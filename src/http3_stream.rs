@@ -286,6 +286,14 @@ impl TlsBackend {
                                 err = Some(io::Error::new(io::ErrorKind::InvalidData, e));
                                 break;
                             }
+                            // 復号済み平文を都度退避する。rustls は受信平文が 16KB
+                            // （DEFAULT_RECEIVED_PLAINTEXT_LIMIT）を超えると次の read_tls を
+                            // "received plaintext buffer full" で拒否するため、1 回の生 read
+                            // （最大 16KB の暗号文 = 複数レコード）をまとめて投入すると
+                            // 平文を排出しないまま上限に達してエラーになる
+                            // （macOS 実機の E2E で 1.2MB のアップロード折り返しが途中で切れた）。
+                            let mut d = self.drained.borrow_mut();
+                            drain_plaintext(&mut d, &mut conn.reader());
                         }
                         err
                     };
@@ -562,7 +570,8 @@ async fn backend_task(
     server.release();
 
     if let Err(status) = outcome {
-        // head 送出前のエラーはステータスを通知（送出後は resp_tx drop で fin）。
+        // head 送出前のエラーはそのステータスで応答し、送出後のエラーはメインループが
+        // ストリームをリセットする（切り詰めた本文を fin で閉じて成功に見せない）。
         let _ = resp_tx.send(RespMsg::Error { status }).await;
     }
     // resp_tx / req_body_rx はここで drop → メインループへ fin（EOF）伝播。
@@ -586,7 +595,7 @@ async fn run_backend_task(
     notify: &ConnWaker,
 ) -> Result<(), u16> {
     let target = &server.target;
-    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port); // F-41
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（UDS 対応、TCP は不変）
     let addr = addr.as_str();
 
     // --- 非同期接続（タイムアウト付き） ---
@@ -862,12 +871,20 @@ async fn stream_body_length(
     }
     while sent < total {
         if std::time::Instant::now() >= deadline {
-            return Ok(()); // 既に head 送出済み → fin（resp_tx drop）で閉じる。
+            // head 送出済み: 短い本文を正常終了（fin）で閉じるとクライアントは切り詰められた
+            // 応答を成功と誤認する。Err を返してストリームをリセットさせる。
+            return Err(504);
         }
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) => break,
+            Ok(0) => {
+                warn!(
+                    "[HTTP/3] streaming backend closed mid-body ({} of {} bytes)",
+                    sent, total
+                );
+                return Err(502);
+            }
             Ok(n) => {
                 let take = n.min(total - sent);
                 let chunk = bytes_from_read(&read_buf, take);
@@ -877,7 +894,10 @@ async fn stream_body_length(
                 sent += take;
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
+            Err(e) => {
+                warn!("[HTTP/3] streaming backend read error mid-body: {}", e);
+                return Err(502);
+            }
         }
     }
     Ok(())
@@ -902,12 +922,16 @@ async fn stream_body_chunked(
 
     loop {
         if std::time::Instant::now() >= deadline {
-            return Ok(());
+            return Err(504); // head 送出済み → リセット（切り詰めを成功に見せない）
         }
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) => break,
+            Ok(0) => {
+                // 終端チャンク前の EOF = 本文の欠落。
+                warn!("[HTTP/3] streaming backend closed before the last chunk");
+                return Err(502);
+            }
             Ok(n) => {
                 // read_buf の先頭 n バイトを Bytes 化してデコード（span はこの Bytes のスライス）。
                 let data = bytes_from_read(&read_buf, n);
@@ -917,8 +941,8 @@ async fn stream_body_chunked(
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => {
-                debug!("[HTTP/3] streaming chunked read error: {}", e);
-                break;
+                warn!("[HTTP/3] streaming chunked read error: {}", e);
+                return Err(502);
             }
         }
     }
@@ -969,12 +993,12 @@ async fn stream_body_eof(
     }
     loop {
         if std::time::Instant::now() >= deadline {
-            return Ok(());
+            return Err(504); // head 送出済み → リセット
         }
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) => break,
+            Ok(0) => break, // EOF 終端なので正常終了
             Ok(n) => {
                 let chunk = bytes_from_read(&read_buf, n);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
@@ -982,7 +1006,10 @@ async fn stream_body_eof(
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
+            Err(e) => {
+                warn!("[HTTP/3] streaming backend read error mid-body: {}", e);
+                return Err(502);
+            }
         }
     }
     Ok(())
@@ -1017,12 +1044,21 @@ async fn stream_response_compressed(
 
     while !done {
         if std::time::Instant::now() >= deadline {
-            break;
+            // head 未送出なので 504 をそのまま返せる（欠けた本文を圧縮して返さない）。
+            return Err(504);
         }
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) => break,
+            Ok(0) => {
+                // length / chunked フレーミングで終端前の EOF は本文の欠落。
+                // EOF 終端（どちらも無い）なら正常終了。
+                if decoder.is_some() || remaining.is_some() {
+                    warn!("[HTTP/3] streaming backend closed before the body completed");
+                    return Err(502);
+                }
+                break;
+            }
             Ok(n) => {
                 let slice = Bytes::copy_from_slice(&read_buf[..n]);
                 accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
@@ -1030,7 +1066,10 @@ async fn stream_response_compressed(
                     || remaining == Some(0);
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
+            Err(e) => {
+                warn!("[HTTP/3] streaming backend read error: {}", e);
+                return Err(502);
+            }
         }
     }
 
@@ -1114,7 +1153,7 @@ async fn send_body_bytes(
     notify: &ConnWaker,
     chunk: Bytes,
 ) -> Result<(), ()> {
-    resp_tx.send(RespMsg::Body(chunk)).await?;
+    resp_tx.send(RespMsg::Body(chunk)).await.map_err(|_| ())?;
     notify.notify();
     Ok(())
 }
@@ -1341,6 +1380,132 @@ mod tests {
     use super::*;
 
     // NOTE: channel / Notify の単体テストは抽出先の [`crate::stream_channel`] に移設した（F-116）。
+
+    /// rustls の client/server をメモリ上でハンドシェイクさせる（テスト用）。
+    /// docker build のサンドボックス等、io_uring が seccomp で拒否される環境では
+    /// ランタイムを起動できない（`l4::proxy` のテストと同じ判定）。
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(all(unix, not(all(veil_rt_uring, target_os = "linux"))))]
+    fn runtime_available() -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    fn handshaked_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
+        use std::sync::Arc;
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let provider = Arc::new(crate::tls_provider::provider::default_provider());
+        let cert_der = ck.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        );
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_cfg),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut &buf[..]).unwrap();
+            server.process_new_packets().unwrap();
+            let mut buf = Vec::new();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut &buf[..]).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        (client, server)
+    }
+
+    /// 1 回の生 read に「16KB レコードの末尾 + 後続の小さいレコード群」が入っても
+    /// `TlsBackend::read_into` がエラーにならず全量を返すこと（回帰テスト）。
+    ///
+    /// rustls の deframer は `read_tls` 1 回あたり最大 4KB しか取り込まないため、
+    /// 生 read 1 回分（最大 16KB）を平文の排出なしに投入し続けると、16KB レコードが
+    /// 完成した直後に小さいレコードの平文が積み増されて受信平文上限（16KB）を超え、
+    /// 次の `read_tls` が "received plaintext buffer full" で失敗していた。
+    /// HTTP/3 の TLS バックエンド経路はこのエラーで本文を途中終了させ、macOS の E2E
+    /// （1.2MB のアップロード折り返し）で切り詰められた応答が 200 で返っていた。
+    #[cfg(unix)]
+    #[test]
+    // 理由付き allow: テストコード（書き込みスレッドの完了待ちに同期 sleep を使う。データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn tls_backend_read_survives_large_record_followed_by_small_records() {
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd as _;
+
+        if !runtime_available() {
+            eprintln!("skip: async runtime unavailable (io_uring denied in this sandbox)");
+            return;
+        }
+
+        let (client, mut server) = handshaked_pair();
+        // 16KB の最大長レコード 1 本 + 200 バイトのレコード 80 本。
+        let mut expected = Vec::new();
+        let big: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut cipher = Vec::new();
+        server.writer().write_all(&big).unwrap();
+        expected.extend_from_slice(&big);
+        server.write_tls(&mut cipher).unwrap();
+        for i in 0..80u8 {
+            let small = [i; 200];
+            server.writer().write_all(&small).unwrap();
+            expected.extend_from_slice(&small);
+            while server.wants_write() {
+                server.write_tls(&mut cipher).unwrap();
+            }
+        }
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds は 2 要素の有効な配列。
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        // 暗号文を一括で流し込む（受信側が 1 回の read で 16KB を取り込めるように）。
+        // SAFETY: fds[1] は socketpair が返した所有 fd で、ここで一度だけ所有権を移す。
+        let mut peer = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[1]) };
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&cipher).unwrap();
+            peer
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // SAFETY: fds[0] は socketpair が返した所有 fd で、TlsBackend へ所有権を移す。
+        let inner = unsafe { TcpStream::from_raw_fd(fds[0]) };
+        let backend = TlsBackend::new(inner, Some(client), Vec::new());
+        let got = crate::runtime::block_on(async move {
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            while got.len() < expected.len() {
+                let (res, b) = backend.read_into(buf).await;
+                buf = b;
+                let n = res.expect("TLS backend read must not fail");
+                assert!(n > 0, "unexpected EOF after {} bytes", got.len());
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected);
+            got.len()
+        });
+        assert_eq!(got, 16 * 1024 + 80 * 200);
+        drop(writer.join().unwrap());
+    }
 
     #[test]
     fn push_chunk_size_line_hex() {

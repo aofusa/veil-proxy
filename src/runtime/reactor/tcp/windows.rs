@@ -355,6 +355,15 @@ impl TcpStream {
     }
 
     pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
+        // F-170: UDS バックエンド表記（`unix:<path>`）は Windows では非対応（B-69 の
+        // 教訓どおり windows.rs にも同じ分岐を必ず入れる。挙動は「対応しない」旨の
+        // エラーを返すのみで、TCP 経路の命令列は無変更）。
+        if addr.starts_with("unix:") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unix domain socket backends are not supported on this platform",
+            ));
+        }
         use std::net::ToSocketAddrs;
         let socket_addr = addr
             .to_socket_addrs()
@@ -425,6 +434,12 @@ impl TcpStream {
         }
     }
 
+    /// `unix.rs` の `readable_lazy` に対応する（B-69: reactor/tcp のメソッドは両方に足す）。
+    /// WSAPoll には readiness ヒントが無いため通常の `readable` と同じ。
+    pub fn readable_lazy(&self) -> Readable<'_> {
+        self.readable()
+    }
+
     pub fn writable(&self) -> Writable<'_> {
         Writable {
             fd: self.fd,
@@ -490,6 +505,15 @@ impl TcpStream {
         let ret = unsafe { ws_shutdown(win::to_socket(self.fd), how) };
         if ret == SOCKET_ERROR {
             return Err(last_wsa_error());
+        }
+        // Linux/BSD ではローカルの SHUT_RD で同じソケットの待機中 poll が即座に
+        // readable（EOF）になるが、Windows の WSAPoll はローカルの SD_RECEIVE を
+        // イベントとして報告しない。待機中の read が idle timeout まで起きないため
+        // （L4 の B-57: 片方向の close で対向方向の read を解除する経路が Windows だけ
+        // 30 秒止まっていた）、読み取り待機者を明示的に起こして recv を再試行させる
+        // （recv は WSAESHUTDOWN を返し、読み取り側が終了する）。
+        if how != SD_SEND {
+            crate::runtime::reactor::executor::wake_all_readers(self.fd);
         }
         Ok(())
     }

@@ -2,8 +2,18 @@
 
 ## 由来
 
-crates.io の [`wasmtime` 40.0.4](https://crates.io/crates/wasmtime/40.0.4) をそのままコピー
-（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-40.0.4/` から）。
+crates.io の [`wasmtime` 36.0.17](https://crates.io/crates/wasmtime/36.0.17)（LTS）をそのままコピー
+（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.17/` から）。
+
+> **2026-10: 40.0.4 → 36.0.17（LTS）へ移した（B-79）。** cargo-audit が wasmtime 40 系に
+> 16 件の勧告（RUSTSEC-2026-0096 = aarch64 Cranelift の誤コンパイルによるサンドボックス脱出
+> など critical を含む）を出した。40 系はすでに保守終了で、修正版は 36.0.x（LTS）と 43 以降に
+> ある。43 以降（最新 49.0.2）は MSRV が Rust 1.96 で、packaging の docker イメージ
+> （1.89 固定のものがある）や pkgsrc の rust-bin を含むツールチェーン全体の更新が要るため、
+> MSRV 1.86 の LTS 36 系を選んだ。veil が使う API（core module・async + fuel yield・
+> epoch 割り込み・プーリングアロケータ・Cranelift / Pulley）は 36 でもそのまま使える。
+> 本体の crates.io 依存（Linux / macOS / Windows / FreeBSD x86_64 / OpenBSD x86_64）も
+> 同じ 36.0.17 に揃えてある。
 `Cargo.toml` / `Cargo.toml.orig` / `LICENSE` / `README.md` / `build.rs` / `src/` を取り込み、
 `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込んでいない
 （veil のワークスペースビルドには不要で、`tests/` は crates.io 公開物とは無関係の
@@ -15,7 +25,13 @@ crates.io の [`wasmtime` 40.0.4](https://crates.io/crates/wasmtime/40.0.4) を�
 
 - `[package] name = "wasmtime"` → `name = "veil-wasmtime"`。
   **`[lib] name = "wasmtime"` は変更していない。**
-- `[lints.rust]` に `dead_code = "allow"` を追加。
+- `[lints.rust]` に `dead_code = "allow"` と `unused_variables = "allow"` を追加
+  （no-signals ビルドで cfg により使われなくなる項目・引数の警告。36.0.17 で後者が増えた）。
+- `[[test]]`（crates.io 版の統合テスト宣言。`tests/` を取り込んでいないため）を削除。
+- `[lints.rust]` の `unused-lifetimes` / `unused-macro-rules` をアンダースコア表記
+  （`unused_lifetimes` / `unused_macro_rules`）へ変更。cargo 1.99 以降はハイフン表記を
+  非推奨としてビルドのたびに manifest 警告を出すため（2026-10、Linux aarch64 VM の
+  cargo 1.99.0 で検出。アンダースコア表記は旧 cargo でも同じ意味で解釈される）。
 
 ### 2. `build.rs`
 
@@ -41,7 +57,7 @@ crates.io の [`wasmtime` 40.0.4](https://crates.io/crates/wasmtime/40.0.4) を�
 
 ## なぜこの vendoring が必要か（B-55）
 
-wasmtime 40 の `signals.rs` には上記 3 ターゲット向けの `ucontext` ベースのシグナルハンドラ
+wasmtime 36 / 40 の `signals.rs` には（OpenBSD aarch64・NetBSD 向けの）上記 3 ターゲット向けの `ucontext` ベースのシグナルハンドラ
 実装が存在せず、`has_native_signals = true` のままビルドすると
 `compile_error!("unsupported platform")` になる。
 
@@ -60,7 +76,7 @@ wasmtime 40 の `signals.rs` には上記 3 ターゲット向けの `ucontext` 
 ## なぜパッケージ名だけ変えて `[lib] name` は変えないのか
 
 Linux / Windows / macOS / FreeBSD(x86_64) / OpenBSD(x86_64) は crates.io の
-`wasmtime` 40.0.4 をそのまま使い、ソースも依存も一切変えない設計（B-55 の影響範囲限定）。
+`wasmtime` 36.0.17 をそのまま使い、ソースも依存も一切変えない設計（B-55 の影響範囲限定）。
 `[target.'cfg(...)'.dependencies]` でターゲット別に依存を出し分けているが、
 もし依存キーを両方とも `wasmtime` のままにすると、cargo は
 
@@ -113,7 +129,8 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
    `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込まない）。
 3. 上記「差分は 2 点だけ」を再適用する。
    - `Cargo.toml`: `name = "veil-wasmtime"` への変更 + `[lints.rust] dead_code = "allow"`
-     （既存の `[lints.rust]` セクションがあればそこに追記、無ければ新設）。
+     （既存の `[lints.rust]` セクションがあればそこに追記、無ければ新設）+ ハイフン表記の
+     lint 名（`unused-lifetimes` 等）のアンダースコア化。
    - `build.rs`: `has_native_signals` 算出への `veil_force_no_native_signals` の AND。
 4. ルート `Cargo.toml` の `wasmtime` / `veil-wasmtime` 依存のバージョン指定
    （`version = "40.0.0"` 等）も新バージョンに合わせて更新する。
@@ -121,3 +138,10 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
    （新バージョンで `build.rs` の周辺コードが変わっている場合は手動でマージ）、
    Linux ホストでの `cargo build --features full` / `cargo clippy` / `cargo fmt --check` が
    ゼロ警告で通ることを確認する。
+
+### 3. `src/runtime/vm/stack_switching/stack/unix.rs`（警告修正のみ・挙動不変）
+
+`wasmtime_continuation_start as usize` を `wasmtime_continuation_start as *const () as usize` に
+した（新しい rustc の `function_casts_as_integer` lint が警告する関数アイテムの直接キャスト。
+lint 名で allow すると、この lint を知らない古い rustc（BSD の pkg 版など）で `unknown lint`
+警告になるため、lint の提案どおりにソースを直した。得られるアドレスは同じ）。

@@ -674,7 +674,12 @@ mod tests {
     ///
     /// `cache::compressed` はグローバルシングルトンなので、他のテストと衝突しない
     /// よう一時ディレクトリ由来のユニークなパスをキーに使う。
+    // グローバル `COMPRESSED_CACHE`（src/cache/compressed.rs）を経由するため、並列
+    // 実行だと他テスト（`public_api_smoke_test` の `clear()` 等）に割り込まれて
+    // フレーキーになる。`content_cache.rs`/`compressed.rs` 全体で同じ既定グループ
+    // （引数なし `#[serial]`）に入れ、モジュールをまたいで直列化する。
     #[test]
+    #[serial_test::serial]
     fn invalidate_also_drops_compressed_cache_variants() {
         let cache = ContentCache::new();
         let dir = tempdir().unwrap();
@@ -741,7 +746,10 @@ mod tests {
     /// （TTL はまだ切れていない）された場合も、圧縮結果キャッシュが道連れに
     /// 破棄されること。TTL だけに委ねていた場合に見逃す不整合
     /// （本体は即時反映されるが圧縮結果だけ古いまま）を防いでいることの確認。
+    // グローバル `COMPRESSED_CACHE` を経由するため #[serial]（理由は上の
+    // `invalidate_also_drops_compressed_cache_variants` と同じ）。
     #[test]
+    #[serial_test::serial]
     fn mtime_revalidation_reload_also_invalidates_compressed_cache() {
         let cache = ContentCache::new();
         let dir = tempdir().unwrap();
@@ -901,7 +909,11 @@ mod tests {
 
     /// グローバルシングルトン経由の公開 API（`get_or_load`/`invalidate`/`clear`）が
     /// 正しく配線されていることの smoke test。
+    // グローバル `CONTENT_CACHE`/`COMPRESSED_CACHE` を直接 `clear()` するため、
+    // 並列実行では他テストのキャッシュ状態を消してしまう（逆に他テスト側からも
+    // ここへ割り込まれる）。#[serial] で直列化する。
     #[test]
+    #[serial_test::serial]
     fn public_api_smoke_test() {
         clear();
         let dir = tempdir().unwrap();

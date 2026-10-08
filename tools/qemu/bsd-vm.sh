@@ -67,6 +67,7 @@
 #   sync       リポジトリを VM へ転送（tar over ssh）
 #   build      VM 内で full features リリースビルド
 #   e2e        VM 内で tests/e2e_setup.sh test を実行
+#   unit       VM 内で単体テスト（--lib）+ 統合テストを実行
 #   fetch      VM 内の release バイナリを host（packaging/build/）へ取得
 #   ssh/scp/console/status/down
 #
@@ -322,7 +323,14 @@ cmd_setup() {
         local base="${WORKDIR}/base.qcow2"
         if [[ ! -f "${base}" ]]; then
             log "FreeBSD VM-IMAGE（BASIC-CLOUDINIT）を DL + 展開: ${url}"
-            curl -fL --retry 3 -o "${base}.xz" "${url}"
+            # サポートが終わったリリースは download.freebsd.org から消えて
+            # ftp-archive の old-releases へ移る（14.3-RELEASE は 2026-10 に 404 化を実測）。
+            # 本家が 404 なら同じパスのアーカイブへフォールバックする。
+            if ! curl -fL --retry 3 -o "${base}.xz" "${url}"; then
+                local archive_url="${url/https:\/\/download.freebsd.org\/releases/http:\/\/ftp-archive.freebsd.org\/pub\/FreeBSD-Archive\/old-releases}"
+                log "本家ミラーに無いためアーカイブから取得: ${archive_url}"
+                curl -fL --retry 3 -o "${base}.xz" "${archive_url}"
+            fi
             xz -dc "${base}.xz" > "${base}"
             rm -f "${base}.xz"
         fi
@@ -347,7 +355,13 @@ cmd_setup() {
         local base="${WORKDIR}/base.qcow2"
         if [[ ! -f "${base}" ]]; then
             log "NetBSD イメージを DL + qcow2 変換: ${url}"
-            curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"
+            # サポート対象外になったリリースのイメージは cdn.netbsd.org から消えて
+            # archive.netbsd.org の NetBSD-archive へ移る（10.1 は 2026-10 に 404 化を実測）。
+            if ! curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"; then
+                local archive_url="${url/cdn.netbsd.org\/pub\/NetBSD/archive.netbsd.org\/pub\/NetBSD-archive}"
+                log "本家ミラーに無いためアーカイブから取得: ${archive_url}"
+                curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${archive_url}"
+            fi
             gunzip -kf "${WORKDIR}/live.img.gz"
             helper qemu-img convert -f raw -O qcow2 live.img base.qcow2
             rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
@@ -739,6 +753,15 @@ EOF
 #   $1 = "force" : 即座に kill -9（docker 版の `docker rm -f` と同じ、猶予なし）。
 #   省略時        : QMP で ACPI シャットダウンを試みてから kill -9 にフォールバック
 #                   （cmd_down で使用）。
+# VM（native の qemu プロセス / docker コンテナ）が起動中か。
+_vm_running() {
+    if [[ "${NATIVE}" == "1" ]]; then
+        [[ -f "${WORKDIR}/qemu.pid" ]] && kill -0 "$(cat "${WORKDIR}/qemu.pid" 2>/dev/null)" 2>/dev/null
+    else
+        docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' 2>/dev/null | grep -q .
+    fi
+}
+
 _native_stop() {
     local mode="${1:-graceful}"
     [[ -f "${WORKDIR}/qemu.pid" ]] || return 0
@@ -759,9 +782,21 @@ _native_stop() {
 }
 
 cmd_up() {
+    # 起動中の VM を即時 kill して起動し直すと、ゲストの UFS が汚れたまま次回起動し、
+    # FreeBSD はシングルユーザーモードの fsck 待ちで止まる（実際に 2 回踏み、fsck の
+    # SALVAGE で cargo レジストリ・pkg のファイルが壊れた）。起動中なら何もしない。
+    # 作り直したいときは VM_RESTART=1 で、正常停止（ACPI powerdown）してから起動する。
+    if _vm_running; then
+        if [[ "${VM_RESTART:-0}" != "1" ]]; then
+            log "既に起動中（再起動するときは VM_RESTART=1）"
+            return 0
+        fi
+        log "VM_RESTART=1: 正常停止してから起動し直す"
+        cmd_down
+    fi
     _write_boot "${1:-}"
     if [[ "${NATIVE}" == "1" ]]; then
-        # 前回分が残っていれば docker rm -f 相当（即時 kill）で片付ける
+        # 前回分の pid が残っていれば片付ける（上で起動中でないことは確認済み）
         _native_stop force
         nohup bash "${WORKDIR}/boot.sh" > "${WORKDIR}/qemu.log" 2>&1 &
         local qemu_pid=$!
@@ -1049,9 +1084,9 @@ fi
 
 cmd_toolchain() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
-        # gmake は tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須。
-        # 無いと `failed to execute command: No such file or directory` で落ちる。
-        # gmake  : tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須
+        # gmake は `--features jemalloc` の tikv-jemalloc-sys で必要だった（B-89 で FreeBSD は
+        # jemalloc feature 自体を廃止）。他の C 依存のビルドで使うことがあるため残している。
+        # gmake  : 上記
         # protobuf: tests/grpc_server の prost-build が protoc を要求する（E2E に必要）
         log "pkg install rust cmake llvm gmake protobuf bash curl nasm git pkgconf"
         cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
@@ -1164,8 +1199,20 @@ cmd_sync() {
     # （HTTP/3 計測クライアント）まで失われ、h3 計測が h2load --h3 フォールバックで
     # 失敗するようになる。`tools` は crate のモジュール解決に関与しないので、
     # 上書き展開だけで十分（`rm -rf` の理由だった E0761 は起きない）。
+    #
+    # `*.sock`（E2E が tests/fixtures に作る UNIX ソケット）は tar に入らないうえ、ホストの
+    # tar がエラー終了扱いになる。`--no-xattrs` は macOS の `com.apple.macl`（SIP 保護で
+    # 消せない拡張属性）をゲストが復元できずに展開がエラー終了し、`&&` の後ろの
+    # members 書き換えが走らずにビルドが壊れるのを防ぐ（2026-10、Apple Silicon で実測）。
+    # `tools/*/results` は git 管理外の計測・検査結果で、container_security の cargo-target が
+    # 2.4GB あり毎回ゲストへ送っていた（NetBSD はルート FS が 1.8GB しかない）ので除外する。
+    # メンバー名は `./` 無し（`tools/...`）なので、GNU tar では `./` 付きのパターンが一致しない
+    # （macOS の bsdtar は一致する）。両方の形を書く。root 所有の sanitizer ビルド成果物を
+    # 読もうとして Permission denied で同期ごと失敗した（Linux ホスト、2026-10-07）。
     (cd "${ROOT}" && tar czf - \
-        --exclude='./target' --exclude='*/target' --exclude='.git' \
+        --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
+        --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
+        --exclude='tools/container_security/results' --exclude='tools/perf/results' \
         src benches tests examples contrib docker/assets third_party tools \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
@@ -1245,7 +1292,7 @@ _guest_env_prefix() {
 }
 
 # BSD 向けの既定 feature セット（Cargo.toml）。
-#   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
+#   full-freebsd : full と同じ機能セット（アロケータはシステムの malloc(3)。B-89）
 #   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
 #                  + 同梱 rustls(ring)/quiche(BoringSSL)。
 #   full-netbsd  : full-openbsd と同一方針（システムアロケータ + 同梱 TLS）。
@@ -1342,8 +1389,40 @@ cmd_e2e() {
     cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${e2e_features}' bash tests/e2e_setup.sh test"
 }
 
+# unit: VM 内で単体テスト（--lib）と統合テストを実行する。
+#   E2E は `tests/e2e_tests.rs` しか走らせないため、ライブラリ側の単体テストが BSD で
+#   コンパイル・通過するかはこれで確かめる（Linux 専用定数を参照するテストが BSD で
+#   コンパイル不能だった B-88 の再発防止）。feature は e2e と同じ規則で決める。
+cmd_unit() {
+    cmd_sync
+    local unit_features="${CARGO_FEATURES}"
+    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${unit_features}" == "full-netbsd" ]]; then
+        unit_features="full-netbsd-no-http3"
+    fi
+    local runner_env=""
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        # B-60: NetBSD は PaX MPROTECT がシステム全体で有効なため、wasmtime を使う単体テスト
+        # （WASM の実行）が EACCES で失敗する。E2E は veil 本体に paxctl +m を掛けているが、
+        # 単体テストのバイナリは cargo が生成するので、cargo の runner で実行直前に掛ける。
+        local triple="${ARCH}-unknown-netbsd"
+        local var="CARGO_TARGET_$(echo "${triple}" | tr 'a-z-' 'A-Z_')_RUNNER"
+        cmd_ssh "cat > ${GUEST_ROOT}/../paxrun.sh && chmod +x ${GUEST_ROOT}/../paxrun.sh" <<'PAXRUN'
+#!/bin/sh
+/usr/sbin/paxctl +m "$1" >/dev/null 2>&1
+exec "$@"
+PAXRUN
+        # 4GB の VM でテストバイナリ 3 本を並列リンクすると ld が OOM で落ちる（実測）。
+        runner_env="${var}=${GUEST_ROOT}/../paxrun.sh CARGO_BUILD_JOBS=2"
+    fi
+    log "in-VM 単体 + 統合テスト（features=${unit_features}）"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) ${runner_env} cargo test --no-default-features --features '${unit_features}' --lib --test integration_tests"
+}
+
 # packaging へ渡すためにビルド済みバイナリを取り出す
 cmd_fetch() {
+    # `up` 直後に呼ばれると SSH がまだ上がっておらず scp が 255 で落ちるため待つ
+    # （`cmd_build`/`cmd_e2e` は `cmd_sync` 経由で待つが、fetch だけ素通りだった）。
+    cmd_wait "${SYNC_WAIT_TIMEOUT:-900}" >/dev/null 2>&1 || die "VM の SSH に到達できない"
     local out_dir="${ROOT}/packaging/build"
     local arch_label; arch_label="${ARCH}"
     mkdir -p "${out_dir}"
@@ -1384,6 +1463,7 @@ case "${COMMAND}" in
     sync) cmd_sync ;;
     build) cmd_build ;;
     e2e) cmd_e2e "$@" ;;
+    unit) cmd_unit ;;
     fetch) cmd_fetch ;;
     ssh) cmd_ssh "$@" ;;
     scp) cmd_scp "$@" ;;

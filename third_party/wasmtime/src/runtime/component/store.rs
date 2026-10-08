@@ -1,5 +1,3 @@
-#[cfg(feature = "component-model-async")]
-use crate::runtime::vm::VMStore;
 use crate::runtime::vm::component::{ComponentInstance, OwnedComponentInstance};
 use crate::store::{StoreData, StoreId, StoreOpaque};
 use crate::{AsContext, AsContextMut, Store, StoreContextMut};
@@ -58,36 +56,25 @@ impl ComponentStoreData {
     }
 
     #[cfg(feature = "component-model-async")]
-    pub(crate) fn drop_fibers_and_futures(store: &mut dyn VMStore) {
+    pub(crate) fn drop_fibers_and_futures(store: &mut StoreOpaque) {
         let mut fibers = Vec::new();
         let mut futures = Vec::new();
-        store
-            .concurrent_state_mut()
-            .take_fibers_and_futures(&mut fibers, &mut futures);
+        for (_, instance) in store.store_data_mut().components.instances.iter_mut() {
+            let Some(instance) = instance.as_mut() else {
+                continue;
+            };
+
+            instance
+                .get_mut()
+                .concurrent_state_mut()
+                .take_fibers_and_futures(&mut fibers, &mut futures);
+        }
 
         for mut fiber in fibers {
             fiber.dispose(store);
         }
 
-        crate::component::concurrent::tls::set(store, move || drop(futures));
-    }
-
-    #[cfg(feature = "component-model-async")]
-    pub(crate) fn assert_guest_tables_empty(&mut self) {
-        for (_, instance) in self.instances.iter_mut() {
-            let Some(instance) = instance.as_mut() else {
-                continue;
-            };
-
-            assert!(
-                instance
-                    .get_mut()
-                    .guest_tables()
-                    .0
-                    .iter()
-                    .all(|(_, table)| table.is_empty())
-            );
-        }
+        crate::component::concurrent::tls::set(store.traitobj_mut(), move || drop(futures));
     }
 }
 
@@ -175,25 +162,6 @@ impl StoreComponentInstanceId {
     /// Panics if `self` does not belong to `store`.
     pub(crate) fn get_mut<'a>(&self, store: &'a mut StoreOpaque) -> Pin<&'a mut ComponentInstance> {
         self.from_data_get_mut(store.store_data_mut())
-    }
-
-    /// Return a mutable `ComponentInstance` and a `ModuleRegistry`
-    /// from the store.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` does not belong to `store`.
-    #[cfg(feature = "component-model-async")]
-    pub(crate) fn get_mut_and_registry<'a>(
-        &self,
-        store: &'a mut StoreOpaque,
-    ) -> (
-        Pin<&'a mut ComponentInstance>,
-        &'a crate::module::ModuleRegistry,
-    ) {
-        let (store_data, registry) = store.store_data_mut_and_registry();
-        let instance = self.from_data_get_mut(store_data);
-        (instance, registry)
     }
 
     /// Same as `get_mut`, but borrows less of a store.

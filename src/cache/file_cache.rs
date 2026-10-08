@@ -14,7 +14,7 @@
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -65,16 +65,22 @@ pub fn configure_global_open_file_cache(
 /// キャッシュされたファイル情報
 #[derive(Clone, Debug)]
 pub struct CachedFileInfo {
-    /// 正規化されたパス（canonicalize結果）
-    pub canonical_path: PathBuf,
+    /// 正規化されたパス（canonicalize結果）。キャッシュヒットのたびに複製されるため
+    /// `Arc` で共有する（以前は `PathBuf` / `String` をヒットごとにディープコピーしていた）。
+    pub canonical_path: std::sync::Arc<Path>,
     /// ファイルサイズ（バイト）
     pub file_size: u64,
-    /// MIMEタイプ文字列
-    pub mime_type: String,
+    /// MIMEタイプ文字列（同上の理由で `Arc` 共有）
+    pub mime_type: std::sync::Arc<str>,
     /// 最終更新時刻
     pub last_modified: Option<SystemTime>,
     /// ファイルかどうか（ディレクトリでない）
     pub is_file: bool,
+    /// メタデータ取得時に開いた fd（通常ファイルのみ）。nginx の `open_file_cache` と同じく
+    /// キャッシュの有効期間中は fd を保持し、HTTP/1.1 静的配信の open/close を毎リクエスト
+    /// 行わずに済ませる（FreeBSD の DTrace 実測で openat + close が 2 syscall/req）。
+    /// 読み取りは `pread`/`sendfile` のオフセット指定 API だけなので共有しても安全。
+    shared_file: Option<std::sync::Arc<std::fs::File>>,
     /// キャッシュ時刻
     cached_at: Instant,
 }
@@ -93,23 +99,33 @@ impl CachedFileInfo {
     /// warning を解消する（`#[allow(dead_code)]` は規約で禁止）。
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(crate) fn from_open_metadata(path: &Path, meta: &std::fs::Metadata) -> Self {
-        let mime_type = mime_guess::from_path(path)
+        let mime_type: std::sync::Arc<str> = mime_guess::from_path(path)
             .first_or_octet_stream()
-            .to_string();
+            .as_ref()
+            .into();
         Self {
-            canonical_path: path.to_path_buf(),
+            canonical_path: path.into(),
             file_size: meta.len(),
             mime_type,
             last_modified: meta.modified().ok(),
             is_file: meta.is_file(),
+            shared_file: None,
             cached_at: Instant::now(),
         }
+    }
+
+    /// メタデータ取得時に開いた fd（キャッシュと共有）。無ければ呼び出し側が開く。
+    #[inline]
+    pub fn shared_file(&self) -> Option<&std::sync::Arc<std::fs::File>> {
+        self.shared_file.as_ref()
     }
 
     /// キャッシュが有効かどうかをチェック
     #[inline]
     pub fn is_valid(&self, max_age: Duration) -> bool {
-        self.cached_at.elapsed() < max_age
+        // 毎ヒットで呼ばれるため、reactor では起床ごとに 1 回読む粗い時計を使う
+        // （有効期間は秒単位なので誤差は問題にならない）。
+        crate::runtime::time::coarse_now().saturating_duration_since(self.cached_at) < max_age
     }
 
     /// HTTP Last-Modified ヘッダー用のRFC 7231形式文字列を生成
@@ -168,13 +184,33 @@ fn unix_timestamp_to_date(timestamp: i64) -> (i32, u32, u32, u32, u32, u32) {
     (year, month, day, hour, min, sec)
 }
 
+/// キャッシュのキー: パスの生バイト列。
+///
+/// `PathBuf` をキーにすると `Path` の `Hash` が要素ごとの走査（正規化）を行い、
+/// 既定の SipHash と合わせてヒットのたびに CPU を使っていた（FreeBSD の DTrace で
+/// `Path::hash` / `Components::next` / SipHash がホットスポットに出ていた）。
+/// 静的配信のパスは常に同じ組み立て方（ルートの base_path + リクエストパス）なので、
+/// バイト列の一致で十分。
+#[inline]
+fn path_key(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
+}
+
+/// キーのハッシャ。キーは実在するファイルのパスに限られる（存在しないパスは挿入しない）が、
+/// 念のためプロセスごとに乱数シードを変える（foldhash）。xxh3 のストリーミング版ハッシャ
+/// （`Xxh3Builder`）は短いキーでは遅い（FreeBSD のプロファイルで `xxh3_stateful_update` /
+/// `digest` が上位に出た）ので使わない。
+fn path_key_hasher() -> foldhash::quality::RandomState {
+    foldhash::quality::RandomState::default()
+}
+
 /// ファイル情報キャッシュ
 ///
 /// DashMapベースのスレッドセーフなキャッシュ実装
 pub struct OpenFileCache {
     /// キャッシュエントリ（パス → ファイル情報）。DashMap は内部シャーディングにより
     /// グローバルロックを持たない。
-    entries: DashMap<PathBuf, CachedFileInfo>,
+    entries: DashMap<Box<[u8]>, CachedFileInfo, foldhash::quality::RandomState>,
     /// キャッシュエントリの有効期間（ナノ秒、ロックフリー atomic）
     valid_duration_nanos: AtomicU64,
     /// キャッシュヒット数
@@ -189,7 +225,7 @@ impl OpenFileCache {
     /// 新しいキャッシュを作成
     fn new() -> Self {
         Self {
-            entries: DashMap::with_capacity(1024),
+            entries: DashMap::with_capacity_and_hasher(1024, path_key_hasher()),
             valid_duration_nanos: AtomicU64::new(60_000_000_000), // デフォルト60秒
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -212,7 +248,7 @@ impl OpenFileCache {
         let max_entries = self.max_entries.load(Ordering::Relaxed);
 
         // まずキャッシュから検索（ヒット時は syscall ゼロ・非同期待機なし）
-        if let Some(entry) = self.entries.get(path) {
+        if let Some(entry) = self.entries.get(path_key(path)) {
             if entry.is_valid(valid_duration) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(entry.clone());
@@ -229,7 +265,7 @@ impl OpenFileCache {
             self.evict_oldest();
         }
 
-        self.entries.insert(path.to_path_buf(), info.clone());
+        self.entries.insert(path_key(path).into(), info.clone());
         Some(info)
     }
 
@@ -262,16 +298,19 @@ impl OpenFileCache {
             // 帰着し、含有チェックが冗長になる点も同一）。
             if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
                 return match res {
-                    Ok((_file, meta)) => {
-                        let mime_type = mime_guess::from_path(&path)
+                    Ok((file, meta)) => {
+                        let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
                             .first_or_octet_stream()
-                            .to_string();
+                            .as_ref()
+                            .into();
+                        let is_file = meta.is_file();
                         Some(CachedFileInfo {
-                            canonical_path: path,
+                            canonical_path: path.into(),
                             file_size: meta.len(),
                             mime_type,
                             last_modified: meta.modified().ok(),
-                            is_file: meta.is_file(),
+                            is_file,
+                            shared_file: is_file.then(|| std::sync::Arc::new(file)),
                             cached_at: Instant::now(),
                         })
                     }
@@ -284,18 +323,24 @@ impl OpenFileCache {
             // F-123: FreeBSD capability mode 下では canonicalize（絶対パス realpath）が
             // 禁止されるため、登録済みルート dirfd 相対の fstatat で代替する
             // （O_RESOLVE_BENEATH が封じ込めを担保。canonical_path は原パスのまま）。
+            // 通常ファイルは配信に使う fd も同時に得る（open + fstat。stat だけにすると
+            // 配信時に毎リクエスト開き直すことになる）。
             #[cfg(target_os = "freebsd")]
-            if let Some(res) = crate::security::capsicum::stat_static(&path) {
-                let st = res.ok()?;
-                let mime_type = mime_guess::from_path(&path)
+            if let Some(res) = crate::security::capsicum::open_static_ro(&path) {
+                let file = res.ok()?;
+                let meta = file.metadata().ok()?;
+                let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
                     .first_or_octet_stream()
-                    .to_string();
+                    .as_ref()
+                    .into();
+                let is_file = meta.is_file();
                 return Some(CachedFileInfo {
-                    canonical_path: path,
-                    file_size: st.len,
+                    canonical_path: path.into(),
+                    file_size: meta.len(),
                     mime_type,
-                    last_modified: st.mtime,
-                    is_file: st.is_file,
+                    last_modified: meta.modified().ok(),
+                    is_file,
+                    shared_file: is_file.then(|| std::sync::Arc::new(file)),
                     cached_at: Instant::now(),
                 });
             }
@@ -304,16 +349,27 @@ impl OpenFileCache {
             // メタデータを取得
             let metadata = std::fs::metadata(&canonical).ok()?;
             // MIMEタイプを推測
-            let mime_type = mime_guess::from_path(&canonical)
+            let mime_type: std::sync::Arc<str> = mime_guess::from_path(&canonical)
                 .first_or_octet_stream()
-                .to_string();
+                .as_ref()
+                .into();
 
+            let is_file = metadata.is_file();
+            // 通常ファイルは配信に使う fd も保持する（開けなければ配信時に開き直す）。
+            let shared_file = if is_file {
+                std::fs::File::open(&canonical)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
             Some(CachedFileInfo {
-                canonical_path: canonical,
+                canonical_path: canonical.into(),
                 file_size: metadata.len(),
                 mime_type,
                 last_modified: metadata.modified().ok(),
-                is_file: metadata.is_file(),
+                is_file,
+                shared_file,
                 cached_at: Instant::now(),
             })
         })
@@ -327,7 +383,7 @@ impl OpenFileCache {
         let mut removed = 0;
 
         // 最も古いエントリから削除
-        let mut oldest: Vec<(PathBuf, Instant)> = self
+        let mut oldest: Vec<(Box<[u8]>, Instant)> = self
             .entries
             .iter()
             .map(|e| (e.key().clone(), e.value().cached_at))
@@ -336,7 +392,7 @@ impl OpenFileCache {
         oldest.sort_by_key(|(_, time)| *time);
 
         for (path, _) in oldest.into_iter().take(to_remove) {
-            self.entries.remove(&path);
+            self.entries.remove(&*path);
             removed += 1;
             if removed >= to_remove {
                 break;
@@ -351,7 +407,7 @@ impl OpenFileCache {
 
     /// 特定のパスをキャッシュから削除
     pub fn invalidate(&self, path: &Path) {
-        self.entries.remove(path);
+        self.entries.remove(path_key(path));
     }
 
     /// キャッシュヒット数を取得
@@ -420,7 +476,7 @@ impl OpenFileCache {
                     OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS.load(Ordering::Relaxed),
                 )
             });
-        let entry = self.entries.get(path)?;
+        let entry = self.entries.get(path_key(path))?;
         if entry.is_valid(valid_duration) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.clone())
@@ -456,7 +512,7 @@ impl OpenFileCache {
         if self.entries.len() >= max_entries.min(current_max_entries) {
             self.evict_oldest();
         }
-        self.entries.insert(path.to_path_buf(), info);
+        self.entries.insert(path_key(path).into(), info);
     }
 
     /// 設定を考慮してファイル情報を取得
@@ -467,7 +523,7 @@ impl OpenFileCache {
         max_entries: usize,
     ) -> Option<CachedFileInfo> {
         // まずキャッシュから検索（ヒット時は非同期待機なし）
-        if let Some(entry) = self.entries.get(path) {
+        if let Some(entry) = self.entries.get(path_key(path)) {
             // ルーティングごとの有効期間で判定
             if entry.is_valid(valid_duration) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -486,7 +542,7 @@ impl OpenFileCache {
             self.evict_oldest();
         }
 
-        self.entries.insert(path.to_path_buf(), info.clone());
+        self.entries.insert(path_key(path).into(), info.clone());
         Some(info)
     }
 }
@@ -581,6 +637,40 @@ mod tests {
         let info2 = info2.unwrap();
         assert_eq!(info1.file_size, info2.file_size);
         assert_eq!(info1.mime_type, info2.mime_type);
+    }
+
+    /// 通常ファイルはメタデータ取得時に開いた fd をキャッシュが保持し、ヒット時は
+    /// 同じ fd を共有すること（HTTP/1.1 静的配信が毎リクエスト open/close しないため）。
+    /// ディレクトリは fd を保持しない。
+    #[cfg(unix)] // FileExt::read_exact_at（pread）を使う
+    #[test]
+    // 理由付き allow: テストコード（一時ファイルの作成に同期 FS を使う。データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_file_cache_keeps_shared_fd_for_regular_files() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("fd.txt");
+        std::fs::write(&file_path, b"shared-fd").unwrap();
+
+        let cache = OpenFileCache::new();
+        let info1 = futures::executor::block_on(cache.get_or_fetch(&file_path)).unwrap();
+        let info2 = futures::executor::block_on(cache.get_or_fetch(&file_path)).unwrap();
+        let f1 = info1.shared_file().expect("regular file must keep an fd");
+        let f2 = info2.shared_file().expect("cache hit must share the fd");
+        assert!(
+            std::sync::Arc::ptr_eq(f1, f2),
+            "hit must not reopen the file"
+        );
+        let mut buf = [0u8; 9];
+        f1.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"shared-fd");
+
+        let dinfo = futures::executor::block_on(cache.get_or_fetch(dir.path())).unwrap();
+        assert!(!dinfo.is_file);
+        assert!(
+            dinfo.shared_file().is_none(),
+            "directories must not keep an fd"
+        );
     }
 
     #[test]

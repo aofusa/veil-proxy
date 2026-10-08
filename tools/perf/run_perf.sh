@@ -423,6 +423,8 @@ for build in $BUILDS; do
     for cfgfile in "$HERE"/configs/$CONFIG_GLOB.toml; do
         [ -e "$cfgfile" ] || continue
         name=$(basename "$cfgfile" .toml)
+        # *_alloc は alloc_measure*.sh 専用（alloc-stats ビルドが前提）なのでスイートでは測らない。
+        case "$name" in *_alloc) continue ;; esac
         # 名前 h2_1_* / h3_* は HTTP/2 有効 → h2load も実施。h2_0_* は HTTP/1.1 のみ。
         # grpc_* は run_load 冒頭で専用計測へ委譲するため h2 値は不問。
         case "$name" in h2_1_*|h3_*) h2=1 ;; *) h2=0 ;; esac

@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
 // F-122: RNG は OpenBSD では ring、他は aws-lc-rs（crate::tls_provider で選択）。
-use crate::tls_provider::{SecureRandom, SystemRandom};
+use crate::tls_provider::{hmac, SecureRandom, SystemRandom};
 use bytes::{BufMut, Bytes, BytesMut};
 use quiche::h3::NameValue;
 use quiche::{h3, Config, ConnectionId};
@@ -82,6 +82,102 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
         .iter()
         .map(|h| h.name().len().saturating_add(h.value().len()))
         .sum()
+}
+
+/// HTTP/3 のフィールドセクション（HEADERS フレーム）の検査結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H3FieldSection {
+    /// 疑似ヘッダを持ち、リクエストの必須要件を満たす（新規リクエスト）。
+    Request,
+    /// 疑似ヘッダを 1 つも持たない（既存ストリームなら trailers、新規ストリームなら malformed）。
+    NoPseudo,
+}
+
+/// HTTP/3 の H3_MESSAGE_ERROR（RFC 9114 §8.1）。
+const H3_MESSAGE_ERROR: u64 = 0x10e;
+
+/// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
+///
+/// `Err` は malformed（呼び出し側が H3_MESSAGE_ERROR で扱う）。検査するのは
+/// 疑似ヘッダの重複・未知/禁止（`:status`、拡張 CONNECT を広告していないので `:protocol` も）・
+/// 通常フィールドの後ろの疑似ヘッダ・大文字のフィールド名・接続固有フィールド・
+/// リクエストの必須疑似ヘッダ（CONNECT とそれ以外で異なる）。
+///
+/// quiche の h3 層はこれらを検査しないため、無ければ `:method` 欠落を GET と見なす等で
+/// malformed なリクエストに 200 を返していた（h3spec で検出）。
+///
+/// ホットパス（リクエストごと）: 確保なし・フィールド列を 1 回走査するだけ。
+fn h3_check_field_section<'a, I>(fields: I) -> Result<H3FieldSection, &'static str>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    const METHOD: u8 = 1;
+    const SCHEME: u8 = 2;
+    const AUTHORITY: u8 = 4;
+    const PATH: u8 = 8;
+    let mut seen: u8 = 0;
+    let mut regular_seen = false;
+    let mut is_connect = false;
+    let mut host_seen = false;
+    let mut scheme_needs_authority = false;
+    for (name, value) in fields {
+        if let Some(pseudo) = name.strip_prefix(b":") {
+            if regular_seen {
+                return Err("pseudo-header after regular field");
+            }
+            let bit = match pseudo {
+                b"method" => METHOD,
+                b"scheme" => SCHEME,
+                b"authority" => AUTHORITY,
+                b"path" => PATH,
+                _ => return Err("unknown or prohibited pseudo-header"),
+            };
+            if seen & bit != 0 {
+                return Err("duplicated pseudo-header");
+            }
+            seen |= bit;
+            if bit == METHOD {
+                is_connect = value == b"CONNECT";
+            } else if bit == SCHEME {
+                scheme_needs_authority = value == b"https" || value == b"http";
+            } else if bit == PATH && value.is_empty() {
+                return Err("empty :path");
+            }
+        } else {
+            regular_seen = true;
+            if name.iter().any(u8::is_ascii_uppercase) {
+                return Err("uppercase field name");
+            }
+            match name {
+                b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+                | b"upgrade" => return Err("connection-specific field"),
+                b"te" if value != b"trailers" => return Err("te other than trailers"),
+                b"host" => host_seen = true,
+                _ => {}
+            }
+        }
+    }
+    if seen == 0 {
+        return Ok(H3FieldSection::NoPseudo);
+    }
+    if seen & METHOD == 0 {
+        return Err("missing :method");
+    }
+    if is_connect {
+        // §4.4: CONNECT は :scheme と :path を省き、:authority を必須とする。
+        if seen & (SCHEME | PATH) != 0 {
+            return Err("CONNECT with :scheme or :path");
+        }
+        if seen & AUTHORITY == 0 {
+            return Err("CONNECT without :authority");
+        }
+    } else if seen & (SCHEME | PATH) != (SCHEME | PATH) {
+        return Err("missing :scheme or :path");
+    } else if scheme_needs_authority && seen & AUTHORITY == 0 && !host_seen {
+        // §4.3.1: http/https は authority 成分が必須 → :authority か Host のどちらかが要る。
+        return Err("missing :authority and host");
+    }
+    Ok(H3FieldSection::Request)
 }
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
@@ -671,6 +767,35 @@ struct SendFileRequest<'a> {
     wasm_modules: Option<&'a Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
 }
 
+/// QUIC ストリーム ID をキーにするマップ用の軽量ハッシャ（乗算ハッシュ 1 回）。
+///
+/// 既定の SipHash はストリームごとの挿入・検索・削除のたびに走り、HTTP/3 の小さい応答では
+/// プロファイル上位に出ていた。ストリーム ID は QUIC の規約上ピアが任意に散らせない
+/// （低い ID から順に開く必要があり、同時数は max_streams で制限される）ため、
+/// HashDoS 耐性の強いハッシャは不要。
+#[derive(Default, Clone, Copy)]
+struct StreamIdHasher(u64);
+
+impl std::hash::Hasher for StreamIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type StreamIdHasherBuilder = std::hash::BuildHasherDefault<StreamIdHasher>;
+type StreamMap<V> = HashMap<u64, V, StreamIdHasherBuilder>;
+
 /// HTTP/3 コネクションハンドラー
 ///
 /// quiche::Connection と h3::Connection をセットで保持し、
@@ -685,15 +810,15 @@ struct Http3Handler {
     /// リモートアドレス
     peer_addr: SocketAddr,
     /// 部分的なレスポンス（ストリーム ID → 保留中の応答。B-43 で head を保持）
-    partial_responses: HashMap<u64, PartialResponse>,
+    partial_responses: StreamMap<PartialResponse>,
     /// クライアント IP アドレス（F-168 P3: `to_string()` のヒープ確保を排除するスタックバッファ）
     client_ip: crate::http_utils::IpStr,
     /// ストリーミングプロキシ中のストリーム（F-32）。
-    proxy_streams: HashMap<u64, ProxyStream>,
+    proxy_streams: StreamMap<ProxyStream>,
     /// バッファ経路の保留リクエスト（F-32）。
-    buffered_reqs: HashMap<u64, BufferedReq>,
+    buffered_reqs: StreamMap<BufferedReq>,
     /// ストリームごとのリクエストボディ蓄積（バッファ経路 + ストリーミング初回バッチ）。
-    stream_bodies: HashMap<u64, BytesMut>,
+    stream_bodies: StreamMap<BytesMut>,
     /// バックエンドタスク → メインループの起床通知（F-32）。F-151 で per-connection 化
     /// （`ConnWaker`）し、`notify()` 前に自 cid を共有起床キューへ積むようにした。
     notify: crate::http3_stream::ConnWaker,
@@ -702,7 +827,7 @@ struct Http3Handler {
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
-    metric_open_streams: HashSet<u64>,
+    metric_open_streams: HashSet<u64, StreamIdHasherBuilder>,
     /// F-151: ダーティ集合への多重登録防止フラグ。`true` の間はメインループの
     /// `dirty_queue` に既に自 cid が積まれている。
     dirty: bool,
@@ -739,14 +864,14 @@ impl Http3Handler {
             h3_conn: None,
             client_ip: crate::http_utils::IpStr::new(peer_addr.ip()),
             peer_addr,
-            partial_responses: HashMap::new(),
-            proxy_streams: HashMap::new(),
-            buffered_reqs: HashMap::new(),
-            stream_bodies: HashMap::new(),
+            partial_responses: StreamMap::default(),
+            proxy_streams: StreamMap::default(),
+            buffered_reqs: StreamMap::default(),
+            stream_bodies: StreamMap::default(),
             notify,
             backend_spawner,
             _conn_metric: Http3ActiveConnGuard::new(),
-            metric_open_streams: HashSet::new(),
+            metric_open_streams: HashSet::default(),
             dirty: false,
             timer_deadline: None,
             key,
@@ -841,7 +966,35 @@ impl Http3Handler {
                             list.len()
                         );
                         did_work = true;
-                        new_headers.push((stream_id, list, more_frames));
+                        let section =
+                            h3_check_field_section(list.iter().map(|h| (h.name(), h.value())));
+                        // 既にリクエストを受け付けたストリームの 2 つ目のセクションは trailers。
+                        let known_stream = self.proxy_streams.contains_key(&stream_id)
+                            || self.buffered_reqs.contains_key(&stream_id)
+                            || new_headers.iter().any(|(id, _, _)| *id == stream_id);
+                        match section {
+                            Ok(H3FieldSection::Request) if !known_stream => {
+                                new_headers.push((stream_id, list, more_frames));
+                            }
+                            // trailers: 転送しない（従来は新規リクエストとして再分類していた）。
+                            Ok(H3FieldSection::NoPseudo) if known_stream => {}
+                            other => {
+                                let reason = match other {
+                                    Err(r) => r,
+                                    Ok(H3FieldSection::Request) => "pseudo-headers in trailers",
+                                    Ok(H3FieldSection::NoPseudo) => "missing :method",
+                                };
+                                // RFC 9114 §4.1.2: malformed はストリームエラー
+                                // H3_MESSAGE_ERROR。§8 によりコネクションエラーとして扱ってよく、
+                                // 不正なクライアントとの接続を残す理由が無いため接続ごと閉じる。
+                                warn!(
+                                    "[HTTP/3] malformed request on stream {} from {}: {}",
+                                    stream_id, self.peer_addr, reason
+                                );
+                                let _ = self.conn.close(true, H3_MESSAGE_ERROR, reason.as_bytes());
+                                break;
+                            }
+                        }
                     }
                     Ok((stream_id, h3::Event::Data)) => {
                         did_work = true;
@@ -1212,6 +1365,15 @@ impl Http3Handler {
             None => return Decision::Buffer, // handle_request -> 502
         };
 
+        // B-84: h2c 上流はストリーミング経路が扱えない（BackendTaskParams に use_h2c が無く
+        // HTTP/1.1 を送ってしまうため、h2c 専用サーバに切られて 502 になる）。h2c 対応済みの
+        // バッファ経路（handle_request -> proxy_to_h2c_backend_async）へ回す。
+        // HTTP/2 クライアント経路（proxy.rs::h2_proxy_h2c）も同じくバッファ型なので、
+        // これで HTTP/2 クライアントと HTTP/3 クライアントの挙動が揃う。
+        if server.target.use_h2c || upstream_group.use_h2c() {
+            return Decision::Buffer;
+        }
+
         // --- リクエスト head 構築 ---
         let client_encoding = accept_encoding
             .map(AcceptedEncoding::parse)
@@ -1307,29 +1469,29 @@ impl Http3Handler {
             return Ok(());
         }
 
-        // ヘッダーを解析
-        let mut method = None;
-        let mut path = None;
-        let mut authority = None;
+        // ヘッダーを解析（`headers` を借用するだけで、リクエストごとに `Vec` へコピーしない）
+        let mut method: Option<&[u8]> = None;
+        let mut path: Option<&[u8]> = None;
+        let mut authority: Option<&[u8]> = None;
         let mut content_length: usize = 0;
-        let mut accept_encoding: Option<Vec<u8>> = None;
-        let mut user_agent: Vec<u8> = Vec::new();
+        let mut accept_encoding: Option<&[u8]> = None;
+        let mut user_agent: &[u8] = &[];
 
         for header in headers {
             match header.name() {
-                b":method" => method = Some(header.value().to_vec()),
-                b":path" => path = Some(header.value().to_vec()),
-                b":authority" => authority = Some(header.value().to_vec()),
+                b":method" => method = Some(header.value()),
+                b":path" => path = Some(header.value()),
+                b":authority" => authority = Some(header.value()),
                 b"content-length" => {
                     if let Ok(s) = std::str::from_utf8(header.value()) {
                         content_length = s.parse().unwrap_or(0);
                     }
                 }
                 name if name.eq_ignore_ascii_case(b"accept-encoding") => {
-                    accept_encoding = Some(header.value().to_vec());
+                    accept_encoding = Some(header.value());
                 }
                 name if name.eq_ignore_ascii_case(b"user-agent") => {
-                    user_agent = header.value().to_vec();
+                    user_agent = header.value();
                 }
                 _ => {}
             }
@@ -1337,21 +1499,20 @@ impl Http3Handler {
 
         // クライアントの Accept-Encoding を解析
         let client_encoding = accept_encoding
-            .as_ref()
-            .map(|v| AcceptedEncoding::parse(v))
+            .map(AcceptedEncoding::parse)
             .unwrap_or(AcceptedEncoding::Identity);
 
-        let method = method.unwrap_or_else(|| b"GET".to_vec());
-        let path = path.unwrap_or_else(|| b"/".to_vec());
-        let authority = authority.unwrap_or_default();
+        let method: &[u8] = method.unwrap_or(b"GET");
+        let path: &[u8] = path.unwrap_or(b"/");
+        let authority: &[u8] = authority.unwrap_or_default();
 
-        // 処理開始時刻
-        let start_time = Instant::now();
+        // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
+        let start_time = crate::logging::request_start_instant();
 
         debug!(
             "[HTTP/3] Request: {} {} (stream {})",
-            String::from_utf8_lossy(&method),
-            String::from_utf8_lossy(&path),
+            String::from_utf8_lossy(method),
+            String::from_utf8_lossy(path),
             stream_id
         );
 
@@ -1363,17 +1524,17 @@ impl Http3Handler {
                 None
             }
         });
-        if crate::http_utils::authority_host_mismatch(&authority, host_hdr) {
+        if crate::http_utils::authority_host_mismatch(authority, host_hdr) {
             self.send_error_response(stream_id, 400, b"Bad Request: :authority/Host mismatch")?;
             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                 &[]
             } else {
-                &user_agent
+                user_agent
             };
             log_access(
-                &method,
-                &authority,
-                &path,
+                method,
+                authority,
+                path,
                 user_agent_slice,
                 content_length as u64,
                 400,
@@ -1395,7 +1556,7 @@ impl Http3Handler {
         if is_grpc {
             debug!(
                 "[HTTP/3] gRPC request detected: {}",
-                String::from_utf8_lossy(&path)
+                String::from_utf8_lossy(path)
             );
         }
 
@@ -1404,7 +1565,7 @@ impl Http3Handler {
             let config = CURRENT_CONFIG.load();
             let prom_config = &config.prometheus_config;
 
-            let path_str = std::str::from_utf8(&path).unwrap_or("/");
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
             if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
                 // IPアドレス制限チェック
                 if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
@@ -1412,12 +1573,12 @@ impl Http3Handler {
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
                     } else {
-                        &user_agent
+                        user_agent
                     };
                     log_access(
-                        &method,
-                        &authority,
-                        &path,
+                        method,
+                        authority,
+                        path,
                         user_agent_slice,
                         request_body.len() as u64,
                         403,
@@ -1444,12 +1605,12 @@ impl Http3Handler {
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]
                 } else {
-                    &user_agent
+                    user_agent
                 };
                 log_access(
-                    &method,
-                    &authority,
-                    &path,
+                    method,
+                    authority,
+                    path,
                     user_agent_slice,
                     request_body.len() as u64,
                     200,
@@ -1475,12 +1636,12 @@ impl Http3Handler {
         // パス/クエリ分離（スキャンを1回に統一）
         let query_start_pos = path.iter().position(|&b| b == b'?');
         let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(&path);
+        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
 
         let backend_result = find_backend_unified(
-            &authority,
+            authority,
             path_without_query,
-            &method,
+            method,
             &headers_raw,
             raw_query,
             &self.peer_addr,
@@ -1492,12 +1653,12 @@ impl Http3Handler {
             if !authority.is_empty() {
                 debug!(
                     "[HTTP/3] No route found for authority '{}', trying default routes",
-                    String::from_utf8_lossy(&authority)
+                    String::from_utf8_lossy(authority)
                 );
                 find_backend_unified(
                     b"",
                     path_without_query,
-                    &method,
+                    method,
                     &headers_raw,
                     raw_query,
                     &self.peer_addr,
@@ -1516,8 +1677,8 @@ impl Http3Handler {
             None => {
                 debug!(
                     "[HTTP/3] No backend found for authority='{}', path='{}'",
-                    String::from_utf8_lossy(&authority),
-                    String::from_utf8_lossy(&path)
+                    String::from_utf8_lossy(authority),
+                    String::from_utf8_lossy(path)
                 );
 
                 // gRPC リクエストの場合は gRPC エラーレスポンスを返す
@@ -1528,12 +1689,12 @@ impl Http3Handler {
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
                     } else {
-                        &user_agent
+                        user_agent
                     };
                     log_access(
-                        &method,
-                        &authority,
-                        &path,
+                        method,
+                        authority,
+                        path,
                         user_agent_slice,
                         request_body.len() as u64,
                         200,
@@ -1549,12 +1710,12 @@ impl Http3Handler {
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]
                 } else {
-                    &user_agent
+                    user_agent
                 };
                 log_access(
-                    &method,
-                    &authority,
-                    &path,
+                    method,
+                    authority,
+                    path,
                     user_agent_slice,
                     request_body.len() as u64,
                     404,
@@ -1572,7 +1733,7 @@ impl Http3Handler {
         let check_result = check_security(
             security,
             self.client_ip.as_str(),
-            &method,
+            method,
             content_length,
             false,
         );
@@ -1584,12 +1745,12 @@ impl Http3Handler {
             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                 &[]
             } else {
-                &user_agent
+                user_agent
             };
             log_access(
-                &method,
-                &authority,
-                &path,
+                method,
+                authority,
+                path,
                 user_agent_slice,
                 request_body.len() as u64,
                 status,
@@ -1614,8 +1775,8 @@ impl Http3Handler {
         {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                let path_str = std::str::from_utf8(&path).unwrap_or("/");
-                let method_str = std::str::from_utf8(&method).unwrap_or("GET");
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
+                let method_str = std::str::from_utf8(method).unwrap_or("GET");
 
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
@@ -1659,12 +1820,12 @@ impl Http3Handler {
                             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                                 &[]
                             } else {
-                                &user_agent
+                                user_agent
                             };
                             log_access(
-                                &method,
-                                &authority,
-                                &path,
+                                method,
+                                authority,
+                                path,
                                 user_agent_slice,
                                 request_body.len() as u64,
                                 resp.status_code,
@@ -1718,12 +1879,12 @@ impl Http3Handler {
                                         let user_agent_slice: &[u8] = if user_agent.is_empty() {
                                             &[]
                                         } else {
-                                            &user_agent
+                                            user_agent
                                         };
                                         log_access(
-                                            &method,
-                                            &authority,
-                                            &path,
+                                            method,
+                                            authority,
+                                            path,
                                             user_agent_slice,
                                             request_body.len() as u64,
                                             resp.status_code,
@@ -1775,8 +1936,8 @@ impl Http3Handler {
                         &security,
                         &effective_compression,
                         client_encoding,
-                        &method,
-                        &path,
+                        method,
+                        path,
                         &prefix,
                         headers,
                         effective_request_body,
@@ -1795,7 +1956,7 @@ impl Http3Handler {
             }
             Backend::MemoryFile(data, mime_type, security, _) => {
                 // パス完全一致チェック
-                let path_str = std::str::from_utf8(&path).unwrap_or("/");
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
                 let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
 
                 let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
@@ -1889,7 +2050,7 @@ impl Http3Handler {
                     base_path: &base_path,
                     is_dir,
                     index_file: index_file.as_deref(),
-                    req_path: &path,
+                    req_path: path,
                     prefix: &prefix,
                     security: &security,
                     compression: &file_compression,
@@ -1909,7 +2070,7 @@ impl Http3Handler {
                     &redirect_url,
                     status_code,
                     preserve_path,
-                    &path,
+                    path,
                     &prefix,
                 )
                 .unwrap_or((500, 0)),
@@ -1918,12 +2079,12 @@ impl Http3Handler {
         let user_agent_slice: &[u8] = if user_agent.is_empty() {
             &[]
         } else {
-            &user_agent
+            user_agent
         };
         log_access(
-            &method,
-            &authority,
-            &path,
+            method,
+            authority,
+            path,
             user_agent_slice,
             request_body.len() as u64,
             status,
@@ -1965,7 +2126,10 @@ impl Http3Handler {
         // ステータスを含むヘッダーを構築（itoa::Buffer使用でヒープ割り当て削減）
         let mut status_buf = itoa::Buffer::new();
         let status_str = status_buf.format(status);
-        let mut h3_headers = vec![h3::Header::new(b":status", status_str.as_bytes())];
+        // 借用ヘッダ（`HeaderRef`）で渡す。`h3::Header::new` は名前と値を毎回 `Vec` に
+        // コピーするため、応答ごとにヘッダ数 × 2 回の確保になっていた。
+        let mut h3_headers: Vec<h3::HeaderRef<'_>> = Vec::with_capacity(headers.len() + 2);
+        h3_headers.push(h3::HeaderRef::new(b":status", status_str.as_bytes()));
 
         // B-46: headers に既に content-length が含まれるか、既存のヘッダー走査
         // ループに検査を織り込んで判定する（追加の走査を増やさない）。
@@ -1975,7 +2139,7 @@ impl Http3Handler {
                 if name.eq_ignore_ascii_case(b"content-length") {
                     has_content_length = true;
                 }
-                h3_headers.push(h3::Header::new(name, value));
+                h3_headers.push(h3::HeaderRef::new(name, value));
             }
         }
 
@@ -1986,11 +2150,11 @@ impl Http3Handler {
         // content-length を malformed message として H3_MESSAGE_ERROR で
         // 拒否し、ヘッダ受信直後にストリームを停止する（ボディ 0 バイト・
         // 全リクエスト失敗）。headers に既に含まれる場合は追加しない。
+        let mut len_buf = itoa::Buffer::new();
         if !has_content_length {
             if let Some(body_data) = body {
-                let mut len_buf = itoa::Buffer::new();
                 let len_str = len_buf.format(body_data.len());
-                h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
+                h3_headers.push(h3::HeaderRef::new(b"content-length", len_str.as_bytes()));
             }
         }
 
@@ -2009,7 +2173,13 @@ impl Http3Handler {
                 self.partial_responses.insert(
                     stream_id,
                     PartialResponse {
-                        head: Some(h3_headers),
+                        // 保留時だけ所有ヘッダへ変換する（稀な経路）。
+                        head: Some(
+                            h3_headers
+                                .iter()
+                                .map(|h| h3::Header::new(h.name(), h.value()))
+                                .collect(),
+                        ),
                         body: body.map(|b| b.to_vec()).unwrap_or_default(),
                         written: 0,
                     },
@@ -2586,62 +2756,54 @@ impl Http3Handler {
         // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
         // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
         // （h2 側 `h2_sendfile` と同じ方針）。
-        let (data, mime_owned, served_path): (bytes::Bytes, String, std::path::PathBuf) =
-            match first_result {
-                Some(cache::StaticFileOutcome::File(info, data)) => {
-                    (data, info.mime_type, full_path)
-                }
-                Some(cache::StaticFileOutcome::Forbidden) => {
-                    self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    return Ok((403, 9));
-                }
-                Some(cache::StaticFileOutcome::Directory(file_info)) => {
-                    // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
-                    // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
-                    // パスにも同じ containment を渡す）。
-                    let filename = index_file.unwrap_or("index.html");
-                    let index_path = file_info.canonical_path.join(filename);
-                    match cache::get_static_file_with_content(
-                        &index_path,
-                        open_file_cache_config,
-                        &content_cfg,
-                        containment,
-                    )
-                    .await
-                    {
-                        Some(cache::StaticFileOutcome::File(info, data)) => {
-                            (data, info.mime_type, index_path)
-                        }
-                        Some(cache::StaticFileOutcome::Forbidden) | None => {
-                            self.send_error_response(stream_id, 403, b"Forbidden")?;
-                            return Ok((403, 9));
-                        }
-                        Some(cache::StaticFileOutcome::Directory(_)) => {
-                            // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
-                            // 安全側に倒して 403 とする）。
-                            self.send_error_response(stream_id, 403, b"Forbidden")?;
-                            return Ok((403, 9));
-                        }
+        let (data, mime_owned, served_path): (
+            bytes::Bytes,
+            std::sync::Arc<str>,
+            std::path::PathBuf,
+        ) = match first_result {
+            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type, full_path),
+            Some(cache::StaticFileOutcome::Forbidden) => {
+                self.send_error_response(stream_id, 403, b"Forbidden")?;
+                return Ok((403, 9));
+            }
+            Some(cache::StaticFileOutcome::Directory(file_info)) => {
+                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
+                // パスにも同じ containment を渡す）。
+                let filename = index_file.unwrap_or("index.html");
+                let index_path = file_info.canonical_path.join(filename);
+                match cache::get_static_file_with_content(
+                    &index_path,
+                    open_file_cache_config,
+                    &content_cfg,
+                    containment,
+                )
+                .await
+                {
+                    Some(cache::StaticFileOutcome::File(info, data)) => {
+                        (data, info.mime_type, index_path)
+                    }
+                    Some(cache::StaticFileOutcome::Forbidden) | None => {
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
+                    }
+                    Some(cache::StaticFileOutcome::Directory(_)) => {
+                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                        // 安全側に倒して 403 とする）。
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
                     }
                 }
-                None => {
-                    // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
-                    cache::invalidate_file_cache(&full_path);
-                    cache::invalidate_content_cache(&full_path);
-                    self.send_error_response(stream_id, 404, b"Not Found")?;
-                    return Ok((404, 9));
-                }
-            };
+            }
+            None => {
+                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                cache::invalidate_file_cache(&full_path);
+                cache::invalidate_content_cache(&full_path);
+                self.send_error_response(stream_id, 404, b"Not Found")?;
+                return Ok((404, 9));
+            }
+        };
         let mime_str: &str = &mime_owned;
-
-        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
-        let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (b"content-type".to_vec(), mime_str.as_bytes().to_vec()),
-            (b"server".to_vec(), b"veil/http3".to_vec()),
-        ];
-        for (k, v) in &security.add_response_headers {
-            header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
-        }
 
         // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
         // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
@@ -2653,18 +2815,15 @@ impl Http3Handler {
             Some(data.len()),
             None,
         );
+        let mut encoding_name: &[u8] = b"";
         let response_body: Bytes = if let Some(enc) = should_compress {
-            let encoding_name: &[u8] = match enc {
+            encoding_name = match enc {
                 AcceptedEncoding::Zstd => b"zstd",
                 AcceptedEncoding::Brotli => b"br",
                 AcceptedEncoding::Gzip => b"gzip",
                 AcceptedEncoding::Deflate => b"deflate",
                 AcceptedEncoding::Identity => b"",
             };
-            if !encoding_name.is_empty() {
-                header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
-            }
             if content_cfg.enabled {
                 let level = cache::compressed::compression_level(enc, compression);
                 cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
@@ -2678,15 +2837,36 @@ impl Http3Handler {
             data.clone()
         };
 
-        #[cfg(feature = "wasm")]
-        if let Some(modules) = wasm_modules {
-            header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+        // 応答ヘッダは借用のまま組み立てる（以前は `Vec<(Vec<u8>, Vec<u8>)>` で
+        // リクエストごとに 7〜8 回確保していた）。所有バッファが要るのは F-132 の
+        // WASM on_response_headers を適用するときだけ。
+        let mut resp_headers: Vec<(&[u8], &[u8])> =
+            Vec::with_capacity(4 + security.add_response_headers.len());
+        resp_headers.push((b"content-type", mime_str.as_bytes()));
+        resp_headers.push((b"server", b"veil/http3"));
+        for (k, v) in &security.add_response_headers {
+            resp_headers.push((k.as_bytes(), v.as_bytes()));
+        }
+        if !encoding_name.is_empty() {
+            resp_headers.push((b"content-encoding", encoding_name));
+            resp_headers.push((b"vary", b"Accept-Encoding"));
         }
 
-        let resp_headers: Vec<(&[u8], &[u8])> = header_store
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            .collect();
+        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
+        #[cfg(feature = "wasm")]
+        if let Some(modules) = wasm_modules {
+            let header_store: Vec<(Vec<u8>, Vec<u8>)> = resp_headers
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect();
+            let header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+            let owned: Vec<(&[u8], &[u8])> = header_store
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.send_response(stream_id, 200, &owned, Some(response_body.as_ref()))?;
+            return Ok((200, response_body.len()));
+        }
 
         self.send_response(stream_id, 200, &resp_headers, Some(response_body.as_ref()))?;
         Ok((200, response_body.len()))
@@ -3088,6 +3268,12 @@ fn drive_request_pump(
 ) -> bool {
     use crate::http3_stream::TrySendError;
     let mut did_work = false;
+    // バックエンドタスクが終了して本文が不要になった（チャネルが満杯のまま受信側が
+    // 閉じた場合も含む。満杯だと try_send に到達せず Closed を観測できない）。
+    if ps.req_tx.as_ref().is_some_and(|t| t.is_closed()) && !ps.req_too_large {
+        abandon_request_body(conn, stream_id, ps);
+        return true;
+    }
     let tx = match &ps.req_tx {
         Some(t) => t,
         None => return did_work,
@@ -3107,8 +3293,7 @@ fn drive_request_pump(
                 return did_work;
             }
             Err(TrySendError::Closed(_)) => {
-                ps.req_pending.clear();
-                ps.req_tx = None;
+                abandon_request_body(conn, stream_id, ps);
                 return true;
             }
         }
@@ -3147,7 +3332,7 @@ fn drive_request_pump(
                             return did_work;
                         }
                         Err(TrySendError::Closed(_)) => {
-                            ps.req_tx = None;
+                            abandon_request_body(conn, stream_id, ps);
                             return true;
                         }
                     }
@@ -3183,6 +3368,25 @@ fn drive_request_pump(
     }
 
     did_work
+}
+
+/// バックエンドタスクが要求本文を必要としなくなった（早期応答・バックエンド切断で
+/// req チャネルの受信側が閉じた）とき、要求ストリームの受信を打ち切る。
+///
+/// 以前は `req_tx` を落とすだけで `recv_body` を呼ばなくなっていたため、未受信の本文が
+/// quiche に溜まって QUIC のフロー制御ウィンドウが補充されず、**本文を送り切ってから応答を
+/// 読むクライアントは送信が止まったまま応答を受け取れず、アイドルタイムアウトまで停止した**
+/// （B-68 の 30 秒待ちの直接の原因）。RFC 9114 §4.1.1 に従い `STOP_SENDING(H3_NO_ERROR)` で
+/// 送信停止を求める（quiche は以後の受信データを破棄し、クライアントは応答を読める）。
+/// クライアントが既に本文を送り切っている（fin 受信済み）場合は何もしない。
+fn abandon_request_body(conn: &mut quiche::Connection, stream_id: u64, ps: &mut ProxyStream) {
+    /// RFC 9114 §8.1 H3_NO_ERROR
+    const H3_NO_ERROR: u64 = 0x100;
+    ps.req_pending.clear();
+    ps.req_tx = None;
+    if !ps.req_eof_seen && !conn.stream_finished(stream_id) {
+        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, H3_NO_ERROR);
+    }
 }
 
 /// レスポンス flush: resp チャネル → `send_response`/`send_body`（フロー制御 + 部分送信保持）。
@@ -3466,11 +3670,14 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
     use crate::runtime::handle::AsRawFd;
     use crate::runtime::tcp::TcpStream;
 
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。この経路は非同期 `connect_str` を
+    // 使うため `unix:` 接頭辞をそのまま扱える。
+    let addr = target.conn_addr();
+    let addr = addr.as_str();
     debug!("[HTTP/3] Async connecting to backend {}", addr);
 
     // 非同期TCP接続（タイムアウト付き）
-    let connect_future = TcpStream::connect_str(&addr);
+    let connect_future = TcpStream::connect_str(addr);
     let backend = match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
         connect_future,
@@ -3569,7 +3776,8 @@ async fn proxy_to_tls_backend_async(
     drop(tcp_stream);
 
     let skip_verify = tls_insecure;
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
+    let addr = target.conn_addr().as_str().to_string();
     let sni_name = target
         .sni_name
         .as_deref()
@@ -3641,12 +3849,12 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
+            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
+            // 同じ列挙を重複実装しない）。
+            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
-            std_stream.set_read_timeout(Some(timeout))?;
-            std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             let mut conn = rustls::ClientConnection::new(config, server_name)
@@ -3709,7 +3917,8 @@ async fn proxy_to_tls_backend_async(
     drop(tcp_stream);
 
     let skip_verify = tls_insecure;
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
+    let addr = target.conn_addr().as_str().to_string();
     let sni_name = target
         .sni_name
         .as_deref()
@@ -3778,12 +3987,12 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
+            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
+            // 同じ列挙を重複実装しない）。
+            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
-            std_stream.set_read_timeout(Some(timeout))?;
-            std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             let mut conn = rustls::ClientConnection::new(config, server_name)
@@ -4023,8 +4232,9 @@ async fn proxy_to_h2c_backend_async(
     timeout_secs: u64,
     security: &SecurityConfig,
 ) -> io::Result<BackendProxyResult> {
-    // F-41/B-74: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック整形で排除。
-    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port);
+    // F-41/B-74/F-170: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック
+    // 整形で排除しつつ、UDS バックエンド（unix:<path>）にも対応する。
+    let addr = target.conn_addr();
     let addr = addr.as_str();
 
     let from_pool;
@@ -4117,7 +4327,18 @@ async fn proxy_to_h2c_backend_async(
 }
 
 /// コネクション管理（Rc<RefCell> で共有）
-type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
+/// 接続マップ本体。キーはサーバが HMAC で導出した接続 ID（B-94）で、データグラムごとに
+/// 数回引くため、既定の SipHash ではなく乱数シード付きの foldhash を使う
+/// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは
+/// 予測不能な HMAC 出力なので、シード付きの高速ハッシュで HashDoS の心配は無い。
+type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, foldhash::quality::RandomState>;
+
+type ConnectionMap = Rc<RefCell<ConnMapInner>>;
+
+/// 接続マップのハッシャ（foldhash がプロセスごとの乱数シードを持つ）。
+fn conn_map_hasher() -> foldhash::quality::RandomState {
+    foldhash::quality::RandomState::default()
+}
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
 ///
@@ -4290,15 +4511,15 @@ pub async fn run_http3_server_async(
     });
 
     // コネクション管理
-    let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
+    let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::with_hasher(conn_map_hasher())));
 
     // F-32: バックエンドタスク → メインループの起床通知（全ハンドラ/タスクで共有）。
     let notify = crate::http3_stream::H3Notify::new();
     // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
     let backend_spawner = crate::http3_stream::backend_task_spawner();
 
-    // 乱数生成器
-    let rng = SystemRandom::new();
+    // B-94: サーバ接続 ID 導出鍵（プロセスで 1 個。初回アクセス時に乱数で生成）。
+    let cid_key: &hmac::Key = &SERVER_CID_KEY;
 
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
 
@@ -4546,7 +4767,7 @@ pub async fn run_http3_server_async(
                                             payload,
                                             meta.from,
                                             meta.gro_segment_size,
-                                            &rng,
+                                            cid_key,
                                             &quic_config,
                                             local_addr,
                                             &notify,
@@ -4622,7 +4843,7 @@ pub async fn run_http3_server_async(
                     &mut recv_buf[..first_total],
                     first_gro.from,
                     first_gro.gro_segment_size,
-                    &rng,
+                    cid_key,
                     &quic_config,
                     local_addr,
                     &notify,
@@ -4650,7 +4871,7 @@ pub async fn run_http3_server_async(
                             &mut mmsg_scratch.buf_mut(i)[..len],
                             from,
                             gro,
-                            &rng,
+                            cid_key,
                             &quic_config,
                             local_addr,
                             &notify,
@@ -4733,7 +4954,7 @@ pub async fn run_http3_server_async(
                 }
 
                 // タイマー再登録（コネクション処理直後）。
-                schedule_timer(handler, &cid, Instant::now(), &mut timers);
+                schedule_timer(handler, &cid, &mut timers);
 
                 if did_work {
                     // まだ仕事が残っている可能性 → dirty のまま維持して再投入する。
@@ -4870,11 +5091,7 @@ fn mark_dirty_flag<T: Clone>(dirty: &mut bool, queue: &mut VecDeque<T>, id: &T) 
 /// 呼び出し元が既に対象 `Http3Handler` を可変借用している場合はこの関数を使わず、
 /// `mark_dirty_flag(&mut handler.dirty, queue, key)` を直接呼ぶ（`conns` の二重借用を避ける
 /// ため。`process_datagram_segments` の受信直後の呼び出し箇所を参照）。
-fn mark_dirty(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
-    queue: &mut VecDeque<ConnKey>,
-    key: &ConnKey,
-) {
+fn mark_dirty(conns: &mut ConnMapInner, queue: &mut VecDeque<ConnKey>, key: &ConnKey) {
     // `ConnKey` = `Rc<ConnectionId>` を `&**key` で deref し、HashMap キー（素の
     // `ConnectionId<'static>`）としてルックアップする。
     if let Some(h) = conns.get_mut(&**key) {
@@ -4884,15 +5101,23 @@ fn mark_dirty(
 
 /// コネクション処理直後にタイマーヒープへ次回期限を登録する（遅延削除方式）。
 ///
-/// `conn.timeout()` が `None`（アイドル/未確立等）の場合は `H3_DEFAULT_TIMER` をフォール
-/// バックとして使う。
+/// `conn.timeout_instant()` が `None`（アイドル/未確立等）の場合は `H3_DEFAULT_TIMER` を
+/// フォールバックとして使う。
+///
+/// ダーティ接続ごと・イテレーションごとに呼ばれるため時刻を読まない: quiche の
+/// `timeout()` は内部で `Instant::now()` を読んで残り時間に変換するので、従来の
+/// `Instant::now() + conn.timeout()` は 1 回あたり時刻読み取り 2 回だった
+/// （FreeBSD aarch64 の HTTP/3 プロファイルで `__vdso_gettc` が最上位）。
+/// 期限の絶対時刻 `timeout_instant()` をそのまま使えば同じ値になる。
 fn schedule_timer(
     handler: &mut Http3Handler,
     key: &ConnKey,
-    now: Instant,
     timers: &mut BinaryHeap<Reverse<TimerKey>>,
 ) {
-    let deadline = now + handler.conn.timeout().unwrap_or(H3_DEFAULT_TIMER);
+    let deadline = match handler.conn.timeout_instant() {
+        Some(t) => t,
+        None => Instant::now() + H3_DEFAULT_TIMER,
+    };
     handler.timer_deadline = Some(deadline);
     timers.push(Reverse(TimerKey(deadline, key.clone())));
 }
@@ -4903,7 +5128,7 @@ fn schedule_timer(
 /// `on_timeout` する走査（従来方式）を廃止する。遅延削除方式: pop したエントリの期限が
 /// 現在の `timer_deadline` と一致しなければ（期限が更新済みの古いエントリ）無視して捨てる。
 fn expire_due_timers(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     timers: &mut BinaryHeap<Reverse<TimerKey>>,
     dirty_queue: &mut VecDeque<ConnKey>,
     now: Instant,
@@ -4944,7 +5169,7 @@ fn expire_due_timers(
 /// 「flag はまだ true → push されない」まま消えてしまう（取りこぼし）。
 fn drain_wake_queue(
     wake_queue: &crate::http3_stream::WakeQueue,
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     dirty_queue: &mut VecDeque<ConnKey>,
 ) {
     // borrow は drain 中だけ（`mark_dirty` は `wake_queue` に触れないため二重借用にならない）。
@@ -4980,13 +5205,37 @@ fn drain_wake_queue(
 /// 削減したかった固定費を上回りかねない。recv した接続は必ずダーティ化されるため、
 /// **同一イテレーション内のダーティ処理ループ**（呼び出し元のメインループ）で
 /// `schedule_timer` が接続ごとに高々 1 回だけ呼ばれ、タイマーの再登録は漏れなく行われる。
+/// B-94: サーバ接続 ID の導出鍵（プロセス全体で 1 個）。
+///
+/// SO_REUSEPORT で同じ 4-tuple は同じワーカーへ届くが、ワーカー間で鍵を分ける理由は無いので
+/// プロセスで共有する（`cbpf` 振り分け等で 4-tuple とワーカーの対応が変わっても同じ SCID になる）。
+static SERVER_CID_KEY: once_cell::sync::Lazy<hmac::Key> = once_cell::sync::Lazy::new(|| {
+    let mut seed = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut seed)
+        .expect("HTTP/3: failed to generate connection ID key");
+    hmac::Key::new(hmac::HMAC_SHA256, &seed)
+});
+
+/// B-94: クライアントの元 DCID からサーバ接続 ID（`MAX_CONN_ID_LEN` バイト）を導出する。
+///
+/// quiche のサンプルサーバと同じ方式（秘密鍵つき HMAC なので外部から予測できない）。
+/// 呼ばれるのは「未知の DCID を持つ Initial パケット」だけで、確立済み接続の
+/// データグラムでは呼ばれない（ハンドシェイク中だけのコスト）。
+fn derive_server_cid(key: &hmac::Key, client_dcid: &[u8]) -> [u8; quiche::MAX_CONN_ID_LEN] {
+    let tag = hmac::sign(key, client_dcid);
+    let mut cid = [0u8; quiche::MAX_CONN_ID_LEN];
+    cid.copy_from_slice(&tag.as_ref()[..quiche::MAX_CONN_ID_LEN]);
+    cid
+}
+
 #[allow(clippy::too_many_arguments)] // F-151: ダーティ集合/起床キューの受け渡しで増加（ホットパスの単一呼び出し経路）
 fn process_datagram_segments(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     data: &mut [u8],
     from: SocketAddr,
     gro_segment_size: Option<u16>,
-    rng: &SystemRandom,
+    cid_key: &hmac::Key,
     quic_config: &Rc<RefCell<quiche::Config>>,
     local_addr: SocketAddr,
     notify: &crate::http3_stream::H3Notify,
@@ -5029,38 +5278,54 @@ fn process_datagram_segments(
                         continue;
                     }
 
-                    // 新規コネクション
-                    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                    rng.fill(&mut scid)
-                        .map_err(|_| io::Error::other("RNG error"))?;
-                    let scid = ConnectionId::from_ref(&scid).into_owned();
+                    // B-94: サーバ接続 ID はクライアントの元 DCID から決定的に導出する。
+                    // クライアントはサーバの最初の応答を受け取るまで Initial を元 DCID 宛てに
+                    // 送り続ける（PTO による再送・複数パケットにまたがる ClientHello）。
+                    // 乱数で SCID を作っていた頃は、それらが届くたびに別の新規接続を
+                    // `accept` していた（孤児接続が増え、クライアントには SCID の異なる
+                    // 2 つのサーバ接続から応答が届いてハンドシェイクが崩れる）。
+                    let derived = derive_server_cid(cid_key, &hdr.dcid);
+                    let derived_ref = ConnectionId::from_ref(&derived);
+                    if conns.contains_key(&derived_ref) {
+                        let cid = derived_ref.into_owned();
+                        prev_cid = Some(cid.clone());
+                        cid
+                    } else {
+                        // 新規コネクション
+                        let scid = derived_ref.into_owned();
 
-                    let mut config_ref = quic_config.borrow_mut();
-                    let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                        let mut config_ref = quic_config.borrow_mut();
+                        let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
 
-                    debug!("[HTTP/3] New connection from {}", from);
+                        debug!("[HTTP/3] New connection from {}", from);
 
-                    // F-151（レビュー修正）: 接続 ID の Rc ハンドルは接続の生成時に 1 度だけ
-                    // 作る（以降はこの Rc を clone するだけで malloc なしに使い回せる）。
-                    let key: ConnKey = Rc::new(scid.clone());
-                    // この接続専用の ConnWaker を組み立てる（cid を積んでから notify() する
-                    // per-connection 通知）。
-                    let waker = crate::http3_stream::ConnWaker::new(
-                        key.clone(),
-                        wake_queue.clone(),
-                        notify.clone(),
-                    );
-                    let mut handler =
-                        Http3Handler::new(conn, from, waker, backend_spawner.clone(), key.clone());
-                    // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
-                    // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
-                    handler.dirty = true;
-                    conns.insert(scid.clone(), handler);
-                    dirty_queue.push_back(key);
+                        // F-151（レビュー修正）: 接続 ID の Rc ハンドルは接続の生成時に 1 度だけ
+                        // 作る（以降はこの Rc を clone するだけで malloc なしに使い回せる）。
+                        let key: ConnKey = Rc::new(scid.clone());
+                        // この接続専用の ConnWaker を組み立てる（cid を積んでから notify() する
+                        // per-connection 通知）。
+                        let waker = crate::http3_stream::ConnWaker::new(
+                            key.clone(),
+                            wake_queue.clone(),
+                            notify.clone(),
+                        );
+                        let mut handler = Http3Handler::new(
+                            conn,
+                            from,
+                            waker,
+                            backend_spawner.clone(),
+                            key.clone(),
+                        );
+                        // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
+                        // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
+                        handler.dirty = true;
+                        conns.insert(scid.clone(), handler);
+                        dirty_queue.push_back(key);
 
-                    prev_cid = Some(scid.clone());
-                    scid
+                        prev_cid = Some(scid.clone());
+                        scid
+                    }
                 } else {
                     let cid = hdr.dcid.into_owned();
                     prev_cid = Some(cid.clone());
@@ -5713,6 +5978,179 @@ fn parse_status_code(header: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
+        h3_check_field_section(fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))
+    }
+
+    const GOOD: [(&str, &str); 4] = [
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "example.com"),
+        (":path", "/"),
+    ];
+
+    #[test]
+    fn test_h3_field_section_accepts_valid_request_and_trailers() {
+        assert_eq!(check(&GOOD), Ok(H3FieldSection::Request));
+        let mut with_regular = GOOD.to_vec();
+        with_regular.push(("user-agent", "x"));
+        with_regular.push(("te", "trailers"));
+        assert_eq!(check(&with_regular), Ok(H3FieldSection::Request));
+        // :authority は Host で代替できる。
+        assert_eq!(
+            check(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                ("host", "example.com"),
+            ]),
+            Ok(H3FieldSection::Request)
+        );
+        assert_eq!(
+            check(&[(":method", "CONNECT"), (":authority", "example.com:443")]),
+            Ok(H3FieldSection::Request)
+        );
+        assert_eq!(check(&[("grpc-status", "0")]), Ok(H3FieldSection::NoPseudo));
+        assert_eq!(check(&[]), Ok(H3FieldSection::NoPseudo));
+    }
+
+    #[test]
+    fn test_h3_field_section_rejects_malformed_requests() {
+        // h3spec: duplicated / absent / prohibited / after regular fields
+        let mut dup = GOOD.to_vec();
+        dup.insert(1, (":method", "GET"));
+        assert!(check(&dup).is_err());
+        assert!(check(&[(":scheme", "https"), (":path", "/")]).is_err());
+        assert!(check(&[(":method", "GET"), (":path", "/")]).is_err());
+        // https なのに :authority も Host も無い
+        assert!(check(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]).is_err());
+        assert!(check(&[(":method", "GET"), (":scheme", "https")]).is_err());
+        let mut status = GOOD.to_vec();
+        status.push((":status", "200"));
+        assert!(check(&status).is_err());
+        let mut protocol = GOOD.to_vec();
+        protocol.push((":protocol", "websocket"));
+        assert!(check(&protocol).is_err());
+        assert!(check(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            ("user-agent", "x"),
+            (":path", "/"),
+        ])
+        .is_err());
+        // その他の malformed
+        let mut empty_path = GOOD.to_vec();
+        empty_path[3] = (":path", "");
+        assert!(check(&empty_path).is_err());
+        for bad in [
+            ("Host", "example.com"),
+            ("connection", "close"),
+            ("transfer-encoding", "chunked"),
+            ("te", "gzip"),
+        ] {
+            let mut v = GOOD.to_vec();
+            v.push(bad);
+            assert!(check(&v).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(check(&[
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "a")
+        ])
+        .is_err());
+        assert!(check(&[(":method", "CONNECT")]).is_err());
+    }
+
+    #[test]
+    fn test_b94_derive_server_cid_is_deterministic_and_keyed() {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"0123456789abcdef0123456789abcdef");
+        let other = hmac::Key::new(hmac::HMAC_SHA256, b"fedcba9876543210fedcba9876543210");
+        let a = derive_server_cid(&key, b"client-dcid-1");
+        assert_eq!(a, derive_server_cid(&key, b"client-dcid-1"));
+        assert_ne!(a, derive_server_cid(&key, b"client-dcid-2"));
+        assert_ne!(a, derive_server_cid(&other, b"client-dcid-1"));
+        assert_eq!(a.len(), quiche::MAX_CONN_ID_LEN);
+    }
+
+    /// B-94: 同じ元 DCID の Initial が 2 回届いても（クライアントの PTO 再送・複数パケットに
+    /// またがる ClientHello）新規接続は 1 つだけ作られる。修正前は届くたびに乱数 SCID で
+    /// 別接続を `accept` していた。
+    #[test]
+    fn test_b94_retransmitted_initial_maps_to_same_connection() {
+        // tests/fixtures はコンテナビルドのコンテキストに含まれないため、その場で生成する。
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        let client_scid = ConnectionId::from_ref(&[7u8; 16]);
+        let client_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &client_scid,
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let mut initial = vec![0u8; 1500];
+        let (len, _) = client.send(&mut initial).unwrap();
+        initial.truncate(len);
+
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        for round in 0..2 {
+            if round == 1 {
+                // 1 回目で作られた接続に目印を付ける（作り直されると消える）。
+                let h = conns.values_mut().next().unwrap();
+                h.stream_bodies.insert(u64::MAX, Default::default());
+            }
+            let mut pkt = initial.clone();
+            process_datagram_segments(
+                &mut conns,
+                &mut pkt,
+                client_addr,
+                None,
+                &key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            conns.len(),
+            1,
+            "retransmitted Initial must not create a 2nd connection"
+        );
+        // 2 回目は**既存の接続へ**届いていること（同じキーで作り直して最初の
+        // ハンドシェイク状態を捨てていないこと）。
+        let handler = conns.values().next().unwrap();
+        assert!(
+            handler.stream_bodies.contains_key(&u64::MAX),
+            "the 2nd datagram must be delivered to the existing connection"
+        );
+    }
 
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり
     /// データグラム drain 上限）の既定値とクランプ範囲。

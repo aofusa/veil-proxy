@@ -3,10 +3,9 @@
 //! `Table` is to WebAssembly tables what `LinearMemory` is to WebAssembly linear memories.
 
 use crate::prelude::*;
-use crate::runtime::store::StoreResourceLimiter;
 use crate::runtime::vm::stack_switching::VMContObj;
 use crate::runtime::vm::vmcontext::{VMFuncRef, VMTableDefinition};
-use crate::runtime::vm::{GcStore, SendSyncPtr, VMGcRef, VmPtr};
+use crate::runtime::vm::{GcStore, SendSyncPtr, VMGcRef, VMStore, VmPtr};
 use core::alloc::Layout;
 use core::mem;
 use core::ops::Range;
@@ -17,6 +16,27 @@ use wasmtime_environ::{
     FUNCREF_INIT_BIT, FUNCREF_MASK, IndexType, Trap, Tunables, WasmHeapTopType, WasmRefType,
 };
 
+/// An element going into or coming out of a table.
+///
+/// Table elements are stored as pointers and are default-initialized with
+/// `ptr::null_mut`.
+pub enum TableElement {
+    /// A `funcref`.
+    FuncRef(Option<NonNull<VMFuncRef>>),
+
+    /// A GC reference.
+    GcRef(Option<VMGcRef>),
+
+    /// An uninitialized funcref value. This should never be exposed
+    /// beyond the `wasmtime` crate boundary; the upper-level code
+    /// (which has access to the info needed for lazy initialization)
+    /// will replace it when fetched.
+    UninitFunc,
+
+    /// A `contref`
+    ContRef(Option<VMContObj>),
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum TableElementType {
     Func,
@@ -25,6 +45,15 @@ pub enum TableElementType {
 }
 
 impl TableElementType {
+    fn matches(&self, val: &TableElement) -> bool {
+        match (val, self) {
+            (TableElement::FuncRef(_), TableElementType::Func) => true,
+            (TableElement::GcRef(_), TableElementType::GcRef) => true,
+            (TableElement::ContRef(_), TableElementType::Cont) => true,
+            _ => false,
+        }
+    }
+
     /// Returns the size required to actually store an element of this particular type
     pub fn element_size(&self) -> usize {
         match self {
@@ -32,6 +61,72 @@ impl TableElementType {
             TableElementType::GcRef => core::mem::size_of::<Option<VMGcRef>>(),
             TableElementType::Cont => core::mem::size_of::<ContTableElem>(),
         }
+    }
+}
+
+// The usage of `*mut VMFuncRef` is safe w.r.t. thread safety, this just relies
+// on thread-safety of `VMGcRef` itself.
+unsafe impl Send for TableElement where VMGcRef: Send {}
+unsafe impl Sync for TableElement where VMGcRef: Sync {}
+
+impl TableElement {
+    /// Consumes a table element into a pointer/reference, as it
+    /// exists outside the table itself. This strips off any tag bits
+    /// or other information that only lives inside the table.
+    ///
+    /// Can only be done to an initialized table element; lazy init
+    /// must occur first. (In other words, lazy values do not survive
+    /// beyond the table, as every table read path initializes them.)
+    ///
+    /// # Safety
+    ///
+    /// The same warnings as for `into_table_values()` apply.
+    pub(crate) unsafe fn into_func_ref_asserting_initialized(self) -> Option<NonNull<VMFuncRef>> {
+        match self {
+            Self::FuncRef(e) => e,
+            Self::UninitFunc => panic!("Uninitialized table element value outside of table slot"),
+            Self::GcRef(_) => panic!("GC reference is not a function reference"),
+            Self::ContRef(_) => panic!("Continuation reference is not a function reference"),
+        }
+    }
+
+    /// Indicates whether this value is the "uninitialized element"
+    /// value.
+    pub(crate) fn is_uninit(&self) -> bool {
+        match self {
+            Self::UninitFunc => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<Option<NonNull<VMFuncRef>>> for TableElement {
+    fn from(f: Option<NonNull<VMFuncRef>>) -> TableElement {
+        TableElement::FuncRef(f)
+    }
+}
+
+impl From<Option<VMGcRef>> for TableElement {
+    fn from(x: Option<VMGcRef>) -> TableElement {
+        TableElement::GcRef(x)
+    }
+}
+
+impl From<VMGcRef> for TableElement {
+    fn from(x: VMGcRef) -> TableElement {
+        TableElement::GcRef(Some(x))
+    }
+}
+
+impl From<Option<VMContObj>> for TableElement {
+    fn from(c: Option<VMContObj>) -> TableElement {
+        TableElement::ContRef(c)
+    }
+}
+
+impl From<VMContObj> for TableElement {
+    fn from(c: VMContObj) -> TableElement {
+        TableElement::ContRef(Some(c))
     }
 }
 
@@ -53,6 +148,8 @@ impl TableElementType {
 struct MaybeTaggedFuncRef(Option<VmPtr<VMFuncRef>>);
 
 impl MaybeTaggedFuncRef {
+    const UNINIT: MaybeTaggedFuncRef = MaybeTaggedFuncRef(None);
+
     /// Converts the given `ptr`, a valid funcref pointer, into a tagged pointer
     /// by adding in the `FUNCREF_INIT_BIT`.
     fn from(ptr: Option<NonNull<VMFuncRef>>, lazy_init: bool) -> Self {
@@ -69,14 +166,16 @@ impl MaybeTaggedFuncRef {
 
     /// Converts a tagged pointer into a `TableElement`, returning `UninitFunc`
     /// for null (not a tagged value) or `FuncRef` for otherwise tagged values.
-    fn into_funcref(self, lazy_init: bool) -> Option<Option<NonNull<VMFuncRef>>> {
+    fn into_table_element(self, lazy_init: bool) -> TableElement {
         let ptr = self.0;
         if lazy_init && ptr.is_none() {
-            None
+            TableElement::UninitFunc
         } else {
             // Masking off the tag bit is harmless whether the table uses lazy
             // init or not.
-            Some(ptr.and_then(|ptr| NonNull::new(ptr.as_ptr().map_addr(|a| a & FUNCREF_MASK))))
+            let unmasked =
+                ptr.and_then(|ptr| NonNull::new(ptr.as_ptr().map_addr(|a| a & FUNCREF_MASK)));
+            TableElement::FuncRef(unmasked)
         }
     }
 }
@@ -309,7 +408,9 @@ unsafe fn alloc_dynamic_table_elements<T>(len: usize) -> Result<Vec<Option<T>>> 
 
     let size = mem::size_of::<Option<T>>();
     let size = size.next_multiple_of(align);
-    let size = size.checked_mul(len).unwrap();
+    let size = size
+        .checked_mul(len)
+        .ok_or_else(|| format_err!("overflow calculating table allocation size"))?;
 
     let layout = Layout::from_size_align(size, align)?;
 
@@ -324,12 +425,12 @@ unsafe fn alloc_dynamic_table_elements<T>(len: usize) -> Result<Vec<Option<T>>> 
 
 impl Table {
     /// Create a new dynamic (movable) table instance for the specified table plan.
-    pub async fn new_dynamic(
+    pub fn new_dynamic(
         ty: &wasmtime_environ::Table,
         tunables: &Tunables,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: &mut dyn VMStore,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, store)?;
         match wasm_to_table_type(ty.ref_type) {
             TableElementType::Func => Ok(Self::from(DynamicFuncTable {
                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
@@ -348,13 +449,13 @@ impl Table {
     }
 
     /// Create a new static (immovable) table instance for the specified table plan.
-    pub async unsafe fn new_static(
+    pub unsafe fn new_static(
         ty: &wasmtime_environ::Table,
         tunables: &Tunables,
         data: SendSyncPtr<[u8]>,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: &mut dyn VMStore,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, store)?;
         let size = minimum;
         let max = maximum.unwrap_or(usize::MAX);
 
@@ -435,9 +536,9 @@ impl Table {
     // Calls the `store`'s limiter to optionally prevent the table from being created.
     //
     // Returns the minimum and maximum size of the table if the table can be created.
-    async fn limit_new(
+    fn limit_new(
         ty: &wasmtime_environ::Table,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: &mut dyn VMStore,
     ) -> Result<(usize, Option<usize>)> {
         // No matter how the table limits are specified
         // The table size is limited by the host's pointer size
@@ -458,16 +559,11 @@ impl Table {
         };
 
         // Inform the store's limiter what's about to happen.
-        if let Some(limiter) = limiter {
-            if !limiter
-                .table_growing(0, minimum.unwrap_or(absolute_max), maximum)
-                .await?
-            {
-                bail!(
-                    "table minimum size of {} elements exceeds table limits",
-                    ty.limits.min
-                );
-            }
+        if !store.table_growing(0, minimum.unwrap_or(absolute_max), maximum)? {
+            bail!(
+                "table minimum size of {} elements exceeds table limits",
+                ty.limits.min
+            );
         }
 
         // At this point we need to actually handle overflows, so bail out with
@@ -533,54 +629,67 @@ impl Table {
         }
     }
 
+    /// Initializes the contents of this table to the specified function
+    ///
+    /// # Panics
+    ///
+    /// Panics if the table is not a function table.
+    pub fn init_func(
+        &mut self,
+        dst: u64,
+        items: impl ExactSizeIterator<Item = Option<NonNull<VMFuncRef>>>,
+    ) -> Result<(), Trap> {
+        let dst = usize::try_from(dst).map_err(|_| Trap::TableOutOfBounds)?;
+
+        let (funcrefs, lazy_init) = self.funcrefs_mut();
+        let elements = funcrefs
+            .get_mut(dst..)
+            .and_then(|s| s.get_mut(..items.len()))
+            .ok_or(Trap::TableOutOfBounds)?;
+
+        for (item, slot) in items.zip(elements) {
+            *slot = MaybeTaggedFuncRef::from(item, lazy_init);
+        }
+        Ok(())
+    }
+
+    /// Fill `table[dst..]` with values from `items`
+    ///
+    /// Returns a trap error on out-of-bounds accesses.
+    pub fn init_gc_refs(
+        &mut self,
+        dst: u64,
+        items: impl ExactSizeIterator<Item = Option<VMGcRef>>,
+    ) -> Result<(), Trap> {
+        let dst = usize::try_from(dst).map_err(|_| Trap::TableOutOfBounds)?;
+
+        let elements = self
+            .gc_refs_mut()
+            .get_mut(dst..)
+            .and_then(|s| s.get_mut(..items.len()))
+            .ok_or(Trap::TableOutOfBounds)?;
+
+        for (item, slot) in items.zip(elements) {
+            *slot = item;
+        }
+        Ok(())
+    }
+
     /// Fill `table[dst..dst + len]` with `val`.
     ///
     /// Returns a trap error on out-of-bounds accesses.
     ///
     /// # Panics
     ///
-    /// Panics if `val` does not have a type that matches this table.
-    pub fn fill_func(
-        &mut self,
-        dst: u64,
-        val: Option<NonNull<VMFuncRef>>,
-        len: u64,
-    ) -> Result<(), Trap> {
-        let range = self.validate_fill(dst, len)?;
-        let (funcrefs, lazy_init) = self.funcrefs_mut();
-        funcrefs[range].fill(MaybeTaggedFuncRef::from(val, lazy_init));
-        Ok(())
-    }
-
-    /// Same as [`Self::fill_func`], but for GC references.
-    ///
-    /// # Panics
-    ///
-    /// Also panics if `gc_store.is_none()` and it's needed.
-    pub fn fill_gc_ref(
+    /// Panics if `val` does not have a type that matches this table, or if
+    /// `gc_store.is_none()` and this is a table of GC references.
+    pub fn fill(
         &mut self,
         mut gc_store: Option<&mut GcStore>,
         dst: u64,
-        val: Option<&VMGcRef>,
+        val: TableElement,
         len: u64,
     ) -> Result<(), Trap> {
-        let range = self.validate_fill(dst, len)?;
-
-        // Clone the init GC reference into each table slot.
-        for slot in &mut self.gc_refs_mut()[range] {
-            GcStore::write_gc_ref_optional_store(gc_store.as_deref_mut(), slot, val);
-        }
-
-        Ok(())
-    }
-    /// Same as [`Self::fill_func`], but for continuations.
-    pub fn fill_cont(&mut self, dst: u64, val: Option<VMContObj>, len: u64) -> Result<(), Trap> {
-        let range = self.validate_fill(dst, len)?;
-        self.contrefs_mut()[range].fill(val);
-        Ok(())
-    }
-
-    fn validate_fill(&mut self, dst: u64, len: u64) -> Result<Range<usize>, Trap> {
         let start = usize::try_from(dst).map_err(|_| Trap::TableOutOfBounds)?;
         let len = usize::try_from(len).map_err(|_| Trap::TableOutOfBounds)?;
         let end = start
@@ -590,7 +699,45 @@ impl Table {
         if end > self.size() {
             return Err(Trap::TableOutOfBounds);
         }
-        Ok(start..end)
+
+        match val {
+            TableElement::FuncRef(f) => {
+                let (funcrefs, lazy_init) = self.funcrefs_mut();
+                funcrefs[start..end].fill(MaybeTaggedFuncRef::from(f, lazy_init));
+            }
+            TableElement::GcRef(r) => {
+                // Clone the init GC reference into each table slot.
+                for slot in &mut self.gc_refs_mut()[start..end] {
+                    match gc_store.as_deref_mut() {
+                        Some(s) => s.write_gc_ref(slot, r.as_ref()),
+                        None => {
+                            debug_assert!(slot.as_ref().is_none_or(|x| x.is_i31()));
+                            debug_assert!(r.as_ref().is_none_or(|r| r.is_i31()));
+                            *slot = r.as_ref().map(|r| r.copy_i31());
+                        }
+                    }
+                }
+
+                // Drop the init GC reference, since we aren't holding onto this
+                // reference anymore, only the clones in the table.
+                if let Some(r) = r {
+                    match gc_store {
+                        Some(s) => s.drop_gc_ref(r),
+                        None => debug_assert!(r.is_i31()),
+                    }
+                }
+            }
+            TableElement::UninitFunc => {
+                let (funcrefs, _lazy_init) = self.funcrefs_mut();
+                funcrefs[start..end].fill(MaybeTaggedFuncRef::UNINIT);
+            }
+            TableElement::ContRef(c) => {
+                let contrefs = self.contrefs_mut();
+                contrefs[start..end].fill(c);
+            }
+        }
+
+        Ok(())
     }
 
     /// Grow table by the specified amount of elements.
@@ -613,50 +760,11 @@ impl Table {
     ///
     /// Generally, prefer using `InstanceHandle::table_grow`, which encapsulates
     /// this unsafety.
-    pub async unsafe fn grow_func(
-        &mut self,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
-        delta: u64,
-        init_value: Option<SendSyncPtr<VMFuncRef>>,
-    ) -> Result<Option<usize>, Error> {
-        self._grow(delta, limiter, |me, base, len| {
-            me.fill_func(base, init_value.map(|p| p.as_non_null()), len)
-        })
-        .await
-    }
-
-    /// Same as [`Self::grow_func`], but for GC references.
-    pub async unsafe fn grow_gc_ref(
-        &mut self,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
-        gc_store: Option<&mut GcStore>,
-        delta: u64,
-        init_value: Option<&VMGcRef>,
-    ) -> Result<Option<usize>, Error> {
-        self._grow(delta, limiter, |me, base, len| {
-            me.fill_gc_ref(gc_store, base, init_value, len)
-        })
-        .await
-    }
-
-    /// Same as [`Self::grow_func`], but for continuations.
-    pub async unsafe fn grow_cont(
-        &mut self,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
-        delta: u64,
-        init_value: Option<VMContObj>,
-    ) -> Result<Option<usize>, Error> {
-        self._grow(delta, limiter, |me, base, len| {
-            me.fill_cont(base, init_value, len)
-        })
-        .await
-    }
-
-    async fn _grow(
+    pub unsafe fn grow(
         &mut self,
         delta: u64,
-        mut limiter: Option<&mut StoreResourceLimiter<'_>>,
-        fill: impl FnOnce(&mut Self, u64, u64) -> Result<(), Trap>,
+        init_value: TableElement,
+        store: &mut dyn VMStore,
     ) -> Result<Option<usize>, Error> {
         let old_size = self.size();
 
@@ -670,21 +778,13 @@ impl Table {
         let new_size = match old_size.checked_add(delta) {
             Some(s) => s,
             None => {
-                if let Some(limiter) = limiter {
-                    limiter
-                        .table_grow_failed(format_err!("overflow calculating new table size"))?;
-                }
+                store.table_grow_failed(format_err!("overflow calculating new table size"))?;
                 return Ok(None);
             }
         };
 
-        if let Some(limiter) = &mut limiter {
-            if !limiter
-                .table_growing(old_size, new_size, self.maximum())
-                .await?
-            {
-                return Ok(None);
-            }
+        if !store.table_growing(old_size, new_size, self.maximum())? {
+            return Ok(None);
         }
 
         // The WebAssembly spec requires failing a `table.grow` request if
@@ -692,12 +792,12 @@ impl Table {
         // limits in the instance allocator as well.
         if let Some(max) = self.maximum() {
             if new_size > max {
-                if let Some(limiter) = limiter {
-                    limiter.table_grow_failed(format_err!("Table maximum size exceeded"))?;
-                }
+                store.table_grow_failed(format_err!("Table maximum size exceeded"))?;
                 return Ok(None);
             }
         }
+
+        debug_assert!(self.type_matches(&init_value));
 
         // First resize the storage and then fill with the init value
         match self {
@@ -728,19 +828,23 @@ impl Table {
             // that delta is non-zero and the new size doesn't exceed the
             // maximum mean we can't get here.
             Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, .. })) => {
+                vec_reserve_resize(elements, new_size)?;
                 elements.resize(new_size, None);
             }
             Table::Dynamic(DynamicTable::GcRef(DynamicGcRefTable { elements, .. })) => {
+                vec_reserve_resize(elements, new_size)?;
                 elements.resize_with(new_size, || None);
             }
             Table::Dynamic(DynamicTable::Cont(DynamicContTable { elements, .. })) => {
+                vec_reserve_resize(elements, new_size)?;
                 elements.resize(new_size, None);
             }
         }
 
-        fill(
-            self,
+        self.fill(
+            store.store_opaque_mut().optional_gc_store_mut(),
             u64::try_from(old_size).unwrap(),
+            init_value,
             u64::try_from(delta).unwrap(),
         )
         .expect("table should not be out of bounds");
@@ -750,44 +854,33 @@ impl Table {
 
     /// Get reference to the specified element.
     ///
-    /// Returns `Ok(None)` if the element is null or uninitialized.
-    /// Returns `Err` if the index is out of bounds.
+    /// Returns `None` if the index is out of bounds.
     ///
     /// Panics if this is a table of GC references and `gc_store` is `None`.
-    pub fn get_func(&self, index: u64) -> Result<Option<NonNull<VMFuncRef>>, Trap> {
-        match self.get_func_maybe_init(index)? {
-            Some(elem) => Ok(elem),
-            None => panic!("function index should have been initialized"),
+    pub fn get(&self, gc_store: Option<&mut GcStore>, index: u64) -> Option<TableElement> {
+        let index = usize::try_from(index).ok()?;
+        match self.element_type() {
+            TableElementType::Func => {
+                let (funcrefs, lazy_init) = self.funcrefs();
+                funcrefs
+                    .get(index)
+                    .copied()
+                    .map(|e| e.into_table_element(lazy_init))
+            }
+            TableElementType::GcRef => self.gc_refs().get(index).map(|r| {
+                let r = r.as_ref().map(|r| match gc_store {
+                    Some(s) => s.clone_gc_ref(r),
+                    None => r.copy_i31(),
+                });
+
+                TableElement::GcRef(r)
+            }),
+            TableElementType::Cont => self
+                .contrefs()
+                .get(index)
+                .copied()
+                .map(|e| TableElement::ContRef(e)),
         }
-    }
-
-    /// Same as [`Self::get_func`], except plumbs through the uninitialized
-    /// variant of functions too as `Ok(None)`. An initialized function element
-    /// is `Ok(Some(element))`
-    pub fn get_func_maybe_init(
-        &self,
-        index: u64,
-    ) -> Result<Option<Option<NonNull<VMFuncRef>>>, Trap> {
-        let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
-        let (funcrefs, lazy_init) = self.funcrefs();
-        Ok(funcrefs
-            .get(index)
-            .ok_or(Trap::TableOutOfBounds)?
-            .into_funcref(lazy_init))
-    }
-
-    /// Same as [`Self::get_func`], but for GC references.
-    pub fn get_gc_ref(&self, index: u64) -> Result<Option<&VMGcRef>, Trap> {
-        let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
-        let gcref = self.gc_refs().get(index).ok_or(Trap::TableOutOfBounds)?;
-        Ok(gcref.as_ref())
-    }
-
-    /// Same as [`Self::get_func`], but for continuations.
-    pub fn get_cont(&self, index: u64) -> Result<Option<VMContObj>, Trap> {
-        let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
-        let cont = self.contrefs().get(index).ok_or(Trap::TableOutOfBounds)?;
-        Ok(*cont)
     }
 
     /// Set reference to the specified element.
@@ -800,28 +893,24 @@ impl Table {
     /// # Panics
     ///
     /// Panics if `elem` is not of the right type for this table.
-    pub fn set_func(&mut self, index: u64, elem: Option<NonNull<VMFuncRef>>) -> Result<(), Trap> {
-        let trap = Trap::TableOutOfBounds;
-        let index: usize = index.try_into().map_err(|_| trap)?;
-        let (funcrefs, lazy_init) = self.funcrefs_mut();
-        *funcrefs.get_mut(index).ok_or(trap)? = MaybeTaggedFuncRef::from(elem, lazy_init);
-        Ok(())
-    }
-
-    /// Same as [`Self::set_func`] except for GC references.
-    pub fn set_gc_ref(
-        &mut self,
-        store: Option<&mut GcStore>,
-        index: u64,
-        elem: Option<&VMGcRef>,
-    ) -> Result<(), Trap> {
-        let trap = Trap::TableOutOfBounds;
-        let index: usize = index.try_into().map_err(|_| trap)?;
-        GcStore::write_gc_ref_optional_store(
-            store,
-            self.gc_refs_mut().get_mut(index).ok_or(trap)?,
-            elem,
-        );
+    pub fn set(&mut self, index: u64, elem: TableElement) -> Result<(), ()> {
+        let index: usize = index.try_into().map_err(|_| ())?;
+        match elem {
+            TableElement::FuncRef(f) => {
+                let (funcrefs, lazy_init) = self.funcrefs_mut();
+                *funcrefs.get_mut(index).ok_or(())? = MaybeTaggedFuncRef::from(f, lazy_init);
+            }
+            TableElement::UninitFunc => {
+                let (funcrefs, _lazy_init) = self.funcrefs_mut();
+                *funcrefs.get_mut(index).ok_or(())? = MaybeTaggedFuncRef::UNINIT;
+            }
+            TableElement::GcRef(e) => {
+                *self.gc_refs_mut().get_mut(index).ok_or(())? = e;
+            }
+            TableElement::ContRef(c) => {
+                *self.contrefs_mut().get_mut(index).ok_or(())? = c;
+            }
+        }
         Ok(())
     }
 
@@ -940,6 +1029,10 @@ impl Table {
         }
     }
 
+    fn type_matches(&self, val: &TableElement) -> bool {
+        self.element_type().matches(val)
+    }
+
     fn funcrefs(&self) -> (&[MaybeTaggedFuncRef], bool) {
         assert_eq!(self.element_type(), TableElementType::Func);
         match self {
@@ -1038,7 +1131,7 @@ impl Table {
     }
 
     fn copy_elements(
-        mut gc_store: Option<&mut GcStore>,
+        gc_store: Option<&mut GcStore>,
         dst_table: &mut Self,
         src_table: &Self,
         dst_range: Range<usize>,
@@ -1063,9 +1156,9 @@ impl Table {
                 );
                 assert!(dst_range.end <= dst_table.gc_refs().len());
                 assert!(src_range.end <= src_table.gc_refs().len());
+                let gc_store = gc_store.unwrap();
                 for (dst, src) in dst_range.zip(src_range) {
-                    GcStore::write_gc_ref_optional_store(
-                        gc_store.as_deref_mut(),
+                    gc_store.write_gc_ref(
                         &mut dst_table.gc_refs_mut()[dst],
                         src_table.gc_refs()[src].as_ref(),
                     );
@@ -1081,7 +1174,7 @@ impl Table {
 
     fn copy_elements_within(
         &mut self,
-        mut gc_store: Option<&mut GcStore>,
+        gc_store: Option<&mut GcStore>,
         dst_range: Range<usize>,
         src_range: Range<usize>,
     ) {
@@ -1103,6 +1196,8 @@ impl Table {
                 funcrefs.copy_within(src_range, dst_range.start);
             }
             TableElementType::GcRef => {
+                let gc_store = gc_store.unwrap();
+
                 // We need to clone each `externref` while handling overlapping
                 // ranges
                 let elements = self.gc_refs_mut();
@@ -1111,14 +1206,14 @@ impl Table {
                         let (ds, ss) = elements.split_at_mut(s);
                         let dst = &mut ds[d];
                         let src = ss[0].as_ref();
-                        GcStore::write_gc_ref_optional_store(gc_store.as_deref_mut(), dst, src);
+                        gc_store.write_gc_ref(dst, src);
                     }
                 } else {
                     for (s, d) in src_range.rev().zip(dst_range.rev()) {
                         let (ss, ds) = elements.split_at_mut(d);
                         let dst = &mut ds[0];
                         let src = ss[s].as_ref();
-                        GcStore::write_gc_ref_optional_store(gc_store.as_deref_mut(), dst, src);
+                        gc_store.write_gc_ref(dst, src);
                     }
                 }
             }
@@ -1139,4 +1234,11 @@ impl Default for Table {
             lazy_init: false,
         })
     }
+}
+
+fn vec_reserve_resize<T>(vec: &mut Vec<T>, new_size: usize) -> Result<()> {
+    if vec.len() < new_size {
+        vec.try_reserve(new_size - vec.len())?;
+    }
+    Ok(())
 }

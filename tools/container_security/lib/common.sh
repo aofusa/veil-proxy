@@ -183,6 +183,8 @@ run_harness() {
         -e "H2SPEC_FULL=${H2SPEC_FULL:-0}" \
         -e "H2SPEC_STRICT=${H2SPEC_STRICT:-0}" \
         -e "H2SPEC_TIMEOUT=${H2SPEC_TIMEOUT:-30}" \
+        -e "H3SPEC_STRICT=${H3SPEC_STRICT:-0}" \
+        -e "H3SPEC_REQUIRED=${H3SPEC_REQUIRED:-0}" \
         -e "TOXIPROXY_HOST=${TOXIPROXY_CONTAINER}" \
         -e "SKIP_TESTSSL=${SKIP_TESTSSL:-0}" \
         -e "PHASE=${phase}" \

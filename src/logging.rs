@@ -495,6 +495,37 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
     }
 }
 
+/// アクセスログ（テキスト / 構造化）かメトリクスのどれか 1 つでも出力先があるか。
+///
+/// `false` なら `log_access` は何もしないので、呼び出し側はリクエスト開始時刻を正確に
+/// 読む必要が無い（[`request_start_instant`]）。
+#[inline]
+pub(crate) fn access_outputs_active() -> bool {
+    #[cfg(not(feature = "access-log"))]
+    let text_log = ftlog::log_enabled!(target: "access", Level::Info);
+    #[cfg(feature = "access-log")]
+    let text_log = crate::config::CURRENT_CONFIG
+        .load()
+        .access_log_config
+        .enabled;
+    text_log || (cfg!(feature = "metrics") && crate::metrics::metrics_runtime_enabled())
+}
+
+/// `log_access` に渡すリクエスト開始時刻。
+///
+/// 出力先が有効なら `Instant::now()`（処理時間を正確に測る）、無効なら値が使われないので
+/// ランタイムのループ時刻キャッシュ（`runtime::time::coarse_now`、reactor では時刻読み取り
+/// なし）で済ませる。FreeBSD aarch64 の HTTP/3 プロファイルで `__vdso_gettc`（時刻読み取り）が
+/// 最上位だったための削減。
+#[inline]
+pub(crate) fn request_start_instant() -> Instant {
+    if access_outputs_active() {
+        Instant::now()
+    } else {
+        crate::runtime::time::coarse_now()
+    }
+}
+
 /// アクセスログを記録 + Prometheusメトリクスを記録
 ///
 /// - 処理時間: `start_instant` からの経過時間を高精度で計測（Instant使用）
@@ -520,6 +551,13 @@ pub(crate) fn log_access(
     client_ip: &str,
     upstream: &str,
 ) {
+    // 出力先が 1 つも無ければ何もしない。本関数はリクエストごとに呼ばれ、以前は
+    // ログもメトリクスも無効な構成でも経過時間・時刻の読み取り（2 回）と from_utf8（4 回）
+    // を毎回行っていた（FreeBSD のプロファイルで from_utf8 と __vdso_gettc が上位）。
+    if !access_outputs_active() {
+        return;
+    }
+
     // 処理時間は Instant で高精度計測
     let duration = start_instant.elapsed();
     let duration_ms = duration.as_millis();

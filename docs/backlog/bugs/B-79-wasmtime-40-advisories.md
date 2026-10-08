@@ -104,3 +104,32 @@ cargo-deny 0.18 以降、`[advisories] unmaintained` は**重大度ではなく�
 **`ignore` で抑制していない**のは、適用対象である RUSTSEC-2026-0096（critical 9.0）と
 RUSTSEC-2026-0088 を隠すことになるためである。**このフェーズが赤いことは、
 未対応の実問題が存在するという正しい状態を表している。**
+
+## 解消（2026-10-07）
+
+2026-10 の container_security 実行で、`cargo audit` の指摘は wasmtime 40.0.4 に **16 件**
+（その後に公開された勧告を含む）、rustls 0.23.40 に **1 件**（RUSTSEC-2026-0285、TLS 1.3 の
+ハンドシェイクメッセージを暗号化レベルの境界をまたいで受理する。修正版 0.23.45）に増えていた。
+
+### wasmtime: 47.x ではなく 36.0.17（LTS）へ移した
+
+勧告の修正版は 36.0.x（LTS のバックポート）と 43 以降の両方に出ている。43 以降（最新の
+安定版 49.0.2）は `rust-version = 1.96` で、packaging の docker イメージ（Rust 1.89 固定や
+cargo-zigbuild の 1.93）・macOS（1.94）・Windows（1.95）・pkgsrc の rust-bin を含む
+ビルド基盤全体の更新が要る。36.0.17 は MSRV 1.86 で既存のすべてのツールチェーンで
+ビルドでき、適用対象だった RUSTSEC-2026-0096（aarch64 Cranelift の誤コンパイル）・
+RUSTSEC-2026-0088（プーリングアロケータ）を含む全件が 36.0.16 以降で修正済みである。
+
+veil の wasmtime の使い方（core module・`async_support` + fuel yield・epoch 割り込み・
+プーリングアロケータ・Cranelift / Pulley・OpenBSD の OnDemand + MAP_STACK スタック）は
+40 → 36 で **ソース無変更でビルドでき**、Proxy-Wasm の E2E（Linux io_uring / epoll、各 BSD、
+macOS）も通った。BSD 向け vendoring（`third_party/wasmtime`）も 36.0.17 で作り直し、差分
+（パッケージ名・`[[test]]` 削除・`dead_code` の allow・lint 名・build.rs の 2 行）は従来どおり。
+
+### rustls 0.23.45 と aws-lc-sys の 1 本化
+
+rustls 0.23.45 は aws-lc-rs 1.18（aws-lc-sys 0.45）を要求する。Linux では quiche が veil の
+直接依存の aws-lc-sys（`ssl` feature、`NO_PREFIX`）を共有する構成のため、直接依存を 0.41 の
+ままにすると aws-lc-sys が 2 本に分かれ、quiche の BoringSSL 互換 API
+（`SSL_set_quic_early_data_context` 等）がリンクできなくなる。直接依存も 0.45 に揃えて
+1 本にした。

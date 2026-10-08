@@ -1,5 +1,5 @@
 use super::{
-    InstanceAllocationRequest, InstanceAllocator, MemoryAllocationIndex, TableAllocationIndex,
+    InstanceAllocationRequest, InstanceAllocatorImpl, MemoryAllocationIndex, TableAllocationIndex,
 };
 use crate::prelude::*;
 use crate::runtime::vm::CompiledModuleId;
@@ -8,7 +8,9 @@ use crate::runtime::vm::memory::{DefaultMemoryCreator, Memory};
 use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::table::Table;
 use alloc::sync::Arc;
-use wasmtime_environ::{DefinedMemoryIndex, DefinedTableIndex, HostPtr, Module, VMOffsets};
+use wasmtime_environ::{
+    DefinedMemoryIndex, DefinedTableIndex, HostPtr, Module, Tunables, VMOffsets,
+};
 
 #[cfg(feature = "gc")]
 use crate::runtime::vm::{GcHeap, GcHeapAllocationIndex, GcRuntime};
@@ -74,10 +76,9 @@ impl Default for OnDemandInstanceAllocator {
     }
 }
 
-#[async_trait::async_trait]
-unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
+unsafe impl InstanceAllocatorImpl for OnDemandInstanceAllocator {
     #[cfg(feature = "component-model")]
-    fn validate_component<'a>(
+    fn validate_component_impl<'a>(
         &self,
         _component: &Component,
         _offsets: &VMComponentOffsets<HostPtr>,
@@ -86,12 +87,12 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
         Ok(())
     }
 
-    fn validate_module(&self, _module: &Module, _offsets: &VMOffsets<HostPtr>) -> Result<()> {
+    fn validate_module_impl(&self, _module: &Module, _offsets: &VMOffsets<HostPtr>) -> Result<()> {
         Ok(())
     }
 
     #[cfg(feature = "gc")]
-    fn validate_memory(&self, _memory: &wasmtime_environ::Memory) -> Result<()> {
+    fn validate_memory_impl(&self, _memory: &wasmtime_environ::Memory) -> Result<()> {
         Ok(())
     }
 
@@ -109,10 +110,11 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
 
     fn decrement_core_instance_count(&self) {}
 
-    async fn allocate_memory(
+    fn allocate_memory(
         &self,
-        request: &mut InstanceAllocationRequest<'_, '_>,
+        request: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Memory,
+        tunables: &Tunables,
         memory_index: Option<DefinedMemoryIndex>,
     ) -> Result<(MemoryAllocationIndex, Memory)> {
         let creator = self
@@ -129,12 +131,16 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
         let allocation_index = MemoryAllocationIndex::default();
         let memory = Memory::new_dynamic(
             ty,
-            request.store.engine(),
+            tunables,
             creator,
+            unsafe {
+                request
+                    .store
+                    .get()
+                    .expect("if module has memory plans, store is not empty")
+            },
             image,
-            request.limiter.as_deref_mut(),
-        )
-        .await?;
+        )?;
         Ok((allocation_index, memory))
     }
 
@@ -148,19 +154,20 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
         // Normal destructors do all the necessary clean up.
     }
 
-    async fn allocate_table(
+    fn allocate_table(
         &self,
-        request: &mut InstanceAllocationRequest<'_, '_>,
+        request: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Table,
+        tunables: &Tunables,
         _table_index: DefinedTableIndex,
     ) -> Result<(TableAllocationIndex, Table)> {
         let allocation_index = TableAllocationIndex::default();
-        let table = Table::new_dynamic(
-            ty,
-            request.store.engine().tunables(),
-            request.limiter.as_deref_mut(),
-        )
-        .await?;
+        let table = Table::new_dynamic(ty, tunables, unsafe {
+            request
+                .store
+                .get()
+                .expect("if module has table plans, store is not empty")
+        })?;
         Ok((allocation_index, table))
     }
 

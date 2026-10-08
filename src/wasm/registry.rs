@@ -81,7 +81,7 @@ impl ModuleRegistry {
         //
         // OpenBSD だけ **OnDemand** を使う。wasmtime の `Config::with_host_stack`
         // （= ファイバスタックの確保方法の差し替え）は **OnDemand でしか参照されず、
-        // プーリングアロケータでは黙って無視される**（wasmtime 40 の
+        // プーリングアロケータでは黙って無視される**（wasmtime 36 / 40 の
         // `config.rs::build_allocator`）。プーリング側はスタックを自前のスラブから
         // `MAP_STACK` 無しで切り出すため、OpenBSD ではファイバへ切り替えた瞬間に
         // カーネルに殺される（B-52）。OnDemand にして下の `MapStackCreator` を

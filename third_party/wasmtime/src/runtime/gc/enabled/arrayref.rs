@@ -1,12 +1,12 @@
 //! Working with GC `array` objects.
 
-use crate::runtime::vm::{VMGcRef, VMStore};
-use crate::store::{StoreId, StoreResourceLimiter};
-use crate::vm::{self, VMArrayRef, VMGcHeader};
+use crate::runtime::vm::VMGcRef;
+use crate::store::StoreId;
+use crate::vm::{VMArrayRef, VMGcHeader};
 use crate::{AnyRef, FieldType};
 use crate::{
     ArrayType, AsContext, AsContextMut, EqRef, GcHeapOutOfMemory, GcRefImpl, GcRootIndex, HeapType,
-    OwnedRooted, RefType, Rooted, Val, ValRaw, ValType, WasmTy,
+    ManuallyRooted, RefType, Rooted, Val, ValRaw, ValType, WasmTy,
     prelude::*,
     store::{AutoAssertNoGc, StoreContextMut, StoreOpaque},
 };
@@ -68,6 +68,11 @@ pub struct ArrayRefPre {
 impl ArrayRefPre {
     /// Create a new `ArrayRefPre` that is associated with the given store
     /// and type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ty` was not created with the same
+    /// [`Engine`](crate::Engine) as `store`.
     pub fn new(mut store: impl AsContextMut, ty: ArrayType) -> Self {
         Self::_new(store.as_context_mut().0, ty)
     }
@@ -108,7 +113,7 @@ impl ArrayRefPre {
 /// `0x12345678` into a reference, pretend it is a valid `arrayref`, and trick
 /// the host into dereferencing it and segfaulting or worse.
 ///
-/// Note that you can also use `Rooted<ArrayRef>` and `OwnedRooted<ArrayRef>`
+/// Note that you can also use `Rooted<ArrayRef>` and `ManuallyRooted<ArrayRef>`
 /// as a type parameter with [`Func::typed`][crate::Func::typed]- and
 /// [`Func::wrap`][crate::Func::wrap]-style APIs.
 ///
@@ -213,16 +218,16 @@ impl Rooted<ArrayRef> {
     }
 }
 
-impl OwnedRooted<ArrayRef> {
+impl ManuallyRooted<ArrayRef> {
     /// Upcast this `arrayref` into an `anyref`.
     #[inline]
-    pub fn to_anyref(self) -> OwnedRooted<AnyRef> {
+    pub fn to_anyref(self) -> ManuallyRooted<AnyRef> {
         self.unchecked_cast()
     }
 
     /// Upcast this `arrayref` into an `eqref`.
     #[inline]
-    pub fn to_eqref(self) -> OwnedRooted<EqRef> {
+    pub fn to_eqref(self) -> ManuallyRooted<EqRef> {
         self.unchecked_cast()
     }
 }
@@ -297,15 +302,18 @@ impl ArrayRef {
         elem: &Val,
         len: u32,
     ) -> Result<Rooted<ArrayRef>> {
-        let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
-        assert!(!store.async_support());
-        vm::assert_ready(Self::_new_async(
-            store,
-            limiter.as_mut(),
-            allocator,
-            elem,
-            len,
-        ))
+        Self::_new(store.as_context_mut().0, allocator, elem, len)
+    }
+
+    pub(crate) fn _new(
+        store: &mut StoreOpaque,
+        allocator: &ArrayRefPre,
+        elem: &Val,
+        len: u32,
+    ) -> Result<Rooted<ArrayRef>> {
+        store.retry_after_gc((), |store, ()| {
+            Self::new_from_iter(store, allocator, RepeatN(elem, len))
+        })
     }
 
     /// Asynchronously allocate a new `array` of the given length, with every
@@ -347,22 +355,40 @@ impl ArrayRef {
         elem: &Val,
         len: u32,
     ) -> Result<Rooted<ArrayRef>> {
-        let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
-        Self::_new_async(store, limiter.as_mut(), allocator, elem, len).await
+        Self::_new_async(store.as_context_mut().0, allocator, elem, len).await
     }
 
+    #[cfg(feature = "async")]
     pub(crate) async fn _new_async(
         store: &mut StoreOpaque,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
         allocator: &ArrayRefPre,
         elem: &Val,
         len: u32,
     ) -> Result<Rooted<ArrayRef>> {
         store
-            .retry_after_gc_async(limiter, (), |store, ()| {
+            .retry_after_gc_async((), |store, ()| {
                 Self::new_from_iter(store, allocator, RepeatN(elem, len))
             })
             .await
+    }
+
+    /// Like `ArrayRef::new` but when async is configured must only ever be
+    /// called from on a fiber stack.
+    pub(crate) unsafe fn new_maybe_async(
+        store: &mut StoreOpaque,
+        allocator: &ArrayRefPre,
+        elem: &Val,
+        len: u32,
+    ) -> Result<Rooted<ArrayRef>> {
+        // Type check the initial element value against the element type.
+        elem.ensure_matches_ty(store, allocator.ty.element_type().unpack())
+            .context("element type mismatch")?;
+
+        unsafe {
+            store.retry_after_gc_maybe_async((), |store, ()| {
+                Self::new_from_iter(store, allocator, RepeatN(elem, len))
+            })
+        }
     }
 
     /// Allocate a new array of the given elements.
@@ -390,7 +416,7 @@ impl ArrayRef {
         // Allocate the array and write each field value into the appropriate
         // offset.
         let arrayref = store
-            .require_gc_store_mut()?
+            .gc_store_mut()?
             .alloc_uninit_array(allocator.type_index(), len, allocator.layout())
             .context("unrecoverable error when allocating new `arrayref`")?
             .map_err(|n| GcHeapOutOfMemory::new((), n))?;
@@ -411,7 +437,7 @@ impl ArrayRef {
         })() {
             Ok(()) => Ok(Rooted::new(&mut store, arrayref.into())),
             Err(e) => {
-                store.require_gc_store_mut()?.dealloc_uninit_array(arrayref);
+                store.gc_store_mut()?.dealloc_uninit_array(arrayref);
                 Err(e)
             }
         }
@@ -453,14 +479,17 @@ impl ArrayRef {
         allocator: &ArrayRefPre,
         elems: &[Val],
     ) -> Result<Rooted<ArrayRef>> {
-        let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
-        assert!(!store.async_support());
-        vm::assert_ready(Self::_new_fixed_async(
-            store,
-            limiter.as_mut(),
-            allocator,
-            elems,
-        ))
+        Self::_new_fixed(store.as_context_mut().0, allocator, elems)
+    }
+
+    pub(crate) fn _new_fixed(
+        store: &mut StoreOpaque,
+        allocator: &ArrayRefPre,
+        elems: &[Val],
+    ) -> Result<Rooted<ArrayRef>> {
+        store.retry_after_gc((), |store, ()| {
+            Self::new_from_iter(store, allocator, elems.iter())
+        })
     }
 
     /// Asynchronously allocate a new `array` containing the given elements.
@@ -504,21 +533,35 @@ impl ArrayRef {
         allocator: &ArrayRefPre,
         elems: &[Val],
     ) -> Result<Rooted<ArrayRef>> {
-        let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
-        Self::_new_fixed_async(store, limiter.as_mut(), allocator, elems).await
+        Self::_new_fixed_async(store.as_context_mut().0, allocator, elems).await
     }
 
+    #[cfg(feature = "async")]
     pub(crate) async fn _new_fixed_async(
         store: &mut StoreOpaque,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
         allocator: &ArrayRefPre,
         elems: &[Val],
     ) -> Result<Rooted<ArrayRef>> {
         store
-            .retry_after_gc_async(limiter, (), |store, ()| {
+            .retry_after_gc_async((), |store, ()| {
                 Self::new_from_iter(store, allocator, elems.iter())
             })
             .await
+    }
+
+    /// Like `ArrayRef::new_fixed[_async]` but it is the caller's responsibility
+    /// to ensure that when async is enabled, this is only called from on a
+    /// fiber stack.
+    pub(crate) unsafe fn new_fixed_maybe_async(
+        store: &mut StoreOpaque,
+        allocator: &ArrayRefPre,
+        elems: &[Val],
+    ) -> Result<Rooted<ArrayRef>> {
+        unsafe {
+            store.retry_after_gc_maybe_async((), |store, ()| {
+                Self::new_from_iter(store, allocator, elems.iter())
+            })
+        }
     }
 
     #[inline]
@@ -595,7 +638,7 @@ impl ArrayRef {
         assert!(self.comes_from_same_store(store));
         let gc_ref = self.inner.try_gc_ref(store)?;
         debug_assert!({
-            let header = store.require_gc_store()?.header(gc_ref);
+            let header = store.gc_store()?.header(gc_ref);
             header.kind().matches(VMGcKind::ArrayRef)
         });
         let arrayref = gc_ref.as_arrayref_unchecked();
@@ -629,7 +672,7 @@ impl ArrayRef {
         let store = AutoAssertNoGc::new(store);
 
         let gc_ref = self.inner.try_gc_ref(&store)?;
-        let header = store.require_gc_store()?.header(gc_ref);
+        let header = store.gc_store()?.header(gc_ref);
         debug_assert!(header.kind().matches(VMGcKind::ArrayRef));
 
         let len = self._len(&store)?;
@@ -682,7 +725,7 @@ impl ArrayRef {
     fn header<'a>(&self, store: &'a AutoAssertNoGc<'_>) -> Result<&'a VMGcHeader> {
         assert!(self.comes_from_same_store(&store));
         let gc_ref = self.inner.try_gc_ref(store)?;
-        Ok(store.require_gc_store()?.header(gc_ref))
+        Ok(store.gc_store()?.header(gc_ref))
     }
 
     fn arrayref<'a>(&self, store: &'a AutoAssertNoGc<'_>) -> Result<&'a VMArrayRef> {
@@ -703,6 +746,7 @@ impl ArrayRef {
         match layout {
             GcLayout::Array(a) => Ok(a),
             GcLayout::Struct(_) => unreachable!(),
+            GcLayout::Exception(_) => unreachable!(),
         }
     }
 
@@ -804,7 +848,7 @@ impl ArrayRef {
 
     pub(crate) fn type_index(&self, store: &StoreOpaque) -> Result<VMSharedTypeIndex> {
         let gc_ref = self.inner.try_gc_ref(store)?;
-        let header = store.require_gc_store()?.header(gc_ref);
+        let header = store.gc_store()?.header(gc_ref);
         debug_assert!(header.kind().matches(VMGcKind::ArrayRef));
         Ok(header.ty().expect("arrayrefs should have concrete types"))
     }
@@ -923,7 +967,7 @@ unsafe impl WasmTy for Option<Rooted<ArrayRef>> {
     }
 }
 
-unsafe impl WasmTy for OwnedRooted<ArrayRef> {
+unsafe impl WasmTy for ManuallyRooted<ArrayRef> {
     #[inline]
     fn valtype() -> ValType {
         ValType::Ref(RefType::new(false, HeapType::Array))
@@ -975,7 +1019,7 @@ unsafe impl WasmTy for OwnedRooted<ArrayRef> {
     }
 }
 
-unsafe impl WasmTy for Option<OwnedRooted<ArrayRef>> {
+unsafe impl WasmTy for Option<ManuallyRooted<ArrayRef>> {
     #[inline]
     fn valtype() -> ValType {
         ValType::ARRAYREF
@@ -995,7 +1039,9 @@ unsafe impl WasmTy for Option<OwnedRooted<ArrayRef>> {
         ty: &HeapType,
     ) -> Result<()> {
         match self {
-            Some(s) => OwnedRooted::<ArrayRef>::dynamic_concrete_type_check(s, store, nullable, ty),
+            Some(s) => {
+                ManuallyRooted::<ArrayRef>::dynamic_concrete_type_check(s, store, nullable, ty)
+            }
             None => {
                 ensure!(
                     nullable,
@@ -1012,11 +1058,11 @@ unsafe impl WasmTy for Option<OwnedRooted<ArrayRef>> {
     }
 
     fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
-        <OwnedRooted<ArrayRef>>::wasm_ty_option_store(self, store, ptr, ValRaw::anyref)
+        <ManuallyRooted<ArrayRef>>::wasm_ty_option_store(self, store, ptr, ValRaw::anyref)
     }
 
     unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
-        <OwnedRooted<ArrayRef>>::wasm_ty_option_load(
+        <ManuallyRooted<ArrayRef>>::wasm_ty_option_load(
             store,
             ptr.get_anyref(),
             ArrayRef::from_cloned_gc_ref,

@@ -438,30 +438,6 @@ async fn send_request_async(
     Ok((status, String::from_utf8_lossy(&body).to_string()))
 }
 
-/// 非同期版: カスタムヘッダー付きHTTPS GETリクエストを送信
-#[allow(dead_code)]
-async fn send_request_with_headers_async(
-    port: u16,
-    path: &str,
-    headers: &[(&str, &str)],
-) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Http1TestClient::new_https("127.0.0.1", port)?;
-    let (status, body) = client.get_with_headers(path, headers).await?;
-    Ok((status, String::from_utf8_lossy(&body).to_string()))
-}
-
-/// 非同期版: HTTPS POSTリクエストを送信
-#[allow(dead_code)]
-async fn send_post_request_async(
-    port: u16,
-    path: &str,
-    body: &[u8],
-) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Http1TestClient::new_https("127.0.0.1", port)?;
-    let (status, resp_body) = client.post(path, body).await?;
-    Ok((status, String::from_utf8_lossy(&resp_body).to_string()))
-}
-
 // ====================
 // 非同期版 プロキシ基本機能テスト（hyper使用）
 // ====================
@@ -3157,6 +3133,57 @@ async fn test_http3_request_body_streaming() {
     panic!(
         "HTTP/3 request body streaming failed after {} attempts: {}",
         MAX_ATTEMPTS, last_err
+    );
+}
+
+/// B-68: バックエンドが要求本文を読み切る前に応答して切断しても、HTTP/3 クライアントが
+/// 詰まらずに応答を受け取れること。
+///
+/// `/error-500/*` のバックエンドはヘッダだけ読んで即座に 500 を返して閉じる。修正前の veil は
+/// バックエンドタスクの終了後に要求ストリームの受信をやめるだけで STOP_SENDING を送らず、
+/// QUIC のフロー制御ウィンドウが補充されないため、本文を送り切ってから応答を読むクライアントは
+/// アイドルタイムアウトまで停止していた。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_http3_early_backend_response_does_not_stall_upload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    use common::http3_client::send_http3_request;
+
+    // QUIC の初期フロー制御ウィンドウ（1MB 程度）を大きく超える本文。
+    let body: Vec<u8> = vec![b'x'; 4_000_000];
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("connect");
+    let started = std::time::Instant::now();
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        send_http3_request(
+            &mut send_request,
+            "POST",
+            "/error-500/upload",
+            &[("content-type", "application/octet-stream")],
+            Some(&body),
+        ),
+    )
+    .await
+    .expect("upload must not stall until the QUIC idle timeout")
+    .expect("response must be received even if the server stops the upload");
+    assert!(
+        status == 500 || status == 502 || status == 503,
+        "unexpected status {}",
+        status
+    );
+    eprintln!(
+        "early backend response: status {} in {:?}",
+        status,
+        started.elapsed()
     );
 }
 
@@ -6508,8 +6535,8 @@ async fn test_grpc_trailer_detailed() {
 // 優先度高: kTLS機能テスト
 // ====================
 
-/// kTLSが利用可能かどうかをチェック
-#[allow(dead_code)]
+/// kTLSが利用可能かどうかをチェック（呼び出し元の kTLS テストと同じ cfg）
+#[cfg(feature = "ktls")]
 fn is_ktls_available() -> bool {
     // /proc/modules で tls モジュールがロードされているか確認
     if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
@@ -18007,6 +18034,30 @@ async fn test_b17_bad_backend_ok_baseline() {
 }
 
 #[tokio::test]
+async fn test_b93_pooled_upstream_closed_while_idle_is_not_reused() {
+    // B-93: bad-backend の通常応答は `Connection: close` を付けずに応答後すぐ接続を閉じる。
+    // veil はこれを keep-alive 接続としてプールするため、従来は同じワーカーで次の要求が
+    // 閉じた接続を再利用して EOF を読み、502 を返していた（E2E 全体実行時に
+    // test_b17_bad_backend_no_response_returns_504 が 502 で落ちるフレークの正体）。
+    // hyper クライアントは keep-alive で同じ接続（= 同じ veil ワーカー）を使い回す。
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    for i in 0..3 {
+        // 専用ルート（上流プールを他テストと共有しない。e2e_setup.sh の bad-b93-pool 参照）
+        let res = tokio::time::timeout(Duration::from_secs(8), client.get("/bad-backend-b93/ok"))
+            .await
+            .expect("must not hang")
+            .expect("must succeed");
+        assert_eq!(
+            res.0, 200,
+            "request #{i} must not reuse the closed upstream"
+        );
+        assert_eq!(res.1, b"ok");
+        // 上流の FIN が veil 側ソケットへ届き、かつ生存確認の閾値（1ms）を超えるまで待つ。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
 async fn test_b17_bad_backend_instant_close_returns_502() {
     // 応答せず即クローズ → 即時 502
     let res = b17_probe("/bad-backend/instant-close")
@@ -25126,5 +25177,258 @@ async fn test_f150_static_content_cache_http1_range() {
     assert!(
         body.bytes().all(|b| b == b'F'),
         "206 のボディ内容がフィクスチャと一致すること"
+    );
+}
+
+// ====================
+// F-170: Unix ドメインソケット（UDS）バックエンド接続
+// ====================
+//
+// バックエンドは veil 自身を UDS で listen させたもの（tests/e2e_setup.sh の
+// backend_uds.toml）。プロキシ側の upstream URL は nginx 互換の
+// `http(s)://unix:<socket-path>[:<path-prefix>]` 表記を使う。
+// UDS バックエンドへ送る Host ヘッダは既定で "localhost" になる。
+
+/// HTTP/1.1 クライアント → TLS over UDS バックエンドへ中継できること。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_tls() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-tls/", &[]).await;
+    assert!(resp.is_some(), "UDS(TLS) route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("Hello from UDS Backend"),
+        "UDS(TLS) upstream should forward the backend body: {}",
+        resp
+    );
+}
+
+/// HTTP/1.1 クライアント → h2c over UDS バックエンドへ中継できること。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_h2c() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-h2c/", &[]).await;
+    assert!(resp.is_some(), "UDS(h2c) route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("Hello from UDS Backend"),
+        "UDS(h2c) upstream should forward the backend body: {}",
+        resp
+    );
+}
+
+/// `http://unix:<path>:/api` のパスプレフィックスが上流パスへ前置されること
+/// （`/uds-prefix/v1/test` → バックエンドの `/api/v1/test`）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_path_prefix() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-prefix/v1/test", &[]).await;
+    assert!(resp.is_some(), "UDS prefix route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("uds prefix v1 test"),
+        "path prefix should be prepended to the upstream path: {}",
+        resp
+    );
+}
+
+/// 存在しないソケットパスへの UDS バックエンド接続は 502 になること
+/// （ハングせずエラー応答へ変換されること）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_missing_socket_returns_502() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-missing/", &[]).await;
+    assert!(
+        resp.is_some(),
+        "missing UDS socket should still return an HTTP response"
+    );
+    let status = get_status_code(&resp.unwrap());
+    assert!(
+        matches!(status, Some(502) | Some(503) | Some(504)),
+        "missing UDS socket should map to 502/503/504, got {:?}",
+        status
+    );
+}
+
+/// UDS 上流に対する TCP ヘルスチェックが healthy 判定になり、中継が成功すること
+/// （`unix:<path>` 形式のアドレスで同期プローブが接続できること）。
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_e2e_uds_backend_tcp_health_check() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // ヘルスチェック間隔（2 秒）を 1 周以上またいでから確認する。
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let resp = send_request(PROXY_PORT, "/uds-health/", &[]).await;
+    assert!(resp.is_some(), "UDS health-checked route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "UDS upstream must stay healthy under TCP health checks: {}",
+        resp
+    );
+}
+
+/// HTTP/2 クライアント → UDS バックエンド（h2c）の中継。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_e2e_uds_backend_via_http2_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = match Http2TestClient::new("127.0.0.1", PROXY_PORT).await {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    let (status, body) = client
+        .send_request("GET", "/uds-h2c/", &[("host", "localhost")], None)
+        .await
+        .expect("HTTP/2 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/2 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/2 → UDS backend body mismatch"
+    );
+}
+
+/// HTTP/3 クライアント → UDS バックエンド（h2c）の中継
+/// （下流 QUIC / 上流 UDS の組み合わせ）。
+///
+/// B-84 修正済み。HTTP/3 のストリーミングバックエンド経路は、上流が h2c の場合
+/// サーバ選択直後にバッファ経路（`handle_request` -> `proxy_to_h2c_backend_async`）へ
+/// 回すようになったため、HTTP/3 → h2c 上流が通ることを検証する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_e2e_uds_backend_via_http3_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)",
+            server_addr, e
+        ),
+    };
+
+    let (status, body) = http3_get(&mut send_request, "/uds-h2c/")
+        .await
+        .expect("HTTP/3 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/3 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/3 → UDS backend body mismatch"
+    );
+}
+
+/// HTTP/3 クライアント → UDS バックエンド（TLS）の中継
+/// （下流 QUIC / 上流 TLS-over-UDS の組み合わせ）。
+///
+/// h2c 上流とは別経路（ストリーミング経路をそのまま通る TLS 上流）のカバレッジを
+/// 維持するため、h2c 版とは別関数として残す。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_e2e_uds_backend_via_http3_client_tls() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)",
+            server_addr, e
+        ),
+    };
+
+    let (status, body) = http3_get(&mut send_request, "/uds-tls/")
+        .await
+        .expect("HTTP/3 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/3 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/3 → UDS backend body mismatch"
+    );
+}
+
+// ====================
+// B-83: 上流 TLS の ALPN が h2 を広告しても中継が壊れないこと
+// ====================
+
+/// B-83 回帰テスト: 上流が ALPN で h2 を広告しても中継が壊れないこと。
+///
+/// `backend_h2c.toml` は `http2_enabled = true` のため TLS リスナー
+/// （`BACKEND_H2C_TLS_PORT`）が ALPN で `h2, http/1.1` を広告する。修正前は
+/// 上流クライアントの ALPN にも `h2` が含まれていたため、上流が h2 を選択して
+/// veil が HTTP/1.1 のバイト列を送りつけ、中継が 502 になっていた。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_alpn_h2_upstream_regression() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/alpn-h2/", &[]).await;
+    assert!(resp.is_some(), "ALPN h2 upstream route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "ALPN h2 upstream should not 502: {}",
+        resp
+    );
+    assert!(
+        resp.contains("H2C Backend"),
+        "ALPN h2 upstream should forward the backend body: {}",
+        resp
     );
 }

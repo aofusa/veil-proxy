@@ -62,8 +62,12 @@ pub enum TlsMode {
 pub struct KtlsServerStream {
     /// 基盤となる TCP ストリーム
     inner: TcpStream,
-    /// rustls サーバーコネクション（kTLS 有効化前は Some、有効化後は None）
-    conn: Option<ServerConnection>,
+    /// rustls サーバーコネクション（kTLS 有効化前は Some、有効化後は None）。
+    /// `ServerConnection` は 1KB 超あるため Box で持つ。ストリームは HTTP/1.1 の各ハンドラへ
+    /// 値でムーブされ、各 async 関数のフューチャにも埋め込まれるため、インラインだと
+    /// 1 リクエストあたり何度も 1.2KB の memcpy になる（FreeBSD のプロファイルで memcpy が
+    /// 最大のホットスポットだった）。Box 化は接続あたり 1 回の確保で済む。
+    conn: Option<Box<ServerConnection>>,
     /// 現在の TLS モード
     mode: TlsMode,
     /// ALPN でネゴシエートされたプロトコル（kTLS 有効化後も保持）
@@ -83,6 +87,20 @@ impl crate::runtime::io::BufferedReadState for KtlsServerStream {
 }
 
 impl KtlsServerStream {
+    /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
+    /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
+    ///
+    /// 復号済みの平文が残っていれば即座に返る。rustls 内部の平文は `read()` が毎回
+    /// `drained_buffer` へ排出しているため、2 回目以降のリクエスト待ちでは
+    /// `drained_buffer` だけを見ればよい（接続直後の 1 回目には使わないこと）。
+    #[cfg(veil_poller_kqueue)]
+    pub async fn wait_next_request(&self) -> io::Result<()> {
+        if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
+            return Ok(());
+        }
+        self.inner.readable_lazy().await
+    }
+
     /// 基盤となる TCP ストリームへの参照を取得
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
@@ -130,7 +148,7 @@ impl KtlsServerStream {
 
     /// rustls コネクションへの参照を取得（kTLS 有効化後は None）
     pub fn rustls_conn(&self) -> Option<&ServerConnection> {
-        self.conn.as_ref()
+        self.conn.as_deref()
     }
 
     /// ALPN でネゴシエートされたプロトコルを取得
@@ -380,9 +398,7 @@ async fn do_server_handshake(
         // 先行読み取りデータがあれば先に処理
         if let Some(data) = initial_data.take() {
             if !data.is_empty() {
-                conn.read_tls(&mut &data[..])?;
-                conn.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::tls_writev::read_tls_all(&mut *conn, &data)?;
                 // データの処理後にハンドシェイクが終わる可能性があるため、ループの先頭に戻る
                 continue;
             }
@@ -402,9 +418,7 @@ async fn do_server_handshake(
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -447,9 +461,7 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -799,7 +811,7 @@ pub async fn accept(
 
     Ok(KtlsServerStream {
         inner: stream,
-        conn: conn_option,
+        conn: conn_option.map(Box::new),
         mode,
         alpn_protocol,
         drained_buffer,
@@ -911,8 +923,6 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
         }
 
         let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
         loop {
             // rustls が復号済みの平文を drained_buffer へ全量取り出す（uninit スペアへ直書き、
             // 中間バッファ無し）。これにより received_plaintext（rustls 既定 16KB 上限）が
@@ -942,31 +952,39 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             }
 
             // 平文が無い → 生 TLS を読み足してデコードする
-            match raw_read(fd, &mut read_buf) {
-                Ok(0) => return (Ok(0), buf), // EOF
-                Ok(n) => {
-                    let conn = match self.conn.as_mut() {
-                        Some(c) => c,
-                        None => return (Err(io::Error::other("No TLS connection")), buf),
+            let fed = crate::tls_writev::with_rx_scratch(
+                |read_buf| -> io::Result<crate::tls_writev::RxFed> {
+                    let n = match raw_read(fd, read_buf) {
+                        Ok(0) => return Ok(crate::tls_writev::RxFed::Eof),
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(crate::tls_writev::RxFed::WouldBlock)
+                        }
+                        Err(e) => return Err(e),
                     };
+                    let conn = self
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("No TLS connection"))?;
                     let mut consumed = 0;
                     while consumed < n {
-                        let tls_read = match conn.read_tls(&mut &read_buf[consumed..n]) {
-                            Ok(0) => break,
-                            Ok(r) => r,
-                            Err(e) => return (Err(e), buf),
-                        };
-                        consumed += tls_read;
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        let r = conn.read_tls(&mut &read_buf[consumed..n])?;
+                        if r == 0 {
+                            break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
-                        // 各 process 後に平文を退避し received_plaintext を空に保つ
-                        // （残りの生 TLS 投入で上限超過させないため）。
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // 各 process 後に平文を退避し received_plaintext を空に保つ。
                         drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
-                    // ループ先頭へ戻り drained_buffer をユーザーへ返す
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(crate::tls_writev::RxFed::Fed)
+                },
+            );
+            match fed {
+                Ok(crate::tls_writev::RxFed::Fed) => {}
+                Ok(crate::tls_writev::RxFed::Eof) => return (Ok(0), buf),
+                Ok(crate::tls_writev::RxFed::WouldBlock) => {
                     if let Err(e) = self.inner.readable().await {
                         return (Err(e), buf);
                     }
@@ -1065,8 +1083,6 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
         }
 
         let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
         loop {
             // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
             // （received_plaintext 既定 16KB 上限の溢れ防止。サーバ側 read と同方針）。
@@ -1092,28 +1108,39 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                 return (Ok(len), buf);
             }
 
-            match raw_read(fd, &mut read_buf) {
-                Ok(0) => return (Ok(0), buf),
-                Ok(n) => {
-                    let conn = match self.conn.as_mut() {
-                        Some(c) => c,
-                        None => return (Err(io::Error::other("No TLS connection")), buf),
+            let fed = crate::tls_writev::with_rx_scratch(
+                |read_buf| -> io::Result<crate::tls_writev::RxFed> {
+                    let n = match raw_read(fd, read_buf) {
+                        Ok(0) => return Ok(crate::tls_writev::RxFed::Eof),
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(crate::tls_writev::RxFed::WouldBlock)
+                        }
+                        Err(e) => return Err(e),
                     };
+                    let conn = self
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("No TLS connection"))?;
                     let mut consumed = 0;
                     while consumed < n {
-                        let tls_read = match conn.read_tls(&mut &read_buf[consumed..n]) {
-                            Ok(0) => break,
-                            Ok(r) => r,
-                            Err(e) => return (Err(e), buf),
-                        };
-                        consumed += tls_read;
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        let r = conn.read_tls(&mut &read_buf[consumed..n])?;
+                        if r == 0 {
+                            break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // 各 process 後に平文を退避し received_plaintext を空に保つ。
                         drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(crate::tls_writev::RxFed::Fed)
+                },
+            );
+            match fed {
+                Ok(crate::tls_writev::RxFed::Fed) => {}
+                Ok(crate::tls_writev::RxFed::Eof) => return (Ok(0), buf),
+                Ok(crate::tls_writev::RxFed::WouldBlock) => {
                     if let Err(e) = self.inner.readable().await {
                         return (Err(e), buf);
                     }

@@ -81,17 +81,32 @@ impl Default for RoundRobinState {
     }
 }
 
-/// L4 上流アドレス（起動時解決済み、または接続時に解決する未解決ホスト名）
+/// L4 上流アドレス（起動時解決済み、接続時に解決する未解決ホスト名、または UDS）。
+///
+/// UDS（`unix:<path>`、F-170）は TCP 上流のみ対象で UDP は対象外（設定検証で拒否する。
+/// `src/config.rs` の L4 上流検証を参照）。
 #[derive(Clone, Debug)]
 pub enum L4UpstreamTarget {
     Resolved(SocketAddr),
     Unresolved(Arc<str>),
+    /// UDS バックエンド（F-170）。ソケットパス（`unix:` 接頭辞は含まない）。
+    #[cfg(unix)]
+    Unix(Arc<str>),
+}
+
+/// L4 TCP 接続の接続先エンドポイント（F-170: `resolve_upstream_target` の唯一の戻り値型）。
+#[derive(Clone, Debug)]
+pub(crate) enum L4Endpoint {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(Arc<str>),
 }
 
 /// 設定ファイルのアドレス文字列を L4 上流ターゲットへ変換する。
 ///
 /// 起動時に解決できるアドレスは `Resolved` としてキャッシュし、
 /// DNS 未解決（B-33）のホスト名は `Unresolved` として保持して接続時に解決する。
+/// `unix:<path>` 表記（F-170）は `Unix` として保持する（起動時解決不要）。
 ///
 /// コールドパス（L4 リスナー起動時のみ）。同期 DNS は接続時 `resolve_upstream_target` の
 /// `offload` へ退避し、ホットパスでは呼ばない。
@@ -101,6 +116,10 @@ pub fn parse_upstream_targets(config: &L4ListenerConfig) -> Vec<L4UpstreamTarget
         .upstreams
         .iter()
         .map(|u| {
+            #[cfg(unix)]
+            if let Some(path) = u.addr.strip_prefix("unix:") {
+                return L4UpstreamTarget::Unix(Arc::from(path));
+            }
             if let Ok(addr) = u.addr.parse::<SocketAddr>() {
                 return L4UpstreamTarget::Resolved(addr);
             }
@@ -123,22 +142,42 @@ fn resolve_upstream_addr_sync(addr: &str) -> Option<SocketAddr> {
     addr.to_socket_addrs().ok().and_then(|mut iter| iter.next())
 }
 
-/// 接続時に上流 `SocketAddr` を解決する（未解決ホスト名は offload で DNS 解決）
+/// 接続時に上流エンドポイントを解決する（未解決ホスト名は offload で DNS 解決、F-170: UDS 対応）。
 ///
-/// `pub(crate)`: L4 UDP セッション確立（`crate::l4::udp`）からも利用する。
-pub(crate) async fn resolve_upstream_target(target: &L4UpstreamTarget) -> Option<SocketAddr> {
+/// `pub(crate)`: L4 UDP セッション確立（`crate::l4::udp`）からも利用する。UDP は
+/// `L4Endpoint::Unix` を受け取っても接続できないため、呼び出し側（`l4/udp.rs`）は
+/// `Unix` を「解決失敗」として扱う（設定検証で UDP 上流の `unix:` は既に拒否済みの
+/// 想定だが、念のための防御）。
+pub(crate) async fn resolve_upstream_target(target: &L4UpstreamTarget) -> Option<L4Endpoint> {
     match target {
-        L4UpstreamTarget::Resolved(addr) => Some(*addr),
+        L4UpstreamTarget::Resolved(addr) => Some(L4Endpoint::Tcp(*addr)),
         L4UpstreamTarget::Unresolved(addr) => {
             let addr = Arc::clone(addr);
-            offload(move || resolve_upstream_addr_sync(&addr)).await
+            offload(move || resolve_upstream_addr_sync(&addr))
+                .await
+                .map(L4Endpoint::Tcp)
+        }
+        #[cfg(unix)]
+        L4UpstreamTarget::Unix(path) => Some(L4Endpoint::Unix(Arc::clone(path))),
+    }
+}
+
+/// `L4Endpoint` へ接続する唯一の入口（F-170: TCP/UDS 両対応）。
+/// TCP 経路（`L4Endpoint::Tcp`）の命令列は F-170 以前と不変。
+async fn connect_l4_endpoint(endpoint: &L4Endpoint) -> std::io::Result<IoUringTcpStream> {
+    match endpoint {
+        L4Endpoint::Tcp(addr) => IoUringTcpStream::connect(*addr).await,
+        #[cfg(unix)]
+        L4Endpoint::Unix(path) => {
+            IoUringTcpStream::connect_unix(std::path::Path::new(path.as_ref())).await
         }
     }
 }
 
 /// 設定ファイルのアドレス文字列を起動時に `SocketAddr` へ変換して保持する。
 ///
-/// 全上流が起動時に解決可能な場合のみ成功（単体テスト・後方互換用）。
+/// 全上流が起動時に解決可能な場合のみ成功（単体テスト・後方互換用）。UDS 上流は
+/// `SocketAddr` で表現できないため常にエラーとする。
 pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>, String> {
     parse_upstream_targets(config)
         .into_iter()
@@ -152,6 +191,11 @@ pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>
                     )
                 })
             }
+            #[cfg(unix)]
+            L4UpstreamTarget::Unix(path) => Err(format!(
+                "upstream 'unix:{}' cannot be represented as a SocketAddr",
+                path
+            )),
         })
         .collect()
 }
@@ -234,6 +278,41 @@ pub fn select_upstream<'a>(
 
 /// バッファサイズ（64KB: io_uring の一般的な推奨値）
 const BUF_SIZE: usize = 64 * 1024;
+
+/// c→u / u→c の 2 方向転送を同時に走らせ、両方の転送バイト数を返す。
+///
+/// `futures::join!` は**どちらか片方が起床するたびに両方を poll する**（子ごとの Waker を
+/// 持たない）。reactor（kqueue/epoll）の `read`/`readable` は poll されるたびに
+/// まず `read(2)`/`poll(2)` を試すので、起床していない側が毎回 EAGAIN を空打ちしていた
+/// （FreeBSD aarch64 の `l4_tcp` 3B で `read` 6.0/req = 1 方向 3 回のうち 1 回が空打ち）。
+/// `FuturesUnordered` は起床した子だけを poll する。子タスクのノード確保は接続あたり 2 回で、
+/// リクエストごとには発生しない（既存の 64KB 転送バッファと同じ接続単位の固定費）。
+async fn join_directions<F>(c2u: F, u2c: F) -> (usize, usize)
+where
+    F: std::future::Future<Output = usize>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use futures::FutureExt;
+    // 2 つの `map` が同じ型になるよう、クロージャではなく関数ポインタで方向を付ける。
+    fn tag_c2u(n: usize) -> (bool, usize) {
+        (true, n)
+    }
+    fn tag_u2c(n: usize) -> (bool, usize) {
+        (false, n)
+    }
+    let mut set = FuturesUnordered::new();
+    set.push(c2u.map(tag_c2u as fn(usize) -> (bool, usize)));
+    set.push(u2c.map(tag_u2c as fn(usize) -> (bool, usize)));
+    let (mut c2u_bytes, mut u2c_bytes) = (0, 0);
+    while let Some((is_c2u, n)) = set.next().await {
+        if is_c2u {
+            c2u_bytes = n;
+        } else {
+            u2c_bytes = n;
+        }
+    }
+    (c2u_bytes, u2c_bytes)
+}
 
 /// 1方向の転送ループ
 ///
@@ -648,39 +727,41 @@ pub async fn bidirectional_forward(
     // へフォールバックする。
     #[cfg(not(target_os = "linux"))]
     {
-        let (c2u_bytes, u2c_bytes) = futures::join!(
+        let (c2u_bytes, u2c_bytes) = join_directions(
             forward_direction(&client, &upstream, idle_timeout, listener_name),
-            forward_direction(&upstream, &client, idle_timeout, listener_name)
-        );
+            forward_direction(&upstream, &client, idle_timeout, listener_name),
+        )
+        .await;
         debug!(
             "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
             listener_name, c2u_bytes, u2c_bytes
         );
-        return;
+        // 以降は Linux 専用（splice）なので、非 Linux ではここが関数の末尾になる。
     }
 
-    // futures::join! は両 Future を同一タスク内でインターリーブするため、
+    // join_directions は両 Future を同一タスク内でインターリーブするため、
     // &TcpStream / &Pipe の同時借用は安全。
     // パイプはスレッドローカルプール（F-40）から取得し、接続ごとの pipe2(2) を排除する。
     #[cfg(target_os = "linux")]
     match (acquire_pipe(), acquire_pipe()) {
         (Ok(c2u_pipe), Ok(u2c_pipe)) => {
-            let (c2u_bytes, u2c_bytes) = futures::join!(
+            let (c2u_bytes, u2c_bytes) = join_directions(
                 forward_direction_splice(
                     &client,
                     &upstream,
                     &c2u_pipe,
                     idle_timeout,
-                    listener_name
+                    listener_name,
                 ),
                 forward_direction_splice(
                     &upstream,
                     &client,
                     &u2c_pipe,
                     idle_timeout,
-                    listener_name
-                )
-            );
+                    listener_name,
+                ),
+            )
+            .await;
             debug!(
                 "[L4:{}] connection closed (splice): c→u {} bytes, u→c {} bytes",
                 listener_name, c2u_bytes, u2c_bytes
@@ -695,10 +776,11 @@ pub async fn bidirectional_forward(
                 "[L4:{}] pipe creation failed; falling back to userspace copy",
                 listener_name
             );
-            let (c2u_bytes, u2c_bytes) = futures::join!(
+            let (c2u_bytes, u2c_bytes) = join_directions(
                 forward_direction(&client, &upstream, idle_timeout, listener_name),
-                forward_direction(&upstream, &client, idle_timeout, listener_name)
-            );
+                forward_direction(&upstream, &client, idle_timeout, listener_name),
+            )
+            .await;
             debug!(
                 "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
                 listener_name, c2u_bytes, u2c_bytes
@@ -793,7 +875,7 @@ pub async fn handle_l4_connection(
         idx: upstream_idx,
     };
 
-    let socket_addr = match upstream_targets.get(upstream_idx) {
+    let endpoint = match upstream_targets.get(upstream_idx) {
         Some(target) => match resolve_upstream_target(target).await {
             Some(a) => a,
             None => {
@@ -814,7 +896,7 @@ pub async fn handle_l4_connection(
     };
 
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-    let upstream = match timeout(connect_timeout, IoUringTcpStream::connect(socket_addr)).await {
+    let upstream = match timeout(connect_timeout, connect_l4_endpoint(&endpoint)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!(
@@ -1152,7 +1234,7 @@ async fn handle_l4_tls_terminate_connection(
         idx: upstream_idx,
     };
 
-    let socket_addr = match upstream_targets.get(upstream_idx) {
+    let endpoint = match upstream_targets.get(upstream_idx) {
         Some(target) => match resolve_upstream_target(target).await {
             Some(a) => a,
             None => {
@@ -1173,7 +1255,7 @@ async fn handle_l4_tls_terminate_connection(
     };
 
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-    let upstream = match timeout(connect_timeout, IoUringTcpStream::connect(socket_addr)).await {
+    let upstream = match timeout(connect_timeout, connect_l4_endpoint(&endpoint)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!(
@@ -1320,9 +1402,38 @@ mod tests {
         assert_eq!(targets.len(), 1);
         match &targets[0] {
             L4UpstreamTarget::Unresolved(host) => assert_eq!(host.as_ref(), "backend.example:4443"),
-            L4UpstreamTarget::Resolved(_) => {
-                panic!("expected Unresolved for hostname upstream")
-            }
+            other => panic!("expected Unresolved for hostname upstream, got {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_upstream_targets_unix_socket() {
+        let config = make_config(vec!["unix:/run/db.sock"], L4LbAlgorithm::RoundRobin);
+        let targets = parse_upstream_targets(&config);
+        assert_eq!(targets.len(), 1);
+        match &targets[0] {
+            L4UpstreamTarget::Unix(path) => assert_eq!(path.as_ref(), "/run/db.sock"),
+            other => panic!("expected Unix for unix: upstream, got {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_upstream_addrs_rejects_unix_socket() {
+        // parse_upstream_addrs は SocketAddr のみを返すため UDS はエラーになる。
+        let config = make_config(vec!["unix:/run/db.sock"], L4LbAlgorithm::RoundRobin);
+        assert!(parse_upstream_addrs(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_resolve_upstream_target_unix() {
+        let target = L4UpstreamTarget::Unix(Arc::from("/run/db.sock"));
+        let endpoint = resolve_upstream_target(&target).await;
+        match endpoint {
+            Some(L4Endpoint::Unix(path)) => assert_eq!(path.as_ref(), "/run/db.sock"),
+            other => panic!("expected L4Endpoint::Unix, got {:?}", other),
         }
     }
 

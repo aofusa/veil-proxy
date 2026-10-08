@@ -1269,6 +1269,53 @@ pub fn create_recv_buffer() -> Vec<u8> {
 // ホットパス規則: スクラッチはスレッドローカルで再利用され（呼び出し側の設計は Linux と
 // 共通）、本エミュレーションもリクエスト毎のヒープ確保を行わない。
 
+/// HTTP/3 の UDP ソケットバッファの希望サイズ（送受信とも）。
+#[cfg(all(not(target_os = "linux"), unix))]
+const QUIC_SOCKET_BUFFER_WANT: libc::c_int = 2 * 1024 * 1024;
+
+/// 下限。これ未満まで下げても通らない環境では諦めて OS 既定のままにする。
+///
+/// NetBSD の既定 `kern.sbmax` は 256KB で、mbuf のオーバーヘッドを差し引いた実効上限は
+/// それより小さい（約 230KB）。下限を 256KB にしていたときは NetBSD で一度も設定できず
+/// 既定（約 40KB）のまま残っていたので、64KB まで下げて通る最大値を探す。
+#[cfg(all(not(target_os = "linux"), unix))]
+const QUIC_SOCKET_BUFFER_MIN: libc::c_int = 64 * 1024;
+
+/// B-95: `SO_RCVBUF`/`SO_SNDBUF` を「通る最大値」で設定する。設定できたサイズを返す。
+///
+/// Linux は `net.core.rmem_max` で黙って切り詰めるだけで失敗しないが、**BSD は上限を超えると
+/// `ENOBUFS` で失敗し、バッファは OS 既定のまま残る**。FreeBSD の上限は
+/// `kern.ipc.maxsockbuf`（既定 2MB）から mbuf のオーバーヘッドを差し引いた値
+/// （`maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES)` ≒ 1.78MB）なので、2MB ちょうどの要求は
+/// 既定設定で必ず失敗し、受信バッファが `net.inet.udp.recvspace`（既定 42KB）のまま
+/// 運用されていた（h3load 64 接続で `dropped due to full socket buffers` が数千万件、
+/// クライアント送信の 14% を損失 → 輻輳制御と PTO バックオフでスループットが崩れていた）。
+/// 失敗したら 1/8 ずつ下げて再試行する（起動時に 1 回だけ実行するコールドパス）。
+#[cfg(all(not(target_os = "linux"), unix))]
+fn set_socket_buffer_best_effort(
+    fd: std::os::unix::io::RawFd,
+    opt: libc::c_int,
+) -> Option<libc::c_int> {
+    let mut want = QUIC_SOCKET_BUFFER_WANT;
+    while want >= QUIC_SOCKET_BUFFER_MIN {
+        // SAFETY: fd は呼び出し元が所有する有効なソケット。値は c_int 1 個。
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &want as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            return Some(want);
+        }
+        want -= want / 8;
+    }
+    None
+}
+
 /// 非 Linux 版 `bind_reuseport`（FreeBSD: `SO_REUSEPORT_LB`（カーネル分散）、
 /// その他 BSD: `SO_REUSEPORT`）。GSO/GRO は非対応のため常に無効。
 #[cfg(all(not(target_os = "linux"), unix))]
@@ -1349,23 +1396,22 @@ impl QuicUdpSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // 高スループット向けにソケットバッファを拡大（Linux 版 configure_gso_gro と同方針。
-        // 失敗してもエラーにしない）。
-        let buf_size: libc::c_int = 2 * 1024 * 1024;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        // 高スループット向けにソケットバッファを拡大（Linux 版 configure_gso_gro と同方針）。
+        // B-95: BSD は上限超過で ENOBUFS になり既定のまま残るため、通る最大値まで下げて設定する。
+        let rcv = set_socket_buffer_best_effort(fd, libc::SO_RCVBUF);
+        let snd = set_socket_buffer_best_effort(fd, libc::SO_SNDBUF);
+        if rcv.is_none() || snd.is_none() {
+            ftlog::warn!(
+                "[HTTP/3] could not enlarge UDP socket buffers (rcvbuf={:?} sndbuf={:?}); \
+                 packets may be dropped under load (raise kern.ipc.maxsockbuf)",
+                rcv,
+                snd
             );
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        } else {
+            ftlog::debug!(
+                "[HTTP/3] UDP socket buffers: rcvbuf={:?} sndbuf={:?}",
+                rcv,
+                snd
             );
         }
 
@@ -1811,12 +1857,40 @@ impl MmsgSendScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-95: 上限を超える要求でも ENOBUFS で諦めず、通る最大値で設定できること。
+    #[cfg(all(not(target_os = "linux"), unix))]
+    #[test]
+    fn test_set_socket_buffer_best_effort_enlarges_rcvbuf() {
+        use std::os::unix::io::AsRawFd;
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = sock.as_raw_fd();
+        let set = set_socket_buffer_best_effort(fd, libc::SO_RCVBUF).expect("rcvbuf");
+        assert!(set >= QUIC_SOCKET_BUFFER_MIN);
+        let mut got: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: 有効なソケットへの getsockopt。
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut got as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(r, 0);
+        assert!(got >= QUIC_SOCKET_BUFFER_MIN, "rcvbuf stayed at {got}");
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     // ====================
     // 定数テスト
     // ====================
 
+    // GSO_SEGMENT_SIZE は Linux 専用定数（GSO は Linux のみ）なので、テストも Linux に限る。
+    // cfg が無いと BSD/macOS/Windows の `cargo test` がコンパイルエラーになる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_gso_segment_size() {
         // GSO セグメントサイズは適切な値
@@ -1830,6 +1904,7 @@ mod tests {
     fn test_recv_buffer_size() {
         // 受信バッファサイズは十分な大きさ
         assert_eq!(RECV_BUFFER_SIZE, 65536);
+        #[cfg(target_os = "linux")]
         const _: () = assert!(RECV_BUFFER_SIZE >= GSO_SEGMENT_SIZE);
     }
 

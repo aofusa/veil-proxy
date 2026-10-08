@@ -74,13 +74,11 @@
 //! FIXME: don't have both RuntimeMemoryCreator and wasmtime::MemoryCreator,
 //! they should be merged together.
 
-use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::store::StoreResourceLimiter;
 use crate::runtime::vm::vmcontext::VMMemoryDefinition;
 #[cfg(has_virtual_memory)]
 use crate::runtime::vm::{HostAlignedByteCount, MmapOffset};
-use crate::runtime::vm::{MemoryImage, MemoryImageSlot, SendSyncPtr};
+use crate::runtime::vm::{MemoryImage, MemoryImageSlot, SendSyncPtr, VMStore};
 use alloc::sync::Arc;
 use core::{ops::Range, ptr::NonNull};
 use wasmtime_environ::Tunables;
@@ -232,20 +230,19 @@ pub enum Memory {
 
 impl Memory {
     /// Create a new dynamic (movable) memory instance for the specified plan.
-    pub async fn new_dynamic(
+    pub fn new_dynamic(
         ty: &wasmtime_environ::Memory,
-        engine: &Engine,
+        tunables: &Tunables,
         creator: &dyn RuntimeMemoryCreator,
+        store: &mut dyn VMStore,
         memory_image: Option<&Arc<MemoryImage>>,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
-        let tunables = engine.tunables();
+        let (minimum, maximum) = Self::limit_new(ty, Some(store))?;
         let allocation = creator.new_memory(ty, tunables, minimum, maximum)?;
 
         let memory = LocalMemory::new(ty, tunables, allocation, memory_image)?;
         Ok(if ty.shared {
-            Memory::Shared(SharedMemory::wrap(engine, ty, memory)?)
+            Memory::Shared(SharedMemory::wrap(ty, memory)?)
         } else {
             Memory::Local(memory)
         })
@@ -253,15 +250,15 @@ impl Memory {
 
     /// Create a new static (immovable) memory instance for the specified plan.
     #[cfg(feature = "pooling-allocator")]
-    pub async fn new_static(
+    pub fn new_static(
         ty: &wasmtime_environ::Memory,
         tunables: &Tunables,
         base: MemoryBase,
         base_capacity: usize,
         memory_image: MemoryImageSlot,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: &mut dyn VMStore,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, Some(store))?;
         let pooled_memory = StaticMemory::new(base, base_capacity, minimum, maximum)?;
         let allocation = Box::new(pooled_memory);
 
@@ -288,9 +285,9 @@ impl Memory {
     ///
     /// Returns a tuple of the minimum size, optional maximum size, and log(page
     /// size) of the memory, all in bytes.
-    pub(crate) async fn limit_new(
+    pub(crate) fn limit_new(
         ty: &wasmtime_environ::Memory,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: Option<&mut dyn VMStore>,
     ) -> Result<(usize, Option<usize>)> {
         let page_size = usize::try_from(ty.page_size()).unwrap();
 
@@ -333,11 +330,8 @@ impl Memory {
         // `minimum` calculation overflowed. This means that the `minimum` we're
         // informing the limiter is lossy and may not be 100% accurate, but for
         // now the expected uses of limiter means that's ok.
-        if let Some(limiter) = limiter {
-            if !limiter
-                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum)
-                .await?
-            {
+        if let Some(store) = store {
+            if !store.memory_growing(0, minimum.unwrap_or(absolute_max), maximum)? {
                 bail!(
                     "memory minimum size of {} pages exceeds memory limits",
                     ty.limits.min
@@ -400,14 +394,14 @@ impl Memory {
     ///
     /// Ensure that the provided Store is not used to get access any Memory
     /// which lives inside it.
-    pub async unsafe fn grow(
+    pub unsafe fn grow(
         &mut self,
         delta_pages: u64,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        store: Option<&mut dyn VMStore>,
     ) -> Result<Option<usize>, Error> {
         let result = match self {
-            Memory::Local(mem) => mem.grow(delta_pages, limiter).await?,
-            Memory::Shared(mem) => mem.grow(delta_pages)?,
+            Memory::Local(mem) => mem.grow(delta_pages, store)?,
+            Memory::Shared(mem) => mem.grow(delta_pages, store)?,
         };
         match result {
             Some((old, _new)) => Ok(Some(old)),
@@ -583,10 +577,10 @@ impl LocalMemory {
     /// the underlying `grow_to` implementation.
     ///
     /// The `store` is used only for error reporting.
-    pub async fn grow(
+    pub fn grow(
         &mut self,
         delta_pages: u64,
-        mut limiter: Option<&mut StoreResourceLimiter<'_>>,
+        mut store: Option<&mut dyn VMStore>,
     ) -> Result<Option<(usize, usize)>, Error> {
         let old_byte_size = self.alloc.byte_size();
 
@@ -617,11 +611,8 @@ impl LocalMemory {
             .and_then(|n| usize::try_from(n).ok());
 
         // Store limiter gets first chance to reject memory_growing.
-        if let Some(limiter) = &mut limiter {
-            if !limiter
-                .memory_growing(old_byte_size, new_byte_size, maximum)
-                .await?
-            {
+        if let Some(store) = &mut store {
+            if !store.memory_growing(old_byte_size, new_byte_size, maximum)? {
                 return Ok(None);
             }
         }
@@ -687,8 +678,8 @@ impl LocalMemory {
                 // report the growth failure to but the error should not be
                 // dropped
                 // (https://github.com/bytecodealliance/wasmtime/issues/4240).
-                if let Some(limiter) = limiter {
-                    limiter.memory_grow_failed(e)?;
+                if let Some(store) = store {
+                    store.memory_grow_failed(e)?;
                 }
                 Ok(None)
             }
@@ -749,7 +740,7 @@ pub fn validate_atomic_addr(
     }
 
     let length = u64::try_from(def.current_length()).unwrap();
-    if !(addr.saturating_add(access_size) <= length) {
+    if !(addr.saturating_add(access_size) < length) {
         return Err(Trap::MemoryOutOfBounds);
     }
 

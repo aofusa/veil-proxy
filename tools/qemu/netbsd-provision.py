@@ -37,11 +37,27 @@ from pexpect import fdpexpect, TIMEOUT  # type: ignore
 
 
 def connect(con_port: int, timeout: int = 180):
+    """シリアルコンソール（QEMU の telnet サーバ）へ接続する。
+
+    Docker モードでは docker-proxy がホスト側ポートを先に開くため、コンテナ内の QEMU が
+    待ち受けを始める前でも connect() 自体は成功し、直後に EOF / ECONNRESET になる
+    （2026-10 に KVM ホストで実測。provision が毎回 `Connection reset by peer` で落ちた）。
+    QEMU の telnet サーバは接続直後にネゴシエーション（IAC ...）を送ってくるので、
+    最初の 1 バイトを MSG_PEEK で確認できるまで接続し直す。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         s = socket.socket()
         try:
             s.connect(("127.0.0.1", con_port))
+            s.settimeout(5)
+            try:
+                first = s.recv(1, socket.MSG_PEEK)
+            except socket.timeout:
+                first = b"?"  # 何も来ないが切断もされていない＝生きている
+            if not first:
+                raise ConnectionResetError("console closed immediately")
+            s.settimeout(None)
             return s
         except OSError:
             s.close()

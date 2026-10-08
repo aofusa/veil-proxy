@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "fuzz"]
-# third_party/wasmtime は crates.io wasmtime 40.0.4 の vendoring（B-55、path 依存）で
+# third_party/wasmtime は crates.io wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
 # vendoring 先まで対象にしてしまう。詳細は third_party/wasmtime/README.veil.md）。
@@ -19,7 +19,8 @@ members = [".", "fuzz"]
 # 本体のビルド・テスト・パッケージングから完全に切り離すためワークスペース外に置く
 # （詳細は tools/perf/h3load/Cargo.toml の冒頭コメント）。計測時のみ
 # `cargo build --release --manifest-path tools/perf/h3load/Cargo.toml` で明示ビルドする。
-exclude = ["third_party/wasmtime", "tools/perf/h3load"]
+# third_party/quiche も同じ理由で除外する（F-172、crates.io quiche 0.24.9 の vendoring）。
+exclude = ["third_party/wasmtime", "third_party/quiche", "tools/perf/h3load"]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -70,6 +71,14 @@ path = "src/lib.rs"
 # （`VM_MEM_MB=8192 tools/qemu/bsd-vm.sh ... up`）。割り当てられない環境では
 # `release` でビルドし `packaging/scripts/build-bsd.sh` の strip でサイズを削る
 # （strip 単体でも実測 -22%）。
+# B-98: デバッグビルドでも Pulley インタープリタ（NetBSD 全アーキ・FreeBSD/OpenBSD aarch64 の
+# wasmtime 実行系、B-55）だけは最適化する。opt-level 0 のままだと命令ディスパッチが桁違いに
+# 遅く、E2E（デバッグビルド）で WAF モジュールを通るリクエストが 1 回 22 秒かかって
+# 並行実行時にタイムアウトしていた（opt-level 3 で 0.2 秒）。小さいクレートなので
+# ビルド時間への影響は小さく、Cranelift で動くターゲットでは実行経路に乗らない。
+[profile.dev.package.pulley-interpreter]
+opt-level = 3
+
 [profile.dist]
 inherits = "release"
 # クレート跨ぎ最適化とコード生成単位の集約。目的はサイズ削減（上表）。
@@ -288,14 +297,19 @@ full = [
 # feature セットを arch ごとに分ける必要がそもそも無い。x86_64 でも aarch64 でも
 # `--features full-freebsd` 等をそのまま使う。
 
-# FreeBSD: mimalloc の代わりに jemalloc、加えて POSIX AIO 経路（F-127）を有効化する。
+# FreeBSD: mimalloc を使わずシステムの malloc(3)（= libc 内蔵の jemalloc）を使う。
+# B-89: 以前は tikv-jemallocator（`jemalloc` feature）を載せていたが、FreeBSD 向けに
+# ビルドされた jemalloc は libthr のフック（`_malloc_thread_cleanup` /
+# `_malloc_prefork` / `_malloc_postfork`）をプレフィックス無しで定義し、libc 内蔵
+# jemalloc のフックを上書きしてしまう。スレッド終了時に libc 側のスレッドキャッシュが
+# 片付けられず、次のスレッド生成で libc の malloc がクラッシュする（単体テストの
+# 並列実行で 100% 再現）。libc の malloc がそもそも jemalloc なので失うものは無い。
 full-freebsd = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "jemalloc",
     # B-63 / F-145: `aio`（F-127 の POSIX AIO 経路）は **既定から外した**。
     #   - 性能: aio_read/aio_write は「submit + aio_error + aio_return」で
     #     1 I/O あたり 3 syscall を要し、readiness 経路（read/write 1 発）より遅い。
@@ -336,7 +350,7 @@ full-openbsd = [
 # （rustls=ring、quiche=boringssl-boring-crate）。
 # システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
 #
-# **wasm を含む（B-55 解消）**。NetBSD は全アーキテクチャで crates.io wasmtime 40 の
+# **wasm を含む（B-55 解消）**。NetBSD は全アーキテクチャで crates.io wasmtime（36 / 40 とも）の
 # ビルドが通らない（`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
 # `compile_error!("unsupported platform")` になる）が、FreeBSD/OpenBSD aarch64 と同様に
 # `third_party/wasmtime`（`veil-wasmtime`）＋ Pulley インタープリタ実行で解消した。
@@ -495,6 +509,10 @@ lru = "0.18.2"
 # - キャッシュキーの生成、ルーティングキャッシュ、バッファリングで使用
 # - ルーティングキャッシュ等で常時使用するため常時有効
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# ホットパスの HashMap / LRU / DashMap 用の高速ハッシャ（乱数シード付き）。短いキー
+# （ルートキャッシュの u64、QUIC 接続 ID、ファイルパス）で SipHash や xxh3 のストリーミング
+# ハッシャより速い。hashbrown が既に依存しているクレートで、新規の依存は増えない。
+foldhash = "0.2"
 
 # glob パターンマッチング（キャッシュバイパス設定用、cache feature で有効化）
 # - シンプルなワイルドカードパターン
@@ -550,7 +568,7 @@ boring = "4.3"
 # Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1) のターゲット別選択（B-55）
 # ====================
 # <BSD_NOSIG> = netbsd 全アーキ ∪ (openbsd, aarch64) ∪ (freebsd, aarch64)。
-# これらのターゲットは crates.io wasmtime 40 の signals.rs に ucontext 分岐が無く
+# これらのターゲットは crates.io wasmtime（36 / 40 とも）の signals.rs に ucontext 分岐が無く
 # `compile_error!("unsupported platform")` になるため third_party/wasmtime
 # （`veil-wasmtime`、Pulley 専用、詳細は third_party/wasmtime/README.veil.md）に切り替える。
 # 依存キーを分けているのは、同一キー `wasmtime` に対し crates.io と path の 2 つの
@@ -564,7 +582,7 @@ boring = "4.3"
 # - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
 #   `[wasm] interpreter = true`（F-135）・OpenBSD（B-52）・<BSD_NOSIG>（B-55）で常時使用。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+wasmtime = { version = "36.0.17", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 veil-wasmtime = { path = "third_party/wasmtime", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
@@ -738,7 +756,7 @@ required-features = ["wasm"]
 # 入れてはならない（重複シンボルでリンクが壊れる）。
 [target.'cfg(target_os = "linux")'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
-aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
+aws-lc-sys = { version = "0.45", features = ["ssl", "bindgen"] }
 
 # FreeBSD は capsicum capability mode 下でも証明書ホットリロードが
 # 動作する in-memory SSL_CTX API（`Config::with_boring_ssl_ctx_builder`、F-136）が
@@ -779,3 +797,11 @@ rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "p
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
 tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
+
+# F-172: quiche は 1 パケットに STREAM フレームを 1 つしか詰めない（upstream は fuzzing
+# ビルド時のみ複数フレームを詰める）。小さい応答を多数多重化する HTTP/3 ではリクエストごとに
+# 1 パケット（sendto + AEAD + ヘッダ保護）を払うことになり、FreeBSD aarch64 の 3B 静的配信で
+# 送信 syscall が 1.01/req（nginx 0.22/req）だった。常に詰めるよう 1 箇所だけ差し替えた
+# vendoring 版で全ターゲットの quiche を置き換える。詳細は third_party/quiche/README.veil.md。
+[patch.crates-io]
+quiche = { path = "third_party/quiche" }

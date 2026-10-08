@@ -103,13 +103,14 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `all` | 下記を setup → fetch まで一括実行 |
 | `setup` | helper イメージ build + ゲストイメージ取得 + SSH 鍵生成（+ FreeBSD は cloud-init シード、OpenBSD は autoinstall 応答ファイル） |
 | `reset` | 起動用オーバーレイを作り直して初期状態へ戻す（**再ダウンロード不要**、FreeBSD） |
-| `up` / `down` / `status` / `console` | VM ライフサイクル（`down` は ACPI シャットダウンを先に試す） |
+| `up` / `down` / `status` / `console` | VM ライフサイクル（`down` は ACPI シャットダウンを先に試す）。**`up` は起動中なら何もしない**（以前は起動中の VM を即時 kill して起動し直しており、FreeBSD の UFS が汚れてシングルユーザーの fsck 待ちで止まり、fsck の SALVAGE で cargo レジストリや pkg のファイルが壊れた）。作り直すときは `VM_RESTART=1`（正常停止してから起動） |
 | `wait` | SSH 到達までブロック |
 | `provision` | SSH 鍵注入まで（OS ごとに方式が違う。下記） |
 | `toolchain` | VM 内へ rust / cmake / llvm / gmake 等を導入 |
 | `sync` | リポジトリを VM へ転送（tar over ssh） |
 | `build` | VM 内でリリースビルド（既定 `--no-default-features --features full-freebsd\|full-openbsd`） |
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
+| `unit` | VM 内で単体テスト（`--lib`）+ 統合テスト（E2E と同じ feature・環境変数） |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 
 > **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**

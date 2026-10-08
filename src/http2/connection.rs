@@ -252,7 +252,12 @@ where
     /// 4. クライアント SETTINGS を受信して ACK (run() ループで処理)
     pub async fn handshake(&mut self) -> Http2Result<()> {
         // 1. クライアントプリフェースを受信
-        self.expect_preface().await?;
+        if let Err(e) = self.expect_preface().await {
+            if matches!(e, Http2Error::InvalidPreface) {
+                self.reject_invalid_preface().await;
+            }
+            return Err(e);
+        }
 
         // 2. サーバー SETTINGS を送信
         self.send_settings().await?;
@@ -288,6 +293,33 @@ where
 
         self.buf_start += preface_len;
         Ok(())
+    }
+
+    /// 不正なプリフェースを受けた接続を閉じる（エラー経路のみ）。
+    ///
+    /// RFC 9113 §3.4: 不正なプリフェースは PROTOCOL_ERROR のコネクションエラー。
+    /// GOAWAY を送ってから送信側を閉じ、相手が閉じるまで（時間・量の上限付きで）読み捨てる。
+    /// 未読データを残したまま close すると TCP は FIN ではなく RST を送り、相手が GOAWAY を
+    /// 読む前に捨てられ得る（h2spec 3.5/2 が h2c で「connection reset by peer」になった）。
+    async fn reject_invalid_preface(&mut self) {
+        const LINGER: std::time::Duration = std::time::Duration::from_millis(500);
+        const MAX_DRAIN: usize = 64 * 1024;
+        let _ = self
+            .send_goaway(Http2ErrorCode::ProtocolError, b"invalid connection preface")
+            .await;
+        let _ = self.stream.shutdown().await;
+        let _ = crate::runtime::time::timeout(LINGER, async {
+            let mut drained = 0usize;
+            while drained < MAX_DRAIN {
+                self.buf_start = 0;
+                self.buf_end = 0;
+                match self.fill_read_buf().await {
+                    Ok(n) => drained += n,
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
     }
 
     /// SETTINGS フレームを送信
@@ -1088,16 +1120,15 @@ where
                             "Connection-specific header field",
                         ));
                     }
-                    b"te" => {
+                    b"te"
                         // TE ヘッダーは "trailers" 以外禁止 (RFC 7540 8.1.2.2)
-                        if !header.value.eq_ignore_ascii_case(b"trailers") {
+                        if !header.value.eq_ignore_ascii_case(b"trailers") => {
                             return Err(Http2Error::stream_error(
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,
                                 "TE header with value other than 'trailers'",
                             ));
                         }
-                    }
                     _ => {}
                 }
             }
@@ -2494,14 +2525,8 @@ mod tests {
 
     /// 単純な同期ドライバ（io_uring 不要な送信テスト用）。Pending は自己 wake 前提で即再試行。
     fn drive<F: Future>(mut fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
         loop {
             match fut.as_mut().poll(&mut cx) {
@@ -2966,5 +2991,25 @@ mod tests {
         conn.recv_data_for_streaming(1, false, 100).expect("recv 2");
         conn.replenish_recv_window(1);
         assert!(conn.write_buf.is_empty(), "閾値未満では補充しない");
+    }
+
+    #[test]
+    fn invalid_preface_sends_goaway_protocol_error() {
+        // RFC 9113 §3.4 / h2spec 3.5/2: 不正なプリフェースには GOAWAY(PROTOCOL_ERROR) を返す。
+        let mut conn = Http2Connection::new_with_initial_buffer(
+            RecordingStream::new(),
+            Http2Settings::default(),
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+        );
+        let result = drive(conn.handshake());
+        assert!(matches!(result, Err(Http2Error::InvalidPreface)));
+        let out = conn.stream.concat();
+        // フレームヘッダ: length(3) type(1) flags(1) stream_id(4)、GOAWAY = 0x7。
+        assert!(out.len() >= 9 + 8, "GOAWAY が送られていない: {out:?}");
+        assert_eq!(out[3], 0x7, "先頭フレームが GOAWAY ではない");
+        let error_code = u32::from_be_bytes([out[13], out[14], out[15], out[16]]);
+        assert_eq!(error_code, Http2ErrorCode::ProtocolError as u32);
+        // GOAWAY 1 フレームだけで、SETTINGS 等は送らない（ハンドシェイクを続けない）。
+        assert_eq!(out.len(), 9 + 8 + b"invalid connection preface".len());
     }
 }

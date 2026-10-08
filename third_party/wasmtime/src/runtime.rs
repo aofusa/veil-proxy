@@ -25,16 +25,18 @@
 // explanation of why truncation shouldn't be happening at runtime. This
 // situation should be pretty rare though.
 #![warn(clippy::cast_possible_truncation)]
+#![warn(
+    unsafe_op_in_unsafe_fn,
+    reason = "opt-in until the crate opts-in as a whole -- #11180"
+)]
 
 #[macro_use]
 pub(crate) mod func;
 
 pub(crate) mod code;
 pub(crate) mod code_memory;
-#[cfg(feature = "debug")]
+#[cfg(feature = "debug-builtins")]
 pub(crate) mod debug;
-#[cfg(feature = "gc")]
-pub(crate) mod exception;
 pub(crate) mod externals;
 #[cfg(feature = "async")]
 pub(crate) mod fiber;
@@ -45,14 +47,13 @@ pub(crate) mod limits;
 pub(crate) mod linker;
 pub(crate) mod memory;
 pub(crate) mod module;
-#[cfg(feature = "debug-builtins")]
-pub(crate) mod native_debug;
 pub(crate) mod resources;
 pub(crate) mod store;
 pub(crate) mod trampoline;
 pub(crate) mod trap;
 pub(crate) mod type_registry;
 pub(crate) mod types;
+pub(crate) mod uninhabited;
 pub(crate) mod v128;
 pub(crate) mod values;
 pub(crate) mod vm;
@@ -75,10 +76,6 @@ cfg_if::cfg_if! {
 }
 
 pub use code_memory::CodeMemory;
-#[cfg(feature = "debug")]
-pub use debug::*;
-#[cfg(feature = "gc")]
-pub use exception::*;
 pub use externals::*;
 pub use func::*;
 pub use gc::*;
@@ -99,8 +96,10 @@ pub use types::*;
 pub use v128::V128;
 pub use values::*;
 
+pub(crate) use uninhabited::*;
+
 #[cfg(feature = "pooling-allocator")]
-pub use vm::{PoolConcurrencyLimitError, PoolingAllocatorMetrics};
+pub use vm::PoolConcurrencyLimitError;
 
 #[cfg(feature = "profiling")]
 mod profiling;

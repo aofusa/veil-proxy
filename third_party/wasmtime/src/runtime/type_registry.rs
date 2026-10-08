@@ -500,7 +500,6 @@ impl Hash for RecGroupEntry {
 }
 
 impl Borrow<WasmRecGroup> for RecGroupEntry {
-    #[inline]
     fn borrow(&self) -> &WasmRecGroup {
         &self.0.hash_consing_key
     }

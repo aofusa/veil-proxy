@@ -127,7 +127,8 @@ fn drain_rustls_into<R: std::io::Read>(drained: &mut Vec<u8>, mut rd: R) {
 
 pub struct SimpleTlsServerStream {
     inner: TcpStream,
-    conn: Option<ServerConnection>,
+    /// `ServerConnection` は 1KB 超あるため Box で持つ（`ktls_rustls::KtlsServerStream` と同じ理由）。
+    conn: Option<Box<ServerConnection>>,
     mode: TlsMode,
     drained_buffer: Vec<u8>,
 }
@@ -142,6 +143,20 @@ impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
 }
 
 impl SimpleTlsServerStream {
+    /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
+    /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
+    ///
+    /// 復号済みの平文が残っていれば即座に返る。rustls 内部の平文は `read()` が毎回
+    /// `drained_buffer` へ排出しているため、2 回目以降のリクエスト待ちでは
+    /// `drained_buffer` だけを見ればよい（接続直後の 1 回目には使わないこと）。
+    #[cfg(veil_poller_kqueue)]
+    pub async fn wait_next_request(&self) -> io::Result<()> {
+        if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
+            return Ok(());
+        }
+        self.inner.readable_lazy().await
+    }
+
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
     }
@@ -296,9 +311,7 @@ async fn do_server_handshake(
         // 先行読み取りデータがあれば先に処理
         if let Some(data) = initial_data.take() {
             if !data.is_empty() {
-                conn.read_tls(&mut &data[..])?;
-                conn.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::tls_writev::read_tls_all(&mut *conn, &data)?;
                 // データの処理後にハンドシェイクが終わる可能性があるため、ループの先頭に戻る
                 continue;
             }
@@ -316,9 +329,7 @@ async fn do_server_handshake(
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -353,9 +364,7 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -390,7 +399,7 @@ pub async fn accept(
 
     Ok(SimpleTlsServerStream {
         inner: stream,
-        conn: Some(conn),
+        conn: Some(Box::new(conn)),
         mode: TlsMode::Rustls,
         drained_buffer: Vec::new(),
     })
@@ -449,8 +458,6 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
         }
 
         let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
         loop {
             // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
             // （received_plaintext 既定 16KB 上限の溢れ防止。大容量 h2/TLS アップロード対応）。
@@ -476,28 +483,39 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
                 return (Ok(len), buf);
             }
 
-            match raw_read(fd, &mut read_buf) {
-                Ok(0) => return (Ok(0), buf),
-                Ok(n) => {
-                    let conn = match self.conn.as_mut() {
-                        Some(c) => c,
-                        None => return (Err(io::Error::other("TLS connection closed")), buf),
+            let fed = crate::tls_writev::with_rx_scratch(
+                |read_buf| -> io::Result<crate::tls_writev::RxFed> {
+                    let n = match raw_read(fd, read_buf) {
+                        Ok(0) => return Ok(crate::tls_writev::RxFed::Eof),
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(crate::tls_writev::RxFed::WouldBlock)
+                        }
+                        Err(e) => return Err(e),
                     };
+                    let conn = self
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("TLS connection closed"))?;
                     let mut consumed = 0;
                     while consumed < n {
-                        let tls_read = match conn.read_tls(&mut &read_buf[consumed..n]) {
-                            Ok(0) => break,
-                            Ok(r) => r,
-                            Err(e) => return (Err(e), buf),
-                        };
-                        consumed += tls_read;
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        let r = conn.read_tls(&mut &read_buf[consumed..n])?;
+                        if r == 0 {
+                            break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // 各 process 後に平文を退避し received_plaintext を空に保つ。
                         drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(crate::tls_writev::RxFed::Fed)
+                },
+            );
+            match fed {
+                Ok(crate::tls_writev::RxFed::Fed) => {}
+                Ok(crate::tls_writev::RxFed::Eof) => return (Ok(0), buf),
+                Ok(crate::tls_writev::RxFed::WouldBlock) => {
                     if let Err(e) = self.inner.readable().await {
                         return (Err(e), buf);
                     }
@@ -587,8 +605,6 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
         }
 
         let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
         loop {
             // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
             // （received_plaintext 既定 16KB 上限の溢れ防止）。
@@ -608,35 +624,41 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
                 return (Ok(len), buf);
             }
 
-            match raw_read(fd, &mut read_buf) {
-                Ok(0) => {
-                    return (Ok(0), buf);
-                }
-                Ok(n) => {
+            let fed = crate::tls_writev::with_rx_scratch(
+                |read_buf| -> io::Result<crate::tls_writev::RxFed> {
+                    let n = match raw_read(fd, read_buf) {
+                        Ok(0) => return Ok(crate::tls_writev::RxFed::Eof),
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(crate::tls_writev::RxFed::WouldBlock)
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let conn = &mut self.conn;
                     let mut consumed = 0;
                     while consumed < n {
-                        let tls_read = match self.conn.read_tls(&mut &read_buf[consumed..n]) {
-                            Ok(0) => break, // rustls がこれ以上読めない
-                            Ok(r) => r,
-                            Err(e) => {
-                                return (Err(e), buf);
-                            }
-                        };
-                        consumed += tls_read;
-                        if let Err(e) = self.conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        let r = conn.read_tls(&mut &read_buf[consumed..n])?;
+                        if r == 0 {
+                            break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
-                        drain_rustls_into(&mut self.drained_buffer, self.conn.reader());
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // 各 process 後に平文を退避し received_plaintext を空に保つ。
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(crate::tls_writev::RxFed::Fed)
+                },
+            );
+            match fed {
+                Ok(crate::tls_writev::RxFed::Fed) => {}
+                Ok(crate::tls_writev::RxFed::Eof) => return (Ok(0), buf),
+                Ok(crate::tls_writev::RxFed::WouldBlock) => {
                     if let Err(e) = self.inner.readable().await {
                         return (Err(e), buf);
                     }
                 }
-                Err(e) => {
-                    return (Err(e), buf);
-                }
+                Err(e) => return (Err(e), buf),
             }
         }
     }

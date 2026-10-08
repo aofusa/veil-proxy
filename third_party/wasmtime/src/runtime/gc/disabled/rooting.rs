@@ -1,13 +1,13 @@
 use crate::runtime::vm::{GcStore, VMGcRef};
 use crate::{
     AsContext, AsContextMut, GcRef, Result, RootedGcRef,
+    runtime::Uninhabited,
     store::{AutoAssertNoGc, StoreOpaque},
 };
-use core::convert::Infallible;
 use core::fmt::{self, Debug};
 use core::hash::{Hash, Hasher};
 use core::marker;
-use core::ops::{Deref, DerefMut};
+use core::ops::Deref;
 
 mod sealed {
     use super::*;
@@ -48,7 +48,7 @@ impl RootSet {
 /// This type is disabled because the `gc` cargo feature was not enabled at
 /// compile time.
 pub struct Rooted<T: GcRef> {
-    pub(crate) inner: Infallible,
+    pub(crate) inner: Uninhabited,
     _phantom: marker::PhantomData<T>,
 }
 
@@ -99,7 +99,7 @@ impl<T: GcRef> Rooted<T> {
         match self.inner {}
     }
 
-    pub fn to_owned_rooted(&self, _store: impl AsContextMut) -> Result<OwnedRooted<T>> {
+    pub fn to_manually_rooted(&self, _store: impl AsContextMut) -> Result<ManuallyRooted<T>> {
         match self.inner {}
     }
 
@@ -122,7 +122,7 @@ pub struct RootScope<C>
 where
     C: AsContextMut,
 {
-    inner: Infallible,
+    inner: Uninhabited,
     _phantom: marker::PhantomData<C>,
 }
 
@@ -157,21 +157,21 @@ where
 
 /// This type has been disabled because the `gc` cargo feature was not enabled
 /// at compile time.
-pub struct OwnedRooted<T>
+pub struct ManuallyRooted<T>
 where
     T: GcRef,
 {
-    pub(crate) inner: Infallible,
+    pub(crate) inner: Uninhabited,
     _phantom: marker::PhantomData<T>,
 }
 
-impl<T: GcRef> Debug for OwnedRooted<T> {
+impl<T: GcRef> Debug for ManuallyRooted<T> {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.inner {}
     }
 }
 
-impl<T: GcRef> Deref for OwnedRooted<T> {
+impl<T: GcRef> Deref for ManuallyRooted<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -179,11 +179,15 @@ impl<T: GcRef> Deref for OwnedRooted<T> {
     }
 }
 
-impl<T> OwnedRooted<T>
+impl<T> ManuallyRooted<T>
 where
     T: GcRef,
 {
     pub fn clone(&self, _store: impl AsContextMut) -> Self {
+        match self.inner {}
+    }
+
+    pub fn unroot(self, _store: impl AsContextMut) {
         match self.inner {}
     }
 
@@ -196,32 +200,8 @@ where
     }
 }
 
-impl<T: GcRef> RootedGcRefImpl<T> for OwnedRooted<T> {
+impl<T: GcRef> RootedGcRefImpl<T> for ManuallyRooted<T> {
     fn assert_unreachable<U>(&self) -> U {
         match self.inner {}
-    }
-}
-
-pub(crate) struct OpaqueRootScope<S> {
-    store: S,
-}
-
-impl<S> Deref for OpaqueRootScope<S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        &self.store
-    }
-}
-
-impl<S> DerefMut for OpaqueRootScope<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.store
-    }
-}
-
-impl<S> OpaqueRootScope<S> {
-    pub(crate) fn new(store: S) -> Self {
-        OpaqueRootScope { store }
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! For example, when given the following tree-like call graph:
 //!
-//! ```text
+//! ```ignore
 //! +---+   +---+   +---+
 //! | a |-->| b |-->| c |
 //! +---+   +---+   +---+
@@ -28,7 +28,7 @@
 //!
 //! then stratification will produce these layers:
 //!
-//! ```text
+//! ```ignore
 //! [
 //!     {c, d, f, g},
 //!     {b, e},

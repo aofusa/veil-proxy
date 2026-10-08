@@ -263,7 +263,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     16,  // ioctl (ソケット、kTLS 設定)
     39,  // getpid
     63,  // uname (カーネルバージョン検出)
-    147, // prctl (PR_SET_NAME、seccomp)
+    157, // prctl (PR_SET_NAME、seccomp)。B-103: 以前は 147（sched_get_priority_min）を書いていた
     158, // arch_prctl
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
@@ -405,7 +405,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     16,  // ioctl (ソケット、kTLS 設定)
     39,  // getpid
     63,  // uname (カーネルバージョン検出)
-    147, // prctl (PR_SET_NAME、seccomp)
+    157, // prctl (PR_SET_NAME、seccomp)。B-103: 以前は 147（sched_get_priority_min）を書いていた
     158, // arch_prctl
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
@@ -490,7 +490,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     215, // munmap
     222, // mmap
     226, // mprotect
-    227, // mremap
+    216, // mremap。B-103: 以前は 227（msync）を書いていた
     233, // madvise
     228, // mlock
     229, // munlock
@@ -521,10 +521,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    146, // setresuid
-    147, // getresuid
-    148, // setresgid
-    149, // getresgid
+    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
+    148, // getresuid
+    149, // setresgid
+    150, // getresgid
     172, // getpid
     173, // getppid
     174, // getuid
@@ -543,8 +543,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     25,  // fcntl
     29,  // ioctl
-    63,  // uname
-    160, // uname (alias)
+    160, // uname（B-103: 以前は 63 = read を uname として重複記載していた）
     167, // prctl
     261, // prlimit64
     278, // getrandom
@@ -624,7 +623,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     215, // munmap
     222, // mmap
     226, // mprotect
-    227, // mremap
+    216, // mremap。B-103: 以前は 227（msync）を書いていた
     233, // madvise
     228, // mlock
     229, // munlock
@@ -655,10 +654,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    146, // setresuid
-    147, // getresuid
-    148, // setresgid
-    149, // getresgid
+    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
+    148, // getresuid
+    149, // setresgid
+    150, // getresgid
     172, // getpid
     173, // getppid
     174, // getuid
@@ -677,8 +676,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     25,  // fcntl
     29,  // ioctl
-    63,  // uname
-    160, // uname (alias)
+    160, // uname（B-103: 以前は 63 = read を uname として重複記載していた）
     167, // prctl
     261, // prlimit64
     278, // getrandom
@@ -2374,6 +2372,8 @@ pub fn report_sandbox_support() {
 //   グローバル名前空間操作（`connect(2)`、`open(2)` の絶対パス等）が一切できなくなるため、
 //   バックエンドへ `connect(2)` する構成（プロキシ/upstream あり）では使えない
 //   （設計ドキュメント 4.2 節）。静的ファイル配信のみの構成でのみ自動適用する。
+//   UDS バックエンド接続（F-170）も AF_UNIX へのパス指定 `connect(2)` である点は同じで、
+//   同じ制約を受ける（upstream ありの構成では capsicum は使えない、という結論に変更なし）。
 #[cfg(target_os = "freebsd")]
 pub mod capsicum {
     use ftlog::{info, warn};
@@ -2710,7 +2710,7 @@ pub mod capsicum {
     /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
     /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
     pub fn open_static_ro(abs: &Path) -> Option<io::Result<std::fs::File>> {
-        with_resolved_root(abs, |dirfd, rel| {
+        retry_outside_capmode(with_resolved_root(abs, |dirfd, rel| {
             let fd = unsafe {
                 libc::openat(
                     dirfd,
@@ -2724,12 +2724,34 @@ pub mod capsicum {
                 // SAFETY: openat が返した所有権のある有効な fd。
                 Ok(unsafe { std::fs::File::from_raw_fd(fd) })
             }
-        })
+        }))
+    }
+
+    /// `O_RESOLVE_BENEATH` が `ENOTCAPABLE` を返したとき、capability mode の外であれば
+    /// `None` を返して呼び出し側の従来経路（`canonicalize()` + 含有チェック）に
+    /// そのリクエスト限りで再判定させる。
+    ///
+    /// FreeBSD の `O_RESOLVE_BENEATH` は、リンク先がルート**内**であっても**絶対**
+    /// シンボリックリンクを `ENOTCAPABLE` で拒否する（Linux の `RESOLVE_BENEATH` が
+    /// `EXDEV` を返すのと同じ仕様）。これを権威ある拒否として扱うと、
+    /// `current -> /srv/www/releases/vNNN` 型のデプロイが 404 になる（F-153 が Linux で
+    /// 避けた失敗モードが FreeBSD にだけ残っていた。BSD 実機の単体テストで検出）。
+    /// `..` によるルート外への脱出も同じ errno になるが、従来経路の含有チェックが拒否する。
+    /// capability mode 内では絶対パスの `realpath` が使えないため従来どおり拒否のまま。
+    fn retry_outside_capmode<T>(r: Option<io::Result<T>>) -> Option<io::Result<T>> {
+        match r {
+            Some(Err(ref e))
+                if e.raw_os_error() == Some(libc::ENOTCAPABLE) && !is_capability_mode() =>
+            {
+                None
+            }
+            other => other,
+        }
     }
 
     /// capability mode 下でルート dirfd 相対に `fstatat` する（`canonicalize`+`metadata` 代替）。
     pub fn stat_static(abs: &Path) -> Option<io::Result<StaticStat>> {
-        with_resolved_root(abs, |dirfd, rel| {
+        retry_outside_capmode(with_resolved_root(abs, |dirfd, rel| {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::fstatat(dirfd, rel.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
             if ret != 0 {
@@ -2752,7 +2774,7 @@ pub mod capsicum {
                 is_file,
                 is_dir,
             })
-        })
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -3768,6 +3790,37 @@ mod tests {
         assert!(!ALLOWED_SYSCALLS.contains(&427)); // io_uring_register
                                                    // eventfd2 は offload 用に両バックエンド共通で許可される。
         assert!(ALLOWED_SYSCALLS.contains(&290));
+    }
+
+    /// B-103: 許可リストは番号の手書きなので、コメントと番号がずれても気づけない
+    /// （x86_64 の prctl を 147 = sched_get_priority_min と書いていた）。
+    /// 実際に使う syscall を `libc::SYS_*`（アーキごとの正しい番号）で引いて確認する。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_allowed_syscalls_match_libc_numbers() {
+        // 権限降格（set*id）は seccomp 適用より前に終わるのでここでは要求しない。
+        let required: &[(&str, i64)] = &[
+            ("read", libc::SYS_read),
+            ("write", libc::SYS_write),
+            ("prctl", libc::SYS_prctl),
+            ("mremap", libc::SYS_mremap),
+            ("uname", libc::SYS_uname),
+            ("getrandom", libc::SYS_getrandom),
+            ("prlimit64", libc::SYS_prlimit64),
+            ("rt_sigreturn", libc::SYS_rt_sigreturn),
+            ("futex", libc::SYS_futex),
+            ("openat2", libc::SYS_openat2),
+            ("eventfd2", libc::SYS_eventfd2),
+        ];
+        for (name, nr) in required {
+            assert!(
+                ALLOWED_SYSCALLS.contains(nr),
+                "{name} ({nr}) が seccomp 許可リストに無い"
+            );
+        }
     }
 
     // ALLOWED_SYSCALLS は Linux syscall 番号表のため、参照するテストは Linux 限定

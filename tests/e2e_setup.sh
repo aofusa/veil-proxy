@@ -64,10 +64,21 @@ BACKEND_GRPC2_PORT=9014
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
 BACKEND_BAD_PORT=9009
+BACKEND_BAD_B93_PORT=9010
 BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
 BACKEND_UDP_ECHO_PORT=9019
+
+# F-170: UDS バックエンド（Unix ドメインソケット上流）検証用のソケットパス。
+# バックエンドは veil 自身（F-164 の UDS リスナー）を使い、1 プロセスで
+# TLS 用と h2c 用の 2 本のソケットを listen する。
+# 注意: sockaddr_un の sun_path は 108 バイト上限のため、パスは短く保つこと。
+BACKEND_UDS_TLS_SOCK="${FIXTURES_DIR}/uds_tls.sock"
+BACKEND_UDS_H2C_SOCK="${FIXTURES_DIR}/uds_h2c.sock"
+# h2c 専用プロセスの（使用しない）TLS リスナー。[server].listen は必須キーのため置く。
+BACKEND_UDS_H2C_TLS_SOCK="${FIXTURES_DIR}/uds_h2c_tls.sock"
+BACKEND_UDS_MISSING_SOCK="${FIXTURES_DIR}/uds_missing.sock"
 
 # 色付き出力
 RED='\033[0;31m'
@@ -189,6 +200,8 @@ prepare_fixtures() {
     mkdir -p "${FIXTURES_DIR}/backend1"
     mkdir -p "${FIXTURES_DIR}/backend2"
     mkdir -p "${FIXTURES_DIR}/backend_h2c"
+    # F-170: UDS バックエンド用フィクスチャ（パスプレフィックス検証用の api/v1 を含む）
+    mkdir -p "${FIXTURES_DIR}/backend_uds/api/v1"
     
     # テスト用証明書を生成
     # CA:FALSE を指定して end-entity 証明書として生成
@@ -220,6 +233,11 @@ prepare_fixtures() {
     echo "OK" > "${FIXTURES_DIR}/backend1/health"
     echo "OK" > "${FIXTURES_DIR}/backend2/health"
     echo "OK" > "${FIXTURES_DIR}/backend_h2c/health"
+
+    # F-170: UDS バックエンド用テストファイル
+    echo "<h1>Hello from UDS Backend</h1>" > "${FIXTURES_DIR}/backend_uds/index.html"
+    echo "OK" > "${FIXTURES_DIR}/backend_uds/health"
+    echo "uds prefix v1 test" > "${FIXTURES_DIR}/backend_uds/api/v1/test"
 
     # 圧縮テスト・大容量ファイルテスト用（1024バイト超の圧縮閾値とtest_static_file_large用）
     #
@@ -453,6 +471,91 @@ index = "index.html"
 add_response_headers = { "X-Server-Id" = "backend_h2c" }
 EOF
 
+    # F-170: UDS バックエンド設定。veil 自身を Unix ドメインソケットで listen させ
+    # （F-164 の UDS リスナー）、プロキシ側から `http(s)://unix:<path>` で接続する。
+    #
+    # B-83 は修正済み。backend1 / backend_h2c と同じく、TLS 用と h2c 用でプロセスを
+    # 分ける構成にしてある（1 プロセスにまとめると h2c のために `http2_enabled = true`
+    # が必要になり、TLS リスナーの ALPN に `h2` が広告されるため、両方のリスナーを
+    # 同一構成で検証したい場合の構成分離として維持する）。
+    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}" "${BACKEND_UDS_H2C_TLS_SOCK}"
+    cat > "${FIXTURES_DIR}/backend_uds_tls.toml" << EOF
+[server]
+listen = "unix:${BACKEND_UDS_TLS_SOCK}"
+threads = 1
+unix_socket_permissions = "0660"
+
+[tls]
+cert_path = "${FIXTURES_DIR}/cert.pem"
+key_path = "${FIXTURES_DIR}/key.pem"
+ktls_enabled = ${backend_ktls_enabled}
+
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_tls" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_tls" }
+EOF
+
+    cat > "${FIXTURES_DIR}/backend_uds_h2c.toml" << EOF
+[server]
+listen = "unix:${BACKEND_UDS_H2C_TLS_SOCK}"  # 未使用（listen は必須キー）
+h2c_listen = "unix:${BACKEND_UDS_H2C_SOCK}"  # h2c 専用（使用する）
+threads = 1
+http2_enabled = true
+h2c_enabled = true
+unix_socket_permissions = "0660"
+
+[tls]
+cert_path = "${FIXTURES_DIR}/cert.pem"
+key_path = "${FIXTURES_DIR}/key.pem"
+ktls_enabled = ${backend_ktls_enabled}
+
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_h2c" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_h2c" }
+EOF
+
     # プロキシ設定（設定タイプに応じて生成）
     local algorithm="round_robin"
     case "$config_type" in
@@ -648,12 +751,74 @@ servers = [
     "http://127.0.0.1:${BACKEND_BAD_PORT}"
 ]
 
+# B-93 の回帰テスト専用。bad-pool と同じ挙動の別ポートにし、上流コネクションプールを
+# 他のテスト（並列実行）と共有しない（共有すると、他テストが直前 1ms 未満に返却した
+# 閉じかけの接続を拾い得る＝B-93 の既知の窓で、テストがフレークする）。
+[upstreams."bad-b93-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_BAD_B93_PORT}"
+]
+
 # SNI 上書き検証用（IP 直打ち + sni_name = localhost）
 [upstreams."sni-pool"]
 algorithm = "round_robin"
 servers = [
     { url = "https://127.0.0.1:${BACKEND1_PORT}", sni_name = "localhost" }
 ]
+tls_insecure = true
+
+# F-170: UDS バックエンド（Unix ドメインソケット上流）
+# `http(s)://unix:<socket-path>[:<path-prefix>]` は nginx の
+# `proxy_pass http://unix:/path:/uri;` と同じ表記。Host ヘッダは既定で "localhost"。
+[upstreams."uds-tls-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://unix:${BACKEND_UDS_TLS_SOCK}"
+]
+tls_insecure = true
+
+[upstreams."uds-h2c-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+# パスプレフィックス付き（/uds-prefix/v1/test -> バックエンドの /api/v1/test）
+[upstreams."uds-prefix-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}:/api", use_h2c = true }
+]
+
+# 存在しないソケットへの接続（502 になること）
+[upstreams."uds-missing-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_MISSING_SOCK}", use_h2c = true }
+]
+
+# UDS 上流に対する TCP ヘルスチェック（unix: アドレスでプローブできること）
+[upstreams."uds-health-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+[upstreams."uds-health-pool".health_check]
+enabled = true
+check_type = "tcp"
+interval_secs = 2
+timeout_secs = 2
+healthy_threshold = 1
+unhealthy_threshold = 3
+
+# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
+# （BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する。この上流を https:// で参照し、
+# 上流クライアントの ALPN から h2 を外しても中継が壊れないことを確認する。
+[upstreams."alpn-h2-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
 tls_insecure = true
 
 # F-44: HTTPS echo バックエンド（自己署名証明書・TLS ストリーミング検証用）
@@ -848,6 +1013,90 @@ rate_limit_requests_per_min = 10
 EOF
     fi
 
+    # F-170: UDS バックエンド検証ルート
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/uds-tls/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-tls-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/uds-h2c/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-h2c-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/uds-prefix/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-prefix-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/uds-missing/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-missing-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/uds-health/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-health-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/uds-tls/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-tls-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/uds-h2c/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-h2c-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/uds-prefix/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-prefix-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/uds-missing/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-missing-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/uds-health/*"
+[route.action]
+type = "Proxy"
+upstream = "uds-health-pool"
+EOF
+
     # バックエンド接続オプション検証ルート（SNI / 厳密証明書 / ヘルスチェック種別）
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
@@ -866,6 +1115,22 @@ path = "/sni-upstream/*"
 [route.action]
 type = "Proxy"
 upstream = "sni-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/alpn-h2/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-pool"
 
 [[route]]
 [route.conditions]
@@ -1078,6 +1343,14 @@ path = "/bad-backend/*"
 [route.action]
 type = "Proxy"
 upstream = "bad-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/bad-backend-b93/*"
+[route.action]
+type = "Proxy"
+upstream = "bad-b93-pool"
 
 # B-10: Round Robin 分散テスト専用ルート（共有 "/" と RR ステートを隔離）
 [[route]]
@@ -1802,6 +2075,15 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
 
+    # F-170: UDS バックエンド起動（B-83 のため TLS 用と h2c 用でプロセスを分ける）
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_uds_tls.toml" > /tmp/backend_uds_tls.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "UDS TLS Backend started on ${BACKEND_UDS_TLS_SOCK} (PID: $!)"
+
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_uds_h2c.toml" > /tmp/backend_uds_h2c.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "UDS H2C Backend started on ${BACKEND_UDS_H2C_SOCK} (PID: $!)"
+
     # gRPCバックエンド起動（スタンドアロンEchoサーバー、ビルドは ensure_veil_binary で完了済み）
     log_info "Starting gRPC Echo Backend..."
     RUST_LOG=debug GRPC_LISTEN_ADDR="127.0.0.1:${BACKEND_GRPC_PORT}" GRPC_SERVER_ID="grpc-server-1" \
@@ -1819,7 +2101,7 @@ start_servers() {
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
@@ -1830,7 +2112,7 @@ start_servers() {
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_BAD_B93_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
             sleep 0.2
             break
         fi
@@ -1861,6 +2143,22 @@ start_servers() {
         log_info "H2C Backend is ready (HTTP/2 over cleartext mode)"
     else
         log_warn "H2C Backend may not be fully ready, continuing..."
+    fi
+
+    # F-170: UDS バックエンドのソケットファイル生成待ち（HTTP プローブは
+    # UDS 相手に curl が使えないため、ソケットの存在で readiness を判定する）
+    local uds_wait=0
+    while [ $uds_wait -lt 30 ]; do
+        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ] \
+            && [ -S "${BACKEND_UDS_H2C_TLS_SOCK}" ]; then
+            log_info "UDS Backend is ready (both sockets bound)"
+            break
+        fi
+        sleep 0.5
+        uds_wait=$((uds_wait + 1))
+    done
+    if [ $uds_wait -ge 30 ]; then
+        log_warn "UDS Backend sockets did not appear, continuing..."
     fi
 
     # gRPCバックエンド起動待機
@@ -1993,7 +2291,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
@@ -2281,7 +2579,10 @@ run_tests() {
 cleanup() {
     log_info "Cleaning up..."
     stop_servers
-    rm -rf "${FIXTURES_DIR}/backend1" "${FIXTURES_DIR}/backend2"
+    rm -rf "${FIXTURES_DIR}/backend1" "${FIXTURES_DIR}/backend2" "${FIXTURES_DIR}/backend_uds"
+    # F-170: UDS ソケットファイルの後始末（残っていると次回起動時に stale socket として
+    # unlink されるが、フィクスチャを汚さないよう明示的に消す）
+    rm -f "${FIXTURES_DIR}"/*.sock
     rm -f "${FIXTURES_DIR}"/*.toml
 }
 

@@ -77,6 +77,28 @@ impl HostPortStr {
         }
     }
 
+    /// `unix:<path>` 形式（F-170: UDS バックエンドの接続先表記）。
+    ///
+    /// `ProxyTarget::unix_path` は `Arc<str>` で保持しているため、`Path` への往復
+    /// （`to_str()` の `expect` パニック経路）を経由せず `&str` を直接受け取る
+    /// （フェーズ1 レビュー指摘: `expect` はホットパスの panic 経路として不要に
+    /// 危険なため、そもそも UTF-8 でない状態を型で作れないようにする）。
+    #[inline]
+    pub(crate) fn unix(path: &str) -> Self {
+        let need = 5 + path.len(); // "unix:" (5 bytes)
+        if need <= 260 {
+            let mut buf = [0u8; 260];
+            buf[..5].copy_from_slice(b"unix:");
+            buf[5..need].copy_from_slice(path.as_bytes());
+            HostPortStr::Stack {
+                buf,
+                len: need as u16,
+            }
+        } else {
+            HostPortStr::Heap(format!("unix:{path}"))
+        }
+    }
+
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
         match self {
@@ -157,7 +179,37 @@ impl PoolKeyStr {
         }
     }
 
+    /// `addr` 形式（SNI なし、平文/HTTP プール用）。`addr` は接続先表記
+    /// （`ProxyTarget::conn_addr()` の結果。TCP は `host:port`、UDS は `unix:<path>`）。
+    ///
+    /// F-170: 単一パーツの `join_colon` は区切り文字を追加しないため `addr` そのものと
+    /// バイト単位で一致する（`plain(host, port)` との等価性は下の単体テストで保証）。
+    #[inline]
+    pub(crate) fn plain_addr(addr: &str) -> Self {
+        Self::join_colon(&[addr])
+    }
+
+    /// `addr:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
+    #[inline]
+    pub(crate) fn tls_addr(addr: &str, sni: &str, tls_insecure: bool) -> Self {
+        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
+    }
+
+    /// `addr:tag` 形式（TLS プール用、SNI なし）。
+    #[inline]
+    pub(crate) fn tls_addr_no_sni(addr: &str, tls_insecure: bool) -> Self {
+        Self::join_colon(&[addr, insecure_tag(tls_insecure)])
+    }
+
     /// `host:port` 形式（SNI なし、平文/HTTP プール用）。
+    ///
+    /// F-170: 本番コードは `plain_addr` へ移行済み（`target.conn_addr()` を渡す形）。
+    /// この `host,port` ベースのコンストラクタは **F-170 以前の実装をそのまま凍結**した
+    /// 単体テスト専用（`#[cfg(test)]`）で、`join_colon` を直接呼ぶ独立した経路として
+    /// `plain_addr` と突き合わせることで不変条件（同じ入力で 1 バイトも変わらない）を
+    /// 検証する。`plain_addr` に委譲すると「同じコードを 2 回呼ぶだけ」の空虚なテストに
+    /// なるため、意図的に実装を重複させている。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn plain(host: &str, port: u16) -> Self {
         let mut port_buf = itoa::Buffer::new();
@@ -165,6 +217,8 @@ impl PoolKeyStr {
     }
 
     /// `host:port:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由。旧実装を凍結）。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn tls(host: &str, port: u16, sni: &str, tls_insecure: bool) -> Self {
         let mut port_buf = itoa::Buffer::new();
@@ -172,19 +226,12 @@ impl PoolKeyStr {
     }
 
     /// `host:port:tag` 形式（TLS プール用、SNI なし）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由。旧実装を凍結）。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn tls_no_sni(host: &str, port: u16, tls_insecure: bool) -> Self {
         let mut port_buf = itoa::Buffer::new();
         Self::join_colon(&[host, port_buf.format(port), insecure_tag(tls_insecure)])
-    }
-
-    /// `addr:sni:tag` 形式（H2 バックエンドプール用、`addr` は既にフォーマット済みの
-    /// `host:port` 文字列）。
-    // `h2_proxy_https`（src/proxy.rs）からのみ使用され、それは http2 feature 限定。
-    #[cfg(feature = "http2")]
-    #[inline]
-    pub(crate) fn addr_sni(addr: &str, sni: &str, tls_insecure: bool) -> Self {
-        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
     }
 }
 
@@ -209,8 +256,8 @@ fn insecure_tag(tls_insecure: bool) -> &'static str {
 ///
 /// # 形式
 /// `Via: 1.1 <hostname>`
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &str) {
     let via_value = format!("1.1 {}", hostname).into_bytes();
 
@@ -237,8 +284,8 @@ pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &s
 /// # Returns
 /// * `Ok(())` - ヘッダーが有効
 /// * `Err(String)` - エラーメッセージ
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn validate_http_headers(
     headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
 ) -> Result<(), String> {
@@ -291,8 +338,8 @@ pub(crate) fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8
 /// # Returns
 /// * `Ok(new_max)` - 拡張後の最大ヘッダー数
 /// * `Err(String)` - 上限超過エラー
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn check_header_count(
     current_count: usize,
     max_headers: usize,
@@ -440,8 +487,8 @@ pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
 ///
 /// # Arguments
 /// * `headers` - ヘッダーのリスト（変更される）
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     // Connectionヘッダーで指定された追加ヘッダーを収集
     // Connectionヘッダー値をトリムして収集（lowercase化は eq_ignore_ascii_case で不要）
@@ -593,8 +640,8 @@ pub(crate) fn normalize_range(spec: &RangeSpec, content_length: u64) -> Option<(
 ///
 /// # Returns
 /// 206レスポンスヘッダー（ボディなし）
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn build_partial_response_header(
     start: u64,
     end: u64,
@@ -698,8 +745,8 @@ pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
 }
 
 /// リクエストからRangeヘッダーを取得
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn get_range_header(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Option<&[u8]> {
     headers
         .iter()
@@ -710,8 +757,8 @@ pub(crate) fn get_range_header(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)])
 /// Accept-Ranges: bytes ヘッダーを追加するかチェック
 ///
 /// 静的ファイル配信時にクライアントにRangeリクエストサポートを通知
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn should_advertise_accept_ranges(method: &[u8]) -> bool {
     // GETとHEADでのみAccept-Rangesを通知
     method.eq_ignore_ascii_case(b"GET") || method.eq_ignore_ascii_case(b"HEAD")
@@ -1363,7 +1410,7 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))] // 理由: ストリーミング転送（F-32）は http2 / http3 経路のみ
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {
@@ -2005,9 +2052,8 @@ mod stack_fmt_tests {
     }
 
     #[test]
-    #[cfg(feature = "http2")]
-    fn pool_key_str_addr_sni_matches_format() {
-        let k = PoolKeyStr::addr_sni("backend.example.com:443", "sni.example.com", true);
+    fn pool_key_str_tls_addr_matches_format() {
+        let k = PoolKeyStr::tls_addr("backend.example.com:443", "sni.example.com", true);
         assert_eq!(
             k.as_str(),
             format!(
@@ -2016,6 +2062,44 @@ mod stack_fmt_tests {
             )
         );
         assert!(matches!(k, PoolKeyStr::Stack { .. }));
+    }
+
+    /// F-170: `host,port` ベースの旧コンストラクタ（`plain`/`tls`/`tls_no_sni`。
+    /// `join_colon` を直接呼ぶ独立した実装として本テスト内に凍結）と `addr` ベースの
+    /// 新コンストラクタ（`plain_addr`/`tls_addr`/`tls_addr_no_sni`）が、TCP（`unix:` を
+    /// 含まない `addr`）で完全に同じ文字列を生成することを突き合わせる。両者が同じ
+    /// 実装に委譲していると「同じコードを 2 回呼ぶだけ」の空虚なテストになるため、
+    /// 独立した 2 経路の一致を確認する不変条件テストとして維持する。
+    #[test]
+    fn pool_key_str_addr_based_matches_host_port_based_for_tcp() {
+        let host = "backend.example.com";
+        let port = 8443u16;
+        let sni = "sni.example.com";
+        let addr = HostPortStr::new(host, port);
+        let addr = addr.as_str();
+
+        assert_eq!(
+            PoolKeyStr::plain(host, port).as_str(),
+            PoolKeyStr::plain_addr(addr).as_str()
+        );
+        for insecure in [true, false] {
+            assert_eq!(
+                PoolKeyStr::tls(host, port, sni, insecure).as_str(),
+                PoolKeyStr::tls_addr(addr, sni, insecure).as_str()
+            );
+            assert_eq!(
+                PoolKeyStr::tls_no_sni(host, port, insecure).as_str(),
+                PoolKeyStr::tls_addr_no_sni(addr, insecure).as_str()
+            );
+        }
+    }
+
+    /// F-170: UDS 表記の `unix(path)` が `unix:<path>` を生成すること
+    /// （プールキー・ノード ID の入力になる接続先表記の唯一の入口）。
+    #[test]
+    fn host_port_str_unix_formats_prefixed_path() {
+        let hp = HostPortStr::unix("/run/app.sock");
+        assert_eq!(hp.as_str(), "unix:/run/app.sock");
     }
 
     #[test]

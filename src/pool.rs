@@ -290,8 +290,117 @@ impl<T> PooledConnection<T> {
     }
 
     /// 接続がまだ有効かどうかを判定（タイムアウトチェック）
+    ///
+    /// HTTP/HTTPS のプールは B-93 で `pooled_conn_reusable`（生存確認つき）へ移ったため、
+    /// 利用者は h2c のプール（`http2`）とテストだけ。
+    #[cfg(any(feature = "http2", test))]
     pub(crate) fn is_valid(&self) -> bool {
         self.created_at.elapsed().as_secs() < self.idle_timeout_secs
+    }
+}
+
+/// B-93: プール内のアイドル時間がこれ未満の接続は生存確認を省く。
+///
+/// 高負荷時はプールへ返した接続が数十 µs 以内に再利用されるため、ここで毎回 syscall を
+/// 打つと「1 プロキシリクエスト 1 syscall」の固定費になる（ホットパス絶対規則）。上流が
+/// アイドル接続を閉じる典型（Node.js の `keepAliveTimeout` 5 秒、nginx の
+/// `keepalive_timeout` 等）はこれよりはるかに長いアイドルの後に起きるため、閾値以上の
+/// 接続だけ確認すれば実害のある競合は拾える。閾値未満で残る窓（上流が応答直後に
+/// `Connection: close` 無しで閉じた FIN がまだ届いていない）は MSG_PEEK でも原理的に
+/// 検出できないので、閾値を下げても救えない。
+const POOL_LIVENESS_CHECK_MIN_IDLE: Duration = Duration::from_millis(1);
+
+/// B-93: プール済みソケットの状態（非ブロッキング `recv(MSG_PEEK)` 1 回で判定）。
+#[derive(Debug, PartialEq, Eq)]
+enum PooledPeerState {
+    /// 受信データなし・接続継続中（再利用してよい）。
+    Idle,
+    /// 未読データがある（平文 HTTP では前応答の残骸 = 再利用すると応答がずれる）。
+    HasData,
+    /// 上流が閉じた（EOF）またはソケットエラー（RST 等）。
+    Closed,
+}
+
+/// B-93: アイドル接続の生存確認。ブロッキングしない（`MSG_DONTWAIT` / 非ブロッキングソケット）。
+#[cfg(unix)]
+fn peek_pooled_peer(fd: crate::runtime::handle::RawFd) -> PooledPeerState {
+    let mut b = 0u8;
+    // SAFETY: 1 バイトのスタックバッファへの MSG_PEEK。fd はプールが所有する有効なソケット。
+    let r = unsafe {
+        libc::recv(
+            fd,
+            (&mut b as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match r {
+        0 => PooledPeerState::Closed,
+        n if n > 0 => PooledPeerState::HasData,
+        _ => match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+                PooledPeerState::Idle
+            }
+            _ => PooledPeerState::Closed,
+        },
+    }
+}
+
+/// B-93: Windows 版。reactor の Winsock ソケットは非ブロッキングなので `MSG_PEEK` のみで足りる。
+#[cfg(windows)]
+fn peek_pooled_peer(fd: crate::runtime::handle::RawFd) -> PooledPeerState {
+    use windows_sys::Win32::Networking::WinSock::{
+        recv, WSAGetLastError, MSG_PEEK, SOCKET_ERROR, WSAEINTR, WSAEWOULDBLOCK,
+    };
+    let mut b = 0u8;
+    // SAFETY: 1 バイトのスタックバッファへの MSG_PEEK。fd はプールが所有する有効なソケット。
+    let r = unsafe {
+        recv(
+            crate::runtime::handle::win::to_socket(fd),
+            &mut b,
+            1,
+            MSG_PEEK as i32,
+        )
+    };
+    if r == 0 {
+        PooledPeerState::Closed
+    } else if r > 0 {
+        PooledPeerState::HasData
+    } else if r == SOCKET_ERROR && matches!(unsafe { WSAGetLastError() }, WSAEWOULDBLOCK | WSAEINTR)
+    {
+        PooledPeerState::Idle
+    } else {
+        PooledPeerState::Closed
+    }
+}
+
+/// B-93: プールから取り出した接続を再利用してよいか。
+///
+/// アイドルタイムアウト超過は破棄。`POOL_LIVENESS_CHECK_MIN_IDLE` 以上アイドルだった
+/// 接続だけ `MSG_PEEK` で生存確認し、上流が閉じていれば破棄する。従来は確認しなかったため、
+/// 上流がアイドル接続を閉じた直後に再利用すると要求を書いた先で EOF を読み、
+/// **クライアントへ 502 を返していた**（nginx は同じ状況で別接続へ再試行する）。
+///
+/// `reject_unread_data`: 平文 HTTP では未読データ＝前応答の残骸（`Content-Length` を
+/// 超えて送ってきた等）なので、再利用すると次の応答とずれる。TLS では上流が送る
+/// post-handshake メッセージ（TLS 1.3 の NewSessionTicket 等）が正当に残り得るため破棄しない。
+fn pooled_conn_reusable(
+    created_at: std::time::Instant,
+    idle_timeout_secs: u64,
+    fd: crate::runtime::handle::RawFd,
+    reject_unread_data: bool,
+) -> bool {
+    let idle = created_at.elapsed();
+    if idle.as_secs() >= idle_timeout_secs {
+        return false;
+    }
+    if idle < POOL_LIVENESS_CHECK_MIN_IDLE {
+        return true;
+    }
+    match peek_pooled_peer(fd) {
+        PooledPeerState::Idle => true,
+        PooledPeerState::HasData => !reject_unread_data,
+        PooledPeerState::Closed => false,
     }
 }
 
@@ -309,9 +418,15 @@ impl HttpConnectionPool {
 
     /// プールから接続を取得（有効な接続がなければNone）
     pub(crate) fn get(&mut self, key: &str) -> Option<TcpStream> {
+        use crate::runtime::handle::AsRawFd;
         if let Some(queue) = self.connections.get_mut(key) {
             while let Some(entry) = queue.pop_front() {
-                if entry.is_valid() {
+                if pooled_conn_reusable(
+                    entry.created_at,
+                    entry.idle_timeout_secs,
+                    entry.stream.as_raw_fd(),
+                    true,
+                ) {
                     // F-09: コネクションプールヒットを記録
                     crate::metrics::record_connection_pool_hit(key);
                     return Some(entry.stream);
@@ -371,7 +486,13 @@ impl HttpsConnectionPool {
     pub(crate) fn get(&mut self, key: &str) -> Option<ClientTls> {
         if let Some(queue) = self.connections.get_mut(key) {
             while let Some(entry) = queue.pop_front() {
-                if entry.is_valid() {
+                if pooled_conn_reusable(
+                    entry.created_at,
+                    entry.idle_timeout_secs,
+                    // 内側の TCP ソケットの fd（Unix の `handle::AsRawFd` は std の re-export）。
+                    <ClientTls as crate::runtime::handle::AsRawFd>::as_raw_fd(&entry.stream),
+                    false,
+                ) {
                     // F-09: コネクションプールヒットを記録
                     crate::metrics::record_connection_pool_hit(key);
                     return Some(entry.stream);
@@ -1447,6 +1568,97 @@ mod alt_svc_tests {
     }
 }
 
+// B-93: プール接続の生存確認（MSG_PEEK）の回帰テスト。std のブロッキングソケットを
+// 使うが、判定関数は MSG_DONTWAIT で非ブロッキングに覗くのでテストがハングしない。
+#[cfg(all(test, unix))]
+mod pooled_liveness_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+
+    // テスト専用のループバック接続（同期ソケット。テストはデータプレーン外）。
+    #[allow(clippy::disallowed_methods)]
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        (c, s)
+    }
+
+    /// 対向の FIN/データがローカルソケットへ届くまで待つ（ループバックでも非同期）。
+    fn wait_until(fd: crate::runtime::handle::RawFd, want: PooledPeerState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while peek_pooled_peer(fd) != want {
+            assert!(
+                Instant::now() < deadline,
+                "peer state never became {want:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn peek_reports_idle_data_and_closed() {
+        let (c, mut s) = pair();
+        assert_eq!(peek_pooled_peer(c.as_raw_fd()), PooledPeerState::Idle);
+        s.write_all(b"x").unwrap();
+        wait_until(c.as_raw_fd(), PooledPeerState::HasData);
+        // MSG_PEEK はデータを消費しない。
+        assert_eq!(peek_pooled_peer(c.as_raw_fd()), PooledPeerState::HasData);
+
+        let (c2, s2) = pair();
+        drop(s2);
+        wait_until(c2.as_raw_fd(), PooledPeerState::Closed);
+    }
+
+    #[test]
+    fn reusable_rejects_closed_peer_after_min_idle() {
+        let (c, s) = pair();
+        drop(s);
+        wait_until(c.as_raw_fd(), PooledPeerState::Closed);
+        let idle_since = Instant::now() - POOL_LIVENESS_CHECK_MIN_IDLE * 2;
+        assert!(!pooled_conn_reusable(idle_since, 30, c.as_raw_fd(), true));
+        assert!(!pooled_conn_reusable(idle_since, 30, c.as_raw_fd(), false));
+    }
+
+    #[test]
+    fn reusable_skips_syscall_below_min_idle() {
+        // 閾値未満は確認しない（高負荷時の即時再利用に syscall を足さない）ので、
+        // 閉じた接続でも true になる。これは仕様（閾値の doc コメント参照）。
+        let (c, s) = pair();
+        drop(s);
+        wait_until(c.as_raw_fd(), PooledPeerState::Closed);
+        assert!(pooled_conn_reusable(
+            Instant::now(),
+            30,
+            c.as_raw_fd(),
+            true
+        ));
+    }
+
+    #[test]
+    fn reusable_unread_data_policy_differs_for_plain_and_tls() {
+        let (c, mut s) = pair();
+        s.write_all(b"leftover").unwrap();
+        wait_until(c.as_raw_fd(), PooledPeerState::HasData);
+        let idle_since = Instant::now() - POOL_LIVENESS_CHECK_MIN_IDLE * 2;
+        // 平文: 前応答の残骸 → 破棄
+        assert!(!pooled_conn_reusable(idle_since, 30, c.as_raw_fd(), true));
+        // TLS: post-handshake メッセージの可能性 → 再利用
+        assert!(pooled_conn_reusable(idle_since, 30, c.as_raw_fd(), false));
+    }
+
+    #[test]
+    fn reusable_rejects_idle_timeout_and_accepts_live_idle() {
+        let (c, _s) = pair();
+        let idle_since = Instant::now() - POOL_LIVENESS_CHECK_MIN_IDLE * 2;
+        assert!(pooled_conn_reusable(idle_since, 30, c.as_raw_fd(), true));
+        let expired = Instant::now() - Duration::from_secs(31);
+        assert!(!pooled_conn_reusable(expired, 30, c.as_raw_fd(), true));
+    }
+}
+
 // ====================
 // テスト
 // ====================
@@ -1521,6 +1733,8 @@ mod tests {
 
     // B-44: バックエンドコネクションプールが max_idle まで保持し、それ以上は
     // 最古のものから破棄することの回帰テスト（BACKEND_POOL_MAX_IDLE_PER_HOST = 256）。
+    // ダミー接続に socketpair(2) を使うため unix 限定（Windows に AF_UNIX socketpair は無い）。
+    #[cfg(unix)]
     mod http_connection_pool {
         use super::super::*;
 
@@ -1538,6 +1752,9 @@ mod tests {
 
         #[test]
         fn test_put_respects_max_idle_256() {
+            // 256 本超の fd を同時に保持する。macOS の既定 soft limit は 256 なので、
+            // 本番の起動処理と同じく soft を引き上げてから行う。
+            crate::system::raise_nofile_limit();
             let mut pool = HttpConnectionPool::new();
             let key = "example.test:80";
             for _ in 0..(BACKEND_POOL_MAX_IDLE_PER_HOST + 8) {

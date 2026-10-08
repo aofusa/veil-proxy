@@ -9,11 +9,7 @@ fn main() {
     let unix = cfg("unix");
     let windows = cfg("windows");
     let miri = cfg("miri");
-
-    // A boolean indicating whether there's a `sys` module for this platform.
-    // This is true for `unix` or `windows`, but both of those require the `std`
-    // feature to also be active so check that too.
-    let supported_os = (unix || windows) && cfg!(feature = "std");
+    let supported_os = unix || windows;
 
     // Determine if the current host architecture is supported by Cranelift
     // meaning that we might be executing native code.
@@ -22,11 +18,12 @@ fn main() {
         _ => false,
     };
 
-    // B-55: signals.rs には netbsd 全アーキ・openbsd/freebsd の aarch64 向け
-    // ucontext 分岐が無く、has_native_signals=true のままだと
-    // compile_error!("unsupported platform") になる。これらのターゲットは
-    // Pulley インタープリタ実行のみを想定しており（veil 側で強制）
+    // B-55: signals.rs には netbsd 全アーキ・openbsd の aarch64 向け ucontext 分岐が無く、
+    // has_native_signals=true のままだと compile_error!("unsupported platform") になる。
+    // これらのターゲットは Pulley インタープリタ実行のみを想定しており（veil 側で強制）
     // シグナルベーストラップは元々不要なため、ここで明示的に無効化する。
+    // freebsd の aarch64 は上流が対応しているが、veil は従来どおり Pulley で動かす
+    // （third_party/wasmtime/README.veil.md 参照）。
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let veil_force_no_native_signals = match (target_os.as_str(), target_arch.as_str()) {
@@ -41,11 +38,9 @@ fn main() {
         && has_host_compiler_backend
         && !veil_force_no_native_signals;
     let has_virtual_memory = supported_os || cfg!(feature = "custom-virtual-memory");
-    let has_custom_sync = !cfg!(feature = "std") && cfg!(feature = "custom-sync-primitives");
 
     custom_cfg("has_native_signals", has_native_signals);
     custom_cfg("has_virtual_memory", has_virtual_memory);
-    custom_cfg("has_custom_sync", has_custom_sync);
     custom_cfg("has_host_compiler_backend", has_host_compiler_backend);
 
     // If this OS isn't supported and no debug-builtins or if Cranelift doesn't support
@@ -102,13 +97,12 @@ fn build_c_helpers() {
     build.define("VERSIONED_SUFFIX", Some(versioned_suffix!()));
     if std::env::var("CARGO_FEATURE_DEBUG_BUILTINS").is_ok() {
         build.define("FEATURE_DEBUG_BUILTINS", None);
-    } else if cfg("windows") {
-        // If debug builtins are disabled and this target is for Windows then
-        // there's no need to build the C helpers file.
-        //
-        // TODO: should skip this on Unix targets as well but needs a solution
-        // for `wasmtime_using_libunwind`.
-        return;
+    }
+
+    // On MinGW targets work around a bug in the MinGW compiler described at
+    // https://github.com/bytecodealliance/wasmtime/pull/9688#issuecomment-2573367719
+    if cfg("windows") && cfg_is("target_env", "gnu") {
+        build.define("__USE_MINGW_SETJMP_NON_SEH", None);
     }
 
     println!("cargo:rerun-if-changed=src/runtime/vm/helpers.c");

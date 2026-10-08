@@ -11,7 +11,7 @@ use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
 use bytes::{Bytes, BytesMut};
-use ftlog::{debug, error, info, warn};
+use ftlog::{debug, error, warn};
 use httparse::{Request, Status};
 use std::io;
 use std::net::SocketAddr;
@@ -65,10 +65,24 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 #[inline]
 async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
     if let Some(sock_addr) = target.socket_addr {
-        TcpStream::connect(sock_addr).await
-    } else {
-        TcpStream::connect_str(addr).await
+        return TcpStream::connect(sock_addr).await;
     }
+    // F-170: UDS バックエンド。`target.unix_path` があるので `connect_str` の
+    // `unix:` 接頭辞判定を経由せず直接 `connect_unix` を呼ぶ（`connect_str` 側でも
+    // `unix:` を扱えるため二重に安全だが、ホットパスで余計な文字列走査をしない）。
+    //
+    // **`#[cfg(unix)]` は必須**（B-69 クラス）: `unix_path` は非 unix でも
+    // 存在する（常に `None`）フィールドなので cfg を付けないとこの分岐が
+    // Windows でもコンパイル対象になり、`reactor::tcp::windows::TcpStream` に
+    // 無い `connect_unix` を呼んで**クロスビルドだけが壊れる**（Linux の
+    // 単体・統合・E2E はすべて通過する）。非 unix では `unix_path` が常に `None`
+    // のため、素通りして `connect_str` へ落ちる挙動で正しい（`connect_str` 側も
+    // `unix:` を非対応エラーで弾く）。
+    #[cfg(unix)]
+    if let Some(path) = &target.unix_path {
+        return TcpStream::connect_unix(std::path::Path::new(path.as_ref())).await;
+    }
+    TcpStream::connect_str(addr).await
 }
 
 /// プロキシ起動時刻（F-21: 管理API /stats 用）
@@ -334,7 +348,7 @@ pub fn check_security(
 /// **重要**: これらのエラーはクライアントが接続を閉じた場合の正常な動作であり、
 /// サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
 /// ログには警告として出力しますが、接続は正常終了として扱います。
-#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+#[cfg_attr(not(feature = "http2"), allow(dead_code))] // 理由: HTTP/2 経路からのみ呼ばれる
 #[inline]
 fn build_sub_path(base: &str, remaining: &str) -> String {
     if remaining.is_empty() {
@@ -1014,7 +1028,8 @@ fn h2_spawn_for_request<S>(
         trailers: parts.trailers,
         client_ip: std::rc::Rc::clone(client_ip),
         client_socket_addr,
-        start: Instant::now(),
+        // アクセスログ・メトリクスが無効なら時刻を読まない（ストリームごとの固定費）。
+        start: crate::logging::request_start_instant(),
     };
 
     let (resp_tx, resp_rx) = crate::stream_channel::channel::<H2RespMsg>(H2_RESP_CHANNEL_CAP);
@@ -1445,7 +1460,7 @@ async fn h2_send(
     notify: &crate::stream_channel::Notify,
     msg: H2RespMsg,
 ) -> Result<(), ()> {
-    let r = resp_tx.send(msg).await;
+    let r = resp_tx.send(msg).await.map_err(|_| ());
     notify.notify();
     r
 }
@@ -1976,7 +1991,7 @@ async fn h2_proxy(
 
     // H2C バックエンドは HPACK 応答のため専用処理。
     if target.use_h2c || upstream_group.use_h2c() {
-        let addr = HostPortStr::new(&target.host, target.port);
+        let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
         let addr = addr.as_str();
         let result = h2_proxy_h2c(
             ctx,
@@ -2032,7 +2047,7 @@ async fn h2_proxy(
     request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
     request.extend_from_slice(&ctx.body);
 
-    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
     let addr = addr.as_str();
 
     let result = if target.use_tls {
@@ -2348,7 +2363,7 @@ async fn h2_proxy_https(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    let pool_key = crate::http_utils::PoolKeyStr::addr_sni(addr, sni, tls_insecure);
+    let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_insecure);
 
     let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key.as_str())) {
         Some(stream) => stream,
@@ -3466,7 +3481,7 @@ async fn h2_serve_streaming(
     let use_tls = target.use_tls;
     let sni = target.sni().to_string();
     let tls_insecure = upstream_group.tls_insecure();
-    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
     let addr = addr.as_str();
 
     // chunked リクエストヘッダ構築。
@@ -4045,6 +4060,19 @@ async fn h2c_connect_and_handshake(
 /// コンテキスト新規確保よりは軽い）。
 #[cfg(all(feature = "http2", feature = "compression"))]
 fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
+    zstd_compress_reused(body, level).unwrap_or_else(|| body.to_vec())
+}
+
+/// スレッドローカルの zstd 圧縮コンテキストを使い回して `body` を圧縮する。
+/// 失敗したら `None`（呼び出し側が無圧縮へフォールバックする）。
+///
+/// B-99: HTTP/1.1 のプロキシ圧縮経路（`transfer_compressed_response` /
+/// `transfer_https_compressed_response`）は F-169 の後も `zstd::encode_all`（呼び出しごとに
+/// コンテキストを確保・初期化するワンショット API）のままで、54KB の zstd レベル 3 に
+/// 1 リクエストあたり約 1.6ms の CPU を使っていた（静的配信の 6 倍）。HTTP/2・HTTP/3 と
+/// 同じくこの関数でコンテキストを使い回す。
+#[cfg(feature = "compression")]
+fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
     use std::cell::RefCell;
 
     thread_local! {
@@ -4056,18 +4084,10 @@ fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
         let mut slot = cell.borrow_mut();
         let compressor = match slot.as_mut() {
             Some(c) => c,
-            None => {
-                let c = match zstd::bulk::Compressor::new(level) {
-                    Ok(c) => c,
-                    Err(_) => return body.to_vec(),
-                };
-                slot.get_or_insert(c)
-            }
+            None => slot.get_or_insert(zstd::bulk::Compressor::new(level).ok()?),
         };
-        if compressor.set_compression_level(level).is_err() {
-            return body.to_vec();
-        }
-        compressor.compress(body).unwrap_or_else(|_| body.to_vec())
+        compressor.set_compression_level(level).ok()?;
+        compressor.compress(body).ok()
     })
 }
 
@@ -4358,6 +4378,35 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     }
 
     (ProtocolType::Unknown, Vec::new())
+}
+
+/// h2c 専用リスナーで HTTP/2 プリフェース以外を受けた接続を閉じる（エラー経路のみ）。
+///
+/// RFC 9113 §3.4: 不正なプリフェースは PROTOCOL_ERROR のコネクションエラー。固定の
+/// GOAWAY(last_stream_id=0, PROTOCOL_ERROR) を送り、送信側を閉じてから相手の close まで
+/// （時間・量の上限付きで）読み捨てる。未読データを残して close すると TCP は FIN ではなく
+/// RST を送り、相手が GOAWAY を読む前に捨てられ得る（h2spec 3.5/2 で検出）。
+#[cfg(feature = "http2")]
+pub async fn reject_h2c_invalid_preface(mut stream: TcpStream) {
+    const LINGER: Duration = Duration::from_millis(500);
+    const MAX_DRAIN: usize = 64 * 1024;
+    // length=8, type=GOAWAY(0x7), flags=0, stream=0 / last_stream_id=0, error=PROTOCOL_ERROR(0x1)
+    const GOAWAY_PROTOCOL_ERROR: [u8; 17] = [0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1];
+    let _ = timeout(LINGER, stream.write_all(GOAWAY_PROTOCOL_ERROR.to_vec())).await;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = timeout(LINGER, async {
+        let mut drained = 0usize;
+        let mut buf = vec![0u8; 4096];
+        while drained < MAX_DRAIN {
+            let (res, b) = stream.read(buf).await;
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => drained += n,
+                _ => break,
+            }
+        }
+    })
+    .await;
 }
 
 /// H2Cサーバー接続処理
@@ -4696,11 +4745,31 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
     let mut connection_metric = ActiveConnectionMetric::new(true);
+    // 接続直後の 1 回目の読み取りか（kqueue の待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
+    #[cfg(veil_poller_kqueue)]
+    let mut first_read = true;
 
     loop {
         // 読み込み（アイドルタイムアウト付き）
         let read_buf = buf_get();
-        let read_result = timeout(IDLE_TIMEOUT, tls_stream.read(read_buf)).await;
+        // kqueue: 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
+        // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから 1 回だけ読む。
+        #[cfg(veil_poller_kqueue)]
+        let wait_first = !first_read && accumulated.is_empty();
+        #[cfg(veil_poller_kqueue)]
+        {
+            first_read = false;
+        }
+        let read_result = timeout(IDLE_TIMEOUT, async {
+            #[cfg(veil_poller_kqueue)]
+            if wait_first {
+                if let Err(e) = tls_stream.wait_next_request().await {
+                    return (Err(e), read_buf);
+                }
+            }
+            tls_stream.read(read_buf).await
+        })
+        .await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
@@ -5206,16 +5275,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .unwrap_or(&path_bytes);
 
                 let config = CURRENT_CONFIG.load();
-                // client_ipをSocketAddrに変換
-                let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
-                    addr
-                } else {
-                    if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-                        SocketAddr::new(ip, 80)
-                    } else {
-                        peer_addr
-                    }
-                };
+                // ルーティングの送信元条件に使うアドレス。`client_ip` は呼び出し側で
+                // `peer_addr.ip()` から作った文字列なので、毎リクエスト文字列から
+                // パースし直さず（DTrace で `read_ipv4_addr` がホットスポットに出ていた）
+                // `peer_addr` をそのまま使う（送信元条件が見るのは IP のみ）。
+                let client_socket_addr = peer_addr;
 
                 // ヘッダーをゼロコピーのバイト列スライスとして参照し、
                 // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）
@@ -5429,8 +5493,8 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     }
                 };
 
-                // 処理時間計測開始（Instant: モノトニック・高精度）
-                let start_instant = Instant::now();
+                // 処理時間計測開始（アクセスログ・メトリクスが無効なら時刻を読まない）
+                let start_instant = crate::logging::request_start_instant();
 
                 // バッファクリア（次のリクエストに備える）
                 accumulated.clear();
@@ -5688,7 +5752,12 @@ async fn handle_backend(
     }
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
-            handle_proxy(
+            // handle_proxy のフューチャは約 19KB あり、インラインで待つと handle_backend の
+            // フューチャ全体が 22KB になる。handle_backend は毎リクエスト生成・ムーブされるため、
+            // 静的配信のリクエストでもこの 22KB の memcpy を払っていた（FreeBSD のプロファイルで
+            // memcpy が最大のホットスポット）。プロキシ経路だけを Box に逃がし、他の経路の
+            // フューチャを約 10KB に縮める。
+            Box::pin(handle_proxy(
                 tls_stream,
                 &upstream_group,
                 &security,
@@ -5705,7 +5774,7 @@ async fn handle_backend(
                 client_wants_close,
                 wasm_modules,
                 client_ip,
-            )
+            ))
             .await
         }
         Backend::MemoryFile(data, mime_type, security, _) => {
@@ -6102,7 +6171,7 @@ async fn handle_websocket_proxy_http(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -6216,7 +6285,7 @@ async fn handle_websocket_proxy_https(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -6895,15 +6964,18 @@ async fn handle_proxy(
     let resilience_start = std::time::Instant::now();
 
     let target = &server.target;
-    // コネクションプールキーの生成
+    // コネクションプールキーの生成（F-170: 接続先表記＝conn_addr() を第 1 要素にする。
+    // TCP では host:port と 1 バイトも変わらないため、プール再利用は不変）。
     // HTTPS: SNI と tls_insecure 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
     let tls_insecure = upstream_group.tls_insecure();
+    let pool_key_addr = target.conn_addr();
+    let pool_key_addr = pool_key_addr.as_str();
     let pool_key = if target.use_tls && target.sni_name.is_some() {
-        crate::http_utils::PoolKeyStr::tls(&target.host, target.port, target.sni(), tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr(pool_key_addr, target.sni(), tls_insecure)
     } else if target.use_tls {
-        crate::http_utils::PoolKeyStr::tls_no_sni(&target.host, target.port, tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr_no_sni(pool_key_addr, tls_insecure)
     } else {
-        crate::http_utils::PoolKeyStr::plain(&target.host, target.port)
+        crate::http_utils::PoolKeyStr::plain_addr(pool_key_addr)
     };
 
     // リクエストパス構築
@@ -7168,11 +7240,9 @@ async fn handle_proxy(
                     );
                 }
                 if s.is_ejected() {
-                    crate::metrics::set_outlier_ejected(
-                        &upstream_group.name,
-                        &format!("{}:{}", s.target.host, s.target.port),
-                        true,
-                    );
+                    // F-170: 接続先表記（conn_addr）で識別する。TCP は従来と不変。
+                    let addr = s.target.conn_addr();
+                    crate::metrics::set_outlier_ejected(&upstream_group.name, addr.as_str(), true);
                 }
             }
         }
@@ -7276,7 +7346,7 @@ async fn proxy_http_pooled(
         Some(stream) => stream,
         None => {
             // 新規接続を作成（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-            let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+            let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
             let addr = addr.as_str();
             let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -7515,7 +7585,7 @@ async fn proxy_h2c(
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
 
     // バックエンドに接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -8610,11 +8680,28 @@ async fn transfer_response_with_compression(
     // 初期値false: エラー時はKeep-Aliveを無効化
     let mut backend_wants_keep_alive = false;
 
+    // kqueue: 要求を送った直後の 1 回目は応答がまだ届いていないのが普通なので、
+    // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから読む
+    // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
+    #[cfg(veil_poller_kqueue)]
+    let mut first_read = true;
+
     // ヘッダー読み取り用バッファ
     loop {
         // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
         let read_buf = buf_get();
-        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(read_buf)).await;
+        #[cfg(veil_poller_kqueue)]
+        let wait_first = std::mem::replace(&mut first_read, false);
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, async {
+            #[cfg(veil_poller_kqueue)]
+            if wait_first {
+                if let Err(e) = backend_stream.readable_lazy().await {
+                    return (Err(e), read_buf);
+                }
+            }
+            backend_stream.read(read_buf).await
+        })
+        .await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
@@ -8669,7 +8756,8 @@ async fn transfer_response_with_compression(
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
                 // 注意: 圧縮時はキャッシュ保存をスキップ（圧縮後のデータをキャッシュするには追加実装が必要）
-                info!(
+                // リクエストごとに通る経路なので info ではなく debug（既定レベルで出さない）。
+                ftlog::debug!(
                     "[Compression] Initializing compressed transfer with {:?}",
                     encoding
                 );
@@ -9010,19 +9098,13 @@ async fn transfer_compressed_response(
 
     // 2. ボディを圧縮
     let compressed_body = match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => {
-                    return transfer_uncompressed_fallback(
-                        client_stream,
-                        original_headers,
-                        &body_data,
-                    )
+        AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
+            Some(compressed) => compressed,
+            None => {
+                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
                     .await;
-                }
             }
-        }
+        },
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);
@@ -9842,7 +9924,7 @@ async fn connect_https_backend_fresh(
     connect_timeout: Duration,
     tls_insecure: bool,
 ) -> Result<ClientTls, (u16, &'static [u8])> {
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let backend_tcp = match timeout(connect_timeout, connect_target(target, addr)).await {
         Ok(Ok(stream)) => {
@@ -10501,19 +10583,13 @@ async fn transfer_compressed_https_response(
 
     // 2. ボディを圧縮
     let compressed_body = match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => {
-                    return transfer_uncompressed_fallback(
-                        client_stream,
-                        original_headers,
-                        &body_data,
-                    )
+        AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
+            Some(compressed) => compressed,
+            None => {
+                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
                     .await;
-                }
             }
-        }
+        },
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);
@@ -10993,18 +11069,25 @@ async fn handle_sendfile(
         return Some((tls_stream, 403, 0, true));
     }
 
-    // ディレクトリの場合はインデックスファイルを試す
-    let (final_path, file_size, mime_type) = if !file_info.is_file {
+    // ディレクトリの場合はインデックスファイルを試す。
+    // `file_info` / `idx_info` は所有値なのでフィールドをムーブする（clone による
+    // PathBuf / String の確保をしない）。open_file_cache が開いた fd を共有していれば
+    // それを使い、open/close を省く（nginx の open_file_cache と同じ）。
+    let (final_path, file_size, mime_type, shared_file) = if !file_info.is_file {
         let filename = index_filename.unwrap_or("index.html");
         let index_path = file_info.canonical_path.join(filename);
 
         // インデックスファイルの情報をキャッシュから取得
         match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
-            Some(idx_info) if idx_info.is_file => (
-                idx_info.canonical_path.clone(),
-                idx_info.file_size,
-                idx_info.mime_type.clone(),
-            ),
+            Some(idx_info) if idx_info.is_file => {
+                let shared = idx_info.shared_file().cloned();
+                (
+                    idx_info.canonical_path,
+                    idx_info.file_size,
+                    idx_info.mime_type,
+                    shared,
+                )
+            }
             _ => {
                 // インデックスファイルが存在しない場合は403 Forbidden
                 let err_buf = ERR_MSG_FORBIDDEN.to_vec();
@@ -11013,23 +11096,28 @@ async fn handle_sendfile(
             }
         }
     } else {
+        let shared = file_info.shared_file().cloned();
         (
-            file_info.canonical_path.clone(),
+            file_info.canonical_path,
             file_info.file_size,
-            file_info.mime_type.clone(),
+            file_info.mime_type,
+            shared,
         )
     };
 
-    // ファイルを開く（非同期、実際のI/Oが必要）
-    let file = match OpenOptions::new().read(true).open(&final_path).await {
-        Ok(f) => f,
-        Err(_) => {
-            // ファイルが開けない場合はキャッシュを無効化
-            cache::invalidate_file_cache(&full_path);
-            let err_buf = ERR_MSG_NOT_FOUND.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 404, 0, true));
-        }
+    // ファイルを開く（キャッシュが fd を保持していれば共有するだけで syscall 無し）
+    let file = match shared_file {
+        Some(f) => crate::runtime::io::File::from_shared(f),
+        None => match OpenOptions::new().read(true).open(&final_path).await {
+            Ok(f) => f,
+            Err(_) => {
+                // ファイルが開けない場合はキャッシュを無効化
+                cache::invalidate_file_cache(&full_path);
+                let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                return Some((tls_stream, 404, 0, true));
+            }
+        },
     };
 
     // キャッシュから取得したサイズとMIMEタイプを使用
@@ -11103,10 +11191,6 @@ async fn handle_sendfile(
     // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
     #[cfg(feature = "wasm")]
     let mut header_buf = {
-        ftlog::info!(
-            "[WASM Response] SendFile: wasm_modules count = {}",
-            wasm_modules.len()
-        );
         if !wasm_modules.is_empty() {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
@@ -11211,7 +11295,16 @@ async fn handle_sendfile(
             // ガードが drop されると TCP_NOPUSH が解除され、残っているデータが
             // 即座にフラッシュされる（NoPushGuard の doc 参照）。取得（setsockopt）
             // 自体に失敗しても致命的ではないため None のまま続行する。
-            let nopush = tls_stream.get_ref().nopush_guard();
+            //
+            // ただしヘッダー + 本文が小さい応答（1 回の sendfile でまとめて送り切れる
+            // サイズ）では早期送出の抑制に意味が無く、setsockopt 2 回（ON/OFF）が丸ごと
+            // 無駄になる（FreeBSD の DTrace 実測で 2 syscall/req、プロファイル上位）。
+            const NOPUSH_MIN_BYTES: u64 = 16 * 1024;
+            let nopush = if transfer_length + header_buf.len() as u64 > NOPUSH_MIN_BYTES {
+                tls_stream.get_ref().nopush_guard()
+            } else {
+                None
+            };
 
             let result = sendfile_all_with_header(
                 out_fd,
@@ -11246,16 +11339,14 @@ async fn handle_sendfile(
         }
     }
 
-    // ヘッダー送信（タイムアウト付き）
-    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
-    }
-
-    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
+    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用（ヘッダーを先に送る）
     #[cfg(veil_ktls)]
     {
         if tls_stream.is_ktls_send_enabled() {
+            let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+            if !matches!(write_result, Ok((Ok(_), _))) {
+                return None;
+            }
             return handle_sendfile_zerocopy(
                 tls_stream,
                 &file,
@@ -11268,9 +11359,11 @@ async fn handle_sendfile(
         }
     }
 
-    // kTLS が無効な場合は従来の read/write を使用（F-150: 静的コンテンツキャッシュ対象）
+    // kTLS が無効な場合は従来の read/write を使用（F-150: 静的コンテンツキャッシュ対象）。
+    // ヘッダーは本文と一緒に送る（静的コンテンツキャッシュ命中時は 1 回の書き込み）。
     handle_sendfile_userspace(
         tls_stream,
+        header_buf,
         &file,
         &final_path,
         file_size,
@@ -11355,6 +11448,7 @@ async fn handle_sendfile_zerocopy(
 #[allow(clippy::too_many_arguments)]
 async fn handle_sendfile_userspace(
     mut tls_stream: ServerTls,
+    header_buf: Vec<u8>,
     file: &crate::runtime::io::File,
     file_path: &Path,
     file_size: u64,
@@ -11382,11 +11476,17 @@ async fn handle_sendfile_userspace(
     #[cfg(target_os = "freebsd")]
     {
         if tls_stream.is_plain() && transfer_length > 0 {
-            use crate::runtime::sendfile::sendfile_all;
+            use crate::runtime::sendfile::sendfile_all_with_header;
             let out_fd = tls_stream.as_raw_fd();
             let in_fd = file.as_raw_fd();
-            return match sendfile_all(out_fd, in_fd, transfer_offset, transfer_length as usize)
-                .await
+            return match sendfile_all_with_header(
+                out_fd,
+                in_fd,
+                transfer_offset,
+                transfer_length as usize,
+                &header_buf,
+            )
+            .await
             {
                 Ok(()) => Some((
                     tls_stream,
@@ -11456,9 +11556,16 @@ async fn handle_sendfile_userspace(
                 // Bytes::slice は参照カウントのみ・コピーなし（Range リクエストの
                 // 部分送出にもそのまま使える）。
                 let slice = data.slice(start..end);
-                let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(slice)).await;
+                // ヘッダーと本文を 1 回で送る（rustls は両方を送信キューへ積んでから
+                // writev 1 回、平文は sendmsg 1 回。以前はヘッダーを先に別途書いていたため
+                // 1 リクエストあたり書き込みが 2 回だった）。
+                let write_result = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all_vectored(header_buf, slice),
+                )
+                .await;
                 return match write_result {
-                    Ok((Ok(_), _)) => Some((
+                    Ok((Ok(_), _, _)) => Some((
                         tls_stream,
                         response_status,
                         transfer_length,
@@ -11470,6 +11577,12 @@ async fn handle_sendfile_userspace(
             // data の長さがリクエスト範囲を満たさない（キャッシュ後にファイルが縮小した
             // 等の稀なレース）場合は安全側で下の通常経路へフォールスルーする。
         }
+    }
+
+    // ヘッダー送信（タイムアウト付き）
+    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        return None;
     }
 
     let mut total_sent = 0u64;
@@ -11668,6 +11781,12 @@ mod connect_gate_tests {
         } else {
             false
         }
+    }
+
+    /// reactor（WSAPoll）ビルド: WSAPoll はカーネル資源を事前確保しないため常に利用可能。
+    #[cfg(veil_poller_wsapoll)]
+    fn io_uring_available() -> bool {
+        true
     }
 
     /// ConnectPermit の Drop が in_flight を確実に減算し、待機者へ通知すること（B-44 第3段）。

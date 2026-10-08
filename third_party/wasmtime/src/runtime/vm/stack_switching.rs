@@ -39,15 +39,19 @@ pub use stack::*;
 /// For performance reasons, the VMContRef at the bottom of this chain
 /// (i.e., the one pointed to by the VMContObj) has a pointer to the
 /// other end of the chain (i.e., its last ancestor).
-#[repr(C)]
+// FIXME(frank-emrich) Does this actually need to be 16-byte aligned any
+// more? Now that we use I128 on the Cranelift side (see
+// [wasmtime_cranelift::stack_switching::fatpointer::pointer_type]), it
+// should be fine to use the natural alignment of the type.
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct VMContObj {
+    pub revision: u64,
     pub contref: NonNull<VMContRef>,
-    pub revision: usize,
 }
 
 impl VMContObj {
-    pub fn new(contref: NonNull<VMContRef>, revision: usize) -> Self {
+    pub fn new(contref: NonNull<VMContRef>, revision: u64) -> Self {
         Self { contref, revision }
     }
 
@@ -59,7 +63,7 @@ impl VMContObj {
     ///
     /// Behavior will be undefined if a pointer to data that is not a
     /// VMContRef is provided.
-    pub unsafe fn from_raw_parts(contref: *mut u8, revision: usize) -> Option<Self> {
+    pub unsafe fn from_raw_parts(contref: *mut u8, revision: u64) -> Option<Self> {
         NonNull::new(contref.cast::<VMContRef>()).map(|contref| Self::new(contref, revision))
     }
 }
@@ -204,7 +208,7 @@ pub struct VMContRef {
     pub last_ancestor: *mut VMContRef,
 
     /// Revision counter.
-    pub revision: usize,
+    pub revision: u64,
 
     /// The underlying stack.
     pub stack: VMContinuationStack,
@@ -298,12 +302,11 @@ unsafe impl Sync for VMContRef {}
 #[inline(always)]
 pub fn cont_new(
     store: &mut dyn crate::vm::VMStore,
-    instance: crate::store::InstanceId,
+    instance: core::pin::Pin<&mut crate::vm::Instance>,
     func: *mut u8,
     param_count: u32,
     result_count: u32,
-) -> anyhow::Result<*mut VMContRef> {
-    let instance = store.instance_mut(instance);
+) -> Result<*mut VMContRef, crate::vm::TrapReason> {
     let caller_vmctx = instance.vmctx();
 
     let stack_size = store.engine().config().async_stack_size;
@@ -545,7 +548,7 @@ pub enum VMStackState {
 mod tests {
     use core::mem::{offset_of, size_of};
 
-    use wasmtime_environ::{HostPtr, Module, PtrSize, StaticModuleIndex, VMOffsets};
+    use wasmtime_environ::{HostPtr, Module, PtrSize, VMOffsets};
 
     use super::*;
 
@@ -558,7 +561,7 @@ mod tests {
 
     #[test]
     fn check_vm_stack_limits_offsets() {
-        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
             offset_of!(VMStackLimits, stack_limit),
@@ -572,7 +575,7 @@ mod tests {
 
     #[test]
     fn check_vm_common_stack_information_offsets() {
-        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
             size_of::<VMCommonStackInformation>(),
@@ -603,7 +606,7 @@ mod tests {
     #[test]
     fn check_vm_array_offsets() {
         // Note that the type parameter has no influence on the size and offsets.
-        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
             size_of::<VMHostArray<()>>(),
@@ -624,26 +627,8 @@ mod tests {
     }
 
     #[test]
-    fn check_vm_contobj_offsets() {
-        let module = Module::new(StaticModuleIndex::from_u32(0));
-        let offsets = VMOffsets::new(HostPtr, &module);
-        assert_eq!(
-            offset_of!(VMContObj, contref),
-            usize::from(offsets.ptr.vmcontobj_contref())
-        );
-        assert_eq!(
-            offset_of!(VMContObj, revision),
-            usize::from(offsets.ptr.vmcontobj_revision())
-        );
-        assert_eq!(
-            size_of::<VMContObj>(),
-            usize::from(offsets.ptr.size_of_vmcontobj())
-        )
-    }
-
-    #[test]
     fn check_vm_contref_offsets() {
-        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
             offset_of!(VMContRef, common_stack_information),
@@ -681,7 +666,7 @@ mod tests {
 
     #[test]
     fn check_vm_stack_chain_offsets() {
-        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
             size_of::<VMStackChain>(),

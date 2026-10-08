@@ -38,6 +38,8 @@ enum SlotState {
 struct TimerSlot {
     generation: u32,
     state: SlotState,
+    /// 登録時のデッドライン（ヒープ圧縮で生存エントリを積み直すために保持する）。
+    deadline: Instant,
 }
 
 /// (index, generation) を u64 へパックする。
@@ -55,6 +57,8 @@ struct TimerState {
     slots: Vec<TimerSlot>,
     free: Vec<u32>,
     heap: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// Free 以外のスロット数（= ヒープ上で意味のあるエントリの上限）。
+    live: usize,
 }
 
 impl TimerState {
@@ -63,10 +67,12 @@ impl TimerState {
     fn new() -> Self {
         let mut slots = Vec::with_capacity(Self::PREALLOC);
         let mut free = Vec::with_capacity(Self::PREALLOC);
+        let epoch = Instant::now();
         for i in 0..Self::PREALLOC as u32 {
             slots.push(TimerSlot {
                 generation: 1,
                 state: SlotState::Free,
+                deadline: epoch,
             });
             free.push(i);
         }
@@ -74,6 +80,7 @@ impl TimerState {
             slots,
             free,
             heap: BinaryHeap::with_capacity(Self::PREALLOC),
+            live: 0,
         }
     }
 
@@ -85,12 +92,15 @@ impl TimerState {
                 self.slots.push(TimerSlot {
                     generation: 1,
                     state: SlotState::Free,
+                    deadline,
                 });
                 i
             }
         };
         let slot = &mut self.slots[index as usize];
         slot.state = SlotState::Armed(None);
+        slot.deadline = deadline;
+        self.live += 1;
         let token = pack(index, slot.generation);
         self.heap.push(Reverse((deadline, token)));
         token
@@ -127,14 +137,38 @@ impl TimerState {
     }
 
     /// 完了を待たずスロットを解放する（Future drop 時。ヒープのエントリは stale として残る）。
+    ///
+    /// `timeout(READ_TIMEOUT, read)` のように I/O が先に終わる使い方では、キャンセルされた
+    /// エントリがデッドライン（30〜60 秒後）までヒープに残り続ける。毎秒十数万リクエストでは
+    /// 数百万件に膨らみ、push のたびに O(log n) のキャッシュミスを払うことになる
+    /// （io_uring 側で B-72 が直したのと同型の問題）。生存数に対してヒープが大きくなりすぎたら
+    /// 生存エントリだけで作り直す（償却 O(1)）。
     fn cancel(&mut self, token: u64) {
         if let Some(i) = self.resolve(token) {
             self.free_slot(i);
+            if self.heap.len() > 2 * self.live + Self::PREALLOC * 4 {
+                self.compact();
+            }
         }
+    }
+
+    /// ヒープを Armed のスロットだけで作り直す。
+    fn compact(&mut self) {
+        let mut entries = std::mem::take(&mut self.heap).into_vec();
+        entries.clear();
+        for (i, slot) in self.slots.iter().enumerate() {
+            if matches!(slot.state, SlotState::Armed(_)) {
+                entries.push(Reverse((slot.deadline, pack(i as u32, slot.generation))));
+            }
+        }
+        self.heap = BinaryHeap::from(entries);
     }
 
     fn free_slot(&mut self, index: usize) {
         let slot = &mut self.slots[index];
+        if !matches!(slot.state, SlotState::Free) {
+            self.live -= 1;
+        }
         slot.generation = slot.generation.wrapping_add(1);
         if slot.generation == 0 {
             slot.generation = 1;
@@ -181,7 +215,36 @@ impl TimerState {
 
 thread_local! {
     static TIMERS: RefCell<TimerState> = RefCell::new(TimerState::new());
+    /// イベントループが起床ごとに 1 回だけ読む時刻（[`refresh_now`]）。
+    static LOOP_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
+
+/// 起床ごとに 1 回だけ時刻を読み直して保持する（executor の起床処理から呼ぶ）。
+#[inline]
+pub(crate) fn refresh_now() -> Instant {
+    let now = Instant::now();
+    LOOP_NOW.with(|c| c.set(Some(now)));
+    now
+}
+
+/// 直近の起床時に読んだ時刻（実行器のループが更新していないスレッドではその場で読む）。
+///
+/// 1 リクエストあたり何度も作られる長いタイムアウト（I/O の 30〜60 秒）の期限計算で
+/// 毎回 `Instant::now()` を読まないために使う（FreeBSD aarch64 のプロファイルで
+/// `__vdso_gettc` が最上位だった）。値は最大で「起床後に動いたタスクの処理時間」だけ
+/// 古いので、精度が必要な用途には使わないこと。
+#[inline]
+pub fn coarse_now() -> Instant {
+    // None のときに値を保存しない: 実行器のループが無いスレッド（テストの
+    // futures::executor::block_on、offload ワーカー等）で初回の時刻に固定されると、
+    // キャッシュの有効期限が永久に切れなくなる。
+    LOOP_NOW.with(|c| c.get()).unwrap_or_else(Instant::now)
+}
+
+/// これ以上のタイムアウトは粗い時計で期限を計算する（早まっても誤差は起床後の処理時間分で、
+/// 秒単位のタイムアウトには影響しない）。短いスリープは「少なくとも指定時間眠る」を
+/// 保証するため正確な時刻を使う。
+const COARSE_CLOCK_MIN: Duration = Duration::from_secs(1);
 
 /// 現在のスレッドの最近接タイマーデッドラインを返す（reactor block_on のパーキング用）。
 pub(crate) fn next_deadline() -> Option<Instant> {
@@ -207,8 +270,13 @@ pub struct Sleep {
 impl Sleep {
     /// 指定した Duration 後に完了する Sleep Future を作成する。
     pub fn new(duration: Duration) -> Self {
+        let now = if duration >= COARSE_CLOCK_MIN {
+            coarse_now()
+        } else {
+            Instant::now()
+        };
         Self {
-            deadline: Instant::now() + duration,
+            deadline: now + duration,
             token: 0,
             registered: false,
         }
@@ -292,3 +360,46 @@ impl std::fmt::Display for Elapsed {
 }
 
 impl std::error::Error for Elapsed {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I/O が先に終わってキャンセルされたタイマーがヒープに溜まり続けないこと。
+    #[test]
+    fn cancelled_timers_do_not_accumulate_in_heap() {
+        let mut st = TimerState::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for _ in 0..100_000 {
+            let t = st.register(deadline);
+            st.cancel(t);
+        }
+        assert_eq!(st.live, 0);
+        assert!(
+            st.heap.len() <= TimerState::PREALLOC * 4 + 1,
+            "heap grew to {} entries",
+            st.heap.len()
+        );
+    }
+
+    /// 圧縮しても生存しているタイマーは失われず、期限で満了すること。
+    #[test]
+    fn compaction_keeps_live_timers() {
+        let mut st = TimerState::new();
+        let base = Instant::now();
+        let keep: Vec<u64> = (0..10)
+            .map(|i| st.register(base + Duration::from_secs(10 + i)))
+            .collect();
+        for _ in 0..50_000 {
+            let t = st.register(base + Duration::from_secs(30));
+            st.cancel(t);
+        }
+        assert_eq!(st.live, 10);
+        assert_eq!(st.next_deadline(), Some(base + Duration::from_secs(10)));
+        st.fire_expired(base + Duration::from_secs(25));
+        for t in keep {
+            assert!(st.take_fired(t), "live timer must fire after compaction");
+        }
+        assert_eq!(st.live, 0);
+    }
+}

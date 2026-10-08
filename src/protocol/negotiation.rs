@@ -38,6 +38,17 @@ pub const ALPN_H2_HTTP11: &[&[u8]] = &[
 /// HTTP/2 のみの ALPN リスト
 pub const ALPN_H2_ONLY: &[&[u8]] = &[b"h2"];
 
+/// 上流（バックエンド）向け ALPN リスト: HTTP/1.1 のみ
+///
+/// veil は TLS 上の HTTP/2 上流（`https://` + h2）を実装していない
+/// （`proxy_https_pooled` / `connect_https_backend_fresh` / `h2_proxy_https` /
+/// `http3_stream::run_backend_task` はいずれも HTTP/1.1 を書き込む）。
+/// そのため上流向けクライアントの ALPN に `h2` を含めてはならない
+/// （含めると h2 対応の HTTPS バックエンド（nginx/Envoy の既定）が h2 を選択し、
+/// veil は HTTP/1.1 のバイト列を送りつけて中継が壊れる。B-83）。
+/// 平文の HTTP/2 上流は `use_h2c`（ALPN を経由しない h2c プール）で対応する。
+pub const ALPN_HTTP11_ONLY: &[&[u8]] = &[b"http/1.1"];
+
 /// rustls ServerConfig に HTTP/2 対応の ALPN を設定
 ///
 /// # Arguments
@@ -60,15 +71,14 @@ pub fn configure_alpn_h2(mut config: ServerConfig, http2_only: bool) -> ServerCo
     config
 }
 
-/// rustls ClientConfig に HTTP/2 対応の ALPN を設定
-pub fn configure_alpn_h2_client(mut config: ClientConfig, http2_only: bool) -> ClientConfig {
-    let protocols = if http2_only {
-        ALPN_H2_ONLY
-    } else {
-        ALPN_H2_HTTP11
-    };
-
-    config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+/// rustls ClientConfig に上流（バックエンド）向けの ALPN を設定
+///
+/// `http/1.1` のみを提示する。veil は TLS 上の HTTP/2 上流を実装しておらず、
+/// `h2` を提示すると h2 対応の HTTPS バックエンド（nginx/Envoy の既定）が h2 を
+/// 選択して中継が壊れる（B-83）。平文の HTTP/2 上流は `use_h2c` を使う
+/// （ALPN を経由しない）。
+pub fn configure_alpn_http11_client(mut config: ClientConfig) -> ClientConfig {
+    config.alpn_protocols = ALPN_HTTP11_ONLY.iter().map(|p| p.to_vec()).collect();
 
     config
 }
@@ -123,5 +133,33 @@ mod tests {
 
         assert_eq!(ALPN_H2_ONLY.len(), 1);
         assert_eq!(ALPN_H2_ONLY[0], b"h2");
+
+        assert_eq!(ALPN_HTTP11_ONLY.len(), 1);
+        assert_eq!(ALPN_HTTP11_ONLY[0], b"http/1.1");
+    }
+
+    /// CryptoProvider をプロセスに一度だけインストールする（テスト用）
+    fn ensure_provider() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = crate::tls_provider::provider::default_provider().install_default();
+        });
+    }
+
+    /// B-83: 上流向けクライアント設定は `h2` を一切提示しないこと
+    #[test]
+    fn test_configure_alpn_http11_client_excludes_h2() {
+        // simple_tls::default_client_config は veil_ktls cfg で有無が変わるため、
+        // ここでは ClientConfig を直接組み立てて alpn_protocols のみを検証する。
+        ensure_provider();
+        let root_store = rustls::RootCertStore::empty();
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let config = configure_alpn_http11_client(config);
+
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert!(!config.alpn_protocols.contains(&b"h2".to_vec()));
     }
 }

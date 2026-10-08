@@ -398,8 +398,8 @@ impl CidrMatcher {
     /// Sort ranges by prefix length (most specific first)
     pub fn optimize(&mut self) {
         // Sort by prefix length descending (more specific first)
-        self.v4_ranges.sort_by(|a, b| b.1.cmp(&a.1));
-        self.v6_ranges.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v4_ranges.sort_by_key(|r| std::cmp::Reverse(r.1));
+        self.v6_ranges.sort_by_key(|r| std::cmp::Reverse(r.1));
     }
 
     /// Check if an IP matches and get candidate routes
@@ -511,12 +511,24 @@ static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// キャッシュ容量（設定値から反映）
 static CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(10000);
 
+/// ルートキャッシュの LRU 本体。キーは xxh3 済みの 64 ビット値で、既定の SipHash で
+/// もう一度ハッシュする必要は無い。ただしキーの xxh3 は固定シードで、パスは攻撃者が
+/// 選べるため（衝突するキーを大量に作られると LRU のバケットが偏る）、乱数シード付きの
+/// foldhash（quality）で包む。xxh3 のストリーミング版ハッシャ（`Xxh3Builder`）は
+/// 小さいキーでは SipHash より遅い（FreeBSD のプロファイルで `xxh3_stateful_update` /
+/// `digest` が上位に出た）ので使わない。
+type RouteLru = LruCache<RouteCacheKey, Option<usize>, foldhash::quality::RandomState>;
+
+fn new_route_lru(cap: NonZeroUsize) -> RouteLru {
+    LruCache::with_hasher(cap, foldhash::quality::RandomState::default())
+}
+
 thread_local! {
     /// スレッドローカル LRU キャッシュ: (世代, キャッシュ本体)
-    static TL_ROUTE_CACHE: RefCell<(u64, LruCache<RouteCacheKey, Option<usize>>)> = {
+    static TL_ROUTE_CACHE: RefCell<(u64, RouteLru)> = {
         let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
             .unwrap_or(NonZeroUsize::new(10000).unwrap());
-        RefCell::new((0, LruCache::new(cap)))
+        RefCell::new((0, new_route_lru(cap)))
     };
 }
 
@@ -550,7 +562,7 @@ impl RouteCache {
             if borrow.0 != gen {
                 let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
                     .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = LruCache::new(cap);
+                borrow.1 = new_route_lru(cap);
                 borrow.0 = gen;
             }
             if let Some(&result) = borrow.1.get(key) {
@@ -571,7 +583,7 @@ impl RouteCache {
             if borrow.0 != gen {
                 let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
                     .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = LruCache::new(cap);
+                borrow.1 = new_route_lru(cap);
                 borrow.0 = gen;
             }
             borrow.1.put(key, route_idx);

@@ -209,6 +209,19 @@ impl TlsWriteSink for rustls::ServerConnection {
     }
 }
 
+/// Box で持つコネクション（`KtlsServerStream` / `SimpleTlsServerStream`）用。
+impl<T: TlsWriteSink + ?Sized> TlsWriteSink for Box<T> {
+    #[inline]
+    fn sink_wants_write(&self) -> bool {
+        (**self).sink_wants_write()
+    }
+
+    #[inline]
+    fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
+        (**self).sink_write_tls(wr)
+    }
+}
+
 impl TlsWriteSink for rustls::ClientConnection {
     #[inline]
     fn sink_wants_write(&self) -> bool {
@@ -431,4 +444,154 @@ mod tests {
         close_fd(tx);
         close_fd(rx);
     }
+}
+
+/// 受信した暗号文 `data` を**全量** rustls へ投入し、レコードを処理する（B-90）。
+///
+/// rustls の `read_tls` は 1 回の呼び出しで最大 4KB（deframer の `READ_SIZE`）しか
+/// 取り込まない。`conn.read_tls(&mut &buf[..n])` を 1 回だけ呼んで戻り値を捨てると、
+/// `n` が 4KB を超えたときに**残りの暗号文が黙って失われ**、以降のレコード境界がずれて
+/// 相手側は `cannot decrypt peer's message` になる。ハンドシェイクでは、クライアントの
+/// Finished と直後のアプリケーションデータ（リクエストヘッダ + ボディ先頭）が 1 回の
+/// read に入ると発生する（FreeBSD の E2E で HTTP/3 → TLS バックエンドの 1.5MB アップロードが
+/// 毎回失敗していた B-68 の真因）。
+///
+/// ハンドシェイク中・直後の 1 回分（最大 16KB の暗号文）は受信平文上限（16KB）を超えないため、
+/// ここでは平文の排出は行わない（排出が必要なデータ転送経路は各ストリームの read が担う）。
+pub(crate) fn read_tls_all<D>(
+    conn: &mut rustls::ConnectionCommon<D>,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut consumed = 0;
+    while consumed < data.len() {
+        let n = conn.read_tls(&mut &data[consumed..])?;
+        if n == 0 {
+            // close_notify 受信後は rustls がこれ以上読まない（以降のバイトは無意味）。
+            break;
+        }
+        consumed += n;
+        conn.process_new_packets()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod read_tls_all_tests {
+    use super::read_tls_all;
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+
+    /// サーバが Finished 待ちになるところまでメモリ上でハンドシェイクを進める。
+    fn pair_until_client_finished() -> (rustls::ClientConnection, rustls::ServerConnection) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let provider = Arc::new(crate::tls_provider::provider::default_provider());
+        let cert_der = ck.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        );
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_cfg),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+        // ClientHello → サーバの応答フライト → クライアントがハンドシェイク完了（Finished は未送出）。
+        let mut buf = Vec::new();
+        client.write_tls(&mut buf).unwrap();
+        read_tls_all(&mut server, &buf).unwrap();
+        let mut buf = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut buf).unwrap();
+        }
+        read_tls_all(&mut client, &buf).unwrap();
+        assert!(!client.is_handshaking());
+        assert!(
+            server.is_handshaking(),
+            "server must still wait for client Finished"
+        );
+        (client, server)
+    }
+
+    /// クライアントの Finished と 4KB を超えるアプリケーションデータが 1 回の read に
+    /// 入っても、全量がサーバへ届くこと（B-90。単発の `read_tls` だと 4KB 以降が失われる）。
+    #[test]
+    fn finished_and_app_data_in_one_read_are_fully_consumed() {
+        let (mut client, mut server) = pair_until_client_finished();
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        client.writer().write_all(&payload).unwrap();
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).unwrap();
+        }
+        assert!(
+            wire.len() > 4096,
+            "the flight must exceed rustls' 4KB read size"
+        );
+
+        read_tls_all(&mut server, &wire).unwrap();
+        assert!(!server.is_handshaking());
+        let mut got = Vec::new();
+        let _ = server.reader().read_to_end(&mut got);
+        assert_eq!(got, payload);
+    }
+
+    /// 対照: 単発の `read_tls` は 4KB しか取り込まない（本ヘルパーが必要な理由の固定）。
+    #[test]
+    fn single_read_tls_consumes_at_most_4k() {
+        let (mut client, mut server) = pair_until_client_finished();
+        client.writer().write_all(&[7u8; 10_000]).unwrap();
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).unwrap();
+        }
+        let n = server.read_tls(&mut &wire[..]).unwrap();
+        assert!(
+            n < wire.len(),
+            "rustls read_tls consumed {} of {}",
+            n,
+            wire.len()
+        );
+    }
+}
+
+/// ユーザー空間 TLS の受信スクラッチ（暗号文 1 回分の生 read 先）のサイズ。
+const RX_SCRATCH_SIZE: usize = 16 * 1024;
+
+thread_local! {
+    /// スレッドごとに 1 本だけ持つ受信スクラッチ。以前は `read()` の呼び出しごとに
+    /// `vec![0u8; 16384]`（16KB の確保 + ゼロ埋め）していた（ホットパス規則違反）。
+    /// 借用は「生 read → rustls へ投入」の同期区間だけで、`.await` を跨がないため
+    /// 同じスレッドの他タスクと競合しない。
+    static RX_SCRATCH: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0u8; RX_SCRATCH_SIZE].into_boxed_slice());
+}
+
+/// 受信スクラッチを借りて `f` を実行する（同期区間専用。`f` の中で `.await` しないこと）。
+#[inline]
+pub(crate) fn with_rx_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    RX_SCRATCH.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// [`with_rx_scratch`] の中で行う「生 read → rustls 投入」1 回分の結果。
+pub(crate) enum RxFed {
+    /// 暗号文を読んで rustls へ投入した（平文はループ先頭で取り出す）。
+    Fed,
+    /// 相手が切断した（EOF）。
+    Eof,
+    /// 読めるデータが無い（readable を待つ）。
+    WouldBlock,
 }

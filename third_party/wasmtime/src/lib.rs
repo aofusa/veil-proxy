@@ -292,17 +292,7 @@
 // and will prevent the doc build from failing.
 #![cfg_attr(feature = "default", warn(rustdoc::broken_intra_doc_links))]
 #![no_std]
-// Wasmtime liberally uses #[cfg]'d definitions of structures to uninhabited
-// types to reduce the total amount of #[cfg], but rustc warns that much usage
-// of these structures, rightfully, leads to unreachable code. This unreachable
-// code is only conditional, however, so it's generally just annoying to deal
-// with. Disable the `unreachable_code` lint in situations like this when some
-// major features are disabled. If all the features are enabled, though, we
-// still want to get warned about this.
-#![cfg_attr(
-    any(not(feature = "threads"), not(feature = "gc",)),
-    allow(unreachable_code, reason = "see comment")
-)]
+#![expect(unsafe_op_in_unsafe_fn, reason = "crate isn't migrated yet")]
 
 #[cfg(feature = "std")]
 #[macro_use]
@@ -362,10 +352,8 @@ macro_rules! map_maybe_uninit {
 pub trait MaybeUninitExt<T> {
     /// Maps `MaybeUninit<T>` to `MaybeUninit<U>` using the closure provided.
     ///
-    /// # Safety
-    ///
-    /// Requires that `*mut U` is a field projection from `*mut T`. Use
-    /// `map_maybe_uninit!` above instead.
+    /// Note that this is `unsafe` as there is no guarantee that `U` comes from
+    /// `T`.
     unsafe fn map<U>(&mut self, f: impl FnOnce(*mut T) -> *mut U)
     -> &mut core::mem::MaybeUninit<U>;
 }
@@ -376,10 +364,7 @@ impl<T> MaybeUninitExt<T> for core::mem::MaybeUninit<T> {
         f: impl FnOnce(*mut T) -> *mut U,
     ) -> &mut core::mem::MaybeUninit<U> {
         let new_ptr = f(self.as_mut_ptr());
-        // SAFETY: the memory layout of these two types are the same, and
-        // asserting that it's a safe reference with the same lifetime as `self`
-        // is a requirement of this function itself.
-        unsafe { core::mem::transmute::<*mut U, &mut core::mem::MaybeUninit<U>>(new_ptr) }
+        core::mem::transmute::<*mut U, &mut core::mem::MaybeUninit<U>>(new_ptr)
     }
 }
 

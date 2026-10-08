@@ -23,12 +23,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// HTTP/3テストクライアント
-#[allow(dead_code)]
 pub struct Http3TestClient {
     endpoint: Endpoint,
 }
 
-#[allow(dead_code)]
 impl Http3TestClient {
     /// 新しいHTTP/3クライアントを作成
     pub async fn new(
@@ -85,7 +83,6 @@ impl Http3TestClient {
 #[derive(Debug, Clone)]
 // テストヘルパ: `headers` は grpc_* アクセサ経由でのみ読まれ、共有 `tests/common` を含む
 // integration_tests 側では未使用になる（e2e_tests では使用）。allow が妥当な理由付き例。
-#[allow(dead_code)]
 pub struct Http3Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -94,7 +91,6 @@ pub struct Http3Response {
 
 // テストヘルパ: grpc_status/grpc_message/header は個別 E2E のみから呼ばれ、
 // integration_tests では未使用（e2e_tests では使用）。
-#[allow(dead_code)]
 impl Http3Response {
     /// ヘッダまたはトレーラーから `grpc-status` を取得（gRPC over H3 用）。
     pub fn grpc_status(&self) -> Option<u32> {
@@ -122,7 +118,6 @@ impl Http3Response {
 }
 
 /// HTTP/3リクエストを送信するヘルパー関数
-#[allow(dead_code)]
 pub async fn send_http3_request(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
@@ -135,7 +130,6 @@ pub async fn send_http3_request(
 }
 
 /// HTTP/3リクエストを送信し、レスポンスヘッダも返す
-#[allow(dead_code)]
 pub async fn send_http3_request_full(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
@@ -163,14 +157,32 @@ pub async fn send_http3_request_full(
     // リクエストを送信
     let mut stream = send_request.send_request(request).await?;
 
-    // ボディを送信（ある場合）
+    // ボディを送信（ある場合）。
+    // RFC 9114 §4.1.1: サーバは本文を受け取り切る前に完全な応答を返し、STOP_SENDING
+    // （H3_NO_ERROR）で送信停止を求めてよい。その場合 send_data/finish はエラーになるが、
+    // 応答自体は届いているので読みに行く（応答も読めなければ送信側のエラーを返す）。
+    let mut send_err = None;
     if let Some(body_data) = body {
-        stream.send_data(Bytes::copy_from_slice(body_data)).await?;
+        if let Err(e) = stream.send_data(Bytes::copy_from_slice(body_data)).await {
+            send_err = Some(e);
+        }
     }
-    stream.finish().await?;
+    if send_err.is_none() {
+        if let Err(e) = stream.finish().await {
+            send_err = Some(e);
+        }
+    }
 
     // レスポンスを受信
-    let response = stream.recv_response().await?;
+    let response = match stream.recv_response().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(match send_err {
+                Some(se) => se.into(),
+                None => e.into(),
+            })
+        }
+    };
     let status = response.status().as_u16();
     let mut resp_headers = Vec::new();
     for (name, value) in response.headers().iter() {
@@ -214,7 +226,6 @@ pub async fn send_http3_request_full(
 /// `chunks` を順に `send_data` し、チャンク間に任意の `inter_chunk_delay` を挟む。
 /// 終端は `finish()` で FIN を立てる。
 // テストヘルパ: e2e_tests のみから呼ばれ、共有 tests/common を含む integration_tests では未使用。
-#[allow(dead_code)]
 pub async fn send_http3_request_chunked(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
@@ -290,7 +301,6 @@ pub async fn send_http3_request_chunked(
 /// リクエスト開始後にボディを途中まで送り、ストリームを drop して強制切断する（RST 相当）。
 /// プロキシ生存確認用。エラーは返さず完了のみ。
 // テストヘルパ: e2e_tests のみから呼ばれ、共有 tests/common を含む integration_tests では未使用。
-#[allow(dead_code)]
 pub async fn send_http3_and_reset(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
@@ -322,7 +332,6 @@ pub async fn send_http3_and_reset(
 }
 
 /// GETリクエストを送信するヘルパー関数
-#[allow(dead_code)]
 pub async fn http3_get(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     path: &str,
@@ -331,7 +340,6 @@ pub async fn http3_get(
 }
 
 /// POSTリクエストを送信するヘルパー関数
-#[allow(dead_code)]
 pub async fn http3_post(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     path: &str,

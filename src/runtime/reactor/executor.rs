@@ -439,7 +439,7 @@ fn park(timeout_ms: i32) {
             }
         });
     }
-    super::timer::fire_expired(Instant::now());
+    super::timer::fire_expired(super::timer::refresh_now());
 }
 
 /// epoll 版イベント配送（F-166 A-1/A-2/A-3）。
@@ -561,7 +561,7 @@ fn park(timeout_ms: i32) {
             }
         });
     }
-    super::timer::fire_expired(Instant::now());
+    super::timer::fire_expired(super::timer::refresh_now());
 }
 
 #[cfg(veil_poller_kqueue)]
@@ -651,7 +651,7 @@ fn park(timeout_ms: i32) {
             }
         });
     }
-    super::timer::fire_expired(Instant::now());
+    super::timer::fire_expired(super::timer::refresh_now());
 }
 
 #[cfg(veil_poller_wsapoll)]

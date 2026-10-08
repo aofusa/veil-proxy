@@ -233,7 +233,13 @@ pub fn open_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)> {
     }
     #[cfg(target_os = "freebsd")]
     if let Some(result) = freebsd_impl::open_beneath_fresh(root, rel) {
-        return result;
+        // O_RESOLVE_BENEATH は絶対シンボリックリンクを（リンク先がルート内でも）
+        // ENOTCAPABLE で拒否する。Linux の EXDEV と同じく、この場合だけ従来経路で
+        // 再判定する（`security::capsicum::retry_outside_capmode` と同じ方針）。
+        match result {
+            Err(ref e) if e.raw_os_error() == Some(libc::ENOTCAPABLE) => {}
+            other => return other,
+        }
     }
     fallback_open_beneath(root, rel)
 }
@@ -261,7 +267,22 @@ fn fallback_open_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)
     // 呼ばれる同期 FS 操作（`register_static_roots`/`open_beneath_for_request` の
     // 呼び出し元がいずれもホットパス外・offload 内であることを保証している）。
     #[allow(clippy::disallowed_methods)]
+    #[cfg(not(windows))]
     let file = File::open(&canonical_full)?;
+    // Windows の CreateFileW はディレクトリを FILE_FLAG_BACKUP_SEMANTICS 無しでは
+    // 開けず ERROR_ACCESS_DENIED を返す。静的ルート直下（`rel` が空）や
+    // ディレクトリ URL の解決が PermissionDenied になってしまうため付与する
+    // （通常ファイルの open には影響しないフラグ）。
+    #[allow(clippy::disallowed_methods)]
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&canonical_full)?
+    };
     let meta = file.metadata()?;
     Ok((file, meta))
 }
@@ -747,6 +768,7 @@ mod tests {
     /// （`is_retry_fallback` のコメント参照）。このテストはその再判定経路が実際に
     /// 「ルート外を指す絶対シンボリックリンクを拒否する」という結論に正しく到達する
     /// ことを検証する（EXDEV → フォールバック → 含有チェックで拒否、を実地で通す）。
+    #[cfg(unix)] // シンボリックリンク作成に std::os::unix を使う
     #[test]
     fn rejects_absolute_symlink_escaping_root() {
         let dir = tempdir().unwrap();
@@ -776,6 +798,7 @@ mod tests {
     /// `openat2` はこのケースでも `EXDEV` を返す（絶対リンクは一律拒否のため）が、
     /// 1 リクエスト限りのフォールバック（`canonicalize()` + 含有チェック）がリンク先を
     /// 正しく解決し、ルート内であることを確認した上で許可する。
+    #[cfg(unix)] // シンボリックリンク作成に std::os::unix を使う
     #[test]
     fn allows_symlink_within_root() {
         let dir = tempdir().unwrap();
@@ -796,6 +819,7 @@ mod tests {
     /// `openat2` の高速経路（`RESOLVE_NO_MAGICLINKS` のみに抵触、`EXDEV` にはならない）
     /// でそのまま解決されるべきこと。絶対リンクの `allows_symlink_within_root`
     /// （フォールバック経由）と対になる、高速経路そのものの回帰防止テスト。
+    #[cfg(unix)] // シンボリックリンク作成に std::os::unix を使う
     #[test]
     fn allows_relative_symlink_within_root() {
         let dir = tempdir().unwrap();

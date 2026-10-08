@@ -212,14 +212,8 @@ fn make_kevent(
 ) -> libc::kevent {
     let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
     ev.ident = fd as libc::uintptr_t;
-    ev.filter = match filter.try_into() {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
-    ev.flags = match flags.try_into() {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
+    ev.filter = filter.try_into().unwrap_or_default();
+    ev.flags = flags.try_into().unwrap_or_default();
     ev
 }
 
@@ -233,14 +227,8 @@ fn make_kevent(
 ) -> libc::kevent {
     let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
     ev.ident = fd as libc::uintptr_t;
-    ev.filter = match filter.try_into() {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
-    ev.flags = match flags.try_into() {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
+    ev.filter = filter.try_into().unwrap_or_default();
+    ev.flags = flags.try_into().unwrap_or_default();
     ev
 }
 

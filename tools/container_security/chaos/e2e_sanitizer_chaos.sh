@@ -70,9 +70,13 @@ if ! docker run --rm \
     bash -c "
         set -euo pipefail
         # full features は quiche(boringssl) のビルドに cmake + C/C++ ツールチェインを要する。
+        # aws-lc-sys の bindgen（B-79 で有効化）には libclang も要る（run_libfuzzer.sh と同じ）。
         export DEBIAN_FRONTEND=noninteractive
         apt-get update >/dev/null 2>&1 && \
-            apt-get install -y --no-install-recommends cmake build-essential perl >/dev/null 2>&1 || true
+            apt-get install -y --no-install-recommends cmake build-essential perl clang libclang-dev >/dev/null 2>&1 || true
+        if [ -z \"\${LIBCLANG_PATH:-}\" ]; then
+            export LIBCLANG_PATH=\$(dirname \$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null | head -1))
+        fi
         rustup component add rust-src 2>/dev/null || true
         # --no-default-features で mimalloc を確実に外す（ASAN の独自アロケータと競合するため）。
         cargo build -Zbuild-std --target ${SAN_TARGET} \
@@ -97,6 +101,9 @@ cat >"${SAN_CTX}/Dockerfile" <<'DOCKERFILE'
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates llvm \
     && rm -rf /var/lib/apt/lists/*
+# 設定の drop_privileges（nonroot:nonroot）は distroless の UID/GID 65532 を前提にしている。
+# debian-slim には無いので作る（無いと veil が起動直後に終了し、負荷が一度も当たらない）。
+RUN groupadd -g 65532 nonroot && useradd -u 65532 -g nonroot -M -s /usr/sbin/nologin nonroot
 COPY veil /usr/local/bin/veil
 RUN chmod +x /usr/local/bin/veil
 ENTRYPOINT ["/usr/local/bin/veil"]
@@ -121,8 +128,8 @@ echo "== sanitizer Veil を起動しカオス負荷 ==" | tee -a "${REPORT}"
 if ! docker run -d --name "${SAN_CONTAINER}" --network "${NET_NAME}" \
     --security-opt seccomp=unconfined \
     "${SAN_OPTS_ENV[@]}" \
-    --tmpfs /var/cache/veil:rw,nosuid,uid=0,gid=0,size=128m \
-    --tmpfs /var/tmp/veil:rw,nosuid,uid=0,gid=0,size=64m \
+    --tmpfs /var/cache/veil:rw,nosuid,uid=65532,gid=65532,size=128m \
+    --tmpfs /var/tmp/veil:rw,nosuid,uid=65532,gid=65532,size=64m \
     -v "${DOCKER_DIR}/assets/conf.d/config.toml:/etc/veil/conf.d/config.toml:ro" \
     -v "${DOCKER_DIR}/assets/ssl:/etc/veil/ssl:ro" \
     -v "${DOCKER_DIR}/assets/www:/var/www:ro" \
@@ -136,7 +143,10 @@ SAN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{e
 sleep 5
 
 # 起動時点で sanitizer エラーが出ていないか、そもそも起動できたか。
+# 起動できていなければ負荷は一度も当たらないので「エラーなし」と報告してはならない。
+started=1
 if [[ "$(docker inspect -f '{{.State.Status}}' "${SAN_CONTAINER}" 2>/dev/null || echo absent)" != "running" ]]; then
+    started=0
     echo "e2e_sanitizer: 起動直後に終了（ログ確認）" | tee -a "${REPORT}"
     docker logs --tail 30 "${SAN_CONTAINER}" 2>&1 | sed 's/^/  | /' | tee -a "${REPORT}"
 fi
@@ -176,7 +186,10 @@ echo "--- sanitizer container logs (tail) ---" >>"${REPORT}"
 echo "${LOGS}" | tail -40 >>"${REPORT}"
 
 fail=0
-if echo "${LOGS}" | grep -qE "${SAN_ERROR_RE}"; then
+if [[ "${started}" != "1" ]]; then
+    echo "e2e_sanitizer: failed (veil が起動しなかったため未検証)" | tee -a "${REPORT}"
+    fail=1
+elif echo "${LOGS}" | grep -qE "${SAN_ERROR_RE}"; then
     echo "e2e_sanitizer: ${SANITIZER}Sanitizer エラーを検出（backlog 起票対象）" | tee -a "${REPORT}"
     echo "${LOGS}" | grep -E "${SAN_ERROR_RE}" | head -10 | tee -a "${REPORT}"
     fail=1

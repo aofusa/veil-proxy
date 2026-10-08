@@ -32,5 +32,6 @@ docker run --rm \
         fi
         timeout 300 cargo deny --color never check advisories licenses 2>&1 \
             | tee /results/cargo_deny_report.txt
-        echo "cargo_deny: ok"
+        # 判定マーカーはレポートファイルへ書く（lib/report.sh がファイルを grep する）。
+        echo "cargo_deny: ok" | tee -a /results/cargo_deny_report.txt
     '

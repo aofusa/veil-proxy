@@ -10,9 +10,9 @@ CI ワークフロー配線は本チケットで行う。**
 
 - F-94: `tools/container_security/harness` に h3spec バイナリ導入 + `h3spec_run.sh`
 - `H3SPEC_STRICT=1` で厳格ゲート可能（ローカル / 手動）
-- GHA の `container-security-nightly.yml` 等への常設配線は未着手
+- GHA の `container-security-nightly.yml` 等への常設配線は 2026-10-05 に完了（`suite` ジョブで `H3SPEC_REQUIRED=1`）
 
-## 改修内容（予定）
+## 改修内容
 
 1. nightly / PR マトリクスで `h3spec` フェーズを実行
 2. 失敗時の artifact（レポート・junit）添付
@@ -27,4 +27,11 @@ CI ワークフロー配線は本チケットで行う。**
 
 ## 対応状況
 
-未着手
+完了（末尾「対応結果」参照）。
+
+## 対応結果（2026-10-05、完了）
+
+`suite` ジョブで `SKIP_H3SPEC=0` + `H3SPEC_REQUIRED=1`（バイナリ未導入を失敗扱い）で毎日実行し、`h3spec_report.txt` を artifact と Job Summary に出す。**`H3SPEC_STRICT`/`H3SPEC_REQUIRED` が `lib/common.sh` からハーネスコンテナへ渡っておらず、run.sh から有効化できなかった不具合**も修正した。トリアージは `h3spec_report.txt` の失敗ケース名で RFC 9114/9204 の該当節を確認し、`H3SPEC_STRICT=1` でローカル再現する。
+
+ワークフローは GitHub Actions 上でしか実行できないため、ローカルでは YAML の構文検証と、
+同じ環境変数での `tools/container_security/run.sh` の実行（v0.7.0 リリース前検証）で確認した。

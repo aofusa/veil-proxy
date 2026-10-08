@@ -10,7 +10,7 @@ use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ftlog::{info, warn};
+use ftlog::{debug, info, warn};
 use httparse::{Request, Status};
 use once_cell::sync::Lazy;
 use rustls::ServerConfig;
@@ -914,44 +914,35 @@ impl CompressionConfig {
             }
         }
 
-        // 4. Content-Type確認
-        if let Some(ct) = content_type {
-            let ct_str = std::str::from_utf8(ct).unwrap_or("");
-            info!("[Compression] Checking Content-Type: '{}'", ct_str);
+        // 4. Content-Type確認（Content-Type が無い場合は圧縮しない）。
+        // 本関数は圧縮対象の応答ごとに呼ばれるため、ログは debug に留める
+        // （以前は info! で毎リクエスト 3 行出力していた）。
+        let ct_str = std::str::from_utf8(content_type?).unwrap_or("");
+        debug!("[Compression] Checking Content-Type: '{}'", ct_str);
 
-            // スキップ対象をチェック
-            for skip in &self.skip_types {
-                if ct_str.starts_with(skip) {
-                    return None;
-                }
-            }
-
-            // 圧縮対象をチェック
-            let is_compressible = self
-                .compressible_types
-                .iter()
-                .any(|t| ct_str.starts_with(t));
-
-            if !is_compressible {
-                return None;
-            }
-        } else {
-            // Content-Typeがない場合は圧縮しない
+        // スキップ対象をチェック
+        if self.skip_types.iter().any(|skip| ct_str.starts_with(skip)) {
             return None;
         }
 
-        // 5. サイズ確認
+        // 圧縮対象をチェック
+        if !self
+            .compressible_types
+            .iter()
+            .any(|t| ct_str.starts_with(t))
+        {
+            return None;
+        }
+
+        // 5. サイズ確認（Content-Length 不明なら圧縮を試みる）
         if let Some(len) = content_length {
-            info!(
-                "[Compression] Checking Content-Length: {} (min_size: {})",
-                len, self.min_size
-            );
             if len < self.min_size {
-                info!("[Compression] Content-Length is too small, skipping");
+                debug!(
+                    "[Compression] Content-Length {} is below min_size {}, skipping",
+                    len, self.min_size
+                );
                 return None;
             }
-        } else {
-            info!("[Compression] Content-Length is missing, proceeding anyway");
         }
 
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
@@ -1400,6 +1391,122 @@ fn default_landlock_write_paths() -> Vec<String> {
 }
 
 // ====================
+// UDS ソケットパス収集（F-164 リスナー・F-170 バックエンド、OpenBSD/macOS 共通）
+// ====================
+
+/// 生の `Config`（unveil/Seatbelt 専用の再パース結果）から UDS ソケットパスを収集する。
+///
+/// - `[server].listen` / `[server].h2c_listen` の `unix:<path>`（F-164。リスナー側は
+///   これまで収集漏れだった）。
+/// - `[[route]]` の Proxy URL（`http(s)://unix:<path>[:<prefix>]`）・
+///   `[upstreams.*.servers]` の URL（F-170、単一 URL プロキシと Upstream グループの両方）。
+/// - `[[l4]].upstreams` の `addr`（`unix:<path>`、F-170、上流のみ。`[[l4]].listen` は
+///   対象外）。
+///
+/// ソケットファイル自体は `bind`/`connect` 時点では存在するとは限らない
+/// （リスナー側は自分で作成、バックエンド側は先方プロセスが作成）ため、
+/// `push_unveil_parent_dir`/`push_sandbox_parent_dir` と同じ「ファイル単体を渡す」
+/// 方針をそのまま踏襲する（`unveil_path`/Seatbelt 側が不存在パスを無害にスキップする、
+/// または `connect(2)` 時点でのみ意味を持つため親ディレクトリ限定は不要）。
+#[cfg(any(target_os = "openbsd", target_os = "macos"))]
+fn collect_uds_socket_paths(config: &Config) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for listen in [
+        Some(&config.server.listen),
+        config.server.h2c_listen.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(path) = listen.strip_prefix("unix:") {
+            if !path.is_empty() {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+
+    if let Some(routes) = &config.route {
+        for route in routes {
+            if let BackendConfig::Proxy { url, .. } = &route.action {
+                if let Some(target) = ProxyTarget::parse(url) {
+                    if let Some(p) = &target.unix_path {
+                        paths.push(PathBuf::from(p.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(upstreams) = &config.upstreams {
+        for group in upstreams.values() {
+            for server in &group.servers {
+                if let Some(target) = ProxyTarget::parse(&server.url) {
+                    if let Some(p) = &target.unix_path {
+                        paths.push(PathBuf::from(p.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "l4-proxy")]
+    if let Some(l4_listeners) = &config.l4 {
+        for l4 in l4_listeners {
+            for u in &l4.upstreams {
+                if let Some(path) = u.addr.strip_prefix("unix:") {
+                    paths.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+/// `LoadedConfig` から UDS バックエンドのソケットパスを収集する（F-170: Linux Landlock 用）。
+///
+/// `collect_uds_socket_paths`（OpenBSD/macOS、生の TOML 再パース）と異なり、こちらは
+/// 起動時に既に構築済みの `Route::resolved_backend` / `upstream_groups` をそのまま
+/// 辿る（ロード時に一度だけ実行するコールドパスであり、`entry.rs` の Landlock 適用箇所
+/// から呼ぶ）。Landlock の FS アクセス権限は UDS への `connect(2)` を仲介しないと
+/// 考えられるが、将来の ABI 変更に備えた保守的措置として書き込み許可へ追加する。
+pub(crate) fn collect_uds_backend_paths_from_loaded(
+    routes: &[Route],
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+    l4_listeners: &[L4ListenerConfig],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    let mut push_group = |group: &UpstreamGroup| {
+        for server in &group.servers {
+            if let Some(p) = &server.target.unix_path {
+                paths.push(PathBuf::from(p.as_ref()));
+            }
+        }
+    };
+
+    for route in routes {
+        if let Some(Backend::Proxy(group, ..)) = &route.resolved_backend {
+            push_group(group);
+        }
+    }
+    for group in upstream_groups.values() {
+        push_group(group);
+    }
+
+    for l4 in l4_listeners {
+        for u in &l4.upstreams {
+            if let Some(path) = u.addr.strip_prefix("unix:") {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+
+    paths
+}
+
+// ====================
 // OpenBSD: unveil 対象パス収集（F-120 Phase 5）
 // ====================
 
@@ -1420,6 +1527,8 @@ pub struct UnveilPaths {
 /// 個々のパス文字列を消費済みで再取得できないフィールドがあるため、unveil 専用に
 /// 設定ファイルをもう一度パースする（起動時コールドパスで 1 回のみ・ホットパス無関係）。
 #[cfg(target_os = "openbsd")]
+// 起動時コールドパス（unveil 前に 1 回だけ設定を読み直す）。データプレーン非経由。
+#[allow(clippy::disallowed_methods)]
 pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
     let config_str = fs::read_to_string(config_path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
@@ -1475,6 +1584,11 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
         push_unveil_parent_dir(&mut read_write_create, file_path);
     }
 
+    // F-164/F-170: UDS リスナー・UDS バックエンドのソケットパス（`unix` promise で
+    // socket/connect/bind が必要）。socket/connect/bind はいずれもパス自体を対象と
+    // するため（親ディレクトリではなく）、`read_write_create` にそのまま追加する。
+    read_write_create.extend(collect_uds_socket_paths(&config));
+
     Ok(UnveilPaths {
         read_only,
         read_write_create,
@@ -1490,6 +1604,8 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
 /// （`LoadedConfig` はパス文字列を消費済みで再取得できないフィールドがある）で、起動時
 /// コールドパスにおいて設定ファイルをもう一度パースする。
 #[cfg(target_os = "macos")]
+// 起動時コールドパス（sandbox_init 前に 1 回だけ設定を読み直す）。データプレーン非経由。
+#[allow(clippy::disallowed_methods)]
 pub fn collect_macos_sandbox_paths(
     config_path: &Path,
 ) -> io::Result<crate::security::macos_sandbox::SandboxPaths> {
@@ -1545,6 +1661,11 @@ pub fn collect_macos_sandbox_paths(
     if let Some(file_path) = &config.logging.error_file_path {
         push_sandbox_parent_dir(&mut read_write, file_path);
     }
+
+    // F-164/F-170: UDS リスナー・UDS バックエンドのソケットパス。既存プロファイルは
+    // `(allow system-socket)` 済みだが、パス指定の `connect`/`bind` にはファイルシステム
+    // パーミッションも必要なため読み書き許可へ追加する。
+    read_write.extend(collect_uds_socket_paths(&config));
 
     Ok(SandboxPaths {
         static_roots,
@@ -2143,7 +2264,7 @@ thread_local! {
 
         // kTLS が有効な場合のみシークレット抽出を有効化した設定を使用
         let config = (*crate::ktls_rustls::client_config(ktls_enabled)).clone();
-        let config = crate::protocol::configure_alpn_h2_client(config, false);
+        let config = crate::protocol::configure_alpn_http11_client(config);
 
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)        // 設定に基づいて kTLS を有効化
@@ -2182,7 +2303,7 @@ thread_local! {
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
 
         let config = (*crate::ktls_rustls::insecure_client_config()).clone();
-        let config = crate::protocol::configure_alpn_h2_client(config, false);
+        let config = crate::protocol::configure_alpn_http11_client(config);
 
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)
@@ -2214,7 +2335,7 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::default_client_config()).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
+        let config = protocol::configure_alpn_http11_client(config);
         simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
@@ -2233,7 +2354,7 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::insecure_client_config()).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
+        let config = protocol::configure_alpn_http11_client(config);
         simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
@@ -2735,10 +2856,12 @@ struct Config {
     /// HTTP/2 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http2: Http2ConfigSection,
     /// HTTP/3 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
@@ -3419,6 +3542,7 @@ pub struct ServerConfigSection {
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http2_enabled: bool,
 
     /// HTTP/3 を有効化するかどうか
@@ -3437,6 +3561,7 @@ pub struct ServerConfigSection {
     /// - リッスンアドレスは [http3].listen で設定
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http3_enabled: bool,
 
     // ====================
@@ -3460,6 +3585,7 @@ pub struct ServerConfigSection {
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub h2c_enabled: bool,
 
     /// H2C リスニングアドレス（オプション）
@@ -3472,6 +3598,7 @@ pub struct ServerConfigSection {
     /// 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub h2c_listen: Option<String>,
 
     /// TLSリスナー（[server].listen）で平文接続を拒否するかどうか（既定 `true`）
@@ -3747,6 +3874,7 @@ pub struct PerformanceConfigSection {
     /// - "manual": 固定チャンクサイズを使用
     #[serde(default = "default_chunk_size_mode")]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub chunk_size_mode: ChunkSizeMode,
 
     /// 手動チャンクサイズ（バイト）
@@ -3755,6 +3883,7 @@ pub struct PerformanceConfigSection {
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub manual_chunk_size: usize,
 
     // ====================
@@ -3770,6 +3899,7 @@ pub struct PerformanceConfigSection {
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub per_stream_pipe_enabled: bool,
 
     // ====================
@@ -4225,17 +4355,33 @@ pub struct ProxyTarget {
     /// `host` がホスト名の場合は `None` となり、従来どおり `TcpStream::connect_str` 経由で
     /// 名前解決する。
     pub socket_addr: Option<std::net::SocketAddr>,
+    /// UDS バックエンド（F-170）。`Some` のときソケットパス文字列を持つ。
+    /// `host`/`port` は Host ヘッダ・SNI・表示用の論理値（既定 `"localhost"` / `0`）。
+    ///
+    /// `Arc<str>`（`Arc<PathBuf>` ではなく）にしているのは (1) `load_backend` が
+    /// リクエストごとに `ProxyTarget` を clone しうる（F-159 で `resolved_backend` に
+    /// したが単一 URL プロキシのフォールバック経路は残っている）ため参照カウント増分の
+    /// みでディープコピーを避けたい、(2) 接続先表記（`unix:<path>`）の組み立て
+    /// （`HostPortStr::unix`）に必要なのは UTF-8 文字列であり、`PathBuf` を経由すると
+    /// `to_str()` の変換が毎回挟まる、の 2 点から。非 unix ターゲットでは常に `None`。
+    pub unix_path: Option<Arc<str>>,
 }
 
 impl ProxyTarget {
     pub fn parse(url: &str) -> Option<Self> {
         let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
             (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
         } else {
-            return None;
+            let rest = url.strip_prefix("http://")?;
+            (false, rest)
         };
+
+        // F-170: `http(s)://unix:<socket-path>[:<path-prefix>]`（nginx の
+        // `proxy_pass http://unix:/path:/uri;` と同じ表記）。UDS 経路は host:port の
+        // 分割ロジックと独立させ、専用のパース関数へ委譲する。
+        if let Some(uds_rest) = rest.strip_prefix("unix:") {
+            return Self::parse_unix(scheme, uds_rest);
+        }
 
         let (host_port, path) = match rest.find('/') {
             Some(idx) => (&rest[..idx], &rest[idx..]),
@@ -4272,7 +4418,59 @@ impl ProxyTarget {
             sni_name: None,
             use_h2c: false, // デフォルトでは無効
             socket_addr,
+            unix_path: None,
         })
+    }
+
+    /// UDS 表記 (`unix:<socket-path>[:<path-prefix>]`、`unix:` 接頭辞は既に剥がれている)
+    /// をパースする（F-170）。
+    ///
+    /// ソケットパスの後ろの **最後の `:`** を境界候補とし、その直後が `/` で始まる
+    /// ときだけパスプレフィックスとして解釈する（省略時は `/`）。ソケットパスに `:`
+    /// は使えない（区切りと衝突するため）。ソケットパスが空なら設定エラーとして
+    /// `None` を返す。
+    #[cfg(unix)]
+    fn parse_unix(scheme: bool, rest: &str) -> Option<Self> {
+        let (socket_path, path_prefix) = match rest.rfind(':') {
+            Some(idx) if rest[idx + 1..].starts_with('/') => (&rest[..idx], &rest[idx + 1..]),
+            _ => (rest, "/"),
+        };
+        if socket_path.is_empty() {
+            return None;
+        }
+        Some(ProxyTarget {
+            host: "localhost".to_string(),
+            port: 0,
+            use_tls: scheme,
+            path_prefix: path_prefix.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            socket_addr: None,
+            unix_path: Some(Arc::from(socket_path)),
+        })
+    }
+
+    /// 非 unix プラットフォームでは UDS 表記を受理しない（F-170）。
+    #[cfg(not(unix))]
+    fn parse_unix(_scheme: bool, _rest: &str) -> Option<Self> {
+        None
+    }
+
+    /// UDS バックエンドかどうか（F-170）。
+    #[inline]
+    pub fn is_unix(&self) -> bool {
+        self.unix_path.is_some()
+    }
+
+    /// 接続先表記。UDS なら `unix:<path>`、それ以外は従来どおり `host:port`
+    /// （F-170）。プールキー・ログ・メトリクス・Consistent Hash のノード ID の
+    /// 唯一の入口として使う。
+    #[inline]
+    pub(crate) fn conn_addr(&self) -> crate::http_utils::HostPortStr {
+        match &self.unix_path {
+            Some(p) => crate::http_utils::HostPortStr::unix(p.as_ref()),
+            None => crate::http_utils::HostPortStr::new(&self.host, self.port),
+        }
     }
 
     /// SNI名を設定したコピーを作成
@@ -4297,8 +4495,13 @@ impl ProxyTarget {
     }
 
     /// デフォルトポートかどうかを判定
+    ///
+    /// UDS バックエンド（F-170）は常に `true`（Host ヘッダへ `:0` を付けない）。
     #[inline]
     pub fn is_default_port(&self) -> bool {
+        if self.is_unix() {
+            return true;
+        }
         if self.use_tls {
             self.port == 443
         } else {
@@ -4350,6 +4553,82 @@ mod proxy_target_socket_addr_tests {
     fn ipv6_bracket_literal_is_rejected_by_existing_split_logic() {
         assert!(ProxyTarget::parse("http://[::1]:8080/").is_none());
         assert!(ProxyTarget::parse("http://[::1]/").is_none());
+    }
+
+    // ==== F-170: UDS バックエンド ====
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_without_path_prefix_defaults_to_slash() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock").unwrap();
+        assert!(t.is_unix());
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock"));
+        assert_eq!(t.path_prefix, "/");
+        assert_eq!(t.host, "localhost");
+        assert_eq!(t.port, 0);
+        assert!(!t.use_tls);
+        assert_eq!(t.socket_addr, None);
+        assert!(t.is_default_port());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_with_path_prefix() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock:/api").unwrap();
+        assert!(t.is_unix());
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock"));
+        assert_eq!(t.path_prefix, "/api");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_https_scheme_sets_use_tls() {
+        let t = ProxyTarget::parse("https://unix:/run/app.sock").unwrap();
+        assert!(t.is_unix());
+        assert!(t.use_tls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_rejects_empty_socket_path() {
+        assert!(ProxyTarget::parse("http://unix:").is_none());
+        // 最後の ':' 以降が '/' で始まらない（`:8080` のような数字）場合は
+        // 全体がソケットパスとして扱われるため空判定にはならないが、コロンの
+        // 直後が空文字列のケースだけを空扱いとする（"unix::/api" → ソケットパス空）。
+        assert!(ProxyTarget::parse("http://unix::/api").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_colon_boundary_requires_slash_after_last_colon() {
+        // 最後の ':' の直後が '/' で始まらない場合は境界とみなさず、全体をソケット
+        // パスとして扱う（ソケットパスに ':' が含まれるケースは非対応の明文化）。
+        let t = ProxyTarget::parse("http://unix:/run/app.sock:8080").unwrap();
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock:8080"));
+        assert_eq!(t.path_prefix, "/");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn parse_unix_notation_rejected_on_non_unix() {
+        assert!(ProxyTarget::parse("http://unix:/run/app.sock").is_none());
+    }
+
+    /// F-170: `conn_addr()` は TCP（`unix_path = None`）で
+    /// `HostPortStr::new(host, port)` と 1 バイトも変わらない（プールキー・
+    /// Consistent Hash ノード ID の再利用を静かに壊さないための不変条件）。
+    #[test]
+    fn conn_addr_matches_host_port_str_for_tcp_target() {
+        let t = ProxyTarget::parse("http://backend.example.com:8080/").unwrap();
+        let expected = crate::http_utils::HostPortStr::new(&t.host, t.port);
+        assert_eq!(t.conn_addr().as_str(), expected.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conn_addr_is_unix_prefixed_for_uds_target() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock").unwrap();
+        assert_eq!(t.conn_addr().as_str(), "unix:/run/app.sock");
     }
 }
 
@@ -4774,8 +5053,9 @@ impl UpstreamGroup {
         use xxhash_rust::xxh3::xxh3_64_with_seed;
         let mut ring: Vec<(u64, usize)> = Vec::with_capacity(pairs.len() * CONSISTENT_HASH_VNODES);
         for (idx, (_, server)) in pairs.iter().enumerate() {
-            // サーバー識別子（host:port）を基に vnode を生成
-            let id = format!("{}:{}", server.target.host, server.target.port);
+            // サーバー識別子（接続先表記。TCP は host:port、UDS は unix:<path>、F-170）を
+            // 基に vnode を生成。TCP では conn_addr() は host:port と 1 バイトも変わらない。
+            let id = server.target.conn_addr().as_str().to_string();
             for vnode in 0..CONSISTENT_HASH_VNODES {
                 let key = format!("{}#{}", id, vnode);
                 let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);
@@ -5205,6 +5485,57 @@ fn apply_alt_svc_from_config(config: &Config) {
     }
 }
 
+/// 上流 URL のパース失敗理由を説明するメッセージ（F-170）。
+///
+/// `ProxyTarget::parse` は非 unix プラットフォームで `http(s)://unix:<path>` を常に
+/// `None` にする（`parse_unix` が `#[cfg(not(unix))]` で `None` を返す）ため、素の
+/// "invalid url" だけでは原因（UDS 非対応）が分からない。`unix:` 表記かつ非 unix
+/// ビルドの場合はその旨を明示する。
+fn proxy_url_invalid_reason(url: &str) -> String {
+    #[cfg(not(unix))]
+    {
+        let rest = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"));
+        if rest.is_some_and(|r| r.starts_with("unix:")) {
+            return format!(
+                "{} (unix domain socket backends are not supported on this platform)",
+                url
+            );
+        }
+    }
+    url.to_string()
+}
+
+#[cfg(test)]
+mod proxy_url_invalid_reason_tests {
+    use super::proxy_url_invalid_reason;
+
+    #[test]
+    fn plain_invalid_url_is_unchanged() {
+        assert_eq!(
+            proxy_url_invalid_reason("not a url"),
+            "not a url".to_string()
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unix_notation_on_non_unix_explains_platform_reason() {
+        let msg = proxy_url_invalid_reason("http://unix:/run/app.sock");
+        assert!(msg.contains("not supported on this platform"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_notation_on_unix_is_unchanged_since_parse_would_succeed() {
+        // unix ビルドでは `unix:` 表記自体は有効なため、ここに到達するのは
+        // 別の理由（空パス等）でパースに失敗した場合のみ。特別なメッセージ拡張はしない。
+        let msg = proxy_url_invalid_reason("http://unix:");
+        assert_eq!(msg, "http://unix:".to_string());
+    }
+}
+
 fn validate_config(config: &Config) -> io::Result<()> {
     // TLS証明書ファイルの存在チェック
     let cert_path = Path::new(&config.tls.cert_path);
@@ -5278,7 +5609,57 @@ fn validate_config(config: &Config) -> io::Result<()> {
                 if ProxyTarget::parse(&entry.url).is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Invalid server URL in upstream '{}': {}", name, entry.url),
+                        format!(
+                            "Invalid server URL in upstream '{}': {}",
+                            name,
+                            proxy_url_invalid_reason(&entry.url)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // L4 上流の妥当性チェック（F-170: `unix:<path>` の非対応プラットフォームでの
+    // 使用を明確なエラーにする）。
+    #[cfg(feature = "l4-proxy")]
+    for l4 in config.l4.iter().flatten() {
+        #[cfg(unix)]
+        for u in &l4.upstreams {
+            if let Some(path) = u.addr.strip_prefix("unix:") {
+                if path.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}' upstream '{}': empty unix socket path",
+                            l4.name, u.addr
+                        ),
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        for u in &l4.upstreams {
+            if u.addr.starts_with("unix:") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "L4 listener '{}' upstream '{}': unix domain socket backends are not supported on this platform",
+                        l4.name, u.addr
+                    ),
+                ));
+            }
+        }
+        // F-170: UDP 上流は UDS 非対応（QUIC/UDP は AF_UNIX に載らない）。
+        if l4.protocol == L4Protocol::Udp {
+            for u in &l4.upstreams {
+                if u.addr.starts_with("unix:") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}' upstream '{}': unix domain socket backends are not supported for UDP",
+                            l4.name, u.addr
+                        ),
                     ));
                 }
             }
@@ -5358,7 +5739,11 @@ fn validate_route_config(
             if ProxyTarget::parse(url).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Invalid proxy URL for route '{}': {}", route_name, url),
+                    format!(
+                        "Invalid proxy URL for route '{}': {}",
+                        route_name,
+                        proxy_url_invalid_reason(url)
+                    ),
                 ));
             }
         }
@@ -5688,9 +6073,11 @@ pub struct LoadedConfig {
     pub tls_only: bool,
     /// TLS証明書パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_path: String,
     /// 証明書の自動リロードを有効にするか（F-03）
     pub tls_auto_reload: bool,
@@ -5704,12 +6091,14 @@ pub struct LoadedConfig {
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
     ///
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,
@@ -5954,6 +6343,9 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     };
 
     // アトミックに設定を入れ替え
+    // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（以前は設定ロード時に
+    // 一度も呼ばれておらず、無効設定・既定値でも毎リクエストのメトリクス記録が走っていた）。
+    crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
@@ -8085,10 +8477,13 @@ mod shipped_config_tests {
         std::fs::write(www.join("robots.txt"), "User-agent: *\n").unwrap();
         std::fs::write(www.join("index.html"), "<html></html>").unwrap();
 
+        // TOML の基本文字列ではバックスラッシュがエスケープ扱いになるため、
+        // Windows のパス（`C:\Users\...`）は区切りを `/` にしてから埋め込む。
+        let toml_path = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
         let content = content
-            .replace("/path/to/cert.pem", &cert_path.to_string_lossy())
-            .replace("/path/to/key.pem", &key_path.to_string_lossy())
-            .replace("/var/www", &www.to_string_lossy());
+            .replace("/path/to/cert.pem", &toml_path(&cert_path))
+            .replace("/path/to/key.pem", &toml_path(&key_path))
+            .replace("/var/www", &toml_path(&www));
 
         let test_path = dir.path().join("config.toml");
         std::fs::write(&test_path, content).unwrap();

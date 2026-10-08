@@ -175,6 +175,17 @@ pub fn raise_nofile_limit() {
     }
     let old_soft = lim.rlim_cur;
     lim.rlim_cur = lim.rlim_max;
+    // macOS は hard が既定で RLIM_INFINITY だが、soft に kern.maxfilesperproc を
+    // 超える値（RLIM_INFINITY を含む）を渡すと setrlimit が EINVAL で失敗する
+    // （setrlimit(2) の COMPATIBILITY 節）。丸めないと soft は既定の 256 のまま残り、
+    // 数百接続で EMFILE になる（実機の単体テストで検出）。
+    #[cfg(target_os = "macos")]
+    if let Some(per_proc) = macos_maxfilesperproc() {
+        lim.rlim_cur = lim.rlim_cur.min(per_proc);
+        if lim.rlim_cur <= old_soft {
+            return;
+        }
+    }
     // SAFETY: lim は初期化済みの rlimit 構造体で、setrlimit はそれを読み取るのみ。
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
         warn!(
@@ -188,6 +199,25 @@ pub fn raise_nofile_limit() {
         "raised RLIMIT_NOFILE soft: {} -> {}",
         old_soft, lim.rlim_cur
     );
+}
+
+/// macOS の 1 プロセスあたりの fd 上限（`kern.maxfilesperproc`）を返す。
+#[cfg(target_os = "macos")]
+fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: name は NUL 終端の静的文字列、val/len は有効なスタック変数で、
+    // sysctlbyname は len バイト以内で val へ書き込むのみ。
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut val as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && val > 0).then_some(val as libc::rlim_t)
 }
 
 /// Windows には `RLIMIT_NOFILE`/`getrlimit`/`setrlimit` に相当する概念が無い
@@ -707,13 +737,16 @@ pub(crate) fn attach_reuseport_cbpf(fd: i32, num_workers: usize) -> io::Result<(
     Ok(())
 }
 
-#[cfg(test)]
+// テストはいずれも unix（rlimit）または Linux（cBPF）専用。Windows では空になり
+// `use super::*` が未使用警告になるため、モジュールごと unix に限定する。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// raise_nofile_limit が panic せず、soft limit が呼び出し前以上・hard 以下に
     /// なること（B-44 第4段）。到達値は環境（コンテナ/権限）依存のため、
-    /// 非減少と上限内のみを検証する。
+    /// 非減少と上限内のみを検証する。Windows には rlimit が無い（no-op 実装）ため unix 限定。
+    #[cfg(unix)]
     #[test]
     fn test_raise_nofile_limit_non_decreasing() {
         let mut before = libc::rlimit {
@@ -800,6 +833,10 @@ mod tests {
     /// アタッチが Err になるため、その場合はテストをスキップする。
     #[cfg(target_os = "linux")]
     #[test]
+    // 理由付き allow: 単体テストのクライアント接続（同期 connect）とカーネルの
+    // accept 分散待ち（sleep）。いずれもテストコードであり、データプレーンの
+    // ホットパスではない（AGENTS.md「テスト/ベンチは理由付き個別 allow」）。
+    #[allow(clippy::disallowed_methods)]
     fn test_reuseport_cbpf_accept_distribution_not_pinned_to_one_worker() {
         use std::net::{TcpListener as StdTcpListener, TcpStream};
         use std::os::unix::io::{AsRawFd, FromRawFd};

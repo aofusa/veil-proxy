@@ -1,19 +1,18 @@
 use crate::component::instance::Instance;
 use crate::component::matching::InstanceType;
 use crate::component::storage::storage_as_slice;
-use crate::component::types::ComponentFunc;
+use crate::component::types::Type;
 use crate::component::values::Val;
 use crate::prelude::*;
 use crate::runtime::vm::component::{ComponentInstance, InstanceFlags, ResourceTables};
 use crate::runtime::vm::{Export, VMFuncRef};
 use crate::store::StoreOpaque;
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
-use anyhow::Context as _;
 use core::mem::{self, MaybeUninit};
 use core::ptr::NonNull;
 use wasmtime_environ::component::{
-    CanonicalOptions, ExportIndex, InterfaceType, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS, OptionsIndex,
-    TypeFuncIndex, TypeTuple,
+    CanonicalOptions, ExportIndex, InterfaceType, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS, TypeFuncIndex,
+    TypeTuple,
 };
 
 #[cfg(feature = "component-model-async")]
@@ -167,7 +166,7 @@ impl Func {
         Return: ComponentNamedList + Lift,
     {
         let cx = InstanceType::new(instance.unwrap_or_else(|| self.instance.id().get(store)));
-        let ty = &cx.types[self.ty_index(store)];
+        let ty = &cx.types[self.ty(store)];
 
         Params::typecheck(&InterfaceType::Tuple(ty.params), &cx)
             .context("type mismatch with parameters")?;
@@ -177,18 +176,34 @@ impl Func {
         Ok(())
     }
 
-    /// Get the type of this function.
-    pub fn ty(&self, store: impl AsContext) -> ComponentFunc {
-        self.ty_(store.as_context().0)
+    /// Get the parameter names and types for this function.
+    pub fn params(&self, store: impl AsContext) -> Box<[(String, Type)]> {
+        let store = store.as_context();
+        let instance = self.instance.id().get(store.0);
+        let types = instance.component().types();
+        let func_ty = &types[self.ty(store.0)];
+        types[func_ty.params]
+            .types
+            .iter()
+            .zip(&func_ty.param_names)
+            .map(|(ty, name)| (name.clone(), Type::from(ty, &InstanceType::new(instance))))
+            .collect()
     }
 
-    fn ty_(&self, store: &StoreOpaque) -> ComponentFunc {
-        let cx = InstanceType::new(self.instance.id().get(store));
-        let ty = self.ty_index(store);
-        ComponentFunc::from(ty, &cx)
+    /// Get the result types for this function.
+    pub fn results(&self, store: impl AsContext) -> Box<[Type]> {
+        let store = store.as_context();
+        let instance = self.instance.id().get(store.0);
+        let types = instance.component().types();
+        let ty = self.ty(store.0);
+        types[types[ty].results]
+            .types
+            .iter()
+            .map(|ty| Type::from(ty, &InstanceType::new(instance)))
+            .collect()
     }
 
-    fn ty_index(&self, store: &StoreOpaque) -> TypeFuncIndex {
+    fn ty(&self, store: &StoreOpaque) -> TypeFuncIndex {
         let instance = self.instance.id().get(store);
         let (ty, _, _) = instance.component().export_lifted_function(self.index);
         ty
@@ -260,15 +275,14 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        let store = store.as_context_mut();
+        let mut store = store.as_context_mut();
 
         #[cfg(feature = "component-model-async")]
         {
-            store
-                .run_concurrent_trap_on_idle(async |store| {
+            self.instance
+                .run_concurrent(&mut store, async |store| {
                     self.call_concurrent_dynamic(store, params, results, false)
                         .await
-                        .map(drop)
                 })
                 .await?
         }
@@ -278,7 +292,6 @@ impl Func {
                 store.0.async_support(),
                 "cannot use `call_async` without enabling async support in the config"
             );
-            let mut store = store;
             store
                 .on_fiber(|store| self.call_impl(store, params, results))
                 .await?
@@ -291,19 +304,21 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        let ty = self.ty(&store);
-        if ty.params().len() != params.len() {
+        let param_tys = self.params(&store);
+        if param_tys.len() != params.len() {
             bail!(
                 "expected {} argument(s), got {}",
-                ty.params().len(),
+                param_tys.len(),
                 params.len(),
             );
         }
 
-        if ty.results().len() != results.len() {
+        let result_tys = self.results(&store);
+
+        if result_tys.len() != results.len() {
             bail!(
                 "expected {} result(s), got {}",
-                ty.results().len(),
+                result_tys.len(),
                 results.len(),
             );
         }
@@ -320,51 +335,6 @@ impl Func {
     /// (if any) automatically when the guest task completes -- no need to
     /// explicitly call `Func::post_return` afterward.
     ///
-    /// This returns a [`TaskExit`] representing the completion of the guest
-    /// task and any transitive subtasks it might create.
-    ///
-    /// # Progress
-    ///
-    /// For the wasm task being created in `call_concurrent` to make progress it
-    /// must be run within the scope of [`run_concurrent`]. If there are no
-    /// active calls to [`run_concurrent`] then the wasm task will appear as
-    /// stalled. This is typically not a concern as an [`Accessor`] is bound
-    /// by default to a scope of [`run_concurrent`].
-    ///
-    /// One situation in which this can arise, for example, is that if a
-    /// [`run_concurrent`] computation finishes its async closure before all
-    /// wasm tasks have completed, then there will be no scope of
-    /// [`run_concurrent`] anywhere. In this situation the wasm tasks that have
-    /// not yet completed will not make progress until [`run_concurrent`] is
-    /// called again.
-    ///
-    /// Embedders will need to ensure that this future is `await`'d within the
-    /// scope of [`run_concurrent`] to ensure that the value can be produced
-    /// during the `await` call.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancelling an async task created via `call_concurrent`, at this time, is
-    /// only possible by dropping the store that the computation runs within.
-    /// With [#11833] implemented then it will be possible to request
-    /// cancellation of a task, but that is not yet implemented. Hard-cancelling
-    /// a task will only ever be possible by dropping the entire store and it is
-    /// not possible to remove just one task from a store.
-    ///
-    /// This async function behaves more like a "spawn" than a normal Rust async
-    /// function. When this function is invoked then metadata for the function
-    /// call is recorded in the store connected to the `accessor` argument and
-    /// the wasm invocation is from then on connected to the store. If the
-    /// future created by this function is dropped it does not cancel the
-    /// in-progress execution of the wasm task. Dropping the future
-    /// relinquishes the host's ability to learn about the result of the task
-    /// but the task will still progress and invoke callbacks and such until
-    /// completion.
-    ///
-    /// [`run_concurrent`]: crate::Store::run_concurrent
-    /// [#11833]: https://github.com/bytecodealliance/wasmtime/issues/11833
-    /// [`Accessor`]: crate::component::Accessor
-    ///
     /// # Panics
     ///
     /// Panics if the store that the [`Accessor`] is derived from does not own
@@ -375,8 +345,8 @@ impl Func {
         accessor: impl AsAccessor<Data: Send>,
         params: &[Val],
         results: &mut [Val],
-    ) -> Result<TaskExit> {
-        self.call_concurrent_dynamic(accessor, params, results, true)
+    ) -> Result<()> {
+        self.call_concurrent_dynamic(accessor.as_accessor(), params, results, true)
             .await
     }
 
@@ -384,12 +354,13 @@ impl Func {
     #[cfg(feature = "component-model-async")]
     async fn call_concurrent_dynamic(
         self,
-        accessor: impl AsAccessor<Data: Send>,
+        store: impl AsAccessor<Data: Send>,
         params: &[Val],
         results: &mut [Val],
         call_post_return_automatically: bool,
-    ) -> Result<TaskExit> {
-        let result = accessor.as_accessor().with(|mut store| {
+    ) -> Result<()> {
+        let store = store.as_accessor();
+        let result = store.with(|mut store| {
             assert!(
                 store.as_context_mut().0.async_support(),
                 "cannot use `call_concurrent` when async support is not enabled on the config"
@@ -403,12 +374,12 @@ impl Func {
             concurrent::queue_call(store.as_context_mut(), prepared)
         })?;
 
-        let (run_results, rx) = result.await?;
+        let run_results = result.await?;
         assert_eq!(run_results.len(), results.len());
         for (result, slot) in run_results.into_iter().zip(results) {
             *slot = result;
         }
-        Ok(TaskExit(rx))
+        Ok(())
     }
 
     /// Calls `concurrent::prepare_call` with monomorphized functions for
@@ -426,7 +397,7 @@ impl Func {
             store,
             self,
             MAX_FLAT_PARAMS,
-            false,
+            true,
             call_post_return_automatically,
             move |func, store, params_out| {
                 func.with_lower_context(store, call_post_return_automatically, |cx, ty| {
@@ -533,18 +504,14 @@ impl Func {
     pub(crate) fn abi_info<'a>(
         &self,
         store: &'a StoreOpaque,
-    ) -> (
-        OptionsIndex,
-        InstanceFlags,
-        TypeFuncIndex,
-        &'a CanonicalOptions,
-    ) {
+    ) -> (Options, InstanceFlags, TypeFuncIndex, &'a CanonicalOptions) {
         let vminstance = self.instance.id().get(store);
         let component = vminstance.component();
         let (ty, _def, options_index) = component.export_lifted_function(self.index);
         let raw_options = &component.env_component().options[options_index];
+        let options = Options::new_index(store, self.instance, options_index);
         (
-            options_index,
+            options,
             vminstance.instance_flags(raw_options.instance),
             ty,
             raw_options,
@@ -763,10 +730,6 @@ impl Func {
             // panic, even if the function call below traps.
             flags.set_needs_post_return(false);
 
-            // Post return functions are forbidden from calling imports or
-            // intrinsics.
-            flags.set_may_leave(false);
-
             // If the function actually had a `post-return` configured in its
             // canonical options that's executed here.
             //
@@ -783,10 +746,9 @@ impl Func {
             }
 
             // And finally if everything completed successfully then the "may
-            // enter" and "may leave" flags are set to `true` again here which
-            // enables further use of the component.
+            // enter" flag is set to `true` again here which enables further use
+            // of the component.
             flags.set_may_enter(true);
-            flags.set_may_leave(true);
 
             let (calls, host_table, _, instance) = store
                 .0
@@ -913,8 +875,8 @@ impl Func {
         may_enter: bool,
         lower: impl FnOnce(&mut LowerContext<T>, InterfaceType) -> Result<()>,
     ) -> Result<()> {
-        let (options_idx, mut flags, ty, options) = self.abi_info(store.0);
-        let async_ = options.async_;
+        let types = self.instance.id().get(store.0).component().types().clone();
+        let (options, mut flags, ty, _) = self.abi_info(store.0);
 
         // Test the "may enter" flag which is a "lock" on this instance.
         // This is immediately set to `false` afterwards and note that
@@ -936,9 +898,8 @@ impl Func {
             debug_assert!(flags.may_leave());
             flags.set_may_leave(false);
         }
-        let mut cx = LowerContext::new(store.as_context_mut(), options_idx, self.instance);
-        let param_ty = InterfaceType::Tuple(cx.types[ty].params);
-        let result = lower(&mut cx, param_ty);
+        let mut cx = LowerContext::new(store.as_context_mut(), &options, &types, self.instance);
+        let result = lower(&mut cx, InterfaceType::Tuple(types[ty].params));
         unsafe { flags.set_may_leave(true) };
         result?;
 
@@ -947,7 +908,7 @@ impl Func {
         // post-return call being required as we're about to enter wasm and
         // afterwards need a post-return.
         unsafe {
-            if may_enter && async_ {
+            if may_enter && options.async_() {
                 flags.set_may_enter(true);
             } else {
                 flags.set_needs_post_return(true);
@@ -968,40 +929,8 @@ impl Func {
         lift: impl FnOnce(&mut LiftContext, InterfaceType) -> Result<R>,
     ) -> Result<R> {
         let (options, _flags, ty, _) = self.abi_info(store);
-        let mut cx = LiftContext::new(store, options, self.instance);
+        let mut cx = LiftContext::new(store, &options, self.instance);
         let ty = InterfaceType::Tuple(cx.types[ty].results);
         lift(&mut cx, ty)
-    }
-}
-
-/// Represents the completion of a task created using
-/// `[Typed]Func::call_concurrent`.
-///
-/// In general, a guest task may continue running after returning a value.
-/// Moreover, any given guest task may create its own subtasks before or after
-/// returning and may exit before some or all of those subtasks have finished
-/// running.  In that case, the still-running subtasks will be "reparented" to
-/// the nearest surviving caller, which may be the original host call.  The
-/// future returned by `TaskExit::block` will resolve once all transitive
-/// subtasks created directly or indirectly by the original call to
-/// `Instance::call_concurrent` have exited.
-#[cfg(feature = "component-model-async")]
-pub struct TaskExit(futures::channel::oneshot::Receiver<()>);
-
-#[cfg(feature = "component-model-async")]
-impl TaskExit {
-    /// Returns a future which will resolve once all transitive subtasks created
-    /// directly or indirectly by the original call to
-    /// `Instance::call_concurrent` have exited.
-    pub async fn block(self, accessor: impl AsAccessor<Data: Send>) {
-        // The current implementation makes no use of `accessor`, but future
-        // implementations might (e.g. by using a more efficient mechanism than
-        // a oneshot channel).
-        _ = accessor;
-
-        // We don't care whether the sender sent us a value or was dropped
-        // first; either one counts as a notification, so we ignore the result
-        // once the future resolves:
-        _ = self.0.await;
     }
 }

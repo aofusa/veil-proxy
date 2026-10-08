@@ -25,10 +25,14 @@
 # 使い方:
 #   tools/qemu/linux-aarch64-e2e.sh              # ビルド → VM 起動 → E2E
 #   SKIP_BUILD=1 tools/qemu/linux-aarch64-e2e.sh # 既存の成果物を使う
+#   NATIVE_BUILD=1 tools/qemu/linux-aarch64-e2e.sh # veil も VM 内でビルドする
 #
 # 環境変数:
 #   CARGO_FEATURES  ビルド/E2E の feature（既定 full）
 #   SKIP_BUILD      1 で Docker クロスビルドを省略
+#   NATIVE_BUILD    1 で Docker クロスビルドを使わず、veil 本体も VM 内でビルドする。
+#                   Apple Silicon macOS の native モード（HVF）向け。HVF では VM が
+#                   ネイティブ速度で動くため、Docker 無しで全 E2E を完走できる。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,7 +47,8 @@ log() { echo "[linux-aarch64-e2e] $*" >&2; }
 die() { echo "[linux-aarch64-e2e] ERROR: $*" >&2; exit 1; }
 
 # 1) Docker で aarch64 バイナリをビルドして取り出す
-if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+NATIVE_BUILD="${NATIVE_BUILD:-0}"
+if [[ "${NATIVE_BUILD}" != "1" && "${SKIP_BUILD:-0}" != "1" ]]; then
     log "docker/Dockerfile.glibc.aarch64 で ${RUST_TARGET} 向けにビルド"
     rm -rf "${STAGE}"; mkdir -p "${STAGE}"
     docker build \
@@ -58,7 +63,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     docker rm "${cid}" >/dev/null
 fi
 BIN="${STAGE}/veil"
-[[ -f "${BIN}" ]] || die "aarch64 バイナリが見つかりません: ${BIN}（SKIP_BUILD=1 のまま実行した？）"
+[[ "${NATIVE_BUILD}" == "1" || -f "${BIN}" ]] || die "aarch64 バイナリが見つかりません: ${BIN}（SKIP_BUILD=1 のまま実行した？）"
 
 # 2) VM 起動
 log "aarch64 VM を起動して SSH 到達を待つ（TCG では非常に時間がかかる）"
@@ -69,20 +74,26 @@ log "aarch64 VM を起動して SSH 到達を待つ（TCG では非常に時間�
 log "VM へリポジトリを転送"
 "${VM}" ssh "rm -rf ${GUEST_ROOT} && mkdir -p ${GUEST_ROOT}"
 (cd "${ROOT}" && tar czf - \
-    src benches tests examples contrib docker/assets \
+    src benches tests examples contrib docker/assets third_party \
     Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
   | "${VM}" ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
 
-log "クロスビルド済み veil を配置（VM 内では veil をビルドしない）"
-"${VM}" ssh "mkdir -p ${GUEST_ROOT}/target/debug"
-"${VM}" scp "${BIN}" "${GUEST_ROOT}/target/debug/veil"
-"${VM}" ssh "chmod +x ${GUEST_ROOT}/target/debug/veil && ${GUEST_ROOT}/target/debug/veil --version || true"
+SKIP_ENV="VEIL_E2E_SKIP_VEIL_BUILD=1"
+if [[ "${NATIVE_BUILD}" == "1" ]]; then
+    SKIP_ENV=""
+else
+    log "クロスビルド済み veil を配置（VM 内では veil をビルドしない）"
+    "${VM}" ssh "mkdir -p ${GUEST_ROOT}/target/debug"
+    "${VM}" scp "${BIN}" "${GUEST_ROOT}/target/debug/veil"
+    "${VM}" ssh "chmod +x ${GUEST_ROOT}/target/debug/veil && ${GUEST_ROOT}/target/debug/veil --version || true"
+fi
 
 log "VM 内の Rust ツールチェーン / E2E 依存を用意"
-"${VM}" ssh 'command -v cargo >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq cargo rustc build-essential pkg-config libssl-dev cmake nasm curl openssl)'
+# Ubuntu の apt 版 rustc は古く本クレートをビルドできないため rustup の stable を使う
+"${VM}" ssh 'set -e; if ! command -v cmake >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1; then sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev cmake nasm curl openssl protobuf-compiler clang libclang-dev python3 >/dev/null; fi; [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'
 
 # 4) E2E 実行
 log "VM 内で tests/e2e_setup.sh test を実行（features=${CARGO_FEATURES}）"
-"${VM}" ssh "cd ${GUEST_ROOT} && VEIL_E2E_SKIP_VEIL_BUILD=1 VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
+"${VM}" ssh "export PATH=\$HOME/.cargo/bin:\$PATH; cd ${GUEST_ROOT} && ${SKIP_ENV} VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
 
 log "完了"

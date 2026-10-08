@@ -29,13 +29,11 @@ type HyperClient = Client<
 
 /// HTTP/1.1テストクライアント
 /// hyper + hyper-rustlsを使用したHTTPS/HTTP対応クライアント
-#[allow(dead_code)]
 pub struct Http1TestClient {
     client: HyperClient,
     base_url: String,
 }
 
-#[allow(dead_code)]
 impl Http1TestClient {
     /// 新しいHTTP/1.1クライアントを作成（HTTPS用、証明書検証なし）
     pub fn new_https(

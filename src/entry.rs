@@ -35,8 +35,10 @@ use crate::server::*;
 /// - `inet`: TCP/UDP ソケット（bind/listen/accept/connect を含む）。
 /// - `dns`: upstream ホスト名解決（`getaddrinfo`）。
 /// - `flock`: ログライブラリ（ftlog）のファイルロック。
+/// - `unix`: AF_UNIX ソケットの socket/connect/bind（F-164 の UDS リスナー・
+///   F-170 の UDS バックエンド接続の両方に必要）。
 #[cfg(target_os = "openbsd")]
-const PLEDGE_PROMISES: &str = "stdio rpath wpath cpath inet dns flock";
+const PLEDGE_PROMISES: &str = "stdio rpath wpath cpath inet dns flock unix";
 
 // ====================
 // ワーカースレッド
@@ -486,6 +488,8 @@ pub fn run() {
         #[cfg(feature = "l4-proxy")]
         l4_listeners: Arc::new(loaded_config.l4_listeners.clone()),
     };
+    // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（config::reload と同じ）。
+    crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
 
@@ -731,6 +735,24 @@ pub fn run() {
         add_parent_dir(loaded_config.logging.resolved_error_path());
         #[cfg(feature = "access-log")]
         add_parent_dir(loaded_config.access_log_config.file_path.as_deref());
+    }
+
+    // F-170: UDS バックエンド（HTTP 上流・L4 上流）のソケットパスを Landlock 書き込み
+    // 許可へ追加する（Landlock の FS 権限は UDS connect を仲介しないと考えられるが、
+    // 将来の ABI 変更に備えた保守的措置）。
+    #[cfg(feature = "l4-proxy")]
+    let l4_listeners_for_uds = loaded_config.l4_listeners.as_slice();
+    #[cfg(not(feature = "l4-proxy"))]
+    let l4_listeners_for_uds: &[crate::config::L4ListenerConfig] = &[];
+    for p in crate::config::collect_uds_backend_paths_from_loaded(
+        &loaded_config.route,
+        &loaded_config.upstream_groups,
+        l4_listeners_for_uds,
+    ) {
+        let s = p.to_string_lossy().into_owned();
+        if !landlock_write_paths.contains(&s) {
+            landlock_write_paths.push(s);
+        }
     }
 
     // セキュリティ設定を構築
@@ -1656,6 +1678,8 @@ pub fn run() {
                                                 "[H2C Worker] Unknown protocol from {}, closing connection",
                                                 peer_addr
                                             );
+                                            // RFC 9113 §3.4: GOAWAY(PROTOCOL_ERROR) を返して閉じる。
+                                            crate::proxy::reject_h2c_invalid_preface(stream).await;
                                         }
                                     }
                                 });

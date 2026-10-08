@@ -48,7 +48,6 @@
 use crate::runtime::handle::{AsRawFd, RawFd};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -981,7 +980,7 @@ fn connect_new(
 ) -> Result<PooledConn, String> {
     let timeout = Duration::from_millis(timeout_ms.max(1) as u64);
     let addr = format!("{host}:{port}");
-    let tcp_stream = TcpStream::connect_timeout(
+    let tcp_stream = crate::upstream::tcp_connect_timeout(
         &addr
             .parse()
             .map_err(|e| format!("invalid upstream address '{addr}': {e}"))?,
@@ -1106,7 +1105,7 @@ pub fn execute_grpc_unary_call(
     let deadline = Instant::now() + timeout;
 
     let addr = format!("{host}:{port}");
-    let tcp_stream = TcpStream::connect_timeout(
+    let tcp_stream = crate::upstream::tcp_connect_timeout(
         &addr
             .parse()
             .map_err(|e| format!("invalid upstream address '{addr}': {e}"))?,
@@ -1326,6 +1325,7 @@ fn defaults_max_frame_size() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     /// アドレス解決に失敗する呼び出しは Err を返す（panic しない）。
     #[test]

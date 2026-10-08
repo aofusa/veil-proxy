@@ -461,10 +461,39 @@ impl TcpStream {
         }
     }
 
-    /// 文字列アドレス（"host:port"）から接続する。
+    /// AF_UNIX パスに非同期で接続する（F-170）。
     ///
-    /// DNS 解決はブロッキングで行う（コールドパスのみ）。
+    /// `sockaddr_un` の構築はパスに対して純粋なので、Future 生成時（この関数内）で
+    /// 組み立てておき、`poll` 側は完成済みの `sockaddr_un` + `len` を使うだけにする
+    /// （接続確立ごとに `PathBuf` を確保しない。フェーズ1 レビュー指摘）。パスが
+    /// `sun_path` に収まらない場合は初回 `poll` で `Poll::Ready(Err(..))` を返す。
+    pub fn connect_unix(path: &std::path::Path) -> ConnectUnix {
+        match build_sockaddr_un(path) {
+            Ok((addr, addr_len)) => ConnectUnix {
+                addr,
+                addr_len,
+                build_err: None,
+                fd: -1,
+                registered: false,
+            },
+            Err(e) => ConnectUnix {
+                addr: unsafe { std::mem::zeroed() },
+                addr_len: 0,
+                build_err: Some(e),
+                fd: -1,
+                registered: false,
+            },
+        }
+    }
+
+    /// 文字列アドレス（"host:port"、または F-170 の `unix:<path>` 表記）から接続する。
+    ///
+    /// DNS 解決はブロッキングで行う（コールドパスのみ）。TCP 経路（`unix:` で
+    /// 始まらない場合）の命令列は F-170 以前と不変。
     pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
+        if let Some(path) = addr.strip_prefix("unix:") {
+            return TcpStream::connect_unix(std::path::Path::new(path)).await;
+        }
         use std::net::ToSocketAddrs;
         let socket_addr = addr
             .to_socket_addrs()
@@ -554,6 +583,24 @@ impl TcpStream {
     pub fn readable(&self) -> Readable<'_> {
         Readable {
             fd: self.fd,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 読み取り可能になるまで待つ（kqueue では確認用の `poll(2)` を打たずに登録から入る）。
+    ///
+    /// HTTP/1.1 keep-alive で「応答を返した直後に次のリクエストを待つ」箇所専用。
+    /// この時点でデータが届いていることはほぼ無いため、`read` を先に試すと毎回 EAGAIN、
+    /// `Readable` は確認用の `poll(2)` を打ってから登録するため、1 リクエストあたり
+    /// 2 syscall が無駄になる（FreeBSD の DTrace 実測: read 1.99/req・poll 0.98/req。
+    /// nginx は kevent の通知を待ってから 1 回だけ読む）。kqueue の `EVFILT_READ` は
+    /// レベルトリガなので、登録時点で既にデータがあればすぐに通知され取りこぼさない。
+    /// 2 回目以降の poll（ヒント無しの起床）は `Readable` と同じく `poll(2)` で確認する。
+    /// epoll は B-75 の理由で確認用 `poll(2)` を省略しないため `Readable` と同じ動作。
+    pub fn readable_lazy(&self) -> ReadableLazy<'_> {
+        ReadableLazy {
+            fd: self.fd,
+            registered: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -908,6 +955,156 @@ impl Drop for Connect {
 }
 
 // ====================
+// ConnectUnix Future（F-170: UDS バックエンド接続）
+// ====================
+
+/// `path` から `libc::sockaddr_un` を組み立てる。
+///
+/// `server::bind_unix_listener` と同じ方針（`OsStrExt::as_bytes` でバイト化 →
+/// 長さチェック → `sun_path` へコピー）。パスが `sun_path` に収まらない場合は
+/// `InvalidInput` で "unix socket path too long" を返す（bind 側と同じ文言）。
+fn build_sockaddr_un(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unix socket path too long: {}", path.display()),
+        ));
+    }
+    for (i, &b) in path_bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+    let addr_len =
+        (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t;
+    Ok((addr, addr_len))
+}
+
+/// AF_UNIX へ接続する Future（`Connect` と同じ try-first パターン）。
+///
+/// `addr`/`addr_len` は `TcpStream::connect_unix()`（Future 生成時）で組み立て済み。
+/// `Box` にせずインラインで持つ（`sockaddr_un` は確保ゼロ・既存 `Connect` の
+/// `SocketAddr` フィールドと同等の増分）。
+pub struct ConnectUnix {
+    addr: libc::sockaddr_un,
+    addr_len: libc::socklen_t,
+    /// `connect_unix()` 呼び出し時点で `sockaddr_un` 構築（パス長超過）に失敗した
+    /// 場合のエラー。成功パスでは常に `None`（`format!` は実行されない）。
+    build_err: Option<io::Error>,
+    fd: RawFd,
+    registered: bool,
+}
+
+impl ConnectUnix {
+    /// 接続失敗時の後始末（`Connect::fail` と同じ理由）。
+    fn fail(&mut self, e: io::Error) -> io::Error {
+        let fd = self.fd;
+        self.fd = -1;
+        if self.registered {
+            unregister(fd);
+            self.registered = false;
+        }
+        unsafe { libc::close(fd) };
+        e
+    }
+}
+
+impl Future for ConnectUnix {
+    type Output = io::Result<TcpStream>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.fd < 0 {
+            if let Some(e) = self.build_err.take() {
+                return Poll::Ready(Err(e));
+            }
+
+            let fd = match create_nonblocking_socket(libc::AF_UNIX) {
+                Ok(fd) => fd,
+                Err(e) => return Poll::Ready(Err(e)),
+            };
+            self.fd = fd;
+
+            let ret = unsafe {
+                libc::connect(
+                    fd,
+                    &self.addr as *const _ as *const libc::sockaddr,
+                    self.addr_len,
+                )
+            };
+            if ret == 0 {
+                // 即座に接続完了（AF_UNIX は多くの場合これに当たる）。
+                let fd = self.fd;
+                self.fd = -1;
+                return Poll::Ready(Ok(TcpStream { fd }));
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                unsafe { libc::close(fd) };
+                self.fd = -1;
+                return Poll::Ready(Err(e));
+            }
+        }
+
+        // `Connect::poll` と同じ理由（B-75）: 確認用 `poll(2)` を省略しない。
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Poll::Ready(Err(self.fail(e)));
+            }
+        }
+        if ret <= 0 || pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+            register_write(self.fd, cx.waker().clone());
+            self.registered = true;
+            return Poll::Pending;
+        }
+
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            return Poll::Ready(Err(self.fail(e)));
+        }
+        if err != 0 {
+            let e = io::Error::from_raw_os_error(err);
+            return Poll::Ready(Err(self.fail(e)));
+        }
+
+        let fd = self.fd;
+        self.fd = -1;
+        Poll::Ready(Ok(TcpStream { fd }))
+    }
+}
+
+impl Drop for ConnectUnix {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            if self.registered {
+                unregister(self.fd);
+            }
+            unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
+// ====================
 // Read Future
 // ====================
 
@@ -1114,6 +1311,45 @@ impl<'a> Future for Readable<'a> {
         }
         // POLLIN/EPOLLIN 相当を即座に確認するため 0 バイト peek は行わず、まず fd の
         // readiness を epoll に問い合わせる（poll(2) を使い syscall 1 発で判定する）。
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Poll::Ready(Ok(()));
+        }
+        register_read(self.fd, cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// 確認用 `poll(2)` を省いて登録から入る読み取り待機 Future（[`TcpStream::readable_lazy`]）。
+pub struct ReadableLazy<'a> {
+    fd: RawFd,
+    registered: bool,
+    _marker: std::marker::PhantomData<&'a TcpStream>,
+}
+
+impl<'a> Future for ReadableLazy<'a> {
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(veil_poller_kqueue)]
+        {
+            if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if !self.registered {
+                self.registered = true;
+                register_read(self.fd, cx.waker().clone());
+                return Poll::Pending;
+            }
+        }
+        let _ = &mut self.registered;
+        // ヒント無しの起床（他タスクによる wake_all_readers 等）や epoll では、
+        // `Readable` と同じく poll(2) で確認してから登録し直す。
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,
@@ -1395,6 +1631,52 @@ mod tests {
         unsafe {
             libc::close(rfd);
             libc::close(wfd);
+        }
+    }
+
+    /// F-170: `TcpStream::connect_unix` が UDS へ正常に接続できること
+    /// （reactor try-first connect(2) 経路）。対向は別スレッドの std blocking
+    /// `UnixListener::accept`（`uring::tcp` 側の同名テストと対になる。F-145 の
+    /// 「reactor はテストの空白地帯」の教訓により、両バックエンドに同じテストを置く）。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_connect_unix_success() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "veil-f170-reactor-connect-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("unix bind");
+        let acceptor = std::thread::spawn(move || listener.accept().expect("accept"));
+
+        let connect_path = path.clone();
+        let connect_result =
+            crate::runtime::block_on(async move { TcpStream::connect_unix(&connect_path).await });
+
+        acceptor.join().expect("acceptor thread join");
+        let _ = std::fs::remove_file(&path);
+        connect_result.expect("connect_unix should succeed");
+    }
+
+    /// F-170: 存在しないソケットパスへの `connect_unix` は `ENOENT` で失敗すること。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_connect_unix_enoent() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "veil-f170-reactor-connect-enoent-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let result = crate::runtime::block_on(async move { TcpStream::connect_unix(&path).await });
+        match result {
+            Ok(_) => panic!("connect to nonexistent socket must fail"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
         }
     }
 }

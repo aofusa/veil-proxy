@@ -240,7 +240,7 @@ fn build_otlp_json(config: &OtelConfig) -> String {
 }
 
 /// ラベル集合を OTLP 属性 JSON 配列の中身に変換する。
-#[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+#[cfg_attr(not(feature = "metrics"), allow(dead_code))] // 理由: OTLP のメトリクス出力（metrics feature）からのみ呼ばれる
 fn build_attributes_json(labels: &[(String, String)]) -> String {
     labels
         .iter()

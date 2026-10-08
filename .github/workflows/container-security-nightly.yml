@@ -2,13 +2,26 @@
 #
 # tools/container_security/run.sh を docker で実行し、fuzz・chaos・SAST・SBOM・
 # TLS スキャン等をまとめて回す。結果（results/）は失敗時も含め artifact として保存する。
-# 重い/専用トポロジのフェーズは入力トグルで選択的に有効化する。
+#
+# ジョブ構成:
+#   suite           毎日。標準フェーズ（trivy / h2spec / h3spec / toxiproxy / testssl /
+#                   semgrep / gitleaks / cargo-audit / cargo-deny / 短時間 libFuzzer）
+#   chaos-extended  毎週（土曜）。既定 SKIP の重いカオス（bad_backend / Pumba netem /
+#                   リソース枯渇 / syscall 障害注入）と OWASP ZAP（DAST）
+#   sanitizers      毎週（土曜）。ASAN/TSAN の E2E カオスと ASAN libFuzzer。
+#                   fuzz コーパスを actions/cache で回次間に持ち越し、cmin で最小化する（F-82）
+#   e2e             毎日。tests/e2e_setup.sh の全 E2E（io_uring / epoll）。PR CI では
+#                   重いため走らせない（F-119）が、F-97〜F-112 で追加した E2E は
+#                   ここで毎日実行される（F-98 / F-100 / F-102 / F-104 / F-108 / F-110 / F-113）
+#   sbom            毎日。SBOM 生成 + grype による SBOM ベースの脆弱性照合（F-81）
 name: container-security-nightly
 
 on:
   schedule:
     # 毎日 UTC 18:00（JST 03:00）。
     - cron: "0 18 * * *"
+    # 毎週土曜 UTC 19:00（JST 日曜 04:00）: 重いカオス・sanitizer。
+    - cron: "0 19 * * 6"
   workflow_dispatch:
     inputs:
       run_libfuzzer:
@@ -23,6 +36,10 @@ on:
         description: "WASM 系 fuzz ターゲット（wasm_abi/wasm_host_abi）を有効化"
         type: boolean
         default: false
+      run_extended:
+        description: "chaos-extended / sanitizers ジョブも実行する（週次ジョブの手動実行）"
+        type: boolean
+        default: false
 
 concurrency:
   group: container-security-${{ github.ref }}
@@ -31,6 +48,7 @@ concurrency:
 jobs:
   suite:
     name: run.sh (${{ matrix.libc }})
+    if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
     # nightly のフルスイートは長時間になり得るため上限を明示。
     timeout-minutes: 120
@@ -60,6 +78,9 @@ jobs:
           SKIP_GITLEAKS: "0"
           # h2spec はフル、fuzz は長め。
           H2SPEC_FULL: "1"
+          # F-95: h3spec は必須（バイナリ未導入なら失敗）。結果は h3spec_report.txt。
+          SKIP_H3SPEC: "0"
+          H3SPEC_REQUIRED: "1"
           FUZZ_MAX_TIME: "300"
         run: ./tools/container_security/run.sh
 
@@ -70,6 +91,7 @@ jobs:
           name: container-security-results-${{ matrix.libc }}
           path: |
             tools/container_security/results/
+            !tools/container_security/results/cargo-target*/
           retention-days: 14
 
       - name: Publish suite summary
@@ -82,9 +104,146 @@ jobs:
             cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
+          h3="tools/container_security/results/h3spec_report.txt"
+          if [ -f "$h3" ]; then
+            echo '### h3spec (${{ matrix.libc }})' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 20 "$h3" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-  sbom-release:
-    name: SBOM artifact (F-65)
+  chaos-extended:
+    name: chaos-extended (glibc)
+    if: github.event.schedule == '0 19 * * 6' || inputs.run_extended
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Veil image (glibc)
+        working-directory: docker
+        run: |
+          docker build -f Dockerfile.glibc -t "veil:glibc" \
+            --build-arg CARGO_FEATURES='full' ..
+      - name: Run extended chaos + DAST
+        env:
+          VEIL_IMAGE: "veil:glibc"
+          # 毎日の suite で回すフェーズは省き、既定 SKIP の重いフェーズだけを有効化する。
+          SKIP_TRIVY: "1"
+          SKIP_H2SPEC: "1"
+          SKIP_H3SPEC: "1"
+          SKIP_TESTSSL: "1"
+          SKIP_SEMGREP: "1"
+          SKIP_SBOM: "1"
+          SKIP_GITLEAKS: "1"
+          SKIP_TOXIPROXY: "1"
+          SKIP_CHAOS_LOAD: "1"
+          SKIP_BAD_BACKEND: "0"
+          SKIP_PUMBA: "0"
+          SKIP_RESOURCE_EXHAUSTION: "0"
+          SKIP_SYSCALL_CHAOS: "0"
+          SYSCALL_CHAOS_BLOCKING: "1"
+          SKIP_ZAP: "0"
+        run: ./tools/container_security/run.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-security-chaos-extended
+          path: |
+            tools/container_security/results/
+            !tools/container_security/results/cargo-target*/
+          retention-days: 30
+
+  sanitizers:
+    name: sanitizers (ASAN/TSAN E2E + ASAN libFuzzer)
+    if: github.event.schedule == '0 19 * * 6' || inputs.run_extended
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      # F-82: 永続コーパスを回次間で持ち越す（キーは毎回新規、restore は前回分の最新）。
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: tools/container_security/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Build Veil image (glibc)
+        working-directory: docker
+        run: |
+          docker build -f Dockerfile.glibc -t "veil:glibc" \
+            --build-arg CARGO_FEATURES='full' ..
+      - name: Run sanitizer phases
+        env:
+          VEIL_IMAGE: "veil:glibc"
+          SKIP_TRIVY: "1"
+          SKIP_H2SPEC: "1"
+          SKIP_H3SPEC: "1"
+          SKIP_TESTSSL: "1"
+          SKIP_SEMGREP: "1"
+          SKIP_SBOM: "1"
+          SKIP_GITLEAKS: "1"
+          SKIP_TOXIPROXY: "1"
+          SKIP_CHAOS_LOAD: "1"
+          RUN_E2E_ASAN: "1"
+          RUN_E2E_TSAN: "1"
+          E2E_SANITIZER_BLOCKING: "1"
+          SKIP_LIBFUZZER_ASAN: "0"
+          FUZZ_TARGETS: "hpack_decode config_toml http2_frame_decode http_header_validate http_request_smuggling grpc_frame_decode qpack_decode http3_frame_decode"
+          FUZZ_MAX_TIME: "600"
+          FUZZ_CMIN: "1"
+        run: ./tools/container_security/run.sh
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tools/container_security/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+      - name: Upload results and corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-security-sanitizers
+          path: |
+            tools/container_security/results/
+            !tools/container_security/results/cargo-target*/
+            tools/container_security/fuzz/corpus/
+          retention-days: 30
+
+  e2e:
+    name: e2e (${{ matrix.backend }})
+    if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: io_uring
+            features: full
+          - backend: epoll
+            features: full,epoll
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run E2E suite
+        env:
+          VEIL_E2E_FEATURES: ${{ matrix.features }}
+        run: ./tests/e2e_setup.sh test
+      - name: Upload server logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ matrix.backend }}
+          path: /tmp/*.log
+          retention-days: 7
+
+  sbom:
+    name: SBOM + vulnerability scan (F-65 / F-81)
+    if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +257,19 @@ jobs:
           VEIL_IMAGE: "veil:glibc"
           SKIP_SBOM: "0"
         run: ./tools/container_security/security/run_sbom.sh
+      # F-81: SBOM を入力に grype で脆弱性を照合する（high 以上で失敗）。
+      - name: Scan source SBOM with grype
+        uses: anchore/scan-action@v6
+        with:
+          sbom: tools/container_security/results/sbom_source.cdx.json
+          severity-cutoff: high
+          output-format: table
+      - name: Scan image SBOM with grype
+        uses: anchore/scan-action@v6
+        with:
+          sbom: tools/container_security/results/sbom_image.spdx.json
+          severity-cutoff: high
+          output-format: table
       - name: Upload SBOM
         if: always()
         uses: actions/upload-artifact@v4

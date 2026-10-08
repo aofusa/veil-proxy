@@ -144,7 +144,7 @@ packaging/
 | ツール | 用途 |
 |--------|------|
 | `cargo` | veil バイナリビルド |
-| `cmake`, `nasm` | `full` フィーチャー（[README.md](../README.md) Build 節参照） |
+| `cmake`, `nasm` | `full` フィーチャー（[docs/guide/ja/building.md](../docs/guide/ja/building.md) 参照） |
 | `dpkg-deb` | `.deb` 生成 |
 | `rpmbuild` | `.rpm` 生成（`rpm` パッケージ） |
 
@@ -260,12 +260,12 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 [`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
 と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
 
-> **NetBSD バイナリも Proxy-Wasm が使える（B-55 解消）**: crates.io wasmtime 40 の
+> **NetBSD バイナリも Proxy-Wasm が使える（B-55 解消）**: crates.io wasmtime（36 / 40 とも）の
 > シグナルベーストラップ実装（`signals.rs`）には NetBSD 向けの `ucontext` 分岐が
 > 一切無く、実機（NetBSD 10.1 amd64）で確認したところ **x86_64 ですら**
 > `compile_error!("unsupported platform")` でビルドできなかった（FreeBSD/OpenBSD は
 > aarch64 のみ非対応、NetBSD はアーキテクチャ不問で非対応）。これを解消するため
-> crates.io wasmtime 40.0.4 を `third_party/wasmtime`（パッケージ名のみ
+> crates.io wasmtime 36.0.17（LTS、B-79 で 40.0.4 から移行）を `third_party/wasmtime`（パッケージ名のみ
 > `veil-wasmtime`）として vendoring し、対象ターゲット（NetBSD 全アーキ・FreeBSD/
 > OpenBSD aarch64）だけ `build.rs` の `has_native_signals` を強制的に `false` にした
 > ものを Cargo のターゲット別依存で選択させ、常に Pulley インタープリタで実行する
@@ -373,7 +373,7 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | セット | アロケータ | 追加 | 使う場所 |
 |---|---|---|---|
 | `full`（既定） | mimalloc | — | Linux / macOS / Windows |
-| `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
+| `full-freebsd` | **システムアロケータ**（libc の jemalloc。tikv-jemalloc は B-89 で廃止） | — | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
 | `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 

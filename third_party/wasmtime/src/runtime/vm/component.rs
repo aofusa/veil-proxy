@@ -7,20 +7,17 @@
 //! cranelift-compiled adapters, will use this `VMComponentContext` as well.
 
 use crate::component::{Component, Instance, InstancePre, ResourceType, RuntimeImport};
-use crate::module::ModuleRegistry;
 use crate::runtime::component::ComponentInstanceId;
 use crate::runtime::vm::instance::{InstanceLayout, OwnedInstance, OwnedVMContext};
 use crate::runtime::vm::vmcontext::VMFunctionBody;
 use crate::runtime::vm::{
-    HostResult, SendSyncPtr, VMArrayCallFunction, VMFuncRef, VMGlobalDefinition,
-    VMMemoryDefinition, VMOpaqueContext, VMStore, VMStoreRawPtr, VMTableImport, VMWasmCallFunction,
-    ValRaw, VmPtr, VmSafe, catch_unwind_and_record_trap,
+    SendSyncPtr, VMArrayCallFunction, VMFuncRef, VMGlobalDefinition, VMMemoryDefinition,
+    VMOpaqueContext, VMStore, VMStoreRawPtr, VMTableImport, VMWasmCallFunction, ValRaw, VmPtr,
+    VmSafe,
 };
 use crate::store::InstanceId;
-use crate::{Func, vm};
 use alloc::alloc::Layout;
 use alloc::sync::Arc;
-use anyhow::Result;
 use core::mem;
 use core::mem::offset_of;
 use core::pin::Pin;
@@ -34,16 +31,17 @@ use wasmtime_environ::{HostPtr, PrimaryMap, VMSharedTypeIndex};
 )]
 const INVALID_PTR: usize = 0xdead_dead_beef_beef_u64 as usize;
 
-mod handle_table;
 mod libcalls;
 mod resources;
 
-pub use self::handle_table::{HandleTable, RemovedResource};
-#[cfg(feature = "component-model-async")]
-pub use self::handle_table::{TransmitLocalState, Waitable};
 #[cfg(feature = "component-model-async")]
 pub use self::resources::CallContext;
-pub use self::resources::{CallContexts, ResourceTables, TypedResource, TypedResourceIndex};
+pub use self::resources::{
+    CallContexts, ResourceTable, ResourceTables, TypedResource, TypedResourceIndex,
+};
+
+#[cfg(feature = "component-model-async")]
+use crate::component::concurrent;
 
 /// Runtime representation of a component instance and all state necessary for
 /// the instance itself.
@@ -78,21 +76,18 @@ pub struct ComponentInstance {
     // Otherwise the full guts of this component should only ever be used during
     // the instantiation of this instance, meaning that after instantiation much
     // of the component can be thrown away (theoretically).
-    //
-    // SAFETY: this field cannot be overwritten after an instance is created. It
-    // must contain this exact same value for the entire lifetime of this
-    // instance. This enables borrowing the component and this instance at the
-    // same time (instance mutably, component not). Additionally it enables
-    // borrowing a store mutably at the same time as a contained instance.
     component: Component,
 
-    /// State of handles (e.g. resources, waitables, etc.) for this component.
+    /// State of resources for this component.
     ///
-    /// For resource handles, this is paired with other information to create a
-    /// `ResourceTables` and manipulated through that.  For other handles, this
-    /// is used directly to translate guest handles to host representations and
-    /// vice-versa.
-    instance_handle_tables: PrimaryMap<RuntimeComponentInstanceIndex, HandleTable>,
+    /// This is paired with other information to create a `ResourceTables` which
+    /// is how this field is manipulated.
+    instance_resource_tables: PrimaryMap<RuntimeComponentInstanceIndex, ResourceTable>,
+
+    /// State related to async for this component, e.g. futures, streams, tasks,
+    /// etc.
+    #[cfg(feature = "component-model-async")]
+    concurrent_state: concurrent::ConcurrentState,
 
     /// What all compile-time-identified core instances are mapped to within the
     /// `Store` that this component belongs to.
@@ -204,10 +199,6 @@ impl ComponentInstance {
     /// Converts the `vmctx` provided into a `ComponentInstance` and runs the
     /// provided closure with that instance.
     ///
-    /// This function will also catch any failures that `f` produces and returns
-    /// an appropriate ABI value to return to wasm. This includes normal errors
-    /// such as traps as well as Rust-side panics which require wasm to unwind.
-    ///
     /// # Unsafety
     ///
     /// This is `unsafe` because `vmctx` cannot be guaranteed to be a valid
@@ -215,17 +206,17 @@ impl ComponentInstance {
     /// mutable reference at this time to the instance from `vmctx`. Note that
     /// it must be also safe to borrow the store mutably, meaning it can't
     /// already be in use elsewhere.
-    pub unsafe fn enter_host_from_wasm<R>(
+    pub unsafe fn from_vmctx<R>(
         vmctx: NonNull<VMComponentContext>,
         f: impl FnOnce(&mut dyn VMStore, Instance) -> R,
-    ) -> R::Abi
-    where
-        R: HostResult,
-    {
+    ) -> R {
         // SAFETY: it's a contract of this function that `vmctx` is a valid
         // allocation which can go backwards to a `ComponentInstance`.
-        let mut ptr = unsafe { Self::from_vmctx(vmctx) };
-
+        let mut ptr = unsafe {
+            vmctx
+                .byte_sub(mem::size_of::<ComponentInstance>())
+                .cast::<ComponentInstance>()
+        };
         // SAFETY: it's a contract of this function that it's safe to use `ptr`
         // as a mutable reference.
         let reference = unsafe { ptr.as_mut() };
@@ -235,24 +226,7 @@ impl ComponentInstance {
         let store = unsafe { &mut *reference.store.0.as_ptr() };
 
         let instance = Instance::from_wasmtime(store, reference.id);
-        catch_unwind_and_record_trap(store, |store| f(store, instance))
-    }
-
-    /// Returns the `InstanceId` associated with the `vmctx` provided.
-    ///
-    /// # Safety
-    ///
-    /// The `vmctx` pointer must be a valid pointer and allocation within a
-    /// `ComponentInstance`. See `Instance::from_vmctx` for some more
-    /// information.
-    unsafe fn from_vmctx(vmctx: NonNull<VMComponentContext>) -> NonNull<ComponentInstance> {
-        // SAFETY: it's a contract of this function that `vmctx` is a valid
-        // pointer to do this pointer arithmetic on.
-        unsafe {
-            vmctx
-                .byte_sub(mem::size_of::<ComponentInstance>())
-                .cast::<ComponentInstance>()
-        }
+        f(store, instance)
     }
 
     /// Returns the `InstanceId` associated with the `vmctx` provided.
@@ -266,7 +240,13 @@ impl ComponentInstance {
     ) -> ComponentInstanceId {
         // SAFETY: it's a contract of this function that `vmctx` is a valid
         // pointer with a `ComponentInstance` in front which can be read.
-        unsafe { Self::from_vmctx(vmctx).as_ref().id }
+        unsafe {
+            vmctx
+                .byte_sub(mem::size_of::<ComponentInstance>())
+                .cast::<ComponentInstance>()
+                .as_ref()
+                .id
+        }
     }
 
     /// Returns the layout corresponding to what would be an allocation of a
@@ -293,16 +273,16 @@ impl ComponentInstance {
     ) -> OwnedComponentInstance {
         let offsets = VMComponentOffsets::new(HostPtr, component.env_component());
         let num_instances = component.env_component().num_runtime_component_instances;
-        let mut instance_handle_tables =
+        let mut instance_resource_tables =
             PrimaryMap::with_capacity(num_instances.try_into().unwrap());
         for _ in 0..num_instances {
-            instance_handle_tables.push(HandleTable::default());
+            instance_resource_tables.push(ResourceTable::default());
         }
 
         let mut ret = OwnedInstance::new(ComponentInstance {
             id,
             offsets,
-            instance_handle_tables,
+            instance_resource_tables,
             instances: PrimaryMap::with_capacity(
                 component
                     .env_component()
@@ -315,6 +295,8 @@ impl ComponentInstance {
             imports: imports.clone(),
             store: VMStoreRawPtr(store),
             post_return_arg: None,
+            #[cfg(feature = "component-model-async")]
+            concurrent_state: concurrent::ConcurrentState::new(component),
             vmctx: OwnedVMContext::new(),
         });
         unsafe {
@@ -344,11 +326,11 @@ impl ComponentInstance {
     ///
     /// This can only be called after `idx` has been initialized at runtime
     /// during the instantiation process of a component.
-    pub fn runtime_memory(&self, idx: RuntimeMemoryIndex) -> NonNull<VMMemoryDefinition> {
+    pub fn runtime_memory(&self, idx: RuntimeMemoryIndex) -> *mut VMMemoryDefinition {
         unsafe {
             let ret = *self.vmctx_plus_offset::<VmPtr<_>>(self.offsets.runtime_memory(idx));
             debug_assert!(ret.as_ptr() as usize != INVALID_PTR);
-            ret.as_non_null()
+            ret.as_ptr()
         }
     }
 
@@ -363,32 +345,6 @@ impl ComponentInstance {
             debug_assert!(ret.from.as_ptr() as usize != INVALID_PTR);
             debug_assert!(ret.vmctx.as_ptr() as usize != INVALID_PTR);
             ret
-        }
-    }
-
-    /// Returns the `Func` at index `func_idx` in the funcref table at `table_idx`.
-    pub fn index_runtime_func_table(
-        &self,
-        registry: &ModuleRegistry,
-        table_idx: RuntimeTableIndex,
-        func_idx: u64,
-    ) -> Result<Option<Func>> {
-        unsafe {
-            let store = self.store.0.as_ref();
-            let table = self.runtime_table(table_idx);
-            let vmctx = table.vmctx.as_non_null();
-            // SAFETY: it's a contract of this function that `vmctx` is a valid
-            // allocation which can go backwards to a `ComponentInstance`.
-            let mut instance_ptr = vm::Instance::from_vmctx(vmctx);
-            // SAFETY: We just constructed `instance_ptr` from a valid pointer. This pointer won't leave
-            // this call, so we don't need a lifetime to bind it to.
-            let instance = Pin::new_unchecked(instance_ptr.as_mut());
-            let table =
-                instance.get_defined_table_with_lazy_init(registry, table.index, [func_idx]);
-            let func = table
-                .get_func(func_idx)?
-                .map(|funcref| Func::from_vm_func_ref(store.id(), funcref));
-            Ok(func)
         }
     }
 
@@ -453,20 +409,6 @@ impl ComponentInstance {
     pub fn trampoline_func_ref(&self, idx: TrampolineIndex) -> NonNull<VMFuncRef> {
         unsafe {
             let offset = self.offsets.trampoline_func_ref(idx);
-            let ret = self.vmctx_plus_offset_raw::<VMFuncRef>(offset);
-            debug_assert!(
-                mem::transmute::<Option<VmPtr<VMWasmCallFunction>>, usize>(ret.as_ref().wasm_call)
-                    != INVALID_PTR
-            );
-            debug_assert!(ret.as_ref().vmctx.as_ptr() as usize != INVALID_PTR);
-            ret
-        }
-    }
-
-    /// Get the core Wasm function reference for the given unsafe intrinsic.
-    pub fn unsafe_intrinsic_func_ref(&self, idx: UnsafeIntrinsic) -> NonNull<VMFuncRef> {
-        unsafe {
-            let offset = self.offsets.unsafe_intrinsic_func_ref(idx);
             let ret = self.vmctx_plus_offset_raw::<VMFuncRef>(offset);
             debug_assert!(
                 mem::transmute::<Option<VmPtr<VMWasmCallFunction>>, usize>(ret.as_ref().wasm_call)
@@ -592,27 +534,6 @@ impl ComponentInstance {
         }
     }
 
-    /// Same as `set_trampoline` but for intrinsic functions.
-    pub fn set_intrinsic(
-        self: Pin<&mut Self>,
-        intrinsic: UnsafeIntrinsic,
-        wasm_call: NonNull<VMWasmCallFunction>,
-        array_call: NonNull<VMArrayCallFunction>,
-        type_index: VMSharedTypeIndex,
-    ) {
-        unsafe {
-            let offset = self.offsets.unsafe_intrinsic_func_ref(intrinsic);
-            debug_assert!(*self.vmctx_plus_offset::<usize>(offset) == INVALID_PTR);
-            let vmctx = VMOpaqueContext::from_vmcomponent(self.vmctx());
-            *self.vmctx_plus_offset_mut(offset) = VMFuncRef {
-                wasm_call: Some(wasm_call.into()),
-                array_call: array_call.into(),
-                type_index,
-                vmctx: vmctx.into(),
-            };
-        }
-    }
-
     /// Configures the destructor for a resource at the `idx` specified.
     ///
     /// This is required to be called for each resource as it's defined within a
@@ -708,14 +629,6 @@ impl ComponentInstance {
                     *self.as_mut().vmctx_plus_offset_mut(offset) = INVALID_PTR;
                 }
             }
-            for i in 0..self.offsets.num_unsafe_intrinsics {
-                let i = UnsafeIntrinsic::from_u32(i);
-                let offset = self.offsets.unsafe_intrinsic_func_ref(i);
-                // SAFETY: see above
-                unsafe {
-                    *self.as_mut().vmctx_plus_offset_mut(offset) = INVALID_PTR;
-                }
-            }
             for i in 0..self.offsets.num_runtime_memories {
                 let i = RuntimeMemoryIndex::from_u32(i);
                 let offset = self.offsets.runtime_memory(i);
@@ -760,14 +673,8 @@ impl ComponentInstance {
                 let i = RuntimeTableIndex::from_u32(i);
                 let offset = self.offsets.runtime_table(i);
                 // SAFETY: see above
-                #[allow(clippy::cast_possible_truncation, reason = "known to not overflow")]
                 unsafe {
-                    *self.as_mut().vmctx_plus_offset_mut::<usize>(
-                        offset + offset_of!(VMTableImport, from) as u32,
-                    ) = INVALID_PTR;
-                    *self.as_mut().vmctx_plus_offset_mut::<usize>(
-                        offset + offset_of!(VMTableImport, vmctx) as u32,
-                    ) = INVALID_PTR;
+                    *self.as_mut().vmctx_plus_offset_mut(offset) = INVALID_PTR;
                 }
             }
         }
@@ -813,16 +720,13 @@ impl ComponentInstance {
     /// This is used when lowering borrows to skip table management and instead
     /// thread through the underlying representation directly.
     pub fn resource_owned_by_own_instance(&self, ty: TypeResourceTableIndex) -> bool {
-        let (resource_ty, resource_instance) = match self.component.types()[ty] {
-            TypeResourceTable::Concrete { ty, instance } => (ty, instance),
-            TypeResourceTable::Abstract(_) => return false,
-        };
+        let resource = &self.component.types()[ty];
         let component = self.component.env_component();
-        let idx = match component.defined_resource_index(resource_ty) {
+        let idx = match component.defined_resource_index(resource.ty) {
             Some(idx) => idx,
             None => return false,
         };
-        resource_instance == component.defined_resource_instances[idx]
+        resource.instance == component.defined_resource_instances[idx]
     }
 
     /// Returns the runtime state of resources associated with this component.
@@ -830,14 +734,14 @@ impl ComponentInstance {
     pub fn guest_tables(
         self: Pin<&mut Self>,
     ) -> (
-        &mut PrimaryMap<RuntimeComponentInstanceIndex, HandleTable>,
+        &mut PrimaryMap<RuntimeComponentInstanceIndex, ResourceTable>,
         &ComponentTypes,
     ) {
         // safety: we've chosen the `pin` guarantee of `self` to not apply to
         // the map returned.
         unsafe {
             let me = self.get_unchecked_mut();
-            (&mut me.instance_handle_tables, me.component.types())
+            (&mut me.instance_resource_tables, me.component.types())
         }
     }
 
@@ -850,7 +754,7 @@ impl ComponentInstance {
         &self,
         ty: TypeResourceTableIndex,
     ) -> (Option<NonNull<VMFuncRef>>, Option<InstanceFlags>) {
-        let resource = self.component.types()[ty].unwrap_concrete_ty();
+        let resource = self.component.types()[ty].ty;
         let dtor = self.resource_destructor(resource);
         let component = self.component.env_component();
         let flags = component.defined_resource_index(resource).map(|i| {
@@ -961,16 +865,11 @@ impl ComponentInstance {
         unsafe { &mut self.get_unchecked_mut().post_return_arg }
     }
 
-    pub(crate) fn check_may_leave(
-        &self,
-        instance: RuntimeComponentInstanceIndex,
-    ) -> anyhow::Result<()> {
-        let flags = self.instance_flags(instance);
-        if unsafe { flags.may_leave() } {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(crate::Trap::CannotLeaveComponent))
-        }
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state_mut(self: Pin<&mut Self>) -> &mut concurrent::ConcurrentState {
+        // SAFETY: we've chosen the `Pin` guarantee of `Self` to not apply to
+        // the map returned.
+        unsafe { &mut self.get_unchecked_mut().concurrent_state }
     }
 }
 

@@ -92,26 +92,89 @@ pub use policy::{CacheControl, CachePolicy, VaryResult};
 ///   結果として同じ「許可」に帰着する（起動後にディレクトリが作成される運用でも
 ///   動作し続ける）。
 ///
-/// FreeBSD capability mode（`cap_enter`、F-123）が有効な間は、実際のパストラバーサル
-/// 封じ込めは dirfd 相対 `openat`/`fstatat` の `O_RESOLVE_BENEATH` が担う。この経路では
-/// `file_info.canonical_path` 自体が生パス（`full_path` そのもの）になるため、
-/// `full_path` が常に `base_path` の join で構築される以上この比較は必ず真になる
-/// （cap_enter 前と同じ「常に許可」という結果は変わらない）。よって
-/// `security::capsicum::static_serving_active()`（追加 syscall 無しの atomic load）が
-/// true の間は比較そのものを省略できる。`cache` feature の有無に依存しないため
-/// feature ゲート外（このファイル）に置く。
+/// FreeBSD では、登録済み静的ルートの dirfd 相対 `openat`/`fstatat`（F-123、
+/// `O_RESOLVE_BENEATH`）で開けた場合の `file_info.canonical_path` は生パス
+/// （`base_path` の join そのもの）になり、canonical 形の `canonical_base` とは
+/// 一致しないことがある（`base_path` がシンボリックリンクを含む場合）。そのため
+/// **生の `base_path` 配下であることも許可条件に加える**。dirfd 経路の生パスは
+/// カーネルが封じ込めを保証済みで、従来経路（`canonicalize()`）の canonical パスは
+/// シンボリックリンクを解決済みなので生の `base_path`（シンボリックリンクなら
+/// canonical パスの接頭辞になり得ない）に一致するのはルート内に限られる。
+///
+/// 以前は `static_serving_active()` の間この比較を丸ごと省略して常に許可していたが、
+/// それでは dirfd 経路を外れて従来経路へ落ちたパス（登録済みルート外・
+/// `ENOTCAPABLE` の再判定。B-89）の封じ込めが効かない（BSD 実機の単体テストで検出）。
+/// `cache` feature の有無に依存しないため feature ゲート外（このファイル）に置く。
 #[inline]
 pub fn sendfile_base_contains(
     file_canonical_path: &std::path::Path,
     canonical_base: Option<&std::path::Path>,
     base_path: &std::path::Path,
 ) -> bool {
+    let base = canonical_base.unwrap_or(base_path);
     #[cfg(target_os = "freebsd")]
-    if crate::security::capsicum::static_serving_active() {
+    if path_has_prefix(file_canonical_path, base_path) {
         return true;
     }
-    let base = canonical_base.unwrap_or(base_path);
-    file_canonical_path.starts_with(base)
+    path_has_prefix(file_canonical_path, base)
+}
+
+/// `Path::starts_with` と同じ判定を、まずバイト列の前方一致（要素境界つき）で行う。
+///
+/// `Path::starts_with` は両方のパスを要素ごとに走査するため、毎リクエスト呼ぶと
+/// 目立つ（FreeBSD のプロファイルで `Components::next` / `Path::starts_with` が上位）。
+/// 静的配信のパスは常に base_path の join で組み立てられるので、ほぼ全件が
+/// バイト列の一致で決着する。一致しない場合（`./` や重複区切りを含む等）だけ
+/// 従来の要素比較で判定し、結果は `Path::starts_with` と変わらない。
+#[inline]
+fn path_has_prefix(path: &std::path::Path, base: &std::path::Path) -> bool {
+    let p = path.as_os_str().as_encoded_bytes();
+    let b = base.as_os_str().as_encoded_bytes();
+    let b_trim = match b.last() {
+        Some(&last) if b.len() > 1 && std::path::is_separator(last as char) => &b[..b.len() - 1],
+        _ => b,
+    };
+    if p.len() >= b_trim.len()
+        && &p[..b_trim.len()] == b_trim
+        && (p.len() == b_trim.len()
+            || std::path::is_separator(p[b_trim.len()] as char)
+            || b_trim
+                .last()
+                .is_some_and(|&c| std::path::is_separator(c as char)))
+    {
+        return true;
+    }
+    path.starts_with(base)
+}
+
+#[cfg(test)]
+mod path_prefix_tests {
+    use super::path_has_prefix;
+    use std::path::Path;
+
+    /// バイト列の高速判定が `Path::starts_with` と常に同じ結論になること。
+    #[test]
+    fn matches_path_starts_with() {
+        let cases = [
+            ("/var/www/a.html", "/var/www"),
+            ("/var/www/a.html", "/var/www/"),
+            ("/var/www", "/var/www"),
+            ("/var/wwwx/a", "/var/www"),
+            ("/var/www/../etc/passwd", "/var/www"),
+            ("/var//www/a", "/var/www"),
+            ("./www/a", "www"),
+            ("/a", "/"),
+            ("/", "/"),
+            ("/other", "/var/www"),
+        ];
+        for (p, b) in cases {
+            assert_eq!(
+                path_has_prefix(Path::new(p), Path::new(b)),
+                Path::new(p).starts_with(Path::new(b)),
+                "{p} vs {b}"
+            );
+        }
+    }
 }
 
 /// ディレクトリルート File バックエンドの per-route 封じ込めパラメータ（F-154）。
@@ -281,9 +344,9 @@ pub struct OpenFileCacheConfig {
 #[cfg(not(feature = "cache"))]
 #[derive(Clone, Debug)]
 pub struct CachedFileInfo {
-    pub canonical_path: std::path::PathBuf,
+    pub canonical_path: std::sync::Arc<std::path::Path>,
     pub file_size: u64,
-    pub mime_type: String,
+    pub mime_type: std::sync::Arc<str>,
     pub last_modified: Option<std::time::SystemTime>,
     pub is_file: bool,
 }
@@ -291,6 +354,12 @@ pub struct CachedFileInfo {
 #[cfg(not(feature = "cache"))]
 impl CachedFileInfo {
     pub fn last_modified_rfc7231(&self) -> Option<String> {
+        None
+    }
+
+    /// `cache` 無効時は fd を保持しない（配信時に開く）。
+    #[inline]
+    pub fn shared_file(&self) -> Option<&std::sync::Arc<std::fs::File>> {
         None
     }
     pub fn is_valid(&self, _max_age: std::time::Duration) -> bool {
@@ -334,11 +403,12 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
             return match res {
                 Ok((_file, meta)) => {
-                    let mime_type = mime_guess::from_path(&path)
+                    let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
                         .first_or_octet_stream()
-                        .to_string();
+                        .as_ref()
+                        .into();
                     Some(CachedFileInfo {
-                        canonical_path: path,
+                        canonical_path: path.into(),
                         file_size: meta.len(),
                         mime_type,
                         last_modified: meta.modified().ok(),
@@ -354,11 +424,12 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         #[cfg(target_os = "freebsd")]
         if let Some(res) = crate::security::capsicum::stat_static(&path) {
             let st = res.ok()?;
-            let mime_type = mime_guess::from_path(&path)
+            let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
                 .first_or_octet_stream()
-                .to_string();
+                .as_ref()
+                .into();
             return Some(CachedFileInfo {
-                canonical_path: path,
+                canonical_path: path.into(),
                 file_size: st.len,
                 mime_type,
                 last_modified: st.mtime,
@@ -370,11 +441,12 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         // ブロックしない（AGENTS.md がホットパス外の正当な同期 FS 利用として許可）。
         #[allow(clippy::disallowed_methods)]
         let metadata = std::fs::metadata(&canonical).ok()?;
-        let mime_type = mime_guess::from_path(&canonical)
+        let mime_type: std::sync::Arc<str> = mime_guess::from_path(&canonical)
             .first_or_octet_stream()
-            .to_string();
+            .as_ref()
+            .into();
         Some(CachedFileInfo {
-            canonical_path: canonical,
+            canonical_path: canonical.into(),
             file_size: metadata.len(),
             mime_type,
             last_modified: metadata.modified().ok(),
@@ -404,11 +476,12 @@ fn build_cached_file_info_uncached(
     path: &std::path::Path,
     meta: &std::fs::Metadata,
 ) -> CachedFileInfo {
-    let mime_type = mime_guess::from_path(path)
+    let mime_type: std::sync::Arc<str> = mime_guess::from_path(path)
         .first_or_octet_stream()
-        .to_string();
+        .as_ref()
+        .into();
     CachedFileInfo {
-        canonical_path: path.to_path_buf(),
+        canonical_path: path.into(),
         file_size: meta.len(),
         mime_type,
         last_modified: meta.modified().ok(),
@@ -480,11 +553,9 @@ fn open_and_read_uncached(
             Ok(mut file) => {
                 let meta = file.metadata().ok()?;
                 if let Some((canonical_base, base_path)) = containment.as_ref() {
-                    // capability mode 下では /proc が使えない。`sendfile_base_contains` は
-                    // `capsicum::static_serving_active()` が true の間（＝この高速経路が
-                    // 使える間は必ず true）常にパスの値によらず true を返す設計
-                    // （このファイル冒頭の `sendfile_base_contains` doc 参照）ため、
-                    // raw path をそのまま渡しても判定結果には影響しない。
+                    // dirfd 相対 openat（O_RESOLVE_BENEATH）で開けた生パスを渡す。
+                    // `sendfile_base_contains` は FreeBSD では生の base_path 配下も許可する
+                    // （このファイル冒頭の doc 参照）ので、ルート内なら判定は真になる。
                     if !sendfile_base_contains(path, canonical_base.as_deref(), base_path) {
                         return Some(StaticFileOutcome::Forbidden);
                     }
