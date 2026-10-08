@@ -1,7 +1,10 @@
 //! テスト用共通ヘルパーモジュール
 //!
 //! 統合テストおよびE2Eテストで使用する共通のユーティリティを提供します。
-
+// 理由付き allow: このモジュールは `tests/e2e_tests.rs` と `tests/integration_tests.rs` の両方に
+// `mod common;` で取り込まれ、テストクレートごとに使うヘルパーが異なる。片方だけが使う項目は
+// もう片方のクレートで必ず dead_code になるため、テスト共有モジュール全体に限って許可する。
+#![allow(dead_code)]
 // 理由付き allow: テストハーネス・E2E クライアントは同期 I/O / sleep / std::net を
 // 意図的に使用する（プロキシ本体のデータプレーンとは別プロセス・別スレッド）。
 // F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
@@ -31,7 +34,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// テスト用の自己署名TLS証明書を生成
-#[allow(dead_code)]
 pub fn generate_test_certs(output_dir: &std::path::Path) -> std::io::Result<(PathBuf, PathBuf)> {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
 
@@ -122,7 +124,6 @@ impl EchoServer {
     }
 
     /// サーバーのポートを取得
-    #[allow(dead_code)] // APIの一貫性のため保持
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -207,7 +208,6 @@ impl SimpleHttpServer {
     }
 
     /// サーバーのポートを取得
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -224,7 +224,6 @@ impl Drop for SimpleHttpServer {
 }
 
 /// テスト用設定ファイルを生成
-#[allow(dead_code)]
 pub fn generate_test_config(
     https_port: u16,
     http_port: u16,
@@ -288,7 +287,6 @@ upstream = "backend"
 }
 
 /// ポートが利用可能になるまで待機
-#[allow(dead_code)]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -301,16 +299,13 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
 }
 
 /// 遅延応答するHTTPサーバー（タイムアウトテスト用）
-#[allow(dead_code)]
 pub struct DelayedHttpServer {
     handle: Option<std::thread::JoinHandle<()>>,
     pub addr: SocketAddr,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[allow(dead_code)]
     delay: Duration,
 }
 
-#[allow(dead_code)]
 impl DelayedHttpServer {
     /// 新しい遅延応答HTTPサーバーを起動
     ///
@@ -379,7 +374,6 @@ impl DelayedHttpServer {
     }
 
     /// サーバーのポートを取得
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.addr.port()
     }

@@ -438,30 +438,6 @@ async fn send_request_async(
     Ok((status, String::from_utf8_lossy(&body).to_string()))
 }
 
-/// 非同期版: カスタムヘッダー付きHTTPS GETリクエストを送信
-#[allow(dead_code)]
-async fn send_request_with_headers_async(
-    port: u16,
-    path: &str,
-    headers: &[(&str, &str)],
-) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Http1TestClient::new_https("127.0.0.1", port)?;
-    let (status, body) = client.get_with_headers(path, headers).await?;
-    Ok((status, String::from_utf8_lossy(&body).to_string()))
-}
-
-/// 非同期版: HTTPS POSTリクエストを送信
-#[allow(dead_code)]
-async fn send_post_request_async(
-    port: u16,
-    path: &str,
-    body: &[u8],
-) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Http1TestClient::new_https("127.0.0.1", port)?;
-    let (status, resp_body) = client.post(path, body).await?;
-    Ok((status, String::from_utf8_lossy(&resp_body).to_string()))
-}
-
 // ====================
 // 非同期版 プロキシ基本機能テスト（hyper使用）
 // ====================
@@ -6559,8 +6535,8 @@ async fn test_grpc_trailer_detailed() {
 // 優先度高: kTLS機能テスト
 // ====================
 
-/// kTLSが利用可能かどうかをチェック
-#[allow(dead_code)]
+/// kTLSが利用可能かどうかをチェック（呼び出し元の kTLS テストと同じ cfg）
+#[cfg(feature = "ktls")]
 fn is_ktls_available() -> bool {
     // /proc/modules で tls モジュールがロードされているか確認
     if let Ok(modules) = std::fs::read_to_string("/proc/modules") {

@@ -256,8 +256,8 @@ fn insecure_tag(tls_insecure: bool) -> &'static str {
 ///
 /// # 形式
 /// `Via: 1.1 <hostname>`
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &str) {
     let via_value = format!("1.1 {}", hostname).into_bytes();
 
@@ -284,8 +284,8 @@ pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &s
 /// # Returns
 /// * `Ok(())` - ヘッダーが有効
 /// * `Err(String)` - エラーメッセージ
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn validate_http_headers(
     headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
 ) -> Result<(), String> {
@@ -338,8 +338,8 @@ pub(crate) fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8
 /// # Returns
 /// * `Ok(new_max)` - 拡張後の最大ヘッダー数
 /// * `Err(String)` - 上限超過エラー
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn check_header_count(
     current_count: usize,
     max_headers: usize,
@@ -487,8 +487,8 @@ pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
 ///
 /// # Arguments
 /// * `headers` - ヘッダーのリスト（変更される）
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     // Connectionヘッダーで指定された追加ヘッダーを収集
     // Connectionヘッダー値をトリムして収集（lowercase化は eq_ignore_ascii_case で不要）
@@ -640,8 +640,8 @@ pub(crate) fn normalize_range(spec: &RangeSpec, content_length: u64) -> Option<(
 ///
 /// # Returns
 /// 206レスポンスヘッダー（ボディなし）
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn build_partial_response_header(
     start: u64,
     end: u64,
@@ -745,8 +745,8 @@ pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
 }
 
 /// リクエストからRangeヘッダーを取得
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn get_range_header(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Option<&[u8]> {
     headers
         .iter()
@@ -757,8 +757,8 @@ pub(crate) fn get_range_header(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)])
 /// Accept-Ranges: bytes ヘッダーを追加するかチェック
 ///
 /// 静的ファイル配信時にクライアントにRangeリクエストサポートを通知
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub(crate) fn should_advertise_accept_ranges(method: &[u8]) -> bool {
     // GETとHEADでのみAccept-Rangesを通知
     method.eq_ignore_ascii_case(b"GET") || method.eq_ignore_ascii_case(b"HEAD")
@@ -1410,7 +1410,7 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))] // 理由: ストリーミング転送（F-32）は http2 / http3 経路のみ
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {

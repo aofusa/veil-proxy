@@ -26,14 +26,12 @@ use tokio_rustls::TlsConnector;
 ///
 /// `ping_pong` は F-96 gRPC Keepalive 検証用。handshake 直後に一度だけ取得し、
 /// バックグラウンド Connection タスクと共有する（h2 は 1 接続 1 PingPong）。
-#[allow(dead_code)] // テストヘルパ: 一部メソッドは個別 E2E のみから呼ばれる
 pub struct Http2TestClient {
     sender: SendRequest<Bytes>,
     /// HTTP/2 PING 用ハンドル（取得済みなら Some）
     ping_pong: Option<h2::PingPong>,
 }
 
-#[allow(dead_code)] // テストヘルパ全体: 未使用メソッドが feature 組み合わせで残る
 impl Http2TestClient {
     /// 新しいHTTP/2クライアントを作成
     pub async fn new(
@@ -450,7 +448,6 @@ impl Http2TestClient {
 /// HTTP/2 レスポンス（ステータス・ヘッダ・ボディ・トレーラー）
 #[derive(Debug, Clone)]
 // テストヘルパ: 共有 tests/common を含む integration_tests では未使用（e2e_tests では使用）。
-#[allow(dead_code)]
 pub struct Http2Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -459,7 +456,6 @@ pub struct Http2Response {
 }
 
 // テストヘルパ: grpc_status/grpc_message は e2e_tests のみから呼ばれ integration_tests では未使用。
-#[allow(dead_code)]
 impl Http2Response {
     /// gRPC トレーラーまたは初期ヘッダから grpc-status を取得
     pub fn grpc_status(&self) -> Option<u32> {

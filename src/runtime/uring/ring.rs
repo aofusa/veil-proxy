@@ -393,11 +393,9 @@ pub struct IoUring {
     sq_tail: *mut AtomicU32,
     sq_ring_mask: *const u32,
     sq_ring_entries: *const u32,
-    // カーネルと共有する SQ フラグ領域（IORING_SQ_NEED_WAKEUP 等）。現在は SQPOLL 未使用の
-    // ため読まないが、mmap レイアウトの完全なマッピングとして保持する（削除するとレイアウト
-    // 導出コードの対応関係が崩れ、将来 SQPOLL 対応時の再導出が必要になる）。
-    #[allow(dead_code)]
-    sq_flags: *mut u32,
+    // SQ フラグ（IORING_SQ_NEED_WAKEUP 等）と CQ のエントリ数は使っていないので持たない。
+    // SQPOLL や CQ オーバーフロー検査を足すときは `params.sq_off.flags` /
+    // `params.cq_off.ring_entries` から同じ形で導出する。
     sq_array: *mut u32,
 
     // SQE 配列
@@ -410,10 +408,6 @@ pub struct IoUring {
     cq_head: *mut AtomicU32,
     cq_tail: *const AtomicU32,
     cq_ring_mask: *const u32,
-    // CQ リングエントリ数。CQ オーバーフロー検査（将来対応）用に mmap レイアウトの
-    // 完全なマッピングとして保持する（sq_flags と同趣旨）。
-    #[allow(dead_code)]
-    cq_ring_entries: *const u32,
     cqes_ptr: *mut IoUringCqe,
 }
 
@@ -518,15 +512,12 @@ impl IoUring {
             unsafe { sq_ring_ptr.add(params.sq_off.ring_mask as usize) as *const u32 };
         let sq_ring_entries =
             unsafe { sq_ring_ptr.add(params.sq_off.ring_entries as usize) as *const u32 };
-        let sq_flags = unsafe { sq_ring_ptr.add(params.sq_off.flags as usize) as *mut u32 };
         let sq_array = unsafe { sq_ring_ptr.add(params.sq_off.array as usize) as *mut u32 };
 
         let cq_head = unsafe { cq_ring_ptr.add(params.cq_off.head as usize) as *mut AtomicU32 };
         let cq_tail = unsafe { cq_ring_ptr.add(params.cq_off.tail as usize) as *const AtomicU32 };
         let cq_ring_mask =
             unsafe { cq_ring_ptr.add(params.cq_off.ring_mask as usize) as *const u32 };
-        let cq_ring_entries =
-            unsafe { cq_ring_ptr.add(params.cq_off.ring_entries as usize) as *const u32 };
         let cqes_ptr = unsafe { cq_ring_ptr.add(params.cq_off.cqes as usize) as *mut IoUringCqe };
 
         Ok(Self {
@@ -538,7 +529,6 @@ impl IoUring {
             sq_tail,
             sq_ring_mask,
             sq_ring_entries,
-            sq_flags,
             sq_array,
             sqes_ptr,
             sqes_size,
@@ -547,7 +537,6 @@ impl IoUring {
             cq_head,
             cq_tail,
             cq_ring_mask,
-            cq_ring_entries,
             cqes_ptr,
         })
     }

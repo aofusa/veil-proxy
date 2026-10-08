@@ -120,6 +120,8 @@ pub enum TrySendError<T> {
     /// 容量上限（バックプレッシャ）。アイテムは返却される。
     Full(T),
     /// 受信端が drop 済み。アイテムは返却される。
+    // 理由付き allow: std の `TrySendError` と同じく、送れなかった値の所有権を呼び出し側へ返すための
+    // フィールド。現在の呼び出し側はすべて破棄する（`Closed(_)`）が、値を取り戻せる API を保つ。
     Closed(#[allow(dead_code)] T),
 }
 

@@ -348,7 +348,7 @@ pub fn check_security(
 /// **重要**: これらのエラーはクライアントが接続を閉じた場合の正常な動作であり、
 /// サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
 /// ログには警告として出力しますが、接続は正常終了として扱います。
-#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+#[cfg_attr(not(feature = "http2"), allow(dead_code))] // 理由: HTTP/2 経路からのみ呼ばれる
 #[inline]
 fn build_sub_path(base: &str, remaining: &str) -> String {
     if remaining.is_empty() {

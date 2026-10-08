@@ -33,7 +33,6 @@ use tonic::{Request, Response, Status};
 
 /// gRPCテストクライアント
 /// tonicを使用したHTTP/2ベースのgRPCクライアント
-#[allow(dead_code)]
 pub struct GrpcTestClient {
     channel: Channel,
 }
@@ -43,7 +42,6 @@ pub struct GrpcFrame {
     pub data: Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl GrpcFrame {
     /// 新しいgRPCフレームを作成
     pub fn new(data: Vec<u8>) -> Self {
@@ -95,7 +93,6 @@ impl GrpcFrame {
     }
 }
 
-#[allow(dead_code)]
 impl GrpcTestClient {
     /// 新しいgRPCクライアントを作成（TLS使用）
     pub async fn new(
@@ -387,7 +384,6 @@ fn url_decode(encoded: &str) -> String {
 /// Display 実装は全バリアントを網羅しており、将来のテスト拡張で使う error surface として
 /// 保持する（dead_code 警告のみ抑止）。
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum GrpcError {
     ConnectionError(String),
     RequestError(String),
@@ -410,7 +406,6 @@ impl std::error::Error for GrpcError {}
 
 /// tonicサービス用のヘルパートレイト
 /// Protobufから生成されたサービスクライアントと組み合わせて使用
-#[allow(dead_code)]
 pub trait GrpcTestHelpers {
     /// gRPCステータスをアサート
     fn assert_ok_status<T>(result: Result<Response<T>, Status>) -> T {
@@ -441,7 +436,6 @@ pub trait GrpcTestHelpers {
 impl<T> GrpcTestHelpers for T {}
 
 /// gRPCメタデータヘルパー
-#[allow(dead_code)]
 pub fn create_metadata(pairs: &[(&str, &str)]) -> tonic::metadata::MetadataMap {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, value) in pairs {
@@ -457,7 +451,6 @@ pub fn create_metadata(pairs: &[(&str, &str)]) -> tonic::metadata::MetadataMap {
 }
 
 /// gRPCリクエストにメタデータを追加するヘルパー
-#[allow(dead_code)]
 pub fn with_metadata<T>(request: T, metadata: &[(&str, &str)]) -> Request<T> {
     let mut req = Request::new(request);
     for (key, value) in metadata {

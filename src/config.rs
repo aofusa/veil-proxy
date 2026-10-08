@@ -2856,10 +2856,12 @@ struct Config {
     /// HTTP/2 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http2: Http2ConfigSection,
     /// HTTP/3 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
@@ -3540,6 +3542,7 @@ pub struct ServerConfigSection {
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http2_enabled: bool,
 
     /// HTTP/3 を有効化するかどうか
@@ -3558,6 +3561,7 @@ pub struct ServerConfigSection {
     /// - リッスンアドレスは [http3].listen で設定
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http3_enabled: bool,
 
     // ====================
@@ -3581,6 +3585,7 @@ pub struct ServerConfigSection {
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub h2c_enabled: bool,
 
     /// H2C リスニングアドレス（オプション）
@@ -3593,6 +3598,7 @@ pub struct ServerConfigSection {
     /// 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub h2c_listen: Option<String>,
 
     /// TLSリスナー（[server].listen）で平文接続を拒否するかどうか（既定 `true`）
@@ -3868,6 +3874,7 @@ pub struct PerformanceConfigSection {
     /// - "manual": 固定チャンクサイズを使用
     #[serde(default = "default_chunk_size_mode")]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub chunk_size_mode: ChunkSizeMode,
 
     /// 手動チャンクサイズ（バイト）
@@ -3876,6 +3883,7 @@ pub struct PerformanceConfigSection {
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub manual_chunk_size: usize,
 
     // ====================
@@ -3891,6 +3899,7 @@ pub struct PerformanceConfigSection {
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
     #[cfg_attr(not(veil_ktls), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub per_stream_pipe_enabled: bool,
 
     // ====================
@@ -6064,9 +6073,11 @@ pub struct LoadedConfig {
     pub tls_only: bool,
     /// TLS証明書パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_path: String,
     /// 証明書の自動リロードを有効にするか（F-03）
     pub tls_auto_reload: bool,
@@ -6080,12 +6091,14 @@ pub struct LoadedConfig {
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
     ///
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,

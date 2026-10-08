@@ -2,7 +2,9 @@
 //!
 //! バッファリング時に大きいレスポンスをディスクにスピルオーバーする機能を提供します。
 
+#[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
 use xxhash_rust::xxh3::xxh3_64;
 
 /// キーからディスクパスを生成（ディレクトリ分散）
@@ -17,8 +19,8 @@ use xxhash_rust::xxh3::xxh3_64;
 ///
 /// # 注意
 /// 実際のバッファリング処理では`disk_buffer`モジュールの関数を使用してください。
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
+// 単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg(test)]
 pub fn key_to_path(base_path: &std::path::Path, key: &[u8]) -> PathBuf {
     let hash = xxh3_64(key);
 
