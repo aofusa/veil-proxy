@@ -129,6 +129,17 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
 
+### プロトコル準拠・サンドボックス
+
+- HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
+  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査）は `third_party/quiche/README.veil.md`。
+- 不正なプリフェースや拒否する接続は、未読データを残して close しない（RST になり相手は GOAWAY を読めない）。
+  送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
+- seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、
+  `test_allowed_syscalls_match_libc_numbers` にも足す（コメントと番号のずれで x86_64 の prctl が拒否されていた。B-103）。
+- container_security の判定は「本当に走ったか」を見る。h3spec の打ち切り・testssl の常時スキップ・サニタイザの
+  起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。
+
 ---
 
 ## 計測の原則（[docs/perf/README.md](docs/perf/README.md)・[tools/perf/README.md](tools/perf/README.md)）
