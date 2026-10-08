@@ -1,20 +1,20 @@
 # v0.7.0 全プラットフォーム検証
 
 リリース前に、対象のすべての OS・アーキテクチャで単体・統合・E2E を回した結果（2026-10-06〜08）。
-最後のコード変更は HTTP/2 の不正プリフェース処理（B-102、`0ff5442`。エラー経路のみ）と、Linux 専用の
-seccomp 許可リストの番号修正（B-103、`3c41170`）。B-102 は全 OS、B-103 は Linux（x86_64 / aarch64）で
-回し直している。`c881dd9` の行は B-102 を含まないが、B-102 の変更は全プラットフォーム共通のコードで、
-同じコードを Linux・macOS・Windows・FreeBSD/OpenBSD/NetBSD x86_64 で確認済み。
+最終コミット（`65c7a18`）で Linux（x86_64 / aarch64）・macOS・Windows を回し直している。BSD は x86_64 が
+`0ff5442`（B-102 = HTTP/2 の不正プリフェース処理まで）、aarch64 が `c881dd9`（B-102 の手前）の結果。その後の変更は
+B-102（全 OS 共通のエラー経路。上記の Linux・macOS・Windows と BSD x86_64 で確認済み）と、BSD のバイナリに
+影響しないもの（Linux 専用の seccomp 修正 B-103、テストと `#[cfg(test)]` の整理、io_uring 構造体の整理）だけ。
 Linux 以外は実機（macOS・Windows）または実カーネルの VM（`tools/qemu/`）上で、ネイティブビルドしたものを
 テストしている。
 
 | OS | アーキ | 環境 | feature | 単体 | 統合 | E2E | コミット |
 |---|---|---|---|---|---|---|---|
-| Linux | x86_64 | ホスト（io_uring） | `full` | 995 | 54 | 555 | `0a96b10` |
-| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | 555 | `0a96b10` |
-| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 993 | 54 | 555 | `3c41170` |
-| macOS | aarch64 | 実機（kqueue reactor） | `full` | 943 | 54 | 555 | `0ff5442` |
-| Windows | x86_64 | 実機（WSAPoll reactor） | `full` | 902 | 54 | スモーク※ | `0ff5442` |
+| Linux | x86_64 | ホスト（io_uring） | `full` | 995 | 54 | 555 | `65c7a18` |
+| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | 555 | `65c7a18` |
+| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 993 | 54 | 555 | `65c7a18` |
+| macOS | aarch64 | 実機（kqueue reactor） | `full` | 943 | 54 | 555 | `65c7a18` |
+| Windows | x86_64 | 実機（WSAPoll reactor） | `full` | 902 | 54 | スモーク※ | `65c7a18`（スモークは `0ff5442` の配布物） |
 | FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 952 | 54 | 555 | `c881dd9` |
 | FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 953 | 54 | 555 | `0ff5442` |
 | OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 940 | 54 | 554（無視 1） | `c881dd9` |
