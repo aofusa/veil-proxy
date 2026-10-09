@@ -7122,6 +7122,32 @@ fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
     resolved
 }
 
+/// chroot(2) 後にルートの `resolved_backend` を作り直す（NetBSD の `chroot_dir`。F-140/F-176）。
+///
+/// 設定ロードは chroot 前に行うため、`canonical_base_memoized` は chroot 外の実体パスを
+/// 返す（証明書を chroot 前後の両方で読めるよう chroot 外の同じパスにシンボリックリンクを
+/// 張る構成では、リンクを辿った chroot 外のパスになる）。chroot 後のファイル解決結果は
+/// 新しいルート基準になるので、`sendfile_base_contains` の包含判定が一致せず静的配信が
+/// すべて 403 になっていた。メモを捨てて新しいルート基準で解決し直す（起動時に 1 回だけ）。
+#[cfg(any(target_os = "netbsd", test))]
+pub fn reresolve_routes_after_chroot(
+    routes: &[Route],
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+) -> Arc<Vec<Route>> {
+    CANONICAL_BASE_MEMO.with(|m| m.borrow_mut().clear());
+    IS_DIR_MEMO.with(|m| m.borrow_mut().clear());
+    Arc::new(
+        routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                route.resolved_backend = build_backend(&route, upstream_groups).ok();
+                route
+            })
+            .collect(),
+    )
+}
+
 pub fn load_backend(
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
@@ -8702,6 +8728,54 @@ mod f159_resolved_backend_tests {
         // ホットパスの安全網として、従来どおり load_backend を呼んでもエラーになること。
         let result = load_backend(&route, &upstream_groups);
         assert!(result.is_err());
+    }
+
+    /// F-176: chroot でファイルシステムの見え方が変わった後、`reresolve_routes_after_chroot`
+    /// が古い canonical 形（メモ）を捨てて解決し直すこと。chroot はテストで行えないので、
+    /// 同じ設定パスが指すシンボリックリンクの先を差し替えて「見え方の変化」を再現する。
+    #[cfg(unix)]
+    #[test]
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn reresolve_routes_after_chroot_drops_stale_canonical_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = dir.path().join("before");
+        let after = dir.path().join("after");
+        std::fs::create_dir_all(before.join("www")).unwrap();
+        std::fs::create_dir_all(after.join("www")).unwrap();
+        let link = dir.path().join("data");
+        std::os::unix::fs::symlink(&before, &link).unwrap();
+
+        let www = link.join("www");
+        let toml = format!(
+            "action = {{ type = \"File\", path = {:?}, mode = \"sendfile\" }}",
+            www.to_str().unwrap()
+        );
+        let mut route: Route = toml::from_str(&toml).unwrap();
+        let upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+        route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+
+        fn canonical_base(route: &Route) -> PathBuf {
+            match route.resolved_backend.as_ref() {
+                Some(Backend::SendFile(_, true, _, _, _, _, Some(base), _, _)) => {
+                    base.to_path_buf()
+                }
+                other => panic!("expected a directory SendFile backend, got {:?}", other),
+            }
+        }
+        assert_eq!(
+            canonical_base(&route),
+            before.join("www").canonicalize().unwrap()
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&after, &link).unwrap();
+
+        let routes = reresolve_routes_after_chroot(std::slice::from_ref(&route), &upstream_groups);
+        assert_eq!(
+            canonical_base(&routes[0]),
+            after.join("www").canonicalize().unwrap()
+        );
     }
 }
 
