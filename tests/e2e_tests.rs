@@ -25832,3 +25832,124 @@ async fn test_f171_http2_grpc_bidi_streaming_is_full_duplex() {
         Some("0")
     );
 }
+
+// ====================
+// F-175: 上流 HTTPS の HTTP/2（ALPN）
+// ====================
+
+/// F-175: `http2 = "on"` の HTTPS 上流（ALPN で h2 を選ぶ veil）へ、HTTP/1.1 で受けた要求を
+/// HTTP/2 で中継できる。"on" は上流が h2 を選ばなければ 502 なので、200 なら h2 で話している。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_f175_https_upstream_h2_from_http1_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    for path in ["/alpn-h2-on/", "/alpn-h2-off/", "/alpn-h2/"] {
+        for _ in 0..3 {
+            let resp = send_request(PROXY_PORT, path, &[])
+                .await
+                .unwrap_or_else(|| panic!("{} should respond", path));
+            assert_eq!(get_status_code(&resp), Some(200), "{}: {}", path, resp);
+            assert!(resp.contains("H2C Backend"), "{}: {}", path, resp);
+        }
+    }
+}
+
+/// F-175: HTTP/2・HTTP/3 で受けた要求も `http2 = "on"` の HTTPS 上流へ HTTP/2 で中継できる。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http2", feature = "http3"))]
+async fn test_f175_https_upstream_h2_from_h2_and_h3_clients() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    for _ in 0..3 {
+        let (status, body) = h2
+            .send_request("GET", "/alpn-h2-on/", &[], None)
+            .await
+            .expect("HTTP/2 request");
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("H2C Backend"));
+    }
+
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    for _ in 0..3 {
+        let resp = send_http3_request_full(&mut send_request, "GET", "/alpn-h2-on/", &[], None)
+            .await
+            .expect("HTTP/3 request");
+        assert_eq!(resp.status, 200);
+        assert!(String::from_utf8_lossy(&resp.body).contains("H2C Backend"));
+    }
+}
+
+/// F-175: HTTP/2 を話さない HTTPS 上流に `http2 = "on"` を指定すると 502 になる
+/// （"auto" なら HTTP/1.1 に切り替える。既存の HTTPS 上流の E2E がその経路を通る）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_f175_http2_on_rejects_http1_only_upstream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let resp = send_request(PROXY_PORT, "/h1-only-h2-on/", &[])
+        .await
+        .expect("should respond");
+    assert_eq!(get_status_code(&resp), Some(502), "{}", resp);
+}
+
+/// F-177: プールへ戻した上流接続が次の要求の前に切れていても（上流が `Connection: close` を付けずに
+/// 応答直後に閉じる）、冪等な要求は新しい接続で 1 回だけ再送されて 200 になる。
+///
+/// B-93 の生存確認はアイドル 1ms 未満の接続を省くため、同じクライアント接続から間を空けずに
+/// 続けて送ると、死んだ接続を引いて応答前に EOF になる。旧実装はその要求が 502 になっていた。
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_f177_idempotent_retry_on_dead_pooled_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connector = tokio_rustls::TlsConnector::from(create_client_config());
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", PROXY_PORT))
+        .await
+        .expect("TCP connect");
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("TLS connect");
+    let req = b"GET /echo-upload/f177 HTTP/1.1\r\nHost: localhost\r\nx-close-silently: 1\r\n\r\n";
+    for i in 0..30 {
+        stream.write_all(req).await.expect("write");
+        // 応答 1 つぶん（ヘッダ + Content-Length 0）を読む。
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp))
+                .await
+                .expect("response in time")
+                .expect("read");
+            assert!(n > 0, "connection closed at request {}", i);
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        assert!(head.starts_with("HTTP/1.1 200"), "request {}: {}", i, head);
+    }
+}

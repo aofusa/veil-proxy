@@ -1745,12 +1745,29 @@ pub(crate) fn status_code_to_reason(status_code: u16) -> &'static str {
     }
 }
 
+/// chunked のチャンクサイズ行（`<hex>\r\n`）を `buf` へ追記する（`format!` を避ける）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) fn push_chunk_size_line(buf: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buf.push(b'0');
+    } else {
+        let mut tmp = [0u8; 16];
+        let mut i = tmp.len();
+        while n > 0 {
+            i -= 1;
+            let d = (n & 0xf) as u8;
+            tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+            n >>= 4;
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+    buf.extend_from_slice(b"\r\n");
+}
+
 /// F-177: 冪等なメソッドか（RFC 9110 §9.2.2。同じ要求を再送しても結果が変わらない）。
 ///
 /// プールから取り出した上流接続が応答の 1 バイト目より前に失敗したとき、新規接続で
 /// 1 回だけ再送してよいかの判定に使う。POST / PATCH は対象外。
-// 呼び出し元は HTTP/3 の上流経路と上流 HTTP/2（F-174）
-#[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
     matches!(
@@ -1759,7 +1776,7 @@ pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
     )
 }
 
-#[cfg(all(test, any(feature = "http2", feature = "http3")))]
+#[cfg(test)]
 mod idempotent_method_tests {
     #[test]
     fn idempotent_methods_f177() {

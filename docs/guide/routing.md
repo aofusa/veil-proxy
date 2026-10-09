@@ -348,9 +348,28 @@ type = "Proxy"
 url = "https://backend.example.com"
 ```
 
-Veil always speaks HTTP/1.1 to backends over TLS (`https://`): it does not offer `h2` in
-the upstream ALPN, so an HTTPS backend never negotiates HTTP/2 with it. HTTP/2 backends
-over TLS are not supported; a plaintext HTTP/2 backend is reached via `use_h2c` below.
+**HTTP/2 to HTTPS backends (F-175)**: the `http2` option controls the upstream ALPN for
+`https://` backends. It can be set on `[upstreams.X]` (group default), on a server entry
+(`{ url = "https://...", http2 = "off" }`) or on a route's `url = "https://..."` action.
+
+| `http2` | Behavior |
+|---------|----------|
+| `"auto"` (default) | Offer `h2, http/1.1` (for requests from HTTP/2 and HTTP/3 clients; see below). If the backend picks `h2`, requests go over a **multiplexed** HTTP/2 connection (F-174: many requests share one connection, both flow-control windows honored); if it picks `http/1.1`, the negotiated connection is used for HTTP/1.1 and the worker remembers the choice for 5 minutes (new connections then offer only `http/1.1`) |
+| `"on"` | Require HTTP/2; a backend that does not pick `h2` gets a 502 |
+| `"off"` | Offer only `http/1.1` (the v0.7 behavior) |
+
+With `"auto"`, requests received over **HTTP/2 and HTTP/3** use the backend's HTTP/2 (full-duplex,
+so gRPC streaming works; measured +80% / +55% for 3-byte responses from HTTP/2 / HTTP/3 clients
+against nginx). Requests received over **HTTP/1.1** keep HTTP/1.1 to the backend under `"auto"`:
+each client connection already has its own pooled backend connection, so going through the
+multiplexed connection only adds a hop (measured −12% at 3 B, −13.5% at 54 KB). With `"on"` they use
+HTTP/2 too: this applies to requests whose body has been fully received (no body, or a
+`Content-Length` body already read), and the response is streamed back (`Transfer-Encoding: chunked`
+unless the backend sent `content-length`). Requests still uploading a body, WASM-filtered routes and
+routes with `buffering` stay on HTTP/1.1. Response
+compression is applied the same way as for HTTP/1.1 backends (gRPC is never compressed). Use
+`http2 = "off"` for backends whose HTTP/2 implementation you do not trust or that serve very large
+responses that should not share one TCP connection.
 
 ### H2C (HTTP/2 over cleartext) Proxy
 

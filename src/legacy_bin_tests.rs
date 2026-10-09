@@ -931,18 +931,21 @@ mod upstream_selection_tests {
                 url: "http://server1:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
             UpstreamServerEntry {
                 url: "http://server2:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
             UpstreamServerEntry {
                 url: "http://server3:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
         ]
@@ -983,6 +986,7 @@ mod upstream_selection_tests {
             url: "invalid-url".into(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight: 1,
         }];
         let group = UpstreamGroup::new(
@@ -1186,12 +1190,14 @@ mod upstream_health_tests {
                 url: "http://healthy:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
             UpstreamServerEntry {
                 url: "http://unhealthy:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
         ];
@@ -1224,12 +1230,14 @@ mod upstream_health_tests {
                 url: "http://server1:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
             UpstreamServerEntry {
                 url: "http://server2:8080".into(),
                 sni_name: None,
                 use_h2c: false,
+                http2: None,
                 weight: 1,
             },
         ];

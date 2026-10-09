@@ -258,9 +258,26 @@ pub struct KtlsClientStream {
     mode: TlsMode,
     /// kTLS 有効化前に rustls が復号したデータ（ドレインバッファ）
     drained_buffer: Vec<u8>,
+    /// ALPN で `h2` が選ばれたか（F-175。kTLS 移行で rustls セッションを手放す前に記録する）。
+    negotiated_h2: bool,
+}
+
+impl crate::runtime::io::BufferedReadState for KtlsClientStream {
+    /// 復号済みで未消費の平文（ドレインバッファ）を保持していれば `true`（F-175: 上流 HTTP/2
+    /// アクターの可読待機前チェック）。`read()` は rustls の平文を毎回ドレインバッファへ排出する。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        !self.drained_buffer.is_empty()
+    }
 }
 
 impl KtlsClientStream {
+    /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
+    #[inline]
+    pub fn negotiated_h2(&self) -> bool {
+        self.negotiated_h2
+    }
+
     /// 基盤となる TCP ストリームへの参照を取得
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
@@ -858,6 +875,9 @@ pub async fn connect(
     // ハンドシェイクを実行
     do_client_handshake(&stream, &mut conn).await?;
 
+    // F-175: ALPN の結果は kTLS 移行で rustls セッションを手放す前に記録する。
+    let negotiated_h2 = conn.alpn_protocol() == Some(b"h2");
+
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option, drained_buffer) = if enable_ktls {
@@ -906,6 +926,7 @@ pub async fn connect(
         conn: conn_option,
         mode,
         drained_buffer,
+        negotiated_h2,
     })
 }
 

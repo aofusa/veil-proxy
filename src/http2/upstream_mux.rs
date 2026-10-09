@@ -1198,6 +1198,194 @@ where
     }
 }
 
+// ============================================================================
+// TLS 上の HTTP/2（F-175）
+// ============================================================================
+
+/// 上流が ALPN で HTTP/1.1 を選んだ結果を覚えておく時間（この間は `"auto"` でも h2 を試さない）。
+const H1_ONLY_TTL: Duration = Duration::from_secs(300);
+
+thread_local! {
+    /// 上流が ALPN で HTTP/1.1 を選んだ接続先（`PoolKeyStr` → 記録時刻）。
+    static H1_ONLY: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::new());
+}
+
+/// `"auto"` の上流が HTTP/1.1 しか話さないと分かっているか（F-175）。
+pub(crate) fn https_known_h1(key: &str) -> bool {
+    H1_ONLY.with(|m| {
+        m.borrow()
+            .get(key)
+            .is_some_and(|t| t.elapsed() < H1_ONLY_TTL)
+    })
+}
+
+fn remember_h1(key: &str) {
+    H1_ONLY.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.get_mut(key) {
+            Some(t) => *t = Instant::now(),
+            None => {
+                m.insert(key.to_string(), Instant::now());
+            }
+        }
+    });
+}
+
+/// [`open_https`] の結果。
+pub(crate) enum HttpsOpen {
+    /// HTTP/2 のストリームを開いた。
+    H2(UpStream),
+    /// 上流は HTTP/1.1。ALPN のために新しく張った接続があれば `Some`（呼び出し側の HTTP/1.1
+    /// 経路で使う。接続を無駄にしない）。上流ごとに一度きりの経路なので `Box` で持つ。
+    Http1(Option<Box<crate::pool::ClientTls>>),
+}
+
+/// HTTPS 上流で HTTP/2 のストリームを開く（F-175）。プールに空きのある接続があればそれを、
+/// 無ければ ALPN `h2, http/1.1` で新しく接続する。上流が HTTP/1.1 を選べば
+/// `HttpsOpen::Http1`（`http2 = "on"` なら 502）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_https<'h, I>(
+    target: &crate::config::ProxyTarget,
+    key: &str,
+    insecure: bool,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    method: &[u8],
+    path: &[u8],
+    authority: &[u8],
+    headers: I,
+    end_stream: bool,
+) -> Result<HttpsOpen, u16>
+where
+    I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+{
+    use crate::config::UpstreamHttp2;
+    if let Some(s) = pool_open(key, method, path, authority, headers.clone(), end_stream) {
+        return Ok(HttpsOpen::H2(s));
+    }
+    if target.http2 == UpstreamHttp2::Auto && https_known_h1(key) {
+        return Ok(HttpsOpen::Http1(None));
+    }
+    let addr = target.conn_addr();
+    let tcp = match crate::runtime::time::timeout(
+        connect_timeout,
+        crate::proxy::connect_target(target, addr.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => {
+            warn!("[h2-upstream] connect error ({}): {}", addr.as_str(), e);
+            return Err(502);
+        }
+        Err(_) => {
+            warn!("[h2-upstream] connect timeout ({})", addr.as_str());
+            return Err(504);
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    let connector = crate::config::get_tls_connector_h2(insecure);
+    let tls =
+        match crate::runtime::time::timeout(connect_timeout, connector.connect(tcp, target.sni()))
+            .await
+        {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(e)) => {
+                warn!(
+                    "[h2-upstream] TLS handshake error ({}): {}",
+                    addr.as_str(),
+                    e
+                );
+                return Err(502);
+            }
+            Err(_) => {
+                warn!("[h2-upstream] TLS handshake timeout ({})", addr.as_str());
+                return Err(504);
+            }
+        };
+    if !tls.negotiated_h2() {
+        if target.http2 == UpstreamHttp2::On {
+            warn!(
+                "[h2-upstream] {} did not negotiate h2 (http2 = \"on\")",
+                addr.as_str()
+            );
+            return Err(502);
+        }
+        remember_h1(key);
+        return Ok(HttpsOpen::Http1(Some(Box::new(tls))));
+    }
+    let mux = H2Mux::start(tls, true, idle_timeout);
+    let stream = mux
+        .open(method, path, authority, headers, end_stream)
+        .ok_or(502u16)?;
+    if !idle_timeout.is_zero() {
+        pool_insert(key, mux);
+    }
+    Ok(HttpsOpen::H2(stream))
+}
+
+/// [`request_https_buffered`] の結果。
+pub(crate) enum HttpsBuffered {
+    /// HTTP/2 で応答を受けた。
+    H2(H2cResponse),
+    /// 上流は HTTP/1.1（[`HttpsOpen::Http1`] と同じ）。
+    Http1(Option<Box<crate::pool::ClientTls>>),
+}
+
+/// HTTPS 上流へバッファ型で要求する（F-175）。HTTP/2 なら応答を全部受けて返し、
+/// 上流が HTTP/1.1 なら呼び出し側の HTTP/1.1 経路へ戻す。再送の規則は [`request_h2c_buffered`] と同じ。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn request_https_buffered<'h, I>(
+    target: &crate::config::ProxyTarget,
+    key: &str,
+    insecure: bool,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    read_timeout: Duration,
+    method: &[u8],
+    path: &[u8],
+    authority: &[u8],
+    headers: I,
+    body: Option<Bytes>,
+    idempotent: bool,
+) -> Result<HttpsBuffered, u16>
+where
+    I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+{
+    let body = body.filter(|b| !b.is_empty());
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut stream = match open_https(
+            target,
+            key,
+            insecure,
+            connect_timeout,
+            idle_timeout,
+            method,
+            path,
+            authority,
+            headers.clone(),
+            body.is_none(),
+        )
+        .await?
+        {
+            HttpsOpen::H2(s) => s,
+            HttpsOpen::Http1(conn) => return Ok(HttpsBuffered::Http1(conn)),
+        };
+        if let (Some(b), Some(tx)) = (&body, &stream.req_tx) {
+            let _ = tx.send(b.clone()).await;
+        }
+        stream.finish_request();
+        match collect_response(&stream, idempotent, read_timeout).await {
+            Ok(resp) => return Ok(HttpsBuffered::H2(resp)),
+            Err(CollectError::Reset { retryable: true }) if attempt == 1 => continue,
+            Err(CollectError::Reset { .. }) => return Err(502),
+            Err(CollectError::Timeout) => return Err(504),
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -2397,6 +2397,46 @@ thread_local! {
     };
 }
 
+// F-175: 上流 HTTPS の HTTP/2（ALPN `h2, http/1.1`）用コネクター。証明書検証・kTLS の設定は
+// 上の HTTP/1.1 用と同じで、ALPN だけが違う（ワーカースレッドごとに 1 回だけ作る）。
+#[cfg(all(veil_ktls, feature = "http2"))]
+thread_local! {
+    static TLS_CONNECTOR_H2: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls = &config_guard.ktls_config;
+        let config = (*crate::ktls_rustls::client_config(ktls.enabled)).clone();
+        let config = crate::protocol::configure_alpn_h2_client(config);
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls.enabled)
+            .with_fallback(ktls.fallback_enabled)
+            .with_tcp_cork(ktls.tcp_cork_enabled)
+    };
+    static TLS_CONNECTOR_H2_INSECURE: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls = &config_guard.ktls_config;
+        let config = (*crate::ktls_rustls::insecure_client_config()).clone();
+        let config = crate::protocol::configure_alpn_h2_client(config);
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls.enabled)
+            .with_fallback(ktls.fallback_enabled)
+            .with_tcp_cork(ktls.tcp_cork_enabled)
+    };
+}
+
+#[cfg(all(not(veil_ktls), feature = "http2"))]
+thread_local! {
+    static TLS_CONNECTOR_H2: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::default_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+    static TLS_CONNECTOR_H2_INSECURE: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::insecure_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+}
+
 // ====================
 // TLS コネクタアクセサ関数
 // ====================
@@ -2411,6 +2451,26 @@ pub fn get_tls_connector() -> RustlsConnector {
 #[cfg(veil_ktls)]
 pub fn get_tls_connector_insecure() -> RustlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
+}
+
+/// F-175: ALPN `h2, http/1.1` の TLS コネクタを取得する。
+#[cfg(all(veil_ktls, feature = "http2"))]
+pub fn get_tls_connector_h2(insecure: bool) -> RustlsConnector {
+    if insecure {
+        TLS_CONNECTOR_H2_INSECURE.with(|c| c.clone())
+    } else {
+        TLS_CONNECTOR_H2.with(|c| c.clone())
+    }
+}
+
+/// F-175: ALPN `h2, http/1.1` の TLS コネクタを取得する。
+#[cfg(all(not(veil_ktls), feature = "http2"))]
+pub fn get_tls_connector_h2(insecure: bool) -> crate::simple_tls::SimpleTlsConnector {
+    if insecure {
+        TLS_CONNECTOR_H2_INSECURE.with(|c| c.clone())
+    } else {
+        TLS_CONNECTOR_H2.with(|c| c.clone())
+    }
 }
 
 /// TLS コネクタを取得（通常接続用）
@@ -2431,6 +2491,22 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
 // 設定構造体
 // ====================
 
+/// 上流 HTTPS で HTTP/2 を使うか（F-175）。平文（`http://`）の上流には効かない（h2c は `use_h2c`）。
+///
+/// - `"auto"`（既定）: TLS の ALPN で `h2, http/1.1` を提示し、上流が選んだ方で話す。HTTP/2 なら
+///   多重化接続（F-174）を使う。上流が HTTP/1.1 を選んだ結果はワーカーごとに覚え、しばらくは
+///   ALPN `http/1.1` だけで接続する。
+/// - `"on"`: HTTP/2 を必須にする（上流が HTTP/2 を選ばなければ 502）。
+/// - `"off"`: ALPN は `http/1.1` のみ（v0.7 までの挙動）。
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamHttp2 {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
 /// Upstream サーバーエントリ（文字列または構造体）
 ///
 /// 以下の2つの形式をサポート:
@@ -2441,6 +2517,8 @@ pub struct UpstreamServerEntry {
     pub url: String,
     pub sni_name: Option<String>,
     pub use_h2c: bool,
+    /// HTTPS 上流の HTTP/2（F-175）。`None` ならグループの設定（既定 `"auto"`）。
+    pub http2: Option<UpstreamHttp2>,
     /// 重み（Weighted Round Robin 用、デフォルト 1）
     pub weight: u32,
 }
@@ -2470,6 +2548,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                     url: v.to_string(),
                     sni_name: None,
                     use_h2c: false,
+                    http2: None,
                     weight: 1,
                 })
             }
@@ -2482,6 +2561,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                 let mut url: Option<String> = None;
                 let mut sni_name: Option<String> = None;
                 let mut use_h2c: Option<bool> = None;
+                let mut http2: Option<UpstreamHttp2> = None;
                 let mut weight: Option<u32> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
@@ -2489,6 +2569,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                         "url" => url = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "http2" => http2 = Some(map.next_value()?),
                         "weight" => weight = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
@@ -2504,6 +2585,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                     url,
                     sni_name,
                     use_h2c,
+                    http2,
                     weight,
                 })
             }
@@ -2543,6 +2625,23 @@ pub struct UpstreamConfig {
     /// 異常検知（Outlier Detection）設定（F-06）
     #[serde(default)]
     pub outlier_detection: OutlierConfig,
+    /// HTTPS 上流の HTTP/2（F-175、既定 `"auto"`）。サーバー単位の `http2` が優先する。
+    #[serde(default)]
+    pub http2: UpstreamHttp2,
+}
+
+impl UpstreamConfig {
+    /// サーバーエントリへグループの `http2` を既定値として埋めたもの（F-175）。
+    fn resolved_servers(&self) -> Vec<UpstreamServerEntry> {
+        self.servers
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                e.http2.get_or_insert(self.http2);
+                e
+            })
+            .collect()
+    }
 }
 
 /// サーキットブレーカー設定（F-06）
@@ -4093,6 +4192,8 @@ pub enum BackendConfig {
         url: String,
         sni_name: Option<String>,
         use_h2c: bool,
+        /// HTTPS 上流の HTTP/2（F-175、既定 `"auto"`）。
+        http2: UpstreamHttp2,
     },
     /// Upstream グループ参照（ロードバランシング用）
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
@@ -4155,6 +4256,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut sni_name: Option<String> = None;
                 // H2C 用フィールド（Proxy用）
                 let mut use_h2c: Option<bool> = None;
+                // HTTPS 上流の HTTP/2（F-175、Proxy用）
+                let mut http2: Option<UpstreamHttp2> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -4174,6 +4277,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "http2" => http2 = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -4200,6 +4304,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 url,
                                 sni_name,
                                 use_h2c,
+                                http2: http2.unwrap_or_default(),
                             })
                         }
                     }
@@ -4377,6 +4482,8 @@ pub struct ProxyTarget {
     /// true の場合、非TLSバックエンドにHTTP/2で接続
     /// HTTP/2 Upgrade 経由ではなく、Prior Knowledge モードを使用
     pub use_h2c: bool,
+    /// HTTPS 上流で HTTP/2 を使うか（F-175）。`use_tls` のときだけ意味を持つ。
+    pub http2: UpstreamHttp2,
     /// 事前パース済みの接続先 `SocketAddr`（`host` が IP アドレスリテラルの場合のみ `Some`）。
     /// 設定ロード時に一度だけ解決しておくことで、ホットパス（接続確立のたびに実行される
     /// `to_socket_addrs()`。内部で `Vec` 確保が発生し、`host` がホスト名の場合は
@@ -4446,6 +4553,7 @@ impl ProxyTarget {
             path_prefix: path.to_string(),
             sni_name: None,
             use_h2c: false, // デフォルトでは無効
+            http2: UpstreamHttp2::default(),
             socket_addr,
             unix_path: None,
         })
@@ -4474,6 +4582,7 @@ impl ProxyTarget {
             path_prefix: path_prefix.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: UpstreamHttp2::default(),
             socket_addr: None,
             unix_path: Some(Arc::from(socket_path)),
         })
@@ -4515,6 +4624,18 @@ impl ProxyTarget {
             self.use_h2c = use_h2c;
         }
         self
+    }
+
+    /// HTTPS 上流の HTTP/2 設定を変更したコピーを作成（F-175）
+    pub fn with_http2(mut self, http2: UpstreamHttp2) -> Self {
+        self.http2 = http2;
+        self
+    }
+
+    /// HTTPS 上流で HTTP/2 を試すか（F-175）。平文・`"off"` では `false`。
+    #[inline]
+    pub fn h2_over_tls(&self) -> bool {
+        self.use_tls && self.http2 != UpstreamHttp2::Off
     }
 
     /// TLS接続時に使用するSNI名を取得
@@ -5040,6 +5161,7 @@ impl UpstreamGroup {
                 ProxyTarget::parse(&entry.url)
                     .map(|target| target.with_sni_name(entry.sni_name.clone()))
                     .map(|target| target.with_h2c(entry.use_h2c))
+                    .map(|target| target.with_http2(entry.http2.unwrap_or_default()))
                     .map(|target| (entry.clone(), UpstreamServer::new(target)))
             })
             .collect();
@@ -6457,7 +6579,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
             let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
                 name.clone(),
-                cfg.servers.clone(),
+                cfg.resolved_servers(),
                 algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
@@ -6651,7 +6773,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
                 name.clone(),
-                cfg.servers.clone(),
+                cfg.resolved_servers(),
                 algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
@@ -7054,12 +7176,14 @@ fn build_backend(
             url,
             sni_name,
             use_h2c,
+            http2,
         } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
                 .with_sni_name(sni_name.clone())
-                .with_h2c(*use_h2c);
+                .with_h2c(*use_h2c)
+                .with_http2(*http2);
 
             if *use_h2c && !target.use_tls {
                 info!("H2C (HTTP/2 over cleartext) enabled for backend: {}", url);
@@ -7533,6 +7657,7 @@ mod load_balancing_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight,
         }
     }
@@ -7840,6 +7965,7 @@ mod circuit_breaker_upstream_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight: 1,
         }
     }
@@ -8003,6 +8129,7 @@ mod advanced_lb_integration_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight,
         }
     }
@@ -8575,5 +8702,70 @@ mod f159_resolved_backend_tests {
         // ホットパスの安全網として、従来どおり load_backend を呼んでもエラーになること。
         let result = load_backend(&route, &upstream_groups);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod f175_upstream_http2_tests {
+    use super::*;
+
+    fn group_from_toml(toml_src: &str) -> UpstreamGroup {
+        let cfg: UpstreamConfig = toml::from_str(toml_src).expect("parse upstream");
+        UpstreamGroup::new(
+            "g".to_string(),
+            cfg.resolved_servers(),
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            cfg.tls_insecure,
+        )
+        .expect("group")
+    }
+
+    /// 既定は "auto"。HTTPS の上流だけが HTTP/2 を試す（平文は h2c 設定に従う）。
+    #[test]
+    fn default_is_auto_and_only_applies_to_tls() {
+        let g = group_from_toml(r#"servers = ["https://127.0.0.1:8443", "http://127.0.0.1:8080"]"#);
+        assert_eq!(g.servers[0].target.http2, UpstreamHttp2::Auto);
+        assert!(g.servers[0].target.h2_over_tls());
+        assert!(!g.servers[1].target.h2_over_tls());
+    }
+
+    /// グループの `http2` がサーバーの既定になり、サーバー単位の指定が優先する。
+    #[test]
+    fn group_default_and_server_override() {
+        let g = group_from_toml(
+            r#"
+http2 = "off"
+servers = [
+    "https://127.0.0.1:8443",
+    { url = "https://127.0.0.1:9443", http2 = "on" },
+]
+"#,
+        );
+        assert_eq!(g.servers[0].target.http2, UpstreamHttp2::Off);
+        assert!(!g.servers[0].target.h2_over_tls());
+        assert_eq!(g.servers[1].target.http2, UpstreamHttp2::On);
+    }
+
+    /// ルートの `url` 指定でも `http2` を受け付ける。不正な値はエラー。
+    #[test]
+    fn route_level_http2_and_invalid_value() {
+        let action: BackendConfig = toml::from_str(
+            r#"type = "Proxy"
+url = "https://127.0.0.1:8443"
+http2 = "on""#,
+        )
+        .expect("route action");
+        match action {
+            BackendConfig::Proxy { http2, .. } => assert_eq!(http2, UpstreamHttp2::On),
+            _ => panic!("expected Proxy"),
+        }
+        assert!(toml::from_str::<UpstreamConfig>(
+            r#"
+http2 = "maybe"
+servers = ["https://127.0.0.1:8443"]
+"#
+        )
+        .is_err());
     }
 }

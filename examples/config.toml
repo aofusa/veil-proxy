@@ -1657,6 +1657,15 @@ revalidate_mtime = false
 # # TLS証明書検証を無効化（自己署名証明書対応、デフォルト: false）
 # # 注意: 本番環境では false を推奨
 # tls_insecure = false
+#
+# # HTTPS 上流で HTTP/2 を使うか（F-175、デフォルト: "auto"）
+# #   "auto": HTTP/2・HTTP/3 で受けた要求は ALPN で h2, http/1.1 を提示し、上流が選んだ方で話す
+# #           （h2 なら多重化接続 F-174）。HTTP/1.1 で受けた要求は HTTP/1.1 のまま（その方が速い）。
+# #           上流が http/1.1 を選んだ結果はワーカーごとに 5 分間覚える
+# #   "on"  : HTTP/2 を必須にする（HTTP/1.1 で受けた要求も。上流が h2 を選ばなければ 502）
+# #   "off" : ALPN は http/1.1 のみ（v0.7 までの挙動）
+# # サーバー単位（{ url = "https://...", http2 = "off" }）やルートの url 指定でも書ける
+# http2 = "auto"
 
 
 
@@ -1806,6 +1815,7 @@ revalidate_mtime = false
 # type = "Proxy"
 # url = "https://192.168.1.100:443"
 # sni_name = "api.internal.example.com"
+# http2 = "auto"  # HTTPS 上流の HTTP/2（F-175）: "auto"（デフォルト）/ "on" / "off"
 # 
 # セキュリティ設定付きプロキシ
 # - 許可メソッド: GET, POST, PUT のみ

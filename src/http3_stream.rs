@@ -459,34 +459,44 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
 /// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` に対応する。
 async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
+    let connector = if insecure {
+        crate::config::get_tls_connector_insecure()
+    } else {
+        crate::config::get_tls_connector()
+    };
+    let stream = connector.connect(tcp, sni).await?;
+    Ok(backend_io_from_client_tls(stream))
+}
+
+/// ハンドシェイク済みのクライアント TLS ストリームを全二重ラッパーにする。
+fn backend_io_from_client_tls(stream: crate::pool::ClientTls) -> BackendIo {
     #[cfg(veil_ktls)]
     {
-        let connector = if insecure {
-            crate::config::get_tls_connector_insecure()
-        } else {
-            crate::config::get_tls_connector()
-        };
-        let stream = connector.connect(tcp, sni).await?;
         let (inner, session, _mode, drained) = stream.into_parts();
-        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
-            inner, session, drained,
-        ))))
+        BackendIo::Tls(Box::new(TlsBackend::new(inner, session, drained)))
     }
     #[cfg(not(veil_ktls))]
     {
-        let connector = if insecure {
-            crate::config::get_tls_connector_insecure()
-        } else {
-            crate::config::get_tls_connector()
-        };
-        let stream = connector.connect(tcp, sni).await?;
         let (inner, session, drained) = stream.into_parts();
-        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
-            inner,
-            Some(session),
-            drained,
-        ))))
+        BackendIo::Tls(Box::new(TlsBackend::new(inner, Some(session), drained)))
     }
+}
+
+/// F-175: ALPN で HTTP/1.1 を選んだ HTTPS 上流の接続（ネゴシエーション済み）をワーカーの
+/// 上流プールへ入れる（直後の HTTP/1.1 の要求で使う）。
+#[cfg(feature = "http2")]
+pub(crate) fn h3_pool_put_client_tls(
+    key: &str,
+    stream: crate::pool::ClientTls,
+    max_idle: usize,
+    idle_timeout_secs: u64,
+) {
+    h3_pool_put(
+        key,
+        backend_io_from_client_tls(stream),
+        max_idle.max(1),
+        idle_timeout_secs.max(1),
+    );
 }
 
 // ============================================================================
@@ -679,7 +689,21 @@ async fn backend_task(
     params.server.acquire();
     #[cfg(feature = "http2")]
     let outcome = if params.h2.is_some() {
-        run_h2_task(&params, &req_body_rx, &resp_tx, &notify).await
+        if params.use_tls {
+            // F-175: HTTPS 上流は ALPN で HTTP/2 を試し、HTTP/1.1 なら従来の経路へ。
+            match open_h2_tls(&params).await {
+                Ok(Some(stream)) => {
+                    relay_h2_stream(&params, stream, &req_body_rx, &resp_tx, &notify).await
+                }
+                Ok(None) => {
+                    let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+                    run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+                }
+                Err(status) => Err(status),
+            }
+        } else {
+            run_h2_task(&params, &req_body_rx, &resp_tx, &notify).await
+        }
     } else {
         let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
         run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
@@ -714,12 +738,12 @@ async fn run_h2_task(
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
 ) -> Result<(), u16> {
-    use crate::http2::upstream_mux::{open_h2c, UpResp};
+    use crate::http2::upstream_mux::open_h2c;
     let h2 = params.h2.as_ref().ok_or(502u16)?;
     let target = &params.server.target;
     let addr = target.conn_addr();
     let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
-    let mut stream = open_h2c(
+    let stream = open_h2c(
         target,
         key.as_str(),
         h2.connect_timeout,
@@ -731,6 +755,60 @@ async fn run_h2_task(
         !params.has_request_body,
     )
     .await?;
+    relay_h2_stream(params, stream, req_body_rx, resp_tx, notify).await
+}
+
+/// F-175: HTTPS 上流で HTTP/2 のストリームを開く。上流が HTTP/1.1 を選んだら `Ok(None)`
+/// （ネゴシエーションに使った接続はワーカーのプールへ入れ、HTTP/1.1 経路で使う）。
+#[cfg(feature = "http2")]
+async fn open_h2_tls(
+    params: &BackendTaskParams,
+) -> Result<Option<crate::http2::upstream_mux::UpStream>, u16> {
+    use crate::http2::upstream_mux::{open_https, HttpsOpen};
+    let h2 = params.h2.as_ref().ok_or(502u16)?;
+    let target = &params.server.target;
+    let addr = target.conn_addr();
+    let key =
+        crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), &params.sni, params.tls_insecure);
+    match open_https(
+        target,
+        key.as_str(),
+        params.tls_insecure,
+        h2.connect_timeout,
+        Duration::from_secs(params.pool_idle_timeout_secs),
+        &h2.method,
+        &h2.path,
+        &h2.authority,
+        h2.headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+        !params.has_request_body,
+    )
+    .await?
+    {
+        HttpsOpen::H2(s) => Ok(Some(s)),
+        HttpsOpen::Http1(conn) => {
+            if let Some(conn) = conn {
+                h3_pool_put_client_tls(
+                    key.as_str(),
+                    *conn,
+                    params.pool_max_idle,
+                    params.pool_idle_timeout_secs,
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// F-171 / F-175: 開いた上流 HTTP/2 ストリームと下流（HTTP/3）を全二重に中継する。
+#[cfg(feature = "http2")]
+async fn relay_h2_stream(
+    params: &BackendTaskParams,
+    mut stream: crate::http2::upstream_mux::UpStream,
+    req_body_rx: &Receiver<Bytes>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+) -> Result<(), u16> {
+    use crate::http2::upstream_mux::UpResp;
     let read_timeout = Duration::from_secs(params.timeout_secs);
 
     // 要求方向: 送信端を所有して流し、終わったら drop（= END_STREAM）。
@@ -1923,29 +2001,11 @@ async fn send_backend_chunk(backend: &BackendIo, data: Bytes) -> io::Result<()> 
         return Ok(());
     }
     let mut header = Vec::with_capacity(18);
-    push_chunk_size_line(&mut header, data.len());
+    crate::http_utils::push_chunk_size_line(&mut header, data.len());
     backend.write_all(Bytes::from(header)).await?;
     backend.write_all(data).await?;
     backend.write_all(Bytes::from_static(b"\r\n")).await?;
     Ok(())
-}
-
-/// chunked のチャンクサイズ行（`<hex>\r\n`）を `buf` へ追記する（`format!` を避ける）。
-pub(crate) fn push_chunk_size_line(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buf.push(b'0');
-    } else {
-        let mut tmp = [0u8; 16];
-        let mut i = tmp.len();
-        while n > 0 {
-            i -= 1;
-            let d = (n & 0xf) as u8;
-            tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
-            n >>= 4;
-        }
-        buf.extend_from_slice(&tmp[i..]);
-    }
-    buf.extend_from_slice(b"\r\n");
 }
 
 /// レスポンスボディのフレーミング種別。
@@ -2298,13 +2358,13 @@ mod tests {
     #[test]
     fn push_chunk_size_line_hex() {
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 0);
+        crate::http_utils::push_chunk_size_line(&mut b, 0);
         assert_eq!(b, b"0\r\n");
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 255);
+        crate::http_utils::push_chunk_size_line(&mut b, 255);
         assert_eq!(b, b"ff\r\n");
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 7000);
+        crate::http_utils::push_chunk_size_line(&mut b, 7000);
         assert_eq!(b, format!("{:x}\r\n", 7000).into_bytes());
     }
 

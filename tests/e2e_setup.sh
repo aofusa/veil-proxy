@@ -821,6 +821,27 @@ algorithm = "round_robin"
 servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
 tls_insecure = true
 
+# F-175: 上流 HTTPS の HTTP/2。"on" は h2 を必須にし（上流が h2 を選ばなければ 502）、
+# "off" は ALPN http/1.1 のみ（B-83 までの挙動）。既定（alpn-h2-pool）は "auto"。
+[upstreams."alpn-h2-on-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
+tls_insecure = true
+http2 = "on"
+
+[upstreams."alpn-h2-off-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
+tls_insecure = true
+http2 = "off"
+
+# F-175: HTTP/2 を話さない HTTPS 上流に "on" を指定すると 502 になる
+[upstreams."h1-only-h2-on-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND1_PORT}"]
+tls_insecure = true
+http2 = "on"
+
 # F-44: HTTPS echo バックエンド（自己署名証明書・TLS ストリーミング検証用）
 [upstreams."tls-echo-pool"]
 algorithm = "round_robin"
@@ -1142,6 +1163,54 @@ path = "/alpn-h2/*"
 [route.action]
 type = "Proxy"
 upstream = "alpn-h2-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/alpn-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/alpn-h2-off/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-off-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/h1-only-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "h1-only-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2-off/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-off-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/h1-only-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "h1-only-h2-on-pool"
 
 [[route]]
 [route.conditions]

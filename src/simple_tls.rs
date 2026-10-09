@@ -270,7 +270,22 @@ pub struct SimpleTlsClientStream {
     drained_buffer: Vec<u8>,
 }
 
+impl crate::runtime::io::BufferedReadState for SimpleTlsClientStream {
+    /// 復号済みで未消費の平文（ドレインバッファ）を保持していれば `true`（F-175: 上流 HTTP/2
+    /// アクターの可読待機前チェック）。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        !self.drained_buffer.is_empty()
+    }
+}
+
 impl SimpleTlsClientStream {
+    /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
+    #[inline]
+    pub fn negotiated_h2(&self) -> bool {
+        self.conn.alpn_protocol() == Some(b"h2")
+    }
+
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
     }

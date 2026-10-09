@@ -1756,6 +1756,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port_pooled}"),
             sni_name: None,
             use_h2c: true,
+            http2: None,
             weight: 1,
         };
         let group = UpstreamGroup::new(

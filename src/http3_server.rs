@@ -1415,8 +1415,22 @@ impl Http3Handler {
         if h2_upstream {
             return Decision::Buffer;
         }
+        // F-175: HTTPS 上流は ALPN で HTTP/2 を試す（HTTP/1.1 しか話さないと分かっている上流は除く）。
+        // 試す場合も、上流が HTTP/1.1 を選んだときのために HTTP/1.1 の要求 head を作っておく。
+        #[cfg(feature = "http2")]
+        let h2_tls = server.target.h2_over_tls() && {
+            let addr = server.target.conn_addr();
+            let key = crate::http_utils::PoolKeyStr::tls_addr(
+                addr.as_str(),
+                server.target.sni(),
+                upstream_group.tls_insecure(),
+            );
+            !crate::http2::upstream_mux::https_known_h1(key.as_str())
+        };
+        #[cfg(not(feature = "http2"))]
+        let h2_tls = false;
         // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。
-        if is_grpc && !h2_upstream {
+        if is_grpc && !h2_upstream && !h2_tls {
             return Decision::Buffer;
         }
 
@@ -1426,7 +1440,7 @@ impl Http3Handler {
             .unwrap_or(AcceptedEncoding::Identity);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
         #[cfg(feature = "http2")]
-        let h2 = h2_upstream.then(|| {
+        let h2 = (h2_upstream || h2_tls).then(|| {
             // gRPC はサービス/メソッドのフルパスを保持する（B-39）。
             let final_path = compute_upstream_request_path(
                 std::str::from_utf8(path).unwrap_or("/"),
@@ -1443,7 +1457,7 @@ impl Http3Handler {
             }
         });
         #[cfg(feature = "http2")]
-        let request_head = if h2.is_some() {
+        let request_head = if h2_upstream {
             Vec::new()
         } else {
             let final_path = compute_backend_path(&server.target, path, &prefix);
@@ -2831,56 +2845,127 @@ impl H3BufferedTask {
                 Err(io::Error::other("H2C requires http2 feature"))
             }
         } else {
-            // HTTP/1.1 リクエスト構築
-            let mut request = Vec::with_capacity(1024 + request_body.len());
-            request.extend_from_slice(method);
-            request.extend_from_slice(b" ");
-            request.extend_from_slice(final_path.as_bytes());
-            request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-            request.extend_from_slice(target.host.as_bytes());
-
-            if !target.is_default_port() {
-                request.extend_from_slice(b":");
-                let mut port_buf = itoa::Buffer::new();
-                request.extend_from_slice(port_buf.format(target.port).as_bytes());
-            }
-            request.extend_from_slice(b"\r\n");
-
-            for (name, value) in &header_pairs {
-                request.extend_from_slice(name);
-                request.extend_from_slice(b": ");
-                request.extend_from_slice(value);
-                request.extend_from_slice(b"\r\n");
-            }
-
-            if !request_body.is_empty() {
-                request.extend_from_slice(b"Content-Length: ");
-                let mut len_buf = itoa::Buffer::new();
-                request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
-                request.extend_from_slice(b"\r\n");
-            }
-
-            // B-104: `Connection: close` は付けない（上流接続はワーカーのプールで再利用する）。
-            request.extend_from_slice(b"\r\n");
-            request.extend_from_slice(request_body);
-
-            let cfg = crate::http3_stream::BufferedExchange {
-                target,
-                timeout_secs,
-                tls_insecure: upstream_group.tls_insecure(),
-                pool_max_idle: security.max_idle_connections_per_host,
-                pool_idle_timeout_secs: security.idle_connection_timeout_secs,
-                no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
-                idempotent: crate::http_utils::is_idempotent_method(method),
-            };
-            crate::http3_stream::exchange_buffered(&cfg, Bytes::from(request))
+            // F-175: HTTPS 上流は ALPN で HTTP/2 を試す。上流が HTTP/1.1 を選んだら、
+            // ネゴシエーションに使った接続をワーカーのプールへ入れて下の HTTP/1.1 経路で使う。
+            #[cfg(feature = "http2")]
+            let h2_result: Option<io::Result<BackendProxyResult>> = if target.h2_over_tls() {
+                let key = crate::http_utils::PoolKeyStr::tls_addr(
+                    target.conn_addr().as_str(),
+                    target.sni(),
+                    upstream_group.tls_insecure(),
+                );
+                let body = (!request_body.is_empty()).then(|| request_body.clone());
+                match crate::http2::upstream_mux::request_https_buffered(
+                    target,
+                    key.as_str(),
+                    upstream_group.tls_insecure(),
+                    Duration::from_secs(security.backend_connect_timeout_secs),
+                    Duration::from_secs(security.idle_connection_timeout_secs),
+                    Duration::from_secs(timeout_secs),
+                    method,
+                    final_path.as_bytes(),
+                    target.host.as_bytes(),
+                    header_pairs
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice())),
+                    body,
+                    crate::http_utils::is_idempotent_method(method),
+                )
                 .await
-                .map(|r| BackendProxyResult {
-                    status_code: r.status,
-                    body: r.body,
-                    headers: r.headers,
-                    trailers: Vec::new(),
-                })
+                {
+                    Ok(crate::http2::upstream_mux::HttpsBuffered::H2(r)) => {
+                        Some(Ok(BackendProxyResult {
+                            status_code: r.status,
+                            body: Vec::from(r.body),
+                            headers: r
+                                .headers
+                                .into_iter()
+                                .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+                                .collect(),
+                            trailers: r
+                                .trailers
+                                .into_iter()
+                                .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+                                .collect(),
+                        }))
+                    }
+                    Ok(crate::http2::upstream_mux::HttpsBuffered::Http1(conn)) => {
+                        if let Some(conn) = conn {
+                            crate::http3_stream::h3_pool_put_client_tls(
+                                key.as_str(),
+                                *conn,
+                                security.max_idle_connections_per_host,
+                                security.idle_connection_timeout_secs,
+                            );
+                        }
+                        None
+                    }
+                    Err(status) => Some(Err(if status == 504 {
+                        io::Error::new(io::ErrorKind::TimedOut, "upstream h2 timeout")
+                    } else {
+                        io::Error::other("upstream h2 request failed")
+                    })),
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "http2"))]
+            let h2_result: Option<io::Result<BackendProxyResult>> = None;
+            match h2_result {
+                Some(r) => r,
+                None => {
+                    // HTTP/1.1 リクエスト構築
+                    let mut request = Vec::with_capacity(1024 + request_body.len());
+                    request.extend_from_slice(method);
+                    request.extend_from_slice(b" ");
+                    request.extend_from_slice(final_path.as_bytes());
+                    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+                    request.extend_from_slice(target.host.as_bytes());
+
+                    if !target.is_default_port() {
+                        request.extend_from_slice(b":");
+                        let mut port_buf = itoa::Buffer::new();
+                        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+                    }
+                    request.extend_from_slice(b"\r\n");
+
+                    for (name, value) in &header_pairs {
+                        request.extend_from_slice(name);
+                        request.extend_from_slice(b": ");
+                        request.extend_from_slice(value);
+                        request.extend_from_slice(b"\r\n");
+                    }
+
+                    if !request_body.is_empty() {
+                        request.extend_from_slice(b"Content-Length: ");
+                        let mut len_buf = itoa::Buffer::new();
+                        request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
+                        request.extend_from_slice(b"\r\n");
+                    }
+
+                    // B-104: `Connection: close` は付けない（上流接続はワーカーのプールで再利用する）。
+                    request.extend_from_slice(b"\r\n");
+                    request.extend_from_slice(request_body);
+
+                    let cfg = crate::http3_stream::BufferedExchange {
+                        target,
+                        timeout_secs,
+                        tls_insecure: upstream_group.tls_insecure(),
+                        pool_max_idle: security.max_idle_connections_per_host,
+                        pool_idle_timeout_secs: security.idle_connection_timeout_secs,
+                        no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+                        idempotent: crate::http_utils::is_idempotent_method(method),
+                    };
+                    crate::http3_stream::exchange_buffered(&cfg, Bytes::from(request))
+                        .await
+                        .map(|r| BackendProxyResult {
+                            status_code: r.status,
+                            body: r.body,
+                            headers: r.headers,
+                            trailers: Vec::new(),
+                        })
+                }
+            }
         };
 
         server.release();
