@@ -244,6 +244,16 @@ pub fn run() {
         warn!("jail_name is set but this build does not target FreeBSD; ignoring");
     }
 
+    // 降格先の利用者・グループ名は chroot・サンドボックスの前に ID へ解決しておく
+    // （chroot 後は /etc/passwd・/etc/group を読めない。F-176）。
+    let privilege_ids = match crate::system::resolve_privilege_ids(&loaded_config.global_security) {
+        Ok(ids) => ids,
+        Err(e) => {
+            error!("Failed to drop privileges: {}", e);
+            return;
+        }
+    };
+
     // NetBSD: chroot(2)（F-140、オプトイン、root 前提）。
     //
     // NetBSD には pledge/unveil 相当のランタイム API が無いため
@@ -665,7 +675,7 @@ pub fn run() {
     // 注意: 特権ポート（1024未満）を使用する場合は、
     // CAP_NET_BIND_SERVICEケイパビリティを付与するか、
     // 権限降格を無効にする必要があります。
-    if let Err(e) = drop_privileges(&loaded_config.global_security) {
+    if let Err(e) = drop_privileges(&privilege_ids) {
         error!("Failed to drop privileges: {}", e);
         return;
     }
