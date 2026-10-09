@@ -541,6 +541,11 @@ _native_fw_x86_64_vars() {
 # 完全に共通（呼び出し元の _write_boot で計算済みのものをそのまま受け取る）で、
 # 違いはアクセラレータ選択とファームウェアの入手経路（コンテナ内固定パス→ホスト探索）
 # ・起動コマンド（docker run → 直接 exec）だけ。
+#
+# user ネットワーク（slirp）は全経路で `ipv6=off`。macOS ホストでは、ゲストが起動時に送る
+# IPv6 UDP を slirp が転送する `sendto(2)` がブロックしたまま戻らず、QEMU のメインスレッドごと
+# 止まってゲストが起動途中で固まった（`sample` で `udp6_input → sosendto → __sendto` を確認。F-176）。
+# ゲストは IPv4 の SSH ポート転送しか使わない。
 _write_boot_native() {
     local drives="$1" seed_drive="$2" console_args="$3"
     # macOS の /bin/bash（3.2）でも動く 64MiB ゼロ埋めパディング（truncate が無い
@@ -580,7 +585,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -591,7 +596,7 @@ set -e
 cd "${WORKDIR}"
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -623,7 +628,7 @@ exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -720,7 +725,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -734,7 +739,7 @@ set -e
 cd /w
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -753,7 +758,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
