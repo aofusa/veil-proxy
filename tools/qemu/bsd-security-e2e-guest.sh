@@ -55,9 +55,22 @@ esac
 
 echo "sec-root-ok" > "$DATA/www/index.html"
 echo "sec-nested-ok" > "$DATA/www/sub/nested.html"
+# 拡張を明示して X.509 v3 にする（OpenBSD の LibreSSL は拡張なしの `req -x509` で v1 を作り、
+# rustls が UnsupportedCertVersion で拒否する）。
 mkcert() {
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$DATA/key.pem.new" -out "$DATA/cert.pem.new" -days 3 -subj "/CN=localhost-$1" >/dev/null 2>&1
+  cat > "$DATA/req.cnf" <<REQ
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = localhost-$1
+[v3]
+subjectAltName = DNS:localhost
+basicConstraints = CA:FALSE
+REQ
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -config "$DATA/req.cnf" \
+    -keyout "$DATA/key.pem.new" -out "$DATA/cert.pem.new" -days 3 >/dev/null 2>&1
   chmod 644 "$DATA/key.pem.new" "$DATA/cert.pem.new"
   mv "$DATA/key.pem.new" "$DATA/key.pem"; mv "$DATA/cert.pem.new" "$DATA/cert.pem"
 }
