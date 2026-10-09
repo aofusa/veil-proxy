@@ -30,6 +30,8 @@
 //! （Phase 2。poller は現状 epoll のみ、kqueue は Phase 4 で追加予定）。
 
 pub mod buf;
+/// 上流ホスト名の非同期解決（B-107: 同期 getaddrinfo をイベントループから外す）。
+pub mod dns;
 /// クロスプラットフォームな FD/ソケットハンドル型（F-125、Windows 対応）。
 ///
 /// `pub`（`pub(crate)` ではない）にする理由は `handle.rs` のモジュール doc 参照

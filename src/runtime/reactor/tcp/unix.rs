@@ -163,6 +163,7 @@ impl TcpListener {
         Self::bind_impl(addr, true)
     }
 
+    #[allow(clippy::disallowed_methods)] // 起動・リロード時のリスナー作成のみ（ホットパス外）
     fn bind_impl(addr: impl std::net::ToSocketAddrs, reuse_port: bool) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
@@ -488,18 +489,13 @@ impl TcpStream {
 
     /// 文字列アドレス（"host:port"、または F-170 の `unix:<path>` 表記）から接続する。
     ///
-    /// DNS 解決はブロッキングで行う（コールドパスのみ）。TCP 経路（`unix:` で
-    /// 始まらない場合）の命令列は F-170 以前と不変。
+    /// ホスト名の解決は `runtime::dns::resolve`（offload + ワーカーごとのキャッシュ。B-107）。
     pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
         if let Some(path) = addr.strip_prefix("unix:") {
             return TcpStream::connect_unix(std::path::Path::new(path)).await;
         }
-        use std::net::ToSocketAddrs;
-        let socket_addr = addr
-            .to_socket_addrs()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address resolved"))?;
+        // B-107: ホスト名は offload で解決する（同期 getaddrinfo でイベントループを止めない）。
+        let socket_addr = crate::runtime::dns::resolve(addr).await?;
         TcpStream::connect(socket_addr).await
     }
 

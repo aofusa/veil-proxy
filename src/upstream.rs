@@ -1324,6 +1324,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // テストコード: 同期 DNS で待ち受けアドレスを決める
     fn test_connect_probe_resolves_hostname() {
         // F-170 修正: connect_probe は SocketAddr パースに失敗した表記を
         // ホスト名として DNS 解決できなければならない（http3_server.rs の
