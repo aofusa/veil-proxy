@@ -1,6 +1,6 @@
 # B-61: FreeBSD/aarch64 実機で `test_http3_large_request_body` が単体実行でも 60 秒タイムアウトする
 
-**状態: 未対応（要調査）**
+**状態: 完了（再現せず。feat/v080-limitations で再検証）**
 
 ## 事象
 
@@ -119,3 +119,10 @@ FreeBSD 14.3 aarch64 でフル E2E を計 4 回実行した際の再現状況:
 いずれも F-155（capsicum パス解決・kqueue write hint・バッチ accept・sf_hdtr）
 および F-156（L4 マルチワーカー化・H2C accept）とは無関係の経路であり、
 これらの変更による回帰ではない（同一コードで Linux io_uring の E2E は 544 件全成功）。
+
+## 再検証（2026-10-09、feat/v080-limitations）
+
+Linux x86_64（io_uring）で `test_http3_large_request_body` を単独で 10 回続けて実行し、**10/10 成功**
+（0.19〜0.39 秒）。フルスイートでも io_uring / epoll とも成功。F-145 以降の HTTP/3 の改修
+（B-12 系の EOF 伝播・F-151 のダーティ集合・B-97）で解消したと考えられる。FreeBSD/aarch64 は
+F-176 の BSD 検証（`bsd-vm.sh freebsd aarch64 e2e`）で確認する。
