@@ -155,6 +155,8 @@ Existing connections are not interrupted, and new settings apply to new connecti
 
 > **Note**: On reload, the path specified with `-c` option at startup (or default `/etc/veil/config.toml`) is used.
 
+> **FreeBSD capsicum capability mode** (`capsicum_capability_mode = true`): the process can no longer open paths after `cap_enter`, so the configuration file cannot be re-read and SIGHUP logs `Failed to reload configuration: Not permitted in capability mode` and keeps the previous configuration. TLS certificates still reload (SIGHUP or mtime poll) when `[tls] auto_reload = true`, because they are read through directory fds opened before `cap_enter` (F-136). Restart the process to apply other configuration changes.
+
 ```bash
 # Edit config file
 vim examples/config.toml

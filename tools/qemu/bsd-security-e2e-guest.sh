@@ -14,7 +14,7 @@
 #   - ルート / ネストした静的ファイルが 200 で返る
 #   - パストラバーサルで静的ルートの外のファイルが漏れない
 #   - panic しない
-#   - SIGHUP で証明書をリロードできる（サンドボックス下でも新しい証明書を読める）
+#   - SIGHUP で証明書をリロードできる（[tls] auto_reload。サンドボックス下でも新しい証明書を読める）
 #   - netbsd: ワーカーが root 以外の利用者で動く
 set -u
 OS="${1:?os}"; BIN="${2:?veil binary}"
@@ -70,6 +70,11 @@ threads = 2
 [tls]
 cert_path = "$DATA/cert.pem"
 key_path = "$DATA/key.pem"
+# 証明書リロードは auto_reload の TLS リロードスレッド経由（SIGHUP で即時）。capsicum の
+# capability mode では設定ファイル全体の再読込は ECAPMODE で失敗するが、証明書は
+# cap_enter 前に開いた dirfd 経由で読める（F-136）。
+auto_reload = true
+reload_interval_secs = 3600
 [security]
 $SEC
 [logging]
