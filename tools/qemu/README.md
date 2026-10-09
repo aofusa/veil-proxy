@@ -112,6 +112,11 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
 | `unit` | VM 内で単体テスト（`--lib`）+ 統合テスト（E2E と同じ feature・環境変数） |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
+| `screen` | QMP の screendump で VGA 画面を PNG に保存（既定 `${WORKDIR}/screen.png`）。シリアルに何も出ない状態の確認用（F-176） |
+| `sendkeys` | QMP の send-key でキー入力（`qmp-sendkeys.py` の引数をそのまま渡す。例: `sendkeys --type 'fsck -y'`）（F-176） |
+| `rescue` | 異常終了後にシングルユーザーの fsck 待ちで止まった VM を、シリアルから `fsck -y` → `reboot` で戻して SSH 到達まで待つ（全 OS。`rescue.py`）（F-176） |
+| `security-e2e` | OS 固有のサンドボックス下での E2E（FreeBSD capsicum / OpenBSD pledge+unveil / NetBSD chroot+特権降格）。`build` 済みの release バイナリで、静的配信・トラバーサル・SIGHUP の証明書リロード・特権降格を確かめる（`bsd-security-e2e.sh <os> <arch>` も同じ）（F-176） |
+| `grow` | ルート FS の拡張（FreeBSD: growfs、NetBSD aarch64: `resize_root=YES` で再起動。NetBSD x86_64 は B-82 のため不可＝`/work` で代替） |
 
 > **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**
 > 停止中に実行すると内部の `cmd_wait` が SSH 到達を **900 秒** 待ち続け、その間
@@ -156,7 +161,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `FREEBSD_VER` / `OPENBSD_VER` / `NETBSD_VER` | `14.3-RELEASE` / `7.9` / `10.1` | ゲスト OS バージョン（OpenBSD の CDN は直近数リリースのみ保持） |
 | `NETBSD_PKG_VER` | `10.0` | NetBSD の pkgsrc バイナリパッケージのバージョン系列（OS バージョンとは別軸。`cdn.NetBSD.org` は `.../10.0/All/` を実際のクォータリー版（例 `10.0_2026Q2`）へリダイレクトする） |
 | `GROW_GB` | 24 | 起動ディスクに上乗せするサイズ |
-| `VM_SMP` / `VM_MEM_MB` | 4 / 4096 | vCPU / メモリ |
+| `VM_SMP` / `VM_MEM_MB` | 4 / 4096（NetBSD x86_64 は 7168） | vCPU / メモリ。NetBSD x86_64 は 4GB だと単体テストのリンクで `ld` が OOM になる（F-176）。`unit` はテストバイナリのリンクを 1 本ずつに直列化する |
 | `VM_ROOT_PASSWORD` | `veil` | ゲスト root パスワード（コンソールデバッグ用。SSH は鍵のみ、ポートは 127.0.0.1 のみ） |
 | `CARGO_FEATURES` | `full-freebsd` / `full-openbsd` | ビルドする feature セット |
 | `BASE_IMG` | — | 既にプロビジョニング済みのイメージを backing file にして起動する（元イメージは変更しない） |
@@ -177,6 +182,8 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` | Linux aarch64 用（後述） |
 | `fbsd-arm64-vm.sh` / `fbsd-arm64-smoke.sh` | FreeBSD arm64 の従来経路（smoke 専用。新規用途は `bsd-vm.sh` を推奨） |
 | `fbsd-capmode-e2e.sh` | capsicum capability mode 静的配信 E2E（F-123） |
+| `bsd-security-e2e.sh` / `bsd-security-e2e-guest.sh` | OS 固有のサンドボックス E2E（`security-e2e` コマンド。F-176） |
+| `rescue.py` | シングルユーザーの fsck 待ちをシリアルから解く（`rescue` コマンド。F-176） |
 
 ### 検証状況
 
@@ -342,6 +349,18 @@ quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない
 
 > aarch64（arm64）はこれらのうち 1・3・4 の影響を受けない。UEFI + efiboot が
 > ファームウェアの ConOut を引き継ぐためシリアルが既定で使え、素直に起動する。
+
+### NetBSD の F-176 対応（v0.8.0）
+
+- **シリアルコンソール**: `/boot.cfg` の `consdev=com0` だけでは x86_64 の live image が再起動後も VGA に出ていた。
+  `provision` は x86 の 1 段目ブートストラップに `installboot -e -o console=com0,speed=115200` を書き、最後に
+  再起動してシリアルに `login:` が出ることを確かめる（出なければ失敗にする）。
+- **WAPBL**: ルートと `/work` を `log` 付きでマウントする。異常終了後もジャーナルの再生で済み、手作業の fsck が要らない
+  （それでも止まった場合は `rescue`）。
+- **メモリ**: NetBSD x86_64 の既定 `VM_MEM_MB` は 7168。
+- **aarch64 の HTTP/3 E2E**: テストクライアントの `quinn-udp` を vendoring（`third_party/quinn-udp`）して
+  libc の `_ALIGNBYTES` 誤り（B-62）を回避した。`full-netbsd-no-http3` への切り替えは廃止し、全 OS 同じ feature で回す。
+- **aarch64 の `grow`**: evbarm の `resize_root` を使う。
 
 ### NetBSD で踏んだ落とし穴（F-140、**実 VM で実測済み**）
 

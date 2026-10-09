@@ -20,7 +20,13 @@ members = [".", "fuzz"]
 # （詳細は tools/perf/h3load/Cargo.toml の冒頭コメント）。計測時のみ
 # `cargo build --release --manifest-path tools/perf/h3load/Cargo.toml` で明示ビルドする。
 # third_party/quiche も同じ理由で除外する（F-172、crates.io quiche 0.24.9 の vendoring）。
-exclude = ["third_party/wasmtime", "third_party/quiche", "tools/perf/h3load"]
+# third_party/quinn-udp もテスト用 HTTP/3 クライアントの依存の vendoring（F-176 / B-62）で同じ扱い。
+exclude = [
+    "third_party/wasmtime",
+    "third_party/quiche",
+    "third_party/quinn-udp",
+    "tools/perf/h3load",
+]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -805,3 +811,6 @@ tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
 # vendoring 版で全ターゲットの quiche を置き換える。詳細は third_party/quiche/README.veil.md。
 [patch.crates-io]
 quiche = { path = "third_party/quiche" }
+# F-176 / B-62: テスト用 HTTP/3 クライアント（quinn）の UDP 層。NetBSD/aarch64 の libc の
+# `_ALIGNBYTES` 誤りを避ける CMSG 実装だけを足した vendoring 版（veil 本体は使わない）。
+quinn-udp = { path = "third_party/quinn-udp" }
