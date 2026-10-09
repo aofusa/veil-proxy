@@ -448,7 +448,10 @@ pub(crate) fn resolve_privilege_ids(
         Some(name) => Some((
             name.to_string(),
             get_uid_by_name(name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("User '{}' not found", name))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("User '{}' not found", name),
+                )
             })?,
         )),
         None => None,

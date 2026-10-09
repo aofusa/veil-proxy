@@ -373,7 +373,10 @@ fn next_echo_conn_id() -> u64 {
 }
 
 /// 1 接続でキープアライブの要求を順に処理する（要求に `Connection: close` があれば閉じる）。
-async fn serve_echo<S>(mut stream: S, conn_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+async fn serve_echo<S>(
+    mut stream: S,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
