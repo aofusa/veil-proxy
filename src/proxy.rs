@@ -1377,7 +1377,6 @@ where
         _ => return None,
     };
 
-    // gRPC はトレイラー処理のため専用経路（非ストリーミング）。
     let is_grpc = h2_headers_store.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case(b"content-type")
             && value
@@ -1385,17 +1384,18 @@ where
                 .map(|p| p.eq_ignore_ascii_case(b"application/grpc"))
                 .unwrap_or(false)
     });
-    if is_grpc {
-        return None;
-    }
-    if buffering.mode == crate::buffering::BufferingMode::Full {
+    // gRPC は buffering = full をバイパスする（F-97）。
+    if buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc {
         return None;
     }
     if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
         return None;
     }
     let server = upstream_group.select(client_ip)?;
-    if server.target.use_h2c {
+    // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する。gRPC を HTTP/1.1
+    // 上流へ送る構成は従来どおりバッファ経路（トレーラーを HTTP/1.1 で受けられない）。
+    let h2_upstream = server.target.use_h2c || upstream_group.use_h2c();
+    if is_grpc && !h2_upstream {
         return None;
     }
     Some(security.max_request_body_size as u64)
@@ -3350,6 +3350,180 @@ async fn h2_redirect(
     (status_code, 0)
 }
 
+/// F-171: HTTP/2 で受けた要求を h2c 上流（多重化接続のストリーム、F-174）へ全二重に中継する。
+/// 戻り値 `(status, resp_size, req_size)`。
+///
+/// 下流の DATA は届いた順に上流ストリームへ、上流の HEADERS / DATA / トレーラーは届いた順に
+/// 下流へ流す（双方向ストリーミング gRPC が成立する）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_relay_h2c_streaming(
+    ctx: &H2RequestCtx,
+    req_rx: &crate::stream_channel::Receiver<Bytes>,
+    target: &ProxyTarget,
+    prefix: &[u8],
+    security: &SecurityConfig,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64, u64) {
+    use crate::http2::upstream_mux::UpResp;
+    let method = &ctx.method[..];
+    let is_grpc = ctx
+        .headers
+        .iter()
+        .any(|h| header_pair_is_grpc(&h.name, &h.value));
+    let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
+    let final_path = compute_upstream_path(path_str, prefix, &target.path_prefix, is_grpc);
+    let addr = target.conn_addr();
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let headers_iter = ctx
+        .headers
+        .iter()
+        .filter(|h| is_grpc || !h.name.eq_ignore_ascii_case(b"te"))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()));
+    let mut stream = match http2::upstream_mux::open_h2c(
+        target,
+        key.as_str(),
+        Duration::from_secs(security.backend_connect_timeout_secs),
+        Duration::from_secs(security.idle_connection_timeout_secs),
+        method,
+        final_path.as_bytes(),
+        target.host.as_bytes(),
+        headers_iter,
+        false,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(status) => {
+            while req_rx.recv().await.is_some() {}
+            let msg: &[u8] = if status == 504 {
+                b"Gateway Timeout"
+            } else {
+                b"Bad Gateway"
+            };
+            let (s, sz) = h2_emit_error(resp_tx, notify, status, msg).await;
+            return (s, sz, 0);
+        }
+    };
+
+    let req_size = std::cell::Cell::new(0u64);
+    let req_tx = stream.req_tx.take();
+    let initial = ctx.body.clone();
+    let upload = async {
+        let Some(tx) = req_tx else {
+            return;
+        };
+        if !initial.is_empty() {
+            req_size.set(initial.len() as u64);
+            if tx.send(initial).await.is_err() {
+                return;
+            }
+        }
+        while let Some(chunk) = req_rx.recv().await {
+            req_size.set(req_size.get() + chunk.len() as u64);
+            if tx.send(chunk).await.is_err() {
+                // 上流がストリームを閉じた（早期応答・リセット）。下流の残りは捨てる。
+                while req_rx.recv().await.is_some() {}
+                return;
+            }
+            notify.notify();
+        }
+        // tx の drop で END_STREAM。
+    };
+
+    let resp_rx = &stream.resp_rx;
+    let download = async {
+        let mut status = 0u16;
+        let mut sent = 0u64;
+        loop {
+            let msg = match timeout(READ_TIMEOUT, resp_rx.recv()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    warn!("[HTTP/2] h2c upstream response timeout");
+                    if status == 0 {
+                        return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                    }
+                    let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(0x2)).await;
+                    return (status, sent);
+                }
+            };
+            match msg {
+                None => {
+                    if status == 0 {
+                        return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                    }
+                    // 送信端の drop でメインループが END_STREAM を送る。
+                    return (status, sent);
+                }
+                Some(UpResp::Head {
+                    status: s,
+                    mut headers,
+                }) => {
+                    status = s;
+                    headers.extend(h2_base_headers(true));
+                    // 上流が HEADERS で終わった（gRPC の trailers-only 応答など）なら、下流にも
+                    // END_STREAM 付きの HEADERS 1 枚で返す（空 DATA で閉じ直さない）。
+                    let end_stream = resp_rx.is_finished();
+                    let head = H2RespMsg::Head {
+                        status: s,
+                        headers,
+                        end_stream,
+                    };
+                    if h2_send(resp_tx, notify, head).await.is_err() || end_stream {
+                        return (status, sent);
+                    }
+                }
+                Some(UpResp::Data(b)) => {
+                    if status == 0 {
+                        return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                    }
+                    sent += b.len() as u64;
+                    if h2_send(resp_tx, notify, H2RespMsg::Body(b)).await.is_err() {
+                        return (status, sent);
+                    }
+                }
+                Some(UpResp::Trailers(trailers)) => {
+                    #[cfg(feature = "grpc")]
+                    {
+                        if let Some(code) = trailers
+                            .iter()
+                            .find(|(n, _)| n.as_ref() == b"grpc-status")
+                            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+                        {
+                            crate::metrics::record_grpc_request(
+                                &final_path,
+                                code.trim(),
+                                &target.host,
+                            );
+                        }
+                        let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
+                    }
+                    #[cfg(not(feature = "grpc"))]
+                    drop(trailers);
+                }
+                Some(UpResp::Reset { .. }) => {
+                    if status == 0 {
+                        return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                    }
+                    // 応答途中の上流エラー: 切り詰めた本文を正常終了に見せない。
+                    let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(0x2)).await;
+                    return (status, sent);
+                }
+            }
+        }
+    };
+
+    let mut upload = std::pin::pin!(futures::FutureExt::fuse(upload));
+    let mut download = std::pin::pin!(futures::FutureExt::fuse(download));
+    loop {
+        futures::select_biased! {
+            (status, sent) = download => return (status, sent, req_size.get()),
+            _ = upload => {}
+        }
+    }
+}
+
 /// リクエスト方向ストリーミング経路（F-32 統合）。戻り値 `(status, resp_size, req_size)`。
 ///
 /// メインループから `req_rx` 経由で流れてくるボディを chunked でバックエンドへゼロコピー
@@ -3419,7 +3593,13 @@ async fn h2_serve_streaming(
         }
     };
 
-    let server = match upstream_group.select(client_ip) {
+    // F-97: Consistent Hash の header/cookie キーに対応（バッファ経路と同じ選び方）。
+    let server = match upstream_group.select_with_header_fn(client_ip, |name| {
+        ctx.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_ref())
+    }) {
         Some(s) => s,
         None => {
             while req_rx.recv().await.is_some() {}
@@ -3427,6 +3607,23 @@ async fn h2_serve_streaming(
             return (s, sz, 0);
         }
     };
+
+    // F-171: h2c 上流は全二重で中継する。
+    if server.target.use_h2c || upstream_group.use_h2c() {
+        server.acquire();
+        let r = h2_relay_h2c_streaming(
+            ctx,
+            req_rx,
+            &server.target,
+            &prefix,
+            &security,
+            resp_tx,
+            notify,
+        )
+        .await;
+        server.release();
+        return r;
+    }
 
     let client_encoding = ctx
         .headers

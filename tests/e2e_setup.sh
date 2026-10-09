@@ -1452,6 +1452,15 @@ EOF
     # gRPCルート設定
     # F-97: Full バッファリング設定でも gRPC は H2C でバイパスされること
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+# F-171: 双方向ストリーミング gRPC の全二重中継（WASM・full バッファなし = ストリーミング経路）
+[[route]]
+[route.conditions]
+path = "/grpc.test.v1.TestService/BidirectionalStreaming"
+[route.action]
+type = "Proxy"
+upstream = "grpc-pool"
+use_h2c = true
+
 [[route]]
 # F-94: gRPC + WASM インターセプタ E2E 用（modules は route 直下）
 # F-97: grpc-pool = consistent_hash + x-user-id / Full buffering bypass

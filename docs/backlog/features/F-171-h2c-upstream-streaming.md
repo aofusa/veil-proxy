@@ -1,5 +1,7 @@
 # F-171: h2c 上流の全二重ストリーミング対応
 
+**状態: 完了（feat/v080-limitations）**
+
 B-84（HTTP/3 のストリーミングバックエンド経路が `use_h2c` を無視する）の修正で
 「HTTP/3 → h2c 上流」はサーバ選択直後にバッファ経路（`Decision::Buffer` ->
 `handle_request` -> `proxy_to_h2c_backend_async`）へ回すようになり、502 は解消した。
@@ -68,3 +70,24 @@ B-84（HTTP/3 のストリーミングバックエンド経路が `use_h2c` を�
 F-174（多重化対応の上流 HTTP/2 クライアント）の上に実装する。`BackendTaskParams` に上流プロトコル
 （HTTP/1.1 / h2c / TLS 上の h2）を持たせ、`classify` の B-84 分岐（h2c → バッファ経路）をストリーミング経路へ変える。
 gRPC も B-97 の改修で `RespMsg::Trailers` を持てるようになるため、ストリーミング経路で扱う。
+
+## 結果（2026-10-09）
+
+- HTTP/3: `BackendTaskParams.h2`（`H2Upstream`: method / `:path` / authority / 所有ヘッダ）を追加し、`classify` で
+  h2c 上流（gRPC を含む）をストリーミング経路へ回す（B-84 のバッファ経路への迂回を廃止）。`run_h2_task` は
+  F-174 の多重化接続でストリームを開き、要求本文の中継と応答（head / DATA / `RespMsg::Trailers`）の中継を
+  同じタスクで並行に進める。圧縮対象（非 gRPC）の応答だけは本文を集めてから圧縮する。
+- HTTP/2: `h2_route_streaming_plan` が h2c 上流（gRPC を含む、gRPC は `buffering = full` をバイパス）を
+  ストリーミング適格にし、`h2_relay_h2c_streaming` が同じ形で全二重に中継する。上流の選択は Consistent Hash の
+  header/cookie キーに対応した `select_with_header_fn`（バッファ経路と同じ）。
+- trailers-only の gRPC 応答（HEADERS + END_STREAM）は、下流でも fin / END_STREAM 付き HEADERS 1 枚で返す。
+- gRPC を HTTP/1.1 上流へ送る構成・WASM 適用ルート・`buffering = full`（gRPC 以外）はバッファ経路のまま。
+- E2E: `test_f171_http3_grpc_bidi_streaming_is_full_duplex` / `test_f171_http2_grpc_bidi_streaming_is_full_duplex`
+  （双方向ストリーミングで、要求ストリームを閉じる前に 1 通目の応答が届く。旧実装はタイムアウトすることを確認済み）。
+
+計測（交互 A/B、gRPC unary を h2load `-c100 -m10`、base = F-174 のコミット。unary はバッファ経路 → ストリーミング経路）:
+
+| フロント | base | new | 差 |
+|---|---|---|---|
+| HTTP/2 | 18,855 | 18,891 | +0.2%（ノイズ） |
+| HTTP/3 | 22,823 | 24,482 | +7.3%（4 ラウンド全勝・分布分離） |

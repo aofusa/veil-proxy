@@ -25651,3 +25651,184 @@ async fn test_b106_grpc_large_request_respects_upstream_flow_control() {
         frames[0].data.len()
     );
 }
+
+/// F-171: HTTP/3 → h2c 上流の全二重中継。双方向ストリーミング gRPC で、要求ストリームを
+/// 閉じる前に 1 通目の応答メッセージが届く（旧実装は要求本文を全部受けてから上流へ送るため、
+/// 要求を閉じるまで何も返らずタイムアウトする）。続けて 2 通目を送り、閉じたあとに
+/// grpc-status 0 のトレーラーで終わる。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "http3", feature = "grpc", feature = "http2"))]
+async fn test_f171_http3_grpc_bidi_streaming_is_full_duplex() {
+    use bytes::Buf;
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://localhost/grpc.test.v1.TestService/BidirectionalStreaming")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(req).await.expect("open stream");
+
+    // 1 通目を送り、要求を閉じずに応答を待つ。
+    stream
+        .send_data(bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request(
+            "first",
+        ))))
+        .await
+        .expect("send first");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_response())
+        .await
+        .expect("response head must arrive before the request stream is finished")
+        .expect("recv_response");
+    assert_eq!(resp.status(), 200);
+
+    let mut buf: Vec<u8> = Vec::new();
+    // LPM 1 通ぶん（5 バイトのヘッダ + 本体）が揃うまで読む。
+    async fn read_one<S: h3::quic::RecvStream>(
+        stream: &mut h3::client::RequestStream<S, bytes::Bytes>,
+        buf: &mut Vec<u8>,
+    ) -> Vec<u8> {
+        loop {
+            if buf.len() >= 5 {
+                let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if buf.len() >= 5 + len {
+                    let msg = buf[5..5 + len].to_vec();
+                    buf.drain(..5 + len);
+                    return msg;
+                }
+            }
+            let mut chunk =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_data())
+                    .await
+                    .expect("echoed message must arrive while the request stream is open")
+                    .expect("recv_data")
+                    .expect("response ended early");
+            while chunk.has_remaining() {
+                let c = chunk.chunk().to_vec();
+                chunk.advance(c.len());
+                buf.extend_from_slice(&c);
+            }
+        }
+    }
+    let first = read_one(&mut stream, &mut buf).await;
+    assert!(
+        first.ends_with(b"first"),
+        "first echo: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    stream
+        .send_data(bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request(
+            "second",
+        ))))
+        .await
+        .expect("send second");
+    let second = read_one(&mut stream, &mut buf).await;
+    assert!(second.ends_with(b"second"));
+
+    stream.finish().await.expect("finish request");
+    while let Some(mut rest) = stream.recv_data().await.expect("recv tail") {
+        rest.advance(rest.remaining());
+    }
+    let trailers = stream
+        .recv_trailers()
+        .await
+        .expect("recv_trailers")
+        .expect("grpc trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
+        Some("0"),
+        "trailers={:?}",
+        trailers
+    );
+}
+
+/// F-171: HTTP/2 → h2c 上流の全二重中継（HTTP/3 版と同じ確認を HTTP/2 で行う）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+async fn test_f171_http2_grpc_bidi_streaming_is_full_duplex() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    let mut sender = client.raw_sender().ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://127.0.0.1/grpc.test.v1.TestService/BidirectionalStreaming")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let (resp_fut, mut send) = sender.send_request(req, false).expect("open stream");
+    send.send_data(
+        bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request("first"))),
+        false,
+    )
+    .expect("send first");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp_fut)
+        .await
+        .expect("response head must arrive before the request stream is finished")
+        .expect("response");
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+
+    let mut buf: Vec<u8> = Vec::new();
+    async fn read_one(body: &mut h2::RecvStream, buf: &mut Vec<u8>) -> Vec<u8> {
+        loop {
+            if buf.len() >= 5 {
+                let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if buf.len() >= 5 + len {
+                    let msg = buf[5..5 + len].to_vec();
+                    buf.drain(..5 + len);
+                    return msg;
+                }
+            }
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.data())
+                .await
+                .expect("echoed message must arrive while the request stream is open")
+                .expect("response ended early")
+                .expect("data");
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    let first = read_one(&mut body, &mut buf).await;
+    assert!(first.ends_with(b"first"));
+
+    send.send_data(
+        bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request("second"))),
+        true,
+    )
+    .expect("send second");
+    let second = read_one(&mut body, &mut buf).await;
+    assert!(second.ends_with(b"second"));
+
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("tail");
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    let trailers = body
+        .trailers()
+        .await
+        .expect("trailers")
+        .expect("grpc trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
+        Some("0")
+    );
+}

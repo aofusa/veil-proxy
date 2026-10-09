@@ -1368,10 +1368,6 @@ impl Http3Handler {
         {
             return Decision::Buffer;
         }
-        // gRPC はトレーラー処理のためバッファ経路（ストリーミング Decision の対象外）
-        if is_grpc {
-            return Decision::Buffer;
-        }
 
         // セキュリティチェック（ストリーミング適格は早期拒否でアップロードを溜めない）。
         let security = backend.security();
@@ -1412,12 +1408,15 @@ impl Http3Handler {
             None => return Decision::Buffer, // handle_request -> 502
         };
 
-        // B-84: h2c 上流はストリーミング経路が扱えない（BackendTaskParams に use_h2c が無く
-        // HTTP/1.1 を送ってしまうため、h2c 専用サーバに切られて 502 になる）。h2c 対応済みの
-        // バッファ経路（handle_request -> proxy_to_h2c_backend_async）へ回す。
-        // HTTP/2 クライアント経路（proxy.rs::h2_proxy_h2c）も同じくバッファ型なので、
-        // これで HTTP/2 クライアントと HTTP/3 クライアントの挙動が揃う。
-        if server.target.use_h2c || upstream_group.use_h2c() {
+        // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する（gRPC を含む。
+        // トレーラーは RespMsg::Trailers）。http2 feature が無ければ従来どおりバッファ経路。
+        let h2_upstream = server.target.use_h2c || upstream_group.use_h2c();
+        #[cfg(not(feature = "http2"))]
+        if h2_upstream {
+            return Decision::Buffer;
+        }
+        // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。
+        if is_grpc && !h2_upstream {
             return Decision::Buffer;
         }
 
@@ -1426,8 +1425,35 @@ impl Http3Handler {
             .map(AcceptedEncoding::parse)
             .unwrap_or(AcceptedEncoding::Identity);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
-        let final_path = compute_backend_path(&server.target, path, &prefix);
-        let request_head = build_h1_request_head(&server.target, method, &final_path, headers);
+        #[cfg(feature = "http2")]
+        let h2 = h2_upstream.then(|| {
+            // gRPC はサービス/メソッドのフルパスを保持する（B-39）。
+            let final_path = compute_upstream_request_path(
+                std::str::from_utf8(path).unwrap_or("/"),
+                &prefix,
+                &server.target.path_prefix,
+                is_grpc,
+            );
+            crate::http3_stream::H2Upstream {
+                method: Bytes::copy_from_slice(method),
+                path: Bytes::from(final_path),
+                authority: Bytes::copy_from_slice(server.target.host.as_bytes()),
+                headers: pack_h3_request_headers(headers),
+                connect_timeout: Duration::from_secs(security.backend_connect_timeout_secs),
+            }
+        });
+        #[cfg(feature = "http2")]
+        let request_head = if h2.is_some() {
+            Vec::new()
+        } else {
+            let final_path = compute_backend_path(&server.target, path, &prefix);
+            build_h1_request_head(&server.target, method, &final_path, headers)
+        };
+        #[cfg(not(feature = "http2"))]
+        let request_head = {
+            let final_path = compute_backend_path(&server.target, path, &prefix);
+            build_h1_request_head(&server.target, method, &final_path, headers)
+        };
 
         // F-44: TLS バックエンドもストリーミング対象（バックエンドタスクが全二重 TLS で貫通）。
         let use_tls = server.target.use_tls;
@@ -1449,6 +1475,8 @@ impl Http3Handler {
             pool_idle_timeout_secs: security.idle_connection_timeout_secs,
             no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
             retry_idempotent: crate::http_utils::is_idempotent_method(method),
+            #[cfg(feature = "http2")]
+            h2,
         })
     }
 
@@ -1893,6 +1921,18 @@ fn pack_resp_headers(
         out.push((name, buf.slice(off..off + v.len())));
     }
     out
+}
+
+/// F-171: HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を 1 回の確保に詰めて所有ペアにする
+/// （上流 HTTP/2 への転送用。ホップバイホップは上流クライアントが落とす）。
+#[cfg(feature = "http2")]
+fn pack_h3_request_headers(headers: &[h3::Header]) -> crate::http3_stream::RespHeaders {
+    let refs: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .filter(|h| !h.name().starts_with(b":"))
+        .map(|h| (h.name(), h.value()))
+        .collect();
+    pack_resp_headers(&refs, None)
 }
 
 impl H3BufferedTask {

@@ -546,6 +546,22 @@ pub(crate) struct BackendTaskParams {
     pub no_response_body: bool,
     /// F-177: 再利用した接続が応答前に失敗したとき、本文の無い要求を 1 回だけ再送するか。
     pub retry_idempotent: bool,
+    /// F-171: 上流が HTTP/2（h2c）なら `Some`。このとき `request_head` は使わない。
+    #[cfg(feature = "http2")]
+    pub h2: Option<H2Upstream>,
+}
+
+/// F-171: HTTP/2 上流へ送る要求（HTTP/1.1 の `request_head` の代わり）。
+#[cfg(feature = "http2")]
+pub(crate) struct H2Upstream {
+    pub method: Bytes,
+    /// 上流へ送る `:path`（gRPC はフルパスのまま）。
+    pub path: Bytes,
+    pub authority: Bytes,
+    /// 転送する要求ヘッダ（疑似ヘッダを除く。ホップバイホップは上流クライアントが落とす）。
+    pub headers: RespHeaders,
+    /// 上流への接続タイムアウト。
+    pub connect_timeout: Duration,
 }
 
 /// バックエンドタスクを起動するスポーナ（F-46: 型付きタスクプール）。
@@ -661,8 +677,18 @@ async fn backend_task(
     notify: ConnWaker,
 ) {
     params.server.acquire();
-    let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
-    let outcome = run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await;
+    #[cfg(feature = "http2")]
+    let outcome = if params.h2.is_some() {
+        run_h2_task(&params, &req_body_rx, &resp_tx, &notify).await
+    } else {
+        let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+        run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+    };
+    #[cfg(not(feature = "http2"))]
+    let outcome = {
+        let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+        run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+    };
     params.server.release();
 
     if let Err(status) = outcome {
@@ -672,6 +698,199 @@ async fn backend_task(
     }
     // resp_tx / req_body_rx はここで drop → メインループへ fin（EOF）伝播。
     notify.notify();
+}
+
+/// F-171: HTTP/2 上流（多重化接続のストリーム）との全二重中継。
+///
+/// 下流（HTTP/3）の要求本文は届いた順に上流ストリームへ流し、上流の応答
+/// （head・DATA・トレーラー）は届いた順にメインループへ流す。両方向を同じタスクで並行に
+/// 進めるので、クライアントストリーミング・双方向ストリーミングの gRPC が成立する
+/// （応答の送出は要求の完了を待たない）。圧縮対象の応答（非 gRPC）だけは本文を集めてから
+/// 圧縮する（HTTP/1.1 経路と同じ）。
+#[cfg(feature = "http2")]
+async fn run_h2_task(
+    params: &BackendTaskParams,
+    req_body_rx: &Receiver<Bytes>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+) -> Result<(), u16> {
+    use crate::http2::upstream_mux::{open_h2c, UpResp};
+    let h2 = params.h2.as_ref().ok_or(502u16)?;
+    let target = &params.server.target;
+    let addr = target.conn_addr();
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let mut stream = open_h2c(
+        target,
+        key.as_str(),
+        h2.connect_timeout,
+        Duration::from_secs(params.pool_idle_timeout_secs),
+        &h2.method,
+        &h2.path,
+        &h2.authority,
+        h2.headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+        !params.has_request_body,
+    )
+    .await?;
+    let read_timeout = Duration::from_secs(params.timeout_secs);
+
+    // 要求方向: 送信端を所有して流し、終わったら drop（= END_STREAM）。
+    let req_tx = stream.req_tx.take();
+    let upload = async move {
+        let Some(tx) = req_tx else {
+            return;
+        };
+        while let Some(chunk) = req_body_rx.recv().await {
+            if tx.send(chunk).await.is_err() {
+                // 上流がストリームを閉じた（早期応答・リセット）。残りは応答側で判定する。
+                return;
+            }
+            // 要求チャネルに空きができた → メインループの recv_body を再開させる。
+            notify.notify();
+        }
+    };
+
+    // 応答方向。
+    let resp_rx = &stream.resp_rx;
+    let download = async move {
+        let mut head_sent = false;
+        loop {
+            let msg = match crate::runtime::time::timeout(read_timeout, resp_rx.recv()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    warn!("[HTTP/3] h2 upstream response timeout");
+                    return Err(if head_sent { 502 } else { 504 });
+                }
+            };
+            match msg {
+                None => return Ok(()),
+                Some(UpResp::Head { status, headers }) => {
+                    let content_type = headers
+                        .iter()
+                        .find(|(n, _)| n.as_ref() == b"content-type")
+                        .map(|(_, v)| v.clone());
+                    let is_grpc = content_type
+                        .as_deref()
+                        .is_some_and(|ct| ct.starts_with(b"application/grpc"));
+                    let should_compress = if is_grpc || params.no_response_body {
+                        None
+                    } else {
+                        let content_length = headers
+                            .iter()
+                            .find(|(n, _)| n.as_ref() == b"content-length")
+                            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+                            .and_then(|v| v.trim().parse().ok());
+                        let content_encoding = headers
+                            .iter()
+                            .find(|(n, _)| n.as_ref() == b"content-encoding")
+                            .map(|(_, v)| v.as_ref());
+                        params.compression.should_compress(
+                            params.client_encoding,
+                            content_type.as_deref(),
+                            content_length,
+                            content_encoding,
+                        )
+                    };
+                    if let Some(enc) = should_compress {
+                        return h2_relay_compressed(
+                            resp_rx,
+                            status,
+                            headers,
+                            enc,
+                            &params.compression,
+                            read_timeout,
+                            resp_tx,
+                        )
+                        .await;
+                    }
+                    if resp_tx
+                        .send(RespMsg::Head { status, headers })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(()); // クライアント切断（stream の drop で上流へ CANCEL）。
+                    }
+                    head_sent = true;
+                    if resp_rx.is_finished() {
+                        // HEADERS で終わった応答（gRPC の trailers-only 等）。すぐ送信端を閉じて
+                        // メインループに HEADERS へ fin を載せさせる。
+                        return Ok(());
+                    }
+                }
+                Some(UpResp::Data(b)) => {
+                    if !head_sent {
+                        return Err(502);
+                    }
+                    if resp_tx.send(RespMsg::Body(b)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(UpResp::Trailers(trailers)) => {
+                    #[cfg(feature = "grpc")]
+                    {
+                        if resp_tx.send(RespMsg::Trailers(trailers)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    #[cfg(not(feature = "grpc"))]
+                    drop(trailers);
+                }
+                Some(UpResp::Reset { .. }) => {
+                    debug!("[HTTP/3] h2 upstream stream reset");
+                    return Err(502);
+                }
+            }
+            notify.notify();
+        }
+    };
+
+    let mut upload = std::pin::pin!(futures::FutureExt::fuse(upload));
+    let mut download = std::pin::pin!(futures::FutureExt::fuse(download));
+    loop {
+        futures::select_biased! {
+            r = download => return r,
+            _ = upload => {}
+        }
+    }
+}
+
+/// F-171: 圧縮対象の h2 応答を最後まで集めて圧縮し、head + 本文として送る。
+#[cfg(feature = "http2")]
+async fn h2_relay_compressed(
+    resp_rx: &Receiver<crate::http2::upstream_mux::UpResp>,
+    status: u16,
+    mut headers: RespHeaders,
+    enc: AcceptedEncoding,
+    compression: &CompressionConfig,
+    read_timeout: Duration,
+    resp_tx: &Sender<RespMsg>,
+) -> Result<(), u16> {
+    use crate::http2::upstream_mux::UpResp;
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match crate::runtime::time::timeout(read_timeout, resp_rx.recv()).await {
+            Err(_) => return Err(504),
+            Ok(None) => break,
+            Ok(Some(UpResp::Data(b))) => body.extend_from_slice(&b),
+            Ok(Some(UpResp::Trailers(_))) | Ok(Some(UpResp::Head { .. })) => {}
+            Ok(Some(UpResp::Reset { .. })) => return Err(502),
+        }
+    }
+    let compressed = crate::http3_server::compress_body_h3(&body, enc, compression);
+    headers.retain(|(n, _)| {
+        !n.eq_ignore_ascii_case(b"content-length") && !n.eq_ignore_ascii_case(b"content-encoding")
+    });
+    headers.push((
+        Bytes::from_static(b"content-encoding"),
+        Bytes::from_static(enc.as_header_value()),
+    ));
+    if resp_tx
+        .send(RespMsg::Head { status, headers })
+        .await
+        .is_ok()
+    {
+        let _ = resp_tx.send(RespMsg::Body(Bytes::from(compressed))).await;
+    }
+    Ok(())
 }
 
 /// 新規に上流へ接続する（TLS ならハンドシェイクまで）。

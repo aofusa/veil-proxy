@@ -64,6 +64,11 @@ impl Http2TestClient {
     }
 
     /// HTTP/2 PING を送信し ACK（PONG）を待つ。gRPC keepalive 検証用（F-96）。
+    /// 生の h2 `SendRequest`（ストリームを開いたまま送受信を交互に行うテスト用。F-171）。
+    pub fn raw_sender(&self) -> SendRequest<Bytes> {
+        self.sender.clone()
+    }
+
     pub async fn ping(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pp = self
             .ping_pong
