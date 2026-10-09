@@ -86,8 +86,8 @@ pub struct Http2Connection<S> {
 // 確保・解放コストを排除する（thread-per-core 設計のためロック不要）。
 
 const H2_READ_BUF_SIZE: usize = 65536;
-/// プールに保持する最大本数（過剰なメモリ保持を防ぐ）
-const H2_READ_BUF_POOL_MAX: usize = 256;
+/// プールに保持する最大本数（過剰なメモリ保持を防ぐ。B-101 で 256 → 64 = 4MB/スレッド）
+const H2_READ_BUF_POOL_MAX: usize = 64;
 /// これを超える肥大化バッファはプールに戻さず解放する（1MB）
 const H2_READ_BUF_RETAIN_MAX: usize = 1 << 20;
 

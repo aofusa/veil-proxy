@@ -85,6 +85,37 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
     }
 }
 
+/// mimalloc のアリーナを予約時に一括コミットしない（B-101）。
+///
+/// 既定（`arena_eager_commit = 2`: overcommit 環境で一括コミット）では、
+/// 解放済みページが purge で decommit されず、アイドル時でも約 25MB の匿名メモリが
+/// RSS に残る。0 にするとアイドル RSS が約 11MB まで下がる（スループット差なし）。
+/// 最初のアリーナは最初の Rust アロケーションで作られるため、`main` より前
+/// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` が
+/// 明示されていればそちらを優先する。
+#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+mod mimalloc_early_options {
+    // libmimalloc-sys は mi_option_arena_eager_commit の定数を公開していない。
+    // mimalloc v2 の mi_option_e における列挙順（show_errors=0, show_stats=1,
+    // verbose=2, eager_commit=3, arena_eager_commit=4）。
+    const MI_OPTION_ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+
+    extern "C" fn set_arena_eager_commit() {
+        // main 前なので std::env（アロケーションする）は使わず libc::getenv で見る
+        // SAFETY: NUL 終端の静的文字列。init_array 実行時点ではスレッドは 1 本で環境変数は不変。
+        let preset = unsafe { libc::getenv(c"MIMALLOC_ARENA_EAGER_COMMIT".as_ptr()) };
+        if preset.is_null() {
+            // SAFETY: mi_option_set はオプション値を書き換えるだけで、初期化前でも呼べる。
+            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0) };
+        }
+    }
+
+    // `.init_array` の関数は Rust ランタイム初期化（最初のアロケーション）より前に呼ばれる。
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static SET_ARENA_EAGER_COMMIT: extern "C" fn() = set_arena_eager_commit;
+}
+
 /// mimalloc の Large OS Pages 設定を有効化し、状態をログ出力
 ///
 /// Huge Pagesが利用可能な場合は有効化し、

@@ -4741,42 +4741,36 @@ fn slice_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
 // 意図的な記述（`let _ =` より意図が明確なため維持する）。
 #[allow(clippy::drop_non_drop)]
 async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: SocketAddr) {
-    let mut accumulated = BytesMut::with_capacity(BUF_SIZE);
+    // B-101: 要求の蓄積バッファは、データが届いてからスレッドローカルのプールで借りる
+    // （接続ごとに 64KB を確保して接続の寿命まで抱えない）。
+    let mut accumulated = BytesMut::new();
 
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
     let mut connection_metric = ActiveConnectionMetric::new(true);
-    // 接続直後の 1 回目の読み取りか（kqueue の待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
-    #[cfg(veil_poller_kqueue)]
+    // 接続直後の 1 回目の読み取りか（待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
     let mut first_read = true;
 
     loop {
-        // 読み込み（アイドルタイムアウト付き）
-        let read_buf = buf_get();
-        // kqueue: 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
-        // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから 1 回だけ読む。
-        #[cfg(veil_poller_kqueue)]
+        // 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
+        // readiness を待ってから読み取りバッファを借りる（B-101: アイドル接続にバッファを
+        // 持たせない。kqueue では先読みの EAGAIN と確認用 poll(2) も省ける）。
         let wait_first = !first_read && accumulated.is_empty();
-        #[cfg(veil_poller_kqueue)]
-        {
-            first_read = false;
+        first_read = false;
+        if accumulated.is_empty() && accumulated.capacity() > 0 {
+            crate::pool::accum_buf_put(std::mem::take(&mut accumulated));
         }
         let read_result = timeout(IDLE_TIMEOUT, async {
-            #[cfg(veil_poller_kqueue)]
             if wait_first {
-                if let Err(e) = tls_stream.wait_next_request().await {
-                    return (Err(e), read_buf);
-                }
+                tls_stream.wait_next_request().await?;
             }
-            tls_stream.read(read_buf).await
+            Ok::<_, io::Error>(tls_stream.read(buf_get()).await)
         })
         .await;
 
         let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => {
-                // アイドルタイムアウト - 接続を閉じる
-                return;
-            }
+            Ok(Ok(result)) => result,
+            // アイドルタイムアウト・待機中のエラー - 接続を閉じる
+            Ok(Err(_)) | Err(_) => return,
         };
 
         let n = match res {
@@ -4793,6 +4787,9 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
         // 読み込んだデータを蓄積（SafeReadBufferの型安全なアクセス）
         returned_buf.set_valid_len(n);
+        if accumulated.capacity() == 0 {
+            accumulated = crate::pool::accum_buf_get();
+        }
         accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
 

@@ -35,6 +35,10 @@ use crate::ktls_rustls;
 
 // バッファサイズ（ページアライン・L2キャッシュ最適化）
 pub(crate) const BUF_SIZE: usize = 65536; // 64KB - io_uring最適サイズ
+/// B-101: `BUF_POOL` が保持する読み取りバッファの上限本数（スレッドごと、64KB × 64 = 4MB）。
+/// アイドルなキープアライブ接続はバッファを持たない（readiness を待ってから借りる）ので、
+/// 同時に必要なのは「いま読んでいる接続」の数だけ。
+const BUF_POOL_CAP: usize = 64;
 pub(crate) const HEADER_BUF_CAPACITY: usize = 512; // HTTPヘッダー用
 
 // ====================
@@ -934,18 +938,53 @@ thread_local! {
     ///
     /// 内部では Vec<u8> を保持し、取得時に SafeReadBuffer でラップします。
     /// これにより、既存のメモリ効率を維持しながら型安全性を向上させています。
-    #[allow(clippy::uninit_vec)]
-    pub(crate) static BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
-        (0..32).map(|_| {
-            let mut buf = Vec::with_capacity(BUF_SIZE);
-            // SAFETY: SafeReadBuffer でラップされるため、
-            // valid_len 経由でしかアクセスできない
-            unsafe {
-                buf.set_len(BUF_SIZE);
-            }
-            buf
-        }).collect()
-    );
+    ///
+    /// B-101: 起動時の事前確保（以前は 64KB × 32 本 = 2MB/スレッド）はやめ、必要になった
+    /// ときに確保する。保持上限は [`BUF_POOL_CAP`]。
+    pub(crate) static BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+// ====================
+// HTTP/1.1 の要求蓄積バッファのプール（B-101）
+// ====================
+
+/// プールに保持する蓄積バッファの上限数（スレッドごと）。
+const ACCUM_BUF_POOL_CAP: usize = 64;
+
+/// 蓄積バッファの初期容量。典型的な要求ヘッダ（数百 B〜数 KB）が収まる 8KB にし、
+/// 同時接続あたりの常駐量を抑える（大きな要求は `extend_from_slice` が伸ばす。B-101）。
+const ACCUM_BUF_INIT: usize = 8 * 1024;
+
+thread_local! {
+    /// B-101: HTTP/1.1 の要求蓄積バッファ（`handle_requests` の `accumulated`）のプール。
+    ///
+    /// **不変条件**: プール内の `BytesMut` は `len() == 0` かつ一意所有（`try_reclaim` 済み）。
+    /// 前の要求のヘッダを切り出した `Bytes` がまだ生きている確保は戻さない（`body_buf_put`
+    /// と同じ規則。生存中の `Bytes` が指す領域を次の要求が上書きする事故を構造的に防ぐ）。
+    static ACCUM_BUF_POOL: RefCell<Vec<bytes::BytesMut>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 蓄積バッファを借りる（空き容量は最低 `ACCUM_BUF_INIT`）。
+#[inline]
+pub(crate) fn accum_buf_get() -> bytes::BytesMut {
+    ACCUM_BUF_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| bytes::BytesMut::with_capacity(ACCUM_BUF_INIT))
+}
+
+/// 蓄積バッファを返す（空かつ一意所有のものだけ。それ以外は drop）。
+#[inline]
+pub(crate) fn accum_buf_put(mut buf: bytes::BytesMut) {
+    // 大きな要求で伸びた確保はプールに残さない（常駐量を初期容量に揃える）
+    if !buf.is_empty() || buf.capacity() > BUF_SIZE {
+        return;
+    }
+    ACCUM_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < ACCUM_BUF_POOL_CAP && buf.try_reclaim(ACCUM_BUF_INIT) {
+            pool.push(buf);
+        }
+    });
 }
 
 /// 安全なバッファ取得ヘルパー
@@ -999,7 +1038,7 @@ pub(crate) fn buf_put(buf: SafeReadBuffer) {
 pub(crate) fn buf_put_vec(mut buf: Vec<u8>) {
     BUF_POOL.with(|p| {
         let mut pool = p.borrow_mut();
-        if pool.len() < 128 {
+        if pool.len() < BUF_POOL_CAP {
             // バッファの容量が十分であることを確認
             if buf.capacity() >= BUF_SIZE {
                 // SAFETY:
@@ -1788,5 +1827,39 @@ mod tests {
             let len = pool.connections.get(key).map(|q| q.len()).unwrap_or(0);
             assert_eq!(len, n, "below max_idle, all connections should be retained");
         }
+    }
+
+    // B-101: 蓄積バッファプールは空かつ一意所有・初期容量規模のものだけを受け取る。
+    #[test]
+    fn b101_accum_buf_pool_rules() {
+        use super::{accum_buf_get, accum_buf_put, ACCUM_BUF_INIT, ACCUM_BUF_POOL, BUF_SIZE};
+        let b = accum_buf_get();
+        assert!(b.capacity() >= ACCUM_BUF_INIT && b.capacity() < BUF_SIZE);
+
+        // 切り出した Bytes が生きている確保は戻らない
+        let mut b = accum_buf_get();
+        b.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        let head = b.split_to(b.len()).freeze();
+        accum_buf_put(b);
+        assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 0);
+        drop(head);
+
+        // 中身が残っているものは戻らない
+        let mut b = accum_buf_get();
+        b.extend_from_slice(b"x");
+        accum_buf_put(b);
+        assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 0);
+
+        // 大きく伸びたものは戻らない
+        let mut b = accum_buf_get();
+        b.reserve(BUF_SIZE * 2);
+        accum_buf_put(b);
+        assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 0);
+
+        // 空・一意所有なら戻り、次の get で再利用される
+        accum_buf_put(accum_buf_get());
+        assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 1);
+        let _ = accum_buf_get();
+        assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 0);
     }
 }

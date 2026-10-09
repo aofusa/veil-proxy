@@ -93,12 +93,21 @@ impl KtlsServerStream {
     /// 復号済みの平文が残っていれば即座に返る。rustls 内部の平文は `read()` が毎回
     /// `drained_buffer` へ排出しているため、2 回目以降のリクエスト待ちでは
     /// `drained_buffer` だけを見ればよい（接続直後の 1 回目には使わないこと）。
-    #[cfg(veil_poller_kqueue)]
+    ///
+    /// B-101: 全バックエンドで使う（以前は kqueue 限定）。待ってから読み取りバッファを借りる
+    /// ことで、アイドルなキープアライブ接続が 64KB のバッファを抱え続けないようにする。
     pub async fn wait_next_request(&self) -> io::Result<()> {
         if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
             return Ok(());
         }
-        self.inner.readable_lazy().await
+        #[cfg(veil_poller_kqueue)]
+        {
+            self.inner.readable_lazy().await
+        }
+        #[cfg(not(veil_poller_kqueue))]
+        {
+            self.inner.readable().await
+        }
     }
 
     /// 基盤となる TCP ストリームへの参照を取得

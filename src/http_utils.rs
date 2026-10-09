@@ -1748,6 +1748,8 @@ pub(crate) fn status_code_to_reason(status_code: u16) -> &'static str {
 ///
 /// プールから取り出した上流接続が応答の 1 バイト目より前に失敗したとき、新規接続で
 /// 1 回だけ再送してよいかの判定に使う。POST / PATCH は対象外。
+// 現状の呼び出し元は HTTP/3 の上流経路のみ（HTTP/1.1・HTTP/2 経路への適用は F-177 の後続）
+#[cfg(feature = "http3")]
 #[inline]
 pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
     matches!(
@@ -1756,7 +1758,7 @@ pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "http3"))]
 mod idempotent_method_tests {
     #[test]
     fn idempotent_methods_f177() {
