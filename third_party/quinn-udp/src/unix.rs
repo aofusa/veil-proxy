@@ -1,4 +1,3 @@
-#[cfg(not(any(apple, target_os = "openbsd", solarish)))]
 use std::{
     io::{self, IoSliceMut},
     mem::{self, MaybeUninit},
