@@ -1,37 +1,29 @@
-// veil: path 依存では依存クレートの lint が抑制されない（crates.io 経由なら cap される）。
-// cfg_aliases! マクロ内部の末尾セミコロン警告はこのクレートの問題ではないので抑制する。
-#![allow(semicolon_in_expressions_from_macros)]
-
-use cfg_aliases::cfg_aliases;
+// veil: upstream は cfg_aliases! マクロで同じ cfg を定義している。path 依存では依存クレートの
+// lint が cap されず、マクロ内部の警告（semicolon_in_expressions_from_macros）が出続けるため、
+// 同じ別名を build スクリプトで直接定義する（意味は upstream と同一）。
+use std::env;
 
 fn main() {
-    // Setup cfg aliases
-    cfg_aliases! {
-        // Platforms
-        apple: {
-            any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "visionos"
-            )
-        },
-        bsd: {
-            any(
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd"
-            )
-        },
-        solarish: {
-            any(
-                target_os = "solaris",
-                target_os = "illumos"
-            )
-        },
-        // Convenience aliases
-        apple_fast: { all(apple, feature = "fast-apple-datapath") },
-        apple_slow: { all(apple, not(feature = "fast-apple-datapath")) },
-        wasm_browser: { all(target_family = "wasm", target_os = "unknown") },
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+    let fast_apple = env::var_os("CARGO_FEATURE_FAST_APPLE_DATAPATH").is_some();
+
+    let apple = matches!(os.as_str(), "macos" | "ios" | "tvos" | "visionos");
+    let bsd = matches!(os.as_str(), "freebsd" | "openbsd" | "netbsd");
+    let solarish = matches!(os.as_str(), "solaris" | "illumos");
+    let wasm_browser = family.split(',').any(|f| f == "wasm") && os == "unknown";
+
+    for (name, on) in [
+        ("apple", apple),
+        ("bsd", bsd),
+        ("solarish", solarish),
+        ("apple_fast", apple && fast_apple),
+        ("apple_slow", apple && !fast_apple),
+        ("wasm_browser", wasm_browser),
+    ] {
+        println!("cargo:rustc-check-cfg=cfg({name})");
+        if on {
+            println!("cargo:rustc-cfg={name}");
+        }
     }
 }

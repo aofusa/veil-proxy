@@ -2678,7 +2678,6 @@ dependencies = [
 name = "quinn-udp"
 version = "0.5.14"
 dependencies = [
- "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",

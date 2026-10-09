@@ -26,7 +26,8 @@ libc クレート（0.2.189 時点でも未修正）は NetBSD/aarch64 の `_ALI
 
 libc の upstream が修正されたら、この vendoring は削除してよい。
 
-### `build.rs`: lint の抑制
+### `build.rs`: cfg_aliases を使わない
 
-path 依存では依存クレートの lint が cap されないため、`cfg_aliases!` マクロ内部で出る
-`semicolon_in_expressions_from_macros` を `#![allow]` した（crates.io 経由なら表示されない警告）。
+path 依存では依存クレートの lint が cap されず、`cfg_aliases!` マクロ内部の警告が出続けるため、
+同じ cfg 別名（`apple` / `bsd` / `solarish` / `apple_fast` / `apple_slow` / `wasm_browser`）を
+`build.rs` で直接定義し、`[build-dependencies] cfg_aliases` を外した。
