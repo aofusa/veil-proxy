@@ -411,7 +411,6 @@ fn perform_grpc_health_check_h2c(
     grpc_frame: &[u8],
     timeout: Duration,
 ) -> Result<bool, ()> {
-    use crate::http2::client::CONNECTION_PREFACE;
     use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
     use crate::http2::hpack::{HpackDecoder, HpackEncoder};
     use crate::http2::settings::defaults;
@@ -426,7 +425,9 @@ fn perform_grpc_health_check_h2c(
     let mut hpack_dec = HpackDecoder::new(defaults::HEADER_TABLE_SIZE as usize);
 
     // Preface + SETTINGS
-    stream.write_all(CONNECTION_PREFACE).map_err(|_| ())?;
+    stream
+        .write_all(defaults::CONNECTION_PREFACE)
+        .map_err(|_| ())?;
     let settings = enc.encode_settings(
         &[
             (0x3, defaults::MAX_CONCURRENT_STREAMS),

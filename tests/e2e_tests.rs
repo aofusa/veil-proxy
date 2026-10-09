@@ -25592,3 +25592,62 @@ async fn test_b104_http3_head_on_keepalive_upstream() {
         "the connection used for HEAD must be reusable"
     );
 }
+
+/// B-106 / F-174: 上流 HTTP/2 のフロー制御。接続ウィンドウ（tonic/hyper の既定 1MB）を超える
+/// gRPC 要求（1.5MB）を HTTP/2 で受けて h2c 上流へ中継しても、WINDOW_UPDATE を待って送り切る。
+///
+/// 旧 `H2cClient` は接続ウィンドウを超えると待たずに "Send window exhausted" で失敗し、
+/// ストリーム単位のウィンドウは見ていなかった。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+async fn test_b106_grpc_large_request_respects_upstream_flow_control() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    // SimpleRequest { message = "x" * N }（field 1, wire type 2, varint 長）
+    const N: usize = 1536 * 1024;
+    let mut msg = vec![0x0a];
+    let mut len = N;
+    while len >= 0x80 {
+        msg.push((len as u8 & 0x7f) | 0x80);
+        len >>= 7;
+    }
+    msg.push(len as u8);
+    msg.extend(std::iter::repeat_n(b'x', N));
+    let lpm = encode_grpc_lpm(&msg);
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("x-user-id", "b106"),
+    ];
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&lpm),
+        )
+        .await
+        .expect("large gRPC request");
+    assert_eq!(resp.status, 200, "headers={:?}", resp.headers);
+    assert_eq!(
+        resp.grpc_status(),
+        Some(0),
+        "headers={:?} trailers={:?}",
+        resp.headers,
+        resp.trailers
+    );
+    let frames = decode_all_grpc_frames(&resp.body);
+    assert_eq!(frames.len(), 1);
+    assert!(
+        frames[0].data.len() >= N,
+        "echoed message must be complete: {} bytes",
+        frames[0].data.len()
+    );
+}

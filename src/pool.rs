@@ -295,9 +295,9 @@ impl<T> PooledConnection<T> {
 
     /// 接続がまだ有効かどうかを判定（タイムアウトチェック）
     ///
-    /// HTTP/HTTPS のプールは B-93 で `pooled_conn_reusable`（生存確認つき）へ移ったため、
-    /// 利用者は h2c のプール（`http2`）とテストだけ。
-    #[cfg(any(feature = "http2", test))]
+    /// HTTP/HTTPS のプールは B-93 で `pooled_conn_reusable`（生存確認つき）へ、h2c は F-174 で
+    /// 多重化接続のプール（`http2::upstream_mux`）へ移ったため、利用者はテストだけ。
+    #[cfg(test)]
     pub(crate) fn is_valid(&self) -> bool {
         self.created_at.elapsed().as_secs() < self.idle_timeout_secs
     }
@@ -540,84 +540,9 @@ impl HttpsConnectionPool {
     }
 }
 
-/// H2C（HTTP/2 平文）バックエンド用コネクションプール（F-106）。
-///
-/// gRPC 中継など `use_h2c` バックエンドへの接続を再利用し、リクエストごとの
-/// TCP 接続 + h2c ハンドシェイク（コネクションプリフェース + SETTINGS 往復）を
-/// 排除する。HTTP/1.1 の `HttpConnectionPool` と異なり、HTTP/2 はコネクション上で
-/// ストリーム ID を単調増加させながら複数リクエストを直列に流せる（`H2cClient` の
-/// `next_stream_id` が状態を保持）。プールに返す前に呼び出し側が
-/// `H2cClient::is_reusable()`（ストリーム ID 枯渇前）と応答成功を確認する。
-/// io_uring の `TcpStream` はワーカースレッドの ring に紐づくため、スレッドローカルで
-/// 同一スレッド再利用のみ行う（thread-per-core）。
-#[cfg(feature = "http2")]
-pub(crate) struct H2cConnectionPool {
-    connections: HashMap<String, VecDeque<PooledConnection<crate::http2::H2cClient<TcpStream>>>>,
-}
-
-#[cfg(feature = "http2")]
-impl H2cConnectionPool {
-    pub(crate) fn new() -> Self {
-        Self {
-            connections: HashMap::new(),
-        }
-    }
-
-    /// プールから接続を取得（有効な接続がなければ None）
-    pub(crate) fn get(&mut self, key: &str) -> Option<crate::http2::H2cClient<TcpStream>> {
-        if let Some(queue) = self.connections.get_mut(key) {
-            while let Some(entry) = queue.pop_front() {
-                if entry.is_valid() {
-                    crate::metrics::record_connection_pool_hit(key);
-                    return Some(entry.stream);
-                }
-                // 無効（アイドルタイムアウト超過）な接続は破棄
-            }
-        }
-        crate::metrics::record_connection_pool_miss(key);
-        None
-    }
-
-    /// 接続をプールに返却（`is_reusable()` を満たす健全な接続のみ返す）
-    ///
-    /// F-166(B-1)/F-165(A2): `key: String` を要求すると呼び出し側が **毎リクエスト**
-    /// `to_string()` する羽目になる（同一ホストへ何千回も返却する gRPC 中継のホットパス）。
-    /// `&str` で受け取り、**既存ホストへの返却（共通ケース）はハッシュマップ探索 1 回のみで
-    /// 新規アロケーションなし**、未登録ホストのときだけ `to_string()` して新規エントリを
-    /// 挿入する（コールドパス、ホストごとに 1 回だけ発生）。
-    pub(crate) fn put(
-        &mut self,
-        key: &str,
-        client: crate::http2::H2cClient<TcpStream>,
-        max_idle: usize,
-        idle_timeout_secs: u64,
-    ) {
-        if let Some(queue) = self.connections.get_mut(key) {
-            while queue.len() >= max_idle {
-                queue.pop_front();
-            }
-            queue.push_back(PooledConnection::new(client, idle_timeout_secs));
-            crate::metrics::set_connection_pool_size(key, queue.len());
-            return;
-        }
-
-        // 未登録ホスト（コールドパス）: ここでのみ新規キーを確保する。
-        let mut queue: VecDeque<PooledConnection<crate::http2::H2cClient<TcpStream>>> =
-            VecDeque::new();
-        queue.push_back(PooledConnection::new(client, idle_timeout_secs));
-        crate::metrics::set_connection_pool_size(key, queue.len());
-        self.connections.insert(key.to_string(), queue);
-    }
-}
-
 thread_local! {
     pub(crate) static HTTP_POOL: RefCell<HttpConnectionPool> = RefCell::new(HttpConnectionPool::new());
     pub(crate) static HTTPS_POOL: RefCell<HttpsConnectionPool> = RefCell::new(HttpsConnectionPool::new());
-}
-
-#[cfg(feature = "http2")]
-thread_local! {
-    pub(crate) static H2C_POOL: RefCell<H2cConnectionPool> = RefCell::new(H2cConnectionPool::new());
 }
 
 // ====================

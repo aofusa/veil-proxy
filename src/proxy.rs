@@ -63,7 +63,7 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 ///
 /// ホットパスのため追加のアロケーション・ヒープボックス化は一切行わない。
 #[inline]
-async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
+pub(crate) async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
     if let Some(sock_addr) = target.socket_addr {
         return TcpStream::connect(sock_addr).await;
     }
@@ -2447,159 +2447,118 @@ async fn h2_proxy_h2c(
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
     let ctx = _ctx;
-    let from_pool;
-    let mut h2c_client = match H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
-        Some(client) => {
-            from_pool = true;
-            client
-        }
-        None => {
-            from_pool = false;
-            match h2c_connect_and_handshake(addr).await {
-                Ok(client) => client,
-                Err(status) => {
-                    let msg: &[u8] = if status == 504 {
-                        b"Gateway Timeout"
-                    } else {
-                        b"Bad Gateway"
-                    };
-                    return h2_emit_error(resp_tx, notify, status, msg).await;
-                }
-            }
-        }
-    };
-
     let is_grpc_upstream = ctx
         .headers
         .iter()
         .any(|h| header_pair_is_grpc(&h.name, &h.value));
-    // F-166/F-165(A2): フィルタ済みイテレータを直接 `send_request` へ渡す
-    // （中間 `Vec<(&[u8], &[u8])>` の `collect()` を回避、1 リクエスト 1 ヒープ確保が消える）。
-    // クロージャは `is_grpc_upstream`（bool、Copy）を借用するだけなので `Clone` になる。
-    let headers_iter = || {
-        ctx.headers
-            .iter()
-            .filter(|h| !h.name.starts_with(b":"))
-            .filter(|h| {
-                !h.name.eq_ignore_ascii_case(b"connection")
-                    && !h.name.eq_ignore_ascii_case(b"keep-alive")
-                    && !h.name.eq_ignore_ascii_case(b"proxy-connection")
-                    && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !h.name.eq_ignore_ascii_case(b"upgrade")
-                    && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
-            })
-            .map(|h| (h.name.as_ref(), h.value.as_ref()))
-    };
+    // F-166/F-165(A2): フィルタ済みイテレータを直接渡す（中間 `Vec` の `collect()` を回避）。
+    // ホップバイホップ・`te`（gRPC 以外）の除外は上流クライアント側（F-174）でも行う。
+    let headers_iter = ctx
+        .headers
+        .iter()
+        .filter(|h| is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()));
 
-    let body: Option<&[u8]> = if ctx.body.is_empty() {
-        None
-    } else {
-        Some(&ctx.body)
-    };
-    let authority = target.host.as_bytes();
-
-    let mut send_result = h2c_client
-        .send_request(method, path, authority, headers_iter(), body)
-        .await;
-    if send_result.is_err() && from_pool {
-        if let Ok(fresh) = h2c_connect_and_handshake(addr).await {
-            h2c_client = fresh;
-            send_result = h2c_client
-                .send_request(method, path, authority, headers_iter(), body)
-                .await;
+    // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）でストリームを開く。
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr);
+    let body = (!ctx.body.is_empty()).then(|| ctx.body.clone());
+    let h2c_resp = match http2::upstream_mux::request_h2c_buffered(
+        target,
+        key.as_str(),
+        Duration::from_secs(security.backend_connect_timeout_secs),
+        Duration::from_secs(security.idle_connection_timeout_secs),
+        READ_TIMEOUT,
+        method,
+        path,
+        target.host.as_bytes(),
+        headers_iter,
+        body,
+        crate::http_utils::is_idempotent_method(method),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(status) => {
+            let msg: &[u8] = if status == 504 {
+                b"Gateway Timeout"
+            } else {
+                b"Bad Gateway"
+            };
+            return h2_emit_error(resp_tx, notify, status, msg).await;
         }
+    };
+    // F-166(B-2)/F-165(A3/A4): バックエンド応答の `Bytes` ヘッダをそのままムーブする
+    // （従来の `(k.clone(), v.clone())` ディープコピーを排除）。
+    let mut header_store: Vec<(Bytes, Bytes)> = h2c_resp.headers;
+    #[cfg(feature = "wasm")]
+    {
+        header_store =
+            apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store).await;
+    }
+    for (n, v) in h2_base_headers(true) {
+        header_store.push((n, v));
     }
 
-    match send_result {
-        Ok(h2c_resp) => {
-            if h2c_client.is_reusable() {
-                let max_idle = security.max_idle_connections_per_host;
-                let idle_timeout = security.idle_connection_timeout_secs;
-                // F-166(B-1)/F-165(A2): `&str` キーで返却。同一ホストへの返却
-                // （共通ケース）は `to_string()` を伴わない（`pool.rs` 参照）。
-                H2C_POOL.with(|p| p.borrow_mut().put(addr, h2c_client, max_idle, idle_timeout));
-            }
+    let has_body = !h2c_resp.body.is_empty();
+    let has_trailers = !h2c_resp.trailers.is_empty();
+    let status = h2c_resp.status;
+    let body_len = h2c_resp.body.len() as u64;
 
-            // F-166(B-2)/F-165(A3/A4): バックエンド応答の `Bytes` ヘッダをそのままムーブする
-            // （従来の `(k.clone(), v.clone())` ディープコピーを排除）。
-            let mut header_store: Vec<(Bytes, Bytes)> = h2c_resp.headers;
-            #[cfg(feature = "wasm")]
-            {
-                header_store =
-                    apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store)
-                        .await;
-            }
-            for (n, v) in h2_base_headers(true) {
-                header_store.push((n, v));
-            }
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status,
+            headers: header_store,
+            end_stream: !has_body && !has_trailers,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (status, 0);
+    }
 
-            let has_body = !h2c_resp.body.is_empty();
-            let has_trailers = !h2c_resp.trailers.is_empty();
-            let status = h2c_resp.status;
-            let body_len = h2c_resp.body.len() as u64;
-
-            if h2_send(
-                resp_tx,
-                notify,
-                H2RespMsg::Head {
-                    status,
-                    headers: header_store,
-                    end_stream: !has_body && !has_trailers,
-                },
-            )
+    if has_body
+        && h2_send(resp_tx, notify, H2RespMsg::Body(h2c_resp.body))
             .await
             .is_err()
-            {
-                return (status, 0);
-            }
+    {
+        return (status, body_len);
+    }
 
-            if has_body
-                && h2_send(resp_tx, notify, H2RespMsg::Body(h2c_resp.body))
-                    .await
-                    .is_err()
-            {
-                return (status, body_len);
-            }
-
-            if has_trailers {
-                #[cfg(feature = "grpc")]
-                {
-                    // gRPC トレイラー WASM フィルタ（F-133）: `grpc-status`/`grpc-message` の
-                    // 書き換えを許可する。`wasm_modules` が空なら早期 return（コスト増なし）。
-                    #[cfg(feature = "wasm")]
-                    let trailers =
-                        apply_h2_wasm_response_trailers(wasm_modules, h2c_resp.trailers).await;
-                    #[cfg(not(feature = "wasm"))]
-                    let trailers = h2c_resp.trailers;
-                    let mut grpc_status = 0u32;
-                    for (name, value) in &trailers {
-                        if name.as_ref() == b"grpc-status" as &[u8] {
-                            if let Ok(s) = std::str::from_utf8(value) {
-                                grpc_status = s.trim().parse().unwrap_or(0);
-                            }
-                        }
+    if has_trailers {
+        #[cfg(feature = "grpc")]
+        {
+            // gRPC トレイラー WASM フィルタ（F-133）: `grpc-status`/`grpc-message` の
+            // 書き換えを許可する。`wasm_modules` が空なら早期 return（コスト増なし）。
+            #[cfg(feature = "wasm")]
+            let trailers = apply_h2_wasm_response_trailers(wasm_modules, h2c_resp.trailers).await;
+            #[cfg(not(feature = "wasm"))]
+            let trailers = h2c_resp.trailers;
+            let mut grpc_status = 0u32;
+            for (name, value) in &trailers {
+                if name.as_ref() == b"grpc-status" as &[u8] {
+                    if let Ok(s) = std::str::from_utf8(value) {
+                        grpc_status = s.trim().parse().unwrap_or(0);
                     }
-                    // F-09: gRPC リクエストメトリクスを記録。
-                    let grpc_method = std::str::from_utf8(path).unwrap_or("");
-                    let mut status_buf = itoa::Buffer::new();
-                    let status_str = status_buf.format(grpc_status);
-                    crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
-                    let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
-                }
-                #[cfg(not(feature = "grpc"))]
-                {
-                    // gRPC feature 無効時はトレイラーをスキップ。
-                    let _ = &h2c_resp.trailers;
                 }
             }
-
-            (status, body_len)
+            // F-09: gRPC リクエストメトリクスを記録。
+            let grpc_method = std::str::from_utf8(path).unwrap_or("");
+            let mut status_buf = itoa::Buffer::new();
+            let status_str = status_buf.format(grpc_status);
+            crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
+            let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
         }
-        Err(e) => {
-            warn!("[HTTP/2] H2C request error ({}): {}", addr, e);
-            h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await
+        #[cfg(not(feature = "grpc"))]
+        {
+            // gRPC feature 無効時はトレイラーをスキップ。
+            let _ = &h2c_resp.trailers;
         }
     }
+
+    (status, body_len)
 }
 
 /// バックエンド HTTP/1.1 レスポンスを受信して [`H2RespMsg`] としてメインループへ流す（F-116）。
@@ -4014,36 +3973,6 @@ fn build_h2_compressed_file_response(
     };
 
     (header_store, response_body)
-}
-
-/// F-106: h2c バックエンドへ新規接続し HTTP/2 ハンドシェイクまで完了する。
-/// 失敗時は送出すべきステータス（502=接続/ハンドシェイク失敗, 504=接続タイムアウト）を返す。
-#[cfg(feature = "http2")]
-async fn h2c_connect_and_handshake(
-    addr: &str,
-) -> Result<http2::H2cClient<crate::runtime::tcp::TcpStream>, u16> {
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-    let backend_stream = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] H2C backend connect error ({}): {}", addr, e);
-            return Err(502);
-        }
-        Err(_) => {
-            warn!("[HTTP/2] H2C backend connect timeout ({})", addr);
-            return Err(504);
-        }
-    };
-    let settings = http2::Http2Settings::default();
-    let mut client = http2::H2cClient::new(backend_stream, settings);
-    if let Err(e) = client.handshake().await {
-        warn!("[HTTP/2] H2C handshake error ({}): {}", addr, e);
-        return Err(502);
-    }
-    Ok(client)
 }
 
 /// F-169 Part B: zstd 圧縮コンテキストをスレッドローカルに保持して使い回す。
@@ -7579,70 +7508,36 @@ async fn proxy_h2c(
     request_body: &[u8],
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
-    let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
-
-    // バックエンドに接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
+    // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）を使う
+    // （従来は要求ごとに TCP 接続 + HTTP/2 ハンドシェイクしていた）。
     let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
-    let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
-
-    let backend_stream = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            error!("H2C connect error to {}: {}", addr, e);
-            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-            return Some((client_stream, 502, 0, true));
-        }
-        Err(_) => {
-            error!("H2C connect timeout to {}", addr);
-            let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-            return Some((client_stream, 504, 0, true));
-        }
-    };
-
-    // H2Cクライアントを作成
-    let settings = http2::Http2Settings::default();
-    let mut h2c_client = http2::H2cClient::new(backend_stream, settings);
-
-    // HTTP/2 ハンドシェイク
-    if let Err(e) = h2c_client.handshake().await {
-        error!("H2C handshake error: {}", e);
-        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-        return Some((client_stream, 502, 0, true));
-    }
-
-    // リクエストを送信
-    let body = if request_body.is_empty() {
-        None
-    } else {
-        Some(request_body)
-    };
-    let authority = target.host.as_bytes();
-
-    // F-166/F-165(A2): `Bytes` ペアへのイテレータを直接渡す（中間 `Vec` の
-    // `collect()` を回避）。
-    let response = match h2c_client
-        .send_request(
-            method,
-            path,
-            authority,
-            headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
-            body,
-        )
-        .await
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let body = (!request_body.is_empty()).then(|| Bytes::copy_from_slice(request_body));
+    let response = match http2::upstream_mux::request_h2c_buffered(
+        target,
+        key.as_str(),
+        Duration::from_secs(security.backend_connect_timeout_secs),
+        Duration::from_secs(security.idle_connection_timeout_secs),
+        READ_TIMEOUT,
+        method,
+        path,
+        target.host.as_bytes(),
+        headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        body,
+        crate::http_utils::is_idempotent_method(method),
+    )
+    .await
     {
         Ok(resp) => resp,
-        Err(e) => {
-            error!("H2C request error: {}", e);
-            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+        Err(status) => {
+            error!("H2C request error to {}: {}", addr.as_str(), status);
+            let err_buf = if status == 504 {
+                ERR_MSG_GATEWAY_TIMEOUT.to_vec()
+            } else {
+                ERR_MSG_BAD_GATEWAY.to_vec()
+            };
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-            return Some((client_stream, 502, 0, true));
+            return Some((client_stream, status, 0, true));
         }
     };
 

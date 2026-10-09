@@ -2016,7 +2016,7 @@ impl H3BufferedTask {
     async fn handle_request(
         &mut self,
         headers: &[h3::Header],
-        request_body: &[u8],
+        request_body: &Bytes,
     ) -> io::Result<()> {
         #[cfg(feature = "wasm")]
         let mut wasm_modules_to_apply: Option<
@@ -2041,7 +2041,7 @@ impl H3BufferedTask {
     async fn handle_request_impl(
         &mut self,
         headers: &[h3::Header],
-        request_body: &[u8],
+        request_body: &Bytes,
         #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
             Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
         >,
@@ -2451,7 +2451,7 @@ impl H3BufferedTask {
                                 match crate::wasm::http_executor::apply_wasm_request_body(
                                     wasm_engine,
                                     &modules_to_apply,
-                                    Bytes::copy_from_slice(request_body),
+                                    request_body.clone(),
                                     true,
                                 )
                                 .await
@@ -2514,11 +2514,10 @@ impl H3BufferedTask {
 
                 // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
                 #[cfg(feature = "wasm")]
-                let effective_request_body: &[u8] = wasm_request_body_override
-                    .as_deref()
-                    .unwrap_or(request_body);
+                let effective_request_body: &Bytes =
+                    wasm_request_body_override.as_ref().unwrap_or(request_body);
                 #[cfg(not(feature = "wasm"))]
-                let effective_request_body: &[u8] = request_body;
+                let effective_request_body: &Bytes = request_body;
 
                 let result = self
                     .handle_proxy(
@@ -2697,7 +2696,7 @@ impl H3BufferedTask {
         req_path: &[u8],
         prefix: &[u8],
         headers: &[h3::Header],
-        request_body: &[u8],
+        request_body: &Bytes,
         #[cfg(feature = "wasm")] wasm_modules: Option<
             &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
         >,
@@ -3991,139 +3990,50 @@ async fn finish_h3_wasm_lifecycle(
     }
 }
 
-/// B-39/B-74: `proxy_to_h2c_backend_async` 用に新規 TCP 接続 + H2C ハンドシェイクを行う。
+/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等。バッファ型）
 ///
-/// プールミス時の新規接続と、プール接続での送信失敗時の再接続の両方から共有する。
-#[cfg(feature = "http2")]
-async fn h3_h2c_connect_and_handshake(
-    addr: &str,
-    timeout_secs: u64,
-) -> io::Result<crate::http2::H2cClient<crate::runtime::tcp::TcpStream>> {
-    use crate::http2::{H2cClient, Http2Settings};
-    use crate::runtime::tcp::TcpStream;
-
-    debug!("[HTTP/3] H2C connecting to backend {}", addr);
-
-    let connect_future = TcpStream::connect_str(addr);
-    let backend = match crate::runtime::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connect_future,
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] H2C backend connect error: {}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            warn!("[HTTP/3] H2C backend connect timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "H2C backend connect timeout",
-            ));
-        }
-    };
-    let _ = backend.set_nodelay(true);
-
-    let settings = Http2Settings::default();
-    let mut client = H2cClient::new(backend, settings);
-
-    if let Err(e) = client.handshake().await {
-        warn!("[HTTP/3] H2C handshake error: {}", e);
-        return Err(io::Error::other(format!("H2C handshake: {}", e)));
-    }
-
-    Ok(client)
-}
-
-/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
-///
-/// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
-///
-/// B-74: `proxy.rs` の `h2_proxy_h2c`（HTTP/2 経路）と同様、`crate::pool::H2C_POOL`
-/// （スレッドローカル）で上流 H2C 接続を再利用する。HTTP/3 のワーカースレッドと
-/// HTTP/2 のワーカースレッドは別スレッドであり、`H2C_POOL` はスレッドローカルなので
-/// 相互に干渉しない（同一スレッド内での再利用のみ）。プールが無かった旧実装は
-/// リクエストごとに TCP 接続 + ハンドシェイクを行い、高負荷時にエフェメラルポートを
-/// 枯渇させて `EADDRNOTAVAIL` を引き起こしていた。
+/// F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）でストリームを開き、
+/// レスポンスヘッダ + ボディ + trailers を返す（旧実装は 1 接続 1 ストリームの直列利用）。
 #[cfg(feature = "http2")]
 async fn proxy_to_h2c_backend_async(
     target: &ProxyTarget,
     method: &[u8],
     path: &[u8],
     headers: &[(Vec<u8>, Vec<u8>)],
-    request_body: &[u8],
+    request_body: &Bytes,
     timeout_secs: u64,
     security: &SecurityConfig,
 ) -> io::Result<BackendProxyResult> {
-    // F-41/B-74/F-170: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック
-    // 整形で排除しつつ、UDS バックエンド（unix:<path>）にも対応する。
+    // F-41/B-74/F-170: スタック整形（UDS バックエンドにも対応）。
     let addr = target.conn_addr();
-    let addr = addr.as_str();
-
-    let from_pool;
-    let mut client = match crate::pool::H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
-        Some(c) => {
-            from_pool = true;
-            c
-        }
-        None => {
-            from_pool = false;
-            h3_h2c_connect_and_handshake(addr, timeout_secs).await?
-        }
-    };
-
-    let body = if request_body.is_empty() {
-        None
-    } else {
-        Some(request_body)
-    };
-    let authority = target.host.as_bytes();
-    // F-166/F-165(A2): 中間 `Vec<(&[u8], &[u8])>` を作らずイテレータを直接渡す
-    // （送信失敗時の再試行のため、同じフィルタ済みイテレータをクロージャで再構築する）。
-    let headers_iter = || headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice()));
-
-    let mut response = crate::runtime::time::timeout(
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let body = (!request_body.is_empty()).then(|| request_body.clone());
+    let response = crate::http2::upstream_mux::request_h2c_buffered(
+        target,
+        key.as_str(),
+        Duration::from_secs(security.backend_connect_timeout_secs),
+        Duration::from_secs(security.idle_connection_timeout_secs),
         Duration::from_secs(timeout_secs),
-        client.send_request(method, path, authority, headers_iter(), body),
+        method,
+        path,
+        target.host.as_bytes(),
+        headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
+        body,
+        crate::http_utils::is_idempotent_method(method),
     )
-    .await;
-
-    // プール由来の接続は上流に既に切られている可能性がある（B-74）。送信が
-    // 失敗（エラー/タイムアウトいずれも）した場合、新規接続で 1 回だけ再試行する。
-    if from_pool && !matches!(response, Ok(Ok(_))) {
-        if let Ok(fresh) = h3_h2c_connect_and_handshake(addr, timeout_secs).await {
-            client = fresh;
-            response = crate::runtime::time::timeout(
-                Duration::from_secs(timeout_secs),
-                client.send_request(method, path, authority, headers_iter(), body),
-            )
-            .await;
+    .await
+    .map_err(|status| {
+        warn!(
+            "[HTTP/3] H2C request to {} failed: {}",
+            addr.as_str(),
+            status
+        );
+        if status == 504 {
+            io::Error::new(io::ErrorKind::TimedOut, "H2C request timeout")
+        } else {
+            io::Error::other("H2C request failed")
         }
-    }
-
-    let response = match response {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] H2C request error: {}", e);
-            return Err(io::Error::other(format!("H2C request: {}", e)));
-        }
-        Err(_) => {
-            warn!("[HTTP/3] H2C request timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "H2C request timeout",
-            ));
-        }
-    };
-
-    // 応答が取得できた接続は、再利用可能ならプールへ返却する。
-    if client.is_reusable() {
-        let max_idle = security.max_idle_connections_per_host;
-        let idle_timeout = security.idle_connection_timeout_secs;
-        crate::pool::H2C_POOL.with(|p| p.borrow_mut().put(addr, client, max_idle, idle_timeout));
-    }
+    })?;
 
     debug!(
         "[HTTP/3] H2C response: status={} body_len={} trailers={}",
@@ -4134,9 +4044,7 @@ async fn proxy_to_h2c_backend_async(
 
     Ok(BackendProxyResult {
         status_code: response.status,
-        // `H2cResponse` は F-166/F-165(A4) で `Bytes` 化されている。`BackendProxyResult`
-        // は本タスクの対象範囲外（HTTP/3 経路）のため型は変えず、境界で `Vec<u8>` へ
-        // 変換する（`Bytes` は一意参照なら `Vec::from` がコピー無しで引き取る）。
+        // `BackendProxyResult` は `Vec<u8>` 型（境界で変換。`Bytes` が一意参照ならコピー無し）。
         body: Vec::from(response.body),
         headers: response
             .headers
