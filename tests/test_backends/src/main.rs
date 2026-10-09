@@ -559,6 +559,13 @@ async fn main() {
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let tls_echo_addr: SocketAddr = format!("127.0.0.1:{}", tls_echo_port).parse().unwrap();
     let udp_echo_addr: SocketAddr = format!("127.0.0.1:{}", udp_echo_port).parse().unwrap();
+    // 2 つ目の echo（同じ実装）。上流接続プールのキーを分けて、並行テストと接続を取り合わない
+    // 検証（B-104 の HEAD 後の再利用）に使う。
+    let echo2_port: u16 = std::env::var("ECHO2_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9020);
+    let echo2_addr: SocketAddr = format!("127.0.0.1:{}", echo2_port).parse().unwrap();
 
     info!(
         "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, udp-echo={}, bad={}",
@@ -570,6 +577,7 @@ async fn main() {
         run_http_error_server(error_addr),
         run_chunked_server(chunked_addr),
         run_echo_server(echo_addr),
+        run_echo_server(echo2_addr),
         run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
         run_udp_echo_server(udp_echo_addr),
         run_bad_backend_server(bad_addr),

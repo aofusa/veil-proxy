@@ -25563,7 +25563,7 @@ async fn test_b104_http3_head_on_keepalive_upstream() {
     let head = send_http3_request_full(
         &mut send_request,
         "HEAD",
-        "/echo-upload/b104-head",
+        "/echo-head-ka/b104-head",
         &[],
         None,
     )
@@ -25579,7 +25579,7 @@ async fn test_b104_http3_head_on_keepalive_upstream() {
     let get = send_http3_request_full(
         &mut send_request,
         "GET",
-        "/echo-upload/b104-after-head",
+        "/echo-head-ka/b104-after-head",
         &[],
         None,
     )
