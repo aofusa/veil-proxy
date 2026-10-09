@@ -18585,7 +18585,7 @@ async fn test_http3_rate_limiting() {
     let mut success = 0u32;
     let mut limited = 0u32;
     for i in 0..40 {
-        match send_http3_request(&mut send_request, "GET", "/rate-limited/", &[], None).await {
+        match send_http3_request(&mut send_request, "GET", "/rate-limited-h3/", &[], None).await {
             Ok((status, _)) => match status {
                 200 => success += 1,
                 429 => {

@@ -787,7 +787,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `client_body_timeout_secs` | Client body receive timeout | 30s |
 | | `backend_connect_timeout_secs` | Backend connection timeout | 10s |
 | Access Control | `allowed_methods` | Allowed HTTP methods (array) | all allowed |
-| | `rate_limit_requests_per_min` | Request limit per minute | 0 (unlimited) |
+| | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
 | | `allowed_ips` | Allowed IP/CIDR (array) | all allowed |
 | | `denied_ips` | Denied IP/CIDR (array, takes priority) | none |
 | Connection Pool | `max_idle_connections_per_host` | Max idle connections per host | 256 |

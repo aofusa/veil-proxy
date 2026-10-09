@@ -308,9 +308,13 @@ pub fn check_security(
         }
     }
 
-    // レートリミットチェック
+    // レートリミットチェック（B-31: ルート × IP ごと、全ワーカー共通）
     if security.rate_limit_requests_per_min > 0
-        && !check_rate_limit(client_ip, security.rate_limit_requests_per_min)
+        && !check_rate_limit(
+            security as *const SecurityConfig as usize,
+            client_ip,
+            security.rate_limit_requests_per_min,
+        )
     {
         return SecurityCheckResult::RateLimitExceeded;
     }
@@ -5471,7 +5475,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                 // レートリミットチェック
                 if security.rate_limit_requests_per_min > 0
-                    && !check_rate_limit(client_ip, security.rate_limit_requests_per_min)
+                    && !check_rate_limit(
+                        security as *const SecurityConfig as usize,
+                        client_ip,
+                        security.rate_limit_requests_per_min,
+                    )
                 {
                     let err_buf = ERR_MSG_TOO_MANY_REQUESTS.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;

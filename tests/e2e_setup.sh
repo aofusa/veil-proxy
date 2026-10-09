@@ -1001,6 +1001,17 @@ upstream = "backend-pool"
 [route.security]
 rate_limit_requests_per_min = 10
 
+# B-31: レート制限は全ワーカー共通・ルートごとに数えるため、HTTP/3 の E2E は専用ルートを使う
+# （HTTP/1.1 の E2E と同じ分に同じルートを叩くと上限を使い切っている）
+[[route]]
+[route.conditions]
+path = "/rate-limited-h3/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+rate_limit_requests_per_min = 10
+
 [[route]]
 [route.conditions]
 host = "127.0.0.1"

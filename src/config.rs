@@ -16,7 +16,6 @@ use once_cell::sync::Lazy;
 use rustls::ServerConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -2116,135 +2115,165 @@ pub async fn drain_connections(worker_type: &str, thread_id: usize) {
 }
 
 // ====================
-// レートリミッター（スライディングウィンドウ方式）
+// レートリミッター（スライディングウィンドウ方式、プロセス共有。B-31）
 // ====================
 //
-// クライアントIPごとに分間リクエスト数を追跡します。
-// スレッドローカルで管理し、ロックフリーで高パフォーマンスを実現。
+// クライアント IP ごとの分間リクエスト数を、**全ワーカーで共有する固定サイズの表**で数える。
+// 従来はワーカーごとの `thread_local!` だったため、設定した「IP あたり N 回/分」が
+// ワーカー数倍まで通っていた（B-31）。
+//
+// - 表は 65,536 スロットの `AtomicU64`（512KB）。レートリミットを使う最初の要求で確保する。
+// - スロットは IP のハッシュ（プロセスごとの乱数シード）で選ぶ。別の IP と同じスロットに
+//   入った場合はカウントを共有する（= わずかに厳しめに倒れる。上限を超えて通すことはない）。
+// - 各スロットは `(分, 今の分の件数, 前の分の件数)` を 64bit に詰め、CAS 1 回で更新する。
+//   要求ごとの確保は無い（従来は新しい IP ごとに `to_string()` していた）。
+// - 推定レートは従来と同じスライディングウィンドウ:
+//   `前の分の件数 × (今の分の残り秒 / 60) + 今の分の件数`
 // ====================
 
-/// レートリミットのエントリ
-pub struct RateLimitEntry {
-    /// 現在のウィンドウ（分）のリクエスト数
-    pub current_count: u32,
-    /// 前のウィンドウ（分）のリクエスト数
-    pub previous_count: u32,
-    /// 現在のウィンドウの開始時刻（分単位のタイムスタンプ）
-    pub current_minute: u64,
+/// 表のスロット数（2 の冪）。
+const RATE_SLOTS: usize = 1 << 16;
+
+struct RateTable {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
+    hasher: foldhash::quality::RandomState,
 }
 
-impl RateLimitEntry {
-    pub fn new(current_minute: u64) -> Self {
-        Self {
-            current_count: 1,
-            previous_count: 0,
-            current_minute,
-        }
-    }
+static RATE_TABLE: std::sync::LazyLock<RateTable> = std::sync::LazyLock::new(|| RateTable {
+    slots: (0..RATE_SLOTS)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect(),
+    hasher: foldhash::quality::RandomState::default(),
+});
 
-    /// リクエストを記録し、現在のレートを返す（スライディングウィンドウ方式）
-    /// 返り値: 推定される分間リクエスト数
-    pub fn record_request(&mut self, now_minute: u64, now_second_in_minute: u32) -> u32 {
-        if now_minute > self.current_minute {
-            if now_minute == self.current_minute + 1 {
-                // 次の分に移行
-                self.previous_count = self.current_count;
-                self.current_count = 1;
-            } else {
-                // 2分以上経過 - リセット
-                self.previous_count = 0;
-                self.current_count = 1;
-            }
-            self.current_minute = now_minute;
+/// スロットの値 `(分, 今の分の件数, 前の分の件数)` を詰める（分は下位 32bit）。
+#[inline]
+fn rate_pack(minute: u32, current: u16, previous: u16) -> u64 {
+    (minute as u64) | ((current as u64) << 32) | ((previous as u64) << 48)
+}
+
+#[inline]
+fn rate_unpack(v: u64) -> (u32, u16, u16) {
+    (v as u32, (v >> 32) as u16, (v >> 48) as u16)
+}
+
+/// スロットへ 1 件記録し、推定レート（スライディングウィンドウ）を返す。
+fn rate_record(slot: &std::sync::atomic::AtomicU64, minute: u32, second_in_minute: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    let mut old = slot.load(Ordering::Relaxed);
+    loop {
+        let (m, cur, prev) = rate_unpack(old);
+        let (cur2, prev2) = if m == minute {
+            (cur.saturating_add(1), prev)
+        } else if m.wrapping_add(1) == minute {
+            (1, cur)
         } else {
-            self.current_count += 1;
-        }
-
-        // スライディングウィンドウによる推定レート計算
-        // 現在の分の経過割合に基づいて重み付け
-        let weight = (60 - now_second_in_minute) as f32 / 60.0;
-        let estimated = (self.previous_count as f32 * weight) + self.current_count as f32;
-        estimated.ceil() as u32
-    }
-}
-
-/// スレッドローカルなレートリミットマップ
-/// キー: クライアントIPアドレス（文字列）
-/// 値: RateLimitEntry
-pub struct RateLimiter {
-    pub entries: HashMap<String, RateLimitEntry>,
-    pub last_cleanup: std::time::Instant,
-}
-
-impl RateLimiter {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            last_cleanup: std::time::Instant::now(),
-        }
-    }
-
-    /// リクエストをチェックし、レート制限を超えていないか確認
-    /// 戻り値: (許可されたか, 現在のレート)
-    ///
-    /// ## パフォーマンス最適化
-    ///
-    /// SystemTime::now()の代わりにCoarse Timerを使用してシステムコールを削減。
-    /// 100ms程度の精度低下は、レートリミットの用途では許容範囲。
-    fn check_and_record(&mut self, client_ip: &str, limit: u64) -> (bool, u32) {
-        // 定期的なクリーンアップ（5分ごと）
-        if self.last_cleanup.elapsed().as_secs() > 300 {
-            self.cleanup();
-            self.last_cleanup = std::time::Instant::now();
-        }
-
-        // Coarse Timerから現在時刻を取得（システムコール削減）
-        // OffsetDateTime から Unix タイムスタンプを計算
-        let now_time = coarse_now();
-        let now_secs = now_time.unix_timestamp() as u64;
-        let now_minute = now_secs / 60;
-        let now_second_in_minute = (now_secs % 60) as u32;
-
-        let rate = if let Some(entry) = self.entries.get_mut(client_ip) {
-            entry.record_request(now_minute, now_second_in_minute)
-        } else {
-            self.entries
-                .insert(client_ip.to_string(), RateLimitEntry::new(now_minute));
-            1
+            (1, 0)
         };
-
-        (rate as u64 <= limit, rate)
-    }
-
-    /// 古いエントリをクリーンアップ
-    ///
-    /// Coarse Timerを使用してシステムコールを削減。
-    fn cleanup(&mut self) {
-        // Coarse Timerから現在時刻を取得
-        let now_time = coarse_now();
-        let now_minute = now_time.unix_timestamp() as u64 / 60;
-
-        // 2分以上古いエントリを削除
-        self.entries
-            .retain(|_, entry| now_minute.saturating_sub(entry.current_minute) < 2);
+        match slot.compare_exchange_weak(
+            old,
+            rate_pack(minute, cur2, prev2),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                let weight = 60u32.saturating_sub(second_in_minute) as u64;
+                // ceil(prev × weight / 60) + cur
+                let carried = (prev2 as u64 * weight).div_ceil(60);
+                return (carried + cur2 as u64).min(u32::MAX as u64) as u32;
+            }
+            Err(actual) => old = actual,
+        }
     }
 }
 
-thread_local! {
-    static RATE_LIMITER: RefCell<RateLimiter> = RefCell::new(RateLimiter::new());
-}
-
-/// レートリミットをチェック
-/// 戻り値: レート制限内であればtrue
-pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
+/// レートリミットをチェック（全ワーカー共有）。
+///
+/// `zone` はルートごとの識別子（呼び出し側はルートの `SecurityConfig` のアドレスを渡す）。
+/// 件数は `(ルート, IP)` ごとに数える（あるルートへの要求が別のルートの上限を消費しない。
+/// nginx の `limit_req` のゾーンと同じ考え方）。設定のリロードで新しいルートになると数え直す。
+/// 戻り値: レート制限内であれば true
+pub fn check_rate_limit(zone: usize, client_ip: &str, limit: u64) -> bool {
     if limit == 0 {
         return true; // 0 = 無制限
     }
+    let table = &*RATE_TABLE;
+    let idx = (std::hash::BuildHasher::hash_one(&table.hasher, (zone, client_ip)) as usize)
+        & (RATE_SLOTS - 1);
+    // Coarse Timer（システムコール削減。精度 100ms 程度で十分）
+    let now_secs = coarse_now().unix_timestamp() as u64;
+    let rate = rate_record(
+        &table.slots[idx],
+        (now_secs / 60) as u32,
+        (now_secs % 60) as u32,
+    );
+    rate as u64 <= limit
+}
 
-    RATE_LIMITER.with(|limiter| {
-        let (allowed, _rate) = limiter.borrow_mut().check_and_record(client_ip, limit);
-        allowed
-    })
+#[cfg(test)]
+mod b31_rate_limit_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn pack_roundtrip() {
+        let v = rate_pack(29_000_000, 123, 65_535);
+        assert_eq!(rate_unpack(v), (29_000_000, 123, 65_535));
+    }
+
+    /// 同じ分は加算、次の分は前の分へ繰り越し、2 分以上空いたらリセット。
+    #[test]
+    fn sliding_window() {
+        let slot = AtomicU64::new(0);
+        for _ in 0..10 {
+            rate_record(&slot, 100, 0);
+        }
+        assert_eq!(
+            rate_unpack(slot.load(std::sync::atomic::Ordering::Relaxed)).1,
+            10
+        );
+        // 次の分の 30 秒目: 前の分 10 件の半分（5）+ 今の分 1 件。
+        assert_eq!(rate_record(&slot, 101, 30), 6);
+        // 分の終わり近く: 繰り越しはほぼ 0（切り上げで 1）+ 今の分 2 件。
+        assert_eq!(rate_record(&slot, 101, 59), 3);
+        // 2 分以上空いたらリセット。
+        assert_eq!(rate_record(&slot, 105, 0), 1);
+    }
+
+    /// 全ワーカー共有: 別スレッドからの要求も同じ IP として数える。
+    #[test]
+    fn shared_across_threads() {
+        let ip = "203.0.113.77";
+        let limit = 40;
+        let allowed: usize = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    (0..20).filter(|_| check_rate_limit(1, ip, limit)).count()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        // 4 スレッド × 20 = 80 件のうち、通るのは上限（40）まで（分の境目をまたぐと
+        // 前の分の繰り越しで少し減ることがあるので上限側だけを厳密に見る）。
+        assert!(
+            allowed <= limit as usize,
+            "allowed {} > limit {}",
+            allowed,
+            limit
+        );
+        assert!(allowed >= 1);
+    }
+
+    /// ルート（zone）が違えば件数は別々に数える。
+    #[test]
+    fn zones_are_independent() {
+        let ip = "198.51.100.9";
+        assert!((0..5).all(|_| check_rate_limit(11, ip, 5)));
+        assert!(!check_rate_limit(11, ip, 5));
+        assert!(check_rate_limit(12, ip, 5));
+    }
 }
 
 // ====================

@@ -1823,6 +1823,7 @@ revalidate_mtime = false
 # allowed_methods = ["GET", "POST", "PUT"]
 # max_request_body_size = 5_242_880
 # backend_connect_timeout_secs = 10
+# # クライアント IP・ルートごと、全ワーカー共通の分間上限（B-31。0 = 無制限）
 # rate_limit_requests_per_min = 60
 
 # --- [route.security] のその他の設定キー（デフォルト値と説明） ---

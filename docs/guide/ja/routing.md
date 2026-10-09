@@ -786,7 +786,7 @@ sandbox_tmpfs_mounts = ["/tmp"]
 | | `client_body_timeout_secs` | クライアントボディ受信タイムアウト | 30秒 |
 | | `backend_connect_timeout_secs` | バックエンド接続タイムアウト | 10秒 |
 | アクセス制御 | `allowed_methods` | 許可するHTTPメソッド（配列） | すべて許可 |
-| | `rate_limit_requests_per_min` | 分間リクエスト数上限 | 0（無制限） |
+| | `rate_limit_requests_per_min` | **クライアント IP・ルートごと、全ワーカー共通**の分間リクエスト数上限（B-31: プロセス共有の 65,536 スロットのアトミック表によるスライディングウィンドウ。あるルートへの要求は別のルートの上限を消費しない。同じスロットに入ったキーはカウントを共有するため、上限は厳しくなる方向にしかずれない） | 0（無制限） |
 | | `allowed_ips` | 許可するIP/CIDR（配列） | すべて許可 |
 | | `denied_ips` | 拒否するIP/CIDR（配列、優先） | なし |
 | コネクションプール | `max_idle_connections_per_host` | ホストごとの最大アイドル接続数 | 256 |
