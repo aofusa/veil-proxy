@@ -31,3 +31,8 @@ libc の upstream が修正されたら、この vendoring は削除してよい
 path 依存では依存クレートの lint が cap されず、`cfg_aliases!` マクロ内部の警告が出続けるため、
 同じ cfg 別名（`apple` / `bsd` / `solarish` / `apple_fast` / `apple_slow` / `wasm_browser`）を
 `build.rs` で直接定義し、`[build-dependencies] cfg_aliases` を外した。
+
+### `src/unix.rs`: 未使用 import
+
+`use std::ptr;` は Linux の `recvmmsg` 経路でしか使われず、BSD では未使用警告になる（path 依存では表示される）。
+使用箇所を `std::ptr::null_mut` に書き換えて import を削除した。

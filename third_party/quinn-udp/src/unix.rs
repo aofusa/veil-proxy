@@ -1,5 +1,4 @@
 #[cfg(not(any(apple, target_os = "openbsd", solarish)))]
-use std::ptr;
 use std::{
     io::{self, IoSliceMut},
     mem::{self, MaybeUninit},
@@ -482,7 +481,7 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
                 hdrs.as_mut_ptr(),
                 bufs.len().min(BATCH_SIZE) as _,
                 0,
-                ptr::null_mut::<libc::timespec>(),
+                std::ptr::null_mut::<libc::timespec>(),
             )
         };
 

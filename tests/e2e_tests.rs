@@ -140,8 +140,8 @@ const PROXY_L4_UDP_PORT: u16 = 8447; // L4 UDP プロキシ（セッションテ
 // 同じ条件で cfg しないと、`wasm` を含まない feature 構成で dead_code 警告になる。
 #[cfg(all(feature = "l4-proxy", feature = "wasm"))]
 const PROXY_L4_WASM_PORT: u16 = 8448;
-// http3 を外したビルド（B-62 の `full-netbsd-no-http3`）では参照元が全て消えるため、
-// 近隣の PROXY_L4_WASM_PORT と同じく feature でゲートする。
+// http3 を外したビルドでは参照元が全て消えるため、近隣の PROXY_L4_WASM_PORT と同じく
+// feature でゲートする。
 #[cfg(feature = "http3")]
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
