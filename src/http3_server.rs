@@ -1398,6 +1398,10 @@ impl Http3Handler {
             use_tls,
             sni,
             tls_insecure,
+            pool_max_idle: security.max_idle_connections_per_host,
+            pool_idle_timeout_secs: security.idle_connection_timeout_secs,
+            no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+            retry_idempotent: crate::http_utils::is_idempotent_method(method),
         })
     }
 
@@ -2511,11 +2515,27 @@ impl Http3Handler {
                 request.extend_from_slice(b"\r\n");
             }
 
-            request.extend_from_slice(b"Connection: close\r\n\r\n");
+            // B-104: `Connection: close` は付けない（上流接続はワーカーのプールで再利用する）。
+            request.extend_from_slice(b"\r\n");
             request.extend_from_slice(request_body);
 
-            let tls_insecure = upstream_group.tls_insecure();
-            proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await
+            let cfg = crate::http3_stream::BufferedExchange {
+                target,
+                timeout_secs,
+                tls_insecure: upstream_group.tls_insecure(),
+                pool_max_idle: security.max_idle_connections_per_host,
+                pool_idle_timeout_secs: security.idle_connection_timeout_secs,
+                no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+                idempotent: crate::http_utils::is_idempotent_method(method),
+            };
+            crate::http3_stream::exchange_buffered(&cfg, Bytes::from(request))
+                .await
+                .map(|r| BackendProxyResult {
+                    status_code: r.status,
+                    body: r.body,
+                    headers: r.headers,
+                    trailers: Vec::new(),
+                })
         };
 
         server.release();
@@ -3194,7 +3214,8 @@ fn merge_response_headers_and_trailers(
 /// ボディフレーミング（`Transfer-Encoding: chunked` か無しか）と末尾の空行は、**実際に
 /// ボディデータが来たか**をバックエンドタスクが判定してから付与する（HTTP/3 では HEADERS
 /// 受信時点でボディ有無が確定しないため。例: h3 クライアントが HEADERS と fin を別送する GET は
-/// `more_frames=true` でもボディなし）。`Connection: close` で 1 リクエスト 1 接続。
+/// `more_frames=true` でもボディなし）。B-104: `Connection: close` は付けない（HTTP/1.1 の既定の
+/// キープアライブで上流接続をワーカーのプールへ返して再利用する）。
 fn build_h1_request_head(
     target: &ProxyTarget,
     method: &[u8],
@@ -3234,7 +3255,6 @@ fn build_h1_request_head(
     }
 
     // ボディフレーミングと末尾空行はタスク側で付与する。
-    req.extend_from_slice(b"Connection: close\r\n");
     req
 }
 
@@ -3659,454 +3679,6 @@ pub struct BackendProxyResult {
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// HTTP/2 trailers（H2C/gRPC 用。H1 バックエンドでは空）
     pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-pub(crate) async fn proxy_to_backend_async_with_tls(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    use crate::runtime::handle::AsRawFd;
-    use crate::runtime::tcp::TcpStream;
-
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。この経路は非同期 `connect_str` を
-    // 使うため `unix:` 接頭辞をそのまま扱える。
-    let addr = target.conn_addr();
-    let addr = addr.as_str();
-    debug!("[HTTP/3] Async connecting to backend {}", addr);
-
-    // 非同期TCP接続（タイムアウト付き）
-    let connect_future = TcpStream::connect_str(addr);
-    let backend = match crate::runtime::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connect_future,
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] Async backend connect error: {}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            warn!("[HTTP/3] Async backend connect timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Backend connect timeout",
-            ));
-        }
-    };
-
-    debug!("[HTTP/3] Async connected to backend {}", addr);
-    let _ = backend.set_nodelay(true);
-
-    // TLSバックエンドの場合
-    if target.use_tls {
-        return proxy_to_tls_backend_async(target, request, backend, timeout_secs, tls_insecure)
-            .await;
-    }
-
-    let fd = backend.as_raw_fd();
-
-    // リクエスト送信（非同期）
-    let mut written = 0;
-    while written < request.len() {
-        match write_nonblocking(fd, &request[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Ok(_) => {
-                backend.writable().await?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                backend.writable().await?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    debug!("[HTTP/3] Async request sent: {} bytes", written);
-
-    // レスポンス受信（非同期）
-    let mut response = Vec::with_capacity(16384);
-    let mut buf = vec![0u8; 8192];
-    let read_timeout = Duration::from_secs(timeout_secs);
-    let start_time = std::time::Instant::now();
-
-    loop {
-        if start_time.elapsed() > read_timeout {
-            break;
-        }
-
-        match read_nonblocking(fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = read_timeout.saturating_sub(start_time.elapsed());
-                if remaining.is_zero() {
-                    break;
-                }
-                match crate::runtime::time::timeout(remaining, backend.readable()).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(e)) if response.is_empty() => return Err(e),
-                    _ => break,
-                }
-            }
-            Err(e) if response.is_empty() => return Err(e),
-            Err(_) => break,
-        }
-    }
-
-    debug!("[HTTP/3] Async response received: {} bytes", response.len());
-    parse_http_response(&response)
-}
-
-/// TLSバックエンドへの非同期プロキシ処理（kTLS版）
-/// kTLS/rustlsフォールバック問題を回避するため spawn_blocking で std TLS 接続を使用
-#[cfg(veil_ktls)]
-// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
-#[allow(clippy::disallowed_methods)]
-async fn proxy_to_tls_backend_async(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    tcp_stream: crate::runtime::tcp::TcpStream,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
-    drop(tcp_stream);
-
-    let skip_verify = tls_insecure;
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
-    let addr = target.conn_addr().as_str().to_string();
-    let sni_name = target
-        .sni_name
-        .as_deref()
-        .unwrap_or(&target.host)
-        .to_string();
-
-    use rustls::ClientConfig;
-    use std::sync::Arc;
-
-    let config: Arc<ClientConfig> = if skip_verify {
-        #[derive(Debug)]
-        struct NoVerify;
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &[rustls::pki_types::CertificateDer<'_>],
-                _: &rustls::pki_types::ServerName<'_>,
-                _: &[u8],
-                _: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                crate::tls_provider::provider::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-                    .to_vec()
-            }
-        }
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
-    } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
-    };
-
-    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let result = (|| -> io::Result<BackendProxyResult> {
-            let timeout = Duration::from_secs(timeout_secs);
-            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
-            // 同じ列挙を重複実装しない）。
-            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
-                warn!("[HTTP/3] std backend connect error: {}", e);
-                e
-            })?;
-            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            let mut conn = rustls::ClientConnection::new(config, server_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
-            tls.write_all(&request)?;
-            let mut response = Vec::with_capacity(16384);
-            let mut buf = [0u8; 8192];
-            // UnexpectedEof は TLS close_notify なしの正常な接続終了（HTTP/1.1 バックエンドで一般的）
-            loop {
-                match std::io::Read::read(&mut tls, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            parse_http_response(&response)
-        })();
-        let _ = tx.send(result);
-    });
-
-    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::other("backend thread died"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "backend TLS timeout",
-                    ));
-                }
-                crate::runtime::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-    }
-}
-
-/// TLSバックエンドへの非同期プロキシ処理（non-kTLS）
-/// 別スレッドでブロッキング TLS 通信を行う
-#[cfg(not(veil_ktls))]
-// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
-#[allow(clippy::disallowed_methods)]
-async fn proxy_to_tls_backend_async(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    tcp_stream: crate::runtime::tcp::TcpStream,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    use rustls::ClientConfig;
-    use std::sync::Arc;
-
-    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
-    drop(tcp_stream);
-
-    let skip_verify = tls_insecure;
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
-    let addr = target.conn_addr().as_str().to_string();
-    let sni_name = target
-        .sni_name
-        .as_deref()
-        .unwrap_or(&target.host)
-        .to_string();
-
-    let config: Arc<ClientConfig> = if skip_verify {
-        #[derive(Debug)]
-        struct NoVerify;
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &[rustls::pki_types::CertificateDer<'_>],
-                _: &rustls::pki_types::ServerName<'_>,
-                _: &[u8],
-                _: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                crate::tls_provider::provider::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-                    .to_vec()
-            }
-        }
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
-    } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
-    };
-
-    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let result = (|| -> io::Result<BackendProxyResult> {
-            let timeout = Duration::from_secs(timeout_secs);
-            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
-            // 同じ列挙を重複実装しない）。
-            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
-                warn!("[HTTP/3] std backend connect error: {}", e);
-                e
-            })?;
-            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            let mut conn = rustls::ClientConnection::new(config, server_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
-            tls.write_all(&request)?;
-            let mut response = Vec::with_capacity(16384);
-            // `read_to_end` は rustls の «close_notify なしの EOF» をエラーとして
-            // 伝播させてしまい、HTTP/3 → TLS バックエンドのプロキシが 502 になる
-            // （B-54）。close_notify を送らずに閉じるバックエンドは HTTP/1.1 では
-            // ごく普通なので、kTLS 版と同じく UnexpectedEof は正常終了として扱う。
-            let mut buf = [0u8; 8192];
-            loop {
-                match std::io::Read::read(&mut tls, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            parse_http_response(&response)
-        })();
-        let _ = tx.send(result);
-    });
-
-    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::other("backend thread died"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "backend TLS timeout",
-                    ));
-                }
-                crate::runtime::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-    }
-}
-
-#[inline]
-fn read_nonblocking(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::read(
-            fd as libc::c_int,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len() as _,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
-
-#[inline]
-fn write_nonblocking(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::write(
-            fd as libc::c_int,
-            buf.as_ptr() as *const libc::c_void,
-            buf.len() as _,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
-
-fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
-    let header_end = find_header_end(response)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP response"))?;
-
-    let header_bytes = &response[..header_end];
-    let body = response[header_end + 4..].to_vec();
-    let status_code = parse_status_code(header_bytes).unwrap_or(502);
-
-    let mut headers = Vec::new();
-    if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
-        for line in header_bytes[first_crlf + 1..].split(|&b| b == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(colon_pos) = memchr::memchr(b':', line) {
-                let name = &line[..colon_pos];
-                let value = line[colon_pos + 1..]
-                    .strip_prefix(b" ")
-                    .unwrap_or(&line[colon_pos + 1..]);
-                if !name.eq_ignore_ascii_case(b"connection")
-                    && !name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !name.eq_ignore_ascii_case(b"keep-alive")
-                {
-                    headers.push((name.to_vec(), value.to_vec()));
-                }
-            }
-        }
-    }
-
-    Ok(BackendProxyResult {
-        status_code,
-        body,
-        headers,
-        trailers: Vec::new(),
-    })
 }
 
 /// B-38: HTTP/3 経路で WASM on_response_headers を適用する
@@ -5952,29 +5524,6 @@ pub(crate) fn compress_body_h3(
     body.to_vec()
 }
 
-/// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// HTTPレスポンスからステータスコードをパース
-fn parse_status_code(header: &[u8]) -> Option<u16> {
-    // "HTTP/1.1 200 OK" のような形式
-    let header_str = std::str::from_utf8(header).ok()?;
-    let first_line = header_str.lines().next()?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() >= 2 {
-        parts[1].parse().ok()
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6501,38 +6050,6 @@ mod tests {
         assert!(!compressed
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
-    }
-
-    /// parse_http_response: 正常系と trailers 空
-    #[test]
-    fn test_parse_http_response_basic() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
-        let r = parse_http_response(raw).expect("parse");
-        assert_eq!(r.status_code, 200);
-        assert_eq!(r.body, b"hello");
-        assert!(r.trailers.is_empty());
-        assert!(r
-            .headers
-            .iter()
-            .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type") && v == b"text/plain"));
-    }
-
-    /// parse_http_response: 不正レスポンスは Err
-    #[test]
-    fn test_parse_http_response_invalid() {
-        let raw = b"not-http-at-all";
-        assert!(parse_http_response(raw).is_err());
-    }
-
-    /// find_header_end / parse_status_code
-    #[test]
-    fn test_parse_status_and_header_end() {
-        assert_eq!(find_header_end(b"HTTP/1.1 404 N\r\n\r\n"), Some(14));
-        assert_eq!(
-            parse_status_code(b"HTTP/1.1 502 Bad Gateway\r\n"),
-            Some(502)
-        );
-        assert_eq!(parse_status_code(b"garbage"), None);
     }
 
     /// B-38: モジュール空ならヘッダをそのまま返す（WASM エンジン不要）

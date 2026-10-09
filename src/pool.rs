@@ -384,7 +384,7 @@ fn peek_pooled_peer(fd: crate::runtime::handle::RawFd) -> PooledPeerState {
 /// `reject_unread_data`: 平文 HTTP では未読データ＝前応答の残骸（`Content-Length` を
 /// 超えて送ってきた等）なので、再利用すると次の応答とずれる。TLS では上流が送る
 /// post-handshake メッセージ（TLS 1.3 の NewSessionTicket 等）が正当に残り得るため破棄しない。
-fn pooled_conn_reusable(
+pub(crate) fn pooled_conn_reusable(
     created_at: std::time::Instant,
     idle_timeout_secs: u64,
     fd: crate::runtime::handle::RawFd,

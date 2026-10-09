@@ -89,15 +89,14 @@ impl io::Write for ProbeStream {
 /// connect はローカルで即時完了するためタイムアウトの必要性が低い）。それ以外は
 /// **まず `SocketAddr` としてパースし、失敗したらホスト名として同期 `getaddrinfo`
 /// （`ToSocketAddrs`）で解決して最初のアドレスを使う**。ホスト名解決はここでのみ
-/// 発生し、呼び出し元はヘルスチェック専用スレッド／`http3_server.rs` の同期 TLS
-/// バックエンド専用スレッドに限られる（いずれもイベントループ外で実行されるため、
-/// AGENTS.md のホットパス絶対規則「同期処理禁止」には抵触しない）。
+/// 発生し、呼び出し元はヘルスチェック専用スレッドに限られる（イベントループ外で
+/// 実行されるため、AGENTS.md のホットパス絶対規則「同期処理禁止」には抵触しない）。
+/// 以前は `http3_server.rs` の同期 TLS バックエンド専用スレッドも使っていたが、
+/// B-105 で非同期経路へ置き換えた。
 ///
-/// この関数は `http3_server.rs::proxy_to_tls_backend_async` が本来呼んでいた
-/// **旧 `std::net::TcpStream::connect(&addr as &str)`（`&str` の `ToSocketAddrs` 実装
-/// による DNS 解決）を引き継ぐもの**である。F-170 導入時に一度 `addr.parse::<SocketAddr>()`
-/// のみへ簡略化してしまい、ホスト名指定の HTTPS バックエンド（`backend.example.com:8080`）
-/// へ HTTP/3 経由で中継できなくなる退行を生んでいたため、ここで DNS 解決を復元する。
+/// F-170 導入時に一度 `addr.parse::<SocketAddr>()` のみへ簡略化してしまい、ホスト名指定の
+/// HTTPS バックエンド（`backend.example.com:8080`）へ HTTP/3 経由で中継できなくなる退行を
+/// 生んでいたため、DNS 解決を残している。
 ///
 /// **副次的な改善**: 旧ヘルスチェック実装（`perform_health_check` 等）は
 /// `addr.parse().unwrap_or_else(|_| 127.0.0.1:80)` により、ホスト名を指定した上流に

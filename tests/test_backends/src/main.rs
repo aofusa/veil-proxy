@@ -310,8 +310,9 @@ async fn run_echo_server(addr: SocketAddr) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!("New echo HTTP connection from {}", peer);
+                let conn_id = next_echo_conn_id();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_echo(stream).await {
+                    if let Err(e) = serve_echo(stream, conn_id).await {
                         debug!("Echo handler error: {}", e);
                     }
                 });
@@ -348,10 +349,11 @@ async fn run_tls_echo_server(addr: SocketAddr, cert_path: String, key_path: Stri
             Ok((stream, peer)) => {
                 debug!("New echo HTTPS connection from {}", peer);
                 let acceptor = acceptor.clone();
+                let conn_id = next_echo_conn_id();
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
                         Ok(tls) => {
-                            if let Err(e) = handle_echo(tls).await {
+                            if let Err(e) = serve_echo(tls, conn_id).await {
                                 debug!("TLS echo handler error: {}", e);
                             }
                         }
@@ -364,7 +366,26 @@ async fn run_tls_echo_server(addr: SocketAddr, cert_path: String, key_path: Stri
     }
 }
 
-async fn handle_echo<S>(mut stream: S) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+/// echo 接続の通し番号（B-104: 上流接続の再利用を E2E で観測するため応答ヘッダで返す）。
+fn next_echo_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 1 接続でキープアライブの要求を順に処理する（要求に `Connection: close` があれば閉じる）。
+async fn serve_echo<S>(mut stream: S, conn_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while handle_echo(&mut stream, conn_id).await? {}
+    Ok(())
+}
+
+/// 要求を 1 つ処理する。戻り値は接続を続けるか。
+async fn handle_echo<S>(
+    stream: &mut S,
+    conn_id: u64,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -375,7 +396,7 @@ where
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return Ok(());
+            return Ok(false);
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -383,11 +404,13 @@ where
             break;
         }
         if buf.len() > 1 << 20 {
-            return Ok(()); // ヘッダーが大きすぎる
+            return Ok(false); // ヘッダーが大きすぎる
         }
     }
 
     let header_str = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+    let close_requested = header_str.contains("\r\nconnection: close");
+    let is_head = header_str.starts_with("head ");
     let is_chunked = header_str.contains("transfer-encoding: chunked");
     let content_length: Option<usize> = header_str
         .split("content-length:")
@@ -464,12 +487,19 @@ where
         b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ",
     );
     out.extend_from_slice(body.len().to_string().as_bytes());
-    out.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
-    out.extend_from_slice(&body);
+    out.extend_from_slice(b"\r\nx-backend-conn-id: ");
+    out.extend_from_slice(conn_id.to_string().as_bytes());
+    if close_requested {
+        out.extend_from_slice(b"\r\nConnection: close");
+    }
+    out.extend_from_slice(b"\r\n\r\n");
+    if !is_head {
+        out.extend_from_slice(&body);
+    }
 
     stream.write_all(&out).await?;
     stream.flush().await?;
-    Ok(())
+    Ok(!close_requested)
 }
 
 #[tokio::main]

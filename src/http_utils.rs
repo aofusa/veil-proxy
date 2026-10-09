@@ -1744,6 +1744,38 @@ pub(crate) fn status_code_to_reason(status_code: u16) -> &'static str {
     }
 }
 
+/// F-177: 冪等なメソッドか（RFC 9110 §9.2.2。同じ要求を再送しても結果が変わらない）。
+///
+/// プールから取り出した上流接続が応答の 1 バイト目より前に失敗したとき、新規接続で
+/// 1 回だけ再送してよいかの判定に使う。POST / PATCH は対象外。
+#[inline]
+pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
+    matches!(
+        method,
+        b"GET" | b"HEAD" | b"OPTIONS" | b"PUT" | b"DELETE" | b"TRACE"
+    )
+}
+
+#[cfg(test)]
+mod idempotent_method_tests {
+    #[test]
+    fn idempotent_methods_f177() {
+        for m in [
+            &b"GET"[..],
+            b"HEAD",
+            b"OPTIONS",
+            b"PUT",
+            b"DELETE",
+            b"TRACE",
+        ] {
+            assert!(super::is_idempotent_method(m));
+        }
+        for m in [&b"POST"[..], b"PATCH", b"CONNECT", b"get"] {
+            assert!(!super::is_idempotent_method(m));
+        }
+    }
+}
+
 #[cfg(test)]
 mod chunked_span_tests {
     use super::*;

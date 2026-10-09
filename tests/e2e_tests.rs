@@ -25432,3 +25432,99 @@ async fn test_e2e_alpn_h2_upstream_regression() {
         resp
     );
 }
+
+/// B-104: HTTP/3 で受けた要求の上流接続がプールで再利用されること（平文・TLS）。
+///
+/// echo バックエンドは接続ごとの通し番号を `x-backend-conn-id` で返す。同じ QUIC 接続
+/// （＝同じ HTTP/3 ワーカー）から順に送った要求は、同じ上流接続で処理されるはず。
+/// 従来は 1 要求 1 接続（`Connection: close`）で、毎回番号が変わっていた。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_b104_http3_reuses_upstream_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    for prefix in ["/echo-upload", "/echo-upload-tls"] {
+        let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+            .await
+            .expect("HTTP/3 connect");
+        let mut ids = std::collections::BTreeSet::new();
+        for i in 0..6 {
+            let path = format!("{}/b104-{}", prefix, i);
+            let resp = send_http3_request_full(&mut send_request, "GET", &path, &[], None)
+                .await
+                .unwrap_or_else(|e| panic!("GET {} failed: {}", path, e));
+            assert_eq!(resp.status, 200, "GET {}", path);
+            let id = resp
+                .header("x-backend-conn-id")
+                .unwrap_or_else(|| panic!("{}: x-backend-conn-id missing", path))
+                .to_string();
+            ids.insert(id);
+        }
+        assert_eq!(
+            ids.len(),
+            1,
+            "{}: sequential HTTP/3 requests must reuse one upstream connection, got {:?}",
+            prefix,
+            ids
+        );
+    }
+}
+
+/// B-104: HEAD への応答は Content-Length があっても本文を読まない（キープアライブの上流は
+/// 閉じないため、読みに行くとタイムアウトまで止まる）。続く GET も同じ接続で通ること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_b104_http3_head_on_keepalive_upstream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let started = std::time::Instant::now();
+    let head = send_http3_request_full(
+        &mut send_request,
+        "HEAD",
+        "/echo-upload/b104-head",
+        &[],
+        None,
+    )
+    .await
+    .expect("HEAD");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty(), "HEAD must not carry a body");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "HEAD must not wait for a body that never comes ({:?})",
+        started.elapsed()
+    );
+    let get = send_http3_request_full(
+        &mut send_request,
+        "GET",
+        "/echo-upload/b104-after-head",
+        &[],
+        None,
+    )
+    .await
+    .expect("GET after HEAD");
+    assert_eq!(get.status, 200);
+    assert_eq!(
+        head.header("x-backend-conn-id"),
+        get.header("x-backend-conn-id"),
+        "the connection used for HEAD must be reusable"
+    );
+}
