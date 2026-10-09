@@ -209,6 +209,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | NetBSD x86_64（2026-08-29 再測、Apple Silicon 上の **TCG**） | **534 passed / 10 failed**（183.93s。HVF の aarch64 が 43s なので 4 倍以上遅い）。**失敗 10 件を 1 件ずつ再実行して切り分けた**: **5 件は単独なら成功**（`http3_request_body_streaming_tls_backend` 6.14s / `http3_sni_and_cert_reload` 4.44s / `http3_throughput` 0.46s / `http3_udp_unreachable_fallback` 3.26s / `rate_limiting_with_config` 3.85s）＝並列実行時の負荷起因。**残り 5 件（HTTP/3 + WASM 4 件・HTTP/3 + WebSocket 1 件）は単独でも失敗する**。原因は E2E ハーネスのログに出る `Proxy failed to become ready within 180s (WASM AOT compile?)` で、**TCG 上では WASM の AOT コンパイル（Pulley）が 180 秒の起動待ちを超過する**ため。B-58（OpenBSD の Pulley が極端に遅い）と同じ現象がエミュレーションで増幅されたもので、**機能不全ではない**。実機の NetBSD x86_64 では 2026-08-06 に完走している。**「NetBSD x86_64 の失敗は全て負荷起因」という従来の記述は誤り**だった |
 | NetBSD aarch64（F-140、2026-08-06 実機） | **フルビルド可**（`full-netbsd`、wasm 込み。B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）が、`TEST_FILTER=wasm_tests` では `test result: ok. 23 passed; 0 failed; 519 filtered out` |
 | **2026-08-29 一斉検証（6 環境すべて）** | 下表参照。**aarch64 は HVF、x86_64 は TCG** |
+| **2026-10-09 v0.8.0（F-176）** | NetBSD x86_64（KVM）e2e 564/1（Pulley の WAF 1 件。B-58 同種）・security-e2e PASS／NetBSD aarch64 565/0・PASS／FreeBSD aarch64 565/0・PASS／OpenBSD aarch64 564/0/1 ignored・PASS。詳細は [F-176](../../docs/backlog/features/F-176-qemu-netbsd-parity.md) |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### 2026-08-29: BSD 6 環境の E2E 一斉実行（Apple Silicon / aarch64=HVF・x86_64=TCG）
