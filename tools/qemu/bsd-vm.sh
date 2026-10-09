@@ -1339,6 +1339,10 @@ _guest_env_prefix() {
         # `Unable to find libclang` で落ちる（実測）。
         pre='LIBCLANG_PATH=$(find -L /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
+        # NetBSD 同梱の GNU ld はデバッグ情報付きの dev プロファイルのリンクが極端に遅い
+        # （x86_64 で単体テストのリンクに約 10 分、E2E の veil 本体は 1 時間を超えても終わらなかった。
+        # F-176）。E2E・単体テストはデバッガを使わないので OpenBSD と同じく切る。
+        pre="${pre} CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0"
         if [[ "${ARCH}" == "aarch64" ]]; then
             # B-59: quiche が内蔵する BoringSSL には aarch64 の CPU 機能検出
             # （`OPENSSL_cpuid_setup`）の実装が linux/apple/win/freebsd/openbsd 用しか無く、
