@@ -245,6 +245,14 @@ impl<T> Receiver<T> {
         TryRecv::Item(item.unwrap())
     }
 
+    /// 送信端が閉じていて、キューに残りが無いか（= 次の `try_recv` は `Closed`）。
+    ///
+    /// 最後の断片を送るときに終端（fin / END_STREAM）を同じ送出へ載せるための先読みに使う。
+    pub fn is_finished(&self) -> bool {
+        let s = self.sh.borrow();
+        s.sender_closed && s.queue.is_empty()
+    }
+
     /// アイテムが来るまで待つ。送信端が閉じてキューも空なら `None`。
     pub async fn recv(&self) -> Option<T> {
         poll_fn(|cx: &mut Context<'_>| {

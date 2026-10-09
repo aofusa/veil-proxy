@@ -1,6 +1,6 @@
 # B-105: HTTP/3 バッファ経路の HTTPS 上流が要求ごとに OS スレッドを生成する
 
-**状態: 対応中（feat/v080-limitations、B-97 と同時）**
+**状態: 完了（feat/v080-limitations）**
 
 ## 事象
 
@@ -16,3 +16,8 @@ Wasm や `buffering = full` を付けた HTTPS 上流ルートでは、1 要求�
 ## 改修
 
 HTTP/1.1・HTTP/2 と同じ非同期 `ClientTls` + `HTTPS_POOL` の経路に置き換え、スレッド経路を削除する。
+
+## 結果（2026-10-09）
+
+`proxy_to_tls_backend_async`（要求ごとのスレッド生成 + 同期 TLS + 5ms ポーリング + 毎回のルート証明書ストア構築）を削除し、
+バッファ経路の HTTPS 上流も B-104 の非同期プール付き経路（`exchange_buffered`）で処理する。

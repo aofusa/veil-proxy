@@ -1,6 +1,6 @@
 # B-104: HTTP/3 の上流接続がプールされない（1 要求 1 TCP 接続）
 
-**状態: 対応中（feat/v080-limitations）**
+**状態: 完了（feat/v080-limitations）**
 
 ## 事象
 
@@ -26,3 +26,14 @@ HTTP/1.1・HTTP/2 で受けた要求は `HTTP_POOL` / `HTTPS_POOL`（B-93 の生
 ## 見積もり
 
 平文上流 +10〜30%、HTTPS 上流 2〜5 倍（クライアント律速でない計測系で）。
+
+## 結果（2026-10-09）
+
+- HTTP/3 ワーカーにスレッドローカルの上流接続プール（`H3_BACKEND_POOL`、平文・TLS 共通の `BackendIo`）を追加し、
+  ストリーミング経路（`backend_task`）・バッファ経路（`exchange_buffered`）とも再利用する。`Connection: close` は付けない。
+- 応答の終端をちょうど読み切った（Content-Length 一致・chunked の終端・HEAD/204/304）接続だけを戻す。EOF 終端・余剰データ・
+  クライアント切断・101 は戻さない。TLS は復号済み平文が残っていれば戻さない。
+- 取り出し時は B-93 と同じく、アイドル 1ms 以上なら `MSG_PEEK` で生存確認する。
+- F-177: 再利用した接続が応答の前に失敗し、本文の無い冪等メソッドなら新規接続で 1 回だけ再送する。
+- E2E: `test_b104_http3_reuses_upstream_connection`（平文・TLS とも 6 要求で上流接続 ≤ 3 本。並行テストと上流を共有するため
+  1 本固定にはしない）、`test_b104_http3_head_on_keepalive_upstream`。

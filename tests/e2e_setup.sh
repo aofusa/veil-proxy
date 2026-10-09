@@ -1246,6 +1246,27 @@ path = "/echo-upload/*"
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
 
+# B-97: HTTP/3 のバッファ経路（buffering = full）が接続を止めないことの検証用
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/echo-full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+[route.buffering]
+mode = "full"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/echo-full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+[route.buffering]
+mode = "full"
+
 # F-44: TLS バックエンドストリーミング検証用（HTTPS echo バックエンド）
 [[route]]
 [route.conditions]

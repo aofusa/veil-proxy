@@ -25433,6 +25433,68 @@ async fn test_e2e_alpn_h2_upstream_regression() {
     );
 }
 
+/// B-97: HTTP/3 のバッファ経路（`buffering = "full"`）の要求が上流を待っている間も、
+/// 同じ QUIC 接続の他の要求が進む。
+///
+/// 従来はメインループがバッファ経路の要求を await しており、上流の応答待ち（ここでは
+/// echo バックエンドの `x-delay-ms` で 1.5 秒）の間、そのワーカーの全接続が止まっていた。
+/// 同じ接続の 2 本目のストリームを使うので、必ず同じワーカーで処理される。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_b97_http3_buffered_request_does_not_block_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+
+    let mut slow_sr = send_request.clone();
+    let slow = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let r = send_http3_request_full(
+            &mut slow_sr,
+            "GET",
+            "/echo-full/b97-slow",
+            &[("x-delay-ms", "1500")],
+            None,
+        )
+        .await
+        .map(|r| r.status)
+        .map_err(|e| e.to_string());
+        (r, started.elapsed())
+    });
+    // 遅い要求が上流で待ちに入ってから速い要求を出す。
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut fast_sr = send_request.clone();
+    let started = std::time::Instant::now();
+    let fast = send_http3_request_full(&mut fast_sr, "GET", "/echo-full/b97-fast", &[], None)
+        .await
+        .expect("fast HTTP/3 request");
+    let fast_elapsed = started.elapsed();
+    assert_eq!(fast.status, 200);
+
+    let (slow_status, slow_elapsed) = slow.await.expect("slow task");
+    assert_eq!(slow_status.expect("slow HTTP/3 request"), 200);
+    assert!(
+        slow_elapsed >= std::time::Duration::from_millis(1400),
+        "slow request should wait for the delayed upstream: {:?}",
+        slow_elapsed
+    );
+    assert!(
+        fast_elapsed < std::time::Duration::from_millis(1000),
+        "fast request on the same connection must not wait for the slow buffered request: {:?}",
+        fast_elapsed
+    );
+}
+
 /// B-104: HTTP/3 で受けた要求の上流接続がプールで再利用されること（平文・TLS）。
 ///
 /// echo バックエンドは接続ごとの通し番号を `x-backend-conn-id` で返す。同じ QUIC 接続

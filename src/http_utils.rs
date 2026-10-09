@@ -17,6 +17,7 @@ pub(crate) const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 ///
 /// IPv6 の最大表記（39 文字）+ IPv4-mapped 形式（45 文字）を収める 46 バイト固定。
 /// `as_str()` で `&str` として下流（`&str` を取る全 API）へ渡す。
+#[derive(Clone, Copy)]
 pub(crate) struct IpStr {
     buf: [u8; 46],
     len: u8,

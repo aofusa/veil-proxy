@@ -507,6 +507,9 @@ pub(crate) enum RespMsg {
     Body(Bytes),
     /// バックエンドエラー（head 送出前なら指定ステータスを返し、送出後はストリームをリセット）。
     Error { status: u16 },
+    /// trailers（gRPC の grpc-status 等）。送出と同時にストリームを fin で閉じる（B-97）。
+    #[cfg(feature = "grpc")]
+    Trailers(RespHeaders),
 }
 
 // ============================================================================
