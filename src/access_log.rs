@@ -16,6 +16,7 @@
 //   BufWriter<File or Stderr> を独占し、recv_timeout() でドレイン
 //   → flush_interval_ms 周期で定期フラッシュ
 //   → 旧 SyncSender の drop により Disconnected を検出して自然終了
+//   → 空のメッセージは「同じパスで開き直す」指示（F-178。ログ行は必ず改行で終わるので空にならない）
 //
 // # 設計の要点
 //
@@ -144,6 +145,19 @@ pub(crate) fn init_access_log_writer(config: &AccessLogConfig) {
 ///
 /// 旧スレッドは旧 SyncSender が drop されることで Disconnected を検出し自然終了する。
 pub(crate) fn reload_access_log_writer(config: &AccessLogConfig) {
+    // F-178: FreeBSD の capability mode 中は新しいパスを開けず、スレッドも作り直さない。
+    // 出力先が変わらないこと（変わる設定はリロード時に拒否済み。
+    // `config::check_capability_mode_reload`）を前提に、既存のライタースレッドへ
+    // 同じパスでの開き直しだけを指示する（logrotate の move + SIGHUP に対応）。
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::is_capability_mode() {
+        if !config.enabled {
+            tx_store().store(Arc::new(None));
+        } else if let Some(tx) = tx_store().load().as_ref() {
+            let _ = tx.send(Vec::new());
+        }
+        return;
+    }
     if !config.enabled {
         // 無効化: 送信先を None に差し替え（旧スレッドは自然終了）
         tx_store().store(Arc::new(None));
@@ -157,6 +171,22 @@ pub(crate) fn reload_access_log_writer(config: &AccessLogConfig) {
     );
     // アトミックに差し替え。旧 Arc の refcount がゼロになった時点で旧 SyncSender が drop される。
     tx_store().store(Arc::new(Some(tx)));
+}
+
+/// アクセスログを追記用に開く（無ければ作る）。
+///
+/// FreeBSD の capability mode では絶対パスの `open` ができないため、`cap_enter` 前に登録した
+/// 親ディレクトリ fd から開く（F-178。`security::capsicum::open_access_log_append`）。
+fn open_log_file(path: &str) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "freebsd")]
+    if let Some(res) = crate::security::capsicum::open_access_log_append(std::path::Path::new(path))
+    {
+        return res;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// ログライタースレッドを起動する
@@ -189,24 +219,33 @@ fn spawn_log_thread(
 
             // 出力先未指定時のデフォルトは標準出力 (stdout)
             let mut writer = match file_path {
-                Some(ref path) => {
-                    match std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                    {
-                        Ok(f) => Writer::File(io::BufWriter::new(f)),
-                        Err(e) => {
-                            eprintln!("access-log: failed to open '{}': {}", path, e);
-                            Writer::Stdout(io::BufWriter::new(io::stdout()))
-                        }
+                Some(ref path) => match open_log_file(path) {
+                    Ok(f) => Writer::File(io::BufWriter::new(f)),
+                    Err(e) => {
+                        eprintln!("access-log: failed to open '{}': {}", path, e);
+                        Writer::Stdout(io::BufWriter::new(io::stdout()))
                     }
-                }
+                },
                 None => Writer::Stdout(io::BufWriter::new(io::stdout())),
             };
 
             loop {
                 match rx.recv_timeout(flush_interval) {
+                    // 開き直し指示（F-178）。失敗したら旧ファイルへ書き続ける
+                    // （stdout へは切り替えない）。
+                    Ok(bytes) if bytes.is_empty() => {
+                        let is_file = matches!(writer, Writer::File(_));
+                        if let (Some(path), true) = (&file_path, is_file) {
+                            let _ = writer.flush();
+                            match open_log_file(path) {
+                                Ok(f) => writer = Writer::File(io::BufWriter::new(f)),
+                                Err(e) => eprintln!(
+                                    "access-log: failed to reopen '{}' (keeping the previous file): {}",
+                                    path, e
+                                ),
+                            }
+                        }
+                    }
                     Ok(bytes) => {
                         let _ = writer.write_all(&bytes);
                     }

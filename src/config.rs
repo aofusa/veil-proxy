@@ -5687,22 +5687,40 @@ mod proxy_url_invalid_reason_tests {
     }
 }
 
+/// `validate_config` の証明書ファイル存在チェックを省くか（F-178: FreeBSD の capability mode 中）。
+fn tls_file_check_suppressed() -> bool {
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::security::capsicum::is_capability_mode()
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        false
+    }
+}
+
 fn validate_config(config: &Config) -> io::Result<()> {
     // TLS証明書ファイルの存在チェック
-    let cert_path = Path::new(&config.tls.cert_path);
-    if !cert_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("TLS certificate file not found: {}", config.tls.cert_path),
-        ));
-    }
+    //
+    // F-178: capability mode 中（＝リロード時）は絶対パスの stat ができず常に「無い」と判定
+    // されるため省く。リロードは TLS 設定を引き継ぐので証明書の存在は結果に影響しない
+    // （証明書の差し替えは `[tls] auto_reload` の dirfd 経路が扱う。F-136）。
+    if !tls_file_check_suppressed() {
+        let cert_path = Path::new(&config.tls.cert_path);
+        if !cert_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("TLS certificate file not found: {}", config.tls.cert_path),
+            ));
+        }
 
-    let key_path = Path::new(&config.tls.key_path);
-    if !key_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("TLS key file not found: {}", config.tls.key_path),
-        ));
+        let key_path = Path::new(&config.tls.key_path);
+        if !key_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("TLS key file not found: {}", config.tls.key_path),
+            ));
+        }
     }
 
     // バインドアドレスの妥当性チェック（F-164: `unix:<path>` も受理する）
@@ -6535,6 +6553,21 @@ pub struct LoadedConfigWithoutTls {
     pub performance: PerformanceConfigSection,
 }
 
+/// リロード時に設定ファイルを読む唯一の入口（F-178）。
+///
+/// FreeBSD の capability mode では絶対パスの `open` が `ECAPMODE` になるため、`cap_enter` 前に
+/// 登録した親ディレクトリ fd から `openat` で読む（`security::capsicum::read_config_file`）。
+/// 未登録（capability mode を使わない構成・他 OS）は従来どおり `fs::read_to_string`。
+// 理由付き allow: リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
+fn read_config_source(path: &Path) -> io::Result<String> {
+    #[cfg(target_os = "freebsd")]
+    if let Some(res) = crate::security::capsicum::read_config_file(path) {
+        return res;
+    }
+    fs::read_to_string(path)
+}
+
 /// TLS証明書を除いた設定をロード（ホットリロード用）
 ///
 /// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
@@ -6542,7 +6575,7 @@ pub struct LoadedConfigWithoutTls {
 // 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
 #[allow(clippy::disallowed_methods)]
 fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
-    let config_str = fs::read_to_string(path)?;
+    let config_str = read_config_source(path)?;
     // ホットリロード時も --override は同じグローバル集合が適用される
     // （src/config_override.rs の単一チョークポイント経由）。
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
@@ -6550,6 +6583,13 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
 
     // 設定ファイルのバリデーション
     validate_config(&config)?;
+
+    // F-178: capability mode 中のリロードは、cap_enter 後でも動く変更だけを受け入れる
+    // （グローバルな状態を書き換える処理より前に判定し、拒否時は何も変えずに前の設定を保つ）。
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::is_capability_mode() {
+        check_capability_mode_reload(&config)?;
+    }
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -7099,6 +7139,17 @@ fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
     if let Some(hit) = CANONICAL_BASE_MEMO.with(|m| m.borrow().get(path).cloned()) {
         return hit;
     }
+    // F-178: capability mode では `canonicalize()` が `ECAPMODE` になる（リロードスレッドの
+    // メモは空）。cap_enter 前の登録時に解決した canonical 形を使う。
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::is_capability_mode() {
+        let resolved = crate::security::capsicum::registered_canonical_root(Path::new(path))
+            .map(|c| Arc::from(c.as_path()));
+        if resolved.is_some() {
+            CANONICAL_BASE_MEMO.with(|m| m.borrow_mut().insert(path.to_string(), resolved.clone()));
+        }
+        return resolved;
+    }
     // 理由付き allow: 設定パスごとに 1 回だけ実行されるコールドパス（以降はメモから返る）。
     #[allow(clippy::disallowed_methods)]
     let resolved = match Path::new(path).canonicalize() {
@@ -7146,6 +7197,151 @@ pub fn reresolve_routes_after_chroot(
             })
             .collect(),
     )
+}
+
+/// FreeBSD capsicum の capability mode（`cap_enter`）に入れない理由（F-178）。
+///
+/// capability mode では `connect(2)`・`bind(2)`・絶対パスの `open(2)` ができない。
+/// 上流への接続やリスナーの追加を要する構成は対象外とし、起動時（入るかどうか）と
+/// リロード時（受け入れるかどうか）で同じ判定を使う。
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapModeBlocker {
+    /// `[upstreams]` がある
+    Upstreams,
+    /// `Proxy` / `ProxyUpstream` のルートがある
+    ProxyRoute,
+    /// `[[l4]]` リスナーがある
+    L4,
+    /// h2c が有効
+    H2c,
+    /// HTTP/3 が有効
+    Http3,
+    /// HTTP→HTTPS リダイレクトリスナーがある
+    HttpRedirect,
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+impl CapModeBlocker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapModeBlocker::Upstreams => "[upstreams] requires connect(2)",
+            CapModeBlocker::ProxyRoute => "a Proxy/ProxyUpstream route requires connect(2)",
+            CapModeBlocker::L4 => "[[l4]] listeners require bind(2)/connect(2)",
+            CapModeBlocker::H2c => "h2c requires an extra listener",
+            CapModeBlocker::Http3 => "HTTP/3 requires an extra UDP listener",
+            CapModeBlocker::HttpRedirect => "the HTTP redirect listener requires bind(2)",
+        }
+    }
+}
+
+/// capability mode の適格判定の入力（ルート以外）。
+#[cfg(any(target_os = "freebsd", test))]
+pub struct CapModeFacts {
+    pub has_upstreams: bool,
+    pub has_l4: bool,
+    pub h2c: bool,
+    pub http3: bool,
+    pub http_redirect: bool,
+}
+
+/// capability mode に入れない最初の理由を返す（入れるなら `None`）。
+#[cfg(any(target_os = "freebsd", test))]
+pub fn capability_mode_blocker(routes: &[Route], facts: &CapModeFacts) -> Option<CapModeBlocker> {
+    if facts.has_upstreams {
+        return Some(CapModeBlocker::Upstreams);
+    }
+    if routes.iter().any(|r| {
+        matches!(
+            r.action,
+            BackendConfig::Proxy { .. } | BackendConfig::ProxyUpstream { .. }
+        )
+    }) {
+        return Some(CapModeBlocker::ProxyRoute);
+    }
+    if facts.has_l4 {
+        return Some(CapModeBlocker::L4);
+    }
+    if facts.h2c {
+        return Some(CapModeBlocker::H2c);
+    }
+    if facts.http3 {
+        return Some(CapModeBlocker::Http3);
+    }
+    if facts.http_redirect {
+        return Some(CapModeBlocker::HttpRedirect);
+    }
+    None
+}
+
+/// capability mode 中のリロードで、新しい設定が cap_enter 後でも動くかを確かめる（F-178）。
+///
+/// 拒否した場合はエラーを返し、呼び出し元（`reload_config`）は前の設定を保つ。
+/// - 上流・追加リスナーを要する構成（`capability_mode_blocker`）
+/// - 起動時に登録していない静的ルート（cap_enter 後は新しいディレクトリを開けない）
+/// - アクセスログの出力先の変更・新規有効化（新しいパスを開けず、スレッドも作り直さない）
+#[cfg(target_os = "freebsd")]
+fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
+    let reject = |why: String| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "capability mode: {}; restart veil to apply this change",
+                why
+            ),
+        ))
+    };
+    let routes: &[Route] = config.route.as_deref().unwrap_or(&[]);
+    #[cfg(feature = "l4-proxy")]
+    let has_l4 = config.l4.as_ref().is_some_and(|v| !v.is_empty());
+    #[cfg(not(feature = "l4-proxy"))]
+    let has_l4 = false;
+    #[cfg(feature = "http2")]
+    let h2c = config.server.h2c_enabled;
+    #[cfg(not(feature = "http2"))]
+    let h2c = false;
+    #[cfg(feature = "http3")]
+    let http3 = config.server.http3_enabled;
+    #[cfg(not(feature = "http3"))]
+    let http3 = false;
+    let facts = CapModeFacts {
+        has_upstreams: config.upstreams.as_ref().is_some_and(|m| !m.is_empty()),
+        has_l4,
+        h2c,
+        http3,
+        http_redirect: config
+            .server
+            .http
+            .as_ref()
+            .is_some_and(|a| a.parse::<SocketAddr>().is_ok()),
+    };
+    if let Some(b) = capability_mode_blocker(routes, &facts) {
+        return reject(b.as_str().to_string());
+    }
+    for route in routes {
+        if let BackendConfig::File { path, .. } = &route.action {
+            if !crate::security::capsicum::is_registered_static_root(Path::new(path)) {
+                return reject(format!(
+                    "static root {:?} was not registered before cap_enter",
+                    path
+                ));
+            }
+        }
+    }
+    #[cfg(feature = "access-log")]
+    {
+        let current = CURRENT_CONFIG.load();
+        let cur = &current.access_log_config;
+        let new = &config.access_log;
+        if new.enabled && (!cur.enabled || new.file_path != cur.file_path) {
+            return reject(format!(
+                "access log destination changed ({:?} -> {:?})",
+                cur.enabled.then_some(&cur.file_path),
+                new.file_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn load_backend(
@@ -7352,6 +7548,19 @@ fn build_backend(
                             "Memory mode not supported for directories",
                         ));
                     }
+                    // F-178: FreeBSD の capability mode 中（リロード）は絶対パスの read が
+                    // できないため、登録済み静的ルート配下なら dirfd 相対で読む。
+                    #[cfg(target_os = "freebsd")]
+                    let data = match crate::security::capsicum::open_static_ro(Path::new(path)) {
+                        Some(f) => {
+                            use std::io::Read;
+                            let mut v = Vec::new();
+                            f?.read_to_end(&mut v)?;
+                            v
+                        }
+                        None => fs::read(path)?,
+                    };
+                    #[cfg(not(target_os = "freebsd"))]
                     let data = fs::read(path)?;
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
 
@@ -8677,6 +8886,103 @@ mod shipped_config_tests {
 
 /// F-159: `Route::resolved_backend` が設定ロード時に構築される前提で、
 /// `load_backend` がホットパスで Arc clone のみを行うことを確認するテスト。
+/// F-178: capability mode の適格判定（起動時とリロード時で共用）。
+#[cfg(test)]
+mod f178_capability_mode_blocker_tests {
+    use super::*;
+
+    fn route(action: &str) -> Route {
+        toml::from_str(&format!("action = {}", action)).unwrap()
+    }
+
+    fn no_facts() -> CapModeFacts {
+        CapModeFacts {
+            has_upstreams: false,
+            has_l4: false,
+            h2c: false,
+            http3: false,
+            http_redirect: false,
+        }
+    }
+
+    #[test]
+    fn static_and_redirect_routes_are_eligible() {
+        let routes = vec![
+            route(r#"{ type = "File", path = "/srv/www", mode = "sendfile" }"#),
+            route(
+                r#"{ type = "Redirect", redirect_url = "https://example.com/", redirect_status = 301, preserve_path = false }"#,
+            ),
+        ];
+        assert_eq!(capability_mode_blocker(&routes, &no_facts()), None);
+    }
+
+    /// 単一 URL の Proxy ルートは upstream グループを作らないが connect(2) が要る
+    /// （以前の起動時判定は upstream グループの有無しか見ていなかった）。
+    #[test]
+    fn proxy_routes_are_rejected() {
+        let proxy = vec![route(
+            r#"{ type = "Proxy", url = "http://127.0.0.1:8080" }"#,
+        )];
+        assert_eq!(
+            capability_mode_blocker(&proxy, &no_facts()),
+            Some(CapModeBlocker::ProxyRoute)
+        );
+        let upstream = vec![route(r#"{ type = "Proxy", upstream = "pool" }"#)];
+        assert_eq!(
+            capability_mode_blocker(&upstream, &no_facts()),
+            Some(CapModeBlocker::ProxyRoute)
+        );
+    }
+
+    #[test]
+    fn listeners_and_upstreams_are_rejected() {
+        let routes = vec![route(
+            r#"{ type = "File", path = "/srv/www", mode = "sendfile" }"#,
+        )];
+        let cases = [
+            (
+                CapModeFacts {
+                    has_upstreams: true,
+                    ..no_facts()
+                },
+                CapModeBlocker::Upstreams,
+            ),
+            (
+                CapModeFacts {
+                    has_l4: true,
+                    ..no_facts()
+                },
+                CapModeBlocker::L4,
+            ),
+            (
+                CapModeFacts {
+                    h2c: true,
+                    ..no_facts()
+                },
+                CapModeBlocker::H2c,
+            ),
+            (
+                CapModeFacts {
+                    http3: true,
+                    ..no_facts()
+                },
+                CapModeBlocker::Http3,
+            ),
+            (
+                CapModeFacts {
+                    http_redirect: true,
+                    ..no_facts()
+                },
+                CapModeBlocker::HttpRedirect,
+            ),
+        ];
+        for (facts, want) in cases {
+            assert_eq!(capability_mode_blocker(&routes, &facts), Some(want));
+            assert!(!want.as_str().is_empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod f159_resolved_backend_tests {
     use super::*;
