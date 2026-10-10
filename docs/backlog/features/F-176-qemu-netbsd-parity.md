@@ -30,6 +30,7 @@
 | NetBSD 10.1 x86_64（KVM） | OK（`SERIAL_CONSOLE_OK`、`/`・`/work` は `log`） | 941 + 54 | 564 / 1 失敗（下記） | OK | PASS（chroot + nobody へ降格・静的配信・証明書リロード） |
 | NetBSD 10.1 aarch64（HVF） | OK（作り直しで確認） | — | **565 / 0**（HTTP/3 込み。B-62 解消） | OK | PASS |
 | FreeBSD 14.3 aarch64（HVF） | — | — | **565 / 0** | OK | PASS（capsicum capability mode・auto_reload で証明書リロード） |
+| OpenBSD 7.9 x86_64（KVM） | — | — | **564 / 0 / 1 ignored**（B-71 の 4 件も成功） | OK | PASS（pledge + unveil） |
 | OpenBSD 7.9 aarch64（HVF） | — | — | **564 / 0 / 1 ignored**（B-58） | OK | PASS（pledge + unveil） |
 
 NetBSD x86_64 の 1 件は `test_http3_wasm_local_response`（WAF モジュールの初回要求での正規表現構築が

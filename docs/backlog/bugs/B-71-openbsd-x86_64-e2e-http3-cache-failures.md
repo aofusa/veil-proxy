@@ -1,7 +1,7 @@
 # B-71: OpenBSD x86_64 の E2E で HTTP/3 キャッシュ系 4 件が恒常的に失敗する
 
 **優先度**: P2
-**ステータス**: 未修正（**F-158 以前から存在することをベースライン実行で確認済み**）
+**ステータス**: 解消（2026-10-10 の再検証で再現しない。feat/v080-limitations）
 **発見日**: 2026-08-22（F-158 のマルチプラットフォーム検証中）
 **関連**: B-68（FreeBSD の HTTP/3 E2E 失敗）、B-70（NetBSD の E2E panic）
 
@@ -64,3 +64,11 @@ F-158 実行のいずれかで成功している。`oversized_request_line`/`ove
   `boring`/`ring` のアセンブリ経路）の可能性がある。
 - E2E スイート全体の実行ごとの揺らぎ（h2c/oversized 系）は別途、
   QEMU x86_64 上のタイミング感度として切り分けが要る。
+
+## 再検証（2026-10-10、feat/v080-limitations）
+
+同じ OpenBSD 7.9 x86_64（KVM）でフル E2E を実行し、**564 passed / 0 failed / 1 ignored**（ignored は B-58）。
+4 件（`http3_buffering_spillover` / `http3_cache_hit_miss` / `http3_cache_invalidation` /
+`http3_cache_stale_if_error`）はいずれも成功した。HTTP/3 のバッファ経路（キャッシュ・`buffering = full`）を
+メインループで await しないようにした B-97 と、上流接続の再利用（B-104）で、これらの要求が同じワーカーの
+他の処理に引きずられなくなったことが効いたと考えられる（単独実行では元々成功していた）。再発したら再オープンする。
