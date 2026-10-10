@@ -154,6 +154,8 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 
 > **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/veil/config.toml`）が使用されます。
 
+> **FreeBSD capsicum の capability mode は fail-closed**（F-181）: `capsicum_capability_mode = true` を指定したのに capability mode に入れない場合、veil は理由をログに出して **終了コード 1 で終了します**。入れないのは、起動後に `connect(2)`/`bind(2)` が要る構成（`Proxy` ルート・`[upstreams]`・`[[l4]]`・h2c・HTTP/3・HTTP リダイレクトリスナー）、`cap_enter(2)` の失敗、ワーカーのリスナー bind が終わらない場合です。弱い rights 制限のサンドボックスへ黙って切り替えることはしません。他のサンドボックスと同じく、`[security] allow_security_failures = true` のときだけ警告して rights 制限のみで続行します。
+
 > **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: SIGHUP（と admin API のリロード）で設定ファイルを読み直せます。`cap_enter` の前に設定ファイルのあるディレクトリ（とアクセスログのディレクトリ）を開いておき、リロードのたびにファイル名を `openat(2)` + `O_RESOLVE_BENEATH` で開き直します。rename による置き換えや、そのディレクトリ内の相対シンボリックリンクの差し替え（Kubernetes の ConfigMap 方式）にも追従します（F-178）。TLS 証明書も `[tls] auto_reload = true` なら同じ仕組みでリロードされます（F-136）。
 >
 > capability mode のプロセスは新しいディレクトリを開くことも、接続・bind することもできません。これらが必要になるリロードは **拒否して以前の設定を維持します**（ログに `capability mode: ...; restart veil to apply this change`）。次の変更は再起動で反映してください。

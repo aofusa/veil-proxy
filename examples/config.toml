@@ -695,8 +695,9 @@ revalidate_mtime = false
 
 # capability mode（cap_enter(2)、不可逆）への降格（FreeBSD専用、オプトイン）。
 # capability mode ではグローバル名前空間操作（bind/connect/パス指定の open 等）が
-# 全面禁止されるため、次をすべて満たす構成でのみ適用される（満たさない場合は
-# 警告ログを出して rights 制限のみに留まる）:
+# 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
+# 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
+# allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
 #   - Proxy ルート（単一 URL・upstream 参照とも）・[upstreams]・L4 リスナーが無い（connect 不要）
 #   - h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。

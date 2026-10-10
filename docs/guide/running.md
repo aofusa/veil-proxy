@@ -155,6 +155,8 @@ Existing connections are not interrupted, and new settings apply to new connecti
 
 > **Note**: On reload, the path specified with `-c` option at startup (or default `/etc/veil/config.toml`) is used.
 
+> **FreeBSD capsicum capability mode — fail-closed** (F-181): when `capsicum_capability_mode = true` is set but capability mode cannot be entered — the configuration needs `connect(2)`/`bind(2)` after startup (`Proxy` routes, `[upstreams]`, `[[l4]]`, h2c, HTTP/3, the HTTP redirect listener), `cap_enter(2)` fails, or the workers do not finish binding — veil logs the reason and **exits with status 1**. It does not silently fall back to the weaker rights-limited sandbox. Set `[security] allow_security_failures = true` to continue in rights-limited mode with a warning instead, as with the other sandboxes.
+
 > **FreeBSD capsicum capability mode** (`capsicum_capability_mode = true`): SIGHUP (and the admin reload) still re-reads the configuration file. Before `cap_enter`, veil opens the directory that holds the configuration file (and the access log directory) and later re-opens the file by name with `openat(2)` + `O_RESOLVE_BENEATH`, so replacing the file by rename and relative symlink swaps inside that directory (Kubernetes ConfigMap style) are picked up (F-178). TLS certificates reload the same way when `[tls] auto_reload = true` (F-136).
 >
 > A process in capability mode cannot open new directories, connect, or bind, so a reload that needs any of these is **rejected and the previous configuration is kept** (the log says `capability mode: ...; restart veil to apply this change`). Restart the process to apply:
