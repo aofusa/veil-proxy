@@ -95,6 +95,10 @@ pub mod stream_channel;
 
 pub mod buffering;
 pub mod cache;
+/// FreeBSD capsicum の capability mode 下の上流接続ブローカー（F-182）。プロトコルは unix 共通で、
+/// Linux の単体テストでも検証する。
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub mod connect_broker;
 pub mod routing;
 pub mod runtime;
 pub mod security;
