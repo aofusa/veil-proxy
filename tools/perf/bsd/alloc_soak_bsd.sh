@@ -61,6 +61,11 @@ while [ "$(date +%s)" -lt "$END" ]; do
         *) f=$(awk '/^requests:/ {f=$10+$12} /^status codes:/ {s=$7+$9} END {print f+s+0}' "$WORK/soak-load.log") ;;
     esac
     FAILED=$((FAILED + f))
+    # 失敗したサイクルの負荷ログと veil のログ末尾を残す（原因の切り分け用）
+    if [ "${f:-0}" -gt 0 ]; then
+        { echo "== cycle $cycle: $cmd"; cat "$WORK/soak-load.log"; echo "-- veil.log tail";
+          tail -20 "$WORK/soak-veil.log"; } >> "$OUT.failures"
+    fi
     kill -0 "$VPID" 2>/dev/null || { echo "!! veil が終了した（cycle $cycle）" >&2; FAILED=$((FAILED + 1)); break; }
     sleep "$IDLE_SECS"
     echo "$(( $(date +%s) - T0 )) $(rss) $FAILED" | tee -a "$OUT"
@@ -77,4 +82,10 @@ END {
     for (i = h + 1; i <= n; i++) b += y[i]
     printf "cycles=%d failed_requests=%d floor_max=%.1fMB floor_first=%.1fMB floor_last=%.1fMB\n", n, failed, max / 1024, y[1], y[n]
     printf "floor_mean_first_half=%.1fMB floor_mean_second_half=%.1fMB floor_slope=%+.2fMB/h\n", a / h, b / (n - h), (sxx > 0 ? sxy / sxx : 0)
+    # 立ち上がりを除いた定常状態（後半）の傾き
+    m = n - h; sx = 0; sy = 0; sxy = 0; sxx = 0
+    for (i = h + 1; i <= n; i++) { sx += x[i]; sy += y[i] }
+    mx = sx / m; my = sy / m
+    for (i = h + 1; i <= n; i++) { sxy += (x[i] - mx) * (y[i] - my); sxx += (x[i] - mx) ^ 2 }
+    printf "floor_slope_second_half=%+.2fMB/h\n", (sxx > 0 ? sxy / sxx : 0)
 }' "$OUT"

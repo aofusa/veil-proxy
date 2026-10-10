@@ -129,6 +129,11 @@ while [ "$(date +%s)" -lt "$END" ]; do
             f=$(awk '/Socket errors:/ {gsub(",","");f=$4+$6+$8+$10} /Non-2xx or 3xx/ {s=$5} END {print f+s+0}' "$logf")
         fi
         FAILED=$(( FAILED + ${f:-0} ))
+        # 失敗したサイクルの負荷ログと veil のログ末尾を残す（原因の切り分け用）
+        if [ "${f:-0}" -gt 0 ]; then
+            { echo "== cycle $cycle: $tool"; cat "$logf"; echo "-- veil.log tail";
+              tail -20 "$WORK/soak-veil.log"; } >> "$OUT.failures"
+        fi
         rm -f "$logf"
     done
     kill -0 "$VPID" 2>/dev/null || { log "!! veil が終了した（cycle $cycle）"; FAILED=$((FAILED + 1)); break; }
@@ -154,4 +159,11 @@ print(f"cycles={n} failed_requests={failed}")
 print(f"rss_max={max(rss)/1024:.1f}MB floor_first={ys[0]:.1f}MB floor_last={ys[-1]:.1f}MB")
 print(f"floor_mean_first_half={sum(ys[:h])/max(h,1):.1f}MB floor_mean_second_half={sum(ys[h:])/max(n-h,1):.1f}MB")
 print(f"floor_slope={slope:+.2f}MB/h")
+# 立ち上がり（プール・キャッシュが最大負荷の規模まで埋まる）を除いた定常状態の傾き。
+# 24 時間運用で効くのはこちら（後半の傾きが 0 付近なら底は頭打ち）。
+xs2, ys2 = xs[h:], ys[h:]
+if len(xs2) >= 2:
+    mx2, my2 = sum(xs2) / len(xs2), sum(ys2) / len(ys2)
+    s2 = sum((x - mx2) * (y - my2) for x, y in zip(xs2, ys2)) / max(sum((x - mx2) ** 2 for x in xs2), 1e-9)
+    print(f"floor_slope_second_half={s2:+.2f}MB/h")
 PY
