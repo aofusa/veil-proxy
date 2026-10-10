@@ -39,8 +39,8 @@ unsafe fn check(p: *const u8, size: usize, tag: u8) {
 #[test]
 fn every_class_allocates_aligned_distinct_blocks() {
     thread::spawn(|| unsafe {
-        for c in 0..size_class::NCLASS {
-            let size = CLASS_SIZE[c] as usize;
+        for &class_size in CLASS_SIZE.iter() {
+            let size = class_size as usize;
             let l = layout(size, 8);
             let mut seen = HashSet::new();
             let mut ptrs = Vec::new();

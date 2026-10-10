@@ -8,7 +8,7 @@
 //! クラスの決定は `alloc` と `dealloc` の両方で `Layout` から同じ関数で行う（`GlobalAlloc`
 //! は解放時にもサイズとアライメントを渡すので、ブロックからクラスを引く必要がない）。
 
-use super::{SLOTS, SLOT_SIZE};
+use super::SLOT_SIZE;
 
 /// クラス数。
 pub(crate) const NCLASS: usize = 52;
@@ -61,7 +61,7 @@ pub(crate) static CLASS_SLOTS: [u8; NCLASS] = {
             }
             n += 1;
         }
-        assert!(n <= 16 && n < SLOTS);
+        assert!(n <= 16);
         t[c] = n as u8;
         c += 1;
     }
@@ -85,7 +85,7 @@ const fn class_of_slow(size: usize) -> usize {
         if size == 0 {
             0
         } else {
-            (size + 15) / 16 - 1
+            size.div_ceil(16) - 1
         }
     } else {
         let w = size - 1;
@@ -117,7 +117,7 @@ pub(crate) fn class_of_aligned(size: usize, align: usize) -> Option<usize> {
     }
     let mut c = class_of(size);
     while c < NCLASS {
-        if CLASS_SIZE[c] as usize % align == 0 {
+        if (CLASS_SIZE[c] as usize).is_multiple_of(align) {
             return Some(c);
         }
         c += 1;

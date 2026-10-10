@@ -119,7 +119,7 @@ fn live_set<A: GlobalAlloc>(a: &A) -> (u64, u64) {
 fn live_band<A: GlobalAlloc>(a: &A, lo: usize, hi: usize) -> (u64, u64) {
     let mut rng = Rng(11);
     let live = if hi > 65536 { 500 } else if hi > 16384 { 3000 } else { 50_000 };
-    let mut size = |rng: &mut Rng| lo + rng.below((hi - lo) as u64) as usize;
+    let size = |rng: &mut Rng| lo + rng.below((hi - lo) as u64) as usize;
     let mut v: Vec<(*mut u8, Layout)> = (0..live)
         .map(|_| {
             let lay = l(size(&mut rng));
@@ -262,6 +262,9 @@ macro_rules! scen {
 }
 
 fn main() {
+    // 分類の健全性（ベンチの前提）: 64KiB はちょうど 1 クラス、1MiB 超は OS 直接。
+    assert_eq!(veil_alloc::usable_size(l(65536)), 65536);
+    assert_eq!(veil_alloc::usable_size(l(2 << 20)), 2 << 20);
     let filter: Vec<String> = std::env::args().skip(1).collect();
     let scenarios: Vec<Scen> = vec![
         scen!("lifo_small", lifo_small),
@@ -306,4 +309,19 @@ fn main() {
             (m[2] / m[0] - 1.0) * 100.0
         );
     }
+    // 全シナリオ後の veil-alloc の保持量（OS へ返し切れていない量）。
+    veil_alloc::collect(true);
+    let st = veil_alloc::stats();
+    println!(
+        "\nveil-alloc after collect(true): active={}KiB dirty={}KiB huge={}KiB segments={} cached={} heaps={} abandoned={} purged_total={}MiB remote_frees={}",
+        st.active_bytes / 1024,
+        st.dirty_bytes / 1024,
+        st.huge_bytes / 1024,
+        st.segments,
+        st.cached_segments,
+        st.heaps,
+        st.abandoned_heaps,
+        st.purged_bytes_total >> 20,
+        st.remote_frees_total
+    );
 }
