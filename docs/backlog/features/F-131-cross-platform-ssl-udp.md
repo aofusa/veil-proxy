@@ -23,9 +23,23 @@
 
 ## 受け入れ条件
 
-- [ ] `docs/backlog/backlog.md` に F-131 チケットを追加。
-- [ ] macOS および Windows x86_64 で `aws-lc-rs` を指定したデフォルト features ビルドが成功する。
-- [ ] OpenBSD, Windows, macOS で `quiche` が `boringssl` バックエンドで正常にビルドできる。
-- [ ] Windows 上で UDP 非同期ソケット層が動作し、`http3` / `l4-proxy` が有効化される。
-- [ ] OpenBSD, Windows (x86_64/aarch64), macOS (x86_64/aarch64) の全ターゲットで `full` features リリースビルドが成功する。
-- [ ] `packaging/scripts/build-cross.sh` および関連ドキュメントが更新され、適切な粒度で git コミットされている。
+- [x] `docs/backlog/backlog.md` に F-131 チケットを追加。
+- [x] macOS および Windows x86_64 で `aws-lc-rs` を指定したデフォルト features ビルドが成功する。
+- [x] OpenBSD, Windows, macOS で `quiche` が `boringssl` バックエンドで正常にビルドできる。
+- [x] Windows 上で UDP 非同期ソケット層が動作し、`http3` / `l4-proxy` が有効化される。
+- [x] OpenBSD, Windows (x86_64/aarch64), macOS (x86_64/aarch64) の全ターゲットで `full` features リリースビルドが成功する。
+- [x] `packaging/scripts/build-cross.sh` および関連ドキュメントが更新され、適切な粒度で git コミットされている。
+
+## 完了確認（2026-10-10）
+
+ソースと v0.7.0 の検証記録で受け入れ条件を確認し、完了とした（本文は計画書のまま実装記録が無かった）。
+
+| 目標 | 確認結果 |
+|------|----------|
+| macOS / Windows の rustls を aws-lc-rs へ | `Cargo.toml` の target 別依存で OpenBSD/NetBSD 以外は `aws_lc_rs`。`src/tls_provider.rs` の `cfg` も一致 |
+| 非 Linux の quiche を boring へ | macOS/Windows・BSD とも `boringssl-boring-crate` + `boring = "4.3"`。Linux は aws-lc-sys 共有のまま（B-47） |
+| Windows UDP | `src/runtime/udp.rs` に `cfg(windows)` 実装 |
+| 全ターゲットの `full` ビルド | `packaging/scripts/build-cross.sh` の既定 features は macOS / Windows（x86_64・aarch64）とも `full`。v0.7.0 で macOS aarch64 実機の単体 943・統合 54・E2E 555、Windows x86_64 実機の単体 902・統合 54・スモーク |
+
+同時に `src/tls_provider.rs` のモジュール説明（F-125 時点の「macOS / Windows は ring」のまま `cfg` と
+食い違っていた）を実装に合わせた。Windows の HTTP/3 は実機での負荷計測をしていない（スモークは TCP のみ）。
