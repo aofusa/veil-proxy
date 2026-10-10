@@ -119,6 +119,14 @@ h1tls_hs wrkclose -t2 -c64 https://127.0.0.1:${TLS_PORT}/3b.html}"
 
 rss_kb() { ps -o rss= -p "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 
+# veil の累積 CPU 時間（user + system、マイクロ秒）。VM のスケジューリング揺らぎで rps が
+# ぶれても、要求あたりの CPU 時間（= 処理の重さ）は安定して比べられる。
+cpu_us() {
+    procstat -r "$1" 2>/dev/null | awk '/user time|system time/ {
+        split($NF, t, ":"); sec = t[1] * 3600 + t[2] * 60 + t[3]; total += sec
+    } END { printf "%d", total * 1000000 }'
+}
+
 wait_port() {
     i=0
     while [ $i -lt 100 ]; do
@@ -164,23 +172,28 @@ while [ "$r" -le "$ROUNDS" ]; do
                 wrkclose) cpuset -l "$LOAD_CPUS" wrk -d "${DURATION}s" -H "Connection: close" $args > "$logf" 2>&1 & ;;
                 h2load) cpuset -l "$LOAD_CPUS" h2load -D "$DURATION" --warm-up-time 1 $args > "$logf" 2>&1 & ;;
             esac
-            lp=$!; peak=0
+            lp=$!; peak=0; c0=$(cpu_us "$VPID")
             while kill -0 "$lp" 2>/dev/null; do
                 x=$(rss_kb "$VPID"); [ "${x:-0}" -gt "$peak" ] && peak=$x
                 sleep 0.25
             done
             wait "$lp"
+            c1=$(cpu_us "$VPID")
             case "$tool" in
                 wrk*)
+                    nreq=$(awk '/requests in/ {print $1}' "$logf")
                     rps=$(awk '/^Requests\/sec:/ {print $2}' "$logf")
                     failed=$(awk '/Socket errors:/ {gsub(",","");f=$4+$6+$8+$10} /Non-2xx or 3xx/ {s=$5} END {print f+s}' "$logf") ;;
                 h2load)
+                    nreq=$(awk '/^requests:/ {print $8}' "$logf")
                     rps=$(awk '/^finished in/ {gsub(",","",$4); print $4}' "$logf")
                     failed=$(awk '/^requests:/ {f=$10+$12} /^status codes:/ {s=$7+$9} END {print f+s}' "$logf") ;;
             esac
-            printf '%s\t%s\t%s_rps\t%s\n%s\t%s\t%s_failed\t%s\n%s\t%s\t%s_peak_kb\t%s\n' \
-                "$name" "$r" "$wl" "${rps:-0}" "$name" "$r" "$wl" "${failed:-NA}" "$name" "$r" "$wl" "$peak" >> "$OUT"
-            log "  $wl rps=${rps:-0} failed=${failed:-NA} peak=${peak}KB"
+            cpr=$(awk -v a="$c0" -v b="$c1" -v n="${nreq:-0}" 'BEGIN { if (n > 0) printf "%.2f", (b - a) / n; else print 0 }')
+            printf '%s\t%s\t%s_rps\t%s\n%s\t%s\t%s_failed\t%s\n%s\t%s\t%s_peak_kb\t%s\n%s\t%s\t%s_cpu_us_per_req\t%s\n' \
+                "$name" "$r" "$wl" "${rps:-0}" "$name" "$r" "$wl" "${failed:-NA}" "$name" "$r" "$wl" "$peak" \
+                "$name" "$r" "$wl" "$cpr" >> "$OUT"
+            log "  $wl rps=${rps:-0} failed=${failed:-NA} peak=${peak}KB cpu/req=${cpr}us"
         done
         t0=$(date +%s)
         for t in $IDLE_POINTS; do

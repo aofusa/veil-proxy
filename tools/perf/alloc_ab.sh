@@ -164,6 +164,10 @@ start_upstream() {
 
 rss_kb() { awk '/^VmRSS:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
 
+# veil の累積 CPU 時間（user + system、マイクロ秒。/proc/<pid>/stat の 14・15 列）。
+CLK_TCK="$(getconf CLK_TCK)"
+cpu_us() { awk -v hz="$CLK_TCK" '{ printf "%d", ($14 + $15) * 1000000 / hz }' "/proc/$1/stat" 2>/dev/null || echo 0; }
+
 wait_port() {
     local port="$1" i
     for i in $(seq 1 100); do
@@ -212,23 +216,28 @@ run_load() {
             -D "$DURATION" --warm-up-time 1 "$@" >"$logf" 2>&1 &
     fi
     local lp=$!
+    local c0
+    c0=$(cpu_us "$VEIL_PID")
     while kill -0 "$lp" 2>/dev/null; do
         r=$(rss_kb "$VEIL_PID"); [ "${r:-0}" -gt "$peak" ] && peak=$r
         sleep 0.25
     done
     wait "$lp"
-    local rps failed
+    local c1 rps failed nreq
+    c1=$(cpu_us "$VEIL_PID")
     if [ "$tool" = wrk ]; then
         rps=$(awk '/^Requests\/sec:/ {print $2}' "$logf")
+        nreq=$(awk '/requests in/ {print $1}' "$logf")
         # Socket errors（connect/read/write/timeout）と非 2xx/3xx
         failed=$(awk '/Socket errors:/ {gsub(",","");f=$4+$6+$8+$10} /Non-2xx or 3xx/ {s=$5} END {print f+s}' "$logf")
-        echo "${rps:-0} ${failed:-0} $peak"
+        echo "${rps:-0} ${failed:-0} $peak $(awk -v a="$c0" -v b="$c1" -v n="${nreq:-0}" 'BEGIN { if (n > 0) printf "%.2f", (b - a) / n; else print 0 }')"
         return
     fi
+    nreq=$(awk '/^requests:/ {print $8}' "$logf")
     rps=$(awk '/^finished in/ {gsub(",","",$4); print $4}' "$logf")
     # 失敗 = failed + errored + 4xx/5xx（h2load の failed は非 2xx を数えない）
     failed=$(awk '/^requests:/ {f=$10+$12} /^status codes:/ {s=$7+$9} END {print f+s}' "$logf")
-    echo "${rps:-0} ${failed:-NA} $peak"
+    echo "${rps:-0} ${failed:-NA} $peak $(awk -v a="$c0" -v b="$c1" -v n="${nreq:-0}" 'BEGIN { if (n > 0) printf "%.2f", (b - a) / n; else print 0 }')"
 }
 
 cleanup() {
@@ -264,11 +273,11 @@ for round in $(seq 1 "$ROUNDS"); do
         while read -r wl args; do
             [ -z "$wl" ] && continue
             # shellcheck disable=SC2086
-            read -r rps failed peak <<<"$(run_load "$wl" $args)"
-            printf '%s\t%s\t%s_rps\t%s\n%s\t%s\t%s_failed\t%s\n%s\t%s\t%s_peak_kb\t%s\n' \
+            read -r rps failed peak cpr <<<"$(run_load "$wl" $args)"
+            printf '%s\t%s\t%s_rps\t%s\n%s\t%s\t%s_failed\t%s\n%s\t%s\t%s_peak_kb\t%s\n%s\t%s\t%s_cpu_us_per_req\t%s\n' \
                 "$name" "$round" "$wl" "$rps" "$name" "$round" "$wl" "$failed" \
-                "$name" "$round" "$wl" "$peak" >> "$OUT"
-            log "  $wl rps=$rps failed=$failed peak=${peak}KB"
+                "$name" "$round" "$wl" "$peak" "$name" "$round" "$wl" "$cpr" >> "$OUT"
+            log "  $wl rps=$rps failed=$failed peak=${peak}KB cpu/req=${cpr}us"
         done <<<"$WORKLOADS"
         t0=$(date +%s)
         for t in $IDLE_POINTS; do

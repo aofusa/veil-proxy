@@ -2,7 +2,7 @@
 """alloc_ab.sh の TSV を集計する（F-183）。
 
 各 metric をバリアントごとに中央値で並べ、先頭のバリアントを基準とした比（%）を添える。
-rps は高いほど良く、*_kb は低いほど良い。
+rps は高いほど良く、*_kb と *_cpu_us_per_req（要求あたりの veil の CPU 時間）は低いほど良い。
 """
 import statistics
 import sys
@@ -40,7 +40,7 @@ def main(path):
                 row.append("-")
                 continue
             med = statistics.median(xs)
-            cell = f"{med:,.0f}"
+            cell = f"{med:,.2f}" if med < 100 else f"{med:,.0f}"
             if len(xs) > 1:
                 cell += f" (±{statistics.pstdev(xs):,.0f})"
             if v != base and bmed:

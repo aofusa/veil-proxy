@@ -129,6 +129,38 @@ ktls_fallback_enabled = false  # kTLS required mode
 | Session Key Exposure | TLS handshake runs in userspace (rustls) (maintains PFS) |
 | DoS Attacks | Monitor kernel resources, rate limiting |
 
+## TLS Session Resumption (F-183)
+
+`[tls] session_resumption` selects how HTTP/1.1 and HTTP/2 clients resume TLS sessions
+(HTTP/3 resumption is handled by quiche).
+
+| Value | Behavior |
+|---|---|
+| `"tickets"` (default) | Stateless session tickets. The ticket key is shared by all workers, rotated automatically and kept across certificate reloads. TLS 1.3 resumption keeps no server-side state and takes no shared lock, so it works for any number of returning clients with constant memory. A `session_cache_size`-entry cache is also kept for TLS 1.2 clients that resume by session ID instead of tickets. |
+| `"cache"` | Server-side session cache only (`session_cache_size` entries, shared by all workers). |
+| `"off"` | No resumption (no tickets are sent). |
+
+```toml
+[tls]
+session_resumption = "tickets"
+session_cache_size = 4096   # entries ("cache", and TLS 1.2 session-ID clients with "tickets")
+tls13_tickets = 1           # tickets sent per TLS 1.3 handshake (0 with "off")
+```
+
+Before F-183 veil used the rustls defaults: a 256-entry cache shared by all workers and two
+TLS 1.3 tickets per handshake, each inserted into the cache. At a few thousand handshakes per
+second that cache turns over in well under a second, so clients returning later could not
+resume. Measured with `tools/perf/alloc_ab.sh` (TLS 1.3, OpenSSL 3 `wrk`, a new connection per
+request): tickets 1,908 req/s vs the old default 1,839 req/s; without resumption 532 req/s.
+
+Changing these keys requires a restart (certificate reloads keep the mode chosen at startup).
+
+> Note on the bundled `williamyeh/wrk` image (LibreSSL 2.7, TLS 1.2 only, 2018): with
+> `"tickets"` it resumes only every other connection (the client does not keep the ticket
+> issued on a resumed handshake), so `h1tls_hs` drops from ~5,500 to ~1,300 req/s compared
+> with `"cache"`. Current OpenSSL, BoringSSL, NSS, Go and rustls clients resume normally; if a
+> fleet of such legacy clients matters more than unbounded TLS 1.3 resumption, use `"cache"`.
+
 ## TLS Certificate Hot Reload
 
 Zero-downtime certificate rotation without restarting the proxy.

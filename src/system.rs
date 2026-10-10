@@ -85,35 +85,63 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
     }
 }
 
-/// mimalloc のアリーナを予約時に一括コミットしない（B-101）。
+/// mimalloc の起動時オプション（B-101 / F-183）。
 ///
-/// 既定（`arena_eager_commit = 2`: overcommit 環境で一括コミット）では、
-/// 解放済みページが purge で decommit されず、アイドル時でも約 25MB の匿名メモリが
-/// RSS に残る。0 にするとアイドル RSS が約 11MB まで下がる（スループット差なし）。
+/// - `arena_eager_commit = 0`（B-101）: 既定（`2`: overcommit 環境で一括コミット）では、
+///   解放済みページが purge で decommit されず、アイドル時でも約 25MB の匿名メモリが
+///   RSS に残る。0 にするとアイドル RSS が約 11MB まで下がる（スループット差なし）。
+/// - `purge_delay = 250`（F-183）: 既定 1000ms。空いたページを OS へ返すまでの遅延。
+///   ワーカーのアイドル時回収（`alloc_tune::idle_tick` の `mi_collect`）と組み合わせ、
+///   負荷後の RSS が約 4% 下がる（スループット差なし。`tools/perf/alloc_ab.sh` で計測）。
+///
 /// 最初のアリーナは最初の Rust アロケーションで作られるため、`main` より前
-/// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` が
-/// 明示されていればそちらを優先する。
+/// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` /
+/// `MIMALLOC_PURGE_DELAY` が明示されていればそちらを優先する。
 #[cfg(all(feature = "mimalloc", target_os = "linux", not(veil_alloc_active)))]
 mod mimalloc_early_options {
-    // libmimalloc-sys は mi_option_arena_eager_commit の定数を公開していない。
-    // mimalloc v2 の mi_option_e における列挙順（show_errors=0, show_stats=1,
-    // verbose=2, eager_commit=3, arena_eager_commit=4）。
+    // libmimalloc-sys は一部のオプション定数を公開していない。同梱の mimalloc v3 の
+    // mi_option_e における列挙順（show_errors=0, show_stats=1, verbose=2,
+    // deprecated_eager_commit=3, arena_eager_commit=4, …, deprecated_eager_commit_delay=14,
+    // purge_delay=15）。
     const MI_OPTION_ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 
-    extern "C" fn set_arena_eager_commit() {
+    extern "C" fn set_early_options() {
         // main 前なので std::env（アロケーションする）は使わず libc::getenv で見る
         // SAFETY: NUL 終端の静的文字列。init_array 実行時点ではスレッドは 1 本で環境変数は不変。
-        let preset = unsafe { libc::getenv(c"MIMALLOC_ARENA_EAGER_COMMIT".as_ptr()) };
-        if preset.is_null() {
-            // SAFETY: mi_option_set はオプション値を書き換えるだけで、初期化前でも呼べる。
-            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0) };
+        // mi_option_set はオプション値を書き換えるだけで、初期化前でも呼べる。
+        unsafe {
+            if libc::getenv(c"MIMALLOC_ARENA_EAGER_COMMIT".as_ptr()).is_null() {
+                libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0);
+            }
+            if libc::getenv(c"MIMALLOC_PURGE_DELAY".as_ptr()).is_null() {
+                libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 250);
+            }
         }
     }
 
     // `.init_array` の関数は Rust ランタイム初期化（最初のアロケーション）より前に呼ばれる。
     #[used]
     #[unsafe(link_section = ".init_array")]
-    static SET_ARENA_EAGER_COMMIT: extern "C" fn() = set_arena_eager_commit;
+    static SET_EARLY_OPTIONS: extern "C" fn() = set_early_options;
+
+    /// `.init_array` が実際に走り、列挙値の添字が正しいこと（添字のずれは黙って別の
+    /// オプションを書き換えるので、値を読み戻して確かめる。B-103 の教訓）。
+    #[test]
+    fn early_options_are_applied() {
+        // SAFETY: 読み取りのみ。
+        unsafe {
+            if libc::getenv(c"MIMALLOC_ARENA_EAGER_COMMIT".as_ptr()).is_null() {
+                assert_eq!(
+                    libmimalloc_sys::mi_option_get(MI_OPTION_ARENA_EAGER_COMMIT),
+                    0
+                );
+            }
+            if libc::getenv(c"MIMALLOC_PURGE_DELAY".as_ptr()).is_null() {
+                assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), 250);
+            }
+        }
+    }
 }
 
 // ====================
