@@ -164,8 +164,18 @@ mod freebsd_malloc_conf {
     pub static malloc_conf: ConfPtr = ConfPtr(super::FREEBSD_MALLOC_CONF.as_ptr());
 }
 
+/// - `dirty_decay_ms:1000`（既定 10000）: 空いたページを 1 秒で返す。
+/// - `muzzy_decay_ms:0`: MADV_FREE 段階を経ずに返す。
+/// - `retain:false`（既定 true）: decay したエクステントを `munmap` する。FreeBSD の
+///   `madvise` では RSS が下がらない（ページはメモリ逼迫まで常駐したまま）ため、既定では
+///   負荷後の RSS がピーク付近に張り付く。false で負荷後 RSS -49%（102 → 52MB）。
+/// - `lg_tcache_max:16`（既定 15）: 64KiB までをスレッドキャッシュに載せる（64KiB の読み取り
+///   バッファがアリーナのロックを通らない）。
+///
+/// 要求あたりの CPU 時間は既定と同等以下（-1〜-5%、`tools/perf/bsd/alloc_ab_bsd.sh`）。
 #[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
-const FREEBSD_MALLOC_CONF: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+const FREEBSD_MALLOC_CONF: &[u8] =
+    b"dirty_decay_ms:1000,muzzy_decay_ms:0,retain:false,lg_tcache_max:16\0";
 
 #[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
 extern "C" {
