@@ -7247,6 +7247,38 @@ impl CapModeBlocker {
     }
 }
 
+/// capability mode を要求されたときの起動時の扱い（F-181）。
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapModeDecision {
+    /// 要求されていない
+    NotRequested,
+    /// capability mode に入る
+    Enter,
+    /// 条件を満たさないが `allow_security_failures = true` なので rights 制限のみで続行する
+    RightsLimitedOnly(CapModeBlocker),
+    /// 条件を満たさないので起動を中止する（既定。fail-closed）
+    Abort(CapModeBlocker),
+}
+
+/// capability mode の起動時の扱いを決める（F-181）。
+///
+/// 要求したのに入れない構成は、他のサンドボックスと同じく既定で起動を中止する
+/// （黙って弱いサンドボックスのまま動かさない）。`allow_security_failures = true` のときだけ続行する。
+#[cfg(any(target_os = "freebsd", test))]
+pub fn capability_mode_decision(
+    requested: bool,
+    blocker: Option<CapModeBlocker>,
+    allow_security_failures: bool,
+) -> CapModeDecision {
+    match (requested, blocker) {
+        (false, _) => CapModeDecision::NotRequested,
+        (true, None) => CapModeDecision::Enter,
+        (true, Some(b)) if allow_security_failures => CapModeDecision::RightsLimitedOnly(b),
+        (true, Some(b)) => CapModeDecision::Abort(b),
+    }
+}
+
 /// capability mode の適格判定の入力（ルート以外）。
 #[cfg(any(target_os = "freebsd", test))]
 pub struct CapModeFacts {
@@ -8943,6 +8975,36 @@ mod f178_capability_mode_blocker_tests {
         assert_eq!(
             capability_mode_blocker(&upstream, &no_facts()),
             Some(CapModeBlocker::ProxyRoute)
+        );
+    }
+
+    /// F-181: 要求したのに入れない構成は既定で起動を中止し、`allow_security_failures` のときだけ続行する。
+    #[test]
+    fn decision_is_fail_closed_by_default() {
+        let b = Some(CapModeBlocker::ProxyRoute);
+        assert_eq!(
+            capability_mode_decision(false, b, false),
+            CapModeDecision::NotRequested
+        );
+        assert_eq!(
+            capability_mode_decision(false, None, true),
+            CapModeDecision::NotRequested
+        );
+        assert_eq!(
+            capability_mode_decision(true, None, false),
+            CapModeDecision::Enter
+        );
+        assert_eq!(
+            capability_mode_decision(true, None, true),
+            CapModeDecision::Enter
+        );
+        assert_eq!(
+            capability_mode_decision(true, b, false),
+            CapModeDecision::Abort(CapModeBlocker::ProxyRoute)
+        );
+        assert_eq!(
+            capability_mode_decision(true, b, true),
+            CapModeDecision::RightsLimitedOnly(CapModeBlocker::ProxyRoute)
         );
     }
 

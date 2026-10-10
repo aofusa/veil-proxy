@@ -864,15 +864,32 @@ pub fn run() {
                 http3,
                 http_redirect: loaded_config.listen_http_addr.is_some(),
             };
-            match crate::config::capability_mode_blocker(&loaded_config.route, &facts) {
-                None => true,
-                Some(b) => {
+            // F-181: 要求したのに入れない構成は、既定で起動を中止する（fail-closed）。
+            use crate::config::CapModeDecision;
+            match crate::config::capability_mode_decision(
+                true,
+                crate::config::capability_mode_blocker(&loaded_config.route, &facts),
+                sec.allow_security_failures,
+            ) {
+                CapModeDecision::Enter => true,
+                CapModeDecision::NotRequested => false,
+                CapModeDecision::RightsLimitedOnly(b) => {
                     warn!(
-                        "capsicum: capability mode requested but {}; staying in \
-                         rights-limited mode",
+                        "capsicum: capability mode requested but {}; continuing in \
+                         rights-limited mode because allow_security_failures = true",
                         b.as_str()
                     );
                     false
+                }
+                CapModeDecision::Abort(b) => {
+                    let msg = format!(
+                        "capsicum: capability mode requested but {}; aborting startup \
+                         (set allow_security_failures = true to continue in rights-limited mode)",
+                        b.as_str()
+                    );
+                    error!("{}", msg);
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
                 }
             }
         } else {
@@ -1156,6 +1173,7 @@ pub fn run() {
             // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
             // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
             // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
+            let allow_failures = loaded_config.global_security.allow_security_failures;
             let tls_auto_reload = loaded_config.tls_auto_reload;
             let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
             let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
@@ -1226,7 +1244,14 @@ pub fn run() {
                                     "capsicum: capability mode active ({} listeners bound)",
                                     expected
                                 ),
-                                Err(e) => error!("capsicum: cap_enter failed: {}", e),
+                                Err(e) => {
+                                    error!("capsicum: cap_enter failed: {}", e);
+                                    // F-181: 要求した防御が効かないまま動かさない。
+                                    if !allow_failures {
+                                        eprintln!("capsicum: cap_enter failed: {}; aborting", e);
+                                        std::process::exit(1);
+                                    }
+                                }
                             }
                             return;
                         }
@@ -1239,6 +1264,14 @@ pub fn run() {
                         "capsicum: timed out waiting for {} listeners; capability mode NOT applied",
                         expected
                     );
+                    // F-181: 要求した防御が効かないまま動かさない。
+                    if !allow_failures {
+                        eprintln!(
+                            "capsicum: timed out waiting for {} listeners; aborting",
+                            expected
+                        );
+                        std::process::exit(1);
+                    }
                 })
                 .expect("failed to spawn veil-cap-enter thread");
         }
