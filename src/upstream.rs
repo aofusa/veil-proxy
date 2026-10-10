@@ -113,6 +113,16 @@ impl io::Write for ProbeStream {
 pub(crate) fn connect_probe(addr: &str, timeout: Duration) -> io::Result<ProbeStream> {
     #[cfg(unix)]
     if let Some(path) = addr.strip_prefix("unix:") {
+        // F-182: capability mode 下は接続ブローカー経由（許可リストの添字で依頼する）。
+        #[cfg(target_os = "freebsd")]
+        if let Some(r) =
+            crate::connect_broker::connect_std_unix(std::path::Path::new(path), timeout)
+        {
+            let stream = r?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            return Ok(ProbeStream::Unix(stream));
+        }
         let stream = std::os::unix::net::UnixStream::connect(path)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -126,6 +136,16 @@ pub(crate) fn connect_probe(addr: &str, timeout: Duration) -> io::Result<ProbeSt
         ));
     }
 
+    // F-182: capability mode 下はホスト名の解決もブローカーが行う（本体は DNS を引けない）。
+    #[cfg(target_os = "freebsd")]
+    if addr.parse::<SocketAddr>().is_err() {
+        if let Some(r) = crate::connect_broker::connect_std_tcp(addr, timeout) {
+            let stream = r?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            return Ok(ProbeStream::Tcp(stream));
+        }
+    }
     let sock_addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -157,6 +177,11 @@ pub fn tcp_connect_timeout(
     addr: &SocketAddr,
     timeout: std::time::Duration,
 ) -> io::Result<std::net::TcpStream> {
+    // F-182: capability mode 下は接続ブローカー経由（許可リストの添字で依頼する）。
+    #[cfg(target_os = "freebsd")]
+    if let Some(r) = crate::connect_broker::connect_std_addr(addr, timeout) {
+        return r;
+    }
     let stream = std::net::TcpStream::connect_timeout(addr, timeout)?;
     if let Some(e) = stream.take_error()? {
         return Err(e);

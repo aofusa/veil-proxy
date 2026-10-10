@@ -127,6 +127,15 @@ impl WorkerListenerSource {
 // ====================
 
 pub fn run() {
+    // F-182: capsicum の capability mode 用の接続ブローカーとして再実行された場合（隠し引数）。
+    // 設定・ログ・ランタイムを一切初期化せずにブローカーのループへ入る。
+    #[cfg(target_os = "freebsd")]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(crate::connect_broker::BROKER_ARG))
+    {
+        std::process::exit(crate::connect_broker::broker_main());
+    }
+
     // コマンドライン引数を解析（--help, --version は clap が自動処理）
     let cli_args = CliArgs::parse();
 
@@ -855,10 +864,9 @@ pub fn run() {
             // metrics（Prometheus）はメインリスナーのルートとして配信されるため
             // 追加リスナーは無く、capability mode の妨げにならない。
             // HTTP→HTTPS リダイレクトリスナーは cap_enter 後の bind になるため不可。
-            // 判定はリロード時（F-178）と共用する。単一 URL の Proxy ルート（upstream
-            // グループを作らない）も connect(2) が要るので対象外。
+            // 判定はリロード時（F-178）と共用する。上流への接続は接続ブローカー（F-182）が
+            // 代行するので、プロキシ・upstream は阻害要因ではない。
             let facts = crate::config::CapModeFacts {
-                has_upstreams: !loaded_config.upstream_groups.is_empty(),
                 has_l4,
                 h2c,
                 http3,
@@ -868,10 +876,39 @@ pub fn run() {
             use crate::config::CapModeDecision;
             match crate::config::capability_mode_decision(
                 true,
-                crate::config::capability_mode_blocker(&loaded_config.route, &facts),
+                crate::config::capability_mode_blocker(&facts),
                 sec.allow_security_failures,
             ) {
-                CapModeDecision::Enter => true,
+                // F-182: 上流があれば、cap_enter より前（ここ。特権降格の後）に接続ブローカーを
+                // 起動する。起動できなければ他の失敗と同じく既定で起動を中止する。
+                CapModeDecision::Enter => {
+                    let allow = crate::config::startup_connect_allowlist(&loaded_config);
+                    if allow.is_empty() {
+                        true
+                    } else {
+                        match crate::connect_broker::start(allow) {
+                            Ok(()) => true,
+                            Err(e) if sec.allow_security_failures => {
+                                warn!(
+                                    "capsicum: failed to start the connect broker ({}); continuing in \
+                                     rights-limited mode because allow_security_failures = true",
+                                    e
+                                );
+                                false
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "capsicum: failed to start the connect broker ({}); aborting startup \
+                                     (set allow_security_failures = true to continue in rights-limited mode)",
+                                    e
+                                );
+                                error!("{}", msg);
+                                eprintln!("{}", msg);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
                 CapModeDecision::NotRequested => false,
                 CapModeDecision::RightsLimitedOnly(b) => {
                     warn!(

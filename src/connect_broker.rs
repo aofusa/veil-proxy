@@ -834,6 +834,65 @@ pub fn client() -> Option<&'static Client> {
     CLIENT.get()
 }
 
+/// 同期の接続（専用スレッド用）を、ブローカーが起動していればその経由で行う。
+/// `None` はブローカー未起動（呼び出し側は従来の経路へ）。`addr` は `"host:port"`（IP リテラル可）。
+#[cfg(target_os = "freebsd")]
+pub fn connect_std_tcp(addr: &str, timeout: Duration) -> Option<io::Result<std::net::TcpStream>> {
+    let c = client()?;
+    Some(blocking_stream(
+        c,
+        c.allowlist().index_of_conn_addr(addr),
+        timeout,
+    ))
+}
+
+/// `connect_std_tcp` の `SocketAddr` 版。
+#[cfg(target_os = "freebsd")]
+pub fn connect_std_addr(
+    addr: &SocketAddr,
+    timeout: Duration,
+) -> Option<io::Result<std::net::TcpStream>> {
+    let c = client()?;
+    Some(blocking_stream(
+        c,
+        c.allowlist().index_of_addr(addr),
+        timeout,
+    ))
+}
+
+/// `connect_std_tcp` の UDS 版。
+#[cfg(target_os = "freebsd")]
+pub fn connect_std_unix(
+    path: &Path,
+    timeout: Duration,
+) -> Option<io::Result<std::os::unix::net::UnixStream>> {
+    let c = client()?;
+    Some(blocking_stream(
+        c,
+        c.allowlist().index_of_unix(path),
+        timeout,
+    ))
+}
+
+/// ブローカー経由で接続し、ブロッキングモードの std のストリームにして返す。
+#[cfg(target_os = "freebsd")]
+fn blocking_stream<S>(c: &Client, idx: Option<u32>, timeout: Duration) -> io::Result<S>
+where
+    S: std::os::fd::FromRawFd,
+{
+    let idx = idx.ok_or_else(not_allowed)?;
+    let fd = c.connect_blocking(idx, timeout)?;
+    // 非ブロッキングを外す（呼び出し側は read/write のタイムアウトで待つ同期 I/O）。
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: connect_blocking が返した所有権のある接続済みソケット。
+    Ok(unsafe { S::from_raw_fd(fd) })
+}
+
 /// ブローカーを起動し、許可リストを渡して準備完了まで待つ（**`cap_enter` 前** に呼ぶ）。
 ///
 /// 特権降格の後に呼ぶので、ブローカーは本体と同じ（降格後の）利用者で動く。準備ができたら
