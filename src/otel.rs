@@ -282,7 +282,15 @@ fn post_otlp(config: &OtelConfig, body: &str) -> anyhow::Result<()> {
     let path = format!("{}/v1/metrics", path_base.trim_end_matches('/'));
     let addr = format!("{}:{}", host, port);
 
-    let mut stream = TcpStream::connect(&addr)?;
+    // F-182: capability mode 下は接続ブローカー経由（エンドポイントは起動時に許可リストへ入れてある）。
+    #[cfg(target_os = "freebsd")]
+    let brokered = crate::connect_broker::connect_std_tcp(&addr, Duration::from_secs(5));
+    #[cfg(not(target_os = "freebsd"))]
+    let brokered: Option<std::io::Result<TcpStream>> = None;
+    let mut stream = match brokered {
+        Some(r) => r?,
+        None => TcpStream::connect(&addr)?,
+    };
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -302,6 +310,14 @@ fn post_otlp(config: &OtelConfig, body: &str) -> anyhow::Result<()> {
 /// エンドポイント URL を (host, port, path) に分解する。
 ///
 /// 例: "http://localhost:4318" -> ("localhost", 4318, "")
+/// エクスポータが接続する `"host:port"`（`post_otlp` と同じ表記。F-182 の接続ブローカーの許可リスト用）。
+#[cfg(target_os = "freebsd")]
+pub(crate) fn connect_addr(endpoint: &str) -> Option<String> {
+    parse_endpoint(endpoint)
+        .ok()
+        .map(|(host, port, _)| format!("{}:{}", host, port))
+}
+
 fn parse_endpoint(endpoint: &str) -> anyhow::Result<(String, u16, String)> {
     let without_scheme = endpoint
         .strip_prefix("http://")

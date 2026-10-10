@@ -7214,15 +7214,12 @@ pub fn reresolve_routes_after_chroot(
 /// FreeBSD capsicum の capability mode（`cap_enter`）に入れない理由（F-178）。
 ///
 /// capability mode では `connect(2)`・`bind(2)`・絶対パスの `open(2)` ができない。
-/// 上流への接続やリスナーの追加を要する構成は対象外とし、起動時（入るかどうか）と
-/// リロード時（受け入れるかどうか）で同じ判定を使う。
+/// `cap_enter` 後にリスナーの追加（`bind(2)`）を要する構成は対象外とし、起動時（入るかどうか）と
+/// リロード時（受け入れるかどうか）で同じ判定を使う。上流への接続は接続ブローカー（F-182）が
+/// 代行するので、プロキシ・`[upstreams]` は阻害要因ではない。
 #[cfg(any(target_os = "freebsd", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapModeBlocker {
-    /// `[upstreams]` がある
-    Upstreams,
-    /// `Proxy` / `ProxyUpstream` のルートがある
-    ProxyRoute,
     /// `[[l4]]` リスナーがある
     L4,
     /// h2c が有効
@@ -7237,8 +7234,6 @@ pub enum CapModeBlocker {
 impl CapModeBlocker {
     pub fn as_str(self) -> &'static str {
         match self {
-            CapModeBlocker::Upstreams => "[upstreams] requires connect(2)",
-            CapModeBlocker::ProxyRoute => "a Proxy/ProxyUpstream route requires connect(2)",
             CapModeBlocker::L4 => "[[l4]] listeners require bind(2)/connect(2)",
             CapModeBlocker::H2c => "h2c requires an extra listener",
             CapModeBlocker::Http3 => "HTTP/3 requires an extra UDP listener",
@@ -7282,7 +7277,6 @@ pub fn capability_mode_decision(
 /// capability mode の適格判定の入力（ルート以外）。
 #[cfg(any(target_os = "freebsd", test))]
 pub struct CapModeFacts {
-    pub has_upstreams: bool,
     pub has_l4: bool,
     pub h2c: bool,
     pub http3: bool,
@@ -7291,18 +7285,7 @@ pub struct CapModeFacts {
 
 /// capability mode に入れない最初の理由を返す（入れるなら `None`）。
 #[cfg(any(target_os = "freebsd", test))]
-pub fn capability_mode_blocker(routes: &[Route], facts: &CapModeFacts) -> Option<CapModeBlocker> {
-    if facts.has_upstreams {
-        return Some(CapModeBlocker::Upstreams);
-    }
-    if routes.iter().any(|r| {
-        matches!(
-            r.action,
-            BackendConfig::Proxy { .. } | BackendConfig::ProxyUpstream { .. }
-        )
-    }) {
-        return Some(CapModeBlocker::ProxyRoute);
-    }
+pub fn capability_mode_blocker(facts: &CapModeFacts) -> Option<CapModeBlocker> {
     if facts.has_l4 {
         return Some(CapModeBlocker::L4);
     }
@@ -7318,10 +7301,75 @@ pub fn capability_mode_blocker(routes: &[Route], facts: &CapModeFacts) -> Option
     None
 }
 
+/// 上流ターゲットを接続ブローカーの許可リストのエントリにする（F-182）。
+#[cfg(target_os = "freebsd")]
+fn connect_target_of(t: &ProxyTarget) -> crate::connect_broker::Target {
+    use crate::connect_broker::Target;
+    if let Some(p) = &t.unix_path {
+        return Target::Unix(PathBuf::from(p.as_ref()));
+    }
+    match t.socket_addr {
+        Some(a) => Target::Addr(a),
+        None => Target::Host(t.conn_addr().as_str().to_string()),
+    }
+}
+
+/// 読み込み済みの設定から、接続ブローカーの許可リストを作る（F-182）。
+///
+/// `[upstreams]` の全サーバ、`Proxy` ルートの URL（ルートごとの上流グループ）、OpenTelemetry の
+/// エンドポイント。データプレーン・ヘルスチェック・WASM の外部呼び出しが接続するのはこの範囲だけ。
+#[cfg(target_os = "freebsd")]
+pub fn startup_connect_allowlist(cfg: &LoadedConfig) -> crate::connect_broker::Allowlist {
+    let mut allow = crate::connect_broker::Allowlist::new();
+    for group in cfg.upstream_groups.values() {
+        for s in &group.servers {
+            allow.insert(connect_target_of(&s.target));
+        }
+    }
+    for route in cfg.route.iter() {
+        if let Some(Backend::Proxy(group, ..)) = &route.resolved_backend {
+            for s in &group.servers {
+                allow.insert(connect_target_of(&s.target));
+            }
+        }
+    }
+    #[cfg(feature = "opentelemetry")]
+    if cfg.opentelemetry.enabled {
+        if let Some(a) = crate::otel::connect_addr(&cfg.opentelemetry.endpoint) {
+            allow.insert(crate::connect_broker::Target::from_host_port(&a));
+        }
+    }
+    allow
+}
+
+/// リロードする設定が接続する上流（F-182。許可リストに入っているかを確かめる）。
+#[cfg(target_os = "freebsd")]
+fn config_connect_targets(config: &Config) -> Vec<crate::connect_broker::Target> {
+    let mut out = Vec::new();
+    if let Some(ups) = &config.upstreams {
+        for u in ups.values() {
+            for e in u.resolved_servers() {
+                if let Some(t) = ProxyTarget::parse(&e.url) {
+                    out.push(connect_target_of(&t));
+                }
+            }
+        }
+    }
+    for route in config.route.as_deref().unwrap_or(&[]) {
+        if let BackendConfig::Proxy { url, .. } = &route.action {
+            if let Some(t) = ProxyTarget::parse(url) {
+                out.push(connect_target_of(&t));
+            }
+        }
+    }
+    out
+}
+
 /// capability mode 中のリロードで、新しい設定が cap_enter 後でも動くかを確かめる（F-178）。
 ///
 /// 拒否した場合はエラーを返し、呼び出し元（`reload_config`）は前の設定を保つ。
-/// - 上流・追加リスナーを要する構成（`capability_mode_blocker`）
+/// - 追加リスナーを要する構成（`capability_mode_blocker`）
+/// - 接続ブローカーの許可リスト（起動時に確定）に無い上流（F-182）
 /// - 起動時に登録していない静的ルート（cap_enter 後は新しいディレクトリを開けない）
 /// - アクセスログの出力先の変更・新規有効化（新しいパスを開けず、スレッドも作り直さない）
 #[cfg(target_os = "freebsd")]
@@ -7349,7 +7397,6 @@ fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
     #[cfg(not(feature = "http3"))]
     let http3 = false;
     let facts = CapModeFacts {
-        has_upstreams: config.upstreams.as_ref().is_some_and(|m| !m.is_empty()),
         has_l4,
         h2c,
         http3,
@@ -7359,8 +7406,23 @@ fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
             .as_ref()
             .is_some_and(|a| a.parse::<SocketAddr>().is_ok()),
     };
-    if let Some(b) = capability_mode_blocker(routes, &facts) {
+    if let Some(b) = capability_mode_blocker(&facts) {
         return reject(b.as_str().to_string());
+    }
+    // F-182: 上流は起動時に確定した接続ブローカーの許可リストに入っているものだけ。
+    let allow = crate::connect_broker::client().map(|c| c.allowlist());
+    for t in config_connect_targets(config) {
+        let ok = allow.is_some_and(|a| match &t {
+            crate::connect_broker::Target::Addr(x) => a.index_of_addr(x).is_some(),
+            crate::connect_broker::Target::Host(h) => a.index_of_host(h).is_some(),
+            crate::connect_broker::Target::Unix(p) => a.index_of_unix(p).is_some(),
+        });
+        if !ok {
+            return reject(format!(
+                "upstream {:?} is not in the connect allowlist fixed at startup",
+                t
+            ));
+        }
     }
     for route in routes {
         if let BackendConfig::File { path, .. } = &route.action {
@@ -8935,13 +8997,8 @@ mod shipped_config_tests {
 mod f178_capability_mode_blocker_tests {
     use super::*;
 
-    fn route(action: &str) -> Route {
-        toml::from_str(&format!("action = {}", action)).unwrap()
-    }
-
     fn no_facts() -> CapModeFacts {
         CapModeFacts {
-            has_upstreams: false,
             has_l4: false,
             h2c: false,
             http3: false,
@@ -8949,39 +9006,16 @@ mod f178_capability_mode_blocker_tests {
         }
     }
 
+    /// 追加リスナーが無ければ入れる（プロキシ・upstream は接続ブローカーが代行するので阻害要因ではない。F-182）。
     #[test]
-    fn static_and_redirect_routes_are_eligible() {
-        let routes = vec![
-            route(r#"{ type = "File", path = "/srv/www", mode = "sendfile" }"#),
-            route(
-                r#"{ type = "Redirect", redirect_url = "https://example.com/", redirect_status = 301, preserve_path = false }"#,
-            ),
-        ];
-        assert_eq!(capability_mode_blocker(&routes, &no_facts()), None);
-    }
-
-    /// 単一 URL の Proxy ルートは upstream グループを作らないが connect(2) が要る
-    /// （以前の起動時判定は upstream グループの有無しか見ていなかった）。
-    #[test]
-    fn proxy_routes_are_rejected() {
-        let proxy = vec![route(
-            r#"{ type = "Proxy", url = "http://127.0.0.1:8080" }"#,
-        )];
-        assert_eq!(
-            capability_mode_blocker(&proxy, &no_facts()),
-            Some(CapModeBlocker::ProxyRoute)
-        );
-        let upstream = vec![route(r#"{ type = "Proxy", upstream = "pool" }"#)];
-        assert_eq!(
-            capability_mode_blocker(&upstream, &no_facts()),
-            Some(CapModeBlocker::ProxyRoute)
-        );
+    fn eligible_without_extra_listeners() {
+        assert_eq!(capability_mode_blocker(&no_facts()), None);
     }
 
     /// F-181: 要求したのに入れない構成は既定で起動を中止し、`allow_security_failures` のときだけ続行する。
     #[test]
     fn decision_is_fail_closed_by_default() {
-        let b = Some(CapModeBlocker::ProxyRoute);
+        let b = Some(CapModeBlocker::L4);
         assert_eq!(
             capability_mode_decision(false, b, false),
             CapModeDecision::NotRequested
@@ -9000,27 +9034,17 @@ mod f178_capability_mode_blocker_tests {
         );
         assert_eq!(
             capability_mode_decision(true, b, false),
-            CapModeDecision::Abort(CapModeBlocker::ProxyRoute)
+            CapModeDecision::Abort(CapModeBlocker::L4)
         );
         assert_eq!(
             capability_mode_decision(true, b, true),
-            CapModeDecision::RightsLimitedOnly(CapModeBlocker::ProxyRoute)
+            CapModeDecision::RightsLimitedOnly(CapModeBlocker::L4)
         );
     }
 
     #[test]
-    fn listeners_and_upstreams_are_rejected() {
-        let routes = vec![route(
-            r#"{ type = "File", path = "/srv/www", mode = "sendfile" }"#,
-        )];
+    fn extra_listeners_are_rejected() {
         let cases = [
-            (
-                CapModeFacts {
-                    has_upstreams: true,
-                    ..no_facts()
-                },
-                CapModeBlocker::Upstreams,
-            ),
             (
                 CapModeFacts {
                     has_l4: true,
@@ -9051,7 +9075,7 @@ mod f178_capability_mode_blocker_tests {
             ),
         ];
         for (facts, want) in cases {
-            assert_eq!(capability_mode_blocker(&routes, &facts), Some(want));
+            assert_eq!(capability_mode_blocker(&facts), Some(want));
             assert!(!want.as_str().is_empty());
         }
     }

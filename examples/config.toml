@@ -698,9 +698,16 @@ revalidate_mtime = false
 # 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
 # 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
 # allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
-#   - Proxy ルート（単一 URL・upstream 参照とも）・[upstreams]・L4 リスナーが無い（connect 不要）
-#   - h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
+#   - L4 リスナー・h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
+#     （cap_enter 後の bind が要るため）
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
+# 上流へのプロキシ（F-182）: Proxy ルート・[upstreams] があっても capability mode に入れる。
+# cap_enter の前（特権降格の後）にサンドボックス外の接続ブローカー（veil 自身を再実行した
+# 子プロセス。同じ利用者で動く）を起動し、起動時の設定に書かれた上流（[upstreams] の全サーバ・
+# Proxy ルートの URL・OpenTelemetry のエンドポイント）だけを許可リストにする。本体は許可リストの
+# 添字でしか接続を依頼できず、ブローカーが connect したソケットを SCM_RIGHTS で受け取る。
+# ホスト名はブローカーが 30 秒ごとに解決し直す。代行のコストは新規の上流接続のときだけ。
+# ブローカーを起動できない・ブローカーが終了した場合は終了コード 1 で終わる（fail-closed）。
 # 静的ファイル配信（F-123）: capability mode 下でも完全動作する。起動時（cap_enter 前）
 # に各 File ルートのディレクトリ fd を確保し、配信時の open/stat を fd 相対の
 # openat(2)/fstatat(2) + O_RESOLVE_BENEATH（FreeBSD 13+、パストラバーサル封じ込め）へ
@@ -708,8 +715,8 @@ revalidate_mtime = false
 # SIGHUP の設定リロード（F-178）: capability mode 中も、cap_enter 前に開いた設定ファイルの
 # ディレクトリ fd から読み直す。ただし cap_enter 後に動かない変更を含むリロードは拒否して
 # 前の設定を保つ（再起動で反映）: 起動時の File ルートのディレクトリ配下にないパスを指す
-# File ルート、上記の Proxy/upstream/L4/h2c/HTTP/3/リダイレクト、アクセスログの有効化・
-# file_path の変更。同じパスのアクセスログの開き直し（logrotate の mv + SIGHUP）はできる。
+# File ルート、許可リストに無い上流（新しい Proxy ルートの URL・[upstreams] のサーバ）、
+# 上記の L4/h2c/HTTP/3/リダイレクト、アクセスログの有効化・file_path の変更。同じパスのアクセスログの開き直し（logrotate の mv + SIGHUP）はできる。
 # capsicum_capability_mode = true
 
 # 起動時に attach する jail 名（FreeBSD専用、root 前提）。
