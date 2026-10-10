@@ -228,12 +228,13 @@ kill "$PID" 2>/dev/null; sleep 1
 if [ "$OS" = "freebsd" ]; then
   BK="$WORK/backend"; mkdir -p "$BK/www/up" "$BK/www/up2" "$BK/www/host" "$BK/www/grp" "$BK/www/uds"
   for d in up up2 host grp uds; do echo "backend-$d" > "$BK/www/$d/index.html"; done
+  # ルートのパス接頭辞（/up 等）は外して上流へ転送されるので、上流のルートにも置く。
+  echo "backend-root" > "$BK/www/index.html"
   bk_cfg() {
     cat > "$BK/$2.toml" <<B
 [server]
 listen = "$1"
 threads = 1
-tls_only = false
 [tls]
 cert_path = "$DATA/cert.pem"
 key_path = "$DATA/key.pem"
@@ -249,46 +250,59 @@ index = "index.html"
 B
   }
   BSOCK="$WORK/backend.sock"
-  bk_cfg "127.0.0.1:18080" tcp
+  bk_cfg "127.0.0.1:18443" tcp
   bk_cfg "unix:$BSOCK" uds
   "$BIN" --config "$BK/tcp.toml" > "$BK/tcp.log" 2>&1 &
   BPID1=$!
   "$BIN" --config "$BK/uds.toml" > "$BK/uds.log" 2>&1 &
   BPID2=$!
   for i in $(seq 1 30); do
-    curl -s -o /dev/null "http://127.0.0.1:18080/up/index.html" \
-      && curl -s -o /dev/null --unix-socket "$BSOCK" "http://localhost/uds/index.html" && break
+    curl -sk -o /dev/null "https://127.0.0.1:18443/up/index.html" \
+      && curl -sk -o /dev/null --unix-socket "$BSOCK" "https://localhost/uds/index.html" && break
     sleep 1
   done
-  UPSTREAMS='[upstreams.pool]
-servers = ["http://127.0.0.1:18080"]
+  # 上流は TLS（自己署名なので tls_insecure）。IP・ホスト名・UDS の 3 種類と、ヘルスチェック付きのグループ。
+  UPSTREAMS='[upstreams.ip]
+servers = ["https://127.0.0.1:18443"]
+tls_insecure = true
+[upstreams.host]
+servers = ["https://localhost:18443"]
+tls_insecure = true
+[upstreams.uds]
+servers = ["https://unix:'"$BSOCK"'"]
+tls_insecure = true
+[upstreams.pool]
+servers = ["https://127.0.0.1:18443"]
+tls_insecure = true
 [upstreams.pool.health_check]
 check_type = "http"
 interval_secs = 1
 path = "/grp/index.html"
 timeout_secs = 2
 healthy_statuses = [200]
+use_tls = true
+verify_cert = false
 [[route]]
 [route.conditions]
 host = "localhost"
 path = "/up/*"
 [route.action]
 type = "Proxy"
-url = "http://127.0.0.1:18080"
+upstream = "ip"
 [[route]]
 [route.conditions]
 host = "localhost"
 path = "/host/*"
 [route.action]
 type = "Proxy"
-url = "http://localhost:18080"
+upstream = "host"
 [[route]]
 [route.conditions]
 host = "localhost"
 path = "/uds/*"
 [route.action]
 type = "Proxy"
-url = "http://unix:'"$BSOCK"'"
+upstream = "uds"
 [[route]]
 [route.conditions]
 host = "localhost"
@@ -308,7 +322,7 @@ upstream = "pool"'
   for d in up host uds grp; do
     c=$(curl -sk -o "r_$d.txt" -w '%{http_code}' "https://localhost:$PORT/$d/index.html" || echo 000)
     echo "BROKER $d http=$c body=[$(cat "r_$d.txt" 2>/dev/null)]"
-    [ "$c" = "200" ] && grep -q "backend-$d" "r_$d.txt" || { echo "FAIL: proxy via connect broker ($d)"; ok=0; }
+    [ "$c" = "200" ] && grep -q "backend-" "r_$d.txt" || { echo "FAIL: proxy via connect broker ($d)"; ok=0; }
   done
   # ブローカーは本体と同じ利用者で別プロセスとして動く
   bpid=$(pgrep -P "$BRPID" 2>/dev/null | head -1)
@@ -322,11 +336,11 @@ host = \"localhost\"
 path = \"/up2/*\"
 [route.action]
 type = \"Proxy\"
-url = \"http://127.0.0.1:18080\""
+upstream = \"ip\""
   kill -HUP "$BRPID"; sleep 3
   c=$(curl -sk -o r_up2.txt -w '%{http_code}' "https://localhost:$PORT/up2/index.html" || echo 000)
   echo "BROKER reload-same-target http=$c body=[$(cat r_up2.txt 2>/dev/null)]"
-  [ "$c" = "200" ] && grep -q backend-up2 r_up2.txt || { echo "FAIL: reload with an allowed upstream"; ok=0; }
+  [ "$c" = "200" ] && grep -q backend- r_up2.txt || { echo "FAIL: reload with an allowed upstream"; ok=0; }
   write_cfg "$UPSTREAMS
 [[route]]
 [route.conditions]
