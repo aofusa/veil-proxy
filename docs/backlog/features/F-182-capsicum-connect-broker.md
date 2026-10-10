@@ -1,6 +1,6 @@
 # F-182: capsicum の capability mode 下でも上流へプロキシできるようにする（接続ブローカー）
 
-**状態: 進行中（feat/f182-capsicum-connect-broker）**
+**状態: 完了（feat/f182-capsicum-connect-broker）**
 
 ## 背景
 
@@ -83,3 +83,32 @@ veil 本体（capability mode）                     接続ブローカー（cap
 ### 対象外（引き続き capability mode に入れない）
 
 L4 リスナー・h2c リスナー・HTTP/3・HTTP リダイレクトリスナー（いずれも `cap_enter` 後の `bind(2)` が要る）。
+
+## 実装
+
+| 箇所 | 内容 |
+|------|------|
+| `src/connect_broker.rs` | プロトコル（SCM_RIGHTS の送受信と検査）・許可リスト・ブローカーのループと解決スレッド・クライアント（unix 共通）。起動（`start`）・監視スレッド・防御（`harden`）・同期接続の補助（`connect_std_*`）は FreeBSD 専用 |
+| `src/runtime/reactor/tcp/unix.rs` | `BrokerConnect`（FreeBSD 専用）。`connect` / `connect_unix` / `connect_str` はブローカー起動時だけこれを使う |
+| `src/upstream.rs`・`src/otel.rs` | ヘルスチェック・WASM の外部呼び出し・OpenTelemetry の同期接続をブローカー経由にする |
+| `src/config.rs` | `startup_connect_allowlist`（許可リスト）、capability mode の阻害要因から Proxy / `[upstreams]` を外す、リロード時は許可リスト外の上流を拒否 |
+| `src/entry.rs` | 隠し引数でブローカーとして起動、capability mode に入る構成で上流があればブローカーを起動（失敗時は fail-closed） |
+
+## 検証（2026-10-10）
+
+- Linux: 単体 1004（ブローカーのプロトコル 5 件: 許可された TCP・ホスト名・UDS への接続、範囲外の添字と接続拒否の
+  errno、不正な要求（magic・長さ・fd なし・fd 2 本・ソケット以外の fd）を捨てて処理を続けること、許可リストの
+  初期化メッセージの検査、重複の統合）・統合 54・E2E 565/565（io_uring・epoll）。clippy 警告なし
+- FreeBSD 14.3 x86_64（QEMU/KVM）: 単体 966/0・統合 54/0・E2E 565/0（capability mode を使わない経路の回帰なし）
+- FreeBSD security-e2e: PASS。capability mode のまま、IP・ホスト名・UDS・ヘルスチェック付きグループの上流へ
+  プロキシして 200。ブローカーは子プロセスとして本体と同じ利用者で動く。同じ上流のままのリロードは通り、許可リスト外の
+  上流を足すリロードは拒否。ブローカーを kill すると本体は終了コード 1。F-178・F-181 の確認も引き続き PASS
+
+## 性能
+
+- **定常状態**（上流はプールで再利用）: FreeBSD VM（4 vCPU、h2load も同じ VM）で HTTP/1.1・32 接続・3 バイトの
+  プロキシ、交互 6 ラウンド。capsicum なし 中央値 6,931 rps、capability mode + ブローカー 中央値 6,807 rps（−1.8%）。
+  ラウンド間のばらつき（±8%）の範囲で、差は無い。全要求成功。
+- **新規の上流接続 1 本あたり**: Linux の単体テストの同期経路で、直接 connect 約 57µs に対しブローカー経由
+  約 145〜195µs（+90〜140µs。プロセス間の起床 2 回と fd の受け渡し）。TLS ハンドシェイク（ミリ秒単位）に比べて小さく、
+  プール・多重化で再利用する要求には乗らない。
