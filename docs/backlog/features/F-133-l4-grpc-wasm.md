@@ -236,3 +236,11 @@ cargo fmt --all
       `test_l4_wasm_close_on_marker`/`test_l4_wasm_disabled_listener_still_passthrough`/
       `test_grpc_wasm_trailer_mutation`/`test_grpc_wasm_request_header_mutation`）。
       **実行**は親タスク側が担当（`./tests/e2e_setup.sh test`）。
+
+## E2E（2026-10-10 追記）
+
+E2E は追加済みで通過している: `test_grpc_wasm_interceptor`、`test_grpc_wasm_trailer_mutation`、
+`test_grpc_wasm_request_header_mutation`、`test_grpc_over_http3_wasm_interceptor`、
+`test_l4_wasm_downstream_upstream_data_rewrite`、`test_l4_wasm_close_on_marker`、
+`test_l4_wasm_disabled_listener_still_passthrough`（2026-10-10 の Linux E2E 565/565 に含まれる）。
+WASM 発の `proxy_grpc_call` の実行系は F-139 で完了。

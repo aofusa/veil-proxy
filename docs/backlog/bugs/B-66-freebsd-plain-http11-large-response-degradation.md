@@ -1,7 +1,7 @@
 # B-66: FreeBSD 平文 HTTP/1.1 の大レスポンス配信が計測を重ねると劣化する（要再検証）
 
 - 優先度: P3（当初 P1 として起票したが、根拠の大半が計測不備由来と判明したため格下げ）
-- 状態: 未確認（計測やり直しが必要）
+- 状態: 完了（未再現のためクローズ。2026-08-17 再検証）
 - 発見: F-155（FreeBSD perf 最適化）の `h1_file_plain` シナリオ追加時、2026-08-17
 - 環境: FreeBSD 14.3-RELEASE aarch64 / QEMU+HVF on Apple Silicon / 4 vCPU・4GB /
   サーバ 2 コア（cpuset 0,1）・負荷生成 2 コア（cpuset 2,3）・loopback

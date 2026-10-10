@@ -155,3 +155,10 @@ docker run --rm -v $(pwd):/io -w /io messense/cargo-zigbuild \
   entitlements だが、サーバプロセスとしての適用は別途調査が必要）。
 - Windows 対応（WSAPoll reactor・Winsock ソケット抽象・Job Object）は規模が
   大きいため、本チケットとは別チケットで実施する。
+
+## 実機検証（2026-10-10 追記）
+
+当初は Docker のクロスビルドのみだったが、v0.7.0 のリリース前検証で macOS aarch64 実機（kqueue reactor、`full`）の
+単体 943・統合 54・E2E 555、Windows x86_64 実機（WSAPoll reactor）の単体 902・統合 54・スモーク（静的 200・プロキシ 200・
+後段停止時 502）を実施済み。Windows は bash の E2E ハーネスが無いためネイティブ E2E はスモークのみ。
+TLS プロバイダは F-131 で macOS / Windows とも aws-lc-rs へ統一した。

@@ -105,3 +105,9 @@ export するため）。詳細は設計メモ参照。
       更新し、実際の Cargo.toml と整合させる。
 - [ ] QEMU 上の FreeBSD/OpenBSD で capsicum/pledge 有効 + HTTP/3 の証明書リロード実地検証
       （別途実施、本チケットの完了はローカル検証まで）。
+
+## QEMU 実地検証（2026-10-10 追記）
+
+F-176 の BSD security-e2e で確認済み。FreeBSD 14.3 aarch64 は capsicum capability mode 下で `[tls] auto_reload` による
+証明書リロードが成功し、OpenBSD 7.9（aarch64 / x86_64）は pledge + unveil 下で SIGHUP による証明書リロードが成功した。
+capability mode 下の SIGHUP による **設定** リロードは対象外で、F-178 で扱う。

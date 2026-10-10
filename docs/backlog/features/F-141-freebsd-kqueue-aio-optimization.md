@@ -145,3 +145,11 @@ FreeBSD の `sendfile(2)` を使ったファイル→ソケットのゼロコピ
   すべて warning ゼロ・テスト全通過を確認済み（`veil_rt_uring`/`veil_poller_epoll`
   経路は無変更のため regression 無し）。
 - 実機 FreeBSD（QEMU）でのビルド・E2E・性能計測は依頼者が別途実施する。
+
+## 完了（2026-10-10）
+
+状態欄の「QEMU 実地検証は別途」は満たされたため完了とする。kqueue の changelist バッチと `read_hint`、FreeBSD の
+`sendfile` 経路は以後の FreeBSD QEMU の E2E（2026-10-10 の FreeBSD 14.3 aarch64 で 565/0、security-e2e PASS）で
+毎回通っており、性能は F-155 で計測済み。本文の見送り項目（`EV_CLEAR` / `EV_DISPATCH`、`aio_readv` /
+`aio_writev`、`lio_listio`、UDP の追加バッチ）は検証なしの `unsafe` 拡大を避ける意図的な不採用。
+`sf_hdtr` は F-155 で平文 HTTP/1.1 限定で実装済み。

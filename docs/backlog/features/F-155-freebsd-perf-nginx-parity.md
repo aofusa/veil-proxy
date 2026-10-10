@@ -1,7 +1,7 @@
 # F-155: FreeBSD の対 nginx パフォーマンスパリティ（ハーネス適正化 + reactor/静的配信の固定費削減）
 
 - 優先度: P1
-- 状態: 完了（Phase 6 は効果未確認。有効な A/B が取れていないため要再評価）
+- 状態: 完了（Phase 6 の残課題は F-156 / F-157 で解消）
 - 関連: F-141（FreeBSD kqueue/sendfile）、F-145（reactor E2E の空白地帯）、F-153/F-154/B-65（静的配信の固定費）、F-123（capsicum capability mode の dirfd 相対化）、B-63（aio 除外）
 
 ## 背景
@@ -136,3 +136,8 @@ FreeBSD の `sendfile(2)` ゼロコピー経路は `handle_sendfile_userspace` �
 - `sf_hdtr` の実機での正しさ: 平文 HTTP/1.1 で 200 応答・`Content-Length` 一致・
   3B 本体一致・54,576B 本体の md5 が配信元と一致することを確認
   （ヘッダの重複送信/欠落が起きていないことの直接的な証拠）。
+
+## 残課題の行き先（2026-10-10 追記）
+
+残課題だった h2c 平文と L4 TCP の 54KB（対 nginx 0.61 / 0.63）は、F-156（L4 マルチワーカーと h2c accept）と
+F-157（h2c の対 nginx 劣後 0.51 → 0.886。当初の writev 案は棄却）で対処済み。

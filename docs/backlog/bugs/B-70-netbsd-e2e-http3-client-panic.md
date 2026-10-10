@@ -1,7 +1,7 @@
 # B-70: NetBSD の E2E が `test_http3_client_creation` の panic で中断する
 
 **優先度**: P2
-**ステータス**: 未修正（F-158 とは無関係であることを構造的に確認済み）
+**ステータス**: 解消（2026-10-10。F-176 の quinn-udp vendoring 後、NetBSD aarch64 の E2E 565/0）
 **発見日**: 2026-08-22（F-158 のマルチプラットフォーム検証中）
 **関連**: B-51（OpenBSD の aws-lc-rs SIGSEGV）、F-140（NetBSD の暗号プロバイダ選択）
 
@@ -62,3 +62,10 @@ async fn test_http3_client_creation() {
 **NetBSD は「ビルド・パッケージは可能だが、E2E の全体結果が取得できない」状態。**
 panic が 1 件でテストバイナリごと落ちるため、他 543 件の合否が不明である。
 切り分けには当該テストを `#[ignore]` するか `--skip` で除外して再実行する必要がある。
+
+## 2026-10-10 解消
+
+F-176 の検証（NetBSD 10.1 aarch64、QEMU/HVF）でフル E2E が **565 / 0**（HTTP/3 込み）となり、
+`common::http3_client::tests::test_http3_client_creation` を含む全件が通過した。panic の原因は B-62 と同じ
+quinn-udp の CMSG アラインメント（libc の `_ALIGNBYTES` 誤り）で、`third_party/quinn-udp` の vendoring
+（B-62 / F-176）で解消したと判断する。

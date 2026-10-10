@@ -68,3 +68,10 @@ sysreg 経由実装の流用）を入れるのが本来の解。boring / quiche 
 - B-55（wasmtime が BSD の一部プラットフォームをサポートしていない件。本チケットは
   B-55 の検証中に発見）
 - F-140（NetBSD 対応。本チケットの事象は F-140 の実機検証から得られた知見）
+
+## 追記（2026-10-10）: OpenBSD aarch64 にも同じ回避が入っている
+
+`tools/qemu/bsd-vm.sh` の `_guest_env_prefix()` は、NetBSD aarch64 だけでなく **OpenBSD aarch64** にも
+`CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` を付けている
+（同じ BoringSSL の CPU 機能検出の欠落）。boring / quiche を上げるときは両方の要否を確認する。
+2026-10-10 の v0.8.0 検証でも、両環境とも回避ありでビルド・E2E が成功している。

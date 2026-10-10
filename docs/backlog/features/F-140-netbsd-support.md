@@ -328,3 +328,9 @@ pkgin install rust-bin cmake llvm clang libressl protobuf gmake bash curl git na
 - `pkgconf` — base に `pkg-config` コマンドが無く `openssl-sys` が失敗する
 - `libressl` — `system-tls` 利用時のみ。ただし **`system-tls` は HTTP/3 と併用不可**
   （F-137/F-142 参照）なので、既定の `full-netbsd`（vendored）では不要
+
+## QEMU 実地検証（2026-10-10 追記）
+
+F-176 で NetBSD 10.1 の x86_64 / aarch64 とも QEMU で単体・E2E・security-e2e（chroot + 特権降格）を実施した。
+aarch64 は E2E 565/0、x86_64 は 564/1（B-110、負荷依存の WASM テスト）。security-e2e で chroot 下の静的配信が
+403 になる B-109 を発見・修正した。
