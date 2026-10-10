@@ -1,6 +1,6 @@
 # F-181: capsicum の capability mode を要求して入れないとき起動を中止する（fail-closed）
 
-**状態: 進行中（feat/f178-capsicum-config-reload）**
+**状態: 完了（feat/f178-capsicum-config-reload）**
 
 ## 現状の問題
 
@@ -29,3 +29,10 @@
 - 単体: 判定関数の全組み合わせ。
 - FreeBSD security-e2e: capability mode + Proxy ルートの構成は終了コード 1 で起動せず理由をログに出す。
   `allow_security_failures = true` なら警告して起動する。
+
+## 検証（2026-10-10）
+
+- Linux: 単体 1000・統合 54。clippy（`full --all-targets`、`--no-default-features`）警告なし
+- FreeBSD 14.3 x86_64（QEMU/KVM）: 単体 962/0・統合 54/0。security-e2e PASS
+  （capability mode + Proxy ルートは終了コード 1 で中止し理由をログに出す。`allow_security_failures = true` なら
+  警告して rights 制限のみで起動し 200 を返す）
