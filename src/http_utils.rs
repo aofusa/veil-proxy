@@ -17,6 +17,7 @@ pub(crate) const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 ///
 /// IPv6 の最大表記（39 文字）+ IPv4-mapped 形式（45 文字）を収める 46 バイト固定。
 /// `as_str()` で `&str` として下流（`&str` を取る全 API）へ渡す。
+#[derive(Clone, Copy)]
 pub(crate) struct IpStr {
     buf: [u8; 46],
     len: u8,
@@ -1741,6 +1742,57 @@ pub(crate) fn status_code_to_reason(status_code: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+/// chunked のチャンクサイズ行（`<hex>\r\n`）を `buf` へ追記する（`format!` を避ける）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) fn push_chunk_size_line(buf: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buf.push(b'0');
+    } else {
+        let mut tmp = [0u8; 16];
+        let mut i = tmp.len();
+        while n > 0 {
+            i -= 1;
+            let d = (n & 0xf) as u8;
+            tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+            n >>= 4;
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// F-177: 冪等なメソッドか（RFC 9110 §9.2.2。同じ要求を再送しても結果が変わらない）。
+///
+/// プールから取り出した上流接続が応答の 1 バイト目より前に失敗したとき、新規接続で
+/// 1 回だけ再送してよいかの判定に使う。POST / PATCH は対象外。
+#[inline]
+pub(crate) fn is_idempotent_method(method: &[u8]) -> bool {
+    matches!(
+        method,
+        b"GET" | b"HEAD" | b"OPTIONS" | b"PUT" | b"DELETE" | b"TRACE"
+    )
+}
+
+#[cfg(test)]
+mod idempotent_method_tests {
+    #[test]
+    fn idempotent_methods_f177() {
+        for m in [
+            &b"GET"[..],
+            b"HEAD",
+            b"OPTIONS",
+            b"PUT",
+            b"DELETE",
+            b"TRACE",
+        ] {
+            assert!(super::is_idempotent_method(m));
+        }
+        for m in [&b"POST"[..], b"PATCH", b"CONNECT", b"get"] {
+            assert!(!super::is_idempotent_method(m));
+        }
     }
 }
 

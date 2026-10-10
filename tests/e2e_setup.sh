@@ -69,6 +69,7 @@ BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
 BACKEND_UDP_ECHO_PORT=9019
+BACKEND_ECHO2_PORT=9020
 
 # F-170: UDS バックエンド（Unix ドメインソケット上流）検証用のソケットパス。
 # バックエンドは veil 自身（F-164 の UDS リスナー）を使い、1 プロセスで
@@ -821,6 +822,27 @@ algorithm = "round_robin"
 servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
 tls_insecure = true
 
+# F-175: 上流 HTTPS の HTTP/2。"on" は h2 を必須にし（上流が h2 を選ばなければ 502）、
+# "off" は ALPN http/1.1 のみ（B-83 までの挙動）。既定（alpn-h2-pool）は "auto"。
+[upstreams."alpn-h2-on-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
+tls_insecure = true
+http2 = "on"
+
+[upstreams."alpn-h2-off-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
+tls_insecure = true
+http2 = "off"
+
+# F-175: HTTP/2 を話さない HTTPS 上流に "on" を指定すると 502 になる
+[upstreams."h1-only-h2-on-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND1_PORT}"]
+tls_insecure = true
+http2 = "on"
+
 # F-44: HTTPS echo バックエンド（自己署名証明書・TLS ストリーミング検証用）
 [upstreams."tls-echo-pool"]
 algorithm = "round_robin"
@@ -1001,6 +1023,17 @@ upstream = "backend-pool"
 [route.security]
 rate_limit_requests_per_min = 10
 
+# B-31: レート制限は全ワーカー共通・ルートごとに数えるため、HTTP/3 の E2E は専用ルートを使う
+# （HTTP/1.1 の E2E と同じ分に同じルートを叩くと上限を使い切っている）
+[[route]]
+[route.conditions]
+path = "/rate-limited-h3/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+rate_limit_requests_per_min = 10
+
 [[route]]
 [route.conditions]
 host = "127.0.0.1"
@@ -1135,6 +1168,54 @@ upstream = "alpn-h2-pool"
 [[route]]
 [route.conditions]
 host = "localhost"
+path = "/alpn-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/alpn-h2-off/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-off-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/h1-only-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "h1-only-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2-off/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-off-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/h1-only-h2-on/*"
+[route.action]
+type = "Proxy"
+upstream = "h1-only-h2-on-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
 path = "/strict-cert/*"
 [route.action]
 type = "Proxy"
@@ -1245,6 +1326,36 @@ path = "/echo-upload/*"
 [route.action]
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+
+# B-104: HEAD 応答後の上流接続の再利用の検証用。2 つ目の echo（別ポート）を使い、上流接続プールの
+# キーを分ける（並行テストと上流接続を取り合わない）。
+[[route]]
+[route.conditions]
+path = "/echo-head-ka/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO2_PORT}"
+
+# B-97: HTTP/3 のバッファ経路（buffering = full）が接続を止めないことの検証用
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/echo-full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+[route.buffering]
+mode = "full"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/echo-full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+[route.buffering]
+mode = "full"
 
 # F-44: TLS バックエンドストリーミング検証用（HTTPS echo バックエンド）
 [[route]]
@@ -1431,6 +1542,15 @@ EOF
     # gRPCルート設定
     # F-97: Full バッファリング設定でも gRPC は H2C でバイパスされること
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+# F-171: 双方向ストリーミング gRPC の全二重中継（WASM・full バッファなし = ストリーミング経路）
+[[route]]
+[route.conditions]
+path = "/grpc.test.v1.TestService/BidirectionalStreaming"
+[route.action]
+type = "Proxy"
+upstream = "grpc-pool"
+use_h2c = true
+
 [[route]]
 # F-94: gRPC + WASM インターセプタ E2E 用（modules は route 直下）
 # F-97: grpc-pool = consistent_hash + x-user-id / Full buffering bypass
@@ -2101,7 +2221,7 @@ start_servers() {
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" ECHO2_PORT="${BACKEND_ECHO2_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \

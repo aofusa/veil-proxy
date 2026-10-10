@@ -23,6 +23,22 @@ threads = 0  # If unspecified or 0, uses same number as CPU cores
 - Each worker thread is pinned to a CPU core (CPU affinity)
 - If thread count exceeds core count, assigned round-robin
 - Recommend setting lower in memory-constrained environments
+- `0` / unspecified honors the cgroup CPU quota (`cpu.max` / `cpu.cfs_quota_us`): a container started with `--cpus 0.25` gets 1 worker, not one per host core
+
+### Memory Footprint (B-101)
+
+Measured in a 1-worker TLS container (`--cpus 0.25`):
+
+| | v0.7.0 | v0.8.0 |
+|---|---|---|
+| Idle process (anon) | ~25 MB | ~10 MB |
+| Idle keep-alive TLS connection | ~100 KB | ~33 KB |
+| Peak under `wrk -c400` (static, TLS) | ~100 MB | ~58 MB |
+
+- A keep-alive connection waiting for its next request holds no read buffer: it waits for readiness first and borrows the 64 KB buffer only when data has arrived. The request accumulation buffer starts at 8 KB and is returned to a per-thread pool while the connection is idle.
+- Per-thread buffer pools are allocated lazily and capped (64 entries each).
+- mimalloc arenas are not eagerly committed (`arena_eager_commit = 0`, set before `main`), which removes ~15 MB of resident memory with no measurable throughput change. Set `MIMALLOC_ARENA_EAGER_COMMIT` in the environment to override.
+- Sizing guide: a 64 MB container sustains 600 idle TLS connections plus 400 active ones. Use `[security] max_concurrent_connections` to bound memory in smaller containers.
 
 ### SO_REUSEPORT CBPF Load Balancing
 

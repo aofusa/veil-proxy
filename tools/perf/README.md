@@ -54,7 +54,7 @@
 > 代わりに `quinn` + `h3`（テスト・計測ツール向けの HTTP/3 ライブラリ。本番データプレーンの
 > `quiche` とは別方針、AGENTS.md 参照）で実装した自前クライアント
 > `tools/perf/h3load`（`h2load` 互換の CLI・出力書式、`cargo build --release --manifest-path
-> tools/perf/h3load/Cargo.toml` でビルド）を使えます。`tools/perf/freebsd/run_perf_freebsd.sh` は
+> tools/perf/h3load/Cargo.toml` でビルド）を使えます。`tools/perf/bsd/run_perf_bsd.sh`（F-176 で FreeBSD / NetBSD / OpenBSD 共通化。旧パス `tools/perf/freebsd/` は互換用の転送スクリプト）は
 > これを優先して使い（無ければ `h2load --h3` にフォールバック）、詳細は同スクリプトのヘッダ
 > コメントを参照してください。
 >

@@ -83,6 +83,16 @@ pub fn configure_alpn_http11_client(mut config: ClientConfig) -> ClientConfig {
     config
 }
 
+/// rustls ClientConfig に上流向けの ALPN `h2, http/1.1` を設定する（F-175）。
+///
+/// 上流の `http2 = "auto" | "on"` で使う。上流が選んだプロトコル（`negotiated_h2`）で
+/// HTTP/2（多重化接続）と HTTP/1.1 を切り替えるため、B-83 の「h2 を提示しながら HTTP/1.1 を
+/// 送る」問題は起きない。
+pub fn configure_alpn_h2_client(mut config: ClientConfig) -> ClientConfig {
+    config.alpn_protocols = ALPN_H2_HTTP11.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
 /// ネゴシエートされたプロトコルを取得
 ///
 /// TLS ハンドシェイク完了後に呼び出し、選択されたプロトコルを返します。

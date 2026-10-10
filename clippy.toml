@@ -19,6 +19,7 @@ disallowed-methods = [
     { path = "std::fs::write", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。buffering 等は runtime::offload 経由で行う" },
     { path = "std::fs::remove_file", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。runtime::io::remove_file / offload を使う" },
     { path = "std::io::copy", reason = "ホットパス禁止（AGENTS.md）: 同期コピー。splice / 非同期 I/O を使う" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "ホットパス禁止（AGENTS.md、B-107）: 同期 DNS（getaddrinfo）。runtime::dns::resolve を使う。起動時・専用スレッド・offload 内のみ理由付き allow 可" },
 ]
 
 # 引数数・型複雑度の閾値（プロジェクト判断）:

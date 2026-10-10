@@ -20,7 +20,13 @@ members = [".", "fuzz"]
 # （詳細は tools/perf/h3load/Cargo.toml の冒頭コメント）。計測時のみ
 # `cargo build --release --manifest-path tools/perf/h3load/Cargo.toml` で明示ビルドする。
 # third_party/quiche も同じ理由で除外する（F-172、crates.io quiche 0.24.9 の vendoring）。
-exclude = ["third_party/wasmtime", "third_party/quiche", "tools/perf/h3load"]
+# third_party/quinn-udp もテスト用 HTTP/3 クライアントの依存の vendoring（F-176 / B-62）で同じ扱い。
+exclude = [
+    "third_party/wasmtime",
+    "third_party/quiche",
+    "third_party/quinn-udp",
+    "tools/perf/h3load",
+]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -357,34 +363,6 @@ full-openbsd = [
 full-netbsd = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
-    "opentelemetry",
-    "compression", "cache", "metrics",
-    "websocket", "rate-limit", "buffering",
-    "system-allocator",
-    "admin",
-    "access-log",
-    "l4-proxy",
-]
-
-# `full-netbsd` から `http3` だけを外したセット（B-62、**E2E 専用**）。
-#
-# NetBSD/aarch64 では E2E の HTTP/3 テストクライアントが使う dev-dependency の
-# quinn-udp が起動直後に panic し、`quinn::Endpoint` の Drop 内で二重 panic して
-# **テストバイナリごと SIGABRT で落ちる**ため、フル E2E スイートが 1 件も完走しない。
-# 原因は libc クレートの NetBSD/aarch64 向け `_ALIGNBYTES` が `c_int`（3）になって
-# いること（正しくは `c_long` の 7。x86_64 側は正しい）で、CMSG のアラインメントが
-# カーネルと 4 バイトずれる。veil 本体は cmsg を io_uring 経路（Linux 専用）でしか
-# 使わないため影響を受けない。詳細は docs/backlog/bugs/B-62-*.md。
-#
-# テスト名による `--skip` では取りこぼす（`test_alt_svc_upgrade_flow` のように名前に
-# http3/h3 を含まない HTTP/3 テストがあるため実測で確認）。feature を落として
-# HTTP/3 テストとクライアントをコンパイル対象から外すのが確実。
-# **配布バイナリのビルドには使わない**（`build`/`fetch` は `full-netbsd` のまま）。
-# NOTE: `grpc-full` は `http3` を含む（grpc-full = grpc + grpc-web + http3）ので
-# 使えない。gRPC は HTTP/2 上のものだけを有効にする。
-full-netbsd-no-http3 = [
-    "ktls", "http2",
-    "grpc", "grpc-web", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -805,3 +783,6 @@ tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
 # vendoring 版で全ターゲットの quiche を置き換える。詳細は third_party/quiche/README.veil.md。
 [patch.crates-io]
 quiche = { path = "third_party/quiche" }
+# F-176 / B-62: テスト用 HTTP/3 クライアント（quinn）の UDP 層。NetBSD/aarch64 の libc の
+# `_ALIGNBYTES` 誤りを避ける CMSG 実装だけを足した vendoring 版（veil 本体は使わない）。
+quinn-udp = { path = "third_party/quinn-udp" }

@@ -176,8 +176,38 @@ def login_and_inject_key(child, password: str, pubkey_path: str) -> None:
         "{ echo 'consdev=com0'; grep -v '^consdev=' /boot.cfg 2>/dev/null; } > /boot.cfg.new && "
         "mv /boot.cfg.new /boot.cfg")
     run("cat /boot.cfg")
+
+    # F-176: ルート FS を WAPBL（log）でマウントする。異常終了後もジャーナルの再生で
+    # 済み、シングルユーザーでの手作業 fsck が要らなくなる（v0.7.0 の検証で、VGA にしか
+    # 出ない fsck 待ちを QMP の screendump と send-key で解いた）。冪等。
+    run("awk 'BEGIN{OFS=\"\\t\"} $2==\"/\" && $3==\"ffs\" && $4 !~ /(^|,)log(,|$)/ {$4=$4\",log\"} {print}' "
+        "/etc/fstab > /etc/fstab.new && mv /etc/fstab.new /etc/fstab")
+    run("grep ' / ' /etc/fstab || grep '\t/\t' /etc/fstab || cat /etc/fstab")
     run("sync")
     print("PROVISIONED_SSH", flush=True)
+
+
+def ensure_serial_console(child, arch: str) -> None:
+    """F-176: 再起動後もシリアルにコンソール（ログインプロンプト）が出るようにして確かめる。
+
+    `/boot.cfg` の `consdev=com0` だけでは、x86_64 の live image は再起動後も VGA に出ていた
+    （v0.7.0 の検証で実測）。x86 では 1 段目のブートストラップ（bootxx）自身がコンソールの
+    既定を持つので、`installboot -e -o console=com0` で書き換える。最後に再起動して、
+    シリアルに `login:` が出ることを確かめる（出なければ失敗にする）。
+    """
+    prompt = r"root@[^#\r\n]*# |[#$] $"
+    if arch == "x86_64":
+        child.sendline("installboot -e -o console=com0,speed=115200 "
+                       "/dev/r$(sysctl -n kern.root_device)a && echo INSTALLBOOT_OK")
+        i = child.expect([r"INSTALLBOOT_OK", prompt, TIMEOUT], timeout=60)
+        if i != 0:
+            print("\nWARNING: installboot -e failed; relying on /boot.cfg consdev only", flush=True)
+        child.expect([prompt, TIMEOUT], timeout=30)
+    child.sendline("sync; shutdown -r now")
+    i = child.expect([r"login:", TIMEOUT], timeout=1800)
+    if i != 0:
+        sys.exit("FAIL: no login prompt on the serial console after reboot")
+    print("\nSERIAL_CONSOLE_OK", flush=True)
 
 
 def main() -> None:
@@ -185,6 +215,7 @@ def main() -> None:
     ap.add_argument("--con-port", type=int, required=True)
     ap.add_argument("--pubkey", default=os.path.expanduser("~/.ssh/veil_qemu_key.pub"))
     ap.add_argument("--password", default="veil")
+    ap.add_argument("--arch", default="x86_64", choices=["x86_64", "aarch64"])
     args = ap.parse_args()
 
     s = connect(args.con_port)
@@ -194,6 +225,7 @@ def main() -> None:
 
     try_switch_to_serial(child)
     login_and_inject_key(child, args.password, args.pubkey)
+    ensure_serial_console(child, args.arch)
     s.close()
 
 

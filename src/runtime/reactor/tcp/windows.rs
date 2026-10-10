@@ -173,6 +173,7 @@ impl TcpListener {
         Self::bind_impl(addr, true)
     }
 
+    #[allow(clippy::disallowed_methods)] // 起動・リロード時のリスナー作成のみ（ホットパス外）
     fn bind_impl(addr: impl std::net::ToSocketAddrs, _reuse_port: bool) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
@@ -364,12 +365,8 @@ impl TcpStream {
                 "unix domain socket backends are not supported on this platform",
             ));
         }
-        use std::net::ToSocketAddrs;
-        let socket_addr = addr
-            .to_socket_addrs()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address resolved"))?;
+        // B-107: ホスト名は offload で解決する（同期 getaddrinfo でイベントループを止めない）。
+        let socket_addr = crate::runtime::dns::resolve(addr).await?;
         TcpStream::connect(socket_addr).await
     }
 

@@ -34,7 +34,7 @@
 
 use crate::runtime::handle::AsRawFd;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -159,6 +159,22 @@ pub(crate) enum BackendIo {
 }
 
 impl BackendIo {
+    /// 基盤ソケットの fd（B-93 の生存確認に使う）。
+    fn raw_fd(&self) -> crate::runtime::handle::RawFd {
+        match self {
+            BackendIo::Plain(s) => s.as_raw_fd(),
+            BackendIo::Tls(t) => t.inner.as_raw_fd(),
+        }
+    }
+
+    /// B-104: プールへ返してよい状態か（TLS は復号済みで未消費の平文が残っていないこと）。
+    fn is_clean(&self) -> bool {
+        match self {
+            BackendIo::Plain(_) => true,
+            BackendIo::Tls(t) => t.drained.borrow().is_empty(),
+        }
+    }
+
     /// 所有バッファへ読み取る（EAGAIN 時は POLL_ADD で待機、ビジースピンしない）。
     async fn read_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         match self {
@@ -443,34 +459,44 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
 /// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` に対応する。
 async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
+    let connector = if insecure {
+        crate::config::get_tls_connector_insecure()
+    } else {
+        crate::config::get_tls_connector()
+    };
+    let stream = connector.connect(tcp, sni).await?;
+    Ok(backend_io_from_client_tls(stream))
+}
+
+/// ハンドシェイク済みのクライアント TLS ストリームを全二重ラッパーにする。
+fn backend_io_from_client_tls(stream: crate::pool::ClientTls) -> BackendIo {
     #[cfg(veil_ktls)]
     {
-        let connector = if insecure {
-            crate::config::get_tls_connector_insecure()
-        } else {
-            crate::config::get_tls_connector()
-        };
-        let stream = connector.connect(tcp, sni).await?;
         let (inner, session, _mode, drained) = stream.into_parts();
-        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
-            inner, session, drained,
-        ))))
+        BackendIo::Tls(Box::new(TlsBackend::new(inner, session, drained)))
     }
     #[cfg(not(veil_ktls))]
     {
-        let connector = if insecure {
-            crate::config::get_tls_connector_insecure()
-        } else {
-            crate::config::get_tls_connector()
-        };
-        let stream = connector.connect(tcp, sni).await?;
         let (inner, session, drained) = stream.into_parts();
-        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
-            inner,
-            Some(session),
-            drained,
-        ))))
+        BackendIo::Tls(Box::new(TlsBackend::new(inner, Some(session), drained)))
     }
+}
+
+/// F-175: ALPN で HTTP/1.1 を選んだ HTTPS 上流の接続（ネゴシエーション済み）をワーカーの
+/// 上流プールへ入れる（直後の HTTP/1.1 の要求で使う）。
+#[cfg(feature = "http2")]
+pub(crate) fn h3_pool_put_client_tls(
+    key: &str,
+    stream: crate::pool::ClientTls,
+    max_idle: usize,
+    idle_timeout_secs: u64,
+) {
+    h3_pool_put(
+        key,
+        backend_io_from_client_tls(stream),
+        max_idle.max(1),
+        idle_timeout_secs.max(1),
+    );
 }
 
 // ============================================================================
@@ -491,6 +517,9 @@ pub(crate) enum RespMsg {
     Body(Bytes),
     /// バックエンドエラー（head 送出前なら指定ステータスを返し、送出後はストリームをリセット）。
     Error { status: u16 },
+    /// trailers（gRPC の grpc-status 等）。送出と同時にストリームを fin で閉じる（B-97）。
+    #[cfg(feature = "grpc")]
+    Trailers(RespHeaders),
 }
 
 // ============================================================================
@@ -519,6 +548,30 @@ pub(crate) struct BackendTaskParams {
     pub sni: String,
     /// 証明書検証をスキップするか（アップストリーム設定 `tls_insecure`）。
     pub tls_insecure: bool,
+    /// B-104: 上流接続プールのホストあたり最大アイドル接続数（`[security] max_idle_connections_per_host`）。
+    pub pool_max_idle: usize,
+    /// B-104: プールのアイドルタイムアウト秒（`[security] idle_connection_timeout_secs`）。
+    pub pool_idle_timeout_secs: u64,
+    /// HEAD 要求か（応答に Content-Length があっても本文を読まない）。
+    pub no_response_body: bool,
+    /// F-177: 再利用した接続が応答前に失敗したとき、本文の無い要求を 1 回だけ再送するか。
+    pub retry_idempotent: bool,
+    /// F-171: 上流が HTTP/2（h2c）なら `Some`。このとき `request_head` は使わない。
+    #[cfg(feature = "http2")]
+    pub h2: Option<H2Upstream>,
+}
+
+/// F-171: HTTP/2 上流へ送る要求（HTTP/1.1 の `request_head` の代わり）。
+#[cfg(feature = "http2")]
+pub(crate) struct H2Upstream {
+    pub method: Bytes,
+    /// 上流へ送る `:path`（gRPC はフルパスのまま）。
+    pub path: Bytes,
+    pub authority: Bytes,
+    /// 転送する要求ヘッダ（疑似ヘッダを除く。ホップバイホップは上流クライアントが落とす）。
+    pub headers: RespHeaders,
+    /// 上流への接続タイムアウト。
+    pub connect_timeout: Duration,
 }
 
 /// バックエンドタスクを起動するスポーナ（F-46: 型付きタスクプール）。
@@ -539,35 +592,128 @@ pub(crate) fn backend_task_spawner() -> BackendSpawner {
     })
 }
 
+// ============================================================================
+// B-104: HTTP/3 ワーカーの上流接続プール
+// ============================================================================
+
+/// プールに置いた上流接続 1 本。
+struct H3PooledBackend {
+    io: BackendIo,
+    /// プールへ返した時刻（アイドル時間の起点。B-93 の生存確認の閾値判定に使う）。
+    returned_at: std::time::Instant,
+    idle_timeout_secs: u64,
+}
+
+thread_local! {
+    /// B-104: HTTP/3 ワーカースレッドの上流接続プール。キーは `PoolKeyStr`
+    /// （平文 = 接続先、TLS = 接続先 + SNI + 検証有無）。
+    ///
+    /// HTTP/1.1・HTTP/2 のワーカーは `HTTP_POOL` / `HTTPS_POOL` を使うが、HTTP/3 の
+    /// ストリーミング経路は全二重の TLS ラッパー（[`TlsBackend`]）を使うため型が異なり、
+    /// HTTP/3 ワーカーは別スレッドでもあるので、専用のプールを持つ。
+    static H3_BACKEND_POOL: RefCell<HashMap<String, VecDeque<H3PooledBackend>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// プールから再利用可能な接続を取り出す（B-93 の生存確認込み）。
+fn h3_pool_get(key: &str) -> Option<BackendIo> {
+    H3_BACKEND_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        let queue = pool.get_mut(key)?;
+        while let Some(entry) = queue.pop_front() {
+            // 平文は未読データ（前応答の残骸）があれば捨てる。TLS は NewSessionTicket 等の
+            // TLS レコードが残り得るので未読データを理由に捨てない（HTTPS_POOL と同じ規則）。
+            let reject_unread = matches!(entry.io, BackendIo::Plain(_));
+            if crate::pool::pooled_conn_reusable(
+                entry.returned_at,
+                entry.idle_timeout_secs,
+                entry.io.raw_fd(),
+                reject_unread,
+            ) {
+                crate::metrics::record_connection_pool_hit(key);
+                return Some(entry.io);
+            }
+        }
+        crate::metrics::record_connection_pool_miss(key);
+        None
+    })
+}
+
+/// 接続をプールへ返す。既存キーへの返却は確保なし（新規キーのときだけ `to_string()`）。
+fn h3_pool_put(key: &str, io: BackendIo, max_idle: usize, idle_timeout_secs: u64) {
+    if max_idle == 0 || idle_timeout_secs == 0 {
+        return;
+    }
+    H3_BACKEND_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        let entry = H3PooledBackend {
+            io,
+            returned_at: std::time::Instant::now(),
+            idle_timeout_secs,
+        };
+        if let Some(queue) = pool.get_mut(key) {
+            while queue.len() >= max_idle {
+                queue.pop_front();
+            }
+            queue.push_back(entry);
+            crate::metrics::set_connection_pool_size(key, queue.len());
+            return;
+        }
+        let mut queue = VecDeque::new();
+        queue.push_back(entry);
+        crate::metrics::set_connection_pool_size(key, queue.len());
+        pool.insert(key.to_string(), queue);
+    });
+}
+
+/// 応答を読み終えたときの上流接続の扱い（B-104）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RespEnd {
+    /// 応答の終端をちょうど読み切った（次の要求に使える）。
+    Reusable,
+    /// EOF 終端・余剰データ・クライアント切断などで、接続を再利用できない。
+    Close,
+}
+
 /// バックエンドストリーミングタスク本体。
 ///
 /// メインループ（`process_h3_events`）から [`BackendSpawner`] 経由で起動され、当該リクエストの
 /// バックエンド往復を独立タスクとして駆動する。タスクは `connections` を一切触らず、
 /// チャネル経由でのみメインループと通信する（quiche の非 Send 制約を満たす）。
 async fn backend_task(
-    params: BackendTaskParams,
+    mut params: BackendTaskParams,
     req_body_rx: Receiver<Bytes>,
     resp_tx: Sender<RespMsg>,
     notify: ConnWaker,
 ) {
-    let server = params.server;
-    server.acquire();
-    let outcome = run_backend_task(
-        &server,
-        params.request_head,
-        params.has_request_body,
-        &params.compression,
-        params.client_encoding,
-        params.timeout_secs,
-        params.use_tls,
-        &params.sni,
-        params.tls_insecure,
-        &req_body_rx,
-        &resp_tx,
-        &notify,
-    )
-    .await;
-    server.release();
+    params.server.acquire();
+    #[cfg(feature = "http2")]
+    let outcome = if params.h2.is_some() {
+        if params.use_tls {
+            // F-175: HTTPS 上流は ALPN で HTTP/2 を試し、HTTP/1.1 なら従来の経路へ。
+            match open_h2_tls(&params).await {
+                Ok(Some(stream)) => {
+                    relay_h2_stream(&params, stream, &req_body_rx, &resp_tx, &notify).await
+                }
+                Ok(None) => {
+                    let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+                    run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+                }
+                Err(status) => Err(status),
+            }
+        } else {
+            run_h2_task(&params, &req_body_rx, &resp_tx, &notify).await
+        }
+    } else {
+        let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+        run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+    };
+    #[cfg(not(feature = "http2"))]
+    let outcome = {
+        let mut head = ReqHead::Raw(std::mem::take(&mut params.request_head));
+        run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
+    };
+    params.server.release();
 
     if let Err(status) = outcome {
         // head 送出前のエラーはそのステータスで応答し、送出後のエラーはメインループが
@@ -578,27 +724,273 @@ async fn backend_task(
     notify.notify();
 }
 
-/// バックエンド往復本体。`Err(status)` は **head 未送出時のみ** のエラー（指定ステータスを返す）。
-#[allow(clippy::too_many_arguments)]
-async fn run_backend_task(
-    server: &UpstreamServer,
-    request_head: Vec<u8>,
-    has_request_body: bool,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    timeout_secs: u64,
-    use_tls: bool,
-    sni: &str,
-    tls_insecure: bool,
+/// F-171: HTTP/2 上流（多重化接続のストリーム）との全二重中継。
+///
+/// 下流（HTTP/3）の要求本文は届いた順に上流ストリームへ流し、上流の応答
+/// （head・DATA・トレーラー）は届いた順にメインループへ流す。両方向を同じタスクで並行に
+/// 進めるので、クライアントストリーミング・双方向ストリーミングの gRPC が成立する
+/// （応答の送出は要求の完了を待たない）。圧縮対象の応答（非 gRPC）だけは本文を集めてから
+/// 圧縮する（HTTP/1.1 経路と同じ）。
+#[cfg(feature = "http2")]
+async fn run_h2_task(
+    params: &BackendTaskParams,
     req_body_rx: &Receiver<Bytes>,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
 ) -> Result<(), u16> {
-    let target = &server.target;
-    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（UDS 対応、TCP は不変）
-    let addr = addr.as_str();
+    use crate::http2::upstream_mux::open_h2c;
+    let h2 = params.h2.as_ref().ok_or(502u16)?;
+    let target = &params.server.target;
+    let addr = target.conn_addr();
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let stream = open_h2c(
+        target,
+        key.as_str(),
+        h2.connect_timeout,
+        Duration::from_secs(params.pool_idle_timeout_secs),
+        &h2.method,
+        &h2.path,
+        &h2.authority,
+        h2.headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+        !params.has_request_body,
+    )
+    .await?;
+    relay_h2_stream(params, stream, req_body_rx, resp_tx, notify).await
+}
 
-    // --- 非同期接続（タイムアウト付き） ---
+/// F-175: HTTPS 上流で HTTP/2 のストリームを開く。上流が HTTP/1.1 を選んだら `Ok(None)`
+/// （ネゴシエーションに使った接続はワーカーのプールへ入れ、HTTP/1.1 経路で使う）。
+#[cfg(feature = "http2")]
+async fn open_h2_tls(
+    params: &BackendTaskParams,
+) -> Result<Option<crate::http2::upstream_mux::UpStream>, u16> {
+    use crate::http2::upstream_mux::{open_https, HttpsOpen};
+    let h2 = params.h2.as_ref().ok_or(502u16)?;
+    let target = &params.server.target;
+    let addr = target.conn_addr();
+    let key =
+        crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), &params.sni, params.tls_insecure);
+    match open_https(
+        target,
+        key.as_str(),
+        params.tls_insecure,
+        h2.connect_timeout,
+        Duration::from_secs(params.pool_idle_timeout_secs),
+        &h2.method,
+        &h2.path,
+        &h2.authority,
+        h2.headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+        !params.has_request_body,
+    )
+    .await?
+    {
+        HttpsOpen::H2(s) => Ok(Some(s)),
+        HttpsOpen::Http1(conn) => {
+            if let Some(conn) = conn {
+                h3_pool_put_client_tls(
+                    key.as_str(),
+                    *conn,
+                    params.pool_max_idle,
+                    params.pool_idle_timeout_secs,
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// F-171 / F-175: 開いた上流 HTTP/2 ストリームと下流（HTTP/3）を全二重に中継する。
+#[cfg(feature = "http2")]
+async fn relay_h2_stream(
+    params: &BackendTaskParams,
+    mut stream: crate::http2::upstream_mux::UpStream,
+    req_body_rx: &Receiver<Bytes>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+) -> Result<(), u16> {
+    use crate::http2::upstream_mux::UpResp;
+    let read_timeout = Duration::from_secs(params.timeout_secs);
+
+    // 要求方向: 送信端を所有して流し、終わったら drop（= END_STREAM）。
+    let req_tx = stream.req_tx.take();
+    let upload = async move {
+        let Some(tx) = req_tx else {
+            return;
+        };
+        while let Some(chunk) = req_body_rx.recv().await {
+            if tx.send(chunk).await.is_err() {
+                // 上流がストリームを閉じた（早期応答・リセット）。残りは応答側で判定する。
+                return;
+            }
+            // 要求チャネルに空きができた → メインループの recv_body を再開させる。
+            notify.notify();
+        }
+    };
+
+    // 応答方向。
+    let resp_rx = &stream.resp_rx;
+    let download = async move {
+        let mut head_sent = false;
+        loop {
+            let msg = match crate::runtime::time::timeout(read_timeout, resp_rx.recv()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    warn!("[HTTP/3] h2 upstream response timeout");
+                    return Err(if head_sent { 502 } else { 504 });
+                }
+            };
+            match msg {
+                None => return Ok(()),
+                Some(UpResp::Head { status, headers }) => {
+                    let content_type = headers
+                        .iter()
+                        .find(|(n, _)| n.as_ref() == b"content-type")
+                        .map(|(_, v)| v.clone());
+                    let is_grpc = content_type
+                        .as_deref()
+                        .is_some_and(|ct| ct.starts_with(b"application/grpc"));
+                    let should_compress = if is_grpc || params.no_response_body {
+                        None
+                    } else {
+                        let content_length = headers
+                            .iter()
+                            .find(|(n, _)| n.as_ref() == b"content-length")
+                            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+                            .and_then(|v| v.trim().parse().ok());
+                        let content_encoding = headers
+                            .iter()
+                            .find(|(n, _)| n.as_ref() == b"content-encoding")
+                            .map(|(_, v)| v.as_ref());
+                        params.compression.should_compress(
+                            params.client_encoding,
+                            content_type.as_deref(),
+                            content_length,
+                            content_encoding,
+                        )
+                    };
+                    if let Some(enc) = should_compress {
+                        return h2_relay_compressed(
+                            resp_rx,
+                            status,
+                            headers,
+                            enc,
+                            &params.compression,
+                            read_timeout,
+                            resp_tx,
+                        )
+                        .await;
+                    }
+                    if resp_tx
+                        .send(RespMsg::Head { status, headers })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(()); // クライアント切断（stream の drop で上流へ CANCEL）。
+                    }
+                    head_sent = true;
+                    if resp_rx.is_finished() {
+                        // HEADERS で終わった応答（gRPC の trailers-only 等）。すぐ送信端を閉じて
+                        // メインループに HEADERS へ fin を載せさせる。
+                        return Ok(());
+                    }
+                }
+                Some(UpResp::Data(b)) => {
+                    if !head_sent {
+                        return Err(502);
+                    }
+                    if resp_tx.send(RespMsg::Body(b)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(UpResp::Trailers(trailers)) => {
+                    #[cfg(feature = "grpc")]
+                    {
+                        if resp_tx.send(RespMsg::Trailers(trailers)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    #[cfg(not(feature = "grpc"))]
+                    drop(trailers);
+                }
+                Some(UpResp::Reset { .. }) => {
+                    debug!("[HTTP/3] h2 upstream stream reset");
+                    return Err(502);
+                }
+            }
+            notify.notify();
+        }
+    };
+
+    let mut upload = std::pin::pin!(futures::FutureExt::fuse(upload));
+    let mut download = std::pin::pin!(futures::FutureExt::fuse(download));
+    loop {
+        futures::select_biased! {
+            r = download => return r,
+            _ = upload => {}
+        }
+    }
+}
+
+/// F-171: 圧縮対象の h2 応答を最後まで集めて圧縮し、head + 本文として送る。
+#[cfg(feature = "http2")]
+async fn h2_relay_compressed(
+    resp_rx: &Receiver<crate::http2::upstream_mux::UpResp>,
+    status: u16,
+    mut headers: RespHeaders,
+    enc: AcceptedEncoding,
+    compression: &CompressionConfig,
+    read_timeout: Duration,
+    resp_tx: &Sender<RespMsg>,
+) -> Result<(), u16> {
+    use crate::http2::upstream_mux::UpResp;
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match crate::runtime::time::timeout(read_timeout, resp_rx.recv()).await {
+            Err(_) => return Err(504),
+            Ok(None) => break,
+            Ok(Some(UpResp::Data(b))) => body.extend_from_slice(&b),
+            Ok(Some(UpResp::Trailers(_))) | Ok(Some(UpResp::Head { .. })) => {}
+            Ok(Some(UpResp::Reset { .. })) => return Err(502),
+        }
+    }
+    let compressed = crate::http3_server::compress_body_h3(&body, enc, compression);
+    headers.retain(|(n, _)| {
+        !n.eq_ignore_ascii_case(b"content-length") && !n.eq_ignore_ascii_case(b"content-encoding")
+    });
+    headers.push((
+        Bytes::from_static(b"content-encoding"),
+        Bytes::from_static(enc.as_header_value()),
+    ));
+    if resp_tx
+        .send(RespMsg::Head { status, headers })
+        .await
+        .is_ok()
+    {
+        let _ = resp_tx.send(RespMsg::Body(Bytes::from(compressed))).await;
+    }
+    Ok(())
+}
+
+/// 新規に上流へ接続する（TLS ならハンドシェイクまで）。
+async fn connect_backend(params: &BackendTaskParams, addr: &str) -> Result<BackendIo, u16> {
+    connect_backend_io(
+        addr,
+        params.timeout_secs,
+        params.use_tls,
+        &params.sni,
+        params.tls_insecure,
+    )
+    .await
+}
+
+/// 新規に上流へ接続する（ストリーミング経路・バッファ経路で共用）。
+async fn connect_backend_io(
+    addr: &str,
+    timeout_secs: u64,
+    use_tls: bool,
+    sni: &str,
+    tls_insecure: bool,
+) -> Result<BackendIo, u16> {
     let connect = TcpStream::connect_str(addr);
     let tcp = match crate::runtime::time::timeout(Duration::from_secs(timeout_secs), connect).await
     {
@@ -614,50 +1006,152 @@ async fn run_backend_task(
     };
     let _ = tcp.set_nodelay(true);
 
-    // --- F-44: TLS バックエンドはハンドシェイクして全二重 TLS ラッパーで包む ---
-    let backend = if use_tls {
-        let insecure = tls_insecure;
-        match crate::runtime::time::timeout(
-            Duration::from_secs(timeout_secs),
-            tls_connect(tcp, sni, insecure),
-        )
-        .await
-        {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                warn!("[HTTP/3] streaming backend TLS handshake error: {}", e);
-                return Err(502);
-            }
-            Err(_) => {
-                warn!("[HTTP/3] streaming backend TLS handshake timeout");
-                return Err(504);
-            }
+    // F-44: TLS バックエンドはハンドシェイクして全二重 TLS ラッパーで包む。
+    if !use_tls {
+        return Ok(BackendIo::Plain(tcp));
+    }
+    match crate::runtime::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tls_connect(tcp, sni, tls_insecure),
+    )
+    .await
+    {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(e)) => {
+            warn!("[HTTP/3] streaming backend TLS handshake error: {}", e);
+            Err(502)
         }
+        Err(_) => {
+            warn!("[HTTP/3] streaming backend TLS handshake timeout");
+            Err(504)
+        }
+    }
+}
+
+/// リクエスト head の状態（F-177 の再送で head を作り直さずに使い回すため）。
+enum ReqHead {
+    /// 末尾空行・ボディフレーミング未付与の head（初回）。
+    Raw(Vec<u8>),
+    /// 本文なしで送った完成済み head（再送時は参照カウントの複製だけで再送できる）。
+    NoBody(Bytes),
+}
+
+/// バックエンド往復本体。`Err(status)` は **head 未送出時のみ** のエラー（指定ステータスを返す）。
+///
+/// B-104: 上流接続はワーカーのプールから取り出し、応答の終端をちょうど読み切れたときだけ返す。
+/// F-177: プールから取り出した接続が応答の 1 バイト目より前に失敗し、要求に本文が無い
+/// （＝再送しても副作用が増えない形で要求を作り直せる）場合に限り、新規接続で 1 回だけ再送する。
+async fn run_backend_task(
+    params: &BackendTaskParams,
+    head: &mut ReqHead,
+    req_body_rx: &Receiver<Bytes>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+) -> Result<(), u16> {
+    let target = &params.server.target;
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（UDS 対応、TCP は不変）
+    let addr = addr.as_str();
+    let pool_key = if params.use_tls {
+        crate::http_utils::PoolKeyStr::tls_addr(addr, &params.sni, params.tls_insecure)
     } else {
-        BackendIo::Plain(tcp)
+        crate::http_utils::PoolKeyStr::plain_addr(addr)
     };
 
+    let mut pooled = h3_pool_get(pool_key.as_str());
+    loop {
+        let reused = pooled.is_some();
+        let backend = match pooled.take() {
+            Some(b) => b,
+            None => connect_backend(params, addr).await?,
+        };
+        let before_head = Cell::new(true);
+        let result = exchange(
+            &backend,
+            params,
+            head,
+            req_body_rx,
+            resp_tx,
+            notify,
+            &before_head,
+        )
+        .await;
+        match result {
+            Ok(RespEnd::Reusable) if backend.is_clean() => {
+                h3_pool_put(
+                    pool_key.as_str(),
+                    backend,
+                    params.pool_max_idle,
+                    params.pool_idle_timeout_secs,
+                );
+                return Ok(());
+            }
+            Ok(_) => return Ok(()),
+            Err(status)
+                if reused
+                    && before_head.get()
+                    && !params.has_request_body
+                    && params.retry_idempotent =>
+            {
+                // F-177: 再利用した接続が応答前に失敗 → 新規接続で 1 回だけ再送。
+                debug!(
+                    "[HTTP/3] pooled backend connection failed before the response ({}); retrying on a fresh connection",
+                    status
+                );
+                continue;
+            }
+            Err(status) => return Err(status),
+        }
+    }
+}
+
+/// 1 回の要求・応答のやり取り。
+#[allow(clippy::too_many_arguments)]
+async fn exchange(
+    backend: &BackendIo,
+    params: &BackendTaskParams,
+    head: &mut ReqHead,
+    req_body_rx: &Receiver<Bytes>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+    before_head: &Cell<bool>,
+) -> Result<RespEnd, u16> {
     // --- リクエスト head + ボディフレーミングの確定 ---
-    // `request_head` は `...Connection: close\r\n`（末尾空行なし・ボディフレーミングなし）。
+    // `request_head` は末尾空行なし・ボディフレーミングなし（B-104 で `Connection: close` は外した）。
     // ボディ有無は HEADERS 受信時点では確定しない（h3 クライアントは HEADERS と fin を別送する
     // ため、ボディのない GET でも `more_frames=true`）。そこで **最初のボディ断片が実際に届くか**
     // を見てから framing を確定する: 届けば `Transfer-Encoding: chunked`、届かなければボディなし。
-    let mut head = request_head;
-    let first_chunk = if has_request_body {
+    let first_chunk = if params.has_request_body {
         req_body_rx.recv().await
     } else {
         None
     };
 
+    let respond = |backend| {
+        stream_response(
+            backend,
+            &params.compression,
+            params.client_encoding,
+            params.timeout_secs,
+            params.no_response_body,
+            resp_tx,
+            notify,
+            before_head,
+        )
+    };
+
     match first_chunk {
         Some(first) => {
-            // 実ボディあり → chunked 逐次転送。
-            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
-            if let Err(e) = backend.write_all(Bytes::from(head)).await {
+            // 実ボディあり → chunked 逐次転送（本文ありの要求は再送しないので head は使い切る）。
+            let mut raw = match std::mem::replace(head, ReqHead::NoBody(Bytes::new())) {
+                ReqHead::Raw(v) => v,
+                ReqHead::NoBody(b) => b[..b.len().saturating_sub(2)].to_vec(),
+            };
+            raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+            if let Err(e) = backend.write_all(Bytes::from(raw)).await {
                 warn!("[HTTP/3] streaming backend head write error: {}", e);
                 return Err(502);
             }
-            if let Err(e) = send_backend_chunk(&backend, first).await {
+            if let Err(e) = send_backend_chunk(backend, first).await {
                 warn!("[HTTP/3] streaming backend body write error: {}", e);
                 return Err(502);
             }
@@ -680,36 +1174,37 @@ async fn run_backend_task(
                 // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
                 while let Some(chunk) = req_body_rx.recv().await {
                     // 書き込み完了まで次フレームを読まない（バックプレッシャ）。
-                    send_backend_chunk(&backend, chunk).await?;
+                    send_backend_chunk(backend, chunk).await?;
                     notify.notify();
                 }
                 // 終端チャンク。
                 backend.write_all(Bytes::from_static(b"0\r\n\r\n")).await?;
                 Ok::<(), io::Error>(())
             };
-            let respond = stream_response(
-                &backend,
-                compression,
-                client_encoding,
-                timeout_secs,
-                resp_tx,
-                notify,
-            );
+            let respond = respond(backend);
 
+            let mut upload_done = false;
             let mut upload = std::pin::pin!(futures::FutureExt::fuse(upload));
             let mut respond = std::pin::pin!(futures::FutureExt::fuse(respond));
             loop {
                 futures::select_biased! {
-                    r = respond => return r,
+                    r = respond => {
+                        // B-104: 本文を送り切る前に応答が完了した（早期応答）接続は、上流が
+                        // 残りの本文をどう扱うか分からないので再利用しない。
+                        return r.map(|end| if upload_done { end } else { RespEnd::Close });
+                    }
                     u = upload => {
-                        if let Err(e) = u {
-                            // レスポンス完結後にバックエンドがリクエスト読み取りを
-                            // 打ち切るのは合法（Connection: close 等）。ここでは中断せず
-                            // レスポンス側の完了・エラー判定に委ねる。
-                            debug!(
-                                "[HTTP/3] streaming backend body write error: {} (response still in flight)",
-                                e
-                            );
+                        match u {
+                            Ok(()) => upload_done = true,
+                            Err(e) => {
+                                // レスポンス完結後にバックエンドがリクエスト読み取りを
+                                // 打ち切るのは合法。ここでは中断せずレスポンス側の完了・
+                                // エラー判定に委ねる（upload_done は false のまま＝再利用しない）。
+                                debug!(
+                                    "[HTTP/3] streaming backend body write error: {} (response still in flight)",
+                                    e
+                                );
+                            }
                         }
                         // アップロード完了後はレスポンス側のみを待つ
                         //（fuse 済みのため以降 select から除外される）。
@@ -719,35 +1214,38 @@ async fn run_backend_task(
         }
         None => {
             // ボディなし（GET 等、または more_frames=true でも実データ無し） → 空行で head 終端。
-            head.extend_from_slice(b"\r\n");
-            if let Err(e) = backend.write_all(Bytes::from(head)).await {
+            let bytes = match std::mem::replace(head, ReqHead::NoBody(Bytes::new())) {
+                ReqHead::Raw(mut v) => {
+                    v.extend_from_slice(b"\r\n");
+                    Bytes::from(v)
+                }
+                ReqHead::NoBody(b) => b,
+            };
+            *head = ReqHead::NoBody(bytes.clone());
+            if let Err(e) = backend.write_all(bytes).await {
                 warn!("[HTTP/3] streaming backend head write error: {}", e);
                 return Err(502);
             }
-
             // --- レスポンス受信（head → body 逐次） ---
-            stream_response(
-                &backend,
-                compression,
-                client_encoding,
-                timeout_secs,
-                resp_tx,
-                notify,
-            )
-            .await
+            respond(backend).await
         }
     }
 }
 
 /// バックエンドレスポンスを head→body の順で受信し、メインループへ逐次転送する。
+///
+/// `before_head` は、最終応答のヘッダをメインループへ送る直前まで `true`（F-177 の再送判定に使う）。
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     backend: &BackendIo,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     timeout_secs: u64,
+    no_response_body: bool,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
-) -> Result<(), u16> {
+    before_head: &Cell<bool>,
+) -> Result<RespEnd, u16> {
     // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。
     let mut read_buf = vec![0u8; RESP_READ_CHUNK];
     let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -787,21 +1285,34 @@ async fn stream_response(
     }
 
     let status = parse_status_code(&head_buf[..header_end]).unwrap_or(502);
-    let parsed = parse_response_headers(&head_buf[..header_end]);
+    let mut parsed = parse_response_headers(&head_buf[..header_end]);
     // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片。
     let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
 
-    // 圧縮判定（content-type / 既存エンコーディング / 既知長）。
-    let should_compress = compression.should_compress(
-        client_encoding,
-        parsed.content_type.as_deref(),
-        parsed.content_length,
-        parsed.content_encoding.as_deref(),
-    );
+    // B-104: 本文を持たない応答（HEAD への応答・204・304）は Content-Length があっても本文を
+    // 読まない（キープアライブでは上流が閉じないため、読みに行くとタイムアウトまで止まる）。
+    if no_response_body || status == 204 || status == 304 {
+        parsed.framing = Framing::Length(0);
+    }
+    // 101（プロトコル切り替え）は HTTP/3 で中継できず、接続も HTTP/1.1 ではなくなる。
+    let reusable_conn = parsed.keep_alive && status != 101;
 
-    if let Some(enc) = should_compress {
+    // 圧縮判定（content-type / 既存エンコーディング / 既知長）。本文の無い応答は圧縮しない。
+    let should_compress = if matches!(parsed.framing, Framing::Length(0)) {
+        None
+    } else {
+        compression.should_compress(
+            client_encoding,
+            parsed.content_type.as_deref(),
+            parsed.content_length,
+            parsed.content_encoding.as_deref(),
+        )
+    };
+
+    let end = if let Some(enc) = should_compress {
         // 圧縮はボディ全体が必要 → バッファ経路（HTTP/2 第1フェーズと同方針）。
-        return stream_response_compressed(
+        before_head.set(false);
+        stream_response_compressed(
             backend,
             status,
             parsed,
@@ -812,40 +1323,43 @@ async fn stream_response(
             deadline,
             resp_tx,
         )
-        .await;
-    }
-
-    // --- head 送出（非圧縮ストリーミング） ---
-    let mut headers = parsed.headers;
-    // 長さ既知ならそのまま転送（クライアントへ content-length 提示）。chunked/EOF は length 削除。
-    if parsed.is_chunked {
-        // chunked のデータ長は不定 → content-length は付けない（quiche がストリーム長を管理）。
-        headers.retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-length"));
-    }
-    if resp_tx
-        .send(RespMsg::Head { status, headers })
-        .await
-        .is_err()
-    {
-        return Ok(()); // クライアント切断。
-    }
-    notify.notify();
-
-    // --- body 逐次転送 ---
-    match parsed.framing {
-        Framing::Length(total) => {
-            stream_body_length(
-                backend, leftover, read_buf, total, deadline, resp_tx, notify,
-            )
+        .await?
+    } else {
+        // --- head 送出（非圧縮ストリーミング） ---
+        let framing = parsed.framing;
+        let mut headers = parsed.headers;
+        // 長さ既知ならそのまま転送（クライアントへ content-length 提示）。chunked/EOF は length 削除。
+        if parsed.is_chunked {
+            // chunked のデータ長は不定 → content-length は付けない（quiche がストリーム長を管理）。
+            headers.retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-length"));
+        }
+        before_head.set(false);
+        if resp_tx
+            .send(RespMsg::Head { status, headers })
             .await
+            .is_err()
+        {
+            return Ok(RespEnd::Close); // クライアント切断。
         }
-        Framing::Chunked => {
-            stream_body_chunked(backend, leftover, read_buf, deadline, resp_tx, notify).await
+        notify.notify();
+
+        // --- body 逐次転送 ---
+        match framing {
+            Framing::Length(total) => {
+                stream_body_length(
+                    backend, leftover, read_buf, total, deadline, resp_tx, notify,
+                )
+                .await?
+            }
+            Framing::Chunked => {
+                stream_body_chunked(backend, leftover, read_buf, deadline, resp_tx, notify).await?
+            }
+            Framing::Eof => {
+                stream_body_eof(backend, leftover, read_buf, deadline, resp_tx, notify).await?
+            }
         }
-        Framing::Eof => {
-            stream_body_eof(backend, leftover, read_buf, deadline, resp_tx, notify).await
-        }
-    }
+    };
+    Ok(if reusable_conn { end } else { RespEnd::Close })
 }
 
 /// 非圧縮・content-length 既知（または不明だが length フレーミング）のボディ転送。
@@ -857,15 +1371,17 @@ async fn stream_body_length(
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
-) -> Result<(), u16> {
+) -> Result<RespEnd, u16> {
     let mut sent = 0usize;
-    if !leftover.is_empty() {
+    // B-104: 宣言長を超えて届いたバイト（上流の誤り）があれば接続を再利用しない。
+    let mut overrun = leftover.len() > total;
+    if !leftover.is_empty() && total > 0 {
         let take = leftover.len().min(total);
         if send_body_bytes(resp_tx, notify, leftover.slice(0..take))
             .await
             .is_err()
         {
-            return Ok(());
+            return Ok(RespEnd::Close);
         }
         sent += take;
     }
@@ -887,9 +1403,10 @@ async fn stream_body_length(
             }
             Ok(n) => {
                 let take = n.min(total - sent);
+                overrun |= n > take;
                 let chunk = bytes_from_read(&read_buf, take);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
-                    return Ok(());
+                    return Ok(RespEnd::Close);
                 }
                 sent += take;
             }
@@ -900,7 +1417,21 @@ async fn stream_body_length(
             }
         }
     }
-    Ok(())
+    Ok(if overrun {
+        RespEnd::Close
+    } else {
+        RespEnd::Reusable
+    })
+}
+
+/// `drain_chunked` の結果。
+enum ChunkedProgress {
+    /// 終端に達していない（次の read を待つ）。
+    More,
+    /// 終端に達した。`exact` は入力を終端ちょうどまで消費したか（余剰があれば `false`）。
+    Done { exact: bool },
+    /// クライアントが切断した。
+    ClientGone,
 }
 
 /// 非圧縮・chunked のボディ転送（`ChunkedDecoder::next_data_span` でゼロコピーデコード）。
@@ -911,13 +1442,17 @@ async fn stream_body_chunked(
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
-) -> Result<(), u16> {
+) -> Result<RespEnd, u16> {
     use crate::http_utils::ChunkedDecoder;
     let mut decoder = ChunkedDecoder::new_unlimited();
 
     // 先読み分を先にデコード。
-    if !leftover.is_empty() && drain_chunked(&mut decoder, &leftover, resp_tx, notify).await? {
-        return Ok(());
+    if !leftover.is_empty() {
+        match drain_chunked(&mut decoder, &leftover, resp_tx, notify).await {
+            ChunkedProgress::More => {}
+            ChunkedProgress::Done { exact } => return Ok(reuse_if(exact)),
+            ChunkedProgress::ClientGone => return Ok(RespEnd::Close),
+        }
     }
 
     loop {
@@ -935,8 +1470,10 @@ async fn stream_body_chunked(
             Ok(n) => {
                 // read_buf の先頭 n バイトを Bytes 化してデコード（span はこの Bytes のスライス）。
                 let data = bytes_from_read(&read_buf, n);
-                if drain_chunked(&mut decoder, &data, resp_tx, notify).await? {
-                    break;
+                match drain_chunked(&mut decoder, &data, resp_tx, notify).await {
+                    ChunkedProgress::More => {}
+                    ChunkedProgress::Done { exact } => return Ok(reuse_if(exact)),
+                    ChunkedProgress::ClientGone => return Ok(RespEnd::Close),
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -946,17 +1483,24 @@ async fn stream_body_chunked(
             }
         }
     }
-    Ok(())
+}
+
+#[inline]
+fn reuse_if(exact: bool) -> RespEnd {
+    if exact {
+        RespEnd::Reusable
+    } else {
+        RespEnd::Close
+    }
 }
 
 /// 1 入力バッファ分の chunked を `next_data_span` で逐次デコードしてストリーム送出する。
-/// 終端（complete）に達したら `Ok(true)` を返す。
 async fn drain_chunked(
     decoder: &mut crate::http_utils::ChunkedDecoder,
     data: &Bytes,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
-) -> Result<bool, u16> {
+) -> ChunkedProgress {
     let mut pos = 0;
     while pos < data.len() {
         let span = decoder.next_data_span(&data[pos..]);
@@ -965,21 +1509,23 @@ async fn drain_chunked(
             let start = pos + span.data_start;
             let chunk = data.slice(start..start + span.data_len);
             if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
-                return Ok(true); // クライアント切断 → 終了扱い。
+                return ChunkedProgress::ClientGone;
             }
         }
         if span.complete {
-            return Ok(true);
+            return ChunkedProgress::Done {
+                exact: pos + span.consumed == data.len(),
+            };
         }
         if span.consumed == 0 {
             break; // これ以上進めない（次の read を待つ）。
         }
         pos += span.consumed;
     }
-    Ok(false)
+    ChunkedProgress::More
 }
 
-/// 非圧縮・EOF 終端（`Connection: close`）のボディ転送。
+/// 非圧縮・EOF 終端（長さもチャンクも無い）のボディ転送。接続は再利用できない。
 async fn stream_body_eof(
     backend: &BackendIo,
     leftover: Bytes,
@@ -987,9 +1533,9 @@ async fn stream_body_eof(
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
-) -> Result<(), u16> {
+) -> Result<RespEnd, u16> {
     if !leftover.is_empty() && send_body_bytes(resp_tx, notify, leftover).await.is_err() {
-        return Ok(());
+        return Ok(RespEnd::Close);
     }
     loop {
         if std::time::Instant::now() >= deadline {
@@ -1002,7 +1548,7 @@ async fn stream_body_eof(
             Ok(n) => {
                 let chunk = bytes_from_read(&read_buf, n);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
-                    return Ok(());
+                    return Ok(RespEnd::Close);
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -1012,7 +1558,7 @@ async fn stream_body_eof(
             }
         }
     }
-    Ok(())
+    Ok(RespEnd::Close)
 }
 
 /// 圧縮経路: ボディ全体を読み切り、圧縮してから head + body を送る。
@@ -1027,7 +1573,7 @@ async fn stream_response_compressed(
     compression: &CompressionConfig,
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
-) -> Result<(), u16> {
+) -> Result<RespEnd, u16> {
     // ボディ全体を読み取る（圧縮に必要）。
     let mut body: Vec<u8> = Vec::with_capacity(leftover.len().max(RESP_READ_CHUNK));
     let mut decoder = if parsed.is_chunked {
@@ -1036,9 +1582,10 @@ async fn stream_response_compressed(
         None
     };
     let mut remaining = parsed.content_length;
+    let eof_framed = decoder.is_none() && remaining.is_none();
 
     // 先読み分。
-    accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
+    let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
     let mut done =
         decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false) || remaining == Some(0);
 
@@ -1053,7 +1600,7 @@ async fn stream_response_compressed(
             Ok(0) => {
                 // length / chunked フレーミングで終端前の EOF は本文の欠落。
                 // EOF 終端（どちらも無い）なら正常終了。
-                if decoder.is_some() || remaining.is_some() {
+                if !eof_framed {
                     warn!("[HTTP/3] streaming backend closed before the body completed");
                     return Err(502);
                 }
@@ -1061,7 +1608,7 @@ async fn stream_response_compressed(
             }
             Ok(n) => {
                 let slice = Bytes::copy_from_slice(&read_buf[..n]);
-                accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
+                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
                 done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)
                     || remaining == Some(0);
             }
@@ -1090,19 +1637,25 @@ async fn stream_response_compressed(
         .await
         .is_err()
     {
-        return Ok(());
+        return Ok(RespEnd::Close);
     }
     let _ = resp_tx.send(RespMsg::Body(Bytes::from(compressed))).await;
-    Ok(())
+    Ok(if eof_framed {
+        RespEnd::Close
+    } else {
+        reuse_if(exact)
+    })
 }
 
-/// 圧縮経路用: 1 入力スライスをデコード（chunked）または素通し（length/eof）して body へ蓄積。
+/// 圧縮経路用: 1 入力スライスをデコード（chunked）または素通し（length/eof）して body へ蓄積する。
+///
+/// 戻り値は「入力を余らせずに消費したか」（B-104: 終端の後ろに余剰バイトがあれば `false`）。
 fn accumulate_body(
     body: &mut Vec<u8>,
     decoder: &mut Option<crate::http_utils::ChunkedDecoder>,
     remaining: &mut Option<usize>,
     data: &Bytes,
-) {
+) -> bool {
     if let Some(dec) = decoder {
         let mut pos = 0;
         while pos < data.len() {
@@ -1111,18 +1664,249 @@ fn accumulate_body(
                 let start = pos + span.data_start;
                 body.extend_from_slice(&data[start..start + span.data_len]);
             }
-            if span.complete || span.consumed == 0 {
+            if span.complete {
+                return pos + span.consumed == data.len();
+            }
+            if span.consumed == 0 {
                 break;
             }
             pos += span.consumed;
         }
+        true
     } else if let Some(rem) = remaining {
         let take = data.len().min(*rem);
         body.extend_from_slice(&data[..take]);
         *rem -= take;
+        take == data.len()
     } else {
         body.extend_from_slice(data);
+        true
     }
+}
+
+// ============================================================================
+// バッファ経路の上流往復（B-104 / B-105）
+// ============================================================================
+
+/// バッファ経路の上流往復の設定（`handle_request` から渡す）。
+pub(crate) struct BufferedExchange<'a> {
+    pub target: &'a crate::config::ProxyTarget,
+    pub timeout_secs: u64,
+    pub tls_insecure: bool,
+    pub pool_max_idle: usize,
+    pub pool_idle_timeout_secs: u64,
+    /// HEAD 要求か（応答本文を読まない）。
+    pub no_response_body: bool,
+    /// F-177: 冪等な要求か（再利用した接続が応答前に失敗したとき 1 回だけ再送する）。
+    pub idempotent: bool,
+}
+
+/// バッファ経路の上流応答（本文はフレーミングを外した完全な本文）。
+pub(crate) struct BufferedResponse {
+    pub status: u16,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub body: Vec<u8>,
+}
+
+/// 完成済みの HTTP/1.1 要求（head + 本文。`Connection: close` は付けない）を上流へ送り、
+/// 応答全体を受け取る。
+///
+/// B-104: 上流接続は HTTP/3 ワーカーのプール（ストリーミング経路と共通）から取り出し、
+/// 応答の終端をちょうど読み切ったときだけ返す。
+/// B-105: HTTPS 上流も同じ非同期経路（`tls_connect`）で扱う。以前はスレッドを生成して
+/// 同期 TLS で接続し、5ms 刻みでポーリングしていた。
+/// F-177: 再利用した接続が応答の 1 バイト目より前に失敗し、要求が冪等なら、要求全体を
+/// 保持しているので新規接続で 1 回だけ再送する。
+pub(crate) async fn exchange_buffered(
+    cfg: &BufferedExchange<'_>,
+    request: Bytes,
+) -> io::Result<BufferedResponse> {
+    let target = cfg.target;
+    let addr = target.conn_addr();
+    let addr = addr.as_str();
+    let sni = target.sni();
+    let pool_key = if target.use_tls {
+        crate::http_utils::PoolKeyStr::tls_addr(addr, sni, cfg.tls_insecure)
+    } else {
+        crate::http_utils::PoolKeyStr::plain_addr(addr)
+    };
+
+    let mut pooled = h3_pool_get(pool_key.as_str());
+    loop {
+        let reused = pooled.is_some();
+        let backend = match pooled.take() {
+            Some(b) => b,
+            None => connect_backend_io(
+                addr,
+                cfg.timeout_secs,
+                target.use_tls,
+                sni,
+                cfg.tls_insecure,
+            )
+            .await
+            .map_err(|status| {
+                io::Error::new(
+                    if status == 504 {
+                        io::ErrorKind::TimedOut
+                    } else {
+                        io::ErrorKind::ConnectionRefused
+                    },
+                    "backend connect failed",
+                )
+            })?,
+        };
+        let mut got_response_bytes = false;
+        let result = buffered_round_trip(
+            &backend,
+            request.clone(),
+            cfg.timeout_secs,
+            cfg.no_response_body,
+            &mut got_response_bytes,
+        )
+        .await;
+        match result {
+            Ok((resp, RespEnd::Reusable)) if backend.is_clean() => {
+                h3_pool_put(
+                    pool_key.as_str(),
+                    backend,
+                    cfg.pool_max_idle,
+                    cfg.pool_idle_timeout_secs,
+                );
+                return Ok(resp);
+            }
+            Ok((resp, _)) => return Ok(resp),
+            Err(e) if reused && !got_response_bytes && cfg.idempotent => {
+                debug!(
+                    "[HTTP/3] pooled backend connection failed before the response ({}); retrying on a fresh connection",
+                    e
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 要求を送り、応答を最後まで読む（バッファ経路の 1 往復）。
+async fn buffered_round_trip(
+    backend: &BackendIo,
+    request: Bytes,
+    timeout_secs: u64,
+    no_response_body: bool,
+    got_response_bytes: &mut bool,
+) -> io::Result<(BufferedResponse, RespEnd)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "backend response timeout");
+    match crate::runtime::time::timeout(
+        Duration::from_secs(timeout_secs),
+        backend.write_all(request),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => return Err(timed_out()),
+    }
+
+    let mut read_buf = vec![0u8; RESP_READ_CHUNK];
+    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    let header_end = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let (res, buf) = backend.read_into(read_buf).await;
+        read_buf = buf;
+        let n = match res {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "backend closed before response headers",
+                ))
+            }
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        };
+        *got_response_bytes = true;
+        head_buf.extend_from_slice(&read_buf[..n]);
+        if let Some(pos) = drain_interim_and_find_header_end(&mut head_buf) {
+            break pos;
+        }
+        if head_buf.len() > MAX_RESP_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backend response headers too large",
+            ));
+        }
+    };
+
+    let status = parse_status_code(&head_buf[..header_end]).unwrap_or(502);
+    let mut parsed = parse_response_headers(&head_buf[..header_end]);
+    if no_response_body || status == 204 || status == 304 {
+        parsed.framing = Framing::Length(0);
+    }
+    let reusable_conn = parsed.keep_alive && status != 101;
+    let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
+
+    let mut decoder = if matches!(parsed.framing, Framing::Chunked) {
+        Some(crate::http_utils::ChunkedDecoder::new_unlimited())
+    } else {
+        None
+    };
+    let mut remaining = match parsed.framing {
+        Framing::Length(n) => Some(n),
+        _ => None,
+    };
+    let eof_framed = matches!(parsed.framing, Framing::Eof);
+    let mut body: Vec<u8> = Vec::with_capacity(remaining.unwrap_or(leftover.len()));
+    let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
+    let mut done =
+        decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false) || remaining == Some(0);
+    while !done {
+        if std::time::Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let (res, buf) = backend.read_into(read_buf).await;
+        read_buf = buf;
+        match res {
+            Ok(0) if eof_framed => break,
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "backend closed before the body completed",
+                ))
+            }
+            Ok(n) => {
+                let slice = Bytes::copy_from_slice(&read_buf[..n]);
+                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
+                done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)
+                    || remaining == Some(0);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    // 本文はフレーミングを外した完全な形で返すので、chunked の痕跡と（圧縮等で変わりうる）
+    // 長さは呼び出し側が付け直す。Content-Length は本文長に合わせる。
+    let headers: Vec<(Vec<u8>, Vec<u8>)> = parsed
+        .headers
+        .into_iter()
+        .filter(|(n, _)| !n.eq_ignore_ascii_case(b"content-length") || no_response_body)
+        .map(|(n, v)| (n.to_vec(), v.to_vec()))
+        .collect();
+    let end = if reusable_conn && !eof_framed && exact {
+        RespEnd::Reusable
+    } else {
+        RespEnd::Close
+    };
+    Ok((
+        BufferedResponse {
+            status,
+            headers,
+            body,
+        },
+        end,
+    ))
 }
 
 // ============================================================================
@@ -1217,29 +2001,11 @@ async fn send_backend_chunk(backend: &BackendIo, data: Bytes) -> io::Result<()> 
         return Ok(());
     }
     let mut header = Vec::with_capacity(18);
-    push_chunk_size_line(&mut header, data.len());
+    crate::http_utils::push_chunk_size_line(&mut header, data.len());
     backend.write_all(Bytes::from(header)).await?;
     backend.write_all(data).await?;
     backend.write_all(Bytes::from_static(b"\r\n")).await?;
     Ok(())
-}
-
-/// chunked のチャンクサイズ行（`<hex>\r\n`）を `buf` へ追記する（`format!` を避ける）。
-pub(crate) fn push_chunk_size_line(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buf.push(b'0');
-    } else {
-        let mut tmp = [0u8; 16];
-        let mut i = tmp.len();
-        while n > 0 {
-            i -= 1;
-            let d = (n & 0xf) as u8;
-            tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
-            n >>= 4;
-        }
-        buf.extend_from_slice(&tmp[i..]);
-    }
-    buf.extend_from_slice(b"\r\n");
 }
 
 /// レスポンスボディのフレーミング種別。
@@ -1261,6 +2027,9 @@ struct ParsedHeaders {
     content_length: Option<usize>,
     content_type: Option<Bytes>,
     content_encoding: Option<Bytes>,
+    /// B-104: 上流がこの応答の後も接続を維持するか（HTTP/1.1 で `Connection: close` 無し、
+    /// または HTTP/1.0 で `Connection: keep-alive`）。`false` なら接続をプールへ返さない。
+    keep_alive: bool,
 }
 
 /// HTTP/1.1 レスポンスヘッダ部（ステータス行除く）をパースし、転送用ヘッダとフレーミングを返す。
@@ -1270,6 +2039,9 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
     let mut content_length: Option<usize> = None;
     let mut content_type: Option<Bytes> = None;
     let mut content_encoding: Option<Bytes> = None;
+    let http11 = header_bytes.starts_with(b"HTTP/1.1");
+    let mut conn_close = false;
+    let mut conn_keep_alive = false;
 
     // 最初の行（ステータス行）はスキップ。
     let after_status = memchr::memchr(b'\n', header_bytes)
@@ -1298,7 +2070,19 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
             }
             continue; // HTTP/3 へは転送しない。
         }
-        if name.eq_ignore_ascii_case(b"connection") || name.eq_ignore_ascii_case(b"keep-alive") {
+        if name.eq_ignore_ascii_case(b"connection") {
+            // トークンのリスト（例: `keep-alive, Upgrade`）。
+            for token in value.split(|&b| b == b',') {
+                let token = token.trim_ascii();
+                if token.eq_ignore_ascii_case(b"close") {
+                    conn_close = true;
+                } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                    conn_keep_alive = true;
+                }
+            }
+            continue; // ホップバイホップ。
+        }
+        if name.eq_ignore_ascii_case(b"keep-alive") {
             continue; // ホップバイホップ。
         }
         if name.eq_ignore_ascii_case(b"content-length") {
@@ -1331,6 +2115,7 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
         content_length,
         content_type,
         content_encoding,
+        keep_alive: !conn_close && (http11 || conn_keep_alive),
     }
 }
 
@@ -1380,6 +2165,69 @@ mod tests {
     use super::*;
 
     // NOTE: channel / Notify の単体テストは抽出先の [`crate::stream_channel`] に移設した（F-116）。
+
+    #[test]
+    fn b104_keep_alive_detection() {
+        let h = parse_response_headers(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n");
+        assert!(h.keep_alive);
+        let h = parse_response_headers(b"HTTP/1.1 200 OK\r\nConnection: close\r\n");
+        assert!(!h.keep_alive);
+        let h = parse_response_headers(b"HTTP/1.1 200 OK\r\nConnection: Keep-Alive, Close\r\n");
+        assert!(!h.keep_alive);
+        let h = parse_response_headers(b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n");
+        assert!(
+            !h.keep_alive,
+            "HTTP/1.0 closes unless keep-alive is requested"
+        );
+        let h = parse_response_headers(b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n");
+        assert!(h.keep_alive);
+        // Connection ヘッダはクライアントへ転送しない（ホップバイホップ）。
+        assert!(h
+            .headers
+            .iter()
+            .all(|(n, _)| !n.eq_ignore_ascii_case(b"connection")));
+    }
+
+    #[test]
+    fn b104_accumulate_body_reports_overrun() {
+        let mut body = Vec::new();
+        let mut dec = None;
+        let mut rem = Some(3usize);
+        assert!(accumulate_body(
+            &mut body,
+            &mut dec,
+            &mut rem,
+            &Bytes::from_static(b"abc")
+        ));
+        let mut rem = Some(3usize);
+        let mut body = Vec::new();
+        assert!(!accumulate_body(
+            &mut body,
+            &mut dec,
+            &mut rem,
+            &Bytes::from_static(b"abcd")
+        ));
+        assert_eq!(body, b"abc");
+
+        let mut dec = Some(crate::http_utils::ChunkedDecoder::new_unlimited());
+        let mut rem = None;
+        let mut body = Vec::new();
+        assert!(accumulate_body(
+            &mut body,
+            &mut dec,
+            &mut rem,
+            &Bytes::from_static(b"3\r\nabc\r\n0\r\n\r\n")
+        ));
+        assert_eq!(body, b"abc");
+        let mut dec = Some(crate::http_utils::ChunkedDecoder::new_unlimited());
+        let mut body = Vec::new();
+        assert!(!accumulate_body(
+            &mut body,
+            &mut dec,
+            &mut rem,
+            &Bytes::from_static(b"3\r\nabc\r\n0\r\n\r\nX")
+        ));
+    }
 
     /// rustls の client/server をメモリ上でハンドシェイクさせる（テスト用）。
     /// docker build のサンドボックス等、io_uring が seccomp で拒否される環境では
@@ -1510,13 +2358,13 @@ mod tests {
     #[test]
     fn push_chunk_size_line_hex() {
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 0);
+        crate::http_utils::push_chunk_size_line(&mut b, 0);
         assert_eq!(b, b"0\r\n");
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 255);
+        crate::http_utils::push_chunk_size_line(&mut b, 255);
         assert_eq!(b, b"ff\r\n");
         let mut b = Vec::new();
-        push_chunk_size_line(&mut b, 7000);
+        crate::http_utils::push_chunk_size_line(&mut b, 7000);
         assert_eq!(b, format!("{:x}\r\n", 7000).into_bytes());
     }
 

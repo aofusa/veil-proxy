@@ -16,7 +16,6 @@ use once_cell::sync::Lazy;
 use rustls::ServerConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -2116,135 +2115,165 @@ pub async fn drain_connections(worker_type: &str, thread_id: usize) {
 }
 
 // ====================
-// レートリミッター（スライディングウィンドウ方式）
+// レートリミッター（スライディングウィンドウ方式、プロセス共有。B-31）
 // ====================
 //
-// クライアントIPごとに分間リクエスト数を追跡します。
-// スレッドローカルで管理し、ロックフリーで高パフォーマンスを実現。
+// クライアント IP ごとの分間リクエスト数を、**全ワーカーで共有する固定サイズの表**で数える。
+// 従来はワーカーごとの `thread_local!` だったため、設定した「IP あたり N 回/分」が
+// ワーカー数倍まで通っていた（B-31）。
+//
+// - 表は 65,536 スロットの `AtomicU64`（512KB）。レートリミットを使う最初の要求で確保する。
+// - スロットは IP のハッシュ（プロセスごとの乱数シード）で選ぶ。別の IP と同じスロットに
+//   入った場合はカウントを共有する（= わずかに厳しめに倒れる。上限を超えて通すことはない）。
+// - 各スロットは `(分, 今の分の件数, 前の分の件数)` を 64bit に詰め、CAS 1 回で更新する。
+//   要求ごとの確保は無い（従来は新しい IP ごとに `to_string()` していた）。
+// - 推定レートは従来と同じスライディングウィンドウ:
+//   `前の分の件数 × (今の分の残り秒 / 60) + 今の分の件数`
 // ====================
 
-/// レートリミットのエントリ
-pub struct RateLimitEntry {
-    /// 現在のウィンドウ（分）のリクエスト数
-    pub current_count: u32,
-    /// 前のウィンドウ（分）のリクエスト数
-    pub previous_count: u32,
-    /// 現在のウィンドウの開始時刻（分単位のタイムスタンプ）
-    pub current_minute: u64,
+/// 表のスロット数（2 の冪）。
+const RATE_SLOTS: usize = 1 << 16;
+
+struct RateTable {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
+    hasher: foldhash::quality::RandomState,
 }
 
-impl RateLimitEntry {
-    pub fn new(current_minute: u64) -> Self {
-        Self {
-            current_count: 1,
-            previous_count: 0,
-            current_minute,
-        }
-    }
+static RATE_TABLE: std::sync::LazyLock<RateTable> = std::sync::LazyLock::new(|| RateTable {
+    slots: (0..RATE_SLOTS)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect(),
+    hasher: foldhash::quality::RandomState::default(),
+});
 
-    /// リクエストを記録し、現在のレートを返す（スライディングウィンドウ方式）
-    /// 返り値: 推定される分間リクエスト数
-    pub fn record_request(&mut self, now_minute: u64, now_second_in_minute: u32) -> u32 {
-        if now_minute > self.current_minute {
-            if now_minute == self.current_minute + 1 {
-                // 次の分に移行
-                self.previous_count = self.current_count;
-                self.current_count = 1;
-            } else {
-                // 2分以上経過 - リセット
-                self.previous_count = 0;
-                self.current_count = 1;
-            }
-            self.current_minute = now_minute;
+/// スロットの値 `(分, 今の分の件数, 前の分の件数)` を詰める（分は下位 32bit）。
+#[inline]
+fn rate_pack(minute: u32, current: u16, previous: u16) -> u64 {
+    (minute as u64) | ((current as u64) << 32) | ((previous as u64) << 48)
+}
+
+#[inline]
+fn rate_unpack(v: u64) -> (u32, u16, u16) {
+    (v as u32, (v >> 32) as u16, (v >> 48) as u16)
+}
+
+/// スロットへ 1 件記録し、推定レート（スライディングウィンドウ）を返す。
+fn rate_record(slot: &std::sync::atomic::AtomicU64, minute: u32, second_in_minute: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    let mut old = slot.load(Ordering::Relaxed);
+    loop {
+        let (m, cur, prev) = rate_unpack(old);
+        let (cur2, prev2) = if m == minute {
+            (cur.saturating_add(1), prev)
+        } else if m.wrapping_add(1) == minute {
+            (1, cur)
         } else {
-            self.current_count += 1;
-        }
-
-        // スライディングウィンドウによる推定レート計算
-        // 現在の分の経過割合に基づいて重み付け
-        let weight = (60 - now_second_in_minute) as f32 / 60.0;
-        let estimated = (self.previous_count as f32 * weight) + self.current_count as f32;
-        estimated.ceil() as u32
-    }
-}
-
-/// スレッドローカルなレートリミットマップ
-/// キー: クライアントIPアドレス（文字列）
-/// 値: RateLimitEntry
-pub struct RateLimiter {
-    pub entries: HashMap<String, RateLimitEntry>,
-    pub last_cleanup: std::time::Instant,
-}
-
-impl RateLimiter {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            last_cleanup: std::time::Instant::now(),
-        }
-    }
-
-    /// リクエストをチェックし、レート制限を超えていないか確認
-    /// 戻り値: (許可されたか, 現在のレート)
-    ///
-    /// ## パフォーマンス最適化
-    ///
-    /// SystemTime::now()の代わりにCoarse Timerを使用してシステムコールを削減。
-    /// 100ms程度の精度低下は、レートリミットの用途では許容範囲。
-    fn check_and_record(&mut self, client_ip: &str, limit: u64) -> (bool, u32) {
-        // 定期的なクリーンアップ（5分ごと）
-        if self.last_cleanup.elapsed().as_secs() > 300 {
-            self.cleanup();
-            self.last_cleanup = std::time::Instant::now();
-        }
-
-        // Coarse Timerから現在時刻を取得（システムコール削減）
-        // OffsetDateTime から Unix タイムスタンプを計算
-        let now_time = coarse_now();
-        let now_secs = now_time.unix_timestamp() as u64;
-        let now_minute = now_secs / 60;
-        let now_second_in_minute = (now_secs % 60) as u32;
-
-        let rate = if let Some(entry) = self.entries.get_mut(client_ip) {
-            entry.record_request(now_minute, now_second_in_minute)
-        } else {
-            self.entries
-                .insert(client_ip.to_string(), RateLimitEntry::new(now_minute));
-            1
+            (1, 0)
         };
-
-        (rate as u64 <= limit, rate)
-    }
-
-    /// 古いエントリをクリーンアップ
-    ///
-    /// Coarse Timerを使用してシステムコールを削減。
-    fn cleanup(&mut self) {
-        // Coarse Timerから現在時刻を取得
-        let now_time = coarse_now();
-        let now_minute = now_time.unix_timestamp() as u64 / 60;
-
-        // 2分以上古いエントリを削除
-        self.entries
-            .retain(|_, entry| now_minute.saturating_sub(entry.current_minute) < 2);
+        match slot.compare_exchange_weak(
+            old,
+            rate_pack(minute, cur2, prev2),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                let weight = 60u32.saturating_sub(second_in_minute) as u64;
+                // ceil(prev × weight / 60) + cur
+                let carried = (prev2 as u64 * weight).div_ceil(60);
+                return (carried + cur2 as u64).min(u32::MAX as u64) as u32;
+            }
+            Err(actual) => old = actual,
+        }
     }
 }
 
-thread_local! {
-    static RATE_LIMITER: RefCell<RateLimiter> = RefCell::new(RateLimiter::new());
-}
-
-/// レートリミットをチェック
-/// 戻り値: レート制限内であればtrue
-pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
+/// レートリミットをチェック（全ワーカー共有）。
+///
+/// `zone` はルートごとの識別子（呼び出し側はルートの `SecurityConfig` のアドレスを渡す）。
+/// 件数は `(ルート, IP)` ごとに数える（あるルートへの要求が別のルートの上限を消費しない。
+/// nginx の `limit_req` のゾーンと同じ考え方）。設定のリロードで新しいルートになると数え直す。
+/// 戻り値: レート制限内であれば true
+pub fn check_rate_limit(zone: usize, client_ip: &str, limit: u64) -> bool {
     if limit == 0 {
         return true; // 0 = 無制限
     }
+    let table = &*RATE_TABLE;
+    let idx = (std::hash::BuildHasher::hash_one(&table.hasher, (zone, client_ip)) as usize)
+        & (RATE_SLOTS - 1);
+    // Coarse Timer（システムコール削減。精度 100ms 程度で十分）
+    let now_secs = coarse_now().unix_timestamp() as u64;
+    let rate = rate_record(
+        &table.slots[idx],
+        (now_secs / 60) as u32,
+        (now_secs % 60) as u32,
+    );
+    rate as u64 <= limit
+}
 
-    RATE_LIMITER.with(|limiter| {
-        let (allowed, _rate) = limiter.borrow_mut().check_and_record(client_ip, limit);
-        allowed
-    })
+#[cfg(test)]
+mod b31_rate_limit_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn pack_roundtrip() {
+        let v = rate_pack(29_000_000, 123, 65_535);
+        assert_eq!(rate_unpack(v), (29_000_000, 123, 65_535));
+    }
+
+    /// 同じ分は加算、次の分は前の分へ繰り越し、2 分以上空いたらリセット。
+    #[test]
+    fn sliding_window() {
+        let slot = AtomicU64::new(0);
+        for _ in 0..10 {
+            rate_record(&slot, 100, 0);
+        }
+        assert_eq!(
+            rate_unpack(slot.load(std::sync::atomic::Ordering::Relaxed)).1,
+            10
+        );
+        // 次の分の 30 秒目: 前の分 10 件の半分（5）+ 今の分 1 件。
+        assert_eq!(rate_record(&slot, 101, 30), 6);
+        // 分の終わり近く: 繰り越しはほぼ 0（切り上げで 1）+ 今の分 2 件。
+        assert_eq!(rate_record(&slot, 101, 59), 3);
+        // 2 分以上空いたらリセット。
+        assert_eq!(rate_record(&slot, 105, 0), 1);
+    }
+
+    /// 全ワーカー共有: 別スレッドからの要求も同じ IP として数える。
+    #[test]
+    fn shared_across_threads() {
+        let ip = "203.0.113.77";
+        let limit = 40;
+        let allowed: usize = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    (0..20).filter(|_| check_rate_limit(1, ip, limit)).count()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        // 4 スレッド × 20 = 80 件のうち、通るのは上限（40）まで（分の境目をまたぐと
+        // 前の分の繰り越しで少し減ることがあるので上限側だけを厳密に見る）。
+        assert!(
+            allowed <= limit as usize,
+            "allowed {} > limit {}",
+            allowed,
+            limit
+        );
+        assert!(allowed >= 1);
+    }
+
+    /// ルート（zone）が違えば件数は別々に数える。
+    #[test]
+    fn zones_are_independent() {
+        let ip = "198.51.100.9";
+        assert!((0..5).all(|_| check_rate_limit(11, ip, 5)));
+        assert!(!check_rate_limit(11, ip, 5));
+        assert!(check_rate_limit(12, ip, 5));
+    }
 }
 
 // ====================
@@ -2368,6 +2397,46 @@ thread_local! {
     };
 }
 
+// F-175: 上流 HTTPS の HTTP/2（ALPN `h2, http/1.1`）用コネクター。証明書検証・kTLS の設定は
+// 上の HTTP/1.1 用と同じで、ALPN だけが違う（ワーカースレッドごとに 1 回だけ作る）。
+#[cfg(all(veil_ktls, feature = "http2"))]
+thread_local! {
+    static TLS_CONNECTOR_H2: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls = &config_guard.ktls_config;
+        let config = (*crate::ktls_rustls::client_config(ktls.enabled)).clone();
+        let config = crate::protocol::configure_alpn_h2_client(config);
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls.enabled)
+            .with_fallback(ktls.fallback_enabled)
+            .with_tcp_cork(ktls.tcp_cork_enabled)
+    };
+    static TLS_CONNECTOR_H2_INSECURE: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls = &config_guard.ktls_config;
+        let config = (*crate::ktls_rustls::insecure_client_config()).clone();
+        let config = crate::protocol::configure_alpn_h2_client(config);
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls.enabled)
+            .with_fallback(ktls.fallback_enabled)
+            .with_tcp_cork(ktls.tcp_cork_enabled)
+    };
+}
+
+#[cfg(all(not(veil_ktls), feature = "http2"))]
+thread_local! {
+    static TLS_CONNECTOR_H2: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::default_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+    static TLS_CONNECTOR_H2_INSECURE: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::insecure_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+}
+
 // ====================
 // TLS コネクタアクセサ関数
 // ====================
@@ -2382,6 +2451,26 @@ pub fn get_tls_connector() -> RustlsConnector {
 #[cfg(veil_ktls)]
 pub fn get_tls_connector_insecure() -> RustlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
+}
+
+/// F-175: ALPN `h2, http/1.1` の TLS コネクタを取得する。
+#[cfg(all(veil_ktls, feature = "http2"))]
+pub fn get_tls_connector_h2(insecure: bool) -> RustlsConnector {
+    if insecure {
+        TLS_CONNECTOR_H2_INSECURE.with(|c| c.clone())
+    } else {
+        TLS_CONNECTOR_H2.with(|c| c.clone())
+    }
+}
+
+/// F-175: ALPN `h2, http/1.1` の TLS コネクタを取得する。
+#[cfg(all(not(veil_ktls), feature = "http2"))]
+pub fn get_tls_connector_h2(insecure: bool) -> crate::simple_tls::SimpleTlsConnector {
+    if insecure {
+        TLS_CONNECTOR_H2_INSECURE.with(|c| c.clone())
+    } else {
+        TLS_CONNECTOR_H2.with(|c| c.clone())
+    }
 }
 
 /// TLS コネクタを取得（通常接続用）
@@ -2402,6 +2491,22 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
 // 設定構造体
 // ====================
 
+/// 上流 HTTPS で HTTP/2 を使うか（F-175）。平文（`http://`）の上流には効かない（h2c は `use_h2c`）。
+///
+/// - `"auto"`（既定）: TLS の ALPN で `h2, http/1.1` を提示し、上流が選んだ方で話す。HTTP/2 なら
+///   多重化接続（F-174）を使う。上流が HTTP/1.1 を選んだ結果はワーカーごとに覚え、しばらくは
+///   ALPN `http/1.1` だけで接続する。
+/// - `"on"`: HTTP/2 を必須にする（上流が HTTP/2 を選ばなければ 502）。
+/// - `"off"`: ALPN は `http/1.1` のみ（v0.7 までの挙動）。
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamHttp2 {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
 /// Upstream サーバーエントリ（文字列または構造体）
 ///
 /// 以下の2つの形式をサポート:
@@ -2412,6 +2517,8 @@ pub struct UpstreamServerEntry {
     pub url: String,
     pub sni_name: Option<String>,
     pub use_h2c: bool,
+    /// HTTPS 上流の HTTP/2（F-175）。`None` ならグループの設定（既定 `"auto"`）。
+    pub http2: Option<UpstreamHttp2>,
     /// 重み（Weighted Round Robin 用、デフォルト 1）
     pub weight: u32,
 }
@@ -2441,6 +2548,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                     url: v.to_string(),
                     sni_name: None,
                     use_h2c: false,
+                    http2: None,
                     weight: 1,
                 })
             }
@@ -2453,6 +2561,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                 let mut url: Option<String> = None;
                 let mut sni_name: Option<String> = None;
                 let mut use_h2c: Option<bool> = None;
+                let mut http2: Option<UpstreamHttp2> = None;
                 let mut weight: Option<u32> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
@@ -2460,6 +2569,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                         "url" => url = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "http2" => http2 = Some(map.next_value()?),
                         "weight" => weight = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
@@ -2475,6 +2585,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                     url,
                     sni_name,
                     use_h2c,
+                    http2,
                     weight,
                 })
             }
@@ -2514,6 +2625,23 @@ pub struct UpstreamConfig {
     /// 異常検知（Outlier Detection）設定（F-06）
     #[serde(default)]
     pub outlier_detection: OutlierConfig,
+    /// HTTPS 上流の HTTP/2（F-175、既定 `"auto"`）。サーバー単位の `http2` が優先する。
+    #[serde(default)]
+    pub http2: UpstreamHttp2,
+}
+
+impl UpstreamConfig {
+    /// サーバーエントリへグループの `http2` を既定値として埋めたもの（F-175）。
+    fn resolved_servers(&self) -> Vec<UpstreamServerEntry> {
+        self.servers
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                e.http2.get_or_insert(self.http2);
+                e
+            })
+            .collect()
+    }
 }
 
 /// サーキットブレーカー設定（F-06）
@@ -4064,6 +4192,8 @@ pub enum BackendConfig {
         url: String,
         sni_name: Option<String>,
         use_h2c: bool,
+        /// HTTPS 上流の HTTP/2（F-175、既定 `"auto"`）。
+        http2: UpstreamHttp2,
     },
     /// Upstream グループ参照（ロードバランシング用）
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
@@ -4126,6 +4256,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut sni_name: Option<String> = None;
                 // H2C 用フィールド（Proxy用）
                 let mut use_h2c: Option<bool> = None;
+                // HTTPS 上流の HTTP/2（F-175、Proxy用）
+                let mut http2: Option<UpstreamHttp2> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -4145,6 +4277,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "http2" => http2 = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -4171,6 +4304,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 url,
                                 sni_name,
                                 use_h2c,
+                                http2: http2.unwrap_or_default(),
                             })
                         }
                     }
@@ -4348,6 +4482,8 @@ pub struct ProxyTarget {
     /// true の場合、非TLSバックエンドにHTTP/2で接続
     /// HTTP/2 Upgrade 経由ではなく、Prior Knowledge モードを使用
     pub use_h2c: bool,
+    /// HTTPS 上流で HTTP/2 を使うか（F-175）。`use_tls` のときだけ意味を持つ。
+    pub http2: UpstreamHttp2,
     /// 事前パース済みの接続先 `SocketAddr`（`host` が IP アドレスリテラルの場合のみ `Some`）。
     /// 設定ロード時に一度だけ解決しておくことで、ホットパス（接続確立のたびに実行される
     /// `to_socket_addrs()`。内部で `Vec` 確保が発生し、`host` がホスト名の場合は
@@ -4417,6 +4553,7 @@ impl ProxyTarget {
             path_prefix: path.to_string(),
             sni_name: None,
             use_h2c: false, // デフォルトでは無効
+            http2: UpstreamHttp2::default(),
             socket_addr,
             unix_path: None,
         })
@@ -4445,6 +4582,7 @@ impl ProxyTarget {
             path_prefix: path_prefix.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: UpstreamHttp2::default(),
             socket_addr: None,
             unix_path: Some(Arc::from(socket_path)),
         })
@@ -4486,6 +4624,18 @@ impl ProxyTarget {
             self.use_h2c = use_h2c;
         }
         self
+    }
+
+    /// HTTPS 上流の HTTP/2 設定を変更したコピーを作成（F-175）
+    pub fn with_http2(mut self, http2: UpstreamHttp2) -> Self {
+        self.http2 = http2;
+        self
+    }
+
+    /// HTTPS 上流で HTTP/2 を試すか（F-175）。平文・`"off"` では `false`。
+    #[inline]
+    pub fn h2_over_tls(&self) -> bool {
+        self.use_tls && self.http2 != UpstreamHttp2::Off
     }
 
     /// TLS接続時に使用するSNI名を取得
@@ -5011,6 +5161,7 @@ impl UpstreamGroup {
                 ProxyTarget::parse(&entry.url)
                     .map(|target| target.with_sni_name(entry.sni_name.clone()))
                     .map(|target| target.with_h2c(entry.use_h2c))
+                    .map(|target| target.with_http2(entry.http2.unwrap_or_default()))
                     .map(|target| (entry.clone(), UpstreamServer::new(target)))
             })
             .collect();
@@ -6428,7 +6579,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
             let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
                 name.clone(),
-                cfg.servers.clone(),
+                cfg.resolved_servers(),
                 algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
@@ -6622,7 +6773,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
                 name.clone(),
-                cfg.servers.clone(),
+                cfg.resolved_servers(),
                 algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
@@ -6971,6 +7122,32 @@ fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
     resolved
 }
 
+/// chroot(2) 後にルートの `resolved_backend` を作り直す（NetBSD の `chroot_dir`。F-140/F-176）。
+///
+/// 設定ロードは chroot 前に行うため、`canonical_base_memoized` は chroot 外の実体パスを
+/// 返す（証明書を chroot 前後の両方で読めるよう chroot 外の同じパスにシンボリックリンクを
+/// 張る構成では、リンクを辿った chroot 外のパスになる）。chroot 後のファイル解決結果は
+/// 新しいルート基準になるので、`sendfile_base_contains` の包含判定が一致せず静的配信が
+/// すべて 403 になっていた。メモを捨てて新しいルート基準で解決し直す（起動時に 1 回だけ）。
+#[cfg(any(target_os = "netbsd", test))]
+pub fn reresolve_routes_after_chroot(
+    routes: &[Route],
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+) -> Arc<Vec<Route>> {
+    CANONICAL_BASE_MEMO.with(|m| m.borrow_mut().clear());
+    IS_DIR_MEMO.with(|m| m.borrow_mut().clear());
+    Arc::new(
+        routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                route.resolved_backend = build_backend(&route, upstream_groups).ok();
+                route
+            })
+            .collect(),
+    )
+}
+
 pub fn load_backend(
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
@@ -7025,12 +7202,14 @@ fn build_backend(
             url,
             sni_name,
             use_h2c,
+            http2,
         } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
                 .with_sni_name(sni_name.clone())
-                .with_h2c(*use_h2c);
+                .with_h2c(*use_h2c)
+                .with_http2(*http2);
 
             if *use_h2c && !target.use_tls {
                 info!("H2C (HTTP/2 over cleartext) enabled for backend: {}", url);
@@ -7504,6 +7683,7 @@ mod load_balancing_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight,
         }
     }
@@ -7811,6 +7991,7 @@ mod circuit_breaker_upstream_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight: 1,
         }
     }
@@ -7974,6 +8155,7 @@ mod advanced_lb_integration_tests {
             url: url.to_string(),
             sni_name: None,
             use_h2c: false,
+            http2: None,
             weight,
         }
     }
@@ -8546,5 +8728,118 @@ mod f159_resolved_backend_tests {
         // ホットパスの安全網として、従来どおり load_backend を呼んでもエラーになること。
         let result = load_backend(&route, &upstream_groups);
         assert!(result.is_err());
+    }
+
+    /// F-176: chroot でファイルシステムの見え方が変わった後、`reresolve_routes_after_chroot`
+    /// が古い canonical 形（メモ）を捨てて解決し直すこと。chroot はテストで行えないので、
+    /// 同じ設定パスが指すシンボリックリンクの先を差し替えて「見え方の変化」を再現する。
+    #[cfg(unix)]
+    #[test]
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn reresolve_routes_after_chroot_drops_stale_canonical_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = dir.path().join("before");
+        let after = dir.path().join("after");
+        std::fs::create_dir_all(before.join("www")).unwrap();
+        std::fs::create_dir_all(after.join("www")).unwrap();
+        let link = dir.path().join("data");
+        std::os::unix::fs::symlink(&before, &link).unwrap();
+
+        let www = link.join("www");
+        let toml = format!(
+            "action = {{ type = \"File\", path = {:?}, mode = \"sendfile\" }}",
+            www.to_str().unwrap()
+        );
+        let mut route: Route = toml::from_str(&toml).unwrap();
+        let upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+        route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+
+        fn canonical_base(route: &Route) -> PathBuf {
+            match route.resolved_backend.as_ref() {
+                Some(Backend::SendFile(_, true, _, _, _, _, Some(base), _, _)) => {
+                    base.to_path_buf()
+                }
+                other => panic!("expected a directory SendFile backend, got {:?}", other),
+            }
+        }
+        assert_eq!(
+            canonical_base(&route),
+            before.join("www").canonicalize().unwrap()
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&after, &link).unwrap();
+
+        let routes = reresolve_routes_after_chroot(std::slice::from_ref(&route), &upstream_groups);
+        assert_eq!(
+            canonical_base(&routes[0]),
+            after.join("www").canonicalize().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod f175_upstream_http2_tests {
+    use super::*;
+
+    fn group_from_toml(toml_src: &str) -> UpstreamGroup {
+        let cfg: UpstreamConfig = toml::from_str(toml_src).expect("parse upstream");
+        UpstreamGroup::new(
+            "g".to_string(),
+            cfg.resolved_servers(),
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            cfg.tls_insecure,
+        )
+        .expect("group")
+    }
+
+    /// 既定は "auto"。HTTPS の上流だけが HTTP/2 を試す（平文は h2c 設定に従う）。
+    #[test]
+    fn default_is_auto_and_only_applies_to_tls() {
+        let g = group_from_toml(r#"servers = ["https://127.0.0.1:8443", "http://127.0.0.1:8080"]"#);
+        assert_eq!(g.servers[0].target.http2, UpstreamHttp2::Auto);
+        assert!(g.servers[0].target.h2_over_tls());
+        assert!(!g.servers[1].target.h2_over_tls());
+    }
+
+    /// グループの `http2` がサーバーの既定になり、サーバー単位の指定が優先する。
+    #[test]
+    fn group_default_and_server_override() {
+        let g = group_from_toml(
+            r#"
+http2 = "off"
+servers = [
+    "https://127.0.0.1:8443",
+    { url = "https://127.0.0.1:9443", http2 = "on" },
+]
+"#,
+        );
+        assert_eq!(g.servers[0].target.http2, UpstreamHttp2::Off);
+        assert!(!g.servers[0].target.h2_over_tls());
+        assert_eq!(g.servers[1].target.http2, UpstreamHttp2::On);
+    }
+
+    /// ルートの `url` 指定でも `http2` を受け付ける。不正な値はエラー。
+    #[test]
+    fn route_level_http2_and_invalid_value() {
+        let action: BackendConfig = toml::from_str(
+            r#"type = "Proxy"
+url = "https://127.0.0.1:8443"
+http2 = "on""#,
+        )
+        .expect("route action");
+        match action {
+            BackendConfig::Proxy { http2, .. } => assert_eq!(http2, UpstreamHttp2::On),
+            _ => panic!("expected Proxy"),
+        }
+        assert!(toml::from_str::<UpstreamConfig>(
+            r#"
+http2 = "maybe"
+servers = ["https://127.0.0.1:8443"]
+"#
+        )
+        .is_err());
     }
 }

@@ -1657,6 +1657,15 @@ revalidate_mtime = false
 # # TLS証明書検証を無効化（自己署名証明書対応、デフォルト: false）
 # # 注意: 本番環境では false を推奨
 # tls_insecure = false
+#
+# # HTTPS 上流で HTTP/2 を使うか（F-175、デフォルト: "auto"）
+# #   "auto": HTTP/2・HTTP/3 で受けた要求は ALPN で h2, http/1.1 を提示し、上流が選んだ方で話す
+# #           （h2 なら多重化接続 F-174）。HTTP/1.1 で受けた要求は HTTP/1.1 のまま（その方が速い）。
+# #           上流が http/1.1 を選んだ結果はワーカーごとに 5 分間覚える
+# #   "on"  : HTTP/2 を必須にする（HTTP/1.1 で受けた要求も。上流が h2 を選ばなければ 502）
+# #   "off" : ALPN は http/1.1 のみ（v0.7 までの挙動）
+# # サーバー単位（{ url = "https://...", http2 = "off" }）やルートの url 指定でも書ける
+# http2 = "auto"
 
 
 
@@ -1806,6 +1815,7 @@ revalidate_mtime = false
 # type = "Proxy"
 # url = "https://192.168.1.100:443"
 # sni_name = "api.internal.example.com"
+# http2 = "auto"  # HTTPS 上流の HTTP/2（F-175）: "auto"（デフォルト）/ "on" / "off"
 # 
 # セキュリティ設定付きプロキシ
 # - 許可メソッド: GET, POST, PUT のみ
@@ -1823,6 +1833,7 @@ revalidate_mtime = false
 # allowed_methods = ["GET", "POST", "PUT"]
 # max_request_body_size = 5_242_880
 # backend_connect_timeout_secs = 10
+# # クライアント IP・ルートごと、全ワーカー共通の分間上限（B-31。0 = 無制限）
 # rate_limit_requests_per_min = 60
 
 # --- [route.security] のその他の設定キー（デフォルト値と説明） ---
@@ -1839,12 +1850,14 @@ revalidate_mtime = false
 # リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
 # max_request_header_size = 8192
 #
-# バックエンド接続プール: ホストごとの最大アイドル接続数
-# （HTTP/1.1・HTTPS に加え、F-106 で H2C/HTTP-2 バックエンド〈gRPC 中継等〉のプールにも適用）
+# バックエンド接続プール: ホストごとの最大アイドル接続数（HTTP/1.1・HTTPS。HTTP/3 ワーカーの
+# HTTP/1.1 上流プール〈B-104〉にも適用）。HTTP/2 上流〈use_h2c〉は接続を多重化する（F-174）ため
+# 本数の上限は持たず、相手の SETTINGS_MAX_CONCURRENT_STREAMS が埋まったときだけ接続を足す
 # max_idle_connections_per_host = 256
 #
 # バックエンド接続プール: アイドル接続の維持時間（秒）
-# （HTTP/1.1・HTTPS・H2C 共通。この時間を超えたアイドル接続は再利用せず破棄）
+# （HTTP/1.1・HTTPS・HTTP/2 共通。HTTP/2 はストリームが無いままこの時間が過ぎると GOAWAY で閉じる。
+#   0 ならプールしない）
 # idle_connection_timeout_secs = 30
 #
 # レスポンスから削除するヘッダー（クライアントへ返送前）

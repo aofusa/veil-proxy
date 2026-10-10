@@ -89,3 +89,10 @@ HTTP/3 系テストはこのプラットフォームでは実行されない（�
 - B-59（NetBSD/aarch64 の BoringSSL リンクエラー。本チケットの発見は同じ実機検証で得た）
 - B-60（NetBSD の PaX MPROTECT による WASM 実行不能）
 - F-140（NetBSD 対応）
+
+## 解消（2026-10-09、feat/v080-limitations / F-176）
+
+libc の修正を待たず、テスト用 HTTP/3 クライアントの依存 `quinn-udp` を vendoring し（`third_party/quinn-udp`）、
+NetBSD/aarch64 だけ正しいアラインメント（`long` 由来の 7）で CMSG マクロを実装した。`full-netbsd-no-http3`
+と、`bsd-vm.sh` の切り替えを削除した。NetBSD 10.1 aarch64（Apple Silicon + HVF）で `full-netbsd` の E2E が
+**565/565 成功**（HTTP/3 を含む。従来は HTTP/3 抜きの 429 件のみ）。

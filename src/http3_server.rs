@@ -626,12 +626,16 @@ struct ProxyStream {
     resp_started: bool,
     /// StreamBlocked で送出保留中の head（次回 drive で再送）。
     head_pending: Option<(u16, crate::http3_stream::RespHeaders)>,
-    /// フロー制御で部分送信になったボディ断片（`(buf, 送信済みオフセット)`）。
-    body_pending: Option<(Bytes, usize)>,
+    /// フロー制御で部分送信になったボディ断片（`(buf, 送信済みオフセット, fin)`）。
+    /// `fin` は最後の断片に終端を載せたもの（送り切ったら応答完了）。
+    body_pending: Option<(Bytes, usize, bool)>,
     /// レスポンス終端（EOF）を受信し、fin 送出が必要（フロー制御で保留中）。
     need_fin: bool,
     /// レスポンス fin 送出済み（= レスポンス完了）。
     resp_fin_sent: bool,
+    /// StreamBlocked で送出保留中の trailers（gRPC。B-97）。
+    #[cfg(feature = "grpc")]
+    trailers_pending: Option<crate::http3_stream::RespHeaders>,
 
     // ---- リクエスト方向（メインループ → バックエンドタスク） ----
     /// リクエストボディ断片の送信端（クライアント END_STREAM で None にして EOF 伝播）。
@@ -664,6 +668,8 @@ impl ProxyStream {
             body_pending: None,
             need_fin: false,
             resp_fin_sent: false,
+            #[cfg(feature = "grpc")]
+            trailers_pending: None,
             req_tx: Some(req_tx),
             req_pending: VecDeque::new(),
             req_readable: false,
@@ -673,12 +679,33 @@ impl ProxyStream {
             req_too_large: false,
         }
     }
+
+    /// B-97: バッファ経路の要求（本文は受信済み）。要求方向は最初から閉じている。
+    fn new_buffered(resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>) -> Self {
+        Self {
+            resp_rx,
+            resp_started: false,
+            head_pending: None,
+            body_pending: None,
+            need_fin: false,
+            resp_fin_sent: false,
+            #[cfg(feature = "grpc")]
+            trailers_pending: None,
+            req_tx: None,
+            req_pending: VecDeque::new(),
+            req_readable: false,
+            req_eof_seen: true,
+            req_bytes_total: 0,
+            max_request_body: 0,
+            req_too_large: false,
+        }
+    }
 }
 
 /// バッファリング（非ストリーミング）経路の保留リクエスト（F-32）。
 ///
 /// ストリーミング非適格なリクエストは END_STREAM 受信まで `stream_bodies` にボディを
-/// 蓄積し、完了時に既存の `handle_request`（バッファ経路）で処理する。
+/// 蓄積し、完了時にバッファ経路の要求タスク（B-97: `H3BufferedTask`）を起動する。
 struct BufferedReq {
     /// リクエストヘッダ（所有）。
     headers: Vec<h3::Header>,
@@ -744,7 +771,6 @@ impl AsRef<[u8]> for ArcVecBytes {
 /// F-132: WASM モジュールリストを渡す引数が増えたことで `clippy::too_many_arguments`
 /// に抵触するため、理由なし `#[allow]` を増やす代わりに構造体へまとめた。
 struct SendFileRequest<'a> {
-    stream_id: u64,
     base_path: &'a Path,
     is_dir: bool,
     index_file: Option<&'a str>,
@@ -824,6 +850,10 @@ struct Http3Handler {
     notify: crate::http3_stream::ConnWaker,
     /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
     backend_spawner: crate::http3_stream::BackendSpawner,
+    /// B-97: 起動待ちのバッファ経路の要求。メインループがワーカーの `FuturesUnordered` へ
+    /// 移して即座に 1 回 poll する（`process_h3_events` の後、`drive_proxy_streams` の前）。
+    /// 容量を保持したまま使い回す（要求ごとの確保なし）。
+    new_buffered: Vec<(H3BufferedTask, Vec<h3::Header>, Bytes)>,
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
@@ -870,6 +900,7 @@ impl Http3Handler {
             stream_bodies: StreamMap::default(),
             notify,
             backend_spawner,
+            new_buffered: Vec::new(),
             _conn_metric: Http3ActiveConnGuard::new(),
             metric_open_streams: HashSet::default(),
             dirty: false,
@@ -943,7 +974,7 @@ impl Http3Handler {
     /// `drive_request_pump` のコメント）。「仕事をしたら必ずもう一度 poll される」ことを
     /// メインループのダーティ集合再投入（`did_work` → dirty のまま維持）で保証し、
     /// イベントが残っているのにダーティを降ろす経路を構造的に排除する。
-    async fn process_h3_events(&mut self) -> io::Result<bool> {
+    fn process_h3_events(&mut self) -> io::Result<bool> {
         // 新規 Headers（stream_id, headers, more_frames）と Finished / Reset を収集。
         // F-168 P3: リクエストごとの `Vec` 確保をなくすため `Http3Handler` の再利用バッファを
         // 借り出す（`mem::take`）。関数末尾で `clear()` して容量を保持したまま戻す。
@@ -1119,10 +1150,26 @@ impl Http3Handler {
             let body = self
                 .stream_bodies
                 .remove(&stream_id)
-                .map(|b| b.to_vec())
+                .map(BytesMut::freeze)
                 .unwrap_or_default();
-            self.handle_request(stream_id, &br.headers, &body).await?;
-            self.metric_stream_close(stream_id);
+            // B-97: メインループでは await せず、要求 Future をメインループへ渡す（`new_buffered`）。
+            // 応答はストリーミング経路と同じ `ProxyStream` で送出し、完了時に
+            // `drive_proxy_streams` がメトリクスを閉じる。
+            let (resp_tx, resp_rx) =
+                crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
+            self.proxy_streams
+                .insert(stream_id, ProxyStream::new_buffered(resp_rx));
+            self.new_buffered.push((
+                H3BufferedTask {
+                    stream_id,
+                    peer_addr: self.peer_addr,
+                    client_ip: self.client_ip,
+                    resp_tx: Some(resp_tx),
+                    notify: self.notify.clone(),
+                },
+                br.headers,
+                body,
+            ));
         }
 
         // 部分的なレスポンスを送信（非ストリーミング経路）。
@@ -1321,10 +1368,6 @@ impl Http3Handler {
         {
             return Decision::Buffer;
         }
-        // gRPC はトレーラー処理のためバッファ経路（ストリーミング Decision の対象外）
-        if is_grpc {
-            return Decision::Buffer;
-        }
 
         // セキュリティチェック（ストリーミング適格は早期拒否でアップロードを溜めない）。
         let security = backend.security();
@@ -1365,12 +1408,29 @@ impl Http3Handler {
             None => return Decision::Buffer, // handle_request -> 502
         };
 
-        // B-84: h2c 上流はストリーミング経路が扱えない（BackendTaskParams に use_h2c が無く
-        // HTTP/1.1 を送ってしまうため、h2c 専用サーバに切られて 502 になる）。h2c 対応済みの
-        // バッファ経路（handle_request -> proxy_to_h2c_backend_async）へ回す。
-        // HTTP/2 クライアント経路（proxy.rs::h2_proxy_h2c）も同じくバッファ型なので、
-        // これで HTTP/2 クライアントと HTTP/3 クライアントの挙動が揃う。
-        if server.target.use_h2c || upstream_group.use_h2c() {
+        // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する（gRPC を含む。
+        // トレーラーは RespMsg::Trailers）。http2 feature が無ければ従来どおりバッファ経路。
+        let h2_upstream = server.target.use_h2c || upstream_group.use_h2c();
+        #[cfg(not(feature = "http2"))]
+        if h2_upstream {
+            return Decision::Buffer;
+        }
+        // F-175: HTTPS 上流は ALPN で HTTP/2 を試す（HTTP/1.1 しか話さないと分かっている上流は除く）。
+        // 試す場合も、上流が HTTP/1.1 を選んだときのために HTTP/1.1 の要求 head を作っておく。
+        #[cfg(feature = "http2")]
+        let h2_tls = server.target.h2_over_tls() && {
+            let addr = server.target.conn_addr();
+            let key = crate::http_utils::PoolKeyStr::tls_addr(
+                addr.as_str(),
+                server.target.sni(),
+                upstream_group.tls_insecure(),
+            );
+            !crate::http2::upstream_mux::https_known_h1(key.as_str())
+        };
+        #[cfg(not(feature = "http2"))]
+        let h2_tls = false;
+        // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。
+        if is_grpc && !h2_upstream && !h2_tls {
             return Decision::Buffer;
         }
 
@@ -1379,8 +1439,35 @@ impl Http3Handler {
             .map(AcceptedEncoding::parse)
             .unwrap_or(AcceptedEncoding::Identity);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
-        let final_path = compute_backend_path(&server.target, path, &prefix);
-        let request_head = build_h1_request_head(&server.target, method, &final_path, headers);
+        #[cfg(feature = "http2")]
+        let h2 = (h2_upstream || h2_tls).then(|| {
+            // gRPC はサービス/メソッドのフルパスを保持する（B-39）。
+            let final_path = compute_upstream_request_path(
+                std::str::from_utf8(path).unwrap_or("/"),
+                &prefix,
+                &server.target.path_prefix,
+                is_grpc,
+            );
+            crate::http3_stream::H2Upstream {
+                method: Bytes::copy_from_slice(method),
+                path: Bytes::from(final_path),
+                authority: Bytes::copy_from_slice(server.target.host.as_bytes()),
+                headers: pack_h3_request_headers(headers),
+                connect_timeout: Duration::from_secs(security.backend_connect_timeout_secs),
+            }
+        });
+        #[cfg(feature = "http2")]
+        let request_head = if h2_upstream {
+            Vec::new()
+        } else {
+            let final_path = compute_backend_path(&server.target, path, &prefix);
+            build_h1_request_head(&server.target, method, &final_path, headers)
+        };
+        #[cfg(not(feature = "http2"))]
+        let request_head = {
+            let final_path = compute_backend_path(&server.target, path, &prefix);
+            build_h1_request_head(&server.target, method, &final_path, headers)
+        };
 
         // F-44: TLS バックエンドもストリーミング対象（バックエンドタスクが全二重 TLS で貫通）。
         let use_tls = server.target.use_tls;
@@ -1398,703 +1485,13 @@ impl Http3Handler {
             use_tls,
             sni,
             tls_insecure,
+            pool_max_idle: security.max_idle_connections_per_host,
+            pool_idle_timeout_secs: security.idle_connection_timeout_secs,
+            no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+            retry_idempotent: crate::http_utils::is_idempotent_method(method),
+            #[cfg(feature = "http2")]
+            h2,
         })
-    }
-
-    /// HTTP/3 リクエストを処理（完全版）
-    ///
-    /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
-    /// `handle_request_impl` を呼び出し、**成功・失敗（`?` による早期 return）を問わず**
-    /// 最後に一度だけ `on_log`（`finish_h3_wasm_lifecycle`）を呼ぶ。
-    ///
-    /// F-132: `handle_request_impl` 内には `self.send_response(...)?` 等、`?` で早期 return
-    /// する箇所が多数あり、そこに個別に `on_log` 呼び出しを仕込むと取りこぼしうる
-    /// （WASM コンテキストのリークに直結する）。このラッパで囲むことで、
-    /// 離脱点の数に関係なく **1 リクエストにつきちょうど 1 回** だけ呼ばれることを構造的に
-    /// 保証する（`handle_request_impl` 側は `finish_h3_wasm_lifecycle` を呼ばない）。
-    async fn handle_request(
-        &mut self,
-        stream_id: u64,
-        headers: &[h3::Header],
-        request_body: &[u8],
-    ) -> io::Result<()> {
-        #[cfg(feature = "wasm")]
-        let mut wasm_modules_to_apply: Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-        > = None;
-
-        let result = self
-            .handle_request_impl(
-                stream_id,
-                headers,
-                request_body,
-                #[cfg(feature = "wasm")]
-                &mut wasm_modules_to_apply,
-            )
-            .await;
-
-        #[cfg(feature = "wasm")]
-        finish_h3_wasm_lifecycle(&wasm_modules_to_apply).await;
-
-        result
-    }
-
-    async fn handle_request_impl(
-        &mut self,
-        stream_id: u64,
-        headers: &[h3::Header],
-        request_body: &[u8],
-        #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-        >,
-    ) -> io::Result<()> {
-        // HTTP/3コネクションが確立されていなければ何もしない
-        if self.h3_conn.is_none() {
-            return Ok(());
-        }
-
-        // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
-        let header_block = h3_request_header_block_size(headers);
-        if header_block > MAX_HEADER_SIZE {
-            let path_len = headers
-                .iter()
-                .find(|h| h.name() == b":path")
-                .map(|h| h.value().len())
-                .unwrap_or(0);
-            if path_len > MAX_HEADER_SIZE {
-                self.send_error_response(stream_id, 414, b"URI Too Long")?;
-            } else {
-                self.send_error_response(stream_id, 431, b"Request Header Fields Too Large")?;
-            }
-            return Ok(());
-        }
-
-        // ヘッダーを解析（`headers` を借用するだけで、リクエストごとに `Vec` へコピーしない）
-        let mut method: Option<&[u8]> = None;
-        let mut path: Option<&[u8]> = None;
-        let mut authority: Option<&[u8]> = None;
-        let mut content_length: usize = 0;
-        let mut accept_encoding: Option<&[u8]> = None;
-        let mut user_agent: &[u8] = &[];
-
-        for header in headers {
-            match header.name() {
-                b":method" => method = Some(header.value()),
-                b":path" => path = Some(header.value()),
-                b":authority" => authority = Some(header.value()),
-                b"content-length" => {
-                    if let Ok(s) = std::str::from_utf8(header.value()) {
-                        content_length = s.parse().unwrap_or(0);
-                    }
-                }
-                name if name.eq_ignore_ascii_case(b"accept-encoding") => {
-                    accept_encoding = Some(header.value());
-                }
-                name if name.eq_ignore_ascii_case(b"user-agent") => {
-                    user_agent = header.value();
-                }
-                _ => {}
-            }
-        }
-
-        // クライアントの Accept-Encoding を解析
-        let client_encoding = accept_encoding
-            .map(AcceptedEncoding::parse)
-            .unwrap_or(AcceptedEncoding::Identity);
-
-        let method: &[u8] = method.unwrap_or(b"GET");
-        let path: &[u8] = path.unwrap_or(b"/");
-        let authority: &[u8] = authority.unwrap_or_default();
-
-        // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
-        let start_time = crate::logging::request_start_instant();
-
-        debug!(
-            "[HTTP/3] Request: {} {} (stream {})",
-            String::from_utf8_lossy(method),
-            String::from_utf8_lossy(path),
-            stream_id
-        );
-
-        // F-97: :authority と Host が矛盾するリクエストを 400 で拒否
-        let host_hdr = headers.iter().find_map(|h| {
-            if h.name().eq_ignore_ascii_case(b"host") {
-                Some(h.value())
-            } else {
-                None
-            }
-        });
-        if crate::http_utils::authority_host_mismatch(authority, host_hdr) {
-            self.send_error_response(stream_id, 400, b"Bad Request: :authority/Host mismatch")?;
-            let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                &[]
-            } else {
-                user_agent
-            };
-            log_access(
-                method,
-                authority,
-                path,
-                user_agent_slice,
-                content_length as u64,
-                400,
-                0,
-                start_time,
-                self.client_ip.as_str(),
-                "",
-            );
-            return Ok(());
-        }
-
-        // gRPC リクエスト検出フラグ
-        #[cfg(feature = "grpc")]
-        let is_grpc = Self::is_grpc_request(headers);
-        #[cfg(not(feature = "grpc"))]
-        let _is_grpc = false;
-
-        #[cfg(feature = "grpc")]
-        if is_grpc {
-            debug!(
-                "[HTTP/3] gRPC request detected: {}",
-                String::from_utf8_lossy(path)
-            );
-        }
-
-        // メトリクスエンドポイント（設定可能なパス）
-        {
-            let config = CURRENT_CONFIG.load();
-            let prom_config = &config.prometheus_config;
-
-            let path_str = std::str::from_utf8(path).unwrap_or("/");
-            if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
-                // IPアドレス制限チェック
-                if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
-                    self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                        &[]
-                    } else {
-                        user_agent
-                    };
-                    log_access(
-                        method,
-                        authority,
-                        path,
-                        user_agent_slice,
-                        request_body.len() as u64,
-                        403,
-                        9,
-                        start_time,
-                        self.client_ip.as_str(),
-                        "",
-                    );
-                    return Ok(());
-                }
-
-                let body = encode_prometheus_metrics();
-                self.send_response(
-                    stream_id,
-                    200,
-                    &[
-                        (b":status", b"200"),
-                        (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                        (b"server", b"veil/http3"),
-                    ],
-                    Some(&body),
-                )?;
-
-                let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                    &[]
-                } else {
-                    user_agent
-                };
-                log_access(
-                    method,
-                    authority,
-                    path,
-                    user_agent_slice,
-                    request_body.len() as u64,
-                    200,
-                    body.len() as u64,
-                    start_time,
-                    self.client_ip.as_str(),
-                    "",
-                );
-                return Ok(());
-            }
-        }
-
-        // バックエンド選択（統合ルーティング）
-        let config = CURRENT_CONFIG.load();
-
-        // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
-        let headers_raw: Vec<(&[u8], &[u8])> = headers
-            .iter()
-            .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
-            .map(|h| (h.name(), h.value()))
-            .collect();
-
-        // パス/クエリ分離（スキャンを1回に統一）
-        let query_start_pos = path.iter().position(|&b| b == b'?');
-        let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
-
-        let backend_result = find_backend_unified(
-            authority,
-            path_without_query,
-            method,
-            &headers_raw,
-            raw_query,
-            &self.peer_addr,
-            config.route.as_slice(),
-            &config.upstream_groups,
-        )
-        .or_else(|| {
-            // authority が空でない場合、デフォルトルートを検索
-            if !authority.is_empty() {
-                debug!(
-                    "[HTTP/3] No route found for authority '{}', trying default routes",
-                    String::from_utf8_lossy(authority)
-                );
-                find_backend_unified(
-                    b"",
-                    path_without_query,
-                    method,
-                    &headers_raw,
-                    raw_query,
-                    &self.peer_addr,
-                    config.route.as_slice(),
-                    &config.upstream_groups,
-                )
-            } else {
-                None
-            }
-        });
-
-        // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
-        // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
-        let (prefix, backend, route_compression) = match backend_result {
-            Some(b) => b,
-            None => {
-                debug!(
-                    "[HTTP/3] No backend found for authority='{}', path='{}'",
-                    String::from_utf8_lossy(authority),
-                    String::from_utf8_lossy(path)
-                );
-
-                // gRPC リクエストの場合は gRPC エラーレスポンスを返す
-                #[cfg(feature = "grpc")]
-                if is_grpc {
-                    // UNIMPLEMENTED (12) - サービス/メソッドが見つからない
-                    self.send_grpc_response(stream_id, &[], None, 12, Some("Service not found"))?;
-                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                        &[]
-                    } else {
-                        user_agent
-                    };
-                    log_access(
-                        method,
-                        authority,
-                        path,
-                        user_agent_slice,
-                        request_body.len() as u64,
-                        200,
-                        0,
-                        start_time,
-                        self.client_ip.as_str(),
-                        "",
-                    );
-                    return Ok(());
-                }
-
-                self.send_error_response(stream_id, 404, b"Not Found")?;
-                let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                    &[]
-                } else {
-                    user_agent
-                };
-                log_access(
-                    method,
-                    authority,
-                    path,
-                    user_agent_slice,
-                    request_body.len() as u64,
-                    404,
-                    9,
-                    start_time,
-                    self.client_ip.as_str(),
-                    "",
-                );
-                return Ok(());
-            }
-        };
-
-        // セキュリティチェック
-        let security = backend.security();
-        let check_result = check_security(
-            security,
-            self.client_ip.as_str(),
-            method,
-            content_length,
-            false,
-        );
-
-        if check_result != SecurityCheckResult::Allowed {
-            let status = check_result.status_code();
-            let msg = check_result.message();
-            self.send_error_response(stream_id, status, msg)?;
-            let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                &[]
-            } else {
-                user_agent
-            };
-            log_access(
-                method,
-                authority,
-                path,
-                user_agent_slice,
-                request_body.len() as u64,
-                status,
-                msg.len() as u64,
-                start_time,
-                self.client_ip.as_str(),
-                "",
-            );
-            return Ok(());
-        }
-
-        // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
-        // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out
-        // パラメータ。ここで `Some` にセットしておけば、この後どの `?` で早期 return しても
-        // 呼び出し元側で必ず一度だけ `on_log` が呼ばれる。
-        #[cfg(feature = "wasm")]
-        let mut wasm_request_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
-        // F-132: WASM on_request_body で書き換えられた本文（適用時のみ Some）。
-        #[cfg(feature = "wasm")]
-        let mut wasm_request_body_override: Option<Bytes> = None;
-        #[cfg(feature = "wasm")]
-        {
-            let config = CURRENT_CONFIG.load();
-            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                let path_str = std::str::from_utf8(path).unwrap_or("/");
-                let method_str = std::str::from_utf8(method).unwrap_or("GET");
-
-                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
-                let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                    backend_modules.clone()
-                } else {
-                    crate::wasm::empty_wasm_modules()
-                };
-
-                if !modules_to_apply.is_empty() {
-                    *wasm_modules_to_apply = Some(modules_to_apply.clone());
-
-                    let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers
-                        .iter()
-                        .filter(|h| !h.name().starts_with(b":"))
-                        .map(|h| (h.name().to_vec(), h.value().to_vec()))
-                        .collect();
-
-                    let wasm_result = wasm_engine
-                        .on_request_headers_with_modules(
-                            &modules_to_apply,
-                            &std::sync::Arc::from(path_str),
-                            &std::sync::Arc::from(method_str),
-                            headers_vec,
-                            &std::sync::Arc::from(self.client_ip.as_str()),
-                            request_body.is_empty(),
-                        )
-                        .await;
-
-                    match wasm_result {
-                        crate::wasm::FilterResult::LocalResponse(resp) => {
-                            self.send_response(
-                                stream_id,
-                                resp.status_code,
-                                &resp
-                                    .headers
-                                    .iter()
-                                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                                    .collect::<Vec<_>>(),
-                                Some(&resp.body),
-                            )?;
-                            let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                                &[]
-                            } else {
-                                user_agent
-                            };
-                            log_access(
-                                method,
-                                authority,
-                                path,
-                                user_agent_slice,
-                                request_body.len() as u64,
-                                resp.status_code,
-                                resp.body.len() as u64,
-                                start_time,
-                                self.client_ip.as_str(),
-                                "",
-                            );
-                            // F-132: on_log は呼び出し元の `handle_request` ラッパが
-                            // `?`/早期 return を問わず最後に一度だけ呼ぶ
-                            // （`*wasm_modules_to_apply` は既にセット済み）。
-                            return Ok(());
-                        }
-                        crate::wasm::FilterResult::Pause => {
-                            warn!("WASM module requested pause, but async operations are not yet supported");
-                        }
-                        crate::wasm::FilterResult::Continue {
-                            headers: modified, ..
-                        } => {
-                            // B-38: 変更後ヘッダを上流リクエストへ反映
-                            wasm_request_headers = Some(modified);
-
-                            // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
-                            // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
-                            // end_of_stream=true の 1 回呼びで実装できる）。
-                            if !request_body.is_empty() {
-                                match crate::wasm::http_executor::apply_wasm_request_body(
-                                    wasm_engine,
-                                    &modules_to_apply,
-                                    Bytes::copy_from_slice(request_body),
-                                    true,
-                                )
-                                .await
-                                {
-                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
-                                        wasm_request_body_override = Some(b);
-                                    }
-                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
-                                        resp,
-                                    ) => {
-                                        self.send_response(
-                                            stream_id,
-                                            resp.status_code,
-                                            &resp
-                                                .headers
-                                                .iter()
-                                                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                                                .collect::<Vec<_>>(),
-                                            Some(&resp.body),
-                                        )?;
-                                        let user_agent_slice: &[u8] = if user_agent.is_empty() {
-                                            &[]
-                                        } else {
-                                            user_agent
-                                        };
-                                        log_access(
-                                            method,
-                                            authority,
-                                            path,
-                                            user_agent_slice,
-                                            request_body.len() as u64,
-                                            resp.status_code,
-                                            resp.body.len() as u64,
-                                            start_time,
-                                            self.client_ip.as_str(),
-                                            "",
-                                        );
-                                        // F-132: on_log は呼び出し元の `handle_request`
-                                        // ラッパが最後に一度だけ呼ぶ。
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // バックエンド処理
-        let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, security, path_compression, _buffering, _cache, _) => {
-                // B-74: H2C 接続プールの max_idle/idle_timeout 用。http2 feature 無効時は
-                // H2C 中継自体が無いため未使用（unused_variables 警告回避）。
-                #[cfg(not(feature = "http2"))]
-                let _ = &security;
-                debug!("[HTTP/3] Starting proxy request to upstream group");
-
-                // HTTP/3専用圧縮設定を解決
-                // 優先順位: パス設定 > HTTP/3設定 > デフォルト
-                let config = CURRENT_CONFIG.load();
-                let effective_compression =
-                    resolve_http3_compression_config(&path_compression, &config.http3_config);
-
-                // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
-                #[cfg(feature = "wasm")]
-                let effective_request_body: &[u8] = wasm_request_body_override
-                    .as_deref()
-                    .unwrap_or(request_body);
-                #[cfg(not(feature = "wasm"))]
-                let effective_request_body: &[u8] = request_body;
-
-                let result = self
-                    .handle_proxy(
-                        stream_id,
-                        &upstream_group,
-                        #[cfg(feature = "http2")]
-                        &security,
-                        &effective_compression,
-                        client_encoding,
-                        method,
-                        path,
-                        &prefix,
-                        headers,
-                        effective_request_body,
-                        #[cfg(feature = "wasm")]
-                        wasm_modules_to_apply.as_ref(),
-                        #[cfg(feature = "wasm")]
-                        wasm_request_headers.as_deref(),
-                    )
-                    .await
-                    .unwrap_or((502, 11));
-                debug!(
-                    "[HTTP/3] Proxy request completed: status={}, size={}",
-                    result.0, result.1
-                );
-                result
-            }
-            Backend::MemoryFile(data, mime_type, security, _) => {
-                // パス完全一致チェック
-                let path_str = std::str::from_utf8(path).unwrap_or("/");
-                let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-
-                let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-                    &path_str[prefix_str.len()..]
-                } else {
-                    ""
-                };
-
-                let clean_remainder = remainder.trim_matches('/');
-                if !clean_remainder.is_empty() {
-                    self.send_error_response(stream_id, 404, b"Not Found")?;
-                    (404, 9)
-                } else {
-                    // F-132: h1/h2 と同様、静的配信（Backend::File 系）にも WASM
-                    // on_response_headers を適用する。
-                    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                        (b"content-type".to_vec(), mime_type.as_bytes().to_vec()),
-                        (b"server".to_vec(), b"veil/http3".to_vec()),
-                    ];
-                    for (k, v) in &security.add_response_headers {
-                        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
-                    }
-
-                    // F-169: HTTP/3 の File 系バックエンドは従来ここで圧縮設定
-                    // （`route_compression`）を破棄しており、h2 と違って圧縮が
-                    // 一切効いていなかった。h2 (`build_h2_compressed_file_response`)
-                    // と同じネゴシエーションを適用する。MemoryFile はファイルシステム
-                    // パスを持たないため圧縮結果キャッシュ（`cache::compressed`）は
-                    // 使えない（毎回圧縮する。h2 側の MemoryFile 経路と同じ扱い）。
-                    let file_compression =
-                        resolve_http3_compression_config(&route_compression, &config.http3_config);
-                    let should_compress = file_compression.should_compress(
-                        client_encoding,
-                        Some(mime_type.as_bytes()),
-                        Some(data.len()),
-                        None,
-                    );
-
-                    let response_body: Bytes = if let Some(enc) = should_compress {
-                        let encoding_name: &[u8] = match enc {
-                            AcceptedEncoding::Zstd => b"zstd",
-                            AcceptedEncoding::Brotli => b"br",
-                            AcceptedEncoding::Gzip => b"gzip",
-                            AcceptedEncoding::Deflate => b"deflate",
-                            AcceptedEncoding::Identity => b"",
-                        };
-                        if !encoding_name.is_empty() {
-                            header_store
-                                .push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
-                        }
-                        Bytes::from(compress_body_h3(data.as_slice(), enc, &file_compression))
-                    } else {
-                        // Arc<Vec<u8>> の参照カウントクローンのみ（ディープコピー無し）。
-                        Bytes::from_owner(ArcVecBytes(data.clone()))
-                    };
-
-                    #[cfg(feature = "wasm")]
-                    if let Some(modules) = wasm_modules_to_apply.as_ref() {
-                        header_store =
-                            apply_h3_wasm_response_headers(modules, 200, header_store).await;
-                    }
-
-                    let resp_headers: Vec<(&[u8], &[u8])> = header_store
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-
-                    self.send_response(stream_id, 200, &resp_headers, Some(&response_body))?;
-                    (200, response_body.len())
-                }
-            }
-            Backend::SendFile(
-                base_path,
-                is_dir,
-                index_file,
-                security,
-                _cache,
-                open_file_cache_config,
-                canonical_base,
-                static_file_cache_config,
-                _,
-            ) => {
-                // F-169: HTTP/3 専用圧縮設定を解決（Proxy 経路の `handle_proxy` と同じ
-                // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
-                // `route_compression` を破棄しており圧縮が一切効いていなかった。
-                let file_compression =
-                    resolve_http3_compression_config(&route_compression, &config.http3_config);
-                self.handle_sendfile(SendFileRequest {
-                    stream_id,
-                    base_path: &base_path,
-                    is_dir,
-                    index_file: index_file.as_deref(),
-                    req_path: path,
-                    prefix: &prefix,
-                    security: &security,
-                    compression: &file_compression,
-                    client_encoding,
-                    open_file_cache_config: open_file_cache_config.as_deref(),
-                    canonical_base: canonical_base.as_deref(),
-                    static_file_cache_config: static_file_cache_config.as_deref(),
-                    #[cfg(feature = "wasm")]
-                    wasm_modules: wasm_modules_to_apply.as_ref(),
-                })
-                .await
-                .unwrap_or((404, 9))
-            }
-            Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
-                .handle_redirect(
-                    stream_id,
-                    &redirect_url,
-                    status_code,
-                    preserve_path,
-                    path,
-                    &prefix,
-                )
-                .unwrap_or((500, 0)),
-        };
-
-        let user_agent_slice: &[u8] = if user_agent.is_empty() {
-            &[]
-        } else {
-            user_agent
-        };
-        log_access(
-            method,
-            authority,
-            path,
-            user_agent_slice,
-            request_body.len() as u64,
-            status,
-            resp_size as u64,
-            start_time,
-            self.client_ip.as_str(),
-            "",
-        );
-        // F-132: on_log は呼び出し元の `handle_request` ラッパが最後に一度だけ呼ぶ。
-        Ok(())
     }
 
     /// レスポンス送信ヘルパー
@@ -2271,656 +1668,6 @@ impl Http3Handler {
         false
     }
 
-    /// gRPC レスポンスを送信 (トレイラー付き)
-    ///
-    /// HTTP/3 では初期 HEADERS の後、ボディ（任意）を送り、
-    /// **`send_additional_headers` で trailers を fin=true で送出**する（B-41）。
-    /// quiche の `send_response` は初期応答専用で、2 回目に使うと失敗しストリームが
-    /// 閉じられずクライアントがハングする。
-    #[cfg(feature = "grpc")]
-    fn send_grpc_response(
-        &mut self,
-        stream_id: u64,
-        headers: &[(&[u8], &[u8])],
-        body: Option<&[u8]>,
-        grpc_status: u32,
-        grpc_message: Option<&str>,
-    ) -> io::Result<()> {
-        let h3_conn = match &mut self.h3_conn {
-            Some(h3) => h3,
-            None => return Ok(()),
-        };
-
-        // 1. 初期ヘッダ（:status + content-type）。grpc-status/message は trailers 専用。
-        let mut h3_headers = vec![
-            h3::Header::new(b":status", b"200"),
-            h3::Header::new(b"content-type", b"application/grpc"),
-        ];
-
-        for (name, value) in filter_h3_grpc_initial_headers(headers) {
-            h3_headers.push(h3::Header::new(name, value));
-        }
-
-        let has_body = body.is_some_and(|b| !b.is_empty());
-
-        // ボディ有無に関わらず初期ヘッダは fin=false（trailers で終端）
-        if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
-            warn!("[HTTP/3] gRPC send_response error: {}", e);
-            return Ok(());
-        }
-
-        // 2. ボディ（fin=false — trailers が続く）
-        if has_body {
-            if let Some(body_data) = body {
-                if let Err(e) = h3_conn.send_body(&mut self.conn, stream_id, body_data, false) {
-                    warn!("[HTTP/3] gRPC send_body error: {}", e);
-                }
-            }
-        }
-
-        // 3. trailers（fin=true）
-        self.send_grpc_trailers_internal(stream_id, grpc_status, grpc_message)
-    }
-
-    /// gRPC トレイラーを `send_additional_headers` で送信しストリームを終了（B-41）。
-    #[cfg(feature = "grpc")]
-    fn send_grpc_trailers_internal(
-        &mut self,
-        stream_id: u64,
-        grpc_status: u32,
-        grpc_message: Option<&str>,
-    ) -> io::Result<()> {
-        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
-
-        let h3_conn = match &mut self.h3_conn {
-            Some(h3) => h3,
-            None => return Ok(()),
-        };
-
-        let code = GrpcStatusCode::from_u8(grpc_status as u8).unwrap_or(GrpcStatusCode::Unknown);
-
-        let status = if let Some(msg) = grpc_message {
-            GrpcStatus::error(code, msg)
-        } else {
-            GrpcStatus::from_code(code)
-        };
-        let trailer_pairs = status.to_trailers();
-
-        let trailers: Vec<h3::Header> = trailer_pairs
-            .iter()
-            .map(|(n, v)| h3::Header::new(n.as_slice(), v.as_slice()))
-            .collect();
-
-        // B-41: trailers は send_additional_headers（is_trailer_section=true, fin=true）
-        // send_response の再利用は不可（初期応答専用 API）
-        if let Err(e) =
-            h3_conn.send_additional_headers(&mut self.conn, stream_id, &trailers, true, true)
-        {
-            warn!(
-                "[HTTP/3] gRPC trailers send_additional_headers error: {}",
-                e
-            );
-            // フォールバック: 空ボディ + fin でストリームを閉じ、クライアントハングを防ぐ
-            if let Err(e2) = h3_conn.send_body(&mut self.conn, stream_id, &[], true) {
-                debug!("[HTTP/3] gRPC trailers fin fallback error: {:?}", e2);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// プロキシ処理（HTTP/1.1 または H2C バックエンドへの変換）
-    ///
-    /// - 通常: HTTP/1.1 で上流へ転送
-    /// - `use_h2c`: H2C (Prior Knowledge) で上流へ転送（B-39: gRPC over HTTP/3）
-    /// - WASM: リクエスト/レスポンスヘッダ変更を適用（B-38）
-    async fn handle_proxy(
-        &mut self,
-        stream_id: u64,
-        upstream_group: &Arc<UpstreamGroup>,
-        // B-74: H2C 接続プール（H2C_POOL）の max_idle/idle_timeout を引くためだけに使う。
-        // http2 feature 無効時は H2C 中継自体が存在しないため未使用になる。
-        #[cfg(feature = "http2")] security: &SecurityConfig,
-        compression: &CompressionConfig,
-        client_encoding: AcceptedEncoding,
-        method: &[u8],
-        req_path: &[u8],
-        prefix: &[u8],
-        headers: &[h3::Header],
-        request_body: &[u8],
-        #[cfg(feature = "wasm")] wasm_modules: Option<
-            &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-        >,
-        #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
-    ) -> io::Result<(u16, usize)> {
-        // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
-        let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
-            headers
-                .iter()
-                .find(|h| h.name().eq_ignore_ascii_case(name))
-                .map(|h| h.value())
-        }) {
-            Some(s) => s,
-            None => {
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-
-        server.acquire();
-        let target = &server.target;
-
-        // リクエストパス構築
-        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-        let timeout_secs = 30;
-
-        // 上流へ送るヘッダソース（WASM 変更後 or 生 H3 ヘッダ）
-        #[cfg(feature = "wasm")]
-        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = if let Some(ov) = wasm_request_headers {
-            ov.iter()
-                .filter(|(n, _)| {
-                    !n.starts_with(b":")
-                        && !n.eq_ignore_ascii_case(b"connection")
-                        && !n.eq_ignore_ascii_case(b"keep-alive")
-                        && !n.eq_ignore_ascii_case(b"transfer-encoding")
-                })
-                .cloned()
-                .collect()
-        } else {
-            headers
-                .iter()
-                .filter(|h| {
-                    !h.name().starts_with(b":")
-                        && !h.name().eq_ignore_ascii_case(b"connection")
-                        && !h.name().eq_ignore_ascii_case(b"keep-alive")
-                        && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
-                })
-                .map(|h| (h.name().to_vec(), h.value().to_vec()))
-                .collect()
-        };
-        #[cfg(not(feature = "wasm"))]
-        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = headers
-            .iter()
-            .filter(|h| {
-                !h.name().starts_with(b":")
-                    && !h.name().eq_ignore_ascii_case(b"connection")
-                    && !h.name().eq_ignore_ascii_case(b"keep-alive")
-                    && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
-            })
-            .map(|h| (h.name().to_vec(), h.value().to_vec()))
-            .collect();
-
-        // gRPC はサービス/メソッドのフルパスを保持（B-39）
-        #[cfg(feature = "grpc")]
-        let is_grpc_req = header_pairs_indicate_grpc(&header_pairs);
-        #[cfg(not(feature = "grpc"))]
-        let is_grpc_req = false;
-
-        let final_path_owned =
-            compute_upstream_request_path(path_str, prefix, &target.path_prefix, is_grpc_req);
-        let final_path = final_path_owned.as_str();
-
-        // B-39: H2C 上流（gRPC 等）
-        let use_h2c = target.use_h2c || upstream_group.use_h2c();
-        let proxy_result = if use_h2c {
-            #[cfg(feature = "http2")]
-            {
-                proxy_to_h2c_backend_async(
-                    target,
-                    method,
-                    final_path.as_bytes(),
-                    &header_pairs,
-                    request_body,
-                    timeout_secs,
-                    security,
-                )
-                .await
-            }
-            #[cfg(not(feature = "http2"))]
-            {
-                warn!("[HTTP/3] use_h2c requested but http2 feature disabled");
-                Err(io::Error::other("H2C requires http2 feature"))
-            }
-        } else {
-            // HTTP/1.1 リクエスト構築
-            let mut request = Vec::with_capacity(1024 + request_body.len());
-            request.extend_from_slice(method);
-            request.extend_from_slice(b" ");
-            request.extend_from_slice(final_path.as_bytes());
-            request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-            request.extend_from_slice(target.host.as_bytes());
-
-            if !target.is_default_port() {
-                request.extend_from_slice(b":");
-                let mut port_buf = itoa::Buffer::new();
-                request.extend_from_slice(port_buf.format(target.port).as_bytes());
-            }
-            request.extend_from_slice(b"\r\n");
-
-            for (name, value) in &header_pairs {
-                request.extend_from_slice(name);
-                request.extend_from_slice(b": ");
-                request.extend_from_slice(value);
-                request.extend_from_slice(b"\r\n");
-            }
-
-            if !request_body.is_empty() {
-                request.extend_from_slice(b"Content-Length: ");
-                let mut len_buf = itoa::Buffer::new();
-                request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
-                request.extend_from_slice(b"\r\n");
-            }
-
-            request.extend_from_slice(b"Connection: close\r\n\r\n");
-            request.extend_from_slice(request_body);
-
-            let tls_insecure = upstream_group.tls_insecure();
-            proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await
-        };
-
-        server.release();
-
-        match proxy_result {
-            Ok(backend_result) => {
-                let status_code = backend_result.status_code;
-                #[cfg(feature = "wasm")]
-                let mut body = backend_result.body;
-                #[cfg(not(feature = "wasm"))]
-                let body = backend_result.body;
-                let trailers = backend_result.trailers;
-
-                // B-38: WASM レスポンスヘッダフィルタ
-                #[cfg(feature = "wasm")]
-                let mut resp_header_store = backend_result.headers;
-                #[cfg(feature = "wasm")]
-                if let Some(modules) = wasm_modules {
-                    if !modules.is_empty() {
-                        resp_header_store =
-                            apply_h3_wasm_response_headers(modules, status_code, resp_header_store)
-                                .await;
-                    }
-                }
-                #[cfg(not(feature = "wasm"))]
-                let resp_header_store = backend_result.headers;
-
-                // gRPC は圧縮ネゴシエーション/ボディフィルタ対象外（application/grpc、trailers は F-133）
-                #[cfg(feature = "grpc")]
-                let is_grpc_ct = resp_header_store
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(b"content-type"))
-                    .map(|(_, v)| crate::grpc::headers::is_grpc_content_type(v))
-                    .unwrap_or(false);
-                #[cfg(not(feature = "grpc"))]
-                let is_grpc_ct = false;
-
-                // F-132: WASM レスポンスボディフィルタ（HTTP/3 は WASM 適用時に必ず
-                // Decision::Buffer に落ちるためボディ全体がメモリ上にある。end_of_stream=true
-                // の 1 回呼びで実装できる）。書き換えたら content-length を更新する（B-46）。
-                #[cfg(feature = "wasm")]
-                if !is_grpc_ct {
-                    if let Some(modules) = wasm_modules {
-                        if !modules.is_empty() {
-                            let config = CURRENT_CONFIG.load();
-                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                match crate::wasm::http_executor::apply_wasm_response_body(
-                                    wasm_engine,
-                                    modules,
-                                    Bytes::from(body),
-                                    true,
-                                )
-                                .await
-                                {
-                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
-                                        crate::wasm::http_executor::set_content_length_header(
-                                            &mut resp_header_store,
-                                            b.len(),
-                                        );
-                                        body = b.to_vec();
-                                    }
-                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
-                                        resp,
-                                    ) => {
-                                        let resp_headers: Vec<(&[u8], &[u8])> = resp
-                                            .headers
-                                            .iter()
-                                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                                            .collect();
-                                        self.send_response(
-                                            stream_id,
-                                            resp.status_code,
-                                            &resp_headers,
-                                            Some(&resp.body),
-                                        )?;
-                                        return Ok((resp.status_code, resp.body.len()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 圧縮判定
-                let mut content_type: Option<&[u8]> = None;
-                let mut existing_encoding: Option<&[u8]> = None;
-                for (name, value) in &resp_header_store {
-                    if name.eq_ignore_ascii_case(b"content-type") {
-                        content_type = Some(value.as_slice());
-                    } else if name.eq_ignore_ascii_case(b"content-encoding") {
-                        existing_encoding = Some(value.as_slice());
-                    }
-                }
-
-                let should_compress = if is_grpc_ct {
-                    None
-                } else {
-                    compression.should_compress(
-                        client_encoding,
-                        content_type,
-                        Some(body.len()),
-                        existing_encoding,
-                    )
-                };
-
-                // レスポンスヘッダ + H2C trailers をマージ（B-39）
-                let owned_headers = merge_response_headers_and_trailers(
-                    &resp_header_store,
-                    &trailers,
-                    should_compress.is_some(),
-                );
-
-                let response_body = if let Some(enc) = should_compress {
-                    compress_body_h3(&body, enc, compression)
-                } else {
-                    body
-                };
-
-                let resp_headers: Vec<(&[u8], &[u8])> = owned_headers
-                    .iter()
-                    .map(|(n, v)| (n.as_slice(), v.as_slice()))
-                    .collect();
-
-                // gRPC: trailers 用 API で終端（status は既に headers にマージ済み）
-                #[cfg(feature = "grpc")]
-                if is_grpc_ct && !trailers.is_empty() {
-                    let grpc_status = trailers
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status"))
-                        .and_then(|(_, v)| std::str::from_utf8(v).ok())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    let grpc_message = trailers
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-message"))
-                        .and_then(|(_, v)| String::from_utf8(v.clone()).ok());
-                    // ヘッダにマージ済み + ボディ送信。status 200 で trailers も送る。
-                    self.send_grpc_response(
-                        stream_id,
-                        &resp_headers,
-                        Some(&response_body),
-                        grpc_status,
-                        grpc_message.as_deref(),
-                    )?;
-                    return Ok((status_code, response_body.len()));
-                }
-
-                self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
-                Ok((status_code, response_body.len()))
-            }
-            Err(e) => {
-                warn!("[HTTP/3] Async backend proxy error: {}", e);
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                Ok((502, 11))
-            }
-        }
-    }
-
-    /// ファイル配信
-    async fn handle_sendfile(&mut self, req: SendFileRequest<'_>) -> io::Result<(u16, usize)> {
-        let SendFileRequest {
-            stream_id,
-            base_path,
-            is_dir,
-            index_file,
-            req_path,
-            prefix,
-            security,
-            compression,
-            client_encoding,
-            open_file_cache_config,
-            canonical_base,
-            static_file_cache_config,
-            #[cfg(feature = "wasm")]
-            wasm_modules,
-        } = req;
-        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-
-        // プレフィックス除去後のサブパス
-        let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-            &path_str[prefix_str.len()..]
-        } else {
-            path_str
-        };
-
-        let clean_sub = sub_path.trim_start_matches('/');
-
-        // パストラバーサル防止
-        if clean_sub.contains("..") {
-            self.send_error_response(stream_id, 403, b"Forbidden")?;
-            return Ok((403, 9));
-        }
-
-        // ファイルパス構築（素の join のみ。ディレクトリかどうかの判定は下の
-        // `get_file_info_with_config` の非同期呼び出しへ委譲する）。
-        let full_path = if is_dir {
-            let mut p = base_path.to_path_buf();
-            if !clean_sub.is_empty() {
-                p.push(clean_sub);
-            }
-            p
-        } else {
-            if !clean_sub.is_empty() {
-                self.send_error_response(stream_id, 404, b"Not Found")?;
-                return Ok((404, 9));
-            }
-            base_path.to_path_buf()
-        };
-
-        // B-65（続き）: 従来は「メタデータ解決（offload 1）→ …index 解決…→ 本体読み込み
-        // （offload 2）」で 1 リクエストあたり offload のクロススレッド往復が 2 回
-        // 発生していた（`docs/backlog/bugs/B-65-freebsd-h2c-request-cost.md`）。
-        // 当初の改修は `is_dir == false`（固定ファイルルート）でしか高速経路が使われず、
-        // 実運用で一般的なディレクトリルートでは改善していなかった。
-        //
-        // `is_dir` の true/false に関わらずまず `get_static_file_with_content` を 1 回
-        // 呼ぶ（両キャッシュヒット時は offload ゼロ）。ディレクトリルートの場合のみ
-        // `containment` に「このルート自身の」`base_path` を渡し、高速経路（Linux）は
-        // その `base_path` の dirfd に対してのみ open する（F-154:
-        // `resolve::open_beneath_in_root`）ため、これ自体が per-route の封じ込めになり、
-        // `readlink` 等の事後検査は不要（`cache::static_file` モジュール doc 参照）。
-        // h1/h2 と同一方針。
-        let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
-        let containment = is_dir.then_some(cache::RouteContainment {
-            root: base_path,
-            canonical_base,
-        });
-        let first_result = cache::get_static_file_with_content(
-            &full_path,
-            open_file_cache_config,
-            &content_cfg,
-            containment,
-        )
-        .await;
-
-        // F-169: `served_path`（実際に配信するパス。ディレクトリルートで index に
-        // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
-        // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
-        // （h2 側 `h2_sendfile` と同じ方針）。
-        let (data, mime_owned, served_path): (
-            bytes::Bytes,
-            std::sync::Arc<str>,
-            std::path::PathBuf,
-        ) = match first_result {
-            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type, full_path),
-            Some(cache::StaticFileOutcome::Forbidden) => {
-                self.send_error_response(stream_id, 403, b"Forbidden")?;
-                return Ok((403, 9));
-            }
-            Some(cache::StaticFileOutcome::Directory(file_info)) => {
-                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
-                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
-                // パスにも同じ containment を渡す）。
-                let filename = index_file.unwrap_or("index.html");
-                let index_path = file_info.canonical_path.join(filename);
-                match cache::get_static_file_with_content(
-                    &index_path,
-                    open_file_cache_config,
-                    &content_cfg,
-                    containment,
-                )
-                .await
-                {
-                    Some(cache::StaticFileOutcome::File(info, data)) => {
-                        (data, info.mime_type, index_path)
-                    }
-                    Some(cache::StaticFileOutcome::Forbidden) | None => {
-                        self.send_error_response(stream_id, 403, b"Forbidden")?;
-                        return Ok((403, 9));
-                    }
-                    Some(cache::StaticFileOutcome::Directory(_)) => {
-                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
-                        // 安全側に倒して 403 とする）。
-                        self.send_error_response(stream_id, 403, b"Forbidden")?;
-                        return Ok((403, 9));
-                    }
-                }
-            }
-            None => {
-                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
-                cache::invalidate_file_cache(&full_path);
-                cache::invalidate_content_cache(&full_path);
-                self.send_error_response(stream_id, 404, b"Not Found")?;
-                return Ok((404, 9));
-            }
-        };
-        let mime_str: &str = &mime_owned;
-
-        // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
-        // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
-        // 従来この関数は圧縮設定自体を受け取っておらず、HTTP/3 の静的配信では
-        // 圧縮が一切効いていなかった。
-        let should_compress = compression.should_compress(
-            client_encoding,
-            Some(mime_str.as_bytes()),
-            Some(data.len()),
-            None,
-        );
-        let mut encoding_name: &[u8] = b"";
-        let response_body: Bytes = if let Some(enc) = should_compress {
-            encoding_name = match enc {
-                AcceptedEncoding::Zstd => b"zstd",
-                AcceptedEncoding::Brotli => b"br",
-                AcceptedEncoding::Gzip => b"gzip",
-                AcceptedEncoding::Deflate => b"deflate",
-                AcceptedEncoding::Identity => b"",
-            };
-            if content_cfg.enabled {
-                let level = cache::compressed::compression_level(enc, compression);
-                cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
-                    compress_body_h3(&data, enc, compression)
-                })
-            } else {
-                Bytes::from(compress_body_h3(&data, enc, compression))
-            }
-        } else {
-            // Bytes::clone() は参照カウント増加のみ（ディープコピー無し）。
-            data.clone()
-        };
-
-        // 応答ヘッダは借用のまま組み立てる（以前は `Vec<(Vec<u8>, Vec<u8>)>` で
-        // リクエストごとに 7〜8 回確保していた）。所有バッファが要るのは F-132 の
-        // WASM on_response_headers を適用するときだけ。
-        let mut resp_headers: Vec<(&[u8], &[u8])> =
-            Vec::with_capacity(4 + security.add_response_headers.len());
-        resp_headers.push((b"content-type", mime_str.as_bytes()));
-        resp_headers.push((b"server", b"veil/http3"));
-        for (k, v) in &security.add_response_headers {
-            resp_headers.push((k.as_bytes(), v.as_bytes()));
-        }
-        if !encoding_name.is_empty() {
-            resp_headers.push((b"content-encoding", encoding_name));
-            resp_headers.push((b"vary", b"Accept-Encoding"));
-        }
-
-        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
-        #[cfg(feature = "wasm")]
-        if let Some(modules) = wasm_modules {
-            let header_store: Vec<(Vec<u8>, Vec<u8>)> = resp_headers
-                .iter()
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
-                .collect();
-            let header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
-            let owned: Vec<(&[u8], &[u8])> = header_store
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                .collect();
-            self.send_response(stream_id, 200, &owned, Some(response_body.as_ref()))?;
-            return Ok((200, response_body.len()));
-        }
-
-        self.send_response(stream_id, 200, &resp_headers, Some(response_body.as_ref()))?;
-        Ok((200, response_body.len()))
-    }
-
-    /// リダイレクト処理
-    fn handle_redirect(
-        &mut self,
-        stream_id: u64,
-        redirect_url: &str,
-        status_code: u16,
-        preserve_path: bool,
-        req_path: &[u8],
-        prefix: &[u8],
-    ) -> io::Result<(u16, usize)> {
-        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-
-        // パス部分（prefix除去後）
-        let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-            &path_str[prefix_str.len()..]
-        } else {
-            path_str
-        };
-
-        // 変数置換とパス追加
-        let mut final_url = redirect_url
-            .replace("$request_uri", path_str)
-            .replace("$path", sub_path);
-
-        if preserve_path && !sub_path.is_empty() {
-            if final_url.ends_with('/') && sub_path.starts_with('/') {
-                final_url.push_str(&sub_path[1..]);
-            } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-                final_url.push('/');
-                final_url.push_str(sub_path);
-            } else {
-                final_url.push_str(sub_path);
-            }
-        }
-
-        self.send_response(
-            stream_id,
-            status_code,
-            &[
-                (b"location", final_url.as_bytes()),
-                (b"server", b"veil/http3"),
-            ],
-            None,
-        )?;
-
-        Ok((status_code, 0))
-    }
-
     /// B-43: 保留中の部分レスポンスを 1 エントリ分だけ再送する共通ヘルパー。
     ///
     /// `flush_partial_responses` と `handle_writable_streams` の双方から使い、
@@ -3072,6 +1819,1562 @@ impl Http3Handler {
 }
 
 // ====================
+// B-97: バッファ経路の要求タスク（メインループから切り離す）
+// ====================
+
+/// B-97: バッファ経路（静的配信・メトリクス・gRPC・Wasm 適用・h2c 上流・`buffering = "full"` 等）の
+/// 要求 1 件を処理するタスクの文脈。
+///
+/// 従来はメインループが `handle_request` を await しており、上流 I/O・offload・Wasm の実行中は
+/// **そのワーカーの全 HTTP/3 接続の受信・ACK・送信が止まっていた**。ストリーミング経路
+/// （F-32）と同じアクターモデルに揃え、タスクは quiche に一切触れず、応答を
+/// [`crate::http3_stream::RespMsg`] としてチャネルへ流す。quiche への送出（フロー制御・
+/// StreamBlocked の保留）はメインループの `drive_proxy_streams` が行う。
+struct H3BufferedTask {
+    /// ログ用のストリーム ID。
+    stream_id: u64,
+    peer_addr: SocketAddr,
+    client_ip: crate::http_utils::IpStr,
+    /// 応答の送信端。応答を送り切った時点で `None`（drop = fin）にし、アクセスログ・
+    /// Wasm `on_log` の完了を待たずに fin を出せるようにする。
+    resp_tx: Option<crate::http3_stream::Sender<crate::http3_stream::RespMsg>>,
+    notify: crate::http3_stream::ConnWaker,
+}
+
+/// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
+///
+/// キャッシュに当たる静的配信・ローカル応答のように await せずに完了する要求は、ここで
+/// 応答をチャネルへ積み終え、同じイテレーションの `drive_proxy_streams` で送出される
+/// （タスクとして spawn すると、メインループのイテレーション末尾の `yield_now` まで実行されず、
+/// 応答の送出が 1 イテレーション遅れて `h3_file` 3B で約 12% 退行した）。
+///
+/// 待ちに入った Future は `FuturesUnordered` に残り、起床するとメインループの select の
+/// アームで poll される。ここでの poll は no-op Waker で行うが、`FuturesUnordered` は
+/// 各 Future に自前の Waker を渡すため取りこぼしはない（select のアームが実 Waker で
+/// poll し直してから待機に入る）。
+fn poll_buffered_once<F: std::future::Future<Output = ()>>(
+    futs: &mut futures::stream::FuturesUnordered<F>,
+) {
+    use futures::StreamExt;
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    while let std::task::Poll::Ready(Some(())) = futs.poll_next_unpin(&mut cx) {}
+}
+
+/// メインループの select アーム: 起床したバッファ経路の要求 Future を進める（B-97）。
+///
+/// 1 件でも完了したら `Ready`。完了しない進捗（応答断片の送出）は Future 内の
+/// `ConnWaker::notify` が notify アームを起こす。空のときは `Pending` のまま（`Ready(None)`
+/// で select を空回りさせない）。
+fn poll_buffered_arm<F: std::future::Future<Output = ()>>(
+    futs: &mut futures::stream::FuturesUnordered<F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<()> {
+    use futures::StreamExt;
+    let mut completed = false;
+    while let std::task::Poll::Ready(Some(())) = futs.poll_next_unpin(cx) {
+        completed = true;
+    }
+    if completed {
+        std::task::Poll::Ready(())
+    } else {
+        std::task::Poll::Pending
+    }
+}
+
+/// バッファ経路の要求タスク本体。
+async fn buffered_request_task(mut task: H3BufferedTask, headers: Vec<h3::Header>, body: Bytes) {
+    if let Err(e) = task.handle_request(&headers, &body).await {
+        // 送信失敗（クライアントがストリームをリセット）など。応答を送れていなければ
+        // メインループが送信端の close を見て 502 を返す。
+        debug!(
+            "[HTTP/3] buffered request on stream {} ended: {}",
+            task.stream_id, e
+        );
+    }
+    task.finish();
+}
+
+/// 借用ヘッダ列を 1 回の確保に詰めて `RespHeaders` にする（ヘッダごとの確保をしない）。
+///
+/// `:status` は除き、`content_length` が `Some` なら `content-length` を末尾に足す。
+fn pack_resp_headers(
+    headers: &[(&[u8], &[u8])],
+    content_length: Option<usize>,
+) -> crate::http3_stream::RespHeaders {
+    let mut len_buf = itoa::Buffer::new();
+    let cl: Option<&str> = content_length.map(|n| len_buf.format(n));
+    let keep = |name: &[u8]| name != b":status";
+    let mut total = cl.map_or(0, |v| b"content-length".len() + v.len());
+    let mut count = usize::from(cl.is_some());
+    for (n, v) in headers.iter().filter(|(n, _)| keep(n)) {
+        total += n.len() + v.len();
+        count += 1;
+    }
+    let mut buf = BytesMut::with_capacity(total);
+    for (n, v) in headers.iter().filter(|(n, _)| keep(n)) {
+        buf.extend_from_slice(n);
+        buf.extend_from_slice(v);
+    }
+    if let Some(v) = cl {
+        buf.extend_from_slice(b"content-length");
+        buf.extend_from_slice(v.as_bytes());
+    }
+    let buf = buf.freeze();
+    let mut out = Vec::with_capacity(count);
+    let mut off = 0;
+    for (n, v) in headers.iter().filter(|(n, _)| keep(n)) {
+        let name = buf.slice(off..off + n.len());
+        off += n.len();
+        let value = buf.slice(off..off + v.len());
+        off += v.len();
+        out.push((name, value));
+    }
+    if let Some(v) = cl {
+        let name = buf.slice(off..off + b"content-length".len());
+        off += b"content-length".len();
+        out.push((name, buf.slice(off..off + v.len())));
+    }
+    out
+}
+
+/// F-171: HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を 1 回の確保に詰めて所有ペアにする
+/// （上流 HTTP/2 への転送用。ホップバイホップは上流クライアントが落とす）。
+#[cfg(feature = "http2")]
+fn pack_h3_request_headers(headers: &[h3::Header]) -> crate::http3_stream::RespHeaders {
+    let refs: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .filter(|h| !h.name().starts_with(b":"))
+        .map(|h| (h.name(), h.value()))
+        .collect();
+    pack_resp_headers(&refs, None)
+}
+
+impl H3BufferedTask {
+    /// 応答断片を 1 つ送ってメインループを起こす。
+    async fn send_msg(&self, msg: crate::http3_stream::RespMsg) -> io::Result<()> {
+        let tx = self
+            .resp_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP/3 response already sent"))?;
+        let r = tx.send(msg).await;
+        self.notify.notify();
+        r.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "HTTP/3 stream closed"))
+    }
+
+    /// 送信端を閉じる（メインループは fin を送る。応答未送出なら 502）。
+    fn finish(&mut self) {
+        if self.resp_tx.take().is_some() {
+            self.notify.notify();
+        }
+    }
+
+    /// 応答（head + 本文）を送り、送信端を閉じる。
+    async fn send_response(
+        &mut self,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        body: Option<Bytes>,
+    ) -> io::Result<()> {
+        use crate::http3_stream::RespMsg;
+        // B-46: 既に content-length がある（プロキシ応答）なら重複させない。
+        let has_cl = headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"));
+        let cl = if has_cl {
+            None
+        } else {
+            body.as_ref().map(|b| b.len())
+        };
+        self.send_msg(RespMsg::Head {
+            status,
+            headers: pack_resp_headers(headers, cl),
+        })
+        .await?;
+        if let Some(b) = body {
+            if !b.is_empty() {
+                self.send_msg(RespMsg::Body(b)).await?;
+            }
+        }
+        self.finish();
+        Ok(())
+    }
+
+    /// エラーレスポンス送信
+    async fn send_error_response(&mut self, status: u16, body: &'static [u8]) -> io::Result<()> {
+        self.send_response(
+            status,
+            &[(b"content-type", b"text/plain"), (b"server", b"veil/http3")],
+            Some(Bytes::from_static(body)),
+        )
+        .await
+    }
+
+    /// gRPC レスポンスを送信（初期 HEADERS → 本文 → trailers）。
+    ///
+    /// trailers はメインループが `send_additional_headers(is_trailer_section=true, fin=true)` で
+    /// 送る（B-41: `send_response` は初期応答専用で、2 回目に使うとストリームが閉じない）。
+    #[cfg(feature = "grpc")]
+    async fn send_grpc_response(
+        &mut self,
+        headers: &[(&[u8], &[u8])],
+        body: Option<Bytes>,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> io::Result<()> {
+        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
+        use crate::http3_stream::RespMsg;
+
+        // 初期ヘッダ（content-type）。grpc-status/message は trailers 専用。
+        let mut initial: Vec<(&[u8], &[u8])> = Vec::with_capacity(headers.len() + 1);
+        initial.push((b"content-type", b"application/grpc"));
+        initial.extend(filter_h3_grpc_initial_headers(headers));
+        self.send_msg(RespMsg::Head {
+            status: 200,
+            headers: pack_resp_headers(&initial, None),
+        })
+        .await?;
+        if let Some(b) = body {
+            if !b.is_empty() {
+                self.send_msg(RespMsg::Body(b)).await?;
+            }
+        }
+
+        let code = GrpcStatusCode::from_u8(grpc_status as u8).unwrap_or(GrpcStatusCode::Unknown);
+        let status = if let Some(msg) = grpc_message {
+            GrpcStatus::error(code, msg)
+        } else {
+            GrpcStatus::from_code(code)
+        };
+        let trailer_pairs = status.to_trailers();
+        let trailer_refs: Vec<(&[u8], &[u8])> = trailer_pairs
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice()))
+            .collect();
+        self.send_msg(RespMsg::Trailers(pack_resp_headers(&trailer_refs, None)))
+            .await?;
+        self.finish();
+        Ok(())
+    }
+
+    /// HTTP/3 リクエストを処理（完全版）
+    ///
+    /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
+    /// `handle_request_impl` を呼び出し、**成功・失敗（`?` による早期 return）を問わず**
+    /// 最後に一度だけ `on_log`（`finish_h3_wasm_lifecycle`）を呼ぶ。
+    ///
+    /// F-132: `handle_request_impl` 内には `self.send_response(...).await?` 等、`?` で早期 return
+    /// する箇所が多数あり、そこに個別に `on_log` 呼び出しを仕込むと取りこぼしうる
+    /// （WASM コンテキストのリークに直結する）。このラッパで囲むことで、
+    /// 離脱点の数に関係なく **1 リクエストにつきちょうど 1 回** だけ呼ばれることを構造的に
+    /// 保証する（`handle_request_impl` 側は `finish_h3_wasm_lifecycle` を呼ばない）。
+    async fn handle_request(
+        &mut self,
+        headers: &[h3::Header],
+        request_body: &Bytes,
+    ) -> io::Result<()> {
+        #[cfg(feature = "wasm")]
+        let mut wasm_modules_to_apply: Option<
+            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        > = None;
+
+        let result = self
+            .handle_request_impl(
+                headers,
+                request_body,
+                #[cfg(feature = "wasm")]
+                &mut wasm_modules_to_apply,
+            )
+            .await;
+
+        #[cfg(feature = "wasm")]
+        finish_h3_wasm_lifecycle(&wasm_modules_to_apply).await;
+
+        result
+    }
+
+    async fn handle_request_impl(
+        &mut self,
+        headers: &[h3::Header],
+        request_body: &Bytes,
+        #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
+            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        >,
+    ) -> io::Result<()> {
+        // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
+        let header_block = h3_request_header_block_size(headers);
+        if header_block > MAX_HEADER_SIZE {
+            let path_len = headers
+                .iter()
+                .find(|h| h.name() == b":path")
+                .map(|h| h.value().len())
+                .unwrap_or(0);
+            if path_len > MAX_HEADER_SIZE {
+                self.send_error_response(414, b"URI Too Long").await?;
+            } else {
+                self.send_error_response(431, b"Request Header Fields Too Large")
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        // ヘッダーを解析（`headers` を借用するだけで、リクエストごとに `Vec` へコピーしない）
+        let mut method: Option<&[u8]> = None;
+        let mut path: Option<&[u8]> = None;
+        let mut authority: Option<&[u8]> = None;
+        let mut content_length: usize = 0;
+        let mut accept_encoding: Option<&[u8]> = None;
+        let mut user_agent: &[u8] = &[];
+
+        for header in headers {
+            match header.name() {
+                b":method" => method = Some(header.value()),
+                b":path" => path = Some(header.value()),
+                b":authority" => authority = Some(header.value()),
+                b"content-length" => {
+                    if let Ok(s) = std::str::from_utf8(header.value()) {
+                        content_length = s.parse().unwrap_or(0);
+                    }
+                }
+                name if name.eq_ignore_ascii_case(b"accept-encoding") => {
+                    accept_encoding = Some(header.value());
+                }
+                name if name.eq_ignore_ascii_case(b"user-agent") => {
+                    user_agent = header.value();
+                }
+                _ => {}
+            }
+        }
+
+        // クライアントの Accept-Encoding を解析
+        let client_encoding = accept_encoding
+            .map(AcceptedEncoding::parse)
+            .unwrap_or(AcceptedEncoding::Identity);
+
+        let method: &[u8] = method.unwrap_or(b"GET");
+        let path: &[u8] = path.unwrap_or(b"/");
+        let authority: &[u8] = authority.unwrap_or_default();
+
+        // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
+        let start_time = crate::logging::request_start_instant();
+
+        debug!(
+            "[HTTP/3] Request: {} {} (stream {})",
+            String::from_utf8_lossy(method),
+            String::from_utf8_lossy(path),
+            self.stream_id
+        );
+
+        // F-97: :authority と Host が矛盾するリクエストを 400 で拒否
+        let host_hdr = headers.iter().find_map(|h| {
+            if h.name().eq_ignore_ascii_case(b"host") {
+                Some(h.value())
+            } else {
+                None
+            }
+        });
+        if crate::http_utils::authority_host_mismatch(authority, host_hdr) {
+            self.send_error_response(400, b"Bad Request: :authority/Host mismatch")
+                .await?;
+            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                &[]
+            } else {
+                user_agent
+            };
+            log_access(
+                method,
+                authority,
+                path,
+                user_agent_slice,
+                content_length as u64,
+                400,
+                0,
+                start_time,
+                self.client_ip.as_str(),
+                "",
+            );
+            return Ok(());
+        }
+
+        // gRPC リクエスト検出フラグ
+        #[cfg(feature = "grpc")]
+        let is_grpc = Http3Handler::is_grpc_request(headers);
+        #[cfg(not(feature = "grpc"))]
+        let _is_grpc = false;
+
+        #[cfg(feature = "grpc")]
+        if is_grpc {
+            debug!(
+                "[HTTP/3] gRPC request detected: {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+
+        // メトリクスエンドポイント（設定可能なパス）
+        {
+            let config = CURRENT_CONFIG.load();
+            let prom_config = &config.prometheus_config;
+
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
+                // IPアドレス制限チェック
+                if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
+                    self.send_error_response(403, b"Forbidden").await?;
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                        &[]
+                    } else {
+                        user_agent
+                    };
+                    log_access(
+                        method,
+                        authority,
+                        path,
+                        user_agent_slice,
+                        request_body.len() as u64,
+                        403,
+                        9,
+                        start_time,
+                        self.client_ip.as_str(),
+                        "",
+                    );
+                    return Ok(());
+                }
+
+                let body = encode_prometheus_metrics();
+                self.send_response(
+                    200,
+                    &[
+                        (b":status", b"200"),
+                        (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+                        (b"server", b"veil/http3"),
+                    ],
+                    Some(Bytes::copy_from_slice(&body)),
+                )
+                .await?;
+
+                let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                    &[]
+                } else {
+                    user_agent
+                };
+                log_access(
+                    method,
+                    authority,
+                    path,
+                    user_agent_slice,
+                    request_body.len() as u64,
+                    200,
+                    body.len() as u64,
+                    start_time,
+                    self.client_ip.as_str(),
+                    "",
+                );
+                return Ok(());
+            }
+        }
+
+        // バックエンド選択（統合ルーティング）
+        let config = CURRENT_CONFIG.load();
+
+        // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
+        let headers_raw: Vec<(&[u8], &[u8])> = headers
+            .iter()
+            .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
+            .map(|h| (h.name(), h.value()))
+            .collect();
+
+        // パス/クエリ分離（スキャンを1回に統一）
+        let query_start_pos = path.iter().position(|&b| b == b'?');
+        let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
+        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
+
+        let backend_result = find_backend_unified(
+            authority,
+            path_without_query,
+            method,
+            &headers_raw,
+            raw_query,
+            &self.peer_addr,
+            config.route.as_slice(),
+            &config.upstream_groups,
+        )
+        .or_else(|| {
+            // authority が空でない場合、デフォルトルートを検索
+            if !authority.is_empty() {
+                debug!(
+                    "[HTTP/3] No route found for authority '{}', trying default routes",
+                    String::from_utf8_lossy(authority)
+                );
+                find_backend_unified(
+                    b"",
+                    path_without_query,
+                    method,
+                    &headers_raw,
+                    raw_query,
+                    &self.peer_addr,
+                    config.route.as_slice(),
+                    &config.upstream_groups,
+                )
+            } else {
+                None
+            }
+        });
+
+        // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
+        // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
+        let (prefix, backend, route_compression) = match backend_result {
+            Some(b) => b,
+            None => {
+                debug!(
+                    "[HTTP/3] No backend found for authority='{}', path='{}'",
+                    String::from_utf8_lossy(authority),
+                    String::from_utf8_lossy(path)
+                );
+
+                // gRPC リクエストの場合は gRPC エラーレスポンスを返す
+                #[cfg(feature = "grpc")]
+                if is_grpc {
+                    // UNIMPLEMENTED (12) - サービス/メソッドが見つからない
+                    self.send_grpc_response(&[], None, 12, Some("Service not found"))
+                        .await?;
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                        &[]
+                    } else {
+                        user_agent
+                    };
+                    log_access(
+                        method,
+                        authority,
+                        path,
+                        user_agent_slice,
+                        request_body.len() as u64,
+                        200,
+                        0,
+                        start_time,
+                        self.client_ip.as_str(),
+                        "",
+                    );
+                    return Ok(());
+                }
+
+                self.send_error_response(404, b"Not Found").await?;
+                let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                    &[]
+                } else {
+                    user_agent
+                };
+                log_access(
+                    method,
+                    authority,
+                    path,
+                    user_agent_slice,
+                    request_body.len() as u64,
+                    404,
+                    9,
+                    start_time,
+                    self.client_ip.as_str(),
+                    "",
+                );
+                return Ok(());
+            }
+        };
+
+        // セキュリティチェック
+        let security = backend.security();
+        let check_result = check_security(
+            security,
+            self.client_ip.as_str(),
+            method,
+            content_length,
+            false,
+        );
+
+        if check_result != SecurityCheckResult::Allowed {
+            let status = check_result.status_code();
+            let msg = check_result.message();
+            self.send_error_response(status, msg).await?;
+            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                &[]
+            } else {
+                user_agent
+            };
+            log_access(
+                method,
+                authority,
+                path,
+                user_agent_slice,
+                request_body.len() as u64,
+                status,
+                msg.len() as u64,
+                start_time,
+                self.client_ip.as_str(),
+                "",
+            );
+            return Ok(());
+        }
+
+        // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
+        // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out
+        // パラメータ。ここで `Some` にセットしておけば、この後どの `?` で早期 return しても
+        // 呼び出し元側で必ず一度だけ `on_log` が呼ばれる。
+        #[cfg(feature = "wasm")]
+        let mut wasm_request_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+        // F-132: WASM on_request_body で書き換えられた本文（適用時のみ Some）。
+        #[cfg(feature = "wasm")]
+        let mut wasm_request_body_override: Option<Bytes> = None;
+        #[cfg(feature = "wasm")]
+        {
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
+                let method_str = std::str::from_utf8(method).unwrap_or("GET");
+
+                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
+                let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
+                    backend_modules.clone()
+                } else {
+                    crate::wasm::empty_wasm_modules()
+                };
+
+                if !modules_to_apply.is_empty() {
+                    *wasm_modules_to_apply = Some(modules_to_apply.clone());
+
+                    let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers
+                        .iter()
+                        .filter(|h| !h.name().starts_with(b":"))
+                        .map(|h| (h.name().to_vec(), h.value().to_vec()))
+                        .collect();
+
+                    let wasm_result = wasm_engine
+                        .on_request_headers_with_modules(
+                            &modules_to_apply,
+                            &std::sync::Arc::from(path_str),
+                            &std::sync::Arc::from(method_str),
+                            headers_vec,
+                            &std::sync::Arc::from(self.client_ip.as_str()),
+                            request_body.is_empty(),
+                        )
+                        .await;
+
+                    match wasm_result {
+                        crate::wasm::FilterResult::LocalResponse(resp) => {
+                            self.send_response(
+                                resp.status_code,
+                                &resp
+                                    .headers
+                                    .iter()
+                                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                    .collect::<Vec<_>>(),
+                                Some(Bytes::copy_from_slice(&resp.body)),
+                            )
+                            .await?;
+                            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                                &[]
+                            } else {
+                                user_agent
+                            };
+                            log_access(
+                                method,
+                                authority,
+                                path,
+                                user_agent_slice,
+                                request_body.len() as u64,
+                                resp.status_code,
+                                resp.body.len() as u64,
+                                start_time,
+                                self.client_ip.as_str(),
+                                "",
+                            );
+                            // F-132: on_log は呼び出し元の `handle_request` ラッパが
+                            // `?`/早期 return を問わず最後に一度だけ呼ぶ
+                            // （`*wasm_modules_to_apply` は既にセット済み）。
+                            return Ok(());
+                        }
+                        crate::wasm::FilterResult::Pause => {
+                            warn!("WASM module requested pause, but async operations are not yet supported");
+                        }
+                        crate::wasm::FilterResult::Continue {
+                            headers: modified, ..
+                        } => {
+                            // B-38: 変更後ヘッダを上流リクエストへ反映
+                            wasm_request_headers = Some(modified);
+
+                            // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
+                            // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
+                            // end_of_stream=true の 1 回呼びで実装できる）。
+                            if !request_body.is_empty() {
+                                match crate::wasm::http_executor::apply_wasm_request_body(
+                                    wasm_engine,
+                                    &modules_to_apply,
+                                    request_body.clone(),
+                                    true,
+                                )
+                                .await
+                                {
+                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                        wasm_request_body_override = Some(b);
+                                    }
+                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                        resp,
+                                    ) => {
+                                        self.send_response(
+                                            resp.status_code,
+                                            &resp
+                                                .headers
+                                                .iter()
+                                                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                                .collect::<Vec<_>>(),
+                                            Some(Bytes::copy_from_slice(&resp.body)),
+                                        )
+                                        .await?;
+                                        let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                                            &[]
+                                        } else {
+                                            user_agent
+                                        };
+                                        log_access(
+                                            method,
+                                            authority,
+                                            path,
+                                            user_agent_slice,
+                                            request_body.len() as u64,
+                                            resp.status_code,
+                                            resp.body.len() as u64,
+                                            start_time,
+                                            self.client_ip.as_str(),
+                                            "",
+                                        );
+                                        // F-132: on_log は呼び出し元の `handle_request`
+                                        // ラッパが最後に一度だけ呼ぶ。
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // バックエンド処理
+        let (status, resp_size) = match backend {
+            Backend::Proxy(upstream_group, security, path_compression, _buffering, _cache, _) => {
+                debug!("[HTTP/3] Starting proxy request to upstream group");
+
+                // HTTP/3専用圧縮設定を解決
+                // 優先順位: パス設定 > HTTP/3設定 > デフォルト
+                let config = CURRENT_CONFIG.load();
+                let effective_compression =
+                    resolve_http3_compression_config(&path_compression, &config.http3_config);
+
+                // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
+                #[cfg(feature = "wasm")]
+                let effective_request_body: &Bytes =
+                    wasm_request_body_override.as_ref().unwrap_or(request_body);
+                #[cfg(not(feature = "wasm"))]
+                let effective_request_body: &Bytes = request_body;
+
+                let result = self
+                    .handle_proxy(
+                        &upstream_group,
+                        &security,
+                        &effective_compression,
+                        client_encoding,
+                        method,
+                        path,
+                        &prefix,
+                        headers,
+                        effective_request_body,
+                        #[cfg(feature = "wasm")]
+                        wasm_modules_to_apply.as_ref(),
+                        #[cfg(feature = "wasm")]
+                        wasm_request_headers.as_deref(),
+                    )
+                    .await
+                    .unwrap_or((502, 11));
+                debug!(
+                    "[HTTP/3] Proxy request completed: status={}, size={}",
+                    result.0, result.1
+                );
+                result
+            }
+            Backend::MemoryFile(data, mime_type, security, _) => {
+                // パス完全一致チェック
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
+                let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+
+                let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+                    &path_str[prefix_str.len()..]
+                } else {
+                    ""
+                };
+
+                let clean_remainder = remainder.trim_matches('/');
+                if !clean_remainder.is_empty() {
+                    self.send_error_response(404, b"Not Found").await?;
+                    (404, 9)
+                } else {
+                    // F-132: h1/h2 と同様、静的配信（Backend::File 系）にも WASM
+                    // on_response_headers を適用する。
+                    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                        (b"content-type".to_vec(), mime_type.as_bytes().to_vec()),
+                        (b"server".to_vec(), b"veil/http3".to_vec()),
+                    ];
+                    for (k, v) in &security.add_response_headers {
+                        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+                    }
+
+                    // F-169: HTTP/3 の File 系バックエンドは従来ここで圧縮設定
+                    // （`route_compression`）を破棄しており、h2 と違って圧縮が
+                    // 一切効いていなかった。h2 (`build_h2_compressed_file_response`)
+                    // と同じネゴシエーションを適用する。MemoryFile はファイルシステム
+                    // パスを持たないため圧縮結果キャッシュ（`cache::compressed`）は
+                    // 使えない（毎回圧縮する。h2 側の MemoryFile 経路と同じ扱い）。
+                    let file_compression =
+                        resolve_http3_compression_config(&route_compression, &config.http3_config);
+                    let should_compress = file_compression.should_compress(
+                        client_encoding,
+                        Some(mime_type.as_bytes()),
+                        Some(data.len()),
+                        None,
+                    );
+
+                    let response_body: Bytes = if let Some(enc) = should_compress {
+                        let encoding_name: &[u8] = match enc {
+                            AcceptedEncoding::Zstd => b"zstd",
+                            AcceptedEncoding::Brotli => b"br",
+                            AcceptedEncoding::Gzip => b"gzip",
+                            AcceptedEncoding::Deflate => b"deflate",
+                            AcceptedEncoding::Identity => b"",
+                        };
+                        if !encoding_name.is_empty() {
+                            header_store
+                                .push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+                            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+                        }
+                        Bytes::from(compress_body_h3(data.as_slice(), enc, &file_compression))
+                    } else {
+                        // Arc<Vec<u8>> の参照カウントクローンのみ（ディープコピー無し）。
+                        Bytes::from_owner(ArcVecBytes(data.clone()))
+                    };
+
+                    #[cfg(feature = "wasm")]
+                    if let Some(modules) = wasm_modules_to_apply.as_ref() {
+                        header_store =
+                            apply_h3_wasm_response_headers(modules, 200, header_store).await;
+                    }
+
+                    let resp_headers: Vec<(&[u8], &[u8])> = header_store
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+
+                    self.send_response(200, &resp_headers, Some(response_body.clone()))
+                        .await?;
+                    (200, response_body.len())
+                }
+            }
+            Backend::SendFile(
+                base_path,
+                is_dir,
+                index_file,
+                security,
+                _cache,
+                open_file_cache_config,
+                canonical_base,
+                static_file_cache_config,
+                _,
+            ) => {
+                // F-169: HTTP/3 専用圧縮設定を解決（Proxy 経路の `handle_proxy` と同じ
+                // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
+                // `route_compression` を破棄しており圧縮が一切効いていなかった。
+                let file_compression =
+                    resolve_http3_compression_config(&route_compression, &config.http3_config);
+                self.handle_sendfile(SendFileRequest {
+                    base_path: &base_path,
+                    is_dir,
+                    index_file: index_file.as_deref(),
+                    req_path: path,
+                    prefix: &prefix,
+                    security: &security,
+                    compression: &file_compression,
+                    client_encoding,
+                    open_file_cache_config: open_file_cache_config.as_deref(),
+                    canonical_base: canonical_base.as_deref(),
+                    static_file_cache_config: static_file_cache_config.as_deref(),
+                    #[cfg(feature = "wasm")]
+                    wasm_modules: wasm_modules_to_apply.as_ref(),
+                })
+                .await
+                .unwrap_or((404, 9))
+            }
+            Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
+                .handle_redirect(&redirect_url, status_code, preserve_path, path, &prefix)
+                .await
+                .unwrap_or((500, 0)),
+        };
+
+        let user_agent_slice: &[u8] = if user_agent.is_empty() {
+            &[]
+        } else {
+            user_agent
+        };
+        log_access(
+            method,
+            authority,
+            path,
+            user_agent_slice,
+            request_body.len() as u64,
+            status,
+            resp_size as u64,
+            start_time,
+            self.client_ip.as_str(),
+            "",
+        );
+        // F-132: on_log は呼び出し元の `handle_request` ラッパが最後に一度だけ呼ぶ。
+        Ok(())
+    }
+
+    /// プロキシ処理（HTTP/1.1 または H2C バックエンドへの変換）
+    ///
+    /// - 通常: HTTP/1.1 で上流へ転送
+    /// - `use_h2c`: H2C (Prior Knowledge) で上流へ転送（B-39: gRPC over HTTP/3）
+    /// - WASM: リクエスト/レスポンスヘッダ変更を適用（B-38）
+    async fn handle_proxy(
+        &mut self,
+        upstream_group: &Arc<UpstreamGroup>,
+        // 上流接続プール（B-74 の H2C_POOL・B-104 の HTTP/1.1 プール）の max_idle/idle_timeout。
+        security: &SecurityConfig,
+        compression: &CompressionConfig,
+        client_encoding: AcceptedEncoding,
+        method: &[u8],
+        req_path: &[u8],
+        prefix: &[u8],
+        headers: &[h3::Header],
+        request_body: &Bytes,
+        #[cfg(feature = "wasm")] wasm_modules: Option<
+            &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        >,
+        #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
+    ) -> io::Result<(u16, usize)> {
+        // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
+        let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
+            headers
+                .iter()
+                .find(|h| h.name().eq_ignore_ascii_case(name))
+                .map(|h| h.value())
+        }) {
+            Some(s) => s,
+            None => {
+                self.send_error_response(502, b"Bad Gateway").await?;
+                return Ok((502, 11));
+            }
+        };
+
+        server.acquire();
+        let target = &server.target;
+
+        // リクエストパス構築
+        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+        let timeout_secs = 30;
+
+        // 上流へ送るヘッダソース（WASM 変更後 or 生 H3 ヘッダ）
+        #[cfg(feature = "wasm")]
+        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = if let Some(ov) = wasm_request_headers {
+            ov.iter()
+                .filter(|(n, _)| {
+                    !n.starts_with(b":")
+                        && !n.eq_ignore_ascii_case(b"connection")
+                        && !n.eq_ignore_ascii_case(b"keep-alive")
+                        && !n.eq_ignore_ascii_case(b"transfer-encoding")
+                })
+                .cloned()
+                .collect()
+        } else {
+            headers
+                .iter()
+                .filter(|h| {
+                    !h.name().starts_with(b":")
+                        && !h.name().eq_ignore_ascii_case(b"connection")
+                        && !h.name().eq_ignore_ascii_case(b"keep-alive")
+                        && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
+                })
+                .map(|h| (h.name().to_vec(), h.value().to_vec()))
+                .collect()
+        };
+        #[cfg(not(feature = "wasm"))]
+        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = headers
+            .iter()
+            .filter(|h| {
+                !h.name().starts_with(b":")
+                    && !h.name().eq_ignore_ascii_case(b"connection")
+                    && !h.name().eq_ignore_ascii_case(b"keep-alive")
+                    && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
+            })
+            .map(|h| (h.name().to_vec(), h.value().to_vec()))
+            .collect();
+
+        // gRPC はサービス/メソッドのフルパスを保持（B-39）
+        #[cfg(feature = "grpc")]
+        let is_grpc_req = header_pairs_indicate_grpc(&header_pairs);
+        #[cfg(not(feature = "grpc"))]
+        let is_grpc_req = false;
+
+        let final_path_owned =
+            compute_upstream_request_path(path_str, prefix, &target.path_prefix, is_grpc_req);
+        let final_path = final_path_owned.as_str();
+
+        // B-39: H2C 上流（gRPC 等）
+        let use_h2c = target.use_h2c || upstream_group.use_h2c();
+        let proxy_result = if use_h2c {
+            #[cfg(feature = "http2")]
+            {
+                proxy_to_h2c_backend_async(
+                    target,
+                    method,
+                    final_path.as_bytes(),
+                    &header_pairs,
+                    request_body,
+                    timeout_secs,
+                    security,
+                )
+                .await
+            }
+            #[cfg(not(feature = "http2"))]
+            {
+                warn!("[HTTP/3] use_h2c requested but http2 feature disabled");
+                Err(io::Error::other("H2C requires http2 feature"))
+            }
+        } else {
+            // F-175: HTTPS 上流は ALPN で HTTP/2 を試す。上流が HTTP/1.1 を選んだら、
+            // ネゴシエーションに使った接続をワーカーのプールへ入れて下の HTTP/1.1 経路で使う。
+            #[cfg(feature = "http2")]
+            let h2_result: Option<io::Result<BackendProxyResult>> = if target.h2_over_tls() {
+                let key = crate::http_utils::PoolKeyStr::tls_addr(
+                    target.conn_addr().as_str(),
+                    target.sni(),
+                    upstream_group.tls_insecure(),
+                );
+                let body = (!request_body.is_empty()).then(|| request_body.clone());
+                match crate::http2::upstream_mux::request_https_buffered(
+                    target,
+                    key.as_str(),
+                    upstream_group.tls_insecure(),
+                    Duration::from_secs(security.backend_connect_timeout_secs),
+                    Duration::from_secs(security.idle_connection_timeout_secs),
+                    Duration::from_secs(timeout_secs),
+                    method,
+                    final_path.as_bytes(),
+                    target.host.as_bytes(),
+                    header_pairs
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice())),
+                    body,
+                    crate::http_utils::is_idempotent_method(method),
+                )
+                .await
+                {
+                    Ok(crate::http2::upstream_mux::HttpsBuffered::H2(r)) => {
+                        Some(Ok(BackendProxyResult {
+                            status_code: r.status,
+                            body: Vec::from(r.body),
+                            headers: r
+                                .headers
+                                .into_iter()
+                                .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+                                .collect(),
+                            trailers: r
+                                .trailers
+                                .into_iter()
+                                .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+                                .collect(),
+                        }))
+                    }
+                    Ok(crate::http2::upstream_mux::HttpsBuffered::Http1(conn)) => {
+                        if let Some(conn) = conn {
+                            crate::http3_stream::h3_pool_put_client_tls(
+                                key.as_str(),
+                                *conn,
+                                security.max_idle_connections_per_host,
+                                security.idle_connection_timeout_secs,
+                            );
+                        }
+                        None
+                    }
+                    Err(status) => Some(Err(if status == 504 {
+                        io::Error::new(io::ErrorKind::TimedOut, "upstream h2 timeout")
+                    } else {
+                        io::Error::other("upstream h2 request failed")
+                    })),
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "http2"))]
+            let h2_result: Option<io::Result<BackendProxyResult>> = None;
+            match h2_result {
+                Some(r) => r,
+                None => {
+                    // HTTP/1.1 リクエスト構築
+                    let mut request = Vec::with_capacity(1024 + request_body.len());
+                    request.extend_from_slice(method);
+                    request.extend_from_slice(b" ");
+                    request.extend_from_slice(final_path.as_bytes());
+                    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+                    request.extend_from_slice(target.host.as_bytes());
+
+                    if !target.is_default_port() {
+                        request.extend_from_slice(b":");
+                        let mut port_buf = itoa::Buffer::new();
+                        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+                    }
+                    request.extend_from_slice(b"\r\n");
+
+                    for (name, value) in &header_pairs {
+                        request.extend_from_slice(name);
+                        request.extend_from_slice(b": ");
+                        request.extend_from_slice(value);
+                        request.extend_from_slice(b"\r\n");
+                    }
+
+                    if !request_body.is_empty() {
+                        request.extend_from_slice(b"Content-Length: ");
+                        let mut len_buf = itoa::Buffer::new();
+                        request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
+                        request.extend_from_slice(b"\r\n");
+                    }
+
+                    // B-104: `Connection: close` は付けない（上流接続はワーカーのプールで再利用する）。
+                    request.extend_from_slice(b"\r\n");
+                    request.extend_from_slice(request_body);
+
+                    let cfg = crate::http3_stream::BufferedExchange {
+                        target,
+                        timeout_secs,
+                        tls_insecure: upstream_group.tls_insecure(),
+                        pool_max_idle: security.max_idle_connections_per_host,
+                        pool_idle_timeout_secs: security.idle_connection_timeout_secs,
+                        no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+                        idempotent: crate::http_utils::is_idempotent_method(method),
+                    };
+                    crate::http3_stream::exchange_buffered(&cfg, Bytes::from(request))
+                        .await
+                        .map(|r| BackendProxyResult {
+                            status_code: r.status,
+                            body: r.body,
+                            headers: r.headers,
+                            trailers: Vec::new(),
+                        })
+                }
+            }
+        };
+
+        server.release();
+
+        match proxy_result {
+            Ok(backend_result) => {
+                let status_code = backend_result.status_code;
+                #[cfg(feature = "wasm")]
+                let mut body = backend_result.body;
+                #[cfg(not(feature = "wasm"))]
+                let body = backend_result.body;
+                let trailers = backend_result.trailers;
+
+                // B-38: WASM レスポンスヘッダフィルタ
+                #[cfg(feature = "wasm")]
+                let mut resp_header_store = backend_result.headers;
+                #[cfg(feature = "wasm")]
+                if let Some(modules) = wasm_modules {
+                    if !modules.is_empty() {
+                        resp_header_store =
+                            apply_h3_wasm_response_headers(modules, status_code, resp_header_store)
+                                .await;
+                    }
+                }
+                #[cfg(not(feature = "wasm"))]
+                let resp_header_store = backend_result.headers;
+
+                // gRPC は圧縮ネゴシエーション/ボディフィルタ対象外（application/grpc、trailers は F-133）
+                #[cfg(feature = "grpc")]
+                let is_grpc_ct = resp_header_store
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(b"content-type"))
+                    .map(|(_, v)| crate::grpc::headers::is_grpc_content_type(v))
+                    .unwrap_or(false);
+                #[cfg(not(feature = "grpc"))]
+                let is_grpc_ct = false;
+
+                // F-132: WASM レスポンスボディフィルタ（HTTP/3 は WASM 適用時に必ず
+                // Decision::Buffer に落ちるためボディ全体がメモリ上にある。end_of_stream=true
+                // の 1 回呼びで実装できる）。書き換えたら content-length を更新する（B-46）。
+                #[cfg(feature = "wasm")]
+                if !is_grpc_ct {
+                    if let Some(modules) = wasm_modules {
+                        if !modules.is_empty() {
+                            let config = CURRENT_CONFIG.load();
+                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                match crate::wasm::http_executor::apply_wasm_response_body(
+                                    wasm_engine,
+                                    modules,
+                                    Bytes::from(body),
+                                    true,
+                                )
+                                .await
+                                {
+                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                        crate::wasm::http_executor::set_content_length_header(
+                                            &mut resp_header_store,
+                                            b.len(),
+                                        );
+                                        body = b.to_vec();
+                                    }
+                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                        resp,
+                                    ) => {
+                                        let resp_headers: Vec<(&[u8], &[u8])> = resp
+                                            .headers
+                                            .iter()
+                                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                            .collect();
+                                        self.send_response(
+                                            resp.status_code,
+                                            &resp_headers,
+                                            Some(Bytes::copy_from_slice(&resp.body)),
+                                        )
+                                        .await?;
+                                        return Ok((resp.status_code, resp.body.len()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 圧縮判定
+                let mut content_type: Option<&[u8]> = None;
+                let mut existing_encoding: Option<&[u8]> = None;
+                for (name, value) in &resp_header_store {
+                    if name.eq_ignore_ascii_case(b"content-type") {
+                        content_type = Some(value.as_slice());
+                    } else if name.eq_ignore_ascii_case(b"content-encoding") {
+                        existing_encoding = Some(value.as_slice());
+                    }
+                }
+
+                let should_compress = if is_grpc_ct {
+                    None
+                } else {
+                    compression.should_compress(
+                        client_encoding,
+                        content_type,
+                        Some(body.len()),
+                        existing_encoding,
+                    )
+                };
+
+                // レスポンスヘッダ + H2C trailers をマージ（B-39）
+                let owned_headers = merge_response_headers_and_trailers(
+                    &resp_header_store,
+                    &trailers,
+                    should_compress.is_some(),
+                );
+
+                let response_body = if let Some(enc) = should_compress {
+                    compress_body_h3(&body, enc, compression)
+                } else {
+                    body
+                };
+                let response_body = Bytes::from(response_body);
+
+                let resp_headers: Vec<(&[u8], &[u8])> = owned_headers
+                    .iter()
+                    .map(|(n, v)| (n.as_slice(), v.as_slice()))
+                    .collect();
+
+                // gRPC: trailers 用 API で終端（status は既に headers にマージ済み）
+                #[cfg(feature = "grpc")]
+                if is_grpc_ct && !trailers.is_empty() {
+                    let grpc_status = trailers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status"))
+                        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let grpc_message = trailers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-message"))
+                        .and_then(|(_, v)| String::from_utf8(v.clone()).ok());
+                    // ヘッダにマージ済み + ボディ送信。status 200 で trailers も送る。
+                    self.send_grpc_response(
+                        &resp_headers,
+                        Some(response_body.clone()),
+                        grpc_status,
+                        grpc_message.as_deref(),
+                    )
+                    .await?;
+                    return Ok((status_code, response_body.len()));
+                }
+
+                self.send_response(status_code, &resp_headers, Some(response_body.clone()))
+                    .await?;
+                Ok((status_code, response_body.len()))
+            }
+            Err(e) => {
+                warn!("[HTTP/3] Async backend proxy error: {}", e);
+                self.send_error_response(502, b"Bad Gateway").await?;
+                Ok((502, 11))
+            }
+        }
+    }
+
+    /// ファイル配信
+    async fn handle_sendfile(&mut self, req: SendFileRequest<'_>) -> io::Result<(u16, usize)> {
+        let SendFileRequest {
+            base_path,
+            is_dir,
+            index_file,
+            req_path,
+            prefix,
+            security,
+            compression,
+            client_encoding,
+            open_file_cache_config,
+            canonical_base,
+            static_file_cache_config,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
+        } = req;
+        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+
+        // プレフィックス除去後のサブパス
+        let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+            &path_str[prefix_str.len()..]
+        } else {
+            path_str
+        };
+
+        let clean_sub = sub_path.trim_start_matches('/');
+
+        // パストラバーサル防止
+        if clean_sub.contains("..") {
+            self.send_error_response(403, b"Forbidden").await?;
+            return Ok((403, 9));
+        }
+
+        // ファイルパス構築（素の join のみ。ディレクトリかどうかの判定は下の
+        // `get_file_info_with_config` の非同期呼び出しへ委譲する）。
+        let full_path = if is_dir {
+            let mut p = base_path.to_path_buf();
+            if !clean_sub.is_empty() {
+                p.push(clean_sub);
+            }
+            p
+        } else {
+            if !clean_sub.is_empty() {
+                self.send_error_response(404, b"Not Found").await?;
+                return Ok((404, 9));
+            }
+            base_path.to_path_buf()
+        };
+
+        // B-65（続き）: 従来は「メタデータ解決（offload 1）→ …index 解決…→ 本体読み込み
+        // （offload 2）」で 1 リクエストあたり offload のクロススレッド往復が 2 回
+        // 発生していた（`docs/backlog/bugs/B-65-freebsd-h2c-request-cost.md`）。
+        // 当初の改修は `is_dir == false`（固定ファイルルート）でしか高速経路が使われず、
+        // 実運用で一般的なディレクトリルートでは改善していなかった。
+        //
+        // `is_dir` の true/false に関わらずまず `get_static_file_with_content` を 1 回
+        // 呼ぶ（両キャッシュヒット時は offload ゼロ）。ディレクトリルートの場合のみ
+        // `containment` に「このルート自身の」`base_path` を渡し、高速経路（Linux）は
+        // その `base_path` の dirfd に対してのみ open する（F-154:
+        // `resolve::open_beneath_in_root`）ため、これ自体が per-route の封じ込めになり、
+        // `readlink` 等の事後検査は不要（`cache::static_file` モジュール doc 参照）。
+        // h1/h2 と同一方針。
+        let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
+        let containment = is_dir.then_some(cache::RouteContainment {
+            root: base_path,
+            canonical_base,
+        });
+        let first_result = cache::get_static_file_with_content(
+            &full_path,
+            open_file_cache_config,
+            &content_cfg,
+            containment,
+        )
+        .await;
+
+        // F-169: `served_path`（実際に配信するパス。ディレクトリルートで index に
+        // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
+        // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
+        // （h2 側 `h2_sendfile` と同じ方針）。
+        let (data, mime_owned, served_path): (
+            bytes::Bytes,
+            std::sync::Arc<str>,
+            std::path::PathBuf,
+        ) = match first_result {
+            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type, full_path),
+            Some(cache::StaticFileOutcome::Forbidden) => {
+                self.send_error_response(403, b"Forbidden").await?;
+                return Ok((403, 9));
+            }
+            Some(cache::StaticFileOutcome::Directory(file_info)) => {
+                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
+                // パスにも同じ containment を渡す）。
+                let filename = index_file.unwrap_or("index.html");
+                let index_path = file_info.canonical_path.join(filename);
+                match cache::get_static_file_with_content(
+                    &index_path,
+                    open_file_cache_config,
+                    &content_cfg,
+                    containment,
+                )
+                .await
+                {
+                    Some(cache::StaticFileOutcome::File(info, data)) => {
+                        (data, info.mime_type, index_path)
+                    }
+                    Some(cache::StaticFileOutcome::Forbidden) | None => {
+                        self.send_error_response(403, b"Forbidden").await?;
+                        return Ok((403, 9));
+                    }
+                    Some(cache::StaticFileOutcome::Directory(_)) => {
+                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                        // 安全側に倒して 403 とする）。
+                        self.send_error_response(403, b"Forbidden").await?;
+                        return Ok((403, 9));
+                    }
+                }
+            }
+            None => {
+                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                cache::invalidate_file_cache(&full_path);
+                cache::invalidate_content_cache(&full_path);
+                self.send_error_response(404, b"Not Found").await?;
+                return Ok((404, 9));
+            }
+        };
+        let mime_str: &str = &mime_owned;
+
+        // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
+        // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
+        // 従来この関数は圧縮設定自体を受け取っておらず、HTTP/3 の静的配信では
+        // 圧縮が一切効いていなかった。
+        let should_compress = compression.should_compress(
+            client_encoding,
+            Some(mime_str.as_bytes()),
+            Some(data.len()),
+            None,
+        );
+        let mut encoding_name: &[u8] = b"";
+        let response_body: Bytes = if let Some(enc) = should_compress {
+            encoding_name = match enc {
+                AcceptedEncoding::Zstd => b"zstd",
+                AcceptedEncoding::Brotli => b"br",
+                AcceptedEncoding::Gzip => b"gzip",
+                AcceptedEncoding::Deflate => b"deflate",
+                AcceptedEncoding::Identity => b"",
+            };
+            if content_cfg.enabled {
+                let level = cache::compressed::compression_level(enc, compression);
+                cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
+                    compress_body_h3(&data, enc, compression)
+                })
+            } else {
+                Bytes::from(compress_body_h3(&data, enc, compression))
+            }
+        } else {
+            // Bytes::clone() は参照カウント増加のみ（ディープコピー無し）。
+            data.clone()
+        };
+
+        // 応答ヘッダは借用のまま組み立てる（以前は `Vec<(Vec<u8>, Vec<u8>)>` で
+        // リクエストごとに 7〜8 回確保していた）。所有バッファが要るのは F-132 の
+        // WASM on_response_headers を適用するときだけ。
+        let mut resp_headers: Vec<(&[u8], &[u8])> =
+            Vec::with_capacity(4 + security.add_response_headers.len());
+        resp_headers.push((b"content-type", mime_str.as_bytes()));
+        resp_headers.push((b"server", b"veil/http3"));
+        for (k, v) in &security.add_response_headers {
+            resp_headers.push((k.as_bytes(), v.as_bytes()));
+        }
+        if !encoding_name.is_empty() {
+            resp_headers.push((b"content-encoding", encoding_name));
+            resp_headers.push((b"vary", b"Accept-Encoding"));
+        }
+
+        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
+        #[cfg(feature = "wasm")]
+        if let Some(modules) = wasm_modules {
+            let header_store: Vec<(Vec<u8>, Vec<u8>)> = resp_headers
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect();
+            let header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+            let owned: Vec<(&[u8], &[u8])> = header_store
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.send_response(200, &owned, Some(response_body.clone()))
+                .await?;
+            return Ok((200, response_body.len()));
+        }
+
+        self.send_response(200, &resp_headers, Some(response_body.clone()))
+            .await?;
+        Ok((200, response_body.len()))
+    }
+
+    /// リダイレクト処理
+    async fn handle_redirect(
+        &mut self,
+        redirect_url: &str,
+        status_code: u16,
+        preserve_path: bool,
+        req_path: &[u8],
+        prefix: &[u8],
+    ) -> io::Result<(u16, usize)> {
+        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+
+        // パス部分（prefix除去後）
+        let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+            &path_str[prefix_str.len()..]
+        } else {
+            path_str
+        };
+
+        // 変数置換とパス追加
+        let mut final_url = redirect_url
+            .replace("$request_uri", path_str)
+            .replace("$path", sub_path);
+
+        if preserve_path && !sub_path.is_empty() {
+            if final_url.ends_with('/') && sub_path.starts_with('/') {
+                final_url.push_str(&sub_path[1..]);
+            } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
+                final_url.push('/');
+                final_url.push_str(sub_path);
+            } else {
+                final_url.push_str(sub_path);
+            }
+        }
+
+        self.send_response(
+            status_code,
+            &[
+                (b"location", final_url.as_bytes()),
+                (b"server", b"veil/http3"),
+            ],
+            None,
+        )
+        .await?;
+
+        Ok((status_code, 0))
+    }
+}
+
+// ====================
 // F-32: ストリーミング用フリー関数（リクエスト head 構築・パス計算・ストリーム駆動）
 // ====================
 
@@ -3194,7 +3497,8 @@ fn merge_response_headers_and_trailers(
 /// ボディフレーミング（`Transfer-Encoding: chunked` か無しか）と末尾の空行は、**実際に
 /// ボディデータが来たか**をバックエンドタスクが判定してから付与する（HTTP/3 では HEADERS
 /// 受信時点でボディ有無が確定しないため。例: h3 クライアントが HEADERS と fin を別送する GET は
-/// `more_frames=true` でもボディなし）。`Connection: close` で 1 リクエスト 1 接続。
+/// `more_frames=true` でもボディなし）。B-104: `Connection: close` は付けない（HTTP/1.1 の既定の
+/// キープアライブで上流接続をワーカーのプールへ返して再利用する）。
 fn build_h1_request_head(
     target: &ProxyTarget,
     method: &[u8],
@@ -3234,7 +3538,6 @@ fn build_h1_request_head(
     }
 
     // ボディフレーミングと末尾空行はタスク側で付与する。
-    req.extend_from_slice(b"Connection: close\r\n");
     req
 }
 
@@ -3444,16 +3747,22 @@ fn drive_response_flush(
     }
 
     // 2. 部分送信のボディ断片を flush。
-    if let Some((buf, off)) = ps.body_pending.take() {
-        match send_h3_body(h3, conn, stream_id, &buf, off) {
-            BodySend::Done => did_work = true,
+    if let Some((buf, off, fin)) = ps.body_pending.take() {
+        match send_h3_body(h3, conn, stream_id, &buf, off, fin) {
+            BodySend::Done => {
+                did_work = true;
+                if fin {
+                    ps.resp_fin_sent = true;
+                    return true;
+                }
+            }
             BodySend::Partial(new_off) => {
                 did_work = true; // 一部でも送れたので進捗あり。
-                ps.body_pending = Some((buf, new_off));
+                ps.body_pending = Some((buf, new_off, fin));
                 return did_work;
             }
             BodySend::Blocked => {
-                ps.body_pending = Some((buf, off));
+                ps.body_pending = Some((buf, off, fin));
                 return did_work;
             }
             BodySend::Error => {
@@ -3463,6 +3772,21 @@ fn drive_response_flush(
         }
     }
 
+    // 2b. StreamBlocked で保留した trailers を再送（gRPC。B-97）。
+    #[cfg(feature = "grpc")]
+    if let Some(trailers) = ps.trailers_pending.take() {
+        return match send_h3_trailers(h3, conn, stream_id, &trailers) {
+            HeadSend::Blocked => {
+                ps.trailers_pending = Some(trailers);
+                did_work
+            }
+            HeadSend::Sent | HeadSend::Error => {
+                ps.resp_fin_sent = true;
+                true
+            }
+        };
+    }
+
     // 3. チャネルを排出して送出。
     loop {
         if ps.head_pending.is_some() || ps.body_pending.is_some() {
@@ -3470,10 +3794,16 @@ fn drive_response_flush(
         }
         match ps.resp_rx.try_recv() {
             TryRecv::Item(RespMsg::Head { status, headers }) => {
-                match send_h3_head(h3, conn, stream_id, status, &headers) {
+                // 本文の無い応答（リダイレクト・HEAD 等）は HEADERS に fin を載せる。
+                let fin = ps.resp_rx.is_finished();
+                match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin) {
                     HeadSend::Sent => {
                         ps.resp_started = true;
                         did_work = true;
+                        if fin {
+                            ps.resp_fin_sent = true;
+                            return true;
+                        }
                     }
                     HeadSend::Blocked => {
                         ps.head_pending = Some((status, headers));
@@ -3485,22 +3815,45 @@ fn drive_response_flush(
                     }
                 }
             }
-            TryRecv::Item(RespMsg::Body(b)) => match send_h3_body(h3, conn, stream_id, &b, 0) {
-                BodySend::Done => did_work = true,
-                BodySend::Partial(off) => {
-                    did_work = true;
-                    ps.body_pending = Some((b, off));
-                    return did_work;
+            TryRecv::Item(RespMsg::Body(b)) => {
+                // 最後の断片なら終端を同じ送出へ載せる（空の fin を別途送らない）。
+                let fin = ps.resp_rx.is_finished();
+                match send_h3_body(h3, conn, stream_id, &b, 0, fin) {
+                    BodySend::Done => {
+                        did_work = true;
+                        if fin {
+                            ps.resp_fin_sent = true;
+                            return true;
+                        }
+                    }
+                    BodySend::Partial(off) => {
+                        did_work = true;
+                        ps.body_pending = Some((b, off, fin));
+                        return did_work;
+                    }
+                    BodySend::Blocked => {
+                        ps.body_pending = Some((b, 0, fin));
+                        return did_work;
+                    }
+                    BodySend::Error => {
+                        ps.resp_fin_sent = true;
+                        return true;
+                    }
                 }
-                BodySend::Blocked => {
-                    ps.body_pending = Some((b, 0));
-                    return did_work;
-                }
-                BodySend::Error => {
-                    ps.resp_fin_sent = true;
-                    return true;
-                }
-            },
+            }
+            #[cfg(feature = "grpc")]
+            TryRecv::Item(RespMsg::Trailers(trailers)) => {
+                return match send_h3_trailers(h3, conn, stream_id, &trailers) {
+                    HeadSend::Blocked => {
+                        ps.trailers_pending = Some(trailers);
+                        did_work
+                    }
+                    HeadSend::Sent | HeadSend::Error => {
+                        ps.resp_fin_sent = true;
+                        true
+                    }
+                };
+            }
             TryRecv::Item(RespMsg::Error { status }) => {
                 if !ps.resp_started {
                     send_simple_h3_error(h3, conn, stream_id, status);
@@ -3554,18 +3907,31 @@ fn send_h3_head(
     status: u16,
     headers: &[(Bytes, Bytes)],
 ) -> HeadSend {
+    send_h3_head_fin(h3, conn, stream_id, status, headers, false)
+}
+
+/// レスポンス head を送る。`fin` なら HEADERS でストリームを閉じる（本文の無い応答）。
+fn send_h3_head_fin(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    status: u16,
+    headers: &[(Bytes, Bytes)],
+    fin: bool,
+) -> HeadSend {
     let mut status_buf = itoa::Buffer::new();
     let status_str = status_buf.format(status);
-    let mut h3_headers: Vec<h3::Header> = Vec::with_capacity(headers.len() + 2);
-    h3_headers.push(h3::Header::new(b":status", status_str.as_bytes()));
-    h3_headers.push(h3::Header::new(b"server", b"veil/http3"));
+    // 借用ヘッダ（`HeaderRef`）で渡す（`h3::Header::new` は名前と値を毎回 `Vec` にコピーする）。
+    let mut h3_headers: Vec<h3::HeaderRef<'_>> = Vec::with_capacity(headers.len() + 2);
+    h3_headers.push(h3::HeaderRef::new(b":status", status_str.as_bytes()));
+    h3_headers.push(h3::HeaderRef::new(b"server", b"veil/http3"));
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b":status") || name.eq_ignore_ascii_case(b"server") {
             continue;
         }
-        h3_headers.push(h3::Header::new(name, value));
+        h3_headers.push(h3::HeaderRef::new(name, value));
     }
-    match h3.send_response(conn, stream_id, &h3_headers, false) {
+    match h3.send_response(conn, stream_id, &h3_headers, fin) {
         Ok(()) => HeadSend::Sent,
         Err(h3::Error::StreamBlocked) => HeadSend::Blocked,
         Err(e) => {
@@ -3575,18 +3941,49 @@ fn send_h3_head(
     }
 }
 
-/// ボディ断片を `send_body(fin=false)` で送る（`off` から）。
+/// trailers を `send_additional_headers(is_trailer_section=true, fin=true)` で送る（B-41/B-97）。
+///
+/// `Error` のときは空ボディ + fin でストリームを閉じ、クライアントのハングを防ぐ。
+#[cfg(feature = "grpc")]
+fn send_h3_trailers(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    trailers: &[(Bytes, Bytes)],
+) -> HeadSend {
+    let refs: Vec<h3::HeaderRef<'_>> = trailers
+        .iter()
+        .map(|(n, v)| h3::HeaderRef::new(n, v))
+        .collect();
+    match h3.send_additional_headers(conn, stream_id, &refs, true, true) {
+        Ok(()) => HeadSend::Sent,
+        Err(h3::Error::StreamBlocked) => HeadSend::Blocked,
+        Err(e) => {
+            warn!(
+                "[HTTP/3] gRPC trailers send_additional_headers error: {}",
+                e
+            );
+            if let Err(e2) = h3.send_body(conn, stream_id, &[], true) {
+                debug!("[HTTP/3] gRPC trailers fin fallback error: {:?}", e2);
+            }
+            HeadSend::Error
+        }
+    }
+}
+
+/// ボディ断片を `send_body` で送る（`off` から）。`fin` は最後の断片に終端を載せる。
 fn send_h3_body(
     h3: &mut h3::Connection,
     conn: &mut quiche::Connection,
     stream_id: u64,
     buf: &[u8],
     off: usize,
+    fin: bool,
 ) -> BodySend {
-    if off >= buf.len() {
+    if off >= buf.len() && !fin {
         return BodySend::Done;
     }
-    match h3.send_body(conn, stream_id, &buf[off..], false) {
+    match h3.send_body(conn, stream_id, &buf[off..], fin) {
         Ok(n) => {
             let new_off = off + n;
             if new_off >= buf.len() {
@@ -3661,454 +4058,6 @@ pub struct BackendProxyResult {
     pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-pub(crate) async fn proxy_to_backend_async_with_tls(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    use crate::runtime::handle::AsRawFd;
-    use crate::runtime::tcp::TcpStream;
-
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。この経路は非同期 `connect_str` を
-    // 使うため `unix:` 接頭辞をそのまま扱える。
-    let addr = target.conn_addr();
-    let addr = addr.as_str();
-    debug!("[HTTP/3] Async connecting to backend {}", addr);
-
-    // 非同期TCP接続（タイムアウト付き）
-    let connect_future = TcpStream::connect_str(addr);
-    let backend = match crate::runtime::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connect_future,
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] Async backend connect error: {}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            warn!("[HTTP/3] Async backend connect timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Backend connect timeout",
-            ));
-        }
-    };
-
-    debug!("[HTTP/3] Async connected to backend {}", addr);
-    let _ = backend.set_nodelay(true);
-
-    // TLSバックエンドの場合
-    if target.use_tls {
-        return proxy_to_tls_backend_async(target, request, backend, timeout_secs, tls_insecure)
-            .await;
-    }
-
-    let fd = backend.as_raw_fd();
-
-    // リクエスト送信（非同期）
-    let mut written = 0;
-    while written < request.len() {
-        match write_nonblocking(fd, &request[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Ok(_) => {
-                backend.writable().await?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                backend.writable().await?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    debug!("[HTTP/3] Async request sent: {} bytes", written);
-
-    // レスポンス受信（非同期）
-    let mut response = Vec::with_capacity(16384);
-    let mut buf = vec![0u8; 8192];
-    let read_timeout = Duration::from_secs(timeout_secs);
-    let start_time = std::time::Instant::now();
-
-    loop {
-        if start_time.elapsed() > read_timeout {
-            break;
-        }
-
-        match read_nonblocking(fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = read_timeout.saturating_sub(start_time.elapsed());
-                if remaining.is_zero() {
-                    break;
-                }
-                match crate::runtime::time::timeout(remaining, backend.readable()).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(e)) if response.is_empty() => return Err(e),
-                    _ => break,
-                }
-            }
-            Err(e) if response.is_empty() => return Err(e),
-            Err(_) => break,
-        }
-    }
-
-    debug!("[HTTP/3] Async response received: {} bytes", response.len());
-    parse_http_response(&response)
-}
-
-/// TLSバックエンドへの非同期プロキシ処理（kTLS版）
-/// kTLS/rustlsフォールバック問題を回避するため spawn_blocking で std TLS 接続を使用
-#[cfg(veil_ktls)]
-// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
-#[allow(clippy::disallowed_methods)]
-async fn proxy_to_tls_backend_async(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    tcp_stream: crate::runtime::tcp::TcpStream,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
-    drop(tcp_stream);
-
-    let skip_verify = tls_insecure;
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
-    let addr = target.conn_addr().as_str().to_string();
-    let sni_name = target
-        .sni_name
-        .as_deref()
-        .unwrap_or(&target.host)
-        .to_string();
-
-    use rustls::ClientConfig;
-    use std::sync::Arc;
-
-    let config: Arc<ClientConfig> = if skip_verify {
-        #[derive(Debug)]
-        struct NoVerify;
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &[rustls::pki_types::CertificateDer<'_>],
-                _: &rustls::pki_types::ServerName<'_>,
-                _: &[u8],
-                _: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                crate::tls_provider::provider::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-                    .to_vec()
-            }
-        }
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
-    } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
-    };
-
-    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let result = (|| -> io::Result<BackendProxyResult> {
-            let timeout = Duration::from_secs(timeout_secs);
-            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
-            // 同じ列挙を重複実装しない）。
-            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
-                warn!("[HTTP/3] std backend connect error: {}", e);
-                e
-            })?;
-            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            let mut conn = rustls::ClientConnection::new(config, server_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
-            tls.write_all(&request)?;
-            let mut response = Vec::with_capacity(16384);
-            let mut buf = [0u8; 8192];
-            // UnexpectedEof は TLS close_notify なしの正常な接続終了（HTTP/1.1 バックエンドで一般的）
-            loop {
-                match std::io::Read::read(&mut tls, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            parse_http_response(&response)
-        })();
-        let _ = tx.send(result);
-    });
-
-    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::other("backend thread died"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "backend TLS timeout",
-                    ));
-                }
-                crate::runtime::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-    }
-}
-
-/// TLSバックエンドへの非同期プロキシ処理（non-kTLS）
-/// 別スレッドでブロッキング TLS 通信を行う
-#[cfg(not(veil_ktls))]
-// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
-#[allow(clippy::disallowed_methods)]
-async fn proxy_to_tls_backend_async(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    tcp_stream: crate::runtime::tcp::TcpStream,
-    timeout_secs: u64,
-    tls_insecure: bool,
-) -> io::Result<BackendProxyResult> {
-    use rustls::ClientConfig;
-    use std::sync::Arc;
-
-    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
-    drop(tcp_stream);
-
-    let skip_verify = tls_insecure;
-    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
-    let addr = target.conn_addr().as_str().to_string();
-    let sni_name = target
-        .sni_name
-        .as_deref()
-        .unwrap_or(&target.host)
-        .to_string();
-
-    let config: Arc<ClientConfig> = if skip_verify {
-        #[derive(Debug)]
-        struct NoVerify;
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &[rustls::pki_types::CertificateDer<'_>],
-                _: &rustls::pki_types::ServerName<'_>,
-                _: &[u8],
-                _: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _: &[u8],
-                _: &rustls::pki_types::CertificateDer<'_>,
-                _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                crate::tls_provider::provider::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-                    .to_vec()
-            }
-        }
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
-    } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
-    };
-
-    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let result = (|| -> io::Result<BackendProxyResult> {
-            let timeout = Duration::from_secs(timeout_secs);
-            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
-            // 同じ列挙を重複実装しない）。
-            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
-                warn!("[HTTP/3] std backend connect error: {}", e);
-                e
-            })?;
-            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            let mut conn = rustls::ClientConnection::new(config, server_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
-            tls.write_all(&request)?;
-            let mut response = Vec::with_capacity(16384);
-            // `read_to_end` は rustls の «close_notify なしの EOF» をエラーとして
-            // 伝播させてしまい、HTTP/3 → TLS バックエンドのプロキシが 502 になる
-            // （B-54）。close_notify を送らずに閉じるバックエンドは HTTP/1.1 では
-            // ごく普通なので、kTLS 版と同じく UnexpectedEof は正常終了として扱う。
-            let mut buf = [0u8; 8192];
-            loop {
-                match std::io::Read::read(&mut tls, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            parse_http_response(&response)
-        })();
-        let _ = tx.send(result);
-    });
-
-    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::other("backend thread died"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "backend TLS timeout",
-                    ));
-                }
-                crate::runtime::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-    }
-}
-
-#[inline]
-fn read_nonblocking(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::read(
-            fd as libc::c_int,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len() as _,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
-
-#[inline]
-fn write_nonblocking(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::write(
-            fd as libc::c_int,
-            buf.as_ptr() as *const libc::c_void,
-            buf.len() as _,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
-
-fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
-    let header_end = find_header_end(response)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP response"))?;
-
-    let header_bytes = &response[..header_end];
-    let body = response[header_end + 4..].to_vec();
-    let status_code = parse_status_code(header_bytes).unwrap_or(502);
-
-    let mut headers = Vec::new();
-    if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
-        for line in header_bytes[first_crlf + 1..].split(|&b| b == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(colon_pos) = memchr::memchr(b':', line) {
-                let name = &line[..colon_pos];
-                let value = line[colon_pos + 1..]
-                    .strip_prefix(b" ")
-                    .unwrap_or(&line[colon_pos + 1..]);
-                if !name.eq_ignore_ascii_case(b"connection")
-                    && !name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !name.eq_ignore_ascii_case(b"keep-alive")
-                {
-                    headers.push((name.to_vec(), value.to_vec()));
-                }
-            }
-        }
-    }
-
-    Ok(BackendProxyResult {
-        status_code,
-        body,
-        headers,
-        trailers: Vec::new(),
-    })
-}
-
 /// B-38: HTTP/3 経路で WASM on_response_headers を適用する
 #[cfg(feature = "wasm")]
 async fn apply_h3_wasm_response_headers(
@@ -4166,139 +4115,50 @@ async fn finish_h3_wasm_lifecycle(
     }
 }
 
-/// B-39/B-74: `proxy_to_h2c_backend_async` 用に新規 TCP 接続 + H2C ハンドシェイクを行う。
+/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等。バッファ型）
 ///
-/// プールミス時の新規接続と、プール接続での送信失敗時の再接続の両方から共有する。
-#[cfg(feature = "http2")]
-async fn h3_h2c_connect_and_handshake(
-    addr: &str,
-    timeout_secs: u64,
-) -> io::Result<crate::http2::H2cClient<crate::runtime::tcp::TcpStream>> {
-    use crate::http2::{H2cClient, Http2Settings};
-    use crate::runtime::tcp::TcpStream;
-
-    debug!("[HTTP/3] H2C connecting to backend {}", addr);
-
-    let connect_future = TcpStream::connect_str(addr);
-    let backend = match crate::runtime::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connect_future,
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] H2C backend connect error: {}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            warn!("[HTTP/3] H2C backend connect timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "H2C backend connect timeout",
-            ));
-        }
-    };
-    let _ = backend.set_nodelay(true);
-
-    let settings = Http2Settings::default();
-    let mut client = H2cClient::new(backend, settings);
-
-    if let Err(e) = client.handshake().await {
-        warn!("[HTTP/3] H2C handshake error: {}", e);
-        return Err(io::Error::other(format!("H2C handshake: {}", e)));
-    }
-
-    Ok(client)
-}
-
-/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
-///
-/// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
-///
-/// B-74: `proxy.rs` の `h2_proxy_h2c`（HTTP/2 経路）と同様、`crate::pool::H2C_POOL`
-/// （スレッドローカル）で上流 H2C 接続を再利用する。HTTP/3 のワーカースレッドと
-/// HTTP/2 のワーカースレッドは別スレッドであり、`H2C_POOL` はスレッドローカルなので
-/// 相互に干渉しない（同一スレッド内での再利用のみ）。プールが無かった旧実装は
-/// リクエストごとに TCP 接続 + ハンドシェイクを行い、高負荷時にエフェメラルポートを
-/// 枯渇させて `EADDRNOTAVAIL` を引き起こしていた。
+/// F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）でストリームを開き、
+/// レスポンスヘッダ + ボディ + trailers を返す（旧実装は 1 接続 1 ストリームの直列利用）。
 #[cfg(feature = "http2")]
 async fn proxy_to_h2c_backend_async(
     target: &ProxyTarget,
     method: &[u8],
     path: &[u8],
     headers: &[(Vec<u8>, Vec<u8>)],
-    request_body: &[u8],
+    request_body: &Bytes,
     timeout_secs: u64,
     security: &SecurityConfig,
 ) -> io::Result<BackendProxyResult> {
-    // F-41/B-74/F-170: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック
-    // 整形で排除しつつ、UDS バックエンド（unix:<path>）にも対応する。
+    // F-41/B-74/F-170: スタック整形（UDS バックエンドにも対応）。
     let addr = target.conn_addr();
-    let addr = addr.as_str();
-
-    let from_pool;
-    let mut client = match crate::pool::H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
-        Some(c) => {
-            from_pool = true;
-            c
-        }
-        None => {
-            from_pool = false;
-            h3_h2c_connect_and_handshake(addr, timeout_secs).await?
-        }
-    };
-
-    let body = if request_body.is_empty() {
-        None
-    } else {
-        Some(request_body)
-    };
-    let authority = target.host.as_bytes();
-    // F-166/F-165(A2): 中間 `Vec<(&[u8], &[u8])>` を作らずイテレータを直接渡す
-    // （送信失敗時の再試行のため、同じフィルタ済みイテレータをクロージャで再構築する）。
-    let headers_iter = || headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice()));
-
-    let mut response = crate::runtime::time::timeout(
+    let key = crate::http_utils::PoolKeyStr::plain_addr(addr.as_str());
+    let body = (!request_body.is_empty()).then(|| request_body.clone());
+    let response = crate::http2::upstream_mux::request_h2c_buffered(
+        target,
+        key.as_str(),
+        Duration::from_secs(security.backend_connect_timeout_secs),
+        Duration::from_secs(security.idle_connection_timeout_secs),
         Duration::from_secs(timeout_secs),
-        client.send_request(method, path, authority, headers_iter(), body),
+        method,
+        path,
+        target.host.as_bytes(),
+        headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
+        body,
+        crate::http_utils::is_idempotent_method(method),
     )
-    .await;
-
-    // プール由来の接続は上流に既に切られている可能性がある（B-74）。送信が
-    // 失敗（エラー/タイムアウトいずれも）した場合、新規接続で 1 回だけ再試行する。
-    if from_pool && !matches!(response, Ok(Ok(_))) {
-        if let Ok(fresh) = h3_h2c_connect_and_handshake(addr, timeout_secs).await {
-            client = fresh;
-            response = crate::runtime::time::timeout(
-                Duration::from_secs(timeout_secs),
-                client.send_request(method, path, authority, headers_iter(), body),
-            )
-            .await;
+    .await
+    .map_err(|status| {
+        warn!(
+            "[HTTP/3] H2C request to {} failed: {}",
+            addr.as_str(),
+            status
+        );
+        if status == 504 {
+            io::Error::new(io::ErrorKind::TimedOut, "H2C request timeout")
+        } else {
+            io::Error::other("H2C request failed")
         }
-    }
-
-    let response = match response {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            warn!("[HTTP/3] H2C request error: {}", e);
-            return Err(io::Error::other(format!("H2C request: {}", e)));
-        }
-        Err(_) => {
-            warn!("[HTTP/3] H2C request timeout");
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "H2C request timeout",
-            ));
-        }
-    };
-
-    // 応答が取得できた接続は、再利用可能ならプールへ返却する。
-    if client.is_reusable() {
-        let max_idle = security.max_idle_connections_per_host;
-        let idle_timeout = security.idle_connection_timeout_secs;
-        crate::pool::H2C_POOL.with(|p| p.borrow_mut().put(addr, client, max_idle, idle_timeout));
-    }
+    })?;
 
     debug!(
         "[HTTP/3] H2C response: status={} body_len={} trailers={}",
@@ -4309,9 +4169,7 @@ async fn proxy_to_h2c_backend_async(
 
     Ok(BackendProxyResult {
         status_code: response.status,
-        // `H2cResponse` は F-166/F-165(A4) で `Bytes` 化されている。`BackendProxyResult`
-        // は本タスクの対象範囲外（HTTP/3 経路）のため型は変えず、境界で `Vec<u8>` へ
-        // 変換する（`Bytes` は一意参照なら `Vec::from` がコピー無しで引き取る）。
+        // `BackendProxyResult` は `Vec<u8>` 型（境界で変換。`Bytes` が一意参照ならコピー無し）。
         body: Vec::from(response.body),
         headers: response
             .headers
@@ -4517,6 +4375,9 @@ pub async fn run_http3_server_async(
     let notify = crate::http3_stream::H3Notify::new();
     // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
     let backend_spawner = crate::http3_stream::backend_task_spawner();
+    // B-97: バッファ経路の要求 Future（静的配信・gRPC・Wasm・buffering=full 等）。メインループは
+    // これを await せず、起床したものだけを select のアームと `poll_buffered_once` で進める。
+    let mut buffered_futs = futures::stream::FuturesUnordered::new();
 
     // B-94: サーバ接続 ID 導出鍵（プロセスで 1 個。初回アクセス時に乱数で生成）。
     let cid_key: &hmac::Key = &SERVER_CID_KEY;
@@ -4739,6 +4600,7 @@ pub async fn run_http3_server_async(
                 }
                 let outcome = futures::select_biased! {
                     r = futures::FutureExt::fuse(ms.recv_batch()) => MsOutcome::Batch(r),
+                    _ = futures::FutureExt::fuse(std::future::poll_fn(|cx| poll_buffered_arm(&mut buffered_futs, cx))) => MsOutcome::Notified,
                     _ = futures::FutureExt::fuse(notify.wait()) => MsOutcome::Notified,
                     _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => MsOutcome::Timeout,
                 };
@@ -4814,6 +4676,7 @@ pub async fn run_http3_server_async(
             // フォールバック: POLL_ADD + recvmsg/recvmmsg（F-33/F-115）
             let recv_outcome = futures::select_biased! {
                 r = futures::FutureExt::fuse(socket.recv_gro_async(&mut recv_buf)) => RecvOutcome::Packet(r),
+                _ = futures::FutureExt::fuse(std::future::poll_fn(|cx| poll_buffered_arm(&mut buffered_futs, cx))) => RecvOutcome::Notified,
                 _ = futures::FutureExt::fuse(notify.wait()) => RecvOutcome::Notified,
                 _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
             };
@@ -4941,10 +4804,20 @@ pub async fn run_http3_server_async(
 
                 // HTTP/3 イベント処理
                 if handler.h3_conn.is_some() {
-                    match handler.process_h3_events().await {
+                    match handler.process_h3_events() {
                         Ok(w) => did_work |= w,
                         Err(e) => warn!("[HTTP/3] process_h3_events error: {}", e),
                     }
+                }
+
+                // B-97: 新しいバッファ経路の要求を Future 集合へ移し、その場で 1 回 poll する
+                // （await せずに完了する要求は、直後の drive_proxy_streams で同じイテレーション内に
+                // 送出される）。
+                if !handler.new_buffered.is_empty() {
+                    for (task, headers, body) in handler.new_buffered.drain(..) {
+                        buffered_futs.push(buffered_request_task(task, headers, body));
+                    }
+                    poll_buffered_once(&mut buffered_futs);
                 }
 
                 // F-32: ストリーミングストリームを駆動。バックエンドタスクが生成したレスポンス
@@ -5952,29 +5825,6 @@ pub(crate) fn compress_body_h3(
     body.to_vec()
 }
 
-/// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// HTTPレスポンスからステータスコードをパース
-fn parse_status_code(header: &[u8]) -> Option<u16> {
-    // "HTTP/1.1 200 OK" のような形式
-    let header_str = std::str::from_utf8(header).ok()?;
-    let first_line = header_str.lines().next()?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() >= 2 {
-        parts[1].parse().ok()
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6503,38 +6353,6 @@ mod tests {
             .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
     }
 
-    /// parse_http_response: 正常系と trailers 空
-    #[test]
-    fn test_parse_http_response_basic() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
-        let r = parse_http_response(raw).expect("parse");
-        assert_eq!(r.status_code, 200);
-        assert_eq!(r.body, b"hello");
-        assert!(r.trailers.is_empty());
-        assert!(r
-            .headers
-            .iter()
-            .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type") && v == b"text/plain"));
-    }
-
-    /// parse_http_response: 不正レスポンスは Err
-    #[test]
-    fn test_parse_http_response_invalid() {
-        let raw = b"not-http-at-all";
-        assert!(parse_http_response(raw).is_err());
-    }
-
-    /// find_header_end / parse_status_code
-    #[test]
-    fn test_parse_status_and_header_end() {
-        assert_eq!(find_header_end(b"HTTP/1.1 404 N\r\n\r\n"), Some(14));
-        assert_eq!(
-            parse_status_code(b"HTTP/1.1 502 Bad Gateway\r\n"),
-            Some(502)
-        );
-        assert_eq!(parse_status_code(b"garbage"), None);
-    }
-
     /// B-38: モジュール空ならヘッダをそのまま返す（WASM エンジン不要）
     #[cfg(feature = "wasm")]
     #[test]
@@ -6593,6 +6411,35 @@ mod tests {
             b"application/json".to_vec()
         )]));
         assert!(!header_pairs_indicate_grpc(&[]));
+    }
+
+    /// B-97: 応答ヘッダを 1 回の確保に詰める（`:status` を除き、content-length を足す）。
+    #[test]
+    fn test_b97_pack_resp_headers() {
+        let packed = pack_resp_headers(
+            &[
+                (b":status", b"200"),
+                (b"content-type", b"text/plain"),
+                (b"x-empty", b""),
+            ],
+            Some(1234),
+        );
+        let pairs: Vec<(&[u8], &[u8])> = packed
+            .iter()
+            .map(|(n, v)| (n.as_ref(), v.as_ref()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (&b"content-type"[..], &b"text/plain"[..]),
+                (&b"x-empty"[..], &b""[..]),
+                (&b"content-length"[..], &b"1234"[..]),
+            ]
+        );
+        assert!(pack_resp_headers(&[], None).is_empty());
+        let only_cl = pack_resp_headers(&[], Some(0));
+        assert_eq!(only_cl.len(), 1);
+        assert_eq!(only_cl[0].1.as_ref(), b"0");
     }
 
     /// Http3Handler::is_grpc_request と同等の content-type 判定

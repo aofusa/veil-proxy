@@ -89,6 +89,15 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- HTTP/3 のバッファ経路（静的配信・gRPC・Wasm・`buffering = full` 等）の要求は、メインループで await しない。
+  ワーカーの `FuturesUnordered` に置いて作成直後に 1 回 poll し、応答は `ProxyStream` のチャネルで返す。
+  別タスクとして spawn すると `yield_now` まで走らず応答が 1 イテレーション遅れる（3B で −12%。B-97）。
+- 上流 HTTP/2（h2c・ALPN で h2 を選んだ HTTPS）は `http2::upstream_mux` の多重化接続だけを使う（接続ごとに
+  1 アクター、接続・ストリーム両方のフロー制御。F-174/B-106）。HTTP/1.1 のクライアントは `http2 = "on"` の
+  ときだけ使う（`"auto"` で使うと 3B −12%・54KB −13.5%。F-175）。
+- 上流のホスト名解決は `runtime::dns::resolve`（offload + キャッシュ）。`ToSocketAddrs` は clippy で禁止
+  （起動時・専用スレッド・offload 内だけ理由付き allow。B-107）。
+- レートリミットはプロセス共有のアトミック表で `(ルート, IP)` ごとに数える（thread_local に戻さない。B-31）。
 - HTTP/3 のサーバ接続 ID はクライアントの元 DCID から HMAC で決定的に導出する（乱数にすると Initial の再送・
   複数パケットの ClientHello が届くたびに別接続を `accept` する。B-94）。
 - BSD は上限を超える `SO_RCVBUF`/`SO_SNDBUF` を `ENOBUFS` で拒否して既定値のまま残す（Linux は黙って切り詰める）。
@@ -110,6 +119,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `#[serde(skip)]` フィールドへ解決し、ホットパスは `Arc` clone のみ（F-148/F-159、B-64）。
 - UDS バックエンドの接続先表記は `ProxyTarget::conn_addr()` が唯一の入口（TCP では従来の `host:port` と 1 バイトも
   変えない）。同期プローブは `upstream::connect_probe`（F-170）。
+- 上流のプール接続が応答の前に切れていたら、本文受信済みの冪等な要求だけ新しい接続で 1 回再送する（F-177）。
+  POST 等は再送しない。再送用の複製は要求バッファのプールから取る（`clone()` しない）。
 - 上流のプール接続はアイドル 1ms 以上のものだけ `MSG_PEEK` で生存確認して取り出す（B-93）。閾値を外して毎回確認すると
   プロキシ要求ごとに syscall が 1 本増える。平文は未読データも破棄、TLS は破棄しない（NewSessionTicket が残り得る）。
 
@@ -127,6 +138,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - `[server].tls_only` は既定 `true`。平文 h2c / HTTP/1.1 の計測・テストは `h2c_listen` か `tls_only = false` を使う（F-163/B-80）。
 - `SO_ATTACH_REUSEPORT_CBPF` は classic BPF。使えるのは ancillary ロードのみ（B-76）。
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
+- キープアライブ待ちの接続は読み取りバッファを持たない（readiness を待ってから借りる）。mimalloc の
+  `arena_eager_commit` は `main` 前（`.init_array`）で 0 にする（実行時に設定すると最初のアリーナに効かない。B-101）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
 
 ### プロトコル準拠・サンドボックス
@@ -227,6 +240,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
 | `third_party/wasmtime/` | wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
+| `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.14 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
 | `packaging/` | 配布物のビルド（[packaging/README.md](packaging/README.md)） |
 | `tools/perf/` | nginx 比較の性能計測ハーネス |

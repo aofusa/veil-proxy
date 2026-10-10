@@ -140,8 +140,8 @@ const PROXY_L4_UDP_PORT: u16 = 8447; // L4 UDP プロキシ（セッションテ
 // 同じ条件で cfg しないと、`wasm` を含まない feature 構成で dead_code 警告になる。
 #[cfg(all(feature = "l4-proxy", feature = "wasm"))]
 const PROXY_L4_WASM_PORT: u16 = 8448;
-// http3 を外したビルド（B-62 の `full-netbsd-no-http3`）では参照元が全て消えるため、
-// 近隣の PROXY_L4_WASM_PORT と同じく feature でゲートする。
+// http3 を外したビルドでは参照元が全て消えるため、近隣の PROXY_L4_WASM_PORT と同じく
+// feature でゲートする。
 #[cfg(feature = "http3")]
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
@@ -18585,7 +18585,7 @@ async fn test_http3_rate_limiting() {
     let mut success = 0u32;
     let mut limited = 0u32;
     for i in 0..40 {
-        match send_http3_request(&mut send_request, "GET", "/rate-limited/", &[], None).await {
+        match send_http3_request(&mut send_request, "GET", "/rate-limited-h3/", &[], None).await {
             Ok((status, _)) => match status {
                 200 => success += 1,
                 429 => {
@@ -25431,4 +25431,525 @@ async fn test_e2e_alpn_h2_upstream_regression() {
         "ALPN h2 upstream should forward the backend body: {}",
         resp
     );
+}
+
+/// B-97: HTTP/3 のバッファ経路（`buffering = "full"`）の要求が上流を待っている間も、
+/// 同じ QUIC 接続の他の要求が進む。
+///
+/// 従来はメインループがバッファ経路の要求を await しており、上流の応答待ち（ここでは
+/// echo バックエンドの `x-delay-ms` で 1.5 秒）の間、そのワーカーの全接続が止まっていた。
+/// 同じ接続の 2 本目のストリームを使うので、必ず同じワーカーで処理される。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_b97_http3_buffered_request_does_not_block_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+
+    let mut slow_sr = send_request.clone();
+    let slow = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let r = send_http3_request_full(
+            &mut slow_sr,
+            "GET",
+            "/echo-full/b97-slow",
+            &[("x-delay-ms", "1500")],
+            None,
+        )
+        .await
+        .map(|r| r.status)
+        .map_err(|e| e.to_string());
+        (r, started.elapsed())
+    });
+    // 遅い要求が上流で待ちに入ってから速い要求を出す。
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut fast_sr = send_request.clone();
+    let started = std::time::Instant::now();
+    let fast = send_http3_request_full(&mut fast_sr, "GET", "/echo-full/b97-fast", &[], None)
+        .await
+        .expect("fast HTTP/3 request");
+    let fast_elapsed = started.elapsed();
+    assert_eq!(fast.status, 200);
+
+    let (slow_status, slow_elapsed) = slow.await.expect("slow task");
+    assert_eq!(slow_status.expect("slow HTTP/3 request"), 200);
+    assert!(
+        slow_elapsed >= std::time::Duration::from_millis(1400),
+        "slow request should wait for the delayed upstream: {:?}",
+        slow_elapsed
+    );
+    assert!(
+        fast_elapsed < std::time::Duration::from_millis(1000),
+        "fast request on the same connection must not wait for the slow buffered request: {:?}",
+        fast_elapsed
+    );
+}
+
+/// B-104: HTTP/3 で受けた要求の上流接続がプールで再利用されること（平文・TLS）。
+///
+/// echo バックエンドは接続ごとの通し番号を `x-backend-conn-id` で返す。同じ QUIC 接続
+/// （＝同じ HTTP/3 ワーカー）から順に送った要求は、同じ上流接続で処理されるはず。
+/// 従来は 1 要求 1 接続（`Connection: close`）で、毎回番号が変わっていた。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_b104_http3_reuses_upstream_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    for prefix in ["/echo-upload", "/echo-upload-tls"] {
+        let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+            .await
+            .expect("HTTP/3 connect");
+        let mut ids = std::collections::BTreeSet::new();
+        for i in 0..6 {
+            let path = format!("{}/b104-{}", prefix, i);
+            let resp = send_http3_request_full(&mut send_request, "GET", &path, &[], None)
+                .await
+                .unwrap_or_else(|e| panic!("GET {} failed: {}", path, e));
+            assert_eq!(resp.status, 200, "GET {}", path);
+            let id = resp
+                .header("x-backend-conn-id")
+                .unwrap_or_else(|| panic!("{}: x-backend-conn-id missing", path))
+                .to_string();
+            ids.insert(id);
+        }
+        // 他の HTTP/3 テスト（test_b104_http3_head_on_keepalive_upstream 等）が同じ上流へ
+        // 並行に要求すると、その間はプールの接続が貸し出し中で 2 本目が正当に開く。
+        // 1 要求 1 接続（B-104 以前）なら 6 本になるので、半分以下なら再利用できている。
+        assert!(
+            ids.len() <= 3,
+            "{}: sequential HTTP/3 requests must reuse upstream connections, got {:?}",
+            prefix,
+            ids
+        );
+    }
+}
+
+/// B-104: HEAD への応答は Content-Length があっても本文を読まない（キープアライブの上流は
+/// 閉じないため、読みに行くとタイムアウトまで止まる）。続く GET も同じ接続で通ること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_b104_http3_head_on_keepalive_upstream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let started = std::time::Instant::now();
+    let head = send_http3_request_full(
+        &mut send_request,
+        "HEAD",
+        "/echo-head-ka/b104-head",
+        &[],
+        None,
+    )
+    .await
+    .expect("HEAD");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty(), "HEAD must not carry a body");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "HEAD must not wait for a body that never comes ({:?})",
+        started.elapsed()
+    );
+    let get = send_http3_request_full(
+        &mut send_request,
+        "GET",
+        "/echo-head-ka/b104-after-head",
+        &[],
+        None,
+    )
+    .await
+    .expect("GET after HEAD");
+    assert_eq!(get.status, 200);
+    assert_eq!(
+        head.header("x-backend-conn-id"),
+        get.header("x-backend-conn-id"),
+        "the connection used for HEAD must be reusable"
+    );
+}
+
+/// B-106 / F-174: 上流 HTTP/2 のフロー制御。接続ウィンドウ（tonic/hyper の既定 1MB）を超える
+/// gRPC 要求（1.5MB）を HTTP/2 で受けて h2c 上流へ中継しても、WINDOW_UPDATE を待って送り切る。
+///
+/// 旧 `H2cClient` は接続ウィンドウを超えると待たずに "Send window exhausted" で失敗し、
+/// ストリーム単位のウィンドウは見ていなかった。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+async fn test_b106_grpc_large_request_respects_upstream_flow_control() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    // SimpleRequest { message = "x" * N }（field 1, wire type 2, varint 長）
+    const N: usize = 1536 * 1024;
+    let mut msg = vec![0x0a];
+    let mut len = N;
+    while len >= 0x80 {
+        msg.push((len as u8 & 0x7f) | 0x80);
+        len >>= 7;
+    }
+    msg.push(len as u8);
+    msg.extend(std::iter::repeat_n(b'x', N));
+    let lpm = encode_grpc_lpm(&msg);
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("x-user-id", "b106"),
+    ];
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&lpm),
+        )
+        .await
+        .expect("large gRPC request");
+    assert_eq!(resp.status, 200, "headers={:?}", resp.headers);
+    assert_eq!(
+        resp.grpc_status(),
+        Some(0),
+        "headers={:?} trailers={:?}",
+        resp.headers,
+        resp.trailers
+    );
+    let frames = decode_all_grpc_frames(&resp.body);
+    assert_eq!(frames.len(), 1);
+    assert!(
+        frames[0].data.len() >= N,
+        "echoed message must be complete: {} bytes",
+        frames[0].data.len()
+    );
+}
+
+/// F-171: HTTP/3 → h2c 上流の全二重中継。双方向ストリーミング gRPC で、要求ストリームを
+/// 閉じる前に 1 通目の応答メッセージが届く（旧実装は要求本文を全部受けてから上流へ送るため、
+/// 要求を閉じるまで何も返らずタイムアウトする）。続けて 2 通目を送り、閉じたあとに
+/// grpc-status 0 のトレーラーで終わる。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "http3", feature = "grpc", feature = "http2"))]
+async fn test_f171_http3_grpc_bidi_streaming_is_full_duplex() {
+    use bytes::Buf;
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://localhost/grpc.test.v1.TestService/BidirectionalStreaming")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(req).await.expect("open stream");
+
+    // 1 通目を送り、要求を閉じずに応答を待つ。
+    stream
+        .send_data(bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request(
+            "first",
+        ))))
+        .await
+        .expect("send first");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_response())
+        .await
+        .expect("response head must arrive before the request stream is finished")
+        .expect("recv_response");
+    assert_eq!(resp.status(), 200);
+
+    let mut buf: Vec<u8> = Vec::new();
+    // LPM 1 通ぶん（5 バイトのヘッダ + 本体）が揃うまで読む。
+    async fn read_one<S: h3::quic::RecvStream>(
+        stream: &mut h3::client::RequestStream<S, bytes::Bytes>,
+        buf: &mut Vec<u8>,
+    ) -> Vec<u8> {
+        loop {
+            if buf.len() >= 5 {
+                let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if buf.len() >= 5 + len {
+                    let msg = buf[5..5 + len].to_vec();
+                    buf.drain(..5 + len);
+                    return msg;
+                }
+            }
+            let mut chunk =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_data())
+                    .await
+                    .expect("echoed message must arrive while the request stream is open")
+                    .expect("recv_data")
+                    .expect("response ended early");
+            while chunk.has_remaining() {
+                let c = chunk.chunk().to_vec();
+                chunk.advance(c.len());
+                buf.extend_from_slice(&c);
+            }
+        }
+    }
+    let first = read_one(&mut stream, &mut buf).await;
+    assert!(
+        first.ends_with(b"first"),
+        "first echo: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    stream
+        .send_data(bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request(
+            "second",
+        ))))
+        .await
+        .expect("send second");
+    let second = read_one(&mut stream, &mut buf).await;
+    assert!(second.ends_with(b"second"));
+
+    stream.finish().await.expect("finish request");
+    while let Some(mut rest) = stream.recv_data().await.expect("recv tail") {
+        rest.advance(rest.remaining());
+    }
+    let trailers = stream
+        .recv_trailers()
+        .await
+        .expect("recv_trailers")
+        .expect("grpc trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
+        Some("0"),
+        "trailers={:?}",
+        trailers
+    );
+}
+
+/// F-171: HTTP/2 → h2c 上流の全二重中継（HTTP/3 版と同じ確認を HTTP/2 で行う）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+async fn test_f171_http2_grpc_bidi_streaming_is_full_duplex() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    let mut sender = client.raw_sender().ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://127.0.0.1/grpc.test.v1.TestService/BidirectionalStreaming")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let (resp_fut, mut send) = sender.send_request(req, false).expect("open stream");
+    send.send_data(
+        bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request("first"))),
+        false,
+    )
+    .expect("send first");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp_fut)
+        .await
+        .expect("response head must arrive before the request stream is finished")
+        .expect("response");
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+
+    let mut buf: Vec<u8> = Vec::new();
+    async fn read_one(body: &mut h2::RecvStream, buf: &mut Vec<u8>) -> Vec<u8> {
+        loop {
+            if buf.len() >= 5 {
+                let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if buf.len() >= 5 + len {
+                    let msg = buf[5..5 + len].to_vec();
+                    buf.drain(..5 + len);
+                    return msg;
+                }
+            }
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.data())
+                .await
+                .expect("echoed message must arrive while the request stream is open")
+                .expect("response ended early")
+                .expect("data");
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    let first = read_one(&mut body, &mut buf).await;
+    assert!(first.ends_with(b"first"));
+
+    send.send_data(
+        bytes::Bytes::from(encode_grpc_lpm(&encode_simple_request("second"))),
+        true,
+    )
+    .expect("send second");
+    let second = read_one(&mut body, &mut buf).await;
+    assert!(second.ends_with(b"second"));
+
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("tail");
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    let trailers = body
+        .trailers()
+        .await
+        .expect("trailers")
+        .expect("grpc trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
+        Some("0")
+    );
+}
+
+// ====================
+// F-175: 上流 HTTPS の HTTP/2（ALPN）
+// ====================
+
+/// F-175: `http2 = "on"` の HTTPS 上流（ALPN で h2 を選ぶ veil）へ、HTTP/1.1 で受けた要求を
+/// HTTP/2 で中継できる。"on" は上流が h2 を選ばなければ 502 なので、200 なら h2 で話している。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_f175_https_upstream_h2_from_http1_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    for path in ["/alpn-h2-on/", "/alpn-h2-off/", "/alpn-h2/"] {
+        for _ in 0..3 {
+            let resp = send_request(PROXY_PORT, path, &[])
+                .await
+                .unwrap_or_else(|| panic!("{} should respond", path));
+            assert_eq!(get_status_code(&resp), Some(200), "{}: {}", path, resp);
+            assert!(resp.contains("H2C Backend"), "{}: {}", path, resp);
+        }
+    }
+}
+
+/// F-175: HTTP/2・HTTP/3 で受けた要求も `http2 = "on"` の HTTPS 上流へ HTTP/2 で中継できる。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http2", feature = "http3"))]
+async fn test_f175_https_upstream_h2_from_h2_and_h3_clients() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client");
+    for _ in 0..3 {
+        let (status, body) = h2
+            .send_request("GET", "/alpn-h2-on/", &[], None)
+            .await
+            .expect("HTTP/2 request");
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("H2C Backend"));
+    }
+
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    for _ in 0..3 {
+        let resp = send_http3_request_full(&mut send_request, "GET", "/alpn-h2-on/", &[], None)
+            .await
+            .expect("HTTP/3 request");
+        assert_eq!(resp.status, 200);
+        assert!(String::from_utf8_lossy(&resp.body).contains("H2C Backend"));
+    }
+}
+
+/// F-175: HTTP/2 を話さない HTTPS 上流に `http2 = "on"` を指定すると 502 になる
+/// （"auto" なら HTTP/1.1 に切り替える。既存の HTTPS 上流の E2E がその経路を通る）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_f175_http2_on_rejects_http1_only_upstream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let resp = send_request(PROXY_PORT, "/h1-only-h2-on/", &[])
+        .await
+        .expect("should respond");
+    assert_eq!(get_status_code(&resp), Some(502), "{}", resp);
+}
+
+/// F-177: プールへ戻した上流接続が次の要求の前に切れていても（上流が `Connection: close` を付けずに
+/// 応答直後に閉じる）、冪等な要求は新しい接続で 1 回だけ再送されて 200 になる。
+///
+/// B-93 の生存確認はアイドル 1ms 未満の接続を省くため、同じクライアント接続から間を空けずに
+/// 続けて送ると、死んだ接続を引いて応答前に EOF になる。旧実装はその要求が 502 になっていた。
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_f177_idempotent_retry_on_dead_pooled_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connector = tokio_rustls::TlsConnector::from(create_client_config());
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", PROXY_PORT))
+        .await
+        .expect("TCP connect");
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("TLS connect");
+    let req = b"GET /echo-upload/f177 HTTP/1.1\r\nHost: localhost\r\nx-close-silently: 1\r\n\r\n";
+    for i in 0..30 {
+        stream.write_all(req).await.expect("write");
+        // 応答 1 つぶん（ヘッダ + Content-Length 0）を読む。
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp))
+                .await
+                .expect("response in time")
+                .expect("read");
+            assert!(n > 0, "connection closed at request {}", i);
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        assert!(head.starts_with("HTTP/1.1 200"), "request {}: {}", i, head);
+    }
 }

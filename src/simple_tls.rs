@@ -149,12 +149,21 @@ impl SimpleTlsServerStream {
     /// 復号済みの平文が残っていれば即座に返る。rustls 内部の平文は `read()` が毎回
     /// `drained_buffer` へ排出しているため、2 回目以降のリクエスト待ちでは
     /// `drained_buffer` だけを見ればよい（接続直後の 1 回目には使わないこと）。
-    #[cfg(veil_poller_kqueue)]
+    ///
+    /// B-101: 全バックエンドで使う（以前は kqueue 限定）。待ってから読み取りバッファを借りる
+    /// ことで、アイドルなキープアライブ接続が 64KB のバッファを抱え続けないようにする。
     pub async fn wait_next_request(&self) -> io::Result<()> {
         if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
             return Ok(());
         }
-        self.inner.readable_lazy().await
+        #[cfg(veil_poller_kqueue)]
+        {
+            self.inner.readable_lazy().await
+        }
+        #[cfg(not(veil_poller_kqueue))]
+        {
+            self.inner.readable().await
+        }
     }
 
     pub fn get_ref(&self) -> &TcpStream {
@@ -261,7 +270,22 @@ pub struct SimpleTlsClientStream {
     drained_buffer: Vec<u8>,
 }
 
+impl crate::runtime::io::BufferedReadState for SimpleTlsClientStream {
+    /// 復号済みで未消費の平文（ドレインバッファ）を保持していれば `true`（F-175: 上流 HTTP/2
+    /// アクターの可読待機前チェック）。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        !self.drained_buffer.is_empty()
+    }
+}
+
 impl SimpleTlsClientStream {
+    /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
+    #[inline]
+    pub fn negotiated_h2(&self) -> bool {
+        self.conn.alpn_protocol() == Some(b"h2")
+    }
+
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
     }

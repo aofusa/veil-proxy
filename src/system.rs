@@ -85,6 +85,37 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
     }
 }
 
+/// mimalloc のアリーナを予約時に一括コミットしない（B-101）。
+///
+/// 既定（`arena_eager_commit = 2`: overcommit 環境で一括コミット）では、
+/// 解放済みページが purge で decommit されず、アイドル時でも約 25MB の匿名メモリが
+/// RSS に残る。0 にするとアイドル RSS が約 11MB まで下がる（スループット差なし）。
+/// 最初のアリーナは最初の Rust アロケーションで作られるため、`main` より前
+/// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` が
+/// 明示されていればそちらを優先する。
+#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+mod mimalloc_early_options {
+    // libmimalloc-sys は mi_option_arena_eager_commit の定数を公開していない。
+    // mimalloc v2 の mi_option_e における列挙順（show_errors=0, show_stats=1,
+    // verbose=2, eager_commit=3, arena_eager_commit=4）。
+    const MI_OPTION_ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+
+    extern "C" fn set_arena_eager_commit() {
+        // main 前なので std::env（アロケーションする）は使わず libc::getenv で見る
+        // SAFETY: NUL 終端の静的文字列。init_array 実行時点ではスレッドは 1 本で環境変数は不変。
+        let preset = unsafe { libc::getenv(c"MIMALLOC_ARENA_EAGER_COMMIT".as_ptr()) };
+        if preset.is_null() {
+            // SAFETY: mi_option_set はオプション値を書き換えるだけで、初期化前でも呼べる。
+            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0) };
+        }
+    }
+
+    // `.init_array` の関数は Rust ランタイム初期化（最初のアロケーション）より前に呼ばれる。
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static SET_ARENA_EAGER_COMMIT: extern "C" fn() = set_arena_eager_commit;
+}
+
 /// mimalloc の Large OS Pages 設定を有効化し、状態をログ出力
 ///
 /// Huge Pagesが利用可能な場合は有効化し、
@@ -380,13 +411,61 @@ pub(crate) fn get_gid_by_name(groupname: &str) -> Option<u32> {
     }
 }
 
-/// 権限降格を実行
+/// 降格先の利用者・グループ（名前と ID）。
+///
+/// 名前の解決（`getpwnam`/`getgrnam` = `/etc/passwd`・`/etc/group` の参照）は、chroot
+/// （NetBSD の `chroot_dir`）やサンドボックスの適用**前**に [`resolve_privilege_ids`] で済ませる。
+/// chroot 後に解決すると、chroot 内に `/etc/group` が無い限り「Group not found」で降格に
+/// 失敗する（F-176 の NetBSD サンドボックス E2E で発見）。
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct PrivilegeIds {
+    group: Option<(String, libc::gid_t)>,
+    user: Option<(String, libc::uid_t)>,
+}
+
+/// 降格先の名前を ID へ解決する。root でなければ降格しないので何もしない。
+#[cfg(unix)]
+pub(crate) fn resolve_privilege_ids(
+    security: &crate::GlobalSecurityConfig,
+) -> io::Result<PrivilegeIds> {
+    if unsafe { libc::getuid() } != 0 {
+        return Ok(PrivilegeIds::default());
+    }
+    let group = match security.drop_privileges_group.as_deref() {
+        Some(name) => Some((
+            name.to_string(),
+            get_gid_by_name(name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Group '{}' not found", name),
+                )
+            })?,
+        )),
+        None => None,
+    };
+    let user = match security.drop_privileges_user.as_deref() {
+        Some(name) => Some((
+            name.to_string(),
+            get_uid_by_name(name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("User '{}' not found", name),
+                )
+            })?,
+        )),
+        None => None,
+    };
+    Ok(PrivilegeIds { group, user })
+}
+
+/// 権限降格を実行（[`resolve_privilege_ids`] で解決済みの ID を使う）
 ///
 /// グループ→ユーザーの順で降格する（逆順では失敗する可能性あり）。
-/// `setgid`/`setgroups`/`setuid` は POSIX のため Linux/FreeBSD/OpenBSD 共通で動作する
+/// `setgid`/`setgroups`/`setuid` は POSIX のため Linux/FreeBSD/OpenBSD/NetBSD 共通で動作する
 /// （F-120 Phase 4 で Linux 限定 cfg とスタブを撤去）。
 #[cfg(unix)]
-pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Result<()> {
+pub(crate) fn drop_privileges(ids: &PrivilegeIds) -> io::Result<()> {
     // rootでない場合は何もしない
     if unsafe { libc::getuid() } != 0 {
         info!("Not running as root, skipping privilege drop");
@@ -394,14 +473,7 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
     }
 
     // グループ降格（先に行う）
-    if let Some(ref group_name) = security.drop_privileges_group {
-        let gid = get_gid_by_name(group_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Group '{}' not found", group_name),
-            )
-        })?;
-
+    if let Some((ref group_name, gid)) = ids.group {
         if unsafe { libc::setgid(gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -418,14 +490,7 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
     }
 
     // ユーザー降格
-    if let Some(ref user_name) = security.drop_privileges_user {
-        let uid = get_uid_by_name(user_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("User '{}' not found", user_name),
-            )
-        })?;
-
+    if let Some((ref user_name, uid)) = ids.user {
         if unsafe { libc::setuid(uid) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -434,7 +499,7 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
     }
 
     // 降格成功の確認
-    if security.drop_privileges_user.is_some() || security.drop_privileges_group.is_some() {
+    if ids.user.is_some() || ids.group.is_some() {
         let current_uid = unsafe { libc::getuid() };
         let current_gid = unsafe { libc::getgid() };
         info!(
@@ -443,7 +508,7 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
         );
 
         // rootに戻れないことを確認
-        if security.drop_privileges_user.is_some() && unsafe { libc::setuid(0) } == 0 {
+        if ids.user.is_some() && unsafe { libc::setuid(0) } == 0 {
             warn!("WARNING: Process can still regain root privileges!");
         }
     }
@@ -454,9 +519,25 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
 /// Windows には POSIX の uid/gid モデルが無いため、`drop_privileges_user`/
 /// `drop_privileges_group` 設定は無視して警告のみ出す（best-effort。実機検証不可のため
 /// 保守的に no-op とする。将来的には制限付きトークン/AppContainer での実装が課題）。
+/// Windows では降格先を持たない（設定があれば `drop_privileges` が警告する）。
 #[cfg(windows)]
-pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Result<()> {
-    if security.drop_privileges_user.is_some() || security.drop_privileges_group.is_some() {
+pub(crate) struct PrivilegeIds {
+    requested: bool,
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_privilege_ids(
+    security: &crate::GlobalSecurityConfig,
+) -> io::Result<PrivilegeIds> {
+    Ok(PrivilegeIds {
+        requested: security.drop_privileges_user.is_some()
+            || security.drop_privileges_group.is_some(),
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn drop_privileges(ids: &PrivilegeIds) -> io::Result<()> {
+    if ids.requested {
         warn!(
             "drop_privileges_user/drop_privileges_group are not supported on Windows \
              (no POSIX uid/gid model); ignoring"

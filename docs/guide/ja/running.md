@@ -154,6 +154,8 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 
 > **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/veil/config.toml`）が使用されます。
 
+> **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: `cap_enter` 後はパスを開けないため設定ファイルを再読込できず、SIGHUP は `Failed to reload configuration: Not permitted in capability mode` を記録して以前の設定を維持します。TLS 証明書は `[tls] auto_reload = true` なら `cap_enter` 前に開いたディレクトリ fd 経由で読むため、SIGHUP・mtime 監視のどちらでもリロードされます（F-136）。それ以外の設定変更は再起動で反映してください。
+
 ```bash
 # 設定ファイルを編集
 vim examples/config.toml

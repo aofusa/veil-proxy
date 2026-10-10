@@ -183,6 +183,18 @@ impl<T> Sender<T> {
         s.queue.len() >= s.cap
     }
 
+    /// 容量に空きがある（または受信端が閉じた）なら `Ready`。満杯なら `cx` の Waker を登録して
+    /// `Pending`（受信側が 1 つ取り出すと起こされる）。送信はしない。
+    pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut s = self.sh.borrow_mut();
+        if s.receiver_closed || s.queue.len() < s.cap {
+            Poll::Ready(())
+        } else {
+            s.send_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
     /// 容量が空くまで待ってから送信する。受信端が閉じていれば `Err(SendClosed)`。
     pub async fn send(&self, item: T) -> Result<(), SendClosed> {
         let mut item = Some(item);
@@ -245,28 +257,41 @@ impl<T> Receiver<T> {
         TryRecv::Item(item.unwrap())
     }
 
+    /// 送信端が閉じていて、キューに残りが無いか（= 次の `try_recv` は `Closed`）。
+    ///
+    /// 最後の断片を送るときに終端（fin / END_STREAM）を同じ送出へ載せるための先読みに使う。
+    pub fn is_finished(&self) -> bool {
+        let s = self.sh.borrow();
+        s.sender_closed && s.queue.is_empty()
+    }
+
     /// アイテムが来るまで待つ。送信端が閉じてキューも空なら `None`。
     pub async fn recv(&self) -> Option<T> {
-        poll_fn(|cx: &mut Context<'_>| {
-            let (item, waker) = {
-                let mut s = self.sh.borrow_mut();
-                match s.queue.pop_front() {
-                    Some(x) => (x, s.send_waker.take()),
-                    None => {
-                        if s.sender_closed {
-                            return Poll::Ready(None);
-                        }
-                        s.recv_waker = Some(cx.waker().clone());
-                        return Poll::Pending;
+        poll_fn(|cx: &mut Context<'_>| self.poll_recv(cx)).await
+    }
+
+    /// [`recv`](Self::recv) の poll 版。空なら `cx` の Waker を登録して `Pending`。
+    ///
+    /// 複数のチャネルと他の I/O をまとめて 1 つの `poll_fn` で待つ側（F-174 の上流
+    /// HTTP/2 アクター）が使う。
+    pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let (item, waker) = {
+            let mut s = self.sh.borrow_mut();
+            match s.queue.pop_front() {
+                Some(x) => (x, s.send_waker.take()),
+                None => {
+                    if s.sender_closed {
+                        return Poll::Ready(None);
                     }
+                    s.recv_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
                 }
-            };
-            if let Some(w) = waker {
-                w.wake();
             }
-            Poll::Ready(Some(item))
-        })
-        .await
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Poll::Ready(Some(item))
     }
 }
 

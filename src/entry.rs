@@ -189,7 +189,8 @@ pub fn run() {
     //   コンテナ既定 soft 1024 を超えるため。ワーカー起動・seccomp 適用より前に実行）
     crate::system::raise_nofile_limit();
 
-    #[cfg(feature = "http3")]
+    // http3: 証明書世代の初期化で、NetBSD: chroot 後のルート再解決で書き換える。
+    #[cfg(any(feature = "http3", target_os = "netbsd"))]
     let mut loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -197,7 +198,7 @@ pub fn run() {
             return;
         }
     };
-    #[cfg(not(feature = "http3"))]
+    #[cfg(not(any(feature = "http3", target_os = "netbsd")))]
     let loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -244,6 +245,16 @@ pub fn run() {
         warn!("jail_name is set but this build does not target FreeBSD; ignoring");
     }
 
+    // 降格先の利用者・グループ名は chroot・サンドボックスの前に ID へ解決しておく
+    // （chroot 後は /etc/passwd・/etc/group を読めない。F-176）。
+    let privilege_ids = match crate::system::resolve_privilege_ids(&loaded_config.global_security) {
+        Ok(ids) => ids,
+        Err(e) => {
+            error!("Failed to drop privileges: {}", e);
+            return;
+        }
+    };
+
     // NetBSD: chroot(2)（F-140、オプトイン、root 前提）。
     //
     // NetBSD には pledge/unveil 相当のランタイム API が無いため
@@ -257,7 +268,14 @@ pub fn run() {
         crate::security::netbsd::report_security_support();
         if let Some(dir) = loaded_config.global_security.chroot_dir.as_deref() {
             match crate::security::netbsd::chroot_to(std::path::Path::new(dir)) {
-                Ok(()) => info!("netbsd: chroot applied to \"{}\"", dir),
+                Ok(()) => {
+                    info!("netbsd: chroot applied to \"{}\"", dir);
+                    // 静的配信のベースパスを新しいルート基準で解決し直す（F-176）。
+                    loaded_config.route = crate::config::reresolve_routes_after_chroot(
+                        &loaded_config.route,
+                        &loaded_config.upstream_groups,
+                    );
+                }
                 Err(e) => {
                     error!("netbsd: chroot(\"{}\") failed: {}", dir, e);
                     if !loaded_config.global_security.allow_security_failures {
@@ -665,7 +683,7 @@ pub fn run() {
     // 注意: 特権ポート（1024未満）を使用する場合は、
     // CAP_NET_BIND_SERVICEケイパビリティを付与するか、
     // 権限降格を無効にする必要があります。
-    if let Err(e) = drop_privileges(&loaded_config.global_security) {
+    if let Err(e) = drop_privileges(&privilege_ids) {
         error!("Failed to drop privileges: {}", e);
         return;
     }

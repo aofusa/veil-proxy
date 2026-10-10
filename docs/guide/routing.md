@@ -348,9 +348,28 @@ type = "Proxy"
 url = "https://backend.example.com"
 ```
 
-Veil always speaks HTTP/1.1 to backends over TLS (`https://`): it does not offer `h2` in
-the upstream ALPN, so an HTTPS backend never negotiates HTTP/2 with it. HTTP/2 backends
-over TLS are not supported; a plaintext HTTP/2 backend is reached via `use_h2c` below.
+**HTTP/2 to HTTPS backends (F-175)**: the `http2` option controls the upstream ALPN for
+`https://` backends. It can be set on `[upstreams.X]` (group default), on a server entry
+(`{ url = "https://...", http2 = "off" }`) or on a route's `url = "https://..."` action.
+
+| `http2` | Behavior |
+|---------|----------|
+| `"auto"` (default) | Offer `h2, http/1.1` (for requests from HTTP/2 and HTTP/3 clients; see below). If the backend picks `h2`, requests go over a **multiplexed** HTTP/2 connection (F-174: many requests share one connection, both flow-control windows honored); if it picks `http/1.1`, the negotiated connection is used for HTTP/1.1 and the worker remembers the choice for 5 minutes (new connections then offer only `http/1.1`) |
+| `"on"` | Require HTTP/2; a backend that does not pick `h2` gets a 502 |
+| `"off"` | Offer only `http/1.1` (the v0.7 behavior) |
+
+With `"auto"`, requests received over **HTTP/2 and HTTP/3** use the backend's HTTP/2 (full-duplex,
+so gRPC streaming works; measured +80% / +55% for 3-byte responses from HTTP/2 / HTTP/3 clients
+against nginx). Requests received over **HTTP/1.1** keep HTTP/1.1 to the backend under `"auto"`:
+each client connection already has its own pooled backend connection, so going through the
+multiplexed connection only adds a hop (measured −12% at 3 B, −13.5% at 54 KB). With `"on"` they use
+HTTP/2 too: this applies to requests whose body has been fully received (no body, or a
+`Content-Length` body already read), and the response is streamed back (`Transfer-Encoding: chunked`
+unless the backend sent `content-length`). Requests still uploading a body, WASM-filtered routes and
+routes with `buffering` stay on HTTP/1.1. Response
+compression is applied the same way as for HTTP/1.1 backends (gRPC is never compressed). Use
+`http2 = "off"` for backends whose HTTP/2 implementation you do not trust or that serve very large
+responses that should not share one TCP connection.
 
 ### H2C (HTTP/2 over cleartext) Proxy
 
@@ -377,7 +396,7 @@ use_h2c = true
 - Leverage HTTP/2 multiplexing and header compression for backend communication
 - Uses Prior Knowledge mode (not via Upgrade)
 
-**H2C Backend Connection Pooling (F-106)**: H2C backend connections are pooled and reused across requests (thread-local `H2C_POOL`, keyed by backend `host:port`), just like the HTTP/1.1/HTTPS pools. Successive requests over the same worker skip the per-request TCP connect **and** the H2C handshake (connection preface + SETTINGS exchange), reusing the connection with monotonically increasing stream IDs. Idle connections expire via `idle_connection_timeout_secs` (and are capped by `max_idle_connections_per_host`); a stale pooled connection that fails on first use is transparently retried once on a fresh connection. This is what makes gRPC relaying (`client → veil (TLS h2) → backend (h2c)`) avoid a fresh handshake per call.
+**H2C Backend Connection Multiplexing (F-174)**: each worker keeps a pool of upstream HTTP/2 connections keyed by backend address, and **many requests share one connection concurrently** (one actor task per connection writes HEADERS/DATA and dispatches received frames to per-stream channels). A new connection is opened only when every pooled connection has reached the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` or received GOAWAY. Request bodies respect both the connection and the stream flow-control windows (B-106), and received DATA is acknowledged with WINDOW_UPDATE only after the downstream has consumed it. A connection with no streams is closed with GOAWAY after `idle_connection_timeout_secs` (`0` disables pooling); the actor notices an upstream close immediately, so stale connections are not handed out. Streams refused by the upstream (REFUSED_STREAM, or above GOAWAY's `last_stream_id`) and idempotent requests that fail before the response head are retried once on a fresh stream. This is what makes gRPC relaying (`client → veil (TLS h2/h3) → backend (h2c)`) avoid a handshake per call and per-call upstream connections.
 
 > **Note**: H2C cannot be used with HTTPS backends (TLS connections). Use only in environments where TLS is not required, such as gRPC communication within internal networks.
 
@@ -787,7 +806,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `client_body_timeout_secs` | Client body receive timeout | 30s |
 | | `backend_connect_timeout_secs` | Backend connection timeout | 10s |
 | Access Control | `allowed_methods` | Allowed HTTP methods (array) | all allowed |
-| | `rate_limit_requests_per_min` | Request limit per minute | 0 (unlimited) |
+| | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
 | | `allowed_ips` | Allowed IP/CIDR (array) | all allowed |
 | | `denied_ips` | Denied IP/CIDR (array, takes priority) | none |
 | Connection Pool | `max_idle_connections_per_host` | Max idle connections per host | 256 |

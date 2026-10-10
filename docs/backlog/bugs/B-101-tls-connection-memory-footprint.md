@@ -1,5 +1,7 @@
 # B-101: 同時 TLS 接続あたりのメモリが大きく、64MB 以下のコンテナで OOM kill される
 
+**ステータス: 完了（feat/v080-limitations）**
+
 ## 事象
 
 `tools/container_security` の `resource_exhaustion`（`SKIP_RESOURCE_EXHAUSTION=0`）の
@@ -29,7 +31,7 @@ file / sock / kernel はいずれも 2MB 以下で、増えているのは anon�
 - `threads = 0` はホストの論理 CPU 数（`--cpus 0.25` でも 4）だけワーカーを作るため、
   スレッドローカルのプールとアロケータのヒープがワーカー数倍になる。
 
-## 対応方針（未着手）
+## 対応方針（feat/v080-limitations で対応中）
 
 1. アイドル（キープアライブ待ち）の接続から読み取りバッファを外し、次のデータが来たときに
    プールから借りる（nginx の `client_header_buffer_size` 相当の小さな初期バッファ）。
@@ -42,3 +44,40 @@ file / sock / kernel はいずれも 2MB 以下で、増えているのは anon�
 
 コンテナのメモリ上限は **同時接続数 × 256KB + 32MB** 程度を目安にする
 （250 接続で約 96MB）。上限を小さくしたい場合は `[security] max_concurrent_connections` で同時接続を絞る。
+
+## 改修内容（確定、2026-10-09）
+
+1. **待ってから借りる**: キープアライブ待ちは readiness を待ってから読み取りバッファを借りる（アイドル接続から 64KB を外す）。
+2. **プールの遅延確保と上限**: `BUF_POOL` の起動時確保をやめ、保持本数に上限を設ける。
+3. **cgroup の CPU 割り当てに合わせたワーカー数**: `threads = 0` のとき `cpu.max`（v2）/ `cpu.cfs_quota_us`（v1）から
+   実効 CPU 数を求める（既定動作。後方互換は考慮しない）。
+4. 処理中の接続の内訳を `alloc-stats` で計測し、上位を削る。
+
+## 結果（2026-10-09）
+
+実装:
+
+- `wait_next_request`（readiness 待ち）を kqueue 限定から全バックエンドへ広げ、`handle_requests` は
+  キープアライブ待ちの前に読み取りバッファを借りない。蓄積バッファ（`accumulated`）は待機前に
+  `ACCUM_BUF_POOL` へ返し、初期容量は 8KB（空・一意所有・64KB 以下のものだけ戻す）。
+- `BUF_POOL` の起動時確保（2MB）をやめ、保持上限を 128 → 64。HTTP/2 の read_buf プール上限 256 → 64。
+- mimalloc の `arena_eager_commit` を 0 に（`.init_array` で `main` より前に設定。環境変数があればそちら優先）。
+- 方針 2（cgroup CPU）はコード変更不要だった: `threads = 0` が使う `num_cpus::get()` は cgroup v1/v2 の
+  クォータを反映済み（`--cpus 0.25` で `Threads: 1` を確認）。ドキュメントに明記。
+
+計測（ubuntu:24.04 コンテナ、`--cpus 0.25`、nofile 1024、TLS、main と交互）:
+
+| 指標 | main | 本対応 |
+|---|---|---|
+| アイドル anon | 24〜25MB | 10MB |
+| 600 アイドル keep-alive TLS 接続 | 77〜94MB（約 100KB/接続） | 30MB（約 33KB/接続） |
+| `wrk -c400` 20 秒中の peak（512MB） | 96〜107MB | 56〜59MB |
+| rps（512MB、6 回平均） | 約 752 | 約 749（差なし） |
+| 64MB 上限 | 424 アイドル接続で OOM | 600 アイドル + wrk 400 で生存 |
+| 48MB 上限 | 194 接続で OOM | 600 アイドルは可、wrk 400 で OOM |
+
+container_security の `resource_exhaustion`（2026-10-10、HEAD 20053dc、`wrk -t4 -c400` TLS 52KB × 20 秒、
+`--cpus 0.25`）: **128 / 96 / 64 / 48MB は稼働を維持**（起票時は 64MB 以下で OOM）、**32MB のみ OOM kill**。
+wrk 400 接続中の peak は 56〜59MB なので 32MB 上限での kill は想定どおりで、上記「当面の運用」の目安
+（同時接続数に見合う上限、または `max_concurrent_connections` で絞る）の範囲。ハーネスは 32MB の kill を
+findings として数えるため、このフェーズは今後も failed と表示される。

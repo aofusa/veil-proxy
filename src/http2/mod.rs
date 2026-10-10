@@ -23,21 +23,20 @@
 //! conn.run(|stream| async { /* handle request */ }).await?;
 //! ```
 
-pub mod client;
 pub mod connection;
 pub mod error;
 pub mod frame;
 pub mod hpack;
 pub mod settings;
 pub mod stream;
+pub(crate) mod upstream_mux;
 
-pub use client::{H2cClient, H2cResponse};
 pub use connection::{Http2Connection, ProcessedRequest};
 pub use error::{Http2Error, Http2ErrorCode};
 pub use settings::Http2Settings;
 pub use stream::{Stream, StreamManager, StreamState};
 
-/// ヘッダ名スロット（F-166/F-165 A1、F-168 H-2 で `client.rs`/`connection.rs` 共通化）。
+/// ヘッダ名スロット（F-166/F-165 A1、F-168 H-2 で上流クライアント/`connection.rs` 共通化）。
 ///
 /// 既に小文字のヘッダ名（大半のケース）は元スライスを借用するだけでコピーしない。
 /// 大文字を含むヘッダ名（稀）のみ `Owned` に小文字化したバッファを持つ。この

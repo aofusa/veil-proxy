@@ -69,6 +69,10 @@
 #   e2e        VM 内で tests/e2e_setup.sh test を実行
 #   unit       VM 内で単体テスト（--lib）+ 統合テストを実行
 #   fetch      VM 内の release バイナリを host（packaging/build/）へ取得
+#   screen     QMP screendump で VGA 画面を PNG に保存（シリアルに出ない状態の確認用）
+#   sendkeys   QMP send-key でキー入力（例: sendkeys --type 'fsck -y'）
+#   rescue     シングルユーザーで止まった VM をシリアルから fsck -y → reboot で戻す
+#   security-e2e  OS 固有のサンドボックス下での E2E（build 済みのバイナリを使う）
 #   ssh/scp/console/status/down
 #
 # 環境変数:
@@ -123,7 +127,14 @@ else
     NATIVE=0
 fi
 VM_SMP="${VM_SMP:-4}"
-VM_MEM_MB="${VM_MEM_MB:-4096}"
+# 既定メモリは OS/アーキ別（F-176）。NetBSD x86_64 は 4GB だと単体テストのリンクで ld が
+# OOM kill され、VM ごと落ちることもあった（v0.7.0 の検証で実測。7GB で解消）。
+if [[ -z "${VM_MEM_MB:-}" ]]; then
+    case "${OS_NAME}-${ARCH}" in
+        netbsd-x86_64) VM_MEM_MB=7168 ;;
+        *) VM_MEM_MB=4096 ;;
+    esac
+fi
 GROW_GB="${GROW_GB:-24}"
 FREEBSD_VER="${FREEBSD_VER:-14.3-RELEASE}"
 # ゲストの root パスワード（シリアルコンソールからのデバッグ用。SSH は鍵のみ）
@@ -530,6 +541,11 @@ _native_fw_x86_64_vars() {
 # 完全に共通（呼び出し元の _write_boot で計算済みのものをそのまま受け取る）で、
 # 違いはアクセラレータ選択とファームウェアの入手経路（コンテナ内固定パス→ホスト探索）
 # ・起動コマンド（docker run → 直接 exec）だけ。
+#
+# user ネットワーク（slirp）は全経路で `ipv6=off`。macOS ホストでは、ゲストが起動時に送る
+# IPv6 UDP を slirp が転送する `sendto(2)` がブロックしたまま戻らず、QEMU のメインスレッドごと
+# 止まってゲストが起動途中で固まった（`sample` で `udp6_input → sosendto → __sendto` を確認。F-176）。
+# ゲストは IPv4 の SSH ポート転送しか使わない。
 _write_boot_native() {
     local drives="$1" seed_drive="$2" console_args="$3"
     # macOS の /bin/bash（3.2）でも動く 64MiB ゼロ埋めパディング（truncate が無い
@@ -569,7 +585,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -580,7 +596,7 @@ set -e
 cd "${WORKDIR}"
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -612,7 +628,7 @@ exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -709,7 +725,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -723,7 +739,7 @@ set -e
 cd /w
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -742,7 +758,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -959,7 +975,7 @@ cmd_provision() {
         CONSOLE_WAIT=1 cmd_up
         unset CONSOLE_WAIT
         python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
-            --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+            --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}" --arch "${ARCH}"
         log "SSH 到達を確認"
         # aarch64 は TCG ホストだと multi-user 到達まで数十分かかりうるため
         # x86_64 より長めの既定タイムアウトにする。
@@ -994,7 +1010,10 @@ if ! mount | grep -q " on /work "; then
     mount /dev/ld1a /work
   fi
 fi
-grep -q " /work " /etc/fstab || echo "/dev/ld1a /work ffs rw 1 2" >> /etc/fstab
+# F-176: WAPBL（log）でマウントする。異常終了後もジャーナルの再生で済み、手作業の fsck が要らない。
+grep -q " /work " /etc/fstab || echo "/dev/ld1a /work ffs rw,log 1 2" >> /etc/fstab
+sed -i.bak -e "s#^/dev/ld1a /work ffs rw 1 2#/dev/ld1a /work ffs rw,log 1 2#" /etc/fstab
+mount -u -o log /work 2>/dev/null || true
 mkdir -p /work/tmp /work/cargo
 if [ ! -L /usr/pkg ]; then
   mkdir -p /work/pkg
@@ -1024,7 +1043,11 @@ cmd_reset() {
 }
 
 cmd_grow() {
-    [[ "${OS_NAME}" == "freebsd" ]] || { log "grow は FreeBSD 専用（OpenBSD は autoinstall 時に全ディスクを使う）"; return 0; }
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        _netbsd_grow
+        return 0
+    fi
+    [[ "${OS_NAME}" == "freebsd" ]] || { log "grow は FreeBSD / NetBSD aarch64 のみ（OpenBSD は autoinstall 時に全ディスクを使う）"; return 0; }
     log "qcow2 を +${GROW_GB}G 拡張 → single-user で growfs"
     cmd_down; sleep 2
     helper qemu-img resize "${IMG_NAME}" "+${GROW_GB}G"
@@ -1056,6 +1079,55 @@ s.close()
 PY
     python3 "${HERE}/freebsd-provision.py" --mode grow --con-port "${CON_PORT}"
     log "grow 完了"
+}
+
+# F-176: NetBSD aarch64（gzimg）のルート FS を拡張する。evbarm のイメージは rc.d/resize_root
+# （resize_disklabel + resize_ffs）を持つので、qcow2 を広げて resize_root=YES で再起動する。
+# x86_64 の live image はルートディスクを拡張できない（B-82）ためスクラッチディスク（/work）で
+# 代替しており、ここでは何もしない。
+_netbsd_grow() {
+    if [[ "${ARCH}" != "aarch64" ]]; then
+        log "NetBSD x86_64 はルートを拡張できない（B-82）。容量は /work（スクラッチディスク）で確保済み"
+        return 0
+    fi
+    log "qcow2 を +${GROW_GB}G 拡張 → resize_root=YES で再起動"
+    cmd_down; sleep 2
+    helper qemu-img resize "${IMG_NAME}" "+${GROW_GB}G"
+    cmd_up
+    cmd_wait 1800
+    cmd_ssh 'grep -q "^resize_root=YES" /etc/rc.conf || echo "resize_root=YES" >> /etc/rc.conf; df -h /; sync'
+    cmd_ssh 'shutdown -r now' || true
+    sleep 20
+    cmd_wait 1800
+    cmd_ssh 'df -h /; sed -i.bak "/^resize_root=YES/d" /etc/rc.conf'
+    log "grow 完了"
+}
+
+# F-176: QMP screendump で VGA 画面を PNG に保存する（シリアルへ何も出ない状態の確認用）。
+cmd_screen() {
+    local out="${1:-${WORKDIR}/screen.png}"
+    local guest_path
+    if [[ "${NATIVE}" == "1" ]]; then
+        guest_path="${WORKDIR}/screen.png"
+    else
+        guest_path="/w/screen.png"   # helper コンテナでは WORKDIR を /w にマウントしている
+    fi
+    python3 "${HERE}/qmp-sendkeys.py" --port "${QMP_PORT}" --screendump "${guest_path}"
+    [[ "${out}" == "${WORKDIR}/screen.png" ]] || cp "${WORKDIR}/screen.png" "${out}"
+    log "画面を保存: ${out}"
+}
+
+# F-176: QMP send-key でキー入力を送る（qmp-sendkeys.py の引数をそのまま渡す）。
+cmd_sendkeys() {
+    python3 "${HERE}/qmp-sendkeys.py" --port "${QMP_PORT}" "$@"
+}
+
+# F-176: 異常終了後にシングルユーザーの fsck 待ちで止まった VM を戻す（全 OS 共通）。
+# シリアルにシェルのプロンプトが出ていれば `fsck -y` → `reboot` を自動で打ち、SSH 到達まで待つ。
+cmd_rescue() {
+    log "シリアルコンソールからシングルユーザーの fsck 待ちを確認する"
+    python3 "${HERE}/rescue.py" --con-port "${CON_PORT}" --timeout "${1:-120}"
+    cmd_wait 1800
 }
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1344,10 @@ _guest_env_prefix() {
         # `Unable to find libclang` で落ちる（実測）。
         pre='LIBCLANG_PATH=$(find -L /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
+        # NetBSD 同梱の GNU ld はデバッグ情報付きの dev プロファイルのリンクが極端に遅い
+        # （x86_64 で単体テストのリンクに約 10 分、E2E の veil 本体は 1 時間を超えても終わらなかった。
+        # F-176）。E2E・単体テストはデバッガを使わないので OpenBSD と同じく切る。
+        pre="${pre} CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0"
         if [[ "${ARCH}" == "aarch64" ]]; then
             # B-59: quiche が内蔵する BoringSSL には aarch64 の CPU 機能検出
             # （`OPENSSL_cpuid_setup`）の実装が linux/apple/win/freebsd/openbsd 用しか無く、
@@ -1370,21 +1446,10 @@ cmd_e2e() {
         cmd_ssh "chmod +x ${GUEST_ROOT}/target/debug/veil"
         env_prefix="${env_prefix} VEIL_E2E_SKIP_VEIL_BUILD=1"
     fi
-    # B-62: NetBSD/aarch64 では E2E の HTTP/3 クライアント（dev-dependency の quinn）が
-    # libc の `_ALIGNBYTES` 不備（NetBSD/aarch64 だけ c_int=3、正しくは c_long=7）で
-    # CMSG のアラインメントをカーネルと 4 バイト取り違え、起動直後に panic する。
-    # さらに `quinn::Endpoint` の Drop 内で二重 panic するため **テストバイナリごと
-    # SIGABRT** になり、フルスイートが 1 件も完走しない。テスト名による `--skip` では
-    # 取りこぼす（`test_alt_svc_upgrade_flow` のように名前に http3/h3 を含まない
-    # HTTP/3 テストがあることを実測で確認）ため、**feature を落として HTTP/3 テストと
-    # クライアントをコンパイル対象から外す**。配布バイナリのビルド（build/fetch）は
-    # `full-netbsd` のままで、HTTP/3 は有効。veil 本体は cmsg を Linux 専用の
-    # io_uring 経路でしか使わないため、この libc の不備の影響を受けない。
+    # B-62 / F-176: NetBSD/aarch64 の HTTP/3 テストクライアント（quinn-udp）が libc の
+    # `_ALIGNBYTES` 誤りで panic していた件は、third_party/quinn-udp（CMSG のアラインメントを
+    # 正した vendoring 版）で解消した。全 OS・全アーキで同じ feature で E2E を回す。
     local e2e_features="${CARGO_FEATURES}"
-    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${e2e_features}" == "full-netbsd" ]]; then
-        e2e_features="full-netbsd-no-http3"
-        log "B-62: NetBSD/aarch64 の E2E は HTTP/3 を外した ${e2e_features} で実行する"
-    fi
     log "in-VM E2E（tests/e2e_setup.sh test、features=${e2e_features}）"
     cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${e2e_features}' bash tests/e2e_setup.sh test"
 }
@@ -1396,9 +1461,6 @@ cmd_e2e() {
 cmd_unit() {
     cmd_sync
     local unit_features="${CARGO_FEATURES}"
-    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${unit_features}" == "full-netbsd" ]]; then
-        unit_features="full-netbsd-no-http3"
-    fi
     local runner_env=""
     if [[ "${OS_NAME}" == "netbsd" ]]; then
         # B-60: NetBSD は PaX MPROTECT がシステム全体で有効なため、wasmtime を使う単体テスト
@@ -1414,8 +1476,15 @@ PAXRUN
         # 4GB の VM でテストバイナリ 3 本を並列リンクすると ld が OOM で落ちる（実測）。
         runner_env="${var}=${GUEST_ROOT}/../paxrun.sh CARGO_BUILD_JOBS=2"
     fi
-    log "in-VM 単体 + 統合テスト（features=${unit_features}）"
-    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) ${runner_env} cargo test --no-default-features --features '${unit_features}' --lib --test integration_tests"
+    local base="cd ${GUEST_ROOT} && $(_guest_env_prefix) ${runner_env} cargo test --no-default-features --features '${unit_features}'"
+    # F-176: テストバイナリのリンクを 1 本ずつに直列化する（大きなバイナリを同時にリンクすると
+    # メモリの少ない VM で ld が OOM になる）。ビルド済みなので最後の実行はリンクし直さない。
+    log "in-VM 単体テストのビルド（features=${unit_features}）"
+    cmd_ssh "${base} --lib --no-run"
+    log "in-VM 統合テストのビルド"
+    cmd_ssh "${base} --test integration_tests --no-run"
+    log "in-VM 単体 + 統合テストの実行"
+    cmd_ssh "${base} --lib --test integration_tests"
 }
 
 # packaging へ渡すためにビルド済みバイナリを取り出す
@@ -1433,6 +1502,17 @@ cmd_fetch() {
     cmd_ssh 'uname -r' > "${dest}.os-version"
     log "取得完了: ${dest}（OS バージョン: $(cat "${dest}.os-version")）"
     log "packaging: ./packaging/scripts/build-bsd.sh --os ${OS_NAME} --arch ${ARCH} --binary ${dest} --os-version \$(cat ${dest}.os-version)"
+}
+
+# F-176: OS 固有のサンドボックス下での E2E（FreeBSD capsicum / OpenBSD pledge+unveil /
+# NetBSD chroot+特権降格）。`build` 済みの release バイナリを使う。
+cmd_security_e2e() {
+    cmd_wait "${SYNC_WAIT_TIMEOUT:-900}" >/dev/null 2>&1 || die "VM の SSH に到達できない"
+    local bin="${GUEST_ROOT}/target/${CARGO_PROFILE}/veil"
+    cmd_ssh "test -x ${bin}" || die "release バイナリが無い（先に build）: ${bin}"
+    cmd_scp "${HERE}/bsd-security-e2e-guest.sh" "${SSH_USER}@127.0.0.1:/tmp/bsd-security-e2e-guest.sh"
+    log "VM 内で OS 固有のサンドボックス E2E を実行（${OS_NAME}）"
+    cmd_ssh "sh /tmp/bsd-security-e2e-guest.sh ${OS_NAME} ${bin}"
 }
 
 # setup から fetch まで一気に実行する（再現用のワンショット）。
@@ -1465,6 +1545,10 @@ case "${COMMAND}" in
     e2e) cmd_e2e "$@" ;;
     unit) cmd_unit ;;
     fetch) cmd_fetch ;;
+    screen) cmd_screen "$@" ;;
+    sendkeys) cmd_sendkeys "$@" ;;
+    rescue) cmd_rescue "$@" ;;
+    security-e2e) cmd_security_e2e ;;
     ssh) cmd_ssh "$@" ;;
     scp) cmd_scp "$@" ;;
     status) cmd_status ;;
