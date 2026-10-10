@@ -5687,6 +5687,18 @@ mod proxy_url_invalid_reason_tests {
     }
 }
 
+/// File ルートのパスが存在するか。
+///
+/// F-178: FreeBSD の capability mode 中（リロード時）は絶対パスの stat ができないため、
+/// 登録済み静的ルートの dirfd 相対で確かめる（登録外のルートはリロード前に拒否済み）。
+fn file_route_path_exists(path: &Path) -> bool {
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::is_capability_mode() {
+        return matches!(crate::security::capsicum::stat_static(path), Some(Ok(_)));
+    }
+    path.exists()
+}
+
 /// `validate_config` の証明書ファイル存在チェックを省くか（F-178: FreeBSD の capability mode 中）。
 fn tls_file_check_suppressed() -> bool {
     #[cfg(target_os = "freebsd")]
@@ -5926,8 +5938,7 @@ fn validate_route_config(
             }
         }
         BackendConfig::File { path, mode, .. } => {
-            let file_path = Path::new(path);
-            if !file_path.exists() {
+            if !file_route_path_exists(Path::new(path)) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
@@ -6581,15 +6592,16 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    // 設定ファイルのバリデーション
-    validate_config(&config)?;
-
     // F-178: capability mode 中のリロードは、cap_enter 後でも動く変更だけを受け入れる
     // （グローバルな状態を書き換える処理より前に判定し、拒否時は何も変えずに前の設定を保つ）。
+    // `validate_config` のパス存在チェックより先に行い、拒否の理由をそのままログに出す。
     #[cfg(target_os = "freebsd")]
     if crate::security::capsicum::is_capability_mode() {
         check_capability_mode_reload(&config)?;
     }
+
+    // 設定ファイルのバリデーション
+    validate_config(&config)?;
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
