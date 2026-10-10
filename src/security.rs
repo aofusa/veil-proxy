@@ -2612,14 +2612,23 @@ pub mod capsicum {
                 )
             };
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                // B-111: 単一ファイルの File ルート（`mode = "memory"` 等）は O_DIRECTORY で
+                // ENOTDIR になる。ここで全体を中断すると他のディレクトリルートも未登録になり、
+                // capability mode の静的配信が全滅するため、そのルートだけ飛ばす
+                // （単一ファイルは起動時に読み込み済み、または従来経路で扱う）。
+                warn!(
+                    "capsicum: static root {:?} をディレクトリとして開けず登録をスキップ: {}",
+                    root,
+                    io::Error::last_os_error()
+                );
+                continue;
             }
             limit_static_dir_rights(fd)?;
             info!(
                 "capsicum: 静的ルート dirfd={} を登録（{:?} → canonical {:?}）",
                 fd, root, canonical
             );
-            dirs.push((root.clone(), fd));
+            dirs.push((root.clone(), canonical, fd));
         }
         let _ = STATIC_DIRS.set(dirs);
         STATIC_ACTIVE.store(true, Ordering::Release);
