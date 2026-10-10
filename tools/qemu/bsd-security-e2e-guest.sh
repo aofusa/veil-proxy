@@ -219,6 +219,45 @@ if [ "$OS" = "netbsd" ]; then
 fi
 
 kill "$PID" 2>/dev/null; sleep 1
+
+# F-181: capability mode を要求したのに入れない構成（Proxy ルート）は起動を中止する。
+# allow_security_failures = true なら警告して rights 制限のみで起動する。
+if [ "$OS" = "freebsd" ]; then
+  PROXY_ROUTE='[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:9"'
+  write_cfg "$PROXY_ROUTE"
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fc.log" 2>&1 &
+  FPID=$!
+  for i in $(seq 1 20); do kill -0 "$FPID" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$FPID" 2>/dev/null; then
+    echo "FAIL: capability mode + Proxy route did not abort"; kill "$FPID"; ok=0
+  else
+    wait "$FPID"; frc=$?
+    echo "FAIL-CLOSED exit=$frc"
+    [ "$frc" = "1" ] || { echo "FAIL: unexpected exit status ($frc)"; ok=0; }
+    grep -q 'aborting startup' "$WORK/veil-fc.log" || { echo "FAIL: no abort reason"; tail -5 "$WORK/veil-fc.log"; ok=0; }
+  fi
+  SEC="$SEC
+allow_security_failures = true"
+  write_cfg "$PROXY_ROUTE"
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fo.log" 2>&1 &
+  OPID=$!
+  oc=000
+  for i in $(seq 1 30); do
+    oc=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:$PORT/" || echo 000)
+    [ "$oc" = "200" ] && break; sleep 1
+  done
+  echo "ALLOW-FAILURES http=$oc"
+  [ "$oc" = "200" ] || { echo "FAIL: allow_security_failures = true did not start"; tail -5 "$WORK/veil-fo.log"; ok=0; }
+  grep -q 'continuing in rights-limited mode' "$WORK/veil-fo.log" || { echo "FAIL: no rights-limited warning"; ok=0; }
+  kill "$OPID" 2>/dev/null; sleep 1
+  grep -q 'panicked at' "$WORK/veil-fc.log" "$WORK/veil-fo.log" && { echo "FAIL: panic (fail-closed)"; ok=0; }
+fi
 if grep -q 'panicked at' "$WORK/veil.log"; then echo "FAIL: panic"; grep -A5 'panicked at' "$WORK/veil.log"; ok=0; fi
 grep -iE 'capability mode|pledge|unveil|chroot|privilege' "$WORK/veil.log" | head -12
 [ "$OS" = "netbsd" ] && rm -f "$DATA"
