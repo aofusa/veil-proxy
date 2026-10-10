@@ -155,7 +155,15 @@ Existing connections are not interrupted, and new settings apply to new connecti
 
 > **Note**: On reload, the path specified with `-c` option at startup (or default `/etc/veil/config.toml`) is used.
 
-> **FreeBSD capsicum capability mode** (`capsicum_capability_mode = true`): the process can no longer open paths after `cap_enter`, so the configuration file cannot be re-read and SIGHUP logs `Failed to reload configuration: Not permitted in capability mode` and keeps the previous configuration. TLS certificates still reload (SIGHUP or mtime poll) when `[tls] auto_reload = true`, because they are read through directory fds opened before `cap_enter` (F-136). Restart the process to apply other configuration changes.
+> **FreeBSD capsicum capability mode** (`capsicum_capability_mode = true`): SIGHUP (and the admin reload) still re-reads the configuration file. Before `cap_enter`, veil opens the directory that holds the configuration file (and the access log directory) and later re-opens the file by name with `openat(2)` + `O_RESOLVE_BENEATH`, so replacing the file by rename and relative symlink swaps inside that directory (Kubernetes ConfigMap style) are picked up (F-178). TLS certificates reload the same way when `[tls] auto_reload = true` (F-136).
+>
+> A process in capability mode cannot open new directories, connect, or bind, so a reload that needs any of these is **rejected and the previous configuration is kept** (the log says `capability mode: ...; restart veil to apply this change`). Restart the process to apply:
+>
+> - a `File` route whose path is not under a directory that was a `File` route at startup (single-file routes outside such a directory included);
+> - `Proxy` routes, `[upstreams]`, `[[l4]]`, h2c, HTTP/3, or the HTTP redirect listener (the same rules decide at startup whether capability mode is entered at all);
+> - enabling the access log or changing `[access_log] file_path`.
+>
+> Reopening the same access log path works, so `logrotate`-style "move, then SIGHUP" rotation is supported. The configuration directory stays readable to the process, so keep the configuration in a dedicated directory.
 
 ```bash
 # Edit config file

@@ -154,7 +154,15 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 
 > **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/veil/config.toml`）が使用されます。
 
-> **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: `cap_enter` 後はパスを開けないため設定ファイルを再読込できず、SIGHUP は `Failed to reload configuration: Not permitted in capability mode` を記録して以前の設定を維持します。TLS 証明書は `[tls] auto_reload = true` なら `cap_enter` 前に開いたディレクトリ fd 経由で読むため、SIGHUP・mtime 監視のどちらでもリロードされます（F-136）。それ以外の設定変更は再起動で反映してください。
+> **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: SIGHUP（と admin API のリロード）で設定ファイルを読み直せます。`cap_enter` の前に設定ファイルのあるディレクトリ（とアクセスログのディレクトリ）を開いておき、リロードのたびにファイル名を `openat(2)` + `O_RESOLVE_BENEATH` で開き直します。rename による置き換えや、そのディレクトリ内の相対シンボリックリンクの差し替え（Kubernetes の ConfigMap 方式）にも追従します（F-178）。TLS 証明書も `[tls] auto_reload = true` なら同じ仕組みでリロードされます（F-136）。
+>
+> capability mode のプロセスは新しいディレクトリを開くことも、接続・bind することもできません。これらが必要になるリロードは **拒否して以前の設定を維持します**（ログに `capability mode: ...; restart veil to apply this change`）。次の変更は再起動で反映してください。
+>
+> - 起動時に `File` ルートだったディレクトリの配下にないパスを指す `File` ルート（そのディレクトリの外にある単一ファイルのルートを含む）
+> - `Proxy` ルート・`[upstreams]`・`[[l4]]`・h2c・HTTP/3・HTTP リダイレクトリスナー（起動時に capability mode へ入るかどうかも同じ規則で決まります）
+> - アクセスログの有効化と `[access_log] file_path` の変更
+>
+> 同じパスのアクセスログは開き直せるので、logrotate の「移動してから SIGHUP」によるローテーションに対応します。設定ファイルのディレクトリはプロセスから読める状態で残るため、設定は専用ディレクトリに置いてください。
 
 ```bash
 # 設定ファイルを編集

@@ -1,6 +1,6 @@
 # F-178: FreeBSD capsicum capability mode 下で SIGHUP の設定リロードを可能にする
 
-**状態: 未着手**
+**状態: 進行中（feat/f178-capsicum-config-reload）**
 
 ## 現状
 
