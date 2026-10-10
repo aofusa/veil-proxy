@@ -150,6 +150,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
 - seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、
   `test_allowed_syscalls_match_libc_numbers` にも足す（コメントと番号のずれで x86_64 の prctl が拒否されていた。B-103）。
+- FreeBSD capability mode 下の上流接続は `connect_broker`（サンドボックス外の子プロセス）経由。本体が渡すのは
+  起動時に確定した許可リストの **添字だけ**（アドレス・ホスト名・パスの文字列を受け付けるプロトコルにしない）。
+  新しい接続経路を足すときは reactor の `connect*` か `connect_broker::connect_std_*` を通す（F-182）。
 - container_security の判定は「本当に走ったか」を見る。h3spec の打ち切り・testssl の常時スキップ・サニタイザの
   起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。
 

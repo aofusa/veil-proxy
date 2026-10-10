@@ -533,8 +533,9 @@ url = "http://unix:/run/app1.sock"
   下流 HTTP/3 → 上流 UDS の中継は対応します。
 - Windows では設定検証エラーになります。
 - OpenBSD ではバックエンドのソケットパスが `unveil(2)` の許可リストへ自動追加され、
-  `unix` pledge promise が要求されます。FreeBSD の capability mode（capsicum）は
-  UDS を含め上流接続のある構成では使えません。
+  `unix` pledge promise が要求されます。FreeBSD の capability mode（capsicum）では、
+  UDS を含む上流への接続は接続ブローカー経由になります（F-182。[実行](running.md) を参照）。
+  接続できるのは起動時の設定に書かれた上流だけです。
 
 ### WebSocket設定
 

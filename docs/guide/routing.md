@@ -536,8 +536,10 @@ Notes and limitations:
   to a UDS backend are supported.
 - Windows rejects `unix:` upstream URLs at config validation time.
 - On OpenBSD, backend socket paths are added to the `unveil(2)` allow-list automatically
-  and the `unix` pledge promise is requested. On FreeBSD, capability mode (capsicum)
-  cannot be combined with any upstream connection, UDS included.
+  and the `unix` pledge promise is requested. On FreeBSD capability mode (capsicum),
+  upstream connections — UDS included — go through the connect broker (F-182; see
+  [Running](running.md)): only the upstreams written in the configuration at startup can be
+  reached.
 
 ### WebSocket Configuration
 
