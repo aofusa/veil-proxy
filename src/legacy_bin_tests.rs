@@ -692,7 +692,7 @@ mod config_parse_tests {
         // デフォルトロギング設定
         let config = LoggingConfigSection::default();
         assert_eq!(config.level, "info");
-        assert_eq!(config.channel_size, 100000);
+        assert_eq!(config.channel_size, 16384);
         assert_eq!(config.flush_interval_ms, 1000);
     }
 

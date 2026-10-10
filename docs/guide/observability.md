@@ -190,7 +190,7 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 |--------|-------------|---------|
 | `level` | Log level (trace/debug/info/warn/error/off) | info |
 | `format` | Log output format (text/json) | text |
-| `channel_size` | Internal channel buffer size | 100000 |
+| `channel_size` | Internal channel buffer size (preallocated, ~88 bytes per slot) | 16384 |
 | `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
 | `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
 | `app_file_path` | App log (INFO/WARN/DEBUG/TRACE) output path | none (**stdout**) |
@@ -230,7 +230,7 @@ Suitable for integration with structured log collection systems (Elasticsearch, 
 [logging]
 level = "info"
 format = "text"  # or "json"
-channel_size = 100000
+channel_size = 16384
 flush_interval_ms = 1000
 # App log -> stdout by default; Error log -> stderr by default.
 app_file_path = "/var/log/veil/veil.log"          # optional

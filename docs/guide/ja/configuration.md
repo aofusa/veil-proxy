@@ -19,7 +19,7 @@
 | `[server]` | `http3_enabled` | `false` | HTTP/3を有効化 |
 | `[logging]` | `level` | `"info"` | ログレベル |
 | `[logging]` | `format` | `"text"` | ログ形式 |
-| `[logging]` | `channel_size` | `100000` | ログチャネルバッファサイズ |
+| `[logging]` | `channel_size` | `16384` | ログチャネルバッファサイズ（全スロットを起動時に確保して常駐。1 件 約 88 バイト。満杯時はブロックせず破棄） |
 | `[logging]` | `flush_interval_ms` | `1000` | フラッシュ間隔（ミリ秒） |
 | `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
@@ -127,7 +127,7 @@ level = "info"
 # ログ出力形式: "text", "json"
 # format = "text"
 # ログチャネルサイズ（高負荷時のログドロップ防止）
-channel_size = 100000
+channel_size = 16384
 # フラッシュ間隔（ミリ秒）
 flush_interval_ms = 1000
 # 最大ログファイルサイズ（バイト、0=ローテーションなし）
