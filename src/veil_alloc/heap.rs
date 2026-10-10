@@ -139,6 +139,8 @@ const RETAIN_EMPTY_PAGES: u8 = 1;
 
 /// 1 回の切り出しで触るバイト数の目安（未使用領域を RSS にしない）。
 const EXTEND_BYTES: usize = 16 * 1024;
+/// スパンの最初の切り出しで触るバイト数。
+const FIRST_EXTEND_BYTES: usize = 4096;
 
 // ====================
 // 確保
@@ -274,7 +276,14 @@ unsafe fn extend(page: *mut Page) {
         debug_assert!((*page).free.is_null());
         let bsize = (*page).block_size as usize;
         let remaining = ((*page).reserved - (*page).capacity) as usize;
-        let count = (EXTEND_BYTES / bsize).clamp(4, 512).min(remaining);
+        // 最初の切り出しは OS ページ 1 枚分だけ触る（ほとんど使われないクラスのページが
+        // 16KiB ずつ常駐しない。スレッド数 × クラス数で効く）。2 回目以降は大きく切り出す。
+        let bytes = if (*page).capacity == 0 {
+            FIRST_EXTEND_BYTES
+        } else {
+            EXTEND_BYTES
+        };
+        let count = (bytes / bsize).clamp(1, 512).min(remaining);
         let first = (*page).start.add((*page).capacity as usize * bsize);
         let mut b = first;
         for _ in 1..count {
