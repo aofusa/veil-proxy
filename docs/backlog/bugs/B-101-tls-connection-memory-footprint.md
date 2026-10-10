@@ -75,3 +75,9 @@ file / sock / kernel はいずれも 2MB 以下で、増えているのは anon�
 | rps（512MB、6 回平均） | 約 752 | 約 749（差なし） |
 | 64MB 上限 | 424 アイドル接続で OOM | 600 アイドル + wrk 400 で生存 |
 | 48MB 上限 | 194 接続で OOM | 600 アイドルは可、wrk 400 で OOM |
+
+container_security の `resource_exhaustion`（2026-10-10、HEAD 20053dc、`wrk -t4 -c400` TLS 52KB × 20 秒、
+`--cpus 0.25`）: **128 / 96 / 64 / 48MB は稼働を維持**（起票時は 64MB 以下で OOM）、**32MB のみ OOM kill**。
+wrk 400 接続中の peak は 56〜59MB なので 32MB 上限での kill は想定どおりで、上記「当面の運用」の目安
+（同時接続数に見合う上限、または `max_concurrent_connections` で絞る）の範囲。ハーネスは 32MB の kill を
+findings として数えるため、このフェーズは今後も failed と表示される。
