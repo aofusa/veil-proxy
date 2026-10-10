@@ -1,6 +1,6 @@
 # F-178: FreeBSD capsicum capability mode 下で SIGHUP の設定リロードを可能にする
 
-**状態: 進行中（feat/f178-capsicum-config-reload）**
+**状態: 完了（feat/f178-capsicum-config-reload）**
 
 ## 現状
 
@@ -49,3 +49,31 @@ capability mode に入れるのは静的配信専用の構成だけ（上流・L
 - アクセスログを mv して SIGHUP すると、新しいファイルに追記される。
 - 他 OS（Linux 等）のリロード挙動は変わらない。ホットパスは変えない。
 - `docs/guide/running.md`（英日）と `examples/config.toml` を更新する。
+
+## 実装（feat/f178-capsicum-config-reload）
+
+| 箇所 | 内容 |
+|------|------|
+| `security::capsicum` | `init_config_dirfd` / `read_config_file`（読み取り専用の権利）、`init_access_log_dirfd` / `open_access_log_append`（`CAP_CREATE`/`CAP_WRITE` 等）。親ディレクトリを開き、ファイル名は毎回 `openat(O_RESOLVE_BENEATH)` で引き直す。ディレクトリ外を指す絶対リンクだけ登録時の実体の親を開く。`STATIC_DIRS` に canonical 形を持たせ `registered_canonical_root` で返す |
+| `entry.rs` | `veil-cap-enter` スレッドで `cap_enter` 直前に設定ファイルとアクセスログの dirfd を登録。適格判定を `config::capability_mode_blocker` に置き換え |
+| `config.rs` | 読み込みは `read_config_source` 1 か所。capability mode 中は `check_capability_mode_reload` で拒否判定（`validate_config` より前）、証明書の存在チェックを省き、File ルートの存在確認と memory モードの読み込みは dirfd 経由、`canonical_base_memoized` は登録表から引く |
+| `access_log.rs` | capability mode 中のリロードはスレッドを作り直さず、空メッセージで既存スレッドに同じパスでの開き直しを指示。開き直しに失敗したら旧ファイルに書き続ける |
+| `wasm/types.rs` | capability mode 中はモジュールファイルの存在チェックを省く（リロードはモジュールを読み直さない） |
+
+起動時の適格判定は従来 upstream グループの有無しか見ておらず、単一 URL の `Proxy` ルートがあっても
+capability mode に入って 502 を返していた。共用の判定で `Proxy` / `ProxyUpstream` ルートを対象外にした。
+
+作業中に見つけた B-111（単一ファイルの File ルートで静的ルートの dirfd 登録が全滅）も同じブランチで修正した。
+
+## 検証（2026-10-10）
+
+- Linux: 単体 999・統合 54・E2E 565/565（io_uring）。clippy（`full --all-targets`、`--no-default-features`）警告なし
+- FreeBSD 14.3 x86_64（QEMU/KVM）: 単体 961/0（新規の `named_file_dir_tests` 4 件を含む）・統合 54/0・
+  E2E 565/0（capability mode を使わない通常経路の回帰なし）。途中で無関係なテストの負荷依存の失敗（B-112）を見つけて修正
+- OpenBSD 7.9 x86_64: security-e2e PASS（テストスクリプトの共通部分を変えたための回帰確認）
+- FreeBSD security-e2e（capability mode）: PASS。リロードで追加ルートが反映、未登録の静的ルートと Proxy ルートを
+  含む設定は理由をログに出して拒否し前の設定で応答、アクセスログを mv して SIGHUP すると新しいファイルへ追記、
+  証明書リロードも従来どおり
+
+初回の security-e2e では、設定ファイルは読めたが `validate_config` の File ルートの `exists()`（絶対パスの stat）で
+リロードが失敗した。設計時の調査では見落としていた経路で、VM で動かして初めて見つかった。
