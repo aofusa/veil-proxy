@@ -1666,7 +1666,11 @@ mod tests {
             while matches!(p.s.read(&mut buf), Ok(n) if n > 0) {}
         });
         run(async move {
-            let mux = H2Mux::start(client, false, Duration::from_millis(200));
+            // B-112: アイドルタイムアウトは、サーバの SETTINGS を待つ間（最大 1 秒）より長く、
+            // 最後の wait_dead の上限（5 秒）より十分短くする。
+            // 200ms だと、負荷の高い環境でサーバスレッドの SETTINGS 送信が遅れたときにストリーム 0 本の
+            // ままアイドル切断され、最初の open が None になる（FreeBSD VM で再現）。
+            let mux = H2Mux::start(client, false, Duration::from_secs(2));
             // サーバの SETTINGS（同時 1 本）が反映されるまで待つ。
             for _ in 0..100 {
                 if mux.sh.inner.borrow().peer_max_concurrent == 1 {
