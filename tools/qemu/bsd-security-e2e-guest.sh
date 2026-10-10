@@ -91,14 +91,12 @@ file_path = \"$WORK/logs/access.log\"
 flush_interval_ms = 200"
 fi
 
-# 設定を書く（rename で置き換える。$1 = Server ヘッダの値、$2 = 先頭に足すルート）
+# 設定を書く（rename で置き換える。$1 = 先頭に足すルート）
 write_cfg() {
   cat > "$WORK/veil.toml.new" <<CFG
 [server]
 listen = "127.0.0.1:$PORT"
 threads = 2
-server_header_enabled = true
-server_header_value = "$1"
 [tls]
 cert_path = "$DATA/cert.pem"
 key_path = "$DATA/key.pem"
@@ -112,7 +110,7 @@ $SEC
 [logging]
 level = "info"
 $ACCESS_LOG
-$2
+$1
 [[route]]
 [route.conditions]
 host = "localhost"
@@ -124,7 +122,7 @@ index = "index.html"
 CFG
   mv "$WORK/veil.toml.new" "$WORK/veil.toml"
 }
-write_cfg "veil-sec-1" ""
+write_cfg ""
 
 cd "$WORK"
 env RUST_BACKTRACE=1 "$BIN" --config "$WORK/veil.toml" > "$WORK/veil.log" 2>&1 &
@@ -158,8 +156,10 @@ code2=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:$PORT/" || ec
 [ "$code2" = "200" ] || { echo "FAIL: serving after reload ($code2)"; ok=0; }
 
 # F-178: capability mode 下の設定リロード（FreeBSD）
+# 反映の目印は /n2/*（www/sub を指す追加ルート）。拒否される設定はこのルートを含まないので、
+# 誤って受け入れると /n2/ が 404 になる。
 if [ "$OS" = "freebsd" ]; then
-  srv() { curl -sk -D - -o /dev/null "https://localhost:$PORT/" | tr -d '\r' | sed -n 's/^[Ss]erver: //p'; }
+  n2() { curl -sk -o r_n2.txt -w '%{http_code}' "https://localhost:$PORT/n2/nested.html" || echo 000; }
   ROUTE_SUB='[[route]]
 [route.conditions]
 host = "localhost"
@@ -167,15 +167,13 @@ path = "/n2/*"
 [route.action]
 type = "File"
 path = "'"$DATA"'/www/sub"'
-  # 1. 受け入れ: Server ヘッダの変更と、登録済みルート配下のディレクトリを指すルートの追加
-  write_cfg "veil-sec-2" "$ROUTE_SUB"; kill -HUP "$PID"; sleep 3
-  s1=$(srv)
-  n2_code=$(curl -sk -o r_n2.txt -w '%{http_code}' "https://localhost:$PORT/n2/nested.html" || echo 000)
-  echo "RELOAD server=[$s1] n2 http=$n2_code body=[$(cat r_n2.txt 2>/dev/null)]"
-  [ "$s1" = "veil-sec-2" ] || { echo "FAIL: config was not reloaded under capability mode"; ok=0; }
-  [ "$n2_code" = "200" ] && grep -q sec-nested-ok r_n2.txt || { echo "FAIL: route added by reload"; ok=0; }
+  # 1. 受け入れ: 登録済みルート配下のディレクトリを指すルートの追加
+  write_cfg "$ROUTE_SUB"; kill -HUP "$PID"; sleep 3
+  c1=$(n2)
+  echo "RELOAD n2 http=$c1 body=[$(cat r_n2.txt 2>/dev/null)]"
+  [ "$c1" = "200" ] && grep -q sec-nested-ok r_n2.txt || { echo "FAIL: config was not reloaded under capability mode"; ok=0; }
   # 2. 拒否: cap_enter 前に登録していない静的ルート
-  write_cfg "veil-sec-3" '[[route]]
+  write_cfg '[[route]]
 [route.conditions]
 host = "localhost"
 path = "/other/*"
@@ -183,12 +181,14 @@ path = "/other/*"
 type = "File"
 path = "'"$DATA"'/other"'
   kill -HUP "$PID"; sleep 3
-  s2=$(srv)
-  echo "REJECT-ROOT server=[$s2]"
-  [ "$s2" = "veil-sec-2" ] || { echo "FAIL: unregistered static root was not rejected"; ok=0; }
+  c2=$(n2)
+  oc=$(curl -sk -o r_other.txt -w '%{http_code}' "https://localhost:$PORT/other/index.html" || echo 000)
+  echo "REJECT-ROOT n2 http=$c2 other http=$oc"
+  [ "$c2" = "200" ] || { echo "FAIL: unregistered static root was not rejected"; ok=0; }
+  grep -q sec-other r_other.txt 2>/dev/null && { echo "FAIL: unregistered root was served"; ok=0; }
   grep -q 'was not registered before cap_enter' "$WORK/veil.log" || { echo "FAIL: no rejection log (root)"; ok=0; }
   # 3. 拒否: プロキシルート（connect(2) が要る）
-  write_cfg "veil-sec-4" '[[route]]
+  write_cfg '[[route]]
 [route.conditions]
 host = "localhost"
 path = "/api/*"
@@ -196,19 +196,20 @@ path = "/api/*"
 type = "Proxy"
 url = "http://127.0.0.1:9"'
   kill -HUP "$PID"; sleep 3
-  s3=$(srv)
-  echo "REJECT-PROXY server=[$s3]"
-  [ "$s3" = "veil-sec-2" ] || { echo "FAIL: proxy route was not rejected"; ok=0; }
+  c3=$(n2)
+  echo "REJECT-PROXY n2 http=$c3"
+  [ "$c3" = "200" ] || { echo "FAIL: proxy route was not rejected"; ok=0; }
   grep -q 'Proxy/ProxyUpstream route requires connect' "$WORK/veil.log" || { echo "FAIL: no rejection log (proxy)"; ok=0; }
   # 4. アクセスログの開き直し（logrotate の move + SIGHUP）
-  write_cfg "veil-sec-2" "$ROUTE_SUB"
+  write_cfg "$ROUTE_SUB"
   mv "$WORK/logs/access.log" "$WORK/logs/access.log.1"
   kill -HUP "$PID"; sleep 3
   curl -sk -o /dev/null "https://localhost:$PORT/after-rotate.html"; sleep 2
   echo "ACCESS-LOG new=[$(grep -c after-rotate "$WORK/logs/access.log" 2>/dev/null)] old=[$(grep -c after-rotate "$WORK/logs/access.log.1" 2>/dev/null)]"
   grep -q after-rotate "$WORK/logs/access.log" 2>/dev/null || { echo "FAIL: access log was not reopened"; ok=0; }
-  s4=$(srv)
-  [ "$s4" = "veil-sec-2" ] || { echo "FAIL: reload after rotation ($s4)"; ok=0; }
+  c4=$(n2)
+  [ "$c4" = "200" ] || { echo "FAIL: serving after rotation ($c4)"; ok=0; }
+  grep -E 'Failed to reload configuration' "$WORK/veil.log" | sed 's/^.*Failed/Failed/' | head -4
 fi
 
 if [ "$OS" = "netbsd" ]; then
