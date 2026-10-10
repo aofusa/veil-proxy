@@ -93,7 +93,7 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
 /// 最初のアリーナは最初の Rust アロケーションで作られるため、`main` より前
 /// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` が
 /// 明示されていればそちらを優先する。
-#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+#[cfg(all(feature = "mimalloc", target_os = "linux", not(veil_alloc_active)))]
 mod mimalloc_early_options {
     // libmimalloc-sys は mi_option_arena_eager_commit の定数を公開していない。
     // mimalloc v2 の mi_option_e における列挙順（show_errors=0, show_stats=1,
@@ -114,6 +114,67 @@ mod mimalloc_early_options {
     #[used]
     #[unsafe(link_section = ".init_array")]
     static SET_ARENA_EAGER_COMMIT: extern "C" fn() = set_arena_eager_commit;
+}
+
+// ====================
+// FreeBSD のシステム malloc（libc 内蔵 jemalloc）のチューニング（F-183）
+// ====================
+
+/// libc の jemalloc が起動時に読む既定設定（`malloc_conf` グローバル変数。jemalloc(3)）。
+///
+/// 環境変数 `MALLOC_CONF` と `/etc/malloc.conf` はこの後に読まれるので、運用側の指定が優先する。
+/// 値は F-183 の計測で決めた（チケット参照）。
+#[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
+mod freebsd_malloc_conf {
+    #[repr(transparent)]
+    pub struct ConfPtr(*const u8);
+    // SAFETY: 静的な読み取り専用文字列へのポインタ。
+    unsafe impl Sync for ConfPtr {}
+
+    #[no_mangle]
+    #[used]
+    pub static malloc_conf: ConfPtr = ConfPtr(super::FREEBSD_MALLOC_CONF.as_ptr());
+}
+
+#[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
+const FREEBSD_MALLOC_CONF: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
+#[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
+extern "C" {
+    fn mallctl(
+        name: *const libc::c_char,
+        oldp: *mut libc::c_void,
+        oldlenp: *mut libc::size_t,
+        newp: *mut libc::c_void,
+        newlen: libc::size_t,
+    ) -> libc::c_int;
+}
+
+/// アイドル時の回収: スレッドキャッシュを flush し、全アリーナの decay を進める。
+///
+/// jemalloc の decay はアリーナへのアクセスのついでに進むため、確保が止まったワーカーの
+/// アリーナは期限を過ぎても dirty ページを返さない。`arena.<MALLCTL_ARENAS_ALL>.decay` で
+/// 期限切れの分だけを返させる（`purge` と違い、期限内のページは残す）。
+#[cfg(all(target_os = "freebsd", not(veil_alloc_active)))]
+pub(crate) fn freebsd_malloc_idle() {
+    // SAFETY: 読み書きしない mallctl 呼び出し（名前は NUL 終端の静的文字列）。
+    unsafe {
+        mallctl(
+            c"thread.tcache.flush".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        // MALLCTL_ARENAS_ALL = 4096
+        mallctl(
+            c"arena.4096.decay".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
 }
 
 /// mimalloc の Large OS Pages 設定を有効化し、状態をログ出力

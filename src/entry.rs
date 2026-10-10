@@ -1116,7 +1116,9 @@ pub fn run() {
                                 continue;
                             }
                             Err(_) => {
-                                // タイムアウト - ループを継続してshutdownチェック
+                                // タイムアウト - ループを継続してshutdownチェック。
+                                // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
+                                crate::alloc_tune::idle_tick();
                                 continue;
                             }
                         };
@@ -1452,7 +1454,9 @@ pub fn run() {
                             continue;
                         }
                         Err(_) => {
-                            // タイムアウト - ループを継続してshutdownチェック
+                            // タイムアウト - ループを継続してshutdownチェック。
+                            // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
+                            crate::alloc_tune::idle_tick();
                             continue;
                         }
                     };
@@ -1723,7 +1727,9 @@ pub fn run() {
                                 continue;
                             }
                             Err(_) => {
-                                // タイムアウト - ループを継続してshutdownチェック
+                                // タイムアウト - ループを継続してshutdownチェック。
+                                // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
+                                crate::alloc_tune::idle_tick();
                                 continue;
                             }
                         };

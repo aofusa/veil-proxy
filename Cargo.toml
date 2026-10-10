@@ -193,6 +193,13 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # ビルド方法: cargo build --no-default-features --features "ktls,http2,jemalloc"
 jemalloc = ["dep:tikv-jemallocator"]
 
+# veil 専用アロケータ（F-183、src/veil_alloc/）
+# thread-per-core 向けのスレッドローカル・ページ単位フリーリスト。依存クレート無し（libc のみ）。
+# 有効化すると mimalloc / jemalloc より優先して `#[global_allocator]` になる（unix のみ。
+# Windows では無視して他のアロケータへフォールバックする）。
+# ビルド方法: cargo build --features "full,veil-alloc"
+veil-alloc = []
+
 # システムアロケータ（明示的指定用）
 # --no-default-features 時のデフォルト
 # ビルド方法: cargo build --no-default-features --features system-allocator
