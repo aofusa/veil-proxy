@@ -287,7 +287,8 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "mimalloc",
+    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc
+    "veil-alloc", "mimalloc",
     "admin",
     "access-log",
     "l4-proxy",
@@ -300,7 +301,7 @@ full = [
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
-# 通常の `--features full` は従来どおり mimalloc のままで挙動を変えない。
+# 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
 #
 # **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
 # `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
@@ -386,7 +387,7 @@ full-container = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "mimalloc",
+    "veil-alloc", "mimalloc",
     "admin",
     "access-log",
     "l4-proxy",

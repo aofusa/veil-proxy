@@ -40,6 +40,53 @@ threads = 0  # 未指定または0の場合はCPUコア数と同じ
 - mimalloc のアリーナを一括コミットしません（`arena_eager_commit = 0` を `main` より前に設定）。スループット差なしで常駐メモリが約 15MB 減ります。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` を指定するとそちらが優先されます。
 - 目安: 64MB のコンテナで TLS のアイドル接続 600 本と処理中の 400 接続を維持できます。さらに小さなコンテナでは `[security] max_concurrent_connections` で上限を設けてください。
 
+### メモリアロケータ（F-183）
+
+| プラットフォーム / ビルド | グローバルアロケータ | チューニング |
+|---|---|---|
+| Linux、`--features full`（と `full-container`） | **veil-alloc**（`src/veil_alloc/`、推奨） | veil の thread-per-core ワーカー向けの専用設計（下記） |
+| Linux、既定 feature | mimalloc v3 | `arena_eager_commit = 0`・`purge_delay = 250` ms（`main` 前に設定。`MIMALLOC_*` 環境変数が優先） |
+| FreeBSD（`full-freebsd`） | libc の `malloc(3)`（jemalloc） | `malloc_conf` シンボルで `dirty_decay_ms:1000,muzzy_decay_ms:0,retain:false,lg_tcache_max:16`（`MALLOC_CONF`・`/etc/malloc.conf` が優先） |
+| OpenBSD / NetBSD | libc の `malloc(3)` | — |
+| Windows | mimalloc | — |
+
+どのアロケータにも **アイドル時回収** をかけます。ワーカーの accept ループは接続が来ないと 1 秒で
+タイムアウトし（HTTP/3 はアイドル時のタイムアウト）、そこで使用中のアロケータに空き領域を OS へ
+返させます（`veil_alloc::collect`、`mi_collect`、jemalloc の `thread.tcache.flush` +
+`arena.<all>.decay`）。これが無いと mimalloc・jemalloc は次に呼ばれるまで返却しないため、負荷の
+後にアイドルになったワーカーはピーク時の RSS を持ち続けていました。
+
+**veil-alloc** はスレッドローカル・サイズクラス・ページ単位フリーリストのアロケータです。
+
+- 高速パスは現在のページのフリーリストへの pop / push だけで、ロックもアトミックもありません。
+  `GlobalAlloc` は解放時にもサイズを渡すので、ブロックごとのヘッダやポインタ→サイズの表を持ちません。
+- 64KiB スロットからなる 4MiB セグメント。256KiB までは 52 のサイズクラス、1MiB まではスロット単位の
+  スパン、それより大きい要求は `mmap` し、解放で `munmap` します。
+- 他スレッド（ロガー・オフロード・チャネル越し）の解放は所有ヒープへロックフリーに投函し、所有者が
+  回収します。
+- 空いたスパンは `VEIL_ALLOC_PURGE_DELAY_MS`（既定 1000）だけ常駐させてから `madvise` で返します。
+  ヒープあたりの常駐した空き領域に上限（`VEIL_ALLOC_DIRTY_MAX_MB`、既定 16）、空セグメントの
+  プロセス全体キャッシュは `VEIL_ALLOC_SEGMENT_CACHE`（既定 8）個までです。
+- 終了したスレッドのヒープは次のスレッドが引き継ぐので、スレッドの入れ替わりでメモリは増えません。
+  `fork(2)` の前後でグローバルロックを取ります。
+- Prometheus（`metrics`）: `veil_allocator_bytes{state="active|dirty|huge|purged_total"}`、
+  `veil_allocator_count{kind="segments|cached_segments|heaps|abandoned_heaps|remote_frees_total"}`。
+
+`tools/perf/alloc_ab.sh` での計測（Linux、2 ワーカーを 2 コアに固定、交互 A/B 3 ラウンド。TLS 上の
+HTTP/1.1・HTTP/2 の静的配信とプロキシ、接続チャーン）:
+
+| | mimalloc（F-183 前） | mimalloc（チューニング後） | veil-alloc |
+|---|---|---|---|
+| スループット | 基準 | ±1% 以内 | チューニング後の mimalloc 比 +0〜1.3% |
+| アイドル RSS | 24.2 MB | 17.4 MB | 17.3 MB（匿名メモリ 3.5 MB） |
+| 負荷の 15 秒後の RSS | 87.5 MB | 78.8 MB | 74.4 MB |
+
+アイドル時の減少の大半は `[logging] channel_size` によるものです（ftlog は全スロットを事前確保する。
+既定を 100000 から 16384 に変更、-7 MB）。`tools/perf/alloc_bench` でアロケータを直接比べると、
+veil-alloc は小物・要求単位のバッチ・64KiB バッファ・スレッド間解放・`realloc` で mimalloc より
+18〜60% 速く、4 スレッドの混合した生存集合では同等です。FreeBSD ではチューニングした `malloc_conf`
+で負荷後の RSS が 102 MB から 52 MB になり、要求あたりの CPU 時間は同等以下でした。
+
 ### SO_REUSEPORT CBPFロードバランシング
 
 #### 概要
