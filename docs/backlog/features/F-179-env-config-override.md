@@ -7,17 +7,26 @@
 F-07（ファジング・カオス・セキュリティスキャン、親）の「将来拡張」に残っていた項目。CLI の上書き
 （`-o` / `--override <path> = <toml-value>`）は F-143 で完了しており、起動・リロード・`-t`・unveil・Seatbelt の
 全ロード経路に `src/config_override.rs` のチョークポイント経由で効く。環境変数による上書き経路は無い
-（2026-10-10 時点で `src/` に `VEIL_*` の設定上書きは無い）。
+（2026-10-10 時点で `src/` に `VEIL_*` の設定上書きは無い）。コンテナや systemd で TOML を書き換えずに
+設定を差し替えられるようにする。
 
-## 改修案
+## 仕様（決定事項）
 
-- `VEIL_OVERRIDE_<n>` もしくは `VEIL_CONFIG__server__listen` 形式など、TOML パスへの対応規則を決める
-  （ドット・配列添字の表現を含む）。既存の `--override` と同じ値の構文（TOML の値）を使う。
-- 優先順位: TOML < 環境変数 < CLI `--override`。
-- 適用は `config_override` の同じチョークポイントに入れ、リロード・`-t` でも同じ集合を適用する。
-- 機密値（秘密鍵 PEM など）は対象にしない（F-180 で扱う）。
+- **名前の規則**: `VEIL_OVERRIDE_<n>` に `--override` と同じ書式（`<path> = <toml-value>`）を入れる。
+  例: `VEIL_OVERRIDE_1='server.listen = "0.0.0.0:8443"'`、`VEIL_OVERRIDE_2='route.0.action.path = "/srv/www"'`。
+  - 配列の添字（`route.0`）やドットを含むキー（クオート）も `--override` と同じ構文でそのまま書ける。パーサと適用処理は `config_override` を共有する。
+  - `<n>` は 10 進の正整数。数値の昇順に適用する（同じパスを複数回指定したら後勝ち）。不正な名前・書式は起動エラー。
+  - 対案の `VEIL__server__listen` 形式（区切りでパスを表す）は、配列の添字や `.` を含むキーを表せないため採らない。
+- **優先順位**: TOML < 環境変数 < CLI の `--override`。
+- **適用経路**: `config_override` の単一チョークポイントに入れ、起動・SIGHUP リロード・`-t` 検証・unveil・Seatbelt の
+  全経路で同じ集合を適用する。
+- **リロード時の扱い**: 環境変数はプロセス起動時の値で固定される。SIGHUP で変わるのは TOML だけで、環境変数の
+  上書きは同じものを当て直す。ガイドに明記する。
+- **機密値は対象外**: 環境変数は `/proc/<pid>/environ`（Linux）や `ps -e`（BSD）で見えやすい。秘密鍵などの機密値は
+  この仕組みで渡さない（F-180 で扱う）。
 
 ## 受け入れ条件
 
-- 単体テスト（規則のパース・優先順位）と E2E（環境変数で listen 等を上書きして起動）。
-- `docs/guide/`（英日）・docker の README に対応表を書く。
+- 単体テスト: 名前の規則（`<n>` の解釈・不正な名前）、書式、適用順と優先順位（TOML < 環境変数 < CLI）。
+- E2E: 環境変数で `listen` 等を上書きして起動する。SIGHUP 後も上書きが保たれる。
+- `docs/guide/`（英日）・docker の README に対応表を書く。`examples/config.toml` に書式の説明を足す。

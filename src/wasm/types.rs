@@ -203,10 +203,20 @@ impl WasmConfig {
         }
 
         // モジュールファイルの存在チェック
-        for module in &self.modules {
-            let path = std::path::Path::new(&module.path);
-            if !path.exists() {
-                anyhow::bail!("WASM module file not found: {}", module.path);
+        //
+        // F-178: FreeBSD の capability mode 中（＝リロード時）は絶対パスの stat ができず
+        // 常に「無い」と判定されるため省く。リロードはモジュールを読み直さない
+        // （WASM エンジンは起動時のものを引き継ぐ）ので、存在は結果に影響しない。
+        #[cfg(target_os = "freebsd")]
+        let skip_exists = crate::security::capsicum::is_capability_mode();
+        #[cfg(not(target_os = "freebsd"))]
+        let skip_exists = false;
+        if !skip_exists {
+            for module in &self.modules {
+                let path = std::path::Path::new(&module.path);
+                if !path.exists() {
+                    anyhow::bail!("WASM module file not found: {}", module.path);
+                }
             }
         }
 

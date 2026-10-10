@@ -2399,6 +2399,8 @@ pub mod capsicum {
     // 個別の権利定数（`<sys/capsicum.h>` から必要な分のみ転記）。
     const CAP_READ: u64 = capright(0, 0x0000_0000_0000_0001);
     const CAP_WRITE: u64 = capright(0, 0x0000_0000_0000_0002);
+    /// `openat(2)` の `O_CREAT`（F-178: capability mode 下でアクセスログを開き直す）。
+    const CAP_CREATE: u64 = capright(0, 0x0000_0000_0000_0040);
     const CAP_SEEK_TELL: u64 = capright(0, 0x0000_0000_0000_0004);
     const CAP_SEEK: u64 = CAP_SEEK_TELL | 0x0000_0000_0000_0008;
     const CAP_MMAP: u64 = capright(0, 0x0000_0000_0000_0010);
@@ -2566,8 +2568,10 @@ pub mod capsicum {
     /// `AT_RESOLVE_BENEATH`（`<sys/fcntl.h>`、FreeBSD 13+）。`fstatat` 等の at-flags 版。
     const AT_RESOLVE_BENEATH: libc::c_int = 0x2000;
 
-    /// 登録済み静的ルート（config の File パス（プレフィックス照合用）→ ディレクトリ fd）。
-    static STATIC_DIRS: OnceLock<Vec<(PathBuf, RawFd)>> = OnceLock::new();
+    /// 登録済み静的ルート（config の File パス（プレフィックス照合用）、その canonical 形、
+    /// ディレクトリ fd）。canonical 形は capability mode 下の設定リロードで
+    /// `canonicalize()` の代わりに使う（F-178。`registered_canonical_root`）。
+    static STATIC_DIRS: OnceLock<Vec<(PathBuf, PathBuf, RawFd)>> = OnceLock::new();
     /// 静的配信の openat 相対化が有効か（`init_static_dirfds` 成功後に true）。
     static STATIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -2586,7 +2590,7 @@ pub mod capsicum {
     /// CAP_MMAP_R/CAP_FCNTL へ制限する。canonicalize は絶対パス操作のため cap_enter 前に
     /// 済ませる（dirfd を開くためだけに使用。プレフィックス照合は config パス原形で行う）。
     pub fn init_static_dirfds(roots: &[PathBuf]) -> io::Result<()> {
-        let mut dirs: Vec<(PathBuf, RawFd)> = Vec::new();
+        let mut dirs: Vec<(PathBuf, PathBuf, RawFd)> = Vec::new();
         for root in roots {
             // 照合キーは config に書かれたパス原形（配信側はこの原形を prefix に絶対パスを
             // 構築するため）。dirfd を開くためだけ canonicalize する。
@@ -2600,7 +2604,7 @@ pub mod capsicum {
                     continue;
                 }
             };
-            if dirs.iter().any(|(p, _)| p == root) {
+            if dirs.iter().any(|(p, _, _)| p == root) {
                 continue;
             }
             let cpath = CString::new(canonical.as_os_str().as_bytes())
@@ -2612,14 +2616,23 @@ pub mod capsicum {
                 )
             };
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                // B-111: 単一ファイルの File ルート（`mode = "memory"` 等）は O_DIRECTORY で
+                // ENOTDIR になる。ここで全体を中断すると他のディレクトリルートも未登録になり、
+                // capability mode の静的配信が全滅するため、そのルートだけ飛ばす
+                // （単一ファイルは起動時に読み込み済み、または従来経路で扱う）。
+                warn!(
+                    "capsicum: static root {:?} をディレクトリとして開けず登録をスキップ: {}",
+                    root,
+                    io::Error::last_os_error()
+                );
+                continue;
             }
             limit_static_dir_rights(fd)?;
             info!(
                 "capsicum: 静的ルート dirfd={} を登録（{:?} → canonical {:?}）",
                 fd, root, canonical
             );
-            dirs.push((root.clone(), fd));
+            dirs.push((root.clone(), canonical, fd));
         }
         let _ = STATIC_DIRS.set(dirs);
         STATIC_ACTIVE.store(true, Ordering::Release);
@@ -2657,7 +2670,7 @@ pub mod capsicum {
             return None;
         }
         let dirs = STATIC_DIRS.get()?;
-        for (root, fd) in dirs {
+        for (root, _, fd) in dirs {
             if let Ok(rel) = abs.strip_prefix(root) {
                 let rel_bytes = rel.as_os_str().as_bytes();
                 let src: &[u8] = if rel_bytes.is_empty() {
@@ -2701,9 +2714,35 @@ pub mod capsicum {
             return false;
         }
         match STATIC_DIRS.get() {
-            Some(dirs) => dirs.iter().any(|(root, _)| abs.strip_prefix(root).is_ok()),
+            Some(dirs) => dirs
+                .iter()
+                .any(|(root, _, _)| abs.strip_prefix(root).is_ok()),
             None => false,
         }
+    }
+
+    /// 登録済み静的ルート配下のパスを、登録時に解決した canonical 形で返す（F-178）。
+    ///
+    /// capability mode では `canonicalize()`（絶対パスの `realpath`）が使えないため、
+    /// 設定リロードで File ルートの canonical なベースパスを求めるときにこれを使う。
+    /// ルート配下の部分パスは、ルートの canonical 形に相対部分を字句的に連結する
+    /// （シンボリックリンクは解決しない。配信時の封じ込めは `O_RESOLVE_BENEATH` が担う）。
+    /// 登録済みルートの配下でなければ `None`。
+    pub fn registered_canonical_root(path: &Path) -> Option<PathBuf> {
+        if !static_serving_active() {
+            return None;
+        }
+        let dirs = STATIC_DIRS.get()?;
+        for (root, canonical, _) in dirs {
+            if let Ok(rel) = path.strip_prefix(root) {
+                return Some(if rel.as_os_str().is_empty() {
+                    canonical.clone()
+                } else {
+                    canonical.join(rel)
+                });
+            }
+        }
+        None
     }
 
     /// capability mode 下でルート dirfd 相対に読み取り専用 open する。
@@ -2925,6 +2964,306 @@ pub mod capsicum {
             is_file,
             is_dir,
         }))
+    }
+
+    // ------------------------------------------------------------------
+    // F-178: capability mode 下の設定リロード（設定ファイル・アクセスログの dirfd 相対化）
+    //
+    // F-136 の証明書と同じく、`cap_enter` 前に **親ディレクトリ** の fd を確保しておき、
+    // リロード時はファイル名を毎回 `openat`（`O_RESOLVE_BENEATH`）で引き直す。名前で引き直す
+    // ので、エディタや構成管理ツールの rename による置き換えにも追従する。
+    //
+    // 証明書（`open_parent_dirfd`）と違い、まず「設定に書かれたパスの親ディレクトリ」を開く。
+    // ディレクトリ内の相対シンボリックリンク（Kubernetes ConfigMap の `..data` 方式など）は
+    // `O_RESOLVE_BENEATH` の範囲内なので、差し替えにも追従できる。そのファイル名がディレクトリ
+    // 外を指す（絶対シンボリックリンク等で `openat` が失敗する）場合だけ、登録時点の実体の
+    // 親ディレクトリを開く（`open_parent_dirfd` と同じ。以後の差し替えには追従しない）。
+    // ------------------------------------------------------------------
+
+    /// 名前付きファイルの登録（config に書かれたパス原形、親ディレクトリ fd、ファイル名）。
+    type NamedFile = (PathBuf, RawFd, CString);
+
+    /// 登録済み設定ファイル。
+    static CONFIG_ENTRY: OnceLock<NamedFile> = OnceLock::new();
+    /// 登録済みアクセスログファイル。
+    static ACCESS_LOG_ENTRY: OnceLock<NamedFile> = OnceLock::new();
+
+    /// `path` の親ディレクトリを開いて `bits` の権利へ制限し、(dirfd, ファイル名) を返す。
+    ///
+    /// `probe` が真なら、開いた dirfd から `openat(O_RESOLVE_BENEATH)` でファイルを読めるかを
+    /// 確かめ、読めなければ実体（canonical パス）の親ディレクトリを開き直す。
+    /// 絶対パスの `open`/`canonicalize` を使うため `cap_enter` 前にのみ呼ぶ。
+    fn open_named_file_dir(path: &Path, bits: &[u64], probe: bool) -> io::Result<(RawFd, CString)> {
+        let open_dir = |dir: &Path| -> io::Result<RawFd> {
+            let dir_c = CString::new(dir.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+            let fd = unsafe {
+                libc::open(
+                    dir_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(fd)
+            }
+        };
+        let split = |p: &Path| -> io::Result<(PathBuf, CString)> {
+            let name = p.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path {:?} has no file name", p),
+                )
+            })?;
+            let parent = match p.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            let name_c = CString::new(name.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL")
+            })?;
+            Ok((parent, name_c))
+        };
+
+        let (parent, name) = split(path)?;
+        let fd = open_dir(&parent.canonicalize()?)?;
+        if probe {
+            let probe_fd = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+                )
+            };
+            if probe_fd < 0 {
+                let e = io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                // ディレクトリ外を指すシンボリックリンク等。実体の親ディレクトリを開く。
+                let canonical = path.canonicalize().map_err(|_| e)?;
+                let (cparent, cname) = split(&canonical)?;
+                let cfd = open_dir(&cparent)?;
+                limit(cfd, bits)?;
+                return Ok((cfd, cname));
+            }
+            unsafe { libc::close(probe_fd) };
+        }
+        limit(fd, bits)?;
+        Ok((fd, name))
+    }
+
+    fn lookup_named(
+        entry: &'static OnceLock<NamedFile>,
+        abs: &Path,
+    ) -> Option<(RawFd, &'static CStr)> {
+        let (p, fd, name) = entry.get()?;
+        if p == abs {
+            Some((*fd, name.as_c_str()))
+        } else {
+            None
+        }
+    }
+
+    /// 設定ファイルの親ディレクトリ fd を登録する（**`cap_enter` 前**に呼ぶこと）。
+    ///
+    /// 権利は読み取りのみ（`CAP_LOOKUP`/`CAP_READ`/`CAP_FSTAT`/`CAP_FCNTL` ほか静的配信と同じ集合）。
+    /// 同じディレクトリの他のファイルも読める点は運用ガイドに書く（専用ディレクトリ推奨）。
+    pub fn init_config_dirfd(path: &Path) -> io::Result<()> {
+        let (fd, name) = open_named_file_dir(
+            path,
+            &[
+                CAP_READ, CAP_LOOKUP, CAP_FSTAT, CAP_SEEK, CAP_MMAP_R, CAP_FCNTL,
+            ],
+            true,
+        )?;
+        if CONFIG_ENTRY.set((path.to_path_buf(), fd, name)).is_err() {
+            unsafe { libc::close(fd) };
+            return Ok(());
+        }
+        info!(
+            "capsicum: 設定ファイル {:?} の dirfd を登録（capability mode 下でも SIGHUP で再読込できる）",
+            path
+        );
+        Ok(())
+    }
+
+    /// 登録済み設定ファイルを dirfd 相対で読む。
+    /// `None` = 未登録（呼び出し側は通常の `fs::read_to_string` へ）。
+    pub fn read_config_file(abs: &Path) -> Option<io::Result<String>> {
+        use std::io::Read;
+        let (dirfd, name) = lookup_named(&CONFIG_ENTRY, abs)?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+            )
+        };
+        if fd < 0 {
+            return Some(Err(io::Error::last_os_error()));
+        }
+        // SAFETY: openat が返した所有権のある有効な fd。
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut s = String::new();
+        Some(f.read_to_string(&mut s).map(|_| s))
+    }
+
+    /// アクセスログの親ディレクトリ fd を登録する（**`cap_enter` 前**に呼ぶこと）。
+    ///
+    /// 権利は `CAP_LOOKUP`/`CAP_CREATE`/`CAP_WRITE`/`CAP_SEEK`/`CAP_FSTAT`/`CAP_FCNTL`。
+    /// 開いたログファイルの fd はこの権利を継承する（読み取りはできない）。
+    pub fn init_access_log_dirfd(path: &Path) -> io::Result<()> {
+        let (fd, name) = open_named_file_dir(
+            path,
+            &[
+                CAP_LOOKUP, CAP_CREATE, CAP_WRITE, CAP_SEEK, CAP_FSTAT, CAP_FCNTL,
+            ],
+            false,
+        )?;
+        if ACCESS_LOG_ENTRY
+            .set((path.to_path_buf(), fd, name))
+            .is_err()
+        {
+            unsafe { libc::close(fd) };
+            return Ok(());
+        }
+        info!(
+            "capsicum: アクセスログ {:?} の dirfd を登録（capability mode 下でも SIGHUP で開き直せる）",
+            path
+        );
+        Ok(())
+    }
+
+    /// 登録済みアクセスログを dirfd 相対で追記用に開く（無ければ作る）。
+    /// `None` = 未登録（呼び出し側は通常の `OpenOptions` へ）。
+    pub fn open_access_log_append(abs: &Path) -> Option<io::Result<std::fs::File>> {
+        let (dirfd, name) = lookup_named(&ACCESS_LOG_ENTRY, abs)?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_APPEND
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | O_RESOLVE_BENEATH,
+                0o666 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            Some(Err(io::Error::last_os_error()))
+        } else {
+            // SAFETY: openat が返した所有権のある有効な fd。
+            Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+    }
+
+    /// F-178: 名前付きファイルの dirfd 登録（cap_enter はしない。登録表の OnceLock も触らない）。
+    #[cfg(test)]
+    mod named_file_dir_tests {
+        use super::*;
+
+        const READ_BITS: &[u64] = &[CAP_READ, CAP_LOOKUP, CAP_FSTAT, CAP_SEEK, CAP_FCNTL];
+
+        fn read_via(fd: RawFd, name: &CStr) -> io::Result<String> {
+            use std::io::Read;
+            let f = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+                )
+            };
+            if f < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut file = unsafe { std::fs::File::from_raw_fd(f) };
+            let mut out = String::new();
+            file.read_to_string(&mut out)?;
+            Ok(out)
+        }
+
+        /// rename による置き換えでも、名前で引き直すので新しい内容が読める。
+        #[test]
+        fn follows_rename_replacement() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("veil.toml");
+            std::fs::write(&path, "v1").unwrap();
+            let (fd, name) = open_named_file_dir(&path, READ_BITS, true).unwrap();
+            assert_eq!(read_via(fd, &name).unwrap(), "v1");
+            let tmp = dir.path().join("veil.toml.new");
+            std::fs::write(&tmp, "v2").unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+            assert_eq!(read_via(fd, &name).unwrap(), "v2");
+            unsafe { libc::close(fd) };
+        }
+
+        /// ディレクトリ内の相対シンボリックリンク（ConfigMap の `..data` 方式）は差し替えに追従する。
+        #[test]
+        fn follows_relative_symlink_swap() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("rev1")).unwrap();
+            std::fs::create_dir(dir.path().join("rev2")).unwrap();
+            std::fs::write(dir.path().join("rev1/veil.toml"), "rev1").unwrap();
+            std::fs::write(dir.path().join("rev2/veil.toml"), "rev2").unwrap();
+            std::os::unix::fs::symlink("rev1", dir.path().join("data")).unwrap();
+            std::os::unix::fs::symlink("data/veil.toml", dir.path().join("veil.toml")).unwrap();
+            let path = dir.path().join("veil.toml");
+            let (fd, name) = open_named_file_dir(&path, READ_BITS, true).unwrap();
+            assert_eq!(read_via(fd, &name).unwrap(), "rev1");
+            std::os::unix::fs::symlink("rev2", dir.path().join("data.new")).unwrap();
+            std::fs::rename(dir.path().join("data.new"), dir.path().join("data")).unwrap();
+            assert_eq!(read_via(fd, &name).unwrap(), "rev2");
+            unsafe { libc::close(fd) };
+        }
+
+        /// ディレクトリ外を指す絶対シンボリックリンクは、登録時点の実体の親ディレクトリを開く。
+        #[test]
+        fn absolute_symlink_falls_back_to_target_dir() {
+            let real = tempfile::tempdir().unwrap();
+            let link_dir = tempfile::tempdir().unwrap();
+            std::fs::write(real.path().join("real.toml"), "real").unwrap();
+            let path = link_dir.path().join("veil.toml");
+            std::os::unix::fs::symlink(real.path().join("real.toml"), &path).unwrap();
+            let (fd, name) = open_named_file_dir(&path, READ_BITS, true).unwrap();
+            assert_eq!(name.to_bytes(), b"real.toml");
+            assert_eq!(read_via(fd, &name).unwrap(), "real");
+            unsafe { libc::close(fd) };
+        }
+
+        /// probe しない登録（アクセスログ）は、ファイルがまだ無くても親ディレクトリで登録できる。
+        #[test]
+        fn log_dir_registration_does_not_require_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("access.log");
+            let (fd, name) = open_named_file_dir(
+                &path,
+                &[
+                    CAP_LOOKUP, CAP_CREATE, CAP_WRITE, CAP_SEEK, CAP_FSTAT, CAP_FCNTL,
+                ],
+                false,
+            )
+            .unwrap();
+            let f = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_APPEND
+                        | libc::O_CREAT
+                        | libc::O_CLOEXEC
+                        | O_RESOLVE_BENEATH,
+                    0o666 as libc::c_uint,
+                )
+            };
+            assert!(f >= 0, "{}", io::Error::last_os_error());
+            let mut file = unsafe { std::fs::File::from_raw_fd(f) };
+            use std::io::Write;
+            file.write_all(b"line\n").unwrap();
+            drop(file);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "line\n");
+            unsafe { libc::close(fd) };
+        }
     }
 
     /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。

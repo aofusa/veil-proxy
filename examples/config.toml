@@ -695,17 +695,21 @@ revalidate_mtime = false
 
 # capability mode（cap_enter(2)、不可逆）への降格（FreeBSD専用、オプトイン）。
 # capability mode ではグローバル名前空間操作（bind/connect/パス指定の open 等）が
-# 全面禁止されるため、次をすべて満たす構成でのみ適用される（満たさない場合は
-# 警告ログを出して rights 制限のみに留まる）:
-#   - プロキシ/upstream・L4 リスナーが無い（connect 不要）
+# 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
+# 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
+# allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
+#   - Proxy ルート（単一 URL・upstream 参照とも）・[upstreams]・L4 リスナーが無い（connect 不要）
 #   - h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
 # 静的ファイル配信（F-123）: capability mode 下でも完全動作する。起動時（cap_enter 前）
 # に各 File ルートのディレクトリ fd を確保し、配信時の open/stat を fd 相対の
 # openat(2)/fstatat(2) + O_RESOLVE_BENEATH（FreeBSD 13+、パストラバーサル封じ込め）へ
 # 切り替えるため、絶対パス open が禁止される capability mode でも 404 にならない。
-# 制約: ホットリロードで File ルートを増やしても capability mode 中は dirfd を追加でき
-# ないため、起動時に存在した File ルートのみ配信できる（新規ルートは警告して無視）。
+# SIGHUP の設定リロード（F-178）: capability mode 中も、cap_enter 前に開いた設定ファイルの
+# ディレクトリ fd から読み直す。ただし cap_enter 後に動かない変更を含むリロードは拒否して
+# 前の設定を保つ（再起動で反映）: 起動時の File ルートのディレクトリ配下にないパスを指す
+# File ルート、上記の Proxy/upstream/L4/h2c/HTTP/3/リダイレクト、アクセスログの有効化・
+# file_path の変更。同じパスのアクセスログの開き直し（logrotate の mv + SIGHUP）はできる。
 # capsicum_capability_mode = true
 
 # 起動時に attach する jail 名（FreeBSD専用、root 前提）。

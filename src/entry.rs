@@ -840,32 +840,58 @@ pub fn run() {
     let capsicum_capability_mode_requested = {
         let sec = &loaded_config.global_security;
         if sec.capsicum_capability_mode {
-            let no_upstreams = loaded_config.upstream_groups.is_empty();
             #[cfg(feature = "l4-proxy")]
-            let no_l4 = loaded_config.l4_listeners.is_empty();
+            let has_l4 = !loaded_config.l4_listeners.is_empty();
             #[cfg(not(feature = "l4-proxy"))]
-            let no_l4 = true;
+            let has_l4 = false;
             #[cfg(feature = "http2")]
-            let no_h2c = !loaded_config.h2c_enabled;
+            let h2c = loaded_config.h2c_enabled;
             #[cfg(not(feature = "http2"))]
-            let no_h2c = true;
+            let h2c = false;
             #[cfg(feature = "http3")]
-            let no_h3 = !loaded_config.http3_enabled;
+            let http3 = loaded_config.http3_enabled;
             #[cfg(not(feature = "http3"))]
-            let no_h3 = true;
+            let http3 = false;
             // metrics（Prometheus）はメインリスナーのルートとして配信されるため
             // 追加リスナーは無く、capability mode の妨げにならない。
             // HTTP→HTTPS リダイレクトリスナーは cap_enter 後の bind になるため不可。
-            let no_http_redirect = loaded_config.listen_http_addr.is_none();
-            let eligible = no_upstreams && no_l4 && no_h2c && no_h3 && no_http_redirect;
-            if !eligible {
-                warn!(
-                    "capsicum: capability mode requested but configuration requires global \
-                     namespace operations (proxy/l4/h2c/http3); staying in \
-                     rights-limited mode"
-                );
+            // 判定はリロード時（F-178）と共用する。単一 URL の Proxy ルート（upstream
+            // グループを作らない）も connect(2) が要るので対象外。
+            let facts = crate::config::CapModeFacts {
+                has_upstreams: !loaded_config.upstream_groups.is_empty(),
+                has_l4,
+                h2c,
+                http3,
+                http_redirect: loaded_config.listen_http_addr.is_some(),
+            };
+            // F-181: 要求したのに入れない構成は、既定で起動を中止する（fail-closed）。
+            use crate::config::CapModeDecision;
+            match crate::config::capability_mode_decision(
+                true,
+                crate::config::capability_mode_blocker(&loaded_config.route, &facts),
+                sec.allow_security_failures,
+            ) {
+                CapModeDecision::Enter => true,
+                CapModeDecision::NotRequested => false,
+                CapModeDecision::RightsLimitedOnly(b) => {
+                    warn!(
+                        "capsicum: capability mode requested but {}; continuing in \
+                         rights-limited mode because allow_security_failures = true",
+                        b.as_str()
+                    );
+                    false
+                }
+                CapModeDecision::Abort(b) => {
+                    let msg = format!(
+                        "capsicum: capability mode requested but {}; aborting startup \
+                         (set allow_security_failures = true to continue in rights-limited mode)",
+                        b.as_str()
+                    );
+                    error!("{}", msg);
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
+                }
             }
-            eligible
         } else {
             false
         }
@@ -1147,9 +1173,22 @@ pub fn run() {
             // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
             // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
             // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
+            let allow_failures = loaded_config.global_security.allow_security_failures;
             let tls_auto_reload = loaded_config.tls_auto_reload;
             let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
             let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
+            // F-178: 設定ファイルとアクセスログの親ディレクトリ fd も cap_enter 前に登録し、
+            // capability mode 下の SIGHUP でも設定を読み直し・ログを開き直せるようにする。
+            let config_path = (**crate::config::CONFIG_PATH.load()).clone();
+            #[cfg(feature = "access-log")]
+            let access_log_path = {
+                let cfg = &loaded_config.access_log_config;
+                if cfg.enabled {
+                    cfg.file_path.clone().map(std::path::PathBuf::from)
+                } else {
+                    None
+                }
+            };
             std::thread::Builder::new()
                 .name("veil-cap-enter".to_string())
                 .spawn(move || {
@@ -1180,12 +1219,39 @@ pub fn run() {
                                     ),
                                 }
                             }
+                            match crate::security::capsicum::init_config_dirfd(&config_path) {
+                                Ok(()) => {}
+                                Err(e) => error!(
+                                    "capsicum: 設定ファイル dirfd の登録に失敗（capability mode 下で\
+                                     SIGHUP の設定リロードが機能しない）: {}",
+                                    e
+                                ),
+                            }
+                            #[cfg(feature = "access-log")]
+                            if let Some(p) = &access_log_path {
+                                if let Err(e) =
+                                    crate::security::capsicum::init_access_log_dirfd(p)
+                                {
+                                    error!(
+                                        "capsicum: アクセスログ dirfd の登録に失敗（capability mode 下で\
+                                         SIGHUP によるログの開き直しが機能しない）: {}",
+                                        e
+                                    );
+                                }
+                            }
                             match crate::security::capsicum::enter_capability_mode() {
                                 Ok(()) => info!(
                                     "capsicum: capability mode active ({} listeners bound)",
                                     expected
                                 ),
-                                Err(e) => error!("capsicum: cap_enter failed: {}", e),
+                                Err(e) => {
+                                    error!("capsicum: cap_enter failed: {}", e);
+                                    // F-181: 要求した防御が効かないまま動かさない。
+                                    if !allow_failures {
+                                        eprintln!("capsicum: cap_enter failed: {}; aborting", e);
+                                        std::process::exit(1);
+                                    }
+                                }
                             }
                             return;
                         }
@@ -1198,6 +1264,14 @@ pub fn run() {
                         "capsicum: timed out waiting for {} listeners; capability mode NOT applied",
                         expected
                     );
+                    // F-181: 要求した防御が効かないまま動かさない。
+                    if !allow_failures {
+                        eprintln!(
+                            "capsicum: timed out waiting for {} listeners; aborting",
+                            expected
+                        );
+                        std::process::exit(1);
+                    }
                 })
                 .expect("failed to spawn veil-cap-enter thread");
         }

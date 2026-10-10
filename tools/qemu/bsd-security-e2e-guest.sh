@@ -16,6 +16,9 @@
 #   - panic しない
 #   - SIGHUP で証明書をリロードできる（[tls] auto_reload。サンドボックス下でも新しい証明書を読める）
 #   - netbsd: ワーカーが root 以外の利用者で動く
+#   - freebsd: capability mode 下でも SIGHUP で設定を読み直せる（F-178）。cap_enter 後に動かない
+#     変更（未登録の静的ルート・プロキシ）は拒否して前の設定を保つ。アクセスログを mv して
+#     SIGHUP すると同じパスで開き直す
 set -u
 OS="${1:?os}"; BIN="${2:?veil binary}"
 PORT="${VEIL_PORT:-9443}"
@@ -76,7 +79,21 @@ REQ
 }
 mkcert 1
 
-cat > "$WORK/veil.toml" <<CFG
+# F-178: FreeBSD はアクセスログも出す（capability mode 下の開き直しを確かめる）
+ACCESS_LOG=""
+if [ "$OS" = "freebsd" ]; then
+  mkdir -p "$WORK/logs" "$DATA/other"
+  echo "sec-other" > "$DATA/other/index.html"
+  ACCESS_LOG="[access_log]
+enabled = true
+format = \"text\"
+file_path = \"$WORK/logs/access.log\"
+flush_interval_ms = 200"
+fi
+
+# 設定を書く（rename で置き換える。$1 = 先頭に足すルート）
+write_cfg() {
+  cat > "$WORK/veil.toml.new" <<CFG
 [server]
 listen = "127.0.0.1:$PORT"
 threads = 2
@@ -84,14 +101,16 @@ threads = 2
 cert_path = "$DATA/cert.pem"
 key_path = "$DATA/key.pem"
 # 証明書リロードは auto_reload の TLS リロードスレッド経由（SIGHUP で即時）。capsicum の
-# capability mode では設定ファイル全体の再読込は ECAPMODE で失敗するが、証明書は
-# cap_enter 前に開いた dirfd 経由で読める（F-136）。
+# capability mode でも、証明書は cap_enter 前に開いた dirfd 経由で読める（F-136。
+# 設定ファイルの再読込も同じ仕組み。F-178）。
 auto_reload = true
 reload_interval_secs = 3600
 [security]
 $SEC
 [logging]
 level = "info"
+$ACCESS_LOG
+$1
 [[route]]
 [route.conditions]
 host = "localhost"
@@ -101,6 +120,9 @@ type = "File"
 path = "$DATA/www"
 index = "index.html"
 CFG
+  mv "$WORK/veil.toml.new" "$WORK/veil.toml"
+}
+write_cfg ""
 
 cd "$WORK"
 env RUST_BACKTRACE=1 "$BIN" --config "$WORK/veil.toml" > "$WORK/veil.log" 2>&1 &
@@ -133,6 +155,63 @@ case "$after" in *localhost-2*) ;; *) echo "FAIL: certificate was not reloaded";
 code2=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:$PORT/" || echo 000)
 [ "$code2" = "200" ] || { echo "FAIL: serving after reload ($code2)"; ok=0; }
 
+# F-178: capability mode 下の設定リロード（FreeBSD）
+# 反映の目印は /n2/*（www/sub を指す追加ルート）。拒否される設定はこのルートを含まないので、
+# 誤って受け入れると /n2/ が 404 になる。
+if [ "$OS" = "freebsd" ]; then
+  n2() { curl -sk -o r_n2.txt -w '%{http_code}' "https://localhost:$PORT/n2/nested.html" || echo 000; }
+  ROUTE_SUB='[[route]]
+[route.conditions]
+host = "localhost"
+path = "/n2/*"
+[route.action]
+type = "File"
+path = "'"$DATA"'/www/sub"'
+  # 1. 受け入れ: 登録済みルート配下のディレクトリを指すルートの追加
+  write_cfg "$ROUTE_SUB"; kill -HUP "$PID"; sleep 3
+  c1=$(n2)
+  echo "RELOAD n2 http=$c1 body=[$(cat r_n2.txt 2>/dev/null)]"
+  [ "$c1" = "200" ] && grep -q sec-nested-ok r_n2.txt || { echo "FAIL: config was not reloaded under capability mode"; ok=0; }
+  # 2. 拒否: cap_enter 前に登録していない静的ルート
+  write_cfg '[[route]]
+[route.conditions]
+host = "localhost"
+path = "/other/*"
+[route.action]
+type = "File"
+path = "'"$DATA"'/other"'
+  kill -HUP "$PID"; sleep 3
+  c2=$(n2)
+  oc=$(curl -sk -o r_other.txt -w '%{http_code}' "https://localhost:$PORT/other/index.html" || echo 000)
+  echo "REJECT-ROOT n2 http=$c2 other http=$oc"
+  [ "$c2" = "200" ] || { echo "FAIL: unregistered static root was not rejected"; ok=0; }
+  grep -q sec-other r_other.txt 2>/dev/null && { echo "FAIL: unregistered root was served"; ok=0; }
+  grep -q 'was not registered before cap_enter' "$WORK/veil.log" || { echo "FAIL: no rejection log (root)"; ok=0; }
+  # 3. 拒否: プロキシルート（connect(2) が要る）
+  write_cfg '[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:9"'
+  kill -HUP "$PID"; sleep 3
+  c3=$(n2)
+  echo "REJECT-PROXY n2 http=$c3"
+  [ "$c3" = "200" ] || { echo "FAIL: proxy route was not rejected"; ok=0; }
+  grep -q 'Proxy/ProxyUpstream route requires connect' "$WORK/veil.log" || { echo "FAIL: no rejection log (proxy)"; ok=0; }
+  # 4. アクセスログの開き直し（logrotate の move + SIGHUP）
+  write_cfg "$ROUTE_SUB"
+  mv "$WORK/logs/access.log" "$WORK/logs/access.log.1"
+  kill -HUP "$PID"; sleep 3
+  curl -sk -o /dev/null "https://localhost:$PORT/after-rotate.html"; sleep 2
+  echo "ACCESS-LOG new=[$(grep -c after-rotate "$WORK/logs/access.log" 2>/dev/null)] old=[$(grep -c after-rotate "$WORK/logs/access.log.1" 2>/dev/null)]"
+  grep -q after-rotate "$WORK/logs/access.log" 2>/dev/null || { echo "FAIL: access log was not reopened"; ok=0; }
+  c4=$(n2)
+  [ "$c4" = "200" ] || { echo "FAIL: serving after rotation ($c4)"; ok=0; }
+  grep -E 'Failed to reload configuration' "$WORK/veil.log" | sed 's/^.*Failed/Failed/' | head -4
+fi
+
 if [ "$OS" = "netbsd" ]; then
   owner=$(ps -o user= -p "$PID" 2>/dev/null | tr -d ' ')
   echo "PROCESS user=[$owner]"
@@ -140,8 +219,47 @@ if [ "$OS" = "netbsd" ]; then
 fi
 
 kill "$PID" 2>/dev/null; sleep 1
+
+# F-181: capability mode を要求したのに入れない構成（Proxy ルート）は起動を中止する。
+# allow_security_failures = true なら警告して rights 制限のみで起動する。
+if [ "$OS" = "freebsd" ]; then
+  PROXY_ROUTE='[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:9"'
+  write_cfg "$PROXY_ROUTE"
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fc.log" 2>&1 &
+  FPID=$!
+  for i in $(seq 1 20); do kill -0 "$FPID" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$FPID" 2>/dev/null; then
+    echo "FAIL: capability mode + Proxy route did not abort"; kill "$FPID"; ok=0
+  else
+    wait "$FPID"; frc=$?
+    echo "FAIL-CLOSED exit=$frc"
+    [ "$frc" = "1" ] || { echo "FAIL: unexpected exit status ($frc)"; ok=0; }
+    grep -q 'aborting startup' "$WORK/veil-fc.log" || { echo "FAIL: no abort reason"; tail -5 "$WORK/veil-fc.log"; ok=0; }
+  fi
+  SEC="$SEC
+allow_security_failures = true"
+  write_cfg "$PROXY_ROUTE"
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fo.log" 2>&1 &
+  OPID=$!
+  oc=000
+  for i in $(seq 1 30); do
+    oc=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:$PORT/" || echo 000)
+    [ "$oc" = "200" ] && break; sleep 1
+  done
+  echo "ALLOW-FAILURES http=$oc"
+  [ "$oc" = "200" ] || { echo "FAIL: allow_security_failures = true did not start"; tail -5 "$WORK/veil-fo.log"; ok=0; }
+  grep -q 'continuing in rights-limited mode' "$WORK/veil-fo.log" || { echo "FAIL: no rights-limited warning"; ok=0; }
+  kill "$OPID" 2>/dev/null; sleep 1
+  grep -q 'panicked at' "$WORK/veil-fc.log" "$WORK/veil-fo.log" && { echo "FAIL: panic (fail-closed)"; ok=0; }
+fi
 if grep -q 'panicked at' "$WORK/veil.log"; then echo "FAIL: panic"; grep -A5 'panicked at' "$WORK/veil.log"; ok=0; fi
-grep -iE 'capability mode|pledge|unveil|chroot|privilege' "$WORK/veil.log" | head -8
+grep -iE 'capability mode|pledge|unveil|chroot|privilege' "$WORK/veil.log" | head -12
 [ "$OS" = "netbsd" ] && rm -f "$DATA"
 if [ "$ok" = "1" ]; then echo "SECURITY_E2E=PASS"; exit 0; fi
 echo "SECURITY_E2E=FAIL"; tail -20 "$WORK/veil.log"; exit 1
