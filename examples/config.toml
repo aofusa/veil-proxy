@@ -344,6 +344,17 @@ ktls_fallback_enabled = true
 # auto_reload = false
 # reload_interval_secs = 60
 
+# TLS セッション再開（F-183、HTTP/1.1・HTTP/2 の rustls 終端。HTTP/3 は quiche 側）
+# "tickets" = ステートレスなセッションチケット【既定】。鍵はプロセス共有で自動ローテーション
+#             （証明書リロードでも維持）。サーバ側にセッション状態を持たず、ワーカー間の
+#             共有ロックも無い（接続数によらずメモリ一定）。
+# "cache"   = サーバ側のセッションキャッシュ（全ワーカー共有、session_cache_size 件）
+# "off"     = セッション再開しない（チケットを送らない）
+# 変更の反映には再起動が必要（証明書リロードでは起動時の方式を引き継ぐ）。
+# session_resumption = "tickets"
+# session_cache_size = 4096     # "cache" のときの件数
+# tls13_tickets = 1             # TLS 1.3 でハンドシェイクごとに送るチケット数（"off" では 0）
+
 
 
 # ==========================================

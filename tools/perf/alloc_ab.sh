@@ -16,7 +16,7 @@
 #   VARIANTS_FILE=variants.txt bash tools/perf/alloc_ab.sh
 #
 # variants.txt（1 行 1 バリアント。`#` 始まりは無視）:
-#   <名前> <veil バイナリのパス> [ENV=VAL ...]
+#   <名前> <veil バイナリのパス> [ENV=VAL ...] [OPT:<設定キー>=<値> ...]（OPT は `veil -o` に渡す）
 #   例:
 #     mi_base   /path/to/veil-mimalloc
 #     mi_purge  /path/to/veil-mimalloc MIMALLOC_PURGE_DELAY=100
@@ -169,10 +169,17 @@ wait_port() {
 }
 
 VEIL_PID=""
+# 引数: バイナリ, ENV=VAL..., 設定上書き（`-o` に渡す `OPT:<key>=<value>`。例 `OPT:logging.channel_size=16384`）
 start_veil() {
     local bin="$1"; shift
-    # shellcheck disable=SC2086
-    env "$@" taskset -c "$VEIL_CPUS" "$bin" -c "$WORK/veil.toml" >"$WORK/veil.log" 2>&1 &
+    local envs=() opts=() a
+    for a in "$@"; do
+        case "$a" in
+            OPT:*) opts+=(-o "${a#OPT:}") ;;
+            *) envs+=("$a") ;;
+        esac
+    done
+    env "${envs[@]}" taskset -c "$VEIL_CPUS" "$bin" -c "$WORK/veil.toml" "${opts[@]}" >"$WORK/veil.log" 2>&1 &
     VEIL_PID=$!
     wait_port "$TLS_PORT" && wait_port "$H2C_PORT"
 }

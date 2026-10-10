@@ -3928,6 +3928,40 @@ pub struct TlsConfigSection {
     /// デフォルト: 60
     #[serde(default = "default_tls_reload_interval")]
     pub reload_interval_secs: u64,
+    /// TLS セッション再開の方式（F-183）。
+    ///
+    /// - `"tickets"`（既定）: ステートレスなセッションチケット。鍵はプロセス共有で定期的に
+    ///   ローテーションされ、サーバ側にセッション状態を持たない（ワーカー間の共有ロック無し・
+    ///   メモリ一定）。
+    /// - `"cache"`: サーバ側のセッションキャッシュ（`session_cache_size` 件、全ワーカー共有）。
+    /// - `"off"`: セッション再開をしない（チケットを送らない）。
+    #[serde(default)]
+    pub session_resumption: SessionResumption,
+    /// `session_resumption = "cache"` のキャッシュ件数（F-183）。既定 4096。
+    #[serde(default = "default_session_cache_size")]
+    pub session_cache_size: usize,
+    /// TLS 1.3 のハンドシェイクごとに送るセッションチケット数（F-183）。既定 1。
+    /// `session_resumption = "off"` のときは 0 になる。
+    #[serde(default = "default_tls13_tickets")]
+    pub tls13_tickets: usize,
+}
+
+/// TLS セッション再開の方式（`[tls] session_resumption`、F-183）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionResumption {
+    #[default]
+    Tickets,
+    Cache,
+    Off,
+}
+
+fn default_session_cache_size() -> usize {
+    4096
+}
+
+fn default_tls13_tickets() -> usize {
+    1
 }
 
 /// 証明書リロードチェック間隔のデフォルト値（秒）
@@ -6080,6 +6114,10 @@ pub fn build_server_config_from_paths(
         cipher_suites: cipher_suites.to_vec(),
         auto_reload: false,
         reload_interval_secs: default_tls_reload_interval(),
+        // 起動時の設定が `TLS_RESUMPTION` に記録済みなら、そちらが使われる。
+        session_resumption: SessionResumption::default(),
+        session_cache_size: default_session_cache_size(),
+        tls13_tickets: default_tls13_tickets(),
     };
     load_tls_config(&section, ktls_enabled, http2_enabled)
         .map_err(|e| anyhow::anyhow!("TLS reload build failed: {}", e))
@@ -6229,6 +6267,8 @@ fn load_tls_config(
         info!("TLS secret extraction enabled for kTLS support");
     }
 
+    apply_session_resumption(&mut config, tls_config)?;
+
     // HTTP/2 有効時は ALPN を設定
     #[cfg(feature = "http2")]
     if http2_enabled {
@@ -6237,6 +6277,59 @@ fn load_tls_config(
     }
 
     Ok(Arc::new(config))
+}
+
+/// プロセス共有のセッションチケット発行器（F-183）。証明書のリロードで `ServerConfig` を
+/// 作り直しても同じ鍵（とローテーション状態）を使い続け、発行済みチケットを無効にしない。
+static TLS_TICKETER: once_cell::sync::OnceCell<Arc<dyn rustls::server::ProducesTickets>> =
+    once_cell::sync::OnceCell::new();
+/// 起動時の `[tls]` のセッション再開設定（方式, キャッシュ件数, TLS 1.3 チケット数）。
+static TLS_RESUMPTION: once_cell::sync::OnceCell<(SessionResumption, usize, usize)> =
+    once_cell::sync::OnceCell::new();
+/// プロセス共有のサーバ側セッションキャッシュ（`session_resumption = "cache"`、F-183）。
+static TLS_SESSION_CACHE: once_cell::sync::OnceCell<Arc<dyn rustls::server::StoresServerSessions>> =
+    once_cell::sync::OnceCell::new();
+
+/// `[tls] session_resumption` を `ServerConfig` へ反映する（F-183）。
+///
+/// rustls の既定（全ワーカー共有の Mutex 付きキャッシュ 256 件 + TLS 1.3 チケット 2 枚）は、
+/// フルハンドシェイクのたびに共有ロック下で 2 件挿入し、再開しないクライアントでも
+/// キャッシュを掃き出し続ける。既定はステートレスチケット 1 枚にする。
+fn apply_session_resumption(config: &mut ServerConfig, tls: &TlsConfigSection) -> io::Result<()> {
+    // 最初の構築（起動時の `[tls]`）の値を記録し、証明書リロード（合成した `[tls]` で
+    // 呼ばれる）でも同じ方式を使う。変更の反映には再起動が要る。
+    let &(mode, cache_size, tickets) = TLS_RESUMPTION.get_or_init(|| {
+        (
+            tls.session_resumption,
+            tls.session_cache_size,
+            tls.tls13_tickets,
+        )
+    });
+    match mode {
+        SessionResumption::Tickets => {
+            let ticketer = TLS_TICKETER
+                .get_or_try_init(crate::tls_provider::provider::Ticketer::new)
+                .map_err(|e| io::Error::other(format!("TLS ticketer: {e}")))?;
+            config.ticketer = Arc::clone(ticketer);
+            // チケットで再開するので、サーバ側のセッション状態は持たない。
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = tickets;
+        }
+        SessionResumption::Cache => {
+            let size = cache_size.max(1);
+            let cache = TLS_SESSION_CACHE.get_or_init(|| {
+                rustls::server::ServerSessionMemoryCache::new(size)
+                    as Arc<dyn rustls::server::StoresServerSessions>
+            });
+            config.session_storage = Arc::clone(cache);
+            config.send_tls13_tickets = tickets;
+        }
+        SessionResumption::Off => {
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+        }
+    }
+    Ok(())
 }
 
 /// 設定読み込みの戻り値型（統一）
