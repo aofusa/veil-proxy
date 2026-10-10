@@ -26,6 +26,7 @@ exclude = [
     "third_party/quiche",
     "third_party/quinn-udp",
     "tools/perf/h3load",
+    "tools/perf/alloc_bench",
 ]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen

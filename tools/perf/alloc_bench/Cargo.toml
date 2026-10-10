@@ -1,0 +1,23 @@
+# alloc_bench — veil-alloc / mimalloc / システムアロケータのマイクロベンチ（F-183、計測専用）
+#
+# veil 本体のワークスペースからは除外している（tools/perf/h3load と同じ理由。ルート
+# Cargo.toml の `[workspace] exclude` と、下の空 [workspace]）。veil-alloc のソースは
+# `#[path]` で直接取り込むので、本体クレート全体をビルドしない。
+#
+# ビルド・実行:
+#   cargo run --release --manifest-path tools/perf/alloc_bench/Cargo.toml
+#   cargo run --release --manifest-path tools/perf/alloc_bench/Cargo.toml -- live_set
+[workspace]
+
+[package]
+name = "alloc_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+mimalloc = { version = "0.1.48", default-features = false }
+
+[profile.release]
+debug = 1

@@ -317,5 +317,40 @@ fn usable_size_matches_class() {
     assert_eq!(usable_size(layout(1, 1)), 16);
     assert_eq!(usable_size(layout(129, 8)), 160);
     assert_eq!(usable_size(layout(65536, 8)), 65536);
-    assert_eq!(usable_size(layout(300_000, 8)), 300_000);
+    assert_eq!(usable_size(layout(300_000, 8)), 5 * 65536);
+    assert_eq!(usable_size(layout(2_000_000, 8)), 2_000_000);
+}
+
+#[test]
+fn large_blocks_reuse_spans_and_cross_threads() {
+    let ptrs = thread::spawn(|| unsafe {
+        let mut out = Vec::new();
+        for i in 0..64usize {
+            let size = 300_000 + i * 10_000;
+            let l = layout(size, 8);
+            let p = A.alloc(l);
+            assert_eq!(p as usize % SLOT_SIZE, 0);
+            fill(p, size, i as u8);
+            if i % 2 == 0 {
+                check(p, size, i as u8);
+                A.dealloc(p, l);
+            } else {
+                out.push((p as usize, size, i as u8));
+            }
+        }
+        // ゼロ埋めの large は再利用スパンでもゼロ。
+        let l = layout(400_000, 8);
+        let z = A.alloc_zeroed(l);
+        assert!((0..400_000).step_by(997).all(|i| *z.add(i) == 0));
+        A.dealloc(z, l);
+        out
+    })
+    .join()
+    .unwrap();
+    unsafe {
+        for (p, size, tag) in ptrs {
+            check(p as *const u8, size, tag);
+            A.dealloc(p as *mut u8, layout(size, 8));
+        }
+    }
 }

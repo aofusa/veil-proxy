@@ -307,6 +307,59 @@ fn refresh_alloc_stats_gauges() {
     ALLOC_STATS_BYTES_TOTAL.set(snap.alloc_bytes as i64);
 }
 
+// ====================
+// veil-alloc の状態（F-183、`veil-alloc` feature）
+// ====================
+//
+// `veil_alloc::stats()`（遅いパスで更新するアトミックの近似値）をスクレイプ直前に反映する。
+// RSS の内訳（使用中 / purge 待ち / huge）を運用で追えるようにする。
+
+#[cfg(all(veil_alloc_active, feature = "metrics"))]
+/// veil-alloc のメモリ量（バイト）。`state` = active（スパン使用中）/ dirty（purge 待ち）/
+/// huge（OS 直接）/ purged_total（purge した累計）
+pub(crate) static VEIL_ALLOCATOR_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_allocator_bytes",
+        "veil-alloc memory by state (active, dirty, huge, purged_total)",
+    );
+    let gauge = IntGaugeVec::new(opts, &["state"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(veil_alloc_active, feature = "metrics"))]
+/// veil-alloc の構造の個数。`kind` = segments（マップ中の 4MiB セグメント）/
+/// cached_segments / heaps / abandoned_heaps / remote_frees_total
+pub(crate) static VEIL_ALLOCATOR_COUNT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_allocator_count",
+        "veil-alloc structure counts (segments, cached_segments, heaps, abandoned_heaps, remote_frees_total)",
+    );
+    let gauge = IntGaugeVec::new(opts, &["kind"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(veil_alloc_active, feature = "metrics"))]
+fn refresh_veil_allocator_gauges() {
+    let s = crate::veil_alloc::stats();
+    let b = &*VEIL_ALLOCATOR_BYTES;
+    b.with_label_values(&["active"]).set(s.active_bytes as i64);
+    b.with_label_values(&["dirty"]).set(s.dirty_bytes as i64);
+    b.with_label_values(&["huge"]).set(s.huge_bytes as i64);
+    b.with_label_values(&["purged_total"])
+        .set(s.purged_bytes_total as i64);
+    let c = &*VEIL_ALLOCATOR_COUNT;
+    c.with_label_values(&["segments"]).set(s.segments as i64);
+    c.with_label_values(&["cached_segments"])
+        .set(s.cached_segments as i64);
+    c.with_label_values(&["heaps"]).set(s.heaps as i64);
+    c.with_label_values(&["abandoned_heaps"])
+        .set(s.abandoned_heaps as i64);
+    c.with_label_values(&["remote_frees_total"])
+        .set(s.remote_frees_total as i64);
+}
+
 /// HTTP/3 接続メトリクスの RAII ガード（Drop で自動 dec）
 #[cfg(feature = "http3")]
 pub(crate) struct Http3ActiveConnGuard {
@@ -961,6 +1014,8 @@ impl CacheSaveContext {
 pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     #[cfg(feature = "alloc-stats")]
     refresh_alloc_stats_gauges();
+    #[cfg(veil_alloc_active)]
+    refresh_veil_allocator_gauges();
 
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();

@@ -17,7 +17,8 @@
 //! - **fork 安全**: グローバルロックを `pthread_atfork` で fork の前後に獲得・解放する。
 //!
 //! メモリ配置: 4MiB 境界のセグメント（64KiB スロット × 64、先頭スロットにヘッダ）。
-//! 256KiB 以下はサイズクラス（52 クラス）、それを超えるものは OS から直接マップする。
+//! 256KiB 以下はサイズクラス（52 クラス）、1MiB 以下はスロット単位の large スパン、
+//! それを超えるものは OS から直接マップする。
 //!
 //! チューニング（起動時に環境変数で上書き可。既定値は計測で決めた。F-183 チケット参照）:
 //!
@@ -53,21 +54,44 @@ pub(crate) const SLOTS: usize = SEGMENT_SIZE / SLOT_SIZE;
 /// veil 専用のグローバルアロケータ。
 pub struct VeilAlloc;
 
-/// `Layout` のサイズクラス。`None` は huge（OS 直接）。確保と解放で同じ関数を使う。
+/// large の上限（これを超えると huge）。セグメント 1 個の使用可能スロット 63 に十分収まる。
+pub(crate) const LARGE_MAX: usize = 1 << 20;
+
+/// 確保の種別。確保と解放で `Layout` から同じ関数で決める。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// サイズクラス（256KiB 以下）。
+    Small(usize),
+    /// スロット数（256KiB 超〜LARGE_MAX、アライメント 64KiB 以下）。
+    Large(usize),
+    /// OS 直接。
+    Huge,
+}
+
 #[inline(always)]
-fn classify(layout: &Layout) -> Option<usize> {
+fn classify(layout: &Layout) -> Kind {
     let size = layout.size();
     let align = layout.align();
-    if align <= MIN_ALIGN {
-        if size <= MAX_CLASS_SIZE {
-            Some(class_of(size))
-        } else {
-            None
+    if align <= MIN_ALIGN && size <= MAX_CLASS_SIZE {
+        return Kind::Small(class_of(size));
+    }
+    classify_slow(size, align)
+}
+
+#[cold]
+fn classify_slow(size: usize, align: usize) -> Kind {
+    if align > SLOT_SIZE {
+        return Kind::Huge;
+    }
+    if align > MIN_ALIGN {
+        if let Some(c) = class_of_aligned(size, align) {
+            return Kind::Small(c);
         }
-    } else if align <= SLOT_SIZE {
-        class_of_aligned(size, align)
+    }
+    if size <= LARGE_MAX {
+        Kind::Large(size.div_ceil(SLOT_SIZE))
     } else {
-        None
+        Kind::Huge
     }
 }
 
@@ -78,8 +102,10 @@ unsafe impl GlobalAlloc for VeilAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         match classify(&layout) {
             // SAFETY: class は有効なサイズクラス。
-            Some(c) => unsafe { heap::alloc(c) },
-            None => huge::alloc(layout.size(), layout.align()),
+            Kind::Small(c) => unsafe { heap::alloc(c) },
+            // SAFETY: slots は 1..=16。
+            Kind::Large(n) => unsafe { heap::alloc_large(n, 0) },
+            Kind::Huge => huge::alloc(layout.size(), layout.align()),
         }
     }
 
@@ -87,9 +113,11 @@ unsafe impl GlobalAlloc for VeilAlloc {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         match classify(&layout) {
             // SAFETY: class は有効なサイズクラス。
-            Some(c) => unsafe { heap::alloc_zeroed(c, layout.size()) },
+            Kind::Small(c) => unsafe { heap::alloc_zeroed(c, layout.size()) },
+            // SAFETY: slots は 1..=16。
+            Kind::Large(n) => unsafe { heap::alloc_large(n, layout.size().max(1)) },
             // 新規マッピングはゼロ。
-            None => huge::alloc(layout.size(), layout.align()),
+            Kind::Huge => huge::alloc(layout.size(), layout.align()),
         }
     }
 
@@ -97,8 +125,10 @@ unsafe impl GlobalAlloc for VeilAlloc {
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         match classify(&layout) {
             // SAFETY: p は同じ layout で確保されたブロック。
-            Some(_) => unsafe { heap::free(p) },
-            None => huge::free(p, layout.size()),
+            Kind::Small(_) => unsafe { heap::free(p) },
+            // SAFETY: p は同じ layout で確保された large ブロック。
+            Kind::Large(_) => unsafe { heap::free_large(p) },
+            Kind::Huge => huge::free(p, layout.size()),
         }
     }
 
@@ -106,17 +136,18 @@ unsafe impl GlobalAlloc for VeilAlloc {
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: GlobalAlloc::realloc の契約により new_size は align で丸めても isize::MAX 以下。
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let old_class = classify(&layout);
-        let new_class = classify(&new_layout);
-        match (old_class, new_class) {
-            (Some(a), Some(b)) if a == b => return p,
-            (None, None) => {
-                let q = huge::realloc(p, layout.size(), new_size, layout.align());
-                if !q.is_null() {
-                    return q;
+        let old_kind = classify(&layout);
+        let new_kind = classify(&new_layout);
+        if old_kind == new_kind {
+            match old_kind {
+                Kind::Huge => {
+                    let q = huge::realloc(p, layout.size(), new_size, layout.align());
+                    if !q.is_null() {
+                        return q;
+                    }
                 }
+                _ => return p,
             }
-            _ => {}
         }
         // SAFETY: 新しいブロックを確保して内容を移し、古いブロックを解放する。
         unsafe {
@@ -133,8 +164,9 @@ unsafe impl GlobalAlloc for VeilAlloc {
 /// クラスのブロックサイズ（テスト・診断用）。
 pub fn usable_size(layout: Layout) -> usize {
     match classify(&layout) {
-        Some(c) => CLASS_SIZE[c] as usize,
-        None => layout.size(),
+        Kind::Small(c) => CLASS_SIZE[c] as usize,
+        Kind::Large(n) => n * SLOT_SIZE,
+        Kind::Huge => layout.size(),
     }
 }
 

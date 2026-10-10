@@ -42,20 +42,21 @@ pub(crate) static CLASS_SIZE: [u32; NCLASS] = {
 
 /// スパン（同じクラスのブロックを切り出す連続スロット）のスロット数。
 ///
-/// 8KiB 以下は 1 スロット（64KiB）に 8 個以上入る。それより大きいクラスは、ブロックが
-/// 4 個以上入り、端数の無駄がスパンの 1/8 以下になる最小のスロット数を選ぶ。
+/// ブロックが 8 個以上入り、端数の無駄がスパンの 1/8 以下になる最小のスロット数を選ぶ
+/// （上限 16 スロット。8KiB 以下は 1 スロット、最大クラス 256KiB は 16 スロットに 4 個）。
 pub(crate) static CLASS_SLOTS: [u8; NCLASS] = {
     let mut t = [0u8; NCLASS];
     let mut c = 0;
     while c < NCLASS {
         let size = class_size_of(c);
-        let min_blocks = if size <= 8192 { 8 } else { 4 };
+        // 中サイズもスパンあたり 8 ブロック以上（上限 16 スロット = 1MiB）。ブロック数が
+        // 少ないとランダムな解放でスパンが頻繁に空→再取得を繰り返す。
         let mut n = 1;
         loop {
             let span = n * SLOT_SIZE;
             let blocks = span / size;
             let waste = span - blocks * size;
-            if blocks >= min_blocks && waste * 8 <= span {
+            if (blocks >= 8 && waste * 8 <= span) || n == 16 {
                 break;
             }
             n += 1;

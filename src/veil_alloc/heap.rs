@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use super::lock::SpinLock;
 use super::segment::{
     self, page_index, page_of, segment_of, Block, Page, Segment, PAGE_FRESH_FREE, PAGE_FULL,
-    PAGE_ZERO_TAIL,
+    PAGE_RETAINED, PAGE_ZERO_TAIL,
 };
 use super::size_class::{CLASS_SIZE, CLASS_SLOTS, NCLASS};
 use super::{os, stats, SLOT_SHIFT, SLOT_SIZE};
@@ -54,6 +54,8 @@ pub(crate) struct Heap {
     segments: *mut Segment,
     /// 所有セグメントのうち完全に空のものの数。
     empty_segments: u32,
+    /// クラスごとに、キューに残している空ページ（direct 以外）の数。
+    retained: [u8; NCLASS],
     /// 所有セグメントの dirty スロット数。
     dirty_slots: u32,
     /// dirty スロットの最早 purge 期限（`dirty_slots > 0` のときだけ有効）。
@@ -86,6 +88,7 @@ impl Heap {
             queue: [ptr::null_mut(); NCLASS],
             segments: ptr::null_mut(),
             empty_segments: 0,
+            retained: [0; NCLASS],
             dirty_slots: 0,
             next_purge: 0,
             abandoned_next: ptr::null_mut(),
@@ -130,6 +133,9 @@ pub(crate) static PURGE_DELAY_MS: AtomicUsize = AtomicUsize::new(1000);
 pub(crate) static DIRTY_MAX_SLOTS: AtomicUsize = AtomicUsize::new(256);
 /// ヒープあたり保持する完全に空のセグメント数。
 pub(crate) static KEEP_EMPTY_SEGMENTS: AtomicUsize = AtomicUsize::new(1);
+
+/// クラスごとに direct とは別にキューへ残す空ページ数。
+const RETAIN_EMPTY_PAGES: u8 = 1;
 
 /// 1 回の切り出しで触るバイト数の目安（未使用領域を RSS にしない）。
 const EXTEND_BYTES: usize = 16 * 1024;
@@ -222,6 +228,10 @@ unsafe fn heap_alloc(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8
                 (*page).flags |= PAGE_FULL;
             }
             page = (*heap).queue[class];
+            if !page.is_null() && (*page).flags & PAGE_RETAINED != 0 {
+                (*page).flags &= !PAGE_RETAINED;
+                (*heap).retained[class] -= 1;
+            }
             if page.is_null() {
                 page = page_new(heap, class);
                 if page.is_null() {
@@ -281,9 +291,9 @@ unsafe fn extend(page: *mut Page) {
     }
 }
 
-/// 新しいスパンを割り当て、キュー先頭に置く。
-unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
-    let n = CLASS_SLOTS[class] as usize;
+/// 連続 `n` スロットのスパンを所有セグメント（無ければ新しいセグメント）から取る。
+/// 戻り値は（ページ記述子, 内容がゼロか）。
+unsafe fn span_take(heap: *mut Heap, n: usize) -> Option<(*mut Page, bool)> {
     // SAFETY: heap の非アトミック状態は呼び出し側が排他的に持つ。
     unsafe {
         let mut found: *mut Segment = ptr::null_mut();
@@ -308,7 +318,7 @@ unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
         if found.is_null() {
             found = segment::acquire(heap);
             if found.is_null() {
-                return ptr::null_mut();
+                return None;
             }
             segment_link(heap, found);
             (*heap).empty_segments += 1;
@@ -321,19 +331,112 @@ unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
         let was_dirty = ((*seg).dirty_mask >> first) & ((1u64 << n) - 1);
         let zero = (*seg).take_run(first, n);
         (*heap).dirty_slots -= was_dirty.count_ones();
-        let bsize = CLASS_SIZE[class];
         let page = (*seg).pages.as_mut_ptr().add(first);
+        (*page).start = (seg as *mut u8).add(first << SLOT_SHIFT);
+        (*page).slots = n as u8;
+        (*page).prev = ptr::null_mut();
+        (*page).next = ptr::null_mut();
+        Some((page, zero))
+    }
+}
+
+/// 新しいスパンを割り当て、キュー先頭に置く。
+unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
+    let n = CLASS_SLOTS[class] as usize;
+    // SAFETY: heap の非アトミック状態は呼び出し側が排他的に持つ。
+    unsafe {
+        let Some((page, zero)) = span_take(heap, n) else {
+            return ptr::null_mut();
+        };
+        let bsize = CLASS_SIZE[class];
         (*page).free = ptr::null_mut();
         (*page).used = 0;
         (*page).flags = if zero { PAGE_ZERO_TAIL } else { 0 };
         (*page).class = class as u8;
-        (*page).slots = n as u8;
         (*page).capacity = 0;
-        (*page).reserved = ((n * SLOT_SIZE) / bsize as usize) as u32;
+        let reserved = ((n * SLOT_SIZE) / bsize as usize) as u32;
+        (*page).reserved = reserved;
+        (*page).requeue_at = reserved - (reserved / 8).max(1);
         (*page).block_size = bsize;
-        (*page).start = (seg as *mut u8).add(first << SLOT_SHIFT);
         queue_push_front(heap, class, page);
         page
+    }
+}
+
+// ====================
+// large（256KiB 超〜LARGE_MAX）: スロット単位のスパンを 1 ブロックとして使う
+// ====================
+
+/// large スパンの印（サイズクラスの代わりに `Page::class` へ入れる）。
+pub(crate) const LARGE_CLASS: u8 = 255;
+
+/// large の確保。`slots` スロットのスパンをそのまま返す（dirty なスロットを再利用し、
+/// 解放後は小さいクラスと同じ遅延 purge に乗る。huge の mmap/munmap より速い）。
+pub(crate) unsafe fn alloc_large(slots: usize, zero_size: usize) -> *mut u8 {
+    let mut heap = current();
+    if heap == empty_heap() {
+        heap = thread_init();
+    }
+    if heap == dead_heap() {
+        let mut g = GLOBAL_HEAP.lock();
+        if g.0.is_null() {
+            let mut h = HEAPS.lock();
+            g.0 = heap_new(&mut h);
+            if g.0.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        // SAFETY: 共有ヒープはロック下で排他的に使う。
+        return unsafe { heap_alloc_large(g.0, slots, zero_size) };
+    }
+    // SAFETY: 自スレッドのヒープ。
+    unsafe { heap_alloc_large(heap, slots, zero_size) }
+}
+
+unsafe fn heap_alloc_large(heap: *mut Heap, slots: usize, zero_size: usize) -> *mut u8 {
+    // SAFETY: heap は呼び出し側が排他的に持つ。
+    unsafe {
+        if !(*heap).remote.0.load(Ordering::Relaxed).is_null() {
+            drain_remote(heap);
+        }
+        let mut taken = span_take(heap, slots);
+        if taken.is_none() {
+            heap_collect(heap, true);
+            segment::flush_cache();
+            taken = span_take(heap, slots);
+        }
+        let Some((page, zero)) = taken else {
+            return ptr::null_mut();
+        };
+        (*page).free = ptr::null_mut();
+        (*page).used = 1;
+        (*page).flags = 0;
+        (*page).class = LARGE_CLASS;
+        (*page).capacity = 1;
+        (*page).reserved = 1;
+        (*page).requeue_at = 0;
+        (*page).block_size = (slots * SLOT_SIZE) as u32;
+        let p = (*page).start;
+        if zero_size > 0 && !zero {
+            ptr::write_bytes(p, 0, zero_size);
+        }
+        p
+    }
+}
+
+/// large の解放（所有者なら即スパン返却、他スレッドなら投函）。
+pub(crate) unsafe fn free_large(p: *mut u8) {
+    // SAFETY: p は alloc_large が返した生きているブロック。
+    unsafe {
+        let seg = segment_of(p);
+        let heap = current();
+        if (*seg).owner.load(Ordering::Relaxed) == heap {
+            let page = page_of(seg, p);
+            (*page).used = 0;
+            span_free(heap, page, os::now_ms());
+        } else {
+            free_remote(seg, p);
+        }
     }
 }
 
@@ -364,10 +467,13 @@ unsafe fn free_local(heap: *mut Heap, seg: *mut Segment, p: *mut u8) {
         let b = p as *mut Block;
         (*b).next = (*page).free;
         (*page).free = b;
-        (*page).used -= 1;
+        let used = (*page).used - 1;
+        (*page).used = used;
         let flags = (*page).flags;
         (*page).flags = flags & !PAGE_FRESH_FREE;
-        if (*page).used == 0 || flags & PAGE_FULL != 0 {
+        // 満杯ページは空きが 1/8 溜まるまでキューへ戻さない（1 つ空くたびに戻すと、
+        // 次の確保で再び満杯になり遅いパスを往復する）。
+        if used == 0 || (flags & PAGE_FULL != 0 && used <= (*page).requeue_at) {
             page_freed_slow(heap, page);
         }
     }
@@ -415,13 +521,25 @@ unsafe fn page_freed_slow(heap: *mut Heap, page: *mut Page) {
     // SAFETY: page は heap の所有ページ。
     unsafe {
         let class = (*page).class as usize;
+        if class == LARGE_CLASS as usize {
+            // large スパン（1 ブロック、キューに入らない）。
+            span_free(heap, page, os::now_ms());
+            return;
+        }
         if (*page).flags & PAGE_FULL != 0 {
             (*page).flags &= !PAGE_FULL;
             queue_push_front(heap, class, page);
         }
         if (*page).used == 0 && (*heap).direct[class] != page {
-            queue_remove(heap, class, page);
-            span_free(heap, page, os::now_ms());
+            // 空ページを 1 枚だけ（direct とは別に）キューに残し、確保・解放が境界を
+            // 行き来するときのスパン返却・再取得の往復を避ける。残りは返す。
+            if (*heap).retained[class] < RETAIN_EMPTY_PAGES {
+                (*heap).retained[class] += 1;
+                (*page).flags |= PAGE_RETAINED;
+            } else {
+                queue_remove(heap, class, page);
+                span_free(heap, page, os::now_ms());
+            }
         }
     }
 }
@@ -513,6 +631,9 @@ pub(crate) unsafe fn heap_collect(heap: *mut Heap, force: bool) {
                 if (*p).used == 0 {
                     if (*heap).direct[class] == p {
                         (*heap).direct[class] = empty_page();
+                    }
+                    if (*p).flags & PAGE_RETAINED != 0 {
+                        (*heap).retained[class] -= 1;
                     }
                     queue_remove(heap, class, p);
                     span_free(heap, p, now);

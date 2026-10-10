@@ -44,6 +44,7 @@ VEIL_CPUS="${VEIL_CPUS:-0,1}"
 LOAD_CPUS="${LOAD_CPUS:-2,3}"
 IDLE_POINTS="${IDLE_POINTS:-0 5 15 30 60}"
 H2_IMG="${H2_IMG:-local/h2load:latest}"
+WRK_IMG="${WRK_IMG:-williamyeh/wrk:latest}"
 TLS_PORT="${TLS_PORT:-19443}"
 H2C_PORT="${H2C_PORT:-19080}"
 UP_PORT="${UP_PORT:-19081}"
@@ -61,6 +62,7 @@ log() { printf '[alloc_ab] %s\n' "$*" >&2; }
 #   h2tls_*  : HTTP/2 over TLS（静的配信、多重化）
 #   h1prx_*  : HTTP/1.1 over TLS → 平文上流（プロキシ）
 #   h2cprx_* : h2c → 平文上流（プロキシ）
+#   h1tls_hs : HTTP/1.1 over TLS、要求ごとに接続を閉じる（フルハンドシェイク／接続チャーン）
 default_workloads() {
     cat <<EOF
 h1tls_54k --h1 -t2 -c256 https://127.0.0.1:${TLS_PORT}/
@@ -68,6 +70,7 @@ h1tls_3b --h1 -t2 -c256 https://127.0.0.1:${TLS_PORT}/3b.html
 h2tls_3b -t2 -c32 -m16 https://127.0.0.1:${TLS_PORT}/3b.html
 h1prx_3b --h1 -t2 -c128 https://127.0.0.1:${TLS_PORT}/p/3b.html
 h2cprx_54k -t2 -c32 -m8 http://127.0.0.1:${H2C_PORT}/p/
+h1tls_hs wrk -t2 -c64 https://127.0.0.1:${TLS_PORT}/3b.html
 EOF
 }
 WORKLOADS="${WORKLOADS:-$(default_workloads)}"
@@ -180,12 +183,20 @@ stop_veil() {
     VEIL_PID=""
 }
 
-# 負荷 1 本: rps・失敗数を返し、期間中の RSS ピークを記録する
+# 負荷 1 本: rps・失敗数を返し、期間中の RSS ピークを記録する。
+# 引数の先頭が `wrk` なら wrk（`-H "Connection: close"` で要求ごとに TLS ハンドシェイクを
+# させる接続チャーン計測用）、それ以外は h2load。
 run_load() {
     local name="$1"; shift
-    local peak=0 r logf="$WORK/load_${name}.log"
-    docker run --rm --network host --cpuset-cpus "$LOAD_CPUS" --entrypoint h2load "$H2_IMG" \
-        -D "$DURATION" --warm-up-time 1 "$@" >"$logf" 2>&1 &
+    local peak=0 r logf="$WORK/load_${name}.log" tool=h2load
+    if [ "${1:-}" = "wrk" ]; then
+        tool=wrk; shift
+        docker run --rm --network host --cpuset-cpus "$LOAD_CPUS" "$WRK_IMG" \
+            -d "${DURATION}s" -H "Connection: close" "$@" >"$logf" 2>&1 &
+    else
+        docker run --rm --network host --cpuset-cpus "$LOAD_CPUS" --entrypoint h2load "$H2_IMG" \
+            -D "$DURATION" --warm-up-time 1 "$@" >"$logf" 2>&1 &
+    fi
     local lp=$!
     while kill -0 "$lp" 2>/dev/null; do
         r=$(rss_kb "$VEIL_PID"); [ "${r:-0}" -gt "$peak" ] && peak=$r
@@ -193,6 +204,13 @@ run_load() {
     done
     wait "$lp"
     local rps failed
+    if [ "$tool" = wrk ]; then
+        rps=$(awk '/^Requests\/sec:/ {print $2}' "$logf")
+        # Socket errors（connect/read/write/timeout）と非 2xx/3xx
+        failed=$(awk '/Socket errors:/ {gsub(",","");f=$4+$6+$8+$10} /Non-2xx or 3xx/ {s=$5} END {print f+s}' "$logf")
+        echo "${rps:-0} ${failed:-0} $peak"
+        return
+    fi
     rps=$(awk '/^finished in/ {gsub(",","",$4); print $4}' "$logf")
     # 失敗 = failed + errored + 4xx/5xx（h2load の failed は非 2xx を数えない）
     failed=$(awk '/^requests:/ {f=$10+$12} /^status codes:/ {s=$7+$9} END {print f+s}' "$logf")

@@ -32,6 +32,8 @@ pub(crate) const PAGE_FULL: u8 = 1;
 pub(crate) const PAGE_FRESH_FREE: u8 = 2;
 /// ページフラグ: `capacity` 以降（まだ切り出していない部分）がゼロ。
 pub(crate) const PAGE_ZERO_TAIL: u8 = 4;
+/// ページフラグ: 空のままキューに残している（`Heap::retained` に数えている）。
+pub(crate) const PAGE_RETAINED: u8 = 8;
 
 /// スパンの記述子。セグメントヘッダ内にスロットと同数並び、スパン先頭スロットのものだけを使う。
 ///
@@ -51,7 +53,8 @@ pub(crate) struct Page {
     /// スパンに入るブロック数。
     pub(crate) reserved: u32,
     pub(crate) block_size: u32,
-    _pad2: u32,
+    /// 満杯ページをキューへ戻す使用数のしきい値（空きがブロック数の 1/8 に達したら戻す）。
+    pub(crate) requeue_at: u32,
     pub(crate) start: *mut u8,
     pub(crate) prev: *mut Page,
     pub(crate) next: *mut Page,
@@ -69,7 +72,7 @@ impl Page {
             capacity: 0,
             reserved: 0,
             block_size: 0,
-            _pad2: 0,
+            requeue_at: 0,
             start: ptr::null_mut(),
             prev: ptr::null_mut(),
             next: ptr::null_mut(),

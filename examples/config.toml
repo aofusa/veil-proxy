@@ -1337,6 +1337,8 @@ revalidate_mtime = false
 #   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
 #   veil_proxy_http_active_connections      アクティブな接続数
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
+#   veil_allocator_bytes{state}             veil-alloc のメモリ量（active / dirty / huge / purged_total。veil-alloc ビルドのみ）
+#   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
 #
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"
