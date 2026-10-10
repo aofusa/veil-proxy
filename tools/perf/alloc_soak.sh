@@ -15,7 +15,7 @@
 # 使い方:
 #   BIN=/path/to/veil MINUTES=60 bash tools/perf/alloc_soak.sh [ENV=VAL ...] [OPT:<key>=<value> ...]
 #
-# 環境変数: BIN（必須） MINUTES (30) LOAD_SECS (20) IDLE_SECS (15) SAMPLE_SECS (2)
+# 環境変数: BIN（必須） MINUTES (30) LOAD_SECS (20) IDLE_SECS (15) SAMPLE_SECS (2) SEED (42)
 #           THREADS (2) VEIL_CPUS (0,1) LOAD_CPUS (2,3) OUT（RSS 時系列 TSV）
 # alloc_ab.sh と同じ作業ディレクトリ・設定・上流（nginx）を使う。
 # =============================================================================
@@ -93,6 +93,8 @@ loads=(
     "wrkossl -t2 -c%c https://127.0.0.1:$TLS_PORT/"
 )
 
+# 負荷列の乱数の種（同じ SEED ならバリアント間で同じ負荷列になる）
+RANDOM="${SEED:-42}"
 FAILED=0
 cycle=0
 END=$(( T0 + MINUTES * 60 ))
