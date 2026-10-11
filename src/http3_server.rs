@@ -4189,7 +4189,24 @@ async fn proxy_to_h2c_backend_async(
 /// 数回引くため、既定の SipHash ではなく乱数シード付きの foldhash を使う
 /// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは
 /// 予測不能な HMAC 出力なので、シード付きの高速ハッシュで HashDoS の心配は無い。
-type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, foldhash::quality::RandomState>;
+///
+/// F-186: 値は `Box<Http3Handler>`。ハンドラは quiche の接続を値で持つ数 KB の構造体で、値のまま表に置くと
+/// 表の容量の倍増（再ハッシュ）のたびに全ハンドラを移動し、同時接続数のピークに合わせて表が
+/// ワーカーあたり 16MB まで伸びたまま残っていた。Box の確保は接続の確立ごとに 1 回（要求ごとではない）。
+type ConnMapInner =
+    HashMap<ConnectionId<'static>, Box<Http3Handler>, foldhash::quality::RandomState>;
+
+/// F-186: 接続表の容量がこの値以下なら縮めない（小さい表の伸縮を繰り返さない）。
+const CONN_MAP_SHRINK_MIN_CAPACITY: usize = 256;
+
+/// F-186: アイドル点（受信待ちのタイムアウト）で、接続が減って表の容量が 4 倍以上余っていたら縮める。
+/// 要求ごとの経路からは呼ばない（`alloc_tune::idle_tick` と同じ位置だけ）。
+fn shrink_idle_conn_map(conns: &mut ConnMapInner) {
+    let cap = conns.capacity();
+    if cap > CONN_MAP_SHRINK_MIN_CAPACITY && conns.len() * 4 < cap {
+        conns.shrink_to((conns.len() * 2).max(CONN_MAP_SHRINK_MIN_CAPACITY));
+    }
+}
 
 type ConnectionMap = Rc<RefCell<ConnMapInner>>;
 
@@ -4613,6 +4630,8 @@ pub async fn run_http3_server_async(
                 }
 
                 if let MsOutcome::Timeout = outcome {
+                    // F-186: 接続が減った後の接続表の余った容量を返す（アロケータへ返す前に）。
+                    shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
                 }
@@ -4701,6 +4720,8 @@ pub async fn run_http3_server_async(
                 }
                 RecvOutcome::Notified => None,
                 RecvOutcome::Timeout => {
+                    // F-186: 接続が減った後の接続表の余った容量を返す（アロケータへ返す前に）。
+                    shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
                     None
@@ -5202,7 +5223,7 @@ fn process_datagram_segments(
                         // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
                         // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
                         handler.dirty = true;
-                        conns.insert(scid.clone(), handler);
+                        conns.insert(scid.clone(), Box::new(handler));
                         dirty_queue.push_back(key);
 
                         prev_cid = Some(scid.clone());
@@ -5841,6 +5862,26 @@ pub(crate) fn compress_body_h3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-186: 接続が減ってアイドルになった表は縮み、小さい表・まだ埋まっている表は縮まない。
+    #[test]
+    fn idle_conn_map_shrinks_only_when_mostly_empty() {
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        conns.reserve(8192);
+        let peak = conns.capacity();
+        shrink_idle_conn_map(&mut conns);
+        assert!(
+            conns.capacity() < peak / 4,
+            "空の表が縮んでいない: {}",
+            conns.capacity()
+        );
+        assert!(conns.capacity() >= CONN_MAP_SHRINK_MIN_CAPACITY);
+
+        // 下限以下の表は触らない。
+        let small = conns.capacity();
+        shrink_idle_conn_map(&mut conns);
+        assert_eq!(conns.capacity(), small);
+    }
 
     fn check(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
         h3_check_field_section(fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))
