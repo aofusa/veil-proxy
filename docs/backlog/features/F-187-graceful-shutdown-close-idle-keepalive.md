@@ -60,3 +60,6 @@ graceful shutdown（`server::setup_signal_handler` → ワーカーの `drain_co
 - 手動（遅い上流: 応答まで 3 秒）で、要求の処理中に SIGTERM:
   HTTP/1.1・h2c・HTTP/2 は応答 200 を受け取ってから 2.1 秒で終了。HTTP/3（h2load、2 接続 × 2 並列）は
   処理中の 4 要求がすべて成功し、2.1 秒で終了。1 接続 4 要求にすると後半の 4 要求は GOAWAY を受けて始まらない。
+- E2E（io_uring・epoll とも 565 件成功）の後片付けで、修正前は veil の一部が SIGTERM の 5 秒後に
+  `Force killing process` で SIGKILL されていた（テストクライアントのキープアライブ接続を待っていた）。
+  修正後は全プロセスが SIGTERM だけで終了する。
