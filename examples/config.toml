@@ -204,10 +204,11 @@ level = "info"
 # JSON形式は構造化ログ収集システム（Elasticsearch, Loki等）との連携に適しています。
 # format = "text"
 
-# ログチャネルサイズ（内部バッファ）
-# 高負荷時のログドロップを防止するため、デフォルト(100)より大幅に増加
-# 推奨範囲: 10000 - 1000000
-# channel_size = 100000
+# ログチャネルサイズ（内部バッファ）。満杯時はブロックせず破棄する。
+# 全スロットが起動時に確保・常駐する（1 件 約 88 バイト）ため、大きくするほどアイドル時の
+# RSS が増える（100000 で約 8.8MB。F-183 で既定を 16384 = 約 1.4MB に変更）。
+# 推奨範囲: 4096 - 1000000
+# channel_size = 16384
 
 # フラッシュ間隔（ミリ秒）
 # ログバッファをディスクにフラッシュする間隔
@@ -343,6 +344,18 @@ ktls_fallback_enabled = true
 #       サンドボックスを無効化する必要がある（HTTP/3 も同条件）。
 # auto_reload = false
 # reload_interval_secs = 60
+
+# TLS セッション再開（F-183、HTTP/1.1・HTTP/2 の rustls 終端。HTTP/3 は quiche 側）
+# "tickets" = ステートレスなセッションチケット【既定】。鍵はプロセス共有で自動ローテーション
+#             （証明書リロードでも維持）。TLS 1.3 の再開はサーバ側の状態を持たず、ワーカー間の
+#             共有ロックも無い。チケット非対応の TLS 1.2 クライアント（session ID で再開する。
+#             例: LibreSSL）向けに session_cache_size 件のキャッシュも併用する。
+# "cache"   = サーバ側のセッションキャッシュ（全ワーカー共有、session_cache_size 件）
+# "off"     = セッション再開しない（チケットを送らない）
+# 変更の反映には再起動が必要（証明書リロードでは起動時の方式を引き継ぐ）。
+# session_resumption = "tickets"
+# session_cache_size = 4096     # セッションキャッシュの件数（"cache"、"tickets" の TLS 1.2 session ID 用）
+# tls13_tickets = 1             # TLS 1.3 でハンドシェイクごとに送るチケット数（"off" では 0）
 
 
 
@@ -1337,6 +1350,8 @@ revalidate_mtime = false
 #   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
 #   veil_proxy_http_active_connections      アクティブな接続数
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
+#   veil_allocator_bytes{state}             veil-alloc のメモリ量（active / dirty / huge / purged_total。veil-alloc ビルドのみ）
+#   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
 #
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"

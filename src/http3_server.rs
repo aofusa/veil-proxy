@@ -4612,6 +4612,10 @@ pub async fn run_http3_server_async(
                     drain_wake_queue(&wake_queue, &mut conns, &mut dirty_queue);
                 }
 
+                if let MsOutcome::Timeout = outcome {
+                    // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
+                    crate::alloc_tune::idle_tick();
+                }
                 if let MsOutcome::Batch(result) = outcome {
                     match result {
                         Ok(n) => {
@@ -4695,7 +4699,12 @@ pub async fn run_http3_server_async(
                     }
                     None
                 }
-                RecvOutcome::Notified | RecvOutcome::Timeout => None,
+                RecvOutcome::Notified => None,
+                RecvOutcome::Timeout => {
+                    // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
+                    crate::alloc_tune::idle_tick();
+                    None
+                }
             };
 
             if let Some(first_gro) = gro_result {

@@ -73,3 +73,4 @@ __pycache__/
 # （それぞれ数 GB。git のインデックス走査を遅くするため必ず除外する）
 /target-prof/
 /target-prof-bins/
+tools/perf/alloc_bench/target/

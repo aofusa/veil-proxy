@@ -142,6 +142,24 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `arena_eager_commit` は `main` 前（`.init_array`）で 0 にする（実行時に設定すると最初のアリーナに効かない。B-101）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
 
+### アロケータ・メモリ（F-183）
+
+- unix の `full` / `full-container` のグローバルアロケータは `src/veil_alloc/`（`veil-alloc`、build.rs の
+  `veil_alloc_active`）。高速パス（`heap::alloc` / `heap::free`）にロック・アトミック・分岐を増やさない。
+  確保と解放の分類は `Layout` だけで決める（`classify` を両側で共有。ブロックヘッダや表を足さない）。
+- アロケータ内の `thread_local!` は const 初期化かつ Drop 無しに限る（デストラクタ登録がアロケーションする）。
+  スレッド終了は pthread キーのデストラクタで検出し、ヒープは解放せず次のスレッドへ引き継ぐ。
+- アロケータの空き領域の返却はワーカーのアイドル点（accept の 1 秒タイムアウト・HTTP/3 のタイムアウト）の
+  `alloc_tune::idle_tick` だけから行う（要求ごとの経路から呼ばない）。mimalloc は `mi_collect`、FreeBSD の
+  libc jemalloc は `arena.<all>.decay`。
+- mimalloc の起動時オプションは `.init_array` で設定し、公開されていない列挙値の添字は読み戻すテストで固定する。
+  FreeBSD の libc jemalloc は `malloc_conf` シンボルで `retain:false`（FreeBSD の `madvise` は RSS を下げない）。
+- ftlog の有界チャネルは全スロットを起動時に確保・常駐させる（`[logging] channel_size` の既定を増やさない）。
+- TLS のセッション再開（`[tls] session_resumption`）のチケット鍵・キャッシュはプロセス共有（証明書リロードで
+  作り直さない）。
+- アロケータ・メモリの変更は `tools/perf/alloc_ab.sh`（BSD は `tools/perf/bsd/alloc_ab_bsd.sh`）で交互 A/B し、
+  RSS の推移と `*_cpu_us_per_req` も見る。長時間の安定性は `alloc_soak.sh` の後半の傾きで判断する。
+
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
@@ -232,6 +250,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `src/main.rs` / `src/lib.rs` / `src/entry.rs` | エントリ / クレートルート・公開 API / 起動配線 |
 | `src/runtime/` | 独自ランタイム。共有（buf/io/offload）+ `uring/`（io_uring）+ `reactor/`（epoll/kqueue/WSAPoll） |
 | `src/tls_writev.rs` | rustls 暗号文の `writev(2)` 直接送出（F-150） |
+| `src/veil_alloc/` | veil 専用アロケータ（F-183、`veil-alloc`）。`src/alloc_tune.rs` はアイドル時回収 |
 | `src/wasm_plugin_config.rs` | Proxy-Wasm プラグイン設定（`wasm` feature 非依存で常にコンパイル） |
 | `tests/`、`benches/` | 単体以外のテスト・E2E・ベンチ |
 | `examples/config.toml` | 設定リファレンス（全キー網羅） |

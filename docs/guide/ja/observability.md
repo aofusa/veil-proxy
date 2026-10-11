@@ -180,7 +180,7 @@ ftlogを使用した高性能非同期ログを提供します。ftlogは内部�
 |-----------|------|-----------|
 | `level` | ログレベル（trace/debug/info/warn/error/off） | info |
 | `format` | ログ出力形式（text/json） | text |
-| `channel_size` | 内部チャネルバッファサイズ | 100000 |
+| `channel_size` | 内部チャネルバッファサイズ（起動時に確保、1 件 約 88 バイト） | 16384 |
 | `flush_interval_ms` | ディスクフラッシュ間隔（ミリ秒） | 1000 |
 | `max_log_size` | 最大ログファイルサイズ（バイト、0=無制限） | 104857600 |
 | `app_file_path` | アプリ本体ログ（INFO/WARN/DEBUG/TRACE）の出力先 | なし（**標準出力**） |
@@ -220,7 +220,7 @@ ftlogを使用した高性能非同期ログを提供します。ftlogは内部�
 [logging]
 level = "info"
 format = "text"  # または "json"
-channel_size = 100000
+channel_size = 16384
 flush_interval_ms = 1000
 # アプリ本体ログは既定で標準出力、エラーログは既定で標準エラー出力。
 app_file_path = "/var/log/veil/veil.log"          # 任意

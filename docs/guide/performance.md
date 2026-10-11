@@ -37,8 +37,64 @@ Measured in a 1-worker TLS container (`--cpus 0.25`):
 
 - A keep-alive connection waiting for its next request holds no read buffer: it waits for readiness first and borrows the 64 KB buffer only when data has arrived. The request accumulation buffer starts at 8 KB and is returned to a per-thread pool while the connection is idle.
 - Per-thread buffer pools are allocated lazily and capped (64 entries each).
-- mimalloc arenas are not eagerly committed (`arena_eager_commit = 0`, set before `main`), which removes ~15 MB of resident memory with no measurable throughput change. Set `MIMALLOC_ARENA_EAGER_COMMIT` in the environment to override.
+- mimalloc arenas are not eagerly committed (`arena_eager_commit = 0`, set before `main`), which removes ~15 MB of resident memory with no measurable throughput change. Set `MIMALLOC_ARENA_EAGER_COMMIT` in the environment to override. See [Memory Allocators](#memory-allocators-f-183) for the F-183 changes.
 - Sizing guide: a 64 MB container sustains 600 idle TLS connections plus 400 active ones. Use `[security] max_concurrent_connections` to bound memory in smaller containers.
+
+### Memory Allocators (F-183)
+
+| Platform / build | Global allocator | Tuning |
+|---|---|---|
+| Linux, `--features full` (and `full-container`) | **veil-alloc** (`src/veil_alloc/`, recommended) | built for veil's thread-per-core workers, see below |
+| Linux, default features | mimalloc v3 | `arena_eager_commit = 0`, `purge_delay = 250` ms (set before `main`; `MIMALLOC_*` env vars override) |
+| FreeBSD (`full-freebsd`) | libc `malloc(3)` (jemalloc) | `dirty_decay_ms:1000,muzzy_decay_ms:0,retain:false,lg_tcache_max:16` via the `malloc_conf` symbol (`MALLOC_CONF` / `/etc/malloc.conf` override) |
+| OpenBSD / NetBSD | libc `malloc(3)` | — |
+| Windows | mimalloc | — |
+
+All allocators are driven by an **idle hook**: a worker's accept loop times out every second when no
+connection arrives (and the HTTP/3 loop times out when idle), and at that point veil asks the active
+allocator to return freed memory to the OS (`veil_alloc::collect`, `mi_collect`, or jemalloc
+`thread.tcache.flush` + `arena.<all>.decay`). Without it, mimalloc and jemalloc only purge when they
+are called again, so a worker that goes idle after a burst kept its peak RSS forever.
+
+**veil-alloc** is a thread-local, size-class, per-page free-list allocator:
+
+- The fast paths are a pop / push on the current page's free list with no lock or atomic. Because
+  `GlobalAlloc` passes the size on free, there is no per-block header and no pointer→size lookup.
+- 4 MiB segments of 64 KiB slots; 52 size classes up to 256 KiB, slot-sized spans up to 1 MiB, larger
+  requests are `mmap`ed and `munmap`ed on free.
+- Frees from other threads (logger, offload pool, channels) are pushed lock-free onto the owner's list
+  and drained by the owner.
+- Emptied spans are kept resident for `VEIL_ALLOC_PURGE_DELAY_MS` (default 1000) and then `madvise`d
+  away; resident-but-free memory per heap is capped (`VEIL_ALLOC_DIRTY_MAX_MB`, default 16); at most
+  `VEIL_ALLOC_SEGMENT_CACHE` (default 8) empty segments are cached process-wide.
+- A thread's heap is handed to the next thread when it exits, so thread churn does not grow memory;
+  global locks are taken around `fork(2)`.
+- Prometheus (with `metrics`): `veil_allocator_bytes{state="active|dirty|huge|purged_total"}` and
+  `veil_allocator_count{kind="segments|cached_segments|heaps|abandoned_heaps|remote_frees_total"}`.
+
+Measured with `tools/perf/alloc_ab.sh` (Linux, 2 workers pinned to 2 cores, load from the other 2 cores,
+interleaved A/B, median of 5 rounds; HTTP/1.1 and HTTP/2 over TLS, static and proxied, plus connection churn;
+no failed requests anywhere):
+
+| | mimalloc (before F-183) | mimalloc (tuned) | veil-alloc |
+|---|---|---|---|
+| Throughput | baseline | −0.1 to +1.1% | −0.3 to **+4.2%** (HTTP/2 TLS 3 B) |
+| veil CPU time per request | baseline | −1.0 to +1.1% | **−1.6 to −4.1%** |
+| Idle RSS | 24.0 MB | 17.1 MB | 16.8 MB (anonymous: 3.5 MB) |
+| Peak RSS under load | baseline | −12 to −17% | −13 to −21% |
+| RSS 30 s after the load | 87.4 MB | 75.0 MB | 73.8 MB |
+
+A 40-minute soak with the same seeded load sequence for both (`tools/perf/alloc_soak.sh`: random mixes of all
+workloads, up to two at once, with 15 s idle gaps) finished with zero failed requests. The post-idle RSS floor
+rises while veil's capped pools and caches fill to the peak-load size and then stays bounded (veil-alloc
+85 MB at the end, mimalloc 87 MB; the steady-state trend is downward for both). With FreeBSD's default
+jemalloc settings the same kind of soak kept rising (+27 MB/h); the tuned `malloc_conf` stays flat.
+
+The idle drop comes mostly from `[logging] channel_size` (ftlog preallocates every slot; the default
+went from 100000 to 16384, −7 MB). `tools/perf/alloc_bench` compares the allocators directly: veil-alloc
+is 18–60% faster than mimalloc on small-object, request-batch, 64 KiB-buffer, cross-thread and
+`realloc` patterns and on par for a 4-thread mixed live set. On FreeBSD the tuned `malloc_conf` cut RSS
+after load from 102 MB to 52 MB with equal or lower CPU time per request.
 
 ### SO_REUSEPORT CBPF Load Balancing
 

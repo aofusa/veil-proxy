@@ -26,6 +26,7 @@ exclude = [
     "third_party/quiche",
     "third_party/quinn-udp",
     "tools/perf/h3load",
+    "tools/perf/alloc_bench",
 ]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
@@ -193,6 +194,13 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # ビルド方法: cargo build --no-default-features --features "ktls,http2,jemalloc"
 jemalloc = ["dep:tikv-jemallocator"]
 
+# veil 専用アロケータ（F-183、src/veil_alloc/）
+# thread-per-core 向けのスレッドローカル・ページ単位フリーリスト。依存クレート無し（libc のみ）。
+# 有効化すると mimalloc / jemalloc より優先して `#[global_allocator]` になる（unix のみ。
+# Windows では無視して他のアロケータへフォールバックする）。
+# ビルド方法: cargo build --features "full,veil-alloc"
+veil-alloc = []
+
 # システムアロケータ（明示的指定用）
 # --no-default-features 時のデフォルト
 # ビルド方法: cargo build --no-default-features --features system-allocator
@@ -279,7 +287,8 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "mimalloc",
+    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc
+    "veil-alloc", "mimalloc",
     "admin",
     "access-log",
     "l4-proxy",
@@ -292,7 +301,7 @@ full = [
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
-# 通常の `--features full` は従来どおり mimalloc のままで挙動を変えない。
+# 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
 #
 # **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
 # `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
@@ -378,7 +387,7 @@ full-container = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "mimalloc",
+    "veil-alloc", "mimalloc",
     "admin",
     "access-log",
     "l4-proxy",

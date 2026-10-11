@@ -5,14 +5,27 @@
 // メモリアロケータ選択
 // ====================
 
-#[cfg(feature = "mimalloc")]
+// F-183: veil 専用アロケータ。`veil-alloc` feature かつ unix（build.rs の
+// `veil_alloc_active`）のとき、mimalloc / jemalloc より優先して使う。
+#[cfg(veil_alloc_active)]
+pub mod veil_alloc;
+
+#[cfg(all(veil_alloc_active, not(feature = "alloc-stats")))]
+#[global_allocator]
+static GLOBAL: veil_alloc::VeilAlloc = veil_alloc::VeilAlloc;
+
+#[cfg(all(feature = "mimalloc", not(veil_alloc_active)))]
 use mimalloc::MiMalloc;
 
-#[cfg(all(feature = "mimalloc", not(feature = "alloc-stats")))]
+#[cfg(all(
+    feature = "mimalloc",
+    not(veil_alloc_active),
+    not(feature = "alloc-stats")
+))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(veil_alloc_active)))]
 use tikv_jemallocator::Jemalloc;
 
 // B-89: FreeBSD 向けの tikv-jemalloc は libthr のフック（`_malloc_thread_cleanup` 等）を
@@ -27,6 +40,7 @@ compile_error!(
 
 #[cfg(all(
     feature = "jemalloc",
+    not(veil_alloc_active),
     not(feature = "mimalloc"),
     not(feature = "alloc-stats")
 ))]
@@ -34,18 +48,27 @@ compile_error!(
 static GLOBAL: Jemalloc = Jemalloc;
 
 // F-165 Phase 1: `alloc-stats` feature 有効時は、既存の選択ロジックが選ぶはずの
-// アロケータ（mimalloc → jemalloc → システムアロケータの優先順）を
+// アロケータ（veil-alloc → mimalloc → jemalloc → システムアロケータの優先順）を
 // `CountingAllocator` で包んだものに差し替える。opt-in・診断ビルド専用。
 #[cfg(feature = "alloc-stats")]
 pub mod alloc_stats;
 
-#[cfg(all(feature = "alloc-stats", feature = "mimalloc"))]
+/// F-183: アロケータのアイドル時回収（ワーカーのアイドル点から呼ぶ）。
+pub(crate) mod alloc_tune;
+
+#[cfg(all(feature = "alloc-stats", veil_alloc_active))]
+#[global_allocator]
+static GLOBAL: alloc_stats::CountingAllocator<veil_alloc::VeilAlloc> =
+    alloc_stats::CountingAllocator(veil_alloc::VeilAlloc);
+
+#[cfg(all(feature = "alloc-stats", feature = "mimalloc", not(veil_alloc_active)))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingAllocator(MiMalloc);
 
 #[cfg(all(
     feature = "alloc-stats",
     feature = "jemalloc",
+    not(veil_alloc_active),
     not(feature = "mimalloc")
 ))]
 #[global_allocator]
@@ -53,6 +76,7 @@ static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingA
 
 #[cfg(all(
     feature = "alloc-stats",
+    not(veil_alloc_active),
     not(feature = "mimalloc"),
     not(feature = "jemalloc")
 ))]

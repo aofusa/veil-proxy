@@ -19,7 +19,7 @@ The following table lists default values for major configuration options:
 | `[server]` | `http3_enabled` | `false` | Enable HTTP/3 |
 | `[logging]` | `level` | `"info"` | Log level |
 | `[logging]` | `format` | `"text"` | Log format |
-| `[logging]` | `channel_size` | `100000` | Log channel buffer size |
+| `[logging]` | `channel_size` | `16384` | Log channel buffer size (slots are preallocated and resident, ~88 bytes each; full → messages are dropped, never blocking) |
 | `[logging]` | `flush_interval_ms` | `1000` | Flush interval (ms) |
 | `[logging]` | `app_file_path` | none (stdout) | App log (INFO/WARN/DEBUG) output path |
 | `[logging]` | `error_file_path` | none (stderr) | Error log (ERROR) output path |
@@ -131,7 +131,7 @@ level = "info"
 # Log output format: "text", "json"
 # format = "text"
 # Log channel size (prevents log drops under high load)
-channel_size = 100000
+channel_size = 16384
 # Flush interval (milliseconds)
 flush_interval_ms = 1000
 # Maximum log file size (bytes, 0=no rotation)

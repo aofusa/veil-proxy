@@ -18,9 +18,26 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EPOLL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VEIL_ALLOC");
 
     emit_runtime_backend_cfg();
     emit_wasm_nosignals_cfg();
+    emit_allocator_cfg();
+}
+
+/// F-183: veil 専用アロケータ（`veil-alloc` feature）を実際に使うかの cfg エイリアス。
+///
+/// | cfg | 条件 | 意味 |
+/// |-----|------|------|
+/// | `veil_alloc_active` | `feature = "veil-alloc"` かつ `target_family = "unix"` | `src/veil_alloc/` をコンパイルし `#[global_allocator]` にする。Windows では feature を無視して mimalloc 等へフォールバックする（pthread キー・mmap 前提のため） |
+fn emit_allocator_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(veil_alloc_active)");
+    let unix = std::env::var("CARGO_CFG_TARGET_FAMILY")
+        .map(|f| f.split(',').any(|x| x == "unix"))
+        .unwrap_or(false);
+    if feature_enabled("VEIL_ALLOC") && unix {
+        println!("cargo::rustc-cfg=veil_alloc_active");
+    }
 }
 
 fn feature_enabled(name: &str) -> bool {
