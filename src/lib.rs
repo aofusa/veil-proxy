@@ -14,13 +14,14 @@ pub mod veil_alloc;
 #[global_allocator]
 static GLOBAL: veil_alloc::VeilAlloc = veil_alloc::VeilAlloc;
 
-// F-184: mimalloc は build.rs の `veil_mimalloc_active` のときだけ使う（Windows・macOS は
-// `mimalloc-force` が無い限りシステムアロケータ）。
-
-#[cfg(veil_mimalloc_active)]
+#[cfg(all(feature = "mimalloc", not(veil_alloc_active)))]
 use mimalloc::MiMalloc;
 
-#[cfg(all(veil_mimalloc_active, not(feature = "alloc-stats")))]
+#[cfg(all(
+    feature = "mimalloc",
+    not(veil_alloc_active),
+    not(feature = "alloc-stats")
+))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -40,7 +41,7 @@ compile_error!(
 #[cfg(all(
     feature = "jemalloc",
     not(veil_alloc_active),
-    not(veil_mimalloc_active),
+    not(feature = "mimalloc"),
     not(feature = "alloc-stats")
 ))]
 #[global_allocator]
@@ -60,7 +61,7 @@ pub(crate) mod alloc_tune;
 static GLOBAL: alloc_stats::CountingAllocator<veil_alloc::VeilAlloc> =
     alloc_stats::CountingAllocator(veil_alloc::VeilAlloc);
 
-#[cfg(all(feature = "alloc-stats", veil_mimalloc_active))]
+#[cfg(all(feature = "alloc-stats", feature = "mimalloc", not(veil_alloc_active)))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingAllocator(MiMalloc);
 
@@ -68,7 +69,7 @@ static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingA
     feature = "alloc-stats",
     feature = "jemalloc",
     not(veil_alloc_active),
-    not(veil_mimalloc_active)
+    not(feature = "mimalloc")
 ))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingAllocator(Jemalloc);
@@ -76,7 +77,7 @@ static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingA
 #[cfg(all(
     feature = "alloc-stats",
     not(veil_alloc_active),
-    not(veil_mimalloc_active),
+    not(feature = "mimalloc"),
     not(feature = "jemalloc")
 ))]
 #[global_allocator]

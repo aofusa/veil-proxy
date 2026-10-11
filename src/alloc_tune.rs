@@ -44,7 +44,7 @@ fn collect_now() {
     crate::veil_alloc::collect(false);
 }
 
-#[cfg(veil_mimalloc_active)]
+#[cfg(all(not(veil_alloc_active), feature = "mimalloc"))]
 fn collect_now() {
     // SAFETY: mi_collect はスレッドのヒープを回収するだけで、引数の制約は無い。
     unsafe { libmimalloc_sys::mi_collect(false) };
@@ -52,7 +52,7 @@ fn collect_now() {
 
 #[cfg(all(
     not(veil_alloc_active),
-    not(veil_mimalloc_active),
+    not(feature = "mimalloc"),
     target_os = "freebsd"
 ))]
 fn collect_now() {
@@ -61,7 +61,7 @@ fn collect_now() {
 
 #[cfg(all(
     not(veil_alloc_active),
-    not(veil_mimalloc_active),
+    not(feature = "mimalloc"),
     not(target_os = "freebsd")
 ))]
 fn collect_now() {}

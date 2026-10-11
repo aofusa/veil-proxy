@@ -187,14 +187,7 @@ grpc-full = ["grpc", "grpc-web", "http3"]
 # mimalloc 高速メモリアロケータ（デフォルト）
 # Huge Pages サポート付き
 # ビルド方法: cargo build --features mimalloc（デフォルトで有効）
-# F-184: Windows と macOS では無視してシステムアロケータ（HeapAlloc / libmalloc）を使う
-# （cargo にターゲット別の default features が無いため build.rs の `veil_mimalloc_active` で
-# 切り替える。依存はビルドされるが `#[global_allocator]` にしないのでリンクされない）。
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
-
-# Windows・macOS でも mimalloc を使う（F-184。既定はシステムアロケータ）
-# ビルド方法: cargo build --features mimalloc-force
-mimalloc-force = ["mimalloc"]
 
 # jemalloc メモリアロケータ
 # mimalloc と排他的に使用（同時に有効化しないこと）
@@ -204,7 +197,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 # veil 専用アロケータ（F-183、src/veil_alloc/）
 # thread-per-core 向けのスレッドローカル・ページ単位フリーリスト。依存クレート無し（libc のみ）。
 # 有効化すると mimalloc / jemalloc より優先して `#[global_allocator]` になる（unix のみ。
-# Windows と macOS（F-184）では無視して他のアロケータへフォールバックする）。
+# Windows では無視して他のアロケータへフォールバックする）。
 # ビルド方法: cargo build --features "full,veil-alloc"
 veil-alloc = []
 
@@ -294,8 +287,7 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    # F-183: Linux・BSD は veil-alloc（mimalloc より優先）。
-    # F-184: Windows・macOS はどちらも無視してシステムアロケータ
+    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc
     "veil-alloc", "mimalloc",
     "admin",
     "access-log",
@@ -309,8 +301,7 @@ full = [
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
-# 通常の `--features full` は Linux で veil-alloc（F-183）、Windows・macOS でシステム
-# アロケータ（F-184）を使う。
+# 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
 #
 # **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
 # `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
@@ -415,7 +406,6 @@ webpki-roots = "1.0.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
 # mimalloc 高速メモリアロケータ（mimalloc feature で有効化）
-# F-184: Windows・macOS では `mimalloc-force` が無い限りリンクしない（build.rs の `veil_mimalloc_active`）
 mimalloc = { version = "0.1.48", default-features = false, optional = true }
 # Huge Pages (Large OS Pages) 設定用
 # mimallocの低レベルAPIを使用してLarge OS Pagesを有効化
