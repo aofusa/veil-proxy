@@ -13,7 +13,7 @@
 #
 # ARG:
 #   RUST_TARGET     x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
-#   CARGO_FEATURES  既定 full（http3 + wasm 含む全機能）
+#   CARGO_FEATURES  既定 full-windows（full と同じ http3 + wasm 含む全機能。アロケータはシステムアロケータ。F-184）
 #
 # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
 # 一元管理する。Windows は "0"（quiche は内蔵 BoringSSL を使うため、aws-lc-sys の
@@ -57,7 +57,7 @@ ENV CMAKE_SYSTEM_NAME=Windows \
 # ==========================================
 FROM tool-builder AS cacher
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-windows
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
@@ -88,7 +88,7 @@ RUN mkdir src benches \
 # ==========================================
 FROM tool-builder AS builder
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-windows
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
 # cacher ステージから「ビルド済みの依存関係アセット」を引き継ぐ

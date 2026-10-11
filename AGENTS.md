@@ -53,7 +53,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - データプレーンは tokio / monoio に依存しない（テスト・クライアント用途は別）。
 - `cfg(feature)` を壊さない。`default = ["ktls", "http2", "mimalloc"]` を崩さず、無効 feature でもコンパイル可能に保つ。
-  BSD 向けは `full-freebsd` / `full-openbsd` / `full-netbsd` という別 feature セットで表現する。
+  BSD 向けは `full-freebsd` / `full-openbsd` / `full-netbsd`、Windows・macOS 向け（システムアロケータ）は
+  `full-windows` / `full-macos` という別 feature セットで表現する（F-184）。
 - バックエンドは build.rs 発行の cfg で選ぶ: Linux 既定 = io_uring（`veil_rt_uring`）、`--features epoll`・BSD・macOS・
   Windows = readiness reactor（`veil_rt_reactor`、poller は `veil_poller_{epoll,kqueue,wsapoll}`）。
   **io_uring パスのロジックは reactor 追加で変えない。** 公開パス `runtime::tcp` 等はファサードで不変。

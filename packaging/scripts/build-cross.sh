@@ -30,7 +30,8 @@
 #   ./packaging/scripts/build-cross.sh --target windows
 #
 # 環境変数:
-#   CARGO_FEATURES  ビルドする feature セット（デフォルト: "full"（http3, wasm 含む全機能））
+#   CARGO_FEATURES  ビルドする feature セット（デフォルト: macos は "full-macos"、windows は
+#                   "full-windows"。どちらも full と同じ全機能でアロケータだけシステムアロケータ。F-184）
 set -euo pipefail
 
 
@@ -41,12 +42,14 @@ OUTPUT_DIR="${PKG_ROOT}/output"
 BUILD_DIR="${PKG_ROOT}/build"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 
-# macOS / Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能。
+# macOS クロスビルドデフォルト feature セット（full-macos: full と同じ http3, wasm 含む全機能で、
+# アロケータは mimalloc ではなくシステムの libmalloc。F-184。
 # TLS 暗号は aws_lc_rs プロバイダを使用、quiche には BoringSSL を使用）。
-DEFAULT_MACOS_FEATURES="full"
+DEFAULT_MACOS_FEATURES="full-macos"
 
-# Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能）。
-DEFAULT_WINDOWS_FEATURES="full"
+# Windows クロスビルドデフォルト feature セット（full-windows: full と同じ全機能で、
+# アロケータは mimalloc ではなく Windows のヒープ。F-184）。
+DEFAULT_WINDOWS_FEATURES="full-windows"
 
 TARGET_OS=""
 

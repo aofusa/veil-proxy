@@ -363,21 +363,23 @@ OpenBSD を想定しておらず cc ラッパ・libstdc++ 互換リンクが要�
 対象 OS の VM 内で `build-bsd.sh` を直接実行する場合は `--os-version` 省略で
 `uname -r` から自動検出される。
 
-### BSD 向けの feature セット（`full-freebsd` / `full-openbsd`）
+### プラットフォーム別の feature セット（`full-freebsd` / `full-openbsd` / `full-netbsd` / `full-macos` / `full-windows`）
 
-BSD 向けパッケージは `full` ではなく **BSD 専用の feature セット**でビルドする
+BSD・macOS・Windows 向けパッケージは `full` ではなく **プラットフォーム専用の feature セット**でビルドする
 （`Cargo.toml` の `[features]`）。機能セットは `full` と同一で、**アロケータと
 FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別の default features が
 無いため、packaging のスクリプト側で `--no-default-features` と併せて明示指定する。
 
 | セット | アロケータ | 追加 | 使う場所 |
 |---|---|---|---|
-| `full`（既定） | mimalloc | — | Linux / macOS / Windows |
+| `full`（既定） | unix: veil-alloc（F-183）/ Windows: mimalloc | — | Linux |
+| `full-macos` | **システムアロケータ**（libmalloc。F-184） | — | `build-cross.sh --target macos` |
+| `full-windows` | **システムアロケータ**（Windows のヒープ。F-184） | — | `build-cross.sh --target windows` |
 | `full-freebsd` | **システムアロケータ**（libc の jemalloc。tikv-jemalloc は B-89 で廃止） | — | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
 | `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 
-通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
+通常の `cargo build --features full` の挙動は従来どおり（unix は veil-alloc、Windows は mimalloc、AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
 
 > **FreeBSD の Docker クロスビルドは削除済み（B-49、未解決のため経路を撤去）**
@@ -437,7 +439,8 @@ macOS は Docker（`messense/cargo-zigbuild`）で **universal2（x86_64 + aarch
 fat binary）をクロスビルド**できる。FreeBSD/OpenBSD と異なり VM ネイティブビルドは
 不要。QEMU 実行・実機検証は行っていない（クロスビルドが通ることのみを合格基準と
 する。設計は `docs/artifacts/f125_windows_macos_design.md`）。
-デフォルトで `--features full`（HTTP/3 + WASM 含む全機能）でビルドされる。
+デフォルトで `--features full-macos`（`full` と同じ HTTP/3 + WASM 含む全機能で、アロケータは
+システムの libmalloc。F-184）でビルドされる。
 
 ```bash
 ./packaging/scripts/build-cross.sh --target macos
@@ -446,7 +449,7 @@ fat binary）をクロスビルド**できる。FreeBSD/OpenBSD と異なり VM 
 内部では [`docker/Dockerfile.macos`](../docker/Dockerfile.macos)（`messense/cargo-zigbuild`
 ベース、`Dockerfile.glibc` と同じ cacher/builder 2 段構成）を
 `--target artifact --output type=local` でビルドし、`cargo zigbuild --release --target
-universal2-apple-darwin --features full` の成果物を取り出す。2 段構成のため、ソース
+universal2-apple-darwin --no-default-features --features full-macos` の成果物を取り出す。2 段構成のため、ソース
 変更だけの再ビルドでは `aws-lc-sys` / `boring-sys` の重い C ビルドがレイヤキャッシュ
 から再利用される（B-47）。macOS は
 rustls の暗号プロバイダに **aws_lc_rs** を使い（`Cargo.toml` の target 別依存、F-131）、
@@ -466,7 +469,8 @@ Windows は Docker（`messense/cargo-xwin`）で **x86_64-pc-windows-msvc** と
 VM ネイティブビルドは不要）。QEMU 実行・実機検証は行っていない
 （クロスビルドが通ることのみを合格基準とする。設計は
 `docs/artifacts/f125_windows_macos_design.md`）。
-デフォルトで `--features full`（HTTP/3 + WASM 含む全機能）でビルドされる。
+デフォルトで `--features full-windows`（`full` と同じ HTTP/3 + WASM 含む全機能で、アロケータは
+Windows のヒープ。F-184）でビルドされる。
 
 ```bash
 ./packaging/scripts/build-cross.sh --target windows
@@ -475,7 +479,7 @@ VM ネイティブビルドは不要）。QEMU 実行・実機検証は行って
 内部では [`docker/Dockerfile.windows`](../docker/Dockerfile.windows)（`messense/cargo-xwin`
 ベース、`Dockerfile.glibc` と同じ cacher/builder 2 段構成）を
 `--target artifact --output type=local` でビルドし、
-`cargo xwin build --release --target <target> --features full` を x86_64/aarch64 両方に
+`cargo xwin build --release --target <target> --no-default-features --features full-windows` を x86_64/aarch64 両方に
 対して実行して、それぞれ zip を出力する。2 段構成により `aws-lc-sys` / `boring-sys` の
 C ビルドと xwin の Windows SDK 取得がレイヤキャッシュに残る（B-47）。rustls の暗号プロバイダは **x86_64 / aarch64 ともに aws_lc_rs**
 を使用し（`Cargo.toml` の target 別依存、F-131）、`http3` (quiche) には BoringSSL (`boring-sys`) を、

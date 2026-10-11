@@ -287,7 +287,8 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc
+    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc。
+    # Windows・macOS の配布ビルドはシステムアロケータの full-windows / full-macos を使う（F-184）
     "veil-alloc", "mimalloc",
     "admin",
     "access-log",
@@ -302,6 +303,8 @@ full = [
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
 # 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
+# Windows・macOS も同じ理由で `full-windows` / `full-macos`（システムアロケータ、F-184）を
+# 用意し、packaging/scripts/build-cross.sh と docker/Dockerfile.{windows,macos} が使う。
 #
 # **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
 # `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
@@ -370,6 +373,36 @@ full-openbsd = [
 # `compile_error!("unsupported platform")` になる）が、FreeBSD/OpenBSD aarch64 と同様に
 # `third_party/wasmtime`（`veil-wasmtime`）＋ Pulley インタープリタ実行で解消した。
 full-netbsd = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# Windows: mimalloc・veil-alloc を使わずシステムアロケータ（Windows のヒープ）を使う（F-184）。
+# 機能セットは `full` と同一（`ktls` は Linux/FreeBSD 以外では build.rs が無効化する）。
+# packaging/scripts/build-cross.sh --target windows（docker/Dockerfile.windows）が使う。
+full-windows = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# macOS: mimalloc・veil-alloc を使わずシステムアロケータ（libmalloc）を使う（F-184）。
+# 機能セットは `full` と同一。packaging/scripts/build-cross.sh --target macos
+# （docker/Dockerfile.macos）が使う。
+full-macos = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
     "opentelemetry",
