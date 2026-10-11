@@ -1645,6 +1645,11 @@ mod b115_shutdown_signals {
     use std::time::{Duration, Instant};
 
     fn start(dir: &Path) -> Child {
+        start_with(dir, "").0
+    }
+
+    /// `server_extra` は `[server]` に足す行。戻り値は子プロセスと待ち受けポート。
+    fn start_with(dir: &Path, server_extra: &str) -> (Child, u16) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
         std::fs::write(dir.join("key.pem"), cert.signing_key.serialize_pem()).unwrap();
@@ -1658,6 +1663,7 @@ mod b115_shutdown_signals {
             r#"[server]
 listen = "127.0.0.1:{port}"
 threads = 1
+{server_extra}
 
 [logging]
 level = "info"
@@ -1695,7 +1701,7 @@ path = "{d}/"
             assert!(Instant::now() < deadline, "veil did not start listening");
             std::thread::sleep(Duration::from_millis(100));
         }
-        child
+        (child, port)
     }
 
     fn log_of(dir: &Path) -> String {
@@ -1745,6 +1751,31 @@ path = "{d}/"
     #[test]
     fn sigint_shuts_down_gracefully() {
         assert_graceful_exit(libc::SIGINT);
+    }
+
+    /// B-118: graceful shutdown の待ちが切れて接続が残っていても、abort せずに終了コード 0 で終わること
+    /// （残った接続タスクがスレッドローカルの破棄中に drop され、破棄済みの op テーブルに触れて
+    /// panic → abort していた）。
+    #[test]
+    fn sigterm_with_open_connection_exits_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, port) = start_with(dir.path(), "graceful_shutdown_timeout_secs = 1");
+        // TLS ハンドシェイクを始めない接続（接続タスクが読み取り待ちのまま残る）
+        let _idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        send(&child, libc::SIGTERM);
+        let st = wait_exit(&mut child, Duration::from_secs(20));
+        if st.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let st = st.expect("veil did not exit after SIGTERM");
+        let log = log_of(dir.path());
+        assert!(st.success(), "veil did not exit cleanly: {st:?}\n{log}");
+        assert!(
+            log.contains("Drain timeout") && log.contains("Server shutdown complete"),
+            "expected a forced drain and a clean shutdown:\n{log}"
+        );
     }
 
     #[test]

@@ -35,3 +35,10 @@ E2E の停止処理（`tests/e2e_setup.sh` の `stop_servers`）は SIGTERM の 
 
 修正後、ネイティブ（seccomp・Landlock 有効）と sanitizer ビルドのコンテナで、SIGTERM から graceful shutdown して
 終了コード 0 で終わることを確認した。
+
+## 関連
+
+- SIGTERM が効くようになったことで、drain の待ちが切れたときに abort する既存の不具合（SIGINT では以前から
+  起きていた）を通りやすくなったため、同じブランチで直した（B-118）。
+- graceful shutdown はアイドルなキープアライブ接続も待つため、クライアントが接続を保持していると上限
+  （既定 30 秒）まで終わらない。改善は F-187。

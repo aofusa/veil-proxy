@@ -5734,7 +5734,11 @@ fn put_h3_send_scratch(mut scratch: H3SendScratch) {
 /// 別スレッドで monoio ランタイムを作成して実行します。
 pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io::Result<()> {
     // カスタム io_uring ランタイムで非同期 HTTP/3 サーバーを実行
-    crate::runtime::block_on(async move { run_http3_server_async(bind_addr, config).await })
+    let r =
+        crate::runtime::block_on(async move { run_http3_server_async(bind_addr, config).await });
+    // B-118: 残った接続タスクをスレッドローカルが生きているうちに破棄する
+    crate::runtime::shutdown_thread();
+    r
 }
 
 // ====================
