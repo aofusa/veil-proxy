@@ -13,7 +13,7 @@
 #
 # ARG:
 #   RUST_TARGET     x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
-#   CARGO_FEATURES  既定 full-windows（full と同じ http3 + wasm 含む全機能。アロケータはシステムアロケータ。F-184）
+#   CARGO_FEATURES  既定 full-windows（full と同じ http3 + wasm 含む全機能。アロケータは mimalloc。F-184）
 #
 # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
 # 一元管理する。Windows は "0"（quiche は内蔵 BoringSSL を使うため、aws-lc-sys の

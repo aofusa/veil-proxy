@@ -31,7 +31,8 @@
 #
 # 環境変数:
 #   CARGO_FEATURES  ビルドする feature セット（デフォルト: macos は "full-macos"、windows は
-#                   "full-windows"。どちらも full と同じ全機能でアロケータだけシステムアロケータ。F-184）
+#                   "full-windows"。どちらも full と同じ全機能で、アロケータは macOS がシステムの
+#                   libmalloc、Windows が mimalloc。F-184）
 set -euo pipefail
 
 
@@ -48,7 +49,7 @@ VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 DEFAULT_MACOS_FEATURES="full-macos"
 
 # Windows クロスビルドデフォルト feature セット（full-windows: full と同じ全機能で、
-# アロケータは mimalloc ではなく Windows のヒープ。F-184）。
+# アロケータは veil-alloc（unix 専用）の代わりに mimalloc。F-184）。
 DEFAULT_WINDOWS_FEATURES="full-windows"
 
 TARGET_OS=""

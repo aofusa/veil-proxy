@@ -374,7 +374,7 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 |---|---|---|---|
 | `full`（既定） | veil-alloc（F-183。Windows では default の mimalloc） | — | Linux |
 | `full-macos` | **システムアロケータ**（libmalloc。F-184） | — | `build-cross.sh --target macos` |
-| `full-windows` | **システムアロケータ**（Windows のヒープ。F-184） | — | `build-cross.sh --target windows` |
+| `full-windows` | mimalloc（F-184） | — | `build-cross.sh --target windows` |
 | `full-freebsd` | **システムアロケータ**（libc の jemalloc。tikv-jemalloc は B-89 で廃止） | — | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
 | `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
@@ -470,7 +470,7 @@ VM ネイティブビルドは不要）。QEMU 実行・実機検証は行って
 （クロスビルドが通ることのみを合格基準とする。設計は
 `docs/artifacts/f125_windows_macos_design.md`）。
 デフォルトで `--features full-windows`（`full` と同じ HTTP/3 + WASM 含む全機能で、アロケータは
-Windows のヒープ。F-184）でビルドされる。
+mimalloc。F-184）でビルドされる。
 
 ```bash
 ./packaging/scripts/build-cross.sh --target windows

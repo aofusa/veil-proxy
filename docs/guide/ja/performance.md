@@ -48,7 +48,8 @@ threads = 0  # 未指定または0の場合はCPUコア数と同じ
 | Linux、既定 feature | mimalloc v3 | `arena_eager_commit = 0`・`purge_delay = 250` ms（`main` 前に設定。`MIMALLOC_*` 環境変数が優先） |
 | FreeBSD（`full-freebsd`） | libc の `malloc(3)`（jemalloc） | `malloc_conf` シンボルで `dirty_decay_ms:1000,muzzy_decay_ms:0,retain:false,lg_tcache_max:16`（`MALLOC_CONF`・`/etc/malloc.conf` が優先） |
 | OpenBSD / NetBSD | libc の `malloc(3)` | — |
-| Windows / macOS の配布ビルド（`full-windows` / `full-macos`。F-184） | システムアロケータ（Windows のヒープ / macOS の libmalloc） | —（Windows で素の `--features full` は mimalloc） |
+| Windows（`full-windows`。F-184） | mimalloc v3 | アイドル時回収（`mi_collect`） |
+| macOS の配布ビルド（`full-macos`。F-184） | システムアロケータ（libmalloc） | — |
 
 どのアロケータにも **アイドル時回収** をかけます。ワーカーの accept ループは接続が来ないと 1 秒で
 タイムアウトし（HTTP/3 はアイドル時のタイムアウト）、そこで使用中のアロケータに空き領域を OS へ
