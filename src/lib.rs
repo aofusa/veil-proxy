@@ -6,7 +6,8 @@
 // ====================
 
 // F-183: veil 専用アロケータ。`veil-alloc` feature かつ unix（build.rs の
-// `veil_alloc_active`）のとき、mimalloc / jemalloc より優先して使う。
+// `veil_alloc_active`）のとき使う。アロケータ feature は排他的に 1 つを選ぶ前提だが、
+// default の mimalloc と同時に有効な場合（`--features full`）は veil-alloc を優先する。
 #[cfg(veil_alloc_active)]
 pub mod veil_alloc;
 

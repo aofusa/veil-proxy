@@ -145,6 +145,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 ### アロケータ・メモリ（F-183）
 
+- アロケータ feature（`veil-alloc`・`mimalloc`・`jemalloc`・`system-allocator`）は排他的に 1 つ選ぶ。`full*` の
+  feature セットに複数入れない（default の mimalloc と重なったときの優先順は veil-alloc > mimalloc > jemalloc）。
 - unix の `full` / `full-container` のグローバルアロケータは `src/veil_alloc/`（`veil-alloc`、build.rs の
   `veil_alloc_active`）。高速パス（`heap::alloc` / `heap::free`）にロック・アトミック・分岐を増やさない。
   確保と解放の分類は `Layout` だけで決める（`classify` を両側で共有。ブロックヘッダや表を足さない）。

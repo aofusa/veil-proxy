@@ -372,14 +372,14 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 
 | セット | アロケータ | 追加 | 使う場所 |
 |---|---|---|---|
-| `full`（既定） | unix: veil-alloc（F-183）/ Windows: mimalloc | — | Linux |
+| `full`（既定） | veil-alloc（F-183。Windows では default の mimalloc） | — | Linux |
 | `full-macos` | **システムアロケータ**（libmalloc。F-184） | — | `build-cross.sh --target macos` |
 | `full-windows` | **システムアロケータ**（Windows のヒープ。F-184） | — | `build-cross.sh --target windows` |
 | `full-freebsd` | **システムアロケータ**（libc の jemalloc。tikv-jemalloc は B-89 で廃止） | — | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
 | `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 
-通常の `cargo build --features full` の挙動は従来どおり（unix は veil-alloc、Windows は mimalloc、AIO 無効）で変わらない。
+通常の `cargo build --features full` の挙動は従来どおり（unix は veil-alloc、Windows は default の mimalloc、AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
 
 > **FreeBSD の Docker クロスビルドは削除済み（B-49、未解決のため経路を撤去）**

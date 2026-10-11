@@ -190,15 +190,16 @@ grpc-full = ["grpc", "grpc-web", "http3"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 # jemalloc メモリアロケータ
-# mimalloc と排他的に使用（同時に有効化しないこと）
+# mimalloc / veil-alloc と排他的に使用（同時に有効化しないこと）
 # ビルド方法: cargo build --no-default-features --features "ktls,http2,jemalloc"
 jemalloc = ["dep:tikv-jemallocator"]
 
 # veil 専用アロケータ（F-183、src/veil_alloc/）
 # thread-per-core 向けのスレッドローカル・ページ単位フリーリスト。依存クレート無し（libc のみ）。
-# 有効化すると mimalloc / jemalloc より優先して `#[global_allocator]` になる（unix のみ。
-# Windows では無視して他のアロケータへフォールバックする）。
-# ビルド方法: cargo build --features "full,veil-alloc"
+# mimalloc / jemalloc と排他的に使用する（`full` / `full-container` はこれだけを含む）。
+# default の mimalloc と同時に有効な場合（`cargo build --features full`）は veil-alloc を優先して
+# `#[global_allocator]` にする（unix のみ。Windows では無視して他のアロケータへフォールバックする）。
+# ビルド方法: cargo build --features veil-alloc
 veil-alloc = []
 
 # システムアロケータ（明示的指定用）
@@ -287,9 +288,7 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc。
-    # Windows・macOS の配布ビルドはシステムアロケータの full-windows / full-macos を使う（F-184）
-    "veil-alloc", "mimalloc",
+    "veil-alloc",
     "admin",
     "access-log",
     "l4-proxy",
@@ -302,7 +301,8 @@ full = [
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
-# 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
+# 通常の `--features full` は unix で veil-alloc（F-183）を使う（Windows は default の mimalloc、
+# `--no-default-features` ならシステムアロケータ）。
 # Windows・macOS も同じ理由で `full-windows` / `full-macos`（システムアロケータ、F-184）を
 # 用意し、packaging/scripts/build-cross.sh と docker/Dockerfile.{windows,macos} が使う。
 #
@@ -420,7 +420,7 @@ full-container = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "veil-alloc", "mimalloc",
+    "veil-alloc",
     "admin",
     "access-log",
     "l4-proxy",
