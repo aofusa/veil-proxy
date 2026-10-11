@@ -13,7 +13,7 @@
 #
 # ARG:
 #   RUST_TARGET     x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
-#   CARGO_FEATURES  既定 full（http3 + wasm 含む全機能）
+#   CARGO_FEATURES  既定 full-windows（full と同じ http3 + wasm 含む全機能。アロケータは mimalloc。F-184）
 #
 # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
 # 一元管理する。Windows は "0"（quiche は内蔵 BoringSSL を使うため、aws-lc-sys の
@@ -57,7 +57,7 @@ ENV CMAKE_SYSTEM_NAME=Windows \
 # ==========================================
 FROM tool-builder AS cacher
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-windows
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
@@ -70,6 +70,9 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
 COPY third_party /app/third_party
 
+# F-184: builder 段と同じ dist プロファイルでビルドする（以前は --release で、出力先
+# target/<triple>/release と target/<triple>/dist が別になるため builder 段で依存を全部
+# ビルドし直していた。時間もディスクも 2 倍かかり、macOS ではホストのディスクを使い切った）。
 # 空の main.rs / lib.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する。
 # xwin の Windows SDK ダウンロードもこの層で完了させ、以降の再ビルドで再取得しない。
 RUN mkdir src benches \
@@ -79,7 +82,7 @@ RUN mkdir src benches \
        | xargs -I {} touch benches/{}.rs \
     && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
        | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
-    && cargo xwin build --release --target "${RUST_TARGET}" \
+    && cargo xwin build --profile dist --target "${RUST_TARGET}" \
          --no-default-features --features "${CARGO_FEATURES}" --locked \
     && rm -rf src/
 
@@ -88,7 +91,7 @@ RUN mkdir src benches \
 # ==========================================
 FROM tool-builder AS builder
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-windows
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
 # cacher ステージから「ビルド済みの依存関係アセット」を引き継ぐ

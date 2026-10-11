@@ -34,11 +34,17 @@ cargo には**ターゲット別の環境変数設定が存在しない**（`[ta
 `Dockerfile.glibc` と同じ **cacher（依存だけ先にビルド）→ builder（実ソース）** の
 2 段構成にしてあるため、ソースだけを変更した再ビルドでは `aws-lc-sys` /
 `boring-sys`（quiche 内蔵 BoringSSL）の重い C ビルドがレイヤキャッシュから再利用される。
+cacher 段も builder 段と同じ `--profile dist` でビルドする（全 Dockerfile 共通。F-184。
+以前は cacher 段だけ `--release` で、出力先が別のため builder 段で依存を全部ビルドし直していた）。
 
-| Dockerfile | ターゲット | ベースイメージ |
-|---|---|---|
-| `Dockerfile.macos` | `universal2-apple-darwin`（x86_64 + aarch64 fat） | `messense/cargo-zigbuild` |
-| `Dockerfile.windows` | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `messense/cargo-xwin` |
+| Dockerfile | ターゲット | ベースイメージ | 既定の `CARGO_FEATURES` |
+|---|---|---|---|
+| `Dockerfile.macos` | `universal2-apple-darwin`（x86_64 + aarch64 fat） | `messense/cargo-zigbuild` | `full-macos`（システムアロケータ。F-184） |
+| `Dockerfile.windows` | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `messense/cargo-xwin` | `full-windows`（mimalloc。F-184） |
+
+ベースイメージはタグを固定していない。cargo-zigbuild 0.23.4（zig 0.16）で quiche の cdylib の
+リンクが失敗するようになったため、vendoring 版 quiche は rlib だけをビルドする
+（`third_party/quiche/README.veil.md`。F-184）。
 
 いずれもランタイムステージを持たない（生成物を Linux コンテナで実行できないため）。
 最終ステージ `artifact` は scratch にバイナリだけを置くので、`--output type=local` で
@@ -48,7 +54,7 @@ cargo には**ターゲット別の環境変数設定が存在しない**（`[ta
 # 例: Windows aarch64 バイナリを ./out へ取り出す
 docker build -f Dockerfile.windows --target artifact \
   --build-arg RUST_TARGET=aarch64-pc-windows-msvc \
-  --build-arg CARGO_FEATURES=full \
+  --build-arg CARGO_FEATURES=full-windows \
   --output type=local,dest=./out ..
 ```
 

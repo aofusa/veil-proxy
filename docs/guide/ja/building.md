@@ -108,8 +108,9 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > **Cargo フィーチャー**: 利用可能なフィーチャーフラグの一覧は [`Cargo.toml` の `[features]` セクション](../../../Cargo.toml) を参照してください。
 > 主な注意点：
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
-> - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`veil-alloc`、`mimalloc`）。unix ではグローバルアロケータが **veil-alloc**、veil-alloc をビルドしない Windows では mimalloc になる
+> - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`veil-alloc`）。unix ではグローバルアロケータが **veil-alloc**、veil-alloc をビルドしない Windows では default の mimalloc（`--no-default-features` ならシステムアロケータ）になる。Windows・macOS の配布ビルドは下記の `full-windows` / `full-macos` を使う
 > - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。3 者とも mimalloc を使わず**システムアロケータ**を使う（`aio` は B-63 により既定から除外）。FreeBSD の `malloc(3)` は元から jemalloc で、tikv-jemalloc を同梱すると libthr の malloc フックを上書きして libc のアロケータを壊すため、FreeBSD では `jemalloc` feature 自体をコンパイルエラーにしている（B-89）。3 者とも `wasm` を含み、`full-openbsd`/`full-netbsd` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52/B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。これらの feature セットは**アーキテクチャ非依存**である（旧 `full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` は基底セットと完全同一だったため廃止した。x86_64・aarch64 とも `--features full-freebsd` 等をそのまま使う）。NetBSD（全アーキ）・FreeBSD aarch64・OpenBSD aarch64 では `wasm` が crates.io wasmtime の代わりに vendoring 版 `third_party/wasmtime`（Pulley 専用、詳細は `third_party/wasmtime/README.veil.md`）を使う（crates.io wasmtime（36 / 40 とも）がこの 3 ターゲットのシグナルハンドリングに対応していないため）。それ以外のプラットフォームは無影響で crates.io wasmtime のまま。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
+> - **`full-windows` / `full-macos`**（F-184）: `full` と機能セットは同一で、veil-alloc の代わりに Windows は **mimalloc**、macOS は**システムアロケータ**（libmalloc）を使う。BSD 向けセットと同じく cargo にターゲット別の default features が無いため、`packaging/scripts/build-cross.sh --target windows|macos`（`docker/Dockerfile.windows` / `docker/Dockerfile.macos`）が `--no-default-features` と併せて指定する
 > - **`full-container`**（F-144）: `full` と機能セットは同一で、加えて `epoll` を有効化する。デフォルトの io_uring 完了ベースランタイム（`veil_rt_uring`）の代わりに、明示的に epoll ベースの readiness ランタイム（`veil_rt_reactor`、Linux 専用）を選ぶ。コンテナ・オーケストレーション環境（Docker/Kubernetes/gVisor 等）では seccomp プロファイルやコンテナランタイムのシステムコールエミュレーションにより io_uring がしばしばブロック・制限されるための対応。`default` は不変。`cargo build --features full-container`（アロケータも差し替えたい場合は `--no-default-features --features full-container` を併用）でビルドする。
 > - **`alloc-stats`**（F-165、診断専用・既定オフ）: 選択中のアロケータ（mimalloc/jemalloc/システム）を
 >   カウンティングアロケータで包み、`veil_alloc_allocs_total` / `veil_alloc_deallocs_total` /
@@ -117,8 +118,8 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 >   （`metrics` feature と `[prometheus] enabled = true` が必要）。**1 リクエストあたりの
 >   ヒープ確保回数**を負荷中に実測するための feature で、ハーネスは `tools/perf/alloc_measure.sh`。
 >   確保ごとにアトミック加算が乗るため、本番ビルドでは有効にしないこと。
-> - **`veil-alloc`**（F-183）: veil 専用アロケータ（`src/veil_alloc/`、依存は `libc` のみ、unix 専用）。有効にすると `mimalloc` / `jemalloc` より優先する（そのため `full` は両方を持てる: unix は veil-alloc、Windows は mimalloc）。チューニングと計測は [メモリアロケータ](performance.md#メモリアロケータf-183)
-> - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可（上記のとおり `veil-alloc` は `mimalloc` と併用できる）
+> - **`veil-alloc`**（F-183）: veil 専用アロケータ（`src/veil_alloc/`、依存は `libc` のみ、unix 専用）。排他的なアロケータフィーチャーの 1 つで、default の `mimalloc` と同時に有効な場合（`cargo build --features full`）は veil-alloc を優先する。チューニングと計測は [メモリアロケータ](performance.md#メモリアロケータf-183)
+> - **アロケータフィーチャー**（`veil-alloc`、`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 1 つだけ有効にする（default の `mimalloc` 以外を選ぶときは `--no-default-features` を併用。複数有効な場合の優先順は veil-alloc > mimalloc > jemalloc）
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 
 

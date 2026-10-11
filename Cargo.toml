@@ -190,15 +190,16 @@ grpc-full = ["grpc", "grpc-web", "http3"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 # jemalloc メモリアロケータ
-# mimalloc と排他的に使用（同時に有効化しないこと）
+# mimalloc / veil-alloc と排他的に使用（同時に有効化しないこと）
 # ビルド方法: cargo build --no-default-features --features "ktls,http2,jemalloc"
 jemalloc = ["dep:tikv-jemallocator"]
 
 # veil 専用アロケータ（F-183、src/veil_alloc/）
 # thread-per-core 向けのスレッドローカル・ページ単位フリーリスト。依存クレート無し（libc のみ）。
-# 有効化すると mimalloc / jemalloc より優先して `#[global_allocator]` になる（unix のみ。
-# Windows では無視して他のアロケータへフォールバックする）。
-# ビルド方法: cargo build --features "full,veil-alloc"
+# mimalloc / jemalloc と排他的に使用する（`full` / `full-container` はこれだけを含む）。
+# default の mimalloc と同時に有効な場合（`cargo build --features full`）は veil-alloc を優先して
+# `#[global_allocator]` にする（unix のみ。Windows では無視して他のアロケータへフォールバックする）。
+# ビルド方法: cargo build --features veil-alloc
 veil-alloc = []
 
 # システムアロケータ（明示的指定用）
@@ -287,8 +288,7 @@ full = [
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    # F-183: unix は veil-alloc（mimalloc より優先）、veil-alloc を持たない Windows は mimalloc
-    "veil-alloc", "mimalloc",
+    "veil-alloc",
     "admin",
     "access-log",
     "l4-proxy",
@@ -301,7 +301,10 @@ full = [
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
 # `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
-# 通常の `--features full` は unix で veil-alloc（F-183）、Windows で mimalloc を使う。
+# 通常の `--features full` は unix で veil-alloc（F-183）を使う（Windows は default の mimalloc、
+# `--no-default-features` ならシステムアロケータ）。
+# Windows・macOS も同じ理由で `full-windows`（mimalloc）/ `full-macos`（システムアロケータ）を
+# 用意し、packaging/scripts/build-cross.sh と docker/Dockerfile.{windows,macos} が使う（F-184）。
 #
 # **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
 # `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
@@ -381,13 +384,43 @@ full-netbsd = [
     "l4-proxy",
 ]
 
+# Windows: veil-alloc（unix 専用）の代わりに mimalloc を使う（F-184）。
+# 機能セットは `full` と同一（`ktls` は Linux/FreeBSD 以外では build.rs が無効化する）。
+# packaging/scripts/build-cross.sh --target windows（docker/Dockerfile.windows）が使う。
+full-windows = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "mimalloc",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# macOS: mimalloc・veil-alloc を使わずシステムアロケータ（libmalloc）を使う（F-184）。
+# 機能セットは `full` と同一。packaging/scripts/build-cross.sh --target macos
+# （docker/Dockerfile.macos）が使う。
+full-macos = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
 full-container = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "veil-alloc", "mimalloc",
+    "veil-alloc",
     "admin",
     "access-log",
     "l4-proxy",

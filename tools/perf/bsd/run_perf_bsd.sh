@@ -277,10 +277,11 @@ level = "warn"
 #   - capsicum + capability mode: FreeBSD の主要なサンドボックス。F-123 で
 #     capability mode 下の静的配信（dirfd + openat/O_RESOLVE_BENEATH）が
 #     動作するようにしてあるので、この構成は F-123/F-153 の回帰テストも兼ねる。
-#   - allow_security_failures = false: セキュリティ機能の適用に失敗したら
-#     黙って無効化せず起動を止める（「有効にしたつもり」を防ぐ）。
+#   - allow_security_failures = true: この構成は h2c の追加リスナーを持つため capability mode には
+#     入れず、capsicum の権限制限（rights-limited mode）で動く。F-181 以降は false だと起動を
+#     中止するので true にして続行させる（F-181 前の計測も実際にはこのモードで動いていた）。
 [security]
-allow_security_failures = false
+allow_security_failures = true
 enable_capsicum = true
 capsicum_capability_mode = true
 
@@ -462,7 +463,7 @@ wait_udp_port() {
 # run_wrk <url> -> "rps<TAB>mbps<TAB>p50<TAB>p99<TAB>errors"
 run_wrk() {
     url="$1"
-    out=$(run_timeout $((DURATION * 4 + 60)) pinned "${GEN_CPUS}" wrk -t"${LOAD_THREADS}" -c"${CONNECTIONS}" \
+    out=$(run_timeout_pinned $((DURATION * 4 + 60)) "${GEN_CPUS}" wrk -t"${LOAD_THREADS}" -c"${CONNECTIONS}" \
             -d"${DURATION}s" --latency --timeout 10s "$url" 2>&1) || true
     printf '%s\n' "$out" >> "${WORK}/logs/wrk.log"
     printf '%s' "$out" | awk '
@@ -487,7 +488,7 @@ run_wrk() {
 run_h2load() {
     url="$1"; shift
     total=$(( CONNECTIONS * 2000 ))
-    out=$(run_timeout $((DURATION * 4 + 60)) pinned "${GEN_CPUS}" h2load -t"${LOAD_THREADS}" -c"${CONNECTIONS}" \
+    out=$(run_timeout_pinned $((DURATION * 4 + 60)) "${GEN_CPUS}" h2load -t"${LOAD_THREADS}" -c"${CONNECTIONS}" \
             -m 32 -n "${total}" "$@" "$url" 2>&1) || true
     printf '%s\n' "$out" >> "${WORK}/logs/h2load.log"
     printf '%s' "$out" | awk '
@@ -520,7 +521,7 @@ run_h2load() {
 # wrk と同じ「時間で区切る」方式にすれば、マシンの速度に依存せず必ず集計行が出る。
 run_h3load() {
     url="$1"
-    out=$(run_timeout $((DURATION * 4 + 60)) pinned "${GEN_CPUS}" "${H3LOAD_BIN}" \
+    out=$(run_timeout_pinned $((DURATION * 4 + 60)) "${GEN_CPUS}" "${H3LOAD_BIN}" \
             -t"${LOAD_THREADS}" -c"${CONNECTIONS}" -m 32 -d "${DURATION}" "$url" 2>&1) || true
     printf '%s\n' "$out" >> "${WORK}/logs/h3load.log"
     printf '%s' "$out" | awk '

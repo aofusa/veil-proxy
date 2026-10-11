@@ -1089,7 +1089,15 @@ mod tests {
     /// 許可リストの添字で TCP・ホスト名・UDS の上流へ接続できる。
     #[test]
     fn connects_to_allowed_targets() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // ブローカー（と runtime::dns::resolve）は解決結果の先頭アドレスへ接続する。
+        // localhost の先頭は環境で 127.0.0.1 とも ::1 とも限らない（コンテナビルドでは ::1。B-113）
+        // ので、その先頭アドレスで待ち受ける。
+        #[allow(clippy::disallowed_methods)] // テスト内の同期解決
+        let lo = std::net::ToSocketAddrs::to_socket_addrs("localhost:0")
+            .unwrap()
+            .next()
+            .unwrap();
+        let l = std::net::TcpListener::bind(lo).unwrap();
         let port = l.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("up.sock");
@@ -1101,7 +1109,7 @@ mod tests {
         ]);
         let a = c.allowlist();
         assert_eq!(
-            a.index_of_conn_addr(&format!("127.0.0.1:{}", port)),
+            a.index_of_conn_addr(&l.local_addr().unwrap().to_string()),
             Some(0)
         );
         assert_eq!(

@@ -41,6 +41,9 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
 COPY third_party /app/third_party
 
+# F-184: builder 段と同じ dist プロファイルでビルドする（以前は --release で、出力先
+# target/<triple>/release と target/<triple>/dist が別になるため builder 段で依存を全部
+# ビルドし直していた。時間もディスクも 2 倍かかっていた）。
 # 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
 # fuzz メンバはワークスペース解決のためにスタブのターゲットだけ用意し、本体はビルドしない
 RUN mkdir src benches \
@@ -55,7 +58,7 @@ RUN mkdir src benches \
     && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
        | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
     && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
-    && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
+    && cargo zigbuild --profile dist --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
     && rm -rf src/
 
 

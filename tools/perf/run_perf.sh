@@ -51,6 +51,9 @@ K6_DURATION="${K6_DURATION:-10s}" # k6 計測時間
 ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
 CONFIG_GLOB="${CONFIG_GLOB:-*}"    # 計測対象 config を絞り込む glob（既定 * = 全構成）。
                                     # 例: CONFIG_GLOB='h3_*' や CONFIG_GLOB='grpc_*' で scoped 計測。
+CONFIGS="${CONFIGS:-}"              # 計測対象 config 名を空白区切りで列挙（指定時は CONFIG_GLOB より優先）。
+                                    # glob 1 個では表せない代表構成の組を A/B で測るとき用。
+SKIP_NGINX="${SKIP_NGINX:-0}"      # 1 で nginx ベースラインを省く（veil 同士の A/B を繰り返すとき用）。
 BUILDS="${BUILDS:-glibc musl}"     # 計測対象の veil ビルド（既定は両方）。改修の A/B 中は
                                     # 片方のイメージしか作り直さないことがあり、古いイメージを
                                     # 混ぜて計測しないよう `BUILDS=glibc` のように絞れる。
@@ -400,6 +403,7 @@ docker run -d --rm --network $NET --network-alias perf-ws \
 # ---- nginx baseline ----
 # results_raw.tsv の行順は (1) nginx ベースライン → (2) veil_glibc 各構成 →
 # (3) veil_musl 各構成 の順であることが要件（このブロックを先頭に保つ）。
+if [ "$SKIP_NGINX" != "1" ]; then
 echo "### nginx"
 docker rm -f nginx-perf >/dev/null 2>&1
 docker run -d --rm --network $NET \
@@ -414,13 +418,20 @@ if wait_ready nginx-perf; then
     run_h2c nginx h2c_proxy nginx-perf "/proxy/"
 fi
 docker rm -f nginx-perf >/dev/null 2>&1
+fi
 
 # ---- veil glibc / musl x configs ----
 # glibc → musl の順でループする（TSV 行順要件: nginx → veil_glibc → veil_musl）。
 # 将来の並列化・リオーダはこの順序を崩すため行わないこと。
 for build in $BUILDS; do
     img="veil:$build"
-    for cfgfile in "$HERE"/configs/$CONFIG_GLOB.toml; do
+    if [ -n "$CONFIGS" ]; then
+        cfgfiles=""
+        for c in $CONFIGS; do cfgfiles="$cfgfiles $HERE/configs/$c.toml"; done
+    else
+        cfgfiles=$(printf '%s ' "$HERE"/configs/$CONFIG_GLOB.toml)
+    fi
+    for cfgfile in $cfgfiles; do
         [ -e "$cfgfile" ] || continue
         name=$(basename "$cfgfile" .toml)
         # *_alloc は alloc_measure*.sh 専用（alloc-stats ビルドが前提）なのでスイートでは測らない。

@@ -53,7 +53,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - データプレーンは tokio / monoio に依存しない（テスト・クライアント用途は別）。
 - `cfg(feature)` を壊さない。`default = ["ktls", "http2", "mimalloc"]` を崩さず、無効 feature でもコンパイル可能に保つ。
-  BSD 向けは `full-freebsd` / `full-openbsd` / `full-netbsd` という別 feature セットで表現する。
+  BSD 向けは `full-freebsd` / `full-openbsd` / `full-netbsd`、Windows 向け（mimalloc）・macOS 向け（システムアロケータ）は
+  `full-windows` / `full-macos` という別 feature セットで表現する（F-184）。
 - バックエンドは build.rs 発行の cfg で選ぶ: Linux 既定 = io_uring（`veil_rt_uring`）、`--features epoll`・BSD・macOS・
   Windows = readiness reactor（`veil_rt_reactor`、poller は `veil_poller_{epoll,kqueue,wsapoll}`）。
   **io_uring パスのロジックは reactor 追加で変えない。** 公開パス `runtime::tcp` 等はファサードで不変。
@@ -104,8 +105,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   失敗を無視せず通る最大値まで下げる（B-95）。負荷ツール側のソケットも同じ（取りこぼしがサーバの PTO として計測に乗る）。
 - 同じタスク内で複数の I/O Future を同時に待つとき `futures::join!` を使わない。片方の起床で全員を poll するため
   reactor では起床していない側が `read(2)`/`poll(2)` を空打ちする（`FuturesUnordered` を使う。F-173）。
-- quiche は `third_party/quiche` の vendoring 版を `[patch.crates-io]` で使う。差分は「複数ストリームの STREAM フレームを
+- quiche は `third_party/quiche` の vendoring 版を `[patch.crates-io]` で使う。主な差分は「複数ストリームの STREAM フレームを
   1 パケットへ詰める」1 行（upstream は fuzzing 時のみ。外すと小応答が 1 リクエスト 1 パケットに戻る。F-172）。
+  `crate-type` は `["lib"]` だけにする（cdylib を戻すと cargo-zigbuild の macOS クロスビルドがリンクで失敗する。F-184）。
 - 静的配信のパス解決に `canonicalize()` を使わない（dirfd 相対 `openat2`/`O_RESOLVE_BENEATH`。`openat2` は seccomp 許可必須。F-153）。
   絶対シンボリックリンクは Linux=`EXDEV`・FreeBSD=`ENOTCAPABLE` で拒否されるので、その場合だけ従来経路で再判定する（B-89）。
 - FreeBSD の静的配信はヘッダも `sendfile(2)` の `sf_hdtr` で 1 syscall（平文 HTTP/1.1 のみ。TLS 経路に通すと平文漏洩。F-155）。
@@ -144,6 +146,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 ### アロケータ・メモリ（F-183）
 
+- アロケータ feature（`veil-alloc`・`mimalloc`・`jemalloc`・`system-allocator`）は排他的に 1 つ選ぶ。`full*` の
+  feature セットに複数入れない（default の mimalloc と重なったときの優先順は veil-alloc > mimalloc > jemalloc）。
 - unix の `full` / `full-container` のグローバルアロケータは `src/veil_alloc/`（`veil-alloc`、build.rs の
   `veil_alloc_active`）。高速パス（`heap::alloc` / `heap::free`）にロック・アトミック・分岐を増やさない。
   確保と解放の分類は `Layout` だけで決める（`classify` を両側で共有。ブロックヘッダや表を足さない）。
@@ -163,7 +167,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
-  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査）は `third_party/quiche/README.veil.md`。
+  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ）は `third_party/quiche/README.veil.md`。
 - 不正なプリフェースや拒否する接続は、未読データを残して close しない（RST になり相手は GOAWAY を読めない）。
   送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
 - seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、
@@ -235,6 +239,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 - **Windows / macOS / BSD は Linux のテストを全て通過する不具合を持ち得る。** クロスビルド
   （`packaging/scripts/build-cross.sh --target windows|macos`）に加え、可能なら実機・VM で `cargo test` と E2E を回す
   （BSD・Linux aarch64 は `tools/qemu/`。B-69/B-73/B-81/B-88）。
+- `docker/Dockerfile.*` の cacher 段と builder 段は同じ `--profile dist` でビルドする（ずらすと依存を 2 回ビルドする。F-184）。
 - コンテナイメージのビルド（`docker/Dockerfile.*`）は中で `cargo test --lib` を走らせる。単体テストは
   `tests/` 配下のフィクスチャを読まない（ビルドコンテキストに無い。証明書は `rcgen` で生成）、
   io_uring を必須にしない（ビルドのサンドボックスは io_uring を拒否する。可用性を見てスキップ）。

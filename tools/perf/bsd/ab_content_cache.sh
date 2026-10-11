@@ -34,7 +34,7 @@ run_one() {
     sleep 2
     pinned "${SRV_CPUS}" "${_bin}" -c "${_cfg}" >/dev/null 2>&1 &
     sleep 4
-    run_timeout 40 pinned "${GEN_CPUS}" h2load -t2 -c32 -m16 -n "${_n}" "${_url}" 2>/dev/null | rps
+    run_timeout_pinned 40 "${GEN_CPUS}" h2load -t2 -c32 -m16 -n "${_n}" "${_url}" 2>/dev/null | rps
 }
 
 if [ "$WITH_NGINX" = "1" ]; then
@@ -56,9 +56,9 @@ while [ "$r" -le "$ROUNDS" ]; do
     if [ "$WITH_NGINX" = "1" ]; then
         # nginx は常駐させたまま（veil の起動停止とは独立）。同じラウンド内で測ることで
         # VM の性能劣化ドリフトを veil と同条件で受ける。
-        nl=$(run_timeout 40 pinned "${GEN_CPUS}" h2load -t2 -c32 -m16 -n 20000 \
+        nl=$(run_timeout_pinned 40 "${GEN_CPUS}" h2load -t2 -c32 -m16 -n 20000 \
              https://127.0.0.1:5443/index.html 2>/dev/null | rps)
-        ns=$(run_timeout 40 pinned "${GEN_CPUS}" h2load -t2 -c32 -m16 -n 40000 \
+        ns=$(run_timeout_pinned 40 "${GEN_CPUS}" h2load -t2 -c32 -m16 -n 40000 \
              https://127.0.0.1:5443/small.html 2>/dev/null | rps)
         printf '%s\t%s\t%s\t%s\n' "$r" "nginx" "${nl:-NA}" "${ns:-NA}"
     fi

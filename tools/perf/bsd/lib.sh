@@ -8,7 +8,8 @@
 #   pin <cpus> <cmd...> : <cmd> を CPU 集合へ固定して実行する（exec）
 #                         FreeBSD = cpuset -l、NetBSD = schedctl -A（自分を固定してから exec）、
 #                         OpenBSD = 固定する API が無いので素の実行（結果に注記すること）
-#   run_timeout <秒> <cmd...> : timeout(1) があればそれで、無ければそのまま実行する
+#   run_timeout <秒> <cmd...> : timeout(1) があればそれで、無ければそのまま実行する（外部コマンドのみ）
+#   run_timeout_pinned <秒> <cpus> <cmd...> : CPU を固定して timeout(1) 付きで実行する
 #   bsd_tune            : listen backlog など計測前のカーネル設定（OS ごとの sysctl 名）
 #   nginx_stream_module : nginx の stream 動的モジュールのパス（無ければ空）
 #   pkg_hint            : 計測ツールの入れ方（エラーメッセージ用）
@@ -29,6 +30,19 @@ pin() {
 # サブシェルで pin する（呼び出し元のシェルを置き換えない）。
 pinned() {
     ( pin "$@" )
+}
+
+# CPU を固定したうえで timeout(1) を挟んで実行する。`run_timeout <秒> pinned ...` は timeout(1) が
+# シェル関数 pinned を exec できず（`timeout: exec(pinned): No such file or directory`）全計測が
+# 0 rps になっていたので、固定する側から外部コマンドの timeout を起動する。
+run_timeout_pinned() {
+    _secs="$1"; _cpus="$2"; shift 2
+    _t=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
+    if [ -n "$_t" ]; then
+        pinned "$_cpus" "$_t" "$_secs" "$@"
+    else
+        pinned "$_cpus" "$@"
+    fi
 }
 
 run_timeout() {
