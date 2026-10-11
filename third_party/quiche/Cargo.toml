@@ -76,11 +76,8 @@ pkg-config-meta = []
 
 [lib]
 name = "quiche"
-crate-type = [
-    "lib",
-    "staticlib",
-    "cdylib",
-]
+# veil: rlib だけを作る（upstream は C FFI 用に staticlib・cdylib も作る。README.veil.md）
+crate-type = ["lib"]
 path = "src/lib.rs"
 
 [dependencies.boring]

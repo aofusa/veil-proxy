@@ -48,7 +48,14 @@ incremental ストリームの末尾への並べ替え（ラウンドロビン�
 
 ### 2. `Cargo.toml`
 
-`[[example]]`（`examples/` を取り込んでいないため存在しないファイルを指す）を削除した。
+- `[[example]]`（`examples/` を取り込んでいないため存在しないファイルを指す）を削除した。
+- `[lib] crate-type` を `["lib", "staticlib", "cdylib"]` から `["lib"]` にした（F-184）。
+  cargo は依存クレートでも列挙された全 crate-type をビルドするため、C 向け FFI の
+  静的ライブラリと共有ライブラリを毎回作っていた（veil は Rust API しか使わない）。
+  cargo-zigbuild 0.23.4（zig 0.16）の macOS クロスビルドでは、この cdylib のリンクが
+  `unable to read exported symbols list '-dead_strip'` で失敗し、`full` の macOS ビルドが
+  通らなくなっていた。rlib だけにするとリンク自体が無くなり、全ターゲットでビルドも短くなる。
+
 それ以外は無変更。
 
 ### 4. `src/lib.rs`: 予約ビットの検査（B-100）
