@@ -137,6 +137,8 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
 | `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |
+| `CONFIGS` | （空） | 計測対象 config 名を空白区切りで列挙（指定時は `CONFIG_GLOB` より優先）。例: `CONFIGS='h2_1_ktls_0_lb_kernel_ofc_1 h2_1_feat_proxy h2c_proxy'` |
+| `SKIP_NGINX` | `0` | `1` で nginx ベースラインを省く（veil 同士の A/B を `BUILDS='old new'` / `'new old'` と順を入れ替えて繰り返すとき用） |
 | `BUILDS` | `glibc musl` | 計測対象の veil ビルド。改修の A/B 中は片方のイメージしか作り直さないため、`BUILDS=glibc` で古い `veil:musl` を混ぜないようにする |
 
 > 全構成（65+）× glibc/musl × 反復 のフルスイートは時間がかかります。素早く確認したい場合は
