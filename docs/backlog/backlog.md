@@ -355,6 +355,7 @@
 | B-113 | P3 | 完了 | [bugs/B-113-connect-broker-test-localhost-ipv6.md](bugs/B-113-connect-broker-test-localhost-ipv6.md) | `connect_broker::tests::connects_to_allowed_targets` が、localhost の先頭が `::1` になる環境（コンテナビルド）で失敗して `docker/Dockerfile.glibc` のビルドが止まる。テストの前提（localhost = 127.0.0.1）の誤りで、待ち受けを localhost の先頭アドレスにして修正 |
 | B-114 | P2 | 完了 | [bugs/B-114-bsd-perf-harness-zero-rps.md](bugs/B-114-bsd-perf-harness-zero-rps.md) | BSD の perf ハーネスが F-181 以降 veil を起動できず（capability mode + h2c で fail-closed）、さらに `timeout(1)` がシェル関数 `pinned` を exec できず全計測 0 rps だった。`allow_security_failures = true` と `run_timeout_pinned` で修正 |
 | B-115 | P1 | 完了 | [bugs/B-115-sigterm-not-handled.md](bugs/B-115-sigterm-not-handled.md) | SIGTERM で graceful shutdown しなかった（ctrlc は termination feature 無しでは SIGINT しか捕まえない。ネイティブは即終了、コンテナの PID 1 では無視されて `docker stop` が SIGKILL まで待つ）。unix は signal-hook で SIGINT / SIGTERM を受けるよう修正 |
+| B-116 | P2 | 完了 | [bugs/B-116-sanitizer-chaos-leak-check-never-ran.md](bugs/B-116-sanitizer-chaos-leak-check-never-ran.md) | E2E sanitizer カオスの LeakSanitizer が一度も走っていなかった（終了を待たずにログを見ていた。seccomp・Landlock・特権降格が LeakSanitizer の ptrace を妨げる）。終了と終了コードを確かめ、sanitizer 用設定でそれらを外すよう修正 |
 
 ---
 

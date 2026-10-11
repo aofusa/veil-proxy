@@ -129,7 +129,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損/順序逆転 + 複合(loss+delay)の注入と回復（F-69、既定 SKIP） |
 | 3g リソース枯渇 | `chaos/resource_exhaustion_chaos.sh` | cgroup 制約下の高並行負荷で panic/OOM 回避（F-68、既定 SKIP） |
 | 3h syscall 障害注入 | `chaos/syscall_chaos.sh` | strace inject で io_uring_enter/setup に EBUSY/ENOMEM/EINTR/EFAULT を注入し panic/segfault なしを検証（F-86、既定 SKIP。CAP_SYS_PTRACE 必要） |
-| 3i E2E sanitizer | `chaos/e2e_sanitizer_chaos.sh` | ASAN/TSAN ビルドの Veil にカオス負荷 + SIGHUP を与え UAF/リーク/データ競合を実行検出（F-85、既定 SKIP。`RUN_E2E_ASAN=1`/`RUN_E2E_TSAN=1`） |
+| 3i E2E sanitizer | `chaos/e2e_sanitizer_chaos.sh` | ASAN/TSAN ビルドの Veil にカオス負荷 + SIGHUP を与え UAF/リーク/データ競合を実行検出（F-85、既定 SKIP。`RUN_E2E_ASAN=1`/`RUN_E2E_TSAN=1`）。LeakSanitizer は終了時に走るので SIGTERM 後の終了（`SAN_EXIT_WAIT` 秒以内・終了コード 0）まで確かめ、ptrace を妨げる seccomp・Landlock・特権降格は外して起動する（B-116） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
 | 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性 |
