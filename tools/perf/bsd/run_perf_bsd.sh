@@ -277,10 +277,11 @@ level = "warn"
 #   - capsicum + capability mode: FreeBSD の主要なサンドボックス。F-123 で
 #     capability mode 下の静的配信（dirfd + openat/O_RESOLVE_BENEATH）が
 #     動作するようにしてあるので、この構成は F-123/F-153 の回帰テストも兼ねる。
-#   - allow_security_failures = false: セキュリティ機能の適用に失敗したら
-#     黙って無効化せず起動を止める（「有効にしたつもり」を防ぐ）。
+#   - allow_security_failures = true: この構成は h2c の追加リスナーを持つため capability mode には
+#     入れず、capsicum の権限制限（rights-limited mode）で動く。F-181 以降は false だと起動を
+#     中止するので true にして続行させる（F-181 前の計測も実際にはこのモードで動いていた）。
 [security]
-allow_security_failures = false
+allow_security_failures = true
 enable_capsicum = true
 capsicum_capability_mode = true
 
