@@ -145,6 +145,11 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `arena_eager_commit` は `main` 前（`.init_array`）で 0 にする（実行時に設定すると最初のアリーナに効かない。B-101）。
 - 終了シグナルは unix では signal-hook で SIGINT / SIGTERM を受ける（ctrlc は termination feature 無しでは SIGTERM を
   捕まえず、有効にすると SIGHUP＝リロードも終了になる。B-115）。
+- キープアライブで次の要求を待つ間（HTTP/1.1 の蓄積が空・HTTP/2 のストリームが無いとき）だけ
+  `runtime::time::timeout_idle(.., true, ..)` を使う。graceful shutdown は `expire_idle_timeouts` でその待ちだけを
+  満了させて閉じる（要求ごとの登録やフラグ監視を足さない。`Sleep` を `select!` に直接渡さず `fuse()` で包む。F-187）。
+  HTTP/2 の接続アイドルタイムアウトもこの待ち（B-119）。HTTP/3 は停止中もメインループを回して GOAWAY → 処理中の要求が
+  無くなった接続から CONNECTION_CLOSE（F-187）。
 - ワーカースレッドは `runtime::block_on` を抜けた直後に `runtime::shutdown_thread()` を呼ぶ（残った接続タスクが
   スレッドローカルの破棄中に drop されると破棄済みの op テーブルに触れて abort する。B-118）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
