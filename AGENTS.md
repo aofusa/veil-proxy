@@ -168,6 +168,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   作り直さない）。
 - アロケータ・メモリの変更は `tools/perf/alloc_ab.sh`（BSD は `tools/perf/bsd/alloc_ab_bsd.sh`）で交互 A/B し、
   RSS の推移と `*_cpu_us_per_req` も見る。長時間の安定性は `alloc_soak.sh` の後半の傾きで判断する。
+  リークは `leak_check.sh`（`alloc-stats` ビルドの生存ヒープ `veil_alloc_live_bytes`・fd・スレッド数を、接続チャーン・
+  異常切断・リロードの反復ごとに採って傾きを見る。F-185）。
 
 ### プロトコル準拠・サンドボックス
 

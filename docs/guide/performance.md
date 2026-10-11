@@ -91,6 +91,12 @@ rises while veil's capped pools and caches fill to the peak-load size and then s
 85 MB at the end, mimalloc 87 MB; the steady-state trend is downward for both). With FreeBSD's default
 jemalloc settings the same kind of soak kept rising (+27 MB/h); the tuned `malloc_conf` stays flat.
 
+Later, the io_uring timer heap was found to hold cancelled timeouts until their deadline, growing with
+request rate × timeout (B-117). With that fixed, peak RSS under the loads above dropped 19–40% and RSS after
+the load went from 75 MB to 45 MB (throughput and CPU per request unchanged). `tools/perf/leak_check.sh`
+checks that repeated connection churn, aborted connections and config reloads do not keep growing memory or
+file descriptors (F-185).
+
 The idle drop comes mostly from `[logging] channel_size` (ftlog preallocates every slot; the default
 went from 100000 to 16384, −7 MB). `tools/perf/alloc_bench` compares the allocators directly: veil-alloc
 is 18–60% faster than mimalloc on small-object, request-batch, 64 KiB-buffer, cross-thread and

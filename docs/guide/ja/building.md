@@ -114,9 +114,11 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > - **`full-container`**（F-144）: `full` と機能セットは同一で、加えて `epoll` を有効化する。デフォルトの io_uring 完了ベースランタイム（`veil_rt_uring`）の代わりに、明示的に epoll ベースの readiness ランタイム（`veil_rt_reactor`、Linux 専用）を選ぶ。コンテナ・オーケストレーション環境（Docker/Kubernetes/gVisor 等）では seccomp プロファイルやコンテナランタイムのシステムコールエミュレーションにより io_uring がしばしばブロック・制限されるための対応。`default` は不変。`cargo build --features full-container`（アロケータも差し替えたい場合は `--no-default-features --features full-container` を併用）でビルドする。
 > - **`alloc-stats`**（F-165、診断専用・既定オフ）: 選択中のアロケータ（mimalloc/jemalloc/システム）を
 >   カウンティングアロケータで包み、`veil_alloc_allocs_total` / `veil_alloc_deallocs_total` /
->   `veil_alloc_reallocs_total` / `veil_alloc_bytes_total` を Prometheus ゲージとして公開する
+>   `veil_alloc_reallocs_total` / `veil_alloc_bytes_total` と、生存中のバイト数・アロケーション数
+>   `veil_alloc_live_bytes` / `veil_alloc_live_allocs`（F-185）を Prometheus ゲージとして公開する
 >   （`metrics` feature と `[prometheus] enabled = true` が必要）。**1 リクエストあたりの
->   ヒープ確保回数**を負荷中に実測するための feature で、ハーネスは `tools/perf/alloc_measure.sh`。
+>   ヒープ確保回数**の実測（`tools/perf/alloc_measure.sh`）と、接続・リロードの反復でリークしないかの
+>   試験（`tools/perf/leak_check.sh`）に使う。
 >   確保ごとにアトミック加算が乗るため、本番ビルドでは有効にしないこと。
 > - **`veil-alloc`**（F-183）: veil 専用アロケータ（`src/veil_alloc/`、依存は `libc` のみ、unix 専用）。排他的なアロケータフィーチャーの 1 つで、default の `mimalloc` と同時に有効な場合（`cargo build --features full`）は veil-alloc を優先する。チューニングと計測は [メモリアロケータ](performance.md#メモリアロケータf-183)
 > - **アロケータフィーチャー**（`veil-alloc`、`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 1 つだけ有効にする（default の `mimalloc` 以外を選ぶときは `--no-default-features` を併用。複数有効な場合の優先順は veil-alloc > mimalloc > jemalloc）

@@ -48,6 +48,9 @@ static DEALLOCS: AtomicU64 = AtomicU64::new(0);
 static REALLOCS: AtomicU64 = AtomicU64::new(0);
 /// 確保した合計バイト数（`alloc`/`alloc_zeroed` は要求サイズ、`realloc` は新サイズを加算）
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 解放した合計バイト数（`dealloc` は解放サイズ、`realloc` は旧サイズを加算）。
+/// `ALLOC_BYTES - FREED_BYTES` が生存バイト数になる（F-185: リーク試験で使う）
+static FREED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// 内側のアロケータ `A` に処理を委譲しつつ、呼び出し回数・バイト数を計測する
 /// `#[global_allocator]`。
@@ -72,6 +75,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         DEALLOCS.fetch_add(1, Ordering::Relaxed);
+        FREED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         unsafe { self.0.dealloc(ptr, layout) }
     }
 
@@ -86,6 +90,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         REALLOCS.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        FREED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         unsafe { self.0.realloc(ptr, layout, new_size) }
     }
 }
@@ -101,6 +106,21 @@ pub struct AllocSnapshot {
     pub reallocs: u64,
     /// 確保した合計バイト数
     pub alloc_bytes: u64,
+    /// 解放した合計バイト数（`realloc` の旧サイズを含む）
+    pub freed_bytes: u64,
+}
+
+impl AllocSnapshot {
+    /// 生存しているアロケーションの数（`allocs - deallocs`）
+    pub fn live_allocs(&self) -> i64 {
+        self.allocs as i64 - self.deallocs as i64
+    }
+
+    /// 生存しているバイト数（`alloc_bytes - freed_bytes`）。アロケータの保持・返却の揺れを
+    /// 含まない「生きているヒープ」の量で、リークの判定に使う（F-185）
+    pub fn live_bytes(&self) -> i64 {
+        self.alloc_bytes as i64 - self.freed_bytes as i64
+    }
 }
 
 /// 現在のアロケーションカウンタを読み取る。
@@ -113,6 +133,7 @@ pub fn snapshot() -> AllocSnapshot {
         deallocs: DEALLOCS.load(Ordering::Relaxed),
         reallocs: REALLOCS.load(Ordering::Relaxed),
         alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
+        freed_bytes: FREED_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -125,6 +146,7 @@ pub fn reset() {
     DEALLOCS.store(0, Ordering::Relaxed);
     REALLOCS.store(0, Ordering::Relaxed);
     ALLOC_BYTES.store(0, Ordering::Relaxed);
+    FREED_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// 現在のスナップショットを `tag` 付きでログ出力する。
@@ -134,12 +156,13 @@ pub fn reset() {
 pub fn log_snapshot(tag: &str) {
     let snap = snapshot();
     ftlog::info!(
-        "alloc-stats[{}]: allocs={} deallocs={} reallocs={} alloc_bytes={}",
+        "alloc-stats[{}]: allocs={} deallocs={} reallocs={} alloc_bytes={} live_bytes={}",
         tag,
         snap.allocs,
         snap.deallocs,
         snap.reallocs,
         snap.alloc_bytes,
+        snap.live_bytes(),
     );
 }
 
@@ -192,7 +215,23 @@ mod tests {
                 deallocs: 0,
                 reallocs: 0,
                 alloc_bytes: 0,
+                freed_bytes: 0,
             }
         );
+    }
+
+    #[test]
+    fn live_bytes_return_after_free() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // 他のテストスレッドのアロケーションも数えるため、差は自分の確保量より十分小さいかで見る
+        let before = snapshot();
+        let mut v: Vec<u8> = Vec::with_capacity(1 << 20);
+        v.reserve(4 << 20); // realloc（旧サイズの解放も数える）
+        let mid = snapshot();
+        assert!(mid.live_bytes() - before.live_bytes() >= (4 << 20));
+        assert!(mid.live_allocs() - before.live_allocs() >= 1);
+        drop(v);
+        let after = snapshot();
+        assert!((after.live_bytes() - before.live_bytes()).abs() < (1 << 20));
     }
 }
