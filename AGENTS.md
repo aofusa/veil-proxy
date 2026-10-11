@@ -114,7 +114,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
 - HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
-  カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。
+  カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して
+  増えすぎたら圧縮する（遅延パージだけだとヒープが「要求レート × タイムアウト」まで膨らむ。reactor も同じ。B-117）。
 - プロキシ応答の中間バッファをリクエストごとに確保しない。ヘッダ解析回数を増やさない（B-72 第 2 弾）。
 - HTTP/2 レスポンスヘッダは `Vec<(Bytes, Bytes)>`（F-165）。per-stream 固定費は接続あたり 1 回で済まないか先に考える（F-162）。
 - `config::load_backend` はリクエストごとに呼ばれる。ルート単位の派生値は設定ロード時に `Route` の
