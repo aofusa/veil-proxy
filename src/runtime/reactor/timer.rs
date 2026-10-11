@@ -40,6 +40,8 @@ struct TimerSlot {
     state: SlotState,
     /// 登録時のデッドライン（ヒープ圧縮で生存エントリを積み直すために保持する）。
     deadline: Instant,
+    /// キープアライブの次の要求待ちのタイマー（F-187: graceful shutdown で即満了させる）。
+    idle: bool,
 }
 
 /// (index, generation) を u64 へパックする。
@@ -59,6 +61,9 @@ struct TimerState {
     heap: BinaryHeap<Reverse<(Instant, u64)>>,
     /// Free 以外のスロット数（= ヒープ上で意味のあるエントリの上限）。
     live: usize,
+    /// F-187: graceful shutdown 中（[`expire_idle_timeouts`] の後）。以後に登録される
+    /// アイドル待ちのタイマーは登録した時点で満了済みにする。
+    idle_shutdown: bool,
 }
 
 impl TimerState {
@@ -73,6 +78,7 @@ impl TimerState {
                 generation: 1,
                 state: SlotState::Free,
                 deadline: epoch,
+                idle: false,
             });
             free.push(i);
         }
@@ -81,10 +87,11 @@ impl TimerState {
             free,
             heap: BinaryHeap::with_capacity(Self::PREALLOC),
             live: 0,
+            idle_shutdown: false,
         }
     }
 
-    fn register(&mut self, deadline: Instant) -> u64 {
+    fn register(&mut self, deadline: Instant, idle: bool) -> u64 {
         let index = match self.free.pop() {
             Some(i) => i,
             None => {
@@ -93,17 +100,40 @@ impl TimerState {
                     generation: 1,
                     state: SlotState::Free,
                     deadline,
+                    idle,
                 });
                 i
             }
         };
         let slot = &mut self.slots[index as usize];
-        slot.state = SlotState::Armed(None);
         slot.deadline = deadline;
+        slot.idle = idle;
         self.live += 1;
         let token = pack(index, slot.generation);
+        if idle && self.idle_shutdown {
+            // F-187: 停止中のアイドル待ちは待たない（ヒープにも積まない）。
+            slot.state = SlotState::Fired;
+            return token;
+        }
+        slot.state = SlotState::Armed(None);
         self.heap.push(Reverse((deadline, token)));
         token
+    }
+
+    /// F-187: アイドル待ちのタイマーをすべて満了させ、以後のアイドル待ちも即満了にする。
+    /// graceful shutdown の開始時に 1 回だけ呼ばれる（O(スロット数)）。ヒープのエントリは
+    /// 満了済みスロットを指す stale として通常どおり捨てられる。
+    fn expire_idle(&mut self) {
+        self.idle_shutdown = true;
+        for slot in &mut self.slots {
+            if slot.idle && matches!(slot.state, SlotState::Armed(_)) {
+                if let SlotState::Armed(Some(w)) =
+                    std::mem::replace(&mut slot.state, SlotState::Fired)
+                {
+                    w.wake();
+                }
+            }
+        }
     }
 
     fn resolve(&self, token: u64) -> Option<usize> {
@@ -251,6 +281,13 @@ pub(crate) fn next_deadline() -> Option<Instant> {
     TIMERS.with(|t| t.borrow_mut().next_deadline())
 }
 
+/// F-187: このスレッドのアイドル待ち（[`timeout_idle`] で `idle = true` のもの）を即座に満了させ、
+/// 以後に始まるアイドル待ちも待たずに満了させる。graceful shutdown でワーカーが接続の
+/// 完了待ちに入るときに呼ぶ（キープアライブで次の要求を待っているだけの接続を閉じさせる）。
+pub fn expire_idle_timeouts() {
+    TIMERS.with(|t| t.borrow_mut().expire_idle());
+}
+
 /// `now` 以前に満了したタイマーを起こす（reactor block_on の起床処理から呼ぶ）。
 pub(crate) fn fire_expired(now: Instant) {
     TIMERS.with(|t| t.borrow_mut().fire_expired(now));
@@ -265,6 +302,8 @@ pub struct Sleep {
     deadline: Instant,
     token: u64,
     registered: bool,
+    /// F-187: キープアライブの次の要求待ち（graceful shutdown で即満了する）。
+    idle: bool,
 }
 
 impl Sleep {
@@ -279,6 +318,7 @@ impl Sleep {
             deadline: now + duration,
             token: 0,
             registered: false,
+            idle: false,
         }
     }
 }
@@ -288,7 +328,7 @@ impl Future for Sleep {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.registered {
-            let token = TIMERS.with(|t| t.borrow_mut().register(self.deadline));
+            let token = TIMERS.with(|t| t.borrow_mut().register(self.deadline, self.idle));
             self.token = token;
             self.registered = true;
         }
@@ -349,6 +389,24 @@ where
     }
 }
 
+/// [`timeout`] と同じだが、`idle = true` なら graceful shutdown（[`expire_idle_timeouts`]）で
+/// 即座に `Err(Elapsed)` になる（F-187）。キープアライブで次の要求を待つ間だけ `idle = true` に
+/// する（要求の途中・応答の途中の待ちに使うと処理中の要求を打ち切る）。内側の Future が先に
+/// 完了していればそちらを返す（パイプライン化された次の要求は処理される）。
+pub async fn timeout_idle<F, R>(duration: Duration, idle: bool, future: F) -> Result<R, Elapsed>
+where
+    F: Future<Output = R>,
+{
+    let mut timer = sleep(duration);
+    timer.idle = idle;
+    // `Fuse` で包む（`Sleep` 自身の `is_terminated` は満了済みで true を返すので、そのまま渡すと
+    // select が満了した枝を飛ばして永久に待つ）。
+    futures::select_biased! {
+        result = futures::FutureExt::fuse(future) => Ok(result),
+        _ = futures::FutureExt::fuse(timer) => Err(Elapsed),
+    }
+}
+
 /// タイムアウトエラー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;
@@ -371,7 +429,7 @@ mod tests {
         let mut st = TimerState::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         for _ in 0..100_000 {
-            let t = st.register(deadline);
+            let t = st.register(deadline, false);
             st.cancel(t);
         }
         assert_eq!(st.live, 0);
@@ -388,10 +446,10 @@ mod tests {
         let mut st = TimerState::new();
         let base = Instant::now();
         let keep: Vec<u64> = (0..10)
-            .map(|i| st.register(base + Duration::from_secs(10 + i)))
+            .map(|i| st.register(base + Duration::from_secs(10 + i), false))
             .collect();
         for _ in 0..50_000 {
-            let t = st.register(base + Duration::from_secs(30));
+            let t = st.register(base + Duration::from_secs(30), false);
             st.cancel(t);
         }
         assert_eq!(st.live, 10);
