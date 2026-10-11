@@ -11,7 +11,7 @@
 - **HTTP/2**: TLS ALPNネゴシエーションによるHTTP/2サポート（ストリーム多重化、HPACK圧縮・**4-bit LUT Huffman デコード** — F-121）
 - **H2Cサーバー**: TLSなしのHTTP/2 Cleartext (H2C) サーバーサポート（Prior Knowledgeモード、RFC 7540 Section 3.4）
 - **HTTP/3**: QUIC/UDPベースのHTTP/3サポート（quiche 低レベル sans-IO API: `Connection::recv`/`send`、輻輳制御・Pacing は `[http3]` で設定可能）。Linux io_uring バックエンドでは UDP データプレーンをパイプライン化: 受信は `mmsg_batch_size` 本の **`IORING_OP_RECVMSG`** を常時 in-flight、送信は **`IORING_OP_SENDMSG`**（GSO `UDP_SEGMENT` cmsg 付き）を複数 SQE で 1 回の `io_uring_enter` にまとめる（F-130。ホットパスに libc `recvmmsg`/`sendmmsg` なし。reactor ビルドや `VEIL_H3_MULTISHOT=0` 時は POLL + `recvmmsg`/`sendmmsg` にフォールバック）。真の `IORING_RECV_MULTISHOT` + 登録済み **provided buffer ring**（`IORING_REGISTER_PBUF_RING`）による受信も実装済み（F-130 C2）だが、**`VEIL_H3_BUFRING=1` のオプトイン**である: 開発・検証機のカーネル（Linux 6.8.0-137-generic）は `IORING_REGISTER_PBUF_RING` をクリーンなリングでも liburing 経由でも `-EINVAL` で拒否するため、multishot 受信経路を実機で一度も動かせておらず、既定では有効にしない。オプトインした場合も登録・アーム失敗時は自動的にパイプライン受信へフォールバックする。0-RTT接続確立
-- **高速アロケータ**: veil 専用の thread-per-core アロケータ **veil-alloc**（unix の `full`。ワーカーがアイドルになると空き領域を OS へ返す）、チューニングした mimalloc（既定 feature）、チューニングした libc の jemalloc（FreeBSD）。[メモリアロケータ](performance.md#メモリアロケータf-183) を参照
+- **高速アロケータ**: veil 専用の thread-per-core アロケータ **veil-alloc**（unix の `full`。ワーカーがアイドルになると空き領域を OS へ返す）、チューニングした mimalloc（既定 feature と Windows の `full-windows`）、システムアロケータ（macOS の `full-macos`）、チューニングした libc の jemalloc（FreeBSD）。[メモリアロケータ](performance.md#メモリアロケータf-183) を参照
 - **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
 
 ### プロキシ機能
