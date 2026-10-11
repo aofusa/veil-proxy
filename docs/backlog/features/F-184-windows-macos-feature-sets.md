@@ -88,4 +88,18 @@ builder 段が `--profile dist` を直接書いており、packaging のスク�
   HTTP/2 は `Invoke-WebRequest -HttpVersion 2.0` の 300 要求すべて 200（応答バージョン 2.0）。動作中の
   ワーキングセット 35MB。aarch64 の Windows 実機は無いので、クロスビルドの確認まで。
 
-<!-- Linux の結果は下に追記 -->
+### Linux（cacher 段の変更の確認、`packaging/scripts/build.sh --docker`）
+
+- glibc（`Dockerfile.glibc`）・musl（`Dockerfile.musl`）とも成功。builder 段のコンパイルは veil 本体だけで、
+  コンテナ内の `cargo test --lib` は 1025 件すべて成功、tar.gz・deb・rpm まで作成できた。
+- 最初の実行では `connect_broker::tests::connects_to_allowed_targets` が失敗した（B-113。F-182 のテストの前提の誤りで、
+  コンテナ内では localhost の先頭が `::1` になる）。修正後に再実行して上記の結果。
+- aarch64 の Dockerfile（`Dockerfile.glibc.aarch64` / `Dockerfile.musl.aarch64`）は同じ 1 行の変更で、
+  ビルドは回していない（キャッシュ無しの Linux aarch64 は 10 時間を超えるため）。
+
+### テスト
+
+- `cargo test --lib --bins --test integration_tests --features full`: 単体 1025・統合 54 すべて成功。
+- E2E（`./tests/e2e_setup.sh test`、io_uring）: 565 すべて成功。
+- `cargo clippy --all-targets --features full -- -D warnings`: 警告なし。
+- `cargo check --lib --no-default-features --features full-windows|full-macos|full` と `full,alloc-stats`: 成功。
