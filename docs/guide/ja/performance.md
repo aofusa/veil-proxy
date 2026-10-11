@@ -72,14 +72,22 @@ threads = 0  # 未指定または0の場合はCPUコア数と同じ
 - Prometheus（`metrics`）: `veil_allocator_bytes{state="active|dirty|huge|purged_total"}`、
   `veil_allocator_count{kind="segments|cached_segments|heaps|abandoned_heaps|remote_frees_total"}`。
 
-`tools/perf/alloc_ab.sh` での計測（Linux、2 ワーカーを 2 コアに固定、交互 A/B 3 ラウンド。TLS 上の
-HTTP/1.1・HTTP/2 の静的配信とプロキシ、接続チャーン）:
+`tools/perf/alloc_ab.sh` での計測（Linux、2 ワーカーを 2 コアに固定、負荷は別の 2 コアから、交互 A/B
+5 ラウンドの中央値。TLS 上の HTTP/1.1・HTTP/2 の静的配信とプロキシ、接続チャーン。失敗要求はすべて 0）:
 
 | | mimalloc（F-183 前） | mimalloc（チューニング後） | veil-alloc |
 |---|---|---|---|
-| スループット | 基準 | ±1% 以内 | チューニング後の mimalloc 比 +0〜1.3% |
-| アイドル RSS | 24.2 MB | 17.4 MB | 17.3 MB（匿名メモリ 3.5 MB） |
-| 負荷の 15 秒後の RSS | 87.5 MB | 78.8 MB | 74.4 MB |
+| スループット | 基準 | -0.1〜+1.1% | -0.3〜**+4.2%**（HTTP/2 TLS 3B） |
+| 要求あたりの veil の CPU 時間 | 基準 | -1.0〜+1.1% | **-1.6〜-4.1%** |
+| アイドル RSS | 24.0 MB | 17.1 MB | 16.8 MB（匿名メモリ 3.5 MB） |
+| 負荷中のピーク RSS | 基準 | -12〜-17% | -13〜-21% |
+| 負荷の 30 秒後の RSS | 87.4 MB | 75.0 MB | 73.8 MB |
+
+両者に同じ乱数の種の負荷列を与えた 40 分のソーク（`tools/perf/alloc_soak.sh`: 全種の負荷をランダムに
+最大 2 本同時 + 15 秒アイドルの反復）は、どちらも失敗要求 0 でした。アイドル後の RSS の底は、上限付きの
+プール・キャッシュが最大負荷の規模まで埋まる間だけ上がり、その後は頭打ちです（最後の底は veil-alloc
+85 MB、mimalloc 87 MB。定常状態の傾きはどちらも下向き）。FreeBSD の既定の jemalloc 設定では同種の
+ソークで底が上がり続け（+27 MB/h）、チューニングした `malloc_conf` では横ばいでした。
 
 アイドル時の減少の大半は `[logging] channel_size` によるものです（ftlog は全スロットを事前確保する。
 既定を 100000 から 16384 に変更、-7 MB）。`tools/perf/alloc_bench` でアロケータを直接比べると、

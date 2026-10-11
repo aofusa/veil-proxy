@@ -72,14 +72,23 @@ are called again, so a worker that goes idle after a burst kept its peak RSS for
 - Prometheus (with `metrics`): `veil_allocator_bytes{state="active|dirty|huge|purged_total"}` and
   `veil_allocator_count{kind="segments|cached_segments|heaps|abandoned_heaps|remote_frees_total"}`.
 
-Measured with `tools/perf/alloc_ab.sh` (Linux, 2 workers pinned to 2 cores, interleaved A/B, 3 rounds;
-HTTP/1.1 and HTTP/2 over TLS, static and proxied, plus connection churn):
+Measured with `tools/perf/alloc_ab.sh` (Linux, 2 workers pinned to 2 cores, load from the other 2 cores,
+interleaved A/B, median of 5 rounds; HTTP/1.1 and HTTP/2 over TLS, static and proxied, plus connection churn;
+no failed requests anywhere):
 
 | | mimalloc (before F-183) | mimalloc (tuned) | veil-alloc |
 |---|---|---|---|
-| Throughput | baseline | within ±1% | +0–1.3% vs tuned mimalloc |
-| Idle RSS | 24.2 MB | 17.4 MB | 17.3 MB (anonymous: 3.5 MB) |
-| RSS 15 s after the load | 87.5 MB | 78.8 MB | 74.4 MB |
+| Throughput | baseline | −0.1 to +1.1% | −0.3 to **+4.2%** (HTTP/2 TLS 3 B) |
+| veil CPU time per request | baseline | −1.0 to +1.1% | **−1.6 to −4.1%** |
+| Idle RSS | 24.0 MB | 17.1 MB | 16.8 MB (anonymous: 3.5 MB) |
+| Peak RSS under load | baseline | −12 to −17% | −13 to −21% |
+| RSS 30 s after the load | 87.4 MB | 75.0 MB | 73.8 MB |
+
+A 40-minute soak with the same seeded load sequence for both (`tools/perf/alloc_soak.sh`: random mixes of all
+workloads, up to two at once, with 15 s idle gaps) finished with zero failed requests. The post-idle RSS floor
+rises while veil's capped pools and caches fill to the peak-load size and then stays bounded (veil-alloc
+85 MB at the end, mimalloc 87 MB; the steady-state trend is downward for both). With FreeBSD's default
+jemalloc settings the same kind of soak kept rising (+27 MB/h); the tuned `malloc_conf` stays flat.
 
 The idle drop comes mostly from `[logging] channel_size` (ftlog preallocates every slot; the default
 went from 100000 to 16384, −7 MB). `tools/perf/alloc_bench` compares the allocators directly: veil-alloc
