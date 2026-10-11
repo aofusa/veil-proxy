@@ -293,6 +293,30 @@ pub(crate) static ALLOC_STATS_BYTES_TOTAL: Lazy<prometheus::IntGauge> = Lazy::ne
     gauge
 });
 
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// 生存しているバイト数（確保 − 解放。F-185 のリーク試験で使う）
+pub(crate) static ALLOC_STATS_LIVE_BYTES: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_live_bytes",
+        "Bytes currently allocated (allocated minus freed) observed by CountingAllocator",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// 生存しているアロケーションの数（allocs − deallocs）
+pub(crate) static ALLOC_STATS_LIVE_ALLOCS: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_live_allocs",
+        "Number of live heap allocations (allocs minus deallocs) observed by CountingAllocator",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 /// アロケーション計測ゲージへ最新のスナップショットを反映する。
 ///
 /// スクレイプ直前（`encode_prometheus_metrics()`）にのみ呼び出し、常時ポーリング
@@ -305,6 +329,8 @@ fn refresh_alloc_stats_gauges() {
     ALLOC_STATS_DEALLOCS_TOTAL.set(snap.deallocs as i64);
     ALLOC_STATS_REALLOCS_TOTAL.set(snap.reallocs as i64);
     ALLOC_STATS_BYTES_TOTAL.set(snap.alloc_bytes as i64);
+    ALLOC_STATS_LIVE_BYTES.set(snap.live_bytes());
+    ALLOC_STATS_LIVE_ALLOCS.set(snap.live_allocs());
 }
 
 // ====================

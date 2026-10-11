@@ -114,7 +114,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
 - HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
-  カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。
+  カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して
+  増えすぎたら圧縮する（遅延パージだけだとヒープが「要求レート × タイムアウト」まで膨らむ。reactor も同じ。B-117）。
 - プロキシ応答の中間バッファをリクエストごとに確保しない。ヘッダ解析回数を増やさない（B-72 第 2 弾）。
 - HTTP/2 レスポンスヘッダは `Vec<(Bytes, Bytes)>`（F-165）。per-stream 固定費は接続あたり 1 回で済まないか先に考える（F-162）。
 - `config::load_backend` はリクエストごとに呼ばれる。ルート単位の派生値は設定ロード時に `Route` の
@@ -142,6 +143,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
 - キープアライブ待ちの接続は読み取りバッファを持たない（readiness を待ってから借りる）。mimalloc の
   `arena_eager_commit` は `main` 前（`.init_array`）で 0 にする（実行時に設定すると最初のアリーナに効かない。B-101）。
+- 終了シグナルは unix では signal-hook で SIGINT / SIGTERM を受ける（ctrlc は termination feature 無しでは SIGTERM を
+  捕まえず、有効にすると SIGHUP＝リロードも終了になる。B-115）。
+- ワーカースレッドは `runtime::block_on` を抜けた直後に `runtime::shutdown_thread()` を呼ぶ（残った接続タスクが
+  スレッドローカルの破棄中に drop されると破棄済みの op テーブルに触れて abort する。B-118）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
 
 ### アロケータ・メモリ（F-183）
@@ -163,6 +168,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   作り直さない）。
 - アロケータ・メモリの変更は `tools/perf/alloc_ab.sh`（BSD は `tools/perf/bsd/alloc_ab_bsd.sh`）で交互 A/B し、
   RSS の推移と `*_cpu_us_per_req` も見る。長時間の安定性は `alloc_soak.sh` の後半の傾きで判断する。
+  リークは `leak_check.sh`（`alloc-stats` ビルドの生存ヒープ `veil_alloc_live_bytes`・fd・スレッド数を、接続チャーン・
+  異常切断・リロードの反復ごとに採って傾きを見る。F-185）。
 
 ### プロトコル準拠・サンドボックス
 
@@ -176,7 +183,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   起動時に確定した許可リストの **添字だけ**（アドレス・ホスト名・パスの文字列を受け付けるプロトコルにしない）。
   新しい接続経路を足すときは reactor の `connect*` か `connect_broker::connect_std_*` を通す（F-182）。
 - container_security の判定は「本当に走ったか」を見る。h3spec の打ち切り・testssl の常時スキップ・サニタイザの
-  起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。
+  起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。LeakSanitizer は
+  終了時にしか走らず、veil の seccomp・Landlock・特権降格があると ptrace できずに落ちる（B-116）。
 
 ---
 

@@ -977,6 +977,28 @@ pub fn init_executor() {
     });
 }
 
+/// B-118: スレッドを終える前に、残っているタスクを破棄する（ワーカーの `block_on` の後に呼ぶ）。
+///
+/// スレッドローカルの破棄（`EXEC_STATE` のデストラクタ）の中でタスクを drop すると、タスク内の
+/// I/O Future の Drop が破棄済みのスレッドローカル（poller・fd 表）に触れ得るので、生きているうちに
+/// drop する。readiness 型なのでカーネル側に完了待ちの操作は残らない（`drain` は io_uring 版用）。
+pub fn shutdown_tasks(_drain: std::time::Duration) {
+    loop {
+        let bodies: Vec<TaskBody> = EXEC_STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.ready.clear();
+            st.slots
+                .iter_mut()
+                .filter_map(|slot| slot.body.take())
+                .collect()
+        });
+        if bodies.is_empty() {
+            break;
+        }
+        drop(bodies);
+    }
+}
+
 /// Future をスポーンする（現在のスレッドのエグゼキュータに）。
 pub fn spawn<F>(future: F)
 where

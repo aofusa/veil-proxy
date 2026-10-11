@@ -415,6 +415,13 @@ impl OpTable {
         }
     }
 
+    /// 完了待ちの op（カーネルがバッファ等を参照し得る）が残っているか（B-118 のシャットダウン用）。
+    fn has_pending_ops(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| !matches!(s.state, OpSlotState::Free))
+    }
+
     /// 全スロットが解放済みか（F-84 ファジング・テストの不変条件検査用）。
     fn all_slots_free(&self) -> bool {
         self.free.len() == self.slots.len()
@@ -1251,6 +1258,43 @@ pub fn init_executor() {
         st.free.clear();
         st.ready.clear();
     });
+}
+
+/// B-118: スレッドを終える前に、残っているタスクを破棄する（ワーカーの `block_on` の後に呼ぶ）。
+///
+/// graceful shutdown の待ちが切れて接続タスクが残ったままスレッドを終えると、スレッドローカルの
+/// 破棄（`EXEC_STATE` のデストラクタ）の中でタスクが drop され、タスク内の I/O Future の Drop
+/// （`detach_op`）が破棄済みの `OP_TABLE` に触れて panic し、プロセスが abort していた。
+/// スレッドローカルが生きているうちに drop し、detach（キャンセル要求）した op の完了を最大 `drain`
+/// だけ刈り取る（カーネルが参照し得るバッファを op テーブルに残したままリングより先に解放しない）。
+pub fn shutdown_tasks(drain: std::time::Duration) {
+    // drop 中に別タスクの wake・spawn が EXEC_STATE を借りるので、取り出してから borrow の外で落とす
+    loop {
+        let bodies: Vec<TaskBody> = EXEC_STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.ready.clear();
+            st.slots
+                .iter_mut()
+                .filter_map(|slot| slot.body.take())
+                .collect()
+        });
+        if bodies.is_empty() {
+            break;
+        }
+        drop(bodies);
+    }
+    // park 用にアームしたカーネルの TIMEOUT も取り消す（期限まで完了しないため）
+    if let Some(old) = ARMED_TIMER.with(|a| a.borrow_mut().take()) {
+        detach_op(old.user_data, OpGuard::Noop);
+    }
+    let deadline = Instant::now() + drain;
+    while OP_TABLE.with(|t| t.borrow().has_pending_ops()) && Instant::now() < deadline {
+        let _ = submit_sqes();
+        poll_completions();
+        // 理由付き allow: スレッド終了時に一度だけ通るシャットダウン経路（データプレーン外）。
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// Future をスポーンする（現在のスレッドのエグゼキュータに）。

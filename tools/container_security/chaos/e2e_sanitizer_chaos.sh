@@ -124,13 +124,23 @@ else
     SAN_OPTS_ENV=(-e "TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1")
 fi
 
+# LeakSanitizer は終了時に ptrace で全スレッドを止めてから走査する。veil 自身の seccomp（ptrace を
+# 許可しない）・Landlock（ドメイン内からの ptrace を拒否する）・特権降格（setuid 後は dumpable でなく
+# なる）のいずれかが有効だと、LeakSanitizer が「fatal error」で落ちて検査できない（F-185。以前は終了を
+# 待たずにログを見ていたので気付かなかった）。sanitizer 実行用の設定ではこの 3 つを外す。
+SAN_CONFIG="${RESULTS_DIR}/e2e-san-config.toml"
+sed -e 's/^enable_seccomp = true/enable_seccomp = false/' \
+    -e 's/^enable_landlock = true/enable_landlock = false/' \
+    -e 's/^drop_privileges_\(user\|group\) = .*/# &（sanitizer 実行では外す）/' \
+    "${DOCKER_DIR}/assets/conf.d/config.toml" >"${SAN_CONFIG}"
+
 echo "== sanitizer Veil を起動しカオス負荷 ==" | tee -a "${REPORT}"
 if ! docker run -d --name "${SAN_CONTAINER}" --network "${NET_NAME}" \
     --security-opt seccomp=unconfined \
     "${SAN_OPTS_ENV[@]}" \
     --tmpfs /var/cache/veil:rw,nosuid,uid=65532,gid=65532,size=128m \
     --tmpfs /var/tmp/veil:rw,nosuid,uid=65532,gid=65532,size=64m \
-    -v "${DOCKER_DIR}/assets/conf.d/config.toml:/etc/veil/conf.d/config.toml:ro" \
+    -v "${SAN_CONFIG}:/etc/veil/conf.d/config.toml:ro" \
     -v "${DOCKER_DIR}/assets/ssl:/etc/veil/ssl:ro" \
     -v "${DOCKER_DIR}/assets/www:/var/www:ro" \
     "${SAN_RUN_IMAGE}" -c /etc/veil/conf.d/config.toml \
@@ -177,8 +187,23 @@ if [[ -n "${SAN_IP}" ]]; then
 fi
 
 # プロセスを正常終了させて LeakSanitizer のプロセス終了時レポートを促す。
+# LeakSanitizer はプロセス終了時にだけ走るので、終了を待って終了コードまで確かめる
+# （以前は TERM の 3 秒後にログを見ていた。sanitizer ビルドは graceful shutdown に時間がかかり、
+# 終了前のログに LeakSanitizer の出力が無いのを「リークなし」と報告していた。F-185）。
+# リークがあると LeakSanitizer は非 0 で終了する（abort_on_error=1 では abort）。
+SAN_EXIT_WAIT="${SAN_EXIT_WAIT:-120}"
 docker kill --signal=TERM "${SAN_CONTAINER}" >/dev/null 2>&1 || true
-sleep 3
+exited=0
+exit_code=""
+for _ in $(seq 1 "${SAN_EXIT_WAIT}"); do
+    if [[ "$(docker inspect -f '{{.State.Status}}' "${SAN_CONTAINER}" 2>/dev/null || echo absent)" == "exited" ]]; then
+        exited=1
+        exit_code="$(docker inspect -f '{{.State.ExitCode}}' "${SAN_CONTAINER}" 2>/dev/null || echo '?')"
+        break
+    fi
+    sleep 1
+done
+echo "e2e_sanitizer: TERM 後の終了 exited=${exited} exit_code=${exit_code:-none}（待機上限 ${SAN_EXIT_WAIT}s）" | tee -a "${REPORT}"
 
 # --- 判定: コンテナログに sanitizer エラーが出ていないこと ---
 LOGS="$(docker logs "${SAN_CONTAINER}" 2>&1 || true)"
@@ -192,6 +217,12 @@ if [[ "${started}" != "1" ]]; then
 elif echo "${LOGS}" | grep -qE "${SAN_ERROR_RE}"; then
     echo "e2e_sanitizer: ${SANITIZER}Sanitizer エラーを検出（backlog 起票対象）" | tee -a "${REPORT}"
     echo "${LOGS}" | grep -E "${SAN_ERROR_RE}" | head -10 | tee -a "${REPORT}"
+    fail=1
+elif [[ "${exited}" != "1" ]]; then
+    echo "e2e_sanitizer: failed (TERM 後 ${SAN_EXIT_WAIT}s で終了せず、終了時の検査が走っていないため未検証)" | tee -a "${REPORT}"
+    fail=1
+elif [[ "${exit_code}" != "0" ]]; then
+    echo "e2e_sanitizer: failed (終了コード ${exit_code}。sanitizer の報告か異常終了。ログ確認)" | tee -a "${REPORT}"
     fail=1
 else
     echo "e2e_sanitizer: ${SANITIZER} エラーなし（カオス負荷 + SIGHUP を通過）" | tee -a "${REPORT}"

@@ -335,6 +335,23 @@ F-158（HTTP/2 インライン初回 poll）の A/B 結果は
 **同一の変更が kqueue で +27.3%、io_uring で −4.6% と正反対になった**ため、
 **ホットパス最適化は必ず両バックエンドで A/B を取ること**。
 
+## リーク試験（`leak_check.sh`、F-185）
+
+veil を 1 プロセス起動したまま、シナリオ（TLS の HTTP/1.1・HTTP/2 と h2c・HTTP/3 の 1 接続 1 要求の
+チャーン、ハンドシェイク・要求・応答の途中での RST、SIGHUP による設定・証明書のリロード）ごとに
+「操作 1 回分 → 静定待ち → 採取」を繰り返し、生存ヒープ・RSS・fd・スレッド数をサイクル番号に回帰した
+傾きで判定する（リークはサイクルごとに一定量ずつ増える。プール・キャッシュが満ちる飽和型の増加は
+先頭の `WARMUP` サイクルで除く）。生存ヒープ（`veil_alloc_live_bytes`）は `alloc-stats` ビルドで採れる。
+
+```bash
+cargo build --release --features full,alloc-stats
+BIN=target/release/veil CYCLES=30 bash tools/perf/leak_check.sh   # 約 50 分
+python3 tools/perf/leak_check_summary.py tools/perf/results/leak_check/<日時>.tsv 5
+```
+
+異常切断は `leak_abort_client.py`（標準ライブラリのみ）が作る。リロードは veil のログの成功行の数で
+実際に行われたかを確かめる。
+
 ## 注意
 
 - 4 コア程度のホストや co-tenant 負荷がある環境では計測が揺れます。**quiet host（loadavg 低）** での

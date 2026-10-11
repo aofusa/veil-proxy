@@ -1629,3 +1629,176 @@ mod f150_tls_writev_roundtrip {
         client_thread.join().expect("client thread panicked");
     }
 }
+
+// ====================
+// B-115: 終了シグナル（バイナリを起動して確かめる）
+// ====================
+//
+// SIGTERM / SIGINT で graceful shutdown して終了コード 0 で終わり、SIGHUP では終了せず設定を
+// 読み直すこと。以前は ctrlc（termination feature 無し）が SIGINT しか捕まえず、SIGTERM は
+// 既定動作（即終了。コンテナの PID 1 では無視）だった。E2E の停止処理は SIGTERM 後に SIGKILL へ
+// フォールバックするため気付けなかった。
+#[cfg(unix)]
+mod b115_shutdown_signals {
+    use std::path::Path;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn start(dir: &Path) -> Child {
+        start_with(dir, "").0
+    }
+
+    /// `server_extra` は `[server]` に足す行。戻り値は子プロセスと待ち受けポート。
+    fn start_with(dir: &Path, server_extra: &str) -> (Child, u16) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
+        std::fs::write(dir.join("key.pem"), cert.signing_key.serialize_pem()).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let d = dir.display();
+        let cfg = format!(
+            r#"[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+{server_extra}
+
+[logging]
+level = "info"
+
+[tls]
+cert_path = "{d}/cert.pem"
+key_path = "{d}/key.pem"
+ktls_enabled = false
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{d}/"
+"#
+        );
+        let cfg_path = dir.join("veil.toml");
+        std::fs::write(&cfg_path, cfg).unwrap();
+        let log = std::fs::File::create(dir.join("veil.log")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
+            .arg("-c")
+            .arg(&cfg_path)
+            .stdout(log)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn veil");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "veil exited during startup: {}",
+                log_of(dir)
+            );
+            assert!(Instant::now() < deadline, "veil did not start listening");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        (child, port)
+    }
+
+    fn log_of(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("veil.log")).unwrap_or_default()
+    }
+
+    fn send(child: &Child, sig: libc::c_int) {
+        // SAFETY: 自分が起動した子プロセスへのシグナル送信のみ
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
+    }
+
+    fn wait_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(st) = child.try_wait().unwrap() {
+                return Some(st);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    fn assert_graceful_exit(sig: libc::c_int) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = start(dir.path());
+        send(&child, sig);
+        let st = wait_exit(&mut child, Duration::from_secs(20));
+        if st.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let st = st.expect("veil did not exit after the signal");
+        // シグナルの既定動作で死ぬと success にならない（ExitStatus は signal を持つ）
+        assert!(st.success(), "veil was not shut down gracefully: {st:?}");
+        let log = log_of(dir.path());
+        assert!(
+            log.contains("Received shutdown signal") && log.contains("Server shutdown complete"),
+            "graceful shutdown log missing:\n{log}"
+        );
+    }
+
+    #[test]
+    fn sigterm_shuts_down_gracefully() {
+        assert_graceful_exit(libc::SIGTERM);
+    }
+
+    #[test]
+    fn sigint_shuts_down_gracefully() {
+        assert_graceful_exit(libc::SIGINT);
+    }
+
+    /// B-118: graceful shutdown の待ちが切れて接続が残っていても、abort せずに終了コード 0 で終わること
+    /// （残った接続タスクがスレッドローカルの破棄中に drop され、破棄済みの op テーブルに触れて
+    /// panic → abort していた）。
+    #[test]
+    fn sigterm_with_open_connection_exits_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, port) = start_with(dir.path(), "graceful_shutdown_timeout_secs = 1");
+        // TLS ハンドシェイクを始めない接続（接続タスクが読み取り待ちのまま残る）
+        let _idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        send(&child, libc::SIGTERM);
+        let st = wait_exit(&mut child, Duration::from_secs(20));
+        if st.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let st = st.expect("veil did not exit after SIGTERM");
+        let log = log_of(dir.path());
+        assert!(st.success(), "veil did not exit cleanly: {st:?}\n{log}");
+        assert!(
+            log.contains("Drain timeout") && log.contains("Server shutdown complete"),
+            "expected a forced drain and a clean shutdown:\n{log}"
+        );
+    }
+
+    #[test]
+    fn sighup_reloads_without_exiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = start(dir.path());
+        send(&child, libc::SIGHUP);
+        // リロードスレッドは 500ms 周期でフラグを見る
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log_of(dir.path()).contains("Configuration reloaded successfully") {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "veil exited on SIGHUP:\n{}",
+                log_of(dir.path())
+            );
+            assert!(
+                Instant::now() < deadline,
+                "SIGHUP did not reload the configuration"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(child.try_wait().unwrap().is_none(), "veil exited on SIGHUP");
+        send(&child, libc::SIGTERM);
+        assert!(wait_exit(&mut child, Duration::from_secs(20)).is_some());
+    }
+}

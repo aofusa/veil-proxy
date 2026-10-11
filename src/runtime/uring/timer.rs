@@ -24,6 +24,11 @@
 //! （`timeout()` で内側 Future が勝った等）場合はスロットを即座に free-list へ返す。
 //! ヒープ上には stale なエントリが残り得るが、pop 時に世代不一致で無視されるため
 //! 安全である（不要エントリは「そのデッドラインに達した時」に遅延パージされる）。
+//!
+//! B-117: 遅延パージだけだと、I/O が先に終わってキャンセルされたタイマー（`timeout(READ_TIMEOUT, ..)`）が
+//! デッドライン（30〜60 秒後）までヒープに残り、ヒープの長さが「要求レート × タイムアウト秒数」に比例する
+//! （数千 rps のプロキシでワーカーあたり 6MB まで伸び、Vec の容量はそのまま残っていた）。reactor 版と
+//! 同じく、生存数に対してヒープが大きくなりすぎたら生存エントリだけで作り直す（償却 O(1)、確保なし）。
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -46,6 +51,8 @@ enum SlotState {
 struct TimerSlot {
     generation: u32,
     state: SlotState,
+    /// 登録時のデッドライン（ヒープ圧縮で生存エントリを積み直すために保持する）。
+    deadline: Instant,
 }
 
 /// (index, generation) を u64 へパックする。
@@ -63,6 +70,8 @@ struct TimerState {
     slots: Vec<TimerSlot>,
     free: Vec<u32>,
     heap: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// Free 以外のスロット数（= ヒープ上で意味のあるエントリの上限）。
+    live: usize,
 }
 
 impl TimerState {
@@ -71,10 +80,12 @@ impl TimerState {
     fn new() -> Self {
         let mut slots = Vec::with_capacity(Self::PREALLOC);
         let mut free = Vec::with_capacity(Self::PREALLOC);
+        let epoch = Instant::now();
         for i in 0..Self::PREALLOC as u32 {
             slots.push(TimerSlot {
                 generation: 1,
                 state: SlotState::Free,
+                deadline: epoch,
             });
             free.push(i);
         }
@@ -82,6 +93,7 @@ impl TimerState {
             slots,
             free,
             heap: BinaryHeap::with_capacity(Self::PREALLOC),
+            live: 0,
         }
     }
 
@@ -93,12 +105,15 @@ impl TimerState {
                 self.slots.push(TimerSlot {
                     generation: 1,
                     state: SlotState::Free,
+                    deadline,
                 });
                 i
             }
         };
         let slot = &mut self.slots[index as usize];
         slot.state = SlotState::Armed(None);
+        slot.deadline = deadline;
+        self.live += 1;
         let token = pack(index, slot.generation);
         self.heap.push(Reverse((deadline, token)));
         token
@@ -135,14 +150,34 @@ impl TimerState {
     }
 
     /// 完了を待たずスロットを解放する（Future drop 時。ヒープのエントリは stale として残る）。
+    ///
+    /// 生存数に対してヒープが大きくなりすぎたら生存エントリだけで作り直す（B-117。reactor 版と同じ）。
     fn cancel(&mut self, token: u64) {
         if let Some(i) = self.resolve(token) {
             self.free_slot(i);
+            if self.heap.len() > 2 * self.live + Self::PREALLOC * 4 {
+                self.compact();
+            }
         }
+    }
+
+    /// ヒープを Armed のスロットだけで作り直す（既存の Vec を使い回すので確保しない）。
+    fn compact(&mut self) {
+        let mut entries = std::mem::take(&mut self.heap).into_vec();
+        entries.clear();
+        for (i, slot) in self.slots.iter().enumerate() {
+            if matches!(slot.state, SlotState::Armed(_)) {
+                entries.push(Reverse((slot.deadline, pack(i as u32, slot.generation))));
+            }
+        }
+        self.heap = BinaryHeap::from(entries);
     }
 
     fn free_slot(&mut self, index: usize) {
         let slot = &mut self.slots[index];
+        if !matches!(slot.state, SlotState::Free) {
+            self.live -= 1;
+        }
         slot.generation = slot.generation.wrapping_add(1);
         if slot.generation == 0 {
             slot.generation = 1;
@@ -403,6 +438,45 @@ mod tests {
                 "dropped Sleep must not leave a live deadline"
             );
         });
+    }
+
+    /// B-117: I/O が先に終わってキャンセルされたタイマーがヒープに溜まり続けないこと
+    /// （io_uring を使わない TimerState 単体のテスト）。
+    #[test]
+    fn cancelled_timers_do_not_accumulate_in_heap() {
+        let mut st = TimerState::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for _ in 0..100_000 {
+            let t = st.register(deadline);
+            st.cancel(t);
+        }
+        assert_eq!(st.live, 0);
+        assert!(
+            st.heap.len() <= TimerState::PREALLOC * 4 + 1,
+            "heap grew to {} entries",
+            st.heap.len()
+        );
+    }
+
+    /// B-117: 圧縮しても生存しているタイマーは失われず、期限で満了すること。
+    #[test]
+    fn compaction_keeps_live_timers() {
+        let mut st = TimerState::new();
+        let base = Instant::now();
+        let keep: Vec<u64> = (0..10)
+            .map(|i| st.register(base + Duration::from_secs(10 + i)))
+            .collect();
+        for _ in 0..50_000 {
+            let t = st.register(base + Duration::from_secs(30));
+            st.cancel(t);
+        }
+        assert_eq!(st.live, 10);
+        assert_eq!(st.next_deadline(), Some(base + Duration::from_secs(10)));
+        st.fire_expired(base + Duration::from_secs(25));
+        for t in keep {
+            assert!(st.take_fired(t), "live timer lost by compaction");
+        }
+        assert_eq!(st.live, 0);
     }
 
     /// 何もしない Waker（poll 1 回だけを目的とする手動 poll 用）。

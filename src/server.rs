@@ -77,7 +77,31 @@ pub(crate) fn cap_safe_sleep(dur: Duration) {
 
 /// シグナルハンドラのセットアップ
 pub fn setup_signal_handler() {
-    // SIGINT, SIGTERM をキャッチしてシャットダウンフラグを設定
+    // SIGINT, SIGTERM をキャッチしてシャットダウンフラグを設定。
+    // unix は signal-hook の専用スレッドで受ける。以前は ctrlc を使っていたが、ctrlc は
+    // termination feature が無いと SIGINT しか捕まえず、SIGTERM は既定動作のままだった
+    // （ネイティブでは graceful shutdown せず即終了、コンテナの PID 1 では無視されて
+    // `docker stop` が SIGKILL まで待つ）。termination を有効にすると SIGHUP（設定リロード）
+    // でも終了するため使えない（B-115）。
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+            .expect("Failed to set signal handler");
+        thread::Builder::new()
+            .name("veil-signal".into())
+            .spawn(move || {
+                for sig in signals.forever() {
+                    info!(
+                        "Received shutdown signal ({}), initiating graceful shutdown...",
+                        if sig == SIGTERM { "SIGTERM" } else { "SIGINT" }
+                    );
+                    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+                }
+            })
+            .expect("Failed to spawn signal thread");
+    }
+    #[cfg(not(unix))]
     ctrlc::set_handler(move || {
         info!("Received shutdown signal, initiating graceful shutdown...");
         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);

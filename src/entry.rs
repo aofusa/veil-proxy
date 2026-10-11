@@ -1192,6 +1192,8 @@ pub fn run() {
 
                     info!("[Thread {}] Worker stopped", thread_id);
                 });
+                // B-118: 待ちが切れて残った接続タスクをスレッドローカルが生きているうちに破棄する
+                crate::runtime::shutdown_thread();
             });
             handles.push(handle);
         }
@@ -1484,6 +1486,7 @@ pub fn run() {
 
                 info!("[HTTP] Redirect worker stopped");
             });
+            crate::runtime::shutdown_thread();
         });
         handles.push(http_handle);
     }
@@ -1852,6 +1855,7 @@ pub fn run() {
 
                     info!("[H2C Worker {}] Stopped", thread_id);
                 });
+                crate::runtime::shutdown_thread();
             });
             handles.push(h2c_handle);
         }

@@ -151,6 +151,15 @@ where
     block_on_with_config(future, &RuntimeConfig::default())
 }
 
+/// スレッドを終える前に、残っているタスクを破棄する（B-118）。
+///
+/// ワーカースレッドは `block_on` を抜けた直後に呼ぶ。graceful shutdown の待ちが切れて接続タスクが
+/// 残っていると、スレッドローカルの破棄の中でタスクが drop され、破棄済みのスレッドローカルに触れて
+/// panic（abort）するため。
+pub fn shutdown_thread() {
+    executor::shutdown_tasks(std::time::Duration::from_millis(500));
+}
+
 /// 設定付きでランタイムを初期化して Future を実行する
 pub fn block_on_with_config<F, R>(future: F, config: &RuntimeConfig) -> R
 where
