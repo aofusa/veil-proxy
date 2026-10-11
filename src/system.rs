@@ -97,7 +97,7 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
 /// 最初のアリーナは最初の Rust アロケーションで作られるため、`main` より前
 /// （ELF の `.init_array`）で設定する。環境変数 `MIMALLOC_ARENA_EAGER_COMMIT` /
 /// `MIMALLOC_PURGE_DELAY` が明示されていればそちらを優先する。
-#[cfg(all(feature = "mimalloc", target_os = "linux", not(veil_alloc_active)))]
+#[cfg(all(veil_mimalloc_active, target_os = "linux"))]
 mod mimalloc_early_options {
     // libmimalloc-sys は一部のオプション定数を公開していない。同梱の mimalloc v3 の
     // mi_option_e における列挙順（show_errors=0, show_stats=1, verbose=2,
@@ -228,8 +228,8 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
     let hp_info = check_huge_pages_availability();
 
     if hp_info.available {
-        // libmimalloc-sys を使用して Large OS Pages を有効化（mimalloc feature 有効時のみ）
-        #[cfg(all(target_os = "linux", feature = "mimalloc"))]
+        // libmimalloc-sys を使用して Large OS Pages を有効化（mimalloc を使うときのみ）
+        #[cfg(all(target_os = "linux", veil_mimalloc_active))]
         {
             unsafe {
                 // mi_option_large_os_pages = 6 (2MiB large pages)

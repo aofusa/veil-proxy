@@ -144,8 +144,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 ### アロケータ・メモリ（F-183）
 
-- unix の `full` / `full-container` のグローバルアロケータは `src/veil_alloc/`（`veil-alloc`、build.rs の
-  `veil_alloc_active`）。高速パス（`heap::alloc` / `heap::free`）にロック・アトミック・分岐を増やさない。
+- Linux・BSD の `full` / `full-container` のグローバルアロケータは `src/veil_alloc/`（`veil-alloc`、build.rs の
+  `veil_alloc_active`）。Windows・macOS は既定（`default` / `full`）でシステムアロケータ（build.rs が `mimalloc`・
+  `veil-alloc` を無視する。mimalloc は `mimalloc-force` で明示。F-184）。アロケータの cfg は `feature = "mimalloc"`
+  ではなく `veil_mimalloc_active` / `veil_alloc_active` で書く。高速パス（`heap::alloc` / `heap::free`）にロック・アトミック・分岐を増やさない。
   確保と解放の分類は `Layout` だけで決める（`classify` を両側で共有。ブロックヘッダや表を足さない）。
 - アロケータ内の `thread_local!` は const 初期化かつ Drop 無しに限る（デストラクタ登録がアロケーションする）。
   スレッド終了は pthread キーのデストラクタで検出し、ヒープは解放せず次のスレッドへ引き継ぐ。

@@ -48,7 +48,7 @@ Measured in a 1-worker TLS container (`--cpus 0.25`):
 | Linux, default features | mimalloc v3 | `arena_eager_commit = 0`, `purge_delay = 250` ms (set before `main`; `MIMALLOC_*` env vars override) |
 | FreeBSD (`full-freebsd`) | libc `malloc(3)` (jemalloc) | `dirty_decay_ms:1000,muzzy_decay_ms:0,retain:false,lg_tcache_max:16` via the `malloc_conf` symbol (`MALLOC_CONF` / `/etc/malloc.conf` override) |
 | OpenBSD / NetBSD | libc `malloc(3)` | — |
-| Windows | mimalloc | — |
+| Windows / macOS (default and `full`, F-184) | system allocator (Windows heap / macOS libmalloc) | the `mimalloc` and `veil-alloc` features are ignored on these targets; build with `--features mimalloc-force` to use mimalloc |
 
 All allocators are driven by an **idle hook**: a worker's accept loop times out every second when no
 connection arrives (and the HTTP/3 loop times out when idle), and at that point veil asks the active

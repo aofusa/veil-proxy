@@ -19,6 +19,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VEIL_ALLOC");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_MIMALLOC");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_MIMALLOC_FORCE");
 
     emit_runtime_backend_cfg();
     emit_wasm_nosignals_cfg();
@@ -29,14 +31,30 @@ fn main() {
 ///
 /// | cfg | 条件 | 意味 |
 /// |-----|------|------|
-/// | `veil_alloc_active` | `feature = "veil-alloc"` かつ `target_family = "unix"` | `src/veil_alloc/` をコンパイルし `#[global_allocator]` にする。Windows では feature を無視して mimalloc 等へフォールバックする（pthread キー・mmap 前提のため） |
+/// | `veil_alloc_active` | `feature = "veil-alloc"` かつ `target_family = "unix"` かつ macOS 以外 | `src/veil_alloc/` をコンパイルし `#[global_allocator]` にする。Windows（pthread キー・mmap 前提のため）と macOS（F-184）では feature を無視する |
+/// | `veil_mimalloc_active` | `veil_alloc_active` でなく、`feature = "mimalloc"` かつ Windows・macOS 以外、または `feature = "mimalloc-force"` | mimalloc を `#[global_allocator]` にする |
+///
+/// F-184: Windows と macOS は既定（`default` / `full`）でシステムアロケータ（HeapAlloc /
+/// libmalloc）を使う。cargo にはターゲット別の default features が無いため、feature は
+/// そのままにして build.rs で無効化する（同じクレートを別名でターゲット別に依存させることは
+/// cargo が許さないため、依存はビルドされるが参照しないのでリンクされない）。Windows・macOS で
+/// mimalloc を使うときは `mimalloc-force` を明示する。
 fn emit_allocator_cfg() {
     println!("cargo::rustc-check-cfg=cfg(veil_alloc_active)");
+    println!("cargo::rustc-check-cfg=cfg(veil_mimalloc_active)");
     let unix = std::env::var("CARGO_CFG_TARGET_FAMILY")
         .map(|f| f.split(',').any(|x| x == "unix"))
         .unwrap_or(false);
-    if feature_enabled("VEIL_ALLOC") && unix {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let native_alloc_os = os == "windows" || os == "macos";
+    let veil_alloc = feature_enabled("VEIL_ALLOC") && unix && !native_alloc_os;
+    if veil_alloc {
         println!("cargo::rustc-cfg=veil_alloc_active");
+    }
+    let mimalloc =
+        (feature_enabled("MIMALLOC") && !native_alloc_os) || feature_enabled("MIMALLOC_FORCE");
+    if mimalloc && !veil_alloc {
+        println!("cargo::rustc-cfg=veil_mimalloc_active");
     }
 }
 
