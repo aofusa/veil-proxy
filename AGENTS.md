@@ -142,6 +142,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
 - キープアライブ待ちの接続は読み取りバッファを持たない（readiness を待ってから借りる）。mimalloc の
   `arena_eager_commit` は `main` 前（`.init_array`）で 0 にする（実行時に設定すると最初のアリーナに効かない。B-101）。
+- 終了シグナルは unix では signal-hook で SIGINT / SIGTERM を受ける（ctrlc は termination feature 無しでは SIGTERM を
+  捕まえず、有効にすると SIGHUP＝リロードも終了になる。B-115）。
 - 動的設定は ArcSwap とリロード経路の不変条件を維持する。`unsafe` は最小限で、拡大時は不変条件をコメントで明示する。
 
 ### アロケータ・メモリ（F-183）

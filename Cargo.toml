@@ -458,7 +458,6 @@ ftlog = "0.2.15"
 time = "0.3.44"
 hostname = "0.4.2"
 itoa = "1.0.17"
-ctrlc = "3.5.1"
 
 # CPUアフィニティ設定
 # 各ワーカースレッドを特定のCPUコアに固定し、キャッシュ効率を向上
@@ -611,6 +610,9 @@ veil-wasmtime = { path = "third_party/wasmtime", optional = true, features = ["p
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）
 # ====================
 [target.'cfg(windows)'.dependencies]
+# Ctrl-C / Ctrl-Break でのシャットダウン（unix は signal-hook で SIGINT / SIGTERM を受ける。
+# ctrlc は termination feature 無しでは SIGTERM を捕まえず、有効にすると SIGHUP も奪うため。B-115）
+ctrlc = "3.5.1"
 windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Foundation",
