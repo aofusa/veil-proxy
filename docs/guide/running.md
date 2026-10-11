@@ -131,6 +131,11 @@ When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:
 3. Wait for all worker threads to finish
 4. Terminate process
 
+The wait for existing connections is bounded by `[server] graceful_shutdown_timeout_secs` (default 30).
+Connections still open after that are closed and the process exits normally (exit status 0).
+On unix both signals are handled by a dedicated signal thread; in containers `docker stop` (SIGTERM)
+therefore shuts veil down gracefully instead of waiting for SIGKILL.
+
 ```bash
 # Start server
 ./veil -c ./examples/config.toml &

@@ -130,6 +130,10 @@ SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは安全に�
 3. 全ワーカースレッドの終了を待機
 4. プロセス終了
 
+既存接続を待つ時間の上限は `[server] graceful_shutdown_timeout_secs`（既定 30 秒）です。過ぎても残っている
+接続は閉じ、プロセスは正常終了（終了コード 0）します。unix では両シグナルを専用のシグナルスレッドで受けるため、
+コンテナの `docker stop`（SIGTERM）でも SIGKILL を待たずに graceful shutdown します。
+
 ```bash
 # サーバー起動
 ./veil -c ./examples/config.toml &
