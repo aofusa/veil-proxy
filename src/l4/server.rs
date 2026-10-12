@@ -50,6 +50,12 @@ pub fn spawn_l4_listeners(
     let core_ids_available = core_ids.as_ref().map(|ids| ids.len()).unwrap_or(0);
 
     for config in listeners {
+        // F-192: ネイティブハンドラのリスナーは上流を使わない（別ループで処理する）。
+        #[cfg(feature = "l4-handler")]
+        if let Some(name) = &config.handler {
+            spawn_l4_handler_listener(config, name, num_threads, balancing);
+            continue;
+        }
         if config.upstreams.is_empty() {
             warn!("[L4:{}] no upstreams configured, skipping", config.name);
             continue;
@@ -324,6 +330,138 @@ pub fn spawn_l4_listeners(
                             listener_name_for_err, thread_id, e
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// ネイティブ L4 ハンドラのリスナーを起動する（F-192、`l4-handler` feature）。
+///
+/// TCP はワーカーごとに SO_REUSEPORT のリスナーを持ち（`create_listener`）、接続を登録した
+/// ハンドラで処理する。UDP は従来の L4 UDP と同じく 1 スレッド。
+#[cfg(feature = "l4-handler")]
+fn spawn_l4_handler_listener(
+    config: &L4ListenerConfig,
+    name: &str,
+    num_threads: usize,
+    balancing: crate::config::ReuseportBalancing,
+) {
+    use crate::api::l4::L4Handler;
+    let Some(handler) = crate::api::l4::lookup(name) else {
+        error!("[L4:{}] unknown handler '{}'", config.name, name);
+        return;
+    };
+    let listen_addr: SocketAddr = match config.listen.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            error!(
+                "[L4:{}] invalid listen address '{}': {}",
+                config.name, config.listen, e
+            );
+            return;
+        }
+    };
+    let listener_name: Arc<str> = Arc::from(config.name.as_str());
+    let idle = Duration::from_secs(config.idle_timeout_secs.max(1));
+    let max_conn = config.max_connections;
+    match handler {
+        L4Handler::Udp(h) => {
+            info!(
+                "[L4:{}] starting UDP native handler '{}' on {}",
+                config.name, name, listen_addr
+            );
+            thread::spawn(move || {
+                crate::runtime::block_on(crate::api::l4::serve_udp(h, listen_addr, listener_name));
+                crate::runtime::shutdown_thread();
+            });
+        }
+        L4Handler::Tcp(h) => {
+            info!(
+                "[L4:{}] starting TCP native handler '{}' on {} ({} workers)",
+                config.name, name, listen_addr, num_threads
+            );
+            let counter = Arc::new(L4ConnectionCounter::new());
+            for thread_id in 0..num_threads {
+                let h = h.clone();
+                let listener_name = listener_name.clone();
+                let counter = counter.clone();
+                let spawned =
+                    thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            crate::runtime::block_on(async move {
+                                let listener = match crate::server::create_listener(
+                                    listen_addr,
+                                    balancing,
+                                    num_threads,
+                                    thread_id,
+                                ) {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        error!(
+                                            "[L4:{} Worker {}] bind error on {}: {}",
+                                            listener_name, thread_id, listen_addr, e
+                                        );
+                                        return;
+                                    }
+                                };
+                                let conn_pool = crate::runtime::TaskPool::new();
+                                loop {
+                                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let (stream, peer) =
+                                        match timeout(Duration::from_secs(1), listener.accept())
+                                            .await
+                                        {
+                                            Ok(Ok(s)) => s,
+                                            Ok(Err(e)) => {
+                                                error!(
+                                                    "[L4:{} Worker {}] accept error: {}",
+                                                    listener_name, thread_id, e
+                                                );
+                                                continue;
+                                            }
+                                            Err(_) => continue,
+                                        };
+                                    if max_conn > 0
+                                        && counter.current.load(Ordering::Relaxed) >= max_conn
+                                    {
+                                        warn!(
+                                            "[L4:{}] connection limit ({}) reached, rejecting {}",
+                                            listener_name, max_conn, peer
+                                        );
+                                        continue;
+                                    }
+                                    let _ = stream.set_nodelay(true);
+                                    counter.current.fetch_add(1, Ordering::Relaxed);
+                                    counter.total.fetch_add(1, Ordering::Relaxed);
+                                    let (h, name, counter) =
+                                        (h.clone(), listener_name.clone(), counter.clone());
+                                    crate::system::spawn_pooled_with_panic_catch(
+                                        &conn_pool,
+                                        async move {
+                                            struct Guard(Arc<L4ConnectionCounter>);
+                                            impl Drop for Guard {
+                                                fn drop(&mut self) {
+                                                    self.0.current.fetch_sub(1, Ordering::Relaxed);
+                                                }
+                                            }
+                                            let _g = Guard(counter);
+                                            crate::api::l4::serve_tcp(h, stream, peer, name, idle)
+                                                .await;
+                                        },
+                                    );
+                                }
+                            });
+                            crate::runtime::shutdown_thread();
+                        });
+                if let Err(e) = spawned {
+                    error!(
+                        "[L4:{}] failed to spawn worker thread {}: {}",
+                        name, thread_id, e
+                    );
                 }
             }
         }

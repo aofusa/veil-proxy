@@ -187,6 +187,18 @@ pub mod server;
 
 mod entry;
 pub use entry::run;
+pub use entry::{run_server, ServerOptions};
+
+/// API サーバ基盤ライブラリ（F-188〜F-192）。`handler` feature（`api` 等）のときだけ存在する。
+#[cfg(feature = "handler")]
+pub mod api;
+#[cfg(feature = "handler")]
+pub use api::prelude;
+#[cfg(feature = "handler")]
+pub use api::{serve, serve_blocking, shutdown, App};
+// マクロ（`#[veil::route]` 等）はクレートルートから使えるようにする。
+#[cfg(feature = "macro")]
+pub use veil_macros::{l4_handler, main, route, Schema};
 
 // bin(旧 main.rs）から移設したクレート内部テスト群（lib+bin 構成対応）
 #[cfg(test)]

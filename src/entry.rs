@@ -161,12 +161,30 @@ pub fn run() {
     overrides.extend(cli_overrides);
     crate::config_override::set_global_overrides(overrides);
 
+    run_server(ServerOptions {
+        config_path: cli_args.config,
+        test_config: cli_args.test_config,
+    });
+}
+
+/// サーバの起動オプション（CLI 解析から独立。API ライブラリからも使う）。
+pub struct ServerOptions {
+    /// 設定ファイルのパス（SIGHUP リロードでも同じパスを読み直す）。
+    pub config_path: std::path::PathBuf,
+    /// `-t` 相当（設定を検証して終了する）。
+    pub test_config: bool,
+}
+
+/// 設定ファイルを読み込んでサーバを起動し、停止（SIGINT/SIGTERM・`server::request_shutdown`）まで
+/// ブロックする。`--override`・環境変数の上書きは呼び出し側が
+/// `config_override::set_global_overrides` で先に確定させておくこと。
+pub fn run_server(opts: ServerOptions) {
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
-    CONFIG_PATH.store(Arc::new(cli_args.config.clone()));
-    let config_path = cli_args.config;
+    CONFIG_PATH.store(Arc::new(opts.config_path.clone()));
+    let config_path = opts.config_path;
 
     // -t オプション: 設定ファイルのテストのみ
-    if cli_args.test_config {
+    if opts.test_config {
         match test_config_file(&config_path) {
             Ok(()) => {
                 println!(
@@ -188,8 +206,11 @@ pub fn run() {
 
     // プロセスレベルで暗号プロバイダーをインストール（aws-lc-rs使用）
     // F-122: OpenBSD は ring、他は aws_lc_rs（`crate::tls_provider` で選択）。
-    CryptoProvider::install_default(crate::tls_provider::provider::default_provider())
-        .expect("Failed to install rustls crypto provider");
+    // ライブラリとして組み込まれた場合はホスト側が先に入れていることがあるため、未設定のときだけ入れる。
+    if CryptoProvider::get_default().is_none() {
+        CryptoProvider::install_default(crate::tls_provider::provider::default_provider())
+            .expect("Failed to install rustls crypto provider");
+    }
 
     // ログ設定を先に読み込む（ログ初期化前）
     // 設定ファイルが読めない場合はデフォルト設定を使用
@@ -991,6 +1012,11 @@ pub fn run() {
 
     #[cfg(not(feature = "http2"))]
     let is_h2c_only_server = false;
+    // `[server].h2c_http1` は H2C 専用リスナーの設定なので http2 feature 無しでは意味が無い。
+    #[cfg(not(feature = "http2"))]
+    if loaded_config.h2c_http1 {
+        warn!("[server].h2c_http1 has no effect in a build without the http2 feature; ignoring");
+    }
 
     // FreeBSD capability mode 用の bind 完了バリア。
     // 各 TLS ワーカーが listener bind に成功したらカウントを進め、全ワーカー分
@@ -1681,6 +1707,7 @@ pub fn run() {
         for thread_id in 0..num_threads {
             let h2c_listener_source = h2c_listener_source.clone();
             let balancing = loaded_config.reuseport_balancing;
+            let h2c_http1 = loaded_config.h2c_http1;
             let max_conn = loaded_config.global_security.max_concurrent_connections;
 
             // このスレッドに割り当てるコアIDを決定
@@ -1805,10 +1832,21 @@ pub fn run() {
                                             )
                                             .await;
                                         }
+                                        ProtocolType::Http11 if h2c_http1 => {
+                                            // `[server].h2c_http1 = true`: 同じポートで平文
+                                            // HTTP/1.1 も処理する（平文専用サーバ構成）。
+                                            crate::proxy::handle_plain_http1_connection(
+                                                stream,
+                                                initial_data,
+                                                peer_addr,
+                                            )
+                                            .await;
+                                        }
                                         ProtocolType::Http11 => {
                                             // HTTP/1.1はH2C専用サーバーではサポートしない
+                                            // （`[server].h2c_http1 = true` で受理する）
                                             warn!(
-                                                "[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server, closing connection from {}",
+                                                "[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server (set [server].h2c_http1 = true to accept it), closing connection from {}",
                                                 peer_addr
                                             );
                                         }

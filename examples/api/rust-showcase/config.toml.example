@@ -1,0 +1,29 @@
+# showcase 用の設定例（config.toml にコピーすると取り込まれる。無ければライブラリ既定で動く）
+[server]
+listen = "0.0.0.0:8080"
+
+[logging]
+level = "info"
+
+[api]
+openapi_title = "veil showcase"
+
+# L4 ネイティブハンドラ（#[veil::l4_handler] で登録した名前を handler に書く）
+[[l4]]
+name = "tcp_echo"
+listen = "0.0.0.0:9000"
+handler = "tcp_echo"
+
+[[l4]]
+name = "udp_echo"
+listen = "0.0.0.0:9001"
+protocol = "udp"
+handler = "udp_echo"
+
+# 既存のプロキシ・静的配信のルートもそのまま書ける（ハンドラのルートと合わせて具体性順に並ぶ）
+# [[route]]
+# [route.conditions]
+# path = "/static/*"
+# [route.action]
+# type = "File"
+# path = "/var/www"

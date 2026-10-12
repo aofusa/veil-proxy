@@ -128,6 +128,8 @@ mod tests {
             module_configuration: None,
             #[cfg(feature = "wasm")]
             resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
+            #[cfg(feature = "l4-handler")]
+            handler: None,
         }
     }
 
@@ -177,6 +179,8 @@ mod tests {
             module_configuration: None,
             #[cfg(feature = "wasm")]
             resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
+            #[cfg(feature = "l4-handler")]
+            handler: None,
         });
         let state = new_health_state(1);
         spawn_l4_health_checker(config, state.clone());

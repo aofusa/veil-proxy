@@ -1927,6 +1927,8 @@ async fn h2_dispatch(
             )
             .await
         }
+        #[cfg(feature = "handler")]
+        Backend::Handler(entry, _, _) => h2_api_handler(ctx, &entry, resp_tx, notify).await,
     };
 
     #[cfg(feature = "wasm")]
@@ -1944,6 +1946,44 @@ async fn h2_dispatch(
     }
 
     result
+}
+
+/// HTTP/2 のネイティブハンドラ（API ライブラリ、F-188）。戻り値 `(status, resp_size)`。
+#[cfg(all(feature = "http2", feature = "handler"))]
+async fn h2_api_handler(
+    ctx: &H2RequestCtx,
+    entry: &crate::api::handler::HandlerEntry,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(ctx.headers.len() + 1);
+    let mut has_host = false;
+    for h in ctx.headers.iter().filter(|h| !h.name.starts_with(b":")) {
+        has_host |= h.name.eq_ignore_ascii_case(b"host");
+        headers.push((h.name.clone(), h.value.clone()));
+    }
+    if !has_host && !ctx.authority.is_empty() {
+        headers.push((Bytes::from_static(b"host"), ctx.authority.clone()));
+    }
+    let req = crate::api::dispatch::build_request(
+        ctx.method.clone(),
+        ctx.path.clone(),
+        headers,
+        ctx.body.clone(),
+        &ctx.client_ip,
+        crate::api::request::HttpVersion::Http2,
+    );
+    let mut resp = crate::api::dispatch::call(entry, req).await;
+    crate::api::dispatch::h2_h3_headers(&mut resp);
+    let status = resp.status_code();
+    let crate::api::response::Response {
+        headers: resp_headers,
+        body,
+        ..
+    } = resp;
+    let mut out = h2_base_headers(false);
+    out.extend(resp_headers);
+    h2_emit_full(resp_tx, notify, status, out, body).await
 }
 
 /// バッファ経路の Proxy 処理（H1/HTTPS/H2C バックエンド）。戻り値 `(status, resp_size)`。
@@ -4811,6 +4851,29 @@ pub async fn reject_h2c_invalid_preface(mut stream: TcpStream) {
     .await;
 }
 
+/// H2C 専用リスナーで受けた平文 HTTP/1.1 接続を処理する（`[server].h2c_http1 = true`）。
+///
+/// プロトコル検出で読んだ先頭バイト列（`initial_data`）を平文ストリームに引き継ぎ、
+/// メインリスナーの `tls_only = false` 経路と同じ `handle_requests` で処理する。
+#[cfg(feature = "http2")]
+pub async fn handle_plain_http1_connection(
+    stream: TcpStream,
+    initial_data: Vec<u8>,
+    peer_addr: SocketAddr,
+) {
+    #[cfg(veil_ktls)]
+    let plain = crate::ktls_rustls::accept_plain(stream, Some(initial_data)).await;
+    #[cfg(not(veil_ktls))]
+    let plain = simple_tls::accept_plain(stream, Some(initial_data)).await;
+    match plain {
+        Ok(plain_stream) => {
+            let client_ip = IpStr::new(peer_addr.ip());
+            handle_requests(plain_stream, client_ip.as_str(), peer_addr).await;
+        }
+        Err(e) => warn!("Failed to create plain stream: {}", e),
+    }
+}
+
 /// H2Cサーバー接続処理
 ///
 /// TLSなしでHTTP/2コネクションを確立し、リクエストを処理します。
@@ -6149,7 +6212,7 @@ async fn handle_backend(
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
     // Redirect 等のローカル応答）はボディを読まないため、keep-alive 接続でボディが次の
     // リクエストに混入して 400 desync を起こす。ローカル応答の前に残りのボディを読み捨てる。
-    if !matches!(backend, Backend::Proxy(..))
+    if !backend_consumes_request_body(&backend)
         && (is_chunked || content_length > initial_body.len())
         && !drain_request_body(&mut tls_stream, content_length, is_chunked, initial_body).await
     {
@@ -6365,6 +6428,164 @@ async fn handle_backend(
             )
             .await
         }
+        #[cfg(feature = "handler")]
+        Backend::Handler(entry, _, _) => {
+            Box::pin(handle_api_handler(
+                tls_stream,
+                &entry,
+                method,
+                req_path,
+                content_length,
+                is_chunked,
+                headers,
+                initial_body,
+                client_wants_close,
+                client_ip,
+            ))
+            .await
+        }
+    }
+}
+
+/// リクエスト本文を自分で読むバックエンドか（それ以外はローカル応答の前に読み捨てる）。
+#[inline]
+fn backend_consumes_request_body(backend: &Backend) -> bool {
+    match backend {
+        Backend::Proxy(..) => true,
+        #[cfg(feature = "handler")]
+        Backend::Handler(..) => true,
+        _ => false,
+    }
+}
+
+/// HTTP/1.1 のネイティブハンドラ（API ライブラリ、F-188）: 本文を上限付きで読み、ハンドラを呼んで
+/// 応答を書く。戻り値は他のバックエンドと同じ `(stream, status, body_len, close)`。
+#[cfg(feature = "handler")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_api_handler(
+    mut tls_stream: ServerTls,
+    entry: &crate::api::handler::HandlerEntry,
+    method: &[u8],
+    req_path: &[u8],
+    content_length: usize,
+    is_chunked: bool,
+    headers: &[(Bytes, Bytes)],
+    initial_body: &[u8],
+    client_wants_close: bool,
+    client_ip: &str,
+) -> Option<(ServerTls, u16, u64, bool)> {
+    let limit = crate::api::app::max_body_size();
+    let body = match read_api_request_body(
+        &mut tls_stream,
+        content_length,
+        is_chunked,
+        initial_body,
+        limit,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(status) => {
+            let resp = crate::api::response::Response::error(
+                status,
+                if status == 413 {
+                    "Payload Too Large"
+                } else {
+                    "Bad Request"
+                },
+            );
+            let mut out = crate::api::dispatch::http1_head(&resp, false);
+            out.extend_from_slice(&resp.body);
+            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await;
+            return Some((tls_stream, status, resp.body.len() as u64, true));
+        }
+    };
+    let req = crate::api::dispatch::build_request(
+        Bytes::copy_from_slice(method),
+        Bytes::copy_from_slice(req_path),
+        headers.to_vec(),
+        body,
+        client_ip,
+        crate::api::request::HttpVersion::Http11,
+    );
+    let resp = crate::api::dispatch::call(entry, req).await;
+    let status = resp.status_code();
+    let body = resp.body().clone();
+    let head = crate::api::dispatch::http1_head(&resp, !client_wants_close);
+    match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
+        Ok((Ok(_), _)) => {}
+        _ => return None,
+    }
+    if !body.is_empty() {
+        let len = body.len() as u64;
+        match timeout(WRITE_TIMEOUT, tls_stream.write_all(body)).await {
+            Ok((Ok(_), _)) => Some((tls_stream, status, len, client_wants_close)),
+            _ => None,
+        }
+    } else {
+        Some((tls_stream, status, 0, client_wants_close))
+    }
+}
+
+/// ハンドラ用に HTTP/1.1 のリクエスト本文を全部読む（Content-Length / chunked、上限 `limit`）。
+/// 失敗はステータス（上限超過 413、それ以外 400）。
+#[cfg(feature = "handler")]
+async fn read_api_request_body(
+    stream: &mut ServerTls,
+    content_length: usize,
+    is_chunked: bool,
+    initial_body: &[u8],
+    limit: usize,
+) -> Result<Bytes, u16> {
+    if is_chunked {
+        let mut decoder = ChunkedDecoder::new(limit as u64);
+        let mut raw: Vec<u8> = initial_body.to_vec();
+        let mut state = decoder.feed(initial_body);
+        while matches!(state, ChunkedFeedResult::Continue) {
+            let buf = buf_get();
+            match timeout(READ_TIMEOUT, stream.read(buf)).await {
+                Ok((Ok(n), mut b)) if n > 0 => {
+                    b.set_valid_len(n);
+                    raw.extend_from_slice(b.as_valid_slice());
+                    state = decoder.feed(b.as_valid_slice());
+                    buf_put(b);
+                }
+                Ok((_, b)) => {
+                    buf_put(b);
+                    return Err(400);
+                }
+                Err(_) => return Err(400),
+            }
+        }
+        match state {
+            ChunkedFeedResult::Complete => Ok(Bytes::from(decode_chunked_body(&raw))),
+            ChunkedFeedResult::SizeLimitExceeded => Err(413),
+            ChunkedFeedResult::Continue => Err(400),
+        }
+    } else {
+        if content_length > limit {
+            return Err(413);
+        }
+        let mut body = Vec::with_capacity(content_length);
+        body.extend_from_slice(&initial_body[..initial_body.len().min(content_length)]);
+        while body.len() < content_length {
+            let buf = buf_get();
+            match timeout(READ_TIMEOUT, stream.read(buf)).await {
+                Ok((Ok(n), mut b)) if n > 0 => {
+                    b.set_valid_len(n);
+                    let want = content_length - body.len();
+                    let got = b.as_valid_slice();
+                    body.extend_from_slice(&got[..got.len().min(want)]);
+                    buf_put(b);
+                }
+                Ok((_, b)) => {
+                    buf_put(b);
+                    return Err(400);
+                }
+                Err(_) => return Err(400),
+            }
+        }
+        Ok(Bytes::from(body))
     }
 }
 

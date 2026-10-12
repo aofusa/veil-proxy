@@ -333,3 +333,36 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             .supported_schemes()
     }
 }
+
+/// h2c（prior knowledge）で GET し、(status, body) を返す（h2 クレート + tokio のテスト専用クライアント）。
+pub fn h2c_get(port: u16, path: &str) -> (u16, Vec<u8>) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut client, conn) = h2::client::handshake(tcp).await.expect("h2c handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("http://localhost:{}{}", port, path))
+            .body(())
+            .unwrap();
+        let (resp, _) = client.send_request(req, true).expect("send");
+        let resp = resp.await.expect("response");
+        let status = resp.status().as_u16();
+        let mut body = resp.into_body();
+        let mut out = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("data");
+            let _ = body.flow_control().release_capacity(chunk.len());
+            out.extend_from_slice(&chunk);
+        }
+        (status, out)
+    })
+}

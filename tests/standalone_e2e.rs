@@ -275,3 +275,125 @@ fn pem_to_der(pem: &str) -> Vec<u8> {
         .as_ref()
         .to_vec()
 }
+
+// ===================== F-188（本体側の小改修） =====================
+
+/// `[tls]` を省略した平文専用サーバ（H2C 専用構成 + `h2c_http1 = true`）で、同じポートに
+/// 平文 HTTP/1.1 と h2c（prior knowledge）の両方が来ても処理できる。
+#[test]
+fn f188_plaintext_only_server_without_tls_serves_http1_and_h2c() {
+    let dir = tempfile::tempdir().unwrap();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "plain").unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+h2c_enabled = true
+h2c_http1 = true
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        www = www.display()
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    let resp = http1_get(port, "/index.html").expect("plain HTTP/1.1");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "plain");
+
+    let (status, body) = h2c_get(port, "/index.html");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"plain");
+}
+
+/// `h2c_http1` を付けない H2C 専用構成は従来どおり HTTP/1.1 を受けない（既定の挙動は不変）。
+#[test]
+fn f188_h2c_only_without_h2c_http1_still_rejects_http1() {
+    let dir = tempfile::tempdir().unwrap();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "x").unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+h2c_enabled = true
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        www = www.display()
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    assert!(
+        http1_get(port, "/index.html").is_err(),
+        "HTTP/1.1 must be rejected without h2c_http1"
+    );
+    let (status, _) = h2c_get(port, "/index.html");
+    assert_eq!(status, 200);
+}
+
+/// `[tls]` を省略できるのは平文専用サーバ構成だけ（TLS リスナーを使う構成は -t で失敗）。
+#[test]
+fn f188_missing_tls_is_rejected_unless_plaintext_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, "[server]\nlisten = \"127.0.0.1:18443\"\n").unwrap();
+    let out = std::process::Command::new(veil_bin())
+        .arg("-t")
+        .arg("-c")
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("TLS certificate is required"), "{}", stderr);
+
+    std::fs::write(
+        &cfg_path,
+        "[server]\nlisten = \"127.0.0.1:18443\"\nh2c_enabled = true\nh2c_http1 = true\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(veil_bin())
+        .arg("-t")
+        .arg("-c")
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

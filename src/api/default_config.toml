@@ -1,0 +1,29 @@
+# veil API ライブラリの既定設定（F-188）。
+#
+# config.toml が無くてもこの設定で起動する。config.toml があればこの上に深くマージされ、
+# さらに Rust コード（`Config::builder()`）・環境変数 `VEIL_OVERRIDE_<n>` で上書きできる。
+# 既定は「TLS 無し・平文 HTTP/1.1 + h2c（prior knowledge）を 0.0.0.0:8080 で受ける」。
+# スレッド数（server.threads）は CPU 数（実行時に入れる）。
+
+[server]
+listen = "0.0.0.0:8080"
+# H2C 専用サーバ構成（TLS リスナーを起動しない）で、同じポートの平文 HTTP/1.1 も受ける。
+h2c_enabled = true
+h2c_http1 = true
+tls_only = false
+http2_enabled = true
+
+[logging]
+level = "info"
+
+[security]
+# ホスト言語（Python・C）やユーザコードの syscall・ファイルアクセスを制限しないよう既定では無効。
+enable_seccomp = false
+enable_landlock = false
+
+[api]
+openapi_enabled = true
+openapi_path = "/docs"
+openapi_json_path = "/openapi.json"
+openapi_title = "veil API"
+openapi_version = "0.1.0"

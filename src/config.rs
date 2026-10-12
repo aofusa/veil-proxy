@@ -1529,15 +1529,17 @@ pub struct UnveilPaths {
 // 起動時コールドパス（unveil 前に 1 回だけ設定を読み直す）。データプレーン非経由。
 #[allow(clippy::disallowed_methods)]
 pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
-    let config_str = fs::read_to_string(config_path)?;
+    let config_str = read_config_text(config_path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut read_only = vec![config_path.to_path_buf()];
     let mut read_write_create = Vec::new();
 
-    read_only.push(PathBuf::from(&config.tls.cert_path));
-    read_only.push(PathBuf::from(&config.tls.key_path));
+    if config.tls.is_configured() {
+        read_only.push(PathBuf::from(&config.tls.cert_path));
+        read_only.push(PathBuf::from(&config.tls.key_path));
+    }
 
     // プロキシ経路の名前解決（getaddrinfo）と upstream TLS 検証に必要なシステムファイル。
     // 静的配信のみの構成では未使用だが、存在すれば読み取り許可しておく（unveil_path は
@@ -1610,23 +1612,22 @@ pub fn collect_macos_sandbox_paths(
 ) -> io::Result<crate::security::macos_sandbox::SandboxPaths> {
     use crate::security::macos_sandbox::SandboxPaths;
 
-    let config_str = fs::read_to_string(config_path)?;
+    let config_str = read_config_text(config_path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut static_roots = Vec::new();
     // `read_only` は wasm feature 有効時のみ変更されるため、mut 修飾を feature で分岐する
     // （wasm 無効ビルドで `unused_mut` 警告を出さないため。allow は使わない）。
+    // 平文専用サーバ（`[tls]` 無し）では証明書パスが空なので含めない。
+    let tls_paths = [&config.tls.cert_path, &config.tls.key_path]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
     #[cfg(feature = "wasm")]
-    let mut read_only = vec![
-        PathBuf::from(&config.tls.cert_path),
-        PathBuf::from(&config.tls.key_path),
-    ];
+    let mut read_only: Vec<PathBuf> = tls_paths.collect();
     #[cfg(not(feature = "wasm"))]
-    let read_only = vec![
-        PathBuf::from(&config.tls.cert_path),
-        PathBuf::from(&config.tls.key_path),
-    ];
+    let read_only: Vec<PathBuf> = tls_paths.collect();
     let mut read_write = Vec::new();
 
     if let Some(routes) = &config.route {
@@ -2952,6 +2953,8 @@ pub struct Route {
 #[derive(Deserialize)]
 struct Config {
     server: ServerConfigSection,
+    /// 省略可（平文専用サーバ構成のときだけ。`validate_tls_presence` 参照）。
+    #[serde(default = "default_tls_section")]
     tls: TlsConfigSection,
     #[serde(default)]
     performance: PerformanceConfigSection,
@@ -3076,7 +3079,8 @@ pub struct L4ListenerConfig {
     pub name: String,
     /// リッスンアドレス（例: "0.0.0.0:3306"）
     pub listen: String,
-    /// upstream バックエンド一覧
+    /// upstream バックエンド一覧（`handler` を使うリスナーでは省略可、F-192）
+    #[cfg_attr(feature = "l4-handler", serde(default))]
     pub upstreams: Vec<L4UpstreamEntry>,
     /// トランスポートプロトコル（tcp / udp）。省略時は後方互換で tcp（F-124）。
     #[serde(default)]
@@ -3116,6 +3120,11 @@ pub struct L4ListenerConfig {
     #[cfg(feature = "wasm")]
     #[serde(skip)]
     pub resolved_wasm_modules: Arc<Vec<ModuleRef>>,
+    /// ネイティブ L4 ハンドラ名（API ライブラリ、F-192）。指定すると上流へ転送せず、登録した
+    /// Rust 関数で接続・データグラムを処理する（`upstreams` は不要）。
+    #[cfg(feature = "l4-handler")]
+    #[serde(default)]
+    pub handler: Option<String>,
 }
 
 fn default_l4_connect_timeout() -> u64 {
@@ -3733,6 +3742,16 @@ pub struct ServerConfigSection {
     // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub h2c_listen: Option<String>,
 
+    /// H2C 専用リスナーで平文 HTTP/1.1 も受けるかどうか（既定 `false`）。
+    ///
+    /// H2C 専用リスナー（`h2c_listen`、または H2C 専用サーバ構成のメインリスナー）は
+    /// 既定ではプロトコル検出で HTTP/1.1 と判定した接続を閉じる。`true` にすると同じポートで
+    /// 平文 HTTP/1.1 も処理する（h2c はプリフェースで判別）。TLS 無しの平文専用サーバ
+    /// （`[tls]` を省略した構成、API ライブラリの既定）で HTTP/1.1 クライアントを受けるために使う。
+    /// 要 `http2` feature（無効時は警告して無視）。
+    #[serde(default)]
+    pub h2c_http1: bool,
+
     /// TLSリスナー（[server].listen）で平文接続を拒否するかどうか（既定 `true`）
     ///
     /// 適用範囲はメインリスナー（`[server].listen`）のみです。
@@ -3868,7 +3887,11 @@ fn default_server_header_value() -> String {
 
 #[derive(Deserialize)]
 pub struct TlsConfigSection {
+    /// 証明書のパス。`[tls]` 自体を省略した場合・空文字の場合は「TLS 無し」。
+    /// TLS 無しが許されるのは平文専用サーバ構成（[`plaintext_only_server`]）だけ。
+    #[serde(default)]
     pub cert_path: String,
+    #[serde(default)]
     pub key_path: String,
     /// kTLSを有効化するかどうか（Linux 5.15+、modprobe tls 必須）
     ///
@@ -4259,6 +4282,10 @@ pub enum BackendConfig {
         redirect_status: u16,
         preserve_path: bool,
     },
+    /// ネイティブハンドラ（API ライブラリ、F-188）。`handler` は登録済みハンドラの名前。
+    /// `handler` feature 無効のビルドでは `type = "Handler"` は設定エラーになる。
+    #[cfg(feature = "handler")]
+    Handler { handler: String },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -4297,6 +4324,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut use_h2c: Option<bool> = None;
                 // HTTPS 上流の HTTP/2（F-175、Proxy用）
                 let mut http2: Option<UpstreamHttp2> = None;
+                // ネイティブハンドラ名（Handler 用、F-188）
+                let mut handler: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -4317,6 +4346,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
                         "http2" => http2 = Some(map.next_value()?),
+                        "handler" => handler = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -4326,6 +4356,20 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let backend_type = backend_type.unwrap_or_else(|| "File".to_string());
 
                 match backend_type.as_str() {
+                    #[cfg(feature = "handler")]
+                    "Handler" => {
+                        let handler =
+                            handler.ok_or_else(|| serde::de::Error::missing_field("handler"))?;
+                        Ok(BackendConfig::Handler { handler })
+                    }
+                    #[cfg(not(feature = "handler"))]
+                    "Handler" => {
+                        let _ = handler;
+                        Err(serde::de::Error::custom(
+                            "action type \"Handler\" requires a build with the `handler` feature \
+                             (veil API library)",
+                        ))
+                    }
                     "Proxy" => {
                         // upstream が指定されている場合はロードバランシング用
                         if let Some(upstream_name) = upstream {
@@ -4447,6 +4491,14 @@ pub enum Backend {
         /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
         Option<Arc<Vec<ModuleRef>>>,
     ),
+    /// ネイティブハンドラ（API ライブラリ、F-188）。設定ロード時に名前解決済みのエントリ・
+    /// ルートのセキュリティ設定・WASM モジュール参照。
+    #[cfg(feature = "handler")]
+    Handler(
+        Arc<crate::api::handler::HandlerEntry>,
+        Arc<SecurityConfig>,
+        Option<Arc<Vec<ModuleRef>>>,
+    ),
 }
 
 // F-159: `Route` に `resolved_backend: Option<Backend>` を追加したため `Route` の
@@ -4459,6 +4511,8 @@ impl std::fmt::Debug for Backend {
             Backend::MemoryFile(..) => write!(f, "Backend::MemoryFile(..)"),
             Backend::SendFile(..) => write!(f, "Backend::SendFile(..)"),
             Backend::Redirect(..) => write!(f, "Backend::Redirect(..)"),
+            #[cfg(feature = "handler")]
+            Backend::Handler(..) => write!(f, "Backend::Handler(..)"),
         }
     }
 }
@@ -4475,6 +4529,8 @@ impl Backend {
             Backend::MemoryFile(_, _, security, _) => security,
             Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
             Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
+            #[cfg(feature = "handler")]
+            Backend::Handler(_, security, _) => security,
         }
     }
 
@@ -4487,6 +4543,8 @@ impl Backend {
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
             Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules) => modules.as_ref(),
+            #[cfg(feature = "handler")]
+            Backend::Handler(_, _, modules) => modules.as_ref(),
         }
     }
 
@@ -4502,6 +4560,10 @@ impl Backend {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
             Backend::Redirect(_, _, _, modules) => {
+                modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
+            }
+            #[cfg(feature = "handler")]
+            Backend::Handler(_, _, modules) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
         }
@@ -5750,13 +5812,55 @@ fn tls_file_check_suppressed() -> bool {
     }
 }
 
+impl TlsConfigSection {
+    /// 証明書・秘密鍵が設定されているか（どちらか一方でも書かれていれば「設定あり」として検査する）。
+    pub fn is_configured(&self) -> bool {
+        !self.cert_path.is_empty() || !self.key_path.is_empty()
+    }
+}
+
+/// `[tls]` を省略したときの既定値（証明書無し = TLS 無し）。
+fn default_tls_section() -> TlsConfigSection {
+    toml::from_str("").expect("TlsConfigSection must deserialize from an empty table")
+}
+
+/// 平文専用サーバ構成か（TLS 証明書無しで起動してよい構成）。
+///
+/// H2C 専用サーバ（`h2c_enabled = true` かつ `h2c_listen` 未指定または `listen` と同一。
+/// TLS リスナー自体が起動しない）で、HTTP/3（QUIC は TLS 必須）が無効なときに限る。
+pub fn plaintext_only_server(server: &ServerConfigSection) -> bool {
+    cfg!(feature = "http2")
+        && server.h2c_enabled
+        && server
+            .h2c_listen
+            .as_deref()
+            .map(|l| l == server.listen)
+            .unwrap_or(true)
+        && !server.http3_enabled
+}
+
+/// `[tls]` が無い構成を検査する（平文専用サーバ以外ではエラー）。
+fn validate_tls_presence(config: &Config) -> io::Result<()> {
+    if config.tls.is_configured() || plaintext_only_server(&config.server) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "TLS certificate is required: set [tls] cert_path and key_path \
+         (a server without TLS is only allowed in the plaintext-only configuration: \
+         [server] h2c_enabled = true without a separate h2c_listen, and http3_enabled = false)",
+    ))
+}
+
 fn validate_config(config: &Config) -> io::Result<()> {
+    validate_tls_presence(config)?;
+
     // TLS証明書ファイルの存在チェック
     //
     // F-178: capability mode 中（＝リロード時）は絶対パスの stat ができず常に「無い」と判定
     // されるため省く。リロードは TLS 設定を引き継ぐので証明書の存在は結果に影響しない
     // （証明書の差し替えは `[tls] auto_reload` の dirfd 経路が扱う。F-136）。
-    if !tls_file_check_suppressed() {
+    if !tls_file_check_suppressed() && config.tls.is_configured() {
         let cert_path = Path::new(&config.tls.cert_path);
         if !cert_path.exists() {
             return Err(io::Error::new(
@@ -5836,6 +5940,54 @@ fn validate_config(config: &Config) -> io::Result<()> {
                         ),
                     ));
                 }
+            }
+        }
+    }
+
+    // F-192: ネイティブ L4 ハンドラの検査（登録済み・プロトコル一致・併用できない設定）。
+    #[cfg(feature = "l4-handler")]
+    for l4 in config.l4.iter().flatten() {
+        if let Some(name) = &l4.handler {
+            let proto = match l4.protocol {
+                L4Protocol::Tcp => "tcp",
+                L4Protocol::Udp => "udp",
+            };
+            match crate::api::l4::protocol_of(name) {
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("L4 listener '{}': unknown handler '{}'", l4.name, name),
+                    ))
+                }
+                Some(p) if p != proto => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}': handler '{}' is a {} handler but protocol = \"{}\"",
+                            l4.name, name, p, proto
+                        ),
+                    ))
+                }
+                Some(_) => {}
+            }
+            if l4.tls != L4TlsMode::None {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "L4 listener '{}': a native handler requires tls = \"none\"",
+                        l4.name
+                    ),
+                ));
+            }
+            #[cfg(feature = "wasm")]
+            if !l4.wasm_modules.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "L4 listener '{}': wasm_modules cannot be combined with a native handler",
+                        l4.name
+                    ),
+                ));
             }
         }
     }
@@ -5993,6 +6145,18 @@ fn validate_route_config(
                     format!(
                         "Invalid mode for route '{}': {} (expected 'sendfile' or 'memory')",
                         route_name, mode
+                    ),
+                ));
+            }
+        }
+        #[cfg(feature = "handler")]
+        BackendConfig::Handler { handler } => {
+            if crate::api::handler::lookup(handler).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Unknown handler '{}' for route '{}' (register it with #[veil::route] or App::route)",
+                        handler, route_name
                     ),
                 ));
             }
@@ -6174,6 +6338,11 @@ fn load_tls_config(
     ktls_enabled: bool,
     #[allow(unused_variables)] http2_enabled: bool,
 ) -> io::Result<Arc<ServerConfig>> {
+    // 平文専用サーバ（`[tls]` 無し）: TLS リスナーは起動しないが、アクセプタの型を満たすために
+    // 証明書を持たない ServerConfig を返す（万一ハンドシェイクが来ても証明書が無く失敗する）。
+    if !tls_config.is_configured() {
+        return Ok(no_certificate_server_config());
+    }
     // F-136: cert/key 読み取りは単一チョークポイント `tls_reload::read_pem` を経由する。
     // 通常（Linux/macOS/Windows/OpenBSD）は `std::fs::read` と完全に等価。FreeBSD
     // capability mode 下で `security::capsicum::init_tls_cert_dirfds` が該当パスを
@@ -6282,6 +6451,32 @@ fn load_tls_config(
     }
 
     Ok(Arc::new(config))
+}
+
+/// 証明書を返さない rustls のサーバ証明書リゾルバ（平文専用サーバ用）。
+#[derive(Debug)]
+struct NoServerCertificate;
+
+impl rustls::server::ResolvesServerCert for NoServerCertificate {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        None
+    }
+}
+
+/// 証明書を持たない ServerConfig（平文専用サーバ用。TLS リスナーは起動しない）。
+fn no_certificate_server_config() -> Arc<ServerConfig> {
+    Arc::new(
+        ServerConfig::builder_with_provider(
+            crate::tls_provider::provider::default_provider().into(),
+        )
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .expect("default TLS versions are always valid")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(NoServerCertificate)),
+    )
 }
 
 /// プロセス共有のセッションチケット発行器（F-183）。証明書のリロードで `ServerConfig` を
@@ -6437,6 +6632,8 @@ pub struct LoadedConfig {
     /// H2C リスニングアドレス（オプション）
     #[cfg(feature = "http2")]
     pub h2c_listen: Option<String>,
+    /// H2C 専用リスナーで平文 HTTP/1.1 も受けるか（`[server].h2c_http1`）
+    pub h2c_http1: bool,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     pub wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
@@ -6687,6 +6884,20 @@ fn read_config_source(path: &Path) -> io::Result<String> {
     if let Some(res) = crate::security::capsicum::read_config_file(path) {
         return res;
     }
+    read_config_text(path)
+}
+
+/// 設定ファイルの本文を読む（起動・リロード・検証の全経路の入口）。
+///
+/// API ライブラリのモード（`handler` feature でフック設定済み）では、ファイルが無ければ
+/// 空文字（= ライブラリ既定設定とコード側の上書きだけで起動する）を返す。
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
+fn read_config_text(path: &Path) -> io::Result<String> {
+    #[cfg(feature = "handler")]
+    if crate::config_override::library_mode() && !path.exists() {
+        return Ok(String::new());
+    }
     fs::read_to_string(path)
 }
 
@@ -6878,7 +7089,7 @@ fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
 // 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
 #[allow(clippy::disallowed_methods)]
 pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
-    let config_str = fs::read_to_string(path)?;
+    let config_str = read_config_text(path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -7040,18 +7251,27 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // TLS証明書をバイト列として読み込み（HTTP/3用、Landlock適用前に読み込み）
     // これによりLandlock適用後も証明書ファイルへのアクセスなしで動作可能
-    let tls_cert_pem = fs::read(&config.tls.cert_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to read TLS cert '{}': {}", config.tls.cert_path, e),
-        )
-    })?;
-    let tls_key_pem = fs::read(&config.tls.key_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to read TLS key '{}': {}", config.tls.key_path, e),
-        )
-    })?;
+    // 平文専用サーバ（`[tls]` 無し）では読まない（HTTP/3 は TLS 必須なので無効が保証されている）。
+    let tls_cert_pem = if !config.tls.is_configured() {
+        Vec::new()
+    } else {
+        fs::read(&config.tls.cert_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to read TLS cert '{}': {}", config.tls.cert_path, e),
+            )
+        })?
+    };
+    let tls_key_pem = if !config.tls.is_configured() {
+        Vec::new()
+    } else {
+        fs::read(&config.tls.key_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to read TLS key '{}': {}", config.tls.key_path, e),
+            )
+        })?
+    };
 
     info!(
         "TLS certificates pre-loaded for Landlock compatibility (cert: {} bytes, key: {} bytes)",
@@ -7100,7 +7320,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_config,
         tls_cert_path: config.tls.cert_path.clone(),
         tls_key_path: config.tls.key_path.clone(),
-        tls_auto_reload: config.tls.auto_reload,
+        // 証明書が無い（平文専用サーバ）ならリロード対象も無い。
+        tls_auto_reload: config.tls.auto_reload && config.tls.is_configured(),
         tls_reload_interval_secs: config.tls.reload_interval_secs,
         tls_cipher_suites: config.tls.cipher_suites.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
@@ -7139,6 +7360,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         h2c_enabled,
         #[cfg(feature = "http2")]
         h2c_listen,
+        h2c_http1: config.server.h2c_http1,
         #[cfg(feature = "wasm")]
         wasm_filter_engine,
         performance: config.performance.clone(),
@@ -7196,7 +7418,7 @@ fn resolve_l4_wasm_modules(
 // 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
 #[allow(clippy::disallowed_methods)]
 pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
-    let config_str = fs::read_to_string(path)?;
+    let config_str = read_config_text(path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(config.logging)
@@ -7833,6 +8055,18 @@ fn build_backend(
             *preserve_path,
             modules_arc.clone(),
         )),
+        #[cfg(feature = "handler")]
+        BackendConfig::Handler { handler } => match crate::api::handler::lookup(handler) {
+            Some(entry) => Ok(Backend::Handler(
+                entry,
+                Arc::new(security),
+                modules_arc.clone(),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown handler '{}' (not registered)", handler),
+            )),
+        },
     }
 }
 
@@ -7975,7 +8209,12 @@ pub struct CliArgs {
 #[allow(clippy::disallowed_methods)]
 pub fn test_config_file(path: &Path) -> io::Result<()> {
     // ファイル存在確認
-    if !path.exists() {
+    // API ライブラリのモードではファイルが無くてもよい（既定設定のみで起動する）。
+    #[cfg(feature = "handler")]
+    let file_required = !crate::config_override::library_mode();
+    #[cfg(not(feature = "handler"))]
+    let file_required = true;
+    if file_required && !path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("configuration file not found: {}", path.display()),
@@ -7983,14 +8222,17 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
     }
 
     // TOMLパース（--override 適用込み。src/config_override.rs の単一チョークポイント）
-    let config_str = std::fs::read_to_string(path)?;
+    let config_str = read_config_text(path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // 設定バリデーション
     validate_config(&config)?;
 
-    // TLS証明書の存在確認
+    // TLS証明書の存在確認（平文専用サーバで `[tls]` が無い場合は対象外）
+    if !config.tls.is_configured() {
+        return Ok(());
+    }
     let cert_path = Path::new(&config.tls.cert_path);
     if !cert_path.exists() {
         return Err(io::Error::new(

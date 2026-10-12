@@ -1,0 +1,240 @@
+//! Tower の `Service` / `Layer` 互換（F-190、`tokio-interface` feature）。
+//!
+//! - `App::layer(L)` / `App::layer_on("/admin", L)`: ハンドラを tower のサービスとして包み、層を掛ける。
+//!   veil のワーカー上でそのまま実行する（tokio の時計・I/O を使わない層向け: 認証・ヘッダ付与・CORS 等）。
+//! - `App::tokio_service(path, svc)`: tower のサービス（axum の Router 等）を tokio 互換ランタイムで
+//!   実行してマウントする（tokio に依存する層・ライブラリ向け）。
+//!
+//! リクエスト・応答は `http` クレートの型（本文は `http_body_util::Full<Bytes>`）で受け渡す。
+
+use super::app::App;
+use super::handler::{HandlerFn, OperationMeta};
+use super::request::Request;
+use super::response::Response;
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tower::ServiceExt;
+use tower_layer::Layer;
+use tower_service::Service;
+
+/// tower 側に渡す本文の型。
+pub type VeilBody = http_body_util::Full<Bytes>;
+
+/// veil の `Request` を `http::Request` にする（元の `Request` は extensions にも入れる。
+/// パスパラメータ等を内側のハンドラへ引き継ぐため）。
+pub fn to_http_request(req: Request) -> http::Request<VeilBody> {
+    let mut uri = String::with_capacity(req.path.len() + req.query.len() + 1);
+    uri.push_str(req.path());
+    if !req.query.is_empty() {
+        uri.push('?');
+        uri.push_str(req.query());
+    }
+    let mut b = http::Request::builder()
+        .method(req.method())
+        .uri(uri)
+        .version(match req.version {
+            super::request::HttpVersion::Http11 => http::Version::HTTP_11,
+            super::request::HttpVersion::Http2 => http::Version::HTTP_2,
+            super::request::HttpVersion::Http3 => http::Version::HTTP_3,
+        });
+    for (n, v) in req.headers.iter() {
+        if let (Ok(n), Ok(v)) = (
+            http::HeaderName::from_bytes(n),
+            http::HeaderValue::from_bytes(v),
+        ) {
+            b = b.header(n, v);
+        }
+    }
+    let body = VeilBody::new(req.body.clone());
+    let mut out = b
+        .body(body)
+        .unwrap_or_else(|_| http::Request::new(VeilBody::new(Bytes::new())));
+    out.extensions_mut().insert(req);
+    out
+}
+
+/// `http::Request` を veil の `Request` に戻す（層が書き換えたメソッド・URI・ヘッダ・本文を反映する）。
+pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
+    let (parts, body) = req.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    let orig = parts.extensions.get::<Request>().cloned();
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let headers: Vec<(Bytes, Bytes)> = parts
+        .headers
+        .iter()
+        .map(|(n, v)| {
+            (
+                Bytes::copy_from_slice(n.as_str().as_bytes()),
+                Bytes::copy_from_slice(v.as_bytes()),
+            )
+        })
+        .collect();
+    let mut req = Request::new(parts.method.as_str().to_string(), target, headers, body);
+    if let Some(o) = orig {
+        req.params = o.params;
+        req.client_ip = o.client_ip;
+        req.version = o.version;
+    }
+    req
+}
+
+/// veil の `Response` を `http::Response` にする。
+pub fn to_http_response(resp: Response) -> http::Response<VeilBody> {
+    let mut b = http::Response::builder().status(resp.status);
+    for (n, v) in &resp.headers {
+        if let (Ok(n), Ok(v)) = (
+            http::HeaderName::from_bytes(n),
+            http::HeaderValue::from_bytes(v),
+        ) {
+            b = b.header(n, v);
+        }
+    }
+    b.body(VeilBody::new(resp.body))
+        .unwrap_or_else(|_| http::Response::new(VeilBody::new(Bytes::new())))
+}
+
+/// `http::Response` を veil の `Response` にする（本文はまとめて読む）。
+pub async fn from_http_response<B>(resp: http::Response<B>) -> Response
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    let (parts, body) = resp.into_parts();
+    let body = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return Response::error(502, &format!("response body error: {}", e)),
+    };
+    let mut r = Response::new(parts.status.as_u16()).with_body(body);
+    for (n, v) in parts.headers.iter() {
+        r.headers.push((
+            Bytes::copy_from_slice(n.as_str().as_bytes()),
+            Bytes::copy_from_slice(v.as_bytes()),
+        ));
+    }
+    r
+}
+
+/// veil のハンドラを tower の `Service` として見せる（層の内側）。
+#[derive(Clone)]
+pub struct HandlerService {
+    func: HandlerFn,
+}
+
+impl Service<http::Request<VeilBody>> for HandlerService {
+    type Response = http::Response<VeilBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>>>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<VeilBody>) -> Self::Future {
+        let func = self.func.clone();
+        Box::pin(async move {
+            let req = from_http_request(req).await;
+            Ok(to_http_response(func(req).await))
+        })
+    }
+}
+
+impl App {
+    /// 全ルートに tower の層を掛ける（veil のワーカー上で実行）。
+    pub fn layer<L, B>(self, layer: L) -> App
+    where
+        L: Layer<HandlerService> + Clone + Send + Sync + 'static,
+        L::Service: Service<http::Request<VeilBody>, Response = http::Response<B>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as Service<http::Request<VeilBody>>>::Error: std::fmt::Display,
+        <L::Service as Service<http::Request<VeilBody>>>::Future: 'static,
+        B: http_body::Body<Data = Bytes> + 'static,
+        B::Error: std::fmt::Display,
+    {
+        self.layer_on("/", layer)
+    }
+
+    /// `prefix`（セグメント境界の前方一致）以下のルートだけに tower の層を掛ける。
+    pub fn layer_on<L, B>(self, prefix: &str, layer: L) -> App
+    where
+        L: Layer<HandlerService> + Clone + Send + Sync + 'static,
+        L::Service: Service<http::Request<VeilBody>, Response = http::Response<B>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as Service<http::Request<VeilBody>>>::Error: std::fmt::Display,
+        <L::Service as Service<http::Request<VeilBody>>>::Future: 'static,
+        B: http_body::Body<Data = Bytes> + 'static,
+        B::Error: std::fmt::Display,
+    {
+        self.wrap_on(prefix, move |inner: HandlerFn| -> HandlerFn {
+            // 層はルートごとに 1 回だけ組み立て、リクエストごとに clone する（tower の慣習）。
+            let svc = layer.layer(HandlerService { func: inner });
+            Arc::new(move |req: Request| {
+                let svc = svc.clone();
+                Box::pin(async move {
+                    match svc.oneshot(to_http_request(req)).await {
+                        Ok(resp) => from_http_response(resp).await,
+                        Err(e) => Response::error(500, &e.to_string()),
+                    }
+                })
+            })
+        })
+    }
+
+    /// tower のサービス（axum の `Router` 等）を tokio 互換ランタイムで実行して `path` にマウントする。
+    /// `path` は `{*rest}` で下位パスをまとめて渡せる（例: `"/legacy/{*rest}"`）。
+    pub fn tokio_service<S, B>(self, methods: &[&str], path: &str, svc: S) -> App
+    where
+        S: Service<http::Request<VeilBody>, Response = http::Response<B>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: std::fmt::Display + Send + 'static,
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::fmt::Display,
+    {
+        let name = format!("tokio_service{}", path.replace(['/', '{', '}', '*'], "_"));
+        let func: HandlerFn = Arc::new(move |req: Request| {
+            let svc = svc.clone();
+            Box::pin(async move {
+                let http_req = to_http_request(req);
+                let res = super::tokio_compat::try_run(async move {
+                    match svc.oneshot(http_req).await {
+                        Ok(resp) => Ok(from_http_response(resp).await),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+                .await;
+                match res {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => Response::error(500, &e),
+                    Err(e) => Response::error(500, &e.to_string()),
+                }
+            })
+        });
+        let meta = OperationMeta {
+            operation_id: name.clone(),
+            ..Default::default()
+        };
+        self.route_fn(&name, methods, path, func, meta)
+    }
+}

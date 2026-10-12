@@ -51,33 +51,38 @@ impl OffloadPool {
     }
 }
 
-static POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
-    let pool = Arc::new(OffloadPool {
-        queue: Mutex::new(VecDeque::new()),
-        cv: Condvar::new(),
-    });
-    // FS の syscall は短時間なので少数のワーカーで十分。最低 2、最大 8。
-    let workers = num_cpus::get().clamp(2, 8);
-    for _ in 0..workers {
-        let pool = Arc::clone(&pool);
-        std::thread::Builder::new()
-            .name("veil-fs-offload".to_string())
-            .spawn(move || loop {
-                let job = {
-                    let mut q = pool.queue.lock().unwrap();
-                    while q.is_empty() {
-                        q = pool.cv.wait(q).unwrap();
+impl OffloadPool {
+    /// `workers` 本のスレッド（名前 `name`）を持つプールを起動する。
+    fn spawn(name: &str, workers: usize) -> Arc<OffloadPool> {
+        let pool = Arc::new(OffloadPool {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        });
+        for _ in 0..workers {
+            let pool = Arc::clone(&pool);
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || loop {
+                    let job = {
+                        let mut q = pool.queue.lock().unwrap();
+                        while q.is_empty() {
+                            q = pool.cv.wait(q).unwrap();
+                        }
+                        q.pop_front()
+                    };
+                    if let Some(job) = job {
+                        job();
                     }
-                    q.pop_front()
-                };
-                if let Some(job) = job {
-                    job();
-                }
-            })
-            .expect("failed to spawn veil-fs-offload thread");
+                })
+                .unwrap_or_else(|e| panic!("failed to spawn {} thread: {}", name, e));
+        }
+        pool
     }
-    pool
-});
+}
+
+// FS の syscall は短時間なので少数のワーカーで十分。最低 2、最大 8。
+static POOL: Lazy<Arc<OffloadPool>> =
+    Lazy::new(|| OffloadPool::spawn("veil-fs-offload", num_cpus::get().clamp(2, 8)));
 
 /// オフロードワーカープールを事前生成する（スレッド spawn を前倒しする）。
 ///
@@ -347,6 +352,20 @@ where
         }
     }));
 
+    wait_until_done(read_fd, &done).await;
+    let result = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("offload result must be present once done");
+    result
+}
+
+/// 完了フラグ `done` が立つまで、起点スレッドの通知 fd（`read_fd`）で待つ。
+///
+/// `offload()` と（`handler` feature 時の）`await_completion()` が共有する待機ループ。
+/// 完了側は結果を格納してから `done` を `Release` で立て、通知 fd を叩く。
+async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
     // ===== io_uring バックエンド: POLL_ADD 待機 =====
     //
     // POLL_ADD の完了は eventfd への write 時点で CQE として **各待機者に個別に** 記録される
@@ -357,11 +376,7 @@ where
     #[cfg(veil_rt_uring)]
     loop {
         if done.load(Ordering::Acquire) {
-            return slot
-                .lock()
-                .unwrap()
-                .take()
-                .expect("offload result must be present once done");
+            return;
         }
         // eventfd が読み取り可能（=どれかのオフロードが完了）になるまで待つ。
         let _ = wait_readable_fd(read_fd).await;
@@ -443,17 +458,146 @@ where
 
         loop {
             if done.load(Ordering::Acquire) {
-                return slot
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("offload result must be present once done");
+                return;
             }
             OffloadWait {
                 read_fd,
-                done: Arc::clone(&done),
+                done: Arc::clone(done),
             }
             .await;
         }
     }
+}
+
+// ===== API ライブラリ用（`handler` feature のみ）: 外部スレッドの完了待ち・ハンドラ専用プール =====
+
+/// 別スレッドで完了する処理の結果を、起点スレッドへ届ける送り手（`await_completion` が渡す）。
+///
+/// `complete` を呼ばずに drop された場合（完了側の panic 等）も待機側は起きて `None` を受け取る。
+#[cfg(feature = "handler")]
+pub struct Completer<R> {
+    slot: Arc<Mutex<Option<R>>>,
+    done: Arc<AtomicBool>,
+    /// 起点スレッドの通知 fd。負値はドライバ無し（単体テスト等。待機側はポーリングする）。
+    write_fd: RawFd,
+    sent: bool,
+}
+
+#[cfg(feature = "handler")]
+impl<R> Completer<R> {
+    /// 結果を格納して起点スレッドを起こす。
+    pub fn complete(mut self, value: R) {
+        *self.slot.lock().unwrap() = Some(value);
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if self.sent {
+            return;
+        }
+        self.sent = true;
+        // 結果格納を Release で公開してから通知 fd を叩く（起点スレッドは Acquire で読む）。
+        self.done.store(true, Ordering::Release);
+        if self.write_fd >= 0 {
+            // SAFETY: write_fd は起点スレッドのスレッドローカルな通知 fd で、スレッドの生存中は
+            // 閉じられない（`offload()` と同じ前提）。
+            unsafe {
+                signal_notify(self.write_fd);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "handler")]
+impl<R> Drop for Completer<R> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// `submit` に [`Completer`] を渡し、別スレッド（tokio ランタイム・専用プール等）で
+/// `complete` されるのを、イベントループをブロックせずに待つ。
+///
+/// スレッド越しに Waker を呼ぶ代わりに `offload()` と同じ「結果スロット + 通知 fd」で
+/// 起点スレッドへ戻る（executor のタスクは `!Send`）。ランタイムドライバが無い場合
+/// （単体テスト等）は完了までポーリングして待つ。`Completer` が `complete` されずに
+/// drop されたら `None`。
+#[cfg(feature = "handler")]
+pub async fn await_completion<R, S>(submit: S) -> Option<R>
+where
+    R: Send + 'static,
+    S: FnOnce(Completer<R>),
+{
+    let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let fds = current_thread_notify_fds();
+    submit(Completer {
+        slot: Arc::clone(&slot),
+        done: Arc::clone(&done),
+        write_fd: fds.map(|(_, w)| w).unwrap_or(-1),
+        sent: false,
+    });
+    match fds {
+        Some((read_fd, _)) => wait_until_done(read_fd, &done).await,
+        None => poll_wait_done(&done),
+    }
+    let value = slot.lock().unwrap().take();
+    value
+}
+
+/// ドライバ無し（単体テスト等）のスレッドで完了を待つ。
+// 理由付き allow: ランタイムドライバが無いスレッド（イベントループ外の単体テスト）でだけ通る待機。
+#[cfg(feature = "handler")]
+#[allow(clippy::disallowed_methods)]
+fn poll_wait_done(done: &AtomicBool) {
+    while !done.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// ハンドラ用プールの既定スレッド数（CPU 数 × 2、最低 4）。
+#[cfg(feature = "handler")]
+fn default_handler_threads() -> usize {
+    (num_cpus::get() * 2).max(4)
+}
+
+/// ハンドラ用プールのスレッド数（`set_handler_pool_threads` で起動前に変更できる）。
+#[cfg(feature = "handler")]
+static HANDLER_POOL_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// API ライブラリのブロッキングなハンドラ（Python・C・`offload = true` の Rust）を実行する専用プール。
+/// FS 用プール（2〜8 本）と分けるのは、重いハンドラで静的配信のオフロードを枯渇させないため。
+#[cfg(feature = "handler")]
+static HANDLER_POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
+    let n = match HANDLER_POOL_THREADS.load(Ordering::Relaxed) {
+        0 => default_handler_threads(),
+        n => n,
+    };
+    OffloadPool::spawn("veil-handler", n)
+});
+
+/// ハンドラ用プールのスレッド数を設定する（最初のハンドラ実行より前に呼ぶこと。以後は無効）。
+#[cfg(feature = "handler")]
+pub fn set_handler_pool_threads(n: usize) {
+    HANDLER_POOL_THREADS.store(n, Ordering::Relaxed);
+}
+
+/// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。
+/// `f` が panic したら `None`。
+#[cfg(feature = "handler")]
+pub async fn offload_handler<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    await_completion(move |completer: Completer<R>| {
+        HANDLER_POOL.submit(Box::new(move || {
+            // panic しても Completer の Drop が待機側を起こす（None）。
+            if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                completer.complete(v);
+            }
+        }));
+    })
+    .await
 }

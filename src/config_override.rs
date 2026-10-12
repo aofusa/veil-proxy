@@ -72,6 +72,51 @@ pub fn global_overrides() -> &'static [ConfigOverride] {
     GLOBAL_OVERRIDES.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
+/// API ライブラリ（`handler` feature）の設定フック。`--override`・環境変数を当てた後の TOML 値木に
+/// ライブラリ既定設定のマージ・ビルダの上書き・ハンドラルートの注入を行う（`api::config` が設定する）。
+#[cfg(feature = "handler")]
+pub type LibraryHook = Box<dyn Fn(&mut toml::Value) -> Result<(), String> + Send + Sync>;
+
+#[cfg(feature = "handler")]
+static LIBRARY_HOOK: OnceLock<LibraryHook> = OnceLock::new();
+
+/// ライブラリモードのフックを設定する（プロセスで 1 回だけ。2 回目は `Err`）。
+#[cfg(feature = "handler")]
+pub fn set_library_hook(hook: LibraryHook) -> Result<(), String> {
+    LIBRARY_HOOK.set(hook).map_err(|_| {
+        "veil library hook is already installed (serve can run once per process)".to_string()
+    })
+}
+
+/// ライブラリモード（フック設定済み）か。設定ファイルが無くても既定設定で起動できる。
+#[cfg(feature = "handler")]
+pub fn library_mode() -> bool {
+    LIBRARY_HOOK.get().is_some()
+}
+
+#[cfg(feature = "handler")]
+impl ConfigOverride {
+    /// パス文字列（`--override` と同じ構文）と値から作る（ビルダの型付き上書き用）。
+    pub fn from_parts(path: &str, value: toml::Value) -> Result<ConfigOverride, String> {
+        let raw_segments = tokenize_path(path.trim())?;
+        let mut segs = Vec::with_capacity(raw_segments.len());
+        for (text, was_quoted) in &raw_segments {
+            segs.push(to_segment(text, *was_quoted)?);
+        }
+        Ok(ConfigOverride {
+            path: segs,
+            value,
+            raw: path.to_string(),
+        })
+    }
+
+    /// TOML 値木へ適用する（ライブラリのビルダが使う）。
+    pub fn apply(&self, root: &mut toml::Value) -> Result<(), String> {
+        apply_override(root, self)
+            .map_err(|e| format!("config override error: {} (from '{}')", e, self.raw))
+    }
+}
+
 /// `__veil_override = <value>` という 1 行ドキュメントとしてパースするための
 /// 中間ラッパー。トップレベルの値としてでなくフィールド値として TOML 値パーサを
 /// 呼び出すことで、整数・文字列・配列・インラインテーブルなど任意の値表現を
@@ -397,7 +442,11 @@ where
     T: serde::de::DeserializeOwned,
 {
     let overrides = global_overrides();
-    if overrides.is_empty() {
+    #[cfg(feature = "handler")]
+    let hook = LIBRARY_HOOK.get();
+    #[cfg(not(feature = "handler"))]
+    let hook: Option<&()> = None;
+    if overrides.is_empty() && hook.is_none() {
         return toml::from_str::<T>(s).map_err(|e| format!("TOML parse error: {}", e));
     }
 
@@ -407,6 +456,11 @@ where
     for ov in overrides {
         apply_override(&mut root, ov)
             .map_err(|e| format!("config override error: {} (from '{}')", e, ov.raw))?;
+    }
+
+    #[cfg(feature = "handler")]
+    if let Some(hook) = hook {
+        hook(&mut root)?;
     }
 
     root.try_into::<T>()
