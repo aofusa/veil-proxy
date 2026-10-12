@@ -104,3 +104,26 @@ enabled = false                   # true なら listen と同じアドレス（U
 
 - 旧キーがソース・設定例・ガイドから消え、`examples/config.toml`・`docs/guide/configuration.md`（英日）に新しい表と移行表がある。
 - 旧キーを書いた設定は移行先を示すエラーで起動しない。
+
+## 結果（設定資材・テスト・ガイドの移行）
+
+旧キー（`[server].http`・`tls_only`・`h2c_enabled`・`h2c_listen`・`h2c_http1`・`http3_enabled`）の利用箇所を新キーへ移行した。
+
+- テスト: `tests/e2e_setup.sh` の生成設定（H2C バックエンドは `listen`（ALPN h2 の TLS）+ `listen_cleartext`、UDS の h2c バックエンドは
+  `listen_cleartext = unix:...`、プロキシは `listen_cleartext` = h2c ポート（8081）+ `enable_secure_redirect = false` + `[http3] enabled`）。
+  **301 リダイレクトの検証は 1 つの平文ポートで h2c 配信と両立できない**ため、別インスタンス `proxy_redirect.toml`
+  （`listen` 8450 + `listen_cleartext` 8080、リダイレクト既定）に分けた（`test_redirect_301` は 8080 のまま）。
+  `tests/integration_tests.rs`（graceful shutdown の平文接続）と `tests/standalone_e2e.rs`（F-179 は `listen_cleartext` の上書き、
+  F-188 は `listen_cleartext` 版に書き換え。`allow_http = false` → 426 + h2c 可、`allow_h2c = false` → h2c 拒否 + HTTP/1.1 可、
+  `enable_secure_redirect` の HTTP/1.1・h2c 双方の 301（`Location`）、削除キーの `veil -t` エラーと移行先、検証規則）。
+  ハーネスに `h2c_get_with_headers` を追加。
+- 設定: `examples/config.toml`（待ち受けの表・移行表）・`contrib/config`・`docker/assets/conf.d`・`deploy/kubernetes/base`
+  （`listen` 8443 TLS + `listen_cleartext` 8080、リダイレクト無し）・`tools/container_security`（フィクスチャ・差分/カオス用の生成設定）。
+- 計測: `tools/perf/gen_configs.sh` と生成設定（構成名は不変。h2c 構成は `:80` のリダイレクトリスナーが無くなり `listen_cleartext` が h2c ポート）、
+  `*_alloc.toml`、`alloc_ab.sh`・`leak_check.sh`・BSD 版（`h1_file_plain` は TLS ポートでの平文受理が無くなったので平文ポートへ）。
+- ライブラリ: C は `veil_config_listen`（TLS）・`veil_config_listen_cleartext`・`veil_config_tls`、Python は `Config.listen`（TLS）・
+  `listen_cleartext`・`tls`、`run(listen_cleartext=, listen=, tls_cert=, tls_key=)`、サンプルの `VEIL_LISTEN` は平文へ。
+- ガイド（英日）: configuration（リスナー表・検証規則・移行表）・protocols（英に H2C 節を追加）・library・kubernetes・running・acme・testing、
+  AGENTS.md の平文計測ルール。
+- 試験: lib 1049・integration 60・standalone_e2e 12・E2E（io_uring / epoll とも 565）・`tests/api/library_e2e.sh` の rust / c / python が通過。
+  kind（k8s）と `examples/container/e2e.sh`（docker イメージが要る）は未実施。

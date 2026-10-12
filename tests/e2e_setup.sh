@@ -79,7 +79,6 @@ BACKEND_ECHO2_PORT=9020
 BACKEND_UDS_TLS_SOCK="${FIXTURES_DIR}/uds_tls.sock"
 BACKEND_UDS_H2C_SOCK="${FIXTURES_DIR}/uds_h2c.sock"
 # h2c 専用プロセスの（使用しない）TLS リスナー。[server].listen は必須キーのため置く。
-BACKEND_UDS_H2C_TLS_SOCK="${FIXTURES_DIR}/uds_h2c_tls.sock"
 BACKEND_UDS_MISSING_SOCK="${FIXTURES_DIR}/uds_missing.sock"
 
 # 色付き出力
@@ -434,7 +433,9 @@ EOF
     # 注意: H2C専用サーバーのため、通常のTLSリスナーは起動されない
     cat > "${FIXTURES_DIR}/backend_h2c.toml" << EOF
 [server]
-# F-200: 平文専用サーバ（listen 無し）。HTTP/1.1 と h2c をプロトコル検出で受け、リダイレクトはしない
+# F-200: 平文リスナー（HTTP/1.1 + h2c をプロトコル検出で受ける。リダイレクトはしない）に加え、
+# TLS リスナー（BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する（B-83 / F-175 の HTTPS 上流 h2 テスト用）。
+listen = "127.0.0.1:${BACKEND_H2C_TLS_PORT}"
 listen_cleartext = "127.0.0.1:${BACKEND_H2C_PORT}"
 enable_secure_redirect = false
 threads = 1
@@ -444,7 +445,7 @@ http2_enabled = true
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = ${backend_ktls_enabled}
-# 注意: 平文専用サーバーのため TLS 証明書は使用されない（listen が無ければ [tls] は省略可）
+# 注意: TLS リスナー（ALPN h2）のために証明書を使う
 
 [logging]
 level = "warn"
@@ -479,7 +480,7 @@ EOF
     # 分ける構成にしてある（1 プロセスにまとめると h2c のために `http2_enabled = true`
     # が必要になり、TLS リスナーの ALPN に `h2` が広告されるため、両方のリスナーを
     # 同一構成で検証したい場合の構成分離として維持する）。
-    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}" "${BACKEND_UDS_H2C_TLS_SOCK}"
+    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}"
     cat > "${FIXTURES_DIR}/backend_uds_tls.toml" << EOF
 [server]
 listen = "unix:${BACKEND_UDS_TLS_SOCK}"
@@ -2299,8 +2300,7 @@ start_servers() {
     # UDS 相手に curl が使えないため、ソケットの存在で readiness を判定する）
     local uds_wait=0
     while [ $uds_wait -lt 30 ]; do
-        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ] \
-            && [ -S "${BACKEND_UDS_H2C_TLS_SOCK}" ]; then
+        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ]; then
             log_info "UDS Backend is ready (both sockets bound)"
             break
         fi
