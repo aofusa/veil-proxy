@@ -30,7 +30,7 @@ run_rust() {
   local W; W="$(mktemp -d)"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
   cat > "$W/config.toml" <<TOML
 [server]
-listen = "127.0.0.1:$P"
+listen_cleartext = "127.0.0.1:$P"
 [logging]
 level = "info"
 [[l4]]
@@ -64,6 +64,13 @@ TOML
   expect "tower layer (global header)" "x-powered-by: veil" curl -s -i "$B/hello"
   expect "HEAD keeps length, no body" "content-length: 13" curl -s -I "$B/hello"
   expect "h2c prior knowledge" '"id":3' curl -s --http2-prior-knowledge "$B/users/3"
+  expect "stream (HTTP/1.1 chunked)" "line 3" curl -s "$B/stream"
+  expect "stream trailer (HTTP/1.1)" "x-lines: 3" curl -s -i "$B/stream"
+  expect "stream trailer (h2c)" "x-lines: 3" curl -s -i --http2-prior-knowledge "$B/stream"
+  expect "stream HEAD (no body)" "transfer-encoding: chunked" bash -c "curl -s -I '$B/stream' | tr A-Z a-z"
+  expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
+  expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
+  expect "streaming request (h2c, 1MiB)" "1048576" bash -c "head -c 1048576 /dev/zero | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
   expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}'
   expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7Badd(a:2,b:3)%7D"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"

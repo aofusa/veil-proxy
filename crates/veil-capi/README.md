@@ -27,7 +27,7 @@ gcc hello.c -Icrates/veil-capi/include -Ltarget/release -lveil -lpthread -ldl -l
 
 ```c
 veil_config_t *cfg = veil_config_new();            /* または veil_config_from_file("config.toml") */
-veil_config_listen(cfg, "0.0.0.0:8080");
+veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* 平文 HTTP/1.1 + h2c（既定）。TLS は veil_config_listen + veil_config_tls */
 veil_register_route(cfg, "/users/{id}", "GET", get_user, NULL);
 veil_run(cfg);                                      /* 停止までブロック。cfg は消費される */
 ```

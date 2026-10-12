@@ -269,7 +269,18 @@ pub unsafe extern "C" fn veil_config_set(
     }
 }
 
-/// 待ち受けアドレス（`[server].listen`）を設定する。例: `"0.0.0.0:8080"`。
+/// 文字列値をキーに設定する（TOML の基本文字列として quote する）。
+fn set_string(cfg: &mut veil_config_t, path: &str, value: &str) -> c_int {
+    // JSON の文字列エスケープは TOML の基本文字列として有効。
+    let quoted = serde_json::to_string(value).unwrap_or_default();
+    match cfg.config.set_override(&format!("{} = {}", path, quoted)) {
+        Ok(()) => VEIL_OK,
+        Err(e) => fail(VEIL_ERR_CONFIG, e.0),
+    }
+}
+
+/// TLS の待ち受けアドレス（`[server].listen`、HTTP/1.1 + h2 ALPN）を設定する。
+/// 例: `"0.0.0.0:8443"`。`veil_config_tls` で証明書も設定すること。
 ///
 /// # Safety
 ///
@@ -280,15 +291,48 @@ pub unsafe extern "C" fn veil_config_listen(cfg: *mut veil_config_t, addr: *cons
         return fail(VEIL_ERR_INVALID_ARG, "NULL config");
     };
     let addr = tryc!(cstr(addr));
-    // JSON の文字列エスケープは TOML の基本文字列として有効。
-    let quoted = serde_json::to_string(addr).unwrap_or_default();
-    match cfg
-        .config
-        .set_override(&format!("server.listen = {}", quoted))
-    {
-        Ok(()) => VEIL_OK,
-        Err(e) => fail(VEIL_ERR_CONFIG, e.0),
+    set_string(cfg, "server.listen", addr)
+}
+
+/// 平文の待ち受けアドレス（`[server].listen_cleartext`、HTTP/1.1 + h2c）を設定する。
+/// 例: `"0.0.0.0:8080"`（ライブラリ既定）。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`addr` は NUL 終端の C 文字列。
+#[no_mangle]
+pub unsafe extern "C" fn veil_config_listen_cleartext(
+    cfg: *mut veil_config_t,
+    addr: *const c_char,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    let addr = tryc!(cstr(addr));
+    set_string(cfg, "server.listen_cleartext", addr)
+}
+
+/// TLS の証明書と秘密鍵（`[tls].cert_path` / `key_path`）を設定する。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`cert_path`・`key_path` は NUL 終端の C 文字列。
+#[no_mangle]
+pub unsafe extern "C" fn veil_config_tls(
+    cfg: *mut veil_config_t,
+    cert_path: *const c_char,
+    key_path: *const c_char,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    let cert = tryc!(cstr(cert_path));
+    let key = tryc!(cstr(key_path));
+    let r = set_string(cfg, "tls.cert_path", cert);
+    if r != VEIL_OK {
+        return r;
     }
+    set_string(cfg, "tls.key_path", key)
 }
 
 /// ワーカースレッド数（`[server].threads`）を設定する。
@@ -985,7 +1029,15 @@ mod tests {
     fn config_and_routes() {
         unsafe {
             let cfg = veil_config_new();
-            assert_eq!(veil_config_listen(cfg, c("127.0.0.1:1").as_ptr()), VEIL_OK);
+            assert_eq!(
+                veil_config_listen_cleartext(cfg, c("127.0.0.1:1").as_ptr()),
+                VEIL_OK
+            );
+            assert_eq!(veil_config_listen(cfg, c("127.0.0.1:2").as_ptr()), VEIL_OK);
+            assert_eq!(
+                veil_config_tls(cfg, c("/tmp/c.pem").as_ptr(), c("/tmp/k.pem").as_ptr()),
+                VEIL_OK
+            );
             assert_eq!(veil_config_threads(cfg, 2), VEIL_OK);
             assert_eq!(
                 veil_config_set(cfg, c("logging.level").as_ptr(), c("\"warn\"").as_ptr()),

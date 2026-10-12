@@ -82,4 +82,4 @@ def has_pydantic():
 
 
 if __name__ == "__main__":
-    app.run(listen=os.environ.get("VEIL_LISTEN", "127.0.0.1:8000"))
+    app.run(listen_cleartext=os.environ.get("VEIL_LISTEN", "127.0.0.1:8000"))

@@ -36,7 +36,7 @@ def hello(name: str, greeting: str = "Hello"):       # name=パス、greeting=�
 def create_user(body: dict):
     return body
 
-veil.run(listen="127.0.0.1:8000")      # Ctrl-C / SIGTERM で graceful に停止
+veil.run(listen_cleartext="127.0.0.1:8000")      # Ctrl-C / SIGTERM で graceful に停止
 ```
 
 FastAPI のように `app = veil.App(title=..., version=...)` を作って `@app.get(...)`、`app.run()` も使えます。
@@ -84,10 +84,10 @@ Python は純粋な Python ハンドラの並列度を GIL に制限されるた
 
 ## 設定
 
-`veil.run(config_path=None, *, listen=None, threads=None, overrides=None, openapi=True)`。
+`veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None, tls_key=None, threads=None, overrides=None, openapi=True)`。
 `overrides` は `{"server.threads": 4, "api.max_body_size": 1048576}` のようにキー → Python 値（TOML に変換）です。
 環境変数 `VEIL_OVERRIDE_<n>` も使えます。キーは `examples/config.toml` を参照してください。
-`veil.Config`（`from_file`・`set`・`listen`・`threads`・`to_toml`）を直接組み立てることもできます。
+`veil.Config`（`from_file`・`set`・`listen_cleartext`・`listen`・`tls`・`threads`・`to_toml`）を直接組み立てることもできます。
 
 ## テスト
 

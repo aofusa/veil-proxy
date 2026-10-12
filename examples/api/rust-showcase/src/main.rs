@@ -207,10 +207,10 @@ where
 #[veil::main]
 async fn main() -> Result<(), veil::api::Error> {
     // config.toml があれば取り込み、無ければライブラリ既定（平文 0.0.0.0:8080、スレッド数 = CPU 数）。
-    // 環境変数 VEIL_LISTEN があればコード側で listen を上書きする例。
+    // 環境変数 VEIL_LISTEN があればコード側で listen_cleartext（平文）を上書きする例。
     let mut builder = Config::load()?.builder().openapi_title("veil showcase");
     if let Ok(listen) = std::env::var("VEIL_LISTEN") {
-        builder = builder.listen(&listen);
+        builder = builder.listen_cleartext(&listen);
     }
     let config = builder.build();
 

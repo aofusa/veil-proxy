@@ -10,7 +10,7 @@ Python はハンドラ関数だけを提供する。ネイティブ拡張 ``veil
     def hello(name: str, greeting: str = "Hello"):
         return {"message": f"{greeting}, {name}"}
 
-    veil.run(listen="127.0.0.1:8000")
+    veil.run(listen_cleartext="127.0.0.1:8000")
 """
 
 import asyncio
@@ -678,7 +678,18 @@ class App:
     def patch(self, path, **kw):
         return self._verb("PATCH")(path, **kw)
 
-    def build_config(self, config_path=None, *, listen=None, threads=None, overrides=None, openapi=True):
+    def build_config(
+        self,
+        config_path=None,
+        *,
+        listen_cleartext=None,
+        listen=None,
+        tls_cert=None,
+        tls_key=None,
+        threads=None,
+        overrides=None,
+        openapi=True,
+    ):
         from . import _veil
 
         cfg = _veil.Config.from_file(config_path) if config_path else _veil.Config()
@@ -688,19 +699,49 @@ class App:
             cfg.set("api.openapi_version", _toml_literal(self.version))
         if not openapi:
             cfg.set("api.openapi_enabled", "false")
+        if listen_cleartext:
+            cfg.listen_cleartext(listen_cleartext)
         if listen:
             cfg.listen(listen)
+        if tls_cert or tls_key:
+            if not (tls_cert and tls_key):
+                raise ValueError("tls_cert and tls_key must be given together")
+            cfg.tls(str(tls_cert), str(tls_key))
         if threads:
             cfg.threads(int(threads))
         for k, v in (overrides or {}).items():
             cfg.set(k, _toml_literal(v))
         return cfg
 
-    def run(self, config_path=None, *, listen=None, threads=None, overrides=None, openapi=True):
-        """サーバを起動し、停止（Ctrl-C・SIGTERM・``veil.shutdown()``）までブロックする。"""
+    def run(
+        self,
+        config_path=None,
+        *,
+        listen_cleartext=None,
+        listen=None,
+        tls_cert=None,
+        tls_key=None,
+        threads=None,
+        overrides=None,
+        openapi=True,
+    ):
+        """サーバを起動し、停止（Ctrl-C・SIGTERM・``veil.shutdown()``）までブロックする。
+
+        ``listen_cleartext`` は平文（HTTP/1.1 + h2c、既定 ``0.0.0.0:8080``）、``listen`` は TLS
+        （``tls_cert`` と ``tls_key`` が要る）のアドレス。
+        """
         from . import _veil
 
-        cfg = self.build_config(config_path, listen=listen, threads=threads, overrides=overrides, openapi=openapi)
+        cfg = self.build_config(
+            config_path,
+            listen_cleartext=listen_cleartext,
+            listen=listen,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            threads=threads,
+            overrides=overrides,
+            openapi=openapi,
+        )
         for r in self.routes:
             hid = len(_HANDLERS)
             _HANDLERS.append(r)
