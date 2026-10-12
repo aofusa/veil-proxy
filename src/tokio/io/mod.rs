@@ -5,6 +5,14 @@ mod read_buf;
 mod util;
 
 pub use read_buf::ReadBuf;
+
+/// `tokio::io::unix`（任意の fd の準備待ち）。
+#[cfg(unix)]
+pub mod unix {
+    pub use crate::tokio::net::{
+        AsyncFd, AsyncFdReadyGuard, AsyncFdReadyMutGuard, AsyncFdTryNewError, TryIoError,
+    };
+}
 pub use std::io::{Error, ErrorKind, Result, SeekFrom};
 pub use util::*;
 
@@ -305,6 +313,19 @@ impl<T: AsRef<[u8]> + Unpin> AsyncSeek for std::io::Cursor<T> {
     }
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<u64>> {
         Poll::Ready(Ok(self.get_mut().position()))
+    }
+}
+
+impl<P> AsyncSeek for Pin<P>
+where
+    P: DerefMut + Unpin,
+    P::Target: AsyncSeek,
+{
+    fn start_seek(self: Pin<&mut Self>, pos: SeekFrom) -> Result<()> {
+        self.get_mut().as_mut().start_seek(pos)
+    }
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
+        self.get_mut().as_mut().poll_complete(cx)
     }
 }
 

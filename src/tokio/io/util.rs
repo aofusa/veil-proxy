@@ -679,6 +679,15 @@ impl AsyncWrite for Empty {
     }
 }
 
+impl AsyncSeek for Empty {
+    fn start_seek(self: Pin<&mut Self>, _: SeekFrom) -> Result<()> {
+        Ok(())
+    }
+    fn poll_complete(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u64>> {
+        Poll::Ready(Ok(0))
+    }
+}
+
 /// 何でも捨てる書き手。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Sink(());
@@ -734,6 +743,15 @@ pub struct BufReader<R> {
     buf: Box<[u8]>,
     pos: usize,
     cap: usize,
+    seek_state: ReaderSeek,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReaderSeek {
+    Init,
+    Start(SeekFrom),
+    PendingOverflowed(i64),
+    Pending,
 }
 
 impl<R: AsyncRead> BufReader<R> {
@@ -747,6 +765,7 @@ impl<R: AsyncRead> BufReader<R> {
             buf: vec![0; capacity].into_boxed_slice(),
             pos: 0,
             cap: 0,
+            seek_state: ReaderSeek::Init,
         }
     }
 }
@@ -838,6 +857,73 @@ impl<R: AsyncRead + AsyncWrite> AsyncWrite for BufReader<R> {
     }
 }
 
+impl<R: AsyncRead + AsyncSeek> AsyncSeek for BufReader<R> {
+    fn start_seek(self: Pin<&mut Self>, pos: SeekFrom) -> Result<()> {
+        // SAFETY: inner を動かさない
+        unsafe { self.get_unchecked_mut() }.seek_state = ReaderSeek::Start(pos);
+        Ok(())
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
+        // SAFETY: inner を動かさない（seek_state は Unpin）
+        let state = std::mem::replace(
+            &mut unsafe { self.as_mut().get_unchecked_mut() }.seek_state,
+            ReaderSeek::Init,
+        );
+        let set = |me: &mut Pin<&mut Self>, st| unsafe { me.as_mut().get_unchecked_mut() }.seek_state = st;
+        let res = match state {
+            ReaderSeek::Init => return Poll::Ready(Ok(0)),
+            ReaderSeek::Start(SeekFrom::Current(n)) => {
+                let remainder = (self.cap - self.pos) as i64;
+                if let Some(offset) = n.checked_sub(remainder) {
+                    self.as_mut()
+                        .get_pin_mut()
+                        .start_seek(SeekFrom::Current(offset))?;
+                } else {
+                    self.as_mut()
+                        .get_pin_mut()
+                        .start_seek(SeekFrom::Current(-remainder))?;
+                    if self.as_mut().get_pin_mut().poll_complete(cx)?.is_pending() {
+                        set(&mut self, ReaderSeek::PendingOverflowed(n));
+                        return Poll::Pending;
+                    }
+                    self.as_mut().discard_buffer();
+                    self.as_mut()
+                        .get_pin_mut()
+                        .start_seek(SeekFrom::Current(n))?;
+                }
+                self.as_mut().get_pin_mut().poll_complete(cx)?
+            }
+            ReaderSeek::PendingOverflowed(n) => {
+                if self.as_mut().get_pin_mut().poll_complete(cx)?.is_pending() {
+                    set(&mut self, ReaderSeek::PendingOverflowed(n));
+                    return Poll::Pending;
+                }
+                self.as_mut().discard_buffer();
+                self.as_mut()
+                    .get_pin_mut()
+                    .start_seek(SeekFrom::Current(n))?;
+                self.as_mut().get_pin_mut().poll_complete(cx)?
+            }
+            ReaderSeek::Start(pos) => {
+                self.as_mut().get_pin_mut().start_seek(pos)?;
+                self.as_mut().get_pin_mut().poll_complete(cx)?
+            }
+            ReaderSeek::Pending => self.as_mut().get_pin_mut().poll_complete(cx)?,
+        };
+        match res {
+            Poll::Ready(r) => {
+                self.discard_buffer();
+                Poll::Ready(Ok(r))
+            }
+            Poll::Pending => {
+                set(&mut self, ReaderSeek::Pending);
+                Poll::Pending
+            }
+        }
+    }
+}
+
 /// `tokio::io::BufWriter`。
 #[derive(Debug)]
 pub struct BufWriter<W> {
@@ -845,6 +931,14 @@ pub struct BufWriter<W> {
     buf: Vec<u8>,
     written: usize,
     cap: usize,
+    seek_state: WriterSeek,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WriterSeek {
+    Init,
+    Start(SeekFrom),
+    Pending,
 }
 
 impl<W: AsyncWrite> BufWriter<W> {
@@ -858,6 +952,7 @@ impl<W: AsyncWrite> BufWriter<W> {
             buf: Vec::with_capacity(cap),
             written: 0,
             cap,
+            seek_state: WriterSeek::Init,
         }
     }
 
@@ -937,6 +1032,39 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.as_mut().flush_buf(cx))?;
         self.get_pin_mut().poll_shutdown(cx)
+    }
+}
+
+impl<W: AsyncWrite + AsyncSeek> AsyncSeek for BufWriter<W> {
+    fn start_seek(self: Pin<&mut Self>, pos: SeekFrom) -> Result<()> {
+        // SAFETY: inner を動かさない
+        unsafe { self.get_unchecked_mut() }.seek_state = WriterSeek::Start(pos);
+        Ok(())
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
+        let pos = match self.seek_state {
+            WriterSeek::Init => return self.get_pin_mut().poll_complete(cx),
+            WriterSeek::Start(p) => Some(p),
+            WriterSeek::Pending => None,
+        };
+        ready!(self.as_mut().flush_buf(cx))?;
+        if let Some(p) = pos {
+            ready!(self.as_mut().get_pin_mut().poll_complete(cx))?;
+            if let Err(e) = self.as_mut().get_pin_mut().start_seek(p) {
+                // SAFETY: inner を動かさない
+                unsafe { self.as_mut().get_unchecked_mut() }.seek_state = WriterSeek::Init;
+                return Poll::Ready(Err(e));
+            }
+        }
+        let r = self.as_mut().get_pin_mut().poll_complete(cx);
+        // SAFETY: 同上
+        unsafe { self.as_mut().get_unchecked_mut() }.seek_state = if r.is_ready() {
+            WriterSeek::Init
+        } else {
+            WriterSeek::Pending
+        };
+        r
     }
 }
 

@@ -116,6 +116,44 @@ impl Notify {
     }
 }
 
+impl Notify {
+    /// `notified` の所有版（`Arc<Notify>` を持つ）。
+    pub fn notified_owned(self: Arc<Self>) -> OwnedNotified {
+        // SAFETY: `inner` は `notify` が指す Notify を借りる。Arc を同じ構造体に持ち、inner を先に drop する
+        // （フィールドの宣言順）ので、借用より先に Notify が消えることはない
+        let inner: Notified<'static> = unsafe { std::mem::transmute(self.notified()) };
+        OwnedNotified {
+            inner,
+            _notify: self,
+        }
+    }
+}
+
+/// `Notify::notified_owned` の Future。
+pub struct OwnedNotified {
+    inner: Notified<'static>,
+    _notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for OwnedNotified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnedNotified")
+    }
+}
+
+impl OwnedNotified {
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        self.get_mut().inner.register(None)
+    }
+}
+
+impl Future for OwnedNotified {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.get_mut().inner).poll(cx)
+    }
+}
+
 /// `Notify::notified` の Future。
 pub struct Notified<'a> {
     notify: &'a Notify,
@@ -443,5 +481,108 @@ impl<T> OnceCell<T> {
 
     pub fn take(&mut self) -> Option<T> {
         self.value.take()
+    }
+}
+
+// ===================== SetOnce =====================
+
+/// `SetOnce::set` の失敗（値を返す）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetOnceError<T>(pub T);
+
+impl<T> std::fmt::Display for SetOnceError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SetOnceError")
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for SetOnceError<T> {}
+
+/// `tokio::sync::SetOnce`（1 回だけ値を置け、置かれるまで `wait` で待てる）。
+pub struct SetOnce<T> {
+    value: std::sync::OnceLock<T>,
+    notify: Notify,
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SetOnce<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetOnce")
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+impl<T> Default for SetOnce<T> {
+    fn default() -> Self {
+        SetOnce::new()
+    }
+}
+
+impl<T: Clone> Clone for SetOnce<T> {
+    fn clone(&self) -> Self {
+        SetOnce::new_with(self.get().cloned())
+    }
+}
+
+impl<T: PartialEq> PartialEq for SetOnce<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq> Eq for SetOnce<T> {}
+
+impl<T> From<T> for SetOnce<T> {
+    fn from(v: T) -> Self {
+        SetOnce::new_with(Some(v))
+    }
+}
+
+impl<T> SetOnce<T> {
+    pub fn new() -> SetOnce<T> {
+        SetOnce::const_new()
+    }
+
+    pub const fn const_new() -> SetOnce<T> {
+        SetOnce {
+            value: std::sync::OnceLock::new(),
+            notify: Notify::const_new(),
+        }
+    }
+
+    pub fn new_with(value: Option<T>) -> SetOnce<T> {
+        let s = SetOnce::new();
+        if let Some(v) = value {
+            let _ = s.value.set(v);
+        }
+        s
+    }
+
+    pub fn initialized(&self) -> bool {
+        self.value.get().is_some()
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        self.value.get()
+    }
+
+    pub fn set(&self, value: T) -> Result<(), SetOnceError<T>> {
+        self.value.set(value).map_err(SetOnceError)?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub fn into_inner(self) -> Option<T> {
+        self.value.into_inner()
+    }
+
+    pub async fn wait(&self) -> &T {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(v) = self.get() {
+                return v;
+            }
+            notified.await;
+        }
     }
 }

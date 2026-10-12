@@ -181,6 +181,7 @@ pub struct File {
     buf: Vec<u8>,
     pos: usize,
     last_write_err: Option<io::Error>,
+    max_buf_size: usize,
 }
 
 impl std::fmt::Debug for File {
@@ -219,6 +220,7 @@ impl File {
             buf: Vec::new(),
             pos: 0,
             last_write_err: None,
+            max_buf_size: 2 * 1024 * 1024,
         }
     }
 
@@ -244,6 +246,7 @@ impl File {
                 buf: Vec::new(),
                 pos: 0,
                 last_write_err: None,
+                max_buf_size: 2 * 1024 * 1024,
             }),
         }
     }
@@ -254,6 +257,15 @@ impl File {
     ) -> io::Result<T> {
         let std = self.std.clone();
         asyncify(move || f(&mut std.lock().unwrap())).await
+    }
+
+    /// 1 回の読み書きでブロッキング用プールへ渡す最大のバイト数。
+    pub fn set_max_buf_size(&mut self, max_buf_size: usize) {
+        self.max_buf_size = max_buf_size.max(1);
+    }
+
+    pub fn max_buf_size(&self) -> usize {
+        self.max_buf_size
     }
 
     pub async fn sync_all(&mut self) -> io::Result<()> {
@@ -332,7 +344,7 @@ impl AsyncRead for File {
                 }
                 continue;
             }
-            let want = dst.remaining().clamp(1, 64 * 1024);
+            let want = dst.remaining().clamp(1, me.max_buf_size);
             me.start(move |f| {
                 let mut b = vec![0u8; want];
                 Op::Read(f.read(&mut b).map(|n| {
@@ -363,7 +375,7 @@ impl AsyncWrite for File {
             me.start(move |f| Op::Seek(f.seek(SeekFrom::Current(-back))));
             ready!(me.poll_busy(cx))?;
         }
-        let data = src.to_vec();
+        let data = src[..src.len().min(me.max_buf_size)].to_vec();
         let n = data.len();
         me.start(move |f| Op::Write(f.write_all(&data).map(|_| data.len())));
         Poll::Ready(Ok(n))
@@ -416,6 +428,21 @@ impl AsyncSeek for File {
     }
 }
 
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for File {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.std.lock().unwrap().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::FromRawFd for File {
+    unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> File {
+        // SAFETY: 呼び出し側が所有権を渡す
+        File::from_std(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
 impl From<std::fs::File> for File {
     fn from(f: std::fs::File) -> File {
         File::from_std(f)
@@ -461,6 +488,12 @@ impl OpenOptions {
         self
     }
     #[cfg(unix)]
+    pub fn custom_flags(&mut self, flags: i32) -> &mut Self {
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut self.0, flags);
+        self
+    }
+
+    #[cfg(unix)]
     pub fn mode(&mut self, mode: u32) -> &mut Self {
         std::os::unix::fs::OpenOptionsExt::mode(&mut self.0, mode);
         self
@@ -469,5 +502,41 @@ impl OpenOptions {
         let o = self.0.clone();
         let p = path.as_ref().to_owned();
         Ok(File::from_std(asyncify(move || o.open(p)).await?))
+    }
+}
+
+/// `tokio::fs::DirBuilder`。
+#[derive(Debug, Default)]
+pub struct DirBuilder {
+    recursive: bool,
+    #[cfg(unix)]
+    mode: Option<u32>,
+}
+
+impl DirBuilder {
+    pub fn new() -> DirBuilder {
+        DirBuilder::default()
+    }
+
+    pub fn recursive(&mut self, recursive: bool) -> &mut Self {
+        self.recursive = recursive;
+        self
+    }
+
+    #[cfg(unix)]
+    pub fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    pub async fn create(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let p = path.as_ref().to_owned();
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(self.recursive);
+        #[cfg(unix)]
+        if let Some(m) = self.mode {
+            std::os::unix::fs::DirBuilderExt::mode(&mut b, m);
+        }
+        asyncify(move || b.create(p)).await
     }
 }

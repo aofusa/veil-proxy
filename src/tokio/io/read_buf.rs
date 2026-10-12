@@ -153,6 +153,27 @@ impl<'a> ReadBuf<'a> {
     }
 }
 
+// SAFETY: tokio と同じ実装（未初期化領域を UninitSlice として見せ、advance_mut で初期化済み・読み込み済みを進める）
+unsafe impl bytes::BufMut for ReadBuf<'_> {
+    fn remaining_mut(&self) -> usize {
+        self.remaining()
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: 呼び出し側が cnt バイトを初期化した
+        unsafe { self.assume_init(cnt) };
+        self.advance(cnt);
+    }
+
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        // SAFETY: 未初期化を初期化済みとして読まない（UninitSlice は書き込み専用）
+        let unfilled = unsafe { self.unfilled_mut() };
+        let len = unfilled.len();
+        let ptr = unfilled.as_mut_ptr() as *mut u8;
+        unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

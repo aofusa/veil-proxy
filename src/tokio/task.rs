@@ -137,81 +137,84 @@ impl From<JoinError> for std::io::Error {
 
 // ===================== 共有状態 =====================
 
-struct Inner<T> {
-    result: Option<Result<T, JoinError>>,
+/// 中止・完了の状態（出力の型に依存しない。`AbortHandle` はこれだけを持つので `Send + Sync`）。
+struct Core {
+    id: Id,
+    inner: Mutex<CoreInner>,
+}
+
+struct CoreInner {
     finished: bool,
     aborted: bool,
     join_waker: WakerSlot,
     task_waker: WakerSlot,
 }
 
-struct State<T> {
-    id: Id,
-    inner: Mutex<Inner<T>>,
-}
-
-impl<T> State<T> {
-    fn new() -> Arc<State<T>> {
-        Arc::new(State {
-            id: Id(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
-            inner: Mutex::new(Inner {
-                result: None,
-                finished: false,
-                aborted: false,
-                join_waker: WakerSlot::default(),
-                task_waker: WakerSlot::default(),
-            }),
-        })
-    }
-
-    fn complete(&self, r: Result<T, JoinError>) {
+impl Core {
+    /// 中止を要求してタスクを起こす（タスクは次の poll で Future を捨てる）。
+    fn abort(&self) {
         let w = {
             let mut g = self.inner.lock().unwrap();
             if g.finished {
                 return;
             }
-            g.finished = true;
-            g.result = Some(r);
-            g.join_waker.take()
+            g.aborted = true;
+            g.task_waker.take()
         };
         if let Some(w) = w {
             w.wake();
         }
     }
-}
 
-/// 中止だけできる型消去した参照。
-trait Abortable: Send + Sync {
-    fn abort(&self);
-    fn is_finished(&self) -> bool;
-    fn id(&self) -> Id;
-}
-
-/// 中止を要求してタスクを起こす（タスクは次の poll で Future を捨てる）。
-fn abort_state<T>(s: &State<T>) {
-    let w = {
-        let mut g = s.inner.lock().unwrap();
-        if g.finished {
-            return;
-        }
-        g.aborted = true;
-        g.task_waker.take()
-    };
-    if let Some(w) = w {
-        w.wake();
-    }
-}
-
-impl<T: Send> Abortable for State<T> {
-    fn abort(&self) {
-        abort_state(self);
-    }
     fn is_finished(&self) -> bool {
         self.inner.lock().unwrap().finished
     }
-    fn id(&self) -> Id {
-        self.id
+}
+
+struct State<T> {
+    id: Id,
+    core: Arc<Core>,
+    result: Mutex<Option<Result<T, JoinError>>>,
+}
+
+impl<T> State<T> {
+    fn new() -> Arc<State<T>> {
+        let id = Id(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        Arc::new(State {
+            id,
+            core: Arc::new(Core {
+                id,
+                inner: Mutex::new(CoreInner {
+                    finished: false,
+                    aborted: false,
+                    join_waker: WakerSlot::default(),
+                    task_waker: WakerSlot::default(),
+                }),
+            }),
+            result: Mutex::new(None),
+        })
     }
+
+    fn complete(&self, r: Result<T, JoinError>) {
+        {
+            let mut g = self.core.inner.lock().unwrap();
+            if g.finished {
+                return;
+            }
+            g.finished = true;
+            // 結果は完了の印と同じロックの中で置く（JoinHandle は印を見てから結果を取る）
+            *self.result.lock().unwrap() = Some(r);
+            let w = g.join_waker.take();
+            drop(g);
+            if let Some(w) = w {
+                w.wake();
+            }
+        }
+    }
+}
+
+fn abort_state<T>(s: &State<T>) {
+    s.core.abort();
 }
 
 // ===================== タスク本体 =====================
@@ -242,7 +245,7 @@ impl<F: Future> Future for TaskCell<F> {
             return Poll::Ready(());
         }
         {
-            let mut g = this.state.inner.lock().unwrap();
+            let mut g = this.state.core.inner.lock().unwrap();
             if g.aborted {
                 drop(g);
                 this.future = None;
@@ -323,21 +326,19 @@ impl<T> std::fmt::Debug for JoinHandle<T> {
 
 impl<T> Unpin for JoinHandle<T> {}
 
-impl<T: Send + 'static> JoinHandle<T> {
+impl<T> JoinHandle<T> {
     pub fn abort(&self) {
-        Abortable::abort(&*self.state);
+        self.state.core.abort();
     }
 
     pub fn abort_handle(&self) -> AbortHandle {
         AbortHandle {
-            inner: self.state.clone(),
+            core: self.state.core.clone(),
         }
     }
-}
 
-impl<T> JoinHandle<T> {
     pub fn is_finished(&self) -> bool {
-        self.state.inner.lock().unwrap().finished
+        self.state.core.is_finished()
     }
 
     pub fn id(&self) -> Id {
@@ -349,13 +350,14 @@ impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut g = self.state.inner.lock().unwrap();
-        if let Some(r) = g.result.take() {
-            return Poll::Ready(r);
-        }
+        let mut g = self.state.core.inner.lock().unwrap();
         if g.finished {
-            // 2 回目の poll（結果は取り出し済み）
-            return Poll::Ready(Err(JoinError::cancelled(self.state.id)));
+            drop(g);
+            return Poll::Ready(match self.state.result.lock().unwrap().take() {
+                Some(r) => r,
+                // 2 回目の poll（結果は取り出し済み）
+                None => Err(JoinError::cancelled(self.state.id)),
+            });
         }
         g.join_waker.register(cx.waker());
         Poll::Pending
@@ -365,26 +367,26 @@ impl<T> Future for JoinHandle<T> {
 /// `tokio::task::AbortHandle`。
 #[derive(Clone)]
 pub struct AbortHandle {
-    inner: Arc<dyn Abortable>,
+    core: Arc<Core>,
 }
 
 impl std::fmt::Debug for AbortHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AbortHandle")
-            .field("id", &self.inner.id())
+            .field("id", &self.core.id)
             .finish()
     }
 }
 
 impl AbortHandle {
     pub fn abort(&self) {
-        self.inner.abort();
+        self.core.abort();
     }
     pub fn is_finished(&self) -> bool {
-        self.inner.is_finished()
+        self.core.is_finished()
     }
     pub fn id(&self) -> Id {
-        self.inner.id()
+        self.core.id
     }
 }
 
@@ -499,14 +501,59 @@ pub async fn yield_now() {
     .await
 }
 
-/// 協調的スケジューリングの予算（このレイヤーでは 1 回譲るだけ）。
-pub async fn consume_budget() {
-    yield_now().await
-}
+/// 協調的スケジューリングの予算（このレイヤーには予算が無いので何もしない）。
+pub async fn consume_budget() {}
 
-/// 予算の制限を外す（このレイヤーでは何もしない）。
-pub fn unconstrained<F: Future>(inner: F) -> F {
-    inner
+pub use coop::{unconstrained, Unconstrained};
+
+/// `tokio::task::coop`（協調的スケジューリングの予算）。このレイヤーには予算が無く、常に進んでよい。
+pub mod coop {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// `poll_proceed` が返す印（何もしない）。
+    #[derive(Debug)]
+    pub struct RestoreOnPending(());
+
+    impl RestoreOnPending {
+        pub fn made_progress(&self) {}
+    }
+
+    /// 予算が残っているか（常に進んでよい）。
+    pub fn poll_proceed(_cx: &mut Context<'_>) -> Poll<RestoreOnPending> {
+        Poll::Ready(RestoreOnPending(()))
+    }
+
+    pub fn has_budget_remaining() -> bool {
+        true
+    }
+
+    pub async fn consume_budget() {}
+
+    /// 予算の制限を外した Future（このレイヤーではそのまま）。
+    #[derive(Debug)]
+    #[must_use = "Unconstrained does nothing unless polled"]
+    pub struct Unconstrained<F> {
+        inner: F,
+    }
+
+    impl<F: Future> Future for Unconstrained<F> {
+        type Output = F::Output;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+            // SAFETY: inner は構造的にピン留めされる
+            unsafe { self.map_unchecked_mut(|s| &mut s.inner) }.poll(cx)
+        }
+    }
+
+    pub fn unconstrained<F>(inner: F) -> Unconstrained<F> {
+        Unconstrained { inner }
+    }
+
+    /// 予算に従う Future（このレイヤーではそのまま）。
+    pub fn cooperative<F: Future>(fut: F) -> F {
+        fut
+    }
 }
 
 // ===================== JoinSet =====================
@@ -567,6 +614,14 @@ impl<T: 'static> JoinSet<T> {
         T: Send,
     {
         self.insert(spawn_local(task))
+    }
+
+    pub fn spawn_local_on<F>(&mut self, task: F, local_set: &LocalSet) -> AbortHandle
+    where
+        F: Future<Output = T> + 'static,
+        T: Send,
+    {
+        self.insert(local_set.spawn_local(task))
     }
 
     pub fn spawn_blocking<F>(&mut self, f: F) -> AbortHandle
@@ -669,6 +724,18 @@ impl<T> Drop for JoinSet<T> {
     fn drop(&mut self) {
         for h in &self.handles {
             abort_state(&h.state);
+        }
+    }
+}
+
+impl<T, F> Extend<F> for JoinSet<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    fn extend<I: IntoIterator<Item = F>>(&mut self, iter: I) {
+        for f in iter {
+            self.spawn(f);
         }
     }
 }
@@ -865,6 +932,14 @@ pub struct TaskLocalFuture<T: 'static, F> {
     key: &'static LocalKey<T>,
     slot: Option<T>,
     future: Option<F>,
+}
+
+impl<T: 'static, F> TaskLocalFuture<T, F> {
+    /// 設定した値を取り出す（Future の完了後・未 poll なら取れる）。
+    pub fn take_value(self: Pin<&mut Self>) -> Option<T> {
+        // SAFETY: slot だけを動かす（future は動かさない）
+        unsafe { self.get_unchecked_mut() }.slot.take()
+    }
 }
 
 impl<T: 'static, F: Future> Future for TaskLocalFuture<T, F> {

@@ -16,11 +16,15 @@
 pub mod veil_alloc;
 
 #[cfg(all(veil_alloc_active, not(feature = "alloc-stats")))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: veil_alloc::VeilAlloc = veil_alloc::VeilAlloc;
 
-#[cfg(all(feature = "mimalloc", not(veil_alloc_active), not(feature = "handler")))]
+#[cfg(all(
+    feature = "mimalloc",
+    not(veil_alloc_active),
+    not(any(feature = "handler", feature = "tokio-compat"))
+))]
 use mimalloc::MiMalloc;
 
 #[cfg(all(
@@ -28,11 +32,15 @@ use mimalloc::MiMalloc;
     not(veil_alloc_active),
     not(feature = "alloc-stats")
 ))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[cfg(all(feature = "jemalloc", not(veil_alloc_active), not(feature = "handler")))]
+#[cfg(all(
+    feature = "jemalloc",
+    not(veil_alloc_active),
+    not(any(feature = "handler", feature = "tokio-compat"))
+))]
 use tikv_jemallocator::Jemalloc;
 
 // B-89: FreeBSD 向けの tikv-jemalloc は libthr のフック（`_malloc_thread_cleanup` 等）を
@@ -51,7 +59,7 @@ compile_error!(
     not(feature = "mimalloc"),
     not(feature = "alloc-stats")
 ))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -65,13 +73,13 @@ pub mod alloc_stats;
 pub(crate) mod alloc_tune;
 
 #[cfg(all(feature = "alloc-stats", veil_alloc_active))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<veil_alloc::VeilAlloc> =
     alloc_stats::CountingAllocator(veil_alloc::VeilAlloc);
 
 #[cfg(all(feature = "alloc-stats", feature = "mimalloc", not(veil_alloc_active)))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingAllocator(MiMalloc);
 
@@ -81,7 +89,7 @@ static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingA
     not(veil_alloc_active),
     not(feature = "mimalloc")
 ))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingAllocator(Jemalloc);
 
@@ -91,7 +99,7 @@ static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingA
     not(feature = "mimalloc"),
     not(feature = "jemalloc")
 ))]
-#[cfg(not(feature = "handler"))]
+#[cfg(not(any(feature = "handler", feature = "tokio-compat")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<std::alloc::System> =
     alloc_stats::CountingAllocator(std::alloc::System);

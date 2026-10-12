@@ -14,12 +14,12 @@ pub use mutex::{
     OwnedRwLockWriteGuard, RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
     TryLockError,
 };
-pub use notify::{Barrier, BarrierWaitResult, Notify, OnceCell, SetError};
+pub use notify::{Barrier, BarrierWaitResult, Notify, OnceCell, SetError, SetOnce, SetOnceError};
 pub use semaphore::{
     AcquireError, OwnedSemaphorePermit, Semaphore, SemaphorePermit, TryAcquireError,
 };
 
 /// `tokio::sync::futures`。
 pub mod futures {
-    pub use super::notify::Notified;
+    pub use super::notify::{Notified, OwnedNotified};
 }

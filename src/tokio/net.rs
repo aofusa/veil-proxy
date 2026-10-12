@@ -525,6 +525,25 @@ impl TcpStream {
         with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.set_ttl(ttl))
     }
 
+    pub fn set_zero_linger(&self) -> io::Result<()> {
+        set_linger_raw(self.io.raw(), Some(std::time::Duration::ZERO))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn quickack(&self) -> io::Result<bool> {
+        getopt_int(self.io.raw(), libc::IPPROTO_TCP, libc::TCP_QUICKACK).map(|v| v != 0)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn set_quickack(&self, quickack: bool) -> io::Result<()> {
+        setopt_int(
+            self.io.raw(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            quickack as libc::c_int,
+        )
+    }
+
     pub fn linger(&self) -> io::Result<Option<std::time::Duration>> {
         let mut l: libc::linger = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
@@ -1075,7 +1094,73 @@ fn getopt_int(fd: RawFd, level: libc::c_int, opt: libc::c_int) -> io::Result<lib
     Ok(v)
 }
 
+fn get_linger(fd: RawFd) -> io::Result<Option<std::time::Duration>> {
+    let mut l: libc::linger = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+    cvt_i(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &mut l as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    })?;
+    Ok((l.l_onoff != 0).then(|| std::time::Duration::from_secs(l.l_linger as u64)))
+}
+
+fn set_linger_raw(fd: RawFd, dur: Option<std::time::Duration>) -> io::Result<()> {
+    let l = libc::linger {
+        l_onoff: dur.is_some() as libc::c_int,
+        l_linger: dur.map(|d| d.as_secs() as libc::c_int).unwrap_or(0),
+    };
+    cvt_i(unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &l as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    })
+    .map(drop)
+}
+
 impl TcpSocket {
+    pub fn linger(&self) -> io::Result<Option<std::time::Duration>> {
+        get_linger(self.fd.as_raw_fd())
+    }
+
+    pub fn set_zero_linger(&self) -> io::Result<()> {
+        set_linger_raw(self.fd.as_raw_fd(), Some(std::time::Duration::ZERO))
+    }
+
+    pub fn tos_v4(&self) -> io::Result<u32> {
+        getopt_int(self.fd.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS).map(|v| v as u32)
+    }
+
+    pub fn set_tos_v4(&self, tos: u32) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            tos as libc::c_int,
+        )
+    }
+
+    pub fn tclass_v6(&self) -> io::Result<u32> {
+        getopt_int(self.fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS).map(|v| v as u32)
+    }
+
+    pub fn set_tclass_v6(&self, tclass: u32) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TCLASS,
+            tclass as libc::c_int,
+        )
+    }
+
     pub fn new_v4() -> io::Result<TcpSocket> {
         Ok(TcpSocket {
             fd: new_socket(libc::AF_INET, libc::SOCK_STREAM)?,
@@ -1443,6 +1528,229 @@ impl UdpSocket {
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         sock_err(self.io.raw())
     }
+
+    pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        poll_fn(|cx| {
+            let mut ready = Ready::EMPTY;
+            if interest.is_readable() {
+                if let Poll::Ready(r) = self.io.poll_read_ready(cx) {
+                    r?;
+                    ready |= Ready::READABLE;
+                }
+            }
+            if interest.is_writable() {
+                if let Poll::Ready(r) = self.io.poll_write_ready(cx) {
+                    r?;
+                    ready |= Ready::WRITABLE;
+                }
+            }
+            if ready.is_empty() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(ready))
+            }
+        })
+        .await
+    }
+
+    pub fn try_recv_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        let dst = buf.chunk_mut();
+        let n = cvt(unsafe { libc::recv(self.io.raw(), dst.as_mut_ptr().cast(), dst.len(), 0) })?;
+        // SAFETY: n バイトは recv で初期化された
+        unsafe { buf.advance_mut(n) };
+        Ok(n)
+    }
+
+    pub async fn recv_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        poll_fn(|cx| self.io.poll_io(false, cx, || self.try_recv_buf(&mut *buf))).await
+    }
+
+    pub fn try_recv_buf_from<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+    ) -> io::Result<(usize, SocketAddr)> {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let dst = buf.chunk_mut();
+        let n = cvt(unsafe {
+            libc::recvfrom(
+                self.io.raw(),
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                0,
+                &mut ss as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            )
+        })?;
+        // SAFETY: n バイトは recvfrom で初期化された
+        unsafe { buf.advance_mut(n) };
+        Ok((n, from_sockaddr(&ss)?))
+    }
+
+    pub async fn recv_buf_from<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+    ) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.try_recv_buf_from(&mut *buf))
+        })
+        .await
+    }
+
+    pub fn poll_peek_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<SocketAddr>> {
+        let (n, a) = ready!(self.io.poll_io(false, cx, || self
+            .std(|s| s.peek_from(buf.initialize_unfilled()))))?;
+        buf.advance(n);
+        Poll::Ready(Ok(a))
+    }
+
+    pub fn try_peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.std(|s| s.peek_from(buf))
+    }
+
+    fn peek_sender_raw(&self) -> io::Result<SocketAddr> {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let mut b = [0u8; 1];
+        cvt(unsafe {
+            libc::recvfrom(
+                self.io.raw(),
+                b.as_mut_ptr().cast(),
+                0,
+                libc::MSG_PEEK,
+                &mut ss as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            )
+        })?;
+        from_sockaddr(&ss)
+    }
+
+    pub async fn peek_sender(&self) -> io::Result<SocketAddr> {
+        poll_fn(|cx| self.poll_peek_sender(cx)).await
+    }
+
+    pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
+        self.io.poll_io(false, cx, || self.peek_sender_raw())
+    }
+
+    pub fn try_peek_sender(&self) -> io::Result<SocketAddr> {
+        self.peek_sender_raw()
+    }
+
+    pub fn multicast_loop_v4(&self) -> io::Result<bool> {
+        self.std(|s| s.multicast_loop_v4())
+    }
+
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.std(|s| s.set_multicast_loop_v4(on))
+    }
+
+    pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
+        self.std(|s| s.multicast_ttl_v4())
+    }
+
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        self.std(|s| s.set_multicast_ttl_v4(ttl))
+    }
+
+    pub fn multicast_loop_v6(&self) -> io::Result<bool> {
+        self.std(|s| s.multicast_loop_v6())
+    }
+
+    pub fn set_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
+        self.std(|s| s.set_multicast_loop_v6(on))
+    }
+
+    pub fn join_multicast_v4(
+        &self,
+        multiaddr: std::net::Ipv4Addr,
+        interface: std::net::Ipv4Addr,
+    ) -> io::Result<()> {
+        self.std(|s| s.join_multicast_v4(&multiaddr, &interface))
+    }
+
+    pub fn join_multicast_v6(
+        &self,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
+    ) -> io::Result<()> {
+        self.std(|s| s.join_multicast_v6(multiaddr, interface))
+    }
+
+    pub fn leave_multicast_v4(
+        &self,
+        multiaddr: std::net::Ipv4Addr,
+        interface: std::net::Ipv4Addr,
+    ) -> io::Result<()> {
+        self.std(|s| s.leave_multicast_v4(&multiaddr, &interface))
+    }
+
+    pub fn leave_multicast_v6(
+        &self,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
+    ) -> io::Result<()> {
+        self.std(|s| s.leave_multicast_v6(multiaddr, interface))
+    }
+
+    pub fn tos_v4(&self) -> io::Result<u32> {
+        getopt_int(self.io.raw(), libc::IPPROTO_IP, libc::IP_TOS).map(|v| v as u32)
+    }
+
+    pub fn set_tos_v4(&self, tos: u32) -> io::Result<()> {
+        setopt_int(
+            self.io.raw(),
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            tos as libc::c_int,
+        )
+    }
+
+    pub fn tclass_v6(&self) -> io::Result<u32> {
+        getopt_int(self.io.raw(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS).map(|v| v as u32)
+    }
+
+    pub fn set_tclass_v6(&self, tclass: u32) -> io::Result<()> {
+        setopt_int(
+            self.io.raw(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TCLASS,
+            tclass as libc::c_int,
+        )
+    }
+}
+
+/// sockaddr_storage を SocketAddr にする。
+fn from_sockaddr(ss: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: family が AF_INET
+            let a = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            Ok(SocketAddr::new(
+                std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)).into(),
+                u16::from_be(a.sin_port),
+            ))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: family が AF_INET6
+            let a = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
+                u16::from_be(a.sin6_port),
+                a.sin6_flowinfo,
+                a.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported address family",
+        )),
+    }
 }
 
 impl AsRawFd for UdpSocket {
@@ -1500,6 +1808,26 @@ impl UnixStream {
             }
         }
         Ok(UnixStream { inner: s })
+    }
+
+    /// アドレス（抽象名前空間を含む）へ接続する。
+    pub async fn connect_addr(addr: &std::os::unix::net::SocketAddr) -> io::Result<UnixStream> {
+        UnixStream::from_std(std::os::unix::net::UnixStream::connect_addr(addr)?)
+    }
+
+    pub fn into_std(self) -> io::Result<std::os::unix::net::UnixStream> {
+        let s = self.inner.into_std()?;
+        let fd: OwnedFd = s.into();
+        Ok(std::os::unix::net::UnixStream::from(fd))
+    }
+
+    /// 相手の資格情報。
+    pub fn peer_cred(&self) -> io::Result<UCred> {
+        peer_cred(self.inner.io.raw())
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.inner.io.raw())
     }
 
     pub fn pair() -> io::Result<(UnixStream, UnixStream)> {
@@ -1657,6 +1985,801 @@ impl UnixListener {
     pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
         with_std::<std::os::unix::net::UnixListener, _>(self.io.raw(), |l| l.local_addr())
     }
+
+    pub fn bind_addr(addr: &std::os::unix::net::SocketAddr) -> io::Result<UnixListener> {
+        UnixListener::from_std(std::os::unix::net::UnixListener::bind_addr(addr)?)
+    }
+
+    pub fn into_std(self) -> io::Result<std::os::unix::net::UnixListener> {
+        let mut io = std::mem::ManuallyDrop::new(self.io);
+        io.release();
+        // SAFETY: Drop を走らせずに fd を取り出す
+        let fd = unsafe { std::ptr::read(&io.fd) };
+        let l = std::os::unix::net::UnixListener::from(fd);
+        l.set_nonblocking(false)?;
+        Ok(l)
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.io.raw())
+    }
+}
+
+/// 相手の資格情報（`UnixStream::peer_cred`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UCred {
+    pid: Option<libc::pid_t>,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+impl UCred {
+    pub fn uid(&self) -> libc::uid_t {
+        self.uid
+    }
+    pub fn gid(&self) -> libc::gid_t {
+        self.gid
+    }
+    pub fn pid(&self) -> Option<libc::pid_t> {
+        self.pid
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_cred(fd: RawFd) -> io::Result<UCred> {
+    let mut c: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    cvt_i(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut c as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    })?;
+    Ok(UCred {
+        pid: Some(c.pid),
+        uid: c.uid,
+        gid: c.gid,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_cred(fd: RawFd) -> io::Result<UCred> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    cvt_i(unsafe { libc::getpeereid(fd, &mut uid, &mut gid) })?;
+    Ok(UCred {
+        pid: None,
+        uid,
+        gid,
+    })
+}
+
+/// `tokio::net::UnixDatagram`。
+#[derive(Debug)]
+pub struct UnixDatagram {
+    io: IoSource,
+}
+
+impl UnixDatagram {
+    fn std<R>(&self, f: impl FnOnce(&std::os::unix::net::UnixDatagram) -> R) -> R {
+        with_std::<std::os::unix::net::UnixDatagram, _>(self.io.raw(), f)
+    }
+
+    pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<UnixDatagram> {
+        UnixDatagram::from_std(std::os::unix::net::UnixDatagram::bind(path)?)
+    }
+
+    pub fn bind_addr(addr: &std::os::unix::net::SocketAddr) -> io::Result<UnixDatagram> {
+        UnixDatagram::from_std(std::os::unix::net::UnixDatagram::bind_addr(addr)?)
+    }
+
+    pub fn unbound() -> io::Result<UnixDatagram> {
+        UnixDatagram::from_std(std::os::unix::net::UnixDatagram::unbound()?)
+    }
+
+    pub fn pair() -> io::Result<(UnixDatagram, UnixDatagram)> {
+        let (a, b) = std::os::unix::net::UnixDatagram::pair()?;
+        Ok((UnixDatagram::from_std(a)?, UnixDatagram::from_std(b)?))
+    }
+
+    pub fn from_std(d: std::os::unix::net::UnixDatagram) -> io::Result<UnixDatagram> {
+        d.set_nonblocking(true)?;
+        let fd: OwnedFd = d.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(UnixDatagram {
+            io: IoSource::new(fd),
+        })
+    }
+
+    pub fn into_std(self) -> io::Result<std::os::unix::net::UnixDatagram> {
+        let mut io = std::mem::ManuallyDrop::new(self.io);
+        io.release();
+        // SAFETY: Drop を走らせずに fd を取り出す
+        let fd = unsafe { std::ptr::read(&io.fd) };
+        let d = std::os::unix::net::UnixDatagram::from(fd);
+        d.set_nonblocking(false)?;
+        Ok(d)
+    }
+
+    pub fn connect<P: AsRef<std::path::Path>>(&self, path: P) -> io::Result<()> {
+        self.std(|d| d.connect(path))
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        poll_fn(|cx| self.io.poll_io(true, cx, || self.std(|d| d.send(buf)))).await
+    }
+
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.std(|d| d.send(buf))
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.std(|d| d.recv(&mut *buf)))
+        })
+        .await
+    }
+
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.std(|d| d.recv(buf))
+    }
+
+    pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let fd = self.io.raw();
+        self.io
+            .poll_io(false, cx, || sys_recv(fd, buf, 0))
+            .map_ok(drop)
+    }
+
+    pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.io.poll_io(true, cx, || self.std(|d| d.send(buf)))
+    }
+
+    pub async fn send_to<P: AsRef<std::path::Path>>(
+        &self,
+        buf: &[u8],
+        target: P,
+    ) -> io::Result<usize> {
+        let t = target.as_ref().to_owned();
+        poll_fn(|cx| {
+            self.io
+                .poll_io(true, cx, || self.std(|d| d.send_to(buf, &t)))
+        })
+        .await
+    }
+
+    pub fn try_send_to<P: AsRef<std::path::Path>>(
+        &self,
+        buf: &[u8],
+        target: P,
+    ) -> io::Result<usize> {
+        self.std(|d| d.send_to(buf, target))
+    }
+
+    pub async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.std(|d| d.recv_from(&mut *buf)))
+        })
+        .await
+    }
+
+    pub fn try_recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
+        self.std(|d| d.recv_from(buf))
+    }
+
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<std::os::unix::net::SocketAddr>> {
+        let (n, a) = ready!(self.io.poll_io(false, cx, || self
+            .std(|d| d.recv_from(buf.initialize_unfilled()))))?;
+        buf.advance(n);
+        Poll::Ready(Ok(a))
+    }
+
+    pub async fn readable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+    }
+
+    pub async fn writable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+    }
+
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        self.std(|d| d.local_addr())
+    }
+
+    pub fn peer_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        self.std(|d| d.peer_addr())
+    }
+
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.std(|d| d.shutdown(how))
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.io.raw())
+    }
+}
+
+impl AsRawFd for UnixDatagram {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.raw()
+    }
+}
+
+/// `tokio::net::UnixSocket`（bind・設定してから listen / connect / datagram にする）。
+#[derive(Debug)]
+pub struct UnixSocket {
+    fd: OwnedFd,
+    datagram: bool,
+}
+
+fn sockaddr_un(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    let p = path.as_os_str().as_encoded_bytes();
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if p.len() >= sun.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+    }
+    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, s) in sun.sun_path.iter_mut().zip(p) {
+        *d = *s as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + p.len() + 1) as libc::socklen_t;
+    Ok((sun, len))
+}
+
+impl UnixSocket {
+    pub fn new_stream() -> io::Result<UnixSocket> {
+        Ok(UnixSocket {
+            fd: new_socket(libc::AF_UNIX, libc::SOCK_STREAM)?,
+            datagram: false,
+        })
+    }
+
+    pub fn new_datagram() -> io::Result<UnixSocket> {
+        Ok(UnixSocket {
+            fd: new_socket(libc::AF_UNIX, libc::SOCK_DGRAM)?,
+            datagram: true,
+        })
+    }
+
+    pub fn bind<P: AsRef<std::path::Path>>(&self, path: P) -> io::Result<()> {
+        let (sun, len) = sockaddr_un(path.as_ref())?;
+        cvt_i(unsafe {
+            libc::bind(
+                self.fd.as_raw_fd(),
+                &sun as *const _ as *const libc::sockaddr,
+                len,
+            )
+        })
+        .map(drop)
+    }
+
+    pub fn listen(self, backlog: u32) -> io::Result<UnixListener> {
+        if self.datagram {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listen cannot be called on a datagram socket",
+            ));
+        }
+        cvt_i(unsafe {
+            libc::listen(
+                self.fd.as_raw_fd(),
+                backlog.min(i32::MAX as u32) as libc::c_int,
+            )
+        })?;
+        Ok(UnixListener {
+            io: IoSource::new(self.fd),
+        })
+    }
+
+    pub async fn connect<P: AsRef<std::path::Path>>(self, path: P) -> io::Result<UnixStream> {
+        if self.datagram {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connect cannot be called on a datagram socket",
+            ));
+        }
+        let (sun, len) = sockaddr_un(path.as_ref())?;
+        let r = unsafe {
+            libc::connect(
+                self.fd.as_raw_fd(),
+                &sun as *const _ as *const libc::sockaddr,
+                len,
+            )
+        };
+        let s = TcpStream {
+            io: Arc::new(IoSource::new(self.fd)),
+        };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) && e.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(e);
+            }
+            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+            if let Some(e) = sock_err(s.io.raw())? {
+                return Err(e);
+            }
+        }
+        Ok(UnixStream { inner: s })
+    }
+
+    pub fn datagram(self) -> io::Result<UnixDatagram> {
+        if !self.datagram {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "datagram cannot be called on a stream socket",
+            ));
+        }
+        Ok(UnixDatagram {
+            io: IoSource::new(self.fd),
+        })
+    }
+}
+
+impl AsRawFd for UnixSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+// ===================== AsyncFd（io::unix） =====================
+
+/// 任意の fd の準備待ち（`tokio::io::unix::AsyncFd`）。準備の状態は「待ちが完了した」ことを覚え、
+/// `clear_ready` か `try_io` の `WouldBlock` で忘れる。
+pub struct AsyncFd<T: AsRawFd> {
+    inner: Option<T>,
+    io: IoSourceRef,
+    interest: Interest,
+    read_ready: std::sync::atomic::AtomicBool,
+    write_ready: std::sync::atomic::AtomicBool,
+}
+
+/// fd を所有しない準備待ち（AsyncFd 用）。
+struct IoSourceRef {
+    fd: RawFd,
+    read: Mutex<WaitSlot>,
+    write: Mutex<WaitSlot>,
+}
+
+impl IoSourceRef {
+    fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        require_runtime();
+        let me = std::thread::current().id();
+        let mut slot = if write {
+            self.write.lock().unwrap()
+        } else {
+            self.read.lock().unwrap()
+        };
+        if slot.pending.as_ref().is_some_and(|(o, _)| *o != me) {
+            slot.clear();
+        }
+        let fd = self.fd;
+        let (_, w) = slot.pending.get_or_insert_with(|| {
+            (
+                me,
+                if write {
+                    Wait::W(crate::runtime::tcp::wait_writable_fd(fd))
+                } else {
+                    Wait::R(crate::runtime::tcp::wait_readable_fd(fd))
+                },
+            )
+        });
+        let r = w.poll(cx);
+        crate::tokio::waker::touch_exit_sentinel();
+        let r = ready!(r);
+        slot.pending = None;
+        Poll::Ready(r)
+    }
+}
+
+impl Drop for IoSourceRef {
+    fn drop(&mut self) {
+        self.read.get_mut().unwrap().clear();
+        self.write.get_mut().unwrap().clear();
+        #[cfg(veil_rt_reactor)]
+        if crate::runtime::has_driver() && !crate::tokio::waker::exiting() {
+            crate::runtime::executor::unregister(self.fd);
+        }
+    }
+}
+
+/// `AsyncFd::try_new` の失敗（元の値を返す）。
+pub struct AsyncFdTryNewError<T> {
+    inner: T,
+    cause: io::Error,
+}
+
+impl<T> AsyncFdTryNewError<T> {
+    pub fn into_parts(self) -> (T, io::Error) {
+        (self.inner, self.cause)
+    }
+}
+
+impl<T> std::fmt::Debug for AsyncFdTryNewError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl<T> std::fmt::Display for AsyncFdTryNewError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl<T> std::error::Error for AsyncFdTryNewError<T> {}
+
+/// `try_io` で `WouldBlock` だった。
+#[derive(Debug)]
+pub struct TryIoError(());
+
+impl<T: AsRawFd> std::fmt::Debug for AsyncFd<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFd").field("fd", &self.io.fd).finish()
+    }
+}
+
+impl<T: AsRawFd> AsyncFd<T> {
+    pub fn new(inner: T) -> io::Result<AsyncFd<T>> {
+        AsyncFd::with_interest(inner, Interest::READABLE | Interest::WRITABLE)
+    }
+
+    pub fn with_interest(inner: T, interest: Interest) -> io::Result<AsyncFd<T>> {
+        AsyncFd::try_with_interest(inner, interest).map_err(|e| e.cause)
+    }
+
+    pub fn try_new(inner: T) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
+        AsyncFd::try_with_interest(inner, Interest::READABLE | Interest::WRITABLE)
+    }
+
+    pub fn try_with_interest(
+        inner: T,
+        interest: Interest,
+    ) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
+        if !crate::runtime::has_driver() {
+            return Err(AsyncFdTryNewError {
+                inner,
+                cause: io::Error::other(
+                    "there is no reactor running, must be called from the context of a Tokio 1.x runtime",
+                ),
+            });
+        }
+        let fd = inner.as_raw_fd();
+        Ok(AsyncFd {
+            inner: Some(inner),
+            io: IoSourceRef {
+                fd,
+                read: Mutex::new(WaitSlot::default()),
+                write: Mutex::new(WaitSlot::default()),
+            },
+            interest,
+            read_ready: std::sync::atomic::AtomicBool::new(false),
+            write_ready: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub fn get_ref(&self) -> &T {
+        self.inner.as_ref().unwrap()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.as_mut().unwrap()
+    }
+
+    pub fn into_inner(mut self) -> T {
+        self.inner.take().unwrap()
+    }
+
+    pub fn interest(&self) -> Interest {
+        self.interest
+    }
+
+    fn flag(&self, write: bool) -> &std::sync::atomic::AtomicBool {
+        if write {
+            &self.write_ready
+        } else {
+            &self.read_ready
+        }
+    }
+
+    fn poll_flag(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.flag(write).load(std::sync::atomic::Ordering::Acquire) {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(self.io.poll_ready(write, cx))?;
+        self.flag(write)
+            .store(true, std::sync::atomic::Ordering::Release);
+        Poll::Ready(Ok(()))
+    }
+
+    pub fn poll_read_ready<'a>(
+        &'a self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<AsyncFdReadyGuard<'a, T>>> {
+        ready!(self.poll_flag(false, cx))?;
+        Poll::Ready(Ok(AsyncFdReadyGuard {
+            fd: self,
+            ready: Ready::READABLE,
+        }))
+    }
+
+    pub fn poll_write_ready<'a>(
+        &'a self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<AsyncFdReadyGuard<'a, T>>> {
+        ready!(self.poll_flag(true, cx))?;
+        Poll::Ready(Ok(AsyncFdReadyGuard {
+            fd: self,
+            ready: Ready::WRITABLE,
+        }))
+    }
+
+    pub fn poll_read_ready_mut<'a>(
+        &'a mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<AsyncFdReadyMutGuard<'a, T>>> {
+        ready!(self.poll_flag(false, cx))?;
+        Poll::Ready(Ok(AsyncFdReadyMutGuard {
+            fd: self,
+            ready: Ready::READABLE,
+        }))
+    }
+
+    pub fn poll_write_ready_mut<'a>(
+        &'a mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<AsyncFdReadyMutGuard<'a, T>>> {
+        ready!(self.poll_flag(true, cx))?;
+        Poll::Ready(Ok(AsyncFdReadyMutGuard {
+            fd: self,
+            ready: Ready::WRITABLE,
+        }))
+    }
+
+    fn poll_ready_interest(
+        &self,
+        interest: Interest,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Ready>> {
+        let mut ready = Ready::EMPTY;
+        if interest.is_readable() {
+            if let Poll::Ready(r) = self.poll_flag(false, cx) {
+                r?;
+                ready |= Ready::READABLE;
+            }
+        }
+        if interest.is_writable() {
+            if let Poll::Ready(r) = self.poll_flag(true, cx) {
+                r?;
+                ready |= Ready::WRITABLE;
+            }
+        }
+        if ready.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(ready))
+        }
+    }
+
+    pub async fn ready(&self, interest: Interest) -> io::Result<AsyncFdReadyGuard<'_, T>> {
+        let ready = poll_fn(|cx| self.poll_ready_interest(interest, cx)).await?;
+        Ok(AsyncFdReadyGuard { fd: self, ready })
+    }
+
+    pub async fn ready_mut(
+        &mut self,
+        interest: Interest,
+    ) -> io::Result<AsyncFdReadyMutGuard<'_, T>> {
+        let ready = poll_fn(|cx| self.poll_ready_interest(interest, cx)).await?;
+        Ok(AsyncFdReadyMutGuard { fd: self, ready })
+    }
+
+    pub async fn readable(&self) -> io::Result<AsyncFdReadyGuard<'_, T>> {
+        self.ready(Interest::READABLE).await
+    }
+
+    pub async fn readable_mut(&mut self) -> io::Result<AsyncFdReadyMutGuard<'_, T>> {
+        self.ready_mut(Interest::READABLE).await
+    }
+
+    pub async fn writable(&self) -> io::Result<AsyncFdReadyGuard<'_, T>> {
+        self.ready(Interest::WRITABLE).await
+    }
+
+    pub async fn writable_mut(&mut self) -> io::Result<AsyncFdReadyMutGuard<'_, T>> {
+        self.ready_mut(Interest::WRITABLE).await
+    }
+
+    /// 準備を待って `f` を呼ぶ（`WouldBlock` なら準備を忘れて待ち直す）。
+    pub async fn async_io<R>(
+        &self,
+        interest: Interest,
+        mut f: impl FnMut(&T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        loop {
+            let mut guard = self.ready(interest).await?;
+            match guard.try_io(|fd| f(fd.get_ref())) {
+                Ok(r) => return r,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    pub async fn async_io_mut<R>(
+        &mut self,
+        interest: Interest,
+        mut f: impl FnMut(&mut T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        loop {
+            let mut guard = self.ready_mut(interest).await?;
+            match guard.try_io(|fd| f(fd.get_mut())) {
+                Ok(r) => return r,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// 準備を待たずに `f` を呼ぶ（`WouldBlock` なら準備を忘れる）。
+    pub fn try_io<R>(
+        &self,
+        interest: Interest,
+        f: impl FnOnce(&T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let r = f(self.get_ref());
+        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            if interest.is_readable() {
+                self.read_ready
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            if interest.is_writable() {
+                self.write_ready
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        r
+    }
+
+    fn clear(&self, ready: Ready) {
+        if ready.is_readable() {
+            self.read_ready
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        if ready.is_writable() {
+            self.write_ready
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl<T: AsRawFd> AsRawFd for AsyncFd<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.fd
+    }
+}
+
+/// 準備ができたことを示すガード。
+pub struct AsyncFdReadyGuard<'a, T: AsRawFd> {
+    fd: &'a AsyncFd<T>,
+    ready: Ready,
+}
+
+impl<T: AsRawFd> std::fmt::Debug for AsyncFdReadyGuard<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFdReadyGuard")
+            .field("ready", &self.ready)
+            .finish()
+    }
+}
+
+impl<'a, T: AsRawFd> AsyncFdReadyGuard<'a, T> {
+    pub fn clear_ready(&mut self) {
+        self.fd.clear(self.ready);
+    }
+
+    pub fn clear_ready_matching(&mut self, ready: Ready) {
+        self.fd.clear(ready);
+    }
+
+    pub fn retain_ready(&mut self) {}
+
+    pub fn ready(&self) -> Ready {
+        self.ready
+    }
+
+    pub fn try_io<R>(
+        &mut self,
+        f: impl FnOnce(&'a AsyncFd<T>) -> io::Result<R>,
+    ) -> Result<io::Result<R>, TryIoError> {
+        match f(self.fd) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.clear_ready();
+                Err(TryIoError(()))
+            }
+            r => Ok(r),
+        }
+    }
+
+    pub fn get_ref(&self) -> &'a AsyncFd<T> {
+        self.fd
+    }
+
+    pub fn get_inner(&self) -> &'a T {
+        self.fd.get_ref()
+    }
+}
+
+/// 準備ができたことを示すガード（可変）。
+pub struct AsyncFdReadyMutGuard<'a, T: AsRawFd> {
+    fd: &'a mut AsyncFd<T>,
+    ready: Ready,
+}
+
+impl<T: AsRawFd> std::fmt::Debug for AsyncFdReadyMutGuard<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFdReadyMutGuard")
+            .field("ready", &self.ready)
+            .finish()
+    }
+}
+
+impl<T: AsRawFd> AsyncFdReadyMutGuard<'_, T> {
+    pub fn clear_ready(&mut self) {
+        self.fd.clear(self.ready);
+    }
+
+    pub fn clear_ready_matching(&mut self, ready: Ready) {
+        self.fd.clear(ready);
+    }
+
+    pub fn retain_ready(&mut self) {}
+
+    pub fn ready(&self) -> Ready {
+        self.ready
+    }
+
+    pub fn try_io<R>(
+        &mut self,
+        f: impl FnOnce(&mut AsyncFd<T>) -> io::Result<R>,
+    ) -> Result<io::Result<R>, TryIoError> {
+        match f(self.fd) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.clear_ready();
+                Err(TryIoError(()))
+            }
+            r => Ok(r),
+        }
+    }
+
+    pub fn get_ref(&self) -> &AsyncFd<T> {
+        self.fd
+    }
+
+    pub fn get_mut(&mut self) -> &mut AsyncFd<T> {
+        self.fd
+    }
+
+    pub fn get_inner(&self) -> &T {
+        self.fd.get_ref()
+    }
+
+    pub fn get_inner_mut(&mut self) -> &mut T {
+        self.fd.get_mut()
+    }
 }
 
 impl AsRawFd for UnixListener {
@@ -1668,5 +2791,6 @@ impl AsRawFd for UnixListener {
 /// `tokio::net::unix`（分割した半分の型は TCP と共通）。
 pub mod unix {
     pub use super::tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
+    pub use super::UCred;
     pub use std::os::unix::net::SocketAddr;
 }

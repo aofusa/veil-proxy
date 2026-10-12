@@ -408,6 +408,17 @@ impl<T> Sender<T> {
         })
     }
 
+    pub fn try_reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, TrySendError<()>> {
+        match self.sem().try_acquire_raw(n) {
+            Ok(()) => Ok(PermitIterator {
+                chan: &self.chan,
+                n,
+            }),
+            Err(super::TryAcquireError::Closed) => Err(TrySendError::Closed(())),
+            Err(super::TryAcquireError::NoPermits) => Err(TrySendError::Full(())),
+        }
+    }
+
     pub fn try_reserve(&self) -> Result<Permit<'_, T>, TrySendError<()>> {
         match self.sem().try_acquire_raw(1) {
             Ok(()) => Ok(Permit { chan: &self.chan }),
@@ -859,6 +870,15 @@ impl<T> UnboundedReceiver<T> {
 
     pub fn sender_weak_count(&self) -> usize {
         self.chan.weak_count.load(Ordering::Acquire)
+    }
+}
+
+impl<T> UnboundedReceiver<T> {
+    pub fn blocking_recv_many(&mut self, buffer: &mut Vec<T>, limit: usize) -> usize {
+        if crate::runtime::has_driver() {
+            panic!("Cannot block the current thread from within a runtime.");
+        }
+        futures::executor::block_on(self.recv_many(buffer, limit))
     }
 }
 

@@ -79,6 +79,7 @@ struct Shared<T> {
     cap: usize,
     rx_count: AtomicUsize,
     tx_count: AtomicUsize,
+    weak_count: AtomicUsize,
     wait: WaitList,
 }
 
@@ -98,6 +99,7 @@ pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         cap: capacity.next_power_of_two(),
         rx_count: AtomicUsize::new(1),
         tx_count: AtomicUsize::new(1),
+        weak_count: AtomicUsize::new(0),
         wait: WaitList::default(),
     });
     (
@@ -190,6 +192,7 @@ impl<T> Sender<T> {
     }
 
     pub fn downgrade(&self) -> WeakSender<T> {
+        self.shared.weak_count.fetch_add(1, Ordering::AcqRel);
         WeakSender {
             shared: self.shared.clone(),
         }
@@ -197,6 +200,10 @@ impl<T> Sender<T> {
 
     pub fn strong_count(&self) -> usize {
         self.shared.tx_count.load(Ordering::Acquire)
+    }
+
+    pub fn weak_count(&self) -> usize {
+        self.shared.weak_count.load(Ordering::Acquire)
     }
 
     pub async fn closed(&self) {
@@ -216,7 +223,36 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Clone for WeakSender<T> {
+    fn clone(&self) -> Self {
+        self.shared.weak_count.fetch_add(1, Ordering::AcqRel);
+        WeakSender {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<T> Drop for WeakSender<T> {
+    fn drop(&mut self) {
+        self.shared.weak_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<T> std::fmt::Debug for WeakSender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("broadcast::WeakSender")
+    }
+}
+
 impl<T> WeakSender<T> {
+    pub fn strong_count(&self) -> usize {
+        self.shared.tx_count.load(Ordering::Acquire)
+    }
+
+    pub fn weak_count(&self) -> usize {
+        self.shared.weak_count.load(Ordering::Acquire)
+    }
+
     pub fn upgrade(&self) -> Option<Sender<T>> {
         let mut n = self.shared.tx_count.load(Ordering::Acquire);
         loop {
@@ -334,6 +370,14 @@ impl<T> Receiver<T> {
 
     pub fn is_closed(&self) -> bool {
         self.shared.buf.lock().unwrap().closed
+    }
+
+    pub fn sender_strong_count(&self) -> usize {
+        self.shared.tx_count.load(Ordering::Acquire)
+    }
+
+    pub fn sender_weak_count(&self) -> usize {
+        self.shared.weak_count.load(Ordering::Acquire)
     }
 
     pub fn same_channel(&self, other: &Self) -> bool {

@@ -331,6 +331,15 @@ impl<T> RwLock<T> {
         }
     }
 
+    pub const fn const_with_max_readers(value: T, max_reads: u32) -> RwLock<T> {
+        assert!(max_reads <= MAX_READS);
+        RwLock {
+            mr: max_reads,
+            s: Semaphore::const_new(max_reads as usize),
+            c: UnsafeCell::new(value),
+        }
+    }
+
     pub fn with_max_readers(value: T, max_reads: u32) -> RwLock<T> {
         assert!(
             max_reads <= MAX_READS,
@@ -517,6 +526,41 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
             data,
             _p: PhantomData,
         }
+    }
+
+    /// 部分への参照に写して読みに落とす。
+    pub fn downgrade_map<U: ?Sized, F: FnOnce(&T) -> &U>(
+        this: Self,
+        f: F,
+    ) -> RwLockReadGuard<'a, U> {
+        let data = f(unsafe { &*this.data }) as *const U;
+        let (s, permits) = (this.s, this.permits);
+        std::mem::forget(this);
+        s.release(permits as usize - 1);
+        RwLockReadGuard {
+            s,
+            data,
+            _p: PhantomData,
+        }
+    }
+
+    /// `f` が `Some` を返したら写して読みに落とす（`None` ならガードを返す）。
+    pub fn try_downgrade_map<U: ?Sized, F: FnOnce(&T) -> Option<&U>>(
+        this: Self,
+        f: F,
+    ) -> Result<RwLockReadGuard<'a, U>, Self> {
+        let data = match f(unsafe { &*this.data }) {
+            Some(d) => d as *const U,
+            None => return Err(this),
+        };
+        let (s, permits) = (this.s, this.permits);
+        std::mem::forget(this);
+        s.release(permits as usize - 1);
+        Ok(RwLockReadGuard {
+            s,
+            data,
+            _p: PhantomData,
+        })
     }
 
     pub fn map<U: ?Sized, F: FnOnce(&mut T) -> &mut U>(

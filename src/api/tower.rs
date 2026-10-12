@@ -8,7 +8,7 @@
 //! リクエスト・応答は `http` クレートの型（本文は `http_body_util::Full<Bytes>`）で受け渡す。
 
 use super::app::App;
-use super::handler::{HandlerFn, OperationMeta};
+use super::handler::HandlerFn;
 use super::request::Request;
 use super::response::Response;
 use bytes::Bytes;
@@ -234,6 +234,7 @@ impl App {
     }
 
     /// tower のサービス（axum の `Router` 等）を tokio 互換ランタイムで実行して `path` にマウントする。
+    #[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
     /// `path` は `{*rest}` で下位パスをまとめて渡せる（例: `"/legacy/{*rest}"`）。
     pub fn tokio_service<S, B>(self, methods: &[&str], path: &str, svc: S) -> App
     where
@@ -266,7 +267,7 @@ impl App {
                 }
             })
         });
-        let meta = OperationMeta {
+        let meta = super::handler::OperationMeta {
             operation_id: name.clone(),
             ..Default::default()
         };

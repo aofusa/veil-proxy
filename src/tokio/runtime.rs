@@ -30,6 +30,8 @@ pub enum RuntimeFlavor {
 
 struct HandleInner {
     kind: Kind,
+    name: Option<String>,
+    id: u64,
     /// ワーカー（マルチスレッド）または `block_on` しているスレッド（カレントスレッド）の受け口
     workers: Mutex<Vec<Arc<Injector>>>,
     /// 受け口ができる前に送られたタスク
@@ -73,6 +75,16 @@ impl Drop for DriverGuard {
     }
 }
 
+/// ランタイムの ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Id(u64);
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// 文脈の Handle が無い。
 #[derive(Debug)]
 pub struct TryCurrentError {
@@ -91,9 +103,12 @@ impl std::error::Error for TryCurrentError {}
 
 impl Handle {
     fn new(kind: Kind) -> Handle {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
         Handle {
             inner: Arc::new(HandleInner {
                 kind,
+                name: None,
+                id: NEXT.fetch_add(1, Ordering::Relaxed) as u64,
                 workers: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
                 next: AtomicUsize::new(0),
@@ -122,6 +137,16 @@ impl Handle {
             return Ok(h);
         }
         Err(TryCurrentError { _p: () })
+    }
+
+    /// ランタイムの名前（`Builder::name`）。
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// ランタイムの ID。
+    pub fn id(&self) -> Id {
+        Id(self.inner.id)
     }
 
     pub fn runtime_flavor(&self) -> RuntimeFlavor {
@@ -309,7 +334,8 @@ fn run_block_on<F: Future>(handle: &Handle, future: F) -> F::Output {
 /// `tokio::runtime::Runtime`。
 pub struct Runtime {
     handle: Handle,
-    threads: Vec<std::thread::JoinHandle<()>>,
+    // Mutex に入れて RefUnwindSafe にする（catch_unwind の中で &Runtime を使えるように）
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     stop: Arc<Mutex<Vec<crate::runtime::offload::Completer<()>>>>,
     owner: std::thread::ThreadId,
 }
@@ -373,7 +399,7 @@ impl Drop for Runtime {
         for c in std::mem::take(&mut *self.stop.lock().unwrap()) {
             c.complete(());
         }
-        for t in self.threads.drain(..) {
+        for t in self.threads.get_mut().unwrap().drain(..) {
             let _ = t.join();
         }
         // ランタイムを作ったスレッド（block_on したスレッド）で drop したら、そこに残ったタスクを片付ける
@@ -388,12 +414,86 @@ impl Drop for Runtime {
     }
 }
 
+/// `tokio::runtime::LocalRuntime`（`Send` でないタスクも spawn できるカレントスレッドのランタイム）。
+pub struct LocalRuntime {
+    rt: Runtime,
+    queue: RefCell<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>>,
+}
+
+impl std::fmt::Debug for LocalRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LocalRuntime")
+    }
+}
+
+/// `Builder::build_local` の設定（互換のため）。
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct LocalOptions {}
+
+impl LocalRuntime {
+    pub fn new() -> std::io::Result<LocalRuntime> {
+        Builder::new_current_thread()
+            .enable_all()
+            .build_local(LocalOptions::default())
+    }
+
+    pub fn handle(&self) -> &Handle {
+        self.rt.handle()
+    }
+
+    pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        if IN_BLOCK_ON.with(|b| b.get()) && crate::runtime::has_driver() {
+            return super::task::spawn_here(future);
+        }
+        let (t, h) = super::task::task(future);
+        self.queue.borrow_mut().push(Box::pin(t));
+        h
+    }
+
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_local(future)
+    }
+
+    pub fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        super::task::spawn_blocking(f)
+    }
+
+    #[track_caller]
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        let queued: Vec<_> = self.queue.borrow_mut().drain(..).collect();
+        self.rt.block_on(async move {
+            for t in queued {
+                crate::runtime::spawn(t);
+            }
+            future.await
+        })
+    }
+
+    pub fn enter(&self) -> EnterGuard<'_> {
+        self.rt.enter()
+    }
+}
+
 /// `tokio::runtime::Builder`。I/O・時計の有効化などの設定は受け付けるだけ（常に有効）。
 pub struct Builder {
     kind: Kind,
     worker_threads: Option<usize>,
     thread_name: String,
     start_paused: bool,
+    name: Option<String>,
 }
 
 impl std::fmt::Debug for Builder {
@@ -418,6 +518,7 @@ impl Builder {
             worker_threads: None,
             thread_name: "tokio-runtime-worker".into(),
             start_paused: false,
+            name: None,
         }
     }
 
@@ -427,12 +528,19 @@ impl Builder {
             worker_threads: None,
             thread_name: "tokio-runtime-worker".into(),
             start_paused: false,
+            name: None,
         }
     }
 
     pub fn worker_threads(&mut self, n: usize) -> &mut Self {
         assert!(n > 0, "Worker threads cannot be set to 0");
         self.worker_threads = Some(n);
+        self
+    }
+
+    /// ランタイムの名前（`Handle::name` で読める）。
+    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -481,13 +589,25 @@ impl Builder {
         self
     }
 
+    /// `LocalRuntime` を作る（種類にかかわらずカレントスレッド）。
+    pub fn build_local(&mut self, _options: LocalOptions) -> std::io::Result<LocalRuntime> {
+        self.kind = Kind::CurrentThread;
+        Ok(LocalRuntime {
+            rt: self.build()?,
+            queue: RefCell::new(Vec::new()),
+        })
+    }
+
     pub fn build(&mut self) -> std::io::Result<Runtime> {
         if self.start_paused {
             return Err(std::io::Error::other(
                 "veil::tokio: start_paused (paused clock) is not supported",
             ));
         }
-        let handle = Handle::new(self.kind);
+        let mut handle = Handle::new(self.kind);
+        if let Some(n) = &self.name {
+            Arc::get_mut(&mut handle.inner).expect("fresh handle").name = Some(n.clone());
+        }
         let stop: Arc<Mutex<Vec<crate::runtime::offload::Completer<()>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let mut threads = Vec::new();
@@ -513,7 +633,7 @@ impl Builder {
         }
         Ok(Runtime {
             handle,
-            threads,
+            threads: Mutex::new(threads),
             stop,
             owner: std::thread::current().id(),
         })
