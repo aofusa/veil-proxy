@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - vds.yaml
+  - client.yaml
+configMapGenerator:
+  - name: veil-config
+    files: [config.toml]
+  - name: veil-vds-snapshot
+    files: [snapshot.toml]
+    options: {disableNameSuffixHash: true}
+generatorOptions:
+  disableNameSuffixHash: false
+# veil-vds-server（tools/vds/vds_server.py）・veil-tls・veil-vds-token は tools/k8s/kind-e2e.sh が作る
+# （kustomize はこのディレクトリの外のファイルを参照できず、Secret はリポジトリに置かないため）。

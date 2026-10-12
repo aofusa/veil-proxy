@@ -1,0 +1,79 @@
+# アプリ（traefik/whoami）+ veil サイドカー（F-196）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veil-app
+  labels: {app: veil-app}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: veil-app}
+  template:
+    metadata:
+      labels: {app: veil-app}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app
+          image: traefik/whoami:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--port", "9000"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+        - name: veil
+          image: veil:musl-k8s
+          imagePullPolicy: IfNotPresent
+          args: ["/veil", "-c", "/etc/veil/conf.d/config.toml"]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: https, containerPort: 8443}
+          env:
+            # F-179: 環境ごとの差分は環境変数で上書きする（秘密値は入れない）
+            - {name: VEIL_OVERRIDE_1, value: 'logging.level = "info"'}
+            - {name: VEIL_OVERRIDE_2, value: "server.threads = 2"}
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/veil/conf.d, readOnly: true}
+            # F-180: Secret は subPath を使わずディレクトリでマウントする（更新が届くように）
+            - {name: tls, mountPath: /etc/veil/tls, readOnly: true}
+            - {name: vds-token, mountPath: /etc/veil/vds, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: veil-config}
+        - name: tls
+          secret: {secretName: veil-tls}
+        - name: vds-token
+          secret: {secretName: veil-vds-token, optional: true}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veil-app
+  labels: {app: veil-app}
+spec:
+  selector: {app: veil-app}
+  # appProtocol は付けない（メッシュのプロトコル検出に任せる）。Linkerd は appProtocol: http を
+  # 「HTTP/1.1 固定」と解釈するため、同じポートで h2c（prior knowledge）を受けると壊れる。
+  # Istio はポート名の接頭辞（http・https）で HTTP / TLS として扱う。
+  ports:
+    - {name: http, port: 80, targetPort: http}
+    - {name: https, port: 443, targetPort: https}

@@ -1,0 +1,19 @@
+# 試験用のクライアント（同じ名前空間に置くのでメッシュに参加する）。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  labels: {app: client}
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: curl
+      image: curlimages/curl:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
