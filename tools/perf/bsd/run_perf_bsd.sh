@@ -254,19 +254,10 @@ _veil_common_head() {
 listen = "0.0.0.0:${VEIL_HTTPS}"
 http2_enabled = true
 threads = ${SRV_THREADS}
-# 平文 HTTP/1.1・h2c の計測用リスナー。
-# [server].http は「HTTP→HTTPS 301 リダイレクト専用」なので平文の実配信には使えない
-# （指定すると平文計測が 301 の空応答を測ることになる）。h2c リスナーを使う。
-h2c_enabled = true
-h2c_listen = "0.0.0.0:${VEIL_HTTP}"
-# F-163 で [server].tls_only の既定が true になった。true のときメインリスナーは
-# プロトコル検出（MSG_PEEK）自体を行わず平文を一切受理しないため、h1_file_plain
-# シナリオ（平文 HTTP/1.1 を TLS ポートへ投げる。下の case 文のコメント参照）が
-# **0 rps・全リクエストエラー**になる。平文 HTTP/1.1 を veil に喋らせる経路は
-# 「メインリスナーのプロトコル検出」しか無い（h2c リスナーは h2c 専用）ので、
-# 計測用構成では明示的に false にする。
-# 2026-08-27 の FreeBSD 計測で実際に踏んだ（veil 0.00 rps / errors 2,175,920）。
-tls_only = false
+# 平文 HTTP/1.1・h2c の計測用リスナー（F-200）。listen_cleartext はプロトコル検出で両方を受ける。
+# 既定の enable_secure_redirect = true だと 301 の空応答を測ることになるので false にする。
+listen_cleartext = "0.0.0.0:${VEIL_HTTP}"
+enable_secure_redirect = false
 ${1:-}
 
 [logging]
@@ -355,11 +346,12 @@ write_veil_configs() {
     # 静的配信
     { _veil_common_head; _veil_route_file; } > "${WORK}/conf/veil_file.toml"
 
-    # 静的配信 + HTTP/3（有効化は [server].http3_enabled、UDP リッスンは [http3].listen）
-    { _veil_common_head 'http3_enabled = true'
+    # 静的配信 + HTTP/3（有効化は [http3].enabled、UDP リッスンは [http3].listen）
+    { _veil_common_head
       cat <<EOF
 
 [http3]
+enabled = true
 listen = "0.0.0.0:${VEIL_HTTPS}"
 EOF
       _veil_route_file
@@ -570,15 +562,10 @@ run_scenario() {
       # nginx 側も `sendfile on;` で同じくカーネルゼロコピー + sf_hdtr を使うため、
       # 「1 リクエストあたりの syscall 数」を真正面から比較する構成になる。
       #
-      # **veil の宛先が HTTPS ポートなのは誤記ではない。** veil の平文リスナー
-      # （`h2c_listen`）は **h2c 専用**で、平文 HTTP/1.1 は
-      # 「Plain HTTP/1.1 not supported on H2C-only server」として切断される。
-      # 一方、メインリスナーは先頭バイトのプロトコル検出（`detect_protocol_with_buffer`）
-      # を行い、TLS ClientHello でなければ平文 HTTP/1.1 として `accept_plain` する。
-      # したがって「veil に平文 HTTP/1.1 を喋らせる」唯一の方法は、TLS ポートへ
-      # `http://` で投げることである（実機で 200 / Content-Length 一致 / 本体 md5 一致を確認済み）。
+      # F-200: veil の平文リスナー（`listen_cleartext`）はプロトコル検出で平文 HTTP/1.1 と h2c を
+      # 両方受けるので、宛先は平文ポート（${VEIL_HTTP}）。TLS ポートは平文を受け付けない。
       h1_file_plain)
-        v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTPS}${REQ_PATH}"
+        v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTP}${REQ_PATH}"
         n_url="http://127.0.0.1:${NGX_HTTP}${REQ_PATH}"; tool=wrk ;;
       h3_file)
         v_cfg=veil_file_h3.toml; v_url="https://127.0.0.1:${VEIL_HTTPS}${REQ_PATH}"

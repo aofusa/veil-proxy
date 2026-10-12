@@ -22,7 +22,7 @@ REQ_PATH="${2:-/small.html}"
 DUR="${DUR:-8}"
 
 case "$SCEN" in
-  h1_file_plain) cfg=veil_file.toml;  v="http://127.0.0.1:4443${REQ_PATH}";  n="http://127.0.0.1:5080${REQ_PATH}" ;;
+  h1_file_plain) cfg=veil_file.toml;  v="http://127.0.0.1:4080${REQ_PATH}";  n="http://127.0.0.1:5080${REQ_PATH}" ;;
   h1_file_tls)   cfg=veil_file.toml;  v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;
   h1_proxy_tls)  cfg=veil_proxy.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443/proxy${REQ_PATH}" ;;
   h3_file)       cfg=veil_file_h3.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;

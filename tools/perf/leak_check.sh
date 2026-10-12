@@ -84,9 +84,8 @@ write_config() { # variant(a|b) path
 [server]
 listen = "127.0.0.1:${TLS_PORT}"
 http2_enabled = true
-http3_enabled = true
-h2c_enabled = true
-h2c_listen = "127.0.0.1:${H2C_PORT}"
+listen_cleartext = "127.0.0.1:${H2C_PORT}"
+enable_secure_redirect = false
 threads = ${THREADS}
 
 [logging]
@@ -111,6 +110,7 @@ auto_reload = true
 reload_interval_secs = 3600
 
 [http3]
+enabled = true
 listen = "127.0.0.1:${TLS_PORT}"
 
 [access_log]

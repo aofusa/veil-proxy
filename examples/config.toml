@@ -16,14 +16,73 @@
 # SIGHUP でも同じ上書きが当て直される。秘密鍵等の機密値は環境変数で渡さないこと。
 
 [server]
+# ====================
+# 待ち受け（F-200）
+# ====================
+#
+# 待ち受けは 2 種類のリスナーと HTTP/3 で整理されています。少なくとも一方の
+# listen / listen_cleartext が必要です（両方同じアドレスはエラー。1 ポートでの TLS/平文の
+# 自動判別はしません）。
+#
+#   キー                       プロトコル                          必要なもの
+#   listen                     TLS: HTTP/1.1 + HTTP/2（ALPN）      [tls]
+#   listen_cleartext           平文: HTTP/1.1 + h2c（自動判別）    （https へリダイレクトするなら listen）
+#   [http3] enabled = true     HTTP/3（UDP、listen と同じアドレス） listen・[tls]・http3 feature
+#
+# listen を書かず listen_cleartext だけにすると、TLS 無しの平文専用サーバになります
+# （[tls] は不要。API ライブラリの既定構成）。
+#
+# 旧キーからの移行（旧キーは削除済みで、書くと移行先を示すエラーで起動しません）:
+#   旧                                                 新
+#   listen（+ tls_only = true / 既定）                 listen
+#   http = "0.0.0.0:80"（HTTPS への 301 専用）          listen_cleartext = "0.0.0.0:80"（リダイレクトは既定）
+#   h2c_enabled = true + h2c_listen = "0.0.0.0:8080"   listen_cleartext = "0.0.0.0:8080" + enable_secure_redirect = false
+#   h2c_enabled = true（H2C 専用）+ h2c_http1 = true   listen_cleartext = <旧 listen>（listen は書かない）+ enable_secure_redirect = false
+#   tls_only = false + h2c_enabled = true（同一ポート） listen と listen_cleartext を別ポートに分ける
+#   http3_enabled = true（+ [http3] listen）           [http3] enabled = true（+ 必要なら [http3] listen）
+#
+# TLS のリスナー（HTTP/1.1 + HTTP/2 ALPN）。[tls] が必要です。平文が来たら
+# TLS ハンドシェイクの失敗で閉じます（プロトコル検出の往復はありません）。
 listen = "127.0.0.1:443"
+
+# 平文のリスナー（HTTP/1.1 + h2c、オプション）
+#
+# 先頭バイトのプロトコル検出（MSG_PEEK）で HTTP/1.1 か h2c（RFC 7540 §3.4 Prior Knowledge）かを
+# 判別します。h2c は `--features http2` が必要です。
+#
+# 既定（enable_secure_redirect = true）では、このポートに来た要求を HTTP/1.1・h2c とも
+# https://<Host>[:<listen のポート>] へ 301 Moved Permanently で返します（コンテンツは配信しません。
+# h2c には HTTP/2 の 301 を返します）。
+#
+# セキュリティ考慮事項:
+# - リダイレクトだけを行い、コンテンツは一切配信しません
+# - 301 Moved Permanently を返すため、ブラウザがURLをキャッシュします
+# - 初回HTTPアクセス時のみ平文通信が発生します
+# - 平文で配信する（enable_secure_redirect = false）のは内部ネットワーク・サイドカー・gRPC 向け。
+#   外部公開時は TLS を使ってください
+#
+# 推奨: 公開サーバーでは HTTP→HTTPS のリダイレクトとして使うことをお勧めします
+#
+listen_cleartext = "127.0.0.1:80"
+
+# listen_cleartext に来た要求を https へ 301 で返すか（既定: true）
+#
+# true には listen が必要です（リダイレクト先が無いと設定エラー）。リダイレクト先のポートは
+# listen のポートです（443 なら省略）。平文のまま配信したいときは false にします。
+# enable_secure_redirect = true
+
+# listen_cleartext で平文 HTTP/1.1 を受けるか（既定: true）。false なら 426 Upgrade Required で拒否します。
+# allow_http = true
+
+# listen_cleartext で h2c を受けるか（既定: true）。false なら GOAWAY(PROTOCOL_ERROR) で拒否します。
+# （allow_http と allow_h2c が両方 false だと何も受けないので設定エラー）
+# allow_h2c = true
 
 # Unix ドメインソケット（UDS）リスナー（F-164、`cfg(unix)` のみ）
 #
-# listen / h2c_listen は "unix:<path>" 形式でも指定できます。
+# listen / listen_cleartext は "unix:<path>" 形式でも指定できます。
 #   listen = "unix:/run/veil/https.sock"
-# リスナー側の対象は listen / h2c_listen のみです（[[l4]].listen・
-# server.http（HTTPS リダイレクト用平文リスナー）・[http3].listen は非対応。
+# リスナー側の対象は listen / listen_cleartext のみです（[[l4]].listen・[http3].listen は非対応。
 # HTTP/3 は QUIC/UDP のため UDS では動作しません）。
 # **上流バックエンドへの UDS 接続は F-170 で対応済みです**（下の
 # 「Unix ドメインソケット（UDS）バックエンド」節を参照）。
@@ -41,20 +100,6 @@ listen = "127.0.0.1:443"
 #   既定値 443 のままになります。
 #
 # unix_socket_permissions = "0660"
-
-# HTTP to HTTPS リダイレクト（オプション）
-#
-# HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
-# ブラウザがhttp://でアクセスした場合、自動的にhttps://にリダイレクトされます。
-#
-# セキュリティ考慮事項:
-# - HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
-# - 301 Moved Permanently を返すため、ブラウザがURLをキャッシュします
-# - 初回HTTPアクセス時のみ平文通信が発生します
-#
-# 推奨: 公開サーバーではこの設定を有効にすることをお勧めします
-#
-http = "127.0.0.1:80"
 
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
@@ -78,63 +123,6 @@ http = "127.0.0.1:80"
 #
 http2_enabled = true
 
-# H2C (HTTP/2 Cleartext) サーバーを有効化
-#
-# TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
-# Prior Knowledgeモードをサポートします。
-#
-# 効果:
-# - ストリーム多重化によるレイテンシ削減
-# - HPACK ヘッダー圧縮によるオーバーヘッド削減
-# - gRPC バックエンドへの接続に適している
-#
-# セキュリティ考慮事項:
-# - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
-# - 外部公開時はTLS必須
-# - デフォルトで無効（明示的に有効化が必要）
-#
-# 注意: `--features http2` でビルドする必要があります
-#
-# h2c_enabled = false
-
-# H2C リスニングアドレス（オプション）
-#
-# 指定した場合、H2C専用のリスナーを起動します。
-# 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
-#
-# 例: "127.0.0.1:8080"
-#
-# 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
-#
-# h2c_listen = "127.0.0.1:8080"
-
-# TLSリスナー（listen）で平文接続を拒否するかどうか（F-163）
-#
-# 適用範囲はメインリスナー（listen）のみです。h2c_listen・http（HTTPSリダイレクト用）・
-# [[l4]] など明示的に平文を扱う経路には影響しません。
-#
-# true（デフォルト）の場合、メインリスナーではプロトコル検出（MSG_PEEK）自体を行わず、
-# 接続は常にTLSハンドシェイクへ渡されます。平文クライアントはハンドシェイク失敗で
-# 切断されます。接続ごとのMSG_PEEK往復（最大200ms待ち）も省けます。
-#
-# false の場合、h2c_enabled = true であれば従来どおりメインリスナーで
-# h2c・平文HTTP/1.1をプロトコル検出により受理します。
-#
-# 注意: h2c_enabled = true かつ h2c_listen が未指定または listen と同一の場合、
-# H2C専用サーバー（TLSリスナー自体が起動しない）となるため、この設定は影響しません。
-#
-# tls_only = true
-
-# H2C 専用リスナーで平文 HTTP/1.1 も受けるかどうか（既定: false）
-#
-# H2C 専用リスナー（h2c_listen、または H2C 専用サーバ構成のメインリスナー）は、既定では
-# プロトコル検出で HTTP/1.1 と判定した接続を閉じます。true にすると同じポートで平文 HTTP/1.1 も
-# 処理します（h2c は接続プリフェースで判別）。TLS 無しの平文専用サーバ（下の [tls] の注記を参照。
-# API ライブラリの既定構成）で HTTP/1.1 クライアントを受けるために使います。
-# 要 http2 feature（無効時は警告して無視）。
-#
-# h2c_http1 = false
-
 # ====================
 # グレースフルシャットダウン設定
 # ====================
@@ -154,7 +142,7 @@ http2_enabled = true
 #
 # graceful_shutdown_timeout_secs = 30
 
-# HTTP/3 を有効化（QUIC/UDP ベース）
+# HTTP/3 は [http3] enabled = true で有効化します（QUIC/UDP ベース。下の [http3] セクション）。
 #
 # 効果:
 # - 0-RTT 接続確立
@@ -164,8 +152,6 @@ http2_enabled = true
 # 注意:
 # - UDP ベースのため kTLS は使用不可
 # - GSO/GRO による高パフォーマンス UDP 処理を使用
-#
-# http3_enabled = true
 
 # ====================
 # Serverヘッダー設定
@@ -278,11 +264,10 @@ level = "info"
 # ==========================================
 # TLS設定
 # ==========================================
-# 注意: [tls] セクション自体を省略できるのは「平文専用サーバ」構成のときだけです
-# （[server] h2c_enabled = true で h2c_listen が無い（または listen と同一）、http3_enabled = false、
-#  http2 feature 有効）。この構成では TLS リスナーを起動せず listen が h2c（と h2c_http1 = true
-#  なら平文 HTTP/1.1）を受けます。それ以外の構成で cert_path / key_path が無いと起動時の検証で
-#  "TLS certificate is required" のエラーになります。
+# 注意: [tls] が必要なのは TLS のリスナー（[server] listen）または HTTP/3（[http3] enabled = true）が
+# あるときだけです。listen_cleartext だけの平文専用サーバ構成（F-200）では省略できます。
+# それ以外の構成で cert_path / key_path が無いと起動時の検証で "TLS certificate is required" の
+# エラーになります。
 [tls]
 
 cert_path = "/path/to/cert.pem"
@@ -733,7 +718,7 @@ revalidate_mtime = false
 # 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
 # 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
 # allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
-#   - L4 リスナー・h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
+#   - L4 リスナー・平文リスナー（listen_cleartext）・HTTP/3 の追加リスナーが無い
 #     （cap_enter 後の bind が要るため）
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
 # 上流へのプロキシ（F-182）: Proxy ルート・[upstreams] があっても capability mode に入れる。
@@ -751,7 +736,7 @@ revalidate_mtime = false
 # ディレクトリ fd から読み直す。ただし cap_enter 後に動かない変更を含むリロードは拒否して
 # 前の設定を保つ（再起動で反映）: 起動時の File ルートのディレクトリ配下にないパスを指す
 # File ルート、許可リストに無い上流（新しい Proxy ルートの URL・[upstreams] のサーバ）、
-# 上記の L4/h2c/HTTP/3/リダイレクト、アクセスログの有効化・file_path の変更。同じパスのアクセスログの開き直し（logrotate の mv + SIGHUP）はできる。
+# 上記の L4/平文リスナー/HTTP/3、アクセスログの有効化・file_path の変更。同じパスのアクセスログの開き直し（logrotate の mv + SIGHUP）はできる。
 # capsicum_capability_mode = true
 
 # 起動時に attach する jail 名（FreeBSD専用、root 前提）。
@@ -1168,7 +1153,7 @@ revalidate_mtime = false
 # ==========================================
 #
 # HTTP/3 (QUIC) プロトコルの詳細なパラメータを設定できます。
-# server.http3_enabled = true で有効化してください。
+# enabled = true で有効化してください（listen と [tls] が必要）。
 #
 # 注意:
 #   - --features http3 でビルドする必要があります
@@ -1176,6 +1161,8 @@ revalidate_mtime = false
 #   - quiche (Cloudflare製) を使用
 #
 [http3]
+# HTTP/3 を有効化する（F-200。既定: false）。listen と [tls] が必要
+# enabled = true
 # HTTP/3リッスンアドレス（UDP）
 # 未指定の場合は server.listen と同じアドレスを使用
 # listen = "127.0.0.1:443"
@@ -1183,7 +1170,7 @@ revalidate_mtime = false
 # ====================
 # Alt-Svc（HTTP/3 広告、F-94）— [http3] に集約
 # ====================
-# server.http3_enabled = true のとき、HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与する。
+# [http3] enabled = true のとき、HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与する。
 # 既定: true（広告する）。false で抑制。
 # alt_svc_enabled = true
 #
@@ -2281,8 +2268,8 @@ revalidate_mtime = false
 # 設定例:
 #
 # [server]
-# h2c_enabled = true
-# h2c_listen = "0.0.0.0:8080"  # H2C専用ポート（オプション）
+# listen_cleartext = "0.0.0.0:8080"   # 平文（HTTP/1.1 + h2c）。listen を書かなければ平文専用サーバ
+# enable_secure_redirect = false      # 平文のまま配信する（既定 true は https へ 301）
 #
 # 使用例:
 #   # curlでH2Cサーバーに接続
@@ -2294,11 +2281,7 @@ revalidate_mtime = false
 # セキュリティ注意事項:
 #   - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
 #   - 外部公開時はTLS必須
-#   - デフォルトで無効（明示的に有効化が必要）
-#
-# [server]
-# h2c_enabled = true
-# h2c_listen = "0.0.0.0:8080"
+#   - デフォルトでは listen_cleartext 自体が無い（明示的に書く必要がある）
 
 # ------------------------------------------
 # ヘッダー操作付きプロキシ

@@ -1,8 +1,7 @@
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 http2_enabled = true
-http3_enabled = true
 threads = 0
 
 [logging]
@@ -30,6 +29,7 @@ ktls_enabled = false
 ktls_fallback_enabled = true
 
 [http3]
+enabled = true
 listen = "0.0.0.0:443"
 
 [access_log]

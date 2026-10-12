@@ -32,7 +32,7 @@ cfg() {
 # http2=$(cap "$http2") ktls=$(cap "$ktls") lb=${lb} open_file_cache=$(cap "$ofc")
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 http2_enabled = ${http2}
 threads = 0
 
@@ -109,7 +109,7 @@ feat_base_head() {
     cat <<'EOF'
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 http2_enabled = true
 threads = 0
 
@@ -432,14 +432,13 @@ count=$((count + 1))
 
 # http3: HTTP/3 (QUIC) 有効化。UDP 443 で同一静的ファイルを配信し、
 # h2load の QUIC モードで計測する（kTLS は QUIC 非対応のため既定どおりオフ）。
-# feat_base_head は http3_enabled を持たないため server ブロックを個別生成する。
+# feat_base_head は [http3] を持たないため server ブロックを個別生成する。
 {
     cat <<'EOF'
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 http2_enabled = true
-http3_enabled = true
 threads = 0
 
 [logging]
@@ -467,6 +466,7 @@ ktls_enabled = false
 ktls_fallback_enabled = true
 
 [http3]
+enabled = true
 listen = "0.0.0.0:443"
 
 [[route]]
@@ -573,25 +573,27 @@ count=$((count + 1))
 # ============================================================
 
 # server/logging/security/performance/tls 共通ヘッダ（http3 有無を引数化）。
-# $1=http3(0/1) $2=h2c ポート（省略可。指定時のみ [server] に h2c_listen を追加）
-#   veil の平文 HTTP/1.1 (`[server].http`) は HTTPS への 301 リダイレクト専用リスナーで
-#   計測に使えないため、平文 HTTP/2 (h2c prior knowledge) を計測するには専用の
-#   h2c_listen リスナーが必要。
+# $1=http3(0/1) $2=h2c ポート（省略可。指定時のみ listen_cleartext をそのポートへ向けリダイレクトを切る）
+#   listen_cleartext は既定で HTTPS への 301 リダイレクト専用のため計測に使えない。平文 HTTP/2
+#   (h2c prior knowledge) を計測するには enable_secure_redirect = false が必要。
 gen_srv_head() {
-    local h3="$1" h2c_port="${2:-}" http3_line="" http3_block="" h2c_lines=""
+    local h3="$1" h2c_port="${2:-}" http3_block="" cleartext_lines=""
     if [ "$h3" = 1 ]; then
-        http3_line=$'http3_enabled = true\n'
-        http3_block=$'\n[http3]\nlisten = "0.0.0.0:443"\n'
+        http3_block=$'\n[http3]\nenabled = true\nlisten = "0.0.0.0:443"\n'
     fi
+    # 平文リスナーは既定でリダイレクト専用（:80）。h2c を計測する構成だけ、同じ listen_cleartext を
+    # h2c ポートへ向けてリダイレクトを切る（F-200: 平文 HTTP/1.1 + h2c を 1 つのリスナーで受ける）。
     if [ -n "$h2c_port" ]; then
-        h2c_lines="h2c_enabled = true"$'\n'"h2c_listen = \"0.0.0.0:${h2c_port}\""$'\n'
+        cleartext_lines="listen_cleartext = \"0.0.0.0:${h2c_port}\""$'\n'"enable_secure_redirect = false"
+    else
+        cleartext_lines='listen_cleartext = "0.0.0.0:80"'
     fi
     cat <<EOF
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+${cleartext_lines}
 http2_enabled = true
-${http3_line}${h2c_lines}threads = 0
+threads = 0
 
 [logging]
 level = "warn"
@@ -746,7 +748,7 @@ done
 
 # --- グループC-2: gRPC over HTTP/3（ベース + 各機能） ---
 # k6 は gRPC over H3 をネイティブ非対応のため run_perf.sh がフェイルセーフで NA を出す。
-# 設定自体は http3_enabled + gRPC ルートで生成しておく（将来クライアント対応時に流用）。
+# 設定自体は [http3] enabled + gRPC ルートで生成しておく（将来クライアント対応時に流用）。
 {
     gen_srv_head 1
     gen_grpc_prelude
@@ -765,9 +767,8 @@ done
 
 # ============================================================
 # h2c（平文 HTTP/2 prior knowledge）
-# veil の平文リスナー `h2c_listen` は h2c 専用で HTTP/1.1 を受け付けない
-# （`[server].http` は HTTPS への 301 リダイレクト専用のため計測に使えない）。
-# gen_srv_head の第 2 引数で h2c_listen を 8080 番へ有効化し、File / Proxy の
+# veil の平文リスナー `listen_cleartext` は既定で HTTPS への 301 リダイレクト専用のため計測に使えない。
+# gen_srv_head の第 2 引数で listen_cleartext を 8080 番へ向け enable_secure_redirect = false にし、File / Proxy の
 # 2 経路を h2load の平文 prior knowledge モードで計測する。
 # ============================================================
 

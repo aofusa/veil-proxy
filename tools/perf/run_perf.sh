@@ -22,7 +22,7 @@ K6DIR="$HERE/k6"                     # k6 スクリプト・proto の所在
 WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
 H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
 H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
-H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: h2c_listen / nginx: listen 8080 http2）
+H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: listen_cleartext / nginx: listen 8080 http2）
 H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
 
 # 計測クライアント 1 回あたりの上限時間（秒）。**サーバ側のハングでスイート全体が
@@ -237,9 +237,8 @@ run_http3() { # label cfg container
     done
 }
 
-# h2c（平文 HTTP/2 prior knowledge）計測: veil の平文リスナー（h2c_listen）は h2c
-# 専用で HTTP/1.1 を受け付けない（`[server].http` は 301 リダイレクト専用）ため、
-# 通常の wrk（HTTP/1.1）ではなく h2load を http:// スキームで使い prior knowledge
+# h2c（平文 HTTP/2 prior knowledge）計測: veil の平文リスナー（listen_cleartext、
+# enable_secure_redirect = false）に対し、通常の wrk（HTTP/1.1）ではなく h2load を http:// スキームで使い prior knowledge
 # で計測する（$H2_IMG をそのまま `--entrypoint h2load` で流用できる）。
 run_h2c() { # label cfg container [path]
     local label="$1" cfg="$2" c="$3" path="${4:-/}" iter reqps tput latmean non2xx cpu mem
@@ -313,7 +312,7 @@ run_load() { # target_label config_label container has_http2
         done
     fi
 
-    # HTTP/3 (h2load QUIC)。http3_enabled 構成（feat_http3 / h3_* 命名）のみ
+    # HTTP/3 (h2load QUIC)。[http3] enabled の構成（feat_http3 / h3_* 命名）のみ
     # UDP/QUIC で追加計測する（h3_* は File/Proxy の H1.1・H2・H3 を同一構成で計測）。
     case "$cfg" in
         *feat_http3*|h3_*) run_http3 "$label" "$cfg" "$c" ;;

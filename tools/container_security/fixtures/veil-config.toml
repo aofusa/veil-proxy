@@ -1,5 +1,5 @@
 # container_security テスト用 Veil 設定（docker/assets/conf.d をベースに拡張）
-# h2spec 要件: GET/POST / が 200 + 非空ボディ。H2C 8443 で cleartext HTTP/2 も検証。
+# h2spec 要件: GET/POST / が 200 + 非空ボディ。listen_cleartext 8443 で cleartext HTTP/2（h2c）も検証。
 #
 # full features ビルドで default(ktls/http2/mimalloc) に加えて有効化される機能
 # （compression / cache / buffering / rate-limit / admin / access-log / http3 /
@@ -8,11 +8,10 @@
 
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+# 平文（HTTP/1.1 + h2c）。h2spec（cleartext）・ファジングが 8443 を使うのでリダイレクトはしない（F-200）。
+listen_cleartext = "0.0.0.0:8443"
+enable_secure_redirect = false
 http2_enabled = true
-http3_enabled = true
-h2c_enabled = true
-h2c_listen = "0.0.0.0:8443"
 threads = 0
 
 [logging]
@@ -63,6 +62,7 @@ format = "json"
 
 # full: HTTP/3（QUIC over UDP 443）。ハンドシェイク/設定経路を有効化。
 [http3]
+enabled = true
 listen = "0.0.0.0:443"
 compression_enabled = true
 

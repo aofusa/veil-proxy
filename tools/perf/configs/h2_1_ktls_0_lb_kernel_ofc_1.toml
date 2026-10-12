@@ -2,7 +2,7 @@
 # http2=True ktls=False lb=kernel open_file_cache=True
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 http2_enabled = true
 threads = 0
 
