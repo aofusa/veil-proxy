@@ -78,6 +78,9 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55）。
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
 COPY third_party /app/third_party
+# crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー（F-188）。本体はこれらを
+# ビルドしないが、マニフェストが無いとワークスペース解決に失敗する（小さいので丸ごとコピーする）
+COPY crates /app/crates
 
 # F-184: builder 段と同じ dist プロファイルでビルドする（以前は --release で、出力先
 # target/<triple>/release と target/<triple>/dist が別になるため builder 段で依存を全部
