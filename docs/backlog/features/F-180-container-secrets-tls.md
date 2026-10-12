@@ -1,6 +1,6 @@
 # F-180: コンテナでの証明書・秘密鍵の受け渡し（F-07 残件）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 背景
 
@@ -19,3 +19,11 @@ F-07 の「将来拡張」に残っていた項目。証明書ホットリロー
 
 - サンプルの構成でコンテナを起動し TLS ハンドシェイクが成立する。Secret を更新すると新しい証明書で応答する。
 - `docs/guide/`（英日）にコンテナでの推奨運用を書く。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- 証明書の変化検知を「mtime が新しくなったら」から「mtime・実体（dev/ino）・サイズのどれかが変わったら」に変更
+  （`tls_reload::PemStamp`）。Kubernetes Secret の `..data` 付け替えで差し替え先の mtime が同じ・古い場合も追従する。
+- Docker secrets の compose 例と E2E（`examples/container/`）、Kubernetes Secret ボリューム（`deploy/kubernetes/`）。
+- 単体テスト（付け替え先の mtime が古い場合）、standalone E2E（TLS ハンドシェイクで返る証明書が替わる）、compose E2E（PASS）、
+  kind（musl / glibc × plain / Istio / Linkerd すべてで Secret 更新後に新しい証明書を返す）。

@@ -1,6 +1,6 @@
 # F-194: Python バインディング（PyO3）— FastAPI 風デコレータ
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -16,3 +16,9 @@ Python から `@veil.route` / `@app.get(...)` のデコレータでルートと�
 ## 受け入れ条件
 
 - wheel を venv にインストールしてサンプルを起動し、ルーティング・変換・検証（pydantic 有無）・OpenAPI を E2E で確認。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `crates/veil-python`（PyO3 abi3、maturin、`veil-api`）+ FastAPI 風の `veil` パッケージ（引数束縛・pydantic 任意・
+  `body_constraints`・HTTPException・OpenAPI）。既定 offload（GIL はハンドラ用プールで取る）。
+- 単体 32 件（pydantic 有無）、`tests/e2e.sh`（2 例、HTTP/1.1・h2c、422、OpenAPI、SIGTERM / SIGINT）。zip の wheel を Debian 11（Python 3.9）でも確認。

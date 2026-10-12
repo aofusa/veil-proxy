@@ -1,6 +1,6 @@
 # F-191: GraphQL 対応（async-graphql、API ライブラリ）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -14,3 +14,7 @@ async-graphql のスキーマを veil のハンドラとして公開する（Gra
 ## 受け入れ条件
 
 - E2E: クエリ・ミューテーション・変数・エラー応答、GraphiQL の HTML。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `App::graphql(path, schema)`（POST JSON・GET クエリ文字列・バッチ・GraphiQL）。E2E でクエリ・GET・GraphiQL を確認。

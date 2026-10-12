@@ -1,6 +1,6 @@
 # F-188: API サーバ基盤ライブラリ（Rust）— Handler・マクロ・設定ビルダ・ライブラリ既定設定
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 背景・目的
 
@@ -33,3 +33,12 @@ API サーバを書けるようにする。ルーティングは Rust のマク�
 - `cargo build --features full` のバイナリに `veil::api` 由来のシンボルが無い。`tools/perf/` の交互 A/B で退行なし。
 - 単体テスト（パスパターン・抽出子・設定マージ・ソート・衝突）、E2E（examples/api/rust-* を起動して curl / HTTP/2 / h2c で叩く）。
 - `docs/guide/library.md`（英日）と `examples/config.toml` の更新。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `src/api/`（handler・request/response・抽出子・パスパターン・ルート注入と具体性ソート・衝突検査・ライブラリ設定・App/serve）、
+  `crates/veil-macros`、本体側は `Backend::Handler` の 3 経路のディスパッチ・`{param}` 照合（`handler` 時のみ）・
+  `[tls]` 省略可の平文専用構成・`[server].h2c_http1`・`entry::run_server`・offload の完了待ち一般化とハンドラ専用プール。
+- ライブラリとして使うときは `#[global_allocator]` を定義しない（利用者が選ぶ）。
+- 試験: 単体（api 33 件ほか）、standalone E2E（平文専用構成 3 件）、`tests/api/library_e2e.sh`（Rust 31 項目・C 10 項目・Python）、
+  full ビルドのバイナリに `veil::api`・inventory・async-graphql・tokio・pyo3 のシンボルが無いこと。性能の交互 A/B は docs/perf/ に記録。

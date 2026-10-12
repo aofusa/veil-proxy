@@ -1,6 +1,6 @@
 # F-179: 環境変数による設定上書き（F-07 残件）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 背景
 
@@ -30,3 +30,10 @@ F-07（ファジング・カオス・セキュリティスキャン、親）の�
 - 単体テスト: 名前の規則（`<n>` の解釈・不正な名前）、書式、適用順と優先順位（TOML < 環境変数 < CLI）。
 - E2E: 環境変数で `listen` 等を上書きして起動する。SIGHUP 後も上書きが保たれる。
 - `docs/guide/`（英日）・docker の README に対応表を書く。`examples/config.toml` に書式の説明を足す。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `config_override::env_overrides_from`（`VEIL_OVERRIDE_<n>` を `<n>` の数値順にパース、不正な名前・値は起動エラー）。
+  `entry::run` で「環境変数 → CLI」の順に連結してグローバル上書き集合に入れる（TOML < 環境変数 < CLI）。ライブラリモードでも有効。
+- 単体テスト 5 件、standalone E2E 3 件（listen の上書きと SIGHUP 後の保持・配列添字と CLI 優先・不正名の起動エラー）、
+  Docker（`examples/container/e2e.sh`）・Kubernetes（`tools/k8s/kind-e2e.sh`）でも確認。

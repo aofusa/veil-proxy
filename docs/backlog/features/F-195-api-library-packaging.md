@@ -1,6 +1,6 @@
 # F-195: ライブラリ成果物の packaging・Docker ビルド・examples・ドキュメント
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -16,3 +16,10 @@
 ## 受け入れ条件
 
 - Docker でのビルドが通り zip の中身（.so/.a/.h/.whl/ソース）が揃う。zip から取り出した成果物でサンプルが動く。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `packaging/scripts/build-lib.sh`（`--docker` / `--local`、`--kind`）、`docker/Dockerfile.lib`（manylinux_2_28）、
+  `assemble-lib-zip.sh` → `packaging/output/lib/veil-lib-<ver>-<arch>-linux-gnu.zip`（c/・python/・rust/・docs/）。
+- 既存の全 Dockerfile の cacher 段と `.dockerignore` にワークスペースメンバー `crates/` を追加。
+- examples/api（rust-showcase・c-hello・python-hello・python-fastapi-like）、`docs/guide/library.md`（英日）。

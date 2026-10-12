@@ -35,7 +35,7 @@
 
 ## 決定した設計（2026-10-12、feat/f188-api-library-vds-k8s）
 
-**状態: 進行中**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 - **A. 内蔵**を採用（feature `acme`、`full*` に含める、`[acme]` セクション）。HTTP-01 チャレンジ。
 - ACME クライアントは専用スレッドで動かし（データプレーン外）、署名は ES256（aws-lc-rs、OpenBSD/NetBSD は ring）。
@@ -43,3 +43,9 @@
 - 発行した証明書は `[tls].cert_path` / `key_path` に原子的に書き込み、既存の証明書ホットリロード（F-03）で無停止に差し替える。
   起動時に証明書が無ければ自己署名の仮証明書を置いて起動する。期限の `renew_before_days` 日前に更新。
 - E2E は Pebble（Let's Encrypt のテスト用 ACME サーバ）。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `src/acme/`（JWS ES256・JWK サムプリント・RFC 8555 のフロー・HTTP-01 応答リスナー・notAfter の解析）、
+  起動時の仮自己署名証明書、原子的な書き込みと証明書ホットリロード、期限前の更新。`docs/guide/acme.md`（英日）。
+- 単体テスト、Pebble での E2E（`tests/acme/pebble_e2e.sh`: 仮証明書 → 発行 → 差し替え → 配信 → 鍵の権限 600）。

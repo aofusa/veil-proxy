@@ -1,6 +1,6 @@
 # F-189: OpenAPI 自動生成と自動バリデーション（API ライブラリ）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -19,3 +19,9 @@
 
 - 単体テスト: スキーマ生成（min/max・必須・Option・ネスト・列挙）、バリデーションのエラー形式。
 - E2E: `/openapi.json` の内容と `/docs` の HTML、バリデーション失敗が 422。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `#[derive(veil::Schema)]`（validator 互換の `range`・`length`・`email`・`url`・`nested`・`custom`、serde の rename 等）と
+  OpenAPI 3.1 生成（`src/api/openapi.rs`）、Swagger UI（`/docs`）。抽出子は autoref 特殊化で Schema/Validate を自動で使う。
+- 422 の形式は FastAPI 互換（`{"detail":[{"loc","msg","type"}]}`）。C・Python のメタデータもマージ。

@@ -1,6 +1,6 @@
 # F-192: L4（TCP/UDP）ネイティブハンドラ（API ライブラリ）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -15,3 +15,8 @@
 ## 受け入れ条件
 
 - E2E: TCP エコー・UDP エコー、ハンドラ無しの既存 L4 E2E が通る。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `[[l4]] handler`（`upstreams` 省略可）、`#[veil::l4_handler]`、`App::l4_tcp` / `l4_udp`。TLS は none のみ、WASM と併用不可（設定エラー）。
+- E2E: TCP エコー・UDP エコー。ハンドラ無しのリスナーは従来の経路のまま。

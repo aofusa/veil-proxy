@@ -1,6 +1,6 @@
 # F-190: Tower 互換・tokio インターフェース互換レイヤー（API ライブラリ）
 
-**状態: 進行中（feat/f188-api-library-vds-k8s）**
+**状態: 完了（feat/f188-api-library-vds-k8s）**
 
 ## 目的
 
@@ -20,3 +20,9 @@ Tower の `Service` / `Layer` をハンドラに適用できるようにする�
 
 - 単体/E2E: 特定プレフィックスだけに認証レイヤーが掛かる、tower-http の層（SetResponseHeader・Timeout）が動く、tokio の
   `sleep` を含むハンドラが動く。feature 無効時に tokio が本体依存に入らない。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `App::layer` / `layer_on(prefix, L)`（veil のワーカー上で実行）、`App::tokio_service`（tower のサービスを tokio 上で実行）、
+  `tokio_compat::run`（結果は offload と同じ通知 fd で受け取る。スレッド越しの Waker 呼び出しはしない）。
+- E2E: `/admin` だけ認証レイヤー、全体に tower-http の SetResponseHeader。
