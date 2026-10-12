@@ -83,13 +83,13 @@ impl std::task::Wake for WaitAll {
 impl WaitSlot {
     fn clear(&mut self) {
         if let Some((owner, w)) = self.pending.take() {
+            // 作ったスレッドでランタイムが生きているときだけ drop する（他は forget。reactor では drop 処理が無い）
+            let w = std::mem::ManuallyDrop::new(w);
             if owner == std::thread::current().id()
                 && !crate::tokio::waker::exiting()
                 && crate::runtime::has_driver()
             {
-                drop(w);
-            } else {
-                std::mem::forget(w);
+                let _ = std::mem::ManuallyDrop::into_inner(w);
             }
         }
     }
