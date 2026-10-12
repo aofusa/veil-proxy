@@ -45,9 +45,20 @@ struct WaitSlot {
 #[derive(Default)]
 struct WaitAll {
     list: Mutex<Vec<std::task::Waker>>,
+    /// `poll_*_ready` の待ち手（tokio と同じく最後に poll した 1 つだけを覚える）
+    last: Mutex<Option<std::task::Waker>>,
 }
 
 impl WaitAll {
+    fn set_last(&self, w: &std::task::Waker) {
+        let old = self
+            .last
+            .lock()
+            .unwrap()
+            .replace(crate::tokio::waker::safe_waker(w));
+        drop(old);
+    }
+
     fn add(&self, w: &std::task::Waker) {
         let mut l = self.list.lock().unwrap();
         if !l.iter().any(|x| x.will_wake(w)) {
@@ -62,7 +73,8 @@ impl std::task::Wake for WaitAll {
     }
     fn wake_by_ref(self: &Arc<Self>) {
         let ws: Vec<_> = std::mem::take(&mut *self.list.lock().unwrap());
-        for w in ws {
+        let last = self.last.lock().unwrap().take();
+        for w in ws.into_iter().chain(last) {
             w.wake();
         }
     }
@@ -71,7 +83,10 @@ impl std::task::Wake for WaitAll {
 impl WaitSlot {
     fn clear(&mut self) {
         if let Some((owner, w)) = self.pending.take() {
-            if owner == std::thread::current().id() && !crate::tokio::waker::exiting() {
+            if owner == std::thread::current().id()
+                && !crate::tokio::waker::exiting()
+                && crate::runtime::has_driver()
+            {
                 drop(w);
             } else {
                 std::mem::forget(w);
@@ -114,14 +129,6 @@ fn check_io_context() {
     }
 }
 
-fn require_runtime() {
-    if !crate::runtime::has_driver() {
-        panic!(
-            "there is no reactor running, must be called from the context of a Tokio 1.x runtime"
-        );
-    }
-}
-
 impl IoSource {
     fn new(fd: OwnedFd) -> IoSource {
         IoSource {
@@ -145,6 +152,31 @@ impl IoSource {
         }
     }
 
+    /// 相手が閉じた・エラーの状態を `ready` に足す（tokio の `READ_CLOSED`・`WRITE_CLOSED`。poll(2) で今の状態を見る）。
+    fn with_closed(&self, mut ready: Ready) -> Ready {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let rdhup = libc::POLLRDHUP;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let rdhup = 0;
+        let mut pfd = libc::pollfd {
+            fd: self.raw(),
+            events: libc::POLLIN | rdhup,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+            if pfd.revents & (rdhup | libc::POLLHUP) != 0 && ready.is_readable() {
+                ready |= Ready::READ_CLOSED;
+            }
+            if pfd.revents & libc::POLLHUP != 0 && ready.is_writable() {
+                ready |= Ready::WRITE_CLOSED;
+            }
+            if pfd.revents & libc::POLLERR != 0 {
+                ready |= Ready::ERROR;
+            }
+        }
+        ready
+    }
+
     /// 操作の結果を見て、`WouldBlock` なら準備の記憶を消す。
     fn track<R>(&self, write: bool, r: io::Result<R>) -> io::Result<R> {
         if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
@@ -154,9 +186,18 @@ impl IoSource {
         r
     }
 
-    fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        require_runtime();
-        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+    /// `coop` は協調スケジューリングの予算を使うか（tokio と同じく `poll_*_ready` と読み書きは使い、
+    /// `readable()`・`writable()`・`ready()` は使わない）。
+    fn poll_ready(&self, write: bool, coop: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // tokio と同じく、ランタイムが止まった後の準備待ちはエラー
+        if !crate::runtime::has_driver() {
+            return Poll::Ready(Err(io::Error::other(
+                "A Tokio 1.x context was found, but it is being shutdown.",
+            )));
+        }
+        if coop {
+            ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+        }
         if self
             .ready_flag(write)
             .load(std::sync::atomic::Ordering::Acquire)
@@ -197,11 +238,19 @@ impl IoSource {
     }
 
     pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_ready(false, cx)
+        self.poll_ready(false, true, cx)
     }
 
     pub(crate) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_ready(true, cx)
+        self.poll_ready(true, true, cx)
+    }
+
+    fn poll_read_ready_nocoop(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_ready(false, false, cx)
+    }
+
+    fn poll_write_ready_nocoop(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_ready(true, false, cx)
     }
 
     /// 準備ができるまで `f` を繰り返す（`WouldBlock` なら準備待ち）。
@@ -216,7 +265,7 @@ impl IoSource {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.ready_flag(write)
                         .store(false, std::sync::atomic::Ordering::Release);
-                    ready!(self.poll_ready(write, cx))?;
+                    ready!(self.poll_ready(write, true, cx))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 r => return Poll::Ready(r),
@@ -662,13 +711,13 @@ impl TcpStream {
         poll_fn(|cx| {
             let mut ready = Ready::EMPTY;
             if interest.is_readable() {
-                if let Poll::Ready(r) = self.io.poll_read_ready(cx) {
+                if let Poll::Ready(r) = self.io.poll_read_ready_nocoop(cx) {
                     r?;
                     ready |= Ready::READABLE;
                 }
             }
             if interest.is_writable() {
-                if let Poll::Ready(r) = self.io.poll_write_ready(cx) {
+                if let Poll::Ready(r) = self.io.poll_write_ready_nocoop(cx) {
                     r?;
                     ready |= Ready::WRITABLE;
                 }
@@ -676,18 +725,18 @@ impl TcpStream {
             if ready.is_empty() {
                 Poll::Pending
             } else {
-                Poll::Ready(Ok(ready))
+                Poll::Ready(Ok(self.io.with_closed(ready)))
             }
         })
         .await
     }
 
     pub async fn readable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+        poll_fn(|cx| self.io.poll_read_ready_nocoop(cx)).await
     }
 
     pub async fn writable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+        poll_fn(|cx| self.io.poll_write_ready_nocoop(cx)).await
     }
 
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1586,11 +1635,11 @@ impl UdpSocket {
     }
 
     pub async fn readable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+        poll_fn(|cx| self.io.poll_read_ready_nocoop(cx)).await
     }
 
     pub async fn writable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+        poll_fn(|cx| self.io.poll_write_ready_nocoop(cx)).await
     }
 
     pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1625,13 +1674,13 @@ impl UdpSocket {
         poll_fn(|cx| {
             let mut ready = Ready::EMPTY;
             if interest.is_readable() {
-                if let Poll::Ready(r) = self.io.poll_read_ready(cx) {
+                if let Poll::Ready(r) = self.io.poll_read_ready_nocoop(cx) {
                     r?;
                     ready |= Ready::READABLE;
                 }
             }
             if interest.is_writable() {
-                if let Poll::Ready(r) = self.io.poll_write_ready(cx) {
+                if let Poll::Ready(r) = self.io.poll_write_ready_nocoop(cx) {
                     r?;
                     ready |= Ready::WRITABLE;
                 }
@@ -2359,11 +2408,11 @@ impl UnixDatagram {
     }
 
     pub async fn readable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+        poll_fn(|cx| self.io.poll_read_ready_nocoop(cx)).await
     }
 
     pub async fn writable(&self) -> io::Result<()> {
-        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+        poll_fn(|cx| self.io.poll_write_ready_nocoop(cx)).await
     }
 
     pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
@@ -2517,6 +2566,9 @@ pub struct AsyncFd<T: AsRawFd> {
     interest: Interest,
     read_ready: std::sync::atomic::AtomicBool,
     write_ready: std::sync::atomic::AtomicBool,
+    /// `WouldBlock` で忘れた（tokio はエッジで覚えるので、次の準備待ちが完了するまで poll(2) で見直さない）
+    read_cleared: std::sync::atomic::AtomicBool,
+    write_cleared: std::sync::atomic::AtomicBool,
 }
 
 /// fd を所有しない準備待ち（AsyncFd 用）。
@@ -2527,9 +2579,18 @@ struct IoSourceRef {
 }
 
 impl IoSourceRef {
-    fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        require_runtime();
-        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+    /// `single` は `poll_*_ready`（最後の Waker だけを覚える）。
+    fn poll_ready(&self, write: bool, single: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // tokio と同じく、ランタイムが止まった後の準備待ちはエラー
+        if !crate::runtime::has_driver() {
+            return Poll::Ready(Err(io::Error::other(
+                "A Tokio 1.x context was found, but it is being shutdown.",
+            )));
+        }
+        // 予算を使うのは poll_*_ready だけ（ready()・readable() は tokio と同じく使わない）
+        if single {
+            ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+        }
         let me = std::thread::current().id();
         let mut slot = if write {
             self.write.lock().unwrap()
@@ -2540,7 +2601,11 @@ impl IoSourceRef {
             slot.clear();
         }
         let fd = self.fd;
-        slot.waiters.add(cx.waker());
+        if single {
+            slot.waiters.set_last(cx.waker());
+        } else {
+            slot.waiters.add(cx.waker());
+        }
         let all = std::task::Waker::from(slot.waiters.clone());
         let (_, w) = slot.pending.get_or_insert_with(|| {
             (
@@ -2630,6 +2695,13 @@ impl<T: AsRawFd> AsyncFd<T> {
     ) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
         check_io_context();
         let fd = inner.as_raw_fd();
+        // 登録できない fd（閉じている・-1）は tokio と同じく作成時に失敗させる
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(AsyncFdTryNewError {
+                inner,
+                cause: io::Error::last_os_error(),
+            });
+        }
         Ok(AsyncFd {
             inner: Some(inner),
             io: IoSourceRef {
@@ -2640,6 +2712,8 @@ impl<T: AsRawFd> AsyncFd<T> {
             interest,
             read_ready: std::sync::atomic::AtomicBool::new(false),
             write_ready: std::sync::atomic::AtomicBool::new(false),
+            read_cleared: std::sync::atomic::AtomicBool::new(false),
+            write_cleared: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2667,13 +2741,19 @@ impl<T: AsRawFd> AsyncFd<T> {
         }
     }
 
-    fn poll_flag(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flag(&self, write: bool, single: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.flag(write).load(std::sync::atomic::Ordering::Acquire) {
             return Poll::Ready(Ok(()));
         }
-        ready!(self.io.poll_ready(write, cx))?;
+        ready!(self.io.poll_ready(write, single, cx))?;
         self.flag(write)
             .store(true, std::sync::atomic::Ordering::Release);
+        let cleared = if write {
+            &self.write_cleared
+        } else {
+            &self.read_cleared
+        };
+        cleared.store(false, std::sync::atomic::Ordering::Release);
         Poll::Ready(Ok(()))
     }
 
@@ -2681,7 +2761,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         &'a self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<AsyncFdReadyGuard<'a, T>>> {
-        ready!(self.poll_flag(false, cx))?;
+        ready!(self.poll_flag(false, true, cx))?;
         Poll::Ready(Ok(AsyncFdReadyGuard {
             fd: self,
             ready: Ready::READABLE,
@@ -2692,7 +2772,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         &'a self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<AsyncFdReadyGuard<'a, T>>> {
-        ready!(self.poll_flag(true, cx))?;
+        ready!(self.poll_flag(true, true, cx))?;
         Poll::Ready(Ok(AsyncFdReadyGuard {
             fd: self,
             ready: Ready::WRITABLE,
@@ -2703,7 +2783,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         &'a mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<AsyncFdReadyMutGuard<'a, T>>> {
-        ready!(self.poll_flag(false, cx))?;
+        ready!(self.poll_flag(false, true, cx))?;
         Poll::Ready(Ok(AsyncFdReadyMutGuard {
             fd: self,
             ready: Ready::READABLE,
@@ -2714,7 +2794,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         &'a mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<AsyncFdReadyMutGuard<'a, T>>> {
-        ready!(self.poll_flag(true, cx))?;
+        ready!(self.poll_flag(true, true, cx))?;
         Poll::Ready(Ok(AsyncFdReadyMutGuard {
             fd: self,
             ready: Ready::WRITABLE,
@@ -2728,13 +2808,13 @@ impl<T: AsRawFd> AsyncFd<T> {
     ) -> Poll<io::Result<Ready>> {
         let mut ready = Ready::EMPTY;
         if interest.is_readable() {
-            if let Poll::Ready(r) = self.poll_flag(false, cx) {
+            if let Poll::Ready(r) = self.poll_flag(false, false, cx) {
                 r?;
                 ready |= Ready::READABLE;
             }
         }
         if interest.is_writable() {
-            if let Poll::Ready(r) = self.poll_flag(true, cx) {
+            if let Poll::Ready(r) = self.poll_flag(true, false, cx) {
                 r?;
                 ready |= Ready::WRITABLE;
             }
@@ -2812,12 +2892,16 @@ impl<T: AsRawFd> AsyncFd<T> {
             || (interest.is_writable()
                 && self.write_ready.load(std::sync::atomic::Ordering::Acquire));
         if !ready {
+            use std::sync::atomic::Ordering::Acquire;
             let mut events = 0;
-            if interest.is_readable() {
+            if interest.is_readable() && !self.read_cleared.load(Acquire) {
                 events |= libc::POLLIN;
             }
-            if interest.is_writable() {
+            if interest.is_writable() && !self.write_cleared.load(Acquire) {
                 events |= libc::POLLOUT;
+            }
+            if events == 0 {
+                return false;
             }
             let mut pfd = libc::pollfd {
                 fd: self.io.fd,
@@ -2852,16 +2936,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         }
         let r = f(self.inner.as_mut().unwrap());
         if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            self.clear(if interest.is_readable() {
-                Ready::READABLE
-            } else {
-                Ready::EMPTY
-            });
-            self.clear(if interest.is_writable() {
-                Ready::WRITABLE
-            } else {
-                Ready::EMPTY
-            });
+            self.clear_interest(interest);
         }
         r
     }
@@ -2876,26 +2951,31 @@ impl<T: AsRawFd> AsyncFd<T> {
         }
         let r = f(self.get_ref());
         if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            if interest.is_readable() {
-                self.read_ready
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
-            if interest.is_writable() {
-                self.write_ready
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
+            self.clear_interest(interest);
         }
         r
     }
 
+    fn clear_interest(&self, interest: Interest) {
+        let mut r = Ready::EMPTY;
+        if interest.is_readable() {
+            r |= Ready::READABLE;
+        }
+        if interest.is_writable() {
+            r |= Ready::WRITABLE;
+        }
+        self.clear(r);
+    }
+
     fn clear(&self, ready: Ready) {
+        use std::sync::atomic::Ordering::Release;
         if ready.is_readable() {
-            self.read_ready
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.read_ready.store(false, Release);
+            self.read_cleared.store(true, Release);
         }
         if ready.is_writable() {
-            self.write_ready
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.write_ready.store(false, Release);
+            self.write_cleared.store(true, Release);
         }
     }
 }
@@ -2926,7 +3006,8 @@ impl<'a, T: AsRawFd> AsyncFdReadyGuard<'a, T> {
     }
 
     pub fn clear_ready_matching(&mut self, ready: Ready) {
-        self.fd.clear(ready);
+        self.fd.clear(ready & self.ready);
+        self.ready = self.ready - ready;
     }
 
     pub fn retain_ready(&mut self) {}
@@ -2977,7 +3058,8 @@ impl<T: AsRawFd> AsyncFdReadyMutGuard<'_, T> {
     }
 
     pub fn clear_ready_matching(&mut self, ready: Ready) {
-        self.fd.clear(ready);
+        self.fd.clear(ready & self.ready);
+        self.ready = self.ready - ready;
     }
 
     pub fn retain_ready(&mut self) {}

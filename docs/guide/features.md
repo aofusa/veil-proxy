@@ -92,9 +92,12 @@ features are in neither `default` nor `full*`, so the proxy binary contains no l
 | `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (plaintext HTTP/1.1 + h2c on `0.0.0.0:8080`, no TLS needed) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json`, Swagger UI, FastAPI-style 422 validation |
-| `tokio-interface` | tower `Layer`/`Service` compatibility and a bridge to tokio-based libraries (the data plane stays tokio-free) |
+| `tokio-compat` | tokio-free tokio compatibility layer: tokio-based libraries run on veil's runtime (part of `api`) |
+| `tokio-compat-bridge` | alternative to `tokio-compat` that bundles a tokio runtime (mutually exclusive with `tokio-compat`) |
 | `graphql` | `async-graphql` endpoint (`App::graphql`) |
 | `l4-handler` | TCP/UDP handlers written as Rust functions on `[[l4]]` listeners |
-| `api` | all of the above |
+| `grpc-handler` | gRPC server on prost messages |
+| `api-core` | all of the above except `tokio-compat` / `tokio-compat-bridge` |
+| `api` | `api-core` + `tokio-compat` |
 
 C (`crates/veil-capi`, `libveil.so`/`libveil.a`) and Python (`crates/veil-python`) bindings are separate crates built on the same code.

@@ -214,8 +214,8 @@ impl<T> Future for Receiver<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let Some(inner) = &this.inner else {
-            // 完了後の poll（tokio と同じく panic せずに閉じたことを返す）
-            return Poll::Ready(Err(RecvError(())));
+            // 完了後（値・閉じたことを返した後）の poll は tokio と同じく panic
+            panic!("called after complete");
         };
         let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
         let r = {

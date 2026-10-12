@@ -1,4 +1,4 @@
-//! Tower の `Service` / `Layer` 互換（F-190、`tokio-interface` feature）。
+//! Tower の `Service` / `Layer` 互換（F-190、`tower-compat` feature。`api-core` に含む）。
 //!
 //! - `App::layer(L)` / `App::layer_on("/admin", L)`: ハンドラを tower のサービスとして包み、層を掛ける。
 //!   veil のワーカー上でそのまま実行する（tokio の時計・I/O を使わない層向け: 認証・ヘッダ付与・CORS 等）。

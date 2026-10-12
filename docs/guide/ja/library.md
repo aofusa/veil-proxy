@@ -22,6 +22,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 - [バリデーションと OpenAPI](#バリデーションと-openapi)
 - [共有状態](#共有状態)
 - [tower の層と tokio 前提ライブラリ](#tower-の層と-tokio-前提ライブラリ)
+- [tokio 互換](#tokio-互換)
 - [GraphQL](#graphql)
 - [L4（TCP/UDP）ハンドラ](#l4tcpudpハンドラ)
 - [TLS と HTTP/3](#tls-と-http3)
@@ -38,13 +39,13 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
   `[[route]]` を注入するので、`config.toml` に書いた `File`・`Proxy` などのルートと共存できます。
 - **ハンドラは veil 独自のランタイム上で動きます。** `async fn` のハンドラは、接続を受け付けたワーカースレッド上で、
   その接続を処理しているのと同じ io_uring（または epoll/kqueue）のイベントループで poll されます。データプレーンに
-  tokio・monoio はありません。tokio 前提のライブラリ（sqlx・reqwest など）が必要なときは、データプレーンに tokio を
-  入れずに済む橋渡し（[tower の層と tokio 前提ライブラリ](#tower-の層と-tokio-前提ライブラリ)）を使います。
+  tokio・monoio はありません。tokio 前提のライブラリ（hyper・reqwest・sqlx など）は、veil の tokio 無しの tokio 互換
+  レイヤーを通じて同じワーカーで動きます（[tokio 互換](#tokio-互換)）。
 - ワーカー上でブロッキング処理をしてはいけません。Rust の **同期** `fn` ハンドラ・C のコールバック・Python のハンドラは、
   veil の `offload` を通じて別のハンドラ用スレッドプール（`[api] handler_threads`）で実行されるので、遅い DB 呼び出しが
   他の接続を止めることはありません。
-- **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・
-  `l4-handler`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
+- **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-compat`・
+  `tokio-compat-bridge`・`graphql`・`l4-handler`・`grpc-handler`・`api-core`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
   従来とまったく同じです。
 - プロキシで使えるものはそのまま使えます。`[server]`・`[tls]`・`[security]`・`[logging]`・`[prometheus]` などのセクション、
   SIGHUP リロード、graceful shutdown（SIGINT/SIGTERM または `veil::shutdown()`）です。
@@ -58,11 +59,16 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 | `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`http2` を含意） |
 | `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]`（`handler` を含意） |
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json` と Swagger UI（`macro` を含意） |
-| `tokio-interface` | tower の `Layer`/`Service` 互換と tokio への橋渡し（`veil::api::tower`・`veil::api::tokio_compat`） |
+| `tokio-compat` | tokio 無しの tokio 互換レイヤー（`veil::tokio`・`App::tokio_service`・`veil::api::tokio_compat`）。[tokio 互換](#tokio-互換) を参照 |
+| `tokio-compat-bridge` | `tokio-compat` の代わりに、本物の tokio ランタイムを同梱して Future をその上で動かす（`tokio-compat` と排他） |
 | `graphql` | `async-graphql` スキーマ向けの `App::graphql()` |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理（`l4-proxy` を含意） |
 | `grpc-handler` | prost のメッセージで書く gRPC サーバ（`veil::api::grpc`、[gRPC](#grpc) を参照。`handler`・`grpc` を含意） |
-| `api` | 上記すべて（`handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・`l4-handler`・`grpc-handler`） |
+| `api-core` | `handler`・`macro`・`openapi`・`graphql`・`l4-handler`・`grpc-handler` と tower の `Layer`/`Service` 互換（`veil::api::tower`） |
+| `api` | `api-core` + `tokio-compat`（ライブラリの既定の使い方） |
+
+tokio の橋渡しを使うときは `features = ["full", "api-core", "tokio-compat-bridge"]` を選びます。`tokio-compat` と
+`tokio-compat-bridge` を両方有効にするとコンパイルエラーになります。
 
 `vds` と `acme` は別の feature で、`full*` に含まれ、プロキシ本体でもライブラリでも使えます（[VDS](vds.md)・[ACME](acme.md) を参照）。
 
@@ -200,7 +206,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `openapi_description` | なし | `info.description` |
 | `max_body_size` | `10485760` | ハンドラへ渡すリクエスト本文の上限（バイト） |
 | `handler_threads` | `0` | 同期 Rust 関数・C コールバック・Python ハンドラを実行するハンドラ用プールのスレッド数（`0` = 組み込みの既定） |
-| `tokio_threads` | `2` | tokio 互換ランタイムのワーカー数 |
+| `tokio_threads` | `2` | 同梱の tokio ランタイムのワーカー数（`tokio-compat-bridge` のみ） |
 | `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
 
 ## ルーティングマクロ
@@ -368,24 +374,26 @@ App::new().state(Db::connect()?).run()?;
 
 ## tower の層と tokio 前提ライブラリ
 
-`tokio-interface` が必要です。リクエストとレスポンスは `http::Request<Full<Bytes>>` / `http::Response` でやり取りします。
+リクエストとレスポンスは `http::Request<Full<Bytes>>` / `http::Response` でやり取りします。
 
 ```rust
 App::new()
-    // 全ルートに tower の Layer を掛ける。veil のワーカー上で実行される（中で tokio のタイマーや I/O を使わない）
+    // 全ルートに tower の Layer を掛ける。veil のワーカー上で実行される
     .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(name, value))
     // /admin 以下のルートだけ（セグメント境界の前方一致）
     .layer_on("/admin", RequireToken)
-    // 既存の tower Service（axum の Router など）を tokio ランタイムで動かしてマウントする
+    // 既存の tower Service（axum の Router など）をマウントする
     .tokio_service(&["GET", "POST"], "/legacy/{*rest}", axum_router)
     .run()?;
 ```
 
-- `layer` / `layer_on` は veil のイベントループの中でハンドラを包みます。tokio のリアクタを必要としない層
-  （認証・ヘッダ付与・CORS など）向けです。tokio のタイマーを使う層（tower の `Timeout` など）は tokio ランタイムが要るので、ここでは使えません。
-- `tokio_service` は tokio 互換ランタイムでサービスを実行し、結果は `offload` と同じ「結果スロット + 通知 fd」でワーカーへ返します
-  （スレッドをまたいで `Waker` を呼びません）。
-- 任意のハンドラの中で tokio 前提のライブラリを使うときは `veil::api::tokio_compat::run` を通します。
+- `layer` / `layer_on`（`api-core`）は veil のイベントループの中でハンドラを包みます。
+- `tokio_service`（`tokio-compat` または `tokio-compat-bridge`）は tower のサービスをマウントします。`tokio-compat` では
+  ほかのハンドラと同じくリクエストを受け付けたワーカーで動きます。`tokio-compat-bridge` では同梱の tokio ランタイムで動き、
+  結果は `offload` と同じ「結果スロット + 通知 fd」でワーカーへ返ります。
+- 任意のハンドラの中で tokio 前提の Future を動かすには `veil::api::tokio_compat::run(fut)` を使います。`tokio-compat` では
+  `fut.await` と同じです（2 つの feature の間でコードを変えずに済むように残しています）。`tokio-compat-bridge` では同梱の
+  ランタイム（遅延起動、ワーカー数は `[api] tokio_threads`、既定 2）で動きます。
 
   ```rust
   let body = veil::api::tokio_compat::run(async move {
@@ -394,8 +402,59 @@ App::new()
   ```
 
   `run` はタスクが panic すると panic します（→ 500）。`try_run` は `Result` を返し、`spawn` は切り離したタスクを起動し、
-  `handle()` は `tokio::runtime::Handle` を返します。ランタイムは遅延起動で、ワーカー数は `[api] tokio_threads`（既定 2）です。
-  データプレーン（受付・TLS・HTTP・ハンドラの poll）が tokio 上で動くことはありません。
+  `handle()` はランタイムのハンドルを返します。
+
+## tokio 互換
+
+`tokio-compat`（`api` に含む）は、tokio の公開 API を **tokio に依存せず** veil 独自のランタイムの上に実装します。
+tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が veil の io_uring（または epoll/kqueue）のワーカーで
+そのまま動きます。データプレーンと veil のランタイムは何も変わりません（互換レイヤーは既存のランタイム API だけを使い、
+プロキシ本体のバイナリには入りません）。
+
+### 使い方
+
+依存ツリー全体の `tokio` クレートを veil のシム（パッケージ名 `tokio`、版 1.99.0。`veil::tokio` を再エクスポート）に
+置き換えます。
+
+```toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+tokio = { version = "1", features = ["full"] }        # シムに解決される
+reqwest = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+```
+
+`veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は
+veil のランタイム（current-thread または multi-thread）を起動します。
+
+### tokio との違い
+
+- **work stealing はありません。** タスクは spawn したスレッドで動きます。ランタイム外のスレッドから `Handle` 経由で
+  spawn するとランタイムのスレッドへ転送します。I/O オブジェクトは作ったスレッドに結び付きます。
+- **スレッドをまたぐ起床**（別スレッドの `Sender`・`spawn_blocking`・別スレッドへ渡した `Waker`）は、通知 fd を通じて
+  所有スレッドへ届けます。veil 自身の Waker を別スレッドから呼ぶことはありません。
+- `spawn_blocking`・`block_in_place`・`fs` は veil のハンドラ用スレッドプール（`[api] handler_threads`）で動きます。
+- 対応: `task`（spawn・`JoinHandle`・`JoinSet`・`LocalSet`・`task_local!`・`yield_now`・協調スケジューリングの予算・
+  `unconstrained`）、`time`（`pause`/`advance`/`start_paused` を含む）、`io`（トレイト・ユーティリティ・`split`・`duplex`・
+  `copy_bidirectional`・バッファ付き I/O）、`net`（TCP・UDP・Unix のストリーム/データグラム/リスナー・`AsyncFd`・
+  `lookup_host`）、`sync`（mpsc・oneshot・watch・broadcast・`Mutex`・`RwLock`・`Semaphore`・`Notify`・`Barrier`・
+  `OnceCell`・`SetOnce`）、`signal`、`fs`、`select!`/`join!`/`try_join!`/`pin!`、`runtime::{Runtime, Builder, Handle}`。
+- 非対応: `process`、ランタイムのメトリクス、タスクダンプ・トレースのフック、io_uring を使う `fs`、Windows の名前付きパイプ。
+  これらや tokio の内部を必要とするクレートは `tokio-compat-bridge` を使ってください。
+
+### 互換性
+
+tokio 自身のテスト（tokio 1.53.2 の `tokio/tests/*.rs`）をシムに対して `tools/tokio-compat/run_tokio_tests.py` で実行した
+結果です。ランタイムの内部を確かめるテスト（`rt_*`・メトリクス・トレース・work stealing・io_uring の fs）は対象外で、
+一覧はスクリプトにあります。
+
+TABLE_JA
+
+実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（io_uring と epoll）: hyper のサーバ（HTTP/1.1 + h2c）と
+クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、sqlx（SQLite・PostgreSQL）。
 
 ## GraphQL
 

@@ -118,6 +118,8 @@ use error::{SendError, SendTimeoutError, TryRecvError, TrySendError};
 struct Queue<T> {
     items: VecDeque<T>,
     rx_closed: bool,
+    /// 受け手が drop された（閉じただけなら予約済みの送信は受け付ける）
+    rx_dropped: bool,
     rx_waker: WakerSlot,
     closed_wakers: Vec<WakerSlot>,
 }
@@ -137,6 +139,7 @@ impl<T> Chan<T> {
             q: Mutex::new(Queue {
                 items: VecDeque::new(),
                 rx_closed: false,
+                rx_dropped: false,
                 rx_waker: WakerSlot::default(),
                 closed_wakers: Vec::new(),
             }),
@@ -147,11 +150,12 @@ impl<T> Chan<T> {
         })
     }
 
-    /// 値を積む（受け手が閉じていれば返す）。容量の許可は呼び出し側が取得済み。
+    /// 値を積む（受け手が drop されていれば返す）。容量の許可は呼び出し側が取得済み。
+    /// tokio と同じく、受け手が `close` しただけなら閉じる前に取った許可での送信は届く。
     fn push(&self, v: T) -> Result<(), T> {
         let w = {
             let mut q = self.q.lock().unwrap();
-            if q.rx_closed {
+            if q.rx_dropped || (q.rx_closed && self.sem.is_none()) {
                 return Err(v);
             }
             q.items.push_back(v);
@@ -165,6 +169,31 @@ impl<T> Chan<T> {
 
     fn is_closed(&self) -> bool {
         self.q.lock().unwrap().rx_closed
+    }
+
+    /// 予約された（まだ送られていない）許可が無い。
+    fn idle(&self) -> bool {
+        self.sem
+            .as_ref()
+            .is_none_or(|s| s.available_permits() == self.cap)
+    }
+
+    /// 許可を返す。受け手が閉じていれば、最後の予約が消えたことを受け手に知らせる。
+    fn release(&self, n: usize) {
+        if let Some(s) = &self.sem {
+            s.release(n);
+        }
+        let w = {
+            let mut q = self.q.lock().unwrap();
+            if q.rx_closed {
+                q.rx_waker.take()
+            } else {
+                None
+            }
+        };
+        if let Some(w) = w {
+            w.wake();
+        }
     }
 
     fn close_rx(&self) {
@@ -219,12 +248,12 @@ impl<T> Chan<T> {
             }
             return Poll::Ready(Some(v));
         }
-        if self.tx_count.load(Ordering::Acquire) == 0 || q.rx_closed {
+        if self.tx_count.load(Ordering::Acquire) == 0 || (q.rx_closed && self.idle()) {
             return Poll::Ready(None);
         }
         q.rx_waker.register(cx.waker());
-        // 登録の後にもう一度（最後の送り手が今 drop したかもしれない）
-        if self.tx_count.load(Ordering::Acquire) == 0 {
+        // 登録の後にもう一度（最後の送り手・予約が今消えたかもしれない）
+        if self.tx_count.load(Ordering::Acquire) == 0 || (q.rx_closed && self.idle()) {
             return Poll::Ready(None);
         }
         Poll::Pending
@@ -239,7 +268,7 @@ impl<T> Chan<T> {
             }
             return Ok(v);
         }
-        if self.tx_count.load(Ordering::Acquire) == 0 || q.rx_closed {
+        if self.tx_count.load(Ordering::Acquire) == 0 || (q.rx_closed && self.idle()) {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
@@ -412,6 +441,10 @@ impl<T> Sender<T> {
     }
 
     pub async fn reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, SendError<()>> {
+        // 容量を超える予約は決して満たせない（tokio と同じくすぐ失敗）
+        if n > self.chan.cap {
+            return Err(SendError(()));
+        }
         self.sem().acquire_raw(n).await.map_err(|_| SendError(()))?;
         Ok(PermitIterator {
             chan: &self.chan,
@@ -420,6 +453,9 @@ impl<T> Sender<T> {
     }
 
     pub fn try_reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, TrySendError<()>> {
+        if n > self.chan.cap {
+            return Err(TrySendError::Full(()));
+        }
         match self.sem().try_acquire_raw(n) {
             Ok(()) => Ok(PermitIterator {
                 chan: &self.chan,
@@ -495,9 +531,7 @@ pub struct Permit<'a, T> {
 impl<T> Permit<'_, T> {
     pub fn send(self, value: T) {
         if self.chan.push(value).is_err() {
-            if let Some(s) = &self.chan.sem {
-                s.release(1);
-            }
+            self.chan.release(1);
         }
         std::mem::forget(self);
     }
@@ -505,9 +539,7 @@ impl<T> Permit<'_, T> {
 
 impl<T> Drop for Permit<'_, T> {
     fn drop(&mut self) {
-        if let Some(s) = &self.chan.sem {
-            s.release(1);
-        }
+        self.chan.release(1);
     }
 }
 
@@ -537,8 +569,8 @@ impl<'a, T> Iterator for PermitIterator<'a, T> {
 
 impl<T> Drop for PermitIterator<'_, T> {
     fn drop(&mut self) {
-        if let Some(s) = &self.chan.sem {
-            s.release(self.n);
+        if self.n > 0 {
+            self.chan.release(self.n);
         }
     }
 }
@@ -552,14 +584,14 @@ impl<T> OwnedPermit<T> {
     pub fn send(mut self, value: T) -> Sender<T> {
         let tx = self.tx.take().unwrap();
         if tx.chan.push(value).is_err() {
-            tx.sem().release(1);
+            tx.chan.release(1);
         }
         tx
     }
 
     pub fn release(mut self) -> Sender<T> {
         let tx = self.tx.take().unwrap();
-        tx.sem().release(1);
+        tx.chan.release(1);
         tx
     }
 }
@@ -567,7 +599,7 @@ impl<T> OwnedPermit<T> {
 impl<T> Drop for OwnedPermit<T> {
     fn drop(&mut self) {
         if let Some(tx) = &self.tx {
-            tx.sem().release(1);
+            tx.chan.release(1);
         }
     }
 }
@@ -655,9 +687,15 @@ impl<T> Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.chan.close_rx();
-        // 残った値を捨てる（容量を返す）
-        let items: Vec<T> = self.chan.q.lock().unwrap().items.drain(..).collect();
+        // 残った値と Waker を捨てる（ロックの外で drop する）
+        let (items, w) = {
+            let mut q = self.chan.q.lock().unwrap();
+            q.rx_dropped = true;
+            let items: Vec<T> = q.items.drain(..).collect();
+            (items, q.rx_waker.take())
+        };
         drop(items);
+        drop(w);
     }
 }
 
@@ -907,8 +945,14 @@ impl<T> UnboundedReceiver<T> {
 impl<T> Drop for UnboundedReceiver<T> {
     fn drop(&mut self) {
         self.chan.close_rx();
-        let items: Vec<T> = self.chan.q.lock().unwrap().items.drain(..).collect();
+        let (items, w) = {
+            let mut q = self.chan.q.lock().unwrap();
+            q.rx_dropped = true;
+            let items: Vec<T> = q.items.drain(..).collect();
+            (items, q.rx_waker.take())
+        };
         drop(items);
+        drop(w);
     }
 }
 

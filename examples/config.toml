@@ -2543,7 +2543,7 @@ revalidate_mtime = false
 # # openapi_description = "..."
 # max_body_size = 10485760          # ハンドラへ渡す本文の上限（バイト）
 # handler_threads = 0               # 同期関数・C・Python 用ハンドラプールのスレッド数（0 = 既定）
-# tokio_threads = 2                 # tokio 互換ランタイムのワーカー数
+# tokio_threads = 2                 # tokio-compat-bridge で同梱する tokio ランタイムのワーカー数
 # grpc_max_message_size = 4194304   # 受信する gRPC メッセージ 1 つの上限（grpc-handler、F-197）
 
 # ==========================================

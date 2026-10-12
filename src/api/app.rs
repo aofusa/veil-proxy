@@ -331,7 +331,7 @@ impl App {
     }
 
     /// ハンドラ関数を包むミドルウェアを登録する（`prefix` が `"/"` なら全ルート）。
-    /// tower の層は `layer` / `layer_on`（`tokio-interface` feature）を使う。
+    /// tower の層は `layer` / `layer_on`（`api-core`）を使う。
     pub fn wrap_on(
         mut self,
         prefix: &str,

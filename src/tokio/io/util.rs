@@ -247,7 +247,7 @@ impl<'a> VecInit<'a> {
         let res = r.as_mut().poll_read(cx, &mut rb);
         let new_len = rb.filled().len();
         let init = rb.initialized().len();
-        assert_eq!(rb.filled().as_ptr(), self.vec.as_ptr() as *const u8);
+        assert_eq!(rb.filled().as_ptr(), self.vec.as_ptr());
         // SAFETY: new_len までは読み込みで初期化された
         unsafe { self.vec.set_len(new_len) };
         self.num_initialized = init;

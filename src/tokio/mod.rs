@@ -6,7 +6,7 @@
 //!
 //! - スレッド越しの wake は `waker` の受け口で所有スレッドへ返す（veil のランタイムは変えない）。
 //! - タスクは spawn したスレッドで動く（work stealing なし）。I/O オブジェクトも作ったスレッドで使う。
-//! - 時計の停止（test-util の `pause`/`advance`）・`process` は未対応。
+//! - `process`・ランタイムのメトリクス・タスクダンプは未対応。
 //!
 //! 設計: docs/backlog/features/F-198-tokio-free-compat-layer.md。互換表: docs/guide/library.md。
 

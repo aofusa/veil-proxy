@@ -22,6 +22,7 @@ Three front ends share the same implementation:
 - [Validation and OpenAPI](#validation-and-openapi)
 - [Shared state](#shared-state)
 - [tower layers and tokio libraries](#tower-layers-and-tokio-libraries)
+- [tokio compatibility](#tokio-compatibility)
 - [GraphQL](#graphql)
 - [L4 (TCP/UDP) handlers](#l4-tcpudp-handlers)
 - [TLS and HTTP/3](#tls-and-http3)
@@ -39,13 +40,13 @@ Three front ends share the same implementation:
   and other route types you write in `config.toml`.
 - **Handlers run on veil's own runtime.** Each `async fn` handler is polled on the worker thread that accepted
   the connection, on the same io_uring (or epoll/kqueue) event loop that serves the connection. The data
-  plane has no tokio or monoio. If you need a tokio-based library (sqlx, reqwest, ...), use the bridge in
-  [tower layers and tokio libraries](#tower-layers-and-tokio-libraries), which keeps tokio out of the data plane.
+  plane has no tokio or monoio. tokio-based libraries (hyper, reqwest, sqlx, ...) run on the same workers through
+  veil's tokio-free tokio compatibility layer ([tokio compatibility](#tokio-compatibility)).
 - Blocking work must not run on a worker. A **synchronous** `fn` handler (Rust), a C callback and a Python
   handler are executed on a separate handler thread pool (`[api] handler_threads`) through veil's `offload`,
   so a slow database call does not stall other connections.
-- **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-interface`,
-  `graphql`, `l4-handler` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
+- **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-compat`,
+  `tokio-compat-bridge`, `graphql`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
   produces exactly the same proxy as before.
 - Everything that works for the proxy still works: the `[server]`, `[tls]`, `[security]`, `[logging]`,
   `[prometheus]`, ... sections, SIGHUP reload, graceful shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
@@ -59,11 +60,16 @@ Three front ends share the same implementation:
 | `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (implies `http2`) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` (implies `handler`) |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
-| `tokio-interface` | tower `Layer`/`Service` compatibility and the tokio bridge ([`veil::api::tower`], [`veil::api::tokio_compat`]) |
+| `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
+| `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
 | `graphql` | `App::graphql()` for `async-graphql` schemas |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
 | `grpc-handler` | gRPC server on prost messages ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
-| `api` | all of the above (`handler`, `macro`, `openapi`, `tokio-interface`, `graphql`, `l4-handler`, `grpc-handler`) |
+| `api-core` | `handler`, `macro`, `openapi`, `graphql`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
+| `api` | `api-core` + `tokio-compat` (the default way to use the library) |
+
+To use the tokio bridge instead, select `features = ["full", "api-core", "tokio-compat-bridge"]`. Enabling both
+`tokio-compat` and `tokio-compat-bridge` is a compile error.
 
 `vds` and `acme` are separate, are part of `full*`, and work in the proxy binary and the library alike
 (see [VDS](vds.md) and [ACME](acme.md)).
@@ -208,7 +214,7 @@ for debugging.
 | `openapi_description` | none | `info.description` |
 | `max_body_size` | `10485760` | maximum request body handed to a handler, in bytes |
 | `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
-| `tokio_threads` | `2` | worker threads of the tokio compatibility runtime |
+| `tokio_threads` | `2` | worker threads of the bundled tokio runtime (`tokio-compat-bridge` only) |
 | `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
 
 ## Routing macros
@@ -384,26 +390,26 @@ App::new().state(Db::connect()?).run()?;
 
 ## tower layers and tokio libraries
 
-Requires `tokio-interface`. Requests and responses are exchanged as `http::Request<Full<Bytes>>` /
-`http::Response`.
+Requests and responses are exchanged as `http::Request<Full<Bytes>>` / `http::Response`.
 
 ```rust
 App::new()
-    // a tower Layer around every route; runs on veil's worker (do not use tokio timers/IO inside)
+    // a tower Layer around every route; runs on veil's worker
     .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(name, value))
     // only routes under /admin (segment-boundary prefix)
     .layer_on("/admin", RequireToken)
-    // mount an existing tower Service (e.g. an axum Router) and run it on the tokio runtime
+    // mount an existing tower Service (e.g. an axum Router)
     .tokio_service(&["GET", "POST"], "/legacy/{*rest}", axum_router)
     .run()?;
 ```
 
-- `layer` / `layer_on` wrap handlers inside veil's event loop. Use them for layers that do not need a tokio
-  reactor (authentication, headers, CORS, ...). Layers that use tokio timers (for example tower's `Timeout`)
-  need the tokio runtime and must not be used here.
-- `tokio_service` runs the service on the tokio compatibility runtime and hands the result back to the worker
-  through the same result-slot-plus-notification-fd mechanism as `offload` (no cross-thread `Waker`).
-- Inside any handler, call tokio-based libraries through `veil::api::tokio_compat::run`:
+- `layer` / `layer_on` (`api-core`) wrap handlers inside veil's event loop.
+- `tokio_service` (`tokio-compat` or `tokio-compat-bridge`) mounts a tower service. With `tokio-compat` it runs on
+  the worker that accepted the request, like any handler; with `tokio-compat-bridge` it runs on the bundled tokio
+  runtime and the result comes back through the same result-slot-plus-notification-fd mechanism as `offload`.
+- Inside any handler, `veil::api::tokio_compat::run(fut)` runs a tokio-based future. With `tokio-compat` this is the
+  same as `fut.await` (kept so the code does not change between the two features); with `tokio-compat-bridge` the
+  future runs on the bundled runtime (`[api] tokio_threads` workers, default 2, started lazily).
 
   ```rust
   let body = veil::api::tokio_compat::run(async move {
@@ -412,8 +418,59 @@ App::new()
   ```
 
   `run` panics (→ 500) if the task panicked; `try_run` returns `Result`; `spawn` starts a detached task and
-  `handle()` returns the `tokio::runtime::Handle`. The runtime starts lazily with `[api] tokio_threads` workers
-  (default 2). The data plane (accept, TLS, HTTP, handler polling) never runs on tokio.
+  `handle()` returns the runtime handle.
+
+## tokio compatibility
+
+`tokio-compat` (part of `api`) implements tokio's public API on top of veil's own runtime **without depending on
+tokio**. tokio-based crates (hyper, reqwest, sqlx, tower-http, ...) then run directly on veil's io_uring (or
+epoll/kqueue) workers. Nothing changes in the data plane or in veil's runtime: the layer only uses the existing
+runtime API, and it is not compiled into the proxy binary.
+
+### Using it
+
+Replace the `tokio` crate of the whole dependency tree with veil's shim (package name `tokio`, version 1.99.0,
+which re-exports `veil::tokio`):
+
+```toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+tokio = { version = "1", features = ["full"] }        # resolved to the shim
+reqwest = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+```
+
+Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.
+`#[tokio::main]` / `#[tokio::test]` start a veil runtime (current-thread or multi-thread flavor).
+
+### How it differs from tokio
+
+- **No work stealing.** A task runs on the thread that spawned it; `spawn` from a non-runtime thread through a
+  `Handle` is forwarded to the runtime's thread. I/O objects are bound to the thread that created them.
+- **Cross-thread wake-ups** (a `Sender` on another thread, `spawn_blocking`, a `Waker` sent elsewhere) are delivered
+  to the owning thread through a notification fd; veil's own wakers are never called from another thread.
+- `spawn_blocking`, `block_in_place` and `fs` run on veil's handler thread pool (`[api] handler_threads`).
+- Supported: `task` (spawn, `JoinHandle`, `JoinSet`, `LocalSet`, `task_local!`, `yield_now`, cooperative budget,
+  `unconstrained`), `time` (incl. `pause`/`advance`/`start_paused`), `io` (traits, utilities, `split`, `duplex`,
+  `copy_bidirectional`, buffered I/O), `net` (TCP, UDP, Unix stream/datagram/listener, `AsyncFd`, `lookup_host`),
+  `sync` (mpsc, oneshot, watch, broadcast, `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`,
+  `SetOnce`), `signal`, `fs`, `select!`/`join!`/`try_join!`/`pin!`, `runtime::{Runtime, Builder, Handle}`.
+- Not supported: `process`, runtime metrics, task dumps/tracing hooks, io_uring-backed `fs`, Windows named pipes.
+  Crates that need these (or tokio's internals) should use `tokio-compat-bridge`.
+
+### Compatibility
+
+Measured by running tokio's own test suite (tokio 1.53.2, `tokio/tests/*.rs`) against the shim with
+`tools/tokio-compat/run_tokio_tests.py`. Tests that check runtime internals (`rt_*`, metrics, tracing, work
+stealing, io_uring fs) are excluded; the script lists them.
+
+TABLE_EN
+
+Real libraries checked by `tools/tokio-compat/ecosystem` (io_uring and epoll): hyper server (HTTP/1.1 + h2c) and
+client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, sqlx with SQLite and PostgreSQL.
 
 ## GraphQL
 

@@ -142,7 +142,7 @@ quiche = {{ path = "{ROOT}/third_party/quiche" }}
 
 
 def build(crate):
-    env = dict(os.environ, CARGO_TARGET_DIR=str(WORK / "target"))
+    env = dict(os.environ, CARGO_TARGET_DIR=str(WORK / "target"), CARGO_INCREMENTAL="0")
     p = subprocess.run(
         ["cargo", "build", "--tests", "--keep-going", "--message-format=json"],
         cwd=crate, env=env, capture_output=True, text=True,

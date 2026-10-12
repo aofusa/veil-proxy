@@ -437,6 +437,20 @@ impl std::ops::BitOr for Ready {
     }
 }
 
+impl std::ops::Sub for Ready {
+    type Output = Ready;
+    fn sub(self, o: Ready) -> Ready {
+        Ready(self.0 & !o.0)
+    }
+}
+
+impl std::ops::BitAnd for Ready {
+    type Output = Ready;
+    fn bitand(self, o: Ready) -> Ready {
+        Ready(self.0 & o.0)
+    }
+}
+
 impl std::ops::BitOrAssign for Ready {
     fn bitor_assign(&mut self, o: Ready) {
         self.0 |= o.0;

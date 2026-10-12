@@ -163,6 +163,14 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no inventory/async-graphql/tokio/pyo3 in the full binary" || bad "library dependencies linked ($n)"
   n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -ciE "veil_build|prost_build|tonic") || true
   [ "$n" = 0 ] && ok "no veil-build/prost-build/tonic in the full binary" || bad "gRPC library code linked ($n)"
+  n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -cE "veil::tokio::") || true
+  [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
+  # F-198: api の既定（tokio-compat）は tokio に依存しない
+  local t; t=$(cd "$ROOT" && cargo tree -q -e normal,build --no-default-features --features full,api -i tokio 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no tokio in the dependency tree of features=api" ;;
+    *) bad "tokio is a dependency of features=api: $t" ;;
+  esac
 }
 
 case "$WHAT" in
