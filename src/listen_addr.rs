@@ -1,11 +1,11 @@
 //! リッスンアドレス表現（F-164: Unix ドメインソケット（UDS）リスナー対応）。
 //!
-//! `[server].listen` / `[server].h2c_listen` は従来 `host:port` の TCP アドレスのみを
+//! `[server].listen` / `[server].listen_cleartext` は従来 `host:port` の TCP アドレスのみを
 //! 受理していたが、`unix:<path>` 形式で AF_UNIX ソケットパスも指定できるようにする。
 //! 対応プラットフォームは `cfg(unix)` のみ（Windows では設定エラーとして起動を拒否する）。
 //!
-//! 対象は `[server].listen` / `[server].h2c_listen` のみ（`[[l4]].listen` ・
-//! 上流バックエンドへの UDS 接続・`[server].http` ・ `[http3].listen` は対象外）。
+//! 対象は `[server].listen` / `[server].listen_cleartext` のみ（`[[l4]].listen` ・
+//! 上流バックエンドへの UDS 接続・`[http3].listen` は対象外）。
 
 use std::fmt;
 use std::net::SocketAddr;

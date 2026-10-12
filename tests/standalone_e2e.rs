@@ -6,7 +6,8 @@
 //!
 //! - F-179: 環境変数 `VEIL_OVERRIDE_<n>` による設定上書き（SIGHUP 後も保たれる）
 //! - F-180: 証明書の Kubernetes Secret 形式（`..data` シンボリックリンク差し替え）への追従
-//! - F-188: TLS 無しの平文専用サーバ（`[server].h2c_http1`）
+//! - F-188 / F-200: TLS 無しの平文専用サーバ（`[server].listen_cleartext`）、`allow_http` / `allow_h2c` /
+//!   `enable_secure_redirect`、削除されたキーのエラー、HTTP/3 の検証規則
 // 理由付き allow: テストハーネスは同期 I/O・sleep・std::net を意図的に使う（データプレーンとは別プロセス）。
 #![allow(clippy::disallowed_methods)]
 
@@ -21,25 +22,18 @@ use std::time::Duration;
 #[test]
 fn f179_env_override_listen_and_survives_sighup() {
     let dir = tempfile::tempdir().unwrap();
-    let (cert, key) = write_self_signed(dir.path());
     let www = dir.path().join("www");
     std::fs::create_dir_all(&www).unwrap();
     std::fs::write(www.join("index.html"), "v1").unwrap();
 
     let file_port = free_port();
     let env_port = free_port();
-    let h2c_port = free_port();
     let config = format!(
         r#"
 [server]
-listen = "127.0.0.1:{file_port}"
+listen_cleartext = "127.0.0.1:{file_port}"
+enable_secure_redirect = false
 threads = 1
-tls_only = false
-h2c_enabled = true
-h2c_listen = "127.0.0.1:{h2c_port}"
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
 [logging]
 level = "warn"
 [[route]]
@@ -49,8 +43,6 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
-        cert = cert.display(),
-        key = key.display(),
         www = www.display(),
     );
     let cfg_path = dir.path().join("config.toml");
@@ -60,7 +52,7 @@ path = "{www}"
         &cfg_path,
         &[(
             "VEIL_OVERRIDE_1",
-            format!(r#"server.listen = "127.0.0.1:{env_port}""#).as_str(),
+            format!(r#"server.listen_cleartext = "127.0.0.1:{env_port}""#).as_str(),
         )],
         &[],
     );
@@ -100,25 +92,18 @@ path = "{www}"
 #[test]
 fn f179_env_override_array_index_and_cli_priority() {
     let dir = tempfile::tempdir().unwrap();
-    let (cert, key) = write_self_signed(dir.path());
     for (name, body) in [("a", "A"), ("b", "B"), ("c", "C")] {
         let d = dir.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("index.html"), body).unwrap();
     }
     let port = free_port();
-    let h2c_port = free_port();
     let config = format!(
         r#"
 [server]
-listen = "127.0.0.1:{port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
 threads = 1
-tls_only = false
-h2c_enabled = true
-h2c_listen = "127.0.0.1:{h2c_port}"
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
 [logging]
 level = "warn"
 [[route]]
@@ -128,8 +113,6 @@ path = "/"
 type = "File"
 path = "{a}"
 "#,
-        cert = cert.display(),
-        key = key.display(),
         a = dir.path().join("a").display(),
     );
     let cfg_path = dir.path().join("config.toml");
@@ -278,22 +261,21 @@ fn pem_to_der(pem: &str) -> Vec<u8> {
 
 // ===================== F-188（本体側の小改修） =====================
 
-/// `[tls]` を省略した平文専用サーバ（H2C 専用構成 + `h2c_http1 = true`）で、同じポートに
-/// 平文 HTTP/1.1 と h2c（prior knowledge）の両方が来ても処理できる。
-#[test]
-fn f188_plaintext_only_server_without_tls_serves_http1_and_h2c() {
-    let dir = tempfile::tempdir().unwrap();
-    let www = dir.path().join("www");
+/// 平文専用サーバの設定（`listen_cleartext` のみ・`[tls]` 無し）を書き出して起動する。
+fn spawn_cleartext(
+    dir: &std::path::Path,
+    port: u16,
+    server_extra: &str,
+) -> VeilProcess {
+    let www = dir.join("www");
     std::fs::create_dir_all(&www).unwrap();
     std::fs::write(www.join("index.html"), "plain").unwrap();
-    let port = free_port();
     let config = format!(
         r#"
 [server]
-listen = "127.0.0.1:{port}"
+listen_cleartext = "127.0.0.1:{port}"
 threads = 1
-h2c_enabled = true
-h2c_http1 = true
+{server_extra}
 [logging]
 level = "warn"
 [[route]]
@@ -305,7 +287,7 @@ path = "{www}"
 "#,
         www = www.display()
     );
-    let cfg_path = dir.path().join("config.toml");
+    let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
     assert!(
@@ -313,6 +295,16 @@ path = "{www}"
         "{}",
         veil.log()
     );
+    veil
+}
+
+/// `[tls]` を省略した平文専用サーバ（`listen_cleartext` のみ）で、同じポートに
+/// 平文 HTTP/1.1 と h2c（prior knowledge）の両方が来ても処理できる。
+#[test]
+fn f188_plaintext_only_server_without_tls_serves_http1_and_h2c() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let veil = spawn_cleartext(dir.path(), port, "enable_secure_redirect = false");
 
     let resp = http1_get(port, "/index.html").expect("plain HTTP/1.1");
     assert_eq!(resp.status, 200, "{}", veil.log());
@@ -327,20 +319,61 @@ path = "{www}"
     assert_eq!(body, b"plain");
 }
 
-/// `h2c_http1` を付けない H2C 専用構成は従来どおり HTTP/1.1 を受けない（既定の挙動は不変）。
+/// F-200: `allow_http = false` は平文 HTTP/1.1 を 426 で拒否し、h2c は受ける。
 #[test]
-fn f188_h2c_only_without_h2c_http1_still_rejects_http1() {
+fn f200_allow_http_false_rejects_http1_with_426_but_serves_h2c() {
     let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let veil = spawn_cleartext(
+        dir.path(),
+        port,
+        "enable_secure_redirect = false\nallow_http = false",
+    );
+    let resp = http1_get(port, "/index.html").expect("HTTP/1.1 is answered with 426");
+    assert_eq!(resp.status, 426, "{}", veil.log());
+    let (status, body) = h2c_get(port, "/index.html");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"plain");
+}
+
+/// F-200: `allow_h2c = false` は h2c を拒否し、平文 HTTP/1.1 は受ける。
+#[test]
+fn f200_allow_h2c_false_rejects_h2c_but_serves_http1() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let veil = spawn_cleartext(
+        dir.path(),
+        port,
+        "enable_secure_redirect = false\nallow_h2c = false",
+    );
+    let resp = http1_get(port, "/index.html").expect("plain HTTP/1.1");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "plain");
+    let rejected = std::panic::catch_unwind(|| h2c_get(port, "/index.html"));
+    assert!(rejected.is_err(), "h2c must be rejected when allow_h2c = false");
+}
+
+/// F-200: `enable_secure_redirect = true`（要 `listen`）なら平文の HTTP/1.1・h2c とも
+/// `https://<Host>:<listen のポート>` へ 301 を返す。
+#[test]
+fn f200_secure_redirect_answers_301_for_http1_and_h2c() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
     let www = dir.path().join("www");
     std::fs::create_dir_all(&www).unwrap();
-    std::fs::write(www.join("index.html"), "x").unwrap();
+    std::fs::write(www.join("index.html"), "plain").unwrap();
+    let tls_port = free_port();
     let port = free_port();
     let config = format!(
         r#"
 [server]
-listen = "127.0.0.1:{port}"
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
 threads = 1
-h2c_enabled = true
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
 [logging]
 level = "warn"
 [[route]]
@@ -350,55 +383,148 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
+        cert = cert.display(),
+        key = key.display(),
         www = www.display()
     );
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(
-        wait_for_port(port, Duration::from_secs(20)),
-        "{}",
-        veil.log()
-    );
-    assert!(
-        http1_get(port, "/index.html").is_err(),
-        "HTTP/1.1 must be rejected without h2c_http1"
-    );
-    let (status, _) = h2c_get(port, "/index.html");
-    assert_eq!(status, 200);
+    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
+    assert!(wait_for_port(tls_port, Duration::from_secs(20)), "{}", veil.log());
+
+    let want = format!("https://localhost:{tls_port}/index.html");
+    let resp = http1_get(port, "/index.html").expect("HTTP/1.1");
+    assert_eq!(resp.status, 301, "{}", veil.log());
+    assert_eq!(resp.header("location"), Some(want.as_str()));
+
+    let (status, headers, _) = h2c_get_with_headers(port, "/index.html");
+    assert_eq!(status, 301, "{}", veil.log());
+    let location = headers
+        .iter()
+        .find(|(n, _)| n == "location")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(location, Some(want.as_str()));
 }
 
-/// `[tls]` を省略できるのは平文専用サーバ構成だけ（TLS リスナーを使う構成は -t で失敗）。
+/// F-200: 削除されたキーは移行先を示すエラーで起動しない（`-t`）。
+#[test]
+fn f200_removed_keys_are_rejected_with_migration_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    for (line, hint) in [
+        ("http = \"127.0.0.1:18080\"", "listen_cleartext"),
+        ("tls_only = false", "listen_cleartext"),
+        ("h2c_enabled = true", "listen_cleartext"),
+        ("h2c_listen = \"127.0.0.1:18081\"", "listen_cleartext"),
+        ("h2c_http1 = true", "listen_cleartext"),
+        ("http3_enabled = true", "[http3]"),
+    ] {
+        std::fs::write(
+            &cfg_path,
+            format!("[server]\nlisten_cleartext = \"127.0.0.1:18080\"\nenable_secure_redirect = false\n{line}\n"),
+        )
+        .unwrap();
+        let out = std::process::Command::new(veil_bin())
+            .arg("-t")
+            .arg("-c")
+            .arg(&cfg_path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{line} must be rejected");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(all.contains(hint), "{line}: no migration hint in: {all}");
+    }
+}
+
+/// F-200: `[tls]` が要るのは `listen`（TLS）か HTTP/3 があるときだけ。
+/// 平文だけなら省略でき、`listen` があって無ければ -t で失敗する。
 #[test]
 fn f188_missing_tls_is_rejected_unless_plaintext_only() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.toml");
-    std::fs::write(&cfg_path, "[server]\nlisten = \"127.0.0.1:18443\"\n").unwrap();
-    let out = std::process::Command::new(veil_bin())
-        .arg("-t")
-        .arg("-c")
-        .arg(&cfg_path)
-        .output()
-        .unwrap();
+    let check = |cfg: &str| {
+        std::fs::write(&cfg_path, cfg).unwrap();
+        std::process::Command::new(veil_bin())
+            .arg("-t")
+            .arg("-c")
+            .arg(&cfg_path)
+            .output()
+            .unwrap()
+    };
+    let out = check("[server]\nlisten = \"127.0.0.1:18443\"\n");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("TLS certificate is required"), "{}", stderr);
 
-    std::fs::write(
-        &cfg_path,
-        "[server]\nlisten = \"127.0.0.1:18443\"\nh2c_enabled = true\nh2c_http1 = true\n",
-    )
-    .unwrap();
-    let out = std::process::Command::new(veil_bin())
-        .arg("-t")
-        .arg("-c")
-        .arg(&cfg_path)
-        .output()
-        .unwrap();
+    let out = check(
+        "[server]\nlisten_cleartext = \"127.0.0.1:18443\"\nenable_secure_redirect = false\n",
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// F-200: 規則違反（リスナー無し・同一アドレス・リダイレクト先無し・HTTP/3 に listen 無し・両方拒否）。
+#[test]
+fn f200_listener_rules_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let cfg_path = dir.path().join("config.toml");
+    let tls = format!(
+        "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
+        cert.display(),
+        key.display()
+    );
+    let run = |cfg: String| {
+        std::fs::write(&cfg_path, cfg).unwrap();
+        std::process::Command::new(veil_bin())
+            .arg("-t")
+            .arg("-c")
+            .arg(&cfg_path)
+            .output()
+            .unwrap()
+    };
+    // リスナー無し
+    assert!(!run(format!("[server]\nthreads = 1\n{tls}")).status.success());
+    // listen と listen_cleartext が同じ
+    assert!(!run(format!(
+        "[server]\nlisten = \"127.0.0.1:18443\"\nlisten_cleartext = \"127.0.0.1:18443\"\nenable_secure_redirect = false\n{tls}"
+    ))
+    .status
+    .success());
+    // enable_secure_redirect（既定 true）なのに listen が無い
+    assert!(!run(format!(
+        "[server]\nlisten_cleartext = \"127.0.0.1:18080\"\n{tls}"
+    ))
+    .status
+    .success());
+    // allow_http / allow_h2c が両方 false
+    assert!(!run(format!(
+        "[server]\nlisten_cleartext = \"127.0.0.1:18080\"\nenable_secure_redirect = false\nallow_http = false\nallow_h2c = false\n{tls}"
+    ))
+    .status
+    .success());
+    // HTTP/3 は listen が要る
+    assert!(!run(format!(
+        "[server]\nlisten_cleartext = \"127.0.0.1:18080\"\nenable_secure_redirect = false\n[http3]\nenabled = true\n{tls}"
+    ))
+    .status
+    .success());
+    // listen + listen_cleartext + HTTP/3（listen の既定アドレス）は通る
+    let ok = run(format!(
+        "[server]\nlisten = \"127.0.0.1:18443\"\nlisten_cleartext = \"127.0.0.1:18080\"\n[http3]\nenabled = true\n{tls}"
+    ));
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
     );
 }
 
@@ -454,10 +580,9 @@ fn f04_vds_delivers_routes_and_keeps_previous_on_nack() {
     let config = format!(
         r#"
 [server]
-listen = "127.0.0.1:{port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
 threads = 1
-h2c_enabled = true
-h2c_http1 = true
 [logging]
 level = "info"
 [vds]

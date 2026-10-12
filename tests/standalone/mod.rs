@@ -331,6 +331,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 /// h2c（prior knowledge）で GET し、(status, body) を返す（h2 クレート + tokio のテスト専用クライアント）。
 pub fn h2c_get(port: u16, path: &str) -> (u16, Vec<u8>) {
+    let (status, _, body) = h2c_get_with_headers(port, path);
+    (status, body)
+}
+
+/// `h2c_get` の応答ヘッダ付き版。(status, ヘッダ（名前は小文字）, body)。
+pub fn h2c_get_with_headers(port: u16, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -351,6 +357,16 @@ pub fn h2c_get(port: u16, path: &str) -> (u16, Vec<u8>) {
         let (resp, _) = client.send_request(req, true).expect("send");
         let resp = resp.await.expect("response");
         let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
         let mut body = resp.into_body();
         let mut out = Vec::new();
         while let Some(chunk) = body.data().await {
@@ -358,6 +374,6 @@ pub fn h2c_get(port: u16, path: &str) -> (u16, Vec<u8>) {
             let _ = body.flow_control().release_capacity(chunk.len());
             out.extend_from_slice(&chunk);
         }
-        (status, out)
+        (status, headers, out)
     })
 }
