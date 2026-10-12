@@ -18,6 +18,9 @@ User guides split out of the top-level README. Each page keeps the original sect
 | HTTP/2, HTTP/3 & WebSocket | [protocols.md](protocols.md) |
 | Compression, cache & buffering | [compression-cache.md](compression-cache.md) |
 | WASM extensions | [wasm.md](wasm.md) |
+| API server library (Rust, C, Python) | [library.md](library.md) |
+| VDS: dynamic routes from a control plane | [vds.md](vds.md) ([schema](vds-schema.json)) |
+| ACME: automatic certificates | [acme.md](acme.md) |
 | Metrics, tracing & logging | [observability.md](observability.md) |
 | Admin & cache purge APIs | [admin-api.md](admin-api.md) |
 | Security & sandboxing | [security.md](security.md) |

@@ -68,6 +68,9 @@
 - **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ、アクティブ接続数、アップストリーム健康状態、サーキットブレーカー状態、コネクションプール統計、gRPC/WASM実行時間等を出力（要設定、デフォルト無効）。再起動なしでランタイム有効/無効切り替え対応
 - **OpenTelemetry（OTLP/HTTP）**: Prometheusメトリクスを任意のOTLPコレクタ（Grafana Tempo, Jaeger等）へプッシュ配信。専用 std スレッドで完全tokio-free（`opentelemetry` feature が必要）
 
+- **VDS（Veil Discovery Service）**: 制御プレーンが xDS 方式の長輪詢・バージョン・ACK/NACK でルートとアップストリームを配信。通常のホットリロード経路で適用（`vds` feature が必要で `full*` に含まれる。[VDS](vds.md) を参照）
+- **ACME**: HTTP-01 による TLS 証明書の自動発行・更新（Let's Encrypt など）。初回起動は仮の自己署名証明書で、発行後は無停止でホットリロード（`acme` feature が必要で `full*` に含まれる。[ACME](acme.md) を参照）
+
 ### セキュリティ
 - **HTTP to HTTPSリダイレクト**: HTTPアクセスを自動的にHTTPSへ301リダイレクト
 - **同時接続数制限**: グローバルな接続数上限設定
@@ -78,3 +81,20 @@
 - **io_uringオペコード制限**: リング作成時に `IORING_REGISTER_RESTRICTIONS` を適用し、必要なオペコード（ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD）のみ許可
 - **Landlockサンドボックス**: ファイルシステムアクセス制限（Linux 5.13+）
 - **systemdサンドボックス**: 名前空間隔離・システムコール制限対応
+
+### API サーバライブラリ
+
+veil はライブラリとして組み込み、Rust・C・Python で API サーバを書けます（[API サーバライブラリ](library.md)を参照）。
+これらの feature は `default` にも `full*` にも含まれないため、プロキシ本体のバイナリにライブラリのコードは入りません。
+
+| feature | 説明 |
+|---------|------|
+| `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`0.0.0.0:8080` で平文 HTTP/1.1 + h2c、TLS 不要） |
+| `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]` |
+| `openapi` | OpenAPI 3.1 の生成、`/openapi.json`、Swagger UI、FastAPI 形式の 422 検証 |
+| `tokio-interface` | tower の `Layer`/`Service` 互換と tokio 前提ライブラリへの橋渡し（データプレーンは tokio 非依存のまま） |
+| `graphql` | `async-graphql` のエンドポイント（`App::graphql`） |
+| `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理 |
+| `api` | 上記すべて |
+
+C（`crates/veil-capi`、`libveil.so`/`libveil.a`）と Python（`crates/veil-python`）のバインディングは、同じコードの上に作られた別クレートです。

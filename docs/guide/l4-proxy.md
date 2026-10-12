@@ -129,6 +129,7 @@ idle_timeout_secs = 30          # evict a client session after 30s of no traffic
 | `module_configuration` | Per-listener Proxy-Wasm plugin configuration override (module name → string or TOML table, F-148). Same merge rules as `[[route]]`; only names listed in `wasm_modules` are accepted. | (none) |
 | `upstreams[].addr` | Upstream address (`"host:port"`) | required |
 | `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |
+| `handler` | Name of a native Rust handler (requires the `l4-handler` feature; `upstreams` is then optional). See [Native Handlers](#native-handlers) | (none) |
 | `health_check` | Optional health check config (same as upstream health_check) | none |
 
 ### Notes
@@ -138,3 +139,28 @@ idle_timeout_secs = 30          # evict a client session after 30s of no traffic
 - TLS termination (`tls = "terminate"`) is reserved for future implementation; currently treated as passthrough.
 - `protocol = "udp"` does not support TLS/DTLS. A UDP listener with `tls` set to anything other than `none` logs a startup warning and is forced to `none`.
 - UDP health checks reuse the existing TCP-connect-based check; verifying actual UDP reachability is out of scope (protocol-dependent and not generally meaningful for connectionless traffic).
+
+### Native Handlers
+
+> **Requires**: the `l4-handler` feature (part of the [API server library](library.md); not in `full`)
+
+A `[[l4]]` listener with a `handler` key does not forward to upstreams. Each TCP connection (or UDP datagram) is passed to
+a Rust function registered with `#[veil::l4_handler(name = "...", protocol = "tcp" | "udp")]` or `App::l4_tcp` /
+`App::l4_udp`; `upstreams` is optional for such a listener.
+
+```toml
+[[l4]]
+name = "tcp_echo"
+listen = "0.0.0.0:9000"
+handler = "tcp_echo"        # the registered handler name
+
+[[l4]]
+name = "udp_echo"
+listen = "0.0.0.0:9001"
+protocol = "udp"
+handler = "udp_echo"
+```
+
+Listeners without `handler` keep the unchanged `splice(2)` / session-table paths. Handler I/O runs on the same io_uring /
+reactor event loop (`read`/`write` are `await`ed and bounded by `idle_timeout_secs`). Like all `[[l4]]` listeners they
+are not reloaded by SIGHUP. See [API server library](library.md#l4-tcpudp-handlers).

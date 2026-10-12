@@ -23,6 +23,10 @@ HTTP/1.1・HTTP/2（TLS / h2c）・HTTP/3（QUIC）・gRPC・WebSocket・生の 
   ヘルスチェック、サーキットブレーカー、リトライ、レスポンス圧縮、プロキシキャッシュ、
   バッファリング、ヘッダー書き換え。
 - **拡張性** — 全プロトコルで Proxy-Wasm フィルタ（Wasmtime）。
+- **動的設定** — [VDS](../guide/ja/vds.md) で制御プレーンからルート・アップストリームを配信（xDS 方式の長輪詢・ACK/NACK）、
+  組み込みの [ACME](../guide/ja/acme.md) で証明書を自動発行・更新（HTTP-01、Let's Encrypt）。
+- **組み込み可能** — veil を[ライブラリ](../guide/ja/library.md)として使い、同じ io_uring データプレーン上で Rust（マクロ・OpenAPI・tower・GraphQL・L4 ハンドラ）・
+  C（`libveil`）・Python（FastAPI 風）の API サーバを書けます。
 - **運用性** — 設定・証明書のホットリロード（`SIGHUP`）、Prometheus メトリクス、
   OpenTelemetry、構造化アクセスログ、管理 API。
 - **既定で安全** — メモリ安全な Rust、seccomp/Landlock（Linux）、capsicum（FreeBSD）、
@@ -94,6 +98,31 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
 
 全設定キーをコメント付きで網羅したリファレンスは [examples/config.toml](../../examples/config.toml) です。
 
+### ライブラリとして使う
+
+```toml
+# Cargo.toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+serde_json = "1"
+```
+
+```rust
+use veil::prelude::*;
+
+#[veil::route(path = "/hello/{name}", method = "GET")]
+async fn hello(name: String) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "hello": name }))
+}
+
+#[veil::main]
+async fn main() -> Result<(), veil::api::Error> {
+    veil::serve(Config::load()?).await   // 0.0.0.0:8080 で平文 HTTP/1.1 + h2c、OpenAPI は /docs
+}
+```
+
+詳しくは[ライブラリガイド](../guide/ja/library.md)（Rust・C API・Python・成果物のビルド）を参照してください。
+
 ## ドキュメント
 
 | トピック | ガイド |
@@ -110,6 +139,9 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
 | HTTP/2・HTTP/3・WebSocket | [docs/guide/ja/protocols.md](../guide/ja/protocols.md) |
 | 圧縮・キャッシュ・バッファリング | [docs/guide/ja/compression-cache.md](../guide/ja/compression-cache.md) |
 | WASM 拡張 | [docs/guide/ja/wasm.md](../guide/ja/wasm.md) |
+| API サーバライブラリ（Rust・C・Python） | [docs/guide/ja/library.md](../guide/ja/library.md) |
+| VDS: 制御プレーンからの動的ルート配信 | [docs/guide/ja/vds.md](../guide/ja/vds.md) |
+| ACME: 証明書の自動発行・更新 | [docs/guide/ja/acme.md](../guide/ja/acme.md) |
 | メトリクス・トレーシング・ログ | [docs/guide/ja/observability.md](../guide/ja/observability.md) |
 | 管理 API・キャッシュ Purge API | [docs/guide/ja/admin-api.md](../guide/ja/admin-api.md) |
 | セキュリティとサンドボックス | [docs/guide/ja/security.md](../guide/ja/security.md) |

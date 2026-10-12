@@ -18,6 +18,9 @@
 | HTTP/2・HTTP/3・WebSocket | [docs/guide/ja/protocols.md](protocols.md) |
 | 圧縮・キャッシュ・バッファリング | [docs/guide/ja/compression-cache.md](compression-cache.md) |
 | WASM 拡張 | [docs/guide/ja/wasm.md](wasm.md) |
+| API サーバライブラリ（Rust・C・Python） | [docs/guide/ja/library.md](library.md) |
+| VDS: 制御プレーンからの動的ルート配信 | [docs/guide/ja/vds.md](vds.md)（[スキーマ](../vds-schema.json)） |
+| ACME: 証明書の自動発行・更新 | [docs/guide/ja/acme.md](acme.md) |
 | メトリクス・トレーシング・ログ | [docs/guide/ja/observability.md](observability.md) |
 | 管理 API・キャッシュ Purge API | [docs/guide/ja/admin-api.md](admin-api.md) |
 | セキュリティとサンドボックス | [docs/guide/ja/security.md](security.md) |
