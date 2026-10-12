@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+# ライブラリ成果物（C ライブラリ・Python wheel・Rust ソース）をビルドして 1 個の zip にする（F-195）。
+#
+#   docker build -f docker/Dockerfile.lib --target export --output type=local,dest=packaging/output/lib .
+#   （packaging/scripts/build-lib.sh --docker が実行する）
+#
+# manylinux_2_28（AlmaLinux 8、glibc 2.28）でビルドするので、wheel と libveil.so は glibc 2.28 以上の
+# Linux（RHEL 8+・Debian 10+・Ubuntu 20.04+）で動く。
+ARG MANYLINUX=quay.io/pypa/manylinux_2_28_x86_64
+
+FROM ${MANYLINUX} AS builder
+ARG LIB_KINDS=rust,c,python
+ARG CARGO_PROFILE=dist
+# aws-lc-sys のビルドに cmake・clang（bindgen）、成果物の zip に zip が要る
+RUN dnf install -y -q clang cmake perl zip && dnf clean all \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:/opt/python/cp312-cp312/bin:$PATH
+WORKDIR /app
+COPY . /app
+RUN set -eux; \
+    if echo ",${LIB_KINDS}," | grep -q ",c,"; then \
+      cargo build --locked --profile "${CARGO_PROFILE}" -p veil-capi; \
+    fi; \
+    mkdir -p /wheels; \
+    if echo ",${LIB_KINDS}," | grep -q ",python,"; then \
+      pip install -q maturin; \
+      cd crates/veil-python && maturin build --locked --profile "${CARGO_PROFILE}" \
+        --compatibility manylinux_2_28 --interpreter python3.12 --out /wheels; cd /app; \
+    fi; \
+    mkdir -p /out; \
+    bash packaging/scripts/assemble-lib-zip.sh /app /out "${LIB_KINDS}" /app/target "${CARGO_PROFILE}" /wheels
+
+FROM scratch AS export
+COPY --from=builder /out/ /

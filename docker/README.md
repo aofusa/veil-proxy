@@ -201,3 +201,12 @@ docker kill --signal=SIGHUP veil-container
 # 設定変更後など以下でログを確認
 docker logs --tail -f veil-container
 ```
+
+### 設定の上書きと証明書の受け渡し（F-179 / F-180）
+
+- 設定値は環境変数 `VEIL_OVERRIDE_<n>`（`--override` と同じ書式、`<n>` の昇順に適用）で上書きできる。
+  優先順位は config.toml < 環境変数 < コマンドラインの `-o`。
+  例: `docker run -e VEIL_OVERRIDE_1='server.threads = 2' -e VEIL_OVERRIDE_2='logging.level = "warn"' veil:musl`
+- 証明書・秘密鍵は環境変数ではなくファイルとして渡す（Docker secrets の `/run/secrets/...`、Kubernetes Secret ボリューム）。
+  `[tls] auto_reload = true` で差し替えに追従する。サンプルと E2E は [`examples/container/`](../examples/container/)、
+  詳細は [docs/guide/tls.md](../docs/guide/tls.md#certificates-and-keys-in-containers)。

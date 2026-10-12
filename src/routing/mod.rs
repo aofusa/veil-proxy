@@ -275,6 +275,13 @@ impl PathRouter {
             return true;
         }
 
+        // F-188: `{param}` / `{*rest}` を含むパターン（API ライブラリのハンドラ）は
+        // セグメント単位で照合する（`handler` feature のビルドのみ）。
+        #[cfg(feature = "handler")]
+        if pattern.contains('{') {
+            return crate::api::pattern::route_pattern_matches(pattern, path.as_bytes());
+        }
+
         // Wildcard pattern: /api/*
         if let Some(prefix) = pattern.strip_suffix("/*") {
             return path.starts_with(prefix)

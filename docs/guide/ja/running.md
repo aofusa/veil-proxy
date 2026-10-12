@@ -68,6 +68,25 @@
 ./veil -o "server.threads = 4" -o "l4.0.listen = 0.0.0.0:9000"
 ```
 
+### 環境変数による設定の上書き（`VEIL_OVERRIDE_<n>`）
+
+同じ上書きを環境変数でも指定できます（コンテナや systemd 向け、F-179）。1 個の変数に 1 個の上書きを
+`--override` と同じ書式で入れ、名前は `VEIL_OVERRIDE_<n>`（`<n>` は 10 進の正整数）にします。
+
+```bash
+VEIL_OVERRIDE_1='server.listen = "0.0.0.0:8443"' \
+VEIL_OVERRIDE_2='route.0.action.path = "/srv/www"' \
+./veil -c /etc/veil/config.toml
+```
+
+| 規則 | 挙動 |
+|------|------|
+| 名前 | `VEIL_OVERRIDE_<n>`。`<n>` は 10 進の正整数（`VEIL_OVERRIDE_1`、`VEIL_OVERRIDE_20`）。それ以外（`VEIL_OVERRIDE_`・`VEIL_OVERRIDE_X`・`VEIL_OVERRIDE_0`）は起動エラー。 |
+| 適用順 | `<n>` の数値の昇順（`2` が `10` より先）。同じパスを複数回指定したら後勝ち。 |
+| 優先順位 | `config.toml` < 環境変数 < コマンドラインの `-o`/`--override`。 |
+| リロード | 環境変数はプロセス起動時の値で固定。SIGHUP で読み直すのは `config.toml` だけで、同じ環境変数の上書きを当て直す。 |
+| 機密値 | 秘密鍵やトークンをこの方法で渡さない（プロセスの環境変数は Linux の `/proc/<pid>/environ` や BSD の `ps -e` で見える）。ファイルとしてマウントする（[コンテナでの証明書・秘密鍵](tls.md#コンテナでの証明書秘密鍵)）。 |
+
 ### 設定ファイルの検証
 
 デプロイやリロード前に設定ファイルを検証できます：

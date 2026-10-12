@@ -17,12 +17,15 @@ The following table lists default values for major configuration options:
 | `[server]` | `server_header_value` | `"veil"` | Server header value |
 | `[server]` | `http2_enabled` | `false` | Enable HTTP/2 |
 | `[server]` | `http3_enabled` | `false` | Enable HTTP/3 |
+| `[server]` | `h2c_http1` | `false` | Also accept plaintext HTTP/1.1 on an h2c-only listener (see [Plaintext-only servers](#plaintext-only-servers-without-tls)) |
 | `[logging]` | `level` | `"info"` | Log level |
 | `[logging]` | `format` | `"text"` | Log format |
 | `[logging]` | `channel_size` | `16384` | Log channel buffer size (slots are preallocated and resident, ~88 bytes each; full → messages are dropped, never blocking) |
 | `[logging]` | `flush_interval_ms` | `1000` | Flush interval (ms) |
 | `[logging]` | `app_file_path` | none (stdout) | App log (INFO/WARN/DEBUG) output path |
 | `[logging]` | `error_file_path` | none (stderr) | Error log (ERROR) output path |
+| `[vds]` | `enabled` | `false` | Receive routes/upstreams from a control plane (see [VDS](vds.md)) |
+| `[acme]` | `enabled` | `false` | Automatic certificate issuance/renewal (see [ACME](acme.md)) |
 | `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT balancing |
@@ -390,3 +393,51 @@ server_header_value = "MyServer/1.0"
 - **Development/Testing**: Enable to identify which server is responding
 - **Production**: Disable to hide server information (security best practice)
 - **Custom Branding**: Set a custom value when Server header is required
+
+## Plaintext-only Servers without TLS
+
+`[tls]` may be **omitted** only when the server is plaintext-only: `[server] h2c_enabled = true` with no separate
+`h2c_listen` (or one equal to `listen`), `http3_enabled = false`, and the `http2` feature compiled in. In that case no
+TLS listener is started and `listen` serves h2c (HTTP/2 prior knowledge). Any other configuration without a usable
+`[tls] cert_path` / `key_path` fails validation with "TLS certificate is required".
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+h2c_enabled = true
+h2c_http1 = true      # also accept plaintext HTTP/1.1 on this port (default: false)
+tls_only = false
+```
+
+`[server] h2c_http1` (default `false`): by default an h2c-only listener (`h2c_listen`, or the main listener of an
+h2c-only server) closes connections that turn out to be HTTP/1.1. With `true`, the same port also serves plaintext
+HTTP/1.1 (h2c is recognized by its connection preface). Requires the `http2` feature (ignored with a warning without it).
+This is the default of the [API library](library.md#configuration-in-library-mode). Do not expose plaintext listeners to
+untrusted networks.
+
+## VDS (`[vds]`)
+
+Routes and upstreams delivered by a control plane. Keys: `enabled`, `server`, `node_id`, `cluster`, `token_file`,
+`ca_cert`, `client_cert`, `client_key`, `poll_timeout_secs`, `retry_initial_ms`, `retry_max_ms`,
+`max_response_bytes`, `max_resources`. Requires the `vds` feature (in `full`). Precedence:
+`config.toml` < VDS < `VEIL_OVERRIDE_<n>` < `--override`. See [VDS](vds.md).
+
+## ACME (`[acme]`)
+
+Automatic certificate issuance and renewal (HTTP-01). Keys: `enabled`, `directory_url`, `contact`, `domains`,
+`storage_dir`, `accept_terms_of_service`, `challenge_listen`, `renew_before_days`, `check_interval_secs`,
+`directory_ca_cert`, `order_timeout_secs`. Requires the `acme` feature (in `full`) and `[tls] cert_path`/`key_path`.
+See [ACME](acme.md).
+
+## Native handlers (`[[l4]] handler`, `[api]`, `type = "Handler"`)
+
+These belong to the [API server library](library.md) (features `handler`, `l4-handler`, `api`); the proxy binary does not
+include them.
+
+- `[[route]]` `action.type = "Handler"` with `handler = "<name>"` routes to a registered Rust/C/Python handler. Without
+  the `handler` feature this is a configuration error.
+- `[[l4]]` `handler = "<name>"` (feature `l4-handler`): handle the connection/datagram with a registered L4 handler
+  instead of forwarding; `upstreams` is then optional. See [L4 proxy](l4-proxy.md#native-handlers).
+- `[api]` (library only): `openapi_enabled`, `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`,
+  `openapi_description`, `max_body_size`, `handler_threads`, `tokio_threads`. See
+  [the library guide](library.md#api-keys-library-only).

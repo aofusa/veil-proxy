@@ -1,0 +1,7 @@
+# VDS で配信するルート（veil の [[route]] と同じ書式）。kubectl で書き換えると数十秒で配信される。
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:9000"

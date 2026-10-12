@@ -1,0 +1,27 @@
+[package]
+name = "veil-capi"
+version = "0.7.0"
+edition = "2021"
+description = "C API for the veil API server library (libveil.so / libveil.a + veil.h)"
+license = "Apache-2.0 OR MIT"
+authors = ["aofusa"]
+publish = false
+
+[lib]
+name = "veil"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+# 既定はコンテナ向けと同じ機能セット（epoll の readiness reactor）+ API 基盤。
+# ライブラリはホストプロセスのアロケータを置き換えない（veil-alloc / mimalloc を含めない）。
+default = ["reactor"]
+reactor = ["veil/epoll"]
+
+[dependencies]
+veil = { path = "../..", default-features = false, features = [
+    "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
+    "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
+    "handler", "openapi", "macro",
+] }
+bytes = "1"
+serde_json = "1"

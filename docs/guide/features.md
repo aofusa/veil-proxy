@@ -68,6 +68,9 @@
 - **Prometheus Metrics**: Export request counts, latency, active connections, upstream health, circuit breaker state, connection pool stats, gRPC/WASM durations, etc. via metrics endpoint (requires configuration, disabled by default); runtime enable/disable without restart
 - **OpenTelemetry (OTLP/HTTP)**: Push Prometheus metrics to any OTLP-compatible collector (Grafana Tempo, Jaeger, etc.) via a dedicated std thread — fully tokio-free (requires `opentelemetry` feature)
 
+- **VDS (Veil Discovery Service)**: a control plane pushes routes and upstreams with xDS-style long polling, versions and ACK/NACK; applied through the normal hot-reload path (requires `vds`, included in `full*`; see [VDS](vds.md))
+- **ACME**: automatic issuance and renewal of TLS certificates over HTTP-01 (Let's Encrypt etc.) with a temporary self-signed certificate at first start and zero-downtime hot reload (requires `acme`, included in `full*`; see [ACME](acme.md))
+
 ### Security
 - **HTTP to HTTPS Redirect**: Automatic 301 redirect from HTTP to HTTPS
 - **Connection Limit**: Global concurrent connection limit
@@ -78,3 +81,20 @@
 - **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support
+
+### API Server Library
+
+veil can be embedded as a library to write API servers in Rust, C or Python (see [API server library](library.md)). These
+features are in neither `default` nor `full*`, so the proxy binary contains no library code:
+
+| Feature | Description |
+|---------|-------------|
+| `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (plaintext HTTP/1.1 + h2c on `0.0.0.0:8080`, no TLS needed) |
+| `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` |
+| `openapi` | OpenAPI 3.1 generation, `/openapi.json`, Swagger UI, FastAPI-style 422 validation |
+| `tokio-interface` | tower `Layer`/`Service` compatibility and a bridge to tokio-based libraries (the data plane stays tokio-free) |
+| `graphql` | `async-graphql` endpoint (`App::graphql`) |
+| `l4-handler` | TCP/UDP handlers written as Rust functions on `[[l4]]` listeners |
+| `api` | all of the above |
+
+C (`crates/veil-capi`, `libveil.so`/`libveil.a`) and Python (`crates/veil-python`) bindings are separate crates built on the same code.

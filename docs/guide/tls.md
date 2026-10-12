@@ -167,7 +167,7 @@ Zero-downtime certificate rotation without restarting the proxy.
 
 ### How It Works
 
-- A background thread polls certificate file `mtime` every `reload_interval_secs` seconds.
+- A background thread polls the certificate and key files every `reload_interval_secs` seconds and reloads when their `mtime`, file identity (device + inode after following symlinks) or size **changes** — not only when they get newer. This also catches Kubernetes Secret updates, which swap a `..data` symlink to a new directory whose files may carry the same or an older `mtime` (F-180).
 - When a change is detected, the new certificate is loaded into an `ArcSwap`.
 - **Existing TLS connections** continue using the old certificate (no disruption).
 - **New TLS handshakes** automatically pick up the new certificate.
@@ -188,6 +188,9 @@ reload_interval_secs = 60  # Poll interval (default: 60s)
 
 ### Let's Encrypt Integration
 
+veil can issue and renew Let's Encrypt certificates by itself (ACME HTTP-01, `--features acme`, part of `full`).
+See [ACME](acme.md). The rest of this section describes the alternative of using an external client such as certbot.
+
 ```bash
 # Renew certificate (certbot)
 certbot renew --deploy-hook "touch /etc/veil/cert.pem"
@@ -195,3 +198,32 @@ certbot renew --deploy-hook "touch /etc/veil/cert.pem"
 ```
 
 > **Note**: If Landlock sandbox is enabled, the certificate directory must be included in `landlock_read_paths`.
+
+## Certificates and Keys in Containers
+
+Mount certificates and private keys as **files** at run time instead of baking them into the image
+or passing them through environment variables (F-180). The environment of a process is readable via
+`/proc/<pid>/environ` and is hard to wipe from memory; files can be permission-restricted and rotated.
+
+| Platform | How the files appear | Notes |
+|----------|---------------------|-------|
+| Docker secrets (`docker compose` / Swarm) | `/run/secrets/<name>` | See [`examples/container/compose.secrets.yaml`](../../examples/container/compose.secrets.yaml). The compose `file:` secret is a bind mount, so rotate it by overwriting the file in place. |
+| Kubernetes Secret volume | `<mountPath>/tls.crt`, `tls.key` (symlinks into `..data/`) | The kubelet updates the volume by atomically swapping the `..data` symlink to a new timestamped directory. veil follows the swap (file identity check). See [`deploy/kubernetes/`](../../deploy/kubernetes/). Do not use `subPath` mounts — they never receive updates. |
+
+```toml
+[tls]
+cert_path = "/run/secrets/tls_cert"      # or /etc/veil/tls/tls.crt on Kubernetes
+key_path  = "/run/secrets/tls_key"
+auto_reload = true
+reload_interval_secs = 10
+
+[security]
+# Allow the whole secret directory, not the individual files: on Kubernetes the new contents live in
+# a new directory under the mount point.
+landlock_read_paths = ["/run/secrets", "/etc/veil", "/var/www"]
+```
+
+Only the *location* of a certificate may be set through `VEIL_OVERRIDE_<n>` (for example
+`VEIL_OVERRIDE_1='tls.cert_path = "/etc/veil/tls/tls.crt"'`); never put PEM contents there.
+`examples/container/e2e.sh` checks the whole flow (TLS with secrets, environment overrides,
+certificate rotation, graceful stop) against a built image.

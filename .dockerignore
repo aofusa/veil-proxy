@@ -19,3 +19,17 @@
 # FreeBSD/OpenBSD aarch64 向け）。対象外プラットフォームのビルドでは本体をコンパイルしないが、
 # マニフェストと宣言ターゲットが無いと cargo がワークスペース解決に失敗するため丸ごと許可する。
 !third_party/
+
+# crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー（F-188）。本体のビルドでは
+# コンパイルしないが、ワークスペース解決にマニフェストとソースが要る。
+!crates/
+# ライブラリ成果物のビルド（docker/Dockerfile.lib）が使う。
+!examples/api/
+!docs/guide/
+!LICENSE-APACHE
+!LICENSE-MIT
+!README.md
+!packaging/scripts/
+!clippy.toml
+# Cargo.toml の [[bench]] の解決に要る（ライブラリ成果物のビルド・Rust ソースの tarball）
+!benches/

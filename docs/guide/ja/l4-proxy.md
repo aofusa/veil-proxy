@@ -115,6 +115,7 @@ idle_timeout_secs = 30          # 30秒無通信でクライアントセッシ�
 | `module_configuration` | リスナー単位の Proxy-Wasm プラグイン設定上書き（モジュール名 → 文字列 or TOML テーブル、F-148）。合成規則は `[[route]]` と同じで、`wasm_modules` に列挙した名前のみ指定可 | （なし） |
 | `upstreams[].addr` | upstreamアドレス（`"host:port"` 形式） | 必須 |
 | `upstreams[].weight` | 重み（weighted RR用、現在予約） | `1` |
+| `handler` | ネイティブ Rust ハンドラの名前（`l4-handler` feature が必要。指定すると `upstreams` は省略可）。[ネイティブハンドラ](#ネイティブハンドラ)を参照 | なし |
 | `health_check` | ヘルスチェック設定（upstreamのhealth_checkと同形式） | なし |
 
 ### 注意事項
@@ -124,3 +125,27 @@ idle_timeout_secs = 30          # 30秒無通信でクライアントセッシ�
 - TLSターミネーション（`tls = "terminate"`）は将来実装予定です。現時点ではパススルーとして動作します。
 - `protocol = "udp"` は TLS/DTLS 非対応です。`tls` に `none` 以外を指定した UDP リスナーは起動時に警告を出し、`none` として扱われます。
 - UDP のヘルスチェックは既存の TCP connect ベースのチェックを流用します。UDP の到達性そのものの確認（プロトコル依存で一般化困難）は scope 外です。
+
+### ネイティブハンドラ
+
+> **要件**: `l4-handler` feature（[API サーバライブラリ](library.md)の一部。`full` には含まれません）
+
+`handler` キーを持つ `[[l4]]` リスナーは上流へ転送しません。TCP 接続（または UDP データグラム）を、`#[veil::l4_handler(name = "...", protocol = "tcp" | "udp")]` や
+`App::l4_tcp` / `App::l4_udp` で登録した Rust 関数に渡します。このようなリスナーでは `upstreams` は省略できます。
+
+```toml
+[[l4]]
+name = "tcp_echo"
+listen = "0.0.0.0:9000"
+handler = "tcp_echo"        # 登録したハンドラ名
+
+[[l4]]
+name = "udp_echo"
+listen = "0.0.0.0:9001"
+protocol = "udp"
+handler = "udp_echo"
+```
+
+`handler` の無いリスナーは従来の `splice(2)`・セッションテーブルの経路のまま変わりません。ハンドラの I/O は同じ io_uring / リアクタのイベントループ上で動きます
+（`read`/`write` は `await` され、`idle_timeout_secs` で打ち切られます）。他の `[[l4]]` と同様、SIGHUP では再読み込みされません。
+詳しくは [API サーバライブラリ](library.md#l4tcpudpハンドラ)を参照してください。

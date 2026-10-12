@@ -2770,6 +2770,46 @@ impl H3BufferedTask {
                 .handle_redirect(&redirect_url, status_code, preserve_path, path, &prefix)
                 .await
                 .unwrap_or((500, 0)),
+            #[cfg(feature = "handler")]
+            Backend::Handler(entry, _, _) => {
+                // ネイティブハンドラ（API ライブラリ、F-188）
+                let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 1);
+                let mut has_host = false;
+                for h in headers.iter().filter(|h| !h.name().starts_with(b":")) {
+                    has_host |= h.name().eq_ignore_ascii_case(b"host");
+                    hdrs.push((
+                        Bytes::copy_from_slice(h.name()),
+                        Bytes::copy_from_slice(h.value()),
+                    ));
+                }
+                if !has_host && !authority.is_empty() {
+                    hdrs.push((
+                        Bytes::from_static(b"host"),
+                        Bytes::copy_from_slice(authority),
+                    ));
+                }
+                let req = crate::api::dispatch::build_request(
+                    Bytes::copy_from_slice(method),
+                    Bytes::copy_from_slice(path),
+                    hdrs,
+                    request_body.clone(),
+                    self.client_ip.as_str(),
+                    crate::api::request::HttpVersion::Http3,
+                );
+                let mut resp = crate::api::dispatch::call(&entry, req).await;
+                crate::api::dispatch::h2_h3_headers(&mut resp);
+                let status = resp.status_code();
+                let resp_headers: Vec<(&[u8], &[u8])> = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                    .collect();
+                let body = resp.body().clone();
+                let len = body.len();
+                self.send_response(status, &resp_headers, Some(body))
+                    .await?;
+                (status, len)
+            }
         };
 
         let user_agent_slice: &[u8] = if user_agent.is_empty() {

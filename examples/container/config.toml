@@ -1,0 +1,52 @@
+# Veil コンテナ用設定（Docker secrets / Kubernetes Secret で証明書・秘密鍵を受け取る例、F-180）
+#
+# 証明書と秘密鍵はイメージに焼き込まず、実行時にファイルとしてマウントする:
+#   - Docker secrets          : /run/secrets/<name>（compose.secrets.yaml 参照）
+#   - Kubernetes Secret volume: /etc/veil/tls/tls.crt, tls.key（deploy/kubernetes/ 参照）
+# 環境変数（VEIL_OVERRIDE_<n>）で渡してはならない（/proc/<pid>/environ で読めるため）。
+# 証明書のパスだけを環境変数で切り替えるのは問題ない（下の compose 例を参照）。
+
+[server]
+listen = "0.0.0.0:8443"
+http2_enabled = true
+threads = 0
+
+[logging]
+level = "info"
+
+[security]
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+seccomp_mode = "filter"
+# 証明書の置き場所（/run/secrets・/etc/veil/tls）を読めるようにする。
+# Kubernetes Secret の更新は ..data シンボリックリンクの付け替えで行われ、
+# 新しい中身はこのディレクトリ配下の別ディレクトリに置かれるため、ファイルではなく
+# ディレクトリ単位で許可する。
+landlock_read_paths = [
+  "/var/www",
+  "/etc/veil",
+  "/run/secrets",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/usr",
+]
+landlock_write_paths = []
+
+[tls]
+cert_path = "/run/secrets/tls_cert"
+key_path = "/run/secrets/tls_key"
+ktls_enabled = false
+# Secret の更新（ファイルの差し替え・シンボリックリンクの付け替え）を検知して無停止で差し替える。
+auto_reload = true
+reload_interval_secs = 10
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www"

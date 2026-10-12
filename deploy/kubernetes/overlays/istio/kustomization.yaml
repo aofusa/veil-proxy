@@ -1,0 +1,14 @@
+# Istio のサイドカー注入（istio-injection=enabled）+ 名前空間全体で mTLS を必須にする。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: veil-istio
+resources:
+  - namespace.yaml
+  - peer-authentication.yaml
+  - ../../base
+patches:
+  - target: {kind: Deployment, name: veil-app}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/1/env/-
+        value: {name: VEIL_OVERRIDE_3, value: "vds.enabled = true"}

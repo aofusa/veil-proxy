@@ -1,0 +1,30 @@
+# veil API ライブラリの総合サンプル（F-188〜F-192）。E2E（tests/library_e2e.rs）がこれを起動して試験する。
+#
+#   cargo run --release                      # config.toml が無ければライブラリ既定（0.0.0.0:8080、平文）
+#   curl localhost:8080/hello
+#   open http://localhost:8080/docs           # Swagger UI
+[package]
+name = "veil-example-showcase"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# veil 本体のワークスペースとは独立させる（`[[example]]` を本体に足すとコンテナビルドが壊れるため）。
+[workspace]
+
+[dependencies]
+# 実際に使うときは git 依存:
+# veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { path = "../../..", default-features = false, features = ["full", "api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+async-graphql = { version = "7", default-features = false }
+tower-http = { version = "0.6", features = ["set-header"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http = "1"
+
+# veil 本体と同じ vendoring 版 quiche を使う（HTTP/3 で複数ストリームの STREAM フレームを 1 パケットへ
+# 詰める差分。外すと小さな応答が 1 リクエスト 1 パケットに戻る。F-172）。
+[patch.crates-io]
+quiche = { path = "../../../third_party/quiche" }

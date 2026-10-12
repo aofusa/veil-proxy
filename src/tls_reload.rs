@@ -31,7 +31,7 @@ use rustls::ServerConfig;
 // 素の `std::fs` で引き続き動作する）。
 //
 // この 2 関数（`read_pem`/`pem_mtime`）が cert/key への唯一の読み取り経路であり、
-// `combined_mtime`（mtime ポーリング）と `reload_http3_certs`（HTTP/3 用 PEM 再読込）が
+// `combined_stamp`（`pem_stamp` 経由の変化ポーリング）と `reload_http3_certs`（HTTP/3 用 PEM 再読込）が
 // 経由する。`src/config.rs` の `load_tls_config`（H1/H2 rustls 用 `ServerConfig` 構築、
 // 起動時・リロード時の両方から呼ばれる）も同じ関数を経由する。
 
@@ -73,6 +73,51 @@ pub fn pem_mtime(path: &Path) -> std::io::Result<SystemTime> {
         }
     }
     std::fs::metadata(path)?.modified()
+}
+
+/// cert/key ファイルの変化検知用スタンプ（F-180）。
+///
+/// mtime だけでなく、シンボリックリンクを辿った先の実体（unix は `dev`・`ino`）とサイズも比べる。
+/// Kubernetes Secret のボリュームは `..data` リンクの付け替えで中身を差し替えるため、差し替え先の
+/// mtime が以前と同じ（カーネルの時刻粒度内で書かれた）こともあれば古いこともある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PemStamp {
+    mtime: SystemTime,
+    dev: u64,
+    ino: u64,
+    len: u64,
+}
+
+/// cert/key のスタンプを取得する（`pem_mtime` と同じチョークポイント規則）。
+// 理由付き allow: 上記 read_pem と同じくコールドパス専用。
+#[allow(clippy::disallowed_methods)]
+pub fn pem_stamp(path: &Path) -> std::io::Result<PemStamp> {
+    #[cfg(target_os = "freebsd")]
+    {
+        if crate::security::capsicum::stat_tls_pem(path).is_some() {
+            // capability mode の dirfd 経路は mtime だけを返す。
+            return Ok(PemStamp {
+                mtime: pem_mtime(path)?,
+                dev: 0,
+                ino: 0,
+                len: 0,
+            });
+        }
+    }
+    let md = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (md.dev(), md.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = (0, 0);
+    Ok(PemStamp {
+        mtime: md.modified()?,
+        dev,
+        ino,
+        len: md.len(),
+    })
 }
 
 /// 証明書ビルダー型
@@ -271,7 +316,7 @@ pub struct TlsCertReloader {
     key_path: PathBuf,
     server_config: Arc<ArcSwap<Option<Arc<ServerConfig>>>>,
     builder: ServerConfigBuilder,
-    last_modified: SystemTime,
+    last_stamp: (PemStamp, PemStamp),
 }
 
 impl TlsCertReloader {
@@ -285,13 +330,13 @@ impl TlsCertReloader {
         server_config: Arc<ArcSwap<Option<Arc<ServerConfig>>>>,
         builder: ServerConfigBuilder,
     ) -> anyhow::Result<Self> {
-        let last_modified = Self::combined_mtime(&cert_path, &key_path)?;
+        let last_stamp = Self::combined_stamp(&cert_path, &key_path)?;
         Ok(Self {
             cert_path,
             key_path,
             server_config,
             builder,
-            last_modified,
+            last_stamp,
         })
     }
 
@@ -308,14 +353,12 @@ impl TlsCertReloader {
         Self::new(cert_path, key_path, swap, builder)
     }
 
-    /// 証明書と秘密鍵の mtime のうち新しい方を返す。
+    /// 証明書と秘密鍵のスタンプ（mtime・実体・サイズ）を返す。
     ///
-    /// F-136: 実際の読み取りは単一チョークポイント `pem_mtime` に集約済み
-    /// （FreeBSD capability mode 下では dirfd 相対 `fstatat` を使う）。
-    fn combined_mtime(cert: &Path, key: &Path) -> anyhow::Result<SystemTime> {
-        let cert_m = pem_mtime(cert)?;
-        let key_m = pem_mtime(key)?;
-        Ok(cert_m.max(key_m))
+    /// F-136: 実際の読み取りは単一チョークポイント（`pem_stamp` → FreeBSD capability mode 下では
+    /// dirfd 相対 `fstatat`）に集約済み。
+    fn combined_stamp(cert: &Path, key: &Path) -> anyhow::Result<(PemStamp, PemStamp)> {
+        Ok((pem_stamp(cert)?, pem_stamp(key)?))
     }
 
     /// ファイルの mtime 変化を検知し、変化していればリロードする。
@@ -323,7 +366,7 @@ impl TlsCertReloader {
     /// # Returns
     /// 実際にリロードした場合 true
     pub fn check_and_reload(&mut self) -> bool {
-        let current = match Self::combined_mtime(&self.cert_path, &self.key_path) {
+        let current = match Self::combined_stamp(&self.cert_path, &self.key_path) {
             Ok(m) => m,
             Err(e) => {
                 ftlog::warn!("TLS cert mtime check failed: {}", e);
@@ -331,7 +374,8 @@ impl TlsCertReloader {
             }
         };
 
-        if current > self.last_modified {
+        // F-180: 「新しくなったら」ではなく「変わったら」リロードする（`PemStamp` 参照）。
+        if current != self.last_stamp {
             match self.reload_now() {
                 Ok(()) => {
                     ftlog::info!("TLS certificate reloaded (mtime changed)");
@@ -360,8 +404,8 @@ impl TlsCertReloader {
         // F-105: HTTP/3 (quiche) ワーカーへも cert/key の生 PEM を配信する。
         // 登録ワーカーが居るときのみファイルを再読込して配信（無ければ無駄な FS 読込を避ける）。
         self.reload_http3_certs()?;
-        // mtime を更新（再ロードの多重発火を防ぐ）
-        self.last_modified = Self::combined_mtime(&self.cert_path, &self.key_path)?;
+        // スタンプを更新（再ロードの多重発火を防ぐ）
+        self.last_stamp = Self::combined_stamp(&self.cert_path, &self.key_path)?;
         Ok(())
     }
 
@@ -381,9 +425,9 @@ impl TlsCertReloader {
         Ok(())
     }
 
-    /// 現在の最終更新時刻（テスト用）
+    /// 現在の最終更新時刻（cert/key の mtime の新しい方。テスト用）
     pub fn last_modified(&self) -> SystemTime {
-        self.last_modified
+        self.last_stamp.0.mtime.max(self.last_stamp.1.mtime)
     }
 }
 
@@ -516,6 +560,55 @@ mod tests {
             gen_after, gen_before,
             "generation must not advance without workers"
         );
+    }
+
+    /// F-180: Kubernetes Secret 形式（`cert.pem -> ..data/cert.pem`、`..data -> ..<timestamp>`）で
+    /// `..data` を付け替えたら、差し替え先の mtime が古くてもリロードする。
+    #[cfg(unix)]
+    #[test]
+    fn check_and_reload_follows_k8s_secret_symlink_swap_with_older_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = dir.path().join("..2026_10_12_01");
+        let v2 = dir.path().join("..2026_10_12_02");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::create_dir_all(&v2).unwrap();
+        write_self_signed(&v1.join("tls.crt"), &v1.join("tls.key"));
+        write_self_signed(&v2.join("tls.crt"), &v2.join("tls.key"));
+        // 差し替え先のほうが mtime が古い。
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in ["tls.crt", "tls.key"] {
+            std::fs::File::options()
+                .write(true)
+                .open(v2.join(f))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let data = dir.path().join("..data");
+        std::os::unix::fs::symlink(&v1, &data).unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::os::unix::fs::symlink("..data/tls.crt", &cert_path).unwrap();
+        std::os::unix::fs::symlink("..data/tls.key", &key_path).unwrap();
+
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let bc = build_count.clone();
+        let builder: ServerConfigBuilder = Box::new(move |_c, _k| {
+            bc.fetch_add(1, Ordering::SeqCst);
+            Ok(make_dummy_config())
+        });
+        let swap: Arc<ArcSwap<Option<Arc<ServerConfig>>>> = Arc::new(ArcSwap::from_pointee(None));
+        let mut reloader = TlsCertReloader::new(cert_path, key_path, swap, builder).unwrap();
+        assert!(!reloader.check_and_reload());
+
+        // kubelet と同じく一時リンクを作って rename で原子的に付け替える。
+        let tmp = dir.path().join("..data_tmp");
+        std::os::unix::fs::symlink(&v2, &tmp).unwrap();
+        std::fs::rename(&tmp, &data).unwrap();
+
+        assert!(reloader.check_and_reload());
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert!(!reloader.check_and_reload());
     }
 
     #[test]

@@ -1,0 +1,8 @@
+# メッシュ外（サイドカー無し）からの平文接続を拒否する。
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT

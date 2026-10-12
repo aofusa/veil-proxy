@@ -5,6 +5,10 @@
 // メモリアロケータ選択
 // ====================
 
+// F-188: API ライブラリ（`handler` feature）として組み込む場合はグローバルアロケータを定義しない。
+// アロケータは組み込む側のバイナリが選ぶ（`#[global_allocator] static A: veil::veil_alloc::VeilAlloc`
+// や mimalloc 等。ライブラリが定義すると利用者の `#[global_allocator]` と衝突するため）。
+
 // F-183: veil 専用アロケータ。`veil-alloc` feature かつ unix（build.rs の
 // `veil_alloc_active`）のとき使う。アロケータ feature は排他的に 1 つを選ぶ前提だが、
 // default の mimalloc と同時に有効な場合（`--features full`）は veil-alloc を優先する。
@@ -12,10 +16,11 @@
 pub mod veil_alloc;
 
 #[cfg(all(veil_alloc_active, not(feature = "alloc-stats")))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: veil_alloc::VeilAlloc = veil_alloc::VeilAlloc;
 
-#[cfg(all(feature = "mimalloc", not(veil_alloc_active)))]
+#[cfg(all(feature = "mimalloc", not(veil_alloc_active), not(feature = "handler")))]
 use mimalloc::MiMalloc;
 
 #[cfg(all(
@@ -23,10 +28,11 @@ use mimalloc::MiMalloc;
     not(veil_alloc_active),
     not(feature = "alloc-stats")
 ))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[cfg(all(feature = "jemalloc", not(veil_alloc_active)))]
+#[cfg(all(feature = "jemalloc", not(veil_alloc_active), not(feature = "handler")))]
 use tikv_jemallocator::Jemalloc;
 
 // B-89: FreeBSD 向けの tikv-jemalloc は libthr のフック（`_malloc_thread_cleanup` 等）を
@@ -45,6 +51,7 @@ compile_error!(
     not(feature = "mimalloc"),
     not(feature = "alloc-stats")
 ))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -58,11 +65,13 @@ pub mod alloc_stats;
 pub(crate) mod alloc_tune;
 
 #[cfg(all(feature = "alloc-stats", veil_alloc_active))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<veil_alloc::VeilAlloc> =
     alloc_stats::CountingAllocator(veil_alloc::VeilAlloc);
 
 #[cfg(all(feature = "alloc-stats", feature = "mimalloc", not(veil_alloc_active)))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingAllocator(MiMalloc);
 
@@ -72,6 +81,7 @@ static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingA
     not(veil_alloc_active),
     not(feature = "mimalloc")
 ))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingAllocator(Jemalloc);
 
@@ -81,6 +91,7 @@ static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingA
     not(feature = "mimalloc"),
     not(feature = "jemalloc")
 ))]
+#[cfg(not(feature = "handler"))]
 #[global_allocator]
 static GLOBAL: alloc_stats::CountingAllocator<std::alloc::System> =
     alloc_stats::CountingAllocator(std::alloc::System);
@@ -173,9 +184,18 @@ pub mod tls_provider;
 /// いずれからも参照するためクレートルート直下に置く。
 pub mod listen_addr;
 
+/// ACME による証明書の自動発行・更新（F-05）。
+#[cfg(feature = "acme")]
+pub mod acme;
 pub mod config;
 pub mod config_override;
+/// 制御プレーン用のブロッキング HTTP クライアント（VDS・ACME の専用スレッド用）。
+#[cfg(any(feature = "vds", feature = "acme"))]
+pub mod ctrl_http;
 pub mod tls_reload;
+/// VDS（Veil Discovery Service）: 制御プレーンからの動的設定配信（F-04）。
+#[cfg(feature = "vds")]
+pub mod vds;
 pub use crate::config::*;
 pub mod fuzz_api;
 /// HTTP/3 / QPACK ワイヤ純関数パーサ（F-112、ホットパス外・ファジング用）。
@@ -187,6 +207,18 @@ pub mod server;
 
 mod entry;
 pub use entry::run;
+pub use entry::{run_server, ServerOptions};
+
+/// API サーバ基盤ライブラリ（F-188〜F-192）。`handler` feature（`api` 等）のときだけ存在する。
+#[cfg(feature = "handler")]
+pub mod api;
+#[cfg(feature = "handler")]
+pub use api::prelude;
+#[cfg(feature = "handler")]
+pub use api::{serve, serve_blocking, shutdown, App};
+// マクロ（`#[veil::route]` 等）はクレートルートから使えるようにする。
+#[cfg(feature = "macro")]
+pub use veil_macros::{l4_handler, main, route, Schema};
 
 // bin(旧 main.rs）から移設したクレート内部テスト群（lib+bin 構成対応）
 #[cfg(test)]

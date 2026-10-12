@@ -36,3 +36,28 @@
 ## 依存
 
 - [grpc.md](grpc.md) の安定化、gRPC server 能力（Veil 側がサーバになる場合）。
+
+---
+
+## 決定した設計（2026-10-12、feat/f188-api-library-vds-k8s）
+
+**状態: 完了（feat/f188-api-library-vds-k8s）**
+
+- 名称は **VDS（Veil Discovery Service）**。feature `vds`（`full*` に含める）、`[vds]` セクション。
+- 転送は **xDS の REST-JSON（State-of-the-World）に準拠した長輪詢**: `POST /v1/discovery` に `DiscoveryRequest`
+  （`version_info` / `node` / `type_url` / `response_nonce` / `error_detail`）を送り、`DiscoveryResponse`
+  （`version_info` / `nonce` / `resources[]`）を受ける。変化が無ければサーバは保留し、タイムアウトで 304。
+  ACK は新しい `version_info`、NACK は旧 `version_info` + `error_detail`（xDS と同じ意味論）。
+  gRPC 双方向ストリームは採らない（データプレーンが tokio 非依存で、制御プレーン側も HTTP だけで実装できる方が運用しやすい）。
+- リソース: `type.veil.dev/veil.v1.Route`（`[[route]]` と同じスキーマ）・`type.veil.dev/veil.v1.Upstream`（`[[upstreams]]` と同じ）を
+  1 個のスナップショット（`type.veil.dev/veil.v1.Snapshot`）で配信（ADS 相当で整合性を保つ）。listen・TLS・L4 は対象外（再起動が必要）。
+- 適用: VDS オーバーレイを設定ロードの単一チョークポイント（`config_override::apply_to_toml_str`）で当て、既存のリロード経路
+  （検証 → ArcSwap）を通す。検証失敗は前版を維持して NACK。優先順位はファイル < VDS < 環境変数 < CLI。
+- 制御プレーンとの通信は専用スレッド（データプレーン外）。認証は Bearer トークン（ファイル）・mTLS・追加 CA。
+- 参照制御プレーン `tools/vds/vds_server.py`、仕様 `docs/guide/vds.md`（英日）+ JSON Schema。
+
+## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
+
+- `src/vds.rs`（専用スレッド、`ctrl_http` クライアント、Bearer・mTLS・追加 CA、上限）、オーバーレイ
+  （`config_override` の単一チョークポイント）、`tools/vds/vds_server.py`、`docs/guide/vds.md`（英日）+ `vds-schema.json`。
+- 単体テスト、standalone E2E（配信・更新・NACK で前の版を保持・復旧）、kind の 3 構成で ConfigMap 更新からのルート追加。

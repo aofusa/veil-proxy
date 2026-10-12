@@ -1190,6 +1190,13 @@ fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
         return true;
     }
 
+    // F-188: `{param}` / `{*rest}` を含むパターン（API ライブラリのハンドラ）は
+    // セグメント単位で照合する（`handler` feature のビルドのみ）。
+    #[cfg(feature = "handler")]
+    if pattern.contains('{') {
+        return crate::api::pattern::route_pattern_matches(pattern, path);
+    }
+
     // ワイルドカードパターン: "/api/*"
     if let Some(prefix) = pattern.strip_suffix("/*") {
         return path_str.starts_with(prefix)

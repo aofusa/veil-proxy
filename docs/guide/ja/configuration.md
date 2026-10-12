@@ -17,10 +17,13 @@
 | `[server]` | `server_header_value` | `"veil"` | Serverヘッダーの値 |
 | `[server]` | `http2_enabled` | `false` | HTTP/2を有効化 |
 | `[server]` | `http3_enabled` | `false` | HTTP/3を有効化 |
+| `[server]` | `h2c_http1` | `false` | H2C 専用リスナーで平文 HTTP/1.1 も受ける（[TLS なしの平文専用サーバ](#tls-なしの平文専用サーバ)を参照） |
 | `[logging]` | `level` | `"info"` | ログレベル |
 | `[logging]` | `format` | `"text"` | ログ形式 |
 | `[logging]` | `channel_size` | `16384` | ログチャネルバッファサイズ（全スロットを起動時に確保して常駐。1 件 約 88 バイト。満杯時はブロックせず破棄） |
 | `[logging]` | `flush_interval_ms` | `1000` | フラッシュ間隔（ミリ秒） |
+| `[vds]` | `enabled` | `false` | 制御プレーンからルート・アップストリームを受け取る（[VDS](vds.md)を参照） |
+| `[acme]` | `enabled` | `false` | 証明書の自動発行・更新（[ACME](acme.md)を参照） |
 | `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT振り分け方式 |
@@ -383,3 +386,44 @@ server_header_value = "MyServer/1.0"
 - **開発/テスト**: どのサーバーが応答しているかを識別するために有効化
 - **本番環境**: サーバー情報を隠すために無効化（セキュリティベストプラクティス）
 - **カスタムブランディング**: Serverヘッダーが必要な場合にカスタム値を設定
+
+## TLS なしの平文専用サーバ
+
+`[tls]` を **省略できる** のは、平文専用サーバのときだけです。`[server] h2c_enabled = true` で、`h2c_listen` が無い（または `listen` と同じ）、
+`http3_enabled = false`、かつ `http2` feature が有効なビルドです。この場合 TLS リスナーは起動せず、`listen` が h2c（HTTP/2 prior knowledge）を受けます。
+それ以外の構成で使える `[tls] cert_path` / `key_path` が無いと、検証で "TLS certificate is required" のエラーになります。
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+h2c_enabled = true
+h2c_http1 = true      # このポートで平文 HTTP/1.1 も受ける（既定: false）
+tls_only = false
+```
+
+`[server] h2c_http1`（既定 `false`）: 既定では H2C 専用リスナー（`h2c_listen`、または H2C 専用サーバのメインリスナー）は、HTTP/1.1 と判定した接続を閉じます。
+`true` にすると同じポートで平文 HTTP/1.1 も処理します（h2c は接続プリフェースで判別）。`http2` feature が必要です（無効時は警告して無視）。
+[API ライブラリ](library.md#ライブラリモードの設定)の既定値です。平文リスナーを信頼できないネットワークに公開しないでください。
+
+## VDS（`[vds]`）
+
+制御プレーンから配信されるルートとアップストリーム。キー: `enabled`・`server`・`node_id`・`cluster`・`token_file`・`ca_cert`・`client_cert`・
+`client_key`・`poll_timeout_secs`・`retry_initial_ms`・`retry_max_ms`・`max_response_bytes`・`max_resources`。`vds` feature（`full` に含まれる）が必要です。
+優先順位は `config.toml` < VDS < `VEIL_OVERRIDE_<n>` < `--override` です。詳細は [VDS](vds.md)。
+
+## ACME（`[acme]`）
+
+証明書の自動発行・更新（HTTP-01）。キー: `enabled`・`directory_url`・`contact`・`domains`・`storage_dir`・`accept_terms_of_service`・
+`challenge_listen`・`renew_before_days`・`check_interval_secs`・`directory_ca_cert`・`order_timeout_secs`。`acme` feature（`full` に含まれる）と
+`[tls] cert_path`/`key_path` が必要です。詳細は [ACME](acme.md)。
+
+## ネイティブハンドラ（`[[l4]] handler`・`[api]`・`type = "Handler"`）
+
+これらは [API サーバライブラリ](library.md)（feature `handler`・`l4-handler`・`api`）のもので、プロキシ本体のバイナリには含まれません。
+
+- `[[route]]` の `action.type = "Handler"` と `handler = "<名前>"` は、登録済みの Rust/C/Python ハンドラへルーティングします。
+  `handler` feature が無いビルドでは設定エラーです。
+- `[[l4]]` の `handler = "<名前>"`（feature `l4-handler`）: 転送せず、登録済みの L4 ハンドラで接続・データグラムを処理します。このとき `upstreams` は省略できます。
+  [L4 プロキシ](l4-proxy.md#ネイティブハンドラ)を参照。
+- `[api]`（ライブラリ専用）: `openapi_enabled`・`openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`openapi_description`・
+  `max_body_size`・`handler_threads`・`tokio_threads`。[ライブラリガイド](library.md#api-キーライブラリ専用)を参照。

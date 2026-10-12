@@ -1,0 +1,52 @@
+# VDS の参照制御プレーン（tools/vds/vds_server.py）。スナップショットは ConfigMap（veil-vds-snapshot）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veil-vds
+  labels: {app: veil-vds}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: veil-vds}
+  template:
+    metadata:
+      labels: {app: veil-vds}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: vds
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-I", "/opt/vds/vds_server.py", "--snapshot", "/etc/vds/snapshot.toml",
+                    "--listen", "0.0.0.0:18000", "--token-file", "/etc/veil/vds/token", "--hold", "20"]
+          ports:
+            - {name: vds, containerPort: 18000}
+          readinessProbe:
+            httpGet: {path: /healthz, port: vds}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: code, mountPath: /opt/vds, readOnly: true}
+            - {name: snapshot, mountPath: /etc/vds, readOnly: true}
+            - {name: vds-token, mountPath: /etc/veil/vds, readOnly: true}
+      volumes:
+        - name: code
+          configMap: {name: veil-vds-server}
+        - name: snapshot
+          configMap: {name: veil-vds-snapshot}
+        - name: vds-token
+          secret: {secretName: veil-vds-token}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veil-vds
+spec:
+  selector: {app: veil-vds}
+  ports:
+    - {name: http-vds, port: 18000, targetPort: vds, appProtocol: http}

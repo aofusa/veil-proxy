@@ -1,0 +1,16 @@
+# 最小のライブラリ利用例（README のクイックスタートと同じコード）。
+#   cargo run   → 平文 HTTP/1.1 + h2c を 0.0.0.0:8080、OpenAPI は /docs
+[package]
+name = "veil-example-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+veil = { path = "../../..", default-features = false, features = ["full", "api"] }
+serde_json = "1"
+
+[patch.crates-io]
+quiche = { path = "../../../third_party/quiche" }

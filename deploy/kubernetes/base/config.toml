@@ -1,0 +1,63 @@
+# Kubernetes のサイドカー用 veil 設定（F-196）。
+#
+# 同じ Pod のアプリ（127.0.0.1:9000）の前段に立つ。メッシュ（Istio / Linkerd）内の通信は
+# メッシュのプロキシが mTLS で暗号化するので、veil は Pod 内向けに平文（HTTP/1.1 + h2c）を
+# 8080 で受け、メッシュ外から直接来る経路向けに TLS を 8443 で受ける。
+#
+# 環境ごとの差分は ConfigMap を書き換えずに環境変数 VEIL_OVERRIDE_<n>（F-179）で入れる。
+# 証明書・秘密鍵は Secret ボリューム（/etc/veil/tls）で受け取り、更新に追従する（F-180）。
+# ルートは VDS（F-04）で制御プレーンから差し替えられる（overlays の vds 設定）。
+
+[server]
+listen = "0.0.0.0:8443"
+http2_enabled = true
+tls_only = false
+h2c_enabled = true
+h2c_listen = "0.0.0.0:8080"
+h2c_http1 = true
+threads = 1
+graceful_shutdown_timeout_secs = 20
+
+[logging]
+level = "info"
+
+[security]
+enable_seccomp = true
+enable_landlock = true
+seccomp_mode = "filter"
+landlock_read_paths = [
+  "/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/etc/ssl",
+  "/lib",
+  "/usr",
+]
+landlock_write_paths = []
+
+[tls]
+cert_path = "/etc/veil/tls/tls.crt"
+key_path = "/etc/veil/tls/tls.key"
+ktls_enabled = false
+auto_reload = true
+reload_interval_secs = 5
+
+[prometheus]
+enabled = true
+path = "/__metrics"
+allowed_ips = ["127.0.0.1/32", "10.0.0.0/8"]
+
+[vds]
+enabled = false
+server = "http://veil-vds:18000"
+token_file = "/etc/veil/vds/token"
+poll_timeout_secs = 20
+retry_initial_ms = 500
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:9000"

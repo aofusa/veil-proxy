@@ -21,6 +21,10 @@ HTTP/1.1, HTTP/2 (TLS and h2c), HTTP/3 (QUIC), gRPC, WebSocket and raw TCP/UDP (
 - **Proxy features** — path/host/header routing, load balancing, health checks, circuit
   breaker, retries, response compression, proxy cache, buffering, header rewriting.
 - **Extensible** — Proxy-Wasm filters (Wasmtime) on every protocol.
+- **Dynamic** — [VDS](docs/guide/vds.md) pushes routes and upstreams from a control plane (xDS-style long polling,
+  ACK/NACK), and built-in [ACME](docs/guide/acme.md) issues and renews certificates (HTTP-01, Let's Encrypt).
+- **Embeddable** — use veil as a [library](docs/guide/library.md) to write API servers in Rust (macros, OpenAPI,
+  tower, GraphQL, L4 handlers), C (`libveil`) or Python (FastAPI-style) on the same io_uring data plane.
 - **Operable** — hot reload (`SIGHUP`) of config and certificates, Prometheus metrics,
   OpenTelemetry, structured access logs, admin API.
 - **Secure by default** — memory-safe Rust, seccomp/Landlock (Linux), capsicum (FreeBSD),
@@ -91,6 +95,31 @@ for feature flags, packaging and BSD/macOS/Windows builds.
 
 A fully commented reference of every key is in [examples/config.toml](examples/config.toml).
 
+### Use veil as a library
+
+```toml
+# Cargo.toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+serde_json = "1"
+```
+
+```rust
+use veil::prelude::*;
+
+#[veil::route(path = "/hello/{name}", method = "GET")]
+async fn hello(name: String) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "hello": name }))
+}
+
+#[veil::main]
+async fn main() -> Result<(), veil::api::Error> {
+    veil::serve(Config::load()?).await   // plaintext HTTP/1.1 + h2c on 0.0.0.0:8080, OpenAPI at /docs
+}
+```
+
+See the [library guide](docs/guide/library.md) (Rust, C API, Python, building artifacts).
+
 ## Documentation
 
 | Topic | Guide |
@@ -107,6 +136,9 @@ A fully commented reference of every key is in [examples/config.toml](examples/c
 | HTTP/2, HTTP/3 & WebSocket | [docs/guide/protocols.md](docs/guide/protocols.md) |
 | Compression, cache & buffering | [docs/guide/compression-cache.md](docs/guide/compression-cache.md) |
 | WASM extensions | [docs/guide/wasm.md](docs/guide/wasm.md) |
+| API server library (Rust, C, Python) | [docs/guide/library.md](docs/guide/library.md) |
+| VDS: dynamic routes from a control plane | [docs/guide/vds.md](docs/guide/vds.md) |
+| ACME: automatic certificates | [docs/guide/acme.md](docs/guide/acme.md) |
 | Metrics, tracing & logging | [docs/guide/observability.md](docs/guide/observability.md) |
 | Admin & cache purge APIs | [docs/guide/admin-api.md](docs/guide/admin-api.md) |
 | Security & sandboxing | [docs/guide/security.md](docs/guide/security.md) |

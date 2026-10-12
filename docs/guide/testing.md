@@ -10,9 +10,9 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 
 | Test Type | Count | Status |
 |-----------|-------|--------|
-| **Unit Tests** (lib) | 694 | ✅ All passing |
+| **Unit Tests** (lib) | 1044 | ✅ All passing |
 | **Integration Tests** (`integration_tests` + property + cancellation-safety) | 55+ | ✅ All passing |
-| **E2E Tests** (`e2e_tests`) | 419 | ✅ All passing |
+| **E2E Tests** (`e2e_tests`) | 565 | ✅ All passing |
 | **Fuzz Targets** (`cargo fuzz`) | 8 | ✅ No crashes |
 | **Benchmarks** | 13 files | ✅ Ready |
 
@@ -123,6 +123,18 @@ cargo bench --bench wasm --features wasm
 ./tests/run_bench.sh throughput  # Throughput only
 ./tests/run_bench.sh latency     # Latency only
 ```
+
+#### Feature-specific end-to-end scripts
+
+Self-contained checks that start their own processes (no shared `e2e_setup.sh` environment):
+
+| What | Command | Covers |
+|------|---------|--------|
+| Process-level behavior | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>` (incl. SIGHUP and CLI priority), Kubernetes-Secret style certificate swap, plaintext-only server (`h2c_http1`), VDS against the reference control plane |
+| API library | `tests/api/library_e2e.sh [rust\|c\|python\|nonregression\|all]` | Rust showcase (macros, validation, OpenAPI, tower layers, GraphQL, L4 handlers, defaults without config.toml), C (shared + static), Python, and that the `full` binary contains no library code |
+| ACME | `tests/acme/pebble_e2e.sh` | issuance from Pebble via HTTP-01 and hot reload (needs docker) |
+| Containers | `examples/container/e2e.sh` | Docker secrets, environment overrides, certificate rotation, graceful stop (needs a built image) |
+| Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | sidecar in Istio / Linkerd meshes on kind ([kubernetes.md](kubernetes.md)) |
 
 ### Test Coverage
 

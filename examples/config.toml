@@ -9,6 +9,11 @@
 # `veil -o "[server].threads = 4"`（ブラケット記法も等価）。
 # 起動時・`-t` 検証時・SIGHUP によるホットリロード時のすべてに同じ上書きが
 # 適用される。構文の詳細は README.md / docs/readme/README.ja.md を参照。
+#
+# 同じ書式は環境変数 `VEIL_OVERRIDE_<n>`（<n> は 10 進の正整数、数値の昇順に適用）でも
+# 指定できる（F-179）。例: VEIL_OVERRIDE_1='server.listen = "0.0.0.0:8443"'
+# 優先順位は config.toml < 環境変数 < コマンドラインの -o。環境変数は起動時の値で固定され、
+# SIGHUP でも同じ上書きが当て直される。秘密鍵等の機密値は環境変数で渡さないこと。
 
 [server]
 listen = "127.0.0.1:443"
@@ -119,6 +124,16 @@ http2_enabled = true
 # H2C専用サーバー（TLSリスナー自体が起動しない）となるため、この設定は影響しません。
 #
 # tls_only = true
+
+# H2C 専用リスナーで平文 HTTP/1.1 も受けるかどうか（既定: false）
+#
+# H2C 専用リスナー（h2c_listen、または H2C 専用サーバ構成のメインリスナー）は、既定では
+# プロトコル検出で HTTP/1.1 と判定した接続を閉じます。true にすると同じポートで平文 HTTP/1.1 も
+# 処理します（h2c は接続プリフェースで判別）。TLS 無しの平文専用サーバ（下の [tls] の注記を参照。
+# API ライブラリの既定構成）で HTTP/1.1 クライアントを受けるために使います。
+# 要 http2 feature（無効時は警告して無視）。
+#
+# h2c_http1 = false
 
 # ====================
 # グレースフルシャットダウン設定
@@ -263,6 +278,11 @@ level = "info"
 # ==========================================
 # TLS設定
 # ==========================================
+# 注意: [tls] セクション自体を省略できるのは「平文専用サーバ」構成のときだけです
+# （[server] h2c_enabled = true で h2c_listen が無い（または listen と同一）、http3_enabled = false、
+#  http2 feature 有効）。この構成では TLS リスナーを起動せず listen が h2c（と h2c_http1 = true
+#  なら平文 HTTP/1.1）を受けます。それ以外の構成で cert_path / key_path が無いと起動時の検証で
+#  "TLS certificate is required" のエラーになります。
 [tls]
 
 cert_path = "/path/to/cert.pem"
@@ -2508,6 +2528,114 @@ revalidate_mtime = false
 #
 #   [[l4.upstreams]]
 #   addr = "10.0.0.2:53"
+
+# ------------------------------------------
+# 例6: ネイティブハンドラ（Rust 関数で処理する。l4-handler feature / ライブラリ用）
+# ------------------------------------------
+# handler を指定したリスナーは上流へ転送せず、登録済みの Rust 関数で接続（TCP）・
+# データグラム（UDP）を処理します（upstreams は不要）。ハンドラは #[veil::l4_handler]
+# または App::l4_tcp / App::l4_udp で登録します（docs/guide/library.md）。
+# プロキシ本体のバイナリ（full）にはこの機能は含まれません。
+# [[l4]]
+# name = "tcp_echo"
+# listen = "0.0.0.0:9000"
+# handler = "tcp_echo"
+#
+# [[l4]]
+# name = "udp_echo"
+# listen = "0.0.0.0:9001"
+# protocol = "udp"
+# handler = "udp_echo"
+
+# ==========================================
+# [api]（API サーバライブラリ専用。プロキシ本体のバイナリは読みません）
+# ==========================================
+# ライブラリモード（handler feature。docs/guide/library.md）でだけ有効なセクションです。
+# [api]
+# openapi_enabled = true            # /openapi.json と Swagger UI を公開する
+# openapi_path = "/docs"            # Swagger UI のパス
+# openapi_json_path = "/openapi.json"
+# openapi_title = "veil API"
+# openapi_version = "0.1.0"
+# # openapi_description = "..."
+# max_body_size = 10485760          # ハンドラへ渡す本文の上限（バイト）
+# handler_threads = 0               # 同期関数・C・Python 用ハンドラプールのスレッド数（0 = 既定）
+# tokio_threads = 2                 # tokio 互換ランタイムのワーカー数
+
+# ==========================================
+# VDS（Veil Discovery Service、F-04）
+# ==========================================
+# 制御プレーンからルート（[[route]]）とアップストリーム（[upstreams.<name>]）を動的に配信します。
+# xDS の REST-JSON / State-of-the-World 相当（version_info・nonce・長輪詢・ACK/NACK）。
+# 受け取ったスナップショットは route 配列と upstreams 表を丸ごと置き換え（config.toml のルートは
+# マージされません）、通常のリロード経路（検証 → ArcSwap）で無停止に適用されます。検証に失敗した
+# スナップショットは拒否（NACK）され、前の設定のまま動きます。listen・TLS・[[l4]] など
+# route / upstreams 以外は変更できません（再起動が必要）。
+# 優先順位: config.toml < VDS < 環境変数 VEIL_OVERRIDE_<n> < CLI --override
+# `vds` feature が必要です（full に含まれます）。[vds] は起動時に読まれ、SIGHUP では反映されません。
+# 詳細は docs/guide/vds.md。参照制御プレーンは tools/vds/vds_server.py。
+#
+# [vds]
+# enabled = false
+# # 制御プレーンの URL（http://host:port[/base] または https://...）。{server}/v1/discovery へ POST する
+# server = ""
+# # ノード ID（空ならホスト名）とクラスタ名
+# node_id = ""
+# cluster = ""
+# # Bearer トークンを書いたファイル（要求ごとに読み直す。空なら Authorization を送らない）
+# token_file = ""
+# # https の追加の信頼 CA（PEM。空なら組み込みの web PKI ルートのみ）
+# ca_cert = ""
+# # 相互 TLS 用のクライアント証明書・鍵（PEM。両方指定したときだけ使う）
+# client_cert = ""
+# client_key = ""
+# # 長輪詢の保留時間の上限（秒）。HTTP のタイムアウトはこの値 + 15 秒
+# poll_timeout_secs = 30
+# # エラー後の再試行待ち（ミリ秒、倍々で retry_max_ms まで）
+# retry_initial_ms = 500
+# retry_max_ms = 30000
+# # 応答本文の上限（バイト）とリソース数の上限
+# max_response_bytes = 16777216
+# max_resources = 10000
+
+# ==========================================
+# ACME（F-05）: 証明書の自動発行・更新（HTTP-01）
+# ==========================================
+# Let's Encrypt 等から証明書を自動で発行・更新します。初回起動で [tls] の cert_path / key_path が
+# 無ければ仮の自己署名証明書を置き（特権降格・サンドボックスの前）、HTTP-01 の応答リスナーを
+# challenge_listen で bind します。発行した証明書は cert_path / key_path へ原子的に書き込み、
+# 既存の証明書ホットリロードで無停止に差し替えます（[tls] auto_reload の値に関係なく有効）。
+# [tls] cert_path / key_path が必須です。HTTP-01 のみ（ワイルドカード証明書は不可）。
+# `acme` feature が必要です（full に含まれます）。[acme] は起動時に読まれ、SIGHUP では反映されません。
+# 要件: domains の名前がこのサーバを指し、インターネットからポート 80 に届くこと。
+#       cert_path / key_path のディレクトリと storage_dir が書き込み可能なこと
+#       （Landlock 有効時は landlock_write_paths に含める）。
+# 詳細は docs/guide/acme.md。外部の certbot + [tls] auto_reload を使う代替もあります。
+#
+# [acme]
+# enabled = false
+# # ACME ディレクトリ URL。試験には staging を使う:
+# #   https://acme-staging-v02.api.letsencrypt.org/directory
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+# # アカウントの連絡先（mailto:）
+# contact = ["mailto:admin@example.com"]
+# # 証明書に入れるドメイン（1 個目が CN。必須で 1 個以上）
+# domains = ["example.com", "www.example.com"]
+# # アカウント鍵などの保存先（書き込み可能で永続化すること。モード 0700 で作成）
+# storage_dir = "/var/lib/veil/acme"
+# # CA の利用規約への同意（true が必須）
+# accept_terms_of_service = false
+# # HTTP-01 の応答用の平文リスナー。それ以外のパスは https:// へ 301 する。
+# # 空なら起動しない（ポート 80 を別の方法で中継する場合）
+# challenge_listen = "0.0.0.0:80"
+# # 有効期限がこの日数以内になったら更新する
+# renew_before_days = 30
+# # 証明書を確認する間隔（秒、最小 60）
+# check_interval_secs = 43200
+# # ACME ディレクトリを検証する追加 CA（PEM。テスト用の Pebble 等）
+# directory_ca_cert = ""
+# # 1 回の発行の制限時間（秒、最小 30）
+# order_timeout_secs = 300
 
 # ------------------------------------------
 # ルートパス

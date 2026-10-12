@@ -176,6 +176,19 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   リークは `leak_check.sh`（`alloc-stats` ビルドの生存ヒープ `veil_alloc_live_bytes`・fd・スレッド数を、接続チャーン・
   異常切断・リロードの反復ごとに採って傾きを見る。F-185）。
 
+### API ライブラリ・制御プレーン（F-188〜F-196・F-04・F-05）
+
+- ライブラリ用コード（`src/api/`、`handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・`l4-handler`・`api`）は
+  default・`full*` に入れない。本体側への追加は `cfg(feature = "handler")` の分岐だけにする（`tests/api/library_e2e.sh nonregression`
+  が full バイナリに `veil::api`・inventory・async-graphql・tokio・pyo3 が無いことを検査する）。`handler` 時は `#[global_allocator]` を定義しない。
+- ライブラリの設定は `config_override::apply_to_toml_str` のフックで合成する（既定 < ファイル < VDS < 環境変数 < インライン < ビルダ、
+  ルート注入・具体性ソート・衝突検査）。リクエスト時にレジストリを引かない（`Backend::Handler` に解決済みの `Arc`）。
+- ハンドラ・tokio の完了は `runtime::offload::await_completion`（結果スロット + 通知 fd）で受ける。スレッド越しに Waker を呼ばない。
+  ブロッキングなハンドラ（同期 fn・C・Python）はハンドラ専用プール（`offload_handler`）で動かし、FS 用プールを使わない。
+- VDS・ACME の通信は専用スレッドの `ctrl_http`（ブロッキング）で行い、データプレーンに触れない。ACME の HTTP-01 は専用リスナー。
+- crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー。Dockerfile の cacher 段と `.dockerignore` に `crates/`・`benches/` が要る。
+- Kubernetes の Service に `appProtocol` を付けない（Linkerd は `http` を HTTP/1.1 固定と解釈し h2c が壊れる。F-196）。
+
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
