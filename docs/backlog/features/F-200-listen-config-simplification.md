@@ -1,6 +1,6 @@
 # F-200: 待ち受け設定の整理（`listen` / `listen_cleartext`）
 
-**状態: 進行中（feat/f197-f200-impl）。後方互換性は持たない（旧キーは削除）**
+**状態: 完了（feat/f197-f200-impl）。後方互換性は持たない（旧キーは削除）**
 
 ## 要望
 
@@ -126,4 +126,6 @@ enabled = false                   # true なら listen と同じアドレス（U
 - ガイド（英日）: configuration（リスナー表・検証規則・移行表）・protocols（英に H2C 節を追加）・library・kubernetes・running・acme・testing、
   AGENTS.md の平文計測ルール。
 - 試験: lib 1049・integration 60・standalone_e2e 12・E2E（io_uring / epoll とも 565）・`tests/api/library_e2e.sh` の rust / c / python が通過。
-  kind（k8s）と `examples/container/e2e.sh`（docker イメージが要る）は未実施。
+  その後、kind（`veil:musl-k8s` で plain・Istio・Linkerd、全 35 項目）と `examples/container/e2e.sh`（Docker secrets の TLS・
+  `VEIL_OVERRIDE`・証明書の差し替え・graceful stop）も通過。F-197〜F-199 を載せた最終状態で lib 1053・integration 60・
+  standalone_e2e 15（io_uring / epoll）・E2E 565（io_uring / epoll）・library_e2e 77 項目を再確認。
