@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tower::ServiceExt;
 use tower_layer::Layer;
@@ -87,6 +87,7 @@ pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
         req.params = o.params;
         req.client_ip = o.client_ip;
         req.version = o.version;
+        req.body_stream = o.body_stream;
     }
     req
 }
@@ -102,9 +103,20 @@ pub fn to_http_response(resp: Response) -> http::Response<VeilBody> {
             b = b.header(n, v);
         }
     }
-    b.body(VeilBody::new(resp.body))
-        .unwrap_or_else(|_| http::Response::new(VeilBody::new(Bytes::new())))
+    let mut out = b
+        .body(VeilBody::new(resp.body))
+        .unwrap_or_else(|_| http::Response::new(VeilBody::new(Bytes::new())));
+    // ストリーミング応答（F-197）は層を素通りさせる（extensions に入れて `from_http_response` で戻す）
+    if let Some(stream) = resp.stream {
+        out.extensions_mut()
+            .insert(StreamCarrier(Arc::new(Mutex::new(Some(stream)))));
+    }
+    out
 }
+
+/// 層を通す間ストリーミング本文を預ける入れ物（http の extensions は `Clone + Sync` を要求する）。
+#[derive(Clone)]
+struct StreamCarrier(Arc<Mutex<Option<super::stream::BodyStream>>>);
 
 /// `http::Response` を veil の `Response` にする（本文はまとめて読む）。
 pub async fn from_http_response<B>(resp: http::Response<B>) -> Response
@@ -113,6 +125,20 @@ where
     B::Error: std::fmt::Display,
 {
     let (parts, body) = resp.into_parts();
+    let carried = parts
+        .extensions
+        .get::<StreamCarrier>()
+        .and_then(|c| c.0.lock().ok().and_then(|mut g| g.take()));
+    if let Some(stream) = carried {
+        let mut r = Response::stream(parts.status.as_u16(), stream);
+        for (n, v) in parts.headers.iter() {
+            r.headers.push((
+                Bytes::copy_from_slice(n.as_str().as_bytes()),
+                Bytes::copy_from_slice(v.as_bytes()),
+            ));
+        }
+        return r;
+    }
     let body = match body.collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Response::error(502, &format!("response body error: {}", e)),
@@ -236,5 +262,32 @@ impl App {
             ..Default::default()
         };
         self.route_fn(&name, methods, path, func, meta)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::stream::BodyChunk;
+    use futures::StreamExt;
+
+    #[test]
+    fn streaming_response_survives_tower_conversion() {
+        let resp = Response::stream(
+            201,
+            futures::stream::iter(vec![
+                BodyChunk::Data(Bytes::from_static(b"a")),
+                BodyChunk::Trailers(vec![(Bytes::from_static(b"t"), Bytes::from_static(b"1"))]),
+            ]),
+        )
+        .with_header("x-h", "v");
+        let http_resp = to_http_response(resp);
+        let mut back = futures::executor::block_on(from_http_response(http_resp));
+        assert_eq!(back.status_code(), 201);
+        assert_eq!(back.header("x-h"), Some(&b"v"[..]));
+        let items: Vec<BodyChunk> =
+            futures::executor::block_on(back.take_stream().expect("stream kept").collect());
+        assert!(matches!(&items[0], BodyChunk::Data(b) if &b[..] == b"a"));
+        assert!(matches!(&items[1], BodyChunk::Trailers(t) if t.len() == 1));
     }
 }

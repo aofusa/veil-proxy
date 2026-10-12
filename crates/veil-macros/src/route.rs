@@ -18,6 +18,7 @@ struct RouteArgs {
     status: Option<u16>,
     offload: Option<bool>,
     hidden: bool,
+    streaming: bool,
 }
 
 fn str_list(e: &Expr) -> syn::Result<Vec<String>> {
@@ -59,7 +60,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                 },
                 _ => return Err(Error::new(value.span(), "expected an integer")),
             },
-            "offload" | "hidden" => {
+            "offload" | "hidden" | "streaming" => {
                 let b = match &value {
                     Expr::Lit(l) => match &l.lit {
                         Lit::Bool(b) => b.value,
@@ -67,15 +68,15 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                     },
                     _ => return Err(Error::new(value.span(), "expected true or false")),
                 };
-                if key == "offload" {
-                    a.offload = Some(b);
-                } else {
-                    a.hidden = b;
+                match key.as_str() {
+                    "offload" => a.offload = Some(b),
+                    "hidden" => a.hidden = b,
+                    _ => a.streaming = b,
                 }
             }
             other => {
                 return Err(meta.error(format!(
-                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden)",
+                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming)",
                     other
                 )))
             }
@@ -383,6 +384,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let description = opt_string(args.description.clone().or(doc_desc));
     let tags = &args.tags;
     let hidden = args.hidden;
+    let streaming = args.streaming;
     let resp_content = response_content(&func.sig.output);
     let ok_status = args.status.unwrap_or(200);
     let ok_desc = if ok_status == 204 {
@@ -439,6 +441,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 methods: &[#(#methods),*],
                 handler: #handler_ident,
                 meta: #meta_ident,
+                streaming_request: #streaming,
             }
         }
     })

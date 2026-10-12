@@ -312,8 +312,10 @@ tokio-interface = [
 graphql = ["handler", "dep:async-graphql"]
 # L4（TCP/UDP）リスナーに Rust 関数をネイティブハンドラとして登録（F-192）
 l4-handler = ["handler", "l4-proxy"]
+# gRPC サーバ（F-197、prost + veil の gRPC 実装。tokio・tonic 非依存）。API ライブラリ専用
+grpc-handler = ["handler", "grpc"]
 # API サーバ開発向けの便利セット（C API・Python は別クレート crates/veil-capi・crates/veil-python）
-api = ["handler", "macro", "openapi", "tokio-interface", "graphql", "l4-handler"]
+api = ["handler", "macro", "openapi", "tokio-interface", "graphql", "l4-handler", "grpc-handler"]
 
 # ====================
 # 複合フィーチャ（便利用）

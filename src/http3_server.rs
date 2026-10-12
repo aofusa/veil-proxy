@@ -638,7 +638,7 @@ struct ProxyStream {
     /// レスポンス fin 送出済み（= レスポンス完了）。
     resp_fin_sent: bool,
     /// StreamBlocked で送出保留中の trailers（gRPC。B-97）。
-    #[cfg(feature = "grpc")]
+    #[cfg(any(feature = "grpc", feature = "handler"))]
     trailers_pending: Option<crate::http3_stream::RespHeaders>,
 
     // ---- リクエスト方向（メインループ → バックエンドタスク） ----
@@ -672,7 +672,7 @@ impl ProxyStream {
             body_pending: None,
             need_fin: false,
             resp_fin_sent: false,
-            #[cfg(feature = "grpc")]
+            #[cfg(any(feature = "grpc", feature = "handler"))]
             trailers_pending: None,
             req_tx: Some(req_tx),
             req_pending: VecDeque::new(),
@@ -693,7 +693,7 @@ impl ProxyStream {
             body_pending: None,
             need_fin: false,
             resp_fin_sent: false,
-            #[cfg(feature = "grpc")]
+            #[cfg(any(feature = "grpc", feature = "handler"))]
             trailers_pending: None,
             req_tx: None,
             req_pending: VecDeque::new(),
@@ -2058,6 +2058,47 @@ impl H3BufferedTask {
         Ok(())
     }
 
+    /// ハンドラのストリーミング応答を送り、送信端を閉じる（F-197）。戻り値は本文のバイト数。
+    #[cfg(feature = "handler")]
+    async fn send_api_stream(
+        &mut self,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        mut stream: crate::api::stream::BodyStream,
+    ) -> io::Result<usize> {
+        use crate::api::stream::BodyChunk;
+        use crate::http3_stream::RespMsg;
+        use futures::StreamExt;
+        self.send_msg(RespMsg::Head {
+            status,
+            headers: pack_resp_headers(headers, None),
+        })
+        .await?;
+        let mut sent = 0usize;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                BodyChunk::Data(b) if b.is_empty() => {}
+                BodyChunk::Data(b) => {
+                    sent += b.len();
+                    self.send_msg(RespMsg::Body(b)).await?;
+                }
+                BodyChunk::Trailers(mut t) => {
+                    crate::api::dispatch::lowercase_names(&mut t);
+                    self.send_msg(RespMsg::Trailers(t)).await?;
+                    break;
+                }
+                BodyChunk::Abort(reason) => {
+                    ftlog::debug!("[api] streaming response aborted: {}", reason);
+                    // head 送出後のエラーはストリームのリセット
+                    self.send_msg(RespMsg::Error { status: 500 }).await?;
+                    break;
+                }
+            }
+        }
+        self.finish();
+        Ok(sent)
+    }
+
     /// エラーレスポンス送信
     async fn send_error_response(&mut self, status: u16, body: &'static [u8]) -> io::Result<()> {
         self.send_response(
@@ -2799,16 +2840,27 @@ impl H3BufferedTask {
                 let mut resp = crate::api::dispatch::call(&entry, req).await;
                 crate::api::dispatch::h2_h3_headers(&mut resp);
                 let status = resp.status_code();
-                let resp_headers: Vec<(&[u8], &[u8])> = resp
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.as_ref(), v.as_ref()))
-                    .collect();
-                let body = resp.body().clone();
-                let len = body.len();
-                self.send_response(status, &resp_headers, Some(body))
-                    .await?;
-                (status, len)
+                if let Some(stream) = resp.take_stream() {
+                    // ストリーミング応答（F-197）: head → 断片 → トレーラ（または fin）
+                    let resp_headers: Vec<(&[u8], &[u8])> = resp
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                        .collect();
+                    let sent = self.send_api_stream(status, &resp_headers, stream).await?;
+                    (status, sent)
+                } else {
+                    let resp_headers: Vec<(&[u8], &[u8])> = resp
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                        .collect();
+                    let body = resp.body().clone();
+                    let len = body.len();
+                    self.send_response(status, &resp_headers, Some(body))
+                        .await?;
+                    (status, len)
+                }
             }
         };
 
@@ -3872,7 +3924,7 @@ fn drive_response_flush(
     }
 
     // 2b. StreamBlocked で保留した trailers を再送（gRPC。B-97）。
-    #[cfg(feature = "grpc")]
+    #[cfg(any(feature = "grpc", feature = "handler"))]
     if let Some(trailers) = ps.trailers_pending.take() {
         return match send_h3_trailers(h3, conn, stream_id, &trailers) {
             HeadSend::Blocked => {
@@ -3940,7 +3992,7 @@ fn drive_response_flush(
                     }
                 }
             }
-            #[cfg(feature = "grpc")]
+            #[cfg(any(feature = "grpc", feature = "handler"))]
             TryRecv::Item(RespMsg::Trailers(trailers)) => {
                 return match send_h3_trailers(h3, conn, stream_id, &trailers) {
                     HeadSend::Blocked => {
@@ -4043,7 +4095,7 @@ fn send_h3_head_fin(
 /// trailers を `send_additional_headers(is_trailer_section=true, fin=true)` で送る（B-41/B-97）。
 ///
 /// `Error` のときは空ボディ + fin でストリームを閉じ、クライアントのハングを防ぐ。
-#[cfg(feature = "grpc")]
+#[cfg(any(feature = "grpc", feature = "handler"))]
 fn send_h3_trailers(
     h3: &mut h3::Connection,
     conn: &mut quiche::Connection,

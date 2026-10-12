@@ -1805,6 +1805,36 @@ where
             .await
     }
 
+    /// 任意のトレーラ（名前は小文字）を END_STREAM 付き HEADERS で送る（ハンドラのストリーミング
+    /// 応答、F-197）。呼び出し側は先に `flush_write_buf` しておくこと。
+    #[cfg(feature = "handler")]
+    pub async fn send_trailers<K, V>(
+        &mut self,
+        stream_id: u32,
+        trailers: &[(K, V)],
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let trailer_list: Vec<(&[u8], &[u8], bool)> = trailers
+            .iter()
+            .map(|(n, v)| (n.as_ref(), v.as_ref(), false))
+            .collect();
+        let trailer_block = self
+            .hpack_encoder
+            .encode(&trailer_list)
+            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+        let trailer_frame =
+            self.frame_encoder
+                .encode_headers(stream_id, &trailer_block, true, true, None);
+        self.write_all(trailer_frame).await?;
+        if let Some(stream) = self.streams.get(stream_id) {
+            stream.send_headers(true)?;
+        }
+        Ok(())
+    }
+
     /// gRPC トレイラーを送信
     ///
     /// grpc-status と grpc-message をトレイラーとして送信し、

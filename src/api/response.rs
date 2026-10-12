@@ -2,12 +2,25 @@
 
 use bytes::Bytes;
 
-/// ハンドラが返す応答。本文は `Bytes`（ゼロコピーで各プロトコルの送信経路へ渡る）。
-#[derive(Debug, Clone)]
+/// ハンドラが返す応答。本文は `Bytes`（ゼロコピーで各プロトコルの送信経路へ渡る）か、
+/// ストリーム（`Response::stream`。断片とトレーラ、F-197）。
 pub struct Response {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(Bytes, Bytes)>,
     pub(crate) body: Bytes,
+    /// ストリーミング本文（あれば `body` の代わりに送る）
+    pub(crate) stream: Option<super::stream::BodyStream>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .field("streaming", &self.stream.is_some())
+            .finish()
+    }
 }
 
 const CT_TEXT: &[u8] = b"text/plain; charset=utf-8";
@@ -22,6 +35,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: Bytes::new(),
+            stream: None,
         }
     }
 
@@ -33,6 +47,7 @@ impl Response {
                 Bytes::from_static(content_type),
             )],
             body,
+            stream: None,
         }
     }
 
@@ -62,6 +77,30 @@ impl Response {
     /// `application/octet-stream`（200）。
     pub fn bytes(body: impl Into<Bytes>) -> Response {
         Self::with_type(200, CT_OCTET, body.into())
+    }
+
+    /// ストリーミング応答（本文を断片で送り、最後にトレーラを送れる。F-197）。
+    /// `content-type` は `with_header` で付ける。
+    pub fn stream<S>(status: u16, body: S) -> Response
+    where
+        S: futures::Stream<Item = super::stream::BodyChunk> + Send + 'static,
+    {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: Bytes::new(),
+            stream: Some(Box::pin(body)),
+        }
+    }
+
+    /// ストリーミング応答か。
+    pub fn is_streaming(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// ストリームを取り出す（アダプタ・テスト用）。
+    pub fn take_stream(&mut self) -> Option<super::stream::BodyStream> {
+        self.stream.take()
     }
 
     /// 204 No Content。

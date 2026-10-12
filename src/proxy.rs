@@ -863,6 +863,9 @@ enum H2RespMsg {
     /// gRPC トレイラー等（END_STREAM 付き HEADERS）。gRPC 経路でのみ生成・送出する。
     #[cfg(feature = "grpc")]
     Trailers(Vec<(Bytes, Bytes)>),
+    /// ハンドラのストリーミング応答のトレーラ（全フィールドをそのまま送る。F-197）。
+    #[cfg(feature = "handler")]
+    HandlerTrailers(Vec<(Bytes, Bytes)>),
     /// head 送出後のバックエンドエラー等でストリームをリセットする（RST_STREAM エラーコード）。
     Reset(u32),
 }
@@ -1290,6 +1293,14 @@ where
                     st.head_sent = true;
                     st.end_sent = true;
                 }
+                #[cfg(feature = "handler")]
+                H2RespMsg::HandlerTrailers(trailers) => {
+                    conn.flush_write_buf().await?;
+                    let _ = conn.send_trailers(sid, &trailers).await;
+                    let st = streams.get_mut(&sid).unwrap();
+                    st.head_sent = true;
+                    st.end_sent = true;
+                }
                 H2RespMsg::Reset(code) => {
                     conn.flush_write_buf().await?;
                     let _ = conn
@@ -1396,6 +1407,11 @@ where
     });
 
     let (_prefix, backend, _rc) = backend_result?;
+    // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
+    #[cfg(feature = "handler")]
+    if let Backend::Handler(entry, _, _) = &backend {
+        return entry.streaming_request.then_some(0);
+    }
     let (upstream_group, security, buffering) = match &backend {
         Backend::Proxy(ug, sec, _comp, buf, _cache, modules) => {
             if modules
@@ -1949,7 +1965,10 @@ async fn h2_dispatch(
             .await
         }
         #[cfg(feature = "handler")]
-        Backend::Handler(entry, _, _) => h2_api_handler(ctx, &entry, resp_tx, notify).await,
+        Backend::Handler(entry, _, _) => {
+            let (status, size, _) = h2_api_handler(ctx, &entry, None, resp_tx, notify).await;
+            (status, size)
+        }
     };
 
     #[cfg(feature = "wasm")]
@@ -1969,14 +1988,19 @@ async fn h2_dispatch(
     result
 }
 
-/// HTTP/2 のネイティブハンドラ（API ライブラリ、F-188）。戻り値 `(status, resp_size)`。
+/// HTTP/2 のネイティブハンドラ（API ライブラリ、F-188）。戻り値 `(status, resp_size, req_size)`。
+///
+/// `req_rx` があればストリーミング受信のルート（F-197）: 届いた本文断片をハンドラの
+/// `Request::take_body_stream()` へ流しながら、応答（ストリーミング応答なら断片とトレーラ）を送る。
+/// 本文の中継と応答の送出は同じタスクの中で `select` し、双方向ストリーム（gRPC の bidi）を成り立たせる。
 #[cfg(all(feature = "http2", feature = "handler"))]
 async fn h2_api_handler(
     ctx: &H2RequestCtx,
     entry: &crate::api::handler::HandlerEntry,
+    req_rx: Option<&crate::stream_channel::Receiver<Bytes>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
-) -> (u16, u64) {
+) -> (u16, u64, u64) {
     let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(ctx.headers.len() + 1);
     let mut has_host = false;
     for h in ctx.headers.iter().filter(|h| !h.name.starts_with(b":")) {
@@ -1986,7 +2010,7 @@ async fn h2_api_handler(
     if !has_host && !ctx.authority.is_empty() {
         headers.push((Bytes::from_static(b"host"), ctx.authority.clone()));
     }
-    let req = crate::api::dispatch::build_request(
+    let mut req = crate::api::dispatch::build_request(
         ctx.method.clone(),
         ctx.path.clone(),
         headers,
@@ -1994,17 +2018,109 @@ async fn h2_api_handler(
         &ctx.client_ip,
         crate::api::request::HttpVersion::Http2,
     );
+    let Some(rx) = req_rx else {
+        let (status, size) = h2_api_respond(entry, req, resp_tx, notify).await;
+        return (status, size, ctx.body.len() as u64);
+    };
+
+    let (mut body_tx, slot) = crate::api::stream::request_body_channel(H2_REQ_CHANNEL_CAP);
+    req.body_stream = Some(slot);
+    let req_size = std::cell::Cell::new(0u64);
+    let req_size_ref = &req_size;
+    // `body_tx` は move で持たせる（中継が終わったら drop して受信ストリームを終える）
+    let pump = async move {
+        let req_size = req_size_ref;
+        use futures::SinkExt;
+        while let Some(chunk) = rx.recv().await {
+            req_size.set(req_size.get() + chunk.len() as u64);
+            if body_tx.send(chunk).await.is_err() {
+                // ハンドラが受信ストリームを捨てた: 残りは読み捨てる（クライアントを止めない）。
+                while let Some(c) = rx.recv().await {
+                    req_size.set(req_size.get() + c.len() as u64);
+                }
+                break;
+            }
+        }
+        // body_tx の drop で受信ストリームが終わる
+    };
+    let work = h2_api_respond(entry, req, resp_tx, notify);
+    let (status, size) =
+        match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
+            futures::future::Either::Left((r, _pump)) => r,
+            futures::future::Either::Right(((), work)) => work.await,
+        };
+    (status, size, req_size.get())
+}
+
+/// ハンドラを呼んで応答を送る（全量・ストリーミングの両方）。戻り値 `(status, resp_size)`。
+#[cfg(all(feature = "http2", feature = "handler"))]
+async fn h2_api_respond(
+    entry: &crate::api::handler::HandlerEntry,
+    req: crate::api::request::Request,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
     let mut resp = crate::api::dispatch::call(entry, req).await;
     crate::api::dispatch::h2_h3_headers(&mut resp);
     let status = resp.status_code();
     let crate::api::response::Response {
         headers: resp_headers,
         body,
+        stream,
         ..
     } = resp;
     let mut out = h2_base_headers(false);
     out.extend(resp_headers);
-    h2_emit_full(resp_tx, notify, status, out, body).await
+    let Some(mut stream) = stream else {
+        return h2_emit_full(resp_tx, notify, status, out, body).await;
+    };
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status,
+            headers: out,
+            end_stream: false,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (status, 0);
+    }
+    use crate::api::stream::BodyChunk;
+    use futures::StreamExt;
+    let mut sent = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let msg = match chunk {
+            BodyChunk::Data(b) if b.is_empty() => continue,
+            BodyChunk::Data(b) => {
+                sent += b.len() as u64;
+                H2RespMsg::Body(b)
+            }
+            BodyChunk::Trailers(mut t) => {
+                crate::api::dispatch::lowercase_names(&mut t);
+                let _ = h2_send(resp_tx, notify, H2RespMsg::HandlerTrailers(t)).await;
+                return (status, sent);
+            }
+            BodyChunk::Abort(reason) => {
+                ftlog::debug!("[api] streaming response aborted: {}", reason);
+                let _ = h2_send(
+                    resp_tx,
+                    notify,
+                    H2RespMsg::Reset(http2::Http2ErrorCode::InternalError as u32),
+                )
+                .await;
+                return (status, sent);
+            }
+        };
+        if h2_send(resp_tx, notify, msg).await.is_err() {
+            // クライアントがストリームを閉じた: ストリームを drop してハンドラ側へ伝える
+            return (status, sent);
+        }
+    }
+    // 送信端の drop で END_STREAM
+    (status, sent)
 }
 
 /// バッファ経路の Proxy 処理（H1/HTTPS/H2C バックエンド）。戻り値 `(status, resp_size)`。
@@ -3914,6 +4030,11 @@ async fn h2_serve_streaming(
     let (prefix, upstream_group, compression, security) = match backend_result {
         Some((prefix, Backend::Proxy(ug, sec, comp, _buf, _cache, _mods), _rc)) => {
             (prefix, ug, comp, sec)
+        }
+        // ストリーミング受信のハンドラ（F-197）
+        #[cfg(feature = "handler")]
+        Some((_prefix, Backend::Handler(entry, _, _), _rc)) if entry.streaming_request => {
+            return h2_api_handler(ctx, &entry, Some(req_rx), resp_tx, notify).await;
         }
         _ => {
             while req_rx.recv().await.is_some() {}
@@ -6458,13 +6579,17 @@ async fn handle_api_handler(
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
-    let resp = crate::api::dispatch::call(entry, req).await;
+    let mut resp = crate::api::dispatch::call(entry, req).await;
     let status = resp.status_code();
     let body = resp.body().clone();
     let head = crate::api::dispatch::http1_head(&resp, !client_wants_close);
     match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
         Ok((Ok(_), _)) => {}
         _ => return None,
+    }
+    if let Some(stream) = resp.take_stream() {
+        let (tls_stream, sent) = write_api_chunked(tls_stream, stream).await?;
+        return Some((tls_stream, status, sent, client_wants_close));
     }
     if !body.is_empty() {
         let len = body.len() as u64;
@@ -6474,6 +6599,56 @@ async fn handle_api_handler(
         }
     } else {
         Some((tls_stream, status, 0, client_wants_close))
+    }
+}
+
+/// ハンドラのストリーミング応答を HTTP/1.1 の chunked で書く（F-197）。トレーラは最後のチャンクの後に
+/// 書く。`Abort`・書き込み失敗は `None`（接続を閉じる）。戻り値は送った本文のバイト数。
+#[cfg(feature = "handler")]
+async fn write_api_chunked(
+    mut tls_stream: ServerTls,
+    mut stream: crate::api::stream::BodyStream,
+) -> Option<(ServerTls, u64)> {
+    use crate::api::stream::BodyChunk;
+    use futures::StreamExt;
+    let mut sent = 0u64;
+    let mut trailers: Vec<(Bytes, Bytes)> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            BodyChunk::Data(b) if b.is_empty() => {}
+            BodyChunk::Data(b) => {
+                let mut prefix = Vec::with_capacity(12);
+                let _ = std::io::Write::write_fmt(&mut prefix, format_args!("{:x}\r\n", b.len()));
+                sent += b.len() as u64;
+                for part in [Bytes::from(prefix), b, Bytes::from_static(b"\r\n")] {
+                    match timeout(WRITE_TIMEOUT, tls_stream.write_all(part)).await {
+                        Ok((Ok(_), _)) => {}
+                        _ => return None,
+                    }
+                }
+            }
+            BodyChunk::Trailers(t) => {
+                trailers = t;
+                break;
+            }
+            BodyChunk::Abort(reason) => {
+                ftlog::debug!("[api] streaming response aborted: {}", reason);
+                return None;
+            }
+        }
+    }
+    let mut tail = Vec::with_capacity(5 + trailers.len() * 32);
+    tail.extend_from_slice(b"0\r\n");
+    for (n, v) in &trailers {
+        tail.extend_from_slice(n);
+        tail.extend_from_slice(b": ");
+        tail.extend_from_slice(v);
+        tail.extend_from_slice(b"\r\n");
+    }
+    tail.extend_from_slice(b"\r\n");
+    match timeout(WRITE_TIMEOUT, tls_stream.write_all(tail)).await {
+        Ok((Ok(_), _)) => Some((tls_stream, sent)),
+        _ => None,
     }
 }
 
