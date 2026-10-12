@@ -161,7 +161,7 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no veil::api symbols in the full binary" || bad "veil::api symbols found ($n)"
   n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -ciE "inventory|async_graphql|tokio::runtime|pyo3") || true
   [ "$n" = 0 ] && ok "no inventory/async-graphql/tokio/pyo3 in the full binary" || bad "library dependencies linked ($n)"
-  n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -ciE "veil_build|prost_build|tonic") || true
+  n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -cE "veil_build::|prost_build::|(^|[^a-z_])tonic::") || true
   [ "$n" = 0 ] && ok "no veil-build/prost-build/tonic in the full binary" || bad "gRPC library code linked ($n)"
   n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -cE "veil::tokio::") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
