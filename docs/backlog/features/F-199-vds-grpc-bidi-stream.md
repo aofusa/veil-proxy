@@ -1,6 +1,6 @@
 # F-199: VDS の gRPC 双方向ストリーム
 
-**状態: 進行中（feat/f197-f200-impl）**
+**状態: 完了（feat/f197-f200-impl）**
 
 ## 要望
 
@@ -109,3 +109,5 @@ message DiscoveryResponse { string version_info = 1; string nonce = 2; string ty
   シナリオ（配信・更新・NACK で前の版を保つ・修正）で同じ結果。
 - kind E2E（`tools/k8s/kind-e2e.sh`）: VDS を gRPC ストリームで Istio・Linkerd 越しに配信し、`/v1/status` で
   `transport = grpc` の ACK と制御プレーン再起動後の再接続を確認する項目を追加。
+  `veil:musl-k8s`（`full-container`）で plain・Istio・Linkerd の 3 構成とも全 35 項目 ok（VDS の配信・gRPC
+  ストリームの ACK・制御プレーン再起動後の再接続を各構成で確認）。

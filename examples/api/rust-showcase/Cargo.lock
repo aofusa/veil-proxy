@@ -2743,16 +2743,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio"
-version = "1.53.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
-dependencies = [
- "pin-project-lite",
- "tokio-macros",
-]
-
-[[package]]
 name = "tokio-macros"
 version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3043,9 +3033,8 @@ dependencies = [
  "serde_urlencoded",
  "signal-hook",
  "time",
- "tokio",
+ "tokio-macros",
  "toml 0.9.12+spec-1.1.0",
- "tower",
  "tower-layer",
  "tower-service",
  "veil-macros",
