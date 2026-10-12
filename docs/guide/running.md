@@ -197,7 +197,7 @@ Existing connections are not interrupted, and new settings apply to new connecti
 >
 > - a `File` route whose path is not under a directory that was a `File` route at startup (single-file routes outside such a directory included);
 > - an upstream that is not in the connect broker's allowlist fixed at startup (a new `Proxy` route URL or `[upstreams]` server; changing routes, weights, or health checks for the same upstreams is fine);
-> - `[[l4]]`, h2c, HTTP/3, or the HTTP redirect listener (the same rules decide at startup whether capability mode is entered at all);
+> - `[[l4]]`, the plaintext listener (`listen_cleartext`), or HTTP/3 (the same rules decide at startup whether capability mode is entered at all);
 > - enabling the access log or changing `[access_log] file_path`.
 >
 > Reopening the same access log path works, so `logrotate`-style "move, then SIGHUP" rotation is supported. The configuration directory stays readable to the process, so keep the configuration in a dedicated directory.

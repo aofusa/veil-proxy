@@ -130,7 +130,7 @@ Self-contained checks that start their own processes (no shared `e2e_setup.sh` e
 
 | What | Command | Covers |
 |------|---------|--------|
-| Process-level behavior | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>` (incl. SIGHUP and CLI priority), Kubernetes-Secret style certificate swap, plaintext-only server (`h2c_http1`), VDS against the reference control plane |
+| Process-level behavior | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>` (incl. SIGHUP and CLI priority), Kubernetes-Secret style certificate swap, plaintext-only server and `allow_http` / `allow_h2c` / `enable_secure_redirect` (`listen_cleartext`), removed-key errors, listener validation rules, VDS against the reference control plane |
 | API library | `tests/api/library_e2e.sh [rust\|c\|python\|nonregression\|all]` | Rust showcase (macros, validation, OpenAPI, tower layers, GraphQL, L4 handlers, defaults without config.toml), C (shared + static), Python, and that the `full` binary contains no library code |
 | ACME | `tests/acme/pebble_e2e.sh` | issuance from Pebble via HTTP-01 and hot reload (needs docker) |
 | Containers | `examples/container/e2e.sh` | Docker secrets, environment overrides, certificate rotation, graceful stop (needs a built image) |
@@ -172,7 +172,7 @@ Self-contained checks that start their own processes (no shared `e2e_setup.sh` e
 - **Backend Access**: Direct backend connections
 - **Prometheus**: Metrics endpoint
 - **Error Handling**: 404 responses
-- **HTTP Redirect**: HTTP to HTTPS redirect
+- **HTTP Redirect**: HTTP to HTTPS redirect (a separate veil instance with `listen_cleartext` + `enable_secure_redirect`, `proxy_redirect.toml`, because the main test proxy serves plaintext h2c on its `listen_cleartext`)
 - **Concurrency**: Concurrent and sequential requests
 - **Performance**: Response time validation
 - **Content Types**: HTML, JSON handling

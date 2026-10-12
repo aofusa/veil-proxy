@@ -131,10 +131,8 @@ The library has its own **default configuration** (embedded in the crate, `src/a
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true     # plaintext HTTP/2 (prior knowledge) ...
-h2c_http1 = true       # ... and plaintext HTTP/1.1 on the same port
-tls_only = false
+listen_cleartext = "0.0.0.0:8080"  # plaintext HTTP/1.1 + h2c (prior knowledge), auto-detected; no `listen`, no [tls]
+enable_secure_redirect = false     # serve plaintext (the server default is a 301 to HTTPS)
 http2_enabled = true
 
 [logging]
@@ -172,7 +170,7 @@ Then the handler routes and the built-in OpenAPI routes are injected, and all ro
 (see [Routing macros](#routing-macros)).
 
 The same composition runs again on every SIGHUP reload, so builder and environment overrides **survive a
-reload**; only the contents of `config.toml` are re-read. `[server] listen`, `[tls]`, `[[l4]]` and the thread
+reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[tls]`, `[[l4]]` and the thread
 count still cannot change without a restart (same as the proxy).
 
 ### Builder
@@ -180,7 +178,7 @@ count still cannot change without a restart (same as the proxy).
 ```rust
 let config = Config::load()?            // or Config::new() (defaults only), Config::from_file("app.toml")?
     .builder()
-    .listen("0.0.0.0:8080")             // [server].listen
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -189,7 +187,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
     .build();
 ```
 
-Typed setters: `listen`, `threads`, `tls_only`, `h2c_enabled`, `http2_enabled`, `log_level`, `openapi_enabled`,
+Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
 `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
 `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
@@ -455,9 +453,10 @@ The default is plaintext. To serve HTTPS (HTTP/1.1 + HTTP/2 via ALPN):
 let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cert.pem", "/etc/veil/key.pem").build();
 ```
 
-`tls()` sets `[tls] cert_path/key_path` and turns off the h2c-only mode (`h2c_enabled = false`,
-`h2c_http1 = false`). Add `.http3("0.0.0.0:8443")` (needs the `http3` feature, included in `full`) for HTTP/3 on a
-UDP port. All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
+`listen(addr)` is the TLS listener (`[server].listen`) and `tls()` sets `[tls] cert_path/key_path`; the library's default
+plaintext listener (`listen_cleartext = "0.0.0.0:8080"`) stays unless you change it. Move it with `listen_cleartext(..)`,
+or make it redirect to the TLS port with `.secure_redirect(true)`. Add `.http3("0.0.0.0:8443")` (needs the `http3`
+feature, included in `full`) for HTTP/3 on a UDP port (`[http3] enabled = true` + `[http3] listen`). All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
 `set(..)`. The security sandbox is **off** by default in library mode; enabling `enable_seccomp` /
 `enable_landlock` is possible but must allow whatever your handlers do (files, sockets, DNS).
 
@@ -501,7 +500,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* or veil_config_from_file("config.toml") */
-    veil_config_listen(cfg, "0.0.0.0:8080");
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* plaintext; TLS: veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* blocks; consumes cfg */
 }
@@ -546,7 +545,7 @@ def hello(name: str, greeting: str = "Hello"):          # name: path, greeting: 
 def create_user(body: dict):
     return body
 
-veil.run(listen="0.0.0.0:8080")                         # blocks; Ctrl-C / SIGTERM stops gracefully
+veil.run(listen_cleartext="0.0.0.0:8080")               # blocks; Ctrl-C / SIGTERM stops gracefully
 ```
 
 - Decorators: `@veil.get/post/put/delete/patch/route`, or `app = veil.App(title=..., version=...)` with
@@ -558,7 +557,7 @@ veil.run(listen="0.0.0.0:8080")                         # blocks; Ctrl-C / SIGTE
   handler pool, so the event loop never waits for the GIL. `offload=False` runs on the network worker and is for
   trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
   several processes.
-- Configuration: `veil.run(config_path=None, *, listen, threads, overrides={"server.threads": 4}, openapi=True)`;
+- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
 Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Examples:

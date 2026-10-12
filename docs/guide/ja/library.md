@@ -128,10 +128,8 @@ fn main() -> Result<(), veil::api::Error> {
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true     # 平文 HTTP/2（prior knowledge）と ...
-h2c_http1 = true       # ... 同じポートの平文 HTTP/1.1
-tls_only = false
+listen_cleartext = "0.0.0.0:8080"  # 平文 HTTP/1.1 + h2c（prior knowledge）をプロトコル検出で判別。`listen` も [tls] も無い
+enable_secure_redirect = false     # 平文で配信する（サーバの既定は HTTPS への 301）
 http2_enabled = true
 
 [logging]
@@ -166,14 +164,14 @@ openapi_version = "0.1.0"
 （[ルーティングマクロ](#ルーティングマクロ)）。
 
 同じ合成が SIGHUP リロードのたびに行われるので、ビルダと環境変数の上書きは **リロード後も保たれます**。読み直されるのは
-`config.toml` の内容だけです。`[server] listen`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
+`config.toml` の内容だけです。`[server] listen` / `listen_cleartext`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
 
 ### ビルダ
 
 ```rust
 let config = Config::load()?            // または Config::new()（既定設定だけ）、Config::from_file("app.toml")?
     .builder()
-    .listen("0.0.0.0:8080")             // [server].listen
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -182,7 +180,7 @@ let config = Config::load()?            // または Config::new()（既定設�
     .build();
 ```
 
-型付きのセッタは `listen`・`threads`・`tls_only`・`h2c_enabled`・`http2_enabled`・`log_level`・`openapi_enabled`・
+型付きのセッタは `listen_cleartext`（平文のアドレス）・`listen`（TLS のアドレス）・`allow_http`・`allow_h2c`・`secure_redirect`・`threads`・`http2_enabled`・`log_level`・`openapi_enabled`・
 `openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`max_body_size`・`handler_threads`・
 `tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
 `Config::to_toml_string()` は合成結果（環境変数の上書きとルート注入の前）を返すので、デバッグに使えます。
@@ -435,8 +433,10 @@ TOML を書かずに `App::l4_tcp(name, listen, f)` / `App::l4_udp(name, listen,
 let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cert.pem", "/etc/veil/key.pem").build();
 ```
 
-`tls()` は `[tls] cert_path/key_path` を設定し、h2c 専用モードを解除します（`h2c_enabled = false`、`h2c_http1 = false`）。
-`.http3("0.0.0.0:8443")` を足すと UDP ポートで HTTP/3 も受けます（`http3` feature が必要で、`full` に含まれます）。
+`listen(addr)` が TLS のリスナー（`[server].listen`）で、`tls()` が `[tls] cert_path/key_path` です。ライブラリ既定の平文リスナー
+（`listen_cleartext = "0.0.0.0:8080"`）はそのまま残るので、`listen_cleartext(..)` で移すか、`.secure_redirect(true)` で TLS ポートへの
+リダイレクトにします。`.http3("0.0.0.0:8443")` を足すと UDP ポートで HTTP/3 も受けます（`http3` feature が必要で、`full` に含まれます。
+`[http3] enabled = true` + `[http3] listen`）。
 そのほかの `[tls]`・`[http2]`・`[http3]`・`[security]` のキーは `config.toml` か `set(..)` で設定します。ライブラリモードでは
 サンドボックスは **既定でオフ** です。`enable_seccomp` / `enable_landlock` を有効にすることもできますが、ハンドラが行う操作
 （ファイル・ソケット・DNS）を許可する必要があります。
@@ -479,7 +479,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* または veil_config_from_file("config.toml") */
-    veil_config_listen(cfg, "0.0.0.0:8080");
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* 平文。TLS は veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* ブロックする。cfg は消費される */
 }
@@ -523,7 +523,7 @@ def hello(name: str, greeting: str = "Hello"):          # name はパス、greet
 def create_user(body: dict):
     return body
 
-veil.run(listen="0.0.0.0:8080")                         # ブロックする。Ctrl-C / SIGTERM で graceful に停止
+veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする。Ctrl-C / SIGTERM で graceful に停止
 ```
 
 - デコレータは `@veil.get/post/put/delete/patch/route`。`app = veil.App(title=..., version=...)` を作って `@app.get(...)`・`app.run()` も使えます。
@@ -533,7 +533,7 @@ veil.run(listen="0.0.0.0:8080")                         # ブロックする。C
 - **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）ではハンドラ用プールで実行されるので、
   イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
   純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
-- 設定: `veil.run(config_path=None, *, listen, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
+- 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは
 [examples/api/python-hello/](../../../examples/api/python-hello/)・

@@ -98,12 +98,12 @@ HTTP/2をサポートしないクライアントは自動的にHTTP/1.1にフォ
 ### H2C (HTTP/2 Cleartext) サーバー
 
 VeilはH2C（HTTP/2 Cleartext、Prior Knowledgeモード）サーバーとしても動作できます。TLSなしでHTTP/2接続を受け付けます。
+h2c と平文 HTTP/1.1 は平文リスナー `[server].listen_cleartext` で受け、プロトコル検出で判別します（F-200）。
 
 #### 特徴
 
 - **Prior Knowledgeモード**: RFC 7540 Section 3.4に準拠したH2C接続
-- **プロトコル自動検出**: 同一ポートでTLS、H2C、HTTP/1.1を自動判別
-- **専用リスナー**: H2C専用ポートでのリッスンも可能
+- **プロトコル自動検出**: 平文リスナーで h2c と平文 HTTP/1.1 を自動判別（TLS は別リスナー `listen`）
 - **内部ネットワーク向け**: 平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
 
 #### 有効化
@@ -116,12 +116,10 @@ cargo build --release --features http2
 ```toml
 # config.toml
 [server]
-# H2Cサーバーを有効化
-h2c_enabled = true
-
-# H2C専用リッスンアドレス（オプション）
-# 未指定の場合は server.listen と同じアドレスを使用
-h2c_listen = "0.0.0.0:8080"
+listen_cleartext = "0.0.0.0:8080"   # 平文: HTTP/1.1 + h2c
+enable_secure_redirect = false      # 平文で配信する（既定は HTTPS への 301 で、`listen` が要る）
+# allow_http = true                 # 平文 HTTP/1.1 を受ける（false なら 426）
+# allow_h2c = true                  # h2c を受ける（false なら GOAWAY）
 ```
 
 #### 使用方法
@@ -134,12 +132,12 @@ curl --http2-prior-knowledge http://localhost:8080/
 #### 注意事項
 
 - `--features http2` でビルドする必要があります
-- **既定では TLS ポート（`[server].listen`）で h2c / 平文 HTTP/1.1 を受理しません**
-  （`[server].tls_only = true` が既定。F-163）。TLS ポートと同居させたい場合は
-  `tls_only = false` を明示するか、`h2c_listen` で専用ポートを分けてください
+- **TLS リスナー（`[server].listen`）は平文を受け付けません**。h2c / 平文 HTTP/1.1 は別ポートの
+  `listen_cleartext` で受けます（`listen` を書かなければ平文専用サーバで、`[tls]` も不要）
 - 平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
 - ALPNネゴシエーションは行われません（Prior Knowledgeモード）
 - プロトコル検出は接続開始時の最初の数バイトを確認して行われます
+- 規則と移行表は[リスナー](configuration.md#リスナーlisten-と-listen_cleartext)を参照
 
 ## HTTP/3サポート
 
@@ -165,7 +163,9 @@ cargo build --release --features http3
 # config.toml
 [server]
 listen = "0.0.0.0:443"
-http3_enabled = true  # HTTP/3を有効化（QUIC/UDP）
+
+[http3]
+enabled = true  # HTTP/3を有効化（QUIC/UDP）。listen と同じアドレスで起動。`listen` と [tls] が必要
 ```
 
 ### 詳細設定
@@ -225,7 +225,7 @@ initial_max_streams_uni = 100
 gso_gro_enabled = false
 
 # Alt-Svc（HTTP/1.1・HTTP/2 応答での HTTP/3 広告、F-94）
-# 関連キーはすべて [http3] に集約。server.http3_enabled = true のときのみ有効。
+# 関連キーはすべて [http3] に集約。[http3] enabled = true のときのみ有効。
 alt_svc_enabled = true          # 既定: true。false で広告を抑制
 # alt_svc = "h3=\":443\"; ma=86400"  # 任意の全文上書き（未指定時は listen ポートから自動生成）
 # alt_svc_ma_secs = 86400            # 自動生成時の max-age（秒、既定 86400）
@@ -235,7 +235,7 @@ alt_svc_enabled = true          # 既定: true。false で広告を抑制
 
 - HTTP/3はUDPベースのため、**kTLSは使用不可**です（TCPを使用しないため）
 - UDPポート443をファイアウォールで開放する必要があります
-- `server.http3_enabled = true` のとき、HTTP/1.1・HTTP/2 応答に `Alt-Svc` で HTTP/3 を広告します（設定はすべて `[http3]`：`alt_svc_enabled`、任意で `alt_svc` / `alt_svc_ma_secs`）
+- `[http3] enabled = true` のとき、HTTP/1.1・HTTP/2 応答に `Alt-Svc` で HTTP/3 を広告します（設定はすべて `[http3]`：`alt_svc_enabled`、任意で `alt_svc` / `alt_svc_ma_secs`）
 
 ## WebSocketサポート
 

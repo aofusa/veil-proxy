@@ -95,6 +95,37 @@ When limits are exceeded, the server responds with `ENHANCE_YOUR_CALM` (0xb) err
 
 Clients that don't support HTTP/2 automatically fall back to HTTP/1.1.
 
+### H2C (HTTP/2 Cleartext) Server
+
+Veil can also serve h2c (HTTP/2 cleartext, prior knowledge mode, RFC 7540 §3.4) without TLS. h2c and plaintext
+HTTP/1.1 are accepted on the plaintext listener `[server].listen_cleartext`, told apart by protocol detection (F-200).
+
+```bash
+# Build with the HTTP/2 feature
+cargo build --release --features http2
+```
+
+```toml
+# config.toml
+[server]
+listen_cleartext = "0.0.0.0:8080"   # plaintext: HTTP/1.1 + h2c
+enable_secure_redirect = false      # serve plaintext (the default is a 301 to HTTPS and needs `listen`)
+# allow_http = true                 # accept plaintext HTTP/1.1 (426 when false)
+# allow_h2c = true                  # accept h2c (GOAWAY when false)
+```
+
+```bash
+curl --http2-prior-knowledge http://localhost:8080/
+```
+
+Notes:
+
+- Requires `--features http2`.
+- The TLS listener (`[server].listen`) never accepts plaintext; put h2c / plaintext HTTP/1.1 on `listen_cleartext`
+  (a separate port). With no `listen`, the server is plaintext-only and needs no `[tls]`.
+- There is no ALPN negotiation (prior knowledge). Do not expose plaintext listeners to untrusted networks.
+- See [Listeners](configuration.md#listeners-listen-and-listen_cleartext) for the full rules and the migration table.
+
 ## HTTP/3 Support
 
 Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https://github.com/cloudflare/quiche).
@@ -121,7 +152,9 @@ cargo build --release --features http3
 # config.toml
 [server]
 listen = "0.0.0.0:443"
-http3_enabled = true  # Enable HTTP/3 (QUIC/UDP)
+
+[http3]
+enabled = true  # Enable HTTP/3 (QUIC/UDP) on listen's address; needs `listen` and [tls]
 ```
 
 ### Advanced Configuration
@@ -130,7 +163,7 @@ Configure detailed HTTP/3 (QUIC) protocol parameters in the `[http3]` section:
 
 ```toml
 [http3]
-# HTTP/3 listen address (UDP, defaults to server.listen if unspecified)
+# HTTP/3 listen address (UDP, defaults to the address of server.listen if unspecified)
 listen = "0.0.0.0:443"
 
 # Maximum idle timeout (milliseconds, default: 30000)
@@ -189,7 +222,7 @@ initial_max_streams_uni = 100
 gso_gro_enabled = false
 
 # Alt-Svc (HTTP/3 advertisement on HTTP/1.1 and HTTP/2 responses; F-94)
-# All Alt-Svc keys live under [http3]. Effective only when server.http3_enabled = true.
+# All Alt-Svc keys live under [http3]. Effective only when [http3] enabled = true.
 alt_svc_enabled = true          # default: true; set false to suppress advertising
 # alt_svc = "h3=\":443\"; ma=86400"  # optional full override (auto from listen port if omitted)
 # alt_svc_ma_secs = 86400            # max-age for auto-generated value (default: 86400)
@@ -199,7 +232,7 @@ alt_svc_enabled = true          # default: true; set false to suppress advertisi
 
 - HTTP/3 is UDP-based, so **kTLS cannot be used** (doesn't use TCP)
 - UDP port 443 must be opened in the firewall
-- When `server.http3_enabled = true`, HTTP/1.1 and HTTP/2 responses advertise HTTP/3 via `Alt-Svc` (all options under `[http3]`: `alt_svc_enabled`, optional `alt_svc` / `alt_svc_ma_secs`)
+- When `[http3] enabled = true`, HTTP/1.1 and HTTP/2 responses advertise HTTP/3 via `Alt-Svc` (all options under `[http3]`: `alt_svc_enabled`, optional `alt_svc` / `alt_svc_ma_secs`)
 
 ## WebSocket Support
 

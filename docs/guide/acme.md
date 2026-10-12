@@ -73,7 +73,7 @@ storage_dir = "/var/lib/veil/acme"
 The responder is a tiny plaintext HTTP/1.1 server on its own thread. It answers
 `GET /.well-known/acme-challenge/<token>` with the key authorization, and answers every other request with a
 `301` redirect to `https://<Host><path>`, so port 80 can double as the HTTP→HTTPS redirect (you do not need
-`[server] http` for it; do not bind both to the same port). It handles at most 64 connections at a time.
+`[server] listen_cleartext` for it; do not bind both to the same port). It handles at most 64 connections at a time.
 
 If something else already serves port 80 (a load balancer, another proxy, a Kubernetes Ingress), set
 `challenge_listen = ""` or a high port such as `"0.0.0.0:8080"` and forward

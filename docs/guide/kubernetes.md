@@ -34,6 +34,7 @@ docker build -f docker/Dockerfile.glibc --build-arg CARGO_FEATURES=full-containe
 | Concern | How |
 |---------|-----|
 | Config file | ConfigMap mounted at `/etc/veil/conf.d/config.toml` |
+| Listeners | `[server] listen = "0.0.0.0:8443"` (TLS) and `listen_cleartext = "0.0.0.0:8080"` (plaintext HTTP/1.1 + h2c) with `enable_secure_redirect = false`, because the mesh already encrypts Pod-to-Pod traffic ([Listeners](configuration.md#listeners-listen-and-listen_cleartext)) |
 | Per-environment differences | `VEIL_OVERRIDE_<n>` environment variables ([running.md](running.md#configuration-override-via-environment-variables-veil_override_n)); the overlays enable VDS with `VEIL_OVERRIDE_3='vds.enabled = true'` |
 | TLS certificate | Secret mounted as a directory (never with `subPath`) and `[tls] auto_reload = true`; Secret updates are picked up through the `..data` symlink swap ([tls.md](tls.md#certificates-and-keys-in-containers)) |
 | Dynamic routes | [VDS](vds.md): update the `veil-vds-snapshot` ConfigMap; the kubelet syncs it to the control plane within about a minute and veil applies it |

@@ -138,7 +138,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - リスナーは必ず `server::create_listener`（UDS は `server::bind_unix_listener`）経由で作る（F-156/F-164）。
 - ワーカーを増やすときは共有すべき状態（LB 状態・接続数カウンタ・ヘルスチェッカー）をリスナーにつき 1 個にする（F-156）。
-- `[server].tls_only` は既定 `true`。平文 h2c / HTTP/1.1 の計測・テストは `h2c_listen` か `tls_only = false` を使う（F-163/B-80）。
+- `[server].listen` は TLS 専用（平文は受けない）。平文 HTTP/1.1・h2c の計測・テストは `[server].listen_cleartext` に
+  `enable_secure_redirect = false` を付けて使う（既定の `true` は https への 301 だけを返す。F-163/B-80/F-200）。
 - `SO_ATTACH_REUSEPORT_CBPF` は classic BPF。使えるのは ancillary ロードのみ（B-76）。
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
 - キープアライブ待ちの接続は読み取りバッファを持たない（readiness を待ってから借りる）。mimalloc の

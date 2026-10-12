@@ -33,6 +33,7 @@ docker build -f docker/Dockerfile.glibc --build-arg CARGO_FEATURES=full-containe
 | 項目 | 方法 |
 |------|------|
 | 設定ファイル | ConfigMap を `/etc/veil/conf.d/config.toml` にマウント |
+| リスナー | `[server] listen = "0.0.0.0:8443"`（TLS）と `listen_cleartext = "0.0.0.0:8080"`（平文 HTTP/1.1 + h2c）。Pod 間はメッシュが暗号化するので `enable_secure_redirect = false`（[リスナー](configuration.md#リスナーlisten-と-listen_cleartext)） |
 | 環境ごとの差分 | 環境変数 `VEIL_OVERRIDE_<n>`（[running.md](running.md#環境変数による設定の上書きveil_override_n)）。overlay は `VEIL_OVERRIDE_3='vds.enabled = true'` で VDS を有効にする |
 | TLS 証明書 | Secret をディレクトリでマウント（`subPath` は使わない）し `[tls] auto_reload = true`。Secret の更新（`..data` の付け替え）に追従する（[tls.md](tls.md#コンテナでの証明書秘密鍵)） |
 | 動的なルート | [VDS](vds.md)。`veil-vds-snapshot` ConfigMap を更新すると、kubelet が 1 分程度で制御プレーンへ同期し、veil が適用する |
