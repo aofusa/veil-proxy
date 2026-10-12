@@ -74,3 +74,6 @@ __pycache__/
 /target-prof/
 /target-prof-bins/
 tools/perf/alloc_bench/target/
+
+# maturin develop の成果物（ビルドで作る。リポジトリには入れない）
+crates/veil-python/python/veil/*.so
