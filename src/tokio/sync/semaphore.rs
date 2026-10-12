@@ -67,6 +67,7 @@ impl Semaphore {
     /// 許可数の上限。
     pub const MAX_PERMITS: usize = usize::MAX >> 3;
 
+    #[track_caller]
     pub fn new(permits: usize) -> Semaphore {
         assert!(
             permits <= Self::MAX_PERMITS,
@@ -258,7 +259,18 @@ impl Future for Acquire<'_> {
     type Output = Result<(), AcquireError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+        let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
+        let r = self.get_mut().poll_inner(cx);
+        if r.is_ready() {
+            coop.made_progress();
+        }
+        r
+    }
+}
+
+impl Acquire<'_> {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), AcquireError>> {
+        let this = self;
         if let Some(node) = &this.node {
             if node.granted.load(Ordering::Acquire) {
                 this.done = true;
@@ -366,6 +378,7 @@ impl SemaphorePermit<'_> {
         self.permits
     }
 
+    #[track_caller]
     pub fn merge(&mut self, mut other: Self) {
         assert!(
             std::ptr::eq(self.sem, other.sem),
@@ -421,6 +434,7 @@ impl OwnedSemaphorePermit {
         &self.sem
     }
 
+    #[track_caller]
     pub fn merge(&mut self, mut other: Self) {
         assert!(
             Arc::ptr_eq(&self.sem, &other.sem),

@@ -229,22 +229,46 @@ pub(crate) fn safe_waker(w: &Waker) -> Waker {
 /// Waker の置き場（同じ Waker なら包み直さない）。sync・JoinHandle・タイマーが使う。
 #[derive(Default)]
 pub(crate) struct WakerSlot {
-    stored: Option<(Waker, Waker)>, // (元の Waker, 包んだ Waker)
+    /// 登録した Waker（ドライバのあるスレッドの Waker は包んだもの）。1 つだけ持つ（参照数を増やさない）
+    stored: Option<Waker>,
+}
+
+/// `stored`（包んだかもしれない Waker）が `w` と同じタスクを起こすか。
+fn same_task(stored: &Waker, w: &Waker) -> bool {
+    if stored.will_wake(w) {
+        return true;
+    }
+    if is_safe(stored) && !is_safe(w) {
+        // SAFETY: 包んだ Waker の data は SafeWakerInner を指す
+        let inner = unsafe { &*(stored.data() as *const SafeWakerInner) };
+        return inner.waker.will_wake(w);
+    }
+    false
 }
 
 impl WakerSlot {
     /// `w` を登録する。
     pub(crate) fn register(&mut self, w: &Waker) {
-        if let Some((orig, _)) = &self.stored {
-            if orig.will_wake(w) {
+        if let Some(stored) = &self.stored {
+            if same_task(stored, w) {
                 return;
             }
         }
-        self.stored = Some((w.clone(), safe_waker(w)));
+        self.stored = Some(safe_waker(w));
+    }
+
+    /// 登録して、入れ替えた古い Waker を返す（呼び出し側がロックの外で落とす）。
+    pub(crate) fn replace(&mut self, w: &Waker) -> Option<Waker> {
+        if let Some(stored) = &self.stored {
+            if same_task(stored, w) {
+                return None;
+            }
+        }
+        self.stored.replace(safe_waker(w))
     }
 
     pub(crate) fn take(&mut self) -> Option<Waker> {
-        self.stored.take().map(|(_, s)| s)
+        self.stored.take()
     }
 
     pub(crate) fn wake(&mut self) {
@@ -315,7 +339,10 @@ impl<F: Future> Future for WithSafeWaker<F> {
             }
         };
         let mut inner = std::task::Context::from_waker(&w);
-        let r = unsafe { Pin::new_unchecked(&mut this.fut) }.poll(&mut inner);
+        crate::tokio::time::note_activity();
+        let r = crate::tokio::task::coop::with_budget(|| {
+            unsafe { Pin::new_unchecked(&mut this.fut) }.poll(&mut inner)
+        });
         touch_exit_sentinel();
         r
     }

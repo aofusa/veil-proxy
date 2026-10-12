@@ -59,6 +59,9 @@ pub(crate) struct IoSource {
     fd: OwnedFd,
     read: Mutex<WaitSlot>,
     write: Mutex<WaitSlot>,
+    /// 準備できたことを覚える（tokio と同じく、操作が `WouldBlock` を返すまで準備できたままとみなす）
+    read_ready: std::sync::atomic::AtomicBool,
+    write_ready: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for IoSource {
@@ -66,6 +69,19 @@ impl std::fmt::Debug for IoSource {
         f.debug_struct("IoSource")
             .field("fd", &self.fd.as_raw_fd())
             .finish()
+    }
+}
+
+/// ソケットを作る・std から取り込むときの検査（tokio と同じく、ランタイムの外・I/O 無効なら panic）。
+#[track_caller]
+fn check_io_context() {
+    if !crate::runtime::has_driver() && crate::tokio::runtime::Handle::try_current().is_err() {
+        panic!(
+            "there is no reactor running, must be called from the context of a Tokio 1.x runtime"
+        );
+    }
+    if !crate::tokio::runtime::io_enabled_in_context() {
+        panic!("A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime builder to enable IO.");
     }
 }
 
@@ -83,6 +99,8 @@ impl IoSource {
             fd,
             read: Mutex::new(WaitSlot::default()),
             write: Mutex::new(WaitSlot::default()),
+            read_ready: std::sync::atomic::AtomicBool::new(false),
+            write_ready: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -90,8 +108,32 @@ impl IoSource {
         self.fd.as_raw_fd()
     }
 
+    fn ready_flag(&self, write: bool) -> &std::sync::atomic::AtomicBool {
+        if write {
+            &self.write_ready
+        } else {
+            &self.read_ready
+        }
+    }
+
+    /// 操作の結果を見て、`WouldBlock` なら準備の記憶を消す。
+    fn track<R>(&self, write: bool, r: io::Result<R>) -> io::Result<R> {
+        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            self.ready_flag(write)
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        r
+    }
+
     fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         require_runtime();
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+        if self
+            .ready_flag(write)
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Poll::Ready(Ok(()));
+        }
         let me = std::thread::current().id();
         let mut slot = if write {
             self.write.lock().unwrap()
@@ -116,6 +158,10 @@ impl IoSource {
         crate::tokio::waker::touch_exit_sentinel();
         let r = ready!(r);
         slot.pending = None;
+        if r.is_ok() {
+            self.ready_flag(write)
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Poll::Ready(r)
     }
 
@@ -137,6 +183,8 @@ impl IoSource {
         loop {
             match f() {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.ready_flag(write)
+                        .store(false, std::sync::atomic::Ordering::Release);
                     ready!(self.poll_ready(write, cx))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -475,7 +523,9 @@ impl TcpStream {
     }
 
     /// std の接続から作る（ノンブロッキングにする）。
+    #[track_caller]
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
+        check_io_context();
         stream.set_nonblocking(true)?;
         let fd: OwnedFd = stream.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -617,12 +667,18 @@ impl TcpStream {
     }
 
     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        cvt(unsafe { libc::recv(self.io.raw(), buf.as_mut_ptr().cast(), buf.len(), 0) })
+        self.io.track(
+            false,
+            cvt(unsafe { libc::recv(self.io.raw(), buf.as_mut_ptr().cast(), buf.len(), 0) }),
+        )
     }
 
     pub fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
         let dst = buf.chunk_mut();
-        let n = cvt(unsafe { libc::recv(self.io.raw(), dst.as_mut_ptr().cast(), dst.len(), 0) })?;
+        let n = self.io.track(
+            false,
+            cvt(unsafe { libc::recv(self.io.raw(), dst.as_mut_ptr().cast(), dst.len(), 0) }),
+        )?;
         // SAFETY: n バイトは recv で初期化された
         unsafe { buf.advance_mut(n) };
         Ok(n)
@@ -639,11 +695,11 @@ impl TcpStream {
     }
 
     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
-        sys_send(self.io.raw(), buf)
+        self.io.track(true, sys_send(self.io.raw(), buf))
     }
 
     pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        sys_writev(self.io.raw(), bufs)
+        self.io.track(true, sys_writev(self.io.raw(), bufs))
     }
 
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -992,7 +1048,9 @@ impl TcpListener {
         }))
     }
 
+    #[track_caller]
     pub fn from_std(listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        check_io_context();
         listener.set_nonblocking(true)?;
         let fd: OwnedFd = listener.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -1361,7 +1419,9 @@ impl UdpSocket {
         }))
     }
 
+    #[track_caller]
     pub fn from_std(socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
+        check_io_context();
         socket.set_nonblocking(true)?;
         let fd: OwnedFd = socket.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -1835,7 +1895,9 @@ impl UnixStream {
         Ok((UnixStream::from_std(a)?, UnixStream::from_std(b)?))
     }
 
+    #[track_caller]
     pub fn from_std(stream: std::os::unix::net::UnixStream) -> io::Result<UnixStream> {
+        check_io_context();
         stream.set_nonblocking(true)?;
         let fd: OwnedFd = stream.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -1952,11 +2014,15 @@ pub struct UnixListener {
 }
 
 impl UnixListener {
+    #[track_caller]
     pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<UnixListener> {
+        check_io_context();
         UnixListener::from_std(std::os::unix::net::UnixListener::bind(path)?)
     }
 
+    #[track_caller]
     pub fn from_std(listener: std::os::unix::net::UnixListener) -> io::Result<UnixListener> {
+        check_io_context();
         listener.set_nonblocking(true)?;
         let fd: OwnedFd = listener.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -2085,7 +2151,9 @@ impl UnixDatagram {
         Ok((UnixDatagram::from_std(a)?, UnixDatagram::from_std(b)?))
     }
 
+    #[track_caller]
     pub fn from_std(d: std::os::unix::net::UnixDatagram) -> io::Result<UnixDatagram> {
+        check_io_context();
         d.set_nonblocking(true)?;
         let fd: OwnedFd = d.into();
         set_nonblocking_cloexec(fd.as_raw_fd())?;
@@ -2359,6 +2427,7 @@ struct IoSourceRef {
 impl IoSourceRef {
     fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         require_runtime();
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         let me = std::thread::current().id();
         let mut slot = if write {
             self.write.lock().unwrap()
@@ -2435,29 +2504,28 @@ impl<T: AsRawFd> std::fmt::Debug for AsyncFd<T> {
 }
 
 impl<T: AsRawFd> AsyncFd<T> {
+    #[track_caller]
     pub fn new(inner: T) -> io::Result<AsyncFd<T>> {
         AsyncFd::with_interest(inner, Interest::READABLE | Interest::WRITABLE)
     }
 
+    #[track_caller]
     pub fn with_interest(inner: T, interest: Interest) -> io::Result<AsyncFd<T>> {
         AsyncFd::try_with_interest(inner, interest).map_err(|e| e.cause)
     }
 
+    #[track_caller]
     pub fn try_new(inner: T) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
         AsyncFd::try_with_interest(inner, Interest::READABLE | Interest::WRITABLE)
     }
 
+    #[track_caller]
     pub fn try_with_interest(
         inner: T,
         interest: Interest,
     ) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
         if !crate::runtime::has_driver() {
-            return Err(AsyncFdTryNewError {
-                inner,
-                cause: io::Error::other(
-                    "there is no reactor running, must be called from the context of a Tokio 1.x runtime",
-                ),
-            });
+            panic!("there is no reactor running, must be called from the context of a Tokio 1.x runtime");
         }
         let fd = inner.as_raw_fd();
         Ok(AsyncFd {

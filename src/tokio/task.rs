@@ -267,7 +267,10 @@ impl<F: Future> Future for TaskCell<F> {
         let id = this.state.id;
         let prev = CURRENT_ID.with(|c| c.replace(Some(id)));
         let fut = this.future.as_mut().unwrap().as_mut();
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(&mut inner_cx)));
+        crate::tokio::time::note_activity();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coop::with_budget(|| fut.poll(&mut inner_cx))
+        }));
         CURRENT_ID.with(|c| c.set(prev));
         crate::tokio::waker::touch_exit_sentinel();
         match r {
@@ -350,8 +353,10 @@ impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let coop = std::task::ready!(coop::poll_proceed(cx));
         let mut g = self.state.core.inner.lock().unwrap();
         if g.finished {
+            coop.made_progress();
             drop(g);
             return Poll::Ready(match self.state.result.lock().unwrap().take() {
                 Some(r) => r,
@@ -424,6 +429,10 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
+    let in_local_set = LOCAL_SET.with(|ls| ls.borrow().is_some());
+    if !in_local_set && !super::runtime::in_local_capable_context() {
+        panic!("`spawn_local` called from outside of a `task::LocalSet` or LocalRuntime");
+    }
     if crate::runtime::has_driver() {
         return spawn_here(future);
     }
@@ -479,11 +488,15 @@ where
 }
 
 /// `tokio::task::block_in_place`（そのまま呼ぶ。veil のワーカーでは他のタスクを止める点に注意）。
+#[track_caller]
 pub fn block_in_place<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    f()
+    if super::runtime::in_current_thread_runtime() {
+        panic!("can call blocking only when running on the multi-threaded runtime");
+    }
+    coop::with_unconstrained(f)
 }
 
 /// 1 回だけ他のタスクに譲る。
@@ -501,37 +514,103 @@ pub async fn yield_now() {
     .await
 }
 
-/// 協調的スケジューリングの予算（このレイヤーには予算が無いので何もしない）。
-pub async fn consume_budget() {}
+/// 協調的スケジューリングの予算を 1 つ使う（使い切っていれば 1 回譲る）。
+pub async fn consume_budget() {
+    coop::consume_budget().await
+}
 
 pub use coop::{unconstrained, Unconstrained};
 
-/// `tokio::task::coop`（協調的スケジューリングの予算）。このレイヤーには予算が無く、常に進んでよい。
+/// `tokio::task::coop`（協調的スケジューリングの予算）。tokio と同じく、タスクの 1 回の poll に 128 の予算を与え、
+/// 葉のリソース（チャネル・タイマー・I/O 等）が 1 つずつ使う。使い切ると `Pending` を返して他のタスクに譲る。
 pub mod coop {
+    use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    /// `poll_proceed` が返す印（何もしない）。
-    #[derive(Debug)]
-    pub struct RestoreOnPending(());
+    const INITIAL: u8 = 128;
 
-    impl RestoreOnPending {
-        pub fn made_progress(&self) {}
+    thread_local! {
+        /// `None` は制限なし（タスクの外・`unconstrained` の中）
+        static BUDGET: Cell<Option<u8>> = const { Cell::new(None) };
     }
 
-    /// 予算が残っているか（常に進んでよい）。
-    pub fn poll_proceed(_cx: &mut Context<'_>) -> Poll<RestoreOnPending> {
-        Poll::Ready(RestoreOnPending(()))
+    /// `f` をタスクの 1 回の poll として、新しい予算で動かす。
+    pub(crate) fn with_budget<R>(f: impl FnOnce() -> R) -> R {
+        with_value(Some(INITIAL), f)
+    }
+
+    /// `f` を予算なしで動かす。
+    pub(crate) fn with_unconstrained<R>(f: impl FnOnce() -> R) -> R {
+        with_value(None, f)
+    }
+
+    fn with_value<R>(v: Option<u8>, f: impl FnOnce() -> R) -> R {
+        struct Reset(Option<u8>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let _ = BUDGET.try_with(|b| b.set(self.0));
+            }
+        }
+        let prev = BUDGET.with(|b| b.replace(v));
+        let _r = Reset(prev);
+        f()
+    }
+
+    /// `poll_proceed` が返す印。進めなかったら（`made_progress` を呼ばずに drop したら）予算を返す。
+    #[derive(Debug)]
+    pub struct RestoreOnPending(Cell<Option<u8>>);
+
+    impl RestoreOnPending {
+        pub fn made_progress(&self) {
+            self.0.set(None);
+        }
+    }
+
+    impl Drop for RestoreOnPending {
+        fn drop(&mut self) {
+            if let Some(v) = self.0.get() {
+                let _ = BUDGET.try_with(|b| b.set(Some(v)));
+            }
+        }
+    }
+
+    /// 予算を 1 つ使う。使い切っていれば Waker を起こして `Pending`。
+    pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<RestoreOnPending> {
+        BUDGET.with(|b| match b.get() {
+            None => Poll::Ready(RestoreOnPending(Cell::new(None))),
+            Some(0) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Some(n) => {
+                b.set(Some(n - 1));
+                Poll::Ready(RestoreOnPending(Cell::new(Some(n))))
+            }
+        })
+    }
+
+    /// 予算を使って進めたことにする（葉のリソース用）。
+    pub(crate) fn poll_proceed_and_make_progress(cx: &mut Context<'_>) -> Poll<()> {
+        match poll_proceed(cx) {
+            Poll::Ready(r) => {
+                r.made_progress();
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     pub fn has_budget_remaining() -> bool {
-        true
+        BUDGET.with(|b| b.get() != Some(0))
     }
 
-    pub async fn consume_budget() {}
+    pub async fn consume_budget() {
+        std::future::poll_fn(poll_proceed_and_make_progress).await
+    }
 
-    /// 予算の制限を外した Future（このレイヤーではそのまま）。
+    /// 予算の制限を外した Future。
     #[derive(Debug)]
     #[must_use = "Unconstrained does nothing unless polled"]
     pub struct Unconstrained<F> {
@@ -542,7 +621,8 @@ pub mod coop {
         type Output = F::Output;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
             // SAFETY: inner は構造的にピン留めされる
-            unsafe { self.map_unchecked_mut(|s| &mut s.inner) }.poll(cx)
+            let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+            with_unconstrained(|| inner.poll(cx))
         }
     }
 
@@ -550,9 +630,28 @@ pub mod coop {
         Unconstrained { inner }
     }
 
-    /// 予算に従う Future（このレイヤーではそのまま）。
-    pub fn cooperative<F: Future>(fut: F) -> F {
-        fut
+    /// 予算に従う Future（poll ごとに予算を 1 つ使う）。
+    pub fn cooperative<F: Future>(fut: F) -> Cooperative<F> {
+        Cooperative { fut }
+    }
+
+    /// `cooperative` の Future。
+    #[derive(Debug)]
+    pub struct Cooperative<F> {
+        fut: F,
+    }
+
+    impl<F: Future> Future for Cooperative<F> {
+        type Output = F::Output;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+            let coop = std::task::ready!(poll_proceed(cx));
+            // SAFETY: fut は構造的にピン留めされる
+            let r = unsafe { self.map_unchecked_mut(|s| &mut s.fut) }.poll(cx);
+            if r.is_ready() {
+                coop.made_progress();
+            }
+            r
+        }
     }
 }
 
@@ -819,6 +918,7 @@ impl LocalSet {
     }
 
     /// `rt.block_on(local.run_until(future))`。
+    #[track_caller]
     pub fn block_on<F>(&self, rt: &super::runtime::Runtime, future: F) -> F::Output
     where
         F: Future,
@@ -884,6 +984,7 @@ impl<T: 'static> LocalKey<T> {
     }
 
     /// 同期版の `scope`。
+    #[track_caller]
     pub fn sync_scope<F: FnOnce() -> R, R>(&'static self, value: T, f: F) -> R {
         let prev = self.inner.with(|c| c.replace(Some(value)));
         struct Restore<T: 'static> {
@@ -903,6 +1004,7 @@ impl<T: 'static> LocalKey<T> {
         f()
     }
 
+    #[track_caller]
     pub fn with<F: FnOnce(&T) -> R, R>(&'static self, f: F) -> R {
         self.try_with(f).expect(
             "cannot access a task-local storage value without setting it via `LocalKey::set`",
@@ -918,6 +1020,7 @@ impl<T: 'static> LocalKey<T> {
 }
 
 impl<T: Clone + 'static> LocalKey<T> {
+    #[track_caller]
     pub fn get(&'static self) -> T {
         self.with(|v| v.clone())
     }

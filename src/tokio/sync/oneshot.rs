@@ -193,6 +193,7 @@ impl<T> Receiver<T> {
         r
     }
 
+    #[track_caller]
     pub fn blocking_recv(self) -> Result<T, RecvError> {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");
@@ -213,13 +214,15 @@ impl<T> Future for Receiver<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let Some(inner) = &this.inner else {
-            panic!("called after complete");
+            // 完了後の poll（tokio と同じく panic せずに閉じたことを返す）
+            return Poll::Ready(Err(RecvError(())));
         };
+        let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
         let r = {
             let mut st = inner.lock().unwrap();
             match st.value.take() {
                 Some(v) => Some(Ok(v)),
-                None if st.tx_dropped || st.complete => Some(Err(RecvError(()))),
+                None if st.tx_dropped || st.complete || st.rx_closed => Some(Err(RecvError(()))),
                 None => {
                     st.rx_waker.register(cx.waker());
                     None
@@ -228,6 +231,7 @@ impl<T> Future for Receiver<T> {
         };
         match r {
             Some(r) => {
+                coop.made_progress();
                 this.inner = None;
                 Poll::Ready(r)
             }

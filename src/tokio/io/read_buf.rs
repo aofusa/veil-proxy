@@ -53,6 +53,7 @@ impl<'a> ReadBuf<'a> {
         unsafe { &mut *(&mut self.buf[..self.filled] as *mut [MaybeUninit<u8>] as *mut [u8]) }
     }
 
+    #[track_caller]
     pub fn take(&mut self, n: usize) -> ReadBuf<'_> {
         let max = std::cmp::min(self.remaining(), n);
         // SAFETY: 未初期化を初期化済みとして見せない（initialized を引き継がない）
@@ -82,10 +83,12 @@ impl<'a> ReadBuf<'a> {
         &mut self.buf[self.filled..]
     }
 
+    #[track_caller]
     pub fn initialize_unfilled(&mut self) -> &mut [u8] {
         self.initialize_unfilled_to(self.remaining())
     }
 
+    #[track_caller]
     pub fn initialize_unfilled_to(&mut self, n: usize) -> &mut [u8] {
         assert!(self.remaining() >= n, "n overflows remaining");
         let end = self.filled + n;
@@ -108,11 +111,13 @@ impl<'a> ReadBuf<'a> {
         self.filled = 0;
     }
 
+    #[track_caller]
     pub fn advance(&mut self, n: usize) {
         let new = self.filled.checked_add(n).expect("filled overflow");
         self.set_filled(new);
     }
 
+    #[track_caller]
     pub fn set_filled(&mut self, n: usize) {
         assert!(
             n <= self.initialized,
@@ -130,6 +135,7 @@ impl<'a> ReadBuf<'a> {
         }
     }
 
+    #[track_caller]
     pub fn put_slice(&mut self, buf: &[u8]) {
         assert!(
             self.remaining() >= buf.len(),

@@ -32,6 +32,11 @@ struct HandleInner {
     kind: Kind,
     name: Option<String>,
     id: u64,
+    /// `enable_time` / `enable_io`（無効ならタイマー・I/O を作ると panic する。tokio と同じ）
+    time_enabled: bool,
+    io_enabled: bool,
+    /// `LocalRuntime`（`spawn_local` を受け付ける）
+    local: bool,
     /// ワーカー（マルチスレッド）または `block_on` しているスレッド（カレントスレッド）の受け口
     workers: Mutex<Vec<Arc<Injector>>>,
     /// 受け口ができる前に送られたタスク
@@ -109,6 +114,9 @@ impl Handle {
                 kind,
                 name: None,
                 id: NEXT.fetch_add(1, Ordering::Relaxed) as u64,
+                time_enabled: true,
+                io_enabled: true,
+                local: false,
                 workers: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
                 next: AtomicUsize::new(0),
@@ -240,6 +248,47 @@ impl Drop for EnterGuard<'_> {
             c.borrow_mut().pop();
         });
     }
+}
+
+/// 文脈がカレントスレッドのランタイム（`block_in_place` 不可）か。
+pub(crate) fn in_current_thread_runtime() -> bool {
+    CONTEXT
+        .try_with(|c| {
+            c.borrow()
+                .last()
+                .map(|h| h.inner.kind == Kind::CurrentThread)
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// `spawn_local` してよい文脈か（tokio のランタイムの文脈なら LocalRuntime だけ。文脈の無い veil の
+/// ワーカー（API ライブラリのハンドラ）は可）。
+pub(crate) fn in_local_capable_context() -> bool {
+    CONTEXT
+        .try_with(|c| c.borrow().last().map(|h| h.inner.local))
+        .ok()
+        .flatten()
+        .unwrap_or_else(crate::runtime::has_driver)
+}
+
+/// 文脈のランタイムでタイマーが使えるか（文脈が無い＝veil のワーカー等なら使える）。
+pub(crate) fn time_enabled_in_context() -> bool {
+    CONTEXT
+        .try_with(|c| c.borrow().last().map(|h| h.inner.time_enabled))
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+}
+
+/// 文脈のランタイムで I/O が使えるか。
+pub(crate) fn io_enabled_in_context() -> bool {
+    CONTEXT
+        .try_with(|c| c.borrow().last().map(|h| h.inner.io_enabled))
+        .ok()
+        .flatten()
+        .unwrap_or(true)
 }
 
 /// このスレッドで veil のランタイムを使えるようにする（一度だけ初期化する）。
@@ -494,6 +543,8 @@ pub struct Builder {
     thread_name: String,
     start_paused: bool,
     name: Option<String>,
+    enable_time: bool,
+    enable_io: bool,
 }
 
 impl std::fmt::Debug for Builder {
@@ -519,6 +570,8 @@ impl Builder {
             thread_name: "tokio-runtime-worker".into(),
             start_paused: false,
             name: None,
+            enable_time: false,
+            enable_io: false,
         }
     }
 
@@ -529,6 +582,8 @@ impl Builder {
             thread_name: "tokio-runtime-worker".into(),
             start_paused: false,
             name: None,
+            enable_time: false,
+            enable_io: false,
         }
     }
 
@@ -555,10 +610,23 @@ impl Builder {
         self
     }
 
+    pub fn enable_all(&mut self) -> &mut Self {
+        self.enable_time = true;
+        self.enable_io = true;
+        self
+    }
+
+    pub fn enable_io(&mut self) -> &mut Self {
+        self.enable_io = true;
+        self
+    }
+
+    pub fn enable_time(&mut self) -> &mut Self {
+        self.enable_time = true;
+        self
+    }
+
     accept! {
-        enable_all(),
-        enable_io(),
-        enable_time(),
         thread_stack_size(v: usize),
         max_blocking_threads(v: usize),
         event_interval(v: u32),
@@ -592,21 +660,31 @@ impl Builder {
     /// `LocalRuntime` を作る（種類にかかわらずカレントスレッド）。
     pub fn build_local(&mut self, _options: LocalOptions) -> std::io::Result<LocalRuntime> {
         self.kind = Kind::CurrentThread;
+        let mut rt = self.build()?;
+        Arc::get_mut(&mut rt.handle.inner)
+            .expect("fresh handle")
+            .local = true;
         Ok(LocalRuntime {
-            rt: self.build()?,
+            rt,
             queue: RefCell::new(Vec::new()),
         })
     }
 
     pub fn build(&mut self) -> std::io::Result<Runtime> {
         if self.start_paused {
-            return Err(std::io::Error::other(
-                "veil::tokio: start_paused (paused clock) is not supported",
-            ));
+            if !self.enable_time {
+                panic!(
+                    "start_paused requires the time driver (call `enable_time` or `enable_all`)"
+                );
+            }
+            super::time::pause();
         }
         let mut handle = Handle::new(self.kind);
-        if let Some(n) = &self.name {
-            Arc::get_mut(&mut handle.inner).expect("fresh handle").name = Some(n.clone());
+        {
+            let inner = Arc::get_mut(&mut handle.inner).expect("fresh handle");
+            inner.name = self.name.clone();
+            inner.time_enabled = self.enable_time;
+            inner.io_enabled = self.enable_io;
         }
         let stop: Arc<Mutex<Vec<crate::runtime::offload::Completer<()>>>> =
             Arc::new(Mutex::new(Vec::new()));

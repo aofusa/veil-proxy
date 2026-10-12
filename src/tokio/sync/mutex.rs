@@ -19,6 +19,7 @@ impl std::fmt::Display for TryLockError {
 impl std::error::Error for TryLockError {}
 
 /// ランタイムのスレッドで同期的に待とうとした。
+#[track_caller]
 fn assert_not_in_runtime(what: &str) {
     if crate::runtime::has_driver() {
         panic!(
@@ -98,6 +99,7 @@ impl<T: ?Sized> Mutex<T> {
             .map_err(|_| TryLockError(()))
     }
 
+    #[track_caller]
     pub fn blocking_lock(&self) -> MutexGuard<'_, T> {
         assert_not_in_runtime("block_on");
         futures::executor::block_on(self.lock())
@@ -115,6 +117,7 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
+    #[track_caller]
     pub fn blocking_lock_owned(self: Arc<Self>) -> OwnedMutexGuard<T> {
         assert_not_in_runtime("block_on");
         futures::executor::block_on(self.lock_owned())
@@ -333,6 +336,7 @@ impl<T> RwLock<T> {
 
     pub const fn const_with_max_readers(value: T, max_reads: u32) -> RwLock<T> {
         assert!(max_reads <= MAX_READS);
+        assert!(max_reads != 0, "a RwLock may not be created with 0 readers");
         RwLock {
             mr: max_reads,
             s: Semaphore::const_new(max_reads as usize),
@@ -340,12 +344,14 @@ impl<T> RwLock<T> {
         }
     }
 
+    #[track_caller]
     pub fn with_max_readers(value: T, max_reads: u32) -> RwLock<T> {
         assert!(
             max_reads <= MAX_READS,
             "a RwLock may not be created with more than {} readers",
             MAX_READS
         );
+        assert!(max_reads != 0, "a RwLock may not be created with 0 readers");
         RwLock {
             mr: max_reads,
             s: Semaphore::new(max_reads as usize),
@@ -377,6 +383,7 @@ impl<T: ?Sized> RwLock<T> {
         })
     }
 
+    #[track_caller]
     pub fn blocking_read(&self) -> RwLockReadGuard<'_, T> {
         assert_not_in_runtime("block_on");
         futures::executor::block_on(self.read())
@@ -404,6 +411,7 @@ impl<T: ?Sized> RwLock<T> {
         })
     }
 
+    #[track_caller]
     pub fn blocking_write(&self) -> RwLockWriteGuard<'_, T> {
         assert_not_in_runtime("block_on");
         futures::executor::block_on(self.write())

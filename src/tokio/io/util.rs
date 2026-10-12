@@ -77,14 +77,13 @@ pub trait AsyncReadExt: AsyncRead {
     where
         Self: Unpin,
     {
-        let start = buf.len();
+        let mut st = VecInit::new(buf);
+        let mut total = 0usize;
         poll_fn(move |cx| loop {
-            if buf.capacity() - buf.len() < 32 {
-                buf.reserve(std::cmp::max(32, buf.capacity()));
-            }
-            let n = ready!(poll_read_buf(Pin::new(&mut *self), cx, &mut *buf))?;
-            if n == 0 {
-                return Poll::Ready(Ok(buf.len() - start));
+            match ready!(st.poll_read_once(Pin::new(&mut *self), cx)) {
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(0) => return Poll::Ready(Ok(std::mem::replace(&mut total, 0))),
+                Ok(n) => total += n,
             }
         })
     }
@@ -98,15 +97,8 @@ pub trait AsyncReadExt: AsyncRead {
     {
         async move {
             let mut bytes = Vec::new();
-            let n = self.read_to_end(&mut bytes).await?;
-            let s = String::from_utf8(bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                )
-            })?;
-            dst.push_str(&s);
-            Ok(n)
+            let r = self.read_to_end(&mut bytes).await;
+            finish_string_read(r, bytes, dst)
         }
     }
 
@@ -155,6 +147,116 @@ pub trait AsyncReadExt: AsyncRead {
 }
 
 impl<R: AsyncRead + ?Sized> AsyncReadExt for R {}
+
+/// `Buf` の中身を 1 回書く（書き手が vectored を使えるなら最大 64 断片をまとめる）。
+fn poll_write_buf_once<W: AsyncWrite + ?Sized, B: bytes::Buf + ?Sized>(
+    w: Pin<&mut W>,
+    cx: &mut Context<'_>,
+    src: &B,
+) -> Poll<Result<usize>> {
+    if w.is_write_vectored() {
+        let mut slices = [io::IoSlice::new(&[]); 64];
+        let n = src.chunks_vectored(&mut slices);
+        w.poll_write_vectored(cx, &slices[..n])
+    } else {
+        w.poll_write(cx, src.chunk())
+    }
+}
+
+/// 読んだバイト列を文字列に足す（tokio と同じ: 入出力のエラーでも、そこまでが UTF-8 なら足す）。
+fn finish_string_read(r: Result<usize>, bytes: Vec<u8>, dst: &mut String) -> Result<usize> {
+    match (r, String::from_utf8(bytes)) {
+        (Ok(n), Ok(s)) => {
+            dst.push_str(&s);
+            Ok(n)
+        }
+        (Err(e), Ok(s)) => {
+            dst.push_str(&s);
+            Err(e)
+        }
+        (Ok(_), Err(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
+/// `read_to_end` の読み込み先（tokio の VecWithInitialized と同じく、確保済みで初期化済みの範囲を覚え、
+/// 初めの容量が埋まったら小さな読み込みで EOF を確かめてから伸ばす）。
+struct VecInit<'a> {
+    vec: &'a mut Vec<u8>,
+    num_initialized: usize,
+    starting_capacity: usize,
+}
+
+impl<'a> VecInit<'a> {
+    fn new(vec: &'a mut Vec<u8>) -> VecInit<'a> {
+        VecInit {
+            num_initialized: vec.len(),
+            starting_capacity: vec.capacity(),
+            vec,
+        }
+    }
+
+    fn reserve(&mut self, n: usize) {
+        if self.vec.capacity() - self.vec.len() >= n {
+            return;
+        }
+        self.num_initialized = self.vec.len();
+        self.vec.reserve(n);
+    }
+
+    fn poll_read_once<R: AsyncRead + ?Sized>(
+        &mut self,
+        mut r: Pin<&mut R>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize>> {
+        const NUM_BYTES: usize = 32;
+        let try_small = self.vec.capacity() - self.vec.len() < NUM_BYTES
+            && self.starting_capacity == self.vec.capacity()
+            && self.starting_capacity >= NUM_BYTES;
+        if try_small {
+            let mut small = [std::mem::MaybeUninit::<u8>::uninit(); NUM_BYTES];
+            let mut rb = ReadBuf::uninit(&mut small);
+            let res = r.as_mut().poll_read(cx, &mut rb);
+            let data = rb.filled();
+            if !data.is_empty() {
+                self.reserve(data.len());
+                self.vec.extend_from_slice(data);
+                self.num_initialized = self.num_initialized.max(self.vec.len());
+            }
+            let n = data.len();
+            return match res {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+            };
+        }
+        self.reserve(NUM_BYTES);
+        let len = self.vec.len();
+        let cap = self.vec.capacity();
+        let ptr = self.vec.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>();
+        // SAFETY: 確保済みの容量全体を MaybeUninit として見る（len までは初期化済み）
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
+        let mut rb = ReadBuf::uninit(slice);
+        // SAFETY: num_initialized までは初期化済み
+        unsafe { rb.assume_init(self.num_initialized) };
+        rb.set_filled(len);
+        let res = r.as_mut().poll_read(cx, &mut rb);
+        let new_len = rb.filled().len();
+        let init = rb.initialized().len();
+        assert_eq!(rb.filled().as_ptr(), self.vec.as_ptr() as *const u8);
+        // SAFETY: new_len までは読み込みで初期化された
+        unsafe { self.vec.set_len(new_len) };
+        self.num_initialized = init;
+        match res {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(new_len - len)),
+        }
+    }
+}
 
 /// `BufMut` へ読み込む（tokio-util の `poll_read_buf` と同じ）。
 pub(crate) fn poll_read_buf<R: AsyncRead + ?Sized, B: bytes::BufMut + ?Sized>(
@@ -229,7 +331,7 @@ pub trait AsyncWriteExt: AsyncWrite {
             if !src.has_remaining() {
                 return Poll::Ready(Ok(0));
             }
-            let n = ready!(Pin::new(&mut *self).poll_write(cx, src.chunk()))?;
+            let n = ready!(poll_write_buf_once(Pin::new(&mut *self), cx, &*src))?;
             src.advance(n);
             Poll::Ready(Ok(n))
         })
@@ -244,7 +346,7 @@ pub trait AsyncWriteExt: AsyncWrite {
     {
         poll_fn(move |cx| {
             while src.has_remaining() {
-                let n = ready!(Pin::new(&mut *self).poll_write(cx, src.chunk()))?;
+                let n = ready!(poll_write_buf_once(Pin::new(&mut *self), cx, &*src))?;
                 if n == 0 {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
@@ -335,15 +437,8 @@ pub trait AsyncBufReadExt: AsyncBufRead {
     {
         async move {
             let mut bytes = Vec::new();
-            let n = self.read_until(b'\n', &mut bytes).await?;
-            let s = String::from_utf8(bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                )
-            })?;
-            buf.push_str(&s);
-            Ok(n)
+            let r = self.read_until(b'\n', &mut bytes).await;
+            finish_string_read(r, bytes, buf)
         }
     }
 
@@ -653,28 +748,33 @@ pub fn empty() -> Empty {
 impl AsyncRead for Empty {
     fn poll_read(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         _: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncBufRead for Empty {
-    fn poll_fill_buf(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(&[]))
     }
     fn consume(self: Pin<&mut Self>, _: usize) {}
 }
 
 impl AsyncWrite for Empty {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(buf.len()))
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(()))
     }
 }
@@ -697,13 +797,16 @@ pub fn sink() -> Sink {
 }
 
 impl AsyncWrite for Sink {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(buf.len()))
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         Poll::Ready(Ok(()))
     }
 }
@@ -719,9 +822,10 @@ pub fn repeat(byte: u8) -> Repeat {
 impl AsyncRead for Repeat {
     fn poll_read(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         let n = buf.remaining();
         let b = self.0;
         for x in buf.initialize_unfilled_to(n) {
@@ -1024,6 +1128,58 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize>> {
+        let cap = self.cap;
+        if self.inner.is_write_vectored() {
+            let total = bufs.iter().fold(0usize, |a, b| a.saturating_add(b.len()));
+            if total > cap - self.buf.len() {
+                ready!(self.as_mut().flush_buf(cx))?;
+            }
+            // SAFETY: inner を動かさない
+            let me = unsafe { self.get_unchecked_mut() };
+            if total >= cap {
+                unsafe { Pin::new_unchecked(&mut me.inner) }.poll_write_vectored(cx, bufs)
+            } else {
+                bufs.iter().for_each(|b| me.buf.extend_from_slice(b));
+                Poll::Ready(Ok(total))
+            }
+        } else {
+            while bufs.first().map(|b| b.len()) == Some(0) {
+                bufs = &bufs[1..];
+            }
+            if bufs.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let first = bufs[0].len();
+            if first > cap - self.buf.len() {
+                ready!(self.as_mut().flush_buf(cx))?;
+            }
+            // SAFETY: inner を動かさない
+            let me = unsafe { self.get_unchecked_mut() };
+            if first >= cap {
+                return unsafe { Pin::new_unchecked(&mut me.inner) }.poll_write(cx, &bufs[0]);
+            }
+            me.buf.extend_from_slice(&bufs[0]);
+            let mut total = first;
+            for b in &bufs[1..] {
+                if b.len() > cap - me.buf.len() {
+                    break;
+                }
+                me.buf.extend_from_slice(b);
+                total += b.len();
+            }
+            Poll::Ready(Ok(total))
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.as_mut().flush_buf(cx))?;
         self.get_pin_mut().poll_flush(cx)
@@ -1180,6 +1336,14 @@ impl CopyBuffer {
         mut writer: Pin<&mut W>,
     ) -> Poll<Result<u64>> {
         loop {
+            // tokio と同じく、1 周ごとに予算を使う（使い切ったら書き出しを flush して譲る）
+            if crate::tokio::task::coop::poll_proceed_and_make_progress(cx).is_pending() {
+                if self.need_flush {
+                    ready!(writer.as_mut().poll_flush(cx))?;
+                    self.need_flush = false;
+                }
+                return Poll::Pending;
+            }
             if self.pos == self.cap && !self.read_done {
                 self.pos = 0;
                 self.cap = 0;
@@ -1359,6 +1523,7 @@ impl<T> ReadHalf<T> {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    #[track_caller]
     pub fn unsplit(self, wr: WriteHalf<T>) -> T
     where
         T: Unpin,
@@ -1464,6 +1629,16 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Join<R, W> {
     ) -> Poll<Result<usize>> {
         Pin::new(&mut self.writer).poll_write(cx, buf)
     }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize>> {
+        Pin::new(&mut self.writer).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.writer.is_write_vectored()
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         Pin::new(&mut self.writer).poll_flush(cx)
     }
@@ -1504,7 +1679,9 @@ impl Pipe {
     }
 
     fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
+        let coop = ready!(crate::tokio::task::coop::poll_proceed(cx));
         if !self.buf.is_empty() {
+            coop.made_progress();
             let n = std::cmp::min(self.buf.len(), buf.remaining());
             let (a, b) = self.buf.as_slices();
             let na = std::cmp::min(a.len(), n);
@@ -1517,13 +1694,43 @@ impl Pipe {
             return Poll::Ready(Ok(()));
         }
         if self.is_closed {
+            coop.made_progress();
             return Poll::Ready(Ok(()));
         }
         self.read_waker.register(cx.waker());
         Poll::Pending
     }
 
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
+        if self.is_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        let mut avail = self.max - self.buf.len();
+        if avail == 0 {
+            self.write_waker.register(cx.waker());
+            return Poll::Pending;
+        }
+        let mut n = 0;
+        for b in bufs {
+            let k = std::cmp::min(avail, b.len());
+            self.buf.extend(&b[..k]);
+            n += k;
+            avail -= k;
+            if avail == 0 {
+                break;
+            }
+        }
+        self.read_waker.wake();
+        Poll::Ready(Ok(n))
+    }
+
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
         if self.is_closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
@@ -1583,6 +1790,16 @@ impl AsyncRead for DuplexStream {
 impl AsyncWrite for DuplexStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
         self.write.lock().unwrap().poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize>> {
+        self.write.lock().unwrap().poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
         Poll::Ready(Ok(()))

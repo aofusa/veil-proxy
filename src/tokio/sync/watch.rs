@@ -51,22 +51,34 @@ pub(crate) struct WaitList {
 impl WaitList {
     pub(crate) fn register(&self, key: &mut Option<u64>, cx: &Context<'_>) {
         let k = *key.get_or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed));
-        self.map
-            .lock()
-            .unwrap()
-            .entry(k)
-            .or_default()
-            .register(cx.waker());
+        // 入れ替えた古い Waker はロックの外で落とす（Drop が同じチャネルを触っても固まらないように）
+        let old = {
+            let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = m.entry(k).or_default();
+            slot.replace(cx.waker())
+        };
+        drop(old);
     }
 
     pub(crate) fn remove(&self, key: &mut Option<u64>) {
         if let Some(k) = key.take() {
-            self.map.lock().unwrap().remove(&k);
+            let old = self
+                .map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&k);
+            drop(old);
         }
     }
 
     pub(crate) fn wake_all(&self) {
-        let ws: Vec<WakerSlot> = self.map.lock().unwrap().drain().map(|(_, w)| w).collect();
+        let ws: Vec<WakerSlot> = self
+            .map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
         for mut w in ws {
             w.wake();
         }
@@ -170,7 +182,7 @@ impl<T> Sender<T> {
     /// 受け手の有無にかかわらず値を変え、前の値を返す。
     pub fn send_replace(&self, value: T) -> T {
         let old = {
-            let mut g = self.shared.value.write().unwrap();
+            let mut g = self.shared.value.write().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *g, value)
         };
         self.shared.version.fetch_add(1, Ordering::AcqRel);
@@ -187,7 +199,7 @@ impl<T> Sender<T> {
 
     pub fn send_if_modified<F: FnOnce(&mut T) -> bool>(&self, modify: F) -> bool {
         let modified = {
-            let mut g = self.shared.value.write().unwrap();
+            let mut g = self.shared.value.write().unwrap_or_else(|e| e.into_inner());
             modify(&mut g)
         };
         if modified {
@@ -199,7 +211,7 @@ impl<T> Sender<T> {
 
     pub fn borrow(&self) -> Ref<'_, T> {
         Ref {
-            inner: self.shared.value.read().unwrap(),
+            inner: self.shared.value.read().unwrap_or_else(|e| e.into_inner()),
             has_changed: false,
         }
     }
@@ -211,6 +223,7 @@ impl<T> Sender<T> {
     pub async fn closed(&self) {
         let mut key = None;
         std::future::poll_fn(|cx| {
+            std::task::ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
             if self.is_closed() {
                 return Poll::Ready(());
             }
@@ -273,13 +286,13 @@ impl<T> Receiver<T> {
     pub fn borrow(&self) -> Ref<'_, T> {
         let has_changed = self.shared.version.load(Ordering::Acquire) != self.version;
         Ref {
-            inner: self.shared.value.read().unwrap(),
+            inner: self.shared.value.read().unwrap_or_else(|e| e.into_inner()),
             has_changed,
         }
     }
 
     pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
-        let inner = self.shared.value.read().unwrap();
+        let inner = self.shared.value.read().unwrap_or_else(|e| e.into_inner());
         let v = self.shared.version.load(Ordering::Acquire);
         let has_changed = v != self.version;
         self.version = v;
@@ -287,11 +300,11 @@ impl<T> Receiver<T> {
     }
 
     pub fn has_changed(&self) -> Result<bool, RecvError> {
-        let changed = self.shared.version.load(Ordering::Acquire) != self.version;
-        if !changed && self.shared.closed.load(Ordering::Acquire) {
+        // tokio と同じく、送り手がいなければ未読の値があってもエラー
+        if self.shared.closed.load(Ordering::Acquire) {
             return Err(RecvError(()));
         }
-        Ok(changed)
+        Ok(self.shared.version.load(Ordering::Acquire) != self.version)
     }
 
     pub fn mark_changed(&mut self) {
@@ -308,6 +321,8 @@ impl<T> Receiver<T> {
         let shared = self.shared.clone();
         let seen = &mut self.version;
         let r = std::future::poll_fn(|cx| {
+            let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
+            coop.made_progress();
             let v = shared.version.load(Ordering::Acquire);
             if v != *seen {
                 *seen = v;

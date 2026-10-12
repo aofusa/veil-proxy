@@ -10,6 +10,8 @@ use std::task::{Context, Poll};
 
 struct Waiter {
     notified: AtomicBool,
+    /// notify_last で起こされた（drop で回すときも同じ向きで回す）
+    by_last: AtomicBool,
     waker: Mutex<WakerSlot>,
 }
 
@@ -88,6 +90,7 @@ impl Notify {
             let mut st = self.state.lock().unwrap();
             match st.waiters.pop_back() {
                 Some(w) => {
+                    w.by_last.store(true, Ordering::Release);
                     w.notified.store(true, Ordering::Release);
                     Some(w)
                 }
@@ -202,6 +205,7 @@ impl Notified<'_> {
         }
         let w = Arc::new(Waiter {
             notified: AtomicBool::new(false),
+            by_last: AtomicBool::new(false),
             waker: Mutex::new(WakerSlot::default()),
         });
         if let Some(cx) = cx {
@@ -234,7 +238,11 @@ impl Drop for Notified<'_> {
             // notify_one を受け取ったまま去る: 次の待ちへ回す（notify_waiters の通知は回さない）
             if st.generation == self.generation {
                 drop(st);
-                self.notify.notify_one();
+                if w.by_last.load(Ordering::Acquire) {
+                    self.notify.notify_last();
+                } else {
+                    self.notify.notify_one();
+                }
             }
         } else {
             st.waiters.retain(|x| !Arc::ptr_eq(x, &w));

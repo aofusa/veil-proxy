@@ -202,6 +202,15 @@ impl<T> Chan<T> {
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
+        let r = self.poll_recv_inner(cx);
+        if r.is_ready() {
+            coop.made_progress();
+        }
+        r
+    }
+
+    fn poll_recv_inner(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut q = self.q.lock().unwrap();
         if let Some(v) = q.items.pop_front() {
             drop(q);
@@ -245,6 +254,7 @@ impl<T> Chan<T> {
 // ===================== 有界 =====================
 
 /// 有界チャネル（`buffer` は 1 以上）。
+#[track_caller]
 pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     assert!(buffer > 0, "mpsc bounded channel requires buffer > 0");
     let c = Chan::new(Some(buffer));
@@ -387,6 +397,7 @@ impl<T> Sender<T> {
         }
     }
 
+    #[track_caller]
     pub fn blocking_send(&self, value: T) -> Result<(), SendError<T>> {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");
@@ -581,6 +592,7 @@ impl<T> Receiver<T> {
         self.chan.try_recv()
     }
 
+    #[track_caller]
     pub fn blocking_recv(&mut self) -> Option<T> {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");
@@ -588,6 +600,7 @@ impl<T> Receiver<T> {
         futures::executor::block_on(self.recv())
     }
 
+    #[track_caller]
     pub fn blocking_recv_many(&mut self, buffer: &mut Vec<T>, limit: usize) -> usize {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");
@@ -841,6 +854,7 @@ impl<T> UnboundedReceiver<T> {
         self.chan.try_recv()
     }
 
+    #[track_caller]
     pub fn blocking_recv(&mut self) -> Option<T> {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");
@@ -874,6 +888,7 @@ impl<T> UnboundedReceiver<T> {
 }
 
 impl<T> UnboundedReceiver<T> {
+    #[track_caller]
     pub fn blocking_recv_many(&mut self, buffer: &mut Vec<T>, limit: usize) -> usize {
         if crate::runtime::has_driver() {
             panic!("Cannot block the current thread from within a runtime.");

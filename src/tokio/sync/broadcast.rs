@@ -84,6 +84,7 @@ struct Shared<T> {
 }
 
 /// 容量 `capacity` の放送チャネル。
+#[track_caller]
 pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "broadcast channel capacity cannot be zero");
     assert!(
@@ -153,7 +154,7 @@ impl<T> Sender<T> {
             return Err(SendError(value));
         }
         {
-            let mut b = self.shared.buf.lock().unwrap();
+            let mut b = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
             let pos = b.tail;
             b.items.push_back((pos, value, n));
             b.tail += 1;
@@ -167,7 +168,12 @@ impl<T> Sender<T> {
 
     pub fn subscribe(&self) -> Receiver<T> {
         self.shared.rx_count.fetch_add(1, Ordering::AcqRel);
-        let next = self.shared.buf.lock().unwrap().tail;
+        let next = self
+            .shared
+            .buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tail;
         Receiver {
             shared: self.shared.clone(),
             next,
@@ -179,7 +185,7 @@ impl<T> Sender<T> {
     }
 
     pub fn len(&self) -> usize {
-        let b = self.shared.buf.lock().unwrap();
+        let b = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
         b.items.iter().filter(|(_, _, left)| *left > 0).count()
     }
 
@@ -288,7 +294,11 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if self.shared.tx_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.buf.lock().unwrap().closed = true;
+            self.shared
+                .buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closed = true;
             self.shared.wait.wake_all();
         }
     }
@@ -296,7 +306,7 @@ impl<T> Drop for Sender<T> {
 
 impl<T: Clone> Receiver<T> {
     fn try_take(&mut self) -> Result<T, TryRecvError> {
-        let mut b = self.shared.buf.lock().unwrap();
+        let mut b = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
         let oldest = b.items.front().map(|(p, _, _)| *p).unwrap_or(b.tail);
         if self.next < oldest {
             let missed = oldest - self.next;
@@ -311,10 +321,14 @@ impl<T: Clone> Receiver<T> {
             };
         }
         let idx = (self.next - oldest) as usize;
+        // clone が panic しても読んだことにする（tokio と同じく次は後ろの値）
+        self.next += 1;
         let item = &mut b.items[idx];
         item.2 = item.2.saturating_sub(1);
         let v = item.1.clone();
-        self.next += 1;
+        let drained = drain_consumed(&mut b);
+        drop(b);
+        drop(drained);
         Ok(v)
     }
 
@@ -326,6 +340,7 @@ impl<T: Clone> Receiver<T> {
         let mut key = None;
         let shared = self.shared.clone();
         let r = std::future::poll_fn(|cx| {
+            std::task::ready!(crate::tokio::task::coop::poll_proceed_and_make_progress(cx));
             for _ in 0..2 {
                 match self.try_take() {
                     Ok(v) => return Poll::Ready(Ok(v)),
@@ -352,7 +367,12 @@ impl<T: Clone> Receiver<T> {
 impl<T> Receiver<T> {
     pub fn resubscribe(&self) -> Receiver<T> {
         self.shared.rx_count.fetch_add(1, Ordering::AcqRel);
-        let next = self.shared.buf.lock().unwrap().tail;
+        let next = self
+            .shared
+            .buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tail;
         Receiver {
             shared: self.shared.clone(),
             next,
@@ -360,7 +380,7 @@ impl<T> Receiver<T> {
     }
 
     pub fn len(&self) -> usize {
-        let b = self.shared.buf.lock().unwrap();
+        let b = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
         (b.tail.saturating_sub(self.next)) as usize
     }
 
@@ -369,7 +389,11 @@ impl<T> Receiver<T> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.shared.buf.lock().unwrap().closed
+        self.shared
+            .buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
     }
 
     pub fn sender_strong_count(&self) -> usize {
@@ -385,9 +409,31 @@ impl<T> Receiver<T> {
     }
 }
 
+/// 全員が読んだ値を先頭から捨てる（捨てた値は呼び出し側がロックの外で drop する）。
+fn drain_consumed<T>(b: &mut Buf<T>) -> Vec<T> {
+    let mut out = Vec::new();
+    while b.items.front().is_some_and(|(_, _, left)| *left == 0) {
+        out.push(b.items.pop_front().unwrap().1);
+    }
+    out
+}
+
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if self.shared.rx_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        // まだ読んでいない値の「残りの受け手」から自分を外す
+        let drained = {
+            let mut b = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
+            let next = self.next;
+            for item in b.items.iter_mut() {
+                if item.0 >= next {
+                    item.2 = item.2.saturating_sub(1);
+                }
+            }
+            drain_consumed(&mut b)
+        };
+        let last = self.shared.rx_count.fetch_sub(1, Ordering::AcqRel) == 1;
+        drop(drained);
+        if last {
             self.shared.wait.wake_all();
         }
     }

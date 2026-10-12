@@ -21,8 +21,9 @@ pub use std::time::Duration;
 pub struct Instant(std::time::Instant);
 
 impl Instant {
+    /// 今（時計を止めているときは止めた時計の時刻）。
     pub fn now() -> Instant {
-        Instant(std::time::Instant::now())
+        Instant(clock_now())
     }
     pub fn from_std(std: std::time::Instant) -> Instant {
         Instant(std)
@@ -99,6 +100,118 @@ impl std::ops::Sub<Instant> for Instant {
     }
 }
 
+// ===================== 時計（tokio の test-util の pause / advance） =====================
+
+/// 時計。止めていないときは `virt_at + (実時間 - real_at)`、止めているときは `virt_at`。
+struct Clock {
+    paused: bool,
+    virt_at: std::time::Instant,
+    real_at: std::time::Instant,
+}
+
+fn clock() -> &'static Mutex<Clock> {
+    static C: OnceLock<Mutex<Clock>> = OnceLock::new();
+    C.get_or_init(|| {
+        let now = std::time::Instant::now();
+        Mutex::new(Clock {
+            paused: false,
+            virt_at: now,
+            real_at: now,
+        })
+    })
+}
+
+/// 時計を一度でも動かした（pause / advance）か。触っていなければ実時間をそのまま使う（速い経路）。
+static CLOCK_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// タスクが動いた回数（時計を止めているときの自動前進の判断に使う。動いている間は進めない）。
+static ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// タスクの poll ごとに呼ぶ（時計を止めているときだけ数える）。
+pub(crate) fn note_activity() {
+    if CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Relaxed) {
+        ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn clock_now() -> std::time::Instant {
+    if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) {
+        return std::time::Instant::now();
+    }
+    let c = clock().lock().unwrap();
+    if c.paused {
+        c.virt_at
+    } else {
+        c.virt_at + std::time::Instant::now().saturating_duration_since(c.real_at)
+    }
+}
+
+fn is_paused() -> bool {
+    CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) && clock().lock().unwrap().paused
+}
+
+/// 時計の時刻（仮想）を実時間に直す（タイマースレッドの待ち時間用）。
+fn to_real(deadline: std::time::Instant) -> std::time::Instant {
+    if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) {
+        return deadline;
+    }
+    let c = clock().lock().unwrap();
+    c.real_at + deadline.saturating_duration_since(c.virt_at)
+}
+
+/// 時計を止める（テスト用）。止めている間は `advance` か、どのタスクも動かなくなったときに次のタイマーまで進む。
+#[track_caller]
+pub fn pause() {
+    CLOCK_TOUCHED.store(true, std::sync::atomic::Ordering::Release);
+    let mut c = clock().lock().unwrap();
+    if c.paused {
+        panic!("time is already frozen");
+    }
+    let now = std::time::Instant::now();
+    let elapsed = now.saturating_duration_since(c.real_at);
+    c.virt_at += elapsed;
+    c.real_at = now;
+    c.paused = true;
+    drop(c);
+    timer().cv.notify_one();
+}
+
+/// 止めた時計を動かす。
+#[track_caller]
+pub fn resume() {
+    let mut c = clock().lock().unwrap();
+    if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) || !c.paused {
+        panic!("time is not frozen");
+    }
+    c.real_at = std::time::Instant::now();
+    c.paused = false;
+    drop(c);
+    timer().cv.notify_one();
+}
+
+/// 止めた時計を `duration` だけ進め、期限の来たタイマーを起こしてから 1 回譲る。
+pub async fn advance(duration: Duration) {
+    {
+        let mut c = clock().lock().unwrap();
+        if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) || !c.paused {
+            panic!("time is not frozen");
+        }
+        c.virt_at += duration;
+    }
+    fire_due(clock_now());
+    crate::tokio::task::yield_now().await;
+}
+
+/// 時計の設定（ランタイムの文脈で timers が無効なら panic する）。
+#[track_caller]
+fn check_time_enabled() {
+    if !crate::tokio::runtime::time_enabled_in_context() {
+        panic!(
+            "A Tokio 1.x context was found, but timers are disabled. Call `enable_time` on the runtime builder to enable timers."
+        );
+    }
+}
+
 // ===================== タイマースレッド =====================
 
 struct Entry {
@@ -157,13 +270,12 @@ fn timer() -> &'static TimerThread {
     })
 }
 
-// 理由付き allow: タイマー専用スレッドの待ち（Condvar）。データプレーンのワーカーではない。
-#[allow(clippy::disallowed_methods)]
-fn run_timer(t: &'static TimerThread) {
-    let mut wheel = t.wheel.lock().unwrap();
-    loop {
-        let now = std::time::Instant::now();
-        let mut due: Vec<Arc<Entry>> = Vec::new();
+/// 期限の来たタイマーを起こす（`now` は時計の時刻）。
+fn fire_due(now: std::time::Instant) {
+    let t = timer();
+    let due: Vec<Arc<Entry>> = {
+        let mut wheel = t.wheel.lock().unwrap();
+        let mut due = Vec::new();
         while let Some(Reverse(top)) = wheel.heap.peek() {
             if top.deadline > now {
                 break;
@@ -173,25 +285,48 @@ fn run_timer(t: &'static TimerThread) {
                 due.push(e);
             }
         }
-        if !due.is_empty() {
-            drop(wheel);
-            for e in due {
-                e.fired.store(true, std::sync::atomic::Ordering::Release);
-                let w = e.waker.lock().unwrap().take();
-                if let Some(w) = w {
-                    w.wake();
+        due
+    };
+    for e in due {
+        e.fired.store(true, std::sync::atomic::Ordering::Release);
+        let w = e.waker.lock().unwrap().take();
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+}
+
+// 理由付き allow: タイマー専用スレッドの待ち（Condvar）。データプレーンのワーカーではない。
+#[allow(clippy::disallowed_methods)]
+fn run_timer(t: &'static TimerThread) {
+    // 時計を止めているとき、この間どのタスクも動かなければ次のタイマーまで進める（tokio の自動前進）
+    const QUIET: Duration = Duration::from_millis(2);
+    loop {
+        fire_due(clock_now());
+        let wheel = t.wheel.lock().unwrap();
+        let earliest = wheel.heap.peek().map(|Reverse(i)| i.deadline);
+        if is_paused() {
+            let Some(next) = earliest else {
+                drop(t.cv.wait_timeout(wheel, QUIET).unwrap());
+                continue;
+            };
+            let before = ACTIVITY.load(std::sync::atomic::Ordering::Relaxed);
+            drop(t.cv.wait_timeout(wheel, QUIET).unwrap());
+            if ACTIVITY.load(std::sync::atomic::Ordering::Relaxed) == before && is_paused() {
+                let mut c = clock().lock().unwrap();
+                if c.paused && next > c.virt_at {
+                    c.virt_at = next;
                 }
             }
-            wheel = t.wheel.lock().unwrap();
             continue;
         }
-        wheel = match wheel.heap.peek() {
-            Some(Reverse(top)) => {
-                let wait = top.deadline.saturating_duration_since(now);
-                t.cv.wait_timeout(wheel, wait).unwrap().0
+        match earliest {
+            Some(d) => {
+                let wait = to_real(d).saturating_duration_since(std::time::Instant::now());
+                drop(t.cv.wait_timeout(wheel, wait).unwrap());
             }
-            None => t.cv.wait(wheel).unwrap(),
-        };
+            None => drop(t.cv.wait(wheel).unwrap()),
+        }
     }
 }
 
@@ -232,6 +367,7 @@ fn register(deadline: std::time::Instant) -> Arc<Entry> {
 pub struct Sleep {
     deadline: Instant,
     entry: Option<Arc<EntryHandle>>,
+    elapsed: bool,
 }
 
 /// `Sleep` が持つ登録（drop でタイマースレッドの項目は無効になる）。
@@ -248,6 +384,7 @@ impl Sleep {
         Sleep {
             deadline,
             entry: None,
+            elapsed: false,
         }
     }
 
@@ -255,8 +392,13 @@ impl Sleep {
         self.deadline
     }
 
+    /// 期限が来たのを poll で確かめたか（tokio と同じく、作っただけ・poll していないなら `false`）。
     pub fn is_elapsed(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.elapsed
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.0.fired.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// 期限を変える（`Pin<&mut Sleep>` で呼ぶ）。
@@ -264,6 +406,7 @@ impl Sleep {
         let this = self.get_mut();
         this.deadline = deadline;
         this.entry = None;
+        this.elapsed = false;
     }
 }
 
@@ -271,9 +414,21 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
+        let coop = std::task::ready!(crate::tokio::task::coop::poll_proceed(cx));
+        let r = self.get_mut().poll_inner(cx);
+        if r.is_ready() {
+            coop.made_progress();
+        }
+        r
+    }
+}
+
+impl Sleep {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self;
         if Instant::now() >= this.deadline {
             this.entry = None;
+            this.elapsed = true;
             return Poll::Ready(());
         }
         let entry = this
@@ -282,6 +437,7 @@ impl Future for Sleep {
         entry.0.waker.lock().unwrap().register(cx.waker());
         if entry.0.fired.load(std::sync::atomic::Ordering::Acquire) {
             this.entry = None;
+            this.elapsed = true;
             return Poll::Ready(());
         }
         Poll::Pending
@@ -289,7 +445,9 @@ impl Future for Sleep {
 }
 
 /// `duration` 後に完了する。
+#[track_caller]
 pub fn sleep(duration: Duration) -> Sleep {
+    check_time_enabled();
     Sleep::new(
         Instant::now()
             .checked_add(duration)
@@ -298,7 +456,9 @@ pub fn sleep(duration: Duration) -> Sleep {
 }
 
 /// `deadline` に完了する。
+#[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
+    check_time_enabled();
     Sleep::new(deadline)
 }
 
@@ -376,6 +536,7 @@ impl<T: Future> Future for Timeout<T> {
 }
 
 /// `duration` を過ぎたら `Err(Elapsed)`。
+#[track_caller]
 pub fn timeout<F: std::future::IntoFuture>(
     duration: Duration,
     future: F,
@@ -387,6 +548,7 @@ pub fn timeout<F: std::future::IntoFuture>(
 }
 
 /// `deadline` を過ぎたら `Err(Elapsed)`。
+#[track_caller]
 pub fn timeout_at<F: std::future::IntoFuture>(
     deadline: Instant,
     future: F,
@@ -420,12 +582,14 @@ pub struct Interval {
 }
 
 /// すぐに 1 回目、以後 `period` ごと。
+#[track_caller]
 pub fn interval(period: Duration) -> Interval {
     assert!(period > Duration::ZERO, "`period` must be non-zero.");
     interval_at(Instant::now(), period)
 }
 
 /// `start` に 1 回目、以後 `period` ごと。
+#[track_caller]
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     assert!(period > Duration::ZERO, "`period` must be non-zero.");
     Interval {
@@ -491,21 +655,6 @@ impl Interval {
     pub fn period(&self) -> Duration {
         self.period
     }
-}
-
-/// tokio の test-util（時計の停止）は未対応。呼ぶと panic する。
-pub fn pause() {
-    panic!("veil::tokio: time::pause is not supported (no paused clock)");
-}
-
-/// tokio の test-util（時計の停止）は未対応。呼ぶと panic する。
-pub fn resume() {
-    panic!("veil::tokio: time::resume is not supported (no paused clock)");
-}
-
-/// tokio の test-util（時計の停止）は未対応。呼ぶと panic する。
-pub async fn advance(_d: Duration) {
-    panic!("veil::tokio: time::advance is not supported (no paused clock)");
 }
 
 #[cfg(test)]
