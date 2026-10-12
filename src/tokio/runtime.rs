@@ -765,6 +765,7 @@ mod tests {
     fn multi_thread_spawn_from_outside_and_cross_thread_wake() {
         let rt = Builder::new_multi_thread()
             .worker_threads(2)
+            .enable_all()
             .build()
             .unwrap();
         let h = rt.spawn(async {
