@@ -1,0 +1,22 @@
+[package]
+name = "veil-python"
+version = "0.7.0"
+edition = "2021"
+description = "Python bindings (PyO3) for the veil API server library"
+license = "Apache-2.0 OR MIT"
+authors = ["aofusa"]
+publish = false
+
+[lib]
+name = "_veil"
+crate-type = ["cdylib"]
+
+[dependencies]
+veil = { path = "../..", default-features = false, features = [
+    "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
+    "rate-limit", "buffering", "admin", "access-log", "l4-proxy", "epoll",
+    "handler", "openapi", "macro",
+] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+bytes = "1"
+serde_json = "1"
