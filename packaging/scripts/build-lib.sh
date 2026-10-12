@@ -28,9 +28,13 @@ OUT="$ROOT/packaging/output/lib"
 mkdir -p "$OUT"
 
 if [ "$MODE" = docker ]; then
+  # type=local は成果物の所有者を root にしようとして非 root の docker（snap 等）で失敗するので、
+  # tar で受け取って展開する（展開は実行ユーザーの所有になる）。
   docker build -f "$ROOT/docker/Dockerfile.lib" --target export \
     --build-arg LIB_KINDS="$KINDS" --build-arg CARGO_PROFILE="$PROFILE" \
-    --output "type=local,dest=$OUT" "$ROOT"
+    --output "type=tar,dest=$OUT/.export.tar" "$ROOT"
+  tar -xf "$OUT/.export.tar" -C "$OUT" --no-same-owner
+  rm -f "$OUT/.export.tar"
   ls -la "$OUT"/veil-lib-*.zip
   exit 0
 fi
