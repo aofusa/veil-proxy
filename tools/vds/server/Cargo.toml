@@ -1,0 +1,27 @@
+# VDS（Veil Discovery Service）の参照制御プレーン（F-04 / F-199）。REST（長輪詢）と gRPC（双方向ストリーム）の
+# 両方を 1 つのポートで提供する。ツール・テスト用途なので tonic + tokio を使う（veil 本体は使わない）。
+#
+#   cargo run --release -- --snapshot snapshot.toml --listen 0.0.0.0:18000 [--token-file token]
+#                          [--tls-cert cert.pem --tls-key key.pem]
+#
+# veil 本体のワークスペースとは独立（tools/perf/h3load と同じ扱い）。
+[package]
+name = "veil-vds-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+axum = "0.7"
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+
+[build-dependencies]
+tonic-build = "0.12"

@@ -49,6 +49,9 @@ allowed_ips = ["127.0.0.1/32", "10.0.0.0/8"]
 [vds]
 enabled = false
 server = "http://veil-vds:18000"
+# gRPC の双方向ストリーム（F-199、既定）。REST の長輪詢にするなら "rest"
+transport = "grpc"
+keepalive_secs = 30
 token_file = "/etc/veil/vds/token"
 poll_timeout_secs = 20
 retry_initial_ms = 500

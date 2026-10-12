@@ -33,3 +33,7 @@
 !clippy.toml
 # Cargo.toml の [[bench]] の解決に要る（ライブラリ成果物のビルド・Rust ソースの tarball）
 !benches/
+# VDS の参照制御プレーン（docker/Dockerfile.vds-server、F-199）と VDS の .proto
+!proto/
+!tools/vds/server/
+tools/vds/server/target/

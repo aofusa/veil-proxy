@@ -1,0 +1,50 @@
+// VDS（Veil Discovery Service）の gRPC 版（F-199）。REST 版（POST /v1/discovery）と同じ意味論の
+// State-of-the-World。xDS の ADS と同じ形の双方向ストリーム:
+//
+// - クライアント（veil）は接続直後に version_info = "" の要求を送る。
+// - サーバは版が変わるたびに DiscoveryResponse を押し出す（長輪詢の待ちは無い）。
+// - クライアントは適用に成功したら新しい version_info（ACK）、失敗したら前の version_info と
+//   error_detail（NACK）を、受け取った nonce を response_nonce に入れて送る。
+//
+// Envoy の xDS（envoy.service.discovery.v3）とのバイナリ互換は対象外。
+// veil 本体は src/vds_grpc.rs に同じ定義を prost の derive で持つ（ビルドに protoc を要求しないため）。
+syntax = "proto3";
+
+package veil.vds.v1;
+
+service VeilDiscoveryService {
+  rpc StreamSnapshots(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+}
+
+message Node {
+  string id = 1;
+  string cluster = 2;
+  string user_agent_name = 3;
+  string user_agent_version = 4;
+}
+
+message ErrorDetail {
+  int32 code = 1;
+  string message = 2;
+}
+
+message DiscoveryRequest {
+  string version_info = 1;
+  Node node = 2;
+  string type_url = 3;        // type.veil.dev/veil.v1.Snapshot
+  string response_nonce = 4;
+  ErrorDetail error_detail = 5;
+}
+
+message Resource {
+  string type_url = 1;        // type.veil.dev/veil.v1.Route / type.veil.dev/veil.v1.Upstream
+  string name = 2;            // Upstream の表の名前（Route では任意）
+  string json = 3;            // [[route]] / [upstreams.<name>] と同じスキーマの JSON オブジェクト（REST 版の resources[] の 1 要素から @type と name を除いたもの）
+}
+
+message DiscoveryResponse {
+  string version_info = 1;
+  string nonce = 2;
+  string type_url = 3;
+  repeated Resource resources = 4;
+}

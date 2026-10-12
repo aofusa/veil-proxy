@@ -538,10 +538,108 @@ fn f200_listener_rules_are_validated() {
 
 // ===================== F-04 VDS =====================
 
-/// 参照制御プレーン（tools/vds/vds_server.py）からルートを配信し、反映・NACK・トークン認証を確かめる。
+/// 参照制御プレーン（tools/vds/vds_server.py、REST の長輪詢）からルートを配信し、反映・NACK・トークン認証を確かめる。
 #[cfg(feature = "vds")]
 #[test]
 fn f04_vds_delivers_routes_and_keeps_previous_on_nack() {
+    vds_scenario(VdsControlPlane::Python, "rest", false);
+}
+
+/// Rust の参照制御プレーン（tools/vds/server）の REST で同じ結果になる（F-199）。
+#[cfg(feature = "vds")]
+#[test]
+fn f199_vds_rest_on_rust_control_plane() {
+    vds_scenario(VdsControlPlane::Rust, "rest", false);
+}
+
+/// gRPC の双方向ストリーム（h2c）で同じ結果になる。制御プレーンの再起動から再接続する（F-199）。
+#[cfg(feature = "vds")]
+#[test]
+fn f199_vds_grpc_stream_h2c() {
+    vds_scenario(VdsControlPlane::Rust, "grpc", false);
+}
+
+/// gRPC の双方向ストリーム（TLS + ALPN h2、追加 CA、Bearer トークン）。
+#[cfg(feature = "vds")]
+#[test]
+fn f199_vds_grpc_stream_tls() {
+    vds_scenario(VdsControlPlane::Rust, "grpc", true);
+}
+
+#[cfg(feature = "vds")]
+#[derive(Clone, Copy, PartialEq)]
+enum VdsControlPlane {
+    Python,
+    Rust,
+}
+
+/// Rust の参照制御プレーンをビルドしてバイナリのパスを返す（テスト全体で 1 回）。
+#[cfg(feature = "vds")]
+fn vds_server_bin() -> std::path::PathBuf {
+    static BUILT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let target = root.join("target/examples-api");
+            let st = std::process::Command::new(env!("CARGO"))
+                .args(["build", "-q", "--manifest-path"])
+                .arg(root.join("tools/vds/server/Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &target)
+                .status()
+                .expect("cargo");
+            assert!(st.success(), "failed to build tools/vds/server");
+            target.join("debug/veil-vds-server")
+        })
+        .clone()
+}
+
+#[cfg(feature = "vds")]
+fn spawn_vds_control_plane(
+    kind: VdsControlPlane,
+    snap: &std::path::Path,
+    port: u16,
+    token: &std::path::Path,
+    tls: Option<(&std::path::Path, &std::path::Path)>,
+) -> ChildGuard {
+    let mut cmd = match kind {
+        VdsControlPlane::Python => {
+            let mut c = std::process::Command::new("python3");
+            c.arg("-I")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tools/vds/vds_server.py"
+                ))
+                .args(["--watch-interval", "0.2"]);
+            c
+        }
+        VdsControlPlane::Rust => std::process::Command::new(vds_server_bin()),
+    };
+    cmd.arg("--snapshot")
+        .arg(snap)
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--token-file")
+        .arg(token)
+        .args(["--hold", "5"]);
+    if let Some((cert, key)) = tls {
+        cmd.arg("--tls-cert").arg(cert).arg("--tls-key").arg(key);
+    }
+    let child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start the VDS control plane");
+    let guard = ChildGuard(child);
+    assert!(
+        wait_for_port(port, Duration::from_secs(15)),
+        "control plane did not start"
+    );
+    guard
+}
+
+/// 配信 → 更新 → NACK（前の版のまま）→ 修正、gRPC では制御プレーンの再起動からの再接続も確かめる。
+#[cfg(feature = "vds")]
+fn vds_scenario(kind: VdsControlPlane, transport: &str, tls: bool) {
     let dir = tempfile::tempdir().unwrap();
     for (name, body) in [("base", "base"), ("a", "A"), ("b", "B")] {
         let d = dir.path().join(name);
@@ -558,33 +656,18 @@ fn f04_vds_delivers_routes_and_keeps_previous_on_nack() {
     std::fs::write(&snap, route(&dir.path().join("a"))).unwrap();
     let token = dir.path().join("token");
     std::fs::write(&token, "s3cret\n").unwrap();
+    let certs = tls.then(|| write_self_signed(dir.path()));
+    let cp_tls = certs.as_ref().map(|(c, k)| (c.as_path(), k.as_path()));
 
     let cp_port = free_port();
-    let cp = ChildGuard(
-        std::process::Command::new("python3")
-            .arg("-I")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tools/vds/vds_server.py"
-            ))
-            .arg("--snapshot")
-            .arg(&snap)
-            .arg("--listen")
-            .arg(format!("127.0.0.1:{}", cp_port))
-            .arg("--token-file")
-            .arg(&token)
-            .arg("--hold")
-            .arg("5")
-            .arg("--watch-interval")
-            .arg("0.2")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("python3 is required for the VDS E2E"),
-    );
-    assert!(wait_for_port(cp_port, Duration::from_secs(10)));
+    let mut cp = spawn_vds_control_plane(kind, &snap, cp_port, &token, cp_tls);
 
     let port = free_port();
+    let scheme = if tls { "https" } else { "http" };
+    let ca = certs
+        .as_ref()
+        .map(|(c, _)| format!("ca_cert = \"{}\"\n", c.display()))
+        .unwrap_or_default();
     let config = format!(
         r#"
 [server]
@@ -595,12 +678,14 @@ threads = 1
 level = "info"
 [vds]
 enabled = true
-server = "http://127.0.0.1:{cp_port}"
+transport = "{transport}"
+server = "{scheme}://127.0.0.1:{cp_port}"
 node_id = "e2e"
 token_file = "{token}"
 poll_timeout_secs = 5
 retry_initial_ms = 100
-{base_route}"#,
+retry_max_ms = 1000
+{ca}{base_route}"#,
         token = token.display(),
         base_route = route(&dir.path().join("base")),
     );
@@ -620,9 +705,19 @@ retry_initial_ms = 100
                 .unwrap_or(false)
         }
     };
+    let status = |cp_port: u16| -> String {
+        if tls {
+            // 状態は TLS の向こう（このテストのクライアントは平文のみ）なので見ない
+            return String::new();
+        }
+        http1_get(cp_port, "/v1/status")
+            .map(|r| r.text())
+            .unwrap_or_default()
+    };
     assert!(
         wait_until(Duration::from_secs(15), body_is("A")),
-        "VDS snapshot A not applied; log:\n{}",
+        "VDS snapshot A not applied ({}); log:\n{}",
+        transport,
         veil.log()
     );
 
@@ -637,9 +732,12 @@ retry_initial_ms = 100
     // 不正な版（存在しないディレクトリ）→ NACK され、前の版（B）のまま
     std::fs::write(&snap, route(&dir.path().join("missing"))).unwrap();
     let nacked = wait_until(Duration::from_secs(15), || {
-        http1_get(cp_port, "/v1/status")
-            .map(|r| r.text().contains("\"nacks\": 1") || r.text().contains("\"nacks\":1"))
-            .unwrap_or(false)
+        if tls {
+            veil.log().contains("rejected snapshot")
+        } else {
+            let s = status(cp_port);
+            s.contains("\"nacks\": 1") || s.contains("\"nacks\":1")
+        }
     });
     assert!(nacked, "NACK not reported; log:\n{}", veil.log());
     assert!(body_is("B")(), "previous snapshot must stay after NACK");
@@ -651,6 +749,31 @@ retry_initial_ms = 100
         "{}",
         veil.log()
     );
+    if kind == VdsControlPlane::Rust && !tls {
+        let s = status(cp_port);
+        assert!(
+            s.contains(&format!("\"transport\":\"{}\"", transport)),
+            "status: {}",
+            s
+        );
+    }
+
+    if transport == "grpc" {
+        // 制御プレーンを止めている間に内容を変え、起動し直すと再接続して届く
+        drop(cp);
+        std::fs::write(&snap, route(&dir.path().join("b"))).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            body_is("A")(),
+            "must keep the last snapshot while disconnected"
+        );
+        cp = spawn_vds_control_plane(kind, &snap, cp_port, &token, cp_tls);
+        assert!(
+            wait_until(Duration::from_secs(20), body_is("B")),
+            "not re-applied after the control plane restarted; log:\n{}",
+            veil.log()
+        );
+    }
     drop(cp);
 }
 

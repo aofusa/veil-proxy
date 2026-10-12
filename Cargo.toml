@@ -279,7 +279,7 @@ l4-proxy = []
 
 # VDS（Veil Discovery Service、F-04）: 制御プレーンからルート・アップストリームを動的に配信する
 # （xDS の REST-JSON / State-of-the-World 相当の長輪詢）。専用スレッドで動き、データプレーンには触れない。
-vds = ["dep:serde_json"]
+vds = ["dep:serde_json", "grpc", "http2"]
 # ACME（F-05）: Let's Encrypt 等から証明書を自動で発行・更新する（HTTP-01）。専用スレッドで動き、
 # 発行した証明書は既存の証明書ホットリロードで無停止に差し替える。
 acme = ["dep:serde_json", "dep:rcgen"]

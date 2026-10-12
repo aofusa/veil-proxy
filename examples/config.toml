@@ -2544,40 +2544,48 @@ revalidate_mtime = false
 # max_body_size = 10485760          # ハンドラへ渡す本文の上限（バイト）
 # handler_threads = 0               # 同期関数・C・Python 用ハンドラプールのスレッド数（0 = 既定）
 # tokio_threads = 2                 # tokio 互換ランタイムのワーカー数
+# grpc_max_message_size = 4194304   # 受信する gRPC メッセージ 1 つの上限（grpc-handler、F-197）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）
 # ==========================================
 # 制御プレーンからルート（[[route]]）とアップストリーム（[upstreams.<name>]）を動的に配信します。
-# xDS の REST-JSON / State-of-the-World 相当（version_info・nonce・長輪詢・ACK/NACK）。
+# xDS の State-of-the-World 相当（version_info・nonce・ACK/NACK）。転送は gRPC の双方向ストリーム
+# （既定、F-199。proto/veil/vds/v1/vds.proto）か REST-JSON の長輪詢。
 # 受け取ったスナップショットは route 配列と upstreams 表を丸ごと置き換え（config.toml のルートは
 # マージされません）、通常のリロード経路（検証 → ArcSwap）で無停止に適用されます。検証に失敗した
 # スナップショットは拒否（NACK）され、前の設定のまま動きます。listen・TLS・[[l4]] など
 # route / upstreams 以外は変更できません（再起動が必要）。
 # 優先順位: config.toml < VDS < 環境変数 VEIL_OVERRIDE_<n> < CLI --override
 # `vds` feature が必要です（full に含まれます）。[vds] は起動時に読まれ、SIGHUP では反映されません。
-# 詳細は docs/guide/vds.md。参照制御プレーンは tools/vds/vds_server.py。
+# 詳細は docs/guide/vds.md。参照制御プレーンは tools/vds/server（Rust、gRPC + REST）と
+# tools/vds/vds_server.py（Python、REST のみ）。
 #
 # [vds]
 # enabled = false
-# # 制御プレーンの URL（http://host:port[/base] または https://...）。{server}/v1/discovery へ POST する
+# # 制御プレーンの URL（http://host:port[/base] または https://...）。gRPC は h2c / TLS（ALPN h2）で
+# # {server}/veil.vds.v1.VeilDiscoveryService/StreamSnapshots、REST は {server}/v1/discovery へ POST する
 # server = ""
+# # 転送: "grpc"（双方向ストリーム。版が変わるとすぐ届く）または "rest"（長輪詢）
+# transport = "grpc"
+# # gRPC の接続の TCP キープアライブ（秒、0 で無効）。押し出しが無い間の相手の消失を検知する
+# keepalive_secs = 30
 # # ノード ID（空ならホスト名）とクラスタ名
 # node_id = ""
 # cluster = ""
-# # Bearer トークンを書いたファイル（要求ごとに読み直す。空なら Authorization を送らない）
+# # Bearer トークンを書いたファイル（REST は要求ごと、gRPC は接続ごとに読み直す。空なら Authorization を送らない）
 # token_file = ""
 # # https の追加の信頼 CA（PEM。空なら組み込みの web PKI ルートのみ）
 # ca_cert = ""
 # # 相互 TLS 用のクライアント証明書・鍵（PEM。両方指定したときだけ使う）
 # client_cert = ""
 # client_key = ""
-# # 長輪詢の保留時間の上限（秒）。HTTP のタイムアウトはこの値 + 15 秒
+# # 長輪詢の保留時間の上限（秒、REST）。HTTP のタイムアウトはこの値 + 15 秒
 # poll_timeout_secs = 30
 # # エラー後の再試行待ち（ミリ秒、倍々で retry_max_ms まで）
 # retry_initial_ms = 500
 # retry_max_ms = 30000
-# # 応答本文の上限（バイト）とリソース数の上限
+# # 応答本文（gRPC は 1 メッセージ）の上限（バイト）とリソース数の上限
 # max_response_bytes = 16777216
 # max_resources = 10000
 

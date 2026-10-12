@@ -1,4 +1,5 @@
-# VDS の参照制御プレーン（tools/vds/vds_server.py）。スナップショットは ConfigMap（veil-vds-snapshot）。
+# VDS の参照制御プレーン（tools/vds/server、gRPC + REST。イメージは docker/Dockerfile.vds-server）。
+# スナップショットは ConfigMap（veil-vds-snapshot）。veil は gRPC の双方向ストリームで購読する（F-199）。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,10 +19,10 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: vds
-          image: python:3.12-alpine
+          image: veil-vds-server:latest
           imagePullPolicy: IfNotPresent
-          command: ["python3", "-I", "/opt/vds/vds_server.py", "--snapshot", "/etc/vds/snapshot.toml",
-                    "--listen", "0.0.0.0:18000", "--token-file", "/etc/veil/vds/token", "--hold", "20"]
+          args: ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000",
+                 "--token-file", "/etc/veil/vds/token", "--hold", "20"]
           ports:
             - {name: vds, containerPort: 18000}
           readinessProbe:
@@ -31,12 +32,9 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
           volumeMounts:
-            - {name: code, mountPath: /opt/vds, readOnly: true}
             - {name: snapshot, mountPath: /etc/vds, readOnly: true}
             - {name: vds-token, mountPath: /etc/veil/vds, readOnly: true}
       volumes:
-        - name: code
-          configMap: {name: veil-vds-server}
         - name: snapshot
           configMap: {name: veil-vds-snapshot}
         - name: vds-token
@@ -49,4 +47,6 @@ metadata:
 spec:
   selector: {app: veil-vds}
   ports:
-    - {name: http-vds, port: 18000, targetPort: vds, appProtocol: http}
+    # gRPC（h2c）と REST を同じポートで。Istio は名前の grpc- 接頭辞で gRPC と扱い、Linkerd は HTTP/2 を自動判別する
+    # （appProtocol: http を付けると Linkerd は HTTP/1.1 に固定して h2c を壊す）
+    - {name: grpc-vds, port: 18000, targetPort: vds}

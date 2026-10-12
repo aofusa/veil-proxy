@@ -86,3 +86,26 @@ message DiscoveryResponse { string version_info = 1; string nonce = 2; string ty
 ## 依存
 
 - F-197 の gRPC 部品（フレーミング・prost）を共有する（ただし VDS はライブラリ用の `handler` には依存しない）。
+
+## 結果
+
+- `proto/veil/vds/v1/vds.proto`。veil 本体は同じ定義を prost の derive で `src/vds_grpc.rs` に持つ（本体のビルドに protoc を
+  要求しない）。ワイヤ互換は tonic-build で .proto から生成した Rust の参照制御プレーンとの E2E で確認している。
+- `[vds] transport = "grpc" | "rest"`（既定 `"grpc"`）、`keepalive_secs`（既定 30）。HTTP/2 の PING ではなく TCP キープアライブ
+  で死活を見る（`http2::upstream_mux` に PING の送信を足さずに済み、押し出しの無い長い間の相手の消失も同じく検知できる）。
+- 接続は `http2::upstream_mux::H2Mux`（`idle_timeout = 0` でストリームの終わりに接続も閉じる）。TLS は VDS 専用の rustls
+  設定（追加 CA・mTLS、ALPN は `h2` だけ）。トークンは接続ごとに読み直す。
+- 適用・ACK/NACK・状態は REST と共通の関数（`vds::apply_snapshot`・`record_applied`・`record_rejected`）。
+- 参照制御プレーン `tools/vds/server`（tonic + axum、gRPC と REST を 1 ポート、TLS 可、SIGTERM 対応）と
+  `docker/Dockerfile.vds-server`。Kubernetes のサンプル（`deploy/kubernetes`）はこれに切り替え、Service のポート名を
+  `grpc-vds`（Istio は gRPC として扱い、Linkerd は HTTP/2 を自動判別。`appProtocol: http` は Linkerd が HTTP/1.1 に固定するので付けない）。
+  Python 版（`tools/vds/vds_server.py`）は REST の最小参照実装として残す。
+
+試験:
+
+- 単体: `vds_grpc::tests`（Resource → REST 形・ACK/NACK の要求・grpc-status）。
+- standalone E2E: `f04_vds_*`（Python・REST）、`f199_vds_rest_on_rust_control_plane`、`f199_vds_grpc_stream_h2c`
+  （制御プレーンの再起動からの再接続を含む）、`f199_vds_grpc_stream_tls`（TLS + 追加 CA + Bearer）。4 つとも同じ
+  シナリオ（配信・更新・NACK で前の版を保つ・修正）で同じ結果。
+- kind E2E（`tools/k8s/kind-e2e.sh`）: VDS を gRPC ストリームで Istio・Linkerd 越しに配信し、`/v1/status` で
+  `transport = grpc` の ACK と制御プレーン再起動後の再接続を確認する項目を追加。

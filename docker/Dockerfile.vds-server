@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# VDS の参照制御プレーン（tools/vds/server、F-199。gRPC + REST）のイメージ。
+#
+#   docker build -f docker/Dockerfile.vds-server -t veil-vds-server:latest .
+#   docker run --rm -v $PWD/snapshot.toml:/etc/vds/snapshot.toml -p 18000:18000 veil-vds-server:latest \
+#       --snapshot /etc/vds/snapshot.toml --listen 0.0.0.0:18000
+#
+# 本体（veil）とは独立したクレート。テスト・小規模運用向けの参照実装（本番は自前の制御プレーンを推奨）。
+
+FROM rust:1-bookworm AS builder
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends protobuf-compiler cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY proto /src/proto
+COPY tools/vds/server /src/tools/vds/server
+RUN cd tools/vds/server && cargo build --release --locked \
+    && cp target/release/veil-vds-server /veil-vds-server
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /veil-vds-server /usr/local/bin/veil-vds-server
+USER 65532:65532
+EXPOSE 18000
+ENTRYPOINT ["/usr/local/bin/veil-vds-server"]
+CMD ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000"]

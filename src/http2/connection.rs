@@ -674,7 +674,7 @@ where
         // closed（RFC 9113 §5.1）。閉じた直後のストリームへの WINDOW_UPDATE・DATA は普通に届く
         // （応答を送り終えた後のアップロードの残り、クライアントの取り消し直後等）ので接続エラーにしない。
         if self.streams.get_ref(stream_id).is_none()
-            && (stream_id % 2 == 0 || stream_id > self.streams.max_client_stream_id())
+            && (stream_id.is_multiple_of(2) || stream_id > self.streams.max_client_stream_id())
         {
             // 一度も開かれていない = idle 状態
             return Err(Http2Error::connection_error(
