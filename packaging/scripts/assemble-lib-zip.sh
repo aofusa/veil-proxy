@@ -60,8 +60,8 @@ if has rust; then
       --transform "s,^,veil-$VER/," \
       Cargo.toml Cargo.lock build.rs clippy.toml .cargo src crates third_party benches \
       fuzz/Cargo.toml fuzz/fuzz_targets LICENSE-APACHE LICENSE-MIT README.md )
-  cp -r "$ROOT/examples/api/rust-showcase" "$STAGE/rust/examples/"
-  rm -rf "$STAGE/rust/examples/rust-showcase/target"
+  cp -r "$ROOT/examples/api/rust-hello" "$ROOT/examples/api/rust-showcase" "$STAGE/rust/examples/"
+  rm -rf "$STAGE"/rust/examples/*/target
   cat > "$STAGE/rust/README.md" <<MD
 # veil (Rust library) $VER
 
