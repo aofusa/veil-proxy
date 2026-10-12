@@ -126,6 +126,19 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 
 
 
+### ライブラリ成果物（Rust ソース・C ライブラリ・Python wheel）
+
+API サーバライブラリ（[library.md](library.md)）は `veil` バイナリとは別に、`packaging/output/lib/` に 1 個の zip で出す:
+
+```bash
+packaging/scripts/build-lib.sh                       # 全種類を docker で（manylinux_2_28、glibc 2.28 以上で動く）
+packaging/scripts/build-lib.sh --kind c,python       # 種類を選ぶ: rust, c, python
+packaging/scripts/build-lib.sh --local --profile release   # ホストのツールチェーンでビルド（maturin が必要）
+```
+
+出力: `veil-lib-<version>-<arch>-linux-gnu.zip`（`c/`: `libveil.so`・`libveil.a`・`veil.h`・pkg-config、`python/`: abi3 の wheel、
+`rust/`: ソースパッケージと例、`docs/`）。
+
 ### ビルドプロファイル
 
 - **`cargo build --release`** は cargo 既定（`lto = false` / `codegen-units = 16`）。

@@ -8,6 +8,7 @@ Debian/Ubuntu 向け `.deb` と Amazon Linux 2023 向け `.rpm` を生成・検�
 |------|------|
 | パッケージ形式 | `.deb`（Debian/Ubuntu）、`.rpm`（Amazon Linux 2023）、スタンドアロン `.tar.gz`（glibc / musl バイナリ） |
 | ビルドスクリプト | `packaging/scripts/build.sh`（deb / rpm / 両バイナリ tar.gz を一括生成） |
+| ライブラリ成果物 | `packaging/scripts/build-lib.sh`（C ライブラリ・Python wheel・Rust ソースを `packaging/output/lib/veil-lib-*.zip` 1 個に。F-195） |
 | デフォルトビルド | `--features full`（全オプションフィーチャー有効） |
 | 設定ファイル | `contrib/config/config.toml`（`examples/config.toml` ベース） |
 | 設定配置先 | `/var/etc/veil/config.toml` |

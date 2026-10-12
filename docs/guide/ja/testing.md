@@ -10,9 +10,9 @@ Veilには、ユニットテスト、統合テスト、エンドツーエンド�
 
 | テスト種別 | テスト数 | 状態 |
 |-----------|---------|------|
-| **ユニットテスト**（lib） | 694 | ✅ すべて成功 |
+| **ユニットテスト**（lib） | 1044 | ✅ すべて成功 |
 | **統合テスト**（`integration_tests` + プロパティ + キャンセル安全性） | 55+ | ✅ すべて成功 |
-| **E2Eテスト**（`e2e_tests`） | 419 | ✅ すべて成功 |
+| **E2Eテスト**（`e2e_tests`） | 565 | ✅ すべて成功 |
 | **Fuzz ターゲット**（`cargo fuzz`） | 8 | ✅ クラッシュなし |
 | **ベンチマーク** | 13ファイル | ✅ 準備完了 |
 
@@ -131,6 +131,18 @@ cargo bench --bench wasm --features wasm
 ./tests/run_bench.sh throughput   # スループットのみ
 ./tests/run_bench.sh latency      # レイテンシのみ
 ```
+
+#### 機能別の E2E スクリプト
+
+自分でプロセスを起動する自己完結型の試験（`e2e_setup.sh` の共有環境は使わない）:
+
+| 対象 | コマンド | 内容 |
+|------|---------|------|
+| プロセス単位の挙動 | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>`（SIGHUP・CLI 優先含む）、Kubernetes Secret 形式の証明書差し替え、平文専用サーバ（`h2c_http1`）、参照制御プレーンを使った VDS |
+| API ライブラリ | `tests/api/library_e2e.sh [rust\|c\|python\|nonregression\|all]` | Rust の総合例（マクロ・検証・OpenAPI・tower 層・GraphQL・L4 ハンドラ・config.toml 無しの既定）、C（共有・静的）、Python、`full` バイナリにライブラリのコードが無いこと |
+| ACME | `tests/acme/pebble_e2e.sh` | Pebble から HTTP-01 で発行してホットリロード（docker が必要） |
+| コンテナ | `examples/container/e2e.sh` | Docker secrets・環境変数の上書き・証明書の差し替え・graceful stop（ビルド済みイメージが必要） |
+| Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | kind 上の Istio / Linkerd メッシュ内のサイドカー（[kubernetes.md](kubernetes.md)） |
 
 ### テストカバレッジ
 

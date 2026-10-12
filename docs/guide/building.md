@@ -118,6 +118,20 @@ See [packaging/README.md](../../packaging/README.md) for details (Docker build, 
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
 
+### Library artifacts (Rust source, C library, Python wheel)
+
+The API server library ([library.md](library.md)) is packaged separately from the `veil` binaries, as a
+single zip in `packaging/output/lib/`:
+
+```bash
+packaging/scripts/build-lib.sh                       # all kinds, in docker (manylinux_2_28, glibc >= 2.28)
+packaging/scripts/build-lib.sh --kind c,python       # choose: rust, c, python
+packaging/scripts/build-lib.sh --local --profile release   # build with the host toolchain (needs maturin)
+```
+
+Output: `veil-lib-<version>-<arch>-linux-gnu.zip` with `c/` (`libveil.so`, `libveil.a`, `veil.h`, pkg-config),
+`python/` (abi3 wheel), `rust/` (source package and examples) and `docs/`.
+
 ### Build profiles
 
 - **`cargo build --release`** uses Cargo's defaults (`lto = false`, `codegen-units = 16`).
