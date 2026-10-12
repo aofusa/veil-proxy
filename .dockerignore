@@ -31,3 +31,5 @@
 !README.md
 !packaging/scripts/
 !clippy.toml
+# Cargo.toml の [[bench]] の解決に要る（ライブラリ成果物のビルド・Rust ソースの tarball）
+!benches/

@@ -58,7 +58,7 @@ if has rust; then
   ( cd "$ROOT" && tar czf "$STAGE/rust/veil-src-$VER.tar.gz" \
       --exclude='target' --exclude='__pycache__' --exclude='*.so' \
       --transform "s,^,veil-$VER/," \
-      Cargo.toml Cargo.lock build.rs clippy.toml .cargo src crates third_party \
+      Cargo.toml Cargo.lock build.rs clippy.toml .cargo src crates third_party benches \
       fuzz/Cargo.toml fuzz/fuzz_targets LICENSE-APACHE LICENSE-MIT README.md )
   cp -r "$ROOT/examples/api/rust-showcase" "$STAGE/rust/examples/"
   rm -rf "$STAGE/rust/examples/rust-showcase/target"
