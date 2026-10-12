@@ -237,6 +237,56 @@ impl ConfigOverride {
     }
 }
 
+/// 環境変数による上書きの名前の接頭辞（F-179）。`VEIL_OVERRIDE_<n>` の `<n>` は 10 進の正整数。
+pub const ENV_OVERRIDE_PREFIX: &str = "VEIL_OVERRIDE_";
+
+/// 環境変数の一覧から `VEIL_OVERRIDE_<n>` を集め、`<n>` の数値の昇順に並べてパースする（F-179）。
+///
+/// 値の書式は `--override` と同じ（`<path> = <toml-value>`）。名前が規則に合わない
+/// （`<n>` が空・10 進数でない・0）・値が不正な場合はエラー（起動を止める）。
+/// 優先順位は TOML < 環境変数 < CLI の `--override` なので、呼び出し側は戻り値の後ろに
+/// CLI の上書きを連結して [`set_global_overrides`] に渡す（後勝ち）。
+pub fn env_overrides_from<I, K, V>(vars: I) -> Result<Vec<ConfigOverride>, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut found: Vec<(u64, ConfigOverride)> = Vec::new();
+    for (k, v) in vars {
+        let Some(name) = k.as_ref().to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(ENV_OVERRIDE_PREFIX) else {
+            continue;
+        };
+        let n: u64 = if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            suffix
+                .parse()
+                .map_err(|_| format!("invalid environment variable name '{}'", name))?
+        } else {
+            return Err(format!(
+                "invalid environment variable name '{}': expected {}<n> with a positive decimal <n>",
+                name, ENV_OVERRIDE_PREFIX
+            ));
+        };
+        if n == 0 {
+            return Err(format!(
+                "invalid environment variable name '{}': <n> must be a positive integer",
+                name
+            ));
+        }
+        let value = v
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| format!("environment variable '{}' is not valid UTF-8", name))?;
+        let ov = ConfigOverride::parse(value).map_err(|e| format!("{}: {}", name, e))?;
+        found.push((n, ov));
+    }
+    found.sort_by_key(|(n, _)| *n);
+    Ok(found.into_iter().map(|(_, ov)| ov).collect())
+}
+
 /// パスを 1 段階たどり、次のノードへの可変参照を返す（最終セグメントより前段用）。
 /// 存在しない中間テーブルはここで生成する。
 fn navigate<'a>(
@@ -564,5 +614,78 @@ mod tests {
 
         let cfg: Cfg = apply_to_toml_str("[server]\nthreads = 1\n").unwrap();
         assert_eq!(cfg.server.threads, 9);
+    }
+
+    // ===== F-179: 環境変数による上書き =====
+
+    fn apply_list(base: &str, ovs: &[ConfigOverride]) -> toml::Value {
+        let mut root: toml::Value = toml::from_str(base).unwrap();
+        for ov in ovs {
+            apply_override(&mut root, ov).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn env_overrides_sorted_by_number_not_by_name() {
+        let ovs = env_overrides_from(vec![
+            ("VEIL_OVERRIDE_10", "server.threads = 10"),
+            ("PATH", "/usr/bin"),
+            ("VEIL_OVERRIDE_2", "server.threads = 2"),
+            ("VEIL_OVERRIDE_1", r#"server.listen = "0.0.0.0:8443""#),
+        ])
+        .unwrap();
+        assert_eq!(ovs.len(), 3);
+        // 1 → 2 → 10 の順に適用され、同じパスは後勝ち（10）。
+        let v = apply_list("[server]\nthreads = 1\n", &ovs);
+        assert_eq!(v["server"]["threads"].as_integer(), Some(10));
+        assert_eq!(v["server"]["listen"].as_str(), Some("0.0.0.0:8443"));
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_names() {
+        for name in [
+            "VEIL_OVERRIDE_",
+            "VEIL_OVERRIDE_A",
+            "VEIL_OVERRIDE_1a",
+            "VEIL_OVERRIDE_0",
+            "VEIL_OVERRIDE_-1",
+        ] {
+            assert!(
+                env_overrides_from(vec![(name, "server.threads = 1")]).is_err(),
+                "{} must be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_value_with_variable_name() {
+        let err = env_overrides_from(vec![("VEIL_OVERRIDE_3", "server.threads")]).unwrap_err();
+        assert!(err.contains("VEIL_OVERRIDE_3"), "{}", err);
+    }
+
+    #[test]
+    fn env_overrides_support_array_index_and_quoted_keys() {
+        let ovs = env_overrides_from(vec![
+            ("VEIL_OVERRIDE_1", r#"route.0.action.path = "/srv/www""#),
+            ("VEIL_OVERRIDE_2", r#"tls."a.b" = 1"#),
+        ])
+        .unwrap();
+        let v = apply_list(
+            "[tls]\n[[route]]\naction = { type = \"File\", path = \"/x\" }\n",
+            &ovs,
+        );
+        assert_eq!(v["route"][0]["action"]["path"].as_str(), Some("/srv/www"));
+        assert_eq!(v["tls"]["a.b"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn env_then_cli_order_gives_cli_priority() {
+        // entry.rs は「環境変数 → CLI」の順に連結して渡す（後勝ち = CLI 優先）。
+        let mut ovs = env_overrides_from(vec![("VEIL_OVERRIDE_1", "server.threads = 4")]).unwrap();
+        ovs.push(ConfigOverride::parse("server.threads = 8").unwrap());
+        let v = apply_list("[server]\nthreads = 1\n", &ovs);
+        assert_eq!(v["server"]["threads"].as_integer(), Some(8));
     }
 }

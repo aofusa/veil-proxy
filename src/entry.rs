@@ -142,7 +142,14 @@ pub fn run() {
     // -o/--override をパースしてグローバルへ確定させる（設定ファイルを読む前に行う）。
     // 起動時のみならずホットリロード（SIGHUP）・-t 検証も同じグローバル集合を通る
     // （src/config_override.rs の apply_to_toml_str が単一チョークポイント）。
-    let overrides = cli_args
+    // F-179: 環境変数 `VEIL_OVERRIDE_<n>` も同じ書式で受ける。優先順位は
+    // TOML < 環境変数 < CLI なので「環境変数（<n> の昇順）→ CLI」の順に連結する（後勝ち）。
+    let mut overrides = crate::config_override::env_overrides_from(std::env::vars_os())
+        .unwrap_or_else(|e| {
+            eprintln!("veil: invalid environment override: {}", e);
+            std::process::exit(1);
+        });
+    let cli_overrides = cli_args
         .overrides
         .iter()
         .map(|s| crate::config_override::ConfigOverride::parse(s))
@@ -151,6 +158,7 @@ pub fn run() {
             eprintln!("veil: invalid --override: {}", e);
             std::process::exit(1);
         });
+    overrides.extend(cli_overrides);
     crate::config_override::set_global_overrides(overrides);
 
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）

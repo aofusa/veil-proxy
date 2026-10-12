@@ -9,6 +9,11 @@
 # `veil -o "[server].threads = 4"`（ブラケット記法も等価）。
 # 起動時・`-t` 検証時・SIGHUP によるホットリロード時のすべてに同じ上書きが
 # 適用される。構文の詳細は README.md / docs/readme/README.ja.md を参照。
+#
+# 同じ書式は環境変数 `VEIL_OVERRIDE_<n>`（<n> は 10 進の正整数、数値の昇順に適用）でも
+# 指定できる（F-179）。例: VEIL_OVERRIDE_1='server.listen = "0.0.0.0:8443"'
+# 優先順位は config.toml < 環境変数 < コマンドラインの -o。環境変数は起動時の値で固定され、
+# SIGHUP でも同じ上書きが当て直される。秘密鍵等の機密値は環境変数で渡さないこと。
 
 [server]
 listen = "127.0.0.1:443"

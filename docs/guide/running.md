@@ -69,6 +69,26 @@ Syntax: `<path> = <toml-value>` (spaces around `=` are optional).
 ./veil -o "server.threads = 4" -o "l4.0.listen = 0.0.0.0:9000"
 ```
 
+### Configuration Override via Environment Variables (`VEIL_OVERRIDE_<n>`)
+
+The same overrides can be supplied through environment variables, which is convenient for
+containers and systemd units (F-179). Put one override per variable, in exactly the
+`--override` syntax, into `VEIL_OVERRIDE_<n>` where `<n>` is a positive decimal integer:
+
+```bash
+VEIL_OVERRIDE_1='server.listen = "0.0.0.0:8443"' \
+VEIL_OVERRIDE_2='route.0.action.path = "/srv/www"' \
+./veil -c /etc/veil/config.toml
+```
+
+| Rule | Behavior |
+|------|----------|
+| Name | `VEIL_OVERRIDE_<n>`; `<n>` must be a positive decimal integer (`VEIL_OVERRIDE_1`, `VEIL_OVERRIDE_20`). Any other suffix (`VEIL_OVERRIDE_`, `VEIL_OVERRIDE_X`, `VEIL_OVERRIDE_0`) is a startup error. |
+| Order | Applied in ascending numeric order of `<n>` (`2` before `10`); when the same path appears twice, the later one wins. |
+| Priority | `config.toml` < environment variables < `-o`/`--override` on the command line. |
+| Reload | The environment is fixed at process start. On SIGHUP only `config.toml` is re-read and the same environment overrides are applied again. |
+| Secrets | Do **not** pass private keys or tokens this way: the environment of a process is visible via `/proc/<pid>/environ` (Linux) or `ps -e` (BSD). Mount them as files instead (see [TLS in containers](tls.md#certificates-and-keys-in-containers)). |
+
 ### Configuration Validation
 
 Test your configuration file before deploying or reloading:
