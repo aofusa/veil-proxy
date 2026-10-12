@@ -507,7 +507,8 @@ pub async fn yield_now() {
             Poll::Ready(())
         } else {
             yielded = true;
-            cx.waker().wake_by_ref();
+            // tokio と同じく、ランタイムが I/O・タイマーを見た後に再開する
+            crate::tokio::waker::defer_wake(cx.waker());
             Poll::Pending
         }
     })
@@ -581,7 +582,7 @@ pub mod coop {
         BUDGET.with(|b| match b.get() {
             None => Poll::Ready(RestoreOnPending(Cell::new(None))),
             Some(0) => {
-                cx.waker().wake_by_ref();
+                crate::tokio::waker::defer_wake(cx.waker());
                 Poll::Pending
             }
             Some(n) => {

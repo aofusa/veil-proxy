@@ -37,6 +37,35 @@ impl Wait {
 #[derive(Default)]
 struct WaitSlot {
     pending: Option<(ThreadId, Wait)>,
+    /// 同じ向きを待っている全員（準備できたら全員を起こす。tokio と同じ）
+    waiters: Arc<WaitAll>,
+}
+
+/// 登録された Waker を全部起こす Waker。
+#[derive(Default)]
+struct WaitAll {
+    list: Mutex<Vec<std::task::Waker>>,
+}
+
+impl WaitAll {
+    fn add(&self, w: &std::task::Waker) {
+        let mut l = self.list.lock().unwrap();
+        if !l.iter().any(|x| x.will_wake(w)) {
+            l.push(crate::tokio::waker::safe_waker(w));
+        }
+    }
+}
+
+impl std::task::Wake for WaitAll {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let ws: Vec<_> = std::mem::take(&mut *self.list.lock().unwrap());
+        for w in ws {
+            w.wake();
+        }
+    }
 }
 
 impl WaitSlot {
@@ -144,6 +173,8 @@ impl IoSource {
             slot.clear();
         }
         let fd = self.raw();
+        slot.waiters.add(cx.waker());
+        let all = std::task::Waker::from(slot.waiters.clone());
         let (_, w) = slot.pending.get_or_insert_with(|| {
             (
                 me,
@@ -154,7 +185,7 @@ impl IoSource {
                 },
             )
         });
-        let r = w.poll(cx);
+        let r = w.poll(&mut Context::from_waker(&all));
         crate::tokio::waker::touch_exit_sentinel();
         let r = ready!(r);
         slot.pending = None;
@@ -514,10 +545,11 @@ impl TcpStream {
             {
                 return Err(e);
             }
-            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
-            if let Some(e) = sock_err(s.io.raw())? {
-                return Err(e);
-            }
+        }
+        // tokio と同じく、すぐ繋がっても一度ランタイムの準備待ちを通して SO_ERROR を見る
+        poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+        if let Some(e) = sock_err(s.io.raw())? {
+            return Err(e);
         }
         Ok(s)
     }
@@ -1845,7 +1877,9 @@ impl UnixStream {
         for (d, s) in sun.sun_path.iter_mut().zip(p) {
             *d = *s as libc::c_char;
         }
-        let len = (std::mem::size_of::<libc::sa_family_t>() + p.len() + 1) as libc::socklen_t;
+        // 抽象名前空間（先頭が NUL）は終端の NUL を含めない
+        let extra = if p.first() == Some(&0) { 0 } else { 1 };
+        let len = (std::mem::size_of::<libc::sa_family_t>() + p.len() + extra) as libc::socklen_t;
         let r = unsafe {
             libc::connect(
                 fd.as_raw_fd(),
@@ -1862,10 +1896,11 @@ impl UnixStream {
             {
                 return Err(e);
             }
-            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
-            if let Some(e) = sock_err(s.io.raw())? {
-                return Err(e);
-            }
+        }
+        // tokio と同じく、すぐ繋がっても一度ランタイムの準備待ちを通して SO_ERROR を見る
+        poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+        if let Some(e) = sock_err(s.io.raw())? {
+            return Err(e);
         }
         Ok(UnixStream { inner: s })
     }
@@ -2017,6 +2052,15 @@ impl UnixListener {
     #[track_caller]
     pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<UnixListener> {
         check_io_context();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let p = path.as_ref().as_os_str().as_encoded_bytes();
+            if p.first() == Some(&0) {
+                let addr = std::os::unix::net::SocketAddr::from_abstract_name(&p[1..])?;
+                return UnixListener::from_std(std::os::unix::net::UnixListener::bind_addr(&addr)?);
+            }
+        }
         UnixListener::from_std(std::os::unix::net::UnixListener::bind(path)?)
     }
 
@@ -2130,6 +2174,63 @@ pub struct UnixDatagram {
 }
 
 impl UnixDatagram {
+    pub fn poll_send_to<P: AsRef<std::path::Path>>(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: P,
+    ) -> Poll<io::Result<usize>> {
+        let t = target.as_ref();
+        self.io
+            .poll_io(true, cx, || self.std(|d| d.send_to(buf, t)))
+    }
+
+    pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_write_ready(cx)
+    }
+
+    pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_read_ready(cx)
+    }
+
+    pub fn try_recv_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        let dst = buf.chunk_mut();
+        let n = self.io.track(
+            false,
+            cvt(unsafe { libc::recv(self.io.raw(), dst.as_mut_ptr().cast(), dst.len(), 0) }),
+        )?;
+        // SAFETY: n バイトは recv で初期化された
+        unsafe { buf.advance_mut(n) };
+        Ok(n)
+    }
+
+    pub async fn recv_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        poll_fn(|cx| self.io.poll_io(false, cx, || self.try_recv_buf(&mut *buf))).await
+    }
+
+    pub fn try_recv_buf_from<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+    ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
+        let dst = buf.chunk_mut();
+        // SAFETY: 未初期化領域へ読み込み、読んだ分だけ advance_mut する
+        let slice = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr(), dst.len()) };
+        let (n, a) = self.io.track(false, self.std(|d| d.recv_from(slice)))?;
+        unsafe { buf.advance_mut(n) };
+        Ok((n, a))
+    }
+
+    pub async fn recv_buf_from<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+    ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.try_recv_buf_from(&mut *buf))
+        })
+        .await
+    }
+
     fn std<R>(&self, f: impl FnOnce(&std::os::unix::net::UnixDatagram) -> R) -> R {
         with_std::<std::os::unix::net::UnixDatagram, _>(self.io.raw(), f)
     }
@@ -2378,10 +2479,11 @@ impl UnixSocket {
             {
                 return Err(e);
             }
-            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
-            if let Some(e) = sock_err(s.io.raw())? {
-                return Err(e);
-            }
+        }
+        // tokio と同じく、すぐ繋がっても一度ランタイムの準備待ちを通して SO_ERROR を見る
+        poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+        if let Some(e) = sock_err(s.io.raw())? {
+            return Err(e);
         }
         Ok(UnixStream { inner: s })
     }
@@ -2438,6 +2540,8 @@ impl IoSourceRef {
             slot.clear();
         }
         let fd = self.fd;
+        slot.waiters.add(cx.waker());
+        let all = std::task::Waker::from(slot.waiters.clone());
         let (_, w) = slot.pending.get_or_insert_with(|| {
             (
                 me,
@@ -2448,7 +2552,7 @@ impl IoSourceRef {
                 },
             )
         });
-        let r = w.poll(cx);
+        let r = w.poll(&mut Context::from_waker(&all));
         crate::tokio::waker::touch_exit_sentinel();
         let r = ready!(r);
         slot.pending = None;
@@ -2524,9 +2628,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         inner: T,
         interest: Interest,
     ) -> Result<AsyncFd<T>, AsyncFdTryNewError<T>> {
-        if !crate::runtime::has_driver() {
-            panic!("there is no reactor running, must be called from the context of a Tokio 1.x runtime");
-        }
+        check_io_context();
         let fd = inner.as_raw_fd();
         Ok(AsyncFd {
             inner: Some(inner),
@@ -2703,11 +2805,75 @@ impl<T: AsRawFd> AsyncFd<T> {
     }
 
     /// 準備を待たずに `f` を呼ぶ（`WouldBlock` なら準備を忘れる）。
+    /// 準備できているか（覚えていなければ poll(2) で今の状態を見る）。
+    fn probe_ready(&self, interest: Interest) -> bool {
+        let mut ready = (interest.is_readable()
+            && self.read_ready.load(std::sync::atomic::Ordering::Acquire))
+            || (interest.is_writable()
+                && self.write_ready.load(std::sync::atomic::Ordering::Acquire));
+        if !ready {
+            let mut events = 0;
+            if interest.is_readable() {
+                events |= libc::POLLIN;
+            }
+            if interest.is_writable() {
+                events |= libc::POLLOUT;
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.io.fd,
+                events,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+                let err = pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0;
+                if pfd.revents & libc::POLLIN != 0 || (err && interest.is_readable()) {
+                    self.read_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    ready = true;
+                }
+                if pfd.revents & libc::POLLOUT != 0 || (err && interest.is_writable()) {
+                    self.write_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    ready = true;
+                }
+            }
+        }
+        ready
+    }
+
+    /// 準備できていれば `f` を呼ぶ（できていなければ呼ばずに `WouldBlock`。`WouldBlock` なら準備を忘れる）。
+    pub fn try_io_mut<R>(
+        &mut self,
+        interest: Interest,
+        f: impl FnOnce(&mut T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        if !self.probe_ready(interest) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let r = f(self.inner.as_mut().unwrap());
+        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            self.clear(if interest.is_readable() {
+                Ready::READABLE
+            } else {
+                Ready::EMPTY
+            });
+            self.clear(if interest.is_writable() {
+                Ready::WRITABLE
+            } else {
+                Ready::EMPTY
+            });
+        }
+        r
+    }
+
     pub fn try_io<R>(
         &self,
         interest: Interest,
         f: impl FnOnce(&T) -> io::Result<R>,
     ) -> io::Result<R> {
+        if !self.probe_ready(interest) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let r = f(self.get_ref());
         if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
             if interest.is_readable() {

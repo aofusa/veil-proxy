@@ -34,6 +34,7 @@ EXCLUDE = [
     (r"^(tracing_|task_trace_|dump$|task_hooks$)", "tokio_unstable / taskdump / トレースのフック"),
     (r"^(time_pause|test_clock|time_alt)$", "時計の停止（test-util の pause/advance）は未対応"),
     (r"(_windows|^net_named_pipe)$", "Windows 専用"),
+    (r"^net_unix_pipe$", "tokio::net::unix::pipe と tokio::process（子プロセス）は未対応"),
     (r"^(coop_budget|task_builder|async_send_sync|unwindsafe|_require_full|no_rt|time_wasm|io_poll_aio)$",
      "協調スケジューリングの予算・tokio_unstable の Builder・型の自動トレイトの網羅検査・特定 OS 専用"),
 ]
@@ -129,7 +130,7 @@ tokio-test = "0.4"
 tokio-util = {{ version = "0.7", features = ["rt"] }}
 socket2 = "0.6"
 libc = "0.2"
-nix = {{ version = "0.29", default-features = false, features = ["fs", "socket", "signal", "process"] }}
+nix = {{ version = "0.30", default-features = false, features = ["fs", "socket", "signal", "process"] }}
 rand = "0.9"
 tempfile = "3"
 

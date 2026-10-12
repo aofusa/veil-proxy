@@ -517,8 +517,15 @@ pub struct PermitIterator<'a, T> {
     n: usize,
 }
 
+impl<T> ExactSizeIterator for PermitIterator<'_, T> {}
+
 impl<'a, T> Iterator for PermitIterator<'a, T> {
     type Item = Permit<'a, T>;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.n, Some(self.n))
+    }
+
     fn next(&mut self) -> Option<Permit<'a, T>> {
         if self.n == 0 {
             return None;

@@ -41,7 +41,7 @@ impl Instant {
         self.0.saturating_duration_since(earlier.0)
     }
     pub fn elapsed(&self) -> Duration {
-        self.0.elapsed()
+        clock_now().saturating_duration_since(self.0)
     }
     pub fn checked_add(&self, d: Duration) -> Option<Instant> {
         self.0.checked_add(d).map(Instant)
@@ -138,7 +138,7 @@ fn clock_now() -> std::time::Instant {
     if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) {
         return std::time::Instant::now();
     }
-    let c = clock().lock().unwrap();
+    let c = clock().lock().unwrap_or_else(|e| e.into_inner());
     if c.paused {
         c.virt_at
     } else {
@@ -147,7 +147,8 @@ fn clock_now() -> std::time::Instant {
 }
 
 fn is_paused() -> bool {
-    CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) && clock().lock().unwrap().paused
+    CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire)
+        && clock().lock().unwrap_or_else(|e| e.into_inner()).paused
 }
 
 /// 時計の時刻（仮想）を実時間に直す（タイマースレッドの待ち時間用）。
@@ -155,7 +156,7 @@ fn to_real(deadline: std::time::Instant) -> std::time::Instant {
     if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) {
         return deadline;
     }
-    let c = clock().lock().unwrap();
+    let c = clock().lock().unwrap_or_else(|e| e.into_inner());
     c.real_at + deadline.saturating_duration_since(c.virt_at)
 }
 
@@ -163,8 +164,9 @@ fn to_real(deadline: std::time::Instant) -> std::time::Instant {
 #[track_caller]
 pub fn pause() {
     CLOCK_TOUCHED.store(true, std::sync::atomic::Ordering::Release);
-    let mut c = clock().lock().unwrap();
+    let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
     if c.paused {
+        drop(c);
         panic!("time is already frozen");
     }
     let now = std::time::Instant::now();
@@ -176,11 +178,19 @@ pub fn pause() {
     timer().cv.notify_one();
 }
 
+/// 止まっていなければ止める（`start_paused` のランタイムを複数作るとき用）。
+pub(crate) fn pause_if_running() {
+    if !is_paused() {
+        pause();
+    }
+}
+
 /// 止めた時計を動かす。
 #[track_caller]
 pub fn resume() {
-    let mut c = clock().lock().unwrap();
+    let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
     if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) || !c.paused {
+        drop(c);
         panic!("time is not frozen");
     }
     c.real_at = std::time::Instant::now();
@@ -192,7 +202,7 @@ pub fn resume() {
 /// 止めた時計を `duration` だけ進め、期限の来たタイマーを起こしてから 1 回譲る。
 pub async fn advance(duration: Duration) {
     {
-        let mut c = clock().lock().unwrap();
+        let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
         if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) || !c.paused {
             panic!("time is not frozen");
         }
@@ -205,6 +215,11 @@ pub async fn advance(duration: Duration) {
 /// 時計の設定（ランタイムの文脈で timers が無効なら panic する）。
 #[track_caller]
 fn check_time_enabled() {
+    if !crate::runtime::has_driver() && crate::tokio::runtime::Handle::try_current().is_err() {
+        panic!(
+            "there is no reactor running, must be called from the context of a Tokio 1.x runtime"
+        );
+    }
     if !crate::tokio::runtime::time_enabled_in_context() {
         panic!(
             "A Tokio 1.x context was found, but timers are disabled. Call `enable_time` on the runtime builder to enable timers."
@@ -313,7 +328,7 @@ fn run_timer(t: &'static TimerThread) {
             let before = ACTIVITY.load(std::sync::atomic::Ordering::Relaxed);
             drop(t.cv.wait_timeout(wheel, QUIET).unwrap());
             if ACTIVITY.load(std::sync::atomic::Ordering::Relaxed) == before && is_paused() {
-                let mut c = clock().lock().unwrap();
+                let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
                 if c.paused && next > c.virt_at {
                     c.virt_at = next;
                 }
@@ -528,7 +543,8 @@ impl<T: Future> Future for Timeout<T> {
         if let Poll::Ready(v) = value.poll(cx) {
             return Poll::Ready(Ok(v));
         }
-        match Pin::new(&mut this.delay).poll(cx) {
+        // 中の Future が予算を使い切っていても期限は見る（tokio と同じ）
+        match crate::tokio::task::coop::with_unconstrained(|| Pin::new(&mut this.delay).poll(cx)) {
             Poll::Ready(()) => Poll::Ready(Err(Elapsed(()))),
             Poll::Pending => Poll::Pending,
         }
@@ -610,19 +626,20 @@ impl Interval {
         }
         let timeout = self.delay.deadline();
         let now = Instant::now();
-        let next = if now > timeout + Duration::from_millis(5) {
+        let add = |a: Instant, d: Duration| a.checked_add(d).unwrap_or_else(Instant::far_future);
+        let next = if now > add(timeout, Duration::from_millis(5)) {
             match self.missed_tick_behavior {
-                MissedTickBehavior::Burst => timeout + self.period,
-                MissedTickBehavior::Delay => now + self.period,
+                MissedTickBehavior::Burst => add(timeout, self.period),
+                MissedTickBehavior::Delay => add(now, self.period),
                 MissedTickBehavior::Skip => {
                     let elapsed = now.duration_since(timeout).as_nanos();
                     let p = self.period.as_nanos().max(1);
                     let skip = (elapsed / p + 1) as u32;
-                    timeout + self.period * skip
+                    add(timeout, self.period.saturating_mul(skip))
                 }
             }
         } else {
-            timeout + self.period
+            add(timeout, self.period)
         };
         Pin::new(&mut self.delay).reset(next);
         Poll::Ready(timeout)
@@ -661,25 +678,33 @@ impl Interval {
 mod tests {
     use super::*;
 
+    fn rt() -> crate::tokio::runtime::Runtime {
+        crate::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     #[test]
-    fn sleep_and_timeout_without_runtime() {
+    fn sleep_and_timeout() {
+        let rt = rt();
         let t = std::time::Instant::now();
-        futures::executor::block_on(sleep(Duration::from_millis(30)));
+        rt.block_on(async { sleep(Duration::from_millis(30)).await });
         assert!(t.elapsed() >= Duration::from_millis(30));
-        let r = futures::executor::block_on(timeout(
-            Duration::from_millis(20),
-            sleep(Duration::from_secs(5)),
-        ));
+        let r = rt.block_on(async {
+            timeout(Duration::from_millis(20), sleep(Duration::from_secs(5))).await
+        });
         assert!(r.is_err());
-        let r = futures::executor::block_on(timeout(Duration::from_secs(5), async { 7 }));
+        let r = rt.block_on(async { timeout(Duration::from_secs(5), async { 7 }).await });
         assert_eq!(r.unwrap(), 7);
     }
 
     #[test]
     fn interval_ticks() {
-        let mut i = interval(Duration::from_millis(10));
+        let rt = rt();
         let t = std::time::Instant::now();
-        futures::executor::block_on(async {
+        rt.block_on(async {
+            let mut i = interval(Duration::from_millis(10));
             for _ in 0..4 {
                 i.tick().await;
             }

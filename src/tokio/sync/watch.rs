@@ -353,6 +353,8 @@ impl<T> Receiver<T> {
         mut f: F,
     ) -> Result<Ref<'_, T>, RecvError> {
         loop {
+            // 条件をすぐ満たしても予算を使う（tokio と同じく協調的）
+            std::future::poll_fn(crate::tokio::task::coop::poll_proceed_and_make_progress).await;
             {
                 let r = self.borrow_and_update();
                 if f(&r) {

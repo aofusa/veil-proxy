@@ -96,9 +96,10 @@ pub trait AsyncReadExt: AsyncRead {
         Self: Unpin,
     {
         async move {
+            // tokio と同じく、入出力のエラーなら何も足さない（read_line とは違う）
             let mut bytes = Vec::new();
-            let r = self.read_to_end(&mut bytes).await;
-            finish_string_read(r, bytes, dst)
+            let r = self.read_to_end(&mut bytes).await?;
+            finish_string_read(Ok(r), bytes, dst)
         }
     }
 

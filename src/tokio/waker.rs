@@ -155,6 +155,22 @@ pub(crate) fn current_injector() -> Option<Arc<Injector>> {
     })
 }
 
+/// Waker を「ランタイムが次に I/O の完了を刈り取った後」に呼ぶ（tokio の yield_now と同じく park まで遅らせる）。
+///
+/// veil の実行キューは空になるまで回るので、すぐ wake すると yield を繰り返すタスクが I/O の完了の刈り取りを
+/// 止めてしまう。所有スレッドの受け口（通知 fd）を経由させると、起こされるのは完了の刈り取りの後になる。
+/// ドライバの無いスレッドではそのまま起こす。
+pub(crate) fn defer_wake(w: &Waker) {
+    match current_injector() {
+        Some(inj) => {
+            if let Err(Job::Wake(w)) = inj.push(Job::Wake(w.clone())) {
+                w.wake();
+            }
+        }
+        None => w.wake_by_ref(),
+    }
+}
+
 // ===================== スレッドセーフな Waker =====================
 
 struct SafeWakerInner {

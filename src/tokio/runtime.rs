@@ -677,7 +677,7 @@ impl Builder {
                     "start_paused requires the time driver (call `enable_time` or `enable_all`)"
                 );
             }
-            super::time::pause();
+            super::time::pause_if_running();
         }
         let mut handle = Handle::new(self.kind);
         {
