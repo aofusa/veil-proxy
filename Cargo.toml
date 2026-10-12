@@ -280,6 +280,9 @@ l4-proxy = []
 # VDS（Veil Discovery Service、F-04）: 制御プレーンからルート・アップストリームを動的に配信する
 # （xDS の REST-JSON / State-of-the-World 相当の長輪詢）。専用スレッドで動き、データプレーンには触れない。
 vds = ["dep:serde_json"]
+# ACME（F-05）: Let's Encrypt 等から証明書を自動で発行・更新する（HTTP-01）。専用スレッドで動き、
+# 発行した証明書は既存の証明書ホットリロードで無停止に差し替える。
+acme = ["dep:serde_json", "dep:rcgen"]
 
 # ====================
 # API サーバ基盤ライブラリ（F-188〜F-192）。veil を他のアプリにライブラリとして組み込む用途。
@@ -328,6 +331,7 @@ full = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 # BSD 向けの全機能ビルド（packaging 用）
@@ -377,6 +381,7 @@ full-freebsd = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 # OpenBSD: システムアロケータ（global_allocator を差し替えない）を使う。
@@ -397,6 +402,7 @@ full-openbsd = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 # NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
@@ -421,6 +427,7 @@ full-netbsd = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 # Windows: veil-alloc（unix 専用）の代わりに mimalloc を使う（F-184）。
@@ -437,6 +444,7 @@ full-windows = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 # macOS: mimalloc・veil-alloc を使わずシステムアロケータ（libmalloc）を使う（F-184）。
@@ -453,6 +461,7 @@ full-macos = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
 ]
 
 full-container = [
@@ -466,6 +475,7 @@ full-container = [
     "access-log",
     "l4-proxy",
     "vds",
+    "acme",
     "epoll",
 ]
 
@@ -613,6 +623,8 @@ async-graphql = { version = "7", optional = true, default-features = false, feat
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
 aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
+# ACME（F-05、`acme` feature）の CSR・鍵生成・仮の自己署名証明書。暗号は rustls と同じ aws-lc-rs。
+rcgen = { version = "0.14.6", optional = true, default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 # ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
@@ -621,6 +633,8 @@ aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 [target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
+# ACME（F-05、`acme` feature）。OpenBSD/NetBSD は rustls と同じ ring。
+rcgen = { version = "0.14.6", optional = true, default-features = false, features = ["crypto", "pem", "ring"] }
 # OpenBSD/NetBSD の quiche(http3) は vendored BoringSSL（`boringssl-boring-crate` feature、
 # 外部 `boring` crate 経由）を無条件で使う（FreeBSD/macOS/Windows と同じ構成、F-136）。
 quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }

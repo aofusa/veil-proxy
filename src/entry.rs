@@ -227,6 +227,19 @@ pub fn run_server(opts: ServerOptions) {
     //   コンテナ既定 soft 1024 を超えるため。ワーカー起動・seccomp 適用より前に実行）
     crate::system::raise_nofile_limit();
 
+    // F-05: ACME。証明書が無ければ仮の自己署名証明書を置き（設定の検証より前）、HTTP-01 の
+    // 応答リスナーを bind する（特権降格・サンドボックスより前）。
+    #[cfg(feature = "acme")]
+    let acme_enabled = match crate::acme::bootstrap(&config_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ACME setup error: {}", e);
+            return;
+        }
+    };
+    #[cfg(not(feature = "acme"))]
+    let acme_enabled = false;
+
     // http3: 証明書世代の初期化で、NetBSD: chroot 後のルート再解決で書き換える。
     #[cfg(any(feature = "http3", target_os = "netbsd"))]
     let mut loaded_config = match load_config(&config_path) {
@@ -459,7 +472,8 @@ pub fn run_server(opts: ServerOptions) {
     // 注意: Landlock サンドボックス適用後は証明書ファイルへの read が
     // 制限される。auto_reload を使う場合は、Landlock の許可パスに証明書
     // ディレクトリを含めるか、サンドボックスを無効化すること。
-    if loaded_config.tls_auto_reload {
+    // ACME が証明書を差し替えるので、ACME 有効時は auto_reload の設定に関わらずリローダーを動かす。
+    if loaded_config.tls_auto_reload || acme_enabled {
         let cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
         let key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
         let interval = loaded_config.tls_reload_interval_secs.max(1);
@@ -552,6 +566,12 @@ pub fn run_server(opts: ServerOptions) {
     // F-04: VDS（制御プレーンからの動的設定配信）。`[vds] enabled = true` のときだけ専用スレッドを起動する。
     #[cfg(feature = "vds")]
     crate::vds::spawn_if_enabled(config_path.clone());
+
+    // F-05: ACME の発行・更新スレッド。
+    #[cfg(feature = "acme")]
+    if acme_enabled {
+        crate::acme::spawn();
+    }
 
     // グローバルプロキシキャッシュの初期化
     // デフォルト設定でグローバルキャッシュを初期化（各ルートのcache設定で有効化される）

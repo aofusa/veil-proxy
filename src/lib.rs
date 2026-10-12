@@ -173,8 +173,14 @@ pub mod tls_provider;
 /// いずれからも参照するためクレートルート直下に置く。
 pub mod listen_addr;
 
+/// ACME による証明書の自動発行・更新（F-05）。
+#[cfg(feature = "acme")]
+pub mod acme;
 pub mod config;
 pub mod config_override;
+/// 制御プレーン用のブロッキング HTTP クライアント（VDS・ACME の専用スレッド用）。
+#[cfg(any(feature = "vds", feature = "acme"))]
+pub mod ctrl_http;
 pub mod tls_reload;
 /// VDS（Veil Discovery Service）: 制御プレーンからの動的設定配信（F-04）。
 #[cfg(feature = "vds")]

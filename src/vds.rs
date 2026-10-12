@@ -23,7 +23,6 @@ use crate::config::SHUTDOWN_FLAG;
 use ftlog::{error, info, warn};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -202,245 +201,6 @@ pub fn apply_overlay(root: &mut toml::Value, overlay: &toml::Value) {
     }
 }
 
-// ===================== HTTP クライアント（専用スレッド・ブロッキング） =====================
-
-struct Target {
-    tls: bool,
-    host: String,
-    port: u16,
-    base: String,
-}
-
-fn parse_server(url: &str) -> Result<Target, String> {
-    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return Err(format!(
-            "vds.server must start with http:// or https:// ({})",
-            url
-        ));
-    };
-    let (authority, base) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].trim_end_matches('/').to_string()),
-        None => (rest, String::new()),
-    };
-    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
-        // [v6]:port
-        let end = stripped.find(']').ok_or("invalid IPv6 host")?;
-        let host = stripped[..end].to_string();
-        let port = stripped[end + 1..]
-            .strip_prefix(':')
-            .map(|p| p.parse::<u16>());
-        (host, port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), Some(p.parse::<u16>())),
-            None => (authority.to_string(), None),
-        }
-    };
-    let port = match port {
-        Some(Ok(p)) => p,
-        Some(Err(_)) => return Err(format!("invalid port in vds.server ({})", url)),
-        None => {
-            if tls {
-                443
-            } else {
-                80
-            }
-        }
-    };
-    if host.is_empty() {
-        return Err(format!("missing host in vds.server ({})", url));
-    }
-    Ok(Target {
-        tls,
-        host,
-        port,
-        base,
-    })
-}
-
-trait Stream: Read + Write {}
-impl<T: Read + Write> Stream for T {}
-
-struct Client {
-    target: Target,
-    tls: Option<Arc<rustls::ClientConfig>>,
-    io_timeout: Duration,
-}
-
-// 理由付き allow: VDS 専用スレッドでのみ実行するブロッキング I/O（データプレーン外）。
-#[allow(clippy::disallowed_methods)]
-fn read_file(path: &str) -> std::io::Result<Vec<u8>> {
-    std::fs::read(path)
-}
-
-fn build_tls(cfg: &VdsConfig) -> Result<Arc<rustls::ClientConfig>, String> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if !cfg.ca_cert.is_empty() {
-        let pem = read_file(&cfg.ca_cert).map_err(|e| format!("vds.ca_cert: {}", e))?;
-        for c in CertificateDer::pem_slice_iter(&pem) {
-            let c = c.map_err(|e| format!("vds.ca_cert: {}", e))?;
-            roots.add(c).map_err(|e| format!("vds.ca_cert: {}", e))?;
-        }
-    }
-    let provider = Arc::new(crate::tls_provider::provider::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(roots);
-    let config = if !cfg.client_cert.is_empty() && !cfg.client_key.is_empty() {
-        let cert_pem =
-            read_file(&cfg.client_cert).map_err(|e| format!("vds.client_cert: {}", e))?;
-        let key_pem = read_file(&cfg.client_key).map_err(|e| format!("vds.client_key: {}", e))?;
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("vds.client_cert: {}", e))?;
-        let key = PrivateKeyDer::from_pem_slice(&key_pem)
-            .map_err(|e| format!("vds.client_key: {}", e))?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| format!("vds client certificate: {}", e))?
-    } else {
-        builder.with_no_client_auth()
-    };
-    Ok(Arc::new(config))
-}
-
-/// 応答（ステータス・本文）。
-struct HttpResult {
-    status: u16,
-    body: Vec<u8>,
-}
-
-impl Client {
-    // 理由付き allow: VDS 専用スレッドでのみ実行するブロッキングな接続・名前解決（データプレーン外）。
-    #[allow(clippy::disallowed_methods)]
-    fn connect(&self) -> Result<Box<dyn Stream>, String> {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<_> = (self.target.host.as_str(), self.target.port)
-            .to_socket_addrs()
-            .map_err(|e| format!("resolve {}: {}", self.target.host, e))?
-            .collect();
-        let mut last = String::from("no address");
-        for a in addrs {
-            match std::net::TcpStream::connect_timeout(&a, Duration::from_secs(5)) {
-                Ok(s) => {
-                    let _ = s.set_read_timeout(Some(self.io_timeout));
-                    let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-                    let _ = s.set_nodelay(true);
-                    if let Some(cfg) = &self.tls {
-                        let name =
-                            rustls::pki_types::ServerName::try_from(self.target.host.clone())
-                                .map_err(|e| e.to_string())?;
-                        let conn = rustls::ClientConnection::new(cfg.clone(), name)
-                            .map_err(|e| e.to_string())?;
-                        return Ok(Box::new(rustls::StreamOwned::new(conn, s)));
-                    }
-                    return Ok(Box::new(s));
-                }
-                Err(e) => last = format!("connect {}: {}", a, e),
-            }
-        }
-        Err(last)
-    }
-
-    fn post(
-        &self,
-        path: &str,
-        body: &[u8],
-        token: Option<&str>,
-        limit: usize,
-    ) -> Result<HttpResult, String> {
-        let mut s = self.connect()?;
-        let host = if self.target.host.contains(':') {
-            format!("[{}]:{}", self.target.host, self.target.port)
-        } else {
-            format!("{}:{}", self.target.host, self.target.port)
-        };
-        let mut req = format!(
-            "POST {}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: veil/{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            self.target.base,
-            path,
-            host,
-            env!("CARGO_PKG_VERSION"),
-            body.len()
-        );
-        if let Some(t) = token {
-            req.push_str("Authorization: Bearer ");
-            req.push_str(t);
-            req.push_str("\r\n");
-        }
-        req.push_str("\r\n");
-        s.write_all(req.as_bytes())
-            .map_err(|e| format!("write: {}", e))?;
-        s.write_all(body).map_err(|e| format!("write: {}", e))?;
-        s.flush().map_err(|e| format!("write: {}", e))?;
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    raw.extend_from_slice(&buf[..n]);
-                    if raw.len() > limit + 64 * 1024 {
-                        return Err(format!("response exceeds max_response_bytes ({})", limit));
-                    }
-                }
-                // TLS の close_notify 無しの切断は本文を読み終えていれば受け入れる
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => break,
-                Err(e) => return Err(format!("read: {}", e)),
-            }
-        }
-        parse_http_response(&raw, limit)
-    }
-}
-
-fn parse_http_response(raw: &[u8], limit: usize) -> Result<HttpResult, String> {
-    let head_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("malformed response (no header terminator)")?;
-    let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| "non-UTF-8 response header")?;
-    let mut lines = head.split("\r\n");
-    let status: u16 = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or("malformed status line")?;
-    let mut chunked = false;
-    let mut length: Option<usize> = None;
-    for l in lines {
-        if let Some((n, v)) = l.split_once(':') {
-            let (n, v) = (n.trim(), v.trim());
-            if n.eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-            {
-                chunked = true;
-            } else if n.eq_ignore_ascii_case("content-length") {
-                length = v.parse().ok();
-            }
-        }
-    }
-    let rest = &raw[head_end + 4..];
-    let body = if chunked {
-        crate::http_utils::decode_chunked_body(rest)
-    } else if let Some(n) = length {
-        rest.get(..n).ok_or("truncated response body")?.to_vec()
-    } else {
-        rest.to_vec()
-    };
-    if body.len() > limit {
-        return Err(format!("response exceeds max_response_bytes ({})", limit));
-    }
-    Ok(HttpResult { status, body })
-}
-
 // ===================== 状態・ループ =====================
 
 /// 現在の VDS の状態（ログ・管理用）。
@@ -477,28 +237,24 @@ pub fn spawn_if_enabled(config_path: PathBuf) {
     if !cfg.enabled {
         return;
     }
-    let target = match parse_server(&cfg.server) {
-        Ok(t) => t,
+    if let Err(e) = crate::ctrl_http::parse_url(&cfg.server) {
+        error!("[VDS] vds.server: {}", e);
+        return;
+    }
+    let tls = crate::ctrl_http::TlsOptions {
+        ca_cert: Some(cfg.ca_cert.clone()),
+        client_cert: Some(cfg.client_cert.clone()),
+        client_key: Some(cfg.client_key.clone()),
+    };
+    let client = match crate::ctrl_http::HttpClient::new(
+        &tls,
+        Duration::from_secs(cfg.poll_timeout_secs.max(1) + 15),
+    ) {
+        Ok(c) => c,
         Err(e) => {
-            error!("[VDS] {}", e);
+            error!("[VDS] TLS setup failed: {}", e);
             return;
         }
-    };
-    let tls = if target.tls {
-        match build_tls(&cfg) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                error!("[VDS] TLS setup failed: {}", e);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let client = Client {
-        target,
-        tls,
-        io_timeout: Duration::from_secs(cfg.poll_timeout_secs.max(1) + 15),
     };
     update_status(|_| {});
     let spawned = std::thread::Builder::new()
@@ -519,7 +275,7 @@ fn node_id(cfg: &VdsConfig) -> String {
         .unwrap_or_else(|| "veil".into())
 }
 
-fn run_loop(cfg: VdsConfig, client: Client, config_path: PathBuf) {
+fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: PathBuf) {
     let node = node_id(&cfg);
     info!("[VDS] subscribing to {} as node '{}'", cfg.server, node);
     let mut version_info = String::new();
@@ -545,7 +301,7 @@ fn run_loop(cfg: VdsConfig, client: Client, config_path: PathBuf) {
         let token = if cfg.token_file.is_empty() {
             None
         } else {
-            match read_file(&cfg.token_file) {
+            match crate::ctrl_http::read_file(&cfg.token_file) {
                 Ok(t) => Some(String::from_utf8_lossy(&t).trim().to_string()),
                 Err(e) => {
                     warn!("[VDS] cannot read token_file {}: {}", cfg.token_file, e);
@@ -556,12 +312,16 @@ fn run_loop(cfg: VdsConfig, client: Client, config_path: PathBuf) {
         let body = serde_json::to_vec(&req).unwrap_or_default();
         // NACK は 1 回だけ伝える（制御プレーンは拒否された版を内容が変わるまで送り直さない）
         error_detail = None;
-        match client.post(
-            "/v1/discovery",
-            &body,
-            token.as_deref(),
-            cfg.max_response_bytes,
-        ) {
+        let url = format!("{}/v1/discovery", cfg.server.trim_end_matches('/'));
+        let auth = token.as_ref().map(|t| format!("Bearer {}", t));
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+        ];
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a.as_str()));
+        }
+        match client.request("POST", &url, &headers, &body, cfg.max_response_bytes) {
             Ok(r) if r.status == 304 => {
                 backoff = cfg.retry_initial_ms.max(50);
                 update_status(|s| s.connected = true);
@@ -672,23 +432,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_server_urls() {
-        let t = parse_server("http://cp:18000").unwrap();
-        assert!(!t.tls);
-        assert_eq!(
-            (t.host.as_str(), t.port, t.base.as_str()),
-            ("cp", 18000, "")
-        );
-        let t = parse_server("https://cp.example/base/").unwrap();
-        assert!(t.tls);
-        assert_eq!((t.port, t.base.as_str()), (443, "/base"));
-        let t = parse_server("http://[::1]:9").unwrap();
-        assert_eq!((t.host.as_str(), t.port), ("::1", 9));
-        assert!(parse_server("ftp://x").is_err());
-        assert!(parse_server("http://x:bad").is_err());
-    }
-
-    #[test]
     fn resources_become_overlay() {
         let res = vec![
             json!({"@type": TYPE_ROUTE, "name": "r1",
@@ -725,22 +468,5 @@ mod tests {
         // 空のスナップショットは「全部空」
         let ov = resources_to_overlay(&[], 5).unwrap();
         assert_eq!(ov["route"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn http_response_parsing() {
-        let r = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 10).unwrap();
-        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
-        let r = parse_http_response(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
-            10,
-        )
-        .unwrap();
-        assert_eq!(r.body, b"ok");
-        assert!(parse_http_response(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n0123456789012345678",
-            10
-        )
-        .is_err());
     }
 }
