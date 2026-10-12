@@ -6,6 +6,7 @@
 
 - API ライブラリとして使うとき gRPC サーバを書けるようにする。
 - メッセージは **prost** を採用する。tonic は使わない。
+- **API ライブラリ専用**。veil のプロキシ用ビルド（default・`full*`）には一切含めない（プロキシの gRPC 中継は従来どおり）。
 - **tokio に依存しない**。veil 既存の gRPC 実装（`src/grpc/`: 5 バイトのフレーミング・`grpc-status`/`grpc-message`・
   `grpc-timeout`・gzip/deflate 圧縮・gRPC-Web）と HTTP/2・HTTP/3 の送信経路をそのまま使う。
 
@@ -40,6 +41,11 @@
 - ホットパス: 変更はハンドラ経路の内側だけ。`Backend::Handler` 以外の経路は 1 行も変わらない。
 
 ### 2. gRPC のサーバ API（feature `grpc-handler` = `handler` + `grpc` + `dep:prost`、`api` に含める）
+
+- `grpc-handler` は API ライブラリ専用で、default・`full*` には入れない。本体側の変更（ハンドラ経路のストリーミングと
+  トレーラ）はすべて `cfg(feature = "handler")` の内側に置き、`grpc-handler` 固有のコードは `src/api/grpc/` に閉じる。
+  `tests/api/library_e2e.sh nonregression` の検査に `veil::api::grpc`・`veil_build` のシンボルが無いことを足す。
+- prost は既に `grpc` feature の optional 依存だが、プロキシのビルドでは使われない（リンクされない）ことも同じ検査で確認する。
 
 ```rust
 use veil::grpc::{Request, Response, Status, Streaming};
@@ -96,7 +102,8 @@ pub fn add_greeter<S: Greeter>(app: App, svc: S) -> App { ... grpc_unary(...) ..
 ## 受け入れ条件
 
 - `examples/api/rust-grpc`（unary + 4 種のストリーミング、ヘルスチェック）が tonic クライアントと grpcurl で動く。
-- `full` のバイナリにライブラリのコードが入らない（`tests/api/library_e2e.sh nonregression`）、tokio が本体依存に入らない。
+- `full`・`full-container` 等のプロキシ用バイナリに gRPC ハンドラのコードが入らない（`tests/api/library_e2e.sh nonregression`）。
+  `api` のビルドでも tokio が依存に入らない（F-198 の既定 `tokio-compat` と組み合わせて確認）。
 - ガイド（`docs/guide/library.md` の gRPC 節、英日）。
 
 ## リスク

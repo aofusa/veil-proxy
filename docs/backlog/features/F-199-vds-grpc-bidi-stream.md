@@ -6,6 +6,9 @@
 
 VDS（F-04）で、現在の REST-JSON の長輪詢に加えて **gRPC の双方向ストリーム**も使えるようにする。
 
+**VDS 本体の機能**（プロキシ用ビルドでも使う）: gRPC の転送は既存の `vds` feature（`full*` に含まれる）に入れる。
+API ライブラリ専用の F-197・F-198 とは違い、`handler` 系 feature には依存しない。
+
 ## 現状（調査結果）
 
 | 項目 | 現状 |
@@ -50,6 +53,9 @@ message DiscoveryResponse { string version_info = 1; string nonce = 2; string ty
 ### 2. クライアント（veil 側）
 
 - `[vds] transport = "grpc" | "rest"`（既定 `"grpc"`）。`server` は `http://`（h2c）/ `https://`（TLS、ALPN h2）。
+- 依存: `vds = ["dep:serde_json", "grpc", "http2"]` とする（`grpc` が prost と `src/grpc/` のフレーミング・ステータスを持つ。
+  `full*` は元々 `grpc-full` を含むので、プロキシ用ビルドの依存は増えない）。接続は `http2::upstream_mux`。
+  tokio・tonic は使わない（VDS 専用スレッドで veil のランタイムを 1 本動かす）。
 - VDS 専用スレッドで veil のランタイムを 1 本動かし（`runtime::block_on`）、`http2::upstream_mux` で
   `POST /veil.vds.v1.VeilDiscoveryService/StreamSnapshots` のストリームを開く。要求は `req_tx` へ gRPC フレームで送り、
   応答は `GrpcFrameDecoder` で切り出して prost でデコードする。トークンは `authorization: Bearer`、mTLS・追加 CA は
