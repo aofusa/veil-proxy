@@ -472,4 +472,4 @@ enable_secure_redirect = false      # 平文で配信する（既定は HTTPS �
 - `[[l4]]` の `handler = "<名前>"`（feature `l4-handler`）: 転送せず、登録済みの L4 ハンドラで接続・データグラムを処理します。このとき `upstreams` は省略できます。
   [L4 プロキシ](l4-proxy.md#ネイティブハンドラ)を参照。
 - `[api]`（ライブラリ専用）: `openapi_enabled`・`openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`openapi_description`・
-  `max_body_size`・`handler_threads`・`tokio_threads`。[ライブラリガイド](library.md#api-キーライブラリ専用)を参照。
+  `max_body_size`・`handler_threads`・`tokio_threads`・`grpc_max_message_size`。[ライブラリガイド](library.md#api-キーライブラリ専用)を参照。

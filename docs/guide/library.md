@@ -62,7 +62,8 @@ Three front ends share the same implementation:
 | `tokio-interface` | tower `Layer`/`Service` compatibility and the tokio bridge ([`veil::api::tower`], [`veil::api::tokio_compat`]) |
 | `graphql` | `App::graphql()` for `async-graphql` schemas |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
-| `api` | all of the above (`handler`, `macro`, `openapi`, `tokio-interface`, `graphql`, `l4-handler`) |
+| `grpc-handler` | gRPC server on prost messages ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
+| `api` | all of the above (`handler`, `macro`, `openapi`, `tokio-interface`, `graphql`, `l4-handler`, `grpc-handler`) |
 
 `vds` and `acme` are separate, are part of `full*`, and work in the proxy binary and the library alike
 (see [VDS](vds.md) and [ACME](acme.md)).
@@ -189,7 +190,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
 
 Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
 `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
-`tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
+`grpc_max_message_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
 
@@ -208,6 +209,7 @@ for debugging.
 | `max_body_size` | `10485760` | maximum request body handed to a handler, in bytes |
 | `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
 | `tokio_threads` | `2` | worker threads of the tokio compatibility runtime |
+| `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
 
 ## Routing macros
 
@@ -282,6 +284,30 @@ A handler may return anything that implements `IntoResponse`:
 
 `ApiError::new(status, msg)`, `bad_request`, `not_found` and `internal` are meant for `?`; a `serde_json::Error`
 converts to a 400 `ApiError`.
+
+### Streaming bodies and trailers
+
+`Response::stream(status, stream)` sends the body as it is produced: the stream yields `BodyChunk::Data(bytes)`,
+optionally ends with `BodyChunk::Trailers(fields)`, and `BodyChunk::Abort(reason)` stops it midway. HTTP/1.1 uses
+chunked encoding (trailers after the last chunk, abort closes the connection), HTTP/2 sends DATA frames and a
+trailing HEADERS frame (abort is RST_STREAM), and HTTP/3 sends the same (abort resets the stream). Chunks that are
+already available are merged up to 16 KiB per frame. For `HEAD` the stream is dropped without being polled.
+
+A route that needs the request body as it arrives sets `streaming = true` (`#[veil::route(..., streaming = true)]`
+or `App::route_fn_streaming`) and reads it with `req.take_body_stream()` (a `Stream<Item = Bytes>`). Over HTTP/2
+the handler runs as soon as the headers arrive and request and response flow in both directions at once; over
+HTTP/1.1 and HTTP/3 the body is read first and handed over as one chunk. `max_body_size` does not apply to a
+streaming route over HTTP/2 (limit it while reading). Both directions pass through tower layers unchanged.
+
+```rust
+#[veil::route(path = "/upper", method = "POST", streaming = true)]
+async fn upper(req: &Request) -> Response {
+    use futures::StreamExt;
+    let body = req.take_body_stream()
+        .map(|c| BodyChunk::Data(bytes::Bytes::from(c.to_ascii_uppercase())));
+    Response::stream(200, body).with_header("content-type", "text/plain")
+}
+```
 
 ## Validation and OpenAPI
 
@@ -401,6 +427,77 @@ App::new().graphql("/graphql", schema).run()?;
 `POST` takes a JSON body (single or batch); `GET` takes `?query=...&variables=...`; a `GET` without a query from a
 browser (`Accept: text/html`) returns GraphiQL. Responses use `application/graphql-response+json` when the client
 asks for it, otherwise `application/json`. Subscriptions are not supported.
+
+## gRPC
+
+Requires `grpc-handler` (part of `api`). Messages are [prost](https://docs.rs/prost) types; the wire handling
+(5-byte framing, `grpc-status`/`grpc-message` trailers, `grpc-timeout`, gzip/deflate) is veil's own, and neither
+tokio nor tonic is used. gRPC calls are ordinary handler routes (`POST /<package>.<Service>/<Method>`) on the same
+listeners, over HTTP/2 (TLS or h2c) and HTTP/3.
+
+### Code generation
+
+Add `veil-build` as a build dependency and `prost` as a dependency:
+
+```rust
+// build.rs
+fn main() -> std::io::Result<()> {
+    veil_build::compile_protos(&["proto/helloworld.proto"], &["proto"])
+}
+```
+
+```rust
+pub mod hello { veil::include_proto!("helloworld"); }
+use hello::greeter_server::{add_greeter, Greeter};
+use veil::api::grpc::{Request, Response, Status};
+
+struct MyGreeter;
+impl Greeter for MyGreeter {
+    async fn say_hello(&self, req: Request<hello::HelloRequest>)
+        -> Result<Response<hello::HelloReply>, Status> {
+        Ok(Response::new(hello::HelloReply { message: format!("Hello {}", req.get_ref().name) }))
+    }
+}
+
+add_greeter(App::new().grpc_health(), MyGreeter).run()
+```
+
+For each service `veil-build` generates a module `<service>_server` with a trait (one method per RPC; implement
+them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)` and `METHODS`. Server and
+bidirectional streaming methods return `Response<BoxStream<T>>`; client streaming and bidirectional methods receive
+`Request<Streaming<T>>`. `veil_build::configure().veil_path("::my_veil")` changes the crate path and `config_mut()`
+exposes the `prost_build::Config`.
+
+### Without code generation
+
+```rust
+App::new()
+    .grpc_unary("/pkg.Svc/Get", |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
+    .grpc_server_streaming("/pkg.Svc/Watch", |req: Request<WatchRequest>| async move {
+        Ok(Response::new(futures::stream::iter(items.into_iter().map(Ok))))
+    })
+    .grpc_client_streaming("/pkg.Svc/Upload", |req: Request<Streaming<Chunk>>| async move { .. })
+    .grpc_bidi("/pkg.Svc/Chat", |req: Request<Streaming<Msg>>| async move { .. })
+```
+
+### Types and behaviour
+
+| Item | Behaviour |
+|------|-----------|
+| `Request<T>` | `get_ref()`, `into_inner()`, `metadata()` / `metadata_value(name)` (request headers except `content-type`, `te`, `grpc-timeout`, `grpc-encoding`), `deadline()`, `client_ip()` |
+| `Response<T>` | `with_metadata(name, value)` (response headers), `with_trailer(name, value)` (after `grpc-status: 0`) |
+| `Status` | `Status::new(Code::X, msg)` or `Status::not_found(msg)` etc., `with_metadata` adds trailers. An error before the first message is sent as a Trailers-Only response |
+| `Streaming<T>` | `Stream<Item = Result<T, Status>>` and `message().await` |
+| Deadline | `grpc-timeout` is enforced with veil's timer: the handler is cancelled and the call ends with `DEADLINE_EXCEEDED` (for streams, checked between messages) |
+| Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
+| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed; responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
+| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded |
+| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
+| Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
+
+gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming
+kinds, deadlines, errors, health), tested with a tonic client and an HTTP/3 client by
+`tests/api/library_e2e.sh grpc`.
 
 ## L4 (TCP/UDP) handlers
 
@@ -580,11 +677,12 @@ Rust source/usage notes. See [Building](building.md) for the proxy packages.
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
-with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, HTTP/1.1 and h2c), and the `nonregression` step
+with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, streaming, HTTP/1.1 and h2c), runs the gRPC
+interoperability checks against `examples/api/rust-grpc` (`grpc`), and the `nonregression` step
 checks that the proxy binary is unaffected. Needs cargo, gcc, curl, nc and python3. Unit tests: `cargo test
 --lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` for Python. See also
 [Testing](testing.md).
@@ -594,6 +692,9 @@ checks that the proxy binary is unaffected. Needs cargo, gcc, curl, nc and pytho
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
 - GraphQL subscriptions are not supported.
+- gRPC: over HTTP/3 the request stream is read completely before the handler runs (bidirectional calls are half
+  duplex there); responses are not compressed; gRPC-Web, server reflection and C/Python gRPC handlers are not
+  available yet.
 - Python handlers are bound by the GIL; C callbacks must be thread-safe.
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
   (`/openapi.json` works offline).

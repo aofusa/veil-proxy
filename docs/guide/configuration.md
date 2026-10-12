@@ -484,5 +484,5 @@ include them.
 - `[[l4]]` `handler = "<name>"` (feature `l4-handler`): handle the connection/datagram with a registered L4 handler
   instead of forwarding; `upstreams` is then optional. See [L4 proxy](l4-proxy.md#native-handlers).
 - `[api]` (library only): `openapi_enabled`, `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`,
-  `openapi_description`, `max_body_size`, `handler_threads`, `tokio_threads`. See
+  `openapi_description`, `max_body_size`, `handler_threads`, `tokio_threads`, `grpc_max_message_size`. See
   [the library guide](library.md#api-keys-library-only).
