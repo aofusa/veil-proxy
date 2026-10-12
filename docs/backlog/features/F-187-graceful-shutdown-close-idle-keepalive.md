@@ -63,3 +63,7 @@ graceful shutdown（`server::setup_signal_handler` → ワーカーの `drain_co
 - E2E（io_uring・epoll とも 565 件成功）の後片付けで、修正前は veil の一部が SIGTERM の 5 秒後に
   `Force killing process` で SIGKILL されていた（テストクライアントのキープアライブ接続を待っていた）。
   修正後は全プロセスが SIGTERM だけで終了する。
+- Windows（`full-windows`、WSAPoll）実機: 単体テスト 904 件成功。HTTP/1.1 の 1 接続 50 要求・HTTP/2 の 50 要求が
+  すべて 200、要求の無い HTTP/2 接続は 60 秒で `GOAWAY(NO_ERROR)` を受けて EOF。
+- 性能: v0.7.0 との交互 A/B（`tools/perf/suite_ab.sh`、69 構成）で全体の比の中央値 1.007、退行なし
+  （`docs/perf/README.md`）。

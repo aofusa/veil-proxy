@@ -19,3 +19,6 @@ F-187 と同じ仕組み（`runtime::time::timeout_idle`）で、処理中のス
 閉じて上限付きで読み捨ててから閉じる。処理中のストリームがある間はタイマーを張らない。
 
 確認は統合テスト `sigterm_sends_goaway_to_idle_h2c`（停止時に同じ経路で GOAWAY を受ける）。
+手動では、Linux（io_uring、h2c）で SETTINGS だけ送って放置した接続が 60.0 秒で
+`GOAWAY(NO_ERROR, last_stream_id = 0)` を、Windows（WSAPoll、TLS）で 1 要求の後に放置した接続が 60 秒で
+`GOAWAY(NO_ERROR, last_stream_id = 1)` を受け、どちらも続けて EOF になることを確かめた。

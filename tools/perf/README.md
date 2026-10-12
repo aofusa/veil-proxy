@@ -344,7 +344,7 @@ F-158（HTTP/2 インライン初回 poll）の A/B 結果は
 ```bash
 git worktree add /tmp/v070 v0.7.0 && (cd /tmp/v070 && docker build -f docker/Dockerfile.glibc -t veil:v070 .)
 docker build -f docker/Dockerfile.glibc -t veil:glibc .
-BASE=v070 NEW=glibc bash tools/perf/suite_ab.sh                                   # 約 9 時間
+BASE=v070 NEW=glibc bash tools/perf/suite_ab.sh                                   # 約 4 時間（69 構成 × 2 イメージ × 3 反復）
 python3 tools/perf/suite_ab_summary.py tools/perf/results/suite_ab/<日時>.tsv v070 glibc
 ```
 
