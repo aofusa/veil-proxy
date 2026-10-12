@@ -131,7 +131,7 @@ async fn reqwest_client(addr: SocketAddr) -> Result<(), String> {
 async fn tower_http_timeout() -> Result<(), String> {
     use tower::{ServiceBuilder, ServiceExt};
     let svc = ServiceBuilder::new()
-        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_millis(50)))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(http::StatusCode::REQUEST_TIMEOUT, Duration::from_millis(50)))
         .service_fn(|req: http::Request<Full<Bytes>>| async move {
             if req.uri().path() == "/slow" {
                 tokio::time::sleep(Duration::from_millis(500)).await;

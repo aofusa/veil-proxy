@@ -451,7 +451,22 @@ tokio 自身のテスト（tokio 1.53.2 の `tokio/tests/*.rs`）をシムに対
 結果です。ランタイムの内部を確かめるテスト（`rt_*`・メトリクス・トレース・work stealing・io_uring の fs）は対象外で、
 一覧はスクリプトにあります。
 
-TABLE_JA
+| 分類 | 合格 / 実行 | 合格率 |
+|---|---|---|
+| time | 53 / 53 | 100.0% |
+| io | 126 / 133 | 94.7% |
+| net | 113 / 113 | 100.0% |
+| sync | 371 / 376 | 98.7% |
+| task | 70 / 98 | 71.4% |
+| macros | 69 / 70 | 98.6% |
+| fs | 42 / 47 | 89.4% |
+| signal | 9 / 11 | 81.8% |
+| **合計** | **853 / 901** | **94.7%** |
+
+`task` の残りの失敗は、タスク API を通じて tokio のランタイム内部を確かめるもの（`Handle` をまたぐタスク ID、
+`JoinSet` が伝える panic、ランタイム外から動かす `LocalSet` など）が中心です。`io` の未達は `AsyncFd` の
+`Interest::ERROR`/`PRIORITY` の準備待ちと、ランタイムを drop した時点で待っていた Future の起床です。ファイルごとの結果は
+スクリプトを実行すると `docs/artifacts/tokio_compat_results.md` に出力されます。
 
 実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（io_uring と epoll）: hyper のサーバ（HTTP/1.1 + h2c）と
 クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、sqlx（SQLite・PostgreSQL）。

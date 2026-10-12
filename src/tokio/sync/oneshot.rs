@@ -183,7 +183,7 @@ impl<T> Receiver<T> {
             let mut st = inner.lock().unwrap();
             match st.value.take() {
                 Some(v) => Ok(v),
-                None if st.tx_dropped || st.complete => Err(TryRecvError::Closed),
+                None if st.tx_dropped || st.complete || st.rx_closed => Err(TryRecvError::Closed),
                 None => Err(TryRecvError::Empty),
             }
         };

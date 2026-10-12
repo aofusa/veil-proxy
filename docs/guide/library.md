@@ -467,7 +467,22 @@ Measured by running tokio's own test suite (tokio 1.53.2, `tokio/tests/*.rs`) ag
 `tools/tokio-compat/run_tokio_tests.py`. Tests that check runtime internals (`rt_*`, metrics, tracing, work
 stealing, io_uring fs) are excluded; the script lists them.
 
-TABLE_EN
+| Category | Passed / run | Rate |
+|---|---|---|
+| time | 53 / 53 | 100.0% |
+| io | 126 / 133 | 94.7% |
+| net | 113 / 113 | 100.0% |
+| sync | 371 / 376 | 98.7% |
+| task | 70 / 98 | 71.4% |
+| macros | 69 / 70 | 98.6% |
+| fs | 42 / 47 | 89.4% |
+| signal | 9 / 11 | 81.8% |
+| **total** | **853 / 901** | **94.7%** |
+
+Most of the remaining `task` failures check tokio's runtime internals through the task API (task IDs across
+`Handle`s, panics propagated by `JoinSet`, `LocalSet` driven from outside a runtime). The `io` misses are
+`AsyncFd` readiness for `Interest::ERROR`/`PRIORITY` and wake-ups of futures that were pending when the runtime was
+dropped. Results per file: `docs/artifacts/tokio_compat_results.md` after running the script.
 
 Real libraries checked by `tools/tokio-compat/ecosystem` (io_uring and epoll): hyper server (HTTP/1.1 + h2c) and
 client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, sqlx with SQLite and PostgreSQL.
