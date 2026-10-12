@@ -262,11 +262,7 @@ fn pem_to_der(pem: &str) -> Vec<u8> {
 // ===================== F-188（本体側の小改修） =====================
 
 /// 平文専用サーバの設定（`listen_cleartext` のみ・`[tls]` 無し）を書き出して起動する。
-fn spawn_cleartext(
-    dir: &std::path::Path,
-    port: u16,
-    server_extra: &str,
-) -> VeilProcess {
+fn spawn_cleartext(dir: &std::path::Path, port: u16, server_extra: &str) -> VeilProcess {
     let www = dir.join("www");
     std::fs::create_dir_all(&www).unwrap();
     std::fs::write(www.join("index.html"), "plain").unwrap();
@@ -350,7 +346,10 @@ fn f200_allow_h2c_false_rejects_h2c_but_serves_http1() {
     assert_eq!(resp.status, 200, "{}", veil.log());
     assert_eq!(resp.text(), "plain");
     let rejected = std::panic::catch_unwind(|| h2c_get(port, "/index.html"));
-    assert!(rejected.is_err(), "h2c must be rejected when allow_h2c = false");
+    assert!(
+        rejected.is_err(),
+        "h2c must be rejected when allow_h2c = false"
+    );
 }
 
 /// F-200: `enable_secure_redirect = true`（要 `listen`）なら平文の HTTP/1.1・h2c とも
@@ -390,8 +389,16 @@ path = "{www}"
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
-    assert!(wait_for_port(tls_port, Duration::from_secs(20)), "{}", veil.log());
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    assert!(
+        wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
 
     let want = format!("https://localhost:{tls_port}/index.html");
     let resp = http1_get(port, "/index.html").expect("HTTP/1.1");
@@ -461,9 +468,8 @@ fn f188_missing_tls_is_rejected_unless_plaintext_only() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("TLS certificate is required"), "{}", stderr);
 
-    let out = check(
-        "[server]\nlisten_cleartext = \"127.0.0.1:18443\"\nenable_secure_redirect = false\n",
-    );
+    let out =
+        check("[server]\nlisten_cleartext = \"127.0.0.1:18443\"\nenable_secure_redirect = false\n");
     assert!(
         out.status.success(),
         "{}",
@@ -492,7 +498,9 @@ fn f200_listener_rules_are_validated() {
             .unwrap()
     };
     // リスナー無し
-    assert!(!run(format!("[server]\nthreads = 1\n{tls}")).status.success());
+    assert!(!run(format!("[server]\nthreads = 1\n{tls}"))
+        .status
+        .success());
     // listen と listen_cleartext が同じ
     assert!(!run(format!(
         "[server]\nlisten = \"127.0.0.1:18443\"\nlisten_cleartext = \"127.0.0.1:18443\"\nenable_secure_redirect = false\n{tls}"

@@ -1793,9 +1793,7 @@ path = "{d}/"
         let h2c = free_port();
         let (child, port) = start_with(
             dir,
-            &format!(
-                "listen_cleartext = \"127.0.0.1:{h2c}\"\nenable_secure_redirect = false"
-            ),
+            &format!("listen_cleartext = \"127.0.0.1:{h2c}\"\nenable_secure_redirect = false"),
         );
         let deadline = Instant::now() + Duration::from_secs(15);
         while std::net::TcpStream::connect(("127.0.0.1", h2c)).is_err() {
