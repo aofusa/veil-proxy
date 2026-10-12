@@ -443,14 +443,22 @@ let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cer
 
 ## メモリアロケータ
 
-`veil` クレート自身が、アロケータ feature が有効なときにプロセス全体の `#[global_allocator]` を宣言します
-（unix では `veil-alloc`、または `mimalloc`。`full` は `veil-alloc` を、`default` は `mimalloc` を含みます）。そのため veil に依存する
-Rust プログラムはプロセス全体でそのアロケータになり、同じバイナリで自前の `#[global_allocator]` を宣言すると
-（重複して）コンパイルエラーになります。次のどちらかを選びます。
+veil をライブラリとして使う場合（`handler` feature を含むビルド。`api` は含む）は、veil は `#[global_allocator]` を
+**宣言しません**。アロケータはアプリケーションが選びます。アロケータ feature（`full` の `veil-alloc`、`default` の
+`mimalloc`）はアロケータのコードをコンパイルするので、自分のバイナリで明示的に選べます。
 
-- プロキシと同じアロケータをそのまま使う（`features = ["full", "api"]` なら何もしない）。
-- 自前のアロケータを使う。`full`・`default`・`veil-alloc`・`mimalloc`・`jemalloc` を有効にせず、必要な feature を個別に並べ
-  （例: `default-features = false, features = ["ktls", "http2", "http3", "api"]`）、自分のバイナリで `#[global_allocator]` を宣言する。
+```rust
+// veil 専用アロケータ（unix。`veil-alloc` は `full` に含まれる）
+#[global_allocator]
+static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
+
+// または mimalloc（依存に `mimalloc` クレートを足す）
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
+
+何も宣言しなければ Rust のシステムアロケータになります。`veil` バイナリ（`handler` 無しのビルド）は従来どおり
+アロケータを選びます。`examples/api/rust-showcase` は `VeilAlloc` を宣言しています。
 
 アロケータ feature は排他です（[メモリアロケータ](performance.md#メモリアロケータf-183)を参照）。
 C と Python のビルド（[`veil-capi`](../../../crates/veil-capi/README.md)・[`veil-python`](../../../crates/veil-python/README.md)）は

@@ -4,11 +4,13 @@
 //! （`config_override::apply_to_toml_str`）に置いたフックが次の順で値木を組み立てる:
 //!
 //! 1. ライブラリ既定（`default_config.toml` + `server.threads = CPU 数`）
-//! 2. config.toml（あれば。1 の上に深くマージ）
-//! 3. 環境変数 `VEIL_OVERRIDE_<n>`（本体と同じ規則）
+//! 2. config.toml（あれば。1 の上に深くマージ）。環境変数 `VEIL_OVERRIDE_<n>`（本体と同じ規則）と
+//!    VDS のオーバーレイはこのファイルの内容に当たってからマージされる
+//! 3. `Config::from_toml_str` のインライン TOML
 //! 4. `ConfigBuilder` の上書き（`set` や `listen` 等）
 //! 5. ハンドラルート・組み込みルート（OpenAPI 等）の注入、具体性による並べ替えと衝突検査
 //!
+//! つまり優先順位は 既定 < ファイル < VDS < 環境変数 < インライン < ビルダ。
 //! 上書きはリロード後も保たれる（フックが毎回同じものを当てる）。
 
 use crate::config_override::ConfigOverride;

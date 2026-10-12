@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use veil::prelude::*;
 
+// アロケータは組み込む側が選ぶ（veil はライブラリとして使うとき #[global_allocator] を定義しない）。
+// ここでは veil 専用アロケータ（`full` に含まれる veil-alloc feature、unix のみ）を使う。
+// mimalloc 等を使うなら mimalloc クレートを依存に足して `mimalloc::MiMalloc` を指定する。
+#[global_allocator]
+static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
+
 /// ユーザー（OpenAPI の components.schemas に載る）
 #[derive(Debug, Clone, Serialize, Deserialize, veil::Schema)]
 struct User {

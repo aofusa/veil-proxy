@@ -463,15 +463,22 @@ UDP port. All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be s
 
 ## Memory allocator
 
-The `veil` crate itself declares the process-wide `#[global_allocator]` when an allocator feature is enabled
-(`veil-alloc` on unix, or `mimalloc`; `full` includes `veil-alloc`, `default` includes `mimalloc`). A Rust program
-that depends on veil therefore gets that allocator for its whole process, and declaring your own
-`#[global_allocator]` in the same binary fails to compile (duplicate global allocator). Choose one:
+When veil is used as a library (any build with the `handler` feature, which `api` includes), it does **not**
+declare a `#[global_allocator]`: the application chooses. The allocator features (`veil-alloc` in `full`,
+`mimalloc` in `default`) still compile the allocator code, so you can pick it explicitly in your binary:
 
-- keep the proxy's allocator (nothing to do with `features = ["full", "api"]`); or
-- use your own allocator: do not enable `full`, `default`, `veil-alloc`, `mimalloc` or `jemalloc`. List the
-  features you need instead (for example `default-features = false, features = ["ktls", "http2", "http3", "api"]`)
-  and declare `#[global_allocator]` in your binary.
+```rust
+// veil's own allocator (unix; `veil-alloc` is part of `full`)
+#[global_allocator]
+static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
+
+// or mimalloc (add the `mimalloc` crate to your dependencies)
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
+
+Without any declaration the Rust system allocator is used. The `veil` binary (built without `handler`) keeps
+selecting its allocator as before. `examples/api/rust-showcase` declares `VeilAlloc`.
 
 Allocator features are mutually exclusive (see [Memory allocators](performance.md#memory-allocators-f-183)).
 The C and Python builds ([`veil-capi`](../../crates/veil-capi/README.md), [`veil-python`](../../crates/veil-python/README.md))
