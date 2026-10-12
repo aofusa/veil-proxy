@@ -188,6 +188,9 @@ reload_interval_secs = 60  # Poll interval (default: 60s)
 
 ### Let's Encrypt Integration
 
+veil can issue and renew Let's Encrypt certificates by itself (ACME HTTP-01, `--features acme`, part of `full`).
+See [ACME](acme.md). The rest of this section describes the alternative of using an external client such as certbot.
+
 ```bash
 # Renew certificate (certbot)
 certbot renew --deploy-hook "touch /etc/veil/cert.pem"

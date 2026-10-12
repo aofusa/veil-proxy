@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aofusa/veil-proxy/docs/guide/vds-schema.json",
+  "title": "Veil Discovery Service (VDS) protocol",
+  "description": "JSON bodies of POST {server}/v1/discovery. See docs/guide/vds.md. A control plane answers a DiscoveryRequest with 200 + DiscoveryResponse, or 304 (empty body) when nothing changed within poll_timeout_secs.",
+  "$defs": {
+    "Node": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "[vds] node_id (the host name when empty)." },
+        "cluster": { "type": "string", "description": "[vds] cluster." },
+        "user_agent_name": { "type": "string", "const": "veil" },
+        "user_agent_version": { "type": "string", "description": "veil version." }
+      },
+      "required": ["id"],
+      "additionalProperties": true
+    },
+    "ErrorDetail": {
+      "type": "object",
+      "description": "Present only in a NACK, once. The message is veil's validation error.",
+      "properties": {
+        "code": { "type": "integer", "const": 3 },
+        "message": { "type": "string" }
+      },
+      "required": ["message"],
+      "additionalProperties": true
+    },
+    "RouteResource": {
+      "type": "object",
+      "description": "One [[route]] entry in the same shape as the TOML. Resource order is evaluation order. null values are dropped. A 'name' field is ignored.",
+      "properties": {
+        "@type": { "const": "type.veil.dev/veil.v1.Route" },
+        "conditions": { "type": "object" },
+        "action": { "type": "object", "properties": { "type": { "type": "string" } }, "required": ["type"] },
+        "security": { "type": "object" }
+      },
+      "required": ["@type", "action"],
+      "additionalProperties": true
+    },
+    "UpstreamResource": {
+      "type": "object",
+      "description": "One [upstreams.<name>] table. 'name' is the table name; the other fields are the table (servers, algorithm, health_check, ...). null values are dropped.",
+      "properties": {
+        "@type": { "const": "type.veil.dev/veil.v1.Upstream" },
+        "name": { "type": "string", "minLength": 1 },
+        "servers": { "type": "array" },
+        "algorithm": { "type": "string" }
+      },
+      "required": ["@type", "name"],
+      "additionalProperties": true
+    },
+    "DiscoveryRequest": {
+      "type": "object",
+      "properties": {
+        "version_info": { "type": "string", "description": "Last successfully applied version; empty before the first snapshot." },
+        "node": { "$ref": "#/$defs/Node" },
+        "type_url": { "type": "string", "const": "type.veil.dev/veil.v1.Snapshot" },
+        "response_nonce": { "type": "string", "description": "nonce of the last response handled (applied or rejected); empty before the first." },
+        "poll_timeout_secs": { "type": "integer", "minimum": 1, "description": "Longest time the server may hold the request." },
+        "error_detail": { "$ref": "#/$defs/ErrorDetail" }
+      },
+      "required": ["version_info", "node", "type_url", "response_nonce"],
+      "additionalProperties": true
+    },
+    "DiscoveryResponse": {
+      "type": "object",
+      "properties": {
+        "version_info": { "type": "string", "description": "Opaque version of this snapshot (for example a content hash)." },
+        "nonce": { "type": "string", "description": "Opaque token echoed back as response_nonce." },
+        "type_url": { "type": "string", "const": "type.veil.dev/veil.v1.Snapshot", "description": "Optional; any other value rejects the response." },
+        "resources": {
+          "type": "array",
+          "description": "The complete snapshot (State-of-the-World). Empty means no routes and no upstreams. Limited by [vds] max_resources (default 10000).",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/RouteResource" },
+              { "$ref": "#/$defs/UpstreamResource" }
+            ]
+          }
+        }
+      },
+      "required": ["version_info"],
+      "additionalProperties": true
+    }
+  },
+  "anyOf": [
+    { "$ref": "#/$defs/DiscoveryRequest" },
+    { "$ref": "#/$defs/DiscoveryResponse" }
+  ]
+}

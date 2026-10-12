@@ -188,6 +188,9 @@ reload_interval_secs = 60  # ポーリング間隔（デフォルト: 60秒）
 
 ### Let's Encryptとの連携
 
+veil は Let's Encrypt の証明書を自分で発行・更新できます（ACME HTTP-01、`--features acme`、`full` に含まれます）。
+詳細は [ACME](acme.md) を参照してください。この節の以降は、certbot など外部クライアントを使う代替方法の説明です。
+
 ```bash
 # 証明書更新（certbot）
 certbot renew --deploy-hook "touch /etc/veil/cert.pem"
