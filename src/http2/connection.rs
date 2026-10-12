@@ -1212,21 +1212,17 @@ where
         }
         self.conn_recv_window -= data_len;
 
-        // 閉じたストリームへの DATA: 読み捨て、コネクションのクレジットは返す（返さないと
-        // 取り消し・打ち切りのたびに接続の受信ウィンドウが減り続け、いずれ全ストリームが止まる）。
-        if self.streams.get_ref(stream_id).is_none() {
+        // ストリームレベルフロー制御（表の検索は 1 回）
+        let Some(stream) = self.streams.get(stream_id) else {
+            // 閉じたストリームへの DATA: 読み捨て、コネクションのクレジットは返す（返さないと
+            // 取り消し・打ち切りのたびに接続の受信ウィンドウが減り続け、いずれ全ストリームが止まる）。
             self.maybe_send_window_update(stream_id).await?;
             return Err(Http2Error::stream_error(
                 stream_id,
                 Http2ErrorCode::StreamClosed,
                 "DATA on closed stream",
             ));
-        }
-
-        // ストリームレベルフロー制御
-        let stream = self.streams.get(stream_id).ok_or_else(|| {
-            Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found")
-        })?;
+        };
 
         // アクティビティ更新 (Slow Loris 対策)
         stream.update_activity();

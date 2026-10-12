@@ -346,6 +346,10 @@ Validation rules (`veil -t` reports them):
 - UDS: `listen` and `listen_cleartext` accept `unix:<path>`; HTTP/3 does not.
 - The removed keys below are a startup error naming the replacement; they are not silently ignored.
 
+`listen_cleartext` is served by every worker thread, like `listen` (the old `http` redirect listener ran on one
+thread). An idle worker set costs roughly 2 MB of RSS per worker, so a TLS + redirect setup uses a few MB more than
+before; throughput on `listen` is unchanged.
+
 ### Migrating from the old keys
 
 The old keys `[server].http`, `tls_only`, `h2c_enabled`, `h2c_listen`, `h2c_http1` and `http3_enabled` were removed

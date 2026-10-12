@@ -339,6 +339,10 @@ path = "/var/www/index.html"
 - UDS: `listen`・`listen_cleartext` は `unix:<path>` を受けます。HTTP/3 は UDS 不可
 - 下の削除されたキーは、移行先を示すエラーで起動しません（黙って無視しません）
 
+`listen_cleartext` は `listen` と同じく全ワーカースレッドで受け付けます（旧 `http` のリダイレクト専用リスナーは
+1 スレッドでした）。待機中のワーカーはおよそ 1 つあたり 2 MB の RSS を使うので、TLS + リダイレクトの構成は以前より
+数 MB 多くなります。`listen` のスループットは変わりません。
+
 ### 旧キーからの移行
 
 `[server].http`・`tls_only`・`h2c_enabled`・`h2c_listen`・`h2c_http1`・`http3_enabled` は互換レイヤー無しで削除されました。
