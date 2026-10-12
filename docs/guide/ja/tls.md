@@ -167,7 +167,7 @@ F-183 より前は rustls の既定（全ワーカー共有の 256 件のキャ�
 
 ### 動作原理
 
-- バックグラウンドスレッドが `reload_interval_secs` 秒ごとに証明書ファイルの `mtime` を監視。
+- バックグラウンドスレッドが `reload_interval_secs` 秒ごとに証明書と秘密鍵を確認し、`mtime`・ファイルの実体（シンボリックリンクを辿った先のデバイス + inode）・サイズのいずれかが**変わったら**リロードする（新しくなったときだけではない）。Kubernetes Secret の更新は `..data` シンボリックリンクを新しいディレクトリへ付け替える方式で、差し替え先の `mtime` が同じか古いこともあるため（F-180）。
 - 変化を検出すると新しい証明書を `ArcSwap` にロード。
 - **既存のTLS接続**は旧証明書を使い続ける（接続断なし）。
 - **新しいTLSハンドシェイク**は自動的に新証明書を使用。
@@ -195,3 +195,31 @@ certbot renew --deploy-hook "touch /etc/veil/cert.pem"
 ```
 
 > **注意**: Landlockサンドボックスが有効な場合、証明書ディレクトリを `landlock_read_paths` に含める必要があります。
+
+## コンテナでの証明書・秘密鍵
+
+証明書と秘密鍵はイメージに焼き込まず、環境変数でも渡さず、実行時に**ファイル**としてマウントする（F-180）。
+プロセスの環境変数は `/proc/<pid>/environ` から読めるうえメモリからの消去も難しい。ファイルなら権限で守れて、差し替えもできる。
+
+| 基盤 | ファイルの見え方 | 注意 |
+|------|----------------|------|
+| Docker secrets（`docker compose` / Swarm） | `/run/secrets/<name>` | [`examples/container/compose.secrets.yaml`](../../../examples/container/compose.secrets.yaml) を参照。compose の `file:` は bind mount なので、更新はファイルをその場で上書きする。 |
+| Kubernetes Secret ボリューム | `<mountPath>/tls.crt`・`tls.key`（`..data/` へのシンボリックリンク） | kubelet は `..data` リンクを新しいディレクトリへ原子的に付け替えて更新する。veil はこれに追従する（ファイルの実体で比較）。[`deploy/kubernetes/`](../../../deploy/kubernetes/) を参照。`subPath` でマウントすると更新が届かないので使わない。 |
+
+```toml
+[tls]
+cert_path = "/run/secrets/tls_cert"      # Kubernetes なら /etc/veil/tls/tls.crt
+key_path  = "/run/secrets/tls_key"
+auto_reload = true
+reload_interval_secs = 10
+
+[security]
+# ファイルではなく Secret のディレクトリごと許可する（Kubernetes では新しい中身がマウント先の
+# 別ディレクトリに置かれるため）。
+landlock_read_paths = ["/run/secrets", "/etc/veil", "/var/www"]
+```
+
+環境変数 `VEIL_OVERRIDE_<n>` で変えてよいのは証明書の**場所**だけ（例:
+`VEIL_OVERRIDE_1='tls.cert_path = "/etc/veil/tls/tls.crt"'`）。PEM の中身は入れない。
+`examples/container/e2e.sh` はビルド済みイメージで一連の流れ（Secret での TLS、環境変数の上書き、
+証明書の差し替え、graceful stop）を確認する。
