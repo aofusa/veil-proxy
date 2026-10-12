@@ -196,6 +196,15 @@ pub mod tls_reload;
 /// VDS（Veil Discovery Service）: 制御プレーンからの動的設定配信（F-04）。
 #[cfg(feature = "vds")]
 pub mod vds;
+
+// tokio 互換レイヤー（F-198、API ライブラリ専用）。2 つの実装は排他。
+#[cfg(all(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
+compile_error!(
+    "features `tokio-compat` (tokio-free, default in `api`) and `tokio-compat-bridge` (bundles tokio) \
+     are mutually exclusive; pick one (use `api-core` + `tokio-compat-bridge` instead of `api`)"
+);
+#[cfg(feature = "tokio-compat")]
+pub mod tokio;
 #[cfg(feature = "vds")]
 pub mod vds_grpc;
 pub use crate::config::*;

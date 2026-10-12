@@ -1,0 +1,37 @@
+# 依存ツリーの tokio を veil の tokio 互換レイヤー（veil::tokio、F-198）に置き換えるためのクレート。
+# `[patch.crates-io] tokio = { path = ".../crates/veil-tokio/tokio-shim" }` で当てる。tokio 本体には依存しない。
+[package]
+name = "tokio"
+# tokio 1.x を要求するどのクレートの版指定も満たすように 1.99
+version = "1.99.0"
+edition = "2021"
+description = "tokio API shim backed by the veil runtime (no tokio)"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# veil のワークスペースには入れない（パス依存として使われる）
+[workspace]
+
+[dependencies]
+veil = { path = "../../..", default-features = false, features = ["tokio-compat"] }
+
+# tokio の機能フラグはすべて受け付ける（有効・無効で API は変わらない）
+[features]
+default = []
+full = ["fs", "io-util", "io-std", "macros", "net", "parking_lot", "process", "rt", "rt-multi-thread", "signal", "sync", "time"]
+fs = []
+io-util = []
+io-std = []
+macros = []
+net = []
+parking_lot = []
+process = []
+rt = []
+rt-multi-thread = []
+signal = []
+sync = []
+time = []
+test-util = []
+tracing = []
+io-uring = []
+taskdump = []

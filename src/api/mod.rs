@@ -38,10 +38,10 @@ pub mod stream;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 
-#[cfg(feature = "tokio-interface")]
+#[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 pub mod tower;
 
-#[cfg(feature = "tokio-interface")]
+#[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 pub mod tokio_compat;
 
 #[cfg(feature = "graphql")]

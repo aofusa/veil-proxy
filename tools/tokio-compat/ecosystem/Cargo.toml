@@ -1,0 +1,34 @@
+# tokio 互換レイヤー（F-198）の実ライブラリ試験。依存ツリーの tokio を crates/veil-tokio/tokio-shim に置き換え、
+# hyper（サーバ・クライアント）・reqwest・tower-http・sqlx（SQLite・PostgreSQL）が veil のランタイムで動くかを見る。
+#
+#   cargo run                          # PostgreSQL は VEIL_PG_URL（例: postgres://postgres:pw@127.0.0.1:5432/postgres）があれば試す
+[package]
+name = "veil-tokio-ecosystem"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+veil = { path = "../../..", default-features = false, features = ["tokio-compat"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.6", features = ["timeout", "cors"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
+serde_json = "1"
+futures = "0.3"
+
+[features]
+# reactor（epoll）バックエンドで試す: cargo run --features epoll
+epoll = ["veil/epoll"]
+
+[patch.crates-io]
+tokio = { path = "../../../crates/veil-tokio/tokio-shim" }
+quiche = { path = "../../../third_party/quiche" }

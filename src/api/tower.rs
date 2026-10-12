@@ -18,9 +18,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use tower::ServiceExt;
 use tower_layer::Layer;
 use tower_service::Service;
+
+/// `tower::ServiceExt::oneshot` と同じ（準備を待ってから 1 回呼ぶ）。tower クレートに依存しないため
+/// （tower の tokio を使う機能が有効だと、tokio を veil の互換レイヤーに置き換えたとき依存が循環する。F-198）。
+async fn oneshot<S, R>(mut svc: S, req: R) -> Result<S::Response, S::Error>
+where
+    S: Service<R>,
+{
+    std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
+    svc.call(req).await
+}
 
 /// tower 側に渡す本文の型。
 pub type VeilBody = http_body_util::Full<Bytes>;
@@ -215,7 +224,7 @@ impl App {
             Arc::new(move |req: Request| {
                 let svc = svc.clone();
                 Box::pin(async move {
-                    match svc.oneshot(to_http_request(req)).await {
+                    match oneshot(svc, to_http_request(req)).await {
                         Ok(resp) => from_http_response(resp).await,
                         Err(e) => Response::error(500, &e.to_string()),
                     }
@@ -244,7 +253,7 @@ impl App {
             Box::pin(async move {
                 let http_req = to_http_request(req);
                 let res = super::tokio_compat::try_run(async move {
-                    match svc.oneshot(http_req).await {
+                    match oneshot(svc, http_req).await {
                         Ok(resp) => Ok(from_http_response(resp).await),
                         Err(e) => Err(e.to_string()),
                     }

@@ -1,0 +1,176 @@
+//! `tokio::io::ReadBuf`（初期化済み・読み込み済みの範囲を持つバッファ）。
+
+use std::mem::MaybeUninit;
+
+/// 読み込み先のバッファ（tokio と同じ意味のメソッド）。
+pub struct ReadBuf<'a> {
+    buf: &'a mut [MaybeUninit<u8>],
+    filled: usize,
+    initialized: usize,
+}
+
+impl std::fmt::Debug for ReadBuf<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadBuf")
+            .field("filled", &self.filled)
+            .field("initialized", &self.initialized)
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+impl<'a> ReadBuf<'a> {
+    pub fn new(buf: &'a mut [u8]) -> ReadBuf<'a> {
+        let initialized = buf.len();
+        // SAFETY: 初期化済みの u8 を MaybeUninit<u8> として見るのは常に安全
+        let buf = unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
+        ReadBuf {
+            buf,
+            filled: 0,
+            initialized,
+        }
+    }
+
+    pub fn uninit(buf: &'a mut [MaybeUninit<u8>]) -> ReadBuf<'a> {
+        ReadBuf {
+            buf,
+            filled: 0,
+            initialized: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn filled(&self) -> &[u8] {
+        // SAFETY: filled <= initialized
+        unsafe { &*(&self.buf[..self.filled] as *const [MaybeUninit<u8>] as *const [u8]) }
+    }
+
+    pub fn filled_mut(&mut self) -> &mut [u8] {
+        // SAFETY: filled <= initialized
+        unsafe { &mut *(&mut self.buf[..self.filled] as *mut [MaybeUninit<u8>] as *mut [u8]) }
+    }
+
+    pub fn take(&mut self, n: usize) -> ReadBuf<'_> {
+        let max = std::cmp::min(self.remaining(), n);
+        // SAFETY: 未初期化を初期化済みとして見せない（initialized を引き継がない）
+        let buf = unsafe { &mut self.unfilled_mut()[..max] };
+        ReadBuf::uninit(buf)
+    }
+
+    pub fn initialized(&self) -> &[u8] {
+        // SAFETY: initialized までは初期化済み
+        unsafe { &*(&self.buf[..self.initialized] as *const [MaybeUninit<u8>] as *const [u8]) }
+    }
+
+    pub fn initialized_mut(&mut self) -> &mut [u8] {
+        // SAFETY: initialized までは初期化済み
+        unsafe { &mut *(&mut self.buf[..self.initialized] as *mut [MaybeUninit<u8>] as *mut [u8]) }
+    }
+
+    /// # Safety
+    /// 返したスライスに未初期化を書き戻してはならない。
+    pub unsafe fn inner_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.buf
+    }
+
+    /// # Safety
+    /// 返したスライスに未初期化を書き戻してはならない。
+    pub unsafe fn unfilled_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        &mut self.buf[self.filled..]
+    }
+
+    pub fn initialize_unfilled(&mut self) -> &mut [u8] {
+        self.initialize_unfilled_to(self.remaining())
+    }
+
+    pub fn initialize_unfilled_to(&mut self, n: usize) -> &mut [u8] {
+        assert!(self.remaining() >= n, "n overflows remaining");
+        let end = self.filled + n;
+        if self.initialized < end {
+            for b in &mut self.buf[self.initialized..end] {
+                *b = MaybeUninit::new(0);
+            }
+            self.initialized = end;
+        }
+        let slice = &mut self.buf[self.filled..end];
+        // SAFETY: 直前で初期化した
+        unsafe { &mut *(slice as *mut [MaybeUninit<u8>] as *mut [u8]) }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.capacity() - self.filled
+    }
+
+    pub fn clear(&mut self) {
+        self.filled = 0;
+    }
+
+    pub fn advance(&mut self, n: usize) {
+        let new = self.filled.checked_add(n).expect("filled overflow");
+        self.set_filled(new);
+    }
+
+    pub fn set_filled(&mut self, n: usize) {
+        assert!(
+            n <= self.initialized,
+            "filled must not become larger than initialized"
+        );
+        self.filled = n;
+    }
+
+    /// # Safety
+    /// `filled + n` までが本当に初期化済みであること。
+    pub unsafe fn assume_init(&mut self, n: usize) {
+        let new = self.filled + n;
+        if new > self.initialized {
+            self.initialized = new;
+        }
+    }
+
+    pub fn put_slice(&mut self, buf: &[u8]) {
+        assert!(
+            self.remaining() >= buf.len(),
+            "buf.len() must fit in remaining(); buf.len() = {}, remaining() = {}",
+            buf.len(),
+            self.remaining()
+        );
+        let amt = buf.len();
+        let end = self.filled + amt;
+        // SAFETY: 範囲内へのコピー
+        unsafe {
+            self.buf[self.filled..end]
+                .as_mut_ptr()
+                .cast::<u8>()
+                .copy_from_nonoverlapping(buf.as_ptr(), amt);
+        }
+        if self.initialized < end {
+            self.initialized = end;
+        }
+        self.filled = end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_buf_semantics() {
+        let mut storage = [0u8; 8];
+        let mut b = ReadBuf::new(&mut storage);
+        assert_eq!(b.remaining(), 8);
+        b.put_slice(b"abc");
+        assert_eq!(b.filled(), b"abc");
+        b.initialize_unfilled_to(2)[..2].copy_from_slice(b"de");
+        b.advance(2);
+        assert_eq!(b.filled(), b"abcde");
+        let mut raw = [MaybeUninit::<u8>::uninit(); 4];
+        let mut u = ReadBuf::uninit(&mut raw);
+        assert_eq!(u.initialized().len(), 0);
+        u.put_slice(b"xy");
+        assert_eq!(u.filled(), b"xy");
+    }
+}

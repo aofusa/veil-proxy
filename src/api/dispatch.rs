@@ -40,10 +40,13 @@ pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
         return Response::error(413, "Payload Too Large");
     }
     let head = &req.method[..] == b"HEAD";
-    let mut resp = match std::panic::AssertUnwindSafe(entry.call(req))
-        .catch_unwind()
-        .await
-    {
+    // tokio 互換レイヤー（F-198）: ハンドラの中で使う同期プリミティブ・チャネルが別スレッドから
+    // 起こしても、所有スレッドで再開するように Waker を包む
+    #[cfg(feature = "tokio-compat")]
+    let fut = crate::tokio::waker::WithSafeWaker::new(entry.call(req));
+    #[cfg(not(feature = "tokio-compat"))]
+    let fut = entry.call(req);
+    let mut resp = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
         Ok(r) => r,
         Err(_) => {
             ftlog::error!("[api] handler '{}' panicked", entry.name);

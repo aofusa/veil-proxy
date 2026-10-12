@@ -1,0 +1,1672 @@
+//! `tokio::net` 互換（F-198、unix）。
+//!
+//! ノンブロッキングのソケットへ直接 `recv`/`send` し、`EAGAIN` のときだけ veil のランタイムの準備待ち
+//! （`runtime::tcp::wait_readable_fd` / `wait_writable_fd`。io_uring は POLL_ADD、reactor は poller 登録）で待つ。
+//! poll ベースの `AsyncRead`/`AsyncWrite` を veil の完了型 I/O の上に作るための橋で、データプレーンは通らない。
+//!
+//! 準備待ちはそれを始めたスレッドのランタイムに属する。ソケットを別のスレッドで poll し直したら、前の待ちは
+//! 捨てずに手放す（`mem::forget`。他スレッドのランタイムの表に触れないため）。タスクはスレッド間を移動しないので
+//! 通常は起きない。
+
+use super::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready};
+use std::future::{poll_fn, Future};
+use std::io;
+use std::net::SocketAddr;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{ready, Context, Poll};
+use std::thread::ThreadId;
+
+// ===================== 準備待ち =====================
+
+enum Wait {
+    R(crate::runtime::tcp::ReadableFd),
+    W(crate::runtime::tcp::WritableFd),
+}
+
+impl Wait {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Wait::R(f) => Pin::new(f).poll(cx),
+            Wait::W(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WaitSlot {
+    pending: Option<(ThreadId, Wait)>,
+}
+
+impl WaitSlot {
+    fn clear(&mut self) {
+        if let Some((owner, w)) = self.pending.take() {
+            if owner == std::thread::current().id() && !crate::tokio::waker::exiting() {
+                drop(w);
+            } else {
+                std::mem::forget(w);
+            }
+        }
+    }
+}
+
+// SAFETY: 待ちの Future は fd と整数だけを持つ。触るのは作ったスレッドだけ（他スレッドでは forget する）
+unsafe impl Send for WaitSlot {}
+
+/// fd と、読み・書きの準備待ち。
+pub(crate) struct IoSource {
+    fd: OwnedFd,
+    read: Mutex<WaitSlot>,
+    write: Mutex<WaitSlot>,
+}
+
+impl std::fmt::Debug for IoSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoSource")
+            .field("fd", &self.fd.as_raw_fd())
+            .finish()
+    }
+}
+
+fn require_runtime() {
+    if !crate::runtime::has_driver() {
+        panic!(
+            "there is no reactor running, must be called from the context of a Tokio 1.x runtime"
+        );
+    }
+}
+
+impl IoSource {
+    fn new(fd: OwnedFd) -> IoSource {
+        IoSource {
+            fd,
+            read: Mutex::new(WaitSlot::default()),
+            write: Mutex::new(WaitSlot::default()),
+        }
+    }
+
+    fn raw(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn poll_ready(&self, write: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        require_runtime();
+        let me = std::thread::current().id();
+        let mut slot = if write {
+            self.write.lock().unwrap()
+        } else {
+            self.read.lock().unwrap()
+        };
+        if slot.pending.as_ref().is_some_and(|(o, _)| *o != me) {
+            slot.clear();
+        }
+        let fd = self.raw();
+        let (_, w) = slot.pending.get_or_insert_with(|| {
+            (
+                me,
+                if write {
+                    Wait::W(crate::runtime::tcp::wait_writable_fd(fd))
+                } else {
+                    Wait::R(crate::runtime::tcp::wait_readable_fd(fd))
+                },
+            )
+        });
+        let r = w.poll(cx);
+        crate::tokio::waker::touch_exit_sentinel();
+        let r = ready!(r);
+        slot.pending = None;
+        Poll::Ready(r)
+    }
+
+    pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_ready(false, cx)
+    }
+
+    pub(crate) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_ready(true, cx)
+    }
+
+    /// 準備ができるまで `f` を繰り返す（`WouldBlock` なら準備待ち）。
+    fn poll_io<R>(
+        &self,
+        write: bool,
+        cx: &mut Context<'_>,
+        mut f: impl FnMut() -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        loop {
+            match f() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.poll_ready(write, cx))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                r => return Poll::Ready(r),
+            }
+        }
+    }
+}
+
+impl IoSource {
+    /// fd を手放す前の後始末: 準備待ちを取り消し（io_uring の POLL_ADD が fd を握ったままにならないように）、
+    /// reactor の fd の記録を消す（同じ番号の fd が次に使われたとき、登録が ADD からやり直しになるように）。
+    fn release(&mut self) {
+        self.read.get_mut().unwrap().clear();
+        self.write.get_mut().unwrap().clear();
+        #[cfg(veil_rt_reactor)]
+        if crate::runtime::has_driver() && !crate::tokio::waker::exiting() {
+            crate::runtime::executor::unregister(self.raw());
+        }
+    }
+}
+
+impl Drop for IoSource {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn cvt(r: isize) -> io::Result<usize> {
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(r as usize)
+    }
+}
+
+fn cvt_i(r: libc::c_int) -> io::Result<libc::c_int> {
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(r)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SEND_FLAGS: libc::c_int = 0;
+
+fn sys_recv(fd: RawFd, buf: &mut ReadBuf<'_>, flags: libc::c_int) -> io::Result<usize> {
+    // SAFETY: 未初期化領域へ書くだけ。書いた分だけ assume_init する
+    let dst = unsafe { buf.unfilled_mut() };
+    let n = cvt(unsafe { libc::recv(fd, dst.as_mut_ptr().cast(), dst.len(), flags) })?;
+    unsafe { buf.assume_init(n) };
+    buf.advance(n);
+    Ok(n)
+}
+
+fn sys_send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    cvt(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS) })
+}
+
+fn sys_writev(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    let n = bufs.len().min(1024) as libc::c_int;
+    cvt(unsafe { libc::writev(fd, bufs.as_ptr().cast(), n) })
+}
+
+fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
+    unsafe {
+        let fl = cvt_i(libc::fcntl(fd, libc::F_GETFL))?;
+        cvt_i(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK))?;
+        let fd_fl = cvt_i(libc::fcntl(fd, libc::F_GETFD))?;
+        cvt_i(libc::fcntl(fd, libc::F_SETFD, fd_fl | libc::FD_CLOEXEC))?;
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    unsafe {
+        // SIGPIPE を出さない（MSG_NOSIGNAL の代わり）
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+        {
+            let one: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn new_socket(domain: libc::c_int, ty: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = cvt_i(unsafe { libc::socket(domain, ty, 0) })?;
+    // SAFETY: 作ったばかりの fd
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_nonblocking_cloexec(fd)?;
+    Ok(owned)
+}
+
+// 理由付き allow: BSD・macOS の sockaddr_in には sin_len 等の追加のフィールドがあり、..zeroed() が要る（Linux では不要）
+#[allow(clippy::needless_update)]
+fn sockaddr(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: ゼロ初期化した sockaddr_storage に書くだけ
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(a.ip().octets()),
+                },
+                ..unsafe { std::mem::zeroed() }
+            };
+            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in, sin) };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: a.ip().octets(),
+                },
+                sin6_scope_id: a.scope_id(),
+                ..unsafe { std::mem::zeroed() }
+            };
+            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in6, sin6) };
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len as libc::socklen_t)
+}
+
+fn sock_err(fd: RawFd) -> io::Result<Option<io::Error>> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    cvt_i(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    })?;
+    Ok((err != 0).then(|| io::Error::from_raw_os_error(err)))
+}
+
+/// fd を std の型として借りる（アドレスの取得・ソケットオプション用。閉じない）。
+fn with_std<T: FromRawFd + IntoRawFd, R>(fd: RawFd, f: impl FnOnce(&T) -> R) -> R {
+    // SAFETY: 借りるだけで、終わったら into_raw_fd で手放す
+    let s = std::mem::ManuallyDrop::new(unsafe { T::from_raw_fd(fd) });
+    f(&s)
+}
+
+// ===================== アドレス解決 =====================
+
+mod sealed {
+    use std::future::Future;
+    use std::io;
+    use std::net::SocketAddr;
+
+    pub trait ToSocketAddrsPriv {
+        fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send;
+    }
+}
+
+/// `tokio::net::ToSocketAddrs`。
+pub trait ToSocketAddrs: sealed::ToSocketAddrsPriv {}
+
+async fn resolve(host: String) -> io::Result<Vec<SocketAddr>> {
+    // 理由付き allow: 名前解決はハンドラ用プール（offload）か、ランタイムの外のスレッドでだけ行う
+    #[allow(clippy::disallowed_methods)]
+    fn lookup(h: &str) -> io::Result<Vec<SocketAddr>> {
+        std::net::ToSocketAddrs::to_socket_addrs(h).map(|i| i.collect())
+    }
+    if let Ok(a) = host.parse::<SocketAddr>() {
+        return Ok(vec![a]);
+    }
+    if crate::runtime::has_driver() {
+        crate::runtime::offload::offload_handler(move || lookup(&host))
+            .await
+            .unwrap_or_else(|| Err(io::Error::other("name resolution panicked")))
+    } else {
+        lookup(&host)
+    }
+}
+
+macro_rules! direct_addrs {
+    ($($t:ty => |$s:ident| $e:expr;)*) => {
+        $(
+            impl sealed::ToSocketAddrsPriv for $t {
+                fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+                    let $s = self;
+                    let v: Vec<SocketAddr> = $e;
+                    async move { Ok(v) }
+                }
+            }
+            impl ToSocketAddrs for $t {}
+        )*
+    };
+}
+
+direct_addrs! {
+    SocketAddr => |s| vec![*s];
+    std::net::SocketAddrV4 => |s| vec![SocketAddr::V4(*s)];
+    std::net::SocketAddrV6 => |s| vec![SocketAddr::V6(*s)];
+    (std::net::IpAddr, u16) => |s| vec![SocketAddr::new(s.0, s.1)];
+    (std::net::Ipv4Addr, u16) => |s| vec![SocketAddr::new(s.0.into(), s.1)];
+    (std::net::Ipv6Addr, u16) => |s| vec![SocketAddr::new(s.0.into(), s.1)];
+    &[SocketAddr] => |s| s.to_vec();
+}
+
+impl sealed::ToSocketAddrsPriv for str {
+    fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        resolve(self.to_string())
+    }
+}
+impl ToSocketAddrs for str {}
+
+impl sealed::ToSocketAddrsPriv for String {
+    fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        resolve(self.clone())
+    }
+}
+impl ToSocketAddrs for String {}
+
+impl sealed::ToSocketAddrsPriv for (&str, u16) {
+    fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        let (h, p) = *self;
+        let s = if h.contains(':') && !h.starts_with('[') {
+            format!("[{}]:{}", h, p)
+        } else {
+            format!("{}:{}", h, p)
+        };
+        resolve(s)
+    }
+}
+impl ToSocketAddrs for (&str, u16) {}
+
+impl sealed::ToSocketAddrsPriv for (String, u16) {
+    fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        let s = if self.0.contains(':') && !self.0.starts_with('[') {
+            format!("[{}]:{}", self.0, self.1)
+        } else {
+            format!("{}:{}", self.0, self.1)
+        };
+        resolve(s)
+    }
+}
+impl ToSocketAddrs for (String, u16) {}
+
+impl<T: ToSocketAddrs + ?Sized + Sync> sealed::ToSocketAddrsPriv for &T {
+    fn to_addrs(&self) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        (**self).to_addrs()
+    }
+}
+impl<T: ToSocketAddrs + ?Sized + Sync> ToSocketAddrs for &T {}
+
+/// 名前を解決する（`tokio::net::lookup_host`）。
+pub async fn lookup_host<T: ToSocketAddrs>(
+    host: T,
+) -> io::Result<impl Iterator<Item = SocketAddr>> {
+    Ok(host.to_addrs().await?.into_iter())
+}
+
+// ===================== TcpStream =====================
+
+/// `tokio::net::TcpStream`。
+#[derive(Debug)]
+pub struct TcpStream {
+    io: Arc<IoSource>,
+}
+
+impl TcpStream {
+    /// 順に接続を試す（最初に成功したもの）。
+    pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+        let addrs = addr.to_addrs().await?;
+        let mut last = None;
+        for a in addrs {
+            match TcpStream::connect_addr(a).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
+    }
+
+    async fn connect_addr(addr: SocketAddr) -> io::Result<TcpStream> {
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        let fd = new_socket(domain, libc::SOCK_STREAM)?;
+        TcpStream::connect_fd(fd, addr).await
+    }
+
+    async fn connect_fd(fd: OwnedFd, addr: SocketAddr) -> io::Result<TcpStream> {
+        let (ss, len) = sockaddr(&addr);
+        let r = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                &ss as *const _ as *const libc::sockaddr,
+                len,
+            )
+        };
+        let s = TcpStream {
+            io: Arc::new(IoSource::new(fd)),
+        };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) && e.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(e);
+            }
+            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+            if let Some(e) = sock_err(s.io.raw())? {
+                return Err(e);
+            }
+        }
+        Ok(s)
+    }
+
+    /// std の接続から作る（ノンブロッキングにする）。
+    pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
+        stream.set_nonblocking(true)?;
+        let fd: OwnedFd = stream.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(TcpStream {
+            io: Arc::new(IoSource::new(fd)),
+        })
+    }
+
+    /// std の接続に戻す（ブロッキングに戻す）。
+    pub fn into_std(self) -> io::Result<std::net::TcpStream> {
+        let io = Arc::try_unwrap(self.io)
+            .map_err(|_| io::Error::other("TcpStream is still shared (split halves alive)"))?;
+        let mut io = std::mem::ManuallyDrop::new(io);
+        io.release();
+        // SAFETY: ManuallyDrop の中の fd を取り出す（IoSource の Drop は走らせない）
+        let fd = unsafe { std::ptr::read(&io.fd) };
+        let s = std::net::TcpStream::from(fd);
+        s.set_nonblocking(false)?;
+        Ok(s)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.local_addr())
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.peer_addr())
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.io.raw())
+    }
+
+    pub fn nodelay(&self) -> io::Result<bool> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.nodelay())
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.set_nodelay(nodelay))
+    }
+
+    pub fn ttl(&self) -> io::Result<u32> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.ttl())
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.set_ttl(ttl))
+    }
+
+    pub fn linger(&self) -> io::Result<Option<std::time::Duration>> {
+        let mut l: libc::linger = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+        cvt_i(unsafe {
+            libc::getsockopt(
+                self.io.raw(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &mut l as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        })?;
+        Ok((l.l_onoff != 0).then(|| std::time::Duration::from_secs(l.l_linger as u64)))
+    }
+
+    pub fn set_linger(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        let l = libc::linger {
+            l_onoff: dur.is_some() as libc::c_int,
+            l_linger: dur.map(|d| d.as_secs() as libc::c_int).unwrap_or(0),
+        };
+        cvt_i(unsafe {
+            libc::setsockopt(
+                self.io.raw(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &l as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        })
+        .map(drop)
+    }
+
+    pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        poll_fn(|cx| {
+            let mut ready = Ready::EMPTY;
+            if interest.is_readable() {
+                if let Poll::Ready(r) = self.io.poll_read_ready(cx) {
+                    r?;
+                    ready |= Ready::READABLE;
+                }
+            }
+            if interest.is_writable() {
+                if let Poll::Ready(r) = self.io.poll_write_ready(cx) {
+                    r?;
+                    ready |= Ready::WRITABLE;
+                }
+            }
+            if ready.is_empty() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(ready))
+            }
+        })
+        .await
+    }
+
+    pub async fn readable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+    }
+
+    pub async fn writable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+    }
+
+    pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_read_ready(cx)
+    }
+
+    pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_write_ready(cx)
+    }
+
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        cvt(unsafe { libc::recv(self.io.raw(), buf.as_mut_ptr().cast(), buf.len(), 0) })
+    }
+
+    pub fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        let dst = buf.chunk_mut();
+        let n = cvt(unsafe { libc::recv(self.io.raw(), dst.as_mut_ptr().cast(), dst.len(), 0) })?;
+        // SAFETY: n バイトは recv で初期化された
+        unsafe { buf.advance_mut(n) };
+        Ok(n)
+    }
+
+    pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        cvt(unsafe {
+            libc::readv(
+                self.io.raw(),
+                bufs.as_mut_ptr().cast(),
+                bufs.len().min(1024) as libc::c_int,
+            )
+        })
+    }
+
+    pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        sys_send(self.io.raw(), buf)
+    }
+
+    pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        sys_writev(self.io.raw(), bufs)
+    }
+
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut *buf);
+            ready!(self.poll_peek(cx, &mut rb))?;
+            Poll::Ready(Ok(rb.filled().len()))
+        })
+        .await
+    }
+
+    pub fn poll_peek(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let fd = self.io.raw();
+        self.io
+            .poll_io(false, cx, || sys_recv(fd, buf, libc::MSG_PEEK))
+    }
+
+    /// 借用の読み・書きの半分。
+    pub fn split(&mut self) -> (tcp::ReadHalf<'_>, tcp::WriteHalf<'_>) {
+        (tcp::ReadHalf(self), tcp::WriteHalf(self))
+    }
+
+    /// 所有の読み・書きの半分（`reunite` で戻す）。
+    pub fn into_split(self) -> (tcp::OwnedReadHalf, tcp::OwnedWriteHalf) {
+        (
+            tcp::OwnedReadHalf {
+                inner: TcpStream {
+                    io: self.io.clone(),
+                },
+            },
+            tcp::OwnedWriteHalf {
+                inner: self,
+                shutdown_on_drop: true,
+            },
+        )
+    }
+
+    fn poll_read_priv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let fd = self.io.raw();
+        self.io
+            .poll_io(false, cx, || sys_recv(fd, buf, 0))
+            .map_ok(drop)
+    }
+
+    fn poll_write_priv(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let fd = self.io.raw();
+        self.io.poll_io(true, cx, || sys_send(fd, buf))
+    }
+
+    fn poll_write_vectored_priv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let fd = self.io.raw();
+        self.io.poll_io(true, cx, || sys_writev(fd, bufs))
+    }
+
+    fn shutdown_std(&self, how: std::net::Shutdown) -> io::Result<()> {
+        let r = with_std::<std::net::TcpStream, _>(self.io.raw(), |s| s.shutdown(how));
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+            r => r,
+        }
+    }
+}
+
+impl AsyncRead for TcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_read_priv(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_priv(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored_priv(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.shutdown_std(std::net::Shutdown::Write))
+    }
+}
+
+impl AsRawFd for TcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.raw()
+    }
+}
+
+impl AsFd for TcpStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.io.fd.as_fd()
+    }
+}
+
+impl TryFrom<std::net::TcpStream> for TcpStream {
+    type Error = io::Error;
+    fn try_from(s: std::net::TcpStream) -> io::Result<TcpStream> {
+        TcpStream::from_std(s)
+    }
+}
+
+/// `tokio::net::tcp`（分割した半分）。
+pub mod tcp {
+    use super::*;
+
+    /// 借用の読みの半分。
+    #[derive(Debug)]
+    pub struct ReadHalf<'a>(pub(super) &'a TcpStream);
+
+    /// 借用の書きの半分。
+    #[derive(Debug)]
+    pub struct WriteHalf<'a>(pub(super) &'a TcpStream);
+
+    impl AsyncRead for ReadHalf<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0.poll_read_priv(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for WriteHalf<'_> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.poll_write_priv(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(self.0.shutdown_std(std::net::Shutdown::Write))
+        }
+    }
+
+    impl ReadHalf<'_> {
+        pub async fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.peek(buf).await
+        }
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.0.peer_addr()
+        }
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.0.local_addr()
+        }
+    }
+
+    impl WriteHalf<'_> {
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.0.peer_addr()
+        }
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.0.local_addr()
+        }
+    }
+
+    /// 所有の読みの半分。
+    #[derive(Debug)]
+    pub struct OwnedReadHalf {
+        pub(super) inner: TcpStream,
+    }
+
+    /// 所有の書きの半分（drop で書き方向を閉じる）。
+    #[derive(Debug)]
+    pub struct OwnedWriteHalf {
+        pub(super) inner: TcpStream,
+        pub(super) shutdown_on_drop: bool,
+    }
+
+    /// 対でない半分を `reunite` しようとした。
+    #[derive(Debug)]
+    pub struct ReuniteError(pub OwnedReadHalf, pub OwnedWriteHalf);
+
+    impl std::fmt::Display for ReuniteError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("tried to reunite halves that are not from the same socket")
+        }
+    }
+
+    impl std::error::Error for ReuniteError {}
+
+    impl OwnedReadHalf {
+        pub fn reunite(self, mut other: OwnedWriteHalf) -> Result<TcpStream, ReuniteError> {
+            if Arc::ptr_eq(&self.inner.io, &other.inner.io) {
+                other.shutdown_on_drop = false;
+                drop(self);
+                let io = other.inner.io.clone();
+                drop(other);
+                Ok(TcpStream { io })
+            } else {
+                Err(ReuniteError(self, other))
+            }
+        }
+        pub async fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.peek(buf).await
+        }
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.peer_addr()
+        }
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+        pub async fn readable(&self) -> io::Result<()> {
+            self.inner.readable().await
+        }
+        pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.try_read(buf)
+        }
+    }
+
+    impl OwnedWriteHalf {
+        pub fn reunite(self, other: OwnedReadHalf) -> Result<TcpStream, ReuniteError> {
+            other.reunite(self)
+        }
+        pub fn forget(mut self) {
+            self.shutdown_on_drop = false;
+        }
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.peer_addr()
+        }
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+        pub async fn writable(&self) -> io::Result<()> {
+            self.inner.writable().await
+        }
+        pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.try_write(buf)
+        }
+    }
+
+    impl Drop for OwnedWriteHalf {
+        fn drop(&mut self) {
+            if self.shutdown_on_drop {
+                let _ = self.inner.shutdown_std(std::net::Shutdown::Write);
+            }
+        }
+    }
+
+    impl AsyncRead for OwnedReadHalf {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.inner.poll_read_priv(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for OwnedWriteHalf {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_write_priv(cx, buf)
+        }
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_write_vectored_priv(cx, bufs)
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let r = self.inner.shutdown_std(std::net::Shutdown::Write);
+            if r.is_ok() {
+                self.get_mut().shutdown_on_drop = false;
+            }
+            Poll::Ready(r)
+        }
+    }
+}
+
+// ===================== TcpListener =====================
+
+/// `tokio::net::TcpListener`。
+#[derive(Debug)]
+pub struct TcpListener {
+    io: IoSource,
+}
+
+fn accept_fd(fd: RawFd) -> io::Result<(OwnedFd, SocketAddr)> {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let nfd =
+        cvt_i(unsafe { libc::accept(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) })?;
+    // SAFETY: accept が返した fd
+    let owned = unsafe { OwnedFd::from_raw_fd(nfd) };
+    set_nonblocking_cloexec(nfd)?;
+    let addr = with_std::<std::net::TcpStream, _>(nfd, |s| s.peer_addr())?;
+    Ok((owned, addr))
+}
+
+impl TcpListener {
+    /// 待ち受ける（最初に bind できたアドレス）。
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
+        let addrs = addr.to_addrs().await?;
+        let mut last = None;
+        for a in addrs {
+            match std::net::TcpListener::bind(a) {
+                Ok(l) => return TcpListener::from_std(l),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
+    }
+
+    pub fn from_std(listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        listener.set_nonblocking(true)?;
+        let fd: OwnedFd = listener.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(TcpListener {
+            io: IoSource::new(fd),
+        })
+    }
+
+    pub fn into_std(self) -> io::Result<std::net::TcpListener> {
+        let mut io = std::mem::ManuallyDrop::new(self.io);
+        io.release();
+        // SAFETY: Drop を走らせずに fd を取り出す
+        let fd = unsafe { std::ptr::read(&io.fd) };
+        let l = std::net::TcpListener::from(fd);
+        l.set_nonblocking(false)?;
+        Ok(l)
+    }
+
+    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        poll_fn(|cx| self.poll_accept(cx)).await
+    }
+
+    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        let fd = self.io.raw();
+        let (s, a) = ready!(self.io.poll_io(false, cx, || accept_fd(fd)))?;
+        Poll::Ready(Ok((
+            TcpStream {
+                io: Arc::new(IoSource::new(s)),
+            },
+            a,
+        )))
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        with_std::<std::net::TcpListener, _>(self.io.raw(), |l| l.local_addr())
+    }
+
+    pub fn ttl(&self) -> io::Result<u32> {
+        with_std::<std::net::TcpListener, _>(self.io.raw(), |l| l.ttl())
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        with_std::<std::net::TcpListener, _>(self.io.raw(), |l| l.set_ttl(ttl))
+    }
+}
+
+impl AsRawFd for TcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.raw()
+    }
+}
+
+impl AsFd for TcpListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.io.fd.as_fd()
+    }
+}
+
+impl TryFrom<std::net::TcpListener> for TcpListener {
+    type Error = io::Error;
+    fn try_from(l: std::net::TcpListener) -> io::Result<TcpListener> {
+        TcpListener::from_std(l)
+    }
+}
+
+// ===================== TcpSocket =====================
+
+/// `tokio::net::TcpSocket`（bind・オプションを設定してから connect / listen する）。
+#[derive(Debug)]
+pub struct TcpSocket {
+    fd: OwnedFd,
+}
+
+fn setopt_int(fd: RawFd, level: libc::c_int, opt: libc::c_int, v: libc::c_int) -> io::Result<()> {
+    cvt_i(unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    })
+    .map(drop)
+}
+
+fn getopt_int(fd: RawFd, level: libc::c_int, opt: libc::c_int) -> io::Result<libc::c_int> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    cvt_i(unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            opt,
+            &mut v as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    })?;
+    Ok(v)
+}
+
+impl TcpSocket {
+    pub fn new_v4() -> io::Result<TcpSocket> {
+        Ok(TcpSocket {
+            fd: new_socket(libc::AF_INET, libc::SOCK_STREAM)?,
+        })
+    }
+
+    pub fn new_v6() -> io::Result<TcpSocket> {
+        Ok(TcpSocket {
+            fd: new_socket(libc::AF_INET6, libc::SOCK_STREAM)?,
+        })
+    }
+
+    pub fn set_reuseaddr(&self, v: bool) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            v as libc::c_int,
+        )
+    }
+
+    pub fn reuseaddr(&self) -> io::Result<bool> {
+        getopt_int(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR).map(|v| v != 0)
+    }
+
+    pub fn set_reuseport(&self, v: bool) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            v as libc::c_int,
+        )
+    }
+
+    pub fn reuseport(&self) -> io::Result<bool> {
+        getopt_int(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT).map(|v| v != 0)
+    }
+
+    pub fn set_keepalive(&self, v: bool) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            v as libc::c_int,
+        )
+    }
+
+    pub fn keepalive(&self) -> io::Result<bool> {
+        getopt_int(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).map(|v| v != 0)
+    }
+
+    pub fn set_nodelay(&self, v: bool) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            v as libc::c_int,
+        )
+    }
+
+    pub fn nodelay(&self) -> io::Result<bool> {
+        getopt_int(self.fd.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY).map(|v| v != 0)
+    }
+
+    pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            size as libc::c_int,
+        )
+    }
+
+    pub fn send_buffer_size(&self) -> io::Result<u32> {
+        getopt_int(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as u32)
+    }
+
+    pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
+        setopt_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            size as libc::c_int,
+        )
+    }
+
+    pub fn recv_buffer_size(&self) -> io::Result<u32> {
+        getopt_int(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as u32)
+    }
+
+    pub fn set_linger(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        let l = libc::linger {
+            l_onoff: dur.is_some() as libc::c_int,
+            l_linger: dur.map(|d| d.as_secs() as libc::c_int).unwrap_or(0),
+        };
+        cvt_i(unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &l as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        })
+        .map(drop)
+    }
+
+    pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+        let (ss, len) = sockaddr(&addr);
+        cvt_i(unsafe {
+            libc::bind(
+                self.fd.as_raw_fd(),
+                &ss as *const _ as *const libc::sockaddr,
+                len,
+            )
+        })
+        .map(drop)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        with_std::<std::net::TcpListener, _>(self.fd.as_raw_fd(), |l| l.local_addr())
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.fd.as_raw_fd())
+    }
+
+    pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
+        TcpStream::connect_fd(self.fd, addr).await
+    }
+
+    pub fn listen(self, backlog: u32) -> io::Result<TcpListener> {
+        cvt_i(unsafe {
+            libc::listen(
+                self.fd.as_raw_fd(),
+                backlog.min(i32::MAX as u32) as libc::c_int,
+            )
+        })?;
+        Ok(TcpListener {
+            io: IoSource::new(self.fd),
+        })
+    }
+
+    pub fn from_std_stream(stream: std::net::TcpStream) -> TcpSocket {
+        TcpSocket { fd: stream.into() }
+    }
+}
+
+impl AsRawFd for TcpSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for TcpSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl FromRawFd for TcpSocket {
+    unsafe fn from_raw_fd(fd: RawFd) -> TcpSocket {
+        TcpSocket {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        }
+    }
+}
+
+impl IntoRawFd for TcpSocket {
+    fn into_raw_fd(self) -> RawFd {
+        self.fd.into_raw_fd()
+    }
+}
+
+// ===================== UdpSocket =====================
+
+/// `tokio::net::UdpSocket`。
+#[derive(Debug)]
+pub struct UdpSocket {
+    io: IoSource,
+}
+
+impl UdpSocket {
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
+        let addrs = addr.to_addrs().await?;
+        let mut last = None;
+        for a in addrs {
+            match std::net::UdpSocket::bind(a) {
+                Ok(s) => return UdpSocket::from_std(s),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
+    }
+
+    pub fn from_std(socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
+        socket.set_nonblocking(true)?;
+        let fd: OwnedFd = socket.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(UdpSocket {
+            io: IoSource::new(fd),
+        })
+    }
+
+    pub fn into_std(self) -> io::Result<std::net::UdpSocket> {
+        let mut io = std::mem::ManuallyDrop::new(self.io);
+        io.release();
+        // SAFETY: Drop を走らせずに fd を取り出す
+        let fd = unsafe { std::ptr::read(&io.fd) };
+        let s = std::net::UdpSocket::from(fd);
+        s.set_nonblocking(false)?;
+        Ok(s)
+    }
+
+    fn std<R>(&self, f: impl FnOnce(&std::net::UdpSocket) -> R) -> R {
+        with_std::<std::net::UdpSocket, _>(self.io.raw(), f)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.std(|s| s.local_addr())
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.std(|s| s.peer_addr())
+    }
+
+    pub async fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+        let addrs = addr.to_addrs().await?;
+        let mut last = None;
+        for a in addrs {
+            match self.std(|s| s.connect(a)) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        poll_fn(|cx| self.poll_send(cx, buf)).await
+    }
+
+    pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.io.poll_io(true, cx, || self.std(|s| s.send(buf)))
+    }
+
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.std(|s| s.send(buf))
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.std(|s| s.recv(&mut *buf)))
+        })
+        .await
+    }
+
+    pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let fd = self.io.raw();
+        self.io
+            .poll_io(false, cx, || sys_recv(fd, buf, 0))
+            .map_ok(drop)
+    }
+
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.std(|s| s.recv(buf))
+    }
+
+    pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], target: A) -> io::Result<usize> {
+        let addrs = target.to_addrs().await?;
+        let a = *addrs.first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no addresses to send data to")
+        })?;
+        poll_fn(|cx| self.poll_send_to(cx, buf, a)).await
+    }
+
+    pub fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.io
+            .poll_io(true, cx, || self.std(|s| s.send_to(buf, target)))
+    }
+
+    pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.std(|s| s.send_to(buf, target))
+    }
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.std(|s| s.recv_from(&mut *buf)))
+        })
+        .await
+    }
+
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<SocketAddr>> {
+        let (n, a) = ready!(self.io.poll_io(false, cx, || self
+            .std(|s| s.recv_from(buf.initialize_unfilled()))))?;
+        buf.advance(n);
+        Poll::Ready(Ok(a))
+    }
+
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.std(|s| s.recv_from(buf))
+    }
+
+    pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| {
+            self.io
+                .poll_io(false, cx, || self.std(|s| s.peek_from(&mut *buf)))
+        })
+        .await
+    }
+
+    pub async fn readable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_read_ready(cx)).await
+    }
+
+    pub async fn writable(&self) -> io::Result<()> {
+        poll_fn(|cx| self.io.poll_write_ready(cx)).await
+    }
+
+    pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_read_ready(cx)
+    }
+
+    pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_write_ready(cx)
+    }
+
+    pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+        self.std(|s| s.set_broadcast(on))
+    }
+
+    pub fn broadcast(&self) -> io::Result<bool> {
+        self.std(|s| s.broadcast())
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.std(|s| s.set_ttl(ttl))
+    }
+
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.std(|s| s.ttl())
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        sock_err(self.io.raw())
+    }
+}
+
+impl AsRawFd for UdpSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.raw()
+    }
+}
+
+impl AsFd for UdpSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.io.fd.as_fd()
+    }
+}
+
+// ===================== Unix ドメインソケット =====================
+
+/// `tokio::net::UnixStream`。
+#[derive(Debug)]
+pub struct UnixStream {
+    inner: TcpStream,
+}
+
+impl UnixStream {
+    pub async fn connect<P: AsRef<std::path::Path>>(path: P) -> io::Result<UnixStream> {
+        let fd = new_socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
+        let p = path.as_ref().as_os_str().as_encoded_bytes();
+        let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if p.len() >= sun.sun_path.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+        }
+        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, s) in sun.sun_path.iter_mut().zip(p) {
+            *d = *s as libc::c_char;
+        }
+        let len = (std::mem::size_of::<libc::sa_family_t>() + p.len() + 1) as libc::socklen_t;
+        let r = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                &sun as *const _ as *const libc::sockaddr,
+                len,
+            )
+        };
+        let s = TcpStream {
+            io: Arc::new(IoSource::new(fd)),
+        };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) && e.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(e);
+            }
+            poll_fn(|cx| s.io.poll_write_ready(cx)).await?;
+            if let Some(e) = sock_err(s.io.raw())? {
+                return Err(e);
+            }
+        }
+        Ok(UnixStream { inner: s })
+    }
+
+    pub fn pair() -> io::Result<(UnixStream, UnixStream)> {
+        let (a, b) = std::os::unix::net::UnixStream::pair()?;
+        Ok((UnixStream::from_std(a)?, UnixStream::from_std(b)?))
+    }
+
+    pub fn from_std(stream: std::os::unix::net::UnixStream) -> io::Result<UnixStream> {
+        stream.set_nonblocking(true)?;
+        let fd: OwnedFd = stream.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(UnixStream {
+            inner: TcpStream {
+                io: Arc::new(IoSource::new(fd)),
+            },
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        with_std::<std::os::unix::net::UnixStream, _>(self.inner.io.raw(), |s| s.local_addr())
+    }
+
+    pub fn peer_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        with_std::<std::os::unix::net::UnixStream, _>(self.inner.io.raw(), |s| s.peer_addr())
+    }
+
+    pub async fn readable(&self) -> io::Result<()> {
+        self.inner.readable().await
+    }
+
+    pub async fn writable(&self) -> io::Result<()> {
+        self.inner.writable().await
+    }
+
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.try_read(buf)
+    }
+
+    pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.try_write(buf)
+    }
+
+    pub fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        self.inner.try_read_buf(buf)
+    }
+
+    pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        self.inner.try_read_vectored(bufs)
+    }
+
+    pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.inner.try_write_vectored(bufs)
+    }
+
+    pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        self.inner.ready(interest).await
+    }
+
+    pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_read_ready(cx)
+    }
+
+    pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_write_ready(cx)
+    }
+
+    pub fn split(&mut self) -> (tcp::ReadHalf<'_>, tcp::WriteHalf<'_>) {
+        self.inner.split()
+    }
+
+    pub fn into_split(self) -> (tcp::OwnedReadHalf, tcp::OwnedWriteHalf) {
+        self.inner.into_split()
+    }
+}
+
+impl AsyncRead for UnixStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.inner.poll_read_priv(cx, buf)
+    }
+}
+
+impl AsyncWrite for UnixStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_write_priv(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_write_vectored_priv(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.inner.shutdown_std(std::net::Shutdown::Write))
+    }
+}
+
+impl AsRawFd for UnixStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.io.raw()
+    }
+}
+
+/// `tokio::net::UnixListener`。
+#[derive(Debug)]
+pub struct UnixListener {
+    io: IoSource,
+}
+
+impl UnixListener {
+    pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<UnixListener> {
+        UnixListener::from_std(std::os::unix::net::UnixListener::bind(path)?)
+    }
+
+    pub fn from_std(listener: std::os::unix::net::UnixListener) -> io::Result<UnixListener> {
+        listener.set_nonblocking(true)?;
+        let fd: OwnedFd = listener.into();
+        set_nonblocking_cloexec(fd.as_raw_fd())?;
+        Ok(UnixListener {
+            io: IoSource::new(fd),
+        })
+    }
+
+    pub async fn accept(&self) -> io::Result<(UnixStream, std::os::unix::net::SocketAddr)> {
+        poll_fn(|cx| self.poll_accept(cx)).await
+    }
+
+    pub fn poll_accept(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<(UnixStream, std::os::unix::net::SocketAddr)>> {
+        let fd = self.io.raw();
+        let r = ready!(self.io.poll_io(false, cx, || with_std::<
+            std::os::unix::net::UnixListener,
+            _,
+        >(fd, |l| l.accept())))?;
+        let (s, a) = r;
+        Poll::Ready(Ok((UnixStream::from_std(s)?, a)))
+    }
+
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        with_std::<std::os::unix::net::UnixListener, _>(self.io.raw(), |l| l.local_addr())
+    }
+}
+
+impl AsRawFd for UnixListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io.raw()
+    }
+}
+
+/// `tokio::net::unix`（分割した半分の型は TCP と共通）。
+pub mod unix {
+    pub use super::tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
+    pub use std::os::unix::net::SocketAddr;
+}
