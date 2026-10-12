@@ -117,11 +117,6 @@ impl VeilProcess {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-
-    /// プロセスが既に終了していれば終了コードを返す。
-    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.as_mut()?.try_wait().ok().flatten()
-    }
 }
 
 impl Drop for VeilProcess {

@@ -317,6 +317,10 @@ path = "{www}"
     let resp = http1_get(port, "/index.html").expect("plain HTTP/1.1");
     assert_eq!(resp.status, 200, "{}", veil.log());
     assert_eq!(resp.text(), "plain");
+    assert!(resp
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("text/html"));
 
     let (status, body) = h2c_get(port, "/index.html");
     assert_eq!(status, 200);

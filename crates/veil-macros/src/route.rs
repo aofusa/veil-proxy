@@ -126,7 +126,7 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
         _ => {}
     }
     let name = name.unwrap_or("").trim_start_matches("r#").to_string();
-    if path_params.iter().any(|p| *p == name) {
+    if path_params.contains(&name) {
         return ArgKind::PathParam(name, ty.clone());
     }
     match option_inner(ty) {

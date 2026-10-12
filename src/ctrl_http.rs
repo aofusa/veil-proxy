@@ -273,7 +273,7 @@ pub fn parse_response(raw: &[u8], limit: usize, head: bool) -> Result<HttpRespon
         .and_then(|(_, v)| v.parse::<usize>().ok());
     let rest = &raw[head_end + 4..];
     let body = if chunked {
-        crate::http_utils::decode_chunked_body(rest)
+        decode_chunked(rest).ok_or("malformed chunked response body")?
     } else if let Some(n) = length {
         rest.get(..n).ok_or("truncated response body")?.to_vec()
     } else {
@@ -287,6 +287,22 @@ pub fn parse_response(raw: &[u8], limit: usize, head: bool) -> Result<HttpRespon
         headers,
         body,
     })
+}
+
+/// chunked 本文を復号する（拡張・トレーラーは読み捨てる）。
+fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = data.windows(2).position(|w| w == b"\r\n")?;
+        let size_str = std::str::from_utf8(&data[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_str.split(';').next()?.trim(), 16).ok()?;
+        data = &data[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(data.get(..size)?);
+        data = data.get(size + 2..)?;
+    }
 }
 
 #[cfg(test)]

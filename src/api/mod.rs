@@ -255,6 +255,8 @@ mod tests {
     struct Plain;
 
     /// autoref 特殊化が「実装していれば使う・無ければ予備」を正しく選ぶ（マクロの生成コードと同じ呼び方）。
+    // 理由付き allow: `(&Probe).method()` の明示的な借用こそが検証対象（予備の impl は `&Probe` にある）。
+    #[allow(clippy::needless_borrow)]
     #[test]
     fn probes_pick_the_bounded_impl_when_available() {
         let mut defs = Definitions::new();
