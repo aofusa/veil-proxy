@@ -54,9 +54,10 @@ CONFIG_GLOB="${CONFIG_GLOB:-*}"    # 計測対象 config を絞り込む glob（
 CONFIGS="${CONFIGS:-}"              # 計測対象 config 名を空白区切りで列挙（指定時は CONFIG_GLOB より優先）。
                                     # glob 1 個では表せない代表構成の組を A/B で測るとき用。
 SKIP_NGINX="${SKIP_NGINX:-0}"      # 1 で nginx ベースラインを省く（veil 同士の A/B を繰り返すとき用）。
-BUILDS="${BUILDS:-glibc musl}"     # 計測対象の veil ビルド（既定は両方）。改修の A/B 中は
+BUILDS="${BUILDS-glibc musl}"      # 計測対象の veil ビルド（未設定なら両方）。改修の A/B 中は
                                     # 片方のイメージしか作り直さないことがあり、古いイメージを
                                     # 混ぜて計測しないよう `BUILDS=glibc` のように絞れる。
+                                    # `BUILDS=""`（空）で veil を測らない（nginx のベースラインだけ）。
 
 # 計測結果は raw（1 反復 1 行）で保存し、analyze_results.sh で median±stdev に集計する。
 RESULTS_RAW="$HERE/results/results_raw.tsv"

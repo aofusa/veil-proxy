@@ -95,6 +95,10 @@ enum H3FieldSection {
 
 /// HTTP/3 の H3_MESSAGE_ERROR（RFC 9114 §8.1）。
 const H3_MESSAGE_ERROR: u64 = 0x10e;
+/// HTTP/3 の H3_NO_ERROR（RFC 9114 §8.1。graceful shutdown の CONNECTION_CLOSE。F-187）。
+const H3_NO_ERROR_CODE: u64 = 0x100;
+/// HTTP/3 の H3_REQUEST_REJECTED（RFC 9114 §8.1。GOAWAY 後に届いた要求。クライアントは再送してよい）。
+const H3_REQUEST_REJECTED: u64 = 0x10b;
 
 /// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
 ///
@@ -878,6 +882,12 @@ struct Http3Handler {
     /// F-168 P3: `process_h3_events` の Reset ストリーム ID 一時収集バッファ（再利用）。
     /// 用法は `ev_new_headers` と同じ。
     ev_reset: Vec<u64>,
+    /// F-187: 受け付けた要求ストリーム ID の最大値 + 4（GOAWAY で「ここまでは処理する」と伝える値）。
+    next_req_stream: u64,
+    /// F-187: 送った GOAWAY の ID。これ以上の ID の新しい要求は H3_REQUEST_REJECTED で断る。
+    goaway_id: Option<u64>,
+    /// F-187: graceful shutdown で CONNECTION_CLOSE を出した。
+    shutdown_closed: bool,
 }
 
 impl Http3Handler {
@@ -909,7 +919,41 @@ impl Http3Handler {
             ev_new_headers: Vec::new(),
             ev_finished: Vec::new(),
             ev_reset: Vec::new(),
+            next_req_stream: 0,
+            goaway_id: None,
+            shutdown_closed: false,
         }
+    }
+
+    /// F-187: 処理中の要求が無いか（応答の送出途中・バックエンド待ち・本文の受信途中のいずれも無い）。
+    fn has_no_requests(&self) -> bool {
+        self.partial_responses.is_empty()
+            && self.proxy_streams.is_empty()
+            && self.buffered_reqs.is_empty()
+            && self.stream_bodies.is_empty()
+            && self.new_buffered.is_empty()
+    }
+
+    /// F-187: graceful shutdown の 1 歩。最初の呼び出しで GOAWAY を送り（以後の新しい要求は断る）、
+    /// 処理中の要求が無くなった時点で CONNECTION_CLOSE（H3_NO_ERROR）を出す。送るものができたら
+    /// `true`（呼び出し側がダーティにして送出させる）。停止中のメインループだけが呼ぶ。
+    fn shutdown_step(&mut self) -> bool {
+        let mut acted = false;
+        if self.goaway_id.is_none() {
+            if let Some(h3) = self.h3_conn.as_mut() {
+                let id = self.next_req_stream;
+                if h3.send_goaway(&mut self.conn, id).is_ok() {
+                    self.goaway_id = Some(id);
+                    acted = true;
+                }
+            }
+        }
+        if !self.shutdown_closed && self.has_no_requests() {
+            self.shutdown_closed = true;
+            let _ = self.conn.close(true, H3_NO_ERROR_CODE, b"");
+            acted = true;
+        }
+        acted
     }
 
     /// リクエストストリームをメトリクス open として計上（二重 open 防止）
@@ -1005,7 +1049,22 @@ impl Http3Handler {
                             || new_headers.iter().any(|(id, _, _)| *id == stream_id);
                         match section {
                             Ok(H3FieldSection::Request) if !known_stream => {
-                                new_headers.push((stream_id, list, more_frames));
+                                if self.goaway_id.is_some_and(|g| stream_id >= g) {
+                                    // F-187: GOAWAY の後に始まった要求は処理しない（再送してよい）。
+                                    let _ = self.conn.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Read,
+                                        H3_REQUEST_REJECTED,
+                                    );
+                                    let _ = self.conn.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Write,
+                                        H3_REQUEST_REJECTED,
+                                    );
+                                } else {
+                                    self.next_req_stream = self.next_req_stream.max(stream_id + 4);
+                                    new_headers.push((stream_id, list, more_frames));
+                                }
                             }
                             // trailers: 転送しない（従来は新規リクエストとして再分類していた）。
                             Ok(H3FieldSection::NoPseudo) if known_stream => {}
@@ -4189,7 +4248,24 @@ async fn proxy_to_h2c_backend_async(
 /// 数回引くため、既定の SipHash ではなく乱数シード付きの foldhash を使う
 /// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは
 /// 予測不能な HMAC 出力なので、シード付きの高速ハッシュで HashDoS の心配は無い。
-type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, foldhash::quality::RandomState>;
+///
+/// F-186: 値は `Box<Http3Handler>`。ハンドラは quiche の接続を値で持つ数 KB の構造体で、値のまま表に置くと
+/// 表の容量の倍増（再ハッシュ）のたびに全ハンドラを移動し、同時接続数のピークに合わせて表が
+/// ワーカーあたり 16MB まで伸びたまま残っていた。Box の確保は接続の確立ごとに 1 回（要求ごとではない）。
+type ConnMapInner =
+    HashMap<ConnectionId<'static>, Box<Http3Handler>, foldhash::quality::RandomState>;
+
+/// F-186: 接続表の容量がこの値以下なら縮めない（小さい表の伸縮を繰り返さない）。
+const CONN_MAP_SHRINK_MIN_CAPACITY: usize = 256;
+
+/// F-186: アイドル点（受信待ちのタイムアウト）で、接続が減って表の容量が 4 倍以上余っていたら縮める。
+/// 要求ごとの経路からは呼ばない（`alloc_tune::idle_tick` と同じ位置だけ）。
+fn shrink_idle_conn_map(conns: &mut ConnMapInner) {
+    let cap = conns.capacity();
+    if cap > CONN_MAP_SHRINK_MIN_CAPACITY && conns.len() * 4 < cap {
+        conns.shrink_to((conns.len() * 2).max(CONN_MAP_SHRINK_MIN_CAPACITY));
+    }
+}
 
 type ConnectionMap = Rc<RefCell<ConnMapInner>>;
 
@@ -4465,6 +4541,8 @@ pub async fn run_http3_server_async(
     // push のたびに発生していた `ConnectionId`（内部 `Vec<u8>`）のヒープ確保を
     // `Rc::clone`（参照カウント +1 のみ）に置き換える（F-151 レビュー修正）。
     let mut dirty_queue: VecDeque<ConnKey> = VecDeque::new();
+    // F-187: graceful shutdown の期限（SHUTDOWN_FLAG を最初に見たときに決める）。
+    let mut shutdown_deadline: Option<Instant> = None;
     let mut timers: BinaryHeap<Reverse<TimerKey>> = BinaryHeap::new();
     // F-151: バックエンドタスクが per-connection に積む起床キュー（`Http3Handler` 生成時に
     // `ConnWaker` へ `Rc` で共有する）。
@@ -4475,58 +4553,40 @@ pub async fn run_http3_server_async(
 
     // メインループ: パケット受信とディスパッチ
     loop {
-        // シャットダウンチェック
+        // シャットダウンチェック（F-187: 停止中もメインループを回し続ける。以前は受信も送信も
+        // 止めて quiche のアイドルタイムアウトを待つだけで、GOAWAY も送っていなかった）。
+        // 各接続に GOAWAY を送って新しい要求を断り、処理中の要求が終わった接続から
+        // CONNECTION_CLOSE を出す。全接続が閉じるか `graceful_shutdown_timeout_secs` で抜ける。
         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-            info!("[HTTP/3] Initiating graceful shutdown...");
-
-            // 全QUICコネクションにGOAWAYを送信
-            {
-                let conns = connections.borrow();
-                let conn_count = conns.len();
-                if conn_count > 0 {
-                    info!("[HTTP/3] Sending GOAWAY to {} connections", conn_count);
+            let now = Instant::now();
+            let mut conns = connections.borrow_mut();
+            let deadline = *shutdown_deadline.get_or_insert_with(|| {
+                info!(
+                    "[HTTP/3] Initiating graceful shutdown ({} connections)",
+                    conns.len()
+                );
+                now + Duration::from_secs(
+                    crate::config::GRACEFUL_SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed),
+                )
+            });
+            if conns.is_empty() {
+                info!("[HTTP/3] All connections drained");
+                info!("[HTTP/3] Shutdown complete");
+                break Ok(());
+            }
+            if now >= deadline {
+                warn!(
+                    "[HTTP/3] Drain timeout, {} connections still active",
+                    conns.len()
+                );
+                info!("[HTTP/3] Shutdown complete");
+                break Ok(());
+            }
+            for handler in conns.values_mut() {
+                if handler.shutdown_step() {
+                    mark_dirty_flag(&mut handler.dirty, &mut dirty_queue, &handler.key);
                 }
             }
-
-            // コネクションが完了するまで待機（タイムアウト付き）
-            let drain_timeout = Duration::from_secs(30);
-            let drain_start = std::time::Instant::now();
-
-            loop {
-                let active_count = connections.borrow().len();
-                if active_count == 0 {
-                    info!("[HTTP/3] All connections drained");
-                    break;
-                }
-
-                if drain_start.elapsed() > drain_timeout {
-                    warn!(
-                        "[HTTP/3] Drain timeout, {} connections still active",
-                        active_count
-                    );
-                    break;
-                }
-
-                // タイムアウト処理を継続
-                {
-                    let mut conns = connections.borrow_mut();
-                    let mut closed = Vec::new();
-                    for (cid, handler) in conns.iter_mut() {
-                        handler.conn.on_timeout();
-                        if handler.conn.is_closed() {
-                            closed.push(cid.clone());
-                        }
-                    }
-                    for cid in closed {
-                        conns.remove(&cid);
-                    }
-                }
-
-                crate::runtime::time::sleep(Duration::from_millis(100)).await;
-            }
-
-            info!("[HTTP/3] Shutdown complete");
-            break Ok(());
         }
 
         // F-105: 証明書ホットリロードの検知（安価な世代ゲート）。
@@ -4613,6 +4673,8 @@ pub async fn run_http3_server_async(
                 }
 
                 if let MsOutcome::Timeout = outcome {
+                    // F-186: 接続が減った後の接続表の余った容量を返す（アロケータへ返す前に）。
+                    shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
                 }
@@ -4701,6 +4763,8 @@ pub async fn run_http3_server_async(
                 }
                 RecvOutcome::Notified => None,
                 RecvOutcome::Timeout => {
+                    // F-186: 接続が減った後の接続表の余った容量を返す（アロケータへ返す前に）。
+                    shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
                     None
@@ -5202,7 +5266,7 @@ fn process_datagram_segments(
                         // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
                         // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
                         handler.dirty = true;
-                        conns.insert(scid.clone(), handler);
+                        conns.insert(scid.clone(), Box::new(handler));
                         dirty_queue.push_back(key);
 
                         prev_cid = Some(scid.clone());
@@ -5841,6 +5905,26 @@ pub(crate) fn compress_body_h3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-186: 接続が減ってアイドルになった表は縮み、小さい表・まだ埋まっている表は縮まない。
+    #[test]
+    fn idle_conn_map_shrinks_only_when_mostly_empty() {
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        conns.reserve(8192);
+        let peak = conns.capacity();
+        shrink_idle_conn_map(&mut conns);
+        assert!(
+            conns.capacity() < peak / 4,
+            "空の表が縮んでいない: {}",
+            conns.capacity()
+        );
+        assert!(conns.capacity() >= CONN_MAP_SHRINK_MIN_CAPACITY);
+
+        // 下限以下の表は触らない。
+        let small = conns.capacity();
+        shrink_idle_conn_map(&mut conns);
+        assert_eq!(conns.capacity(), small);
+    }
 
     fn check(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
         h3_check_field_section(fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))

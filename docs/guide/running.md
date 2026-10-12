@@ -127,9 +127,16 @@ Error: Upstream 'backend-pool' not found
 When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:
 
 1. Stop accepting new connections
-2. Complete processing of existing requests
-3. Wait for all worker threads to finish
-4. Terminate process
+2. Close idle keep-alive connections immediately (HTTP/1.1 connections waiting for the next request;
+   HTTP/2 connections with no open stream receive `GOAWAY(NO_ERROR)`; HTTP/3 connections receive
+   `GOAWAY` and are closed with `H3_NO_ERROR` once their in-flight requests finish)
+3. Complete processing of in-flight requests (each connection closes after its last response;
+   HTTP/2 and HTTP/3 refuse streams opened after the GOAWAY)
+4. Wait for all worker threads to finish
+5. Terminate process
+
+HTTP/2 connections without open streams are also closed with `GOAWAY(NO_ERROR)` after 60 seconds of
+inactivity during normal operation (the same idle timeout as HTTP/1.1 keep-alive).
 
 The wait for existing connections is bounded by `[server] graceful_shutdown_timeout_secs` (default 30).
 Connections still open after that are closed and the process exits normally (exit status 0).

@@ -8,6 +8,7 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・L4 のスループッ�
 | [`results_raw.tsv`](results_raw.tsv) | Linux x86_64 のフルスイート生データ（1 反復 1 行）+ B-99 の再計測 |
 | [`results_summary.md`](results_summary.md) | 上記の median±stdev 集計（`tools/perf/analyze_results.sh` の出力） |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 ネイティブ計測の生データ |
+| [`v070_ab_raw.tsv`](v070_ab_raw.tsv) / [`v070_ab_recheck.tsv`](v070_ab_recheck.tsv) | v0.7.0 との交互 A/B（`tools/perf/suite_ab.sh`）の生データと再計測 |
 | [`platform_verification.md`](platform_verification.md) | v0.7.0 の全プラットフォーム検証（単体・統合・E2E） |
 
 ---
@@ -86,6 +87,43 @@ HTTP/1.1 のプロキシ圧縮 2 経路だけ `zstd::encode_all`（呼び出し�
 
 どちらもラン間のばらつき（同一イメージで最大 15%、下記）の範囲内。後者はコンテナと相性の悪い
 kTLS 有効の構成で、同じ構成の HTTP/1.1 は 6,656（nginx 6,437 の 1.03×）だった。
+
+### v0.7.0 との交互 A/B（2026-10-12、F-186 / F-187 のブランチ）
+
+v0.7.0（`278e9ed`）以降の変更（F-183 の veil-alloc、F-171・B-97・B-104/B-105 の HTTP/3 上流、F-186・F-187 等）で
+退行していないかを確かめるため、`tools/perf/suite_ab.sh` で **構成ごとに 2 イメージを交互に**測った（構成ごとに
+順番を入れ替える。69 構成 × 3 反復、約 4 時間。生データは [`v070_ab_raw.tsv`](v070_ab_raw.tsv)）。
+
+- イメージ: `veil:v070`（v0.7.0 の worktree からビルド）/ `veil:glibc`（`feat/f186-f187-h3map-idle-shutdown`、`03edef4`）。どちらも `full`・io_uring
+- **798 計測すべてで Non-2xx = 0、NA 行ゼロ**
+- 集計: `python3 tools/perf/suite_ab_summary.py docs/perf/v070_ab_raw.tsv v070 glibc`
+
+| プロトコル | 組数 | Req/s 比の中央値 | 最小 | 最大 | < 0.95 | メモリ比の中央値 |
+|---|---|---|---|---|---|---|
+| HTTP/1.1 | 54 | 1.007 | 0.907 | 1.053 | 1 | 0.21 |
+| HTTP/2 | 45 | 1.003 | 0.964 | 1.030 | 0 | 0.44 |
+| HTTP/3 | 19 | 1.036 | 0.960 | 1.092 | 0 | 0.42 |
+| h2c | 2 | 0.986 | 0.984 | 0.989 | 0 | 0.34 |
+| gRPC | 6 | **1.175** | 1.165 | 1.217 | 0 | 0.26 |
+| gRPC over HTTP/3 | 6 | **2.827** | 2.686 | 2.895 | 0 | 0.29 |
+| WebSocket | 1 | 0.991 | — | — | 0 | 0.19 |
+| **全体** | 133 | **1.007** | 0.907 | 2.895 | 1 | 0.34 |
+
+（比は 今回 / v0.7.0。メモリは計測中の `docker stats` の値。）
+
+- **退行なし。** gRPC over HTTP/3 の伸びは HTTP/3 の上流接続の再利用（B-104/B-105）とバッファ経路の
+  即時 poll（B-97）、メモリの減少は主に veil-alloc とアイドル時の返却（F-183）による。
+- 0.95 を下回った `h2_1_proxy_compression` HTTP/1.1（v0.7.0 2,820 / 今回 2,557、0.907）を、順番を変えて
+  5 反復ずつ 2 回再計測した（[`v070_ab_recheck.tsv`](v070_ab_recheck.tsv)）:
+
+  | 順番 | v0.7.0 | 今回 | 比 |
+  |---|---|---|---|
+  | v0.7.0 → 今回 | 2,386 | 2,568 | 1.076 |
+  | 今回 → v0.7.0 | 2,762 | 2,695 | 0.976 |
+  | 10 反復の中央値 | 2,573 | 2,587 | **1.005** |
+
+  v0.7.0 側が 2,379〜2,848 と振れていた（下記「計測上の注意」の 15% のばらつき）。同じ処理の
+  `h3_proxy_compression` HTTP/1.1 はフルスイートで 1.053 だった。
 
 ---
 

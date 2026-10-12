@@ -302,11 +302,17 @@ where
     /// 未読データを残したまま close すると TCP は FIN ではなく RST を送り、相手が GOAWAY を
     /// 読む前に捨てられ得る（h2spec 3.5/2 が h2c で「connection reset by peer」になった）。
     async fn reject_invalid_preface(&mut self) {
+        self.close_with_goaway(Http2ErrorCode::ProtocolError, b"invalid connection preface")
+            .await;
+    }
+
+    /// GOAWAY を送って接続を閉じる（未読データで RST にならないよう、送信側を閉じてから
+    /// 時間・量の上限付きで読み捨てる。B-102）。アイドルタイムアウト・graceful shutdown
+    /// （B-119 / F-187）と不正なプリフェースの拒否で使う。
+    pub async fn close_with_goaway(&mut self, error_code: Http2ErrorCode, debug_data: &[u8]) {
         const LINGER: std::time::Duration = std::time::Duration::from_millis(500);
         const MAX_DRAIN: usize = 64 * 1024;
-        let _ = self
-            .send_goaway(Http2ErrorCode::ProtocolError, b"invalid connection preface")
-            .await;
+        let _ = self.send_goaway(error_code, debug_data).await;
         let _ = self.stream.shutdown().await;
         let _ = crate::runtime::time::timeout(LINGER, async {
             let mut drained = 0usize;
@@ -2299,6 +2305,12 @@ impl<S: crate::runtime::io::BufferedReadState> Http2Connection<S> {
     /// 待ちとは区別する。後者は POLLIN が発火するため通常の待機で拾える）。
     pub fn has_stream_buffered_read_data(&self) -> bool {
         self.stream.has_buffered_read_data()
+    }
+
+    /// 読み込みバッファに未処理のバイト（分割フレームの続き待ち）があるか（B-119 / F-187:
+    /// これが `true` の接続はアイドルとみなさない）。
+    pub fn has_partial_frame(&self) -> bool {
+        self.buf_end > self.buf_start
     }
 }
 

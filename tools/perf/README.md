@@ -335,6 +335,22 @@ F-158（HTTP/2 インライン初回 poll）の A/B 結果は
 **同一の変更が kqueue で +27.3%、io_uring で −4.6% と正反対になった**ため、
 **ホットパス最適化は必ず両バックエンドで A/B を取ること**。
 
+## フルスイートの交互 A/B（`suite_ab.sh`、リリース間の退行確認）
+
+`run_perf.sh` はビルドを外側のループにするため、`BUILDS="base new"` では片方の全構成（約 4.5 時間）の後に
+もう片方を測ることになり、時間をまたいだ比較になる。`suite_ab.sh` は構成 1 つごとに `run_perf.sh` を呼んで
+2 つのイメージを続けて測り、構成ごとに順番を入れ替える（実行順の偏りを打ち消す）。
+
+```bash
+git worktree add /tmp/v070 v0.7.0 && (cd /tmp/v070 && docker build -f docker/Dockerfile.glibc -t veil:v070 .)
+docker build -f docker/Dockerfile.glibc -t veil:glibc .
+BASE=v070 NEW=glibc bash tools/perf/suite_ab.sh                                   # 約 4 時間（69 構成 × 2 イメージ × 3 反復）
+python3 tools/perf/suite_ab_summary.py tools/perf/results/suite_ab/<日時>.tsv v070 glibc
+```
+
+集計は (構成, プロトコル) ごとの rps 中央値の比（new / base）の分布と、0.95 未満の組・errors のある行の一覧。
+0.95 未満の組は単独で再計測して戻るかを見る（`CONFIG_GLOB` で絞って `suite_ab.sh` を再実行）。
+
 ## リーク試験（`leak_check.sh`、F-185）
 
 veil を 1 プロセス起動したまま、シナリオ（TLS の HTTP/1.1・HTTP/2 と h2c・HTTP/3 の 1 接続 1 要求の

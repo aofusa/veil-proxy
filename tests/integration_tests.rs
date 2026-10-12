@@ -1778,6 +1778,142 @@ path = "{d}/"
         );
     }
 
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// 平文 HTTP/1.1（メインリスナーのプロトコル検出）と h2c 専用リスナーを有効にして起動する。
+    /// 戻り値は子プロセス・メインのポート・h2c のポート。
+    fn start_plain(dir: &Path) -> (Child, u16, u16) {
+        std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+        let h2c = free_port();
+        let (child, port) = start_with(
+            dir,
+            &format!("tls_only = false\nh2c_enabled = true\nh2c_listen = \"127.0.0.1:{h2c}\""),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", h2c)).is_err() {
+            assert!(Instant::now() < deadline, "h2c listener did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        (child, port, h2c)
+    }
+
+    /// 相手が閉じるまで読み、読めたバイト列を返す（`limit` を過ぎたら None）。
+    fn read_until_eof(sock: &mut std::net::TcpStream, limit: Duration) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let deadline = Instant::now() + limit;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        while Instant::now() < deadline {
+            match sock.read(&mut buf) {
+                Ok(0) => return Some(out),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => return Some(out),
+            }
+        }
+        None
+    }
+
+    /// SIGTERM を送り、上限（既定 30 秒）を待たずに正常終了して全接続を閉じ終えたことを確かめる。
+    fn sigterm_and_expect_prompt_drain(child: &mut Child, dir: &Path) {
+        let t0 = Instant::now();
+        send(child, libc::SIGTERM);
+        let st = wait_exit(child, Duration::from_secs(25));
+        if st.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let log = log_of(dir);
+        let st = st.unwrap_or_else(|| panic!("veil did not exit after SIGTERM:\n{log}"));
+        assert!(st.success(), "veil did not exit cleanly: {st:?}\n{log}");
+        // ワーカーの accept は 1 秒のタイムアウトでフラグを見る。アイドル接続を待つと 30 秒かかる。
+        assert!(
+            t0.elapsed() < Duration::from_secs(8),
+            "shutdown waited for the idle keep-alive connection ({:?}):\n{log}",
+            t0.elapsed()
+        );
+        assert!(
+            !log.contains("Drain timeout") && log.contains("Server shutdown complete"),
+            "connections were not drained:\n{log}"
+        );
+    }
+
+    /// F-187: キープアライブで次の要求を待っているだけの HTTP/1.1 接続は、graceful shutdown で
+    /// すぐ閉じる（以前は `graceful_shutdown_timeout_secs` の 30 秒いっぱい待っていた）。
+    #[test]
+    fn sigterm_closes_idle_http11_keepalive() {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, port, _) = start_plain(dir.path());
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.write_all(b"GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let mut got = Vec::new();
+        while !got.ends_with(b"hi") {
+            let n = sock.read(&mut buf).expect("response");
+            assert!(n > 0, "connection closed before the response");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            got.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&got)
+        );
+
+        sigterm_and_expect_prompt_drain(&mut child, dir.path());
+        assert!(
+            read_until_eof(&mut sock, Duration::from_secs(5)).is_some(),
+            "the idle connection was not closed"
+        );
+    }
+
+    /// F-187 / B-119: 要求の無い h2c 接続は graceful shutdown で GOAWAY（NO_ERROR）を受けて閉じる。
+    #[test]
+    fn sigterm_sends_goaway_to_idle_h2c() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, _, h2c) = start_plain(dir.path());
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", h2c)).unwrap();
+        // プリフェース + 空の SETTINGS
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        sigterm_and_expect_prompt_drain(&mut child, dir.path());
+        let data = read_until_eof(&mut sock, Duration::from_secs(5))
+            .expect("the idle h2c connection was not closed");
+        // フレームを順にたどって GOAWAY（type 0x7）と、そのエラーコード NO_ERROR を探す
+        let mut pos = 0;
+        let mut goaway = None;
+        while pos + 9 <= data.len() {
+            let len = u32::from_be_bytes([0, data[pos], data[pos + 1], data[pos + 2]]) as usize;
+            let ty = data[pos + 3];
+            if ty == 0x7 && pos + 9 + 8 <= data.len() {
+                let p = pos + 9;
+                goaway = Some(u32::from_be_bytes([
+                    data[p + 4],
+                    data[p + 5],
+                    data[p + 6],
+                    data[p + 7],
+                ]));
+            }
+            pos += 9 + len;
+        }
+        assert_eq!(goaway, Some(0), "no GOAWAY(NO_ERROR) in {data:02x?}");
+    }
+
     #[test]
     fn sighup_reloads_without_exiting() {
         let dir = tempfile::tempdir().unwrap();

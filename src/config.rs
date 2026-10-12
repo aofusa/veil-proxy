@@ -2071,6 +2071,10 @@ pub async fn drain_connections(worker_type: &str, thread_id: usize) {
         return;
     }
 
+    // F-187: キープアライブで次の要求を待っているだけの接続（このワーカーが受け付けたもの）を
+    // すぐ閉じさせる。処理中の要求は待ち、応答を返して次の待ちに入った時点で閉じる。
+    crate::runtime::time::expire_idle_timeouts();
+
     let start = std::time::Instant::now();
     let drain_timeout = Duration::from_secs(timeout_secs);
 

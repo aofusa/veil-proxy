@@ -9,7 +9,7 @@ use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::OpenOptions;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
-use crate::runtime::time::timeout;
+use crate::runtime::time::{timeout, timeout_idle};
 use bytes::{Bytes, BytesMut};
 use ftlog::{debug, error, warn};
 use httparse::{Request, Status};
@@ -785,8 +785,26 @@ where
         } else if processed_any {
             // 進捗ありだが追加入力はまだ。drive へ戻る（fill しない）。
             continue;
+        } else if streams.is_empty() && !conn.has_partial_frame() {
+            // 処理中のストリームも分割フレームの続きも無い＝次の要求を待っているだけ。
+            // アイドルタイムアウト（B-119: 以前は無期限に待っていた）と graceful shutdown
+            // （F-187: `expire_idle_timeouts` で即座に満了）で GOAWAY を送って閉じる。
+            match timeout_idle(
+                IDLE_TIMEOUT,
+                true,
+                h2_select_readable_or_notify(conn.raw_fd(), &notify),
+            )
+            .await
+            {
+                Ok(readable) => readable,
+                Err(_) => {
+                    conn.close_with_goaway(http2::Http2ErrorCode::NoError, b"")
+                        .await;
+                    break;
+                }
+            }
         } else {
-            // idle: 可読 or notify を待つ。可読なら fill する。
+            // 処理中のストリームがある: 可読 or notify を待つ。可読なら fill する。
             h2_select_readable_or_notify(conn.raw_fd(), &notify).await
         };
 
@@ -5140,10 +5158,13 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
         // 持たせない。kqueue では先読みの EAGAIN と確認用 poll(2) も省ける）。
         let wait_first = !first_read && accumulated.is_empty();
         first_read = false;
-        if accumulated.is_empty() && accumulated.capacity() > 0 {
+        // F-187: 蓄積が空＝次の要求を待っているだけ。graceful shutdown ではこの待ちを即座に
+        // 打ち切って接続を閉じる（要求の途中まで届いている接続は待つ）。
+        let idle = accumulated.is_empty();
+        if idle && accumulated.capacity() > 0 {
             crate::pool::accum_buf_put(std::mem::take(&mut accumulated));
         }
-        let read_result = timeout(IDLE_TIMEOUT, async {
+        let read_result = timeout_idle(IDLE_TIMEOUT, idle, async {
             if wait_first {
                 tls_stream.wait_next_request().await?;
             }
