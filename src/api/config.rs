@@ -167,20 +167,28 @@ impl ConfigBuilder {
     }
 
     setter!(
-        /// `[server].listen`（例: `"0.0.0.0:8080"`）。
+        /// `[server].listen_cleartext`（平文 HTTP/1.1・h2c のリスナー。ライブラリ既定は `"0.0.0.0:8080"`）。
+        listen_cleartext, "server.listen_cleartext", v: &str => toml::Value::String(v.to_string())
+    );
+    setter!(
+        /// `[server].listen`（TLS のリスナー。`tls(cert, key)` と一緒に使う。F-200）。
         listen, "server.listen", v: &str => toml::Value::String(v.to_string())
+    );
+    setter!(
+        /// `[server].allow_http`（平文リスナーで HTTP/1.1 を受けるか）。
+        allow_http, "server.allow_http", v: bool => toml::Value::Boolean(v)
+    );
+    setter!(
+        /// `[server].allow_h2c`（平文リスナーで h2c を受けるか）。
+        allow_h2c, "server.allow_h2c", v: bool => toml::Value::Boolean(v)
+    );
+    setter!(
+        /// `[server].enable_secure_redirect`（平文リスナーの要求を https へ 301 で返すか）。
+        secure_redirect, "server.enable_secure_redirect", v: bool => toml::Value::Boolean(v)
     );
     setter!(
         /// `[server].threads`（ワーカースレッド数。既定は CPU 数）。
         threads, "server.threads", v: usize => toml::Value::Integer(v as i64)
-    );
-    setter!(
-        /// `[server].tls_only`。
-        tls_only, "server.tls_only", v: bool => toml::Value::Boolean(v)
-    );
-    setter!(
-        /// `[server].h2c_enabled`。
-        h2c_enabled, "server.h2c_enabled", v: bool => toml::Value::Boolean(v)
     );
     setter!(
         /// `[server].http2_enabled`（TLS の ALPN で h2 を選べるようにする）。
@@ -219,26 +227,16 @@ impl ConfigBuilder {
         handler_threads, "api.handler_threads", v: usize => toml::Value::Integer(v as i64)
     );
 
-    /// TLS を有効にする（`[tls]` を入れ、TLS リスナーで HTTP/1.1・h2（ALPN）を受ける）。
-    /// 平文の h2c 専用構成は解除する（`h2c_enabled = false`）。
-    pub fn tls(mut self, cert_path: &str, key_path: &str) -> Self {
-        for (p, v) in [
-            ("tls.cert_path", toml::Value::String(cert_path.to_string())),
-            ("tls.key_path", toml::Value::String(key_path.to_string())),
-            ("server.h2c_enabled", toml::Value::Boolean(false)),
-            ("server.h2c_http1", toml::Value::Boolean(false)),
-        ] {
-            self.config
-                .overrides
-                .push(ConfigOverride::from_parts(p, v).expect("static override path"));
-        }
-        self
+    /// TLS の証明書・秘密鍵（`[tls]`）。TLS のリスナーは `listen(addr)` で別に指定する（F-200）。
+    pub fn tls(self, cert_path: &str, key_path: &str) -> Self {
+        self.push("tls.cert_path", toml::Value::String(cert_path.to_string()))
+            .push("tls.key_path", toml::Value::String(key_path.to_string()))
     }
 
-    /// HTTP/3 を有効にする（要 TLS・`http3` feature）。
+    /// HTTP/3 を有効にする（要 `listen`・TLS・`http3` feature）。引数は UDP のアドレス。
     pub fn http3(mut self, listen: &str) -> Self {
         for (p, v) in [
-            ("server.http3_enabled", toml::Value::Boolean(true)),
+            ("http3.enabled", toml::Value::Boolean(true)),
             ("http3.listen", toml::Value::String(listen.to_string())),
         ] {
             self.config
@@ -324,9 +322,12 @@ mod tests {
     #[test]
     fn defaults_are_plaintext_on_8080_with_cpu_threads() {
         let v = Config::new().to_value().unwrap();
-        assert_eq!(v["server"]["listen"].as_str(), Some("0.0.0.0:8080"));
-        assert_eq!(v["server"]["h2c_enabled"].as_bool(), Some(true));
-        assert_eq!(v["server"]["h2c_http1"].as_bool(), Some(true));
+        assert_eq!(
+            v["server"]["listen_cleartext"].as_str(),
+            Some("0.0.0.0:8080")
+        );
+        assert_eq!(v["server"]["enable_secure_redirect"].as_bool(), Some(false));
+        assert!(v["server"].get("listen").is_none());
         assert_eq!(
             v["server"]["threads"].as_integer(),
             Some(num_cpus::get() as i64)
@@ -337,34 +338,43 @@ mod tests {
     #[test]
     fn inline_merges_over_defaults_and_builder_wins() {
         let cfg = Config::from_toml_str(
-            "[server]\nlisten = \"127.0.0.1:9000\"\n[logging]\nlevel = \"warn\"\n",
+            "[server]\nlisten_cleartext = \"127.0.0.1:9000\"\n[logging]\nlevel = \"warn\"\n",
         )
         .unwrap()
         .builder()
         .threads(3)
-        .listen("127.0.0.1:9100")
+        .listen_cleartext("127.0.0.1:9100")
         .set("api.openapi_enabled = false")
         .unwrap()
         .build();
         let v = cfg.to_value().unwrap();
-        assert_eq!(v["server"]["listen"].as_str(), Some("127.0.0.1:9100"));
+        assert_eq!(
+            v["server"]["listen_cleartext"].as_str(),
+            Some("127.0.0.1:9100")
+        );
         assert_eq!(v["server"]["threads"].as_integer(), Some(3));
         // インラインで書かなかったキーは既定が残る
-        assert_eq!(v["server"]["h2c_http1"].as_bool(), Some(true));
+        assert_eq!(v["server"]["enable_secure_redirect"].as_bool(), Some(false));
         assert_eq!(v["logging"]["level"].as_str(), Some("warn"));
         assert_eq!(v["api"]["openapi_enabled"].as_bool(), Some(false));
     }
 
     #[test]
-    fn tls_builder_switches_off_h2c_only_mode() {
+    fn tls_builder_sets_listen_and_certificate() {
         let v = Config::new()
             .builder()
+            .listen("0.0.0.0:8443")
             .tls("/c.pem", "/k.pem")
             .build()
             .to_value()
             .unwrap();
         assert_eq!(v["tls"]["cert_path"].as_str(), Some("/c.pem"));
-        assert_eq!(v["server"]["h2c_enabled"].as_bool(), Some(false));
+        assert_eq!(v["server"]["listen"].as_str(), Some("0.0.0.0:8443"));
+        // 平文のリスナーは既定のまま残る
+        assert_eq!(
+            v["server"]["listen_cleartext"].as_str(),
+            Some("0.0.0.0:8080")
+        );
     }
 
     #[test]

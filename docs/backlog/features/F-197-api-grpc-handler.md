@@ -1,6 +1,6 @@
 # F-197: API ライブラリでの gRPC 対応（prost + veil の gRPC 実装、tokio 非依存）
 
-**状態: 設計済み・未着手（design/f197-f200）**
+**状態: 進行中（feat/f197-f200-impl）**
 
 ## 要望
 

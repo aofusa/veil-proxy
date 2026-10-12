@@ -539,7 +539,7 @@ where
     let mut connection_metric = ActiveConnectionMetric::new(true);
 
     // カスタムリクエストハンドラーを使用してメインループ実行
-    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric).await;
+    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric, false).await;
 
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
@@ -560,6 +560,9 @@ async fn handle_http2_requests<S>(
     conn: &mut http2::Http2Connection<S>,
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
+    // F-200: 平文リスナー（`listen_cleartext`）で `enable_secure_redirect = true` のとき、
+    // すべての要求を https へ 301 で返す（TLS の接続は常に false）。
+    redirect_https: bool,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent
@@ -685,6 +688,7 @@ where
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
+                            redirect_https,
                         );
                     }
                     Ok(None) => {}
@@ -732,6 +736,7 @@ where
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
+                            redirect_https,
                         );
                     }
                 }
@@ -882,6 +887,8 @@ struct H2RequestCtx {
     client_ip: std::rc::Rc<str>,
     /// `client_ip` から解決した `SocketAddr`。接続確立時に 1 回だけ解決する（F-162）。
     client_socket_addr: SocketAddr,
+    /// 平文リスナーの `enable_secure_redirect`（F-200）。true なら要求を https へ 301 で返す。
+    redirect_https: bool,
     start: Instant,
 }
 
@@ -996,6 +1003,7 @@ fn h2_spawn_for_request<S>(
     client_ip: &std::rc::Rc<str>,
     client_socket_addr: SocketAddr,
     connection_metric: &mut ActiveConnectionMetric,
+    redirect_https: bool,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
@@ -1006,7 +1014,8 @@ fn h2_spawn_for_request<S>(
 
     // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
-    let plan = if body_pending {
+    // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
+    let plan = if body_pending && !redirect_https {
         h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
     } else {
         None
@@ -1050,6 +1059,7 @@ fn h2_spawn_for_request<S>(
         trailers: parts.trailers,
         client_ip: std::rc::Rc::clone(client_ip),
         client_socket_addr,
+        redirect_https,
         // アクセスログ・メトリクスが無効なら時刻を読まない（ストリームごとの固定費）。
         start: crate::logging::request_start_instant(),
     };
@@ -1585,6 +1595,16 @@ async fn h2_dispatch(
     let path = &ctx.path[..];
     let client_ip: &str = &ctx.client_ip;
 
+    // F-200: 平文リスナーの HTTPS リダイレクト。
+    if ctx.redirect_https {
+        let host = std::str::from_utf8(&ctx.authority).unwrap_or("");
+        let location =
+            crate::config::https_redirect_url(host, std::str::from_utf8(path).unwrap_or("/"));
+        let mut headers = h2_base_headers(false);
+        headers.push((Bytes::from_static(b"location"), Bytes::from(location)));
+        return h2_emit_full(resp_tx, notify, 301, headers, Bytes::new()).await;
+    }
+
     // 非疑似ヘッダーのみ（ルーティング・転送用）。
     let headers_raw: Vec<(&[u8], &[u8])> = ctx
         .headers
@@ -1824,6 +1844,7 @@ async fn h2_dispatch(
             trailers: ctx.trailers.clone(),
             client_ip: ctx.client_ip.clone(),
             client_socket_addr: ctx.client_socket_addr,
+            redirect_https: ctx.redirect_https,
             start: ctx.start,
         };
         &modified_ctx
@@ -4851,7 +4872,7 @@ pub async fn reject_h2c_invalid_preface(mut stream: TcpStream) {
     .await;
 }
 
-/// H2C 専用リスナーで受けた平文 HTTP/1.1 接続を処理する（`[server].h2c_http1 = true`）。
+/// 平文リスナー（`[server].listen_cleartext`）で受けた HTTP/1.1 接続を処理する（F-200）。
 ///
 /// プロトコル検出で読んだ先頭バイト列（`initial_data`）を平文ストリームに引き継ぎ、
 /// メインリスナーの `tls_only = false` 経路と同じ `handle_requests` で処理する。
@@ -4874,11 +4895,41 @@ pub async fn handle_plain_http1_connection(
     }
 }
 
+/// 平文リスナーで `allow_http = false` のとき HTTP/1.1 を 426 で断る（F-200）。
+///
+/// 未読データを残して close すると RST になるため、送信側を閉じてから上限付きで読み捨てる（B-102）。
+#[cfg(feature = "http2")]
+pub async fn reject_plain_http1(mut stream: TcpStream) {
+    const LINGER: Duration = Duration::from_millis(500);
+    const MAX_DRAIN: usize = 64 * 1024;
+    const RESP: &[u8] = b"HTTP/1.1 426 Upgrade Required\r\nUpgrade: TLS/1.2, HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = timeout(LINGER, stream.write_all(RESP.to_vec())).await;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = timeout(LINGER, async {
+        let mut drained = 0usize;
+        let mut buf = vec![0u8; 4096];
+        while drained < MAX_DRAIN {
+            let (res, b) = stream.read(buf).await;
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => drained += n,
+                _ => break,
+            }
+        }
+    })
+    .await;
+}
+
 /// H2Cサーバー接続処理
 ///
 /// TLSなしでHTTP/2コネクションを確立し、リクエストを処理します。
 #[cfg(feature = "http2")]
-pub async fn handle_h2c_connection(stream: TcpStream, client_ip: &str, initial_data: Vec<u8>) {
+pub async fn handle_h2c_connection(
+    stream: TcpStream,
+    client_ip: &str,
+    initial_data: Vec<u8>,
+    redirect_https: bool,
+) {
     use http2::Http2Connection;
 
     // HTTP/2設定を取得
@@ -4903,7 +4954,8 @@ pub async fn handle_h2c_connection(stream: TcpStream, client_ip: &str, initial_d
     let mut connection_metric = ActiveConnectionMetric::new(true);
 
     // 既存のHTTP/2リクエスト処理を使用
-    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric).await;
+    let result =
+        handle_http2_requests(&mut conn, client_ip, &mut connection_metric, redirect_https).await;
 
     if let Err(e) = result {
         warn!("[H2C] Connection error: {}", e);
@@ -4914,62 +4966,9 @@ pub async fn handle_h2c_connection(stream: TcpStream, client_ip: &str, initial_d
 
 // kTLS 有効時の接続処理（rustls + ktls2）
 #[cfg(veil_ktls)]
-pub async fn handle_connection(
-    #[cfg_attr(not(feature = "http2"), allow(unused_mut))] mut stream: TcpStream,
-    acceptor: RustlsAcceptor,
-    peer_addr: SocketAddr,
-) {
-    #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
-    let mut initial_buffer = None;
-
-    // H2Cが有効な場合、プロトコル検出を実行
-    #[cfg(feature = "http2")]
-    {
-        let config = CURRENT_CONFIG.load();
-        if config.h2c_enabled && !config.tls_only {
-            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
-            initial_buffer = Some(initial_data);
-
-            match protocol_type {
-                ProtocolType::H2C => {
-                    // H2Cサーバーハンドラー
-                    let client_ip = IpStr::new(peer_addr.ip());
-                    handle_h2c_connection(
-                        stream,
-                        client_ip.as_str(),
-                        initial_buffer.take().unwrap(),
-                    )
-                    .await;
-                    return;
-                }
-                ProtocolType::Http11 => {
-                    // HTTP/1.1ハンドラー（平文接続）
-                    // TLSハンドシェイクをスキップして、平文ストリームとして処理
-                    let plain_stream =
-                        match acceptor.accept_plain(stream, initial_buffer.take()).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("Failed to create plain stream: {}", e);
-                                return;
-                            }
-                        };
-                    let client_ip = IpStr::new(peer_addr.ip());
-                    handle_requests(plain_stream, client_ip.as_str(), peer_addr).await;
-                    return;
-                }
-                ProtocolType::TLS => {
-                    // TLSハンドシェイク（既存処理へ）
-                }
-                ProtocolType::Unknown => {
-                    warn!(
-                        "[H2C] Unknown protocol from {}, falling back to TLS",
-                        peer_addr
-                    );
-                    // 初期データは保持したままTLSハンドシェイクへ
-                }
-            }
-        }
-    }
+pub async fn handle_connection(stream: TcpStream, acceptor: RustlsAcceptor, peer_addr: SocketAddr) {
+    // F-200: TLS のリスナー（`[server].listen`）は常に TLS だけを受ける（平文は `listen_cleartext`）。
+    let initial_buffer = None;
 
     // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
@@ -5010,62 +5009,13 @@ pub async fn handle_connection(
 
 // kTLS 無効時の接続処理（rustls のみ）
 #[cfg(not(veil_ktls))]
-#[cfg_attr(not(feature = "http2"), allow(unused_mut))]
 pub async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     acceptor: simple_tls::SimpleTlsAcceptor,
     peer_addr: SocketAddr,
 ) {
-    let mut initial_buffer = None;
-
-    // H2Cが有効な場合、プロトコル検出を実行
-    #[cfg(feature = "http2")]
-    {
-        let config = CURRENT_CONFIG.load();
-        if config.h2c_enabled && !config.tls_only {
-            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
-            initial_buffer = Some(initial_data);
-
-            match protocol_type {
-                ProtocolType::H2C => {
-                    // H2Cサーバーハンドラー
-                    let client_ip = IpStr::new(peer_addr.ip());
-                    handle_h2c_connection(
-                        stream,
-                        client_ip.as_str(),
-                        initial_buffer.take().unwrap(),
-                    )
-                    .await;
-                    return;
-                }
-                ProtocolType::Http11 => {
-                    // HTTP/1.1ハンドラー（平文接続）
-                    // TLSハンドシェイクをスキップして、平文ストリームとして処理
-                    let plain_stream =
-                        match acceptor.accept_plain(stream, initial_buffer.take()).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("Failed to create plain stream: {}", e);
-                                return;
-                            }
-                        };
-                    let client_ip = IpStr::new(peer_addr.ip());
-                    handle_requests(plain_stream, client_ip.as_str(), peer_addr).await;
-                    return;
-                }
-                ProtocolType::TLS => {
-                    // TLSハンドシェイク（既存処理へ）
-                }
-                ProtocolType::Unknown => {
-                    warn!(
-                        "[H2C] Unknown protocol from {}, falling back to TLS",
-                        peer_addr
-                    );
-                    // 初期データは保持したままTLSハンドシェイクへ
-                }
-            }
-        }
-    }
+    // F-200: TLS のリスナー（`[server].listen`）は常に TLS だけを受ける（平文は `listen_cleartext`）。
+    let initial_buffer = None;
 
     // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
