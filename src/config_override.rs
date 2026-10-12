@@ -72,6 +72,20 @@ pub fn global_overrides() -> &'static [ConfigOverride] {
     GLOBAL_OVERRIDES.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
+/// VDS（F-04、`vds` feature）で配信されたスナップショット（`route` 配列・`upstreams` 表）。
+/// 設定ファイルの上、環境変数・CLI の上書きの下に当てる。
+#[cfg(feature = "vds")]
+static VDS_OVERLAY: once_cell::sync::Lazy<arc_swap::ArcSwapOption<toml::Value>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwapOption::from(None));
+
+/// VDS オーバーレイを差し替え、前の値を返す（失敗時に戻すため）。
+#[cfg(feature = "vds")]
+pub fn swap_vds_overlay(
+    overlay: Option<std::sync::Arc<toml::Value>>,
+) -> Option<std::sync::Arc<toml::Value>> {
+    VDS_OVERLAY.swap(overlay)
+}
+
 /// API ライブラリ（`handler` feature）の設定フック。`--override`・環境変数を当てた後の TOML 値木に
 /// ライブラリ既定設定のマージ・ビルダの上書き・ハンドラルートの注入を行う（`api::config` が設定する）。
 #[cfg(feature = "handler")]
@@ -446,12 +460,22 @@ where
     let hook = LIBRARY_HOOK.get();
     #[cfg(not(feature = "handler"))]
     let hook: Option<&()> = None;
-    if overrides.is_empty() && hook.is_none() {
+    #[cfg(feature = "vds")]
+    let vds = VDS_OVERLAY.load_full();
+    #[cfg(not(feature = "vds"))]
+    let vds: Option<()> = None;
+    if overrides.is_empty() && hook.is_none() && vds.is_none() {
         return toml::from_str::<T>(s).map_err(|e| format!("TOML parse error: {}", e));
     }
 
     let mut root: toml::Value =
         toml::from_str(s).map_err(|e| format!("TOML parse error: {}", e))?;
+
+    // 優先順位: ファイル < VDS < 環境変数 < CLI（< ライブラリのビルダ上書き）
+    #[cfg(feature = "vds")]
+    if let Some(ov) = vds.as_deref() {
+        crate::vds::apply_overlay(&mut root, ov);
+    }
 
     for ov in overrides {
         apply_override(&mut root, ov)

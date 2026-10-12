@@ -277,6 +277,10 @@ access-log = []
 # ビルド方法: cargo build --features l4-proxy
 l4-proxy = []
 
+# VDS（Veil Discovery Service、F-04）: 制御プレーンからルート・アップストリームを動的に配信する
+# （xDS の REST-JSON / State-of-the-World 相当の長輪詢）。専用スレッドで動き、データプレーンには触れない。
+vds = ["dep:serde_json"]
+
 # ====================
 # API サーバ基盤ライブラリ（F-188〜F-192）。veil を他のアプリにライブラリとして組み込む用途。
 # いずれも default・full* に含めない（本体ビルドにライブラリ用コードを入れない）。
@@ -323,6 +327,7 @@ full = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 # BSD 向けの全機能ビルド（packaging 用）
@@ -371,6 +376,7 @@ full-freebsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 # OpenBSD: システムアロケータ（global_allocator を差し替えない）を使う。
@@ -390,6 +396,7 @@ full-openbsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 # NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
@@ -413,6 +420,7 @@ full-netbsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 # Windows: veil-alloc（unix 専用）の代わりに mimalloc を使う（F-184）。
@@ -428,6 +436,7 @@ full-windows = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 # macOS: mimalloc・veil-alloc を使わずシステムアロケータ（libmalloc）を使う（F-184）。
@@ -443,6 +452,7 @@ full-macos = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
 ]
 
 full-container = [
@@ -455,6 +465,7 @@ full-container = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vds",
     "epoll",
 ]
 

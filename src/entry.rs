@@ -549,6 +549,10 @@ pub fn run_server(opts: ServerOptions) {
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
 
+    // F-04: VDS（制御プレーンからの動的設定配信）。`[vds] enabled = true` のときだけ専用スレッドを起動する。
+    #[cfg(feature = "vds")]
+    crate::vds::spawn_if_enabled(config_path.clone());
+
     // グローバルプロキシキャッシュの初期化
     // デフォルト設定でグローバルキャッシュを初期化（各ルートのcache設定で有効化される）
     let global_cache_config = crate::cache::CacheConfig {

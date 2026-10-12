@@ -397,3 +397,132 @@ fn f188_missing_tls_is_rejected_unless_plaintext_only() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ===================== F-04 VDS =====================
+
+/// 参照制御プレーン（tools/vds/vds_server.py）からルートを配信し、反映・NACK・トークン認証を確かめる。
+#[cfg(feature = "vds")]
+#[test]
+fn f04_vds_delivers_routes_and_keeps_previous_on_nack() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [("base", "base"), ("a", "A"), ("b", "B")] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.html"), body).unwrap();
+    }
+    let snap = dir.path().join("snapshot.toml");
+    let route = |p: &std::path::Path| {
+        format!(
+            "[[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"File\"\npath = \"{}\"\n",
+            p.display()
+        )
+    };
+    std::fs::write(&snap, route(&dir.path().join("a"))).unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "s3cret\n").unwrap();
+
+    let cp_port = free_port();
+    let cp = ChildGuard(
+        std::process::Command::new("python3")
+            .arg("-I")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tools/vds/vds_server.py"
+            ))
+            .arg("--snapshot")
+            .arg(&snap)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{}", cp_port))
+            .arg("--token-file")
+            .arg(&token)
+            .arg("--hold")
+            .arg("5")
+            .arg("--watch-interval")
+            .arg("0.2")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("python3 is required for the VDS E2E"),
+    );
+    assert!(wait_for_port(cp_port, Duration::from_secs(10)));
+
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+h2c_enabled = true
+h2c_http1 = true
+[logging]
+level = "info"
+[vds]
+enabled = true
+server = "http://127.0.0.1:{cp_port}"
+node_id = "e2e"
+token_file = "{token}"
+poll_timeout_secs = 5
+retry_initial_ms = 100
+{base_route}"#,
+        token = token.display(),
+        base_route = route(&dir.path().join("base")),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    let body_is = |want: &'static str| {
+        move || {
+            http1_get(port, "/index.html")
+                .map(|r| r.text() == want)
+                .unwrap_or(false)
+        }
+    };
+    assert!(
+        wait_until(Duration::from_secs(15), body_is("A")),
+        "VDS snapshot A not applied; log:\n{}",
+        veil.log()
+    );
+
+    // 配信内容を変える → 新しいリクエストに反映される
+    std::fs::write(&snap, route(&dir.path().join("b"))).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), body_is("B")),
+        "VDS snapshot B not applied; log:\n{}",
+        veil.log()
+    );
+
+    // 不正な版（存在しないディレクトリ）→ NACK され、前の版（B）のまま
+    std::fs::write(&snap, route(&dir.path().join("missing"))).unwrap();
+    let nacked = wait_until(Duration::from_secs(15), || {
+        http1_get(cp_port, "/v1/status")
+            .map(|r| r.text().contains("\"nacks\": 1") || r.text().contains("\"nacks\":1"))
+            .unwrap_or(false)
+    });
+    assert!(nacked, "NACK not reported; log:\n{}", veil.log());
+    assert!(body_is("B")(), "previous snapshot must stay after NACK");
+
+    // 直すと再び反映される
+    std::fs::write(&snap, route(&dir.path().join("a"))).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), body_is("A")),
+        "{}",
+        veil.log()
+    );
+    drop(cp);
+}
+
+/// 子プロセスを Drop で止める。
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}

@@ -176,6 +176,9 @@ pub mod listen_addr;
 pub mod config;
 pub mod config_override;
 pub mod tls_reload;
+/// VDS（Veil Discovery Service）: 制御プレーンからの動的設定配信（F-04）。
+#[cfg(feature = "vds")]
+pub mod vds;
 pub use crate::config::*;
 pub mod fuzz_api;
 /// HTTP/3 / QPACK ワイヤ純関数パーサ（F-112、ホットパス外・ファジング用）。

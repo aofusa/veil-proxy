@@ -6893,7 +6893,7 @@ fn read_config_source(path: &Path) -> io::Result<String> {
 /// 空文字（= ライブラリ既定設定とコード側の上書きだけで起動する）を返す。
 // 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
 #[allow(clippy::disallowed_methods)]
-fn read_config_text(path: &Path) -> io::Result<String> {
+pub(crate) fn read_config_text(path: &Path) -> io::Result<String> {
     #[cfg(feature = "handler")]
     if crate::config_override::library_mode() && !path.exists() {
         return Ok(String::new());
