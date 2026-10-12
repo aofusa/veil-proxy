@@ -57,6 +57,52 @@ pub(crate) fn request_body_channel(
     (tx, Arc::new(Mutex::new(Some(RequestBodyStream { rx }))))
 }
 
+/// 送出側が 1 回にまとめる本文の上限（HTTP/2 の既定 DATA フレーム長に合わせる）。
+pub(crate) const COALESCE_MAX: usize = 16 * 1024;
+
+/// 既に用意できている後続の `Data` を `max` バイトまで `first` に連結する（待たない）。
+///
+/// 小さな断片（gRPC の小さなメッセージ等）を 1 つずつ送るとフレーム数・syscall が断片の数だけ増え、
+/// クライアントが取り消した直後に届く大量のフレームを相手が攻撃と見なす（h2 の
+/// `max_local_error_reset_streams`）。連結できない要素（トレーラ・中断・上限を超える断片）は `carry` に返す。
+pub(crate) fn coalesce(
+    first: Bytes,
+    stream: &mut BodyStream,
+    max: usize,
+    carry: &mut Option<BodyChunk>,
+) -> Bytes {
+    use futures::{FutureExt, StreamExt};
+    if first.len() >= max {
+        return first;
+    }
+    let mut buf: Option<bytes::BytesMut> = None;
+    let mut len = first.len();
+    loop {
+        match stream.next().now_or_never() {
+            Some(Some(BodyChunk::Data(b))) if b.is_empty() => {}
+            Some(Some(BodyChunk::Data(b))) if len + b.len() <= max => {
+                let out = buf.get_or_insert_with(|| {
+                    let mut m = bytes::BytesMut::with_capacity(max);
+                    m.extend_from_slice(&first);
+                    m
+                });
+                out.extend_from_slice(&b);
+                len += b.len();
+            }
+            Some(Some(other)) => {
+                *carry = Some(other);
+                break;
+            }
+            // 終端（None）は次の `next()` でもう一度 None が返る
+            Some(None) | None => break,
+        }
+    }
+    match buf {
+        Some(b) => b.freeze(),
+        None => first,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +121,23 @@ mod tests {
             assert_eq!(rx.next().await.as_deref(), Some(&b"b"[..]));
             assert!(rx.next().await.is_none());
         });
+    }
+
+    #[test]
+    fn coalesce_merges_ready_chunks_and_carries_the_rest() {
+        let mut s: BodyStream = Box::pin(futures::stream::iter(vec![
+            BodyChunk::Data(Bytes::from_static(b"bb")),
+            BodyChunk::Data(Bytes::from_static(b"cc")),
+            BodyChunk::Data(Bytes::from_static(b"dddddd")),
+            BodyChunk::Trailers(vec![]),
+        ]));
+        let mut carry = None;
+        let out = coalesce(Bytes::from_static(b"aa"), &mut s, 6, &mut carry);
+        assert_eq!(&out[..], b"aabbcc");
+        assert!(matches!(carry.take(), Some(BodyChunk::Data(b)) if &b[..] == b"dddddd"));
+        let out = coalesce(Bytes::from_static(b"x"), &mut s, 6, &mut carry);
+        assert_eq!(&out[..], b"x");
+        assert!(matches!(carry, Some(BodyChunk::Trailers(_))));
     }
 
     #[test]

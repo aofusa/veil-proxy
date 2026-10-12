@@ -1,0 +1,28 @@
+# veil の gRPC サーバ（F-197、examples/api/rust-grpc）の相互運用試験クライアント。
+# テスト専用なので tonic・tokio を使う（veil 本体・サンプルのサーバは tokio・tonic を使わない）。
+# HTTP/3 は quinn + h3 で gRPC のフレームを直接組む（tonic は HTTP/3 を話さない）。
+#
+#   cargo run -- --h2c 127.0.0.1:50051 [--h3 127.0.0.1:50443]
+[package]
+name = "veil-grpc-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tonic = { version = "0.12", features = ["gzip"] }
+tonic-health = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls"] }
+rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
+bytes = "1"
+http = "1"
+
+[build-dependencies]
+tonic-build = "0.12"

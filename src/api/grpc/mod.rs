@@ -16,6 +16,14 @@
 
 pub mod health;
 
+/// `veil-build` が `OUT_DIR` に書いた `<package>.rs` を取り込む（`veil::include_proto!("helloworld");`）。
+#[macro_export]
+macro_rules! include_proto {
+    ($package:literal) => {
+        include!(concat!(env!("OUT_DIR"), "/", $package, ".rs"));
+    };
+}
+
 use super::app::App;
 use super::handler::{HandlerFn, HandlerFuture, OperationMeta};
 use super::request::HttpVersion;
@@ -632,12 +640,40 @@ fn once<T: Send + 'static>(
     futures::stream::once(futures::future::ready(Ok(m)))
 }
 
-fn grpc_route(app: App, path: &str, func: HandlerFn) -> App {
+fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
     let meta = OperationMeta {
         operation_id: path.trim_start_matches('/').replace(['/', '.'], "_"),
         hidden: true,
         ..Default::default()
     };
+    // 同じサービスの未定義メソッドは UNIMPLEMENTED（既定の 404 では gRPC のクライアントが本文を
+    // メッセージとして読もうとして INTERNAL になる）。定義済みのメソッドの方が具体的なので優先される。
+    if let Some(service) = path
+        .strip_prefix('/')
+        .and_then(|p| p.split_once('/'))
+        .map(|(svc, _)| svc)
+    {
+        let fallback = format!("/{}/{{*method}}", service);
+        if !app.routes.iter().any(|r| r.path == fallback) {
+            let func: HandlerFn = Arc::new(|req: super::request::Request| -> HandlerFuture {
+                Box::pin(async move {
+                    match accept(&req) {
+                        Ok(_) => trailers_only(&Status::unimplemented(format!(
+                            "method {} is not implemented",
+                            req.path()
+                        ))),
+                        Err(r) => r,
+                    }
+                })
+            });
+            let meta = OperationMeta {
+                operation_id: format!("{}_unimplemented", service.replace('.', "_")),
+                hidden: true,
+                ..Default::default()
+            };
+            app = app.route_fn(&meta.operation_id.clone(), &["POST"], &fallback, func, meta);
+        }
+    }
     app.route_fn_streaming(path, &["POST"], path, func, meta)
 }
 

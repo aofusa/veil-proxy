@@ -89,7 +89,8 @@ impl Response {
             status,
             headers: Vec::new(),
             body: Bytes::new(),
-            stream: Some(Box::pin(body)),
+            // fuse: 送出側は終端の後にもう一度 poll することがある（`stream::coalesce`）
+            stream: Some(Box::pin(futures::StreamExt::fuse(body))),
         }
     }
 

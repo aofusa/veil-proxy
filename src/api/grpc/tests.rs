@@ -308,10 +308,35 @@ fn server_streaming_error_mid_stream() {
 }
 
 #[test]
+fn unknown_method_of_service_is_unimplemented() {
+    let app = echo_app();
+    let fallback = app
+        .routes
+        .iter()
+        .find(|r| r.path == "/pkg.Svc/{*method}")
+        .expect("fallback route")
+        .func
+        .clone();
+    let resp = futures::executor::block_on(fallback(grpc_request(HttpVersion::Http2, vec![], &[])));
+    assert_eq!(
+        field(&resp.headers().to_vec(), "grpc-status"),
+        Some(&b"12"[..])
+    );
+}
+
+#[test]
 fn health_check_and_watch() {
     let app = App::new().grpc_health();
-    let check = app.routes[0].func.clone();
-    let watch = app.routes[1].func.clone();
+    let func = |p: &str| {
+        app.routes
+            .iter()
+            .find(|r| r.path == p)
+            .unwrap()
+            .func
+            .clone()
+    };
+    let check = func("/grpc.health.v1.Health/Check");
+    let watch = func("/grpc.health.v1.Health/Watch");
     let (_, data, _) = collect(futures::executor::block_on(check(grpc_request(
         HttpVersion::Http2,
         vec![frame(&HealthCheckRequest::default())],

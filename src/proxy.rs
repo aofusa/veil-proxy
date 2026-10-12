@@ -1321,6 +1321,14 @@ where
             // 残り得る。そのクレジットが conn レベルに滞留しないよう補充する。
             if st.req_streaming {
                 conn.replenish_recv_window(sid);
+                // 応答を送り終えたのに要求本文がまだ届いている（上限超過で早期に応答した等）:
+                // RST_STREAM(NO_ERROR) で送信を止めてもらう（RFC 9113 §8.1）。
+                if !st.req_eof && st.end_sent {
+                    conn.flush_write_buf().await?;
+                    let _ = conn
+                        .send_rst_stream(sid, http2::Http2ErrorCode::NoError)
+                        .await;
+                }
             }
         }
     }
@@ -2091,10 +2099,24 @@ async fn h2_api_respond(
     use crate::api::stream::BodyChunk;
     use futures::StreamExt;
     let mut sent = 0u64;
-    while let Some(chunk) = stream.next().await {
+    let mut carry: Option<BodyChunk> = None;
+    loop {
+        let chunk = match carry.take() {
+            Some(c) => c,
+            None => match stream.next().await {
+                Some(c) => c,
+                None => break,
+            },
+        };
         let msg = match chunk {
             BodyChunk::Data(b) if b.is_empty() => continue,
             BodyChunk::Data(b) => {
+                let b = crate::api::stream::coalesce(
+                    b,
+                    &mut stream,
+                    crate::api::stream::COALESCE_MAX,
+                    &mut carry,
+                );
                 sent += b.len() as u64;
                 H2RespMsg::Body(b)
             }
@@ -4996,7 +5018,7 @@ pub async fn reject_h2c_invalid_preface(mut stream: TcpStream) {
 /// 平文リスナー（`[server].listen_cleartext`）で受けた HTTP/1.1 接続を処理する（F-200）。
 ///
 /// プロトコル検出で読んだ先頭バイト列（`initial_data`）を平文ストリームに引き継ぎ、
-/// メインリスナーの `tls_only = false` 経路と同じ `handle_requests` で処理する。
+/// TLS 接続と同じ `handle_requests` で処理する。
 #[cfg(feature = "http2")]
 pub async fn handle_plain_http1_connection(
     stream: TcpStream,
@@ -6613,10 +6635,24 @@ async fn write_api_chunked(
     use futures::StreamExt;
     let mut sent = 0u64;
     let mut trailers: Vec<(Bytes, Bytes)> = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    let mut carry: Option<BodyChunk> = None;
+    loop {
+        let chunk = match carry.take() {
+            Some(c) => c,
+            None => match stream.next().await {
+                Some(c) => c,
+                None => break,
+            },
+        };
         match chunk {
             BodyChunk::Data(b) if b.is_empty() => {}
             BodyChunk::Data(b) => {
+                let b = crate::api::stream::coalesce(
+                    b,
+                    &mut stream,
+                    crate::api::stream::COALESCE_MAX,
+                    &mut carry,
+                );
                 let mut prefix = Vec::with_capacity(12);
                 let _ = std::io::Write::write_fmt(&mut prefix, format_args!("{:x}\r\n", b.len()));
                 sent += b.len() as u64;

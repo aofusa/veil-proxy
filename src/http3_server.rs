@@ -2075,10 +2075,24 @@ impl H3BufferedTask {
         })
         .await?;
         let mut sent = 0usize;
-        while let Some(chunk) = stream.next().await {
+        let mut carry: Option<BodyChunk> = None;
+        loop {
+            let chunk = match carry.take() {
+                Some(c) => c,
+                None => match stream.next().await {
+                    Some(c) => c,
+                    None => break,
+                },
+            };
             match chunk {
                 BodyChunk::Data(b) if b.is_empty() => {}
                 BodyChunk::Data(b) => {
+                    let b = crate::api::stream::coalesce(
+                        b,
+                        &mut stream,
+                        crate::api::stream::COALESCE_MAX,
+                        &mut carry,
+                    );
                     sent += b.len();
                     self.send_msg(RespMsg::Body(b)).await?;
                 }

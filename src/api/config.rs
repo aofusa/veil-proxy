@@ -226,6 +226,10 @@ impl ConfigBuilder {
         /// `[api].handler_threads`（ブロッキングなハンドラ・Python・C の実行プールのスレッド数）。
         handler_threads, "api.handler_threads", v: usize => toml::Value::Integer(v as i64)
     );
+    setter!(
+        /// `[api].grpc_max_message_size`（gRPC の受信メッセージ上限、既定 4MiB。F-197）。
+        grpc_max_message_size, "api.grpc_max_message_size", v: usize => toml::Value::Integer(v as i64)
+    );
 
     /// TLS の証明書・秘密鍵（`[tls]`）。TLS のリスナーは `listen(addr)` で別に指定する（F-200）。
     pub fn tls(self, cert_path: &str, key_path: &str) -> Self {
