@@ -129,3 +129,8 @@ enabled = false                   # true なら listen と同じアドレス（U
   その後、kind（`veil:musl-k8s` で plain・Istio・Linkerd、全 35 項目）と `examples/container/e2e.sh`（Docker secrets の TLS・
   `VEIL_OVERRIDE`・証明書の差し替え・graceful stop）も通過。F-197〜F-199 を載せた最終状態で lib 1053・integration 60・
   standalone_e2e 15（io_uring / epoll）・E2E 565（io_uring / epoll）・library_e2e 77 項目を再確認。
+- 性能（main との交互 A/B、glibc イメージ、各側は自分の作業ツリーの設定を使う。`docs/artifacts/perf_ab_f197_f200*.tsv`）:
+  TLS 静的配信 h1/h2・TLS プロキシ h1/h2・h2c 静的配信・h2c プロキシ・HTTP/3 プロキシ・gRPC の中央値の差は −0.3%〜+2.8%
+  （h2c プロキシは 18 サンプルで −0.2%、gRPC は修正後 4 ラウンドで +0.3%）で、退行なし。B-121 の修正が DATA ごとにストリーム表を
+  2 回引いていたのは 1 回にまとめた。RSS は `listen_cleartext` が全ワーカーで受け付けるぶん（旧 `http` は 1 スレッド）、
+  TLS + リダイレクト構成で数 MB 増える（ガイドに記載）。
