@@ -31,6 +31,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 - [Python](#python)
 - [ライブラリ成果物のビルド](#ライブラリ成果物のビルド)
 - [性能](#性能)
+- [対応プラットフォーム](#対応プラットフォーム)
 - [テスト](#テスト)
 - [制限事項](#制限事項)
 
@@ -451,6 +452,8 @@ veil のランタイム（current-thread または multi-thread）を起動し�
   `lookup_host`）、`sync`（mpsc・oneshot・watch・broadcast・`Mutex`・`RwLock`・`Semaphore`・`Notify`・`Barrier`・
   `OnceCell`・`SetOnce`）、`signal`、`fs`、`select!`/`join!`/`try_join!`/`pin!`、`runtime::{Runtime, Builder, Handle}`。
 - 非対応: `process`、ランタイムのメトリクス、タスクダンプ・トレースのフック、io_uring を使う `fs`、Windows の名前付きパイプ。
+  **Windows** ではまだ `net` と `signal` がありません（F-204）。自分でソケットを開くクレート（hyper・axum のサーバ、reqwest、
+  sqlx）は Windows ではシムの上でビルドできません。`tokio_service` で載せるサービスは動きます。
   これらや tokio の内部を必要とするクレートは `tokio-compat-bridge` を使ってください。
 
 ### 互換性
@@ -476,7 +479,8 @@ tokio 自身のテスト（tokio 1.53.2 の `tokio/tests/*.rs`）をシムに対
 `Interest::ERROR`/`PRIORITY` の準備待ちと、ランタイムを drop した時点で待っていた Future の起床です。ファイルごとの結果は
 スクリプトを実行すると `docs/artifacts/tokio_compat_results.md` に出力されます。
 
-実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（io_uring と epoll）: hyper のサーバ（HTTP/1.1 + h2c）と
+実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（Linux の io_uring と epoll、macOS・FreeBSD・OpenBSD・NetBSD の
+kqueue のリアクタ。[対応プラットフォーム](#対応プラットフォーム)）: hyper のサーバ（HTTP/1.1 + h2c）と
 クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、axum 0.8（`axum::serve`・抽出子・State・
 graceful shutdown）、sqlx（SQLite・PostgreSQL）。
 
@@ -627,6 +631,7 @@ veil をライブラリとして使う場合（`handler` feature を含むビル
 
 ```rust
 // veil 専用アロケータ（unix。`veil-alloc` は `full` に含まれる）
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 
@@ -635,13 +640,14 @@ static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ```
 
-何も宣言しなければ Rust のシステムアロケータになります。`veil` バイナリ（`handler` 無しのビルド）は従来どおり
+何も宣言しなければ Rust のシステムアロケータになります（Windows では上の例もこれになります）。`veil` バイナリ（`handler` 無しのビルド）は従来どおり
 アロケータを選びます。`examples/api/rust-showcase` は `VeilAlloc` を宣言しています。
 
 アロケータ feature は排他です（[メモリアロケータ](performance.md#メモリアロケータf-183)を参照）。
 C と Python のビルド（[`veil-capi`](../../../crates/veil-capi/README.md)・[`veil-python`](../../../crates/veil-python/README.md)）は
 アロケータ feature を一切有効にしないので、ホストプロセス（C プログラムや Python インタプリタ）のアロケータを置き換えません。
-また io_uring ではなく epoll（readiness リアクタ）バックエンドでビルドされ、gRPC・WASM・VDS・ACME は含みません。
+Linux では io_uring ではなく epoll（readiness リアクタ）バックエンドでビルドされ、他の OS は既定のリアクタ（kqueue・WSAPoll）です。
+gRPC・WASM・VDS・ACME は含みません。
 
 ## C API
 
@@ -669,6 +675,11 @@ gcc hello.c -Icrates/veil-capi/include -Ltarget/release -lveil -lpthread -ldl -l
     -Wl,-rpath,$PWD/target/release -o hello          # 動的リンク
 gcc hello.c -Icrates/veil-capi/include target/release/libveil.a -lpthread -ldl -lm -o hello   # 静的リンク
 ```
+
+他の OS では動的ライブラリは `libveil.dylib`（macOS）・`veil.dll` + `veil.dll.lib`（Windows、MSVC）で、静的リンクに要る
+システムライブラリも違います（OpenBSD・NetBSD に `libdl` は無い、Windows は `ws2_32.lib` 等）。一覧は rustc に聞けます:
+`cargo rustc -p veil-capi --release --crate-type staticlib -- --print native-static-libs`
+（`examples/api/c-hello/Makefile` は `LIBS=...` で受け取ります。MSVC のコマンドラインは `tests/api/library_e2e.sh` にあります）。
 
 **スレッドモデル。** 既定ではコールバックは **ハンドラ用プール**（`[api] handler_threads`）で実行されるので、ブロックしてもかまいません（DB・ファイル）。
 ただし **複数のスレッドから同時に呼ばれる** ので、共有データを保護し、`user_data` をスレッドセーフにしてください。
@@ -781,6 +792,24 @@ FastAPI 0.143・uvicorn 0.54（uvloop・httptools）・pydantic 2。uvicorn の�
 ただし Python のハンドラは GIL で直列化されるので、1 プロセスではコア数に比例して伸びません。`offload=True` は GIL を
 待つ間もイベントループを止めませんが、ハンドラ用プールへの受け渡しのぶん p99 が高くなります。
 
+## 対応プラットフォーム
+
+ライブラリ（Rust・C・Python）と gRPC サーバ・VDS を、各 OS で `tests/api/library_e2e.sh` と `tests/standalone_e2e.rs` により
+確認しました（F-203、2026-10）。
+
+| OS | プロキシと VDS（`standalone_e2e`） | Rust の API | gRPC（h2c・h3） | C | Python | `veil::tokio` の実ライブラリ |
+|---|---|---|---|---|---|---|
+| Linux x86_64（io_uring・epoll） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓（PostgreSQL を含む） |
+| macOS 15 arm64（kqueue） | ✓ | ✓ | ✓ | ✓（clang） | ✓ | ✓ |
+| FreeBSD 14.3 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| OpenBSD 7.9 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| NetBSD 10.1 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Windows 11 x86_64（WSAPoll） | ✓（SIGHUP・Secret の差し替えの試験を除く） | ✓（SIGHUP を除く） | ✓ | ✓（MSVC） | ✓ | –（`net` が無い。F-204） |
+
+- **Windows** にはシグナルがありません。SIGHUP による設定の再読み込みと SIGTERM による graceful shutdown は使えません
+  （Ctrl-C で止まります）。`veil::tokio` には Windows ではまだ `net`・`signal` がありません（[tokio 互換](#tokio-互換)）。
+- C のライブラリは OS のツールチェーン（cc/clang、Windows は MSVC）でビルドします。リンクは [C API](#c-api) を参照してください。
+
 ## テスト
 
 ```bash
@@ -788,8 +817,10 @@ tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # 既定: al
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
-OpenAPI・tower・GraphQL・L4 エコー・ストリーミング・HTTP/1.1 と h2c）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
-cargo・gcc・curl・nc・python3 が必要です。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
+OpenAPI・tower・GraphQL・L4 エコー・ストリーミング・HTTP/1.1 と h2c）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
+Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
+cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
+（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
 [テスト](testing.md)も参照してください。
 
 ## 制限事項

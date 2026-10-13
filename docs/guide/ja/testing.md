@@ -139,7 +139,7 @@ cargo bench --bench wasm --features wasm
 | 対象 | コマンド | 内容 |
 |------|---------|------|
 | プロセス単位の挙動 | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>`（SIGHUP・CLI 優先含む）、Kubernetes Secret 形式の証明書差し替え、平文専用サーバと `allow_http` / `allow_h2c` / `enable_secure_redirect`（`listen_cleartext`）、削除されたキーのエラー、リスナーの検証規則、参照制御プレーンを使った VDS |
-| API ライブラリ | `tests/api/library_e2e.sh [rust\|c\|python\|nonregression\|all]` | Rust の総合例（マクロ・検証・OpenAPI・tower 層・GraphQL・L4 ハンドラ・config.toml 無しの既定）、C（共有・静的）、Python、`full` バイナリにライブラリのコードが無いこと |
+| API ライブラリ | `tests/api/library_e2e.sh [rust\|grpc\|c\|python\|nonregression\|all]` | Rust の総合例（マクロ・検証・OpenAPI・tower 層・GraphQL・L4 ハンドラ・config.toml 無しの既定）、gRPC の相互運用（Linux は io_uring と epoll）、C（共有・静的）、Python、`full` バイナリにライブラリのコードが無いこと。Linux・macOS・BSD・Windows（Git Bash）で動く（[対応プラットフォーム](library.md#対応プラットフォーム)） |
 | ACME | `tests/acme/pebble_e2e.sh` | Pebble から HTTP-01 で発行してホットリロード（docker が必要） |
 | コンテナ | `examples/container/e2e.sh` | Docker secrets・環境変数の上書き・証明書の差し替え・graceful stop（ビルド済みイメージが必要） |
 | Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | kind 上の Istio / Linkerd メッシュ内のサイドカー（[kubernetes.md](kubernetes.md)） |
