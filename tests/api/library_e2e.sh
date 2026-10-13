@@ -53,7 +53,16 @@ print(out.decode())' "$@"; }
 ok()   { echo "  ok   $*"; }
 bad()  { echo "  FAIL $*"; FAIL=1; }
 free_port() { "$PY3" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
-wait_port() { for _ in $(seq 1 100); do (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+# wait_port <port> [pid]: 最大 30 秒（VM を同時に動かす高負荷のホストでは起動に 10 秒を超えることがある）。
+# pid を渡すと、そのプロセスが終了した時点で失敗にする。
+wait_port() {
+  for _ in $(seq 1 300); do
+    (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0
+    [ -n "${2:-}" ] && ! kill -0 "$2" 2>/dev/null && return 1
+    sleep 0.1
+  done
+  return 1
+}
 expect() { # expect <name> <expected-substring> <command...>
   local name="$1" want="$2"; shift 2
   local got; got="$("$@" 2>&1)"
@@ -82,7 +91,7 @@ handler = "udp_echo"
 TOML
   (cd "$W" && exec "$T/debug/veil-example-showcase$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
-  wait_port "$P" || { bad "start"; cat "$W/log"; return; }
+  wait_port "$P" "$PID" || { bad "start"; cat "$W/log"; return; }
   local B="http://127.0.0.1:$P"
   expect "GET /hello" "Hello, World!" curl -s "$B/hello"
   expect "path+query params" '"email":"user7@example.com"' curl -s "$B/users/7?verbose=true"
@@ -161,7 +170,7 @@ run_c() {
     local P; P=$(free_port)
     VEIL_LISTEN="127.0.0.1:$P" PATH="$ROOT/target/release:$PATH" "$CH/$bin$EXE" > "$TMPD/c.log" 2>&1 &
     local PID=$!; PIDS+=("$PID")
-    wait_port "$P" || { bad "$bin start"; continue; }
+    wait_port "$P" "$PID" || { bad "$bin start"; cat "$TMPD/c.log"; continue; }
     local B="http://127.0.0.1:$P"
     expect "$bin GET /" "Hello from C" curl -s "$B/"
     expect "$bin path param (decoded)" '{"id":"a b"}' curl -s "$B/users/a%20b"
@@ -237,7 +246,7 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" \
     VEIL_TLS_KEY="$W/key.pem" exec "$T/debug/veil-example-grpc$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
-  wait_port "$P" || { bad "start ($label)"; cat "$W/log"; return; }
+  wait_port "$P" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
   local rc=$?
   echo "$out" | sed 's/^/  /'
