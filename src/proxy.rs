@@ -1576,6 +1576,24 @@ async fn h2_emit_full(
     (status, len)
 }
 
+/// 要求本文の残りを読み捨てる。戻り値は読み捨てたバイト数。
+///
+/// 消費するたびに `notify` でメインループを起こす。起こさないと `req_pending` の残りがチャネルへ
+/// 補充されず、recv ウィンドウも補充されないので、ウィンドウを超える本文を送るクライアントが
+/// 止まったまま終わらない（reactor では他に起床の契機が無く必ず固まる。B-123）。
+#[cfg(feature = "http2")]
+async fn h2_drain_req(
+    req_rx: &crate::stream_channel::Receiver<Bytes>,
+    notify: &crate::stream_channel::Notify,
+) -> u64 {
+    let mut n = 0u64;
+    while let Some(c) = req_rx.recv().await {
+        n += c.len() as u64;
+        notify.notify();
+    }
+    n
+}
+
 /// エラー応答（Server ヘッダ付き）をメッセージ化して送る。戻り値 `(status, body_len)`。
 #[cfg(feature = "http2")]
 async fn h2_emit_error(
@@ -2043,11 +2061,11 @@ async fn h2_api_handler(
             req_size.set(req_size.get() + chunk.len() as u64);
             if body_tx.send(chunk).await.is_err() {
                 // ハンドラが受信ストリームを捨てた: 残りは読み捨てる（クライアントを止めない）。
-                while let Some(c) = rx.recv().await {
-                    req_size.set(req_size.get() + c.len() as u64);
-                }
+                req_size.set(req_size.get() + h2_drain_req(rx, notify).await);
                 break;
             }
+            // 消費したらメインループを起こして残りの補充と WINDOW_UPDATE をさせる（B-123）
+            notify.notify();
         }
         // body_tx の drop で受信ストリームが終わる
     };
@@ -3863,7 +3881,7 @@ async fn h2_relay_h2_streaming(
     let mut stream = match opened {
         Ok(s) => s,
         Err(status) => {
-            while req_rx.recv().await.is_some() {}
+            h2_drain_req(req_rx, notify).await;
             let msg: &[u8] = if status == 504 {
                 b"Gateway Timeout"
             } else {
@@ -3891,7 +3909,7 @@ async fn h2_relay_h2_streaming(
             req_size.set(req_size.get() + chunk.len() as u64);
             if tx.send(chunk).await.is_err() {
                 // 上流がストリームを閉じた（早期応答・リセット）。下流の残りは捨てる。
-                while req_rx.recv().await.is_some() {}
+                h2_drain_req(req_rx, notify).await;
                 return;
             }
             notify.notify();
@@ -4059,7 +4077,7 @@ async fn h2_serve_streaming(
             return h2_api_handler(ctx, &entry, Some(req_rx), resp_tx, notify).await;
         }
         _ => {
-            while req_rx.recv().await.is_some() {}
+            h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
             return (s, sz, 0);
         }
@@ -4074,7 +4092,7 @@ async fn h2_serve_streaming(
     }) {
         Some(s) => s,
         None => {
-            while req_rx.recv().await.is_some() {}
+            h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
             return (s, sz, 0);
         }
@@ -4180,7 +4198,7 @@ async fn h2_serve_streaming(
         _ => {
             server.release();
             request_buf_put(request);
-            while req_rx.recv().await.is_some() {}
+            h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
             return (s, sz, 0);
         }
@@ -4209,7 +4227,7 @@ async fn h2_serve_streaming(
             }
             _ => {
                 request_buf_put(request);
-                while req_rx.recv().await.is_some() {}
+                h2_drain_req(req_rx, notify).await;
                 let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                 (s, sz, 0)
             }
@@ -4251,7 +4269,7 @@ where
     let (write_res, returned_request) = backend.write_all(request).await;
     request_buf_put(returned_request);
     if write_res.is_err() {
-        while req_rx.recv().await.is_some() {}
+        h2_drain_req(req_rx, notify).await;
         let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
         return (s, sz, 0);
     }
