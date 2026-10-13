@@ -35,3 +35,4 @@ F-200 以前は、この判別を通るのは旧 h2c リスナー（`h2c_http1 =
 - `tests/standalone_e2e.rs` の `b122_cleartext_waits_for_late_and_fragmented_first_bytes`: 接続 1 秒後の要求・3 バイトの断片の
   あとの続き・何も送らない接続 5 本のあとの要求がすべて 200、ログに `Unknown protocol` が出ない。修正前のコードでは
   1 つ目（遅れた要求）で失敗することを確認。
+- 回帰: lib 1053・integration 60・standalone_e2e 16（io_uring / epoll）・E2E 565（io_uring / epoll）が通過。
