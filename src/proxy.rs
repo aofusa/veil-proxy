@@ -5452,14 +5452,15 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
                     .map(|h| slice_range(&accumulated, h.value));
                 // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
-                // httparse の格納先と同じ 64 個が上限。await をまたがないので Future は大きくならない。
-                let mut header_ranges = [((0usize, 0usize), (0usize, 0usize)); 64];
+                // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
+                // 位置は u16 に収まる（配列を 512 バイトに抑え、要求ごとの初期化を小さくする）。
+                // await をまたがないので Future は大きくならない。
+                let mut header_ranges = [[0u16; 4]; 64];
                 let mut header_count = 0;
                 for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
-                    header_ranges[header_count] = (
-                        slice_range(&accumulated, h.name.as_bytes()),
-                        slice_range(&accumulated, h.value),
-                    );
+                    let (no, nl) = slice_range(&accumulated, h.name.as_bytes());
+                    let (vo, vl) = slice_range(&accumulated, h.value);
+                    header_ranges[header_count] = [no as u16, nl as u16, vo as u16, vl as u16];
                     header_count += 1;
                 }
 
@@ -5475,10 +5476,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // みでコピーを伴わない）。
                 let headers_for_proxy: Vec<(Bytes, Bytes)> = header_ranges[..header_count]
                     .iter()
-                    .map(|&((name_off, name_len), (value_off, value_len))| {
+                    .map(|&[no, nl, vo, vl]| {
+                        let (no, nl, vo, vl) = (no as usize, nl as usize, vo as usize, vl as usize);
                         (
-                            header_bytes.slice(name_off..name_off + name_len),
-                            header_bytes.slice(value_off..value_off + value_len),
+                            header_bytes.slice(no..no + nl),
+                            header_bytes.slice(vo..vo + vl),
                         )
                     })
                     .collect();
@@ -5881,12 +5883,22 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // headers_for_proxy は既に accumulated から切り出し済みの Bytes なので、
                 // ここでは参照を並べるだけで新たなコピーは発生しない。
                 let backend_result = {
-                    // スタックの配列に並べる（要求ごとに Vec を確保しない。F-202）。ヘッダは最大 64 個。
-                    let mut raw_buf: [(&[u8], &[u8]); 64] = [(&[], &[]); 64];
-                    for (slot, (k, v)) in raw_buf.iter_mut().zip(headers_for_proxy.iter()) {
-                        *slot = (k.as_ref(), v.as_ref());
-                    }
-                    let headers_raw = &raw_buf[..headers_for_proxy.len().min(64)];
+                    // 16 個まではスタックの配列に並べる（要求ごとに Vec を確保しない。F-202）。それより多いときだけ確保する。
+                    let mut raw_buf: [(&[u8], &[u8]); 16] = [(&[], &[]); 16];
+                    let raw_vec: Vec<(&[u8], &[u8])>;
+                    let headers_raw: &[(&[u8], &[u8])] = if headers_for_proxy.len() <= raw_buf.len()
+                    {
+                        for (slot, (k, v)) in raw_buf.iter_mut().zip(headers_for_proxy.iter()) {
+                            *slot = (k.as_ref(), v.as_ref());
+                        }
+                        &raw_buf[..headers_for_proxy.len()]
+                    } else {
+                        raw_vec = headers_for_proxy
+                            .iter()
+                            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                            .collect();
+                        &raw_vec
+                    };
                     let raw_query: &[u8] =
                         query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
 
