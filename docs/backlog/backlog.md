@@ -377,6 +377,7 @@
 | B-119 | P2 | 完了 | [bugs/B-119-http2-no-idle-timeout.md](bugs/B-119-http2-no-idle-timeout.md) | HTTP/2 の接続にアイドルタイムアウトが無く、ストリームの無い接続を無期限に保持していた（HTTP/1.1 は 60 秒）。処理中のストリームが無い待ちに 60 秒のタイムアウトを付け、GOAWAY(NO_ERROR) で閉じる（F-187 で判明）
 | B-120 | P3 | 未修正 | [bugs/B-120-upstream-mux-test-thread-local-abort.md](bugs/B-120-upstream-mux-test-thread-local-abort.md) | 単体テスト全体の並列実行が高負荷時に `http2::upstream_mux` のテストスレッドで「thread local panicked on drop」により abort することがある（1/10 回、負荷なしでは再現せず。B-118 と同型の疑い、テストのみ）
 | B-121 | P2 | 完了 | [bugs/B-121-http2-frames-on-closed-streams.md](bugs/B-121-http2-frames-on-closed-streams.md) | HTTP/2 で閉じて表から消えたストリームへの WINDOW_UPDATE・DATA を idle と見なして接続を PROTOCOL_ERROR で切っていた。閉じたストリームへの DATA の接続クレジットも返していなかった（F-197 の gRPC 試験で発見）
+| B-122 | P1 | 完了 | [bugs/B-122-cleartext-detect-timeout.md](bugs/B-122-cleartext-detect-timeout.md) | 平文リスナー（`listen_cleartext`）のプロトコル判別が最初のバイトを 200ms しか待たず、遅れて要求を送る HTTP/1.1 のクライアント（事前接続・接続プール）へ HTTP/2 の GOAWAY を返していた（F-200 で平文 HTTP/1.1 全体が対象に）。何も送らない接続ごとの WARN も。アイドル待ちに変更し、空接続は debug で閉じる
 
 ---
 
