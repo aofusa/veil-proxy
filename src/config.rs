@@ -1394,7 +1394,7 @@ fn default_landlock_write_paths() -> Vec<String> {
 
 /// 生の `Config`（unveil/Seatbelt 専用の再パース結果）から UDS ソケットパスを収集する。
 ///
-/// - `[server].listen` / `[server].h2c_listen` の `unix:<path>`（F-164。リスナー側は
+/// - `[server].listen` / `[server].listen_cleartext` の `unix:<path>`（F-164。リスナー側は
 ///   これまで収集漏れだった）。
 /// - `[[route]]` の Proxy URL（`http(s)://unix:<path>[:<prefix>]`）・
 ///   `[upstreams.*.servers]` の URL（F-170、単一 URL プロキシと Upstream グループの両方）。
@@ -1411,8 +1411,8 @@ fn collect_uds_socket_paths(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     for listen in [
-        Some(&config.server.listen),
-        config.server.h2c_listen.as_ref(),
+        config.server.listen.as_ref(),
+        config.server.listen_cleartext.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -3715,7 +3715,7 @@ pub struct ServerConfigSection {
     // ====================
     // Unix ドメインソケット（UDS）設定（F-164）
     // ====================
-    /// `[server].listen` / `[server].h2c_listen` に `unix:<path>` を指定した場合の
+    /// `[server].listen` / `[server].listen_cleartext` に `unix:<path>` を指定した場合の
     /// ソケットファイルパーミッション（8 進数表記の文字列、既定 `"0660"`）。
     ///
     /// bind の前後で `umask(2)` と `chmod(2)` を用いて適用する（Linux では AF_UNIX
