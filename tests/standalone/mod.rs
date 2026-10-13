@@ -276,7 +276,7 @@ fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
 /// TLS ハンドシェイクしてサーバ証明書（DER の先頭 1 枚）を返す（検証しない）。
 pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
     use std::sync::Arc;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = veil::tls_provider::provider::default_provider().install_default();
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -333,7 +333,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        veil::tls_provider::provider::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
