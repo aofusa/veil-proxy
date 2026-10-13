@@ -138,7 +138,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - リスナーは必ず `server::create_listener`（UDS は `server::bind_unix_listener`）経由で作る（F-156/F-164）。
 - ワーカーを増やすときは共有すべき状態（LB 状態・接続数カウンタ・ヘルスチェッカー）をリスナーにつき 1 個にする（F-156）。
-- `[server].tls_only` は既定 `true`。平文 h2c / HTTP/1.1 の計測・テストは `h2c_listen` か `tls_only = false` を使う（F-163/B-80）。
+- `[server].listen` は TLS 専用（平文は受けない）。平文 HTTP/1.1・h2c の計測・テストは `[server].listen_cleartext` に
+  `enable_secure_redirect = false` を付けて使う（既定の `true` は https への 301 だけを返す。F-163/B-80/F-200）。
 - `SO_ATTACH_REUSEPORT_CBPF` は classic BPF。使えるのは ancillary ロードのみ（B-76）。
 - WASM の gRPC 呼び出しは専用スレッドで駆動する（tick スレッドへ戻さない。F-139）。
 - キープアライブ待ちの接続は読み取りバッファを持たない（readiness を待ってから借りる）。mimalloc の
@@ -178,7 +179,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 ### API ライブラリ・制御プレーン（F-188〜F-196・F-04・F-05）
 
-- ライブラリ用コード（`src/api/`、`handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・`l4-handler`・`api`）は
+- ライブラリ用コード（`src/api/`、`handler`・`macro`・`openapi`・`tokio-compat`・`tokio-compat-bridge`・`graphql`・`l4-handler`・`grpc-handler`・`api-core`・`api`）は
   default・`full*` に入れない。本体側への追加は `cfg(feature = "handler")` の分岐だけにする（`tests/api/library_e2e.sh nonregression`
   が full バイナリに `veil::api`・inventory・async-graphql・tokio・pyo3 が無いことを検査する）。`handler` 時は `#[global_allocator]` を定義しない。
 - ライブラリの設定は `config_override::apply_to_toml_str` のフックで合成する（既定 < ファイル < VDS < 環境変数 < インライン < ビルダ、

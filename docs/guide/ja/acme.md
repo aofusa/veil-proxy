@@ -66,7 +66,7 @@ storage_dir = "/var/lib/veil/acme"
 
 応答リスナーは専用スレッドで動く小さな平文 HTTP/1.1 サーバです。`GET /.well-known/acme-challenge/<token>` には key authorization を返し、
 それ以外のリクエストには `https://<Host><path>` への `301` リダイレクトを返すので、ポート 80 を HTTP→HTTPS リダイレクトとしても使えます
-（そのために `[server] http` を使う必要はありません。同じポートに両方を bind しないでください）。同時に処理する接続は最大 64 です。
+（そのために `[server] listen_cleartext` を使う必要はありません。同じポートに両方を bind しないでください）。同時に処理する接続は最大 64 です。
 
 すでに別のもの（ロードバランサ・別のプロキシ・Kubernetes の Ingress）がポート 80 を受けているなら、`challenge_listen = ""` にするか
 `"0.0.0.0:8080"` のような別ポートにして、`/.well-known/acme-challenge/` をそこへ転送してください。

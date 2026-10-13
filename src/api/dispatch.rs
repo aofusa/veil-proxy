@@ -29,6 +29,7 @@ pub(crate) fn build_request(
             .parse::<IpAddr>()
             .unwrap_or(IpAddr::from([0, 0, 0, 0])),
         version,
+        body_stream: None,
     }
 }
 
@@ -39,10 +40,13 @@ pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
         return Response::error(413, "Payload Too Large");
     }
     let head = &req.method[..] == b"HEAD";
-    let mut resp = match std::panic::AssertUnwindSafe(entry.call(req))
-        .catch_unwind()
-        .await
-    {
+    // tokio 互換レイヤー（F-198）: ハンドラの中で使う同期プリミティブ・チャネルが別スレッドから
+    // 起こしても、所有スレッドで再開するように Waker を包む
+    #[cfg(feature = "tokio-compat")]
+    let fut = crate::tokio::waker::WithSafeWaker::new(entry.call(req));
+    #[cfg(not(feature = "tokio-compat"))]
+    let fut = entry.call(req);
+    let mut resp = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
         Ok(r) => r,
         Err(_) => {
             ftlog::error!("[api] handler '{}' panicked", entry.name);
@@ -50,6 +54,15 @@ pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
         }
     };
     if head {
+        // HEAD はストリームを送らない（drop でハンドラ側の生成を止める）。長さは不明なので付けない。
+        if resp.stream.take().is_some() {
+            // HTTP/1.1 の HEAD でも GET と同じく chunked と示す（HTTP/2・HTTP/3 では取り除かれる）
+            resp.headers.push((
+                Bytes::from_static(b"transfer-encoding"),
+                Bytes::from_static(b"chunked"),
+            ));
+            return resp;
+        }
         let len = resp.body.len();
         resp.body = Bytes::new();
         if !resp
@@ -76,7 +89,12 @@ pub(crate) fn h2_h3_headers(resp: &mut Response) {
             || n.eq_ignore_ascii_case(b"upgrade")
             || n.eq_ignore_ascii_case(b"proxy-connection"))
     });
-    for (n, _) in resp.headers.iter_mut() {
+    lowercase_names(&mut resp.headers);
+}
+
+/// フィールド名を小文字にする（HTTP/2・HTTP/3 のヘッダ・トレーラ）。小文字だけなら何も確保しない。
+pub(crate) fn lowercase_names(fields: &mut [(Bytes, Bytes)]) {
+    for (n, _) in fields.iter_mut() {
         if n.iter().any(|b| b.is_ascii_uppercase()) {
             *n = Bytes::from(n.to_ascii_lowercase());
         }
@@ -84,8 +102,13 @@ pub(crate) fn h2_h3_headers(resp: &mut Response) {
 }
 
 /// HTTP/1.1 の応答ヘッダ部（ステータス行〜空行）を作る。本文の長さで `Content-Length` を付ける
-/// （ハンドラが付けていればそれを使う。HEAD では `call` が付けている）。
+/// （ハンドラが付けていればそれを使う。HEAD では `call` が付けている）。ストリーミング応答は
+/// `Transfer-Encoding: chunked`（F-197）。
 pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
+    let chunked = resp.stream.is_some()
+        || resp.headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case(b"transfer-encoding") && v.eq_ignore_ascii_case(b"chunked")
+        });
     let mut out = Vec::with_capacity(128 + resp.headers.len() * 32);
     out.extend_from_slice(b"HTTP/1.1 ");
     let mut buf = itoa::Buffer::new();
@@ -99,6 +122,9 @@ pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
             continue;
         }
         if n.eq_ignore_ascii_case(b"content-length") {
+            if chunked {
+                continue;
+            }
             has_len = true;
         }
         out.extend_from_slice(n);
@@ -106,7 +132,9 @@ pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
         out.extend_from_slice(v);
         out.extend_from_slice(b"\r\n");
     }
-    if !has_len && !(resp.status == 204 || resp.status == 304 || resp.status < 200) {
+    if chunked && !(resp.status == 204 || resp.status == 304 || resp.status < 200) {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if !has_len && !(resp.status == 204 || resp.status == 304 || resp.status < 200) {
         out.extend_from_slice(b"Content-Length: ");
         out.extend_from_slice(buf.format(resp.body.len()).as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -155,6 +183,47 @@ mod tests {
         assert!(h.ends_with("Connection: keep-alive\r\n\r\n"));
         let h = String::from_utf8(http1_head(&Response::no_content(), false)).unwrap();
         assert!(!h.contains("Content-Length"), "{}", h);
+    }
+
+    #[test]
+    fn http1_head_streaming_is_chunked() {
+        let r = Response::stream(200, futures::stream::empty()).with_header("content-length", "5");
+        let h = String::from_utf8(http1_head(&r, true)).unwrap();
+        assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{}", h);
+        assert!(!h.to_ascii_lowercase().contains("content-length"), "{}", h);
+    }
+
+    #[test]
+    fn head_drops_stream() {
+        let entry = crate::api::handler::HandlerEntry::new(
+            "s",
+            "/",
+            &["GET", "HEAD"],
+            std::sync::Arc::new(|_req: Request| -> crate::api::handler::HandlerFuture {
+                Box::pin(async {
+                    Response::stream(
+                        200,
+                        futures::stream::iter(vec![crate::api::stream::BodyChunk::Data(
+                            Bytes::from_static(b"x"),
+                        )]),
+                    )
+                })
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let req = build_request(
+            Bytes::from_static(b"HEAD"),
+            Bytes::from_static(b"/"),
+            Vec::new(),
+            Bytes::new(),
+            "127.0.0.1",
+            HttpVersion::Http11,
+        );
+        let resp = futures::executor::block_on(call(&entry, req));
+        assert!(!resp.is_streaming());
+        let h = String::from_utf8(http1_head(&resp, true)).unwrap();
+        assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{}", h);
     }
 
     #[test]

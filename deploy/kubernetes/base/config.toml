@@ -9,12 +9,10 @@
 # ルートは VDS（F-04）で制御プレーンから差し替えられる（overlays の vds 設定）。
 
 [server]
-listen = "0.0.0.0:8443"
+listen = "0.0.0.0:8443"                  # TLS（HTTP/1.1 + h2 ALPN）
+listen_cleartext = "0.0.0.0:8080"        # 平文（HTTP/1.1 + h2c）。メッシュ内向けなのでリダイレクトしない
+enable_secure_redirect = false
 http2_enabled = true
-tls_only = false
-h2c_enabled = true
-h2c_listen = "0.0.0.0:8080"
-h2c_http1 = true
 threads = 1
 graceful_shutdown_timeout_secs = 20
 
@@ -51,6 +49,9 @@ allowed_ips = ["127.0.0.1/32", "10.0.0.0/8"]
 [vds]
 enabled = false
 server = "http://veil-vds:18000"
+# gRPC の双方向ストリーム（F-199、既定）。REST の長輪詢にするなら "rest"
+transport = "grpc"
+keepalive_secs = 30
 token_file = "/etc/veil/vds/token"
 poll_timeout_secs = 20
 retry_initial_ms = 500

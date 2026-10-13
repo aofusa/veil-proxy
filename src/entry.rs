@@ -510,18 +510,21 @@ pub fn run_server(opts: ServerOptions) {
     // F-164: `unix:<path>` 形式（UDS）も受理する。`config::validate_config` で既に
     // 検証済みのため、ここでのパース失敗は基本的に起こらない想定だが、防御的に
     // 従来どおり TCP 既定値へフォールバックする。
-    let listen_kind = crate::listen_addr::ListenAddr::parse(&loaded_config.listen_addr)
-        .unwrap_or_else(|e| {
-            warn!(
-                "Invalid listen address '{}': {} (falling back to 0.0.0.0:443)",
-                loaded_config.listen_addr, e
-            );
-            crate::listen_addr::ListenAddr::Tcp(SocketAddr::from(([0, 0, 0, 0], 443)))
+    // F-200: TLS のリスナー（`[server].listen`）は省略可（平文だけのサーバ）。
+    let listen_kind: Option<crate::listen_addr::ListenAddr> =
+        loaded_config.listen_addr.as_deref().map(|l| {
+            crate::listen_addr::ListenAddr::parse(l).unwrap_or_else(|e| {
+                warn!(
+                    "Invalid listen address '{}': {} (falling back to 0.0.0.0:443)",
+                    l, e
+                );
+                crate::listen_addr::ListenAddr::Tcp(SocketAddr::from(([0, 0, 0, 0], 443)))
+            })
         });
 
-    // HTTPSリダイレクト用ポートを保存（HTTP→HTTPSリダイレクト時に使用）。
+    // HTTPSリダイレクト用ポートを保存（平文リスナーの `enable_secure_redirect` が使う）。
     // UDS にはポートの概念が無いため、TCP のときのみ更新する（既定値 443 のまま = F-164）。
-    if let Some(addr) = listen_kind.tcp_addr() {
+    if let Some(addr) = listen_kind.as_ref().and_then(|k| k.tcp_addr()) {
         HTTPS_REDIRECT_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -534,7 +537,7 @@ pub fn run_server(opts: ServerOptions) {
         optimized_router: loaded_config.optimized_router.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
-        tls_only: loaded_config.tls_only,
+        cleartext: loaded_config.cleartext,
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         #[cfg(feature = "admin")]
@@ -548,10 +551,6 @@ pub fn run_server(opts: ServerOptions) {
         http2_config: loaded_config.http2_config.clone(),
         #[cfg(feature = "http3")]
         http3_config: loaded_config.http3_config.clone(),
-        #[cfg(feature = "http2")]
-        h2c_enabled: loaded_config.h2c_enabled,
-        #[cfg(feature = "http2")]
-        h2c_listen: loaded_config.h2c_listen.clone(),
         #[cfg(feature = "wasm")]
         wasm_filter_engine: loaded_config.wasm_filter_engine.clone(),
         performance: loaded_config.performance.clone(),
@@ -906,10 +905,8 @@ pub fn run_server(opts: ServerOptions) {
             let has_l4 = !loaded_config.l4_listeners.is_empty();
             #[cfg(not(feature = "l4-proxy"))]
             let has_l4 = false;
-            #[cfg(feature = "http2")]
-            let h2c = loaded_config.h2c_enabled;
-            #[cfg(not(feature = "http2"))]
-            let h2c = false;
+            // F-200: 平文リスナー（HTTP/1.1・h2c）は bind 待ちの対象外なので capability mode を阻む。
+            let cleartext = loaded_config.listen_cleartext.is_some();
             #[cfg(feature = "http3")]
             let http3 = loaded_config.http3_enabled;
             #[cfg(not(feature = "http3"))]
@@ -921,9 +918,8 @@ pub fn run_server(opts: ServerOptions) {
             // 代行するので、プロキシ・upstream は阻害要因ではない。
             let facts = crate::config::CapModeFacts {
                 has_l4,
-                h2c,
+                cleartext,
                 http3,
-                http_redirect: loaded_config.listen_http_addr.is_some(),
             };
             // F-181: 要求したのに入れない構成は、既定で起動を中止する（fail-closed）。
             use crate::config::CapModeDecision;
@@ -1027,21 +1023,6 @@ pub fn run_server(opts: ServerOptions) {
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
 
-    // H2C専用サーバーの判定
-    // H2Cが有効で、h2c_listenが未指定またはlistenと同じ場合、通常のTLSリスナーは不要
-    #[cfg(feature = "http2")]
-    let is_h2c_only_server = loaded_config.h2c_enabled
-        && (loaded_config.h2c_listen.is_none()
-            || loaded_config.h2c_listen.as_ref().unwrap() == &loaded_config.listen_addr);
-
-    #[cfg(not(feature = "http2"))]
-    let is_h2c_only_server = false;
-    // `[server].h2c_http1` は H2C 専用リスナーの設定なので http2 feature 無しでは意味が無い。
-    #[cfg(not(feature = "http2"))]
-    if loaded_config.h2c_http1 {
-        warn!("[server].h2c_http1 has no effect in a build without the http2 feature; ignoring");
-    }
-
     // FreeBSD capability mode 用の bind 完了バリア。
     // 各 TLS ワーカーが listener bind に成功したらカウントを進め、全ワーカー分
     // 揃ってから `cap_enter(2)` する（capability mode 中は bind 不可のため、
@@ -1068,8 +1049,8 @@ pub fn run_server(opts: ServerOptions) {
     #[cfg(unix)]
     let mut main_listener_unix_path: Option<std::path::PathBuf> = None;
 
-    // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
-    if !is_h2c_only_server {
+    // TLS のリスナーを起動（`[server].listen` があるときだけ。F-200）
+    if let Some(listen_kind) = listen_kind.clone() {
         // F-164: UDS の場合はワーカー spawn 前に 1 度だけ bind する
         // （AF_UNIX には SO_REUSEPORT が無いため）。
         let listener_source = match WorkerListenerSource::prepare(
@@ -1091,10 +1072,6 @@ pub fn run_server(opts: ServerOptions) {
         info!("HTTPS Server");
         info!("Listen Address: {}", listen_kind);
         info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!(
-            "TLS Only (plaintext rejected on main listener): {}",
-            loaded_config.tls_only
-        );
         info!("============================================");
 
         for thread_id in 0..num_threads {
@@ -1470,83 +1447,7 @@ pub fn run_server(opts: ServerOptions) {
                 .expect("failed to spawn veil-macos-sandbox thread");
         }
     } else {
-        info!("Skipping TLS listener (H2C-only server detected)");
-    }
-
-    // HTTP to HTTPS リダイレクトワーカー（設定されている場合のみ）
-    if let Some(http_addr) = loaded_config.listen_http_addr {
-        info!("============================================");
-        info!("HTTP to HTTPS Redirect Server");
-        info!("HTTP Listen Address: {}", http_addr);
-        info!("All HTTP requests will be redirected to HTTPS (301)");
-        info!("============================================");
-
-        let http_handle = spawn_worker_thread(move || {
-            crate::runtime::block_on(async move {
-                // HTTPリスナーを作成（SO_REUSEADDRを有効化）
-                let listener = match TcpListener::bind(http_addr) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!("[HTTP] Bind error on {}: {}", http_addr, e);
-                        return;
-                    }
-                };
-
-                info!("[HTTP] Redirect worker started");
-
-                // F-46: リダイレクトハンドラの型付きタスクプール
-                let redirect_pool = crate::runtime::TaskPool::new();
-
-                loop {
-                    // Shutdown チェック
-                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-                        info!("[HTTP] Shutting down...");
-                        break;
-                    }
-
-                    // タイムアウト付きaccept
-                    let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
-
-                    let (stream, peer_addr) = match accept_result {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            error!("[HTTP] Accept error: {}", e);
-                            continue;
-                        }
-                        Err(_) => {
-                            // タイムアウト - ループを継続してshutdownチェック。
-                            // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
-                            crate::alloc_tune::idle_tick();
-                            continue;
-                        }
-                    };
-
-                    // F-35: 最前線 IP ブロックリスト（リダイレクト処理前に弾く）
-                    if crate::config::is_ip_blocked(peer_addr.ip()) {
-                        continue;
-                    }
-
-                    let _ = stream.set_nodelay(true);
-
-                    // 軽量なリダイレクト処理をspawn（パニック耐性あり・型付きプール）
-                    spawn_pooled_with_panic_catch(&redirect_pool, async move {
-                        handle_http_redirect(stream).await;
-                    });
-                }
-
-                // グレースフルシャットダウン: 既存接続の完了を待機
-                // HTTPリダイレクトワーカーはConnectionGuardを使用していないため、
-                // 単純にスリープで待機（リダイレクト処理は高速なため問題なし）
-                let timeout_secs = GRACEFUL_SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
-                if timeout_secs > 0 {
-                    crate::runtime::time::sleep(Duration::from_millis(500)).await;
-                }
-
-                info!("[HTTP] Redirect worker stopped");
-            });
-            crate::runtime::shutdown_thread();
-        });
-        handles.push(http_handle);
+        info!("No TLS listener ([server].listen is not set): plaintext-only server");
     }
 
     // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
@@ -1556,10 +1457,12 @@ pub fn run_server(opts: ServerOptions) {
     // HTTP/3を使用する場合はLandlock設定で証明書パスを許可する必要があります。
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
+        // F-200: `[http3] listen` が無ければ `[server].listen` と同じアドレス（UDP）。
         let http3_addr_str = loaded_config
             .http3_listen
             .clone()
-            .unwrap_or_else(|| loaded_config.listen_addr.clone());
+            .or_else(|| loaded_config.listen_addr.clone())
+            .unwrap_or_default();
 
         let http3_addr: SocketAddr = match http3_addr_str.parse() {
             Ok(addr) => addr,
@@ -1668,30 +1571,24 @@ pub fn run_server(opts: ServerOptions) {
         // ローカル変数の Arc をドロップ（参照カウントを減らす）
         drop(tls_cert_pem);
         drop(tls_key_pem);
-    } else {
-        // H2C 専用サーバー構成（TLS リスナー自体が起動しない）のため、
-        // `[server].tls_only` は影響しない（F-163）。
-        info!(
-            "H2C-only server configuration detected (h2c_enabled=true, h2c_listen unset or == listen); \
-             TLS listener is not started, so [server].tls_only has no effect"
-        );
     }
 
-    // H2C リスナーの UDS ソケットファイルパス（bind した場合のみ）。
+    // 平文リスナーの UDS ソケットファイルパス（bind した場合のみ）。
     // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
     // `http2` feature 無効時は代入されないため `mut` が未使用になる。
     #[cfg(unix)]
     #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
     let mut h2c_listener_unix_path: Option<std::path::PathBuf> = None;
 
-    // H2C (HTTP/2 Cleartext) サーバー（設定されている場合のみ）
+    // F-200: 平文のリスナー（`[server].listen_cleartext`）。HTTP/1.1 と h2c をプロトコル検出で
+    // 判別し、`allow_http`・`allow_h2c`・`enable_secure_redirect`（接続ごとに CURRENT_CONFIG を読む）に従う。
+    #[cfg(not(feature = "http2"))]
+    if loaded_config.listen_cleartext.is_some() {
+        error!("[server].listen_cleartext requires a build with the http2 feature");
+        return;
+    }
     #[cfg(feature = "http2")]
-    if loaded_config.h2c_enabled {
-        let h2c_addr_str = loaded_config
-            .h2c_listen
-            .clone()
-            .unwrap_or_else(|| loaded_config.listen_addr.clone());
-
+    if let Some(h2c_addr_str) = loaded_config.listen_cleartext.clone() {
         // F-164: `unix:<path>` 形式（UDS）も受理する。
         let h2c_listen_kind = match crate::listen_addr::ListenAddr::parse(&h2c_addr_str) {
             Ok(k) => k,
@@ -1731,7 +1628,6 @@ pub fn run_server(opts: ServerOptions) {
         for thread_id in 0..num_threads {
             let h2c_listener_source = h2c_listener_source.clone();
             let balancing = loaded_config.reuseport_balancing;
-            let h2c_http1 = loaded_config.h2c_http1;
             let max_conn = loaded_config.global_security.max_concurrent_connections;
 
             // このスレッドに割り当てるコアIDを決定
@@ -1847,43 +1743,64 @@ pub fn run_server(opts: ServerOptions) {
                                         detect_protocol_with_buffer(&mut stream).await;
 
                                     match protocol_type {
-                                        ProtocolType::H2C => {
-                                            // H2C接続処理
+                                        // F-200: 受け入れ方は接続ごとに読む（SIGHUP で変えられる）。
+                                        ProtocolType::H2C
+                                            if CURRENT_CONFIG.load().cleartext.allow_h2c =>
+                                        {
+                                            let redirect =
+                                                CURRENT_CONFIG.load().cleartext.secure_redirect;
                                             handle_h2c_connection(
                                                 stream,
                                                 client_ip.as_str(),
                                                 initial_data,
+                                                redirect,
                                             )
                                             .await;
                                         }
-                                        ProtocolType::Http11 if h2c_http1 => {
-                                            // `[server].h2c_http1 = true`: 同じポートで平文
-                                            // HTTP/1.1 も処理する（平文専用サーバ構成）。
-                                            crate::proxy::handle_plain_http1_connection(
-                                                stream,
-                                                initial_data,
-                                                peer_addr,
-                                            )
-                                            .await;
-                                        }
-                                        ProtocolType::Http11 => {
-                                            // HTTP/1.1はH2C専用サーバーではサポートしない
-                                            // （`[server].h2c_http1 = true` で受理する）
-                                            warn!(
-                                                "[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server (set [server].h2c_http1 = true to accept it), closing connection from {}",
+                                        ProtocolType::H2C => {
+                                            // allow_h2c = false: GOAWAY(PROTOCOL_ERROR) で閉じる（B-102 の作法）
+                                            debug!(
+                                                "[Cleartext] h2c is not allowed (allow_h2c = false), rejecting {}",
                                                 peer_addr
                                             );
+                                            crate::proxy::reject_h2c_invalid_preface(stream).await;
+                                        }
+                                        ProtocolType::Http11
+                                            if CURRENT_CONFIG.load().cleartext.allow_http =>
+                                        {
+                                            if CURRENT_CONFIG.load().cleartext.secure_redirect {
+                                                crate::config::handle_http_redirect(
+                                                    stream,
+                                                    initial_data,
+                                                )
+                                                .await;
+                                            } else {
+                                                crate::proxy::handle_plain_http1_connection(
+                                                    stream,
+                                                    initial_data,
+                                                    peer_addr,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        ProtocolType::Http11 => {
+                                            // allow_http = false: 426 を返して閉じる
+                                            debug!(
+                                                "[Cleartext] plaintext HTTP/1.1 is not allowed (allow_http = false), rejecting {}",
+                                                peer_addr
+                                            );
+                                            crate::proxy::reject_plain_http1(stream).await;
                                         }
                                         ProtocolType::TLS => {
-                                            // TLSはH2C専用サーバーではサポートしない
-                                            warn!(
-                                                "[H2C Worker] TLS not supported on H2C-only server, closing connection from {}",
+                                            // 平文リスナーに TLS が来た（ポートの取り違え）
+                                            debug!(
+                                                "[Cleartext] TLS handshake on the cleartext listener from {}, closing",
                                                 peer_addr
                                             );
                                         }
                                         ProtocolType::Unknown => {
                                             warn!(
-                                                "[H2C Worker] Unknown protocol from {}, closing connection",
+                                                "[Cleartext] Unknown protocol from {}, closing connection",
                                                 peer_addr
                                             );
                                             // RFC 9113 §3.4: GOAWAY(PROTOCOL_ERROR) を返して閉じる。

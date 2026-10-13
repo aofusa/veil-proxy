@@ -4,21 +4,23 @@
 # ==========================================
 
 [server]
+# TLS のリスナー（HTTP/1.1 + HTTP/2 ALPN）。[tls] が必要（F-200）。
 listen = "127.0.0.1:443"
 
-# HTTP to HTTPS リダイレクト（オプション）
+# 平文のリスナー（HTTP/1.1 + h2c。プロトコル検出で判別、オプション）
 #
-# HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
-# ブラウザがhttp://でアクセスした場合、自動的にhttps://にリダイレクトされます。
+# 既定（enable_secure_redirect = true）では、このポートに来た要求（HTTP/1.1・h2c とも）を
+# https://<Host>[:<listen のポート>] へ 301 Moved Permanently で返します（コンテンツは配信しません）。
+# 公開サーバーではこの設定を有効にすることをお勧めします。
 #
-# セキュリティ考慮事項:
-# - HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
-# - 301 Moved Permanently を返すため、ブラウザがURLをキャッシュします
-# - 初回HTTPアクセス時のみ平文通信が発生します
+# 平文のまま配信したい（内部ネットワーク・gRPC 等）ときは enable_secure_redirect = false にします。
+# allow_http / allow_h2c（既定 true）で平文 HTTP/1.1・h2c をそれぞれ受けるか選べます。
+# listen を書かずに listen_cleartext だけにすると平文専用サーバ（[tls] 不要）になります。
 #
-# 推奨: 公開サーバーではこの設定を有効にすることをお勧めします
-#
-http = "127.0.0.1:80"
+listen_cleartext = "127.0.0.1:80"
+# enable_secure_redirect = true   # false で平文のまま配信（true は listen が必要）
+# allow_http = true
+# allow_h2c = true               # h2c（RFC 7540 §3.4 Prior Knowledge）。要 --features http2
 
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
@@ -42,36 +44,6 @@ http = "127.0.0.1:80"
 #
 http2_enabled = true
 
-# H2C (HTTP/2 Cleartext) サーバーを有効化
-#
-# TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
-# Prior Knowledgeモードをサポートします。
-#
-# 効果:
-# - ストリーム多重化によるレイテンシ削減
-# - HPACK ヘッダー圧縮によるオーバーヘッド削減
-# - gRPC バックエンドへの接続に適している
-#
-# セキュリティ考慮事項:
-# - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
-# - 外部公開時はTLS必須
-# - デフォルトで無効（明示的に有効化が必要）
-#
-# 注意: `--features http2` でビルドする必要があります
-#
-# h2c_enabled = false
-
-# H2C リスニングアドレス（オプション）
-#
-# 指定した場合、H2C専用のリスナーを起動します。
-# 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
-#
-# 例: "127.0.0.1:8080"
-#
-# 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
-#
-# h2c_listen = "127.0.0.1:8080"
-
 # ====================
 # グレースフルシャットダウン設定
 # ====================
@@ -89,7 +61,8 @@ http2_enabled = true
 #
 # graceful_shutdown_timeout_secs = 30
 
-# HTTP/3 を有効化（QUIC/UDP ベース）
+# HTTP/3 は [http3] enabled = true で有効化します（QUIC/UDP ベース。listen と同じアドレス、
+# [http3] listen で別アドレスも可。下の [http3] セクション参照）。
 #
 # 効果:
 # - 0-RTT 接続確立
@@ -100,7 +73,6 @@ http2_enabled = true
 # - UDP ベースのため kTLS は使用不可
 # - GSO/GRO による高パフォーマンス UDP 処理を使用
 #
-http3_enabled = true
 
 # ====================
 # Serverヘッダー設定
@@ -876,7 +848,7 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # ==========================================
 #
 # HTTP/3 (QUIC) プロトコルの詳細なパラメータを設定できます。
-# server.http3_enabled = true で有効化してください。
+# enabled = true で有効化してください（listen と [tls] が必要）。
 #
 # 注意:
 #   - --features http3 でビルドする必要があります
@@ -884,6 +856,8 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 #   - quiche (Cloudflare製) を使用
 #
 [http3]
+# HTTP/3 を有効化する（F-200）
+enabled = true
 # HTTP/3リッスンアドレス（UDP）
 # 未指定の場合は server.listen と同じアドレスを使用
 # listen = "127.0.0.1:443"
@@ -891,7 +865,7 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # ====================
 # Alt-Svc（HTTP/3 広告、F-94）— 設定は [http3] に集約
 # ====================
-# server.http3_enabled = true のとき、HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与する。
+# [http3] enabled = true のとき、HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与する。
 # 既定: true（広告する）。false で抑制。
 # alt_svc_enabled = true
 #
@@ -1882,8 +1856,8 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # 設定例:
 #
 # [server]
-# h2c_enabled = true
-# h2c_listen = "0.0.0.0:8080"  # H2C専用ポート（オプション）
+# listen_cleartext = "0.0.0.0:8080"   # 平文（HTTP/1.1 + h2c）。listen を書かなければ平文専用サーバ
+# enable_secure_redirect = false      # 平文のまま配信する（既定 true は https へ 301）
 #
 # 使用例:
 #   # curlでH2Cサーバーに接続
@@ -1895,11 +1869,7 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # セキュリティ注意事項:
 #   - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
 #   - 外部公開時はTLS必須
-#   - デフォルトで無効（明示的に有効化が必要）
-#
-# [server]
-# h2c_enabled = true
-# h2c_listen = "0.0.0.0:8080"
+#   - デフォルトでは listen_cleartext 自体が無い（明示的に書く必要がある）
 
 # ------------------------------------------
 # ヘッダー操作付きプロキシ

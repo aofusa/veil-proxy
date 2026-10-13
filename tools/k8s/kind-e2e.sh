@@ -11,7 +11,7 @@
 #   3. メッシュ外からの拒否（Istio の STRICT mTLS）
 #   4. veil 自身の TLS（Secret の証明書）と Secret 更新での差し替え（F-180）
 #   5. 環境変数 VEIL_OVERRIDE_<n> の反映（F-179）
-#   6. VDS でのルート追加（F-04）
+#   6. VDS でのルート追加（F-04。gRPC の双方向ストリームがメッシュを通る。F-199）
 #   7. Pod 削除時の graceful shutdown（猶予内に終了）
 # 前提: docker・kind・kubectl・istioctl・linkerd・openssl（~/.local/bin でも可）。
 set -uo pipefail
@@ -45,7 +45,12 @@ ensure_cluster() {
     kind create cluster --name "$CLUSTER" --wait 120s || exit 1
   fi
   kubectl config use-context "kind-$CLUSTER" >/dev/null
-  for img in "$IMAGE" traefik/whoami:latest python:3.12-alpine curlimages/curl:latest; do
+  # VDS の参照制御プレーン（F-199）
+  if ! docker image inspect veil-vds-server:latest >/dev/null 2>&1 || [ -n "${REBUILD_VDS:-}" ]; then
+    log "veil-vds-server イメージをビルド"
+    docker build -q -f "$ROOT/docker/Dockerfile.vds-server" -t veil-vds-server:latest "$ROOT" >/dev/null || exit 1
+  fi
+  for img in "$IMAGE" veil-vds-server:latest traefik/whoami:latest curlimages/curl:latest; do
     docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
     kind load docker-image --name "$CLUSTER" "$img" >/dev/null 2>&1 || { echo "failed to load $img"; exit 1; }
   done
@@ -85,7 +90,6 @@ deploy() { # deploy <overlay> <namespace>
   gen_cert v1.veil.test
   kubectl -n "$ns" create secret tls veil-tls --cert="$WORK/v1.veil.test.crt" --key="$WORK/v1.veil.test.key" >/dev/null
   kubectl -n "$ns" create secret generic veil-vds-token --from-literal=token="$(openssl rand -hex 16)" >/dev/null
-  kubectl -n "$ns" create configmap veil-vds-server --from-file=vds_server.py="$ROOT/tools/vds/vds_server.py" >/dev/null
   kubectl kustomize "$ROOT/deploy/kubernetes/overlays/$ov" | sed "s#image: veil:musl-k8s#image: $IMAGE#" \
     | kubectl apply -f - >/dev/null || return 1
   kubectl -n "$ns" rollout status deploy/veil-vds --timeout=300s >/dev/null &&
@@ -165,6 +169,16 @@ TOML
   if retry 240 bash -c "kubectl -n $NS exec client -c curl -- curl -s -m 10 -o /dev/null -w '%{redirect_url}' http://veil-app/vds-added | grep -q from-vds"; then
     ok "VDS delivered a new route through the mesh"
   else bad "VDS route not applied"; kubectl -n "$NS" logs deploy/veil-app -c veil | grep -i vds | tail -5; fi
+  # 6b. 購読が gRPC の双方向ストリームで ACK まで届いている（制御プレーンの状態）
+  out=$(kubectl -n "$NS" exec client -c curl -- curl -s -m 10 http://veil-vds:18000/v1/status)
+  [[ "$out" == *'"transport":"grpc"'* && "$out" == *'"acked_version":"'[0-9a-f]* ]] \
+    && ok "VDS over a gRPC stream through the mesh (acked)" || bad "VDS status: $out"
+  # 6c. 制御プレーンを作り直しても再接続して最新の版を受け取る
+  kubectl -n "$NS" rollout restart deploy/veil-vds >/dev/null
+  kubectl -n "$NS" rollout status deploy/veil-vds --timeout=300s >/dev/null
+  if retry 120 bash -c "kubectl -n $NS exec client -c curl -- curl -s -m 10 http://veil-vds:18000/v1/status | grep -q '\"transport\":\"grpc\"'"; then
+    ok "VDS stream reconnected after the control plane restarted"
+  else bad "VDS did not reconnect"; fi
   # 7. graceful shutdown: veil が SIGTERM を受けてから止まるまでの時間をログの時刻で測る
   #    （Pod 全体の終了時間はアプリ側のコンテナにも左右される。デモの whoami は PID 1 で SIGTERM を
   #    無視するため猶予いっぱいかかる）

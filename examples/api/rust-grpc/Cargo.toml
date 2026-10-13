@@ -1,0 +1,26 @@
+# veil の gRPC サーバのサンプル（F-197）。tokio・tonic を使わない（veil の HTTP/2・HTTP/3 と prost だけ）。
+#
+#   cargo run --release                  # 平文 0.0.0.0:50051（h2c）。VEIL_LISTEN で変更
+#   grpcurl -plaintext -import-path proto -proto demo.proto -d '{"name":"veil"}' localhost:50051 demo.v1.Demo/SayHello
+[package]
+name = "veil-example-grpc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# veil 本体のワークスペースとは独立させる（`[[example]]` を本体に足すとコンテナビルドが壊れるため）。
+[workspace]
+
+[dependencies]
+# 実際に使うときは git 依存:
+# veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { path = "../../..", default-features = false, features = ["full", "api"] }
+prost = "0.13"
+futures = "0.3"
+
+[build-dependencies]
+veil-build = { path = "../../../crates/veil-build" }
+
+# veil 本体と同じ vendoring 版 quiche を使う（F-172）。
+[patch.crates-io]
+quiche = { path = "../../../third_party/quiche" }

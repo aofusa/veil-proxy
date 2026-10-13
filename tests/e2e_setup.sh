@@ -48,7 +48,8 @@ DOCKER_PLATFORM=""
 
 # ポート設定
 PROXY_HTTPS_PORT=8443
-PROXY_HTTP_PORT=8080
+PROXY_HTTP_PORT=8080  # F-200: 301 リダイレクト専用インスタンス（proxy_redirect.toml）の平文ポート
+PROXY_REDIRECT_TLS_PORT=8450  # 同インスタンスの TLS ポート（リダイレクト先。未使用）
 PROXY_H2C_PORT=8081
 PROXY_L4_PORT=8444
 PROXY_L4_LEAST_CONN_PORT=8445
@@ -78,7 +79,6 @@ BACKEND_ECHO2_PORT=9020
 BACKEND_UDS_TLS_SOCK="${FIXTURES_DIR}/uds_tls.sock"
 BACKEND_UDS_H2C_SOCK="${FIXTURES_DIR}/uds_h2c.sock"
 # h2c 専用プロセスの（使用しない）TLS リスナー。[server].listen は必須キーのため置く。
-BACKEND_UDS_H2C_TLS_SOCK="${FIXTURES_DIR}/uds_h2c_tls.sock"
 BACKEND_UDS_MISSING_SOCK="${FIXTURES_DIR}/uds_missing.sock"
 
 # 色付き出力
@@ -433,18 +433,19 @@ EOF
     # 注意: H2C専用サーバーのため、通常のTLSリスナーは起動されない
     cat > "${FIXTURES_DIR}/backend_h2c.toml" << EOF
 [server]
-listen = "127.0.0.1:${BACKEND_H2C_TLS_PORT}"  # TLSポート（未使用）
-h2c_listen = "127.0.0.1:${BACKEND_H2C_PORT}"  # H2C専用ポート（使用）
+# F-200: 平文リスナー（HTTP/1.1 + h2c をプロトコル検出で受ける。リダイレクトはしない）に加え、
+# TLS リスナー（BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する（B-83 / F-175 の HTTPS 上流 h2 テスト用）。
+listen = "127.0.0.1:${BACKEND_H2C_TLS_PORT}"
+listen_cleartext = "127.0.0.1:${BACKEND_H2C_PORT}"
+enable_secure_redirect = false
 threads = 1
 http2_enabled = true
-h2c_enabled = true
-# 注意: listenとh2c_listenを別ポートにすることで競合を回避しつつH2Cを有効化
 
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = ${backend_ktls_enabled}
-# 注意: H2C専用サーバーのため、TLS証明書は使用されないが、設定ファイルの検証で必要
+# 注意: TLS リスナー（ALPN h2）のために証明書を使う
 
 [logging]
 level = "warn"
@@ -479,7 +480,7 @@ EOF
     # 分ける構成にしてある（1 プロセスにまとめると h2c のために `http2_enabled = true`
     # が必要になり、TLS リスナーの ALPN に `h2` が広告されるため、両方のリスナーを
     # 同一構成で検証したい場合の構成分離として維持する）。
-    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}" "${BACKEND_UDS_H2C_TLS_SOCK}"
+    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}"
     cat > "${FIXTURES_DIR}/backend_uds_tls.toml" << EOF
 [server]
 listen = "unix:${BACKEND_UDS_TLS_SOCK}"
@@ -519,11 +520,10 @@ EOF
 
     cat > "${FIXTURES_DIR}/backend_uds_h2c.toml" << EOF
 [server]
-listen = "unix:${BACKEND_UDS_H2C_TLS_SOCK}"  # 未使用（listen は必須キー）
-h2c_listen = "unix:${BACKEND_UDS_H2C_SOCK}"  # h2c 専用（使用する）
+listen_cleartext = "unix:${BACKEND_UDS_H2C_SOCK}"  # F-200: 平文専用（HTTP/1.1 + h2c）
+enable_secure_redirect = false
 threads = 1
 http2_enabled = true
-h2c_enabled = true
 unix_socket_permissions = "0660"
 
 [tls]
@@ -557,6 +557,32 @@ index = "index.html"
 add_response_headers = { "X-Server-Id" = "backend_uds_h2c" }
 EOF
 
+    # F-200: HTTP → HTTPS の 301 リダイレクト専用インスタンス（listen_cleartext + enable_secure_redirect 既定 true）
+    cat > "${FIXTURES_DIR}/proxy_redirect.toml" << EOF
+[server]
+listen = "127.0.0.1:${PROXY_REDIRECT_TLS_PORT}"
+listen_cleartext = "127.0.0.1:${PROXY_HTTP_PORT}"
+threads = 1
+http2_enabled = true
+
+[tls]
+cert_path = "${FIXTURES_DIR}/cert.pem"
+key_path = "${FIXTURES_DIR}/key.pem"
+ktls_enabled = false
+
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend2"
+index = "index.html"
+EOF
+
     # プロキシ設定（設定タイプに応じて生成）
     local algorithm="round_robin"
     case "$config_type" in
@@ -572,13 +598,12 @@ EOF
     cat > "${FIXTURES_DIR}/proxy.toml" << EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
-http = "127.0.0.1:${PROXY_HTTP_PORT}"
-h2c_listen = "127.0.0.1:${PROXY_H2C_PORT}"
-h2c_enabled = true
-redirect_http_to_https = false
+# F-200: 平文（HTTP/1.1 + h2c）は listen_cleartext、リダイレクトはしない（gRPC/h2c テスト用）。
+# HTTP → HTTPS の 301 は別プロセス（proxy_redirect.toml）で検証する。
+listen_cleartext = "127.0.0.1:${PROXY_H2C_PORT}"
+enable_secure_redirect = false
 threads = 1
 http2_enabled = true
-http3_enabled = true
 
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
@@ -614,6 +639,7 @@ path_prefix = "/__admin"
 secret = "test-admin-secret"
 
 [http3]
+enabled = true
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 compression_enabled = true
 
@@ -2124,7 +2150,7 @@ start_proxy_host() {
     echo $! >> "$PIDS_FILE"
     # F-49: リロード E2E テストが SIGHUP を送るためのプロキシ PID ファイル
     echo $! > "${FIXTURES_DIR}/proxy.pid"
-    log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
+    log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_H2C_PORT} (PID: $!)"
 }
 
 start_proxy_container() {
@@ -2204,6 +2230,11 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "UDS H2C Backend started on ${BACKEND_UDS_H2C_SOCK} (PID: $!)"
 
+    # F-200: HTTP → HTTPS リダイレクト専用インスタンス
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/proxy_redirect.toml" > /tmp/proxy_redirect.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "Redirect instance started on port ${PROXY_HTTP_PORT} (PID: $!)"
+
     # gRPCバックエンド起動（スタンドアロンEchoサーバー、ビルドは ensure_veil_binary で完了済み）
     log_info "Starting gRPC Echo Backend..."
     RUST_LOG=debug GRPC_LISTEN_ADDR="127.0.0.1:${BACKEND_GRPC_PORT}" GRPC_SERVER_ID="grpc-server-1" \
@@ -2269,8 +2300,7 @@ start_servers() {
     # UDS 相手に curl が使えないため、ソケットの存在で readiness を判定する）
     local uds_wait=0
     while [ $uds_wait -lt 30 ]; do
-        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ] \
-            && [ -S "${BACKEND_UDS_H2C_TLS_SOCK}" ]; then
+        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ]; then
             log_info "UDS Backend is ready (both sockets bound)"
             break
         fi
@@ -2411,7 +2441,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_REDIRECT_TLS_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
@@ -2439,7 +2469,7 @@ wait_for_proxy_ready() {
     local start_ts
     start_ts=$(date +%s)
     while true; do
-        if curl -ks "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1 \
+        if curl -ks "http://127.0.0.1:${PROXY_H2C_PORT}/__metrics" > /dev/null 2>&1 \
             || curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
             return 0
         fi
@@ -2609,8 +2639,8 @@ verify_server_stability_check() {
     
     # プロキシの安定性を確認
     local proxy_url=""
-    if curl -ks "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1; then
-        proxy_url="http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics"
+    if curl -ks "http://127.0.0.1:${PROXY_H2C_PORT}/__metrics" > /dev/null 2>&1; then
+        proxy_url="http://127.0.0.1:${PROXY_H2C_PORT}/__metrics"
     elif curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
         proxy_url="https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics"
     else

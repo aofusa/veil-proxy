@@ -3,7 +3,7 @@
 [← ドキュメント目次](README.md) · [English](../vds.md)
 
 VDS（Veil Discovery Service）は、**制御プレーン** から稼働中の veil のルートとアップストリームを配信する仕組みです。
-Envoy の xDS（REST-JSON・State-of-the-World）の最小サブセットで、同じ意味論（バージョン・nonce・長輪詢・ACK/NACK）を持ちます。
+Envoy の xDS（State-of-the-World）の最小サブセットで、同じ意味論（バージョン・nonce・ACK/NACK）を gRPC の双方向ストリーム（既定）か REST-JSON の長輪詢で運びます。
 制御プレーンが新しいスナップショットを公開すると、veil はそれを検証し、通常のホットリロード経路で（無停止で）差し替えて応答（ACK）します。
 検証に失敗したスナップショットは拒否（NACK）され、前の設定のまま動き続けます。
 
@@ -12,7 +12,8 @@ Envoy の xDS（REST-JSON・State-of-the-World）の最小サブセットで、�
 
 - 制御プレーンとの通信は **専用スレッド** で行い、データプレーン（ワーカーのイベントループ）には一切触れません。
 - スナップショットの適用は SIGHUP リロードとまったく同じ検証を通るので、不正なスナップショットでプロキシが落ちることはありません。
-- 制御プレーンは、下記のプロトコルを実装した任意の HTTP サーバです。参照実装として小さな `tools/vds/vds_server.py` を同梱しています。
+- 制御プレーンは、下記のプロトコルを実装した任意のサーバです。参照実装として `tools/vds/server`（Rust、gRPC + REST）と
+  `tools/vds/vds_server.py`（Python、REST）を同梱しています。
 
 ## 設定
 
@@ -30,16 +31,18 @@ token_file = "/etc/veil/vds/token"
 | キー | 既定値 | 説明 |
 |------|--------|------|
 | `enabled` | `false` | VDS クライアントのスレッドを起動する |
-| `server` | `""` | 制御プレーンのベース URL: `http://host:port[/base]` または `https://...`（有効時は必須。`{server}/v1/discovery` へ POST する） |
+| `server` | `""` | 制御プレーンのベース URL: `http://host:port[/base]` または `https://...`（有効時は必須） |
+| `transport` | `"grpc"` | `"grpc"`: 双方向ストリーム（h2c または TLS + ALPN h2）、`"rest"`: `{server}/v1/discovery` の長輪詢 |
+| `keepalive_secs` | `30` | gRPC の接続の TCP キープアライブ（`0` で無効） |
 | `node_id` | `""` | 制御プレーンへ送るノード ID。空ならホスト名 |
 | `cluster` | `""` | 制御プレーンへ送るクラスタ（グループ）名 |
-| `token_file` | `""` | Bearer トークンを書いたファイル。**要求のたびに** 読み直すのでローテーションできる。空なら `Authorization` を送らない |
+| `token_file` | `""` | Bearer トークンを書いたファイル。要求（REST）・接続（gRPC）のたびに読み直すのでローテーションできる。空なら `Authorization` を送らない |
 | `ca_cert` | `""` | `https` の追加の信頼 CA（PEM）。空なら組み込みの web PKI ルートだけ |
 | `client_cert` / `client_key` | `""` | 相互 TLS 用のクライアント証明書・鍵（PEM）。両方指定したときだけ使う |
-| `poll_timeout_secs` | `30` | 変化が無いときに制御プレーンが要求を保留してよい時間（`poll_timeout_secs` として送る）。HTTP のタイムアウトはこの値 + 15 秒 |
+| `poll_timeout_secs` | `30` | REST: 変化が無いときに制御プレーンが要求を保留してよい時間（`poll_timeout_secs` として送る）。HTTP のタイムアウトはこの値 + 15 秒 |
 | `retry_initial_ms` | `500` | エラー後の最初の再試行までの待ち時間（毎回 2 倍） |
 | `retry_max_ms` | `30000` | 再試行待ちの上限 |
-| `max_response_bytes` | `16777216` | これを超える応答は拒否する（16 MiB） |
+| `max_response_bytes` | `16777216` | これを超える応答（gRPC はメッセージ）は拒否する（16 MiB） |
 | `max_resources` | `10000` | これを超える数のリソースを持つスナップショットは拒否する |
 
 VDS も設定の一部なので、`VEIL_OVERRIDE_<n>` と `--override` が使えます
@@ -69,6 +72,39 @@ config.toml  <  VDS スナップショット  <  環境変数 VEIL_OVERRIDE_<n> 
 スナップショットと上書きはリロードのたびに適用し直されるので、SIGHUP をしても配信済みのスナップショットは保たれます。
 
 ## プロトコル
+
+同じメッセージと意味論を 2 種類の転送で運べます（`[vds] transport`）。
+
+- **gRPC**（既定）: 長寿命の双方向ストリーム 1 本。制御プレーンはスナップショットが変わった時点で押し出すので、輪詢はありません。
+- **REST**: JSON の長輪詢（下記）。HTTP/2 を話せない制御プレーン向けです。
+
+### gRPC（既定）
+
+サービスは [`proto/veil/vds/v1/vds.proto`](../../../proto/veil/vds/v1/vds.proto) で定義しています。
+
+```proto
+service VeilDiscoveryService {
+  rpc StreamSnapshots(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+}
+message DiscoveryRequest  { string version_info = 1; Node node = 2; string type_url = 3;
+                            string response_nonce = 4; ErrorDetail error_detail = 5; }
+message DiscoveryResponse { string version_info = 1; string nonce = 2; string type_url = 3;
+                            repeated Resource resources = 4; }
+message Resource { string type_url = 1; string name = 2; string json = 3; }
+```
+
+veil は VDS のスレッドで `POST {server}/veil.vds.v1.VeilDiscoveryService/StreamSnapshots` を h2c（`http://`）または
+TLS + ALPN `h2`（`https://`）で開きます（veil 自身の HTTP/2 クライアント。tokio・tonic は使いません）。`token_file` があれば
+`authorization: Bearer <token>` を付けます（接続のたびに読み直す）。各フィールドの意味は REST と同じです。`Resource` は REST の
+`resources` 配列の 1 要素で、`@type` を `type_url` に、`name` を `name` に移し、残りのオブジェクトを JSON にして `json` に入れたものです。
+
+1. 接続したら veil は `version_info = ""`（再接続なら最後に適用した版）の要求を送る。
+2. 制御プレーンは、スナップショットがそのノードの版と違えば（かつ拒否されていなければ）`DiscoveryResponse` を送る。
+3. veil は適用し、同じストリームで次の要求を送る: **ACK**（新しい `version_info` と応答の `nonce`）か **NACK**（古い `version_info`・`nonce`・`error_detail`）。
+4. ストリームが終わる・失敗する・`grpc-status` が 0 以外なら、指数バックオフで張り直し、最後に適用した版から再開する。
+   `keepalive_secs`（TCP キープアライブ）で、押し出しの無い長い間に制御プレーンが消えたことを検知する。
+
+### REST
 
 すべての要求は `POST {server}/v1/discovery`（`Content-Type: application/json`）です。`token_file` を設定していれば、
 各要求に `Authorization: Bearer <token>` が付きます。
@@ -142,7 +178,7 @@ JSON の `null` は取り除かれます（TOML に null は無いため）。�
 `config.toml` のルート・アップストリームに書けるものはすべて使えます。[設定リファレンス](configuration.md)・
 [ルーティング](routing.md)・[ロードバランシング](load-balancing.md)・[examples/config.toml](../../../examples/config.toml)を参照してください。
 
-### 長輪詢・304・ACK・NACK
+#### 長輪詢・304・ACK・NACK
 
 1. veil が現在の `version_info` を付けて要求を送る。
 2. 制御プレーンに新しいものが無ければ、変化があるか `poll_timeout_secs` が過ぎるまで要求を **保留** し、過ぎたら
@@ -166,9 +202,16 @@ JSON の `null` は取り除かれます（TOML に null は無いため）。�
 
 ## 参照制御プレーン
 
-`tools/vds/vds_server.py`（Python 3.11 以上・標準ライブラリのみ）は、スナップショットのファイルを配信し、veil ノードを長輪詢で待たせます。
+参照実装を 2 つ同梱しています。どちらもスナップショットのファイルを配信し、ノードごとの状態を持ちます。
+
+| | `tools/vds/server`（Rust） | `tools/vds/vds_server.py`（Python） |
+|---|---|---|
+| 転送 | gRPC **と** REST を 1 つのポートで（HTTP/1.1・h2c・TLS） | REST のみ |
+| 起動 | `cargo run --release --manifest-path tools/vds/server/Cargo.toml -- ...` または `docker/Dockerfile.vds-server` のイメージ | `python3 tools/vds/vds_server.py ...`（3.11 以上・標準ライブラリのみ） |
 
 ```bash
+veil-vds-server --snapshot snapshot.toml --listen 0.0.0.0:18000 \
+    [--token-file token] [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
 python3 tools/vds/vds_server.py --snapshot snapshot.toml --listen 0.0.0.0:18000 \
     [--token-file token] [--hold 30]
 ```
@@ -187,9 +230,9 @@ type = "Proxy"
 upstream = "api"
 ```
 
-サーバはファイルを監視し、内容が変わると（バージョンは SHA-256 の先頭 16 桁）保留中の要求に応答します。TOML として解析できない
-スナップショットは公開されず、前のものが残ります。エンドポイントは `POST /v1/discovery`（プロトコル）、`GET /v1/status`
-（ノードごとの ACK 済みバージョンと最後の NACK を JSON で返す）、`GET /healthz` です。veil 側の設定は次のとおりです。
+サーバはファイルを監視し、内容が変わると（バージョンは SHA-256 の先頭 16 桁）gRPC のストリームへ押し出し、保留中の REST の要求に応答します。TOML として解析できない
+スナップショットは公開されず、前のものが残ります。エンドポイントは gRPC のサービス（Rust 版のみ）、`POST /v1/discovery`、`GET /v1/status`
+（ノードごとの ACK 済みバージョン・最後の NACK・転送を JSON で返す）、`GET /healthz` です。veil 側の設定は次のとおりです。
 
 ```toml
 [vds]
@@ -228,15 +271,13 @@ spec:
     spec:
       containers:
         - name: vds
-          image: python:3.12-alpine
-          command: ["python3", "-I", "/opt/vds/vds_server.py", "--snapshot", "/etc/vds/snapshot.toml",
-                    "--listen", "0.0.0.0:18000", "--token-file", "/etc/veil/vds/token"]
+          image: veil-vds-server:latest   # docker/Dockerfile.vds-server
+          args: ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000",
+                 "--token-file", "/etc/veil/vds/token"]
           volumeMounts:
-            - {name: code, mountPath: /opt/vds, readOnly: true}       # vds_server.py を入れた ConfigMap
             - {name: snapshot, mountPath: /etc/vds, readOnly: true}
             - {name: token, mountPath: /etc/veil/vds, readOnly: true} # Secret
       volumes:
-        - {name: code, configMap: {name: veil-vds-server}}
         - {name: snapshot, configMap: {name: veil-vds-snapshot}}
         - {name: token, secret: {secretName: veil-vds-token}}
 ---
@@ -245,7 +286,7 @@ kind: Service
 metadata: {name: veil-vds}
 spec:
   selector: {app: veil-vds}
-  ports: [{name: http-vds, port: 18000, targetPort: 18000}]
+  ports: [{name: grpc-vds, port: 18000, targetPort: 18000}]   # Istio は grpc- 接頭辞、Linkerd は HTTP/2 を自動判別
 ```
 
 スナップショットを `subPath` でマウントしないでください（kubelet は `subPath` のマウントを更新しません）。veil のコンテナでは
@@ -259,6 +300,7 @@ spec:
 |------|--------------|
 | 何も起きない | `[vds] enabled = true`、正しい `server` の URL、ログの `[VDS]` 行（`subscribing to ...`） |
 | `rejected snapshot` の警告 | メッセージが検証エラーです。スナップショットを直してください（前の設定は動き続けています） |
-| `control plane returned 401` | `token_file` の内容が制御プレーンのトークンと一致していない |
+| `control plane returned 401` / `grpc-status 16` | `token_file` の内容が制御プレーンのトークンと一致していない |
+| `stream ... failed` で `HTTP 404`・`did not negotiate h2` | 制御プレーンが gRPC を話さない: `transport = "rest"` にする（例: `tools/vds/vds_server.py`） |
 | TLS エラー | プライベート CA なら `ca_cert`、証明書のサーバ名、mTLS なら `client_cert`/`client_key` |
 | リロードでスナップショットが消えた？ | 消えません。SIGHUP のたびに適用し直されます。同じキーに `-o`/`VEIL_OVERRIDE_<n>` があるとそちらが優先されます |

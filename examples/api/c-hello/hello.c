@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *listen = getenv("VEIL_LISTEN");
-    if (listen != NULL && *listen != '\0' && check(veil_config_listen(cfg, listen), "listen")) {
+    if (listen != NULL && *listen != '\0' && check(veil_config_listen_cleartext(cfg, listen), "listen")) {
         return 1;
     }
 

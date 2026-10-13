@@ -57,7 +57,7 @@ docker run --rm --network "${NET_NAME}" curlimages/curl:latest \
 cat >"${RESULTS_DIR}/bad-backend.toml" <<EOF
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 threads = 0
 [logging]
 level = "info"

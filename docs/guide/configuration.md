@@ -16,8 +16,12 @@ The following table lists default values for major configuration options:
 | `[server]` | `server_header_enabled` | `false` | Enable Server header |
 | `[server]` | `server_header_value` | `"veil"` | Server header value |
 | `[server]` | `http2_enabled` | `false` | Enable HTTP/2 |
-| `[server]` | `http3_enabled` | `false` | Enable HTTP/3 |
-| `[server]` | `h2c_http1` | `false` | Also accept plaintext HTTP/1.1 on an h2c-only listener (see [Plaintext-only servers](#plaintext-only-servers-without-tls)) |
+| `[server]` | `listen` | none | TLS listener (HTTP/1.1 + h2 ALPN); at least one of `listen` / `listen_cleartext` is required (see [Listeners](#listeners-listen-and-listen_cleartext)) |
+| `[server]` | `listen_cleartext` | none | Plaintext listener (HTTP/1.1 + h2c, auto-detected) |
+| `[server]` | `enable_secure_redirect` | `true` | Answer every `listen_cleartext` request with a 301 to HTTPS (needs `listen`; `false` serves plaintext) |
+| `[server]` | `allow_http` | `true` | `listen_cleartext` accepts plaintext HTTP/1.1 (else 426) |
+| `[server]` | `allow_h2c` | `true` | `listen_cleartext` accepts h2c (else GOAWAY) |
+| `[http3]` | `enabled` | `false` | Enable HTTP/3 on `listen`'s address (UDP), or on `[http3].listen` |
 | `[logging]` | `level` | `"info"` | Log level |
 | `[logging]` | `format` | `"text"` | Log format |
 | `[logging]` | `channel_size` | `16384` | Log channel buffer size (slots are preallocated and resident, ~88 bytes each; full → messages are dropped, never blocking) |
@@ -79,7 +83,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `recv_drain_max` | `64` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
-| `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `server.http3_enabled`) |
+| `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `[http3] enabled = true`) |
 | `[http3]` | `alt_svc` | _(auto)_ | Override Alt-Svc header value (default: `h3=":PORT"; ma=…` from listen port) |
 | `[http3]` | `alt_svc_ma_secs` | `86400` | max-age for auto-generated Alt-Svc |
 
@@ -87,11 +91,12 @@ Configuration file example (`examples/config.toml`):
 
 ```toml
 [server]
+# TLS listener: HTTP/1.1 + HTTP/2 (ALPN). Requires [tls]. Plaintext is never accepted here.
 listen = "0.0.0.0:443"
 # Unix domain socket listeners (Unix only)
-# [server].listen and [server].h2c_listen also accept "unix:<path>", e.g.
+# [server].listen and [server].listen_cleartext also accept "unix:<path>", e.g.
 #   listen = "unix:/run/veil/https.sock"
-# Listener side is limited to these two: [[l4]].listen, [server].http and [http3].listen
+# Listener side is limited to these two: [[l4]].listen and [http3].listen
 # are not supported (HTTP/3 is QUIC/UDP and cannot run over a unix socket — set
 # [http3].listen explicitly).
 # Upstream (backend) connections over UDS ARE supported — see "Unix domain socket
@@ -103,23 +108,19 @@ listen = "0.0.0.0:443"
 # The peer address of a UDS connection is reported as the placeholder 127.0.0.1:0
 # (IP blocklist and access logs see this value).
 # unix_socket_permissions = "0660"   # mode applied to the socket file (octal string)
-# Reject plaintext connections on the main listener (default: true)
-# Applies to [server].listen only. When true, protocol detection (MSG_PEEK) is skipped
-# entirely and every connection goes straight to the TLS handshake, so plaintext
-# HTTP/1.1 and h2c clients are disconnected. Set to false to accept h2c / plaintext
-# HTTP/1.1 on the TLS port (requires h2c_enabled = true), which is the pre-0.8 behavior.
-# [server].h2c_listen, [server].http (redirect listener) and [[l4]] are unaffected.
-tls_only = true
-# HTTP to HTTPS redirect (optional)
-# Automatically redirect HTTP access to HTTPS (301 Moved Permanently)
-http = "0.0.0.0:80"
+# Plaintext listener: HTTP/1.1 + h2c, auto-detected (optional, F-200)
+# By default (enable_secure_redirect = true) every request on this port is answered with a
+# 301 to https://<Host>[:<listen port>]. See "Listeners" below.
+listen_cleartext = "0.0.0.0:80"
+# enable_secure_redirect = true    # false: actually serve plaintext (needed when there is no `listen`)
+# allow_http = true                # accept plaintext HTTP/1.1 on listen_cleartext (else 426)
+# allow_h2c = true                 # accept h2c on listen_cleartext (else GOAWAY)
 # Number of worker threads (optional)
 # If unspecified or 0, uses the same number of threads as CPU cores
 threads = 4
 # Enable HTTP/2 (only when built with --features http2)
 http2_enabled = true
-# Enable HTTP/3 (only when built with --features http3)
-http3_enabled = true
+# HTTP/3 is enabled with [http3] enabled = true (only when built with --features http3)
 # Server header configuration (optional)
 # Security consideration: Server header reveals server software information
 # Recommended to disable in production environments
@@ -315,21 +316,73 @@ type = "File"
 path = "/var/www/index.html"
 ```
 
+## Listeners (`listen` and `listen_cleartext`)
+
+Listening is configured by two listeners and HTTP/3 (F-200). At least one of `listen` and `listen_cleartext` is
+required, and they must not use the same address (a single port no longer auto-detects TLS vs. plaintext).
+
+| Key | Protocols | Requires |
+|-----|-----------|----------|
+| `[server].listen` | TLS: HTTP/1.1 + HTTP/2 (ALPN). Plaintext is rejected by the TLS handshake | `[tls]` |
+| `[server].listen_cleartext` | Plaintext: HTTP/1.1 + h2c (prior knowledge), told apart by protocol detection (`MSG_PEEK`) | `listen` if `enable_secure_redirect = true`; the `http2` feature for h2c |
+| `[http3] enabled = true` | HTTP/3 (UDP) on `listen`'s address, or on `[http3].listen` if set | `listen`, `[tls]`, the `http3` feature |
+
+`listen_cleartext` keys (all under `[server]`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `allow_http` | `true` | Accept plaintext HTTP/1.1. When `false`, HTTP/1.1 gets `426 Upgrade Required` |
+| `allow_h2c` | `true` | Accept h2c. When `false`, h2c gets `GOAWAY(PROTOCOL_ERROR)` |
+| `enable_secure_redirect` | `true` | Answer every request (HTTP/1.1 and h2c) with `301` to `https://<Host>[:<listen port>]` (the port is omitted for 443; h2c gets an HTTP/2 301). `true` without `listen` is a configuration error (nowhere to redirect to). Set `false` to actually serve plaintext |
+
+Validation rules (`veil -t` reports them):
+
+- No `listen` and no `listen_cleartext`: error.
+- `listen` equal to `listen_cleartext`: error.
+- `allow_http = false` and `allow_h2c = false`: error (the listener would accept nothing).
+- `enable_secure_redirect = true` (the default) without `listen`: error.
+- `[tls]` is required only when `listen` or `[http3] enabled = true` is present (a `listen_cleartext`-only server needs none, see [Plaintext-only servers](#plaintext-only-servers-without-tls)).
+- `[http3] enabled = true` without `listen`: error (QUIC requires TLS). The `Alt-Svc` header advertises HTTP/3's actual port.
+- UDS: `listen` and `listen_cleartext` accept `unix:<path>`; HTTP/3 does not.
+- The removed keys below are a startup error naming the replacement; they are not silently ignored.
+
+`listen_cleartext` is served by every worker thread, like `listen` (the old `http` redirect listener ran on one
+thread). An idle worker set costs roughly 2 MB of RSS per worker, so a TLS + redirect setup uses a few MB more than
+before; throughput on `listen` is unchanged.
+
+### Migrating from the old keys
+
+The old keys `[server].http`, `tls_only`, `h2c_enabled`, `h2c_listen`, `h2c_http1` and `http3_enabled` were removed
+with no compatibility layer.
+
+| Old | New |
+|-----|-----|
+| `listen` + `tls_only = true` (default) | `listen` |
+| `http = "0.0.0.0:80"` (redirect-only listener) | `listen_cleartext = "0.0.0.0:80"` (redirecting is the default) |
+| `h2c_enabled = true` + `h2c_listen = "0.0.0.0:8080"` | `listen_cleartext = "0.0.0.0:8080"` + `enable_secure_redirect = false` |
+| `h2c_enabled = true` (h2c-only server) + `h2c_http1 = true` | `listen_cleartext = <the old listen>` (no `listen`) + `enable_secure_redirect = false` |
+| `tls_only = false` + `h2c_enabled = true` (one port auto-detecting) | `listen` and a separate `listen_cleartext` port + `enable_secure_redirect = false` |
+| `http3_enabled = true` (+ `[http3] listen`) | `[http3] enabled = true` (+ `[http3] listen` if needed) |
+
+A configuration that had both `http` (redirect) and `h2c_listen` (served h2c) needs two listeners for two purposes;
+`listen_cleartext` is a single address, so run the redirect on a separate veil instance (or let your load balancer
+do it) or choose one behavior.
+
 ## HTTP to HTTPS Redirect
 
-This feature automatically redirects HTTP access to HTTPS.
+`listen_cleartext` redirects HTTP to HTTPS by default (`enable_secure_redirect = true`).
 
 ### Configuration
 
 ```toml
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"  # Enable HTTP redirect
+listen_cleartext = "0.0.0.0:80"  # redirects to HTTPS (the default behavior)
 ```
 
 ### Behavior
 
-- Access to `http://example.com/path` is redirected to `https://example.com/path` with 301
+- Access to `http://example.com/path` is redirected to `https://example.com/path` with 301 (h2c clients get an HTTP/2 301)
 - Domain name is extracted from the Host header to construct the redirect URL
 - **Port handling**: The redirect URL uses the port from the `[server].listen` setting
   - If listen port is 443 (default): `https://example.com/path` (port omitted)
@@ -396,24 +449,20 @@ server_header_value = "MyServer/1.0"
 
 ## Plaintext-only Servers without TLS
 
-`[tls]` may be **omitted** only when the server is plaintext-only: `[server] h2c_enabled = true` with no separate
-`h2c_listen` (or one equal to `listen`), `http3_enabled = false`, and the `http2` feature compiled in. In that case no
-TLS listener is started and `listen` serves h2c (HTTP/2 prior knowledge). Any other configuration without a usable
-`[tls] cert_path` / `key_path` fails validation with "TLS certificate is required".
+`[tls]` may be **omitted** when there is no TLS to terminate: no `listen` and no `[http3] enabled = true`, only
+`listen_cleartext` with `enable_secure_redirect = false` (a redirect needs `listen`). Any configuration with `listen` or
+HTTP/3 and without a usable `[tls] cert_path` / `key_path` fails validation with "TLS certificate is required".
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true
-h2c_http1 = true      # also accept plaintext HTTP/1.1 on this port (default: false)
-tls_only = false
+listen_cleartext = "0.0.0.0:8080"   # HTTP/1.1 + h2c, auto-detected
+enable_secure_redirect = false      # serve plaintext (the default is a 301 to HTTPS)
+# allow_http = true                 # accept plaintext HTTP/1.1 (426 when false)
+# allow_h2c = true                  # accept h2c (GOAWAY when false); needs the `http2` feature
 ```
 
-`[server] h2c_http1` (default `false`): by default an h2c-only listener (`h2c_listen`, or the main listener of an
-h2c-only server) closes connections that turn out to be HTTP/1.1. With `true`, the same port also serves plaintext
-HTTP/1.1 (h2c is recognized by its connection preface). Requires the `http2` feature (ignored with a warning without it).
-This is the default of the [API library](library.md#configuration-in-library-mode). Do not expose plaintext listeners to
-untrusted networks.
+This is the default shape of the [API library](library.md#configuration-in-library-mode). Do not expose plaintext
+listeners to untrusted networks.
 
 ## VDS (`[vds]`)
 
@@ -439,5 +488,5 @@ include them.
 - `[[l4]]` `handler = "<name>"` (feature `l4-handler`): handle the connection/datagram with a registered L4 handler
   instead of forwarding; `upstreams` is then optional. See [L4 proxy](l4-proxy.md#native-handlers).
 - `[api]` (library only): `openapi_enabled`, `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`,
-  `openapi_description`, `max_body_size`, `handler_threads`, `tokio_threads`. See
+  `openapi_description`, `max_body_size`, `handler_threads`, `tokio_threads`, `grpc_max_message_size`. See
   [the library guide](library.md#api-keys-library-only).

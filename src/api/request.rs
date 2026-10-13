@@ -39,6 +39,8 @@ pub struct Request {
     pub(crate) params: PathParams,
     pub(crate) client_ip: IpAddr,
     pub(crate) version: HttpVersion,
+    /// ストリーミング受信の本文（`streaming_request` のルートで HTTP/2 のとき。F-197）
+    pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
 }
 
 impl Request {
@@ -60,6 +62,7 @@ impl Request {
             params: Vec::new(),
             client_ip: IpAddr::from([127, 0, 0, 1]),
             version: HttpVersion::Http11,
+            body_stream: None,
         }
     }
 
@@ -106,6 +109,30 @@ impl Request {
     /// 全ヘッダ（受信順、名前は受信したままの大文字小文字）。
     pub fn headers(&self) -> &[(Bytes, Bytes)] {
         &self.headers
+    }
+
+    /// 本文を届いた順の断片で受け取る（1 回だけ取れる。F-197）。
+    ///
+    /// ストリーミング受信のルート（HTTP/2）では届いた DATA を順に返す。それ以外では全量の本文を
+    /// 1 断片（空なら 0 断片）として返す。
+    pub fn take_body_stream(&self) -> super::stream::RequestBodyStream {
+        if let Some(slot) = &self.body_stream {
+            if let Some(s) = slot.lock().unwrap().take() {
+                return s;
+            }
+        }
+        let (mut tx, slot) = super::stream::request_body_channel(1);
+        if !self.body.is_empty() {
+            let _ = tx.try_send(self.body.clone());
+        }
+        drop(tx);
+        let s = slot.lock().unwrap().take().expect("fresh slot");
+        s
+    }
+
+    /// ストリーミング受信のルートか（本文が `take_body_stream` で届く）。
+    pub fn is_body_streaming(&self) -> bool {
+        self.body_stream.is_some()
     }
 
     /// 本文。

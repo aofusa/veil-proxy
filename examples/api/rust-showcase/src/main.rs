@@ -6,6 +6,7 @@
 //! - tower の層（`/admin` だけに認証、全体に応答ヘッダ）
 //! - GraphQL（async-graphql）
 //! - L4 ネイティブハンドラ（TCP エコー・UDP エコー）
+//! - ストリーミング応答とトレーラ・ストリーミング受信（F-197）
 //! - config.toml の取り込みと Rust コードでの上書き
 use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,28 @@ async fn files(req: &Request) -> String {
     format!("file: {}", req.param("rest").unwrap_or_default())
 }
 
+/// 本文を断片で返し、最後にトレーラを送る（ストリーミング応答、F-197）
+#[veil::route(path = "/stream", method = "GET", tags = ["demo"])]
+async fn stream_lines() -> Response {
+    let chunks = (1..=3)
+        .map(|i| BodyChunk::Data(bytes::Bytes::from(format!("line {}\n", i))))
+        .chain(std::iter::once(BodyChunk::Trailers(vec![(
+            bytes::Bytes::from_static(b"x-lines"),
+            bytes::Bytes::from_static(b"3"),
+        )])));
+    Response::stream(200, futures::stream::iter(chunks)).with_header("content-type", "text/plain")
+}
+
+/// 要求本文を届いた順に受け取り、大文字にして返す（ストリーミング受信 + 応答。HTTP/2 では全二重）
+#[veil::route(path = "/upper", method = "POST", streaming = true, tags = ["demo"])]
+async fn upper(req: &Request) -> Response {
+    use futures::StreamExt;
+    let body = req
+        .take_body_stream()
+        .map(|chunk| BodyChunk::Data(bytes::Bytes::from(chunk.to_ascii_uppercase())));
+    Response::stream(200, body).with_header("content-type", "text/plain")
+}
+
 /// 管理用（tower の層で認証する）
 #[veil::route(path = "/admin/stats", method = "GET", tags = ["admin"])]
 async fn admin_stats(counter: State<Counter>) -> Json<serde_json::Value> {
@@ -206,11 +229,11 @@ where
 
 #[veil::main]
 async fn main() -> Result<(), veil::api::Error> {
-    // config.toml があれば取り込み、無ければライブラリ既定（平文 0.0.0.0:8080、スレッド数 = CPU 数）。
-    // 環境変数 VEIL_LISTEN があればコード側で listen を上書きする例。
+    // config.toml があれば取り込み、無ければライブラリ既定（平文 127.0.0.1:8080、スレッド数 = CPU 数）。
+    // 環境変数 VEIL_LISTEN があればコード側で listen_cleartext（平文）を上書きする例。
     let mut builder = Config::load()?.builder().openapi_title("veil showcase");
     if let Ok(listen) = std::env::var("VEIL_LISTEN") {
-        builder = builder.listen(&listen);
+        builder = builder.listen_cleartext(&listen);
     }
     let config = builder.build();
 

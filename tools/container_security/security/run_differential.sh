@@ -68,7 +68,7 @@ docker run -d --name "${DF_NGINX}" --network "${NET_NAME}" \
 cat >"${RESULTS_DIR}/diff-veil.toml" <<EOF
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:80"
 threads = 0
 [logging]
 level = "warn"

@@ -12,5 +12,5 @@ configMapGenerator:
     options: {disableNameSuffixHash: true}
 generatorOptions:
   disableNameSuffixHash: false
-# veil-vds-server（tools/vds/vds_server.py）・veil-tls・veil-vds-token は tools/k8s/kind-e2e.sh が作る
+# veil-tls・veil-vds-token は tools/k8s/kind-e2e.sh が作る（制御プレーンのイメージ veil-vds-server も同スクリプトがビルドする）
 # （kustomize はこのディレクトリの外のファイルを参照できず、Secret はリポジトリに置かないため）。

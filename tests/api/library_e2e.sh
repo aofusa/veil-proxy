@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|c|python|nonregression|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]   （既定 all）
 #
 # 前提: cargo・gcc・curl・nc・python3。Python は PYTHON（既定: 作業用 venv を自動作成し maturin で導入）。
 # 停止は pid 指定の kill（`pkill -f` は自分のシェルを巻き込むので使わない）。
@@ -30,7 +30,7 @@ run_rust() {
   local W; W="$(mktemp -d)"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
   cat > "$W/config.toml" <<TOML
 [server]
-listen = "127.0.0.1:$P"
+listen_cleartext = "127.0.0.1:$P"
 [logging]
 level = "info"
 [[l4]]
@@ -64,6 +64,13 @@ TOML
   expect "tower layer (global header)" "x-powered-by: veil" curl -s -i "$B/hello"
   expect "HEAD keeps length, no body" "content-length: 13" curl -s -I "$B/hello"
   expect "h2c prior knowledge" '"id":3' curl -s --http2-prior-knowledge "$B/users/3"
+  expect "stream (HTTP/1.1 chunked)" "line 3" curl -s "$B/stream"
+  expect "stream trailer (HTTP/1.1)" "x-lines: 3" curl -s -i "$B/stream"
+  expect "stream trailer (h2c)" "x-lines: 3" curl -s -i --http2-prior-knowledge "$B/stream"
+  expect "stream HEAD (no body)" "transfer-encoding: chunked" bash -c "curl -s -I '$B/stream' | tr A-Z a-z"
+  expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
+  expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
+  expect "streaming request (h2c, 1MiB)" "1048576" bash -c "head -c 1048576 /dev/zero | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
   expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}'
   expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7Badd(a:2,b:3)%7D"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
@@ -128,6 +135,25 @@ run_python() {
   rm -f /tmp/veil-py-$$.log
 }
 
+run_grpc() {
+  echo "== gRPC (examples/api/rust-grpc + tonic / quinn+h3 クライアント、F-197)"
+  local T="$ROOT/target/examples-api"
+  (cd "$ROOT/examples/api/rust-grpc" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build server"; return; }
+  (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build client"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port); local S; S=$(free_port)
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" \
+    VEIL_TLS_KEY="$W/key.pem" exec "$T/debug/veil-example-grpc") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" || { bad "start"; cat "$W/log"; return; }
+  local out; out="$(timeout 300 "$T/debug/veil-grpc-check" --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
+  local rc=$?
+  echo "$out" | sed 's/^/  /'
+  [ "$rc" = 0 ] && ok "grpc interop (exit 0)" || bad "grpc interop (exit $rc)"
+  kill "$PID"
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない"
   (cd "$ROOT" && cargo build -q --features full) || { bad "build full"; return; }
@@ -135,14 +161,25 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no veil::api symbols in the full binary" || bad "veil::api symbols found ($n)"
   n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -ciE "inventory|async_graphql|tokio::runtime|pyo3") || true
   [ "$n" = 0 ] && ok "no inventory/async-graphql/tokio/pyo3 in the full binary" || bad "library dependencies linked ($n)"
+  n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -cE "veil_build::|prost_build::|(^|[^a-z_])tonic::") || true
+  [ "$n" = 0 ] && ok "no veil-build/prost-build/tonic in the full binary" || bad "gRPC library code linked ($n)"
+  n=$(nm -C "$ROOT/target/debug/veil" 2>/dev/null | grep -cE "veil::tokio::") || true
+  [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
+  # F-198: api の既定（tokio-compat）は tokio に依存しない
+  local t; t=$(cd "$ROOT" && cargo tree -q -e normal,build --no-default-features --features full,api -i tokio 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no tokio in the dependency tree of features=api" ;;
+    *) bad "tokio is a dependency of features=api: $t" ;;
+  esac
 }
 
 case "$WHAT" in
   rust) run_rust ;;
+  grpc) run_grpc ;;
   c) run_c ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
-  all) run_nonregression; run_rust; run_c; run_python ;;
-  *) echo "usage: $0 [rust|c|python|nonregression|all]"; exit 2 ;;
+  all) run_nonregression; run_rust; run_grpc; run_c; run_python ;;
+  *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

@@ -17,6 +17,14 @@
 //! 優先順位: config.toml < VDS < 環境変数 `VEIL_OVERRIDE_<n>` < CLI `--override`。
 //! listen・TLS・L4 は対象外（再起動が必要なため）。
 //!
+//! 転送は 2 種類（`[vds] transport`）:
+//!
+//! - `"grpc"`（既定、F-199）: `veil.vds.v1.VeilDiscoveryService/StreamSnapshots` の双方向ストリーム
+//!   （`proto/veil/vds/v1/vds.proto`、`src/vds_grpc.rs`）。サーバが版を押し出すので長輪詢の待ちが無い。
+//! - `"rest"`: 上の `POST /v1/discovery` の長輪詢。
+//!
+//! 適用・ACK/NACK・状態は両者で共通（[`apply_snapshot`]・[`record_applied`]・[`record_rejected`]）。
+//!
 //! 通信は専用スレッドで行い、データプレーン（ワーカーのイベントループ）には一切触れない。
 
 use crate::config::SHUTDOWN_FLAG;
@@ -52,7 +60,11 @@ pub struct VdsConfig {
     /// mTLS のクライアント証明書・鍵（PEM、両方指定したときだけ使う）。
     pub client_cert: String,
     pub client_key: String,
-    /// 長輪詢の保留時間の上限（秒、制御プレーンへ伝える）。
+    /// 転送（`"grpc"` = gRPC の双方向ストリーム、`"rest"` = REST の長輪詢）。
+    pub transport: String,
+    /// gRPC の接続の TCP キープアライブ（秒、0 で無効）。応答が来ない長寿命のストリームで死活を見る。
+    pub keepalive_secs: u64,
+    /// 長輪詢の保留時間の上限（秒、制御プレーンへ伝える。REST）。
     pub poll_timeout_secs: u64,
     pub retry_initial_ms: u64,
     pub retry_max_ms: u64,
@@ -73,6 +85,8 @@ impl Default for VdsConfig {
             ca_cert: String::new(),
             client_cert: String::new(),
             client_key: String::new(),
+            transport: "grpc".into(),
+            keepalive_secs: 30,
             poll_timeout_secs: 30,
             retry_initial_ms: 500,
             retry_max_ms: 30_000,
@@ -241,6 +255,23 @@ pub fn spawn_if_enabled(config_path: PathBuf) {
         error!("[VDS] vds.server: {}", e);
         return;
     }
+    if cfg.transport == "grpc" {
+        update_status(|_| {});
+        let spawned = std::thread::Builder::new()
+            .name("veil-vds".into())
+            .spawn(move || crate::vds_grpc::run(cfg, config_path));
+        if let Err(e) = spawned {
+            error!("[VDS] failed to spawn the VDS thread: {}", e);
+        }
+        return;
+    }
+    if cfg.transport != "rest" {
+        error!(
+            "[VDS] vds.transport must be \"grpc\" or \"rest\" (got \"{}\")",
+            cfg.transport
+        );
+        return;
+    }
     let tls = crate::ctrl_http::TlsOptions {
         ca_cert: Some(cfg.ca_cert.clone()),
         client_cert: Some(cfg.client_cert.clone()),
@@ -265,7 +296,7 @@ pub fn spawn_if_enabled(config_path: PathBuf) {
     }
 }
 
-fn node_id(cfg: &VdsConfig) -> String {
+pub(crate) fn node_id(cfg: &VdsConfig) -> String {
     if !cfg.node_id.is_empty() {
         return cfg.node_id.clone();
     }
@@ -331,28 +362,16 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
                 update_status(|s| s.connected = true);
                 match handle_response(&r.body, &cfg, &config_path) {
                     Ok((v, n)) => {
-                        info!("[VDS] applied snapshot version '{}'", v);
+                        record_applied(&v);
                         version_info = v;
                         nonce = n;
                         error_detail = None;
-                        update_status(|s| {
-                            s.version_info = version_info.clone();
-                            s.last_error = None;
-                            s.updates_acked += 1;
-                        });
                     }
                     Err((n, e)) => {
                         // NACK: 前の version_info のまま error_detail を返す（前の設定は残る）
-                        warn!(
-                            "[VDS] rejected snapshot (keeping version '{}'): {}",
-                            version_info, e
-                        );
+                        record_rejected(&version_info, &e);
                         nonce = n;
-                        error_detail = Some(e.clone());
-                        update_status(|s| {
-                            s.last_error = Some(e);
-                            s.updates_nacked += 1;
-                        });
+                        error_detail = Some(e);
                     }
                 }
                 // ACK/NACK はすぐ次の要求で伝える
@@ -381,6 +400,39 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
         }
     }
     info!("[VDS] stopped");
+}
+
+/// 適用に成功した版を記録する（ACK の前）。
+pub(crate) fn record_applied(version_info: &str) {
+    info!("[VDS] applied snapshot version '{}'", version_info);
+    update_status(|s| {
+        s.connected = true;
+        s.version_info = version_info.to_string();
+        s.last_error = None;
+        s.updates_acked += 1;
+    });
+}
+
+/// 拒否した版を記録する（NACK の前）。
+pub(crate) fn record_rejected(kept_version: &str, error: &str) {
+    warn!(
+        "[VDS] rejected snapshot (keeping version '{}'): {}",
+        kept_version, error
+    );
+    update_status(|s| {
+        s.last_error = Some(error.to_string());
+        s.updates_nacked += 1;
+    });
+}
+
+/// 接続状態を記録する。
+pub(crate) fn record_connection(connected: bool, error: Option<String>) {
+    update_status(|s| {
+        s.connected = connected;
+        if error.is_some() {
+            s.last_error = error;
+        }
+    });
 }
 
 fn sleep_backoff(backoff: &mut u64, max: u64) {
@@ -412,19 +464,38 @@ fn handle_response(
 ) -> Result<(String, String), (String, String)> {
     let resp: DiscoveryResponse = serde_json::from_slice(body)
         .map_err(|e| (String::new(), format!("invalid DiscoveryResponse: {}", e)))?;
-    let nonce = resp.nonce.clone();
-    if !resp.type_url.is_empty() && resp.type_url != TYPE_SNAPSHOT {
-        return Err((nonce, format!("unexpected type_url '{}'", resp.type_url)));
+    apply_snapshot(
+        resp.version_info,
+        resp.nonce,
+        &resp.type_url,
+        &resp.resources,
+        cfg,
+        config_path,
+    )
+}
+
+/// スナップショットを検証・適用する（REST・gRPC 共通）。`resources` は REST 版の形
+/// （`@type`・`name` と本体のキーを持つオブジェクト）。成功は (version_info, nonce)、失敗は (nonce, 理由)。
+pub(crate) fn apply_snapshot(
+    version_info: String,
+    nonce: String,
+    type_url: &str,
+    resources: &[Value],
+    cfg: &VdsConfig,
+    config_path: &std::path::Path,
+) -> Result<(String, String), (String, String)> {
+    if !type_url.is_empty() && type_url != TYPE_SNAPSHOT {
+        return Err((nonce, format!("unexpected type_url '{}'", type_url)));
     }
     let overlay =
-        resources_to_overlay(&resp.resources, cfg.max_resources).map_err(|e| (nonce.clone(), e))?;
+        resources_to_overlay(resources, cfg.max_resources).map_err(|e| (nonce.clone(), e))?;
     let previous = crate::config_override::swap_vds_overlay(Some(Arc::new(overlay)));
     if let Err(e) = crate::config::reload_config(config_path) {
         // 失敗: オーバーレイを戻す（現在の設定は reload 失敗で変わっていない）
         crate::config_override::swap_vds_overlay(previous);
         return Err((nonce, e.to_string()));
     }
-    Ok((resp.version_info, nonce))
+    Ok((version_info, nonce))
 }
 
 #[cfg(test)]

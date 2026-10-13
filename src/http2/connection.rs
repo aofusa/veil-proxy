@@ -670,8 +670,13 @@ where
 
     /// ストリームがアイドル状態でないことを検証 (RFC 7540 Section 5.1)
     fn validate_stream_not_idle(&self, stream_id: u32, frame_type: &str) -> Http2Result<()> {
-        if self.streams.get_ref(stream_id).is_none() {
-            // ストリームが存在しない = idle 状態
+        // 表に無いストリームでも、開いたことのある ID（クライアント起点で最大 ID 以下）は idle ではなく
+        // closed（RFC 9113 §5.1）。閉じた直後のストリームへの WINDOW_UPDATE・DATA は普通に届く
+        // （応答を送り終えた後のアップロードの残り、クライアントの取り消し直後等）ので接続エラーにしない。
+        if self.streams.get_ref(stream_id).is_none()
+            && (stream_id.is_multiple_of(2) || stream_id > self.streams.max_client_stream_id())
+        {
+            // 一度も開かれていない = idle 状態
             return Err(Http2Error::connection_error(
                 Http2ErrorCode::ProtocolError,
                 format!("{} frame on idle stream {}", frame_type, stream_id),
@@ -1207,10 +1212,17 @@ where
         }
         self.conn_recv_window -= data_len;
 
-        // ストリームレベルフロー制御
-        let stream = self.streams.get(stream_id).ok_or_else(|| {
-            Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found")
-        })?;
+        // ストリームレベルフロー制御（表の検索は 1 回）
+        let Some(stream) = self.streams.get(stream_id) else {
+            // 閉じたストリームへの DATA: 読み捨て、コネクションのクレジットは返す（返さないと
+            // 取り消し・打ち切りのたびに接続の受信ウィンドウが減り続け、いずれ全ストリームが止まる）。
+            self.maybe_send_window_update(stream_id).await?;
+            return Err(Http2Error::stream_error(
+                stream_id,
+                Http2ErrorCode::StreamClosed,
+                "DATA on closed stream",
+            ));
+        };
 
         // アクティビティ更新 (Slow Loris 対策)
         stream.update_activity();
@@ -1805,6 +1817,36 @@ where
             .await
     }
 
+    /// 任意のトレーラ（名前は小文字）を END_STREAM 付き HEADERS で送る（ハンドラのストリーミング
+    /// 応答、F-197）。呼び出し側は先に `flush_write_buf` しておくこと。
+    #[cfg(feature = "handler")]
+    pub async fn send_trailers<K, V>(
+        &mut self,
+        stream_id: u32,
+        trailers: &[(K, V)],
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let trailer_list: Vec<(&[u8], &[u8], bool)> = trailers
+            .iter()
+            .map(|(n, v)| (n.as_ref(), v.as_ref(), false))
+            .collect();
+        let trailer_block = self
+            .hpack_encoder
+            .encode(&trailer_list)
+            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+        let trailer_frame =
+            self.frame_encoder
+                .encode_headers(stream_id, &trailer_block, true, true, None);
+        self.write_all(trailer_frame).await?;
+        if let Some(stream) = self.streams.get(stream_id) {
+            stream.send_headers(true)?;
+        }
+        Ok(())
+    }
+
     /// gRPC トレイラーを送信
     ///
     /// grpc-status と grpc-message をトレイラーとして送信し、
@@ -2361,6 +2403,80 @@ pub struct H2RequestParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 読むと EOF、書いたものは捨てるだけのソケット（フレーム処理の単体テスト用）。
+    struct NullIo;
+
+    impl crate::runtime::io::AsyncReadRent for NullIo {
+        async fn read<T: crate::runtime::buf::IoBufMut>(
+            &mut self,
+            buf: T,
+        ) -> crate::runtime::io::BufResult<usize, T> {
+            (Ok(0), buf)
+        }
+    }
+
+    impl crate::runtime::io::AsyncWriteRent for NullIo {
+        async fn write<T: crate::runtime::buf::IoBuf>(
+            &mut self,
+            buf: T,
+        ) -> crate::runtime::io::BufResult<usize, T> {
+            let n = buf.bytes_init();
+            (Ok(n), buf)
+        }
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 閉じて表から消えたストリームへの WINDOW_UPDATE・DATA は接続エラーにしない（RFC 9113 §5.1）。
+    /// 開いたことの無い ID は従来どおり idle として接続エラー。
+    #[test]
+    fn frames_on_closed_streams_are_not_connection_errors() {
+        futures::executor::block_on(async {
+            let mut conn = Http2Connection::new(NullIo, Http2Settings::default());
+            conn.streams.get_or_create_client_stream(1).unwrap();
+            conn.streams.get_or_create_client_stream(3).unwrap();
+            for id in [1, 3] {
+                conn.streams.get(id).unwrap().send_rst_stream();
+            }
+            conn.streams.cleanup_closed();
+            assert!(conn.streams.get_ref(1).is_none());
+
+            let r = conn
+                .process_frame(Frame::WindowUpdate {
+                    stream_id: 1,
+                    increment: 100,
+                })
+                .await;
+            assert!(matches!(r, Ok(None)), "{:?}", r.err());
+
+            let window = conn.conn_recv_window;
+            let r = conn
+                .process_frame(Frame::Data {
+                    stream_id: 3,
+                    end_stream: false,
+                    data: vec![0u8; 1000],
+                })
+                .await;
+            let e = r.expect_err("stream error");
+            assert!(!e.should_goaway(), "must not be a connection error: {}", e);
+            assert_eq!(e.rst_stream_id(), Some(3));
+            // 閉じたストリームの DATA もコネクションの受信ウィンドウを消費する（補充は閾値で行う）
+            assert_eq!(conn.conn_recv_window, window - 1000);
+
+            // 一度も開いていない ID は idle
+            for id in [5, 2] {
+                let r = conn
+                    .process_frame(Frame::WindowUpdate {
+                        stream_id: id,
+                        increment: 1,
+                    })
+                    .await;
+                assert!(r.is_err_and(|e| e.should_goaway()), "stream {}", id);
+            }
+        });
+    }
 
     // ====================
     // CONNECTION_PREFACE テスト

@@ -33,9 +33,10 @@ docker build -f docker/Dockerfile.glibc --build-arg CARGO_FEATURES=full-containe
 | 項目 | 方法 |
 |------|------|
 | 設定ファイル | ConfigMap を `/etc/veil/conf.d/config.toml` にマウント |
+| リスナー | `[server] listen = "0.0.0.0:8443"`（TLS）と `listen_cleartext = "0.0.0.0:8080"`（平文 HTTP/1.1 + h2c）。Pod 間はメッシュが暗号化するので `enable_secure_redirect = false`（[リスナー](configuration.md#リスナーlisten-と-listen_cleartext)） |
 | 環境ごとの差分 | 環境変数 `VEIL_OVERRIDE_<n>`（[running.md](running.md#環境変数による設定の上書きveil_override_n)）。overlay は `VEIL_OVERRIDE_3='vds.enabled = true'` で VDS を有効にする |
 | TLS 証明書 | Secret をディレクトリでマウント（`subPath` は使わない）し `[tls] auto_reload = true`。Secret の更新（`..data` の付け替え）に追従する（[tls.md](tls.md#コンテナでの証明書秘密鍵)） |
-| 動的なルート | [VDS](vds.md)。`veil-vds-snapshot` ConfigMap を更新すると、kubelet が 1 分程度で制御プレーンへ同期し、veil が適用する |
+| 動的なルート | [VDS](vds.md)。`veil-vds-snapshot` ConfigMap を更新すると、kubelet が 1 分程度で制御プレーンへ同期し、制御プレーンが gRPC のストリームで veil へ押し出して veil が適用する |
 | 停止 | SIGTERM で受付を止め、アイドルなキープアライブ接続はすぐ閉じ、残りを `graceful_shutdown_timeout_secs` 内に終える（`terminationGracePeriodSeconds` より短くする） |
 | 堅牢化 | 非 root（65532）・読み取り専用ルート FS・全 capability を落とし・`RuntimeDefault` seccomp で動く。veil 自身の seccomp・Landlock も有効のまま |
 
@@ -60,6 +61,6 @@ tools/k8s/kind-e2e.sh glibc all
 
 kind のクラスタを作り、イメージを読み込み、メッシュを導入して overlay をデプロイし、疎通（HTTP/1.1・h2c）、mTLS の
 証拠（Istio の XFCC の SPIFFE ID・Linkerd の `l5d-client-id`）、メッシュ外クライアントの拒否（Istio STRICT）、
-Secret の証明書での TLS と Secret 更新での差し替え、`VEIL_OVERRIDE_<n>`、VDS でのルート追加、SIGTERM 後の
+Secret の証明書での TLS と Secret 更新での差し替え、`VEIL_OVERRIDE_<n>`、VDS でのルート追加（メッシュ越しの gRPC ストリーム、制御プレーン再起動後の再接続）、SIGTERM 後の
 graceful shutdown を確かめる。docker・kind・kubectl・istioctl・linkerd・openssl が必要。snap 版 docker は `/tmp` を
 読めないため、一時ファイルは `target/tmp` に置く。

@@ -69,6 +69,8 @@ pub struct ApiSettings {
     pub max_body_size: usize,
     pub handler_threads: usize,
     pub tokio_threads: usize,
+    /// gRPC の受信メッセージ上限（F-197、`grpc-handler`）
+    pub grpc_max_message_size: usize,
 }
 
 impl ApiSettings {
@@ -103,6 +105,7 @@ impl ApiSettings {
             max_body_size: n("max_body_size", 10 * 1024 * 1024),
             handler_threads: n("handler_threads", 0),
             tokio_threads: n("tokio_threads", 2),
+            grpc_max_message_size: n("grpc_max_message_size", 4 * 1024 * 1024),
         }
     }
 }
@@ -140,6 +143,7 @@ pub(crate) struct PendingRoute {
     pub methods: Vec<String>,
     pub func: HandlerFn,
     pub meta: OperationMeta,
+    pub streaming_request: bool,
 }
 
 /// ハンドラ関数を包むミドルウェア（`layer_on` 等）。`prefix` に一致するルートだけに掛かる。
@@ -159,7 +163,7 @@ pub(crate) struct Middleware {
 /// ```
 pub struct App {
     config: Result<Config, ConfigError>,
-    routes: Vec<PendingRoute>,
+    pub(crate) routes: Vec<PendingRoute>,
     middleware: Vec<Middleware>,
     include_macro_routes: bool,
     setup: Vec<SetupFn>,
@@ -260,7 +264,24 @@ impl App {
             methods: methods.iter().map(|m| m.to_string()).collect(),
             func,
             meta,
+            streaming_request: false,
         });
+        self
+    }
+
+    /// 要求本文をストリーミングで受け取るハンドラ関数を登録する（`Request::take_body_stream`、F-197）。
+    pub fn route_fn_streaming(
+        mut self,
+        name: &str,
+        methods: &[&str],
+        path: &str,
+        func: HandlerFn,
+        meta: OperationMeta,
+    ) -> App {
+        self = self.route_fn(name, methods, path, func, meta);
+        if let Some(last) = self.routes.last_mut() {
+            last.streaming_request = true;
+        }
         self
     }
 
@@ -310,7 +331,7 @@ impl App {
     }
 
     /// ハンドラ関数を包むミドルウェアを登録する（`prefix` が `"/"` なら全ルート）。
-    /// tower の層は `layer` / `layer_on`（`tokio-interface` feature）を使う。
+    /// tower の層は `layer` / `layer_on`（`api-core`）を使う。
     pub fn wrap_on(
         mut self,
         prefix: &str,
@@ -345,6 +366,7 @@ impl App {
                     methods: def.methods.iter().map(|m| m.to_string()).collect(),
                     func: Arc::new(move |req| f(req)),
                     meta: (def.meta)(),
+                    streaming_request: def.streaming_request,
                 });
             }
         }
@@ -359,7 +381,8 @@ impl App {
             }
             let methods: Vec<&str> = route.methods.iter().map(|s| s.as_str()).collect();
             let entry =
-                HandlerEntry::new(route.name.as_str(), &route.path, &methods, func, route.meta)?;
+                HandlerEntry::new(route.name.as_str(), &route.path, &methods, func, route.meta)?
+                    .with_streaming_request(route.streaming_request);
             handler::register(entry)?;
         }
         start(config)
@@ -408,6 +431,8 @@ fn start(config: Config) -> Result<(), Error> {
         let settings = ApiSettings::from_value(api.as_ref());
         MAX_BODY_SIZE.store(settings.max_body_size, Ordering::Relaxed);
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
+        #[cfg(feature = "grpc-handler")]
+        super::grpc::set_max_message_size(settings.grpc_max_message_size);
         if settings.handler_threads > 0 {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);
         }

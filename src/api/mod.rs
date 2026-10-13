@@ -14,7 +14,7 @@
 //!
 //! #[veil::main]
 //! async fn main() -> Result<(), veil::api::Error> {
-//!     let config = Config::load()?.builder().listen("0.0.0.0:8080").build();
+//!     let config = Config::load()?.builder().listen_cleartext("0.0.0.0:8080").build();
 //!     veil::serve(config).await
 //! }
 //! ```
@@ -25,20 +25,23 @@ pub mod app;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod extract;
+#[cfg(feature = "grpc-handler")]
+pub mod grpc;
 pub mod handler;
 pub mod pattern;
 pub mod request;
 pub mod response;
 pub(crate) mod routes;
 pub mod schema;
+pub mod stream;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
 
-#[cfg(feature = "tokio-interface")]
+#[cfg(feature = "tower-compat")]
 pub mod tower;
 
-#[cfg(feature = "tokio-interface")]
+#[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 pub mod tokio_compat;
 
 #[cfg(feature = "graphql")]
@@ -57,6 +60,7 @@ pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta};
 pub use request::{HttpVersion, Request};
 pub use response::{ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
+pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
 
 /// よく使う型をまとめて取り込む（`use veil::prelude::*;`）。
 pub mod prelude {
@@ -68,6 +72,7 @@ pub mod prelude {
     pub use super::request::Request;
     pub use super::response::{ApiError, Html, IntoResponse, Response};
     pub use super::schema::{ApiSchema, Validate};
+    pub use super::stream::{BodyChunk, RequestBodyStream};
     #[cfg(feature = "macro")]
     pub use veil_macros::Schema;
 }

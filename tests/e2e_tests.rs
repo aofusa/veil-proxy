@@ -19878,7 +19878,7 @@ async fn test_alt_svc_http3_advertisement() {
         .find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
     assert!(
         alt_svc_h1.is_some(),
-        "HTTP/1.1 response must include Alt-Svc when http3_enabled, headers={:?}",
+        "HTTP/1.1 response must include Alt-Svc when [http3].enabled, headers={:?}",
         headers
     );
     let v = &alt_svc_h1.unwrap().1;

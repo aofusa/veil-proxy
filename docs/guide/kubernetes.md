@@ -34,9 +34,10 @@ docker build -f docker/Dockerfile.glibc --build-arg CARGO_FEATURES=full-containe
 | Concern | How |
 |---------|-----|
 | Config file | ConfigMap mounted at `/etc/veil/conf.d/config.toml` |
+| Listeners | `[server] listen = "0.0.0.0:8443"` (TLS) and `listen_cleartext = "0.0.0.0:8080"` (plaintext HTTP/1.1 + h2c) with `enable_secure_redirect = false`, because the mesh already encrypts Pod-to-Pod traffic ([Listeners](configuration.md#listeners-listen-and-listen_cleartext)) |
 | Per-environment differences | `VEIL_OVERRIDE_<n>` environment variables ([running.md](running.md#configuration-override-via-environment-variables-veil_override_n)); the overlays enable VDS with `VEIL_OVERRIDE_3='vds.enabled = true'` |
 | TLS certificate | Secret mounted as a directory (never with `subPath`) and `[tls] auto_reload = true`; Secret updates are picked up through the `..data` symlink swap ([tls.md](tls.md#certificates-and-keys-in-containers)) |
-| Dynamic routes | [VDS](vds.md): update the `veil-vds-snapshot` ConfigMap; the kubelet syncs it to the control plane within about a minute and veil applies it |
+| Dynamic routes | [VDS](vds.md): update the `veil-vds-snapshot` ConfigMap; the kubelet syncs it to the control plane within about a minute, the control plane pushes it to veil over a gRPC stream and veil applies it |
 | Shutdown | veil stops accepting on SIGTERM, closes idle keep-alive connections at once and drains the rest within `graceful_shutdown_timeout_secs` (keep it below `terminationGracePeriodSeconds`) |
 | Hardening | runs as non-root (65532) with a read-only root filesystem, all capabilities dropped and `RuntimeDefault` seccomp; veil's own seccomp/Landlock stay enabled |
 
@@ -63,6 +64,6 @@ tools/k8s/kind-e2e.sh glibc all
 The script creates a kind cluster, loads the image, installs the mesh, deploys the overlay and checks:
 connectivity (HTTP/1.1 and h2c), mTLS evidence (Istio XFCC SPIFFE ID / Linkerd `l5d-client-id`), rejection of
 a client outside the mesh (Istio STRICT), veil's TLS from the Secret and its hot reload on Secret update,
-`VEIL_OVERRIDE_<n>`, a route added through VDS, and graceful shutdown after SIGTERM. It needs docker, kind,
+`VEIL_OVERRIDE_<n>`, a route added through VDS (gRPC stream through the mesh, reconnect after the control plane restarts), and graceful shutdown after SIGTERM. It needs docker, kind,
 kubectl, istioctl, linkerd and openssl. With snap-packaged docker the script keeps temporary files under
 `target/tmp` (snap docker cannot read `/tmp`).

@@ -3,8 +3,8 @@
 [← Documentation index](README.md) · [日本語](ja/vds.md)
 
 VDS (Veil Discovery Service) lets a **control plane** push the routes and upstreams of a running veil. It is a
-minimal subset of Envoy's xDS (REST-JSON, State-of-the-World) with the same semantics: a version, a nonce,
-long polling, and ACK/NACK. When the control plane publishes a new snapshot, veil validates it, swaps it in with
+minimal subset of Envoy's xDS (State-of-the-World) with the same semantics: a version, a nonce and ACK/NACK,
+carried over a gRPC bidirectional stream (default) or REST-JSON long polling. When the control plane publishes a new snapshot, veil validates it, swaps it in with
 its normal hot-reload path (zero downtime) and acknowledges it. A snapshot that fails validation is rejected
 (NACK) and the previous configuration keeps serving.
 
@@ -14,8 +14,8 @@ its normal hot-reload path (zero downtime) and acknowledges it. A snapshot that 
 - veil talks to the control plane on a **dedicated thread**; the data plane (worker event loops) is never touched.
 - Applying a snapshot goes through exactly the same validation as a SIGHUP reload, so a bad snapshot cannot
   take the proxy down.
-- The control plane is any HTTP server implementing the protocol below. A small reference implementation,
-  `tools/vds/vds_server.py`, ships with veil.
+- The control plane is any server implementing the protocol below. Reference implementations ship with veil:
+  `tools/vds/server` (Rust, gRPC + REST) and `tools/vds/vds_server.py` (Python, REST).
 
 ## Configuration
 
@@ -33,16 +33,18 @@ token_file = "/etc/veil/vds/token"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `false` | start the VDS client thread |
-| `server` | `""` | control plane base URL: `http://host:port[/base]` or `https://...` (required when enabled; the client posts to `{server}/v1/discovery`) |
+| `server` | `""` | control plane base URL: `http://host:port[/base]` or `https://...` (required when enabled) |
+| `transport` | `"grpc"` | `"grpc"`: bidirectional stream (h2c or TLS with ALPN h2); `"rest"`: long polling of `{server}/v1/discovery` |
+| `keepalive_secs` | `30` | TCP keepalive of the gRPC connection (`0` = off) |
 | `node_id` | `""` | identity sent to the control plane; empty = the host name |
 | `cluster` | `""` | cluster / group label sent to the control plane |
-| `token_file` | `""` | file containing a Bearer token; read again for **every** request so it can be rotated; empty = no `Authorization` header |
+| `token_file` | `""` | file containing a Bearer token; read again for every request (REST) or connection (gRPC) so it can be rotated; empty = no `Authorization` header |
 | `ca_cert` | `""` | extra trusted CA (PEM) for `https` servers; empty = the built-in web PKI roots only |
 | `client_cert` / `client_key` | `""` | client certificate and key (PEM) for mutual TLS; used only when both are set |
-| `poll_timeout_secs` | `30` | how long the control plane may hold a request when nothing changed (sent as `poll_timeout_secs`); the HTTP timeout is this value + 15 s |
+| `poll_timeout_secs` | `30` | REST: how long the control plane may hold a request when nothing changed (sent as `poll_timeout_secs`); the HTTP timeout is this value + 15 s |
 | `retry_initial_ms` | `500` | first retry delay after an error (doubles each time) |
 | `retry_max_ms` | `30000` | maximum retry delay |
-| `max_response_bytes` | `16777216` | reject responses larger than this (16 MiB) |
+| `max_response_bytes` | `16777216` | reject responses (gRPC: messages) larger than this (16 MiB) |
 | `max_resources` | `10000` | reject snapshots with more resources than this |
 
 Because VDS is just configuration, it also accepts `VEIL_OVERRIDE_<n>` and `--override`
@@ -76,6 +78,44 @@ A higher layer wins. For example, `VEIL_OVERRIDE_1='route.0.action.path = "/srv"
 delivered. Overlay and overrides are applied again on every reload, so a SIGHUP keeps the delivered snapshot.
 
 ## Protocol
+
+Two transports carry the same messages and semantics (`[vds] transport`):
+
+- **gRPC** (default): one long-lived bidirectional stream. The control plane pushes a new snapshot as soon as it
+  changes; there is no polling.
+- **REST**: JSON long polling (below). Use it for control planes that cannot speak HTTP/2.
+
+### gRPC (default)
+
+The service is defined in [`proto/veil/vds/v1/vds.proto`](../../proto/veil/vds/v1/vds.proto):
+
+```proto
+service VeilDiscoveryService {
+  rpc StreamSnapshots(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+}
+message DiscoveryRequest  { string version_info = 1; Node node = 2; string type_url = 3;
+                            string response_nonce = 4; ErrorDetail error_detail = 5; }
+message DiscoveryResponse { string version_info = 1; string nonce = 2; string type_url = 3;
+                            repeated Resource resources = 4; }
+message Resource { string type_url = 1; string name = 2; string json = 3; }
+```
+
+veil opens `POST {server}/veil.vds.v1.VeilDiscoveryService/StreamSnapshots` over h2c (`http://`) or TLS with ALPN
+`h2` (`https://`) on its VDS thread (veil's own HTTP/2 client; no tokio, no tonic), with `authorization: Bearer
+<token>` when `token_file` is set (read on every connection). The fields mean exactly what they mean in REST; a
+`Resource` is one element of the REST `resources` array with `@type` moved to `type_url`, `name` to `name`, and
+the rest of the object serialized as JSON in `json`.
+
+1. On connect veil sends a request with `version_info = ""` (or the last applied version after a reconnect).
+2. The control plane sends a `DiscoveryResponse` whenever the snapshot differs from what the node has (and was not
+   rejected).
+3. veil applies it and sends the next request on the same stream: **ACK** (new `version_info` and the response's
+   `nonce`) or **NACK** (old `version_info`, the `nonce` and `error_detail`).
+4. If the stream ends, fails or carries a non-zero `grpc-status`, veil reconnects with exponential backoff and
+   resumes from its last applied version. `keepalive_secs` (TCP keepalive) detects a vanished control plane during
+   long quiet periods.
+
+### REST
 
 All requests are `POST {server}/v1/discovery` with `Content-Type: application/json`. If `token_file` is set, each
 request carries `Authorization: Bearer <token>`.
@@ -150,7 +190,7 @@ Everything a route or upstream can contain in `config.toml` is allowed — see t
 [Configuration](configuration.md), [Routing](routing.md) and [Load balancing](load-balancing.md) guides and
 [examples/config.toml](../../examples/config.toml).
 
-### Long polling, 304, ACK and NACK
+#### Long polling, 304, ACK and NACK
 
 1. veil sends a request with its current `version_info`.
 2. If the control plane has nothing newer, it **holds** the request until something changes or until
@@ -176,11 +216,18 @@ Everything a route or upstream can contain in `config.toml` is allowed — see t
 - If the sandbox is on (`[security]`), the VDS thread runs inside it, so the files above must be readable
   (`landlock_read_paths`).
 
-## Reference control plane
+## Reference control planes
 
-`tools/vds/vds_server.py` (Python 3.11+, standard library only) serves a snapshot file and long-polls veil nodes:
+Two reference implementations ship with veil. Both serve a snapshot file and keep the per-node status:
+
+| | `tools/vds/server` (Rust) | `tools/vds/vds_server.py` (Python) |
+|---|---|---|
+| transports | gRPC **and** REST on one port (HTTP/1.1, h2c, TLS) | REST only |
+| run | `cargo run --release --manifest-path tools/vds/server/Cargo.toml -- ...` or the `docker/Dockerfile.vds-server` image | `python3 tools/vds/vds_server.py ...` (3.11+, standard library only) |
 
 ```bash
+veil-vds-server --snapshot snapshot.toml --listen 0.0.0.0:18000 \
+    [--token-file token] [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
 python3 tools/vds/vds_server.py --snapshot snapshot.toml --listen 0.0.0.0:18000 \
     [--token-file token] [--hold 30]
 ```
@@ -200,10 +247,10 @@ type = "Proxy"
 upstream = "api"
 ```
 
-The server watches the file; when its content changes (the version is the first 16 hex digits of the SHA-256), it
-answers the held requests. A snapshot that fails to parse as TOML is not published and the previous one stays.
-Endpoints: `POST /v1/discovery` (the protocol), `GET /v1/status` (per-node acknowledged version and last NACK,
-as JSON) and `GET /healthz`. Run veil with:
+The servers watch the file; when its content changes (the version is the first 16 hex digits of the SHA-256), they
+push it to gRPC streams and answer the held REST requests. A snapshot that fails to parse as TOML is not published and the previous one stays.
+Endpoints: the gRPC service (Rust only), `POST /v1/discovery`, `GET /v1/status` (per-node acknowledged version,
+last NACK and transport, as JSON) and `GET /healthz`. Run veil with:
 
 ```toml
 [vds]
@@ -243,15 +290,13 @@ spec:
     spec:
       containers:
         - name: vds
-          image: python:3.12-alpine
-          command: ["python3", "-I", "/opt/vds/vds_server.py", "--snapshot", "/etc/vds/snapshot.toml",
-                    "--listen", "0.0.0.0:18000", "--token-file", "/etc/veil/vds/token"]
+          image: veil-vds-server:latest   # docker/Dockerfile.vds-server
+          args: ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000",
+                 "--token-file", "/etc/veil/vds/token"]
           volumeMounts:
-            - {name: code, mountPath: /opt/vds, readOnly: true}       # ConfigMap holding vds_server.py
             - {name: snapshot, mountPath: /etc/vds, readOnly: true}
             - {name: token, mountPath: /etc/veil/vds, readOnly: true} # Secret
       volumes:
-        - {name: code, configMap: {name: veil-vds-server}}
         - {name: snapshot, configMap: {name: veil-vds-snapshot}}
         - {name: token, secret: {secretName: veil-vds-token}}
 ---
@@ -260,7 +305,7 @@ kind: Service
 metadata: {name: veil-vds}
 spec:
   selector: {app: veil-vds}
-  ports: [{name: http-vds, port: 18000, targetPort: 18000}]
+  ports: [{name: grpc-vds, port: 18000, targetPort: 18000}]   # Istio: grpc- prefix; Linkerd detects HTTP/2
 ```
 
 Do not mount the snapshot with `subPath` (the kubelet never updates such mounts). In the veil container, set
@@ -274,6 +319,7 @@ Deployment, VDS control plane, Istio/Linkerd overlays) is in [`deploy/kubernetes
 |---------|-------|
 | nothing happens | `[vds] enabled = true`, a valid `server` URL, and the `[VDS]` lines in the log (`subscribing to ...`) |
 | `rejected snapshot` warnings | the message is the validation error; fix the snapshot (the previous configuration is still serving) |
-| `control plane returned 401` | `token_file` content does not match the server's token |
+| `control plane returned 401` / `grpc-status 16` | `token_file` content does not match the server's token |
+| `stream ... failed` with `HTTP 404` / `did not negotiate h2` | the control plane does not speak gRPC: set `transport = "rest"` (for example with `tools/vds/vds_server.py`) |
 | TLS errors | `ca_cert` for a private CA, the server name in the certificate, and `client_cert`/`client_key` for mTLS |
 | snapshot ignored in a reload | it is not; the overlay is re-applied on every SIGHUP. A `-o`/`VEIL_OVERRIDE_<n>` on the same key overrides it |

@@ -16,8 +16,12 @@
 | `[server]` | `server_header_enabled` | `false` | Serverヘッダーを有効化 |
 | `[server]` | `server_header_value` | `"veil"` | Serverヘッダーの値 |
 | `[server]` | `http2_enabled` | `false` | HTTP/2を有効化 |
-| `[server]` | `http3_enabled` | `false` | HTTP/3を有効化 |
-| `[server]` | `h2c_http1` | `false` | H2C 専用リスナーで平文 HTTP/1.1 も受ける（[TLS なしの平文専用サーバ](#tls-なしの平文専用サーバ)を参照） |
+| `[server]` | `listen` | なし | TLS リスナー（HTTP/1.1 + h2 ALPN）。`listen` / `listen_cleartext` の少なくとも一方が必須（[リスナー](#リスナーlisten-と-listen_cleartext)を参照） |
+| `[server]` | `listen_cleartext` | なし | 平文リスナー（HTTP/1.1 + h2c をプロトコル検出で判別） |
+| `[server]` | `enable_secure_redirect` | `true` | `listen_cleartext` の要求をすべて HTTPS へ 301 で返す（`listen` が要る。`false` で平文のまま配信） |
+| `[server]` | `allow_http` | `true` | `listen_cleartext` で平文 HTTP/1.1 を受ける（false なら 426） |
+| `[server]` | `allow_h2c` | `true` | `listen_cleartext` で h2c を受ける（false なら GOAWAY） |
+| `[http3]` | `enabled` | `false` | `listen` と同じアドレス（UDP）、または `[http3].listen` で HTTP/3 を有効化 |
 | `[logging]` | `level` | `"info"` | ログレベル |
 | `[logging]` | `format` | `"text"` | ログ形式 |
 | `[logging]` | `channel_size` | `16384` | ログチャネルバッファサイズ（全スロットを起動時に確保して常駐。1 件 約 88 バイト。満杯時はブロックせず破棄） |
@@ -77,7 +81,7 @@
 | `[http3]` | `recv_drain_max` | `64` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
-| `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`server.http3_enabled` 時のみ） |
+| `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`[http3] enabled = true` 時のみ） |
 | `[http3]` | `alt_svc` | _(自動)_ | Alt-Svc ヘッダー値の上書き（未指定時は listen ポートから `h3=":PORT"; ma=…`） |
 | `[http3]` | `alt_svc_ma_secs` | `86400` | 自動生成 Alt-Svc の max-age（秒） |
 
@@ -85,11 +89,12 @@
 
 ```toml
 [server]
+# TLS リスナー: HTTP/1.1 + HTTP/2（ALPN）。[tls] が必要。ここでは平文を受け付けない。
 listen = "0.0.0.0:443"
 # Unix ドメインソケット（UDS）リスナー（Unix 系のみ）
-# [server].listen / [server].h2c_listen は "unix:<path>" 形式も指定できる。例:
+# [server].listen / [server].listen_cleartext は "unix:<path>" 形式も指定できる。例:
 #   listen = "unix:/run/veil/https.sock"
-# リスナー側の対象はこの 2 つのみ（[[l4]].listen・[server].http・[http3].listen は非対応。
+# リスナー側の対象はこの 2 つのみ（[[l4]].listen・[http3].listen は非対応。
 # HTTP/3 は QUIC/UDP のため UDS 不可。listen が unix: のときは [http3].listen 必須）。
 # 上流バックエンドへの UDS 接続は対応済み（下の「UDS バックエンド」節を参照）。
 # Windows では設定検証でエラーになる。
@@ -99,23 +104,19 @@ listen = "0.0.0.0:443"
 # UDS 接続の peer アドレスはプレースホルダ 127.0.0.1:0 になる
 # （IP ブロックリスト・アクセスログの送信元 IP もこの値）。
 # unix_socket_permissions = "0660"   # ソケットファイルのパーミッション（8 進数文字列）
-# メインリスナーで平文接続を拒否する（既定: true）
-# 適用範囲は [server].listen のみ。true の場合はプロトコル検出（MSG_PEEK）を行わず
-# 常に TLS ハンドシェイクへ進むため、平文 HTTP/1.1 / h2c クライアントは切断される。
-# false にすると従来どおり TLS ポートで h2c / 平文 HTTP/1.1 を受理する
-# （h2c_enabled = true が必要）。
-# [server].h2c_listen・[server].http（リダイレクト用）・[[l4]] には影響しない。
-tls_only = true
-# HTTP to HTTPSリダイレクト（オプション）
-# HTTPアクセスを自動的にHTTPSにリダイレクト（301 Moved Permanently）
-http = "0.0.0.0:80"
+# 平文リスナー: HTTP/1.1 + h2c をプロトコル検出で判別（オプション、F-200）
+# 既定（enable_secure_redirect = true）ではこのポートへの要求をすべて
+# https://<Host>[:<listen のポート>] へ 301 で返す。下の「リスナー」節を参照。
+listen_cleartext = "0.0.0.0:80"
+# enable_secure_redirect = true    # false: 平文で実際に配信する（listen が無いときは必須）
+# allow_http = true                # listen_cleartext で平文 HTTP/1.1 を受ける（false なら 426）
+# allow_h2c = true                 # listen_cleartext で h2c を受ける（false なら GOAWAY）
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
 # HTTP/2を有効化（--features http2 でビルド時のみ）
 http2_enabled = true
-# HTTP/3を有効化（--features http3 でビルド時のみ）
-http3_enabled = true
+# HTTP/3 は [http3] enabled = true で有効化（--features http3 でビルド時のみ）
 # Serverヘッダー設定（オプション）
 # セキュリティ考慮事項: Serverヘッダーはサーバーソフトウェア情報を公開します
 # 本番環境では無効化を推奨
@@ -308,21 +309,72 @@ type = "File"
 path = "/var/www/index.html"
 ```
 
+## リスナー（`listen` と `listen_cleartext`）
+
+待ち受けは 2 種類のリスナーと HTTP/3 で構成します（F-200）。`listen` と `listen_cleartext` の少なくとも一方が必須で、
+同じアドレスにはできません（1 つのポートで TLS と平文を自動判別することはなくなりました）。
+
+| キー | プロトコル | 必要なもの |
+|------|-----------|-----------|
+| `[server].listen` | TLS: HTTP/1.1 + HTTP/2（ALPN）。平文は TLS ハンドシェイクの失敗で閉じる | `[tls]` |
+| `[server].listen_cleartext` | 平文: HTTP/1.1 + h2c（prior knowledge）。プロトコル検出（`MSG_PEEK`）で判別 | `enable_secure_redirect = true` なら `listen`、h2c は `http2` feature |
+| `[http3] enabled = true` | `listen` と同じアドレス（UDP）、`[http3].listen` があればそちらで HTTP/3 | `listen`・`[tls]`・`http3` feature |
+
+`listen_cleartext` のキー（すべて `[server]` 配下）:
+
+| キー | 既定 | 意味 |
+|------|------|------|
+| `allow_http` | `true` | 平文 HTTP/1.1 を受ける。`false` なら HTTP/1.1 は `426 Upgrade Required` |
+| `allow_h2c` | `true` | h2c を受ける。`false` なら h2c は `GOAWAY(PROTOCOL_ERROR)` |
+| `enable_secure_redirect` | `true` | 要求（HTTP/1.1・h2c とも）を `https://<Host>[:<listen のポート>]` へ `301` で返す（443 ならポート省略。h2c には HTTP/2 の 301）。`listen` が無いのに `true` は設定エラー（リダイレクト先が無い）。平文で配信したいときは `false` |
+
+検証規則（`veil -t` で報告されます）:
+
+- `listen` も `listen_cleartext` も無い: エラー
+- `listen` と `listen_cleartext` が同じアドレス: エラー
+- `allow_http = false` かつ `allow_h2c = false`: エラー（何も受けないため）
+- `enable_secure_redirect = true`（既定）で `listen` が無い: エラー
+- `[tls]` が必要なのは `listen` か `[http3] enabled = true` があるときだけ（`listen_cleartext` だけの構成では不要。[TLS なしの平文専用サーバ](#tls-なしの平文専用サーバ)を参照）
+- `[http3] enabled = true` で `listen` が無い: エラー（QUIC は TLS 必須）。`Alt-Svc` は HTTP/3 の実際のポートで広告されます
+- UDS: `listen`・`listen_cleartext` は `unix:<path>` を受けます。HTTP/3 は UDS 不可
+- 下の削除されたキーは、移行先を示すエラーで起動しません（黙って無視しません）
+
+`listen_cleartext` は `listen` と同じく全ワーカースレッドで受け付けます（旧 `http` のリダイレクト専用リスナーは
+1 スレッドでした）。待機中のワーカーはおよそ 1 つあたり 2 MB の RSS を使うので、TLS + リダイレクトの構成は以前より
+数 MB 多くなります。`listen` のスループットは変わりません。
+
+### 旧キーからの移行
+
+`[server].http`・`tls_only`・`h2c_enabled`・`h2c_listen`・`h2c_http1`・`http3_enabled` は互換レイヤー無しで削除されました。
+
+| 旧 | 新 |
+|----|----|
+| `listen` + `tls_only = true`（既定） | `listen` |
+| `http = "0.0.0.0:80"`（リダイレクト専用リスナー） | `listen_cleartext = "0.0.0.0:80"`（リダイレクトが既定） |
+| `h2c_enabled = true` + `h2c_listen = "0.0.0.0:8080"` | `listen_cleartext = "0.0.0.0:8080"` + `enable_secure_redirect = false` |
+| `h2c_enabled = true`（H2C 専用）+ `h2c_http1 = true` | `listen_cleartext = <旧 listen>`（`listen` は書かない）+ `enable_secure_redirect = false` |
+| `tls_only = false` + `h2c_enabled = true`（同一ポートで自動判別） | `listen` と別ポートの `listen_cleartext` + `enable_secure_redirect = false` |
+| `http3_enabled = true`（+ `[http3] listen`） | `[http3] enabled = true`（+ 必要なら `[http3] listen`） |
+
+`http`（リダイレクト）と `h2c_listen`（h2c 配信）の両方を使っていた構成は、目的の違う 2 つのリスナーが要りましたが、
+`listen_cleartext` は 1 つのアドレスです。リダイレクトは別の veil インスタンス（またはロードバランサ）に任せるか、
+どちらかの動作を選んでください。
+
 ## HTTP to HTTPS リダイレクト
 
-HTTPアクセスを自動的にHTTPSにリダイレクトする機能です。
+`listen_cleartext` は既定（`enable_secure_redirect = true`）で HTTP を HTTPS へリダイレクトします。
 
 ### 設定
 
 ```toml
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
+listen_cleartext = "0.0.0.0:80"  # HTTPS へリダイレクト（既定の動作）
 ```
 
 ### 動作
 
-- `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト
+- `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト（h2c クライアントには HTTP/2 の 301）
 - Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
 - **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用
   - listenポートが443の場合（デフォルト）: `https://example.com/path`（ポート省略）
@@ -389,21 +441,19 @@ server_header_value = "MyServer/1.0"
 
 ## TLS なしの平文専用サーバ
 
-`[tls]` を **省略できる** のは、平文専用サーバのときだけです。`[server] h2c_enabled = true` で、`h2c_listen` が無い（または `listen` と同じ）、
-`http3_enabled = false`、かつ `http2` feature が有効なビルドです。この場合 TLS リスナーは起動せず、`listen` が h2c（HTTP/2 prior knowledge）を受けます。
-それ以外の構成で使える `[tls] cert_path` / `key_path` が無いと、検証で "TLS certificate is required" のエラーになります。
+終端する TLS が無いとき（`listen` が無く `[http3] enabled = true` でもない）は `[tls]` を **省略できます**。`listen_cleartext` だけで、
+`enable_secure_redirect = false` にします（リダイレクトには `listen` が要るため）。`listen` か HTTP/3 があって使える
+`[tls] cert_path` / `key_path` が無いと、検証で "TLS certificate is required" のエラーになります。
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true
-h2c_http1 = true      # このポートで平文 HTTP/1.1 も受ける（既定: false）
-tls_only = false
+listen_cleartext = "0.0.0.0:8080"   # HTTP/1.1 + h2c をプロトコル検出で判別
+enable_secure_redirect = false      # 平文で配信する（既定は HTTPS への 301）
+# allow_http = true                 # 平文 HTTP/1.1 を受ける（false なら 426）
+# allow_h2c = true                  # h2c を受ける（false なら GOAWAY）。http2 feature が必要
 ```
 
-`[server] h2c_http1`（既定 `false`）: 既定では H2C 専用リスナー（`h2c_listen`、または H2C 専用サーバのメインリスナー）は、HTTP/1.1 と判定した接続を閉じます。
-`true` にすると同じポートで平文 HTTP/1.1 も処理します（h2c は接続プリフェースで判別）。`http2` feature が必要です（無効時は警告して無視）。
-[API ライブラリ](library.md#ライブラリモードの設定)の既定値です。平文リスナーを信頼できないネットワークに公開しないでください。
+[API ライブラリ](library.md#ライブラリモードの設定)の既定の形です。平文リスナーを信頼できないネットワークに公開しないでください。
 
 ## VDS（`[vds]`）
 
@@ -426,4 +476,4 @@ tls_only = false
 - `[[l4]]` の `handler = "<名前>"`（feature `l4-handler`）: 転送せず、登録済みの L4 ハンドラで接続・データグラムを処理します。このとき `upstreams` は省略できます。
   [L4 プロキシ](l4-proxy.md#ネイティブハンドラ)を参照。
 - `[api]`（ライブラリ専用）: `openapi_enabled`・`openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`openapi_description`・
-  `max_body_size`・`handler_threads`・`tokio_threads`。[ライブラリガイド](library.md#api-キーライブラリ専用)を参照。
+  `max_body_size`・`handler_threads`・`tokio_threads`・`grpc_max_message_size`。[ライブラリガイド](library.md#api-キーライブラリ専用)を参照。

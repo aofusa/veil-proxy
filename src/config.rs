@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::io::BufReader;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3375,9 +3374,12 @@ impl Http3CompressionConfig {
 /// HTTP/3 詳細設定
 ///
 /// HTTP/3 (QUIC) プロトコルのパラメータを設定します。
-/// 有効化は `server.http3_enabled` で行います。
+/// 有効化は `[http3] enabled` で行います。
 #[derive(Deserialize, Clone)]
 pub struct Http3ConfigSection {
+    /// HTTP/3 を起動するか（F-200。旧 `[server].http3_enabled`）。`[server].listen`（TLS）が必要。
+    #[serde(default)]
+    pub enabled: bool,
     /// HTTP/3リッスンアドレス（UDP）
     /// 未指定の場合は server.listen と同じアドレスを使用
     #[serde(default)]
@@ -3521,7 +3523,7 @@ pub struct Http3ConfigSection {
     // ====================
     /// HTTP/1.1・HTTP/2 応答へ `Alt-Svc` ヘッダーを付与するか
     ///
-    /// デフォルト: `true`（`server.http3_enabled = true` のときのみ実際に広告される）
+    /// デフォルト: `true`（`[http3] enabled = true` のときのみ実際に広告される）
     /// `false` にすると広告を抑制する。
     #[serde(default = "default_true")]
     pub alt_svc_enabled: bool,
@@ -3571,6 +3573,7 @@ fn default_h3_recv_drain_max() -> usize {
 impl Default for Http3ConfigSection {
     fn default() -> Self {
         Self {
+            enabled: false,
             listen: None,
             max_idle_timeout: default_h3_max_idle_timeout(),
             max_udp_payload_size: default_h3_max_udp_payload_size(),
@@ -3634,15 +3637,38 @@ impl Http3ConfigSection {
 
 #[derive(Deserialize)]
 pub struct ServerConfigSection {
-    pub listen: String,
-    /// HTTPリスナーアドレス（オプション）
-    ///
-    /// 指定した場合、HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
-    /// 例: "0.0.0.0:80"
-    ///
-    /// リダイレクトのみを行い、コンテンツは配信しません（セキュリティ考慮）。
+    /// TLS のリスナー（HTTP/1.1・h2（ALPN）。`[http3] enabled = true` なら同じアドレスの UDP で HTTP/3）。
+    /// 省略可（平文だけのサーバ）。`unix:<path>` も受理する（F-164）。指定時は `[tls]` が必須（F-200）。
     #[serde(default)]
-    pub http: Option<String>,
+    pub listen: Option<String>,
+    /// 平文のリスナー（HTTP/1.1・h2c（prior knowledge）、F-200）。省略可。
+    /// プロトコル検出で HTTP/1.1 か h2c かを判別し、`allow_http`・`allow_h2c` で受けるかを決める。
+    #[serde(default)]
+    pub listen_cleartext: Option<String>,
+    /// `listen_cleartext` で平文 HTTP/1.1 を受けるか（既定 `true`）。
+    #[serde(default = "default_true")]
+    pub allow_http: bool,
+    /// `listen_cleartext` で h2c を受けるか（既定 `true`、要 `http2` feature）。
+    #[serde(default = "default_true")]
+    pub allow_h2c: bool,
+    /// `listen_cleartext` に来た要求（HTTP/1.1・h2c とも）を `https://<Host>[:<listen のポート>]` へ
+    /// 301 でリダイレクトするか（既定 `true`）。平文で配信するときは `false`。`listen` が無いのに
+    /// `true` は設定エラー（リダイレクト先が無い）。
+    #[serde(default = "default_true")]
+    pub enable_secure_redirect: bool,
+    /// 削除したキー（F-200）。書かれていたら移行先を示す設定エラーにする（黙って無視しない）。
+    #[serde(default, rename = "http")]
+    removed_http: Option<toml::Value>,
+    #[serde(default, rename = "tls_only")]
+    removed_tls_only: Option<toml::Value>,
+    #[serde(default, rename = "h2c_enabled")]
+    removed_h2c_enabled: Option<toml::Value>,
+    #[serde(default, rename = "h2c_listen")]
+    removed_h2c_listen: Option<toml::Value>,
+    #[serde(default, rename = "h2c_http1")]
+    removed_h2c_http1: Option<toml::Value>,
+    #[serde(default, rename = "http3_enabled")]
+    removed_http3_enabled: Option<toml::Value>,
     /// ワーカースレッド数
     /// 未指定または0の場合はCPUコア数と同じスレッド数を使用
     #[serde(default)]
@@ -3686,91 +3712,6 @@ pub struct ServerConfigSection {
     // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http2_enabled: bool,
 
-    /// HTTP/3 を有効化するかどうか
-    ///
-    /// QUIC/UDP ベースの HTTP/3 プロトコルをサポートします。
-    ///
-    /// 効果:
-    /// - 0-RTT 接続確立
-    /// - 接続マイグレーション
-    /// - Head-of-Line ブロッキング解消
-    ///
-    /// 注意:
-    /// - `--features http3` でビルドする必要があります
-    /// - HTTP/3 は UDP ベースのため kTLS は使用不可
-    /// - GSO/GRO による高パフォーマンス UDP 処理を使用
-    /// - リッスンアドレスは [http3].listen で設定
-    #[serde(default)]
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
-    pub http3_enabled: bool,
-
-    // ====================
-    // H2C (HTTP/2 Cleartext) 設定
-    // ====================
-    /// H2C (HTTP/2 Cleartext) サーバーを有効化するかどうか
-    ///
-    /// TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
-    /// Prior Knowledgeモードをサポートします。
-    ///
-    /// 効果:
-    /// - ストリーム多重化によるレイテンシ削減
-    /// - HPACK ヘッダー圧縮によるオーバーヘッド削減
-    /// - gRPC バックエンドへの接続に適している
-    ///
-    /// セキュリティ考慮事項:
-    /// - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
-    /// - 外部公開時はTLS必須
-    /// - デフォルトで無効（明示的に有効化が必要）
-    ///
-    /// 注意: `--features http2` でビルドする必要があります
-    #[serde(default)]
-    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
-    pub h2c_enabled: bool,
-
-    /// H2C リスニングアドレス（オプション）
-    ///
-    /// 指定した場合、H2C専用のリスナーを起動します。
-    /// 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
-    ///
-    /// 例: "0.0.0.0:8080"
-    ///
-    /// 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
-    #[serde(default)]
-    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
-    pub h2c_listen: Option<String>,
-
-    /// H2C 専用リスナーで平文 HTTP/1.1 も受けるかどうか（既定 `false`）。
-    ///
-    /// H2C 専用リスナー（`h2c_listen`、または H2C 専用サーバ構成のメインリスナー）は
-    /// 既定ではプロトコル検出で HTTP/1.1 と判定した接続を閉じる。`true` にすると同じポートで
-    /// 平文 HTTP/1.1 も処理する（h2c はプリフェースで判別）。TLS 無しの平文専用サーバ
-    /// （`[tls]` を省略した構成、API ライブラリの既定）で HTTP/1.1 クライアントを受けるために使う。
-    /// 要 `http2` feature（無効時は警告して無視）。
-    #[serde(default)]
-    pub h2c_http1: bool,
-
-    /// TLSリスナー（[server].listen）で平文接続を拒否するかどうか（既定 `true`）
-    ///
-    /// 適用範囲はメインリスナー（`[server].listen`）のみです。
-    /// `[server].h2c_listen`、`listen_http`（HTTPS リダイレクト用）、`[[l4]]` など
-    /// 明示的に平文を扱う経路には影響しません。
-    ///
-    /// `true`（既定）の場合、メインリスナーではプロトコル検出（MSG_PEEK）自体を行わず、
-    /// 接続は常に TLS ハンドシェイクへ渡されます。平文クライアントはハンドシェイク失敗で
-    /// 切断されます。これは最も厳格な既定であると同時に、接続ごとの MSG_PEEK 往復
-    /// （最大 200ms 待ち）を省くためホットパス的にも有利です。
-    ///
-    /// `false` の場合、`h2c_enabled = true` であれば従来どおりメインリスナーで
-    /// h2c / 平文 HTTP/1.1 を受理します（プロトコル検出を実行）。
-    ///
-    /// 注意: `h2c_enabled = true` かつ `h2c_listen` が未指定または `listen` と同一の場合、
-    /// H2C 専用サーバー（TLS リスナー自体が起動しない）となるため、この設定は影響しません。
-    #[serde(default = "default_tls_only")]
-    pub tls_only: bool,
-
     // ====================
     // Unix ドメインソケット（UDS）設定（F-164）
     // ====================
@@ -3804,13 +3745,6 @@ pub struct ServerConfigSection {
 /// グレースフルシャットダウンタイムアウトのデフォルト値（30秒）
 fn default_graceful_shutdown_timeout() -> u64 {
     30
-}
-
-/// `[server].tls_only` のデフォルト値（`true`）
-///
-/// TLS リスナーへの平文フォールバックを既定で禁止する（F-163）。
-fn default_tls_only() -> bool {
-    true
 }
 
 /// `[server].unix_socket_permissions` のデフォルト値（`"0660"`）。
@@ -5707,13 +5641,13 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
 
 /// HTTP/3 有効時に Alt-Svc 広告を初期化する（F-94、コールドパス）。
 ///
-/// `server.http3_enabled && [http3].alt_svc_enabled` のとき、
+/// `[http3] enabled && [http3].alt_svc_enabled` のとき、
 /// `[http3].alt_svc` 明示値、または listen ポートから自動生成した値を登録する。
 /// Alt-Svc 関連キーはすべて `[http3]` に集約する。
 fn apply_alt_svc_from_config(config: &Config) {
     #[cfg(feature = "http3")]
     {
-        let enabled = config.server.http3_enabled && config.http3.alt_svc_enabled;
+        let enabled = config.http3.enabled && config.http3.alt_svc_enabled;
         let value = if enabled {
             if let Some(ref explicit) = config.http3.alt_svc {
                 explicit.clone()
@@ -5722,7 +5656,8 @@ fn apply_alt_svc_from_config(config: &Config) {
                     .http3
                     .listen
                     .as_deref()
-                    .unwrap_or(config.server.listen.as_str());
+                    .or(config.server.listen.as_deref())
+                    .unwrap_or("");
                 crate::pool::build_alt_svc_value(listen, config.http3.alt_svc_ma_secs)
             }
         } else {
@@ -5824,36 +5759,149 @@ fn default_tls_section() -> TlsConfigSection {
     toml::from_str("").expect("TlsConfigSection must deserialize from an empty table")
 }
 
-/// 平文専用サーバ構成か（TLS 証明書無しで起動してよい構成）。
-///
-/// H2C 専用サーバ（`h2c_enabled = true` かつ `h2c_listen` 未指定または `listen` と同一。
-/// TLS リスナー自体が起動しない）で、HTTP/3（QUIC は TLS 必須）が無効なときに限る。
-pub fn plaintext_only_server(server: &ServerConfigSection) -> bool {
-    cfg!(feature = "http2")
-        && server.h2c_enabled
-        && server
-            .h2c_listen
-            .as_deref()
-            .map(|l| l == server.listen)
-            .unwrap_or(true)
-        && !server.http3_enabled
+/// `[server].listen_cleartext` の受け入れ方（F-200）。リロードで変えられる（接続ごとに読む）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleartextPolicy {
+    /// 平文 HTTP/1.1 を受ける
+    pub allow_http: bool,
+    /// h2c（prior knowledge）を受ける
+    pub allow_h2c: bool,
+    /// 受けた要求を https へ 301 でリダイレクトする
+    pub secure_redirect: bool,
 }
 
-/// `[tls]` が無い構成を検査する（平文専用サーバ以外ではエラー）。
-fn validate_tls_presence(config: &Config) -> io::Result<()> {
-    if config.tls.is_configured() || plaintext_only_server(&config.server) {
-        return Ok(());
+impl Default for CleartextPolicy {
+    fn default() -> Self {
+        CleartextPolicy {
+            allow_http: true,
+            allow_h2c: true,
+            secure_redirect: true,
+        }
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "TLS certificate is required: set [tls] cert_path and key_path \
-         (a server without TLS is only allowed in the plaintext-only configuration: \
-         [server] h2c_enabled = true without a separate h2c_listen, and http3_enabled = false)",
-    ))
+}
+
+impl CleartextPolicy {
+    fn from_server(server: &ServerConfigSection) -> CleartextPolicy {
+        CleartextPolicy {
+            allow_http: server.allow_http,
+            allow_h2c: server.allow_h2c,
+            secure_redirect: server.enable_secure_redirect,
+        }
+    }
+}
+
+/// TLS が必要な構成か（`[server].listen` か HTTP/3 がある。F-200）。
+pub fn tls_required(config_server: &ServerConfigSection, http3_enabled: bool) -> bool {
+    config_server.listen.is_some() || http3_enabled
+}
+
+/// F-200 で削除したキーを、移行先を示すエラーにする。
+fn validate_removed_keys(server: &ServerConfigSection) -> io::Result<()> {
+    let removed: [(&str, bool, &str); 6] = [
+        (
+            "[server].http",
+            server.removed_http.is_some(),
+            "use [server].listen_cleartext (HTTPS redirect is [server].enable_secure_redirect, default true)",
+        ),
+        (
+            "[server].tls_only",
+            server.removed_tls_only.is_some(),
+            "[server].listen is always TLS-only now; serve plaintext on [server].listen_cleartext",
+        ),
+        (
+            "[server].h2c_enabled",
+            server.removed_h2c_enabled.is_some(),
+            "use [server].listen_cleartext with allow_h2c = true (default)",
+        ),
+        (
+            "[server].h2c_listen",
+            server.removed_h2c_listen.is_some(),
+            "use [server].listen_cleartext",
+        ),
+        (
+            "[server].h2c_http1",
+            server.removed_h2c_http1.is_some(),
+            "use [server].listen_cleartext with allow_http = true (default)",
+        ),
+        (
+            "[server].http3_enabled",
+            server.removed_http3_enabled.is_some(),
+            "use [http3].enabled",
+        ),
+    ];
+    for (key, present, hint) in removed {
+        if present {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} was removed (F-200): {}", key, hint),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 待ち受けの規則（F-200）と、TLS の有無の検査。
+fn validate_listeners(config: &Config) -> io::Result<()> {
+    let invalid = |m: String| Err(io::Error::new(io::ErrorKind::InvalidInput, m));
+    let server = &config.server;
+    validate_removed_keys(server)?;
+    if server.listen.is_none() && server.listen_cleartext.is_none() {
+        return invalid(
+            "no listener: set [server].listen (TLS) and/or [server].listen_cleartext (plaintext)"
+                .into(),
+        );
+    }
+    let parse = |key: &str, v: &str| {
+        crate::listen_addr::ListenAddr::parse(v).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid {}: {}", key, e),
+            )
+        })
+    };
+    let tls_addr = match &server.listen {
+        Some(l) => Some(parse("[server].listen", l)?),
+        None => None,
+    };
+    if let Some(c) = &server.listen_cleartext {
+        let addr = parse("[server].listen_cleartext", c)?;
+        if Some(&addr) == tls_addr.as_ref() {
+            return invalid(format!(
+                "[server].listen and [server].listen_cleartext must differ ({})",
+                c
+            ));
+        }
+        if !server.allow_http && !server.allow_h2c {
+            return invalid(
+                "[server].listen_cleartext accepts nothing: allow_http and allow_h2c are both false"
+                    .into(),
+            );
+        }
+        if server.enable_secure_redirect && server.listen.is_none() {
+            return invalid(
+                "[server].enable_secure_redirect = true needs a TLS listener ([server].listen) to \
+                 redirect to; set enable_secure_redirect = false to serve plaintext"
+                    .into(),
+            );
+        }
+    }
+    let http3 = config.http3.enabled;
+    if http3 && server.listen.is_none() {
+        return invalid("[http3].enabled = true needs [server].listen (QUIC requires TLS)".into());
+    }
+    if tls_required(server, http3) && !config.tls.is_configured() {
+        return invalid(
+            "TLS certificate is required: set [tls] cert_path and key_path \
+             ([server].listen and HTTP/3 are TLS listeners; a plaintext-only server uses only \
+             [server].listen_cleartext)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_config(config: &Config) -> io::Result<()> {
-    validate_tls_presence(config)?;
+    validate_listeners(config)?;
 
     // TLS証明書ファイルの存在チェック
     //
@@ -5878,25 +5926,6 @@ fn validate_config(config: &Config) -> io::Result<()> {
         }
     }
 
-    // バインドアドレスの妥当性チェック（F-164: `unix:<path>` も受理する）
-    if let Err(e) = crate::listen_addr::ListenAddr::parse(&config.server.listen) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid listen address: {}", e),
-        ));
-    }
-
-    // H2C リスニングアドレスの妥当性チェック（F-164: `unix:<path>` も受理する）
-    #[cfg(feature = "http2")]
-    if let Some(ref h2c_listen) = config.server.h2c_listen {
-        if let Err(e) = crate::listen_addr::ListenAddr::parse(h2c_listen) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid h2c_listen address: {}", e),
-            ));
-        }
-    }
-
     // UDS ソケットパーミッションの妥当性チェック（F-164）
     if let Err(e) = parse_unix_socket_permissions(&config.server.unix_socket_permissions) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
@@ -5906,9 +5935,13 @@ fn validate_config(config: &Config) -> io::Result<()> {
     // `unix:<path>` のとき `[http3].listen` が未指定だと、HTTP/3 リスナーが
     // `[server].listen` を継承して起動時に失敗するため、設定エラーとして先に弾く。
     #[cfg(feature = "http3")]
-    if config.server.http3_enabled
+    if config.http3.enabled
         && config.http3.listen.is_none()
-        && crate::listen_addr::ListenAddr::parse(&config.server.listen)
+        && config
+            .server
+            .listen
+            .as_deref()
+            .and_then(|l| crate::listen_addr::ListenAddr::parse(l).ok())
             .map(|a| a.is_unix())
             .unwrap_or(false)
     {
@@ -6547,16 +6580,17 @@ fn apply_session_resumption_mode(
 
 /// 設定読み込みの戻り値型（統一）
 pub struct LoadedConfig {
-    pub listen_addr: String,
+    /// TLS のリスナー（`[server].listen`、F-200）。無ければ平文だけのサーバ。
+    pub listen_addr: Option<String>,
+    /// 平文のリスナー（`[server].listen_cleartext`、F-200）
+    pub listen_cleartext: Option<String>,
+    /// 平文リスナーの受け入れ方（F-200）
+    pub cleartext: CleartextPolicy,
     /// UDS ソケットファイルパーミッション（`[server].unix_socket_permissions`、
     /// F-164）。8 進数表記の文字列のまま保持し、bind 時に
     /// `parse_unix_socket_permissions` でパースする。
     pub unix_socket_permissions: String,
-    /// HTTPリスナーアドレス（HTTPSリダイレクト用、オプション）
-    pub listen_http_addr: Option<SocketAddr>,
     pub tls_config: Arc<ServerConfig>,
-    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
-    pub tls_only: bool,
     /// TLS証明書パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
@@ -6626,14 +6660,6 @@ pub struct LoadedConfig {
     /// HTTP/3 設定（詳細設定）
     #[cfg(feature = "http3")]
     pub http3_config: Http3ConfigSection,
-    /// H2C (HTTP/2 Cleartext) を有効化するかどうか
-    #[cfg(feature = "http2")]
-    pub h2c_enabled: bool,
-    /// H2C リスニングアドレス（オプション）
-    #[cfg(feature = "http2")]
-    pub h2c_listen: Option<String>,
-    /// H2C 専用リスナーで平文 HTTP/1.1 も受けるか（`[server].h2c_http1`）
-    pub h2c_http1: bool,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     pub wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
@@ -6680,10 +6706,8 @@ pub struct RuntimeConfig {
     pub tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定（ホットリロード時の参照用）
     pub ktls_config: Arc<KtlsConfig>,
-    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
-    ///
-    /// メインリスナー（`[server].listen`）のみに適用される。ホットリロード対象。
-    pub tls_only: bool,
+    /// 平文リスナー（`[server].listen_cleartext`）の受け入れ方（F-200）。ホットリロード対象。
+    pub cleartext: CleartextPolicy,
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
@@ -6705,13 +6729,6 @@ pub struct RuntimeConfig {
     /// HTTP/3 設定（圧縮設定の解決に使用）
     #[cfg(feature = "http3")]
     pub http3_config: Http3ConfigSection,
-    /// H2C (HTTP/2 Cleartext) を有効化するかどうか
-    #[cfg(feature = "http2")]
-    pub h2c_enabled: bool,
-    /// H2C リスニングアドレス（オプション）
-    /// ホットリロード時の参照用（現在は起動時のみ使用）
-    #[cfg(feature = "http2")]
-    pub h2c_listen: Option<String>,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     pub wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
@@ -6729,7 +6746,7 @@ impl Default for RuntimeConfig {
             optimized_router: Arc::new(routing::OptimizedRouter::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
-            tls_only: default_tls_only(),
+            cleartext: CleartextPolicy::default(),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             #[cfg(feature = "admin")]
@@ -6743,10 +6760,6 @@ impl Default for RuntimeConfig {
             http2_config: Http2ConfigSection::default(),
             #[cfg(feature = "http3")]
             http3_config: Http3ConfigSection::default(),
-            #[cfg(feature = "http2")]
-            h2c_enabled: false,
-            #[cfg(feature = "http2")]
-            h2c_listen: None,
             #[cfg(feature = "wasm")]
             wasm_filter_engine: None,
             performance: PerformanceConfigSection::default(),
@@ -6804,7 +6817,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
-        tls_only: loaded.tls_only,
+        cleartext: loaded.cleartext,
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         #[cfg(feature = "admin")]
@@ -6818,10 +6831,6 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         http2_config: loaded.http2_config,
         #[cfg(feature = "http3")]
         http3_config: loaded.http3_config,
-        #[cfg(feature = "http2")]
-        h2c_enabled: loaded.h2c_enabled,
-        #[cfg(feature = "http2")]
-        h2c_listen: loaded.h2c_listen.clone(),
         #[cfg(feature = "wasm")]
         wasm_filter_engine: current.wasm_filter_engine.clone(),
         performance: loaded.performance.clone(),
@@ -6863,12 +6872,8 @@ pub struct LoadedConfigWithoutTls {
     pub http2_config: Http2ConfigSection,
     #[cfg(feature = "http3")]
     pub http3_config: Http3ConfigSection,
-    #[cfg(feature = "http2")]
-    pub h2c_enabled: bool,
-    #[cfg(feature = "http2")]
-    pub h2c_listen: Option<String>,
-    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
-    pub tls_only: bool,
+    /// 平文リスナーの受け入れ方（F-200）
+    pub cleartext: CleartextPolicy,
     pub performance: PerformanceConfigSection,
 }
 
@@ -6932,10 +6937,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
-    #[cfg(feature = "http2")]
-    let h2c_enabled = config.server.h2c_enabled;
-    #[cfg(feature = "http2")]
-    let h2c_listen = config.server.h2c_listen.clone();
+    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を更新（リロード対応）
     init_server_header(
@@ -7041,11 +7043,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
-        #[cfg(feature = "http2")]
-        h2c_enabled,
-        #[cfg(feature = "http2")]
-        h2c_listen,
-        tls_only: config.server.tls_only,
+        cleartext,
         performance: config.performance.clone(),
     })
 }
@@ -7110,17 +7108,14 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
     #[cfg(feature = "http3")]
-    let http3_enabled = config.server.http3_enabled;
+    let http3_enabled = config.http3.enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
     #[cfg(feature = "http3")]
     let http3_listen = http3_config.listen.clone();
-    #[cfg(feature = "http2")]
-    let h2c_enabled = config.server.h2c_enabled;
-    #[cfg(feature = "http2")]
-    let h2c_listen = config.server.h2c_listen.clone();
+    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を初期化
     init_server_header(
@@ -7220,20 +7215,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         _ => num_cpus::get(),
     };
 
-    // HTTPリスナーアドレスをパース（HTTPSリダイレクト用）
-    let listen_http_addr =
-        config
-            .server
-            .http
-            .as_ref()
-            .and_then(|addr| match addr.parse::<SocketAddr>() {
-                Ok(socket_addr) => Some(socket_addr),
-                Err(e) => {
-                    warn!("Invalid HTTP listen address '{}': {}", addr, e);
-                    None
-                }
-            });
-
     // Prometheusメトリクス設定をログ出力
     // F-09: ランタイムトグルを設定（enabled=false で record_* がノーオップ・endpoint が 404）
     crate::metrics::set_metrics_runtime_enabled(config.prometheus.enabled);
@@ -7314,9 +7295,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     Ok(LoadedConfig {
-        listen_addr: config.server.listen,
+        listen_addr: config.server.listen.clone(),
+        listen_cleartext: config.server.listen_cleartext.clone(),
+        cleartext,
         unix_socket_permissions: config.server.unix_socket_permissions.clone(),
-        listen_http_addr,
         tls_config,
         tls_cert_path: config.tls.cert_path.clone(),
         tls_key_path: config.tls.key_path.clone(),
@@ -7326,7 +7308,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_cipher_suites: config.tls.cipher_suites.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
-        tls_only: config.server.tls_only,
         route: routes,
         optimized_router,
         ktls_config,
@@ -7356,11 +7337,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
-        #[cfg(feature = "http2")]
-        h2c_enabled,
-        #[cfg(feature = "http2")]
-        h2c_listen,
-        h2c_http1: config.server.h2c_http1,
         #[cfg(feature = "wasm")]
         wasm_filter_engine,
         performance: config.performance.clone(),
@@ -7555,12 +7531,10 @@ pub fn reresolve_routes_after_chroot(
 pub enum CapModeBlocker {
     /// `[[l4]]` リスナーがある
     L4,
-    /// h2c が有効
-    H2c,
+    /// 平文のリスナー（`[server].listen_cleartext`、F-200）がある
+    Cleartext,
     /// HTTP/3 が有効
     Http3,
-    /// HTTP→HTTPS リダイレクトリスナーがある
-    HttpRedirect,
 }
 
 #[cfg(any(target_os = "freebsd", test))]
@@ -7568,9 +7542,8 @@ impl CapModeBlocker {
     pub fn as_str(self) -> &'static str {
         match self {
             CapModeBlocker::L4 => "[[l4]] listeners require bind(2)/connect(2)",
-            CapModeBlocker::H2c => "h2c requires an extra listener",
+            CapModeBlocker::Cleartext => "[server].listen_cleartext requires an extra listener",
             CapModeBlocker::Http3 => "HTTP/3 requires an extra UDP listener",
-            CapModeBlocker::HttpRedirect => "the HTTP redirect listener requires bind(2)",
         }
     }
 }
@@ -7611,9 +7584,9 @@ pub fn capability_mode_decision(
 #[cfg(any(target_os = "freebsd", test))]
 pub struct CapModeFacts {
     pub has_l4: bool,
-    pub h2c: bool,
+    /// `[server].listen_cleartext` がある（F-200）
+    pub cleartext: bool,
     pub http3: bool,
-    pub http_redirect: bool,
 }
 
 /// capability mode に入れない最初の理由を返す（入れるなら `None`）。
@@ -7622,14 +7595,11 @@ pub fn capability_mode_blocker(facts: &CapModeFacts) -> Option<CapModeBlocker> {
     if facts.has_l4 {
         return Some(CapModeBlocker::L4);
     }
-    if facts.h2c {
-        return Some(CapModeBlocker::H2c);
+    if facts.cleartext {
+        return Some(CapModeBlocker::Cleartext);
     }
     if facts.http3 {
         return Some(CapModeBlocker::Http3);
-    }
-    if facts.http_redirect {
-        return Some(CapModeBlocker::HttpRedirect);
     }
     None
 }
@@ -7721,23 +7691,14 @@ fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
     let has_l4 = config.l4.as_ref().is_some_and(|v| !v.is_empty());
     #[cfg(not(feature = "l4-proxy"))]
     let has_l4 = false;
-    #[cfg(feature = "http2")]
-    let h2c = config.server.h2c_enabled;
-    #[cfg(not(feature = "http2"))]
-    let h2c = false;
     #[cfg(feature = "http3")]
-    let http3 = config.server.http3_enabled;
+    let http3 = config.http3.enabled;
     #[cfg(not(feature = "http3"))]
     let http3 = false;
     let facts = CapModeFacts {
         has_l4,
-        h2c,
+        cleartext: config.server.listen_cleartext.is_some(),
         http3,
-        http_redirect: config
-            .server
-            .http
-            .as_ref()
-            .is_some_and(|a| a.parse::<SocketAddr>().is_ok()),
     };
     if let Some(b) = capability_mode_blocker(&facts) {
         return reject(b.as_str().to_string());
@@ -8088,70 +8049,48 @@ fn build_backend(
 // HTTP_301_REDIRECT_TEMPLATE, HTTP_301_REDIRECT_SUFFIX は
 // crate::constants モジュールに移動しました
 
-/// HTTPリクエストを処理し、HTTPSにリダイレクトする
+/// HTTPS へのリダイレクト先 URL（F-200）。ポートは `[server].listen` のもの（443 なら省略）。
+pub fn https_redirect_url(host: &str, path: &str) -> String {
+    let port = HTTPS_REDIRECT_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    // Host からポートを外す（`[v6]:port` は `]` まで残す）
+    let host = match host.find(']') {
+        Some(i) if host.starts_with('[') => &host[..=i],
+        _ => host.split(':').next().unwrap_or(host),
+    };
+    let host = if host.is_empty() { "localhost" } else { host };
+    let path = if path.starts_with('/') { path } else { "/" };
+    if port == 443 {
+        format!("https://{}{}", host, path)
+    } else {
+        format!("https://{}:{}{}", host, port, path)
+    }
+}
+
+/// 平文リスナー（`listen_cleartext`、`enable_secure_redirect = true`）の HTTP/1.1 を https へ 301 で返す。
 ///
-/// リクエストからHostヘッダーとパスを読み取り、
-/// https://{host}:{port}{path} への301リダイレクトを返します。
-/// ポートはHETTPS_REDIRECT_PORT（[server].listenから抽出）を使用し、
-/// 443の場合はURL中のポート指定を省略します。
-pub async fn handle_http_redirect(mut stream: TcpStream) {
-    // リクエストを読み取るためのバッファ（ヘッダーのみなので小さめ）
-    let mut buffer = vec![0u8; 4096];
-
-    // タイムアウト付きで読み取り
-    let read_result = timeout(Duration::from_secs(5), stream.read(buffer)).await;
-
-    let (result, buf) = match read_result {
-        Ok(r) => r,
-        Err(_) => {
-            // タイムアウト
-            return;
+/// `initial` はプロトコル検出で既に読んだ先頭バイト列。要求ヘッダが揃うまで（4KiB まで）読み足す。
+pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>) {
+    let mut buffer = initial;
+    while !buffer.windows(4).any(|w| w == b"\r\n\r\n") && buffer.len() < 4096 {
+        let read_result = timeout(Duration::from_secs(5), stream.read(vec![0u8; 4096])).await;
+        match read_result {
+            Ok((Ok(n), buf)) if n > 0 => buffer.extend_from_slice(&buf[..n]),
+            _ => break,
         }
-    };
-    buffer = buf;
-
-    let bytes_read = match result {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    // HTTPリクエストをパース
+    }
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = Request::new(&mut headers);
-
-    let path = match req.parse(&buffer[..bytes_read]) {
+    let path = match req.parse(&buffer) {
         Ok(Status::Complete(_)) | Ok(Status::Partial) => req.path.unwrap_or("/"),
         Err(_) => "/",
     };
-
-    // Hostヘッダーを取得
     let host = req
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("Host"))
         .map(|h| std::str::from_utf8(h.value).unwrap_or(""))
         .unwrap_or("");
-
-    // 設定から抽出したHTTPSポートを取得
-    let port = HTTPS_REDIRECT_PORT.load(std::sync::atomic::Ordering::Relaxed);
-
-    // リダイレクトURLを構築
-    let redirect_url = if host.is_empty() {
-        // Hostヘッダーがない場合はlocalhost
-        if port == 443 {
-            format!("https://localhost{}", path)
-        } else {
-            format!("https://localhost:{}{}", port, path)
-        }
-    } else {
-        // ホストにポート番号が含まれている場合は除去
-        let clean_host = host.split(':').next().unwrap_or(host);
-        if port == 443 {
-            format!("https://{}{}", clean_host, path)
-        } else {
-            format!("https://{}:{}{}", clean_host, port, path)
-        }
-    };
+    let redirect_url = https_redirect_url(host, path);
 
     // 301レスポンスを構築
     let mut response = Vec::with_capacity(
@@ -8305,40 +8244,107 @@ mod blocklist_tests {
 }
 
 // ====================
-// F-163: [server].tls_only のテスト
+// F-200: 待ち受け設定（listen / listen_cleartext）のテスト
 // ====================
+
 #[cfg(test)]
-mod tls_only_tests {
+mod f200_listener_tests {
     use super::*;
 
+    fn check(toml_text: &str) -> Result<(), String> {
+        let cfg: Config = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        validate_listeners(&cfg).map_err(|e| e.to_string())
+    }
+
+    const TLS: &str = "[tls]\ncert_path = \"/c.pem\"\nkey_path = \"/k.pem\"\n";
+
     #[test]
-    fn test_tls_only_default_is_true() {
-        // tls_only を省略すると true になる
-        let toml = r#"
-listen = "0.0.0.0:8443"
-"#;
-        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
-        assert!(cfg.tls_only);
+    fn cleartext_defaults_are_all_true() {
+        let cfg: Config =
+            toml::from_str("[server]\nlisten_cleartext = \"127.0.0.1:80\"\n").unwrap();
+        assert!(cfg.server.allow_http && cfg.server.allow_h2c && cfg.server.enable_secure_redirect);
+        assert!(!cfg.http3.enabled);
     }
 
     #[test]
-    fn test_tls_only_deser_false() {
-        let toml = r#"
-listen = "0.0.0.0:8443"
-tls_only = false
-"#;
-        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
-        assert!(!cfg.tls_only);
+    fn needs_at_least_one_listener() {
+        assert!(check("[server]\n").unwrap_err().contains("no listener"));
     }
 
     #[test]
-    fn test_tls_only_deser_true_explicit() {
-        let toml = r#"
-listen = "0.0.0.0:8443"
-tls_only = true
-"#;
-        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
-        assert!(cfg.tls_only);
+    fn tls_listener_needs_certificate() {
+        let e = check("[server]\nlisten = \"127.0.0.1:443\"\n").unwrap_err();
+        assert!(e.contains("TLS certificate is required"), "{}", e);
+        check(&format!("[server]\nlisten = \"127.0.0.1:443\"\n{}", TLS)).unwrap();
+    }
+
+    #[test]
+    fn plaintext_only_server_needs_no_tls_but_no_redirect() {
+        // 既定の enable_secure_redirect = true はリダイレクト先が無いのでエラー
+        let e = check("[server]\nlisten_cleartext = \"127.0.0.1:80\"\n").unwrap_err();
+        assert!(e.contains("enable_secure_redirect"), "{}", e);
+        check("[server]\nlisten_cleartext = \"127.0.0.1:80\"\nenable_secure_redirect = false\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn listeners_must_differ_and_accept_something() {
+        let both = format!(
+            "[server]\nlisten = \"127.0.0.1:443\"\nlisten_cleartext = \"127.0.0.1:443\"\n{}",
+            TLS
+        );
+        assert!(check(&both).unwrap_err().contains("must differ"));
+        let none = "[server]\nlisten_cleartext = \"127.0.0.1:80\"\nallow_http = false\nallow_h2c = false\nenable_secure_redirect = false\n";
+        assert!(check(none).unwrap_err().contains("accepts nothing"));
+    }
+
+    #[test]
+    fn http3_needs_tls_listener() {
+        let e = check(
+            "[server]\nlisten_cleartext = \"127.0.0.1:80\"\nenable_secure_redirect = false\n[http3]\nenabled = true\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("[http3].enabled"), "{}", e);
+        check(&format!(
+            "[server]\nlisten = \"127.0.0.1:443\"\n[http3]\nenabled = true\n{}",
+            TLS
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn removed_keys_point_to_the_replacement() {
+        for (key, hint) in [
+            ("http = \"0.0.0.0:80\"", "listen_cleartext"),
+            ("tls_only = false", "listen_cleartext"),
+            ("h2c_enabled = true", "allow_h2c"),
+            ("h2c_listen = \"0.0.0.0:8080\"", "listen_cleartext"),
+            ("h2c_http1 = true", "allow_http"),
+            ("http3_enabled = true", "[http3].enabled"),
+        ] {
+            let e = check(&format!(
+                "[server]\nlisten = \"127.0.0.1:443\"\n{}\n{}",
+                key, TLS
+            ))
+            .unwrap_err();
+            assert!(
+                e.contains("was removed") && e.contains(hint),
+                "{} -> {}",
+                key,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_url_uses_listen_port() {
+        HTTPS_REDIRECT_PORT.store(443, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            https_redirect_url("a.example:80", "/x?y"),
+            "https://a.example/x?y"
+        );
+        assert_eq!(https_redirect_url("", "/"), "https://localhost/");
+        assert_eq!(https_redirect_url("[::1]:80", "/"), "https://[::1]/");
     }
 }
 
@@ -9353,9 +9359,8 @@ mod f178_capability_mode_blocker_tests {
     fn no_facts() -> CapModeFacts {
         CapModeFacts {
             has_l4: false,
-            h2c: false,
+            cleartext: false,
             http3: false,
-            http_redirect: false,
         }
     }
 
@@ -9407,10 +9412,10 @@ mod f178_capability_mode_blocker_tests {
             ),
             (
                 CapModeFacts {
-                    h2c: true,
+                    cleartext: true,
                     ..no_facts()
                 },
-                CapModeBlocker::H2c,
+                CapModeBlocker::Cleartext,
             ),
             (
                 CapModeFacts {
@@ -9418,13 +9423,6 @@ mod f178_capability_mode_blocker_tests {
                     ..no_facts()
                 },
                 CapModeBlocker::Http3,
-            ),
-            (
-                CapModeFacts {
-                    http_redirect: true,
-                    ..no_facts()
-                },
-                CapModeBlocker::HttpRedirect,
             ),
         ];
         for (facts, want) in cases {

@@ -1,6 +1,6 @@
 # F-198: tokio 互換レイヤーを tokio 無しで実現する（API ライブラリ専用）
 
-**状態: 設計済み・未着手（design/f197-f200）**
+**状態: 完了（feat/f197-f200-impl）**
 
 ## 要望
 
@@ -124,3 +124,41 @@ veil のランタイムの上に tokio と同じパス・型名・シグネチ�
 
 - poll ベースの `AsyncRead` と veil のレント型 I/O の橋渡しでコピーが 1 回増える（互換レイヤーの対価として許容）。
 - tokio の内部 API に依存するクレートは置き換えられない（互換表で明示し、`tokio-compat-bridge` を案内する）。
+
+## 結果
+
+設計から変えた点・判断:
+
+- 実装は `crates/veil-tokio` ではなく veil 本体の `src/tokio/`（`veil::tokio`）。互換レイヤーがランタイムの内部
+  （`offload::await_completion`・executor）を使うため、別クレートにすると veil ↔ veil-tokio が循環する。
+  `crates/veil-tokio/tokio-shim`（パッケージ名 `tokio`、版 1.99.0）は `veil::tokio::*` を再エクスポートするだけ。
+- スレッド越しの wake は「タスクごとの `CompatTask` + `await_completion`」ではなく、**スレッドごとの受け口
+  `waker::Injector`**（常駐タスクが `await_completion` で待ち、`Job::Wake`/`Job::Spawn` を所有スレッドで実行）。
+  別スレッドから呼べる Waker は `safe_waker`（所有スレッドなら veil の Waker を直接、他なら Injector へ）。
+  ランタイム（`src/runtime/`）の変更は `cfg(feature = "handler")` → `handler-pool` の可視性の付け替えだけ。
+- `tokio-compat` は `handler` に依存しない（`serde_json` の `PartialEq` 実装が tokio のテストの型推論を壊すため）。
+  veil は `tower` クレートに依存しない（`tokio-shim` 経由で循環するため。`api::tower` は自前の `oneshot`）。
+  feature: `tokio-compat = ["handler-pool", "dep:tokio-macros"]`、`tokio-compat-bridge = ["tower-compat", "dep:tokio"]`、
+  `api-core`（tower 互換を含む）、`api = ["api-core", "tokio-compat"]`。
+- 当初「未対応」としていた test-util の時計（`pause`/`resume`/`advance`/`start_paused`、静止 2ms で自動前進）と
+  協調スケジューリングの予算（`task::coop`、128/poll、`unconstrained`）も実装した（tokio のテストの多くが前提にするため）。
+- tokio の意味論に合わせた主な点: 準備状態の記憶（`WouldBlock` で忘れる）、同じソケットを待つ全員を起こす、
+  `readable()`/`writable()` は予算を使わない、`ready()` の `READ_CLOSED`、`connect` は常に準備待ち + `SO_ERROR`、
+  Linux の抽象名前空間、mpsc の「close 後も予約済みの送信は届く」、`enable_time`/`enable_io` の検査、
+  プロセス終了時にスレッドローカルを触らない（終了の番兵・`ForgetOnExit`）。
+
+試験:
+
+- tokio 1.53.2 の `tokio/tests/*.rs` を `tools/tokio-compat/run_tokio_tests.py` で実行（io_uring、除外は
+  `rt_*`・process・io_uring の fs・tracing/dump・Windows 等）: time 53/53（100%）・io 126/133（94.7%）・
+  net 113/113（100%）・sync 371/376（98.7%）・task 70/98・macros 69/70・fs 42/47・signal 9/11、全体 853/901（94.7%）。
+  受け入れ条件（time・io・net・sync 9 割以上）を満たす。経過は `docs/artifacts/tokio_tests_run*.log`。
+- 実ライブラリ（`tools/tokio-compat/ecosystem`、io_uring と epoll の両方）: hyper サーバ（HTTP/1.1 + h2c）と
+  クライアント、hyper h2c 50 並行、reqwest 30 並行 + タイムアウト、tower-http `TimeoutLayer`、sqlx SQLite、
+  sqlx PostgreSQL 20 並行、別スレッドからの起床、待ち I/O を残した `process::exit`。すべて ok。
+- `tests/api/library_e2e.sh nonregression` に、full バイナリに `veil::tokio` が無いこと・`features = api` の依存
+  ツリーに tokio が無いことを追加。
+
+残り（互換表に記載）: `process`、ランタイムのメトリクス・タスクダンプ、`AsyncFd` の `Interest::ERROR`/`PRIORITY`、
+ランタイムを drop した時点で待っていた I/O Future の起床、タスク ID・`JoinSet` の panic 伝播などランタイム内部に
+依存するテスト。

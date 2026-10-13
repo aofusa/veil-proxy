@@ -1,9 +1,8 @@
 [server]
 listen = "0.0.0.0:443"
-http = "0.0.0.0:80"
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
 http2_enabled = true
-h2c_enabled = true
-h2c_listen = "0.0.0.0:8080"
 threads = 0
 
 [logging]

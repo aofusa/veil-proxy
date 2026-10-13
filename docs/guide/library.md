@@ -22,6 +22,7 @@ Three front ends share the same implementation:
 - [Validation and OpenAPI](#validation-and-openapi)
 - [Shared state](#shared-state)
 - [tower layers and tokio libraries](#tower-layers-and-tokio-libraries)
+- [tokio compatibility](#tokio-compatibility)
 - [GraphQL](#graphql)
 - [L4 (TCP/UDP) handlers](#l4-tcpudp-handlers)
 - [TLS and HTTP/3](#tls-and-http3)
@@ -39,13 +40,13 @@ Three front ends share the same implementation:
   and other route types you write in `config.toml`.
 - **Handlers run on veil's own runtime.** Each `async fn` handler is polled on the worker thread that accepted
   the connection, on the same io_uring (or epoll/kqueue) event loop that serves the connection. The data
-  plane has no tokio or monoio. If you need a tokio-based library (sqlx, reqwest, ...), use the bridge in
-  [tower layers and tokio libraries](#tower-layers-and-tokio-libraries), which keeps tokio out of the data plane.
+  plane has no tokio or monoio. tokio-based libraries (hyper, reqwest, sqlx, ...) run on the same workers through
+  veil's tokio-free tokio compatibility layer ([tokio compatibility](#tokio-compatibility)).
 - Blocking work must not run on a worker. A **synchronous** `fn` handler (Rust), a C callback and a Python
   handler are executed on a separate handler thread pool (`[api] handler_threads`) through veil's `offload`,
   so a slow database call does not stall other connections.
-- **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-interface`,
-  `graphql`, `l4-handler` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
+- **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-compat`,
+  `tokio-compat-bridge`, `graphql`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
   produces exactly the same proxy as before.
 - Everything that works for the proxy still works: the `[server]`, `[tls]`, `[security]`, `[logging]`,
   `[prometheus]`, ... sections, SIGHUP reload, graceful shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
@@ -59,10 +60,16 @@ Three front ends share the same implementation:
 | `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (implies `http2`) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` (implies `handler`) |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
-| `tokio-interface` | tower `Layer`/`Service` compatibility and the tokio bridge ([`veil::api::tower`], [`veil::api::tokio_compat`]) |
+| `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
+| `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
 | `graphql` | `App::graphql()` for `async-graphql` schemas |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
-| `api` | all of the above (`handler`, `macro`, `openapi`, `tokio-interface`, `graphql`, `l4-handler`) |
+| `grpc-handler` | gRPC server on prost messages ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
+| `api-core` | `handler`, `macro`, `openapi`, `graphql`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
+| `api` | `api-core` + `tokio-compat` (the default way to use the library) |
+
+To use the tokio bridge instead, select `features = ["full", "api-core", "tokio-compat-bridge"]`. Enabling both
+`tokio-compat` and `tokio-compat-bridge` is a compile error.
 
 `vds` and `acme` are separate, are part of `full*`, and work in the proxy binary and the library alike
 (see [VDS](vds.md) and [ACME](acme.md)).
@@ -131,10 +138,8 @@ The library has its own **default configuration** (embedded in the crate, `src/a
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true     # plaintext HTTP/2 (prior knowledge) ...
-h2c_http1 = true       # ... and plaintext HTTP/1.1 on the same port
-tls_only = false
+listen_cleartext = "127.0.0.1:8080"  # plaintext HTTP/1.1 + h2c (prior knowledge), auto-detected; loopback only; no `listen`, no [tls]
+enable_secure_redirect = false     # serve plaintext (the server default is a 301 to HTTPS)
 http2_enabled = true
 
 [logging]
@@ -153,8 +158,14 @@ openapi_version = "0.1.0"
 ```
 
 plus `[server] threads` = the number of CPUs. So the server starts with no configuration file at all, speaks
-plaintext HTTP/1.1 and h2c on `0.0.0.0:8080`, and needs **no TLS certificate** (`[tls]` may be omitted only in
+plaintext HTTP/1.1 and h2c on `127.0.0.1:8080`, and needs **no TLS certificate** (`[tls]` may be omitted only in
 this plaintext-only configuration; see [Configuration](configuration.md#plaintext-only-servers-without-tls)).
+
+The default listener is bound to the **loopback address only**, so an application started without configuration
+is not reachable from other hosts. To expose it (for example inside a container or behind a load balancer), set the
+address explicitly: `listen_cleartext = "0.0.0.0:8080"` in `config.toml`, `.listen_cleartext("0.0.0.0:8080")` in
+Rust, `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")` in C, `veil.run(listen_cleartext="0.0.0.0:8080")` in
+Python, or `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`.
 
 ### Sources and precedence
 
@@ -172,7 +183,7 @@ Then the handler routes and the built-in OpenAPI routes are injected, and all ro
 (see [Routing macros](#routing-macros)).
 
 The same composition runs again on every SIGHUP reload, so builder and environment overrides **survive a
-reload**; only the contents of `config.toml` are re-read. `[server] listen`, `[tls]`, `[[l4]]` and the thread
+reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[tls]`, `[[l4]]` and the thread
 count still cannot change without a restart (same as the proxy).
 
 ### Builder
@@ -180,7 +191,7 @@ count still cannot change without a restart (same as the proxy).
 ```rust
 let config = Config::load()?            // or Config::new() (defaults only), Config::from_file("app.toml")?
     .builder()
-    .listen("0.0.0.0:8080")             // [server].listen
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext (exposes it; the default is 127.0.0.1:8080)
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -189,9 +200,9 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
     .build();
 ```
 
-Typed setters: `listen`, `threads`, `tls_only`, `h2c_enabled`, `http2_enabled`, `log_level`, `openapi_enabled`,
+Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
 `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
-`tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
+`grpc_max_message_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
 
@@ -209,7 +220,8 @@ for debugging.
 | `openapi_description` | none | `info.description` |
 | `max_body_size` | `10485760` | maximum request body handed to a handler, in bytes |
 | `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
-| `tokio_threads` | `2` | worker threads of the tokio compatibility runtime |
+| `tokio_threads` | `2` | worker threads of the bundled tokio runtime (`tokio-compat-bridge` only) |
+| `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
 
 ## Routing macros
 
@@ -284,6 +296,30 @@ A handler may return anything that implements `IntoResponse`:
 
 `ApiError::new(status, msg)`, `bad_request`, `not_found` and `internal` are meant for `?`; a `serde_json::Error`
 converts to a 400 `ApiError`.
+
+### Streaming bodies and trailers
+
+`Response::stream(status, stream)` sends the body as it is produced: the stream yields `BodyChunk::Data(bytes)`,
+optionally ends with `BodyChunk::Trailers(fields)`, and `BodyChunk::Abort(reason)` stops it midway. HTTP/1.1 uses
+chunked encoding (trailers after the last chunk, abort closes the connection), HTTP/2 sends DATA frames and a
+trailing HEADERS frame (abort is RST_STREAM), and HTTP/3 sends the same (abort resets the stream). Chunks that are
+already available are merged up to 16 KiB per frame. For `HEAD` the stream is dropped without being polled.
+
+A route that needs the request body as it arrives sets `streaming = true` (`#[veil::route(..., streaming = true)]`
+or `App::route_fn_streaming`) and reads it with `req.take_body_stream()` (a `Stream<Item = Bytes>`). Over HTTP/2
+the handler runs as soon as the headers arrive and request and response flow in both directions at once; over
+HTTP/1.1 and HTTP/3 the body is read first and handed over as one chunk. `max_body_size` does not apply to a
+streaming route over HTTP/2 (limit it while reading). Both directions pass through tower layers unchanged.
+
+```rust
+#[veil::route(path = "/upper", method = "POST", streaming = true)]
+async fn upper(req: &Request) -> Response {
+    use futures::StreamExt;
+    let body = req.take_body_stream()
+        .map(|c| BodyChunk::Data(bytes::Bytes::from(c.to_ascii_uppercase())));
+    Response::stream(200, body).with_header("content-type", "text/plain")
+}
+```
 
 ## Validation and OpenAPI
 
@@ -360,26 +396,26 @@ App::new().state(Db::connect()?).run()?;
 
 ## tower layers and tokio libraries
 
-Requires `tokio-interface`. Requests and responses are exchanged as `http::Request<Full<Bytes>>` /
-`http::Response`.
+Requests and responses are exchanged as `http::Request<Full<Bytes>>` / `http::Response`.
 
 ```rust
 App::new()
-    // a tower Layer around every route; runs on veil's worker (do not use tokio timers/IO inside)
+    // a tower Layer around every route; runs on veil's worker
     .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(name, value))
     // only routes under /admin (segment-boundary prefix)
     .layer_on("/admin", RequireToken)
-    // mount an existing tower Service (e.g. an axum Router) and run it on the tokio runtime
+    // mount an existing tower Service (e.g. an axum Router)
     .tokio_service(&["GET", "POST"], "/legacy/{*rest}", axum_router)
     .run()?;
 ```
 
-- `layer` / `layer_on` wrap handlers inside veil's event loop. Use them for layers that do not need a tokio
-  reactor (authentication, headers, CORS, ...). Layers that use tokio timers (for example tower's `Timeout`)
-  need the tokio runtime and must not be used here.
-- `tokio_service` runs the service on the tokio compatibility runtime and hands the result back to the worker
-  through the same result-slot-plus-notification-fd mechanism as `offload` (no cross-thread `Waker`).
-- Inside any handler, call tokio-based libraries through `veil::api::tokio_compat::run`:
+- `layer` / `layer_on` (`api-core`) wrap handlers inside veil's event loop.
+- `tokio_service` (`tokio-compat` or `tokio-compat-bridge`) mounts a tower service. With `tokio-compat` it runs on
+  the worker that accepted the request, like any handler; with `tokio-compat-bridge` it runs on the bundled tokio
+  runtime and the result comes back through the same result-slot-plus-notification-fd mechanism as `offload`.
+- Inside any handler, `veil::api::tokio_compat::run(fut)` runs a tokio-based future. With `tokio-compat` this is the
+  same as `fut.await` (kept so the code does not change between the two features); with `tokio-compat-bridge` the
+  future runs on the bundled runtime (`[api] tokio_threads` workers, default 2, started lazily).
 
   ```rust
   let body = veil::api::tokio_compat::run(async move {
@@ -388,8 +424,74 @@ App::new()
   ```
 
   `run` panics (→ 500) if the task panicked; `try_run` returns `Result`; `spawn` starts a detached task and
-  `handle()` returns the `tokio::runtime::Handle`. The runtime starts lazily with `[api] tokio_threads` workers
-  (default 2). The data plane (accept, TLS, HTTP, handler polling) never runs on tokio.
+  `handle()` returns the runtime handle.
+
+## tokio compatibility
+
+`tokio-compat` (part of `api`) implements tokio's public API on top of veil's own runtime **without depending on
+tokio**. tokio-based crates (hyper, reqwest, sqlx, tower-http, ...) then run directly on veil's io_uring (or
+epoll/kqueue) workers. Nothing changes in the data plane or in veil's runtime: the layer only uses the existing
+runtime API, and it is not compiled into the proxy binary.
+
+### Using it
+
+Replace the `tokio` crate of the whole dependency tree with veil's shim (package name `tokio`, version 1.99.0,
+which re-exports `veil::tokio`):
+
+```toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+tokio = { version = "1", features = ["full"] }        # resolved to the shim
+reqwest = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+```
+
+Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.
+`#[tokio::main]` / `#[tokio::test]` start a veil runtime (current-thread or multi-thread flavor).
+
+### How it differs from tokio
+
+- **No work stealing.** A task runs on the thread that spawned it; `spawn` from a non-runtime thread through a
+  `Handle` is forwarded to the runtime's thread. I/O objects are bound to the thread that created them.
+- **Cross-thread wake-ups** (a `Sender` on another thread, `spawn_blocking`, a `Waker` sent elsewhere) are delivered
+  to the owning thread through a notification fd; veil's own wakers are never called from another thread.
+- `spawn_blocking`, `block_in_place` and `fs` run on veil's handler thread pool (`[api] handler_threads`).
+- Supported: `task` (spawn, `JoinHandle`, `JoinSet`, `LocalSet`, `task_local!`, `yield_now`, cooperative budget,
+  `unconstrained`), `time` (incl. `pause`/`advance`/`start_paused`), `io` (traits, utilities, `split`, `duplex`,
+  `copy_bidirectional`, buffered I/O), `net` (TCP, UDP, Unix stream/datagram/listener, `AsyncFd`, `lookup_host`),
+  `sync` (mpsc, oneshot, watch, broadcast, `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`,
+  `SetOnce`), `signal`, `fs`, `select!`/`join!`/`try_join!`/`pin!`, `runtime::{Runtime, Builder, Handle}`.
+- Not supported: `process`, runtime metrics, task dumps/tracing hooks, io_uring-backed `fs`, Windows named pipes.
+  Crates that need these (or tokio's internals) should use `tokio-compat-bridge`.
+
+### Compatibility
+
+Measured by running tokio's own test suite (tokio 1.53.2, `tokio/tests/*.rs`) against the shim with
+`tools/tokio-compat/run_tokio_tests.py`. Tests that check runtime internals (`rt_*`, metrics, tracing, work
+stealing, io_uring fs) are excluded; the script lists them.
+
+| Category | Passed / run | Rate |
+|---|---|---|
+| time | 53 / 53 | 100.0% |
+| io | 126 / 133 | 94.7% |
+| net | 113 / 113 | 100.0% |
+| sync | 371 / 376 | 98.7% |
+| task | 70 / 98 | 71.4% |
+| macros | 69 / 70 | 98.6% |
+| fs | 42 / 47 | 89.4% |
+| signal | 9 / 11 | 81.8% |
+| **total** | **853 / 901** | **94.7%** |
+
+Most of the remaining `task` failures check tokio's runtime internals through the task API (task IDs across
+`Handle`s, panics propagated by `JoinSet`, `LocalSet` driven from outside a runtime). The `io` misses are
+`AsyncFd` readiness for `Interest::ERROR`/`PRIORITY` and wake-ups of futures that were pending when the runtime was
+dropped. Results per file: `docs/artifacts/tokio_compat_results.md` after running the script.
+
+Real libraries checked by `tools/tokio-compat/ecosystem` (io_uring and epoll): hyper server (HTTP/1.1 + h2c) and
+client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, sqlx with SQLite and PostgreSQL.
 
 ## GraphQL
 
@@ -403,6 +505,77 @@ App::new().graphql("/graphql", schema).run()?;
 `POST` takes a JSON body (single or batch); `GET` takes `?query=...&variables=...`; a `GET` without a query from a
 browser (`Accept: text/html`) returns GraphiQL. Responses use `application/graphql-response+json` when the client
 asks for it, otherwise `application/json`. Subscriptions are not supported.
+
+## gRPC
+
+Requires `grpc-handler` (part of `api`). Messages are [prost](https://docs.rs/prost) types; the wire handling
+(5-byte framing, `grpc-status`/`grpc-message` trailers, `grpc-timeout`, gzip/deflate) is veil's own, and neither
+tokio nor tonic is used. gRPC calls are ordinary handler routes (`POST /<package>.<Service>/<Method>`) on the same
+listeners, over HTTP/2 (TLS or h2c) and HTTP/3.
+
+### Code generation
+
+Add `veil-build` as a build dependency and `prost` as a dependency:
+
+```rust
+// build.rs
+fn main() -> std::io::Result<()> {
+    veil_build::compile_protos(&["proto/helloworld.proto"], &["proto"])
+}
+```
+
+```rust
+pub mod hello { veil::include_proto!("helloworld"); }
+use hello::greeter_server::{add_greeter, Greeter};
+use veil::api::grpc::{Request, Response, Status};
+
+struct MyGreeter;
+impl Greeter for MyGreeter {
+    async fn say_hello(&self, req: Request<hello::HelloRequest>)
+        -> Result<Response<hello::HelloReply>, Status> {
+        Ok(Response::new(hello::HelloReply { message: format!("Hello {}", req.get_ref().name) }))
+    }
+}
+
+add_greeter(App::new().grpc_health(), MyGreeter).run()
+```
+
+For each service `veil-build` generates a module `<service>_server` with a trait (one method per RPC; implement
+them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)` and `METHODS`. Server and
+bidirectional streaming methods return `Response<BoxStream<T>>`; client streaming and bidirectional methods receive
+`Request<Streaming<T>>`. `veil_build::configure().veil_path("::my_veil")` changes the crate path and `config_mut()`
+exposes the `prost_build::Config`.
+
+### Without code generation
+
+```rust
+App::new()
+    .grpc_unary("/pkg.Svc/Get", |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
+    .grpc_server_streaming("/pkg.Svc/Watch", |req: Request<WatchRequest>| async move {
+        Ok(Response::new(futures::stream::iter(items.into_iter().map(Ok))))
+    })
+    .grpc_client_streaming("/pkg.Svc/Upload", |req: Request<Streaming<Chunk>>| async move { .. })
+    .grpc_bidi("/pkg.Svc/Chat", |req: Request<Streaming<Msg>>| async move { .. })
+```
+
+### Types and behaviour
+
+| Item | Behaviour |
+|------|-----------|
+| `Request<T>` | `get_ref()`, `into_inner()`, `metadata()` / `metadata_value(name)` (request headers except `content-type`, `te`, `grpc-timeout`, `grpc-encoding`), `deadline()`, `client_ip()` |
+| `Response<T>` | `with_metadata(name, value)` (response headers), `with_trailer(name, value)` (after `grpc-status: 0`) |
+| `Status` | `Status::new(Code::X, msg)` or `Status::not_found(msg)` etc., `with_metadata` adds trailers. An error before the first message is sent as a Trailers-Only response |
+| `Streaming<T>` | `Stream<Item = Result<T, Status>>` and `message().await` |
+| Deadline | `grpc-timeout` is enforced with veil's timer: the handler is cancelled and the call ends with `DEADLINE_EXCEEDED` (for streams, checked between messages) |
+| Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
+| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed; responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
+| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded |
+| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
+| Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
+
+gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming
+kinds, deadlines, errors, health), tested with a tonic client and an HTTP/3 client by
+`tests/api/library_e2e.sh grpc`.
 
 ## L4 (TCP/UDP) handlers
 
@@ -455,9 +628,10 @@ The default is plaintext. To serve HTTPS (HTTP/1.1 + HTTP/2 via ALPN):
 let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cert.pem", "/etc/veil/key.pem").build();
 ```
 
-`tls()` sets `[tls] cert_path/key_path` and turns off the h2c-only mode (`h2c_enabled = false`,
-`h2c_http1 = false`). Add `.http3("0.0.0.0:8443")` (needs the `http3` feature, included in `full`) for HTTP/3 on a
-UDP port. All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
+`listen(addr)` is the TLS listener (`[server].listen`) and `tls()` sets `[tls] cert_path/key_path`; the library's default
+plaintext listener (`listen_cleartext = "127.0.0.1:8080"`, loopback only) stays unless you change it. Move it with `listen_cleartext(..)`,
+or make it redirect to the TLS port with `.secure_redirect(true)`. Add `.http3("0.0.0.0:8443")` (needs the `http3`
+feature, included in `full`) for HTTP/3 on a UDP port (`[http3] enabled = true` + `[http3] listen`). All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
 `set(..)`. The security sandbox is **off** by default in library mode; enabling `enable_seccomp` /
 `enable_landlock` is possible but must allow whatever your handlers do (files, sockets, DNS).
 
@@ -501,7 +675,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* or veil_config_from_file("config.toml") */
-    veil_config_listen(cfg, "0.0.0.0:8080");
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* plaintext, exposed (default 127.0.0.1:8080); TLS: veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* blocks; consumes cfg */
 }
@@ -546,7 +720,7 @@ def hello(name: str, greeting: str = "Hello"):          # name: path, greeting: 
 def create_user(body: dict):
     return body
 
-veil.run(listen="0.0.0.0:8080")                         # blocks; Ctrl-C / SIGTERM stops gracefully
+veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; default 127.0.0.1:8080); Ctrl-C / SIGTERM stops gracefully
 ```
 
 - Decorators: `@veil.get/post/put/delete/patch/route`, or `app = veil.App(title=..., version=...)` with
@@ -558,7 +732,7 @@ veil.run(listen="0.0.0.0:8080")                         # blocks; Ctrl-C / SIGTE
   handler pool, so the event loop never waits for the GIL. `offload=False` runs on the network worker and is for
   trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
   several processes.
-- Configuration: `veil.run(config_path=None, *, listen, threads, overrides={"server.threads": 4}, openapi=True)`;
+- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
 Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Examples:
@@ -581,11 +755,12 @@ Rust source/usage notes. See [Building](building.md) for the proxy packages.
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
-with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, HTTP/1.1 and h2c), and the `nonregression` step
+with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, streaming, HTTP/1.1 and h2c), runs the gRPC
+interoperability checks against `examples/api/rust-grpc` (`grpc`), and the `nonregression` step
 checks that the proxy binary is unaffected. Needs cargo, gcc, curl, nc and python3. Unit tests: `cargo test
 --lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` for Python. See also
 [Testing](testing.md).
@@ -595,6 +770,9 @@ checks that the proxy binary is unaffected. Needs cargo, gcc, curl, nc and pytho
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
 - GraphQL subscriptions are not supported.
+- gRPC: over HTTP/3 the request stream is read completely before the handler runs (bidirectional calls are half
+  duplex there); responses are not compressed; gRPC-Web, server reflection and C/Python gRPC handlers are not
+  available yet.
 - Python handlers are bound by the GIL; C callbacks must be thread-safe.
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
   (`/openapi.json` works offline).

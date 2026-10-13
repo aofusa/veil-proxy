@@ -1,6 +1,6 @@
 # F-197: API ライブラリでの gRPC 対応（prost + veil の gRPC 実装、tokio 非依存）
 
-**状態: 設計済み・未着手（design/f197-f200）**
+**状態: 完了（feat/f197-f200-impl）**
 
 ## 要望
 
@@ -110,3 +110,29 @@ pub fn add_greeter<S: Greeter>(app: App, svc: S) -> App { ... grpc_unary(...) ..
 
 - ストリーミング応答のバックプレッシャ: H2 の `resp_tx` チャネル（容量 4）でハンドラ側の送信 Future が待つ形にする。
 - `async fn` を含むトレイトの dyn 化: 生成コードは静的ディスパッチ（ジェネリクス）にして Box を 1 リクエスト 1 個に抑える。
+
+## 結果
+
+設計から変えた点・判断:
+
+- 応答の型は `Response { body: ResponseBody }` ではなく、既存の `body: Bytes` に `stream: Option<BodyStream>` を足した
+  （`Response::stream(status, stream)`、`BodyChunk::{Data, Trailers, Abort}`）。全量応答の経路はそのまま。
+- 要求のストリーミングは `Request::take_body_stream()`（`body_stream()` ではなく 1 回だけ取れる）。HTTP/2 は
+  `h2_route_streaming_plan` を `streaming_request` のハンドラにも適格にし、`req_rx` からハンドラ用のチャネルへ中継しながら
+  応答を送る（同じタスク内の `select`、全二重）。HTTP/1.1・HTTP/3 は全量を読んでから 1 断片で渡す（HTTP/3 の gRPC の
+  双方向は半二重。制限事項に記載）。
+- パスは `veil::grpc::*` ではなく `veil::api::grpc::*`（`crate::grpc` はプロキシの gRPC 中継が使っている）。
+  生成コードは `#[veil::async_trait_local]` ではなく `-> impl Future`（RPITIT。実装は `async fn` で書ける）。
+- 応答は非圧縮（gRPC の仕様上サーバは選べる）。gRPC-Web・Server Reflection・C/Python は後続。
+- 小さな断片を 1 フレームずつ送ると、クライアントの取り消し直後に届く大量のフレームを h2 クレートが攻撃と見なして
+  ENHANCE_YOUR_CALM で接続を切るため、準備済みの断片を 16KiB までまとめる（`api::stream::coalesce`）。
+- 相互運用試験で HTTP/2 受付の既存バグ B-121（閉じたストリームへの WINDOW_UPDATE で接続を切る）を発見・修正。
+
+試験:
+
+- 単体: `api::grpc::tests`（単項・ストリーミング 3 種・Trailers-Only・分割フレーム・上限・gzip・415/HTTP/1.1/未知の
+  圧縮・UNIMPLEMENTED・ヘルスチェック）、`api::stream`・`api::tower`・`api::dispatch` のストリーミング、`veil-build`。
+- `tests/api/library_e2e.sh rust`（ストリーミング応答・トレーラ・HEAD・ストリーミング受信 1MiB を HTTP/1.1・h2c で）と
+  `grpc`（tonic で h2c 15 項目: unary・empty/large unary・上限・gzip・server/client streaming・ping_pong・timeout・
+  status・cancel_after_first_response・unimplemented・health・200 並行。quinn+h3 で HTTP/3 6 項目）。
+- `nonregression`: プロキシのバイナリに `veil::api`・`veil_build`・`prost_build`・tonic が無い。

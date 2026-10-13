@@ -17,7 +17,7 @@
 | `h2c_proxy_lab.sh` | h2c 単一構成のラボハーネス（`run_perf.sh` は 1 構成の計測が終わるとコンテナを落とすため、**負荷をかけたまま**の CPU 内訳・syscall 集計・メモリ推移が取れない）。`up`/`upnginx` で veil と比較対象 nginx を起動しっぱなしにし、`load`（rps）・`cpu`（クライアント/プロキシ/上流の 3 者同時サンプル）・`strace`（**1 リクエストあたりの syscall 回数**）・`mem`（持続負荷中の RSS 推移）を差し込む。ペイロードは `/`（54,576B）と `/3b.html`（3B）の 2 サイズを配信し、**バイト単価と固定費を切り分けられる**ようにしてある |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
-| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の h2c 専用リスナーと条件を揃える） |
+| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
@@ -132,7 +132,7 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `WRK_ARGS` | `-t4 -c100 -d10s --timeout 5s --latency` | HTTP/1.1（wrk）: 4 スレッド・100 接続・10 秒 |
 | `H2_ARGS` | `-n 30000 -c100 -m10` | HTTP/2（h2load）: 30000 リクエスト・100 接続・多重化 10 |
 | `H3_ARGS` | `--alpn-list=h3 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・30000 リクエスト・100 接続・多重化 10 |
-| `H2C_PORT` | `8080` | h2c（平文 HTTP/2 prior knowledge）: veil の `h2c_listen` / nginx の `listen 8080 http2` のポート |
+| `H2C_PORT` | `8080` | h2c（平文 HTTP/2 prior knowledge）: veil の `listen_cleartext` / nginx の `listen 8080 http2` のポート |
 | `H2C_ARGS` | `$H2_ARGS`（既定 `-n 30000 -c100 -m10`） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
@@ -220,10 +220,10 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 
 ### h2c（平文 HTTP/2 prior knowledge、`h2c_file` / `h2c_proxy`）
 
-veil の平文リスナー `h2c_listen` は **h2c 専用**で HTTP/1.1 を受け付けません（`[server].http` は
-HTTPS への 301 リダイレクト専用のため計測に使えません）。そのため h2c は専用の 2 構成を用意し、
-`gen_srv_head` の第 2 引数（h2c ポート）で `h2c_enabled = true` / `h2c_listen = "0.0.0.0:8080"` を
-`[server]` に追加します。
+veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirect = true`）では HTTPS への 301
+リダイレクトだけを返すため計測に使えません。そのため h2c は専用の 2 構成を用意し、
+`gen_srv_head` の第 2 引数（h2c ポート）で `listen_cleartext = "0.0.0.0:8080"` /
+`enable_secure_redirect = false` に切り替えます（`:80` のリダイレクトリスナーはこの 2 構成では無くなります）。
 
 | 構成 | プロトコル | アクション | 計測対象 |
 |------|-----------|-----------|----------|

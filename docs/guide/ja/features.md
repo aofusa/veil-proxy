@@ -89,12 +89,15 @@ veil はライブラリとして組み込み、Rust・C・Python で API サー�
 
 | feature | 説明 |
 |---------|------|
-| `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`0.0.0.0:8080` で平文 HTTP/1.1 + h2c、TLS 不要） |
+| `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`127.0.0.1:8080` で平文 HTTP/1.1 + h2c、ループバックのみ、TLS 不要） |
 | `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]` |
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json`、Swagger UI、FastAPI 形式の 422 検証 |
-| `tokio-interface` | tower の `Layer`/`Service` 互換と tokio 前提ライブラリへの橋渡し（データプレーンは tokio 非依存のまま） |
+| `tokio-compat` | tokio 無しの tokio 互換レイヤー。tokio 前提のライブラリが veil のランタイムで動く（`api` に含む） |
+| `tokio-compat-bridge` | `tokio-compat` の代わりに tokio ランタイムを同梱する版（`tokio-compat` と排他） |
 | `graphql` | `async-graphql` のエンドポイント（`App::graphql`） |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理 |
-| `api` | 上記すべて |
+| `grpc-handler` | prost のメッセージで書く gRPC サーバ |
+| `api-core` | `tokio-compat` / `tokio-compat-bridge` 以外の上記すべて |
+| `api` | `api-core` + `tokio-compat` |
 
 C（`crates/veil-capi`、`libveil.so`/`libveil.a`）と Python（`crates/veil-python`）のバインディングは、同じコードの上に作られた別クレートです。

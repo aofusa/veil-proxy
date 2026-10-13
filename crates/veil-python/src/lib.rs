@@ -57,10 +57,24 @@ impl PyConfig {
             .map_err(cfg_err)
     }
 
-    /// `[server].listen`。
+    /// `[server].listen`（TLS のリスナー。`tls(cert, key)` と併用する）。
     fn listen(&mut self, addr: &str) -> PyResult<()> {
         let lit = serde_json::to_string(addr).map_err(cfg_err)?;
         self.set("server.listen", &lit)
+    }
+
+    /// `[server].listen_cleartext`（平文 HTTP/1.1 + h2c のリスナー。ライブラリ既定は `127.0.0.1:8080`）。
+    fn listen_cleartext(&mut self, addr: &str) -> PyResult<()> {
+        let lit = serde_json::to_string(addr).map_err(cfg_err)?;
+        self.set("server.listen_cleartext", &lit)
+    }
+
+    /// `[tls].cert_path` / `key_path`。
+    fn tls(&mut self, cert_path: &str, key_path: &str) -> PyResult<()> {
+        let cert = serde_json::to_string(cert_path).map_err(cfg_err)?;
+        let key = serde_json::to_string(key_path).map_err(cfg_err)?;
+        self.set("tls.cert_path", &cert)?;
+        self.set("tls.key_path", &key)
     }
 
     /// `[server].threads`。

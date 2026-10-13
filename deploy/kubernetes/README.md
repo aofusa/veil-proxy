@@ -16,7 +16,8 @@ client Pod ──(mesh mTLS)──▶ [istio-proxy / linkerd-proxy] ─▶ veil 
 | `overlays/istio` | `istio-injection=enabled` の名前空間 + `PeerAuthentication` STRICT（`veil-istio`） |
 | `overlays/linkerd` | `linkerd.io/inject: enabled` の名前空間（`veil-linkerd`） |
 
-各 overlay は `VEIL_OVERRIDE_3='vds.enabled = true'`（F-179）で VDS（F-04）を有効にする。
+各 overlay は `VEIL_OVERRIDE_3='vds.enabled = true'`（F-179）で VDS（F-04）を有効にする。veil は制御プレーン
+（`tools/vds/server`）を gRPC の双方向ストリームで購読する（F-199）。
 
 ## 前提として作るもの（リポジトリに置かない）
 
@@ -25,12 +26,12 @@ NS=veil-istio
 kubectl apply -f overlays/istio/namespace.yaml
 kubectl -n $NS create secret tls veil-tls --cert=tls.crt --key=tls.key          # veil の TLS（F-180）
 kubectl -n $NS create secret generic veil-vds-token --from-literal=token=$(openssl rand -hex 16)
-kubectl -n $NS create configmap veil-vds-server --from-file=vds_server.py=../../tools/vds/vds_server.py
 kubectl apply -k overlays/istio
 ```
 
 イメージは `veil:musl-k8s`（`docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=full-container -t veil:musl-k8s .`）。
-glibc 版を使う場合は `docker/Dockerfile.glibc` でビルドし、イメージ名を差し替える。
+glibc 版を使う場合は `docker/Dockerfile.glibc` でビルドし、イメージ名を差し替える。VDS の制御プレーンは
+`veil-vds-server:latest`（`docker build -f docker/Dockerfile.vds-server -t veil-vds-server:latest .`）。
 
 ## 運用のポイント
 

@@ -701,7 +701,7 @@ mod config_parse_tests {
         // ServerConfigSectionはDeserializeのみなので、デフォルト値関数をテスト
         // threads = 0 がデフォルト（CPUコア数）
         // http2_enabled = false がデフォルト
-        // http3_enabled = false がデフォルト
+        // [http3].enabled = false がデフォルト
     }
 
     #[test]

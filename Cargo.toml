@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python"]
+members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build"]
 # third_party/wasmtime は crates.io wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
@@ -22,6 +22,7 @@ members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-p
 # third_party/quiche も同じ理由で除外する（F-172、crates.io quiche 0.24.9 の vendoring）。
 # third_party/quinn-udp もテスト用 HTTP/3 クライアントの依存の vendoring（F-176 / B-62）で同じ扱い。
 exclude = [
+    "crates/veil-tokio/tokio-shim",
     "third_party/wasmtime",
     "third_party/quiche",
     "third_party/quinn-udp",
@@ -279,7 +280,7 @@ l4-proxy = []
 
 # VDS（Veil Discovery Service、F-04）: 制御プレーンからルート・アップストリームを動的に配信する
 # （xDS の REST-JSON / State-of-the-World 相当の長輪詢）。専用スレッドで動き、データプレーンには触れない。
-vds = ["dep:serde_json"]
+vds = ["dep:serde_json", "grpc", "http2"]
 # ACME（F-05）: Let's Encrypt 等から証明書を自動で発行・更新する（HTTP-01）。専用スレッドで動き、
 # 発行した証明書は既存の証明書ホットリロードで無停止に差し替える。
 acme = ["dep:serde_json", "dep:rcgen"]
@@ -291,29 +292,41 @@ acme = ["dep:serde_json", "dep:rcgen"]
 # ====================
 
 # ネイティブ Handler アクション（`type = "Handler"`）・Request/Response・設定ビルダ・ライブラリ既定設定
-handler = ["http2", "dep:serde_json", "dep:serde_urlencoded", "dep:inventory"]
-# ルート定義用 proc-macro（#[veil::route] / #[veil::l4_handler] / #[veil::main] / #[derive(veil::Schema)]）
-macro = ["handler", "dep:veil-macros"]
-# マクロのメタデータからの OpenAPI 3.1 生成・Swagger UI（F-189）
-openapi = ["handler", "macro"]
-# Tower の Service/Layer 互換と tokio 前提ライブラリへの橋渡し（F-190）。
-# tokio はハンドラから使う橋渡し専用で、データプレーン（受付・プロトコル処理）には入らない。
-tokio-interface = [
+handler = ["http2", "dep:serde_json", "dep:serde_urlencoded", "dep:inventory", "handler-pool"]
+# 内部用: ハンドラ用ブロッキングプールと別スレッドからの完了受け取り（runtime::offload::await_completion）。
+# handler と tokio-compat が使う（単独で選ぶものではない）
+handler-pool = []
+# 内部用: tower の Service/Layer 互換（veil::api::tower）。api-core と tokio-compat-bridge が使う
+tower-compat = [
     "handler",
-    "dep:tower",
     "dep:tower-service",
     "dep:tower-layer",
     "dep:http",
     "dep:http-body",
     "dep:http-body-util",
-    "dep:tokio",
 ]
+# ルート定義用 proc-macro（#[veil::route] / #[veil::l4_handler] / #[veil::main] / #[derive(veil::Schema)]）
+macro = ["handler", "dep:veil-macros"]
+# マクロのメタデータからの OpenAPI 3.1 生成・Swagger UI（F-189）
+openapi = ["handler", "macro"]
+# tokio 互換レイヤー（F-198）。2 つは排他（両方有効は compile_error）。tower の Service/Layer 互換は api-core に含む。
+# - tokio-compat（api の既定）: tokio 無し。veil のランタイムの上に tokio の API（veil::tokio、crates/veil-tokio/tokio-shim
+#   で依存ツリーの tokio を置き換えられる）を提供する。handler に依存しない（置き換えた tokio が serde_json 等を
+#   引き込まないように）。
+# - tokio-compat-bridge: tokio のランタイムを同梱して Future を tokio 上で実行し、結果を通知 fd で受け取る（旧 F-190）。
+#   tokio の内部に強く依存するクレート向け。api には含めない（api-core と組み合わせて選ぶ）。
+tokio-compat = ["handler-pool", "dep:tokio-macros"]
+tokio-compat-bridge = ["tower-compat", "dep:tokio"]
 # async-graphql のスキーマを Handler として公開（F-191）
 graphql = ["handler", "dep:async-graphql"]
 # L4（TCP/UDP）リスナーに Rust 関数をネイティブハンドラとして登録（F-192）
 l4-handler = ["handler", "l4-proxy"]
+# gRPC サーバ（F-197、prost + veil の gRPC 実装。tokio・tonic 非依存）。API ライブラリ専用
+grpc-handler = ["handler", "grpc"]
+# tokio 互換レイヤー以外の API ライブラリ一式（tokio-compat-bridge と組み合わせるときに使う）
+api-core = ["handler", "macro", "openapi", "graphql", "l4-handler", "grpc-handler", "tower-compat"]
 # API サーバ開発向けの便利セット（C API・Python は別クレート crates/veil-capi・crates/veil-python）
-api = ["handler", "macro", "openapi", "tokio-interface", "graphql", "l4-handler"]
+api = ["api-core", "tokio-compat"]
 
 # ====================
 # 複合フィーチャ（便利用）
@@ -600,13 +613,14 @@ serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
 veil-macros = { path = "crates/veil-macros", version = "0.7.0", optional = true }
-tower = { version = "0.5", optional = true, default-features = false, features = ["util"] }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }
 http-body = { version = "1.0", optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 tokio = { version = "1.48", optional = true, default-features = false, features = ["rt-multi-thread", "time", "sync", "macros"] }
+# tokio-compat の #[tokio::main] / #[tokio::test] と select! の補助（proc-macro だけ。tokio 本体には依存しない）
+tokio-macros = { version = "2.5", optional = true }
 async-graphql = { version = "7", optional = true, default-features = false, features = ["graphiql"] }
 
 # ====================

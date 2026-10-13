@@ -117,7 +117,7 @@ async fn hello(name: String) -> Json<serde_json::Value> {
 
 #[veil::main]
 async fn main() -> Result<(), veil::api::Error> {
-    veil::serve(Config::load()?).await   // 0.0.0.0:8080 で平文 HTTP/1.1 + h2c、OpenAPI は /docs
+    veil::serve(Config::load()?).await   // 127.0.0.1:8080 で平文 HTTP/1.1 + h2c、OpenAPI は /docs
 }
 ```
 

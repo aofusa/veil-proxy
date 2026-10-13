@@ -1786,14 +1786,14 @@ path = "{d}/"
             .port()
     }
 
-    /// 平文 HTTP/1.1（メインリスナーのプロトコル検出）と h2c 専用リスナーを有効にして起動する。
-    /// 戻り値は子プロセス・メインのポート・h2c のポート。
+    /// 平文リスナー（`listen_cleartext`、HTTP/1.1 と h2c をプロトコル検出。F-200）を有効にして起動する。
+    /// 戻り値は子プロセス・TLS のポート・平文のポート。
     fn start_plain(dir: &Path) -> (Child, u16, u16) {
         std::fs::write(dir.join("hello.txt"), "hi").unwrap();
         let h2c = free_port();
         let (child, port) = start_with(
             dir,
-            &format!("tls_only = false\nh2c_enabled = true\nh2c_listen = \"127.0.0.1:{h2c}\""),
+            &format!("listen_cleartext = \"127.0.0.1:{h2c}\"\nenable_secure_redirect = false"),
         );
         let deadline = Instant::now() + Duration::from_secs(15);
         while std::net::TcpStream::connect(("127.0.0.1", h2c)).is_err() {
@@ -1854,7 +1854,7 @@ path = "{d}/"
     fn sigterm_closes_idle_http11_keepalive() {
         use std::io::{Read as _, Write as _};
         let dir = tempfile::tempdir().unwrap();
-        let (mut child, port, _) = start_plain(dir.path());
+        let (mut child, _, port) = start_plain(dir.path());
         let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         sock.write_all(b"GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();

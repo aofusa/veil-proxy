@@ -946,7 +946,7 @@ impl Drop for OwnedListenerFd {
     }
 }
 
-/// AF_UNIX ソケットにリッスンする（F-164、`[server].listen` / `[server].h2c_listen` の
+/// AF_UNIX ソケットにリッスンする（F-164、`[server].listen` / `[server].listen_cleartext` の
 /// `unix:<path>` 形式向け）。
 ///
 /// ワーカー spawn 前に **1 回だけ** 呼ぶ想定のコールドパス関数（起動時のみ）。

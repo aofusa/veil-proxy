@@ -474,7 +474,7 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
 /// 別スレッドで完了する処理の結果を、起点スレッドへ届ける送り手（`await_completion` が渡す）。
 ///
 /// `complete` を呼ばずに drop された場合（完了側の panic 等）も待機側は起きて `None` を受け取る。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 pub struct Completer<R> {
     slot: Arc<Mutex<Option<R>>>,
     done: Arc<AtomicBool>,
@@ -483,7 +483,7 @@ pub struct Completer<R> {
     sent: bool,
 }
 
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 impl<R> Completer<R> {
     /// 結果を格納して起点スレッドを起こす。
     pub fn complete(mut self, value: R) {
@@ -508,7 +508,7 @@ impl<R> Completer<R> {
     }
 }
 
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 impl<R> Drop for Completer<R> {
     fn drop(&mut self) {
         self.finish();
@@ -522,7 +522,7 @@ impl<R> Drop for Completer<R> {
 /// 起点スレッドへ戻る（executor のタスクは `!Send`）。ランタイムドライバが無い場合
 /// （単体テスト等）は完了までポーリングして待つ。`Completer` が `complete` されずに
 /// drop されたら `None`。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 pub async fn await_completion<R, S>(submit: S) -> Option<R>
 where
     R: Send + 'static,
@@ -547,7 +547,7 @@ where
 
 /// ドライバ無し（単体テスト等）のスレッドで完了を待つ。
 // 理由付き allow: ランタイムドライバが無いスレッド（イベントループ外の単体テスト）でだけ通る待機。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 #[allow(clippy::disallowed_methods)]
 fn poll_wait_done(done: &AtomicBool) {
     while !done.load(Ordering::Acquire) {
@@ -556,19 +556,19 @@ fn poll_wait_done(done: &AtomicBool) {
 }
 
 /// ハンドラ用プールの既定スレッド数（CPU 数 × 2、最低 4）。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 fn default_handler_threads() -> usize {
     (num_cpus::get() * 2).max(4)
 }
 
 /// ハンドラ用プールのスレッド数（`set_handler_pool_threads` で起動前に変更できる）。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 static HANDLER_POOL_THREADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// API ライブラリのブロッキングなハンドラ（Python・C・`offload = true` の Rust）を実行する専用プール。
 /// FS 用プール（2〜8 本）と分けるのは、重いハンドラで静的配信のオフロードを枯渇させないため。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 static HANDLER_POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
     let n = match HANDLER_POOL_THREADS.load(Ordering::Relaxed) {
         0 => default_handler_threads(),
@@ -578,14 +578,14 @@ static HANDLER_POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
 });
 
 /// ハンドラ用プールのスレッド数を設定する（最初のハンドラ実行より前に呼ぶこと。以後は無効）。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 pub fn set_handler_pool_threads(n: usize) {
     HANDLER_POOL_THREADS.store(n, Ordering::Relaxed);
 }
 
 /// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。
 /// `f` が panic したら `None`。
-#[cfg(feature = "handler")]
+#[cfg(feature = "handler-pool")]
 pub async fn offload_handler<F, R>(f: F) -> Option<R>
 where
     F: FnOnce() -> R + Send + 'static,

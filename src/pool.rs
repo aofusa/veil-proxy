@@ -1377,7 +1377,7 @@ pub(crate) fn init_server_header(enabled: bool, value: &str) {
 // Alt-Svc ヘッダー（HTTP/3 広告、F-94）
 // ====================
 //
-// `server.http3_enabled` 時に HTTP/1.1 / HTTP/2 応答へ `Alt-Svc: h3=":port"; ma=...`
+// `[http3] enabled` 時に HTTP/1.1 / HTTP/2 応答へ `Alt-Svc: h3=":port"; ma=...`
 // を付与し、ブラウザ等クライアントが HTTP/3 へアップグレードできるようにする。
 // Server ヘッダーと同じく ArcSwap + AtomicBool でホットパスのゼロコピー参照を実現。
 
@@ -1434,7 +1434,7 @@ impl AltSvcGuard {
 
 /// Alt-Svc 設定を初期化
 ///
-/// * `enabled` - 広告を有効にするか（通常は `http3_enabled` と連動）
+/// * `enabled` - 広告を有効にするか（通常は `[http3] enabled` と連動）
 /// * `value` - ヘッダー値全文（例: `h3=":8443"; ma=86400`）。空なら無効扱い
 pub(crate) fn init_alt_svc(enabled: bool, value: &str) {
     if !value.is_empty() {

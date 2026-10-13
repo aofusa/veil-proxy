@@ -22,6 +22,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 - [バリデーションと OpenAPI](#バリデーションと-openapi)
 - [共有状態](#共有状態)
 - [tower の層と tokio 前提ライブラリ](#tower-の層と-tokio-前提ライブラリ)
+- [tokio 互換](#tokio-互換)
 - [GraphQL](#graphql)
 - [L4（TCP/UDP）ハンドラ](#l4tcpudpハンドラ)
 - [TLS と HTTP/3](#tls-と-http3)
@@ -38,13 +39,13 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
   `[[route]]` を注入するので、`config.toml` に書いた `File`・`Proxy` などのルートと共存できます。
 - **ハンドラは veil 独自のランタイム上で動きます。** `async fn` のハンドラは、接続を受け付けたワーカースレッド上で、
   その接続を処理しているのと同じ io_uring（または epoll/kqueue）のイベントループで poll されます。データプレーンに
-  tokio・monoio はありません。tokio 前提のライブラリ（sqlx・reqwest など）が必要なときは、データプレーンに tokio を
-  入れずに済む橋渡し（[tower の層と tokio 前提ライブラリ](#tower-の層と-tokio-前提ライブラリ)）を使います。
+  tokio・monoio はありません。tokio 前提のライブラリ（hyper・reqwest・sqlx など）は、veil の tokio 無しの tokio 互換
+  レイヤーを通じて同じワーカーで動きます（[tokio 互換](#tokio-互換)）。
 - ワーカー上でブロッキング処理をしてはいけません。Rust の **同期** `fn` ハンドラ・C のコールバック・Python のハンドラは、
   veil の `offload` を通じて別のハンドラ用スレッドプール（`[api] handler_threads`）で実行されるので、遅い DB 呼び出しが
   他の接続を止めることはありません。
-- **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・
-  `l4-handler`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
+- **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-compat`・
+  `tokio-compat-bridge`・`graphql`・`l4-handler`・`grpc-handler`・`api-core`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
   従来とまったく同じです。
 - プロキシで使えるものはそのまま使えます。`[server]`・`[tls]`・`[security]`・`[logging]`・`[prometheus]` などのセクション、
   SIGHUP リロード、graceful shutdown（SIGINT/SIGTERM または `veil::shutdown()`）です。
@@ -58,10 +59,16 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 | `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`http2` を含意） |
 | `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]`（`handler` を含意） |
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json` と Swagger UI（`macro` を含意） |
-| `tokio-interface` | tower の `Layer`/`Service` 互換と tokio への橋渡し（`veil::api::tower`・`veil::api::tokio_compat`） |
+| `tokio-compat` | tokio 無しの tokio 互換レイヤー（`veil::tokio`・`App::tokio_service`・`veil::api::tokio_compat`）。[tokio 互換](#tokio-互換) を参照 |
+| `tokio-compat-bridge` | `tokio-compat` の代わりに、本物の tokio ランタイムを同梱して Future をその上で動かす（`tokio-compat` と排他） |
 | `graphql` | `async-graphql` スキーマ向けの `App::graphql()` |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理（`l4-proxy` を含意） |
-| `api` | 上記すべて（`handler`・`macro`・`openapi`・`tokio-interface`・`graphql`・`l4-handler`） |
+| `grpc-handler` | prost のメッセージで書く gRPC サーバ（`veil::api::grpc`、[gRPC](#grpc) を参照。`handler`・`grpc` を含意） |
+| `api-core` | `handler`・`macro`・`openapi`・`graphql`・`l4-handler`・`grpc-handler` と tower の `Layer`/`Service` 互換（`veil::api::tower`） |
+| `api` | `api-core` + `tokio-compat`（ライブラリの既定の使い方） |
+
+tokio の橋渡しを使うときは `features = ["full", "api-core", "tokio-compat-bridge"]` を選びます。`tokio-compat` と
+`tokio-compat-bridge` を両方有効にするとコンパイルエラーになります。
 
 `vds` と `acme` は別の feature で、`full*` に含まれ、プロキシ本体でもライブラリでも使えます（[VDS](vds.md)・[ACME](acme.md) を参照）。
 
@@ -128,10 +135,8 @@ fn main() -> Result<(), veil::api::Error> {
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"
-h2c_enabled = true     # 平文 HTTP/2（prior knowledge）と ...
-h2c_http1 = true       # ... 同じポートの平文 HTTP/1.1
-tls_only = false
+listen_cleartext = "127.0.0.1:8080"  # 平文 HTTP/1.1 + h2c（prior knowledge）をプロトコル検出で判別。ループバックのみ。`listen` も [tls] も無い
+enable_secure_redirect = false     # 平文で配信する（サーバの既定は HTTPS への 301）
 http2_enabled = true
 
 [logging]
@@ -149,8 +154,13 @@ openapi_title = "veil API"
 openapi_version = "0.1.0"
 ```
 
-これに `[server] threads` = CPU 数が加わります。設定ファイルが無くても起動し、`0.0.0.0:8080` で平文の HTTP/1.1 と h2c を受け、
+これに `[server] threads` = CPU 数が加わります。設定ファイルが無くても起動し、`127.0.0.1:8080` で平文の HTTP/1.1 と h2c を受け、
 **TLS 証明書は不要** です（`[tls]` を省略できるのはこの平文専用構成だけです。[設定リファレンス](configuration.md#tls-なしの平文専用サーバ)を参照）。
+
+既定のリスナーは **ループバックアドレスだけ** で受けるので、設定なしで起動したアプリケーションには他のホストから届きません。
+コンテナ内やロードバランサの背後などで外部に公開するときはアドレスを明示します（`config.toml` の `listen_cleartext = "0.0.0.0:8080"`、
+Rust の `.listen_cleartext("0.0.0.0:8080")`、C の `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")`、
+Python の `veil.run(listen_cleartext="0.0.0.0:8080")`、または `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`）。
 
 ### 設定の合成と優先順位
 
@@ -166,14 +176,14 @@ openapi_version = "0.1.0"
 （[ルーティングマクロ](#ルーティングマクロ)）。
 
 同じ合成が SIGHUP リロードのたびに行われるので、ビルダと環境変数の上書きは **リロード後も保たれます**。読み直されるのは
-`config.toml` の内容だけです。`[server] listen`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
+`config.toml` の内容だけです。`[server] listen` / `listen_cleartext`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
 
 ### ビルダ
 
 ```rust
 let config = Config::load()?            // または Config::new()（既定設定だけ）、Config::from_file("app.toml")?
     .builder()
-    .listen("0.0.0.0:8080")             // [server].listen
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext（外部に公開。既定は 127.0.0.1:8080）
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -182,9 +192,9 @@ let config = Config::load()?            // または Config::new()（既定設�
     .build();
 ```
 
-型付きのセッタは `listen`・`threads`・`tls_only`・`h2c_enabled`・`http2_enabled`・`log_level`・`openapi_enabled`・
+型付きのセッタは `listen_cleartext`（平文のアドレス）・`listen`（TLS のアドレス）・`allow_http`・`allow_h2c`・`secure_redirect`・`threads`・`http2_enabled`・`log_level`・`openapi_enabled`・
 `openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`max_body_size`・`handler_threads`・
-`tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
+`grpc_max_message_size`・`tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
 `Config::to_toml_string()` は合成結果（環境変数の上書きとルート注入の前）を返すので、デバッグに使えます。
 
 ### `[api]` キー（ライブラリ専用）
@@ -201,7 +211,8 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `openapi_description` | なし | `info.description` |
 | `max_body_size` | `10485760` | ハンドラへ渡すリクエスト本文の上限（バイト） |
 | `handler_threads` | `0` | 同期 Rust 関数・C コールバック・Python ハンドラを実行するハンドラ用プールのスレッド数（`0` = 組み込みの既定） |
-| `tokio_threads` | `2` | tokio 互換ランタイムのワーカー数 |
+| `tokio_threads` | `2` | 同梱の tokio ランタイムのワーカー数（`tokio-compat-bridge` のみ） |
+| `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
 
 ## ルーティングマクロ
 
@@ -271,6 +282,30 @@ host・正規化したパス（パラメータ名は無視）・その他の条�
 | `ApiError` | 指定ステータスで `{"detail": "メッセージ"}` |
 
 `ApiError::new(status, msg)`・`bad_request`・`not_found`・`internal` は `?` で返す用途です。`serde_json::Error` は 400 の `ApiError` に変換されます。
+
+### ストリーミング本文とトレーラ
+
+`Response::stream(status, stream)` は本文をできた順に送ります。ストリームは `BodyChunk::Data(bytes)` を返し、
+最後に `BodyChunk::Trailers(fields)` を返せます。`BodyChunk::Abort(reason)` は途中で打ち切ります。HTTP/1.1 は chunked
+（トレーラは最後のチャンクの後、打ち切りは接続を閉じる）、HTTP/2 は DATA フレームと末尾の HEADERS（打ち切りは RST_STREAM）、
+HTTP/3 も同様（打ち切りはストリームのリセット）です。すでに用意できている断片は 1 フレーム 16KiB までまとめて送ります。
+`HEAD` ではストリームを poll せずに捨てます。
+
+届いた順に要求本文を受け取りたいルートは `streaming = true`（`#[veil::route(..., streaming = true)]` または
+`App::route_fn_streaming`）にして、`req.take_body_stream()`（`Stream<Item = Bytes>`）で読みます。HTTP/2 ではヘッダが
+届いた時点でハンドラが動き、要求と応答が同時に流れます（全二重）。HTTP/1.1 と HTTP/3 では本文を読み終えてから 1 断片として
+渡します。HTTP/2 のストリーミング受信のルートには `max_body_size` が掛からないので、読みながら制限してください。
+どちらの向きも tower の層をそのまま通ります。
+
+```rust
+#[veil::route(path = "/upper", method = "POST", streaming = true)]
+async fn upper(req: &Request) -> Response {
+    use futures::StreamExt;
+    let body = req.take_body_stream()
+        .map(|c| BodyChunk::Data(bytes::Bytes::from(c.to_ascii_uppercase())));
+    Response::stream(200, body).with_header("content-type", "text/plain")
+}
+```
 
 ## バリデーションと OpenAPI
 
@@ -344,24 +379,26 @@ App::new().state(Db::connect()?).run()?;
 
 ## tower の層と tokio 前提ライブラリ
 
-`tokio-interface` が必要です。リクエストとレスポンスは `http::Request<Full<Bytes>>` / `http::Response` でやり取りします。
+リクエストとレスポンスは `http::Request<Full<Bytes>>` / `http::Response` でやり取りします。
 
 ```rust
 App::new()
-    // 全ルートに tower の Layer を掛ける。veil のワーカー上で実行される（中で tokio のタイマーや I/O を使わない）
+    // 全ルートに tower の Layer を掛ける。veil のワーカー上で実行される
     .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(name, value))
     // /admin 以下のルートだけ（セグメント境界の前方一致）
     .layer_on("/admin", RequireToken)
-    // 既存の tower Service（axum の Router など）を tokio ランタイムで動かしてマウントする
+    // 既存の tower Service（axum の Router など）をマウントする
     .tokio_service(&["GET", "POST"], "/legacy/{*rest}", axum_router)
     .run()?;
 ```
 
-- `layer` / `layer_on` は veil のイベントループの中でハンドラを包みます。tokio のリアクタを必要としない層
-  （認証・ヘッダ付与・CORS など）向けです。tokio のタイマーを使う層（tower の `Timeout` など）は tokio ランタイムが要るので、ここでは使えません。
-- `tokio_service` は tokio 互換ランタイムでサービスを実行し、結果は `offload` と同じ「結果スロット + 通知 fd」でワーカーへ返します
-  （スレッドをまたいで `Waker` を呼びません）。
-- 任意のハンドラの中で tokio 前提のライブラリを使うときは `veil::api::tokio_compat::run` を通します。
+- `layer` / `layer_on`（`api-core`）は veil のイベントループの中でハンドラを包みます。
+- `tokio_service`（`tokio-compat` または `tokio-compat-bridge`）は tower のサービスをマウントします。`tokio-compat` では
+  ほかのハンドラと同じくリクエストを受け付けたワーカーで動きます。`tokio-compat-bridge` では同梱の tokio ランタイムで動き、
+  結果は `offload` と同じ「結果スロット + 通知 fd」でワーカーへ返ります。
+- 任意のハンドラの中で tokio 前提の Future を動かすには `veil::api::tokio_compat::run(fut)` を使います。`tokio-compat` では
+  `fut.await` と同じです（2 つの feature の間でコードを変えずに済むように残しています）。`tokio-compat-bridge` では同梱の
+  ランタイム（遅延起動、ワーカー数は `[api] tokio_threads`、既定 2）で動きます。
 
   ```rust
   let body = veil::api::tokio_compat::run(async move {
@@ -370,8 +407,74 @@ App::new()
   ```
 
   `run` はタスクが panic すると panic します（→ 500）。`try_run` は `Result` を返し、`spawn` は切り離したタスクを起動し、
-  `handle()` は `tokio::runtime::Handle` を返します。ランタイムは遅延起動で、ワーカー数は `[api] tokio_threads`（既定 2）です。
-  データプレーン（受付・TLS・HTTP・ハンドラの poll）が tokio 上で動くことはありません。
+  `handle()` はランタイムのハンドルを返します。
+
+## tokio 互換
+
+`tokio-compat`（`api` に含む）は、tokio の公開 API を **tokio に依存せず** veil 独自のランタイムの上に実装します。
+tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が veil の io_uring（または epoll/kqueue）のワーカーで
+そのまま動きます。データプレーンと veil のランタイムは何も変わりません（互換レイヤーは既存のランタイム API だけを使い、
+プロキシ本体のバイナリには入りません）。
+
+### 使い方
+
+依存ツリー全体の `tokio` クレートを veil のシム（パッケージ名 `tokio`、版 1.99.0。`veil::tokio` を再エクスポート）に
+置き換えます。
+
+```toml
+[dependencies]
+veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+tokio = { version = "1", features = ["full"] }        # シムに解決される
+reqwest = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+```
+
+`veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は
+veil のランタイム（current-thread または multi-thread）を起動します。
+
+### tokio との違い
+
+- **work stealing はありません。** タスクは spawn したスレッドで動きます。ランタイム外のスレッドから `Handle` 経由で
+  spawn するとランタイムのスレッドへ転送します。I/O オブジェクトは作ったスレッドに結び付きます。
+- **スレッドをまたぐ起床**（別スレッドの `Sender`・`spawn_blocking`・別スレッドへ渡した `Waker`）は、通知 fd を通じて
+  所有スレッドへ届けます。veil 自身の Waker を別スレッドから呼ぶことはありません。
+- `spawn_blocking`・`block_in_place`・`fs` は veil のハンドラ用スレッドプール（`[api] handler_threads`）で動きます。
+- 対応: `task`（spawn・`JoinHandle`・`JoinSet`・`LocalSet`・`task_local!`・`yield_now`・協調スケジューリングの予算・
+  `unconstrained`）、`time`（`pause`/`advance`/`start_paused` を含む）、`io`（トレイト・ユーティリティ・`split`・`duplex`・
+  `copy_bidirectional`・バッファ付き I/O）、`net`（TCP・UDP・Unix のストリーム/データグラム/リスナー・`AsyncFd`・
+  `lookup_host`）、`sync`（mpsc・oneshot・watch・broadcast・`Mutex`・`RwLock`・`Semaphore`・`Notify`・`Barrier`・
+  `OnceCell`・`SetOnce`）、`signal`、`fs`、`select!`/`join!`/`try_join!`/`pin!`、`runtime::{Runtime, Builder, Handle}`。
+- 非対応: `process`、ランタイムのメトリクス、タスクダンプ・トレースのフック、io_uring を使う `fs`、Windows の名前付きパイプ。
+  これらや tokio の内部を必要とするクレートは `tokio-compat-bridge` を使ってください。
+
+### 互換性
+
+tokio 自身のテスト（tokio 1.53.2 の `tokio/tests/*.rs`）をシムに対して `tools/tokio-compat/run_tokio_tests.py` で実行した
+結果です。ランタイムの内部を確かめるテスト（`rt_*`・メトリクス・トレース・work stealing・io_uring の fs）は対象外で、
+一覧はスクリプトにあります。
+
+| 分類 | 合格 / 実行 | 合格率 |
+|---|---|---|
+| time | 53 / 53 | 100.0% |
+| io | 126 / 133 | 94.7% |
+| net | 113 / 113 | 100.0% |
+| sync | 371 / 376 | 98.7% |
+| task | 70 / 98 | 71.4% |
+| macros | 69 / 70 | 98.6% |
+| fs | 42 / 47 | 89.4% |
+| signal | 9 / 11 | 81.8% |
+| **合計** | **853 / 901** | **94.7%** |
+
+`task` の残りの失敗は、タスク API を通じて tokio のランタイム内部を確かめるもの（`Handle` をまたぐタスク ID、
+`JoinSet` が伝える panic、ランタイム外から動かす `LocalSet` など）が中心です。`io` の未達は `AsyncFd` の
+`Interest::ERROR`/`PRIORITY` の準備待ちと、ランタイムを drop した時点で待っていた Future の起床です。ファイルごとの結果は
+スクリプトを実行すると `docs/artifacts/tokio_compat_results.md` に出力されます。
+
+実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（io_uring と epoll）: hyper のサーバ（HTTP/1.1 + h2c）と
+クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、sqlx（SQLite・PostgreSQL）。
 
 ## GraphQL
 
@@ -385,6 +488,75 @@ App::new().graphql("/graphql", schema).run()?;
 `POST` は JSON 本文（単発またはバッチ）、`GET` は `?query=...&variables=...` を受けます。クエリの無い `GET` でブラウザ
 （`Accept: text/html`）なら GraphiQL を返します。クライアントが求めたときは `application/graphql-response+json`、
 それ以外は `application/json` で応答します。サブスクリプションは非対応です。
+
+## gRPC
+
+`grpc-handler`（`api` に含まれる）が必要です。メッセージは [prost](https://docs.rs/prost) の型、ワイヤ処理（5 バイトの
+フレーミング・`grpc-status`/`grpc-message` のトレーラ・`grpc-timeout`・gzip/deflate）は veil 自身の実装で、tokio も tonic も
+使いません。gRPC の呼び出しは普通のハンドラのルート（`POST /<package>.<Service>/<Method>`）で、同じリスナーの HTTP/2
+（TLS・h2c）と HTTP/3 で受けます。
+
+### コード生成
+
+`veil-build` を build-dependency に、`prost` を依存に足します。
+
+```rust
+// build.rs
+fn main() -> std::io::Result<()> {
+    veil_build::compile_protos(&["proto/helloworld.proto"], &["proto"])
+}
+```
+
+```rust
+pub mod hello { veil::include_proto!("helloworld"); }
+use hello::greeter_server::{add_greeter, Greeter};
+use veil::api::grpc::{Request, Response, Status};
+
+struct MyGreeter;
+impl Greeter for MyGreeter {
+    async fn say_hello(&self, req: Request<hello::HelloRequest>)
+        -> Result<Response<hello::HelloReply>, Status> {
+        Ok(Response::new(hello::HelloReply { message: format!("Hello {}", req.get_ref().name) }))
+    }
+}
+
+add_greeter(App::new().grpc_health(), MyGreeter).run()
+```
+
+`veil-build` はサービスごとに `<service>_server` モジュールを作り、トレイト（RPC ごとに 1 メソッド。`async fn` で実装でき、
+Future に `Send` は要りません）、`add_<service>(app, 実装)`、`METHODS` を生成します。サーバ・双方向ストリーミングは
+`Response<BoxStream<T>>` を返し、クライアント・双方向ストリーミングは `Request<Streaming<T>>` を受け取ります。
+`veil_build::configure().veil_path("::my_veil")` でクレートのパスを変えられ、`config_mut()` で `prost_build::Config` を触れます。
+
+### コード生成なし
+
+```rust
+App::new()
+    .grpc_unary("/pkg.Svc/Get", |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
+    .grpc_server_streaming("/pkg.Svc/Watch", |req: Request<WatchRequest>| async move {
+        Ok(Response::new(futures::stream::iter(items.into_iter().map(Ok))))
+    })
+    .grpc_client_streaming("/pkg.Svc/Upload", |req: Request<Streaming<Chunk>>| async move { .. })
+    .grpc_bidi("/pkg.Svc/Chat", |req: Request<Streaming<Msg>>| async move { .. })
+```
+
+### 型と挙動
+
+| 項目 | 挙動 |
+|------|------|
+| `Request<T>` | `get_ref()`・`into_inner()`・`metadata()` / `metadata_value(name)`（`content-type`・`te`・`grpc-timeout`・`grpc-encoding` を除く要求ヘッダ）・`deadline()`・`client_ip()` |
+| `Response<T>` | `with_metadata(name, value)`（応答ヘッダ）・`with_trailer(name, value)`（`grpc-status: 0` の後ろ） |
+| `Status` | `Status::new(Code::X, msg)` や `Status::not_found(msg)` 等。`with_metadata` はトレーラに足す。最初のメッセージより前のエラーは Trailers-Only 応答 |
+| `Streaming<T>` | `Stream<Item = Result<T, Status>>` と `message().await` |
+| 期限 | `grpc-timeout` を veil のタイマーで強制し、ハンドラを取り消して `DEADLINE_EXCEEDED` で終える（ストリームはメッセージの間で確認） |
+| 取り消し | クライアントの RST_STREAM・切断でハンドラの Future と応答ストリームを drop する |
+| 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す。応答は非圧縮（`grpc-accept-encoding: identity,gzip,deflate`） |
+| 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED` |
+| エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
+| ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
+
+gRPC のルートは OpenAPI に載りません。完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・
+ヘルスチェック）で、`tests/api/library_e2e.sh grpc` が tonic のクライアントと HTTP/3 のクライアントで試験します。
 
 ## L4（TCP/UDP）ハンドラ
 
@@ -435,8 +607,10 @@ TOML を書かずに `App::l4_tcp(name, listen, f)` / `App::l4_udp(name, listen,
 let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cert.pem", "/etc/veil/key.pem").build();
 ```
 
-`tls()` は `[tls] cert_path/key_path` を設定し、h2c 専用モードを解除します（`h2c_enabled = false`、`h2c_http1 = false`）。
-`.http3("0.0.0.0:8443")` を足すと UDP ポートで HTTP/3 も受けます（`http3` feature が必要で、`full` に含まれます）。
+`listen(addr)` が TLS のリスナー（`[server].listen`）で、`tls()` が `[tls] cert_path/key_path` です。ライブラリ既定の平文リスナー
+（`listen_cleartext = "127.0.0.1:8080"`、ループバックのみ）はそのまま残るので、`listen_cleartext(..)` で移すか、`.secure_redirect(true)` で TLS ポートへの
+リダイレクトにします。`.http3("0.0.0.0:8443")` を足すと UDP ポートで HTTP/3 も受けます（`http3` feature が必要で、`full` に含まれます。
+`[http3] enabled = true` + `[http3] listen`）。
 そのほかの `[tls]`・`[http2]`・`[http3]`・`[security]` のキーは `config.toml` か `set(..)` で設定します。ライブラリモードでは
 サンドボックスは **既定でオフ** です。`enable_seccomp` / `enable_landlock` を有効にすることもできますが、ハンドラが行う操作
 （ファイル・ソケット・DNS）を許可する必要があります。
@@ -479,7 +653,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* または veil_config_from_file("config.toml") */
-    veil_config_listen(cfg, "0.0.0.0:8080");
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* 平文で外部に公開（既定は 127.0.0.1:8080）。TLS は veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* ブロックする。cfg は消費される */
 }
@@ -523,7 +697,7 @@ def hello(name: str, greeting: str = "Hello"):          # name はパス、greet
 def create_user(body: dict):
     return body
 
-veil.run(listen="0.0.0.0:8080")                         # ブロックする。Ctrl-C / SIGTERM で graceful に停止
+veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（外部に公開。既定は 127.0.0.1:8080）。Ctrl-C / SIGTERM で graceful に停止
 ```
 
 - デコレータは `@veil.get/post/put/delete/patch/route`。`app = veil.App(title=..., version=...)` を作って `@app.get(...)`・`app.run()` も使えます。
@@ -533,7 +707,7 @@ veil.run(listen="0.0.0.0:8080")                         # ブロックする。C
 - **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）ではハンドラ用プールで実行されるので、
   イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
   純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
-- 設定: `veil.run(config_path=None, *, listen, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
+- 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは
 [examples/api/python-hello/](../../../examples/api/python-hello/)・
@@ -555,16 +729,18 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 ## テスト
 
 ```bash
-tests/api/library_e2e.sh [rust|c|python|nonregression|all]     # 既定: all
+tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # 既定: all
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
-OpenAPI・tower・GraphQL・L4 エコー・HTTP/1.1 と h2c）。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
+OpenAPI・tower・GraphQL・L4 エコー・ストリーミング・HTTP/1.1 と h2c）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 cargo・gcc・curl・nc・python3 が必要です。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
 [テスト](testing.md)も参照してください。
 
 ## 制限事項
 
+- gRPC: HTTP/3 では要求ストリームを読み終えてからハンドラを呼びます（双方向の呼び出しは半二重）。応答は圧縮しません。
+  gRPC-Web・Server Reflection・C/Python の gRPC ハンドラはまだありません。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - GraphQL のサブスクリプションは非対応です。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。

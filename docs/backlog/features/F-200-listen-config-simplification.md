@@ -1,6 +1,6 @@
 # F-200: 待ち受け設定の整理（`listen` / `listen_cleartext`）
 
-**状態: 設計済み・未着手（design/f197-f200）。後方互換性は持たない（旧キーは削除）**
+**状態: 完了（feat/f197-f200-impl）。後方互換性は持たない（旧キーは削除）**
 
 ## 要望
 
@@ -85,7 +85,8 @@ enabled = false                   # true なら listen と同じアドレス（U
   HTTP/1.1（`handle_plain_http1_connection`）/ h2c（`handle_h2c_connection`）/ リダイレクト、の 1 本にする。
 - リダイレクトは現行の `handle_http_redirect`（`config.rs` の HTTP → HTTPS 301）を HTTP/1.1・h2c の両方に使えるようにする
   （h2c は HTTP/2 の 301 応答）。リダイレクト先ポートは `listen` のポート（443 なら省略）。
-- API ライブラリ（F-188）: 既定設定を `listen_cleartext = "0.0.0.0:8080"`・`enable_secure_redirect = false`・`listen` 無しに。
+- API ライブラリ（F-188）: 既定設定を `listen_cleartext = "127.0.0.1:8080"`（ループバックのみ。設定なしで起動したアプリを
+  外部に公開しない。公開するときは `0.0.0.0:8080` 等を明示する）・`enable_secure_redirect = false`・`listen` 無しに。
   `ConfigBuilder::tls()` は `listen` を設定するだけ、`h2c_enabled()`・`tls_only()` は削除し `listen_cleartext()`・`allow_http()`・
   `allow_h2c()`・`secure_redirect()` に置き換える。C・Python の設定 API も同様。
 - 生成・テスト資材: `tools/perf/gen_configs.sh` を新キーで生成し直し、構成名（`h2_0_...`）は変えない。
@@ -104,3 +105,33 @@ enabled = false                   # true なら listen と同じアドレス（U
 
 - 旧キーがソース・設定例・ガイドから消え、`examples/config.toml`・`docs/guide/configuration.md`（英日）に新しい表と移行表がある。
 - 旧キーを書いた設定は移行先を示すエラーで起動しない。
+
+## 結果（設定資材・テスト・ガイドの移行）
+
+旧キー（`[server].http`・`tls_only`・`h2c_enabled`・`h2c_listen`・`h2c_http1`・`http3_enabled`）の利用箇所を新キーへ移行した。
+
+- テスト: `tests/e2e_setup.sh` の生成設定（H2C バックエンドは `listen`（ALPN h2 の TLS）+ `listen_cleartext`、UDS の h2c バックエンドは
+  `listen_cleartext = unix:...`、プロキシは `listen_cleartext` = h2c ポート（8081）+ `enable_secure_redirect = false` + `[http3] enabled`）。
+  **301 リダイレクトの検証は 1 つの平文ポートで h2c 配信と両立できない**ため、別インスタンス `proxy_redirect.toml`
+  （`listen` 8450 + `listen_cleartext` 8080、リダイレクト既定）に分けた（`test_redirect_301` は 8080 のまま）。
+  `tests/integration_tests.rs`（graceful shutdown の平文接続）と `tests/standalone_e2e.rs`（F-179 は `listen_cleartext` の上書き、
+  F-188 は `listen_cleartext` 版に書き換え。`allow_http = false` → 426 + h2c 可、`allow_h2c = false` → h2c 拒否 + HTTP/1.1 可、
+  `enable_secure_redirect` の HTTP/1.1・h2c 双方の 301（`Location`）、削除キーの `veil -t` エラーと移行先、検証規則）。
+  ハーネスに `h2c_get_with_headers` を追加。
+- 設定: `examples/config.toml`（待ち受けの表・移行表）・`contrib/config`・`docker/assets/conf.d`・`deploy/kubernetes/base`
+  （`listen` 8443 TLS + `listen_cleartext` 8080、リダイレクト無し）・`tools/container_security`（フィクスチャ・差分/カオス用の生成設定）。
+- 計測: `tools/perf/gen_configs.sh` と生成設定（構成名は不変。h2c 構成は `:80` のリダイレクトリスナーが無くなり `listen_cleartext` が h2c ポート）、
+  `*_alloc.toml`、`alloc_ab.sh`・`leak_check.sh`・BSD 版（`h1_file_plain` は TLS ポートでの平文受理が無くなったので平文ポートへ）。
+- ライブラリ: C は `veil_config_listen`（TLS）・`veil_config_listen_cleartext`・`veil_config_tls`、Python は `Config.listen`（TLS）・
+  `listen_cleartext`・`tls`、`run(listen_cleartext=, listen=, tls_cert=, tls_key=)`、サンプルの `VEIL_LISTEN` は平文へ。
+- ガイド（英日）: configuration（リスナー表・検証規則・移行表）・protocols（英に H2C 節を追加）・library・kubernetes・running・acme・testing、
+  AGENTS.md の平文計測ルール。
+- 試験: lib 1049・integration 60・standalone_e2e 12・E2E（io_uring / epoll とも 565）・`tests/api/library_e2e.sh` の rust / c / python が通過。
+  その後、kind（`veil:musl-k8s` で plain・Istio・Linkerd、全 35 項目）と `examples/container/e2e.sh`（Docker secrets の TLS・
+  `VEIL_OVERRIDE`・証明書の差し替え・graceful stop）も通過。F-197〜F-199 を載せた最終状態で lib 1053・integration 60・
+  standalone_e2e 15（io_uring / epoll）・E2E 565（io_uring / epoll）・library_e2e 77 項目を再確認。
+- 性能（main との交互 A/B、glibc イメージ、各側は自分の作業ツリーの設定を使う。`docs/artifacts/perf_ab_f197_f200*.tsv`）:
+  TLS 静的配信 h1/h2・TLS プロキシ h1/h2・h2c 静的配信・h2c プロキシ・HTTP/3 プロキシ・gRPC の中央値の差は −0.3%〜+2.8%
+  （h2c プロキシは 18 サンプルで −0.2%、gRPC は修正後 4 ラウンドで +0.3%）で、退行なし。B-121 の修正が DATA ごとにストリーム表を
+  2 回引いていたのは 1 回にまとめた。RSS は `listen_cleartext` が全ワーカーで受け付けるぶん（旧 `http` は 1 スレッド）、
+  TLS + リダイレクト構成で数 MB 増える（ガイドに記載）。

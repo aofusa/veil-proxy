@@ -76,6 +76,8 @@ pub struct RouteDef {
     pub methods: &'static [&'static str],
     pub handler: fn(Request) -> HandlerFuture,
     pub meta: fn() -> OperationMeta,
+    /// 要求本文をストリーミングで受け取る（HTTP/2。`#[veil::route(streaming = true)]`、F-197）
+    pub streaming_request: bool,
 }
 
 inventory::collect!(RouteDef);
@@ -88,6 +90,8 @@ pub struct HandlerEntry {
     pub methods: Vec<String>,
     pub func: HandlerFn,
     pub meta: OperationMeta,
+    /// 要求本文をストリーミングで受け取る（HTTP/2 で `Request::take_body_stream` に届いた順に流す。F-197）
+    pub streaming_request: bool,
 }
 
 impl std::fmt::Debug for HandlerEntry {
@@ -126,7 +130,14 @@ impl HandlerEntry {
             methods: ms,
             func,
             meta,
+            streaming_request: false,
         })
+    }
+
+    /// 要求本文のストリーミング受信を有効にする。
+    pub fn with_streaming_request(mut self, on: bool) -> HandlerEntry {
+        self.streaming_request = on;
+        self
     }
 
     /// リクエストを処理する（パスを再照合してパラメータを取り出し、ハンドラを呼ぶ）。
@@ -181,7 +192,8 @@ pub fn register_macro_routes() -> Result<(), String> {
         for def in inventory::iter::<RouteDef> {
             let f = def.handler;
             let func: HandlerFn = Arc::new(move |req| f(req));
-            let entry = HandlerEntry::new(def.name, def.path, def.methods, func, (def.meta)())?;
+            let entry = HandlerEntry::new(def.name, def.path, def.methods, func, (def.meta)())?
+                .with_streaming_request(def.streaming_request);
             register(entry)?;
         }
         Ok(())
