@@ -149,6 +149,32 @@ main（e44fdf3）と feat/f188-api-library-vds-k8s の glibc `full` イメージ
 （ブランチが先: ブランチ 13,041 / main 12,856 = +1.4%）、両順序の平均を載せた。どの構成も同一イメージの
 ラン間の振れ（数 %）の範囲内で、退行は無い。結果 TSV は `tools/perf/results/suite_ab/f188-*.tsv`。
 
+## 平文リスナー統合・tokio 互換レイヤー追加の非退行確認（2026-10-12、F-197〜F-200）
+
+main（c3151ec、F-197〜F-200 のマージ前）とブランチ feat/f197-f200-impl の glibc `full` イメージを交互に計測した
+（各側は自分の作業ツリーの生成設定を使う。F-200 で h2c 構成の平文ポートが `listen_cleartext` になったため）。
+req/s は 6 サンプルの中央値、errors はすべて 0。
+
+| 構成 | プロトコル | main | ブランチ | 差 |
+|------|-----------|-----:|--------:|---:|
+| TLS 静的配信（h2 有効, ofc 有効） | HTTP/1.1 | 6,187 | 6,199 | +0.2% |
+| 同上 | HTTP/2 | 5,639 | 5,695 | +1.0% |
+| TLS プロキシ | HTTP/1.1 | 4,065 | 4,066 | +0.0% |
+| 同上 | HTTP/2 | 3,992 | 4,086 | +2.4% |
+| h2c 静的配信 | h2c | 20,223 | 20,158 | −0.3% |
+| h2c プロキシ | h2c | 7,149 | 7,046 | −1.4%（18 サンプルで −0.2%） |
+| HTTP/3 有効のプロキシ | HTTP/1.1 | 4,095 | 4,088 | −0.2% |
+| 同上 | HTTP/2 | 4,074 | 4,102 | +0.7% |
+| 同上 | HTTP/3 | 1,242 | 1,277 | +2.8% |
+| gRPC | gRPC | 3,116 | 3,024 | −2.9%（B-121 修正後の 12 サンプルで +0.3%） |
+
+- tokio 互換レイヤー（`tokio-compat`）は default・`full*` に入らないので、プロキシのバイナリには含まれない
+  （`tests/api/library_e2e.sh nonregression` で検査）。差はラン間の振れの範囲内で、退行は無い。
+- RSS は `listen_cleartext` が全ワーカーで受け付けるようになったぶん（旧 `[http]` は 1 スレッド）、TLS + リダイレクトの
+  構成で数 MB 増える。
+- API ライブラリ自体の性能（axum on tokio / `veil::tokio`・veil のハンドラ・FastAPI との比較）は
+  [docs/guide/library.md の Performance](../guide/library.md#performance) と `tools/api-bench/`。
+
 ## FreeBSD 14.3 aarch64（QEMU + HVF、ネイティブ）
 
 - コミット: `d8126b6`。`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`（3B と 54,576B）
