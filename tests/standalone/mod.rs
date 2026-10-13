@@ -135,14 +135,20 @@ impl Drop for VeilProcess {
     }
 }
 
+/// `127.0.0.1:port` へ接続する。NetBSD では拒否された接続でも std の `connect_timeout` が `Ok` を
+/// 返してエラーを `SO_ERROR` に残すので（B-91）、`take_error` まで確かめる。
+pub fn connect_local(port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let s = TcpStream::connect_timeout(&format!("127.0.0.1:{}", port).parse().unwrap(), timeout)?;
+    match s.take_error()? {
+        Some(e) => Err(e),
+        None => Ok(s),
+    }
+}
+
 /// `port` に接続できるようになるまで待つ。
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     wait_until(timeout, || {
-        TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", port).parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
+        connect_local(port, Duration::from_millis(200)).is_ok()
     })
 }
 
@@ -193,10 +199,7 @@ pub fn http1_request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> std::io::Result<HttpResponse> {
-    let mut s = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().unwrap(),
-        Duration::from_secs(2),
-    )?;
+    let mut s = connect_local(port, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut req = format!(
         "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -285,10 +288,7 @@ pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), name)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut sock = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().unwrap(),
-        Duration::from_secs(2),
-    )?;
+    let mut sock = connect_local(port, Duration::from_secs(2))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;

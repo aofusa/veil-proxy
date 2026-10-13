@@ -385,6 +385,7 @@
 | B-123 | P1 | 完了 | [bugs/B-123-h2-request-body-consumer-notify.md](bugs/B-123-h2-request-body-consumer-notify.md) | HTTP/2 の要求本文を受け取る側（API ハンドラへのポンプ・エラー時の読み捨て 7 か所）がメインループを起こさず、recv ウィンドウ（1MiB）を超える本文で応答が返らなかった（reactor で必ず固まる。gRPC の 3MiB unary・上流に繋がらない 3MiB の POST）。消費のたびに notify |
 | B-124 | P1 | 完了 | [bugs/B-124-non-linux-build-breakage.md](bugs/B-124-non-linux-build-breakage.md) | macOS・OpenBSD で veil 本体がビルドできなかった（F-200 で消した `h2c_listen` を unveil/Seatbelt 用の UDS パス収集が参照）。macOS で単体テストがビルドできなかった（connect_broker の定数） |
 | B-125 | P2 | 完了 | [bugs/B-125-api-library-non-linux.md](bugs/B-125-api-library-non-linux.md) | API ライブラリの C・Python 版が Linux 以外でビルドできなかった（`epoll` feature を無条件に指定）。サンプル・VDS の Rust 制御プレーンが Windows でビルドできなかった |
+| B-126 | P2 | 完了 | [bugs/B-126-netbsd-connect-timeout-so-error.md](bugs/B-126-netbsd-connect-timeout-so-error.md) | NetBSD で VDS・ACME の制御プレーンへの接続が拒否されても次のアドレスを試さなかった（std の `connect_timeout` が `Ok` を返し `SO_ERROR` に残る。B-91 の取りこぼし）。試験の接続待ちも同じ |
 
 ---
 
