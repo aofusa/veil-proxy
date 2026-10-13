@@ -1,0 +1,25 @@
+# axum + veil の tokio 互換レイヤー（依存ツリーの tokio を veil の shim に置き換える）と、
+# veil の API ライブラリ（axum の Router を tokio_service で載せる・ネイティブハンドラ）。tools/api-bench/README.md を参照。
+[package]
+name = "api-bench-axum-veil"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+veil = { path = "../../..", default-features = false, features = ["http2", "api"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }   # crates/veil-tokio/tokio-shim に解決される
+serde_json = "1"
+
+[features]
+# reactor（epoll）バックエンドで測る: cargo build --release --features epoll
+epoll = ["veil/epoll"]
+
+[patch.crates-io]
+tokio = { path = "../../../crates/veil-tokio/tokio-shim" }
+
+[profile.release]
+codegen-units = 1

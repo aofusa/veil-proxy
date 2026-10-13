@@ -28,6 +28,8 @@ tests/fixtures/f150_cache/*
 # サンプルフィルタのビルド成果物
 examples/wasm-filters/*/target/
 examples/api/*/target/
+tools/api-bench/*/target/
+tools/api-bench/*/target-epoll/
 examples/wasm-filters/*/Cargo.lock
 tests/wasm/*.wasm
 
