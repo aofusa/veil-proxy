@@ -107,7 +107,7 @@ TOML
   expect "stream HEAD (no body)" "transfer-encoding: chunked" bash -c "curl -s -I '$B/stream' | tr A-Z a-z"
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
-  expect "streaming request (h2c, 1MiB)" "1048576" bash -c "head -c 1048576 /dev/zero | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
+  expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
   expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}'
   expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7Badd(a:2,b:3)%7D"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
