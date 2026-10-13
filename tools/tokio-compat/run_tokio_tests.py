@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -169,11 +170,20 @@ def count_tests(path):
 
 
 def run_one(exe, test, timeout):
+    # 試験は自分のプロセスグループで動かし、タイムアウト・中断（Ctrl-C 等）のときはグループごと止める
+    # （止めないと CPU を使い続ける試験プロセスが孤児として残り、後の計測を乱す）。
+    p = subprocess.Popen([exe, "--exact", test, "--test-threads=1"], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        p = subprocess.run([exe, "--exact", test, "--test-threads=1"], capture_output=True, text=True, timeout=timeout)
+        stdout, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
         return "timeout", ""
-    out = p.stdout + p.stderr
+    except BaseException:
+        os.killpg(p.pid, signal.SIGKILL)
+        raise
+    out = stdout + stderr
     if "1 passed" in out:
         return "ok", out
     if "1 ignored" in out or "0 passed; 0 failed; 1 ignored" in out:

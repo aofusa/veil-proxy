@@ -4768,6 +4768,8 @@ pub enum ProtocolType {
     TLS,     // TLS (HTTPS)
     Http11,  // HTTP/1.1
     Unknown, // 不明
+    /// 1 バイトも届かずに閉じられた・アイドルタイムアウト・graceful shutdown（TCP のヘルスチェック等。B-122）
+    Closed,
 }
 
 /// プロトコル判別で読み取った初期データを保持し、
@@ -4876,9 +4878,12 @@ impl<S: crate::runtime::io::AsyncWriteRent + Unpin> crate::runtime::io::AsyncWri
 /// 2. TLS ClientHello（最初の5バイト）
 /// 3. HTTP/1.1リクエスト（最初の3バイトでメソッド検出）
 ///
-/// エラーハンドリング:
-/// - 読み込みエラー: Unknownを返し、空のバッファを返す
-/// - タイムアウト: 短いタイムアウトを設定して再試行（将来の改善）
+/// 待ち方（B-122）:
+/// - 最初のバイトまでは、キープアライブで次の要求を待つのと同じアイドル待ち（`IDLE_TIMEOUT`、graceful shutdown で
+///   即座に満了）。ブラウザの事前接続や接続プールは、接続してから要求を送るまで間を空けることがある
+///   （以前は 200ms で打ち切って Unknown とし、HTTP/1.1 のクライアントへ HTTP/2 の GOAWAY を返していた）。
+/// - 判別に足りない断片（5 バイト未満・HTTP/2 プリフェースの途中）の続きは短い上限（200ms）で待つ。
+/// - 1 バイトも届かずに閉じられた・タイムアウトした接続は `Closed`、判別できないバイト列は `Unknown`。
 pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolType, Vec<u8>) {
     // ソケットバッファを MSG_PEEK で覗き見て（消費せず）プロトコルを判別する。
     //
@@ -4887,22 +4892,29 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     // `received corrupt message / InvalidContentType` で失敗する不具合があった
     // （h2c 検出が有効な全接続で発生しうる）。MSG_PEEK ならバイトはソケットに残るため、
     // 判別後に TLS/H2C/HTTP1.1 各ハンドラがそのまま読み直せる（initial_data は常に空）。
+    const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const PARTIAL_TIMEOUT: Duration = Duration::from_millis(200);
     let fd = stream.as_raw_fd();
-    let start_time = std::time::Instant::now();
-    let timeout_duration = Duration::from_millis(200);
     let mut peeked = [0u8; 24];
     let mut n = 0usize;
+    // 断片を最初に覗いた時刻（続きを待つ上限の起点）
+    let mut partial_since: Option<std::time::Instant> = None;
 
     loop {
-        let remaining_timeout = match timeout_duration.checked_sub(start_time.elapsed()) {
-            Some(d) if d.as_millis() > 0 => d,
-            _ => break,
-        };
-
         // データ到着を待つ（MSG_PEEK は消費しないのでタイムアウトキャンセルしても安全）。
-        match timeout(remaining_timeout, stream.readable()).await {
-            Ok(Ok(())) => {}
-            _ => break,
+        match partial_since {
+            None => match timeout_idle(crate::pool::IDLE_TIMEOUT, true, stream.readable()).await {
+                Ok(Ok(())) => {}
+                _ => break,
+            },
+            Some(since) => {
+                if since.elapsed() >= PARTIAL_TIMEOUT {
+                    break;
+                }
+                // 断片はソケットに残ったまま（覗いただけ）なので readable は即座に成立する。
+                // 続きを待つ間は readiness ではなく短い sleep で覗き直す（断片は稀な経路）。
+                crate::runtime::time::sleep(Duration::from_millis(1)).await;
+            }
         }
 
         // 消費せずに覗き見る（毎回ソケットバッファの先頭から最大 24 バイト）。
@@ -4946,15 +4958,21 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
         }
         n = ret as usize;
         // TLS/HTTP1.1 は 5 バイト、H2C プリフェースは 24 バイトで判別可能。
-        if n >= 24 || n >= 5 {
+        // プリフェースの途中（"PRI * ..." の 24 バイト未満）なら続きを待つ。
+        if n >= 24 || (n >= 5 && !PREFACE.starts_with(&peeked[..n])) {
             break;
         }
+        partial_since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    if n == 0 {
+        return (ProtocolType::Closed, Vec::new());
     }
 
     let data = &peeked[..n];
 
     // HTTP/2 プリフェース検出（24バイト固定）。MSG_PEEK なので initial_data は空で返す。
-    if n >= 24 && data == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+    if n >= 24 && data == PREFACE {
         debug!("[Protocol Detection] H2C (HTTP/2 Cleartext) detected");
         return (ProtocolType::H2C, Vec::new());
     }
@@ -4976,12 +4994,10 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
         }
     }
 
-    if n > 0 {
-        debug!(
-            "[Protocol Detection] Unknown protocol ({} bytes): hex={:02x?}",
-            n, data
-        );
-    }
+    debug!(
+        "[Protocol Detection] Unknown protocol ({} bytes): hex={:02x?}",
+        n, data
+    );
 
     (ProtocolType::Unknown, Vec::new())
 }

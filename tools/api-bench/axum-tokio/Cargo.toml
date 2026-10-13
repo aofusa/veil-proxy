@@ -1,0 +1,16 @@
+# axum + 本物の tokio（比較の基準）。tools/api-bench/README.md を参照。
+[package]
+name = "api-bench-axum-tokio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1

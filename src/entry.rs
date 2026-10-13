@@ -1798,8 +1798,16 @@ pub fn run_server(opts: ServerOptions) {
                                                 peer_addr
                                             );
                                         }
+                                        ProtocolType::Closed => {
+                                            // 何も送らずに閉じた・アイドルのまま満了（TCP のヘルスチェック等。B-122）
+                                            debug!(
+                                                "[Cleartext] connection from {} closed before sending any data",
+                                                peer_addr
+                                            );
+                                        }
                                         ProtocolType::Unknown => {
-                                            warn!(
+                                            // 接続ごとのログなので debug（相手が任意に発生させられる。B-122）
+                                            debug!(
                                                 "[Cleartext] Unknown protocol from {}, closing connection",
                                                 peer_addr
                                             );

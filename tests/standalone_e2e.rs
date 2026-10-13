@@ -315,6 +315,58 @@ fn f188_plaintext_only_server_without_tls_serves_http1_and_h2c() {
     assert_eq!(body, b"plain");
 }
 
+/// B-122: 平文リスナーは接続してから最初のバイトが届くまで待つ（以前は 200ms で打ち切り、HTTP/1.1 の
+/// クライアントへ HTTP/2 の GOAWAY を返していた）。最初の断片が判別に足りなくても続きを待ち、
+/// 何も送らずに閉じた接続（TCP のヘルスチェック）は WARN を出さずに閉じる。
+#[test]
+fn b122_cleartext_waits_for_late_and_fragmented_first_bytes() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let veil = spawn_cleartext(dir.path(), port, "enable_secure_redirect = false");
+
+    let get = |chunks: &[(&[u8], u64)]| -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        for (bytes, delay_ms) in chunks {
+            std::thread::sleep(Duration::from_millis(*delay_ms));
+            s.write_all(bytes).unwrap();
+        }
+        let mut buf = [0u8; 512];
+        let n = s.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+    let req: &[u8] = b"GET /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    // 接続後 1 秒たってから要求を送る（ブラウザの事前接続・接続プール）
+    let resp = get(&[(req, 1000)]);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "late request: {resp:?}\n{}",
+        veil.log()
+    );
+    // 判別に足りない断片（3 バイト）のあとに続き
+    let resp = get(&[(&req[..3], 0), (&req[3..], 50)]);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "fragmented request: {resp:?}\n{}",
+        veil.log()
+    );
+
+    // 何も送らずに閉じる接続（TCP のヘルスチェック）を繰り返しても、その後の要求は通り WARN も出ない
+    for _ in 0..5 {
+        drop(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+    }
+    let resp = http1_get(port, "/index.html").expect("plain HTTP/1.1 after empty connections");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !veil.log().contains("Unknown protocol"),
+        "empty connections must not be logged as unknown protocol:\n{}",
+        veil.log()
+    );
+}
+
 /// F-200: `allow_http = false` は平文 HTTP/1.1 を 426 で拒否し、h2c は受ける。
 #[test]
 fn f200_allow_http_false_rejects_http1_with_426_but_serves_h2c() {

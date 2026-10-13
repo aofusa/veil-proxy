@@ -1,4 +1,4 @@
-//! tokio 互換レイヤー（F-198）の実ライブラリ試験。`ok <名前>` / `FAIL <名前>: <理由>` を出し、失敗があれば終了コード 1。
+//! tokio 互換レイヤー（F-198）の実ライブラリ試験（hyper・reqwest・tower-http・axum・sqlx）。`ok <名前>` / `FAIL <名前>: <理由>` を出し、失敗があれば終了コード 1。
 //! この crate の `tokio` は crates/veil-tokio/tokio-shim（veil のランタイム）に置き換わっている。
 
 use bytes::Bytes;
@@ -149,6 +149,64 @@ async fn tower_http_timeout() -> Result<(), String> {
     Ok(())
 }
 
+/// axum（`axum::serve`）: パス・JSON の抽出、State、並行要求、graceful shutdown。
+async fn axum_server() -> Result<(), String> {
+    use axum::extract::{Path, State};
+    use axum::routing::{get, post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/hello/{name}", get(|Path(name): Path<String>| async move { format!("hello {name}") }))
+        .route(
+            "/echo",
+            post(|State(h): State<Arc<AtomicUsize>>, axum::Json(v): axum::Json<serde_json::Value>| async move {
+                h.fetch_add(1, Ordering::Relaxed);
+                axum::Json(serde_json::json!({ "echo": v }))
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    let client = reqwest::Client::new();
+    let r = client.get(format!("http://{addr}/hello/veil")).send().await.map_err(|e| e.to_string())?;
+    let t = r.text().await.map_err(|e| e.to_string())?;
+    if t != "hello veil" {
+        return Err(format!("hello: {t:?}"));
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..30 {
+        let c = client.clone();
+        set.spawn(async move {
+            let r = c.post(format!("http://{addr}/echo")).json(&serde_json::json!({ "i": i })).send().await?;
+            r.json::<serde_json::Value>().await
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        let v = r.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        if v["echo"]["i"].as_i64().is_none() {
+            return Err(format!("echo: {v}"));
+        }
+    }
+    if hits.load(Ordering::Relaxed) != 30 {
+        return Err(format!("state: {}", hits.load(Ordering::Relaxed)));
+    }
+    drop(client);
+    let _ = stop_tx.send(());
+    match tokio::time::timeout(Duration::from_secs(5), server).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        other => Err(format!("graceful shutdown: {other:?}")),
+    }
+}
+
 async fn sqlx_sqlite() -> Result<(), String> {
     use sqlx::Row;
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -270,6 +328,7 @@ async fn main() {
     report("hyper h2c client (50 concurrent)", hyper_h2_client(addr).await);
     report("reqwest (30 concurrent + timeout)", reqwest_client(addr).await);
     report("tower-http TimeoutLayer", tower_http_timeout().await);
+    report("axum (serve, extractors, state, graceful shutdown)", axum_server().await);
     report("sqlx sqlite", sqlx_sqlite().await);
     match std::env::var("VEIL_PG_URL") {
         Ok(url) => report("sqlx postgres (20 concurrent)", sqlx_postgres(&url).await),

@@ -1,0 +1,4 @@
+# FastAPI 側（uvicorn[standard] で uvloop・httptools を使う）。veil 側は crates/veil-python を maturin develop --release で入れる。
+fastapi
+uvicorn[standard]
+maturin

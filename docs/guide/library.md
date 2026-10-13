@@ -30,6 +30,7 @@ Three front ends share the same implementation:
 - [C API](#c-api)
 - [Python](#python)
 - [Building library artifacts](#building-library-artifacts)
+- [Performance](#performance)
 - [Testing](#testing)
 - [Limitations](#limitations)
 
@@ -455,7 +456,10 @@ Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works witho
 ### How it differs from tokio
 
 - **No work stealing.** A task runs on the thread that spawned it; `spawn` from a non-runtime thread through a
-  `Handle` is forwarded to the runtime's thread. I/O objects are bound to the thread that created them.
+  `Handle` is forwarded to the runtime's thread. I/O objects are bound to the thread that created them. A server
+  that accepts on one listener and spawns a task per connection (`axum::serve`, a hyper accept loop) therefore
+  runs on one thread even on a multi-thread runtime; use one listener per thread with `SO_REUSEPORT` or mount the
+  service in a veil `App` (see [Performance](#performance)).
 - **Cross-thread wake-ups** (a `Sender` on another thread, `spawn_blocking`, a `Waker` sent elsewhere) are delivered
   to the owning thread through a notification fd; veil's own wakers are never called from another thread.
 - `spawn_blocking`, `block_in_place` and `fs` run on veil's handler thread pool (`[api] handler_threads`).
@@ -491,7 +495,8 @@ Most of the remaining `task` failures check tokio's runtime internals through th
 dropped. Results per file: `docs/artifacts/tokio_compat_results.md` after running the script.
 
 Real libraries checked by `tools/tokio-compat/ecosystem` (io_uring and epoll): hyper server (HTTP/1.1 + h2c) and
-client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, sqlx with SQLite and PostgreSQL.
+client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, axum 0.8 (`axum::serve`, extractors, state, graceful
+shutdown), sqlx with SQLite and PostgreSQL.
 
 ## GraphQL
 
@@ -751,6 +756,59 @@ builds the selected kinds (`all` is the default; `--docker` runs the build in a 
 `docker/Dockerfile.lib`) and writes a single archive `veil-lib-<version>-<arch>-linux-gnu.zip` to
 `packaging/output/lib/`. It contains `libveil.so`/`libveil.a` with `veil.h` (C), the Python wheel, and the
 Rust source/usage notes. See [Building](building.md) for the proxy packages.
+
+## Performance
+
+Measured with [tools/api-bench](../../tools/api-bench/README.md): the same two endpoints (`GET /plaintext` →
+`Hello, World!`, `GET /json/{name}` → `{"message":"Hello, <name>"}`) in each framework, HTTP/1.1 keep-alive,
+`wrk -t2 -c64 -d10s`, 3 rounds alternating the order of the targets, median. The server runs on one physical core
+(2 hyperthreads, CPUs 0-1, 2 server threads / workers) and wrk on the other (CPUs 2-3) of an Intel i5-3320M
+(2 cores / 4 threads, 2012 laptop), so the absolute numbers are small; compare the ratios. "CPU µs/req" is the busy
+time of the server's cores (including the kernel's loopback processing) divided by the requests. Raw data:
+`docs/artifacts/api_bench_{rust,python}.tsv` after running the script.
+
+### Rust: axum on tokio, axum on `veil::tokio`, veil handlers
+
+| Target | plaintext req/s | json req/s | p99 ms (plaintext) | CPU µs/req (plaintext) | RSS MB |
+|---|---:|---:|---:|---:|---:|
+| axum + tokio, `axum::serve` | 66,061 | 59,630 | 1.50 | 30.6 | 5.3 |
+| axum + tokio, per-core (`SO_REUSEPORT`) | 67,811 | 62,077 | 1.34 | 29.8 | 5.0 |
+| axum + `veil::tokio`, `axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
+| axum + `veil::tokio`, per-core | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
+| axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
+| veil `App` + axum `Router` (`tokio_service`) | 33,316 | 31,190 | 2.47 | 61.1 | 11.3 |
+| veil `App` + axum `Router` (epoll) | 36,577 | 34,106 | 2.17 | 55.6 | 9.7 |
+| veil native handler (`#[veil::route]`) | 42,533 | 39,507 | 1.96 | 47.6 | 11.2 |
+| veil native handler (epoll) | 49,149 | 45,495 | 1.75 | 41.4 | 9.6 |
+
+- **axum runs on `veil::tokio` unchanged** (the same source, with the `tokio` crate patched to the shim). Per core it
+  reaches about **80% (io_uring) to 84% (epoll)** of axum on tokio, and uses 20–25% more CPU per request.
+- **`axum::serve` on a multi-thread `veil::tokio` runtime uses only one thread**: there is no work stealing, so every
+  connection task stays on the thread that accepted it (the server cores are only ~85% busy out of 200%). For
+  multi-core use, run one current-thread runtime and one `SO_REUSEPORT` listener per thread (the "per-core" rows,
+  `run_percore` in `tools/api-bench/common.rs`), or mount the router in a veil `App`, whose workers each accept.
+- veil's own handler path (request conversion, routing, extraction, response) currently costs more CPU per request
+  than axum on tokio: the native handler reaches 63% (io_uring) / 72% (epoll) of it, and mounting an axum `Router`
+  adds a conversion to and from `http::Request`/`http::Response` on top. At this concurrency the io_uring backend
+  makes about 2.3 `io_uring_enter` calls per request (no batching), which is why epoll is faster here. This is the
+  API library's handler path, not the proxy data plane, and is tracked as a follow-up.
+
+### Python: FastAPI (uvicorn) and veil
+
+| Target | plaintext req/s | json req/s | p99 ms (plaintext) | CPU µs/req (plaintext) | RSS MB |
+|---|---:|---:|---:|---:|---:|
+| FastAPI `async def`, uvicorn 1 worker | 5,502 | 4,333 | 14.46 | 189.4 | 49.4 |
+| FastAPI `async def`, uvicorn 2 workers | 6,859 | 5,473 | 10.17 | 296.2 | 136.4 |
+| FastAPI `def`, uvicorn 2 workers | 3,661 | 3,174 | 50.23 | 551.5 | 140.6 |
+| veil, `offload=True` (default), 2 threads | 15,467 | 11,726 | 10.99 | 106.4 | 31.1 |
+| veil, `offload=False`, 2 threads | 17,110 | 12,737 | 4.07 | 118.4 | 30.4 |
+
+FastAPI 0.143 / uvicorn 0.54 with uvloop and httptools; pydantic 2. uvicorn's workers are processes, veil runs one
+process. veil serves **2.1–2.5× the requests of FastAPI with 2 workers** (2.7–3.1× of one worker) with less than
+half the CPU per request and less than a quarter of the memory, because HTTP parsing, routing and the response are
+done in Rust and only the handler body runs in Python. Python handlers are still serialized by the GIL, so a
+single process does not scale with cores; `offload=True` keeps the event loop free of the GIL at the cost of a
+handoff to the handler pool (the higher p99).
 
 ## Testing
 
