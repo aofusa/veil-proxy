@@ -341,15 +341,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[vds] listening on {} (gRPC + REST)", listen);
     server
         .add_routes(tonic::service::Routes::from(routes))
-        .serve_with_shutdown(listen, async {
-            // コンテナの停止（SIGTERM）と Ctrl-C（SIGINT）
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-        })
+        .serve_with_shutdown(listen, shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// コンテナの停止（SIGTERM）と Ctrl-C（SIGINT）
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// Windows は Ctrl-C（Ctrl-Break 等の他のコンソールイベントは使わない）
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
