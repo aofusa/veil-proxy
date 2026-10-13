@@ -339,25 +339,17 @@ fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
         let fd_fl = cvt_i(libc::fcntl(fd, libc::F_GETFD))?;
         cvt_i(libc::fcntl(fd, libc::F_SETFD, fd_fl | libc::FD_CLOEXEC))?;
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
+    // SIGPIPE を出さない（MSG_NOSIGNAL の代わり。OpenBSD に SO_NOSIGPIPE は無い）
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     unsafe {
-        // SIGPIPE を出さない（MSG_NOSIGNAL の代わり）
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-        {
-            let one: libc::c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        let one: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
     Ok(())
 }
