@@ -735,12 +735,23 @@ fn spawn_vds_control_plane(
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("failed to start the VDS control plane");
-    let guard = ChildGuard(child);
-    assert!(
-        wait_for_port(port, Duration::from_secs(15)),
-        "control plane did not start"
-    );
-    guard
+    let mut guard = ChildGuard(child);
+    // 負荷の高いホスト（VM の同時実行・初回の .pyc 生成）では Python の起動に 15 秒を超えることがある。
+    // 終了したらすぐ失敗にし、待つのは最大 60 秒。
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(Some(st)) = guard.0.try_wait() {
+            panic!("control plane exited: {st}");
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return guard;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "control plane did not start in 60s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// 配信 → 更新 → NACK（前の版のまま）→ 修正、gRPC では制御プレーンの再起動からの再接続も確かめる。
