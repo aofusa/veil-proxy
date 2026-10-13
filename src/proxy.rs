@@ -5341,6 +5341,9 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
     let mut connection_metric = ActiveConnectionMetric::new(true);
     // 接続直後の 1 回目の読み取りか（待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
     let mut first_read = true;
+    // ネイティブハンドラの呼び出しで要求をまたいで使い回す状態（F-202）
+    #[cfg(feature = "handler")]
+    let mut api_cache = crate::api::dispatch::CallCache::default();
 
     loop {
         // 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
@@ -5448,17 +5451,17 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
                     .map(|h| slice_range(&accumulated, h.value));
-                let header_ranges: Vec<((usize, usize), (usize, usize))> = req
-                    .headers
-                    .iter()
-                    .filter(|h| !h.name.is_empty())
-                    .map(|h| {
-                        (
-                            slice_range(&accumulated, h.name.as_bytes()),
-                            slice_range(&accumulated, h.value),
-                        )
-                    })
-                    .collect();
+                // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
+                // httparse の格納先と同じ 64 個が上限。await をまたがないので Future は大きくならない。
+                let mut header_ranges = [((0usize, 0usize), (0usize, 0usize)); 64];
+                let mut header_count = 0;
+                for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
+                    header_ranges[header_count] = (
+                        slice_range(&accumulated, h.name.as_bytes()),
+                        slice_range(&accumulated, h.value),
+                    );
+                    header_count += 1;
+                }
 
                 // req（accumulated への借用）をここで明示的に終了させる。
                 drop(req);
@@ -5467,6 +5470,18 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // split_to 後は accumulated にボディの続きだけが残り、読み込みバッファとして
                 // 再利用できる。
                 let header_bytes: Bytes = accumulated.split_to(header_len).freeze();
+
+                // ヘッダー一覧を Bytes ペアとして構築（`Bytes::slice` は参照カウント +1 の
+                // みでコピーを伴わない）。
+                let headers_for_proxy: Vec<(Bytes, Bytes)> = header_ranges[..header_count]
+                    .iter()
+                    .map(|&((name_off, name_len), (value_off, value_len))| {
+                        (
+                            header_bytes.slice(name_off..name_off + name_len),
+                            header_bytes.slice(value_off..value_off + value_len),
+                        )
+                    })
+                    .collect();
 
                 // HTTPメソッド取得
                 let method_bytes: Bytes = method_range
@@ -5507,32 +5522,20 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .map(|(off, len)| header_bytes.slice(off..off + len))
                     .unwrap_or_else(Bytes::new);
 
-                // ヘッダー一覧を Bytes ペアとして構築（`Bytes::slice` は参照カウント +1 の
-                // みでコピーを伴わない）。
-                let headers_for_proxy: Vec<(Bytes, Bytes)> = header_ranges
-                    .into_iter()
-                    .map(|((name_off, name_len), (value_off, value_len))| {
-                        (
-                            header_bytes.slice(name_off..name_off + name_len),
-                            header_bytes.slice(value_off..value_off + value_len),
-                        )
-                    })
-                    .collect();
-
                 // Content-Length ヘッダーの値を取得し、不正な値の場合は400 Bad Requestを返す
                 // 複数の Content-Length ヘッダーは RFC 7230 Section 3.3.2 違反 → 400
-                let cl_headers: Vec<_> = headers_for_proxy
+                // 確保せずに 1 つ目と 2 つ目の有無だけを見る（F-202）
+                let mut cl_iter = headers_for_proxy
                     .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case(b"content-length"))
-                    .collect();
-
-                if cl_headers.len() > 1 {
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(b"content-length"));
+                let cl_first = cl_iter.next();
+                if cl_iter.next().is_some() {
                     let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
                 }
 
-                let content_length: usize = if let Some((_, cl_value)) = cl_headers.first() {
+                let content_length: usize = if let Some((_, cl_value)) = cl_first {
                     match std::str::from_utf8(cl_value)
                         .ok()
                         .and_then(|s| s.trim().parse::<usize>().ok())
@@ -5878,10 +5881,12 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // headers_for_proxy は既に accumulated から切り出し済みの Bytes なので、
                 // ここでは参照を並べるだけで新たなコピーは発生しない。
                 let backend_result = {
-                    let headers_raw: Vec<(&[u8], &[u8])> = headers_for_proxy
-                        .iter()
-                        .map(|(k, v)| (k.as_ref(), v.as_ref()))
-                        .collect();
+                    // スタックの配列に並べる（要求ごとに Vec を確保しない。F-202）。ヘッダは最大 64 個。
+                    let mut raw_buf: [(&[u8], &[u8]); 64] = [(&[], &[]); 64];
+                    for (slot, (k, v)) in raw_buf.iter_mut().zip(headers_for_proxy.iter()) {
+                        *slot = (k.as_ref(), v.as_ref());
+                    }
+                    let headers_raw = &raw_buf[..headers_for_proxy.len().min(64)];
                     let raw_query: &[u8] =
                         query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
 
@@ -5889,7 +5894,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         &host_bytes,
                         path_without_query,
                         &method_bytes,
-                        &headers_raw,
+                        headers_raw,
                         raw_query,
                         &client_socket_addr,
                         config.route.as_slice(),
@@ -6180,9 +6185,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     prefix,
                     content_length,
                     is_chunked,
-                    &headers_for_proxy,
+                    headers_for_proxy,
                     &initial_body,
                     client_wants_close,
+                    #[cfg(feature = "handler")]
+                    &mut api_cache,
                     {
                         #[cfg(feature = "wasm")]
                         {
@@ -6190,7 +6197,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         }
                         #[cfg(not(feature = "wasm"))]
                         {
-                            Arc::new(Vec::new())
+                            no_wasm_modules()
                         }
                     },
                     client_ip,
@@ -6325,14 +6332,16 @@ async fn drain_request_body(
 async fn handle_backend(
     mut tls_stream: ServerTls,
     backend: Backend,
-    method: &[u8],
-    req_path: &[u8],
+    method: &Bytes,
+    req_path: &Bytes,
     prefix: Arc<[u8]>,
     content_length: usize,
     is_chunked: bool,
-    headers: &[(Bytes, Bytes)],
+    // 所有で受け取る（ネイティブハンドラは複製せずに Request へ渡す。F-202）
+    headers: Vec<(Bytes, Bytes)>,
     initial_body: &[u8],
     client_wants_close: bool,
+    #[cfg(feature = "handler")] api_cache: &mut crate::api::dispatch::CallCache,
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
@@ -6365,7 +6374,7 @@ async fn handle_backend(
                 &prefix,
                 content_length,
                 is_chunked,
-                headers,
+                &headers,
                 initial_body,
                 client_wants_close,
                 wasm_modules,
@@ -6568,6 +6577,7 @@ async fn handle_backend(
                 initial_body,
                 client_wants_close,
                 client_ip,
+                api_cache,
             ))
             .await
         }
@@ -6592,14 +6602,15 @@ fn backend_consumes_request_body(backend: &Backend) -> bool {
 async fn handle_api_handler(
     mut tls_stream: ServerTls,
     entry: &crate::api::handler::HandlerEntry,
-    method: &[u8],
-    req_path: &[u8],
+    method: &Bytes,
+    req_path: &Bytes,
     content_length: usize,
     is_chunked: bool,
-    headers: &[(Bytes, Bytes)],
+    headers: Vec<(Bytes, Bytes)>,
     initial_body: &[u8],
     client_wants_close: bool,
     client_ip: &str,
+    api_cache: &mut crate::api::dispatch::CallCache,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     let limit = crate::api::app::max_body_size();
     let body = match read_api_request_body(
@@ -6627,36 +6638,63 @@ async fn handle_api_handler(
             return Some((tls_stream, status, resp.body.len() as u64, true));
         }
     };
+    // メソッド・パスは要求ヘッダの領域を指す Bytes（参照カウントだけ。F-202）
     let req = crate::api::dispatch::build_request(
-        Bytes::copy_from_slice(method),
-        Bytes::copy_from_slice(req_path),
-        headers.to_vec(),
+        method.clone(),
+        req_path.clone(),
+        headers,
         body,
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
-    let mut resp = crate::api::dispatch::call(entry, req).await;
+    let mut resp = crate::api::dispatch::call_with(entry, req, api_cache).await;
     let status = resp.status_code();
     let body = resp.body().clone();
-    let head = crate::api::dispatch::http1_head(&resp, !client_wants_close);
+    // ステータス行・ヘッダはスレッドローカルのプールのバッファに書き、小さな本文は同じバッファに続けて
+    // 1 回の書き込みで送る（要求ごとの確保と、ヘッダ・本文の 2 回の書き込みを避ける。F-202）
+    let inline_body = !resp.is_streaming() && body.len() <= API_INLINE_BODY_MAX;
+    let mut head =
+        crate::pool::request_buf_get(API_HEAD_ESTIMATE + if inline_body { body.len() } else { 0 });
+    crate::api::dispatch::write_http1_head(&mut head, &resp, !client_wants_close);
+    if inline_body {
+        head.extend_from_slice(&body);
+    }
+    let streaming = resp.take_stream();
     match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
-        Ok((Ok(_), _)) => {}
+        Ok((Ok(_), buf)) => crate::pool::request_buf_put(buf),
         _ => return None,
     }
-    if let Some(stream) = resp.take_stream() {
+    if let Some(stream) = streaming {
         let (tls_stream, sent) = write_api_chunked(tls_stream, stream).await?;
         return Some((tls_stream, status, sent, client_wants_close));
     }
-    if !body.is_empty() {
-        let len = body.len() as u64;
+    let len = body.len() as u64;
+    if !inline_body {
         match timeout(WRITE_TIMEOUT, tls_stream.write_all(body)).await {
-            Ok((Ok(_), _)) => Some((tls_stream, status, len, client_wants_close)),
-            _ => None,
+            Ok((Ok(_), _)) => {}
+            _ => return None,
         }
-    } else {
-        Some((tls_stream, status, 0, client_wants_close))
     }
+    Some((tls_stream, status, len, client_wants_close))
 }
+
+/// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧。要求ごとに `Arc` を作らないよう
+/// スレッドごとに 1 つを使い回す（F-202）。
+#[cfg(not(feature = "wasm"))]
+fn no_wasm_modules() -> Arc<Vec<crate::wasm_plugin_config::ModuleRef>> {
+    thread_local! {
+        static EMPTY: Arc<Vec<crate::wasm_plugin_config::ModuleRef>> = Arc::new(Vec::new());
+    }
+    EMPTY.with(Arc::clone)
+}
+
+/// HTTP/1.1 のハンドラ応答で、ヘッダと同じバッファに続けて 1 回で書く本文の上限（F-202）。
+/// 要求バッファのプールの大きい方（既定 4KB）に収まる大きさ。超えるものはヘッダと別に書く（複製しない）。
+#[cfg(feature = "handler")]
+const API_INLINE_BODY_MAX: usize = 3 * 1024;
+/// ステータス行と既定のヘッダの見積もり（プールのバッファの選択に使う）。
+#[cfg(feature = "handler")]
+const API_HEAD_ESTIMATE: usize = 256;
 
 /// ハンドラのストリーミング応答を HTTP/1.1 の chunked で書く（F-197）。トレーラは最後のチャンクの後に
 /// 書く。`Abort`・書き込み失敗は `None`（接続を閉じる）。戻り値は送った本文のバイト数。

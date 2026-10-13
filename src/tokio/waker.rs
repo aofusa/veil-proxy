@@ -331,7 +331,7 @@ impl<F> Drop for ForgetOnExit<F> {
 /// 安全にする。`api::dispatch::call` が使う）。
 pub(crate) struct WithSafeWaker<F> {
     fut: F,
-    cache: Option<(Waker, Waker)>,
+    cache: SafeWakerCache,
 }
 
 impl<F> WithSafeWaker<F> {
@@ -346,22 +346,58 @@ impl<F: Future> Future for WithSafeWaker<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
         // SAFETY: `fut` は構造的にピン留めされ、動かさない
         let this = unsafe { self.get_unchecked_mut() };
-        let w = match &this.cache {
-            Some((orig, safe)) if orig.will_wake(cx.waker()) => safe.clone(),
-            _ => {
-                let s = safe_waker(cx.waker());
-                this.cache = Some((cx.waker().clone(), s.clone()));
-                s
-            }
-        };
-        let mut inner = std::task::Context::from_waker(&w);
-        crate::tokio::time::note_activity();
-        let r = crate::tokio::task::coop::with_budget(|| {
-            unsafe { Pin::new_unchecked(&mut this.fut) }.poll(&mut inner)
-        });
-        touch_exit_sentinel();
-        r
+        poll_with_safe_waker(
+            unsafe { Pin::new_unchecked(&mut this.fut) },
+            &mut this.cache,
+            cx,
+        )
     }
+}
+
+/// 包んだ Waker の置き場（`(元の Waker, 包んだ Waker)`）。同じ Waker なら包み直さない。
+pub(crate) type SafeWakerCache = Option<(Waker, Waker)>;
+
+/// [`WithSafeWaker`] の置き場を外から借りる版。API ライブラリの HTTP/1.1 の接続が持ち、キープアライブの
+/// 要求をまたいで包んだ Waker を使い回す（要求ごとに `Arc` を作らない。F-202）。
+pub(crate) struct WithSafeWakerIn<'a, F> {
+    fut: F,
+    cache: &'a mut SafeWakerCache,
+}
+
+impl<'a, F> WithSafeWakerIn<'a, F> {
+    pub(crate) fn new(fut: F, cache: &'a mut SafeWakerCache) -> WithSafeWakerIn<'a, F> {
+        WithSafeWakerIn { fut, cache }
+    }
+}
+
+impl<F: Future> Future for WithSafeWakerIn<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        // SAFETY: `fut` は構造的にピン留めされ、動かさない（`cache` は参照で、ピン留めと無関係）
+        let this = unsafe { self.get_unchecked_mut() };
+        poll_with_safe_waker(unsafe { Pin::new_unchecked(&mut this.fut) }, this.cache, cx)
+    }
+}
+
+fn poll_with_safe_waker<F: Future>(
+    fut: Pin<&mut F>,
+    cache: &mut SafeWakerCache,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<F::Output> {
+    let w = match cache {
+        Some((orig, safe)) if orig.will_wake(cx.waker()) => safe.clone(),
+        _ => {
+            let s = safe_waker(cx.waker());
+            *cache = Some((cx.waker().clone(), s.clone()));
+            s
+        }
+    };
+    let mut inner = std::task::Context::from_waker(&w);
+    crate::tokio::time::note_activity();
+    let r = crate::tokio::task::coop::with_budget(|| fut.poll(&mut inner));
+    touch_exit_sentinel();
+    r
 }
 
 #[cfg(test)]

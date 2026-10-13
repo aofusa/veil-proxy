@@ -6,7 +6,6 @@ use super::response::Response;
 use bytes::Bytes;
 use futures::FutureExt;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 /// リクエストを組み立てる（`target` はクエリを含む `:path` / リクエストライン）。
 pub(crate) fn build_request(
@@ -22,7 +21,7 @@ pub(crate) fn build_request(
         method,
         path,
         query,
-        headers: Arc::new(headers),
+        headers,
         body,
         params: Vec::new(),
         client_ip: client_ip
@@ -33,9 +32,25 @@ pub(crate) fn build_request(
     }
 }
 
+/// 接続ごとに持ち、要求をまたいで使い回す状態（F-202）。今は tokio 互換レイヤーの包んだ Waker だけ。
+#[derive(Default)]
+pub(crate) struct CallCache {
+    #[cfg(feature = "tokio-compat")]
+    waker: crate::tokio::waker::SafeWakerCache,
+}
+
 /// ハンドラを呼ぶ。本文の上限超過は 413、ハンドラの panic は 500、HEAD は本文を落として
 /// `content-length` に元の長さを入れる。
 pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
+    call_with(entry, req, &mut CallCache::default()).await
+}
+
+/// [`call`] の、接続ごとの [`CallCache`] を使う版（HTTP/1.1 のキープアライブで要求ごとの確保を減らす）。
+pub(crate) async fn call_with(
+    entry: &HandlerEntry,
+    req: Request,
+    cache: &mut CallCache,
+) -> Response {
     if req.body.len() > super::app::max_body_size() {
         return Response::error(413, "Payload Too Large");
     }
@@ -43,9 +58,12 @@ pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
     // tokio 互換レイヤー（F-198）: ハンドラの中で使う同期プリミティブ・チャネルが別スレッドから
     // 起こしても、所有スレッドで再開するように Waker を包む
     #[cfg(feature = "tokio-compat")]
-    let fut = crate::tokio::waker::WithSafeWaker::new(entry.call(req));
+    let fut = crate::tokio::waker::WithSafeWakerIn::new(entry.call(req), &mut cache.waker);
     #[cfg(not(feature = "tokio-compat"))]
-    let fut = entry.call(req);
+    let fut = {
+        let _ = cache;
+        entry.call(req)
+    };
     let mut resp = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
         Ok(r) => r,
         Err(_) => {
@@ -105,11 +123,18 @@ pub(crate) fn lowercase_names(fields: &mut [(Bytes, Bytes)]) {
 /// （ハンドラが付けていればそれを使う。HEAD では `call` が付けている）。ストリーミング応答は
 /// `Transfer-Encoding: chunked`（F-197）。
 pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + resp.headers.len() * 32);
+    write_http1_head(&mut out, resp, keep_alive);
+    out
+}
+
+/// [`http1_head`] を `out` の末尾に書く（呼び出し側がプールのバッファを使う。F-202）。
+/// chunked かどうかは `resp.stream` で決めるので、ストリームを取り出す前に呼ぶこと。
+pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: bool) {
     let chunked = resp.stream.is_some()
         || resp.headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case(b"transfer-encoding") && v.eq_ignore_ascii_case(b"chunked")
         });
-    let mut out = Vec::with_capacity(128 + resp.headers.len() * 32);
     out.extend_from_slice(b"HTTP/1.1 ");
     let mut buf = itoa::Buffer::new();
     out.extend_from_slice(buf.format(resp.status).as_bytes());
@@ -144,7 +169,6 @@ pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
     } else {
         out.extend_from_slice(b"Connection: close\r\n\r\n");
     }
-    out
 }
 
 /// 理由句（API でよく使うものを本体の表に足す）。
