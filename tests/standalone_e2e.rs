@@ -883,9 +883,11 @@ retry_max_ms = 1000
     drop(cp);
 }
 
-/// 子プロセスを Drop で止める。
+/// 子プロセスを Drop で止める（VDS の制御プレーン用）。
+#[cfg(feature = "vds")]
 struct ChildGuard(std::process::Child);
 
+#[cfg(feature = "vds")]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
