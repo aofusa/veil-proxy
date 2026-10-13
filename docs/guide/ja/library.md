@@ -30,6 +30,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 - [C API](#c-api)
 - [Python](#python)
 - [ライブラリ成果物のビルド](#ライブラリ成果物のビルド)
+- [性能](#性能)
 - [テスト](#テスト)
 - [制限事項](#制限事項)
 
@@ -438,7 +439,9 @@ veil のランタイム（current-thread または multi-thread）を起動し�
 ### tokio との違い
 
 - **work stealing はありません。** タスクは spawn したスレッドで動きます。ランタイム外のスレッドから `Handle` 経由で
-  spawn するとランタイムのスレッドへ転送します。I/O オブジェクトは作ったスレッドに結び付きます。
+  spawn するとランタイムのスレッドへ転送します。I/O オブジェクトは作ったスレッドに結び付きます。そのため、1 つのリスナーで
+  受理して接続ごとにタスクを spawn するサーバ（`axum::serve`・hyper の受理ループ）は、マルチスレッドのランタイムでも
+  1 本のスレッドで動きます。スレッドごとに `SO_REUSEPORT` のリスナーを持たせるか、veil の `App` に載せてください（[性能](#性能)）。
 - **スレッドをまたぐ起床**（別スレッドの `Sender`・`spawn_blocking`・別スレッドへ渡した `Waker`）は、通知 fd を通じて
   所有スレッドへ届けます。veil 自身の Waker を別スレッドから呼ぶことはありません。
 - `spawn_blocking`・`block_in_place`・`fs` は veil のハンドラ用スレッドプール（`[api] handler_threads`）で動きます。
@@ -474,7 +477,8 @@ tokio 自身のテスト（tokio 1.53.2 の `tokio/tests/*.rs`）をシムに対
 スクリプトを実行すると `docs/artifacts/tokio_compat_results.md` に出力されます。
 
 実ライブラリは `tools/tokio-compat/ecosystem` で確認しています（io_uring と epoll）: hyper のサーバ（HTTP/1.1 + h2c）と
-クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、sqlx（SQLite・PostgreSQL）。
+クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、axum 0.8（`axum::serve`・抽出子・State・
+graceful shutdown）、sqlx（SQLite・PostgreSQL）。
 
 ## GraphQL
 
@@ -725,6 +729,57 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 `packaging/output/lib/` に 1 つのアーカイブ `veil-lib-<version>-<arch>-linux-gnu.zip` を出力します。中身は
 `libveil.so`/`libveil.a` と `veil.h`（C）、Python の wheel、Rust 向けのソースと使い方のメモです。
 プロキシ本体のパッケージは[ビルドとパッケージ](building.md)を参照してください。
+
+## 性能
+
+[tools/api-bench](../../../tools/api-bench/README.md) で測りました。各フレームワークで同じ 2 つのエンドポイント
+（`GET /plaintext` → `Hello, World!`、`GET /json/{name}` → `{"message":"Hello, <name>"}`）を実装し、HTTP/1.1 のキープアライブで
+`wrk -t2 -c64 -d10s`、対象の順番を入れ替えながら 3 ラウンド交互に測った中央値です。サーバは物理コア 1 つ（ハイパースレッド 2 本、
+CPU 0-1、サーバのスレッド・ワーカーは 2）、wrk はもう 1 つの物理コア（CPU 2-3）で、Intel i5-3320M（2 コア 4 スレッド、2012 年の
+ノート PC）です。絶対値は小さいので比率で見てください。「CPU µs/req」はサーバのコアの busy 時間（カーネルのループバック処理を含む）を
+要求数で割った値です。生データはスクリプトの実行後に `docs/artifacts/api_bench_{rust,python}.tsv`。
+
+### Rust: tokio 上の axum・`veil::tokio` 上の axum・veil のハンドラ
+
+| 対象 | plaintext req/s | json req/s | p99 ms（plaintext） | CPU µs/req（plaintext） | RSS MB |
+|---|---:|---:|---:|---:|---:|
+| axum + tokio、`axum::serve` | 66,061 | 59,630 | 1.50 | 30.6 | 5.3 |
+| axum + tokio、スレッドごと（`SO_REUSEPORT`） | 67,811 | 62,077 | 1.34 | 29.8 | 5.0 |
+| axum + `veil::tokio`、`axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
+| axum + `veil::tokio`、スレッドごと | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
+| axum + `veil::tokio`、スレッドごと（epoll） | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
+| veil の `App` + axum の `Router`（`tokio_service`） | 33,316 | 31,190 | 2.47 | 61.1 | 11.3 |
+| veil の `App` + axum の `Router`（epoll） | 36,577 | 34,106 | 2.17 | 55.6 | 9.7 |
+| veil のネイティブハンドラ（`#[veil::route]`） | 42,533 | 39,507 | 1.96 | 47.6 | 11.2 |
+| veil のネイティブハンドラ（epoll） | 49,149 | 45,495 | 1.75 | 41.4 | 9.6 |
+
+- **axum は `veil::tokio` の上でそのまま動きます**（同じソースで、`tokio` クレートを shim に置き換えただけ）。コアあたりでは
+  tokio 上の axum の **約 80%（io_uring）〜84%（epoll）** で、1 要求あたりの CPU は 20〜25% 多くなります。
+- **マルチスレッドの `veil::tokio` ランタイムで `axum::serve` を動かすとスレッドは 1 本しか使われません**。work stealing が無いので、
+  接続のタスクは受理したスレッドに留まります（サーバのコアの busy は 200% 中 85% ほど）。複数コアを使うには、スレッドごとに
+  カレントスレッドのランタイムと `SO_REUSEPORT` のリスナーを持たせる（表の「スレッドごと」。`tools/api-bench/common.rs` の
+  `run_percore`）か、ワーカーごとに受理する veil の `App` に Router を載せます。
+- veil 自身のハンドラ経路（要求の変換・ルーティング・抽出・応答）は、現状では tokio 上の axum より 1 要求あたりの CPU が
+  多く、ネイティブハンドラで tokio 上の axum の 63%（io_uring）/ 72%（epoll）です。axum の `Router` を載せる場合は
+  `http::Request`/`http::Response` との変換がさらに加わります。この並行度では io_uring のバックエンドが 1 要求あたり約 2.3 回
+  `io_uring_enter` を呼んでおり（まとめて投入できていない）、ここでは epoll のほうが速くなります。これは API ライブラリの
+  ハンドラ経路の話で、プロキシのデータプレーンではありません。改善は後続の課題として管理しています。
+
+### Python: FastAPI（uvicorn）と veil
+
+| 対象 | plaintext req/s | json req/s | p99 ms（plaintext） | CPU µs/req（plaintext） | RSS MB |
+|---|---:|---:|---:|---:|---:|
+| FastAPI `async def`、uvicorn 1 ワーカー | 5,502 | 4,333 | 14.46 | 189.4 | 49.4 |
+| FastAPI `async def`、uvicorn 2 ワーカー | 6,859 | 5,473 | 10.17 | 296.2 | 136.4 |
+| FastAPI `def`、uvicorn 2 ワーカー | 3,661 | 3,174 | 50.23 | 551.5 | 140.6 |
+| veil、`offload=True`（既定）、2 スレッド | 15,467 | 11,726 | 10.99 | 106.4 | 31.1 |
+| veil、`offload=False`、2 スレッド | 17,110 | 12,737 | 4.07 | 118.4 | 30.4 |
+
+FastAPI 0.143・uvicorn 0.54（uvloop・httptools）・pydantic 2。uvicorn のワーカーはプロセス、veil は 1 プロセスです。veil は
+**2 ワーカーの FastAPI の 2.1〜2.5 倍**（1 ワーカーの 2.7〜3.1 倍）の要求を、半分以下の 1 要求あたり CPU と 4 分の 1 以下の
+メモリで処理します。HTTP の解析・ルーティング・応答の生成を Rust で行い、Python で動くのはハンドラ本体だけだからです。
+ただし Python のハンドラは GIL で直列化されるので、1 プロセスではコア数に比例して伸びません。`offload=True` は GIL を
+待つ間もイベントループを止めませんが、ハンドラ用プールへの受け渡しのぶん p99 が高くなります。
 
 ## テスト
 
