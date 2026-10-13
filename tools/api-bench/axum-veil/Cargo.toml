@@ -17,6 +17,8 @@ serde_json = "1"
 [features]
 # reactor（epoll）バックエンドで測る: cargo build --release --features epoll
 epoll = ["veil/epoll"]
+# 確保の回数を数える（allocs/req）: cargo build --release --features count-allocs
+count-allocs = []
 
 [patch.crates-io]
 tokio = { path = "../../../crates/veil-tokio/tokio-shim" }

@@ -65,6 +65,15 @@ TARGETS = {
     },
 }
 
+# 改修前後の交互 A/B: BENCH_BASE_DIR に改修前の作業ツリー（git worktree）を渡すと、その tools/api-bench の
+# axum-veil（io_uring・epoll）で veil のハンドラ経路の対象を「[base]」として足す。
+BASE = os.environ.get("BENCH_BASE_DIR")
+if BASE:
+    for sub, tag in (("target", ""), ("target-epoll", " [epoll]")):
+        b = os.path.join(BASE, "tools", "api-bench", "axum-veil", sub, "release", "api-bench-axum-veil")
+        TARGETS["rust"]["veil App + axum Router (mount)" + tag + " [base]"] = ([b, "mount", ADDR, str(THREADS)], {}, None)
+        TARGETS["rust"]["veil native handler" + tag + " [base]"] = ([b, "native", ADDR, str(THREADS)], {}, None)
+
 
 def tree_pids(pid):
     out = [pid]
