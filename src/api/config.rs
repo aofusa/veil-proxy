@@ -167,7 +167,7 @@ impl ConfigBuilder {
     }
 
     setter!(
-        /// `[server].listen_cleartext`（平文 HTTP/1.1・h2c のリスナー。ライブラリ既定は `"0.0.0.0:8080"`）。
+        /// `[server].listen_cleartext`（平文 HTTP/1.1・h2c のリスナー。ライブラリ既定は `"127.0.0.1:8080"`）。
         listen_cleartext, "server.listen_cleartext", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
@@ -328,7 +328,7 @@ mod tests {
         let v = Config::new().to_value().unwrap();
         assert_eq!(
             v["server"]["listen_cleartext"].as_str(),
-            Some("0.0.0.0:8080")
+            Some("127.0.0.1:8080")
         );
         assert_eq!(v["server"]["enable_secure_redirect"].as_bool(), Some(false));
         assert!(v["server"].get("listen").is_none());
@@ -377,7 +377,7 @@ mod tests {
         // 平文のリスナーは既定のまま残る
         assert_eq!(
             v["server"]["listen_cleartext"].as_str(),
-            Some("0.0.0.0:8080")
+            Some("127.0.0.1:8080")
         );
     }
 

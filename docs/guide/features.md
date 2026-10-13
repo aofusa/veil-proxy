@@ -89,7 +89,7 @@ features are in neither `default` nor `full*`, so the proxy binary contains no l
 
 | Feature | Description |
 |---------|-------------|
-| `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (plaintext HTTP/1.1 + h2c on `0.0.0.0:8080`, no TLS needed) |
+| `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (plaintext HTTP/1.1 + h2c on `127.0.0.1:8080`, loopback only, no TLS needed) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json`, Swagger UI, FastAPI-style 422 validation |
 | `tokio-compat` | tokio-free tokio compatibility layer: tokio-based libraries run on veil's runtime (part of `api`) |

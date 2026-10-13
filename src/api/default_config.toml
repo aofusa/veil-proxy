@@ -2,13 +2,14 @@
 #
 # config.toml が無くてもこの設定で起動する。config.toml があればこの上に深くマージされ、
 # さらに Rust コード（`Config::builder()`）・環境変数 `VEIL_OVERRIDE_<n>` で上書きできる。
-# 既定は「TLS 無し・平文 HTTP/1.1 + h2c（prior knowledge）を 0.0.0.0:8080 で受ける」
+# 既定は「TLS 無し・平文 HTTP/1.1 + h2c（prior knowledge）を 127.0.0.1:8080 で受ける」
 # （`[server].listen_cleartext`。TLS を使うときは `[server].listen` と `[tls]` を足す）。
 # スレッド数（server.threads）は CPU 数（実行時に入れる）。
 
 [server]
 # 平文のリスナー（HTTP/1.1 + h2c）。TLS のリスナー（listen）は既定では無い（F-200）。
-listen_cleartext = "0.0.0.0:8080"
+# 既定はループバックだけで受け、外部に公開しない。公開するときは "0.0.0.0:8080" 等を明示する。
+listen_cleartext = "127.0.0.1:8080"
 # TLS のリスナーが無いので https へのリダイレクトはしない（平文で配信する）。
 enable_secure_redirect = false
 http2_enabled = true

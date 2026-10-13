@@ -727,7 +727,7 @@ class App:
     ):
         """サーバを起動し、停止（Ctrl-C・SIGTERM・``veil.shutdown()``）までブロックする。
 
-        ``listen_cleartext`` は平文（HTTP/1.1 + h2c、既定 ``0.0.0.0:8080``）、``listen`` は TLS
+        ``listen_cleartext`` は平文（HTTP/1.1 + h2c、既定 ``127.0.0.1:8080``）、``listen`` は TLS
         （``tls_cert`` と ``tls_key`` が要る）のアドレス。
         """
         from . import _veil

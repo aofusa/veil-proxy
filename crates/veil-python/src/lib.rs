@@ -63,7 +63,7 @@ impl PyConfig {
         self.set("server.listen", &lit)
     }
 
-    /// `[server].listen_cleartext`（平文 HTTP/1.1 + h2c のリスナー。ライブラリ既定は `0.0.0.0:8080`）。
+    /// `[server].listen_cleartext`（平文 HTTP/1.1 + h2c のリスナー。ライブラリ既定は `127.0.0.1:8080`）。
     fn listen_cleartext(&mut self, addr: &str) -> PyResult<()> {
         let lit = serde_json::to_string(addr).map_err(cfg_err)?;
         self.set("server.listen_cleartext", &lit)

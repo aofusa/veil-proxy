@@ -85,7 +85,8 @@ enabled = false                   # true なら listen と同じアドレス（U
   HTTP/1.1（`handle_plain_http1_connection`）/ h2c（`handle_h2c_connection`）/ リダイレクト、の 1 本にする。
 - リダイレクトは現行の `handle_http_redirect`（`config.rs` の HTTP → HTTPS 301）を HTTP/1.1・h2c の両方に使えるようにする
   （h2c は HTTP/2 の 301 応答）。リダイレクト先ポートは `listen` のポート（443 なら省略）。
-- API ライブラリ（F-188）: 既定設定を `listen_cleartext = "0.0.0.0:8080"`・`enable_secure_redirect = false`・`listen` 無しに。
+- API ライブラリ（F-188）: 既定設定を `listen_cleartext = "127.0.0.1:8080"`（ループバックのみ。設定なしで起動したアプリを
+  外部に公開しない。公開するときは `0.0.0.0:8080` 等を明示する）・`enable_secure_redirect = false`・`listen` 無しに。
   `ConfigBuilder::tls()` は `listen` を設定するだけ、`h2c_enabled()`・`tls_only()` は削除し `listen_cleartext()`・`allow_http()`・
   `allow_h2c()`・`secure_redirect()` に置き換える。C・Python の設定 API も同様。
 - 生成・テスト資材: `tools/perf/gen_configs.sh` を新キーで生成し直し、構成名（`h2_0_...`）は変えない。

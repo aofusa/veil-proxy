@@ -82,7 +82,7 @@ async fn main() -> Result<(), veil::api::Error> {
     // 既定は平文 0.0.0.0:50051（h2c）。VEIL_LISTEN で平文、VEIL_TLS_LISTEN + 証明書で TLS（HTTP/2・HTTP/3）。
     let mut builder = Config::load()?
         .builder()
-        .listen_cleartext(&std::env::var("VEIL_LISTEN").unwrap_or_else(|_| "0.0.0.0:50051".into()))
+        .listen_cleartext(&std::env::var("VEIL_LISTEN").unwrap_or_else(|_| "127.0.0.1:50051".into()))
         .openapi_enabled(false);
     if let (Ok(listen), Ok(cert), Ok(key)) = (
         std::env::var("VEIL_TLS_LISTEN"),

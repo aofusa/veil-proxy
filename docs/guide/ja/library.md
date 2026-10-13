@@ -135,7 +135,7 @@ fn main() -> Result<(), veil::api::Error> {
 
 ```toml
 [server]
-listen_cleartext = "0.0.0.0:8080"  # 平文 HTTP/1.1 + h2c（prior knowledge）をプロトコル検出で判別。`listen` も [tls] も無い
+listen_cleartext = "127.0.0.1:8080"  # 平文 HTTP/1.1 + h2c（prior knowledge）をプロトコル検出で判別。ループバックのみ。`listen` も [tls] も無い
 enable_secure_redirect = false     # 平文で配信する（サーバの既定は HTTPS への 301）
 http2_enabled = true
 
@@ -154,8 +154,13 @@ openapi_title = "veil API"
 openapi_version = "0.1.0"
 ```
 
-これに `[server] threads` = CPU 数が加わります。設定ファイルが無くても起動し、`0.0.0.0:8080` で平文の HTTP/1.1 と h2c を受け、
+これに `[server] threads` = CPU 数が加わります。設定ファイルが無くても起動し、`127.0.0.1:8080` で平文の HTTP/1.1 と h2c を受け、
 **TLS 証明書は不要** です（`[tls]` を省略できるのはこの平文専用構成だけです。[設定リファレンス](configuration.md#tls-なしの平文専用サーバ)を参照）。
+
+既定のリスナーは **ループバックアドレスだけ** で受けるので、設定なしで起動したアプリケーションには他のホストから届きません。
+コンテナ内やロードバランサの背後などで外部に公開するときはアドレスを明示します（`config.toml` の `listen_cleartext = "0.0.0.0:8080"`、
+Rust の `.listen_cleartext("0.0.0.0:8080")`、C の `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")`、
+Python の `veil.run(listen_cleartext="0.0.0.0:8080")`、または `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`）。
 
 ### 設定の合成と優先順位
 
@@ -178,7 +183,7 @@ openapi_version = "0.1.0"
 ```rust
 let config = Config::load()?            // または Config::new()（既定設定だけ）、Config::from_file("app.toml")?
     .builder()
-    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext（外部に公開。既定は 127.0.0.1:8080）
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -603,7 +608,7 @@ let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cer
 ```
 
 `listen(addr)` が TLS のリスナー（`[server].listen`）で、`tls()` が `[tls] cert_path/key_path` です。ライブラリ既定の平文リスナー
-（`listen_cleartext = "0.0.0.0:8080"`）はそのまま残るので、`listen_cleartext(..)` で移すか、`.secure_redirect(true)` で TLS ポートへの
+（`listen_cleartext = "127.0.0.1:8080"`、ループバックのみ）はそのまま残るので、`listen_cleartext(..)` で移すか、`.secure_redirect(true)` で TLS ポートへの
 リダイレクトにします。`.http3("0.0.0.0:8443")` を足すと UDP ポートで HTTP/3 も受けます（`http3` feature が必要で、`full` に含まれます。
 `[http3] enabled = true` + `[http3] listen`）。
 そのほかの `[tls]`・`[http2]`・`[http3]`・`[security]` のキーは `config.toml` か `set(..)` で設定します。ライブラリモードでは
@@ -648,7 +653,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* または veil_config_from_file("config.toml") */
-    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* 平文。TLS は veil_config_listen + veil_config_tls */
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* 平文で外部に公開（既定は 127.0.0.1:8080）。TLS は veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* ブロックする。cfg は消費される */
 }
@@ -692,7 +697,7 @@ def hello(name: str, greeting: str = "Hello"):          # name はパス、greet
 def create_user(body: dict):
     return body
 
-veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする。Ctrl-C / SIGTERM で graceful に停止
+veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（外部に公開。既定は 127.0.0.1:8080）。Ctrl-C / SIGTERM で graceful に停止
 ```
 
 - デコレータは `@veil.get/post/put/delete/patch/route`。`app = veil.App(title=..., version=...)` を作って `@app.get(...)`・`app.run()` も使えます。

@@ -1,6 +1,6 @@
 # showcase 用の設定例（config.toml にコピーすると取り込まれる。無ければライブラリ既定で動く）
 [server]
-listen_cleartext = "0.0.0.0:8080"   # 平文 HTTP/1.1 + h2c（TLS は listen + [tls]）
+listen_cleartext = "0.0.0.0:8080"   # 平文 HTTP/1.1 + h2c を外部に公開（既定は 127.0.0.1:8080。TLS は listen + [tls]）
 
 [logging]
 level = "info"

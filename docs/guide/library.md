@@ -138,7 +138,7 @@ The library has its own **default configuration** (embedded in the crate, `src/a
 
 ```toml
 [server]
-listen_cleartext = "0.0.0.0:8080"  # plaintext HTTP/1.1 + h2c (prior knowledge), auto-detected; no `listen`, no [tls]
+listen_cleartext = "127.0.0.1:8080"  # plaintext HTTP/1.1 + h2c (prior knowledge), auto-detected; loopback only; no `listen`, no [tls]
 enable_secure_redirect = false     # serve plaintext (the server default is a 301 to HTTPS)
 http2_enabled = true
 
@@ -158,8 +158,14 @@ openapi_version = "0.1.0"
 ```
 
 plus `[server] threads` = the number of CPUs. So the server starts with no configuration file at all, speaks
-plaintext HTTP/1.1 and h2c on `0.0.0.0:8080`, and needs **no TLS certificate** (`[tls]` may be omitted only in
+plaintext HTTP/1.1 and h2c on `127.0.0.1:8080`, and needs **no TLS certificate** (`[tls]` may be omitted only in
 this plaintext-only configuration; see [Configuration](configuration.md#plaintext-only-servers-without-tls)).
+
+The default listener is bound to the **loopback address only**, so an application started without configuration
+is not reachable from other hosts. To expose it (for example inside a container or behind a load balancer), set the
+address explicitly: `listen_cleartext = "0.0.0.0:8080"` in `config.toml`, `.listen_cleartext("0.0.0.0:8080")` in
+Rust, `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")` in C, `veil.run(listen_cleartext="0.0.0.0:8080")` in
+Python, or `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`.
 
 ### Sources and precedence
 
@@ -185,7 +191,7 @@ count still cannot change without a restart (same as the proxy).
 ```rust
 let config = Config::load()?            // or Config::new() (defaults only), Config::from_file("app.toml")?
     .builder()
-    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext
+    .listen_cleartext("0.0.0.0:8080")   // [server].listen_cleartext (exposes it; the default is 127.0.0.1:8080)
     .threads(4)                         // [server].threads
     .log_level("warn")                  // [logging].level
     .openapi_title("My API")            // [api].*
@@ -623,7 +629,7 @@ let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cer
 ```
 
 `listen(addr)` is the TLS listener (`[server].listen`) and `tls()` sets `[tls] cert_path/key_path`; the library's default
-plaintext listener (`listen_cleartext = "0.0.0.0:8080"`) stays unless you change it. Move it with `listen_cleartext(..)`,
+plaintext listener (`listen_cleartext = "127.0.0.1:8080"`, loopback only) stays unless you change it. Move it with `listen_cleartext(..)`,
 or make it redirect to the TLS port with `.secure_redirect(true)`. Add `.http3("0.0.0.0:8443")` (needs the `http3`
 feature, included in `full`) for HTTP/3 on a UDP port (`[http3] enabled = true` + `[http3] listen`). All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
 `set(..)`. The security sandbox is **off** by default in library mode; enabling `enable_seccomp` /
@@ -669,7 +675,7 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 int main(void) {
     veil_config_t *cfg = veil_config_new();           /* or veil_config_from_file("config.toml") */
-    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* plaintext; TLS: veil_config_listen + veil_config_tls */
+    veil_config_listen_cleartext(cfg, "0.0.0.0:8080");   /* plaintext, exposed (default 127.0.0.1:8080); TLS: veil_config_listen + veil_config_tls */
     veil_register_route(cfg, "/hello", "GET", hello, NULL);
     return veil_run(cfg);                              /* blocks; consumes cfg */
 }
@@ -714,7 +720,7 @@ def hello(name: str, greeting: str = "Hello"):          # name: path, greeting: 
 def create_user(body: dict):
     return body
 
-veil.run(listen_cleartext="0.0.0.0:8080")               # blocks; Ctrl-C / SIGTERM stops gracefully
+veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; default 127.0.0.1:8080); Ctrl-C / SIGTERM stops gracefully
 ```
 
 - Decorators: `@veil.get/post/put/delete/patch/route`, or `app = veil.App(title=..., version=...)` with

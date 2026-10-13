@@ -30,7 +30,8 @@
 #   [http3] enabled = true     HTTP/3（UDP、listen と同じアドレス） listen・[tls]・http3 feature
 #
 # listen を書かず listen_cleartext だけにすると、TLS 無しの平文専用サーバになります
-# （[tls] は不要。API ライブラリの既定構成）。
+# （[tls] は不要。API ライブラリの既定構成で、ライブラリ既定は listen_cleartext = "127.0.0.1:8080"＝
+# ループバックのみ。外部に公開するときは "0.0.0.0:8080" 等を明示する）。
 #
 # 旧キーからの移行（旧キーは削除済みで、書くと移行先を示すエラーで起動しません）:
 #   旧                                                 新

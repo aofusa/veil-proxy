@@ -27,6 +27,7 @@ tests/fixtures/f150_cache/*
 # WASM ビルドアーティファクト
 # サンプルフィルタのビルド成果物
 examples/wasm-filters/*/target/
+examples/api/*/target/
 examples/wasm-filters/*/Cargo.lock
 tests/wasm/*.wasm
 

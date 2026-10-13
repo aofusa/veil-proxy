@@ -55,7 +55,7 @@ veil_config_t *veil_config_from_file(const char *path);
  */
 int veil_config_set(veil_config_t *cfg, const char *path, const char *toml_value);
 
-/* 平文の待ち受けアドレス ([server].listen_cleartext、HTTP/1.1 + h2c)。例: "0.0.0.0:8080" (既定) */
+/* 平文の待ち受けアドレス ([server].listen_cleartext、HTTP/1.1 + h2c)。例: "127.0.0.1:8080" (既定。外部に公開するときは "0.0.0.0:8080") */
 int veil_config_listen_cleartext(veil_config_t *cfg, const char *addr);
 
 /* TLS の待ち受けアドレス ([server].listen、HTTP/1.1 + h2 ALPN)。veil_config_tls と併用する。 */

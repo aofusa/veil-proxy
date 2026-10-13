@@ -1,6 +1,6 @@
 # veil API ライブラリの総合サンプル（F-188〜F-192）。E2E（tests/library_e2e.rs）がこれを起動して試験する。
 #
-#   cargo run --release                      # config.toml が無ければライブラリ既定（0.0.0.0:8080、平文）
+#   cargo run --release                      # config.toml が無ければライブラリ既定（127.0.0.1:8080、平文）
 #   curl localhost:8080/hello
 #   open http://localhost:8080/docs           # Swagger UI
 [package]

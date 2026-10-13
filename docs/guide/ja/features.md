@@ -89,7 +89,7 @@ veil はライブラリとして組み込み、Rust・C・Python で API サー�
 
 | feature | 説明 |
 |---------|------|
-| `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`0.0.0.0:8080` で平文 HTTP/1.1 + h2c、TLS 不要） |
+| `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`127.0.0.1:8080` で平文 HTTP/1.1 + h2c、ループバックのみ、TLS 不要） |
 | `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]` |
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json`、Swagger UI、FastAPI 形式の 422 検証 |
 | `tokio-compat` | tokio 無しの tokio 互換レイヤー。tokio 前提のライブラリが veil のランタイムで動く（`api` に含む） |

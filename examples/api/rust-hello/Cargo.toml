@@ -1,5 +1,5 @@
 # 最小のライブラリ利用例（README のクイックスタートと同じコード）。
-#   cargo run   → 平文 HTTP/1.1 + h2c を 0.0.0.0:8080、OpenAPI は /docs
+#   cargo run   → 平文 HTTP/1.1 + h2c を 127.0.0.1:8080、OpenAPI は /docs
 [package]
 name = "veil-example-hello"
 version = "0.1.0"

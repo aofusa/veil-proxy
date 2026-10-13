@@ -295,7 +295,7 @@ pub unsafe extern "C" fn veil_config_listen(cfg: *mut veil_config_t, addr: *cons
 }
 
 /// 平文の待ち受けアドレス（`[server].listen_cleartext`、HTTP/1.1 + h2c）を設定する。
-/// 例: `"0.0.0.0:8080"`（ライブラリ既定）。
+/// 例: `"127.0.0.1:8080"`（ライブラリ既定。外部に公開するときは `"0.0.0.0:8080"`）。
 ///
 /// # Safety
 ///
