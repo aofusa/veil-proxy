@@ -787,10 +787,14 @@ time of the server's cores (including the kernel's loopback processing) divided 
 | axum + `veil::tokio`, `axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
 | axum + `veil::tokio`, per-core | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
 | axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
-| veil `App` + axum `Router` (`tokio_service`) | 33,316 | 31,190 | 2.47 | 61.1 | 11.3 |
-| veil `App` + axum `Router` (epoll) | 36,577 | 34,106 | 2.17 | 55.6 | 9.7 |
-| veil native handler (`#[veil::route]`) | 42,533 | 39,507 | 1.96 | 47.6 | 11.2 |
-| veil native handler (epoll) | 49,149 | 45,495 | 1.75 | 41.4 | 9.6 |
+| veil `App` + axum `Router` (`tokio_service`) | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
+| veil `App` + axum `Router` (epoll) | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
+| veil native handler (`#[veil::route]`) | 64,546 | 58,524 | 2.14 | 31.7 | 11.3 |
+| veil native handler (epoll) | 66,722 | 60,461 | 2.65 | 30.9 | 9.6 |
+
+The four veil rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head and a
+small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s; before
+F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) req/s for plaintext.
 
 - **axum runs on `veil::tokio` unchanged** (the same source, with the `tokio` crate patched to the shim). Per core it
   reaches about **80% (io_uring) to 84% (epoll)** of axum on tokio, and uses 20–25% more CPU per request.
@@ -798,11 +802,11 @@ time of the server's cores (including the kernel's loopback processing) divided 
   connection task stays on the thread that accepted it (the server cores are only ~85% busy out of 200%). For
   multi-core use, run one current-thread runtime and one `SO_REUSEPORT` listener per thread (the "per-core" rows,
   `run_percore` in `tools/api-bench/common.rs`), or mount the router in a veil `App`, whose workers each accept.
-- veil's own handler path (request conversion, routing, extraction, response) currently costs more CPU per request
-  than axum on tokio: the native handler reaches 63% (io_uring) / 72% (epoll) of it, and mounting an axum `Router`
-  adds a conversion to and from `http::Request`/`http::Response` on top. At this concurrency the io_uring backend
-  makes about 2.3 `io_uring_enter` calls per request (no batching), which is why epoll is faster here. This is the
-  API library's handler path, not the proxy data plane, and is tracked as a follow-up.
+- **veil's native handler reaches 98% (epoll) / 93% (io_uring) of axum on tokio** (5-round re-measurement), with
+  about the same CPU per request (30.5–31.7 µs against 29.3 µs). The remaining io_uring gap is the keep-alive wait:
+  the next request is awaited with a readiness poll and then read (two operations, so idle connections hold no read
+  buffer), which is tracked as F-205. Mounting an axum `Router` adds a conversion to and from
+  `http::Request`/`http::Response` (most of its 30 allocations per request are in http/axum).
 
 ### Python: FastAPI (uvicorn) and veil
 
