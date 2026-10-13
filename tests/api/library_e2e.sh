@@ -152,6 +152,8 @@ run_c() {
   echo "== C (examples/api/c-hello)"
   (cd "$ROOT" && cargo build -q -p veil-capi --release) || { bad "build libveil"; return; }
   local CH="$ROOT/examples/api/c-hello"
+  # 前回（別の OS・アーキからコピーされた作業ツリーを含む）の実行ファイルを make が新しいと見なさないように
+  rm -f "$CH/hello" "$CH/hello-static" "$CH/hello.exe" "$CH/hello-static.exe"
   if [ "$OS" = Linux ]; then
     make -s -C "$CH" hello hello-static >/dev/null || { bad "compile hello.c"; return; }
   else
