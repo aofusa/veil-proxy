@@ -48,7 +48,10 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
 
         // Plugin properties
         "plugin_name" => Some(state.http_ctx.plugin_name.as_bytes().to_vec()),
-        "plugin_root_id" => Some(state.http_ctx.root_context_id.to_string().into_bytes()),
+        "plugin_root_id" => match &state.http_ctx.plugin_root_id {
+            Some(r) => Some(r.as_bytes().to_vec()),
+            None => Some(state.http_ctx.root_context_id.to_string().into_bytes()),
+        },
 
         // Check custom_properties for user-defined properties
         _ => state.http_ctx.custom_properties.get(path).cloned(),
@@ -59,7 +62,9 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
 ///
 /// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
 async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
-    let func = caller.get_export("proxy_on_memory_allocate")?;
+    let func = caller
+        .get_export("proxy_on_memory_allocate")
+        .or_else(|| caller.get_export("malloc"))?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
     typed.call_async(&mut *caller, size as i32).await.ok()
@@ -102,6 +107,22 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
 
 /// Parse property path from bytes
 fn parse_path(data: &[u8]) -> Option<String> {
+    // Proxy-Wasm の SDK（Rust・C++）と Envoy はパスの要素を NUL で区切る（`request\0path`）。
+    // 従来の長さ付きの形式で読めなければ NUL 区切りとして読む（B-131）。
+    parse_len_prefixed_path(data).or_else(|| {
+        if data.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = data
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("."))
+    })
+}
+
+fn parse_len_prefixed_path(data: &[u8]) -> Option<String> {
     // Path is serialized as: [num_parts:4][part1_len:4][part1]...
     if data.len() < 4 {
         return None;
@@ -258,4 +279,29 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_path;
+
+    #[test]
+    fn parse_path_accepts_sdk_nul_separated_paths() {
+        // B-131: Proxy-Wasm の SDK（Rust・C++）は要素を NUL で区切る
+        assert_eq!(parse_path(b"plugin_root_id").as_deref(), Some("plugin_root_id"));
+        assert_eq!(parse_path(b"request\0path").as_deref(), Some("request.path"));
+        assert_eq!(parse_path(b"request\0path\0").as_deref(), Some("request.path"));
+        assert_eq!(parse_path(b""), None);
+    }
+
+    #[test]
+    fn parse_path_keeps_length_prefixed_paths() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&7u32.to_le_bytes());
+        b.extend_from_slice(b"request");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(b"path");
+        assert_eq!(parse_path(&b).as_deref(), Some("request.path"));
+    }
 }

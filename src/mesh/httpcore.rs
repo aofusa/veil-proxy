@@ -213,6 +213,8 @@ pub enum ResponseFlag {
     NoCluster,
     /// UO: サーキットブレーカの上限（接続・保留・要求数）を超えた
     UpstreamOverflow,
+    /// NFCF: ECDS のフィルタの設定が届いていない
+    NoFilterConfigFound,
 }
 
 impl ResponseFlag {
@@ -229,6 +231,7 @@ impl ResponseFlag {
             ResponseFlag::FaultInjected => "FI",
             ResponseFlag::RbacDenied => "RBAC",
             ResponseFlag::NoCluster => "NC",
+            ResponseFlag::NoFilterConfigFound => "NFCF",
             ResponseFlag::UpstreamOverflow => "UO",
         }
     }

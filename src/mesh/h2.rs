@@ -159,7 +159,7 @@ async fn local(
 
 async fn task(
     c: Arc<ConnCtx>,
-    rq: H2RequestCtx,
+    mut rq: H2RequestCtx,
     req_rx: Option<Receiver<Bytes>>,
     tx: &Sender<H2RespMsg>,
     notify: &Notify,
@@ -183,6 +183,18 @@ async fn task(
         }
         headers.push((h.name.clone(), h.value.clone()));
     }
+    let filtered = l7::request_filters(
+        &c,
+        &mut l7::ReqParts {
+            method: &mut rq.method,
+            path: &mut rq.path,
+            authority: &mut rq.authority,
+            headers: &mut headers,
+            scheme: &scheme,
+            eos: req_rx.is_none() && rq.body.is_empty(),
+        },
+    )
+    .await;
     let view = ReqView {
         method: &rq.method,
         path: &rq.path,
@@ -196,7 +208,11 @@ async fn task(
         .find(|(k, _)| k.as_ref() == b"content-length")
         .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse().ok())
         .unwrap_or(rq.body.len() as u64);
-    match l7::decide(&c, &view) {
+    let decision = match filtered {
+        Ok((jwt, ran)) => l7::decide(&c, &view, jwt, ran),
+        Err(lr) => Decision::Local(lr),
+    };
+    match decision {
         Decision::Local(lr) => {
             local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
             let labels = c.labels(None, None, is_grpc);
@@ -535,6 +551,7 @@ async fn forward(
                     }
                     let ums = started.elapsed().as_millis() as u64;
                     out.upstream_ms = Some(ums);
+                    f.response_filters(status, &mut headers).await;
                     let peer_resp = l7::downstream_response_headers(
                         c,
                         Some(f),
@@ -815,6 +832,7 @@ async fn to_h1(
     }
     let ums = started.elapsed().as_millis() as u64;
     out.upstream_ms = Some(ums);
+    f.response_filters(status, &mut headers).await;
     let peer_resp = l7::downstream_response_headers(c, Some(f), &mut headers, Some(ums), origin);
     out.peer = l7::peer_workload(c, peer_req, peer_resp, picked.endpoint());
     out.status = status;

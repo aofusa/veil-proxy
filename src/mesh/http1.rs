@@ -90,8 +90,8 @@ where
             .await;
             return;
         }
-        let method = sub(&head, req.method.unwrap_or("GET").as_bytes());
-        let path = sub(&head, req.path.unwrap_or("/").as_bytes());
+        let mut method = sub(&head, req.method.unwrap_or("GET").as_bytes());
+        let mut path = sub(&head, req.path.unwrap_or("/").as_bytes());
         let http10 = req.version == Some(0);
         let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(req.headers.len() + 8);
         let mut authority = Bytes::new();
@@ -150,6 +150,18 @@ where
             keep_alive = false;
         }
         super::stats::DOWNSTREAM_RQ_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let filtered = l7::request_filters(
+            &ctx,
+            &mut l7::ReqParts {
+                method: &mut method,
+                path: &mut path,
+                authority: &mut authority,
+                headers: &mut headers,
+                scheme: if ctx.tls { b"https" } else { b"http" },
+                eos: matches!(framing, Framing::None | Framing::Length(0)),
+            },
+        )
+        .await;
         let view = ReqView {
             method: &method,
             path: &path,
@@ -169,7 +181,11 @@ where
             Framing::Length(n) => n,
             _ => 0,
         };
-        match l7::decide(&ctx, &view) {
+        let decision = match filtered {
+            Ok((jwt, ran)) => l7::decide(&ctx, &view, jwt, ran),
+            Err(lr) => Decision::Local(lr),
+        };
+        match decision {
             Decision::Local(lr) => {
                 // 本文は読み捨てる（キープアライブを保つ）
                 let ok = discard_body(&mut io, &mut acc, framing).await.is_ok();
@@ -978,6 +994,7 @@ where
         let upstream_ms = started.elapsed().as_millis() as u64;
         out.upstream_ms = Some(upstream_ms);
         let mut resp_headers = rh.headers;
+        f.response_filters(rh.status, &mut resp_headers).await;
         let peer_resp = l7::downstream_response_headers(
             ctx,
             Some(f),
@@ -1219,6 +1236,7 @@ where
                 status,
                 mut headers,
             }) => {
+                f.response_filters(status, &mut headers).await;
                 let peer_resp = l7::downstream_response_headers(
                     ctx,
                     Some(f),

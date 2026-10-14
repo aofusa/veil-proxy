@@ -43,6 +43,8 @@ impl ListenerTable {
 pub struct Registry {
     pub routes: HashMap<String, Arc<RouteSlot>>,
     pub clusters: HashMap<String, Arc<ClusterSlot>>,
+    /// ECDS（HTTP フィルタの設定）のスロット
+    pub ecds: HashMap<String, Arc<EcdsSlot>>,
 }
 
 impl Registry {
@@ -50,6 +52,18 @@ impl Registry {
         self.routes
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(RouteSlot::new(name)))
+            .clone()
+    }
+
+    pub fn ecds_slot(&mut self, name: &str) -> Arc<EcdsSlot> {
+        self.ecds
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                Arc::new(EcdsSlot {
+                    name: name.to_string(),
+                    filter: arc_swap::ArcSwapOption::empty(),
+                })
+            })
             .clone()
     }
 

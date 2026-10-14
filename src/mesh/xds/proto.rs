@@ -1168,10 +1168,89 @@ pub struct HttpFilter {
     pub name: String,
     #[prost(message, optional, tag = "4")]
     pub typed_config: Option<Any>,
+    /// ECDS（Istio の WasmPlugin）。`config_source` は ADS 固定なので読まない
+    #[prost(message, optional, tag = "5")]
+    pub config_discovery: Option<ExtensionConfigSource>,
     #[prost(bool, tag = "6")]
     pub is_optional: bool,
     #[prost(bool, tag = "7")]
     pub disabled: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExtensionConfigSource {
+    #[prost(message, optional, tag = "2")]
+    pub default_config: Option<Any>,
+    #[prost(bool, tag = "3")]
+    pub apply_default_config_without_warming: bool,
+    #[prost(string, repeated, tag = "4")]
+    pub type_urls: Vec<String>,
+}
+
+/// ECDS のリソース（`envoy.config.core.v3.TypedExtensionConfig`）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TypedExtensionConfig {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(message, optional, tag = "2")]
+    pub typed_config: Option<Any>,
+}
+
+/// `envoy.extensions.filters.http.wasm.v3.Wasm`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WasmFilter {
+    #[prost(message, optional, tag = "1")]
+    pub config: Option<WasmPluginConfig>,
+}
+
+/// `envoy.extensions.wasm.v3.PluginConfig`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WasmPluginConfig {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub root_id: String,
+    #[prost(message, optional, tag = "3")]
+    pub vm_config: Option<WasmVmConfig>,
+    #[prost(message, optional, tag = "4")]
+    pub configuration: Option<Any>,
+    #[prost(bool, tag = "5")]
+    pub fail_open: bool,
+    /// 0 = FAIL_CLOSED, 1 = FAIL_OPEN, 2 = FAIL_RELOAD
+    #[prost(int32, tag = "7")]
+    pub failure_policy: i32,
+}
+
+/// `envoy.extensions.wasm.v3.VmConfig`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WasmVmConfig {
+    #[prost(string, tag = "1")]
+    pub vm_id: String,
+    #[prost(string, tag = "2")]
+    pub runtime: String,
+    #[prost(message, optional, tag = "3")]
+    pub code: Option<AsyncDataSource>,
+    #[prost(message, optional, tag = "4")]
+    pub configuration: Option<Any>,
+}
+
+/// `envoy.config.core.v3.AsyncDataSource`（`remote` は pilot-agent がローカルのファイルに書き換えるので読まない）
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct AsyncDataSource {
+    #[prost(message, optional, tag = "1")]
+    pub local: Option<DataSource>,
+}
+
+/// `google.protobuf.StringValue` / `BytesValue`（Wasm の `configuration`）
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StringValue {
+    #[prost(string, tag = "1")]
+    pub value: String,
+}
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BytesValue {
+    #[prost(bytes = "vec", tag = "1")]
+    pub value: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1355,6 +1434,7 @@ pub const T_UPSTREAM_TLS: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 pub const T_HTTP_PROTOCOL_OPTIONS: &str =
     "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+pub const T_WASM: &str = "type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm";
 pub const T_FAULT: &str = "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault";
 pub const T_TYPED_STRUCT_UDPA: &str = "type.googleapis.com/udpa.type.v1.TypedStruct";
 pub const T_TYPED_STRUCT_XDS: &str = "type.googleapis.com/xds.type.v3.TypedStruct";

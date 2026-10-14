@@ -64,6 +64,9 @@ pub struct FilterEngine {
     /// 外部 I/O を待つ経路では、再開直前に締切を引き直す必要がある（さもないと
     /// 無関係な同時リクエストの WASM 呼び出しだけで誤ってトラップする）。
     epoch_deadline: u64,
+    /// 要求ヘッダの段でモジュールが失敗（トラップ・proc_exit 等）したら 503 で拒否する
+    /// （Envoy の `failure_policy: FAIL_CLOSED`。メッシュの WasmPlugin 用、F-222）。既定は false（従来どおり続行）。
+    fail_closed: bool,
 }
 
 impl FilterEngine {
@@ -83,6 +86,7 @@ impl FilterEngine {
             registry,
             fuel_limit,
             epoch_deadline,
+            fail_closed: false,
         })
     }
 
@@ -150,6 +154,13 @@ impl FilterEngine {
                 }
                 Err(e) => {
                     ftlog::error!("[wasm:{}] on_request_headers error: {}", module.name, e);
+                    if self.fail_closed {
+                        return FilterResult::LocalResponse(LocalResponse {
+                            status_code: 503,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        });
+                    }
                     // Continue on error
                 }
             }
@@ -437,6 +448,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.set_request(method.clone(), path.clone(), headers, client_ip.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -599,6 +611,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.set_response(status, headers);
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -658,6 +671,20 @@ impl FilterEngine {
     }
 
     /// Get a loaded module by name
+    /// モジュールの Proxy-Wasm の root_id（プロパティ `plugin_root_id`）を設定する。Envoy 互換の
+    /// サイドカー（F-222）が ECDS の `PluginConfig.root_id` を渡すのに使う（C++ SDK はこの名前で
+    /// ルートコンテキストのファクトリを選ぶ）。読み込み直後（エンジンを共有する前）だけ効く。
+    /// 要求ヘッダの段の失敗で拒否する（Envoy の FAIL_CLOSED。F-222）。
+    #[cfg(feature = "mesh")]
+    pub fn set_fail_closed(&mut self, on: bool) {
+        self.fail_closed = on;
+    }
+
+    #[cfg(feature = "mesh")]
+    pub fn set_root_id(&mut self, module: &str, root_id: &str) -> bool {
+        self.registry.set_root_id(module, root_id)
+    }
+
     pub fn get_module(&self, name: &str) -> Option<Arc<LoadedModule>> {
         self.registry.get_module(name)
     }
@@ -722,6 +749,7 @@ impl FilterEngine {
         // Create context with HTTP call response
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
 
         // Store the response in context
@@ -926,6 +954,7 @@ impl FilterEngine {
         let body_len = body.len();
         http_ctx.set_request_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -1096,6 +1125,7 @@ impl FilterEngine {
         let body_len = body.len();
         http_ctx.set_response_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -1219,6 +1249,7 @@ impl FilterEngine {
         // proxy_get_buffer(PluginConfiguration) で空を読んでしまう）。
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -1325,6 +1356,7 @@ impl FilterEngine {
         // F-148: `execute_on_log` と同じ理由で configuration の実体も積む。
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -1539,6 +1571,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.request_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -1686,6 +1719,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.response_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
@@ -1907,6 +1941,7 @@ impl FilterEngine {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
         // F-134: MapType::GrpcReceiveInitialMetadata(4) のバックストア。
         // ゲストが proxy_on_grpc_receive_initial_metadata 内で
@@ -2031,6 +2066,7 @@ impl FilterEngine {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
         // F-134: BufferType::GrpcReceiveBuffer(5) のバックストア。
         http_ctx.grpc_receive_message = bytes::Bytes::copy_from_slice(message);
@@ -2152,6 +2188,7 @@ impl FilterEngine {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
         // F-134: MapType::GrpcReceiveTrailingMetadata(5) のバックストア。
         // F-160: `grpc_receive_trailing_metadata` の型は headers.rs 共通のため
@@ -2272,6 +2309,7 @@ impl FilterEngine {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
 
         let host_state = HostState::new(http_ctx);
@@ -2389,6 +2427,7 @@ impl FilterEngine {
     ) -> anyhow::Result<NetworkAction> {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
@@ -2536,6 +2575,7 @@ impl FilterEngine {
             }
         }
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
@@ -2673,6 +2713,7 @@ impl FilterEngine {
     ) -> anyhow::Result<()> {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
@@ -2957,6 +2998,7 @@ mod exec_smoke_tests {
             Arc::from("127.0.0.1"),
         );
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
 
         let host_state = HostState::new(http_ctx);

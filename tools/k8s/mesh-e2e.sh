@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -713,6 +713,32 @@ EOF
   kubectl -n "$NS" delete telemetry tracing >/dev/null
 }
 
+wasm() {
+  log "wasm (WasmPlugin = Proxy-Wasm via ECDS)"
+  # Istio のタスク（Wasm Plugin）の basic_auth を whoami のサイドカー（inbound）に入れる
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata: {name: basic-auth}
+spec:
+  selector: {matchLabels: {app: whoami}}
+  url: oci://ghcr.io/istio-ecosystem/wasm-extensions/basic_auth:1.12.0
+  phase: AUTHN
+  pluginConfig:
+    basic_auth_rules:
+    - prefix: "/"
+      request_methods: ["GET", "POST"]
+      credentials: ["ok:test", "YWRtaW4zOmFkbWluMw=="]
+EOF
+  if retry 120 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 401"; then ok "WasmPlugin basic_auth: no credentials -> 401"; else bad "WasmPlugin: not enforced ($(cexec curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami."$NS"/))"; fi
+  out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' -u ok:test http://whoami."$NS"/)" || true
+  if [ "$out" = 200 ]; then ok "WasmPlugin basic_auth: valid credentials -> 200"; else bad "WasmPlugin valid credentials: $out"; fi
+  out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' -u ok:wrong http://whoami."$NS"/)" || true
+  if [ "$out" = 401 ]; then ok "WasmPlugin basic_auth: wrong credentials -> 401"; else bad "WasmPlugin wrong credentials: $out"; fi
+  kubectl -n "$NS" delete wasmplugin basic-auth >/dev/null
+  if retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200"; then ok "WasmPlugin removed -> 200"; else bad "WasmPlugin removal not applied"; fi
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -726,7 +752,8 @@ case "$SUITE" in
   tasks) tasks ;;
   gateway) gateway ;;
   telemetry) telemetry ;;
-  all) smoke; tasks; gateway; telemetry ;;
+  wasm) wasm ;;
+  all) smoke; tasks; gateway; telemetry; wasm ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

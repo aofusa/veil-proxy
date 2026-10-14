@@ -25,6 +25,8 @@ pub struct LoadedModule {
     pub capabilities: ModuleCapabilities,
     /// Plugin configuration
     pub configuration: Arc<[u8]>,
+    /// Proxy-Wasm の root_id（`plugin_root_id`）。未設定なら従来どおりルートコンテキストの ID を返す
+    pub root_id: Option<Arc<str>>,
 }
 
 /// Module registry
@@ -67,6 +69,18 @@ impl ModuleRegistry {
         }
 
         Ok(registry)
+    }
+
+    /// 読み込んだモジュールの root_id を設定する（F-222。共有前のみ）。
+    #[cfg(feature = "mesh")]
+    pub fn set_root_id(&mut self, module: &str, root_id: &str) -> bool {
+        match self.modules.get_mut(module).and_then(Arc::get_mut) {
+            Some(m) => {
+                m.root_id = Some(Arc::from(root_id));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Create Wasmtime engine with pooling allocator
@@ -186,6 +200,7 @@ impl ModuleRegistry {
             instance_pre,
             capabilities: config.capabilities.clone(),
             configuration: config.configuration.to_bytes(),
+            root_id: None,
         };
 
         ftlog::info!(

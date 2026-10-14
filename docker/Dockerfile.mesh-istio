@@ -4,7 +4,7 @@
 # pilot-agent が起動する `/usr/local/bin/envoy`（ProxyConfig.binaryPath の既定）だけを veil にする。
 # veil は docker/Dockerfile.musl で `mesh-istio` を有効にしてビルドした静的リンクのバイナリ。
 #
-#   docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=mesh-istio,epoll -t veil:musl-mesh .
+#   docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=mesh-istio,epoll,wasm -t veil:musl-mesh .
 #   docker build -f docker/Dockerfile.mesh-istio -t veil.local/istio-proxy:1.31.1 .
 #
 # 注入: Pod の注釈 `sidecar.istio.io/proxyImage: veil.local/istio-proxy:1.31.1`（`/` を含む名前でないと注入テンプレートが無視する）（または istioctl install の

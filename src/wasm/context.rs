@@ -123,6 +123,8 @@ pub struct HttpContext {
     pub client_ip: std::sync::Arc<str>,
     /// Plugin name
     pub plugin_name: String,
+    /// Proxy-Wasm の root_id（設定されたモジュールのみ。F-222）
+    pub plugin_root_id: Option<Arc<str>>,
     /// Plugin configuration（ルート単位で実効値が解決されている場合はその値。F-148）
     pub plugin_configuration: Arc<[u8]>,
     /// VM configuration
@@ -280,6 +282,7 @@ impl HttpContext {
             response_body_complete: false,
             client_ip: std::sync::Arc::from(""),
             plugin_name: String::new(),
+            plugin_root_id: None,
             plugin_configuration: crate::wasm_plugin_config::empty_configuration(),
             vm_configuration: crate::wasm_plugin_config::empty_configuration(),
             request_headers_modified: false,

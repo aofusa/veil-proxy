@@ -376,6 +376,26 @@ pub enum HttpFilterCfg {
     Rbac(Arc<crate::mesh::model::RbacCfg>),
     /// JWT の検証（Istio の RequestAuthentication。F-220）
     Jwt(Arc<crate::mesh::jwt::JwtCfg>),
+    /// ECDS で届くフィルタ（Istio の WasmPlugin。F-222）
+    Ecds(Arc<EcdsSlot>),
+    /// Proxy-Wasm のプラグイン（ECDS の中身）
+    #[cfg(feature = "wasm")]
+    Wasm(Arc<crate::mesh::wasm::MeshWasm>),
+    /// 何もしない（読み込めなかった FAIL_OPEN のプラグイン）
+    Noop,
+}
+
+/// ECDS の 1 リソースのスロット（HCM のフィルタはこれを共有し、ECDS の更新で中身を差し替える）。
+pub struct EcdsSlot {
+    pub name: String,
+    /// 届くまでは `None`（Envoy はリスナーのウォーミングで待つ。veil は要求を少し待たせてから 500）
+    pub filter: arc_swap::ArcSwapOption<HttpFilterCfg>,
+}
+
+impl std::fmt::Debug for EcdsSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdsSlot").field("name", &self.name).finish()
+    }
 }
 
 /// ルート表への参照（RDS の名前で共有するスロットか、インライン）。

@@ -141,6 +141,79 @@ fn struct_strings(s: &p::Struct) -> Vec<(String, String)> {
     v
 }
 
+/// ECDS で届いた HTTP フィルタ（`TypedExtensionConfig.typed_config`）を変換する。
+/// Istio の WasmPlugin は Wasm、pilot-agent が取得に失敗して差し替えたものは RBAC（拒否）か何もしないフィルタ。
+pub fn ecds_filter(name: &str, any: &p::Any) -> R<HttpFilterCfg> {
+    let ty = inner_type(any);
+    if ty == p::T_WASM {
+        let w = decode_any::<p::WasmFilter>(any, p::T_WASM).ok_or("invalid Wasm filter")?;
+        let pc = w.config.unwrap_or_default();
+        let fail_open = pc.fail_open || pc.failure_policy == 1;
+        return match wasm_plugin(name, &pc, !fail_open) {
+            Ok(f) => Ok(f),
+            Err(e) if fail_open => {
+                ftlog::warn!("[mesh] wasm plugin {} disabled (fail open): {}", name, e);
+                Ok(HttpFilterCfg::Noop)
+            }
+            Err(e) => Err(e),
+        };
+    }
+    if ty.contains("filters.http.rbac") {
+        return Ok(HttpFilterCfg::Rbac(Arc::new(super::rbac::http_rbac(any)?)));
+    }
+    if ty.ends_with("stats.PluginConfig")
+        || ty.contains("peer_metadata")
+        || ty.contains("metadataexchange")
+        || ty.contains("grpc_stats")
+    {
+        return Ok(HttpFilterCfg::Noop);
+    }
+    Err(format!("unsupported ECDS filter {} ({})", name, ty))
+}
+
+#[cfg(feature = "wasm")]
+fn wasm_plugin(name: &str, pc: &p::WasmPluginConfig, fail_closed: bool) -> R<HttpFilterCfg> {
+    let vm = pc.vm_config.as_ref().ok_or("Wasm plugin without vm_config")?;
+    let path = match vm
+        .code
+        .as_ref()
+        .and_then(|c| c.local.as_ref())
+        .and_then(|d| d.specifier.as_ref())
+    {
+        Some(p::data_source::Specifier::Filename(f)) => f.clone(),
+        _ => return Err("Wasm plugin without a local module file".into()),
+    };
+    let configuration = pc.configuration.as_ref().map(any_bytes).unwrap_or_default();
+    let w = crate::mesh::wasm::load(name, &path, &pc.root_id, configuration, fail_closed)?;
+    Ok(HttpFilterCfg::Wasm(Arc::new(w)))
+}
+
+#[cfg(not(feature = "wasm"))]
+fn wasm_plugin(_name: &str, _pc: &p::WasmPluginConfig, _fail_closed: bool) -> R<HttpFilterCfg> {
+    Err("this veil is built without Proxy-Wasm (the `wasm` feature)".into())
+}
+
+/// Wasm の `configuration`（`StringValue`・`BytesValue`・`Struct`）をプラグインに渡すバイト列にする。
+#[cfg(feature = "wasm")]
+fn any_bytes(a: &p::Any) -> Vec<u8> {
+    if a.type_url.ends_with("google.protobuf.StringValue") {
+        return decode_any::<p::StringValue>(a, &a.type_url)
+            .map(|v| v.value.into_bytes())
+            .unwrap_or_default();
+    }
+    if a.type_url.ends_with("google.protobuf.BytesValue") {
+        return decode_any::<p::BytesValue>(a, &a.type_url)
+            .map(|v| v.value)
+            .unwrap_or_default();
+    }
+    if a.type_url.ends_with("google.protobuf.Struct") {
+        return decode_any::<p::Struct>(a, &a.type_url)
+            .map(|s| super::struct_to_json(&s).to_string().into_bytes())
+            .unwrap_or_default();
+    }
+    a.value.clone()
+}
+
 /// Istio の拡張フィルタ（TypedStruct で包まれる）の実際の型 URL。
 fn inner_type(any: &p::Any) -> String {
     if any.type_url == p::T_TYPED_STRUCT_UDPA || any.type_url == p::T_TYPED_STRUCT_XDS {
@@ -533,6 +606,20 @@ fn http_cm(
     }
     for f in &hcm.http_filters {
         if f.disabled {
+            continue;
+        }
+        if let Some(cd) = &f.config_discovery {
+            // ECDS（Istio の WasmPlugin）。届くまでは既定の設定があればそれを使う
+            let slot = reg.ecds_slot(&f.name);
+            if slot.filter.load().is_none() {
+                if let Some(def) = &cd.default_config {
+                    match ecds_filter(&f.name, def) {
+                        Ok(fc) => slot.filter.store(Some(Arc::new(fc))),
+                        Err(e) => ftlog::warn!("[mesh] ECDS default for {}: {}", f.name, e),
+                    }
+                }
+            }
+            filters.push(HttpFilterCfg::Ecds(slot));
             continue;
         }
         let ty = f.typed_config.as_ref().map(inner_type).unwrap_or_default();

@@ -37,6 +37,8 @@ pub struct RawResources {
     pub clusters: HashMap<String, (String, p::Cluster)>,
     pub routes: HashMap<String, (String, p::RouteConfiguration)>,
     pub endpoints: HashMap<String, (String, p::ClusterLoadAssignment)>,
+    /// ECDS（HTTP フィルタの設定。Istio の WasmPlugin）
+    pub ecds: HashMap<String, (String, p::TypedExtensionConfig)>,
     /// 最後の NACK の理由（型 → 理由）
     pub last_nack: HashMap<String, String>,
 }
@@ -65,6 +67,8 @@ struct Subs {
     eds_slots: HashMap<String, Vec<Arc<ClusterSlot>>>,
     /// ADS で購読中の秘密（ゲートウェイの `kubernetes://<credentialName>`）
     secrets: BTreeSet<String>,
+    /// 購読中の ECDS の名前
+    ecds: BTreeSet<String>,
 }
 
 pub fn spawn(cfg: AdsConfig) {
@@ -187,6 +191,17 @@ async fn session(
         )
         .await?;
     }
+    if !subs.ecds.is_empty() {
+        send(
+            &stream,
+            p::DeltaDiscoveryRequest {
+                type_url: p::TYPE_ECDS.into(),
+                resource_names_subscribe: subs.ecds.iter().cloned().collect(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     if !subs.secrets.is_empty() {
         send(
             &stream,
@@ -296,6 +311,7 @@ fn handle(resp: p::DeltaDiscoveryResponse, subs: &mut Subs) -> Vec<p::DeltaDisco
         p::TYPE_ROUTE => apply_routes(&resp, &mut errors),
         p::TYPE_ENDPOINT => apply_endpoints(&resp, subs, &mut errors),
         p::TYPE_SECRET => apply_secrets(&resp, &mut errors),
+        p::TYPE_ECDS => apply_ecds(&resp, &mut errors),
         other => {
             // 購読していない型（Istio の拡張等）。ACK だけ返す
             debug!("[xds] ignoring resources of type {}", other);
@@ -514,6 +530,35 @@ fn apply_listeners(
             ..Default::default()
         });
     }
+    // ECDS の購読を作り直す
+    let mut wanted = BTreeSet::new();
+    for l in subs.listeners.values() {
+        for c in l.chains.iter().chain(l.default_chain.iter()) {
+            if let ChainAction::Http(h) = &c.action {
+                for f in &h.filters {
+                    if let HttpFilterCfg::Ecds(s) = f {
+                        wanted.insert(s.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    reg.ecds
+        .retain(|k, s| wanted.contains(k) || Arc::strong_count(s) > 1);
+    let sub: Vec<String> = wanted.difference(&subs.ecds).cloned().collect();
+    let unsub: Vec<String> = subs.ecds.difference(&wanted).cloned().collect();
+    for n in &unsub {
+        raw.ecds.remove(n);
+    }
+    subs.ecds = wanted;
+    if !sub.is_empty() || !unsub.is_empty() {
+        out.push(p::DeltaDiscoveryRequest {
+            type_url: p::TYPE_ECDS.into(),
+            resource_names_subscribe: sub,
+            resource_names_unsubscribe: unsub,
+            ..Default::default()
+        });
+    }
     let st = state();
     st.lds_updates.fetch_add(1, Ordering::Relaxed);
     st.lds_ready.store(true, Ordering::Relaxed);
@@ -577,5 +622,37 @@ fn apply_secrets(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
         if let Err(e) = crate::mesh::envoy::sds::apply(&sec) {
             errors.push(format!("secret {}: {}", name, e));
         }
+    }
+}
+
+/// ECDS（Istio の WasmPlugin）。Wasm のモジュールはここで読み込む（コンパイルは xDS のスレッドで済ませる）。
+fn apply_ecds(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
+    let items: Vec<(String, String, p::TypedExtensionConfig)> =
+        decode_resources(resp, p::TYPE_ECDS, errors);
+    for (name, version, tc) in items {
+        let name = if tc.name.is_empty() { name } else { tc.name.clone() };
+        let Some(any) = &tc.typed_config else {
+            errors.push(format!("ECDS {} without typed_config", name));
+            continue;
+        };
+        match translate::ecds_filter(&name, any) {
+            Ok(f) => {
+                let slot = state()
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ecds_slot(&name);
+                slot.filter.store(Some(Arc::new(f)));
+                info!("[xds] ECDS {} applied", name);
+                RAW.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ecds
+                    .insert(name, (version, tc));
+            }
+            Err(e) => errors.push(format!("ECDS {}: {}", name, e)),
+        }
+    }
+    for name in &resp.removed_resources {
+        RAW.lock().unwrap_or_else(|e| e.into_inner()).ecds.remove(name);
     }
 }

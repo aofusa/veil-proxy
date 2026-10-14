@@ -210,6 +210,9 @@ pub struct Forward {
     pub jwt_add: Vec<(Bytes, Bytes)>,
     /// この hop のスパン（トレースの設定があるときだけ）
     pub span: Option<super::tracing::Span>,
+    /// 要求の段で通った Wasm のフィルタ（応答の段で呼ぶ）
+    #[cfg(feature = "wasm")]
+    pub wasm: super::wasm::Ran,
 }
 
 impl Forward {
@@ -218,6 +221,16 @@ impl Forward {
     }
     pub fn vhost(&self) -> &VirtualHost {
         &self.table.vhosts[self.vh]
+    }
+
+    /// 応答ヘッダの段の Wasm のフィルタ（無ければ何もしない）。
+    pub async fn response_filters(&self, status: u16, headers: &mut Vec<(Bytes, Bytes)>) {
+        #[cfg(feature = "wasm")]
+        if !self.wasm.is_empty() {
+            super::wasm::on_response(&self.wasm, status, headers).await;
+        }
+        #[cfg(not(feature = "wasm"))]
+        let _ = (status, headers);
     }
 }
 
@@ -257,14 +270,65 @@ fn chance(per_million: u32) -> bool {
     per_million >= 1_000_000 || (httpcore::rand_u32() % 1_000_000) < per_million
 }
 
-/// 要求からルートを選ぶ（RBAC・フォルト・CORS のプリフライトも含む）。
-pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
-    let is_grpc = req.is_grpc();
-    // 認証・認可（HTTP フィルタの順）
+/// 要求の段で通った Wasm のフィルタ（`wasm` feature が無ければ空）。
+#[cfg(feature = "wasm")]
+pub type WasmRan = super::wasm::Ran;
+#[cfg(not(feature = "wasm"))]
+pub type WasmRan = ();
+
+/// 要求の可変の部分（Wasm のフィルタがヘッダ・疑似ヘッダを書き換える）。
+pub struct ReqParts<'a> {
+    pub method: &'a mut Bytes,
+    pub path: &'a mut Bytes,
+    pub authority: &'a mut Bytes,
+    pub headers: &'a mut Vec<(Bytes, Bytes)>,
+    pub scheme: &'a [u8],
+    /// 本文が無い（ヘッダで要求が終わる）
+    pub eos: bool,
+}
+
+impl ReqParts<'_> {
+    pub fn view(&self) -> ReqView<'_> {
+        ReqView {
+            method: self.method,
+            path: self.path,
+            authority: self.authority,
+            headers: self.headers,
+            scheme: self.scheme,
+        }
+    }
+}
+
+/// 要求側の認証・認可・Wasm のフィルタ（HTTP フィルタの順）を通す。拒否ならローカル応答。
+/// 戻り値は JWT の結果と、応答の段でも呼ぶ Wasm のフィルタ。
+pub async fn request_filters(
+    ctx: &ConnCtx,
+    rq: &mut ReqParts<'_>,
+) -> Result<(super::jwt::JwtOutcome, WasmRan), LocalReply> {
     let mut jwt = super::jwt::JwtOutcome::default();
+    #[cfg_attr(not(feature = "wasm"), allow(unused_mut))]
+    let mut ran = WasmRan::default();
     for f in &ctx.hcm.filters {
+        let ecds;
+        let f = match f {
+            HttpFilterCfg::Ecds(slot) => {
+                ecds = wait_ecds(slot).await;
+                match &ecds {
+                    Some(f) => &**f,
+                    None => {
+                        let mut lr = LocalReply::new(500, ResponseFlag::NoFilterConfigFound);
+                        if rq.view().is_grpc() {
+                            lr.grpc_status = Some(13);
+                        }
+                        return Err(lr);
+                    }
+                }
+            }
+            f => f,
+        };
         match f {
             HttpFilterCfg::Jwt(cfg) => {
+                let req = rq.view();
                 let header = |n: &str| req.header(n);
                 match super::jwt::authenticate(cfg, req.method, req.path, &header) {
                     Ok(o) => {
@@ -279,25 +343,53 @@ pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
                             Bytes::from_static(b"www-authenticate"),
                             Bytes::from_static(b"Bearer realm=\"veil\", error=\"invalid_token\""),
                         ));
-                        if is_grpc {
+                        if req.is_grpc() {
                             lr.grpc_status = Some(16);
                         }
-                        return Decision::Local(lr);
+                        return Err(lr);
                     }
                 }
             }
             HttpFilterCfg::Rbac(r) => {
-                if !rbac_allows(ctx, req, r, &jwt.payloads) {
+                let req = rq.view();
+                if !rbac_allows(ctx, &req, r, &jwt.payloads) {
                     let mut lr = LocalReply::new(403, ResponseFlag::RbacDenied);
-                    if is_grpc {
+                    if req.is_grpc() {
                         lr.grpc_status = Some(7);
                     }
-                    return Decision::Local(lr);
+                    return Err(lr);
                 }
+            }
+            #[cfg(feature = "wasm")]
+            HttpFilterCfg::Wasm(w) => {
+                super::wasm::on_request(w, ctx, rq).await?;
+                ran.push(w.clone());
             }
             _ => {}
         }
     }
+    Ok((jwt, ran))
+}
+
+/// ECDS のフィルタが届くまで少し待つ（Envoy はリスナーのウォーミングで待つ）。
+async fn wait_ecds(slot: &EcdsSlot) -> Option<Arc<HttpFilterCfg>> {
+    for _ in 0..100 {
+        if let Some(f) = slot.filter.load_full() {
+            return Some(f);
+        }
+        crate::runtime::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// 要求からルートを選ぶ（フォルト・CORS のプリフライトも含む）。認証・認可は [`request_filters`] で済ませておく。
+pub fn decide(
+    ctx: &ConnCtx,
+    req: &ReqView<'_>,
+    jwt: super::jwt::JwtOutcome,
+    #[cfg_attr(not(feature = "wasm"), allow(unused_variables))] wasm: WasmRan,
+) -> Decision {
+    let is_grpc = req.is_grpc();
     let table = ctx.hcm.routes.load();
     let Some(vh) = table.select_vhost(req.authority) else {
         return Decision::Local(LocalReply::new(404, ResponseFlag::NoRoute));
@@ -478,6 +570,8 @@ pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
                 cors,
                 jwt_remove: jwt.remove_headers,
                 jwt_add: jwt.add_headers,
+                #[cfg(feature = "wasm")]
+                wasm,
                 span: ctx.hcm.tracer.as_ref().map(|t| {
                     let header = |n: &str| req.header(n);
                     super::tracing::begin(t, &header)

@@ -37,6 +37,8 @@ pub mod stats;
 pub mod tcp;
 pub mod tracing;
 pub mod upstream;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 pub mod xds;
 
 #[cfg(feature = "mesh-linkerd")]
