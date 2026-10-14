@@ -17,6 +17,8 @@ classifiers = [
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]
+# veil.grpc.Server（grpc_tools.protoc の生成コードをそのまま使う層）。基本の層 veil.grpc.unary_unary 等は不要
+grpc = ["grpcio"]
 
 [tool.maturin]
 module-name = "veil._veil"

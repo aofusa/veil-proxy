@@ -59,6 +59,70 @@ veil_run(cfg);                                      /* 停止までブロック�
 | `user_data` | ライブラリは解釈せずそのまま返す。**サーバ稼働中ずっと有効で、複数スレッドから同時に使っても安全**であること（呼び出し側が保証する）。 |
 | `veil_last_error()` | スレッドローカル。次のエラーまで有効。解放しない。 |
 
+## ストリーミング・gRPC・L4（F-210）
+
+veil はバイト列を運ぶだけで、メッセージの直列化（protobuf-c・nanopb・upb 等）は利用者が行います。
+動くサンプルは [examples/api/c-features/](../../examples/api/c-features/)（`make` で作れます）。
+
+### 応答と要求本文のストリーミング
+
+```c
+static int events(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    veil_response_set_header(resp, "content-type", "text/event-stream");
+    veil_stream_t *s = veil_response_stream(resp);      /* ステータス・ヘッダを送る */
+    for (int i = 0; i < 3; i++)
+        if (veil_stream_write(s, (const uint8_t *)"data: tick\n\n", 12) == VEIL_ERR_CLOSED) break;
+    veil_stream_close(s);                                /* 必須。別スレッドに渡して後で閉じてもよい */
+    return 0;
+}
+/* 要求本文を届いた順に読む: veil_register_route_ex(..., VEIL_ROUTE_STREAM_BODY) と */
+int64_t n; uint8_t buf[16384];
+while ((n = veil_request_body_read(req, buf, sizeof buf)) > 0) { /* ... */ }
+```
+
+### gRPC
+
+```c
+static int say_hello(veil_grpc_call_t *call, void *ud) {
+    const uint8_t *msg; size_t len;
+    if (veil_grpc_recv(call, &msg, &len) != 1) {
+        veil_grpc_set_status(call, 3, "missing request");     /* INVALID_ARGUMENT */
+        return 0;
+    }
+    /* msg を復号して応答を符号化 */
+    veil_grpc_send(call, out, out_len);
+    return 0;                                            /* veil_grpc_set_status の状態（未設定なら OK）で終える */
+}
+veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL);
+veil_register_grpc_health(cfg);                          /* grpc.health.v1.Health */
+```
+
+- `veil_grpc_recv`: 1 = 受け取った（ポインタは次の recv かコールバックの終わりまで有効）、0 = 終わり、負 = エラー。
+- 単項・クライアントストリーミングの `veil_grpc_send` は 1 回だけ（2 回目は `VEIL_ERR_STATE`）。
+- メタデータ・期限: `veil_grpc_metadata`・`veil_grpc_method`・`veil_grpc_deadline_ms`。応答ヘッダ・トレーラ:
+  `veil_grpc_set_header`・`veil_grpc_set_trailer`。
+- 圧縮・期限・gRPC-Web・`[api] grpc_*` の設定は Rust のハンドラと同じで、HTTP/2・HTTP/3 の両方で動きます。
+
+### L4（TCP・UDP）
+
+```c
+static int on_data(veil_l4_conn_t *c, const uint8_t *d, size_t n, void *ud) { return veil_l4_write(c, d, n); }
+static const veil_l4_tcp_callbacks_t cb = { .on_data = on_data };
+veil_register_l4_tcp(cfg, "echo", "127.0.0.1:7000", &cb, NULL);
+```
+
+コールバックはハンドラ用プールで、接続ごとに 1 つずつ順に呼ばれます（`veil_l4_write`・`veil_l4_close` はコールバックの中でだけ）。
+接続ごとのデータは `veil_l4_set_conn_data` / `veil_l4_conn_data`。UDP は `veil_register_l4_udp` のコールバックで
+`veil_l4_reply` を呼ぶと応答します。
+
+### 所有権
+
+| 対象 | 規則 |
+|------|------|
+| `veil_stream_t *` | `veil_stream_close` で必ず閉じる（閉じるまで応答は終わらない）。コールバックの後も別スレッドで使える。 |
+| `veil_grpc_call_t *` / `veil_l4_conn_t *` / `veil_l4_reply_t *` | コールバックの中でだけ有効。 |
+| `VEIL_ROUTE_INLINE` のルート | ストリーミング・本文の読み取りは使えない（`VEIL_ERR_STATE` / `NULL`）。 |
+
 ## エラーコード
 
 | 値 | 名前 | 意味 |
@@ -68,6 +132,8 @@ veil_run(cfg);                                      /* 停止までブロック�
 | -2 | `VEIL_ERR_CONFIG` | 設定の読み込み・上書きの失敗 |
 | -3 | `VEIL_ERR_RUNTIME` | 起動・実行時のエラー（ルート衝突、ポート使用中 など） |
 | -4 | `VEIL_ERR_UTF8` | 文字列が UTF-8 ではない |
+| -5 | `VEIL_ERR_CLOSED` | 相手が切断した・ストリームが閉じている（F-210） |
+| -6 | `VEIL_ERR_STATE` | 呼べない状態（INLINE でのストリーミング・単項の 2 回目の送信等） |
 
 理由は `veil_last_error()` で取れます。
 

@@ -734,6 +734,27 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 `VEIL_OVERRIDE_<n>` も通常どおり効きます。詳細（所有権の表・エラーコード・API 一覧）は
 [crates/veil-capi/README.md](../../../crates/veil-capi/README.md)、サンプルは [examples/api/c-hello/](../../../examples/api/c-hello/) です。
 
+**ストリーミング・gRPC・L4（F-210）。** C API も Rust と同じ機能を持ちます。veil はバイト列を運ぶだけで、メッセージの
+直列化は好きなライブラリ（protobuf-c・nanopb・upb 等）で行います。
+
+- 応答のストリーミング: `veil_stream_t *s = veil_response_stream(resp)` はそれまでに設定したステータスとヘッダを送り、
+  コールバックから戻った後も使えるハンドルを返します（別スレッドで書き続けてもかまいません）。`veil_stream_write`
+  （複製する。満杯なら待つ。切断後は `VEIL_ERR_CLOSED`）・`veil_stream_set_trailer`・`veil_stream_close`（必須。本文を終えて解放）。
+- 要求本文: `veil_request_body_read(req, buf, cap)` で次の断片を読みます（0 で終わり）。ルートのフラグ
+  `VEIL_ROUTE_STREAM_BODY` を付けると、本文が届く前にコールバックを呼び、届いた順に返します。
+- gRPC: `veil_register_grpc(cfg, "/pkg.Svc/Method", VEIL_GRPC_UNARY | ..._SERVER_STREAMING | ..._CLIENT_STREAMING | ..._BIDI, fn, ud)`。
+  コールバックの中で `veil_grpc_recv` / `veil_grpc_send`（符号化済みのバイト列）・`veil_grpc_set_status`・
+  `veil_grpc_set_header` / `_set_trailer`・`veil_grpc_metadata`・`veil_grpc_deadline_ms`。
+  `veil_register_grpc_health(cfg)` で `grpc.health.v1.Health` を足します。圧縮・期限・gRPC-Web・`[api] grpc_*` のキーは
+  Rust のハンドラと同じで、HTTP/2・HTTP/3 の両方で動きます。
+- L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)`（`on_connect` / `on_data` / `on_close`。ハンドラ用プールで
+  接続ごとに 1 つずつ順に呼ばれ、`veil_l4_write` / `veil_l4_close` はコールバックの中で）と
+  `veil_register_l4_udp(cfg, name, listen, fn, ud)`（`veil_l4_reply` でデータグラムに応答）。
+- ストリーミングの関数は `VEIL_ROUTE_INLINE` のルートでは使えません（`VEIL_ERR_STATE`）。
+
+全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
+相互運用試験を通ります）。
+
 ## Python
 
 `crates/veil-python` は PyO3 の拡張（abi3、Python 3.9 以上）で、`veil` として import します。
@@ -767,11 +788,31 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
   純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
 - **サーバの中では**、ハンドラに Rust 側の要求（`veil._veil.NativeRequest`。`isinstance` では `veil.Request`）が渡ります。属性・メソッドは同じで、ハンドラが読んだ属性だけを作ります。よくある戻り値（`str`・`bytes`・`dict`/`list`・`None`・`veil.Response`）は Rust で本文を複製せずに応答にします（F-212）。`async def` のハンドラはハンドラ用プールのスレッドごとに 1 つのイベントループで動きます。Python 3.9 以上が必要です。
+- **ストリーミング（F-210）。** ジェネレータ・非同期ジェネレータを返す（`text/plain` で断片ごとに送る）か、
+  `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`、Server-Sent Events なら `veil.EventSourceResponse(iterable)`
+  （要素は文字列・JSON にできる値・`{"event", "data", "id", "retry"}` の dict）。`@veil.post(..., stream_body=True)` は本文が
+  届く前にハンドラを呼び、`for chunk in request.stream()` で届いた順に読みます（`async def` でも使えます。断片ごとにプールの
+  スレッドで待ちます）。
+- **gRPC（F-210）** は `veil.grpc`（依存なし）: `@veil.grpc.unary_unary("/pkg.Svc/Method",
+  request_deserializer=Req.FromString, response_serializer=Resp.SerializeToString)` と `unary_stream`・`stream_unary`・
+  `stream_stream`。引数名は grpcio と同じなので直列化は何でも使えます（protobuf・betterproto・JSON、省略すると `bytes` のまま）。
+  `context` は grpcio の `ServicerContext` の主要なメソッド（`abort`・`set_code`・`set_details`・`invocation_metadata`・
+  `send_initial_metadata`・`set_trailing_metadata`・`time_remaining`・`is_active`）を持ちます。`pip install veil-api[grpc]` を
+  入れると `grpc_tools.protoc` の生成コードがそのまま動きます: `veil.grpc.Server()` を `add_<Service>Servicer_to_server` に渡し、
+  `server.add_insecure_port(...)`・`server.wait_for_termination()`。`veil.grpc.add_health()` で `grpc.health.v1.Health`。
+  `async def` のメソッドと非同期ジェネレータも使えます。
+- **L4（F-210）:** `veil.Protocol` のサブクラスに `@veil.l4_tcp(name, listen)`（asyncio と同じ `connection_made` /
+  `data_received` / `connection_lost`。`self.transport.write` はコールバックの中で）、`def f(data, peer) -> bytes | None` に
+  `@veil.l4_udp(name, listen)`。
+- **GraphQL:** 好きなライブラリを普通のルートとして載せます。[examples/api/python-graphql/](../../../examples/api/python-graphql/)
+  は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは
 [examples/api/python-hello/](../../../examples/api/python-hello/)・
-[examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/) です。
+[examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/)・
+[examples/api/python-features/](../../../examples/api/python-features/)（ストリーミング・L4）・
+[examples/api/python-grpc/](../../../examples/api/python-grpc/)（grpcio の生成コードと基本の層）です。
 
 ## ライブラリ成果物のビルド
 
@@ -874,8 +915,7 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 
 ## 制限事項
 
-- gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。C/Python の
-  gRPC ハンドラはまだありません（F-210）。
+- gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります

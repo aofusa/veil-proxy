@@ -16,6 +16,8 @@ use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use veil::api::bridge::HandlerContext;
 use veil::api::{Request, Response};
 
 fn lossy(b: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -32,6 +34,8 @@ pub struct NativeRequest {
     params: GILOnceCell<Py<PyDict>>,
     client_ip: GILOnceCell<Py<PyString>>,
     query_params: GILOnceCell<Py<PyAny>>,
+    /// ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0。F-210）
+    pub(crate) ctx: AtomicUsize,
 }
 
 impl NativeRequest {
@@ -44,7 +48,23 @@ impl NativeRequest {
             params: GILOnceCell::new(),
             client_ip: GILOnceCell::new(),
             query_params: GILOnceCell::new(),
+            ctx: AtomicUsize::new(0),
         }
+    }
+
+    /// 要求本文の次の断片（ストリーミング受信のルートで、ハンドラの呼び出しの間だけ。GIL を外して待つ）。
+    fn read_chunk(&self, py: Python<'_>) -> Option<Bytes> {
+        let p = self.ctx.load(Ordering::Acquire);
+        if p == 0 {
+            return None;
+        }
+        // SAFETY: ctx はこの要求を処理しているプールのスレッドの `call_blocking` の閉包が持つ `HandlerContext` で、
+        // 呼び出しが終わる前に 0 へ戻す（`lib.rs::call_python`）。同じスレッドからしか使わない。
+        let ctx = unsafe { &mut *(p as *mut HandlerContext) };
+        if !ctx.has_body_stream() {
+            return None;
+        }
+        py.allow_threads(|| ctx.read_body())
     }
 }
 
@@ -54,6 +74,9 @@ struct Helpers {
     dumps: Py<PyAny>,
     loads: Py<PyAny>,
     response_type: Py<PyAny>,
+    /// `veil.StreamingResponse`・`veil._stream_of`（ジェネレータ等をストリーミングの応答にする。F-210）
+    streaming_type: Py<PyAny>,
+    stream_of: Py<PyAny>,
 }
 
 static HELPERS: GILOnceCell<Helpers> = GILOnceCell::new();
@@ -66,6 +89,8 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
             dumps: veil.getattr("_dumps")?.unbind(),
             loads: py.import("json")?.getattr("loads")?.unbind(),
             response_type: veil.getattr("Response")?.unbind(),
+            streaming_type: veil.getattr("StreamingResponse")?.unbind(),
+            stream_of: veil.getattr("_stream_of")?.unbind(),
         })
     })
 }
@@ -185,6 +210,14 @@ impl NativeRequest {
         Ok(q)
     }
 
+    /// 要求本文を届いた順に返す反復子（`stream_body=True` のルート。それ以外は全量の本文を 1 回）。
+    fn stream(slf: Bound<'_, Self>) -> NativeBodyIter {
+        NativeBodyIter {
+            req: slf.unbind(),
+            whole_done: false,
+        }
+    }
+
     fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         helpers(py)?.loads.call1(py, (self.body(py),))
     }
@@ -195,6 +228,37 @@ impl NativeRequest {
 
     fn __repr__(&self) -> String {
         format!("<veil.Request {} {}>", self.req.method(), self.req.path())
+    }
+}
+
+/// `NativeRequest.stream()` の反復子。
+#[pyclass(name = "NativeBodyIter", module = "veil._veil")]
+pub struct NativeBodyIter {
+    req: Py<NativeRequest>,
+    whole_done: bool,
+}
+
+#[pymethods]
+impl NativeBodyIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyBytes>> {
+        let r = self.req.borrow(py);
+        let streaming = {
+            let p = r.ctx.load(Ordering::Acquire);
+            // SAFETY: read_chunk と同じ
+            p != 0 && unsafe { (*(p as *mut HandlerContext)).has_body_stream() }
+        };
+        if streaming {
+            return r.read_chunk(py).map(|b| PyBytes::new(py, &b).unbind());
+        }
+        if self.whole_done || r.req.body().is_empty() {
+            return None;
+        }
+        self.whole_done = true;
+        Some(r.body(py))
     }
 }
 
@@ -299,6 +363,7 @@ pub fn to_response(
     result: Bound<'_, PyAny>,
     status: u16,
     fallback: &Py<PyAny>,
+    ctx: Option<&mut HandlerContext>,
 ) -> PyResult<Response> {
     let ok = |ct: &'static [u8], body: Bytes| {
         Response::new(status)
@@ -326,8 +391,17 @@ pub fn to_response(
         return Ok(ok(CT_JSON, backed(body.bind(py))?));
     }
     let h = helpers(py)?;
+    // ストリーミング（`StreamingResponse`・ジェネレータ・非同期ジェネレータ。F-210）
+    if result.is_instance(h.streaming_type.bind(py))? {
+        return stream_response(py, &result, ctx);
+    }
     let resp = if result.is_instance(h.response_type.bind(py))? {
         result
+    } else if let Some(sr) = {
+        let s = h.stream_of.call1(py, (result.clone(), status))?;
+        (!s.is_none(py)).then(|| s.into_bound(py))
+    } {
+        return stream_response(py, &sr, ctx);
     } else {
         // タプル・bytearray・pydantic のモデル等は Python の変換規則に任せる
         fallback.call1(py, (result,))?.into_bound(py)
@@ -422,6 +496,93 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
 pub fn _json_fast(v: Bound<'_, PyAny>) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     json_fast(&v, &mut out, 0).then_some(out)
+}
+
+/// `veil.StreamingResponse` を送る。ハンドラ用プールなら本文を断片ごとに送り（GIL を外して書く）、
+/// INLINE（`offload=False`）なら全部集めて 1 つの本文にする。
+fn stream_response(
+    py: Python<'_>,
+    sr: &Bound<'_, PyAny>,
+    ctx: Option<&mut HandlerContext>,
+) -> PyResult<Response> {
+    let mut head = response_object_head(sr)?;
+    let it = sr.call_method0(pyo3::intern!(py, "_iter"))?;
+    let Some(ctx) = ctx else {
+        let mut body = Vec::new();
+        for item in it.try_iter()? {
+            body.extend_from_slice(&to_chunk(item?)?);
+        }
+        return Ok(head.with_body(body));
+    };
+    let trailers = sr.getattr(pyo3::intern!(py, "trailers")).ok();
+    let Some(writer) = ctx.start_stream(std::mem::replace(&mut head, Response::new(200))) else {
+        return Ok(Response::new(500));
+    };
+    let mut closed = false;
+    for item in it.try_iter()? {
+        let b = to_chunk(item?)?;
+        if b.is_empty() {
+            continue;
+        }
+        if !py.allow_threads(|| writer.write(b)) {
+            closed = true;
+            break;
+        }
+    }
+    if closed {
+        // クライアントが切断した: ジェネレータを閉じる（finally 節を走らせる）
+        let _ = it.call_method0(pyo3::intern!(py, "close"));
+        return Ok(Response::new(200));
+    }
+    let mut t = Vec::new();
+    if let Some(tr) = trailers.filter(|t| !t.is_none()) {
+        for item in tr.try_iter()? {
+            let item = item?;
+            let tup = item.downcast::<PyTuple>()?;
+            let n: PyBackedStr = tup.get_item(0)?.extract()?;
+            let v: PyBackedStr = tup.get_item(1)?.extract()?;
+            t.push((
+                Bytes::copy_from_slice(n.to_ascii_lowercase().as_bytes()),
+                Bytes::copy_from_slice(v.as_bytes()),
+            ));
+        }
+    }
+    if t.is_empty() {
+        drop(writer);
+    } else {
+        py.allow_threads(|| writer.finish_with_trailers(t));
+    }
+    Ok(Response::new(200))
+}
+
+/// 断片を `Bytes` にする（`bytes` は複製しない、`str` は UTF-8、`bytearray`・`memoryview` は複製）。
+fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
+    if let Ok(s) = item.downcast::<PyString>() {
+        let s: PyBackedStr = s.extract()?;
+        return Ok(Bytes::from_owner(PyStrOwner(s)));
+    }
+    if item.is_instance_of::<PyBytes>() {
+        return backed(&item);
+    }
+    let v: Vec<u8> = item.extract()?;
+    Ok(Bytes::from(v))
+}
+
+/// `status`・`headers` だけを読む（ストリーミングの head）。
+fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
+    let status: u16 = resp
+        .getattr(pyo3::intern!(resp.py(), "status"))?
+        .extract()?;
+    let mut r = Response::new(status);
+    let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
+    for item in headers.try_iter()? {
+        let item = item?;
+        let t = item.downcast::<PyTuple>()?;
+        let n: PyBackedStr = t.get_item(0)?.extract()?;
+        let v: PyBackedStr = t.get_item(1)?.extract()?;
+        r = r.with_header(known_header(&n), Bytes::copy_from_slice(v.as_bytes()));
+    }
+    Ok(r)
 }
 
 /// Python の `veil.Response`（`status`・`headers`・`body`）を応答にする。

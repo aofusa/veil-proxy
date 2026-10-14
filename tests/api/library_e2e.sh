@@ -301,6 +301,77 @@ run_python() {
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_binding.py) >/dev/null 2>&1 && ok "unit tests" || bad "unit tests"
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
+  run_python_f210 "$PY"
+}
+
+py_stop() { # py_stop <pid>（Windows の venv の python はランチャなので子ごと止める）
+  if [ "$OS" = Windows ]; then taskkill //F //T //PID "$(cat /proc/$1/winpid 2>/dev/null || echo $1)" >/dev/null 2>&1 || kill "$1"
+  else kill "$1"; fi
+}
+
+run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio の層）・GraphQL（F-210）
+  local PY="$1" EX="$ROOT/examples/api"
+  echo "== Python: streaming / L4 / gRPC / GraphQL (F-210)"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P L4 U; P=$(free_port); L4=$(free_port); U=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" VEIL_L4_TCP="127.0.0.1:$L4" VEIL_L4_UDP="127.0.0.1:$U" "$PY" "$EX/python-features/app.py" > "$W/f.log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  if wait_port "$P" "$PID"; then
+    local B="http://127.0.0.1:$P"
+    expect "py generator streaming" "line 3" curl -s -N "$B/stream"
+    expect "py SSE" 'data: {"n":3}' curl -s -N "$B/sse"
+    expect "py async generator + trailer (h2c)" "x-parts: 3" bash -c "curl -s -i --http2-prior-knowledge '$B/async-stream' | tr A-Z a-z"
+    expect "py streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
+    expect "py L4 TCP echo" "py-tcp" l4_echo tcp "$L4" py-tcp
+    expect "py L4 UDP echo" "echo:py-udp" l4_echo udp "$U" py-udp
+  else
+    bad "python-features start"; cat "$W/f.log"
+  fi
+  py_stop "$PID"
+  # gRPC: メッセージの生成は grpc_tools（入れば）か protoc + protobuf
+  "$PY" -m pip -q install protobuf >/dev/null 2>&1
+  local GEN="$W/gen"; mkdir -p "$GEN"; local have_grpcio=0
+  if "$PY" -m pip -q install grpcio grpcio-tools >/dev/null 2>&1 && \
+     "$PY" -m grpc_tools.protoc -I "$EX/rust-grpc/proto" --python_out="$GEN" --grpc_python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" 2>/dev/null; then
+    have_grpcio=1
+  else
+    "${PROTOC:-protoc}" -I "$EX/rust-grpc/proto" --python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" || { bad "generate demo_pb2"; return; }
+  fi
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
+  local modes="plain"; [ "$have_grpcio" = 1 ] && modes="plain grpcio"
+  local mode
+  for mode in $modes; do
+    local GP GS; GP=$(free_port); GS=$(free_port)
+    GEN_DIR="$GEN" VEIL_GRPC_MODE=$mode VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
+      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+    local GPID=$!; PIDS+=("$GPID")
+    wait_port "$GP" "$GPID" || { bad "python-grpc ($mode) start"; cat "$W/g.log"; continue; }
+    local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$GP" --h3 "127.0.0.1:$GS" 2>&1)"
+    local rc=$?
+    echo "$out" | sed 's/^/  /'
+    [ "$rc" = 0 ] && ok "py gRPC interop ($mode)" || bad "py gRPC interop ($mode, exit $rc)"
+    py_stop "$GPID"
+  done
+  [ "$have_grpcio" = 1 ] || echo "  skip py gRPC (grpcio layer): grpcio is not installable here"
+  # GraphQL（strawberry。入らない環境では飛ばす）
+  if "$PY" -m pip -q install strawberry-graphql >/dev/null 2>&1; then
+    local QP; QP=$(free_port)
+    VEIL_LISTEN="127.0.0.1:$QP" "$PY" "$EX/python-graphql/app.py" > "$W/q.log" 2>&1 &
+    local QPID=$!; PIDS+=("$QPID")
+    if wait_port "$QP" "$QPID"; then
+      local QB="http://127.0.0.1:$QP/graphql" J='content-type: application/json'
+      expect "py GraphQL query" '{"data":{"add":3}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
+      expect "py GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
+      expect "py GraphQL subscription (SSE)" "event: complete" curl -s -N -X POST "$QB" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(start: 2) }"}'
+    else
+      bad "python-graphql start"; cat "$W/q.log"
+    fi
+    py_stop "$QPID"
+  else
+    echo "  skip py GraphQL: strawberry-graphql is not installable here"
+  fi
 }
 
 run_grpc() {

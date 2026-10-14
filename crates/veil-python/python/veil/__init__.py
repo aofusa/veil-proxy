@@ -30,6 +30,9 @@ __all__ = [
     "JSONResponse",
     "HTTPException",
     "Headers",
+    "StreamingResponse",
+    "EventSourceResponse",
+    "Protocol",
     "route",
     "get",
     "post",
@@ -126,6 +129,12 @@ class Request(metaclass=abc.ABCMeta):
     def text(self):
         return self.body.decode("utf-8", errors="replace")
 
+    def stream(self):
+        """本文を届いた順に返す反復子（サーバの中で ``stream_body=True`` のルートなら届いた断片ごと。
+        ここでは全量を 1 回）。"""
+        if self.body:
+            yield self.body
+
 
 def _query_params(query):
     """クエリの辞書（同名キーは最初の値）。``Request.query_params`` と ``NativeRequest`` が共有する。"""
@@ -176,6 +185,95 @@ class Response:
 
     def _triple(self):
         return (self.status, self.headers, self.body)
+
+
+def _aiter_sync(agen):
+    """非同期反復子を、スレッドのイベントループで回す同期の反復子にする（F-210）。"""
+    it = agen.__aiter__()
+    while True:
+        try:
+            yield _run_coro(it.__anext__())
+        except StopAsyncIteration:
+            return
+
+
+class StreamingResponse(Response):
+    """本文を断片ごとに送る応答（F-210）。``content`` は bytes・str を返す反復子・ジェネレータ・非同期反復子。
+    サーバの中では断片が届いた順にクライアントへ送られる（ハンドラ用プールのスレッドで反復する）。
+    ``trailers`` は本文の後に送るトレーラ（``[(name, value)]``）。"""
+
+    def __init__(self, content, status=200, headers=None, media_type=None, trailers=None):
+        super().__init__(b"", status, headers, media_type)
+        self.content = content
+        self.trailers = list(trailers) if trailers else None
+
+    def _iter(self):
+        c = self.content
+        if hasattr(c, "__aiter__"):
+            return _aiter_sync(c)
+        return iter(c)
+
+    @property
+    def body(self):
+        """本文全体（単体テスト・``offload=False`` 用。サーバの中のストリーミングでは使わない）。"""
+        if self._body is None:
+            self._body = b"".join(x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in self._iter())
+        return self._body
+
+    @body.setter
+    def body(self, v):
+        self._body = None if v == b"" else v
+
+
+def _sse_event(item):
+    if isinstance(item, dict) and set(item) <= {"event", "data", "id", "retry"} and "data" in item:
+        out = []
+        for k in ("event", "id", "retry"):
+            if k in item:
+                out.append("%s: %s\n" % (k, item[k]))
+        data = item["data"]
+        if not isinstance(data, str):
+            data = _dumps(data).decode()
+        out.extend("data: %s\n" % line for line in data.split("\n"))
+        return "".join(out) + "\n"
+    if not isinstance(item, str):
+        item = _dumps(item).decode()
+    return "".join("data: %s\n" % line for line in item.split("\n")) + "\n"
+
+
+class EventSourceResponse(StreamingResponse):
+    """Server-Sent Events（``text/event-stream``）。各要素は str（``data:`` 行）・JSON にできる値、または
+    ``{"event": ..., "data": ..., "id": ..., "retry": ...}``。"""
+
+    def __init__(self, content, status=200, headers=None):
+        super().__init__(content, status, headers, "text/event-stream")
+        hs = [k.lower() for k, _ in self.headers]
+        if "cache-control" not in hs:
+            self.headers.append(("cache-control", "no-cache"))
+
+    def _iter(self):
+        return (_sse_event(x) for x in super()._iter())
+
+
+def _stream_of(result, status):
+    """ジェネレータ・非同期ジェネレータを返したハンドラをストリーミングの応答にする（Rust から呼ぶ）。"""
+    if inspect.isgenerator(result) or inspect.isasyncgen(result):
+        return StreamingResponse(result, status, media_type="text/plain; charset=utf-8")
+    return None
+
+
+class Protocol:
+    """L4（TCP）のハンドラ（asyncio.Protocol と同じ名前のメソッド。F-210）。接続ごとに 1 つ作られ、
+    コールバックはハンドラ用プールのスレッドで 1 つずつ順に呼ばれる。``transport.write`` はコールバックの中でだけ。"""
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data):
+        pass
+
+    def connection_lost(self, exc):
+        pass
 
 
 class JSONResponse(Response):
@@ -434,8 +532,9 @@ def _is_validation_error(exc):
 class Route:
     """登録された 1 ルート。``handle()`` は Rust 非依存で単体テストできる。"""
 
-    def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code):
+    def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False):
         self.func = func
+        self.stream_body = stream_body
         self.path = path
         self.methods = [m.upper() for m in methods]
         self.offload = offload
@@ -528,6 +627,9 @@ class Route:
         extra = None
         if isinstance(result, Response):
             return result
+        stream = _stream_of(result, status)
+        if stream is not None:
+            return stream
         if isinstance(result, tuple) and len(result) in (2, 3):
             if len(result) == 3:
                 result, status, extra = result
@@ -730,12 +832,48 @@ class App:
         self.title = title
         self.version = version
         self.routes = []
+        self.grpc_methods = []  # (path, handler)  handler.handle(call) -> (code, message)
+        self.grpc_health = False
+        self.l4 = []  # ("tcp" | "udp", name, listen, factory_or_func)
 
-    def route(self, path, methods=None, offload=True, body_constraints=None, tags=None, summary=None, status_code=200):
+    def route(
+        self,
+        path,
+        methods=None,
+        offload=True,
+        body_constraints=None,
+        tags=None,
+        summary=None,
+        status_code=200,
+        stream_body=False,
+    ):
+        """``stream_body=True`` なら要求本文を溜めずにハンドラを呼び、``req.stream()`` で届いた順に読める（F-210）。"""
+
         def deco(func):
             self.routes.append(
-                Route(func, path, methods or ["GET"], offload, body_constraints, tags, summary, status_code)
+                Route(func, path, methods or ["GET"], offload, body_constraints, tags, summary, status_code, stream_body)
             )
+            return func
+
+        return deco
+
+    # ---- L4（F-210） ----
+
+    def l4_tcp(self, name, listen):
+        """TCP リスナー ``listen`` を開き、接続ごとに ``factory()``（``veil.Protocol`` の派生クラス等）で処理する。"""
+
+        def deco(factory):
+            self.l4.append(("tcp", name, listen, factory))
+            return factory
+
+        return deco
+
+    def l4_udp(self, name, listen):
+        """UDP リスナー ``listen`` を開き、データグラムごとに ``func(data: bytes, peer: (host, port))`` を呼ぶ
+        （bytes を返すと送信元へ返信）。"""
+
+        def deco(func):
+            self.l4.append(("udp", name, listen, func))
             return func
 
         return deco
@@ -832,7 +970,17 @@ class App:
         for r in self.routes:
             hid = len(_HANDLERS)
             _HANDLERS.append(r)
-            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code)
+            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code, r.stream_body)
+        for path, handler in self.grpc_methods:
+            hid = len(_HANDLERS)
+            _HANDLERS.append(handler)
+            _veil.register_grpc(path, hid)
+        if self.grpc_health:
+            _veil.register_grpc_health()
+        for kind, name, listen, f in self.l4:
+            hid = len(_HANDLERS)
+            _HANDLERS.append(f)
+            (_veil.register_l4_tcp if kind == "tcp" else _veil.register_l4_udp)(name, listen, hid)
         _veil.run(cfg, _HANDLERS)
 
 
@@ -845,6 +993,8 @@ put = _default_app.put
 delete = _default_app.delete
 patch = _default_app.patch
 run = _default_app.run
+l4_tcp = _default_app.l4_tcp
+l4_udp = _default_app.l4_udp
 
 
 def shutdown():
