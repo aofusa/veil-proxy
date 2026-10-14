@@ -27,3 +27,7 @@ veil を Kubernetes のサイドカーコンテナとしてデプロイし、Ist
   VDS でのルート追加、SIGTERM から 1 秒以内の停止）が ALL OK。
 - 見つけた落とし穴: Service の `appProtocol: http` を Linkerd は HTTP/1.1 固定と解釈し h2c が壊れる（付けない）。
   デモの whoami は PID 1 で SIGTERM を無視するため Pod の終了は猶予いっぱいかかる（veil 自体は 1 秒以内）。
+
+## その後
+
+メッシュのプロキシ（Istio の Envoy・Linkerd の linkerd2-proxy）そのものを veil に置き換える計画は F-215（子 F-216〜F-225）。

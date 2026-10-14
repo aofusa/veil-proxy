@@ -64,3 +64,10 @@ kind のクラスタを作り、イメージを読み込み、メッシュを導
 Secret の証明書での TLS と Secret 更新での差し替え、`VEIL_OVERRIDE_<n>`、VDS でのルート追加（メッシュ越しの gRPC ストリーム、制御プレーン再起動後の再接続）、SIGTERM 後の
 graceful shutdown を確かめる。docker・kind・kubectl・istioctl・linkerd・openssl が必要。snap 版 docker は `/tmp` を
 読めないため、一時ファイルは `target/tmp` に置く。
+
+## 今後: veil をメッシュのプロキシにする
+
+上の構成ではメッシュのプロキシ（Istio は Envoy、Linkerd は linkerd2-proxy）が veil の隣に残ります。そのプロキシ自体を
+veil に置き換える計画（istiod・Linkerd の制御プレーンは無改造、veil と本家のプロキシの混在、musl 版のイメージ、
+メッシュを使わない既存のプロキシの性能を退行させない）は F-215（`docs/backlog/features/F-215-service-mesh-dataplane.md`、
+子チケット F-216〜F-225）にあります。
