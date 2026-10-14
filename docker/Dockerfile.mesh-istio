@@ -1,0 +1,16 @@
+# Istio のサイドカー・ゲートウェイ用イメージ（F-222）: istio/proxyv2 の Envoy を veil（musl 版）に差し替える。
+#
+# pilot-agent・iptables（istio-init）・ブートストラップのテンプレートは istio/proxyv2 のものをそのまま使い、
+# pilot-agent が起動する `/usr/local/bin/envoy`（ProxyConfig.binaryPath の既定）だけを veil にする。
+# veil は docker/Dockerfile.musl で `mesh-istio` を有効にしてビルドした静的リンクのバイナリ。
+#
+#   docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=mesh-istio,epoll -t veil:musl-mesh .
+#   docker build -f docker/Dockerfile.mesh-istio -t veil-istio-proxy:1.31.1 .
+#
+# 注入: Pod の注釈 `sidecar.istio.io/proxyImage: veil-istio-proxy:1.31.1`（または istioctl install の
+# `--set values.global.proxy.image=...`）。
+ARG ISTIO_PROXY_IMAGE=docker.io/istio/proxyv2:1.31.1
+ARG VEIL_IMAGE=veil:musl-mesh
+FROM ${VEIL_IMAGE} AS veil
+FROM ${ISTIO_PROXY_IMAGE}
+COPY --from=veil /veil /usr/local/bin/envoy

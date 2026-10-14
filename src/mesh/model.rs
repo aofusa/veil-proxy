@@ -348,6 +348,8 @@ pub enum HttpFilterCfg {
     Fault(Arc<FaultCfg>),
     Cors,
     Rbac(Arc<crate::mesh::model::RbacCfg>),
+    /// JWT の検証（Istio の RequestAuthentication。F-220）
+    Jwt(Arc<crate::mesh::jwt::JwtCfg>),
 }
 
 /// ルート表への参照（RDS の名前で共有するスロットか、インライン）。
@@ -774,11 +776,43 @@ pub enum RbacPrincipal {
     DirectRemoteIp(Cidr),
     RemoteIp(Cidr),
     Header(HeaderMatch),
-    /// JWT 等のメタデータ（`istio_authn` の `request.auth.principal` 等）
+    /// JWT 等のメタデータ（`envoy.filters.http.jwt_authn` の `payload.iss` 等）
     Metadata {
-        key: String,
-        value: StringMatcher,
+        filter: String,
+        path: Vec<String>,
+        value: MetaMatch,
     },
+}
+
+/// メタデータの値の照合（Envoy の `ValueMatcher`）。
+#[derive(Debug)]
+pub enum MetaMatch {
+    Str(StringMatcher),
+    /// 配列のいずれかの要素が一致
+    List(Box<MetaMatch>),
+    Or(Vec<MetaMatch>),
+    Present(bool),
+    Bool(bool),
+    /// 評価できない（一致しない）
+    Never,
+}
+
+impl MetaMatch {
+    pub fn matches(&self, v: Option<&serde_json::Value>) -> bool {
+        match self {
+            MetaMatch::Present(p) => v.is_some() == *p,
+            MetaMatch::Never => false,
+            MetaMatch::Or(list) => list.iter().any(|m| m.matches(v)),
+            MetaMatch::Str(m) => {
+                matches!(v, Some(serde_json::Value::String(s)) if m.matches(s.as_bytes()))
+            }
+            MetaMatch::Bool(b) => matches!(v, Some(serde_json::Value::Bool(x)) if x == b),
+            MetaMatch::List(inner) => match v {
+                Some(serde_json::Value::Array(a)) => a.iter().any(|e| inner.matches(Some(e))),
+                _ => false,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

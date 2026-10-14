@@ -149,6 +149,9 @@ pub struct Forward {
     /// フォルト注入の遅延
     pub delay: Option<Duration>,
     pub cors: Option<Arc<CorsCfg>>,
+    /// JWT の検証で決まった要求ヘッダの変更（トークンの削除・claim のヘッダ）
+    pub jwt_remove: Vec<Bytes>,
+    pub jwt_add: Vec<(Bytes, Bytes)>,
 }
 
 impl Forward {
@@ -161,9 +164,20 @@ impl Forward {
 }
 
 /// RBAC の入力を作って評価する。
-fn rbac_allows(ctx: &ConnCtx, req: &ReqView<'_>, cfg: &RbacCfg) -> bool {
+fn rbac_allows(
+    ctx: &ConnCtx,
+    req: &ReqView<'_>,
+    cfg: &RbacCfg,
+    jwt: &[(String, serde_json::Value)],
+) -> bool {
     let header = |n: &str| req.header(n);
-    let md = |_: &str| -> Vec<String> { Vec::new() };
+    let md = |filter: &str, path: &[String]| -> Option<serde_json::Value> {
+        if filter == "envoy.filters.http.jwt_authn" {
+            super::jwt::lookup(jwt, path).cloned()
+        } else {
+            None
+        }
+    };
     let input = super::xds::rbac::RbacInput {
         header: &header,
         path: req.path,
@@ -188,16 +202,42 @@ fn chance(per_million: u32) -> bool {
 /// 要求からルートを選ぶ（RBAC・フォルト・CORS のプリフライトも含む）。
 pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
     let is_grpc = req.is_grpc();
-    // 認可（HTTP フィルタの順）
+    // 認証・認可（HTTP フィルタの順）
+    let mut jwt = super::jwt::JwtOutcome::default();
     for f in &ctx.hcm.filters {
-        if let HttpFilterCfg::Rbac(r) = f {
-            if !rbac_allows(ctx, req, r) {
-                let mut lr = LocalReply::new(403, ResponseFlag::RbacDenied);
-                if is_grpc {
-                    lr.grpc_status = Some(7);
+        match f {
+            HttpFilterCfg::Jwt(cfg) => {
+                let header = |n: &str| req.header(n);
+                match super::jwt::authenticate(cfg, req.method, req.path, &header) {
+                    Ok(o) => {
+                        jwt.payloads.extend(o.payloads);
+                        jwt.remove_headers.extend(o.remove_headers);
+                        jwt.add_headers.extend(o.add_headers);
+                    }
+                    Err((status, msg)) => {
+                        let mut lr = LocalReply::new(status, ResponseFlag::RbacDenied);
+                        lr.body = Bytes::from_static(msg.as_bytes());
+                        lr.headers.push((
+                            Bytes::from_static(b"www-authenticate"),
+                            Bytes::from_static(b"Bearer realm=\"veil\", error=\"invalid_token\""),
+                        ));
+                        if is_grpc {
+                            lr.grpc_status = Some(16);
+                        }
+                        return Decision::Local(lr);
+                    }
                 }
-                return Decision::Local(lr);
             }
+            HttpFilterCfg::Rbac(r) => {
+                if !rbac_allows(ctx, req, r, &jwt.payloads) {
+                    let mut lr = LocalReply::new(403, ResponseFlag::RbacDenied);
+                    if is_grpc {
+                        lr.grpc_status = Some(7);
+                    }
+                    return Decision::Local(lr);
+                }
+            }
+            _ => {}
         }
     }
     let table = ctx.hcm.routes.load();
@@ -378,6 +418,8 @@ pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
                 hash,
                 delay,
                 cors,
+                jwt_remove: jwt.remove_headers,
+                jwt_add: jwt.add_headers,
             }))
         }
     }
@@ -690,6 +732,13 @@ pub fn upstream_request_headers(
             Bytes::from_static(b"x-envoy-attempt-count"),
             Bytes::copy_from_slice(b.format(attempt).as_bytes()),
         ));
+    }
+    for r in &f.jwt_remove {
+        out.retain(|(k, _)| !k.eq_ignore_ascii_case(r));
+    }
+    for (k, v) in &f.jwt_add {
+        out.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
+        out.push((k.clone(), v.clone()));
     }
     // ヘッダ操作（重み付き → ルート → 仮想ホスト → 表 の順。Envoy は具体的な方を後に適用＝勝つ）
     f.table.request_ops.apply(&mut out);

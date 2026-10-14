@@ -176,7 +176,7 @@ pub struct PathSegment {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ValueMatcher {
-    #[prost(oneof = "value_matcher::Pattern", tags = "3, 4, 5, 6")]
+    #[prost(oneof = "value_matcher::Pattern", tags = "3, 4, 5, 6, 7")]
     pub pattern: Option<value_matcher::Pattern>,
 }
 
@@ -185,6 +185,11 @@ pub mod value_matcher {
     pub struct ListMatcher {
         #[prost(message, optional, boxed, tag = "1")]
         pub one_of: Option<Box<super::ValueMatcher>>,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct OrMatcher {
+        #[prost(message, repeated, tag = "1")]
+        pub value_matchers: Vec<super::ValueMatcher>,
     }
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Pattern {
@@ -196,6 +201,8 @@ pub mod value_matcher {
         PresentMatch(bool),
         #[prost(message, tag = "6")]
         ListMatch(ListMatcher),
+        #[prost(message, tag = "7")]
+        OrMatch(OrMatcher),
     }
 }
 
@@ -336,30 +343,13 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
         Some(I::Header(h)) => RbacPrincipal::Header(header(h)?),
         Some(I::UrlPath(_)) => RbacPrincipal::Any,
         Some(I::Metadata(m)) => {
-            // Istio の JWT（istio_authn の request.auth.principal 等）
-            let key = m
-                .path
-                .iter()
-                .map(|s| s.key.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            let value = match m.value.as_ref().and_then(|v| v.pattern.as_ref()) {
-                Some(value_matcher::Pattern::StringMatch(sm)) => string_matcher(sm)?,
-                Some(value_matcher::Pattern::ListMatch(l)) => {
-                    match l.one_of.as_ref().and_then(|v| v.pattern.as_ref()) {
-                        Some(value_matcher::Pattern::StringMatch(sm)) => string_matcher(sm)?,
-                        _ => return Ok(RbacPrincipal::Not(Box::new(RbacPrincipal::Any))),
-                    }
-                }
-                Some(value_matcher::Pattern::PresentMatch(true)) => StringMatcher {
-                    pattern: StrMatch::Prefix(String::new()),
-                    ignore_case: false,
-                },
-                _ => return Ok(RbacPrincipal::Not(Box::new(RbacPrincipal::Any))),
-            };
             let pr = RbacPrincipal::Metadata {
-                key: format!("{}:{}", m.filter, key),
-                value,
+                filter: m.filter.clone(),
+                path: m.path.iter().map(|s| s.key.clone()).collect(),
+                value: match &m.value {
+                    Some(v) => meta_match(v)?,
+                    None => MetaMatch::Present(true),
+                },
             };
             if m.invert {
                 RbacPrincipal::Not(Box::new(pr))
@@ -369,6 +359,21 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
         }
         Some(I::NotId(n)) => RbacPrincipal::Not(Box::new(princ(n)?)),
         None => RbacPrincipal::Not(Box::new(RbacPrincipal::Any)),
+    })
+}
+
+fn meta_match(v: &ValueMatcher) -> R<MetaMatch> {
+    use value_matcher::Pattern as V;
+    Ok(match &v.pattern {
+        Some(V::StringMatch(sm)) => MetaMatch::Str(string_matcher(sm)?),
+        Some(V::BoolMatch(b)) => MetaMatch::Bool(*b),
+        Some(V::PresentMatch(p)) => MetaMatch::Present(*p),
+        Some(V::ListMatch(l)) => match &l.one_of {
+            Some(inner) => MetaMatch::List(Box::new(meta_match(inner)?)),
+            None => MetaMatch::Never,
+        },
+        Some(V::OrMatch(o)) => MetaMatch::Or(o.value_matchers.iter().map(meta_match).collect::<R<_>>()?),
+        None => MetaMatch::Never,
     })
 }
 
@@ -386,8 +391,8 @@ pub struct RbacInput<'a> {
     pub principal: Option<&'a str>,
     pub direct_remote: Option<std::net::IpAddr>,
     pub remote: Option<std::net::IpAddr>,
-    /// JWT 等のメタデータ（"istio_authn:request.auth.principal" → 値の一覧）
-    pub metadata: &'a dyn Fn(&str) -> Vec<String>,
+    /// フィルタのメタデータ（フィルタ名, パス）→ 値（JWT の payload 等）
+    pub metadata: &'a dyn Fn(&str, &[String]) -> Option<serde_json::Value>,
     /// HTTP の属性を持つか（TCP の RBAC はヘッダ・パスの条件に一致しない）
     pub http: bool,
 }
@@ -437,9 +442,11 @@ fn eval_princ(x: &RbacPrincipal, i: &RbacInput<'_>) -> bool {
             .or(i.direct_remote)
             .is_some_and(|ip| c.contains(ip)),
         RbacPrincipal::Header(h) => i.http && h.matches((i.header)(&h.name).as_deref()),
-        RbacPrincipal::Metadata { key, value } => (i.metadata)(key)
-            .iter()
-            .any(|v| value.matches(v.as_bytes())),
+        RbacPrincipal::Metadata {
+            filter,
+            path,
+            value,
+        } => value.matches((i.metadata)(filter, path).as_ref()),
     }
 }
 
@@ -479,7 +486,7 @@ mod tests {
         principal: Option<&'a str>,
         path: &'a [u8],
         hdr: &'a dyn Fn(&str) -> Option<bytes::Bytes>,
-        md: &'a dyn Fn(&str) -> Vec<String>,
+        md: &'a dyn Fn(&str, &[String]) -> Option<serde_json::Value>,
     ) -> RbacInput<'a> {
         RbacInput {
             header: hdr,
@@ -516,7 +523,7 @@ mod tests {
         };
         let get = |n: &str| (n == ":method").then(|| bytes::Bytes::from_static(b"GET"));
         let post = |n: &str| (n == ":method").then(|| bytes::Bytes::from_static(b"POST"));
-        let md = |_: &str| Vec::new();
+        let md = |_: &str, _: &[String]| None;
         assert!(allowed(
             &cfg,
             &input(
@@ -564,7 +571,7 @@ mod tests {
             )],
         };
         let h = |_: &str| None;
-        let md = |_: &str| Vec::new();
+        let md = |_: &str, _: &[String]| None;
         assert!(!allowed(&cfg, &input(None, b"/admin/x", &h, &md)));
         assert!(allowed(&cfg, &input(None, b"/public?a=/admin", &h, &md)));
     }

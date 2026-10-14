@@ -544,6 +544,11 @@ fn http_cm(
             }
             _ => {}
         }
+        if ty == crate::mesh::jwt::T_JWT || f.name == "envoy.filters.http.jwt_authn" {
+            let any = f.typed_config.as_ref().ok_or("jwt_authn without config")?;
+            filters.push(HttpFilterCfg::Jwt(Arc::new(crate::mesh::jwt::translate(any)?)));
+            continue;
+        }
         if ty.contains("filters.http.rbac") || f.name == "envoy.filters.http.rbac" {
             let any = f.typed_config.as_ref().ok_or("rbac without config")?;
             filters.push(HttpFilterCfg::Rbac(Arc::new(super::rbac::http_rbac(any)?)));

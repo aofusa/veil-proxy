@@ -25,6 +25,7 @@ pub mod l7;
 pub mod http1;
 pub mod httpcore;
 pub mod identity;
+pub mod jwt;
 pub mod model;
 pub mod net;
 pub mod peer;

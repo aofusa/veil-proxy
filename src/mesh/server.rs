@@ -555,7 +555,7 @@ async fn serve_tcp(
     let (principal, _, _) = principal_of(&peer_cert);
     if let Some(r) = &tp.rbac {
         let header = |_: &str| None;
-        let md = |_: &str| Vec::new();
+        let md = |_: &str, _: &[String]| None;
         let input = super::xds::rbac::RbacInput {
             header: &header,
             path: b"",
