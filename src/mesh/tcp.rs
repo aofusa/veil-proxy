@@ -71,11 +71,20 @@ where
 /// 読める平文を既に手元に持っているか（TLS は rustls の中の復号済みの分も含める）。
 pub trait PendingRead {
     fn pending_read(&mut self) -> bool;
+    /// ソケットが可読になった後に呼ぶ。`read` が待たずに返る（平文がある・閉じた）なら `true`。
+    /// TLS は可読でも制御レコード（NewSessionTicket 等）だけのことがあり、そこで `read` すると
+    /// 平文が来るまで待ってしまい、反対方向の転送が止まる。
+    fn fill_ready(&mut self) -> bool {
+        true
+    }
 }
 
 impl PendingRead for super::server::DownStream {
     fn pending_read(&mut self) -> bool {
         self.take_pending_plaintext()
+    }
+    fn fill_ready(&mut self) -> bool {
+        self.fill_plaintext_nonblocking().unwrap_or(true)
     }
 }
 
@@ -84,6 +93,12 @@ impl PendingRead for super::upstream::UpIo {
         match self {
             super::upstream::UpIo::Plain(_) => false,
             super::upstream::UpIo::Tls(s) => s.take_pending_plaintext(),
+        }
+    }
+    fn fill_ready(&mut self) -> bool {
+        match self {
+            super::upstream::UpIo::Plain(_) => true,
+            super::upstream::UpIo::Tls(s) => s.fill_plaintext_nonblocking().unwrap_or(true),
         }
     }
 }
@@ -107,30 +122,40 @@ where
         {
             break;
         }
-        let which = if a_open && a.pending_read() {
+        let pa = a_open && a.pending_read();
+        let pb = !pa && b_open && b.pending_read();
+        let which = if pa {
             Ready::A
-        } else if b_open && b.pending_read() {
+        } else if pb {
             Ready::B
         } else {
-            wait_either(a_fd, b_fd, a_open, b_open, Duration::from_secs(1)).await
+            match wait_either(a_fd, b_fd, a_open, b_open, Duration::from_secs(1)).await {
+                Ready::A if !a.fill_ready() => continue,
+                Ready::B if !b.fill_ready() => continue,
+                r => r,
+            }
         };
         match which {
             Ready::A => match pump(a, b).await {
                 Ok(0) | Err(_) => {
+                    ftlog::debug!("[mesh] tcp relay: downstream closed after {} bytes", ab);
                     a_open = false;
                     half_close(b_fd);
                 }
                 Ok(n) => {
+                    ftlog::debug!("[mesh] tcp relay: {} bytes downstream -> upstream", n);
                     ab += n as u64;
                     last_activity = std::time::Instant::now();
                 }
             },
             Ready::B => match pump(b, a).await {
                 Ok(0) | Err(_) => {
+                    ftlog::debug!("[mesh] tcp relay: upstream closed after {} bytes", ba);
                     b_open = false;
                     half_close(a_fd);
                 }
                 Ok(n) => {
+                    ftlog::debug!("[mesh] tcp relay: {} bytes upstream -> downstream", n);
                     ba += n as u64;
                     last_activity = std::time::Instant::now();
                 }
@@ -143,4 +168,68 @@ where
         }
     }
     (ab, ba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::tcp::TcpStream;
+    use std::io::{Read, Write};
+
+    impl PendingRead for TcpStream {
+        fn pending_read(&mut self) -> bool {
+            false
+        }
+    }
+
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        (c, s)
+    }
+
+    fn to_rt(s: std::net::TcpStream) -> TcpStream {
+        use std::os::fd::IntoRawFd;
+        s.set_nonblocking(true).unwrap();
+        // SAFETY: 所有権を移す
+        unsafe { TcpStream::from_raw_fd(s.into_raw_fd()) }
+    }
+
+    /// 待ちに入ってから届いたデータも両方向に転送する（データが後から来る場合の起床）。
+    #[test]
+    fn relays_late_data_both_ways() {
+        #[cfg(veil_rt_uring)]
+        if crate::runtime::IoUring::new(8, 0).is_err() {
+            return;
+        }
+        let (mut app, a_srv) = pair();
+        let (b_cli, mut echo) = pair();
+        let echo_t = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let n = echo.read(&mut buf).unwrap();
+            echo.write_all(&buf[..n]).unwrap();
+            // 相手が送信側を閉じるまで待つ
+            let _ = echo.read(&mut buf);
+        });
+        let app_t = std::thread::spawn(move || {
+            // 理由付き allow: 試験のスレッド
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(300));
+            app.write_all(b"ping-tcp").unwrap();
+            let mut buf = [0u8; 8];
+            app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            app.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping-tcp");
+            app.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        crate::runtime::block_on(async move {
+            let mut a = to_rt(a_srv);
+            let mut b = to_rt(b_cli);
+            let (ab, ba) = relay(&mut a, &mut b, Duration::from_secs(10)).await;
+            assert_eq!((ab, ba), (8, 8));
+        });
+        app_t.join().unwrap();
+        echo_t.join().unwrap();
+    }
 }

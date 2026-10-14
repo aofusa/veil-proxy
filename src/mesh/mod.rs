@@ -22,6 +22,7 @@ pub mod detect;
 pub mod envoy;
 pub mod h2;
 pub mod l7;
+pub mod mirror;
 pub mod http1;
 pub mod httpcore;
 pub mod identity;

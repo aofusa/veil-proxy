@@ -989,6 +989,9 @@ pub struct RequestMirrorPolicy {
     pub cluster: String,
     #[prost(message, optional, tag = "3")]
     pub runtime_fraction: Option<RuntimeFractionalPercent>,
+    /// Host に `-shadow` を付けない（Istio は true）
+    #[prost(bool, tag = "6")]
+    pub disable_shadow_host_suffix_append: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

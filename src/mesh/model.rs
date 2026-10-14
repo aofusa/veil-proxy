@@ -666,7 +666,8 @@ pub struct ForwardAction {
     pub regex_rewrite: Option<(regex::Regex, String)>,
     pub host_rewrite: Option<Bytes>,
     pub auto_host_rewrite: bool,
-    pub mirrors: Vec<(Arc<ClusterSlot>, u32)>,
+    /// ミラー先（クラスタ, 百万分率, Host に `-shadow` を付けるか）
+    pub mirrors: Vec<(Arc<ClusterSlot>, u32, bool)>,
     pub hash: Vec<HashPolicy>,
     pub websocket: Option<bool>,
 }
@@ -862,6 +863,8 @@ impl ClusterSlot {
 
 #[derive(Debug, Default)]
 pub struct ClusterStats {
+    /// 処理中の要求（サーキットブレーカの上限。`upstream::admit`）
+    pub active_rq: AtomicU64,
     pub upstream_rq_total: AtomicU64,
     pub upstream_cx_total: AtomicU64,
     pub upstream_rq_5xx: AtomicU64,

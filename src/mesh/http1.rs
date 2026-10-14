@@ -755,7 +755,23 @@ where
             }
         };
         let downstream_h2 = false;
-        if l7::upstream_is_h2(&picked.cfg, downstream_h2) && !upgrade {
+        let up_h2 = l7::upstream_is_h2(&picked.cfg, downstream_h2) && !upgrade;
+        let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
+            Ok(a) => a,
+            Err(flag) => {
+                out.status = 503;
+                out.flag = flag;
+                let _ = discard_body(io, acc, framing).await;
+                let _ = write_local(io, &fail(503, flag), is_grpc, ctx, !keep_alive).await;
+                return out;
+            }
+        };
+        if attempt == 1 && !f.action.mirrors.is_empty() {
+            if let Some(n) = body_len {
+                super::mirror::spawn_h1(f, ctx, method, up_path, authority, headers, Bytes::copy_from_slice(&acc[..n]), framing == Framing::Chunked);
+            }
+        }
+        if up_h2 {
             return forward_to_h2(
                 io, acc, ctx, f, &picked, method, up_path, authority, headers, framing, keep_alive,
                 is_grpc, out, origin,

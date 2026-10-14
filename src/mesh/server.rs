@@ -412,6 +412,14 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         transport: Some(transport),
         alpn: &alpn_refs,
     };
+    ftlog::debug!(
+        "[mesh] conn {} -> {} on {} (listener {}, detected {:?})",
+        peer,
+        dst,
+        laddr,
+        target.name,
+        det
+    );
     let Some(chain) = select_chain(&target, &facts).cloned() else {
         ftlog::debug!("[mesh] no filter chain for {} on {}", dst, target.name);
         return;
@@ -611,6 +619,7 @@ async fn serve_tcp(
         );
     }
     picked.begin();
+    ftlog::debug!("[mesh] tcp connecting to {} (tls={})", picked.addr, picked.tls.is_some());
     let mut up = match super::upstream::connect(&picked, super::upstream::Alpn::Tcp).await {
         Ok(u) => u,
         Err(e) => {
@@ -630,6 +639,14 @@ async fn serve_tcp(
         }
     };
     let idle = tp.idle_timeout.unwrap_or(Duration::from_secs(3600));
+    ftlog::debug!(
+        "[mesh] tcp {} -> {} via {} (tls down={}, up={})",
+        peer,
+        dst,
+        picked.addr,
+        chain.tls.is_some(),
+        picked.tls.is_some()
+    );
     let (sent, received) = super::tcp::relay(&mut ds, &mut up, idle).await;
     picked.end(false, false);
     if stats {

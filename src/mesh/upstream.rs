@@ -248,6 +248,32 @@ fn jump_hash(mut key: u64, buckets: i32) -> i32 {
     b as i32
 }
 
+/// サーキットブレーカの入場券（処理中の要求数。Drop で返す）。
+pub struct Admission<'a>(&'a ClusterSlot);
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.stats.active_rq.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// クラスタの同時要求数の上限（Envoy の circuit_breakers。HTTP/1.1 は接続数 + 保留、HTTP/2 は
+/// 要求数 + 保留）を超えていなければ入場させる。超えていれば `UpstreamOverflow`（503 UO）。
+pub fn admit<'a>(slot: &'a ClusterSlot, cfg: &ClusterCfg, h2: bool) -> Result<Admission<'a>, ResponseFlag> {
+    let limit = if h2 {
+        cfg.max_requests as u64 + cfg.max_pending as u64
+    } else {
+        cfg.max_connections as u64 + cfg.max_pending as u64
+    };
+    let prev = slot.stats.active_rq.fetch_add(1, Ordering::Relaxed);
+    if prev >= limit {
+        slot.stats.active_rq.fetch_sub(1, Ordering::Relaxed);
+        return Err(ResponseFlag::UpstreamOverflow);
+    }
+    slot.stats.upstream_rq_total.fetch_add(1, Ordering::Relaxed);
+    Ok(Admission(slot))
+}
+
 /// TLS の用途。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Alpn {

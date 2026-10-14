@@ -305,7 +305,24 @@ async fn forward(
             }
         };
         let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
-        if !l7::upstream_is_h2(&picked.cfg, true) {
+        let up_h2 = l7::upstream_is_h2(&picked.cfg, true);
+        let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
+            Ok(a) => a,
+            Err(flag) => {
+                out.status = 503;
+                out.flag = flag;
+                let mut lr = LocalReply::new(503, flag);
+                if is_grpc {
+                    lr.grpc_status = Some(14);
+                }
+                local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                return out;
+            }
+        };
+        if attempt == 1 && !f.action.mirrors.is_empty() && req_rx.is_none() {
+            super::mirror::spawn_h1(f, c, &rq.method, path, &authority, headers, first_body.clone(), false);
+        }
+        if !up_h2 {
             return to_h1(
                 c,
                 f,

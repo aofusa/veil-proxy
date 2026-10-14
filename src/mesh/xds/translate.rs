@@ -972,6 +972,7 @@ fn forward(ra: &p::RouteAction, reg: &mut Registry) -> R<ForwardAction> {
                     .and_then(|f| f.default_value.as_ref())
                     .map(|p| p.per_million())
                     .unwrap_or(1_000_000),
+                !m.disable_shadow_host_suffix_append,
             )
         })
         .collect();

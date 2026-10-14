@@ -370,18 +370,97 @@ EOF
   if [ "${v2:-0}" -ge 15 ] && [ "${v2:-0}" -le 70 ]; then ok "traffic shifting 80/20 (v2 got $v2/200)"; else bad "traffic shifting v2=$v2/200"; fi
   out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://fortio."$NS":8080/v2only)" || true
   if [ "$out" = 200 ]; then ok "uri rewrite + subset routing"; else bad "rewrite/subset: $out"; fi
-  # Retries（上流が 503 を返すと 2 回まで再送: fortio の ?status=503:50 で半分失敗させる）
+  kubectl -n "$NS" delete destinationrule fortio >/dev/null 2>&1
+  kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
+  # Retries: fortio の ?status=503:50 は半分の確率で 503。4 回まで再送すれば 50 回中ほぼ全部 200 になる
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: networking.istio.io/v1
 kind: VirtualService
-metadata: {name: whoami}
+metadata: {name: fortio}
 spec:
-  hosts: [whoami]
+  hosts: [fortio]
   http:
-  - route: [{destination: {host: whoami}}]
-    retries: {attempts: 3, retryOn: 5xx}
+  - match: [{uri: {prefix: /retry}}]
+    rewrite: {uri: /echo}
+    retries: {attempts: 4, retryOn: 5xx}
+    route: [{destination: {host: fortio}}]
+  - match: [{uri: {prefix: /noretry}}]
+    rewrite: {uri: /echo}
+    retries: {attempts: 0}
+    route: [{destination: {host: fortio}}]
+  - route: [{destination: {host: fortio}}]
+    mirror: {host: whoami, port: {number: 80}}
+    mirrorPercentage: {value: 100}
 EOF
-  sleep 3
+  sleep 5
+  local okn loop50
+  loop50='for i in $(seq 50); do curl -s -m 5 -o /dev/null -w "%{http_code}\n" "$0"; done'
+  okn="$(cexec sh -c "$loop50" "http://fortio.$NS:8080/retry?status=503:50" | grep -c '^200$')"
+  if [ "${okn:-0}" -ge 45 ]; then ok "retries on 5xx ($okn/50 succeeded)"; else bad "retries: only $okn/50 succeeded"; fi
+  okn="$(cexec sh -c "$loop50" "http://fortio.$NS:8080/noretry?status=503:50" | grep -c '^200$')"
+  if [ "${okn:-0}" -le 40 ]; then ok "no retries when attempts=0 ($okn/50 succeeded)"; else bad "attempts=0 still retried ($okn/50)"; fi
+  # Mirroring: fortio への要求を whoami へ複製する（whoami の受け側の istio_requests_total が増える）
+  local wpod before after
+  wpod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
+  dest_total() { kubectl -n "$NS" exec "$wpod" -c istio-proxy -- curl -s localhost:15090/stats/prometheus 2>/dev/null | grep '^istio_requests_total{reporter="destination"' | awk '{s+=$NF} END{print s+0}'; }
+  before="$(dest_total)"
+  cexec sh -c 'for i in $(seq 10); do curl -s -m 5 -o /dev/null "$0"; done' "http://fortio.$NS:8080/echo"
+  after="$before"
+  for _ in $(seq 15); do after="$(dest_total)"; [ "$after" -ge $((before + 10)) ] && break; sleep 2; done
+  if [ "$after" -ge $((before + 10)) ]; then ok "mirroring to whoami ($before -> $after)"; else bad "mirroring: $before -> $after"; fi
+  kubectl -n "$NS" delete virtualservice fortio >/dev/null
+  # Circuit breaking: 接続 1・保留 1 に絞り、同時 10 本で溢れた分は 503（UO）
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: fortio-cb}
+spec:
+  host: fortio
+  trafficPolicy:
+    connectionPool:
+      tcp: {maxConnections: 1}
+      http: {http1MaxPendingRequests: 1, maxRequestsPerConnection: 1}
+EOF
+  sleep 5
+  out="$(fexec fortio load -c 10 -qps 0 -n 200 -loglevel Warning "http://fortio.$NS:8080/echo?delay=20ms" 2>&1 | grep -E '^Code (200|503)' | tr '\n' ' ')" || true
+  if echo "$out" | grep -q "Code 503" && echo "$out" | grep -q "Code 200"; then ok "circuit breaking: overflow -> 503 ($out)"; else bad "circuit breaking: $out"; fi
+  kubectl -n "$NS" delete destinationrule fortio-cb >/dev/null
+  # JWT（RequestAuthentication + requestPrincipals と claim の条件。Istio の samples の鍵とトークン）
+  cat <<'EOF' | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata: {name: jwt}
+spec:
+  selector: {matchLabels: {app: whoami}}
+  jwtRules:
+  - issuer: "testing@secure.istio.io"
+    jwks: '{ "keys":[ {"e":"AQAB","kid":"DHFbpoIUqrY8t2zpA2qXfCmr5VO5ZEr4RzHU_-envvQ","kty":"RSA","n":"xAE7eB6qugXyCAG3yhh7pkDkT65pHymX-P7KfIupjf59vsdo91bSP9C8H07pSAGQO1MV_xFj9VswgsCg4R6otmg5PV2He95lZdHtOcU5DXIg_pbhLdKXbi66GlVeK6ABZOUW3WYtnNHD-91gVuoeJT_DwtGGcp4ignkgXfkiEm4sw-4sfb4qdt5oLbyVpmW6x9cfa7vs2WTfURiCrBoUqgBo_-4WTiULmmHSGZHOjzwa8WtrtOQGsAFjIbno85jp6MnGGGZPYZbDAa_b3y5u-YpW7ypZrvD8BgtKVjgtQgZhLAGezMt0ua3DRrWnKqTZ0BJ_EyxOGuHJrLsn00fnMQ"}]}'
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: require-jwt}
+spec:
+  selector: {matchLabels: {app: whoami}}
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        requestPrincipals: ["testing@secure.istio.io/testing@secure.istio.io"]
+    when:
+    - key: request.auth.claims[groups]
+      values: ["group1"]
+EOF
+  local tok
+  tok="$(tr -d '\n' < "$ROOT/tools/k8s/testdata/groups-scope.jwt")"
+  if retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 403"; then ok "JWT: no token -> 403"; else bad "JWT: no token not denied"; fi
+  out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" http://whoami."$NS"/)" || true
+  if [ "$out" = 200 ]; then ok "JWT: valid token with group1 -> 200"; else bad "JWT valid token: $out"; fi
+  out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}x" http://whoami."$NS"/)" || true
+  if [ "$out" = 401 ]; then ok "JWT: tampered token -> 401"; else bad "JWT tampered token: $out"; fi
+  kubectl -n "$NS" delete requestauthentication jwt >/dev/null
+  kubectl -n "$NS" delete authorizationpolicy require-jwt >/dev/null
+  # 次の試験の前に、ポリシーの削除がプロキシへ届くのを待つ
+  retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200" || true
   # Authorization: client だけ GET を許す
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: security.istio.io/v1
@@ -400,9 +479,8 @@ EOF
   out="$(kubectl -n "$NS" exec deploy/fortio -c fortio -- fortio curl -quiet http://whoami."$NS"/ 2>&1 | head -1)" || true
   if echo "$out" | grep -q 403; then ok "AuthorizationPolicy denies other principals"; else bad "authz other principal: $out"; fi
   kubectl -n "$NS" delete authorizationpolicy whoami-allow >/dev/null
-  kubectl -n "$NS" delete virtualservice whoami fortio >/dev/null
-  kubectl -n "$NS" delete destinationrule fortio >/dev/null
-  kubectl -n "$NS" delete deploy fortio-v2 >/dev/null
+  kubectl -n "$NS" delete destinationrule fortio >/dev/null 2>&1
+  kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
 }
 
 cleanup() {

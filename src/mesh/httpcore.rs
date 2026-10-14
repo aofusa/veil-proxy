@@ -211,6 +211,8 @@ pub enum ResponseFlag {
     RbacDenied,
     /// NC: クラスタが無い
     NoCluster,
+    /// UO: サーキットブレーカの上限（接続・保留・要求数）を超えた
+    UpstreamOverflow,
 }
 
 impl ResponseFlag {
@@ -227,6 +229,7 @@ impl ResponseFlag {
             ResponseFlag::FaultInjected => "FI",
             ResponseFlag::RbacDenied => "RBAC",
             ResponseFlag::NoCluster => "NC",
+            ResponseFlag::UpstreamOverflow => "UO",
         }
     }
 }
@@ -242,6 +245,9 @@ pub fn local_reply_body(status: u16, flag: ResponseFlag) -> &'static [u8] {
         ResponseFlag::RbacDenied => b"RBAC: access denied",
         ResponseFlag::FaultInjected => b"fault filter abort",
         ResponseFlag::NoCluster => b"no cluster",
+        ResponseFlag::UpstreamOverflow => {
+            b"upstream connect error or disconnect/reset before headers. reset reason: overflow"
+        }
         _ => match status {
             404 => b"",
             _ => b"",
