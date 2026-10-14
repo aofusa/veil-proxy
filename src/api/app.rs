@@ -77,6 +77,8 @@ pub struct ApiSettings {
     pub grpc_response_compression_min_size: usize,
     /// gRPC-Web の CORS で許す Origin（`"*"` で全部、空なら CORS 無し。F-209）
     pub grpc_web_cors_origins: Vec<String>,
+    /// gRPC の送信メッセージの上限（0 = 無制限。F-209）
+    pub grpc_max_send_message_size: usize,
 }
 
 impl ApiSettings {
@@ -123,6 +125,7 @@ impl ApiSettings {
                         .collect()
                 })
                 .unwrap_or_default(),
+            grpc_max_send_message_size: n("grpc_max_send_message_size", 0),
         }
     }
 }
@@ -361,6 +364,19 @@ impl App {
         self
     }
 
+    /// 試験用: 最後に登録したルートの関数に、起動時と同じ順でミドルウェアを掛けたもの。
+    #[cfg(test)]
+    pub(crate) fn last_route_wrapped(&self) -> HandlerFn {
+        let route = self.routes.last().expect("registered");
+        let mut func = route.func.clone();
+        for mw in &self.middleware {
+            if path_has_prefix(&route.path, &mw.prefix) {
+                func = (mw.wrap)(func);
+            }
+        }
+        func
+    }
+
     /// 起動時（ハンドラ登録の前）に実行する初期化処理を足す（DB 接続の確立・L4 ハンドラ等の拡張が使う）。
     pub fn on_setup(mut self, f: impl FnOnce() -> Result<(), String> + Send + 'static) -> App {
         self.setup.push(Box::new(f));
@@ -458,6 +474,7 @@ fn start(config: Config) -> Result<(), Error> {
                 ftlog::warn!("{}; responses are not compressed", e);
             }
             super::grpc::set_grpc_web_cors_origins(settings.grpc_web_cors_origins.clone());
+            super::grpc::set_max_send_message_size(settings.grpc_max_send_message_size);
         }
         if settings.handler_threads > 0 {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);

@@ -2732,6 +2732,29 @@ impl H3BufferedTask {
                     return Ok(());
                 }
 
+                // 未登録のサービスへの gRPC は Trailers-Only の UNIMPLEMENTED（F-209）
+                #[cfg(feature = "grpc-handler")]
+                if let Some(h) = crate::api::grpc::unknown_route_response(
+                    headers.iter().map(|h| (h.name(), h.value())),
+                    path,
+                ) {
+                    let pairs: Vec<(&[u8], &[u8])> =
+                        h.iter().map(|(n, v)| (n.as_ref(), v.as_ref())).collect();
+                    self.send_response(200, &pairs, None).await?;
+                    log_access(
+                        method,
+                        authority,
+                        path,
+                        user_agent,
+                        request_body.len() as u64,
+                        200,
+                        0,
+                        start_time,
+                        self.client_ip.as_str(),
+                        "",
+                    );
+                    return Ok(());
+                }
                 self.send_error_response(404, b"Not Found").await?;
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]

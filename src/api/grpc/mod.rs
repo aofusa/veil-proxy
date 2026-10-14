@@ -117,6 +117,13 @@ pub fn max_message_size() -> usize {
     MAX_MESSAGE_SIZE.load(Ordering::Relaxed)
 }
 
+/// 送信メッセージの上限（`[api] grpc_max_send_message_size`、0 = 無制限。F-209 #8）。
+static MAX_SEND_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn set_max_send_message_size(n: usize) {
+    MAX_SEND_MESSAGE_SIZE.store(n, Ordering::Relaxed);
+}
+
 /// 応答の圧縮（`[api] grpc_response_compression`、0 = しない・1 = gzip・2 = deflate。F-209 #2）。
 static RESPONSE_COMPRESSION: AtomicU8 = AtomicU8::new(0);
 /// この大きさ未満のメッセージは圧縮しない（`[api] grpc_response_compression_min_size`）。
@@ -190,6 +197,8 @@ pub struct Status {
     code: Code,
     message: String,
     metadata: Metadata,
+    /// `grpc-status-details-bin`（符号化済みの `google.rpc.Status`。F-209 #6）
+    details: Option<Bytes>,
 }
 
 macro_rules! status_ctor {
@@ -209,6 +218,7 @@ impl Status {
             code,
             message: message.into(),
             metadata: Vec::new(),
+            details: None,
         }
     }
 
@@ -245,6 +255,19 @@ impl Status {
         self
     }
 
+    /// エラーの詳細（`grpc-status-details-bin` で送る、符号化済みの `google.rpc.Status`。F-209）。
+    /// `google.rpc.BadRequest` 等を入れた `google.rpc.Status` を利用者の protobuf ライブラリで符号化して渡す
+    /// （veil は中身を解釈しない。`code`・`message` はこの `Status` と同じにするのが gRPC の約束）。
+    pub fn with_details(mut self, details: impl Into<Bytes>) -> Status {
+        self.details = Some(details.into());
+        self
+    }
+
+    /// `with_details` で付けた詳細。
+    pub fn details(&self) -> Option<&Bytes> {
+        self.details.as_ref()
+    }
+
     /// `grpc-status`・`grpc-message`（パーセントエンコード）と追加のメタデータ。
     pub(crate) fn to_trailers(&self) -> Metadata {
         let mut out = Vec::with_capacity(2 + self.metadata.len());
@@ -258,6 +281,16 @@ impl Status {
                 Bytes::from_static(b"grpc-message"),
                 Bytes::from(percent_encode(&self.message)),
             ));
+        }
+        if let Some(d) = &self.details {
+            // バイナリのメタデータ（`-bin`）は base64。gRPC の実装は `=` の無い形を送る
+            let mut enc = web::Base64Encoder::default();
+            let mut v = BytesMut::from(&enc.encode(d)[..]);
+            v.extend_from_slice(&enc.finish());
+            while v.last() == Some(&b'=') {
+                v.truncate(v.len() - 1);
+            }
+            out.push((Bytes::from_static(b"grpc-status-details-bin"), v.freeze()));
         }
         out.extend(self.metadata.iter().cloned());
         out
@@ -331,6 +364,8 @@ pub struct Request<T> {
     message: T,
     deadline: Option<Instant>,
     client_ip: IpAddr,
+    /// `/<package>.<Service>/<Method>`
+    path: Bytes,
 }
 
 impl<T> Request<T> {
@@ -341,6 +376,7 @@ impl<T> Request<T> {
             message,
             deadline: None,
             client_ip: IpAddr::from([127, 0, 0, 1]),
+            path: Bytes::new(),
         }
     }
 
@@ -378,6 +414,11 @@ impl<T> Request<T> {
         self.client_ip
     }
 
+    /// 呼ばれたメソッド（`/<package>.<Service>/<Method>`。`Request::new` で作ったものは空）。
+    pub fn method(&self) -> &str {
+        std::str::from_utf8(&self.path).unwrap_or("")
+    }
+
     /// メッセージだけ差し替える（メタデータ・期限は保つ）。
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Request<U> {
         Request {
@@ -385,6 +426,7 @@ impl<T> Request<T> {
             message: f(self.message),
             deadline: self.deadline,
             client_ip: self.client_ip,
+            path: self.path,
         }
     }
 }
@@ -594,6 +636,9 @@ pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, 
     buf.put_bytes(0, 5);
     codec.encode(m, &mut buf)?;
     let len = buf.len() - 5;
+    if let Some(s) = send_limit_error(len, MAX_SEND_MESSAGE_SIZE.load(Ordering::Relaxed)) {
+        return Err(s);
+    }
     let len = u32::try_from(len)
         .map_err(|_| Status::resource_exhausted(format!("response message too large ({})", len)))?;
     buf[1..5].copy_from_slice(&len.to_be_bytes());
@@ -615,6 +660,16 @@ fn compress_frame(frame: Bytes, encoding: Compression) -> Result<Bytes, Status> 
     buf.put_u32(c.len() as u32);
     buf.extend_from_slice(&c);
     Ok(buf.freeze())
+}
+
+/// 送信メッセージの上限を超えていたら `RESOURCE_EXHAUSTED`（0 = 無制限）。
+fn send_limit_error(len: usize, max: usize) -> Option<Status> {
+    (max > 0 && len > max).then(|| {
+        Status::resource_exhausted(format!(
+            "response message larger than max ({} vs. {})",
+            len, max
+        ))
+    })
 }
 
 /// 応答のメッセージ列を本文の断片とトレーラに変える（最後に `grpc-status`、途中の `Err` はその状態で終える）。
@@ -792,6 +847,7 @@ struct Call {
     /// gRPC-Web の要求なら `Some`（F-209 #4）
     web: Option<web::WebMode>,
     client_ip: IpAddr,
+    path: Bytes,
 }
 
 /// gRPC の要求として受け付けられるかを見る（だめなら返す応答）。
@@ -856,7 +912,39 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
         accepts: accepted_encodings(req.header("grpc-accept-encoding")),
         web,
         client_ip: req.client_ip(),
+        path: req.path.clone(),
     })
+}
+
+/// どのルートにも当たらなかった要求が通常の gRPC（gRPC-Web を除く）なら、Trailers-Only の `UNIMPLEMENTED` の
+/// 応答ヘッダ（`:status` 200 で送る）。プロトコル側の 404 の代わりに使う（F-209 #9）。gRPC の仕様では
+/// HTTP の 404 は `UNIMPLEMENTED` と読み替えられるが、ログ・メトリクスに 404 が出てクライアントのメッセージも曖昧になる。
+pub(crate) fn unknown_route_response<'a>(
+    mut headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    path: &[u8],
+) -> Option<Metadata> {
+    let ct = headers
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"content-type"))?
+        .1;
+    if !crate::grpc::headers::is_grpc_content_type(ct) || web::web_mode(ct).is_some() {
+        return None;
+    }
+    let service = path
+        .strip_prefix(b"/")
+        .and_then(|p| p.split(|&b| b == b'/').next())
+        .unwrap_or_default();
+    let mut out = vec![(
+        Bytes::from_static(b"content-type"),
+        Bytes::from_static(b"application/grpc"),
+    )];
+    out.extend(
+        Status::unimplemented(format!(
+            "service {} is not implemented",
+            String::from_utf8_lossy(service)
+        ))
+        .to_trailers(),
+    );
+    Some(out)
 }
 
 /// 期限付きで Future を待つ（期限切れは `DEADLINE_EXCEEDED`）。
@@ -913,6 +1001,7 @@ fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
             message,
             deadline,
             client_ip: call.client_ip,
+            path: call.path,
         },
         deadline,
     )
@@ -923,6 +1012,40 @@ fn once<T: Send + 'static>(
     m: T,
 ) -> futures::stream::Once<futures::future::Ready<Result<T, Status>>> {
     futures::stream::once(futures::future::ready(Ok(m)))
+}
+
+impl App {
+    /// gRPC のメソッドを呼ぶ前に `f` を呼ぶ（認証・メタデータの検査等。F-209 #7）。`prefix` は `"/"` で全部、
+    /// `"/pkg.Svc/"` でそのサービスだけ。`Err` を返すとメソッドを呼ばずにその状態で終える（Trailers-Only）。
+    /// gRPC・gRPC-Web 以外の要求（同じ前置きの HTTP のルート）には何もしない。
+    pub fn grpc_interceptor<F>(self, prefix: &str, f: F) -> App
+    where
+        F: Fn(&Request<()>) -> Result<(), Status> + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        self.wrap_on(prefix, move |inner: HandlerFn| -> HandlerFn {
+            let f = f.clone();
+            Arc::new(move |req: super::request::Request| -> HandlerFuture {
+                let ct = req.header("content-type").unwrap_or_default();
+                if req.method() == "OPTIONS"
+                    || !crate::grpc::headers::is_grpc_content_type(ct.as_bytes())
+                {
+                    return inner(req);
+                }
+                match accept(&req) {
+                    Ok(call) => {
+                        let web = call.web.clone();
+                        let (r, _) = make_request(call, ());
+                        match f(&r) {
+                            Ok(()) => inner(req),
+                            Err(s) => Box::pin(futures::future::ready(error_response(&web, &s))),
+                        }
+                    }
+                    Err(resp) => Box::pin(futures::future::ready(resp)),
+                }
+            })
+        })
+    }
 }
 
 /// gRPC-Web のプリフライト（`OPTIONS`）をハンドラの前で返す（F-209 #4）。
@@ -1135,7 +1258,7 @@ impl App {
     }
 
     /// 双方向ストリーミング RPC（要求のストリーム → 応答のストリーム）を登録する。
-    /// HTTP/2 では要求と応答が全二重で流れる（HTTP/3 では要求本文を受け終えてから呼ばれる）。
+    /// HTTP/2・HTTP/3 とも要求と応答が全二重で流れる（F-209）。
     pub fn grpc_bidi<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
         C: Codec<Req> + Codec<Resp> + Unpin,

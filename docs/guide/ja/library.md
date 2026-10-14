@@ -214,6 +214,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `handler_threads` | `0` | 同期 Rust 関数・C コールバック・Python ハンドラを実行するハンドラ用プールのスレッド数（`0` = 組み込みの既定） |
 | `tokio_threads` | `2` | 同梱の tokio ランタイムのワーカー数（`tokio-compat-bridge` のみ） |
 | `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
+| `grpc_max_send_message_size` | `0` | 送信する gRPC メッセージ 1 つの上限（0 = 無制限） |
 | `grpc_response_compression` | `"none"` | gRPC の応答メッセージの圧縮: `"none"`・`"gzip"`・`"deflate"`（クライアントが `grpc-accept-encoding` で受けるときだけ。`compression` feature が必要） |
 | `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
 | `grpc_web_cors_origins` | `[]` | ブラウザから gRPC-Web で呼んでよい Origin（`["*"]` で全部）。空なら CORS のヘッダを付けず、プリフライトは 403 |
@@ -593,13 +594,16 @@ App::new()
 | `Request<T>` | `get_ref()`・`into_inner()`・`metadata()` / `metadata_value(name)`（`content-type`・`te`・`grpc-timeout`・`grpc-encoding` を除く要求ヘッダ）・`deadline()`・`client_ip()` |
 | `Response<T>` | `with_metadata(name, value)`（応答ヘッダ）・`with_trailer(name, value)`（`grpc-status: 0` の後ろ） |
 | `Status` | `Status::new(Code::X, msg)` や `Status::not_found(msg)` 等。`with_metadata` はトレーラに足す。最初のメッセージより前のエラーは Trailers-Only 応答 |
+| エラーの詳細 | `Status::with_details(bytes)` が符号化済みの `google.rpc.Status`（`BadRequest`・`ErrorInfo` 等を入れたもの）を `grpc-status-details-bin` で送る。符号化は利用者の protobuf ライブラリで行う |
+| インターセプタ | `App::grpc_interceptor(prefix, \|req: &Request<()>\| -> Result<(), Status>)` が `prefix`（`"/"` や `"/pkg.Svc/"`）以下の gRPC のメソッドの前に、メタデータ・期限・クライアントのアドレス・`method()` を渡して呼ばれる。`Err` ならその状態で終える（認証・クォータ）。同じ前置きの gRPC 以外の要求は素通し |
+| 送信の上限 | `[api] grpc_max_send_message_size`（既定 0 = 無制限）。超える応答メッセージは `RESOURCE_EXHAUSTED` で終える |
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` と `message().await` |
 | 期限 | `grpc-timeout` を veil のタイマーで強制し、ハンドラを取り消して `DEADLINE_EXCEEDED` で終える（ストリームはメッセージの間で確認） |
 | 取り消し | クライアントの RST_STREAM・切断でハンドラの Future と応答ストリームを drop する |
 | 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す（`compression` feature が必要。`full` に含まれる。無いビルドは `identity` だけを受け、他は `UNIMPLEMENTED`）。応答は `[api] grpc_response_compression`（1 回の呼び出しだけなら `Response::with_compression(Compression::Gzip)`）の方式をクライアントが `grpc-accept-encoding` で受けるとき、`grpc_response_compression_min_size` バイト以上のメッセージを圧縮する。それ以外は非圧縮 |
 | 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED`。圧縮されたメッセージは解凍後の大きさに掛かり、超えた時点で解凍を打ち切る |
 | gRPC-Web | `application/grpc-web`・`application/grpc-web+proto` と base64 の `application/grpc-web-text(+proto)` を同じメソッドで受ける（HTTP/1.1・HTTP/2・HTTP/3）。トレーラは本文の最後の枠（フラグ `0x80`）で返すので、ブラウザ（grpc-web・Connect）から変換用のプロキシ無しで veil を直接呼べる。`OPTIONS` のプリフライトは `[api] grpc_web_cors_origins` で答える |
-| エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC（gRPC-Web を除く）は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
+| エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC（gRPC-Web を除く）は `grpc-status: 13`、登録済みサービスの未定義メソッドと、どのルートにも当たらないパスへの gRPC は `UNIMPLEMENTED` |
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
 | リフレクション | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` で `grpc.reflection.v1` と `v1alpha`（`ServerReflectionInfo`）を登録する。grpcurl・Postman・grpcui が `.proto` 無しでサービスの一覧と型を取得できる。`FILE_DESCRIPTOR_SET` は `veil-build` が生成する（コンパイルしたパッケージごとに渡す）。`list_services` は登録したすべての gRPC サービスを返す。組み込みのヘルスチェックとリフレクション自身の型は返さない |
 
@@ -869,8 +873,8 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 
 ## 制限事項
 
-- gRPC: HTTP/3 では要求ストリームを読み終えてからハンドラを呼びます（双方向の呼び出しは半二重）。応答は圧縮しません。
-  gRPC-Web・Server Reflection・C/Python の gRPC ハンドラはまだありません。
+- gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。C/Python の
+  gRPC ハンドラはまだありません（F-210）。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります

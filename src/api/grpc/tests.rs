@@ -752,3 +752,74 @@ fn response_encoding_negotiation() {
         Compression::Identity
     );
 }
+
+/// F-209 #6: `with_details` は `grpc-status-details-bin`（base64、`=` 無し）で送る。
+#[test]
+fn status_details_bin() {
+    let t = Status::invalid_argument("bad")
+        .with_details(Bytes::from_static(b"\x08\x03\x12\x03bad"))
+        .to_trailers();
+    let v = field(&t, "grpc-status-details-bin").unwrap();
+    assert_eq!(v, b"CAMSA2JhZA");
+    let mut d = web::Base64Decoder::default();
+    let mut out = BytesMut::new();
+    d.push(b"CAMSA2JhZA==", &mut out).unwrap();
+    assert_eq!(&out[..], b"\x08\x03\x12\x03bad");
+}
+
+/// F-209 #7: インターセプタはメタデータを見て断れる（Trailers-Only）。gRPC 以外の要求は素通し。
+#[test]
+fn interceptor_rejects_and_passes() {
+    let app = App::new()
+        .grpc_interceptor("/pkg.Svc/", |r: &Request<()>| {
+            assert_eq!(r.method(), "/pkg.Svc/M");
+            match r.metadata_value("authorization") {
+                Some(b"Bearer ok") => Ok(()),
+                _ => Err(Status::unauthenticated("no token")),
+            }
+        })
+        .grpc_unary(
+            "/pkg.Svc/M",
+            HealthCodec,
+            |req: Request<HealthCheckRequest>| async move {
+                assert_eq!(req.method(), "/pkg.Svc/M");
+                Ok(Response::new(HealthCheckResponse { status: 1 }))
+            },
+        );
+    let f = app.last_route_wrapped();
+    let msg = || frame(&HealthCheckRequest::default());
+    let resp = futures::executor::block_on(f(grpc_request(HttpVersion::Http2, vec![msg()], &[])));
+    assert_eq!(
+        field(&resp.headers().to_vec(), "grpc-status"),
+        Some(&b"16"[..])
+    );
+    let (_, _, t) = collect(futures::executor::block_on(f(grpc_request(
+        HttpVersion::Http2,
+        vec![msg()],
+        &[("authorization", "Bearer ok")],
+    ))));
+    assert_eq!(field(&t, "grpc-status"), Some(&b"0"[..]));
+}
+
+/// F-209 #8: 送信メッセージの上限。
+#[test]
+fn send_limit() {
+    assert!(send_limit_error(10, 0).is_none());
+    assert!(send_limit_error(10, 10).is_none());
+    assert_eq!(
+        send_limit_error(11, 10).unwrap().code(),
+        Code::ResourceExhausted
+    );
+}
+
+/// F-209 #9: どのルートにも当たらない通常の gRPC は Trailers-Only の UNIMPLEMENTED。gRPC-Web・他は 404 のまま。
+#[test]
+fn unknown_route_is_unimplemented_for_grpc() {
+    let h = |ct: &'static [u8]| vec![(&b"content-type"[..], ct)];
+    let r = unknown_route_response(h(b"application/grpc").into_iter(), b"/nope.Svc/M").unwrap();
+    assert_eq!(field(&r, "grpc-status"), Some(&b"12"[..]));
+    assert!(percent_decode(field(&r, "grpc-message").unwrap()).contains("nope.Svc"));
+    assert!(unknown_route_response(h(b"application/grpc-web").into_iter(), b"/x/y").is_none());
+    assert!(unknown_route_response(h(b"text/plain").into_iter(), b"/x/y").is_none());
+    assert!(unknown_route_response(Vec::new().into_iter(), b"/x/y").is_none());
+}

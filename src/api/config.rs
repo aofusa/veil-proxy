@@ -231,6 +231,10 @@ impl ConfigBuilder {
         grpc_max_message_size, "api.grpc_max_message_size", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
+        /// `[api].grpc_max_send_message_size`（gRPC の送信メッセージの上限、0 = 無制限。F-209）。
+        grpc_max_send_message_size, "api.grpc_max_send_message_size", v: usize => toml::Value::Integer(v as i64)
+    );
+    setter!(
         /// `[api].grpc_response_compression`（gRPC の応答の圧縮: `"none"`・`"gzip"`・`"deflate"`、既定 `"none"`。F-209）。
         grpc_response_compression, "api.grpc_response_compression", v: &str => toml::Value::String(v.to_string())
     );

@@ -832,6 +832,15 @@ async fn h3_checks(addr: std::net::SocketAddr) {
         }),
     );
 
+    let r = h3_call::<_, Empty>(&mut send, &authority, "/nope.v1.Nope/Call", &[Empty {}]).await;
+    report(
+        "h3 unknown service is UNIMPLEMENTED (F-209)",
+        r.and_then(|(_, s)| {
+            ensure!(s == "12", "grpc-status {}", s);
+            Ok(())
+        }),
+    );
+
     let r = h3_call::<_, Empty>(
         &mut send,
         &authority,

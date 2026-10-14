@@ -1717,6 +1717,16 @@ async fn h2_dispatch(
     let (prefix, backend, route_compression) = match backend_result {
         Some(b) => b,
         None => {
+            // 未登録のサービスへの gRPC は Trailers-Only の UNIMPLEMENTED（F-209）
+            #[cfg(feature = "grpc-handler")]
+            if let Some(h) = crate::api::grpc::unknown_route_response(
+                ctx.headers.iter().map(|h| (&h.name[..], &h.value[..])),
+                path,
+            ) {
+                let mut headers = h2_base_headers(false);
+                headers.extend(h);
+                return h2_emit_full(resp_tx, notify, 200, headers, Bytes::new()).await;
+            }
             return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
         }
     };
