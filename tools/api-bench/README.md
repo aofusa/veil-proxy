@@ -76,6 +76,8 @@ BENCH_BASE_DIR=/path/to/base python3 tools/api-bench/run_bench.py --group rust -
 
 `BENCH_BASE_DIR` を渡すと、その作業ツリーの `axum-veil` で `mount`・`native`（io_uring・epoll）を「[base]」として足し、
 同じラウンドの中で交互に測る。
+`--proto h3` では、その作業ツリーの `target-h3`・`target-h3-epoll` のネイティブハンドラを「[base]」として足す
+（`axum-veil` に `http3` feature が無い古いコミットは、今の `tools/api-bench/axum-veil` と `common.rs` を写してからビルドする）。
 
 ```bash
 (cd tools/api-bench/axum-veil && CARGO_TARGET_DIR=target-count cargo build --release --features count-allocs)

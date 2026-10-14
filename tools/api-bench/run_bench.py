@@ -301,6 +301,10 @@ def main():
             "veil native handler": ([AVH3, "native", ADDR, str(THREADS)], {}, None),
             "veil native handler [epoll]": ([AVH3E, "native", ADDR, str(THREADS)], {}, None),
         }
+        if BASE:
+            for sub, tag in (("target-h3", ""), ("target-h3-epoll", " [epoll]")):
+                b = os.path.join(BASE, "tools", "api-bench", "axum-veil", sub, "release", "api-bench-axum-veil")
+                targets["veil native handler" + tag + " [base]"] = ([b, "native", ADDR, str(THREADS)], {}, None)
         make_cert()
     if a.only:
         keys = [k.strip() for k in a.only.split(",")]

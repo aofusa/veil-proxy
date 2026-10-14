@@ -1,6 +1,6 @@
 # F-206: Rust の API ライブラリを tokio 上の axum 以上の性能にする（API ライブラリの範囲だけで）
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14。手順 1 は F-205 で置き換え、手順 2〜3 は不要だったので入れていない）**
 
 ## 背景
 
@@ -100,3 +100,24 @@ allocs/req を記録する。段ごとに 1 コミット。
 ## 関連
 
 F-201（ベンチ）、F-202（14 → 4 allocs/req）、F-205（プロキシと共通の経路の同じ問題。こちらで得た結果を持ち込む）、B-101。
+
+## 結果（2026-10-14）
+
+手順 1 は F-205（共通の経路の io_uring の直接読み取り）で置き換えた。それだけで受け入れ条件を満たしたので、手順 2（確保の削減）・
+手順 3（ハンドラだけの App のルーティング）は入れていない（`--features full` のバイナリを変えない・本体側の分岐を増やさない）。
+手順 4（計測の拡張）は入れた: `tools/api-bench/run_bench.py --proto h2c|h3`（h2load / h2load-h3）、axum の 2 クレートに
+hyper の HTTP/2、veil の HTTP/3 は `http3` feature の別ビルド（`target-h3`・`target-h3-epoll`）。ネイティブの列は `#[veil::route]`。
+
+`tools/api-bench`、サーバ 2 スレッド（CPU 0-1）・負荷は CPU 2-3、中央値:
+
+| 対象 | HTTP/1.1 plaintext | HTTP/1.1 json | h2c plaintext | h2c json | HTTP/3 plaintext | HTTP/3 json |
+|---|---:|---:|---:|---:|---:|---:|
+| axum + tokio（percore） | 66,980 | 61,184 | 87,586 | 78,050 | – | – |
+| veil ネイティブ（io_uring） | 68,832（103%） | 63,069（103%） | 123,615（141%） | 109,938（141%） | 69,039 | 63,752 |
+| veil ネイティブ（epoll） | 67,013（100%） | 61,303（100%） | 126,200（144%） | 110,824（142%） | 83,638 | 76,200 |
+
+HTTP/1.1 は 5 ラウンド、h2c・HTTP/3 は 3 ラウンド（`docs/artifacts/f206_final_{h1,h2c,h3}.tsv`）。CPU µs/req は HTTP/1.1 の
+plaintext で axum 30.5・io_uring 29.4・epoll 30.2。
+
+HTTP/3 の io_uring が epoll より 2 割遅いのは main でも同じ（B-128 で multishot の受信が有効になった前後で差が無いことを
+`docs/artifacts/b128_h3_ab.tsv` で確認: io_uring 70,082 / 68,963（main）、epoll 85,044 / 84,315（main））。F-214 で調べる。

@@ -886,12 +886,13 @@ time of the server's cores (including the kernel's loopback processing) divided 
 | axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
 | veil `App` + axum `Router` (`tokio_service`) | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
 | veil `App` + axum `Router` (epoll) | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
-| veil native handler (`#[veil::route]`) | 64,546 | 58,524 | 2.14 | 31.7 | 11.3 |
-| veil native handler (epoll) | 66,722 | 60,461 | 2.65 | 30.9 | 9.6 |
+| veil native handler (`#[veil::route]`) | 68,832 | 63,069 | 2.83 | 29.4 | 11.4 |
+| veil native handler (epoll) | 67,013 | 61,303 | 2.78 | 30.2 | 10.0 |
 
-The four veil rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head and a
-small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s; before
-F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) req/s for plaintext.
+The `App` + `Router` rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head
+and a small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s;
+before F-202 they were 33,349 / 36,702 req/s. The two native rows were re-measured after F-205 (5 alternating rounds
+against axum + tokio per-core at 66,980 / 61,184 req/s in the same run; `docs/artifacts/f206_final_h1.tsv`).
 
 - **axum runs on `veil::tokio` unchanged** (the same source, with the `tokio` crate patched to the shim). Per core it
   reaches about **80% (io_uring) to 84% (epoll)** of axum on tokio, and uses 20–25% more CPU per request.
@@ -899,11 +900,29 @@ F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) r
   connection task stays on the thread that accepted it (the server cores are only ~85% busy out of 200%). For
   multi-core use, run one current-thread runtime and one `SO_REUSEPORT` listener per thread (the "per-core" rows,
   `run_percore` in `tools/api-bench/common.rs`), or mount the router in a veil `App`, whose workers each accept.
-- **veil's native handler reaches 98% (epoll) / 93% (io_uring) of axum on tokio** (5-round re-measurement), with
-  about the same CPU per request (30.5–31.7 µs against 29.3 µs). The remaining io_uring gap is the keep-alive wait:
-  the next request is awaited with a readiness poll and then read (two operations, so idle connections hold no read
-  buffer), which is tracked as F-205. Mounting an axum `Router` adds a conversion to and from
-  `http::Request`/`http::Response` (most of its 30 allocations per request are in http/axum).
+- **veil's native handler reaches 103% (io_uring) / 100% (epoll) of axum on tokio** for both endpoints, with less or
+  equal CPU per request (29.4 / 30.2 µs against 30.5 µs). On io_uring a keep-alive connection that sends its next
+  request quickly is read with one bounded `RECV` instead of a readiness poll followed by a read (F-205,
+  `[performance] keepalive_direct_read_ms`); idle connections still hold no read buffer. Mounting an axum `Router`
+  adds a conversion to and from `http::Request`/`http::Response` (most of its 30 allocations per request are in
+  http/axum).
+
+### HTTP/2 (h2c) and HTTP/3
+
+`h2load -t2 -c64 -m10 -D10` (h2c; HTTP/3 with an h2load built with ngtcp2), same machine and endpoints, 3 alternating
+rounds, median (`docs/artifacts/f206_final_{h2c,h3}.tsv`). axum has no HTTP/3, so the HTTP/3 rows have nothing to
+compare against and are kept to watch for regressions.
+
+| Target | protocol | plaintext req/s | json req/s | CPU µs/req (plaintext) |
+|---|---|---:|---:|---:|
+| axum + tokio, per-core (hyper HTTP/2) | h2c | 87,586 | 78,050 | 23.3 |
+| veil native handler | h2c | 123,615 | 109,938 | 16.6 |
+| veil native handler (epoll) | h2c | 126,200 | 110,824 | 16.2 |
+| veil native handler (TLS) | HTTP/3 | 69,039 | 63,752 | 29.5 |
+| veil native handler (TLS, epoll) | HTTP/3 | 83,638 | 76,200 | 24.4 |
+
+Over h2c veil serves **1.4× the requests of axum on tokio** with 30% less CPU per request (the frames of all
+streams of a connection that are ready in one loop iteration go out in one write).
 
 ### Python: FastAPI (uvicorn) and veil
 
@@ -912,13 +931,16 @@ F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) r
 | FastAPI `async def`, uvicorn 1 worker | 5,502 | 4,333 | 14.46 | 189.4 | 49.4 |
 | FastAPI `async def`, uvicorn 2 workers | 6,859 | 5,473 | 10.17 | 296.2 | 136.4 |
 | FastAPI `def`, uvicorn 2 workers | 3,661 | 3,174 | 50.23 | 551.5 | 140.6 |
-| veil, `offload=True` (default), 2 threads | 15,467 | 11,726 | 10.99 | 106.4 | 31.1 |
-| veil, `offload=False`, 2 threads | 17,110 | 12,737 | 4.07 | 118.4 | 30.4 |
+| veil, `offload=True` (default), 2 threads | 25,494 | 22,567 | 6.70 | 71.1 | 31.3 |
+| veil, `offload=False`, 2 threads | 26,229 | 24,226 | 2.95 | 77.0 | 30.4 |
 
 FastAPI 0.143 / uvicorn 0.54 with uvloop and httptools; pydantic 2. uvicorn's workers are processes, veil runs one
-process. veil serves **2.1–2.5× the requests of FastAPI with 2 workers** (2.7–3.1× of one worker) with less than
-half the CPU per request and less than a quarter of the memory, because HTTP parsing, routing and the response are
-done in Rust and only the handler body runs in Python. Python handlers are still serialized by the GIL, so a
+process. The veil rows were re-measured after F-212 (5 alternating rounds against the previous binding,
+`docs/artifacts/f212_ab_py.tsv`; before F-212: 15,848 / 12,237 req/s and 110 µs/req with `offload=True`); the
+FastAPI rows are from the F-201 run. veil serves **3.7–4.4× the requests of FastAPI with 2 workers** (4.6–5.6× of one
+worker) with about a quarter of the CPU per request and less than a quarter of the memory, because HTTP parsing,
+routing and the response are done in Rust and only the handler body runs in Python (the request object is created in
+Rust and only the attributes the handler reads become Python objects). Python handlers are still serialized by the GIL, so a
 single process does not scale with cores; `offload=True` keeps the event loop free of the GIL at the cost of a
 handoff to the handler pool (the higher p99).
 
