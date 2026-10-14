@@ -106,10 +106,23 @@ provided buffer ring の案は採らなかった。開発ホスト（Ubuntu 6.8.
   （`[performance] keepalive_direct_read_ms`、既定 20ms、0 で無効）。読み取りバッファからの写しも無くなる。
   - io_uring: `TcpStream::read_within`（`RECV` 1 回）。期限で `ASYNC_CANCEL` を投げて CQE を待つので、
     取り消しと行き違いで届いたデータも失わない（`-ECANCELED` のときだけバッファを返して従来の待ちへ）。
-  - epoll: `timeout(期限, read)`。届いていれば `EPOLL_CTL_MOD` と確認用の `poll(2)` を省く（読めたときだけ省くので B-75 を守る）。
+  - epoll: `timeout(期限, read)` で先に読む形を試したが、外れたときの空打ちが当たりで省ける `poll(2)`・`epoll_ctl` を
+    上回って −1.4〜−2.5% だったので入れていない（下の表）。
 - 期限を過ぎた接続は従来どおりバッファを持たずに待つ（B-101 の性質は保つ。持つのは期限の間の 8KB だけ）。
-- 平文の接続だけ。TLS・kqueue・WSAPoll は今までどおり。
+- 平文の接続・io_uring だけ。TLS・reactor（epoll・kqueue・WSAPoll）は今までどおり。
 - 付随して B-128（io_uring の制限が `IOSQE_BUFFER_SELECT` を拒否）と B-129（HTTP/1.1 のパイプラインで 2 つ目の要求を失う）を修正。
 
 試験: `tests/e2e_tests.rs::test_f205_keepalive_direct_read_and_fallback`（すぐ・期限の後 30/150/400ms・パイプライン・
 分割した要求・8KB を超える本文。io_uring・epoll）。
+
+### 計測（2026-10-14、`tools/api-bench`、HTTP/1.1・64 接続・サーバ 2 スレッド・5 ラウンド交互、中央値。`docs/artifacts/f205_ab_h1.tsv`）
+
+| 対象 | plaintext req/s | json req/s | CPU µs/req（plaintext） |
+|---|---:|---:|---:|
+| axum + tokio（percore） | 67,656 | 61,408 | 30.0 |
+| veil ネイティブ io_uring 改修前（main） | 65,291 | 58,559 | 31.3 |
+| veil ネイティブ io_uring **改修後** | **69,634（+6.7%）** | **63,324（+8.1%）** | 29.2 |
+| veil ネイティブ epoll 改修前 | 68,000 | 61,904 | 30.1 |
+| veil ネイティブ epoll（先読みを試した版） | 67,033（−1.4%） | 60,343（−2.5%） | 30.3 |
+
+io_uring は axum の 103%（plaintext・json とも）。epoll の先読みは入れず、epoll は改修前と同じ経路（axum の 100〜101%）。

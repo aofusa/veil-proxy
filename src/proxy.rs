@@ -5337,31 +5337,26 @@ fn slice_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
     (start, needle.len())
 }
 
-// 統一されたリクエスト処理ループ（型エイリアスを使用）
-// clippy::drop_non_drop 許容理由: `req` はヘッダバッファ（accumulated）への借用を保持する
-// 非 Drop 型で、`drop(req)` は借用領域を明示的に終わらせて後続の可変利用を許すための
-// 意図的な記述（`let _ =` より意図が明確なため維持する）。
-#[allow(clippy::drop_non_drop)]
 /// キープアライブの次の要求の読み方（F-205）。
 enum KeepaliveRead {
     /// 従来: 読み取りバッファへ読み、蓄積へ写す
     Buf(io::Result<usize>, SafeReadBuffer),
-    /// 蓄積バッファへ直接読んだ
+    /// 蓄積バッファへ直接読んだ（io_uring）
+    #[cfg(veil_rt_uring)]
     Direct(io::Result<usize>, BytesMut),
 }
 
-/// 応答を返した直後に、次の要求を蓄積バッファへ直接読みにいく（F-205）。`[performance]
+/// 応答を返した直後に、次の要求を蓄積バッファへ直接読みにいく（F-205、io_uring）。`[performance]
 /// keepalive_direct_read_ms`（既定 20ms）の間に届けば `Some`。届かなければ読みを取り消して `None`
 /// （バッファは返す。呼び出し側はバッファを持たない従来の待ち方に戻る。B-101）。
 ///
-/// - io_uring: RECV 1 回（`POLL_ADD` → `RECV` の 2 操作を 1 回に）。期限では ASYNC_CANCEL を投げて CQE を待つので、
-///   取り消しと行き違いで届いたデータも失わない。
-/// - epoll: `read(2)` を先に試す（届いていれば `EPOLL_CTL_MOD` と確認用の `poll(2)` を省く）。読みの Future を
-///   捨ててもデータはソケットに残る。B-75 の「イベントを見たという記録だけで待ちを省く」最適化とは違い、待ちを
-///   省くのは実際に読めたときだけ。
+/// RECV 1 回で受ける（`POLL_ADD` → `RECV` の 2 操作を 1 回に）。期限では ASYNC_CANCEL を投げて CQE を待つので、
+/// 取り消しと行き違いで届いたデータも失わない。
 ///
-/// 平文の接続だけ（TLS は復号の状態があるので従来どおり）。kqueue（`readable_lazy`）・WSAPoll は対象外。
-#[cfg(any(veil_rt_uring, veil_poller_epoll))]
+/// epoll では入れていない: `read(2)` を先に試す形を測ったところ、外れたときの空打ちが当たりで省ける
+/// `poll(2)`・`epoll_ctl` を上回り、`tools/api-bench` で −1.4〜−2.5% だった（F-205 のチケット）。
+/// 平文の接続だけ（TLS は復号の状態があるので従来どおり）。
+#[cfg(veil_rt_uring)]
 async fn keepalive_direct_read(tls_stream: &ServerTls) -> Option<(io::Result<usize>, BytesMut)> {
     let wait = CURRENT_CONFIG.load().performance.keepalive_direct_read();
     if wait.is_zero()
@@ -5371,26 +5366,17 @@ async fn keepalive_direct_read(tls_stream: &ServerTls) -> Option<(io::Result<usi
         return None;
     }
     let buf = crate::pool::accum_buf_get();
-    #[cfg(veil_rt_uring)]
-    {
-        let (res, buf) = tls_stream.get_ref().read_within(buf, wait).await;
-        match res {
-            Some(r) => Some((r, buf)),
-            None => {
-                crate::pool::accum_buf_put(buf);
-                None
-            }
+    let (res, buf) = tls_stream.get_ref().read_within(buf, wait).await;
+    match res {
+        Some(r) => Some((r, buf)),
+        None => {
+            crate::pool::accum_buf_put(buf);
+            None
         }
-    }
-    #[cfg(veil_poller_epoll)]
-    {
-        // 期限で Future ごとバッファを捨てる（アイドルへ移る接続だけ。データはソケットに残る）
-        crate::runtime::time::timeout(wait, tls_stream.get_ref().read(buf))
-            .await
-            .ok()
     }
 }
 
+// 統一されたリクエスト処理ループ（型エイリアスを使用）
 async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: SocketAddr) {
     // B-101: 要求の蓄積バッファは、データが届いてからスレッドローカルのプールで借りる
     // （接続ごとに 64KB を確保して接続の寿命まで抱えない）。
@@ -5424,7 +5410,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
             let read_result = timeout_idle(IDLE_TIMEOUT, idle, async {
                 if wait_first {
                     // F-205: 応答の直後は、次の要求を蓄積バッファへ直接読みにいく（届けば 1 回の操作で済む）
-                    #[cfg(any(veil_rt_uring, veil_poller_epoll))]
+                    #[cfg(veil_rt_uring)]
                     if let Some((res, buf)) = keepalive_direct_read(&tls_stream).await {
                         return Ok::<_, io::Error>(KeepaliveRead::Direct(res, buf));
                     }
@@ -5453,6 +5439,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     }
                 },
                 // F-205: 蓄積バッファへ直接読んだ（写しが要らない）
+                #[cfg(veil_rt_uring)]
                 Ok(Ok(KeepaliveRead::Direct(res, buf))) => match res {
                     Ok(n) if n > 0 => accumulated = buf,
                     _ => {

@@ -34,7 +34,7 @@ The following table lists default values for major configuration options:
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT balancing |
 | `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
-| `[performance]` | `keepalive_direct_read_ms` | `20` | Plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
+| `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring, plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries |
