@@ -124,7 +124,7 @@ fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
 }
 
 /// ノンブロッキングソケットを作成する。
-fn create_nonblocking_socket(domain: i32) -> io::Result<RawFd> {
+pub(crate) fn create_nonblocking_socket(domain: i32) -> io::Result<RawFd> {
     ensure_wsa_started();
     let sock = unsafe { socket(domain, SOCK_STREAM, IPPROTO_TCP as i32) };
     if sock == INVALID_SOCKET {

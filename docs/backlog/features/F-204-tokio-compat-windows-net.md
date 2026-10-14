@@ -1,6 +1,6 @@
 # F-204: Windows の `veil::tokio` に `net`・`signal` を実装する
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景
 
@@ -75,3 +75,28 @@ F-203（各 OS での API の E2E）で、Windows の `veil::tokio`（tokio 互�
 ## 見積もり
 
 `sys_windows.rs` が 500〜700 行、移動が 3,100 行（差分は `libc::` の置き換え）。
+
+## 実装（2026-10-14）
+
+- `src/tokio/net.rs` を `src/tokio/net/` に分けた: `mod.rs`（準備待ち・TCP・UDP・アドレス解決。OS に依る呼び出しは
+  全部 `sys::` を通す）、`sys_unix.rs`（今までの libc の呼び出しをそのまま移した）、`sys_windows.rs`（Winsock）、
+  `unix_impl.rs`（Unix ドメインソケット・`AsyncFd`、`cfg(unix)`）。ソケットオプションは `Opt` 列挙で渡し、OS ごとの番号は
+  `sys` が決める。
+- Windows: ソケット作成は reactor の `create_nonblocking_socket`（`pub(crate)` にした）、`writev`/`readv` は
+  `WSASend`/`WSARecv`（std の `IoSlice` は `WSABUF` と同じ配置）、`shutdown(Read|Both)` の後は読み取りの待ち手を起こす
+  （B-88）、0 バイトの `MSG_PEEK` の `recvfrom` が返す `WSAEMSGSIZE` は送り主を返す（socket2 と同じ）。trait は
+  `AsRawSocket`・`AsSocket`（`TcpSocket` は `FromRawSocket`・`IntoRawSocket` も）。`TcpSocket::set_reuseport` は unix だけ。
+- `net::windows::named_pipe` は型と設定の関数だけ（開くと `Unsupported`）。hyper-util が型を名前で参照するため。
+- `signal`: unix は今まで通り。Windows は `SetConsoleCtrlHandler` で `ctrl_c`・`signal::windows::{ctrl_c, ctrl_break,
+  ctrl_close, ctrl_logoff, ctrl_shutdown}`。受け手のいない種類は FALSE を返して次のハンドラ（veil 本体の ctrlc）へ回す。
+  閉じる・ログオフ・シャットダウンはハンドラから戻るとプロセスが終わるので、受け手がいれば戻らずに待つ（tokio と同じ）。
+- `tools/tokio-compat/run_tokio_tests.py` を Windows でも動くようにした（taskkill /T・UTF-8・パス・unix だけの dev-deps）。
+
+## 結果
+
+- Windows 11（aofish）: `tools/tokio-compat/ecosystem` 全項目 ok（hyper サーバ・h2c クライアント 50 並行・reqwest・
+  tower-http・axum・sqlx sqlite。postgres は未設定で skip）。tokio 1.53.2 の試験（net・io・signal の分類）:
+  net 79/79、io 99/101（失敗 2 件は Linux と同じ `io_driver` のランタイム破棄時の起床）。
+  `docs/artifacts/f204_tokio_tests_windows.md`。
+- Linux（unix の移動の確認）: io_uring は net 113/113・io 123/130・signal 9/11、epoll は net 112/113（`uds_stream::epollhup`
+  は main でも同じく失敗する既存の差）で、移動前と同じ。`docs/artifacts/f204_tokio_tests_{uring,epoll}.md`。

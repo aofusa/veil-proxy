@@ -473,8 +473,10 @@ Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works witho
   `sync` (mpsc, oneshot, watch, broadcast, `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`,
   `SetOnce`), `signal`, `fs`, `select!`/`join!`/`try_join!`/`pin!`, `runtime::{Runtime, Builder, Handle}`.
 - Not supported: `process`, runtime metrics, task dumps/tracing hooks, io_uring-backed `fs`, Windows named pipes.
-  On **Windows**, `net` and `signal` are not available yet (F-204), so crates that open sockets themselves
-  (hyper/axum servers, reqwest, sqlx) do not build on the shim there; services mounted with `tokio_service` work.
+  On **Windows** (F-204), `net` has TCP, UDP and `lookup_host` (Unix sockets and `AsyncFd` are unix-only, as in
+  tokio; `net::windows::named_pipe` exists so that crates referring to it build, but pipes cannot be opened), and
+  `signal` has `ctrl_c` and `signal::windows::{ctrl_c, ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown}`
+  (`SetConsoleCtrlHandler`; an event nobody listens for goes on to the next handler, e.g. veil's own Ctrl-C shutdown).
   Crates that need these (or tokio's internals) should use `tokio-compat-bridge`.
 
 ### Compatibility
@@ -932,7 +934,7 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 | FreeBSD 14.3 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | OpenBSD 7.9 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | NetBSD 10.1 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Windows 11 x86_64 (WSAPoll) | ✓ (no SIGHUP/secret-swap tests) | ✓ (no SIGHUP) | ✓ | ✓ (MSVC) | ✓ | – (no `net`, F-204) |
+| Windows 11 x86_64 (WSAPoll) | ✓ (no SIGHUP/secret-swap tests) | ✓ (no SIGHUP) | ✓ | ✓ (MSVC) | ✓ | ✓ (F-204) |
 
 - **Windows** has no signals: configuration reload with SIGHUP and graceful shutdown on SIGTERM are not available
   (Ctrl-C stops the process). `veil::tokio` has no `net`/`signal` there yet (see [tokio compatibility](#tokio-compatibility)).

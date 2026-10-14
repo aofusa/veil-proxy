@@ -359,17 +359,20 @@ pub(crate) type SafeWakerCache = Option<(Waker, Waker)>;
 
 /// [`WithSafeWaker`] の置き場を外から借りる版。API ライブラリの HTTP/1.1 の接続が持ち、キープアライブの
 /// 要求をまたいで包んだ Waker を使い回す（要求ごとに `Arc` を作らない。F-202）。
+#[cfg(feature = "handler")]
 pub(crate) struct WithSafeWakerIn<'a, F> {
     fut: F,
     cache: &'a mut SafeWakerCache,
 }
 
+#[cfg(feature = "handler")]
 impl<'a, F> WithSafeWakerIn<'a, F> {
     pub(crate) fn new(fut: F, cache: &'a mut SafeWakerCache) -> WithSafeWakerIn<'a, F> {
         WithSafeWakerIn { fut, cache }
     }
 }
 
+#[cfg(feature = "handler")]
 impl<F: Future> Future for WithSafeWakerIn<'_, F> {
     type Output = F::Output;
 

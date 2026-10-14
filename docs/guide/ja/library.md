@@ -455,8 +455,10 @@ veil のランタイム（current-thread または multi-thread）を起動し�
   `lookup_host`）、`sync`（mpsc・oneshot・watch・broadcast・`Mutex`・`RwLock`・`Semaphore`・`Notify`・`Barrier`・
   `OnceCell`・`SetOnce`）、`signal`、`fs`、`select!`/`join!`/`try_join!`/`pin!`、`runtime::{Runtime, Builder, Handle}`。
 - 非対応: `process`、ランタイムのメトリクス、タスクダンプ・トレースのフック、io_uring を使う `fs`、Windows の名前付きパイプ。
-  **Windows** ではまだ `net` と `signal` がありません（F-204）。自分でソケットを開くクレート（hyper・axum のサーバ、reqwest、
-  sqlx）は Windows ではシムの上でビルドできません。`tokio_service` で載せるサービスは動きます。
+  **Windows**（F-204）の `net` は TCP・UDP・`lookup_host`（Unix ドメインソケットと `AsyncFd` は tokio と同じく unix だけ。
+  `net::windows::named_pipe` は参照するクレートがビルドできるように型だけあり、パイプは開けません）、`signal` は `ctrl_c` と
+  `signal::windows::{ctrl_c, ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown}`（`SetConsoleCtrlHandler`。受け手のいない
+  イベントは次のハンドラ、たとえば veil 本体の Ctrl-C での停止へ回します）。
   これらや tokio の内部を必要とするクレートは `tokio-compat-bridge` を使ってください。
 
 ### 互換性
@@ -894,7 +896,7 @@ FastAPI 0.143・uvicorn 0.54（uvloop・httptools）・pydantic 2。uvicorn の�
 | FreeBSD 14.3 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | OpenBSD 7.9 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | NetBSD 10.1 x86_64（kqueue） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Windows 11 x86_64（WSAPoll） | ✓（SIGHUP・Secret の差し替えの試験を除く） | ✓（SIGHUP を除く） | ✓ | ✓（MSVC） | ✓ | –（`net` が無い。F-204） |
+| Windows 11 x86_64（WSAPoll） | ✓（SIGHUP・Secret の差し替えの試験を除く） | ✓（SIGHUP を除く） | ✓ | ✓（MSVC） | ✓ | ✓（F-204） |
 
 - **Windows** にはシグナルがありません。SIGHUP による設定の再読み込みと SIGTERM による graceful shutdown は使えません
   （Ctrl-C で止まります）。`veil::tokio` には Windows ではまだ `net`・`signal` がありません（[tokio 互換](#tokio-互換)）。

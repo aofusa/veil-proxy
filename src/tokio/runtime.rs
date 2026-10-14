@@ -282,8 +282,7 @@ pub(crate) fn time_enabled_in_context() -> bool {
         .unwrap_or(true)
 }
 
-/// 文脈のランタイムで I/O が使えるか（使うのは unix だけの `net`）。
-#[cfg(unix)]
+/// 文脈のランタイムで I/O が使えるか（`net` が使う）。
 pub(crate) fn io_enabled_in_context() -> bool {
     CONTEXT
         .try_with(|c| c.borrow().last().map(|h| h.inner.io_enabled))
