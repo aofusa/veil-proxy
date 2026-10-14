@@ -422,6 +422,69 @@ async fn h3_call_with<Req: Message, Resp: Message + Default>(
     Ok((out, status))
 }
 
+/// HTTP/3 の双方向ストリーミングが全二重か（F-209 #5）: 1 通送って応答を受け取ってから次を送る。
+/// 要求本文を受け終えてから呼ぶ半二重の実装では最初の応答が来ずにタイムアウトする。
+async fn h3_ping_pong(
+    send: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    authority: &str,
+) -> Result<(), String> {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{}/demo.v1.Demo/Chat", authority))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(request).await.map_err(|e| e.to_string())?;
+    let mut buf = BytesMut::new();
+    let mut got_head = false;
+    for word in ["ping", "pong", "veil"] {
+        stream
+            .send_data(frame(&ChatMessage { text: word.into() }))
+            .await
+            .map_err(|e| e.to_string())?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            if !got_head {
+                stream.recv_response().await.map_err(|e| e.to_string())?;
+                got_head = true;
+            }
+            loop {
+                if buf.len() >= 5 {
+                    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                    if buf.len() >= 5 + len {
+                        let m = ChatMessage::decode(&buf[5..5 + len]).map_err(|e| e.to_string())?;
+                        buf.advance(5 + len);
+                        return Ok::<_, String>(m);
+                    }
+                }
+                match stream.recv_data().await.map_err(|e| e.to_string())? {
+                    Some(mut chunk) => {
+                        while chunk.has_remaining() {
+                            let c = chunk.chunk();
+                            buf.extend_from_slice(c);
+                            let n = c.len();
+                            chunk.advance(n);
+                        }
+                    }
+                    None => return Err("stream ended".into()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("no reply to {:?} before the request ended (half duplex)", word))??;
+        ensure!(reply.text == word.to_uppercase(), "got {:?}", reply);
+    }
+    stream.finish().await.map_err(|e| e.to_string())?;
+    while stream.recv_data().await.map_err(|e| e.to_string())?.is_some() {}
+    let trailers = stream.recv_trailers().await.map_err(|e| e.to_string())?;
+    let status = trailers
+        .as_ref()
+        .and_then(|t| t.get("grpc-status"))
+        .map(|v| v.to_str().unwrap_or("").to_string());
+    ensure!(status.as_deref() == Some("0"), "grpc-status {:?}", status);
+    Ok(())
+}
+
 async fn h3_checks(addr: std::net::SocketAddr) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder()
@@ -488,12 +551,17 @@ async fn h3_checks(addr: std::net::SocketAddr) {
     let msgs = vec![ChatMessage { text: "a".into() }, ChatMessage { text: "b".into() }];
     let r = h3_call::<_, ChatMessage>(&mut send, &authority, "/demo.v1.Demo/Chat", &msgs).await;
     report(
-        "h3 bidi (half duplex)",
+        "h3 bidi",
         r.and_then(|(m, s)| {
             ensure!(s == "0", "grpc-status {}", s);
             ensure!(m.len() == 2 && m[1].text == "B", "got {:?}", m);
             Ok(())
         }),
+    );
+
+    report(
+        "h3 bidi ping_pong (full duplex, F-209)",
+        h3_ping_pong(&mut send, &authority).await,
     );
 
     let t = std::time::Instant::now();
