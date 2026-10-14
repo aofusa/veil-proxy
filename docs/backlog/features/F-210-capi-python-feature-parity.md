@@ -77,16 +77,28 @@ HTTP のハンドラだけを持つ。
   - ストリーミング: `veil_grpc_recv(call, &ptr, &len)`（ブロック、0 で終わり）・`veil_grpc_send(call, ptr, len)`・
     `veil_grpc_finish(call, code, message)`。メタデータ・期限・トレーラの取得・設定関数。
   - サンプル `examples/api/c-grpc` は protobuf-c（または nanopb）で符号化する。
-- Python: grpcio の生成コード（`grpc_tools.protoc` の `*_pb2_grpc.py`）を**そのまま使える**ようにする。
-  - `veil.grpc.Server` は grpcio の `add_generic_rpc_handlers` / `add_registered_method_handlers` を受け取り、
-    `RpcMethodHandler`（`unary_unary` 等の 4 種類と `request_deserializer`・`response_serializer`）を veil に登録する。
-    直列化はその生成コードの関数（利用者が選んだ protobuf ライブラリ）が行う。
-  - `context` は grpcio の `ServicerContext` の主要部分（`abort`・`set_code`・`set_details`・`invocation_metadata`・
-    `set_trailing_metadata`・`time_remaining`・`is_active`）を持つ。`grpc.aio` 形式（`async def`）も 2 のイベントループで動かす。
-  - grpcio 本体（C++ のコア）は必須にしない（生成コードが `import grpc` するので、`grpc` が無い環境では
-    `veil.grpc` が最小の `grpc` 互換モジュールを提供するか、grpcio を入れてもらうかを着手時に決める。生成コードが使うのは
-    `grpc.unary_unary_rpc_method_handler` 等と `StatusCode` だけ）。
-  - `@veil.grpc_unary("/pkg.Svc/M", request_deserializer=..., response_serializer=...)` の素の登録も持つ。
+- Python: **2 層**にする（2026-10-14 決定）。どちらも同じ Rust の土台（`BytesCodec`）の上に載り、上の層は下の層だけで書く。
+  - **基本の層（依存無し）**: `veil.grpc.unary_unary(path, handler, request_deserializer=None, response_serializer=None)`・
+    `unary_stream`・`stream_unary`・`stream_stream`（デコレータ形 `@veil.grpc.unary_unary("/pkg.Svc/M", ...)` も）。
+    直列化は「`bytes` → オブジェクト」「オブジェクト → `bytes`」の任意の関数で、省略すると `bytes` のまま渡す。
+    grpcio と同じ引数名なので、どの protobuf ライブラリでも同じ書き方になる:
+    `protobuf` は `Msg.FromString` / `Msg.SerializeToString`、betterproto は `Msg().parse` / `bytes`、JSON なら `json.loads` / `json.dumps`。
+    `context` は下の `ServicerContext` 互換と同じもの（grpcio が無くても動く。状態コードは `veil.grpc.StatusCode`）。
+  - **grpcio の層（任意依存）**: `pip install veil[grpc]`（`pyproject.toml` の optional-dependencies に `grpc = ["grpcio"]`。
+    pydantic と同じ扱い）。`veil.grpc.Server` が grpcio の `add_generic_rpc_handlers` と `add_registered_method_handlers`
+    （新しい grpcio-tools の生成コードが使う）を受け、各 `RpcMethodHandler` の 4 種類と直列化関数を基本の層に登録する。
+    `grpc_tools.protoc` が生成した `add_<Service>Servicer_to_server(servicer, server)` と servicer のクラスが**そのまま動く**。
+    `context` は grpcio の `ServicerContext` の主要部分（`abort`・`abort_with_status`・`set_code`・`set_details`・
+    `invocation_metadata`・`send_initial_metadata`・`set_trailing_metadata`・`time_remaining`・`is_active`・`peer`）を持ち、
+    状態コードは `grpc.StatusCode` をそのまま受ける。`grpc.aio` 形式（`async def` のメソッド・非同期ジェネレータ）は
+    F-212 のイベントループで動かす。
+  - `grpc` という名前の偽モジュールは提供しない（本物の grpcio と同じ環境に入ると衝突し、どちらが読まれるかで挙動が変わるため）。
+    grpcio の生成コード（`*_pb2_grpc.py`）を使う人は `veil[grpc]` を入れる。生成コードを使わない人は grpcio 不要。
+  - grpcio-tools（`.proto` からの生成）は利用者の開発時の道具で、veil の依存にしない。`*_pb2.py` が使う `protobuf` も利用者の依存。
+  - 対応しないもの（記録）: betterproto・grpclib のサービス基底クラス（`ServiceBase`）をそのまま載せる層。betterproto の
+    メッセージは基本の層で使える。要望があれば 3 つ目の層として足せる（基本の層の上に 100 行程度）。
+  - 試験: `examples/api/python-grpc` を grpcio-tools の生成コード + `veil.grpc.Server` で書き、`rust-grpc` と同じ tonic
+    クライアントの試験を流す。基本の層は grpcio を入れない venv で、`protobuf` の `FromString` 版と生の `bytes` 版を試す。
 
 ### 5. GraphQL
 
@@ -118,7 +130,8 @@ veil に GraphQL の処理は持たない（F-207 と同じ方針）。
 ## 受け入れ条件
 
 - 上の表の C・Python の × が ○ になり、`library_e2e.sh` で確かめられている。
-- C・Python の直列化は利用者が選ぶ（veil-capi・veil-python に protobuf・GraphQL のライブラリへの依存が無い）。
+- C・Python の直列化は利用者が選ぶ（veil-capi・veil-python の必須依存に protobuf・GraphQL のライブラリが無い。grpcio は
+  Python の任意依存 `veil[grpc]` のみで、grpcio 無しでも基本の層で gRPC を提供できる）。
 - `crates/veil-capi/README.md`・`include/veil.h`・`crates/veil-python/README.md`・`docs/guide/library.md`（英日）を更新する。
 
 ## 関連
