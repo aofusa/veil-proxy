@@ -43,6 +43,10 @@ AT = os.path.join(HERE, "axum-tokio", "target", "release", "api-bench-axum-tokio
 AV = os.path.join(HERE, "axum-veil", "target", "release", "api-bench-axum-veil")
 # reactor（epoll）版: cd axum-veil && CARGO_TARGET_DIR=target-epoll cargo build --release --features epoll
 AVE = os.path.join(HERE, "axum-veil", "target-epoll", "release", "api-bench-axum-veil")
+# HTTP/3 版（--proto h3）: cd axum-veil && CARGO_TARGET_DIR=target-h3 cargo build --release --features http3
+#                          （epoll: CARGO_TARGET_DIR=target-h3-epoll cargo build --release --features http3,epoll）
+AVH3 = os.path.join(HERE, "axum-veil", "target-h3", "release", "api-bench-axum-veil")
+AVH3E = os.path.join(HERE, "axum-veil", "target-h3-epoll", "release", "api-bench-axum-veil")
 PY = os.path.join(VENV, "bin", "python")
 UV = os.path.join(VENV, "bin", "uvicorn")
 PYDIR = os.path.join(HERE, "python")
@@ -181,7 +185,7 @@ def h2load(path, duration, conns, proto):
         v = float(mean.group(1))
         m = f"{v / 1000 if mean.group(2) == 'us' else v * 1000 if mean.group(2) == 's' else v:.3f}"
     return {
-        "rps": rps.group(1) if rps else "NA",
+        "rps": rps.group(1) if rps and float(rps.group(1)) > 0 else "NA",
         "p50_ms": m,
         "p99_ms": "NA",
         "errors": (f"failed={fails.group(1)}" if fails and fails.group(1) != "0" else "")
@@ -216,7 +220,7 @@ def run_one(name, spec, endpoint, duration, conns, warmup, proto="h1"):
         res["cores_pct"] = f"{100 * (b1 - b0) / hz / (t1 - t0):.0f}"
         # サーバのコアの busy 時間 / 要求数（wrk の計測時間 ≒ t1 - t0）
         res["us_per_req"] = (f"{1e6 * (b1 - b0) / hz / (float(res['rps']) * duration):.1f}"
-                             if res["rps"] != "NA" else "NA")
+                             if res["rps"] != "NA" and float(res["rps"]) > 0 else "NA")
         res["rss_mb"] = f"{rss_mb(tree_pids(p.pid)):.1f}"
         return res
     finally:
@@ -283,7 +287,10 @@ def main():
     targets = TARGETS[a.group]
     if a.proto == "h3":
         # HTTP/3 は veil の HTTP サーバだけ（axum に HTTP/3 は無い）。自己署名の証明書を作る
-        targets = {n: s for n, s in targets.items() if "native" in n or "mount" in n}
+        targets = {
+            "veil native handler": ([AVH3, "native", ADDR, str(THREADS)], {}, None),
+            "veil native handler [epoll]": ([AVH3E, "native", ADDR, str(THREADS)], {}, None),
+        }
         make_cert()
     if a.only:
         keys = [k.strip() for k in a.only.split(",")]

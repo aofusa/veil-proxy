@@ -50,6 +50,21 @@ python3 tools/api-bench/run_bench.py --summary docs/artifacts/api_bench_rust.tsv
   コアの busy。ループバックのソフト割り込みを含む）、`us_per_req`（`cores_pct` から求めた 1 要求あたりの CPU 時間）、`rss_mb`。
 - 計測前に他の負荷が無いことを確かめる（`top`。tokio のテストハーネスの取り残しが CPU を使い続けていたことがある）。
 
+## HTTP/2・HTTP/3（F-206）
+
+```bash
+(cd tools/api-bench/axum-veil && CARGO_TARGET_DIR=target-h3 cargo build --release --features http3 && \
+   CARGO_TARGET_DIR=target-h3-epoll cargo build --release --features http3,epoll)
+python3 tools/api-bench/run_bench.py --group rust --proto h2c --only "percore,native" --out ...   # h2load（docker local/h2load）
+python3 tools/api-bench/run_bench.py --group rust --proto h3 --out ...                          # h2load-h3（local/h2load-h3）
+```
+
+- `--proto h2c` は h2load の prior knowledge（`-c` 接続 × `-m`（`H2LOAD_STREAMS`、既定 10）本の同時ストリーム）。axum も
+  `http2` feature で h2c を受ける。
+- `--proto h3` は veil のネイティブハンドラだけ（axum に HTTP/3 は無い）。`target/api-bench-{cert,key}.pem` に自己署名の
+  証明書を作り、`BENCH_TLS_CERT`・`BENCH_TLS_KEY` で TLS + HTTP/3 を同じアドレスで受ける。
+- h2load は p50/p99 を出さないので、`p50_ms` の列に平均（`time for request` の mean）を入れる。
+
 ## 改修前後の交互 A/B と確保の回数（F-202）
 
 ```bash
