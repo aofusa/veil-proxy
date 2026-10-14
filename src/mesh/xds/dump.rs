@@ -17,6 +17,61 @@ fn addr_json(a: &Option<p::Address>) -> Value {
     }
 }
 
+/// フィルタの typed_config（istioctl は種類と HCM の RDS 名・tcp_proxy のクラスタ名を読む）。
+fn filter_json(f: &p::Filter) -> Value {
+    let ty = f
+        .typed_config
+        .as_ref()
+        .map(|a| a.type_url.clone())
+        .unwrap_or_default();
+    let tc = if ty == p::T_HCM {
+        let hcm: Option<p::HttpConnectionManager> = f
+            .typed_config
+            .as_ref()
+            .and_then(|a| p::decode_any(a, p::T_HCM));
+        let mut v = json!({"@type": ty});
+        if let Some(h) = hcm {
+            v["stat_prefix"] = json!(h.stat_prefix);
+            match &h.route_specifier {
+                Some(p::hcm::RouteSpecifier::Rds(r)) => {
+                    v["rds"] = json!({"route_config_name": r.route_config_name, "config_source": {"ads": {}}})
+                }
+                Some(p::hcm::RouteSpecifier::RouteConfig(rc)) => v["route_config"] = route_json(rc),
+                None => {}
+            }
+            v["http_filters"] = Value::Array(
+                h.http_filters
+                    .iter()
+                    .map(|hf| json!({"name": hf.name, "typed_config": opaque_typed(hf.typed_config.as_ref())}))
+                    .collect(),
+            );
+        }
+        v
+    } else if ty == p::T_TCP_PROXY {
+        let tp: Option<p::TcpProxy> = f
+            .typed_config
+            .as_ref()
+            .and_then(|a| p::decode_any(a, p::T_TCP_PROXY));
+        let mut v = json!({"@type": ty});
+        if let Some(t) = tp {
+            v["stat_prefix"] = json!(t.stat_prefix);
+            if let Some(p::tcp_proxy::ClusterSpecifier::Cluster(c)) = &t.cluster_specifier {
+                v["cluster"] = json!(c);
+            }
+        }
+        v
+    } else {
+        opaque_typed(f.typed_config.as_ref())
+    };
+    json!({"name": f.name, "typed_config": tc})
+}
+
+/// 中身を出さない typed_config（protojson で読めるよう TypedStruct に包む）。
+fn opaque_typed(a: Option<&p::Any>) -> Value {
+    let inner = a.map(|a| a.type_url.clone()).unwrap_or_default();
+    json!({"@type": p::T_TYPED_STRUCT_UDPA, "type_url": inner, "value": {}})
+}
+
 fn listener_json(l: &p::Listener) -> Value {
     let chains: Vec<Value> = l
         .filter_chains
@@ -39,11 +94,14 @@ fn listener_json(l: &p::Listener) -> Value {
             if !m.server_names.is_empty() {
                 mj.insert("server_names".into(), json!(m.server_names));
             }
-            json!({
-                "name": fc.name,
+            let mut fcj = json!({
                 "filter_chain_match": Value::Object(mj),
-                "filters": fc.filters.iter().map(|f| json!({"name": f.name})).collect::<Vec<_>>(),
-            })
+                "filters": fc.filters.iter().map(filter_json).collect::<Vec<_>>(),
+            });
+            if !fc.name.is_empty() {
+                fcj["name"] = json!(fc.name);
+            }
+            fcj
         })
         .collect();
     let mut v = json!({
@@ -182,12 +240,57 @@ pub fn config_dump(query: &str) -> String {
             .collect();
         configs.push(json!({"@type": "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump", "dynamic_endpoint_configs": eps}));
     }
-    let secrets: Vec<Value> = crate::mesh::identity::summary()
+    let b64 = |b: &[u8]| crate::mesh::httpcore::base64_encode(b);
+    let secrets: Vec<Value> = crate::mesh::identity::pems()
         .into_iter()
-        .map(|(n, _, _)| json!({"name": n, "secret": {"@type": p::TYPE_SECRET, "name": n}}))
+        .map(|(n, chain, ca)| {
+            let mut sec = json!({"@type": p::TYPE_SECRET, "name": n});
+            if let Some(c) = chain {
+                sec["tls_certificate"] = json!({
+                    "certificate_chain": {"inline_bytes": b64(&c)},
+                    "private_key": {"inline_string": "[redacted]"}
+                });
+            }
+            if let Some(ca) = ca {
+                sec["validation_context"] = json!({"trusted_ca": {"inline_bytes": b64(&ca)}});
+            }
+            json!({"name": n, "version_info": "", "secret": sec})
+        })
         .collect();
     configs.push(json!({"@type": "type.googleapis.com/envoy.admin.v3.SecretsConfigDump", "dynamic_active_secrets": secrets}));
     json!({"configs": configs}).to_string()
+}
+
+/// `/clusters?format=json`（istioctl `proxy-config endpoints`）。
+pub fn clusters_json() -> String {
+    let reg = crate::mesh::state::state()
+        .registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut names: Vec<&String> = reg.clusters.keys().collect();
+    names.sort();
+    let statuses: Vec<Value> = names
+        .iter()
+        .map(|n| {
+            let slot = &reg.clusters[*n];
+            let hosts: Vec<Value> = slot
+                .endpoints
+                .load()
+                .endpoints
+                .iter()
+                .map(|e| {
+                    json!({
+                        "address": {"socket_address": {"address": e.addr.ip().to_string(), "port_value": e.addr.port()}},
+                        "health_status": {"eds_health_status": if e.healthy { "HEALTHY" } else { "UNHEALTHY" }},
+                        "weight": e.weight,
+                        "locality": {"region": e.locality.0, "zone": e.locality.1, "sub_zone": e.locality.2},
+                    })
+                })
+                .collect();
+            json!({"name": n, "host_statuses": hosts})
+        })
+        .collect();
+    json!({"cluster_statuses": statuses}).to_string()
 }
 
 /// `/clusters`（テキスト。`<cluster>::<addr>::health_flags::healthy` の形）。

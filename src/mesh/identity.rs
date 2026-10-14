@@ -27,6 +27,8 @@ pub static PROVIDER: Lazy<Arc<CryptoProvider>> =
 pub struct Roots {
     pub store: Arc<RootCertStore>,
     pub client_verifier: Arc<dyn ClientCertVerifier>,
+    /// 信頼アンカーの PEM（管理 API 用）
+    pub pem: Vec<u8>,
 }
 
 impl std::fmt::Debug for Roots {
@@ -44,6 +46,8 @@ pub struct OwnCert {
     pub uri: String,
     /// 有効期限（UNIX 秒）
     pub not_after: i64,
+    /// 証明書チェーンの PEM（管理 API の `config_dump` に出す。鍵は持たない）
+    pub chain_pem: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -86,10 +90,12 @@ pub fn set_cert_der(
         })
         .unwrap_or_default();
     let not_after = parse_not_after(&leaf).unwrap_or(0);
+    let chain_pem = chain.iter().map(|c| der_to_pem(c)).collect::<String>().into_bytes();
     let own = Arc::new(OwnCert {
         key: Arc::new(CertifiedKey::new(chain, signing)),
         uri,
         not_after,
+        chain_pem,
     });
     STORE.rcu(|cur| {
         let mut certs = cur.certs.clone();
@@ -124,6 +130,7 @@ pub fn set_roots_pem(name: &str, pem: &[u8]) -> Result<(), String> {
     let roots = Arc::new(Roots {
         store,
         client_verifier,
+        pem: pem.to_vec(),
     });
     STORE.rcu(|cur| {
         let mut r = cur.roots.clone();
@@ -134,6 +141,34 @@ pub fn set_roots_pem(name: &str, pem: &[u8]) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+/// DER の証明書を PEM にする。
+pub fn der_to_pem(der: &[u8]) -> String {
+    let b64 = super::httpcore::base64_encode(der);
+    let mut s = String::with_capacity(b64.len() + 64);
+    s.push_str("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        s.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        s.push('\n');
+    }
+    s.push_str("-----END CERTIFICATE-----\n");
+    s
+}
+
+/// 証明書・信頼アンカーの PEM（管理 API の config_dump。名前 → (証明書チェーン, 信頼アンカー)）。
+pub fn pems() -> Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let s = STORE.load();
+    let mut v: Vec<_> = s
+        .certs
+        .iter()
+        .map(|(k, c)| (k.clone(), Some(c.chain_pem.clone()), None))
+        .collect();
+    for (k, r) in &s.roots {
+        v.push((k.clone(), None, Some(r.pem.clone())));
+    }
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 pub fn cert(name: &str) -> Option<Arc<OwnCert>> {

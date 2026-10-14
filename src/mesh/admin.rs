@@ -181,6 +181,9 @@ fn route(method: &str, path: &str, query: &str) -> (u16, &'static str, String) {
             "application/json",
             super::xds::dump::config_dump(query),
         ),
+        "/clusters" if query.contains("format=json") => {
+            (200, "application/json", super::xds::dump::clusters_json())
+        }
         "/clusters" => (200, "text/plain", super::xds::dump::clusters_text()),
         "/listeners" => (200, "text/plain", super::xds::dump::listeners_text()),
         "/memory" => (

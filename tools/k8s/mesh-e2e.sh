@@ -285,6 +285,16 @@ EOF
   out="$(cexec curl -s -m 10 http://whoami."$NS"/)" || true
   if echo "$out" | grep -q "^Hostname: whoami"; then ok "mesh client still allowed under STRICT"; else bad "STRICT mesh client: $out"; fi
   kubectl -n "$NS" delete peerauthentication default >/dev/null
+  # istioctl proxy-config（管理 API の config_dump・clusters?format=json を読む）
+  local cpod t pcok=1
+  cpod="$(kubectl -n "$NS" get pod -l app=client -o jsonpath='{.items[0].metadata.name}')"
+  for t in listeners clusters routes endpoints secret; do
+    out="$(istioctl proxy-config "$t" -n "$NS" "$cpod" 2>&1)" || pcok=0
+    if echo "$out" | grep -qiE "panic|error"; then pcok=0; fi
+    [ "$(echo "$out" | wc -l)" -ge 2 ] || pcok=0
+  done
+  if [ $pcok = 1 ] && istioctl proxy-config secret -n "$NS" "$cpod" 2>&1 | grep -q "default.*ACTIVE.*true"; then
+    ok "istioctl proxy-config listeners/clusters/routes/endpoints/secret"; else bad "istioctl proxy-config"; fi
   # 観測（受け側の標準メトリクス）
   local pod
   pod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
