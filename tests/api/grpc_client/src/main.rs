@@ -325,6 +325,103 @@ async fn health(ch: tonic::transport::Channel) -> Result<(), String> {
 }
 
 /// 多数の同時呼び出し（多重化）。
+async fn next_reflection(
+    s: &mut tonic::Streaming<tonic_reflection::pb::v1::ServerReflectionResponse>,
+) -> Result<tonic_reflection::pb::v1::server_reflection_response::MessageResponse, String> {
+    s.message()
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.message_response)
+        .ok_or_else(|| "missing response".to_string())
+}
+
+/// サーバリフレクション（F-209 #3）: 一覧・シンボルからファイルの記述子・見つからないときのエラー。v1alpha も。
+async fn reflection(ch: tonic::transport::Channel) -> Result<(), String> {
+    use tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient;
+    use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
+    use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
+    use tonic_reflection::pb::v1::ServerReflectionRequest;
+    let req = |m: MessageRequest| ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(m),
+    };
+    let reqs = vec![
+        req(MessageRequest::ListServices("*".into())),
+        req(MessageRequest::FileContainingSymbol("demo.v1.Demo".into())),
+        req(MessageRequest::FileContainingSymbol(
+            "demo.v1.Demo.SayHello".into(),
+        )),
+        req(MessageRequest::FileByFilename("demo.proto".into())),
+        req(MessageRequest::FileContainingSymbol("demo.v1.Nope".into())),
+    ];
+    let mut s = ServerReflectionClient::new(ch.clone())
+        .server_reflection_info(tokio_stream::iter(reqs))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    match next_reflection(&mut s).await? {
+        MessageResponse::ListServicesResponse(l) => {
+            let names: Vec<_> = l.service.iter().map(|s| s.name.as_str()).collect();
+            for want in [
+                "demo.v1.Demo",
+                "grpc.health.v1.Health",
+                "grpc.reflection.v1.ServerReflection",
+            ] {
+                ensure!(names.contains(&want), "{} not in {:?}", want, names);
+            }
+        }
+        other => return Err(format!("list: {:?}", other)),
+    }
+    for _ in 0..3 {
+        match next_reflection(&mut s).await? {
+            MessageResponse::FileDescriptorResponse(f) => {
+                let fd = prost_types::FileDescriptorProto::decode(&f.file_descriptor_proto[0][..])
+                    .map_err(|e| e.to_string())?;
+                ensure!(fd.name() == "demo.proto", "file {:?}", fd.name());
+                ensure!(
+                    fd.service
+                        .iter()
+                        .any(|s| s.name() == "Demo"
+                            && s.method.iter().any(|m| m.name() == "SayHello")),
+                    "service Demo missing"
+                );
+            }
+            other => return Err(format!("file: {:?}", other)),
+        }
+    }
+    match next_reflection(&mut s).await? {
+        MessageResponse::ErrorResponse(e) => ensure!(e.error_code == 5, "code {}", e.error_code),
+        other => return Err(format!("missing symbol: {:?}", other)),
+    }
+    // v1alpha（古いクライアント）
+    use tonic_reflection::pb::v1alpha as alpha;
+    let mut s = alpha::server_reflection_client::ServerReflectionClient::new(ch)
+        .server_reflection_info(tokio_stream::iter(vec![alpha::ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(
+                alpha::server_reflection_request::MessageRequest::ListServices("*".into()),
+            ),
+        }]))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    match s
+        .message()
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.message_response)
+    {
+        Some(alpha::server_reflection_response::MessageResponse::ListServicesResponse(l)) => {
+            ensure!(
+                l.service.iter().any(|s| s.name == "demo.v1.Demo"),
+                "v1alpha list"
+            );
+        }
+        other => return Err(format!("v1alpha: {:?}", other)),
+    }
+    Ok(())
+}
+
 async fn concurrent(c: &Client) -> Result<(), String> {
     let mut set = tokio::task::JoinSet::new();
     for i in 0..200 {
@@ -794,6 +891,10 @@ async fn main() {
         );
         report("h2 unimplemented method", unimplemented(ch.clone()).await);
         report("h2 health check/watch", health(ch.clone()).await);
+        report(
+            "h2 server reflection v1/v1alpha (F-209)",
+            reflection(ch.clone()).await,
+        );
         report("h2 200 concurrent calls", concurrent(&c).await);
     }
     if let Some(h3) = arg("--h3") {

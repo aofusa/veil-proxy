@@ -15,6 +15,8 @@
 //! - `fn add_<service>(app, svc) -> App`: 全メソッドを `App::grpc_*` で登録する（静的ディスパッチ）。
 //! - `SERVICE_NAME`・`METHODS`（`/<package>.<Service>/<Method>` の一覧）。
 //! - `ProstCodec`: prost のメッセージを符号化・復号する `veil::api::grpc::Codec` の実装（F-208）。
+//! - `FILE_DESCRIPTOR_SET`: コンパイルした `.proto`（と import 先）の `FileDescriptorSet`。
+//!   `App::grpc_reflection(&[FILE_DESCRIPTOR_SET])` でサーバリフレクションに使う（F-209）。
 //!   veil 本体は protobuf の実装に依存しないので、prost との橋渡しは生成コードが持つ。
 //!
 //! 生成コードは tokio・tonic に依存しない（`veil::api::grpc` と prost のみ）。利用者のクレートに `prost` の依存が要る
@@ -64,9 +66,23 @@ impl Builder {
         protos: &[impl AsRef<Path>],
         includes: &[impl AsRef<Path>],
     ) -> io::Result<()> {
+        // F-209: サーバリフレクション用に FileDescriptorSet を OUT_DIR に書き、生成コードから include_bytes! する。
+        // build.rs の外（OUT_DIR が無い）ではリフレクション用の定数を出さない。
+        let descriptor = std::env::var_os("OUT_DIR").map(|out| {
+            let stem = protos
+                .first()
+                .and_then(|p| p.as_ref().file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Path::new(&out).join(format!("veil_fds_{}.bin", stem))
+        });
+        if let Some(path) = &descriptor {
+            self.config.file_descriptor_set_path(path);
+        }
         self.config
             .service_generator(Box::new(VeilServiceGenerator {
                 veil: self.veil_path.clone(),
+                descriptor: descriptor.map(|p| p.to_string_lossy().into_owned()),
             }));
         self.config.compile_protos(protos, includes)
     }
@@ -75,12 +91,15 @@ impl Builder {
 /// サービス定義からサーバ側のコードを書く。
 pub struct VeilServiceGenerator {
     veil: String,
+    /// `FileDescriptorSet` のファイル（生成コードの `FILE_DESCRIPTOR_SET` が取り込む）
+    descriptor: Option<String>,
 }
 
 impl VeilServiceGenerator {
     pub fn new(veil_path: impl Into<String>) -> VeilServiceGenerator {
         VeilServiceGenerator {
             veil: veil_path.into(),
+            descriptor: None,
         }
     }
 }
@@ -146,6 +165,17 @@ impl ServiceGenerator for VeilServiceGenerator {
             let _ = write!(buf, "\"{}\", ", path_of(&service, m));
         }
         let _ = writeln!(buf, "];");
+        if let Some(d) = &self.descriptor {
+            let _ = writeln!(
+                buf,
+                "    /// コンパイルした `.proto` の `FileDescriptorSet`（`App::grpc_reflection` に渡す）。"
+            );
+            let _ = writeln!(
+                buf,
+                "    pub const FILE_DESCRIPTOR_SET: &[u8] = ::core::include_bytes!({:?});",
+                d
+            );
+        }
 
         // codec（F-208）: このクレートにローカルな型なので、prost の任意のメッセージ型に veil の trait を実装できる
         let _ = writeln!(

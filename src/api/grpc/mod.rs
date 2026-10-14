@@ -19,6 +19,7 @@
 //! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
 
 pub mod health;
+pub mod reflection;
 mod web;
 pub(crate) mod wire;
 
@@ -947,6 +948,7 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
         .and_then(|p| p.split_once('/'))
         .map(|(svc, _)| svc)
     {
+        reflection::record_service(service);
         let fallback = format!("/{}/{{*method}}", service);
         if !app.routes.iter().any(|r| r.path == fallback) {
             let func: HandlerFn = Arc::new(|req: super::request::Request| -> HandlerFuture {

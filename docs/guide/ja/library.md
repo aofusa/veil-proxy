@@ -601,6 +601,7 @@ App::new()
 | gRPC-Web | `application/grpc-web`・`application/grpc-web+proto` と base64 の `application/grpc-web-text(+proto)` を同じメソッドで受ける（HTTP/1.1・HTTP/2・HTTP/3）。トレーラは本文の最後の枠（フラグ `0x80`）で返すので、ブラウザ（grpc-web・Connect）から変換用のプロキシ無しで veil を直接呼べる。`OPTIONS` のプリフライトは `[api] grpc_web_cors_origins` で答える |
 | エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC（gRPC-Web を除く）は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
+| リフレクション | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` で `grpc.reflection.v1` と `v1alpha`（`ServerReflectionInfo`）を登録する。grpcurl・Postman・grpcui が `.proto` 無しでサービスの一覧と型を取得できる。`FILE_DESCRIPTOR_SET` は `veil-build` が生成する（コンパイルしたパッケージごとに渡す）。`list_services` は登録したすべての gRPC サービスを返す。組み込みのヘルスチェックとリフレクション自身の型は返さない |
 
 gRPC のルートは OpenAPI に載りません。完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・
 ヘルスチェック）で、`tests/api/library_e2e.sh grpc` が tonic のクライアントと HTTP/3 のクライアントで試験します。

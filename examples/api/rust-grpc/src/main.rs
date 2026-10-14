@@ -96,6 +96,10 @@ async fn main() -> Result<(), veil::api::Error> {
     ) {
         builder = builder.listen(&listen).tls(&cert, &key).http3(&listen);
     }
-    let app = App::new().config(builder.build()).grpc_health();
+    // ヘルスチェックとサーバリフレクション（grpcurl 等が .proto 無しで一覧・型を調べられる。F-209）
+    let app = App::new()
+        .config(builder.build())
+        .grpc_health()
+        .grpc_reflection(&[demo::demo_server::FILE_DESCRIPTOR_SET]);
     add_demo(app, DemoService).run()
 }

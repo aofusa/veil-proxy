@@ -1,6 +1,6 @@
 //! 組み込みのサービス（`grpc.health.v1` 等）のための最小の protobuf の符号化（F-208）。
 //!
-//! veil は protobuf の実装に依存しないので、組み込みのサービスの小さなメッセージ（文字列・列挙）は
+//! veil は protobuf の実装に依存しないので、組み込みのサービスの小さなメッセージ（文字列・列挙・入れ子のメッセージ）は
 //! ここで手書きする。未知のフィールドは読み飛ばす（proto3 の前方互換）。
 
 use super::Status;
@@ -41,6 +41,26 @@ pub(crate) fn put_bytes_field(out: &mut BytesMut, field: u32, v: &[u8]) {
     put_key(out, field, LEN);
     put_varint(out, v.len() as u64);
     out.put_slice(v);
+}
+
+/// 入れ子のメッセージ（空でも書く。oneof の選択を表すため）。
+pub(crate) fn put_message_field(out: &mut BytesMut, field: u32, v: &[u8]) {
+    put_key(out, field, LEN);
+    put_varint(out, v.len() as u64);
+    out.put_slice(v);
+}
+
+/// repeated int32（proto3 の既定の packed 形式）。空なら書かない。
+pub(crate) fn put_packed_int32_field(out: &mut BytesMut, field: u32, v: &[i32]) {
+    if v.is_empty() {
+        return;
+    }
+    let len: usize = v.iter().map(|x| varint_len(*x as i64 as u64)).sum();
+    put_key(out, field, LEN);
+    put_varint(out, len as u64);
+    for x in v {
+        put_varint(out, *x as i64 as u64);
+    }
 }
 
 /// int32・列挙（負の値は 10 バイトの varint）。proto3 の既定値（0）は書かない。
