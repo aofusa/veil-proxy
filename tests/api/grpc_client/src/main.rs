@@ -900,10 +900,12 @@ async fn main() {
         );
         report("h2 unimplemented method", unimplemented(ch.clone()).await);
         report("h2 health check/watch", health(ch.clone()).await);
-        report(
-            "h2 server reflection v1/v1alpha (F-209)",
-            reflection(ch.clone()).await,
-        );
+        if !args.iter().any(|a| a == "--no-reflection") {
+            report(
+                "h2 server reflection v1/v1alpha (F-209)",
+                reflection(ch.clone()).await,
+            );
+        }
         report("h2 200 concurrent calls", concurrent(&c).await);
     }
     if let Some(h3) = arg("--h3") {

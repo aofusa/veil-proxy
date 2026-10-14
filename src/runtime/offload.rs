@@ -555,6 +555,63 @@ fn poll_wait_done(done: &AtomicBool) {
     }
 }
 
+/// 別スレッドから起点スレッド（ワーカー）を起こすための旗（F-210 の C・Python の橋渡し）。
+///
+/// 起点スレッドで作り（そのスレッドの通知 fd を覚える）、`Arc` で別スレッドへ渡す。別スレッドは
+/// [`WakeFlag::notify`] で旗を立てて通知 fd を叩き、起点スレッドは [`WakeFlag::wait`] で旗が立つまで待つ
+/// （`await_completion` と同じ「旗 + 通知 fd」。スレッド越しに Waker を呼ばない）。
+/// 取りこぼさない使い方: 待つ側は `reset()` → 条件を確かめる → 満たされなければ `wait()`。
+#[cfg(feature = "handler-pool")]
+pub struct WakeFlag {
+    flag: Arc<AtomicBool>,
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
+
+#[cfg(feature = "handler-pool")]
+impl WakeFlag {
+    /// 現在のスレッド（ワーカー）を起こす旗。ドライバが無い（単体テスト等）ときはポーリングで待つ。
+    pub fn new() -> WakeFlag {
+        let fds = current_thread_notify_fds();
+        WakeFlag {
+            flag: Arc::new(AtomicBool::new(false)),
+            read_fd: fds.map(|(r, _)| r).unwrap_or(-1),
+            write_fd: fds.map(|(_, w)| w).unwrap_or(-1),
+        }
+    }
+
+    /// 旗を立てて起点スレッドを起こす（どのスレッドからでも）。
+    pub fn notify(&self) {
+        self.flag.store(true, Ordering::Release);
+        if self.write_fd >= 0 {
+            // SAFETY: write_fd は起点スレッドのスレッドローカルな通知 fd で、スレッドの生存中は
+            // 閉じられない（`Completer` と同じ前提）。
+            unsafe { signal_notify(self.write_fd) };
+        }
+    }
+
+    /// 旗を下ろす（起点スレッドが条件を確かめる前に）。
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::Release);
+    }
+
+    /// 旗が立つまで待つ（起点スレッドで）。
+    pub async fn wait(&self) {
+        if self.read_fd >= 0 {
+            wait_until_done(self.read_fd, &self.flag).await;
+        } else {
+            poll_wait_done(&self.flag);
+        }
+    }
+}
+
+#[cfg(feature = "handler-pool")]
+impl Default for WakeFlag {
+    fn default() -> Self {
+        WakeFlag::new()
+    }
+}
+
 /// ハンドラ用プールの既定スレッド数（CPU 数 × 2、最低 4）。
 #[cfg(feature = "handler-pool")]
 fn default_handler_threads() -> usize {
@@ -581,6 +638,18 @@ static HANDLER_POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
 #[cfg(feature = "handler-pool")]
 pub fn set_handler_pool_threads(n: usize) {
     HANDLER_POOL_THREADS.store(n, Ordering::Relaxed);
+}
+
+/// ブロッキングな処理 `f` をハンドラ用プールで実行し、完了を待たない（結果は呼び出し側が
+/// `api::bridge` のキュー等で受け取る。F-210）。`f` の panic はプールのスレッドで捕まえる。
+#[cfg(feature = "handler-pool")]
+pub fn spawn_handler<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    HANDLER_POOL.submit(Box::new(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    }));
 }
 
 /// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。

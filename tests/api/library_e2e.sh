@@ -235,6 +235,58 @@ BAT
   rm -f "$dir/build-msvc.bat" "$dir"/*.obj
 }
 
+c_msvc_dyn() { # c_msvc_dyn <dir> <name>（<name>.c を veil.dll とリンクして <name>.exe）
+  local dir="$1" name="$2" vc="${VCVARS:-}"
+  if [ -z "$vc" ]; then
+    local vs; vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath | tr -d '\r')
+    vc="$vs\\VC\\Auxiliary\\Build\\vcvars64.bat"
+  fi
+  local rel; rel="$(cygpath -w "$ROOT/target/release")"
+  local inc; inc="$(cygpath -w "$ROOT/crates/veil-capi/include")"
+  cat > "$dir/build-msvc.bat" <<BAT
+@call "$vc" >nul || exit /b 1
+cl /nologo /W3 /utf-8 /I"$inc" $name.c /Fe:$name.exe /link /LIBPATH:"$rel" veil.dll.lib || exit /b 1
+BAT
+  (cd "$dir" && cmd //c build-msvc.bat) > "$TMPD/msvc.log" 2>&1 || { tail -20 "$TMPD/msvc.log"; rm -f "$dir/build-msvc.bat"; return 1; }
+  rm -f "$dir/build-msvc.bat" "$dir"/*.obj
+}
+
+run_c_features() {
+  echo "== C (examples/api/c-features: ストリーミング・gRPC・L4、F-210)"
+  local CF="$ROOT/examples/api/c-features"
+  rm -f "$CF/features" "$CF/features.exe"
+  if [ "$OS" = Windows ]; then
+    c_msvc_dyn "$CF" features || { bad "compile features.c (MSVC)"; return; }
+  else
+    local MK; MK=$(command -v gmake || command -v make)
+    local libs="-lpthread -ldl -lm"
+    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+      --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
+    "$MK" -s -C "$CF" CC="${CC:-cc}" LIBS="$libs" features >/dev/null || { bad "compile features.c"; return; }
+  fi
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  local P S L4 U; P=$(free_port); S=$(free_port); L4=$(free_port); U=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_L4_TCP="127.0.0.1:$L4" VEIL_L4_UDP="127.0.0.1:$U" PATH="$ROOT/target/release:$PATH" exec "$CF/features$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "features start"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P"
+  expect "C streaming response (SSE)" "data: tick 3" curl -s -N "$B/sse"
+  expect "C streaming trailer (h2c)" "x-ticks: 3" bash -c "curl -s -i --http2-prior-knowledge '$B/sse' | tr A-Z a-z"
+  expect "C streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
+  expect "C streaming request body (h2c)" "300000" bash -c "dd if=/dev/zero bs=1000 count=300 2>/dev/null | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/count'"
+  expect "C L4 TCP echo" "c-tcp" l4_echo tcp "$L4" c-tcp
+  expect "C L4 UDP echo" "echo:c-udp" l4_echo udp "$U" c-udp
+  (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
+  local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
+  local rc=$?
+  echo "$out" | sed 's/^/  /'
+  [ "$rc" = 0 ] && ok "C gRPC interop (tonic + HTTP/3, exit 0)" || bad "C gRPC interop (exit $rc)"
+  kill "$PID"
+}
+
 run_python() {
   echo "== Python (crates/veil-python)"
   local PY="${PYTHON:-}"
@@ -328,10 +380,10 @@ run_nonregression() {
 case "$WHAT" in
   rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
-  c) run_c ;;
+  c) run_c; run_c_features ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_python ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_c_features; run_python ;;
   *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

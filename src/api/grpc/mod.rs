@@ -18,6 +18,8 @@
 //! 応答はストリーミング応答（DATA の後にトレーラ `grpc-status`）で送る。HTTP/2・HTTP/3 で動き、
 //! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
 
+/// ブロッキングな gRPC のハンドラ（C・Python 用、F-210）
+pub mod blocking;
 pub mod health;
 pub mod reflection;
 mod web;
