@@ -520,6 +520,21 @@ apiVersion: v1
 kind: ServiceAccount
 metadata: {name: ingress}
 ---
+# Istio のゲートウェイの Helm チャートと同じ: credentialName の秘密を読む権限（istiod が確認する）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ingress-sds}
+rules:
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ingress-sds}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ingress-sds}
+subjects: [{kind: ServiceAccount, name: ingress}]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: ingress}
@@ -542,6 +557,8 @@ spec:
   ports:
   - {name: http, port: 80, targetPort: 8080}
   - {name: https, port: 443, targetPort: 8443}
+  - {name: https-mutual, port: 8444, targetPort: 8444}
+  - {name: tls-passthrough, port: 8445, targetPort: 8445}
 ---
 apiVersion: networking.istio.io/v1
 kind: Gateway
@@ -584,6 +601,127 @@ EOF
     ok "Istio Gateway HTTPS (SIMPLE, credentialName)"; else bad "gateway HTTPS"; fi
   out="$($pexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://$ip/fortio/echo)" || true
   if [ "$out" = 200 ]; then ok "gateway prefix rewrite -> fortio"; else bad "gateway rewrite: $out"; fi
+  # MUTUAL（クライアント証明書を要求）と PASSTHROUGH（SNI で TLS のまま転送）。クライアント証明書は v3 にする
+  # （veil の検証〈webpki〉は X.509 v1 を受け付けない。Envoy〈BoringSSL〉は受け付ける）
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 7 -subj "/CN=gw-ca" \
+    -keyout "$TMPDIR/gwca-$NS.key" -out "$TMPDIR/gwca-$NS.crt" 2>/dev/null
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=client" \
+    -keyout "$TMPDIR/gwcl-$NS.key" -out "$TMPDIR/gwcl-$NS.csr" 2>/dev/null
+  openssl x509 -req -in "$TMPDIR/gwcl-$NS.csr" -CA "$TMPDIR/gwca-$NS.crt" -CAkey "$TMPDIR/gwca-$NS.key" \
+    -CAcreateserial -days 7 -out "$TMPDIR/gwcl-$NS.crt" \
+    -extfile <(printf 'basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n') 2>/dev/null
+  kubectl -n "$NS" delete secret gw-mtls >/dev/null 2>&1
+  kubectl -n "$NS" create secret generic gw-mtls --from-file=tls.crt="$TMPDIR/gw-$NS.crt" \
+    --from-file=tls.key="$TMPDIR/gw-$NS.key" --from-file=ca.crt="$TMPDIR/gwca-$NS.crt" >/dev/null
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw-tls}
+spec:
+  selector: {istio: ingress-$NS}
+  servers:
+  - port: {number: 8444, name: https-mutual, protocol: HTTPS}
+    hosts: ["gw.example.com"]
+    tls: {mode: MUTUAL, credentialName: gw-mtls}
+  - port: {number: 8445, name: tls-passthrough, protocol: TLS}
+    hosts: ["gw.example.com"]
+    tls: {mode: PASSTHROUGH}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: via-gw-tls}
+spec:
+  hosts: ["gw.example.com"]
+  gateways: [gw-tls]
+  http:
+  - route: [{destination: {host: whoami, port: {number: 80}}}]
+  tls:
+  - match: [{port: 8445, sniHosts: ["gw.example.com"]}]
+    route: [{destination: {host: ingress.$NS.svc.cluster.local, port: {number: 443}}}]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: ingress-plain}
+spec:
+  host: ingress.$NS.svc.cluster.local
+  trafficPolicy: {tls: {mode: DISABLE}}
+EOF
+  local cl_crt cl_key
+  cl_crt="$(base64 -w0 < "$TMPDIR/gwcl-$NS.crt")"; cl_key="$(base64 -w0 < "$TMPDIR/gwcl-$NS.key")"
+  $pexec sh -c "echo $cl_crt | base64 -d > /tmp/cl.crt; echo $cl_key | base64 -d > /tmp/cl.key"
+  if retry 60 sh -c "$pexec curl -s -m 5 -k --cert /tmp/cl.crt --key /tmp/cl.key --resolve gw.example.com:8444:$ip https://gw.example.com:8444/ | grep -q '^Hostname: whoami'"; then
+    ok "Istio Gateway HTTPS MUTUAL with a client certificate"; else bad "gateway MUTUAL"; fi
+  out="$($pexec curl -s -m 5 -k -o /dev/null -w '%{http_code}' --resolve gw.example.com:8444:$ip https://gw.example.com:8444/ 2>&1)" || true
+  if [ "$out" != 200 ]; then ok "gateway MUTUAL rejects clients without a certificate"; else bad "gateway MUTUAL accepted no certificate"; fi
+  if retry 60 sh -c "$pexec curl -s -m 5 -k --resolve gw.example.com:8445:$ip https://gw.example.com:8445/ | grep -q '^Hostname: whoami'"; then
+    ok "Istio Gateway TLS PASSTHROUGH (SNI)"; else bad "gateway PASSTHROUGH"; fi
+  kubectl -n "$NS" delete virtualservice via-gw-tls >/dev/null 2>&1
+  kubectl -n "$NS" delete gateway.networking.istio.io gw-tls >/dev/null 2>&1
+  kubectl -n "$NS" delete destinationrule ingress-plain >/dev/null 2>&1
+  # egress ゲートウェイ（Egress Gateways のタスク）: メッシュ外のサービスへの HTTP をゲートウェイ経由にする
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: egress}
+spec:
+  selector: {matchLabels: {istio: egress-$NS}}
+  template:
+    metadata:
+      annotations: {inject.istio.io/templates: gateway, $gw_ann}
+      labels: {istio: egress-$NS, sidecar.istio.io/inject: "true"}
+    spec:
+      serviceAccountName: ingress
+      containers:
+      - {name: istio-proxy, image: auto, imagePullPolicy: IfNotPresent}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: egress}
+spec:
+  selector: {istio: egress-$NS}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata: {name: ext}
+spec:
+  hosts: [ext.example.com]
+  location: MESH_EXTERNAL
+  resolution: DNS
+  ports: [{number: 80, name: http, protocol: HTTP}]
+  endpoints: [{address: plain.$NS-plain.svc.cluster.local}]
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: egress-gw}
+spec:
+  selector: {istio: egress-$NS}
+  servers:
+  - port: {number: 8080, name: http, protocol: HTTP}
+    hosts: [ext.example.com]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: via-egress}
+spec:
+  hosts: [ext.example.com]
+  gateways: [mesh, egress-gw]
+  http:
+  - match: [{gateways: [mesh], port: 80}]
+    route: [{destination: {host: egress.$NS.svc.cluster.local, port: {number: 80}}}]
+  - match: [{gateways: [egress-gw], port: 8080}]
+    route: [{destination: {host: ext.example.com, port: {number: 80}}}]
+EOF
+  kubectl -n "$NS" rollout status deploy/egress --timeout=240s >/dev/null || bad "egress deploy"
+  if retry 90 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 --resolve ext.example.com:80:240.240.0.1 http://ext.example.com/ | grep -q '^Hostname: plain'"; then
+    ok "egress gateway: mesh -> egress -> external service"; else bad "egress gateway: $(cexec curl -s -m 5 -o /dev/null -w '%{http_code}' --resolve ext.example.com:80:240.240.0.1 http://ext.example.com/)"; fi
+  out="$(kubectl -n "$NS" exec deploy/egress -- curl -s localhost:15000/stats/prometheus 2>/dev/null | grep istio_requests_total | grep -c 'ext.example.com')" || true
+  if [ "${out:-0}" -gt 0 ]; then ok "egress gateway reports the external request"; else bad "egress gateway metrics: no ext.example.com"; fi
+  kubectl -n "$NS" delete virtualservice via-egress >/dev/null 2>&1
+  kubectl -n "$NS" delete gateway.networking.istio.io egress-gw >/dev/null 2>&1
+  kubectl -n "$NS" delete serviceentry ext >/dev/null 2>&1
+  kubectl -n "$NS" delete deploy egress >/dev/null 2>&1
+  kubectl -n "$NS" delete svc egress >/dev/null 2>&1
   # Gateway API（HTTPRoute）
   if ! kubectl get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
     kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml >/dev/null 2>&1
