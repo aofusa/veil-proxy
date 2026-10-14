@@ -52,7 +52,7 @@ HTTP のハンドラだけを持つ。
   - 戻り値がジェネレータ / 非同期ジェネレータ、または `veil.StreamingResponse(iterable, media_type=...)` ならストリーミング。
     `veil.EventSourceResponse` で SSE の整形（`data:` 行）も用意する。
   - `request.stream()`（同期イテレータ）・`async for chunk in request.astream()`。
-- 非同期（Python）: プールのスレッドごとに 1 個のイベントループを作って使い回す（`asyncio.run` を毎回作らない）。
+- 非同期（Python）: プールのスレッドごとに 1 個のイベントループを作って使い回す（`asyncio.run` を毎回作らない。F-212 の手順 5 で入れる）。
   `async def` のハンドラはそのループで実行し、非同期ジェネレータもそのまま回す。
 
 ### 3. L4（TCP・UDP）
