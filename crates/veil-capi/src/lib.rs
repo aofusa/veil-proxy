@@ -1059,7 +1059,13 @@ mod tests {
     fn invoke_maps_return_codes() {
         let mut counter = 0i32;
         let ud = UserData(&mut counter as *mut i32 as *mut c_void);
-        let r = invoke(echo_cb, ud, Request::new("POST", "/e", vec![], "body"));
+        // ctx 無し（INLINE と同じ。ストリーミングの関数は使えない）
+        let r = invoke(
+            echo_cb,
+            ud,
+            Request::new("POST", "/e", vec![], "body"),
+            ptr::null_mut(),
+        );
         assert_eq!(r.status_code(), 200);
         assert_eq!(&r.body()[..], b"body");
         assert_eq!(counter, 1);
@@ -1067,6 +1073,7 @@ mod tests {
             fail_cb,
             UserData(ptr::null_mut()),
             Request::new("GET", "/", vec![], ""),
+            ptr::null_mut(),
         );
         assert_eq!(r.status_code(), 500);
     }
