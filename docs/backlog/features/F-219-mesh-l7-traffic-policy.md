@@ -41,6 +41,9 @@ Istio の VirtualService・DestinationRule・Gateway API の HTTPRoute / GRPCRou
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - 表の不足を全部埋め、各機能の単体・E2E（`tests/e2e_tests.rs`）。Istio の公式タスク（Request Routing・Fault Injection・
   Traffic Shifting・Request Timeouts・Circuit Breaking・Mirroring）と Linkerd のタスク（Traffic Split・Retries・Timeouts）を
   F-225 の kind の試験で通す。

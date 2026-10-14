@@ -41,6 +41,9 @@ Istio・Linkerd の init コンテナ / CNI が設定する iptables の REDIREC
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - 単体: `SO_ORIGINAL_DST` の取得（network namespace + iptables を作れる環境では統合試験、無ければスキップ）、プロトコル検出の
   分類表（分割された ClientHello・途中で切れたプリフェース・サーバが先に話す場合のタイムアウト）。
 - E2E（Linux、`unshare -n` の network namespace で iptables REDIRECT を張る）: outbound の HTTP/1.1・h2c・TLS（passthrough）・

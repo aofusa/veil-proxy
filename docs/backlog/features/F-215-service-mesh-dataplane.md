@@ -35,10 +35,24 @@ Linkerd は Envoy を使っていないので、「Envoy の置き換え」は I
    multicluster の gateway 無し構成（任意）が動き、`linkerd check --proxy`・`linkerd viz stat/top/edges`（tap は任意）が動く。
 3. **混在**: 同じメッシュで veil の Pod と本家のプロキシ（Envoy・linkerd2-proxy）の Pod が相互に通信できる
    （移行は Pod 単位で段階的に行うので必須）。
-4. **性能**: 同じクラスタ・同じ負荷で、本家のプロキシより追加レイテンシ（p50・p99）・CPU・メモリが小さい
+4. **既存の性能の維持（必須）**: メッシュを使わない veil のプロキシの性能が退行しない（下記「必須」の節）。
+5. **性能**: 同じクラスタ・同じ負荷で、本家のプロキシより追加レイテンシ（p50・p99）・CPU・メモリが小さい
    （数値目標は F-225 でベースラインを測ってから決める）。
-5. **対象外（明示）**: Istio の EnvoyFilter（Envoy の内部構造へのパッチ。受け取ったら NACK して istiod の
+6. **対象外（明示）**: Istio の EnvoyFilter（Envoy の内部構造へのパッチ。受け取ったら NACK して istiod の
    `proxy-status` に理由を出す）、Envoy の Lua フィルタ、Envoy 固有の統計名の完全互換（Istio の標準メトリクスは対象）。
+
+## 必須: veil の既存のプロキシの性能を退行させない
+
+メッシュの対応は **veil の既存のプロキシ（メッシュを使わない構成）の性能に退行を出さないことを必須条件**とする。
+
+- メッシュの機能は `mesh*` feature とメッシュのリスナー（仮想 inbound / outbound・メッシュモデルを参照するリスナー）の中に閉じ、
+  既存のリスナー・ルート・上流の経路には「メッシュの設定が無ければ何もしない」分岐（ロード時に決まる値の確認 1 回）以上を足さない。
+  一般機能として既存の経路に入れるもの（mTLS の検証・L7 の新機能等）も、設定していないときのコストはゼロにする
+  （ロード時に解決した `Option` の確認だけ。要求ごとの確保・ロック・syscall を増やさない）。
+- 判定: 各子チケットの完了時とマージ前に、`tools/perf` の交互 A/B（`suite_ab.sh`、main とブランチ、io_uring と epoll、
+  3B と 54KB、HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC の代表構成）で **比の中央値が 0.98 以上、どの構成も 0.95 未満にならない**
+  （F-200・F-202・api-roadmap と同じ基準）。外れた構成は原因を潰すまでマージしない。結果は `docs/perf/README.md`。
+- `default`・`full*` のバイナリに mesh のコード・proto の生成物が入らないことを検査する（`tests/api/library_e2e.sh nonregression` と同じ方式）。
 
 ## 全体設計
 
@@ -105,8 +119,10 @@ Envoy の xDS も linkerd2-proxy-api も、最終的には「どのポートで�
 - Linux のみ（Kubernetes のノード）。バックエンドは epoll を基本にする: containerd / Docker の `RuntimeDefault` の seccomp は
   io_uring を拒否するため（F-196 と同じ `full-container` 系）。`Localhost` の seccomp プロファイルを配れる環境向けに
   io_uring 版も測る。
-- イメージ: `docker/Dockerfile.mesh-istio`（`istio/proxyv2` を土台に Envoy を veil に差し替え、または pilot-agent だけを
-  コピーした distroless）と `docker/Dockerfile.mesh-linkerd`（veil 単体、UID 2102）。Istio の UID 1337・Linkerd の UID 2102 は
+- **イメージは musl 版**（`docker/Dockerfile.musl` の静的リンクの veil。F-196 と同じく musl をメインにする）。
+  `docker/Dockerfile.mesh-istio` は musl の veil に、`istio/proxyv2` から pilot-agent（Go の静的バイナリ）と必要な
+  ファイル（ブートストラップのテンプレート等）だけをコピーした distroless のイメージ（Envoy は入れない）。
+  `docker/Dockerfile.mesh-linkerd` は musl の veil 単体（UID 2102）。Istio の UID 1337・Linkerd の UID 2102 は
   iptables の除外条件なので、その UID で動かす（veil の特権降格の先も同じ UID）。
 - proto は `third_party/` に必要な部分だけ置き（Envoy の data-plane-api・xds・udpa・Istio の proto・linkerd2-proxy-api、いずれも
   Apache-2.0。LICENSE と取得元のコミットを README で記録）、`veil-build`（F-208）の prost 生成を使う。

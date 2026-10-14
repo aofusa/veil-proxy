@@ -29,6 +29,9 @@ Linkerd の Server・AuthorizationPolicy・MeshTLSAuthentication・NetworkAuthen
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - 単体: 規則の評価順・既定の拒否・PERMISSIVE で ID が無い接続・JWT（期限・発行者・audience・JWKS の更新）。
 - F-225 の kind で Istio の公式タスク（Authorization の HTTP・TCP・JWT・deny・dry-run、Authentication Policy）と Linkerd の
   タスク（Restricting Access To Services・Per-Route Policy）を通す。

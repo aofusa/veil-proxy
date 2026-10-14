@@ -37,6 +37,9 @@ Kiali・Grafana の Istio のダッシュボード・`linkerd viz` が、veil �
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - F-225 の kind で、Kiali のグラフ（bookinfo）に veil の Pod 間の辺と mTLS の鍵マークが出る、Istio の Grafana ダッシュボードの
   主要パネルが埋まる、`linkerd viz stat/edges/top`（tap は任意）が emojivoto で動く、Jaeger に bookinfo のトレースが繋がって出る。
 - 標準メトリクスを有効にしても `tools/perf` の代表構成で退行が 2% 以内（交互 A/B）。

@@ -35,6 +35,10 @@
 - **目標の決定**: 最初の計測（stock のベースライン）で数値を記録し、本チケットの受け入れ条件に目標（例: 追加 p99 が Envoy の
   ½・CPU が ⅔・RSS が ½、linkerd2-proxy に対して同等以上）を書き足す。結果は `docs/perf/` と `docs/guide/kubernetes.md`。
 
+- **既存のプロキシの非退行（必須、F-215）**: メッシュ外の性能は `tools/perf/suite_ab.sh` の main とブランチの交互 A/B で判定し、
+  各子チケットの完了時とマージ前に回す（比の中央値 0.98 以上、どの構成も 0.95 未満にならない）。
+- イメージは musl 版（`docker/Dockerfile.musl` の veil。`Dockerfile.mesh-istio`・`Dockerfile.mesh-linkerd` も musl の veil を使う）。
+
 ## 受け入れ条件
 
 - stock の Istio・Linkerd で全スイートが通る（台本の正しさの確認）こと、ベースラインの計測値が記録されていること。

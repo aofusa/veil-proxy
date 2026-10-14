@@ -39,6 +39,9 @@ Linkerd が注入する linkerd2-proxy（Rust、Envoy ではない）を veil �
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - emojivoto・books を全 Pod veil で動かし、`linkerd check --proxy`（版の警告は許容）、`linkerd viz stat/edges/top` が動く。
 - 本家の linkerd2-proxy の Pod と veil の Pod の相互通信（HTTP/1.1 の昇格・gRPC・opaque の TCP（例: Redis / MySQL）・mTLS の
   `client_id` の受け渡し）を両方向で確認。

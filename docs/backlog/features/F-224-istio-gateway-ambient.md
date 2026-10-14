@@ -27,6 +27,9 @@ Istio で Envoy が動いている残りの場所、ingress / egress ゲート�
 
 ## 受け入れ条件
 
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。
+
 - ingress ゲートウェイ: Istio のタスク（Ingress Gateways・Secure Gateways の SIMPLE / MUTUAL・Ingress without TLS termination・
   Gateway API）と Gateway API の conformance（コア）を F-225 で通す。egress ゲートウェイ: Egress Gateways のタスク。
 - waypoint: ambient の bookinfo で waypoint を veil にして、L7 の認可・トラフィックの移行（ambient のタスク）が動く。ztunnel は本家。

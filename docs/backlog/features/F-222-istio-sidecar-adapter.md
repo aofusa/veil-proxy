@@ -13,6 +13,7 @@ UDS `./etc/istio/proxy/XDS`）、証明書（CSR → istiod の CA → SDS を U
 DNS プロキシ、健康チェックの書き換え（15021）、Wasm モジュールの取得（ECDS のリモート URL をローカルのファイルに書き換える）、
 終了時の排出を行う。これらを作り直さず使えるので、veil は「Envoy として振る舞う」部分だけを持てばよい。
 pilot-agent は `ProxyConfig.binaryPath`（既定 `/usr/local/bin/envoy`）を起動するので、そこに veil（Envoy 互換の起動モード）を置く。
+イメージは musl の veil + pilot-agent（`docker/Dockerfile.mesh-istio`、Envoy は入れない）。
 注入は `sidecar.istio.io/proxyImage` 注釈か、注入テンプレート（`values.global.proxy.image`）でイメージを差し替える。
 
 ## 設計
@@ -52,7 +53,10 @@ pilot-agent は `ProxyConfig.binaryPath`（既定 `/usr/local/bin/envoy`）を�
    Proxy-Wasm のプラグイン設定に変換する（モジュールはローカルのファイルに pilot-agent が書き換え済み）。
 8. **DNS**: pilot-agent の DNS プロキシ（15053）はそのまま使える（veil は関与しない）。
 
-## 受け入れ条件（段階ごと）
+## 受け入れ条件
+
+- （必須、F-215）既存のプロキシの性能が退行しない（`tools/perf/suite_ab.sh` の main との交互 A/B、比の中央値 0.98 以上・0.95 未満なし）。
+  コンテナで試すときのイメージは musl 版。（段階ごと）
 
 - (a) 透過転送 + mTLS + ルーティング: bookinfo が全 Pod veil で動き、VirtualService・DestinationRule・ServiceEntry の公式タスク、
   PeerAuthentication の STRICT・PERMISSIVE、Envoy の Pod との混在。

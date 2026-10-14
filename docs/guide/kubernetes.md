@@ -67,3 +67,10 @@ a client outside the mesh (Istio STRICT), veil's TLS from the Secret and its hot
 `VEIL_OVERRIDE_<n>`, a route added through VDS (gRPC stream through the mesh, reconnect after the control plane restarts), and graceful shutdown after SIGTERM. It needs docker, kind,
 kubectl, istioctl, linkerd and openssl. With snap-packaged docker the script keeps temporary files under
 `target/tmp` (snap docker cannot read `/tmp`).
+
+## Roadmap: veil as the mesh proxy
+
+The setup above keeps the mesh's own proxy (Envoy for Istio, linkerd2-proxy for Linkerd) next to veil. Replacing
+that proxy with veil — istiod and the Linkerd control plane unchanged, veil and stock proxies interoperating in
+one mesh, the musl image, and no performance regression for veil's existing (non-mesh) proxy — is planned in
+F-215 (`docs/backlog/features/F-215-service-mesh-dataplane.md`, sub-tickets F-216 to F-225).
