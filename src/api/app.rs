@@ -364,8 +364,8 @@ impl App {
         self
     }
 
-    /// 試験用: 最後に登録したルートの関数に、起動時と同じ順でミドルウェアを掛けたもの。
-    #[cfg(test)]
+    /// 試験用: 最後に登録したルートの関数に、起動時と同じ順でミドルウェアを掛けたもの（gRPC の試験が使う）。
+    #[cfg(all(test, feature = "grpc-handler"))]
     pub(crate) fn last_route_wrapped(&self) -> HandlerFn {
         let route = self.routes.last().expect("registered");
         let mut func = route.func.clone();
