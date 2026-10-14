@@ -763,7 +763,7 @@ Example: [examples/api/c-hello/](../../examples/api/c-hello/).
 
 ## Python
 
-`crates/veil-python` is a PyO3 extension (abi3, Python 3.8+) imported as `veil`:
+`crates/veil-python` is a PyO3 extension (abi3, Python 3.9+) imported as `veil`:
 
 ```bash
 pip install maturin
@@ -795,6 +795,11 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   handler pool, so the event loop never waits for the GIL. `offload=False` runs on the network worker and is for
   trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
   several processes.
+- **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
+  `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
+  handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
+  into the response in Rust without copying the body (F-212). `async def` handlers run on one event loop per
+  handler-pool thread. Python 3.9 or later is required.
 - Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 

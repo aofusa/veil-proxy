@@ -736,7 +736,7 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 
 ## Python
 
-`crates/veil-python` は PyO3 の拡張（abi3、Python 3.8 以上）で、`veil` として import します。
+`crates/veil-python` は PyO3 の拡張（abi3、Python 3.9 以上）で、`veil` として import します。
 
 ```bash
 pip install maturin
@@ -766,6 +766,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 - **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）ではハンドラ用プールで実行されるので、
   イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
   純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
+- **サーバの中では**、ハンドラに Rust 側の要求（`veil._veil.NativeRequest`。`isinstance` では `veil.Request`）が渡ります。属性・メソッドは同じで、ハンドラが読んだ属性だけを作ります。よくある戻り値（`str`・`bytes`・`dict`/`list`・`None`・`veil.Response`）は Rust で本文を複製せずに応答にします（F-212）。`async def` のハンドラはハンドラ用プールのスレッドごとに 1 つのイベントループで動きます。Python 3.9 以上が必要です。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは

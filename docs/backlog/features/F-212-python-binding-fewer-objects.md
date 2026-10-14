@@ -1,6 +1,6 @@
 # F-212: Python バインディングの要求ごとのオブジェクト生成を減らす（使い勝手は変えない）
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景（F-201 の計測）
 
@@ -112,3 +112,30 @@ Rust と Python の境目で要求ごとに多数のオブジェクトを作っ�
 ## 関連
 
 F-194（Python バインディング）、F-201（ベンチ）、F-210（C・Python の機能拡充。ストリーミングの `Request` もこのクラスの上に作る）。
+
+## 実施内容（2026-10-14）
+
+- `veil._veil.NativeRequest`・`NativeHeaders`（`crates/veil-python/src/native.rs`）: Rust の `Request` を包み、属性は初回アクセスで
+  作って `GILOnceCell` にキャッシュ。`method` はよく使うものを intern。`__dict__` を持つ（任意の属性を足せる）。
+  `veil.Request`・`veil.Headers` を `abc.ABCMeta` にして仮想サブクラスとして登録（`isinstance` が真）。
+- **純 Python の `Request` と `Route.handle` は残した**（`test_binding.py` が拡張無しで動く前提を保つ）。サーバだけが
+  `Route._call`（ルートの登録時に、引数無し・`req` だけ・`str` のパス引数だけ・それ以外（`bind`）から選んだ呼び出し口）を
+  `NativeRequest` 1 つで呼ぶ。`_dispatch`・8 要素の引数タプル・Python の `Request`/`Headers` の生成が無くなった。
+- 戻り値は Rust で応答にする: `str`（UTF-8 のまま）・`bytes`（`PyBackedBytes` で複製無し）・`dict`/`list` は **Rust で JSON に**
+  （`str`・64 ビット整数・真偽値・None・dict・list・tuple だけのとき。`_dumps` と同じバイト列であることを試験で確認。
+  float・str 以外のキー・巨大な整数・孤立サロゲートは `_dumps` に戻す）・`None`・`veil.Response`。それ以外は `Route.to_response`。
+- `async def` はスレッドごとに 1 つのイベントループ（`_run_coro`。`Route.handle` も同じ）。
+- 設計の「`Response` のヘッダを既知の名前で静的にする」は `known_header` で一部。Python の下限は 3.9（abi3-py39、`dict` の
+  ため）。
+- 試験: `tests/test_native.py`（新規、12 件: 属性・ヘッダが純 Python 版と一致・キャッシュ・isinstance・追加属性・`_call` と
+  `handle` が同じ応答（引数の種類 7 通り・戻り値の型 7 通り）・Rust の JSON 化が `_dumps` と同じバイト列）。既存の
+  `test_binding.py`（32 件）・`e2e.sh`・`library_e2e.sh python` は無修正で通る。
+
+### 計測（`tools/api-bench`、2 スレッド・64 接続・5 ラウンド交互、中央値。`docs/artifacts/f212_ab_py.tsv`）
+
+| 対象 | plaintext req/s | plaintext CPU µs/req | json req/s | json CPU µs/req |
+|---|---:|---:|---:|---:|
+| 改修前 offload=True | 15,848 | 110.2 | 12,237 | 140.5 |
+| **改修後 offload=True** | **25,494（+61%）** | **71.1（−35%）** | **22,567（+84%）** | **83.9（−40%）** |
+| 改修前 offload=False | 16,823 | 107.5 | 13,308 | 122.9 |
+| 改修後 offload=False | 26,229（+56%） | 77.0（−28%） | 24,226（+82%） | 83.3（−32%） |

@@ -85,6 +85,16 @@ if BASE:
         TARGETS["rust"]["veil native handler" + tag + " [base]"] = ([b, "native", ADDR, str(THREADS)], {}, None)
 
 
+# F-212: 改修前の Python バインディングを入れた venv（BENCH_BASE_VENV）を渡すと、veil の Python を「[base]」として足す
+BASE_VENV = os.environ.get("BENCH_BASE_VENV")
+if BASE_VENV:
+    bpy = os.path.join(BASE_VENV, "bin", "python")
+    TARGETS["python"]["veil (offload=True) [base]"] = (
+        [bpy, "veil_app.py"], {"BENCH_OFFLOAD": "1", "BENCH_THREADS": str(THREADS)}, PYDIR)
+    TARGETS["python"]["veil (offload=False) [base]"] = (
+        [bpy, "veil_app.py"], {"BENCH_OFFLOAD": "0", "BENCH_THREADS": str(THREADS)}, PYDIR)
+
+
 def tree_pids(pid):
     out = [pid]
     for p in out:

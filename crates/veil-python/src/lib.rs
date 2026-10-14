@@ -1,12 +1,14 @@
 //! veil API サーバライブラリの Python バインディング（F-194）。
 //!
 //! Python 側（`python/veil/__init__.py`）がデコレータでルートを集め、`register_route` で
-//! ここへ登録し、`run` で起動する。リクエストごとに Python の dispatcher を GIL 下で呼ぶ。
+//! ここへ登録し、`run` で起動する。リクエストごとにルートの呼び出し口（`Route._call`）を GIL 下で
+//! [`native::NativeRequest`] 1 つを渡して呼び、戻り値を Rust で応答にする（F-212）。
+
+mod native;
 
 use bytes::Bytes;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::{Arc, Mutex};
 use veil::api::{App, Config as VeilConfig, HandlerFn, OperationMeta, Request, Response};
 
@@ -17,6 +19,8 @@ struct PendingRoute {
     handler_id: u64,
     offload: bool,
     openapi: Option<serde_json::Value>,
+    /// 既定のステータス（デコレータの `status_code`）
+    status_code: u16,
 }
 
 static PENDING: Mutex<Vec<PendingRoute>> = Mutex::new(Vec::new());
@@ -90,13 +94,14 @@ impl PyConfig {
 
 /// ルートを登録する（`run` までの間に溜める）。
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200))]
 fn register_route(
     path: String,
     methods: Vec<String>,
     handler_id: u64,
     offload: bool,
     openapi_json: Option<String>,
+    status_code: u16,
 ) -> PyResult<()> {
     let openapi = match openapi_json {
         Some(s) => Some(
@@ -111,45 +116,25 @@ fn register_route(
         handler_id,
         offload,
         openapi,
+        status_code,
     });
     Ok(())
 }
 
-fn lossy(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
+/// 1 ルートの Python 側の呼び出し口（`Route._call` と、扱わない戻り値の変換 `Route.to_response`）。
+struct PyRoute {
+    call: Py<PyAny>,
+    fallback: Py<PyAny>,
+    status: u16,
 }
 
-/// Python の dispatcher を GIL 下で呼び、応答を組み立てる。
-fn call_python(dispatcher: &Py<PyAny>, handler_id: u64, req: &Request) -> Response {
+/// ルートの呼び出し口を GIL 下で呼び、応答を組み立てる。
+fn call_python(route: &PyRoute, req: Request) -> Response {
     Python::with_gil(|py| {
         let r = (|| -> PyResult<Response> {
-            let headers = PyList::empty(py);
-            for (n, v) in req.headers() {
-                headers.append((lossy(n), lossy(v)))?;
-            }
-            let params = PyDict::new(py);
-            for (name, _) in req.params().iter() {
-                if let Some(v) = req.param(name) {
-                    params.set_item(&**name, v.as_ref())?;
-                }
-            }
-            let args = (
-                handler_id,
-                req.method(),
-                req.path(),
-                req.query(),
-                headers,
-                PyBytes::new(py, req.body()),
-                params,
-                req.client_ip().to_string(),
-            );
-            let out = dispatcher.call1(py, args)?;
-            let (status, hdrs, body): (u16, Vec<(String, String)>, Vec<u8>) = out.extract(py)?;
-            let mut resp = Response::new(status).with_body(Bytes::from(body));
-            for (n, v) in hdrs {
-                resp = resp.with_header(Bytes::from(n), Bytes::from(v));
-            }
-            Ok(resp)
+            let req = Py::new(py, native::NativeRequest::new(req))?;
+            let out = route.call.call1(py, (req,))?;
+            native::to_response(py, out.into_bound(py), route.status, &route.fallback)
         })();
         match r {
             Ok(resp) => resp,
@@ -168,36 +153,44 @@ fn internal_error() -> Response {
     .with_status(500)
 }
 
-fn make_handler(dispatcher: Py<PyAny>, handler_id: u64, offload: bool) -> HandlerFn {
-    let dispatcher = Arc::new(dispatcher);
+fn make_handler(route: PyRoute, offload: bool) -> HandlerFn {
+    let route = Arc::new(route);
     Arc::new(move |req: Request| {
-        let d = Arc::clone(&dispatcher);
+        let r = Arc::clone(&route);
         Box::pin(async move {
             if offload {
                 // GIL を握る呼び出しはイベントループ（ワーカー）を止めないようハンドラ用プールへ退避する。
-                match veil::runtime::offload::offload_handler(move || {
-                    call_python(&d, handler_id, &req)
-                })
-                .await
-                {
+                match veil::runtime::offload::offload_handler(move || call_python(&r, req)).await {
                     Some(r) => r,
                     None => internal_error(),
                 }
             } else {
-                call_python(&d, handler_id, &req)
+                call_python(&r, req)
             }
         })
     })
 }
 
 /// サーバを起動し、停止（SIGINT/SIGTERM・`shutdown()`）までブロックする。GIL は解放する。
+/// `handlers` は handler_id → Python の `Route`（`_call` と `to_response` を持つ）。
 #[pyfunction]
-fn run(py: Python<'_>, config: PyConfig, dispatcher: Py<PyAny>) -> PyResult<()> {
+fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<()> {
     let routes = std::mem::take(&mut *PENDING.lock().unwrap());
     let mut app = App::new().config(config.inner).without_macro_routes();
     for (i, r) in routes.into_iter().enumerate() {
         let methods: Vec<&str> = r.methods.iter().map(|s| s.as_str()).collect();
-        let func = make_handler(dispatcher.clone_ref(py), r.handler_id, r.offload);
+        let route = handlers
+            .get(r.handler_id as usize)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", r.handler_id)))?
+            .bind(py);
+        let func = make_handler(
+            PyRoute {
+                call: route.getattr("_call")?.unbind(),
+                fallback: route.getattr("to_response")?.unbind(),
+                status: r.status_code,
+            },
+            r.offload,
+        );
         let meta = OperationMeta {
             operation_id: format!("py_{}", r.handler_id),
             raw: r.openapi,
@@ -212,7 +205,7 @@ fn run(py: Python<'_>, config: PyConfig, dispatcher: Py<PyAny>) -> PyResult<()> 
             meta,
         );
     }
-    drop(dispatcher);
+    drop(handlers);
     py.allow_threads(move || app.run())
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -226,8 +219,11 @@ fn shutdown() {
 #[pymodule]
 fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConfig>()?;
+    m.add_class::<native::NativeRequest>()?;
+    m.add_class::<native::NativeHeaders>()?;
     m.add_function(wrap_pyfunction!(register_route, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
+    m.add_function(wrap_pyfunction!(native::_json_fast, m)?)?;
     Ok(())
 }

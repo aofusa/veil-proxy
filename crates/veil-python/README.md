@@ -15,7 +15,7 @@ maturin build --release          # wheel を作る（target/wheels/）
 pip install pydantic             # 任意（モデルによる本文検証・スキーマ生成）
 ```
 
-abi3（Python 3.8 以上、1 つの wheel で全バージョン）です。
+abi3（Python 3.9 以上、1 つの wheel で全バージョン）です。
 
 ## 使い方
 

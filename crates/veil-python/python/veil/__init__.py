@@ -13,8 +13,10 @@ Python はハンドラ関数だけを提供する。ネイティブ拡張 ``veil
     veil.run(listen_cleartext="127.0.0.1:8000")
 """
 
+import abc
 import asyncio
 import http
+import threading
 import inspect
 import json
 import re
@@ -47,8 +49,10 @@ _JSON_CT = "application/json"
 # --------------------------------------------------------------------------
 
 
-class Headers:
-    """大文字小文字を区別しない読み取り専用のヘッダ辞書（同名ヘッダは受信順に保持）。"""
+class Headers(metaclass=abc.ABCMeta):
+    """大文字小文字を区別しない読み取り専用のヘッダ辞書（同名ヘッダは受信順に保持）。
+
+    サーバの中では Rust 側の ``veil._veil.NativeHeaders``（同じメソッド）が渡る（F-212）。"""
 
     def __init__(self, items=()):
         self._items = [(str(k), str(v)) for k, v in items]
@@ -93,8 +97,11 @@ class Headers:
         return "Headers(%r)" % (self._items,)
 
 
-class Request:
-    """ハンドラに渡るリクエスト。"""
+class Request(metaclass=abc.ABCMeta):
+    """ハンドラに渡るリクエスト。
+
+    サーバの中では Rust 側の ``veil._veil.NativeRequest``（同じ属性・メソッド。触った属性だけを作る）が渡り、
+    ``isinstance(req, veil.Request)`` は真（F-212）。"""
 
     def __init__(self, method="GET", path="/", query="", headers=(), body=b"", params=None, client_ip=""):
         self.method = method
@@ -110,8 +117,7 @@ class Request:
     def query_params(self):
         """クエリの辞書（同名キーは最初の値）。"""
         if self._query_params is None:
-            parsed = urllib.parse.parse_qs(self.query, keep_blank_values=True)
-            self._query_params = {k: v[0] for k, v in parsed.items()}
+            self._query_params = _query_params(self.query)
         return self._query_params
 
     def json(self):
@@ -119,6 +125,24 @@ class Request:
 
     def text(self):
         return self.body.decode("utf-8", errors="replace")
+
+
+def _query_params(query):
+    """クエリの辞書（同名キーは最初の値）。``Request.query_params`` と ``NativeRequest`` が共有する。"""
+    parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
+    return {k: v[0] for k, v in parsed.items()}
+
+
+_LOOPS = threading.local()
+
+
+def _run_coro(coro):
+    """``async def`` のハンドラをスレッドごとに 1 つのイベントループで動かす（要求ごとに作らない。F-212）。"""
+    loop = getattr(_LOOPS, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _LOOPS.loop = loop
+    return loop.run_until_complete(coro)
 
 
 def _json_default(o):
@@ -423,6 +447,7 @@ class Route:
         self.params = _build_params(func, set(self.path_names))
         self.is_async = inspect.iscoroutinefunction(func)
         self._hints = _resolve_hints(func)
+        self._call = self._make_call()
 
     # ---- 引数束縛 ----
 
@@ -530,12 +555,71 @@ class Route:
             kwargs = self.bind(req)
             result = self.func(**kwargs)
             if inspect.iscoroutine(result):
-                result = asyncio.run(result)
+                result = _run_coro(result)
             return self.to_response(result)
         except _ValidationFailed as e:
             return JSONResponse({"detail": e.errors}, 422)
         except HTTPException as e:
             return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
+
+    # ---- サーバからの呼び出し（F-212） ----
+
+    def _make_call(self):
+        """サーバ（Rust）が要求ごとに呼ぶ関数を、引数の種類から前もって選ぶ。戻り値は変換前の値
+        （``str``・``dict``・``Response`` 等。Rust が応答にし、扱えないものは ``to_response`` に回す）。
+        検証エラー・``HTTPException`` は ``handle`` と同じ応答にする。"""
+        func = self.func
+        is_async = self.is_async
+        positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        sig = inspect.signature(func).parameters
+        if not self.params and not self.body_constraints:
+            def invoke(req):
+                return func()
+        elif (
+            len(self.params) == 1
+            and self.params[0].kind == "request"
+            and not self.body_constraints
+            and sig[self.params[0].name].kind in positional
+        ):
+            def invoke(req):
+                return func(req)
+        elif (
+            self.params
+            and not self.body_constraints
+            and all(
+                p.kind == "path" and p.ann in (str, _EMPTY) and sig[p.name].kind in positional
+                for p in self.params
+            )
+        ):
+            # パスの引数だけ（型変換無しの str）: ルートが当たればパスの引数は必ずある
+            names = tuple(p.name for p in self.params)
+            if len(names) == 1:
+                (n,) = names
+
+                def invoke(req):
+                    return func(req.params[n])
+            else:
+                def invoke(req):
+                    params = req.params
+                    return func(*[params[n] for n in names])
+        else:
+            bind = self.bind
+
+            def invoke(req):
+                return func(**bind(req))
+
+        def call(req):
+            try:
+                result = invoke(req)
+                if is_async:
+                    result = _run_coro(result)
+                return result
+            except _ValidationFailed as e:
+                return JSONResponse({"detail": e.errors}, 422)
+            except HTTPException as e:
+                return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
+
+        return call
 
     # ---- OpenAPI ----
 
@@ -742,11 +826,14 @@ class App:
             overrides=overrides,
             openapi=openapi,
         )
+        # サーバの中で渡る Rust 側の型も isinstance(x, veil.Request / veil.Headers) で真にする
+        Request.register(_veil.NativeRequest)
+        Headers.register(_veil.NativeHeaders)
         for r in self.routes:
             hid = len(_HANDLERS)
             _HANDLERS.append(r)
-            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json())
-        _veil.run(cfg, _dispatch)
+            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code)
+        _veil.run(cfg, _HANDLERS)
 
 
 # モジュールレベルの既定 App（``@veil.get(...)`` / ``veil.run(...)``）
