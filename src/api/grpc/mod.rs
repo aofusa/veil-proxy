@@ -1,10 +1,14 @@
-//! gRPC サーバ（API ライブラリ、F-197）。メッセージは prost、ワイヤ処理は veil の `src/grpc/`
+//! gRPC サーバ（API ライブラリ、F-197）。ワイヤ処理は veil の `src/grpc/`
 //! （5 バイトのフレーミング・`grpc-status`/`grpc-message`・`grpc-timeout`・gzip/deflate）。tokio・tonic に依存しない。
+//!
+//! メッセージの符号化と復号は [`Codec`] が担い、veil 自身は protobuf の実装に依存しない（F-208）。
+//! `.proto` から `veil-build` で生成したコードは prost のメッセージと `ProstCodec` を使う。
+//! 別の protobuf 実装・JSON 等は `Codec` を実装すれば使える。[`BytesCodec`] は符号化前のバイト列をそのまま渡す。
 //!
 //! ```ignore
 //! use veil::api::grpc::{Request, Response, Status};
 //! App::new()
-//!     .grpc_unary("/helloworld.Greeter/SayHello", |req: Request<HelloRequest>| async move {
+//!     .grpc_unary("/helloworld.Greeter/SayHello", ProstCodec, |req: Request<HelloRequest>| async move {
 //!         Ok(Response::new(HelloReply { message: format!("Hello {}", req.get_ref().name) }))
 //!     })
 //!     .run()
@@ -15,6 +19,7 @@
 //! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
 
 pub mod health;
+pub(crate) mod wire;
 
 /// `veil-build` が `OUT_DIR` に書いた `<package>.rs` を取り込む（`veil::include_proto!("helloworld");`）。
 #[macro_export]
@@ -30,10 +35,9 @@ use super::request::HttpVersion;
 use super::stream::{BodyChunk, RequestBodyStream};
 use crate::grpc::compression::GrpcCompression;
 use crate::grpc::framing::GrpcFrameDecoder;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::BufMut;
 use futures::{Stream, StreamExt};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,8 +46,51 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 pub use crate::grpc::status::GrpcStatusCode as Code;
-/// 生成コード・利用者が同じ版の prost を使えるように再エクスポートする。
-pub use prost;
+/// codec の実装（生成コードの `ProstCodec` 等）が使うバッファの型。
+pub use bytes::{Bytes, BytesMut};
+
+// ===================== Codec =====================
+
+/// メッセージ型 `T` の符号化と復号（F-208）。
+///
+/// 「メッセージ型に実装する trait」ではなく「codec の型に実装する trait」にしている。生成コードは利用者の
+/// クレートにローカルな codec の型（`ProstCodec`）を置き、`impl<T: prost::Message + Default> Codec<T> for ProstCodec`
+/// と書ける（orphan rule。外部クレートのメッセージ型 `prost_types::Empty` 等も rpc に使える）。
+pub trait Codec<T>: Clone + Send + Sync + 'static {
+    /// `out` の末尾にメッセージを書く（veil が先に 5 バイトの見出しの領域を空け、書いた後に長さを入れる）。
+    fn encode(&self, message: &T, out: &mut BytesMut) -> Result<(), Status>;
+    /// 1 メッセージ分（解凍済み）を復号する。
+    fn decode(&self, buf: Bytes) -> Result<T, Status>;
+    /// 符号化後の大きさ（分かれば。送信バッファを 1 回で確保するため。0 = 不明）。
+    fn encoded_len(&self, _message: &T) -> usize {
+        0
+    }
+}
+
+/// 符号化前のバイト列をそのまま受け渡す codec（生成コード無しで使う・C や Python の橋渡し）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BytesCodec;
+
+impl Codec<Bytes> for BytesCodec {
+    fn encode(&self, message: &Bytes, out: &mut BytesMut) -> Result<(), Status> {
+        out.extend_from_slice(message);
+        Ok(())
+    }
+    fn decode(&self, buf: Bytes) -> Result<Bytes, Status> {
+        Ok(buf)
+    }
+    fn encoded_len(&self, message: &Bytes) -> usize {
+        message.len()
+    }
+}
+
+/// 受信ストリームが持つ復号関数（ルートの登録時に 1 回作り、呼び出しごとには `Arc` を複製するだけ）。
+type DecodeFn<T> = Arc<dyn Fn(Bytes) -> Result<T, Status> + Send + Sync>;
+
+fn decode_fn<T: 'static, C: Codec<T>>(codec: &C) -> DecodeFn<T> {
+    let codec = codec.clone();
+    Arc::new(move |b| codec.decode(b))
+}
 
 /// メタデータ（要求ヘッダ・応答ヘッダ・トレーラ）。名前は小文字。
 pub type Metadata = Vec<(Bytes, Bytes)>;
@@ -318,14 +365,14 @@ impl<T> Response<T> {
 // ===================== Streaming（受信） =====================
 
 /// 受信メッセージのストリーム（client streaming・bidi の要求）。届いた本文を gRPC のフレームに切り出し、
-/// 圧縮を戻して `T::decode` する。上限超過は `RESOURCE_EXHAUSTED`、壊れたメッセージは `INTERNAL`。
+/// 圧縮を戻して codec で復号する。上限超過は `RESOURCE_EXHAUSTED`、壊れたメッセージは `INTERNAL`。
 pub struct Streaming<T> {
     body: RequestBodyStream,
     decoder: GrpcFrameDecoder,
     encoding: GrpcCompression,
+    decode: DecodeFn<T>,
     body_done: bool,
     finished: bool,
-    _t: PhantomData<fn() -> T>,
 }
 
 impl<T> std::fmt::Debug for Streaming<T> {
@@ -336,15 +383,19 @@ impl<T> std::fmt::Debug for Streaming<T> {
     }
 }
 
-impl<T: prost::Message + Default> Streaming<T> {
-    fn new(body: RequestBodyStream, encoding: GrpcCompression) -> Streaming<T> {
+impl<T> Streaming<T> {
+    fn new(
+        body: RequestBodyStream,
+        encoding: GrpcCompression,
+        decode: DecodeFn<T>,
+    ) -> Streaming<T> {
         Streaming {
             body,
             decoder: GrpcFrameDecoder::with_max_size(max_message_size()),
             encoding,
+            decode,
             body_done: false,
             finished: false,
-            _t: PhantomData,
         }
     }
 
@@ -384,12 +435,11 @@ impl<T: prost::Message + Default> Streaming<T> {
                 max_message_size()
             )));
         }
-        T::decode(&data[..])
-            .map_err(|e| Status::internal(format!("failed to decode message: {}", e)))
+        (self.decode)(Bytes::from(data))
     }
 }
 
-impl<T: prost::Message + Default> Stream for Streaming<T> {
+impl<T> Stream for Streaming<T> {
     type Item = Result<T, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -439,28 +489,30 @@ impl<T: prost::Message + Default> Stream for Streaming<T> {
 
 // ===================== 送信 =====================
 
-/// メッセージを 5 バイトの見出し付きで符号化する（非圧縮）。
-pub(crate) fn encode_message<T: prost::Message>(m: &T) -> Bytes {
-    let len = m.encoded_len();
-    let mut buf = BytesMut::with_capacity(5 + len);
-    buf.put_u8(0);
-    buf.put_u32(len as u32);
-    // 容量を確保済みなので失敗しない
-    let _ = m.encode(&mut buf);
-    buf.freeze()
+/// メッセージを 5 バイトの見出し付きで符号化する（非圧縮）。見出しの領域を空けて codec に書かせ、後で長さを入れる。
+pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, Status> {
+    let mut buf = BytesMut::with_capacity(5 + codec.encoded_len(m));
+    buf.put_bytes(0, 5);
+    codec.encode(m, &mut buf)?;
+    let len = buf.len() - 5;
+    let len = u32::try_from(len)
+        .map_err(|_| Status::resource_exhausted(format!("response message too large ({})", len)))?;
+    buf[1..5].copy_from_slice(&len.to_be_bytes());
+    Ok(buf.freeze())
 }
 
 /// 応答のメッセージ列を本文の断片とトレーラに変える（最後に `grpc-status`、途中の `Err` はその状態で終える）。
-struct GrpcBody<S> {
+struct GrpcBody<S, C> {
     inner: S,
+    codec: C,
     trailers: Option<Metadata>,
     deadline: Option<Instant>,
 }
 
-impl<S, T> Stream for GrpcBody<S>
+impl<S, T, C> Stream for GrpcBody<S, C>
 where
     S: Stream<Item = Result<T, Status>> + Unpin,
-    T: prost::Message,
+    C: Codec<T> + Unpin,
 {
     type Item = BodyChunk;
 
@@ -476,7 +528,13 @@ where
             )));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(m))) => Poll::Ready(Some(BodyChunk::Data(encode_message(&m)))),
+            Poll::Ready(Some(Ok(m))) => match encode_message(&this.codec, &m) {
+                Ok(b) => Poll::Ready(Some(BodyChunk::Data(b))),
+                Err(s) => {
+                    this.trailers = None;
+                    Poll::Ready(Some(BodyChunk::Trailers(s.to_trailers())))
+                }
+            },
             Poll::Ready(Some(Err(s))) => {
                 this.trailers = None;
                 Poll::Ready(Some(BodyChunk::Trailers(s.to_trailers())))
@@ -513,10 +571,15 @@ fn trailers_only(status: &Status) -> super::response::Response {
 }
 
 /// メッセージ列の応答。
-fn stream_response<S, T>(resp: Response<S>, deadline: Option<Instant>) -> super::response::Response
+fn stream_response<S, T, C>(
+    resp: Response<S>,
+    deadline: Option<Instant>,
+    codec: C,
+) -> super::response::Response
 where
     S: Stream<Item = Result<T, Status>> + Send + Unpin + 'static,
-    T: prost::Message + 'static,
+    T: 'static,
+    C: Codec<T> + Unpin,
 {
     let Response {
         metadata,
@@ -527,6 +590,7 @@ where
     head.headers.extend(metadata);
     let body = GrpcBody {
         inner: message,
+        codec,
         trailers: Some(trailers),
         deadline,
     };
@@ -629,7 +693,7 @@ where
 }
 
 /// 単項の要求メッセージを 1 つ読む（0 個・2 個以上はエラー）。
-async fn read_single<T: prost::Message + Default>(mut s: Streaming<T>) -> Result<T, Status> {
+async fn read_single<T>(mut s: Streaming<T>) -> Result<T, Status> {
     let Some(first) = s.message().await? else {
         return Err(Status::internal("missing request message"));
     };
@@ -641,11 +705,12 @@ async fn read_single<T: prost::Message + Default>(mut s: Streaming<T>) -> Result
     Ok(first)
 }
 
-fn request_parts<T: prost::Message + Default>(
+fn request_parts<T>(
     req: &super::request::Request,
     call: &Call,
+    decode: &DecodeFn<T>,
 ) -> Streaming<T> {
-    Streaming::new(req.take_body_stream(), call.encoding)
+    Streaming::new(req.take_body_stream(), call.encoding, decode.clone())
 }
 
 fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
@@ -707,22 +772,27 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
 
 impl App {
     /// 単項 RPC（1 要求 → 1 応答）を登録する。`path` は `/<package>.<Service>/<Method>`。
-    pub fn grpc_unary<Req, Resp, F, Fut>(self, path: &str, f: F) -> App
+    /// `codec` が要求と応答のメッセージを符号化・復号する（`veil-build` の生成コードは `ProstCodec`）。
+    pub fn grpc_unary<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + Send + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: Send + 'static,
         F: Fn(Request<Req>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<Resp>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
                     let m = read_single(body).await?;
@@ -744,6 +814,7 @@ impl App {
                                 trailers,
                             },
                             None,
+                            codec,
                         )
                     }
                     Err(s) => trailers_only(&s),
@@ -754,23 +825,27 @@ impl App {
     }
 
     /// サーバストリーミング RPC（1 要求 → 応答のストリーム）を登録する。
-    pub fn grpc_server_streaming<Req, Resp, S, F, Fut>(self, path: &str, f: F) -> App
+    pub fn grpc_server_streaming<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: 'static,
         S: Stream<Item = Result<Resp, Status>> + Send + 'static,
         F: Fn(Request<Req>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<S>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
                     let m = read_single(body).await?;
@@ -779,7 +854,7 @@ impl App {
                 })
                 .await;
                 match r {
-                    Ok(resp) => stream_response(boxed(resp), deadline),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec),
                     Err(s) => trailers_only(&s),
                 }
             })
@@ -788,22 +863,26 @@ impl App {
     }
 
     /// クライアントストリーミング RPC（要求のストリーム → 1 応答）を登録する。
-    pub fn grpc_client_streaming<Req, Resp, F, Fut>(self, path: &str, f: F) -> App
+    pub fn grpc_client_streaming<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + Send + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: Send + 'static,
         F: Fn(Request<Streaming<Req>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<Resp>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
                     Ok(resp) => {
@@ -819,6 +898,7 @@ impl App {
                                 trailers,
                             },
                             None,
+                            codec,
                         )
                     }
                     Err(s) => trailers_only(&s),
@@ -830,26 +910,30 @@ impl App {
 
     /// 双方向ストリーミング RPC（要求のストリーム → 応答のストリーム）を登録する。
     /// HTTP/2 では要求と応答が全二重で流れる（HTTP/3 では要求本文を受け終えてから呼ばれる）。
-    pub fn grpc_bidi<Req, Resp, S, F, Fut>(self, path: &str, f: F) -> App
+    pub fn grpc_bidi<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: 'static,
         S: Stream<Item = Result<Resp, Status>> + Send + 'static,
         F: Fn(Request<Streaming<Req>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<S>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
-                    Ok(resp) => stream_response(boxed(resp), deadline),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec),
                     Err(s) => trailers_only(&s),
                 }
             })

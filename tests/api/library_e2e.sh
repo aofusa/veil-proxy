@@ -301,6 +301,18 @@ run_nonregression() {
     *"did not match"*|"") ok "no tokio in the dependency tree of features=api" ;;
     *) bad "tokio is a dependency of features=api: $t" ;;
   esac
+  # F-207: GraphQL は利用者が選ぶ（api に async-graphql を含めない）。F-208: gRPC ハンドラは prost に依存しない
+  # （veil で prost を使うのは VDS だけ。vds を含まない構成で確かめる）
+  t=$(cd "$ROOT" && cargo tree -q -e normal --no-default-features --features api -i async-graphql 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no async-graphql in the dependency tree of features=api" ;;
+    *) bad "async-graphql is a dependency of features=api: $t" ;;
+  esac
+  t=$(cd "$ROOT" && cargo tree -q -e normal --no-default-features --features "http2,grpc-handler" -i prost 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no prost in the dependency tree of features=grpc-handler" ;;
+    *) bad "prost is a dependency of features=grpc-handler: $t" ;;
+  esac
 }
 
 case "$WHAT" in

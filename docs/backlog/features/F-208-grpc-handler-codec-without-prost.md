@@ -1,6 +1,6 @@
 # F-208: gRPC ハンドラを prost から切り離す（メッセージの符号化は `veil-build` が生成するコードが担う）
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景
 
@@ -98,3 +98,20 @@ vds = ["dep:prost", "dep:serde_json", "grpc", "http2"]
 
 F-197、F-209（gRPC の未対応機能。サーバリフレクションは記述子を `veil-build` が埋め込む形で本チケットの上に作る）、
 F-210（C・Python の gRPC は `BytesCodec` の上に作る）。
+
+## 実施内容（2026-10-14）
+
+- `veil::api::grpc::Codec<T>`（`encode`・`decode`・任意の `encoded_len`）と `BytesCodec`。`Bytes`・`BytesMut` を再エクスポート。
+- 登録のメソッドは名前を変えずに **第 2 引数に codec** を取る形にした（`grpc_unary(path, codec, f)` 等）。設計の
+  `grpc_*_with` は、codec 無しの版を残さないので接尾辞だけが残る形になるため採らなかった。
+- `Streaming<T>` は登録時に 1 回作った復号関数（`Arc<dyn Fn(Bytes) -> Result<T, Status>>`）を持つ（呼び出しごとの確保は増えない）。
+  応答は 5 バイトの見出しの領域を空けて codec に書かせ、後から長さを入れる（`encoded_len` が分かれば確保 1 回）。
+- `grpc.health.v1` は手書きの符号化（`HealthCodec`、`src/api/grpc/wire.rs` の最小の varint・長さ付きフィールド・未知フィールドの読み飛ばし）。
+  単体試験で prost（dev-dependency）と同じバイト列であることを確かめる。
+- features: `grpc = []`、`vds` が `dep:prost` を持つ。`pub use prost` を削除。
+- `veil-build`: サービスのモジュールに `ProstCodec`（`impl<T: prost::Message + Default> Codec<T>`）を生成し、`add_<service>` は
+  それで登録する。`crates/veil-build/README.md` を新設。
+- 設計の `CONTENT_SUBTYPE`（`application/grpc+json` 等の照合）は入れていない。受け付けは今どおり `application/grpc*` で、
+  副型の扱いは codec を選ぶ利用者に任せる（必要になったら F-209 の続きとして足す）。
+- 試験: 単体（`health_codec_matches_prost`・`bytes_codec_roundtrip`・wire の varint と読み飛ばし）、`library_e2e.sh grpc`
+  （tonic・quinn + h3、io_uring・epoll）、`nonregression` に「`http2,grpc-handler` の依存に prost が無い」「`api` に async-graphql が無い」を追加。

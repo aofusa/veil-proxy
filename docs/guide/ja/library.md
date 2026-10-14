@@ -64,7 +64,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 | `tokio-compat` | tokio 無しの tokio 互換レイヤー（`veil::tokio`・`App::tokio_service`・`veil::api::tokio_compat`）。[tokio 互換](#tokio-互換) を参照 |
 | `tokio-compat-bridge` | `tokio-compat` の代わりに、本物の tokio ランタイムを同梱して Future をその上で動かす（`tokio-compat` と排他） |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理（`l4-proxy` を含意） |
-| `grpc-handler` | prost のメッセージで書く gRPC サーバ（`veil::api::grpc`、[gRPC](#grpc) を参照。`handler`・`grpc` を含意） |
+| `grpc-handler` | gRPC サーバ。メッセージは利用者が選ぶ codec が符号化する（`veil-build` 経由なら prost）（`veil::api::grpc`、[gRPC](#grpc) を参照。`handler`・`grpc` を含意） |
 | `api-core` | `handler`・`macro`・`openapi`・`l4-handler`・`grpc-handler` と tower の `Layer`/`Service` 互換（`veil::api::tower`） |
 | `api` | `api-core` + `tokio-compat`（ライブラリの既定の使い方） |
 
@@ -509,14 +509,16 @@ graphql::graphql(App::new(), "/graphql", schema).run()?;
 
 ## gRPC
 
-`grpc-handler`（`api` に含まれる）が必要です。メッセージは [prost](https://docs.rs/prost) の型、ワイヤ処理（5 バイトの
-フレーミング・`grpc-status`/`grpc-message` のトレーラ・`grpc-timeout`・gzip/deflate）は veil 自身の実装で、tokio も tonic も
-使いません。gRPC の呼び出しは普通のハンドラのルート（`POST /<package>.<Service>/<Method>`）で、同じリスナーの HTTP/2
+`grpc-handler`（`api` に含まれる）が必要です。ワイヤ処理（5 バイトのフレーミング・`grpc-status`/`grpc-message` の
+トレーラ・`grpc-timeout`・gzip/deflate）は veil 自身の実装で、tokio も tonic も使いません。protobuf の実装にも依存しません。
+メッセージの符号化と復号は、メソッドの登録時に渡す **codec**（`veil::api::grpc::Codec<T>`）が行います。`veil-build` が
+生成するコードは [prost](https://docs.rs/prost) のメッセージと生成された `ProstCodec` を使い、他の protobuf ライブラリや
+JSON も `Codec` を実装すれば使えます。gRPC の呼び出しは普通のハンドラのルート（`POST /<package>.<Service>/<Method>`）で、同じリスナーの HTTP/2
 （TLS・h2c）と HTTP/3 で受けます。
 
 ### コード生成
 
-`veil-build` を build-dependency に、`prost` を依存に足します。
+`veil-build` を build-dependency に、`prost`（0.13。`veil-build` の prost-build が生成するコードに合う版）を依存に足します。
 
 ```rust
 // build.rs
@@ -542,21 +544,44 @@ add_greeter(App::new().grpc_health(), MyGreeter).run()
 ```
 
 `veil-build` はサービスごとに `<service>_server` モジュールを作り、トレイト（RPC ごとに 1 メソッド。`async fn` で実装でき、
-Future に `Send` は要りません）、`add_<service>(app, 実装)`、`METHODS` を生成します。サーバ・双方向ストリーミングは
+Future に `Send` は要りません）、`add_<service>(app, 実装)`、`METHODS`、`ProstCodec`（`add_<service>` がメソッドの登録に使う prost の codec）を生成します。サーバ・双方向ストリーミングは
 `Response<BoxStream<T>>` を返し、クライアント・双方向ストリーミングは `Request<Streaming<T>>` を受け取ります。
 `veil_build::configure().veil_path("::my_veil")` でクレートのパスを変えられ、`config_mut()` で `prost_build::Config` を触れます。
 
 ### コード生成なし
 
+メソッドは codec と一緒に登録します。prost のメッセージ（`#[derive(prost::Message)]`）用の codec は 10 行ほどです:
+
 ```rust
+use veil::api::grpc::{Bytes, BytesMut, Codec, Request, Response, Status, Streaming};
+
+#[derive(Clone, Copy)]
+struct ProstCodec;
+impl<T: prost::Message + Default + 'static> Codec<T> for ProstCodec {
+    fn encode(&self, m: &T, out: &mut BytesMut) -> Result<(), Status> {
+        m.encode(out).map_err(|e| Status::internal(e.to_string()))
+    }
+    fn decode(&self, buf: Bytes) -> Result<T, Status> {
+        T::decode(buf).map_err(|e| Status::internal(e.to_string()))
+    }
+    fn encoded_len(&self, m: &T) -> usize { m.encoded_len() }   // 任意: メッセージごとの確保を 1 回にする
+}
+
 App::new()
-    .grpc_unary("/pkg.Svc/Get", |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
-    .grpc_server_streaming("/pkg.Svc/Watch", |req: Request<WatchRequest>| async move {
+    .grpc_unary("/pkg.Svc/Get", ProstCodec, |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
+    .grpc_server_streaming("/pkg.Svc/Watch", ProstCodec, |req: Request<WatchRequest>| async move {
         Ok(Response::new(futures::stream::iter(items.into_iter().map(Ok))))
     })
-    .grpc_client_streaming("/pkg.Svc/Upload", |req: Request<Streaming<Chunk>>| async move { .. })
-    .grpc_bidi("/pkg.Svc/Chat", |req: Request<Streaming<Msg>>| async move { .. })
+    .grpc_client_streaming("/pkg.Svc/Upload", ProstCodec, |req: Request<Streaming<Chunk>>| async move { .. })
+    .grpc_bidi("/pkg.Svc/Chat", ProstCodec, |req: Request<Streaming<Msg>>| async move { .. })
 ```
+
+`veil::api::grpc::BytesCodec` は符号化されたメッセージを `Bytes` のまま渡します（`Request<Bytes>`・`Response<Bytes>`）。
+自分で復号する場合や、そのまま転送する場合に使います。
+
+> v0.7 までは codec を取らず prost のメッセージだけを受け、`veil::api::grpc::prost` で prost を再エクスポートしていました。
+> F-208 以降、`veil-build` の生成コードは自分で `ProstCodec` を登録します（再ビルドするだけで移行できます）。手で登録している
+> コードは上のように codec の引数を足し、`prost` に直接依存してください。
 
 ### 型と挙動
 

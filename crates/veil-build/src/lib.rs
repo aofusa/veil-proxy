@@ -14,8 +14,11 @@
 //!   サーバ/双方向ストリーミングの応答は `veil::api::grpc::BoxStream<T>`、受信ストリームは `Streaming<T>`。
 //! - `fn add_<service>(app, svc) -> App`: 全メソッドを `App::grpc_*` で登録する（静的ディスパッチ）。
 //! - `SERVICE_NAME`・`METHODS`（`/<package>.<Service>/<Method>` の一覧）。
+//! - `ProstCodec`: prost のメッセージを符号化・復号する `veil::api::grpc::Codec` の実装（F-208）。
+//!   veil 本体は protobuf の実装に依存しないので、prost との橋渡しは生成コードが持つ。
 //!
-//! 生成コードは tokio・tonic に依存しない（`veil::api::grpc` と prost のみ）。
+//! 生成コードは tokio・tonic に依存しない（`veil::api::grpc` と prost のみ）。利用者のクレートに `prost` の依存が要る
+//! （prost-build 0.13 が生成するコードに合わせて `prost = "0.13"`）。
 
 use prost_build::{Method, Service, ServiceGenerator};
 use std::fmt::Write as _;
@@ -144,6 +147,41 @@ impl ServiceGenerator for VeilServiceGenerator {
         }
         let _ = writeln!(buf, "];");
 
+        // codec（F-208）: このクレートにローカルな型なので、prost の任意のメッセージ型に veil の trait を実装できる
+        let _ = writeln!(
+            buf,
+            "    /// prost のメッセージの符号化と復号（veil-build が生成）。"
+        );
+        let _ = writeln!(buf, "    #[derive(Clone, Copy, Debug, Default)]");
+        let _ = writeln!(buf, "    pub struct ProstCodec;");
+        let _ = writeln!(
+            buf,
+            "    impl<T: ::prost::Message + ::core::default::Default + 'static> {g}::Codec<T> for ProstCodec {{"
+        );
+        let _ = writeln!(
+            buf,
+            "        fn encode(&self, message: &T, out: &mut {g}::BytesMut) -> ::core::result::Result<(), {g}::Status> {{"
+        );
+        let _ = writeln!(
+            buf,
+            "            ::prost::Message::encode(message, out).map_err(|e| {g}::Status::internal(e.to_string()))"
+        );
+        let _ = writeln!(buf, "        }}");
+        let _ = writeln!(
+            buf,
+            "        fn decode(&self, buf: {g}::Bytes) -> ::core::result::Result<T, {g}::Status> {{"
+        );
+        let _ = writeln!(
+            buf,
+            "            <T as ::prost::Message>::decode(buf).map_err(|e| {g}::Status::internal(::std::format!(\"failed to decode message: {{}}\", e)))"
+        );
+        let _ = writeln!(buf, "        }}");
+        let _ = writeln!(
+            buf,
+            "        fn encoded_len(&self, message: &T) -> usize {{ ::prost::Message::encoded_len(message) }}"
+        );
+        let _ = writeln!(buf, "    }}");
+
         // トレイト
         doc(&service.comments.leading, "    ", buf);
         let _ = writeln!(
@@ -204,7 +242,7 @@ impl ServiceGenerator for VeilServiceGenerator {
             let _ = writeln!(buf, "            let s = service.clone();");
             let _ = writeln!(
                 buf,
-                "            app.{reg}(\"{}\", move |req: {req}| {{ let s = s.clone(); async move {{ s.{}(req).await }} }})",
+                "            app.{reg}(\"{}\", ProstCodec, move |req: {req}| {{ let s = s.clone(); async move {{ s.{}(req).await }} }})",
                 path_of(&service, m),
                 m.name
             );

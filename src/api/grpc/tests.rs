@@ -1,12 +1,15 @@
 //! gRPC サーバ層の単体テスト（ワーカーを起動せず、ハンドラ関数を直接呼ぶ）。
 
-use super::health::{HealthCheckRequest, HealthCheckResponse};
+use super::health::{HealthCheckRequest, HealthCheckResponse, HealthCodec};
 use super::*;
 use crate::api::request::Request as ApiRequest;
 use futures::SinkExt;
 
-fn frame<T: prost::Message>(m: &T) -> Bytes {
-    encode_message(m)
+fn frame<T>(m: &T) -> Bytes
+where
+    HealthCodec: Codec<T>,
+{
+    encode_message(&HealthCodec, m).unwrap()
 }
 
 fn grpc_request(version: HttpVersion, frames: Vec<Bytes>, extra: &[(&str, &str)]) -> ApiRequest {
@@ -58,12 +61,15 @@ fn field<'a>(m: &'a Metadata, name: &str) -> Option<&'a [u8]> {
         .map(|(_, v)| v.as_ref())
 }
 
-fn decode_all<T: prost::Message + Default>(data: &[u8]) -> Vec<T> {
+fn decode_all<T>(data: &[u8]) -> Vec<T>
+where
+    HealthCodec: Codec<T>,
+{
     let mut d = GrpcFrameDecoder::new();
     d.push(data);
     let mut out = Vec::new();
     while let Some(f) = d.decode_next().unwrap() {
-        out.push(T::decode(&f.data[..]).unwrap());
+        out.push(HealthCodec.decode(Bytes::from(f.data)).unwrap());
     }
     out
 }
@@ -75,6 +81,7 @@ fn handler_of(app: App) -> HandlerFn {
 fn echo_app() -> App {
     App::new().grpc_unary(
         "/pkg.Svc/M",
+        HealthCodec,
         |req: Request<HealthCheckRequest>| async move {
             if req.get_ref().service == "fail" {
                 return Err(
@@ -217,9 +224,15 @@ fn oversized_message_is_resource_exhausted() {
 #[test]
 fn gzip_compressed_request() {
     let f = handler_of(echo_app());
-    let raw = prost::Message::encode_to_vec(&HealthCheckRequest {
-        service: "gz".into(),
-    });
+    let mut raw = BytesMut::new();
+    HealthCodec
+        .encode(
+            &HealthCheckRequest {
+                service: "gz".into(),
+            },
+            &mut raw,
+        )
+        .unwrap();
     let gz = GrpcCompression::Gzip.compress(&raw, 6).unwrap();
     let mut fr = BytesMut::new();
     fr.put_u8(1);
@@ -314,6 +327,7 @@ fn grpc_web_is_rejected() {
 fn bidi_and_client_streaming() {
     let bidi = handler_of(App::new().grpc_bidi(
         "/pkg.Svc/Chat",
+        HealthCodec,
         |req: Request<Streaming<HealthCheckRequest>>| async move {
             let s = req.into_inner().map(|m| {
                 m.map(|m| HealthCheckRequest {
@@ -345,6 +359,7 @@ fn bidi_and_client_streaming() {
 
     let client = handler_of(App::new().grpc_client_streaming(
         "/pkg.Svc/Up",
+        HealthCodec,
         |req: Request<Streaming<HealthCheckRequest>>| async move {
             let mut s = req.into_inner();
             let mut n = 0;
@@ -366,6 +381,7 @@ fn bidi_and_client_streaming() {
 fn server_streaming_error_mid_stream() {
     let f = handler_of(App::new().grpc_server_streaming(
         "/pkg.Svc/Watch",
+        HealthCodec,
         |_req: Request<HealthCheckRequest>| async move {
             Ok(Response::new(futures::stream::iter(vec![
                 Ok(HealthCheckResponse { status: 1 }),
@@ -449,4 +465,76 @@ fn health_check_and_watch() {
     };
     assert_eq!(status(first), 1);
     assert_eq!(status(second), 2);
+}
+
+/// F-208: 手書きのヘルスチェックの符号化が prost（dev-dependency）と同じバイト列で、互いに読めること。
+#[test]
+fn health_codec_matches_prost() {
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PReq {
+        #[prost(string, tag = "1")]
+        service: String,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PResp {
+        #[prost(int32, tag = "1")]
+        status: i32,
+    }
+    for svc in ["", "a", "pkg.Service", &"x".repeat(300)] {
+        let mut ours = BytesMut::new();
+        HealthCodec
+            .encode(
+                &HealthCheckRequest {
+                    service: svc.into(),
+                },
+                &mut ours,
+            )
+            .unwrap();
+        let theirs = prost::Message::encode_to_vec(&PReq {
+            service: svc.into(),
+        });
+        assert_eq!(&ours[..], &theirs[..], "{:?}", svc);
+        let back: HealthCheckRequest = HealthCodec.decode(Bytes::from(theirs)).unwrap();
+        assert_eq!(back.service, svc);
+    }
+    for st in [0, 1, 2, 3, -1] {
+        let mut ours = BytesMut::new();
+        HealthCodec
+            .encode(&HealthCheckResponse { status: st }, &mut ours)
+            .unwrap();
+        let theirs = prost::Message::encode_to_vec(&PResp { status: st });
+        assert_eq!(&ours[..], &theirs[..], "{}", st);
+        let back: HealthCheckResponse = HealthCodec.decode(Bytes::from(theirs)).unwrap();
+        assert_eq!(back.status, st);
+    }
+    // 壊れたメッセージは INTERNAL
+    let r: Result<HealthCheckRequest, _> =
+        HealthCodec.decode(Bytes::from_static(&[0x0a, 0x05, b'a']));
+    assert_eq!(r.unwrap_err().code(), Code::Internal);
+}
+
+/// F-208: `BytesCodec` は符号化前のバイト列をそのまま受け渡す（C・Python の橋渡しと生成コード無しの利用）。
+#[test]
+fn bytes_codec_roundtrip() {
+    let f = handler_of(App::new().grpc_unary(
+        "/raw.Svc/Echo",
+        BytesCodec,
+        |req: Request<Bytes>| async move {
+            let mut v = b"echo:".to_vec();
+            v.extend_from_slice(req.get_ref());
+            Ok(Response::new(Bytes::from(v)))
+        },
+    ));
+    let msg = encode_message(&BytesCodec, &Bytes::from_static(b"\x00\x01raw")).unwrap();
+    let (_, data, t) = collect(futures::executor::block_on(f(grpc_request(
+        HttpVersion::Http2,
+        vec![msg],
+        &[],
+    ))));
+    assert_eq!(field(&t, "grpc-status"), Some(&b"0"[..]));
+    assert_eq!(&data[5..], b"echo:\x00\x01raw");
+    assert_eq!(
+        u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize,
+        data.len() - 5
+    );
 }
