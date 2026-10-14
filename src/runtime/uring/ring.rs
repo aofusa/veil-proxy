@@ -554,7 +554,7 @@ impl IoUring {
         // `PROXY_ALLOWED_OPCODES`（SQE 許可リスト）を変更せずここで明示的に許可する。
         // セキュリティサーフェスの変化は「provided buffer の登録が可能になること」のみで、
         // 新しい SQE オペコードは一切追加していない。
-        let mut restrictions: Vec<IoUringRestriction> = Vec::with_capacity(sqe_opcodes.len() + 3);
+        let mut restrictions: Vec<IoUringRestriction> = Vec::with_capacity(sqe_opcodes.len() + 4);
         restrictions.push(IoUringRestriction {
             opcode: IORING_RESTRICTION_REGISTER_OP,
             register_opcode_or_sqe_op: IORING_REGISTER_ENABLE_RINGS as u8,
@@ -568,6 +568,15 @@ impl IoUring {
         restrictions.push(IoUringRestriction {
             opcode: IORING_RESTRICTION_REGISTER_OP,
             register_opcode_or_sqe_op: IORING_UNREGISTER_PBUF_RING as u8,
+            ..Default::default()
+        });
+        // B-128: 制限を登録すると SQE フラグも許可したものしか通らない（未許可は -EACCES）。provided buffer を
+        // 選ぶ IOSQE_BUFFER_SELECT（HTTP/3 の multishot 受信 F-130 C2・TCP のキープアライブ受信 F-205）だけを
+        // 許可する。これが無いと buffer select の op は本番のリングで全部 -EACCES になり、F-130 C2 は常に
+        // C1 へ戻っていた。他のフラグ（IO_LINK・ASYNC・FIXED_FILE 等）は今どおり使わないので許可しない。
+        restrictions.push(IoUringRestriction {
+            opcode: IORING_RESTRICTION_SQE_FLAGS_ALLOWED,
+            register_opcode_or_sqe_op: IOSQE_BUFFER_SELECT,
             ..Default::default()
         });
         restrictions.extend(sqe_opcodes.iter().map(|&op| IoUringRestriction {
@@ -921,6 +930,73 @@ mod tests {
             Some(-libc::EACCES),
             "disallowed opcode must be rejected with -EACCES (restrictions active)"
         );
+    }
+
+    /// B-128 回帰: 制限付きのリングは許可していない SQE フラグを `-EACCES` で拒否する。provided buffer を
+    /// 選ぶ `IOSQE_BUFFER_SELECT`（HTTP/3 の multishot 受信・F-205 の TCP の受信）だけは許可されていること。
+    /// 許可が無いと、制限付きの本番のリングでは buffer select の op が全部 `-EACCES` になる。
+    #[test]
+    fn restrictions_allow_only_buffer_select_flag() {
+        let mut ring = match IoUring::new(8, IORING_SETUP_R_DISABLED) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("io_uring R_DISABLED unavailable ({e}); skipping");
+                return;
+            }
+        };
+        if let Err(e) = ring.apply_restrictions(&[IORING_OP_NOP, IORING_OP_RECV]) {
+            eprintln!("apply_restrictions unsupported ({e}); skipping");
+            return;
+        }
+        ring.enable_rings().expect("enable_rings");
+        // 受信できるデータを置いたソケット（buffer select を受ける RECV で試す。NOP は buffer select を
+        // 受けないので、制限より前の検査で -EOPNOTSUPP になり区別できない）
+        let mut fds = [0i32; 2];
+        // SAFETY: fds は 2 要素の配列。
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fds[1] は直前に作ったソケット。
+        unsafe { libc::write(fds[1], b"xxxxxxxx".as_ptr() as *const libc::c_void, 8) };
+        let mut run = |opcode: u8, flags: u8, ud: u64| {
+            {
+                let sqe = ring.get_sqe().expect("sqe");
+                sqe.opcode = opcode;
+                sqe.flags = flags;
+                sqe.user_data = ud;
+                if opcode == IORING_OP_RECV {
+                    sqe.fd = fds[0];
+                    sqe.len = 1;
+                    // 登録していないバッファ群（制限を通れば -ENOBUFS になる）
+                    sqe.buf_index_or_buf_group = 77;
+                }
+            }
+            ring.submit_and_wait(1).expect("submit");
+            let mut res = None;
+            ring.consume_cqes(|cqe| {
+                if cqe.user_data == ud {
+                    res = Some(cqe.res);
+                }
+            });
+            res.expect("cqe")
+        };
+        // buffer select は制限で弾かれない（NOP が buffer select を受けないことによる別のエラーは問わない）
+        assert_eq!(
+            run(IORING_OP_RECV, IOSQE_BUFFER_SELECT, 1),
+            -libc::ENOBUFS,
+            "IOSQE_BUFFER_SELECT must pass the restriction (then fail for the empty buffer group)"
+        );
+        // それ以外のフラグは許可しない（セキュリティサーフェスを広げない）
+        assert_eq!(run(IORING_OP_NOP, IOSQE_ASYNC, 2), -libc::EACCES);
+        assert_eq!(run(IORING_OP_NOP, IOSQE_IO_LINK, 3), -libc::EACCES);
+        // フラグ無しは今どおり
+        assert_eq!(run(IORING_OP_NOP, 0, 4), 0);
+        // SAFETY: 直前に作ったソケット。
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 
     /// B-24 回帰: SQ が満杯でも `get_sqe_or_submit` は pending を提出してスロットを解放し、
