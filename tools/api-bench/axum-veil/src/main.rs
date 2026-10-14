@@ -20,13 +20,17 @@ async fn json(name: String) -> Json<serde_json::Value> {
 }
 
 fn config(addr: &str, threads: usize) -> Config {
-    Config::new()
+    let b = Config::new()
         .builder()
-        .listen_cleartext(addr)
         .threads(threads)
         .log_level("warn")
-        .openapi_enabled(false)
-        .build()
+        .openapi_enabled(false);
+    // HTTP/3 の計測（run_bench.py --proto h3）: TLS のリスナーと HTTP/3 を同じアドレスで
+    let b = match (std::env::var("BENCH_TLS_CERT"), std::env::var("BENCH_TLS_KEY")) {
+        (Ok(cert), Ok(key)) => b.listen(addr).tls(&cert, &key).http3(addr),
+        _ => b.listen_cleartext(addr),
+    };
+    b.build()
 }
 
 /// `--features count-allocs`: 確保（alloc・realloc）の累計を 1 秒ごとに標準エラーへ出す（allocs/req を求める）。

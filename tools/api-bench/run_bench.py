@@ -7,6 +7,8 @@
     python3 tools/api-bench/run_bench.py --group rust   --rounds 3 --out docs/artifacts/api_bench_rust.tsv
     python3 tools/api-bench/run_bench.py --group python --rounds 3 --out docs/artifacts/api_bench_python.tsv
     python3 tools/api-bench/run_bench.py --summary docs/artifacts/api_bench_rust.tsv
+    python3 tools/api-bench/run_bench.py --group rust --proto h2c --only "native,percore" --out ...  # HTTP/2（h2load）
+    python3 tools/api-bench/run_bench.py --group rust --proto h3 --only "native" --out ...           # HTTP/3（h2load-h3）
 
 前提: tools/api-bench/README.md のビルド手順（axum-tokio・axum-veil の release ビルド、Python の venv）と
 docker イメージ local/wrk-openssl（wrk）。
@@ -31,6 +33,10 @@ SERVER_CPUS = os.environ.get("BENCH_SERVER_CPUS", "0,1")
 CLIENT_CPUS = os.environ.get("BENCH_CLIENT_CPUS", "2,3")
 THREADS = int(os.environ.get("BENCH_THREADS", "2"))
 WRK_IMG = os.environ.get("WRK_IMG", "local/wrk-openssl:latest")
+# HTTP/2（h2c）・HTTP/3 の負荷ツール（F-206）。h2load の -m（1 接続あたりの同時ストリーム）は H2LOAD_STREAMS
+H2LOAD_IMG = os.environ.get("H2LOAD_IMG", "local/h2load:latest")
+H2LOAD_H3_IMG = os.environ.get("H2LOAD_H3_IMG", "local/h2load-h3:latest")
+H2LOAD_STREAMS = int(os.environ.get("H2LOAD_STREAMS", "10"))
 PATHS = {"plaintext": "/plaintext", "json": "/json/veil"}
 
 AT = os.path.join(HERE, "axum-tokio", "target", "release", "api-bench-axum-tokio")
@@ -156,9 +162,42 @@ def wrk(path, duration, conns):
     }
 
 
-def run_one(name, spec, endpoint, duration, conns, warmup):
+def h2load(path, duration, conns, proto):
+    """h2load（h2c は prior knowledge、h3 は QUIC）。列は wrk に合わせ、p50 の代わりに平均を入れる。"""
+    if proto == "h3":
+        img, url, extra = H2LOAD_H3_IMG, f"https://{ADDR}{path}", ["--alpn-list=h3"]
+    else:
+        img, url, extra = H2LOAD_IMG, f"http://{ADDR}{path}", []
+    t = len(CLIENT_CPUS.split(","))
+    cmd = ["docker", "run", "--rm", "--network", "host", "--cpuset-cpus", CLIENT_CPUS, img,
+           f"-t{t}", f"-c{max(conns, t)}", f"-m{H2LOAD_STREAMS}", f"-D{duration}"] + extra + [url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 60)
+    o = r.stdout + r.stderr
+    rps = re.search(r"finished in [\d.]+\w+, ([\d.]+) req/s", o)
+    fails = re.search(r"requests: \d+ total, \d+ started, \d+ done, \d+ succeeded, (\d+) failed", o)
+    mean = re.search(r"time for request:\s+\S+\s+\S+\s+([\d.]+)(us|ms|s)", o)
+    m = "NA"
+    if mean:
+        v = float(mean.group(1))
+        m = f"{v / 1000 if mean.group(2) == 'us' else v * 1000 if mean.group(2) == 's' else v:.3f}"
+    return {
+        "rps": rps.group(1) if rps else "NA",
+        "p50_ms": m,
+        "p99_ms": "NA",
+        "errors": (f"failed={fails.group(1)}" if fails and fails.group(1) != "0" else "")
+        + ("" if rps else " " + o.strip().splitlines()[-1][:120] if o.strip() else ""),
+    }
+
+
+def load(path, duration, conns, proto):
+    return wrk(path, duration, conns) if proto == "h1" else h2load(path, duration, conns, proto)
+
+
+def run_one(name, spec, endpoint, duration, conns, warmup, proto="h1"):
     cmd, env, cwd = spec
     e = dict(os.environ, **env)
+    if proto == "h3":
+        e.update(BENCH_TLS_CERT=TLS[0], BENCH_TLS_KEY=TLS[1])
     p = subprocess.Popen(["taskset", "-c", SERVER_CPUS] + cmd, env=e, cwd=cwd,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
@@ -167,10 +206,10 @@ def run_one(name, spec, endpoint, duration, conns, warmup):
                     "cores_pct": "NA", "us_per_req": "NA", "rss_mb": "NA"}
         time.sleep(1.0)  # uvicorn の複数ワーカーが揃うまで
         if warmup:
-            wrk(PATHS[endpoint], warmup, conns)
+            load(PATHS[endpoint], warmup, conns, proto)
         pids = tree_pids(p.pid)
         c0, b0, t0 = cpu_ticks(pids), cores_busy(SERVER_CPUS), time.time()
-        res = wrk(PATHS[endpoint], duration, conns)
+        res = load(PATHS[endpoint], duration, conns, proto)
         c1, b1, t1 = cpu_ticks(pids), cores_busy(SERVER_CPUS), time.time()
         hz = os.sysconf("SC_CLK_TCK")
         res["cpu_pct"] = f"{100 * (c1 - c0) / hz / (t1 - t0):.0f}"
@@ -213,6 +252,17 @@ def summary(path):
                   f"{med('cores_pct'):.0f} | {med('us_per_req'):.1f} | {med('rss_mb'):.1f} | {len(ok)} | {'; '.join(errs)} |")
 
 
+TLS = (os.path.join(ROOT, "target", "api-bench-cert.pem"), os.path.join(ROOT, "target", "api-bench-key.pem"))
+
+
+def make_cert():
+    if all(os.path.exists(f) for f in TLS):
+        return
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", TLS[1], "-out", TLS[0],
+                    "-days", "30", "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], check=True, capture_output=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", choices=list(TARGETS))
@@ -222,6 +272,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--conns", type=int, default=64)
     ap.add_argument("--endpoints", default="plaintext,json")
+    ap.add_argument("--proto", choices=["h1", "h2c", "h3"], default="h1",
+                    help="h1 = wrk（HTTP/1.1）、h2c = h2load（HTTP/2 平文）、h3 = h2load-h3（HTTP/3、veil のみ）")
     ap.add_argument("--out")
     ap.add_argument("--summary")
     a = ap.parse_args()
@@ -229,6 +281,10 @@ def main():
         summary(a.summary)
         return
     targets = TARGETS[a.group]
+    if a.proto == "h3":
+        # HTTP/3 は veil の HTTP サーバだけ（axum に HTTP/3 は無い）。自己署名の証明書を作る
+        targets = {n: s for n, s in targets.items() if "native" in n or "mount" in n}
+        make_cert()
     if a.only:
         keys = [k.strip() for k in a.only.split(",")]
         targets = {n: s for n, s in targets.items() if any(k in n for k in keys)}
@@ -245,7 +301,7 @@ def main():
                 order.reverse()
             for ep in a.endpoints.split(","):
                 for n in order:
-                    res = run_one(n, targets[n], ep, a.duration, a.conns, a.warmup)
+                    res = run_one(n, targets[n], ep, a.duration, a.conns, a.warmup, a.proto)
                     row = {"round": r, "target": n, "endpoint": ep, **res}
                     w.writerow(row)
                     f.flush()
