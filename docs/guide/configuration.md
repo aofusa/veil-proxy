@@ -467,9 +467,9 @@ listeners to untrusted networks.
 
 ## VDS (`[vds]`)
 
-Routes and upstreams delivered by a control plane. Keys: `enabled`, `server`, `node_id`, `cluster`, `token_file`,
-`ca_cert`, `client_cert`, `client_key`, `poll_timeout_secs`, `retry_initial_ms`, `retry_max_ms`,
-`max_response_bytes`, `max_resources`. Requires the `vds` feature (in `full`). Precedence:
+Routes and upstreams delivered by a control plane. Keys: `enabled`, `server`, `servers`, `transport`,
+`keepalive_secs`, `node_id`, `cluster`, `token_file`, `ca_cert`, `client_cert`, `client_key`, `poll_timeout_secs`,
+`retry_initial_ms`, `retry_max_ms`, `max_response_bytes`, `max_resources`, `initial_fetch_timeout_ms`. Requires the `vds` feature (in `full`). Precedence:
 `config.toml` < VDS < `VEIL_OVERRIDE_<n>` < `--override`. See [VDS](vds.md).
 
 ## ACME (`[acme]`)
