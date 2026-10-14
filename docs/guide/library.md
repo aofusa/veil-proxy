@@ -203,7 +203,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
 
 Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
 `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
-`grpc_max_message_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
+`grpc_max_message_size`, `grpc_response_compression`, `grpc_response_compression_min_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
 
@@ -223,6 +223,8 @@ for debugging.
 | `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
 | `tokio_threads` | `2` | worker threads of the bundled tokio runtime (`tokio-compat-bridge` only) |
 | `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
+| `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
+| `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
 
 ## Routing macros
 
@@ -615,7 +617,7 @@ for example to decode it yourself or to forward it.
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` and `message().await` |
 | Deadline | `grpc-timeout` is enforced with veil's timer: the handler is cancelled and the call ends with `DEADLINE_EXCEEDED` (for streams, checked between messages) |
 | Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
-| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed (needs the `compression` feature, which `full` includes; without it only `identity` is accepted and other encodings get `UNIMPLEMENTED`); responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
+| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed (needs the `compression` feature, which `full` includes; without it only `identity` is accepted and other encodings get `UNIMPLEMENTED`); responses are compressed when `[api] grpc_response_compression` (or `Response::with_compression(Compression::Gzip)` for one call) names an encoding that the client accepts in `grpc-accept-encoding`, for messages of at least `grpc_response_compression_min_size` bytes; otherwise they are sent uncompressed |
 | Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded. For a compressed message the limit applies to the decompressed size, and decompression stops as soon as it is exceeded |
 | Errors | `content-type` other than `application/grpc*` (and gRPC-Web, `application/grpc-web*`) is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
 | Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |

@@ -2546,6 +2546,9 @@ revalidate_mtime = false
 # handler_threads = 0               # 同期関数・C・Python 用ハンドラプールのスレッド数（0 = 既定）
 # tokio_threads = 2                 # tokio-compat-bridge で同梱する tokio ランタイムのワーカー数
 # grpc_max_message_size = 4194304   # 受信する gRPC メッセージ 1 つの上限（grpc-handler、F-197）
+# grpc_response_compression = "none"   # gRPC の応答の圧縮: "none"・"gzip"・"deflate"（クライアントの grpc-accept-encoding が
+#                                      # 受けるときだけ。compression feature が必要。F-209）
+# grpc_response_compression_min_size = 1024   # これ未満の gRPC メッセージは圧縮しない（バイト）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）

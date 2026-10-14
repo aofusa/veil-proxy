@@ -40,11 +40,13 @@ use futures::{Stream, StreamExt};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+/// 応答の圧縮方式（`Response::with_compression`）。
+pub use crate::grpc::compression::GrpcCompression as Compression;
 pub use crate::grpc::status::GrpcStatusCode as Code;
 /// codec の実装（生成コードの `ProstCodec` 等）が使うバッファの型。
 pub use bytes::{Bytes, BytesMut};
@@ -111,6 +113,66 @@ pub(crate) fn set_max_message_size(n: usize) {
 /// 現在の受信メッセージ上限。
 pub fn max_message_size() -> usize {
     MAX_MESSAGE_SIZE.load(Ordering::Relaxed)
+}
+
+/// 応答の圧縮（`[api] grpc_response_compression`、0 = しない・1 = gzip・2 = deflate。F-209 #2）。
+static RESPONSE_COMPRESSION: AtomicU8 = AtomicU8::new(0);
+/// この大きさ未満のメッセージは圧縮しない（`[api] grpc_response_compression_min_size`）。
+static RESPONSE_COMPRESSION_MIN: AtomicUsize = AtomicUsize::new(1024);
+
+/// `[api] grpc_response_compression`（`"none"`・`"gzip"`・`"deflate"`）を反映する。知らない値は `none` にして返す。
+pub(crate) fn set_response_compression(name: &str, min_size: usize) -> Result<(), String> {
+    let (v, r) = match name.to_ascii_lowercase().as_str() {
+        "" | "none" | "identity" => (0, Ok(())),
+        "gzip" => (1, Ok(())),
+        "deflate" => (2, Ok(())),
+        other => (
+            0,
+            Err(format!(
+                "[api] grpc_response_compression = {:?} is not one of none, gzip, deflate",
+                other
+            )),
+        ),
+    };
+    RESPONSE_COMPRESSION.store(v, Ordering::Relaxed);
+    RESPONSE_COMPRESSION_MIN.store(min_size, Ordering::Relaxed);
+    r
+}
+
+fn configured_compression() -> Compression {
+    match RESPONSE_COMPRESSION.load(Ordering::Relaxed) {
+        1 => Compression::Gzip,
+        2 => Compression::Deflate,
+        _ => Compression::Identity,
+    }
+}
+
+/// 要求の `grpc-accept-encoding` が受けると言っている方式（ビット: 1 = gzip・2 = deflate）。
+fn accepted_encodings(v: Option<&str>) -> u8 {
+    let mut out = 0;
+    for e in v.unwrap_or("").split(',') {
+        match e.trim() {
+            x if x.eq_ignore_ascii_case("gzip") => out |= 1,
+            x if x.eq_ignore_ascii_case("deflate") => out |= 2,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 応答に使う圧縮方式: 呼び出しの指定 > 設定。クライアントが受けると言っていない・このビルドで使えない方式は使わない。
+fn response_encoding(want: Option<Compression>, accepts: u8) -> Compression {
+    let want = want.unwrap_or_else(configured_compression);
+    let bit = match want {
+        Compression::Gzip => 1,
+        Compression::Deflate => 2,
+        Compression::Identity => return Compression::Identity,
+    };
+    if accepts & bit != 0 && want.is_supported() {
+        want
+    } else {
+        Compression::Identity
+    }
 }
 
 // ===================== Status =====================
@@ -326,6 +388,7 @@ pub struct Response<T> {
     metadata: Metadata,
     message: T,
     trailers: Metadata,
+    compression: Option<Compression>,
 }
 
 impl<T> Response<T> {
@@ -334,7 +397,15 @@ impl<T> Response<T> {
             metadata: Vec::new(),
             message,
             trailers: Vec::new(),
+            compression: None,
         }
+    }
+
+    /// この呼び出しの応答の圧縮方式（`[api] grpc_response_compression` より優先。`Compression::Identity` で圧縮しない）。
+    /// クライアントが `grpc-accept-encoding` で受けると言っていない方式は使わない（非圧縮で送る）。
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
     }
 
     pub fn get_ref(&self) -> &T {
@@ -501,10 +572,29 @@ pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, 
     Ok(buf.freeze())
 }
 
+/// 圧縮する設定なら、最小サイズ以上のメッセージを圧縮した枠に作り直す（圧縮フラグ 1）。
+fn compress_frame(frame: Bytes, encoding: Compression) -> Result<Bytes, Status> {
+    if encoding == Compression::Identity
+        || frame.len() - 5 < RESPONSE_COMPRESSION_MIN.load(Ordering::Relaxed)
+    {
+        return Ok(frame);
+    }
+    let c = encoding
+        .compress(&frame[5..], 6)
+        .map_err(|e| Status::internal(format!("failed to compress message: {}", e)))?;
+    let mut buf = BytesMut::with_capacity(5 + c.len());
+    buf.put_u8(1);
+    buf.put_u32(c.len() as u32);
+    buf.extend_from_slice(&c);
+    Ok(buf.freeze())
+}
+
 /// 応答のメッセージ列を本文の断片とトレーラに変える（最後に `grpc-status`、途中の `Err` はその状態で終える）。
 struct GrpcBody<S, C> {
     inner: S,
     codec: C,
+    /// 応答の圧縮（F-209 #2）。`Identity` なら圧縮しない
+    encoding: Compression,
     trailers: Option<Metadata>,
     deadline: Option<Instant>,
 }
@@ -528,7 +618,9 @@ where
             )));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(m))) => match encode_message(&this.codec, &m) {
+            Poll::Ready(Some(Ok(m))) => match encode_message(&this.codec, &m)
+                .and_then(|b| compress_frame(b, this.encoding))
+            {
                 Ok(b) => Poll::Ready(Some(BodyChunk::Data(b))),
                 Err(s) => {
                     this.trailers = None;
@@ -575,6 +667,7 @@ fn stream_response<S, T, C>(
     resp: Response<S>,
     deadline: Option<Instant>,
     codec: C,
+    accepts: u8,
 ) -> super::response::Response
 where
     S: Stream<Item = Result<T, Status>> + Send + Unpin + 'static,
@@ -585,12 +678,21 @@ where
         metadata,
         message,
         trailers,
+        compression,
     } = resp;
+    let encoding = response_encoding(compression, accepts);
     let mut head = grpc_head(200);
+    if encoding != Compression::Identity {
+        head.headers.push((
+            Bytes::from_static(b"grpc-encoding"),
+            Bytes::from_static(encoding.as_bytes()),
+        ));
+    }
     head.headers.extend(metadata);
     let body = GrpcBody {
         inner: message,
         codec,
+        encoding,
         trailers: Some(trailers),
         deadline,
     };
@@ -606,6 +708,8 @@ struct Call {
     metadata: Metadata,
     deadline: Option<Instant>,
     encoding: GrpcCompression,
+    /// `grpc-accept-encoding`（`accepted_encodings` のビット）
+    accepts: u8,
     client_ip: IpAddr,
 }
 
@@ -662,6 +766,7 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
         metadata,
         deadline,
         encoding,
+        accepts: accepted_encodings(req.header("grpc-accept-encoding")),
         client_ip: req.client_ip(),
     })
 }
@@ -792,6 +897,7 @@ impl App {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
+                let accepts = call.accepts;
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
@@ -806,15 +912,18 @@ impl App {
                             metadata,
                             message,
                             trailers,
+                            compression,
                         } = resp;
                         stream_response(
                             Response {
                                 metadata,
                                 message: once(message),
                                 trailers,
+                                compression,
                             },
                             None,
                             codec,
+                            accepts,
                         )
                     }
                     Err(s) => trailers_only(&s),
@@ -845,6 +954,7 @@ impl App {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
+                let accepts = call.accepts;
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
@@ -854,7 +964,7 @@ impl App {
                 })
                 .await;
                 match r {
-                    Ok(resp) => stream_response(boxed(resp), deadline, codec),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts),
                     Err(s) => trailers_only(&s),
                 }
             })
@@ -882,6 +992,7 @@ impl App {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
+                let accepts = call.accepts;
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
@@ -890,15 +1001,18 @@ impl App {
                             metadata,
                             message,
                             trailers,
+                            compression,
                         } = resp;
                         stream_response(
                             Response {
                                 metadata,
                                 message: once(message),
                                 trailers,
+                                compression,
                             },
                             None,
                             codec,
+                            accepts,
                         )
                     }
                     Err(s) => trailers_only(&s),
@@ -930,10 +1044,11 @@ impl App {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
+                let accepts = call.accepts;
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
-                    Ok(resp) => stream_response(boxed(resp), deadline, codec),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts),
                     Err(s) => trailers_only(&s),
                 }
             })
@@ -951,6 +1066,7 @@ where
         metadata: resp.metadata,
         message: Box::pin(resp.message),
         trailers: resp.trailers,
+        compression: resp.compression,
     }
 }
 

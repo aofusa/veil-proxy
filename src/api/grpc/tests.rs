@@ -538,3 +538,58 @@ fn bytes_codec_roundtrip() {
         data.len() - 5
     );
 }
+
+/// F-209 #2: 応答の圧縮は呼び出しの指定（または設定）とクライアントの `grpc-accept-encoding` の両方が要る。
+#[cfg(feature = "compression")]
+#[test]
+fn response_compression_needs_client_acceptance() {
+    let f = handler_of(App::new().grpc_unary(
+        "/raw.Svc/Big",
+        BytesCodec,
+        |_req: Request<Bytes>| async move {
+            Ok(Response::new(Bytes::from(vec![b'a'; 4096])).with_compression(Compression::Gzip))
+        },
+    ));
+    let call = |accept: &[(&str, &str)]| {
+        let msg = encode_message(&BytesCodec, &Bytes::from_static(b"x")).unwrap();
+        collect(futures::executor::block_on(f(grpc_request(
+            HttpVersion::Http2,
+            vec![msg],
+            accept,
+        ))))
+    };
+    // 受ける: grpc-encoding: gzip、圧縮フラグ 1、戻すと元の 4096 バイト
+    let (h, data, t) = call(&[("grpc-accept-encoding", "identity, gzip")]);
+    assert_eq!(field(&t, "grpc-status"), Some(&b"0"[..]));
+    assert_eq!(field(&h, "grpc-encoding"), Some(&b"gzip"[..]));
+    assert_eq!(data[0], 1);
+    let len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+    assert!(len < 4096, "{}", len);
+    let raw = Compression::Gzip.decompress(&data[5..5 + len]).unwrap();
+    assert_eq!(raw, vec![b'a'; 4096]);
+    // 受けると言っていない: 非圧縮
+    let (h, data, _) = call(&[]);
+    assert_eq!(field(&h, "grpc-encoding"), None);
+    assert_eq!(data[0], 0);
+    assert_eq!(data.len(), 5 + 4096);
+    // deflate しか受けない: 指定の gzip は使わない
+    let (h, data, _) = call(&[("grpc-accept-encoding", "deflate")]);
+    assert_eq!(field(&h, "grpc-encoding"), None);
+    assert_eq!(data[0], 0);
+}
+
+#[test]
+fn response_encoding_negotiation() {
+    assert_eq!(accepted_encodings(Some("identity, gzip ,DEFLATE")), 3);
+    assert_eq!(accepted_encodings(None), 0);
+    assert_eq!(
+        response_encoding(Some(Compression::Identity), 3),
+        Compression::Identity
+    );
+    let gz = response_encoding(Some(Compression::Gzip), 1);
+    assert_eq!(gz == Compression::Gzip, cfg!(feature = "compression"));
+    assert_eq!(
+        response_encoding(Some(Compression::Gzip), 2),
+        Compression::Identity
+    );
+}

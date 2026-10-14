@@ -83,8 +83,12 @@ async fn main() -> Result<(), veil::api::Error> {
     // 既定は平文 0.0.0.0:50051（h2c）。VEIL_LISTEN で平文、VEIL_TLS_LISTEN + 証明書で TLS（HTTP/2・HTTP/3）。
     let mut builder = Config::load()?
         .builder()
-        .listen_cleartext(&std::env::var("VEIL_LISTEN").unwrap_or_else(|_| "127.0.0.1:50051".into()))
-        .openapi_enabled(false);
+        .listen_cleartext(
+            &std::env::var("VEIL_LISTEN").unwrap_or_else(|_| "127.0.0.1:50051".into()),
+        )
+        .openapi_enabled(false)
+        // 1KB 以上の応答メッセージを gzip で圧縮する（クライアントが grpc-accept-encoding で受けるときだけ。F-209）
+        .grpc_response_compression("gzip");
     if let (Ok(listen), Ok(cert), Ok(key)) = (
         std::env::var("VEIL_TLS_LISTEN"),
         std::env::var("VEIL_TLS_CERT"),

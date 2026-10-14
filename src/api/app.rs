@@ -71,6 +71,10 @@ pub struct ApiSettings {
     pub tokio_threads: usize,
     /// gRPC の受信メッセージ上限（F-197、`grpc-handler`）
     pub grpc_max_message_size: usize,
+    /// gRPC の応答の圧縮（`none`・`gzip`・`deflate`。F-209）
+    pub grpc_response_compression: String,
+    /// この大きさ未満の gRPC メッセージは圧縮しない（F-209）
+    pub grpc_response_compression_min_size: usize,
 }
 
 impl ApiSettings {
@@ -106,6 +110,8 @@ impl ApiSettings {
             handler_threads: n("handler_threads", 0),
             tokio_threads: n("tokio_threads", 2),
             grpc_max_message_size: n("grpc_max_message_size", 4 * 1024 * 1024),
+            grpc_response_compression: s("grpc_response_compression", "none"),
+            grpc_response_compression_min_size: n("grpc_response_compression_min_size", 1024),
         }
     }
 }
@@ -432,7 +438,15 @@ fn start(config: Config) -> Result<(), Error> {
         MAX_BODY_SIZE.store(settings.max_body_size, Ordering::Relaxed);
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
         #[cfg(feature = "grpc-handler")]
-        super::grpc::set_max_message_size(settings.grpc_max_message_size);
+        {
+            super::grpc::set_max_message_size(settings.grpc_max_message_size);
+            if let Err(e) = super::grpc::set_response_compression(
+                &settings.grpc_response_compression,
+                settings.grpc_response_compression_min_size,
+            ) {
+                ftlog::warn!("{}; responses are not compressed", e);
+            }
+        }
         if settings.handler_threads > 0 {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);
         }

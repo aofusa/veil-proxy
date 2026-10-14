@@ -1647,6 +1647,7 @@ name = "veil-grpc-check"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flate2",
  "h3",
  "h3-quinn",
  "http",

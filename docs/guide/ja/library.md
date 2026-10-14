@@ -195,7 +195,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 
 型付きのセッタは `listen_cleartext`（平文のアドレス）・`listen`（TLS のアドレス）・`allow_http`・`allow_h2c`・`secure_redirect`・`threads`・`http2_enabled`・`log_level`・`openapi_enabled`・
 `openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`max_body_size`・`handler_threads`・
-`grpc_max_message_size`・`tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
+`grpc_max_message_size`・`grpc_response_compression`・`grpc_response_compression_min_size`・`tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
 `Config::to_toml_string()` は合成結果（環境変数の上書きとルート注入の前）を返すので、デバッグに使えます。
 
 ### `[api]` キー（ライブラリ専用）
@@ -214,6 +214,8 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `handler_threads` | `0` | 同期 Rust 関数・C コールバック・Python ハンドラを実行するハンドラ用プールのスレッド数（`0` = 組み込みの既定） |
 | `tokio_threads` | `2` | 同梱の tokio ランタイムのワーカー数（`tokio-compat-bridge` のみ） |
 | `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
+| `grpc_response_compression` | `"none"` | gRPC の応答メッセージの圧縮: `"none"`・`"gzip"`・`"deflate"`（クライアントが `grpc-accept-encoding` で受けるときだけ。`compression` feature が必要） |
+| `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
 
 ## ルーティングマクロ
 
@@ -593,7 +595,7 @@ App::new()
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` と `message().await` |
 | 期限 | `grpc-timeout` を veil のタイマーで強制し、ハンドラを取り消して `DEADLINE_EXCEEDED` で終える（ストリームはメッセージの間で確認） |
 | 取り消し | クライアントの RST_STREAM・切断でハンドラの Future と応答ストリームを drop する |
-| 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す（`compression` feature が必要。`full` に含まれる。無いビルドは `identity` だけを受け、他は `UNIMPLEMENTED`）。応答は非圧縮（`grpc-accept-encoding: identity,gzip,deflate`） |
+| 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す（`compression` feature が必要。`full` に含まれる。無いビルドは `identity` だけを受け、他は `UNIMPLEMENTED`）。応答は `[api] grpc_response_compression`（1 回の呼び出しだけなら `Response::with_compression(Compression::Gzip)`）の方式をクライアントが `grpc-accept-encoding` で受けるとき、`grpc_response_compression_min_size` バイト以上のメッセージを圧縮する。それ以外は非圧縮 |
 | 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED`。圧縮されたメッセージは解凍後の大きさに掛かり、超えた時点で解凍を打ち切る |
 | エラー | `content-type` が `application/grpc*` 以外（と gRPC-Web の `application/grpc-web*`）は 415、HTTP/1.1 の gRPC は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
