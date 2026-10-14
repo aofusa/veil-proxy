@@ -299,6 +299,26 @@ pub struct DownstreamTls {
     pub validation_name: Option<String>,
     /// rustls のサーバ設定（証明書・信頼アンカーは差し替え可能なリゾルバを経由する）
     pub server_config: Arc<rustls::ServerConfig>,
+    /// ALPN を交渉しない設定。クライアントの ALPN と重ならないときに使う（rustls は ALPN の不一致で
+    /// ハンドシェイクを止めるが、Envoy（BoringSSL）は交渉しないで続ける。Istio の TCP の mTLS は
+    /// `istio` だけを提示し、受け側の Envoy は `istio-peer-exchange, h2, http/1.1` を持つ）
+    pub server_config_no_alpn: Arc<rustls::ServerConfig>,
+}
+
+impl DownstreamTls {
+    /// ClientHello の ALPN に合わせて設定を選ぶ。
+    pub fn config_for(&self, client_alpn: &[String]) -> Arc<rustls::ServerConfig> {
+        if client_alpn.is_empty()
+            || self
+                .alpn
+                .iter()
+                .any(|a| client_alpn.iter().any(|c| c.as_bytes() == a.as_slice()))
+        {
+            self.server_config.clone()
+        } else {
+            self.server_config_no_alpn.clone()
+        }
+    }
 }
 
 /// クライアント証明書の転送（`forward_client_cert_details`）。

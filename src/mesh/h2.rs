@@ -304,7 +304,7 @@ async fn forward(
                 return out;
             }
         };
-        let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false);
+        let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
         if !l7::upstream_is_h2(&picked.cfg, true) {
             return to_h1(
                 c,

@@ -4,7 +4,7 @@
 #
 #   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|all> [--keep]
 #
-# 使うイメージ: veil-istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
+# 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
 # 前提: docker・kind・kubectl・istioctl（~/.local/bin でも可）。
 set -uo pipefail
@@ -17,7 +17,8 @@ SUITE="${2:-smoke}"
 KEEP="${3:-}"
 CLUSTER="${KIND_CLUSTER:-mesh}"
 ISTIO_VERSION="${ISTIO_VERSION:-1.31.1}"
-VEIL_PROXY="${VEIL_PROXY_IMAGE:-veil-istio-proxy:$ISTIO_VERSION}"
+# Istio の注入テンプレートは `/` を含む名前のときだけ sidecar.istio.io/proxyImage を使う
+VEIL_PROXY="${VEIL_PROXY_IMAGE:-veil.local/istio-proxy:$ISTIO_VERSION}"
 NS="mesh-$MODE"
 FAIL=0
 PASS=0
@@ -53,11 +54,15 @@ ensure_cluster() {
   done
 }
 
-# proxy_annotation <role>: veil のプロキシにするワークロードだけ注釈を付ける
+# proxy_annotation <role>: veil のプロキシにするワークロードだけ注釈を付ける。
+# mixed は whoami・client2 = veil、fortio・client = Envoy（veil ⇄ Envoy の両方向を試す）
 proxy_annotation() {
   case "$MODE" in
     veil) echo "sidecar.istio.io/proxyImage: $VEIL_PROXY" ;;
-    mixed) [ "$1" = server ] && echo "sidecar.istio.io/proxyImage: $VEIL_PROXY" || echo "sidecar.istio.io/inject: \"true\"" ;;
+    mixed) case "$1" in
+             whoami|client2) echo "sidecar.istio.io/proxyImage: $VEIL_PROXY" ;;
+             *) echo "sidecar.istio.io/inject: \"true\"" ;;
+           esac ;;
     *) echo "sidecar.istio.io/inject: \"true\"" ;;
   esac
 }
@@ -66,11 +71,11 @@ deploy() {
   kubectl create ns "$NS" >/dev/null 2>&1
   kubectl label ns "$NS" istio-injection=enabled --overwrite >/dev/null
   kubectl create ns "$NS-plain" >/dev/null 2>&1
-  local server_ann client_ann client2_ann
-  server_ann="$(proxy_annotation server)"
+  local fortio_ann whoami_ann client_ann client2_ann
+  fortio_ann="$(proxy_annotation fortio)"
+  whoami_ann="$(proxy_annotation whoami)"
   client_ann="$(proxy_annotation client)"
-  # mixed では client2 を veil、server2 を Envoy にして逆向きも試す
-  if [ "$MODE" = mixed ]; then client2_ann="sidecar.istio.io/proxyImage: $VEIL_PROXY"; else client2_ann="$client_ann"; fi
+  client2_ann="$(proxy_annotation client2)"
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: v1
 kind: ServiceAccount
@@ -85,7 +90,7 @@ spec:
   template:
     metadata:
       labels: {app: fortio, version: v1}
-      annotations: {$server_ann}
+      annotations: {$fortio_ann}
     spec:
       serviceAccountName: fortio
       containers:
@@ -117,7 +122,7 @@ spec:
   template:
     metadata:
       labels: {app: whoami, version: v1}
-      annotations: {$server_ann}
+      annotations: {$whoami_ann}
     spec:
       serviceAccountName: whoami
       containers:
@@ -220,10 +225,12 @@ proxy_is_veil() { # proxy_is_veil <deploy>
 
 smoke() {
   log "smoke ($MODE)"
-  local want_server want_client
-  case "$MODE" in veil) want_server=1; want_client=1 ;; mixed) want_server=1; want_client=0 ;; *) want_server=0; want_client=0 ;; esac
-  if proxy_is_veil whoami; then [ $want_server = 1 ] && ok "server proxy is veil" || bad "server proxy should be Envoy"; else [ $want_server = 0 ] && ok "server proxy is Envoy" || bad "server proxy is not veil"; fi
-  if proxy_is_veil client; then [ $want_client = 1 ] && ok "client proxy is veil" || bad "client proxy should be Envoy"; else [ $want_client = 0 ] && ok "client proxy is Envoy" || bad "client proxy is not veil"; fi
+  local d want
+  for d in whoami fortio client client2; do
+    case "$(proxy_annotation $d)" in *proxyImage*) want=veil ;; *) want=Envoy ;; esac
+    if proxy_is_veil $d; then got=veil; else got=Envoy; fi
+    [ "$got" = "$want" ] && ok "$d proxy is $got" || bad "$d proxy is $got (want $want)"
+  done
 
   # HTTP/1.1 と mTLS（受け側が付ける XFCC に双方の SPIFFE ID）
   local out
@@ -236,6 +243,13 @@ smoke() {
   # 逆向き（mixed では client2 = veil → whoami）
   out="$(c2exec curl -s -m 10 http://whoami."$NS"/)" || true
   if echo "$out" | grep -q "^Hostname: whoami"; then ok "HTTP/1.1 client2 -> whoami"; else bad "client2 -> whoami: $out"; fi
+  # client2 → fortio（mixed では veil → Envoy）: HTTP/1.1・h2c・TCP
+  out="$(c2exec curl -s -m 10 -o /dev/null -w '%{http_code}' http://fortio."$NS":8080/echo)" || true
+  if [ "$out" = 200 ]; then ok "HTTP/1.1 client2 -> fortio"; else bad "client2 -> fortio: $out"; fi
+  out="$(c2exec curl -s -m 10 --http2-prior-knowledge -o /dev/null -w '%{http_code} %{http_version}' http://fortio."$NS":8080/echo)" || true
+  if [ "$out" = "200 2" ]; then ok "h2c client2 -> fortio"; else bad "h2c client2 -> fortio: $out"; fi
+  out="$(c2exec sh -c "printf 'ping-tcp' | curl -s -m 3 telnet://fortio.$NS:8078" 2>/dev/null)" || true
+  if echo "$out" | grep -q "ping-tcp"; then ok "TCP client2 -> fortio"; else bad "TCP client2 -> fortio: $out"; fi
   # h2c（prior knowledge）
   out="$(cexec curl -s -m 10 --http2-prior-knowledge -o /dev/null -w '%{http_code} %{http_version}' http://fortio."$NS":8080/echo)" || true
   if [ "$out" = "200 2" ]; then ok "h2c client -> fortio"; else bad "h2c: $out"; fi
@@ -298,7 +312,7 @@ spec:
   template:
     metadata:
       labels: {app: fortio, version: v2}
-      annotations: {$(proxy_annotation server)}
+      annotations: {$(proxy_annotation fortio)}
     spec:
       serviceAccountName: fortio
       containers:

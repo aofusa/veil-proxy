@@ -87,6 +87,15 @@ impl crate::runtime::io::BufferedReadState for KtlsServerStream {
 }
 
 impl KtlsServerStream {
+    /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送。
+    /// ハンドシェイクと同じ便で届いたアプリデータはソケットの可読では通知されない）。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        if let Some(conn) = self.conn.as_mut() {
+            drain_rustls_into(&mut self.drained_buffer, conn.reader());
+        }
+        !self.drained_buffer.is_empty()
+    }
+
     /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
     /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
     ///
@@ -272,6 +281,14 @@ impl crate::runtime::io::BufferedReadState for KtlsClientStream {
 }
 
 impl KtlsClientStream {
+    /// [`KtlsServerStream::take_pending_plaintext`] のクライアント側。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        if let Some(conn) = self.conn.as_mut() {
+            drain_rustls_into(&mut self.drained_buffer, conn.reader());
+        }
+        !self.drained_buffer.is_empty()
+    }
+
     /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
     #[inline]
     pub fn negotiated_h2(&self) -> bool {

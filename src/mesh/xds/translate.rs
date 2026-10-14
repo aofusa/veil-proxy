@@ -173,6 +173,20 @@ fn san_matchers(v: Option<&p::CertificateValidationContext>) -> R<Vec<StringMatc
 
 /// 共通の TLS 設定から（自分の証明書の名前・信頼アンカーの名前・SAN の条件・ALPN）。
 fn common_tls(c: &p::CommonTlsContext) -> R<(Option<String>, Option<String>, Vec<StringMatcher>)> {
+    // 参照された秘密（ゲートウェイの credentialName・DestinationRule の credentialName 等）を SDS で購読する
+    for sc in &c.tls_certificate_sds_secret_configs {
+        crate::mesh::envoy::sds::want(&sc.name);
+    }
+    use p::common_tls_context::ValidationContextType as V0;
+    match &c.validation_context_type {
+        Some(V0::CombinedValidationContext(cv)) => {
+            if let Some(s) = &cv.validation_context_sds_secret_config {
+                crate::mesh::envoy::sds::want(&s.name);
+            }
+        }
+        Some(V0::ValidationContextSdsSecretConfig(s)) => crate::mesh::envoy::sds::want(&s.name),
+        _ => {}
+    }
     let cert = c
         .tls_certificate_sds_secret_configs
         .first()
@@ -212,9 +226,12 @@ fn downstream_tls(ctx: &p::DownstreamTlsContext) -> R<Arc<DownstreamTls>> {
         .as_ref()
         .map(|b| b.value)
         .unwrap_or(false);
+    // istio-peer-exchange（TCP の metadata exchange）は交渉しない（交換を実装するまで。交渉すると
+    // Envoy のクライアントがストリームの先頭に交換のヘッダを書く）
     let alpn: Vec<Vec<u8>> = common
         .alpn_protocols
         .iter()
+        .filter(|a| a.as_str() != "istio-peer-exchange")
         .map(|a| a.as_bytes().to_vec())
         .collect();
     let server_config = crate::mesh::identity::server_config(
@@ -224,6 +241,13 @@ fn downstream_tls(ctx: &p::DownstreamTlsContext) -> R<Arc<DownstreamTls>> {
         require,
         &alpn,
     )?;
+    let server_config_no_alpn = crate::mesh::identity::server_config(
+        &cert_name,
+        roots.as_deref(),
+        sans.clone(),
+        require,
+        &[],
+    )?;
     Ok(Arc::new(DownstreamTls {
         require_client_cert: require,
         alpn,
@@ -231,6 +255,7 @@ fn downstream_tls(ctx: &p::DownstreamTlsContext) -> R<Arc<DownstreamTls>> {
         cert_name,
         validation_name: roots,
         server_config,
+        server_config_no_alpn,
     }))
 }
 

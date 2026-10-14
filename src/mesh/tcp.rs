@@ -6,7 +6,7 @@
 //! 片側が閉じたら相手側へ送信の終わり（FIN / close_notify）を伝え、もう一方が閉じるまで続ける（半クローズ）。
 
 use crate::runtime::handle::AsRawFd;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, BufferedReadState};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 use std::future::Future;
 use std::future::poll_fn;
 use std::task::Poll;
@@ -68,11 +68,31 @@ where
     Ok(n)
 }
 
+/// 読める平文を既に手元に持っているか（TLS は rustls の中の復号済みの分も含める）。
+pub trait PendingRead {
+    fn pending_read(&mut self) -> bool;
+}
+
+impl PendingRead for super::server::DownStream {
+    fn pending_read(&mut self) -> bool {
+        self.take_pending_plaintext()
+    }
+}
+
+impl PendingRead for super::upstream::UpIo {
+    fn pending_read(&mut self) -> bool {
+        match self {
+            super::upstream::UpIo::Plain(_) => false,
+            super::upstream::UpIo::Tls(s) => s.take_pending_plaintext(),
+        }
+    }
+}
+
 /// 両方向に転送する。戻り値は (a→b のバイト数, b→a のバイト数)。
 pub async fn relay<A, B>(a: &mut A, b: &mut B, idle_timeout: Duration) -> (u64, u64)
 where
-    A: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState,
-    B: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState,
+    A: AsyncReadRent + AsyncWriteRentExt + AsRawFd + PendingRead,
+    B: AsyncReadRent + AsyncWriteRentExt + AsRawFd + PendingRead,
 {
     let (mut ab, mut ba) = (0u64, 0u64);
     let (mut a_open, mut b_open) = (true, true);
@@ -87,9 +107,9 @@ where
         {
             break;
         }
-        let which = if a_open && a.has_buffered_read_data() {
+        let which = if a_open && a.pending_read() {
             Ready::A
-        } else if b_open && b.has_buffered_read_data() {
+        } else if b_open && b.pending_read() {
             Ready::B
         } else {
             wait_either(a_fd, b_fd, a_open, b_open, Duration::from_secs(1)).await

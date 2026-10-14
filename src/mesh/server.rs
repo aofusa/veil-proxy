@@ -314,14 +314,16 @@ async fn tls_accept(
     stream: TcpStream,
     tls: &DownstreamTls,
     initial: Vec<u8>,
+    client_alpn: &[String],
 ) -> std::io::Result<(DownStream, Option<Vec<u8>>)> {
+    let server_config = tls.config_for(client_alpn);
     let fut = async {
         #[cfg(veil_ktls)]
         {
             let c = crate::config::CURRENT_CONFIG.load();
             crate::ktls_rustls::accept_with_peer_cert(
                 stream,
-                tls.server_config.clone(),
+                server_config,
                 c.ktls_config.enabled,
                 c.ktls_config.fallback_enabled,
                 c.ktls_config.tcp_cork_enabled,
@@ -428,6 +430,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
                 dst,
                 target.direction,
                 sni,
+                &alpn,
             )
             .await;
         }
@@ -442,6 +445,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
                 dst,
                 target.direction,
                 sni,
+                &alpn,
             )
             .await;
         }
@@ -482,6 +486,7 @@ async fn serve_http(
     dst: SocketAddr,
     direction: Direction,
     sni: Option<String>,
+    client_alpn: &[String],
 ) {
     let direction = if hcm.direction == Direction::Unspecified {
         direction
@@ -489,7 +494,7 @@ async fn serve_http(
         hcm.direction
     };
     let (ds, peer_cert, h2) = match &chain.tls {
-        Some(tls) => match tls_accept(stream, tls, initial).await {
+        Some(tls) => match tls_accept(stream, tls, initial, client_alpn).await {
             Ok((s, pc)) => {
                 let h2 = s.alpn_protocol() == Some(b"h2");
                 (s, pc, h2)
@@ -538,9 +543,10 @@ async fn serve_tcp(
     dst: SocketAddr,
     direction: Direction,
     sni: Option<String>,
+    client_alpn: &[String],
 ) {
     let (mut ds, peer_cert) = match &chain.tls {
-        Some(tls) => match tls_accept(stream, tls, initial).await {
+        Some(tls) => match tls_accept(stream, tls, initial, client_alpn).await {
             Ok(x) => x,
             Err(e) => {
                 ftlog::debug!("[mesh] TLS handshake from {} failed: {}", peer, e);

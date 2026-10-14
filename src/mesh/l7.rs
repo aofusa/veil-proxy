@@ -615,6 +615,7 @@ pub fn upstream_request_headers(
     headers: &[(Bytes, Bytes)],
     attempt: u32,
     keep_upgrade: bool,
+    keep_chunked: bool,
 ) -> (Vec<(Bytes, Bytes)>, Option<Arc<super::peer::Workload>>) {
     let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 6);
     let mut has_req_id = false;
@@ -630,7 +631,9 @@ pub fn upstream_request_headers(
         if httpcore::is_hop_by_hop(kb) {
             let keep = (keep_upgrade
                 && (kb.eq_ignore_ascii_case(b"upgrade") || kb.eq_ignore_ascii_case(b"connection")))
-                || (kb.eq_ignore_ascii_case(b"te") && v.eq_ignore_ascii_case(b"trailers"));
+                || (kb.eq_ignore_ascii_case(b"te") && v.eq_ignore_ascii_case(b"trailers"))
+                // chunked の本文はそのまま中継するので Transfer-Encoding も渡す（HTTP/1.1 の上流）
+                || (kb.eq_ignore_ascii_case(b"transfer-encoding") && keep_chunked);
             if !keep {
                 continue;
             }
@@ -771,7 +774,7 @@ pub fn downstream_response_headers(
             peer_md_id = Some(v.clone());
             return false;
         }
-        !k.eq_ignore_ascii_case(b"server")
+        !k.eq_ignore_ascii_case(b"server") && !k.eq_ignore_ascii_case(b"x-envoy-upstream-service-time")
     });
     if ctx.hcm.peer_metadata {
         match ctx.direction {

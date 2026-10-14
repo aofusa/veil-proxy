@@ -36,7 +36,7 @@ enum Framing {
 /// 下流の 1 接続を処理する。
 pub async fn serve<S>(mut io: S, initial: Vec<u8>, ctx: Arc<ConnCtx>)
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + Unpin + 'static,
+    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
     let mut acc = BytesMut::from(&initial[..]);
     loop {
@@ -711,7 +711,7 @@ async fn forward<S>(
     origin: Option<&Bytes>,
 ) -> Outcome
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + Unpin + 'static,
+    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
     let svc = f
         .cluster
@@ -763,7 +763,7 @@ where
             .await;
         }
         let (req_headers, peer_req) =
-            l7::upstream_request_headers(ctx, f, headers, attempt, upgrade);
+            l7::upstream_request_headers(ctx, f, headers, attempt, upgrade, framing == Framing::Chunked);
         let host: Bytes = host_rw.clone().unwrap_or_else(|| authority.clone());
         let head = request_head(method, up_path, &req_headers, &host, host_rw.is_some());
         picked.begin();
@@ -1054,10 +1054,10 @@ async fn forward_to_h2<S>(
     origin: Option<&Bytes>,
 ) -> Outcome
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + Unpin + 'static,
+    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
     use crate::http2::upstream_mux::UpResp;
-    let (req_headers, peer_req) = l7::upstream_request_headers(ctx, f, headers, 1, false);
+    let (req_headers, peer_req) = l7::upstream_request_headers(ctx, f, headers, 1, false, false);
     let host = f
         .action
         .host_rewrite
