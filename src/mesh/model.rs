@@ -343,6 +343,8 @@ pub struct HttpCm {
     pub xfcc_uri: bool,
     pub xfcc_dns: bool,
     pub generate_request_id: bool,
+    /// 接続の相手のアドレスを X-Forwarded-For に足す（Envoy の `use_remote_address`。ゲートウェイ）
+    pub use_remote_address: bool,
     pub websocket: bool,
     /// HTTP フィルタ（順序どおり。fault・cors・rbac 等。未知で任意のものは除いてある）
     pub filters: Vec<HttpFilterCfg>,

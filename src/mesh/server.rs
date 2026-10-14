@@ -316,6 +316,12 @@ async fn tls_accept(
     initial: Vec<u8>,
     client_alpn: &[String],
 ) -> std::io::Result<(DownStream, Option<Vec<u8>>)> {
+    // 証明書が SDS でまだ届いていなければ少し待つ（Envoy は秘密が揃うまでリスナーを有効にしない＝ウォーミング）
+    let mut waited = 0;
+    while super::identity::cert(&tls.cert_name).is_none() && waited < 200 {
+        crate::runtime::time::sleep(Duration::from_millis(50)).await;
+        waited += 1;
+    }
     let server_config = tls.config_for(client_alpn);
     let fut = async {
         #[cfg(veil_ktls)]

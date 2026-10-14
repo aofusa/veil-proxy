@@ -32,6 +32,20 @@ pub fn want(name: &str) {
     }
 }
 
+/// ADS で配られる秘密か（Istio のゲートウェイの `credentialName` は `kubernetes://<name>`。
+/// サイドカーの `default`・`ROOTCA` は pilot-agent の SDS の UDS で配られる）。
+pub fn via_ads(name: &str) -> bool {
+    name.starts_with("kubernetes://") || name.starts_with("kubernetes-gateway://")
+}
+
+/// ADS で購読する秘密の名前（今欲しいもの）。
+pub fn wanted_ads() -> BTreeSet<String> {
+    WANTED
+        .lock()
+        .map(|w| w.iter().filter(|n| via_ads(n)).cloned().collect())
+        .unwrap_or_default()
+}
+
 fn frame<M: Message>(m: &M) -> Bytes {
     let len = m.encoded_len();
     let mut b = BytesMut::with_capacity(5 + len);
@@ -182,7 +196,7 @@ async fn session(uds: &PathBuf, node: &p::Node, name: &str, got: &mut bool) -> R
     }
 }
 
-fn apply(sec: &p::Secret) -> Result<(), String> {
+pub fn apply(sec: &p::Secret) -> Result<(), String> {
     if let Some(tc) = &sec.tls_certificate {
         let chain = tc
             .certificate_chain

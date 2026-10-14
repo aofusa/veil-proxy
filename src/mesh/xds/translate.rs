@@ -634,6 +634,11 @@ fn http_cm(
             .as_ref()
             .map(|b| b.value)
             .unwrap_or(true),
+        use_remote_address: hcm
+            .use_remote_address
+            .as_ref()
+            .map(|b| b.value)
+            .unwrap_or(false),
         websocket: hcm.upgrade_configs.iter().any(|u| {
             u.upgrade_type.eq_ignore_ascii_case("websocket")
                 && u.enabled.as_ref().map(|b| b.value).unwrap_or(true)

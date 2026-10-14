@@ -658,6 +658,19 @@ pub fn upstream_request_headers(
         }
         out.push((k.clone(), v.clone()));
     }
+    if ctx.hcm.use_remote_address {
+        let ip = ctx.peer.ip().to_string();
+        match out.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"x-forwarded-for")) {
+            Some((_, v)) => {
+                let mut nv = BytesMut::with_capacity(v.len() + ip.len() + 2);
+                nv.extend_from_slice(v);
+                nv.extend_from_slice(b", ");
+                nv.extend_from_slice(ip.as_bytes());
+                *v = nv.freeze();
+            }
+            None => out.push((Bytes::from_static(b"x-forwarded-for"), Bytes::from(ip))),
+        }
+    }
     if !has_req_id && ctx.hcm.generate_request_id {
         out.push((Bytes::from_static(b"x-request-id"), httpcore::uuid_v4()));
     }

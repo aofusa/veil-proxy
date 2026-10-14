@@ -63,6 +63,8 @@ struct Subs {
     listeners: HashMap<String, Arc<MeshListener>>,
     /// EDS の名前 → それを使うクラスタのスロット
     eds_slots: HashMap<String, Vec<Arc<ClusterSlot>>>,
+    /// ADS で購読中の秘密（ゲートウェイの `kubernetes://<credentialName>`）
+    secrets: BTreeSet<String>,
 }
 
 pub fn spawn(cfg: AdsConfig) {
@@ -185,6 +187,17 @@ async fn session(
         )
         .await?;
     }
+    if !subs.secrets.is_empty() {
+        send(
+            &stream,
+            p::DeltaDiscoveryRequest {
+                type_url: p::TYPE_SECRET.into(),
+                resource_names_subscribe: subs.secrets.iter().cloned().collect(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
 
     let mut decoder = GrpcFrameDecoder::with_max_size(256 * 1024 * 1024);
     loop {
@@ -282,6 +295,7 @@ fn handle(resp: p::DeltaDiscoveryResponse, subs: &mut Subs) -> Vec<p::DeltaDisco
         p::TYPE_LISTENER => apply_listeners(&resp, subs, &mut errors, &mut out),
         p::TYPE_ROUTE => apply_routes(&resp, &mut errors),
         p::TYPE_ENDPOINT => apply_endpoints(&resp, subs, &mut errors),
+        p::TYPE_SECRET => apply_secrets(&resp, &mut errors),
         other => {
             // 購読していない型（Istio の拡張等）。ACK だけ返す
             debug!("[xds] ignoring resources of type {}", other);
@@ -310,6 +324,17 @@ fn handle(resp: p::DeltaDiscoveryResponse, subs: &mut Subs) -> Vec<p::DeltaDisco
             message: msg,
         })
     };
+    // ゲートウェイの証明書（変換で参照された `kubernetes://...`）を ADS で購読する
+    let wanted = crate::mesh::envoy::sds::wanted_ads();
+    let sub: Vec<String> = wanted.difference(&subs.secrets).cloned().collect();
+    if !sub.is_empty() {
+        out.push(p::DeltaDiscoveryRequest {
+            type_url: p::TYPE_SECRET.into(),
+            resource_names_subscribe: sub,
+            ..Default::default()
+        });
+        subs.secrets = wanted;
+    }
     // ACK / NACK は購読の差分より先に送る
     out.insert(
         0,
@@ -541,4 +566,16 @@ fn apply_endpoints(resp: &p::DeltaDiscoveryResponse, subs: &mut Subs, errors: &m
         }
     }
     state().eds_updates.fetch_add(1, Ordering::Relaxed);
+}
+
+fn apply_secrets(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
+    let items: Vec<(String, String, p::Secret)> = decode_resources(resp, p::TYPE_SECRET, errors);
+    for (name, _version, mut sec) in items {
+        if sec.name.is_empty() {
+            sec.name = name.clone();
+        }
+        if let Err(e) = crate::mesh::envoy::sds::apply(&sec) {
+            errors.push(format!("secret {}: {}", name, e));
+        }
+    }
 }

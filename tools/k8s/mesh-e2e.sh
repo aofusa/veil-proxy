@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -483,6 +483,148 @@ EOF
   kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
 }
 
+gateway() {
+  log "gateway ($MODE)"
+  local gw_ann ip out
+  gw_ann="$(proxy_annotation whoami)"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 7 -subj "/CN=gw.example.com" \
+    -addext "subjectAltName=DNS:gw.example.com" -keyout "$TMPDIR/gw-$NS.key" -out "$TMPDIR/gw-$NS.crt" 2>/dev/null
+  kubectl -n "$NS" delete secret gw-cert >/dev/null 2>&1
+  kubectl -n "$NS" create secret tls gw-cert --cert="$TMPDIR/gw-$NS.crt" --key="$TMPDIR/gw-$NS.key" >/dev/null
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: ingress}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ingress}
+spec:
+  selector: {matchLabels: {istio: ingress-$NS}}
+  template:
+    metadata:
+      annotations: {inject.istio.io/templates: gateway, $gw_ann}
+      labels: {istio: ingress-$NS, sidecar.istio.io/inject: "true"}
+    spec:
+      serviceAccountName: ingress
+      containers:
+      - {name: istio-proxy, image: auto, imagePullPolicy: IfNotPresent}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ingress}
+spec:
+  selector: {istio: ingress-$NS}
+  ports:
+  - {name: http, port: 80, targetPort: 8080}
+  - {name: https, port: 443, targetPort: 8443}
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw}
+spec:
+  selector: {istio: ingress-$NS}
+  servers:
+  - port: {number: 8080, name: http, protocol: HTTP}
+    hosts: ["*"]
+  - port: {number: 8443, name: https, protocol: HTTPS}
+    hosts: ["gw.example.com"]
+    tls: {mode: SIMPLE, credentialName: gw-cert}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: via-gw}
+spec:
+  hosts: ["*"]
+  gateways: [gw]
+  http:
+  - match: [{uri: {prefix: /fortio/}}]
+    rewrite: {uri: /}
+    route: [{destination: {host: fortio, port: {number: 8080}}}]
+  - route: [{destination: {host: whoami, port: {number: 80}}}]
+EOF
+  kubectl -n "$NS" rollout status deploy/ingress --timeout=240s >/dev/null || { bad "gateway deploy"; return; }
+  if proxy_is_veil ingress; then
+    case "$gw_ann" in *proxyImage*) ok "gateway proxy is veil" ;; *) bad "gateway proxy should be Envoy" ;; esac
+  else
+    case "$gw_ann" in *proxyImage*) bad "gateway proxy is not veil" ;; *) ok "gateway proxy is Envoy" ;; esac
+  fi
+  ip="$(kubectl -n "$NS" get svc ingress -o jsonpath='{.spec.clusterIP}')"
+  local pexec="kubectl -n $NS-plain exec deploy/plain -c curl --"
+  if retry 60 sh -c "$pexec curl -s -m 5 http://$ip/ | grep -q '^Hostname: whoami'"; then ok "Istio Gateway HTTP -> whoami"; else bad "gateway HTTP"; fi
+  out="$($pexec curl -s -m 10 http://$ip/)" || true
+  if echo "$out" | grep -qi "X-Forwarded-For: "; then ok "gateway adds X-Forwarded-For"; else bad "gateway XFF missing"; fi
+  if echo "$out" | grep -qi "X-Forwarded-Client-Cert: By=spiffe://cluster.local/ns/$NS/sa/whoami;.*URI=spiffe://cluster.local/ns/$NS/sa/ingress"; then
+    ok "gateway -> backend uses mTLS (gateway identity)"; else bad "gateway mTLS: $(echo "$out" | grep -i client-cert)"; fi
+  if retry 60 sh -c "$pexec curl -s -m 5 --cacert /dev/null -k --resolve gw.example.com:443:$ip https://gw.example.com/ | grep -q '^Hostname: whoami'"; then
+    ok "Istio Gateway HTTPS (SIMPLE, credentialName)"; else bad "gateway HTTPS"; fi
+  out="$($pexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://$ip/fortio/echo)" || true
+  if [ "$out" = 200 ]; then ok "gateway prefix rewrite -> fortio"; else bad "gateway rewrite: $out"; fi
+  # Gateway API（HTTPRoute）
+  if ! kubectl get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml >/dev/null 2>&1
+  fi
+  # 生成されるゲートウェイの Deployment は ConfigMap のオーバーレイ（parametersRef）でイメージを差し替える
+  local gimg="docker.io/istio/proxyv2:$ISTIO_VERSION"
+  case "$gw_ann" in *proxyImage*) gimg="$VEIL_PROXY" ;; esac
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: gapi-options}
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            image: $gimg
+            imagePullPolicy: IfNotPresent
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: gapi}
+spec:
+  gatewayClassName: istio
+  infrastructure:
+    parametersRef: {group: "", kind: ConfigMap, name: gapi-options}
+  listeners:
+  - {name: http, port: 80, protocol: HTTP, allowedRoutes: {namespaces: {from: Same}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: gapi}
+spec:
+  parentRefs: [{name: gapi}]
+  rules:
+  - matches: [{path: {type: PathPrefix, value: /app}}]
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier: {add: [{name: x-gapi, value: "1"}]}
+    backendRefs: [{name: whoami, port: 80}]
+EOF
+  if retry 180 sh -c "kubectl -n $NS get deploy gapi-istio >/dev/null 2>&1"; then
+    kubectl -n "$NS" rollout status deploy/gapi-istio --timeout=240s >/dev/null
+    local gip
+    gip="$(kubectl -n "$NS" get svc gapi-istio -o jsonpath='{.spec.clusterIP}')"
+    if retry 90 sh -c "$pexec curl -s -m 5 http://$gip/app | grep -qi '^X-Gapi: 1'"; then ok "Gateway API HTTPRoute (header modifier)"; else bad "Gateway API HTTPRoute"; fi
+    out="$($pexec curl -s -m 5 -o /dev/null -w '%{http_code}' http://$gip/other)" || true
+    if [ "$out" = 404 ]; then ok "Gateway API unmatched path -> 404"; else bad "Gateway API unmatched: $out"; fi
+    case "$gw_ann" in
+      *proxyImage*) if kubectl -n "$NS" exec deploy/gapi-istio -- /usr/local/bin/envoy --version 2>/dev/null | grep -q veil; then ok "Gateway API gateway is veil"; else bad "Gateway API gateway is not veil"; fi ;;
+    esac
+  else
+    bad "Gateway API deployment not created"
+  fi
+  kubectl -n "$NS" delete httproute gapi >/dev/null 2>&1
+  kubectl -n "$NS" delete gateway.gateway.networking.k8s.io gapi >/dev/null 2>&1
+  kubectl -n "$NS" delete configmap gapi-options >/dev/null 2>&1
+  kubectl -n "$NS" delete virtualservice via-gw >/dev/null 2>&1
+  kubectl -n "$NS" delete gateway.networking.istio.io gw >/dev/null 2>&1
+  kubectl -n "$NS" delete deploy ingress >/dev/null 2>&1
+  kubectl -n "$NS" delete svc ingress >/dev/null 2>&1
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -494,7 +636,8 @@ deploy || { bad "deploy"; cleanup; exit 1; }
 case "$SUITE" in
   smoke) smoke ;;
   tasks) tasks ;;
-  all) smoke; tasks ;;
+  gateway) gateway ;;
+  all) smoke; tasks; gateway ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

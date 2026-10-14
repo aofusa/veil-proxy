@@ -315,6 +315,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
         xfcc_uri: false,
         xfcc_dns: false,
         generate_request_id: false,
+        use_remote_address: false,
         websocket: false,
         filters: Vec::new(),
         peer_metadata: false,
