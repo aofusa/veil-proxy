@@ -4148,6 +4148,7 @@ name = "veil-python"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "itoa",
  "pyo3",
  "serde_json",
  "veil",
