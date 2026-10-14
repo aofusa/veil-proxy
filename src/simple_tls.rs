@@ -429,6 +429,32 @@ pub async fn accept(
     })
 }
 
+/// [`accept`] と同じだが、相手のクライアント証明書（leaf の DER）も返す（メッシュの mTLS。F-217）。
+pub async fn accept_with_peer_cert(
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+    mut initial_data: Option<Vec<u8>>,
+) -> io::Result<(SimpleTlsServerStream, Option<Vec<u8>>)> {
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+    let peer_cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec());
+
+    Ok((
+        SimpleTlsServerStream {
+            inner: stream,
+            conn: Some(Box::new(conn)),
+            mode: TlsMode::Rustls,
+            drained_buffer: Vec::new(),
+        },
+        peer_cert,
+    ))
+}
+
 /// 平文（TLSなし）接続をアクセプト（H2C対応用）
 pub async fn accept_plain(
     stream: TcpStream,

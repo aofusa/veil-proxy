@@ -844,6 +844,97 @@ pub async fn accept(
     })
 }
 
+/// [`accept`] と同じだが、相手のクライアント証明書（leaf の DER）も返す（メッシュの mTLS。F-217）。
+///
+/// kTLS を有効にすると rustls の接続を手放すため、ハンドシェイクの直後に控える。既存の [`accept`] の
+/// 経路（ストリームの構造体）は変えない（証明書を持たせると全 TLS 接続の構造体が大きくなる）。
+pub async fn accept_with_peer_cert(
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+    enable_ktls: bool,
+    allow_fallback: bool,
+    tcp_cork_enabled: bool,
+    mut initial_data: Option<Vec<u8>>,
+) -> io::Result<(KtlsServerStream, Option<Vec<u8>>)> {
+    // io_uring's IORING_OP_ACCEPT does not set SOCK_NONBLOCK unlike accept4(2).
+    // We use raw_read/tls_writev (writev) on this fd, so we must ensure O_NONBLOCK is set.
+    {
+        let fd = stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // ハンドシェイクを実行
+    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+
+    // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
+    let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
+    // 相手の証明書（leaf）。kTLS を有効にすると rustls の接続を手放すので先に控える
+    let peer_cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec());
+
+    // kTLS の有効化を試みる
+    #[cfg(feature = "ktls")]
+    let (mode, conn_option, drained_buffer) = if enable_ktls {
+        match try_enable_ktls_server(&stream, conn, tcp_cork_enabled) {
+            KtlsEnableResult::Enabled(mode, drained) => {
+                // kTLS 有効化成功 + ドレイン済みバッファ
+                (mode, None, drained)
+            }
+            KtlsEnableResult::Fallback(returned_conn, reason) => {
+                if allow_fallback {
+                    // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                    // warnログは try_enable_ktls_server 内で既に出力済み
+                    let _ = reason;
+                    (TlsMode::Rustls, Some(returned_conn), Vec::new())
+                } else {
+                    // フォールバック無効 - 接続を拒否
+                    ftlog::error!(
+                        "kTLS unavailable ({}) and fallback disabled, rejecting connection",
+                        reason
+                    );
+                    return Err(io::Error::other(format!(
+                        "kTLS required but unavailable: {}",
+                        reason
+                    )));
+                }
+            }
+            KtlsEnableResult::Fatal(e) => {
+                // シークレット抽出後の失敗等、致命的エラー
+                ftlog::error!("kTLS fatal error: {}, connection cannot continue", e);
+                return Err(e);
+            }
+        }
+    } else {
+        (TlsMode::Rustls, Some(conn), Vec::new())
+    };
+
+    #[cfg(not(feature = "ktls"))]
+    let (mode, conn_option, drained_buffer) = {
+        let _ = enable_ktls;
+        let _ = allow_fallback;
+        (TlsMode::Rustls, Some(conn), Vec::new())
+    };
+
+    Ok((
+        KtlsServerStream {
+            inner: stream,
+            conn: conn_option.map(Box::new),
+            mode,
+            alpn_protocol,
+            drained_buffer,
+        },
+        peer_cert,
+    ))
+}
+
 /// TLS ハンドシェイクを実行しクライアント TLS ストリームを作成
 ///
 /// kTLS の有効化に失敗した場合の動作は `allow_fallback` で制御されます：

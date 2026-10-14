@@ -136,6 +136,12 @@ pub fn run() {
         std::process::exit(crate::connect_broker::broker_main());
     }
 
+    // F-222: Istio の pilot-agent から Envoy として起動された（argv[0] が envoy・`veil envoy ...`）
+    #[cfg(feature = "mesh-istio")]
+    if let Some(args) = crate::mesh::envoy_invocation() {
+        std::process::exit(crate::mesh::envoy::main(args));
+    }
+
     // コマンドライン引数を解析（--help, --version は clap が自動処理）
     let cli_args = CliArgs::parse();
 

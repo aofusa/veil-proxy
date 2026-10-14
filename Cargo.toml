@@ -286,6 +286,19 @@ vds = ["dep:serde_json", "dep:prost", "grpc", "http2"]
 acme = ["dep:serde_json", "dep:rcgen"]
 
 # ====================
+# サービスメッシュのデータプレーン（F-215〜F-225）。Istio の Envoy・Linkerd のプロキシを veil に置き換える。
+# default・full* には入れない（F-215 の必須条件: メッシュを使わない既存のプロキシの性能を退行させない）。
+# Linux のみ（Kubernetes のノード。SO_ORIGINAL_DST・iptables の REDIRECT が前提）。
+# 設計: docs/backlog/features/F-215-service-mesh-dataplane.md
+# ====================
+# 共通部（メッシュモデル・透過転送・ワークロード ID の mTLS・L7・観測）
+mesh = ["dep:prost", "dep:serde_json", "dep:regex", "http2", "grpc"]
+# Istio のサイドカー・ゲートウェイ（Envoy 互換の起動・Envoy の xDS v3 の変換・SDS・管理 API の模倣。F-222・F-224）
+mesh-istio = ["mesh"]
+# Linkerd のプロキシ（linkerd2-proxy-api・プロキシ同士の取り決め。F-223）
+mesh-linkerd = ["mesh"]
+
+# ====================
 # API サーバ基盤ライブラリ（F-188〜F-192）。veil を他のアプリにライブラリとして組み込む用途。
 # いずれも default・full* に含めない（本体ビルドにライブラリ用コードを入れない）。
 # 設計: docs/backlog/features/F-188-api-library-core.md
@@ -608,6 +621,8 @@ futures = "0.3.31"
 # API サーバ基盤ライブラリ（`handler` 系 feature のみ。F-188〜F-191）
 # ====================
 serde_json = { version = "1.0", optional = true }
+# メッシュ（F-219）のルートの正規表現（Envoy の safe_regex。RE2 互換の構文の範囲）
+regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }

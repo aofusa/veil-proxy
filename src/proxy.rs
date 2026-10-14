@@ -571,11 +571,93 @@ where
         + crate::runtime::io::BufferedReadState
         + Unpin,
 {
+    let svc = ProxyH2Service {
+        spawner: h2_task_spawner(),
+    };
+    handle_http2_requests_with(conn, client_ip, connection_metric, redirect_https, &svc).await
+}
+
+/// HTTP/2 の per-stream 処理を差し替える口（F-222: メッシュのデータプレーンが自分のルーティングと上流で
+/// 使う）。veil の通常のプロキシは [`ProxyH2Service`]（従来の処理そのもの。単相化で同じコードになる）。
+#[cfg(feature = "http2")]
+pub(crate) trait H2Service {
+    /// 本文がまだ届いている途中の要求を、本文をチャネルで流す（ストリーミング）にするか。
+    /// `Some(上限)` ならストリーミング（0 は上限なし）、`None` は本文を溜めてから処理する。
+    fn streaming_plan<S>(
+        &self,
+        conn: &http2::Http2Connection<S>,
+        stream_id: u32,
+        client_ip: &str,
+        client_socket_addr: SocketAddr,
+    ) -> Option<u64>
+    where
+        S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin;
+
+    /// 要求 1 つを処理するタスクを起動する。
+    fn spawn(
+        &self,
+        ctx: H2RequestCtx,
+        req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+        resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+        notify: crate::stream_channel::Notify,
+    );
+}
+
+/// 通常のプロキシの per-stream 処理（ルーティング・セキュリティ・WASM・バックエンド）。
+#[cfg(feature = "http2")]
+struct ProxyH2Service {
+    spawner: H2TaskSpawner,
+}
+
+#[cfg(feature = "http2")]
+impl H2Service for ProxyH2Service {
+    #[inline]
+    fn streaming_plan<S>(
+        &self,
+        conn: &http2::Http2Connection<S>,
+        stream_id: u32,
+        client_ip: &str,
+        client_socket_addr: SocketAddr,
+    ) -> Option<u64>
+    where
+        S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    {
+        h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
+    }
+
+    #[inline]
+    fn spawn(
+        &self,
+        ctx: H2RequestCtx,
+        req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+        resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+        notify: crate::stream_channel::Notify,
+    ) {
+        (self.spawner)(ctx, req_rx, resp_tx, notify)
+    }
+}
+
+/// [`handle_http2_requests`] の本体（per-stream 処理を `svc` で差し替えられる）。
+#[cfg(feature = "http2")]
+pub(crate) async fn handle_http2_requests_with<S, V>(
+    conn: &mut http2::Http2Connection<S>,
+    client_ip: &str,
+    connection_metric: &mut ActiveConnectionMetric,
+    redirect_https: bool,
+    svc: &V,
+) -> Result<(), http2::Http2Error>
+where
+    S: crate::runtime::io::AsyncReadRent
+        + crate::runtime::io::AsyncWriteRentExt
+        + AsRawFd
+        + crate::runtime::io::BufferedReadState
+        + Unpin,
+    V: H2Service,
+{
     use http2::frame::Frame;
     use http2::Http2Error;
 
     let notify = crate::stream_channel::Notify::new();
-    let spawner = h2_task_spawner();
     // F-162: per-stream 固定費削減。`client_ip` の `Rc<str>` 化と `SocketAddr` 解決は
     // 接続あたり 1 回だけ行い、以降は `Rc::clone`（参照カウント +1）と値渡し（Copy）で使い回す。
     let client_ip_rc: std::rc::Rc<str> = std::rc::Rc::from(client_ip);
@@ -693,7 +775,7 @@ where
                             req.body_pending,
                             &mut streams,
                             &notify,
-                            &spawner,
+                            svc,
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
@@ -741,7 +823,7 @@ where
                             req.body_pending,
                             &mut streams,
                             &notify,
-                            &spawner,
+                            svc,
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
@@ -854,7 +936,7 @@ where
 /// 接続状態を進めるため、[`H2RespMsg::Head`]/[`H2RespMsg::Trailers`] のエンコードは
 /// **メインループが送信順に**行う（タスクは名前/値ペアのまま渡す）。
 #[cfg(feature = "http2")]
-enum H2RespMsg {
+pub(crate) enum H2RespMsg {
     /// レスポンス head（ステータス + ヘッダ）。最初に 1 回だけ送られる。
     ///
     /// F-166/F-165(B-2/A4): ヘッダは `Vec<(Bytes, Bytes)>`。`Bytes` は
@@ -881,27 +963,27 @@ enum H2RespMsg {
 
 /// per-stream リクエストタスクへ conn 非依存で引き渡すリクエスト情報（F-116）。
 #[cfg(feature = "http2")]
-struct H2RequestCtx {
+pub(crate) struct H2RequestCtx {
     /// デコーダのアリーナ由来 `Bytes`（参照カウント clone のみ、R2/F-165）。
-    method: Bytes,
-    path: Bytes,
+    pub(crate) method: Bytes,
+    pub(crate) path: Bytes,
     /// `:authority`（無ければ host ヘッダー、いずれも無ければ空）。
-    authority: Bytes,
+    pub(crate) authority: Bytes,
     /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
-    headers: Vec<crate::http2::hpack::HeaderField>,
+    pub(crate) headers: Vec<crate::http2::hpack::HeaderField>,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
-    body: Bytes,
+    pub(crate) body: Bytes,
     /// リクエストトレイラー（gRPC 等。通常のリクエストでは空、F-133）。wasm feature
     /// 無効時は誰も読まないためフィールド自体を無くす（dead_code 回避）。
     #[cfg(feature = "wasm")]
     trailers: Vec<crate::http2::hpack::HeaderField>,
     /// 接続あたり 1 回だけ確保して `Rc::clone`（参照カウント +1）で使い回す（F-162）。
-    client_ip: std::rc::Rc<str>,
+    pub(crate) client_ip: std::rc::Rc<str>,
     /// `client_ip` から解決した `SocketAddr`。接続確立時に 1 回だけ解決する（F-162）。
-    client_socket_addr: SocketAddr,
+    pub(crate) client_socket_addr: SocketAddr,
     /// 平文リスナーの `enable_secure_redirect`（F-200）。true なら要求を https へ 301 で返す。
-    redirect_https: bool,
-    start: Instant,
+    pub(crate) redirect_https: bool,
+    pub(crate) start: Instant,
 }
 
 /// メインループ側のストリーム状態（F-116）。
@@ -1005,19 +1087,20 @@ const H2_REQ_CHANNEL_CAP: usize = 4;
 /// ボディ継続で、ストリーミング適格ならリクエストボディチャネル付きで起動する。
 #[cfg(feature = "http2")]
 #[allow(clippy::too_many_arguments)]
-fn h2_spawn_for_request<S>(
+fn h2_spawn_for_request<S, V>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
     body_pending: bool,
     streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
     notify: &crate::stream_channel::Notify,
-    spawner: &H2TaskSpawner,
+    svc: &V,
     client_ip: &std::rc::Rc<str>,
     client_socket_addr: SocketAddr,
     connection_metric: &mut ActiveConnectionMetric,
     redirect_https: bool,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    V: H2Service,
 {
     // 既にタスク起動済みのストリーム（body_pending の二重通知）はスキップ。
     if streams.contains_key(&stream_id) {
@@ -1028,7 +1111,7 @@ fn h2_spawn_for_request<S>(
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
     let plan = if body_pending && !redirect_https {
-        h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
+        svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr)
     } else {
         None
     };
@@ -1095,7 +1178,7 @@ fn h2_spawn_for_request<S>(
     // 容量 `H2_RESP_CHANNEL_CAP`（4）の有界チャネルであり、それを超える送出は
     // タスク側が Pending で止まる（= 通常の spawn 経路にフォールバックする）ため、
     // 送出順序を先取りしても取りこぼしは発生しない。
-    spawner(ctx, req_rx, resp_tx, notify.clone());
+    svc.spawn(ctx, req_rx, resp_tx, notify.clone());
 
     streams.insert(
         stream_id,

@@ -206,6 +206,10 @@ pub mod tls_reload;
 #[cfg(feature = "vds")]
 pub mod vds;
 
+// サービスメッシュのデータプレーン（F-215。Istio の Envoy・Linkerd のプロキシの置き換え）
+#[cfg(feature = "mesh")]
+pub mod mesh;
+
 // tokio 互換レイヤー（F-198、API ライブラリ専用）。2 つの実装は排他。
 #[cfg(all(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 compile_error!(
