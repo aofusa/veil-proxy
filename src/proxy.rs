@@ -657,7 +657,16 @@ where
                             conn.flush_write_buf().await?;
                             continue;
                         }
-                        if data_len > 0 {
+                        if st.req_tx.is_none() {
+                            // B-130: 受け手（ハンドラ・上流への中継）が本文を読み終える前に閉じた。残りの本文は
+                            // 捨てて、そのぶんの受信ウィンドウをすぐ返す（溜めると補充されずに接続全体の
+                            // ウィンドウが尽き、同じ接続の他の要求が止まる）。
+                            if data_len > 0 {
+                                conn.replenish_recv_window(stream_id);
+                                // 直後の process_frame は write_buf が空である前提（write_all）なので先に送る
+                                conn.flush_write_buf().await?;
+                            }
+                        } else if data_len > 0 {
                             // ゼロコピー: 受信フレームの所有バッファをそのまま Bytes 化して転送。
                             st.req_pending.push_back(Bytes::from(data));
                         }
@@ -1176,8 +1185,10 @@ where
                         break;
                     }
                     Err(TrySendError::Closed(_)) => {
+                        // B-130: 受け手が閉じた。溜めていた本文を捨て、そのぶんのウィンドウを返す
                         st.req_pending.clear();
                         st.req_tx = None;
+                        transferred = true;
                     }
                 }
             }
