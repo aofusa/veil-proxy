@@ -394,7 +394,7 @@
 | B-124 | P1 | 完了 | [bugs/B-124-non-linux-build-breakage.md](bugs/B-124-non-linux-build-breakage.md) | macOS・OpenBSD で veil 本体がビルドできなかった（F-200 で消した `h2c_listen` を unveil/Seatbelt 用の UDS パス収集が参照）。macOS で単体テストがビルドできなかった（connect_broker の定数） |
 | B-125 | P2 | 完了 | [bugs/B-125-api-library-non-linux.md](bugs/B-125-api-library-non-linux.md) | API ライブラリの C・Python 版が Linux 以外でビルドできなかった（`epoll` feature を無条件に指定）。サンプル・VDS の Rust 制御プレーンが Windows でビルドできなかった |
 | B-126 | P2 | 完了 | [bugs/B-126-netbsd-connect-timeout-so-error.md](bugs/B-126-netbsd-connect-timeout-so-error.md) | NetBSD で VDS・ACME の制御プレーンへの接続が拒否されても次のアドレスを試さなかった（std の `connect_timeout` が `Ok` を返し `SO_ERROR` に残る。B-91 の取りこぼし）。試験の接続待ちも同じ |
-| B-127 | P1 | 未修正 | [bugs/B-127-grpc-handler-decompression-unbounded.md](bugs/B-127-grpc-handler-decompression-unbounded.md) | gRPC ハンドラ（`grpc-handler`）が `grpc-encoding: gzip`/`deflate` のメッセージを上限無しで解凍してから `grpc_max_message_size` と比べる（4MiB の圧縮メッセージで数 GB を確保させられる）。`compression` feature 無しでは解凍せずに通す（F-209 で発見） |
+| B-127 | P1 | 完了 | [bugs/B-127-grpc-handler-decompression-unbounded.md](bugs/B-127-grpc-handler-decompression-unbounded.md) | gRPC ハンドラ（`grpc-handler`）が `grpc-encoding: gzip`/`deflate` のメッセージを上限無しで解凍してから `grpc_max_message_size` と比べる（4MiB の圧縮メッセージで数 GB を確保させられる）。`compression` feature 無しでは解凍せずに通す（F-209 で発見） |
 
 ---
 

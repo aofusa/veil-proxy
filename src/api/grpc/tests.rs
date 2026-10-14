@@ -234,6 +234,82 @@ fn gzip_compressed_request() {
     assert_eq!(decode_all::<HealthCheckRequest>(&data)[0].service, ":gz");
 }
 
+/// 応答の `grpc-status`（Trailers-Only ならヘッダ、そうでなければトレーラ）。
+fn status_of(resp: crate::api::response::Response) -> Option<Vec<u8>> {
+    if let Some(v) = field(&resp.headers().to_vec(), "grpc-status") {
+        return Some(v.to_vec());
+    }
+    let (_, _, t) = collect(resp);
+    field(&t, "grpc-status").map(|v| v.to_vec())
+}
+
+/// B-127: 解凍すると上限を大きく超えるメッセージは、全部解凍せずに RESOURCE_EXHAUSTED。
+#[cfg(feature = "compression")]
+#[test]
+fn gzip_bomb_is_resource_exhausted() {
+    let f = handler_of(echo_app());
+    // 上限（4MiB）の 16 倍に展開される 0 の列（圧縮後は 64KB 程度）
+    let bomb = vec![0u8; max_message_size() * 16];
+    for (name, enc) in [
+        ("gzip", GrpcCompression::Gzip),
+        ("deflate", GrpcCompression::Deflate),
+    ] {
+        let c = enc.compress(&bomb, 9).unwrap();
+        assert!(c.len() < max_message_size());
+        let mut fr = BytesMut::new();
+        fr.put_u8(1);
+        fr.put_u32(c.len() as u32);
+        fr.extend_from_slice(&c);
+        let resp = futures::executor::block_on(f(grpc_request(
+            HttpVersion::Http2,
+            vec![fr.freeze()],
+            &[("grpc-encoding", name)],
+        )));
+        assert_eq!(status_of(resp).as_deref(), Some(&b"8"[..]), "{}", name);
+    }
+}
+
+/// B-127: `compression` feature 無しのビルドは gzip を解凍せずに通していた。UNIMPLEMENTED で断る。
+#[cfg(not(feature = "compression"))]
+#[test]
+fn gzip_without_compression_feature_is_unimplemented() {
+    let f = handler_of(echo_app());
+    let resp = futures::executor::block_on(f(grpc_request(
+        HttpVersion::Http2,
+        vec![],
+        &[("grpc-encoding", "gzip")],
+    )));
+    assert_eq!(status_of(resp).as_deref(), Some(&b"12"[..]));
+}
+
+/// B-127 / F-209 #4: gRPC-Web を通常の gRPC として処理しない。
+#[test]
+fn grpc_web_is_rejected() {
+    let f = handler_of(echo_app());
+    for ct in [
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/grpc-web-text",
+    ] {
+        let mut req = ApiRequest::new(
+            "POST",
+            "/pkg.Svc/M",
+            vec![(
+                Bytes::from_static(b"content-type"),
+                Bytes::copy_from_slice(ct.as_bytes()),
+            )],
+            Bytes::new(),
+        );
+        req.version = HttpVersion::Http2;
+        assert_eq!(
+            futures::executor::block_on(f(req)).status_code(),
+            415,
+            "{}",
+            ct
+        );
+    }
+}
+
 #[test]
 fn bidi_and_client_streaming() {
     let bidi = handler_of(App::new().grpc_bidi(

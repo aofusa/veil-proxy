@@ -79,6 +79,42 @@ impl GrpcCompression {
         }
     }
 
+    /// このビルドで実際に解凍できるか（`compression` feature 無しでは gzip・deflate を扱えない。B-127）
+    pub fn is_supported(&self) -> bool {
+        match self {
+            Self::Identity => true,
+            _ => cfg!(feature = "compression"),
+        }
+    }
+
+    /// 解凍後の大きさが `limit` を超えたら打ち切る（B-127）。
+    ///
+    /// 全部解凍してから大きさを比べると、高圧縮率の小さなメッセージで巨大な確保をさせられる。
+    /// `limit + 1` バイトまでしか読まず、超えたら `MessageTooLarge`（`size` は `limit + 1`）を返す。
+    /// 確保も `limit + 1` バイトを超えない。
+    pub fn decompress_limited(&self, data: &[u8], limit: usize) -> Result<Vec<u8>, GrpcError> {
+        match self {
+            Self::Identity => {
+                if data.len() > limit {
+                    return Err(GrpcError::MessageTooLarge {
+                        size: data.len(),
+                        max: limit,
+                    });
+                }
+                Ok(data.to_vec())
+            }
+            #[cfg(feature = "compression")]
+            Self::Gzip => read_limited(GzDecoder::new(data), limit, "gzip"),
+            #[cfg(feature = "compression")]
+            Self::Deflate => read_limited(DeflateDecoder::new(data), limit, "deflate"),
+            #[cfg(not(feature = "compression"))]
+            _ => Err(GrpcError::CompressionError(format!(
+                "{} is not supported in this build",
+                self.as_str()
+            ))),
+        }
+    }
+
     /// Decompress data with this encoding
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, GrpcError> {
         match self {
@@ -184,6 +220,24 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
     Ok(result)
 }
 
+/// 解凍器から `limit + 1` バイトまで読む（B-127）。
+#[cfg(feature = "compression")]
+fn read_limited<R: Read>(decoder: R, limit: usize, name: &str) -> Result<Vec<u8>, GrpcError> {
+    let cap = limit.saturating_add(1);
+    let mut result = Vec::new();
+    decoder
+        .take(cap as u64)
+        .read_to_end(&mut result)
+        .map_err(|e| GrpcError::CompressionError(format!("{} decompress: {}", name, e)))?;
+    if result.len() > limit {
+        return Err(GrpcError::MessageTooLarge {
+            size: result.len(),
+            max: limit,
+        });
+    }
+    Ok(result)
+}
+
 /// Compress data with deflate
 #[cfg(feature = "compression")]
 fn compress_deflate(data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
@@ -232,6 +286,53 @@ mod tests {
         let decompressed = GrpcCompression::Deflate.decompress(&compressed).unwrap();
 
         assert_eq!(decompressed, original);
+    }
+
+    /// B-127: 高圧縮率のメッセージは上限 + 1 バイトで打ち切る（全部は解凍しない）。
+    #[test]
+    #[cfg(feature = "compression")]
+    fn test_decompress_limited_stops_at_limit() {
+        let limit = 64 * 1024;
+        // 上限の 1000 倍に展開される 0 の列
+        let bomb = vec![0u8; limit * 1000];
+        for enc in [GrpcCompression::Gzip, GrpcCompression::Deflate] {
+            let compressed = enc.compress(&bomb, 9).unwrap();
+            assert!(compressed.len() < limit, "{:?}: {}", enc, compressed.len());
+            match enc.decompress_limited(&compressed, limit) {
+                Err(GrpcError::MessageTooLarge { size, max }) => {
+                    assert_eq!(size, limit + 1);
+                    assert_eq!(max, limit);
+                }
+                other => panic!("{:?}: {:?}", enc, other.map(|v| v.len())),
+            }
+            // 上限ちょうどは通る
+            let exact = vec![7u8; limit];
+            let c = enc.compress(&exact, 6).unwrap();
+            assert_eq!(enc.decompress_limited(&c, limit).unwrap(), exact);
+        }
+    }
+
+    #[test]
+    fn test_decompress_limited_identity() {
+        assert_eq!(
+            GrpcCompression::Identity
+                .decompress_limited(b"abc", 3)
+                .unwrap(),
+            b"abc"
+        );
+        assert!(matches!(
+            GrpcCompression::Identity.decompress_limited(b"abcd", 3),
+            Err(GrpcError::MessageTooLarge { size: 4, max: 3 })
+        ));
+    }
+
+    #[test]
+    fn test_is_supported() {
+        assert!(GrpcCompression::Identity.is_supported());
+        assert_eq!(
+            GrpcCompression::Gzip.is_supported(),
+            cfg!(feature = "compression")
+        );
     }
 
     #[test]

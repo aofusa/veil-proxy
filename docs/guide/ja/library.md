@@ -558,9 +558,9 @@ App::new()
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` と `message().await` |
 | 期限 | `grpc-timeout` を veil のタイマーで強制し、ハンドラを取り消して `DEADLINE_EXCEEDED` で終える（ストリームはメッセージの間で確認） |
 | 取り消し | クライアントの RST_STREAM・切断でハンドラの Future と応答ストリームを drop する |
-| 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す。応答は非圧縮（`grpc-accept-encoding: identity,gzip,deflate`） |
-| 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED` |
-| エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
+| 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す（`compression` feature が必要。`full` に含まれる。無いビルドは `identity` だけを受け、他は `UNIMPLEMENTED`）。応答は非圧縮（`grpc-accept-encoding: identity,gzip,deflate`） |
+| 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED`。圧縮されたメッセージは解凍後の大きさに掛かり、超えた時点で解凍を打ち切る |
+| エラー | `content-type` が `application/grpc*` 以外（と gRPC-Web の `application/grpc-web*`）は 415、HTTP/1.1 の gRPC は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
 
 gRPC のルートは OpenAPI に載りません。完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・

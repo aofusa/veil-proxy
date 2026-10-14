@@ -106,6 +106,23 @@ async fn gzip(c: &mut Client) -> Result<(), String> {
     Ok(())
 }
 
+/// B-127: 解凍すると上限（4MiB）を大きく超えるメッセージ（圧縮後は 64KB 程度）は RESOURCE_EXHAUSTED。
+/// その後もサーバが応答すること。
+async fn gzip_bomb(c: &mut Client) -> Result<(), String> {
+    let r = c
+        .clone()
+        .send_compressed(CompressionEncoding::Gzip)
+        .say_hello(HelloRequest {
+            name: "x".repeat(64 * 1024 * 1024),
+        })
+        .await;
+    match r {
+        Err(s) if s.code() == Code::ResourceExhausted => {}
+        other => return Err(format!("want RESOURCE_EXHAUSTED, got {:?}", other.map(|_| ()))),
+    }
+    unary(c).await
+}
+
 async fn server_streaming(c: &mut Client) -> Result<(), String> {
     let mut s = c
         .count_up(CountRequest { count: 1000 })
@@ -537,6 +554,7 @@ async fn main() {
         report("h2 large_unary (3MiB)", large_unary(&mut c).await);
         report("h2 message too large", too_large(&mut c).await);
         report("h2 gzip request", gzip(&mut c).await);
+        report("h2 gzip bomb (B-127)", gzip_bomb(&mut c).await);
         report("h2 server_streaming", server_streaming(&mut c).await);
         report("h2 server_streaming error", server_streaming_error(&mut c).await);
         report("h2 client_streaming", client_streaming(&mut c).await);

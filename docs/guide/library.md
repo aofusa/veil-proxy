@@ -577,9 +577,9 @@ App::new()
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` and `message().await` |
 | Deadline | `grpc-timeout` is enforced with veil's timer: the handler is cancelled and the call ends with `DEADLINE_EXCEEDED` (for streams, checked between messages) |
 | Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
-| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed; responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
-| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded |
-| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
+| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed (needs the `compression` feature, which `full` includes; without it only `identity` is accepted and other encodings get `UNIMPLEMENTED`); responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
+| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded. For a compressed message the limit applies to the decompressed size, and decompression stops as soon as it is exceeded |
+| Errors | `content-type` other than `application/grpc*` (and gRPC-Web, `application/grpc-web*`) is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
 | Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
 
 gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming

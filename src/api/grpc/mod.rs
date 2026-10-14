@@ -358,9 +358,22 @@ impl<T: prost::Message + Default> Streaming<T> {
             if self.encoding == GrpcCompression::Identity {
                 return Err(Status::internal("compressed message without grpc-encoding"));
             }
-            self.encoding
-                .decompress(&data)
-                .map_err(|e| Status::internal(format!("failed to decompress message: {}", e)))?
+            // B-127: 解凍後の大きさは上限 + 1 バイトで打ち切る（全部解凍してから比べない）
+            match self.encoding.decompress_limited(&data, max_message_size()) {
+                Ok(d) => d,
+                Err(crate::grpc::framing::GrpcError::MessageTooLarge { max, .. }) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "decompressed message larger than max ({})",
+                        max
+                    )))
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "failed to decompress message: {}",
+                        e
+                    )))
+                }
+            }
         } else {
             data
         };
@@ -479,10 +492,17 @@ where
     }
 }
 
+/// 受け付ける `grpc-encoding`（`compression` feature 無しのビルドでは identity だけ。B-127）。
+const GRPC_ACCEPT_ENCODING: &str = if cfg!(feature = "compression") {
+    "identity,gzip,deflate"
+} else {
+    "identity"
+};
+
 fn grpc_head(status: u16) -> super::response::Response {
     super::response::Response::new(status)
         .with_header("content-type", "application/grpc")
-        .with_header("grpc-accept-encoding", "identity,gzip,deflate")
+        .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING)
 }
 
 /// エラーだけを返す応答（Trailers-Only: `grpc-status` を応答ヘッダに載せて本文無しで終える）。
@@ -528,7 +548,9 @@ struct Call {
 /// gRPC の要求として受け付けられるかを見る（だめなら返す応答）。
 fn accept(req: &super::request::Request) -> Result<Call, super::response::Response> {
     let ct = req.header("content-type").unwrap_or_default();
-    if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) {
+    // gRPC-Web（`application/grpc-web*`）は本文内のトレーラ等の形式が違う。通常の gRPC として扱うと
+    // ブラウザが読めない応答を返すので断る（B-127 / F-209 #4）。
+    if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) || is_grpc_web(ct.as_bytes()) {
         return Err(super::response::Response::error(
             415,
             "Unsupported Media Type (expected application/grpc)",
@@ -542,8 +564,8 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
     let encoding = match req.header("grpc-encoding") {
         None => GrpcCompression::Identity,
         Some(v) => match GrpcCompression::from_bytes(v.as_bytes()) {
-            Some(c) => c,
-            None => {
+            Some(c) if c.is_supported() => c,
+            _ => {
                 return Err(trailers_only(&Status::unimplemented(format!(
                     "grpc-encoding '{}' is not supported",
                     v
@@ -578,6 +600,12 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
         encoding,
         client_ip: req.client_ip(),
     })
+}
+
+/// `application/grpc-web`・`application/grpc-web+proto`・`application/grpc-web-text` 等。
+fn is_grpc_web(ct: &[u8]) -> bool {
+    const P: &[u8] = b"application/grpc-web";
+    ct.len() >= P.len() && ct[..P.len()].eq_ignore_ascii_case(P)
 }
 
 /// 期限付きで Future を待つ（期限切れは `DEADLINE_EXCEEDED`）。

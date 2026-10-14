@@ -1,6 +1,6 @@
 # B-127: gRPC ハンドラが圧縮メッセージを上限無しで解凍する（解凍後のサイズで DoS）
 
-**状態: 未修正（F-209 の洗い出しで発見、2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14。F-209 の洗い出しで発見）**
 
 ## 症状
 
@@ -31,3 +31,14 @@
 - 単体: 高圧縮率の gzip（上限の 1000 倍に展開されるもの）で `RESOURCE_EXHAUSTED` になり、確保が上限 + α に収まること
   （`count-allocs` か `alloc-stats` で最大確保を見る）。上限ちょうどは通ること。
 - E2E: `library_e2e.sh grpc` に圧縮爆弾の要求を 1 件足し、応答が `RESOURCE_EXHAUSTED` でサーバが生きていること。
+
+## 対応（2026-10-14）
+
+- `GrpcCompression::decompress_limited`（`src/grpc/compression.rs`）: `Read::take(limit + 1)` で読み、超えたら
+  `MessageTooLarge`。gRPC ハンドラの `Streaming::decode_frame` はこれを使い、`RESOURCE_EXHAUSTED` を返す。
+- `GrpcCompression::is_supported`: `compression` feature 無しのビルドでは gzip・deflate を `UNIMPLEMENTED` で断り、
+  `grpc-accept-encoding` は `identity` だけにする。
+- `application/grpc-web*` は 415（F-209 #4 の実装までの間、通常の gRPC として誤処理しない）。
+- 試験: 単体（`test_decompress_limited_stops_at_limit`・`gzip_bomb_is_resource_exhausted`・
+  `gzip_without_compression_feature_is_unimplemented`・`grpc_web_is_rejected`）、E2E（`library_e2e.sh grpc` の
+  `h2 gzip bomb (B-127)`: 64MiB に展開されるメッセージで `RESOURCE_EXHAUSTED`、その後も応答する。io_uring・epoll）。
