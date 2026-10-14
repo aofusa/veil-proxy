@@ -74,8 +74,8 @@ pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
 pub enum OpResult {
     /// 完了していない
     Pending,
-    /// 完了（CQE.res と CQE.flags。flags は provided buffer の選択結果（F-205）等）
-    Done(i32, u32),
+    /// 完了（res は CQE.res）
+    Done(i32),
 }
 
 /// ドロップされた in-flight op の後始末ガード（F-46: 確保不要の `Noop` を追加）。
@@ -93,18 +93,14 @@ pub enum OpGuard {
     Noop,
     /// 後始末クロージャ（バッファ・fd 等を保持）。
     Cleanup(Box<dyn FnOnce(i32)>),
-    /// CQE.flags も要る後始末（provided buffer を選んだ RECV がカーネルの選んだバッファを返す。F-205）。
-    CleanupWithFlags(Box<dyn FnOnce(i32, u32)>),
 }
 
 impl OpGuard {
     /// ガードを実行する（`Noop` は何もしない）。
     #[inline]
-    fn run(self, res: i32, flags: u32) {
-        match self {
-            OpGuard::Noop => {}
-            OpGuard::Cleanup(f) => f(res),
-            OpGuard::CleanupWithFlags(f) => f(res, flags),
+    fn run(self, res: i32) {
+        if let OpGuard::Cleanup(f) = self {
+            f(res);
         }
     }
 }
@@ -283,7 +279,7 @@ impl OpTable {
         };
         match &mut self.slots[i].state {
             OpSlotState::Active { result, waker } => {
-                *result = OpResult::Done(cqe.res, cqe.flags);
+                *result = OpResult::Done(cqe.res);
                 if let Some(w) = waker.take() {
                     w.wake();
                 }
@@ -310,7 +306,7 @@ impl OpTable {
                 let state = std::mem::replace(&mut self.slots[i].state, OpSlotState::Free);
                 self.free_slot(i);
                 if let OpSlotState::Detached(guard) = state {
-                    guard.run(cqe.res, cqe.flags);
+                    guard.run(cqe.res);
                 }
                 true
             }
@@ -330,13 +326,13 @@ impl OpTable {
         };
         match &self.slots[i].state {
             OpSlotState::Active {
-                result: OpResult::Done(res, flags),
+                result: OpResult::Done(res),
                 ..
             } => {
                 // 既に完了済み（CQE 到着済みだが take されていない）。即座に後始末。
-                let (res, flags) = (*res, *flags);
+                let res = *res;
                 self.free_slot(i);
-                guard.run(res, flags);
+                guard.run(res);
                 false
             }
             OpSlotState::Active {
@@ -351,7 +347,7 @@ impl OpTable {
                 if ms.finished && ms.queue.is_empty() {
                     // 既に終端済みで未消費なし → 即後始末。
                     self.free_slot(i);
-                    guard.run(0, 0);
+                    guard.run(0);
                     false
                 } else {
                     // 進行中 or 未消費あり。キャンセルしてガードで延命。
@@ -365,19 +361,14 @@ impl OpTable {
 
     /// 操作の結果を取得し、スロットを解放する
     fn take_result(&mut self, user_data: u64) -> Option<i32> {
-        self.take_result_flags(user_data).map(|(res, _)| res)
-    }
-
-    /// 操作の結果と CQE.flags を取得し、スロットを解放する（F-205）
-    fn take_result_flags(&mut self, user_data: u64) -> Option<(i32, u32)> {
         let i = self.resolve(user_data)?;
         if let OpSlotState::Active {
-            result: OpResult::Done(res, flags),
+            result: OpResult::Done(res),
             ..
         } = self.slots[i].state
         {
             self.free_slot(i);
-            return Some((res, flags));
+            return Some(res);
         }
         None
     }
@@ -408,7 +399,7 @@ impl OpTable {
     fn peek_result(&self, user_data: u64) -> Option<i32> {
         let i = self.resolve(user_data)?;
         if let OpSlotState::Active {
-            result: OpResult::Done(res, _),
+            result: OpResult::Done(res),
             ..
         } = self.slots[i].state
         {
@@ -769,11 +760,6 @@ pub fn take_op_result(user_data: u64) -> Option<i32> {
     OP_TABLE.with(|t| t.borrow_mut().take_result(user_data))
 }
 
-/// 操作の結果と CQE.flags を取得して削除する（provided buffer の選択結果を読む RECV。F-205）
-pub fn take_op_result_flags(user_data: u64) -> Option<(i32, u32)> {
-    OP_TABLE.with(|t| t.borrow_mut().take_result_flags(user_data))
-}
-
 /// 操作の結果を参照する（削除しない）
 pub fn peek_op_result(user_data: u64) -> Option<i32> {
     OP_TABLE.with(|t| t.borrow().peek_result(user_data))
@@ -805,6 +791,12 @@ pub fn detach_op(user_data: u64, guard: OpGuard) {
 /// 勝つたびに発生するホットパス）。スロットは自然完了の CQE 到着時に解放される。
 pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
     let _ = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+}
+
+/// in-flight op を取り消す（ASYNC_CANCEL）。op は Future が持ったままで、取り消し（`-ECANCELED`）か
+/// 行き違いの完了の CQE を通常どおり受け取る（F-205: 待ちを打ち切っても届いたデータを捨てない）。
+pub fn cancel_op(user_data: u64) {
+    submit_cancel(user_data);
 }
 
 /// 指定した user_data の in-flight op に ASYNC_CANCEL を投げる（ベストエフォート）。

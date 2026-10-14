@@ -397,6 +397,7 @@
 | B-126 | P2 | 完了 | [bugs/B-126-netbsd-connect-timeout-so-error.md](bugs/B-126-netbsd-connect-timeout-so-error.md) | NetBSD で VDS・ACME の制御プレーンへの接続が拒否されても次のアドレスを試さなかった（std の `connect_timeout` が `Ok` を返し `SO_ERROR` に残る。B-91 の取りこぼし）。試験の接続待ちも同じ |
 | B-127 | P1 | 完了 | [bugs/B-127-grpc-handler-decompression-unbounded.md](bugs/B-127-grpc-handler-decompression-unbounded.md) | gRPC ハンドラ（`grpc-handler`）が `grpc-encoding: gzip`/`deflate` のメッセージを上限無しで解凍してから `grpc_max_message_size` と比べる（4MiB の圧縮メッセージで数 GB を確保させられる）。`compression` feature 無しでは解凍せずに通す（F-209 で発見） |
 | B-128 | P2 | 完了 | [bugs/B-128-uring-restrictions-reject-buffer-select.md](bugs/B-128-uring-restrictions-reject-buffer-select.md) | io_uring の制限付きリングが SQE フラグの許可を登録しておらず、`IOSQE_BUFFER_SELECT` 付きの op が本番で全部 `-EACCES` だった。HTTP/3 の multishot 受信（F-130 C2）は常に C1 へ戻っていた（単体試験は制限無しのリングなので通っていた）。buffer select だけを許可 |
+| B-129 | P1 | 完了 | [bugs/B-129-http1-pipelined-request-dropped.md](bugs/B-129-http1-pipelined-request-dropped.md) | HTTP/1.1 のパイプラインで 2 つ目以降の要求を 1 つ目の本文として捨て、接続が止まっていた。`Content-Length` を超えた分を次の要求として残し、揃っていれば読まずに処理する |
 
 ---
 

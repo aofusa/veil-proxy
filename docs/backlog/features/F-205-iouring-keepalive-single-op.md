@@ -1,6 +1,6 @@
 # F-205: HTTP/1.1 のキープアライブ待ちを 1 回の操作にする（io_uring の POLL_ADD → RECV・epoll の確認用 poll）
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 実装済み・計測中（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景（F-202 の計測）
 
@@ -96,3 +96,20 @@ io_uring の 1 回目の読み取り（リング）以外の読み取りも、�
 F-206（Rust の API を axum 以上に、API ライブラリの範囲だけで）の手順 1 は、同じ方法をハンドラだけのリスナーに
 `cfg(feature = "handler")` の分岐で入れる案。**本チケットを先に入れれば F-206 の手順 1 は要らない**（計測だけ行い、
 F-206 は確保とルーティングの手順 2〜4 に集中する）。順番は F-205 → F-206 を勧める。
+
+## 実装（2026-10-14）: 設計の「小さな初期バッファで直接 RECV」案に変更
+
+provided buffer ring の案は採らなかった。開発ホスト（Ubuntu 6.8.0-146）では `IORING_REGISTER_PBUF_RING` が C から
+直接呼んでも `EINVAL` になり（B-128 の追記）、検証できない経路を入れられないため。代わりに:
+
+- 応答の直後、次の要求を **要求の蓄積バッファ（8KB、既存のプール）へ直接** 読みにいく
+  （`[performance] keepalive_direct_read_ms`、既定 20ms、0 で無効）。読み取りバッファからの写しも無くなる。
+  - io_uring: `TcpStream::read_within`（`RECV` 1 回）。期限で `ASYNC_CANCEL` を投げて CQE を待つので、
+    取り消しと行き違いで届いたデータも失わない（`-ECANCELED` のときだけバッファを返して従来の待ちへ）。
+  - epoll: `timeout(期限, read)`。届いていれば `EPOLL_CTL_MOD` と確認用の `poll(2)` を省く（読めたときだけ省くので B-75 を守る）。
+- 期限を過ぎた接続は従来どおりバッファを持たずに待つ（B-101 の性質は保つ。持つのは期限の間の 8KB だけ）。
+- 平文の接続だけ。TLS・kqueue・WSAPoll は今までどおり。
+- 付随して B-128（io_uring の制限が `IOSQE_BUFFER_SELECT` を拒否）と B-129（HTTP/1.1 のパイプラインで 2 つ目の要求を失う）を修正。
+
+試験: `tests/e2e_tests.rs::test_f205_keepalive_direct_read_and_fallback`（すぐ・期限の後 30/150/400ms・パイプライン・
+分割した要求・8KB を超える本文。io_uring・epoll）。

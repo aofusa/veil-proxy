@@ -30,3 +30,10 @@
 - HTTP/3 の受信が本番で初めて C2（multishot）になる。HTTP/3 の E2E（`tests/e2e_setup.sh`、io_uring）と HTTP/3 の
   交互 A/B（`tools/perf`）で確かめる（結果は F-205 のチケットに記録）。
 - F-205（TCP のキープアライブ受信を provided buffer の RECV 1 回にする）はこの修正が前提。
+
+## 追記（2026-10-14）
+
+開発ホスト（Ubuntu 6.8.0-146-generic）では `IORING_REGISTER_PBUF_RING` そのものが、制限の無い新しいリングでも、
+C から直接呼んでも `EINVAL` を返す（ユーザ空間のリング・`IOU_PBUF_RING_MMAP` の両方）。このホストでは F-130 C2 は
+制限以前にリングの登録で失敗して C1 で動く。本チケットの修正（フラグの許可）は登録できるカーネルで C2 が動くための
+前提で、制限の検査そのものは単体試験（RECV + 未登録のバッファ群で `-ENOBUFS`）で確かめた。

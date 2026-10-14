@@ -25953,3 +25953,85 @@ async fn test_f177_idempotent_retry_on_dead_pooled_connection() {
         assert!(head.starts_with("HTTP/1.1 200"), "request {}: {}", i, head);
     }
 }
+
+/// 平文の HTTP/1.1 で応答を 1 つ読む（Content-Length の本文まで）。ステータス行を返す。
+fn f205_read_response(stream: &mut TcpStream, carry: &mut Vec<u8>) -> String {
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(end) = carry.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&carry[..end]).to_string();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let l = l.to_ascii_lowercase();
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while carry.len() < end + 4 + len {
+                let n = stream.read(&mut buf).expect("read body");
+                assert!(n > 0, "connection closed in the body");
+                carry.extend_from_slice(&buf[..n]);
+            }
+            carry.drain(..end + 4 + len);
+            return head.lines().next().unwrap_or_default().to_string();
+        }
+        let n = stream.read(&mut buf).expect("read head");
+        assert!(n > 0, "connection closed before a response");
+        carry.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// F-205: キープアライブの次の要求を蓄積バッファへ直接読む経路と、期限（既定 20ms）を過ぎて従来の待ち方へ
+/// 戻る経路の両方で、同じ接続の要求が正しく処理される（すぐ・期限の後・パイプライン・分割・大きな本文）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_f205_keepalive_direct_read_and_fallback() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", PROXY_H2C_PORT)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut carry = Vec::new();
+    let req = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    // 1. 接続直後・応答の直後（直接読む経路）
+    for _ in 0..20 {
+        s.write_all(req).unwrap();
+        assert!(f205_read_response(&mut s, &mut carry).contains(" 200"));
+    }
+    // 2. 期限を過ぎてから（読みを取り消して従来の待ち方へ戻った後）
+    for wait_ms in [30u64, 150, 400] {
+        std::thread::sleep(Duration::from_millis(wait_ms));
+        s.write_all(req).unwrap();
+        assert!(
+            f205_read_response(&mut s, &mut carry).contains(" 200"),
+            "after {}ms",
+            wait_ms
+        );
+    }
+    // 3. パイプライン（1 回の書き込みに 3 要求）
+    s.write_all(&req.repeat(3)).unwrap();
+    for _ in 0..3 {
+        assert!(f205_read_response(&mut s, &mut carry).contains(" 200"));
+    }
+    // 4. 要求を 2 回に分けて送る（直接読んだ断片の後を従来の読みで受ける）
+    s.write_all(b"GET / HTTP/1.1\r\nHo").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    s.write_all(b"st: localhost\r\n\r\n").unwrap();
+    assert!(f205_read_response(&mut s, &mut carry).contains(" 200"));
+    // 5. 蓄積バッファ（8KB）を超える本文
+    let body = vec![b'a'; 20000];
+    let mut post = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    post.extend_from_slice(&body);
+    s.write_all(&post).unwrap();
+    let status = f205_read_response(&mut s, &mut carry);
+    assert!(status.starts_with("HTTP/1.1 "), "{}", status);
+    // 接続はまだ使える
+    s.write_all(req).unwrap();
+    assert!(f205_read_response(&mut s, &mut carry).contains(" 200"));
+}
