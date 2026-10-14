@@ -28,9 +28,65 @@ pub struct ConnCtx {
     pub peer_cert_hash: Option<Arc<str>>,
     pub peer_dns: Vec<String>,
     pub sni: Option<String>,
+    /// LDS の更新でフィルタチェーンを選び直すための接続の属性（静的なリスナーは `None`）
+    pub relookup: Option<Arc<Relookup>>,
+    /// この文脈を作ったときのリスナーの表の版
+    pub table_version: u64,
+}
+
+/// 接続のフィルタチェーンを選び直すのに要る属性。
+pub struct Relookup {
+    pub laddr: SocketAddr,
+    pub dst: SocketAddr,
+    pub transport: TransportProto,
+    pub alpn: Vec<String>,
 }
 
 impl ConnCtx {
+    /// リスナーの表が更新されていれば、同じ接続の属性でフィルタチェーンを選び直した文脈を返す
+    /// （Envoy は LDS の更新で古いリスナーの接続を排出する。veil は次の要求から新しい設定を使う）。
+    /// HTTP でなくなった・リスナーが消えたときは `None`（接続を閉じる）。
+    pub fn refreshed(self: &Arc<Self>) -> Option<Arc<ConnCtx>> {
+        let Some(rl) = &self.relookup else {
+            return Some(self.clone());
+        };
+        let table = super::state::state().listeners.load();
+        if table.version == self.table_version {
+            return Some(self.clone());
+        }
+        let lst = table.bound.iter().find(|l| l.addr == rl.laddr)?.clone();
+        let target = if lst.use_original_dst {
+            table.find_original_dst(rl.dst).cloned().unwrap_or(lst)
+        } else {
+            lst
+        };
+        let alpn: Vec<&str> = rl.alpn.iter().map(|s| s.as_str()).collect();
+        let facts = ConnFacts {
+            dst: Some(rl.dst),
+            src: Some(self.peer),
+            sni: self.sni.as_deref(),
+            transport: Some(rl.transport),
+            alpn: &alpn,
+        };
+        let chain = super::server::select_chain(&target, &facts)?;
+        let ChainAction::Http(hcm) = &chain.action else {
+            return None;
+        };
+        Some(Arc::new(ConnCtx {
+            hcm: hcm.clone(),
+            direction: self.direction,
+            orig_dst: self.orig_dst,
+            peer: self.peer,
+            tls: self.tls,
+            peer_principal: self.peer_principal.clone(),
+            peer_cert_hash: self.peer_cert_hash.clone(),
+            peer_dns: self.peer_dns.clone(),
+            sni: self.sni.clone(),
+            relookup: self.relookup.clone(),
+            table_version: table.version,
+        }))
+    }
+
     /// 観測のラベル（相手のワークロードは要求ごとに決まる）。
     pub fn labels(
         &self,
@@ -879,4 +935,65 @@ pub fn peer_workload(
         _ => from_response
             .or_else(|| endpoint.and_then(|e| super::peer::cached_endpoint(&e.workload))),
     }
+}
+
+/// HTTP の要求 1 件のアクセスログ（設定があるときだけ。`ctx.hcm.access_logs`）。
+#[allow(clippy::too_many_arguments)]
+pub fn access_log(
+    ctx: &ConnCtx,
+    req: &ReqView<'_>,
+    start: std::time::SystemTime,
+    protocol: &str,
+    status: u16,
+    flag: ResponseFlag,
+    bytes_received: u64,
+    bytes_sent: u64,
+    duration_ms: u64,
+    upstream: Option<SocketAddr>,
+    cluster: Option<&ClusterCfg>,
+    route_name: &str,
+    upstream_ms: Option<u64>,
+) {
+    if ctx.hcm.access_logs.is_empty() {
+        return;
+    }
+    let reqf = |n: &str| req.header(n);
+    let respf = |n: &str| -> Option<Bytes> {
+        if n == "x-envoy-upstream-service-time" {
+            upstream_ms.map(|m| Bytes::from(m.to_string()))
+        } else {
+            None
+        }
+    };
+    let details = match flag {
+        ResponseFlag::None if upstream.is_some() => "via_upstream",
+        ResponseFlag::None => "direct_response",
+        ResponseFlag::NoRoute => "route_not_found",
+        ResponseFlag::RbacDenied => "rbac_access_denied_matched_policy[none]",
+        ResponseFlag::FaultInjected => "fault_filter_abort",
+        ResponseFlag::NoHealthyUpstream => "no_healthy_upstream",
+        ResponseFlag::UpstreamOverflow => "upstream_reset_before_response_started{overflow}",
+        ResponseFlag::UpstreamTimeout => "response_timeout",
+        ResponseFlag::NoCluster => "cluster_not_found",
+        _ => "upstream_reset_before_response_started{connection_failure}",
+    };
+    let rec = super::accesslog::Record {
+        start,
+        protocol,
+        code: status,
+        flags: flag.as_str(),
+        details,
+        bytes_received,
+        bytes_sent,
+        duration_ms,
+        req: &reqf,
+        resp: &respf,
+        upstream_host: upstream,
+        cluster: cluster.map(|c| c.name.as_str()).unwrap_or(""),
+        downstream_local: ctx.orig_dst,
+        downstream_remote: Some(ctx.peer),
+        sni: ctx.sni.as_deref(),
+        route_name,
+    };
+    super::accesslog::emit(&ctx.hcm.access_logs, &rec);
 }

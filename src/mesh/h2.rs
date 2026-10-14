@@ -19,7 +19,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub struct MeshH2Service {
-    pub ctx: Arc<ConnCtx>,
+    pub ctx: std::cell::RefCell<Arc<ConnCtx>>,
 }
 
 impl H2Service for MeshH2Service {
@@ -43,7 +43,12 @@ impl H2Service for MeshH2Service {
         resp_tx: Sender<H2RespMsg>,
         notify: Notify,
     ) {
-        let c = self.ctx.clone();
+        // LDS の更新で設定が変わっていれば選び直す（HTTP でなくなったら古い設定のまま。接続は GOAWAY されない）
+        let refreshed = self.ctx.borrow().refreshed();
+        if let Some(r) = refreshed {
+            *self.ctx.borrow_mut() = r;
+        }
+        let c = self.ctx.borrow().clone();
         crate::runtime::spawn(async move {
             task(c, ctx, req_rx, &resp_tx, &notify).await;
             drop(resp_tx);
@@ -72,7 +77,9 @@ where
         return;
     }
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
-    let svc = MeshH2Service { ctx: ctx.clone() };
+    let svc = MeshH2Service {
+        ctx: std::cell::RefCell::new(ctx.clone()),
+    };
     let ip = ctx.peer.ip().to_string();
     if let Err(e) =
         crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &svc).await
@@ -159,6 +166,11 @@ async fn task(
 ) {
     super::stats::DOWNSTREAM_RQ_TOTAL.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
+    let start_sys = if c.hcm.access_logs.is_empty() {
+        std::time::UNIX_EPOCH
+    } else {
+        std::time::SystemTime::now()
+    };
     let mut scheme = Bytes::from_static(b"http");
     let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(rq.headers.len() + 8);
     for h in &rq.headers {
@@ -197,6 +209,21 @@ async fn task(
                 req_len,
                 lr.body.len() as u64,
             );
+            l7::access_log(
+                &c,
+                &view,
+                start_sys,
+                "HTTP/2",
+                lr.status,
+                lr.flag,
+                req_len,
+                lr.body.len() as u64,
+                start.elapsed().as_millis() as u64,
+                None,
+                None,
+                "",
+                None,
+            );
         }
         Decision::Forward(f) => {
             if let Some(d) = f.delay {
@@ -226,6 +253,21 @@ async fn task(
                 o.req_bytes.max(req_len),
                 o.resp_bytes,
             );
+            l7::access_log(
+                &c,
+                &view,
+                start_sys,
+                "HTTP/2",
+                o.status,
+                o.flag,
+                o.req_bytes.max(req_len),
+                o.resp_bytes,
+                start.elapsed().as_millis() as u64,
+                o.upstream,
+                o.cluster.as_deref(),
+                &f.route().name,
+                o.upstream_ms,
+            );
         }
     }
 }
@@ -238,6 +280,10 @@ pub(crate) struct Outcome {
     pub resp_bytes: u64,
     pub peer: Option<Arc<super::peer::Workload>>,
     pub svc: Option<Arc<super::stats::ServiceLabels>>,
+    /// アクセスログ用（上流のアドレス・クラスタ・上流の所要時間）
+    pub upstream: Option<std::net::SocketAddr>,
+    pub cluster: Option<Arc<super::model::ClusterCfg>>,
+    pub upstream_ms: Option<u64>,
 }
 
 fn grpc_status_of(h: &[(Bytes, Bytes)]) -> Option<u32> {
@@ -274,6 +320,9 @@ async fn forward(
         resp_bytes: 0,
         peer: None,
         svc,
+        upstream: None,
+        cluster: None,
+        upstream_ms: None,
     };
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
     let max_attempts = 1 + retry.as_ref().map_or(0, |r| r.num_retries);
@@ -304,6 +353,8 @@ async fn forward(
                 return out;
             }
         };
+        out.upstream = Some(picked.addr);
+        out.cluster = Some(picked.cfg.clone());
         let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
         let up_h2 = l7::upstream_is_h2(&picked.cfg, true);
         let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
@@ -481,11 +532,13 @@ async fn forward(
                         retry_now = true;
                         break;
                     }
+                    let ums = started.elapsed().as_millis() as u64;
+                    out.upstream_ms = Some(ums);
                     let peer_resp = l7::downstream_response_headers(
                         c,
                         Some(f),
                         &mut headers,
-                        Some(started.elapsed().as_millis() as u64),
+                        Some(ums),
                         origin,
                     );
                     out.peer = l7::peer_workload(c, peer_req.clone(), peer_resp, picked.endpoint());
@@ -759,13 +812,9 @@ async fn to_h1(
         }
         headers.push((Bytes::from(name), Bytes::copy_from_slice(h.value)));
     }
-    let peer_resp = l7::downstream_response_headers(
-        c,
-        Some(f),
-        &mut headers,
-        Some(started.elapsed().as_millis() as u64),
-        origin,
-    );
+    let ums = started.elapsed().as_millis() as u64;
+    out.upstream_ms = Some(ums);
+    let peer_resp = l7::downstream_response_headers(c, Some(f), &mut headers, Some(ums), origin);
     out.peer = l7::peer_workload(c, peer_req, peer_resp, picked.endpoint());
     out.status = status;
     let no_body = method.as_ref() == b"HEAD" || status == 204 || status == 304 || len == Some(0);

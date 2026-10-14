@@ -356,6 +356,8 @@ pub struct HttpCm {
     pub stream_idle_timeout: Option<Duration>,
     /// トレースのサンプリング（百万分率）
     pub trace_sampling: u32,
+    /// アクセスログ（Istio の Telemetry API。空なら何もしない）
+    pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +419,7 @@ pub struct TcpProxyCfg {
     pub idle_timeout: Option<Duration>,
     /// TCP の認可（Envoy の network RBAC。Istio の AuthorizationPolicy の TCP 規則）
     pub rbac: Option<Arc<RbacCfg>>,
+    pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
 }
 
 impl TcpProxyCfg {

@@ -34,7 +34,7 @@ enum Framing {
 }
 
 /// 下流の 1 接続を処理する。
-pub async fn serve<S>(mut io: S, initial: Vec<u8>, ctx: Arc<ConnCtx>)
+pub async fn serve<S>(mut io: S, initial: Vec<u8>, mut ctx: Arc<ConnCtx>)
 where
     S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
@@ -69,6 +69,11 @@ where
                 Ok(true) => {}
                 _ => return,
             }
+        };
+        // LDS の更新で設定が変わっていれば選び直す（HTTP でなくなったら閉じる）
+        ctx = match ctx.refreshed() {
+            Some(c) => c,
+            None => return,
         };
         let head = acc.split_to(head_end).freeze();
         let mut hbuf = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -153,6 +158,12 @@ where
             scheme: if ctx.tls { b"https" } else { b"http" },
         };
         let start = Instant::now();
+        let start_sys = if ctx.hcm.access_logs.is_empty() {
+            std::time::UNIX_EPOCH
+        } else {
+            std::time::SystemTime::now()
+        };
+        let proto: &str = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
         let is_grpc = view.is_grpc();
         let req_body_len = match framing {
             Framing::Length(n) => n,
@@ -173,6 +184,21 @@ where
                     start.elapsed().as_secs_f64() * 1000.0,
                     req_body_len,
                     lr.body.len() as u64,
+                );
+                l7::access_log(
+                    &ctx,
+                    &view,
+                    start_sys,
+                    proto,
+                    lr.status,
+                    lr.flag,
+                    req_body_len,
+                    lr.body.len() as u64,
+                    start.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                    "",
+                    None,
                 );
                 if !keep {
                     return;
@@ -213,6 +239,21 @@ where
                     start.elapsed().as_secs_f64() * 1000.0,
                     r.req_bytes,
                     r.resp_bytes,
+                );
+                l7::access_log(
+                    &ctx,
+                    &view,
+                    start_sys,
+                    proto,
+                    r.status,
+                    r.flag,
+                    r.req_bytes,
+                    r.resp_bytes,
+                    start.elapsed().as_millis() as u64,
+                    r.upstream,
+                    r.cluster.as_deref(),
+                    &f.route().name,
+                    r.upstream_ms,
                 );
                 if !r.keep_alive {
                     return;
@@ -576,6 +617,10 @@ pub(crate) struct Outcome {
     pub resp_bytes: u64,
     pub peer: Option<Arc<super::peer::Workload>>,
     pub svc: Option<Arc<super::stats::ServiceLabels>>,
+    /// アクセスログ用（上流のアドレス・クラスタ・上流の所要時間）
+    pub upstream: Option<std::net::SocketAddr>,
+    pub cluster: Option<Arc<super::model::ClusterCfg>>,
+    pub upstream_ms: Option<u64>,
 }
 
 /// 上流の応答のヘッダ。
@@ -729,6 +774,9 @@ where
         resp_bytes: 0,
         peer: None,
         svc,
+        upstream: None,
+        cluster: None,
+        upstream_ms: None,
     };
     let fail = |status: u16, flag: ResponseFlag| LocalReply::new(status, flag);
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
@@ -754,6 +802,8 @@ where
                 return out;
             }
         };
+        out.upstream = Some(picked.addr);
+        out.cluster = Some(picked.cfg.clone());
         let downstream_h2 = false;
         let up_h2 = l7::upstream_is_h2(&picked.cfg, downstream_h2) && !upgrade;
         let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
@@ -925,6 +975,7 @@ where
             }
         }
         let upstream_ms = started.elapsed().as_millis() as u64;
+        out.upstream_ms = Some(upstream_ms);
         let mut resp_headers = rh.headers;
         let peer_resp = l7::downstream_response_headers(
             ctx,

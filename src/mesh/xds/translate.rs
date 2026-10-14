@@ -508,6 +508,7 @@ fn tcp_proxy(tp: &p::TcpProxy, reg: &mut Registry, rbac: Option<Arc<RbacCfg>>) -
         total_weight,
         idle_timeout: dur_nonzero(&tp.idle_timeout).or(Some(Duration::from_secs(3600))),
         rbac,
+        access_logs: crate::mesh::accesslog::translate(&tp.access_log),
     })
 }
 
@@ -649,6 +650,7 @@ fn http_cm(
         direction,
         stream_idle_timeout: dur_nonzero(&hcm.stream_idle_timeout),
         trace_sampling,
+        access_logs: crate::mesh::accesslog::translate(&hcm.access_log),
     })
 }
 

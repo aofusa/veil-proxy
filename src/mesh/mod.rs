@@ -17,6 +17,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("the `mesh` feature is Linux-only (SO_ORIGINAL_DST / iptables REDIRECT)");
 
+pub mod accesslog;
 pub mod admin;
 pub mod detect;
 pub mod envoy;

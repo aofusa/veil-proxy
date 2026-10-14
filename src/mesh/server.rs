@@ -386,6 +386,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     };
     // virtualOutbound は元の宛先に対応するリスナーへ渡す
     let table = state().listeners.load();
+    let table_version = table.version;
     let target: Arc<MeshListener> = if lst.use_original_dst {
         table.find_original_dst(dst).cloned().unwrap_or(lst)
     } else {
@@ -434,6 +435,18 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         ChainAction::Close => {}
         ChainAction::Http(hcm) => {
             let hcm = hcm.clone();
+            // 静的なリスナー（ブートストラップ）は LDS で変わらないので選び直さない
+            let relookup = (!STATIC_LISTENERS
+                .get()
+                .is_some_and(|v| v.iter().any(|l| l.addr == laddr)))
+            .then(|| {
+                Arc::new(super::l7::Relookup {
+                    laddr,
+                    dst,
+                    transport,
+                    alpn: alpn.clone(),
+                })
+            });
             serve_http(
                 stream,
                 initial,
@@ -445,6 +458,8 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
                 target.direction,
                 sni,
                 &alpn,
+                relookup,
+                table_version,
             )
             .await;
         }
@@ -501,6 +516,8 @@ async fn serve_http(
     direction: Direction,
     sni: Option<String>,
     client_alpn: &[String],
+    relookup: Option<Arc<super::l7::Relookup>>,
+    table_version: u64,
 ) {
     let direction = if hcm.direction == Direction::Unspecified {
         direction
@@ -539,6 +556,8 @@ async fn serve_http(
         peer_cert_hash: hash,
         peer_dns: dns,
         sni,
+        relookup,
+        table_version,
     });
     if h2 {
         super::h2::serve(ds, Vec::new(), ctx).await;
@@ -653,8 +672,32 @@ async fn serve_tcp(
         chain.tls.is_some(),
         picked.tls.is_some()
     );
+    let start_sys = std::time::SystemTime::now();
+    let started = std::time::Instant::now();
     let (sent, received) = super::tcp::relay(&mut ds, &mut up, idle).await;
     picked.end(false, false);
+    if !tp.access_logs.is_empty() {
+        let none = |_: &str| None;
+        let rec = super::accesslog::Record {
+            start: start_sys,
+            protocol: "-",
+            code: 0,
+            flags: "-",
+            details: "-",
+            bytes_received: sent,
+            bytes_sent: received,
+            duration_ms: started.elapsed().as_millis() as u64,
+            req: &none,
+            resp: &none,
+            upstream_host: Some(picked.addr),
+            cluster: &picked.cfg.name,
+            downstream_local: Some(dst),
+            downstream_remote: Some(peer),
+            sni: sni.as_deref(),
+            route_name: "",
+        };
+        super::accesslog::emit(&tp.access_logs, &rec);
+    }
     if stats {
         super::stats::record_tcp(
             &labels,

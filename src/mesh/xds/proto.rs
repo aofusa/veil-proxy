@@ -1098,6 +1098,8 @@ pub struct HttpConnectionManager {
     /// 0 = AUTO, 1 = HTTP1, 2 = HTTP2
     #[prost(int32, tag = "1")]
     pub codec_type: i32,
+    #[prost(message, repeated, tag = "13")]
+    pub access_log: Vec<crate::mesh::accesslog::AccessLogProto>,
     #[prost(string, tag = "2")]
     pub stat_prefix: String,
     #[prost(message, repeated, tag = "5")]
@@ -1186,6 +1188,8 @@ pub struct HttpFilter {
 pub struct TcpProxy {
     #[prost(string, tag = "1")]
     pub stat_prefix: String,
+    #[prost(message, repeated, tag = "5")]
+    pub access_log: Vec<crate::mesh::accesslog::AccessLogProto>,
     #[prost(message, optional, tag = "8")]
     pub idle_timeout: Option<Duration>,
     #[prost(oneof = "tcp_proxy::ClusterSpecifier", tags = "2, 10")]

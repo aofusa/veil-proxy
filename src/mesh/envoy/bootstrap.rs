@@ -323,6 +323,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
         direction: Direction::Unspecified,
         stream_idle_timeout: None,
         trace_sampling: 0,
+        access_logs: Vec::new(),
     };
     Ok(Some(MeshListener {
         name,

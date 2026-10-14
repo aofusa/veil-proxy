@@ -471,6 +471,20 @@ EOF
   kubectl -n "$NS" delete authorizationpolicy require-jwt >/dev/null
   # 次の試験の前に、ポリシーの削除がプロキシへ届くのを待つ
   retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200" || true
+  # Telemetry API のアクセスログ（Envoy の既定の書式で stdout）
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata: {name: logs}
+spec:
+  accessLogging:
+  - providers: [{name: envoy}]
+EOF
+  sleep 6
+  cexec curl -s -m 5 -o /dev/null "http://fortio.$NS:8080/echo?accesslog=1"
+  if retry 30 sh -c "kubectl -n $NS logs deploy/client -c istio-proxy --since=60s | grep -q '\"GET /echo?accesslog=1 HTTP/1.1\" 200 - via_upstream'"; then
+    ok "access log (Telemetry API, Envoy format)"; else bad "access log: $(kubectl -n "$NS" logs deploy/client -c istio-proxy --since=60s | grep accesslog | tail -1)"; fi
+  kubectl -n "$NS" delete telemetry logs >/dev/null
   # Authorization: client だけ GET を許す
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: security.istio.io/v1
