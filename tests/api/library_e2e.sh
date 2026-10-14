@@ -403,9 +403,9 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   [ "$rc" = 0 ] && ok "grpc interop ($label, exit 0)" || bad "grpc interop ($label, exit $rc)"
   # gRPC-Web（F-209）: ブラウザの代わりに curl。HelloRequest{name:"web"} の枠と、その base64
   local U="http://127.0.0.1:$P/demo.v1.Demo/SayHello"
-  expect "grpc-web binary over HTTP/1.1 ($label)" "Hello web" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | tr -c '[:print:]' '.'"
-  expect "grpc-web trailer frame ($label)" "grpc-status: 0" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | tr -c '[:print:]' '.'"
-  expect "grpc-web-text (h2c, $label)" "Hello web" bash -c "printf 'AAAAAAUKA3dlYg==' | curl -s --http2-prior-knowledge -X POST --data-binary @- -H 'content-type: application/grpc-web-text' '$U' | $PY3 -c 'import sys,base64; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode(\"latin-1\"))' | tr -c '[:print:]' '.'"
+  expect "grpc-web binary over HTTP/1.1 ($label)" "Hello web" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | LC_ALL=C tr -c '[:print:]' '.'"
+  expect "grpc-web trailer frame ($label)" "grpc-status: 0" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | LC_ALL=C tr -c '[:print:]' '.'"
+  expect "grpc-web-text (h2c, $label)" "Hello web" bash -c "printf 'AAAAAAUKA3dlYg==' | curl -s --http2-prior-knowledge -X POST --data-binary @- -H 'content-type: application/grpc-web-text' '$U' | $PY3 -c 'import sys,base64; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode(\"latin-1\"))' | LC_ALL=C tr -c '[:print:]' '.'"
   expect "grpc-web CORS preflight ($label)" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$U' | tr A-Z a-z"
   expect "unknown gRPC service is UNIMPLEMENTED, not 404 ($label)" "grpc-status: 12" bash -c "curl -s -i --http2-prior-knowledge -X POST -H 'content-type: application/grpc' -H 'te: trailers' --data-binary '' 'http://127.0.0.1:$P/nope.v1.Nope/Call' | tr A-Z a-z"
   expect "grpc-web CORS rejects other origins ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://evil.example' "$U"
