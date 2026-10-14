@@ -208,6 +208,8 @@ pub struct Forward {
     /// JWT の検証で決まった要求ヘッダの変更（トークンの削除・claim のヘッダ）
     pub jwt_remove: Vec<Bytes>,
     pub jwt_add: Vec<(Bytes, Bytes)>,
+    /// この hop のスパン（トレースの設定があるときだけ）
+    pub span: Option<super::tracing::Span>,
 }
 
 impl Forward {
@@ -476,6 +478,10 @@ pub fn decide(ctx: &ConnCtx, req: &ReqView<'_>) -> Decision {
                 cors,
                 jwt_remove: jwt.remove_headers,
                 jwt_add: jwt.add_headers,
+                span: ctx.hcm.tracer.as_ref().map(|t| {
+                    let header = |n: &str| req.header(n);
+                    super::tracing::begin(t, &header)
+                }),
             }))
         }
     }
@@ -805,6 +811,16 @@ pub fn upstream_request_headers(
             Bytes::copy_from_slice(b.format(attempt).as_bytes()),
         ));
     }
+    if let Some(sp) = &f.span {
+        out.retain(|(k, _)| {
+            !(k.eq_ignore_ascii_case(b"x-b3-traceid")
+                || k.eq_ignore_ascii_case(b"x-b3-spanid")
+                || k.eq_ignore_ascii_case(b"x-b3-parentspanid")
+                || k.eq_ignore_ascii_case(b"x-b3-sampled")
+                || k.eq_ignore_ascii_case(b"b3"))
+        });
+        out.extend(sp.upstream_headers());
+    }
     for r in &f.jwt_remove {
         out.retain(|(k, _)| !k.eq_ignore_ascii_case(r));
     }
@@ -996,4 +1012,39 @@ pub fn access_log(
         route_name,
     };
     super::accesslog::emit(&ctx.hcm.access_logs, &rec);
+}
+
+/// この hop のスパンを終える（トレースの設定があり、サンプルしたときだけ送る）。
+pub fn finish_span(ctx: &ConnCtx, f: &Forward, req: &ReqView<'_>, status: u16, cluster: Option<&ClusterCfg>) {
+    let (Some(t), Some(sp)) = (&ctx.hcm.tracer, &f.span) else {
+        return;
+    };
+    if !sp.sampled {
+        return;
+    }
+    let op = f.route().operation.clone();
+    let name = if op.is_empty() {
+        String::from_utf8_lossy(req.authority).into_owned()
+    } else {
+        String::from_utf8_lossy(&op).into_owned()
+    };
+    let url = format!(
+        "{}://{}{}",
+        String::from_utf8_lossy(if req.scheme.is_empty() { b"http" } else { req.scheme }),
+        String::from_utf8_lossy(req.authority),
+        String::from_utf8_lossy(req.path)
+    );
+    let kind = if ctx.direction == Direction::Inbound { "SERVER" } else { "CLIENT" };
+    let header = |n: &str| req.header(n);
+    super::tracing::finish(
+        t,
+        sp,
+        &name,
+        kind,
+        req.method,
+        &url,
+        status,
+        cluster.map(|c| c.name.as_str()).unwrap_or(""),
+        &header,
+    );
 }

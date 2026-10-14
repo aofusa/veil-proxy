@@ -324,6 +324,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
         stream_idle_timeout: None,
         trace_sampling: 0,
         access_logs: Vec::new(),
+        tracer: None,
     };
     Ok(Some(MeshListener {
         name,

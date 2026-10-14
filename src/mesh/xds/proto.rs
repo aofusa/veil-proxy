@@ -1105,7 +1105,7 @@ pub struct HttpConnectionManager {
     #[prost(message, repeated, tag = "5")]
     pub http_filters: Vec<HttpFilter>,
     #[prost(message, optional, tag = "7")]
-    pub tracing: Option<HcmTracing>,
+    pub tracing: Option<crate::mesh::tracing::HcmTracingFull>,
     #[prost(string, tag = "10")]
     pub server_name: String,
     #[prost(message, optional, tag = "24")]
@@ -1133,16 +1133,6 @@ pub mod hcm {
         #[prost(message, tag = "4")]
         RouteConfig(super::RouteConfiguration),
     }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct HcmTracing {
-    #[prost(message, optional, tag = "3")]
-    pub client_sampling: Option<Percent>,
-    #[prost(message, optional, tag = "4")]
-    pub random_sampling: Option<Percent>,
-    #[prost(message, optional, tag = "5")]
-    pub overall_sampling: Option<Percent>,
 }
 
 /// `envoy.type.v3.Percent`（0〜100 の double）

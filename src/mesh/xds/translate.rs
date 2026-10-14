@@ -607,6 +607,11 @@ fn http_cm(
         .and_then(|t| t.random_sampling.as_ref())
         .map(|p| (p.value * 10_000.0) as u32)
         .unwrap_or(0);
+    let tracer = hcm
+        .tracing
+        .as_ref()
+        .and_then(|t| crate::mesh::tracing::from_full(t, reg))
+        .map(Arc::new);
     Ok(HttpCm {
         stat_prefix: hcm.stat_prefix.clone(),
         routes,
@@ -651,6 +656,7 @@ fn http_cm(
         stream_idle_timeout: dur_nonzero(&hcm.stream_idle_timeout),
         trace_sampling,
         access_logs: crate::mesh::accesslog::translate(&hcm.access_log),
+        tracer,
     })
 }
 

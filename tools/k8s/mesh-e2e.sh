@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -649,6 +649,70 @@ EOF
   kubectl -n "$NS" delete svc ingress >/dev/null 2>&1
 }
 
+telemetry() {
+  log "telemetry ($MODE)"
+  # Jaeger（Zipkin 互換の受け口）と Istio のトレースのプロバイダ（無ければ入れる）
+  if ! kubectl -n istio-system get deploy jaeger >/dev/null 2>&1; then
+    docker image inspect jaegertracing/all-in-one:latest >/dev/null 2>&1 || docker pull -q jaegertracing/all-in-one:latest >/dev/null
+    kind load docker-image --name "$CLUSTER" jaegertracing/all-in-one:latest >/dev/null 2>&1
+    cat <<'EOF' | kubectl -n istio-system apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: jaeger}
+spec:
+  selector: {matchLabels: {app: jaeger}}
+  template:
+    metadata: {labels: {app: jaeger}, annotations: {sidecar.istio.io/inject: "false"}}
+    spec:
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:latest
+        imagePullPolicy: IfNotPresent
+        env: [{name: COLLECTOR_ZIPKIN_HOST_PORT, value: ":9411"}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: jaeger-collector}
+spec:
+  selector: {app: jaeger}
+  ports: [{name: http-zipkin, port: 9411}, {name: http-query, port: 16686}]
+EOF
+    kubectl -n istio-system rollout status deploy/jaeger --timeout=180s >/dev/null
+  fi
+  if ! kubectl -n istio-system get cm istio -o jsonpath='{.data.mesh}' | grep -q "jaeger-collector"; then
+    istioctl install -y --set profile=minimal --set meshConfig.enableTracing=true \
+      --set 'meshConfig.extensionProviders[0].name=zipkin' \
+      --set 'meshConfig.extensionProviders[0].zipkin.service=jaeger-collector.istio-system.svc.cluster.local' \
+      --set 'meshConfig.extensionProviders[0].zipkin.port=9411' >/dev/null 2>&1
+    sleep 10
+  fi
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata: {name: tracing}
+spec:
+  tracing:
+  - providers: [{name: zipkin}]
+    randomSamplingPercentage: 100
+EOF
+  sleep 8
+  local tid j
+  tid="$(printf '%032x' $((RANDOM * RANDOM)))"
+  cexec curl -s -m 5 -o /dev/null -H "x-b3-traceid: $tid" -H "x-b3-spanid: 00000000000000aa" -H "x-b3-sampled: 1" "http://whoami.$NS/"
+  j="$(kubectl -n istio-system get pod -l app=jaeger -o name | head -1)"
+  local spans=""
+  for _ in $(seq 20); do
+    spans="$(kubectl -n istio-system exec "$j" -- wget -qO- "http://localhost:16686/api/traces/$tid" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); t=(d.get("data") or [{}])[0]; print(len(t.get("spans",[])), " ".join(sorted(set(p["serviceName"] for p in t.get("processes",{}).values()))))' 2>/dev/null)"
+    case "$spans" in 2*client*whoami*) break ;; esac
+    sleep 2
+  done
+  case "$spans" in
+    2*client.$NS*whoami.$NS*) ok "tracing: B3 context continued, client + server spans in Jaeger ($spans)" ;;
+    *) bad "tracing: $spans" ;;
+  esac
+  kubectl -n "$NS" delete telemetry tracing >/dev/null
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -661,7 +725,8 @@ case "$SUITE" in
   smoke) smoke ;;
   tasks) tasks ;;
   gateway) gateway ;;
-  all) smoke; tasks; gateway ;;
+  telemetry) telemetry ;;
+  all) smoke; tasks; gateway; telemetry ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

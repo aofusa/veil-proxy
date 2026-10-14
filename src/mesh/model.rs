@@ -358,6 +358,8 @@ pub struct HttpCm {
     pub trace_sampling: u32,
     /// アクセスログ（Istio の Telemetry API。空なら何もしない）
     pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
+    /// 分散トレース（Zipkin。None なら B3 を素通しするだけ）
+    pub tracer: Option<Arc<crate::mesh::tracing::TracerCfg>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

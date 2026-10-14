@@ -35,6 +35,7 @@ pub mod server;
 pub mod state;
 pub mod stats;
 pub mod tcp;
+pub mod tracing;
 pub mod upstream;
 pub mod xds;
 

@@ -255,6 +255,7 @@ where
                     &f.route().name,
                     r.upstream_ms,
                 );
+                l7::finish_span(&ctx, &f, &view, r.status, r.cluster.as_deref());
                 if !r.keep_alive {
                     return;
                 }

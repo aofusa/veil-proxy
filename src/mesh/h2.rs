@@ -268,6 +268,7 @@ async fn task(
                 &f.route().name,
                 o.upstream_ms,
             );
+            l7::finish_span(&c, &f, &view, o.status, o.cluster.as_deref());
         }
     }
 }
