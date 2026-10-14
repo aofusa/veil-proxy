@@ -166,14 +166,21 @@ pub fn run(cfg: VdsConfig, config_path: PathBuf) {
 }
 
 async fn run_async(cfg: VdsConfig, config_path: PathBuf) {
-    let url = match crate::ctrl_http::parse_url(&cfg.server) {
-        Ok(u) => u,
-        Err(e) => {
-            warn!("[VDS] vds.server: {}", e);
-            return;
+    let servers = cfg.server_list();
+    let mut urls = Vec::with_capacity(servers.len());
+    for s in &servers {
+        match crate::ctrl_http::parse_url(s) {
+            Ok(u) => urls.push(u),
+            Err(e) => {
+                warn!("[VDS] vds.server '{}': {}", s, e);
+                return;
+            }
         }
-    };
-    let tls = if url.tls {
+    }
+    if urls.is_empty() {
+        return;
+    }
+    let tls = if urls.iter().any(|u| u.tls) {
         match connector(&cfg) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -192,16 +199,22 @@ async fn run_async(cfg: VdsConfig, config_path: PathBuf) {
     };
     info!(
         "[VDS] subscribing to {} (gRPC) as node '{}'",
-        cfg.server, node.id
+        servers.join(", "),
+        node.id
     );
     let mut state = State::default();
     let initial = cfg.retry_initial_ms.max(50);
     let mut backoff = initial;
+    let mut rot = crate::vds::ServerRotation::new(urls.len());
     while !SHUTDOWN_FLAG.load(Ordering::Relaxed) {
         let mut got_response = false;
+        let i = rot.current();
+        // 失敗して次の制御プレーンへ移った（1 周していない）ならバックオフせずにすぐ試す
+        let mut next_now = false;
         match session(
             &cfg,
-            &url,
+            &servers[i],
+            &urls[i],
             tls.as_ref(),
             &node,
             &mut state,
@@ -210,17 +223,24 @@ async fn run_async(cfg: VdsConfig, config_path: PathBuf) {
         )
         .await
         {
-            Ok(()) => info!("[VDS] stream to {} ended; reconnecting", cfg.server),
+            Ok(()) => info!("[VDS] stream to {} ended; reconnecting", servers[i]),
             Err(e) => {
-                warn!("[VDS] stream to {} failed: {}", cfg.server, e);
+                warn!("[VDS] stream to {} failed: {}", servers[i], e);
                 crate::vds::record_connection(false, Some(e));
+                // 次の制御プレーンへ（全部を 1 周したらバックオフ）。nonce は制御プレーンごとのもの
+                state.nonce.clear();
+                next_now = !rot.failed();
             }
         }
         if got_response {
             backoff = initial;
+            rot.succeeded();
         }
         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             break;
+        }
+        if next_now {
+            continue;
         }
         let mut left = backoff;
         while left > 0 && !SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -236,6 +256,7 @@ async fn run_async(cfg: VdsConfig, config_path: PathBuf) {
 #[allow(clippy::too_many_arguments)]
 async fn session(
     cfg: &VdsConfig,
+    server: &str,
     url: &crate::ctrl_http::Url,
     tls: Option<&Connector>,
     node: &Node,
@@ -333,7 +354,7 @@ async fn session(
                 if let Some(e) = grpc_error(&headers) {
                     return Err(e);
                 }
-                crate::vds::record_connection(true, None);
+                crate::vds::record_connection_to(server);
             }
             Some(UpResp::Data(chunk)) => {
                 decoder.push(&chunk);

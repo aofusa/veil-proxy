@@ -12,6 +12,7 @@ Admin APIは設定可能なプレフィックス（デフォルト: `/__admin`�
 |---------|------|------|
 | `GET` | `/__admin/config` | 現在の設定をJSONダンプ（secretはマスク） |
 | `GET` | `/__admin/stats` | ランタイム統計（uptime等） |
+| `GET` | `/__admin/vds` | VDS クライアントの状態: 接続・制御プレーン・適用中の版・最後の NACK の理由・回数（F-211。VDS 無効時は `{"enabled":false}`） |
 | `POST` | `/__admin/reload` | 設定ホットリロードをトリガー |
 | `POST` | `/__admin/tls/reload` | TLS証明書ホットリロードをトリガー |
 | `POST` | `/__admin/cache/purge` | キャッシュPurge（詳細は下記参照） |

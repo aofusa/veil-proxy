@@ -4328,6 +4328,15 @@ where
     (status, sent, req_size)
 }
 
+/// 管理 API の `GET {path_prefix}/vds`（F-211）。VDS が無効・未対応のビルドでは `{"enabled":false}`。
+#[cfg(feature = "admin")]
+fn admin_vds_json() -> String {
+    #[cfg(feature = "vds")]
+    return crate::vds::status_json();
+    #[cfg(not(feature = "vds"))]
+    return "{\"enabled\":false}".to_string();
+}
+
 /// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す。
 #[cfg(all(feature = "http2", feature = "admin"))]
 fn h2_admin_response(
@@ -4375,7 +4384,11 @@ fn h2_admin_response(
     let path_suffix = &path_str[admin_config.path_prefix.len()..];
     let is_known_endpoint = matches!(
         (method, path_suffix),
-        (b"GET", "/config") | (b"GET", "/stats") | (b"POST", "/reload") | (b"POST", "/tls/reload")
+        (b"GET", "/config")
+            | (b"GET", "/stats")
+            | (b"GET", "/vds")
+            | (b"POST", "/reload")
+            | (b"POST", "/tls/reload")
     );
     if !is_known_endpoint {
         return None;
@@ -4396,6 +4409,7 @@ fn h2_admin_response(
                 let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
                 (200, json.into_bytes())
             }
+            (b"GET", "/vds") => (200, admin_vds_json().into_bytes()),
             (b"POST", "/reload") => {
                 use std::sync::atomic::Ordering;
                 RELOAD_FLAG.store(true, Ordering::Relaxed);
@@ -5840,6 +5854,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                             (method_bytes.as_ref(), path_suffix),
                             (b"GET", "/config")
                                 | (b"GET", "/stats")
+                                | (b"GET", "/vds")
                                 | (b"POST", "/reload")
                                 | (b"POST", "/tls/reload")
                         );
@@ -5880,6 +5895,16 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                             // PROXY_START_TIME を初回アクセスで初期化
                                             let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
                                             let body = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                                            let mut resp = format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                body.len()
+                                            ).into_bytes();
+                                            resp.extend_from_slice(body.as_bytes());
+                                            resp
+                                        }
+                                        (b"GET", "/vds") => {
+                                            // F-211: VDS の状態（接続・適用中の版・最後の NACK の理由・更新回数）
+                                            let body = admin_vds_json();
                                             let mut resp = format!(
                                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                                 body.len()

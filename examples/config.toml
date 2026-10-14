@@ -1371,6 +1371,7 @@ revalidate_mtime = false
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
 #   veil_allocator_bytes{state}             veil-alloc のメモリ量（active / dirty / huge / purged_total。veil-alloc ビルドのみ）
 #   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
+#   veil_proxy_vds_connected 等             VDS の状態（[vds] 有効時のみ。F-211、[vds] の節を参照）
 #
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"
@@ -2581,6 +2582,9 @@ revalidate_mtime = false
 # # 制御プレーンの URL（http://host:port[/base] または https://...）。gRPC は h2c / TLS（ALPN h2）で
 # # {server}/veil.vds.v1.VeilDiscoveryService/StreamSnapshots、REST は {server}/v1/discovery へ POST する
 # server = ""
+# # 制御プレーンを複数（冗長化、F-211）。指定すると server より優先。つながらない・ストリームが失敗したら
+# # 次を試し、全部を 1 周したら retry_* のバックオフ
+# servers = ["http://cp-1:18000", "http://cp-2:18000"]
 # # 転送: "grpc"（双方向ストリーム。版が変わるとすぐ届く）または "rest"（長輪詢）
 # transport = "grpc"
 # # gRPC の接続の TCP キープアライブ（秒、0 で無効）。押し出しが無い間の相手の消失を検知する
@@ -2603,6 +2607,13 @@ revalidate_mtime = false
 # # 応答本文（gRPC は 1 メッセージ）の上限（バイト）とリソース数の上限
 # max_response_bytes = 16777216
 # max_resources = 10000
+# # 起動時に最初のスナップショットを適用するまでリスナーを開かずに待つ上限（ミリ秒、0 = 待たない。F-211）。
+# # 期限を過ぎたら config.toml の設定で開始する（k8s のサイドカーで古い設定のまま要求を受けないため）
+# initial_fetch_timeout_ms = 0
+#
+# 状態は Prometheus（veil_proxy_vds_connected・veil_proxy_vds_applied_info{version_info}・
+# veil_proxy_vds_updates_total{result="applied|rejected"}・veil_proxy_vds_last_update_timestamp_seconds）と
+# 管理 API の GET {[admin] path_prefix}/vds（JSON）で見られます（F-211）。
 
 # ==========================================
 # ACME（F-05）: 証明書の自動発行・更新（HTTP-01）

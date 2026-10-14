@@ -33,7 +33,8 @@ token_file = "/etc/veil/vds/token"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `false` | start the VDS client thread |
-| `server` | `""` | control plane base URL: `http://host:port[/base]` or `https://...` (required when enabled) |
+| `server` | `""` | control plane base URL: `http://host:port[/base]` or `https://...` (required when enabled, unless `servers` is set) |
+| `servers` | `[]` | several control planes for redundancy (F-211). Takes precedence over `server`. When a connection or stream fails veil tries the next one right away; after a full round it waits with the retry backoff |
 | `transport` | `"grpc"` | `"grpc"`: bidirectional stream (h2c or TLS with ALPN h2); `"rest"`: long polling of `{server}/v1/discovery` |
 | `keepalive_secs` | `30` | TCP keepalive of the gRPC connection (`0` = off) |
 | `node_id` | `""` | identity sent to the control plane; empty = the host name |
@@ -46,10 +47,32 @@ token_file = "/etc/veil/vds/token"
 | `retry_max_ms` | `30000` | maximum retry delay |
 | `max_response_bytes` | `16777216` | reject responses (gRPC: messages) larger than this (16 MiB) |
 | `max_resources` | `10000` | reject snapshots with more resources than this |
+| `initial_fetch_timeout_ms` | `0` | at startup, wait up to this long for the first snapshot before opening the listeners (`0` = do not wait). When it expires veil starts with the file configuration. Useful for a Kubernetes sidecar that must not serve stale routes (F-211) |
 
 Because VDS is just configuration, it also accepts `VEIL_OVERRIDE_<n>` and `--override`
 (see [Running](running.md#configuration-override-via-environment-variables-veil_override_n)), for example
 `VEIL_OVERRIDE_1='vds.server = "http://cp:18000"'`.
+
+## Status: metrics and admin API
+
+The state of the client (F-211) is exported to Prometheus (`[prometheus] enabled = true`) when VDS is enabled:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `veil_proxy_vds_connected` | gauge | `1` while a control plane answers, `0` otherwise |
+| `veil_proxy_vds_applied_info{version_info}` | gauge | always `1`; the label is the snapshot version being served |
+| `veil_proxy_vds_updates_total{result="applied"\|"rejected"}` | counter | snapshots applied (ACK) and rejected (NACK) |
+| `veil_proxy_vds_last_update_timestamp_seconds` | gauge | Unix time of the last snapshot applied or rejected |
+
+The [admin API](admin-api.md) returns the same as JSON at `GET {path_prefix}/vds` (default `/__admin/vds`):
+
+```json
+{"enabled":true,"connected":true,"server":"http://cp-1:18000","version_info":"3f2a9c1d04b7e612",
+ "last_error":null,"updates_acked":4,"updates_nacked":1,"last_update_unix":1791700000}
+```
+
+`last_error` is the reason of the last rejected snapshot (or the last connection error). Without VDS the endpoint
+returns `{"enabled":false}`.
 
 ## What a snapshot controls
 
@@ -318,6 +341,8 @@ Deployment, VDS control plane, Istio/Linkerd overlays) is in [`deploy/kubernetes
 | Symptom | Check |
 |---------|-------|
 | nothing happens | `[vds] enabled = true`, a valid `server` URL, and the `[VDS]` lines in the log (`subscribing to ...`) |
+| which version is running / why was it rejected | `GET /__admin/vds` or the `veil_proxy_vds_*` metrics |
+| startup takes `initial_fetch_timeout_ms` | no control plane answered in time (`no snapshot within initial_fetch_timeout_ms` in the log); veil then started with the file configuration |
 | `rejected snapshot` warnings | the message is the validation error; fix the snapshot (the previous configuration is still serving) |
 | `control plane returned 401` / `grpc-status 16` | `token_file` content does not match the server's token |
 | `stream ... failed` with `HTTP 404` / `did not negotiate h2` | the control plane does not speak gRPC: set `transport = "rest"` (for example with `tools/vds/vds_server.py`) |

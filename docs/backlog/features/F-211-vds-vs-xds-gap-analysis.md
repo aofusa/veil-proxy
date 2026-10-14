@@ -1,6 +1,6 @@
 # F-211: VDS の機能強化（Envoy の xDS と比べた不足機能の洗い出しと計画）
 
-**状態: 未着手（洗い出し済み 2026-10-14。実装は下の優先度順に、着手時に項目ごとのチケットに切る）**
+**状態: 1〜3 完了（feat/api-roadmap-impl、2026-10-14）。4 以降は未着手（着手時に項目ごとのチケットに切る）**
 
 ## 今の VDS（F-04・F-199、`src/vds.rs`・`src/vds_grpc.rs`・`docs/guide/vds.md`）
 
@@ -63,3 +63,21 @@
 ## 関連
 
 F-04・F-199（今の VDS）、`vds-xds-dynamic-config.md`（当初の構想）、F-196（k8s サイドカー）、F-156（ワーカーをまたぐ共有状態）。
+
+## 実装（1〜3、2026-10-14）
+
+1. **状態**: `VdsStatus` に `server`（今つないでいる制御プレーン）・`last_update_unix` を足し、`vds::status_json()` を
+   管理 API の `GET {path_prefix}/vds`（HTTP/1.1・HTTP/2 の管理 API、`admin` feature。VDS 無効なら `{"enabled":false}`）で返す。
+   Prometheus は `veil_proxy_vds_connected`・`veil_proxy_vds_applied_info{version_info}`・
+   `veil_proxy_vds_updates_total{result}`・`veil_proxy_vds_last_update_timestamp_seconds`（VDS のスレッドが接続・適用・拒否の
+   たびに更新し、スクレイプ時には何もしない。`[vds]` 有効時だけ登録）。
+2. **冗長化**: `[vds] servers = [..]`（`server` より優先）。`ServerRotation` で、失敗したらすぐ次の制御プレーンへ、全部を 1 周
+   したら従来のバックオフ。gRPC・REST の両方。制御プレーンを替えたら nonce は捨てる（版は SotW なのでそのまま送る）。
+3. **初回の待ち**: `[vds] initial_fetch_timeout_ms`（既定 0 = 待たない。Envoy の `initial_fetch_timeout`）。`spawn_if_enabled` が
+   VDS のスレッドを起動した後、最初の適用（Condvar）か期限まで起動を止める。リスナーはその後で開く。期限切れは警告して
+   ファイルの設定で開始する。
+
+試験: `vds::tests::server_list_and_rotation`、`tests/standalone_e2e.rs` の `f211_vds_failover_status_metrics_admin`
+（gRPC・REST の両方で、1 台目を止めると 2 台目の内容が届く・`/__admin/vds` と `/metrics` の値・認証）と
+`f211_vds_initial_fetch_wait`（制御プレーンが後から起動するまでリスナーが開かず、最初の応答から VDS の内容／期限で
+ファイルの設定のまま開始）。文書: `docs/guide/vds.md`・`admin-api.md`・`observability.md`（英日）、`examples/config.toml`。
