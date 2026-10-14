@@ -894,6 +894,245 @@ retry_max_ms = 1000
     drop(cp);
 }
 
+/// F-211: 制御プレーンの冗長化（1 台目を止めると 2 台目から配信が続く）と、状態のメトリクス・管理 API。
+#[cfg(feature = "vds")]
+#[test]
+fn f211_vds_failover_status_metrics_admin() {
+    for transport in ["grpc", "rest"] {
+        vds_failover(transport);
+    }
+}
+
+#[cfg(feature = "vds")]
+fn vds_failover(transport: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [("base", "base"), ("a", "A"), ("b", "B")] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.html"), body).unwrap();
+    }
+    let route = |p: &std::path::Path| {
+        format!(
+            "[[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"File\"\npath = \"{}\"\n",
+            tp(p)
+        )
+    };
+    // 2 台の制御プレーンは別の内容を配る（どちらから届いたかが本文でわかる）
+    let snap1 = dir.path().join("snap1.toml");
+    let snap2 = dir.path().join("snap2.toml");
+    std::fs::write(&snap1, route(&dir.path().join("a"))).unwrap();
+    std::fs::write(&snap2, route(&dir.path().join("b"))).unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "s3cret\n").unwrap();
+    let (p1, p2) = (free_port(), free_port());
+    let cp1 = spawn_vds_control_plane(VdsControlPlane::Rust, &snap1, p1, &token, None);
+    let cp2 = spawn_vds_control_plane(VdsControlPlane::Rust, &snap2, p2, &token, None);
+
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "info"
+[admin]
+enabled = true
+secret = "adm"
+allowed_ips = ["127.0.0.1"]
+[prometheus]
+enabled = true
+path = "/metrics"
+allowed_ips = ["127.0.0.1"]
+[vds]
+enabled = true
+transport = "{transport}"
+servers = ["http://127.0.0.1:{p1}", "http://127.0.0.1:{p2}"]
+node_id = "e2e"
+token_file = "{token}"
+poll_timeout_secs = 2
+retry_initial_ms = 100
+retry_max_ms = 500
+{base_route}"#,
+        token = tp(&token),
+        base_route = route(&dir.path().join("base")),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    let body_is = |want: &'static str| {
+        move || {
+            http1_get(port, "/index.html")
+                .map(|r| r.text() == want)
+                .unwrap_or(false)
+        }
+    };
+    let admin_vds = || {
+        http1_request(
+            port,
+            "GET",
+            "/__admin/vds",
+            &[("Authorization", "Bearer adm")],
+            b"",
+        )
+        .map(|r| r.text())
+        .unwrap_or_default()
+    };
+    assert!(
+        wait_until(Duration::from_secs(15), body_is("A")),
+        "{}: snapshot from the first control plane not applied; log:\n{}",
+        transport,
+        veil.log()
+    );
+    let s = admin_vds();
+    assert!(
+        s.contains("\"enabled\":true")
+            && s.contains("\"connected\":true")
+            && s.contains(&format!("127.0.0.1:{}", p1))
+            && s.contains("\"updates_acked\":1"),
+        "{}: /__admin/vds: {}",
+        transport,
+        s
+    );
+    // 認証が要る
+    let r = http1_get(port, "/__admin/vds").unwrap();
+    assert_eq!(r.status, 401, "{}", r.text());
+
+    // 1 台目を止める → 2 台目から配信が続く
+    drop(cp1);
+    assert!(
+        wait_until(Duration::from_secs(20), body_is("B")),
+        "{}: did not fail over to the second control plane; log:\n{}",
+        transport,
+        veil.log()
+    );
+    let s = admin_vds();
+    assert!(
+        s.contains(&format!("127.0.0.1:{}", p2)) && s.contains("\"updates_acked\":2"),
+        "{}: /__admin/vds after failover: {}",
+        transport,
+        s
+    );
+    let m = http1_get(port, "/metrics")
+        .map(|r| r.text())
+        .unwrap_or_default();
+    for want in [
+        "veil_proxy_vds_connected 1",
+        "veil_proxy_vds_updates_total{result=\"applied\"} 2",
+        "veil_proxy_vds_updates_total{result=\"rejected\"} 0",
+        "veil_proxy_vds_applied_info{version_info=",
+        "veil_proxy_vds_last_update_timestamp_seconds ",
+    ] {
+        assert!(
+            m.contains(want),
+            "{}: metrics lack {:?}:\n{}",
+            transport,
+            want,
+            m
+        );
+    }
+    drop(cp2);
+}
+
+/// F-211: `initial_fetch_timeout_ms` の間は最初のスナップショットが届くまでリスナーを開かない。
+/// 期限を過ぎたらファイルの設定で開始する。
+#[cfg(feature = "vds")]
+#[test]
+fn f211_vds_initial_fetch_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [("base", "base"), ("a", "A")] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.html"), body).unwrap();
+    }
+    let route = |p: &std::path::Path| {
+        format!(
+            "[[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"File\"\npath = \"{}\"\n",
+            tp(p)
+        )
+    };
+    let snap = dir.path().join("snap.toml");
+    std::fs::write(&snap, route(&dir.path().join("a"))).unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "s3cret\n").unwrap();
+    let write_config = |name: &str, port: u16, cp_port: u16, wait_ms: u64| {
+        let config = format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "info"
+[vds]
+enabled = true
+server = "http://127.0.0.1:{cp_port}"
+node_id = "e2e"
+token_file = "{token}"
+retry_initial_ms = 100
+retry_max_ms = 300
+initial_fetch_timeout_ms = {wait_ms}
+{base_route}"#,
+            token = tp(&token),
+            base_route = route(&dir.path().join("base")),
+        );
+        let p = dir.path().join(name);
+        std::fs::write(&p, config).unwrap();
+        p
+    };
+
+    // 1. 制御プレーンが後から起動する: それまでリスナーは開かず、開いたときには VDS の内容
+    let (port, cp_port) = (free_port(), free_port());
+    let cfg = write_config("wait.toml", port, cp_port, 60_000);
+    let veil = VeilProcess::spawn(&cfg, &[], &[]);
+    assert!(
+        !wait_for_port(port, Duration::from_secs(2)),
+        "listener opened before the initial snapshot; log:\n{}",
+        veil.log()
+    );
+    let cp = spawn_vds_control_plane(VdsControlPlane::Rust, &snap, cp_port, &token, None);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "listener did not open after the initial snapshot; log:\n{}",
+        veil.log()
+    );
+    let r = http1_get(port, "/index.html").unwrap();
+    assert_eq!(
+        r.text(),
+        "A",
+        "the first response must use the VDS snapshot"
+    );
+    drop(veil);
+    drop(cp);
+
+    // 2. 制御プレーンが無い: 期限でファイルの設定のまま開始する
+    let (port, cp_port) = (free_port(), free_port());
+    let cfg = write_config("timeout.toml", port, cp_port, 1_500);
+    let start = std::time::Instant::now();
+    let veil = VeilProcess::spawn(&cfg, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "listener did not open after initial_fetch_timeout_ms; log:\n{}",
+        veil.log()
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(1_400),
+        "listener opened before initial_fetch_timeout_ms"
+    );
+    assert_eq!(http1_get(port, "/index.html").unwrap().text(), "base");
+    assert!(
+        veil.log().contains("initial_fetch_timeout_ms"),
+        "{}",
+        veil.log()
+    );
+}
+
 /// 子プロセスを Drop で止める（VDS の制御プレーン用）。
 #[cfg(feature = "vds")]
 struct ChildGuard(std::process::Child);

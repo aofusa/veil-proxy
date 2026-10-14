@@ -1,13 +1,17 @@
 //! veil API サーバライブラリの Python バインディング（F-194）。
 //!
 //! Python 側（`python/veil/__init__.py`）がデコレータでルートを集め、`register_route` で
-//! ここへ登録し、`run` で起動する。リクエストごとに Python の dispatcher を GIL 下で呼ぶ。
+//! ここへ登録し、`run` で起動する。リクエストごとにルートの呼び出し口（`Route._call`）を GIL 下で
+//! [`native::NativeRequest`] 1 つを渡して呼び、戻り値を Rust で応答にする（F-212）。
+
+mod ext;
+mod native;
 
 use bytes::Bytes;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::{Arc, Mutex};
+use veil::api::bridge::HandlerContext;
 use veil::api::{App, Config as VeilConfig, HandlerFn, OperationMeta, Request, Response};
 
 /// `register_route` で登録された、起動前のルート。
@@ -17,9 +21,69 @@ struct PendingRoute {
     handler_id: u64,
     offload: bool,
     openapi: Option<serde_json::Value>,
+    /// 既定のステータス（デコレータの `status_code`）
+    status_code: u16,
+    /// 要求本文をストリーミングで受ける（`stream_body=True`、F-210）
+    stream_body: bool,
 }
 
 static PENDING: Mutex<Vec<PendingRoute>> = Mutex::new(Vec::new());
+
+/// gRPC・L4 の登録（`run` までの間に溜める。F-210）。
+enum PendingExtra {
+    Grpc {
+        path: String,
+        handler_id: u64,
+    },
+    L4Tcp {
+        name: String,
+        listen: String,
+        handler_id: u64,
+    },
+    L4Udp {
+        name: String,
+        listen: String,
+        handler_id: u64,
+    },
+    GrpcHealth,
+}
+
+static PENDING_EXTRA: Mutex<Vec<PendingExtra>> = Mutex::new(Vec::new());
+
+/// gRPC のメソッドを登録する（`handlers[handler_id]` は `handle(call) -> (code, message)` を持つ）。
+#[pyfunction]
+fn register_grpc(path: String, handler_id: u64) {
+    PENDING_EXTRA
+        .lock()
+        .unwrap()
+        .push(PendingExtra::Grpc { path, handler_id });
+}
+
+/// `grpc.health.v1.Health`（Check・Watch）を登録する。
+#[pyfunction]
+fn register_grpc_health() {
+    PENDING_EXTRA.lock().unwrap().push(PendingExtra::GrpcHealth);
+}
+
+/// L4 の TCP リスナー（`handlers[handler_id]` はプロトコルを作る呼び出し可能オブジェクト）。
+#[pyfunction]
+fn register_l4_tcp(name: String, listen: String, handler_id: u64) {
+    PENDING_EXTRA.lock().unwrap().push(PendingExtra::L4Tcp {
+        name,
+        listen,
+        handler_id,
+    });
+}
+
+/// L4 の UDP リスナー（`handlers[handler_id]` は `f(data, peer) -> bytes | None`）。
+#[pyfunction]
+fn register_l4_udp(name: String, listen: String, handler_id: u64) {
+    PENDING_EXTRA.lock().unwrap().push(PendingExtra::L4Udp {
+        name,
+        listen,
+        handler_id,
+    });
+}
 
 /// 設定（`veil::api::Config` のラッパ）。
 #[pyclass(name = "Config", module = "veil._veil")]
@@ -90,13 +154,16 @@ impl PyConfig {
 
 /// ルートを登録する（`run` までの間に溜める）。
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false))]
+#[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
 fn register_route(
     path: String,
     methods: Vec<String>,
     handler_id: u64,
     offload: bool,
     openapi_json: Option<String>,
+    status_code: u16,
+    stream_body: bool,
 ) -> PyResult<()> {
     let openapi = match openapi_json {
         Some(s) => Some(
@@ -111,45 +178,43 @@ fn register_route(
         handler_id,
         offload,
         openapi,
+        status_code,
+        stream_body,
     });
     Ok(())
 }
 
-fn lossy(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
+/// 1 ルートの Python 側の呼び出し口（`Route._call` と、扱わない戻り値の変換 `Route.to_response`）。
+struct PyRoute {
+    call: Py<PyAny>,
+    fallback: Py<PyAny>,
+    status: u16,
 }
 
-/// Python の dispatcher を GIL 下で呼び、応答を組み立てる。
-fn call_python(dispatcher: &Py<PyAny>, handler_id: u64, req: &Request) -> Response {
+/// ルートの呼び出し口を GIL 下で呼び、応答を組み立てる。`ctx` はハンドラ用プールで動くとき（ストリーミングの
+/// 応答・要求本文の順次受信ができる。F-210）。
+fn call_python(route: &PyRoute, req: Request, ctx: Option<&mut HandlerContext>) -> Response {
     Python::with_gil(|py| {
         let r = (|| -> PyResult<Response> {
-            let headers = PyList::empty(py);
-            for (n, v) in req.headers() {
-                headers.append((lossy(n), lossy(v)))?;
+            let native_req = native::NativeRequest::new(req);
+            let ctx_ptr = ctx.map(|c| c as *mut HandlerContext);
+            if let Some(p) = ctx_ptr {
+                native_req
+                    .ctx
+                    .store(p as usize, std::sync::atomic::Ordering::Release);
             }
-            let params = PyDict::new(py);
-            for (name, _) in req.params().iter() {
-                if let Some(v) = req.param(name) {
-                    params.set_item(&**name, v.as_ref())?;
-                }
-            }
-            let args = (
-                handler_id,
-                req.method(),
-                req.path(),
-                req.query(),
-                headers,
-                PyBytes::new(py, req.body()),
-                params,
-                req.client_ip().to_string(),
-            );
-            let out = dispatcher.call1(py, args)?;
-            let (status, hdrs, body): (u16, Vec<(String, String)>, Vec<u8>) = out.extract(py)?;
-            let mut resp = Response::new(status).with_body(Bytes::from(body));
-            for (n, v) in hdrs {
-                resp = resp.with_header(Bytes::from(n), Bytes::from(v));
-            }
-            Ok(resp)
+            let req = Py::new(py, native_req)?;
+            let out = route.call.call1(py, (req.clone_ref(py),));
+            let resp = out.and_then(|out| {
+                // SAFETY: ctx_ptr は call_blocking の閉包が持つ HandlerContext（この呼び出しの間有効）
+                let ctx = ctx_ptr.map(|p| unsafe { &mut *p });
+                native::to_response(py, out.into_bound(py), route.status, &route.fallback, ctx)
+            });
+            // 呼び出しの外で要求本文を読まれないように外す
+            req.borrow(py)
+                .ctx
+                .store(0, std::sync::atomic::Ordering::Release);
+            resp
         })();
         match r {
             Ok(resp) => resp,
@@ -168,51 +233,94 @@ fn internal_error() -> Response {
     .with_status(500)
 }
 
-fn make_handler(dispatcher: Py<PyAny>, handler_id: u64, offload: bool) -> HandlerFn {
-    let dispatcher = Arc::new(dispatcher);
+fn make_handler(route: PyRoute, offload: bool) -> HandlerFn {
+    let route = Arc::new(route);
     Arc::new(move |req: Request| {
-        let d = Arc::clone(&dispatcher);
+        let r = Arc::clone(&route);
         Box::pin(async move {
             if offload {
                 // GIL を握る呼び出しはイベントループ（ワーカー）を止めないようハンドラ用プールへ退避する。
-                match veil::runtime::offload::offload_handler(move || {
-                    call_python(&d, handler_id, &req)
+                // 応答のストリーミング・要求本文の順次受信は call_blocking の文脈で（F-210）
+                veil::api::bridge::call_blocking(req, move |req, ctx| {
+                    call_python(&r, req, Some(ctx))
                 })
                 .await
-                {
-                    Some(r) => r,
-                    None => internal_error(),
-                }
             } else {
-                call_python(&d, handler_id, &req)
+                call_python(&r, req, None)
             }
         })
     })
 }
 
 /// サーバを起動し、停止（SIGINT/SIGTERM・`shutdown()`）までブロックする。GIL は解放する。
+/// `handlers` は handler_id → Python の `Route`（`_call` と `to_response` を持つ）。
 #[pyfunction]
-fn run(py: Python<'_>, config: PyConfig, dispatcher: Py<PyAny>) -> PyResult<()> {
+fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<()> {
     let routes = std::mem::take(&mut *PENDING.lock().unwrap());
     let mut app = App::new().config(config.inner).without_macro_routes();
     for (i, r) in routes.into_iter().enumerate() {
         let methods: Vec<&str> = r.methods.iter().map(|s| s.as_str()).collect();
-        let func = make_handler(dispatcher.clone_ref(py), r.handler_id, r.offload);
+        let route = handlers
+            .get(r.handler_id as usize)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", r.handler_id)))?
+            .bind(py);
+        let func = make_handler(
+            PyRoute {
+                call: route.getattr("_call")?.unbind(),
+                fallback: route.getattr("to_response")?.unbind(),
+                status: r.status_code,
+            },
+            r.offload,
+        );
         let meta = OperationMeta {
             operation_id: format!("py_{}", r.handler_id),
             raw: r.openapi,
             hidden: false,
             ..Default::default()
         };
-        app = app.route_fn(
-            &format!("py_{}_{}", i, r.handler_id),
-            &methods,
-            &r.path,
-            func,
-            meta,
-        );
+        let name = format!("py_{}_{}", i, r.handler_id);
+        app = if r.stream_body {
+            app.route_fn_streaming(&name, &methods, &r.path, func, meta)
+        } else {
+            app.route_fn(&name, &methods, &r.path, func, meta)
+        };
     }
-    drop(dispatcher);
+    let handler = |id: u64| -> PyResult<Py<PyAny>> {
+        handlers
+            .get(id as usize)
+            .map(|h| h.clone_ref(py))
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", id)))
+    };
+    for e in std::mem::take(&mut *PENDING_EXTRA.lock().unwrap()) {
+        app = match e {
+            PendingExtra::Grpc { path, handler_id } => {
+                let h = handler(handler_id)?.bind(py).getattr("handle")?.unbind();
+                app.grpc_blocking(&path, move |call| ext::run_grpc(&h, call))
+            }
+            PendingExtra::L4Tcp {
+                name,
+                listen,
+                handler_id,
+            } => {
+                let factory = handler(handler_id)?;
+                app.l4_tcp_blocking(&name, &listen, move |peer, out| {
+                    ext::PySession::connect(&factory, peer, out)
+                })
+            }
+            PendingExtra::L4Udp {
+                name,
+                listen,
+                handler_id,
+            } => {
+                let f = handler(handler_id)?;
+                app.l4_udp_blocking(&name, &listen, move |data, peer| {
+                    ext::run_udp(&f, data, peer)
+                })
+            }
+            PendingExtra::GrpcHealth => app.grpc_health(),
+        };
+    }
+    drop(handlers);
     py.allow_threads(move || app.run())
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -226,8 +334,18 @@ fn shutdown() {
 #[pymodule]
 fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConfig>()?;
+    m.add_class::<native::NativeRequest>()?;
+    m.add_class::<native::NativeHeaders>()?;
+    m.add_class::<native::NativeBodyIter>()?;
+    m.add_class::<ext::NativeGrpcCall>()?;
+    m.add_class::<ext::NativeTransport>()?;
+    m.add_function(wrap_pyfunction!(register_grpc, m)?)?;
+    m.add_function(wrap_pyfunction!(register_grpc_health, m)?)?;
+    m.add_function(wrap_pyfunction!(register_l4_tcp, m)?)?;
+    m.add_function(wrap_pyfunction!(register_l4_udp, m)?)?;
     m.add_function(wrap_pyfunction!(register_route, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
+    m.add_function(wrap_pyfunction!(native::_json_fast, m)?)?;
     Ok(())
 }

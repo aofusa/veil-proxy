@@ -18,3 +18,6 @@ async-graphql のスキーマを veil のハンドラとして公開する（Gra
 ## 結果（2026-10-12、feat/f188-api-library-vds-k8s）
 
 - `App::graphql(path, schema)`（POST JSON・GET クエリ文字列・バッチ・GraphiQL）。E2E でクエリ・GET・GraphiQL を確認。
+
+
+> 2026-10-14: F-207 で `graphql` feature と `App::graphql` を廃止した。async-graphql の載せ方は `examples/api/rust-graphql` を参照。

@@ -13,8 +13,10 @@ Python はハンドラ関数だけを提供する。ネイティブ拡張 ``veil
     veil.run(listen_cleartext="127.0.0.1:8000")
 """
 
+import abc
 import asyncio
 import http
+import threading
 import inspect
 import json
 import re
@@ -28,6 +30,9 @@ __all__ = [
     "JSONResponse",
     "HTTPException",
     "Headers",
+    "StreamingResponse",
+    "EventSourceResponse",
+    "Protocol",
     "route",
     "get",
     "post",
@@ -47,8 +52,10 @@ _JSON_CT = "application/json"
 # --------------------------------------------------------------------------
 
 
-class Headers:
-    """大文字小文字を区別しない読み取り専用のヘッダ辞書（同名ヘッダは受信順に保持）。"""
+class Headers(metaclass=abc.ABCMeta):
+    """大文字小文字を区別しない読み取り専用のヘッダ辞書（同名ヘッダは受信順に保持）。
+
+    サーバの中では Rust 側の ``veil._veil.NativeHeaders``（同じメソッド）が渡る（F-212）。"""
 
     def __init__(self, items=()):
         self._items = [(str(k), str(v)) for k, v in items]
@@ -93,8 +100,11 @@ class Headers:
         return "Headers(%r)" % (self._items,)
 
 
-class Request:
-    """ハンドラに渡るリクエスト。"""
+class Request(metaclass=abc.ABCMeta):
+    """ハンドラに渡るリクエスト。
+
+    サーバの中では Rust 側の ``veil._veil.NativeRequest``（同じ属性・メソッド。触った属性だけを作る）が渡り、
+    ``isinstance(req, veil.Request)`` は真（F-212）。"""
 
     def __init__(self, method="GET", path="/", query="", headers=(), body=b"", params=None, client_ip=""):
         self.method = method
@@ -110,8 +120,7 @@ class Request:
     def query_params(self):
         """クエリの辞書（同名キーは最初の値）。"""
         if self._query_params is None:
-            parsed = urllib.parse.parse_qs(self.query, keep_blank_values=True)
-            self._query_params = {k: v[0] for k, v in parsed.items()}
+            self._query_params = _query_params(self.query)
         return self._query_params
 
     def json(self):
@@ -119,6 +128,30 @@ class Request:
 
     def text(self):
         return self.body.decode("utf-8", errors="replace")
+
+    def stream(self):
+        """本文を届いた順に返す反復子（サーバの中で ``stream_body=True`` のルートなら届いた断片ごと。
+        ここでは全量を 1 回）。"""
+        if self.body:
+            yield self.body
+
+
+def _query_params(query):
+    """クエリの辞書（同名キーは最初の値）。``Request.query_params`` と ``NativeRequest`` が共有する。"""
+    parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
+    return {k: v[0] for k, v in parsed.items()}
+
+
+_LOOPS = threading.local()
+
+
+def _run_coro(coro):
+    """``async def`` のハンドラをスレッドごとに 1 つのイベントループで動かす（要求ごとに作らない。F-212）。"""
+    loop = getattr(_LOOPS, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _LOOPS.loop = loop
+    return loop.run_until_complete(coro)
 
 
 def _json_default(o):
@@ -152,6 +185,95 @@ class Response:
 
     def _triple(self):
         return (self.status, self.headers, self.body)
+
+
+def _aiter_sync(agen):
+    """非同期反復子を、スレッドのイベントループで回す同期の反復子にする（F-210）。"""
+    it = agen.__aiter__()
+    while True:
+        try:
+            yield _run_coro(it.__anext__())
+        except StopAsyncIteration:
+            return
+
+
+class StreamingResponse(Response):
+    """本文を断片ごとに送る応答（F-210）。``content`` は bytes・str を返す反復子・ジェネレータ・非同期反復子。
+    サーバの中では断片が届いた順にクライアントへ送られる（ハンドラ用プールのスレッドで反復する）。
+    ``trailers`` は本文の後に送るトレーラ（``[(name, value)]``）。"""
+
+    def __init__(self, content, status=200, headers=None, media_type=None, trailers=None):
+        super().__init__(b"", status, headers, media_type)
+        self.content = content
+        self.trailers = list(trailers) if trailers else None
+
+    def _iter(self):
+        c = self.content
+        if hasattr(c, "__aiter__"):
+            return _aiter_sync(c)
+        return iter(c)
+
+    @property
+    def body(self):
+        """本文全体（単体テスト・``offload=False`` 用。サーバの中のストリーミングでは使わない）。"""
+        if self._body is None:
+            self._body = b"".join(x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in self._iter())
+        return self._body
+
+    @body.setter
+    def body(self, v):
+        self._body = None if v == b"" else v
+
+
+def _sse_event(item):
+    if isinstance(item, dict) and set(item) <= {"event", "data", "id", "retry"} and "data" in item:
+        out = []
+        for k in ("event", "id", "retry"):
+            if k in item:
+                out.append("%s: %s\n" % (k, item[k]))
+        data = item["data"]
+        if not isinstance(data, str):
+            data = _dumps(data).decode()
+        out.extend("data: %s\n" % line for line in data.split("\n"))
+        return "".join(out) + "\n"
+    if not isinstance(item, str):
+        item = _dumps(item).decode()
+    return "".join("data: %s\n" % line for line in item.split("\n")) + "\n"
+
+
+class EventSourceResponse(StreamingResponse):
+    """Server-Sent Events（``text/event-stream``）。各要素は str（``data:`` 行）・JSON にできる値、または
+    ``{"event": ..., "data": ..., "id": ..., "retry": ...}``。"""
+
+    def __init__(self, content, status=200, headers=None):
+        super().__init__(content, status, headers, "text/event-stream")
+        hs = [k.lower() for k, _ in self.headers]
+        if "cache-control" not in hs:
+            self.headers.append(("cache-control", "no-cache"))
+
+    def _iter(self):
+        return (_sse_event(x) for x in super()._iter())
+
+
+def _stream_of(result, status):
+    """ジェネレータ・非同期ジェネレータを返したハンドラをストリーミングの応答にする（Rust から呼ぶ）。"""
+    if inspect.isgenerator(result) or inspect.isasyncgen(result):
+        return StreamingResponse(result, status, media_type="text/plain; charset=utf-8")
+    return None
+
+
+class Protocol:
+    """L4（TCP）のハンドラ（asyncio.Protocol と同じ名前のメソッド。F-210）。接続ごとに 1 つ作られ、
+    コールバックはハンドラ用プールのスレッドで 1 つずつ順に呼ばれる。``transport.write`` はコールバックの中でだけ。"""
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data):
+        pass
+
+    def connection_lost(self, exc):
+        pass
 
 
 class JSONResponse(Response):
@@ -410,8 +532,9 @@ def _is_validation_error(exc):
 class Route:
     """登録された 1 ルート。``handle()`` は Rust 非依存で単体テストできる。"""
 
-    def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code):
+    def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False):
         self.func = func
+        self.stream_body = stream_body
         self.path = path
         self.methods = [m.upper() for m in methods]
         self.offload = offload
@@ -423,6 +546,7 @@ class Route:
         self.params = _build_params(func, set(self.path_names))
         self.is_async = inspect.iscoroutinefunction(func)
         self._hints = _resolve_hints(func)
+        self._call = self._make_call()
 
     # ---- 引数束縛 ----
 
@@ -503,6 +627,9 @@ class Route:
         extra = None
         if isinstance(result, Response):
             return result
+        stream = _stream_of(result, status)
+        if stream is not None:
+            return stream
         if isinstance(result, tuple) and len(result) in (2, 3):
             if len(result) == 3:
                 result, status, extra = result
@@ -530,12 +657,71 @@ class Route:
             kwargs = self.bind(req)
             result = self.func(**kwargs)
             if inspect.iscoroutine(result):
-                result = asyncio.run(result)
+                result = _run_coro(result)
             return self.to_response(result)
         except _ValidationFailed as e:
             return JSONResponse({"detail": e.errors}, 422)
         except HTTPException as e:
             return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
+
+    # ---- サーバからの呼び出し（F-212） ----
+
+    def _make_call(self):
+        """サーバ（Rust）が要求ごとに呼ぶ関数を、引数の種類から前もって選ぶ。戻り値は変換前の値
+        （``str``・``dict``・``Response`` 等。Rust が応答にし、扱えないものは ``to_response`` に回す）。
+        検証エラー・``HTTPException`` は ``handle`` と同じ応答にする。"""
+        func = self.func
+        is_async = self.is_async
+        positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        sig = inspect.signature(func).parameters
+        if not self.params and not self.body_constraints:
+            def invoke(req):
+                return func()
+        elif (
+            len(self.params) == 1
+            and self.params[0].kind == "request"
+            and not self.body_constraints
+            and sig[self.params[0].name].kind in positional
+        ):
+            def invoke(req):
+                return func(req)
+        elif (
+            self.params
+            and not self.body_constraints
+            and all(
+                p.kind == "path" and p.ann in (str, _EMPTY) and sig[p.name].kind in positional
+                for p in self.params
+            )
+        ):
+            # パスの引数だけ（型変換無しの str）: ルートが当たればパスの引数は必ずある
+            names = tuple(p.name for p in self.params)
+            if len(names) == 1:
+                (n,) = names
+
+                def invoke(req):
+                    return func(req.params[n])
+            else:
+                def invoke(req):
+                    params = req.params
+                    return func(*[params[n] for n in names])
+        else:
+            bind = self.bind
+
+            def invoke(req):
+                return func(**bind(req))
+
+        def call(req):
+            try:
+                result = invoke(req)
+                if is_async:
+                    result = _run_coro(result)
+                return result
+            except _ValidationFailed as e:
+                return JSONResponse({"detail": e.errors}, 422)
+            except HTTPException as e:
+                return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
+
+        return call
 
     # ---- OpenAPI ----
 
@@ -646,12 +832,48 @@ class App:
         self.title = title
         self.version = version
         self.routes = []
+        self.grpc_methods = []  # (path, handler)  handler.handle(call) -> (code, message)
+        self.grpc_health = False
+        self.l4 = []  # ("tcp" | "udp", name, listen, factory_or_func)
 
-    def route(self, path, methods=None, offload=True, body_constraints=None, tags=None, summary=None, status_code=200):
+    def route(
+        self,
+        path,
+        methods=None,
+        offload=True,
+        body_constraints=None,
+        tags=None,
+        summary=None,
+        status_code=200,
+        stream_body=False,
+    ):
+        """``stream_body=True`` なら要求本文を溜めずにハンドラを呼び、``req.stream()`` で届いた順に読める（F-210）。"""
+
         def deco(func):
             self.routes.append(
-                Route(func, path, methods or ["GET"], offload, body_constraints, tags, summary, status_code)
+                Route(func, path, methods or ["GET"], offload, body_constraints, tags, summary, status_code, stream_body)
             )
+            return func
+
+        return deco
+
+    # ---- L4（F-210） ----
+
+    def l4_tcp(self, name, listen):
+        """TCP リスナー ``listen`` を開き、接続ごとに ``factory()``（``veil.Protocol`` の派生クラス等）で処理する。"""
+
+        def deco(factory):
+            self.l4.append(("tcp", name, listen, factory))
+            return factory
+
+        return deco
+
+    def l4_udp(self, name, listen):
+        """UDP リスナー ``listen`` を開き、データグラムごとに ``func(data: bytes, peer: (host, port))`` を呼ぶ
+        （bytes を返すと送信元へ返信）。"""
+
+        def deco(func):
+            self.l4.append(("udp", name, listen, func))
             return func
 
         return deco
@@ -742,11 +964,24 @@ class App:
             overrides=overrides,
             openapi=openapi,
         )
+        # サーバの中で渡る Rust 側の型も isinstance(x, veil.Request / veil.Headers) で真にする
+        Request.register(_veil.NativeRequest)
+        Headers.register(_veil.NativeHeaders)
         for r in self.routes:
             hid = len(_HANDLERS)
             _HANDLERS.append(r)
-            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json())
-        _veil.run(cfg, _dispatch)
+            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code, r.stream_body)
+        for path, handler in self.grpc_methods:
+            hid = len(_HANDLERS)
+            _HANDLERS.append(handler)
+            _veil.register_grpc(path, hid)
+        if self.grpc_health:
+            _veil.register_grpc_health()
+        for kind, name, listen, f in self.l4:
+            hid = len(_HANDLERS)
+            _HANDLERS.append(f)
+            (_veil.register_l4_tcp if kind == "tcp" else _veil.register_l4_udp)(name, listen, hid)
+        _veil.run(cfg, _HANDLERS)
 
 
 # モジュールレベルの既定 App（``@veil.get(...)`` / ``veil.run(...)``）
@@ -758,6 +993,8 @@ put = _default_app.put
 delete = _default_app.delete
 patch = _default_app.patch
 run = _default_app.run
+l4_tcp = _default_app.l4_tcp
+l4_udp = _default_app.l4_udp
 
 
 def shutdown():

@@ -43,6 +43,10 @@ Use the `path` option to change the endpoint path.
 | `veil_proxy_http_response_size_bytes` | Histogram | - | Response body size |
 | `veil_proxy_http_active_connections` | Gauge | host | Active connection count |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | Upstream health status (1=healthy, 0=unhealthy) |
+| `veil_proxy_vds_connected` | Gauge | - | VDS: 1 while a control plane answers (only with `[vds] enabled`, F-211) |
+| `veil_proxy_vds_applied_info` | Gauge | version_info | VDS: the snapshot version being served (always 1) |
+| `veil_proxy_vds_updates_total` | Counter | result | VDS: snapshots `applied` / `rejected` |
+| `veil_proxy_vds_last_update_timestamp_seconds` | Gauge | - | VDS: Unix time of the last snapshot applied or rejected |
 | `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
 | `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
 | `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |

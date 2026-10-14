@@ -5,28 +5,29 @@
 //!
 //! 状態はプロセス共有（どのワーカーで受けても同じ）。サーバ全体（`""`）は登録時に `SERVING`。
 
-use super::{Request, Response, Status};
+use super::{wire, Codec, Request, Response, Status};
 use crate::api::app::App;
+use bytes::{Bytes, BytesMut};
 use futures::channel::mpsc;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// `grpc.health.v1.HealthCheckRequest`
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HealthCheckRequest {
-    #[prost(string, tag = "1")]
+    /// 1: `string service`
     pub service: String,
 }
 
 /// `grpc.health.v1.HealthCheckResponse`
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HealthCheckResponse {
-    #[prost(enumeration = "ServingStatus", tag = "1")]
+    /// 1: `ServingStatus status`（列挙の数値）
     pub status: i32,
 }
 
 /// `grpc.health.v1.HealthCheckResponse.ServingStatus`
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i32)]
 pub enum ServingStatus {
     Unknown = 0,
@@ -34,6 +35,52 @@ pub enum ServingStatus {
     NotServing = 2,
     /// `Watch` だけが使う（未登録のサービス）
     ServiceUnknown = 3,
+}
+
+/// ヘルスチェックの 2 メッセージの手書きの符号化（veil は protobuf の実装に依存しない。F-208）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HealthCodec;
+
+impl Codec<HealthCheckRequest> for HealthCodec {
+    fn encode(&self, m: &HealthCheckRequest, out: &mut BytesMut) -> Result<(), Status> {
+        wire::put_bytes_field(out, 1, m.service.as_bytes());
+        Ok(())
+    }
+    fn decode(&self, buf: Bytes) -> Result<HealthCheckRequest, Status> {
+        let mut r = wire::Reader::new(&buf);
+        let mut m = HealthCheckRequest::default();
+        while let Some((field, w)) = r.next_key()? {
+            match (field, w) {
+                (1, wire::LEN) => m.service = r.read_string()?,
+                _ => r.skip(w)?,
+            }
+        }
+        Ok(m)
+    }
+    fn encoded_len(&self, m: &HealthCheckRequest) -> usize {
+        wire::bytes_field_len(1, m.service.len())
+    }
+}
+
+impl Codec<HealthCheckResponse> for HealthCodec {
+    fn encode(&self, m: &HealthCheckResponse, out: &mut BytesMut) -> Result<(), Status> {
+        wire::put_int32_field(out, 1, m.status);
+        Ok(())
+    }
+    fn decode(&self, buf: Bytes) -> Result<HealthCheckResponse, Status> {
+        let mut r = wire::Reader::new(&buf);
+        let mut m = HealthCheckResponse::default();
+        while let Some((field, w)) = r.next_key()? {
+            match (field, w) {
+                (1, wire::VARINT) => m.status = r.read_varint()? as i32,
+                _ => r.skip(w)?,
+            }
+        }
+        Ok(m)
+    }
+    fn encoded_len(&self, _m: &HealthCheckResponse) -> usize {
+        11
+    }
 }
 
 struct Entry {
@@ -96,6 +143,7 @@ impl App {
         }
         self.grpc_unary(
             "/grpc.health.v1.Health/Check",
+            HealthCodec,
             |req: Request<HealthCheckRequest>| async move {
                 match serving_status(&req.get_ref().service) {
                     Some(s) if s != ServingStatus::ServiceUnknown => {
@@ -107,6 +155,7 @@ impl App {
         )
         .grpc_server_streaming(
             "/grpc.health.v1.Health/Watch",
+            HealthCodec,
             |req: Request<HealthCheckRequest>| async move {
                 use futures::StreamExt;
                 let rx = watch(&req.get_ref().service);

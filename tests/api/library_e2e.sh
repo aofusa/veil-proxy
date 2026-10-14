@@ -117,8 +117,6 @@ TOML
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
-  expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}'
-  expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7Badd(a:2,b:3)%7D"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
@@ -146,6 +144,31 @@ TOML
   PIDS+=("$!"); wait_port "$P2"
   expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P2/openapi.json"
   kill "$!" 2>/dev/null
+}
+
+run_graphql() {
+  echo "== GraphQL (examples/api/rust-graphql、async-graphql を利用者側で載せる。F-207)"
+  local T="$ROOT/target/examples-api"
+  (cd "$ROOT/examples/api/rust-graphql" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build graphql"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" exec "$T/debug/veil-example-graphql$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start graphql"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P/graphql" J='content-type: application/json'
+  expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
+  expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B?query=%7Badd(a:2,b:3)%7D"
+  expect "GraphQL variables" '{"data":{"greeting":"Hello, veil!"}}' curl -s -X POST "$B" -H "$J" -d '{"query":"query($n:String!){ greeting(name:$n) }","variables":{"n":"veil"}}'
+  expect "GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$B" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
+  expect "GraphQL batch" '[{"data":{"add":2}},{"data":{"count":5}}]' curl -s -X POST "$B" -H "$J" -d '[{"query":"{ add(a:1,b:1) }"},{"query":"{ count }"}]'
+  expect "GraphQL error" '"errors"' curl -s -X POST "$B" -H "$J" -d '{"query":"{ nope }"}'
+  expect "GraphQL response media type" "application/graphql-response+json" curl -s -i -X POST "$B" -H "$J" -H 'accept: application/graphql-response+json' -d '{"query":"{ add(a:1,b:1) }"}'
+  expect "GraphiQL" "graphiql" bash -c "curl -s -H 'accept: text/html' '$B' | tr A-Z a-z"
+  expect "subscription over SSE" 'event: next
+data: {"data":{"countdown":0}}
+
+event: complete' curl -s -N -X POST "$B" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(from: 2) }"}'
+  expect "subscription over SSE (h2c)" '"countdown":2' curl -s -N --http2-prior-knowledge -X POST "$B" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(from: 2) }"}'
+  kill "$PID" 2>/dev/null
 }
 
 run_c() {
@@ -212,6 +235,58 @@ BAT
   rm -f "$dir/build-msvc.bat" "$dir"/*.obj
 }
 
+c_msvc_dyn() { # c_msvc_dyn <dir> <name>（<name>.c を veil.dll とリンクして <name>.exe）
+  local dir="$1" name="$2" vc="${VCVARS:-}"
+  if [ -z "$vc" ]; then
+    local vs; vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath | tr -d '\r')
+    vc="$vs\\VC\\Auxiliary\\Build\\vcvars64.bat"
+  fi
+  local rel; rel="$(cygpath -w "$ROOT/target/release")"
+  local inc; inc="$(cygpath -w "$ROOT/crates/veil-capi/include")"
+  cat > "$dir/build-msvc.bat" <<BAT
+@call "$vc" >nul || exit /b 1
+cl /nologo /W3 /utf-8 /I"$inc" $name.c /Fe:$name.exe /link /LIBPATH:"$rel" veil.dll.lib || exit /b 1
+BAT
+  (cd "$dir" && cmd //c build-msvc.bat) > "$TMPD/msvc.log" 2>&1 || { tail -20 "$TMPD/msvc.log"; rm -f "$dir/build-msvc.bat"; return 1; }
+  rm -f "$dir/build-msvc.bat" "$dir"/*.obj
+}
+
+run_c_features() {
+  echo "== C (examples/api/c-features: ストリーミング・gRPC・L4、F-210)"
+  local CF="$ROOT/examples/api/c-features"
+  rm -f "$CF/features" "$CF/features.exe"
+  if [ "$OS" = Windows ]; then
+    c_msvc_dyn "$CF" features || { bad "compile features.c (MSVC)"; return; }
+  else
+    local MK; MK=$(command -v gmake || command -v make)
+    local libs="-lpthread -ldl -lm"
+    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+      --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
+    "$MK" -s -C "$CF" CC="${CC:-cc}" LIBS="$libs" features >/dev/null || { bad "compile features.c"; return; }
+  fi
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  local P S L4 U; P=$(free_port); S=$(free_port); L4=$(free_port); U=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_L4_TCP="127.0.0.1:$L4" VEIL_L4_UDP="127.0.0.1:$U" PATH="$ROOT/target/release:$PATH" exec "$CF/features$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "features start"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P"
+  expect "C streaming response (SSE)" "data: tick 3" curl -s -N "$B/sse"
+  expect "C streaming trailer (h2c)" "x-ticks: 3" bash -c "curl -s -i --http2-prior-knowledge '$B/sse' | tr A-Z a-z"
+  expect "C streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
+  expect "C streaming request body (h2c)" "300000" bash -c "dd if=/dev/zero bs=1000 count=300 2>/dev/null | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/count'"
+  expect "C L4 TCP echo" "c-tcp" l4_echo tcp "$L4" c-tcp
+  expect "C L4 UDP echo" "echo:c-udp" l4_echo udp "$U" c-udp
+  (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
+  local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
+  local rc=$?
+  echo "$out" | sed 's/^/  /'
+  [ "$rc" = 0 ] && ok "C gRPC interop (tonic + HTTP/3, exit 0)" || bad "C gRPC interop (exit $rc)"
+  kill "$PID"
+}
+
 run_python() {
   echo "== Python (crates/veil-python)"
   local PY="${PYTHON:-}"
@@ -224,7 +299,79 @@ run_python() {
     PY="$VB/python$EXE"
   fi
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_binding.py) >/dev/null 2>&1 && ok "unit tests" || bad "unit tests"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
+  run_python_f210 "$PY"
+}
+
+py_stop() { # py_stop <pid>（Windows の venv の python はランチャなので子ごと止める）
+  if [ "$OS" = Windows ]; then taskkill //F //T //PID "$(cat /proc/$1/winpid 2>/dev/null || echo $1)" >/dev/null 2>&1 || kill "$1"
+  else kill "$1"; fi
+}
+
+run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio の層）・GraphQL（F-210）
+  local PY="$1" EX="$ROOT/examples/api"
+  echo "== Python: streaming / L4 / gRPC / GraphQL (F-210)"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P L4 U; P=$(free_port); L4=$(free_port); U=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" VEIL_L4_TCP="127.0.0.1:$L4" VEIL_L4_UDP="127.0.0.1:$U" "$PY" "$EX/python-features/app.py" > "$W/f.log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  if wait_port "$P" "$PID"; then
+    local B="http://127.0.0.1:$P"
+    expect "py generator streaming" "line 3" curl -s -N "$B/stream"
+    expect "py SSE" 'data: {"n":3}' curl -s -N "$B/sse"
+    expect "py async generator + trailer (h2c)" "x-parts: 3" bash -c "curl -s -i --http2-prior-knowledge '$B/async-stream' | tr A-Z a-z"
+    expect "py streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
+    expect "py L4 TCP echo" "py-tcp" l4_echo tcp "$L4" py-tcp
+    expect "py L4 UDP echo" "echo:py-udp" l4_echo udp "$U" py-udp
+  else
+    bad "python-features start"; cat "$W/f.log"
+  fi
+  py_stop "$PID"
+  # gRPC: メッセージの生成は grpc_tools（入れば）か protoc + protobuf
+  "$PY" -m pip -q install protobuf >/dev/null 2>&1
+  local GEN="$W/gen"; mkdir -p "$GEN"; local have_grpcio=0
+  if "$PY" -m pip -q install grpcio grpcio-tools >/dev/null 2>&1 && \
+     "$PY" -m grpc_tools.protoc -I "$EX/rust-grpc/proto" --python_out="$GEN" --grpc_python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" 2>/dev/null; then
+    have_grpcio=1
+  else
+    "${PROTOC:-protoc}" -I "$EX/rust-grpc/proto" --python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" || { bad "generate demo_pb2"; return; }
+  fi
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
+  local modes="plain"; [ "$have_grpcio" = 1 ] && modes="plain grpcio"
+  local mode
+  for mode in $modes; do
+    local GP GS; GP=$(free_port); GS=$(free_port)
+    GEN_DIR="$GEN" VEIL_GRPC_MODE=$mode VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
+      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+    local GPID=$!; PIDS+=("$GPID")
+    wait_port "$GP" "$GPID" || { bad "python-grpc ($mode) start"; cat "$W/g.log"; continue; }
+    local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$GP" --h3 "127.0.0.1:$GS" 2>&1)"
+    local rc=$?
+    echo "$out" | sed 's/^/  /'
+    [ "$rc" = 0 ] && ok "py gRPC interop ($mode)" || bad "py gRPC interop ($mode, exit $rc)"
+    py_stop "$GPID"
+  done
+  [ "$have_grpcio" = 1 ] || echo "  skip py gRPC (grpcio layer): grpcio is not installable here"
+  # GraphQL（strawberry。入らない環境では飛ばす）
+  if "$PY" -m pip -q install strawberry-graphql >/dev/null 2>&1; then
+    local QP; QP=$(free_port)
+    VEIL_LISTEN="127.0.0.1:$QP" "$PY" "$EX/python-graphql/app.py" > "$W/q.log" 2>&1 &
+    local QPID=$!; PIDS+=("$QPID")
+    if wait_port "$QP" "$QPID"; then
+      local QB="http://127.0.0.1:$QP/graphql" J='content-type: application/json'
+      expect "py GraphQL query" '{"data":{"add":3}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
+      expect "py GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
+      expect "py GraphQL subscription (SSE)" "event: complete" curl -s -N -X POST "$QB" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(start: 2) }"}'
+    else
+      bad "python-graphql start"; cat "$W/q.log"
+    fi
+    py_stop "$QPID"
+  else
+    echo "  skip py GraphQL: strawberry-graphql is not installable here"
+  fi
 }
 
 run_grpc() {
@@ -246,13 +393,22 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
   (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" \
-    VEIL_TLS_KEY="$W/key.pem" exec "$T/debug/veil-example-grpc$EXE") > "$W/log" 2>&1 &
+    VEIL_TLS_KEY="$W/key.pem" VEIL_OVERRIDE_1='api.grpc_web_cors_origins = ["https://app.example"]' \
+    exec "$T/debug/veil-example-grpc$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
   wait_port "$P" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
   local rc=$?
   echo "$out" | sed 's/^/  /'
   [ "$rc" = 0 ] && ok "grpc interop ($label, exit 0)" || bad "grpc interop ($label, exit $rc)"
+  # gRPC-Web（F-209）: ブラウザの代わりに curl。HelloRequest{name:"web"} の枠と、その base64
+  local U="http://127.0.0.1:$P/demo.v1.Demo/SayHello"
+  expect "grpc-web binary over HTTP/1.1 ($label)" "Hello web" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | LC_ALL=C tr -c '[:print:]' '.'"
+  expect "grpc-web trailer frame ($label)" "grpc-status: 0" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | LC_ALL=C tr -c '[:print:]' '.'"
+  expect "grpc-web-text (h2c, $label)" "Hello web" bash -c "printf 'AAAAAAUKA3dlYg==' | curl -s --http2-prior-knowledge -X POST --data-binary @- -H 'content-type: application/grpc-web-text' '$U' | $PY3 -c 'import sys,base64; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode(\"latin-1\"))' | LC_ALL=C tr -c '[:print:]' '.'"
+  expect "grpc-web CORS preflight ($label)" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$U' | tr A-Z a-z"
+  expect "unknown gRPC service is UNIMPLEMENTED, not 404 ($label)" "grpc-status: 12" bash -c "curl -s -i --http2-prior-knowledge -X POST -H 'content-type: application/grpc' -H 'te: trailers' --data-binary '' 'http://127.0.0.1:$P/nope.v1.Nope/Call' | tr A-Z a-z"
+  expect "grpc-web CORS rejects other origins ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://evil.example' "$U"
   kill "$PID"
 }
 
@@ -278,15 +434,27 @@ run_nonregression() {
     *"did not match"*|"") ok "no tokio in the dependency tree of features=api" ;;
     *) bad "tokio is a dependency of features=api: $t" ;;
   esac
+  # F-207: GraphQL は利用者が選ぶ（api に async-graphql を含めない）。F-208: gRPC ハンドラは prost に依存しない
+  # （veil で prost を使うのは VDS だけ。vds を含まない構成で確かめる）
+  t=$(cd "$ROOT" && cargo tree -q -e normal --no-default-features --features api -i async-graphql 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no async-graphql in the dependency tree of features=api" ;;
+    *) bad "async-graphql is a dependency of features=api: $t" ;;
+  esac
+  t=$(cd "$ROOT" && cargo tree -q -e normal --no-default-features --features "http2,grpc-handler" -i prost 2>&1 | head -1) || true
+  case "$t" in
+    *"did not match"*|"") ok "no prost in the dependency tree of features=grpc-handler" ;;
+    *) bad "prost is a dependency of features=grpc-handler: $t" ;;
+  esac
 }
 
 case "$WHAT" in
-  rust) run_rust ;;
+  rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
-  c) run_c ;;
+  c) run_c; run_c_features ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
-  all) run_nonregression; run_rust; run_grpc; run_c; run_python ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_c_features; run_python ;;
   *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

@@ -230,6 +230,31 @@ impl ConfigBuilder {
         /// `[api].grpc_max_message_size`（gRPC の受信メッセージ上限、既定 4MiB。F-197）。
         grpc_max_message_size, "api.grpc_max_message_size", v: usize => toml::Value::Integer(v as i64)
     );
+    setter!(
+        /// `[api].grpc_max_send_message_size`（gRPC の送信メッセージの上限、0 = 無制限。F-209）。
+        grpc_max_send_message_size, "api.grpc_max_send_message_size", v: usize => toml::Value::Integer(v as i64)
+    );
+    setter!(
+        /// `[api].grpc_response_compression`（gRPC の応答の圧縮: `"none"`・`"gzip"`・`"deflate"`、既定 `"none"`。F-209）。
+        grpc_response_compression, "api.grpc_response_compression", v: &str => toml::Value::String(v.to_string())
+    );
+    setter!(
+        /// `[api].grpc_response_compression_min_size`（これ未満のメッセージは圧縮しない、既定 1024。F-209）。
+        grpc_response_compression_min_size, "api.grpc_response_compression_min_size", v: usize => toml::Value::Integer(v as i64)
+    );
+
+    /// `[api].grpc_web_cors_origins`（gRPC-Web の CORS で許す Origin。`"*"` で全部。F-209）。
+    pub fn grpc_web_cors_origins(self, origins: &[&str]) -> Self {
+        self.push(
+            "api.grpc_web_cors_origins",
+            toml::Value::Array(
+                origins
+                    .iter()
+                    .map(|o| toml::Value::String(o.to_string()))
+                    .collect(),
+            ),
+        )
+    }
 
     /// TLS の証明書・秘密鍵（`[tls]`）。TLS のリスナーは `listen(addr)` で別に指定する（F-200）。
     pub fn tls(self, cert_path: &str, key_path: &str) -> Self {

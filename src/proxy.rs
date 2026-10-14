@@ -657,7 +657,16 @@ where
                             conn.flush_write_buf().await?;
                             continue;
                         }
-                        if data_len > 0 {
+                        if st.req_tx.is_none() {
+                            // B-130: 受け手（ハンドラ・上流への中継）が本文を読み終える前に閉じた。残りの本文は
+                            // 捨てて、そのぶんの受信ウィンドウをすぐ返す（溜めると補充されずに接続全体の
+                            // ウィンドウが尽き、同じ接続の他の要求が止まる）。
+                            if data_len > 0 {
+                                conn.replenish_recv_window(stream_id);
+                                // 直後の process_frame は write_buf が空である前提（write_all）なので先に送る
+                                conn.flush_write_buf().await?;
+                            }
+                        } else if data_len > 0 {
                             // ゼロコピー: 受信フレームの所有バッファをそのまま Bytes 化して転送。
                             st.req_pending.push_back(Bytes::from(data));
                         }
@@ -1176,8 +1185,10 @@ where
                         break;
                     }
                     Err(TrySendError::Closed(_)) => {
+                        // B-130: 受け手が閉じた。溜めていた本文を捨て、そのぶんのウィンドウを返す
                         st.req_pending.clear();
                         st.req_tx = None;
+                        transferred = true;
                     }
                 }
             }
@@ -1717,6 +1728,16 @@ async fn h2_dispatch(
     let (prefix, backend, route_compression) = match backend_result {
         Some(b) => b,
         None => {
+            // 未登録のサービスへの gRPC は Trailers-Only の UNIMPLEMENTED（F-209）
+            #[cfg(feature = "grpc-handler")]
+            if let Some(h) = crate::api::grpc::unknown_route_response(
+                ctx.headers.iter().map(|h| (&h.name[..], &h.value[..])),
+                path,
+            ) {
+                let mut headers = h2_base_headers(false);
+                headers.extend(h);
+                return h2_emit_full(resp_tx, notify, 200, headers, Bytes::new()).await;
+            }
             return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
         }
     };
@@ -4307,6 +4328,15 @@ where
     (status, sent, req_size)
 }
 
+/// 管理 API の `GET {path_prefix}/vds`（F-211）。VDS が無効・未対応のビルドでは `{"enabled":false}`。
+#[cfg(feature = "admin")]
+fn admin_vds_json() -> String {
+    #[cfg(feature = "vds")]
+    return crate::vds::status_json();
+    #[cfg(not(feature = "vds"))]
+    return "{\"enabled\":false}".to_string();
+}
+
 /// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す。
 #[cfg(all(feature = "http2", feature = "admin"))]
 fn h2_admin_response(
@@ -4354,7 +4384,11 @@ fn h2_admin_response(
     let path_suffix = &path_str[admin_config.path_prefix.len()..];
     let is_known_endpoint = matches!(
         (method, path_suffix),
-        (b"GET", "/config") | (b"GET", "/stats") | (b"POST", "/reload") | (b"POST", "/tls/reload")
+        (b"GET", "/config")
+            | (b"GET", "/stats")
+            | (b"GET", "/vds")
+            | (b"POST", "/reload")
+            | (b"POST", "/tls/reload")
     );
     if !is_known_endpoint {
         return None;
@@ -4375,6 +4409,7 @@ fn h2_admin_response(
                 let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
                 (200, json.into_bytes())
             }
+            (b"GET", "/vds") => (200, admin_vds_json().into_bytes()),
             (b"POST", "/reload") => {
                 use std::sync::atomic::Ordering;
                 RELOAD_FLAG.store(true, Ordering::Relaxed);
@@ -5327,11 +5362,46 @@ fn slice_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
     (start, needle.len())
 }
 
+/// キープアライブの次の要求の読み方（F-205）。
+enum KeepaliveRead {
+    /// 従来: 読み取りバッファへ読み、蓄積へ写す
+    Buf(io::Result<usize>, SafeReadBuffer),
+    /// 蓄積バッファへ直接読んだ（io_uring）
+    #[cfg(veil_rt_uring)]
+    Direct(io::Result<usize>, BytesMut),
+}
+
+/// 応答を返した直後に、次の要求を蓄積バッファへ直接読みにいく（F-205、io_uring）。`[performance]
+/// keepalive_direct_read_ms`（既定 20ms）の間に届けば `Some`。届かなければ読みを取り消して `None`
+/// （バッファは返す。呼び出し側はバッファを持たない従来の待ち方に戻る。B-101）。
+///
+/// RECV 1 回で受ける（`POLL_ADD` → `RECV` の 2 操作を 1 回に）。期限では ASYNC_CANCEL を投げて CQE を待つので、
+/// 取り消しと行き違いで届いたデータも失わない。
+///
+/// epoll では入れていない: `read(2)` を先に試す形を測ったところ、外れたときの空打ちが当たりで省ける
+/// `poll(2)`・`epoll_ctl` を上回り、`tools/api-bench` で −1.4〜−2.5% だった（F-205 のチケット）。
+/// 平文の接続だけ（TLS は復号の状態があるので従来どおり）。
+#[cfg(veil_rt_uring)]
+async fn keepalive_direct_read(tls_stream: &ServerTls) -> Option<(io::Result<usize>, BytesMut)> {
+    let wait = CURRENT_CONFIG.load().performance.keepalive_direct_read();
+    if wait.is_zero()
+        || !tls_stream.is_plain()
+        || crate::runtime::io::BufferedReadState::has_buffered_read_data(tls_stream)
+    {
+        return None;
+    }
+    let buf = crate::pool::accum_buf_get();
+    let (res, buf) = tls_stream.get_ref().read_within(buf, wait).await;
+    match res {
+        Some(r) => Some((r, buf)),
+        None => {
+            crate::pool::accum_buf_put(buf);
+            None
+        }
+    }
+}
+
 // 統一されたリクエスト処理ループ（型エイリアスを使用）
-// clippy::drop_non_drop 許容理由: `req` はヘッダバッファ（accumulated）への借用を保持する
-// 非 Drop 型で、`drop(req)` は借用領域を明示的に終わらせて後続の可変利用を許すための
-// 意図的な記述（`let _ =` より意図が明確なため維持する）。
-#[allow(clippy::drop_non_drop)]
 async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: SocketAddr) {
     // B-101: 要求の蓄積バッファは、データが届いてからスレッドローカルのプールで借りる
     // （接続ごとに 64KB を確保して接続の寿命まで抱えない）。
@@ -5341,6 +5411,8 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
     let mut connection_metric = ActiveConnectionMetric::new(true);
     // 接続直後の 1 回目の読み取りか（待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
     let mut first_read = true;
+    // B-129: 蓄積に次の要求のヘッダが揃っている（パイプライン）
+    let mut pipelined_ready = false;
     // ネイティブハンドラの呼び出しで要求をまたいで使い回す状態（F-202）
     #[cfg(feature = "handler")]
     let mut api_cache = crate::api::dispatch::CallCache::default();
@@ -5349,47 +5421,61 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
         // 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
         // readiness を待ってから読み取りバッファを借りる（B-101: アイドル接続にバッファを
         // 持たせない。kqueue では先読みの EAGAIN と確認用 poll(2) も省ける）。
-        let wait_first = !first_read && accumulated.is_empty();
-        first_read = false;
-        // F-187: 蓄積が空＝次の要求を待っているだけ。graceful shutdown ではこの待ちを即座に
-        // 打ち切って接続を閉じる（要求の途中まで届いている接続は待つ）。
-        let idle = accumulated.is_empty();
-        if idle && accumulated.capacity() > 0 {
-            crate::pool::accum_buf_put(std::mem::take(&mut accumulated));
+        // B-129: 前の要求の後ろに次の要求（パイプライン）が丸ごと届いていれば、読まずに処理する
+        // （読みにいくと、もう送られてこないデータを待ち続ける）
+        if !std::mem::take(&mut pipelined_ready) {
+            let wait_first = !first_read && accumulated.is_empty();
+            first_read = false;
+            // F-187: 蓄積が空＝次の要求を待っているだけ。graceful shutdown ではこの待ちを即座に
+            // 打ち切って接続を閉じる（要求の途中まで届いている接続は待つ）。
+            let idle = accumulated.is_empty();
+            if idle && accumulated.capacity() > 0 {
+                crate::pool::accum_buf_put(std::mem::take(&mut accumulated));
+            }
+            let read_result = timeout_idle(IDLE_TIMEOUT, idle, async {
+                if wait_first {
+                    // F-205: 応答の直後は、次の要求を蓄積バッファへ直接読みにいく（届けば 1 回の操作で済む）
+                    #[cfg(veil_rt_uring)]
+                    if let Some((res, buf)) = keepalive_direct_read(&tls_stream).await {
+                        return Ok::<_, io::Error>(KeepaliveRead::Direct(res, buf));
+                    }
+                    tls_stream.wait_next_request().await?;
+                }
+                let (res, buf) = tls_stream.read(buf_get()).await;
+                Ok::<_, io::Error>(KeepaliveRead::Buf(res, buf))
+            })
+            .await;
+
+            match read_result {
+                Ok(Ok(KeepaliveRead::Buf(res, mut returned_buf))) => match res {
+                    Ok(n) if n > 0 => {
+                        // 読み込んだデータを蓄積（SafeReadBufferの型安全なアクセス）
+                        returned_buf.set_valid_len(n);
+                        if accumulated.capacity() == 0 {
+                            accumulated = crate::pool::accum_buf_get();
+                        }
+                        accumulated.extend_from_slice(returned_buf.as_valid_slice());
+                        buf_put(returned_buf);
+                    }
+                    // 0 = 相手が閉じた・読み取りエラー
+                    _ => {
+                        buf_put(returned_buf);
+                        return;
+                    }
+                },
+                // F-205: 蓄積バッファへ直接読んだ（写しが要らない）
+                #[cfg(veil_rt_uring)]
+                Ok(Ok(KeepaliveRead::Direct(res, buf))) => match res {
+                    Ok(n) if n > 0 => accumulated = buf,
+                    _ => {
+                        crate::pool::accum_buf_put(buf);
+                        return;
+                    }
+                },
+                // アイドルタイムアウト・待機中のエラー - 接続を閉じる
+                Ok(Err(_)) | Err(_) => return,
+            }
         }
-        let read_result = timeout_idle(IDLE_TIMEOUT, idle, async {
-            if wait_first {
-                tls_stream.wait_next_request().await?;
-            }
-            Ok::<_, io::Error>(tls_stream.read(buf_get()).await)
-        })
-        .await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(Ok(result)) => result,
-            // アイドルタイムアウト・待機中のエラー - 接続を閉じる
-            Ok(Err(_)) | Err(_) => return,
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                return;
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                return;
-            }
-        };
-
-        // 読み込んだデータを蓄積（SafeReadBufferの型安全なアクセス）
-        returned_buf.set_valid_len(n);
-        if accumulated.capacity() == 0 {
-            accumulated = crate::pool::accum_buf_get();
-        }
-        accumulated.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
 
         // ヘッダーサイズ制限チェック（RFC 6585: 431 Request Header Fields Too Large）
         // ヘッダー終端 \r\n\r\n が見つかった場合はヘッダー部分のみをチェック。
@@ -5464,8 +5550,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     header_count += 1;
                 }
 
-                // req（accumulated への借用）をここで明示的に終了させる。
-                drop(req);
+                // req（accumulated への借用）はここで使い終わる（以後 accumulated を可変で使う）。
 
                 // ヘッダー領域を Bytes として切り出す（参照カウント共有・memcpy なし）。
                 // split_to 後は accumulated にボディの続きだけが残り、読み込みバッファとして
@@ -5769,6 +5854,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                             (method_bytes.as_ref(), path_suffix),
                             (b"GET", "/config")
                                 | (b"GET", "/stats")
+                                | (b"GET", "/vds")
                                 | (b"POST", "/reload")
                                 | (b"POST", "/tls/reload")
                         );
@@ -5809,6 +5895,16 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                             // PROXY_START_TIME を初回アクセスで初期化
                                             let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
                                             let body = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                                            let mut resp = format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                body.len()
+                                            ).into_bytes();
+                                            resp.extend_from_slice(body.as_bytes());
+                                            resp
+                                        }
+                                        (b"GET", "/vds") => {
+                                            // F-211: VDS の状態（接続・適用中の版・最後の NACK の理由・更新回数）
+                                            let body = admin_vds_json();
                                             let mut resp = format!(
                                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                                 body.len()
@@ -5972,6 +6068,14 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // ヘッダー領域は既に `accumulated.split_to(header_len)` で切り出し済みのため、
                 // 残っている accumulated 全体がそのままボディの先頭部分になる
                 // （header_len によるオフセット計算は不要）。
+                // B-129: 本文の長さが決まっている要求（chunked・WebSocket 以外）は、本文より後ろのデータを
+                // 次の要求（パイプライン）として残す（以前は本文の先頭として扱い、次の要求を失っていた）
+                let pipelined: BytesMut =
+                    if !is_chunked && !is_websocket && accumulated.len() > content_length {
+                        accumulated.split_off(content_length)
+                    } else {
+                        BytesMut::new()
+                    };
                 let initial_body: Vec<u8> = accumulated.to_vec();
 
                 // WASMモジュールの適用
@@ -6251,6 +6355,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
                         if should_close {
                             return;
+                        }
+                        // B-129: 届いている次の要求（パイプライン）を蓄積に戻す
+                        if !pipelined.is_empty() {
+                            accumulated.extend_from_slice(&pipelined);
+                            pipelined_ready = accumulated.windows(4).any(|w| w == b"\r\n\r\n");
                         }
                         // Keep-Alive: ループを継続して次のリクエストを待機
                     }

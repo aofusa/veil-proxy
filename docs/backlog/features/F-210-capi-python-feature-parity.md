@@ -1,6 +1,6 @@
 # F-210: C API・Python を Rust の API 並みにする（ストリーミング・L4・gRPC・GraphQL）
 
-**状態: 未着手（設計済み 2026-10-14。段階ごとにコミット、必要なら着手時に段階ごとのチケットに切る）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景
 
@@ -137,3 +137,30 @@ veil に GraphQL の処理は持たない（F-207 と同じ方針）。
 ## 関連
 
 F-193・F-194（今の C・Python）、F-207（GraphQL）、F-208（`BytesCodec`）、F-209（gRPC の未対応項目は C・Python にも同じく効く）。
+
+## 実装（2026-10-14）
+
+設計からの変更点と実装の要点。
+
+- **土台**は `api::bridge`（設計の `api::pipe`）: `to_worker`（プール → ワーカー。押し込むと `WakeFlag` と通知 fd で
+  ワーカーを起こす。スレッド越しに Waker を呼ばない）と `to_pool`（ワーカー → プール。Condvar で待つ）の有界キュー、
+  `call_blocking`（ハンドラ用プールでコールバックを呼び、応答の頭・断片・トレーラをキューで返す）、
+  `runtime::offload::spawn_handler`。
+- **gRPC** は `api::grpc::blocking`（`App::grpc_blocking`）: 4 種類ともワイヤ上は同じなので双方向として `BytesCodec` で
+  登録し、単項等の 1 通の制限は C・Python の層で行う。何も送らずにエラーで終えたら Trailers-Only。
+- **L4** は `api::l4` の blocking 版（`L4Out`・`L4Session`、`App::l4_tcp_blocking`・`l4_udp_blocking`）。
+- **C**（`crates/veil-capi/src/ext.rs`、`veil.h`）: 関数名は `veil_stream_set_trailer`・`veil_grpc_set_status`・
+  `veil_l4_reply` 等（README の表）。エラーコード `VEIL_ERR_CLOSED`・`VEIL_ERR_STATE` を追加。サンプルは
+  `examples/api/c-features`（protobuf-c ではなく手書きの最小の protobuf の符号化で、依存を増やさない）。
+- **Python**（`crates/veil-python/src/ext.rs`・`native.rs`、`python/veil/grpc.py`）: `StreamingResponse`・
+  `EventSourceResponse`・ジェネレータの戻り値・`stream_body=True` と `request.stream()`・`veil.grpc`（基本の層と
+  `Server`）・`veil.Protocol` と `l4_tcp`・`l4_udp`。`request.astream()` は作らなかった（`async def` の中でも
+  `request.stream()` が使える。プールのスレッドごとのイベントループなので、断片を待つ間ブロックしても他の要求を止めない）。
+  `pyproject.toml` の任意依存 `grpc = ["grpcio"]`。
+- **GraphQL**: `examples/api/python-graphql`（strawberry）。
+
+## 結果
+
+- `tests/api/library_e2e.sh c` / `python`: C・Python とも Rust の gRPC のサンプルと同じ tonic の相互運用試験
+  （h2 と h3、26 項目）・SSE・本文のストリーミング・L4 の TCP/UDP。Python は grpcio の生成コードと基本の層の両方。
+- 試験中に HTTP/2 の接続ウィンドウの補充漏れ（B-130）を発見・修正した。

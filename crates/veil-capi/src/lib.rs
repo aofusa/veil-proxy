@@ -18,6 +18,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use bytes::Bytes;
+use veil::api::bridge::HandlerContext;
 use veil::api::{App, Config, HandlerFn, OperationMeta, Request, Response};
 
 // ===================== BoringSSL 互換シンボルの橋渡し =====================
@@ -64,9 +65,15 @@ pub const VEIL_ERR_CONFIG: c_int = -2;
 pub const VEIL_ERR_RUNTIME: c_int = -3;
 /// 文字列が UTF-8 ではない。
 pub const VEIL_ERR_UTF8: c_int = -4;
+/// 相手（クライアント）が切断した・ストリームが閉じている（F-210）。
+pub const VEIL_ERR_CLOSED: c_int = -5;
+/// 呼べない状態（INLINE のルートでのストリーミング・単項の 2 回目の送信等。F-210）。
+pub const VEIL_ERR_STATE: c_int = -6;
 
 /// コールバックをワーカースレッド上で直接実行する（既定はハンドラ用プール）。
 pub const VEIL_ROUTE_INLINE: u32 = 1;
+/// 要求本文を溜めずにコールバックを呼ぶ（`veil_request_body_read` で順に読む。F-210）。
+pub const VEIL_ROUTE_STREAM_BODY: u32 = 2;
 
 // ===================== 最後のエラー =====================
 
@@ -123,6 +130,7 @@ struct CRoute {
     func: veil_handler_fn,
     user_data: UserData,
     inline: bool,
+    stream_body: bool,
     meta: OperationMeta,
 }
 
@@ -131,6 +139,8 @@ struct CRoute {
 pub struct veil_config_t {
     config: Config,
     routes: Vec<CRoute>,
+    /// gRPC・L4 の登録（`veil_run` で `App` に足す。F-210）
+    extra: Vec<Box<dyn FnOnce(App) -> App + Send>>,
 }
 
 /// リクエスト（不透明）。コールバックの間だけ有効。
@@ -140,12 +150,18 @@ pub struct veil_request_t {
     /// 復号した文字列の置き場。`String` のヒープは `Vec` が伸びても動かないので、
     /// ここに積んだ文字列へのポインタはコールバックの間有効。
     arena: RefCell<Vec<String>>,
+    /// ハンドラ用プールで動くときの文脈（要求本文の読み取り。INLINE は NULL。F-210）
+    ctx: *mut HandlerContext,
+    /// 読みかけの本文の断片（`veil_request_body_read` の残り）
+    body_pending: RefCell<Bytes>,
 }
 
 /// レスポンス（不透明）。コールバックの間だけ有効。
 #[allow(non_camel_case_types)]
 pub struct veil_response_t {
     resp: Response,
+    /// ハンドラ用プールで動くときの文脈（ストリーミング。INLINE は NULL。F-210）
+    ctx: *mut HandlerContext,
 }
 
 impl veil_request_t {
@@ -153,6 +169,8 @@ impl veil_request_t {
         veil_request_t {
             req,
             arena: RefCell::new(Vec::new()),
+            ctx: ptr::null_mut(),
+            body_pending: RefCell::new(Bytes::new()),
         }
     }
 
@@ -220,6 +238,7 @@ pub unsafe extern "C" fn veil_config_new() -> *mut veil_config_t {
     Box::into_raw(Box::new(veil_config_t {
         config: Config::new(),
         routes: Vec::new(),
+        extra: Vec::new(),
     }))
 }
 
@@ -238,6 +257,7 @@ pub unsafe extern "C" fn veil_config_from_file(path: *const c_char) -> *mut veil
         Ok(config) => Box::into_raw(Box::new(veil_config_t {
             config,
             routes: Vec::new(),
+            extra: Vec::new(),
         })),
         Err(e) => {
             set_last_error(e.0);
@@ -435,8 +455,14 @@ pub unsafe extern "C" fn veil_register_route_ex(
     let Some(func) = handler else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL handler");
     };
-    if flags & !VEIL_ROUTE_INLINE != 0 {
+    if flags & !(VEIL_ROUTE_INLINE | VEIL_ROUTE_STREAM_BODY) != 0 {
         return fail(VEIL_ERR_INVALID_ARG, "unknown route flags");
+    }
+    if flags & VEIL_ROUTE_INLINE != 0 && flags & VEIL_ROUTE_STREAM_BODY != 0 {
+        return fail(
+            VEIL_ERR_INVALID_ARG,
+            "VEIL_ROUTE_STREAM_BODY needs a handler-pool route (not VEIL_ROUTE_INLINE)",
+        );
     }
     let path = tryc!(cstr(path));
     if !path.starts_with('/') {
@@ -479,16 +505,19 @@ pub unsafe extern "C" fn veil_register_route_ex(
         func,
         user_data: UserData(user_data),
         inline: flags & VEIL_ROUTE_INLINE != 0,
+        stream_body: flags & VEIL_ROUTE_STREAM_BODY != 0,
         meta,
     });
     VEIL_OK
 }
 
-/// C コールバックを 1 回呼ぶ。0 以外の戻り値・panic は 500。
-fn invoke(func: veil_handler_fn, ud: UserData, req: Request) -> Response {
-    let wreq = veil_request_t::new(req);
+/// C コールバックを 1 回呼ぶ。0 以外の戻り値・panic は 500（ストリーミングを始めた後は使わない）。
+fn invoke(func: veil_handler_fn, ud: UserData, req: Request, ctx: *mut HandlerContext) -> Response {
+    let mut wreq = veil_request_t::new(req);
+    wreq.ctx = ctx;
     let mut wresp = veil_response_t {
         resp: Response::new(200),
+        ctx,
     };
     let rc = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: wreq / wresp はこの呼び出しの間だけ生きる。user_data の契約は UserData を参照。
@@ -504,15 +533,16 @@ fn invoke(func: veil_handler_fn, ud: UserData, req: Request) -> Response {
 /// ルートからハンドラ関数を作る。
 fn make_handler(func: veil_handler_fn, ud: UserData, inline: bool) -> HandlerFn {
     if inline {
-        std::sync::Arc::new(move |req| Box::pin(async move { invoke(func, ud, req) }))
-    } else {
         std::sync::Arc::new(move |req| {
-            Box::pin(async move {
-                match veil::runtime::offload::offload_handler(move || invoke(func, ud, req)).await {
-                    Some(r) => r,
-                    None => Response::error(500, "handler panicked"),
-                }
-            })
+            Box::pin(async move { invoke(func, ud, req, ptr::null_mut()) })
+        })
+    } else {
+        // ハンドラ用プールで呼ぶ。コールバックは応答をストリーミングにでき（`veil_response_stream`）、
+        // ストリーミング受信のルートでは要求本文を順に読める（F-210）
+        std::sync::Arc::new(move |req| {
+            Box::pin(veil::api::bridge::call_blocking(req, move |req, ctx| {
+                invoke(func, ud, req, ctx as *mut HandlerContext)
+            }))
         })
     }
 }
@@ -536,7 +566,14 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
     for r in cfg.routes {
         let methods: Vec<&str> = r.methods.iter().map(|m| m.as_str()).collect();
         let func = make_handler(r.func, r.user_data, r.inline);
-        app = app.route_fn(&r.name, &methods, &r.path, func, r.meta);
+        app = if r.stream_body {
+            app.route_fn_streaming(&r.name, &methods, &r.path, func, r.meta)
+        } else {
+            app.route_fn(&r.name, &methods, &r.path, func, r.meta)
+        };
+    }
+    for f in cfg.extra {
+        app = f(app);
     }
     match catch_unwind(AssertUnwindSafe(|| app.run())) {
         Ok(Ok(())) => VEIL_OK,
@@ -768,6 +805,16 @@ pub unsafe extern "C" fn veil_response_set_header(
     };
     let name = tryc!(cstr(name));
     let value = tryc!(cstr(value));
+    if !valid_header(name, value) {
+        return fail(VEIL_ERR_INVALID_ARG, "invalid header name or value");
+    }
+    r.resp
+        .set_header(name, Bytes::copy_from_slice(value.as_bytes()));
+    VEIL_OK
+}
+
+/// ヘッダ（トレーラ・gRPC のメタデータも）の名前と値として送ってよいか（CR/LF 等の制御文字を拒否）。
+fn valid_header(name: &str, value: &str) -> bool {
     let name_ok = !name.is_empty()
         && name
             .bytes()
@@ -775,12 +822,7 @@ pub unsafe extern "C" fn veil_response_set_header(
     let value_ok = value
         .bytes()
         .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f));
-    if !name_ok || !value_ok {
-        return fail(VEIL_ERR_INVALID_ARG, "invalid header name or value");
-    }
-    r.resp
-        .set_header(name, Bytes::copy_from_slice(value.as_bytes()));
-    VEIL_OK
+    name_ok && value_ok
 }
 
 /// 本文を設定する（コピーする。Content-Type は変えない）。
@@ -845,6 +887,9 @@ unsafe fn set_typed(resp: *mut veil_response_t, text: *const c_char, ctype: &'st
         .set_header("content-type", Bytes::from_static(ctype.as_bytes()));
     VEIL_OK
 }
+
+/// ストリーミング・gRPC・L4（F-210）。`tryc!` 等の後に置く（マクロはテキスト順で見える）。
+mod ext;
 
 #[cfg(test)]
 mod tests {
@@ -940,6 +985,7 @@ mod tests {
     fn response_setters() {
         let mut r = veil_response_t {
             resp: Response::new(200),
+            ctx: ptr::null_mut(),
         };
         let rp: *mut veil_response_t = &mut r;
         unsafe {
@@ -1013,7 +1059,13 @@ mod tests {
     fn invoke_maps_return_codes() {
         let mut counter = 0i32;
         let ud = UserData(&mut counter as *mut i32 as *mut c_void);
-        let r = invoke(echo_cb, ud, Request::new("POST", "/e", vec![], "body"));
+        // ctx 無し（INLINE と同じ。ストリーミングの関数は使えない）
+        let r = invoke(
+            echo_cb,
+            ud,
+            Request::new("POST", "/e", vec![], "body"),
+            ptr::null_mut(),
+        );
         assert_eq!(r.status_code(), 200);
         assert_eq!(&r.body()[..], b"body");
         assert_eq!(counter, 1);
@@ -1021,6 +1073,7 @@ mod tests {
             fail_cb,
             UserData(ptr::null_mut()),
             Request::new("GET", "/", vec![], ""),
+            ptr::null_mut(),
         );
         assert_eq!(r.status_code(), 500);
     }

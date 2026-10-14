@@ -1,6 +1,6 @@
 # F-207: async-graphql への依存をやめる（GraphQL のライブラリは利用者が選ぶ）
 
-**状態: 未着手（設計済み 2026-10-14）**
+**状態: 完了（feat/api-roadmap-impl、2026-10-14）**
 
 ## 背景
 
@@ -48,3 +48,14 @@ GraphQL のライブラリは async-graphql の他に juniper・cynic（クラ�
 - `cargo tree --features api -p veil` に async-graphql が出ない。
 - `examples/api/rust-graphql` が `library_e2e.sh` で通る（Linux。他 OS は F-203 の手順で 1 回）。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-14）
+
+- `graphql` feature・`async-graphql` 依存・`src/api/graphql.rs` を削除し、`api-core` から外した（`cargo tree --features api` に
+  async-graphql が出ない）。
+- `examples/api/rust-graphql`（新規）: `src/graphql.rs`（コピーして使う橋渡し、GET・POST・バッチ・GraphiQL・
+  `application/graphql-response+json`・GraphQL over SSE）と、問い合わせ・変更・サブスクリプション（`countdown`、
+  `veil::tokio::time::sleep`）の `main.rs`。rust-showcase から GraphQL を外した。
+- `tests/api/library_e2e.sh` に `run_graphql`（`rust` と `all` で実行）: POST・GET・変数・変更・バッチ・エラー・
+  応答のメディア型・GraphiQL・SSE のサブスクリプション（HTTP/1.1・h2c）。`nonregression` の async-graphql 検査は残した。
+- 文書: `docs/guide/library.md`（英日）の GraphQL 節・features の表・Limitations、`docs/guide/features.md`（英日）、AGENTS.md。

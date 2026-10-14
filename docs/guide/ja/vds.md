@@ -31,7 +31,8 @@ token_file = "/etc/veil/vds/token"
 | キー | 既定値 | 説明 |
 |------|--------|------|
 | `enabled` | `false` | VDS クライアントのスレッドを起動する |
-| `server` | `""` | 制御プレーンのベース URL: `http://host:port[/base]` または `https://...`（有効時は必須） |
+| `server` | `""` | 制御プレーンのベース URL: `http://host:port[/base]` または `https://...`（有効時は必須。`servers` を指定したときは不要） |
+| `servers` | `[]` | 冗長化のための複数の制御プレーン（F-211）。`server` より優先。接続・ストリームが失敗したらすぐ次を試し、全部を 1 周したら再試行のバックオフで待つ |
 | `transport` | `"grpc"` | `"grpc"`: 双方向ストリーム（h2c または TLS + ALPN h2）、`"rest"`: `{server}/v1/discovery` の長輪詢 |
 | `keepalive_secs` | `30` | gRPC の接続の TCP キープアライブ（`0` で無効） |
 | `node_id` | `""` | 制御プレーンへ送るノード ID。空ならホスト名 |
@@ -44,9 +45,31 @@ token_file = "/etc/veil/vds/token"
 | `retry_max_ms` | `30000` | 再試行待ちの上限 |
 | `max_response_bytes` | `16777216` | これを超える応答（gRPC はメッセージ）は拒否する（16 MiB） |
 | `max_resources` | `10000` | これを超える数のリソースを持つスナップショットは拒否する |
+| `initial_fetch_timeout_ms` | `0` | 起動時、最初のスナップショットを適用するまでリスナーを開かずに待つ上限（`0` は待たない）。期限を過ぎたらファイルの設定で開始する。古いルートで要求を受けてはいけない Kubernetes のサイドカー向け（F-211） |
 
 VDS も設定の一部なので、`VEIL_OVERRIDE_<n>` と `--override` が使えます
 （[起動・運用](running.md#環境変数による設定の上書きveil_override_n)を参照）。例: `VEIL_OVERRIDE_1='vds.server = "http://cp:18000"'`。
+
+## 状態: メトリクスと管理 API
+
+VDS が有効なとき、クライアントの状態（F-211）を Prometheus（`[prometheus] enabled = true`）に出します。
+
+| メトリクス | 種類 | 意味 |
+|-----------|------|------|
+| `veil_proxy_vds_connected` | gauge | 制御プレーンが応答している間 `1`、それ以外 `0` |
+| `veil_proxy_vds_applied_info{version_info}` | gauge | 常に `1`。ラベルが適用中のスナップショットの版 |
+| `veil_proxy_vds_updates_total{result="applied"\|"rejected"}` | counter | 適用（ACK）・拒否（NACK）したスナップショットの数 |
+| `veil_proxy_vds_last_update_timestamp_seconds` | gauge | 最後にスナップショットを適用・拒否した時刻（UNIX 秒） |
+
+[管理 API](admin-api.md) の `GET {path_prefix}/vds`（既定 `/__admin/vds`）は同じ内容を JSON で返します。
+
+```json
+{"enabled":true,"connected":true,"server":"http://cp-1:18000","version_info":"3f2a9c1d04b7e612",
+ "last_error":null,"updates_acked":4,"updates_nacked":1,"last_update_unix":1791700000}
+```
+
+`last_error` は最後に拒否したスナップショットの理由（または最後の接続エラー）です。VDS が無効なら
+`{"enabled":false}` を返します。
 
 ## スナップショットで制御できるもの
 
@@ -299,6 +322,8 @@ spec:
 | 症状 | 確認すること |
 |------|--------------|
 | 何も起きない | `[vds] enabled = true`、正しい `server` の URL、ログの `[VDS]` 行（`subscribing to ...`） |
+| どの版で動いているか・なぜ拒否されたか | `GET /__admin/vds` か `veil_proxy_vds_*` のメトリクス |
+| 起動に `initial_fetch_timeout_ms` かかる | 期限内に制御プレーンが応答しなかった（ログに `no snapshot within initial_fetch_timeout_ms`）。ファイルの設定で開始しています |
 | `rejected snapshot` の警告 | メッセージが検証エラーです。スナップショットを直してください（前の設定は動き続けています） |
 | `control plane returned 401` / `grpc-status 16` | `token_file` の内容が制御プレーンのトークンと一致していない |
 | `stream ... failed` で `HTTP 404`・`did not negotiate h2` | 制御プレーンが gRPC を話さない: `transport = "rest"` にする（例: `tools/vds/vds_server.py`） |

@@ -793,6 +793,12 @@ pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
     let _ = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
 }
 
+/// in-flight op を取り消す（ASYNC_CANCEL）。op は Future が持ったままで、取り消し（`-ECANCELED`）か
+/// 行き違いの完了の CQE を通常どおり受け取る（F-205: 待ちを打ち切っても届いたデータを捨てない）。
+pub fn cancel_op(user_data: u64) {
+    submit_cancel(user_data);
+}
+
 /// 指定した user_data の in-flight op に ASYNC_CANCEL を投げる（ベストエフォート）。
 fn submit_cancel(target_user_data: u64) {
     with_ring(|ring| {

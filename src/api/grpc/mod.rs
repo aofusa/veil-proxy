@@ -1,10 +1,14 @@
-//! gRPC サーバ（API ライブラリ、F-197）。メッセージは prost、ワイヤ処理は veil の `src/grpc/`
+//! gRPC サーバ（API ライブラリ、F-197）。ワイヤ処理は veil の `src/grpc/`
 //! （5 バイトのフレーミング・`grpc-status`/`grpc-message`・`grpc-timeout`・gzip/deflate）。tokio・tonic に依存しない。
+//!
+//! メッセージの符号化と復号は [`Codec`] が担い、veil 自身は protobuf の実装に依存しない（F-208）。
+//! `.proto` から `veil-build` で生成したコードは prost のメッセージと `ProstCodec` を使う。
+//! 別の protobuf 実装・JSON 等は `Codec` を実装すれば使える。[`BytesCodec`] は符号化前のバイト列をそのまま渡す。
 //!
 //! ```ignore
 //! use veil::api::grpc::{Request, Response, Status};
 //! App::new()
-//!     .grpc_unary("/helloworld.Greeter/SayHello", |req: Request<HelloRequest>| async move {
+//!     .grpc_unary("/helloworld.Greeter/SayHello", ProstCodec, |req: Request<HelloRequest>| async move {
 //!         Ok(Response::new(HelloReply { message: format!("Hello {}", req.get_ref().name) }))
 //!     })
 //!     .run()
@@ -14,7 +18,12 @@
 //! 応答はストリーミング応答（DATA の後にトレーラ `grpc-status`）で送る。HTTP/2・HTTP/3 で動き、
 //! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
 
+/// ブロッキングな gRPC のハンドラ（C・Python 用、F-210）
+pub mod blocking;
 pub mod health;
+pub mod reflection;
+mod web;
+pub(crate) mod wire;
 
 /// `veil-build` が `OUT_DIR` に書いた `<package>.rs` を取り込む（`veil::include_proto!("helloworld");`）。
 #[macro_export]
@@ -30,20 +39,64 @@ use super::request::HttpVersion;
 use super::stream::{BodyChunk, RequestBodyStream};
 use crate::grpc::compression::GrpcCompression;
 use crate::grpc::framing::GrpcFrameDecoder;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::BufMut;
 use futures::{Stream, StreamExt};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+/// 応答の圧縮方式（`Response::with_compression`）。
+pub use crate::grpc::compression::GrpcCompression as Compression;
 pub use crate::grpc::status::GrpcStatusCode as Code;
-/// 生成コード・利用者が同じ版の prost を使えるように再エクスポートする。
-pub use prost;
+/// codec の実装（生成コードの `ProstCodec` 等）が使うバッファの型。
+pub use bytes::{Bytes, BytesMut};
+
+// ===================== Codec =====================
+
+/// メッセージ型 `T` の符号化と復号（F-208）。
+///
+/// 「メッセージ型に実装する trait」ではなく「codec の型に実装する trait」にしている。生成コードは利用者の
+/// クレートにローカルな codec の型（`ProstCodec`）を置き、`impl<T: prost::Message + Default> Codec<T> for ProstCodec`
+/// と書ける（orphan rule。外部クレートのメッセージ型 `prost_types::Empty` 等も rpc に使える）。
+pub trait Codec<T>: Clone + Send + Sync + 'static {
+    /// `out` の末尾にメッセージを書く（veil が先に 5 バイトの見出しの領域を空け、書いた後に長さを入れる）。
+    fn encode(&self, message: &T, out: &mut BytesMut) -> Result<(), Status>;
+    /// 1 メッセージ分（解凍済み）を復号する。
+    fn decode(&self, buf: Bytes) -> Result<T, Status>;
+    /// 符号化後の大きさ（分かれば。送信バッファを 1 回で確保するため。0 = 不明）。
+    fn encoded_len(&self, _message: &T) -> usize {
+        0
+    }
+}
+
+/// 符号化前のバイト列をそのまま受け渡す codec（生成コード無しで使う・C や Python の橋渡し）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BytesCodec;
+
+impl Codec<Bytes> for BytesCodec {
+    fn encode(&self, message: &Bytes, out: &mut BytesMut) -> Result<(), Status> {
+        out.extend_from_slice(message);
+        Ok(())
+    }
+    fn decode(&self, buf: Bytes) -> Result<Bytes, Status> {
+        Ok(buf)
+    }
+    fn encoded_len(&self, message: &Bytes) -> usize {
+        message.len()
+    }
+}
+
+/// 受信ストリームが持つ復号関数（ルートの登録時に 1 回作り、呼び出しごとには `Arc` を複製するだけ）。
+type DecodeFn<T> = Arc<dyn Fn(Bytes) -> Result<T, Status> + Send + Sync>;
+
+fn decode_fn<T: 'static, C: Codec<T>>(codec: &C) -> DecodeFn<T> {
+    let codec = codec.clone();
+    Arc::new(move |b| codec.decode(b))
+}
 
 /// メタデータ（要求ヘッダ・応答ヘッダ・トレーラ）。名前は小文字。
 pub type Metadata = Vec<(Bytes, Bytes)>;
@@ -66,6 +119,78 @@ pub fn max_message_size() -> usize {
     MAX_MESSAGE_SIZE.load(Ordering::Relaxed)
 }
 
+/// 送信メッセージの上限（`[api] grpc_max_send_message_size`、0 = 無制限。F-209 #8）。
+static MAX_SEND_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn set_max_send_message_size(n: usize) {
+    MAX_SEND_MESSAGE_SIZE.store(n, Ordering::Relaxed);
+}
+
+/// 応答の圧縮（`[api] grpc_response_compression`、0 = しない・1 = gzip・2 = deflate。F-209 #2）。
+static RESPONSE_COMPRESSION: AtomicU8 = AtomicU8::new(0);
+/// この大きさ未満のメッセージは圧縮しない（`[api] grpc_response_compression_min_size`）。
+static RESPONSE_COMPRESSION_MIN: AtomicUsize = AtomicUsize::new(1024);
+
+/// `[api] grpc_response_compression`（`"none"`・`"gzip"`・`"deflate"`）を反映する。知らない値は `none` にして返す。
+pub(crate) fn set_response_compression(name: &str, min_size: usize) -> Result<(), String> {
+    let (v, r) = match name.to_ascii_lowercase().as_str() {
+        "" | "none" | "identity" => (0, Ok(())),
+        "gzip" => (1, Ok(())),
+        "deflate" => (2, Ok(())),
+        other => (
+            0,
+            Err(format!(
+                "[api] grpc_response_compression = {:?} is not one of none, gzip, deflate",
+                other
+            )),
+        ),
+    };
+    RESPONSE_COMPRESSION.store(v, Ordering::Relaxed);
+    RESPONSE_COMPRESSION_MIN.store(min_size, Ordering::Relaxed);
+    r
+}
+
+/// `[api] grpc_web_cors_origins` を反映する（F-209 #4）。
+pub(crate) fn set_grpc_web_cors_origins(origins: Vec<String>) {
+    web::set_cors_origins(origins);
+}
+
+fn configured_compression() -> Compression {
+    match RESPONSE_COMPRESSION.load(Ordering::Relaxed) {
+        1 => Compression::Gzip,
+        2 => Compression::Deflate,
+        _ => Compression::Identity,
+    }
+}
+
+/// 要求の `grpc-accept-encoding` が受けると言っている方式（ビット: 1 = gzip・2 = deflate）。
+fn accepted_encodings(v: Option<&str>) -> u8 {
+    let mut out = 0;
+    for e in v.unwrap_or("").split(',') {
+        match e.trim() {
+            x if x.eq_ignore_ascii_case("gzip") => out |= 1,
+            x if x.eq_ignore_ascii_case("deflate") => out |= 2,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 応答に使う圧縮方式: 呼び出しの指定 > 設定。クライアントが受けると言っていない・このビルドで使えない方式は使わない。
+fn response_encoding(want: Option<Compression>, accepts: u8) -> Compression {
+    let want = want.unwrap_or_else(configured_compression);
+    let bit = match want {
+        Compression::Gzip => 1,
+        Compression::Deflate => 2,
+        Compression::Identity => return Compression::Identity,
+    };
+    if accepts & bit != 0 && want.is_supported() {
+        want
+    } else {
+        Compression::Identity
+    }
+}
+
 // ===================== Status =====================
 
 /// gRPC のステータス（コード・メッセージ・追加のトレーラ）。
@@ -74,6 +199,8 @@ pub struct Status {
     code: Code,
     message: String,
     metadata: Metadata,
+    /// `grpc-status-details-bin`（符号化済みの `google.rpc.Status`。F-209 #6）
+    details: Option<Bytes>,
 }
 
 macro_rules! status_ctor {
@@ -93,6 +220,7 @@ impl Status {
             code,
             message: message.into(),
             metadata: Vec::new(),
+            details: None,
         }
     }
 
@@ -129,6 +257,19 @@ impl Status {
         self
     }
 
+    /// エラーの詳細（`grpc-status-details-bin` で送る、符号化済みの `google.rpc.Status`。F-209）。
+    /// `google.rpc.BadRequest` 等を入れた `google.rpc.Status` を利用者の protobuf ライブラリで符号化して渡す
+    /// （veil は中身を解釈しない。`code`・`message` はこの `Status` と同じにするのが gRPC の約束）。
+    pub fn with_details(mut self, details: impl Into<Bytes>) -> Status {
+        self.details = Some(details.into());
+        self
+    }
+
+    /// `with_details` で付けた詳細。
+    pub fn details(&self) -> Option<&Bytes> {
+        self.details.as_ref()
+    }
+
     /// `grpc-status`・`grpc-message`（パーセントエンコード）と追加のメタデータ。
     pub(crate) fn to_trailers(&self) -> Metadata {
         let mut out = Vec::with_capacity(2 + self.metadata.len());
@@ -142,6 +283,16 @@ impl Status {
                 Bytes::from_static(b"grpc-message"),
                 Bytes::from(percent_encode(&self.message)),
             ));
+        }
+        if let Some(d) = &self.details {
+            // バイナリのメタデータ（`-bin`）は base64。gRPC の実装は `=` の無い形を送る
+            let mut enc = web::Base64Encoder::default();
+            let mut v = BytesMut::from(&enc.encode(d)[..]);
+            v.extend_from_slice(&enc.finish());
+            while v.last() == Some(&b'=') {
+                v.truncate(v.len() - 1);
+            }
+            out.push((Bytes::from_static(b"grpc-status-details-bin"), v.freeze()));
         }
         out.extend(self.metadata.iter().cloned());
         out
@@ -215,6 +366,8 @@ pub struct Request<T> {
     message: T,
     deadline: Option<Instant>,
     client_ip: IpAddr,
+    /// `/<package>.<Service>/<Method>`
+    path: Bytes,
 }
 
 impl<T> Request<T> {
@@ -225,6 +378,7 @@ impl<T> Request<T> {
             message,
             deadline: None,
             client_ip: IpAddr::from([127, 0, 0, 1]),
+            path: Bytes::new(),
         }
     }
 
@@ -262,6 +416,11 @@ impl<T> Request<T> {
         self.client_ip
     }
 
+    /// 呼ばれたメソッド（`/<package>.<Service>/<Method>`。`Request::new` で作ったものは空）。
+    pub fn method(&self) -> &str {
+        std::str::from_utf8(&self.path).unwrap_or("")
+    }
+
     /// メッセージだけ差し替える（メタデータ・期限は保つ）。
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Request<U> {
         Request {
@@ -269,6 +428,7 @@ impl<T> Request<T> {
             message: f(self.message),
             deadline: self.deadline,
             client_ip: self.client_ip,
+            path: self.path,
         }
     }
 }
@@ -279,6 +439,7 @@ pub struct Response<T> {
     metadata: Metadata,
     message: T,
     trailers: Metadata,
+    compression: Option<Compression>,
 }
 
 impl<T> Response<T> {
@@ -287,7 +448,15 @@ impl<T> Response<T> {
             metadata: Vec::new(),
             message,
             trailers: Vec::new(),
+            compression: None,
         }
+    }
+
+    /// この呼び出しの応答の圧縮方式（`[api] grpc_response_compression` より優先。`Compression::Identity` で圧縮しない）。
+    /// クライアントが `grpc-accept-encoding` で受けると言っていない方式は使わない（非圧縮で送る）。
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
     }
 
     pub fn get_ref(&self) -> &T {
@@ -318,14 +487,16 @@ impl<T> Response<T> {
 // ===================== Streaming（受信） =====================
 
 /// 受信メッセージのストリーム（client streaming・bidi の要求）。届いた本文を gRPC のフレームに切り出し、
-/// 圧縮を戻して `T::decode` する。上限超過は `RESOURCE_EXHAUSTED`、壊れたメッセージは `INTERNAL`。
+/// 圧縮を戻して codec で復号する。上限超過は `RESOURCE_EXHAUSTED`、壊れたメッセージは `INTERNAL`。
 pub struct Streaming<T> {
     body: RequestBodyStream,
     decoder: GrpcFrameDecoder,
     encoding: GrpcCompression,
+    decode: DecodeFn<T>,
+    /// gRPC-Web の `-text`（本文が base64）なら戻しながら読む（F-209 #4）
+    text: Option<web::Base64Decoder>,
     body_done: bool,
     finished: bool,
-    _t: PhantomData<fn() -> T>,
 }
 
 impl<T> std::fmt::Debug for Streaming<T> {
@@ -336,15 +507,21 @@ impl<T> std::fmt::Debug for Streaming<T> {
     }
 }
 
-impl<T: prost::Message + Default> Streaming<T> {
-    fn new(body: RequestBodyStream, encoding: GrpcCompression) -> Streaming<T> {
+impl<T> Streaming<T> {
+    fn new(
+        body: RequestBodyStream,
+        encoding: GrpcCompression,
+        decode: DecodeFn<T>,
+        text: bool,
+    ) -> Streaming<T> {
         Streaming {
             body,
             decoder: GrpcFrameDecoder::with_max_size(max_message_size()),
             encoding,
+            decode,
+            text: text.then(web::Base64Decoder::default),
             body_done: false,
             finished: false,
-            _t: PhantomData,
         }
     }
 
@@ -358,9 +535,22 @@ impl<T: prost::Message + Default> Streaming<T> {
             if self.encoding == GrpcCompression::Identity {
                 return Err(Status::internal("compressed message without grpc-encoding"));
             }
-            self.encoding
-                .decompress(&data)
-                .map_err(|e| Status::internal(format!("failed to decompress message: {}", e)))?
+            // B-127: 解凍後の大きさは上限 + 1 バイトで打ち切る（全部解凍してから比べない）
+            match self.encoding.decompress_limited(&data, max_message_size()) {
+                Ok(d) => d,
+                Err(crate::grpc::framing::GrpcError::MessageTooLarge { max, .. }) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "decompressed message larger than max ({})",
+                        max
+                    )))
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "failed to decompress message: {}",
+                        e
+                    )))
+                }
+            }
         } else {
             data
         };
@@ -371,12 +561,11 @@ impl<T: prost::Message + Default> Streaming<T> {
                 max_message_size()
             )));
         }
-        T::decode(&data[..])
-            .map_err(|e| Status::internal(format!("failed to decode message: {}", e)))
+        (self.decode)(Bytes::from(data))
     }
 }
 
-impl<T: prost::Message + Default> Stream for Streaming<T> {
+impl<T> Stream for Streaming<T> {
     type Item = Result<T, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -408,6 +597,11 @@ impl<T: prost::Message + Default> Stream for Streaming<T> {
             }
             if this.body_done {
                 this.finished = true;
+                if this.text.as_ref().is_some_and(|d| d.finish().is_err()) {
+                    return Poll::Ready(Some(Err(Status::internal(
+                        "grpc-web-text request body is not valid base64",
+                    ))));
+                }
                 if this.decoder.has_pending() {
                     return Poll::Ready(Some(Err(Status::internal(
                         "request body ended in the middle of a message",
@@ -416,7 +610,19 @@ impl<T: prost::Message + Default> Stream for Streaming<T> {
                 return Poll::Ready(None);
             }
             match Pin::new(&mut this.body).poll_next(cx) {
-                Poll::Ready(Some(chunk)) => this.decoder.push(&chunk),
+                Poll::Ready(Some(chunk)) => match this.text.as_mut() {
+                    None => this.decoder.push(&chunk),
+                    Some(dec) => {
+                        let mut raw = BytesMut::with_capacity(chunk.len() / 4 * 3 + 3);
+                        if dec.push(&chunk, &mut raw).is_err() {
+                            this.finished = true;
+                            return Poll::Ready(Some(Err(Status::internal(
+                                "grpc-web-text request body is not valid base64",
+                            ))));
+                        }
+                        this.decoder.push(&raw);
+                    }
+                },
                 Poll::Ready(None) => this.body_done = true,
                 Poll::Pending => return Poll::Pending,
             }
@@ -426,28 +632,88 @@ impl<T: prost::Message + Default> Stream for Streaming<T> {
 
 // ===================== 送信 =====================
 
-/// メッセージを 5 バイトの見出し付きで符号化する（非圧縮）。
-pub(crate) fn encode_message<T: prost::Message>(m: &T) -> Bytes {
-    let len = m.encoded_len();
-    let mut buf = BytesMut::with_capacity(5 + len);
-    buf.put_u8(0);
-    buf.put_u32(len as u32);
-    // 容量を確保済みなので失敗しない
-    let _ = m.encode(&mut buf);
-    buf.freeze()
+/// メッセージを 5 バイトの見出し付きで符号化する（非圧縮）。見出しの領域を空けて codec に書かせ、後で長さを入れる。
+pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, Status> {
+    let mut buf = BytesMut::with_capacity(5 + codec.encoded_len(m));
+    buf.put_bytes(0, 5);
+    codec.encode(m, &mut buf)?;
+    let len = buf.len() - 5;
+    if let Some(s) = send_limit_error(len, MAX_SEND_MESSAGE_SIZE.load(Ordering::Relaxed)) {
+        return Err(s);
+    }
+    let len = u32::try_from(len)
+        .map_err(|_| Status::resource_exhausted(format!("response message too large ({})", len)))?;
+    buf[1..5].copy_from_slice(&len.to_be_bytes());
+    Ok(buf.freeze())
+}
+
+/// 圧縮する設定なら、最小サイズ以上のメッセージを圧縮した枠に作り直す（圧縮フラグ 1）。
+fn compress_frame(frame: Bytes, encoding: Compression) -> Result<Bytes, Status> {
+    if encoding == Compression::Identity
+        || frame.len() - 5 < RESPONSE_COMPRESSION_MIN.load(Ordering::Relaxed)
+    {
+        return Ok(frame);
+    }
+    let c = encoding
+        .compress(&frame[5..], 6)
+        .map_err(|e| Status::internal(format!("failed to compress message: {}", e)))?;
+    let mut buf = BytesMut::with_capacity(5 + c.len());
+    buf.put_u8(1);
+    buf.put_u32(c.len() as u32);
+    buf.extend_from_slice(&c);
+    Ok(buf.freeze())
+}
+
+/// 送信メッセージの上限を超えていたら `RESOURCE_EXHAUSTED`（0 = 無制限）。
+fn send_limit_error(len: usize, max: usize) -> Option<Status> {
+    (max > 0 && len > max).then(|| {
+        Status::resource_exhausted(format!(
+            "response message larger than max ({} vs. {})",
+            len, max
+        ))
+    })
 }
 
 /// 応答のメッセージ列を本文の断片とトレーラに変える（最後に `grpc-status`、途中の `Err` はその状態で終える）。
-struct GrpcBody<S> {
+struct GrpcBody<S, C> {
     inner: S,
+    codec: C,
+    /// 応答の圧縮（F-209 #2）。`Identity` なら圧縮しない
+    encoding: Compression,
+    /// gRPC-Web（F-209 #4）: トレーラを本文の最後の枠で送る。`Some(Some(_))` は `-text`（base64）
+    web: Option<Option<web::Base64Encoder>>,
     trailers: Option<Metadata>,
     deadline: Option<Instant>,
 }
 
-impl<S, T> Stream for GrpcBody<S>
+impl<S, C> GrpcBody<S, C> {
+    /// 本文の断片（gRPC-Web の `-text` なら base64 にする）。
+    fn data(&mut self, b: Bytes) -> BodyChunk {
+        match &mut self.web {
+            Some(Some(enc)) => BodyChunk::Data(enc.encode(&b)),
+            _ => BodyChunk::Data(b),
+        }
+    }
+
+    /// 最後のトレーラ（gRPC-Web は本文の最後の枠）。この後は `None` を返す。
+    fn end(&mut self, trailers: Metadata) -> BodyChunk {
+        self.trailers = None;
+        match &mut self.web {
+            None => BodyChunk::Trailers(trailers),
+            Some(None) => BodyChunk::Data(web::trailer_frame(&trailers)),
+            Some(Some(enc)) => {
+                let mut out = BytesMut::from(&enc.encode(&web::trailer_frame(&trailers))[..]);
+                out.extend_from_slice(&enc.finish());
+                BodyChunk::Data(out.freeze())
+            }
+        }
+    }
+}
+
+impl<S, T, C> Stream for GrpcBody<S, C>
 where
     S: Stream<Item = Result<T, Status>> + Unpin,
-    T: prost::Message,
+    C: Codec<T> + Unpin,
 {
     type Item = BodyChunk;
 
@@ -457,32 +723,67 @@ where
             return Poll::Ready(None);
         };
         if this.deadline.is_some_and(|d| Instant::now() >= d) {
-            this.trailers = None;
-            return Poll::Ready(Some(BodyChunk::Trailers(
-                Status::deadline_exceeded("deadline exceeded").to_trailers(),
-            )));
+            let t = Status::deadline_exceeded("deadline exceeded").to_trailers();
+            return Poll::Ready(Some(this.end(t)));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(m))) => Poll::Ready(Some(BodyChunk::Data(encode_message(&m)))),
-            Poll::Ready(Some(Err(s))) => {
-                this.trailers = None;
-                Poll::Ready(Some(BodyChunk::Trailers(s.to_trailers())))
-            }
+            Poll::Ready(Some(Ok(m))) => match encode_message(&this.codec, &m)
+                .and_then(|b| compress_frame(b, this.encoding))
+            {
+                Ok(b) => Poll::Ready(Some(this.data(b))),
+                Err(s) => Poll::Ready(Some(this.end(s.to_trailers()))),
+            },
+            Poll::Ready(Some(Err(s))) => Poll::Ready(Some(this.end(s.to_trailers()))),
             Poll::Ready(None) => {
                 let mut t = Status::new(Code::Ok, "").to_trailers();
                 t.extend(ok_trailers.iter().cloned());
-                this.trailers = None;
-                Poll::Ready(Some(BodyChunk::Trailers(t)))
+                Poll::Ready(Some(this.end(t)))
             }
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
+/// 受け付ける `grpc-encoding`（`compression` feature 無しのビルドでは identity だけ。B-127）。
+const GRPC_ACCEPT_ENCODING: &str = if cfg!(feature = "compression") {
+    "identity,gzip,deflate"
+} else {
+    "identity"
+};
+
 fn grpc_head(status: u16) -> super::response::Response {
     super::response::Response::new(status)
         .with_header("content-type", "application/grpc")
-        .with_header("grpc-accept-encoding", "identity,gzip,deflate")
+        .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING)
+}
+
+/// gRPC-Web の応答ヘッダ（要求と同じ `content-type`・CORS）。
+fn web_head(w: &web::WebMode) -> super::response::Response {
+    let mut r = super::response::Response::new(200)
+        .with_header("content-type", w.content_type.clone())
+        .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING);
+    r.headers.extend(w.cors.iter().cloned());
+    r
+}
+
+/// エラーだけを返す応答。gRPC-Web は状態をヘッダにも載せ、本文にトレーラの枠を置く
+/// （ブラウザは CORS で公開されていないヘッダを読めないことがあるため両方に置く）。
+fn error_response(web: &Option<web::WebMode>, status: &Status) -> super::response::Response {
+    let Some(w) = web else {
+        return trailers_only(status);
+    };
+    let mut r = web_head(w);
+    let t = status.to_trailers();
+    let frame = web::trailer_frame(&t);
+    r.headers.extend(t);
+    if w.text {
+        let mut enc = web::Base64Encoder::default();
+        let mut b = BytesMut::from(&enc.encode(&frame)[..]);
+        b.extend_from_slice(&enc.finish());
+        r.with_body(b.freeze())
+    } else {
+        r.with_body(frame)
+    }
 }
 
 /// エラーだけを返す応答（Trailers-Only: `grpc-status` を応答ヘッダに載せて本文無しで終える）。
@@ -493,20 +794,41 @@ fn trailers_only(status: &Status) -> super::response::Response {
 }
 
 /// メッセージ列の応答。
-fn stream_response<S, T>(resp: Response<S>, deadline: Option<Instant>) -> super::response::Response
+fn stream_response<S, T, C>(
+    resp: Response<S>,
+    deadline: Option<Instant>,
+    codec: C,
+    accepts: u8,
+    web: Option<web::WebMode>,
+) -> super::response::Response
 where
     S: Stream<Item = Result<T, Status>> + Send + Unpin + 'static,
-    T: prost::Message + 'static,
+    T: 'static,
+    C: Codec<T> + Unpin,
 {
     let Response {
         metadata,
         message,
         trailers,
+        compression,
     } = resp;
-    let mut head = grpc_head(200);
+    let encoding = response_encoding(compression, accepts);
+    let mut head = match &web {
+        None => grpc_head(200),
+        Some(w) => web_head(w),
+    };
+    if encoding != Compression::Identity {
+        head.headers.push((
+            Bytes::from_static(b"grpc-encoding"),
+            Bytes::from_static(encoding.as_bytes()),
+        ));
+    }
     head.headers.extend(metadata);
     let body = GrpcBody {
         inner: message,
+        codec,
+        encoding,
+        web: web.map(|w| w.text.then(web::Base64Encoder::default)),
         trailers: Some(trailers),
         deadline,
     };
@@ -522,32 +844,45 @@ struct Call {
     metadata: Metadata,
     deadline: Option<Instant>,
     encoding: GrpcCompression,
+    /// `grpc-accept-encoding`（`accepted_encodings` のビット）
+    accepts: u8,
+    /// gRPC-Web の要求なら `Some`（F-209 #4）
+    web: Option<web::WebMode>,
     client_ip: IpAddr,
+    path: Bytes,
 }
 
 /// gRPC の要求として受け付けられるかを見る（だめなら返す応答）。
 fn accept(req: &super::request::Request) -> Result<Call, super::response::Response> {
     let ct = req.header("content-type").unwrap_or_default();
-    if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) {
-        return Err(super::response::Response::error(
-            415,
-            "Unsupported Media Type (expected application/grpc)",
-        ));
-    }
-    if req.version == HttpVersion::Http11 {
-        return Err(trailers_only(&Status::internal(
-            "gRPC requires HTTP/2 or HTTP/3",
-        )));
+    // gRPC-Web（`application/grpc-web*`）は本文の最後の枠でトレーラを返す（F-209 #4）。HTTP/1.1 でも受ける
+    let web = web::web_mode(ct.as_bytes()).map(|(text, content_type)| web::WebMode {
+        text,
+        content_type,
+        cors: web::cors_response_headers(req.header("origin")),
+    });
+    if web.is_none() {
+        if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) {
+            return Err(super::response::Response::error(
+                415,
+                "Unsupported Media Type (expected application/grpc)",
+            ));
+        }
+        if req.version == HttpVersion::Http11 {
+            return Err(trailers_only(&Status::internal(
+                "gRPC requires HTTP/2 or HTTP/3",
+            )));
+        }
     }
     let encoding = match req.header("grpc-encoding") {
         None => GrpcCompression::Identity,
         Some(v) => match GrpcCompression::from_bytes(v.as_bytes()) {
-            Some(c) => c,
-            None => {
-                return Err(trailers_only(&Status::unimplemented(format!(
-                    "grpc-encoding '{}' is not supported",
-                    v
-                ))))
+            Some(c) if c.is_supported() => c,
+            _ => {
+                return Err(error_response(
+                    &web,
+                    &Status::unimplemented(format!("grpc-encoding '{}' is not supported", v)),
+                ))
             }
         },
     };
@@ -576,8 +911,42 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
         metadata,
         deadline,
         encoding,
+        accepts: accepted_encodings(req.header("grpc-accept-encoding")),
+        web,
         client_ip: req.client_ip(),
+        path: req.path.clone(),
     })
+}
+
+/// どのルートにも当たらなかった要求が通常の gRPC（gRPC-Web を除く）なら、Trailers-Only の `UNIMPLEMENTED` の
+/// 応答ヘッダ（`:status` 200 で送る）。プロトコル側の 404 の代わりに使う（F-209 #9）。gRPC の仕様では
+/// HTTP の 404 は `UNIMPLEMENTED` と読み替えられるが、ログ・メトリクスに 404 が出てクライアントのメッセージも曖昧になる。
+pub(crate) fn unknown_route_response<'a>(
+    mut headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    path: &[u8],
+) -> Option<Metadata> {
+    let ct = headers
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"content-type"))?
+        .1;
+    if !crate::grpc::headers::is_grpc_content_type(ct) || web::web_mode(ct).is_some() {
+        return None;
+    }
+    let service = path
+        .strip_prefix(b"/")
+        .and_then(|p| p.split(|&b| b == b'/').next())
+        .unwrap_or_default();
+    let mut out = vec![(
+        Bytes::from_static(b"content-type"),
+        Bytes::from_static(b"application/grpc"),
+    )];
+    out.extend(
+        Status::unimplemented(format!(
+            "service {} is not implemented",
+            String::from_utf8_lossy(service)
+        ))
+        .to_trailers(),
+    );
+    Some(out)
 }
 
 /// 期限付きで Future を待つ（期限切れは `DEADLINE_EXCEEDED`）。
@@ -601,7 +970,7 @@ where
 }
 
 /// 単項の要求メッセージを 1 つ読む（0 個・2 個以上はエラー）。
-async fn read_single<T: prost::Message + Default>(mut s: Streaming<T>) -> Result<T, Status> {
+async fn read_single<T>(mut s: Streaming<T>) -> Result<T, Status> {
     let Some(first) = s.message().await? else {
         return Err(Status::internal("missing request message"));
     };
@@ -613,11 +982,17 @@ async fn read_single<T: prost::Message + Default>(mut s: Streaming<T>) -> Result
     Ok(first)
 }
 
-fn request_parts<T: prost::Message + Default>(
+fn request_parts<T>(
     req: &super::request::Request,
     call: &Call,
+    decode: &DecodeFn<T>,
 ) -> Streaming<T> {
-    Streaming::new(req.take_body_stream(), call.encoding)
+    Streaming::new(
+        req.take_body_stream(),
+        call.encoding,
+        decode.clone(),
+        call.web.as_ref().is_some_and(|w| w.text),
+    )
 }
 
 fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
@@ -628,6 +1003,7 @@ fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
             message,
             deadline,
             client_ip: call.client_ip,
+            path: call.path,
         },
         deadline,
     )
@@ -638,6 +1014,50 @@ fn once<T: Send + 'static>(
     m: T,
 ) -> futures::stream::Once<futures::future::Ready<Result<T, Status>>> {
     futures::stream::once(futures::future::ready(Ok(m)))
+}
+
+impl App {
+    /// gRPC のメソッドを呼ぶ前に `f` を呼ぶ（認証・メタデータの検査等。F-209 #7）。`prefix` は `"/"` で全部、
+    /// `"/pkg.Svc/"` でそのサービスだけ。`Err` を返すとメソッドを呼ばずにその状態で終える（Trailers-Only）。
+    /// gRPC・gRPC-Web 以外の要求（同じ前置きの HTTP のルート）には何もしない。
+    pub fn grpc_interceptor<F>(self, prefix: &str, f: F) -> App
+    where
+        F: Fn(&Request<()>) -> Result<(), Status> + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        self.wrap_on(prefix, move |inner: HandlerFn| -> HandlerFn {
+            let f = f.clone();
+            Arc::new(move |req: super::request::Request| -> HandlerFuture {
+                let ct = req.header("content-type").unwrap_or_default();
+                if req.method() == "OPTIONS"
+                    || !crate::grpc::headers::is_grpc_content_type(ct.as_bytes())
+                {
+                    return inner(req);
+                }
+                match accept(&req) {
+                    Ok(call) => {
+                        let web = call.web.clone();
+                        let (r, _) = make_request(call, ());
+                        match f(&r) {
+                            Ok(()) => inner(req),
+                            Err(s) => Box::pin(futures::future::ready(error_response(&web, &s))),
+                        }
+                    }
+                    Err(resp) => Box::pin(futures::future::ready(resp)),
+                }
+            })
+        })
+    }
+}
+
+/// gRPC-Web のプリフライト（`OPTIONS`）をハンドラの前で返す（F-209 #4）。
+fn with_preflight(func: HandlerFn) -> HandlerFn {
+    Arc::new(move |req: super::request::Request| -> HandlerFuture {
+        if req.method() == "OPTIONS" {
+            return Box::pin(futures::future::ready(web::preflight(&req)));
+        }
+        func(req)
+    })
 }
 
 fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
@@ -653,15 +1073,19 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
         .and_then(|p| p.split_once('/'))
         .map(|(svc, _)| svc)
     {
+        reflection::record_service(service);
         let fallback = format!("/{}/{{*method}}", service);
         if !app.routes.iter().any(|r| r.path == fallback) {
             let func: HandlerFn = Arc::new(|req: super::request::Request| -> HandlerFuture {
                 Box::pin(async move {
                     match accept(&req) {
-                        Ok(_) => trailers_only(&Status::unimplemented(format!(
-                            "method {} is not implemented",
-                            req.path()
-                        ))),
+                        Ok(call) => error_response(
+                            &call.web,
+                            &Status::unimplemented(format!(
+                                "method {} is not implemented",
+                                req.path()
+                            )),
+                        ),
                         Err(r) => r,
                     }
                 })
@@ -671,30 +1095,43 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
                 hidden: true,
                 ..Default::default()
             };
-            app = app.route_fn(&meta.operation_id.clone(), &["POST"], &fallback, func, meta);
+            app = app.route_fn(
+                &meta.operation_id.clone(),
+                &["POST", "OPTIONS"],
+                &fallback,
+                with_preflight(func),
+                meta,
+            );
         }
     }
-    app.route_fn_streaming(path, &["POST"], path, func, meta)
+    app.route_fn_streaming(path, &["POST", "OPTIONS"], path, with_preflight(func), meta)
 }
 
 impl App {
     /// 単項 RPC（1 要求 → 1 応答）を登録する。`path` は `/<package>.<Service>/<Method>`。
-    pub fn grpc_unary<Req, Resp, F, Fut>(self, path: &str, f: F) -> App
+    /// `codec` が要求と応答のメッセージを符号化・復号する（`veil-build` の生成コードは `ProstCodec`）。
+    pub fn grpc_unary<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + Send + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: Send + 'static,
         F: Fn(Request<Req>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<Resp>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let accepts = call.accepts;
+                let web = call.web.clone();
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
                     let m = read_single(body).await?;
@@ -708,17 +1145,22 @@ impl App {
                             metadata,
                             message,
                             trailers,
+                            compression,
                         } = resp;
                         stream_response(
                             Response {
                                 metadata,
                                 message: once(message),
                                 trailers,
+                                compression,
                             },
                             None,
+                            codec,
+                            accepts,
+                            web,
                         )
                     }
-                    Err(s) => trailers_only(&s),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -726,23 +1168,29 @@ impl App {
     }
 
     /// サーバストリーミング RPC（1 要求 → 応答のストリーム）を登録する。
-    pub fn grpc_server_streaming<Req, Resp, S, F, Fut>(self, path: &str, f: F) -> App
+    pub fn grpc_server_streaming<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: 'static,
         S: Stream<Item = Result<Resp, Status>> + Send + 'static,
         F: Fn(Request<Req>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<S>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let accepts = call.accepts;
+                let web = call.web.clone();
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
                     let m = read_single(body).await?;
@@ -751,8 +1199,8 @@ impl App {
                 })
                 .await;
                 match r {
-                    Ok(resp) => stream_response(boxed(resp), deadline),
-                    Err(s) => trailers_only(&s),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts, web),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -760,22 +1208,28 @@ impl App {
     }
 
     /// クライアントストリーミング RPC（要求のストリーム → 1 応答）を登録する。
-    pub fn grpc_client_streaming<Req, Resp, F, Fut>(self, path: &str, f: F) -> App
+    pub fn grpc_client_streaming<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + Send + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: Send + 'static,
         F: Fn(Request<Streaming<Req>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<Resp>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let accepts = call.accepts;
+                let web = call.web.clone();
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
                     Ok(resp) => {
@@ -783,17 +1237,22 @@ impl App {
                             metadata,
                             message,
                             trailers,
+                            compression,
                         } = resp;
                         stream_response(
                             Response {
                                 metadata,
                                 message: once(message),
                                 trailers,
+                                compression,
                             },
                             None,
+                            codec,
+                            accepts,
+                            web,
                         )
                     }
-                    Err(s) => trailers_only(&s),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -801,28 +1260,34 @@ impl App {
     }
 
     /// 双方向ストリーミング RPC（要求のストリーム → 応答のストリーム）を登録する。
-    /// HTTP/2 では要求と応答が全二重で流れる（HTTP/3 では要求本文を受け終えてから呼ばれる）。
-    pub fn grpc_bidi<Req, Resp, S, F, Fut>(self, path: &str, f: F) -> App
+    /// HTTP/2・HTTP/3 とも要求と応答が全二重で流れる（F-209）。
+    pub fn grpc_bidi<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
-        Req: prost::Message + Default + 'static,
-        Resp: prost::Message + 'static,
+        C: Codec<Req> + Codec<Resp> + Unpin,
+        Req: 'static,
+        Resp: 'static,
         S: Stream<Item = Result<Resp, Status>> + Send + 'static,
         F: Fn(Request<Streaming<Req>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Response<S>, Status>> + 'static,
     {
         let f = Arc::new(f);
+        let decode = decode_fn::<Req, C>(&codec);
         let func: HandlerFn = Arc::new(move |req| -> HandlerFuture {
             let f = f.clone();
+            let codec = codec.clone();
+            let decode = decode.clone();
             Box::pin(async move {
                 let call = match accept(&req) {
                     Ok(c) => c,
                     Err(r) => return r,
                 };
-                let body: Streaming<Req> = request_parts(&req, &call);
+                let accepts = call.accepts;
+                let web = call.web.clone();
+                let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
-                    Ok(resp) => stream_response(boxed(resp), deadline),
-                    Err(s) => trailers_only(&s),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts, web),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -839,6 +1304,7 @@ where
         metadata: resp.metadata,
         message: Box::pin(resp.message),
         trailers: resp.trailers,
+        compression: resp.compression,
     }
 }
 

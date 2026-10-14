@@ -111,6 +111,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `build` | VM 内でリリースビルド（既定 `--no-default-features --features full-freebsd\|full-openbsd`） |
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
 | `unit` | VM 内で単体テスト（`--lib`）+ 統合テスト（E2E と同じ feature・環境変数） |
+| `run '<cmd>'` | VM 内のリポジトリで任意のコマンドを実行（ビルドと同じ環境変数。例: `run 'bash tests/api/library_e2e.sh all'`、`run 'cargo test --no-default-features --features full-freebsd --test standalone_e2e'`） |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 | `screen` | QMP の screendump で VGA 画面を PNG に保存（既定 `${WORKDIR}/screen.png`）。シリアルに何も出ない状態の確認用（F-176） |
 | `sendkeys` | QMP の send-key でキー入力（`qmp-sendkeys.py` の引数をそのまま渡す。例: `sendkeys --type 'fsck -y'`）（F-176） |

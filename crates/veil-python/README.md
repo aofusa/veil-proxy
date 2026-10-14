@@ -15,7 +15,7 @@ maturin build --release          # wheel を作る（target/wheels/）
 pip install pydantic             # 任意（モデルによる本文検証・スキーマ生成）
 ```
 
-abi3（Python 3.8 以上、1 つの wheel で全バージョン）です。
+abi3（Python 3.9 以上、1 つの wheel で全バージョン）です。
 
 ## 使い方
 
@@ -79,8 +79,92 @@ Python のハンドラは GIL を握って実行されます。
 - **`offload=False`**: ワーカースレッド上で直接呼びます。自明に軽い処理（定数応答など）専用です。
   重い処理・ブロッキング I/O・長い GIL 保持を置くと、そのワーカーが担当する全接続が止まります。
 
-`veil.run()` は GIL を解放して起動します。async 関数も使えますが、呼び出しごとに `asyncio.run` で実行されます。
+`veil.run()` は GIL を解放して起動します。async 関数はハンドラ用プールのスレッドごとに 1 つのイベントループで実行されます（F-212）。
 Python は純粋な Python ハンドラの並列度を GIL に制限されるため、CPU バウンドな処理は別プロセス構成を検討してください。
+
+## ストリーミング（F-210）
+
+```python
+@veil.get("/stream")
+def stream():                      # ジェネレータ（非同期ジェネレータも可）は断片ごとに text/plain で送る
+    for i in range(3):
+        yield f"line {i}\n"
+
+@veil.get("/sse")
+def sse():                         # Server-Sent Events。要素は str・JSON にできる値・{"event", "data", "id", "retry"}
+    return veil.EventSourceResponse({"event": "tick", "data": {"n": i}} for i in range(3))
+
+@veil.get("/file")
+def file():
+    return veil.StreamingResponse(open("big.bin", "rb"), media_type="application/octet-stream",
+                                  trailers=[("x-checksum", "...")])
+
+@veil.post("/upload", stream_body=True)   # 本文が届く前に呼ぶ
+def upload(req: veil.Request):
+    return str(sum(len(c) for c in req.stream()))   # 届いた順に読む
+```
+
+ストリーミングの応答はハンドラ用プールのスレッドで反復します（`offload=False` のルートでは全量を作ってから送ります）。
+クライアントが切断すると反復を止めます。
+
+## gRPC（F-210）
+
+veil はメッセージの直列化に依存しません（protobuf・betterproto・JSON 等を利用者が選びます）。2 つの層があります。
+
+**基本の層（依存なし）** — grpcio と同じ引数名:
+
+```python
+import veil, veil.grpc
+from demo_pb2 import HelloRequest, HelloReply
+
+@veil.grpc.unary_unary("/demo.v1.Demo/SayHello",
+                       request_deserializer=HelloRequest.FromString,
+                       response_serializer=HelloReply.SerializeToString)
+def say_hello(request, context):
+    return HelloReply(message="Hello " + request.name)
+
+veil.grpc.add_health()                            # grpc.health.v1.Health
+veil.run(listen_cleartext="127.0.0.1:50051")
+```
+
+`unary_stream`・`stream_unary`・`stream_stream` も同じ形で、ストリーミングの入力は反復子、出力は反復子・ジェネレータです。
+直列化関数を省くと `bytes` のまま受け渡します。`async def` と非同期ジェネレータも使えます。
+
+**grpcio の層（`pip install veil-api[grpc]`）** — `grpc_tools.protoc` の生成コードをそのまま使う:
+
+```python
+server = veil.grpc.Server()
+demo_pb2_grpc.add_DemoServicer_to_server(MyServicer(), server)
+server.add_insecure_port("127.0.0.1:50051")
+server.start(); server.wait_for_termination()     # = veil.run(listen_cleartext=...)
+```
+
+`context` は grpcio の `ServicerContext` の主要部分（`abort`・`abort_with_status`・`set_code`・`set_details`・
+`invocation_metadata`・`send_initial_metadata`・`set_trailing_metadata`・`time_remaining`・`is_active`・`peer`）を持ち、
+状態コードは `grpc.StatusCode` も `veil.grpc.StatusCode` も受けます。TLS（HTTP/2・HTTP/3）は
+`app.run(listen=..., tls_cert=..., tls_key=...)` で使います（`add_secure_port` はありません）。
+圧縮・期限・gRPC-Web・`[api] grpc_*` の設定は Rust のハンドラと同じです。
+サンプル: `examples/api/python-grpc/`（`VEIL_GRPC_MODE=grpcio|plain`）。
+
+## L4（TCP・UDP、F-210）
+
+```python
+@veil.l4_tcp("echo", "127.0.0.1:7000")
+class Echo(veil.Protocol):                 # asyncio.Protocol と同じ名前
+    def data_received(self, data):
+        self.transport.write(data)         # コールバックの中でだけ
+
+@veil.l4_udp("udp_echo", "127.0.0.1:7001")
+def udp_echo(data, peer):                  # peer = (host, port)。bytes を返すと応答、None は無応答
+    return data
+```
+
+コールバックはハンドラ用プールで、接続ごとに 1 つずつ順に呼ばれます。
+
+## GraphQL
+
+veil は GraphQL の実装を持ちません。好きなライブラリを普通のルートとして載せます。
+`examples/api/python-graphql/` は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）の例です。
 
 ## 設定
 

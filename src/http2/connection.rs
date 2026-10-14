@@ -1227,7 +1227,13 @@ where
         // アクティビティ更新 (Slow Loris 対策)
         stream.update_activity();
 
-        stream.recv_data(data, end_stream)?;
+        if let Err(e) = stream.recv_data(data, end_stream) {
+            // B-130: 表に残っているが閉じた（こちらが RST_STREAM を送った・応答を終えた）ストリームへの
+            // 行き違いの DATA。接続のクレジットは返す（返さないと、応答を先に返して要求本文の残りを
+            // 断るたびに接続の受信ウィンドウが減り、同じ接続の全ストリームが止まる）。
+            self.maybe_send_window_update(stream_id).await?;
+            return Err(e);
+        }
 
         // WINDOW_UPDATE を送信 (必要に応じて)
         self.maybe_send_window_update(stream_id).await?;
@@ -2475,6 +2481,34 @@ mod tests {
                     .await;
                 assert!(r.is_err_and(|e| e.should_goaway()), "stream {}", id);
             }
+        });
+    }
+
+    /// B-130: 表に残っているが閉じたストリーム（こちらが RST_STREAM を送った直後等）への DATA も、
+    /// 閾値を超えたら接続の受信ウィンドウを補充する（補充しないと同じ接続の後続の要求が止まる）。
+    #[test]
+    fn data_on_closed_stream_still_in_table_replenishes_connection_window() {
+        futures::executor::block_on(async {
+            let mut conn = Http2Connection::new(NullIo, Http2Settings::default());
+            conn.streams.get_or_create_client_stream(1).unwrap();
+            conn.streams.get(1).unwrap().send_rst_stream();
+            assert!(conn.streams.get_ref(1).is_some());
+
+            let full = conn.conn_recv_window;
+            let r = conn
+                .process_frame(Frame::Data {
+                    stream_id: 1,
+                    end_stream: false,
+                    data: vec![0u8; (full as usize / 2) + 1],
+                })
+                .await;
+            let e = r.expect_err("stream error");
+            assert!(!e.should_goaway(), "must not be a connection error: {}", e);
+            assert_eq!(e.rst_stream_id(), Some(1));
+            assert_eq!(
+                conn.conn_recv_window, full,
+                "connection window must be replenished"
+            );
         });
     }
 

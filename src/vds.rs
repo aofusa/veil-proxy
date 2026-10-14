@@ -50,6 +50,9 @@ pub struct VdsConfig {
     pub enabled: bool,
     /// 制御プレーンの URL（`http://host:port[/base]` / `https://...`）。
     pub server: String,
+    /// 制御プレーンを複数（冗長化、F-211）。指定すると `server` より優先し、つながらない・ストリームが
+    /// 失敗したら次を試す（全部を 1 周したらバックオフ）。
+    pub servers: Vec<String>,
     /// ノード ID（空ならホスト名）。
     pub node_id: String,
     pub cluster: String,
@@ -72,6 +75,9 @@ pub struct VdsConfig {
     pub max_response_bytes: usize,
     /// リソース数の上限。
     pub max_resources: usize,
+    /// 起動時に最初のスナップショットを適用するまでリスナーを開かずに待つ上限（ミリ秒、0 = 待たない。F-211）。
+    /// 期限を過ぎたらファイルの設定で開始する（Envoy の `initial_fetch_timeout` 相当）。
+    pub initial_fetch_timeout_ms: u64,
 }
 
 impl Default for VdsConfig {
@@ -79,6 +85,7 @@ impl Default for VdsConfig {
         VdsConfig {
             enabled: false,
             server: String::new(),
+            servers: Vec::new(),
             node_id: String::new(),
             cluster: String::new(),
             token_file: String::new(),
@@ -92,7 +99,58 @@ impl Default for VdsConfig {
             retry_max_ms: 30_000,
             max_response_bytes: 16 * 1024 * 1024,
             max_resources: 10_000,
+            initial_fetch_timeout_ms: 0,
         }
+    }
+}
+
+impl VdsConfig {
+    /// 試す制御プレーンの一覧（`servers`、無ければ `server`）。
+    pub fn server_list(&self) -> Vec<String> {
+        if !self.servers.is_empty() {
+            return self.servers.clone();
+        }
+        if self.server.is_empty() {
+            return Vec::new();
+        }
+        vec![self.server.clone()]
+    }
+}
+
+/// 制御プレーンの一覧を順に試す位置（失敗したら次へ。1 周したらバックオフする）。
+pub(crate) struct ServerRotation {
+    len: usize,
+    idx: usize,
+    fails: usize,
+}
+
+impl ServerRotation {
+    pub(crate) fn new(len: usize) -> Self {
+        ServerRotation {
+            len: len.max(1),
+            idx: 0,
+            fails: 0,
+        }
+    }
+
+    pub(crate) fn current(&self) -> usize {
+        self.idx
+    }
+
+    /// 応答を受け取れた（1 周の数え直し）。
+    pub(crate) fn succeeded(&mut self) {
+        self.fails = 0;
+    }
+
+    /// 今の制御プレーンで失敗した。次へ進め、1 周したら `true`（バックオフしてから試す）。
+    pub(crate) fn failed(&mut self) -> bool {
+        self.idx = (self.idx + 1) % self.len;
+        self.fails += 1;
+        if self.fails >= self.len {
+            self.fails = 0;
+            return true;
+        }
+        false
     }
 }
 
@@ -221,10 +279,14 @@ pub fn apply_overlay(root: &mut toml::Value, overlay: &toml::Value) {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VdsStatus {
     pub connected: bool,
+    /// 今つないでいる（最後に試した）制御プレーン。
+    pub server: String,
     pub version_info: String,
     pub last_error: Option<String>,
     pub updates_acked: u64,
     pub updates_nacked: u64,
+    /// 最後に適用・拒否した時刻（UNIX 秒）。
+    pub last_update_unix: Option<u64>,
 }
 
 static STATUS: std::sync::Mutex<Option<VdsStatus>> = std::sync::Mutex::new(None);
@@ -234,9 +296,48 @@ pub fn status() -> Option<VdsStatus> {
     STATUS.lock().unwrap().clone()
 }
 
+/// 管理エンドポイント（`GET {path_prefix}/vds`）の JSON。VDS が無効なら `{"enabled":false}`。
+pub fn status_json() -> String {
+    match status() {
+        Some(s) => {
+            let mut v = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
+            v["enabled"] = json!(true);
+            v.to_string()
+        }
+        None => "{\"enabled\":false}".into(),
+    }
+}
+
 fn update_status(f: impl FnOnce(&mut VdsStatus)) {
     let mut g = STATUS.lock().unwrap();
     f(g.get_or_insert_with(VdsStatus::default));
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 最初のスナップショットを適用したか（`initial_fetch_timeout_ms` の待ち）。
+static INITIAL: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// 最初のスナップショットの適用を `timeout` まで待つ（起動時だけ。適用したら `true`）。
+fn wait_initial(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut done = INITIAL.0.lock().unwrap();
+    while !*done && !SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        // 停止を見逃さないよう短い間隔で起きる
+        let step = (deadline - now).min(Duration::from_millis(200));
+        done = INITIAL.1.wait_timeout(done, step).unwrap().0;
+    }
+    *done
 }
 
 /// `[vds] enabled = true` なら専用スレッドで制御プレーンへの購読を始める。
@@ -251,18 +352,28 @@ pub fn spawn_if_enabled(config_path: PathBuf) {
     if !cfg.enabled {
         return;
     }
-    if let Err(e) = crate::ctrl_http::parse_url(&cfg.server) {
-        error!("[VDS] vds.server: {}", e);
+    let servers = cfg.server_list();
+    if servers.is_empty() {
+        error!("[VDS] vds.server (or vds.servers) is required");
         return;
     }
+    for s in &servers {
+        if let Err(e) = crate::ctrl_http::parse_url(s) {
+            error!("[VDS] vds.server '{}': {}", s, e);
+            return;
+        }
+    }
+    let wait = Duration::from_millis(cfg.initial_fetch_timeout_ms);
     if cfg.transport == "grpc" {
-        update_status(|_| {});
+        start_status(&servers[0]);
         let spawned = std::thread::Builder::new()
             .name("veil-vds".into())
             .spawn(move || crate::vds_grpc::run(cfg, config_path));
         if let Err(e) = spawned {
             error!("[VDS] failed to spawn the VDS thread: {}", e);
+            return;
         }
+        wait_initial_snapshot(wait);
         return;
     }
     if cfg.transport != "rest" {
@@ -287,12 +398,39 @@ pub fn spawn_if_enabled(config_path: PathBuf) {
             return;
         }
     };
-    update_status(|_| {});
+    start_status(&servers[0]);
     let spawned = std::thread::Builder::new()
         .name("veil-vds".into())
         .spawn(move || run_loop(cfg, client, config_path));
     if let Err(e) = spawned {
         error!("[VDS] failed to spawn the VDS thread: {}", e);
+        return;
+    }
+    wait_initial_snapshot(wait);
+}
+
+fn start_status(server: &str) {
+    update_status(|s| s.server = server.to_string());
+    #[cfg(feature = "metrics")]
+    crate::metrics::vds_set_connected(false);
+}
+
+/// `initial_fetch_timeout_ms` > 0 なら、最初のスナップショットを適用するまで起動を止める（リスナーはまだ開いていない）。
+fn wait_initial_snapshot(wait: Duration) {
+    if wait.is_zero() {
+        return;
+    }
+    info!(
+        "[VDS] waiting up to {} ms for the initial snapshot before opening listeners",
+        wait.as_millis()
+    );
+    if wait_initial(wait) {
+        info!("[VDS] initial snapshot applied; starting");
+    } else {
+        warn!(
+            "[VDS] no snapshot within initial_fetch_timeout_ms ({} ms); starting with the file configuration",
+            wait.as_millis()
+        );
     }
 }
 
@@ -308,7 +446,13 @@ pub(crate) fn node_id(cfg: &VdsConfig) -> String {
 
 fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: PathBuf) {
     let node = node_id(&cfg);
-    info!("[VDS] subscribing to {} as node '{}'", cfg.server, node);
+    let servers = cfg.server_list();
+    let mut rot = ServerRotation::new(servers.len());
+    info!(
+        "[VDS] subscribing to {} as node '{}'",
+        servers.join(", "),
+        node
+    );
     let mut version_info = String::new();
     let mut nonce = String::new();
     let mut error_detail: Option<String> = None;
@@ -343,7 +487,8 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
         let body = serde_json::to_vec(&req).unwrap_or_default();
         // NACK は 1 回だけ伝える（制御プレーンは拒否された版を内容が変わるまで送り直さない）
         error_detail = None;
-        let url = format!("{}/v1/discovery", cfg.server.trim_end_matches('/'));
+        let server = &servers[rot.current()];
+        let url = format!("{}/v1/discovery", server.trim_end_matches('/'));
         let auth = token.as_ref().map(|t| format!("Bearer {}", t));
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
@@ -355,11 +500,13 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
         match client.request("POST", &url, &headers, &body, cfg.max_response_bytes) {
             Ok(r) if r.status == 304 => {
                 backoff = cfg.retry_initial_ms.max(50);
-                update_status(|s| s.connected = true);
+                rot.succeeded();
+                record_connection_to(server);
             }
             Ok(r) if r.status == 200 => {
                 backoff = cfg.retry_initial_ms.max(50);
-                update_status(|s| s.connected = true);
+                rot.succeeded();
+                record_connection_to(server);
                 match handle_response(&r.body, &cfg, &config_path) {
                     Ok((v, n)) => {
                         record_applied(&v);
@@ -383,19 +530,20 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
                     r.status,
                     String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
                 );
-                update_status(|s| {
-                    s.connected = false;
-                    s.last_error = Some(format!("HTTP {}", r.status));
-                });
-                sleep_backoff(&mut backoff, cfg.retry_max_ms);
+                record_connection(false, Some(format!("HTTP {}", r.status)));
+                // 制御プレーンが替わったら nonce は意味を持たない（版は SotW なのでそのまま伝える）
+                nonce.clear();
+                if rot.failed() {
+                    sleep_backoff(&mut backoff, cfg.retry_max_ms);
+                }
             }
             Err(e) => {
-                warn!("[VDS] request to {} failed: {}", cfg.server, e);
-                update_status(|s| {
-                    s.connected = false;
-                    s.last_error = Some(e);
-                });
-                sleep_backoff(&mut backoff, cfg.retry_max_ms);
+                warn!("[VDS] request to {} failed: {}", server, e);
+                record_connection(false, Some(e));
+                nonce.clear();
+                if rot.failed() {
+                    sleep_backoff(&mut backoff, cfg.retry_max_ms);
+                }
             }
         }
     }
@@ -405,12 +553,21 @@ fn run_loop(cfg: VdsConfig, client: crate::ctrl_http::HttpClient, config_path: P
 /// 適用に成功した版を記録する（ACK の前）。
 pub(crate) fn record_applied(version_info: &str) {
     info!("[VDS] applied snapshot version '{}'", version_info);
+    let now = unix_now();
     update_status(|s| {
         s.connected = true;
         s.version_info = version_info.to_string();
         s.last_error = None;
         s.updates_acked += 1;
+        s.last_update_unix = Some(now);
     });
+    #[cfg(feature = "metrics")]
+    crate::metrics::vds_record_update(Some(version_info), now);
+    let mut done = INITIAL.0.lock().unwrap();
+    if !*done {
+        *done = true;
+        INITIAL.1.notify_all();
+    }
 }
 
 /// 拒否した版を記録する（NACK の前）。
@@ -419,10 +576,14 @@ pub(crate) fn record_rejected(kept_version: &str, error: &str) {
         "[VDS] rejected snapshot (keeping version '{}'): {}",
         kept_version, error
     );
+    let now = unix_now();
     update_status(|s| {
         s.last_error = Some(error.to_string());
         s.updates_nacked += 1;
+        s.last_update_unix = Some(now);
     });
+    #[cfg(feature = "metrics")]
+    crate::metrics::vds_record_update(None, now);
 }
 
 /// 接続状態を記録する。
@@ -433,6 +594,20 @@ pub(crate) fn record_connection(connected: bool, error: Option<String>) {
             s.last_error = error;
         }
     });
+    #[cfg(feature = "metrics")]
+    crate::metrics::vds_set_connected(connected);
+}
+
+/// `server` から応答を受け取れた（接続中）。
+pub(crate) fn record_connection_to(server: &str) {
+    update_status(|s| {
+        s.connected = true;
+        if s.server != server {
+            s.server = server.to_string();
+        }
+    });
+    #[cfg(feature = "metrics")]
+    crate::metrics::vds_set_connected(true);
 }
 
 fn sleep_backoff(backoff: &mut u64, max: u64) {
@@ -526,6 +701,37 @@ mod tests {
         assert_eq!(root["route"].as_array().unwrap().len(), 1);
         assert_eq!(root["route"][0]["conditions"]["path"].as_str(), Some("/a"));
         assert_eq!(root["server"]["listen"].as_str(), Some("x"));
+    }
+
+    #[test]
+    fn server_list_and_rotation() {
+        let mut c = VdsConfig {
+            server: "http://a".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.server_list(), vec!["http://a".to_string()]);
+        c.servers = vec!["http://b".into(), "http://c".into()];
+        assert_eq!(
+            c.server_list(),
+            vec!["http://b".to_string(), "http://c".to_string()]
+        );
+        c.servers.clear();
+        c.server.clear();
+        assert!(c.server_list().is_empty());
+
+        // 失敗したら次へ。全部を 1 周したらバックオフ（true）
+        let mut r = ServerRotation::new(3);
+        assert_eq!(r.current(), 0);
+        assert!(!r.failed());
+        assert_eq!(r.current(), 1);
+        r.succeeded();
+        assert!(!r.failed());
+        assert!(!r.failed());
+        assert!(r.failed());
+        assert_eq!(r.current(), 1);
+        let mut one = ServerRotation::new(1);
+        assert!(one.failed());
+        assert_eq!(one.current(), 0);
     }
 
     #[test]

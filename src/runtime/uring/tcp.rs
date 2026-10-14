@@ -19,8 +19,8 @@ use std::task::{Context, Poll};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{
-    alloc_op, detach_op, peek_op_result, remove_op, set_op_waker, submit_sqes, take_op_result,
-    with_ring, OpGuard,
+    alloc_op, cancel_op, detach_op, peek_op_result, remove_op, set_op_waker, submit_sqes,
+    take_op_result, with_ring, OpGuard,
 };
 use crate::runtime::ring::{
     IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
@@ -460,6 +460,22 @@ impl TcpStream {
             buf: Some(buf),
             user_data: 0,
             submitted: false,
+        }
+    }
+
+    /// `wait` の間だけ RECV で待つ（F-205: HTTP/1.1 のキープアライブで次の要求を 1 回の操作で受ける）。
+    ///
+    /// 戻り値の `None` は「`wait` の間に何も届かず、RECV を取り消した」（バッファは返る。呼び出し側は
+    /// バッファを持たない待ち方に切り替える）。期限が来ても op は捨てずに ASYNC_CANCEL を投げて CQE を待つので、
+    /// 取り消しと行き違いで届いたデータも失わない（`ReadFuture` を drop すると失う。F-116）。
+    pub fn read_within<T: IoBufMut>(&self, buf: T, wait: std::time::Duration) -> ReadWithin<T> {
+        ReadWithin {
+            fd: self.fd,
+            buf: Some(buf),
+            user_data: 0,
+            submitted: false,
+            sleep: super::timer::sleep(wait),
+            cancelled: false,
         }
     }
 
@@ -1027,6 +1043,95 @@ impl<T: IoBufMut> Drop for ReadFuture<T> {
         // （タイムアウト等で `timeout(_, read())` の負け側 arm として drop される）。
         // カーネルは buf アドレスをまだ参照しているため、即解放すると UAF。detach して
         // バッファを完了/キャンセルの CQE 到着まで生かし、その後に解放する。
+        if self.submitted {
+            if let Some(buf) = self.buf.take() {
+                detach_op(
+                    self.user_data,
+                    OpGuard::Cleanup(Box::new(move |_res| drop(buf))),
+                );
+            }
+        }
+    }
+}
+
+/// [`TcpStream::read_within`] の Future。
+pub struct ReadWithin<T: IoBufMut> {
+    fd: RawFd,
+    buf: Option<T>,
+    user_data: u64,
+    submitted: bool,
+    sleep: super::timer::Sleep,
+    /// ASYNC_CANCEL を投げた
+    cancelled: bool,
+}
+
+impl<T: IoBufMut> Future for ReadWithin<T> {
+    type Output = (Option<io::Result<usize>>, T);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: 自己参照を持たない（Sleep も Unpin）
+        let this = unsafe { self.get_unchecked_mut() };
+        if !this.submitted {
+            let user_data = alloc_op();
+            let fd = this.fd;
+            let (ptr, len) = {
+                let buf = this
+                    .buf
+                    .as_mut()
+                    .expect("ReadWithin polled after completion");
+                (buf.write_ptr() as u64, buf.bytes_total() as u32)
+            };
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
+                    sqe.opcode = IORING_OP_RECV;
+                    sqe.fd = fd;
+                    sqe.addr_or_splice_off_in = ptr;
+                    sqe.len = len;
+                    sqe.user_data = user_data;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !acquired {
+                remove_op(user_data);
+                let buf = this.buf.take().expect("buffer present on SQ-full");
+                return Poll::Ready((Some(Err(io::Error::from(io::ErrorKind::WouldBlock))), buf));
+            }
+            if let Err(e) = submit_sqes() {
+                remove_op(user_data);
+                let buf = this.buf.take().expect("buffer present on submit error");
+                return Poll::Ready((Some(Err(e)), buf));
+            }
+            this.user_data = user_data;
+            this.submitted = true;
+        }
+        if let Some(n) = take_op_result(this.user_data) {
+            let mut buf = this.buf.take().expect("buffer present at completion");
+            return Poll::Ready(if n == -libc::ECANCELED && this.cancelled {
+                (None, buf)
+            } else if n < 0 {
+                (Some(Err(io::Error::from_raw_os_error(-n))), buf)
+            } else {
+                // SAFETY: カーネルが n バイトを初期化した
+                unsafe { buf.set_init(n as usize) };
+                (Some(Ok(n as usize)), buf)
+            });
+        }
+        set_op_waker(this.user_data, cx.waker().clone());
+        if !this.cancelled && Pin::new(&mut this.sleep).poll(cx).is_ready() {
+            // 期限: 取り消して CQE を待つ（行き違いで届いたデータはそのまま受け取る）
+            cancel_op(this.user_data);
+            this.cancelled = true;
+        }
+        Poll::Pending
+    }
+}
+
+impl<T: IoBufMut> Drop for ReadWithin<T> {
+    fn drop(&mut self) {
+        // 待ちそのものを打ち切られた（アイドルタイムアウト・graceful shutdown で接続を閉じる）。
+        // カーネルが buf を参照しているので CQE まで生かす（`ReadFuture` と同じ）。
         if self.submitted {
             if let Some(buf) = self.buf.take() {
                 detach_op(

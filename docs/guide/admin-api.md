@@ -12,6 +12,7 @@ The admin API exposes runtime management endpoints under a configurable prefix (
 |--------|------|-------------|
 | `GET` | `/__admin/config` | Dump current config as JSON (secrets masked) |
 | `GET` | `/__admin/stats` | Runtime stats (uptime, circuit breaker state) |
+| `GET` | `/__admin/vds` | VDS client status: connected, control plane, applied version, last NACK reason, counts (F-211; `{"enabled":false}` without VDS) |
 | `POST` | `/__admin/reload` | Trigger config hot-reload |
 | `POST` | `/__admin/tls/reload` | Trigger TLS certificate hot-reload |
 | `POST` | `/__admin/cache/purge` | Cache purge (see Cache Purge section) |

@@ -43,6 +43,10 @@ GET /__metrics
 | `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
 | `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
+| `veil_proxy_vds_connected` | Gauge | - | VDS: 制御プレーンが応答している間 1（`[vds] enabled` のときだけ。F-211） |
+| `veil_proxy_vds_applied_info` | Gauge | version_info | VDS: 適用中のスナップショットの版（値は常に 1） |
+| `veil_proxy_vds_updates_total` | Counter | result | VDS: `applied`（適用）・`rejected`（拒否）したスナップショットの数 |
+| `veil_proxy_vds_last_update_timestamp_seconds` | Gauge | - | VDS: 最後にスナップショットを適用・拒否した時刻（UNIX 秒） |
 | `veil_proxy_cache_hits_total` | Counter | host | キャッシュヒット総数 |
 | `veil_proxy_cache_misses_total` | Counter | host | キャッシュミス総数 |
 | `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数 |

@@ -10,7 +10,7 @@ Three front ends share the same implementation:
 
 | Front end | Where | Typical use |
 |-----------|-------|-------------|
-| Rust library | the `veil` crate with the `api` feature set | the fastest option; macros, OpenAPI, tower, GraphQL |
+| Rust library | the `veil` crate with the `api` feature set | the fastest option; macros, OpenAPI, tower, gRPC, any GraphQL library |
 | C API | [`crates/veil-capi`](../../crates/veil-capi/README.md) (`libveil.so` / `libveil.a`, `veil.h`) | C, C++ and any language with a C FFI |
 | Python | [`crates/veil-python`](../../crates/veil-python/README.md) (wheel, `import veil`) | FastAPI-style decorators |
 
@@ -48,7 +48,7 @@ Three front ends share the same implementation:
   handler are executed on a separate handler thread pool (`[api] handler_threads`) through veil's `offload`,
   so a slow database call does not stall other connections.
 - **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-compat`,
-  `tokio-compat-bridge`, `graphql`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
+  `tokio-compat-bridge`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
   produces exactly the same proxy as before.
 - Everything that works for the proxy still works: the `[server]`, `[tls]`, `[security]`, `[logging]`,
   `[prometheus]`, ... sections, SIGHUP reload, graceful shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
@@ -64,10 +64,9 @@ Three front ends share the same implementation:
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
 | `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
 | `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
-| `graphql` | `App::graphql()` for `async-graphql` schemas |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
-| `grpc-handler` | gRPC server on prost messages ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
-| `api-core` | `handler`, `macro`, `openapi`, `graphql`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
+| `grpc-handler` | gRPC server; messages are encoded by a codec you choose (prost through `veil-build`) ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
+| `api-core` | `handler`, `macro`, `openapi`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
 | `api` | `api-core` + `tokio-compat` (the default way to use the library) |
 
 To use the tokio bridge instead, select `features = ["full", "api-core", "tokio-compat-bridge"]`. Enabling both
@@ -204,7 +203,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
 
 Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
 `openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
-`grpc_max_message_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
+`grpc_max_message_size`, `grpc_response_compression`, `grpc_response_compression_min_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
 
@@ -224,6 +223,10 @@ for debugging.
 | `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
 | `tokio_threads` | `2` | worker threads of the bundled tokio runtime (`tokio-compat-bridge` only) |
 | `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
+| `grpc_max_send_message_size` | `0` | maximum size of one sent gRPC message (0 = no limit) |
+| `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
+| `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
+| `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
 
 ## Routing macros
 
@@ -470,8 +473,10 @@ Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works witho
   `sync` (mpsc, oneshot, watch, broadcast, `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`,
   `SetOnce`), `signal`, `fs`, `select!`/`join!`/`try_join!`/`pin!`, `runtime::{Runtime, Builder, Handle}`.
 - Not supported: `process`, runtime metrics, task dumps/tracing hooks, io_uring-backed `fs`, Windows named pipes.
-  On **Windows**, `net` and `signal` are not available yet (F-204), so crates that open sockets themselves
-  (hyper/axum servers, reqwest, sqlx) do not build on the shim there; services mounted with `tokio_service` work.
+  On **Windows** (F-204), `net` has TCP, UDP and `lookup_host` (Unix sockets and `AsyncFd` are unix-only, as in
+  tokio; `net::windows::named_pipe` exists so that crates referring to it build, but pipes cannot be opened), and
+  `signal` has `ctrl_c` and `signal::windows::{ctrl_c, ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown}`
+  (`SetConsoleCtrlHandler`; an event nobody listens for goes on to the next handler, e.g. veil's own Ctrl-C shutdown).
   Crates that need these (or tokio's internals) should use `tokio-compat-bridge`.
 
 ### Compatibility
@@ -504,27 +509,42 @@ shutdown), sqlx with SQLite and PostgreSQL.
 
 ## GraphQL
 
-Requires `graphql`; bring your own `async-graphql` schema (add `async-graphql` to your `Cargo.toml`).
+veil does not depend on a GraphQL library: you pick one (async-graphql, juniper, ...) and mount it as an ordinary
+handler with `App::route_fn` (`GET` and `POST` on one path). The handler reads the query from `Request::body()` or
+`Request::query()` and returns the result as JSON; subscriptions can be streamed as Server-Sent Events with
+`Response::stream`.
+
+[`examples/api/rust-graphql`](../../examples/api/rust-graphql/) does this for async-graphql in one file you can copy
+(`src/graphql.rs`, about 100 lines):
 
 ```rust
-let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-App::new().graphql("/graphql", schema).run()?;
+mod graphql;   // copied from examples/api/rust-graphql/src/graphql.rs
+
+let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-`POST` takes a JSON body (single or batch); `GET` takes `?query=...&variables=...`; a `GET` without a query from a
-browser (`Accept: text/html`) returns GraphiQL. Responses use `application/graphql-response+json` when the client
-asks for it, otherwise `application/json`. Subscriptions are not supported.
+It serves `POST` with a JSON body (single or batch) and `GET` with `?query=...&variables=...`, GraphiQL for a browser
+`GET` without a query (`Accept: text/html`), `application/graphql-response+json` when the client asks for it
+(otherwise `application/json`), and subscriptions over SSE (GraphQL over SSE, distinct connections mode) when the
+request has `Accept: text/event-stream`: one `event: next` per result and a final `event: complete`.
+
+> Up to v0.7 the `graphql` feature provided `App::graphql(path, schema)`. It was removed (F-207) so that the API
+> library does not pull in async-graphql; copy `src/graphql.rs` from the example to keep the same behaviour.
 
 ## gRPC
 
-Requires `grpc-handler` (part of `api`). Messages are [prost](https://docs.rs/prost) types; the wire handling
-(5-byte framing, `grpc-status`/`grpc-message` trailers, `grpc-timeout`, gzip/deflate) is veil's own, and neither
-tokio nor tonic is used. gRPC calls are ordinary handler routes (`POST /<package>.<Service>/<Method>`) on the same
+Requires `grpc-handler` (part of `api`). The wire handling (5-byte framing, `grpc-status`/`grpc-message` trailers,
+`grpc-timeout`, gzip/deflate) is veil's own, and neither tokio nor tonic is used. veil does not depend on a protobuf
+implementation either: messages are encoded and decoded by a **codec** (`veil::api::grpc::Codec<T>`) that you pass
+when a method is registered. Code generated by `veil-build` uses [prost](https://docs.rs/prost) messages and a
+generated `ProstCodec`; any other protobuf library, or JSON, works by implementing `Codec`. gRPC calls are ordinary handler routes (`POST /<package>.<Service>/<Method>`) on the same
 listeners, over HTTP/2 (TLS or h2c) and HTTP/3.
 
 ### Code generation
 
-Add `veil-build` as a build dependency and `prost` as a dependency:
+Add `veil-build` as a build dependency and `prost` (0.13, the version `veil-build`'s prost-build generates code for)
+as a dependency:
 
 ```rust
 // build.rs
@@ -550,22 +570,46 @@ add_greeter(App::new().grpc_health(), MyGreeter).run()
 ```
 
 For each service `veil-build` generates a module `<service>_server` with a trait (one method per RPC; implement
-them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)` and `METHODS`. Server and
+them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)`, `METHODS` and `ProstCodec`
+(the prost codec that `add_<service>` registers the methods with). Server and
 bidirectional streaming methods return `Response<BoxStream<T>>`; client streaming and bidirectional methods receive
 `Request<Streaming<T>>`. `veil_build::configure().veil_path("::my_veil")` changes the crate path and `config_mut()`
 exposes the `prost_build::Config`.
 
 ### Without code generation
 
+Register methods with a codec. A codec for prost messages (`#[derive(prost::Message)]`) is ten lines:
+
 ```rust
+use veil::api::grpc::{Bytes, BytesMut, Codec, Request, Response, Status, Streaming};
+
+#[derive(Clone, Copy)]
+struct ProstCodec;
+impl<T: prost::Message + Default + 'static> Codec<T> for ProstCodec {
+    fn encode(&self, m: &T, out: &mut BytesMut) -> Result<(), Status> {
+        m.encode(out).map_err(|e| Status::internal(e.to_string()))
+    }
+    fn decode(&self, buf: Bytes) -> Result<T, Status> {
+        T::decode(buf).map_err(|e| Status::internal(e.to_string()))
+    }
+    fn encoded_len(&self, m: &T) -> usize { m.encoded_len() }   // optional: one allocation per message
+}
+
 App::new()
-    .grpc_unary("/pkg.Svc/Get", |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
-    .grpc_server_streaming("/pkg.Svc/Watch", |req: Request<WatchRequest>| async move {
+    .grpc_unary("/pkg.Svc/Get", ProstCodec, |req: Request<GetRequest>| async move { Ok(Response::new(reply)) })
+    .grpc_server_streaming("/pkg.Svc/Watch", ProstCodec, |req: Request<WatchRequest>| async move {
         Ok(Response::new(futures::stream::iter(items.into_iter().map(Ok))))
     })
-    .grpc_client_streaming("/pkg.Svc/Upload", |req: Request<Streaming<Chunk>>| async move { .. })
-    .grpc_bidi("/pkg.Svc/Chat", |req: Request<Streaming<Msg>>| async move { .. })
+    .grpc_client_streaming("/pkg.Svc/Upload", ProstCodec, |req: Request<Streaming<Chunk>>| async move { .. })
+    .grpc_bidi("/pkg.Svc/Chat", ProstCodec, |req: Request<Streaming<Msg>>| async move { .. })
 ```
+
+`veil::api::grpc::BytesCodec` passes the encoded message through as `Bytes` (`Request<Bytes>`, `Response<Bytes>`),
+for example to decode it yourself or to forward it.
+
+> Up to v0.7 the methods took no codec and required prost messages, and `veil::api::grpc::prost` re-exported prost.
+> Since F-208 code generated by `veil-build` registers `ProstCodec` itself (rebuild to update); hand-written
+> registrations add a codec argument as above, and depend on `prost` directly.
 
 ### Types and behaviour
 
@@ -574,13 +618,18 @@ App::new()
 | `Request<T>` | `get_ref()`, `into_inner()`, `metadata()` / `metadata_value(name)` (request headers except `content-type`, `te`, `grpc-timeout`, `grpc-encoding`), `deadline()`, `client_ip()` |
 | `Response<T>` | `with_metadata(name, value)` (response headers), `with_trailer(name, value)` (after `grpc-status: 0`) |
 | `Status` | `Status::new(Code::X, msg)` or `Status::not_found(msg)` etc., `with_metadata` adds trailers. An error before the first message is sent as a Trailers-Only response |
+| Error details | `Status::with_details(bytes)` sends an encoded `google.rpc.Status` (with `BadRequest`, `ErrorInfo`, ...) as `grpc-status-details-bin`; encode it with the protobuf library you use |
+| Interceptors | `App::grpc_interceptor(prefix, \|req: &Request<()>\| -> Result<(), Status>)` runs before every gRPC method under `prefix` (`"/"` or `"/pkg.Svc/"`) with the metadata, deadline, client address and `method()`; an `Err` ends the call with that status (authentication, quotas). Other requests on the same prefix pass through |
+| Send limit | `[api] grpc_max_send_message_size` (default 0 = no limit): a larger response message ends the call with `RESOURCE_EXHAUSTED` |
 | `Streaming<T>` | `Stream<Item = Result<T, Status>>` and `message().await` |
 | Deadline | `grpc-timeout` is enforced with veil's timer: the handler is cancelled and the call ends with `DEADLINE_EXCEEDED` (for streams, checked between messages) |
 | Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
-| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed; responses are sent uncompressed (`grpc-accept-encoding: identity,gzip,deflate`) |
-| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded |
-| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
+| Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed (needs the `compression` feature, which `full` includes; without it only `identity` is accepted and other encodings get `UNIMPLEMENTED`); responses are compressed when `[api] grpc_response_compression` (or `Response::with_compression(Compression::Gzip)` for one call) names an encoding that the client accepts in `grpc-accept-encoding`, for messages of at least `grpc_response_compression_min_size` bytes; otherwise they are sent uncompressed |
+| Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded. For a compressed message the limit applies to the decompressed size, and decompression stops as soon as it is exceeded |
+| gRPC-Web | `application/grpc-web`, `application/grpc-web+proto` and the base64 variants `application/grpc-web-text(+proto)` are served by the same methods, over HTTP/1.1, HTTP/2 and HTTP/3: the trailers come as the last frame of the body (flag `0x80`), so browsers (grpc-web, Connect) call veil directly without a translating proxy. `OPTIONS` preflights are answered from `[api] grpc_web_cors_origins` |
+| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call (not gRPC-Web) over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service, or a gRPC call to a path that no route serves, gets `UNIMPLEMENTED` |
 | Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
+| Reflection | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` registers `grpc.reflection.v1` and `v1alpha` (`ServerReflectionInfo`), so grpcurl, Postman and grpcui list the services and fetch their types without the `.proto` files. `FILE_DESCRIPTOR_SET` is generated by `veil-build`; pass one per compiled package. `list_services` reports every registered gRPC service; the types of the built-in health and reflection services are not described |
 
 gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming
 kinds, deadlines, errors, health), tested with a tonic client and an HTTP/3 client by
@@ -714,9 +763,31 @@ Settings are applied with `veil_config_set(cfg, "server.threads", "4")`, and `VE
 Details (ownership table, error codes, API list): [crates/veil-capi/README.md](../../crates/veil-capi/README.md).
 Example: [examples/api/c-hello/](../../examples/api/c-hello/).
 
+**Streaming, gRPC and L4 (F-210).** The C API has the same features as the Rust one; veil only moves bytes, and
+you serialize messages with the library of your choice (protobuf-c, nanopb, upb, ...):
+
+- Streaming response: `veil_stream_t *s = veil_response_stream(resp)` sends the status and headers set so far and
+  returns a handle that stays valid after the callback returns (another thread may keep writing);
+  `veil_stream_write` (copies, waits when the queue is full, `VEIL_ERR_CLOSED` after the client left),
+  `veil_stream_set_trailer`, and `veil_stream_close` (required; ends the body and frees the handle).
+- Request body: `veil_request_body_read(req, buf, cap)` reads the next chunk (0 = end). With the route flag
+  `VEIL_ROUTE_STREAM_BODY` the callback is called before the body has arrived and chunks are returned as they come.
+- gRPC: `veil_register_grpc(cfg, "/pkg.Svc/Method", VEIL_GRPC_UNARY | ..._SERVER_STREAMING | ..._CLIENT_STREAMING | ..._BIDI, fn, ud)`;
+  inside the callback `veil_grpc_recv` / `veil_grpc_send` (encoded message bytes), `veil_grpc_set_status`,
+  `veil_grpc_set_header` / `_set_trailer`, `veil_grpc_metadata`, `veil_grpc_deadline_ms`.
+  `veil_register_grpc_health(cfg)` adds `grpc.health.v1.Health`. Compression, deadlines, gRPC-Web and the
+  `[api] grpc_*` keys behave as for Rust handlers; HTTP/2 and HTTP/3 both work.
+- L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)` with `on_connect` / `on_data` / `on_close`
+  (called on the handler pool, one at a time per connection; `veil_l4_write` / `veil_l4_close` inside a callback),
+  and `veil_register_l4_udp(cfg, name, listen, fn, ud)` (`veil_l4_reply` answers a datagram).
+- Streaming functions cannot be used on `VEIL_ROUTE_INLINE` routes (`VEIL_ERR_STATE`).
+
+Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
+interoperability checks as the Rust gRPC example).
+
 ## Python
 
-`crates/veil-python` is a PyO3 extension (abi3, Python 3.8+) imported as `veil`:
+`crates/veil-python` is a PyO3 extension (abi3, Python 3.9+) imported as `veil`:
 
 ```bash
 pip install maturin
@@ -748,12 +819,38 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   handler pool, so the event loop never waits for the GIL. `offload=False` runs on the network worker and is for
   trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
   several processes.
+- **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
+  `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
+  handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
+  into the response in Rust without copying the body (F-212). `async def` handlers run on one event loop per
+  handler-pool thread. Python 3.9 or later is required.
+- **Streaming (F-210).** Return a generator or async generator (sent chunk by chunk as `text/plain`), a
+  `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`, or a `veil.EventSourceResponse(iterable)` for
+  Server-Sent Events (items are strings, JSON-able values or `{"event", "data", "id", "retry"}` dicts).
+  `@veil.post(..., stream_body=True)` calls the handler before the body has arrived; `for chunk in request.stream()`
+  reads it as it comes (it also works in `async def` handlers, blocking the pool thread for each chunk).
+- **gRPC (F-210)** in `veil.grpc`, with no dependency: `@veil.grpc.unary_unary("/pkg.Svc/Method",
+  request_deserializer=Req.FromString, response_serializer=Resp.SerializeToString)` and `unary_stream`,
+  `stream_unary`, `stream_stream` (the same argument names as grpcio, so any serializer works: protobuf,
+  betterproto, JSON, or raw `bytes` when omitted). The `context` has the main methods of grpcio's
+  `ServicerContext` (`abort`, `set_code`, `set_details`, `invocation_metadata`, `send_initial_metadata`,
+  `set_trailing_metadata`, `time_remaining`, `is_active`). With `pip install veil-api[grpc]`, code generated by
+  `grpc_tools.protoc` runs unchanged: pass `veil.grpc.Server()` to `add_<Service>Servicer_to_server`, then
+  `server.add_insecure_port(...)` and `server.wait_for_termination()`. `veil.grpc.add_health()` adds
+  `grpc.health.v1.Health`. `async def` methods and async generators work.
+- **L4 (F-210):** `@veil.l4_tcp(name, listen)` on a `veil.Protocol` subclass (`connection_made` /
+  `data_received` / `connection_lost`, like asyncio; `self.transport.write` inside a callback) and
+  `@veil.l4_udp(name, listen)` on `def f(data, peer) -> bytes | None`.
+- **GraphQL:** mount any library as an ordinary route; [examples/api/python-graphql/](../../examples/api/python-graphql/)
+  uses strawberry (queries, mutations, and subscriptions over SSE).
 - Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
 Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Examples:
 [examples/api/python-hello/](../../examples/api/python-hello/),
-[examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/).
+[examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/),
+[examples/api/python-features/](../../examples/api/python-features/) (streaming, L4),
+[examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer).
 
 ## Building library artifacts
 
@@ -789,12 +886,13 @@ time of the server's cores (including the kernel's loopback processing) divided 
 | axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
 | veil `App` + axum `Router` (`tokio_service`) | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
 | veil `App` + axum `Router` (epoll) | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
-| veil native handler (`#[veil::route]`) | 64,546 | 58,524 | 2.14 | 31.7 | 11.3 |
-| veil native handler (epoll) | 66,722 | 60,461 | 2.65 | 30.9 | 9.6 |
+| veil native handler (`#[veil::route]`) | 68,832 | 63,069 | 2.83 | 29.4 | 11.4 |
+| veil native handler (epoll) | 67,013 | 61,303 | 2.78 | 30.2 | 10.0 |
 
-The four veil rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head and a
-small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s; before
-F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) req/s for plaintext.
+The `App` + `Router` rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head
+and a small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s;
+before F-202 they were 33,349 / 36,702 req/s. The two native rows were re-measured after F-205 (5 alternating rounds
+against axum + tokio per-core at 66,980 / 61,184 req/s in the same run; `docs/artifacts/f206_final_h1.tsv`).
 
 - **axum runs on `veil::tokio` unchanged** (the same source, with the `tokio` crate patched to the shim). Per core it
   reaches about **80% (io_uring) to 84% (epoll)** of axum on tokio, and uses 20–25% more CPU per request.
@@ -802,11 +900,29 @@ F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) r
   connection task stays on the thread that accepted it (the server cores are only ~85% busy out of 200%). For
   multi-core use, run one current-thread runtime and one `SO_REUSEPORT` listener per thread (the "per-core" rows,
   `run_percore` in `tools/api-bench/common.rs`), or mount the router in a veil `App`, whose workers each accept.
-- **veil's native handler reaches 98% (epoll) / 93% (io_uring) of axum on tokio** (5-round re-measurement), with
-  about the same CPU per request (30.5–31.7 µs against 29.3 µs). The remaining io_uring gap is the keep-alive wait:
-  the next request is awaited with a readiness poll and then read (two operations, so idle connections hold no read
-  buffer), which is tracked as F-205. Mounting an axum `Router` adds a conversion to and from
-  `http::Request`/`http::Response` (most of its 30 allocations per request are in http/axum).
+- **veil's native handler reaches 103% (io_uring) / 100% (epoll) of axum on tokio** for both endpoints, with less or
+  equal CPU per request (29.4 / 30.2 µs against 30.5 µs). On io_uring a keep-alive connection that sends its next
+  request quickly is read with one bounded `RECV` instead of a readiness poll followed by a read (F-205,
+  `[performance] keepalive_direct_read_ms`); idle connections still hold no read buffer. Mounting an axum `Router`
+  adds a conversion to and from `http::Request`/`http::Response` (most of its 30 allocations per request are in
+  http/axum).
+
+### HTTP/2 (h2c) and HTTP/3
+
+`h2load -t2 -c64 -m10 -D10` (h2c; HTTP/3 with an h2load built with ngtcp2), same machine and endpoints, 3 alternating
+rounds, median (`docs/artifacts/f206_final_{h2c,h3}.tsv`). axum has no HTTP/3, so the HTTP/3 rows have nothing to
+compare against and are kept to watch for regressions.
+
+| Target | protocol | plaintext req/s | json req/s | CPU µs/req (plaintext) |
+|---|---|---:|---:|---:|
+| axum + tokio, per-core (hyper HTTP/2) | h2c | 87,586 | 78,050 | 23.3 |
+| veil native handler | h2c | 123,615 | 109,938 | 16.6 |
+| veil native handler (epoll) | h2c | 126,200 | 110,824 | 16.2 |
+| veil native handler (TLS) | HTTP/3 | 69,039 | 63,752 | 29.5 |
+| veil native handler (TLS, epoll) | HTTP/3 | 83,638 | 76,200 | 24.4 |
+
+Over h2c veil serves **1.4× the requests of axum on tokio** with 30% less CPU per request (the frames of all
+streams of a connection that are ready in one loop iteration go out in one write).
 
 ### Python: FastAPI (uvicorn) and veil
 
@@ -815,13 +931,16 @@ F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) r
 | FastAPI `async def`, uvicorn 1 worker | 5,502 | 4,333 | 14.46 | 189.4 | 49.4 |
 | FastAPI `async def`, uvicorn 2 workers | 6,859 | 5,473 | 10.17 | 296.2 | 136.4 |
 | FastAPI `def`, uvicorn 2 workers | 3,661 | 3,174 | 50.23 | 551.5 | 140.6 |
-| veil, `offload=True` (default), 2 threads | 15,467 | 11,726 | 10.99 | 106.4 | 31.1 |
-| veil, `offload=False`, 2 threads | 17,110 | 12,737 | 4.07 | 118.4 | 30.4 |
+| veil, `offload=True` (default), 2 threads | 25,494 | 22,567 | 6.70 | 71.1 | 31.3 |
+| veil, `offload=False`, 2 threads | 26,229 | 24,226 | 2.95 | 77.0 | 30.4 |
 
 FastAPI 0.143 / uvicorn 0.54 with uvloop and httptools; pydantic 2. uvicorn's workers are processes, veil runs one
-process. veil serves **2.1–2.5× the requests of FastAPI with 2 workers** (2.7–3.1× of one worker) with less than
-half the CPU per request and less than a quarter of the memory, because HTTP parsing, routing and the response are
-done in Rust and only the handler body runs in Python. Python handlers are still serialized by the GIL, so a
+process. The veil rows were re-measured after F-212 (5 alternating rounds against the previous binding,
+`docs/artifacts/f212_ab_py.tsv`; before F-212: 15,848 / 12,237 req/s and 110 µs/req with `offload=True`); the
+FastAPI rows are from the F-201 run. veil serves **3.7–4.4× the requests of FastAPI with 2 workers** (4.6–5.6× of one
+worker) with about a quarter of the CPU per request and less than a quarter of the memory, because HTTP parsing,
+routing and the response are done in Rust and only the handler body runs in Python (the request object is created in
+Rust and only the attributes the handler reads become Python objects). Python handlers are still serialized by the GIL, so a
 single process does not scale with cores; `offload=True` keeps the event loop free of the GIL at the cost of a
 handoff to the handler pool (the higher p99).
 
@@ -837,7 +956,7 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 | FreeBSD 14.3 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | OpenBSD 7.9 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | NetBSD 10.1 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Windows 11 x86_64 (WSAPoll) | ✓ (no SIGHUP/secret-swap tests) | ✓ (no SIGHUP) | ✓ | ✓ (MSVC) | ✓ | – (no `net`, F-204) |
+| Windows 11 x86_64 (WSAPoll) | ✓ (no SIGHUP/secret-swap tests) | ✓ (no SIGHUP) | ✓ | ✓ (MSVC) | ✓ | ✓ (F-204) |
 
 - **Windows** has no signals: configuration reload with SIGHUP and graceful shutdown on SIGTERM are not available
   (Ctrl-C stops the process). `veil::tokio` has no `net`/`signal` there yet (see [tokio compatibility](#tokio-compatibility)).
@@ -850,7 +969,8 @@ tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: a
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
-with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, streaming, HTTP/1.1 and h2c), runs the gRPC
+with curl (routing, validation, OpenAPI, tower, L4 echo, streaming, HTTP/1.1 and h2c, and GraphQL with SSE
+subscriptions through `examples/api/rust-graphql`), runs the gRPC
 interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
 and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
@@ -863,10 +983,7 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
-- GraphQL subscriptions are not supported.
-- gRPC: over HTTP/3 the request stream is read completely before the handler runs (bidirectional calls are half
-  duplex there); responses are not compressed; gRPC-Web, server reflection and C/Python gRPC handlers are not
-  available yet.
+- gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
 - Python handlers are bound by the GIL; C callbacks must be thread-safe.
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
   (`/openapi.json` works offline).

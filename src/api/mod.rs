@@ -22,6 +22,8 @@
 //! 設計: `docs/backlog/features/F-188-api-library-core.md`。利用者向けガイド: `docs/guide/library.md`。
 
 pub mod app;
+/// ワーカーとハンドラ用プールの間の有界キュー（C・Python のストリーミング・gRPC・L4。F-210）
+pub mod bridge;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod extract;
@@ -43,9 +45,6 @@ pub mod tower;
 
 #[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 pub mod tokio_compat;
-
-#[cfg(feature = "graphql")]
-pub mod graphql;
 
 #[cfg(feature = "l4-handler")]
 pub mod l4;

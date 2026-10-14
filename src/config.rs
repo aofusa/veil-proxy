@@ -4026,6 +4026,14 @@ pub struct PerformanceConfigSection {
     // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub per_stream_pipe_enabled: bool,
 
+    /// HTTP/1.1 のキープアライブで、応答を返した直後に次の要求を蓄積バッファへ直接読みにいく時間（ミリ秒、F-205）。
+    ///
+    /// 未指定は 20。この間に届けば「待つ → 読む」の 2 段を io_uring の RECV 1 回にでき、届かなければ読みを
+    /// 取り消してバッファを返し、従来どおりバッファを持たない待ち方に戻る（B-101）。0 で無効（常に従来の待ち方）。
+    /// 平文の接続・io_uring だけが対象（reactor は先に待つ）。
+    #[serde(default)]
+    pub keepalive_direct_read_ms: Option<u64>,
+
     // ====================
     // OpenFileCache設定
     // ====================
@@ -4060,6 +4068,13 @@ pub struct PerformanceConfigSection {
     /// デフォルト: 10000
     #[serde(default = "default_open_file_cache_max_entries")]
     pub open_file_cache_max_entries: usize,
+}
+
+impl PerformanceConfigSection {
+    /// `keepalive_direct_read_ms`（未指定は 20ms。F-205）。
+    pub fn keepalive_direct_read(&self) -> Duration {
+        Duration::from_millis(self.keepalive_direct_read_ms.unwrap_or(20))
+    }
 }
 
 fn default_open_file_cache_valid_duration() -> u64 {

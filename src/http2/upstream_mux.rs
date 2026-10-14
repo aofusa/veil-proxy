@@ -1501,6 +1501,9 @@ mod tests {
 
     fn run<F: std::future::Future<Output = ()> + 'static>(f: F) {
         crate::runtime::block_on(f);
+        // B-118: 試験のスレッドでも、抜けたらランタイムを片付けてからスレッドを終える（残った op・タスクを
+        // スレッドローカルの破棄の途中で drop すると、破棄済みの表に触れて abort する）
+        crate::runtime::shutdown_thread();
     }
 
     /// アクターの終了を待つ（タスクを残したままランタイムを抜けないため）。

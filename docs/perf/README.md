@@ -193,6 +193,30 @@ F-202 は HTTP/1.1 の共通経路（ヘッダ位置・ルーティング用の�
 初期化）は HTTP/1.1 が両方の順番で 0.98〜0.996 だったので、配列を u16 の位置（512 バイト）と 16 個まで（それより多いときだけ
 確保）に縮めた。ハンドラ経路そのものの結果は [library.md の Performance](../guide/library.md#performance) と F-202。
 
+## API ロードマップ（B-127〜B-130・F-204〜F-212）の非退行確認（2026-10-14、feat/api-roadmap-impl）
+
+このブランチはデータプレーンの共通経路も変えた（F-205: io_uring の平文 HTTP/1.1 のキープアライブで次の要求を
+蓄積バッファへ直接 `RECV`、B-129: HTTP/1.1 のパイプライン、B-130: HTTP/2 の受信ウィンドウの補充、B-128: io_uring の
+制限で `IOSQE_BUFFER_SELECT` を許可＝HTTP/3 の multishot 受信が有効に）。main（566010fc、`veil:mainbase`）と
+ブランチ（`veil:apinew`）の glibc `full` イメージを、`suite_ab.sh` と同じ交互の方法で代表 11 構成について測った
+（構成ごとに順番を入れ替え、各 3 回の中央値の比、新 / 旧。`tools/perf/results/suite_ab/api_roadmap_ab.tsv`）。
+
+| 構成 | プロトコル | 比 |
+|------|-----------|---:|
+| h2c 静的配信 / プロキシ | h2c | 0.994 / 0.981 |
+| HTTP/1.1 のみ（kTLS 無・有、ofc 有効） | HTTP/1.1 | 0.991 / 0.980 |
+| h2 有効（kTLS 無、ofc 有効） | HTTP/1.1・HTTP/2 | 0.995・1.000 |
+| プロキシ（h2 有効） | HTTP/1.1・HTTP/2 | 1.002・1.029 |
+| gRPC（h2 / h3） | gRPC | 0.990 / 1.023 |
+| WebSocket | WebSocket | 1.047 |
+| HTTP/3 プロキシ | HTTP/1.1・HTTP/2・HTTP/3 | 0.988・1.005・1.014 |
+| HTTP/3 静的配信（キャッシュ） | HTTP/1.1・HTTP/2・HTTP/3 | 1.008・1.048・1.001 |
+
+全 17 組の比の中央値 1.001（0.980〜1.048、0.95 未満は無し）で退行は無い。F-205 が効く平文の HTTP/1.1 はこのスイートに
+無い（TLS の構成は対象外の経路）ので、効果は API ライブラリのベンチで見た（io_uring で +6.7%（plaintext）・+8.1%（json）、
+[library.md の Performance](../guide/library.md#performance)・F-205）。B-128 で multishot の受信が有効になった HTTP/3 も
+変わらない（API ライブラリの HTTP/3 でも main と同じ。`docs/artifacts/b128_h3_ab.tsv`）。
+
 ## FreeBSD 14.3 aarch64（QEMU + HVF、ネイティブ）
 
 - コミット: `d8126b6`。`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`（3B と 54,576B）

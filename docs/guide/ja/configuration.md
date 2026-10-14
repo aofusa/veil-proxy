@@ -32,6 +32,7 @@
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT振り分け方式 |
 | `[performance]` | `huge_pages_enabled` | `false` | Huge Pagesを有効化 |
+| `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring・平文 HTTP/1.1 のキープアライブで、次の要求をこの時間だけ直接読みにいき、その後はバッファを持たずに待つ（`0` = 常に先に待つ。F-205） |
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数 |
@@ -457,8 +458,9 @@ enable_secure_redirect = false      # 平文で配信する（既定は HTTPS �
 
 ## VDS（`[vds]`）
 
-制御プレーンから配信されるルートとアップストリーム。キー: `enabled`・`server`・`node_id`・`cluster`・`token_file`・`ca_cert`・`client_cert`・
-`client_key`・`poll_timeout_secs`・`retry_initial_ms`・`retry_max_ms`・`max_response_bytes`・`max_resources`。`vds` feature（`full` に含まれる）が必要です。
+制御プレーンから配信されるルートとアップストリーム。キー: `enabled`・`server`・`servers`・`transport`・`keepalive_secs`・`node_id`・`cluster`・
+`token_file`・`ca_cert`・`client_cert`・`client_key`・`poll_timeout_secs`・`retry_initial_ms`・`retry_max_ms`・`max_response_bytes`・
+`max_resources`・`initial_fetch_timeout_ms`。`vds` feature（`full` に含まれる）が必要です。
 優先順位は `config.toml` < VDS < `VEIL_OVERRIDE_<n>` < `--override` です。詳細は [VDS](vds.md)。
 
 ## ACME（`[acme]`）

@@ -42,11 +42,17 @@ macro_rules! ensure {
 type Client = DemoClient<tonic::transport::Channel>;
 
 async fn unary(c: &mut Client) -> Result<(), String> {
-    let mut req = Request::new(HelloRequest { name: "veil".into() });
-    req.metadata_mut().insert("x-caller", "tonic".parse().unwrap());
+    let mut req = Request::new(HelloRequest {
+        name: "veil".into(),
+    });
+    req.metadata_mut()
+        .insert("x-caller", "tonic".parse().unwrap());
     let resp = c.say_hello(req).await.map_err(|s| s.to_string())?;
     ensure!(
-        resp.metadata().get("x-caller-echo").map(|v| v.to_str().unwrap()) == Some("tonic"),
+        resp.metadata()
+            .get("x-caller-echo")
+            .map(|v| v.to_str().unwrap())
+            == Some("tonic"),
         "metadata echo missing: {:?}",
         resp.metadata()
     );
@@ -56,7 +62,11 @@ async fn unary(c: &mut Client) -> Result<(), String> {
         "trailer missing: {:?}",
         resp.metadata()
     );
-    ensure!(resp.get_ref().message == "Hello veil", "got {:?}", resp.get_ref());
+    ensure!(
+        resp.get_ref().message == "Hello veil",
+        "got {:?}",
+        resp.get_ref()
+    );
     Ok(())
 }
 
@@ -65,7 +75,11 @@ async fn empty_unary(c: &mut Client) -> Result<(), String> {
         .say_hello(HelloRequest::default())
         .await
         .map_err(|s| s.to_string())?;
-    ensure!(resp.get_ref().message == "Hello ", "got {:?}", resp.get_ref());
+    ensure!(
+        resp.get_ref().message == "Hello ",
+        "got {:?}",
+        resp.get_ref()
+    );
     Ok(())
 }
 
@@ -89,7 +103,10 @@ async fn too_large(c: &mut Client) -> Result<(), String> {
     let name = "x".repeat(5 * 1024 * 1024);
     match c.say_hello(HelloRequest { name }).await {
         Err(s) if s.code() == Code::ResourceExhausted => Ok(()),
-        other => Err(format!("want RESOURCE_EXHAUSTED, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "want RESOURCE_EXHAUSTED, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -102,8 +119,34 @@ async fn gzip(c: &mut Client) -> Result<(), String> {
         })
         .await
         .map_err(|s| s.to_string())?;
-    ensure!(resp.get_ref().message.len() == 10_006, "len {}", resp.get_ref().message.len());
+    ensure!(
+        resp.get_ref().message.len() == 10_006,
+        "len {}",
+        resp.get_ref().message.len()
+    );
     Ok(())
+}
+
+/// B-127: 解凍すると上限（4MiB）を大きく超えるメッセージ（圧縮後は 64KB 程度）は RESOURCE_EXHAUSTED。
+/// その後もサーバが応答すること。
+async fn gzip_bomb(c: &mut Client) -> Result<(), String> {
+    let r = c
+        .clone()
+        .send_compressed(CompressionEncoding::Gzip)
+        .say_hello(HelloRequest {
+            name: "x".repeat(64 * 1024 * 1024),
+        })
+        .await;
+    match r {
+        Err(s) if s.code() == Code::ResourceExhausted => {}
+        other => {
+            return Err(format!(
+                "want RESOURCE_EXHAUSTED, got {:?}",
+                other.map(|_| ())
+            ))
+        }
+    }
+    unary(c).await
 }
 
 async fn server_streaming(c: &mut Client) -> Result<(), String> {
@@ -124,7 +167,10 @@ async fn server_streaming(c: &mut Client) -> Result<(), String> {
 async fn server_streaming_error(c: &mut Client) -> Result<(), String> {
     match c.count_up(CountRequest { count: 1_000_000 }).await {
         Err(s) if s.code() == Code::InvalidArgument => Ok(()),
-        other => Err(format!("want INVALID_ARGUMENT, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "want INVALID_ARGUMENT, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -181,10 +227,17 @@ async fn deadline(c: &mut Client) -> Result<(), String> {
     // tonic はクライアント側でも同じ期限で打ち切る（Cancelled）。サーバ側の強制は HTTP/3 の試験で見る。
     match c.sleep(req).await {
         Err(s) if s.code() == Code::DeadlineExceeded || s.code() == Code::Cancelled => {
-            ensure!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+            ensure!(
+                t.elapsed() < Duration::from_secs(2),
+                "took {:?}",
+                t.elapsed()
+            );
             Ok(())
         }
-        other => Err(format!("want DEADLINE_EXCEEDED, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "want DEADLINE_EXCEEDED, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -272,6 +325,103 @@ async fn health(ch: tonic::transport::Channel) -> Result<(), String> {
 }
 
 /// 多数の同時呼び出し（多重化）。
+async fn next_reflection(
+    s: &mut tonic::Streaming<tonic_reflection::pb::v1::ServerReflectionResponse>,
+) -> Result<tonic_reflection::pb::v1::server_reflection_response::MessageResponse, String> {
+    s.message()
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.message_response)
+        .ok_or_else(|| "missing response".to_string())
+}
+
+/// サーバリフレクション（F-209 #3）: 一覧・シンボルからファイルの記述子・見つからないときのエラー。v1alpha も。
+async fn reflection(ch: tonic::transport::Channel) -> Result<(), String> {
+    use tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient;
+    use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
+    use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
+    use tonic_reflection::pb::v1::ServerReflectionRequest;
+    let req = |m: MessageRequest| ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(m),
+    };
+    let reqs = vec![
+        req(MessageRequest::ListServices("*".into())),
+        req(MessageRequest::FileContainingSymbol("demo.v1.Demo".into())),
+        req(MessageRequest::FileContainingSymbol(
+            "demo.v1.Demo.SayHello".into(),
+        )),
+        req(MessageRequest::FileByFilename("demo.proto".into())),
+        req(MessageRequest::FileContainingSymbol("demo.v1.Nope".into())),
+    ];
+    let mut s = ServerReflectionClient::new(ch.clone())
+        .server_reflection_info(tokio_stream::iter(reqs))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    match next_reflection(&mut s).await? {
+        MessageResponse::ListServicesResponse(l) => {
+            let names: Vec<_> = l.service.iter().map(|s| s.name.as_str()).collect();
+            for want in [
+                "demo.v1.Demo",
+                "grpc.health.v1.Health",
+                "grpc.reflection.v1.ServerReflection",
+            ] {
+                ensure!(names.contains(&want), "{} not in {:?}", want, names);
+            }
+        }
+        other => return Err(format!("list: {:?}", other)),
+    }
+    for _ in 0..3 {
+        match next_reflection(&mut s).await? {
+            MessageResponse::FileDescriptorResponse(f) => {
+                let fd = prost_types::FileDescriptorProto::decode(&f.file_descriptor_proto[0][..])
+                    .map_err(|e| e.to_string())?;
+                ensure!(fd.name() == "demo.proto", "file {:?}", fd.name());
+                ensure!(
+                    fd.service
+                        .iter()
+                        .any(|s| s.name() == "Demo"
+                            && s.method.iter().any(|m| m.name() == "SayHello")),
+                    "service Demo missing"
+                );
+            }
+            other => return Err(format!("file: {:?}", other)),
+        }
+    }
+    match next_reflection(&mut s).await? {
+        MessageResponse::ErrorResponse(e) => ensure!(e.error_code == 5, "code {}", e.error_code),
+        other => return Err(format!("missing symbol: {:?}", other)),
+    }
+    // v1alpha（古いクライアント）
+    use tonic_reflection::pb::v1alpha as alpha;
+    let mut s = alpha::server_reflection_client::ServerReflectionClient::new(ch)
+        .server_reflection_info(tokio_stream::iter(vec![alpha::ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(
+                alpha::server_reflection_request::MessageRequest::ListServices("*".into()),
+            ),
+        }]))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    match s
+        .message()
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.message_response)
+    {
+        Some(alpha::server_reflection_response::MessageResponse::ListServicesResponse(l)) => {
+            ensure!(
+                l.service.iter().any(|s| s.name == "demo.v1.Demo"),
+                "v1alpha list"
+            );
+        }
+        other => return Err(format!("v1alpha: {:?}", other)),
+    }
+    Ok(())
+}
+
 async fn concurrent(c: &Client) -> Result<(), String> {
     let mut set = tokio::task::JoinSet::new();
     for i in 0..200 {
@@ -359,6 +509,20 @@ async fn h3_call_with<Req: Message, Resp: Message + Default>(
     reqs: &[Req],
     grpc_timeout: Option<&str>,
 ) -> Result<(Vec<Resp>, String), String> {
+    h3_call_full(send, authority, path, reqs, grpc_timeout, None)
+        .await
+        .map(|(m, s, _)| (m, s))
+}
+
+/// 応答の `grpc-encoding` も返す版（`accept_encoding` を `grpc-accept-encoding` で送る）。
+async fn h3_call_full<Req: Message, Resp: Message + Default>(
+    send: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    authority: &str,
+    path: &str,
+    reqs: &[Req],
+    grpc_timeout: Option<&str>,
+    accept_encoding: Option<&str>,
+) -> Result<(Vec<Resp>, String, Option<String>), String> {
     let mut request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{}{}", authority, path))
@@ -367,17 +531,30 @@ async fn h3_call_with<Req: Message, Resp: Message + Default>(
     if let Some(t) = grpc_timeout {
         request = request.header("grpc-timeout", t);
     }
+    if let Some(e) = accept_encoding {
+        request = request.header("grpc-accept-encoding", e);
+    }
     let request = request.body(()).unwrap();
-    let mut stream = send.send_request(request).await.map_err(|e| e.to_string())?;
+    let mut stream = send
+        .send_request(request)
+        .await
+        .map_err(|e| e.to_string())?;
     for r in reqs {
-        stream.send_data(frame(r)).await.map_err(|e| e.to_string())?;
+        stream
+            .send_data(frame(r))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     stream.finish().await.map_err(|e| e.to_string())?;
     let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
     if let Some(s) = resp.headers().get("grpc-status") {
         // Trailers-Only
-        return Ok((Vec::new(), s.to_str().unwrap_or("").to_string()));
+        return Ok((Vec::new(), s.to_str().unwrap_or("").to_string(), None));
     }
+    let encoding = resp
+        .headers()
+        .get("grpc-encoding")
+        .map(|v| v.to_str().unwrap_or("").to_string());
     let mut buf = BytesMut::new();
     while let Some(mut chunk) = stream.recv_data().await.map_err(|e| e.to_string())? {
         while chunk.has_remaining() {
@@ -399,14 +576,107 @@ async fn h3_call_with<Req: Message, Resp: Message + Default>(
         if buf.len() < 5 + len {
             return Err("truncated response frame".into());
         }
-        out.push(Resp::decode(&buf[5..5 + len]).map_err(|e| e.to_string())?);
+        let payload = &buf[5..5 + len];
+        let m = if buf[0] == 1 {
+            // 圧縮フラグ: grpc-encoding が gzip のときだけ（それ以外は誤り）
+            if encoding.as_deref() != Some("gzip") {
+                return Err(format!(
+                    "compressed frame with grpc-encoding {:?}",
+                    encoding
+                ));
+            }
+            let mut d = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(payload), &mut d)
+                .map_err(|e| e.to_string())?;
+            Resp::decode(&d[..]).map_err(|e| e.to_string())?
+        } else {
+            Resp::decode(payload).map_err(|e| e.to_string())?
+        };
+        out.push(m);
         buf.advance(5 + len);
     }
-    Ok((out, status))
+    Ok((out, status, encoding))
+}
+
+/// HTTP/3 の双方向ストリーミングが全二重か（F-209 #5）: 1 通送って応答を受け取ってから次を送る。
+/// 要求本文を受け終えてから呼ぶ半二重の実装では最初の応答が来ずにタイムアウトする。
+async fn h3_ping_pong(
+    send: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    authority: &str,
+) -> Result<(), String> {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{}/demo.v1.Demo/Chat", authority))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let mut stream = send
+        .send_request(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = BytesMut::new();
+    let mut got_head = false;
+    for word in ["ping", "pong", "veil"] {
+        stream
+            .send_data(frame(&ChatMessage { text: word.into() }))
+            .await
+            .map_err(|e| e.to_string())?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            if !got_head {
+                stream.recv_response().await.map_err(|e| e.to_string())?;
+                got_head = true;
+            }
+            loop {
+                if buf.len() >= 5 {
+                    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                    if buf.len() >= 5 + len {
+                        let m = ChatMessage::decode(&buf[5..5 + len]).map_err(|e| e.to_string())?;
+                        buf.advance(5 + len);
+                        return Ok::<_, String>(m);
+                    }
+                }
+                match stream.recv_data().await.map_err(|e| e.to_string())? {
+                    Some(mut chunk) => {
+                        while chunk.has_remaining() {
+                            let c = chunk.chunk();
+                            buf.extend_from_slice(c);
+                            let n = c.len();
+                            chunk.advance(n);
+                        }
+                    }
+                    None => return Err("stream ended".into()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "no reply to {:?} before the request ended (half duplex)",
+                word
+            )
+        })??;
+        ensure!(reply.text == word.to_uppercase(), "got {:?}", reply);
+    }
+    stream.finish().await.map_err(|e| e.to_string())?;
+    while stream
+        .recv_data()
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {}
+    let trailers = stream.recv_trailers().await.map_err(|e| e.to_string())?;
+    let status = trailers
+        .as_ref()
+        .and_then(|t| t.get("grpc-status"))
+        .map(|v| v.to_str().unwrap_or("").to_string());
+    ensure!(status.as_deref() == Some("0"), "grpc-status {:?}", status);
+    Ok(())
 }
 
 async fn h3_checks(addr: std::net::SocketAddr) {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
@@ -419,7 +689,9 @@ async fn h3_checks(addr: std::net::SocketAddr) {
         Ok(c) => c,
         Err(e) => return report("h3 connect", Err(e.to_string())),
     };
-    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = driver.wait_idle().await;
     });
@@ -452,7 +724,11 @@ async fn h3_checks(addr: std::net::SocketAddr) {
         "h3 server streaming",
         r.and_then(|(m, s)| {
             ensure!(s == "0", "grpc-status {}", s);
-            ensure!(m.len() == 500 && m[499].n == 500, "got {} messages", m.len());
+            ensure!(
+                m.len() == 500 && m[499].n == 500,
+                "got {} messages",
+                m.len()
+            );
             Ok(())
         }),
     );
@@ -468,15 +744,70 @@ async fn h3_checks(addr: std::net::SocketAddr) {
         }),
     );
 
-    let msgs = vec![ChatMessage { text: "a".into() }, ChatMessage { text: "b".into() }];
+    let msgs = vec![
+        ChatMessage { text: "a".into() },
+        ChatMessage { text: "b".into() },
+    ];
     let r = h3_call::<_, ChatMessage>(&mut send, &authority, "/demo.v1.Demo/Chat", &msgs).await;
     report(
-        "h3 bidi (half duplex)",
+        "h3 bidi",
         r.and_then(|(m, s)| {
             ensure!(s == "0", "grpc-status {}", s);
             ensure!(m.len() == 2 && m[1].text == "B", "got {:?}", m);
             Ok(())
         }),
+    );
+
+    // F-209 #2: 1KB 以上の応答は gzip（サンプルは grpc_response_compression = "gzip"）。受けると言わなければ非圧縮
+    let big = "z".repeat(4000);
+    let r = h3_call_full::<_, HelloReply>(
+        &mut send,
+        &authority,
+        "/demo.v1.Demo/SayHello",
+        &[HelloRequest { name: big.clone() }],
+        None,
+        Some("identity,gzip"),
+    )
+    .await;
+    report(
+        "h3 gzip response (F-209)",
+        r.and_then(|(m, s, enc)| {
+            ensure!(s == "0", "grpc-status {}", s);
+            ensure!(enc.as_deref() == Some("gzip"), "grpc-encoding {:?}", enc);
+            ensure!(
+                m.len() == 1 && m[0].message.len() == 4006,
+                "got {:?}",
+                m.len()
+            );
+            Ok(())
+        }),
+    );
+    let r = h3_call_full::<_, HelloReply>(
+        &mut send,
+        &authority,
+        "/demo.v1.Demo/SayHello",
+        &[HelloRequest { name: big }],
+        None,
+        None,
+    )
+    .await;
+    report(
+        "h3 no compression without grpc-accept-encoding (F-209)",
+        r.and_then(|(m, s, enc)| {
+            ensure!(s == "0", "grpc-status {}", s);
+            ensure!(enc.is_none(), "grpc-encoding {:?}", enc);
+            ensure!(
+                m.len() == 1 && m[0].message.len() == 4006,
+                "got {:?}",
+                m.len()
+            );
+            Ok(())
+        }),
+    );
+
+    report(
+        "h3 bidi ping_pong (full duplex, F-209)",
+        h3_ping_pong(&mut send, &authority).await,
     );
 
     let t = std::time::Instant::now();
@@ -492,7 +823,20 @@ async fn h3_checks(addr: std::net::SocketAddr) {
         "h3 server enforces grpc-timeout",
         r.and_then(|(_, s)| {
             ensure!(s == "4", "grpc-status {}", s);
-            ensure!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+            ensure!(
+                t.elapsed() < Duration::from_secs(2),
+                "took {:?}",
+                t.elapsed()
+            );
+            Ok(())
+        }),
+    );
+
+    let r = h3_call::<_, Empty>(&mut send, &authority, "/nope.v1.Nope/Call", &[Empty {}]).await;
+    report(
+        "h3 unknown service is UNIMPLEMENTED (F-209)",
+        r.and_then(|(_, s)| {
+            ensure!(s == "12", "grpc-status {}", s);
             Ok(())
         }),
     );
@@ -537,18 +881,31 @@ async fn main() {
         report("h2 large_unary (3MiB)", large_unary(&mut c).await);
         report("h2 message too large", too_large(&mut c).await);
         report("h2 gzip request", gzip(&mut c).await);
+        report("h2 gzip bomb (B-127)", gzip_bomb(&mut c).await);
         report("h2 server_streaming", server_streaming(&mut c).await);
-        report("h2 server_streaming error", server_streaming_error(&mut c).await);
+        report(
+            "h2 server_streaming error",
+            server_streaming_error(&mut c).await,
+        );
         report("h2 client_streaming", client_streaming(&mut c).await);
         report("h2 ping_pong (full duplex)", ping_pong(&mut c).await);
         report("h2 timeout_on_sleeping_server", deadline(&mut c).await);
-        report("h2 status_code_and_message", status_code_and_message(&mut c).await);
+        report(
+            "h2 status_code_and_message",
+            status_code_and_message(&mut c).await,
+        );
         report(
             "h2 cancel_after_first_response",
             cancel_after_first_response(&mut c).await,
         );
         report("h2 unimplemented method", unimplemented(ch.clone()).await);
         report("h2 health check/watch", health(ch.clone()).await);
+        if !args.iter().any(|a| a == "--no-reflection") {
+            report(
+                "h2 server reflection v1/v1alpha (F-209)",
+                reflection(ch.clone()).await,
+            );
+        }
         report("h2 200 concurrent calls", concurrent(&c).await);
     }
     if let Some(h3) = arg("--h3") {

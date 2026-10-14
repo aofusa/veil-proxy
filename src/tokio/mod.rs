@@ -15,10 +15,8 @@ pub mod future;
 pub mod io;
 #[doc(hidden)]
 pub mod macros;
-#[cfg(unix)]
 pub mod net;
 pub mod runtime;
-#[cfg(unix)]
 pub mod signal;
 pub mod sync;
 pub mod task;

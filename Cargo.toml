@@ -167,10 +167,9 @@ aio = []
 wasm = ["dep:wasmtime", "dep:veil-wasmtime"]
 
 # gRPC サポート (HTTP/2 ベース)
-# gRPC ワイヤプロトコル（framing, headers, trailers）を実装
-# Protobuf 解析には prost を使用（オプション）
+# gRPC ワイヤプロトコル（framing, headers, trailers）を実装（メッセージは解析しないので protobuf の実装に依存しない）
 # ビルド方法: cargo build --features grpc
-grpc = ["dep:prost"]
+grpc = []
 
 # gRPC-Web サポート
 # ブラウザ互換の gRPC-Web プロトコル変換
@@ -280,7 +279,8 @@ l4-proxy = []
 
 # VDS（Veil Discovery Service、F-04）: 制御プレーンからルート・アップストリームを動的に配信する
 # （xDS の REST-JSON / State-of-the-World 相当の長輪詢）。専用スレッドで動き、データプレーンには触れない。
-vds = ["dep:serde_json", "grpc", "http2"]
+# 制御プレーンとの gRPC のメッセージだけは prost の derive で持つ（veil で prost を使うのは VDS だけ。F-208）。
+vds = ["dep:serde_json", "dep:prost", "grpc", "http2"]
 # ACME（F-05）: Let's Encrypt 等から証明書を自動で発行・更新する（HTTP-01）。専用スレッドで動き、
 # 発行した証明書は既存の証明書ホットリロードで無停止に差し替える。
 acme = ["dep:serde_json", "dep:rcgen"]
@@ -317,14 +317,13 @@ openapi = ["handler", "macro"]
 #   tokio の内部に強く依存するクレート向け。api には含めない（api-core と組み合わせて選ぶ）。
 tokio-compat = ["handler-pool", "dep:tokio-macros"]
 tokio-compat-bridge = ["tower-compat", "dep:tokio"]
-# async-graphql のスキーマを Handler として公開（F-191）
-graphql = ["handler", "dep:async-graphql"]
 # L4（TCP/UDP）リスナーに Rust 関数をネイティブハンドラとして登録（F-192）
 l4-handler = ["handler", "l4-proxy"]
-# gRPC サーバ（F-197、prost + veil の gRPC 実装。tokio・tonic 非依存）。API ライブラリ専用
+# gRPC サーバ（F-197、veil の gRPC 実装。tokio・tonic・prost 非依存。メッセージは利用者の codec（veil-build の
+# 生成コードは prost）が符号化する。F-208）。API ライブラリ専用
 grpc-handler = ["handler", "grpc"]
 # tokio 互換レイヤー以外の API ライブラリ一式（tokio-compat-bridge と組み合わせるときに使う）
-api-core = ["handler", "macro", "openapi", "graphql", "l4-handler", "grpc-handler", "tower-compat"]
+api-core = ["handler", "macro", "openapi", "l4-handler", "grpc-handler", "tower-compat"]
 # API サーバ開発向けの便利セット（C API・Python は別クレート crates/veil-capi・crates/veil-python）
 api = ["api-core", "tokio-compat"]
 
@@ -551,7 +550,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 # 分割したため、末尾の [target.*.dependencies]（`wasmtime` / `veil-wasmtime`）で定義する。
 
 # Protobuf: gRPC メッセージのシリアライズ/デシリアライズ
-# prost は gRPC feature 有効時のみ使用
+# prost は VDS（vds feature）の制御プレーンのメッセージにだけ使う（F-208）
 prost = { version = "0.13", optional = true }
 
 # ====================
@@ -621,7 +620,6 @@ http-body-util = { version = "0.1.3", optional = true }
 tokio = { version = "1.48", optional = true, default-features = false, features = ["rt-multi-thread", "time", "sync", "macros"] }
 # tokio-compat の #[tokio::main] / #[tokio::test] と select! の補助（proc-macro だけ。tokio 本体には依存しない）
 tokio-macros = { version = "2.5", optional = true }
-async-graphql = { version = "7", optional = true, default-features = false, features = ["graphiql"] }
 
 # ====================
 # rustls 暗号プロバイダの target 別選択（F-122、src/tls_provider.rs 参照）
@@ -707,6 +705,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_IO",
+    "Win32_System_Console",
 ] }
 
 # ====================
@@ -723,6 +722,8 @@ windows-sys = { version = "0.59", features = [
 nix = { version = "0.30.1", features = ["uio", "process", "feature", "sched", "mount", "hostname"] }
 
 [dev-dependencies]
+# gRPC ハンドラの手書きの符号化（health 等）を prost と突き合わせる（F-208）
+prost = "0.13"
 # テスト用一時ディレクトリ
 tempfile = "3.24.0"
 

@@ -94,9 +94,8 @@ features are in neither `default` nor `full*`, so the proxy binary contains no l
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json`, Swagger UI, FastAPI-style 422 validation |
 | `tokio-compat` | tokio-free tokio compatibility layer: tokio-based libraries run on veil's runtime (part of `api`) |
 | `tokio-compat-bridge` | alternative to `tokio-compat` that bundles a tokio runtime (mutually exclusive with `tokio-compat`) |
-| `graphql` | `async-graphql` endpoint (`App::graphql`) |
 | `l4-handler` | TCP/UDP handlers written as Rust functions on `[[l4]]` listeners |
-| `grpc-handler` | gRPC server on prost messages |
+| `grpc-handler` | gRPC server (messages encoded by your codec; prost through `veil-build`) |
 | `api-core` | all of the above except `tokio-compat` / `tokio-compat-bridge` |
 | `api` | `api-core` + `tokio-compat` |
 

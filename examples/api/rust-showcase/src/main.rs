@@ -4,11 +4,9 @@
 //! - `#[derive(veil::Schema)]` による OpenAPI 反映と自動バリデーション（422）
 //! - `App` でのプログラム的なルート登録・ブロッキングハンドラ
 //! - tower の層（`/admin` だけに認証、全体に応答ヘッダ）
-//! - GraphQL（async-graphql）
 //! - L4 ネイティブハンドラ（TCP エコー・UDP エコー）
 //! - ストリーミング応答とトレーラ・ストリーミング受信（F-197）
 //! - config.toml の取り込みと Rust コードでの上書き
-use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use veil::prelude::*;
@@ -165,19 +163,6 @@ async fn udp_echo(dgram: L4Datagram) -> Option<bytes::Bytes> {
     Some(out.into())
 }
 
-struct QueryRoot;
-
-#[Object]
-impl QueryRoot {
-    /// 2 つの数の和
-    async fn add(&self, a: i32, b: i32) -> i32 {
-        a + b
-    }
-    async fn greeting(&self, name: String) -> String {
-        format!("Hello, {}!", name)
-    }
-}
-
 /// `/admin` 以下だけに掛ける簡易認証（tower の Layer）
 #[derive(Clone)]
 struct RequireToken;
@@ -238,8 +223,6 @@ async fn main() -> Result<(), veil::api::Error> {
     }
     let config = builder.build();
 
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-
     App::new()
         .config(config)
         .state(Counter {
@@ -257,6 +240,5 @@ async fn main() -> Result<(), veil::api::Error> {
             http::header::HeaderName::from_static("x-powered-by"),
             http::HeaderValue::from_static("veil"),
         ))
-        .graphql("/graphql", schema)
         .run()
 }

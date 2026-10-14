@@ -334,6 +334,91 @@ fn refresh_alloc_stats_gauges() {
 }
 
 // ====================
+// VDS の状態（F-211）
+// ====================
+//
+// VDS の専用スレッドが接続・適用・拒否のたびに更新する（データプレーンからは触らない）。
+// `[vds] enabled = true` で起動したときだけ登録される（最初の `vds_set_connected` で生成）。
+
+#[cfg(all(feature = "metrics", feature = "vds"))]
+/// 制御プレーンにつながっているか（1 / 0）。
+static VDS_CONNECTED: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "vds_connected",
+        "Whether VDS is connected to a control plane (1) or not (0)",
+    )
+    .namespace("veil_proxy");
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "metrics", feature = "vds"))]
+/// 適用中のスナップショットの版（値は常に 1、`version_info` ラベルが版）。
+static VDS_APPLIED_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "vds_applied_info",
+        "The VDS snapshot version currently applied (always 1)",
+    )
+    .namespace("veil_proxy");
+    let gauge = IntGaugeVec::new(opts, &["version_info"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "metrics", feature = "vds"))]
+/// 受け取ったスナップショットの数（`result` = applied / rejected）。
+static VDS_UPDATES_TOTAL: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "vds_updates_total",
+        "VDS snapshots received, by result (applied, rejected)",
+    )
+    .namespace("veil_proxy");
+    let counter = prometheus::IntCounterVec::new(opts, &["result"]).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+#[cfg(all(feature = "metrics", feature = "vds"))]
+/// 最後にスナップショットを適用・拒否した時刻（UNIX 秒）。
+static VDS_LAST_UPDATE_TIMESTAMP: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "vds_last_update_timestamp_seconds",
+        "Unix time of the last VDS snapshot applied or rejected",
+    )
+    .namespace("veil_proxy");
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// VDS の接続状態（VDS のスレッドから。初回の呼び出しで VDS のメトリクスを全部登録する）。
+#[cfg(all(feature = "metrics", feature = "vds"))]
+pub(crate) fn vds_set_connected(connected: bool) {
+    VDS_CONNECTED.set(connected as i64);
+    Lazy::force(&VDS_APPLIED_INFO);
+    let _ = VDS_UPDATES_TOTAL.with_label_values(&["applied"]);
+    let _ = VDS_UPDATES_TOTAL.with_label_values(&["rejected"]);
+    Lazy::force(&VDS_LAST_UPDATE_TIMESTAMP);
+}
+
+/// スナップショットを適用した（`Some(版)`）・拒否した（`None`）。
+#[cfg(all(feature = "metrics", feature = "vds"))]
+pub(crate) fn vds_record_update(applied_version: Option<&str>, unix_secs: u64) {
+    match applied_version {
+        Some(v) => {
+            VDS_APPLIED_INFO.reset();
+            VDS_APPLIED_INFO.with_label_values(&[v]).set(1);
+            VDS_UPDATES_TOTAL.with_label_values(&["applied"]).inc();
+        }
+        None => VDS_UPDATES_TOTAL.with_label_values(&["rejected"]).inc(),
+    }
+    VDS_LAST_UPDATE_TIMESTAMP.set(unix_secs as i64);
+}
+
+// ====================
 // veil-alloc の状態（F-183、`veil-alloc` feature）
 // ====================
 //

@@ -71,6 +71,14 @@ pub struct ApiSettings {
     pub tokio_threads: usize,
     /// gRPC の受信メッセージ上限（F-197、`grpc-handler`）
     pub grpc_max_message_size: usize,
+    /// gRPC の応答の圧縮（`none`・`gzip`・`deflate`。F-209）
+    pub grpc_response_compression: String,
+    /// この大きさ未満の gRPC メッセージは圧縮しない（F-209）
+    pub grpc_response_compression_min_size: usize,
+    /// gRPC-Web の CORS で許す Origin（`"*"` で全部、空なら CORS 無し。F-209）
+    pub grpc_web_cors_origins: Vec<String>,
+    /// gRPC の送信メッセージの上限（0 = 無制限。F-209）
+    pub grpc_max_send_message_size: usize,
 }
 
 impl ApiSettings {
@@ -106,6 +114,18 @@ impl ApiSettings {
             handler_threads: n("handler_threads", 0),
             tokio_threads: n("tokio_threads", 2),
             grpc_max_message_size: n("grpc_max_message_size", 4 * 1024 * 1024),
+            grpc_response_compression: s("grpc_response_compression", "none"),
+            grpc_response_compression_min_size: n("grpc_response_compression_min_size", 1024),
+            grpc_web_cors_origins: v
+                .and_then(|t| t.get("grpc_web_cors_origins"))
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            grpc_max_send_message_size: n("grpc_max_send_message_size", 0),
         }
     }
 }
@@ -344,6 +364,19 @@ impl App {
         self
     }
 
+    /// 試験用: 最後に登録したルートの関数に、起動時と同じ順でミドルウェアを掛けたもの（gRPC の試験が使う）。
+    #[cfg(all(test, feature = "grpc-handler"))]
+    pub(crate) fn last_route_wrapped(&self) -> HandlerFn {
+        let route = self.routes.last().expect("registered");
+        let mut func = route.func.clone();
+        for mw in &self.middleware {
+            if path_has_prefix(&route.path, &mw.prefix) {
+                func = (mw.wrap)(func);
+            }
+        }
+        func
+    }
+
     /// 起動時（ハンドラ登録の前）に実行する初期化処理を足す（DB 接続の確立・L4 ハンドラ等の拡張が使う）。
     pub fn on_setup(mut self, f: impl FnOnce() -> Result<(), String> + Send + 'static) -> App {
         self.setup.push(Box::new(f));
@@ -432,7 +465,17 @@ fn start(config: Config) -> Result<(), Error> {
         MAX_BODY_SIZE.store(settings.max_body_size, Ordering::Relaxed);
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
         #[cfg(feature = "grpc-handler")]
-        super::grpc::set_max_message_size(settings.grpc_max_message_size);
+        {
+            super::grpc::set_max_message_size(settings.grpc_max_message_size);
+            if let Err(e) = super::grpc::set_response_compression(
+                &settings.grpc_response_compression,
+                settings.grpc_response_compression_min_size,
+            ) {
+                ftlog::warn!("{}; responses are not compressed", e);
+            }
+            super::grpc::set_grpc_web_cors_origins(settings.grpc_web_cors_origins.clone());
+            super::grpc::set_max_send_message_size(settings.grpc_max_send_message_size);
+        }
         if settings.handler_threads > 0 {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);
         }

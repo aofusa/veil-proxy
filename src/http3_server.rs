@@ -736,6 +736,9 @@ enum RecvOutcome {
 enum Decision {
     /// ストリーミング適格 → バックエンドタスクを spawn。
     Stream(crate::http3_stream::BackendTaskParams),
+    /// 要求本文をストリーミングで受けるネイティブハンドラ（gRPC の双方向等。F-209 #5）→ ハンドラのタスクを spawn。
+    #[cfg(feature = "handler")]
+    StreamHandler(Box<H3HandlerStream>),
     /// 非適格 → バッファ経路（`handle_request`）。
     Buffer,
     /// classify が即時応答済み（セキュリティ拒否など）。
@@ -1159,6 +1162,26 @@ impl Http3Handler {
                     (self.backend_spawner)(params, req_rx, resp_tx, self.notify.clone());
                     self.proxy_streams.insert(stream_id, ps);
                 }
+                #[cfg(feature = "handler")]
+                Decision::StreamHandler(h) => {
+                    let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
+                    let (resp_tx, resp_rx) =
+                        crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
+                    let mut ps = ProxyStream::new(resp_rx, req_tx, more_frames, h.max_request_body);
+                    if let Some(body) = self.stream_bodies.remove(&stream_id) {
+                        if !body.is_empty() {
+                            ps.req_bytes_total += body.len() as u64;
+                            ps.req_pending.push_back(body.freeze());
+                        }
+                    }
+                    crate::runtime::spawn(h3_api_stream_task(
+                        h,
+                        req_rx,
+                        resp_tx,
+                        self.notify.clone(),
+                    ));
+                    self.proxy_streams.insert(stream_id, ps);
+                }
                 Decision::Buffer => {
                     self.buffered_reqs.insert(
                         stream_id,
@@ -1399,6 +1422,76 @@ impl Http3Handler {
             Some(b) => b,
             None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
         };
+
+        // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
+        // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
+        #[cfg(feature = "handler")]
+        if let Backend::Handler(entry, _, _) = &backend {
+            if !entry.streaming_request || !more_frames {
+                return Decision::Buffer;
+            }
+            let security = backend.security();
+            let check = check_security(
+                security,
+                self.client_ip.as_str(),
+                method,
+                content_length,
+                false,
+            );
+            if check != SecurityCheckResult::Allowed {
+                let status = check.status_code();
+                let msg = check.message();
+                let _ = self.send_error_response(stream_id, status, msg);
+                log_access(
+                    method,
+                    authority,
+                    path,
+                    user_agent,
+                    content_length as u64,
+                    status,
+                    msg.len() as u64,
+                    Instant::now(),
+                    self.client_ip.as_str(),
+                    "",
+                );
+                return Decision::Handled;
+            }
+            let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 1);
+            let mut has_host = false;
+            for h in headers.iter().filter(|h| !h.name().starts_with(b":")) {
+                has_host |= h.name().eq_ignore_ascii_case(b"host");
+                hdrs.push((
+                    Bytes::copy_from_slice(h.name()),
+                    Bytes::copy_from_slice(h.value()),
+                ));
+            }
+            if !has_host && !authority.is_empty() {
+                hdrs.push((
+                    Bytes::from_static(b"host"),
+                    Bytes::copy_from_slice(authority),
+                ));
+            }
+            let req = crate::api::dispatch::build_request(
+                Bytes::copy_from_slice(method),
+                Bytes::copy_from_slice(path),
+                hdrs,
+                Bytes::new(),
+                self.client_ip.as_str(),
+                crate::api::request::HttpVersion::Http3,
+            );
+            return Decision::StreamHandler(Box::new(H3HandlerStream {
+                entry: entry.clone(),
+                req,
+                max_request_body: crate::api::app::max_body_size() as u64,
+                log: H3AccessLog {
+                    method: Bytes::copy_from_slice(method),
+                    authority: Bytes::copy_from_slice(authority),
+                    path: Bytes::copy_from_slice(path),
+                    user_agent: Bytes::copy_from_slice(user_agent),
+                    client_ip: self.client_ip,
+                },
+            }));
+        }
 
         // Proxy バックエンドのみストリーミング対象。
         let (upstream_group, path_compression, buffering, _modules) = match &backend {
@@ -1956,6 +2049,175 @@ async fn buffered_request_task(mut task: H3BufferedTask, headers: Vec<h3::Header
 /// 借用ヘッダ列を 1 回の確保に詰めて `RespHeaders` にする（ヘッダごとの確保をしない）。
 ///
 /// `:status` は除き、`content_length` が `Some` なら `content-length` を末尾に足す。
+/// 要求本文をストリーミングで受けるハンドラの起動パラメータ（F-209 #5）。
+#[cfg(feature = "handler")]
+struct H3HandlerStream {
+    entry: std::sync::Arc<crate::api::handler::HandlerEntry>,
+    req: crate::api::request::Request,
+    max_request_body: u64,
+    log: H3AccessLog,
+}
+
+/// アクセスログに要る要求の情報（タスクがメインループの借用を持たないよう所有で持つ）。
+#[cfg(feature = "handler")]
+struct H3AccessLog {
+    method: Bytes,
+    authority: Bytes,
+    path: Bytes,
+    user_agent: Bytes,
+    client_ip: crate::http_utils::IpStr,
+}
+
+/// 要求本文をストリーミングで受けるハンドラのタスク（F-209 #5）。メインループが `req_rx` へ流す本文を
+/// ハンドラの受信ストリームへ中継しながらハンドラを呼び、応答を `RespMsg` でメインループへ返す
+/// （HTTP/2 の `h2_api_handler` と同じ形。両方向が同時に進むので gRPC の双方向が全二重になる）。
+#[cfg(feature = "handler")]
+async fn h3_api_stream_task(
+    h: Box<H3HandlerStream>,
+    req_rx: crate::http3_stream::Receiver<Bytes>,
+    resp_tx: crate::http3_stream::Sender<crate::http3_stream::RespMsg>,
+    notify: crate::http3_stream::ConnWaker,
+) {
+    let start = Instant::now();
+    let H3HandlerStream {
+        entry,
+        mut req,
+        log,
+        ..
+    } = *h;
+    let (mut body_tx, slot) = crate::api::stream::request_body_channel(REQ_CHAN_CAP);
+    req.body_stream = Some(slot);
+    let req_size = std::cell::Cell::new(0u64);
+    let req_size_ref = &req_size;
+    let rx = &req_rx;
+    let notify_ref = &notify;
+    // `body_tx` は move で持たせる（中継が終わったら drop して受信ストリームを終える）。
+    // ハンドラとこの中継はどちらもチャネルの待ちだけで、起こされていない側を poll しても syscall は出ない。
+    let pump = async move {
+        use futures::SinkExt;
+        while let Some(chunk) = rx.recv().await {
+            req_size_ref.set(req_size_ref.get() + chunk.len() as u64);
+            // 消費したらメインループを起こして残りの本文を受け取らせる（QUIC のフロー制御の補充）
+            notify_ref.notify();
+            if body_tx.send(chunk).await.is_err() {
+                // ハンドラが受信ストリームを捨てた: 残りは読み捨てる（クライアントを止めない）
+                while let Some(c) = rx.recv().await {
+                    req_size_ref.set(req_size_ref.get() + c.len() as u64);
+                    notify_ref.notify();
+                }
+                break;
+            }
+        }
+    };
+    let work = h3_api_respond(&entry, req, &resp_tx, &notify);
+    let (status, sent) =
+        match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
+            futures::future::Either::Left((r, _pump)) => r,
+            futures::future::Either::Right(((), work)) => work.await,
+        };
+    drop(resp_tx);
+    notify.notify();
+    log_access(
+        &log.method,
+        &log.authority,
+        &log.path,
+        &log.user_agent,
+        req_size.get(),
+        status,
+        sent,
+        start,
+        log.client_ip.as_str(),
+        "",
+    );
+}
+
+/// ハンドラを呼んで応答を `RespMsg` で送る。戻り値 `(status, 送った本文のバイト数)`。
+#[cfg(feature = "handler")]
+async fn h3_api_respond(
+    entry: &crate::api::handler::HandlerEntry,
+    req: crate::api::request::Request,
+    resp_tx: &crate::http3_stream::Sender<crate::http3_stream::RespMsg>,
+    notify: &crate::http3_stream::ConnWaker,
+) -> (u16, u64) {
+    use crate::api::stream::BodyChunk;
+    use crate::http3_stream::RespMsg;
+    use futures::StreamExt;
+    let send = |msg: RespMsg| async move {
+        let r = resp_tx.send(msg).await;
+        notify.notify();
+        r.is_ok()
+    };
+    let mut resp = crate::api::dispatch::call(entry, req).await;
+    crate::api::dispatch::h2_h3_headers(&mut resp);
+    let status = resp.status_code();
+    let stream = resp.take_stream();
+    let headers: Vec<(&[u8], &[u8])> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect();
+    let Some(mut stream) = stream else {
+        let body = resp.body().clone();
+        let len = body.len() as u64;
+        let head = RespMsg::Head {
+            status,
+            headers: pack_resp_headers(&headers, Some(body.len())),
+        };
+        if send(head).await && !body.is_empty() {
+            send(RespMsg::Body(body)).await;
+        }
+        return (status, len);
+    };
+    if !send(RespMsg::Head {
+        status,
+        headers: pack_resp_headers(&headers, None),
+    })
+    .await
+    {
+        return (status, 0);
+    }
+    let mut sent = 0u64;
+    let mut carry: Option<BodyChunk> = None;
+    loop {
+        let chunk = match carry.take() {
+            Some(c) => c,
+            None => match stream.next().await {
+                Some(c) => c,
+                None => break,
+            },
+        };
+        let msg = match chunk {
+            BodyChunk::Data(b) if b.is_empty() => continue,
+            BodyChunk::Data(b) => {
+                let b = crate::api::stream::coalesce(
+                    b,
+                    &mut stream,
+                    crate::api::stream::COALESCE_MAX,
+                    &mut carry,
+                );
+                sent += b.len() as u64;
+                RespMsg::Body(b)
+            }
+            BodyChunk::Trailers(mut t) => {
+                crate::api::dispatch::lowercase_names(&mut t);
+                send(RespMsg::Trailers(t)).await;
+                return (status, sent);
+            }
+            BodyChunk::Abort(reason) => {
+                ftlog::debug!("[api] streaming response aborted: {}", reason);
+                // head 送出後のエラーはストリームのリセット
+                send(RespMsg::Error { status: 500 }).await;
+                return (status, sent);
+            }
+        };
+        if !send(msg).await {
+            // クライアントがストリームを閉じた: ストリームを drop してハンドラ側へ伝える
+            return (status, sent);
+        }
+    }
+    (status, sent)
+}
+
 fn pack_resp_headers(
     headers: &[(&[u8], &[u8])],
     content_length: Option<usize>,
@@ -2470,6 +2732,29 @@ impl H3BufferedTask {
                     return Ok(());
                 }
 
+                // 未登録のサービスへの gRPC は Trailers-Only の UNIMPLEMENTED（F-209）
+                #[cfg(feature = "grpc-handler")]
+                if let Some(h) = crate::api::grpc::unknown_route_response(
+                    headers.iter().map(|h| (h.name(), h.value())),
+                    path,
+                ) {
+                    let pairs: Vec<(&[u8], &[u8])> =
+                        h.iter().map(|(n, v)| (n.as_ref(), v.as_ref())).collect();
+                    self.send_response(200, &pairs, None).await?;
+                    log_access(
+                        method,
+                        authority,
+                        path,
+                        user_agent,
+                        request_body.len() as u64,
+                        200,
+                        0,
+                        start_time,
+                        self.client_ip.as_str(),
+                        "",
+                    );
+                    return Ok(());
+                }
                 self.send_error_response(404, b"Not Found").await?;
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]

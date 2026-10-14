@@ -88,7 +88,7 @@ def make_crate(src, epoll):
         shutil.rmtree(crate / "tests", ignore_errors=True)
     (crate / "src").mkdir(parents=True, exist_ok=True)
     shutil.copytree(src / "tests", crate / "tests")
-    (crate / "src" / "lib.rs").write_text("// tokio のテストを動かすための空のクレート\n")
+    (crate / "src" / "lib.rs").write_text("// tokio のテストを動かすための空のクレート\n", encoding="utf-8")
     veil_features = '["tokio-compat", "epoll"]' if epoll else '["tokio-compat"]'
     (crate / "Cargo.toml").write_text(f'''[package]
 name = "tokio-tests-on-veil"
@@ -116,7 +116,7 @@ parking_lot = []
 
 [dependencies]
 tokio = {{ version = "1", features = ["full"] }}
-veil = {{ path = "{ROOT}", default-features = false, features = {veil_features} }}
+veil = {{ path = "{ROOT.as_posix()}", default-features = false, features = {veil_features} }}
 
 [dev-dependencies]
 async-stream = "0.3"
@@ -130,15 +130,18 @@ tokio-stream = "0.1"
 tokio-test = "0.4"
 tokio-util = {{ version = "0.7", features = ["rt"] }}
 socket2 = "0.6"
-libc = "0.2"
-nix = {{ version = "0.30", default-features = false, features = ["fs", "socket", "signal", "process"] }}
 rand = "0.9"
 tempfile = "3"
 
+# tokio と同じく unix だけ（Windows でもこの試験用クレートをビルドできるように）
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+nix = {{ version = "0.30", default-features = false, features = ["fs", "socket", "signal", "process"] }}
+
 [patch.crates-io]
-tokio = {{ path = "{ROOT}/crates/veil-tokio/tokio-shim" }}
-quiche = {{ path = "{ROOT}/third_party/quiche" }}
-''')
+tokio = {{ path = "{ROOT.as_posix()}/crates/veil-tokio/tokio-shim" }}
+quiche = {{ path = "{ROOT.as_posix()}/third_party/quiche" }}
+''', encoding="utf-8")
     return crate
 
 
@@ -165,23 +168,33 @@ def build(crate):
 
 
 def count_tests(path):
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     return len(re.findall(r"#\[(tokio::test|test|maybe_tokio_test)\b", text))
+
+
+def kill_tree(p):
+    """試験プロセスとその子をまとめて止める（unix はプロセスグループ、Windows は taskkill /T）。"""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+    else:
+        os.killpg(p.pid, signal.SIGKILL)
 
 
 def run_one(exe, test, timeout):
     # 試験は自分のプロセスグループで動かし、タイムアウト・中断（Ctrl-C 等）のときはグループごと止める
     # （止めないと CPU を使い続ける試験プロセスが孤児として残り、後の計測を乱す）。
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
     p = subprocess.Popen([exe, "--exact", test, "--test-threads=1"], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+                         stderr=subprocess.PIPE, text=True, errors="replace", **group)
     try:
         stdout, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGKILL)
+        kill_tree(p)
         p.communicate()
         return "timeout", ""
     except BaseException:
-        os.killpg(p.pid, signal.SIGKILL)
+        kill_tree(p)
         raise
     out = stdout + stderr
     if "1 passed" in out:
@@ -189,6 +202,14 @@ def run_one(exe, test, timeout):
     if "1 ignored" in out or "0 passed; 0 failed; 1 ignored" in out:
         return "ignored", out
     return "fail", out
+
+
+def backend(epoll):
+    if os.name == "nt":
+        return "Windows, WSAPoll"
+    if sys.platform.startswith("linux"):
+        return "epoll" if epoll else "io_uring"
+    return "kqueue"
 
 
 def main():
@@ -201,7 +222,7 @@ def main():
 
     src = tokio_source()
     crate = make_crate(src, a.epoll)
-    print(f"building tokio {VERSION} tests against veil::tokio ({'epoll' if a.epoll else 'io_uring'}) ...", flush=True)
+    print(f"building tokio {VERSION} tests against veil::tokio ({backend(a.epoll)}) ...", flush=True)
     exes, build_failed, errs = build(crate)
 
     per_file = {}
@@ -236,7 +257,7 @@ def main():
         cats[c][0] += r["ok"]
         cats[c][1] += r["ok"] + r["fail"] + r["timeout"]
 
-    lines = [f"# tokio {VERSION} のテストを veil::tokio で実行した結果（{'epoll' if a.epoll else 'io_uring'}）", ""]
+    lines = [f"# tokio {VERSION} のテストを veil::tokio で実行した結果（{backend(a.epoll)}）", ""]
     lines += ["| 分類 | 合格 / 対象 | 合格率 |", "|------|------------|--------|"]
     for c, _ in CATEGORIES + [("other", "")]:
         ok, n = cats.get(c, [0, 0])
@@ -259,7 +280,7 @@ def main():
     if errs:
         lines += ["", "## ビルドエラー（先頭）", "", "```"] + errs[:40] + ["```"]
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text("\n".join(lines) + "\n")
+    Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines[:16]))
     print(f"\nwritten: {a.out}")
 

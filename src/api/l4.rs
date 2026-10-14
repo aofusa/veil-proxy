@@ -296,6 +296,126 @@ impl App {
     }
 }
 
+// ===================== ブロッキングな L4 ハンドラ（C・Python 用、F-210） =====================
+
+/// ブロッキングな L4 ハンドラの出力（コールバックの中で書いたデータと、閉じるかどうか）。
+#[derive(Default)]
+pub struct L4Out {
+    writes: Vec<Bytes>,
+    close: bool,
+}
+
+impl L4Out {
+    /// 送るデータを足す（コールバックから戻った後にまとめて送る）。
+    pub fn write(&mut self, data: Bytes) {
+        if !data.is_empty() {
+            self.writes.push(data);
+        }
+    }
+
+    /// 送り終えたら接続を閉じる。
+    pub fn close(&mut self) {
+        self.close = true;
+    }
+}
+
+/// 1 つの TCP 接続の状態（接続ごとに作る。コールバックは接続ごとに 1 つずつ順に呼ばれる）。
+pub trait L4Session: Send {
+    /// 受信したデータ。
+    fn on_data(&mut self, data: &[u8], out: &mut L4Out);
+    /// 接続が閉じた（相手が閉じた・`close` した・エラー）。
+    fn on_close(&mut self) {}
+}
+
+/// ブロッキングなコールバックをハンドラ用プールで呼ぶ（panic は接続を閉じる）。
+async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Option<R> {
+    crate::runtime::offload::offload_handler(f).await
+}
+
+async fn flush(conn: &mut L4Connection, out: &mut L4Out) -> Result<(), L4Error> {
+    for b in out.writes.drain(..) {
+        conn.write_bytes(b).await?;
+    }
+    Ok(())
+}
+
+impl App {
+    /// ブロッキングなコールバックの TCP ハンドラ（C・Python 用、F-210）。`connect` は接続ごとにハンドラ用プールで
+    /// 呼ばれ、[`L4Session`] を返す（`None` なら閉じる）。読み書きはワーカーの非同期 I/O で、コールバックは
+    /// 受信のたびにプールで 1 つずつ呼ばれる（同じ接続のコールバックは並行しない）。
+    pub fn l4_tcp_blocking<F>(self, name: &str, listen: &str, connect: F) -> App
+    where
+        F: Fn(SocketAddr, &mut L4Out) -> Option<Box<dyn L4Session>> + Send + Sync + 'static,
+    {
+        let connect = Arc::new(connect);
+        self.l4_tcp(name, listen, move |conn: &mut L4Connection| {
+            let connect = connect.clone();
+            Box::pin(async move {
+                let peer = conn.peer_addr();
+                let Some((session, mut out)) = blocking(move || {
+                    let mut out = L4Out::default();
+                    (connect(peer, &mut out), out)
+                })
+                .await
+                else {
+                    return Ok(());
+                };
+                flush(conn, &mut out).await?;
+                let Some(session) = session else {
+                    return Ok(());
+                };
+                let session = Arc::new(Mutex::new(session));
+                let mut result = Ok(());
+                if !out.close {
+                    loop {
+                        let data = match conn.read_bytes(L4_READ_CHUNK).await {
+                            Ok(d) if d.is_empty() => break,
+                            Ok(d) => d,
+                            Err(e) => {
+                                result = Err(e);
+                                break;
+                            }
+                        };
+                        let s = session.clone();
+                        let Some(mut out) = blocking(move || {
+                            let mut out = L4Out::default();
+                            s.lock().unwrap().on_data(&data, &mut out);
+                            out
+                        })
+                        .await
+                        else {
+                            break;
+                        };
+                        if let Err(e) = flush(conn, &mut out).await {
+                            result = Err(e);
+                            break;
+                        }
+                        if out.close {
+                            break;
+                        }
+                    }
+                }
+                let s = session.clone();
+                let _ = blocking(move || s.lock().unwrap().on_close()).await;
+                result
+            })
+        })
+    }
+
+    /// ブロッキングなコールバックの UDP ハンドラ（C・Python 用、F-210）。`f` はデータグラムごとにハンドラ用
+    /// プールで呼ばれ、`Some` を返すと送信元へ返信する。
+    pub fn l4_udp_blocking<F>(self, name: &str, listen: &str, f: F) -> App
+    where
+        F: Fn(Bytes, SocketAddr) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        self.l4_udp(name, listen, move |g: L4Datagram| {
+            let f = f.clone();
+            async move { blocking(move || f(g.data, g.peer)).await.flatten() }
+        })
+    }
+}
+
 /// 設定フック: `App::l4_*` の `[[l4]]` を注入する（同名の `[[l4]]` が TOML にあれば注入しない）。
 pub(crate) fn inject_l4(root: &mut toml::Value) -> Result<(), String> {
     let injected = INJECTED.lock().unwrap().clone();
