@@ -94,7 +94,6 @@ veil はライブラリとして組み込み、Rust・C・Python で API サー�
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json`、Swagger UI、FastAPI 形式の 422 検証 |
 | `tokio-compat` | tokio 無しの tokio 互換レイヤー。tokio 前提のライブラリが veil のランタイムで動く（`api` に含む） |
 | `tokio-compat-bridge` | `tokio-compat` の代わりに tokio ランタイムを同梱する版（`tokio-compat` と排他） |
-| `graphql` | `async-graphql` のエンドポイント（`App::graphql`） |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理 |
 | `grpc-handler` | prost のメッセージで書く gRPC サーバ |
 | `api-core` | `tokio-compat` / `tokio-compat-bridge` 以外の上記すべて |

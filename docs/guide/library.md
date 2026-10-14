@@ -10,7 +10,7 @@ Three front ends share the same implementation:
 
 | Front end | Where | Typical use |
 |-----------|-------|-------------|
-| Rust library | the `veil` crate with the `api` feature set | the fastest option; macros, OpenAPI, tower, GraphQL |
+| Rust library | the `veil` crate with the `api` feature set | the fastest option; macros, OpenAPI, tower, gRPC, any GraphQL library |
 | C API | [`crates/veil-capi`](../../crates/veil-capi/README.md) (`libveil.so` / `libveil.a`, `veil.h`) | C, C++ and any language with a C FFI |
 | Python | [`crates/veil-python`](../../crates/veil-python/README.md) (wheel, `import veil`) | FastAPI-style decorators |
 
@@ -48,7 +48,7 @@ Three front ends share the same implementation:
   handler are executed on a separate handler thread pool (`[api] handler_threads`) through veil's `offload`,
   so a slow database call does not stall other connections.
 - **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-compat`,
-  `tokio-compat-bridge`, `graphql`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
+  `tokio-compat-bridge`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
   produces exactly the same proxy as before.
 - Everything that works for the proxy still works: the `[server]`, `[tls]`, `[security]`, `[logging]`,
   `[prometheus]`, ... sections, SIGHUP reload, graceful shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
@@ -64,10 +64,9 @@ Three front ends share the same implementation:
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
 | `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
 | `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
-| `graphql` | `App::graphql()` for `async-graphql` schemas |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
 | `grpc-handler` | gRPC server on prost messages ([`veil::api::grpc`], see [gRPC](#grpc)) (implies `handler`, `grpc`) |
-| `api-core` | `handler`, `macro`, `openapi`, `graphql`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
+| `api-core` | `handler`, `macro`, `openapi`, `l4-handler`, `grpc-handler` and tower `Layer`/`Service` compatibility ([`veil::api::tower`]) |
 | `api` | `api-core` + `tokio-compat` (the default way to use the library) |
 
 To use the tokio bridge instead, select `features = ["full", "api-core", "tokio-compat-bridge"]`. Enabling both
@@ -504,16 +503,28 @@ shutdown), sqlx with SQLite and PostgreSQL.
 
 ## GraphQL
 
-Requires `graphql`; bring your own `async-graphql` schema (add `async-graphql` to your `Cargo.toml`).
+veil does not depend on a GraphQL library: you pick one (async-graphql, juniper, ...) and mount it as an ordinary
+handler with `App::route_fn` (`GET` and `POST` on one path). The handler reads the query from `Request::body()` or
+`Request::query()` and returns the result as JSON; subscriptions can be streamed as Server-Sent Events with
+`Response::stream`.
+
+[`examples/api/rust-graphql`](../../examples/api/rust-graphql/) does this for async-graphql in one file you can copy
+(`src/graphql.rs`, about 100 lines):
 
 ```rust
-let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-App::new().graphql("/graphql", schema).run()?;
+mod graphql;   // copied from examples/api/rust-graphql/src/graphql.rs
+
+let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-`POST` takes a JSON body (single or batch); `GET` takes `?query=...&variables=...`; a `GET` without a query from a
-browser (`Accept: text/html`) returns GraphiQL. Responses use `application/graphql-response+json` when the client
-asks for it, otherwise `application/json`. Subscriptions are not supported.
+It serves `POST` with a JSON body (single or batch) and `GET` with `?query=...&variables=...`, GraphiQL for a browser
+`GET` without a query (`Accept: text/html`), `application/graphql-response+json` when the client asks for it
+(otherwise `application/json`), and subscriptions over SSE (GraphQL over SSE, distinct connections mode) when the
+request has `Accept: text/event-stream`: one `event: next` per result and a final `event: complete`.
+
+> Up to v0.7 the `graphql` feature provided `App::graphql(path, schema)`. It was removed (F-207) so that the API
+> library does not pull in async-graphql; copy `src/graphql.rs` from the example to keep the same behaviour.
 
 ## gRPC
 
@@ -850,7 +861,8 @@ tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: a
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
-with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, streaming, HTTP/1.1 and h2c), runs the gRPC
+with curl (routing, validation, OpenAPI, tower, L4 echo, streaming, HTTP/1.1 and h2c, and GraphQL with SSE
+subscriptions through `examples/api/rust-graphql`), runs the gRPC
 interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
 and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
@@ -863,7 +875,6 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
-- GraphQL subscriptions are not supported.
 - gRPC: over HTTP/3 the request stream is read completely before the handler runs (bidirectional calls are half
   duplex there); responses are not compressed; gRPC-Web, server reflection and C/Python gRPC handlers are not
   available yet.

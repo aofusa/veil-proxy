@@ -44,8 +44,6 @@ pub mod tower;
 #[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
 pub mod tokio_compat;
 
-#[cfg(feature = "graphql")]
-pub mod graphql;
 
 #[cfg(feature = "l4-handler")]
 pub mod l4;

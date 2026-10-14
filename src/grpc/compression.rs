@@ -81,10 +81,7 @@ impl GrpcCompression {
 
     /// このビルドで実際に解凍できるか（`compression` feature 無しでは gzip・deflate を扱えない。B-127）
     pub fn is_supported(&self) -> bool {
-        match self {
-            Self::Identity => true,
-            _ => cfg!(feature = "compression"),
-        }
+        matches!(self, Self::Identity) || cfg!(feature = "compression")
     }
 
     /// 解凍後の大きさが `limit` を超えたら打ち切る（B-127）。

@@ -117,8 +117,6 @@ TOML
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
-  expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}'
-  expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7Badd(a:2,b:3)%7D"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
@@ -146,6 +144,31 @@ TOML
   PIDS+=("$!"); wait_port "$P2"
   expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P2/openapi.json"
   kill "$!" 2>/dev/null
+}
+
+run_graphql() {
+  echo "== GraphQL (examples/api/rust-graphql、async-graphql を利用者側で載せる。F-207)"
+  local T="$ROOT/target/examples-api"
+  (cd "$ROOT/examples/api/rust-graphql" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build graphql"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" exec "$T/debug/veil-example-graphql$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start graphql"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P/graphql" J='content-type: application/json'
+  expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
+  expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B?query=%7Badd(a:2,b:3)%7D"
+  expect "GraphQL variables" '{"data":{"greeting":"Hello, veil!"}}' curl -s -X POST "$B" -H "$J" -d '{"query":"query($n:String!){ greeting(name:$n) }","variables":{"n":"veil"}}'
+  expect "GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$B" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
+  expect "GraphQL batch" '[{"data":{"add":2}},{"data":{"count":5}}]' curl -s -X POST "$B" -H "$J" -d '[{"query":"{ add(a:1,b:1) }"},{"query":"{ count }"}]'
+  expect "GraphQL error" '"errors"' curl -s -X POST "$B" -H "$J" -d '{"query":"{ nope }"}'
+  expect "GraphQL response media type" "application/graphql-response+json" curl -s -i -X POST "$B" -H "$J" -H 'accept: application/graphql-response+json' -d '{"query":"{ add(a:1,b:1) }"}'
+  expect "GraphiQL" "graphiql" bash -c "curl -s -H 'accept: text/html' '$B' | tr A-Z a-z"
+  expect "subscription over SSE" 'event: next
+data: {"data":{"countdown":0}}
+
+event: complete' curl -s -N -X POST "$B" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(from: 2) }"}'
+  expect "subscription over SSE (h2c)" '"countdown":2' curl -s -N --http2-prior-knowledge -X POST "$B" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(from: 2) }"}'
+  kill "$PID" 2>/dev/null
 }
 
 run_c() {
@@ -281,12 +304,12 @@ run_nonregression() {
 }
 
 case "$WHAT" in
-  rust) run_rust ;;
+  rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
   c) run_c ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
-  all) run_nonregression; run_rust; run_grpc; run_c; run_python ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_python ;;
   *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

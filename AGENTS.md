@@ -179,7 +179,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 ### API ライブラリ・制御プレーン（F-188〜F-196・F-04・F-05）
 
-- ライブラリ用コード（`src/api/`、`handler`・`macro`・`openapi`・`tokio-compat`・`tokio-compat-bridge`・`graphql`・`l4-handler`・`grpc-handler`・`api-core`・`api`）は
+- ライブラリ用コード（`src/api/`、`handler`・`macro`・`openapi`・`tokio-compat`・`tokio-compat-bridge`・`l4-handler`・`grpc-handler`・`api-core`・`api`）は
   default・`full*` に入れない。本体側への追加は `cfg(feature = "handler")` の分岐だけにする（`tests/api/library_e2e.sh nonregression`
   が full バイナリに `veil::api`・inventory・async-graphql・tokio・pyo3 が無いことを検査する）。`handler` 時は `#[global_allocator]` を定義しない。
 - ライブラリの設定は `config_override::apply_to_toml_str` のフックで合成する（既定 < ファイル < VDS < 環境変数 < インライン < ビルダ、

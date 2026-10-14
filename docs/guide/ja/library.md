@@ -10,7 +10,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 
 | フロントエンド | 場所 | 主な用途 |
 |----------------|------|----------|
-| Rust ライブラリ | `veil` クレート（`api` feature 群） | 最速。マクロ・OpenAPI・tower・GraphQL |
+| Rust ライブラリ | `veil` クレート（`api` feature 群） | 最速。マクロ・OpenAPI・tower・gRPC・任意の GraphQL ライブラリ |
 | C API | [`crates/veil-capi`](../../../crates/veil-capi/README.md)（`libveil.so` / `libveil.a`、`veil.h`） | C・C++ など C FFI を持つ言語 |
 | Python | [`crates/veil-python`](../../../crates/veil-python/README.md)（wheel、`import veil`） | FastAPI 風のデコレータ |
 
@@ -47,7 +47,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
   veil の `offload` を通じて別のハンドラ用スレッドプール（`[api] handler_threads`）で実行されるので、遅い DB 呼び出しが
   他の接続を止めることはありません。
 - **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-compat`・
-  `tokio-compat-bridge`・`graphql`・`l4-handler`・`grpc-handler`・`api-core`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
+  `tokio-compat-bridge`・`l4-handler`・`grpc-handler`・`api-core`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
   従来とまったく同じです。
 - プロキシで使えるものはそのまま使えます。`[server]`・`[tls]`・`[security]`・`[logging]`・`[prometheus]` などのセクション、
   SIGHUP リロード、graceful shutdown（SIGINT/SIGTERM または `veil::shutdown()`）です。
@@ -63,10 +63,9 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json` と Swagger UI（`macro` を含意） |
 | `tokio-compat` | tokio 無しの tokio 互換レイヤー（`veil::tokio`・`App::tokio_service`・`veil::api::tokio_compat`）。[tokio 互換](#tokio-互換) を参照 |
 | `tokio-compat-bridge` | `tokio-compat` の代わりに、本物の tokio ランタイムを同梱して Future をその上で動かす（`tokio-compat` と排他） |
-| `graphql` | `async-graphql` スキーマ向けの `App::graphql()` |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理（`l4-proxy` を含意） |
 | `grpc-handler` | prost のメッセージで書く gRPC サーバ（`veil::api::grpc`、[gRPC](#grpc) を参照。`handler`・`grpc` を含意） |
-| `api-core` | `handler`・`macro`・`openapi`・`graphql`・`l4-handler`・`grpc-handler` と tower の `Layer`/`Service` 互換（`veil::api::tower`） |
+| `api-core` | `handler`・`macro`・`openapi`・`l4-handler`・`grpc-handler` と tower の `Layer`/`Service` 互換（`veil::api::tower`） |
 | `api` | `api-core` + `tokio-compat`（ライブラリの既定の使い方） |
 
 tokio の橋渡しを使うときは `features = ["full", "api-core", "tokio-compat-bridge"]` を選びます。`tokio-compat` と
@@ -486,16 +485,27 @@ graceful shutdown）、sqlx（SQLite・PostgreSQL）。
 
 ## GraphQL
 
-`graphql` が必要です。`async-graphql` のスキーマは利用者が用意します（`Cargo.toml` に `async-graphql` を追加）。
+veil は GraphQL のライブラリに依存しません。利用者が好きな実装（async-graphql・juniper 等）を選び、普通のハンドラとして
+`App::route_fn` で載せます（1 つのパスに `GET` と `POST`）。ハンドラは `Request::body()` か `Request::query()` から問い合わせを
+読み、結果を JSON で返します。サブスクリプションは `Response::stream` で Server-Sent Events として送れます。
+
+[`examples/api/rust-graphql`](../../../examples/api/rust-graphql/) が async-graphql でこれを行う例で、コピーして使える
+1 ファイル（`src/graphql.rs`、約 100 行）にまとめています:
 
 ```rust
-let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-App::new().graphql("/graphql", schema).run()?;
+mod graphql;   // examples/api/rust-graphql/src/graphql.rs をコピー
+
+let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-`POST` は JSON 本文（単発またはバッチ）、`GET` は `?query=...&variables=...` を受けます。クエリの無い `GET` でブラウザ
+`POST` は JSON 本文（単発またはバッチ）、`GET` は `?query=...&variables=...` を受け、クエリの無い `GET` でブラウザ
 （`Accept: text/html`）なら GraphiQL を返します。クライアントが求めたときは `application/graphql-response+json`、
-それ以外は `application/json` で応答します。サブスクリプションは非対応です。
+それ以外は `application/json` で応答します。`Accept: text/event-stream` の要求はサブスクリプションを SSE
+（GraphQL over SSE の distinct connections モード）で返します（結果ごとに `event: next`、最後に `event: complete`）。
+
+> v0.7 までは `graphql` feature が `App::graphql(path, schema)` を提供していました。API ライブラリが async-graphql を
+> 引き込まないように廃止しました（F-207）。同じ動作はサンプルの `src/graphql.rs` をコピーすれば得られます。
 
 ## gRPC
 
@@ -821,7 +831,7 @@ tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # 既定: al
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
-OpenAPI・tower・GraphQL・L4 エコー・ストリーミング・HTTP/1.1 と h2c）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
+OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
 cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
 （python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
@@ -832,7 +842,6 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - gRPC: HTTP/3 では要求ストリームを読み終えてからハンドラを呼びます（双方向の呼び出しは半二重）。応答は圧縮しません。
   gRPC-Web・Server Reflection・C/Python の gRPC ハンドラはまだありません。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
-- GraphQL のサブスクリプションは非対応です。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります
   （`/openapi.json` はオフラインでも使えます）。
