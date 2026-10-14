@@ -10,6 +10,7 @@ pub mod demo {
 use demo::demo_server::{add_demo, Demo};
 use demo::*;
 
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 

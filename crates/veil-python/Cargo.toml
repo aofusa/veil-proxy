@@ -14,9 +14,13 @@ crate-type = ["cdylib"]
 [dependencies]
 veil = { path = "../..", default-features = false, features = [
     "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
-    "rate-limit", "buffering", "admin", "access-log", "l4-proxy", "epoll",
+    "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
     "handler", "openapi", "macro",
 ] }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
 bytes = "1"
 serde_json = "1"
+
+# epoll feature は Linux でだけ指定できる（他の OS は kqueue / WSAPoll の reactor が自動で選ばれる）。
+[target.'cfg(target_os = "linux")'.dependencies]
+veil = { path = "../..", default-features = false, features = ["epoll"] }

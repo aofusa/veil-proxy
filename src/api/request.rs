@@ -34,7 +34,8 @@ pub struct Request {
     pub(crate) path: Bytes,
     /// `?` の後ろ（無ければ空）。
     pub(crate) query: Bytes,
-    pub(crate) headers: std::sync::Arc<Vec<(Bytes, Bytes)>>,
+    /// 受信したままのヘッダ（要求ごとの `Arc` を作らない。`Headers` 抽出子が使われたときだけ包む。F-202）
+    pub(crate) headers: Vec<(Bytes, Bytes)>,
     pub(crate) body: Bytes,
     pub(crate) params: PathParams,
     pub(crate) client_ip: IpAddr,
@@ -57,7 +58,7 @@ impl Request {
             method: method.into(),
             path,
             query,
-            headers: std::sync::Arc::new(headers),
+            headers,
             body: body.into(),
             params: Vec::new(),
             client_ip: IpAddr::from([127, 0, 0, 1]),

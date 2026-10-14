@@ -29,7 +29,7 @@ tests/fixtures/f150_cache/*
 examples/wasm-filters/*/target/
 examples/api/*/target/
 tools/api-bench/*/target/
-tools/api-bench/*/target-epoll/
+tools/api-bench/*/target-*/
 examples/wasm-filters/*/Cargo.lock
 tests/wasm/*.wasm
 

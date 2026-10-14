@@ -131,7 +131,7 @@ Self-contained checks that start their own processes (no shared `e2e_setup.sh` e
 | What | Command | Covers |
 |------|---------|--------|
 | Process-level behavior | `cargo test --test standalone_e2e --features full` | `VEIL_OVERRIDE_<n>` (incl. SIGHUP and CLI priority), Kubernetes-Secret style certificate swap, plaintext-only server and `allow_http` / `allow_h2c` / `enable_secure_redirect` (`listen_cleartext`), removed-key errors, listener validation rules, VDS against the reference control plane |
-| API library | `tests/api/library_e2e.sh [rust\|c\|python\|nonregression\|all]` | Rust showcase (macros, validation, OpenAPI, tower layers, GraphQL, L4 handlers, defaults without config.toml), C (shared + static), Python, and that the `full` binary contains no library code |
+| API library | `tests/api/library_e2e.sh [rust\|grpc\|c\|python\|nonregression\|all]` | Rust showcase (macros, validation, OpenAPI, tower layers, GraphQL, L4 handlers, defaults without config.toml), gRPC interop (Linux: io_uring and epoll), C (shared + static), Python, and that the `full` binary contains no library code. Runs on Linux, macOS, BSD and Windows (Git Bash); see [Platforms](library.md#platforms) |
 | ACME | `tests/acme/pebble_e2e.sh` | issuance from Pebble via HTTP-01 and hot reload (needs docker) |
 | Containers | `examples/container/e2e.sh` | Docker secrets, environment overrides, certificate rotation, graceful stop (needs a built image) |
 | Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | sidecar in Istio / Linkerd meshes on kind ([kubernetes.md](kubernetes.md)) |

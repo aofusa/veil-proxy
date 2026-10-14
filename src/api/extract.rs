@@ -92,7 +92,7 @@ impl FromRequest for String {
 
 impl FromRequest for Headers {
     fn from_request(req: &Request) -> Result<Self, Response> {
-        Ok(Headers(req.headers.clone()))
+        Ok(Headers(std::sync::Arc::new(req.headers.clone())))
     }
 }
 

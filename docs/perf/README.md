@@ -175,6 +175,24 @@ req/s は 6 サンプルの中央値、errors はすべて 0。
 - API ライブラリ自体の性能（axum on tokio / `veil::tokio`・veil のハンドラ・FastAPI との比較）は
   [docs/guide/library.md の Performance](../guide/library.md#performance) と `tools/api-bench/`。
 
+## API ライブラリのハンドラ経路の改善の非退行確認（2026-10-13、F-202）
+
+F-202 は HTTP/1.1 の共通経路（ヘッダ位置・ルーティング用の一覧をスタックの配列に、Content-Length の検査を確保なしに）も
+変えたので、F-202 の前（`veil:f202base`）と後（`veil:f202new`）の glibc `full` イメージを `tools/perf/suite_ab.sh` で
+両方の順番で測った（各 3 回の中央値の比、新 / 旧）。
+
+| 構成 | プロトコル | 新が先 | 旧が先 |
+|------|-----------|-------:|-------:|
+| 静的配信（h2 無効, ofc 有効） | HTTP/1.1 | 1.000 | 0.990 |
+| 静的配信（h2 有効, ofc 有効） | HTTP/1.1 | 1.010 | 1.000 |
+| 同上 | HTTP/2 | 0.982 | 1.018 |
+| プロキシ | HTTP/1.1 | 0.997 | 1.025 |
+| 同上 | HTTP/2 | 1.000 | 1.001 |
+
+どれも順番を入れ替えると向きが逆になる振れで、退行は無い。最初の版（64 個ぶんの配列を 2 つ、要求ごとに 4KB を
+初期化）は HTTP/1.1 が両方の順番で 0.98〜0.996 だったので、配列を u16 の位置（512 バイト）と 16 個まで（それより多いときだけ
+確保）に縮めた。ハンドラ経路そのものの結果は [library.md の Performance](../guide/library.md#performance) と F-202。
+
 ## FreeBSD 14.3 aarch64（QEMU + HVF、ネイティブ）
 
 - コミット: `d8126b6`。`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`（3B と 54,576B）

@@ -164,7 +164,14 @@ impl HttpClient {
             .collect();
         let mut last = String::from("no address");
         for a in addrs {
-            match std::net::TcpStream::connect_timeout(&a, Duration::from_secs(5)) {
+            // NetBSD では拒否された接続でも connect_timeout が Ok を返し、エラーは SO_ERROR に残る
+            // （B-91・upstream::tcp_connect_timeout と同じ）。確かめないと次のアドレスを試さない。
+            let connected = std::net::TcpStream::connect_timeout(&a, Duration::from_secs(5))
+                .and_then(|s| match s.take_error()? {
+                    Some(e) => Err(e),
+                    None => Ok(s),
+                });
+            match connected {
                 Ok(s) => {
                     let _ = s.set_read_timeout(Some(self.io_timeout));
                     let _ = s.set_write_timeout(Some(Duration::from_secs(10)));

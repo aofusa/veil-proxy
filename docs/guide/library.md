@@ -31,6 +31,7 @@ Three front ends share the same implementation:
 - [Python](#python)
 - [Building library artifacts](#building-library-artifacts)
 - [Performance](#performance)
+- [Platforms](#platforms)
 - [Testing](#testing)
 - [Limitations](#limitations)
 
@@ -469,6 +470,8 @@ Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works witho
   `sync` (mpsc, oneshot, watch, broadcast, `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`,
   `SetOnce`), `signal`, `fs`, `select!`/`join!`/`try_join!`/`pin!`, `runtime::{Runtime, Builder, Handle}`.
 - Not supported: `process`, runtime metrics, task dumps/tracing hooks, io_uring-backed `fs`, Windows named pipes.
+  On **Windows**, `net` and `signal` are not available yet (F-204), so crates that open sockets themselves
+  (hyper/axum servers, reqwest, sqlx) do not build on the shim there; services mounted with `tokio_service` work.
   Crates that need these (or tokio's internals) should use `tokio-compat-bridge`.
 
 ### Compatibility
@@ -494,7 +497,8 @@ Most of the remaining `task` failures check tokio's runtime internals through th
 `AsyncFd` readiness for `Interest::ERROR`/`PRIORITY` and wake-ups of futures that were pending when the runtime was
 dropped. Results per file: `docs/artifacts/tokio_compat_results.md` after running the script.
 
-Real libraries checked by `tools/tokio-compat/ecosystem` (io_uring and epoll): hyper server (HTTP/1.1 + h2c) and
+Real libraries checked by `tools/tokio-compat/ecosystem` (Linux io_uring and epoll, and the kqueue reactor on macOS,
+FreeBSD, OpenBSD and NetBSD; see [Platforms](#platforms)): hyper server (HTTP/1.1 + h2c) and
 client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, axum 0.8 (`axum::serve`, extractors, state, graceful
 shutdown), sqlx with SQLite and PostgreSQL.
 
@@ -648,6 +652,7 @@ declare a `#[global_allocator]`: the application chooses. The allocator features
 
 ```rust
 // veil's own allocator (unix; `veil-alloc` is part of `full`)
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 
@@ -656,14 +661,14 @@ static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ```
 
-Without any declaration the Rust system allocator is used. The `veil` binary (built without `handler`) keeps
+Without any declaration the Rust system allocator is used (on Windows the example above falls back to it). The `veil` binary (built without `handler`) keeps
 selecting its allocator as before. `examples/api/rust-showcase` declares `VeilAlloc`.
 
 Allocator features are mutually exclusive (see [Memory allocators](performance.md#memory-allocators-f-183)).
 The C and Python builds ([`veil-capi`](../../crates/veil-capi/README.md), [`veil-python`](../../crates/veil-python/README.md))
 enable no allocator feature, so they never replace the allocator of the host process (a C program or the Python
-interpreter). They are also built on the epoll (readiness reactor) backend rather than io_uring, and without the
-gRPC, WASM, VDS and ACME features.
+interpreter). On Linux they are built on the epoll (readiness reactor) backend rather than io_uring; other systems
+use their default reactor (kqueue, WSAPoll). They are built without the gRPC, WASM, VDS and ACME features.
 
 ## C API
 
@@ -692,6 +697,12 @@ gcc hello.c -Icrates/veil-capi/include -Ltarget/release -lveil -lpthread -ldl -l
     -Wl,-rpath,$PWD/target/release -o hello          # dynamic
 gcc hello.c -Icrates/veil-capi/include target/release/libveil.a -lpthread -ldl -lm -o hello   # static
 ```
+
+On other systems the dynamic library is `libveil.dylib` (macOS) or `veil.dll` + `veil.dll.lib` (Windows, MSVC),
+and the system libraries for a static link differ (OpenBSD and NetBSD have no `libdl`, Windows needs `ws2_32.lib`
+and others). Ask rustc for the list:
+`cargo rustc -p veil-capi --release --crate-type staticlib -- --print native-static-libs`
+(`examples/api/c-hello/Makefile` takes it as `LIBS=...`; `tests/api/library_e2e.sh` shows the MSVC command line).
 
 **Threading.** By default the callback runs on the **handler pool** (`[api] handler_threads`), so it may block
 (database, files), but it is called from **several threads at once** — protect shared data and make `user_data`
@@ -776,10 +787,14 @@ time of the server's cores (including the kernel's loopback processing) divided 
 | axum + `veil::tokio`, `axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
 | axum + `veil::tokio`, per-core | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
 | axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
-| veil `App` + axum `Router` (`tokio_service`) | 33,316 | 31,190 | 2.47 | 61.1 | 11.3 |
-| veil `App` + axum `Router` (epoll) | 36,577 | 34,106 | 2.17 | 55.6 | 9.7 |
-| veil native handler (`#[veil::route]`) | 42,533 | 39,507 | 1.96 | 47.6 | 11.2 |
-| veil native handler (epoll) | 49,149 | 45,495 | 1.75 | 41.4 | 9.6 |
+| veil `App` + axum `Router` (`tokio_service`) | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
+| veil `App` + axum `Router` (epoll) | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
+| veil native handler (`#[veil::route]`) | 64,546 | 58,524 | 2.14 | 31.7 | 11.3 |
+| veil native handler (epoll) | 66,722 | 60,461 | 2.65 | 30.9 | 9.6 |
+
+The four veil rows were measured after F-202 (handler path: 14 → 4 allocations per request, the response head and a
+small body written at once), in the same alternating run as axum + tokio per-core at 68,343 / 61,675 req/s; before
+F-202 they were 33,349 / 36,702 (`tokio_service`) and 42,366 / 48,783 (native) req/s for plaintext.
 
 - **axum runs on `veil::tokio` unchanged** (the same source, with the `tokio` crate patched to the shim). Per core it
   reaches about **80% (io_uring) to 84% (epoll)** of axum on tokio, and uses 20–25% more CPU per request.
@@ -787,11 +802,11 @@ time of the server's cores (including the kernel's loopback processing) divided 
   connection task stays on the thread that accepted it (the server cores are only ~85% busy out of 200%). For
   multi-core use, run one current-thread runtime and one `SO_REUSEPORT` listener per thread (the "per-core" rows,
   `run_percore` in `tools/api-bench/common.rs`), or mount the router in a veil `App`, whose workers each accept.
-- veil's own handler path (request conversion, routing, extraction, response) currently costs more CPU per request
-  than axum on tokio: the native handler reaches 63% (io_uring) / 72% (epoll) of it, and mounting an axum `Router`
-  adds a conversion to and from `http::Request`/`http::Response` on top. At this concurrency the io_uring backend
-  makes about 2.3 `io_uring_enter` calls per request (no batching), which is why epoll is faster here. This is the
-  API library's handler path, not the proxy data plane, and is tracked as a follow-up.
+- **veil's native handler reaches 98% (epoll) / 93% (io_uring) of axum on tokio** (5-round re-measurement), with
+  about the same CPU per request (30.5–31.7 µs against 29.3 µs). The remaining io_uring gap is the keep-alive wait:
+  the next request is awaited with a readiness poll and then read (two operations, so idle connections hold no read
+  buffer), which is tracked as F-205. Mounting an axum `Router` adds a conversion to and from
+  `http::Request`/`http::Response` (most of its 30 allocations per request are in http/axum).
 
 ### Python: FastAPI (uvicorn) and veil
 
@@ -810,6 +825,24 @@ done in Rust and only the handler body runs in Python. Python handlers are still
 single process does not scale with cores; `offload=True` keeps the event loop free of the GIL at the cost of a
 handoff to the handler pool (the higher p99).
 
+## Platforms
+
+The library (Rust, C, Python), its gRPC server and VDS were checked on each system with `tests/api/library_e2e.sh`
+and `tests/standalone_e2e.rs` (F-203, 2026-10):
+
+| System | Proxy and VDS (`standalone_e2e`) | Rust API | gRPC (h2c, h3) | C | Python | `veil::tokio` ecosystem |
+|---|---|---|---|---|---|---|
+| Linux x86_64 (io_uring, epoll) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (incl. PostgreSQL) |
+| macOS 15 arm64 (kqueue) | ✓ | ✓ | ✓ | ✓ (clang) | ✓ | ✓ |
+| FreeBSD 14.3 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| OpenBSD 7.9 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| NetBSD 10.1 x86_64 (kqueue) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Windows 11 x86_64 (WSAPoll) | ✓ (no SIGHUP/secret-swap tests) | ✓ (no SIGHUP) | ✓ | ✓ (MSVC) | ✓ | – (no `net`, F-204) |
+
+- **Windows** has no signals: configuration reload with SIGHUP and graceful shutdown on SIGTERM are not available
+  (Ctrl-C stops the process). `veil::tokio` has no `net`/`signal` there yet (see [tokio compatibility](#tokio-compatibility)).
+- The C library is built with the system's toolchain (cc/clang, MSVC on Windows); see [C API](#c-api) for linking.
+
 ## Testing
 
 ```bash
@@ -818,8 +851,11 @@ tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: a
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
 with curl (routing, validation, OpenAPI, tower, GraphQL, L4 echo, streaming, HTTP/1.1 and h2c), runs the gRPC
-interoperability checks against `examples/api/rust-grpc` (`grpc`), and the `nonregression` step
-checks that the proxy binary is unaffected. Needs cargo, gcc, curl, nc and python3. Unit tests: `cargo test
+interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
+and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
+NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
+(GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
+another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 --lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` for Python. See also
 [Testing](testing.md).
 

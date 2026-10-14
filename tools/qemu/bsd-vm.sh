@@ -1260,6 +1260,8 @@ cmd_sync() {
     # `src/tls_provider.rs` → `src/tls_provider/mod.rs` へ移動した際、ゲストに旧
     # ファイルが残って `E0761: file for module found at both ...` でビルドが壊れた
     # （F-142、実機で検出）。`target/` は転送対象外なので消えない（ビルドキャッシュは維持）。
+    # `crates`（veil-macros 等のワークスペースメンバー。F-188）と `proto`（VDS の .proto）も転送する。members から外すのは
+    # `fuzz` だけ（members に crates/* が増えて、以前の `[".", "fuzz"]` 全体の置換が一致しなくなっていた）。
     # `tools` も必ず転送する。VM 内で実行するのはビルド・E2E だけでなく
     # **perf 計測ハーネス（tools/perf/freebsd/run_perf_freebsd.sh）**もであり、
     # これが転送対象から漏れていると **ホスト側でハーネスを直しても VM 側は
@@ -1285,12 +1287,12 @@ cmd_sync() {
         --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
         --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
         --exclude='tools/container_security/results' --exclude='tools/perf/results' \
-        src benches tests examples contrib docker/assets third_party tools \
+        src benches tests examples contrib docker/assets third_party tools crates proto \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
-          && rm -rf src benches tests examples contrib docker/assets third_party .cargo \
+          && rm -rf src benches tests examples contrib docker/assets third_party crates proto .cargo \
           && tar xzf - \
-          && sed -i'' -e 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
+          && sed -i'' -e 's|\"fuzz\", ||' Cargo.toml"
 }
 
 # aws-lc-sys の bindgen が libclang を要求するため、VM 内での LIBCLANG_PATH を解決する

@@ -11,7 +11,14 @@ LOG="$(mktemp)"
 
 ok()   { echo "  ok   $*"; }
 bad()  { echo "  FAIL $*"; FAIL=$((FAIL + 1)); }
-cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""; }
+WINDOWS=""; case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; esac
+# Windows の venv の python.exe は本体を子プロセスで起動するランチャなので、Git Bash の kill では
+# 子（サーバ本体）が残る。プロセスツリーごと止める。
+stop() { # stop <pid>
+  if [ -n "$WINDOWS" ]; then taskkill //F //T //PID "$(cat "/proc/$1/winpid" 2>/dev/null)" >/dev/null 2>&1; fi
+  kill "$1" 2>/dev/null
+}
+cleanup() { [ -n "$PID" ] && stop "$PID"; wait "$PID" 2>/dev/null; PID=""; }
 trap 'cleanup; rm -f "$LOG"' EXIT
 
 free_port() { "$PYTHON" -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
@@ -62,8 +69,12 @@ for needle in '"/ping"' '"/hello/{name}"' '"/users"' '"maximum":120' '"minLength
   [[ "$SPEC" == *"$needle"* ]] && ok "openapi has $needle" || bad "openapi missing $needle: $SPEC"
 done
 [[ "$(curl -s "$(U /docs)")" == *swagger* || "$(curl -s "$(U /docs)")" == *Swagger* ]] && ok "/docs" || bad "/docs"
-kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
-if kill -0 "$PID" 2>/dev/null; then bad "graceful shutdown (SIGTERM)"; else ok "graceful shutdown (SIGTERM)"; fi
+if [ -n "$WINDOWS" ]; then
+  echo "  skip graceful shutdown (SIGTERM): Windows"; stop "$PID"; wait "$PID" 2>/dev/null
+else
+  kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$PID" 2>/dev/null; then bad "graceful shutdown (SIGTERM)"; else ok "graceful shutdown (SIGTERM)"; fi
+fi
 PID=""
 
 echo "== python-fastapi-like"
@@ -86,10 +97,14 @@ if [[ "$HAVE_PYD" == *true* ]]; then
 else
   [[ "$SPEC" == *'"maxLength":50'* ]] && ok "openapi body_constraints schema" || bad "openapi body_constraints schema"
 fi
-# Ctrl-C 相当（SIGINT）でも graceful に終了する
-kill -INT "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
-if kill -0 "$PID" 2>/dev/null; then bad "graceful shutdown (SIGINT)"; else ok "graceful shutdown (SIGINT)"; fi
-PID=""
+# Ctrl-C 相当（SIGINT）でも graceful に終了する（Windows の Git Bash からネイティブのプロセスへ SIGINT は送れない）
+if [ -n "$WINDOWS" ]; then
+  echo "  skip graceful shutdown (SIGINT): Windows"
+else
+  kill -INT "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$PID" 2>/dev/null; then bad "graceful shutdown (SIGINT)"; else ok "graceful shutdown (SIGINT)"; fi
+  PID=""
+fi
 
 echo
 [ "$FAIL" -eq 0 ] && echo "ALL OK" || { echo "$FAIL FAILED"; exit 1; }

@@ -13,6 +13,11 @@ pub fn veil_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_veil"))
 }
 
+/// 設定（TOML の基本文字列）に埋め込むパス。Windows の `\\` はエスケープとして読まれるので `/` にする。
+pub fn tp(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 /// 空いている TCP ポートを 1 つ返す（bind して即解放）。
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -92,6 +97,7 @@ impl VeilProcess {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 
+    #[cfg(unix)]
     pub fn sighup(&self) {
         unsafe {
             libc::kill(self.pid(), libc::SIGHUP);
@@ -101,9 +107,13 @@ impl VeilProcess {
     /// SIGTERM を送り、終了を待つ（最大 `wait`）。終了コードを返す（タイムアウトなら None）。
     pub fn terminate(&mut self, wait: Duration) -> Option<std::process::ExitStatus> {
         let mut child = self.child.take()?;
+        #[cfg(unix)]
         unsafe {
             libc::kill(child.id() as i32, libc::SIGTERM);
         }
+        // Windows にシグナルは無い（終了待ちの代わりに即終了させる）
+        #[cfg(windows)]
+        let _ = child.kill();
         let deadline = Instant::now() + wait;
         loop {
             if let Ok(Some(st)) = child.try_wait() {
@@ -125,14 +135,20 @@ impl Drop for VeilProcess {
     }
 }
 
+/// `127.0.0.1:port` へ接続する。NetBSD では拒否された接続でも std の `connect_timeout` が `Ok` を
+/// 返してエラーを `SO_ERROR` に残すので（B-91）、`take_error` まで確かめる。
+pub fn connect_local(port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let s = TcpStream::connect_timeout(&format!("127.0.0.1:{}", port).parse().unwrap(), timeout)?;
+    match s.take_error()? {
+        Some(e) => Err(e),
+        None => Ok(s),
+    }
+}
+
 /// `port` に接続できるようになるまで待つ。
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     wait_until(timeout, || {
-        TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", port).parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
+        connect_local(port, Duration::from_millis(200)).is_ok()
     })
 }
 
@@ -183,10 +199,7 @@ pub fn http1_request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> std::io::Result<HttpResponse> {
-    let mut s = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().unwrap(),
-        Duration::from_secs(2),
-    )?;
+    let mut s = connect_local(port, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut req = format!(
         "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -266,7 +279,7 @@ fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
 /// TLS ハンドシェイクしてサーバ証明書（DER の先頭 1 枚）を返す（検証しない）。
 pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
     use std::sync::Arc;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = veil::tls_provider::provider::default_provider().install_default();
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -275,10 +288,7 @@ pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), name)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut sock = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().unwrap(),
-        Duration::from_secs(2),
-    )?;
+    let mut sock = connect_local(port, Duration::from_secs(2))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;
@@ -323,7 +333,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        veil::tls_provider::provider::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -333,6 +343,51 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 pub fn h2c_get(port: u16, path: &str) -> (u16, Vec<u8>) {
     let (status, _, body) = h2c_get_with_headers(port, path);
     (status, body)
+}
+
+/// h2c で `body_len` バイトの本文を POST して応答のステータスを返す（`timeout` を過ぎたら None）。
+/// 本文は相手の流量制御ウィンドウに従って送る（ウィンドウが補充されなければ止まる）。
+pub fn h2c_post(port: u16, path: &str, body_len: usize, timeout: Duration) -> Option<u16> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let run = async {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let (mut client, conn) = h2::client::handshake(tcp).await.expect("h2c handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = http::Request::builder()
+                .method("POST")
+                .uri(format!("http://localhost:{}{}", port, path))
+                .body(())
+                .unwrap();
+            let (resp, mut send) = client.send_request(req, false).expect("send");
+            let resp = tokio::spawn(resp);
+            let chunk = bytes::Bytes::from(vec![b'x'; 16 * 1024]);
+            let mut left = body_len;
+            while left > 0 {
+                send.reserve_capacity(left.min(chunk.len()));
+                let cap = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                    Some(Ok(n)) => n,
+                    // 応答が先に来てストリームが閉じた
+                    _ => break,
+                };
+                let n = cap.min(left);
+                if send.send_data(chunk.slice(..n), n == left).is_err() {
+                    break;
+                }
+                left -= n;
+            }
+            let resp = resp.await.expect("join").expect("response");
+            resp.status().as_u16()
+        };
+        tokio::time::timeout(timeout, run).await.ok()
+    })
 }
 
 /// `h2c_get` の応答ヘッダ付き版。(status, ヘッダ（名前は小文字）, body)。

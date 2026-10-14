@@ -55,6 +55,12 @@ fn io_uring_available() -> bool {
     }
 }
 
+/// reactor（WSAPoll）ビルドは常に使える。
+#[cfg(veil_poller_wsapoll)]
+fn io_uring_available() -> bool {
+    true
+}
+
 /// 決定的な擬似乱数（LCG）。失敗再現のためシードを固定できる。
 struct Lcg(u64);
 

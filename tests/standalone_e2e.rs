@@ -43,7 +43,7 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
-        www = www.display(),
+        www = tp(&www),
     );
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, &config).unwrap();
@@ -70,14 +70,24 @@ path = "{www}"
     );
 
     // 設定ファイルのルートを変えて SIGHUP。listen の上書きは保たれ、ルートの変更は反映される。
+    // Windows に SIGHUP は無い。
+    #[cfg(unix)]
+    reload_keeps_env_override(&veil, &dir, &cfg_path, &config, &www, env_port);
+}
+
+#[cfg(unix)]
+fn reload_keeps_env_override(
+    veil: &VeilProcess,
+    dir: &tempfile::TempDir,
+    cfg_path: &std::path::Path,
+    config: &str,
+    www: &std::path::Path,
+    env_port: u16,
+) {
     let www2 = dir.path().join("www2");
     std::fs::create_dir_all(&www2).unwrap();
     std::fs::write(www2.join("index.html"), "v2").unwrap();
-    std::fs::write(
-        &cfg_path,
-        config.replace(&www.display().to_string(), &www2.display().to_string()),
-    )
-    .unwrap();
+    std::fs::write(cfg_path, config.replace(&tp(www), &tp(&www2))).unwrap();
     veil.sighup();
     let ok = wait_until(Duration::from_secs(10), || {
         http1_get(env_port, "/index.html")
@@ -113,13 +123,13 @@ path = "/"
 type = "File"
 path = "{a}"
 "#,
-        a = dir.path().join("a").display(),
+        a = tp(&dir.path().join("a")),
     );
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, &config).unwrap();
 
-    let b = dir.path().join("b").display().to_string();
-    let c = dir.path().join("c").display().to_string();
+    let b = tp(&dir.path().join("b"));
+    let c = tp(&dir.path().join("c"));
     let env_value = format!(r#"route.0.action.path = "{b}""#);
     let cli_value = format!(r#"route.0.action.path = "{c}""#);
 
@@ -213,8 +223,8 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
-        secret = secret.display(),
-        www = www.display(),
+        secret = tp(&secret),
+        www = tp(&www),
     );
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
@@ -281,7 +291,7 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
-        www = www.display()
+        www = tp(&www)
     );
     let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
@@ -367,6 +377,45 @@ fn b122_cleartext_waits_for_late_and_fragmented_first_bytes() {
     );
 }
 
+/// B-123: HTTP/2 の要求本文を読み捨てる経路（上流に繋がらず 502 を返す等）でも、消費のたびに
+/// メインループを起こして recv ウィンドウを補充する。以前は補充されず、接続の初期ウィンドウ（1MiB）を
+/// 超える本文を送るクライアントが止まったまま応答が返らなかった（reactor で必ず固まる）。
+#[test]
+fn b123_h2c_large_body_to_failing_upstream_gets_502() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    // 誰も listen していないポート（接続は拒否される）
+    let dead = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/up"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{dead}"
+"#
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    for _ in 0..2 {
+        let status = h2c_post(port, "/up", 3 * 1024 * 1024, Duration::from_secs(20));
+        assert_eq!(status, Some(502), "{}", veil.log());
+    }
+}
+
 /// F-200: `allow_http = false` は平文 HTTP/1.1 を 426 で拒否し、h2c は受ける。
 #[test]
 fn f200_allow_http_false_rejects_http1_with_426_but_serves_h2c() {
@@ -434,9 +483,9 @@ path = "/"
 type = "File"
 path = "{www}"
 "#,
-        cert = cert.display(),
-        key = key.display(),
-        www = www.display()
+        cert = tp(&cert),
+        key = tp(&key),
+        www = tp(&www)
     );
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
@@ -537,8 +586,8 @@ fn f200_listener_rules_are_validated() {
     let cfg_path = dir.path().join("config.toml");
     let tls = format!(
         "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
-        cert.display(),
-        key.display()
+        tp(&cert),
+        tp(&key)
     );
     let run = |cfg: String| {
         std::fs::write(&cfg_path, cfg).unwrap();
@@ -640,7 +689,10 @@ fn vds_server_bin() -> std::path::PathBuf {
                 .status()
                 .expect("cargo");
             assert!(st.success(), "failed to build tools/vds/server");
-            target.join("debug/veil-vds-server")
+            target.join(format!(
+                "debug/veil-vds-server{}",
+                std::env::consts::EXE_SUFFIX
+            ))
         })
         .clone()
 }
@@ -655,7 +707,9 @@ fn spawn_vds_control_plane(
 ) -> ChildGuard {
     let mut cmd = match kind {
         VdsControlPlane::Python => {
-            let mut c = std::process::Command::new("python3");
+            // python3 の名前が違う環境（Windows の Store スタブ等）は PYTHON3 で指定する
+            let py = std::env::var("PYTHON3").unwrap_or_else(|_| "python3".into());
+            let mut c = std::process::Command::new(py);
             c.arg("-I")
                 .arg(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -681,12 +735,23 @@ fn spawn_vds_control_plane(
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("failed to start the VDS control plane");
-    let guard = ChildGuard(child);
-    assert!(
-        wait_for_port(port, Duration::from_secs(15)),
-        "control plane did not start"
-    );
-    guard
+    let mut guard = ChildGuard(child);
+    // 負荷の高いホスト（VM の同時実行・初回の .pyc 生成）では Python の起動に 15 秒を超えることがある。
+    // 終了したらすぐ失敗にし、待つのは最大 60 秒。
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(Some(st)) = guard.0.try_wait() {
+            panic!("control plane exited: {st}");
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return guard;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "control plane did not start in 60s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// 配信 → 更新 → NACK（前の版のまま）→ 修正、gRPC では制御プレーンの再起動からの再接続も確かめる。
@@ -702,7 +767,7 @@ fn vds_scenario(kind: VdsControlPlane, transport: &str, tls: bool) {
     let route = |p: &std::path::Path| {
         format!(
             "[[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"File\"\npath = \"{}\"\n",
-            p.display()
+            tp(p)
         )
     };
     std::fs::write(&snap, route(&dir.path().join("a"))).unwrap();
@@ -718,7 +783,7 @@ fn vds_scenario(kind: VdsControlPlane, transport: &str, tls: bool) {
     let scheme = if tls { "https" } else { "http" };
     let ca = certs
         .as_ref()
-        .map(|(c, _)| format!("ca_cert = \"{}\"\n", c.display()))
+        .map(|(c, _)| format!("ca_cert = \"{}\"\n", tp(c)))
         .unwrap_or_default();
     let config = format!(
         r#"
@@ -738,7 +803,7 @@ poll_timeout_secs = 5
 retry_initial_ms = 100
 retry_max_ms = 1000
 {ca}{base_route}"#,
-        token = token.display(),
+        token = tp(&token),
         base_route = route(&dir.path().join("base")),
     );
     let cfg_path = dir.path().join("config.toml");
@@ -829,9 +894,11 @@ retry_max_ms = 1000
     drop(cp);
 }
 
-/// 子プロセスを Drop で止める。
+/// 子プロセスを Drop で止める（VDS の制御プレーン用）。
+#[cfg(feature = "vds")]
 struct ChildGuard(std::process::Child);
 
+#[cfg(feature = "vds")]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();

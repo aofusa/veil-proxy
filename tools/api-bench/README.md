@@ -10,6 +10,7 @@ veil の API ライブラリを、同じ 2 つのエンドポイント（`GET /p
 | `axum-veil/` | 同じ axum のコードを veil の tokio 互換レイヤーで（`[patch.crates-io] tokio` を `crates/veil-tokio/tokio-shim` に置き換え）。加えて `mount`（veil の `App` に axum の Router を `tokio_service` で載せる）と `native`（veil のネイティブハンドラ） |
 | `python/` | FastAPI（uvicorn）と veil の Python バインディングで同じエンドポイント |
 | `run_bench.py` | 計測ドライバ（交互計測・TSV・中央値の表） |
+| `allocs.py` | veil のハンドラ経路の 1 要求あたりの確保回数（`axum-veil` の `count-allocs` ビルドを使う。F-202） |
 
 起動モード（Rust）:
 
@@ -48,3 +49,26 @@ python3 tools/api-bench/run_bench.py --summary docs/artifacts/api_bench_rust.tsv
 - 列: `rps`・`p50_ms`・`p99_ms`（wrk）、`cpu_pct`（サーバのプロセスツリーの utime + stime）、`cores_pct`（サーバに割り当てた
   コアの busy。ループバックのソフト割り込みを含む）、`us_per_req`（`cores_pct` から求めた 1 要求あたりの CPU 時間）、`rss_mb`。
 - 計測前に他の負荷が無いことを確かめる（`top`。tokio のテストハーネスの取り残しが CPU を使い続けていたことがある）。
+
+## 改修前後の交互 A/B と確保の回数（F-202）
+
+```bash
+git worktree add /path/to/base <改修前のコミット>
+(cd /path/to/base/tools/api-bench/axum-veil && cargo build --release && \
+   CARGO_TARGET_DIR=target-epoll cargo build --release --features epoll)
+BENCH_BASE_DIR=/path/to/base python3 tools/api-bench/run_bench.py --group rust --only "native handler,(mount)"
+```
+
+`BENCH_BASE_DIR` を渡すと、その作業ツリーの `axum-veil` で `mount`・`native`（io_uring・epoll）を「[base]」として足し、
+同じラウンドの中で交互に測る。
+
+```bash
+(cd tools/api-bench/axum-veil && CARGO_TARGET_DIR=target-count cargo build --release --features count-allocs)
+python3 tools/api-bench/allocs.py [--mode native|mount] [--path /plaintext|/json/veil] [--bin <path>]
+ALLOC_TRACE=60 tools/api-bench/axum-veil/target-count/release/api-bench-axum-veil native 127.0.0.1:3000 1
+```
+
+`count-allocs` のビルドは確保（alloc・realloc）の累計を 1 秒ごとに標準エラーへ出し、`allocs.py` は wrk の負荷の
+前後の差を要求数で割る。`ALLOC_TRACE=<n>` は起動 4 秒後から確保 n 回ぶんのバックトレースを出す（どこで確保しているか。
+行番号が要るときは `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` でビルドする）。
+
