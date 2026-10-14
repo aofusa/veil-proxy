@@ -71,6 +71,9 @@ F-205（同じ 2 段の待ちをプロキシと共通の経路で直す）とは
 
 - `tools/api-bench` に HTTP/2（h2c、`h2load`）と、`#[veil::route]`（マクロ・抽出子）経由のハンドラの列を足す
   （今は `App::get` のネイティブと `tokio_service` のみ）。axum 側は hyper の HTTP/2。
+- veil のネイティブハンドラの **HTTP/3** の列も足す（2026-10-14 追加）。クライアントは `h2load --npn-list h3`（tools/perf と
+  同じ h3 対応ビルド）か、無ければ quinn + h3 の負荷ツール。axum には HTTP/3 が無いので比較相手は無し（veil の HTTP/2 と並べて
+  記録し、退行の監視に使う）。
 - `/json` の本文を書くとき `serde_json::to_vec` の `Vec` をそのまま `Bytes` にしているか（複製が無いか）を確かめる。
 
 ### 5. 載せた axum（`tokio_service`）
@@ -87,6 +90,7 @@ allocs/req を記録する。段ごとに 1 コミット。
 
 - `tools/api-bench` のネイティブハンドラが、tokio 上の axum（per-core）に対して `/plaintext`・`/json` とも
   **io_uring・epoll の両方で 100% 以上**（5 ラウンド交互、`docs/artifacts/` に TSV）。HTTP/2 の列も同等以上。
+  HTTP/3 の列は記録する（比較相手なし）。
 - `#[veil::route]` 経由のハンドラも同等以上。
 - `library_e2e.sh` の全節・`cargo test --features api`・`tests/standalone_e2e.rs` が通る。
 - `--features full` のバイナリに変化が無い（`nonregression`）。アイドル接続あたりのメモリが増えない
