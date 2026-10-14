@@ -68,6 +68,7 @@
 #   build      VM 内で full features リリースビルド
 #   e2e        VM 内で tests/e2e_setup.sh test を実行
 #   unit       VM 内で単体テスト（--lib）+ 統合テストを実行
+#   run        VM 内のリポジトリでコマンドを実行（ビルドと同じ環境変数。例: run 'bash tests/api/library_e2e.sh all'）
 #   fetch      VM 内の release バイナリを host（packaging/build/）へ取得
 #   screen     QMP screendump で VGA 画面を PNG に保存（シリアルに出ない状態の確認用）
 #   sendkeys   QMP send-key でキー入力（例: sendkeys --type 'fsck -y'）
@@ -1489,6 +1490,15 @@ PAXRUN
     cmd_ssh "${base} --lib --test integration_tests"
 }
 
+# VM 内のリポジトリで任意のコマンドを、ビルドと同じ環境（_guest_env_prefix）で実行する
+# （例: run 'cargo test --no-default-features --features full-freebsd --test standalone_e2e'、
+#  run 'bash tests/api/library_e2e.sh all'）。dev のデバッグ情報は付けない（NetBSD の ld が遅い）。
+cmd_run() {
+    [[ $# -ge 1 ]] || die "run: コマンドを指定する"
+    local c="$*"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 bash -c $(printf '%q' "${c}")"
+}
+
 # packaging へ渡すためにビルド済みバイナリを取り出す
 cmd_fetch() {
     # `up` 直後に呼ばれると SSH がまだ上がっておらず scp が 255 で落ちるため待つ
@@ -1546,6 +1556,7 @@ case "${COMMAND}" in
     build) cmd_build ;;
     e2e) cmd_e2e "$@" ;;
     unit) cmd_unit ;;
+    run) cmd_run "$@" ;;
     fetch) cmd_fetch ;;
     screen) cmd_screen "$@" ;;
     sendkeys) cmd_sendkeys "$@" ;;
