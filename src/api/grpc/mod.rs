@@ -19,6 +19,7 @@
 //! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
 
 pub mod health;
+mod web;
 pub(crate) mod wire;
 
 /// `veil-build` が `OUT_DIR` に書いた `<package>.rs` を取り込む（`veil::include_proto!("helloworld");`）。
@@ -137,6 +138,11 @@ pub(crate) fn set_response_compression(name: &str, min_size: usize) -> Result<()
     RESPONSE_COMPRESSION.store(v, Ordering::Relaxed);
     RESPONSE_COMPRESSION_MIN.store(min_size, Ordering::Relaxed);
     r
+}
+
+/// `[api] grpc_web_cors_origins` を反映する（F-209 #4）。
+pub(crate) fn set_grpc_web_cors_origins(origins: Vec<String>) {
+    web::set_cors_origins(origins);
 }
 
 fn configured_compression() -> Compression {
@@ -442,6 +448,8 @@ pub struct Streaming<T> {
     decoder: GrpcFrameDecoder,
     encoding: GrpcCompression,
     decode: DecodeFn<T>,
+    /// gRPC-Web の `-text`（本文が base64）なら戻しながら読む（F-209 #4）
+    text: Option<web::Base64Decoder>,
     body_done: bool,
     finished: bool,
 }
@@ -459,12 +467,14 @@ impl<T> Streaming<T> {
         body: RequestBodyStream,
         encoding: GrpcCompression,
         decode: DecodeFn<T>,
+        text: bool,
     ) -> Streaming<T> {
         Streaming {
             body,
             decoder: GrpcFrameDecoder::with_max_size(max_message_size()),
             encoding,
             decode,
+            text: text.then(web::Base64Decoder::default),
             body_done: false,
             finished: false,
         }
@@ -542,6 +552,11 @@ impl<T> Stream for Streaming<T> {
             }
             if this.body_done {
                 this.finished = true;
+                if this.text.as_ref().is_some_and(|d| d.finish().is_err()) {
+                    return Poll::Ready(Some(Err(Status::internal(
+                        "grpc-web-text request body is not valid base64",
+                    ))));
+                }
                 if this.decoder.has_pending() {
                     return Poll::Ready(Some(Err(Status::internal(
                         "request body ended in the middle of a message",
@@ -550,7 +565,19 @@ impl<T> Stream for Streaming<T> {
                 return Poll::Ready(None);
             }
             match Pin::new(&mut this.body).poll_next(cx) {
-                Poll::Ready(Some(chunk)) => this.decoder.push(&chunk),
+                Poll::Ready(Some(chunk)) => match this.text.as_mut() {
+                    None => this.decoder.push(&chunk),
+                    Some(dec) => {
+                        let mut raw = BytesMut::with_capacity(chunk.len() / 4 * 3 + 3);
+                        if dec.push(&chunk, &mut raw).is_err() {
+                            this.finished = true;
+                            return Poll::Ready(Some(Err(Status::internal(
+                                "grpc-web-text request body is not valid base64",
+                            ))));
+                        }
+                        this.decoder.push(&raw);
+                    }
+                },
                 Poll::Ready(None) => this.body_done = true,
                 Poll::Pending => return Poll::Pending,
             }
@@ -595,8 +622,34 @@ struct GrpcBody<S, C> {
     codec: C,
     /// 応答の圧縮（F-209 #2）。`Identity` なら圧縮しない
     encoding: Compression,
+    /// gRPC-Web（F-209 #4）: トレーラを本文の最後の枠で送る。`Some(Some(_))` は `-text`（base64）
+    web: Option<Option<web::Base64Encoder>>,
     trailers: Option<Metadata>,
     deadline: Option<Instant>,
+}
+
+impl<S, C> GrpcBody<S, C> {
+    /// 本文の断片（gRPC-Web の `-text` なら base64 にする）。
+    fn data(&mut self, b: Bytes) -> BodyChunk {
+        match &mut self.web {
+            Some(Some(enc)) => BodyChunk::Data(enc.encode(&b)),
+            _ => BodyChunk::Data(b),
+        }
+    }
+
+    /// 最後のトレーラ（gRPC-Web は本文の最後の枠）。この後は `None` を返す。
+    fn end(&mut self, trailers: Metadata) -> BodyChunk {
+        self.trailers = None;
+        match &mut self.web {
+            None => BodyChunk::Trailers(trailers),
+            Some(None) => BodyChunk::Data(web::trailer_frame(&trailers)),
+            Some(Some(enc)) => {
+                let mut out = BytesMut::from(&enc.encode(&web::trailer_frame(&trailers))[..]);
+                out.extend_from_slice(&enc.finish());
+                BodyChunk::Data(out.freeze())
+            }
+        }
+    }
 }
 
 impl<S, T, C> Stream for GrpcBody<S, C>
@@ -612,30 +665,21 @@ where
             return Poll::Ready(None);
         };
         if this.deadline.is_some_and(|d| Instant::now() >= d) {
-            this.trailers = None;
-            return Poll::Ready(Some(BodyChunk::Trailers(
-                Status::deadline_exceeded("deadline exceeded").to_trailers(),
-            )));
+            let t = Status::deadline_exceeded("deadline exceeded").to_trailers();
+            return Poll::Ready(Some(this.end(t)));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(m))) => match encode_message(&this.codec, &m)
                 .and_then(|b| compress_frame(b, this.encoding))
             {
-                Ok(b) => Poll::Ready(Some(BodyChunk::Data(b))),
-                Err(s) => {
-                    this.trailers = None;
-                    Poll::Ready(Some(BodyChunk::Trailers(s.to_trailers())))
-                }
+                Ok(b) => Poll::Ready(Some(this.data(b))),
+                Err(s) => Poll::Ready(Some(this.end(s.to_trailers()))),
             },
-            Poll::Ready(Some(Err(s))) => {
-                this.trailers = None;
-                Poll::Ready(Some(BodyChunk::Trailers(s.to_trailers())))
-            }
+            Poll::Ready(Some(Err(s))) => Poll::Ready(Some(this.end(s.to_trailers()))),
             Poll::Ready(None) => {
                 let mut t = Status::new(Code::Ok, "").to_trailers();
                 t.extend(ok_trailers.iter().cloned());
-                this.trailers = None;
-                Poll::Ready(Some(BodyChunk::Trailers(t)))
+                Poll::Ready(Some(this.end(t)))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -655,6 +699,35 @@ fn grpc_head(status: u16) -> super::response::Response {
         .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING)
 }
 
+/// gRPC-Web の応答ヘッダ（要求と同じ `content-type`・CORS）。
+fn web_head(w: &web::WebMode) -> super::response::Response {
+    let mut r = super::response::Response::new(200)
+        .with_header("content-type", w.content_type.clone())
+        .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING);
+    r.headers.extend(w.cors.iter().cloned());
+    r
+}
+
+/// エラーだけを返す応答。gRPC-Web は状態をヘッダにも載せ、本文にトレーラの枠を置く
+/// （ブラウザは CORS で公開されていないヘッダを読めないことがあるため両方に置く）。
+fn error_response(web: &Option<web::WebMode>, status: &Status) -> super::response::Response {
+    let Some(w) = web else {
+        return trailers_only(status);
+    };
+    let mut r = web_head(w);
+    let t = status.to_trailers();
+    let frame = web::trailer_frame(&t);
+    r.headers.extend(t);
+    if w.text {
+        let mut enc = web::Base64Encoder::default();
+        let mut b = BytesMut::from(&enc.encode(&frame)[..]);
+        b.extend_from_slice(&enc.finish());
+        r.with_body(b.freeze())
+    } else {
+        r.with_body(frame)
+    }
+}
+
 /// エラーだけを返す応答（Trailers-Only: `grpc-status` を応答ヘッダに載せて本文無しで終える）。
 fn trailers_only(status: &Status) -> super::response::Response {
     let mut r = grpc_head(200);
@@ -668,6 +741,7 @@ fn stream_response<S, T, C>(
     deadline: Option<Instant>,
     codec: C,
     accepts: u8,
+    web: Option<web::WebMode>,
 ) -> super::response::Response
 where
     S: Stream<Item = Result<T, Status>> + Send + Unpin + 'static,
@@ -681,7 +755,10 @@ where
         compression,
     } = resp;
     let encoding = response_encoding(compression, accepts);
-    let mut head = grpc_head(200);
+    let mut head = match &web {
+        None => grpc_head(200),
+        Some(w) => web_head(w),
+    };
     if encoding != Compression::Identity {
         head.headers.push((
             Bytes::from_static(b"grpc-encoding"),
@@ -693,6 +770,7 @@ where
         inner: message,
         codec,
         encoding,
+        web: web.map(|w| w.text.then(web::Base64Encoder::default)),
         trailers: Some(trailers),
         deadline,
     };
@@ -710,34 +788,42 @@ struct Call {
     encoding: GrpcCompression,
     /// `grpc-accept-encoding`（`accepted_encodings` のビット）
     accepts: u8,
+    /// gRPC-Web の要求なら `Some`（F-209 #4）
+    web: Option<web::WebMode>,
     client_ip: IpAddr,
 }
 
 /// gRPC の要求として受け付けられるかを見る（だめなら返す応答）。
 fn accept(req: &super::request::Request) -> Result<Call, super::response::Response> {
     let ct = req.header("content-type").unwrap_or_default();
-    // gRPC-Web（`application/grpc-web*`）は本文内のトレーラ等の形式が違う。通常の gRPC として扱うと
-    // ブラウザが読めない応答を返すので断る（B-127 / F-209 #4）。
-    if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) || is_grpc_web(ct.as_bytes()) {
-        return Err(super::response::Response::error(
-            415,
-            "Unsupported Media Type (expected application/grpc)",
-        ));
-    }
-    if req.version == HttpVersion::Http11 {
-        return Err(trailers_only(&Status::internal(
-            "gRPC requires HTTP/2 or HTTP/3",
-        )));
+    // gRPC-Web（`application/grpc-web*`）は本文の最後の枠でトレーラを返す（F-209 #4）。HTTP/1.1 でも受ける
+    let web = web::web_mode(ct.as_bytes()).map(|(text, content_type)| web::WebMode {
+        text,
+        content_type,
+        cors: web::cors_response_headers(req.header("origin")),
+    });
+    if web.is_none() {
+        if !crate::grpc::headers::is_grpc_content_type(ct.as_bytes()) {
+            return Err(super::response::Response::error(
+                415,
+                "Unsupported Media Type (expected application/grpc)",
+            ));
+        }
+        if req.version == HttpVersion::Http11 {
+            return Err(trailers_only(&Status::internal(
+                "gRPC requires HTTP/2 or HTTP/3",
+            )));
+        }
     }
     let encoding = match req.header("grpc-encoding") {
         None => GrpcCompression::Identity,
         Some(v) => match GrpcCompression::from_bytes(v.as_bytes()) {
             Some(c) if c.is_supported() => c,
             _ => {
-                return Err(trailers_only(&Status::unimplemented(format!(
-                    "grpc-encoding '{}' is not supported",
-                    v
-                ))))
+                return Err(error_response(
+                    &web,
+                    &Status::unimplemented(format!("grpc-encoding '{}' is not supported", v)),
+                ))
             }
         },
     };
@@ -767,14 +853,9 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
         deadline,
         encoding,
         accepts: accepted_encodings(req.header("grpc-accept-encoding")),
+        web,
         client_ip: req.client_ip(),
     })
-}
-
-/// `application/grpc-web`・`application/grpc-web+proto`・`application/grpc-web-text` 等。
-fn is_grpc_web(ct: &[u8]) -> bool {
-    const P: &[u8] = b"application/grpc-web";
-    ct.len() >= P.len() && ct[..P.len()].eq_ignore_ascii_case(P)
 }
 
 /// 期限付きで Future を待つ（期限切れは `DEADLINE_EXCEEDED`）。
@@ -815,7 +896,12 @@ fn request_parts<T>(
     call: &Call,
     decode: &DecodeFn<T>,
 ) -> Streaming<T> {
-    Streaming::new(req.take_body_stream(), call.encoding, decode.clone())
+    Streaming::new(
+        req.take_body_stream(),
+        call.encoding,
+        decode.clone(),
+        call.web.as_ref().is_some_and(|w| w.text),
+    )
 }
 
 fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
@@ -838,6 +924,16 @@ fn once<T: Send + 'static>(
     futures::stream::once(futures::future::ready(Ok(m)))
 }
 
+/// gRPC-Web のプリフライト（`OPTIONS`）をハンドラの前で返す（F-209 #4）。
+fn with_preflight(func: HandlerFn) -> HandlerFn {
+    Arc::new(move |req: super::request::Request| -> HandlerFuture {
+        if req.method() == "OPTIONS" {
+            return Box::pin(futures::future::ready(web::preflight(&req)));
+        }
+        func(req)
+    })
+}
+
 fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
     let meta = OperationMeta {
         operation_id: path.trim_start_matches('/').replace(['/', '.'], "_"),
@@ -856,10 +952,13 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
             let func: HandlerFn = Arc::new(|req: super::request::Request| -> HandlerFuture {
                 Box::pin(async move {
                     match accept(&req) {
-                        Ok(_) => trailers_only(&Status::unimplemented(format!(
-                            "method {} is not implemented",
-                            req.path()
-                        ))),
+                        Ok(call) => error_response(
+                            &call.web,
+                            &Status::unimplemented(format!(
+                                "method {} is not implemented",
+                                req.path()
+                            )),
+                        ),
                         Err(r) => r,
                     }
                 })
@@ -869,10 +968,16 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
                 hidden: true,
                 ..Default::default()
             };
-            app = app.route_fn(&meta.operation_id.clone(), &["POST"], &fallback, func, meta);
+            app = app.route_fn(
+                &meta.operation_id.clone(),
+                &["POST", "OPTIONS"],
+                &fallback,
+                with_preflight(func),
+                meta,
+            );
         }
     }
-    app.route_fn_streaming(path, &["POST"], path, func, meta)
+    app.route_fn_streaming(path, &["POST", "OPTIONS"], path, with_preflight(func), meta)
 }
 
 impl App {
@@ -898,6 +1003,7 @@ impl App {
                     Err(r) => return r,
                 };
                 let accepts = call.accepts;
+                let web = call.web.clone();
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
@@ -924,9 +1030,10 @@ impl App {
                             None,
                             codec,
                             accepts,
+                            web,
                         )
                     }
-                    Err(s) => trailers_only(&s),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -955,6 +1062,7 @@ impl App {
                     Err(r) => return r,
                 };
                 let accepts = call.accepts;
+                let web = call.web.clone();
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
@@ -964,8 +1072,8 @@ impl App {
                 })
                 .await;
                 match r {
-                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts),
-                    Err(s) => trailers_only(&s),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts, web),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -993,6 +1101,7 @@ impl App {
                     Err(r) => return r,
                 };
                 let accepts = call.accepts;
+                let web = call.web.clone();
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
@@ -1013,9 +1122,10 @@ impl App {
                             None,
                             codec,
                             accepts,
+                            web,
                         )
                     }
-                    Err(s) => trailers_only(&s),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });
@@ -1045,11 +1155,12 @@ impl App {
                     Err(r) => return r,
                 };
                 let accepts = call.accepts;
+                let web = call.web.clone();
                 let body: Streaming<Req> = request_parts(&req, &call, &decode);
                 let (req, deadline) = make_request(call, body);
                 match with_deadline(deadline, f(req)).await {
-                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts),
-                    Err(s) => trailers_only(&s),
+                    Ok(resp) => stream_response(boxed(resp), deadline, codec, accepts, web),
+                    Err(s) => error_response(&web, &s),
                 }
             })
         });

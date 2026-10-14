@@ -225,6 +225,7 @@ for debugging.
 | `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
 | `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
 | `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
+| `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
 
 ## Routing macros
 
@@ -619,7 +620,8 @@ for example to decode it yourself or to forward it.
 | Cancellation | a client RST_STREAM / disconnect drops the handler future and the response stream |
 | Compression | requests with `grpc-encoding: gzip` or `deflate` are decompressed (needs the `compression` feature, which `full` includes; without it only `identity` is accepted and other encodings get `UNIMPLEMENTED`); responses are compressed when `[api] grpc_response_compression` (or `Response::with_compression(Compression::Gzip)` for one call) names an encoding that the client accepts in `grpc-accept-encoding`, for messages of at least `grpc_response_compression_min_size` bytes; otherwise they are sent uncompressed |
 | Size limit | `[api] grpc_max_message_size` (default 4 MiB) per received message, `RESOURCE_EXHAUSTED` when exceeded. For a compressed message the limit applies to the decompressed size, and decompression stops as soon as it is exceeded |
-| Errors | `content-type` other than `application/grpc*` (and gRPC-Web, `application/grpc-web*`) is 415; a gRPC call over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
+| gRPC-Web | `application/grpc-web`, `application/grpc-web+proto` and the base64 variants `application/grpc-web-text(+proto)` are served by the same methods, over HTTP/1.1, HTTP/2 and HTTP/3: the trailers come as the last frame of the body (flag `0x80`), so browsers (grpc-web, Connect) call veil directly without a translating proxy. `OPTIONS` preflights are answered from `[api] grpc_web_cors_origins` |
+| Errors | `content-type` other than `application/grpc*` is 415; a gRPC call (not gRPC-Web) over HTTP/1.1 gets `grpc-status: 13`; an unknown method of a registered service gets `UNIMPLEMENTED` |
 | Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
 
 gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming

@@ -239,6 +239,19 @@ impl ConfigBuilder {
         grpc_response_compression_min_size, "api.grpc_response_compression_min_size", v: usize => toml::Value::Integer(v as i64)
     );
 
+    /// `[api].grpc_web_cors_origins`（gRPC-Web の CORS で許す Origin。`"*"` で全部。F-209）。
+    pub fn grpc_web_cors_origins(self, origins: &[&str]) -> Self {
+        self.push(
+            "api.grpc_web_cors_origins",
+            toml::Value::Array(
+                origins
+                    .iter()
+                    .map(|o| toml::Value::String(o.to_string()))
+                    .collect(),
+            ),
+        )
+    }
+
     /// TLS の証明書・秘密鍵（`[tls]`）。TLS のリスナーは `listen(addr)` で別に指定する（F-200）。
     pub fn tls(self, cert_path: &str, key_path: &str) -> Self {
         self.push("tls.cert_path", toml::Value::String(cert_path.to_string()))

@@ -269,13 +269,21 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
   (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" \
-    VEIL_TLS_KEY="$W/key.pem" exec "$T/debug/veil-example-grpc$EXE") > "$W/log" 2>&1 &
+    VEIL_TLS_KEY="$W/key.pem" VEIL_OVERRIDE_1='api.grpc_web_cors_origins = ["https://app.example"]' \
+    exec "$T/debug/veil-example-grpc$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
   wait_port "$P" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
   local rc=$?
   echo "$out" | sed 's/^/  /'
   [ "$rc" = 0 ] && ok "grpc interop ($label, exit 0)" || bad "grpc interop ($label, exit $rc)"
+  # gRPC-Web（F-209）: ブラウザの代わりに curl。HelloRequest{name:"web"} の枠と、その base64
+  local U="http://127.0.0.1:$P/demo.v1.Demo/SayHello"
+  expect "grpc-web binary over HTTP/1.1 ($label)" "Hello web" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | tr -c '[:print:]' '.'"
+  expect "grpc-web trailer frame ($label)" "grpc-status: 0" bash -c "printf '\\000\\000\\000\\000\\005\\012\\003web' | curl -s --http1.1 -X POST --data-binary @- -H 'content-type: application/grpc-web+proto' '$U' | tr -c '[:print:]' '.'"
+  expect "grpc-web-text (h2c, $label)" "Hello web" bash -c "printf 'AAAAAAUKA3dlYg==' | curl -s --http2-prior-knowledge -X POST --data-binary @- -H 'content-type: application/grpc-web-text' '$U' | $PY3 -c 'import sys,base64; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode(\"latin-1\"))' | tr -c '[:print:]' '.'"
+  expect "grpc-web CORS preflight ($label)" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$U' | tr A-Z a-z"
+  expect "grpc-web CORS rejects other origins ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://evil.example' "$U"
   kill "$PID"
 }
 

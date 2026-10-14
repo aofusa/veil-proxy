@@ -216,6 +216,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
 | `grpc_response_compression` | `"none"` | gRPC の応答メッセージの圧縮: `"none"`・`"gzip"`・`"deflate"`（クライアントが `grpc-accept-encoding` で受けるときだけ。`compression` feature が必要） |
 | `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
+| `grpc_web_cors_origins` | `[]` | ブラウザから gRPC-Web で呼んでよい Origin（`["*"]` で全部）。空なら CORS のヘッダを付けず、プリフライトは 403 |
 
 ## ルーティングマクロ
 
@@ -597,7 +598,8 @@ App::new()
 | 取り消し | クライアントの RST_STREAM・切断でハンドラの Future と応答ストリームを drop する |
 | 圧縮 | `grpc-encoding: gzip`・`deflate` の要求を戻す（`compression` feature が必要。`full` に含まれる。無いビルドは `identity` だけを受け、他は `UNIMPLEMENTED`）。応答は `[api] grpc_response_compression`（1 回の呼び出しだけなら `Response::with_compression(Compression::Gzip)`）の方式をクライアントが `grpc-accept-encoding` で受けるとき、`grpc_response_compression_min_size` バイト以上のメッセージを圧縮する。それ以外は非圧縮 |
 | 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED`。圧縮されたメッセージは解凍後の大きさに掛かり、超えた時点で解凍を打ち切る |
-| エラー | `content-type` が `application/grpc*` 以外（と gRPC-Web の `application/grpc-web*`）は 415、HTTP/1.1 の gRPC は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
+| gRPC-Web | `application/grpc-web`・`application/grpc-web+proto` と base64 の `application/grpc-web-text(+proto)` を同じメソッドで受ける（HTTP/1.1・HTTP/2・HTTP/3）。トレーラは本文の最後の枠（フラグ `0x80`）で返すので、ブラウザ（grpc-web・Connect）から変換用のプロキシ無しで veil を直接呼べる。`OPTIONS` のプリフライトは `[api] grpc_web_cors_origins` で答える |
+| エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC（gRPC-Web を除く）は `grpc-status: 13`、登録済みサービスの未定義メソッドは `UNIMPLEMENTED` |
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
 
 gRPC のルートは OpenAPI に載りません。完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・

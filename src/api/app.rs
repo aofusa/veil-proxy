@@ -75,6 +75,8 @@ pub struct ApiSettings {
     pub grpc_response_compression: String,
     /// この大きさ未満の gRPC メッセージは圧縮しない（F-209）
     pub grpc_response_compression_min_size: usize,
+    /// gRPC-Web の CORS で許す Origin（`"*"` で全部、空なら CORS 無し。F-209）
+    pub grpc_web_cors_origins: Vec<String>,
 }
 
 impl ApiSettings {
@@ -112,6 +114,15 @@ impl ApiSettings {
             grpc_max_message_size: n("grpc_max_message_size", 4 * 1024 * 1024),
             grpc_response_compression: s("grpc_response_compression", "none"),
             grpc_response_compression_min_size: n("grpc_response_compression_min_size", 1024),
+            grpc_web_cors_origins: v
+                .and_then(|t| t.get("grpc_web_cors_origins"))
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -446,6 +457,7 @@ fn start(config: Config) -> Result<(), Error> {
             ) {
                 ftlog::warn!("{}; responses are not compressed", e);
             }
+            super::grpc::set_grpc_web_cors_origins(settings.grpc_web_cors_origins.clone());
         }
         if settings.handler_threads > 0 {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);

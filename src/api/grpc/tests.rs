@@ -295,32 +295,191 @@ fn gzip_without_compression_feature_is_unimplemented() {
     assert_eq!(status_of(resp).as_deref(), Some(&b"12"[..]));
 }
 
-/// B-127 / F-209 #4: gRPC-Web を通常の gRPC として処理しない。
+fn web_request(version: HttpVersion, ct: &str, body: Bytes, extra: &[(&str, &str)]) -> ApiRequest {
+    let mut headers = vec![(
+        Bytes::from_static(b"content-type"),
+        Bytes::copy_from_slice(ct.as_bytes()),
+    )];
+    for (n, v) in extra {
+        headers.push((
+            Bytes::copy_from_slice(n.as_bytes()),
+            Bytes::copy_from_slice(v.as_bytes()),
+        ));
+    }
+    let mut req = ApiRequest::new("POST", "/pkg.Svc/M", headers, Bytes::new());
+    req.version = version;
+    let (mut tx, slot) = crate::api::stream::request_body_channel(1);
+    futures::executor::block_on(async { tx.send(body).await.unwrap() });
+    drop(tx);
+    req.body_stream = Some(slot);
+    req
+}
+
+/// 本文の枠を (フラグ, 中身) に分ける。
+fn web_frames(mut body: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    while body.len() >= 5 {
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        out.push((body[0], body[5..5 + len].to_vec()));
+        body = &body[5 + len..];
+    }
+    assert!(body.is_empty(), "trailing bytes");
+    out
+}
+
+fn b64(data: &[u8]) -> Vec<u8> {
+    let mut e = web::Base64Encoder::default();
+    let mut out = e.encode(data).to_vec();
+    out.extend_from_slice(&e.finish());
+    out
+}
+
+fn unb64(data: &[u8]) -> Vec<u8> {
+    let mut d = web::Base64Decoder::default();
+    let mut out = BytesMut::new();
+    d.push(data, &mut out).unwrap();
+    d.finish().unwrap();
+    out.to_vec()
+}
+
+/// F-209 #4: gRPC-Web（バイナリ）は HTTP/1.1 でも受け、トレーラを本文の最後の枠（0x80）で返す。
 #[test]
-fn grpc_web_is_rejected() {
+fn grpc_web_binary_over_http1() {
     let f = handler_of(echo_app());
-    for ct in [
-        "application/grpc-web",
+    let msg = frame(&HealthCheckRequest {
+        service: "web".into(),
+    });
+    let (h, data, t) = collect(futures::executor::block_on(f(web_request(
+        HttpVersion::Http11,
         "application/grpc-web+proto",
+        msg,
+        &[("x-who", "b")],
+    ))));
+    assert!(t.is_empty(), "no HTTP trailers for gRPC-Web: {:?}", t);
+    assert_eq!(
+        field(&h, "content-type"),
+        Some(&b"application/grpc-web+proto"[..])
+    );
+    let frames = web_frames(&data);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].0, 0);
+    let m: HealthCheckRequest = HealthCodec
+        .decode(Bytes::from(frames[0].1.clone()))
+        .unwrap();
+    assert_eq!(m.service, "b:web");
+    assert_eq!(frames[1].0, 0x80);
+    let trailers = String::from_utf8(frames[1].1.clone()).unwrap();
+    assert!(trailers.contains("grpc-status: 0\r\n"), "{}", trailers);
+    assert!(trailers.contains("x-tail: t\r\n"), "{}", trailers);
+}
+
+/// F-209 #4: `-text` は要求も応答も base64。エラーは状態をヘッダと本文のトレーラの枠の両方に載せる。
+#[test]
+fn grpc_web_text_and_errors() {
+    let f = handler_of(echo_app());
+    let msg = frame(&HealthCheckRequest {
+        service: "txt".into(),
+    });
+    let (h, data, _) = collect(futures::executor::block_on(f(web_request(
+        HttpVersion::Http2,
         "application/grpc-web-text",
-    ] {
-        let mut req = ApiRequest::new(
-            "POST",
+        Bytes::from(b64(&msg)),
+        &[],
+    ))));
+    assert_eq!(
+        field(&h, "content-type"),
+        Some(&b"application/grpc-web-text"[..])
+    );
+    let frames = web_frames(&unb64(&data));
+    let m: HealthCheckRequest = HealthCodec
+        .decode(Bytes::from(frames[0].1.clone()))
+        .unwrap();
+    assert_eq!(m.service, ":txt");
+    assert_eq!(frames[1].0, 0x80);
+
+    let bad = frame(&HealthCheckRequest {
+        service: "fail".into(),
+    });
+    let resp = futures::executor::block_on(f(web_request(
+        HttpVersion::Http11,
+        "application/grpc-web-text+proto",
+        Bytes::from(b64(&bad)),
+        &[],
+    )));
+    let h = resp.headers().to_vec();
+    assert_eq!(field(&h, "grpc-status"), Some(&b"3"[..]));
+    let frames = web_frames(&unb64(resp.body()));
+    assert_eq!(frames.len(), 1);
+    assert!(String::from_utf8_lossy(&frames[0].1).contains("grpc-status: 3"));
+
+    // 壊れた base64 は INTERNAL
+    let resp = futures::executor::block_on(f(web_request(
+        HttpVersion::Http2,
+        "application/grpc-web-text",
+        Bytes::from_static(b"!!!!"),
+        &[],
+    )));
+    assert_eq!(
+        field(&resp.headers().to_vec(), "grpc-status"),
+        Some(&b"13"[..])
+    );
+    // 通常の gRPC は今どおり HTTP/1.1 を断る
+    let resp = futures::executor::block_on(f(grpc_request(HttpVersion::Http11, vec![], &[])));
+    assert_eq!(
+        field(&resp.headers().to_vec(), "grpc-status"),
+        Some(&b"13"[..])
+    );
+}
+
+/// F-209 #4: CORS（`[api] grpc_web_cors_origins`）。許された Origin にだけプリフライトと応答のヘッダを返す。
+#[test]
+fn grpc_web_cors() {
+    let f = handler_of(echo_app());
+    web::set_cors_origins(vec!["https://app.example".into()]);
+    let preflight = |origin: &str| {
+        let req = ApiRequest::new(
+            "OPTIONS",
             "/pkg.Svc/M",
-            vec![(
-                Bytes::from_static(b"content-type"),
-                Bytes::copy_from_slice(ct.as_bytes()),
-            )],
+            vec![
+                (
+                    Bytes::from_static(b"origin"),
+                    Bytes::copy_from_slice(origin.as_bytes()),
+                ),
+                (
+                    Bytes::from_static(b"access-control-request-headers"),
+                    Bytes::from_static(b"content-type,x-grpc-web"),
+                ),
+            ],
             Bytes::new(),
         );
-        req.version = HttpVersion::Http2;
-        assert_eq!(
-            futures::executor::block_on(f(req)).status_code(),
-            415,
-            "{}",
-            ct
-        );
-    }
+        futures::executor::block_on(f(req))
+    };
+    let ok = preflight("https://app.example");
+    assert_eq!(ok.status_code(), 204);
+    let h = ok.headers().to_vec();
+    assert_eq!(
+        field(&h, "access-control-allow-origin"),
+        Some(&b"https://app.example"[..])
+    );
+    assert_eq!(
+        field(&h, "access-control-allow-headers"),
+        Some(&b"content-type,x-grpc-web"[..])
+    );
+    assert_eq!(preflight("https://evil.example").status_code(), 403);
+    let msg = frame(&HealthCheckRequest {
+        service: "c".into(),
+    });
+    let (h, _, _) = collect(futures::executor::block_on(f(web_request(
+        HttpVersion::Http11,
+        "application/grpc-web",
+        msg,
+        &[("origin", "https://app.example")],
+    ))));
+    assert_eq!(
+        field(&h, "access-control-allow-origin"),
+        Some(&b"https://app.example"[..])
+    );
+    assert!(field(&h, "access-control-expose-headers").is_some());
 }
 
 #[test]
