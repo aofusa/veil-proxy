@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|observe|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|observe|chaos|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -1265,6 +1265,58 @@ print(best)' 2>/dev/null)"
   kubectl delete ns "$bns" --wait=false >/dev/null 2>&1
 }
 
+# カオス（F-225）: 負荷を掛けたまま制御プレーンを再起動・停止し、宛先の Pod を消し、プロキシのプロセスを殺す。
+# データプレーンは istiod が居なくても前の設定で動き続け、戻れば新しい設定を受け取ること。
+chaos() {
+  log "chaos: istiod restart / outage, pod deletion, proxy kill ($MODE)"
+  kubectl -n "$NS" scale deploy/whoami --replicas=2 >/dev/null
+  kubectl -n "$NS" rollout status deploy/whoami --timeout=300s >/dev/null
+  sleep 5
+  local out pct victim
+  # 1) istiod の再起動と、宛先の Pod の削除を負荷の最中に
+  fexec fortio load -c 4 -qps 50 -t 60s -timeout 5s -allow-initial-errors -loglevel Error "http://whoami.$NS/" > "$TMPDIR/chaos-$MODE.txt" 2>&1 &
+  local lp=$!
+  sleep 8
+  kubectl -n istio-system rollout restart deploy/istiod >/dev/null
+  kubectl -n istio-system rollout status deploy/istiod --timeout=300s >/dev/null
+  victim="$(kubectl -n "$NS" get pod -l app=whoami -o name | head -1)"
+  kubectl -n "$NS" delete "$victim" --wait=false >/dev/null
+  wait $lp
+  out="$(grep '^Code' "$TMPDIR/chaos-$MODE.txt" | tr '\n' ' ')"
+  pct="$(awk '/^Code 200 :/{gsub(/[()%]/,"",$5); print $5 + 0}' "$TMPDIR/chaos-$MODE.txt")"
+  if awk -v p="${pct:-0}" 'BEGIN{exit !(p >= 99)}'; then ok "istiod restart + pod deletion under load: $out"; else bad "istiod restart + pod deletion: $out"; fi
+  # 2) istiod を止めている間も前の設定で流れ、戻ったら新しい設定（VirtualService のヘッダ）が届く
+  kubectl -n istio-system scale deploy/istiod --replicas=0 >/dev/null
+  kubectl -n istio-system wait --for=delete pod -l app=istiod --timeout=120s >/dev/null 2>&1
+  sleep 5
+  out="$(fexec fortio load -c 2 -qps 20 -t 15s -timeout 5s -loglevel Error "http://whoami.$NS/" 2>&1 | grep '^Code' | tr '\n' ' ')"
+  case "$out" in "Code 200 : "*"(100.0 %) ") ok "control plane down: traffic keeps flowing ($out)" ;; *) bad "control plane down: $out" ;; esac
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: chaos-whoami}
+spec:
+  hosts: [whoami]
+  http:
+  - route: [{destination: {host: whoami}}]
+    headers: {response: {add: {x-chaos: after-outage}}}
+EOF
+  kubectl -n istio-system scale deploy/istiod --replicas=1 >/dev/null
+  kubectl -n istio-system rollout status deploy/istiod --timeout=300s >/dev/null
+  if retry 120 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -D- -o /dev/null http://whoami.$NS/ | grep -qi 'x-chaos: after-outage'"; then
+    ok "control plane back: new configuration applied"; else bad "configuration after istiod outage not applied"; fi
+  kubectl -n "$NS" delete virtualservice chaos-whoami >/dev/null 2>&1
+  # 3) クライアントのプロキシのプロセスを殺す（pilot-agent ごと終わり、コンテナが再起動して戻る）
+  local before after
+  before="$(kubectl -n "$NS" get pod -l app=client -o jsonpath='{range .items[0].status.initContainerStatuses[*]}{.name}={.restartCount} {end}{range .items[0].status.containerStatuses[*]}{.name}={.restartCount} {end}' | grep -o 'istio-proxy=[0-9]*')"
+  kubectl -n "$NS" exec deploy/client -c istio-proxy -- sh -c 'kill -9 $(pidof envoy)' >/dev/null 2>&1
+  if retry 120 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200"; then
+    after="$(kubectl -n "$NS" get pod -l app=client -o jsonpath='{range .items[0].status.initContainerStatuses[*]}{.name}={.restartCount} {end}{range .items[0].status.containerStatuses[*]}{.name}={.restartCount} {end}' | grep -o 'istio-proxy=[0-9]*')"
+    ok "proxy killed: recovered ($before -> $after)"
+  else bad "proxy killed: no recovery"; fi
+  kubectl -n "$NS" scale deploy/whoami --replicas=1 >/dev/null
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -1281,7 +1333,8 @@ case "$SUITE" in
   wasm) wasm ;;
   ambient) ambient ;;
   observe) observe ;;
-  all) smoke; tasks; gateway; telemetry; wasm; ambient; observe ;;
+  chaos) chaos ;;
+  all) smoke; tasks; gateway; telemetry; wasm; ambient; observe; chaos ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"
