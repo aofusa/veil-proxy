@@ -1137,6 +1137,233 @@ pub struct ExponentialBackoff {
 }
 
 // ---------------------------------------------------------------------------
+// io.linkerd.proxy.tap（viz の `linkerd viz tap / top`）
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ObserveRequest {
+    #[prost(uint32, tag = "1")]
+    pub limit: u32,
+    #[prost(message, optional, tag = "2")]
+    pub r#match: Option<TapMatch>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapMatch {
+    #[prost(oneof = "tap_match::Match", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    pub r#match: Option<tap_match::Match>,
+}
+
+pub mod tap_match {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Match {
+        #[prost(message, tag = "1")]
+        All(super::TapMatchSeq),
+        #[prost(message, tag = "2")]
+        Any(super::TapMatchSeq),
+        #[prost(message, tag = "3")]
+        Not(Box<super::TapMatch>),
+        #[prost(message, tag = "4")]
+        Source(super::TapTcp),
+        #[prost(message, tag = "5")]
+        Destination(super::TapTcp),
+        #[prost(message, tag = "6")]
+        Http(super::TapHttp),
+        #[prost(message, tag = "7")]
+        DestinationLabel(super::TapLabel),
+        #[prost(message, tag = "8")]
+        RouteLabel(super::TapLabel),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapMatchSeq {
+    #[prost(message, repeated, tag = "1")]
+    pub matches: Vec<TapMatch>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapLabel {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapTcp {
+    #[prost(oneof = "tap_tcp::Match", tags = "1, 3")]
+    pub r#match: Option<tap_tcp::Match>,
+}
+
+pub mod tap_tcp {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Match {
+        #[prost(message, tag = "1")]
+        Netmask(super::TapNetmask),
+        #[prost(message, tag = "3")]
+        Ports(super::TapPortRange),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapNetmask {
+    #[prost(message, optional, tag = "1")]
+    pub ip: Option<IpAddress>,
+    #[prost(uint32, tag = "2")]
+    pub mask: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapPortRange {
+    #[prost(uint32, tag = "1")]
+    pub min: u32,
+    #[prost(uint32, tag = "2")]
+    pub max: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapHttp {
+    #[prost(oneof = "tap_http::Match", tags = "1, 2, 3, 4")]
+    pub r#match: Option<tap_http::Match>,
+}
+
+pub mod tap_http {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Match {
+        #[prost(message, tag = "1")]
+        Scheme(super::Scheme),
+        #[prost(message, tag = "2")]
+        Authority(super::TapStringMatch),
+        #[prost(message, tag = "3")]
+        Method(super::HttpMethod),
+        #[prost(message, tag = "4")]
+        Path(super::TapStringMatch),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapStringMatch {
+    #[prost(oneof = "tap_string_match::Match", tags = "1, 2")]
+    pub r#match: Option<tap_string_match::Match>,
+}
+
+pub mod tap_string_match {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Match {
+        #[prost(string, tag = "1")]
+        Exact(String),
+        #[prost(string, tag = "2")]
+        Prefix(String),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapEvent {
+    #[prost(message, optional, tag = "1")]
+    pub source: Option<TcpAddress>,
+    #[prost(message, optional, tag = "5")]
+    pub source_meta: Option<EndpointMeta>,
+    #[prost(message, optional, tag = "7")]
+    pub route_meta: Option<EndpointMeta>,
+    #[prost(message, optional, tag = "2")]
+    pub destination: Option<TcpAddress>,
+    #[prost(message, optional, tag = "4")]
+    pub destination_meta: Option<EndpointMeta>,
+    /// UNKNOWN=0 INBOUND=1 OUTBOUND=2
+    #[prost(int32, tag = "6")]
+    pub proxy_direction: i32,
+    #[prost(message, optional, tag = "3")]
+    pub http: Option<TapHttpEvent>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EndpointMeta {
+    #[prost(map = "string, string", tag = "1")]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapHttpEvent {
+    #[prost(oneof = "tap_http_event::Event", tags = "1, 2, 3")]
+    pub event: Option<tap_http_event::Event>,
+}
+
+pub mod tap_http_event {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        RequestInit(super::TapRequestInit),
+        #[prost(message, tag = "2")]
+        ResponseInit(super::TapResponseInit),
+        #[prost(message, tag = "3")]
+        ResponseEnd(super::TapResponseEnd),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapStreamId {
+    #[prost(uint32, tag = "1")]
+    pub base: u32,
+    #[prost(uint64, tag = "2")]
+    pub stream: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapRequestInit {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<TapStreamId>,
+    #[prost(message, optional, tag = "2")]
+    pub method: Option<HttpMethod>,
+    #[prost(message, optional, tag = "3")]
+    pub scheme: Option<Scheme>,
+    #[prost(string, tag = "4")]
+    pub authority: String,
+    #[prost(string, tag = "5")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapResponseInit {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<TapStreamId>,
+    #[prost(message, optional, tag = "2")]
+    pub since_request_init: Option<Duration>,
+    #[prost(uint32, tag = "3")]
+    pub http_status: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapResponseEnd {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<TapStreamId>,
+    #[prost(message, optional, tag = "2")]
+    pub since_request_init: Option<Duration>,
+    #[prost(message, optional, tag = "3")]
+    pub since_response_init: Option<Duration>,
+    #[prost(uint64, tag = "4")]
+    pub response_bytes: u64,
+    #[prost(message, optional, tag = "5")]
+    pub eos: Option<TapEos>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TapEos {
+    #[prost(oneof = "tap_eos::End", tags = "1, 2")]
+    pub end: Option<tap_eos::End>,
+}
+
+pub mod tap_eos {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum End {
+        #[prost(uint32, tag = "1")]
+        GrpcStatusCode(u32),
+        #[prost(uint32, tag = "2")]
+        ResetErrorCode(u32),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // transport.l5d.io/v1（プロキシ同士の opaque transport の先頭に送るヘッダ）
 // ---------------------------------------------------------------------------
 

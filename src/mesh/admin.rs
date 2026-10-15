@@ -14,15 +14,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// 管理 API の経路（メソッド・パス・クエリ → ステータス・Content-Type・本文）。
-pub type Route = fn(&str, &str, &str) -> (u16, &'static str, String);
-
 pub fn spawn(addr: SocketAddr) {
-    spawn_with(addr, route);
-}
-
-/// 経路を差し替えて管理 API を開く（Linkerd の 4191 も同じ作り。F-223）。
-pub fn spawn_with(addr: SocketAddr, route: Route) {
     let r = std::thread::Builder::new()
         .name("veil-admin".into())
         .spawn(move || {
@@ -41,7 +33,7 @@ pub fn spawn_with(addr: SocketAddr, route: Route) {
                     let _ = std::thread::Builder::new()
                         .name("veil-admin-conn".into())
                         .spawn(move || {
-                            let _ = handle(s, route);
+                            let _ = handle(s);
                         });
                 }
             }
@@ -51,7 +43,7 @@ pub fn spawn_with(addr: SocketAddr, route: Route) {
     }
 }
 
-fn handle(mut s: TcpStream, route: Route) -> std::io::Result<()> {
+fn handle(mut s: TcpStream) -> std::io::Result<()> {
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];

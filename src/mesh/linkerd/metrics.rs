@@ -85,6 +85,58 @@ fn labels(r: &Req<'_>) -> String {
     s
 }
 
+/// HTTP の要求 1 本（メッシュの HTTP の処理から渡す）。
+pub struct HttpDone<'a> {
+    pub view: &'a crate::mesh::l7::ReqView<'a>,
+    pub upstream: Option<std::net::SocketAddr>,
+    pub status: u16,
+    pub grpc: Option<u32>,
+    pub latency: std::time::Duration,
+    pub resp_bytes: u64,
+    pub ep_labels: Option<&'a str>,
+    pub server_id: Option<&'a str>,
+}
+
+/// HTTP の要求 1 本を記録する（Linkerd の接続だけ。tap の購読があればイベントも積む）。
+pub fn record_http(ctx: &crate::mesh::l7::ConnCtx, d: &HttpDone<'_>) {
+    let inbound = ctx.direction == crate::mesh::model::Direction::Inbound;
+    let Some(target) = (if inbound { ctx.orig_dst } else { d.upstream.or(ctx.orig_dst) }) else {
+        return;
+    };
+    let (status, grpc, ep_labels, server_id) = (d.status, d.grpc, d.ep_labels, d.server_id);
+    let latency_ms = d.latency.as_secs_f64() * 1000.0;
+    let authority = std::str::from_utf8(d.view.authority).unwrap_or("");
+    if super::tap::active() {
+        super::tap::emit(&super::tap::TapReq {
+            inbound,
+            source: ctx.peer,
+            destination: target,
+            dst_labels: if inbound { None } else { ep_labels },
+            client_id: if inbound { ctx.peer_dns.first().map(|s| s.as_str()) } else { None },
+            method: d.view.method,
+            scheme: d.view.scheme,
+            authority: d.view.authority,
+            path: d.view.path,
+            status,
+            grpc,
+            latency: d.latency,
+            resp_bytes: d.resp_bytes,
+        });
+    }
+    record(&Req {
+        inbound,
+        authority,
+        target_addr: target,
+        tls: if inbound { ctx.tls } else { server_id.is_some() },
+        client_id: if inbound { ctx.peer_dns.first().map(|s| s.as_str()) } else { None },
+        server_id: if inbound { None } else { server_id },
+        dst_labels: if inbound { None } else { ep_labels },
+        status,
+        grpc,
+        latency_ms,
+    });
+}
+
 pub fn record(r: &Req<'_>) {
     let key = labels(r);
     let failure = r.status >= 500 || r.grpc.is_some_and(|g| g != 0);
@@ -108,6 +160,85 @@ pub fn record(r: &Req<'_>) {
         s.sum += r.latency_ms;
         s.count += 1;
     });
+}
+
+// ---------------------------------------------------------------------------
+// TCP（接続の数。viz の edges・stat の TCP_CONN）
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone, Copy)]
+struct TcpStats {
+    open_total: u64,
+    close_total: u64,
+    open: i64,
+}
+
+static TCP: Mutex<Option<HashMap<Arc<str>, TcpStats>>> = Mutex::new(None);
+
+/// 接続 1 本（作ってから捨てるまで `tcp_open_connections` に数える）。
+pub struct TcpGuard {
+    key: Arc<str>,
+}
+
+impl TcpGuard {
+    fn new(key: String) -> Self {
+        let key: Arc<str> = Arc::from(key);
+        let mut g = TCP.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g.get_or_insert_with(HashMap::new).entry(key.clone()).or_default();
+        e.open_total += 1;
+        e.open += 1;
+        TcpGuard { key }
+    }
+
+    /// inbound の接続（相手の ID は mTLS のときだけ）。
+    pub fn inbound(target: std::net::SocketAddr, client_id: Option<&str>) -> Self {
+        let mut s = format!("direction=\"inbound\",peer=\"src\",target_addr=\"{}\"", target);
+        match client_id {
+            Some(c) => s.push_str(&format!(",tls=\"true\",client_id=\"{}\"", c)),
+            None => s.push_str(",tls=\"no_identity\",no_tls_reason=\"no_tls_from_remote\""),
+        }
+        Self::new(s)
+    }
+
+    /// 相手のプロキシへの mTLS の接続（宛先のラベル付き）。
+    pub fn outbound(target: std::net::SocketAddr, server_id: &str, dst_labels: Option<&str>) -> Self {
+        let mut s = format!(
+            "direction=\"outbound\",peer=\"dst\",target_addr=\"{}\",tls=\"true\",server_id=\"{}\"",
+            target, server_id
+        );
+        if let Some(d) = dst_labels {
+            s.push(',');
+            s.push_str(d);
+        }
+        Self::new(s)
+    }
+}
+
+impl Drop for TcpGuard {
+    fn drop(&mut self) {
+        let mut g = TCP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&self.key) {
+            e.close_total += 1;
+            e.open -= 1;
+        }
+    }
+}
+
+fn tcp_text(out: &mut String) {
+    let g = TCP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else { return };
+    out.push_str("# HELP tcp_open_total Total count of opened connections\n# TYPE tcp_open_total counter\n");
+    for (k, s) in m {
+        out.push_str(&format!("tcp_open_total{{{}}} {}\n", k, s.open_total));
+    }
+    out.push_str("# HELP tcp_close_total Total count of closed connections\n# TYPE tcp_close_total counter\n");
+    for (k, s) in m {
+        out.push_str(&format!("tcp_close_total{{{},errno=\"\"}} {}\n", k, s.close_total));
+    }
+    out.push_str("# HELP tcp_open_connections Number of currently-open connections\n# TYPE tcp_open_connections gauge\n");
+    for (k, s) in m {
+        out.push_str(&format!("tcp_open_connections{{{}}} {}\n", k, s.open.max(0)));
+    }
 }
 
 pub fn text() -> String {
@@ -165,6 +296,7 @@ pub fn text() -> String {
         out.push_str(&format!("response_latency_ms_sum{{{}}} {}\n", k, s.sum));
         out.push_str(&format!("response_latency_ms_count{{{}}} {}\n", k, s.count));
     }
+    tcp_text(&mut out);
     let (o, i, b) = super::discovery::counts();
     out.push_str(&format!(
         "# TYPE veil_linkerd_watches gauge\nveil_linkerd_watches{{kind=\"outbound\"}} {}\nveil_linkerd_watches{{kind=\"inbound\"}} {}\nveil_linkerd_watches{{kind=\"destination\"}} {}\n",

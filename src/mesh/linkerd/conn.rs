@@ -38,6 +38,10 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     let dst = crate::mesh::net::original_dst(fd).unwrap_or(local);
     if laddr.port() == cfg.outbound_addr.port() {
         outbound(&cfg, stream, peer, dst).await;
+    } else if laddr.port() == cfg.admin_addr.port() {
+        super::admin::serve(&cfg, stream, peer).await;
+    } else if laddr.port() == cfg.control_addr.port() {
+        super::tap::serve(&cfg, stream, peer).await;
     } else {
         inbound(&cfg, stream, peer, dst).await;
     }
@@ -123,7 +127,7 @@ async fn outbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: Socket
 }
 
 /// TLS を終端した後の先頭を読んで分類する。
-async fn read_classify(ds: &mut DownStream, mut acc: Vec<u8>) -> (Detected, Vec<u8>) {
+pub(super) async fn read_classify(ds: &mut DownStream, mut acc: Vec<u8>) -> (Detected, Vec<u8>) {
     loop {
         if let Some(d) = detect::classify(&acc) {
             return (d, acc);
@@ -151,7 +155,7 @@ async fn read_classify(ds: &mut DownStream, mut acc: Vec<u8>) -> (Detected, Vec<
 }
 
 /// opaque transport の transport header を読む（残りのバイトも返す）。
-async fn read_transport_header(ds: &mut DownStream) -> Option<(p::TransportHeader, Vec<u8>)> {
+pub(super) async fn read_transport_header(ds: &mut DownStream) -> Option<(p::TransportHeader, Vec<u8>)> {
     let mut acc: Vec<u8> = Vec::new();
     loop {
         match p::TransportHeader::decode_prefaced(&acc) {
@@ -171,6 +175,49 @@ async fn read_transport_header(ds: &mut DownStream) -> Option<(p::TransportHeade
             Ok(n) => acc.extend_from_slice(&buf[..n]),
         }
     }
+}
+
+/// 自分の ID の TLS を終端する（相手の ID は DNS の SAN）。
+pub(super) async fn accept_tls(
+    stream: TcpStream,
+    initial: Vec<u8>,
+    peer: SocketAddr,
+) -> Option<(DownStream, Option<String>)> {
+    let accept = async {
+        #[cfg(veil_ktls)]
+        {
+            crate::ktls_rustls::accept_with_peer_cert(
+                stream,
+                server_config(),
+                false,
+                true,
+                false,
+                Some(initial),
+            )
+            .await
+        }
+        #[cfg(not(veil_ktls))]
+        {
+            crate::simple_tls::accept_with_peer_cert(stream, server_config(), Some(initial)).await
+        }
+    };
+    let (ds, cert) = match crate::runtime::timeout(Duration::from_secs(10), accept).await {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            ftlog::debug!("[linkerd] TLS from {} failed: {}", peer, e);
+            return None;
+        }
+        Err(_) => return None,
+    };
+    let client_id = cert.as_deref().and_then(|c| {
+        crate::mesh::identity::parse_sans(c)
+            .into_iter()
+            .find_map(|s| match s {
+                crate::mesh::identity::San::Dns(d) => Some(d),
+                _ => None,
+            })
+    });
+    Some((ds, client_id))
 }
 
 fn server_config() -> Arc<rustls::ServerConfig> {
@@ -193,41 +240,9 @@ async fn inbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: SocketA
     match det {
         Detected::Closed => {}
         Detected::Tls { sni: Some(sni), .. } if sni == cfg.local_name => {
-            let accept = async {
-                #[cfg(veil_ktls)]
-                {
-                    crate::ktls_rustls::accept_with_peer_cert(
-                        stream,
-                        server_config(),
-                        false,
-                        true,
-                        false,
-                        Some(initial),
-                    )
-                    .await
-                }
-                #[cfg(not(veil_ktls))]
-                {
-                    crate::simple_tls::accept_with_peer_cert(stream, server_config(), Some(initial))
-                        .await
-                }
+            let Some((mut ds, client_id)) = accept_tls(stream, initial, peer).await else {
+                return;
             };
-            let (mut ds, cert) = match crate::runtime::timeout(Duration::from_secs(10), accept).await {
-                Ok(Ok(x)) => x,
-                Ok(Err(e)) => {
-                    ftlog::debug!("[linkerd] TLS from {} failed: {}", peer, e);
-                    return;
-                }
-                Err(_) => return,
-            };
-            let client_id = cert.as_deref().and_then(|c| {
-                crate::mesh::identity::parse_sans(c)
-                    .into_iter()
-                    .find_map(|s| match s {
-                        crate::mesh::identity::San::Dns(d) => Some(d),
-                        _ => None,
-                    })
-            });
             if ds.alpn_protocol() == Some(p::TRANSPORT_ALPN) {
                 let Some((h, rest)) = read_transport_header(&mut ds).await else {
                     return;
@@ -259,6 +274,7 @@ async fn serve_port(
     client_id: Option<String>,
     http_ok: bool,
 ) {
+    let _tcp = super::metrics::TcpGuard::inbound(dst, client_id.as_deref());
     let ic = discovery::inbound(dst.port()).await;
     let Some(ic) = ic else {
         relay(ds, &discovery::app_tcp(cfg), dst).await;

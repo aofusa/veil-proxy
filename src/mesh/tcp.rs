@@ -93,12 +93,16 @@ impl PendingRead for super::upstream::UpIo {
         match self {
             super::upstream::UpIo::Plain(_) => false,
             super::upstream::UpIo::Tls(s) => s.take_pending_plaintext(),
+            #[cfg(feature = "mesh-linkerd")]
+            super::upstream::UpIo::Tracked(s, _) => s.take_pending_plaintext(),
         }
     }
     fn fill_ready(&mut self) -> bool {
         match self {
             super::upstream::UpIo::Plain(_) => true,
             super::upstream::UpIo::Tls(s) => s.fill_plaintext_nonblocking().unwrap_or(true),
+            #[cfg(feature = "mesh-linkerd")]
+            super::upstream::UpIo::Tracked(s, _) => s.fill_plaintext_nonblocking().unwrap_or(true),
         }
     }
 }

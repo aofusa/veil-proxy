@@ -272,6 +272,22 @@ where
                     r.upstream_ms,
                 );
                 l7::finish_span(&ctx, &f, &view, r.status, r.cluster.as_deref());
+                #[cfg(feature = "mesh-linkerd")]
+                if ctx.hcm.linkerd {
+                    super::linkerd::metrics::record_http(
+                        &ctx,
+                        &super::linkerd::metrics::HttpDone {
+                            view: &view,
+                            upstream: r.upstream,
+                            status: r.status,
+                            grpc: r.grpc,
+                            latency: start.elapsed(),
+                            resp_bytes: r.resp_bytes,
+                            ep_labels: r.ep_labels.as_deref(),
+                            server_id: r.server_id.as_deref(),
+                        },
+                    );
+                }
                 if !r.keep_alive {
                     return;
                 }
@@ -643,6 +659,9 @@ pub(crate) struct Outcome {
     pub upstream: Option<std::net::SocketAddr>,
     pub cluster: Option<Arc<super::model::ClusterCfg>>,
     pub upstream_ms: Option<u64>,
+    /// 選んだエンドポイントの観測のラベルと相手の ID（Linkerd のメトリクス）
+    pub ep_labels: Option<Arc<str>>,
+    pub server_id: Option<Arc<str>>,
 }
 
 /// 上流の応答のヘッダ。
@@ -799,6 +818,8 @@ where
         upstream: None,
         cluster: None,
         upstream_ms: None,
+        ep_labels: None,
+        server_id: None,
     };
     let fail = |status: u16, flag: ResponseFlag| LocalReply::new(status, flag);
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
@@ -825,6 +846,12 @@ where
             }
         };
         out.upstream = Some(picked.addr);
+        out.ep_labels = picked.endpoint().and_then(|e| e.metric_labels.clone());
+        out.server_id = picked
+            .tls
+            .as_ref()
+            .filter(|t| t.mesh_mtls && t.transport.is_some())
+            .map(|t| Arc::<str>::from(t.sni.as_str()));
         out.cluster = Some(picked.cfg.clone());
         let downstream_h2 = false;
         // Linkerd: 相手のプロキシが HTTP/2 を受けられる（ProtocolHint.H2）なら昇格して送る（`l5d-orig-proto`）

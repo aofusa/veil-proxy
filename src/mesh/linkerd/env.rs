@@ -9,6 +9,9 @@ pub struct Config {
     pub inbound_addr: SocketAddr,
     pub outbound_addr: SocketAddr,
     pub admin_addr: SocketAddr,
+    /// tap の制御ポート（4190）と、受け付ける tap サービスの ID（viz の tap-injector が入れる）
+    pub control_addr: SocketAddr,
+    pub tap_name: Option<String>,
     /// 制御プレーン（`host:port`）と、その TLS のサーバの ID
     pub dst_addr: String,
     pub dst_name: String,
@@ -89,6 +92,8 @@ impl Config {
             inbound_addr: addr("LINKERD2_PROXY_INBOUND_LISTEN_ADDR", "0.0.0.0:4143"),
             outbound_addr: addr("LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR", "127.0.0.1:4140"),
             admin_addr: addr("LINKERD2_PROXY_ADMIN_LISTEN_ADDR", "0.0.0.0:4191"),
+            control_addr: addr("LINKERD2_PROXY_CONTROL_LISTEN_ADDR", "0.0.0.0:4190"),
+            tap_name: var("LINKERD2_PROXY_TAP_SVC_NAME"),
             dst_addr: req("LINKERD2_PROXY_DESTINATION_SVC_ADDR")?,
             dst_name: var("LINKERD2_PROXY_DESTINATION_SVC_NAME").unwrap_or_default(),
             policy_addr: req("LINKERD2_PROXY_POLICY_SVC_ADDR")?,

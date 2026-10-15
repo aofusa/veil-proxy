@@ -17,6 +17,7 @@ pub mod env;
 pub mod identity;
 pub mod metrics;
 pub mod proto;
+pub mod tap;
 
 use crate::mesh::model::*;
 use std::sync::Arc;
@@ -86,13 +87,17 @@ pub fn main() -> i32 {
         cfg.admin_addr
     );
     let _ = conn::CONFIG.set(cfg.clone());
-    let _ = crate::mesh::server::STATIC_LISTENERS.set(vec![
+    let mut listeners = vec![
         listener("inbound", cfg.inbound_addr, Direction::Inbound),
         listener("outbound", cfg.outbound_addr, Direction::Outbound),
-    ]);
+        listener("admin", cfg.admin_addr, Direction::Inbound),
+    ];
+    if cfg.tap_name.is_some() {
+        listeners.push(listener("control", cfg.control_addr, Direction::Inbound));
+    }
+    let _ = crate::mesh::server::STATIC_LISTENERS.set(listeners);
     crate::mesh::server::set_linkerd_mode();
     control::spawn(cfg.clone());
-    crate::mesh::admin::spawn_with(cfg.admin_addr, admin::route);
     crate::mesh::envoy::spawn_signal_thread(std::time::Duration::from_secs(5));
     crate::mesh::server::run(cfg.cores.max(1));
     ftlog::info!("[linkerd] stopped");

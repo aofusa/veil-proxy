@@ -351,6 +351,22 @@ async fn task(
                 o.upstream_ms,
             );
             l7::finish_span(&c, &f, &view, o.status, o.cluster.as_deref());
+            #[cfg(feature = "mesh-linkerd")]
+            if c.hcm.linkerd {
+                super::linkerd::metrics::record_http(
+                    &c,
+                    &super::linkerd::metrics::HttpDone {
+                        view: &view,
+                        upstream: o.upstream,
+                        status: o.status,
+                        grpc: o.grpc,
+                        latency: start.elapsed(),
+                        resp_bytes: o.resp_bytes,
+                        ep_labels: o.ep_labels.as_deref(),
+                        server_id: o.server_id.as_deref(),
+                    },
+                );
+            }
         }
     }
 }
@@ -367,6 +383,9 @@ pub(crate) struct Outcome {
     pub upstream: Option<std::net::SocketAddr>,
     pub cluster: Option<Arc<super::model::ClusterCfg>>,
     pub upstream_ms: Option<u64>,
+    /// 選んだエンドポイントの観測のラベルと相手の ID（Linkerd のメトリクス）
+    pub ep_labels: Option<Arc<str>>,
+    pub server_id: Option<Arc<str>>,
 }
 
 fn grpc_status_of(h: &[(Bytes, Bytes)]) -> Option<u32> {
@@ -406,6 +425,8 @@ async fn forward(
         upstream: None,
         cluster: None,
         upstream_ms: None,
+        ep_labels: None,
+        server_id: None,
     };
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
     let max_attempts = 1 + retry.as_ref().map_or(0, |r| r.num_retries);
@@ -437,6 +458,12 @@ async fn forward(
             }
         };
         out.upstream = Some(picked.addr);
+        out.ep_labels = picked.endpoint().and_then(|e| e.metric_labels.clone());
+        out.server_id = picked
+            .tls
+            .as_ref()
+            .filter(|t| t.mesh_mtls && t.transport.is_some())
+            .map(|t| Arc::<str>::from(t.sni.as_str()));
         out.cluster = Some(picked.cfg.clone());
         let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
         // Linkerd の inbound: 相手のプロキシが HTTP/1.1 から昇格させた要求（`l5d-orig-proto`）はアプリへ HTTP/1.1 で

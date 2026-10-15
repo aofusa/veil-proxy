@@ -28,6 +28,9 @@ pub type ClientTls = crate::pool::ClientTls;
 pub enum UpIo {
     Plain(TcpStream),
     Tls(Box<ClientTls>),
+    /// Linkerd のプロキシ同士の mTLS（接続の数を Linkerd のメトリクスに数える。F-223）
+    #[cfg(feature = "mesh-linkerd")]
+    Tracked(Box<ClientTls>, super::linkerd::metrics::TcpGuard),
 }
 
 impl AsyncReadRent for UpIo {
@@ -35,6 +38,8 @@ impl AsyncReadRent for UpIo {
         match self {
             UpIo::Plain(s) => s.read(buf).await,
             UpIo::Tls(s) => s.read(buf).await,
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.read(buf).await,
         }
     }
 }
@@ -44,6 +49,8 @@ impl AsyncWriteRent for UpIo {
         match self {
             UpIo::Plain(s) => s.write(buf).await,
             UpIo::Tls(s) => s.write(buf).await,
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.write(buf).await,
         }
     }
 
@@ -51,6 +58,8 @@ impl AsyncWriteRent for UpIo {
         match self {
             UpIo::Plain(s) => s.flush().await,
             UpIo::Tls(s) => s.flush().await,
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.flush().await,
         }
     }
 
@@ -58,6 +67,8 @@ impl AsyncWriteRent for UpIo {
         match self {
             UpIo::Plain(s) => AsyncWriteRent::shutdown(s).await,
             UpIo::Tls(s) => s.shutdown().await,
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.shutdown().await,
         }
     }
 }
@@ -67,6 +78,8 @@ impl AsRawFd for UpIo {
         match self {
             UpIo::Plain(s) => s.as_raw_fd(),
             UpIo::Tls(s) => s.as_raw_fd(),
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.as_raw_fd(),
         }
     }
 }
@@ -76,6 +89,8 @@ impl BufferedReadState for UpIo {
         match self {
             UpIo::Plain(_) => false,
             UpIo::Tls(s) => s.has_buffered_read_data(),
+            #[cfg(feature = "mesh-linkerd")]
+            UpIo::Tracked(s, _) => s.has_buffered_read_data(),
         }
     }
 }
@@ -350,6 +365,22 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
         }
     };
     match crate::runtime::timeout(p.cfg.connect_timeout.max(Duration::from_secs(1)), hs).await {
+        // Linkerd のプロキシ同士（接続を数える）
+        #[cfg(feature = "mesh-linkerd")]
+        Ok(Ok(s)) if tls.transport.is_some() => {
+            let guard = super::linkerd::metrics::TcpGuard::outbound(
+                p.addr,
+                &tls.sni,
+                p.endpoint().and_then(|e| e.metric_labels.as_deref()),
+            );
+            let mut io = UpIo::Tracked(Box::new(s), guard);
+            if tagged.is_some() {
+                let header = linkerd_transport_header(p.addr.port(), &alpn);
+                let (r, _) = io.write_all(header).await;
+                r?;
+            }
+            Ok(io)
+        }
         Ok(Ok(s)) if tagged.is_some() => {
             let mut io = UpIo::Tls(Box::new(s));
             let header = linkerd_transport_header(p.addr.port(), &alpn);
@@ -412,6 +443,8 @@ pub fn negotiated_h2(io: &UpIo) -> bool {
     match io {
         UpIo::Plain(_) => true,
         UpIo::Tls(s) => s.negotiated_h2(),
+        #[cfg(feature = "mesh-linkerd")]
+        UpIo::Tracked(s, _) => s.negotiated_h2(),
     }
 }
 
@@ -523,7 +556,7 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
     if !negotiated_h2(&io) && !linkerd {
         return Err(io::Error::other("upstream did not negotiate h2"));
     }
-    let https = matches!(io, UpIo::Tls(_));
+    let https = !matches!(io, UpIo::Plain(_));
     let mux = Rc::new(crate::http2::upstream_mux::H2Mux::start(
         io,
         https,
