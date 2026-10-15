@@ -1291,6 +1291,10 @@ chaos() {
   sleep 5
   out="$(fexec fortio load -c 2 -qps 20 -t 15s -timeout 5s -loglevel Error "http://whoami.$NS/" 2>&1 | grep '^Code' | tr '\n' ' ')"
   case "$out" in "Code 200 : "*"(100.0 %) ") ok "control plane down: traffic keeps flowing ($out)" ;; *) bad "control plane down: $out" ;; esac
+  kubectl -n istio-system scale deploy/istiod --replicas=1 >/dev/null
+  kubectl -n istio-system rollout status deploy/istiod --timeout=300s >/dev/null
+  # 検証の webhook が istiod なので、新しい設定は戻ってから入れる（張り直した ADS で届くこと）
+  retry 60 kubectl -n istio-system exec deploy/istiod -- true
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: networking.istio.io/v1
 kind: VirtualService
@@ -1301,8 +1305,6 @@ spec:
   - route: [{destination: {host: whoami}}]
     headers: {response: {add: {x-chaos: after-outage}}}
 EOF
-  kubectl -n istio-system scale deploy/istiod --replicas=1 >/dev/null
-  kubectl -n istio-system rollout status deploy/istiod --timeout=300s >/dev/null
   if retry 120 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -D- -o /dev/null http://whoami.$NS/ | grep -qi 'x-chaos: after-outage'"; then
     ok "control plane back: new configuration applied"; else bad "configuration after istiod outage not applied"; fi
   kubectl -n "$NS" delete virtualservice chaos-whoami >/dev/null 2>&1
@@ -1310,9 +1312,11 @@ EOF
   local before after
   before="$(kubectl -n "$NS" get pod -l app=client -o jsonpath='{range .items[0].status.initContainerStatuses[*]}{.name}={.restartCount} {end}{range .items[0].status.containerStatuses[*]}{.name}={.restartCount} {end}' | grep -o 'istio-proxy=[0-9]*')"
   kubectl -n "$NS" exec deploy/client -c istio-proxy -- sh -c 'kill -9 $(pidof envoy)' >/dev/null 2>&1
+  local rc0="${before#*=}"
+  retry 120 sh -c "kubectl -n $NS get pod -l app=client -o jsonpath='{.items[0].status.initContainerStatuses[?(@.name==\"istio-proxy\")].restartCount}' | awk '{exit !(\$1 > $rc0)}'"
   if retry 120 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200"; then
     after="$(kubectl -n "$NS" get pod -l app=client -o jsonpath='{range .items[0].status.initContainerStatuses[*]}{.name}={.restartCount} {end}{range .items[0].status.containerStatuses[*]}{.name}={.restartCount} {end}' | grep -o 'istio-proxy=[0-9]*')"
-    ok "proxy killed: recovered ($before -> $after)"
+    if [ "$after" != "$before" ]; then ok "proxy killed: restarted and recovered ($before -> $after)"; else bad "proxy kill did not restart the proxy ($before -> $after)"; fi
   else bad "proxy killed: no recovery"; fi
   kubectl -n "$NS" scale deploy/whoami --replicas=1 >/dev/null
 }
