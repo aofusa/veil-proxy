@@ -16,7 +16,7 @@ CLUSTER="${KIND_CLUSTER:-mesh}"
 IMAGE="${1:-veil.local/istio-proxy:1.31.1}"
 N="${2:-200}"
 NS=mesh-syscalls
-STRACE=veil.local/strace:latest
+STRACE=veil.local/strace:1   # latest のタグだとエフェメラルコンテナが pull しに行く
 
 kubectl config use-context "kind-$CLUSTER" >/dev/null
 if ! docker image inspect "$STRACE" >/dev/null 2>&1; then
@@ -58,24 +58,30 @@ kubectl -n "$NS" rollout status deploy --timeout=300s >/dev/null || { echo "not 
 # 平文で受ける（PERMISSIVE）。メッシュ外の client から inbound（15006 の virtualInbound）へ直接入る
 pod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
 kubectl -n "$NS" exec deploy/client -- curl -s -o /dev/null http://whoami/ ; sleep 2
+# 同じ長さで 2 回数える: 何も送らない回（アイドルの 1 秒ごとの accept のタイムアウト等）と、N 本の接続を送る回。
+# 差を N で割ったものが接続あたり
 kubectl -n "$NS" debug "$pod" --image="$STRACE" --target=istio-proxy --profile=sysadmin -c tracer -q -- \
-  sh -c 'pid=$(pidof envoy); exec timeout -s INT 40 strace -f -c -p "$pid"' >/dev/null
-for _ in $(seq 30); do
-  kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.ephemeralContainerStatuses[0].state.running}' | grep -q startedAt && break
+  sh -c 'pid=$(pidof envoy); timeout -s INT 30 strace -f -c -p "$pid"; echo ===LOAD===; timeout -s INT 30 strace -f -c -p "$pid"; echo ===END===' >/dev/null
+for _ in $(seq 90); do
+  kubectl -n "$NS" logs "$pod" -c tracer 2>/dev/null | grep -q '===LOAD===' && break
   sleep 1
 done
-sleep 4
+sleep 2
 kubectl -n "$NS" exec deploy/client -- sh -c "for i in \$(seq $N); do curl -s -o /dev/null -H 'Connection: close' http://whoami/; done"
 for _ in $(seq 60); do
-  kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.ephemeralContainerStatuses[0].state.terminated}' | grep -q exitCode && break
+  kubectl -n "$NS" logs "$pod" -c tracer 2>/dev/null | grep -q '===END===' && break
   sleep 1
 done
 kubectl -n "$NS" logs "$pod" -c tracer > "$TMPDIR/mesh-syscalls.txt" 2>&1
-echo "image: $IMAGE, connections: $N (inbound, plaintext, whoami sidecar)"
-awk -v n="$N" '
-  /^-----/ {sec++; next}
-  sec == 1 && NF >= 5 && $NF != "total" {
-    calls = ($4 ~ /^[0-9]+$/) ? $4 : $3; name = $NF
-    printf "%-20s %8d calls  %6.2f / connection\n", name, calls, calls / n
-  }' "$TMPDIR/mesh-syscalls.txt" | sort -k2 -n -r
+echo "image: $IMAGE, connections: $N (inbound, plaintext, whoami sidecar; loaded 30s minus idle 30s)"
+awk -v n="$N" 'BEGIN { phase = 0 }
+  /===LOAD===/ {phase = 1; next}
+  /^-----/ {next}
+  NF >= 5 && $NF != "total" && $NF != "syscall" && $4 ~ /^[0-9]+$/ { c[phase, $NF] += $4; names[$NF] = 1 }
+  END {
+    for (k in names) {
+      d = c[1, k] - c[0, k]
+      if (d / n >= 0.05 || d / n <= -0.05) printf "%-20s %8d - %8d idle  %6.2f / connection\n", k, c[1, k], c[0, k], d / n
+    }
+  }' "$TMPDIR/mesh-syscalls.txt" | sort -k6 -n -r
 kubectl delete ns "$NS" --wait=false >/dev/null 2>&1

@@ -34,8 +34,9 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         return;
     };
     let fd = stream.as_raw_fd();
-    let local = crate::mesh::net::local_addr(fd).unwrap_or(laddr);
-    let dst = crate::mesh::net::original_dst(fd).unwrap_or(local);
+    // 宛先は SO_ORIGINAL_DST（getsockopt 1 本）。取れないときだけ getsockname
+    let dst = crate::mesh::net::original_dst(fd)
+        .unwrap_or_else(|| crate::mesh::net::local_addr(fd).unwrap_or(laddr));
     if laddr.port() == cfg.outbound_addr.port() {
         outbound(&cfg, stream, peer, dst).await;
     } else if laddr.port() == cfg.admin_addr.port() {

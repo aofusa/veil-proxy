@@ -412,11 +412,19 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         return;
     }
     let fd = stream.as_raw_fd();
-    let local = super::net::local_addr(fd).unwrap_or(laddr);
+    // 透過転送の接続は SO_ORIGINAL_DST（getsockopt）1 本で宛先が決まる。取れないとき・透過転送でないリスナーが
+    // ワイルドカードに bind しているときだけ getsockname で自分の側のアドレスを取る
+    let local = || {
+        if laddr.ip().is_unspecified() {
+            super::net::local_addr(fd).unwrap_or(laddr)
+        } else {
+            laddr
+        }
+    };
     let dst = if lst.use_original_dst || lst.direction == Direction::Inbound {
-        super::net::original_dst(fd).unwrap_or(local)
+        super::net::original_dst(fd).unwrap_or_else(local)
     } else {
-        local
+        local()
     };
     // virtualOutbound は元の宛先に対応するリスナーへ渡す
     let table = state().listeners.load();
