@@ -827,6 +827,11 @@ async fn to_h1(
         head.put_slice(b"content-length: ");
         head.put_slice(it.format(first_body.len()).as_bytes());
         head.put_slice(b"\r\n");
+    } else if !has_len && req_rx.is_none() && matches!(method.as_ref(), b"POST" | b"PUT" | b"PATCH")
+    {
+        // 本文の無い POST・PUT・PATCH は content-length: 0 を付ける（hyper = linkerd2-proxy・Envoy と同じ。
+        // 付けないと WEBrick 等は 411 を返す）
+        head.put_slice(b"content-length: 0\r\n");
     }
     head.put_slice(b"\r\n");
     let write_chunk = |b: Bytes| -> Bytes {
