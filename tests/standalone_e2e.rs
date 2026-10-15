@@ -1171,6 +1171,13 @@ fn write_mtls_pki(dir: &std::path::Path) {
     let client = cp.signed_by(&client_key, &issuer).unwrap();
     std::fs::write(dir.join("client.pem"), client.pem()).unwrap();
     std::fs::write(dir.join("client.key"), client_key.serialize_pem()).unwrap();
+
+    // 同じ CA が発行した別の ID（F-220 の SAN の許可リストの試験用）
+    let other_key = KeyPair::generate().unwrap();
+    let op = CertificateParams::new(vec!["other.test".to_string()]).unwrap();
+    let other = op.signed_by(&other_key, &issuer).unwrap();
+    std::fs::write(dir.join("other.pem"), other.pem()).unwrap();
+    std::fs::write(dir.join("other.key"), other_key.serialize_pem()).unwrap();
 }
 
 /// TLS で GET して応答の先頭行を返す（サーバ証明書は検証しない。`client` はクライアント証明書の PEM の組）。
@@ -1521,4 +1528,167 @@ max_age_secs = 600
     .unwrap();
     assert!(other.header("access-control-allow-origin").is_none());
     assert_eq!(http1_get(port, "/cors").unwrap().text(), "actual");
+}
+
+// ===================== F-220（TOML の JWT・ID による認可） =====================
+
+/// テスト用: ES256 の鍵で payload に署名したトークンと、その JWKS。
+#[cfg(all(feature = "jwt", not(any(target_os = "openbsd", target_os = "netbsd"))))]
+fn es256_token(payload: &str) -> (String, String) {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    fn enc(b: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for ch in b.chunks(3) {
+            let n = (ch[0] as u32) << 16
+                | (*ch.get(1).unwrap_or(&0) as u32) << 8
+                | *ch.get(2).unwrap_or(&0) as u32;
+            for i in 0..(ch.len() + 1) {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+    let pt = kp.public_key().as_ref();
+    let jwks = format!(
+        r#"{{"keys":[{{"kty":"EC","crv":"P-256","kid":"k1","x":"{}","y":"{}"}}]}}"#,
+        enc(&pt[1..33]),
+        enc(&pt[33..65])
+    );
+    let input = format!(
+        "{}.{}",
+        enc(br#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#),
+        enc(payload.as_bytes())
+    );
+    let sig = kp.sign(&rng, input.as_bytes()).unwrap();
+    (format!("{}.{}", input, enc(sig.as_ref())), jwks)
+}
+
+/// `[route.jwt]`: トークンの無い要求・検証できない要求は 401、claim の条件に合わない要求は 403、正しい要求は
+/// action へ（HTTP/1.1・h2c）。`[tls] client_allowed_sans`: 同じ CA の証明書でも一覧に無い ID はハンドシェイクで拒否。
+#[cfg(all(feature = "jwt", not(any(target_os = "openbsd", target_os = "netbsd"))))]
+#[test]
+fn f220_route_jwt_and_client_allowed_sans() {
+    let dir = tempfile::tempdir().unwrap();
+    let (good, jwks) = es256_token(
+        r#"{"iss":"https://issuer.test","aud":"api","exp":4000000000,"sub":"alice","scope":"read write"}"#,
+    );
+    // 同じ鍵の別のトークンは作れないので、claim 違いは別の鍵で作り JWKS を 2 本にする
+    let (no_scope, jwks2) = es256_token(
+        r#"{"iss":"https://issuer.test","aud":"api","exp":4000000000,"sub":"bob","scope":"write"}"#,
+    );
+    let k1: serde_json::Value = serde_json::from_str(&jwks).unwrap();
+    let mut k2: serde_json::Value = serde_json::from_str(&jwks2).unwrap();
+    k2["keys"][0]["kid"] = serde_json::Value::String("k1".into());
+    let both = serde_json::json!({"keys": [k1["keys"][0].clone(), k2["keys"][0].clone()]});
+    let jwks_path = dir.path().join("jwks.json");
+    std::fs::write(&jwks_path, both.to_string()).unwrap();
+    let (other_iss, _) = es256_token(r#"{"iss":"https://evil.test","aud":"api"}"#);
+
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+threads = 1
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+path = "/api"
+[route.action]
+type = "Respond"
+body = "secret"
+[route.jwt]
+issuer = "https://issuer.test"
+audiences = ["api"]
+jwks_path = "{jwks}"
+require_claims = {{ scope = ["read"] }}
+"#,
+        jwks = tp(&jwks_path)
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
+
+    let get = |auth: Option<String>| {
+        let h: Vec<(&str, String)> = auth.map(|a| vec![("Authorization", a)]).unwrap_or_default();
+        let hr: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        http1_request(port, "GET", "/api", &hr, b"").unwrap()
+    };
+    let r = get(None);
+    assert_eq!(r.status, 401, "{}", veil.log());
+    assert!(r.header("www-authenticate").is_some());
+    assert_eq!(get(Some("Bearer garbage".into())).status, 401);
+    assert_eq!(get(Some(format!("Bearer {other_iss}"))).status, 401);
+    assert_eq!(get(Some(format!("Bearer {no_scope}"))).status, 403);
+    let ok = get(Some(format!("Bearer {good}")));
+    assert_eq!((ok.status, ok.text().as_str()), (200, "secret"));
+    // h2c（ストリーミングの下見を通る経路）でもトークンが無ければ 401
+    let (st, _) = h2c_get(port, "/api");
+    assert_eq!(st, 401);
+
+    // ID による認可（ハンドシェイク）
+    let pki = dir.path().join("pki");
+    std::fs::create_dir_all(&pki).unwrap();
+    write_mtls_pki(&pki);
+    let www = pki.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "hello").unwrap();
+    let tls_port = free_port();
+    let tls_cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+threads = 1
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+client_auth = "require"
+client_ca = "{p}/ca.pem"
+client_allowed_sans = ["client.test"]
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        p = tp(&pki),
+        www = tp(&www)
+    );
+    let tls_cfg_path = pki.join("config.toml");
+    std::fs::write(&tls_cfg_path, tls_cfg).unwrap();
+    let tls_veil = VeilProcess::spawn(&tls_cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        tls_veil.log()
+    );
+    let allowed = tls_get_status_line(
+        tls_port,
+        "/",
+        Some((&pki.join("client.pem"), &pki.join("client.key"))),
+    )
+    .unwrap_or_else(|e| panic!("allowed identity rejected: {e}\n{}", tls_veil.log()));
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    let denied = tls_get_status_line(
+        tls_port,
+        "/",
+        Some((&pki.join("other.pem"), &pki.join("other.key"))),
+    );
+    assert!(
+        !matches!(&denied, Ok(l) if l.starts_with("HTTP/1.1 200")),
+        "identity outside client_allowed_sans must be rejected: {denied:?}"
+    );
 }

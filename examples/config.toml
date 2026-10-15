@@ -374,6 +374,9 @@ ktls_fallback_enabled = true
 # 変更の反映には再起動が必要（証明書リロードでは起動時の設定を引き継ぐ）。
 # client_auth = "none"
 # client_ca = "/path/to/client-ca.pem"
+# 受けるクライアント証明書の SAN（DNS 名・URI・IP。どれかが一致すれば受ける。F-220）。空なら client_ca が
+# 発行したもの全部。ハンドシェイクで 1 回だけ照合する。client_auth が none 以外のときだけ書ける。
+# client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]
 
 
 
@@ -2387,6 +2390,18 @@ revalidate_mtime = false
 # expose_headers = []
 # max_age_secs = 600
 # allow_credentials = false    # "*" とは併用できない
+#
+# JWT の検証（F-220、`jwt` feature）。トークン無し・検証できない → 401、require_claims を満たさない → 403
+# [route.jwt]
+# issuer = "https://auth.example.com"      # "iss"（空なら見ない）
+# audiences = ["api"]                      # どれかが "aud" に入っていること（空なら見ない）
+# jwks_path = "/etc/veil/jwks.json"        # または jwks = '{"keys":[...]}'（ロード時に読む。差し替えは SIGHUP）
+# header = "authorization"                 # 既定
+# prefix = "Bearer "                       # 既定
+# allow_missing = false
+# require_expiration = false
+# clock_skew_secs = 60
+# require_claims = { scope = ["read"] }
 
 # ------------------------------------------
 # ロードバランシング（Upstream参照）

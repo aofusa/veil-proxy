@@ -171,6 +171,7 @@ cert_path = "/etc/veil/cert.pem"
 key_path  = "/etc/veil/key.pem"
 client_auth = "require"            # "none" (default) | "optional" | "require"
 client_ca   = "/etc/veil/client-ca.pem"
+client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # optional (F-220)
 ```
 
 - `"require"` rejects clients that send no certificate, or one that does not chain to `client_ca`, during the
@@ -178,7 +179,11 @@ client_ca   = "/etc/veil/client-ca.pem"
   sent is still verified).
 - Applies to TLS over TCP (HTTP/1.1 and HTTP/2). Combining it with `[http3]` is a startup error, because QUIC
   clients would bypass the check.
-- Certificate hot reload keeps the startup `client_auth` / `client_ca`; changing them needs a restart.
+- `client_allowed_sans` accepts only certificates with one of the listed SANs (DNS name, URI or IP), checked once
+  during the handshake; other identities from the same CA are rejected. It needs `client_auth = "optional"` or
+  `"require"`.
+- Certificate hot reload keeps the startup `client_auth` / `client_ca` / `client_allowed_sans`; changing them needs a
+  restart.
 
 ### Client certificates towards upstreams
 

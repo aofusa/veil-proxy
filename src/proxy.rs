@@ -4183,6 +4183,14 @@ async fn h2_serve_streaming(
         Some((_prefix, Backend::Handler(entry, _, _), _rc)) if entry.streaming_request => {
             return h2_api_handler(ctx, &entry, Some(req_rx), resp_tx, notify).await;
         }
+        // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
+        Some((_prefix, Backend::Respond(r), _rc)) => {
+            h2_drain_req(req_rx, notify).await;
+            let mut headers = h2_base_headers(false);
+            headers.extend(r.headers.iter().cloned());
+            let (s, sz) = h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await;
+            return (s, sz, 0);
+        }
         _ => {
             h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;

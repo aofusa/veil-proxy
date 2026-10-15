@@ -192,6 +192,8 @@ pub mod tls_provider;
 pub mod x509_san;
 /// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
 pub mod upstream_tls;
+#[cfg(feature = "jwt")]
+pub mod jwt_verify;
 pub mod route_traffic;
 
 /// リッスンアドレス表現（F-164: `unix:<path>` UDS 対応）。`config`/`server`/`entry` の

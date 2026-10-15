@@ -81,6 +81,38 @@ drop_privileges_group = "veil"
 > 
 > Namespace隔離が必要な場合は、**systemdレベル**で行うことを推奨します（下記参照）。
 
+## JWT の認証（F-220）
+
+`[route.jwt]` はルートの要求ごとに JSON Web Token を検証してから action へ渡す（`jwt` feature が必要で `full*` に含まれる）。
+トークンの無い要求は `401`（`Jwt is missing`）、検証できないトークンは `401`（`Jwt verification fails`）、検証できたが
+`require_claims` を満たさないトークンは `403`（`RBAC: access denied`）。
+
+```toml
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "api"
+[route.jwt]
+issuer = "https://auth.example.com"       # "iss" と照合（空なら見ない）
+audiences = ["api"]                       # どれかが "aud" に入っていること（空なら見ない）
+jwks_path = "/etc/veil/jwks.json"         # または jwks = '{"keys":[...]}' でインライン
+# header = "authorization"                # 既定
+# prefix = "Bearer "                      # 既定（大文字小文字は区別しない）
+# allow_missing = false                   # true: トークンの無い要求も通す（あれば検証する）
+# require_expiration = false
+# clock_skew_secs = 60
+require_claims = { scope = ["read"] }     # 全部の claim がどれかの値を持つこと
+```
+
+- 署名: JWKS の RSA・EC（P-256・P-384）の鍵で RS256/384/512・PS256/384/512・ES256/384。`exp`・`nbf` は時刻のずれを
+  見込んで確かめる。
+- 文字列の claim は空白で区切る（OAuth の `scope`）。配列はどれかの要素、真偽値・数値は文字列にして照合する。
+- JWKS は設定のロード時に読む。鍵の更新はファイルを差し替えて `SIGHUP`。リモートの JWKS の URI は取りに行かない。
+- `[route.traffic.cors]` が答える CORS のプリフライトにはトークンが要らない。
+- TLS のクライアントの ID による認可は `[tls] client_allowed_sans`（[TLS](tls.md)）。
+
 ## セキュリティ強化（systemd サンドボックス化）
 
 io_uringは強力な非同期I/Oインターフェースですが、悪用されるとカーネル権限を奪われるリスクがあります。

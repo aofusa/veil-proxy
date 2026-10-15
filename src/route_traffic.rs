@@ -1,7 +1,7 @@
 //! ルート単位のトラフィック制御（F-219、メッシュ無しの TOML のルート）。
 //!
-//! `[route.traffic]` の重み付き分割（`split`）・フォルト注入の中断（`fault`）・CORS のプリフライト（`cors`）と、
-//! 固定応答の action（`type = "Respond"`）。どれもルートの照合（`upstream::find_backend_unified`）の直後に
+//! `[route.traffic]` の重み付き分割（`split`）・フォルト注入の中断（`fault`）・CORS のプリフライト（`cors`）、
+//! `[route.jwt]` の JWT の検証と claim の条件（F-220、`jwt` feature）と、固定応答の action（`type = "Respond"`）。どれもルートの照合（`upstream::find_backend_unified`）の直後に
 //! 解決済みの [`Backend`] を選ぶだけで、プロトコル（HTTP/1.1・HTTP/2・HTTP/3）ごとの経路は変えない。
 //!
 //! - 設定のロード時に分割先の `Backend`・中断とプリフライトの応答を作っておき、要求のたびには `Backend` の
@@ -63,6 +63,110 @@ pub struct FaultConfig {
 
 fn default_percent() -> f64 {
     100.0
+}
+
+/// `[route.jwt]`（F-220）。検証できない要求は 401、claim の条件に合わない要求は 403 で返す。
+/// 型は `jwt` feature が無くても持つ（書かれていたら設定のロードでエラーにし、黙って素通しにしない）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtConfig {
+    /// `iss` の期待値（空なら見ない）
+    #[serde(default)]
+    pub issuer: String,
+    /// `aud` に入っていてほしい値（どれか 1 つ。空なら見ない）
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    /// JWKS（JSON の文字列）
+    #[serde(default)]
+    pub jwks: String,
+    /// JWKS のファイル（設定のロード時に読む。差し替えは SIGHUP）
+    #[serde(default)]
+    pub jwks_path: String,
+    /// トークンを読むヘッダ
+    #[serde(default = "default_jwt_header")]
+    pub header: String,
+    /// ヘッダの値の接頭辞（大文字小文字は区別しない）
+    #[serde(default = "default_jwt_prefix")]
+    pub prefix: String,
+    /// トークンの無い要求も通す（あれば検証する）
+    #[serde(default)]
+    pub allow_missing: bool,
+    /// `exp` の無いトークンを拒否する
+    #[serde(default)]
+    pub require_expiration: bool,
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_secs: u64,
+    /// claim の条件（名前 → 許す値。全部の claim がどれかの値を持つこと。配列・空白区切りの文字列も見る）
+    #[serde(default)]
+    pub require_claims: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+fn default_jwt_header() -> String {
+    "authorization".into()
+}
+
+fn default_jwt_prefix() -> String {
+    "Bearer ".into()
+}
+
+fn default_clock_skew() -> u64 {
+    60
+}
+
+/// 解決済みの `[route.jwt]`。
+#[cfg(feature = "jwt")]
+struct JwtRule {
+    keys: Vec<crate::jwt_verify::Jwk>,
+    issuer: String,
+    audiences: Vec<String>,
+    header: Box<[u8]>,
+    prefix: Box<[u8]>,
+    allow_missing: bool,
+    require_expiration: bool,
+    clock_skew_secs: u64,
+    claims: Vec<(String, Vec<String>)>,
+    missing: Backend,
+    invalid: Backend,
+    denied: Backend,
+}
+
+#[cfg(feature = "jwt")]
+impl JwtRule {
+    /// 通すなら `None`、拒否なら 401 / 403 の固定応答。
+    fn check(&self, headers: &[(&[u8], &[u8])]) -> Option<Backend> {
+        let Some(v) = header(headers, &self.header) else {
+            return (!self.allow_missing).then(|| self.missing.clone());
+        };
+        let p = self.prefix.len();
+        if v.len() < p || !v[..p].eq_ignore_ascii_case(&self.prefix) {
+            return Some(self.invalid.clone());
+        }
+        let Ok(token) = std::str::from_utf8(v[p..].trim_ascii()) else {
+            return Some(self.invalid.clone());
+        };
+        let c = crate::jwt_verify::Check {
+            keys: &self.keys,
+            issuer: &self.issuer,
+            audiences: &self.audiences,
+            require_expiration: self.require_expiration,
+            clock_skew_secs: self.clock_skew_secs,
+            now: crate::jwt_verify::unix_secs(),
+        };
+        let Some(payload) = crate::jwt_verify::verify(&c, token) else {
+            return Some(self.invalid.clone());
+        };
+        let ok = self.claims.iter().all(|(name, allowed)| {
+            let has = |s: &str| allowed.iter().any(|a| a == s);
+            match payload.get(name) {
+                Some(serde_json::Value::String(s)) => s.split_ascii_whitespace().any(has),
+                Some(serde_json::Value::Array(a)) => a.iter().any(|x| x.as_str().is_some_and(has)),
+                Some(serde_json::Value::Bool(b)) => has(if *b { "true" } else { "false" }),
+                Some(serde_json::Value::Number(n)) => has(&n.to_string()),
+                _ => false,
+            }
+        });
+        (!ok).then(|| self.denied.clone())
+    }
 }
 
 /// CORS のプリフライトの応答。
@@ -163,6 +267,8 @@ pub struct TrafficPolicy {
     /// (100 万分率, 中断の応答)
     abort: Option<(u32, Backend)>,
     cors: Option<CorsPreflight>,
+    #[cfg(feature = "jwt")]
+    jwt: Option<JwtRule>,
 }
 
 struct CorsPreflight {
@@ -239,6 +345,13 @@ impl TrafficPolicy {
                 }
             }
         }
+        // JWT（F-220）は乱数を使わないので下見でも判定する（HTTP/3 のストリーミングは下見だけでディスパッチする）
+        #[cfg(feature = "jwt")]
+        if let Some(j) = &self.jwt {
+            if let Some(b) = j.check(headers) {
+                return Some(b);
+            }
+        }
         if let Some((ppm, b)) = &self.abort {
             if !draw || (next_u64() % 1_000_000) < u64::from(*ppm) {
                 return Some(b.clone());
@@ -270,9 +383,19 @@ pub fn resolve(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
     build: impl Fn(&Route, &HashMap<String, Arc<UpstreamGroup>>) -> io::Result<Backend>,
 ) -> io::Result<Option<Arc<TrafficPolicy>>> {
-    let Some(t) = &route.traffic else {
+    if route.traffic.is_none() && route.jwt.is_none() {
         return Ok(None);
-    };
+    }
+    let default_traffic = TrafficConfig::default();
+    let t = route.traffic.as_ref().unwrap_or(&default_traffic);
+    #[cfg(feature = "jwt")]
+    let jwt = route.jwt.as_ref().map(resolve_jwt).transpose()?;
+    #[cfg(not(feature = "jwt"))]
+    if route.jwt.is_some() {
+        return Err(err(
+            "[route.jwt] requires a build with the `jwt` feature (included in `full`)".into(),
+        ));
+    }
     let mut split = Vec::with_capacity(t.split.len());
     let mut total: u32 = 0;
     for (i, e) in t.split.iter().enumerate() {
@@ -301,6 +424,7 @@ pub fn resolve(
         let mut r = route.clone();
         r.action = action;
         r.traffic = None;
+        r.jwt = None;
         let b = build(&r, upstream_groups)
             .map_err(|e2| err(format!("[route.traffic] split[{}]: {}", i, e2)))?;
         total = total
@@ -405,7 +529,59 @@ pub fn resolve(
         split_total: total,
         abort,
         cors,
+        #[cfg(feature = "jwt")]
+        jwt,
     })))
+}
+
+#[cfg(feature = "jwt")]
+fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
+    let text = match (j.jwks.is_empty(), j.jwks_path.is_empty()) {
+        (false, true) => j.jwks.clone(),
+        (true, false) => {
+            let b = crate::tls_reload::read_pem(std::path::Path::new(&j.jwks_path))
+                .map_err(|e| err(format!("[route.jwt] jwks_path {}: {}", j.jwks_path, e)))?;
+            String::from_utf8(b)
+                .map_err(|_| err(format!("[route.jwt] jwks_path {}: not UTF-8", j.jwks_path)))?
+        }
+        _ => return Err(err("[route.jwt] set exactly one of jwks or jwks_path".into())),
+    };
+    let keys = crate::jwt_verify::parse_jwks(&text);
+    if keys.is_empty() {
+        return Err(err("[route.jwt] the JWKS has no usable keys".into()));
+    }
+    let text_resp = |status: u16, body: &'static [u8], www: Option<&'static [u8]>| {
+        let mut h = vec![(
+            Bytes::from_static(b"content-type"),
+            Bytes::from_static(b"text/plain"),
+        )];
+        if let Some(w) = www {
+            h.push((Bytes::from_static(b"www-authenticate"), Bytes::from_static(w)));
+        }
+        respond_backend(status, h, Bytes::from_static(body))
+    };
+    Ok(JwtRule {
+        keys,
+        issuer: j.issuer.clone(),
+        audiences: j.audiences.clone(),
+        header: j.header.to_ascii_lowercase().into_bytes().into_boxed_slice(),
+        prefix: j.prefix.as_bytes().to_vec().into_boxed_slice(),
+        allow_missing: j.allow_missing,
+        require_expiration: j.require_expiration,
+        clock_skew_secs: j.clock_skew_secs,
+        claims: j
+            .require_claims
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        missing: text_resp(401, b"Jwt is missing", Some(b"Bearer realm=\"veil\"")),
+        invalid: text_resp(
+            401,
+            b"Jwt verification fails",
+            Some(b"Bearer realm=\"veil\", error=\"invalid_token\""),
+        ),
+        denied: text_resp(403, b"RBAC: access denied", None),
+    })
 }
 
 #[cfg(test)]
@@ -433,6 +609,8 @@ mod tests {
                 )
             }),
             cors: None,
+            #[cfg(feature = "jwt")]
+            jwt: None,
         }
     }
 

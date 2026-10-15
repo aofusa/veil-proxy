@@ -171,12 +171,15 @@ cert_path = "/etc/veil/cert.pem"
 key_path  = "/etc/veil/key.pem"
 client_auth = "require"            # "none"（既定） | "optional" | "require"
 client_ca   = "/etc/veil/client-ca.pem"
+client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # 任意（F-220）
 ```
 
 - `"require"` は証明書を出さないクライアントと、`client_ca` で検証できない証明書のクライアントをハンドシェイクで
   拒否する。`"optional"` は証明書を求めるが、出さないクライアントも受ける（出された証明書は検証する）。
 - TCP の TLS（HTTP/1.1・HTTP/2）に効く。`[http3]` と併用すると QUIC のクライアントが迂回できるので、起動時にエラーにする。
-- 証明書のホットリロードは起動時の `client_auth`・`client_ca` を引き継ぐ。これらの変更には再起動が要る。
+- `client_allowed_sans` は一覧の SAN（DNS 名・URI・IP）のどれかを持つ証明書だけを受ける。ハンドシェイクで 1 回だけ照合し、
+  同じ CA が発行した別の ID は拒否する。`client_auth = "optional"` か `"require"` が要る。
+- 証明書のホットリロードは起動時の `client_auth`・`client_ca`・`client_allowed_sans` を引き継ぐ。これらの変更には再起動が要る。
 
 ### 上流へクライアント証明書を出す
 

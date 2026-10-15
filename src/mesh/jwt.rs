@@ -131,19 +131,7 @@ pub mod jwt_requirement {
 // モデル
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub enum Key {
-    Rsa { n: Vec<u8>, e: Vec<u8> },
-    Ec256(Vec<u8>),
-    Ec384(Vec<u8>),
-}
-
-#[derive(Debug)]
-pub struct Jwk {
-    pub kid: Option<String>,
-    pub alg: Option<String>,
-    pub key: Key,
-}
+pub use crate::jwt_verify::{Jwk, Key};
 
 #[derive(Debug)]
 pub struct Provider {
@@ -184,37 +172,7 @@ fn b64url(s: &str) -> Option<Vec<u8>> {
 }
 
 fn parse_jwks(text: &str) -> Vec<Jwk> {
-    let v: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let keys = v.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
-    keys.iter()
-        .filter_map(|k| {
-            let kid = k.get("kid").and_then(|x| x.as_str()).map(|s| s.to_string());
-            let alg = k.get("alg").and_then(|x| x.as_str()).map(|s| s.to_string());
-            let key = match k.get("kty")?.as_str()? {
-                "RSA" => Key::Rsa {
-                    n: b64url(k.get("n")?.as_str()?)?,
-                    e: b64url(k.get("e")?.as_str()?)?,
-                },
-                "EC" => {
-                    let x = b64url(k.get("x")?.as_str()?)?;
-                    let y = b64url(k.get("y")?.as_str()?)?;
-                    let mut pt = vec![4u8];
-                    pt.extend_from_slice(&x);
-                    pt.extend_from_slice(&y);
-                    match k.get("crv")?.as_str()? {
-                        "P-256" => Key::Ec256(pt),
-                        "P-384" => Key::Ec384(pt),
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            };
-            Some(Jwk { kid, alg, key })
-        })
-        .collect()
+    crate::jwt_verify::parse_jwks(text)
 }
 
 fn requirement(r: &JwtRequirement) -> Result<Requirement, String> {
@@ -353,29 +311,7 @@ fn token_from(prov: &Provider, header: &dyn Fn(&str) -> Option<Bytes>, query: &[
 }
 
 fn verify_sig(alg: &str, key: &Key, msg: &[u8], sig: &[u8]) -> bool {
-    use aws_lc_rs::signature as s;
-    match (alg, key) {
-        ("RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512", Key::Rsa { n, e }) => {
-            let params: &s::RsaParameters = match alg {
-                "RS256" => &s::RSA_PKCS1_2048_8192_SHA256,
-                "RS384" => &s::RSA_PKCS1_2048_8192_SHA384,
-                "RS512" => &s::RSA_PKCS1_2048_8192_SHA512,
-                "PS256" => &s::RSA_PSS_2048_8192_SHA256,
-                "PS384" => &s::RSA_PSS_2048_8192_SHA384,
-                _ => &s::RSA_PSS_2048_8192_SHA512,
-            };
-            s::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() }
-                .verify(params, msg, sig)
-                .is_ok()
-        }
-        ("ES256", Key::Ec256(pt)) => s::UnparsedPublicKey::new(&s::ECDSA_P256_SHA256_FIXED, pt)
-            .verify(msg, sig)
-            .is_ok(),
-        ("ES384", Key::Ec384(pt)) => s::UnparsedPublicKey::new(&s::ECDSA_P384_SHA384_FIXED, pt)
-            .verify(msg, sig)
-            .is_ok(),
-        _ => false,
-    }
+    crate::jwt_verify::verify_sig(alg, key, msg, sig)
 }
 
 /// トークンを検証して payload を返す。

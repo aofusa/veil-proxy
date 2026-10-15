@@ -3012,6 +3012,9 @@ pub struct Route {
     /// ルート単位のトラフィック制御（重み付き分割・フォルトの中断・CORS のプリフライト。F-219）
     #[serde(default)]
     pub traffic: Option<crate::route_traffic::TrafficConfig>,
+    /// JWT の検証と claim の条件（F-220。`jwt` feature）
+    #[serde(default)]
+    pub jwt: Option<crate::route_traffic::JwtConfig>,
     /// 設定ロード時に解決済みの `traffic`（F-219。無ければ `None` でホットパスは分岐 1 個だけ）
     #[serde(skip)]
     pub resolved_traffic: Option<Arc<crate::route_traffic::TrafficPolicy>>,
@@ -3984,6 +3987,10 @@ pub struct TlsConfigSection {
     /// クライアント証明書の信頼アンカー（PEM、`client_auth` が `none` 以外のとき必須。F-217）。
     #[serde(default)]
     pub client_ca: String,
+    /// 受けるクライアント証明書の SAN（DNS 名・URI・IP のどれかが一致すれば受ける。空なら `client_ca` が
+    /// 発行したもの全部）。ハンドシェイクで 1 回だけ照合する（F-220 の ID による認可）。
+    #[serde(default)]
+    pub client_allowed_sans: Vec<String>,
 }
 
 /// クライアント証明書の要求（`[tls] client_auth`、F-217）。
@@ -6054,6 +6061,13 @@ fn validate_listeners(config: &Config) -> io::Result<()> {
 fn validate_config(config: &Config) -> io::Result<()> {
     validate_listeners(config)?;
 
+    // F-220: SAN の許可リストはクライアント証明書を要求するときだけ意味がある（黙って無視しない）
+    if !config.tls.client_allowed_sans.is_empty() && config.tls.client_auth == ClientAuthMode::None {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "[tls] client_allowed_sans requires client_auth = \"optional\" or \"require\"",
+        ));
+    }
     // F-217: クライアント証明書は TCP の TLS（HTTP/1.1・HTTP/2）だけ。HTTP/3 を併用すると mTLS を迂回できるので拒否する
     if config.tls.client_auth != ClientAuthMode::None {
         if config.tls.client_ca.is_empty() {
@@ -6491,6 +6505,7 @@ pub fn build_server_config_from_paths(
         // 起動時の設定が `TLS_CLIENT_AUTH` に記録済みなら、そちらが使われる。
         client_auth: ClientAuthMode::None,
         client_ca: String::new(),
+        client_allowed_sans: Vec::new(),
     };
     load_tls_config(&section, ktls_enabled, http2_enabled)
         .map_err(|e| anyhow::anyhow!("TLS reload build failed: {}", e))
@@ -6663,7 +6678,7 @@ fn load_tls_config(
 }
 
 /// 起動時の `[tls] client_auth`・`client_ca`（証明書のリロードでも同じものを使う。F-217）。
-static TLS_CLIENT_AUTH: once_cell::sync::OnceCell<(ClientAuthMode, String)> =
+static TLS_CLIENT_AUTH: once_cell::sync::OnceCell<(ClientAuthMode, String, Vec<String>)> =
     once_cell::sync::OnceCell::new();
 
 /// クライアント証明書の検証器（`client_auth = "none"` なら `None`）。
@@ -6671,8 +6686,14 @@ fn client_cert_verifier(
     tls_config: &TlsConfigSection,
     provider: Arc<rustls::crypto::CryptoProvider>,
 ) -> io::Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>> {
-    let (mode, ca) = TLS_CLIENT_AUTH
-        .get_or_init(|| (tls_config.client_auth, tls_config.client_ca.clone()))
+    let (mode, ca, allowed) = TLS_CLIENT_AUTH
+        .get_or_init(|| {
+            (
+                tls_config.client_auth,
+                tls_config.client_ca.clone(),
+                tls_config.client_allowed_sans.clone(),
+            )
+        })
         .clone();
     if mode == ClientAuthMode::None {
         return Ok(None);
@@ -6708,8 +6729,85 @@ fn client_cert_verifier(
     let v = b
         .build()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e)))?;
-    info!("TLS client certificates: {:?} (CA {})", mode, ca);
-    Ok(Some(v))
+    info!(
+        "TLS client certificates: {:?} (CA {}, allowed SANs {:?})",
+        mode, ca, allowed
+    );
+    if allowed.is_empty() {
+        return Ok(Some(v));
+    }
+    Ok(Some(Arc::new(ClientSanAllowList { inner: v, allowed })))
+}
+
+/// クライアント証明書の SAN を許可リストで照合する検証器（`[tls] client_allowed_sans`、F-220）。
+/// チェーンの検証は `WebPkiClientVerifier` に任せ、通ったものの SAN だけを見る（ハンドシェイクで 1 回）。
+#[derive(Debug)]
+struct ClientSanAllowList {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    allowed: Vec<String>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for ClientSanAllowList {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let v = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        use crate::x509_san::San;
+        let ok = crate::x509_san::parse_sans(end_entity).iter().any(|s| {
+            self.allowed.iter().any(|a| match s {
+                San::Dns(d) => d.eq_ignore_ascii_case(a),
+                San::Uri(u) => u == a,
+                San::Ip(ip) => ip.to_string() == *a,
+            })
+        });
+        if ok {
+            Ok(v)
+        } else {
+            debug!("TLS client certificate rejected: SAN not in client_allowed_sans");
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 /// 証明書を返さない rustls のサーバ証明書リゾルバ（平文専用サーバ用）。
