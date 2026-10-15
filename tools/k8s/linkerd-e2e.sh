@@ -502,7 +502,8 @@ certs() {
   e1="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
   sleep 75
   e2="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
-  if [ -n "$e1" ] && [ -n "$e2" ] && awk -v a="$e1" -v b="$e2" 'BEGIN{exit !(b > a)}'; then ok "workload certificate renewed ($e1 -> $e2)"; else bad "certificate not renewed: $e1 -> $e2"; fi
+  # 期限が変わり、まだ切れていないこと（最初の証明書は寿命の設定が効く前の 24 時間のものの場合があり、更新後の方が早く切れる）
+  if [ -n "$e1" ] && [ -n "$e2" ] && awk -v a="$e1" -v b="$e2" -v now="$(date +%s)" 'BEGIN{exit !(b != a && b > now)}'; then ok "workload certificate renewed ($e1 -> $e2)"; else bad "certificate not renewed: $e1 -> $e2"; fi
   if retry 30 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 http://whoami/ | grep -q '^L5d-Client-Id: client'"; then ok "mTLS keeps working after the renewal"; else bad "mTLS after renewal"; fi
   linkerd upgrade --set identity.issuer.issuanceLifetime=24h0m0s 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
   kubectl -n linkerd rollout status deploy/linkerd-identity --timeout=300s >/dev/null
