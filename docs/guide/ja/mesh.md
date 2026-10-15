@@ -101,6 +101,7 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 |------|------|
 | `VEIL_MESH_LOG` | メッシュのデータプレーンのログの水準（`trace` … `error`）。Envoy の `-l` と `LINKERD2_PROXY_LOG` より優先 |
 | `VEIL_MESH_KTLS` | `1` でメッシュの mTLS に kTLS を使う（既定は無効。ノードに `tls` モジュールが無いと接続ごとにフォールバックのログが出る） |
+| `VEIL_MESH_XDS_RECORD` | 受け取った Delta ADS の応答を 1 つずつ保存するディレクトリ（`NNNN-<型>.pb`。鍵を含む SDS の応答は保存しない）。istiod の xDS を試験のフィクスチャにするのに使う。ルートのファイルシステムは読み取り専用なので `proxy.istio.io/config: '{"proxyMetadata": {"VEIL_MESH_XDS_RECORD": "/etc/istio/proxy/xds"}}'` で指定する |
 
 ## 違い・制限
 
@@ -119,10 +120,19 @@ kind の上で fortio で測った（`tools/k8s/mesh-bench.sh`。クライアン
 ## 試験
 
 ```bash
-tools/k8s/mesh-e2e.sh    <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|all>   # Istio
-tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|certs|viz|all>                    # Linkerd
-tools/k8s/mesh-bench.sh  [rounds] [duration]                                                   # Istio のサイドカーの性能
+tools/k8s/mesh-e2e.sh    <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|observe|chaos|all>   # Istio
+tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|certs|viz|all>                                  # Linkerd
+tools/k8s/mesh-bench.sh  [rounds] [duration]                                     # Istio のサイドカーの性能
+tools/k8s/linkerd-bench.sh [rounds] [duration]                                   # Linkerd のサイドカーの性能
+tools/k8s/mesh-gateway-conformance.sh <stock|veil>                               # Gateway API の conformance（GATEWAY-HTTP）
+tools/k8s/mesh-fixtures.sh                                                       # istiod の xDS を tests/fixtures/istio/<版>/ に保存
+tools/k8s/mesh-syscalls.sh [image] [connections]                                 # 透過転送の接続あたりの syscall（strace）
+cargo test --test mesh_istio_fixtures --features mesh-istio                      # 保存した xDS の変換（NACK が無い・主な設定）
 ```
+
+`observe` は bookinfo を Prometheus・Kiali・Grafana・Jaeger（Istio の samples/addons）と動かし、Kiali のグラフ（全部の辺に
+mTLS の鍵マーク）、Istio のダッシュボードのパネルの式、4 つのサービスにまたがるトレース、`istioctl analyze`、Pod の起動時間、
+SIGTERM の排出を確かめる。`chaos` は負荷を掛けたまま istiod を再起動・停止し、宛先の Pod を消し、プロキシのプロセスを殺す。
 
 `stock` は同じ試験を本家のプロキシで回す（台本の確認）。`mixed` は一部のワークロードを veil、残りを本家にして両方向の
 通信を通す。kind・kubectl・istioctl・linkerd が要る。

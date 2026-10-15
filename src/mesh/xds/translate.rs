@@ -1254,6 +1254,11 @@ fn forward(ra: &p::RouteAction, reg: &mut Registry) -> R<ForwardAction> {
         .any(|u| u.upgrade_type.eq_ignore_ascii_case("CONNECT") && u.connect_config.is_some());
     Ok(ForwardAction {
         connect_terminate,
+        cluster_not_found: match ra.cluster_not_found_response_code {
+            1 => 404,
+            2 => 500,
+            _ => 503,
+        },
         target,
         timeout: dur_nonzero(&ra.timeout).or_else(|| {
             // Istio は既定で 0s（無制限）を明示する。未指定の Envoy の既定は 15s

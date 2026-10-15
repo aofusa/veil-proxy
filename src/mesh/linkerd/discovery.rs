@@ -797,6 +797,7 @@ fn forward_action(
         .and_then(|t| dur(&t.request).or_else(|| dur(&t.response)))
         .or_else(|| dur(request_timeout));
     Some(ForwardAction {
+        cluster_not_found: 503,
         target,
         timeout,
         idle_timeout: timeouts.and_then(|t| dur(&t.idle)),
@@ -1287,6 +1288,7 @@ fn app_slot(cfg: &Config) -> Arc<ClusterSlot> {
 
 fn app_action(cfg: &Config) -> RouteAction {
     RouteAction::Forward(Arc::new(ForwardAction {
+        cluster_not_found: 503,
         target: ClusterTarget::Single(app_slot(cfg)),
         timeout: None,
         idle_timeout: None,

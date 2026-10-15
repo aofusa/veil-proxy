@@ -805,6 +805,8 @@ pub struct ForwardAction {
     pub websocket: Option<bool>,
     /// CONNECT を終端して中身を内部リスナーへ渡す（HBONE。`upgrade_configs` の `connect_config`）
     pub connect_terminate: bool,
+    /// ルートのクラスタが無いときのステータス（`cluster_not_found_response_code`）
+    pub cluster_not_found: u16,
 }
 
 #[derive(Debug)]

@@ -274,6 +274,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
                 fraction: None,
                 grpc_only: false,
                 action: RouteAction::Forward(Arc::new(ForwardAction {
+                    cluster_not_found: 503,
                     target: ClusterTarget::Single(reg.cluster_slot(cluster)),
                     timeout: None,
                     idle_timeout: None,

@@ -578,7 +578,10 @@ pub fn decide(
                 ClusterTarget::Single(c) => (c.clone(), None),
                 ClusterTarget::Weighted { clusters, total } => {
                     if clusters.is_empty() {
-                        return Decision::Local(LocalReply::new(503, ResponseFlag::NoCluster));
+                        return Decision::Local(LocalReply::new(
+                            fa.cluster_not_found,
+                            ResponseFlag::NoCluster,
+                        ));
                     }
                     let mut r = httpcore::rand_u32() % (*total).max(1);
                     let mut idx = clusters.len() - 1;
@@ -593,7 +596,10 @@ pub fn decide(
                 }
                 ClusterTarget::Header(h) => {
                     let Some(name) = req.header(h) else {
-                        return Decision::Local(LocalReply::new(503, ResponseFlag::NoCluster));
+                        return Decision::Local(LocalReply::new(
+                            fa.cluster_not_found,
+                            ResponseFlag::NoCluster,
+                        ));
                     };
                     let name = String::from_utf8_lossy(&name).into_owned();
                     let slot = super::state::state()
@@ -604,11 +610,22 @@ pub fn decide(
                     match slot {
                         Some(s) => (s, None),
                         None => {
-                            return Decision::Local(LocalReply::new(503, ResponseFlag::NoCluster));
+                            return Decision::Local(LocalReply::new(
+                                fa.cluster_not_found,
+                                ResponseFlag::NoCluster,
+                            ));
                         }
                     }
                 }
             };
+            // クラスタが（まだ・もう）無い。Istio は Gateway API の無効な backendRef をこの形で送る
+            // （既定の 503 は従来どおり上流を選ぶところで返す。Linkerd は解決を待つため）
+            if fa.cluster_not_found != 503 && cluster.cfg.load().is_none() {
+                return Decision::Local(LocalReply::new(
+                    fa.cluster_not_found,
+                    ResponseFlag::NoCluster,
+                ));
+            }
             let hash = hash_of(&fa.hash, req, ctx);
             Decision::Forward(Box::new(Forward {
                 table: table.clone(),

@@ -1025,6 +1025,9 @@ pub struct RouteAction {
     pub upgrade_configs: Vec<UpgradeConfig>,
     #[prost(message, optional, tag = "36")]
     pub max_stream_duration: Option<MaxStreamDuration>,
+    /// クラスタが無いときの応答（0 = 503、1 = 404、2 = 500。Istio は Gateway API の無効な backendRef に 500）
+    #[prost(int32, tag = "20")]
+    pub cluster_not_found_response_code: i32,
     #[prost(oneof = "route_action::HostRewrite", tags = "6, 7")]
     pub host_rewrite: Option<route_action::HostRewrite>,
 }

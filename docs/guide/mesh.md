@@ -108,6 +108,7 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
 |----------|---------|
 | `VEIL_MESH_LOG` | log level of the mesh data plane (`trace` … `error`); overrides Envoy's `-l` and `LINKERD2_PROXY_LOG` |
 | `VEIL_MESH_KTLS` | `1` enables kTLS for mesh mTLS (off by default: nodes without the `tls` module would log a fallback per connection) |
+| `VEIL_MESH_XDS_RECORD` | directory where veil saves every Delta ADS response it receives (`NNNN-<type>.pb`; SDS responses, which carry keys, are not saved). Used to capture istiod's xDS as test fixtures. Set it through `proxy.istio.io/config: '{"proxyMetadata": {"VEIL_MESH_XDS_RECORD": "/etc/istio/proxy/xds"}}'` (the root filesystem is read-only) |
 
 ## Differences and limitations
 
@@ -127,10 +128,20 @@ Measured on kind with fortio (`tools/k8s/mesh-bench.sh`, client and server sidec
 ## Tests
 
 ```bash
-tools/k8s/mesh-e2e.sh    <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|all>   # Istio
-tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|certs|viz|all>                    # Linkerd
-tools/k8s/mesh-bench.sh  [rounds] [duration]                                                   # Istio sidecar benchmark
+tools/k8s/mesh-e2e.sh    <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|observe|chaos|all>   # Istio
+tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|certs|viz|all>                                  # Linkerd
+tools/k8s/mesh-bench.sh  [rounds] [duration]                                     # Istio sidecar benchmark
+tools/k8s/linkerd-bench.sh [rounds] [duration]                                   # Linkerd sidecar benchmark
+tools/k8s/mesh-gateway-conformance.sh <stock|veil>                               # Gateway API conformance (GATEWAY-HTTP)
+tools/k8s/mesh-fixtures.sh                                                       # capture istiod's xDS into tests/fixtures/istio/<version>/
+tools/k8s/mesh-syscalls.sh [image] [connections]                                 # syscalls per intercepted connection (strace)
+cargo test --test mesh_istio_fixtures --features mesh-istio                      # translate the captured xDS (no NACK, key settings)
 ```
+
+`observe` runs bookinfo with Prometheus, Kiali, Grafana and Jaeger (Istio's samples/addons) and checks the Kiali
+graph (every edge with the mTLS lock), the Istio dashboards' panel queries, a trace across all four services,
+`istioctl analyze`, Pod start-up time and SIGTERM draining. `chaos` restarts and stops istiod under load, deletes
+destination Pods and kills the proxy process.
 
 `stock` runs the same checks with the stock proxies (to validate the script), `mixed` makes some workloads veil and
 the rest stock so traffic crosses both ways. They need kind, kubectl, istioctl and linkerd.
