@@ -32,6 +32,15 @@ pub static STATIC_LISTENERS: OnceCell<Vec<Arc<MeshListener>>> = OnceCell::new();
 
 static WORKERS: OnceCell<usize> = OnceCell::new();
 
+/// Linkerd のプロキシとして動く（接続の処理を Linkerd のものにする。F-223）
+#[cfg(feature = "mesh-linkerd")]
+static LINKERD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "mesh-linkerd")]
+pub fn set_linkerd_mode() {
+    LINKERD.store(true, Ordering::Relaxed);
+}
+
 /// ワーカーを起動し、停止まで戻らない。
 pub fn run(workers: usize) {
     let workers = workers.max(1);
@@ -112,7 +121,18 @@ async fn worker(id: usize, workers: usize) {
             ) {
                 Ok(l) => {
                     let stop = Rc::new(Cell::new(false));
-                    crate::runtime::spawn(accept_loop(l, *addr, stop.clone()));
+                    #[cfg(feature = "mesh-linkerd")]
+                    if LINKERD.load(Ordering::Relaxed) {
+                        crate::runtime::spawn(accept_loop(
+                            l,
+                            *addr,
+                            stop.clone(),
+                            super::linkerd::conn::handle,
+                        ));
+                        active.insert(*addr, Active { stop });
+                        continue;
+                    }
+                    crate::runtime::spawn(accept_loop(l, *addr, stop.clone(), handle));
                     active.insert(*addr, Active { stop });
                     ftlog::debug!("[mesh] worker {} listening on {}", id, addr);
                 }
@@ -137,7 +157,15 @@ async fn worker(id: usize, workers: usize) {
     }
 }
 
-async fn accept_loop(l: crate::runtime::TcpListener, addr: SocketAddr, stop: Rc<Cell<bool>>) {
+async fn accept_loop<F, Fut>(
+    l: crate::runtime::TcpListener,
+    addr: SocketAddr,
+    stop: Rc<Cell<bool>>,
+    h: F,
+) where
+    F: Fn(TcpStream, SocketAddr, SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
     let pool = crate::runtime::TaskPool::new();
     loop {
         if stop.get() || crate::config::SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -145,7 +173,7 @@ async fn accept_loop(l: crate::runtime::TcpListener, addr: SocketAddr, stop: Rc<
         }
         match crate::runtime::timeout(Duration::from_secs(1), l.accept()).await {
             Ok(Ok((stream, peer))) => {
-                pool.spawn(handle(stream, peer, addr));
+                pool.spawn(h(stream, peer, addr));
             }
             Ok(Err(e)) => {
                 ftlog::debug!("[mesh] accept on {}: {}", addr, e);
@@ -362,7 +390,7 @@ async fn tls_accept(
     }
 }
 
-async fn plain(stream: TcpStream, initial: Vec<u8>) -> std::io::Result<DownStream> {
+pub(crate) async fn plain(stream: TcpStream, initial: Vec<u8>) -> std::io::Result<DownStream> {
     #[cfg(veil_ktls)]
     {
         crate::ktls_rustls::accept_plain(stream, Some(initial)).await

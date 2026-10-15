@@ -379,6 +379,7 @@ pub fn upstream_tls(ctx: &p::UpstreamTlsContext) -> R<Arc<UpstreamTls>> {
         h1: mk(&h1)?,
         h2: mk(&h2)?,
         mesh_mtls,
+        transport: None,
     }))
 }
 
@@ -878,6 +879,7 @@ fn http_cm(
         trace_sampling,
         access_logs: crate::mesh::accesslog::translate(&hcm.access_log),
         tracer,
+        linkerd: false,
     })
 }
 
@@ -1129,6 +1131,7 @@ fn route(r: &p::Route, reg: &mut Registry) -> R<MeshRoute> {
         ),
         fault: per_filter_fault(&r.typed_per_filter_config)?,
         cors: per_filter_cors(&r.typed_per_filter_config, cors_legacy)?,
+        rbac: None,
     })
 }
 

@@ -292,6 +292,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
                 operation: Bytes::new(),
                 fault: None,
                 cors: None,
+                rbac: None,
             });
         }
         table.vhosts.push(VirtualHost {
@@ -327,6 +328,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
         trace_sampling: 0,
         access_logs: Vec::new(),
         tracer: None,
+        linkerd: false,
     };
     Ok(Some(MeshListener {
         name,

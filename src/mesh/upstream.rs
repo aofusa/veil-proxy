@@ -8,7 +8,9 @@
 use super::httpcore::ResponseFlag;
 use super::model::*;
 use crate::runtime::handle::AsRawFd;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, BufResult, BufferedReadState};
+use crate::runtime::io::{
+    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, BufResult, BufferedReadState,
+};
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::{IoBuf, IoBufMut};
 use std::cell::RefCell;
@@ -200,7 +202,10 @@ pub fn pick(
         }
     };
     let ep = &eps.endpoints[idx];
-    let tls = cfg.tls_for(ep).cloned();
+    let tls = match &ep.tls {
+        Some(t) => Some(t.clone()),
+        None => cfg.tls_for(ep).cloned(),
+    };
     // 内部アドレスで元の宛先がメタデータに無いものは、接続の元の宛先を使う（waypoint の direct チェーン）
     let addr = match (&ep.internal, orig_dst) {
         (Some(_), Some(d)) if ep.addr.port() == 0 => d,
@@ -305,7 +310,17 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
             .await
             .map(UpIo::Plain);
     }
-    let tcp = match super::net::connect(p.addr, p.cfg.bind, p.cfg.connect_timeout).await {
+    // Linkerd の opaque transport: 相手のプロキシの受け口へ ALPN `transport.l5d.io/v1` で張り、
+    // 最初に transport header（本来の宛先のポート）を送る
+    let tagged = match (p.endpoint().and_then(|e| e.tagged_port), &p.tls) {
+        (Some(port), Some(t)) if t.transport.is_some() => Some(port),
+        _ => None,
+    };
+    let dial = match tagged {
+        Some(port) => SocketAddr::new(p.addr.ip(), port),
+        None => p.addr,
+    };
+    let tcp = match super::net::connect(dial, p.cfg.bind, p.cfg.connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
             super::stats::UPSTREAM_CX_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -315,10 +330,11 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
     let Some(tls) = &p.tls else {
         return Ok(UpIo::Plain(tcp));
     };
-    let cfg = match alpn {
-        Alpn::H1 => tls.h1.clone(),
-        Alpn::H2 => tls.h2.clone(),
-        Alpn::Tcp => tls.tcp.clone(),
+    let cfg = match (&tls.transport, tagged, &alpn) {
+        (Some(t), Some(_), _) => t.clone(),
+        (_, _, Alpn::H1) => tls.h1.clone(),
+        (_, _, Alpn::H2) => tls.h2.clone(),
+        (_, _, Alpn::Tcp) => tls.tcp.clone(),
     };
     let name = server_name(&tls.sni, p.addr);
     let hs = async {
@@ -334,6 +350,13 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
         }
     };
     match crate::runtime::timeout(p.cfg.connect_timeout.max(Duration::from_secs(1)), hs).await {
+        Ok(Ok(s)) if tagged.is_some() => {
+            let mut io = UpIo::Tls(Box::new(s));
+            let header = linkerd_transport_header(p.addr.port(), &alpn);
+            let (r, _) = io.write_all(header).await;
+            r?;
+            Ok(io)
+        }
         Ok(Ok(s)) => Ok(UpIo::Tls(Box::new(s))),
         Ok(Err(e)) => {
             super::stats::UPSTREAM_CX_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -344,6 +367,34 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
             "TLS handshake timeout",
         )),
     }
+}
+
+/// Linkerd の transport header（`transport.l5d.io/v1`）。HTTP は中身の版も伝える。
+fn linkerd_transport_header(port: u16, alpn: &Alpn) -> Vec<u8> {
+    // プレフェース + 長さ（u32 BE） + proto（port = 1: int32、session_protocol = 3: {http1 = 1 | http2 = 2}）
+    let mut msg = Vec::with_capacity(16);
+    msg.push(0x08);
+    let mut v = port as u64;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            msg.push(b);
+            break;
+        }
+        msg.push(b | 0x80);
+    }
+    match alpn {
+        Alpn::H1 => msg.extend_from_slice(&[0x1a, 0x02, 0x0a, 0x00]),
+        Alpn::H2 => msg.extend_from_slice(&[0x1a, 0x02, 0x12, 0x00]),
+        Alpn::Tcp => {}
+    }
+    const PREFACE: &[u8] = b"transport.l5d.io/v1\r\n\r\n";
+    let mut out = Vec::with_capacity(PREFACE.len() + 4 + msg.len());
+    out.extend_from_slice(PREFACE);
+    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    out.extend_from_slice(&msg);
+    out
 }
 
 fn server_name(sni: &str, addr: SocketAddr) -> rustls::pki_types::ServerName<'static> {
@@ -467,7 +518,9 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
         return Ok(m);
     }
     let io = connect(p, Alpn::H2).await?;
-    if !negotiated_h2(&io) {
+    // Linkerd のプロキシ同士は ALPN を使わず、HTTP/2 はプリフェースで判別する
+    let linkerd = p.tls.as_ref().is_some_and(|t| t.transport.is_some());
+    if !negotiated_h2(&io) && !linkerd {
         return Err(io::Error::other("upstream did not negotiate h2"));
     }
     let https = matches!(io, UpIo::Tls(_));
@@ -476,6 +529,9 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
         https,
         p.cfg.idle_timeout,
     ));
+    if linkerd {
+        mux.set_keep_host();
+    }
     H2_POOL.with(|pool| pool.borrow_mut().entry(key).or_default().push(mux.clone()));
     Ok(mux)
 }

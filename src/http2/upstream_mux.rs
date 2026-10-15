@@ -181,6 +181,10 @@ struct Shared {
     dead: Cell<bool>,
     /// `:scheme`（TLS 上の h2 なら `https`）。
     https: bool,
+    /// `host` ヘッダを落とさずに送る（Linkerd の HTTP/1.1 → HTTP/2 の昇格。相手のプロキシが HTTP/1.1 に戻すときに
+    /// 使う。メッシュのみ。F-223）
+    #[cfg(feature = "mesh")]
+    keep_host: Cell<bool>,
 }
 
 /// 上流 HTTP/2 接続のハンドル（プールが保持し、`open` でストリームを割り当てる）。
@@ -246,6 +250,8 @@ impl H2Mux {
             notify: Notify::new(),
             dead: Cell::new(false),
             https,
+            #[cfg(feature = "mesh")]
+            keep_host: Cell::new(false),
         });
         crate::runtime::spawn(run_actor(io, sh.clone(), idle_timeout));
         Self { sh }
@@ -260,9 +266,24 @@ impl H2Mux {
         !g.goaway && (g.streams.len() as u32) < g.peer_max_concurrent && g.next_id < STREAM_ID_LIMIT
     }
 
+    /// `host` ヘッダを送るようにする（Linkerd の昇格。F-223）。
+    #[cfg(feature = "mesh")]
+    pub(crate) fn set_keep_host(&self) {
+        self.sh.keep_host.set(true);
+    }
+
     /// 接続が終了しているか（プールから外す）。
     pub(crate) fn is_dead(&self) -> bool {
         self.sh.dead.get()
+    }
+
+    #[inline]
+    fn skip(&self, name: &[u8], value: &[u8]) -> bool {
+        #[cfg(feature = "mesh")]
+        if self.sh.keep_host.get() && name.eq_ignore_ascii_case(b"host") {
+            return false;
+        }
+        skip_request_header(name, value)
     }
 
     /// ストリームを開いて HEADERS を送信キューへ積む。割り当てられなければ `None`。
@@ -289,7 +310,7 @@ impl H2Mux {
         // HTTP/2 はヘッダ名の小文字必須（RFC 9113 §8.2）。既に小文字の名前は借用のまま。
         let mut lowered: Vec<NameSlot<'h>> = Vec::new();
         for (name, value) in headers.clone() {
-            if skip_request_header(name, value) {
+            if self.skip(name, value) {
                 continue;
             }
             if name.iter().any(|b| b.is_ascii_uppercase()) {
@@ -318,7 +339,7 @@ impl H2Mux {
         }
         let mut li = 0usize;
         for (name, value) in headers {
-            if skip_request_header(name, value) {
+            if self.skip(name, value) {
                 continue;
             }
             list.push((lowered[li].as_slice(), value, false));

@@ -164,7 +164,7 @@ pub fn main(args: Vec<String>) -> i32 {
 }
 
 /// SIGTERM・SIGINT で排出してから止める（pilot-agent は先に `/drain_listeners` を呼ぶ）。
-fn spawn_signal_thread(drain: Duration) {
+pub(crate) fn spawn_signal_thread(drain: Duration) {
     use signal_hook::consts::{SIGINT, SIGTERM};
     let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
         Ok(s) => s,

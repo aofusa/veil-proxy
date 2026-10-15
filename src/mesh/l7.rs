@@ -416,6 +416,16 @@ pub fn decide(
         return Decision::Local(LocalReply::new(404, ResponseFlag::NoRoute));
     };
     let route = &vh.routes[ri];
+    // ルート単位の認可（Linkerd の HTTPRoute を対象にした AuthorizationPolicy）
+    if let Some(r) = &route.rbac {
+        if !rbac_allows(ctx, req, r, &jwt.payloads) {
+            let mut lr = LocalReply::new(403, ResponseFlag::RbacDenied);
+            if is_grpc {
+                lr.grpc_status = Some(7);
+            }
+            return Decision::Local(lr);
+        }
+    }
     // CORS（プリフライト）
     let cors = if ctx
         .hcm
@@ -816,6 +826,9 @@ pub fn upstream_request_headers(
             continue;
         } else if kb.eq_ignore_ascii_case(b"x-envoy-attempt-count")
             || kb.eq_ignore_ascii_case(b"expect")
+            || (ctx.hcm.linkerd
+                && (kb.eq_ignore_ascii_case(b"l5d-client-id")
+                    || kb.eq_ignore_ascii_case(b"l5d-orig-proto")))
         {
             continue;
         }
@@ -837,7 +850,18 @@ pub fn upstream_request_headers(
     if !has_req_id && ctx.hcm.generate_request_id {
         out.push((Bytes::from_static(b"x-request-id"), httpcore::uuid_v4()));
     }
-    if !has_xfp {
+    // Linkerd の inbound: mTLS の相手の ID をアプリへ渡す（本家の linkerd2-proxy と同じ）
+    if ctx.hcm.linkerd && ctx.direction == Direction::Inbound {
+        let id = ctx
+            .peer_dns
+            .first()
+            .map(|d| Bytes::from(d.clone()))
+            .or_else(|| ctx.peer_principal.as_ref().map(|p| Bytes::from(p.to_string())));
+        if let Some(id) = id {
+            out.push((Bytes::from_static(b"l5d-client-id"), id));
+        }
+    }
+    if !has_xfp && !ctx.hcm.linkerd {
         out.push((
             Bytes::from_static(b"x-forwarded-proto"),
             Bytes::from_static(if ctx.tls && ctx.direction != Direction::Inbound {
@@ -951,6 +975,16 @@ pub fn downstream_response_headers(
     let mut peer = None;
     let mut peer_md: Option<Bytes> = None;
     let mut peer_md_id: Option<Bytes> = None;
+    if ctx.hcm.linkerd {
+        // Linkerd は応答を書き換えない（outbound で HTTP/2 へ昇格したときの `l5d-orig-proto` だけ外す）
+        if ctx.direction != Direction::Inbound {
+            resp.retain(|(k, _)| !k.eq_ignore_ascii_case(b"l5d-orig-proto"));
+        }
+        if let Some(f) = f {
+            f.route().response_ops.apply(resp);
+        }
+        return None;
+    }
     resp.retain(|(k, v)| {
         if k.eq_ignore_ascii_case(super::peer::HDR_METADATA) {
             peer_md = Some(v.clone());

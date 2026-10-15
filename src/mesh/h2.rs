@@ -155,10 +155,17 @@ async fn local(
     notify: &Notify,
     lr: &LocalReply,
     is_grpc: bool,
-    server: &Bytes,
+    hcm: &super::model::HttpCm,
 ) {
     let mut headers = lr.headers.clone();
-    headers.push((Bytes::from_static(b"server"), server.clone()));
+    if hcm.linkerd {
+        headers.push((
+            Bytes::from_static(b"l5d-proxy-error"),
+            Bytes::from_static(super::httpcore::reason(lr.status).as_bytes()),
+        ));
+    } else {
+        headers.push((Bytes::from_static(b"server"), hcm.server_name.clone()));
+    }
     if is_grpc && lr.grpc_status.is_some() {
         headers.push((
             Bytes::from_static(b"content-type"),
@@ -270,7 +277,7 @@ async fn task(
     };
     match decision {
         Decision::Local(lr) => {
-            local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+            local(tx, notify, &lr, is_grpc, &c.hcm).await;
             let labels = c.labels(None, None, is_grpc);
             super::stats::record_request(
                 &labels,
@@ -425,14 +432,19 @@ async fn forward(
                 if is_grpc {
                     lr.grpc_status = Some(14);
                 }
-                local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                local(tx, notify, &lr, is_grpc, &c.hcm).await;
                 return out;
             }
         };
         out.upstream = Some(picked.addr);
         out.cluster = Some(picked.cfg.clone());
         let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
-        let up_h2 = l7::upstream_is_h2(&picked.cfg, true);
+        // Linkerd の inbound: 相手のプロキシが HTTP/1.1 から昇格させた要求（`l5d-orig-proto`）はアプリへ HTTP/1.1 で
+        let up_h2 = l7::upstream_is_h2(&picked.cfg, true)
+            && !(c.hcm.linkerd
+                && headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(b"l5d-orig-proto")));
         let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
             Ok(a) => a,
             Err(flag) => {
@@ -442,7 +454,7 @@ async fn forward(
                 if is_grpc {
                     lr.grpc_status = Some(14);
                 }
-                local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                local(tx, notify, &lr, is_grpc, &c.hcm).await;
                 return out;
             }
         };
@@ -491,7 +503,7 @@ async fn forward(
                 if is_grpc {
                     lr.grpc_status = Some(14);
                 }
-                local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                local(tx, notify, &lr, is_grpc, &c.hcm).await;
                 return out;
             }
         };
@@ -515,7 +527,7 @@ async fn forward(
                 notify,
                 &LocalReply::new(503, out.flag),
                 is_grpc,
-                &c.hcm.server_name,
+                &c.hcm,
             )
             .await;
             return out;
@@ -541,7 +553,7 @@ async fn forward(
                 if is_grpc {
                     lr.grpc_status = Some(4);
                 }
-                local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                local(tx, notify, &lr, is_grpc, &c.hcm).await;
                 picked.end(false, true);
                 return out;
             }
@@ -670,7 +682,7 @@ async fn forward(
                         if is_grpc {
                             lr.grpc_status = Some(14);
                         }
-                        local(tx, notify, &lr, is_grpc, &c.hcm.server_name).await;
+                        local(tx, notify, &lr, is_grpc, &c.hcm).await;
                     } else {
                         out.flag = ResponseFlag::UpstreamConnectionTermination;
                         send(tx, notify, H2RespMsg::Reset(0x2)).await;
@@ -686,7 +698,7 @@ async fn forward(
                             notify,
                             &LocalReply::new(503, out.flag),
                             is_grpc,
-                            &c.hcm.server_name,
+                            &c.hcm,
                         )
                         .await;
                     }
@@ -736,7 +748,7 @@ async fn to_h1(
                     notify,
                     &LocalReply::new(503, out.flag),
                     is_grpc,
-                    &c.hcm.server_name,
+                    &c.hcm,
                 )
                 .await;
                 return out;
@@ -811,7 +823,7 @@ async fn to_h1(
             notify,
             &LocalReply::new(503, out.flag),
             is_grpc,
-            &c.hcm.server_name,
+            &c.hcm,
         )
         .await;
         return out;
@@ -835,7 +847,7 @@ async fn to_h1(
                     notify,
                     &LocalReply::new(503, out.flag),
                     is_grpc,
-                    &c.hcm.server_name,
+                    &c.hcm,
                 )
                 .await;
                 return out;
@@ -852,7 +864,7 @@ async fn to_h1(
             notify,
             &LocalReply::new(502, ResponseFlag::None),
             is_grpc,
-            &c.hcm.server_name,
+            &c.hcm,
         )
         .await;
         return out;
@@ -893,6 +905,13 @@ async fn to_h1(
     out.upstream_ms = Some(ums);
     f.response_filters(status, &mut headers).await;
     let peer_resp = l7::downstream_response_headers(c, Some(f), &mut headers, Some(ums), origin);
+    // Linkerd の inbound で HTTP/1.1 に戻した要求の応答には元の版を付ける（相手のプロキシが外す）
+    if c.hcm.linkerd && c.direction == super::model::Direction::Inbound {
+        headers.push((
+            Bytes::from_static(b"l5d-orig-proto"),
+            Bytes::from_static(b"HTTP/1.1"),
+        ));
+    }
     out.peer = l7::peer_workload(c, peer_req, peer_resp, picked.endpoint());
     out.status = status;
     let no_body = method.as_ref() == b"HEAD" || status == 204 || status == 304 || len == Some(0);

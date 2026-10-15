@@ -454,6 +454,9 @@ pub struct HttpCm {
     pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
     /// 分散トレース（Zipkin。None なら B3 を素通しするだけ）
     pub tracer: Option<Arc<crate::mesh::tracing::TracerCfg>>,
+    /// Linkerd の取り決め（`server`・`x-envoy-*`・`x-forwarded-proto` を付けない、inbound で
+    /// `l5d-client-id`、ローカル応答に `l5d-proxy-error`。F-223）
+    pub linkerd: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,6 +690,8 @@ pub struct MeshRoute {
     pub operation: Bytes,
     pub fault: Option<Arc<FaultCfg>>,
     pub cors: Option<Arc<CorsCfg>>,
+    /// ルート単位の認可（Linkerd の HTTPRoute を対象にした AuthorizationPolicy。F-223）
+    pub rbac: Option<Arc<RbacCfg>>,
 }
 
 impl MeshRoute {
@@ -1094,6 +1099,8 @@ pub struct UpstreamTls {
     pub h2: Arc<rustls::ClientConfig>,
     /// メッシュの mTLS（Istio の ISTIO_MUTUAL。テレメトリの connection_security_policy）
     pub mesh_mtls: bool,
+    /// Linkerd の opaque transport（ALPN `transport.l5d.io/v1`。F-223）
+    pub transport: Option<Arc<rustls::ClientConfig>>,
 }
 
 #[derive(Debug, Default)]
@@ -1119,6 +1126,14 @@ pub struct MeshEndpoint {
     /// 内部アドレス（`envoy_internal_address`）の内部リスナーの名前。`addr` はそのとき元の宛先
     /// （メタデータ `envoy.filters.listener.original_dst.local`）
     pub internal: Option<Arc<str>>,
+    /// エンドポイントごとの TLS（Linkerd の `TlsIdentity`。クラスタの TLS より優先する）
+    pub tls: Option<Arc<UpstreamTls>>,
+    /// HTTP/1.1 の要求を HTTP/2 に昇格して送る（Linkerd の `ProtocolHint.H2`、`l5d-orig-proto`）
+    pub h2_upgrade: bool,
+    /// opaque transport の受け口のポート（Linkerd の `OpaqueTransport.inbound_port`。transport header を送る）
+    pub tagged_port: Option<u16>,
+    /// 観測のラベル（Prometheus の書式で連結済み。Linkerd の `metric_labels`）
+    pub metric_labels: Option<Arc<str>>,
     /// 同時要求数（LEAST_REQUEST）
     pub active: AtomicUsize,
     /// 外れ値検出の状態
@@ -1137,6 +1152,10 @@ impl MeshEndpoint {
             socket_match: Vec::new(),
             workload: Bytes::new(),
             internal: None,
+            tls: None,
+            h2_upgrade: false,
+            tagged_port: None,
+            metric_labels: None,
             active: AtomicUsize::new(0),
             consecutive_5xx: AtomicUsize::new(0),
             ejected_until_ms: AtomicU64::new(0),

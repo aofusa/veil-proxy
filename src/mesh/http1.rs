@@ -345,7 +345,12 @@ async fn write_local<S: AsyncWriteRentExt>(
         }
     }
     put_header(&mut b, b"date", httpdate_now().as_bytes());
-    put_header(&mut b, b"server", &ctx.hcm.server_name);
+    if ctx.hcm.linkerd {
+        // プロキシが作った応答の印（本家の linkerd2-proxy と同じ）
+        put_header(&mut b, b"l5d-proxy-error", httpcore::reason(lr.status).as_bytes());
+    } else {
+        put_header(&mut b, b"server", &ctx.hcm.server_name);
+    }
     if close {
         put_header(&mut b, b"connection", b"close");
     }
@@ -822,7 +827,10 @@ where
         out.upstream = Some(picked.addr);
         out.cluster = Some(picked.cfg.clone());
         let downstream_h2 = false;
-        let up_h2 = l7::upstream_is_h2(&picked.cfg, downstream_h2) && !upgrade;
+        // Linkerd: 相手のプロキシが HTTP/2 を受けられる（ProtocolHint.H2）なら昇格して送る（`l5d-orig-proto`）
+        let up_h2 = (l7::upstream_is_h2(&picked.cfg, downstream_h2)
+            || (ctx.hcm.linkerd && picked.endpoint().is_some_and(|e| e.h2_upgrade)))
+            && !upgrade;
         let _admission = match upstream::admit(&f.cluster, &picked.cfg, up_h2) {
             Ok(a) => a,
             Err(flag) => {
@@ -1142,7 +1150,14 @@ where
     S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
     use crate::http2::upstream_mux::UpResp;
-    let (req_headers, peer_req) = l7::upstream_request_headers(ctx, f, headers, 1, false, false);
+    let (mut req_headers, peer_req) =
+        l7::upstream_request_headers(ctx, f, headers, 1, false, false);
+    if ctx.hcm.linkerd && !matches!(picked.cfg.proto, super::model::UpstreamProto::Http2) {
+        req_headers.push((
+            Bytes::from_static(b"l5d-orig-proto"),
+            Bytes::from_static(b"HTTP/1.1"),
+        ));
+    }
     let host = f
         .action
         .host_rewrite
