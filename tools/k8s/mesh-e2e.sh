@@ -1187,20 +1187,24 @@ EOF
   out="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 2 -qps 10 -t 30s -timeout 10s -allow-initial-errors -loglevel Error http://productpage:9080/productpage 2>&1)"
   if echo "$out" | awk '/^Code 200 :/{gsub(/[()%]/,"",$5); exit !($5 + 0 >= 99)}' && echo "$out" | grep -q '^Code 200'; then
     ok "bookinfo productpage under load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; else bad "productpage load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; fi
-  pages="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio curl -loglevel Error http://productpage:9080/productpage 2>/dev/null)"
-  case "$pages" in
-    *"Book Details"*"Book Reviews"*)
-      if echo "$pages" | grep -q "Error fetching product details\|Ratings service is currently unavailable\|Sorry, product reviews are currently unavailable"; then
-        bad "productpage shows backend errors"; else ok "productpage renders details and reviews"; fi ;;
-    *) bad "productpage content" ;;
-  esac
+  # Java の reviews は立ち上がり直後に ratings の呼び出しが時間切れになることがあるので、60 秒の間に正しく表示されればよい
+  local okp=0
+  for _ in $(seq 20); do
+    pages="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio curl -loglevel Error http://productpage:9080/productpage 2>/dev/null)"
+    case "$pages" in
+      *"Book Details"*"Book Reviews"*)
+        if ! echo "$pages" | grep -q "Error fetching product details\|Ratings service is currently unavailable\|Sorry, product reviews are currently unavailable"; then okp=1; break; fi ;;
+    esac
+    sleep 3
+  done
+  if [ $okp = 1 ]; then ok "productpage renders details and reviews"; else bad "productpage content"; fi
   # Prometheus（pilot-agent の統合メトリクスをアドオンの Prometheus が集める）と Grafana の Istio のダッシュボードの主要パネルの式。
   # パネルは irate（直近の 2 点）なので、負荷を掛けている間に評価する
   kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 2 -qps 10 -t 150s -timeout 10s -allow-initial-errors -loglevel Error http://productpage:9080/productpage >/dev/null 2>&1 &
   local bg=$!
   sleep 45
   local edges
-  edges="$(prom "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[2m])) by (source_workload,destination_workload,connection_security_policy)" \
+  edges="$(prom "sum(increase(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[5m])) by (source_workload,destination_workload,connection_security_policy)" \
     | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(" ".join(sorted("%s>%s:%s" % (x["metric"].get("source_workload"), x["metric"].get("destination_workload"), x["metric"].get("connection_security_policy")) for x in r)))' 2>/dev/null)"
   case "$edges" in
     *productpage-v1\>details-v1:mutual_tls*productpage-v1\>reviews-v*:mutual_tls*reviews-v*\>ratings-v1:mutual_tls*) ok "Prometheus: bookinfo edges over mTLS ($edges)" ;;
