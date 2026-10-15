@@ -13,8 +13,8 @@ use crate::runtime::handle::AsRawFd;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, BufferedReadState};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 100;
@@ -36,7 +36,13 @@ enum Framing {
 /// 下流の 1 接続を処理する。
 pub async fn serve<S>(mut io: S, initial: Vec<u8>, mut ctx: Arc<ConnCtx>)
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
+    S: AsyncReadRent
+        + AsyncWriteRentExt
+        + AsRawFd
+        + BufferedReadState
+        + super::tcp::PendingRead
+        + Unpin
+        + 'static,
 {
     let mut acc = BytesMut::from(&initial[..]);
     loop {
@@ -363,7 +369,11 @@ async fn write_local<S: AsyncWriteRentExt>(
     put_header(&mut b, b"date", httpdate_now().as_bytes());
     if ctx.hcm.linkerd {
         // プロキシが作った応答の印（本家の linkerd2-proxy と同じ）
-        put_header(&mut b, b"l5d-proxy-error", httpcore::reason(lr.status).as_bytes());
+        put_header(
+            &mut b,
+            b"l5d-proxy-error",
+            httpcore::reason(lr.status).as_bytes(),
+        );
     } else {
         put_header(&mut b, b"server", &ctx.hcm.server_name);
     }
@@ -711,10 +721,9 @@ async fn read_resp_head(up: &mut UpIo, buf: &mut BytesMut, head_req: bool) -> io
                             framing = Framing::Chunked;
                         }
                     }
-                    b"connection"
-                        if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) => {
-                            keep = false;
-                        }
+                    b"connection" if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) => {
+                        keep = false;
+                    }
                     _ => {}
                 }
                 headers.push((name, value));
@@ -793,7 +802,13 @@ async fn forward<S>(
     origin: Option<&Bytes>,
 ) -> Outcome
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
+    S: AsyncReadRent
+        + AsyncWriteRentExt
+        + AsRawFd
+        + BufferedReadState
+        + super::tcp::PendingRead
+        + Unpin
+        + 'static,
 {
     let svc = f
         .cluster
@@ -866,7 +881,16 @@ where
         };
         if attempt == 1 && !f.action.mirrors.is_empty() {
             if let Some(n) = body_len {
-                super::mirror::spawn_h1(f, ctx, method, up_path, authority, headers, Bytes::copy_from_slice(&acc[..n]), framing == Framing::Chunked);
+                super::mirror::spawn_h1(
+                    f,
+                    ctx,
+                    method,
+                    up_path,
+                    authority,
+                    headers,
+                    Bytes::copy_from_slice(&acc[..n]),
+                    framing == Framing::Chunked,
+                );
             }
         }
         if up_h2 {
@@ -891,8 +915,14 @@ where
                 }
             }
         }
-        let (req_headers, peer_req) =
-            l7::upstream_request_headers(ctx, f, headers, attempt, upgrade, framing == Framing::Chunked);
+        let (req_headers, peer_req) = l7::upstream_request_headers(
+            ctx,
+            f,
+            headers,
+            attempt,
+            upgrade,
+            framing == Framing::Chunked,
+        );
         let host: Bytes = host_rw.clone().unwrap_or_else(|| authority.clone());
         let head = request_head(method, up_path, &req_headers, &host, host_rw.is_some());
         picked.begin();
@@ -1183,7 +1213,13 @@ async fn forward_to_h2<S>(
     again: H2Again<'_>,
 ) -> H2Result
 where
-    S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
+    S: AsyncReadRent
+        + AsyncWriteRentExt
+        + AsRawFd
+        + BufferedReadState
+        + super::tcp::PendingRead
+        + Unpin
+        + 'static,
 {
     use crate::http2::upstream_mux::UpResp;
     let (mut req_headers, peer_req) =
@@ -1313,7 +1349,14 @@ where
                         if let Some(n) = again.body_len.filter(|_| replay) {
                             acc.advance(n.min(acc.len()));
                         }
-                        let _ = write_local(io, &LocalReply::new(504, out.flag), is_grpc, ctx, !keep_alive).await;
+                        let _ = write_local(
+                            io,
+                            &LocalReply::new(504, out.flag),
+                            is_grpc,
+                            ctx,
+                            !keep_alive,
+                        )
+                        .await;
                         out.keep_alive = keep_alive;
                         return H2Result::Done(out);
                     }
@@ -1331,7 +1374,9 @@ where
                 _ => None,
             };
             let again_now = match (&item, again.retry) {
-                (Some(UpResp::Head { status, .. }), Some(r)) => l7::retry_on_status(r, *status, grpc),
+                (Some(UpResp::Head { status, .. }), Some(r)) => {
+                    l7::retry_on_status(r, *status, grpc)
+                }
                 (Some(UpResp::Reset { .. }) | None, Some(r)) => r.on_reset || r.on_refused_stream,
                 _ => false,
             };

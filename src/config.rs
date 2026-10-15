@@ -6062,7 +6062,8 @@ fn validate_config(config: &Config) -> io::Result<()> {
     validate_listeners(config)?;
 
     // F-220: SAN の許可リストはクライアント証明書を要求するときだけ意味がある（黙って無視しない）
-    if !config.tls.client_allowed_sans.is_empty() && config.tls.client_auth == ClientAuthMode::None {
+    if !config.tls.client_allowed_sans.is_empty() && config.tls.client_auth == ClientAuthMode::None
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "[tls] client_allowed_sans requires client_auth = \"optional\" or \"require\"",
@@ -6708,10 +6709,16 @@ fn client_cert_verifier(
     let mut roots = rustls::RootCertStore::empty();
     for c in CertificateDer::pem_reader_iter(BufReader::new(pem.as_slice())) {
         let c = c.map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("[tls] client_ca: {}", e),
+            )
         })?;
         roots.add(c).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("[tls] client_ca: {}", e),
+            )
         })?;
     }
     if roots.is_empty() {
@@ -6726,9 +6733,12 @@ fn client_cert_verifier(
     } else {
         b
     };
-    let v = b
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e)))?;
+    let v = b.build().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("[tls] client_ca: {}", e),
+        )
+    })?;
     info!(
         "TLS client certificates: {:?} (CA {}, allowed SANs {:?})",
         mode, ca, allowed
@@ -7284,8 +7294,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                let mut group =
-                    group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                let mut group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
                 if cfg.tls.is_set() {
                     group = group.with_tls_client(crate::upstream_tls::intern(
                         &cfg.tls,
@@ -7481,8 +7490,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                let mut group =
-                    group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                let mut group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
                 if cfg.tls.is_set() {
                     group = group.with_tls_client(crate::upstream_tls::intern(
                         &cfg.tls,

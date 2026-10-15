@@ -2142,11 +2142,20 @@ mod stack_fmt_tests {
         for insecure in [true, false] {
             assert_eq!(
                 PoolKeyStr::tls(host, port, sni, insecure).as_str(),
-                PoolKeyStr::tls_addr(addr, sni, crate::upstream_tls::TlsProfile::from_insecure(insecure)).as_str()
+                PoolKeyStr::tls_addr(
+                    addr,
+                    sni,
+                    crate::upstream_tls::TlsProfile::from_insecure(insecure)
+                )
+                .as_str()
             );
             assert_eq!(
                 PoolKeyStr::tls_no_sni(host, port, insecure).as_str(),
-                PoolKeyStr::tls_addr_no_sni(addr, crate::upstream_tls::TlsProfile::from_insecure(insecure)).as_str()
+                PoolKeyStr::tls_addr_no_sni(
+                    addr,
+                    crate::upstream_tls::TlsProfile::from_insecure(insecure)
+                )
+                .as_str()
             );
         }
     }

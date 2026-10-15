@@ -12,9 +12,9 @@ use crate::proxy::{H2RequestCtx, H2RespMsg, H2Service};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 use crate::stream_channel::{Notify, Receiver, Sender};
 use bytes::{BufMut, Bytes, BytesMut};
-use std::future::{Future, poll_fn};
-use std::sync::Arc;
+use std::future::{poll_fn, Future};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -120,9 +120,20 @@ async fn connect_terminate(
         .endpoints
         .iter()
         .find_map(|e| e.internal.clone())
-        .and_then(|name| super::state::state().listeners.load().internal.get(&*name).cloned());
+        .and_then(|name| {
+            super::state::state()
+                .listeners
+                .load()
+                .internal
+                .get(&*name)
+                .cloned()
+        });
     let Some(lst) = lst else {
-        ftlog::debug!("[mesh] CONNECT {}: no internal listener behind {}", dst, f.cluster.name);
+        ftlog::debug!(
+            "[mesh] CONNECT {}: no internal listener behind {}",
+            dst,
+            f.cluster.name
+        );
         send(tx, notify, reply(503)).await;
         return;
     };
@@ -465,7 +476,8 @@ async fn forward(
             .filter(|t| t.mesh_mtls && t.transport.is_some())
             .map(|t| Arc::<str>::from(t.sni.as_str()));
         out.cluster = Some(picked.cfg.clone());
-        let (req_headers, peer_req) = l7::upstream_request_headers(c, f, headers, attempt, false, false);
+        let (req_headers, peer_req) =
+            l7::upstream_request_headers(c, f, headers, attempt, false, false);
         // Linkerd の inbound: 相手のプロキシが HTTP/1.1 から昇格させた要求（`l5d-orig-proto`）はアプリへ HTTP/1.1 で
         let up_h2 = l7::upstream_is_h2(&picked.cfg, true)
             && !(c.hcm.linkerd
@@ -486,7 +498,16 @@ async fn forward(
             }
         };
         if attempt == 1 && !f.action.mirrors.is_empty() && req_rx.is_none() {
-            super::mirror::spawn_h1(f, c, &rq.method, path, &authority, headers, first_body.clone(), false);
+            super::mirror::spawn_h1(
+                f,
+                c,
+                &rq.method,
+                path,
+                &authority,
+                headers,
+                first_body.clone(),
+                false,
+            );
         }
         if !up_h2 {
             return to_h1(
@@ -549,14 +570,7 @@ async fn forward(
             }
             out.status = 503;
             out.flag = ResponseFlag::UpstreamConnectFailure;
-            local(
-                tx,
-                notify,
-                &LocalReply::new(503, out.flag),
-                is_grpc,
-                &c.hcm,
-            )
-            .await;
+            local(tx, notify, &LocalReply::new(503, out.flag), is_grpc, &c.hcm).await;
             return out;
         };
         if !first_body.is_empty() {
@@ -723,14 +737,7 @@ async fn forward(
                     if !head_sent {
                         out.status = 503;
                         out.flag = ResponseFlag::UpstreamConnectionTermination;
-                        local(
-                            tx,
-                            notify,
-                            &LocalReply::new(503, out.flag),
-                            is_grpc,
-                            &c.hcm,
-                        )
-                        .await;
+                        local(tx, notify, &LocalReply::new(503, out.flag), is_grpc, &c.hcm).await;
                     }
                     done = true;
                 }
@@ -773,14 +780,7 @@ async fn to_h1(
                 picked.end(false, true);
                 out.status = 503;
                 out.flag = ResponseFlag::UpstreamConnectFailure;
-                local(
-                    tx,
-                    notify,
-                    &LocalReply::new(503, out.flag),
-                    is_grpc,
-                    &c.hcm,
-                )
-                .await;
+                local(tx, notify, &LocalReply::new(503, out.flag), is_grpc, &c.hcm).await;
                 return out;
             }
         },
@@ -849,14 +849,7 @@ async fn to_h1(
         picked.end(false, true);
         out.status = 503;
         out.flag = ResponseFlag::UpstreamConnectionTermination;
-        local(
-            tx,
-            notify,
-            &LocalReply::new(503, out.flag),
-            is_grpc,
-            &c.hcm,
-        )
-        .await;
+        local(tx, notify, &LocalReply::new(503, out.flag), is_grpc, &c.hcm).await;
         return out;
     }
     // 応答
@@ -873,14 +866,7 @@ async fn to_h1(
                 picked.end(false, true);
                 out.status = 503;
                 out.flag = ResponseFlag::UpstreamConnectionTermination;
-                local(
-                    tx,
-                    notify,
-                    &LocalReply::new(503, out.flag),
-                    is_grpc,
-                    &c.hcm,
-                )
-                .await;
+                local(tx, notify, &LocalReply::new(503, out.flag), is_grpc, &c.hcm).await;
                 return out;
             }
         }

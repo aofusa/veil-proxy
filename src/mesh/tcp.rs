@@ -7,8 +7,8 @@
 
 use crate::runtime::handle::AsRawFd;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
-use std::future::Future;
 use std::future::poll_fn;
+use std::future::Future;
 use std::task::Poll;
 use std::time::Duration;
 

@@ -221,7 +221,10 @@ pub async fn call<Q: Message>(t: &CtlTarget, path: &str, req: &Q) -> Result<Call
 
 impl Call {
     /// 次のメッセージ（ストリームが正常に終われば `None`）。`idle` を過ぎても何も来なければエラー。
-    pub async fn next<R: Message + Default>(&mut self, idle: Duration) -> Result<Option<R>, String> {
+    pub async fn next<R: Message + Default>(
+        &mut self,
+        idle: Duration,
+    ) -> Result<Option<R>, String> {
         loop {
             match self.dec.decode_next() {
                 Ok(Some(f)) => {

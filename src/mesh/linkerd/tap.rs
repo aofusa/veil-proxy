@@ -169,36 +169,48 @@ pub fn emit(r: &TapReq<'_>) {
             ip: Some(p::IpAddress::from_ip(r.destination.ip())),
             port: r.destination.port() as u32,
         }),
-        destination_meta: Some(p::EndpointMeta { labels: dst.clone() }),
+        destination_meta: Some(p::EndpointMeta {
+            labels: dst.clone(),
+        }),
         proxy_direction: if r.inbound { 1 } else { 2 },
         http: Some(p::TapHttpEvent { event: Some(http) }),
     };
     let events = [
-        frame(&base(p::tap_http_event::Event::RequestInit(p::TapRequestInit {
-            id: Some(id.clone()),
-            method: Some(method(r.method)),
-            scheme: Some(p::Scheme {
-                r#type: Some(p::scheme::Type::Registered(
-                    if r.scheme.eq_ignore_ascii_case(b"https") { 1 } else { 0 },
-                )),
-            }),
-            authority: String::from_utf8_lossy(r.authority).into_owned(),
-            path: String::from_utf8_lossy(r.path).into_owned(),
-        }))),
-        frame(&base(p::tap_http_event::Event::ResponseInit(p::TapResponseInit {
-            id: Some(id.clone()),
-            since_request_init: Some(dur(r.latency)),
-            http_status: r.status as u32,
-        }))),
-        frame(&base(p::tap_http_event::Event::ResponseEnd(p::TapResponseEnd {
-            id: Some(id),
-            since_request_init: Some(dur(r.latency)),
-            since_response_init: Some(dur(Duration::ZERO)),
-            response_bytes: r.resp_bytes,
-            eos: r.grpc.map(|g| p::TapEos {
-                end: Some(p::tap_eos::End::GrpcStatusCode(g)),
-            }),
-        }))),
+        frame(&base(p::tap_http_event::Event::RequestInit(
+            p::TapRequestInit {
+                id: Some(id.clone()),
+                method: Some(method(r.method)),
+                scheme: Some(p::Scheme {
+                    r#type: Some(p::scheme::Type::Registered(
+                        if r.scheme.eq_ignore_ascii_case(b"https") {
+                            1
+                        } else {
+                            0
+                        },
+                    )),
+                }),
+                authority: String::from_utf8_lossy(r.authority).into_owned(),
+                path: String::from_utf8_lossy(r.path).into_owned(),
+            },
+        ))),
+        frame(&base(p::tap_http_event::Event::ResponseInit(
+            p::TapResponseInit {
+                id: Some(id.clone()),
+                since_request_init: Some(dur(r.latency)),
+                http_status: r.status as u32,
+            },
+        ))),
+        frame(&base(p::tap_http_event::Event::ResponseEnd(
+            p::TapResponseEnd {
+                id: Some(id),
+                since_request_init: Some(dur(r.latency)),
+                since_response_init: Some(dur(Duration::ZERO)),
+                response_bytes: r.resp_bytes,
+                eos: r.grpc.map(|g| p::TapEos {
+                    end: Some(p::tap_eos::End::GrpcStatusCode(g)),
+                }),
+            },
+        ))),
     ];
     for t in taps {
         if t.m.as_ref().is_none_or(|m| matches(m, r, &dst)) {
@@ -256,7 +268,8 @@ pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr
     }
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
     let ip = peer.ip().to_string();
-    let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &TapH2).await;
+    let _ =
+        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &TapH2).await;
 }
 
 struct TapH2;
@@ -330,7 +343,11 @@ async fn observe(ctx: H2RequestCtx, tx: &Sender<H2RespMsg>, notify: &Notify) {
         t.push(tap.clone());
     }
     ACTIVE.fetch_add(1, Ordering::Relaxed);
-    let limit = if req.limit == 0 { u64::MAX } else { req.limit as u64 };
+    let limit = if req.limit == 0 {
+        u64::MAX
+    } else {
+        req.limit as u64
+    };
     let mut sent_reqs = 0u64;
     let mut ok = send(tx, notify, head).await;
     while ok && sent_reqs < limit && !crate::config::SHUTDOWN_FLAG.load(Ordering::Relaxed) {

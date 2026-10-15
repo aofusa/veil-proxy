@@ -11,9 +11,12 @@ use std::net::SocketAddr;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 
-pub const T_FILE: &str = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog";
-pub const T_STDOUT: &str = "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
-pub const T_STDERR: &str = "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
+pub const T_FILE: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog";
+pub const T_STDOUT: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
+pub const T_STDERR: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AccessLogProto {
@@ -169,11 +172,19 @@ pub fn translate(list: &[AccessLogProto]) -> Vec<std::sync::Arc<AccessLogCfg>> {
     for a in list {
         let Some(any) = &a.typed_config else { continue };
         let (path, lf, legacy, legacy_json) = if any.type_url == T_FILE {
-            let Some(f) = p::decode_any::<FileAccessLog>(any, T_FILE) else { continue };
+            let Some(f) = p::decode_any::<FileAccessLog>(any, T_FILE) else {
+                continue;
+            };
             (f.path, f.log_format, f.format, f.json_format)
         } else if any.type_url == T_STDOUT || any.type_url == T_STDERR {
-            let Some(f) = p::decode_any::<StreamAccessLog>(any, &any.type_url) else { continue };
-            let path = if any.type_url == T_STDOUT { "/dev/stdout" } else { "/dev/stderr" };
+            let Some(f) = p::decode_any::<StreamAccessLog>(any, &any.type_url) else {
+                continue;
+            };
+            let path = if any.type_url == T_STDOUT {
+                "/dev/stdout"
+            } else {
+                "/dev/stderr"
+            };
             (path.to_string(), f.log_format, String::new(), None)
         } else {
             ftlog::debug!("[mesh] ignoring access log {}", any.type_url);
@@ -182,7 +193,9 @@ pub fn translate(list: &[AccessLogProto]) -> Vec<std::sync::Arc<AccessLogCfg>> {
         let format = match (lf, legacy_json) {
             (Some(sfs), _) => match (sfs.json_format, sfs.text_format_source, sfs.text_format) {
                 (Some(j), _, _) => json_fields(&j),
-                (None, Some(ds), _) => Format::Text(parse_format(&String::from_utf8_lossy(ds.inline().unwrap_or(b"")))),
+                (None, Some(ds), _) => Format::Text(parse_format(&String::from_utf8_lossy(
+                    ds.inline().unwrap_or(b""),
+                ))),
                 (None, None, t) if !t.is_empty() => Format::Text(parse_format(&t)),
                 _ => Format::Text(parse_format(DEFAULT_FORMAT)),
             },
@@ -226,9 +239,7 @@ pub struct Record<'a> {
 }
 
 fn start_time(t: std::time::SystemTime) -> String {
-    let d = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let dt = time::OffsetDateTime::from_unix_timestamp(d.as_secs() as i64)
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(
@@ -263,7 +274,9 @@ fn render(toks: &[Tok], r: &Record<'_>, out: &mut String) {
                 let _ = write!(out, "{}", r.code);
             }
             Tok::ResponseFlags => out.push_str(r.flags),
-            Tok::ResponseCodeDetails => out.push_str(if r.details.is_empty() { "-" } else { r.details }),
+            Tok::ResponseCodeDetails => {
+                out.push_str(if r.details.is_empty() { "-" } else { r.details })
+            }
             Tok::ConnTermDetails | Tok::UpstreamFailureReason | Tok::Unknown => out.push('-'),
             Tok::BytesReceived => {
                 let _ = write!(out, "{}", r.bytes_received);
@@ -280,7 +293,9 @@ fn render(toks: &[Tok], r: &Record<'_>, out: &mut String) {
                 }
                 None => out.push('-'),
             },
-            Tok::UpstreamCluster => out.push_str(if r.cluster.is_empty() { "-" } else { r.cluster }),
+            Tok::UpstreamCluster => {
+                out.push_str(if r.cluster.is_empty() { "-" } else { r.cluster })
+            }
             Tok::UpstreamLocalAddress => out.push('-'),
             Tok::DownstreamLocalAddress => match r.downstream_local {
                 Some(a) => {
@@ -301,7 +316,11 @@ fn render(toks: &[Tok], r: &Record<'_>, out: &mut String) {
                 None => out.push('-'),
             },
             Tok::RequestedServerName => out.push_str(r.sni.unwrap_or("-")),
-            Tok::RouteName => out.push_str(if r.route_name.is_empty() { "-" } else { r.route_name }),
+            Tok::RouteName => out.push_str(if r.route_name.is_empty() {
+                "-"
+            } else {
+                r.route_name
+            }),
         }
     }
 }
@@ -317,7 +336,9 @@ pub fn format_line(cfg: &AccessLogCfg, r: &Record<'_>) -> String {
                 let mut v = String::new();
                 render(toks, r, &mut v);
                 let val = match v.parse::<i64>() {
-                    Ok(n) if toks.len() == 1 && !matches!(toks[0], Tok::Lit(_)) => serde_json::json!(n),
+                    Ok(n) if toks.len() == 1 && !matches!(toks[0], Tok::Lit(_)) => {
+                        serde_json::json!(n)
+                    }
                     _ if v == "-" => serde_json::Value::Null,
                     _ => serde_json::Value::String(v),
                 };
@@ -344,7 +365,8 @@ fn writer() -> Option<SyncSender<(String, String)>> {
             .name("veil-accesslog".into())
             .spawn(move || {
                 use std::io::Write;
-                let mut files: std::collections::HashMap<String, std::fs::File> = Default::default();
+                let mut files: std::collections::HashMap<String, std::fs::File> =
+                    Default::default();
                 while let Ok((path, line)) = rx.recv() {
                     let r = match path.as_str() {
                         "/dev/stdout" => std::io::stdout().write_all(line.as_bytes()),
@@ -352,7 +374,11 @@ fn writer() -> Option<SyncSender<(String, String)>> {
                         _ => {
                             let f = match files.get_mut(&path) {
                                 Some(f) => f,
-                                None => match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                None => match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&path)
+                                {
                                     Ok(f) => files.entry(path.clone()).or_insert(f),
                                     Err(_) => continue,
                                 },

@@ -2365,8 +2365,7 @@ async fn h2_proxy(
     if target.h2_over_tls() {
         let tls_profile = upstream_group.tls_profile();
         let addr = target.conn_addr();
-        let key =
-            crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
+        let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
         let is_grpc = ctx
             .headers
             .iter()
@@ -3950,8 +3949,7 @@ async fn h2_relay_h2_streaming(
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
     let idle_timeout = Duration::from_secs(security.idle_connection_timeout_secs);
     let opened = if target.use_tls {
-        let key =
-            crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
+        let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
         match http2::upstream_mux::open_https(
             target,
             key.as_str(),
@@ -11434,15 +11432,13 @@ async fn proxy_https_pooled(
         };
         let (mut backend_stream, from_pool) = match pooled {
             Some(stream) => (stream, true),
-            None => {
-                match connect_https_backend_fresh(target, connect_timeout, tls_profile).await {
-                    Ok(stream) => (stream, false),
-                    Err((code, msg)) => {
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
-                        return Some((client_stream, code, 0, true));
-                    }
+            None => match connect_https_backend_fresh(target, connect_timeout, tls_profile).await {
+                Ok(stream) => (stream, false),
+                Err((code, msg)) => {
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
+                    return Some((client_stream, code, 0, true));
                 }
-            }
+            },
         };
 
         // リトライ可能要求の 1 回目は複製を渡し（次の試行のため原本を保持）、それ以外は move する。

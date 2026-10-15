@@ -23,7 +23,9 @@ pub struct MeshWasm {
 
 impl std::fmt::Debug for MeshWasm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeshWasm").field("name", &self.name).finish()
+        f.debug_struct("MeshWasm")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -49,7 +51,9 @@ pub fn load(
     let module = ModuleConfig {
         name: name.to_string(),
         path: path.to_string(),
-        configuration: PluginConfiguration::Raw(String::from_utf8_lossy(&configuration).into_owned()),
+        configuration: PluginConfiguration::Raw(
+            String::from_utf8_lossy(&configuration).into_owned(),
+        ),
         capabilities: capabilities(),
     };
     // Envoy の Wasm にはメモリの上限が無い（C++ SDK の emscripten 製は最小で 16MB を要求する）。
@@ -75,7 +79,11 @@ pub fn load(
 }
 
 /// 要求ヘッダの段。ヘッダ（疑似ヘッダを含む）の変更を `rq` に戻す。プラグインのローカル応答は `Err`。
-pub async fn on_request(w: &MeshWasm, ctx: &ConnCtx, rq: &mut ReqParts<'_>) -> Result<(), LocalReply> {
+pub async fn on_request(
+    w: &MeshWasm,
+    ctx: &ConnCtx,
+    rq: &mut ReqParts<'_>,
+) -> Result<(), LocalReply> {
     let mut hv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rq.headers.len() + 4);
     hv.push((b":method".to_vec(), rq.method.to_vec()));
     hv.push((b":path".to_vec(), rq.path.to_vec()));
@@ -107,7 +115,10 @@ pub async fn on_request(w: &MeshWasm, ctx: &ConnCtx, rq: &mut ReqParts<'_>) -> R
             Ok(())
         }
         FilterResult::Pause => {
-            ftlog::debug!("[mesh] wasm plugin {} paused the request; continuing", w.name);
+            ftlog::debug!(
+                "[mesh] wasm plugin {} paused the request; continuing",
+                w.name
+            );
             Ok(())
         }
         FilterResult::LocalResponse(resp) => Err(local_reply(resp)),

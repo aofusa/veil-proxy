@@ -103,7 +103,10 @@ pub struct TracerCfg {
 }
 
 /// HCM の tracing を変換する（Zipkin のプロバイダが無ければ `None`）。
-pub fn from_full(full: &HcmTracingFull, reg: &mut crate::mesh::state::Registry) -> Option<TracerCfg> {
+pub fn from_full(
+    full: &HcmTracingFull,
+    reg: &mut crate::mesh::state::Registry,
+) -> Option<TracerCfg> {
     let prov = full.provider.as_ref()?;
     let any = prov.typed_config.as_ref()?;
     if any.type_url != T_ZIPKIN {
@@ -119,14 +122,25 @@ pub fn from_full(full: &HcmTracingFull, reg: &mut crate::mesh::state::Registry) 
         return None;
     }
     // uri は "http://host/path" か "/path"
-    let (host, path) = match uri.strip_prefix("http://").or_else(|| uri.strip_prefix("https://")) {
+    let (host, path) = match uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))
+    {
         Some(rest) => match rest.find('/') {
             Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
             None => (rest.to_string(), "/api/v2/spans".to_string()),
         },
         None => (
-            if z.collector_hostname.is_empty() { cluster.clone() } else { z.collector_hostname.clone() },
-            if uri.is_empty() { "/api/v2/spans".to_string() } else { uri },
+            if z.collector_hostname.is_empty() {
+                cluster.clone()
+            } else {
+                z.collector_hostname.clone()
+            },
+            if uri.is_empty() {
+                "/api/v2/spans".to_string()
+            } else {
+                uri
+            },
         ),
     };
     let mut tags = Vec::new();
@@ -135,7 +149,11 @@ pub fn from_full(full: &HcmTracingFull, reg: &mut crate::mesh::state::Registry) 
         if let Some(l) = &t.literal {
             tags.push((t.tag.clone(), l.value.clone()));
         } else if let Some(h) = &t.request_header {
-            header_tags.push((t.tag.clone(), h.name.to_ascii_lowercase(), h.default_value.clone()));
+            header_tags.push((
+                t.tag.clone(),
+                h.name.to_ascii_lowercase(),
+                h.default_value.clone(),
+            ));
         }
     }
     Some(TracerCfg {
@@ -246,8 +264,14 @@ impl Span {
     /// 上流へ伝播する B3 のヘッダ（このスパンを親にする）。
     pub fn upstream_headers(&self) -> [(Bytes, Bytes); 4] {
         [
-            (Bytes::from_static(b"x-b3-traceid"), Bytes::from(self.trace_id())),
-            (Bytes::from_static(b"x-b3-spanid"), Bytes::from(hex16(self.id))),
+            (
+                Bytes::from_static(b"x-b3-traceid"),
+                Bytes::from(self.trace_id()),
+            ),
+            (
+                Bytes::from_static(b"x-b3-spanid"),
+                Bytes::from(hex16(self.id)),
+            ),
             (
                 Bytes::from_static(b"x-b3-parentspanid"),
                 Bytes::from(self.parent.map(hex16).unwrap_or_else(|| hex16(self.id))),
@@ -347,7 +371,12 @@ fn reporter(cfg: &Arc<TracerCfg>) -> Option<SyncSender<String>> {
 
 // 理由付き allow: トレースの送信専用スレッド（データプレーン外）でブロッキングの HTTP を使う
 #[allow(clippy::disallowed_methods)]
-fn report_loop(rx: std::sync::mpsc::Receiver<String>, slot: Arc<ClusterSlot>, host: String, path: String) {
+fn report_loop(
+    rx: std::sync::mpsc::Receiver<String>,
+    slot: Arc<ClusterSlot>,
+    host: String,
+    path: String,
+) {
     use std::io::{Read, Write};
     loop {
         let first = match rx.recv() {
@@ -371,7 +400,9 @@ fn report_loop(rx: std::sync::mpsc::Receiver<String>, slot: Arc<ClusterSlot>, ho
         let Some(ep) = eps.healthy.first().and_then(|&i| eps.endpoints.get(i)) else {
             continue;
         };
-        let Ok(mut s) = std::net::TcpStream::connect_timeout(&ep.addr, std::time::Duration::from_secs(2)) else {
+        let Ok(mut s) =
+            std::net::TcpStream::connect_timeout(&ep.addr, std::time::Duration::from_secs(2))
+        else {
             continue;
         };
         let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
@@ -417,7 +448,10 @@ mod tests {
         assert_eq!(s.parent, Some(0xa2fb4a1d1a96d312));
         assert!(s.sampled);
         let up = s.upstream_headers();
-        assert_eq!(up[0].1, Bytes::from_static(b"463ac35c9f6413ad48485a3953bb6124"));
+        assert_eq!(
+            up[0].1,
+            Bytes::from_static(b"463ac35c9f6413ad48485a3953bb6124")
+        );
         assert_eq!(up[2].1, Bytes::from_static(b"a2fb4a1d1a96d312"));
         // 来た判断が 0 なら送らない
         let h0 = |n: &str| (n == "b3").then(|| Bytes::from_static(b"0"));

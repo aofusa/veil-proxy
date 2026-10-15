@@ -48,7 +48,8 @@ pub fn spawn_h1(
             if k.as_ref() == b"host" || k.starts_with(b":") {
                 continue;
             }
-            if super::httpcore::is_hop_by_hop(k) && !(chunked && k.as_ref() == b"transfer-encoding") {
+            if super::httpcore::is_hop_by_hop(k) && !(chunked && k.as_ref() == b"transfer-encoding")
+            {
                 continue;
             }
             head.put_slice(k);
@@ -61,7 +62,9 @@ pub fn spawn_h1(
         let body = body.clone();
         let slot: Arc<super::model::ClusterSlot> = slot.clone();
         crate::runtime::spawn(async move {
-            let Ok(_a) = upstream::admit(&slot, &picked.cfg, false) else { return };
+            let Ok(_a) = upstream::admit(&slot, &picked.cfg, false) else {
+                return;
+            };
             let fut = async {
                 let mut up = upstream::connect(&picked, Alpn::H1).await.ok()?;
                 up.write_all(head).await.0.ok()?;

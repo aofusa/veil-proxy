@@ -6,8 +6,8 @@ use super::control::{self, CtlTarget};
 use super::env::Config;
 use super::proto as p;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PATH: &str = "/io.linkerd.proxy.identity.Identity/Certify";
@@ -38,10 +38,9 @@ pub async fn run(cfg: Arc<Config>) {
             Ok(expiry) => {
                 backoff = Duration::from_millis(200);
                 READY.store(true, Ordering::Relaxed);
-                let left = expiry
-                    .duration_since(SystemTime::now())
-                    .unwrap_or_default();
-                let wait = (left * 7 / 10).clamp(Duration::from_secs(10), Duration::from_secs(86_400));
+                let left = expiry.duration_since(SystemTime::now()).unwrap_or_default();
+                let wait =
+                    (left * 7 / 10).clamp(Duration::from_secs(10), Duration::from_secs(86_400));
                 ftlog::info!(
                     "[linkerd] certified {} (expires in {}s, refresh in {}s)",
                     cfg.local_name,
@@ -69,7 +68,9 @@ async fn certify(cfg: &Config, t: &CtlTarget) -> Result<SystemTime, String> {
         certificate_signing_request: csr,
     };
     let resp: p::CertifyResponse = control::unary(t, PATH, &req, Duration::from_secs(10)).await?;
-    let exp = resp.valid_until.ok_or("certify response without valid_until")?;
+    let exp = resp
+        .valid_until
+        .ok_or("certify response without valid_until")?;
     let expiry = UNIX_EPOCH + Duration::from_secs(exp.seconds.max(0) as u64);
     if expiry <= SystemTime::now() {
         return Err("certificate already expired".into());

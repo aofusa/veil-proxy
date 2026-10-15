@@ -173,7 +173,10 @@ pub fn ecds_filter(name: &str, any: &p::Any) -> R<HttpFilterCfg> {
 
 #[cfg(feature = "wasm")]
 fn wasm_plugin(name: &str, pc: &p::WasmPluginConfig, fail_closed: bool) -> R<HttpFilterCfg> {
-    let vm = pc.vm_config.as_ref().ok_or("Wasm plugin without vm_config")?;
+    let vm = pc
+        .vm_config
+        .as_ref()
+        .ok_or("Wasm plugin without vm_config")?;
     let path = match vm
         .code
         .as_ref()
@@ -466,7 +469,8 @@ pub fn listener(l: &p::Listener, reg: &mut Registry) -> R<MeshListener> {
     };
     let matcher = match &l.filter_chain_matcher {
         Some(m) => Some(
-            chain_matcher(m, &l.filter_chains).map_err(|e| format!("listener {}: {}", l.name, e))?,
+            chain_matcher(m, &l.filter_chains)
+                .map_err(|e| format!("listener {}: {}", l.name, e))?,
         ),
         None => None,
     };
@@ -521,7 +525,12 @@ fn chain_matcher(m: &p::XdsMatcher, chains: &[p::FilterChain]) -> R<ChainMatcher
         "ServerNameInput" => MatchInput::ServerName,
         "TransportProtocolInput" => MatchInput::TransportProtocol,
         "ApplicationProtocolInput" => MatchInput::ApplicationProtocol,
-        _ => return Err(format!("filter_chain_matcher: unsupported input {}", input_ty)),
+        _ => {
+            return Err(format!(
+                "filter_chain_matcher: unsupported input {}",
+                input_ty
+            ))
+        }
     };
     let on = |o: &p::XdsOnMatch| on_match(o, chains);
     let map = match &tree.tree_type {
@@ -539,7 +548,10 @@ fn chain_matcher(m: &p::XdsMatcher, chains: &[p::FilterChain]) -> R<ChainMatcher
                 .collect::<R<_>>()?,
         ),
         Some(p::xds_matcher::TreeType::CustomMatch(c)) => {
-            let any = c.typed_config.as_ref().ok_or("custom_match without config")?;
+            let any = c
+                .typed_config
+                .as_ref()
+                .ok_or("custom_match without config")?;
             let ipm: p::XdsIpMatcher = decode_any(any, p::T_IP_MATCHER)
                 .ok_or_else(|| format!("unsupported custom_match {}", any.type_url))?;
             let mut v = Vec::new();
@@ -787,7 +799,9 @@ fn http_cm(
         }
         if ty == crate::mesh::jwt::T_JWT || f.name == "envoy.filters.http.jwt_authn" {
             let any = f.typed_config.as_ref().ok_or("jwt_authn without config")?;
-            filters.push(HttpFilterCfg::Jwt(Arc::new(crate::mesh::jwt::translate(any)?)));
+            filters.push(HttpFilterCfg::Jwt(Arc::new(crate::mesh::jwt::translate(
+                any,
+            )?)));
             continue;
         }
         if ty.contains("filters.http.rbac") || f.name == "envoy.filters.http.rbac" {
@@ -797,10 +811,9 @@ fn http_cm(
         }
         if ty.contains("peer_metadata") || ty.contains("metadataexchange") {
             // ヘッダでの交換（`istio_headers`）だけを扱う。waypoint の workload_discovery だけの設定は観測用
-            peer_metadata |= f
-                .typed_config
-                .as_ref()
-                .is_none_or(|a| !is_typed_struct(a) || typed_struct_json(a).contains("istio_headers"));
+            peer_metadata |= f.typed_config.as_ref().is_none_or(|a| {
+                !is_typed_struct(a) || typed_struct_json(a).contains("istio_headers")
+            });
             continue;
         }
         if ty.contains("set_filter_state") {
@@ -1517,16 +1530,18 @@ mod tests {
             keep_matching: false,
         };
         let by_port = p::XdsMatcher {
-            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(p::XdsMatcherTree {
-                input: Some(tec(
-                    "port",
-                    "envoy.extensions.matching.common_inputs.network.v3.DestinationPortInput",
-                    Vec::new(),
-                )),
-                tree_type: Some(p::xds_matcher::TreeType::ExactMatchMap(p::XdsMatchMap {
-                    map: [("80".to_string(), action("svc-80"))].into_iter().collect(),
-                })),
-            })),
+            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(
+                p::XdsMatcherTree {
+                    input: Some(tec(
+                        "port",
+                        "envoy.extensions.matching.common_inputs.network.v3.DestinationPortInput",
+                        Vec::new(),
+                    )),
+                    tree_type: Some(p::xds_matcher::TreeType::ExactMatchMap(p::XdsMatchMap {
+                        map: [("80".to_string(), action("svc-80"))].into_iter().collect(),
+                    })),
+                },
+            )),
             on_no_match: None,
         };
         let ipm = p::XdsIpMatcher {
@@ -1543,18 +1558,20 @@ mod tests {
             }],
         };
         let m = p::XdsMatcher {
-            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(p::XdsMatcherTree {
-                input: Some(tec(
-                    "ip",
-                    "envoy.extensions.matching.common_inputs.network.v3.DestinationIPInput",
-                    Vec::new(),
-                )),
-                tree_type: Some(p::xds_matcher::TreeType::CustomMatch(tec(
-                    "ip",
-                    "xds.type.matcher.v3.IPMatcher",
-                    ipm.encode_to_vec(),
-                ))),
-            })),
+            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(
+                p::XdsMatcherTree {
+                    input: Some(tec(
+                        "ip",
+                        "envoy.extensions.matching.common_inputs.network.v3.DestinationIPInput",
+                        Vec::new(),
+                    )),
+                    tree_type: Some(p::xds_matcher::TreeType::CustomMatch(tec(
+                        "ip",
+                        "xds.type.matcher.v3.IPMatcher",
+                        ipm.encode_to_vec(),
+                    ))),
+                },
+            )),
             on_no_match: Some(Box::new(action("direct"))),
         };
         let chains = vec![
@@ -1601,16 +1618,18 @@ mod tests {
                     .map(|i| p::LbEndpoint {
                         endpoint: Some(p::Endpoint {
                             address: Some(p::Address {
-                                address: Some(p::address::Address::SocketAddress(p::SocketAddress {
-                                    protocol: 0,
-                                    address: format!(
-                                        "10.{}.{}.{}",
-                                        (svc / 250) % 250,
-                                        svc % 250,
-                                        (i + gen) % 250 + 1
-                                    ),
-                                    port_value: 8080,
-                                })),
+                                address: Some(p::address::Address::SocketAddress(
+                                    p::SocketAddress {
+                                        protocol: 0,
+                                        address: format!(
+                                            "10.{}.{}.{}",
+                                            (svc / 250) % 250,
+                                            svc % 250,
+                                            (i + gen) % 250 + 1
+                                        ),
+                                        port_value: 8080,
+                                    },
+                                )),
                             }),
                             hostname: String::new(),
                         }),
@@ -1724,7 +1743,10 @@ mod tests {
             busy_rate,
             busy_rate / idle_rate.max(1.0) * 100.0
         );
-        assert!(per_update_us < 5_000.0, "one EDS update must stay well below 5 ms");
+        assert!(
+            per_update_us < 5_000.0,
+            "one EDS update must stay well below 5 ms"
+        );
     }
 
     #[test]
@@ -1784,10 +1806,9 @@ mod tests {
         match &r.action {
             RouteAction::Forward(f) => {
                 assert!(f.timeout.is_none(), "Istio の 0s は無制限");
-                assert!(
-                    reg.clusters
-                        .contains_key("outbound|80||whoami.demo.svc.cluster.local")
-                );
+                assert!(reg
+                    .clusters
+                    .contains_key("outbound|80||whoami.demo.svc.cluster.local"));
             }
             _ => panic!(),
         }

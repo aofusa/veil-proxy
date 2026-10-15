@@ -165,7 +165,11 @@ fn esc(out: &mut String, v: &str) {
 }
 
 fn or_unknown(s: &str) -> &str {
-    if s.is_empty() { "unknown" } else { s }
+    if s.is_empty() {
+        "unknown"
+    } else {
+        s
+    }
 }
 
 /// ラベルの文字列（`{` と `}` を除く）を作る（組が初めて現れたときだけ）。

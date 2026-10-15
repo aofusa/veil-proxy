@@ -1159,7 +1159,8 @@ fn write_mtls_pki(dir: &std::path::Path) {
 
     let server_key = KeyPair::generate().unwrap();
     let mut sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    sp.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    sp.subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     sp.subject_alt_names
         .push(SanType::URI("spiffe://test/server".try_into().unwrap()));
     let server = sp.signed_by(&server_key, &issuer).unwrap();
@@ -1312,7 +1313,11 @@ path = "{www}"
     );
     std::fs::write(up_dir.join("config.toml"), up_cfg).unwrap();
     let mut up = VeilProcess::spawn(&up_dir.join("config.toml"), &[], &[]);
-    assert!(wait_for_port(up_port, Duration::from_secs(20)), "{}", up.log());
+    assert!(
+        wait_for_port(up_port, Duration::from_secs(20)),
+        "{}",
+        up.log()
+    );
 
     let no_cert = tls_get_status_line(up_port, "/ok", None);
     assert!(
@@ -1465,7 +1470,11 @@ max_age_secs = 600
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
 
     // 固定応答
     let r = http1_get(port, "/direct").unwrap();
@@ -1536,7 +1545,7 @@ max_age_secs = 600
 #[cfg(all(feature = "jwt", not(any(target_os = "openbsd", target_os = "netbsd"))))]
 fn es256_token(payload: &str) -> (String, String) {
     use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     fn enc(b: &[u8]) -> String {
         const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
@@ -1617,7 +1626,11 @@ require_claims = {{ scope = ["read"] }}
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
 
     let get = |auth: Option<String>| {
         let h: Vec<(&str, String)> = auth.map(|a| vec![("Authorization", a)]).unwrap_or_default();

@@ -867,7 +867,10 @@ pub fn upstream_request_headers(
     }
     if ctx.hcm.use_remote_address {
         let ip = ctx.peer.ip().to_string();
-        match out.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"x-forwarded-for")) {
+        match out
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(b"x-forwarded-for"))
+        {
             Some((_, v)) => {
                 let mut nv = BytesMut::with_capacity(v.len() + ip.len() + 2);
                 nv.extend_from_slice(v);
@@ -887,7 +890,11 @@ pub fn upstream_request_headers(
             .peer_dns
             .first()
             .map(|d| Bytes::from(d.clone()))
-            .or_else(|| ctx.peer_principal.as_ref().map(|p| Bytes::from(p.to_string())));
+            .or_else(|| {
+                ctx.peer_principal
+                    .as_ref()
+                    .map(|p| Bytes::from(p.to_string()))
+            });
         if let Some(id) = id {
             out.push((Bytes::from_static(b"l5d-client-id"), id));
         }
@@ -1025,7 +1032,8 @@ pub fn downstream_response_headers(
             peer_md_id = Some(v.clone());
             return false;
         }
-        !k.eq_ignore_ascii_case(b"server") && !k.eq_ignore_ascii_case(b"x-envoy-upstream-service-time")
+        !k.eq_ignore_ascii_case(b"server")
+            && !k.eq_ignore_ascii_case(b"x-envoy-upstream-service-time")
     });
     if ctx.hcm.peer_metadata {
         match ctx.direction {
@@ -1181,7 +1189,13 @@ pub fn access_log(
 }
 
 /// この hop のスパンを終える（トレースの設定があり、サンプルしたときだけ送る）。
-pub fn finish_span(ctx: &ConnCtx, f: &Forward, req: &ReqView<'_>, status: u16, cluster: Option<&ClusterCfg>) {
+pub fn finish_span(
+    ctx: &ConnCtx,
+    f: &Forward,
+    req: &ReqView<'_>,
+    status: u16,
+    cluster: Option<&ClusterCfg>,
+) {
     let (Some(t), Some(sp)) = (&ctx.hcm.tracer, &f.span) else {
         return;
     };
@@ -1196,11 +1210,19 @@ pub fn finish_span(ctx: &ConnCtx, f: &Forward, req: &ReqView<'_>, status: u16, c
     };
     let url = format!(
         "{}://{}{}",
-        String::from_utf8_lossy(if req.scheme.is_empty() { b"http" } else { req.scheme }),
+        String::from_utf8_lossy(if req.scheme.is_empty() {
+            b"http"
+        } else {
+            req.scheme
+        }),
         String::from_utf8_lossy(req.authority),
         String::from_utf8_lossy(req.path)
     );
-    let kind = if ctx.direction == Direction::Inbound { "SERVER" } else { "CLIENT" };
+    let kind = if ctx.direction == Direction::Inbound {
+        "SERVER"
+    } else {
+        "CLIENT"
+    };
     let header = |n: &str| req.header(n);
     super::tracing::finish(
         t,

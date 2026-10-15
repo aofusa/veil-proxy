@@ -13,7 +13,8 @@ use std::sync::Arc;
 // proto（envoy.extensions.filters.http.jwt_authn.v3）
 // ---------------------------------------------------------------------------
 
-pub const T_JWT: &str = "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication";
+pub const T_JWT: &str =
+    "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication";
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct JwtAuthentication {
@@ -179,9 +180,21 @@ fn requirement(r: &JwtRequirement) -> Result<Requirement, String> {
     use jwt_requirement::Type as T;
     Ok(match &r.r#type {
         Some(T::ProviderName(n)) => Requirement::Provider(n.clone(), Vec::new()),
-        Some(T::ProviderAndAudiences(pa)) => Requirement::Provider(pa.provider_name.clone(), pa.audiences.clone()),
-        Some(T::RequiresAny(l)) => Requirement::Any(l.requirements.iter().map(requirement).collect::<Result<_, _>>()?),
-        Some(T::RequiresAll(l)) => Requirement::All(l.requirements.iter().map(requirement).collect::<Result<_, _>>()?),
+        Some(T::ProviderAndAudiences(pa)) => {
+            Requirement::Provider(pa.provider_name.clone(), pa.audiences.clone())
+        }
+        Some(T::RequiresAny(l)) => Requirement::Any(
+            l.requirements
+                .iter()
+                .map(requirement)
+                .collect::<Result<_, _>>()?,
+        ),
+        Some(T::RequiresAll(l)) => Requirement::All(
+            l.requirements
+                .iter()
+                .map(requirement)
+                .collect::<Result<_, _>>()?,
+        ),
         Some(T::AllowMissingOrFailed(_)) => Requirement::AllowMissingOrFailed,
         Some(T::AllowMissing(_)) => Requirement::AllowMissing,
         None => Requirement::AllowMissingOrFailed,
@@ -194,7 +207,10 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
     let mut providers = HashMap::new();
     for (name, pp) in &ja.providers {
         if pp.remote_jwks.is_some() {
-            return Err(format!("jwt provider {}: remote_jwks is not supported (istiod inlines JWKS)", name));
+            return Err(format!(
+                "jwt provider {}: remote_jwks is not supported (istiod inlines JWKS)",
+                name
+            ));
         }
         let jwks = pp
             .local_jwks
@@ -228,11 +244,20 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
                     .as_ref()
                     .map(|n| n.space_delimited_claims.clone())
                     .unwrap_or_default(),
-                clock_skew: if pp.clock_skew_seconds == 0 { 60 } else { pp.clock_skew_seconds as u64 },
+                clock_skew: if pp.clock_skew_seconds == 0 {
+                    60
+                } else {
+                    pp.clock_skew_seconds as u64
+                },
                 claim_to_headers: pp
                     .claim_to_headers
                     .iter()
-                    .map(|c| (Bytes::from(c.header_name.to_ascii_lowercase()), c.claim_name.clone()))
+                    .map(|c| {
+                        (
+                            Bytes::from(c.header_name.to_ascii_lowercase()),
+                            c.claim_name.clone(),
+                        )
+                    })
                     .collect(),
                 keys: parse_jwks(&jwks),
             }),
@@ -241,9 +266,15 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
     let mut rules = Vec::new();
     for r in &ja.rules {
         let path = match r.r#match.as_ref().and_then(|m| m.path_specifier.as_ref()) {
-            Some(p::route_match::PathSpecifier::Prefix(s)) if s.is_empty() || s == "/" => super::model::PathMatch::Any,
-            Some(p::route_match::PathSpecifier::Prefix(s)) => super::model::PathMatch::Prefix(s.clone()),
-            Some(p::route_match::PathSpecifier::Path(s)) => super::model::PathMatch::Exact(s.clone()),
+            Some(p::route_match::PathSpecifier::Prefix(s)) if s.is_empty() || s == "/" => {
+                super::model::PathMatch::Any
+            }
+            Some(p::route_match::PathSpecifier::Prefix(s)) => {
+                super::model::PathMatch::Prefix(s.clone())
+            }
+            Some(p::route_match::PathSpecifier::Path(s)) => {
+                super::model::PathMatch::Exact(s.clone())
+            }
             Some(p::route_match::PathSpecifier::SafeRegex(re)) => super::model::PathMatch::Regex(
                 regex::Regex::new(&re.regex).map_err(|e| format!("jwt rule regex: {e}"))?,
             ),
@@ -253,7 +284,9 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
             (Some(rq), _) => requirement(rq)?,
             (None, "") => Requirement::AllowMissingOrFailed,
             (None, name) => requirement(
-                ja.requirement_map.get(name).ok_or_else(|| format!("unknown requirement {}", name))?,
+                ja.requirement_map
+                    .get(name)
+                    .ok_or_else(|| format!("unknown requirement {}", name))?,
             )?,
         };
         rules.push((path, req));
@@ -284,7 +317,11 @@ pub struct JwtOutcome {
     pub add_headers: Vec<(Bytes, Bytes)>,
 }
 
-fn token_from(prov: &Provider, header: &dyn Fn(&str) -> Option<Bytes>, query: &[u8]) -> Option<(String, Option<Bytes>)> {
+fn token_from(
+    prov: &Provider,
+    header: &dyn Fn(&str) -> Option<Bytes>,
+    query: &[u8],
+) -> Option<(String, Option<Bytes>)> {
     for (name, prefix) in &prov.from_headers {
         if let Some(v) = header(name) {
             let s = String::from_utf8_lossy(&v).into_owned();
@@ -315,7 +352,12 @@ fn verify_sig(alg: &str, key: &Key, msg: &[u8], sig: &[u8]) -> bool {
 }
 
 /// トークンを検証して payload を返す。
-pub fn verify_token(prov: &Provider, token: &str, audiences: &[String], now: u64) -> Option<serde_json::Value> {
+pub fn verify_token(
+    prov: &Provider,
+    token: &str,
+    audiences: &[String],
+    now: u64,
+) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     let (h, pl, sg) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() {
@@ -338,7 +380,9 @@ pub fn verify_token(prov: &Provider, token: &str, audiences: &[String], now: u64
     if !ok {
         return None;
     }
-    if !prov.issuer.is_empty() && payload.get("iss").and_then(|i| i.as_str()) != Some(prov.issuer.as_str()) {
+    if !prov.issuer.is_empty()
+        && payload.get("iss").and_then(|i| i.as_str()) != Some(prov.issuer.as_str())
+    {
         return None;
     }
     let skew = prov.clock_skew;
@@ -352,11 +396,17 @@ pub fn verify_token(prov: &Provider, token: &str, audiences: &[String], now: u64
             return None;
         }
     }
-    let want: &[String] = if audiences.is_empty() { &prov.audiences } else { audiences };
+    let want: &[String] = if audiences.is_empty() {
+        &prov.audiences
+    } else {
+        audiences
+    };
     if !want.is_empty() {
         let aud_ok = match payload.get("aud") {
             Some(serde_json::Value::String(a)) => want.iter().any(|w| w == a),
-            Some(serde_json::Value::Array(a)) => a.iter().any(|x| x.as_str().is_some_and(|s| want.iter().any(|w| w == s))),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .any(|x| x.as_str().is_some_and(|s| want.iter().any(|w| w == s))),
             _ => false,
         };
         if !aud_ok {
@@ -366,7 +416,10 @@ pub fn verify_token(prov: &Provider, token: &str, audiences: &[String], now: u64
     for c in &prov.space_delimited {
         if let Some(serde_json::Value::String(s)) = payload.get(c).cloned() {
             payload[c] = serde_json::Value::Array(
-                s.split(' ').filter(|x| !x.is_empty()).map(|x| serde_json::Value::String(x.into())).collect(),
+                s.split(' ')
+                    .filter(|x| !x.is_empty())
+                    .map(|x| serde_json::Value::String(x.into()))
+                    .collect(),
             );
         }
     }
@@ -385,12 +438,22 @@ fn eval(
         Requirement::AllowMissingOrFailed => {
             // 検証できるものは検証してメタデータにする（失敗は無視）
             for prov in cfg.providers.values() {
-                let _ = eval(cfg, &Requirement::Provider(prov.name.clone(), Vec::new()), header, query, now, out);
+                let _ = eval(
+                    cfg,
+                    &Requirement::Provider(prov.name.clone(), Vec::new()),
+                    header,
+                    query,
+                    now,
+                    out,
+                );
             }
             Ok(())
         }
         Requirement::AllowMissing => {
-            let any_token = cfg.providers.values().any(|p| token_from(p, header, query).is_some());
+            let any_token = cfg
+                .providers
+                .values()
+                .any(|p| token_from(p, header, query).is_some());
             if any_token {
                 Err(Fail::Invalid)
             } else {
@@ -476,7 +539,10 @@ pub fn authenticate(
 }
 
 /// payload から RBAC のメタデータの値を取り出す（`path` は ["payload", "iss"] のような列）。
-pub fn lookup<'a>(payloads: &'a [(String, serde_json::Value)], path: &[String]) -> Option<&'a serde_json::Value> {
+pub fn lookup<'a>(
+    payloads: &'a [(String, serde_json::Value)],
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
     let (first, rest) = path.split_first()?;
     let mut v = &payloads.iter().find(|(k, _)| k == first)?.1;
     for k in rest {
@@ -538,6 +604,9 @@ mod tests {
         // 改ざん: 401
         let bad = format!("Bearer {}x", TOKEN_GROUP);
         let hb = |n: &str| (n == "authorization").then(|| Bytes::from(bad.clone()));
-        assert_eq!(authenticate(&c, b"GET", b"/", &hb).err(), Some((401, "Jwt verification fails")));
+        assert_eq!(
+            authenticate(&c, b"GET", b"/", &hb).err(),
+            Some((401, "Jwt verification fails"))
+        );
     }
 }

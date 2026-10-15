@@ -86,10 +86,7 @@ static RESOLVED: Lazy<Mutex<std::collections::HashSet<String>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
 fn resolved(name: &str) -> bool {
-    RESOLVED
-        .lock()
-        .map(|r| r.contains(name))
-        .unwrap_or(true)
+    RESOLVED.lock().map(|r| r.contains(name)).unwrap_or(true)
 }
 
 fn mark_resolved(name: &str) {
@@ -202,7 +199,12 @@ pub fn current_hcm(direction: Direction, dst: SocketAddr) -> Option<Arc<HttpCm>>
             .get(&dst.port())
             .and_then(|t| t.cfg.load_full())
             .map(|c| c.hcm.clone()),
-        _ => match OUT.load().get(&dst).and_then(|t| t.cfg.load_full()).as_deref() {
+        _ => match OUT
+            .load()
+            .get(&dst)
+            .and_then(|t| t.cfg.load_full())
+            .as_deref()
+        {
             Some(OutCfg::Http { hcm, .. }) => Some(hcm.clone()),
             _ => None,
         },
@@ -275,7 +277,8 @@ pub async fn watch_outbound(cfg: Arc<Config>, dst: SocketAddr) {
         }
         // 届かないうちは素通しにして待たせない
         if t.cfg.load().is_none() {
-            t.cfg.store(Some(Arc::new(OutCfg::Opaque(forward_tcp(&cfg, dst)))));
+            t.cfg
+                .store(Some(Arc::new(OutCfg::Opaque(forward_tcp(&cfg, dst)))));
         }
         crate::runtime::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -417,8 +420,13 @@ fn tls_for(identity: &str, sni: &str) -> Option<Arc<UpstreamTls>> {
     }
     let san = vec![StringMatcher::exact(identity)];
     let mk = |alpn: &[&[u8]]| {
-        crate::mesh::identity::client_config(Some(super::CERT), Some(super::ROOTS), san.clone(), alpn)
-            .ok()
+        crate::mesh::identity::client_config(
+            Some(super::CERT),
+            Some(super::ROOTS),
+            san.clone(),
+            alpn,
+        )
+        .ok()
     };
     let plain = mk(&[])?;
     let t = Arc::new(UpstreamTls {
@@ -463,7 +471,8 @@ fn endpoint(wa: &p::WeightedAddr, set_labels: &HashMap<String, String>) -> Optio
                 .filter(|p| *p != 0);
         }
     }
-    let mut labels: Vec<(&String, &String)> = set_labels.iter().chain(wa.metric_labels.iter()).collect();
+    let mut labels: Vec<(&String, &String)> =
+        set_labels.iter().chain(wa.metric_labels.iter()).collect();
     labels.sort();
     labels.dedup_by(|a, b| a.0 == b.0);
     if !labels.is_empty() {
@@ -504,7 +513,11 @@ fn backend_cfg(cfg: &Config, name: &str, outlier: Option<OutlierCfg>) -> Cluster
 }
 
 /// バックエンドのクラスタ（`Destination.Get` を購読する。forward は宛先 1 つ）。
-fn backend_slot(cfg: &Arc<Config>, b: &p::Backend, outlier: Option<OutlierCfg>) -> Option<Arc<ClusterSlot>> {
+fn backend_slot(
+    cfg: &Arc<Config>,
+    b: &p::Backend,
+    outlier: Option<OutlierCfg>,
+) -> Option<Arc<ClusterSlot>> {
     let (key, path, forward) = match &b.kind {
         Some(p::backend::Kind::Balancer(bal)) => {
             let path = bal.discovery.as_ref()?.dst.as_ref()?.path.clone();
@@ -632,7 +645,10 @@ fn header_ops(m: &p::HeaderModifier) -> HeaderOps {
     for n in &m.remove {
         ops.remove.push(Bytes::from(n.to_ascii_lowercase()));
     }
-    for (hs, action) in [(&m.set, AppendAction::Overwrite), (&m.add, AppendAction::Append)] {
+    for (hs, action) in [
+        (&m.set, AppendAction::Overwrite),
+        (&m.add, AppendAction::Append),
+    ] {
         if let Some(hs) = hs {
             for h in &hs.headers {
                 ops.add.push(HeaderAdd {
@@ -660,7 +676,9 @@ fn regex(re: &str) -> Result<regex::Regex, String> {
 }
 
 /// HTTPRoute の一致を [`MeshRoute`] の条件にする（パス・メソッド・ヘッダ・クエリ）。
-fn route_match(m: Option<&p::HttpRouteMatch>) -> Result<(PathMatch, Vec<HeaderMatch>, Vec<QueryMatch>), String> {
+fn route_match(
+    m: Option<&p::HttpRouteMatch>,
+) -> Result<(PathMatch, Vec<HeaderMatch>, Vec<QueryMatch>), String> {
     let Some(m) = m else {
         return Ok((PathMatch::Any, Vec::new(), Vec::new()));
     };
@@ -668,7 +686,9 @@ fn route_match(m: Option<&p::HttpRouteMatch>) -> Result<(PathMatch, Vec<HeaderMa
         Some(p::path_match::Kind::Exact(s)) => PathMatch::Exact(s.clone()),
         Some(p::path_match::Kind::Prefix(s)) if s.is_empty() || s == "/" => PathMatch::Any,
         // Gateway API の PathPrefix は区切り単位（`/a` は `/a`・`/a/..`）
-        Some(p::path_match::Kind::Prefix(s)) => PathMatch::Separated(s.trim_end_matches('/').to_string()),
+        Some(p::path_match::Kind::Prefix(s)) => {
+            PathMatch::Separated(s.trim_end_matches('/').to_string())
+        }
         Some(p::path_match::Kind::Regex(r)) => PathMatch::Regex(regex(r)?),
         None => PathMatch::Any,
     };
@@ -796,7 +816,12 @@ fn http_retry(r: &p::HttpRetry) -> Option<Arc<RetryPolicy>> {
         return None;
     }
     let mut codes = Vec::new();
-    for sr in r.conditions.as_ref().map(|c| c.status_ranges.as_slice()).unwrap_or(&[]) {
+    for sr in r
+        .conditions
+        .as_ref()
+        .map(|c| c.status_ranges.as_slice())
+        .unwrap_or(&[])
+    {
         let end = if sr.end == 0 { sr.start } else { sr.end };
         for c in sr.start..=end.min(599) {
             codes.push(c as u16);
@@ -867,7 +892,10 @@ fn apply_http_filters(r: &mut MeshRoute, filters: &[p::HttpFilter]) {
             Some(p::http_filter::Kind::FailureInjector(fi)) => {
                 r.fault = Some(Arc::new(FaultCfg {
                     delay: None,
-                    abort_http: Some((fi.status.clamp(100, 599) as u16, ratio_per_million(&fi.ratio))),
+                    abort_http: Some((
+                        fi.status.clamp(100, 599) as u16,
+                        ratio_per_million(&fi.ratio),
+                    )),
                     abort_grpc: None,
                     headers: Vec::new(),
                 }));
@@ -891,7 +919,11 @@ fn apply_http_filters(r: &mut MeshRoute, filters: &[p::HttpFilter]) {
                         _ => None,
                     },
                     strip_query: false,
-                    status: if rd.status == 0 { 302 } else { rd.status as u16 },
+                    status: if rd.status == 0 {
+                        302
+                    } else {
+                        rd.status as u16
+                    },
                 }));
             }
             None => {}
@@ -917,7 +949,12 @@ fn route_table(name: &str, mut routes: Vec<MeshRoute>) -> RouteTable {
 }
 
 /// Linkerd の HTTP の接続管理（Envoy 固有のヘッダを付けない）。
-pub fn http_cm(name: &str, table: RouteTable, direction: Direction, filters: Vec<HttpFilterCfg>) -> HttpCm {
+pub fn http_cm(
+    name: &str,
+    table: RouteTable,
+    direction: Direction,
+    filters: Vec<HttpFilterCfg>,
+) -> HttpCm {
     HttpCm {
         stat_prefix: name.to_string(),
         routes: RouteRef::Inline(Arc::new(table)),
@@ -954,7 +991,12 @@ fn outbound_http(
         for rule in &r.rules {
             let clusters = distribution(cfg, rule.backends.as_ref(), out.clone());
             let retry = rule.retry.as_ref().and_then(http_retry);
-            let action = match forward_action(clusters, rule.timeouts.as_ref(), &rule.request_timeout, retry) {
+            let action = match forward_action(
+                clusters,
+                rule.timeouts.as_ref(),
+                &rule.request_timeout,
+                retry,
+            ) {
                 Some(fa) => RouteAction::Forward(Arc::new(fa)),
                 None => RouteAction::Direct {
                     status: 500,
@@ -985,7 +1027,11 @@ fn outbound_http(
     )))
 }
 
-fn outbound_grpc(cfg: &Arc<Config>, dst: SocketAddr, g: &p::OutboundGrpc) -> Result<Arc<HttpCm>, String> {
+fn outbound_grpc(
+    cfg: &Arc<Config>,
+    dst: SocketAddr,
+    g: &p::OutboundGrpc,
+) -> Result<Arc<HttpCm>, String> {
     let out = outlier(g.failure_accrual.as_ref());
     let mut routes = Vec::new();
     for r in &g.routes {
@@ -993,7 +1039,12 @@ fn outbound_grpc(cfg: &Arc<Config>, dst: SocketAddr, g: &p::OutboundGrpc) -> Res
         for rule in &r.rules {
             let clusters = distribution(cfg, rule.backends.as_ref(), out.clone());
             let retry = rule.retry.as_ref().and_then(grpc_retry);
-            let action = match forward_action(clusters, rule.timeouts.as_ref(), &rule.request_timeout, retry) {
+            let action = match forward_action(
+                clusters,
+                rule.timeouts.as_ref(),
+                &rule.request_timeout,
+                retry,
+            ) {
                 Some(fa) => RouteAction::Forward(Arc::new(fa)),
                 None => RouteAction::Direct {
                     status: 500,
@@ -1027,13 +1078,17 @@ fn grpc_match(mr: &mut MeshRoute, m: &p::GrpcRouteMatch) -> Result<(), String> {
         mr.path = match (rpc.service.is_empty(), rpc.method.is_empty()) {
             (false, false) => PathMatch::Exact(format!("/{}/{}", rpc.service, rpc.method)),
             (false, true) => PathMatch::Prefix(format!("/{}/", rpc.service)),
-            (true, false) => PathMatch::Regex(regex(&format!("/[^/]+/{}", regex::escape(&rpc.method)))?),
+            (true, false) => {
+                PathMatch::Regex(regex(&format!("/[^/]+/{}", regex::escape(&rpc.method)))?)
+            }
             (true, true) => PathMatch::Any,
         };
     }
     for h in &m.headers {
         let sm = match &h.value {
-            Some(p::header_match::Value::Exact(v)) => StringMatcher::exact(&String::from_utf8_lossy(v)),
+            Some(p::header_match::Value::Exact(v)) => {
+                StringMatcher::exact(&String::from_utf8_lossy(v))
+            }
             Some(p::header_match::Value::Regex(r)) => StringMatcher {
                 pattern: StrMatch::Regex(regex(r)?),
                 ignore_case: false,
@@ -1076,7 +1131,11 @@ fn outbound_opaque(cfg: &Arc<Config>, dst: SocketAddr, o: &p::OutboundOpaque) ->
     Arc::new(tcp_cfg(clusters))
 }
 
-fn translate_outbound(cfg: &Arc<Config>, dst: SocketAddr, pol: &p::OutboundPolicy) -> Result<OutCfg, String> {
+fn translate_outbound(
+    cfg: &Arc<Config>,
+    dst: SocketAddr,
+    pol: &p::OutboundPolicy,
+) -> Result<OutCfg, String> {
     use p::outbound_protocol::Kind as K;
     match pol.protocol.as_ref().and_then(|p| p.kind.as_ref()) {
         Some(K::Detect(d)) => {
@@ -1088,7 +1147,9 @@ fn translate_outbound(cfg: &Arc<Config>, dst: SocketAddr, pol: &p::OutboundPolic
                     detect: true,
                     opaque,
                 }),
-                None => Ok(OutCfg::Opaque(opaque.unwrap_or_else(|| forward_tcp(cfg, dst)))),
+                None => Ok(OutCfg::Opaque(
+                    opaque.unwrap_or_else(|| forward_tcp(cfg, dst)),
+                )),
             }
         }
         Some(K::Http1(h)) | Some(K::Http2(h)) => Ok(OutCfg::Http {
@@ -1136,10 +1197,12 @@ fn network_principal(n: &p::Network) -> Option<RbacPrincipal> {
     let mut v = vec![inc];
     for e in &n.except {
         if let Some(ip) = e.ip.as_ref().and_then(|i| i.to_ip()) {
-            v.push(RbacPrincipal::Not(Box::new(RbacPrincipal::DirectRemoteIp(Cidr {
-                addr: ip,
-                len: e.prefix_len as u8,
-            }))));
+            v.push(RbacPrincipal::Not(Box::new(RbacPrincipal::DirectRemoteIp(
+                Cidr {
+                    addr: ip,
+                    len: e.prefix_len as u8,
+                },
+            ))));
         }
     }
     Some(RbacPrincipal::And(v))
@@ -1182,7 +1245,10 @@ fn authz_policy(a: &p::Authz) -> RbacPolicy {
     };
     RbacPolicy {
         permissions: vec![RbacPermission::Any],
-        principals: vec![RbacPrincipal::And(vec![net, authn_principal(a.authentication.as_ref())])],
+        principals: vec![RbacPrincipal::And(vec![
+            net,
+            authn_principal(a.authentication.as_ref()),
+        ])],
     }
 }
 
@@ -1235,7 +1301,11 @@ fn app_action(cfg: &Config) -> RouteAction {
     }))
 }
 
-fn inbound_http_routes(cfg: &Config, routes: &[p::InboundHttpRoute], server: &[p::Authz]) -> Result<Vec<MeshRoute>, String> {
+fn inbound_http_routes(
+    cfg: &Config,
+    routes: &[p::InboundHttpRoute],
+    server: &[p::Authz],
+) -> Result<Vec<MeshRoute>, String> {
     let mut out = Vec::new();
     if routes.is_empty() {
         // 古い制御プレーン: 全部に一致する既定のルート（Server の認可）
@@ -1245,7 +1315,11 @@ fn inbound_http_routes(cfg: &Config, routes: &[p::InboundHttpRoute], server: &[p
         return Ok(out);
     }
     for route in routes {
-        let name = route.metadata.as_ref().map(|m| m.name()).unwrap_or_default();
+        let name = route
+            .metadata
+            .as_ref()
+            .map(|m| m.name())
+            .unwrap_or_default();
         let authzs: Vec<&p::Authz> = route.authorizations.iter().chain(server.iter()).collect();
         let rb = rbac(&authzs);
         for rule in &route.rules {
@@ -1269,10 +1343,18 @@ fn inbound_http_routes(cfg: &Config, routes: &[p::InboundHttpRoute], server: &[p
     Ok(out)
 }
 
-fn inbound_grpc_routes(cfg: &Config, routes: &[p::InboundGrpcRoute], server: &[p::Authz]) -> Result<Vec<MeshRoute>, String> {
+fn inbound_grpc_routes(
+    cfg: &Config,
+    routes: &[p::InboundGrpcRoute],
+    server: &[p::Authz],
+) -> Result<Vec<MeshRoute>, String> {
     let mut out = Vec::new();
     for route in routes {
-        let name = route.metadata.as_ref().map(|m| m.name()).unwrap_or_default();
+        let name = route
+            .metadata
+            .as_ref()
+            .map(|m| m.name())
+            .unwrap_or_default();
         let authzs: Vec<&p::Authz> = route.authorizations.iter().chain(server.iter()).collect();
         let rb = rbac(&authzs);
         for rule in &route.rules {
@@ -1306,12 +1388,24 @@ fn translate_inbound(cfg: &Config, port: u16, srv: &p::Server) -> Result<InCfg, 
             InProto::Detect,
             inbound_http_routes(cfg, &d.http_routes, &srv.authorizations)?,
         ),
-        Some(K::Http1(h)) => (InProto::Http1, inbound_http_routes(cfg, &h.routes, &srv.authorizations)?),
-        Some(K::Http2(h)) => (InProto::Http2, inbound_http_routes(cfg, &h.routes, &srv.authorizations)?),
-        Some(K::Grpc(g)) => (InProto::Http2, inbound_grpc_routes(cfg, &g.routes, &srv.authorizations)?),
+        Some(K::Http1(h)) => (
+            InProto::Http1,
+            inbound_http_routes(cfg, &h.routes, &srv.authorizations)?,
+        ),
+        Some(K::Http2(h)) => (
+            InProto::Http2,
+            inbound_http_routes(cfg, &h.routes, &srv.authorizations)?,
+        ),
+        Some(K::Grpc(g)) => (
+            InProto::Http2,
+            inbound_grpc_routes(cfg, &g.routes, &srv.authorizations)?,
+        ),
         Some(K::Opaque(_)) => (InProto::Opaque, Vec::new()),
         Some(K::Tls(_)) => (InProto::Tls, Vec::new()),
-        None => (InProto::Detect, inbound_http_routes(cfg, &[], &srv.authorizations)?),
+        None => (
+            InProto::Detect,
+            inbound_http_routes(cfg, &[], &srv.authorizations)?,
+        ),
     };
     Ok(InCfg {
         proto,
@@ -1341,15 +1435,19 @@ fn default_inbound(cfg: &Config, port: u16) -> InCfg {
     };
     let authzs = match cfg.default_policy.as_str() {
         "deny" => Vec::new(),
-        "all-authenticated" | "cluster-authenticated" => vec![any_net(Some(
-            p::authn::Permit::MeshTls(p::PermitMeshTls {
-                clients: Some(p::permit_mesh_tls::Clients::Identities(p::PermitClientIdentities {
-                    identities: Vec::new(),
-                    suffixes: vec![p::IdentitySuffix { parts: Vec::new() }],
-                })),
-            }),
-        ))],
-        _ => vec![any_net(Some(p::authn::Permit::Unauthenticated(p::Empty {})))],
+        "all-authenticated" | "cluster-authenticated" => {
+            vec![any_net(Some(p::authn::Permit::MeshTls(p::PermitMeshTls {
+                clients: Some(p::permit_mesh_tls::Clients::Identities(
+                    p::PermitClientIdentities {
+                        identities: Vec::new(),
+                        suffixes: vec![p::IdentitySuffix { parts: Vec::new() }],
+                    },
+                )),
+            })))]
+        }
+        _ => vec![any_net(Some(p::authn::Permit::Unauthenticated(
+            p::Empty {},
+        )))],
     };
     let proto = if cfg.opaque_ports.contains(&port) {
         p::InboundProtocol {
@@ -1357,7 +1455,9 @@ fn default_inbound(cfg: &Config, port: u16) -> InCfg {
         }
     } else {
         p::InboundProtocol {
-            kind: Some(p::inbound_protocol::Kind::Detect(p::InboundDetect::default())),
+            kind: Some(p::inbound_protocol::Kind::Detect(
+                p::InboundDetect::default(),
+            )),
         }
     };
     let srv = p::Server {
@@ -1368,7 +1468,12 @@ fn default_inbound(cfg: &Config, port: u16) -> InCfg {
     };
     translate_inbound(cfg, port, &srv).unwrap_or_else(|_| InCfg {
         proto: InProto::Opaque,
-        hcm: Arc::new(http_cm("inbound", RouteTable::empty("inbound"), Direction::Inbound, Vec::new())),
+        hcm: Arc::new(http_cm(
+            "inbound",
+            RouteTable::empty("inbound"),
+            Direction::Inbound,
+            Vec::new(),
+        )),
         tcp_rbac: rbac(&[]),
     })
 }

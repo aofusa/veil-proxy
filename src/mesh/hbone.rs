@@ -48,7 +48,12 @@ pub fn socketpair() -> io::Result<(TcpStream, TcpStream)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: 作ったばかりの非ブロッキングのソケット fd の所有権を移す
-    Ok(unsafe { (TcpStream::from_raw_fd(fds[0]), TcpStream::from_raw_fd(fds[1])) })
+    Ok(unsafe {
+        (
+            TcpStream::from_raw_fd(fds[0]),
+            TcpStream::from_raw_fd(fds[1]),
+        )
+    })
 }
 
 /// 同じソケットの別の fd（読みと書きを別のタスクで行う）。
@@ -116,7 +121,10 @@ thread_local! {
 /// HBONE の CONNECT を張り、中身を転送する端を返す。
 async fn originate(tp: &super::model::TcpProxyCfg, dst: SocketAddr) -> io::Result<TcpStream> {
     let err = |m: String| io::Error::new(io::ErrorKind::ConnectionRefused, m);
-    let slot = tp.pick().cloned().ok_or_else(|| err("tunnel without a cluster".into()))?;
+    let slot = tp
+        .pick()
+        .cloned()
+        .ok_or_else(|| err("tunnel without a cluster".into()))?;
     let cfg = slot
         .cfg
         .load()
@@ -151,7 +159,13 @@ async fn originate(tp: &super::model::TcpProxyCfg, dst: SocketAddr) -> io::Resul
         }
     };
     let mut st = mux
-        .open(b"CONNECT", b"", authority.as_bytes(), std::iter::empty(), false)
+        .open(
+            b"CONNECT",
+            b"",
+            authority.as_bytes(),
+            std::iter::empty(),
+            false,
+        )
         .ok_or_else(|| err(format!("cannot open a CONNECT stream to {}", target)))?;
     let head = crate::runtime::time::timeout(
         cfg.connect_timeout.max(Duration::from_secs(1)),
@@ -162,7 +176,10 @@ async fn originate(tp: &super::model::TcpProxyCfg, dst: SocketAddr) -> io::Resul
     match head {
         Some(UpResp::Head { status, .. }) if (200..300).contains(&status) => {}
         Some(UpResp::Head { status, .. }) => {
-            return Err(err(format!("HBONE CONNECT to {} returned {}", authority, status)));
+            return Err(err(format!(
+                "HBONE CONNECT to {} returned {}",
+                authority, status
+            )));
         }
         _ => return Err(err(format!("HBONE CONNECT to {} failed", authority))),
     }

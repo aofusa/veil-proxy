@@ -3,8 +3,8 @@
 //! 変換できない規則（CEL の条件・未知のマッチャ等）は安全側に倒す: ALLOW のポリシーなら
 //! そのポリシーを一致しない（＝許さない）扱いに、DENY のポリシーなら一致する（＝拒否する）扱いにする。
 
-use super::proto::{self as p, Any, decode_any};
-use super::translate::{R, string_matcher};
+use super::proto::{self as p, decode_any, Any};
+use super::translate::{string_matcher, R};
 use crate::mesh::model::*;
 
 // ---------------------------------------------------------------------------
@@ -395,7 +395,9 @@ fn meta_match(v: &ValueMatcher) -> R<MetaMatch> {
             Some(inner) => MetaMatch::List(Box::new(meta_match(inner)?)),
             None => MetaMatch::Never,
         },
-        Some(V::OrMatch(o)) => MetaMatch::Or(o.value_matchers.iter().map(meta_match).collect::<R<_>>()?),
+        Some(V::OrMatch(o)) => {
+            MetaMatch::Or(o.value_matchers.iter().map(meta_match).collect::<R<_>>()?)
+        }
         None => MetaMatch::Never,
     })
 }
@@ -546,11 +548,21 @@ mod tests {
         let md = |_: &str, _: &[String]| None;
         assert!(eval_princ(
             &x,
-            &input(Some("spiffe://cluster.local/ns/demo/sa/client"), b"/", &none, &md)
+            &input(
+                Some("spiffe://cluster.local/ns/demo/sa/client"),
+                b"/",
+                &none,
+                &md
+            )
         ));
         assert!(!eval_princ(
             &x,
-            &input(Some("spiffe://cluster.local/ns/demo/sa/other"), b"/", &none, &md)
+            &input(
+                Some("spiffe://cluster.local/ns/demo/sa/other"),
+                b"/",
+                &none,
+                &md
+            )
         ));
     }
 

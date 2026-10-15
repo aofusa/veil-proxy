@@ -1418,12 +1418,8 @@ impl TransportHeader {
         if &buf[..TRANSPORT_PREFACE.len()] != TRANSPORT_PREFACE {
             return Err("not a transport header".into());
         }
-        let n = u32::from_be_bytes([
-            buf[hdr - 4],
-            buf[hdr - 3],
-            buf[hdr - 2],
-            buf[hdr - 1],
-        ]) as usize;
+        let n =
+            u32::from_be_bytes([buf[hdr - 4], buf[hdr - 3], buf[hdr - 2], buf[hdr - 1]]) as usize;
         if n > 64 * 1024 {
             return Err("transport header too large".into());
         }
@@ -1452,7 +1448,9 @@ mod tests {
         let (d, used) = TransportHeader::decode_prefaced(&b).unwrap().unwrap();
         assert_eq!(d.port, 6379);
         assert_eq!(&b[used..], b"PING\r\n");
-        assert!(TransportHeader::decode_prefaced(&b[..10]).unwrap().is_none());
+        assert!(TransportHeader::decode_prefaced(&b[..10])
+            .unwrap()
+            .is_none());
     }
 
     #[test]

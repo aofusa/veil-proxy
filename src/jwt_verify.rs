@@ -11,7 +11,10 @@ use ring::signature as sig;
 /// JWKS の公開鍵。
 #[derive(Debug)]
 pub enum Key {
-    Rsa { n: Vec<u8>, e: Vec<u8> },
+    Rsa {
+        n: Vec<u8>,
+        e: Vec<u8>,
+    },
     /// 非圧縮の点（0x04 || x || y）
     Ec256(Vec<u8>),
     Ec384(Vec<u8>),
@@ -176,9 +179,10 @@ pub fn verify(c: &Check<'_>, token: &str) -> Option<serde_json::Value> {
     if !c.audiences.is_empty() {
         let aud_ok = match payload.get("aud") {
             Some(serde_json::Value::String(a)) => c.audiences.iter().any(|w| w == a),
-            Some(serde_json::Value::Array(a)) => a
-                .iter()
-                .any(|x| x.as_str().is_some_and(|s| c.audiences.iter().any(|w| w == s))),
+            Some(serde_json::Value::Array(a)) => a.iter().any(|x| {
+                x.as_str()
+                    .is_some_and(|s| c.audiences.iter().any(|w| w == s))
+            }),
             _ => false,
         };
         if !aud_ok {
@@ -210,15 +214,12 @@ pub(crate) mod tests {
         let pkcs8 =
             EcdsaKeyPair::generate_pkcs8(&sig::ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
         #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
-        let kp =
-            EcdsaKeyPair::from_pkcs8(&sig::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&sig::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .unwrap();
         #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
-        let kp = EcdsaKeyPair::from_pkcs8(
-            &sig::ECDSA_P256_SHA256_FIXED_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .unwrap();
+        let kp =
+            EcdsaKeyPair::from_pkcs8(&sig::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
         let pt = kp.public_key().as_ref();
         let enc = |b: &[u8]| b64url_encode(b);
         let jwks = format!(
@@ -251,7 +252,8 @@ pub(crate) mod tests {
 
     #[test]
     fn es256_issuer_audience_and_expiry() {
-        let (tok, jwks) = es256_token(r#"{"iss":"https://issuer","aud":["api"],"exp":2000000000,"sub":"alice"}"#);
+        let (tok, jwks) =
+            es256_token(r#"{"iss":"https://issuer","aud":["api"],"exp":2000000000,"sub":"alice"}"#);
         let keys = parse_jwks(&jwks);
         assert_eq!(keys.len(), 1);
         let aud = vec!["api".to_string()];

@@ -288,9 +288,18 @@ mod tests {
     #[test]
     fn parse_path_accepts_sdk_nul_separated_paths() {
         // B-131: Proxy-Wasm の SDK（Rust・C++）は要素を NUL で区切る
-        assert_eq!(parse_path(b"plugin_root_id").as_deref(), Some("plugin_root_id"));
-        assert_eq!(parse_path(b"request\0path").as_deref(), Some("request.path"));
-        assert_eq!(parse_path(b"request\0path\0").as_deref(), Some("request.path"));
+        assert_eq!(
+            parse_path(b"plugin_root_id").as_deref(),
+            Some("plugin_root_id")
+        );
+        assert_eq!(
+            parse_path(b"request\0path").as_deref(),
+            Some("request.path")
+        );
+        assert_eq!(
+            parse_path(b"request\0path\0").as_deref(),
+            Some("request.path")
+        );
         assert_eq!(parse_path(b""), None);
     }
 

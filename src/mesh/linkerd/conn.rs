@@ -47,7 +47,13 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     }
 }
 
-fn ctx(hcm: Arc<HttpCm>, direction: Direction, dst: SocketAddr, peer: SocketAddr, client_id: Option<String>) -> Arc<ConnCtx> {
+fn ctx(
+    hcm: Arc<HttpCm>,
+    direction: Direction,
+    dst: SocketAddr,
+    peer: SocketAddr,
+    client_id: Option<String>,
+) -> Arc<ConnCtx> {
     Arc::new(ConnCtx {
         hcm,
         direction,
@@ -81,14 +87,15 @@ async fn relay(mut ds: DownStream, tp: &TcpProxyCfg, dst: SocketAddr) {
         Err(_) => return,
     };
     picked.begin();
-    let mut up = match crate::mesh::upstream::connect(&picked, crate::mesh::upstream::Alpn::Tcp).await {
-        Ok(u) => u,
-        Err(e) => {
-            picked.end(false, true);
-            ftlog::debug!("[linkerd] tcp connect to {} failed: {}", picked.addr, e);
-            return;
-        }
-    };
+    let mut up =
+        match crate::mesh::upstream::connect(&picked, crate::mesh::upstream::Alpn::Tcp).await {
+            Ok(u) => u,
+            Err(e) => {
+                picked.end(false, true);
+                ftlog::debug!("[linkerd] tcp connect to {} failed: {}", picked.addr, e);
+                return;
+            }
+        };
     let _ = crate::mesh::tcp::relay(&mut ds, &mut up, Duration::from_secs(3600)).await;
     picked.end(false, false);
 }
@@ -110,7 +117,11 @@ async fn outbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: Socket
         return;
     };
     match oc.as_deref() {
-        Some(OutCfg::Http { hcm, detect: _, opaque }) => match det {
+        Some(OutCfg::Http {
+            hcm,
+            detect: _,
+            opaque,
+        }) => match det {
             Detected::Http1 | Detected::H2c => {
                 let c = ctx(hcm.clone(), Direction::Outbound, dst, peer, None);
                 serve_http(ds, Vec::new(), det == Detected::H2c, c).await;
@@ -155,7 +166,9 @@ pub(super) async fn read_classify(ds: &mut DownStream, mut acc: Vec<u8>) -> (Det
 }
 
 /// opaque transport の transport header を読む（残りのバイトも返す）。
-pub(super) async fn read_transport_header(ds: &mut DownStream) -> Option<(p::TransportHeader, Vec<u8>)> {
+pub(super) async fn read_transport_header(
+    ds: &mut DownStream,
+) -> Option<(p::TransportHeader, Vec<u8>)> {
     let mut acc: Vec<u8> = Vec::new();
     loop {
         match p::TransportHeader::decode_prefaced(&acc) {
@@ -296,7 +309,8 @@ async fn serve_port(
         };
         crate::mesh::xds::rbac::allowed(&ic.tcp_rbac, &input)
     };
-    let detect_http = http_ok && matches!(ic.proto, InProto::Detect | InProto::Http1 | InProto::Http2);
+    let detect_http =
+        http_ok && matches!(ic.proto, InProto::Detect | InProto::Http1 | InProto::Http2);
     if detect_http {
         let (det, acc) = read_classify(&mut ds, initial).await;
         match det {
@@ -333,7 +347,12 @@ async fn serve_port(
 }
 
 /// 先に読んでしまった `prefix` をアプリへ送ってから L4 で転送する。
-async fn relay_with_prefix(ds: &mut DownStream, prefix: Vec<u8>, tp: &TcpProxyCfg, dst: SocketAddr) {
+async fn relay_with_prefix(
+    ds: &mut DownStream,
+    prefix: Vec<u8>,
+    tp: &TcpProxyCfg,
+    dst: SocketAddr,
+) {
     use crate::runtime::io::AsyncWriteRentExt;
     let Some(slot) = tp.pick().cloned() else {
         return;
@@ -343,13 +362,14 @@ async fn relay_with_prefix(ds: &mut DownStream, prefix: Vec<u8>, tp: &TcpProxyCf
         Err(_) => return,
     };
     picked.begin();
-    let mut up = match crate::mesh::upstream::connect(&picked, crate::mesh::upstream::Alpn::Tcp).await {
-        Ok(u) => u,
-        Err(_) => {
-            picked.end(false, true);
-            return;
-        }
-    };
+    let mut up =
+        match crate::mesh::upstream::connect(&picked, crate::mesh::upstream::Alpn::Tcp).await {
+            Ok(u) => u,
+            Err(_) => {
+                picked.end(false, true);
+                return;
+            }
+        };
     if up.write_all(prefix).await.0.is_err() {
         picked.end(false, true);
         return;

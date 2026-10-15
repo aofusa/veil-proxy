@@ -5,7 +5,7 @@
 
 use super::ads::RAW;
 use super::proto as p;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn addr_json(a: &Option<p::Address>) -> Value {
     match a.as_ref().and_then(|a| a.address.as_ref()) {

@@ -458,7 +458,11 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
 ///
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
 /// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_profile` に対応する。
-async fn tls_connect(tcp: TcpStream, sni: &str, tls_profile: crate::upstream_tls::TlsProfile) -> io::Result<BackendIo> {
+async fn tls_connect(
+    tcp: TcpStream,
+    sni: &str,
+    tls_profile: crate::upstream_tls::TlsProfile,
+) -> io::Result<BackendIo> {
     let connector = crate::config::tls_connector(tls_profile);
     let stream = connector.connect(tcp, sni).await?;
     Ok(backend_io_from_client_tls(stream))
@@ -1732,24 +1736,20 @@ pub(crate) async fn exchange_buffered(
         let reused = pooled.is_some();
         let backend = match pooled.take() {
             Some(b) => b,
-            None => connect_backend_io(
-                addr,
-                cfg.timeout_secs,
-                target.use_tls,
-                sni,
-                cfg.tls_profile,
-            )
-            .await
-            .map_err(|status| {
-                io::Error::new(
-                    if status == 504 {
-                        io::ErrorKind::TimedOut
-                    } else {
-                        io::ErrorKind::ConnectionRefused
-                    },
-                    "backend connect failed",
-                )
-            })?,
+            None => {
+                connect_backend_io(addr, cfg.timeout_secs, target.use_tls, sni, cfg.tls_profile)
+                    .await
+                    .map_err(|status| {
+                        io::Error::new(
+                            if status == 504 {
+                                io::ErrorKind::TimedOut
+                            } else {
+                                io::ErrorKind::ConnectionRefused
+                            },
+                            "backend connect failed",
+                        )
+                    })?
+            }
         };
         let mut got_response_bytes = false;
         let result = buffered_round_trip(

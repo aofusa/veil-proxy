@@ -214,7 +214,12 @@ impl FixedResponse {
                 v.extend_from_slice(b"\r\n");
             }
             v.extend_from_slice(
-                format!("Content-Length: {}\r\nConnection: {}\r\n\r\n", body.len(), conn).as_bytes(),
+                format!(
+                    "Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                    body.len(),
+                    conn
+                )
+                .as_bytes(),
             );
             v.extend_from_slice(&body);
             Bytes::from(v)
@@ -327,12 +332,7 @@ impl TrafficPolicy {
     /// 要求の `Backend` を選ぶ。`None` は `[route.action]` のまま（`load_backend`）。
     /// `draw = false` は下見（乱数を引かない。中断の可能性があれば中断の応答を返してバッファ経路にさせる）。
     #[inline]
-    pub fn select(
-        &self,
-        method: &[u8],
-        headers: &[(&[u8], &[u8])],
-        draw: bool,
-    ) -> Option<Backend> {
+    pub fn select(&self, method: &[u8], headers: &[(&[u8], &[u8])], draw: bool) -> Option<Backend> {
         if let Some(c) = &self.cors {
             if method == b"OPTIONS" && header(headers, b"access-control-request-method").is_some() {
                 if let Some(origin) = header(headers, b"origin") {
@@ -445,7 +445,9 @@ pub fn resolve(
                 )));
             }
             if !(0.0..=100.0).contains(&f.abort_percent) {
-                return Err(err("[route.traffic] fault.abort_percent must be 0..=100".into()));
+                return Err(err(
+                    "[route.traffic] fault.abort_percent must be 0..=100".into()
+                ));
             }
             let ppm = (f.abort_percent * 10_000.0).round() as u32;
             Some((
@@ -513,7 +515,8 @@ pub fn resolve(
                 if o == "*" {
                     if c.allow_credentials {
                         return Err(err(
-                            "[route.traffic] cors: allow_credentials cannot be used with \"*\"".into(),
+                            "[route.traffic] cors: allow_credentials cannot be used with \"*\""
+                                .into(),
                         ));
                     }
                     any = Some(make("*"));
@@ -544,7 +547,11 @@ fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
             String::from_utf8(b)
                 .map_err(|_| err(format!("[route.jwt] jwks_path {}: not UTF-8", j.jwks_path)))?
         }
-        _ => return Err(err("[route.jwt] set exactly one of jwks or jwks_path".into())),
+        _ => {
+            return Err(err(
+                "[route.jwt] set exactly one of jwks or jwks_path".into()
+            ))
+        }
     };
     let keys = crate::jwt_verify::parse_jwks(&text);
     if keys.is_empty() {
@@ -556,7 +563,10 @@ fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
             Bytes::from_static(b"text/plain"),
         )];
         if let Some(w) = www {
-            h.push((Bytes::from_static(b"www-authenticate"), Bytes::from_static(w)));
+            h.push((
+                Bytes::from_static(b"www-authenticate"),
+                Bytes::from_static(w),
+            ));
         }
         respond_backend(status, h, Bytes::from_static(body))
     };
@@ -564,7 +574,11 @@ fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
         keys,
         issuer: j.issuer.clone(),
         audiences: j.audiences.clone(),
-        header: j.header.to_ascii_lowercase().into_bytes().into_boxed_slice(),
+        header: j
+            .header
+            .to_ascii_lowercase()
+            .into_bytes()
+            .into_boxed_slice(),
         prefix: j.prefix.as_bytes().to_vec().into_boxed_slice(),
         allow_missing: j.allow_missing,
         require_expiration: j.require_expiration,
@@ -674,7 +688,10 @@ status = 200
         };
         assert_eq!(r.status, 200);
         let text = String::from_utf8_lossy(&r.h1_close).to_string();
-        assert!(text.contains("access-control-allow-origin: https://a.example"), "{text}");
+        assert!(
+            text.contains("access-control-allow-origin: https://a.example"),
+            "{text}"
+        );
         assert!(text.contains("access-control-max-age: 600"), "{text}");
         // 一覧に無いオリジン・プリフライトでない要求は action のまま
         let other: [(&[u8], &[u8]); 2] = [

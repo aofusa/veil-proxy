@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub type ClientTls = crate::pool::ClientTls;
@@ -211,7 +211,11 @@ pub fn pick(
             }
             LbPolicy::Random => {
                 let i = eps.healthy[super::httpcore::rand_u32() as usize % n];
-                if usable(i) { i } else { rr_pick(&eps, &usable) }
+                if usable(i) {
+                    i
+                } else {
+                    rr_pick(&eps, &usable)
+                }
             }
             _ => rr_pick(&eps, &usable),
         }
@@ -283,7 +287,11 @@ impl Drop for Admission<'_> {
 
 /// クラスタの同時要求数の上限（Envoy の circuit_breakers。HTTP/1.1 は接続数 + 保留、HTTP/2 は
 /// 要求数 + 保留）を超えていなければ入場させる。超えていれば `UpstreamOverflow`（503 UO）。
-pub fn admit<'a>(slot: &'a ClusterSlot, cfg: &ClusterCfg, h2: bool) -> Result<Admission<'a>, ResponseFlag> {
+pub fn admit<'a>(
+    slot: &'a ClusterSlot,
+    cfg: &ClusterCfg,
+    h2: bool,
+) -> Result<Admission<'a>, ResponseFlag> {
     let limit = if h2 {
         cfg.max_requests as u64 + cfg.max_pending as u64
     } else {

@@ -57,10 +57,11 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
                 return;
             }
             let buf: Vec<u8> = Vec::with_capacity(4096);
-            let (r, buf) = match crate::runtime::timeout(Duration::from_secs(60), ds.read(buf)).await {
-                Ok(r) => r,
-                Err(_) => return,
-            };
+            let (r, buf) =
+                match crate::runtime::timeout(Duration::from_secs(60), ds.read(buf)).await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
             match r {
                 Ok(0) | Err(_) => return,
                 Ok(n) => acc.extend_from_slice(&buf[..n]),
@@ -69,7 +70,10 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
         let (method, target, close, body_len) = {
             let mut hb = [httparse::EMPTY_HEADER; 64];
             let mut req = httparse::Request::new(&mut hb);
-            if !matches!(req.parse(&acc[..head_end]), Ok(httparse::Status::Complete(_))) {
+            if !matches!(
+                req.parse(&acc[..head_end]),
+                Ok(httparse::Status::Complete(_))
+            ) {
                 return;
             }
             let close = req.headers.iter().any(|h| {
@@ -79,7 +83,13 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
                 .headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                .and_then(|h| std::str::from_utf8(h.value).ok()?.trim().parse::<usize>().ok())
+                .and_then(|h| {
+                    std::str::from_utf8(h.value)
+                        .ok()?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
                 .unwrap_or(0);
             (
                 req.method.unwrap_or("GET").to_string(),
@@ -149,7 +159,10 @@ impl H2Service for AdminH2 {
             let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
             let (status, ctype, body) = route(&method, path, query);
             let mut headers = vec![
-                (Bytes::from_static(b"content-type"), Bytes::from_static(ctype.as_bytes())),
+                (
+                    Bytes::from_static(b"content-type"),
+                    Bytes::from_static(ctype.as_bytes()),
+                ),
                 (
                     Bytes::from_static(b"content-length"),
                     Bytes::from(body.len().to_string()),
@@ -192,7 +205,8 @@ async fn serve_h2(ds: DownStream, acc: Vec<u8>, peer: SocketAddr) {
     }
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
     let ip = peer.ip().to_string();
-    let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &AdminH2).await;
+    let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &AdminH2)
+        .await;
 }
 
 pub fn route(method: &str, path: &str, _query: &str) -> (u16, &'static str, String) {
@@ -215,7 +229,11 @@ pub fn route(method: &str, path: &str, _query: &str) -> (u16, &'static str, Stri
                 crate::config::SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
                 (200, "text/plain", "shutdown\n".into())
             } else {
-                (404, "text/plain", "shutdown endpoint is not enabled\n".into())
+                (
+                    404,
+                    "text/plain",
+                    "shutdown endpoint is not enabled\n".into(),
+                )
             }
         }
         "/env.json" => {
@@ -225,9 +243,17 @@ pub fn route(method: &str, path: &str, _query: &str) -> (u16, &'static str, Stri
                     m.insert(k, serde_json::Value::String(v));
                 }
             }
-            (200, "application/json", serde_json::Value::Object(m).to_string())
+            (
+                200,
+                "application/json",
+                serde_json::Value::Object(m).to_string(),
+            )
         }
-        "/proxy-log-level" => (200, "text/plain", cfg.map(|c| c.log.clone()).unwrap_or_default()),
+        "/proxy-log-level" => (
+            200,
+            "text/plain",
+            cfg.map(|c| c.log.clone()).unwrap_or_default(),
+        ),
         _ => (404, "text/plain", "not found\n".into()),
     }
 }

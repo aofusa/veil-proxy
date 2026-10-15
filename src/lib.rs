@@ -186,15 +186,15 @@ pub mod simple_tls;
 /// `veil_ktls` の有無に関わらず常にコンパイルする。
 pub(crate) mod tls_writev;
 
-/// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
-pub mod tls_provider;
-/// X.509 の SAN の取り出し（メッシュの mTLS・上流の mTLS の `expected_san`。F-217）
-pub mod x509_san;
-/// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
-pub mod upstream_tls;
 #[cfg(feature = "jwt")]
 pub mod jwt_verify;
 pub mod route_traffic;
+/// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
+pub mod tls_provider;
+/// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
+pub mod upstream_tls;
+/// X.509 の SAN の取り出し（メッシュの mTLS・上流の mTLS の `expected_san`。F-217）
+pub mod x509_san;
 
 /// リッスンアドレス表現（F-164: `unix:<path>` UDS 対応）。`config`/`server`/`entry` の
 /// いずれからも参照するためクレートルート直下に置く。

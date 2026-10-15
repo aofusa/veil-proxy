@@ -8,17 +8,17 @@
 //! 作らない（ホットパスは `Arc` の参照だけ）。接続のプールの鍵には設定ごとのタグを足し、別の証明書の接続を
 //! 共有しない。
 
-use crate::x509_san::{San, parse_sans};
-use rustls::ClientConfig;
+use crate::x509_san::{parse_sans, San};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use serde::Deserialize;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// TOML の上流の TLS の設定（未設定なら従来どおり既定のコネクタ）。
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Hash)]
@@ -259,7 +259,11 @@ fn build(s: &UpstreamTlsSettings, ktls: bool) -> io::Result<UpstreamTlsClient> {
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| err(format!("tls_client_cert: {}", e)))?
         }
-        _ => return Err(err("tls_client_cert and tls_client_key must be set together".into())),
+        _ => {
+            return Err(err(
+                "tls_client_cert and tls_client_key must be set together".into(),
+            ))
+        }
     };
     cfg.enable_secret_extraction = ktls;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -289,8 +293,9 @@ mod tests {
         let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let mut lp = rcgen::CertificateParams::new(vec!["backend.local".to_string()]).unwrap();
-        lp.subject_alt_names
-            .push(rcgen::SanType::URI(rcgen::string::Ia5String::try_from(san_uri).unwrap()));
+        lp.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(san_uri).unwrap(),
+        ));
         let leaf = lp.signed_by(&leaf_key, &ca).unwrap();
         (ca.pem(), leaf.der().clone())
     }

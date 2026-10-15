@@ -17,8 +17,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 下流のストリーム（平文も TLS も同じ型。`accept_plain` は先読みした分を持つ）。
@@ -431,7 +431,17 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     let relookup = !STATIC_LISTENERS
         .get()
         .is_some_and(|v| v.iter().any(|l| l.addr == laddr));
-    dispatch(stream, peer, laddr, dst, target, table_version, relookup, None).await;
+    dispatch(
+        stream,
+        peer,
+        laddr,
+        dst,
+        target,
+        table_version,
+        relookup,
+        None,
+    )
+    .await;
 }
 
 /// 外側の接続（HBONE の mTLS）から引き継ぐ相手の ID。内部リスナーへ渡した接続で使う。
@@ -736,7 +746,11 @@ async fn serve_tcp(
         );
     }
     picked.begin();
-    ftlog::debug!("[mesh] tcp connecting to {} (tls={})", picked.addr, picked.tls.is_some());
+    ftlog::debug!(
+        "[mesh] tcp connecting to {} (tls={})",
+        picked.addr,
+        picked.tls.is_some()
+    );
     let mut up = match super::upstream::connect(&picked, super::upstream::Alpn::Tcp).await {
         Ok(u) => u,
         Err(e) => {

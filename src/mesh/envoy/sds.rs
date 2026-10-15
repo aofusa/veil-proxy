@@ -12,8 +12,8 @@ use once_cell::sync::Lazy;
 use prost::Message;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const PATH: &str = "/envoy.service.secret.v3.SecretDiscoveryService/StreamSecrets";
@@ -103,7 +103,12 @@ async fn stream_loop(uds: PathBuf, node: p::Node, name: String) {
     }
 }
 
-async fn session(uds: &std::path::Path, node: &p::Node, name: &str, got: &mut bool) -> Result<(), String> {
+async fn session(
+    uds: &std::path::Path,
+    node: &p::Node,
+    name: &str,
+    got: &mut bool,
+) -> Result<(), String> {
     use crate::http2::upstream_mux::{H2Mux, UpResp};
     let io = crate::runtime::time::timeout(
         Duration::from_secs(10),

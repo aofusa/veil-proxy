@@ -150,4 +150,3 @@ pub fn parse_not_after(cert: &[u8]) -> Option<i64> {
     let days = era * 146097 + doe - 719468;
     Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
-

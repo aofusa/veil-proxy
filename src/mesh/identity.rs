@@ -90,7 +90,11 @@ pub fn set_cert_der(
         })
         .unwrap_or_default();
     let not_after = parse_not_after(&leaf).unwrap_or(0);
-    let chain_pem = chain.iter().map(|c| der_to_pem(c)).collect::<String>().into_bytes();
+    let chain_pem = chain
+        .iter()
+        .map(|c| der_to_pem(c))
+        .collect::<String>()
+        .into_bytes();
     let own = Arc::new(OwnCert {
         key: Arc::new(CertifiedKey::new(chain, signing)),
         uri,
@@ -197,7 +201,7 @@ pub fn summary() -> Vec<(String, String, i64)> {
 // SAN
 // ---------------------------------------------------------------------------
 
-pub use crate::x509_san::{San, parse_not_after, parse_sans};
+pub use crate::x509_san::{parse_not_after, parse_sans, San};
 
 fn san_matches(sans: &[San], matchers: &[StringMatcher]) -> bool {
     if matchers.is_empty() {

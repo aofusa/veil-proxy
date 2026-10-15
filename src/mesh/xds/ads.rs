@@ -11,7 +11,7 @@ use super::proto::{self as p, decode_any};
 use super::translate;
 use crate::grpc::framing::GrpcFrameDecoder;
 use crate::mesh::model::*;
-use crate::mesh::state::{ListenerTable, state};
+use crate::mesh::state::{state, ListenerTable};
 use bytes::{BufMut, Bytes, BytesMut};
 use ftlog::{debug, info, warn};
 use prost::Message;
@@ -632,7 +632,11 @@ fn apply_ecds(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
     let items: Vec<(String, String, p::TypedExtensionConfig)> =
         decode_resources(resp, p::TYPE_ECDS, errors);
     for (name, version, tc) in items {
-        let name = if tc.name.is_empty() { name } else { tc.name.clone() };
+        let name = if tc.name.is_empty() {
+            name
+        } else {
+            tc.name.clone()
+        };
         let Some(any) = &tc.typed_config else {
             errors.push(format!("ECDS {} without typed_config", name));
             continue;
@@ -655,6 +659,9 @@ fn apply_ecds(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
         }
     }
     for name in &resp.removed_resources {
-        RAW.lock().unwrap_or_else(|e| e.into_inner()).ecds.remove(name);
+        RAW.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ecds
+            .remove(name);
     }
 }

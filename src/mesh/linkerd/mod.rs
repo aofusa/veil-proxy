@@ -48,7 +48,10 @@ fn listener(name: &str, addr: std::net::SocketAddr, direction: Direction) -> Arc
 pub fn main() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("linkerd2-proxy veil-{} (veil mesh data plane)", env!("CARGO_PKG_VERSION"));
+        println!(
+            "linkerd2-proxy veil-{} (veil mesh data plane)",
+            env!("CARGO_PKG_VERSION")
+        );
         return 0;
     }
     let cfg = match env::Config::from_env() {

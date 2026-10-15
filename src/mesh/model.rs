@@ -8,8 +8,8 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -491,7 +491,9 @@ pub struct EcdsSlot {
 
 impl std::fmt::Debug for EcdsSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EcdsSlot").field("name", &self.name).finish()
+        f.debug_struct("EcdsSlot")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
