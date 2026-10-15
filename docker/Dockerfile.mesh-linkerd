@@ -1,0 +1,16 @@
+# Linkerd のサイドカー用イメージ（F-223）: cr.l5d.io/linkerd/proxy の linkerd2-proxy を veil（musl 版）に差し替える。
+#
+# init（linkerd2-proxy-init。iptables）と linkerd2-proxy-identity（鍵と CSR を作って本体を exec する）は本家のまま使い、
+# 本体の `/usr/lib/linkerd/linkerd2-proxy` だけを veil にする（argv[0] が linkerd2-proxy なら Linkerd のプロキシとして動く）。
+# veil は docker/Dockerfile.musl で `mesh-linkerd` を有効にしてビルドした静的リンクのバイナリ（Istio 用と同じものでよい）。
+#
+#   docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=mesh-istio,mesh-linkerd,epoll,wasm -t veil:musl-mesh .
+#   docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-26.10.1 .
+#
+# 注入: Pod の注釈 `config.linkerd.io/proxy-image: veil.local/linkerd-proxy` と `config.linkerd.io/proxy-version: edge-26.10.1`
+# （または `linkerd inject --proxy-image ... --proxy-version ...`）。init も同じイメージを使うので、本家のタグに合わせる。
+ARG LINKERD_PROXY_IMAGE=cr.l5d.io/linkerd/proxy:edge-26.10.1
+ARG VEIL_IMAGE=veil:musl-mesh
+FROM ${VEIL_IMAGE} AS veil
+FROM ${LINKERD_PROXY_IMAGE}
+COPY --from=veil /veil /usr/lib/linkerd/linkerd2-proxy

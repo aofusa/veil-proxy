@@ -2,7 +2,7 @@
 # Linkerd のサイドカー（linkerd2-proxy）を veil にした E2E（F-223・F-225）。kind の上の Linkerd（制御プレーンは本家）で
 # 本家の linkerd2-proxy の Pod と veil の Pod を動かし、Linkerd のタスクを試す。
 #
-#   tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|all> [--keep]
+#   tools/k8s/linkerd-e2e.sh <stock|veil|mixed> <smoke|tasks|ops|certs|viz|all> [--keep]
 #
 #   stock: 全 Pod が本家の linkerd2-proxy（台本の正しさの確認）
 #   veil:  全 Pod が veil
@@ -427,6 +427,81 @@ ops() {
   case "$out" in *veil*) is_veil whoami && ok "linkerd2-proxy --version reports veil" ;; esac
 }
 
+# viz の確認（emojivoto・booksapp。linkerd viz stat / edges / tap / top）
+viz() {
+  log "viz ($MODE)"
+  if ! kubectl get ns linkerd-viz >/dev/null 2>&1; then
+    linkerd viz install | kubectl apply -f - >/dev/null || { bad "viz install"; return; }
+  fi
+  kubectl -n linkerd-viz rollout status deploy --timeout=300s >/dev/null
+  local img app ns
+  for img in ghcr.io/buoyantio/emojivoto-emoji-svc:v11 ghcr.io/buoyantio/emojivoto-web:v11 ghcr.io/buoyantio/emojivoto-voting-svc:v11 \
+             ghcr.io/buoyantio/booksapp:v0.0.5 ghcr.io/buoyantio/booksapp-traffic:v0.0.3; do
+    docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
+    kind load docker-image --name "$CLUSTER" "$img" >/dev/null 2>&1
+  done
+  curl -sL -m 30 https://run.linkerd.io/emojivoto.yml -o "$TMPDIR/emojivoto.yml"
+  curl -sL -m 30 https://run.linkerd.io/booksapp.yml -o "$TMPDIR/booksapp.yml"
+  for app in emojivoto booksapp; do
+    ns="$NS-$app"
+    kubectl create ns "$ns" >/dev/null 2>&1
+    # emojivoto は名前空間を名前で参照するので置き換える。veil の注入は mode に従う
+    # （mixed は emojivoto の web・emoji と booksapp の webapp・books を veil）
+    sed -e "s/emojivoto:/$ns:/g; s/^  namespace: emojivoto$/  namespace: $ns/; /^kind: Namespace/,/^---/d" "$TMPDIR/$app.yml" > "$TMPDIR/$app-$MODE.yml"
+    case "$MODE" in
+      stock) linkerd inject "$TMPDIR/$app-$MODE.yml" ;;
+      veil) linkerd inject --proxy-image "$VEIL_IMAGE" --proxy-version "$VEIL_VERSION" --image-pull-policy IfNotPresent "$TMPDIR/$app-$MODE.yml" ;;
+      mixed) linkerd inject "$TMPDIR/$app-$MODE.yml" | python3 -c '
+import sys, yaml
+docs = list(yaml.safe_load_all(sys.stdin))
+for d in docs:
+    if d and d.get("kind") == "Deployment" and d["metadata"]["name"] in ("web", "emoji", "webapp", "books"):
+        a = d["spec"]["template"]["metadata"].setdefault("annotations", {})
+        a["config.linkerd.io/proxy-image"] = sys.argv[1]
+        a["config.linkerd.io/proxy-version"] = sys.argv[2]
+        a["config.linkerd.io/image-pull-policy"] = "IfNotPresent"
+print(yaml.safe_dump_all(docs))' "$VEIL_IMAGE" "$VEIL_VERSION" ;;
+    esac 2>/dev/null | kubectl -n "$ns" apply -f - >/dev/null
+    kubectl -n "$ns" rollout status deploy --timeout=300s >/dev/null || bad "$app deploy"
+  done
+  sleep 70
+  ns="$NS-emojivoto"
+  out="$(linkerd viz stat deploy -n "$ns" 2>&1)"
+  if echo "$out" | awk '$1 ~ /^(emoji|voting|web)$/ && $3 ~ /%/' | wc -l | grep -q 3; then ok "viz stat (emojivoto: emoji, voting, web have success rates)"; else bad "viz stat emojivoto: $out"; fi
+  out="$(linkerd viz edges deploy -n "$ns" 2>&1)"
+  if echo "$out" | grep -qE "^vote-bot +web .*√" && echo "$out" | grep -qE "^web +emoji .*√" && echo "$out" | grep -qE "^web +voting .*√"; then
+    ok "viz edges (vote-bot->web, web->emoji, web->voting secured)"; else bad "viz edges: $out"; fi
+  out="$(timeout 15 linkerd viz tap deploy/web -n "$ns" --max-rps 5 2>&1 | head -30)"
+  if echo "$out" | grep -q "^req id=" && echo "$out" | grep -q "^end id="; then ok "viz tap deploy/web"; else bad "viz tap: $(echo "$out" | head -3)"; fi
+  script -qc "stty cols 200 rows 40; TERM=xterm timeout 12 linkerd viz top deploy/web -n $ns" /dev/null > "$TMPDIR/top-$MODE.out" 2>&1
+  if sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$TMPDIR/top-$MODE.out" | grep -aq "EmojiService"; then ok "viz top deploy/web"; else bad "viz top"; fi
+  ns="$NS-booksapp"
+  out="$(linkerd viz stat deploy -n "$ns" 2>&1)"
+  if echo "$out" | awk '$1 ~ /^(authors|books|webapp)$/ && $3 ~ /%/' | wc -l | grep -q 3; then ok "viz stat (booksapp: authors, books, webapp)"; else bad "viz stat booksapp: $out"; fi
+  out="$(linkerd viz edges deploy -n "$ns" 2>&1)"
+  if echo "$out" | grep -qE "^webapp +books .*√" && echo "$out" | grep -qE "^webapp +authors .*√"; then ok "viz edges (booksapp)"; else bad "viz edges booksapp: $out"; fi
+  out="$(linkerd check --proxy -n "$NS-emojivoto" 2>&1)" || true
+  if echo "$out" | grep -q "^×"; then bad "linkerd check --proxy (emojivoto): $(echo "$out" | grep -A2 '^×' | head -6)"; else ok "linkerd check --proxy (emojivoto)"; fi
+  if [ "$KEEP" != "--keep" ]; then kubectl delete ns "$NS-emojivoto" "$NS-booksapp" --wait=false >/dev/null 2>&1; fi
+}
+
+# 証明書の更新（ワークロードの証明書の有効期間を 1 分にして、更新の後も通信が続く）
+certs() {
+  log "certs ($MODE)"
+  local e1 e2
+  linkerd upgrade --set identity.issuer.issuanceLifetime=1m0s 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
+  kubectl -n linkerd rollout status deploy/linkerd-identity --timeout=300s >/dev/null
+  kubectl -n "$NS" rollout restart deploy/whoami deploy/client >/dev/null
+  kubectl -n "$NS" rollout status deploy/whoami deploy/client --timeout=300s >/dev/null
+  e1="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
+  sleep 75
+  e2="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
+  if [ -n "$e1" ] && [ -n "$e2" ] && awk -v a="$e1" -v b="$e2" 'BEGIN{exit !(b > a)}'; then ok "workload certificate renewed ($e1 -> $e2)"; else bad "certificate not renewed: $e1 -> $e2"; fi
+  if retry 30 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 http://whoami/ | grep -q '^L5d-Client-Id: client'"; then ok "mTLS keeps working after the renewal"; else bad "mTLS after renewal"; fi
+  linkerd upgrade --set identity.issuer.issuanceLifetime=24h0m0s 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
+  kubectl -n linkerd rollout status deploy/linkerd-identity --timeout=300s >/dev/null
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -439,7 +514,9 @@ case "$SUITE" in
   smoke) smoke ;;
   tasks) tasks ;;
   ops) ops ;;
-  all) smoke; tasks; ops ;;
+  viz) viz ;;
+  certs) certs ;;
+  all) smoke; tasks; ops; certs; viz ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

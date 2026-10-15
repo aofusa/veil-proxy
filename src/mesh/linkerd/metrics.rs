@@ -303,7 +303,7 @@ pub fn text() -> String {
         o, i, b
     ));
     out.push_str(&format!(
-        "# TYPE identity_cert_expiration_timestamp_seconds gauge\nidentity_cert_expiration_timestamp_seconds {}\n",
+        "# HELP control_identity_cert_expiration_timestamp_seconds Time when this proxy's current mTLS identity certificate will expire (in seconds since the UNIX epoch).\n# TYPE control_identity_cert_expiration_timestamp_seconds gauge\ncontrol_identity_cert_expiration_timestamp_seconds {}\n",
         super::identity::EXPIRY.load(std::sync::atomic::Ordering::Relaxed)
     ));
     out
