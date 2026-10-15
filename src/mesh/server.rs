@@ -43,6 +43,20 @@ pub fn set_linkerd_mode() {
 
 /// ワーカーを起動し、停止まで戻らない。
 pub fn run(workers: usize) {
+    // io_uring のビルドで io_uring が使えない（コンテナの seccomp が RuntimeDefault 等。Linkerd の注入は
+    // これを付ける）なら、ワーカーごとに panic する前に理由を出して終わる
+    #[cfg(veil_rt_uring)]
+    if let Err(e) = crate::runtime::ring::IoUring::new(8, 0) {
+        let msg = format!(
+            "[mesh] io_uring is not available ({}): the container's seccomp profile forbids it \
+             (RuntimeDefault, which Linkerd's proxy injector sets, blocks io_uring). \
+             Use the image built with the `epoll` feature",
+            e
+        );
+        ftlog::error!("{}", msg);
+        eprintln!("{}", msg);
+        std::process::exit(1);
+    }
     let workers = workers.max(1);
     let _ = WORKERS.set(workers);
     let mut handles = Vec::new();

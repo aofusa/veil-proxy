@@ -42,7 +42,9 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
 ```
 
 `epoll` は readiness reactor を選ぶ（コンテナの既定の seccomp は io_uring を拒否する）。`wasm` は Istio の WasmPlugin に
-要る。試験した版は Istio 1.31.1 と Linkerd edge-26.10.1（proxy v2.370.0）。
+要る。`epoll` を付けないビルドは io_uring を使う。Istio のサイドカーでは動く（注入される `istio-proxy` のコンテナには seccomp の
+指定が無い。smoke と tasks のスイートで確認）が、Linkerd では動かない（注入がプロキシに `seccompProfile: RuntimeDefault` を
+付ける。veil はその旨を出して起動時に終わる）。試験した版は Istio 1.31.1 と Linkerd edge-26.10.1（proxy v2.370.0）。
 
 ## Istio
 
