@@ -244,6 +244,7 @@ pub async fn terminate<F, Fut>(
     dst: SocketAddr,
     inherited: Inherited,
     req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    notify: crate::stream_channel::Notify,
     mut send_body: F,
 ) where
     F: FnMut(Bytes) -> Fut,
@@ -263,6 +264,8 @@ pub async fn terminate<F, Fut>(
         let mut wr = wr;
         if let Some(rx) = req_rx {
             while let Some(b) = rx.recv().await {
+                // 消費したら駆動部を起こして受信ウィンドウを補充させる
+                notify.notify();
                 if wr.write_all(b).await.0.is_err() {
                     break;
                 }

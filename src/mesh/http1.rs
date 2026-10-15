@@ -11,7 +11,7 @@ use super::l7::{self, ConnCtx, Decision, Forward, LocalReply, ReqView};
 use super::upstream::{self, Alpn, UpIo};
 use crate::runtime::handle::AsRawFd;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, BufferedReadState};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -847,11 +847,26 @@ where
             }
         }
         if up_h2 {
-            return forward_to_h2(
+            // 本文を全部読めていて試行が残っていればリトライできる（Linkerd の昇格した HTTP/2 も同じ）
+            let again = H2Again {
+                retry: retry.as_deref().filter(|_| attempt < max_attempts),
+                body_len: body_len.filter(|_| framing != Framing::Chunked),
+                deadline,
+                attempt,
+            };
+            match forward_to_h2(
                 io, acc, ctx, f, &picked, method, up_path, authority, headers, framing, keep_alive,
-                is_grpc, out, origin,
+                is_grpc, out, origin, again,
             )
-            .await;
+            .await
+            {
+                H2Result::Done(o) => return o,
+                H2Result::Retry(o) => {
+                    out = o;
+                    tried.push(picked.addr);
+                    continue;
+                }
+            }
         }
         let (req_headers, peer_req) =
             l7::upstream_request_headers(ctx, f, headers, attempt, upgrade, framing == Framing::Chunked);
@@ -1145,13 +1160,14 @@ async fn forward_to_h2<S>(
     is_grpc: bool,
     mut out: Outcome,
     origin: Option<&Bytes>,
-) -> Outcome
+    again: H2Again<'_>,
+) -> H2Result
 where
     S: AsyncReadRent + AsyncWriteRentExt + AsRawFd + BufferedReadState + super::tcp::PendingRead + Unpin + 'static,
 {
     use crate::http2::upstream_mux::UpResp;
     let (mut req_headers, peer_req) =
-        l7::upstream_request_headers(ctx, f, headers, 1, false, false);
+        l7::upstream_request_headers(ctx, f, headers, again.attempt, false, false);
     if ctx.hcm.linkerd && !matches!(picked.cfg.proto, super::model::UpstreamProto::Http2) {
         req_headers.push((
             Bytes::from_static(b"l5d-orig-proto"),
@@ -1169,6 +1185,13 @@ where
         Ok(m) => m,
         Err(_) => {
             picked.end(false, true);
+            if again.body_len.is_some()
+                && again
+                    .retry
+                    .is_some_and(|r| r.on_connect_failure || r.on_reset_before_request)
+            {
+                return H2Result::Retry(out);
+            }
             out.status = 503;
             out.flag = ResponseFlag::UpstreamConnectFailure;
             let _ = discard_body(io, acc, framing).await;
@@ -1180,10 +1203,10 @@ where
                 !keep_alive,
             )
             .await;
-            return out;
+            return H2Result::Done(out);
         }
     };
-    let no_body = framing == Framing::None;
+    let no_body = framing == Framing::None || again.body_len == Some(0);
     let Some(mut st) = mux.open(
         method,
         path,
@@ -1202,10 +1225,21 @@ where
             !keep_alive,
         )
         .await;
-        return out;
+        return H2Result::Done(out);
     };
+    // 本文: リトライできるときは読み込み済みの本文を複製して送る（応答を見るまで手元に残す）
+    let replay = again.retry.is_some() && again.body_len.is_some();
+    if replay {
+        if let (Some(n), Some(tx)) = (again.body_len, &st.req_tx) {
+            if n > 0 {
+                out.req_bytes = n as u64;
+                let _ = tx.send(Bytes::copy_from_slice(&acc[..n])).await;
+            }
+        }
+        st.finish_request();
+    }
     // 本文: Content-Length はそのまま、chunked は中身を取り出して送る
-    if !no_body {
+    if !no_body && !replay {
         let r = match framing {
             Framing::Length(mut n) => {
                 let mut ok = true;
@@ -1239,14 +1273,58 @@ where
             picked.end(false, true);
             out.status = 400;
             out.keep_alive = false;
-            return out;
+            return H2Result::Done(out);
         }
     }
     let mut keep = keep_alive;
     let mut head_sent = false;
     let mut trailers_grpc = None;
     loop {
-        match st.resp_rx.recv().await {
+        // 応答のヘッダまでのタイムアウト（ルートの timeout。Linkerd の HTTPRoute の timeouts.request も）
+        let item = match again.deadline.filter(|_| !head_sent) {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                match crate::runtime::time::timeout(left, st.resp_rx.recv()).await {
+                    Ok(i) => i,
+                    Err(_) => {
+                        picked.end(false, true);
+                        out.status = 504;
+                        out.flag = ResponseFlag::UpstreamTimeout;
+                        if let Some(n) = again.body_len.filter(|_| replay) {
+                            acc.advance(n.min(acc.len()));
+                        }
+                        let _ = write_local(io, &LocalReply::new(504, out.flag), is_grpc, ctx, !keep_alive).await;
+                        out.keep_alive = keep_alive;
+                        return H2Result::Done(out);
+                    }
+                }
+            }
+            None => st.resp_rx.recv().await,
+        };
+        // リトライ（応答のステータス・gRPC のステータス、接続の切断）
+        if replay && !head_sent {
+            let grpc = match &item {
+                Some(UpResp::Head { headers, .. }) => headers
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == b"grpc-status")
+                    .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse().ok()),
+                _ => None,
+            };
+            let again_now = match (&item, again.retry) {
+                (Some(UpResp::Head { status, .. }), Some(r)) => l7::retry_on_status(r, *status, grpc),
+                (Some(UpResp::Reset { .. }) | None, Some(r)) => r.on_reset || r.on_refused_stream,
+                _ => false,
+            };
+            if again_now {
+                let st5 = matches!(&item, Some(UpResp::Head { status, .. }) if *status >= 500);
+                picked.end(st5, !st5);
+                return H2Result::Retry(out);
+            }
+            if let Some(n) = again.body_len {
+                acc.advance(n.min(acc.len()));
+            }
+        }
+        match item {
             Some(UpResp::Head {
                 status,
                 mut headers,
@@ -1305,7 +1383,7 @@ where
                 picked.end(out.status >= 500, false);
                 out.grpc = trailers_grpc;
                 out.keep_alive = keep;
-                return out;
+                return H2Result::Done(out);
             }
             Some(UpResp::Reset { .. }) => {
                 keep = false;
@@ -1339,7 +1417,24 @@ where
     picked.end(out.status >= 500, false);
     out.grpc = trailers_grpc;
     out.keep_alive = keep;
-    out
+    H2Result::Done(out)
+}
+
+/// HTTP/2 の上流への 1 回の試行のリトライの条件。
+struct H2Again<'a> {
+    /// リトライの方針（試行が残っているときだけ）
+    retry: Option<&'a super::model::RetryPolicy>,
+    /// 読み込み済みの本文の長さ（`acc` の先頭。chunked は除く）
+    body_len: Option<usize>,
+    /// 応答のヘッダまでの期限
+    deadline: Option<Instant>,
+    attempt: u32,
+}
+
+enum H2Result {
+    Done(Outcome),
+    /// 別のエンドポイントでやり直す（本文は `acc` に残っている）
+    Retry(Outcome),
 }
 
 /// chunked の本文から中身だけを取り出して HTTP/2 のストリームへ送る。

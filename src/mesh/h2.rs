@@ -144,7 +144,7 @@ async fn connect_terminate(
         cert_hash: c.peer_cert_hash.clone(),
         dns: c.peer_dns.clone(),
     };
-    super::hbone::terminate(lst, c.peer, dst, inherited, req_rx, |b| {
+    super::hbone::terminate(lst, c.peer, dst, inherited, req_rx, notify.clone(), |b| {
         send(tx, notify, H2RespMsg::Body(b))
     })
     .await;
@@ -594,6 +594,9 @@ async fn forward(
             match ev {
                 Ev::Timeout => continue,
                 Ev::Req(Some(chunk)) => {
+                    // 消費したら駆動部を起こして受信ウィンドウを補充させる（B-123 と同じ。起こさないと
+                    // 64KB を超える本文が WINDOW_UPDATE を待って止まる）
+                    notify.notify();
                     out.req_bytes += chunk.len() as u64;
                     if let Some(t) = &st.req_tx {
                         let _ = t.send(chunk).await;
@@ -802,6 +805,7 @@ async fn to_h1(
         }
         if let Some(rx) = &req_rx {
             while let Some(b) = rx.recv().await {
+                notify.notify();
                 out.req_bytes += b.len() as u64;
                 if !b.is_empty() {
                     up.write_all(write_chunk(b)).await.0?;

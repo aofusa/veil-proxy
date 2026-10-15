@@ -194,6 +194,21 @@ pub async fn inbound(port: u16) -> Option<Arc<InCfg>> {
     wait(&t.cfg, Duration::from_secs(3)).await
 }
 
+/// 接続の途中でポリシーが更新されたときの現在の HTTP の設定（要求ごとに呼ぶ。表を 1 回引くだけ）。
+pub fn current_hcm(direction: Direction, dst: SocketAddr) -> Option<Arc<HttpCm>> {
+    match direction {
+        Direction::Inbound => IN
+            .load()
+            .get(&dst.port())
+            .and_then(|t| t.cfg.load_full())
+            .map(|c| c.hcm.clone()),
+        _ => match OUT.load().get(&dst).and_then(|t| t.cfg.load_full()).as_deref() {
+            Some(OutCfg::Http { hcm, .. }) => Some(hcm.clone()),
+            _ => None,
+        },
+    }
+}
+
 /// 管理 API 用: 購読中の宛先・ポートの数。
 pub fn counts() -> (usize, usize, usize) {
     (
@@ -288,7 +303,22 @@ pub async fn watch_inbound(cfg: Arc<Config>, port: u16) {
                     Ok(Some(srv)) => {
                         backoff = Duration::from_millis(100);
                         match translate_inbound(&cfg, port, &srv) {
-                            Ok(ic) => t.cfg.store(Some(Arc::new(ic))),
+                            Ok(ic) => {
+                                if let RouteRef::Inline(rt) = &ic.hcm.routes {
+                                    ftlog::debug!(
+                                        "[linkerd] inbound {}: {:?} routes {:?}, {} server authorizations",
+                                        port,
+                                        ic.proto,
+                                        rt.vhosts
+                                            .iter()
+                                            .flat_map(|v| v.routes.iter())
+                                            .map(|r| format!("{} {:?}", r.name, r.path))
+                                            .collect::<Vec<_>>(),
+                                        srv.authorizations.len()
+                                    );
+                                }
+                                t.cfg.store(Some(Arc::new(ic)))
+                            }
                             Err(e) => ftlog::warn!("[linkerd] inbound policy for {}: {}", port, e),
                         }
                     }

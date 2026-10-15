@@ -47,6 +47,20 @@ impl ConnCtx {
     /// （Envoy は LDS の更新で古いリスナーの接続を排出する。veil は次の要求から新しい設定を使う）。
     /// HTTP でなくなった・リスナーが消えたときは `None`（接続を閉じる）。
     pub fn refreshed(self: &Arc<Self>) -> Option<Arc<ConnCtx>> {
+        // Linkerd: ポート（inbound）・宛先（outbound）のポリシーが更新されていれば次の要求から使う
+        #[cfg(feature = "mesh-linkerd")]
+        if self.hcm.linkerd {
+            if let Some(dst) = self.orig_dst {
+                if let Some(h) = super::linkerd::discovery::current_hcm(self.direction, dst) {
+                    if !Arc::ptr_eq(&h, &self.hcm) {
+                        let mut c = self.shallow_clone();
+                        c.hcm = h;
+                        return Some(Arc::new(c));
+                    }
+                }
+            }
+            return Some(self.clone());
+        }
         let Some(rl) = &self.relookup else {
             return Some(self.clone());
         };
@@ -85,6 +99,23 @@ impl ConnCtx {
             relookup: self.relookup.clone(),
             table_version: table.version,
         }))
+    }
+
+    #[cfg(feature = "mesh-linkerd")]
+    fn shallow_clone(&self) -> ConnCtx {
+        ConnCtx {
+            hcm: self.hcm.clone(),
+            direction: self.direction,
+            orig_dst: self.orig_dst,
+            peer: self.peer,
+            tls: self.tls,
+            peer_principal: self.peer_principal.clone(),
+            peer_cert_hash: self.peer_cert_hash.clone(),
+            peer_dns: self.peer_dns.clone(),
+            sni: self.sni.clone(),
+            relookup: self.relookup.clone(),
+            table_version: self.table_version,
+        }
     }
 
     /// 観測のラベル（相手のワークロードは要求ごとに決まる）。
