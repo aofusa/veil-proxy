@@ -516,6 +516,22 @@ EOF
   out="$(kubectl -n "$NS" exec deploy/fortio -c fortio -- fortio curl -quiet http://whoami."$NS"/ 2>&1 | head -1)" || true
   if echo "$out" | grep -q 403; then ok "AuthorizationPolicy denies other principals"; else bad "authz other principal: $out"; fi
   kubectl -n "$NS" delete authorizationpolicies.security.istio.io whoami-allow >/dev/null
+  # dry-run（istio.io/dry-run）: DENY を判定だけにして通す（Envoy の shadow_rules）
+  cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: whoami-dryrun
+  annotations: {istio.io/dry-run: "true"}
+spec:
+  selector: {matchLabels: {app: whoami}}
+  action: DENY
+  rules: [{to: [{operation: {methods: ["GET"]}}]}]
+EOF
+  sleep 8
+  out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://whoami."$NS"/)" || true
+  if [ "$out" = 200 ]; then ok "AuthorizationPolicy dry-run: DENY is only evaluated (200)"; else bad "dry-run: $out"; fi
+  kubectl -n "$NS" delete authorizationpolicies.security.istio.io whoami-dryrun >/dev/null
   kubectl -n "$NS" delete destinationrule fortio >/dev/null 2>&1
   kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
 }
