@@ -20,6 +20,10 @@ pub struct Bootstrap {
     pub ads_uds: Option<PathBuf>,
     pub sds_uds: Option<PathBuf>,
     pub static_listeners: Vec<Arc<MeshListener>>,
+    /// `metadata_discovery`（`istio.workload.BootstrapExtension`）がある: ADS で WDS（istio.workload.Workload）を購読し、
+    /// 受け側で送信元の IP からワークロードを知る（Istio の PEER_METADATA_DISCOVERY。このときクラスタの `disable_mx`
+    /// で送り手はヘッダを付けない）
+    pub workload_discovery: bool,
 }
 
 enum StaticAddr {
@@ -172,12 +176,23 @@ pub fn parse(text: &str) -> Result<Bootstrap, String> {
             }
         }
     }
+    let workload_discovery = v
+        .get("bootstrap_extensions")
+        .and_then(|x| x.as_array())
+        .is_some_and(|a| {
+            a.iter().any(|e| {
+                e.pointer("/typed_config/type_url")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.ends_with("istio.workload.BootstrapExtension"))
+            })
+        });
     Ok(Bootstrap {
         node,
         admin,
         ads_uds,
         sds_uds,
         static_listeners,
+        workload_discovery,
     })
 }
 
@@ -356,6 +371,22 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_workload_discovery_extension() {
+        // ambient のプロファイルの istiod（PEER_METADATA_DISCOVERY）が付ける拡張
+        let b = parse(
+            r#"{"node": {"id": "sidecar~10.0.0.1~a.ns~ns.svc.cluster.local"},
+                "bootstrap_extensions": [{"name": "metadata_discovery", "typed_config": {
+                  "@type": "type.googleapis.com/udpa.type.v1.TypedStruct",
+                  "type_url": "type.googleapis.com/istio.workload.BootstrapExtension",
+                  "value": {"config_source": {"ads": {}}}}}]}"#,
+        )
+        .unwrap();
+        assert!(b.workload_discovery);
+        let b = parse(include_str!("testdata/istio_bootstrap.json")).unwrap();
+        assert!(!b.workload_discovery);
+    }
 
     #[test]
     fn parses_istio_bootstrap() {

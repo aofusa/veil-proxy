@@ -1169,7 +1169,8 @@ pub fn peer_workload(
     endpoint: Option<&MeshEndpoint>,
 ) -> Option<Arc<super::peer::Workload>> {
     match ctx.direction {
-        Direction::Inbound => from_request,
+        // ヘッダが無ければ送信元の IP から（Envoy の workload_discovery と同じ）
+        Direction::Inbound => from_request.or_else(|| super::peer::by_ip(ctx.peer.ip())),
         _ => from_response
             .or_else(|| endpoint.and_then(|e| super::peer::cached_endpoint(&e.workload))),
     }

@@ -1585,3 +1585,30 @@ pub fn decode_any<M: prost::Message + Default>(any: &Any, type_url: &str) -> Opt
     }
     M::decode(any.value.as_slice()).ok()
 }
+
+/// WDS（Istio の workload discovery。`istio.workload.Workload` のうち送信元の特定に使う項目）。
+pub const TYPE_WORKLOAD: &str = "type.googleapis.com/istio.workload.Workload";
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WdsWorkload {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub namespace: String,
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub addresses: Vec<Vec<u8>>,
+    #[prost(string, tag = "6")]
+    pub trust_domain: String,
+    #[prost(string, tag = "7")]
+    pub service_account: String,
+    #[prost(string, tag = "10")]
+    pub canonical_name: String,
+    #[prost(string, tag = "11")]
+    pub canonical_revision: String,
+    #[prost(string, tag = "13")]
+    pub workload_name: String,
+    #[prost(string, tag = "18")]
+    pub cluster_id: String,
+    #[prost(string, tag = "20")]
+    pub uid: String,
+}

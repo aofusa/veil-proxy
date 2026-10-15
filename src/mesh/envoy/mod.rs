@@ -145,6 +145,7 @@ pub fn main(args: Vec<String>) -> i32 {
         Some(ads) => crate::mesh::xds::ads::spawn(crate::mesh::xds::ads::AdsConfig {
             uds_path: ads,
             node: b.node.clone(),
+            workload_discovery: b.workload_discovery,
         }),
         None => ftlog::warn!("[envoy] no ADS cluster in the bootstrap"),
     }

@@ -190,6 +190,54 @@ pub fn from_endpoint_workload(w: &[u8]) -> Option<Workload> {
     })
 }
 
+/// 送信元の IP → ワークロード（EDS のエンドポイントの `istio.workload` から。Envoy の `workload_discovery` の代わり）。
+/// 受け側で要求に peer metadata のヘッダが無いとき（Envoy のクライアント等）に引く。xDS のスレッドが EDS の応答ごとに
+/// 作り直して差し替え、データプレーンは読むだけ（接続ごとに 1 回）。
+static BY_IP: once_cell::sync::Lazy<arc_swap::ArcSwap<HashMap<std::net::IpAddr, Arc<Workload>>>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(HashMap::new()));
+/// EDS の名前 → そのエンドポイントの (IP, ワークロード)（xDS のスレッドだけが触る）
+static BY_EDS: std::sync::Mutex<Option<HashMap<String, Vec<(std::net::IpAddr, Arc<Workload>)>>>> =
+    std::sync::Mutex::new(None);
+
+/// EDS の 1 リソースのエンドポイントのワークロードを登録する（`None` は削除）。`publish_endpoint_workloads` で反映。
+pub fn set_endpoint_workloads(eds: &str, eps: Option<Vec<(std::net::IpAddr, Arc<Workload>)>>) {
+    let mut g = BY_EDS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    match eps {
+        Some(v) => {
+            m.insert(eds.to_string(), v);
+        }
+        None => {
+            m.remove(eds);
+        }
+    }
+}
+
+/// 登録したものから IP の表を作り直して差し替える（EDS の応答ごとに 1 回）。
+pub fn publish_endpoint_workloads() {
+    let g = BY_EDS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = HashMap::new();
+    if let Some(m) = g.as_ref() {
+        // EDS 由来を先に、WDS（`wds:`）を後に入れる（同じ IP なら WDS のワークロード名を使う）
+        for wds in [false, true] {
+            for (k, v) in m.iter() {
+                if k.starts_with("wds:") != wds {
+                    continue;
+                }
+                for (ip, w) in v {
+                    out.insert(*ip, w.clone());
+                }
+            }
+        }
+    }
+    BY_IP.store(Arc::new(out));
+}
+
+/// 送信元の IP のワークロード。
+pub fn by_ip(ip: std::net::IpAddr) -> Option<Arc<Workload>> {
+    BY_IP.load().get(&ip).cloned()
+}
+
 thread_local! {
     /// id（または値）→ 解析済みの属性。上限を超えたら捨てて作り直す
     static CACHE: RefCell<HashMap<Bytes, Arc<Workload>>> = RefCell::new(HashMap::new());

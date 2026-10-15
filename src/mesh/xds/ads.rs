@@ -28,6 +28,8 @@ pub const PATH: &str =
 pub struct AdsConfig {
     pub uds_path: PathBuf,
     pub node: p::Node,
+    /// WDS（istio.workload.Workload）も購読する（ブートストラップの `metadata_discovery`）
+    pub workload_discovery: bool,
 }
 
 /// 生のリソース（管理 API の `config_dump`・再変換用）。
@@ -156,6 +158,18 @@ async fn session(
             _ => HashMap::new(),
         }
     };
+    if cfg.workload_discovery {
+        send(
+            &stream,
+            p::DeltaDiscoveryRequest {
+                node: Some(cfg.node.clone()),
+                type_url: p::TYPE_WORKLOAD.into(),
+                resource_names_subscribe: vec!["*".into()],
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     for (i, ty) in [p::TYPE_CLUSTER, p::TYPE_LISTENER].into_iter().enumerate() {
         send(
             &stream,
@@ -333,6 +347,7 @@ fn handle(resp: p::DeltaDiscoveryResponse, subs: &mut Subs) -> Vec<p::DeltaDisco
         p::TYPE_ENDPOINT => apply_endpoints(&resp, subs, &mut errors),
         p::TYPE_SECRET => apply_secrets(&resp, &mut errors),
         p::TYPE_ECDS => apply_ecds(&resp, &mut errors),
+        p::TYPE_WORKLOAD => apply_workloads(&resp),
         other => {
             // 購読していない型（Istio の拡張等）。ACK だけ返す
             debug!("[xds] ignoring resources of type {}", other);
@@ -456,6 +471,10 @@ fn apply_clusters(
     let unsub: Vec<String> = subs.eds.difference(&wanted).cloned().collect();
     for n in &unsub {
         raw.endpoints.remove(n);
+        crate::mesh::peer::set_endpoint_workloads(n, None);
+    }
+    if !unsub.is_empty() {
+        crate::mesh::peer::publish_endpoint_workloads();
     }
     // 既に届いている EDS は新しいスロットにも入れる
     for (eds_name, slots) in &eds_slots {
@@ -617,15 +636,32 @@ fn apply_endpoints(resp: &p::DeltaDiscoveryResponse, subs: &mut Subs, errors: &m
         decode_resources(resp, p::TYPE_ENDPOINT, errors);
     let mut raw = RAW.lock().unwrap_or_else(|e| e.into_inner());
     for (name, version, la) in items {
+        let set = translate::endpoint_set(&la, false);
+        // 受け側の送信元の特定（ヘッダの無い相手。Envoy の workload_discovery の代わり）
+        let wl: Vec<(std::net::IpAddr, Arc<crate::mesh::peer::Workload>)> = set
+            .endpoints
+            .iter()
+            .filter(|e| !e.workload.is_empty())
+            .filter_map(|e| {
+                crate::mesh::peer::from_endpoint_workload(&e.workload)
+                    .map(|w| (e.addr.ip(), Arc::new(w)))
+            })
+            .collect();
+        crate::mesh::peer::set_endpoint_workloads(&name, Some(wl));
         if let Some(slots) = subs.eds_slots.get(&name) {
             // スロットごとに前の状態（同時要求数・外れ値検出）を引き継ぐ
+            let mut set = Some(set);
             for s in slots {
-                s.replace_endpoints(translate::endpoint_set(&la, false));
+                s.replace_endpoints(
+                    set.take()
+                        .unwrap_or_else(|| translate::endpoint_set(&la, false)),
+                );
             }
         }
         raw.endpoints.insert(name, (version, la));
     }
     for name in &resp.removed_resources {
+        crate::mesh::peer::set_endpoint_workloads(name, None);
         raw.endpoints.remove(name);
         if let Some(slots) = subs.eds_slots.get(name) {
             for s in slots {
@@ -633,7 +669,64 @@ fn apply_endpoints(resp: &p::DeltaDiscoveryResponse, subs: &mut Subs, errors: &m
             }
         }
     }
+    crate::mesh::peer::publish_endpoint_workloads();
     state().eds_updates.fetch_add(1, Ordering::Relaxed);
+}
+
+/// WDS: 送信元の IP → ワークロード（受け側の観測のラベル。Envoy の workload_discovery と同じ使い方）。
+fn apply_workloads(resp: &p::DeltaDiscoveryResponse) {
+    for r in &resp.resources {
+        let Some(any) = &r.resource else { continue };
+        let Ok(w) = p::WdsWorkload::decode(any.value.as_slice()) else {
+            continue;
+        };
+        let wl = Arc::new(crate::mesh::peer::Workload {
+            name: if w.workload_name.is_empty() {
+                w.name.clone()
+            } else {
+                w.workload_name.clone()
+            },
+            namespace: w.namespace.clone(),
+            app: w.canonical_name.clone(),
+            version: w.canonical_revision.clone(),
+            canonical_service: w.canonical_name.clone(),
+            canonical_revision: w.canonical_revision.clone(),
+            cluster: w.cluster_id.clone(),
+            principal: if w.service_account.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "spiffe://{}/ns/{}/sa/{}",
+                    if w.trust_domain.is_empty() {
+                        "cluster.local"
+                    } else {
+                        w.trust_domain.as_str()
+                    },
+                    w.namespace,
+                    w.service_account
+                )
+            },
+        });
+        let ips: Vec<(std::net::IpAddr, Arc<crate::mesh::peer::Workload>)> = w
+            .addresses
+            .iter()
+            .filter_map(|a| match a.len() {
+                4 => Some(std::net::IpAddr::from(
+                    <[u8; 4]>::try_from(a.as_slice()).ok()?,
+                )),
+                16 => Some(std::net::IpAddr::from(
+                    <[u8; 16]>::try_from(a.as_slice()).ok()?,
+                )),
+                _ => None,
+            })
+            .map(|ip| (ip, wl.clone()))
+            .collect();
+        crate::mesh::peer::set_endpoint_workloads(&format!("wds:{}", r.name), Some(ips));
+    }
+    for name in &resp.removed_resources {
+        crate::mesh::peer::set_endpoint_workloads(&format!("wds:{}", name), None);
+    }
+    crate::mesh::peer::publish_endpoint_workloads();
 }
 
 fn apply_secrets(resp: &p::DeltaDiscoveryResponse, errors: &mut Vec<String>) {
