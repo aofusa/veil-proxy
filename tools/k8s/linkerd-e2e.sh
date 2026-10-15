@@ -455,9 +455,9 @@ viz() {
       veil) linkerd inject --proxy-image "$VEIL_IMAGE" --proxy-version "$VEIL_VERSION" --image-pull-policy IfNotPresent "$TMPDIR/$app-$MODE.yml" ;;
       mixed) linkerd inject "$TMPDIR/$app-$MODE.yml" | python3 -c '
 import sys, yaml
-docs = list(yaml.safe_load_all(sys.stdin))
+docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
 for d in docs:
-    if d and d.get("kind") == "Deployment" and d["metadata"]["name"] in ("web", "emoji", "webapp", "books"):
+    if d.get("kind") == "Deployment" and d["metadata"]["name"] in ("web", "emoji", "webapp", "books"):
         a = d["spec"]["template"]["metadata"].setdefault("annotations", {})
         a["config.linkerd.io/proxy-image"] = sys.argv[1]
         a["config.linkerd.io/proxy-version"] = sys.argv[2]
