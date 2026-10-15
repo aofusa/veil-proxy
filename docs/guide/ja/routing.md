@@ -29,6 +29,7 @@
 | `Proxy` | HTTPSプロキシ（SNI指定） | `{ type = "Proxy", url = "https://192.168.1.100", sni_name = "api.example.com" }` |
 | `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
 | `Redirect` | HTTPリダイレクト | `{ type = "Redirect", redirect_url = "https://new.example.com", redirect_status = 301 }` |
+| `Respond` | 固定応答（F-219） | `{ type = "Respond", status = 200, body = "ok", content_type = "text/plain" }` |
 
 > **Note**: `Proxy` タイプは `url`（単一バックエンド）または `upstream`（ロードバランシング）のいずれかを指定します。WebSocketは両方で自動サポートされます。HTTPSバックエンドへのIP直打ち時は `sni_name` でSNI名を指定可能です。
 
@@ -870,6 +871,61 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 | IPv4 CIDR | `192.168.0.0/24` |
 | 単一IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
+
+## ルート単位のトラフィック制御（F-219）
+
+`type = "Respond"` は固定応答を返す。`[route.traffic]` は任意のルートに重み付き分割・フォルト注入（中断）・CORS の
+プリフライトへの応答を足す。どれも設定のロード時に解決し、要求のたびには作っておいたバックエンドから 1 つ選ぶだけ
+（分割と中断は乱数 1 個）。`[route.traffic]` の無いルートには影響しない。HTTP/1.1・HTTP/2・HTTP/3 のどれでも効く。
+
+```toml
+# 固定応答（Envoy の direct_response 相当）
+[[route]]
+[route.conditions]
+path = "/healthz"
+[route.action]
+type = "Respond"
+status = 200                 # 既定 200
+body = "ok"
+content_type = "text/plain"  # 任意
+
+# カナリア: 90% を stable、10% を canary へ（upstream の名前か URL）
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "stable"          # 必須のまま（分割が当たらないときに使う）
+[route.traffic]
+split = [
+  { upstream = "stable", weight = 90 },
+  { upstream = "canary", weight = 10 },
+  # { url = "http://10.0.0.9:8080", weight = 5, use_h2c = false },
+]
+
+# フォルト注入: 5% の要求を 503 で中断する
+[route.traffic.fault]
+abort_status = 503
+abort_percent = 5.0          # 0〜100、既定 100
+
+# CORS のプリフライト（Origin と Access-Control-Request-Method の付いた OPTIONS）
+[route.traffic.cors]
+allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
+allow_methods = ["GET", "POST"]
+allow_headers = ["content-type", "authorization"]
+expose_headers = []
+max_age_secs = 600
+allow_credentials = false    # "*" とは併用できない
+```
+
+- 分割先にもルートの `security`・`compression`・`buffering`・`modules` が効く（action と同じ）。
+- プリフライトへの応答は `200` と `Access-Control-Allow-*` のヘッダで、一致したオリジンをそのまま返す（`Vary: Origin`）。
+  他のオリジンからのプリフライトと、プリフライトでない要求は action へ行く。実際の応答の
+  `Access-Control-Allow-Origin` は `[route.security] add_response_headers` で付ける。
+- フォルトの中断を設定したルートの要求は、HTTP/2・HTTP/3 ではバッファ経路を通る（判定は要求をディスパッチするときの 1 回）。
+- TOML のルートにはまだ無いもの: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
+  メッシュのデータプレーンは Istio / Linkerd のポリシーからこれらを実装している（[mesh.md](mesh.md)）。TOML のルートでは
+  上流のタイムアウトと冪等な要求の再送（[load-balancing.md](load-balancing.md)）を使う。
 
 ## リダイレクト
 

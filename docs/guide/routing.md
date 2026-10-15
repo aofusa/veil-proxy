@@ -29,6 +29,7 @@ Routes are evaluated in array order (first-match). All routes use the unified `[
 | `Proxy` | HTTPS proxy (with SNI) | `{ type = "Proxy", url = "https://192.168.1.100", sni_name = "api.example.com" }` |
 | `File` | Static file serving | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
 | `Redirect` | HTTP redirect | `{ type = "Redirect", redirect_url = "https://new.example.com", redirect_status = 301 }` |
+| `Respond` | Fixed response (F-219) | `{ type = "Respond", status = 200, body = "ok", content_type = "text/plain" }` |
 
 > **Note**: `Proxy` type uses either `url` (single backend) or `upstream` (load balancing). WebSocket is automatically supported for both. When connecting to HTTPS backends via IP, you can specify the SNI name with `sni_name`.
 
@@ -874,6 +875,63 @@ IP restrictions are evaluated in **deny → allow** order (deny takes priority).
 | IPv4 CIDR | `192.168.0.0/24` |
 | Single IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
+
+## Per-Route Traffic Control (F-219)
+
+`type = "Respond"` returns a fixed response, and `[route.traffic]` adds weighted splits, fault injection (abort) and
+CORS preflight answers to any route. They are resolved when the configuration is loaded; per request veil only picks
+one of the prebuilt backends (one random number for splits and faults), and routes without `[route.traffic]` are
+unaffected. All of them work on HTTP/1.1, HTTP/2 and HTTP/3.
+
+```toml
+# Fixed response (Envoy's direct_response)
+[[route]]
+[route.conditions]
+path = "/healthz"
+[route.action]
+type = "Respond"
+status = 200                 # default 200
+body = "ok"
+content_type = "text/plain"  # optional
+
+# Canary: 90% to the stable pool, 10% to the canary (upstream names or URLs)
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "stable"          # still required; used when no split entry applies
+[route.traffic]
+split = [
+  { upstream = "stable", weight = 90 },
+  { upstream = "canary", weight = 10 },
+  # { url = "http://10.0.0.9:8080", weight = 5, use_h2c = false },
+]
+
+# Fault injection: abort 5% of the requests with 503
+[route.traffic.fault]
+abort_status = 503
+abort_percent = 5.0          # 0..=100, default 100
+
+# CORS preflight (OPTIONS with Origin and Access-Control-Request-Method)
+[route.traffic.cors]
+allow_origins = ["https://app.example.com"]   # exact matches, or "*"
+allow_methods = ["GET", "POST"]
+allow_headers = ["content-type", "authorization"]
+expose_headers = []
+max_age_secs = 600
+allow_credentials = false    # cannot be combined with "*"
+```
+
+- A split entry uses the route's `security`, `compression`, `buffering` and `modules`, like the action itself.
+- The preflight answer is `200` with the `Access-Control-Allow-*` headers and echoes the matching origin
+  (`Vary: Origin`). Preflights from other origins, and all non-preflight requests, go to the action. Add
+  `Access-Control-Allow-Origin` to actual responses with `[route.security] add_response_headers`.
+- When the fault abort applies to a route, its requests take the buffered path on HTTP/2 and HTTP/3 (the decision
+  is made once, when the request is dispatched).
+- Not available on TOML routes yet: per-route request timeouts, conditional retries, mirroring and fault delays.
+  The mesh data plane implements them from Istio / Linkerd policies ([mesh.md](mesh.md)); for TOML routes use the
+  upstream timeouts and the idempotent retry ([load-balancing.md](load-balancing.md)).
 
 ## Redirect
 

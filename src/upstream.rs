@@ -869,6 +869,74 @@ pub fn find_backend_unified(
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+    find_backend_inner(
+        host,
+        path,
+        method,
+        headers,
+        raw_query,
+        source_ip,
+        routes,
+        upstream_groups,
+        true,
+    )
+}
+
+/// ストリーミングにするかの下見用（HTTP/2 の `h2_route_streaming_plan`・HTTP/3 の `classify`）。
+/// ルートのトラフィック制御（F-219）の乱数を引かない（下見と本番で 2 回引かない）。
+#[allow(clippy::too_many_arguments)]
+pub fn find_backend_preview(
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
+    source_ip: &SocketAddr,
+    routes: &[Route],
+    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+    find_backend_inner(
+        host,
+        path,
+        method,
+        headers,
+        raw_query,
+        source_ip,
+        routes,
+        upstream_groups,
+        false,
+    )
+}
+
+/// 照合したルートの Backend（トラフィック制御があればそれで選ぶ。F-219）。
+#[inline]
+fn route_backend(
+    route: &Route,
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+    method: &[u8],
+    headers: &[(&[u8], &[u8])],
+    draw: bool,
+) -> io::Result<Backend> {
+    if let Some(t) = &route.resolved_traffic {
+        if let Some(b) = t.select(method, headers, draw) {
+            return Ok(b);
+        }
+    }
+    load_backend(route, upstream_groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_backend_inner(
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
+    source_ip: &SocketAddr,
+    routes: &[Route],
+    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    draw: bool,
+) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
     let optimized_router = &config.optimized_router;
@@ -898,7 +966,7 @@ pub fn find_backend_unified(
                 raw_query,
                 source_ip,
             ) {
-                if let Ok(backend) = load_backend(route, upstream_groups) {
+                if let Ok(backend) = route_backend(route, upstream_groups, method, headers, draw) {
                     // F-159: 解決済みなら Arc clone のみ（malloc なし）。
                     let prefix = route
                         .resolved_path_prefix
@@ -935,6 +1003,7 @@ pub fn find_backend_unified(
             upstream_groups,
             &cache_key,
             optimized_router,
+            draw,
         );
     }
 
@@ -955,7 +1024,7 @@ pub fn find_backend_unified(
                     "[Routing] Matched route index: {} (path={:?} action={:?})",
                     route_idx, route.conditions.path, route.action
                 );
-                match load_backend(route, upstream_groups) {
+                match route_backend(route, upstream_groups, method, headers, draw) {
                     Ok(backend) => {
                         // F-159: 解決済みなら Arc clone のみ（malloc なし）。
                         let prefix = route
@@ -1076,6 +1145,7 @@ pub(crate) fn find_backend_linear(
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
     cache_key: &routing::RouteCacheKey,
     optimized_router: &routing::OptimizedRouter,
+    draw: bool,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 配列の順序で評価（first-match）
     for (i, route) in routes.iter().enumerate() {
@@ -1094,7 +1164,7 @@ pub(crate) fn find_backend_linear(
                 "Route[{}] matched (linear fallback): host={:?} path={:?} method={:?}",
                 i, route.conditions.host, route.conditions.path, route.conditions.method
             );
-            match load_backend(route, upstream_groups) {
+            match route_backend(route, upstream_groups, method, headers, draw) {
                 Ok(backend) => {
                     // F-159: 解決済みなら Arc clone のみ（malloc なし）。
                     let prefix = route

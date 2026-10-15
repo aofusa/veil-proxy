@@ -1391,7 +1391,7 @@ impl Http3Handler {
         let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
         let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
 
-        let backend_result = find_backend_unified(
+        let backend_result = crate::upstream::find_backend_preview(
             authority,
             path_wo_query,
             method,
@@ -1403,7 +1403,7 @@ impl Http3Handler {
         )
         .or_else(|| {
             if !authority.is_empty() {
-                find_backend_unified(
+                crate::upstream::find_backend_preview(
                     b"",
                     path_wo_query,
                     method,
@@ -3105,6 +3105,22 @@ impl H3BufferedTask {
                 })
                 .await
                 .unwrap_or((404, 9))
+            }
+            Backend::Respond(r) => {
+                // 固定応答（F-219）。ヘッダはスタック上の配列へ参照を並べる
+                let mut hs: [(&[u8], &[u8]); 12] = [(&[], &[]); 12];
+                let n = r.headers.len().min(hs.len() - 1);
+                for (slot, (k, v)) in hs.iter_mut().zip(r.headers.iter().take(n)) {
+                    *slot = (k.as_ref(), v.as_ref());
+                }
+                hs[n] = (b"server", b"veil/http3");
+                match self
+                    .send_response(r.status, &hs[..n + 1], Some(r.body.clone()))
+                    .await
+                {
+                    Ok(()) => (r.status, r.body.len()),
+                    Err(_) => (500, 0),
+                }
             }
             Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
                 .handle_redirect(&redirect_url, status_code, preserve_path, path, &prefix)

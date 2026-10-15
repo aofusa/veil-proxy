@@ -1379,3 +1379,146 @@ expected_san = ["spiffe://test/other"]
     let bad = http1_get(front_port, "/bad").expect("front /bad");
     assert_eq!(bad.status, 502, "upstream with a different SAN must fail");
 }
+
+// ===================== F-219（TOML のルート単位のトラフィック制御） =====================
+
+/// 固定応答（`type = "Respond"`）・重み付き分割・フォルトの中断・CORS のプリフライトを、HTTP/1.1 と h2c で確かめる。
+/// 分割先は同じ veil の別ルート（`/a`・`/b` の固定応答）。
+#[test]
+fn f219_route_traffic_respond_split_fault_cors() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+threads = 1
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+path = "/a"
+[route.action]
+type = "Respond"
+body = "A"
+
+[[route]]
+[route.conditions]
+path = "/b"
+[route.action]
+type = "Respond"
+body = "B"
+
+[[route]]
+[route.conditions]
+path = "/direct"
+[route.action]
+type = "Respond"
+status = 418
+body = "teapot"
+content_type = "text/plain"
+
+[[route]]
+[route.conditions]
+path = "/split"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/a"
+[route.traffic]
+split = [
+  {{ url = "http://127.0.0.1:{port}/a", weight = 80 }},
+  {{ url = "http://127.0.0.1:{port}/b", weight = 20 }},
+]
+
+[[route]]
+[route.conditions]
+path = "/fault"
+[route.action]
+type = "Respond"
+body = "not aborted"
+[route.traffic.fault]
+abort_status = 503
+abort_percent = 100
+
+[[route]]
+[route.conditions]
+path = "/cors"
+[route.action]
+type = "Respond"
+body = "actual"
+[route.traffic.cors]
+allow_origins = ["https://a.example"]
+allow_methods = ["GET", "POST"]
+max_age_secs = 600
+"#
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(wait_for_port(port, Duration::from_secs(20)), "{}", veil.log());
+
+    // 固定応答
+    let r = http1_get(port, "/direct").unwrap();
+    assert_eq!(r.status, 418);
+    assert_eq!(r.text(), "teapot");
+    assert_eq!(r.header("content-type"), Some("text/plain"));
+    let (st, body) = h2c_get(port, "/direct");
+    assert_eq!((st, body.as_slice()), (418, &b"teapot"[..]));
+
+    // 重み付き分割（80:20）
+    let mut a = 0;
+    let n = 200;
+    for _ in 0..n {
+        let r = http1_get(port, "/split").unwrap();
+        assert_eq!(r.status, 200, "{}", veil.log());
+        match r.text().as_str() {
+            "A" => a += 1,
+            "B" => {}
+            other => panic!("unexpected body {other:?}"),
+        }
+    }
+    assert!((130..=190).contains(&a), "A={a} of {n}");
+    let (st, _) = h2c_get(port, "/split");
+    assert_eq!(st, 200);
+
+    // フォルトの中断（100%）。h2c はストリーミングの下見を通る経路でも 1 回だけ判定する
+    assert_eq!(http1_get(port, "/fault").unwrap().status, 503);
+    let (st, body) = h2c_get(port, "/fault");
+    assert_eq!((st, body.as_slice()), (503, &b"fault filter abort"[..]));
+
+    // CORS のプリフライト（一覧のオリジンだけ）。プリフライトでない要求は action のまま
+    let pre = http1_request(
+        port,
+        "OPTIONS",
+        "/cors",
+        &[
+            ("Origin", "https://a.example"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(pre.status, 200);
+    assert_eq!(
+        pre.header("access-control-allow-origin"),
+        Some("https://a.example")
+    );
+    assert_eq!(pre.header("access-control-allow-methods"), Some("GET,POST"));
+    assert_eq!(pre.header("access-control-max-age"), Some("600"));
+    let other = http1_request(
+        port,
+        "OPTIONS",
+        "/cors",
+        &[
+            ("Origin", "https://evil.example"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        b"",
+    )
+    .unwrap();
+    assert!(other.header("access-control-allow-origin").is_none());
+    assert_eq!(http1_get(port, "/cors").unwrap().text(), "actual");
+}

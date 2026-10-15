@@ -95,6 +95,14 @@ servers = ["http://node1:8080", "http://node2:8080"]
 
 > **Note**: Uses a 150-vnode ring per server (xxh3 hash). When a server becomes unhealthy it is excluded and the next node in the ring takes over.
 
+### Splitting Between Upstream Groups and Retries
+
+Weights on servers balance inside one group. To send a share of a route's traffic to a different group (a canary
+release), use `[route.traffic] split` ([routing.md](routing.md#per-route-traffic-control-f-219)).
+
+When a pooled upstream connection turns out to be closed before any response byte, veil resends an idempotent
+request whose body it has fully received once on a new connection (F-177). Other requests are not retried.
+
 ### Compatibility with Single Backend
 
 The traditional `url` specification continues to work:

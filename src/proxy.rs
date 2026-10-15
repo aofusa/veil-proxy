@@ -1481,7 +1481,7 @@ where
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
 
-    let backend_result = find_backend_unified(
+    let backend_result = crate::upstream::find_backend_preview(
         &authority,
         path_wo_query,
         &method,
@@ -1493,7 +1493,7 @@ where
     )
     .or_else(|| {
         if !authority.is_empty() {
-            find_backend_unified(
+            crate::upstream::find_backend_preview(
                 b"",
                 path_wo_query,
                 &method,
@@ -2081,6 +2081,12 @@ async fn h2_dispatch(
                 notify,
             )
             .await
+        }
+        Backend::Respond(r) => {
+            // 固定応答（F-219）
+            let mut headers = h2_base_headers(false);
+            headers.extend(r.headers.iter().cloned());
+            h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             h2_redirect(
@@ -6750,6 +6756,28 @@ async fn handle_backend(
                 static_file_cache_config.as_deref(),
             )
             .await
+        }
+        Backend::Respond(r) => {
+            // 固定応答（F-219）。応答全体はロード時に組み立て済み（Bytes の参照カウントだけ）
+            let full = if client_wants_close {
+                &r.h1_close
+            } else {
+                &r.h1_keepalive
+            };
+            let out = if method.as_ref() == b"HEAD" {
+                full.slice(..full.len() - r.body.len())
+            } else {
+                full.clone()
+            };
+            match timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await {
+                Ok((Ok(_), _)) => Some((
+                    tls_stream,
+                    r.status,
+                    r.body.len() as u64,
+                    client_wants_close,
+                )),
+                _ => None,
+            }
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(

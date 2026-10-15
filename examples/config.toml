@@ -2358,6 +2358,37 @@ revalidate_mtime = false
 # # /legacy/users → https://example.com/v2/users
 
 # ------------------------------------------
+# 固定応答・ルート単位のトラフィック制御（F-219）
+# ------------------------------------------
+# 固定応答（Envoy の direct_response 相当）
+# [route.action]
+# type = "Respond"
+# status = 200                 # 既定 200
+# body = "ok"
+# content_type = "text/plain"  # 任意
+#
+# [route.traffic] は任意のルートに書ける（ロード時に解決。無いルートには影響しない）
+# [route.traffic]
+# # 重み付き分割（upstream の名前か url。分割先にもルートの security 等が効く）
+# split = [
+#   { upstream = "stable", weight = 90 },
+#   { upstream = "canary", weight = 10 },
+#   # { url = "http://10.0.0.9:8080", weight = 5, use_h2c = false },
+# ]
+# # フォルト注入（中断）。HTTP/2・HTTP/3 ではこのルートの要求はバッファ経路になる
+# [route.traffic.fault]
+# abort_status = 503
+# abort_percent = 5.0          # 0〜100、既定 100
+# # CORS のプリフライト（OPTIONS + Origin + Access-Control-Request-Method）に 200 で答える
+# [route.traffic.cors]
+# allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
+# allow_methods = ["GET", "POST"]
+# allow_headers = ["content-type", "authorization"]
+# expose_headers = []
+# max_age_secs = 600
+# allow_credentials = false    # "*" とは併用できない
+
+# ------------------------------------------
 # ロードバランシング（Upstream参照）
 # ------------------------------------------
 # upstreams セクションで定義したグループを参照

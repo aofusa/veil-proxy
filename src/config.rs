@@ -3008,6 +3008,13 @@ pub struct Route {
     /// 設定ロード時に解決済みのパスプレフィックス（`extract_path_prefix` の結果、F-159）。
     #[serde(skip)]
     pub resolved_path_prefix: Option<Arc<[u8]>>,
+
+    /// ルート単位のトラフィック制御（重み付き分割・フォルトの中断・CORS のプリフライト。F-219）
+    #[serde(default)]
+    pub traffic: Option<crate::route_traffic::TrafficConfig>,
+    /// 設定ロード時に解決済みの `traffic`（F-219。無ければ `None` でホットパスは分岐 1 個だけ）
+    #[serde(skip)]
+    pub resolved_traffic: Option<Arc<crate::route_traffic::TrafficPolicy>>,
 }
 
 #[derive(Deserialize)]
@@ -4318,6 +4325,12 @@ pub enum BackendConfig {
     /// `handler` feature 無効のビルドでは `type = "Handler"` は設定エラーになる。
     #[cfg(feature = "handler")]
     Handler { handler: String },
+    /// 固定応答（F-219、Envoy の `direct_response` 相当）。`status`・`body`・`content_type`
+    Respond {
+        status: u16,
+        body: String,
+        content_type: Option<String>,
+    },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -4360,6 +4373,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut handler: Option<String> = None;
                 // 上流の mTLS（Proxy 用、F-217）
                 let mut tls = crate::upstream_tls::UpstreamTlsSettings::default();
+                // 固定応答（Respond 用、F-219）
+                let mut status: Option<u16> = None;
+                let mut body: Option<String> = None;
+                let mut content_type: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -4385,6 +4402,9 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "tls_client_key" => tls.tls_client_key = map.next_value()?,
                         "tls_ca" => tls.tls_ca = map.next_value()?,
                         "expected_san" => tls.expected_san = map.next_value()?,
+                        "status" => status = Some(map.next_value()?),
+                        "body" => body = Some(map.next_value()?),
+                        "content_type" => content_type = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -4430,6 +4450,20 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             })
                         }
                     }
+                    "Respond" => {
+                        let status = status.unwrap_or(200);
+                        if !(100..=599).contains(&status) {
+                            return Err(serde::de::Error::custom(format!(
+                                "invalid status: {}",
+                                status
+                            )));
+                        }
+                        Ok(BackendConfig::Respond {
+                            status,
+                            body: body.unwrap_or_default(),
+                            content_type,
+                        })
+                    }
                     "Redirect" => {
                         let redirect_url = redirect_url
                             .ok_or_else(|| serde::de::Error::missing_field("redirect_url"))?;
@@ -4467,6 +4501,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
 
 #[derive(Clone)]
 pub enum Backend {
+    /// 固定応答（F-219: `type = "Respond"`・フォルトの中断・CORS のプリフライト）
+    Respond(Arc<crate::route_traffic::FixedResponse>),
     /// Proxy バックエンド（ロードバランシング対応）
     /// - Arc<UpstreamGroup>: アップストリームグループ（単一または複数バックエンド）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
@@ -4550,6 +4586,7 @@ impl std::fmt::Debug for Backend {
             Backend::MemoryFile(..) => write!(f, "Backend::MemoryFile(..)"),
             Backend::SendFile(..) => write!(f, "Backend::SendFile(..)"),
             Backend::Redirect(..) => write!(f, "Backend::Redirect(..)"),
+            Backend::Respond(..) => write!(f, "Backend::Respond(..)"),
             #[cfg(feature = "handler")]
             Backend::Handler(..) => write!(f, "Backend::Handler(..)"),
         }
@@ -4567,7 +4604,7 @@ impl Backend {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
             Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
-            Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
+            Backend::Redirect(_, _, _, _) | Backend::Respond(_) => &DEFAULT_SECURITY,
             #[cfg(feature = "handler")]
             Backend::Handler(_, security, _) => security,
         }
@@ -4582,6 +4619,7 @@ impl Backend {
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
             Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules) => modules.as_ref(),
+            Backend::Respond(_) => None,
             #[cfg(feature = "handler")]
             Backend::Handler(_, _, modules) => modules.as_ref(),
         }
@@ -4601,6 +4639,7 @@ impl Backend {
             Backend::Redirect(_, _, _, modules) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
+            Backend::Respond(_) => None,
             #[cfg(feature = "handler")]
             Backend::Handler(_, _, modules) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
@@ -6310,6 +6349,7 @@ fn validate_route_config(
                 ));
             }
         }
+        BackendConfig::Respond { .. } => {}
         #[cfg(feature = "handler")]
         BackendConfig::Handler { handler } => {
             if crate::api::handler::lookup(handler).is_none() {
@@ -7183,6 +7223,9 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
             route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
+            route.resolved_traffic =
+                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -7380,6 +7423,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
             route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
+            route.resolved_traffic =
+                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -8213,6 +8259,26 @@ fn build_backend(
                 }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
+        }
+        BackendConfig::Respond {
+            status,
+            body,
+            content_type,
+        } => {
+            let mut headers = Vec::with_capacity(1);
+            if let Some(ct) = content_type {
+                headers.push((
+                    bytes::Bytes::from_static(b"content-type"),
+                    bytes::Bytes::from(ct.clone()),
+                ));
+            }
+            Ok(Backend::Respond(Arc::new(
+                crate::route_traffic::FixedResponse::new(
+                    *status,
+                    headers,
+                    bytes::Bytes::from(body.clone()),
+                ),
+            )))
         }
         BackendConfig::Redirect {
             redirect_url,
