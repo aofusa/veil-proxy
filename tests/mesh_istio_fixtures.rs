@@ -148,6 +148,17 @@ fn istio_outbound_config_translates_without_nack() {
             v1.tls_default.is_some() || !v1.tls_matches.is_empty(),
             "{v}: auto mTLS"
         );
+        // 上流の ID（auto mTLS の SAN の期待値 = 宛先のサービスアカウント）
+        let tls = v1
+            .tls_matches
+            .iter()
+            .find_map(|(_, t)| t.clone())
+            .or(v1.tls_default.clone());
+        assert_eq!(
+            tls.and_then(|t| t.principal.clone()).as_deref(),
+            Some("spiffe://cluster.local/ns/xds-fixtures/sa/default"),
+            "{v}: upstream principal"
+        );
         // whoami の一貫性ハッシュ
         let who = a
             .clusters
@@ -246,6 +257,8 @@ fn istio_inbound_security_config_translates_without_nack() {
                 .all(|c| c.tls.as_ref().is_some_and(|t| t.require_client_cert)),
             "{v}: STRICT mTLS"
         );
+        // HTTP の標準メトリクス（HCM の istio.stats）を数える
+        assert!(chains.iter().all(|c| c.stats), "{v}: istio.stats");
         // AuthorizationPolicy（DENY と ALLOW）と RequestAuthentication（JWT）が HTTP のフィルタに入っている
         let ChainAction::Http(h) = &chains[0].action else {
             panic!("{v}: not HTTP")

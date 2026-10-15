@@ -198,15 +198,17 @@ where
                 let keep = keep_alive && ok;
                 let _ = write_local(&mut io, &lr, is_grpc, &ctx, !keep).await;
                 let labels = ctx.labels(None, None, is_grpc);
-                super::stats::record_request(
-                    &labels,
-                    lr.status,
-                    lr.grpc_status,
-                    lr.flag,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                    req_body_len,
-                    lr.body.len() as u64,
-                );
+                if ctx.stats {
+                    super::stats::record_request(
+                        &labels,
+                        lr.status,
+                        lr.grpc_status,
+                        lr.flag,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        req_body_len,
+                        lr.body.len() as u64,
+                    );
+                }
                 l7::access_log(
                     &ctx,
                     &view,
@@ -252,16 +254,21 @@ where
                     origin.as_ref(),
                 )
                 .await;
-                let labels = ctx.labels(r.peer.clone(), r.svc.clone(), is_grpc);
-                super::stats::record_request(
-                    &labels,
-                    r.status,
-                    r.grpc,
-                    r.flag,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                    r.req_bytes,
-                    r.resp_bytes,
-                );
+                let mut labels = ctx.labels(r.peer.clone(), r.svc.clone(), is_grpc);
+                if ctx.direction != super::model::Direction::Inbound {
+                    labels.peer_principal = r.up_principal.clone();
+                }
+                if ctx.stats {
+                    super::stats::record_request(
+                        &labels,
+                        r.status,
+                        r.grpc,
+                        r.flag,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        r.req_bytes,
+                        r.resp_bytes,
+                    );
+                }
                 l7::access_log(
                     &ctx,
                     &view,
@@ -672,6 +679,8 @@ pub(crate) struct Outcome {
     /// 選んだエンドポイントの観測のラベルと相手の ID（Linkerd のメトリクス）
     pub ep_labels: Option<Arc<str>>,
     pub server_id: Option<Arc<str>>,
+    /// 上流の ID（outbound の destination_principal）
+    pub up_principal: Option<Arc<str>>,
 }
 
 /// 上流の応答のヘッダ。
@@ -831,6 +840,7 @@ where
         upstream_ms: None,
         ep_labels: None,
         server_id: None,
+        up_principal: None,
     };
     let fail = |status: u16, flag: ResponseFlag| LocalReply::new(status, flag);
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
@@ -863,6 +873,11 @@ where
             .as_ref()
             .filter(|t| t.mesh_mtls && t.transport.is_some())
             .map(|t| Arc::<str>::from(t.sni.as_str()));
+        out.up_principal = picked
+            .tls
+            .as_ref()
+            .filter(|t| t.mesh_mtls)
+            .and_then(|t| t.principal.clone());
         out.cluster = Some(picked.cfg.clone());
         let downstream_h2 = false;
         // Linkerd: 相手のプロキシが HTTP/2 を受けられる（ProtocolHint.H2）なら昇格して送る（`l5d-orig-proto`）

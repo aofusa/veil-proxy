@@ -290,15 +290,17 @@ async fn task(
         Decision::Local(lr) => {
             local(tx, notify, &lr, is_grpc, &c.hcm).await;
             let labels = c.labels(None, None, is_grpc);
-            super::stats::record_request(
-                &labels,
-                lr.status,
-                lr.grpc_status,
-                lr.flag,
-                start.elapsed().as_secs_f64() * 1000.0,
-                req_len,
-                lr.body.len() as u64,
-            );
+            if c.stats {
+                super::stats::record_request(
+                    &labels,
+                    lr.status,
+                    lr.grpc_status,
+                    lr.flag,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    req_len,
+                    lr.body.len() as u64,
+                );
+            }
             l7::access_log(
                 &c,
                 &view,
@@ -336,16 +338,21 @@ async fn task(
                 origin.as_ref(),
             )
             .await;
-            let labels = c.labels(o.peer.clone(), o.svc.clone(), is_grpc);
-            super::stats::record_request(
-                &labels,
-                o.status,
-                o.grpc,
-                o.flag,
-                start.elapsed().as_secs_f64() * 1000.0,
-                o.req_bytes.max(req_len),
-                o.resp_bytes,
-            );
+            let mut labels = c.labels(o.peer.clone(), o.svc.clone(), is_grpc);
+            if c.direction != super::model::Direction::Inbound {
+                labels.peer_principal = o.up_principal.clone();
+            }
+            if c.stats {
+                super::stats::record_request(
+                    &labels,
+                    o.status,
+                    o.grpc,
+                    o.flag,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    o.req_bytes.max(req_len),
+                    o.resp_bytes,
+                );
+            }
             l7::access_log(
                 &c,
                 &view,
@@ -397,6 +404,8 @@ pub(crate) struct Outcome {
     /// 選んだエンドポイントの観測のラベルと相手の ID（Linkerd のメトリクス）
     pub ep_labels: Option<Arc<str>>,
     pub server_id: Option<Arc<str>>,
+    /// 上流の ID（outbound の destination_principal）
+    pub up_principal: Option<Arc<str>>,
 }
 
 fn grpc_status_of(h: &[(Bytes, Bytes)]) -> Option<u32> {
@@ -438,6 +447,7 @@ async fn forward(
         upstream_ms: None,
         ep_labels: None,
         server_id: None,
+        up_principal: None,
     };
     let retry = f.action.retry.clone().or_else(|| f.vhost().retry.clone());
     let max_attempts = 1 + retry.as_ref().map_or(0, |r| r.num_retries);
@@ -475,6 +485,11 @@ async fn forward(
             .as_ref()
             .filter(|t| t.mesh_mtls && t.transport.is_some())
             .map(|t| Arc::<str>::from(t.sni.as_str()));
+        out.up_principal = picked
+            .tls
+            .as_ref()
+            .filter(|t| t.mesh_mtls)
+            .and_then(|t| t.principal.clone());
         out.cluster = Some(picked.cfg.clone());
         let (req_headers, peer_req) =
             l7::upstream_request_headers(c, f, headers, attempt, false, false);

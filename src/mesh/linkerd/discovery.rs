@@ -437,6 +437,7 @@ fn tls_for(identity: &str, sni: &str) -> Option<Arc<UpstreamTls>> {
         h2: plain,
         mesh_mtls: true,
         transport: mk(&[p::TRANSPORT_ALPN]),
+        principal: None,
     });
     cache.insert(key, t.clone());
     Some(t)

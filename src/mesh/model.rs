@@ -1103,6 +1103,9 @@ pub struct UpstreamTls {
     pub mesh_mtls: bool,
     /// Linkerd の opaque transport（ALPN `transport.l5d.io/v1`。F-223）
     pub transport: Option<Arc<rustls::ClientConfig>>,
+    /// 上流の ID（SAN の期待値が SPIFFE ID 1 つだけのとき。検証を通った相手はこの ID。outbound の
+    /// destination_principal。Envoy は上流の証明書の URI SAN を使う）
+    pub principal: Option<Arc<str>>,
 }
 
 #[derive(Debug, Default)]

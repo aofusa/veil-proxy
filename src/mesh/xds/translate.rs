@@ -383,6 +383,13 @@ pub fn upstream_tls(ctx: &p::UpstreamTlsContext) -> R<Arc<UpstreamTls>> {
         h2: mk(&h2)?,
         mesh_mtls,
         transport: None,
+        principal: match sans.as_slice() {
+            [m] => match &m.pattern {
+                StrMatch::Exact(id) if id.starts_with("spiffe://") => Some(Arc::from(id.as_str())),
+                _ => None,
+            },
+            _ => None,
+        },
     }))
 }
 
@@ -664,6 +671,16 @@ fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -
             let any = f.typed_config.as_ref().ok_or("HCM without config")?;
             let hcm: p::HttpConnectionManager =
                 decode_any(any, p::T_HCM).ok_or("invalid HttpConnectionManager")?;
+            // HTTP の標準メトリクスは HCM の HTTP フィルタの `istio.stats`（無いリスナー＝管理用は数えない）
+            if hcm.http_filters.iter().any(|hf| {
+                hf.name == "istio.stats"
+                    || hf
+                        .typed_config
+                        .as_ref()
+                        .is_some_and(|a| inner_type(a).ends_with("stats.PluginConfig"))
+            }) {
+                stats = true;
+            }
             action = Some(ChainAction::Http(Arc::new(http_cm(
                 &hcm,
                 reg,

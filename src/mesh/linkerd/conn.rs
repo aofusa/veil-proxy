@@ -66,6 +66,8 @@ fn ctx(
         sni: None,
         relookup: None,
         table_version: 0,
+        // Linkerd は自分のメトリクス（linkerd::metrics）を数える
+        stats: false,
     })
 }
 

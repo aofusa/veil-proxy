@@ -1132,7 +1132,9 @@ for p in json.load(sys.stdin)["items"]:
     ready = [c for c in p["status"]["conditions"] if c["type"] == "Ready" and c["status"] == "True"]
     if not ready:
         continue
-    img = [c["image"] for c in p["status"]["containerStatuses"] if c["name"] == "istio-proxy"][0]
+    # Istio 1.31 のサイドカーはネイティブのサイドカー（initContainers）
+    st = p["status"].get("containerStatuses", []) + p["status"].get("initContainerStatuses", [])
+    img = [c["image"] for c in st if c["name"] == "istio-proxy"][0]
     print("%.0f" % (ts(ready[0]["lastTransitionTime"]) - ts(p["metadata"]["creationTimestamp"])).total_seconds(), "veil" if "veil" in img else "envoy")
     break')"
   ok "productpage: Pod created -> Ready ${st% *}s (${st#* })"
@@ -1167,7 +1169,7 @@ EOF
   sleep 8
   local out pages
   out="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 2 -qps 10 -t 30s -timeout 10s -allow-initial-errors -loglevel Error http://productpage:9080/productpage 2>&1)"
-  if echo "$out" | awk '/^Code 200 :/{gsub(/[()%]/,"",$5); exit !($5 >= 99)} END{}' && echo "$out" | grep -q '^Code 200'; then
+  if echo "$out" | awk '/^Code 200 :/{gsub(/[()%]/,"",$5); exit !($5 + 0 >= 99)}' && echo "$out" | grep -q '^Code 200'; then
     ok "bookinfo productpage under load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; else bad "productpage load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; fi
   pages="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio curl -loglevel Error http://productpage:9080/productpage 2>/dev/null)"
   case "$pages" in
@@ -1213,7 +1215,9 @@ es = g["elements"].get("edges") or []
 mtls = [e for e in es if float(e["data"].get("isMTLS", 0) or 0) > 0]
 print(len(es), len(mtls), " ".join(sorted("%s>%s" % (nodes.get(e["data"]["source"]), nodes.get(e["data"]["target"])) for e in mtls)))' 2>/dev/null)"
   case "$kg" in
-    *productpage-v1\>details-v1*productpage-v1\>reviews-v*reviews-v*\>ratings-v1*) ok "Kiali graph: edges with the mTLS lock ($kg)" ;;
+    *productpage-v1\>details-v1*productpage-v1\>reviews-v*reviews-v*\>ratings-v1*)
+      # 全部の辺に鍵マーク（unknown への辺・平文の辺が無い）
+      if [ "${kg%% *}" = "$(echo "$kg" | awk '{print $2}')" ]; then ok "Kiali graph: every edge has the mTLS lock ($kg)"; else bad "Kiali graph has edges without mTLS: $kg"; fi ;;
     *) bad "Kiali graph: $kg" ;;
   esac
   # Jaeger: productpage → details / reviews → ratings が 1 本のトレースに繋がる

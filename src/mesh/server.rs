@@ -655,6 +655,7 @@ async fn serve_http(
         sni,
         relookup,
         table_version,
+        stats: chain.stats,
     });
     if h2 {
         super::h2::serve(ds, Vec::new(), ctx).await;

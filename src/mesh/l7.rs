@@ -32,6 +32,8 @@ pub struct ConnCtx {
     pub relookup: Option<Arc<Relookup>>,
     /// この文脈を作ったときのリスナーの表の版
     pub table_version: u64,
+    /// Istio の標準メトリクスを数えるか（フィルタチェーンに `istio.stats` がある。管理用のリスナー 15090・15021 は数えない）
+    pub stats: bool,
 }
 
 /// 接続のフィルタチェーンを選び直すのに要る属性。
@@ -98,6 +100,7 @@ impl ConnCtx {
             sni: self.sni.clone(),
             relookup: self.relookup.clone(),
             table_version: table.version,
+            stats: chain.stats,
         }))
     }
 
@@ -115,6 +118,7 @@ impl ConnCtx {
             sni: self.sni.clone(),
             relookup: self.relookup.clone(),
             table_version: self.table_version,
+            stats: self.stats,
         }
     }
 
