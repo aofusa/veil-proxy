@@ -74,18 +74,16 @@ fn apply(version: &str, app: &str) -> Applied {
                     },
                     None => a.errors.push(format!("listener {}: cannot decode", name)),
                 },
-                p::TYPE_ROUTE => {
-                    match decode_any::<p::RouteConfiguration>(any, p::TYPE_ROUTE) {
-                        Some(rc) => match translate::route_table(&rc, &mut a.reg) {
-                            Ok(t) => {
-                                let slot = a.reg.route_slot(&name);
-                                slot.table.store(Arc::new(t));
-                            }
-                            Err(e) => a.errors.push(format!("route {}: {}", name, e)),
-                        },
-                        None => a.errors.push(format!("route {}: cannot decode", name)),
-                    }
-                }
+                p::TYPE_ROUTE => match decode_any::<p::RouteConfiguration>(any, p::TYPE_ROUTE) {
+                    Some(rc) => match translate::route_table(&rc, &mut a.reg) {
+                        Ok(t) => {
+                            let slot = a.reg.route_slot(&name);
+                            slot.table.store(Arc::new(t));
+                        }
+                        Err(e) => a.errors.push(format!("route {}: {}", name, e)),
+                    },
+                    None => a.errors.push(format!("route {}: cannot decode", name)),
+                },
                 p::TYPE_ENDPOINT => {
                     match decode_any::<p::ClusterLoadAssignment>(any, p::TYPE_ENDPOINT) {
                         Some(la) => {
@@ -146,7 +144,10 @@ fn istio_outbound_config_translates_without_nack() {
         assert!(v1.outlier.is_some(), "{v}: outlierDetection");
         assert_eq!(v1.max_connections, 100, "{v}");
         assert_eq!(v1.max_requests_per_conn, 10, "{v}");
-        assert!(v1.tls_default.is_some() || !v1.tls_matches.is_empty(), "{v}: auto mTLS");
+        assert!(
+            v1.tls_default.is_some() || !v1.tls_matches.is_empty(),
+            "{v}: auto mTLS"
+        );
         // whoami の一貫性ハッシュ
         let who = a
             .clusters
@@ -154,11 +155,16 @@ fn istio_outbound_config_translates_without_nack() {
             .find(|(n, _)| n.starts_with("outbound|80||whoami.xds-fixtures."))
             .map(|(_, c)| c.clone())
             .unwrap_or_else(|| panic!("{v}: no whoami cluster"));
-        assert!(matches!(who.lb, LbPolicy::RingHash | LbPolicy::Maglev), "{v}: {:?}", who.lb);
+        assert!(
+            matches!(who.lb, LbPolicy::RingHash | LbPolicy::Maglev),
+            "{v}: {:?}",
+            who.lb
+        );
 
         // VirtualService: ヘッダの一致・フォルト・正規表現の書き換え・重み付き分割・リトライ・タイムアウト・ミラー・CORS
         let tables = route_tables(&a);
-        let vh = find_vhost(&tables, "fortio.xds-fixtures.").unwrap_or_else(|| panic!("{v}: no fortio vhost"));
+        let vh = find_vhost(&tables, "fortio.xds-fixtures.")
+            .unwrap_or_else(|| panic!("{v}: no fortio vhost"));
         assert!(vh.routes.len() >= 4, "{v}: {} routes", vh.routes.len());
         assert!(
             vh.routes[0].headers.iter().any(|h| h.name == "x-canary"),
@@ -172,7 +178,11 @@ fn istio_outbound_config_translates_without_nack() {
         };
         // Istio は正規表現の一致の rewrite.uri を prefix_rewrite で送る（パス全体の置き換え）
         assert!(matches!(vh.routes[2].path, PathMatch::Regex(_)), "{v}");
-        assert_eq!(fw.prefix_rewrite.as_deref(), Some(&b"/echo"[..]), "{v}: rewrite");
+        assert_eq!(
+            fw.prefix_rewrite.as_deref(),
+            Some(&b"/echo"[..]),
+            "{v}: rewrite"
+        );
         let RouteAction::Forward(fw) = &vh.routes[3].action else {
             panic!("{v}: default route is not a forward")
         };
@@ -187,12 +197,22 @@ fn istio_outbound_config_translates_without_nack() {
         );
         let r = fw.retry.as_ref().expect("retry");
         assert_eq!(r.num_retries, 3, "{v}");
-        assert!(r.on_5xx && r.on_reset && r.on_connect_failure, "{v}: {:?}", r);
+        assert!(
+            r.on_5xx && r.on_reset && r.on_connect_failure,
+            "{v}: {:?}",
+            r
+        );
         assert_eq!(fw.timeout, Some(std::time::Duration::from_secs(3)), "{v}");
         assert_eq!(fw.mirrors.len(), 1, "{v}: mirror");
         assert_eq!(fw.mirrors[0].1, 250_000, "{v}: mirror percentage");
-        assert!(vh.routes[3].cors.is_some() || vh.cors.is_some(), "{v}: CORS");
-        assert!(!vh.routes[3].request_ops.is_empty(), "{v}: header set/remove");
+        assert!(
+            vh.routes[3].cors.is_some() || vh.cors.is_some(),
+            "{v}: CORS"
+        );
+        assert!(
+            !vh.routes[3].request_ops.is_empty(),
+            "{v}: header set/remove"
+        );
 
         // ServiceEntry（MESH_EXTERNAL・DNS）
         assert!(
@@ -245,6 +265,9 @@ fn istio_inbound_security_config_translates_without_nack() {
                 _ => {}
             }
         }
-        assert!(allow >= 1 && deny >= 1 && jwt == 1, "{v}: allow={allow} deny={deny} jwt={jwt}");
+        assert!(
+            allow >= 1 && deny >= 1 && jwt == 1,
+            "{v}: allow={allow} deny={deny} jwt={jwt}"
+        );
     }
 }

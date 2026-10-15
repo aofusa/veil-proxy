@@ -755,7 +755,9 @@ pub fn rewritten_path(f: &Forward, path: &[u8]) -> Option<Bytes> {
         // 完全一致・正規表現の一致は、クエリを除いたパス全体を置き換える（Envoy と同じ。Istio は正規表現の
         // 一致の `rewrite.uri` を `prefix_rewrite` で送る）
         if let PathMatch::Exact(_) | PathMatch::Regex(_) = &f.route().path {
-            let q = memchr::memchr(b'?', path).map(|i| &path[i..]).unwrap_or(b"");
+            let q = memchr::memchr(b'?', path)
+                .map(|i| &path[i..])
+                .unwrap_or(b"");
             let mut b = BytesMut::with_capacity(pre.len() + q.len());
             b.extend_from_slice(pre);
             b.extend_from_slice(q);

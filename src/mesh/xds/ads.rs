@@ -306,9 +306,8 @@ fn grpc_error(headers: &[(Bytes, Bytes)]) -> Option<String> {
 /// 理由付き allow: xDS の専用スレッド（データプレーンの外）での同期のファイル書き込み。
 #[allow(clippy::disallowed_methods)]
 fn record(raw: &[u8], type_url: &str) {
-    static DIR: once_cell::sync::Lazy<Option<PathBuf>> = once_cell::sync::Lazy::new(|| {
-        std::env::var_os("VEIL_MESH_XDS_RECORD").map(PathBuf::from)
-    });
+    static DIR: once_cell::sync::Lazy<Option<PathBuf>> =
+        once_cell::sync::Lazy::new(|| std::env::var_os("VEIL_MESH_XDS_RECORD").map(PathBuf::from));
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let Some(dir) = DIR.as_ref() else { return };
     if type_url == p::TYPE_SECRET {
