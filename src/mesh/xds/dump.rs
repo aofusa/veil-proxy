@@ -13,6 +13,12 @@ fn addr_json(a: &Option<p::Address>) -> Value {
             "socket_address": {"address": sa.address, "port_value": sa.port_value}
         }),
         Some(p::address::Address::Pipe(pp)) => json!({"pipe": {"path": pp.path}}),
+        Some(p::address::Address::EnvoyInternalAddress(ia)) => json!({
+            "envoy_internal_address": {
+                "server_listener_name": ia.server_listener_name,
+                "endpoint_id": ia.endpoint_id
+            }
+        }),
         None => Value::Null,
     }
 }

@@ -214,6 +214,18 @@ fn any_bytes(a: &p::Any) -> Vec<u8> {
     a.value.clone()
 }
 
+fn is_typed_struct(any: &p::Any) -> bool {
+    any.type_url == p::T_TYPED_STRUCT_UDPA || any.type_url == p::T_TYPED_STRUCT_XDS
+}
+
+/// TypedStruct の中身（JSON の文字列）。
+fn typed_struct_json(any: &p::Any) -> String {
+    decode_any::<p::TypedStruct>(any, &any.type_url)
+        .and_then(|ts| ts.value)
+        .map(|v| super::struct_to_json(&v).to_string())
+        .unwrap_or_default()
+}
+
 /// Istio の拡張フィルタ（TypedStruct で包まれる）の実際の型 URL。
 fn inner_type(any: &p::Any) -> String {
     if any.type_url == p::T_TYPED_STRUCT_UDPA || any.type_url == p::T_TYPED_STRUCT_XDS {
@@ -382,6 +394,15 @@ fn transport_socket_upstream(ts: &p::TransportSocket) -> R<Option<Arc<UpstreamTl
     if any.type_url.ends_with("RawBuffer") {
         return Ok(None);
     }
+    if any.type_url == p::T_INTERNAL_UPSTREAM {
+        // 内部リスナーへの接続（ambient の waypoint）。中の transport socket を使う
+        let iu: p::InternalUpstreamTransport =
+            decode_any(any, p::T_INTERNAL_UPSTREAM).ok_or("invalid InternalUpstreamTransport")?;
+        return match &iu.transport_socket {
+            Some(ts) => transport_socket_upstream(ts),
+            None => Ok(None),
+        };
+    }
     Err(format!(
         "unsupported upstream transport socket {}",
         any.type_url
@@ -393,11 +414,13 @@ fn transport_socket_upstream(ts: &p::TransportSocket) -> R<Option<Arc<UpstreamTl
 // ---------------------------------------------------------------------------
 
 pub fn listener(l: &p::Listener, reg: &mut Registry) -> R<MeshListener> {
-    let addr = l
-        .address
-        .as_ref()
-        .and_then(|a| a.socket_addr())
-        .ok_or_else(|| format!("listener {}: unsupported address", l.name))?;
+    let internal = l.internal_listener.is_some();
+    let addr = match l.address.as_ref().and_then(|a| a.socket_addr()) {
+        Some(a) => a,
+        // 内部リスナーはアドレスを持たない（名前で引く）
+        None if internal => SocketAddr::from(([0, 0, 0, 0], 0)),
+        None => return Err(format!("listener {}: unsupported address", l.name)),
+    };
     let direction = match l.traffic_direction {
         1 => Direction::Inbound,
         2 => Direction::Outbound,
@@ -440,8 +463,15 @@ pub fn listener(l: &p::Listener, reg: &mut Registry) -> R<MeshListener> {
         )),
         None => None,
     };
+    let matcher = match &l.filter_chain_matcher {
+        Some(m) => Some(
+            chain_matcher(m, &l.filter_chains).map_err(|e| format!("listener {}: {}", l.name, e))?,
+        ),
+        None => None,
+    };
     let needs_sniff = tls_inspector
         || http_inspector
+        || matcher.is_some()
         || chains.iter().any(|c| {
             c.m.transport.is_some()
                 || !c.m.application_protocols.is_empty()
@@ -455,14 +485,104 @@ pub fn listener(l: &p::Listener, reg: &mut Registry) -> R<MeshListener> {
             .as_ref()
             .map(|b| b.value)
             .unwrap_or(false),
-        bind_to_port: l.bind_to_port.as_ref().map(|b| b.value).unwrap_or(true),
+        bind_to_port: !internal && l.bind_to_port.as_ref().map(|b| b.value).unwrap_or(true),
         direction,
         chains,
         default_chain,
         tls_inspector,
         http_inspector,
         needs_sniff,
+        internal,
+        matcher,
     })
+}
+
+/// `filter_chain_matcher`（matcher_tree）を変換する。アクションはフィルタチェーンの名前（`StringValue`）。
+fn chain_matcher(m: &p::XdsMatcher, chains: &[p::FilterChain]) -> R<ChainMatcher> {
+    let tree = match &m.matcher_type {
+        Some(p::xds_matcher::MatcherType::MatcherTree(t)) => t,
+        Some(p::xds_matcher::MatcherType::MatcherList(_)) => {
+            return Err("filter_chain_matcher: matcher_list is not supported".into());
+        }
+        None => return Err("filter_chain_matcher without a matcher".into()),
+    };
+    let input_ty = tree
+        .input
+        .as_ref()
+        .and_then(|i| i.typed_config.as_ref())
+        .map(|a| a.type_url.as_str())
+        .unwrap_or("");
+    let input = match input_ty.rsplit('.').next().unwrap_or("") {
+        "DestinationIPInput" => MatchInput::DstIp,
+        "DestinationPortInput" => MatchInput::DstPort,
+        "SourceIPInput" | "DirectSourceIPInput" => MatchInput::SrcIp,
+        "SourcePortInput" => MatchInput::SrcPort,
+        "ServerNameInput" => MatchInput::ServerName,
+        "TransportProtocolInput" => MatchInput::TransportProtocol,
+        "ApplicationProtocolInput" => MatchInput::ApplicationProtocol,
+        _ => return Err(format!("filter_chain_matcher: unsupported input {}", input_ty)),
+    };
+    let on = |o: &p::XdsOnMatch| on_match(o, chains);
+    let map = match &tree.tree_type {
+        Some(p::xds_matcher::TreeType::ExactMatchMap(mm)) => {
+            let mut h = HashMap::new();
+            for (k, v) in &mm.map {
+                h.insert(k.clone(), on(v)?);
+            }
+            MatchMap::Exact(h)
+        }
+        Some(p::xds_matcher::TreeType::PrefixMatchMap(mm)) => MatchMap::Prefix(
+            mm.map
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), on(v)?)))
+                .collect::<R<_>>()?,
+        ),
+        Some(p::xds_matcher::TreeType::CustomMatch(c)) => {
+            let any = c.typed_config.as_ref().ok_or("custom_match without config")?;
+            let ipm: p::XdsIpMatcher = decode_any(any, p::T_IP_MATCHER)
+                .ok_or_else(|| format!("unsupported custom_match {}", any.type_url))?;
+            let mut v = Vec::new();
+            for rm in &ipm.range_matchers {
+                let Some(o) = &rm.on_match else { continue };
+                v.push((rm.ranges.iter().map(cidr).collect::<R<_>>()?, on(o)?));
+            }
+            MatchMap::Ip(v)
+        }
+        None => return Err("matcher_tree without a map".into()),
+    };
+    let on_no_match = match &m.on_no_match {
+        Some(o) => Some(Box::new(on(o)?)),
+        None => None,
+    };
+    Ok(ChainMatcher {
+        input,
+        map,
+        on_no_match,
+    })
+}
+
+fn on_match(o: &p::XdsOnMatch, chains: &[p::FilterChain]) -> R<ChainOnMatch> {
+    match &o.on_match {
+        Some(p::xds_matcher::OnMatch::Matcher(m)) => {
+            Ok(ChainOnMatch::Matcher(Box::new(chain_matcher(m, chains)?)))
+        }
+        Some(p::xds_matcher::OnMatch::Action(a)) => {
+            let name = match &a.typed_config {
+                Some(any) if any.type_url.ends_with("google.protobuf.StringValue") => {
+                    decode_any::<p::StringValue>(any, &any.type_url)
+                        .map(|v| v.value)
+                        .unwrap_or_else(|| a.name.clone())
+                }
+                _ => a.name.clone(),
+            };
+            chains
+                .iter()
+                .position(|c| c.name == name)
+                .map(ChainOnMatch::Chain)
+                .ok_or_else(|| format!("filter_chain_matcher: no filter chain named {}", name))
+        }
+        None => Err("on_match without an action".into()),
+    }
 }
 
 fn chain_match(m: &p::FilterChainMatch) -> R<ChainMatch> {
@@ -493,6 +613,8 @@ fn is_passive_network_filter(name: &str, ty: &str) -> bool {
         "istio.metadata_exchange" | "istio.stats" | "envoy.filters.network.connection_limit"
     ) || ty.contains("metadataexchange")
         || ty.ends_with("stats.PluginConfig")
+        // waypoint の filter state（宛先・相手の ID の受け渡し）。veil は接続の文脈で直接渡す
+        || ty.contains("set_filter_state")
 }
 
 fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -> R<FilterChain> {
@@ -582,6 +704,11 @@ fn tcp_proxy(tp: &p::TcpProxy, reg: &mut Registry, rbac: Option<Arc<RbacCfg>>) -
         idle_timeout: dur_nonzero(&tp.idle_timeout).or(Some(Duration::from_secs(3600))),
         rbac,
         access_logs: crate::mesh::accesslog::translate(&tp.access_log),
+        tunnel: tp
+            .tunneling_config
+            .as_ref()
+            .filter(|t| !t.use_post)
+            .map(|t| Arc::from(t.hostname.as_str())),
     })
 }
 
@@ -668,7 +795,14 @@ fn http_cm(
             continue;
         }
         if ty.contains("peer_metadata") || ty.contains("metadataexchange") {
-            peer_metadata = true;
+            // ヘッダでの交換（`istio_headers`）だけを扱う。waypoint の workload_discovery だけの設定は観測用
+            peer_metadata |= f
+                .typed_config
+                .as_ref()
+                .is_none_or(|a| !is_typed_struct(a) || typed_struct_json(a).contains("istio_headers"));
+            continue;
+        }
+        if ty.contains("set_filter_state") {
             continue;
         }
         if ty.contains("alpn") {
@@ -916,7 +1050,7 @@ fn route(r: &p::Route, reg: &mut Registry) -> R<MeshRoute> {
         Some(PS::Path(s)) => PathMatch::Exact(s.clone()),
         Some(PS::SafeRegex(re)) => PathMatch::Regex(compile_regex(&re.regex)?),
         Some(PS::PathSeparatedPrefix(s)) => PathMatch::Separated(s.clone()),
-        Some(PS::ConnectMatcher(_)) => PathMatch::Any,
+        Some(PS::ConnectMatcher(_)) => PathMatch::Connect,
         None => PathMatch::Any,
     };
     let headers = m.headers.iter().map(header_match).collect::<R<Vec<_>>>()?;
@@ -1081,7 +1215,12 @@ fn forward(ra: &p::RouteAction, reg: &mut Registry) -> R<ForwardAction> {
         .iter()
         .find(|u| u.upgrade_type.eq_ignore_ascii_case("websocket"))
         .map(|u| u.enabled.as_ref().map(|b| b.value).unwrap_or(true));
+    let connect_terminate = ra
+        .upgrade_configs
+        .iter()
+        .any(|u| u.upgrade_type.eq_ignore_ascii_case("CONNECT") && u.connect_config.is_some());
     Ok(ForwardAction {
+        connect_terminate,
         target,
         timeout: dur_nonzero(&ra.timeout).or_else(|| {
             // Istio は既定で 0s（無制限）を明示する。未指定の Envoy の既定は 15s
@@ -1230,7 +1369,13 @@ pub fn cluster(c: &p::Cluster) -> R<ClusterCfg> {
         .unwrap_or_else(|| c.name.clone());
     let svc_labels =
         crate::mesh::stats::service_labels(&service_host, &service_name, &service_namespace);
+    let port_override = c
+        .original_dst_lb_config
+        .as_ref()
+        .and_then(|o| o.upstream_port_override.as_ref())
+        .map(|p| p.value as u16);
     Ok(ClusterCfg {
+        port_override,
         svc_labels,
         name: c.name.clone(),
         kind,
@@ -1274,7 +1419,21 @@ pub fn endpoint_set(la: &p::ClusterLoadAssignment, resolve_names: bool) -> Endpo
             let Some(addr_msg) = &ep.address else {
                 continue;
             };
+            // 内部アドレス: 元の宛先はメタデータ `envoy.filters.listener.original_dst.local`
+            let internal = match &addr_msg.address {
+                Some(p::address::Address::EnvoyInternalAddress(ia)) => {
+                    Some(Arc::<str>::from(ia.server_listener_name.as_str()))
+                }
+                _ => None,
+            };
             let addrs: Vec<SocketAddr> = match addr_msg.socket_addr() {
+                None if internal.is_some() => vec![lb
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.filter_metadata.get("envoy.filters.listener.original_dst"))
+                    .and_then(|s| s.get_str("local"))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))],
                 Some(a) => vec![a],
                 None if resolve_names => match &addr_msg.address {
                     Some(p::address::Address::SocketAddress(sa)) => {
@@ -1295,6 +1454,7 @@ pub fn endpoint_set(la: &p::ClusterLoadAssignment, resolve_names: bool) -> Endpo
                 me.healthy = matches!(lb.health_status, 0 | 1 | 5);
                 me.priority = loc.priority;
                 me.locality = locality.clone();
+                me.internal = internal.clone();
                 if let Some(md) = &lb.metadata {
                     if let Some(m) = md.filter_metadata.get("envoy.transport_socket_match") {
                         me.socket_match = struct_strings(m);
@@ -1328,6 +1488,94 @@ fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 mod tests {
     use super::*;
     use crate::mesh::state::Registry;
+
+    /// waypoint の `main_internal` と同じ形の `filter_chain_matcher`（宛先 IP → 宛先ポート → チェーン名）。
+    #[test]
+    fn filter_chain_matcher_selects_by_destination_ip_and_port() {
+        use prost::Message;
+        let tec = |name: &str, ty: &str, value: Vec<u8>| p::TypedExtensionConfig {
+            name: name.into(),
+            typed_config: Some(p::Any {
+                type_url: format!("type.googleapis.com/{}", ty),
+                value,
+            }),
+        };
+        let action = |chain: &str| p::XdsOnMatch {
+            on_match: Some(p::xds_matcher::OnMatch::Action(tec(
+                chain,
+                "google.protobuf.StringValue",
+                p::StringValue {
+                    value: chain.into(),
+                }
+                .encode_to_vec(),
+            ))),
+            keep_matching: false,
+        };
+        let by_port = p::XdsMatcher {
+            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(p::XdsMatcherTree {
+                input: Some(tec(
+                    "port",
+                    "envoy.extensions.matching.common_inputs.network.v3.DestinationPortInput",
+                    Vec::new(),
+                )),
+                tree_type: Some(p::xds_matcher::TreeType::ExactMatchMap(p::XdsMatchMap {
+                    map: [("80".to_string(), action("svc-80"))].into_iter().collect(),
+                })),
+            })),
+            on_no_match: None,
+        };
+        let ipm = p::XdsIpMatcher {
+            range_matchers: vec![p::XdsIpRangeMatcher {
+                ranges: vec![p::CidrRange {
+                    address_prefix: "10.96.0.10".into(),
+                    prefix_len: Some(p::UInt32Value { value: 32 }),
+                }],
+                on_match: Some(p::XdsOnMatch {
+                    on_match: Some(p::xds_matcher::OnMatch::Matcher(Box::new(by_port))),
+                    keep_matching: false,
+                }),
+                exclusive: false,
+            }],
+        };
+        let m = p::XdsMatcher {
+            matcher_type: Some(p::xds_matcher::MatcherType::MatcherTree(p::XdsMatcherTree {
+                input: Some(tec(
+                    "ip",
+                    "envoy.extensions.matching.common_inputs.network.v3.DestinationIPInput",
+                    Vec::new(),
+                )),
+                tree_type: Some(p::xds_matcher::TreeType::CustomMatch(tec(
+                    "ip",
+                    "xds.type.matcher.v3.IPMatcher",
+                    ipm.encode_to_vec(),
+                ))),
+            })),
+            on_no_match: Some(Box::new(action("direct"))),
+        };
+        let chains = vec![
+            p::FilterChain {
+                name: "svc-80".into(),
+                ..Default::default()
+            },
+            p::FilterChain {
+                name: "direct".into(),
+                ..Default::default()
+            },
+        ];
+        // ワイヤ形式を経由して変換する
+        let m = p::XdsMatcher::decode(m.encode_to_vec().as_slice()).unwrap();
+        let cm = chain_matcher(&m, &chains).unwrap();
+        let facts = |dst: &str| ConnFacts {
+            dst: Some(dst.parse().unwrap()),
+            src: None,
+            sni: None,
+            transport: None,
+            alpn: &[],
+        };
+        assert_eq!(cm.eval(&facts("10.96.0.10:80")), Some(0));
+        assert_eq!(cm.eval(&facts("10.96.0.10:81")), Some(1));
+        assert_eq!(cm.eval(&facts("10.96.0.11:80")), Some(1));
+    }
 
     #[test]
     fn route_table_selects_vhost_like_envoy() {

@@ -22,6 +22,8 @@ pub struct ListenerTable {
     pub by_addr: HashMap<SocketAddr, Arc<MeshListener>>,
     /// 同上: `0.0.0.0:<port>`（ワイルドカード）
     pub by_port: HashMap<u16, Arc<MeshListener>>,
+    /// 内部リスナー（名前で引く）
+    pub internal: HashMap<String, Arc<MeshListener>>,
     pub version: u64,
 }
 

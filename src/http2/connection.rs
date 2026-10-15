@@ -18,6 +18,10 @@ use crate::http2::stream::{Stream, StreamManager, StreamState};
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// HTTP/2 コネクション (サーバー側)
+/// CONNECT の要求（RFC 9113 §8.5）を受け付けるか（メッシュのデータプレーンだけが立てる。F-224）。
+#[cfg(feature = "mesh")]
+pub static ALLOW_CONNECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct Http2Connection<S> {
     /// TLS ストリーム
     stream: S,
@@ -1027,6 +1031,9 @@ where
 
     /// リクエストヘッダーを検証 (RFC 7540 Section 8.1.2)
     ///
+    /// CONNECT（`:scheme`・`:path` なし、`:authority` 必須。RFC 9113 §8.5）は [`ALLOW_CONNECT`] が立っている
+    /// プロセス（メッシュのデータプレーン。ambient の HBONE を受ける waypoint）でだけ受け付ける。
+    ///
     /// バリデーション項目:
     /// - ヘッダー名の大文字チェック (8.1.2)
     /// - 擬似ヘッダーの順序 (8.1.2.1)
@@ -1044,6 +1051,8 @@ where
         let mut scheme_count = 0u8;
         let mut path_count = 0u8;
         let mut authority_count = 0u8;
+        #[cfg(feature = "mesh")]
+        let mut is_connect = false;
 
         for header in headers {
             let name = &header.name;
@@ -1081,6 +1090,10 @@ where
                 match name.as_ref() {
                     b":method" => {
                         method_count += 1;
+                        #[cfg(feature = "mesh")]
+                        if header.value.as_ref() == b"CONNECT" {
+                            is_connect = true;
+                        }
                     }
                     b":scheme" => {
                         scheme_count += 1;
@@ -1159,6 +1172,15 @@ where
                         "Duplicate :method pseudo-header"
                     },
                 ));
+            }
+            #[cfg(feature = "mesh")]
+            if is_connect
+                && scheme_count == 0
+                && path_count == 0
+                && authority_count == 1
+                && ALLOW_CONNECT.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(());
             }
             if scheme_count != 1 {
                 return Err(Http2Error::stream_error(

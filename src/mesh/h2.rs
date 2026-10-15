@@ -94,6 +94,62 @@ async fn send(tx: &Sender<H2RespMsg>, notify: &Notify, msg: H2RespMsg) -> bool {
     r
 }
 
+/// CONNECT を終端して中身を内部リスナーへ渡す（ambient の waypoint の HBONE。F-224）。
+async fn connect_terminate(
+    c: &Arc<ConnCtx>,
+    f: &Forward,
+    authority: &[u8],
+    req_rx: Option<Receiver<Bytes>>,
+    tx: &Sender<H2RespMsg>,
+    notify: &Notify,
+) {
+    let reply = |status: u16| H2RespMsg::Head {
+        status,
+        headers: Vec::new(),
+        end_stream: true,
+    };
+    let Some(dst) = super::hbone::parse_authority(authority) else {
+        send(tx, notify, reply(400)).await;
+        return;
+    };
+    // 終端先のクラスタのエンドポイントは内部リスナー（`main_internal`）
+    let lst = f
+        .cluster
+        .endpoints
+        .load()
+        .endpoints
+        .iter()
+        .find_map(|e| e.internal.clone())
+        .and_then(|name| super::state::state().listeners.load().internal.get(&*name).cloned());
+    let Some(lst) = lst else {
+        ftlog::debug!("[mesh] CONNECT {}: no internal listener behind {}", dst, f.cluster.name);
+        send(tx, notify, reply(503)).await;
+        return;
+    };
+    if !send(
+        tx,
+        notify,
+        H2RespMsg::Head {
+            status: 200,
+            headers: Vec::new(),
+            end_stream: false,
+        },
+    )
+    .await
+    {
+        return;
+    }
+    let inherited = super::server::Inherited {
+        principal: c.peer_principal.clone(),
+        cert_hash: c.peer_cert_hash.clone(),
+        dns: c.peer_dns.clone(),
+    };
+    super::hbone::terminate(lst, c.peer, dst, inherited, req_rx, |b| {
+        send(tx, notify, H2RespMsg::Body(b))
+    })
+    .await;
+}
+
 async fn local(
     tx: &Sender<H2RespMsg>,
     notify: &Notify,
@@ -240,6 +296,9 @@ async fn task(
                 "",
                 None,
             );
+        }
+        Decision::Forward(f) if f.action.connect_terminate && rq.method.as_ref() == b"CONNECT" => {
+            connect_terminate(&c, &f, &rq.authority, req_rx, tx, notify).await;
         }
         Decision::Forward(f) => {
             if let Some(d) = f.delay {

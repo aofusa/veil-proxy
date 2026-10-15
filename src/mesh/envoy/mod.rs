@@ -156,6 +156,8 @@ pub fn main(args: Vec<String>) -> i32 {
         .concurrency
         .filter(|n| *n > 0)
         .unwrap_or_else(num_cpus::get);
+    // ambient の HBONE（HTTP/2 CONNECT）を受ける
+    crate::http2::connection::ALLOW_CONNECT.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::mesh::server::run(workers);
     ftlog::info!("[envoy] stopped");
     0

@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -41,7 +41,12 @@ ensure_cluster() {
   kubectl config use-context "kind-$CLUSTER" >/dev/null
   if ! kubectl get ns istio-system >/dev/null 2>&1; then
     log "Istio $ISTIO_VERSION を導入"
-    istioctl install --set profile=minimal -y >/dev/null || exit 1
+    # ambient のプロファイル（istiod + istio-cni + ztunnel。サイドカーの注入もそのまま使える）。トレースの
+    # 送り先（telemetry の試験の Jaeger）も最初から入れておく（後から istioctl install し直すと設定が戻る）
+    istioctl install -y --set profile=ambient --set meshConfig.enableTracing=true \
+      --set 'meshConfig.extensionProviders[0].name=zipkin' \
+      --set 'meshConfig.extensionProviders[0].zipkin.service=jaeger-collector.istio-system.svc.cluster.local' \
+      --set 'meshConfig.extensionProviders[0].zipkin.port=9411' >/dev/null || exit 1
   fi
   kubectl -n istio-system rollout status deploy/istiod --timeout=300s >/dev/null
   for img in fortio/fortio:latest traefik/whoami:latest curlimages/curl:latest; do
@@ -818,7 +823,7 @@ EOF
     kubectl -n istio-system rollout status deploy/jaeger --timeout=180s >/dev/null
   fi
   if ! kubectl -n istio-system get cm istio -o jsonpath='{.data.mesh}' | grep -q "jaeger-collector"; then
-    istioctl install -y --set profile=minimal --set meshConfig.enableTracing=true \
+    istioctl install -y --set profile=ambient --set meshConfig.enableTracing=true \
       --set 'meshConfig.extensionProviders[0].name=zipkin' \
       --set 'meshConfig.extensionProviders[0].zipkin.service=jaeger-collector.istio-system.svc.cluster.local' \
       --set 'meshConfig.extensionProviders[0].zipkin.port=9411' >/dev/null 2>&1
@@ -877,6 +882,181 @@ EOF
   if retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200"; then ok "WasmPlugin removed -> 200"; else bad "WasmPlugin removal not applied"; fi
 }
 
+ambient() {
+  log "ambient waypoint ($MODE)"
+  local ans="$NS-amb" wimg out
+  # stock は Istio の既定（distroless の proxyv2）、veil・mixed は waypoint を veil にする（ztunnel は本家）
+  case "$MODE" in stock) wimg="" ;; *) wimg="$VEIL_PROXY" ;; esac
+  if ! kubectl get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml >/dev/null 2>&1
+  fi
+  kubectl create ns "$ans" >/dev/null 2>&1
+  kubectl label ns "$ans" istio.io/dataplane-mode=ambient --overwrite >/dev/null
+  cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: whoami}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: whoami-v1}
+spec:
+  selector: {matchLabels: {app: whoami, version: v1}}
+  template:
+    metadata: {labels: {app: whoami, version: v1}}
+    spec:
+      serviceAccountName: whoami
+      containers: [{name: whoami, image: traefik/whoami:latest, imagePullPolicy: IfNotPresent}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: whoami-v2}
+spec:
+  selector: {matchLabels: {app: whoami, version: v2}}
+  template:
+    metadata: {labels: {app: whoami, version: v2}}
+    spec:
+      serviceAccountName: whoami
+      containers: [{name: whoami, image: traefik/whoami:latest, imagePullPolicy: IfNotPresent}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: whoami}
+spec:
+  selector: {app: whoami}
+  ports: [{name: http, port: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: whoami-v1}
+spec:
+  selector: {app: whoami, version: v1}
+  ports: [{name: http, port: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: whoami-v2}
+spec:
+  selector: {app: whoami, version: v2}
+  ports: [{name: http, port: 80}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: client}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client}
+spec:
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      serviceAccountName: client
+      containers: [{name: curl, image: curlimages/curl:latest, imagePullPolicy: IfNotPresent, command: [sleep, infinity]}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: other}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: other}
+spec:
+  selector: {matchLabels: {app: other}}
+  template:
+    metadata: {labels: {app: other}}
+    spec:
+      serviceAccountName: other
+      containers: [{name: curl, image: curlimages/curl:latest, imagePullPolicy: IfNotPresent, command: [sleep, infinity]}]
+EOF
+  local params=""
+  if [ -n "$wimg" ]; then
+    cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: waypoint-image}
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            image: $wimg
+            imagePullPolicy: IfNotPresent
+EOF
+    params="  infrastructure:
+    parametersRef: {group: \"\", kind: ConfigMap, name: waypoint-image}"
+  fi
+  cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: waypoint
+  labels: {istio.io/waypoint-for: service}
+spec:
+  gatewayClassName: istio-waypoint
+$params
+  listeners:
+  - {name: mesh, port: 15008, protocol: HBONE}
+EOF
+  kubectl label ns "$ans" istio.io/use-waypoint=waypoint --overwrite >/dev/null
+  kubectl -n "$ans" rollout status deploy/whoami-v1 deploy/whoami-v2 deploy/client deploy/other --timeout=300s >/dev/null || { bad "ambient deploy"; return; }
+  retry 120 sh -c "kubectl -n $ans get deploy waypoint >/dev/null 2>&1" || { bad "waypoint not created"; return; }
+  kubectl -n "$ans" rollout status deploy/waypoint --timeout=240s >/dev/null || { bad "waypoint rollout"; return; }
+  local img
+  img="$(kubectl -n "$ans" get deploy waypoint -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  case "$wimg:$img" in
+    :*proxyv2*) ok "waypoint is Envoy ($img)" ;;
+    ?*:"$wimg") ok "waypoint is veil ($img)" ;;
+    *) bad "waypoint image: $img" ;;
+  esac
+  local aexec="kubectl -n $ans exec deploy/client --"
+  # waypoint を通ると L7 の処理（x-request-id の付与）が入る
+  if retry 90 sh -c "$aexec curl -s -m 5 http://whoami/ | grep -qi '^X-Request-Id: '"; then ok "ambient: client -> waypoint (L7) -> whoami"; else bad "ambient via waypoint: $($aexec curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami/)"; fi
+  out="$($aexec curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -d hello http://whoami/)" || true
+  if [ "$out" = 200 ]; then ok "ambient: POST with a body via waypoint"; else bad "ambient POST: $out"; fi
+  # トラフィックの振り分け（HTTPRoute の parentRef が Service）
+  cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: whoami}
+spec:
+  parentRefs: [{group: "", kind: Service, name: whoami, port: 80}]
+  rules:
+  - matches: [{headers: [{name: x-canary, value: "1"}]}]
+    backendRefs: [{name: whoami-v2, port: 80}]
+  - backendRefs: [{name: whoami-v1, port: 80}]
+EOF
+  if retry 90 sh -c "$aexec curl -s -m 5 -H 'x-canary: 1' http://whoami/ | grep -q '^Hostname: whoami-v2'"; then ok "ambient HTTPRoute: header match -> v2"; else bad "ambient HTTPRoute header match"; fi
+  local v1=0 i
+  for i in 1 2 3 4 5 6; do
+    $aexec curl -s -m 5 http://whoami/ | grep -q '^Hostname: whoami-v1' && v1=$((v1+1))
+  done
+  if [ "$v1" = 6 ]; then ok "ambient HTTPRoute: default -> v1 (6/6)"; else bad "ambient HTTPRoute default: v1=$v1/6"; fi
+  kubectl -n "$ans" delete httproute whoami >/dev/null
+  # L7 の認可（waypoint が適用する AuthorizationPolicy）
+  cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: whoami-l7}
+spec:
+  targetRefs: [{kind: Service, group: "", name: whoami}]
+  action: ALLOW
+  rules:
+  - from: [{source: {principals: ["cluster.local/ns/$ans/sa/client"]}}]
+    to: [{operation: {methods: ["GET"]}}]
+EOF
+  if retry 90 sh -c "$aexec curl -s -m 5 -o /dev/null -w '%{http_code}' -X DELETE http://whoami/ | grep -q 403"; then ok "ambient AuthorizationPolicy: DELETE -> 403 at waypoint"; else bad "ambient authz DELETE not denied"; fi
+  out="$($aexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://whoami/)" || true
+  if [ "$out" = 200 ]; then ok "ambient AuthorizationPolicy: GET from client -> 200"; else bad "ambient authz GET: $out"; fi
+  out="$(kubectl -n "$ans" exec deploy/other -- curl -s -m 10 -o /dev/null -w '%{http_code}' http://whoami/)" || true
+  if [ "$out" = 403 ]; then ok "ambient AuthorizationPolicy: other principal -> 403"; else bad "ambient authz other: $out"; fi
+  kubectl -n "$ans" delete authorizationpolicy whoami-l7 >/dev/null
+  if [ "$KEEP" != "--keep" ]; then kubectl delete ns "$ans" --wait=false >/dev/null 2>&1; fi
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -891,7 +1071,8 @@ case "$SUITE" in
   gateway) gateway ;;
   telemetry) telemetry ;;
   wasm) wasm ;;
-  all) smoke; tasks; gateway; telemetry; wasm ;;
+  ambient) ambient ;;
+  all) smoke; tasks; gateway; telemetry; wasm; ambient ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

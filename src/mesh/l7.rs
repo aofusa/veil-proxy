@@ -353,6 +353,13 @@ pub async fn request_filters(
             HttpFilterCfg::Rbac(r) => {
                 let req = rq.view();
                 if !rbac_allows(ctx, &req, r, &jwt.payloads) {
+                    ftlog::debug!(
+                        "[mesh] RBAC denied {} {} (principal {:?}, peer {})",
+                        String::from_utf8_lossy(req.method),
+                        String::from_utf8_lossy(req.path),
+                        ctx.peer_principal,
+                        ctx.peer
+                    );
                     let mut lr = LocalReply::new(403, ResponseFlag::RbacDenied);
                     if req.is_grpc() {
                         lr.grpc_status = Some(7);

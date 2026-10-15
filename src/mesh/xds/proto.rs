@@ -264,7 +264,7 @@ pub struct Metadata {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Address {
-    #[prost(oneof = "address::Address", tags = "1, 2")]
+    #[prost(oneof = "address::Address", tags = "1, 2, 3")]
     pub address: Option<address::Address>,
 }
 
@@ -275,7 +275,18 @@ pub mod address {
         SocketAddress(super::SocketAddress),
         #[prost(message, tag = "2")]
         Pipe(super::Pipe),
+        /// Envoy の内部リスナー（ambient の waypoint）
+        #[prost(message, tag = "3")]
+        EnvoyInternalAddress(super::EnvoyInternalAddress),
     }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EnvoyInternalAddress {
+    #[prost(string, tag = "1")]
+    pub server_listener_name: String,
+    #[prost(string, tag = "2")]
+    pub endpoint_id: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -437,6 +448,108 @@ pub struct Listener {
     pub traffic_direction: i32,
     #[prost(message, optional, tag = "26")]
     pub bind_to_port: Option<BoolValue>,
+    /// 内部リスナー（`listener_specifier` の `internal_listener`）
+    #[prost(message, optional, tag = "27")]
+    pub internal_listener: Option<Empty>,
+    /// フィルタチェーンの選択の matcher（`filter_chain_matcher`。ambient の waypoint）
+    #[prost(message, optional, tag = "32")]
+    pub filter_chain_matcher: Option<XdsMatcher>,
+}
+
+// ---------------------------------------------------------------------------
+// xds.type.matcher.v3（フィルタチェーンの選択に使う形だけ）
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsMatcher {
+    #[prost(oneof = "xds_matcher::MatcherType", tags = "1, 2")]
+    pub matcher_type: Option<xds_matcher::MatcherType>,
+    #[prost(message, optional, boxed, tag = "3")]
+    pub on_no_match: Option<Box<XdsOnMatch>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsOnMatch {
+    #[prost(oneof = "xds_matcher::OnMatch", tags = "1, 2")]
+    pub on_match: Option<xds_matcher::OnMatch>,
+    #[prost(bool, tag = "3")]
+    pub keep_matching: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsMatcherTree {
+    #[prost(message, optional, tag = "1")]
+    pub input: Option<TypedExtensionConfig>,
+    #[prost(oneof = "xds_matcher::TreeType", tags = "2, 3, 4")]
+    pub tree_type: Option<xds_matcher::TreeType>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsMatchMap {
+    #[prost(map = "string, message", tag = "1")]
+    pub map: HashMap<String, XdsOnMatch>,
+}
+
+/// `xds.type.matcher.v3.IPMatcher`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsIpMatcher {
+    #[prost(message, repeated, tag = "1")]
+    pub range_matchers: Vec<XdsIpRangeMatcher>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct XdsIpRangeMatcher {
+    #[prost(message, repeated, tag = "1")]
+    pub ranges: Vec<CidrRange>,
+    #[prost(message, optional, tag = "2")]
+    pub on_match: Option<XdsOnMatch>,
+    #[prost(bool, tag = "3")]
+    pub exclusive: bool,
+}
+
+pub mod xds_matcher {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum MatcherType {
+        /// `matcher_list`（使わない。来たら変換でエラーにする）
+        #[prost(message, tag = "1")]
+        MatcherList(super::Empty),
+        #[prost(message, tag = "2")]
+        MatcherTree(super::XdsMatcherTree),
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum OnMatch {
+        #[prost(message, tag = "1")]
+        Matcher(Box<super::XdsMatcher>),
+        #[prost(message, tag = "2")]
+        Action(super::TypedExtensionConfig),
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum TreeType {
+        #[prost(message, tag = "2")]
+        ExactMatchMap(super::XdsMatchMap),
+        #[prost(message, tag = "3")]
+        PrefixMatchMap(super::XdsMatchMap),
+        #[prost(message, tag = "4")]
+        CustomMatch(super::TypedExtensionConfig),
+    }
+}
+
+/// `envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct InternalUpstreamTransport {
+    #[prost(message, optional, tag = "3")]
+    pub transport_socket: Option<TransportSocket>,
+}
+
+/// `Cluster.OriginalDstLbConfig`
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OriginalDstLbConfig {
+    #[prost(bool, tag = "1")]
+    pub use_http_header: bool,
+    #[prost(string, tag = "2")]
+    pub http_header_name: String,
+    #[prost(message, optional, tag = "3")]
+    pub upstream_port_override: Option<UInt32Value>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -523,6 +636,8 @@ pub struct Cluster {
     pub transport_socket_matches: Vec<TransportSocketMatch>,
     #[prost(string, tag = "28")]
     pub alt_stat_name: String,
+    #[prost(message, optional, tag = "34")]
+    pub original_dst_lb_config: Option<OriginalDstLbConfig>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1042,6 +1157,9 @@ pub struct UpgradeConfig {
     pub upgrade_type: String,
     #[prost(message, optional, tag = "2")]
     pub enabled: Option<BoolValue>,
+    /// CONNECT を終端する（中身は使わない）
+    #[prost(message, optional, tag = "3")]
+    pub connect_config: Option<Empty>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1263,9 +1381,21 @@ pub struct TcpProxy {
     pub idle_timeout: Option<Duration>,
     #[prost(oneof = "tcp_proxy::ClusterSpecifier", tags = "2, 10")]
     pub cluster_specifier: Option<tcp_proxy::ClusterSpecifier>,
+    /// HTTP/2 CONNECT のトンネル（ambient の HBONE）
+    #[prost(message, optional, tag = "12")]
+    pub tunneling_config: Option<tcp_proxy::TunnelingConfig>,
 }
 
 pub mod tcp_proxy {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct TunnelingConfig {
+        #[prost(string, tag = "1")]
+        pub hostname: String,
+        #[prost(bool, tag = "2")]
+        pub use_post: bool,
+        #[prost(message, repeated, tag = "3")]
+        pub headers_to_add: Vec<super::HeaderValueOption>,
+    }
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct WeightedCluster {
         #[prost(message, repeated, tag = "1")]
@@ -1434,6 +1564,9 @@ pub const T_UPSTREAM_TLS: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 pub const T_HTTP_PROTOCOL_OPTIONS: &str =
     "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+pub const T_INTERNAL_UPSTREAM: &str =
+    "type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport";
+pub const T_IP_MATCHER: &str = "type.googleapis.com/xds.type.matcher.v3.IPMatcher";
 pub const T_WASM: &str = "type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm";
 pub const T_FAULT: &str = "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault";
 pub const T_TYPED_STRUCT_UDPA: &str = "type.googleapis.com/udpa.type.v1.TypedStruct";

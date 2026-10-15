@@ -22,6 +22,7 @@ pub mod admin;
 pub mod detect;
 pub mod envoy;
 pub mod h2;
+pub mod hbone;
 pub mod l7;
 pub mod mirror;
 pub mod http1;

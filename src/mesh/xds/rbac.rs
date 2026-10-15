@@ -99,7 +99,7 @@ pub mod permission {
 pub struct Principal {
     #[prost(
         oneof = "principal::Identifier",
-        tags = "1, 2, 3, 4, 5, 10, 11, 6, 9, 7, 8"
+        tags = "1, 2, 3, 4, 5, 10, 11, 6, 9, 7, 8, 12"
     )]
     pub identifier: Option<principal::Identifier>,
 }
@@ -139,7 +139,19 @@ pub mod principal {
         Metadata(super::MetadataMatcher),
         #[prost(message, tag = "8")]
         NotId(Box<super::Principal>),
+        /// filter state（ambient の waypoint は相手の ID を `io.istio.peer_principal` で見る）
+        #[prost(message, tag = "12")]
+        FilterState(super::FilterStateMatcher),
     }
+}
+
+/// `envoy.type.matcher.v3.FilterStateMatcher`（文字列の照合だけ）
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct FilterStateMatcher {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(message, optional, tag = "2")]
+    pub string_match: Option<p::StringMatcher>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -358,6 +370,17 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
             }
         }
         Some(I::NotId(n)) => RbacPrincipal::Not(Box::new(princ(n)?)),
+        // waypoint: HBONE の mTLS の相手（`%DOWNSTREAM_PEER_URI_SAN%`）。veil は内部リスナーへ相手の ID を
+        // そのまま引き継ぐので、認証済みの主体と同じに扱う
+        Some(I::FilterState(f)) if f.key == "io.istio.peer_principal" => {
+            RbacPrincipal::Authenticated(match &f.string_match {
+                Some(sm) => Some(string_matcher(sm)?),
+                None => None,
+            })
+        }
+        Some(I::FilterState(f)) => {
+            return Err(format!("unsupported RBAC filter_state principal {}", f.key));
+        }
         None => RbacPrincipal::Not(Box::new(RbacPrincipal::Any)),
     })
 }
@@ -499,6 +522,36 @@ mod tests {
             metadata: md,
             http: true,
         }
+    }
+
+    /// ambient の waypoint の認可: 相手の ID は filter state（`io.istio.peer_principal`）で来る（F-224）。
+    #[test]
+    fn waypoint_filter_state_principal_is_decoded_and_matched() {
+        use prost::Message;
+        let pr = Principal {
+            identifier: Some(principal::Identifier::FilterState(FilterStateMatcher {
+                key: "io.istio.peer_principal".into(),
+                string_match: Some(p::StringMatcher {
+                    ignore_case: false,
+                    pattern: Some(p::string_matcher::Pattern::Exact(
+                        "spiffe://cluster.local/ns/demo/sa/client".into(),
+                    )),
+                }),
+            })),
+        };
+        // ワイヤ形式を経由しても失われない（oneof の tags に 12 が無いと None になり全拒否になっていた）
+        let decoded = Principal::decode(pr.encode_to_vec().as_slice()).unwrap();
+        let x = princ(&decoded).unwrap();
+        let none = |_: &str| None;
+        let md = |_: &str, _: &[String]| None;
+        assert!(eval_princ(
+            &x,
+            &input(Some("spiffe://cluster.local/ns/demo/sa/client"), b"/", &none, &md)
+        ));
+        assert!(!eval_princ(
+            &x,
+            &input(Some("spiffe://cluster.local/ns/demo/sa/other"), b"/", &none, &md)
+        ));
     }
 
     #[test]

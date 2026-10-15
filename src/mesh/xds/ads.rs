@@ -491,7 +491,9 @@ fn apply_listeners(
         ..Default::default()
     };
     for l in subs.listeners.values() {
-        if l.bind_to_port {
+        if l.internal {
+            table.internal.insert(l.name.clone(), l.clone());
+        } else if l.bind_to_port {
             table.bound.push(l.clone());
         } else if l.addr.ip().is_unspecified() {
             table.by_port.insert(l.addr.port(), l.clone());

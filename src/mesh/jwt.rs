@@ -529,6 +529,7 @@ pub fn authenticate(
         super::model::PathMatch::Exact(x) => p == x.as_bytes(),
         super::model::PathMatch::Separated(x) => p.starts_with(x.as_bytes()),
         super::model::PathMatch::Regex(re) => std::str::from_utf8(p).is_ok_and(|s| re.is_match(s)),
+        super::model::PathMatch::Connect => method == b"CONNECT",
     });
     let Some((_, req)) = rule else { return Ok(out) };
     let now = super::httpcore::unix_secs();

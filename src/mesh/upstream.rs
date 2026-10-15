@@ -201,7 +201,11 @@ pub fn pick(
     };
     let ep = &eps.endpoints[idx];
     let tls = cfg.tls_for(ep).cloned();
-    let addr = ep.addr;
+    // 内部アドレスで元の宛先がメタデータに無いものは、接続の元の宛先を使う（waypoint の direct チェーン）
+    let addr = match (&ep.internal, orig_dst) {
+        (Some(_), Some(d)) if ep.addr.port() == 0 => d,
+        _ => ep.addr,
+    };
     Ok(Picked {
         cfg,
         eps,
@@ -294,6 +298,13 @@ fn ktls_settings() -> (bool, bool, bool) {
 /// 上流へ接続する（TLS ならハンドシェイクまで）。
 pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
     super::stats::UPSTREAM_CX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // 内部アドレス（Envoy の内部リスナー。ambient の waypoint の HBONE）
+    if let Some(name) = p.endpoint().and_then(|e| e.internal.as_ref()) {
+        // HBONE の送出は内側でこの関数（mTLS の接続）を呼ぶので Box で再帰を切る
+        return Box::pin(super::hbone::connect_internal(name, p.addr))
+            .await
+            .map(UpIo::Plain);
+    }
     let tcp = match super::net::connect(p.addr, p.cfg.bind, p.cfg.connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
@@ -363,6 +374,8 @@ struct PoolKey {
     /// TLS の設定（`Arc` のポインタ。平文は 0）
     tls: usize,
     bind: Option<SocketAddr>,
+    /// 内部リスナー経由（HBONE のトンネル）か
+    internal: bool,
 }
 
 fn pool_key(p: &Picked) -> PoolKey {
@@ -370,6 +383,7 @@ fn pool_key(p: &Picked) -> PoolKey {
         addr: p.addr,
         tls: p.tls.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize),
         bind: p.cfg.bind,
+        internal: p.endpoint().is_some_and(|e| e.internal.is_some()),
     }
 }
 
@@ -493,6 +507,7 @@ mod tests {
             service_namespace: Default::default(),
             eds_name: "c".into(),
             svc_labels: None,
+            port_override: None,
         }))));
         s.endpoints.store(Arc::new(EndpointSet::new(
             eps.iter()

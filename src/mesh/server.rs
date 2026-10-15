@@ -157,6 +157,12 @@ async fn accept_loop(l: crate::runtime::TcpListener, addr: SocketAddr, stop: Rc<
 
 /// Envoy のフィルタチェーンの選択（宛先ポート → 宛先 IP → SNI → トランスポート → ALPN → 送信元）。
 pub fn select_chain<'a>(l: &'a MeshListener, f: &ConnFacts<'_>) -> Option<&'a Arc<FilterChain>> {
+    if let Some(m) = &l.matcher {
+        return m
+            .eval(f)
+            .and_then(|i| l.chains.get(i))
+            .or(l.default_chain.as_ref());
+    }
     let mut cands: Vec<&Arc<FilterChain>> = l.chains.iter().collect();
     // 宛先ポート
     let port = f.dst.map(|d| d.port());
@@ -393,6 +399,56 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         lst
     };
     drop(table);
+    // 静的なリスナー（ブートストラップ）は LDS で変わらないので選び直さない
+    let relookup = !STATIC_LISTENERS
+        .get()
+        .is_some_and(|v| v.iter().any(|l| l.addr == laddr));
+    dispatch(stream, peer, laddr, dst, target, table_version, relookup, None).await;
+}
+
+/// 外側の接続（HBONE の mTLS）から引き継ぐ相手の ID。内部リスナーへ渡した接続で使う。
+#[derive(Clone, Default)]
+pub struct Inherited {
+    pub principal: Option<Arc<str>>,
+    pub cert_hash: Option<Arc<str>>,
+    pub dns: Vec<String>,
+}
+
+/// 内部リスナーへ渡された接続（HBONE の CONNECT の中身）を処理する。`dst` は CONNECT の宛先。
+pub async fn handle_internal(
+    stream: TcpStream,
+    lst: Arc<MeshListener>,
+    peer: SocketAddr,
+    dst: SocketAddr,
+    inherited: Inherited,
+) {
+    let _cx = super::stats::CxGuard::new();
+    let table_version = state().listeners.load().version;
+    dispatch(
+        stream,
+        peer,
+        dst,
+        dst,
+        lst,
+        table_version,
+        false,
+        Some(inherited),
+    )
+    .await;
+}
+
+/// 先読み → フィルタチェーンの選択 → HTTP / L4 の処理。
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
+    stream: TcpStream,
+    peer: SocketAddr,
+    laddr: SocketAddr,
+    dst: SocketAddr,
+    target: Arc<MeshListener>,
+    table_version: u64,
+    relookup: bool,
+    inherited: Option<Inherited>,
+) {
     let (det, initial) = if target.needs_sniff {
         detect::sniff(&stream, None).await
     } else {
@@ -435,11 +491,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
         ChainAction::Close => {}
         ChainAction::Http(hcm) => {
             let hcm = hcm.clone();
-            // 静的なリスナー（ブートストラップ）は LDS で変わらないので選び直さない
-            let relookup = (!STATIC_LISTENERS
-                .get()
-                .is_some_and(|v| v.iter().any(|l| l.addr == laddr)))
-            .then(|| {
+            let relookup = relookup.then(|| {
                 Arc::new(super::l7::Relookup {
                     laddr,
                     dst,
@@ -460,6 +512,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
                 &alpn,
                 relookup,
                 table_version,
+                inherited,
             )
             .await;
         }
@@ -475,6 +528,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
                 target.direction,
                 sni,
                 &alpn,
+                inherited,
             )
             .await;
         }
@@ -518,6 +572,7 @@ async fn serve_http(
     client_alpn: &[String],
     relookup: Option<Arc<super::l7::Relookup>>,
     table_version: u64,
+    inherited: Option<Inherited>,
 ) {
     let direction = if hcm.direction == Direction::Unspecified {
         direction
@@ -545,13 +600,17 @@ async fn serve_http(
         Codec::Http1 => false,
         Codec::Auto => h2,
     };
-    let (principal, hash, dns) = principal_of(&peer_cert);
+    let mtls = chain.tls.is_some() || inherited.is_some();
+    let (principal, hash, dns) = match inherited {
+        Some(i) => (i.principal, i.cert_hash, i.dns),
+        None => principal_of(&peer_cert),
+    };
     let ctx = Arc::new(ConnCtx {
         hcm,
         direction,
         orig_dst: Some(dst),
         peer,
-        tls: chain.tls.is_some(),
+        tls: mtls,
         peer_principal: principal,
         peer_cert_hash: hash,
         peer_dns: dns,
@@ -577,6 +636,7 @@ async fn serve_tcp(
     direction: Direction,
     sni: Option<String>,
     client_alpn: &[String],
+    inherited: Option<Inherited>,
 ) {
     let (mut ds, peer_cert) = match &chain.tls {
         Some(tls) => match tls_accept(stream, tls, initial, client_alpn).await {
@@ -591,7 +651,11 @@ async fn serve_tcp(
             Err(_) => return,
         },
     };
-    let (principal, _, _) = principal_of(&peer_cert);
+    let mtls = chain.tls.is_some() || inherited.is_some();
+    let principal = match inherited {
+        Some(i) => i.principal,
+        None => principal_of(&peer_cert).0,
+    };
     if let Some(r) = &tp.rbac {
         let header = |_: &str| None;
         let md = |_: &str, _: &[String]| None;
@@ -630,7 +694,7 @@ async fn serve_tcp(
         peer_principal: principal.clone(),
         service: picked.cfg.svc_labels.clone(),
         proto: super::stats::Proto::Tcp,
-        mtls: chain.tls.is_some() && principal.is_some(),
+        mtls: mtls && principal.is_some(),
     };
     let stats = chain.stats;
     if stats {
@@ -792,6 +856,8 @@ mod tests {
             tls_inspector: true,
             http_inspector: true,
             needs_sniff: true,
+            internal: false,
+            matcher: None,
         };
         let f = |port: u16, t: TransportProto, alpn: &'static [&'static str]| ConnFacts {
             dst: Some(SocketAddr::new("10.0.0.5".parse().unwrap(), port)),

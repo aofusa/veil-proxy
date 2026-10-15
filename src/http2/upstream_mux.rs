@@ -302,11 +302,20 @@ impl H2Mux {
             }
         }
         let scheme: &[u8] = if self.sh.https { b"https" } else { b"http" };
+        // CONNECT（ambient の HBONE。メッシュのみ）は `:scheme`・`:path` を送らない（RFC 9113 §8.5）
+        #[cfg(feature = "mesh")]
+        let connect = method == b"CONNECT";
+        #[cfg(not(feature = "mesh"))]
+        let connect = false;
         let mut list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(lowered.len() + 4);
         list.push((b":method", method, false));
-        list.push((b":scheme", scheme, false));
+        if !connect {
+            list.push((b":scheme", scheme, false));
+        }
         list.push((b":authority", authority, false));
-        list.push((b":path", path, false));
+        if !connect {
+            list.push((b":path", path, false));
+        }
         let mut li = 0usize;
         for (name, value) in headers {
             if skip_request_header(name, value) {

@@ -202,6 +202,7 @@ fn static_cluster(name: &str) -> ClusterCfg {
         service_name: Bytes::new(),
         service_namespace: Bytes::new(),
         eds_name: name.to_string(),
+        port_override: None,
         svc_labels: None,
     }
 }
@@ -284,6 +285,7 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
                     mirrors: Vec::new(),
                     hash: Vec::new(),
                     websocket: None,
+                    connect_terminate: false,
                 })),
                 request_ops: HeaderOps::default(),
                 response_ops: HeaderOps::default(),
@@ -343,6 +345,8 @@ fn static_listener(l: &Value) -> Result<Option<MeshListener>, String> {
         tls_inspector: false,
         http_inspector: true,
         needs_sniff: true,
+        internal: false,
+        matcher: None,
     }))
 }
 

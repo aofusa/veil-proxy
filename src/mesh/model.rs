@@ -236,6 +236,100 @@ pub struct MeshListener {
     pub http_inspector: bool,
     /// フィルタチェーンの選択に送信元・宛先 IP・SNI・ALPN を見るか（見ないなら先読みを省く）
     pub needs_sniff: bool,
+    /// Envoy の内部リスナー（ポートを持たず、HBONE の CONNECT の終端・内部アドレスのエンドポイントから渡される）
+    pub internal: bool,
+    /// `filter_chain_matcher`（あれば `chains` の条件より優先する。ambient の waypoint）
+    pub matcher: Option<ChainMatcher>,
+}
+
+/// `filter_chain_matcher`（xds.type.matcher.v3 の matcher_tree）を評価する形。
+#[derive(Debug)]
+pub struct ChainMatcher {
+    pub input: MatchInput,
+    pub map: MatchMap,
+    pub on_no_match: Option<Box<ChainOnMatch>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchInput {
+    DstIp,
+    DstPort,
+    SrcIp,
+    SrcPort,
+    ServerName,
+    TransportProtocol,
+    ApplicationProtocol,
+}
+
+#[derive(Debug)]
+pub enum MatchMap {
+    Exact(HashMap<String, ChainOnMatch>),
+    Prefix(Vec<(String, ChainOnMatch)>),
+    /// IP の範囲（最長一致）
+    Ip(Vec<(Vec<Cidr>, ChainOnMatch)>),
+}
+
+#[derive(Debug)]
+pub enum ChainOnMatch {
+    /// `chains` の添字
+    Chain(usize),
+    Matcher(Box<ChainMatcher>),
+}
+
+impl ChainMatcher {
+    /// 一致したフィルタチェーンの添字。
+    pub fn eval(&self, f: &ConnFacts<'_>) -> Option<usize> {
+        let value: Option<String> = match self.input {
+            MatchInput::DstIp => f.dst.map(|a| a.ip().to_string()),
+            MatchInput::DstPort => f.dst.map(|a| a.port().to_string()),
+            MatchInput::SrcIp => f.src.map(|a| a.ip().to_string()),
+            MatchInput::SrcPort => f.src.map(|a| a.port().to_string()),
+            MatchInput::ServerName => f.sni.map(|s| s.to_string()),
+            MatchInput::TransportProtocol => f.transport.map(|t| {
+                match t {
+                    TransportProto::Tls => "tls",
+                    TransportProto::RawBuffer => "raw_buffer",
+                }
+                .to_string()
+            }),
+            MatchInput::ApplicationProtocol => f.alpn.first().map(|s| s.to_string()),
+        };
+        let hit = match (&self.map, &value) {
+            (MatchMap::Exact(m), Some(v)) => m.get(v),
+            (MatchMap::Prefix(v), Some(val)) => v
+                .iter()
+                .filter(|(p, _)| val.starts_with(p.as_str()))
+                .max_by_key(|(p, _)| p.len())
+                .map(|(_, m)| m),
+            (MatchMap::Ip(v), Some(val)) => match val.parse::<IpAddr>() {
+                Ok(ip) => v
+                    .iter()
+                    .filter_map(|(ranges, m)| {
+                        ranges
+                            .iter()
+                            .filter(|r| r.contains(ip))
+                            .map(|r| r.len)
+                            .max()
+                            .map(|len| (len, m))
+                    })
+                    .max_by_key(|(len, _)| *len)
+                    .map(|(_, m)| m),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let resolved = hit.and_then(|m| m.eval(f));
+        resolved.or_else(|| self.on_no_match.as_ref().and_then(|m| m.eval(f)))
+    }
+}
+
+impl ChainOnMatch {
+    fn eval(&self, f: &ConnFacts<'_>) -> Option<usize> {
+        match self {
+            ChainOnMatch::Chain(i) => Some(*i),
+            ChainOnMatch::Matcher(m) => m.eval(f),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +536,8 @@ pub struct TcpProxyCfg {
     /// TCP の認可（Envoy の network RBAC。Istio の AuthorizationPolicy の TCP 規則）
     pub rbac: Option<Arc<RbacCfg>>,
     pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
+    /// HTTP/2 CONNECT のトンネル（HBONE）の `:authority` の書式（`tunneling_config.hostname`）
+    pub tunnel: Option<Arc<str>>,
 }
 
 impl TcpProxyCfg {
@@ -569,6 +665,8 @@ pub enum PathMatch {
     Separated(String),
     Regex(regex::Regex),
     Any,
+    /// `connect_matcher`（CONNECT の要求だけ）
+    Connect,
 }
 
 #[derive(Debug)]
@@ -605,6 +703,7 @@ impl MeshRoute {
         }
         let ok = match &self.path {
             PathMatch::Any => true,
+            PathMatch::Connect => header(":method").is_some_and(|m| m.as_ref() == b"CONNECT"),
             PathMatch::Prefix(p) => {
                 path.len() >= p.len()
                     && if self.case_sensitive {
@@ -697,6 +796,8 @@ pub struct ForwardAction {
     pub mirrors: Vec<(Arc<ClusterSlot>, u32, bool)>,
     pub hash: Vec<HashPolicy>,
     pub websocket: Option<bool>,
+    /// CONNECT を終端して中身を内部リスナーへ渡す（HBONE。`upgrade_configs` の `connect_config`）
+    pub connect_terminate: bool,
 }
 
 #[derive(Debug)]
@@ -950,6 +1051,8 @@ pub struct ClusterCfg {
     pub eds_name: String,
     /// 観測の宛先サービスのラベル（`service_*` から作る）
     pub svc_labels: Option<Arc<crate::mesh::stats::ServiceLabels>>,
+    /// ORIGINAL_DST のポートの置き換え（`original_dst_lb_config.upstream_port_override`。HBONE は 15008）
+    pub port_override: Option<u16>,
 }
 
 impl ClusterCfg {
@@ -1013,6 +1116,9 @@ pub struct MeshEndpoint {
     pub socket_match: Vec<(String, String)>,
     /// Istio の `istio.workload`（"name;namespace;canonical;revision;cluster"）
     pub workload: Bytes,
+    /// 内部アドレス（`envoy_internal_address`）の内部リスナーの名前。`addr` はそのとき元の宛先
+    /// （メタデータ `envoy.filters.listener.original_dst.local`）
+    pub internal: Option<Arc<str>>,
     /// 同時要求数（LEAST_REQUEST）
     pub active: AtomicUsize,
     /// 外れ値検出の状態
@@ -1030,6 +1136,7 @@ impl MeshEndpoint {
             locality: Default::default(),
             socket_match: Vec::new(),
             workload: Bytes::new(),
+            internal: None,
             active: AtomicUsize::new(0),
             consecutive_5xx: AtomicUsize::new(0),
             ejected_until_ms: AtomicU64::new(0),
