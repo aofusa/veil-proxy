@@ -250,6 +250,7 @@ async fn session(
                     let resp = p::DeltaDiscoveryResponse::decode(&f.data[..])
                         .map_err(|e| format!("invalid DeltaDiscoveryResponse: {}", e))?;
                     *got = true;
+                    record(&f.data[..], &resp.type_url);
                     for req in handle(resp, subs) {
                         send(&stream, req).await?;
                     }
@@ -298,6 +299,27 @@ fn grpc_error(headers: &[(Bytes, Bytes)]) -> Option<String> {
         String::from_utf8_lossy(&status),
         msg
     ))
+}
+
+/// `VEIL_MESH_XDS_RECORD=<ディレクトリ>` のとき、受け取った応答を 1 つずつ `<連番>-<型>.pb` に保存する
+/// （istiod の xDS をフィクスチャにする。`tests/fixtures/istio/<版>/`）。秘密鍵を含む SDS の応答は保存しない。
+/// 理由付き allow: xDS の専用スレッド（データプレーンの外）での同期のファイル書き込み。
+#[allow(clippy::disallowed_methods)]
+fn record(raw: &[u8], type_url: &str) {
+    static DIR: once_cell::sync::Lazy<Option<PathBuf>> = once_cell::sync::Lazy::new(|| {
+        std::env::var_os("VEIL_MESH_XDS_RECORD").map(PathBuf::from)
+    });
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(dir) = DIR.as_ref() else { return };
+    if type_url == p::TYPE_SECRET {
+        return;
+    }
+    let short = type_url.rsplit('.').next().unwrap_or("unknown");
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::write(dir.join(format!("{:04}-{}.pb", n, short)), raw) {
+        warn!("[xds] cannot record a response: {}", e);
+    }
 }
 
 /// 応答 1 つを適用し、送る要求（ACK/NACK と購読の差分）を返す。

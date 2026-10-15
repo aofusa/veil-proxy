@@ -2,7 +2,7 @@
 # メッシュのデータプレーンの E2E（F-225）。kind のクラスタに Istio を入れ、サイドカーのプロキシを
 # 本家（stock = Envoy）・veil・混在（mixed）で動かして同じ台本を流す。
 #
-#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|all> [--keep]
+#   tools/k8s/mesh-e2e.sh <stock|veil|mixed> <smoke|tasks|gateway|telemetry|wasm|ambient|observe|all> [--keep]
 #
 # 使うイメージ: veil.local/istio-proxy:<istio の版>（docker/Dockerfile.mesh-istio。musl の veil を istio/proxyv2 に入れたもの）
 # 試験のアプリ: fortio（HTTP 8080・gRPC 8079・TCP 8078）、traefik/whoami（HTTP、受け取った要求ヘッダを返す）、curl
@@ -366,6 +366,9 @@ spec:
   - match: [{uri: {prefix: /v2only}}]
     rewrite: {uri: /echo}
     route: [{destination: {host: fortio, subset: v2}}]
+  - match: [{uri: {regex: "^/re/[0-9]+$"}}]
+    rewrite: {uri: /debug}
+    route: [{destination: {host: fortio, subset: v1}}]
   - route:
     - {destination: {host: fortio, subset: v1}, weight: 80}
     - {destination: {host: fortio, subset: v2}, weight: 20}
@@ -387,6 +390,9 @@ EOF
   if [ "${v2:-0}" -ge 15 ] && [ "${v2:-0}" -le 70 ]; then ok "traffic shifting 80/20 (v2 got $v2/200)"; else bad "traffic shifting v2=$v2/200"; fi
   out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' http://fortio."$NS":8080/v2only)" || true
   if [ "$out" = 200 ]; then ok "uri rewrite + subset routing"; else bad "rewrite/subset: $out"; fi
+  # 正規表現の一致の rewrite.uri（Istio は prefix_rewrite で送る = パス全体の置き換え）
+  out="$(cexec curl -s -m 10 "http://fortio.$NS:8080/re/42?x=1" | grep -m1 '^GET ')" || true
+  case "$out" in "GET /debug?x=1 "*) ok "regex match + uri rewrite ($out)" ;; *) bad "regex rewrite: $out" ;; esac
   kubectl -n "$NS" delete destinationrule fortio >/dev/null 2>&1
   kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
   # Retries: fortio の ?status=503:50 は半分の確率で 503。4 回まで再送すれば 50 回中ほぼ全部 200 になる
@@ -794,8 +800,7 @@ EOF
   kubectl -n "$NS" delete svc ingress >/dev/null 2>&1
 }
 
-telemetry() {
-  log "telemetry ($MODE)"
+telemetry_jaeger_ready() {
   # Jaeger（Zipkin 互換の受け口）と Istio のトレースのプロバイダ（無ければ入れる）
   if ! kubectl -n istio-system get deploy jaeger >/dev/null 2>&1; then
     docker image inspect jaegertracing/all-in-one:latest >/dev/null 2>&1 || docker pull -q jaegertracing/all-in-one:latest >/dev/null
@@ -831,6 +836,11 @@ EOF
       --set 'meshConfig.extensionProviders[0].zipkin.port=9411' >/dev/null 2>&1
     sleep 10
   fi
+}
+
+telemetry() {
+  log "telemetry ($MODE)"
+  telemetry_jaeger_ready
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: telemetry.istio.io/v1
 kind: Telemetry
@@ -1059,6 +1069,198 @@ EOF
   if [ "$KEEP" != "--keep" ]; then kubectl delete ns "$ans" --wait=false >/dev/null 2>&1; fi
 }
 
+# 観測と運用（F-221・F-222）: bookinfo を全 Pod（mixed は半分）veil で動かし、Prometheus・Kiali・Grafana の
+# パネルの式・Jaeger のトレース・istioctl analyze・起動から Ready までの時間・SIGTERM の排出を見る。
+# アドオンは Istio の samples/addons（prometheus・kiali・grafana）。Jaeger は telemetry と同じもの。
+SAMPLES="$ROOT/target/tmp/istio-samples"
+fetch_samples() {
+  mkdir -p "$SAMPLES"
+  local base="https://raw.githubusercontent.com/istio/istio/release-${ISTIO_VERSION%.*}"
+  for f in samples/addons/prometheus.yaml samples/addons/kiali.yaml samples/addons/grafana.yaml \
+           samples/bookinfo/platform/kube/bookinfo.yaml samples/bookinfo/networking/destination-rule-all-mtls.yaml \
+           samples/bookinfo/networking/virtual-service-reviews-50-v3.yaml; do
+    [ -s "$SAMPLES/$(basename "$f")" ] || curl -sfL -o "$SAMPLES/$(basename "$f")" "$base/$f" || return 1
+  done
+}
+prom() { # prom <PromQL>: アドオンの Prometheus に問い合わせた JSON
+  kubectl -n istio-system exec deploy/prometheus -c prometheus-server -- \
+    wget -qO- "http://localhost:9090/api/v1/query?query=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$1")" 2>/dev/null
+}
+observe() {
+  log "observe: bookinfo + Prometheus / Kiali / Grafana / Jaeger, analyze, startup, drain ($MODE)"
+  fetch_samples || { bad "fetch Istio samples"; return; }
+  telemetry_jaeger_ready
+  for a in prometheus kiali grafana; do
+    kubectl -n istio-system get deploy "$a" >/dev/null 2>&1 || kubectl apply -f "$SAMPLES/$a.yaml" >/dev/null 2>&1
+  done
+  kubectl -n istio-system rollout status deploy/prometheus deploy/kiali deploy/grafana --timeout=600s >/dev/null \
+    || { bad "addons not ready"; return; }
+  local bns="$NS-bi"
+  kubectl wait --for=delete ns/"$bns" --timeout=300s >/dev/null 2>&1
+  kubectl create ns "$bns" >/dev/null 2>&1
+  kubectl label ns "$bns" istio-injection=enabled --overwrite >/dev/null
+  # 注入の前に注釈を付ける（mixed は productpage・reviews が veil、details・ratings が Envoy）
+  python3 - "$SAMPLES/bookinfo.yaml" "$MODE" "$VEIL_PROXY" > "$TMPDIR/bookinfo-$MODE.yaml" <<'PY'
+import sys, yaml
+src, mode, image = sys.argv[1:]
+docs = [d for d in yaml.safe_load_all(open(src)) if d]
+for d in docs:
+    if d.get("kind") != "Deployment":
+        continue
+    app = d["spec"]["template"]["metadata"]["labels"]["app"]
+    veil = mode == "veil" or (mode == "mixed" and app in ("productpage", "reviews"))
+    if veil:
+        d["spec"]["template"]["metadata"].setdefault("annotations", {})["sidecar.istio.io/proxyImage"] = image
+print(yaml.safe_dump_all(docs))
+PY
+  local t0=$SECONDS
+  kubectl -n "$bns" apply -f "$TMPDIR/bookinfo-$MODE.yaml" >/dev/null
+  kubectl -n "$bns" apply -f "$SAMPLES/destination-rule-all-mtls.yaml" -f "$SAMPLES/virtual-service-reviews-50-v3.yaml" >/dev/null
+  kubectl -n "$bns" rollout status deploy --timeout=900s >/dev/null || { bad "bookinfo not ready"; return; }
+  ok "bookinfo is up ($((SECONDS - t0))s for all Pods)"
+  # 起動から Ready まで（イメージが揃った状態で productpage を作り直し、Pod の作成 → Ready）
+  kubectl -n "$bns" rollout restart deploy/productpage-v1 >/dev/null
+  kubectl -n "$bns" rollout status deploy/productpage-v1 --timeout=300s >/dev/null
+  sleep 3
+  local st
+  st="$(kubectl -n "$bns" get pod -l app=productpage -o json | python3 -c '
+import json, sys, datetime
+ts = lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+for p in json.load(sys.stdin)["items"]:
+    if p["metadata"].get("deletionTimestamp"):
+        continue
+    ready = [c for c in p["status"]["conditions"] if c["type"] == "Ready" and c["status"] == "True"]
+    if not ready:
+        continue
+    img = [c["image"] for c in p["status"]["containerStatuses"] if c["name"] == "istio-proxy"][0]
+    print("%.0f" % (ts(ready[0]["lastTransitionTime"]) - ts(p["metadata"]["creationTimestamp"])).total_seconds(), "veil" if "veil" in img else "envoy")
+    break')"
+  ok "productpage: Pod created -> Ready ${st% *}s (${st#* })"
+  echo "${MODE} startup_ready_s ${st}" >> "$TMPDIR/mesh-observe.tsv"
+  kubectl -n "$bns" apply -f - >/dev/null <<EOF
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata: {name: tracing}
+spec:
+  tracing:
+  - providers: [{name: zipkin}]
+    randomSamplingPercentage: 100
+EOF
+  kubectl -n "$bns" apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loadgen}
+spec:
+  selector: {matchLabels: {app: loadgen}}
+  template:
+    metadata:
+      labels: {app: loadgen}
+      annotations: {$(proxy_annotation client)}
+    spec:
+      containers:
+      - name: fortio
+        image: fortio/fortio:latest
+        imagePullPolicy: IfNotPresent
+        args: ["server", "-http-port", "18080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+EOF
+  kubectl -n "$bns" rollout status deploy/loadgen --timeout=300s >/dev/null
+  sleep 8
+  local out pages
+  out="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 2 -qps 10 -t 30s -timeout 10s -allow-initial-errors -loglevel Error http://productpage:9080/productpage 2>&1)"
+  if echo "$out" | awk '/^Code 200 :/{gsub(/[()%]/,"",$5); exit !($5 >= 99)} END{}' && echo "$out" | grep -q '^Code 200'; then
+    ok "bookinfo productpage under load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; else bad "productpage load: $(echo "$out" | grep '^Code' | tr '\n' ' ')"; fi
+  pages="$(kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio curl -loglevel Error http://productpage:9080/productpage 2>/dev/null)"
+  case "$pages" in
+    *"Book Details"*"Book Reviews"*)
+      if echo "$pages" | grep -q "Error fetching product details\|Ratings service is currently unavailable\|Sorry, product reviews are currently unavailable"; then
+        bad "productpage shows backend errors"; else ok "productpage renders details and reviews"; fi ;;
+    *) bad "productpage content" ;;
+  esac
+  # Prometheus（pilot-agent の統合メトリクスをアドオンの Prometheus が集める）と Grafana の Istio のダッシュボードの主要パネルの式。
+  # パネルは irate（直近の 2 点）なので、負荷を掛けている間に評価する
+  kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 2 -qps 10 -t 150s -timeout 10s -allow-initial-errors -loglevel Error http://productpage:9080/productpage >/dev/null 2>&1 &
+  local bg=$!
+  sleep 45
+  local edges
+  edges="$(prom "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[2m])) by (source_workload,destination_workload,connection_security_policy)" \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(" ".join(sorted("%s>%s:%s" % (x["metric"].get("source_workload"), x["metric"].get("destination_workload"), x["metric"].get("connection_security_policy")) for x in r)))' 2>/dev/null)"
+  case "$edges" in
+    *productpage-v1\>details-v1:mutual_tls*productpage-v1\>reviews-v*:mutual_tls*reviews-v*\>ratings-v1:mutual_tls*) ok "Prometheus: bookinfo edges over mTLS ($edges)" ;;
+    *) bad "Prometheus edges: $edges" ;;
+  esac
+  local q n failed=""
+  for q in \
+    "round(sum(irate(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[1m])), 0.001)" \
+    "sum(irate(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\",response_code!~\"5.*\"}[1m])) / sum(irate(istio_requests_total{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[1m]))" \
+    "histogram_quantile(0.99, sum(irate(istio_request_duration_milliseconds_bucket{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[1m])) by (le))" \
+    "histogram_quantile(0.50, sum(irate(istio_request_bytes_bucket{reporter=\"destination\",destination_workload_namespace=\"$bns\"}[1m])) by (le))" \
+    "histogram_quantile(0.50, sum(irate(istio_response_bytes_bucket{reporter=\"source\",source_workload_namespace=\"$bns\"}[1m])) by (le))" \
+    "sum(irate(istio_requests_total{reporter=\"source\",source_workload=\"productpage-v1\",source_workload_namespace=\"$bns\"}[1m])) by (destination_service)"; do
+    n="$(prom "$q" | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(sum(1 for x in r if x["value"][1] not in ("NaN","0")))' 2>/dev/null)"
+    [ "${n:-0}" -ge 1 ] || failed="$failed [$q]"
+  done
+  if [ -z "$failed" ]; then ok "Grafana Istio dashboard panel queries return data (volume, success rate, P99, sizes, by service)"; else bad "panel queries without data:$failed"; fi
+  wait $bg
+  if kubectl get --raw "/api/v1/namespaces/istio-system/services/grafana:3000/proxy/api/search?query=Istio" 2>/dev/null | grep -q "Istio Service Dashboard"; then
+    ok "Grafana has the Istio dashboards"; else bad "Grafana dashboards"; fi
+  # Kiali のグラフ（辺と mTLS の鍵マーク = isMTLS）
+  local kg
+  kg="$(kubectl get --raw "/api/v1/namespaces/istio-system/services/kiali:20001/proxy/kiali/api/namespaces/graph?namespaces=$bns&graphType=workload&duration=300s" 2>/dev/null | python3 -c '
+import json, sys
+g = json.load(sys.stdin)
+nodes = {n["data"]["id"]: n["data"].get("workload") or n["data"].get("service") or n["data"].get("nodeType") for n in g["elements"]["nodes"]}
+es = g["elements"].get("edges") or []
+mtls = [e for e in es if float(e["data"].get("isMTLS", 0) or 0) > 0]
+print(len(es), len(mtls), " ".join(sorted("%s>%s" % (nodes.get(e["data"]["source"]), nodes.get(e["data"]["target"])) for e in mtls)))' 2>/dev/null)"
+  case "$kg" in
+    *productpage-v1\>details-v1*productpage-v1\>reviews-v*reviews-v*\>ratings-v1*) ok "Kiali graph: edges with the mTLS lock ($kg)" ;;
+    *) bad "Kiali graph: $kg" ;;
+  esac
+  # Jaeger: productpage → details / reviews → ratings が 1 本のトレースに繋がる
+  local j tr
+  j="$(kubectl -n istio-system get pod -l app=jaeger -o name | head -1)"
+  tr="$(kubectl -n istio-system exec "$j" -- wget -qO- "http://localhost:16686/api/traces?service=productpage.$bns&limit=50&lookback=10m" 2>/dev/null | python3 -c '
+import json, sys
+best = ""
+for t in json.load(sys.stdin).get("data") or []:
+    svcs = sorted(set(p["serviceName"].split(".")[0] for p in t.get("processes", {}).values()))
+    if len(svcs) > len(best.split()):
+        best = " ".join(svcs)
+print(best)' 2>/dev/null)"
+  case "$tr" in
+    *details*productpage*ratings*reviews*) ok "Jaeger: one trace spans $tr" ;;
+    *) bad "Jaeger bookinfo trace: $tr" ;;
+  esac
+  # istioctl analyze（veil 起因の警告が無いこと。注釈でイメージを変えたことの IST0105 は差し替えそのもの）
+  local an
+  an="$(istioctl analyze -n "$bns" 2>&1)"
+  # Pod（＝プロキシ）についての指摘だけを見る（サンプルの DestinationRule の未使用のサブセット IST0173 等は対象外）
+  if echo "$an" | grep -E "^(Error|Warning)" | grep "(Pod " | grep -v "IST0105" | grep -q .; then
+    bad "istioctl analyze: $(echo "$an" | grep -E '^(Error|Warning)' | grep '(Pod ' | head -3)"
+  else
+    ok "istioctl analyze: no warnings caused by the proxy ($(echo "$an" | grep -c IST0105) IST0105 image notices)"
+  fi
+  # SIGTERM の排出: ratings に負荷を掛けたまま Pod を 1 つ消す。pilot-agent が /drain_listeners の後にプロキシへ
+  # SIGTERM を送る。プロキシが自分で終わらなければ猶予（30 秒）で殺されるので、消えるまでの時間も見る
+  kubectl -n "$bns" scale deploy/ratings-v1 --replicas=2 >/dev/null
+  kubectl -n "$bns" rollout status deploy/ratings-v1 --timeout=300s >/dev/null
+  sleep 5
+  kubectl -n "$bns" exec deploy/loadgen -c fortio -- fortio load -c 4 -qps 40 -t 25s -timeout 5s -allow-initial-errors -loglevel Error http://ratings:9080/ratings/0 > "$TMPDIR/drain-$MODE.txt" 2>&1 &
+  local lp=$! victim d0 dt codes okpct
+  sleep 6
+  victim="$(kubectl -n "$bns" get pod -l app=ratings -o name | head -1)"
+  d0=$SECONDS
+  kubectl -n "$bns" delete "$victim" --wait=true --timeout=60s >/dev/null 2>&1
+  dt=$((SECONDS - d0))
+  wait $lp
+  codes="$(grep '^Code' "$TMPDIR/drain-$MODE.txt" | tr '\n' ' ')"
+  okpct="$(awk '/^Code 200 :/{gsub(/[()%]/,"",$5); print $5}' "$TMPDIR/drain-$MODE.txt")"
+  echo "${MODE} drain_delete_s ${dt} codes ${codes}" >> "$TMPDIR/mesh-observe.tsv"
+  if [ "$dt" -lt 25 ] && awk -v p="${okpct:-0}" 'BEGIN{exit !(p >= 98)}'; then
+    ok "SIGTERM drain: pod gone in ${dt}s, $codes"; else bad "SIGTERM drain: ${dt}s, $codes"; fi
+  kubectl delete ns "$bns" --wait=false >/dev/null 2>&1
+}
+
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     kubectl delete ns "$NS" "$NS-plain" --wait=false >/dev/null 2>&1
@@ -1074,7 +1276,8 @@ case "$SUITE" in
   telemetry) telemetry ;;
   wasm) wasm ;;
   ambient) ambient ;;
-  all) smoke; tasks; gateway; telemetry; wasm; ambient ;;
+  observe) observe ;;
+  all) smoke; tasks; gateway; telemetry; wasm; ambient; observe ;;
 esac
 cleanup
 echo "== $MODE/$SUITE: pass=$PASS $([ $FAIL = 0 ] && echo ALL OK || echo FAILED)"

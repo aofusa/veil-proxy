@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# 透過転送の接続あたりの syscall（F-216）。kind の Istio で whoami のサイドカー（veil）に strace を付け、
+# 新しい接続を N 本（Connection: close の要求）送って、syscall の種類ごとの回数を接続あたりにして出す。
+# 透過転送で増えるのは SO_ORIGINAL_DST の getsockopt だけであることを確かめる。
+#
+#   tools/k8s/mesh-syscalls.sh [image] [connections]
+#
+# strace はエフェメラルコンテナ（kubectl debug --profile=sysadmin、alpine + strace）から istio-proxy の
+# プロセスに付ける。前提: mesh-e2e.sh と同じ（kind・Istio・veil のイメージ）。
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+mkdir -p "$ROOT/target/tmp"
+export TMPDIR="$ROOT/target/tmp"
+CLUSTER="${KIND_CLUSTER:-mesh}"
+IMAGE="${1:-veil.local/istio-proxy:1.31.1}"
+N="${2:-200}"
+NS=mesh-syscalls
+STRACE=veil.local/strace:latest
+
+kubectl config use-context "kind-$CLUSTER" >/dev/null
+if ! docker image inspect "$STRACE" >/dev/null 2>&1; then
+  printf 'FROM alpine:3.20\nRUN apk add --no-cache strace\n' | docker build -q -t "$STRACE" - >/dev/null || exit 1
+fi
+kind load docker-image --name "$CLUSTER" "$STRACE" "$IMAGE" >/dev/null 2>&1
+kubectl delete ns "$NS" --wait=true >/dev/null 2>&1
+kubectl create ns "$NS" >/dev/null
+kubectl label ns "$NS" istio-injection=enabled >/dev/null
+cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: whoami}
+spec:
+  selector: {matchLabels: {app: whoami}}
+  template:
+    metadata: {labels: {app: whoami}, annotations: {sidecar.istio.io/proxyImage: $IMAGE}}
+    spec:
+      containers: [{name: whoami, image: traefik/whoami:latest, imagePullPolicy: IfNotPresent}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: whoami}
+spec:
+  selector: {app: whoami}
+  ports: [{name: http, port: 80}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client}
+spec:
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}, annotations: {sidecar.istio.io/inject: "false"}}
+    spec:
+      containers: [{name: curl, image: curlimages/curl:latest, imagePullPolicy: IfNotPresent, command: ["sleep", "infinity"]}]
+EOF
+kubectl -n "$NS" rollout status deploy --timeout=300s >/dev/null || { echo "not ready"; exit 1; }
+# 平文で受ける（PERMISSIVE）。メッシュ外の client から inbound（15006 の virtualInbound）へ直接入る
+pod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n "$NS" exec deploy/client -- curl -s -o /dev/null http://whoami/ ; sleep 2
+kubectl -n "$NS" debug "$pod" --image="$STRACE" --target=istio-proxy --profile=sysadmin -c tracer -q -- \
+  sh -c 'pid=$(pidof envoy); exec timeout -s INT 40 strace -f -c -p "$pid"' >/dev/null
+for _ in $(seq 30); do
+  kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.ephemeralContainerStatuses[0].state.running}' | grep -q startedAt && break
+  sleep 1
+done
+sleep 4
+kubectl -n "$NS" exec deploy/client -- sh -c "for i in \$(seq $N); do curl -s -o /dev/null -H 'Connection: close' http://whoami/; done"
+for _ in $(seq 60); do
+  kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.ephemeralContainerStatuses[0].state.terminated}' | grep -q exitCode && break
+  sleep 1
+done
+kubectl -n "$NS" logs "$pod" -c tracer > "$TMPDIR/mesh-syscalls.txt" 2>&1
+echo "image: $IMAGE, connections: $N (inbound, plaintext, whoami sidecar)"
+awk -v n="$N" '
+  /^-----/ {sec++; next}
+  sec == 1 && NF >= 5 && $NF != "total" {
+    calls = ($4 ~ /^[0-9]+$/) ? $4 : $3; name = $NF
+    printf "%-20s %8d calls  %6.2f / connection\n", name, calls, calls / n
+  }' "$TMPDIR/mesh-syscalls.txt" | sort -k2 -n -r
+kubectl delete ns "$NS" --wait=false >/dev/null 2>&1

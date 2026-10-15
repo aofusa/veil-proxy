@@ -282,3 +282,17 @@ flush_interval_ms = 1000  # BufWriter のフラッシュ間隔（ミリ秒、デ
 ```json
 {"timestamp":"2026-01-01T00:00:00Z","type":"access","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
 ```
+
+## サービスメッシュのデータプレーン（F-221）
+
+veil をメッシュのプロキシとして動かすとき（[mesh.md](mesh.md)）は、上の `[prometheus]` のメトリクスではなく、メッシュ
+自身の観測を出す。メッシュの道具はそのまま使える。
+
+| メッシュ | veil が出すもの | 使える道具 |
+|----------|-----------------|------------|
+| Istio | `istio_requests_total`・`istio_request_duration_milliseconds`・`istio_request_bytes`・`istio_response_bytes`・`istio_tcp_*`（Istio のラベル。peer metadata の交換、`connection_security_policy`）を pilot-agent が `:15020/stats/prometheus` にまとめる。Telemetry API の Envoy 書式のアクセスログ。Zipkin / B3 のスパン | Prometheus、Kiali（mTLS の鍵マーク付きのグラフ）、Grafana の Istio のダッシュボード、Jaeger |
+| Linkerd | 管理ポート 4191 の `request_total`・`response_total`・`response_latency_ms`・`tcp_*`・`control_identity_cert_expiration_timestamp_seconds`、4190 の tap | `linkerd viz stat / edges / top / tap`、Prometheus |
+
+ラベルは要求ごとではなく接続ごと（相手の ID と metadata）に決める。Istio 側は `tools/k8s/mesh-e2e.sh <mode> observe`
+が bookinfo で確かめ（Kiali のグラフ・Grafana のパネルの式・Jaeger のトレース）、Linkerd 側は
+`tools/k8s/linkerd-e2e.sh <mode> viz` が emojivoto と booksapp で確かめる。
