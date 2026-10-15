@@ -394,7 +394,7 @@ fn apply_clusters(
             Ok(cfg) => {
                 let slot = reg.cluster_slot(&name);
                 if let Some(eps) = translate::static_endpoints(&c) {
-                    slot.endpoints.store(Arc::new(eps));
+                    slot.replace_endpoints(eps);
                 }
                 if cfg.kind == ClusterKind::OriginalDst {
                     slot.endpoints.store(Arc::new(EndpointSet::default()));
@@ -596,10 +596,10 @@ fn apply_endpoints(resp: &p::DeltaDiscoveryResponse, subs: &mut Subs, errors: &m
         decode_resources(resp, p::TYPE_ENDPOINT, errors);
     let mut raw = RAW.lock().unwrap_or_else(|e| e.into_inner());
     for (name, version, la) in items {
-        let set = Arc::new(translate::endpoint_set(&la, false));
         if let Some(slots) = subs.eds_slots.get(&name) {
+            // スロットごとに前の状態（同時要求数・外れ値検出）を引き継ぐ
             for s in slots {
-                s.endpoints.store(set.clone());
+                s.replace_endpoints(translate::endpoint_set(&la, false));
             }
         }
         raw.endpoints.insert(name, (version, la));

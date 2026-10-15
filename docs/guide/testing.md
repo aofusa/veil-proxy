@@ -135,6 +135,9 @@ Self-contained checks that start their own processes (no shared `e2e_setup.sh` e
 | ACME | `tests/acme/pebble_e2e.sh` | issuance from Pebble via HTTP-01 and hot reload (needs docker) |
 | Containers | `examples/container/e2e.sh` | Docker secrets, environment overrides, certificate rotation, graceful stop (needs a built image) |
 | Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | sidecar in Istio / Linkerd meshes on kind ([kubernetes.md](kubernetes.md)) |
+| Service mesh (Istio) | `tools/k8s/mesh-e2e.sh <stock\|veil\|mixed> <smoke\|tasks\|gateway\|telemetry\|wasm\|ambient\|all>` | veil as Envoy: sidecars, gateways, waypoint ([mesh.md](mesh.md)) |
+| Service mesh (Linkerd) | `tools/k8s/linkerd-e2e.sh <stock\|veil\|mixed> <smoke\|tasks\|ops\|certs\|viz\|all>` | veil as linkerd2-proxy ([mesh.md](mesh.md)) |
+| Service mesh benchmark | `tools/k8s/mesh-bench.sh [rounds] [duration]` | veil vs Envoy sidecars with fortio ([mesh.md](mesh.md)) |
 
 ### Test Coverage
 

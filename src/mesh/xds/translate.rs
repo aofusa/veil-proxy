@@ -1580,6 +1580,151 @@ mod tests {
         assert_eq!(cm.eval(&facts("10.96.0.11:80")), Some(1));
     }
 
+    /// 規模の試験（F-218）: サービス数 × エンドポイント数の EDS を適用し、1 件の更新の時間・メモリと、更新中の
+    /// エンドポイントの選択（データプレーンの処理）の落ち込みを測る。既定は 500 × 10（速い）、
+    /// `VEIL_MESH_SCALE_SERVICES=5000` で設計の規模（5,000 サービス・50,000 エンドポイント）。結果は標準出力。
+    #[test]
+    fn eds_scale_update_cost() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let services: usize = std::env::var("VEIL_MESH_SCALE_SERVICES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+        let per = 10usize;
+        let la = |svc: usize, gen: usize| p::ClusterLoadAssignment {
+            cluster_name: format!("outbound|80||svc-{svc}.ns.svc.cluster.local"),
+            endpoints: vec![p::LocalityLbEndpoints {
+                locality: None,
+                lb_endpoints: (0..per)
+                    .map(|i| p::LbEndpoint {
+                        endpoint: Some(p::Endpoint {
+                            address: Some(p::Address {
+                                address: Some(p::address::Address::SocketAddress(p::SocketAddress {
+                                    protocol: 0,
+                                    address: format!(
+                                        "10.{}.{}.{}",
+                                        (svc / 250) % 250,
+                                        svc % 250,
+                                        (i + gen) % 250 + 1
+                                    ),
+                                    port_value: 8080,
+                                })),
+                            }),
+                            hostname: String::new(),
+                        }),
+                        health_status: 1,
+                        metadata: None,
+                        load_balancing_weight: None,
+                    })
+                    .collect(),
+                load_balancing_weight: None,
+                priority: 0,
+            }],
+        };
+        let rss_kb = || {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        };
+        let rss0 = rss_kb();
+        let slots: Vec<Arc<ClusterSlot>> = (0..services)
+            .map(|i| Arc::new(ClusterSlot::new(&format!("svc-{i}"))))
+            .collect();
+        let t0 = std::time::Instant::now();
+        for (i, s) in slots.iter().enumerate() {
+            s.replace_endpoints(endpoint_set(&la(i, 0), false));
+        }
+        let initial = t0.elapsed();
+        let rss1 = rss_kb();
+        // 更新中のエンドポイントの選択の回数（別スレッドで回し続ける）
+        let stop = Arc::new(AtomicBool::new(false));
+        let picks = Arc::new(AtomicU64::new(0));
+        let cfg = Arc::new(ClusterCfg {
+            name: "c".into(),
+            kind: ClusterKind::Eds,
+            lb: LbPolicy::LeastRequest,
+            connect_timeout: Duration::from_secs(1),
+            bind: None,
+            tls_matches: Vec::new(),
+            tls_default: None,
+            proto: UpstreamProto::Http1,
+            idle_timeout: Duration::from_secs(60),
+            max_requests_per_conn: 0,
+            outlier: None,
+            max_connections: 1024,
+            max_pending: 1024,
+            max_requests: 1024,
+            max_retries: 3,
+            service_host: Bytes::new(),
+            service_name: Bytes::new(),
+            service_namespace: Bytes::new(),
+            eds_name: "c".into(),
+            svc_labels: None,
+            port_override: None,
+        });
+        for s in &slots {
+            s.cfg.store(Arc::new(Some(cfg.clone())));
+        }
+        let run = |secs: u64| {
+            let (stop, picks, slots) = (stop.clone(), picks.clone(), slots.clone());
+            std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let s = &slots[i % slots.len()];
+                    if let Ok(p) = crate::mesh::upstream::pick(s, None, None, &[]) {
+                        p.begin();
+                        p.end(false, false);
+                    }
+                    picks.fetch_add(1, Ordering::Relaxed);
+                    i = i.wrapping_add(7919);
+                }
+                let _ = secs;
+            })
+        };
+        // 更新なし
+        let h = run(1);
+        // 理由付き allow: 試験のスレッドで時間を測る
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let idle_rate = picks.swap(0, Ordering::Relaxed) as f64 / 0.5;
+        stop.store(false, Ordering::Relaxed);
+        // 更新あり（全サービスのエンドポイントを 1 件ずつ入れ替え続ける）
+        let h = run(1);
+        let t1 = std::time::Instant::now();
+        let mut updates = 0usize;
+        while t1.elapsed() < Duration::from_millis(500) {
+            let i = updates % services;
+            slots[i].replace_endpoints(endpoint_set(&la(i, updates / services + 1), false));
+            updates += 1;
+        }
+        let busy = t1.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let busy_rate = picks.load(Ordering::Relaxed) as f64 / busy.as_secs_f64();
+        let per_update_us = busy.as_secs_f64() * 1e6 / updates.max(1) as f64;
+        println!(
+            "eds scale: services={} endpoints={} initial={:?} ({:.1} us/service) rss=+{} kB \
+             update={:.1} us/service picks/s idle={:.0} during-updates={:.0} ({:.1}%)",
+            services,
+            services * per,
+            initial,
+            initial.as_secs_f64() * 1e6 / services as f64,
+            rss1.saturating_sub(rss0),
+            per_update_us,
+            idle_rate,
+            busy_rate,
+            busy_rate / idle_rate.max(1.0) * 100.0
+        );
+        assert!(per_update_us < 5_000.0, "one EDS update must stay well below 5 ms");
+    }
+
     #[test]
     fn route_table_selects_vhost_like_envoy() {
         let rc = p::RouteConfiguration {

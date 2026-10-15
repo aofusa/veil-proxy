@@ -67,6 +67,8 @@ proxy_ann() {
 
 deploy() {
   log "deploy ($MODE)"
+  # 前回の後片付け（--wait=false の削除）が終わるのを待つ
+  kubectl wait --for=delete ns/"$NS" ns/"$NS-plain" --timeout=300s >/dev/null 2>&1
   kubectl create ns "$NS" >/dev/null 2>&1
   kubectl annotate ns "$NS" linkerd.io/inject=enabled --overwrite >/dev/null
   kubectl create ns "$NS-plain" >/dev/null 2>&1

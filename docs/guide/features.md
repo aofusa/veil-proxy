@@ -100,3 +100,16 @@ features are in neither `default` nor `full*`, so the proxy binary contains no l
 | `api` | `api-core` + `tokio-compat` |
 
 C (`crates/veil-capi`, `libveil.so`/`libveil.a`) and Python (`crates/veil-python`) bindings are separate crates built on the same code.
+
+### Service mesh data plane
+
+veil can replace the mesh proxy (Istio's Envoy, Linkerd's linkerd2-proxy; see [Service mesh data plane](mesh.md)).
+These features are in neither `default` nor `full*` (Linux only):
+
+| Feature | Description |
+|---------|-------------|
+| `mesh` | the mesh engine (transparent interception, mTLS, HTTP/1.1 / HTTP/2 / L4, the mesh model) |
+| `mesh-istio` | `mesh` + Envoy compatibility (bootstrap, Delta ADS / SDS, Envoy's admin API) — started as `envoy` |
+| `mesh-linkerd` | `mesh` + linkerd2-proxy compatibility (identity, destination, policy, tap) — started as `linkerd2-proxy` |
+
+Add `wasm` for Istio's WasmPlugin and `epoll` for containers (the default container seccomp profile rejects io_uring).

@@ -1134,6 +1134,13 @@ pub struct MeshEndpoint {
     pub tagged_port: Option<u16>,
     /// 観測のラベル（Prometheus の書式で連結済み。Linkerd の `metric_labels`）
     pub metric_labels: Option<Arc<str>>,
+    /// 負荷分散・外れ値検出の状態（EDS の更新で同じアドレスのエンドポイントに引き継ぐ。F-218）
+    pub state: Arc<EndpointState>,
+}
+
+/// エンドポイントの動的な状態。
+#[derive(Debug, Default)]
+pub struct EndpointState {
     /// 同時要求数（LEAST_REQUEST）
     pub active: AtomicUsize,
     /// 外れ値検出の状態
@@ -1156,14 +1163,12 @@ impl MeshEndpoint {
             h2_upgrade: false,
             tagged_port: None,
             metric_labels: None,
-            active: AtomicUsize::new(0),
-            consecutive_5xx: AtomicUsize::new(0),
-            ejected_until_ms: AtomicU64::new(0),
+            state: Arc::new(EndpointState::default()),
         }
     }
 
     pub fn is_ejected(&self, now_ms: u64) -> bool {
-        self.ejected_until_ms.load(Ordering::Relaxed) > now_ms
+        self.state.ejected_until_ms.load(Ordering::Relaxed) > now_ms
     }
 }
 
@@ -1205,5 +1210,34 @@ impl EndpointSet {
             rr: AtomicUsize::new(0),
             total_weight,
         }
+    }
+
+    /// 前の集合から、同じアドレスのエンドポイントの状態（同時要求数・外れ値検出）とラウンドロビンの位置を
+    /// 引き継ぐ（Envoy も EDS の更新でホストの状態を保つ。処理中の要求は共有した状態を減らす）。
+    pub fn carry_from(mut self, prev: &EndpointSet) -> Self {
+        if prev.endpoints.is_empty() {
+            return self;
+        }
+        let old: HashMap<(SocketAddr, bool), &Arc<EndpointState>> = prev
+            .endpoints
+            .iter()
+            .map(|e| ((e.addr, e.internal.is_some()), &e.state))
+            .collect();
+        for e in &mut self.endpoints {
+            if let Some(s) = old.get(&(e.addr, e.internal.is_some())) {
+                e.state = Arc::clone(s);
+            }
+        }
+        self.rr = AtomicUsize::new(prev.rr.load(Ordering::Relaxed));
+        self
+    }
+}
+
+impl ClusterSlot {
+    /// エンドポイントの集合を差し替える（状態は同じアドレスに引き継ぐ）。
+    pub fn replace_endpoints(&self, set: EndpointSet) -> Arc<EndpointSet> {
+        let set = Arc::new(set.carry_from(&self.endpoints.load()));
+        self.endpoints.store(set.clone());
+        set
     }
 }

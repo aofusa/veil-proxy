@@ -73,6 +73,8 @@ proxy_annotation() {
 }
 
 deploy() {
+  # 前回の後片付け（--wait=false の削除）が終わるのを待つ
+  kubectl wait --for=delete ns/"$NS" ns/"$NS-plain" ns/"$NS-amb" --timeout=300s >/dev/null 2>&1
   kubectl create ns "$NS" >/dev/null 2>&1
   kubectl label ns "$NS" istio-injection=enabled --overwrite >/dev/null
   kubectl create ns "$NS-plain" >/dev/null 2>&1

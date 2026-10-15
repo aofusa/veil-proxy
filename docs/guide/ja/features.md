@@ -100,3 +100,16 @@ veil はライブラリとして組み込み、Rust・C・Python で API サー�
 | `api` | `api-core` + `tokio-compat` |
 
 C（`crates/veil-capi`、`libveil.so`/`libveil.a`）と Python（`crates/veil-python`）のバインディングは、同じコードの上に作られた別クレートです。
+
+### サービスメッシュのデータプレーン
+
+veil はメッシュのプロキシ（Istio の Envoy、Linkerd の linkerd2-proxy）を置き換えられます（[サービスメッシュのデータプレーン](mesh.md)
+を参照）。これらの feature は `default` にも `full*` にも含まれません（Linux のみ）。
+
+| feature | 説明 |
+|---------|------|
+| `mesh` | メッシュのエンジン（透過転送・mTLS・HTTP/1.1 / HTTP/2 / L4・メッシュのモデル） |
+| `mesh-istio` | `mesh` + Envoy 互換（ブートストラップ・Delta ADS / SDS・Envoy の管理 API）。`envoy` として起動 |
+| `mesh-linkerd` | `mesh` + linkerd2-proxy 互換（identity・destination・policy・tap）。`linkerd2-proxy` として起動 |
+
+Istio の WasmPlugin には `wasm`、コンテナでは `epoll` を足します（コンテナの既定の seccomp は io_uring を拒否します）。

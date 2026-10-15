@@ -65,9 +65,9 @@ Secret の証明書での TLS と Secret 更新での差し替え、`VEIL_OVERRI
 graceful shutdown を確かめる。docker・kind・kubectl・istioctl・linkerd・openssl が必要。snap 版 docker は `/tmp` を
 読めないため、一時ファイルは `target/tmp` に置く。
 
-## 今後: veil をメッシュのプロキシにする
+## veil をメッシュのプロキシにする
 
-上の構成ではメッシュのプロキシ（Istio は Envoy、Linkerd は linkerd2-proxy）が veil の隣に残ります。そのプロキシ自体を
-veil に置き換える計画（istiod・Linkerd の制御プレーンは無改造、veil と本家のプロキシの混在、musl 版のイメージ、
-メッシュを使わない既存のプロキシの性能を退行させない）は F-215（`docs/backlog/features/F-215-service-mesh-dataplane.md`、
-子チケット F-216〜F-225）にあります。
+上の構成ではメッシュのプロキシ（Istio は Envoy、Linkerd は linkerd2-proxy）が veil の隣に残ります。veil はそのプロキシ
+自体も**置き換えられます**（サイドカー、Istio のゲートウェイと ambient の waypoint、Linkerd のサイドカー）。istiod・
+Linkerd の制御プレーンは無改造のまま、veil と本家のプロキシが同じメッシュで相互に通信します。
+[サービスメッシュのデータプレーン](mesh.md)を参照してください。

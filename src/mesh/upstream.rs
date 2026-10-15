@@ -113,17 +113,17 @@ impl Picked {
     /// 同時要求数（LEAST_REQUEST）を数える。
     pub fn begin(&self) {
         if let Some(e) = self.endpoint() {
-            e.active.fetch_add(1, Ordering::Relaxed);
+            e.state.active.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn end(&self, status_5xx: bool, gateway_error: bool) {
         let Some(e) = self.endpoint() else { return };
-        e.active.fetch_sub(1, Ordering::Relaxed);
+        e.state.active.fetch_sub(1, Ordering::Relaxed);
         // 外れ値検出（連続 5xx / ゲートウェイエラー）
         let Some(o) = &self.cfg.outlier else { return };
         if status_5xx || gateway_error {
-            let n = e.consecutive_5xx.fetch_add(1, Ordering::Relaxed) + 1;
+            let n = e.state.consecutive_5xx.fetch_add(1, Ordering::Relaxed) + 1;
             let hit = (o.consecutive_5xx > 0 && n >= o.consecutive_5xx as usize)
                 || (gateway_error
                     && o.consecutive_gateway > 0
@@ -140,12 +140,12 @@ impl Picked {
                     || ejected == 0
                 {
                     let until = super::httpcore::now_ms() + o.base_ejection.as_millis() as u64;
-                    e.ejected_until_ms.store(until, Ordering::Relaxed);
-                    e.consecutive_5xx.store(0, Ordering::Relaxed);
+                    e.state.ejected_until_ms.store(until, Ordering::Relaxed);
+                    e.state.consecutive_5xx.store(0, Ordering::Relaxed);
                 }
             }
         } else {
-            e.consecutive_5xx.store(0, Ordering::Relaxed);
+            e.state.consecutive_5xx.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -198,7 +198,7 @@ pub fn pick(
                     if !usable(i) {
                         continue;
                     }
-                    let a = eps.endpoints[i].active.load(Ordering::Relaxed);
+                    let a = eps.endpoints[i].state.active.load(Ordering::Relaxed);
                     match best {
                         Some((_, ba)) if ba <= a => {}
                         _ => best = Some((i, a)),
@@ -572,6 +572,41 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EDS の更新で同じアドレスのエンドポイントの状態を引き継ぐ（F-218）。処理中の要求の終わりは新しい集合にも効く。
+    #[test]
+    fn endpoint_update_keeps_lb_state() {
+        let s = slot_with(vec!["10.0.0.1:80", "10.0.0.2:80"], LbPolicy::LeastRequest);
+        let p = pick(&s, None, None, &[]).unwrap();
+        p.begin();
+        let a = p.addr;
+        // 外れ値で排出されたことにする
+        s.endpoints.load().endpoints[0]
+            .state
+            .ejected_until_ms
+            .store(u64::MAX, Ordering::Relaxed);
+        // 更新: 1 つ目はそのまま、2 つ目は消え、3 つ目が増える
+        s.replace_endpoints(EndpointSet::new(vec![
+            MeshEndpoint::new("10.0.0.1:80".parse().unwrap()),
+            MeshEndpoint::new("10.0.0.3:80".parse().unwrap()),
+        ]));
+        let eps = s.endpoints.load();
+        assert!(eps.endpoints[0].is_ejected(0), "ejection is kept");
+        let active = |addr: SocketAddr| {
+            eps.endpoints
+                .iter()
+                .find(|e| e.addr == addr)
+                .map(|e| e.state.active.load(Ordering::Relaxed))
+        };
+        if let Some(n) = active(a) {
+            assert_eq!(n, 1, "in-flight request is still counted");
+        }
+        p.end(false, false);
+        if let Some(n) = active(a) {
+            assert_eq!(n, 0, "finishing the old pick updates the shared state");
+        }
+        assert_eq!(active("10.0.0.3:80".parse().unwrap()), Some(0));
+    }
 
     fn slot_with(eps: Vec<&str>, lb: LbPolicy) -> ClusterSlot {
         let s = ClusterSlot::new("c");

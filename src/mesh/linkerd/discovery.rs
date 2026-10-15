@@ -386,7 +386,7 @@ async fn watch_destination(cfg: Arc<Config>, path: String, slot: Arc<ClusterSlot
                             .filter_map(|(wa, labels)| endpoint(wa, labels))
                             .collect();
                         ftlog::debug!("[linkerd] {}: {} endpoints", path, eps.len());
-                        slot.endpoints.store(Arc::new(EndpointSet::new(eps)));
+                        slot.replace_endpoints(EndpointSet::new(eps));
                         mark_resolved(&slot.name);
                     }
                     Ok(None) => break,
