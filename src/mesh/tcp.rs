@@ -115,8 +115,8 @@ where
 {
     let (mut ab, mut ba) = (0u64, 0u64);
     let (mut a_open, mut b_open) = (true, true);
-    let a_fd = a.as_raw_fd() as i32;
-    let b_fd = b.as_raw_fd() as i32;
+    let a_fd = a.as_raw_fd();
+    let b_fd = b.as_raw_fd();
     let mut last_activity = std::time::Instant::now();
     while a_open || b_open {
         if super::state::state()
@@ -175,6 +175,8 @@ where
 }
 
 #[cfg(test)]
+// 理由付き allow: テストは同期 I/O（std::net・std::fs）で前提を作る（データプレーンの外）。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::runtime::tcp::TcpStream;

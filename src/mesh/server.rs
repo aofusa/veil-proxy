@@ -411,7 +411,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     if state().is_draining(lst.direction) {
         return;
     }
-    let fd = stream.as_raw_fd() as i32;
+    let fd = stream.as_raw_fd();
     let local = super::net::local_addr(fd).unwrap_or(laddr);
     let dst = if lst.use_original_dst || lst.direction == Direction::Inbound {
         super::net::original_dst(fd).unwrap_or(local)

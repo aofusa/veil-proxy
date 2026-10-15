@@ -223,6 +223,8 @@ pub fn fd_of<S: AsRawFd>(s: &S) -> libc::c_int {
 }
 
 #[cfg(test)]
+// 理由付き allow: テストは同期 I/O（std::net・std::fs）で前提を作る（データプレーンの外）。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

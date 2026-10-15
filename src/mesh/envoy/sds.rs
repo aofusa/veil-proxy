@@ -103,7 +103,7 @@ async fn stream_loop(uds: PathBuf, node: p::Node, name: String) {
     }
 }
 
-async fn session(uds: &PathBuf, node: &p::Node, name: &str, got: &mut bool) -> Result<(), String> {
+async fn session(uds: &std::path::Path, node: &p::Node, name: &str, got: &mut bool) -> Result<(), String> {
     use crate::http2::upstream_mux::{H2Mux, UpResp};
     let io = crate::runtime::time::timeout(
         Duration::from_secs(10),

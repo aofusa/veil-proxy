@@ -866,6 +866,9 @@ pub struct Route {
 }
 
 pub mod route {
+    // 理由付き allow: prost の oneof（Envoy の Route.action の写し）。設定の受信時に 1 回デコードするだけで、
+    // 箱に入れると生成コードの形（prost の oneof の型）と食い違う。
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Action {
         #[prost(message, tag = "2")]

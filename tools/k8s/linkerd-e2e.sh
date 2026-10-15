@@ -266,7 +266,7 @@ EOF
   if retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 http://whoami/ | grep -q '^Hostname: whoami-b'"; then ok "traffic split (weight 0/100 -> whoami-b)"; else bad "traffic split"; fi
   out="$(cexec curl -s -m 5 -H 'x-canary: 1' http://whoami/)" || true
   if echo "$out" | grep -q '^Hostname: whoami-b'; then ok "HTTPRoute header match"; else bad "header match"; fi
-  kubectl -n "$NS" delete httproute split >/dev/null
+  kubectl -n "$NS" delete httproutes.gateway.networking.k8s.io split >/dev/null
   # Timeouts（HTTPRoute の timeouts.request）
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: gateway.networking.k8s.io/v1
@@ -282,7 +282,7 @@ EOF
   if retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 10 -o /dev/null -w '%{http_code}' 'http://fortio:8080/echo?delay=3s' | grep -q 504"; then ok "request timeout 1s -> 504"; else bad "timeout: $(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' 'http://fortio:8080/echo?delay=3s')"; fi
   out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' 'http://fortio:8080/echo?delay=100ms')" || true
   if [ "$out" = 200 ]; then ok "fast request within the timeout -> 200"; else bad "timeout fast: $out"; fi
-  kubectl -n "$NS" delete httproute fortio-timeout >/dev/null
+  kubectl -n "$NS" delete httproutes.gateway.networking.k8s.io fortio-timeout >/dev/null
   # Retries（HTTPRoute の注釈 retry.linkerd.io/http）: 50% で 503 を返す宛先が、リトライで概ね成功する
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: gateway.networking.k8s.io/v1
@@ -302,7 +302,7 @@ EOF
     [ "$out" = 200 ] && n=$((n+1))
   done
   if [ "$n" -ge 26 ]; then ok "retries on 5xx ($n/30 succeeded at 50% failure)"; else bad "retries: $n/30"; fi
-  kubectl -n "$NS" delete httproute fortio-retry >/dev/null
+  kubectl -n "$NS" delete httproutes.gateway.networking.k8s.io fortio-retry >/dev/null
   # Restricting access（Server + MeshTLSAuthentication + AuthorizationPolicy）: client だけ許可
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: policy.linkerd.io/v1beta3
@@ -360,7 +360,7 @@ EOF
   kubectl -n "$NS" delete authorizationpolicy.policy.linkerd.io whoami-client whoami-app-client2 >/dev/null 2>&1
   kubectl -n "$NS" delete httproute.policy.linkerd.io whoami-app >/dev/null 2>&1
   kubectl -n "$NS" delete meshtlsauthentication client-only client2-only >/dev/null 2>&1
-  kubectl -n "$NS" delete server whoami-http >/dev/null 2>&1
+  kubectl -n "$NS" delete servers.policy.linkerd.io whoami-http >/dev/null 2>&1
   retry 60 sh -c "kubectl -n $NS exec deploy/client2 -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami/ | grep -q 200" || true
   # Circuit breaking（failure accrual）: 2 つのエンドポイントのうち常に 500 を返す方を外す
   cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null

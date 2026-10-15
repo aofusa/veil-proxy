@@ -58,10 +58,12 @@ pub fn main() -> i32 {
             return 1;
         }
     };
-    let mut lc = crate::logging::LoggingConfigSection::default();
-    lc.level = std::env::var("VEIL_MESH_LOG")
-        .ok()
-        .unwrap_or_else(|| cfg.log_level().to_string());
+    let lc = crate::logging::LoggingConfigSection {
+        level: std::env::var("VEIL_MESH_LOG")
+            .ok()
+            .unwrap_or_else(|| cfg.log_level().to_string()),
+        ..Default::default()
+    };
     let _guard = crate::logging::init_logging(&lc);
     {
         // 既存のコンポーネント（TLS・HTTP/2）が読む実行時設定（kTLS は使わない）

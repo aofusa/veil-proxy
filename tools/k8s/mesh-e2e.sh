@@ -475,7 +475,7 @@ EOF
   out="$(cexec curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}x" http://whoami."$NS"/)" || true
   if [ "$out" = 401 ]; then ok "JWT: tampered token -> 401"; else bad "JWT tampered token: $out"; fi
   kubectl -n "$NS" delete requestauthentication jwt >/dev/null
-  kubectl -n "$NS" delete authorizationpolicy require-jwt >/dev/null
+  kubectl -n "$NS" delete authorizationpolicies.security.istio.io require-jwt >/dev/null
   # 次の試験の前に、ポリシーの削除がプロキシへ届くのを待つ
   retry 60 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 -o /dev/null -w '%{http_code}' http://whoami.$NS/ | grep -q 200" || true
   # Telemetry API のアクセスログ（Envoy の既定の書式で stdout）
@@ -509,7 +509,7 @@ EOF
   if [ "$out" = 200 ]; then ok "AuthorizationPolicy allows GET from client"; else bad "authz GET: $out"; fi
   out="$(kubectl -n "$NS" exec deploy/fortio -c fortio -- fortio curl -quiet http://whoami."$NS"/ 2>&1 | head -1)" || true
   if echo "$out" | grep -q 403; then ok "AuthorizationPolicy denies other principals"; else bad "authz other principal: $out"; fi
-  kubectl -n "$NS" delete authorizationpolicy whoami-allow >/dev/null
+  kubectl -n "$NS" delete authorizationpolicies.security.istio.io whoami-allow >/dev/null
   kubectl -n "$NS" delete destinationrule fortio >/dev/null 2>&1
   kubectl -n "$NS" delete deploy fortio-v2 >/dev/null 2>&1
 }
@@ -785,7 +785,7 @@ EOF
   else
     bad "Gateway API deployment not created"
   fi
-  kubectl -n "$NS" delete httproute gapi >/dev/null 2>&1
+  kubectl -n "$NS" delete httproutes.gateway.networking.k8s.io gapi >/dev/null 2>&1
   kubectl -n "$NS" delete gateway.gateway.networking.k8s.io gapi >/dev/null 2>&1
   kubectl -n "$NS" delete configmap gapi-options >/dev/null 2>&1
   kubectl -n "$NS" delete virtualservice via-gw >/dev/null 2>&1
@@ -1037,7 +1037,7 @@ EOF
     $aexec curl -s -m 5 http://whoami/ | grep -q '^Hostname: whoami-v1' && v1=$((v1+1))
   done
   if [ "$v1" = 6 ]; then ok "ambient HTTPRoute: default -> v1 (6/6)"; else bad "ambient HTTPRoute default: v1=$v1/6"; fi
-  kubectl -n "$ans" delete httproute whoami >/dev/null
+  kubectl -n "$ans" delete httproutes.gateway.networking.k8s.io whoami >/dev/null
   # L7 の認可（waypoint が適用する AuthorizationPolicy）
   cat <<EOF | kubectl -n "$ans" apply -f - >/dev/null
 apiVersion: security.istio.io/v1
@@ -1055,7 +1055,7 @@ EOF
   if [ "$out" = 200 ]; then ok "ambient AuthorizationPolicy: GET from client -> 200"; else bad "ambient authz GET: $out"; fi
   out="$(kubectl -n "$ans" exec deploy/other -- curl -s -m 10 -o /dev/null -w '%{http_code}' http://whoami/)" || true
   if [ "$out" = 403 ]; then ok "ambient AuthorizationPolicy: other principal -> 403"; else bad "ambient authz other: $out"; fi
-  kubectl -n "$ans" delete authorizationpolicy whoami-l7 >/dev/null
+  kubectl -n "$ans" delete authorizationpolicies.security.istio.io whoami-l7 >/dev/null
   if [ "$KEEP" != "--keep" ]; then kubectl delete ns "$ans" --wait=false >/dev/null 2>&1; fi
 }
 

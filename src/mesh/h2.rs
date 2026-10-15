@@ -982,10 +982,7 @@ async fn to_h1(
             if chunked {
                 sc_buf.extend_from_slice(&rbuf.split());
                 // chunked をほどいて中身だけ送る
-                loop {
-                    let Some(i) = memchr::memmem::find(&sc_buf, b"\r\n") else {
-                        break;
-                    };
+                while let Some(i) = memchr::memmem::find(&sc_buf, b"\r\n") {
                     let size = usize::from_str_radix(
                         std::str::from_utf8(&sc_buf[..i])
                             .unwrap_or("")

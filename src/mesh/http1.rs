@@ -689,11 +689,8 @@ async fn read_resp_head(up: &mut UpIo, buf: &mut BytesMut, head_req: bool) -> io
             }
             let http10 = resp.version == Some(0);
             let mut headers = Vec::with_capacity(resp.headers.len() + 4);
-            let mut framing = if http10 {
-                Framing::UntilClose
-            } else {
-                Framing::UntilClose
-            };
+            // 長さの指定が無ければ接続を閉じるまで（HTTP/1.0 も同じ）
+            let mut framing = Framing::UntilClose;
             let mut has_len = false;
             let mut keep = !http10;
             for h in resp.headers.iter() {
@@ -714,11 +711,10 @@ async fn read_resp_head(up: &mut UpIo, buf: &mut BytesMut, head_req: bool) -> io
                             framing = Framing::Chunked;
                         }
                     }
-                    b"connection" => {
-                        if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) {
+                    b"connection"
+                        if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) => {
                             keep = false;
                         }
-                    }
                     _ => {}
                 }
                 headers.push((name, value));
@@ -918,11 +914,8 @@ where
                     if can_retry {
                         continue;
                     }
-                    let flag = if e.kind() == io::ErrorKind::TimedOut {
-                        ResponseFlag::UpstreamConnectFailure
-                    } else {
-                        ResponseFlag::UpstreamConnectFailure
-                    };
+                    // Envoy は接続のタイムアウトも UF（上流への接続の失敗）
+                    let flag = ResponseFlag::UpstreamConnectFailure;
                     out.status = 503;
                     out.flag = if attempt > 1 {
                         ResponseFlag::UpstreamRetryLimit

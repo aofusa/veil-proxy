@@ -217,13 +217,13 @@ fn parse_jwks(text: &str) -> Vec<Jwk> {
         .collect()
 }
 
-fn requirement(r: &JwtRequirement, map: &HashMap<String, JwtRequirement>) -> Result<Requirement, String> {
+fn requirement(r: &JwtRequirement) -> Result<Requirement, String> {
     use jwt_requirement::Type as T;
     Ok(match &r.r#type {
         Some(T::ProviderName(n)) => Requirement::Provider(n.clone(), Vec::new()),
         Some(T::ProviderAndAudiences(pa)) => Requirement::Provider(pa.provider_name.clone(), pa.audiences.clone()),
-        Some(T::RequiresAny(l)) => Requirement::Any(l.requirements.iter().map(|x| requirement(x, map)).collect::<Result<_, _>>()?),
-        Some(T::RequiresAll(l)) => Requirement::All(l.requirements.iter().map(|x| requirement(x, map)).collect::<Result<_, _>>()?),
+        Some(T::RequiresAny(l)) => Requirement::Any(l.requirements.iter().map(requirement).collect::<Result<_, _>>()?),
+        Some(T::RequiresAll(l)) => Requirement::All(l.requirements.iter().map(requirement).collect::<Result<_, _>>()?),
         Some(T::AllowMissingOrFailed(_)) => Requirement::AllowMissingOrFailed,
         Some(T::AllowMissing(_)) => Requirement::AllowMissing,
         None => Requirement::AllowMissingOrFailed,
@@ -292,11 +292,10 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
             _ => super::model::PathMatch::Any,
         };
         let req = match (&r.requires, r.requirement_name.as_str()) {
-            (Some(rq), _) => requirement(rq, &ja.requirement_map)?,
+            (Some(rq), _) => requirement(rq)?,
             (None, "") => Requirement::AllowMissingOrFailed,
             (None, name) => requirement(
                 ja.requirement_map.get(name).ok_or_else(|| format!("unknown requirement {}", name))?,
-                &ja.requirement_map,
             )?,
         };
         rules.push((path, req));

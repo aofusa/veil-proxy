@@ -54,7 +54,7 @@ pub fn socketpair() -> io::Result<(TcpStream, TcpStream)> {
 /// 同じソケットの別の fd（読みと書きを別のタスクで行う）。
 fn dup(s: &TcpStream) -> io::Result<TcpStream> {
     // SAFETY: 有効な fd を複製する
-    let fd = unsafe { libc::fcntl(s.as_raw_fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
+    let fd = unsafe { libc::fcntl(s.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -65,7 +65,7 @@ fn dup(s: &TcpStream) -> io::Result<TcpStream> {
 fn shutdown(s: &TcpStream, how: i32) {
     // SAFETY: 有効なソケット fd の送信側（または両方）を閉じるだけ
     unsafe {
-        libc::shutdown(s.as_raw_fd() as i32, how);
+        libc::shutdown(s.as_raw_fd(), how);
     }
 }
 

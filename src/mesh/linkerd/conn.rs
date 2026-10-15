@@ -33,7 +33,7 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     let Some(cfg) = CONFIG.get().cloned() else {
         return;
     };
-    let fd = stream.as_raw_fd() as i32;
+    let fd = stream.as_raw_fd();
     let local = crate::mesh::net::local_addr(fd).unwrap_or(laddr);
     let dst = crate::mesh::net::original_dst(fd).unwrap_or(local);
     if laddr.port() == cfg.outbound_addr.port() {

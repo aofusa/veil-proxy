@@ -946,8 +946,8 @@ pub fn route_table(rc: &p::RouteConfiguration, reg: &mut Registry) -> R<RouteTab
             }
         }
     }
-    t.suffix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    t.prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    t.suffix.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+    t.prefix.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
     Ok(t)
 }
 
@@ -1098,7 +1098,7 @@ fn route(r: &p::Route, reg: &mut Registry) -> R<MeshRoute> {
                 .body
                 .as_ref()
                 .and_then(|b| b.inline())
-                .map(|b| Bytes::copy_from_slice(b))
+                .map(Bytes::copy_from_slice)
                 .unwrap_or_default(),
         },
         Some(p::route::Action::NonForwardingAction(_)) => RouteAction::NonForwarding,
@@ -1488,6 +1488,8 @@ fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 }
 
 #[cfg(test)]
+// 理由付き allow: テストは同期 I/O（std::net・std::fs）で前提を作る（データプレーンの外）。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::mesh::state::Registry;
