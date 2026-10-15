@@ -496,9 +496,17 @@ certs() {
   log "certs ($MODE)"
   local e1 e2
   linkerd upgrade --set identity.issuer.issuanceLifetime=1m0s 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
-  kubectl -n linkerd rollout status deploy/linkerd-identity --timeout=300s >/dev/null
+  # upgrade は proxy-injector も作り直す。準備ができる前に Pod を作ると注入されない（webhook は失敗を無視する）
+  kubectl -n linkerd rollout status deploy/linkerd-identity deploy/linkerd-proxy-injector deploy/linkerd-destination --timeout=300s >/dev/null
   kubectl -n "$NS" rollout restart deploy/whoami deploy/client >/dev/null
   kubectl -n "$NS" rollout status deploy/whoami deploy/client --timeout=300s >/dev/null
+  local d
+  for d in whoami client; do
+    if ! kubectl -n "$NS" get pod -l app=$d -o jsonpath='{.items[*].spec.initContainers[*].name} {.items[*].spec.containers[*].name}' | grep -q linkerd-proxy; then
+      kubectl -n "$NS" rollout restart deploy/$d >/dev/null
+      kubectl -n "$NS" rollout status deploy/$d --timeout=300s >/dev/null
+    fi
+  done
   e1="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
   sleep 75
   e2="$(linkerd diagnostics proxy-metrics -n "$NS" deploy/whoami 2>/dev/null | awk '/^control_identity_cert_expiration_timestamp_seconds/{print $2; exit}')"
@@ -506,7 +514,7 @@ certs() {
   if [ -n "$e1" ] && [ -n "$e2" ] && awk -v a="$e1" -v b="$e2" -v now="$(date +%s)" 'BEGIN{exit !(b != a && b > now)}'; then ok "workload certificate renewed ($e1 -> $e2)"; else bad "certificate not renewed: $e1 -> $e2"; fi
   if retry 30 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 http://whoami/ | grep -q '^L5d-Client-Id: client'"; then ok "mTLS keeps working after the renewal"; else bad "mTLS after renewal"; fi
   linkerd upgrade --set identity.issuer.issuanceLifetime=24h0m0s 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
-  kubectl -n linkerd rollout status deploy/linkerd-identity --timeout=300s >/dev/null
+  kubectl -n linkerd rollout status deploy/linkerd-identity deploy/linkerd-proxy-injector deploy/linkerd-destination --timeout=300s >/dev/null
 }
 
 cleanup() {
