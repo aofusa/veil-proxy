@@ -2489,6 +2489,64 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
 }
 
+/// 上流の TLS の種類に合ったコネクタ（HTTP/1.1。F-217）。
+#[cfg(veil_ktls)]
+pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> RustlsConnector {
+    use crate::upstream_tls::TlsProfile;
+    match p {
+        TlsProfile::Verify => get_tls_connector(),
+        TlsProfile::Insecure => get_tls_connector_insecure(),
+        TlsProfile::Custom(c) => {
+            let k = &CURRENT_CONFIG.load().ktls_config;
+            RustlsConnector::new(c.h1.clone())
+                .with_ktls(k.enabled)
+                .with_fallback(k.fallback_enabled)
+                .with_tcp_cork(k.tcp_cork_enabled)
+        }
+    }
+}
+
+/// 上流の TLS の種類に合ったコネクタ（HTTP/1.1。F-217）。
+#[cfg(not(veil_ktls))]
+pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> crate::simple_tls::SimpleTlsConnector {
+    use crate::upstream_tls::TlsProfile;
+    match p {
+        TlsProfile::Verify => get_tls_connector(),
+        TlsProfile::Insecure => get_tls_connector_insecure(),
+        TlsProfile::Custom(c) => crate::simple_tls::SimpleTlsConnector::new(c.h1.clone()),
+    }
+}
+
+/// 上流の TLS の種類に合った ALPN `h2, http/1.1` のコネクタ（F-175・F-217）。
+#[cfg(all(veil_ktls, feature = "http2"))]
+pub fn tls_connector_h2(p: crate::upstream_tls::TlsProfile) -> RustlsConnector {
+    use crate::upstream_tls::TlsProfile;
+    match p {
+        TlsProfile::Verify => get_tls_connector_h2(false),
+        TlsProfile::Insecure => get_tls_connector_h2(true),
+        TlsProfile::Custom(c) => {
+            let k = &CURRENT_CONFIG.load().ktls_config;
+            RustlsConnector::new(c.h2.clone())
+                .with_ktls(k.enabled)
+                .with_fallback(k.fallback_enabled)
+                .with_tcp_cork(k.tcp_cork_enabled)
+        }
+    }
+}
+
+/// 上流の TLS の種類に合った ALPN `h2, http/1.1` のコネクタ（F-175・F-217）。
+#[cfg(all(not(veil_ktls), feature = "http2"))]
+pub fn tls_connector_h2(
+    p: crate::upstream_tls::TlsProfile,
+) -> crate::simple_tls::SimpleTlsConnector {
+    use crate::upstream_tls::TlsProfile;
+    match p {
+        TlsProfile::Verify => get_tls_connector_h2(false),
+        TlsProfile::Insecure => get_tls_connector_h2(true),
+        TlsProfile::Custom(c) => crate::simple_tls::SimpleTlsConnector::new(c.h2.clone()),
+    }
+}
+
 // ====================
 // WASM Response Filter Context
 // ====================
@@ -2623,6 +2681,9 @@ pub struct UpstreamConfig {
     /// 注意: 本番環境では false を推奨
     #[serde(default)]
     pub tls_insecure: bool,
+    /// 上流の mTLS（`tls_client_cert`・`tls_client_key`・`tls_ca`・`expected_san`。F-217）
+    #[serde(flatten)]
+    pub tls: crate::upstream_tls::UpstreamTlsSettings,
     /// サーキットブレーカー設定（F-06）
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
@@ -3906,6 +3967,26 @@ pub struct TlsConfigSection {
     /// `session_resumption = "off"` のときは 0 になる。
     #[serde(default = "default_tls13_tickets")]
     pub tls13_tickets: usize,
+    /// クライアント証明書の要求（mTLS の受け側、F-217）。
+    ///
+    /// - `"none"`（既定）: 要求しない
+    /// - `"optional"`: 要求するが、無くても受ける（あれば `client_ca` で検証する）
+    /// - `"require"`: 必須（無い・検証できないクライアントはハンドシェイクで拒否）
+    #[serde(default)]
+    pub client_auth: ClientAuthMode,
+    /// クライアント証明書の信頼アンカー（PEM、`client_auth` が `none` 以外のとき必須。F-217）。
+    #[serde(default)]
+    pub client_ca: String,
+}
+
+/// クライアント証明書の要求（`[tls] client_auth`、F-217）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuthMode {
+    #[default]
+    None,
+    Optional,
+    Require,
 }
 
 /// TLS セッション再開の方式（`[tls] session_resumption`、F-183）。
@@ -4205,6 +4286,8 @@ pub enum BackendConfig {
         use_h2c: bool,
         /// HTTPS 上流の HTTP/2（F-175、既定 `"auto"`）。
         http2: UpstreamHttp2,
+        /// 上流の mTLS（F-217。未設定なら `None`）
+        tls: Option<Box<crate::upstream_tls::UpstreamTlsSettings>>,
     },
     /// Upstream グループ参照（ロードバランシング用）
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
@@ -4275,6 +4358,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut http2: Option<UpstreamHttp2> = None;
                 // ネイティブハンドラ名（Handler 用、F-188）
                 let mut handler: Option<String> = None;
+                // 上流の mTLS（Proxy 用、F-217）
+                let mut tls = crate::upstream_tls::UpstreamTlsSettings::default();
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -4296,6 +4381,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
                         "http2" => http2 = Some(map.next_value()?),
                         "handler" => handler = Some(map.next_value()?),
+                        "tls_client_cert" => tls.tls_client_cert = map.next_value()?,
+                        "tls_client_key" => tls.tls_client_key = map.next_value()?,
+                        "tls_ca" => tls.tls_ca = map.next_value()?,
+                        "expected_san" => tls.expected_san = map.next_value()?,
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -4337,6 +4426,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 sni_name,
                                 use_h2c,
                                 http2: http2.unwrap_or_default(),
+                                tls: tls.is_set().then(|| Box::new(tls)),
                             })
                         }
                     }
@@ -5180,8 +5270,8 @@ pub struct UpstreamGroup {
     pub rr_counter: Arc<AtomicUsize>,
     /// 健康チェック設定（オプション）
     pub health_check: Option<HealthCheckConfig>,
-    /// TLS証明書検証を無効化（自己署名証明書を許可）
-    pub tls_insecure: bool,
+    /// 上流の TLS の種類（検証する・しない・上流の mTLS の設定。F-217）
+    pub tls_profile: crate::upstream_tls::TlsProfile,
     /// H2C (HTTP/2 over cleartext) を強制するかどうか
     pub use_h2c: bool,
     /// Weighted Round Robin 用の累積重みオフセット（構築時計算、O(1) 選択用）
@@ -5240,7 +5330,7 @@ impl UpstreamGroup {
             algorithm,
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check,
-            tls_insecure,
+            tls_profile: crate::upstream_tls::TlsProfile::from_insecure(tls_insecure),
             use_h2c: false, // デフォルトでは各サーバーの設定に従う
             weighted_offsets,
             total_weight,
@@ -5301,8 +5391,9 @@ impl UpstreamGroup {
             servers: vec![server],
             algorithm: LoadBalanceAlgorithm::RoundRobin,
             rr_counter: Arc::new(AtomicUsize::new(0)),
-            health_check: None,  // 単一サーバーでは健康チェックなし
-            tls_insecure: false, // 単一サーバーではデフォルトで証明書検証を有効
+            health_check: None, // 単一サーバーでは健康チェックなし
+            // 単一サーバーではデフォルトで証明書検証を有効
+            tls_profile: crate::upstream_tls::TlsProfile::Verify,
             use_h2c: false,
             weighted_offsets: vec![1],
             total_weight: 1,
@@ -5542,9 +5633,15 @@ impl UpstreamGroup {
         self.servers.is_empty()
     }
 
-    /// TLS証明書検証を無効化するかどうかを取得
-    pub fn tls_insecure(&self) -> bool {
-        self.tls_insecure
+    /// 上流の TLS の種類（接続の作り方とプールの鍵。F-217）
+    pub fn tls_profile(&self) -> crate::upstream_tls::TlsProfile {
+        self.tls_profile
+    }
+
+    /// 上流の mTLS の設定を使う（F-217。`tls_insecure` より優先）
+    pub fn with_tls_client(mut self, c: &'static crate::upstream_tls::UpstreamTlsClient) -> Self {
+        self.tls_profile = crate::upstream_tls::TlsProfile::Custom(c);
+        self
     }
 
     /// H2C (HTTP/2 over cleartext) を強制するかどうかを取得
@@ -5917,6 +6014,22 @@ fn validate_listeners(config: &Config) -> io::Result<()> {
 
 fn validate_config(config: &Config) -> io::Result<()> {
     validate_listeners(config)?;
+
+    // F-217: クライアント証明書は TCP の TLS（HTTP/1.1・HTTP/2）だけ。HTTP/3 を併用すると mTLS を迂回できるので拒否する
+    if config.tls.client_auth != ClientAuthMode::None {
+        if config.tls.client_ca.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[tls] client_auth requires client_ca",
+            ));
+        }
+        if config.http3.enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[tls] client_auth is not supported with [http3] enabled (HTTP/3 clients would bypass it)",
+            ));
+        }
+    }
 
     // TLS証明書ファイルの存在チェック
     //
@@ -6335,6 +6448,9 @@ pub fn build_server_config_from_paths(
         session_resumption: SessionResumption::default(),
         session_cache_size: default_session_cache_size(),
         tls13_tickets: default_tls13_tickets(),
+        // 起動時の設定が `TLS_CLIENT_AUTH` に記録済みなら、そちらが使われる。
+        client_auth: ClientAuthMode::None,
+        client_ca: String::new(),
     };
     load_tls_config(&section, ktls_enabled, http2_enabled)
         .map_err(|e| anyhow::anyhow!("TLS reload build failed: {}", e))
@@ -6468,17 +6584,22 @@ fn load_tls_config(
             provider.cipher_suites = suites;
         }
 
-        ServerConfig::builder_with_provider(provider.into())
+        let provider: Arc<rustls::crypto::CryptoProvider> = provider.into();
+        let builder = ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("TLS version error: {}", e),
                 )
-            })?
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, keys)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            })?;
+        // F-217: クライアント証明書（mTLS の受け側）
+        match client_cert_verifier(tls_config, provider)? {
+            Some(v) => builder.with_client_cert_verifier(v),
+            None => builder.with_no_client_auth(),
+        }
+        .with_single_cert(cert_chain, keys)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     };
 
     // kTLS が有効な場合のみシークレット抽出を有効化
@@ -6499,6 +6620,56 @@ fn load_tls_config(
     }
 
     Ok(Arc::new(config))
+}
+
+/// 起動時の `[tls] client_auth`・`client_ca`（証明書のリロードでも同じものを使う。F-217）。
+static TLS_CLIENT_AUTH: once_cell::sync::OnceCell<(ClientAuthMode, String)> =
+    once_cell::sync::OnceCell::new();
+
+/// クライアント証明書の検証器（`client_auth = "none"` なら `None`）。
+fn client_cert_verifier(
+    tls_config: &TlsConfigSection,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> io::Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>> {
+    let (mode, ca) = TLS_CLIENT_AUTH
+        .get_or_init(|| (tls_config.client_auth, tls_config.client_ca.clone()))
+        .clone();
+    if mode == ClientAuthMode::None {
+        return Ok(None);
+    }
+    if ca.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "[tls] client_auth requires client_ca",
+        ));
+    }
+    let pem = crate::tls_reload::read_pem(Path::new(&ca))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_reader_iter(BufReader::new(pem.as_slice())) {
+        let c = c.map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e))
+        })?;
+        roots.add(c).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e))
+        })?;
+    }
+    if roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "[tls] client_ca: no certificates",
+        ));
+    }
+    let b = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
+    let b = if mode == ClientAuthMode::Optional {
+        b.allow_unauthenticated()
+    } else {
+        b
+    };
+    let v = b
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("[tls] client_ca: {}", e)))?;
+    info!("TLS client certificates: {:?} (CA {})", mode, ca);
+    Ok(Some(v))
 }
 
 /// 証明書を返さない rustls のサーバ証明書リゾルバ（平文専用サーバ用）。
@@ -6975,7 +7146,14 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                let mut group =
+                    group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                if cfg.tls.is_set() {
+                    group = group.with_tls_client(crate::upstream_tls::intern(
+                        &cfg.tls,
+                        config.tls.ktls_enabled,
+                    )?);
+                }
                 info!(
                     "Reloaded upstream '{}' with {} servers ({:?})",
                     name,
@@ -7162,7 +7340,14 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                let mut group =
+                    group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                if cfg.tls.is_set() {
+                    group = group.with_tls_client(crate::upstream_tls::intern(
+                        &cfg.tls,
+                        config.tls.ktls_enabled,
+                    )?);
+                }
                 info!(
                     "Loaded upstream '{}' with {} servers ({:?})",
                     name,
@@ -7814,6 +7999,7 @@ fn build_backend(
             sni_name,
             use_h2c,
             http2,
+            tls,
         } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
@@ -7850,7 +8036,14 @@ fn build_backend(
                 );
             }
 
-            let group = UpstreamGroup::single(target);
+            let mut group = UpstreamGroup::single(target);
+            if let Some(t) = tls {
+                // 上流の mTLS（F-217）。同じ設定は作り直さない（設定のロード時にだけ作る）
+                group = group.with_tls_client(crate::upstream_tls::intern(
+                    t,
+                    CURRENT_CONFIG.load().ktls_config.enabled,
+                )?);
+            }
             Ok(Backend::Proxy(
                 Arc::new(group),
                 Arc::new(security.clone()),

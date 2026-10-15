@@ -1277,7 +1277,7 @@ pub(crate) enum HttpsOpen {
 pub(crate) async fn open_https<'h, I>(
     target: &crate::config::ProxyTarget,
     key: &str,
-    insecure: bool,
+    insecure: crate::upstream_tls::TlsProfile,
     connect_timeout: Duration,
     idle_timeout: Duration,
     method: &[u8],
@@ -1314,7 +1314,7 @@ where
         }
     };
     let _ = tcp.set_nodelay(true);
-    let connector = crate::config::get_tls_connector_h2(insecure);
+    let connector = crate::config::tls_connector_h2(insecure);
     let tls =
         match crate::runtime::time::timeout(connect_timeout, connector.connect(tcp, target.sni()))
             .await
@@ -1368,7 +1368,7 @@ pub(crate) enum HttpsBuffered {
 pub(crate) async fn request_https_buffered<'h, I>(
     target: &crate::config::ProxyTarget,
     key: &str,
-    insecure: bool,
+    insecure: crate::upstream_tls::TlsProfile,
     connect_timeout: Duration,
     idle_timeout: Duration,
     read_timeout: Duration,

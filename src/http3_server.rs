@@ -1575,7 +1575,7 @@ impl Http3Handler {
             let key = crate::http_utils::PoolKeyStr::tls_addr(
                 addr.as_str(),
                 server.target.sni(),
-                upstream_group.tls_insecure(),
+                upstream_group.tls_profile(),
             );
             !crate::http2::upstream_mux::https_known_h1(key.as_str())
         };
@@ -1624,7 +1624,7 @@ impl Http3Handler {
         // F-44: TLS バックエンドもストリーミング対象（バックエンドタスクが全二重 TLS で貫通）。
         let use_tls = server.target.use_tls;
         let sni = server.target.sni().to_string();
-        let tls_insecure = upstream_group.tls_insecure();
+        let tls_profile = upstream_group.tls_profile();
 
         Decision::Stream(crate::http3_stream::BackendTaskParams {
             server,
@@ -1636,7 +1636,7 @@ impl Http3Handler {
             max_request_body: security.max_request_body_size as u64,
             use_tls,
             sni,
-            tls_insecure,
+            tls_profile,
             pool_max_idle: security.max_idle_connections_per_host,
             pool_idle_timeout_secs: security.idle_connection_timeout_secs,
             no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
@@ -3302,13 +3302,13 @@ impl H3BufferedTask {
                 let key = crate::http_utils::PoolKeyStr::tls_addr(
                     target.conn_addr().as_str(),
                     target.sni(),
-                    upstream_group.tls_insecure(),
+                    upstream_group.tls_profile(),
                 );
                 let body = (!request_body.is_empty()).then(|| request_body.clone());
                 match crate::http2::upstream_mux::request_https_buffered(
                     target,
                     key.as_str(),
-                    upstream_group.tls_insecure(),
+                    upstream_group.tls_profile(),
                     Duration::from_secs(security.backend_connect_timeout_secs),
                     Duration::from_secs(security.idle_connection_timeout_secs),
                     Duration::from_secs(timeout_secs),
@@ -3400,7 +3400,7 @@ impl H3BufferedTask {
                     let cfg = crate::http3_stream::BufferedExchange {
                         target,
                         timeout_secs,
-                        tls_insecure: upstream_group.tls_insecure(),
+                        tls_profile: upstream_group.tls_profile(),
                         pool_max_idle: security.max_idle_connections_per_host,
                         pool_idle_timeout_secs: security.idle_connection_timeout_secs,
                         no_response_body: method.eq_ignore_ascii_case(b"HEAD"),

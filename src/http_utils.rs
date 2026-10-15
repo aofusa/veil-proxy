@@ -192,14 +192,14 @@ impl PoolKeyStr {
 
     /// `addr:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
     #[inline]
-    pub(crate) fn tls_addr(addr: &str, sni: &str, tls_insecure: bool) -> Self {
-        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
+    pub(crate) fn tls_addr(addr: &str, sni: &str, tls: crate::upstream_tls::TlsProfile) -> Self {
+        Self::join_colon(&[addr, sni, tls.tag()])
     }
 
     /// `addr:tag` 形式（TLS プール用、SNI なし）。
     #[inline]
-    pub(crate) fn tls_addr_no_sni(addr: &str, tls_insecure: bool) -> Self {
-        Self::join_colon(&[addr, insecure_tag(tls_insecure)])
+    pub(crate) fn tls_addr_no_sni(addr: &str, tls: crate::upstream_tls::TlsProfile) -> Self {
+        Self::join_colon(&[addr, tls.tag()])
     }
 
     /// `host:port` 形式（SNI なし、平文/HTTP プール用）。
@@ -238,6 +238,7 @@ impl PoolKeyStr {
 
 /// プールキーの `tls_insecure` タグ（証明書検証設定の異なる接続の再利用を防ぐ、B-30）。
 #[inline]
+#[cfg(test)]
 fn insecure_tag(tls_insecure: bool) -> &'static str {
     if tls_insecure {
         "insecure"
@@ -2105,7 +2106,11 @@ mod stack_fmt_tests {
 
     #[test]
     fn pool_key_str_tls_addr_matches_format() {
-        let k = PoolKeyStr::tls_addr("backend.example.com:443", "sni.example.com", true);
+        let k = PoolKeyStr::tls_addr(
+            "backend.example.com:443",
+            "sni.example.com",
+            crate::upstream_tls::TlsProfile::Insecure,
+        );
         assert_eq!(
             k.as_str(),
             format!(
@@ -2137,11 +2142,11 @@ mod stack_fmt_tests {
         for insecure in [true, false] {
             assert_eq!(
                 PoolKeyStr::tls(host, port, sni, insecure).as_str(),
-                PoolKeyStr::tls_addr(addr, sni, insecure).as_str()
+                PoolKeyStr::tls_addr(addr, sni, crate::upstream_tls::TlsProfile::from_insecure(insecure)).as_str()
             );
             assert_eq!(
                 PoolKeyStr::tls_no_sni(host, port, insecure).as_str(),
-                PoolKeyStr::tls_addr_no_sni(addr, insecure).as_str()
+                PoolKeyStr::tls_addr_no_sni(addr, crate::upstream_tls::TlsProfile::from_insecure(insecure)).as_str()
             );
         }
     }

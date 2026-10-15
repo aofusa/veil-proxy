@@ -1144,3 +1144,238 @@ impl Drop for ChildGuard {
         let _ = self.0.wait();
     }
 }
+
+// ===================== F-217（TOML の mTLS） =====================
+
+/// テスト用の CA と、それが発行するサーバ証明書（URI SAN 付き）・クライアント証明書を書き出す。
+fn write_mtls_pki(dir: &std::path::Path) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    sp.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    sp.subject_alt_names
+        .push(SanType::URI("spiffe://test/server".try_into().unwrap()));
+    let server = sp.signed_by(&server_key, &issuer).unwrap();
+    std::fs::write(dir.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let cp = CertificateParams::new(vec!["client.test".to_string()]).unwrap();
+    let client = cp.signed_by(&client_key, &issuer).unwrap();
+    std::fs::write(dir.join("client.pem"), client.pem()).unwrap();
+    std::fs::write(dir.join("client.key"), client_key.serialize_pem()).unwrap();
+}
+
+/// TLS で GET して応答の先頭行を返す（サーバ証明書は検証しない。`client` はクライアント証明書の PEM の組）。
+fn tls_get_status_line(
+    port: u16,
+    path: &str,
+    client: Option<(&std::path::Path, &std::path::Path)>,
+) -> std::io::Result<String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let _ = veil::tls_provider::provider::default_provider().install_default();
+    let b = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifyServer));
+    let config = match client {
+        Some((cert, key)) => {
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            let key = PrivateKeyDer::from_pem_file(key).unwrap();
+            b.with_client_auth_cert(certs, key).unwrap()
+        }
+        None => b.with_no_client_auth(),
+    };
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), name)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let sock = connect_local(port, Duration::from_secs(2))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+    write!(
+        tls,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    tls.flush()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tls.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if buf.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    Ok(text.lines().next().unwrap_or("").to_string())
+}
+
+#[derive(Debug)]
+struct NoVerifyServer;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifyServer {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        veil::tls_provider::provider::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// `[tls] client_auth = "require"` のサーバは証明書の無いクライアントを拒否し、`client_ca` が発行した証明書なら受ける。
+/// その前段の veil は `tls_client_cert`・`tls_client_key`・`tls_ca`・`expected_san`（URI SAN）で上流へ mTLS で
+/// 接続でき、`expected_san` が合わない上流は 502 になる。
+#[test]
+fn f217_toml_mtls_server_client_auth_and_upstream_client_cert() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki = dir.path();
+    write_mtls_pki(pki);
+    let www = pki.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "hello").unwrap();
+    std::fs::write(www.join("ok"), "hello").unwrap();
+    std::fs::write(www.join("bad"), "hello").unwrap();
+
+    // 受け側: mTLS 必須の TLS サーバ
+    let up_port = free_port();
+    let up_dir = pki.join("up");
+    std::fs::create_dir_all(&up_dir).unwrap();
+    let up_cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{up_port}"
+threads = 1
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+client_auth = "require"
+client_ca = "{p}/ca.pem"
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        p = tp(pki),
+        www = tp(&www),
+    );
+    std::fs::write(up_dir.join("config.toml"), up_cfg).unwrap();
+    let mut up = VeilProcess::spawn(&up_dir.join("config.toml"), &[], &[]);
+    assert!(wait_for_port(up_port, Duration::from_secs(20)), "{}", up.log());
+
+    let no_cert = tls_get_status_line(up_port, "/ok", None);
+    assert!(
+        !matches!(&no_cert, Ok(l) if l.starts_with("HTTP/1.1 200")),
+        "client without a certificate must be rejected: {:?}",
+        no_cert
+    );
+    let with_cert = tls_get_status_line(
+        up_port,
+        "/ok",
+        Some((&pki.join("client.pem"), &pki.join("client.key"))),
+    )
+    .unwrap_or_else(|e| panic!("mTLS request failed: {e}\n{}", up.log()));
+    assert!(with_cert.starts_with("HTTP/1.1 200"), "{with_cert}");
+
+    // 送り側: 平文で受けて上流へ mTLS
+    let front_port = free_port();
+    let front_dir = pki.join("front");
+    std::fs::create_dir_all(&front_dir).unwrap();
+    let front_cfg = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{front_port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/ok"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:{up_port}"
+tls_client_cert = "{p}/client.pem"
+tls_client_key = "{p}/client.key"
+tls_ca = "{p}/ca.pem"
+expected_san = ["spiffe://test/server"]
+[[route]]
+[route.conditions]
+path = "/bad"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:{up_port}"
+tls_client_cert = "{p}/client.pem"
+tls_client_key = "{p}/client.key"
+tls_ca = "{p}/ca.pem"
+expected_san = ["spiffe://test/other"]
+"#,
+        p = tp(pki),
+    );
+    std::fs::write(front_dir.join("config.toml"), front_cfg).unwrap();
+    let mut front = VeilProcess::spawn(&front_dir.join("config.toml"), &[], &[]);
+    assert!(
+        wait_for_port(front_port, Duration::from_secs(20)),
+        "{}",
+        front.log()
+    );
+
+    let ok = http1_get(front_port, "/ok").expect("front /ok");
+    if ok.status != 200 {
+        front.terminate(Duration::from_secs(5));
+        up.terminate(Duration::from_secs(5));
+        panic!(
+            "proxy over mTLS failed: {}\nfront:\n{}\nupstream:\n{}",
+            ok.status,
+            front.log(),
+            up.log()
+        );
+    }
+    assert_eq!(ok.text(), "hello");
+    let bad = http1_get(front_port, "/bad").expect("front /bad");
+    assert_eq!(bad.status, 502, "upstream with a different SAN must fail");
+}

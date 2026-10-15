@@ -470,6 +470,9 @@ print(yaml.safe_dump_all(docs))' "$VEIL_IMAGE" "$VEIL_VERSION" ;;
   ns="$NS-emojivoto"
   out="$(linkerd viz stat deploy -n "$ns" 2>&1)"
   if echo "$out" | awk '$1 ~ /^(emoji|voting|web)$/ && $3 ~ /%/' | wc -l | grep -q 3; then ok "viz stat (emojivoto: emoji, voting, web have success rates)"; else bad "viz stat emojivoto: $out"; fi
+  # viz の Prometheus のスクレイプが回るまで待つ
+  edges_ok() { local o; o="$(linkerd viz edges deploy -n "$1" 2>&1)"; shift; for e in "$@"; do echo "$o" | grep -qE "^${e% *} +${e#* } .*√" || return 1; done; }
+  retry 120 edges_ok "$ns" "vote-bot web" "web emoji" "web voting"
   out="$(linkerd viz edges deploy -n "$ns" 2>&1)"
   if echo "$out" | grep -qE "^vote-bot +web .*√" && echo "$out" | grep -qE "^web +emoji .*√" && echo "$out" | grep -qE "^web +voting .*√"; then
     ok "viz edges (vote-bot->web, web->emoji, web->voting secured)"; else bad "viz edges: $out"; fi
@@ -480,6 +483,7 @@ print(yaml.safe_dump_all(docs))' "$VEIL_IMAGE" "$VEIL_VERSION" ;;
   ns="$NS-booksapp"
   out="$(linkerd viz stat deploy -n "$ns" 2>&1)"
   if echo "$out" | awk '$1 ~ /^(authors|books|webapp)$/ && $3 ~ /%/' | wc -l | grep -q 3; then ok "viz stat (booksapp: authors, books, webapp)"; else bad "viz stat booksapp: $out"; fi
+  retry 120 edges_ok "$ns" "webapp books" "webapp authors"
   out="$(linkerd viz edges deploy -n "$ns" 2>&1)"
   if echo "$out" | grep -qE "^webapp +books .*√" && echo "$out" | grep -qE "^webapp +authors .*√"; then ok "viz edges (booksapp)"; else bad "viz edges booksapp: $out"; fi
   out="$(linkerd check --proxy -n "$NS-emojivoto" 2>&1)" || true

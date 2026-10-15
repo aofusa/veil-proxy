@@ -365,6 +365,16 @@ ktls_fallback_enabled = true
 # session_cache_size = 4096     # セッションキャッシュの件数（"cache"、"tickets" の TLS 1.2 session ID 用）
 # tls13_tickets = 1             # TLS 1.3 でハンドシェイクごとに送るチケット数（"off" では 0）
 
+# クライアント証明書（mTLS の受け側。F-217）
+# "none"     = 要求しない（既定）
+# "optional" = 要求するが、無くても受ける（出されたものは client_ca で検証する）
+# "require"  = 必須（無い・client_ca で検証できないクライアントはハンドシェイクで拒否）
+# client_ca はクライアント証明書の信頼アンカー（PEM、none 以外では必須）。
+# TCP の TLS（HTTP/1.1・HTTP/2）だけに効く。[http3] と併用すると QUIC で迂回できるので起動時にエラー。
+# 変更の反映には再起動が必要（証明書リロードでは起動時の設定を引き継ぐ）。
+# client_auth = "none"
+# client_ca = "/path/to/client-ca.pem"
+
 
 
 # ==========================================
@@ -1703,6 +1713,17 @@ revalidate_mtime = false
 # # TLS証明書検証を無効化（自己署名証明書対応、デフォルト: false）
 # # 注意: 本番環境では false を推奨
 # tls_insecure = false
+#
+# # 上流の mTLS（F-217）。Proxy の action（type = "Proxy"）にも同じキーを書ける
+# #   tls_client_cert / tls_client_key: 上流へ出すクライアント証明書と秘密鍵（PEM、組で指定）
+# #   tls_ca:       上流の証明書の信頼アンカー（PEM。省略時は既定の公開 CA）
+# #   expected_san: 上流の証明書の SAN の期待値（DNS 名・URI・IP。どれかが一致すれば受ける。
+# #                 指定するとホスト名の代わりにこれで照合する。SPIFFE ID 等）
+# # 設定のロード時に読み込む（証明書の差し替えは SIGHUP の設定リロードで反映）。tls_insecure より優先
+# tls_client_cert = "/etc/veil/upstream-client.pem"
+# tls_client_key = "/etc/veil/upstream-client.key"
+# tls_ca = "/etc/veil/upstream-ca.pem"
+# expected_san = ["spiffe://cluster.local/ns/default/sa/backend"]
 #
 # # HTTPS 上流で HTTP/2 を使うか（F-175、デフォルト: "auto"）
 # #   "auto": HTTP/2・HTTP/3 で受けた要求は ALPN で h2, http/1.1 を提示し、上流が選んだ方で話す
