@@ -1118,7 +1118,8 @@ where
             // 長さの分からない応答は chunked で返す（下流の接続を保てる）
             put_header(&mut hb, b"transfer-encoding", b"chunked");
         }
-        if !keep {
+        // 101 は `connection: upgrade` だけ（close を並べると WebSocket のクライアントが拒否する）
+        if !keep && rh.status != 101 {
             put_header(&mut hb, b"connection", b"close");
         }
         hb.put_slice(b"\r\n");

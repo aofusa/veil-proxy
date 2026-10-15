@@ -572,7 +572,7 @@ pub fn decide(
             Decision::Local(lr)
         }
         RouteAction::NonForwarding => Decision::Local(LocalReply::new(200, ResponseFlag::None)),
-        RouteAction::Redirect(r) => Decision::Local(redirect(r, req)),
+        RouteAction::Redirect(r) => Decision::Local(redirect(r, req, &route.path)),
         RouteAction::Forward(fa) => {
             let (cluster, weighted) = match &fa.target {
                 ClusterTarget::Single(c) => (c.clone(), None),
@@ -706,7 +706,7 @@ fn hash_of(policies: &[HashPolicy], req: &ReqView<'_>, ctx: &ConnCtx) -> Option<
     any.then(|| h.finish())
 }
 
-fn redirect(r: &RedirectCfg, req: &ReqView<'_>) -> LocalReply {
+fn redirect(r: &RedirectCfg, req: &ReqView<'_>, matched: &PathMatch) -> LocalReply {
     let scheme = r.scheme.clone().unwrap_or_else(|| {
         String::from_utf8_lossy(if req.scheme.is_empty() {
             b"http"
@@ -722,22 +722,33 @@ fn redirect(r: &RedirectCfg, req: &ReqView<'_>) -> LocalReply {
         }
         _ => (host_full.clone(), None),
     };
-    let host = r.host.clone().unwrap_or(host0);
-    let port = match (r.port, &r.scheme) {
-        (Some(p), _) => Some(p.to_string()),
-        (None, Some(_)) => None,
-        (None, None) => port0,
+    // Envoy と同じ: port_redirect があればそれ。host_redirect か scheme を変えたら元のポートは引き継がない
+    let port = match (r.port, &r.scheme, &r.host) {
+        (Some(p), _, _) => Some(p.to_string()),
+        (None, Some(_), _) | (None, None, Some(_)) => None,
+        (None, None, None) => port0,
     };
+    let host = r.host.clone().unwrap_or(host0);
     let (path, query) = req.path_and_query();
     let mut new_path = match (&r.path, &r.prefix_rewrite) {
         (Some(p), _) => p.clone(),
         (None, Some(pre)) => {
-            // ルートの prefix を外して置き換える（一致した prefix はここでは分からないので先頭の / までを置換）
-            format!(
-                "{}{}",
-                pre.trim_end_matches('/'),
-                String::from_utf8_lossy(path)
-            )
+            // 一致した prefix を置き換える（Envoy の prefix_rewrite。完全一致・正規表現の一致はパス全体）
+            let rest: &[u8] = match matched {
+                PathMatch::Prefix(p) | PathMatch::Separated(p) if path.len() >= p.len() => {
+                    &path[p.len()..]
+                }
+                PathMatch::Exact(_) | PathMatch::Regex(_) => b"",
+                _ => path,
+            };
+            let rest = String::from_utf8_lossy(rest);
+            if pre.ends_with('/') && rest.starts_with('/') {
+                format!("{}{}", pre, &rest[1..])
+            } else if rest.is_empty() || rest.starts_with('/') || pre.ends_with('/') {
+                format!("{}{}", pre, rest)
+            } else {
+                format!("{}/{}", pre, rest)
+            }
         }
         (None, None) => String::from_utf8_lossy(path).into_owned(),
     };
@@ -745,6 +756,11 @@ fn redirect(r: &RedirectCfg, req: &ReqView<'_>) -> LocalReply {
         new_path.push('?');
         new_path.push_str(&String::from_utf8_lossy(query));
     }
+    // 方式の既定のポート（http の 80・https の 443）は書かない（Envoy と同じ）
+    let port = port.filter(|p| {
+        !((scheme.eq_ignore_ascii_case("http") && p == "80")
+            || (scheme.eq_ignore_ascii_case("https") && p == "443"))
+    });
     let loc = match port {
         Some(p) => format!("{}://{}:{}{}", scheme, host, p, new_path),
         None => format!("{}://{}{}", scheme, host, new_path),
@@ -1267,4 +1283,86 @@ pub fn finish_span(
         cluster.map(|c| c.name.as_str()).unwrap_or(""),
         &header,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loc(r: &RedirectCfg, authority: &str, path: &str, m: &PathMatch) -> String {
+        let req = ReqView {
+            method: b"GET",
+            path: path.as_bytes(),
+            authority: authority.as_bytes(),
+            headers: &[],
+            scheme: b"http",
+        };
+        let lr = redirect(r, &req, m);
+        let v = &lr
+            .headers
+            .iter()
+            .find(|(k, _)| k.as_ref() == b"location")
+            .unwrap()
+            .1;
+        String::from_utf8(v.to_vec()).unwrap()
+    }
+
+    fn cfg() -> RedirectCfg {
+        RedirectCfg {
+            host: None,
+            port: None,
+            scheme: None,
+            path: None,
+            prefix_rewrite: None,
+            strip_query: false,
+            status: 302,
+        }
+    }
+
+    /// Gateway API の ReplacePrefixMatch（Envoy の prefix_rewrite）は一致した prefix だけを置き換える。
+    #[test]
+    fn redirect_replaces_only_the_matched_prefix() {
+        let mut r = cfg();
+        r.prefix_rewrite = Some("/replacement-prefix".into());
+        let m = PathMatch::Separated("/original-prefix".into());
+        assert_eq!(
+            loc(&r, "gw", "/original-prefix/lemon", &m),
+            "http://gw/replacement-prefix/lemon"
+        );
+        assert_eq!(
+            loc(&r, "gw", "/original-prefix", &m),
+            "http://gw/replacement-prefix"
+        );
+        assert_eq!(
+            loc(&r, "gw", "/original-prefix?a=1", &m),
+            "http://gw/replacement-prefix?a=1"
+        );
+    }
+
+    /// host_redirect だけなら元のポートは引き継がない。既定のポートは書かない。port_redirect は付ける。
+    #[test]
+    fn redirect_port_follows_envoy() {
+        let mut r = cfg();
+        r.host = Some("example.org".into());
+        assert_eq!(
+            loc(&r, "gw:8080", "/x", &PathMatch::Any),
+            "http://example.org/x"
+        );
+        r.port = Some(80);
+        assert_eq!(
+            loc(&r, "gw:8080", "/x", &PathMatch::Any),
+            "http://example.org/x"
+        );
+        r.port = Some(8443);
+        assert_eq!(
+            loc(&r, "gw:8080", "/x", &PathMatch::Any),
+            "http://example.org:8443/x"
+        );
+        let mut r = cfg();
+        r.path = Some("/y".into());
+        assert_eq!(
+            loc(&r, "gw:8080", "/x", &PathMatch::Any),
+            "http://gw:8080/y"
+        );
+    }
 }

@@ -61,6 +61,8 @@ data:
       template:
         spec:${proxy_overlay:- {\}}
 EOF
+# 前回の試験の名前空間が消えるのを待つ
+kubectl wait --for=delete ns/gateway-conformance-infra ns/gateway-conformance-app-backend ns/gateway-conformance-web-backend --timeout=300s >/dev/null 2>&1
 kubectl delete ns "$NS" --wait=true >/dev/null 2>&1
 kubectl create ns "$NS" >/dev/null
 kubectl -n "$NS" create serviceaccount runner >/dev/null

@@ -617,6 +617,20 @@ async fn serve_http(
     } else {
         hcm.direction
     };
+    // 平文で Codec が AUTO なのに先頭を読んでいない（先読みの要らないリスナー。ゲートウェイ等）なら、ここで
+    // HTTP/2 の prior knowledge かを見分ける（Envoy の HCM の AUTO と同じ）
+    let (det, initial) = if chain.tls.is_none()
+        && matches!(hcm.codec, Codec::Auto)
+        && initial.is_empty()
+        && det == Detected::Other
+    {
+        detect::sniff(&stream, None).await
+    } else {
+        (det, initial)
+    };
+    if det == Detected::Closed {
+        return;
+    }
     let (ds, peer_cert, h2) = match &chain.tls {
         Some(tls) => match tls_accept(stream, tls, initial, client_alpn).await {
             Ok((s, pc)) => {
