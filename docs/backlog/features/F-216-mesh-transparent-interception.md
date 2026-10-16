@@ -1,6 +1,6 @@
 # F-216: メッシュの透過転送（SO_ORIGINAL_DST・仮想 inbound / outbound）とプロトコル検出
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -49,6 +49,19 @@ Istio・Linkerd の init コンテナ / CNI が設定する iptables の REDIREC
 - E2E（Linux、`unshare -n` の network namespace で iptables REDIRECT を張る）: outbound の HTTP/1.1・h2c・TLS（passthrough）・
   opaque TCP がそれぞれ元の宛先へ届く。inbound がアプリへ届く。UID の除外でループしない。
 - 接続あたりの syscall 増が `getsockopt` 1 本だけであることを strace で確認。io_uring・epoll の両方の E2E。
+
+
+## 実装の結果
+
+- virtualOutbound / virtualInbound・元の宛先のリスナーへの受け渡し・プロトコル検出（TLS の SNI/ALPN・h2c・HTTP/1・opaque。
+  読んだバイトは再利用）。Istio の 127.0.0.6 からの inbound、UID 1337 の除外（istio-init / linkerd-init の iptables）。
+- 接続あたりの syscall（`tools/k8s/mesh-syscalls.sh`。アイドルの回を差し引く）: 透過転送で増えるのは SO_ORIGINAL_DST の
+  `getsockopt` 1 本だけ（以前は `getsockname` も 1 本あった→修正）。
+- io_uring と epoll: epoll 版（既定のイメージ）で全スイート、io_uring 版で Istio の smoke 26/26・tasks 18/18。Linkerd は
+  注入がプロキシに `seccompProfile: RuntimeDefault` を付けるので io_uring が使えない（理由を出して起動時に終わる）。
+- `unshare -n` の network namespace での E2E はこのホストで作れない（非特権）。代わりに kind の Pod の中で istio-init /
+  linkerd-init が張る iptables の上で、outbound の HTTP/1.1・h2c・TLS（passthrough）・opaque TCP、inbound を確かめた
+  （mesh-e2e.sh の smoke、linkerd-e2e.sh の smoke・tasks）。
 
 ## 関連
 

@@ -1,6 +1,6 @@
 # F-222: Istio のサイドカーのアダプタ（Envoy のブートストラップ・xDS v3 の変換・SDS・管理 API の模倣）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -67,6 +67,16 @@ pilot-agent は `ProxyConfig.binaryPath`（既定 `/usr/local/bin/envoy`）を�
   `istioctl analyze` に veil 起因の警告が無い、Pod の起動 → Ready が Envoy と同等以下、SIGTERM で排出して終わる。
 - istiod が生成した xDS を対象の版ごとにフィクスチャとして保存し（`tests/fixtures/istio/<version>/`）、変換の単体試験。
 - `docs/guide/kubernetes.md`（英日）に「Istio のプロキシとして使う」の節。
+
+
+## 実装の結果
+
+- pilot-agent を残して `/usr/local/bin/envoy` を veil に差し替える。ブートストラップ・Delta ADS・SDS・ECDS（WasmPlugin → Proxy-Wasm、
+  B-131）・管理 API（istioctl proxy-status / proxy-config）。
+- istiod の xDS のフィクスチャ（`tests/fixtures/istio/1.31.1/`、`tools/k8s/mesh-fixtures.sh`・`VEIL_MESH_XDS_RECORD`）と変換の試験
+  `tests/mesh_istio_fixtures.rs`。
+- bookinfo を全 Pod veil で動かす・istioctl analyze にプロキシ起因の指摘なし・Pod の作成 → Ready は Envoy 46 秒に対して veil 19〜34 秒・
+  SIGTERM の排出（負荷の最中に Pod を消して 99.7% 成功、Envoy は 99.8%）・カオス（istiod の再起動・停止、プロキシの kill）。
 
 ## 関連
 

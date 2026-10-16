@@ -923,7 +923,7 @@ allow_credentials = false    # "*" とは併用できない
   他のオリジンからのプリフライトと、プリフライトでない要求は action へ行く。実際の応答の
   `Access-Control-Allow-Origin` は `[route.security] add_response_headers` で付ける。
 - フォルトの中断を設定したルートの要求は、HTTP/2・HTTP/3 ではバッファ経路を通る（判定は要求をディスパッチするときの 1 回）。
-- TOML のルートにはまだ無いもの: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
+- TOML のルートにはまだ無いもの（F-226）: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
   メッシュのデータプレーンは Istio / Linkerd のポリシーからこれらを実装している（[mesh.md](mesh.md)）。TOML のルートでは
   上流のタイムアウトと冪等な要求の再送（[load-balancing.md](load-balancing.md)）を使う。
 

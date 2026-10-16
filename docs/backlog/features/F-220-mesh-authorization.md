@@ -1,6 +1,6 @@
 # F-220: メッシュの認可・認証（RBAC・JWT・ext_authz）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -36,6 +36,15 @@ Linkerd の Server・AuthorizationPolicy・MeshTLSAuthentication・NetworkAuthen
 - F-225 の kind で Istio の公式タスク（Authorization の HTTP・TCP・JWT・deny・dry-run、Authentication Policy）と Linkerd の
   タスク（Restricting Access To Services・Per-Route Policy）を通す。
 - メッシュ無しの TOML からも使えるようにする（`[route.security]` の拡張か別のセクション）。`docs/guide/security.md`（英日）。
+
+
+## 実装の結果
+
+- メッシュ: Istio の AuthorizationPolicy（HTTP・TCP・ALLOW / DENY・dry-run）・RequestAuthentication（JWT、インラインの JWKS）、
+  Linkerd の Server・AuthorizationPolicy・MeshTLSAuthentication・ルート単位の認可。ext_authz は未対応（NACK）。
+- TOML: `[route.jwt]`（署名・iss・aud・exp/nbf・`require_claims`。トークン無し・検証失敗は 401、claim の不一致は 403）と
+  `[tls] client_allowed_sans`（クライアント証明書の SAN をハンドシェイクで照合）。JWT の検証は `src/jwt_verify.rs` にまとめて
+  メッシュと共有（`jwt` feature、`full*` に含める）。E2E `f220_route_jwt_and_client_allowed_sans`。`docs/guide/security.md`（英日）。
 
 ## 関連
 

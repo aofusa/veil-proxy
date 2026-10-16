@@ -217,6 +217,37 @@ F-202 は HTTP/1.1 の共通経路（ヘッダ位置・ルーティング用の�
 [library.md の Performance](../guide/library.md#performance)・F-205）。B-128 で multishot の受信が有効になった HTTP/3 も
 変わらない（API ライブラリの HTTP/3 でも main と同じ。`docs/artifacts/b128_h3_ab.tsv`）。
 
+<a id="service-mesh"></a>
+
+## サービスメッシュ（2026-10-16、F-215〜F-225、kind）
+
+veil（musl、epoll）を Istio 1.31.1 の Envoy・Linkerd edge-26.10.1 の linkerd2-proxy と同じ経路に置き、fortio で交互に測った
+（`tools/k8s/mesh-bench.sh 3 20s`・`linkerd-bench.sh 2 20s`。ラウンドごとに順番を入れ替え、平均）。kind の単一ノード（4 コア）、
+プロキシの `concurrency` は 2、fortio は 16 接続、128 バイトの echo。CPU と RSS は kubelet の stats/summary のプロキシの
+コンテナ（Istio は pilot-agent を含む）。
+
+| 経路 | 項目 | 本家 | veil | 比 |
+|------|------|-----:|-----:|---:|
+| Istio のサイドカー（両側） | HTTP/1.1 の最大スループット（rps） | 3,221 | 6,732 | 2.09 |
+| | gRPC の最大スループット（rps） | 2,520 | 4,600 | 1.83 |
+| | 1,000 rps の p50 / p90 / p99 / p99.9（ms） | 5.44 / 7.19 / 11.7 / 19.7 | 2.56 / 3.74 / 5.33 / 9.43 | |
+| | サイドカーの CPU（µs / 要求、両側の合計） | 685 | 280 | 0.41 |
+| | RSS（MB、クライアント側 / サーバ側） | 37.4 / 36.4 | 24.2 / 24.6 | |
+| Istio のゲートウェイ（Gateway API） | HTTP/1.1 の最大スループット（rps） | 5,597 | 11,125 | 1.99 |
+| | 1,000 rps の p50 / p99 / p99.9（ms） | 3.90 / 7.39 / 9.62 | 1.91 / 4.51 / 6.50 | |
+| | CPU（µs / 要求） | 305 | 116 | 0.38 |
+| | RSS（MB） | 33.0 | 19.4 | |
+| Linkerd のサイドカー（両側） | HTTP/1.1 の最大スループット（rps） | 4,109 | 7,261 | 1.77 |
+| | gRPC の最大スループット（rps） | 2,835 | 4,814 | 1.70 |
+| | 1,000 rps の p50 / p90 / p99 / p99.9（ms） | 3.78 / 5.02 / 8.49 / 17.5 | 3.05 / 4.61 / 6.42 / 10.6 | |
+| | プロキシの CPU（µs / 要求、両側の合計） | 452 | 267 | 0.59 |
+| | RSS（MB、クライアント側 / サーバ側） | 5.8 / 5.6 | 5.4 / 4.3 | |
+
+メッシュ無し（サイドカー無し）の同じ経路は 24,570 rps（gRPC 12,580 rps）。起動（bookinfo の productpage の Pod の作成 → Ready）は
+Envoy 46 秒に対して veil 19〜34 秒、SIGTERM の排出（負荷の最中に Pod を消す）の成功率は Envoy 99.8%・veil 99.6〜99.7%
+（`mesh-e2e.sh <mode> observe`）。接続あたりの syscall は透過転送で `getsockopt`（SO_ORIGINAL_DST）1 本だけ増える
+（`tools/k8s/mesh-syscalls.sh`）。
+
 ## FreeBSD 14.3 aarch64（QEMU + HVF、ネイティブ）
 
 - コミット: `d8126b6`。`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`（3B と 54,576B）

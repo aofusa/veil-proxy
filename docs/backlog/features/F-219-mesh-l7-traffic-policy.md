@@ -1,6 +1,6 @@
 # F-219: メッシュの L7 のトラフィック制御の不足分
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15。TOML のルートの要求のタイムアウト・条件付きリトライ・ミラー・フォルトの遅延は F-226）**
 
 ## 目的
 
@@ -48,6 +48,19 @@ Istio の VirtualService・DestinationRule・Gateway API の HTTPRoute / GRPCRou
   Traffic Shifting・Request Timeouts・Circuit Breaking・Mirroring）と Linkerd のタスク（Traffic Split・Retries・Timeouts）を
   F-225 の kind の試験で通す。
 - `docs/guide/routing.md`・`load-balancing.md`（英日）・`examples/config.toml`。
+
+
+## 実装の結果
+
+- メッシュ: 重み付き分割・条件付きリトライ・タイムアウト・ミラー・フォルト（遅延・中断）・CORS・ヘッダ操作・リダイレクト・
+  書き換え（正規表現の一致の `prefix_rewrite` はパス全体の置き換え）・直接応答・LEAST_REQUEST・一貫性ハッシュ・サブセット・
+  外れ値検出・HTTP/2 への昇格。Istio の tasks（Request Routing・Fault Injection・Traffic Shifting・Request Timeouts・
+  Circuit Breaking・Mirroring）と Linkerd の tasks（Traffic Split・Retries・Timeouts）を通した。
+- TOML: `type = "Respond"`（固定応答）と `[route.traffic]`（重み付き分割・フォルトの中断・CORS のプリフライト）。ルート照合の直後に
+  解決済みの Backend を選ぶだけ（無いルートは分岐 1 個）。HTTP/2・HTTP/3 の下見は乱数を引かない。
+  E2E `f219_route_traffic_respond_split_fault_cors`。`docs/guide/routing.md`・`load-balancing.md`（英日）・`examples/config.toml`。
+- TOML のルートにまだ無いもの（メッシュにはある）: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
+  既存のプロキシの全経路（HTTP/1.1・HTTP/2・HTTP/3・ストリーミング）に入れる必要があり、性能の非退行と合わせて F-226 で扱う。
 
 ## 関連
 

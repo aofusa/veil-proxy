@@ -116,8 +116,17 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 
 ## 性能
 
-kind の上で fortio で測った（`tools/k8s/mesh-bench.sh`。クライアントとサーバの両側のサイドカー、交互のラウンド）。
-表は [docs/perf/README.md](../../perf/README.md#service-mesh) にある。
+kind の上で fortio で測った（`tools/k8s/mesh-bench.sh`・`linkerd-bench.sh`。クライアントとサーバの両側のプロキシ、
+交互のラウンド、4 コアのノード、プロキシの concurrency は 2）。
+
+| 経路 | 本家 | veil |
+|------|-----:|-----:|
+| Istio のサイドカー、HTTP/1.1 の最大（rps） / 1,000 rps の p99 | 3,221 / 11.7 ms | 6,732 / 5.3 ms |
+| Istio のサイドカー、要求あたりの CPU（両側） | 685 µs | 280 µs |
+| Istio のゲートウェイ（Gateway API）、HTTP/1.1 の最大（rps） | 5,597 | 11,125 |
+| Linkerd のサイドカー、HTTP/1.1 の最大（rps） / gRPC の最大（rps） | 4,109 / 2,835 | 7,261 / 4,814 |
+
+遅延の分位・RSS・起動・排出を含む表は [docs/perf/README.md](../../perf/README.md#service-mesh)。
 
 ## 試験
 

@@ -124,8 +124,18 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
 
 ## Performance
 
-Measured on kind with fortio (`tools/k8s/mesh-bench.sh`, client and server sidecars, alternating rounds). See
-[docs/perf/README.md](../perf/README.md#service-mesh) for the full table.
+Measured on kind with fortio (`tools/k8s/mesh-bench.sh` and `linkerd-bench.sh`: client and server proxies, alternating
+rounds, 4-core node, proxy concurrency 2):
+
+| Path | Stock | veil |
+|------|------:|-----:|
+| Istio sidecars, HTTP/1.1 max (rps) / p99 at 1,000 rps | 3,221 / 11.7 ms | 6,732 / 5.3 ms |
+| Istio sidecars, CPU per request (both sides) | 685 µs | 280 µs |
+| Istio gateway (Gateway API), HTTP/1.1 max (rps) | 5,597 | 11,125 |
+| Linkerd sidecars, HTTP/1.1 max (rps) / gRPC max (rps) | 4,109 / 2,835 | 7,261 / 4,814 |
+
+See [docs/perf/README.md](../perf/README.md#service-mesh) for the full table (latency percentiles, RSS, start-up and
+draining).
 
 ## Tests
 

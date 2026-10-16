@@ -1,6 +1,6 @@
 # F-224: Istio のゲートウェイ・ambient（waypoint・HBONE、ztunnel は検討）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -34,6 +34,17 @@ Istio で Envoy が動いている残りの場所、ingress / egress ゲート�
   Gateway API）と Gateway API の conformance（コア）を F-225 で通す。egress ゲートウェイ: Egress Gateways のタスク。
 - waypoint: ambient の bookinfo で waypoint を veil にして、L7 の認可・トラフィックの移行（ambient のタスク）が動く。ztunnel は本家。
 - ゲートウェイの性能を Envoy のゲートウェイと比べる（F-225）。
+
+
+## 実装の結果
+
+- ingress / egress ゲートウェイ（Istio の Gateway: HTTP・SIMPLE・MUTUAL・PASSTHROUGH、egress）、Gateway API のゲートウェイ、
+  ambient の waypoint（HBONE・内部リスナー・filter_chain_matcher）。ztunnel は本家のまま。
+- Gateway API の conformance（v1.2.1、GATEWAY-HTTP、`tools/k8s/mesh-gateway-conformance.sh`）: コア 33 項目は stock / veil とも合格。
+  Istio が対応する拡張機能（21 項目）も含めて veil（musl）で全部合格（337 のサブテスト）。見つかった不具合: 無効な backendRef の
+  500、ReplacePrefixMatch のリダイレクト、リダイレクトのポート、ゲートウェイでの h2c、101 の応答の connection ヘッダ。
+- ambient の試験は whoami で行った（bookinfo ではない）。
+- ゲートウェイの性能（mesh-bench の gw-stock / gw-veil）: HTTP/1.1 の最大 Envoy 5,597 rps に対して veil 11,125 rps、要求あたりの CPU 305 → 116 µs（docs/perf/README.md）。
 
 ## 関連
 

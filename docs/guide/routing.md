@@ -929,7 +929,7 @@ allow_credentials = false    # cannot be combined with "*"
   `Access-Control-Allow-Origin` to actual responses with `[route.security] add_response_headers`.
 - When the fault abort applies to a route, its requests take the buffered path on HTTP/2 and HTTP/3 (the decision
   is made once, when the request is dispatched).
-- Not available on TOML routes yet: per-route request timeouts, conditional retries, mirroring and fault delays.
+- Not available on TOML routes yet (F-226): per-route request timeouts, conditional retries, mirroring and fault delays.
   The mesh data plane implements them from Istio / Linkerd policies ([mesh.md](mesh.md)); for TOML routes use the
   upstream timeouts and the idempotent retry ([load-balancing.md](load-balancing.md)).
 

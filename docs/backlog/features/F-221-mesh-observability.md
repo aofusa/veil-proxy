@@ -1,6 +1,6 @@
 # F-221: メッシュの観測（Istio・Linkerd の標準メトリクス・分散トレース・アクセスログ）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -43,6 +43,18 @@ Kiali・Grafana の Istio のダッシュボード・`linkerd viz` が、veil �
 - F-225 の kind で、Kiali のグラフ（bookinfo）に veil の Pod 間の辺と mTLS の鍵マークが出る、Istio の Grafana ダッシュボードの
   主要パネルが埋まる、`linkerd viz stat/edges/top`（tap は任意）が emojivoto で動く、Jaeger に bookinfo のトレースが繋がって出る。
 - 標準メトリクスを有効にしても `tools/perf` の代表構成で退行が 2% 以内（交互 A/B）。
+- `docs/guide/observability.md`（英日）。
+
+
+## 実装の結果
+
+- Istio の標準メトリクス（peer metadata の交換、`connection_security_policy`、outbound の `destination_principal`）・Telemetry API の
+  アクセスログ・Zipkin / B3 のトレース。Linkerd の `/metrics`（viz の stat / edges / top / tap）。
+- `mesh-e2e.sh <mode> observe`: bookinfo で Prometheus・Kiali（全部の辺に mTLS の鍵マーク）・Grafana の Istio のダッシュボードの
+  パネルの式・Jaeger（4 サービスにまたがるトレース）。stock / veil とも合格。
+- 見つかった不具合: 管理用のリスナー（15090）への要求を istio_requests_total に数え、Kiali に unknown への平文の辺が出ていた。
+  ambient のプロファイルの istiod は送り手にヘッダの peer metadata を付けさせない（クラスタの `disable_mx`）ので、受け手は
+  WDS（`istio.workload.Workload`、ブートストラップの `metadata_discovery`）で送信元を知る必要があった（Envoy → veil が unknown）。
 - `docs/guide/observability.md`（英日）。
 
 ## 関連
