@@ -924,7 +924,10 @@ required-features = ["wasm"]
 # 入れてはならない（重複シンボルでリンクが壊れる）。
 [target.'cfg(target_os = "linux")'.dependencies]
 quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.1", default-features = false, optional = true }
-aws-lc-sys = { version = "0.45", features = ["ssl", "bindgen"] }
+# F-238: rustls（aws-lc-rs）が引く aws-lc-sys と必ず同じ 1 つの版にする（2 つになると、プレフィックス無しの
+# シンボルが衝突し、ビルドが libcrypto を見つけられずに失敗する）。crates.io から入れた利用者の解決では
+# aws-lc-rs の最新が新しい aws-lc-sys を要求するので、範囲で受けて同じ版に寄せる。
+aws-lc-sys = { version = ">=0.45, <0.48", features = ["ssl", "bindgen"] }
 
 # FreeBSD は capsicum capability mode 下でも証明書ホットリロードが
 # 動作する in-memory SSL_CTX API（`Config::with_boring_ssl_ctx_builder`、F-136）が

@@ -1,6 +1,6 @@
 //! kTLS + splice(2) の HTTP プロキシ
 //!
-//! F-233 で `proxy_orig.rs` から移した（中身は変えていない）。
+//! F-233 で `src/proxy.rs` から移した（中身は変えていない）。
 
 use super::*;
 
