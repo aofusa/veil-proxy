@@ -50,7 +50,8 @@ pub fn run(workers: usize) {
         let msg = format!(
             "[mesh] io_uring is not available ({}): the container's seccomp profile forbids it \
              (RuntimeDefault, which Linkerd's proxy injector sets, blocks io_uring). \
-             Use the image built with the `epoll` feature",
+             Use the image built with the `epoll` feature, or put the epoll build next to this one as \
+             `<this binary>.epoll` (or set VEIL_FALLBACK_BIN) to switch to it at start-up",
             e
         );
         ftlog::error!("{}", msg);

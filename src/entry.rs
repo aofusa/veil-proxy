@@ -127,6 +127,11 @@ impl WorkerListenerSource {
 // ====================
 
 pub fn run() {
+    // F-237: io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）、同じイメージの epoll 版へ
+    // 切り替える（切り替え先が無ければ何もしない）。メッシュの起動（F-227）より前に行う。
+    #[cfg(veil_rt_uring)]
+    crate::runtime::fallback::exec_reactor_if_uring_unavailable();
+
     // F-182: capsicum の capability mode 用の接続ブローカーとして再実行された場合（隠し引数）。
     // 設定・ログ・ランタイムを一切初期化せずにブローカーのループへ入る。
     #[cfg(target_os = "freebsd")]

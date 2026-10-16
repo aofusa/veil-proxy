@@ -48,6 +48,9 @@ pub mod udp;
 mod reactor;
 #[cfg(veil_rt_uring)]
 mod uring;
+// io_uring が使えないときの epoll 版への切り替え（F-237）
+#[cfg(veil_rt_uring)]
+pub mod fallback;
 
 #[cfg(veil_rt_reactor)]
 pub use reactor::{executor, tcp, timer};

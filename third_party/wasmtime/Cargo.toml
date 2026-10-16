@@ -34,6 +34,8 @@ readme = "README.md"
 license = "Apache-2.0 WITH LLVM-exception"
 repository = "https://github.com/aofusa/veil-proxy"
 homepage = "https://github.com/bytecodealliance/wasmtime"
+# veil: Cargo.toml.orig（upstream の元のマニフェスト、参照用）は cargo の予約名なので公開物に入れない
+exclude = ["/Cargo.toml.orig"]
 resolver = "2"
 
 [package.metadata.docs.rs]
