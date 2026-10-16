@@ -712,7 +712,6 @@ pub(super) async fn handle_requests(
                     .map(|i| &path_bytes[..i])
                     .unwrap_or(&path_bytes);
 
-                let config = CURRENT_CONFIG.load();
                 // ルーティングの送信元条件に使うアドレス。`client_ip` は呼び出し側で
                 // `peer_addr.ip()` から作った文字列なので、毎リクエスト文字列から
                 // パースし直さず（DTrace で `read_ipv4_addr` がホットスポットに出ていた）
@@ -743,15 +742,14 @@ pub(super) async fn handle_requests(
                     let raw_query: &[u8] =
                         query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
 
-                    find_backend_unified(
+                    crate::l7::resolve_route(
                         &host_bytes,
                         path_without_query,
                         &method_bytes,
                         headers_raw,
                         raw_query,
                         &client_socket_addr,
-                        config.route.as_slice(),
-                        &config.upstream_groups,
+                        true,
                     )
                 };
 
@@ -767,45 +765,16 @@ pub(super) async fn handle_requests(
                 // セキュリティ設定を取得
                 let security = backend.security();
 
-                // IP制限チェック（deny → allow の順で評価）
-                let ip_filter = security.ip_filter();
-                if ip_filter.is_configured() && !ip_filter.is_allowed(client_ip) {
-                    let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                    return;
-                }
-
-                // 許可メソッドチェック
-                if !security.allowed_methods.is_empty() {
-                    let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
-                    let is_allowed = security
-                        .allowed_methods
-                        .iter()
-                        .any(|m| m.eq_ignore_ascii_case(method_str));
-                    if !is_allowed {
-                        let err_buf = ERR_MSG_METHOD_NOT_ALLOWED.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                        return;
-                    }
-                }
-
-                // ルートごとのボディサイズ制限（chunked以外）
-                if !is_chunked && content_length > security.max_request_body_size {
-                    let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                    return;
-                }
-
-                // レートリミットチェック
-                if security.rate_limit_requests_per_min > 0
-                    && !check_rate_limit(
-                        security as *const SecurityConfig as usize,
-                        client_ip,
-                        security.rate_limit_requests_per_min,
-                    )
-                {
-                    let err_buf = ERR_MSG_TOO_MANY_REQUESTS.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                // IP 制限・許可メソッド・本文の大きさ（chunked 以外）・レート制限（F-234: 3 経路で共通の検査と順）
+                let check = check_security(
+                    security,
+                    client_ip,
+                    &method_bytes,
+                    content_length,
+                    is_chunked,
+                );
+                if let Some(resp) = check.http1_response() {
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(resp.to_vec())).await;
                     return;
                 }
 
@@ -1441,7 +1410,7 @@ pub(super) async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => {
             handle_redirect(
                 tls_stream,
                 &redirect_url,

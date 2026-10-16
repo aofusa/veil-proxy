@@ -27,7 +27,6 @@ use crate::logging::*;
 use crate::metrics::*;
 use crate::pool::*;
 use crate::runtime::handle::{AsRawFd, RawFd};
-use crate::upstream::*;
 
 use crate::server::spawn_background_revalidation;
 
@@ -125,58 +124,10 @@ static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
 // 共通セキュリティチェック（HTTP/1.1, HTTP/2, HTTP/3 共用）
 // ====================
 //
-// プロトコル非依存のセキュリティチェック関数群。
-// 各プロトコルハンドラーから呼び出されます。
+// プロトコル非依存のセキュリティチェックは src/l7.rs（F-234）。ここは各プロトコルハンドラーが
+// 使う名前を再エクスポートする（`crate::proxy::check_security` 等の既存のパスを保つ）。
+pub use crate::l7::{check_security, SecurityCheckResult};
 
-/// セキュリティチェック結果
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecurityCheckResult {
-    /// 許可（処理を継続）
-    Allowed,
-    /// IP拒否（403 Forbidden）
-    IpDenied,
-    /// メソッド不許可（405 Method Not Allowed）
-    MethodNotAllowed,
-    /// レート制限超過（429 Too Many Requests）
-    RateLimitExceeded,
-    /// リクエストサイズ超過（413 Request Entity Too Large）
-    RequestTooLarge,
-}
-
-impl SecurityCheckResult {
-    /// HTTPステータスコードに変換
-    #[inline]
-    pub fn status_code(&self) -> u16 {
-        match self {
-            SecurityCheckResult::Allowed => 200,
-            SecurityCheckResult::IpDenied => 403,
-            SecurityCheckResult::MethodNotAllowed => 405,
-            SecurityCheckResult::RateLimitExceeded => 429,
-            SecurityCheckResult::RequestTooLarge => 413,
-        }
-    }
-
-    /// エラーメッセージを取得
-    #[inline]
-    pub fn message(&self) -> &'static [u8] {
-        match self {
-            SecurityCheckResult::Allowed => b"OK",
-            SecurityCheckResult::IpDenied => b"Forbidden",
-            SecurityCheckResult::MethodNotAllowed => b"Method Not Allowed",
-            SecurityCheckResult::RateLimitExceeded => b"Too Many Requests",
-            SecurityCheckResult::RequestTooLarge => b"Request Entity Too Large",
-        }
-    }
-}
-
-/// 統合セキュリティチェック（すべてのプロトコル共用）
-///
-/// ## チェック項目
-/// 1. IP制限（allowed_ips, denied_ips）
-/// 2. HTTPメソッド制限（allowed_methods）
-/// 3. レートリミット（rate_limit_requests_per_min）
-/// 4. ボディサイズ制限（max_request_body_size）
-///
 /// 管理 API: 設定情報をJSON形式で返す（F-21: GET /__admin/config）
 ///
 /// secret フィールドは "***" にマスクする。
@@ -307,55 +258,6 @@ fn handle_cache_purge(path_with_query: &str, is_purge_method: bool) -> Vec<u8> {
         );
         b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     }
-}
-
-/// ## パフォーマンス
-/// 設定がデフォルトの場合、has_security_checks() で早期リターンし、
-/// オーバーヘッドを最小化。
-#[cfg(any(feature = "http2", feature = "http3"))]
-#[inline]
-pub fn check_security(
-    security: &SecurityConfig,
-    client_ip: &str,
-    method: &[u8],
-    content_length: usize,
-    is_chunked: bool,
-) -> SecurityCheckResult {
-    // IP制限チェック
-    let ip_filter = security.ip_filter();
-    if ip_filter.is_configured() && !ip_filter.is_allowed(client_ip) {
-        return SecurityCheckResult::IpDenied;
-    }
-
-    // 許可メソッドチェック
-    if !security.allowed_methods.is_empty() {
-        let method_str = std::str::from_utf8(method).unwrap_or("GET");
-        let is_allowed = security
-            .allowed_methods
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(method_str));
-        if !is_allowed {
-            return SecurityCheckResult::MethodNotAllowed;
-        }
-    }
-
-    // レートリミットチェック（B-31: ルート × IP ごと、全ワーカー共通）
-    if security.rate_limit_requests_per_min > 0
-        && !check_rate_limit(
-            security as *const SecurityConfig as usize,
-            client_ip,
-            security.rate_limit_requests_per_min,
-        )
-    {
-        return SecurityCheckResult::RateLimitExceeded;
-    }
-
-    // ボディサイズ制限（chunked以外）
-    if !is_chunked && content_length > security.max_request_body_size {
-        return SecurityCheckResult::RequestTooLarge;
-    }
-
-    SecurityCheckResult::Allowed
 }
 
 // ====================

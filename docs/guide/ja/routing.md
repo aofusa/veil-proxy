@@ -856,6 +856,19 @@ url = "http://localhost:9000/"
   allowed_methods = ["GET", "POST"]
 ```
 
+#### 検査の順
+
+`[route.security]` はすべてのルートの種類に効く（`Respond`・`Redirect`、`[route.traffic]` が返す応答〈フォルトの中断・
+CORS のプリフライト〉と `[route.jwt]` の応答も含む）。HTTP/1.1・HTTP/2・HTTP/3 は同じ順で検査し、最初に失敗した検査で
+応答が決まる。
+
+1. IP 制限（`allowed_ips` / `denied_ips`）→ 403
+2. `allowed_methods` → 405
+3. `max_request_body_size` → 413（HTTP/3・HTTP/2 は `content-length` が無くても受け取った本文の長さで数える）
+4. `rate_limit_requests_per_min` → 429
+
+状態を持たない検査を先にするので、大きさで拒否する要求はレート制限の枠を使わない。
+
 #### IP制限の評価順序
 
 IP制限は **deny → allow** の順で評価されます（denyが優先）。

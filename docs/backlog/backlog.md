@@ -426,6 +426,8 @@
 | B-129 | P1 | 完了 | [bugs/B-129-http1-pipelined-request-dropped.md](bugs/B-129-http1-pipelined-request-dropped.md) | HTTP/1.1 のパイプラインで 2 つ目以降の要求を 1 つ目の本文として捨て、接続が止まっていた。`Content-Length` を超えた分を次の要求として残し、揃っていれば読まずに処理する |
 | B-130 | P1 | 完了 | [bugs/B-130-http2-closed-stream-data-window-leak.md](bugs/B-130-http2-closed-stream-data-window-leak.md) | HTTP/2 で本文の受け手が閉じた（ハンドラが本文を読み終える前に応答した）ストリームへの DATA が接続の受信ウィンドウを返さず、同じ接続の後続の要求が止まっていた（上限超過の gRPC メッセージの直後等）。3 つの経路で補充する |
 | B-131 | P2 | 完了 | [bugs/B-131-proxy-wasm-cpp-sdk-compat.md](bugs/B-131-proxy-wasm-cpp-sdk-compat.md) | Proxy-Wasm の C++ SDK 製のモジュールが `proxy_get_property` を読めず異常終了していた（パスの NUL 区切りを読まない・`malloc` のエクスポートを使わない・`plugin_root_id` が数値）。Istio の WasmPlugin の試験で発見 |
+| B-132 | P1 | 完了 | [bugs/B-132-security-check-order-and-h3-body-length.md](bugs/B-132-security-check-order-and-h3-body-length.md) | HTTP/2・HTTP/3 は本文の上限の前にレート制限を数え（413 の要求が枠を使い、413 と 429 の優先がプロトコルで違った）、HTTP/3 は content-length の無い要求の本文の上限を見ていなかった。検査を src/l7.rs に 1 つにまとめた（F-234） |
+| B-133 | P0 | 完了 | [bugs/B-133-respond-redirect-ignore-route-security.md](bugs/B-133-respond-redirect-ignore-route-security.md) | `Respond`・`Redirect` のルート（とトラフィック制御・JWT の応答）が `[route.security]` を無視し、IP 制限等が効いていなかった（3 経路とも） |
 
 ---
 

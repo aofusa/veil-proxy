@@ -73,7 +73,6 @@ use crate::metrics::{
 };
 use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
-use crate::upstream::find_backend_unified;
 
 // F-233: 機能ごとのファイル（子モジュールは `use super::*;` で親の名前を見る）
 mod request_task;
@@ -1403,32 +1402,15 @@ impl Http3Handler {
         let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
         let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
 
-        let backend_result = crate::upstream::find_backend_preview(
+        let backend_result = crate::l7::resolve_route(
             authority,
             path_wo_query,
             method,
             &headers_raw,
             raw_query,
             &self.peer_addr,
-            config.route.as_slice(),
-            &config.upstream_groups,
-        )
-        .or_else(|| {
-            if !authority.is_empty() {
-                crate::upstream::find_backend_preview(
-                    b"",
-                    path_wo_query,
-                    method,
-                    &headers_raw,
-                    raw_query,
-                    &self.peer_addr,
-                    config.route.as_slice(),
-                    &config.upstream_groups,
-                )
-            } else {
-                None
-            }
-        });
+            false,
+        );
 
         let (prefix, backend, _route_compression) = match backend_result {
             Some(b) => b,

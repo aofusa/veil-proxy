@@ -701,37 +701,15 @@ impl H3BufferedTask {
         let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
         let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
 
-        let backend_result = find_backend_unified(
+        let backend_result = crate::l7::resolve_route(
             authority,
             path_without_query,
             method,
             &headers_raw,
             raw_query,
             &self.peer_addr,
-            config.route.as_slice(),
-            &config.upstream_groups,
-        )
-        .or_else(|| {
-            // authority が空でない場合、デフォルトルートを検索
-            if !authority.is_empty() {
-                debug!(
-                    "[HTTP/3] No route found for authority '{}', trying default routes",
-                    String::from_utf8_lossy(authority)
-                );
-                find_backend_unified(
-                    b"",
-                    path_without_query,
-                    method,
-                    &headers_raw,
-                    raw_query,
-                    &self.peer_addr,
-                    config.route.as_slice(),
-                    &config.upstream_groups,
-                )
-            } else {
-                None
-            }
-        });
+            true,
+        );
 
         // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
         // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
@@ -815,13 +793,14 @@ impl H3BufferedTask {
             }
         };
 
-        // セキュリティチェック
+        // セキュリティチェック。本文は受信済みなので実際の長さでも上限を見る（HTTP/3 は content-length を
+        // 省略できる。省略した要求が本文の上限を素通りしていた。B-132 の行列の試験で発見）
         let security = backend.security();
         let check_result = check_security(
             security,
             self.client_ip.as_str(),
             method,
-            content_length,
+            content_length.max(request_body.len()),
             false,
         );
 
@@ -1160,7 +1139,7 @@ impl H3BufferedTask {
                     Err(_) => (500, 0),
                 }
             }
-            Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
+            Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => self
                 .handle_redirect(&redirect_url, status_code, preserve_path, path, &prefix)
                 .await
                 .unwrap_or((500, 0)),

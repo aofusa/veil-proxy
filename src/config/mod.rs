@@ -2966,7 +2966,7 @@ mod f159_resolved_backend_tests {
         // Redirect ならリダイレクト先 URL が resolved_backend 由来のものと一致することを確認
         // （clone のみで再構築していないことの間接確認）。
         match loaded {
-            Backend::Redirect(url, status, preserve_path, _) => {
+            Backend::Redirect(url, status, preserve_path, _, _) => {
                 assert_eq!(&*url, "https://example.com/");
                 assert_eq!(status, 301);
                 assert!(!preserve_path);

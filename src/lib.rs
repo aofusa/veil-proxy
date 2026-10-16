@@ -287,6 +287,9 @@ pub(crate) mod tls_writev;
 pub mod jwt_verify;
 #[doc(hidden)]
 pub mod route_traffic;
+// HTTP/1.1・2・3 で共通の L7 の段（ルートの照合・セキュリティの検査。F-234）
+#[doc(hidden)]
+pub mod l7;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 #[doc(hidden)]
 pub mod tls_provider;

@@ -10,7 +10,7 @@
 //! - 乱数で決める判定（分割・中断）は、ストリーミングにするかの下見（`draw = false`）では引かない。
 //!   下見とディスパッチで 2 回引くと、中断の割合が二乗になる（下見は中断の可能性があればバッファ経路にする）。
 
-use crate::config::{Backend, BackendConfig, Route, UpstreamGroup};
+use crate::config::{Backend, BackendConfig, Route, SecurityConfig, UpstreamGroup};
 use bytes::Bytes;
 use serde::Deserialize;
 use std::cell::Cell;
@@ -198,6 +198,10 @@ pub struct FixedResponse {
     /// HTTP/1.1 の応答全体（`Connection: keep-alive` / `close`）
     pub h1_keepalive: Bytes,
     pub h1_close: Bytes,
+    /// ルートの `[route.security]`（IP 制限・許可メソッド・本文の大きさ・レート制限）。B-133 より前は
+    /// `Backend::security()` が既定値を返し、`type = "Respond"` とトラフィック制御の応答（フォルト・CORS・JWT）は
+    /// ルートのセキュリティ設定を無視していた
+    pub security: Arc<SecurityConfig>,
 }
 
 impl FixedResponse {
@@ -232,8 +236,23 @@ impl FixedResponse {
             body,
             h1_keepalive,
             h1_close,
+            security: default_security(),
         }
     }
+
+    /// ルートのセキュリティ設定を付ける（ロード時に 1 回）
+    pub fn with_security(mut self, security: Arc<SecurityConfig>) -> Self {
+        self.security = security;
+        self
+    }
+}
+
+/// セキュリティ設定の無い固定応答（単体テスト・ルートの外で作る応答）が共有する既定値
+fn default_security() -> Arc<SecurityConfig> {
+    static DEFAULT: std::sync::OnceLock<Arc<SecurityConfig>> = std::sync::OnceLock::new();
+    DEFAULT
+        .get_or_init(|| Arc::new(SecurityConfig::default()))
+        .clone()
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -373,8 +392,15 @@ fn err(m: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, m)
 }
 
-fn respond_backend(status: u16, headers: Vec<(Bytes, Bytes)>, body: Bytes) -> Backend {
-    Backend::Respond(Arc::new(FixedResponse::new(status, headers, body)))
+fn respond_backend(
+    security: &Arc<SecurityConfig>,
+    status: u16,
+    headers: Vec<(Bytes, Bytes)>,
+    body: Bytes,
+) -> Backend {
+    Backend::Respond(Arc::new(
+        FixedResponse::new(status, headers, body).with_security(security.clone()),
+    ))
 }
 
 /// `[route.traffic]` を解決する（設定のロード時）。
@@ -388,8 +414,14 @@ pub fn resolve(
     }
     let default_traffic = TrafficConfig::default();
     let t = route.traffic.as_ref().unwrap_or(&default_traffic);
+    // トラフィック制御が返す応答（フォルト・CORS・JWT）にもルートのセキュリティ設定を付ける（B-133）
+    let sec = Arc::new(route.security.clone().unwrap_or_default());
     #[cfg(feature = "jwt")]
-    let jwt = route.jwt.as_ref().map(resolve_jwt).transpose()?;
+    let jwt = route
+        .jwt
+        .as_ref()
+        .map(|j| resolve_jwt(j, &sec))
+        .transpose()?;
     #[cfg(not(feature = "jwt"))]
     if route.jwt.is_some() {
         return Err(err(
@@ -453,6 +485,7 @@ pub fn resolve(
             Some((
                 ppm,
                 respond_backend(
+                    &sec,
                     f.abort_status,
                     vec![(
                         Bytes::from_static(b"content-type"),
@@ -507,7 +540,7 @@ pub fn resolve(
                         Bytes::from_static(b"true"),
                     ));
                 }
-                respond_backend(200, h, Bytes::new())
+                respond_backend(&sec, 200, h, Bytes::new())
             };
             let mut any = None;
             let mut exact = Vec::new();
@@ -538,7 +571,7 @@ pub fn resolve(
 }
 
 #[cfg(feature = "jwt")]
-fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
+fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> {
     let text = match (j.jwks.is_empty(), j.jwks_path.is_empty()) {
         (false, true) => j.jwks.clone(),
         (true, false) => {
@@ -568,7 +601,7 @@ fn resolve_jwt(j: &JwtConfig) -> io::Result<JwtRule> {
                 Bytes::from_static(w),
             ));
         }
-        respond_backend(status, h, Bytes::from_static(body))
+        respond_backend(sec, status, h, Bytes::from_static(body))
     };
     Ok(JwtRule {
         keys,
@@ -612,14 +645,20 @@ mod tests {
     fn policy(abort_percent: f64) -> TrafficPolicy {
         TrafficPolicy {
             split: vec![
-                (90, respond_backend(201, vec![], Bytes::new())),
-                (100, respond_backend(202, vec![], Bytes::new())),
+                (
+                    90,
+                    respond_backend(&default_security(), 201, vec![], Bytes::new()),
+                ),
+                (
+                    100,
+                    respond_backend(&default_security(), 202, vec![], Bytes::new()),
+                ),
             ],
             split_total: 100,
             abort: (abort_percent > 0.0).then(|| {
                 (
                     (abort_percent * 10_000.0) as u32,
-                    respond_backend(503, vec![], Bytes::new()),
+                    respond_backend(&default_security(), 503, vec![], Bytes::new()),
                 )
             }),
             cors: None,

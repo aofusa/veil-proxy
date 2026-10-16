@@ -982,37 +982,19 @@ where
         .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect();
 
-    let config = CURRENT_CONFIG.load();
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
 
-    let backend_result = crate::upstream::find_backend_preview(
+    let backend_result = crate::l7::resolve_route(
         &authority,
         path_wo_query,
         &method,
         &headers_raw,
         raw_query,
         &client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        if !authority.is_empty() {
-            crate::upstream::find_backend_preview(
-                b"",
-                path_wo_query,
-                &method,
-                &headers_raw,
-                raw_query,
-                &client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
-        }
-    });
+        false,
+    );
 
     let (_prefix, backend, _rc) = backend_result?;
     // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
@@ -1281,38 +1263,20 @@ pub(super) async fn h2_dispatch(
         return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
     }
 
-    let config = CURRENT_CONFIG.load();
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
     let authority = &ctx.authority[..];
 
-    let backend_result = find_backend_unified(
+    let backend_result = crate::l7::resolve_route(
         authority,
         path_wo_query,
         method,
         &headers_raw,
         raw_query,
         &ctx.client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        if !authority.is_empty() {
-            find_backend_unified(
-                b"",
-                path_wo_query,
-                method,
-                &headers_raw,
-                raw_query,
-                &ctx.client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
-        }
-    });
+        true,
+    );
 
     let (prefix, backend, route_compression) = match backend_result {
         Some(b) => b,
@@ -1594,7 +1558,7 @@ pub(super) async fn h2_dispatch(
             headers.extend(r.headers.iter().cloned());
             h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => {
             h2_redirect(
                 ctx,
                 &redirect_url,
@@ -3638,38 +3602,20 @@ pub(super) async fn h2_serve_streaming(
         .map(|h| (h.name.as_ref(), h.value.as_ref()))
         .collect();
 
-    let config = CURRENT_CONFIG.load();
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
     let authority = &ctx.authority[..];
 
-    let backend_result = find_backend_unified(
+    let backend_result = crate::l7::resolve_route(
         authority,
         path_wo_query,
         method,
         &headers_raw,
         raw_query,
         &ctx.client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        if !authority.is_empty() {
-            find_backend_unified(
-                b"",
-                path_wo_query,
-                method,
-                &headers_raw,
-                raw_query,
-                &ctx.client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
-        }
-    });
+        true,
+    );
 
     // 適格判定が外れる（config 再読込レース等）場合は req をドレインして 502。
     let (prefix, upstream_group, compression, security) = match backend_result {

@@ -74,6 +74,8 @@ pub enum Backend {
         bool,
         /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
         Option<Arc<Vec<ModuleRef>>>,
+        /// ルートの `[route.security]`（B-133 より前は持たず、既定値で検査していた）
+        Arc<SecurityConfig>,
     ),
     /// ネイティブハンドラ（API ライブラリ、F-188）。設定ロード時に名前解決済みのエントリ・
     /// ルートのセキュリティ設定・WASM モジュール参照。
@@ -106,14 +108,12 @@ impl Backend {
     /// このバックエンドのセキュリティ設定を取得
     #[inline]
     pub fn security(&self) -> &SecurityConfig {
-        // デフォルトのセキュリティ設定（Redirect用）
-        static DEFAULT_SECURITY: Lazy<SecurityConfig> = Lazy::new(SecurityConfig::default);
-
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
             Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
-            Backend::Redirect(_, _, _, _) | Backend::Respond(_) => &DEFAULT_SECURITY,
+            Backend::Redirect(_, _, _, _, security) => security,
+            Backend::Respond(r) => &r.security,
             #[cfg(feature = "handler")]
             Backend::Handler(_, security, _) => security,
         }
@@ -127,7 +127,7 @@ impl Backend {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
             Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
-            Backend::Redirect(_, _, _, modules) => modules.as_ref(),
+            Backend::Redirect(_, _, _, modules, _) => modules.as_ref(),
             Backend::Respond(_) => None,
             #[cfg(feature = "handler")]
             Backend::Handler(_, _, modules) => modules.as_ref(),
@@ -145,7 +145,7 @@ impl Backend {
             Backend::SendFile(_, _, _, _, _, _, _, _, modules) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
-            Backend::Redirect(_, _, _, modules) => {
+            Backend::Redirect(_, _, _, modules, _) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
             Backend::Respond(_) => None,

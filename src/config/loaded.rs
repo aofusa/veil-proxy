@@ -1469,7 +1469,8 @@ pub(super) fn build_backend(
                     *status,
                     headers,
                     bytes::Bytes::from(body.clone()),
-                ),
+                )
+                .with_security(Arc::new(security)),
             )))
         }
         BackendConfig::Redirect {
@@ -1481,6 +1482,7 @@ pub(super) fn build_backend(
             *redirect_status,
             *preserve_path,
             modules_arc.clone(),
+            Arc::new(security),
         )),
         #[cfg(feature = "handler")]
         BackendConfig::Handler { handler } => match crate::api::handler::lookup(handler) {
