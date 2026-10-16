@@ -8,7 +8,7 @@
 #   - HTTP/1.1 の最大スループット（-c 16 -qps 0）
 #   - HTTP/1.1 の一定レート（1000 qps）での p50 / p90 / p99 / p99.9 の遅延
 #   - gRPC（ping）の最大スループット
-#   - サイドカー（クライアント側 + サーバ側）の CPU 時間（cgroup の usage_usec）と RSS
+#   - サイドカー（クライアント側 + サーバ側）の istio-proxy コンテナの CPU 時間と RSS（kubelet の stats/summary。pilot-agent を含む）
 #   - GATEWAY=1（既定）: Gateway API のゲートウェイ（Envoy と veil。mode = gw-stock / gw-veil）の同じ項目
 #     （gRPC 以外。CPU と RSS はゲートウェイの Pod）
 # 結果は TSV（target/tmp/mesh-bench.tsv）。前提: mesh-e2e.sh と同じ（kind・istioctl・veil のイメージ）。
@@ -81,20 +81,34 @@ EOF
   kubectl -n "$ns" rollout status deploy/server deploy/client --timeout=300s >/dev/null
 }
 
-# サイドカーの CPU 時間（usec）と RSS（kB）。none は 0
-sidecar_stats() { # sidecar_stats <ns> <deploy>
-  local ns="$1" d="$2"
-  kubectl -n "$ns" exec "deploy/$d" -c istio-proxy -- sh -c \
-    'u=$(grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d" " -f2); p=$(pgrep -f usr/local/bin/envoy | head -1); r=$(grep VmRSS /proc/$p/status | tr -s " " | cut -d" " -f2); echo "$u $r"' 2>/dev/null || echo "0 0"
+NODE="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
+# プロキシのコンテナ（istio-proxy。pilot-agent を含む）の累積 CPU（usec）と RSS（kB）。kubelet の stats/summary から読む
+# （distroless の proxyv2 にはシェルが無い。stats/summary は 10〜15 秒ごとに更新される）。無ければ 0
+proxy_stats() { # proxy_stats <ns> <pod 名の接頭辞>
+  kubectl get --raw "/api/v1/nodes/$NODE/proxy/stats/summary" 2>/dev/null | python3 -c '
+import json, sys
+ns, pre = sys.argv[1], sys.argv[2]
+for p in json.load(sys.stdin).get("pods", []):
+    r = p["podRef"]
+    if r["namespace"] != ns or not r["name"].startswith(pre + "-"):
+        continue
+    for c in p.get("containers", []):
+        if c["name"] == "istio-proxy":
+            print(c["cpu"]["usageCoreNanoSeconds"] // 1000, c["memory"].get("rssBytes", 0) // 1024)
+            sys.exit(0)
+print("0 0")' "$1" "$2"
 }
+sidecar_stats() { proxy_stats "$1" "$2"; }
 
 run_mode() { # run_mode <mode> <round>
   local mode="$1" round="$2" ns="bench-$1" url grpc out qps p50 p90 p99 p999 gqps
   url="http://server.$ns:8080/echo?size=128"
   grpc="server.$ns:8079"
+  sleep 16
   read -r c0 _ <<<"$(sidecar_stats "$ns" client)"; read -r s0 _ <<<"$(sidecar_stats "$ns" server)"
   out="$(kubectl -n "$ns" exec deploy/client -c fortio -- fortio load -c 16 -qps 0 -t "$DUR" -loglevel Error "$url" 2>&1)"
   qps="$(echo "$out" | awk '/All done/{print $(NF-1)}')"
+  sleep 16
   read -r c1 _ <<<"$(sidecar_stats "$ns" client)"; read -r s1 _ <<<"$(sidecar_stats "$ns" server)"
   local reqs cpu_per
   reqs="$(echo "$out" | awk '/All done/{print $3}')"
@@ -165,18 +179,17 @@ EOF
   kubectl -n "$ns" rollout status deploy/gw-stock-istio deploy/gw-veil-istio --timeout=300s >/dev/null
 }
 
-gw_stats() { # gw_stats <ns> <deploy>
-  kubectl -n "$1" exec "deploy/$2" -c istio-proxy -- sh -c \
-    'u=$(grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d" " -f2); p=$(pgrep -f usr/local/bin/envoy | head -1); r=$(grep VmRSS /proc/$p/status | tr -s " " | cut -d" " -f2); echo "$u $r"' 2>/dev/null || echo "0 0"
-}
+gw_stats() { proxy_stats "$1" "$2"; }
 
 run_gw() { # run_gw <stock|veil> <round>
   local m="$1" round="$2" ns=bench-none url out qps reqs cpu_per p50 p90 p99 p999 g0 g1 rss
   url="http://gw-$m-istio.$ns/echo?size=128"
+  sleep 16
   read -r g0 _ <<<"$(gw_stats "$ns" "gw-$m-istio")"
   out="$(kubectl -n "$ns" exec deploy/client -c fortio -- fortio load -c 16 -qps 0 -t "$DUR" -loglevel Error "$url" 2>&1)"
   qps="$(echo "$out" | awk '/All done/{print $(NF-1)}')"
   reqs="$(echo "$out" | awk '/All done/{print $3}')"
+  sleep 16
   read -r g1 _ <<<"$(gw_stats "$ns" "gw-$m-istio")"
   cpu_per="$(awk -v a=$((g1 - g0)) -v n="${reqs:-1}" 'BEGIN{ if (n>0) printf "%.1f", a/n; else print 0 }')"
   out="$(kubectl -n "$ns" exec deploy/client -c fortio -- fortio load -c 16 -qps 1000 -t "$DUR" -loglevel Error "$url" 2>&1)"
