@@ -11,6 +11,8 @@
 //! 必要としない（登録済み Waker を残しても、後続の再登録で上書きされるか、無関係になった
 //! タスクへの無害な spurious wake になるのみ）。
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -29,9 +31,11 @@ const TCP_NODELAY: libc::c_int = 1;
 // ====================
 
 fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: sockaddr_storage は整数とバイト配列だけの POD で、全ビット 0 が有効な初期値。
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(v4) => {
+            // SAFETY: storage は sockaddr_in を収める大きさ・アラインメントの sockaddr_storage で、可変参照は storage を排他借用している間だけ使う。
             let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
             sin.sin_family = libc::AF_INET as _;
             sin.sin_port = v4.port().to_be();
@@ -39,6 +43,7 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::sock
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
         SocketAddr::V6(v6) => {
+            // SAFETY: storage は sockaddr_in6 を収める大きさ・アラインメントの sockaddr_storage で、可変参照は storage を排他借用している間だけ使う。
             let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
             sin6.sin6_family = libc::AF_INET6 as _;
             sin6.sin6_port = v6.port().to_be();
@@ -54,12 +59,14 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::sock
 fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
+            // SAFETY: ss_family が AF_INET なので storage の中身は sockaddr_in。sockaddr_storage は sockaddr_in に十分な大きさとアラインメントを持つ。
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         }
         libc::AF_INET6 => {
+            // SAFETY: ss_family が AF_INET6 なので storage の中身は sockaddr_in6。sockaddr_storage は sockaddr_in6 に十分な大きさとアラインメントを持つ。
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
@@ -91,10 +98,12 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
     // の macOS 節 1）。他 OS は 1 syscall で完結させる。
     #[cfg(target_os = "macos")]
     let fd = {
+        // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に fd < 0 で検査する。
         let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: fd は直前に作った有効なソケット。fcntl は整数引数のみ。
         unsafe {
             libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
             libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -102,6 +111,7 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
         fd
     };
     #[cfg(not(target_os = "macos"))]
+    // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に fd < 0 で検査する。
     let fd = unsafe {
         libc::socket(
             domain,
@@ -123,6 +133,7 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
 #[cfg(target_os = "macos")]
 fn set_so_nosigpipe(fd: RawFd) {
     let optval: libc::c_int = 1;
+    // SAFETY: fd は呼び出し元が作った有効なソケット。optval は c_int を指し長さはその大きさ。失敗しても致命ではないので戻り値は見ない。
     unsafe {
         libc::setsockopt(
             fd,
@@ -178,6 +189,7 @@ impl TcpListener {
         let fd = create_nonblocking_socket(domain)?;
 
         let optval: libc::c_int = 1;
+        // SAFETY: fd は create_nonblocking_socket が返した有効なソケット。optval は c_int を指し長さはその大きさ。失敗しても致命ではないので戻り値は見ない。
         unsafe {
             libc::setsockopt(
                 fd,
@@ -206,16 +218,20 @@ impl TcpListener {
         }
 
         let (storage, len) = sockaddr_to_storage(&addr);
+        // SAFETY: fd は有効なソケット。storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
         let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
             let e = io::Error::last_os_error();
+            // SAFETY: fd は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる（未登録なので unregister も不要）。
             unsafe { libc::close(fd) };
             return Err(e);
         }
 
+        // SAFETY: fd は bind 済みの有効なソケット。listen は整数引数のみを取る。
         let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
             let e = io::Error::last_os_error();
+            // SAFETY: fd は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる（未登録なので unregister も不要）。
             unsafe { libc::close(fd) };
             return Err(e);
         }
@@ -248,8 +264,10 @@ impl TcpListener {
 
     /// ローカルアドレスを取得する。
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: self.fd は有効なソケット。storage と len は生存する可変領域で len は storage の大きさ。
         let ret = unsafe {
             libc::getsockname(
                 self.fd,
@@ -330,6 +348,7 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         unregister(self.fd);
+        // SAFETY: self.fd は TcpListener が所有する有効なソケットで、unregister 済み。Drop により 1 度だけ閉じる。
         unsafe { libc::close(self.fd) };
     }
 }
@@ -357,6 +376,7 @@ impl AsRawFd for TcpListener {
 /// - それ以外のエラー: `Err(e)`
 fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockaddr_storage)>> {
     loop {
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         // macOS には `accept4(2)` が無いため、`accept(2)` +
@@ -364,6 +384,7 @@ fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockadd
         // する（設計 docs/artifacts/f125_windows_macos_design.md の macOS 節 1）。
         // 他 OS は従来どおり `accept4` 1 syscall で完結させる。
         #[cfg(target_os = "macos")]
+        // SAFETY: listener_fd は有効なリスナー。storage と len は生存する可変領域で len は storage の大きさ。
         let fd = unsafe {
             libc::accept(
                 listener_fd,
@@ -372,6 +393,7 @@ fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockadd
             )
         };
         #[cfg(not(target_os = "macos"))]
+        // SAFETY: listener_fd は有効なリスナー。storage と len は生存する可変領域で len は storage の大きさ。
         let fd = unsafe {
             libc::accept4(
                 listener_fd,
@@ -383,6 +405,7 @@ fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockadd
         if fd >= 0 {
             #[cfg(target_os = "macos")]
             {
+                // SAFETY: fd は accept が返した自分の所有するソケット。fcntl は整数引数のみ。
                 unsafe {
                     libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
                     libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -488,6 +511,7 @@ impl TcpStream {
                 brokered,
             },
             Err(e) => ConnectUnix {
+                // SAFETY: sockaddr_un は POD で、全ビット 0 が有効な初期値（build_err が Some なので使われない）。
                 addr: unsafe { std::mem::zeroed() },
                 addr_len: 0,
                 build_err: Some(e),
@@ -632,6 +656,7 @@ impl TcpStream {
     /// TCP_NODELAY を設定する。
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         let optval: libc::c_int = if nodelay { 1 } else { 0 };
+        // SAFETY: self.fd は有効なソケット。optval は c_int を指し長さはその大きさ。
         let ret = unsafe {
             libc::setsockopt(
                 self.fd,
@@ -656,6 +681,7 @@ impl TcpStream {
     #[cfg(target_os = "freebsd")]
     pub fn set_nopush(&self, enable: bool) -> io::Result<()> {
         let optval: libc::c_int = if enable { 1 } else { 0 };
+        // SAFETY: self.fd は有効なソケット。optval は c_int を指し長さはその大きさ。
         let ret = unsafe {
             libc::setsockopt(
                 self.fd,
@@ -692,8 +718,10 @@ impl TcpStream {
 
     /// ピアアドレスを取得する。
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: self.fd は有効なソケット。storage と len は生存する可変領域で len は storage の大きさ。
         let ret = unsafe {
             libc::getpeername(
                 self.fd,
@@ -709,8 +737,10 @@ impl TcpStream {
 
     /// ローカルアドレスを取得する。
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: self.fd は有効なソケット。storage と len は生存する可変領域で len は storage の大きさ。
         let ret = unsafe {
             libc::getsockname(
                 self.fd,
@@ -731,6 +761,7 @@ impl TcpStream {
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
+        // SAFETY: self.fd は有効なソケット。how は SHUT_RD/SHUT_WR/SHUT_RDWR のいずれか。
         let ret = unsafe { libc::shutdown(self.fd, how) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
@@ -790,6 +821,7 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         if self.fd >= 0 {
             unregister(self.fd);
+            // SAFETY: self.fd は TcpStream が所有する有効な fd（>= 0 を確認済み）で、unregister 済み。Drop により 1 度だけ閉じる。
             unsafe { libc::close(self.fd) };
         }
     }
@@ -870,6 +902,7 @@ impl Connect {
             unregister(fd);
             self.registered = false;
         }
+        // SAFETY: fd は本 Future が作った自分の所有するソケットで、fd を -1 に置き換えて以後触れない。登録済みなら上で unregister 済みで、ここで 1 度だけ閉じる。
         unsafe { libc::close(fd) };
         e
     }
@@ -896,6 +929,7 @@ impl Future for Connect {
             self.fd = fd;
 
             let (storage, len) = sockaddr_to_storage(&self.addr);
+            // SAFETY: fd は直前に作った有効なソケット。storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
             let ret =
                 unsafe { libc::connect(fd, &storage as *const _ as *const libc::sockaddr, len) };
             if ret == 0 {
@@ -906,6 +940,7 @@ impl Future for Connect {
             }
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                // SAFETY: fd は本 Future が作った自分の所有するソケットで、self.fd を -1 にして以後触れない。ここで 1 度だけ閉じる。
                 unsafe { libc::close(fd) };
                 self.fd = -1;
                 return Poll::Ready(Err(e));
@@ -924,6 +959,7 @@ impl Future for Connect {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret < 0 {
             let e = io::Error::last_os_error();
@@ -942,6 +978,7 @@ impl Future for Connect {
         // 接続完了（または失敗）: SO_ERROR で接続結果を確認する。
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: self.fd は有効なソケット。err と len は生存する可変領域で len は c_int の大きさ。
         let ret = unsafe {
             libc::getsockopt(
                 self.fd,
@@ -972,6 +1009,7 @@ impl Drop for Connect {
             if self.registered {
                 unregister(self.fd);
             }
+            // SAFETY: self.fd は本 Future が所有する有効な fd（>= 0 を確認済み）で、登録済みなら unregister 済み。Drop により 1 度だけ閉じる。
             unsafe { libc::close(self.fd) };
         }
     }
@@ -989,6 +1027,7 @@ impl Drop for Connect {
 fn build_sockaddr_un(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     use std::os::unix::ffi::OsStrExt;
 
+    // SAFETY: sockaddr_un は POD で、全ビット 0 が有効な初期値。
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let path_bytes = path.as_os_str().as_bytes();
@@ -1033,6 +1072,7 @@ impl ConnectUnix {
             unregister(fd);
             self.registered = false;
         }
+        // SAFETY: fd は本 Future が作った自分の所有するソケットで、fd を -1 に置き換えて以後触れない。登録済みなら上で unregister 済みで、ここで 1 度だけ閉じる。
         unsafe { libc::close(fd) };
         e
     }
@@ -1057,6 +1097,7 @@ impl Future for ConnectUnix {
             };
             self.fd = fd;
 
+            // SAFETY: fd は直前に作った有効なソケット。addr は build_sockaddr_un が構築し、addr_len は有効な長さ。
             let ret = unsafe {
                 libc::connect(
                     fd,
@@ -1072,6 +1113,7 @@ impl Future for ConnectUnix {
             }
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                // SAFETY: fd は本 Future が作った自分の所有するソケットで、self.fd を -1 にして以後触れない。ここで 1 度だけ閉じる。
                 unsafe { libc::close(fd) };
                 self.fd = -1;
                 return Poll::Ready(Err(e));
@@ -1084,6 +1126,7 @@ impl Future for ConnectUnix {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret < 0 {
             let e = io::Error::last_os_error();
@@ -1099,6 +1142,7 @@ impl Future for ConnectUnix {
 
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: self.fd は有効なソケット。err と len は生存する可変領域で len は c_int の大きさ。
         let ret = unsafe {
             libc::getsockopt(
                 self.fd,
@@ -1129,6 +1173,7 @@ impl Drop for ConnectUnix {
             if self.registered {
                 unregister(self.fd);
             }
+            // SAFETY: self.fd は本 Future が所有する有効な fd（>= 0 を確認済み）で、登録済みなら unregister 済み。Drop により 1 度だけ閉じる。
             unsafe { libc::close(self.fd) };
         }
     }
@@ -1148,12 +1193,14 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: ReadFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
             let buf = this
                 .buf
                 .as_mut()
                 .expect("ReadFuture polled after completion");
+            // SAFETY: this.fd は有効なソケット。buf.write_ptr() は bytes_total() バイトの書き込み可能な領域を指し、buf は Future が所有しているので read(2) の間生存する。
             let ret = unsafe {
                 libc::read(
                     this.fd,
@@ -1195,6 +1242,7 @@ impl<T: IoBuf> Future for WriteFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: WriteFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
             let buf = this
@@ -1207,6 +1255,7 @@ impl<T: IoBuf> Future for WriteFuture<T> {
             const SEND_FLAGS: libc::c_int = 0;
             #[cfg(not(target_os = "macos"))]
             const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+            // SAFETY: this.fd は有効なソケット。buf.read_ptr() は bytes_init() バイトの初期化済み領域を指し、buf は Future が所有しているので send(2) の間生存する。
             let ret = unsafe {
                 libc::send(
                     this.fd,
@@ -1248,6 +1297,7 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
     type Output = (io::Result<usize>, A, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: SendMsgFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
             let (a, b) = this
@@ -1266,6 +1316,7 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
             let mut iov_count = 0usize;
             if skip < a_len {
                 iovecs[iov_count] = libc::iovec {
+                    // SAFETY: skip < a_len を確認済みで、a_ptr は a_len バイトの初期化済み領域の先頭なので add(skip) は範囲内。
                     iov_base: unsafe { a_ptr.add(skip) } as *mut libc::c_void,
                     iov_len: a_len - skip,
                 };
@@ -1280,12 +1331,14 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
             } else {
                 let b_skip = skip - a_len;
                 iovecs[iov_count] = libc::iovec {
+                    // SAFETY: skip >= a_len かつ debug_assert で skip < a_len + b_len なので b_skip < b_len で、b_ptr.add(b_skip) は範囲内。
                     iov_base: unsafe { b_ptr.add(b_skip) } as *mut libc::c_void,
                     iov_len: b_len - b_skip,
                 };
                 iov_count += 1;
             }
 
+            // SAFETY: msghdr は整数とポインタだけの POD で、全ビット 0（NULL・長さ 0）が有効な初期値。ポインタは直後に設定する。
             let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
             msghdr.msg_iov = iovecs.as_mut_ptr();
             msghdr.msg_iovlen = iov_count as _;
@@ -1296,6 +1349,7 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
             const SENDMSG_FLAGS: libc::c_int = 0;
             #[cfg(not(target_os = "macos"))]
             const SENDMSG_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+            // SAFETY: this.fd は有効なソケット。msghdr の msg_iov は上で構築した iovecs（ローカルに生存）を指し、各 iov_base は this.bufs が所有する初期化済み領域を指す。
             let ret = unsafe { libc::sendmsg(this.fd, &msghdr, SENDMSG_FLAGS) };
             if ret >= 0 {
                 let (a, b) = this.bufs.take().expect("buffers present at completion");
@@ -1346,6 +1400,7 @@ impl<'a> Future for Readable<'a> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
@@ -1385,6 +1440,7 @@ impl<'a> Future for ReadableLazy<'a> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
@@ -1417,6 +1473,7 @@ impl<'a> Future for Writable<'a> {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret > 0 && pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
@@ -1451,6 +1508,7 @@ impl Future for ReadableFd {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
@@ -1480,6 +1538,7 @@ impl Future for WritableFd {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret > 0 && pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
@@ -1526,6 +1585,7 @@ mod tests {
         // TcpListener が fd の所有権を持つため、std 側の Drop による二重 close を
         // 避ける（所有権を明示的に移す）。
         std::mem::forget(listener);
+        // SAFETY: fd は UnixListener が listen 済みの有効な AF_UNIX ソケットで、元の所有者は mem::forget 済み。所有権は TcpListener だけが持つ。
         let uds_listener = unsafe { TcpListener::from_raw_fd_unix(fd) };
 
         let connect_path = path.clone();
@@ -1547,9 +1607,11 @@ mod tests {
     /// テスト用の非ブロッキング pipe(2) を 1 組作る（読み取り端, 書き込み端）。
     fn make_nonblocking_pipe() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
+        // SAFETY: fds は 2 要素の配列で、pipe(2) はその 2 要素に fd を書き込む。
         let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(ret, 0, "pipe(2) failed: {}", io::Error::last_os_error());
         for &fd in &fds {
+            // SAFETY: fd は直前に pipe(2) で作った有効な fd。fcntl は整数引数のみ。
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 let r = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -1577,6 +1639,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 let b = [1u8];
+                // SAFETY: wfd は有効な pipe の書き込み端。b は 1 バイトの配列で、長さ 1 を渡す。
                 let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 1) };
                 assert_eq!(n, 1);
             });
@@ -1585,11 +1648,13 @@ mod tests {
 
             // データを完全に drain する（次の書き込みが確実に新しい edge になるように）。
             let mut buf = [0u8; 1];
+            // SAFETY: rfd は有効な pipe の読み取り端。buf は 1 バイトの書き込み可能な配列で、長さ 1 を渡す。
             let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1) };
             assert_eq!(n, 1);
 
             // 2) 誰も待っていない状態で新しいデータを書き込む（新しい edge を生む）。
             let b = [2u8];
+            // SAFETY: wfd は有効な pipe の書き込み端。b は 1 バイトの配列で、長さ 1 を渡す。
             let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 1) };
             assert_eq!(n, 1);
 
@@ -1608,11 +1673,13 @@ mod tests {
                 .expect("second readable wait via hint");
 
             let mut buf2 = [0u8; 1];
+            // SAFETY: rfd は有効な pipe の読み取り端。buf2 は 1 バイトの書き込み可能な配列で、長さ 1 を渡す。
             let n2 = unsafe { libc::read(rfd, buf2.as_mut_ptr() as *mut std::ffi::c_void, 1) };
             assert_eq!(n2, 1);
             assert_eq!(buf2[0], 2);
         });
 
+        // SAFETY: rfd・wfd は make_nonblocking_pipe が作った自分の所有する fd で、他に使う者はおらずここで 1 度だけ閉じる。
         unsafe {
             libc::close(rfd);
             libc::close(wfd);
@@ -1631,6 +1698,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 let b = [1u8, 2u8];
+                // SAFETY: wfd は有効な pipe の書き込み端。b は 2 バイトの配列で、長さ 2 を渡す。
                 let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 2) };
                 assert_eq!(n, 2);
             });
@@ -1641,6 +1709,7 @@ mod tests {
 
             // 部分読み取り: 2 バイト書き込まれたうち 1 バイトだけ読む。
             let mut buf = [0u8; 1];
+            // SAFETY: rfd は有効な pipe の読み取り端。buf は 1 バイトの書き込み可能な配列で、長さ 1 を渡す。
             let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1) };
             assert_eq!(n, 1);
             assert_eq!(buf[0], 1);
@@ -1653,11 +1722,13 @@ mod tests {
                 .expect("second readable wait via poll(2) fallback");
 
             let mut buf2 = [0u8; 1];
+            // SAFETY: rfd は有効な pipe の読み取り端。buf2 は 1 バイトの書き込み可能な配列で、長さ 1 を渡す。
             let n2 = unsafe { libc::read(rfd, buf2.as_mut_ptr() as *mut std::ffi::c_void, 1) };
             assert_eq!(n2, 1);
             assert_eq!(buf2[0], 2);
         });
 
+        // SAFETY: rfd・wfd は make_nonblocking_pipe が作った自分の所有する fd で、他に使う者はおらずここで 1 度だけ閉じる。
         unsafe {
             libc::close(rfd);
             libc::close(wfd);
@@ -1752,6 +1823,7 @@ impl BrokerConnect {
                 unregister(self.reply);
                 self.reply_registered = false;
             }
+            // SAFETY: self.reply は本 Future が所有する返信用ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
             unsafe { libc::close(self.reply) };
             self.reply = -1;
         }
@@ -1763,6 +1835,7 @@ impl BrokerConnect {
                 unregister(self.fd);
                 self.fd_registered = false;
             }
+            // SAFETY: self.fd は本 Future が所有する受け取った接続ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
             unsafe { libc::close(self.fd) };
             self.fd = -1;
         }
@@ -1821,6 +1894,7 @@ impl Future for BrokerConnect {
             events: libc::POLLOUT,
             revents: 0,
         };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
         let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
         if ret < 0 {
             let e = io::Error::last_os_error();
