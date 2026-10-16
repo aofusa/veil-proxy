@@ -117,7 +117,7 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 ## 性能
 
 kind の上で fortio で測った（`tools/k8s/mesh-bench.sh`。クライアントとサーバの両側のサイドカー、交互のラウンド）。
-表は [docs/perf/README.md](../../perf/README.md#サービスメッシュ) にある。
+表は [docs/perf/README.md](../../perf/README.md#service-mesh) にある。
 
 ## 試験
 
