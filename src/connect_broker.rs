@@ -533,7 +533,7 @@ fn sockaddr_in(a: &SocketAddr) -> (libc::c_int, libc::sockaddr_storage, libc::so
     match a {
         SocketAddr::V4(v4) => {
             let sin = libc::sockaddr_in {
-                #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+                #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))]
                 sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: v4.port().to_be(),
@@ -552,7 +552,7 @@ fn sockaddr_in(a: &SocketAddr) -> (libc::c_int, libc::sockaddr_storage, libc::so
         }
         SocketAddr::V6(v6) => {
             let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-            #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))]
             {
                 sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
             }
@@ -586,7 +586,7 @@ fn sockaddr_un(p: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
         addr.sun_path[i] = c as libc::c_char;
     }
     let len = (std::mem::size_of::<libc::sa_family_t>() + b.len() + 1) as libc::socklen_t;
-    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))]
     {
         addr.sun_len = len as u8;
     }
