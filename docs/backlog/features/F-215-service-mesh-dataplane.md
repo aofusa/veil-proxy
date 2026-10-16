@@ -190,6 +190,8 @@ Istio は istiod が生成する Envoy の設定（フィルタの種類は有�
 - 既存のプロキシの非退行: `tools/perf/suite_ab.sh` の main との交互 A/B（結果は docs/perf/README.md の「サービスメッシュ」と
   「非退行」の節）。
 - 利用者向け: `docs/guide/mesh.md`（英日）。
+- 残件（2026-10-16 起票・設計）: F-226（TOML のルートのタイムアウト・リトライ・ミラー・遅延）、F-227（RuntimeDefault の下の
+  io_uring 版）、F-228（ztunnel）、F-229（ext_authz）、F-230（kind を使わない透過転送の E2E・ambient の bookinfo）。
 
 ## 関連
 
