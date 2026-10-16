@@ -214,3 +214,6 @@ for r in $(seq "$ROUNDS"); do
     for m in $gorder; do run_gw "$m" "$r"; done
   fi
 done
+
+# 後片付け（ノードの CPU の要求を空ける）。KEEP=1 で残す
+[ "${KEEP:-0}" = 1 ] || kubectl delete ns bench-none bench-stock bench-veil --wait=false >/dev/null 2>&1

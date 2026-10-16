@@ -125,3 +125,6 @@ for r in $(seq "$ROUNDS"); do
   if [ $((r % 2)) = 1 ]; then order="none stock veil"; else order="veil stock none"; fi
   for m in $order; do run_mode "$m" "$r"; done
 done
+
+# 後片付け（ノードの CPU の要求を空ける）。KEEP=1 で残す
+[ "${KEEP:-0}" = 1 ] || kubectl delete ns l5d-bench-none l5d-bench-stock l5d-bench-veil --wait=false >/dev/null 2>&1
