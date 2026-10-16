@@ -42,7 +42,7 @@ spec:
   template:
     metadata:
       labels: {app: server}
-      annotations: {$ann, config.linkerd.io/proxy-cpu-limit: "2"}
+      annotations: {$ann, config.linkerd.io/proxy-cpu-limit: "2", config.linkerd.io/proxy-cpu-request: "100m"}
     spec:
       containers:
       - name: fortio
@@ -66,7 +66,7 @@ spec:
   template:
     metadata:
       labels: {app: client}
-      annotations: {$ann, config.linkerd.io/proxy-cpu-limit: "2"}
+      annotations: {$ann, config.linkerd.io/proxy-cpu-limit: "2", config.linkerd.io/proxy-cpu-request: "100m"}
     spec:
       containers:
       - name: fortio
