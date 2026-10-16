@@ -75,25 +75,34 @@ tokio の橋渡しを使うときは `features = ["full", "api-core", "tokio-com
 
 ### Cargo.toml
 
-veil は crates.io には公開されていません。git 依存か path 依存を使います。feature は用途で選びます。`full` は HTTP/3・kTLS・
-gRPC・WASM などプロキシ機能を一通り含み、コンテナ向けは `full-container` です。`default-features` は切ります
-（アロケータの選び方は [メモリアロケータ](#メモリアロケータ) を参照）。
+crates.io には **`veil-proxy`** の名前で公開しています（`veil` は別のプロジェクトの名前）。依存のキーは `veil` のままにします。
+ライブラリ名が `veil` で、マクロが生成するコードも `::veil::` を参照するためです。feature は用途で選びます。`full` は
+HTTP/3・kTLS・gRPC・WASM などプロキシ機能を一通り含み、コンテナ向けは `full-container` です。`default-features` は切ります
+（アロケータの選び方は [メモリアロケータ](#メモリアロケータ) を参照）。API の文書は [docs.rs/veil-proxy](https://docs.rs/veil-proxy)。
 
 ```toml
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
-# ローカルのチェックアウトを使う場合:
-# veil = { path = "../veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+# リポジトリやローカルのチェックアウトを使う場合:
+# veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+# veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# HTTP/3 を使うときの推奨: veil がビルドに使う vendoring 版 quiche を使う。
-# 複数ストリームの STREAM フレームを 1 パケットへ詰める差分で、外すと小さな応答が
-# 1 リクエスト 1 パケットに戻る（F-172）。cargo は最上位パッケージの [patch] しか見ない。
-[patch.crates-io]
-quiche = { git = "https://github.com/aofusa/veil-proxy" }
-# または: quiche = { path = "../veil-proxy/third_party/quiche" }
 ```
+
+**Linux で HTTP/3 を使う**ときは、利用する側のプロジェクトの `.cargo/config.toml` に設定が 1 つ要ります。quiche は rustls と
+同じ `aws-lc-sys` をシンボルのプレフィックス無しで使います。veil を依存として使うと、cargo は veil 自身の
+`.cargo/config.toml` を読みません。設定が無いと、veil のビルドスクリプトがこの内容を示して止まります。
+
+```toml
+# 利用する側の .cargo/config.toml（ビルドするターゲットごとに 1 行）
+[env]
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
+```
+
+複数ストリームの STREAM フレームを 1 パケットへ詰める vendoring 版 quiche（F-172）は通常の依存（`veil-proxy-quiche`）なので、
+`[patch]` は要りません。
 
 平文 HTTP の API だけなら `default-features = false` と `features = ["api"]` で足ります（TLS・HTTP/3 なし）。
 `examples/api/rust-showcase` はすべての機能を使った完全なプロジェクトです。
@@ -428,13 +437,16 @@ tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が v
 
 ```toml
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # シムに解決される
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 
 [patch.crates-io]
-tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+# シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
+# 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.0", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.0" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は

@@ -2,6 +2,36 @@
 
 Dockerイメージのビルドとコンテナの実行
 
+## 公開イメージ（F-237）
+
+タグ `vX.Y.Z` の push で `ghcr.io/aofusa/veil` に公開する（`.github/workflows/release.yml`、手順は
+[packaging/README.md](../packaging/README.md) の「公開」）。`linux/amd64`・`linux/arm64` のマルチアーキ。
+
+| タグ | 中身 |
+|---|---|
+| `latest`・`musl`・`musl-vX.Y.Z` | musl 版（`Dockerfile.musl`、scratch） |
+| `glibc`・`glibc-vX.Y.Z` | glibc 版（`Dockerfile.glibc`、distroless） |
+
+どちらも `/veil`（`full`、io_uring）と `/veil.epoll`（`full-container`、epoll）を持つ。`/veil` は起動の最初に io_uring を
+作れるかを確かめ、作れなければ（Docker の既定の seccomp・Kubernetes の `RuntimeDefault`）`/veil.epoll` を同じ引数で
+exec する（`src/runtime/fallback.rs`。`VEIL_FALLBACK_BIN` で切り替え先を変えられる）。io_uring で動かすには
+`--security-opt seccomp=unconfined` か io_uring を許す独自のプロファイルを使う。
+
+```sh
+docker run --rm -p 443:443 -p 443:443/udp \
+  -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+  -v "$PWD/ssl:/etc/veil/ssl:ro" ghcr.io/aofusa/veil:latest
+```
+
+同じ構成を手元でビルドするには `CARGO_FEATURES_FALLBACK` を付ける（付けなければ `/veil` だけの従来のイメージ）。
+起動の試験は `tools/release/image-smoke.sh <image>`。
+
+```sh
+docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=full \
+  --build-arg CARGO_FEATURES_FALLBACK=full-container -t veil:musl .
+tools/release/image-smoke.sh veil:musl
+```
+
 
 ビルド
 ```sh

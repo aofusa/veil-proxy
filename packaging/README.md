@@ -558,6 +558,54 @@ packaging/output/veil-0.8.0-x86_64-unknown-linux-musl.tar.gz
 5. `dpkg-deb` で `.deb` を生成
 6. `rpmbuild` で `.rpm` を生成
 
+## 公開（リリース。F-237・F-238）
+
+タグ `vX.Y.Z` を push すると `.github/workflows/release.yml` が次を公開する。版はタグの版で、タグ（`v` を除く）と
+`Cargo.toml` の `[workspace.package] version` が違えば何も公開しない（`tools/release/verify-tag.sh`）。
+
+| 公開先 | 中身 | 鍵 |
+|---|---|---|
+| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`。`linux/amd64`・`linux/arm64`。`/veil`（io_uring）と `/veil.epoll`（epoll、io_uring が使えないときに切り替える） | `GITHUB_TOKEN` |
+| crates.io | `veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`、vendoring の `veil-proxy-quiche`・`veil-proxy-wasmtime` | trusted publishing（OIDC） |
+| PyPI | `veil-api` の wheel（manylinux・musllinux の x86_64・aarch64、macOS の arm64・x86_64、Windows の x86_64）と sdist | trusted publishing（OIDC） |
+
+手順:
+
+```bash
+tools/release/bump-version.sh 0.8.0       # 版を揃える（F-231）→ コミットして main にマージ
+git tag v0.8.0-rc.1 && git push origin v0.8.0-rc.1   # まず rc で通しを確かめる
+git tag v0.8.0      && git push origin v0.8.0        # 本公開
+```
+
+- プレリリースのタグ（`-` を含む）では、イメージは版のタグ（`musl-v0.8.0-rc.1` 等）だけを付けて `latest`・`musl`・`glibc` を
+  動かさない。crates は `cargo package --workspace` の検証だけ（crates.io の公開は取り消せない）。PyPI は TestPyPI へ送る。
+- 版のタグのイメージは上書きしない（同じタグがあれば失敗する）。crates は既にある版を飛ばすので、途中で失敗しても再実行できる。
+- イメージはダイジェストで push → アーキごとのランナー（arm64 は `ubuntu-24.04-arm`）で `tools/release/image-smoke.sh`
+  （既定の seccomp で epoll 版に切り替わること、seccomp 無しで io_uring のままのこと、HTTP/1.1・2・3）→ マニフェストに
+  まとめてタグ付けと cosign のキーレス署名。
+- Docker Hub にも置く場合は、リポジトリの secret に `DOCKERHUB_USERNAME`・`DOCKERHUB_TOKEN` を入れる（無ければ飛ばす）。
+
+### 最初の 1 回だけ人が行う準備
+
+CI ではできないので、最初の公開の前に 1 回だけ行う。
+
+1. **GitHub**: リポジトリの Settings → Environments に `crates-io` と `pypi` を作る（必要なら承認者を付ける）。
+2. **crates.io**: trusted publishing は既にあるクレートにしか登録できない。最初の版（0.8.0）だけ、API の鍵で手元から
+   公開する。`tools/release/publish-crates.sh` が依存の順に公開し、既にある版を飛ばす。
+
+   ```bash
+   CARGO_REGISTRY_TOKEN=... tools/release/publish-crates.sh
+   ```
+
+   そのあと 5 つのクレートの Settings → Trusted Publishing に、リポジトリ `aofusa/veil-proxy`・workflow `release.yml`・
+   environment `crates-io` を登録し、API の鍵を失効させる。
+3. **PyPI**: プロジェクトを作る前に、Publishing の「pending publisher」に `veil-api`・`aofusa/veil-proxy`・`release.yml`・
+   environment `pypi` を登録する（TestPyPI にも同じものを登録する）。
+4. **ghcr.io**: 最初の公開の後、パッケージ `veil` の Package settings で可視性を public にし、リポジトリと紐付ける。
+5. **Read the Docs**（F-239）: `veil-api` のプロジェクトを GitHub のリポジトリから作る（`.readthedocs.yaml` を読む）。
+   Automation rules で「新しいタグを有効にし、`stable` を最新のタグに向ける」を有効にする。docs.rs は crates.io に
+   公開すると自動でビルドされる。
+
 ## インストール
 
 ### Debian / Ubuntu
