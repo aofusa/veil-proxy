@@ -80,12 +80,12 @@ Docker でのビルド（[docker/Dockerfile.glibc](../../../docker/Dockerfile.gl
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i packaging/output/veil_0.7.0_amd64.deb
+sudo dpkg -i packaging/output/veil_0.8.0_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 
 # Amazon Linux 2023
-sudo dnf install -y packaging/output/veil-0.7.0-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.8.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
@@ -156,3 +156,19 @@ packaging/scripts/build-lib.sh --local --profile release   # ホストのツー�
   `catch_unwind` で包み、1 リクエストの panic をログに記録してワーカーを生かす設計。
   abort にすると 1 本の不正リクエストでプロキシ全体が落ち、`ConnectionGuard` の
   `Drop`（接続数の計上）も走らない。
+
+### 版とリリース
+
+版はルートの `Cargo.toml` の `[workspace.package] version` の 1 箇所で決める。ルートのクレートと `crates/*` はそれを継ぎ
+（`version.workspace = true`）、Python の wheel は `crates/veil-python` の版を使う（`pyproject.toml` の `dynamic = ["version"]`）。
+変えるときは次を実行する。
+
+```bash
+tools/release/bump-version.sh 0.8.0
+```
+
+台本は `veil-macros` への依存の版、ワークスペースとワークスペース外のクレート（`examples/api/*`・`tools/*`）の `Cargo.lock`、
+文書の中で今の版を例として書いた箇所も揃える。計測の基準として書いた版（`docs/perf/`・`docs/guide/performance.md`・`tools/perf/`）は
+変えない。同じ版で 2 回実行しても差分は出ない。
+
+リリースは、`main` に入ったコミットに打つタグ `vX.Y.Z` である。公開の workflow は、タグとワークスペースの版が違えば何も公開しない。
