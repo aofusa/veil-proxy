@@ -457,13 +457,13 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
 /// TLS ハンドシェイクを実行して [`BackendIo::Tls`] を構築する（F-44）。
 ///
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
-/// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` に対応する。
-async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
-    let connector = if insecure {
-        crate::config::get_tls_connector_insecure()
-    } else {
-        crate::config::get_tls_connector()
-    };
+/// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_profile` に対応する。
+async fn tls_connect(
+    tcp: TcpStream,
+    sni: &str,
+    tls_profile: crate::upstream_tls::TlsProfile,
+) -> io::Result<BackendIo> {
+    let connector = crate::config::tls_connector(tls_profile);
     let stream = connector.connect(tcp, sni).await?;
     Ok(backend_io_from_client_tls(stream))
 }
@@ -546,8 +546,8 @@ pub(crate) struct BackendTaskParams {
     pub use_tls: bool,
     /// TLS の SNI / 証明書検証に使うサーバ名（`sni_name` 設定またはホスト名）。
     pub sni: String,
-    /// 証明書検証をスキップするか（アップストリーム設定 `tls_insecure`）。
-    pub tls_insecure: bool,
+    /// 証明書検証をスキップするか（アップストリーム設定 `tls_profile`）。
+    pub tls_profile: crate::upstream_tls::TlsProfile,
     /// B-104: 上流接続プールのホストあたり最大アイドル接続数（`[security] max_idle_connections_per_host`）。
     pub pool_max_idle: usize,
     /// B-104: プールのアイドルタイムアウト秒（`[security] idle_connection_timeout_secs`）。
@@ -769,11 +769,11 @@ async fn open_h2_tls(
     let target = &params.server.target;
     let addr = target.conn_addr();
     let key =
-        crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), &params.sni, params.tls_insecure);
+        crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), &params.sni, params.tls_profile);
     match open_https(
         target,
         key.as_str(),
-        params.tls_insecure,
+        params.tls_profile,
         h2.connect_timeout,
         Duration::from_secs(params.pool_idle_timeout_secs),
         &h2.method,
@@ -978,7 +978,7 @@ async fn connect_backend(params: &BackendTaskParams, addr: &str) -> Result<Backe
         params.timeout_secs,
         params.use_tls,
         &params.sni,
-        params.tls_insecure,
+        params.tls_profile,
     )
     .await
 }
@@ -989,7 +989,7 @@ async fn connect_backend_io(
     timeout_secs: u64,
     use_tls: bool,
     sni: &str,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
 ) -> Result<BackendIo, u16> {
     let connect = TcpStream::connect_str(addr);
     let tcp = match crate::runtime::time::timeout(Duration::from_secs(timeout_secs), connect).await
@@ -1012,7 +1012,7 @@ async fn connect_backend_io(
     }
     match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
-        tls_connect(tcp, sni, tls_insecure),
+        tls_connect(tcp, sni, tls_profile),
     )
     .await
     {
@@ -1052,7 +1052,7 @@ async fn run_backend_task(
     let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（UDS 対応、TCP は不変）
     let addr = addr.as_str();
     let pool_key = if params.use_tls {
-        crate::http_utils::PoolKeyStr::tls_addr(addr, &params.sni, params.tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr(addr, &params.sni, params.tls_profile)
     } else {
         crate::http_utils::PoolKeyStr::plain_addr(addr)
     };
@@ -1692,7 +1692,7 @@ fn accumulate_body(
 pub(crate) struct BufferedExchange<'a> {
     pub target: &'a crate::config::ProxyTarget,
     pub timeout_secs: u64,
-    pub tls_insecure: bool,
+    pub tls_profile: crate::upstream_tls::TlsProfile,
     pub pool_max_idle: usize,
     pub pool_idle_timeout_secs: u64,
     /// HEAD 要求か（応答本文を読まない）。
@@ -1726,7 +1726,7 @@ pub(crate) async fn exchange_buffered(
     let addr = addr.as_str();
     let sni = target.sni();
     let pool_key = if target.use_tls {
-        crate::http_utils::PoolKeyStr::tls_addr(addr, sni, cfg.tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr(addr, sni, cfg.tls_profile)
     } else {
         crate::http_utils::PoolKeyStr::plain_addr(addr)
     };
@@ -1736,24 +1736,20 @@ pub(crate) async fn exchange_buffered(
         let reused = pooled.is_some();
         let backend = match pooled.take() {
             Some(b) => b,
-            None => connect_backend_io(
-                addr,
-                cfg.timeout_secs,
-                target.use_tls,
-                sni,
-                cfg.tls_insecure,
-            )
-            .await
-            .map_err(|status| {
-                io::Error::new(
-                    if status == 504 {
-                        io::ErrorKind::TimedOut
-                    } else {
-                        io::ErrorKind::ConnectionRefused
-                    },
-                    "backend connect failed",
-                )
-            })?,
+            None => {
+                connect_backend_io(addr, cfg.timeout_secs, target.use_tls, sni, cfg.tls_profile)
+                    .await
+                    .map_err(|status| {
+                        io::Error::new(
+                            if status == 504 {
+                                io::ErrorKind::TimedOut
+                            } else {
+                                io::ErrorKind::ConnectionRefused
+                            },
+                            "backend connect failed",
+                        )
+                    })?
+            }
         };
         let mut got_response_bytes = false;
         let result = buffered_round_trip(

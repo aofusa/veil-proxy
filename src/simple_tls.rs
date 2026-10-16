@@ -143,6 +143,51 @@ impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
 }
 
 impl SimpleTlsServerStream {
+    /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送）。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        if let Some(conn) = self.conn.as_mut() {
+            drain_rustls_into(&mut self.drained_buffer, conn.reader());
+        }
+        !self.drained_buffer.is_empty()
+    }
+
+    /// 可読になったソケットから、ブロックせずに読めるだけ TLS レコードを取り込み、復号した平文を
+    /// ドレインバッファへ移す（メッシュの L4 転送）。`Ok(true)` は「平文がある・相手が閉じた」
+    /// （`read` が待たずに返る）、`Ok(false)` は制御レコード（TLS 1.3 の NewSessionTicket 等）だけで
+    /// まだ平文が無い。kTLS で受信している場合はカーネルが平文だけを返すので常に `Ok(true)`。
+    pub fn fill_plaintext_nonblocking(&mut self) -> io::Result<bool> {
+        if !self.drained_buffer.is_empty() {
+            return Ok(true);
+        }
+        let fd = self.inner.as_raw_fd();
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(true);
+        };
+        let mut buf = [0u8; 16384];
+        loop {
+            match raw_read(fd, &mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let r = conn.read_tls(&mut &buf[consumed..n])?;
+                        if r == 0 {
+                            break;
+                        }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(!self.drained_buffer.is_empty());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
     /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
     ///
@@ -280,6 +325,47 @@ impl crate::runtime::io::BufferedReadState for SimpleTlsClientStream {
 }
 
 impl SimpleTlsClientStream {
+    /// [`SimpleTlsServerStream::take_pending_plaintext`] のクライアント側。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        drain_rustls_into(&mut self.drained_buffer, self.conn.reader());
+        !self.drained_buffer.is_empty()
+    }
+
+    /// 可読になったソケットから、ブロックせずに読めるだけ TLS レコードを取り込み、復号した平文を
+    /// ドレインバッファへ移す（メッシュの L4 転送）。`Ok(true)` は「平文がある・相手が閉じた」
+    /// （`read` が待たずに返る）、`Ok(false)` は制御レコード（TLS 1.3 の NewSessionTicket 等）だけで
+    /// まだ平文が無い。kTLS で受信している場合はカーネルが平文だけを返すので常に `Ok(true)`。
+    pub fn fill_plaintext_nonblocking(&mut self) -> io::Result<bool> {
+        if !self.drained_buffer.is_empty() {
+            return Ok(true);
+        }
+        let fd = self.inner.as_raw_fd();
+        let conn = &mut self.conn;
+        let mut buf = [0u8; 16384];
+        loop {
+            match raw_read(fd, &mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let r = conn.read_tls(&mut &buf[consumed..n])?;
+                        if r == 0 {
+                            break;
+                        }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(!self.drained_buffer.is_empty());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
     #[inline]
     pub fn negotiated_h2(&self) -> bool {
@@ -427,6 +513,32 @@ pub async fn accept(
         mode: TlsMode::Rustls,
         drained_buffer: Vec::new(),
     })
+}
+
+/// [`accept`] と同じだが、相手のクライアント証明書（leaf の DER）も返す（メッシュの mTLS。F-217）。
+pub async fn accept_with_peer_cert(
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+    mut initial_data: Option<Vec<u8>>,
+) -> io::Result<(SimpleTlsServerStream, Option<Vec<u8>>)> {
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+    let peer_cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec());
+
+    Ok((
+        SimpleTlsServerStream {
+            inner: stream,
+            conn: Some(Box::new(conn)),
+            mode: TlsMode::Rustls,
+            drained_buffer: Vec::new(),
+        },
+        peer_cert,
+    ))
 }
 
 /// 平文（TLSなし）接続をアクセプト（H2C対応用）

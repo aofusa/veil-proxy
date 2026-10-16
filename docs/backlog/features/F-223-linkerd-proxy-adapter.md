@@ -1,6 +1,6 @@
 # F-223: Linkerd のアダプタ（linkerd2-proxy の置き換え）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -48,6 +48,15 @@ Linkerd が注入する linkerd2-proxy（Rust、Envoy ではない）を veil �
 - Linkerd のタスク（Automatic mTLS・Restricting Access To Services・Per-Route Policy・Retries・Timeouts・Traffic Split・
   Circuit Breaking（failure accrual））を F-225 の kind で通す。
 - 証明書の更新（有効期限を短くした Linkerd で）・制御プレーンの再起動・Pod の SIGTERM。
+
+
+## 実装の結果
+
+- Identity（CSR）・Destination・Policy の gRPC、プロキシ同士の取り決め（DNS の SAN の mTLS・`l5d-orig-proto` の昇格・opaque
+  transport・`l5d-client-id`・`l5d-proxy-error`）、管理ポート 4191・tap 4190。
+- linkerd-e2e.sh の stock / veil / mixed（smoke・tasks・ops・certs・viz）。emojivoto・booksapp を全 Pod veil で、viz の stat / edges /
+  top / tap が動く。
+- 見つかった不具合: HTTP/2 で受けた本文の無い POST を content-length 無しでアプリへ送り、booksapp の webapp が 411 を返していた。
 
 ## 関連
 

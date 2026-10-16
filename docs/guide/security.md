@@ -76,6 +76,41 @@ drop_privileges_group = "veil"
 > 
 > If namespace isolation is required, we recommend doing it at the **systemd level** (see below).
 
+## JWT Authentication (F-220)
+
+`[route.jwt]` verifies a JSON Web Token on every request of the route before it reaches the action (requires the
+`jwt` feature, included in `full*`). Requests without a token get `401` (`Jwt is missing`), tokens that do not verify
+get `401` (`Jwt verification fails`), and verified tokens that do not satisfy `require_claims` get `403`
+(`RBAC: access denied`).
+
+```toml
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "api"
+[route.jwt]
+issuer = "https://auth.example.com"       # checked against "iss" (empty: not checked)
+audiences = ["api"]                       # one of them must be in "aud" (empty: not checked)
+jwks_path = "/etc/veil/jwks.json"         # or jwks = '{"keys":[...]}' inline
+# header = "authorization"                # default
+# prefix = "Bearer "                      # default (case-insensitive)
+# allow_missing = false                   # true: requests without a token pass (a token present is still verified)
+# require_expiration = false
+# clock_skew_secs = 60
+require_claims = { scope = ["read"] }     # every claim must have one of the values
+```
+
+- Signatures: RS256/384/512, PS256/384/512 and ES256/384 with RSA and EC (P-256, P-384) keys from the JWKS. `exp`
+  and `nbf` are checked with the clock skew.
+- A claim that is a string is split on spaces (OAuth `scope`), arrays match any element, booleans and numbers match
+  their text form.
+- The JWKS is read when the configuration is loaded; replace the file and send `SIGHUP` to rotate keys. veil does not
+  fetch remote JWKS URIs.
+- CORS preflights answered by `[route.traffic.cors]` do not need a token.
+- For identity-based authorization of TLS clients, use `[tls] client_allowed_sans` ([TLS](tls.md)).
+
 ## Security Hardening (systemd Sandboxing)
 
 io_uring is a powerful async I/O interface, but if exploited, it poses a risk of kernel privilege escalation.

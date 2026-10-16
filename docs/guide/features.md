@@ -29,6 +29,8 @@
 - **Header Manipulation**: Add/remove request/response headers (X-Real-IP, HSTS, etc.)
 - **Redirect**: 301/302/307/308 HTTP redirects (with path preservation option)
 - **SNI Configuration**: Specify SNI name when connecting to HTTPS backends via IP (virtual host support)
+- **Per-route traffic control (F-219)**: fixed responses (`type = "Respond"`), weighted splits across upstreams (canary), fault injection (abort) and CORS preflight answers (`[route.traffic]`, see [Routing](routing.md))
+- **Upstream mTLS (F-217)**: client certificate, trust anchors and expected SANs (e.g. SPIFFE IDs) per upstream (see [TLS](tls.md))
 
 ### HTTP Processing
 - **Keep-Alive**: Full HTTP/1.1 Keep-Alive support
@@ -76,6 +78,8 @@
 - **Connection Limit**: Global concurrent connection limit
 - **Rate Limiter**: Sliding window rate limiting
 - **IP Restriction**: IP address filtering with CIDR support
+- **Client certificates (F-217 / F-220)**: `[tls] client_auth` / `client_ca`, and `client_allowed_sans` to accept only listed identities (see [TLS](tls.md))
+- **JWT (F-220)**: `[route.jwt]` verifies tokens (RS/PS/ES, `iss`, `aud`, `exp`) and claim conditions; 401 / 403 otherwise (requires `jwt`, included in `full*`; see [Security](security.md))
 - **Privilege Dropping**: Drop to unprivileged user after root startup
 - **seccomp Filter**: BPF-based system call restriction with argument-level PROT_EXEC validation for mmap/mprotect (optional)
 - **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
@@ -100,3 +104,16 @@ features are in neither `default` nor `full*`, so the proxy binary contains no l
 | `api` | `api-core` + `tokio-compat` |
 
 C (`crates/veil-capi`, `libveil.so`/`libveil.a`) and Python (`crates/veil-python`) bindings are separate crates built on the same code.
+
+### Service mesh data plane
+
+veil can replace the mesh proxy (Istio's Envoy, Linkerd's linkerd2-proxy; see [Service mesh data plane](mesh.md)).
+These features are in neither `default` nor `full*` (Linux only):
+
+| Feature | Description |
+|---------|-------------|
+| `mesh` | the mesh engine (transparent interception, mTLS, HTTP/1.1 / HTTP/2 / L4, the mesh model) |
+| `mesh-istio` | `mesh` + Envoy compatibility (bootstrap, Delta ADS / SDS, Envoy's admin API) — started as `envoy` |
+| `mesh-linkerd` | `mesh` + linkerd2-proxy compatibility (identity, destination, policy, tap) — started as `linkerd2-proxy` |
+
+Add `wasm` for Istio's WasmPlugin and `epoll` for containers (the default container seccomp profile rejects io_uring).

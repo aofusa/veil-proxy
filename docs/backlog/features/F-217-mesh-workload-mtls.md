@@ -1,6 +1,6 @@
 # F-217: ワークロード ID の mTLS（受け・送り・ID の検証・証明書の差し替え・PERMISSIVE）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 現状
 
@@ -39,6 +39,15 @@
 - 設定（メッシュ無しでも使える一般機能として）: `[tls] client_auth = "require" | "optional"`・`client_ca`、上流の `tls_client_cert`・
   `tls_ca`・`expected_san`。`docs/guide/tls.md`（英日）と `examples/config.toml`。
 - 性能: mTLS の有無で既存の TLS の構成（`tools/perf` の TLS 構成）が退行しない（交互 A/B）。
+
+
+## 実装の結果
+
+- メッシュ: SDS / Linkerd の Identity の証明書でワークロードの mTLS（SPIFFE / Linkerd の DNS の SAN の検証、PERMISSIVE / STRICT、
+  証明書の差し替えは次のハンドシェイクから）。
+- TOML（メッシュ無しでも使える一般機能）: `[tls] client_auth`・`client_ca`、上流の `tls_client_cert`・`tls_client_key`・
+  `tls_ca`・`expected_san`（`[upstreams.<name>]` と Proxy の action）。`src/upstream_tls.rs`（`TlsProfile`）・`src/x509_san.rs`。
+  自己完結の E2E `f217_toml_mtls_server_client_auth_and_upstream_client_cert`。`docs/guide/tls.md`（英日）・`examples/config.toml`。
 
 ## 関連
 

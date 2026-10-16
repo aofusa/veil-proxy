@@ -161,6 +161,49 @@ F-183 より前は rustls の既定（全ワーカー共有の 256 件のキャ�
 > OpenSSL・BoringSSL・NSS・Go・rustls のクライアントは問題なく再開します。こうした古い
 > クライアントが TLS 1.3 の無制限な再開より重要なら `"cache"` を使ってください。
 
+## クライアント証明書と上流の mTLS（F-217）
+
+### クライアント証明書を要求する
+
+```toml
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path  = "/etc/veil/key.pem"
+client_auth = "require"            # "none"（既定） | "optional" | "require"
+client_ca   = "/etc/veil/client-ca.pem"
+client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # 任意（F-220）
+```
+
+- `"require"` は証明書を出さないクライアントと、`client_ca` で検証できない証明書のクライアントをハンドシェイクで
+  拒否する。`"optional"` は証明書を求めるが、出さないクライアントも受ける（出された証明書は検証する）。
+- TCP の TLS（HTTP/1.1・HTTP/2）に効く。`[http3]` と併用すると QUIC のクライアントが迂回できるので、起動時にエラーにする。
+- `client_allowed_sans` は一覧の SAN（DNS 名・URI・IP）のどれかを持つ証明書だけを受ける。ハンドシェイクで 1 回だけ照合し、
+  同じ CA が発行した別の ID は拒否する。`client_auth = "optional"` か `"require"` が要る。
+- 証明書のホットリロードは起動時の `client_auth`・`client_ca`・`client_allowed_sans` を引き継ぐ。これらの変更には再起動が要る。
+
+### 上流へクライアント証明書を出す
+
+`[upstreams.<name>]` と `Proxy` の action に書ける:
+
+| キー | 意味 |
+|------|------|
+| `tls_client_cert` / `tls_client_key` | 上流へ出すクライアント証明書と秘密鍵（PEM、組で指定） |
+| `tls_ca` | 上流の証明書の信頼アンカー（PEM。省略時は既定の公開 CA） |
+| `expected_san` | 上流の証明書の SAN の期待値（DNS 名・URI・IP。どれかが一致すれば受ける）。指定するとホスト名の照合の代わりにこれを使う（SPIFFE ID 等） |
+
+```toml
+[upstreams.backend]
+servers = ["https://10.0.0.5:8443"]
+tls_client_cert = "/etc/veil/upstream-client.pem"
+tls_client_key  = "/etc/veil/upstream-client.key"
+tls_ca          = "/etc/veil/upstream-ca.pem"
+expected_san    = ["spiffe://cluster.local/ns/default/sa/backend"]
+```
+
+TLS の設定は設定のロード時に作る（接続ごとには作らない）。プールの接続はこの設定ごとに分けるので、クライアント
+証明書の違う上流が接続を共有することはない。証明書のファイルを差し替えたら `SIGHUP` の設定リロードで反映する。
+`tls_insecure` より優先する。
+
 ## TLS証明書ホットリロード
 
 プロキシを再起動せずにTLS証明書をローテーションします。

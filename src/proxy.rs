@@ -571,11 +571,93 @@ where
         + crate::runtime::io::BufferedReadState
         + Unpin,
 {
+    let svc = ProxyH2Service {
+        spawner: h2_task_spawner(),
+    };
+    handle_http2_requests_with(conn, client_ip, connection_metric, redirect_https, &svc).await
+}
+
+/// HTTP/2 の per-stream 処理を差し替える口（F-222: メッシュのデータプレーンが自分のルーティングと上流で
+/// 使う）。veil の通常のプロキシは [`ProxyH2Service`]（従来の処理そのもの。単相化で同じコードになる）。
+#[cfg(feature = "http2")]
+pub(crate) trait H2Service {
+    /// 本文がまだ届いている途中の要求を、本文をチャネルで流す（ストリーミング）にするか。
+    /// `Some(上限)` ならストリーミング（0 は上限なし）、`None` は本文を溜めてから処理する。
+    fn streaming_plan<S>(
+        &self,
+        conn: &http2::Http2Connection<S>,
+        stream_id: u32,
+        client_ip: &str,
+        client_socket_addr: SocketAddr,
+    ) -> Option<u64>
+    where
+        S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin;
+
+    /// 要求 1 つを処理するタスクを起動する。
+    fn spawn(
+        &self,
+        ctx: H2RequestCtx,
+        req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+        resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+        notify: crate::stream_channel::Notify,
+    );
+}
+
+/// 通常のプロキシの per-stream 処理（ルーティング・セキュリティ・WASM・バックエンド）。
+#[cfg(feature = "http2")]
+struct ProxyH2Service {
+    spawner: H2TaskSpawner,
+}
+
+#[cfg(feature = "http2")]
+impl H2Service for ProxyH2Service {
+    #[inline]
+    fn streaming_plan<S>(
+        &self,
+        conn: &http2::Http2Connection<S>,
+        stream_id: u32,
+        client_ip: &str,
+        client_socket_addr: SocketAddr,
+    ) -> Option<u64>
+    where
+        S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    {
+        h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
+    }
+
+    #[inline]
+    fn spawn(
+        &self,
+        ctx: H2RequestCtx,
+        req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+        resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+        notify: crate::stream_channel::Notify,
+    ) {
+        (self.spawner)(ctx, req_rx, resp_tx, notify)
+    }
+}
+
+/// [`handle_http2_requests`] の本体（per-stream 処理を `svc` で差し替えられる）。
+#[cfg(feature = "http2")]
+pub(crate) async fn handle_http2_requests_with<S, V>(
+    conn: &mut http2::Http2Connection<S>,
+    client_ip: &str,
+    connection_metric: &mut ActiveConnectionMetric,
+    redirect_https: bool,
+    svc: &V,
+) -> Result<(), http2::Http2Error>
+where
+    S: crate::runtime::io::AsyncReadRent
+        + crate::runtime::io::AsyncWriteRentExt
+        + AsRawFd
+        + crate::runtime::io::BufferedReadState
+        + Unpin,
+    V: H2Service,
+{
     use http2::frame::Frame;
     use http2::Http2Error;
 
     let notify = crate::stream_channel::Notify::new();
-    let spawner = h2_task_spawner();
     // F-162: per-stream 固定費削減。`client_ip` の `Rc<str>` 化と `SocketAddr` 解決は
     // 接続あたり 1 回だけ行い、以降は `Rc::clone`（参照カウント +1）と値渡し（Copy）で使い回す。
     let client_ip_rc: std::rc::Rc<str> = std::rc::Rc::from(client_ip);
@@ -693,7 +775,7 @@ where
                             req.body_pending,
                             &mut streams,
                             &notify,
-                            &spawner,
+                            svc,
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
@@ -741,7 +823,7 @@ where
                             req.body_pending,
                             &mut streams,
                             &notify,
-                            &spawner,
+                            svc,
                             &client_ip_rc,
                             client_socket_addr,
                             connection_metric,
@@ -854,7 +936,7 @@ where
 /// 接続状態を進めるため、[`H2RespMsg::Head`]/[`H2RespMsg::Trailers`] のエンコードは
 /// **メインループが送信順に**行う（タスクは名前/値ペアのまま渡す）。
 #[cfg(feature = "http2")]
-enum H2RespMsg {
+pub(crate) enum H2RespMsg {
     /// レスポンス head（ステータス + ヘッダ）。最初に 1 回だけ送られる。
     ///
     /// F-166/F-165(B-2/A4): ヘッダは `Vec<(Bytes, Bytes)>`。`Bytes` は
@@ -881,27 +963,27 @@ enum H2RespMsg {
 
 /// per-stream リクエストタスクへ conn 非依存で引き渡すリクエスト情報（F-116）。
 #[cfg(feature = "http2")]
-struct H2RequestCtx {
+pub(crate) struct H2RequestCtx {
     /// デコーダのアリーナ由来 `Bytes`（参照カウント clone のみ、R2/F-165）。
-    method: Bytes,
-    path: Bytes,
+    pub(crate) method: Bytes,
+    pub(crate) path: Bytes,
     /// `:authority`（無ければ host ヘッダー、いずれも無ければ空）。
-    authority: Bytes,
+    pub(crate) authority: Bytes,
     /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
-    headers: Vec<crate::http2::hpack::HeaderField>,
+    pub(crate) headers: Vec<crate::http2::hpack::HeaderField>,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
-    body: Bytes,
+    pub(crate) body: Bytes,
     /// リクエストトレイラー（gRPC 等。通常のリクエストでは空、F-133）。wasm feature
     /// 無効時は誰も読まないためフィールド自体を無くす（dead_code 回避）。
     #[cfg(feature = "wasm")]
     trailers: Vec<crate::http2::hpack::HeaderField>,
     /// 接続あたり 1 回だけ確保して `Rc::clone`（参照カウント +1）で使い回す（F-162）。
-    client_ip: std::rc::Rc<str>,
+    pub(crate) client_ip: std::rc::Rc<str>,
     /// `client_ip` から解決した `SocketAddr`。接続確立時に 1 回だけ解決する（F-162）。
-    client_socket_addr: SocketAddr,
+    pub(crate) client_socket_addr: SocketAddr,
     /// 平文リスナーの `enable_secure_redirect`（F-200）。true なら要求を https へ 301 で返す。
-    redirect_https: bool,
-    start: Instant,
+    pub(crate) redirect_https: bool,
+    pub(crate) start: Instant,
 }
 
 /// メインループ側のストリーム状態（F-116）。
@@ -1005,19 +1087,20 @@ const H2_REQ_CHANNEL_CAP: usize = 4;
 /// ボディ継続で、ストリーミング適格ならリクエストボディチャネル付きで起動する。
 #[cfg(feature = "http2")]
 #[allow(clippy::too_many_arguments)]
-fn h2_spawn_for_request<S>(
+fn h2_spawn_for_request<S, V>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
     body_pending: bool,
     streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
     notify: &crate::stream_channel::Notify,
-    spawner: &H2TaskSpawner,
+    svc: &V,
     client_ip: &std::rc::Rc<str>,
     client_socket_addr: SocketAddr,
     connection_metric: &mut ActiveConnectionMetric,
     redirect_https: bool,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    V: H2Service,
 {
     // 既にタスク起動済みのストリーム（body_pending の二重通知）はスキップ。
     if streams.contains_key(&stream_id) {
@@ -1028,7 +1111,7 @@ fn h2_spawn_for_request<S>(
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
     let plan = if body_pending && !redirect_https {
-        h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
+        svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr)
     } else {
         None
     };
@@ -1095,7 +1178,7 @@ fn h2_spawn_for_request<S>(
     // 容量 `H2_RESP_CHANNEL_CAP`（4）の有界チャネルであり、それを超える送出は
     // タスク側が Pending で止まる（= 通常の spawn 経路にフォールバックする）ため、
     // 送出順序を先取りしても取りこぼしは発生しない。
-    spawner(ctx, req_rx, resp_tx, notify.clone());
+    svc.spawn(ctx, req_rx, resp_tx, notify.clone());
 
     streams.insert(
         stream_id,
@@ -1398,7 +1481,7 @@ where
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
 
-    let backend_result = find_backend_unified(
+    let backend_result = crate::upstream::find_backend_preview(
         &authority,
         path_wo_query,
         &method,
@@ -1410,7 +1493,7 @@ where
     )
     .or_else(|| {
         if !authority.is_empty() {
-            find_backend_unified(
+            crate::upstream::find_backend_preview(
                 b"",
                 path_wo_query,
                 &method,
@@ -1999,6 +2082,12 @@ async fn h2_dispatch(
             )
             .await
         }
+        Backend::Respond(r) => {
+            // 固定応答（F-219）
+            let mut headers = h2_base_headers(false);
+            headers.extend(r.headers.iter().cloned());
+            h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await
+        }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             h2_redirect(
                 ctx,
@@ -2274,10 +2363,9 @@ async fn h2_proxy(
     // F-175: HTTPS 上流は ALPN で HTTP/2 を試す（多重化接続）。上流が HTTP/1.1 を選べば
     // ネゴシエーションに使った接続を TLS プールへ入れて、下の HTTP/1.1 経路で使う。
     if target.h2_over_tls() {
-        let tls_insecure = upstream_group.tls_insecure();
+        let tls_profile = upstream_group.tls_profile();
         let addr = target.conn_addr();
-        let key =
-            crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_insecure);
+        let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
         let is_grpc = ctx
             .headers
             .iter()
@@ -2291,7 +2379,7 @@ async fn h2_proxy(
         match http2::upstream_mux::request_https_buffered(
             target,
             key.as_str(),
-            tls_insecure,
+            tls_profile,
             Duration::from_secs(security.backend_connect_timeout_secs),
             Duration::from_secs(security.idle_connection_timeout_secs),
             READ_TIMEOUT,
@@ -2392,7 +2480,7 @@ async fn h2_proxy(
             compression,
             client_encoding,
             security,
-            upstream_group.tls_insecure(),
+            upstream_group.tls_profile(),
             resp_tx,
             notify,
         )
@@ -2729,11 +2817,11 @@ async fn h2_proxy_https(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_insecure);
+    let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_profile);
     // F-177: プールの接続が応答の前に切れていたら、冪等な要求に限り新しい接続で 1 回だけ再送する。
     let idempotent = request_line_is_idempotent(&request);
     let mut request = request;
@@ -2767,11 +2855,8 @@ async fn h2_proxy_https(
                 match acquired {
                     GateAcquire::Pooled(stream) => (stream, true),
                     GateAcquire::Fresh(backend_tcp) => {
-                        let tls_result = if tls_insecure {
-                            let connector = get_tls_connector_insecure();
-                            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
-                        } else {
-                            let connector = get_tls_connector();
+                        let tls_result = {
+                            let connector = crate::config::tls_connector(tls_profile);
                             timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
                         };
                         match tls_result {
@@ -3841,7 +3926,7 @@ async fn h2_relay_h2_streaming(
     ctx: &H2RequestCtx,
     req_rx: &crate::stream_channel::Receiver<Bytes>,
     target: &ProxyTarget,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
     prefix: &[u8],
     security: &SecurityConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
@@ -3864,12 +3949,11 @@ async fn h2_relay_h2_streaming(
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
     let idle_timeout = Duration::from_secs(security.idle_connection_timeout_secs);
     let opened = if target.use_tls {
-        let key =
-            crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_insecure);
+        let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
         match http2::upstream_mux::open_https(
             target,
             key.as_str(),
-            tls_insecure,
+            tls_profile,
             connect_timeout,
             idle_timeout,
             method,
@@ -4097,6 +4181,14 @@ async fn h2_serve_streaming(
         Some((_prefix, Backend::Handler(entry, _, _), _rc)) if entry.streaming_request => {
             return h2_api_handler(ctx, &entry, Some(req_rx), resp_tx, notify).await;
         }
+        // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
+        Some((_prefix, Backend::Respond(r), _rc)) => {
+            h2_drain_req(req_rx, notify).await;
+            let mut headers = h2_base_headers(false);
+            headers.extend(r.headers.iter().cloned());
+            let (s, sz) = h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await;
+            return (s, sz, 0);
+        }
         _ => {
             h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
@@ -4128,7 +4220,7 @@ async fn h2_serve_streaming(
             ctx,
             req_rx,
             &server.target,
-            upstream_group.tls_insecure(),
+            upstream_group.tls_profile(),
             &prefix,
             &security,
             resp_tx,
@@ -4153,7 +4245,7 @@ async fn h2_serve_streaming(
     let target = &server.target;
     let use_tls = target.use_tls;
     let sni = target.sni().to_string();
-    let tls_insecure = upstream_group.tls_insecure();
+    let tls_profile = upstream_group.tls_profile();
     let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
     let addr = addr.as_str();
 
@@ -4226,11 +4318,8 @@ async fn h2_serve_streaming(
     };
 
     let (status, resp_size, req_size) = if use_tls {
-        let tls_result = if tls_insecure {
-            let connector = get_tls_connector_insecure();
-            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
-        } else {
-            let connector = get_tls_connector();
+        let tls_result = {
+            let connector = crate::config::tls_connector(tls_profile);
             timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
         };
         match tls_result {
@@ -6242,6 +6331,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         let ws_result = handle_websocket_proxy(
                             tls_stream,
                             &server.target,
+                            upstream_group.tls_profile(),
                             security,
                             &method_bytes,
                             &path_bytes,
@@ -6673,6 +6763,28 @@ async fn handle_backend(
             )
             .await
         }
+        Backend::Respond(r) => {
+            // 固定応答（F-219）。応答全体はロード時に組み立て済み（Bytes の参照カウントだけ）
+            let full = if client_wants_close {
+                &r.h1_close
+            } else {
+                &r.h1_keepalive
+            };
+            let out = if method.as_ref() == b"HEAD" {
+                full.slice(..full.len() - r.body.len())
+            } else {
+                full.clone()
+            };
+            match timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await {
+                Ok((Ok(_), _)) => Some((
+                    tls_stream,
+                    r.status,
+                    r.body.len() as u64,
+                    client_wants_close,
+                )),
+                _ => None,
+            }
+        }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(
                 tls_stream,
@@ -7049,9 +7161,11 @@ async fn handle_redirect(
 /// # Returns
 /// Some((status_code, bytes_transferred)) - 成功時
 /// None - エラー時
+#[allow(clippy::too_many_arguments)]
 async fn handle_websocket_proxy(
     client_stream: ServerTls,
     target: &ProxyTarget,
+    tls_profile: crate::upstream_tls::TlsProfile,
     security: &SecurityConfig,
     method: &[u8],
     req_path: &[u8],
@@ -7125,6 +7239,7 @@ async fn handle_websocket_proxy(
         handle_websocket_proxy_https(
             client_stream,
             target,
+            tls_profile,
             connect_timeout,
             request,
             &poll_config,
@@ -7261,6 +7376,7 @@ async fn handle_websocket_proxy_http(
 async fn handle_websocket_proxy_https(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
+    tls_profile: crate::upstream_tls::TlsProfile,
     connect_timeout: Duration,
     request: Vec<u8>,
     poll_config: &WebSocketPollConfig,
@@ -7289,7 +7405,7 @@ async fn handle_websocket_proxy_https(
     };
 
     // TLS 接続
-    let connector = get_tls_connector();
+    let connector = crate::config::tls_connector(tls_profile);
     let tls_result = timeout(
         connect_timeout,
         connector.connect(backend_tcp, &target.host),
@@ -7947,14 +8063,14 @@ async fn handle_proxy(
     let target = &server.target;
     // コネクションプールキーの生成（F-170: 接続先表記＝conn_addr() を第 1 要素にする。
     // TCP では host:port と 1 バイトも変わらないため、プール再利用は不変）。
-    // HTTPS: SNI と tls_insecure 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
-    let tls_insecure = upstream_group.tls_insecure();
+    // HTTPS: SNI と tls_profile 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
+    let tls_profile = upstream_group.tls_profile();
     let pool_key_addr = target.conn_addr();
     let pool_key_addr = pool_key_addr.as_str();
     let pool_key = if target.use_tls && target.sni_name.is_some() {
-        crate::http_utils::PoolKeyStr::tls_addr(pool_key_addr, target.sni(), tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr(pool_key_addr, target.sni(), tls_profile)
     } else if target.use_tls {
-        crate::http_utils::PoolKeyStr::tls_addr_no_sni(pool_key_addr, tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr_no_sni(pool_key_addr, tls_profile)
     } else {
         crate::http_utils::PoolKeyStr::plain_addr(pool_key_addr)
     };
@@ -8134,7 +8250,7 @@ async fn handle_proxy(
             headers,
             initial_body,
             client_wants_close,
-            tls_insecure,
+            tls_profile,
         )
         .await
         {
@@ -8156,7 +8272,7 @@ async fn handle_proxy(
 
     let result = if target.use_tls {
         // HTTPS接続（キャッシュ保存はHTTPのみサポート、HTTPSは別途実装が必要）
-        // 上流証明書検証は per-upstream の tls_insecure のみで制御（B-30: VEIL_TLS_INSECURE はクライアント向け）
+        // 上流証明書検証は per-upstream の tls_profile のみで制御（B-30: VEIL_TLS_INSECURE はクライアント向け）
         proxy_https_pooled(
             client_stream,
             target,
@@ -8170,7 +8286,7 @@ async fn handle_proxy(
             is_chunked,
             initial_body,
             client_wants_close,
-            tls_insecure,
+            tls_profile,
             wasm_modules,
         )
         .await
@@ -8653,15 +8769,15 @@ async fn proxy_h1_via_https_h2(
     headers: &[(Bytes, Bytes)],
     request_body: &[u8],
     client_wants_close: bool,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
 ) -> H1ViaH2 {
     use crate::http2::upstream_mux::{HttpsOpen, UpResp};
     let addr = target.conn_addr();
-    let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_insecure);
+    let key = crate::http_utils::PoolKeyStr::tls_addr(addr.as_str(), target.sni(), tls_profile);
     let opened = http2::upstream_mux::open_https(
         target,
         key.as_str(),
-        tls_insecure,
+        tls_profile,
         Duration::from_secs(security.backend_connect_timeout_secs),
         Duration::from_secs(security.idle_connection_timeout_secs),
         method,
@@ -11221,7 +11337,7 @@ async fn splice_transfer_response_ktls(
 async fn connect_https_backend_fresh(
     target: &ProxyTarget,
     connect_timeout: Duration,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
 ) -> Result<ClientTls, (u16, &'static [u8])> {
     let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
@@ -11242,13 +11358,10 @@ async fn connect_https_backend_fresh(
 
     // TLS接続（タイムアウト付き）
     // SNI名を使用（sni_nameが設定されていればそれを使用、なければhostを使用）
-    // tls_insecure が true の場合、証明書検証をスキップ
+    // 上流の TLS の種類（検証しない・上流の mTLS。F-217）に合ったコネクタで張る
     let sni = target.sni();
-    let tls_result = if tls_insecure {
-        let connector = get_tls_connector_insecure();
-        timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
-    } else {
-        let connector = get_tls_connector();
+    let tls_result = {
+        let connector = crate::config::tls_connector(tls_profile);
         timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
     };
 
@@ -11278,7 +11391,7 @@ async fn proxy_https_pooled(
     is_chunked: bool,
     initial_body: &[u8],
     client_wants_close: bool,
-    tls_insecure: bool,
+    tls_profile: crate::upstream_tls::TlsProfile,
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
@@ -11319,15 +11432,13 @@ async fn proxy_https_pooled(
         };
         let (mut backend_stream, from_pool) = match pooled {
             Some(stream) => (stream, true),
-            None => {
-                match connect_https_backend_fresh(target, connect_timeout, tls_insecure).await {
-                    Ok(stream) => (stream, false),
-                    Err((code, msg)) => {
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
-                        return Some((client_stream, code, 0, true));
-                    }
+            None => match connect_https_backend_fresh(target, connect_timeout, tls_profile).await {
+                Ok(stream) => (stream, false),
+                Err((code, msg)) => {
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
+                    return Some((client_stream, code, 0, true));
                 }
-            }
+            },
         };
 
         // リトライ可能要求の 1 回目は複製を渡し（次の試行のため原本を保持）、それ以外は move する。

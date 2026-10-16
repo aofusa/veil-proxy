@@ -114,7 +114,9 @@ fn is_known_buffer_type(buffer_type: i32) -> bool {
 ///
 /// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
 async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
-    let func = caller.get_export("proxy_on_memory_allocate")?;
+    let func = caller
+        .get_export("proxy_on_memory_allocate")
+        .or_else(|| caller.get_export("malloc"))?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
     typed.call_async(&mut *caller, size as i32).await.ok()

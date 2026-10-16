@@ -290,3 +290,17 @@ Access logs are written asynchronously by a dedicated writer thread. The hot pat
 ```json
 {"timestamp":"2026-01-01T00:00:00Z","type":"access","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
 ```
+
+## Service Mesh Data Plane (F-221)
+
+When veil runs as the mesh proxy ([mesh.md](mesh.md)), it exposes the mesh's own telemetry instead of the
+`[prometheus]` metrics above, so the mesh tooling works unchanged:
+
+| Mesh | What veil emits | Works with |
+|------|-----------------|------------|
+| Istio | `istio_requests_total`, `istio_request_duration_milliseconds`, `istio_request_bytes`, `istio_response_bytes`, `istio_tcp_*` with Istio's labels (peer metadata exchange, `connection_security_policy`), merged by pilot-agent on `:15020/stats/prometheus`; Envoy-format access logs through the Telemetry API; Zipkin / B3 spans | Prometheus, Kiali (graph with mTLS lock icons), Grafana's Istio dashboards, Jaeger |
+| Linkerd | `request_total`, `response_total`, `response_latency_ms`, `tcp_*`, `control_identity_cert_expiration_timestamp_seconds` on the admin port 4191; tap on 4190 | `linkerd viz stat / edges / top / tap`, Prometheus |
+
+Labels are resolved per connection (peer identity and metadata), not per request. `tools/k8s/mesh-e2e.sh <mode>
+observe` checks the Istio side with bookinfo (Kiali graph, Grafana panel queries, Jaeger traces), and
+`tools/k8s/linkerd-e2e.sh <mode> viz` checks the Linkerd side with emojivoto and booksapp.

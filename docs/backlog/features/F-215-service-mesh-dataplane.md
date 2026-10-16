@@ -1,6 +1,6 @@
 # F-215: Kubernetes のサービスメッシュのデータプレーンを veil で置き換える（Istio の Envoy・Linkerd の linkerd2-proxy）
 
-**状態: 未着手（2026-10-14 起票・設計。子チケット F-216〜F-225）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15。子 F-216〜F-225 完了）**
 
 ## 目的
 
@@ -179,6 +179,17 @@ Istio は istiod が生成する Envoy の設定（フィルタの種類は有�
 | F-223 | Linkerd のアダプタ（環境変数・Identity・Destination・Policy・プロキシ同士の取り決め・管理ポート） |
 | F-224 | Istio のゲートウェイ・ambient（waypoint・HBONE、ztunnel は検討） |
 | F-225 | メッシュの試験・計測基盤（kind、本家との混在、Gateway API conformance、Envoy・linkerd2-proxy との比較） |
+
+
+## 実装の結果
+
+- `src/mesh/` の専用エンジン（feature `mesh`・`mesh-istio`・`mesh-linkerd`、default・`full*` には入れない）。同じバイナリが
+  `argv[0]` で Envoy（pilot-agent の `/usr/local/bin/envoy`）か linkerd2-proxy として起動する。
+- イメージは musl 版の veil を本家のプロキシのイメージに入れたもの（`docker/Dockerfile.mesh-istio`・`Dockerfile.mesh-linkerd`）。
+- kind の Istio 1.31.1・Linkerd edge-26.10.1 で、本家（stock）・veil・混在（mixed）の全スイートを通した（各子チケット）。
+- 既存のプロキシの非退行: `tools/perf/suite_ab.sh` の main との交互 A/B（結果は docs/perf/README.md の「サービスメッシュ」と
+  「非退行」の節）。
+- 利用者向け: `docs/guide/mesh.md`（英日）。
 
 ## 関連
 

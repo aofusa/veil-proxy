@@ -87,6 +87,52 @@ impl crate::runtime::io::BufferedReadState for KtlsServerStream {
 }
 
 impl KtlsServerStream {
+    /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送。
+    /// ハンドシェイクと同じ便で届いたアプリデータはソケットの可読では通知されない）。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        if let Some(conn) = self.conn.as_mut() {
+            drain_rustls_into(&mut self.drained_buffer, conn.reader());
+        }
+        !self.drained_buffer.is_empty()
+    }
+
+    /// 可読になったソケットから、ブロックせずに読めるだけ TLS レコードを取り込み、復号した平文を
+    /// ドレインバッファへ移す（メッシュの L4 転送）。`Ok(true)` は「平文がある・相手が閉じた」
+    /// （`read` が待たずに返る）、`Ok(false)` は制御レコード（TLS 1.3 の NewSessionTicket 等）だけで
+    /// まだ平文が無い。kTLS で受信している場合はカーネルが平文だけを返すので常に `Ok(true)`。
+    pub fn fill_plaintext_nonblocking(&mut self) -> io::Result<bool> {
+        if !self.drained_buffer.is_empty() {
+            return Ok(true);
+        }
+        let fd = self.inner.as_raw_fd();
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(true);
+        };
+        let mut buf = [0u8; 16384];
+        loop {
+            match raw_read(fd, &mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let r = conn.read_tls(&mut &buf[consumed..n])?;
+                        if r == 0 {
+                            break;
+                        }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(!self.drained_buffer.is_empty());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
     /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
     ///
@@ -272,6 +318,51 @@ impl crate::runtime::io::BufferedReadState for KtlsClientStream {
 }
 
 impl KtlsClientStream {
+    /// [`KtlsServerStream::take_pending_plaintext`] のクライアント側。
+    pub fn take_pending_plaintext(&mut self) -> bool {
+        if let Some(conn) = self.conn.as_mut() {
+            drain_rustls_into(&mut self.drained_buffer, conn.reader());
+        }
+        !self.drained_buffer.is_empty()
+    }
+
+    /// 可読になったソケットから、ブロックせずに読めるだけ TLS レコードを取り込み、復号した平文を
+    /// ドレインバッファへ移す（メッシュの L4 転送）。`Ok(true)` は「平文がある・相手が閉じた」
+    /// （`read` が待たずに返る）、`Ok(false)` は制御レコード（TLS 1.3 の NewSessionTicket 等）だけで
+    /// まだ平文が無い。kTLS で受信している場合はカーネルが平文だけを返すので常に `Ok(true)`。
+    pub fn fill_plaintext_nonblocking(&mut self) -> io::Result<bool> {
+        if !self.drained_buffer.is_empty() {
+            return Ok(true);
+        }
+        let fd = self.inner.as_raw_fd();
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(true);
+        };
+        let mut buf = [0u8; 16384];
+        loop {
+            match raw_read(fd, &mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let r = conn.read_tls(&mut &buf[consumed..n])?;
+                        if r == 0 {
+                            break;
+                        }
+                        consumed += r;
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(!self.drained_buffer.is_empty());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// ALPN で HTTP/2（`h2`）が選ばれたか（F-175）。
     #[inline]
     pub fn negotiated_h2(&self) -> bool {
@@ -842,6 +933,97 @@ pub async fn accept(
         alpn_protocol,
         drained_buffer,
     })
+}
+
+/// [`accept`] と同じだが、相手のクライアント証明書（leaf の DER）も返す（メッシュの mTLS。F-217）。
+///
+/// kTLS を有効にすると rustls の接続を手放すため、ハンドシェイクの直後に控える。既存の [`accept`] の
+/// 経路（ストリームの構造体）は変えない（証明書を持たせると全 TLS 接続の構造体が大きくなる）。
+pub async fn accept_with_peer_cert(
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+    enable_ktls: bool,
+    allow_fallback: bool,
+    tcp_cork_enabled: bool,
+    mut initial_data: Option<Vec<u8>>,
+) -> io::Result<(KtlsServerStream, Option<Vec<u8>>)> {
+    // io_uring's IORING_OP_ACCEPT does not set SOCK_NONBLOCK unlike accept4(2).
+    // We use raw_read/tls_writev (writev) on this fd, so we must ensure O_NONBLOCK is set.
+    {
+        let fd = stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // ハンドシェイクを実行
+    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+
+    // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
+    let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
+    // 相手の証明書（leaf）。kTLS を有効にすると rustls の接続を手放すので先に控える
+    let peer_cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec());
+
+    // kTLS の有効化を試みる
+    #[cfg(feature = "ktls")]
+    let (mode, conn_option, drained_buffer) = if enable_ktls {
+        match try_enable_ktls_server(&stream, conn, tcp_cork_enabled) {
+            KtlsEnableResult::Enabled(mode, drained) => {
+                // kTLS 有効化成功 + ドレイン済みバッファ
+                (mode, None, drained)
+            }
+            KtlsEnableResult::Fallback(returned_conn, reason) => {
+                if allow_fallback {
+                    // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                    // warnログは try_enable_ktls_server 内で既に出力済み
+                    let _ = reason;
+                    (TlsMode::Rustls, Some(returned_conn), Vec::new())
+                } else {
+                    // フォールバック無効 - 接続を拒否
+                    ftlog::error!(
+                        "kTLS unavailable ({}) and fallback disabled, rejecting connection",
+                        reason
+                    );
+                    return Err(io::Error::other(format!(
+                        "kTLS required but unavailable: {}",
+                        reason
+                    )));
+                }
+            }
+            KtlsEnableResult::Fatal(e) => {
+                // シークレット抽出後の失敗等、致命的エラー
+                ftlog::error!("kTLS fatal error: {}, connection cannot continue", e);
+                return Err(e);
+            }
+        }
+    } else {
+        (TlsMode::Rustls, Some(conn), Vec::new())
+    };
+
+    #[cfg(not(feature = "ktls"))]
+    let (mode, conn_option, drained_buffer) = {
+        let _ = enable_ktls;
+        let _ = allow_fallback;
+        (TlsMode::Rustls, Some(conn), Vec::new())
+    };
+
+    Ok((
+        KtlsServerStream {
+            inner: stream,
+            conn: conn_option.map(Box::new),
+            mode,
+            alpn_protocol,
+            drained_buffer,
+        },
+        peer_cert,
+    ))
 }
 
 /// TLS ハンドシェイクを実行しクライアント TLS ストリームを作成

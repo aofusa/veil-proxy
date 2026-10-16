@@ -1144,3 +1144,564 @@ impl Drop for ChildGuard {
         let _ = self.0.wait();
     }
 }
+
+// ===================== F-217（TOML の mTLS） =====================
+
+/// テスト用の CA と、それが発行するサーバ証明書（URI SAN 付き）・クライアント証明書を書き出す。
+fn write_mtls_pki(dir: &std::path::Path) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    sp.subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    sp.subject_alt_names
+        .push(SanType::URI("spiffe://test/server".try_into().unwrap()));
+    let server = sp.signed_by(&server_key, &issuer).unwrap();
+    std::fs::write(dir.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let cp = CertificateParams::new(vec!["client.test".to_string()]).unwrap();
+    let client = cp.signed_by(&client_key, &issuer).unwrap();
+    std::fs::write(dir.join("client.pem"), client.pem()).unwrap();
+    std::fs::write(dir.join("client.key"), client_key.serialize_pem()).unwrap();
+
+    // 同じ CA が発行した別の ID（F-220 の SAN の許可リストの試験用）
+    let other_key = KeyPair::generate().unwrap();
+    let op = CertificateParams::new(vec!["other.test".to_string()]).unwrap();
+    let other = op.signed_by(&other_key, &issuer).unwrap();
+    std::fs::write(dir.join("other.pem"), other.pem()).unwrap();
+    std::fs::write(dir.join("other.key"), other_key.serialize_pem()).unwrap();
+}
+
+/// TLS で GET して応答の先頭行を返す（サーバ証明書は検証しない。`client` はクライアント証明書の PEM の組）。
+fn tls_get_status_line(
+    port: u16,
+    path: &str,
+    client: Option<(&std::path::Path, &std::path::Path)>,
+) -> std::io::Result<String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let _ = veil::tls_provider::provider::default_provider().install_default();
+    let b = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifyServer));
+    let config = match client {
+        Some((cert, key)) => {
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            let key = PrivateKeyDer::from_pem_file(key).unwrap();
+            b.with_client_auth_cert(certs, key).unwrap()
+        }
+        None => b.with_no_client_auth(),
+    };
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), name)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let sock = connect_local(port, Duration::from_secs(2))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+    write!(
+        tls,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    tls.flush()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tls.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if buf.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    Ok(text.lines().next().unwrap_or("").to_string())
+}
+
+#[derive(Debug)]
+struct NoVerifyServer;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifyServer {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        veil::tls_provider::provider::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// `[tls] client_auth = "require"` のサーバは証明書の無いクライアントを拒否し、`client_ca` が発行した証明書なら受ける。
+/// その前段の veil は `tls_client_cert`・`tls_client_key`・`tls_ca`・`expected_san`（URI SAN）で上流へ mTLS で
+/// 接続でき、`expected_san` が合わない上流は 502 になる。
+#[test]
+fn f217_toml_mtls_server_client_auth_and_upstream_client_cert() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki = dir.path();
+    write_mtls_pki(pki);
+    let www = pki.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "hello").unwrap();
+    std::fs::write(www.join("ok"), "hello").unwrap();
+    std::fs::write(www.join("bad"), "hello").unwrap();
+
+    // 受け側: mTLS 必須の TLS サーバ
+    let up_port = free_port();
+    let up_dir = pki.join("up");
+    std::fs::create_dir_all(&up_dir).unwrap();
+    let up_cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{up_port}"
+threads = 1
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+client_auth = "require"
+client_ca = "{p}/ca.pem"
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        p = tp(pki),
+        www = tp(&www),
+    );
+    std::fs::write(up_dir.join("config.toml"), up_cfg).unwrap();
+    let mut up = VeilProcess::spawn(&up_dir.join("config.toml"), &[], &[]);
+    assert!(
+        wait_for_port(up_port, Duration::from_secs(20)),
+        "{}",
+        up.log()
+    );
+
+    let no_cert = tls_get_status_line(up_port, "/ok", None);
+    assert!(
+        !matches!(&no_cert, Ok(l) if l.starts_with("HTTP/1.1 200")),
+        "client without a certificate must be rejected: {:?}",
+        no_cert
+    );
+    let with_cert = tls_get_status_line(
+        up_port,
+        "/ok",
+        Some((&pki.join("client.pem"), &pki.join("client.key"))),
+    )
+    .unwrap_or_else(|e| panic!("mTLS request failed: {e}\n{}", up.log()));
+    assert!(with_cert.starts_with("HTTP/1.1 200"), "{with_cert}");
+
+    // 送り側: 平文で受けて上流へ mTLS
+    let front_port = free_port();
+    let front_dir = pki.join("front");
+    std::fs::create_dir_all(&front_dir).unwrap();
+    let front_cfg = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{front_port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/ok"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:{up_port}"
+tls_client_cert = "{p}/client.pem"
+tls_client_key = "{p}/client.key"
+tls_ca = "{p}/ca.pem"
+expected_san = ["spiffe://test/server"]
+[[route]]
+[route.conditions]
+path = "/bad"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:{up_port}"
+tls_client_cert = "{p}/client.pem"
+tls_client_key = "{p}/client.key"
+tls_ca = "{p}/ca.pem"
+expected_san = ["spiffe://test/other"]
+"#,
+        p = tp(pki),
+    );
+    std::fs::write(front_dir.join("config.toml"), front_cfg).unwrap();
+    let mut front = VeilProcess::spawn(&front_dir.join("config.toml"), &[], &[]);
+    assert!(
+        wait_for_port(front_port, Duration::from_secs(20)),
+        "{}",
+        front.log()
+    );
+
+    let ok = http1_get(front_port, "/ok").expect("front /ok");
+    if ok.status != 200 {
+        front.terminate(Duration::from_secs(5));
+        up.terminate(Duration::from_secs(5));
+        panic!(
+            "proxy over mTLS failed: {}\nfront:\n{}\nupstream:\n{}",
+            ok.status,
+            front.log(),
+            up.log()
+        );
+    }
+    assert_eq!(ok.text(), "hello");
+    let bad = http1_get(front_port, "/bad").expect("front /bad");
+    assert_eq!(bad.status, 502, "upstream with a different SAN must fail");
+}
+
+// ===================== F-219（TOML のルート単位のトラフィック制御） =====================
+
+/// 固定応答（`type = "Respond"`）・重み付き分割・フォルトの中断・CORS のプリフライトを、HTTP/1.1 と h2c で確かめる。
+/// 分割先は同じ veil の別ルート（`/a`・`/b` の固定応答）。
+#[test]
+fn f219_route_traffic_respond_split_fault_cors() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+threads = 1
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+path = "/a"
+[route.action]
+type = "Respond"
+body = "A"
+
+[[route]]
+[route.conditions]
+path = "/b"
+[route.action]
+type = "Respond"
+body = "B"
+
+[[route]]
+[route.conditions]
+path = "/direct"
+[route.action]
+type = "Respond"
+status = 418
+body = "teapot"
+content_type = "text/plain"
+
+[[route]]
+[route.conditions]
+path = "/split"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/a"
+[route.traffic]
+split = [
+  {{ url = "http://127.0.0.1:{port}/a", weight = 80 }},
+  {{ url = "http://127.0.0.1:{port}/b", weight = 20 }},
+]
+
+[[route]]
+[route.conditions]
+path = "/fault"
+[route.action]
+type = "Respond"
+body = "not aborted"
+[route.traffic.fault]
+abort_status = 503
+abort_percent = 100
+
+[[route]]
+[route.conditions]
+path = "/cors"
+[route.action]
+type = "Respond"
+body = "actual"
+[route.traffic.cors]
+allow_origins = ["https://a.example"]
+allow_methods = ["GET", "POST"]
+max_age_secs = 600
+"#
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    // 固定応答
+    let r = http1_get(port, "/direct").unwrap();
+    assert_eq!(r.status, 418);
+    assert_eq!(r.text(), "teapot");
+    assert_eq!(r.header("content-type"), Some("text/plain"));
+    let (st, body) = h2c_get(port, "/direct");
+    assert_eq!((st, body.as_slice()), (418, &b"teapot"[..]));
+
+    // 重み付き分割（80:20）
+    let mut a = 0;
+    let n = 200;
+    for _ in 0..n {
+        let r = http1_get(port, "/split").unwrap();
+        assert_eq!(r.status, 200, "{}", veil.log());
+        match r.text().as_str() {
+            "A" => a += 1,
+            "B" => {}
+            other => panic!("unexpected body {other:?}"),
+        }
+    }
+    assert!((130..=190).contains(&a), "A={a} of {n}");
+    let (st, _) = h2c_get(port, "/split");
+    assert_eq!(st, 200);
+
+    // フォルトの中断（100%）。h2c はストリーミングの下見を通る経路でも 1 回だけ判定する
+    assert_eq!(http1_get(port, "/fault").unwrap().status, 503);
+    let (st, body) = h2c_get(port, "/fault");
+    assert_eq!((st, body.as_slice()), (503, &b"fault filter abort"[..]));
+
+    // CORS のプリフライト（一覧のオリジンだけ）。プリフライトでない要求は action のまま
+    let pre = http1_request(
+        port,
+        "OPTIONS",
+        "/cors",
+        &[
+            ("Origin", "https://a.example"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(pre.status, 200);
+    assert_eq!(
+        pre.header("access-control-allow-origin"),
+        Some("https://a.example")
+    );
+    assert_eq!(pre.header("access-control-allow-methods"), Some("GET,POST"));
+    assert_eq!(pre.header("access-control-max-age"), Some("600"));
+    let other = http1_request(
+        port,
+        "OPTIONS",
+        "/cors",
+        &[
+            ("Origin", "https://evil.example"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        b"",
+    )
+    .unwrap();
+    assert!(other.header("access-control-allow-origin").is_none());
+    assert_eq!(http1_get(port, "/cors").unwrap().text(), "actual");
+}
+
+// ===================== F-220（TOML の JWT・ID による認可） =====================
+
+/// テスト用: ES256 の鍵で payload に署名したトークンと、その JWKS。
+#[cfg(all(feature = "jwt", not(any(target_os = "openbsd", target_os = "netbsd"))))]
+fn es256_token(payload: &str) -> (String, String) {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    fn enc(b: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for ch in b.chunks(3) {
+            let n = (ch[0] as u32) << 16
+                | (*ch.get(1).unwrap_or(&0) as u32) << 8
+                | *ch.get(2).unwrap_or(&0) as u32;
+            for i in 0..(ch.len() + 1) {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+    let pt = kp.public_key().as_ref();
+    let jwks = format!(
+        r#"{{"keys":[{{"kty":"EC","crv":"P-256","kid":"k1","x":"{}","y":"{}"}}]}}"#,
+        enc(&pt[1..33]),
+        enc(&pt[33..65])
+    );
+    let input = format!(
+        "{}.{}",
+        enc(br#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#),
+        enc(payload.as_bytes())
+    );
+    let sig = kp.sign(&rng, input.as_bytes()).unwrap();
+    (format!("{}.{}", input, enc(sig.as_ref())), jwks)
+}
+
+/// `[route.jwt]`: トークンの無い要求・検証できない要求は 401、claim の条件に合わない要求は 403、正しい要求は
+/// action へ（HTTP/1.1・h2c）。`[tls] client_allowed_sans`: 同じ CA の証明書でも一覧に無い ID はハンドシェイクで拒否。
+#[cfg(all(feature = "jwt", not(any(target_os = "openbsd", target_os = "netbsd"))))]
+#[test]
+fn f220_route_jwt_and_client_allowed_sans() {
+    let dir = tempfile::tempdir().unwrap();
+    let (good, jwks) = es256_token(
+        r#"{"iss":"https://issuer.test","aud":"api","exp":4000000000,"sub":"alice","scope":"read write"}"#,
+    );
+    // 同じ鍵の別のトークンは作れないので、claim 違いは別の鍵で作り JWKS を 2 本にする
+    let (no_scope, jwks2) = es256_token(
+        r#"{"iss":"https://issuer.test","aud":"api","exp":4000000000,"sub":"bob","scope":"write"}"#,
+    );
+    let k1: serde_json::Value = serde_json::from_str(&jwks).unwrap();
+    let mut k2: serde_json::Value = serde_json::from_str(&jwks2).unwrap();
+    k2["keys"][0]["kid"] = serde_json::Value::String("k1".into());
+    let both = serde_json::json!({"keys": [k1["keys"][0].clone(), k2["keys"][0].clone()]});
+    let jwks_path = dir.path().join("jwks.json");
+    std::fs::write(&jwks_path, both.to_string()).unwrap();
+    let (other_iss, _) = es256_token(r#"{"iss":"https://evil.test","aud":"api"}"#);
+
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+threads = 1
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+path = "/api"
+[route.action]
+type = "Respond"
+body = "secret"
+[route.jwt]
+issuer = "https://issuer.test"
+audiences = ["api"]
+jwks_path = "{jwks}"
+require_claims = {{ scope = ["read"] }}
+"#,
+        jwks = tp(&jwks_path)
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    let get = |auth: Option<String>| {
+        let h: Vec<(&str, String)> = auth.map(|a| vec![("Authorization", a)]).unwrap_or_default();
+        let hr: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        http1_request(port, "GET", "/api", &hr, b"").unwrap()
+    };
+    let r = get(None);
+    assert_eq!(r.status, 401, "{}", veil.log());
+    assert!(r.header("www-authenticate").is_some());
+    assert_eq!(get(Some("Bearer garbage".into())).status, 401);
+    assert_eq!(get(Some(format!("Bearer {other_iss}"))).status, 401);
+    assert_eq!(get(Some(format!("Bearer {no_scope}"))).status, 403);
+    let ok = get(Some(format!("Bearer {good}")));
+    assert_eq!((ok.status, ok.text().as_str()), (200, "secret"));
+    // h2c（ストリーミングの下見を通る経路）でもトークンが無ければ 401
+    let (st, _) = h2c_get(port, "/api");
+    assert_eq!(st, 401);
+
+    // ID による認可（ハンドシェイク）
+    let pki = dir.path().join("pki");
+    std::fs::create_dir_all(&pki).unwrap();
+    write_mtls_pki(&pki);
+    let www = pki.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "hello").unwrap();
+    let tls_port = free_port();
+    let tls_cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+threads = 1
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+client_auth = "require"
+client_ca = "{p}/ca.pem"
+client_allowed_sans = ["client.test"]
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        p = tp(&pki),
+        www = tp(&www)
+    );
+    let tls_cfg_path = pki.join("config.toml");
+    std::fs::write(&tls_cfg_path, tls_cfg).unwrap();
+    let tls_veil = VeilProcess::spawn(&tls_cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        tls_veil.log()
+    );
+    let allowed = tls_get_status_line(
+        tls_port,
+        "/",
+        Some((&pki.join("client.pem"), &pki.join("client.key"))),
+    )
+    .unwrap_or_else(|e| panic!("allowed identity rejected: {e}\n{}", tls_veil.log()));
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    let denied = tls_get_status_line(
+        tls_port,
+        "/",
+        Some((&pki.join("other.pem"), &pki.join("other.key"))),
+    );
+    assert!(
+        !matches!(&denied, Ok(l) if l.starts_with("HTTP/1.1 200")),
+        "identity outside client_allowed_sans must be rejected: {denied:?}"
+    );
+}

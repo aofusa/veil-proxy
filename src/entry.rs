@@ -136,6 +136,17 @@ pub fn run() {
         std::process::exit(crate::connect_broker::broker_main());
     }
 
+    // F-222: Istio の pilot-agent から Envoy として起動された（argv[0] が envoy・`veil envoy ...`）
+    #[cfg(feature = "mesh-istio")]
+    if let Some(args) = crate::mesh::envoy_invocation() {
+        std::process::exit(crate::mesh::envoy::main(args));
+    }
+    // Linkerd のプロキシ（イメージの /usr/lib/linkerd/linkerd2-proxy を veil にする。F-223）
+    #[cfg(feature = "mesh-linkerd")]
+    if crate::mesh::linkerd_invocation() {
+        std::process::exit(crate::mesh::linkerd::main());
+    }
+
     // コマンドライン引数を解析（--help, --version は clap が自動処理）
     let cli_args = CliArgs::parse();
 

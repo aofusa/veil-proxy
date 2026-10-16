@@ -1,6 +1,6 @@
 # F-225: メッシュの試験・計測基盤（kind・混在・conformance・Envoy / linkerd2-proxy との比較）
 
-**状態: 未着手（2026-10-14 起票・設計。親 F-215。最初に着手する）**
+**状態: 完了（feat/mesh-dataplane-impl、2026-10-15）**
 
 ## 目的
 
@@ -43,6 +43,17 @@
 
 - stock の Istio・Linkerd で全スイートが通る（台本の正しさの確認）こと、ベースラインの計測値が記録されていること。
 - 以降の各チケット（F-216〜F-224）の受け入れ条件はこの基盤のスイートで判定する。
+
+
+## 実装の結果
+
+- `tools/k8s/mesh-e2e.sh`（smoke・tasks・gateway・telemetry・wasm・ambient・observe・chaos）、`linkerd-e2e.sh`（smoke・tasks・ops・
+  certs・viz）、`mesh-gateway-conformance.sh`、`mesh-bench.sh`（サイドカーとゲートウェイ）、`linkerd-bench.sh`、`mesh-fixtures.sh`、
+  `mesh-syscalls.sh`。stock で全スイートが通ることを確かめてから veil / mixed で通した。
+- カオス: 負荷の最中の istiod の再起動と Pod の削除、istiod の停止中も前の設定で流れ戻れば新しい設定が届く、プロキシの kill からの復帰。
+- 最終の結果（musl のイメージ、2026-10-16）: Istio の all（smoke・tasks・gateway・telemetry・wasm・ambient・observe・chaos）は
+  veil 87/87・mixed 87/87、Linkerd の all は veil 39/39・mixed 39/39・stock 38/38、Gateway API の conformance は veil で全部合格。
+- 性能（docs/perf/README.md の「サービスメッシュ」）: Istio のサイドカーの HTTP/1.1 の最大 3,221 → 6,732 rps、Linkerd 4,109 → 7,261 rps。
 
 ## 関連
 

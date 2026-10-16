@@ -22,6 +22,7 @@
 | VDS: 制御プレーンからの動的ルート配信 | [docs/guide/ja/vds.md](vds.md)（[スキーマ](../vds-schema.json)） |
 | ACME: 証明書の自動発行・更新 | [docs/guide/ja/acme.md](acme.md) |
 | Kubernetes（サイドカー、Istio / Linkerd） | [docs/guide/ja/kubernetes.md](kubernetes.md) |
+| サービスメッシュのデータプレーン（Envoy・linkerd2-proxy の代わりに veil） | [docs/guide/ja/mesh.md](mesh.md) |
 | メトリクス・トレーシング・ログ | [docs/guide/ja/observability.md](observability.md) |
 | 管理 API・キャッシュ Purge API | [docs/guide/ja/admin-api.md](admin-api.md) |
 | セキュリティとサンドボックス | [docs/guide/ja/security.md](security.md) |

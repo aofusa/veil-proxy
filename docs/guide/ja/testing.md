@@ -143,6 +143,11 @@ cargo bench --bench wasm --features wasm
 | ACME | `tests/acme/pebble_e2e.sh` | Pebble から HTTP-01 で発行してホットリロード（docker が必要） |
 | コンテナ | `examples/container/e2e.sh` | Docker secrets・環境変数の上書き・証明書の差し替え・graceful stop（ビルド済みイメージが必要） |
 | Kubernetes | `tools/k8s/kind-e2e.sh <musl\|glibc> <plain\|istio\|linkerd\|all>` | kind 上の Istio / Linkerd メッシュ内のサイドカー（[kubernetes.md](kubernetes.md)） |
+| サービスメッシュ（Istio） | `tools/k8s/mesh-e2e.sh <stock\|veil\|mixed> <smoke\|tasks\|gateway\|telemetry\|wasm\|ambient\|observe\|chaos\|all>` | Envoy の代わりの veil: サイドカー・ゲートウェイ・waypoint・bookinfo と Kiali / Grafana / Jaeger・カオス（[mesh.md](mesh.md)） |
+| サービスメッシュ（Linkerd） | `tools/k8s/linkerd-e2e.sh <stock\|veil\|mixed> <smoke\|tasks\|ops\|certs\|viz\|all>` | linkerd2-proxy の代わりの veil（[mesh.md](mesh.md)） |
+| Gateway API の conformance | `tools/k8s/mesh-gateway-conformance.sh <stock\|veil>` | Istio の GatewayClass で GATEWAY-HTTP（コアと Istio が対応する拡張機能） |
+| istiod の xDS のフィクスチャ | `cargo test --test mesh_istio_fixtures --features mesh-istio` | `tools/k8s/mesh-fixtures.sh` で保存した xDS の変換（NACK が無い・主な設定） |
+| サービスメッシュの性能 | `tools/k8s/mesh-bench.sh [rounds] [duration]` | fortio で veil と Envoy のサイドカーを比べる（[mesh.md](mesh.md)） |
 
 ### テストカバレッジ
 

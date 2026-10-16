@@ -161,6 +161,53 @@ Changing these keys requires a restart (certificate reloads keep the mode chosen
 > with `"cache"`. Current OpenSSL, BoringSSL, NSS, Go and rustls clients resume normally; if a
 > fleet of such legacy clients matters more than unbounded TLS 1.3 resumption, use `"cache"`.
 
+## Client Certificates and Upstream mTLS (F-217)
+
+### Requiring client certificates
+
+```toml
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path  = "/etc/veil/key.pem"
+client_auth = "require"            # "none" (default) | "optional" | "require"
+client_ca   = "/etc/veil/client-ca.pem"
+client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # optional (F-220)
+```
+
+- `"require"` rejects clients that send no certificate, or one that does not chain to `client_ca`, during the
+  handshake. `"optional"` asks for a certificate but also accepts clients without one (a certificate that is
+  sent is still verified).
+- Applies to TLS over TCP (HTTP/1.1 and HTTP/2). Combining it with `[http3]` is a startup error, because QUIC
+  clients would bypass the check.
+- `client_allowed_sans` accepts only certificates with one of the listed SANs (DNS name, URI or IP), checked once
+  during the handshake; other identities from the same CA are rejected. It needs `client_auth = "optional"` or
+  `"require"`.
+- Certificate hot reload keeps the startup `client_auth` / `client_ca` / `client_allowed_sans`; changing them needs a
+  restart.
+
+### Client certificates towards upstreams
+
+`[upstreams.<name>]` and the `Proxy` action accept:
+
+| Key | Meaning |
+|-----|---------|
+| `tls_client_cert` / `tls_client_key` | client certificate and key (PEM) presented to the upstream; set both |
+| `tls_ca` | trust anchors (PEM) for the upstream certificate; the public roots when omitted |
+| `expected_san` | accepted SANs of the upstream certificate (DNS name, URI or IP; any match). When set, it replaces the host name check, e.g. for SPIFFE IDs |
+
+```toml
+[upstreams.backend]
+servers = ["https://10.0.0.5:8443"]
+tls_client_cert = "/etc/veil/upstream-client.pem"
+tls_client_key  = "/etc/veil/upstream-client.key"
+tls_ca          = "/etc/veil/upstream-ca.pem"
+expected_san    = ["spiffe://cluster.local/ns/default/sa/backend"]
+```
+
+The TLS configuration is built when the configuration is loaded (not per connection). Pooled connections are
+keyed by it, so upstreams with different client certificates never share a connection. A `SIGHUP` reload picks up
+replaced certificate files. These keys take precedence over `tls_insecure`.
+
 ## TLS Certificate Hot Reload
 
 Zero-downtime certificate rotation without restarting the proxy.

@@ -186,8 +186,15 @@ pub mod simple_tls;
 /// `veil_ktls` の有無に関わらず常にコンパイルする。
 pub(crate) mod tls_writev;
 
+#[cfg(feature = "jwt")]
+pub mod jwt_verify;
+pub mod route_traffic;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 pub mod tls_provider;
+/// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
+pub mod upstream_tls;
+/// X.509 の SAN の取り出し（メッシュの mTLS・上流の mTLS の `expected_san`。F-217）
+pub mod x509_san;
 
 /// リッスンアドレス表現（F-164: `unix:<path>` UDS 対応）。`config`/`server`/`entry` の
 /// いずれからも参照するためクレートルート直下に置く。
@@ -205,6 +212,10 @@ pub mod tls_reload;
 /// VDS（Veil Discovery Service）: 制御プレーンからの動的設定配信（F-04）。
 #[cfg(feature = "vds")]
 pub mod vds;
+
+// サービスメッシュのデータプレーン（F-215。Istio の Envoy・Linkerd のプロキシの置き換え）
+#[cfg(feature = "mesh")]
+pub mod mesh;
 
 // tokio 互換レイヤー（F-198、API ライブラリ専用）。2 つの実装は排他。
 #[cfg(all(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
