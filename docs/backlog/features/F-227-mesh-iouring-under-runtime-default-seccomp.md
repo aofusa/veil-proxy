@@ -24,6 +24,9 @@
 
 ## 段階 1 の設計: 起動時に epoll 版へ切り替える
 
+（2026-10-16 追記）同じ切り替えを、一般のコンテナイメージのために F-237 で `src/entry.rs` に入れる（環境変数は
+`VEIL_FALLBACK_BIN`）。F-237 が先に入れば、本チケットはメッシュのイメージに epoll 版を同梱し、同じ関数を呼ぶだけになる。
+
 **採る案:** イメージに両方のバイナリを入れる。io_uring 版が起動時に io_uring を使えなければ、epoll 版を `execve(2)` する。
 
 - 配置: `/usr/lib/linkerd/linkerd2-proxy`（io_uring 版）と `/usr/lib/linkerd/linkerd2-proxy.epoll`（epoll 版）。
