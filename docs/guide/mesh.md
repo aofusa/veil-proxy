@@ -121,6 +121,11 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
 - ztunnel (ambient L4) is not replaced. Linkerd's multicluster gateways (`authority_override`) and the legacy
   `ServiceProfile` routes (`GetProfile`) are not used; Linkerd's current `HTTPRoute`-based policies are.
 - Tap events are emitted when a request completes (the three events of a request carry the same timing).
+- `ext_authz` (Istio's `CUSTOM` AuthorizationPolicy action) is not implemented; a listener that needs it is rejected.
+- The ambient waypoint was tested with whoami workloads, not with bookinfo. Transparent interception was tested inside
+  kind pods (istio-init / linkerd-init iptables), not in a local network namespace.
+- The per-route request timeout, conditional retries, mirroring and fault delay exist in the mesh only; plain TOML
+  routes do not have them yet (F-226).
 
 ## Performance
 

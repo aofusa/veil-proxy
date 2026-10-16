@@ -113,6 +113,11 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 - ztunnel（ambient の L4）は置き換えない。Linkerd のマルチクラスタのゲートウェイ（`authority_override`）と、古い
   `ServiceProfile` のルート（`GetProfile`）は使わない（現在の `HTTPRoute` のポリシーを使う）。
 - tap のイベントは要求が終わったときに出す（1 本の要求の 3 つのイベントは同じ時刻を持つ）。
+- `ext_authz`（Istio の AuthorizationPolicy の `CUSTOM`）は未対応。それを要るリスナーは拒否する。
+- ambient の waypoint は whoami のワークロードで試した（bookinfo ではない）。透過転送は kind の Pod の中（istio-init /
+  linkerd-init の iptables）で試した（手元の network namespace ではない）。
+- ルート単位の要求のタイムアウト・条件付きリトライ・ミラー・フォルトの遅延はメッシュだけにある。メッシュ無しの TOML の
+  ルートにはまだ無い（F-226）。
 
 ## 性能
 
