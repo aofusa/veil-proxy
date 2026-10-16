@@ -44,7 +44,7 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
 `epoll` は readiness reactor を選ぶ（コンテナの既定の seccomp は io_uring を拒否する）。`wasm` は Istio の WasmPlugin に
 要る。`epoll` を付けないビルドは io_uring を使う。Istio のサイドカーでは動く（注入される `istio-proxy` のコンテナには seccomp の
 指定が無い。smoke と tasks のスイートで確認）が、Linkerd では動かない（注入がプロキシに `seccompProfile: RuntimeDefault` を
-付ける。veil はその旨を出して起動時に終わる）。試験した版は Istio 1.31.1 と Linkerd edge-26.10.1（proxy v2.370.0）。
+付ける。veil はその旨を出して起動時に終わる。F-227）。試験した版は Istio 1.31.1 と Linkerd edge-26.10.1（proxy v2.370.0）。
 
 ## Istio
 
@@ -110,12 +110,12 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 - veil が実装していない Envoy のフィルタは、任意（optional）の指定が無ければ拒否（NACK）する。Envoy と同じく前の設定の
   まま動く。`config_dump` は istioctl が読む項目を返し、全項目ではない。
 - X.509 v1 のクライアント証明書は受け付けない（webpki）。Envoy（BoringSSL）は受け付ける。メッシュが発行する証明書は v3。
-- ztunnel（ambient の L4）は置き換えない。Linkerd のマルチクラスタのゲートウェイ（`authority_override`）と、古い
+- ztunnel（ambient の L4）は置き換えない（F-228）。Linkerd のマルチクラスタのゲートウェイ（`authority_override`）と、古い
   `ServiceProfile` のルート（`GetProfile`）は使わない（現在の `HTTPRoute` のポリシーを使う）。
 - tap のイベントは要求が終わったときに出す（1 本の要求の 3 つのイベントは同じ時刻を持つ）。
-- `ext_authz`（Istio の AuthorizationPolicy の `CUSTOM`）は未対応。それを要るリスナーは拒否する。
+- `ext_authz`（Istio の AuthorizationPolicy の `CUSTOM`）は未対応。それを要るリスナーは拒否する（F-229）。
 - ambient の waypoint は whoami のワークロードで試した（bookinfo ではない）。透過転送は kind の Pod の中（istio-init /
-  linkerd-init の iptables）で試した（手元の network namespace ではない）。
+  linkerd-init の iptables）で試した（手元の network namespace ではない。F-230）。
 - ルート単位の要求のタイムアウト・条件付きリトライ・ミラー・フォルトの遅延はメッシュだけにある。メッシュ無しの TOML の
   ルートにはまだ無い（F-226）。
 

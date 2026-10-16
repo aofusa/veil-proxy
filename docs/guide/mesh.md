@@ -47,7 +47,7 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
 `epoll` selects the readiness reactor because the default container seccomp profile rejects io_uring. `wasm` is needed
 for Istio's WasmPlugin. A build without `epoll` uses io_uring: it works for Istio sidecars (the injected `istio-proxy`
 container has no seccomp profile; checked with the smoke and tasks suites), but not for Linkerd, whose injector sets
-`seccompProfile: RuntimeDefault` on the proxy (veil then exits at start-up with a message saying so). The versions tested are Istio 1.31.1 and Linkerd edge-26.10.1 (proxy v2.370.0).
+`seccompProfile: RuntimeDefault` on the proxy (veil then exits at start-up with a message saying so; F-227). The versions tested are Istio 1.31.1 and Linkerd edge-26.10.1 (proxy v2.370.0).
 
 ## Istio
 
@@ -118,12 +118,12 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
   configuration stays in effect, as with Envoy. `config_dump` contains what istioctl reads, not every field.
 - X.509 v1 client certificates are rejected (webpki); Envoy (BoringSSL) accepts them. Certificates issued by the
   meshes are v3.
-- ztunnel (ambient L4) is not replaced. Linkerd's multicluster gateways (`authority_override`) and the legacy
+- ztunnel (ambient L4) is not replaced (F-228). Linkerd's multicluster gateways (`authority_override`) and the legacy
   `ServiceProfile` routes (`GetProfile`) are not used; Linkerd's current `HTTPRoute`-based policies are.
 - Tap events are emitted when a request completes (the three events of a request carry the same timing).
-- `ext_authz` (Istio's `CUSTOM` AuthorizationPolicy action) is not implemented; a listener that needs it is rejected.
+- `ext_authz` (Istio's `CUSTOM` AuthorizationPolicy action) is not implemented; a listener that needs it is rejected (F-229).
 - The ambient waypoint was tested with whoami workloads, not with bookinfo. Transparent interception was tested inside
-  kind pods (istio-init / linkerd-init iptables), not in a local network namespace.
+  kind pods (istio-init / linkerd-init iptables), not in a local network namespace (F-230).
 - The per-route request timeout, conditional retries, mirroring and fault delay exist in the mesh only; plain TOML
   routes do not have them yet (F-226).
 
