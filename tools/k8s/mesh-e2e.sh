@@ -868,7 +868,7 @@ spec:
 EOF
   sleep 8
   local tid j
-  tid="$(printf '%032x' $((RANDOM * RANDOM)))"
+  tid="$(printf '%016x' $((RANDOM * RANDOM * RANDOM)))"  # 64 ビット（Envoy は 128 ビットの B3 を 64 ビットで報告することがある）
   cexec curl -s -m 5 -o /dev/null -H "x-b3-traceid: $tid" -H "x-b3-spanid: 00000000000000aa" -H "x-b3-sampled: 1" "http://whoami.$NS/"
   j="$(kubectl -n istio-system get pod -l app=jaeger -o name | head -1)"
   local spans=""
