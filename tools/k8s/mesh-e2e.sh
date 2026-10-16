@@ -305,7 +305,7 @@ EOF
   # 観測（受け側の標準メトリクス）
   local pod
   pod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
-  out="$(kubectl -n "$NS" exec "$pod" -c istio-proxy -- curl -s localhost:15090/stats/prometheus 2>/dev/null | grep '^istio_requests_total' | head -3)" || true
+  out="$(kubectl -n "$NS" exec "$pod" -c istio-proxy -- pilot-agent request GET stats/prometheus 2>/dev/null | grep '^istio_requests_total' | head -3)" || true
   if echo "$out" | grep -q "reporter=\"destination\".*source_workload=\"client\""; then ok "istio_requests_total (destination) has source_workload=client"; else bad "metrics: $out"; fi
   # istiod から見た同期
   out="$(istioctl proxy-status -v 1 -n "$NS" 2>&1)" || true
@@ -425,7 +425,7 @@ EOF
   # Mirroring: fortio への要求を whoami へ複製する（whoami の受け側の istio_requests_total が増える）
   local wpod before after
   wpod="$(kubectl -n "$NS" get pod -l app=whoami -o jsonpath='{.items[0].metadata.name}')"
-  dest_total() { kubectl -n "$NS" exec "$wpod" -c istio-proxy -- curl -s localhost:15090/stats/prometheus 2>/dev/null | grep '^istio_requests_total{reporter="destination"' | awk '{s+=$NF} END{print s+0}'; }
+  dest_total() { kubectl -n "$NS" exec "$wpod" -c istio-proxy -- pilot-agent request GET stats/prometheus 2>/dev/null | grep '^istio_requests_total{reporter="destination"' | awk '{s+=$NF} END{print s+0}'; }
   before="$(dest_total)"
   cexec sh -c 'for i in $(seq 10); do curl -s -m 5 -o /dev/null "$0"; done' "http://fortio.$NS:8080/echo"
   after="$before"
@@ -744,7 +744,7 @@ EOF
   kubectl -n "$NS" rollout status deploy/egress --timeout=240s >/dev/null || bad "egress deploy"
   if retry 90 sh -c "kubectl -n $NS exec deploy/client -c curl -- curl -s -m 5 --resolve ext.example.com:80:240.240.0.1 http://ext.example.com/ | grep -q '^Hostname: plain'"; then
     ok "egress gateway: mesh -> egress -> external service"; else bad "egress gateway: $(cexec curl -s -m 5 -o /dev/null -w '%{http_code}' --resolve ext.example.com:80:240.240.0.1 http://ext.example.com/)"; fi
-  out="$(kubectl -n "$NS" exec deploy/egress -- curl -s localhost:15000/stats/prometheus 2>/dev/null | grep istio_requests_total | grep -c 'ext.example.com')" || true
+  out="$(kubectl -n "$NS" exec deploy/egress -- pilot-agent request GET stats/prometheus 2>/dev/null | grep istio_requests_total | grep -c 'ext.example.com')" || true
   if [ "${out:-0}" -gt 0 ]; then ok "egress gateway reports the external request"; else bad "egress gateway metrics: no ext.example.com"; fi
   kubectl -n "$NS" delete virtualservice via-egress >/dev/null 2>&1
   kubectl -n "$NS" delete gateway.networking.istio.io egress-gw >/dev/null 2>&1
