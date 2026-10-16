@@ -135,6 +135,7 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
         let addr = listener.local_addr().expect("local_addr should succeed");
+        // 理由付き allow: テストのループバック接続の準備（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         let stream = std::net::TcpStream::connect(addr).expect("connect should succeed");
         drop(listener);

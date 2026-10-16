@@ -1516,6 +1516,7 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
         let addr = listener.local_addr().expect("local_addr should succeed");
+        // 理由付き allow: テストのループバック接続の準備・模擬サーバの起動待ち（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         let stream = TcpStream::connect(addr).expect("connect should succeed");
         stream.set_nonblocking(true).expect("set_nonblocking");
@@ -1725,6 +1726,7 @@ mod tests {
         // --- 旧方式: execute_grpc_unary_call（1 呼び出し 1 接続） ---
         let accepted_fresh = Arc::new(AtomicUsize::new(0));
         let (port_fresh, _server_fresh) = spawn_mock_grpc_server(accepted_fresh.clone());
+        // 理由付き allow: テストのループバック接続の準備・模擬サーバの起動待ち（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_millis(50));
 
@@ -1742,6 +1744,7 @@ mod tests {
             assert!(result.is_ok(), "unary call should succeed: {result:?}");
         }
         let elapsed_fresh = start_fresh.elapsed();
+        // 理由付き allow: テストのループバック接続の準備・模擬サーバの起動待ち（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_millis(100));
         let conns_fresh = accepted_fresh.load(Ordering::SeqCst);
@@ -1749,6 +1752,7 @@ mod tests {
         // --- 新方式: GrpcRunner（接続プール） ---
         let accepted_pooled = Arc::new(AtomicUsize::new(0));
         let (port_pooled, _server_pooled) = spawn_mock_grpc_server(accepted_pooled.clone());
+        // 理由付き allow: テストのループバック接続の準備・模擬サーバの起動待ち（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_millis(50));
 
@@ -1811,6 +1815,7 @@ mod tests {
             }
         }
         let elapsed_pooled = start_pooled.elapsed();
+        // 理由付き allow: テストのループバック接続の準備・模擬サーバの起動待ち（データプレーンではない）
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_millis(100));
         let conns_pooled = accepted_pooled.load(Ordering::SeqCst);

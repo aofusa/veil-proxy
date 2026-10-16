@@ -1633,6 +1633,7 @@ mod tests {
 
     /// REFUSED_STREAM は再送してよい失敗、それ以外の RST_STREAM は再送しない失敗になる。
     #[test]
+    // 理由付き allow: テストの模擬上流サーバ（std の同期ソケット・スレッド。データプレーンではない）
     #[allow(clippy::disallowed_methods)]
     fn f174_refused_stream_is_retryable() {
         if !runtime_available() {
@@ -1681,6 +1682,7 @@ mod tests {
     /// SETTINGS_MAX_CONCURRENT_STREAMS に達した接続には新しいストリームを割り当てず、
     /// ストリームが終われば再び割り当てる。
     #[test]
+    // 理由付き allow: テストの模擬上流サーバ（std の同期ソケット・スレッド。データプレーンではない）
     #[allow(clippy::disallowed_methods)]
     fn f174_respects_max_concurrent_streams() {
         if !runtime_available() {
@@ -1745,6 +1747,7 @@ mod tests {
 
     /// 応答の途中でハンドルを捨てると RST_STREAM(CANCEL) を送り、接続は他のストリームに使える。
     #[test]
+    // 理由付き allow: テストの模擬上流サーバ（std の同期ソケット・スレッド。データプレーンではない）
     #[allow(clippy::disallowed_methods)]
     fn f174_dropping_stream_sends_cancel() {
         if !runtime_available() {
