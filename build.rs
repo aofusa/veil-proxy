@@ -52,7 +52,10 @@ fn check_aws_lc_no_prefix() {
         .unwrap_or_default();
     let v = value.trim().to_ascii_lowercase();
     let truthy = !v.is_empty()
-        && !(v.starts_with('0') || v.starts_with('n') || v.starts_with("off") || v.starts_with('f'));
+        && !(v.starts_with('0')
+            || v.starts_with('n')
+            || v.starts_with("off")
+            || v.starts_with('f'));
     if !truthy {
         panic!(
             "veil-proxy: the `http3` feature on Linux needs aws-lc-sys built without symbol prefixes.\n\

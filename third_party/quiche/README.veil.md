@@ -82,3 +82,13 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 `[lints.rust]` で allow しない理由: この lint を知らない古い rustc（BSD の pkg 版など）で
 `unknown lint` 警告に変わるだけになるため。呼び出し側は戻り値を使っておらず、ABI 上も
 `()` と `void` は等価。
+
+## 公開用の変更（F-238）
+
+veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
+
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.1`（`[lib] name = "quiche"` はそのまま）。
+  既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
+  `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
+- `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
+- ソースの差分は上の「差分」の節のまま。
