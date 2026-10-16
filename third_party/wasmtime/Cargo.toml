@@ -18,7 +18,8 @@ rust-version = "1.86.0"
 # 相互排他な別パッケージとして扱う必要がある。cargo が --extern に渡すのは
 # lib ターゲット名なので、パッケージ名を変えても `use wasmtime::…` は無変更で動く。
 # 詳細は third_party/wasmtime/README.veil.md 参照。
-name = "veil-wasmtime"
+# veil: 公開名（F-238。`[lib] name = "wasmtime"` はそのまま）
+name = "veil-proxy-wasmtime"
 version = "36.0.17"
 authors = ["The Wasmtime Project Developers"]
 build = "build.rs"
@@ -27,11 +28,12 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "High-level API to expose the Wasmtime runtime"
+description = "wasmtime 36.0.17 vendored for veil-proxy on NetBSD and FreeBSD/OpenBSD aarch64 (Pulley only; see README.veil.md)"
 documentation = "https://docs.rs/wasmtime"
 readme = "README.md"
 license = "Apache-2.0 WITH LLVM-exception"
-repository = "https://github.com/bytecodealliance/wasmtime"
+repository = "https://github.com/aofusa/veil-proxy"
+homepage = "https://github.com/bytecodealliance/wasmtime"
 resolver = "2"
 
 [package.metadata.docs.rs]

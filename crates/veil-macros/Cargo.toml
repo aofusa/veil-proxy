@@ -1,5 +1,5 @@
 [package]
-name = "veil-macros"
+name = "veil-proxy-macros"
 version.workspace = true
 edition.workspace = true
 description = "Procedural macros for the veil API server library (#[veil::route], #[veil::main], #[derive(veil::Schema)])"
@@ -8,6 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [lib]
+name = "veil_macros"
 proc-macro = true
 
 [dependencies]

@@ -9,7 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
-veil = { path = "../../..", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 
 [patch.crates-io]
