@@ -775,6 +775,11 @@ pub(super) async fn handle_requests(
                 );
                 if let Some(resp) = check.http1_response() {
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(resp.to_vec())).await;
+                    // 本文をまだ受け取り切っていない要求（413 等）は、未読のまま閉じると RST になり、
+                    // 書いた応答がクライアントに届かないことがある（macOS で再現）。読み捨ててから閉じる（B-102）
+                    if is_chunked || content_length > accumulated.len() {
+                        lingering_drain_before_close(&mut tls_stream).await;
+                    }
                     return;
                 }
 
