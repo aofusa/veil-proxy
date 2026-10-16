@@ -309,7 +309,10 @@ fn chance(per_million: u32) -> bool {
 #[cfg(feature = "wasm")]
 pub type WasmRan = super::wasm::Ran;
 #[cfg(not(feature = "wasm"))]
-pub type WasmRan = ();
+/// Wasm 無しのビルドの置き物（`()` や単位構造体だと `let ran = WasmRan::default()` が clippy の
+/// let_unit_value / default_constructed_unit_structs になる）
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WasmRan(());
 
 /// 要求の可変の部分（Wasm のフィルタがヘッダ・疑似ヘッダを書き換える）。
 pub struct ReqParts<'a> {

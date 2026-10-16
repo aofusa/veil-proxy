@@ -105,6 +105,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(all(
     feature = "jemalloc",
     not(veil_alloc_active),
+    not(feature = "mimalloc"),
     not(any(feature = "handler", feature = "tokio-compat"))
 ))]
 use tikv_jemallocator::Jemalloc;

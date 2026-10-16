@@ -3863,15 +3863,6 @@ where
     (status, sent, req_size)
 }
 
-/// 管理 API の `GET {path_prefix}/vds`（F-211）。VDS が無効・未対応のビルドでは `{"enabled":false}`。
-#[cfg(feature = "admin")]
-pub(super) fn admin_vds_json() -> String {
-    #[cfg(feature = "vds")]
-    return crate::vds::status_json();
-    #[cfg(not(feature = "vds"))]
-    return "{\"enabled\":false}".to_string();
-}
-
 /// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す。
 #[cfg(all(feature = "http2", feature = "admin"))]
 pub(super) fn h2_admin_response(

@@ -439,6 +439,44 @@ fn request_line_is_idempotent(request: &[u8]) -> bool {
     crate::http_utils::is_idempotent_method(&request[..method_end])
 }
 
+// HTTP/1.1・HTTP/2 の両方から使う（F-233 の分割で http2 の子に入っていた）
+/// 管理 API の `GET {path_prefix}/vds`（F-211）。VDS が無効・未対応のビルドでは `{"enabled":false}`。
+#[cfg(feature = "admin")]
+fn admin_vds_json() -> String {
+    #[cfg(feature = "vds")]
+    return crate::vds::status_json();
+    #[cfg(not(feature = "vds"))]
+    return "{\"enabled\":false}".to_string();
+}
+
+/// スレッドローカルの zstd 圧縮コンテキストを使い回して `body` を圧縮する。
+/// 失敗したら `None`（呼び出し側が無圧縮へフォールバックする）。
+///
+/// B-99: HTTP/1.1 のプロキシ圧縮経路（`transfer_compressed_response` /
+/// `transfer_https_compressed_response`）は F-169 の後も `zstd::encode_all`（呼び出しごとに
+/// コンテキストを確保・初期化するワンショット API）のままで、54KB の zstd レベル 3 に
+/// 1 リクエストあたり約 1.6ms の CPU を使っていた（静的配信の 6 倍）。HTTP/2・HTTP/3 と
+/// 同じくこの関数でコンテキストを使い回す。
+#[cfg(feature = "compression")]
+fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { RefCell::new(None) };
+    }
+
+    ZSTD_COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let compressor = match slot.as_mut() {
+            Some(c) => c,
+            None => slot.get_or_insert(zstd::bulk::Compressor::new(level).ok()?),
+        };
+        compressor.set_compression_level(level).ok()?;
+        compressor.compress(body).ok()
+    })
+}
+
 // ====================
 // ロギング
 // ====================

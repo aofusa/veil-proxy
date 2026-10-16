@@ -292,34 +292,6 @@ pub(super) fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
     zstd_compress_reused(body, level).unwrap_or_else(|| body.to_vec())
 }
 
-/// スレッドローカルの zstd 圧縮コンテキストを使い回して `body` を圧縮する。
-/// 失敗したら `None`（呼び出し側が無圧縮へフォールバックする）。
-///
-/// B-99: HTTP/1.1 のプロキシ圧縮経路（`transfer_compressed_response` /
-/// `transfer_https_compressed_response`）は F-169 の後も `zstd::encode_all`（呼び出しごとに
-/// コンテキストを確保・初期化するワンショット API）のままで、54KB の zstd レベル 3 に
-/// 1 リクエストあたり約 1.6ms の CPU を使っていた（静的配信の 6 倍）。HTTP/2・HTTP/3 と
-/// 同じくこの関数でコンテキストを使い回す。
-#[cfg(feature = "compression")]
-pub(super) fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
-            const { RefCell::new(None) };
-    }
-
-    ZSTD_COMPRESSOR.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let compressor = match slot.as_mut() {
-            Some(c) => c,
-            None => slot.get_or_insert(zstd::bulk::Compressor::new(level).ok()?),
-        };
-        compressor.set_compression_level(level).ok()?;
-        compressor.compress(body).ok()
-    })
-}
-
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
 ///
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
