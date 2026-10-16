@@ -217,6 +217,28 @@ F-202 は HTTP/1.1 の共通経路（ヘッダ位置・ルーティング用の�
 [library.md の Performance](../guide/library.md#performance)・F-205）。B-128 で multishot の受信が有効になった HTTP/3 も
 変わらない（API ライブラリの HTTP/3 でも main と同じ。`docs/artifacts/b128_h3_ab.tsv`）。
 
+## サービスメッシュのデータプレーン・TOML の mTLS / トラフィック制御 / JWT の非退行確認（2026-10-16、feat/mesh-dataplane-impl）
+
+メッシュのデータプレーン（`src/mesh/`）は default・`full*` に入らないが、このブランチは既存のプロキシの共通の経路にも
+手を入れた（F-217: 上流の TLS の種類 `TlsProfile` を全経路のコネクタとプールの鍵へ、F-219 / F-220: ルート照合の直後の
+`[route.traffic]`・`[route.jwt]` の分岐、HTTP/2 の共通の駆動部）。main（70ffb3b0、`veil:main-ab`）とブランチ（`veil:mesh-ab`）の
+glibc `full` イメージを `suite_ab.sh` で代表 11 構成について交互に測った（構成ごとに順番を入れ替え、各 3 回の中央値の比、新 / 旧。
+kind は止めて計測。`tools/perf/results/suite_ab/mesh_dataplane/`）。
+
+| 構成 | プロトコル | 比 |
+|------|-----------|---:|
+| h2c 静的配信 / プロキシ | h2c | 0.990 / 1.011 |
+| HTTP/1.1 のみ（kTLS 無・有、ofc 有効） | HTTP/1.1 | 1.005 / 0.991 |
+| h2 有効（kTLS 無、ofc 有効） | HTTP/1.1・HTTP/2 | 0.994・0.966（測り直し 1.021・1.001） |
+| プロキシ（h2 有効） | HTTP/1.1・HTTP/2 | 0.986・1.006 |
+| gRPC（h2 / h3） | gRPC | 1.023 / 1.038 |
+| WebSocket | WebSocket | 1.052 |
+| HTTP/3 プロキシ | HTTP/1.1・HTTP/2・HTTP/3 | 1.010・0.992・1.023 |
+| HTTP/3 静的配信（キャッシュ） | HTTP/1.1・HTTP/2・HTTP/3 | 1.000・1.039・0.997 |
+
+全 17 組の比の中央値 1.005（0.966〜1.052、0.95 未満は無し）で退行は無い。最小の 0.966 は同じ構成の測り直しで 1.001。
+`full` のバイナリにはメッシュのコード（`src/mesh/`・Linkerd / Istio の文字列）が入っていない。
+
 <a id="service-mesh"></a>
 
 ## サービスメッシュ（2026-10-16、F-215〜F-225、kind）
