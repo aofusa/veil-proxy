@@ -71,6 +71,7 @@ BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
 BACKEND_UDP_ECHO_PORT=9019
 BACKEND_ECHO2_PORT=9020
+BACKEND_ECHO3_PORT=9021
 
 # F-170: UDS バックエンド（Unix ドメインソケット上流）検証用のソケットパス。
 # バックエンドは veil 自身（F-164 の UDS リスナー）を使い、1 プロセスで
@@ -1362,6 +1363,14 @@ path = "/echo-head-ka/*"
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_ECHO2_PORT}"
 
+# B-104: 順に送った HTTP/3 の要求が上流接続を再利用することの検証用。3 つ目の echo（この試験だけが使う）
+[[route]]
+[route.conditions]
+path = "/echo-reuse/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO3_PORT}"
+
 # B-97: HTTP/3 のバッファ経路（buffering = full）が接続を止めないことの検証用
 [[route]]
 [route.conditions]
@@ -2252,7 +2261,7 @@ start_servers() {
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" ECHO2_PORT="${BACKEND_ECHO2_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" ECHO2_PORT="${BACKEND_ECHO2_PORT}" ECHO3_PORT="${BACKEND_ECHO3_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \

@@ -472,7 +472,8 @@ pub(super) async fn test_b104_http3_reuses_upstream_connection() {
         .parse()
         .expect("Invalid server address");
 
-    for prefix in ["/echo-upload", "/echo-upload-tls"] {
+    // 平文は、この試験だけが使う 3 つ目の echo（/echo-reuse）。/echo-upload は他の HTTP/3 の試験が同時に使う
+    for prefix in ["/echo-reuse", "/echo-upload-tls"] {
         let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
             .await
             .expect("HTTP/3 connect");
