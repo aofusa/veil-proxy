@@ -182,7 +182,7 @@ fn emit_runtime_backend_cfg() {
     }
 }
 
-/// B-55: wasm feature がターゲット別依存（`wasmtime` / `veil-wasmtime`）のどちらを
+/// B-55: wasm feature がターゲット別依存（`wasmtime` / `veil-proxy-wasmtime`）のどちらを
 /// 選んでいるかを `src/wasm/registry.rs` から判定するための cfg エイリアスを発行する。
 ///
 /// | cfg | 条件 | 意味 |

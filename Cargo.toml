@@ -203,10 +203,10 @@ aio = []
 # Wasmtime ランタイムによる WebAssembly フィルタ
 # AOT コンパイル、Pooling Allocator、InstancePre 使用
 # B-55: netbsd 全アーキ・freebsd/openbsd の aarch64 は crates.io wasmtime のビルドが
-# 通らないため third_party/wasmtime（veil-wasmtime、Pulley 専用）に切り替える。
+# 通らないため third_party/wasmtime（veil-proxy-wasmtime、Pulley 専用）に切り替える。
 # 依存はターゲット別に排他なので、ビルドごとに実際に有効になるのはどちらか一方のみ
 # （[target.*.dependencies] 参照）。
-wasm = ["dep:wasmtime", "dep:veil-wasmtime"]
+wasm = ["dep:wasmtime", "dep:veil-proxy-wasmtime"]
 
 # gRPC サポート (HTTP/2 ベース)
 # gRPC ワイヤプロトコル（framing, headers, trailers）を実装（メッセージは解析しないので protobuf の実装に依存しない）
@@ -740,7 +740,7 @@ boring = "4.3"
 # <BSD_NOSIG> = netbsd 全アーキ ∪ (openbsd, aarch64) ∪ (freebsd, aarch64)。
 # これらのターゲットは crates.io wasmtime（36 / 40 とも）の signals.rs に ucontext 分岐が無く
 # `compile_error!("unsupported platform")` になるため third_party/wasmtime
-# （`veil-wasmtime`、Pulley 専用、詳細は third_party/wasmtime/README.veil.md）に切り替える。
+# （`veil-proxy-wasmtime`、Pulley 専用、詳細は third_party/wasmtime/README.veil.md）に切り替える。
 # 依存キーを分けているのは、同一キー `wasmtime` に対し crates.io と path の 2 つの
 # source を target 別に与えると cargo が
 # 「Dependency 'wasmtime' has different source paths depending on the build target」
@@ -755,7 +755,9 @@ boring = "4.3"
 wasmtime = { version = "36.0.17", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
-veil-wasmtime = { package = "veil-proxy-wasmtime", path = "third_party/wasmtime", version = "36.0.17", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+# 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
+# キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.17", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）

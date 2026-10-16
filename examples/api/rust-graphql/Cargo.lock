@@ -2165,25 +2165,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiche"
-version = "0.24.9"
-dependencies = [
- "boring",
- "cmake",
- "either",
- "enum_dispatch",
- "foreign-types-shared",
- "intrusive-collections",
- "libc",
- "libm",
- "log",
- "octets",
- "slab",
- "smallvec",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2951,7 +2932,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "veil"
+name = "veil-example-graphql"
+version = "0.1.0"
+dependencies = [
+ "async-graphql",
+ "bytes",
+ "futures",
+ "serde_json",
+ "veil-proxy",
+]
+
+[[package]]
+name = "veil-proxy"
 version = "0.8.0"
 dependencies = [
  "anyhow",
@@ -2987,7 +2979,6 @@ dependencies = [
  "once_cell",
  "prometheus",
  "prost",
- "quiche",
  "rayon",
  "rcgen",
  "ring",
@@ -3002,8 +2993,9 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tower-layer",
  "tower-service",
- "veil-macros",
- "veil-wasmtime",
+ "veil-proxy-macros",
+ "veil-proxy-quiche",
+ "veil-proxy-wasmtime",
  "wasmtime",
  "webpki-roots",
  "windows-sys 0.59.0",
@@ -3012,18 +3004,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "veil-example-graphql"
-version = "0.1.0"
-dependencies = [
- "async-graphql",
- "bytes",
- "futures",
- "serde_json",
- "veil",
-]
-
-[[package]]
-name = "veil-macros"
+name = "veil-proxy-macros"
 version = "0.8.0"
 dependencies = [
  "proc-macro2",
@@ -3032,7 +3013,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "veil-wasmtime"
+name = "veil-proxy-quiche"
+version = "0.24.9-veil.1"
+dependencies = [
+ "boring",
+ "cmake",
+ "either",
+ "enum_dispatch",
+ "foreign-types-shared",
+ "intrusive-collections",
+ "libc",
+ "libm",
+ "log",
+ "octets",
+ "slab",
+ "smallvec",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "veil-proxy-wasmtime"
 version = "36.0.17"
 dependencies = [
  "addr2line",
