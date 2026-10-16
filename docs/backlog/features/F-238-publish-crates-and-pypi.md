@@ -1,6 +1,6 @@
 # F-238: Rust のライブラリと Python のモジュールの公開（タグの push で crates.io・PyPI へ自動公開）
 
-**状態: 未着手（2026-10-16 起票・設計）**
+**状態: 完了（feat/v080-release、2026-10-16。公開そのもの〈タグの push と最初の 1 回の人の準備〉は main へのマージの後）**
 
 ## 目的
 
@@ -109,6 +109,27 @@ git のタグ `vX.Y.Z` を push したら、CI が次の 2 つを自動で公開
 - `docs/guide/library.md`（英日）・`crates/*/README.md` の依存の書き方を、crates.io・PyPI の形に更新する（git の形は残す）。
 - 既存のプロキシの性能が退行しない。quiche を patch からパッケージの別名に替えても中身は同じだが、HTTP/3 の行を
   `suite_ab.sh` で確かめる。
+
+
+## 実装の結果
+
+### 段階 0 の洗い出しと決着
+
+| 項目 | 結果 |
+|---|---|
+| 1. vendoring の wasmtime | `veil-proxy-wasmtime`（36.0.17）として公開する。`Cargo.toml.orig`（cargo の予約名）を除いた |
+| 2. quiche の `[patch]` | `veil-proxy-quiche`（`=0.24.9-veil.1`）を各ターゲットの依存に直接書く。patch は外した |
+| 3. `AWS_LC_SYS_NO_PREFIX` | 確かめた: リポジトリの外のプロジェクトで設定が無いと、veil の build.rs が設定を示して止まる。設定すると通る |
+| （3 の調査で見つかった別の問題） | 利用者の解決では aws-lc-rs の最新が aws-lc-sys 0.46 を引き、veil の 0.45 と 2 つになって libcrypto が見つからずに失敗した。`aws-lc-sys = ">=0.45, <0.48"` にして 1 つに寄せた |
+| 4. パッケージの大きさ | `include` で src・build.rs・README・LICENSE だけ。veil-proxy は 1.6MB。`src/` の `.rs` 以外（`include_str!` が読むもの）も入れる |
+| 5. tokio-shim | crates.io の依存を crates.io の別名で patch することはできない（cargo の制約）。git の patch のまま、veil も同じタグから取るように文書に書いた |
+
+- `cargo package --workspace`（vendoring の 2 つをメンバーに入れた作業用のコピー）で 5 つとも検証のビルドまで通った。
+- リポジトリの外の新しいプロジェクトで、展開したパッケージを `[patch.crates-io]` で当てて `features = ["full", "api"]`（Linux の
+  http3 を含む）がビルドでき、`examples/api/rust-hello` 相当が HTTP/1.1・h2c で応答した。
+- `tools/release/publish-crates.sh`（`--dry-run` は `cargo package --workspace`）、release.yml の crates・wheels（7 種）・sdist・PyPI。
+- 文書: README（英日）・library.md（英日）・`crates/README.crates-io.md`・`crates/veil-build/README.md`・`crates/veil-tokio/README.md`・
+  `packaging/README.md`（最初の 1 回の人の準備）。
 
 ## 関連
 

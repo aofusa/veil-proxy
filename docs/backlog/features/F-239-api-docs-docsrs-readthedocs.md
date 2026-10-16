@@ -1,6 +1,6 @@
 # F-239: Rust の API ライブラリと Python のモジュールの文書（docs.rs・Read the Docs）
 
-**状態: 未着手（2026-10-16 起票・設計。F-238 の公開と同時に使えるようにする）**
+**状態: 完了（feat/v080-release、2026-10-16。docs.rs・Read the Docs への掲載は公開の後）**
 
 ## 目的
 
@@ -80,6 +80,16 @@ F-238 で公開したときに、それぞれの文書のサイトで API の文
 - CI の検査が通る: `missing_docs`・doctest・`RUSTDOCFLAGS=-D warnings` の rustdoc・`mypy.stubtest`・Sphinx の `-W`（警告を
   失敗にする）。
 - `docs/guide/library.md`（英日）から、docs.rs と Read the Docs へリンクする。
+
+
+## 実装の結果
+
+- Rust: `[package.metadata.docs.rs]`、英語の crate の doc、利用者向けでない 56 個に `#[doc(hidden)]`、`veil::api` に `missing_docs`
+  （88 項目に doc を足した）、`RUSTDOCFLAGS=-D warnings` の rustdoc（stable と nightly の `--cfg docsrs`）と doctest が通る。CI の `docs` ジョブ。
+- Python: `_veil.pyi`（`mypy.stubtest` が許可リスト無しで通る）、Sphinx + sphinx-autoapi の文書（`crates/veil-python/docs/`、
+  `sphinx-build -W` が通る。拡張をコンパイルしない）、`.readthedocs.yaml`、pyproject の URL・分類。CI の `python-docs` ジョブ。
+- 日本語の Read the Docs は gettext の仕組みだけ（翻訳ファイルはまだ無い）。
+- docs.rs の環境のイメージでの事前のビルドは行っていない（docs.rs は公開すると自動でビルドする。rustdoc は手元で -D warnings で通る）。
 
 ## 関連
 

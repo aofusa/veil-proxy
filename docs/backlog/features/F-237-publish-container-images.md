@@ -1,6 +1,6 @@
 # F-237: コンテナイメージの公開（musl が主・glibc が副、タグの push で自動公開）
 
-**状態: 未着手（2026-10-16 起票・設計）**
+**状態: 完了（feat/v080-release、2026-10-16。公開そのもの〈タグの push〉は main へのマージの後）**
 
 ## 目的
 
@@ -105,6 +105,18 @@ veil のコンテナイメージをレジストリに公開する。musl 版を�
 - `docker/README.md`・README の Quickstart（`docker run ghcr.io/aofusa/veil`）・`docs/guide/building.md`・`kubernetes.md`（英日）を
   更新する。
 - 既存のプロキシの性能が退行しない（切り替えの確認は起動時の 1 回だけ。`suite_ab.sh`）。
+
+
+## 実装の結果
+
+- `src/runtime/fallback.rs`: 起動の最初に io_uring を作れなければ `<自分のパス>.epoll`（または `VEIL_FALLBACK_BIN`）を
+  同じ引数で `execve`。`docker/Dockerfile.{musl,glibc}{,.aarch64}` は `CARGO_FEATURES_FALLBACK` が空でなければ `/veil.epoll` も入れる。
+- `.github/workflows/release.yml`（actionlint・shellcheck 済み）と `tools/release/{verify-tag,image-smoke,publish-images}.sh`。
+- 手元の確認（musl、x86_64、`--features full` + `full-container`、52.7MB）: `tools/release/image-smoke.sh` が全部 ok
+  （io_uring を拒否する seccomp で epoll 版へ切り替わる、seccomp 無しで io_uring のまま、どちらも HTTP/1.1・2・3、`--version` 0.8.0）。
+  kind の Pod（`seccompProfile: RuntimeDefault`）でも「Switching to the epoll build」を出して応答した。
+- このホストの Docker（29.8）は既定の seccomp で io_uring を許していた。そこで試験は io_uring を拒否するプロファイルを明示する。
+- 実際の ghcr への公開・arm64 のランナーでの試験は、タグを push したときに CI で行う（`packaging/README.md` の「公開」）。
 
 ## 関連
 
