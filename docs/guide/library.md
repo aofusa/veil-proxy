@@ -859,6 +859,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
 - Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
+Full documentation (quickstart, FastAPI migration table, API reference): <https://veil-api.readthedocs.io>.
 Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Examples:
 [examples/api/python-hello/](../../examples/api/python-hello/),
 [examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/),

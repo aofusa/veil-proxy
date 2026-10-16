@@ -331,6 +331,7 @@ fn shutdown() {
     veil::api::app::shutdown();
 }
 
+/// Native extension of the veil API server library (use the `veil` package instead).
 #[pymodule]
 fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConfig>()?;

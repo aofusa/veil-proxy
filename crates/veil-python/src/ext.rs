@@ -63,6 +63,7 @@ impl NativeGrpcCall {
         self.with_call(|call| call.add_header(lower(name), v))
     }
 
+    /// Add a response trailer (sent after the last message).
     fn add_trailer(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let v = meta_value(value)?;
         self.with_call(|call| call.add_trailer(lower(name), v))
@@ -88,6 +89,7 @@ impl NativeGrpcCall {
         })
     }
 
+    /// Full method path of the call, e.g. `/pkg.Svc/Method`.
     fn method(&self) -> PyResult<String> {
         self.with_call(|call| call.method().to_string())
     }
@@ -102,6 +104,7 @@ impl NativeGrpcCall {
         })
     }
 
+    /// False once the client has cancelled or disconnected.
     fn is_active(&self) -> PyResult<bool> {
         self.with_call(|call| !call.is_cancelled())
     }
@@ -172,6 +175,7 @@ impl NativeTransport {
 
 #[pymethods]
 impl NativeTransport {
+    /// Send bytes to the peer (valid only inside the protocol callbacks).
     fn write(&self, data: &[u8]) -> PyResult<()> {
         let b = Bytes::copy_from_slice(data);
         self.with_out(|o| o.write(b))
@@ -184,6 +188,7 @@ impl NativeTransport {
         Ok(())
     }
 
+    /// True after `close()` was called.
     fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }

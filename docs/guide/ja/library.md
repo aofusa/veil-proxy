@@ -822,6 +822,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
+文書全体（入門・FastAPI からの移行の対応表・API 一覧）は <https://veil-api.readthedocs.io> にあります（英語が正。日本語版は gettext で作る。手順は crates/veil-python/docs/conf.py の冒頭）。
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは
 [examples/api/python-hello/](../../../examples/api/python-hello/)・
 [examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/)・

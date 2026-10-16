@@ -1,8 +1,11 @@
-"""veil API サーバライブラリの Python バインディング（F-194）。
+"""FastAPI-style Python bindings for the veil API server library.
 
-FastAPI 風のデコレータ API。HTTP の受理・TLS・HTTP/2/3・OpenAPI 配信は Rust 側（veil）が行い、
-Python はハンドラ関数だけを提供する。ネイティブ拡張 ``veil._veil`` は ``run()`` / ``shutdown()`` で
-初めて読み込む（引数束縛・検証・OpenAPI 生成は純 Python で、拡張が無くてもテストできる）。
+The HTTP server, TLS, HTTP/2, HTTP/3 and the OpenAPI endpoints run in Rust (veil, on io_uring);
+Python only supplies handler functions. The native extension ``veil._veil`` is imported lazily
+by :func:`run` / :func:`shutdown` (argument binding, validation and OpenAPI generation are pure
+Python and can be tested without the extension).
+
+.. code-block:: python
 
     import veil
 
@@ -53,14 +56,17 @@ _JSON_CT = "application/json"
 
 
 class Headers(metaclass=abc.ABCMeta):
-    """大文字小文字を区別しない読み取り専用のヘッダ辞書（同名ヘッダは受信順に保持）。
+    """Case-insensitive, read-only request headers (repeated headers keep their arrival order).
 
-    サーバの中では Rust 側の ``veil._veil.NativeHeaders``（同じメソッド）が渡る（F-212）。"""
+    Inside the server a Rust-backed ``veil._veil.NativeHeaders`` with the same methods is passed.
+    """
 
     def __init__(self, items=()):
+        """Build headers from an iterable of ``(name, value)`` pairs."""
         self._items = [(str(k), str(v)) for k, v in items]
 
     def get(self, name, default=None):
+        """Return the first value of header ``name`` (case-insensitive), or ``default``."""
         low = name.lower()
         for k, v in self._items:
             if k.lower() == low:
@@ -68,25 +74,31 @@ class Headers(metaclass=abc.ABCMeta):
         return default
 
     def getlist(self, name):
+        """Return all values of header ``name`` in arrival order."""
         low = name.lower()
         return [v for k, v in self._items if k.lower() == low]
 
     def __getitem__(self, name):
+        """Return the first value of header ``name``; raise ``KeyError`` if absent."""
         v = self.get(name)
         if v is None:
             raise KeyError(name)
         return v
 
     def __contains__(self, name):
+        """Return True if header ``name`` is present."""
         return self.get(name) is not None
 
     def __iter__(self):
+        """Iterate over the distinct header names."""
         return iter(self.keys())
 
     def __len__(self):
+        """Return the number of header lines (duplicates counted)."""
         return len(self._items)
 
     def keys(self):
+        """Return the distinct header names (the first spelling seen)."""
         seen = []
         for k, _ in self._items:
             if k.lower() not in [s.lower() for s in seen]:
@@ -94,6 +106,7 @@ class Headers(metaclass=abc.ABCMeta):
         return seen
 
     def items(self):
+        """Return all ``(name, value)`` pairs in arrival order."""
         return list(self._items)
 
     def __repr__(self):
@@ -101,12 +114,14 @@ class Headers(metaclass=abc.ABCMeta):
 
 
 class Request(metaclass=abc.ABCMeta):
-    """ハンドラに渡るリクエスト。
+    """The request passed to a handler.
 
-    サーバの中では Rust 側の ``veil._veil.NativeRequest``（同じ属性・メソッド。触った属性だけを作る）が渡り、
-    ``isinstance(req, veil.Request)`` は真（F-212）。"""
+    Inside the server a Rust-backed ``veil._veil.NativeRequest`` (same attributes and methods; an
+    attribute is created only when it is read) is passed, and ``isinstance(req, veil.Request)`` is true.
+    """
 
     def __init__(self, method="GET", path="/", query="", headers=(), body=b"", params=None, client_ip=""):
+        """Build a request directly (useful in unit tests)."""
         self.method = method
         self.path = path
         self.query = query
@@ -118,20 +133,25 @@ class Request(metaclass=abc.ABCMeta):
 
     @property
     def query_params(self):
-        """クエリの辞書（同名キーは最初の値）。"""
+        """Query string as a dict (the first value of a repeated key)."""
         if self._query_params is None:
             self._query_params = _query_params(self.query)
         return self._query_params
 
     def json(self):
+        """Parse the body as JSON."""
         return json.loads(self.body)
 
     def text(self):
+        """Return the body decoded as UTF-8 (undecodable bytes are replaced)."""
         return self.body.decode("utf-8", errors="replace")
 
     def stream(self):
-        """本文を届いた順に返す反復子（サーバの中で ``stream_body=True`` のルートなら届いた断片ごと。
-        ここでは全量を 1 回）。"""
+        """Iterate over the body in the order it arrives.
+
+        In the server this yields each received chunk on routes declared with ``stream_body=True``;
+        elsewhere it yields the whole body once.
+        """
         if self.body:
             yield self.body
 
@@ -167,9 +187,10 @@ def _dumps(obj):
 
 
 class Response:
-    """生のレスポンス。``body`` は bytes / str。"""
+    """A raw response. ``body`` is ``bytes`` or ``str``; ``media_type`` sets ``content-type`` if no such header is given."""
 
     def __init__(self, body=b"", status=200, headers=None, media_type=None):
+        """Create a response from a body, status, optional headers (dict or pairs) and media type."""
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.body = bytes(body)
@@ -198,11 +219,15 @@ def _aiter_sync(agen):
 
 
 class StreamingResponse(Response):
-    """本文を断片ごとに送る応答（F-210）。``content`` は bytes・str を返す反復子・ジェネレータ・非同期反復子。
-    サーバの中では断片が届いた順にクライアントへ送られる（ハンドラ用プールのスレッドで反復する）。
-    ``trailers`` は本文の後に送るトレーラ（``[(name, value)]``）。"""
+    """A response whose body is sent chunk by chunk.
+
+    ``content`` is an iterator, generator or async iterator of ``bytes`` / ``str``. In the server chunks
+    are sent to the client as they are produced (iterated on a handler-pool thread). ``trailers`` is a
+    list of ``(name, value)`` pairs sent after the body.
+    """
 
     def __init__(self, content, status=200, headers=None, media_type=None, trailers=None):
+        """Create a streaming response from ``content`` (see the class documentation)."""
         super().__init__(b"", status, headers, media_type)
         self.content = content
         self.trailers = list(trailers) if trailers else None
@@ -242,10 +267,14 @@ def _sse_event(item):
 
 
 class EventSourceResponse(StreamingResponse):
-    """Server-Sent Events（``text/event-stream``）。各要素は str（``data:`` 行）・JSON にできる値、または
-    ``{"event": ..., "data": ..., "id": ..., "retry": ...}``。"""
+    """Server-Sent Events (``text/event-stream``).
+
+    Each item is a ``str`` (a ``data:`` line), a JSON-serialisable value, or a dict with the keys
+    ``event``, ``data``, ``id`` and ``retry``.
+    """
 
     def __init__(self, content, status=200, headers=None):
+        """Create an SSE response from an iterable or generator of events."""
         super().__init__(content, status, headers, "text/event-stream")
         hs = [k.lower() for k, _ in self.headers]
         if "cache-control" not in hs:
@@ -263,28 +292,37 @@ def _stream_of(result, status):
 
 
 class Protocol:
-    """L4（TCP）のハンドラ（asyncio.Protocol と同じ名前のメソッド。F-210）。接続ごとに 1 つ作られ、
-    コールバックはハンドラ用プールのスレッドで 1 つずつ順に呼ばれる。``transport.write`` はコールバックの中でだけ。"""
+    """Handler base class for an L4 TCP listener (same method names as ``asyncio.Protocol``).
+
+    One instance is created per connection; the callbacks run one at a time on a handler-pool thread.
+    ``self.transport.write`` is valid only inside a callback.
+    """
 
     def connection_made(self, transport):
+        """Called when a connection is accepted; the default stores ``transport``."""
         self.transport = transport
 
     def data_received(self, data):
+        """Called with each chunk of bytes received from the peer."""
         pass
 
     def connection_lost(self, exc):
+        """Called when the connection is closed."""
         pass
 
 
 class JSONResponse(Response):
+    """A response whose body is ``content`` encoded as JSON (``application/json``)."""
     def __init__(self, content=None, status=200, headers=None):
+        """Create a JSON response from a JSON-serialisable ``content``."""
         super().__init__(_dumps(content), status, headers, _JSON_CT)
 
 
 class HTTPException(Exception):
-    """``raise HTTPException(404, "not found")`` → ``{"detail": "not found"}``。"""
+    """Raise to return an error response: ``raise HTTPException(404, "not found")`` gives ``{"detail": "not found"}``."""
 
     def __init__(self, status_code, detail=None, headers=None):
+        """Create an exception with ``status_code``, an optional ``detail`` (default: the HTTP reason phrase) and extra ``headers``."""
         if detail is None:
             try:
                 detail = http.HTTPStatus(status_code).phrase
@@ -438,7 +476,7 @@ def _field_rules(rules):
 
 
 def validate_constraints(obj, constraints):
-    """辞書の本文を ``body_constraints`` で検証し、FastAPI 形のエラー配列を返す（空なら OK）。"""
+    """Validate a dict body against ``body_constraints`` and return a FastAPI-style list of errors (empty if valid)."""
     errors = []
     if not isinstance(obj, dict):
         return [_err(["body"], "Input should be a valid dictionary or object", "dict_type")]
@@ -489,7 +527,7 @@ def _check_value(v, rules, loc):
 
 
 def constraints_schema(constraints):
-    """``body_constraints`` を OpenAPI の JSON Schema（object）にする。"""
+    """Convert ``body_constraints`` to an OpenAPI JSON Schema (object)."""
     props = {}
     required = []
     top = constraints.get("required")
@@ -530,7 +568,7 @@ def _is_validation_error(exc):
 
 
 class Route:
-    """登録された 1 ルート。``handle()`` は Rust 非依存で単体テストできる。"""
+    """One registered route. ``handle()`` is independent of Rust and can be unit-tested."""
 
     def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False):
         self.func = func
@@ -551,7 +589,7 @@ class Route:
     # ---- 引数束縛 ----
 
     def bind(self, req):
-        """リクエストから関数の引数を作る。検証エラーは ``_ValidationFailed``。"""
+        """Build the function arguments from the request; validation errors raise an internal exception that becomes a 422 response."""
         kwargs = {}
         errors = []
         qp = None
@@ -623,6 +661,7 @@ class Route:
     # ---- 戻り値変換 ----
 
     def to_response(self, result):
+        """Convert a handler return value (dict, str, tuple, ``None``, ...) to a :class:`Response`."""
         status = self.status_code
         extra = None
         if isinstance(result, Response):
@@ -652,7 +691,7 @@ class Route:
         return r
 
     def handle(self, req):
-        """リクエスト → ``Response``（HTTPException・検証エラーはここで応答にする）。"""
+        """Run the handler for a request and return a :class:`Response` (``HTTPException`` and validation errors become responses here)."""
         try:
             kwargs = self.bind(req)
             result = self.func(**kwargs)
@@ -726,7 +765,7 @@ class Route:
     # ---- OpenAPI ----
 
     def openapi(self):
-        """Operation Object（辞書）。pydantic のスキーマは ``x-veil-components`` に載せる。"""
+        """Return the OpenAPI Operation Object (a dict) of this route."""
         func = self.func
         doc = inspect.getdoc(func) or ""
         lines = doc.strip().splitlines()
@@ -794,6 +833,7 @@ class Route:
         return {"$ref": "#/components/schemas/" + model.__name__}
 
     def openapi_json(self):
+        """Return the Operation Object as a JSON string."""
         return json.dumps(self.openapi(), separators=(",", ":"), ensure_ascii=False)
 
 
@@ -826,9 +866,10 @@ def _toml_literal(v):
 
 
 class App:
-    """ルートの集合。``@app.get(...)`` で登録し、``app.run()`` で起動する。"""
+    """A set of routes. Register with ``@app.get(...)`` and start with ``app.run()``."""
 
     def __init__(self, title="veil API", version="0.1.0"):
+        """Create an application with the OpenAPI ``title`` and ``version``."""
         self.title = title
         self.version = version
         self.routes = []
@@ -847,7 +888,13 @@ class App:
         status_code=200,
         stream_body=False,
     ):
-        """``stream_body=True`` なら要求本文を溜めずにハンドラを呼び、``req.stream()`` で届いた順に読める（F-210）。"""
+        """Register a handler for ``path`` and ``methods`` (default ``["GET"]``); use as a decorator.
+
+        ``offload=True`` runs the handler on the handler pool, ``False`` on the network worker (trivially cheap
+        handlers only). ``body_constraints`` validates dict bodies without pydantic. ``tags`` and ``summary`` go
+        to OpenAPI, ``status_code`` is the default status. With ``stream_body=True`` the handler is called before
+        the request body has arrived and ``req.stream()`` reads it as it comes.
+        """
 
         def deco(func):
             self.routes.append(
@@ -860,7 +907,7 @@ class App:
     # ---- L4（F-210） ----
 
     def l4_tcp(self, name, listen):
-        """TCP リスナー ``listen`` を開き、接続ごとに ``factory()``（``veil.Protocol`` の派生クラス等）で処理する。"""
+        """Open the TCP listener ``listen`` and handle each connection with ``factory()`` (e.g. a :class:`Protocol` subclass); use as a decorator."""
 
         def deco(factory):
             self.l4.append(("tcp", name, listen, factory))
@@ -869,8 +916,7 @@ class App:
         return deco
 
     def l4_udp(self, name, listen):
-        """UDP リスナー ``listen`` を開き、データグラムごとに ``func(data: bytes, peer: (host, port))`` を呼ぶ
-        （bytes を返すと送信元へ返信）。"""
+        """Open the UDP listener ``listen`` and call ``func(data, peer)`` per datagram (``peer`` is ``(host, port)``); a returned ``bytes`` is sent back; use as a decorator."""
 
         def deco(func):
             self.l4.append(("udp", name, listen, func))
@@ -886,18 +932,23 @@ class App:
         return deco
 
     def get(self, path, **kw):
+        """Decorator registering a ``GET`` handler (same keyword arguments as :meth:`route`)."""
         return self._verb("GET")(path, **kw)
 
     def post(self, path, **kw):
+        """Decorator registering a ``POST`` handler (same keyword arguments as :meth:`route`)."""
         return self._verb("POST")(path, **kw)
 
     def put(self, path, **kw):
+        """Decorator registering a ``PUT`` handler (same keyword arguments as :meth:`route`)."""
         return self._verb("PUT")(path, **kw)
 
     def delete(self, path, **kw):
+        """Decorator registering a ``DELETE`` handler (same keyword arguments as :meth:`route`)."""
         return self._verb("DELETE")(path, **kw)
 
     def patch(self, path, **kw):
+        """Decorator registering a ``PATCH`` handler (same keyword arguments as :meth:`route`)."""
         return self._verb("PATCH")(path, **kw)
 
     def build_config(
@@ -912,6 +963,7 @@ class App:
         overrides=None,
         openapi=True,
     ):
+        """Build the native ``Config`` from the arguments of :meth:`run` (requires the native extension)."""
         from . import _veil
 
         cfg = _veil.Config.from_file(config_path) if config_path else _veil.Config()
@@ -947,10 +999,11 @@ class App:
         overrides=None,
         openapi=True,
     ):
-        """サーバを起動し、停止（Ctrl-C・SIGTERM・``veil.shutdown()``）までブロックする。
+        """Start the server and block until it stops (Ctrl-C, SIGTERM or :func:`shutdown`).
 
-        ``listen_cleartext`` は平文（HTTP/1.1 + h2c、既定 ``127.0.0.1:8080``）、``listen`` は TLS
-        （``tls_cert`` と ``tls_key`` が要る）のアドレス。
+        ``listen_cleartext`` is the plaintext HTTP/1.1 + h2c address (default ``127.0.0.1:8080``); ``listen`` is
+        the TLS address and needs ``tls_cert`` and ``tls_key``. ``overrides`` maps config keys to Python values,
+        e.g. ``{"server.threads": 4}``. ``openapi=False`` disables ``/openapi.json`` and ``/docs``.
         """
         from . import _veil
 
@@ -998,7 +1051,7 @@ l4_udp = _default_app.l4_udp
 
 
 def shutdown():
-    """実行中のサーバを graceful に停止する。"""
+    """Stop the running server gracefully."""
     from . import _veil
 
     _veil.shutdown()

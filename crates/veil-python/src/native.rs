@@ -134,6 +134,7 @@ impl NativeRequest {
         NativeRequest::new(req)
     }
 
+    /// HTTP method, upper-case (e.g. `GET`).
     #[getter]
     fn method<'py>(&self, py: Python<'py>) -> Bound<'py, PyString> {
         match self.req.method() {
@@ -148,6 +149,7 @@ impl NativeRequest {
         }
     }
 
+    /// Request path without the query string.
     #[getter]
     fn path(&self, py: Python<'_>) -> Py<PyString> {
         self.path
@@ -155,6 +157,7 @@ impl NativeRequest {
             .clone_ref(py)
     }
 
+    /// Raw query string without the leading `?`.
     #[getter]
     fn query(&self, py: Python<'_>) -> Py<PyString> {
         self.query
@@ -162,6 +165,7 @@ impl NativeRequest {
             .clone_ref(py)
     }
 
+    /// Whole request body as `bytes`.
     #[getter]
     fn body(&self, py: Python<'_>) -> Py<PyBytes> {
         self.body
@@ -169,6 +173,7 @@ impl NativeRequest {
             .clone_ref(py)
     }
 
+    /// Client IP address as a string.
     #[getter]
     fn client_ip(&self, py: Python<'_>) -> Py<PyString> {
         self.client_ip
@@ -178,6 +183,7 @@ impl NativeRequest {
             .clone_ref(py)
     }
 
+    /// Path parameters as a dict (`{name}` in the route pattern -> value).
     #[getter]
     fn params(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         if let Some(d) = self.params.get(py) {
@@ -194,6 +200,7 @@ impl NativeRequest {
         Ok(d)
     }
 
+    /// Request headers (case-insensitive, read-only).
     #[getter]
     fn headers(slf: Bound<'_, Self>) -> NativeHeaders {
         NativeHeaders { req: slf.unbind() }
@@ -218,14 +225,17 @@ impl NativeRequest {
         }
     }
 
+    /// Parse the body as JSON.
     fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         helpers(py)?.loads.call1(py, (self.body(py),))
     }
 
+    /// Body decoded as UTF-8 (lossy).
     fn text(&self) -> String {
         lossy(self.req.body()).into_owned()
     }
 
+    /// Debug representation.
     fn __repr__(&self) -> String {
         format!("<veil.Request {} {}>", self.req.method(), self.req.path())
     }
@@ -240,10 +250,12 @@ pub struct NativeBodyIter {
 
 #[pymethods]
 impl NativeBodyIter {
+    /// Return the iterator itself.
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
+    /// Next body chunk as `bytes`; raises `StopIteration` at the end.
     fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyBytes>> {
         let r = self.req.borrow(py);
         let streaming = {
@@ -277,6 +289,7 @@ impl NativeHeaders {
 
 #[pymethods]
 impl NativeHeaders {
+    /// First value of header `name` (case-insensitive), or `default` (None).
     #[pyo3(signature = (name, default=None))]
     fn get(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
         let found = self.with(py, |h| {
@@ -287,6 +300,7 @@ impl NativeHeaders {
         found.unwrap_or_else(|| default.unwrap_or_else(|| py.None()))
     }
 
+    /// All values of header `name`, in arrival order.
     fn getlist(&self, py: Python<'_>, name: &str) -> Vec<String> {
         self.with(py, |h| {
             h.iter()
@@ -296,6 +310,7 @@ impl NativeHeaders {
         })
     }
 
+    /// First value of header `name`; raises `KeyError` if absent.
     fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<String> {
         self.with(py, |h| {
             h.iter()
@@ -305,6 +320,7 @@ impl NativeHeaders {
         .ok_or_else(|| PyKeyError::new_err(name.to_string()))
     }
 
+    /// True if header `name` is present (case-insensitive).
     fn __contains__(&self, py: Python<'_>, name: &str) -> bool {
         self.with(py, |h| {
             h.iter()
@@ -312,6 +328,7 @@ impl NativeHeaders {
         })
     }
 
+    /// Number of header lines (duplicates counted).
     fn __len__(&self, py: Python<'_>) -> usize {
         self.with(py, |h| h.len())
     }
@@ -330,11 +347,13 @@ impl NativeHeaders {
         })
     }
 
+    /// Iterate over distinct header names.
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let keys = PyList::new(py, self.keys(py))?;
         Ok(keys.call_method0("__iter__")?.unbind())
     }
 
+    /// All `(name, value)` pairs in arrival order.
     fn items(&self, py: Python<'_>) -> Vec<(String, String)> {
         self.with(py, |h| {
             h.iter()
@@ -343,6 +362,7 @@ impl NativeHeaders {
         })
     }
 
+    /// Debug representation.
     fn __repr__(&self, py: Python<'_>) -> String {
         format!("Headers({:?})", self.items(py))
     }
