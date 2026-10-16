@@ -1171,7 +1171,7 @@ pub(crate) enum ChunkedFeedResult {
 /// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
 /// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
 // ストリーミング転送（F-32）は http2 / http3 経路でのみ使用する
-#[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+#[cfg(any(feature = "http2", feature = "http3"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkedSpan {
     /// 入力スライス内のボディデータ開始オフセット。
@@ -1412,7 +1412,7 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))] // 理由: ストリーミング転送（F-32）は http2 / http3 経路のみ
+    #[cfg(any(feature = "http2", feature = "http3"))] // ストリーミング転送（F-32）は http2 / http3 経路のみ
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {
@@ -1797,7 +1797,7 @@ mod idempotent_method_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "http2", feature = "http3")))]
 mod chunked_span_tests {
     use super::*;
 

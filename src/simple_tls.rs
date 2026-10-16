@@ -1,7 +1,7 @@
 //! # シンプルな rustls TLS ストリームモジュール
 //!
 //! kTLS 無効時に使用される、rustls を直接使用した TLS ストリーム実装。
-//! monoio の AsyncReadRent/AsyncWriteRent を実装します.
+//! ランタイムの AsyncReadRent/AsyncWriteRent（`src/runtime/io.rs`）を実装します.
 
 use std::io;
 use std::sync::Arc;

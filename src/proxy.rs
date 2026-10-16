@@ -352,7 +352,6 @@ pub fn check_security(
 /// **重要**: これらのエラーはクライアントが接続を閉じた場合の正常な動作であり、
 /// サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
 /// ログには警告として出力しますが、接続は正常終了として扱います。
-#[cfg_attr(not(feature = "http2"), allow(dead_code))] // 理由: HTTP/2 経路からのみ呼ばれる
 #[inline]
 fn build_sub_path(base: &str, remaining: &str) -> String {
     if remaining.is_empty() {
@@ -1252,9 +1251,13 @@ where
     stream_ids.extend(streams.keys().copied());
 
     for &sid in stream_ids.iter() {
+        // ストリームの表は、このループの後（`done` の処理）でだけ取り除く。ループの間は同じ
+        // エントリを指し続けるので、1 回だけ引いて使い回す（`conn` とは別の借用）。
+        let Some(st) = streams.get_mut(&sid) else {
+            continue;
+        };
         // --- リクエストボディを req チャネルへ流す（バックプレッシャ考慮） ---
         {
-            let st = streams.get_mut(&sid).unwrap();
             let mut transferred = false;
             while st.req_tx.is_some() {
                 let item = match st.req_pending.pop_front() {
@@ -1267,7 +1270,7 @@ where
                         st.req_pending.push_front(it);
                         break;
                     }
-                    Err(TrySendError::Closed(_)) => {
+                    Err(TrySendError::Closed) => {
                         // B-130: 受け手が閉じた。溜めていた本文を捨て、そのぶんのウィンドウを返す
                         st.req_pending.clear();
                         st.req_tx = None;
@@ -1290,7 +1293,6 @@ where
 
         // --- pending_body（ウィンドウ待ち残）を先に再送 ---
         {
-            let st = streams.get_mut(&sid).unwrap();
             if let Some((buf, off)) = st.pending_body.take() {
                 let queued = conn.queue_data_frames(sid, &buf[off..], false)?;
                 let new_off = off + queued;
@@ -1307,15 +1309,11 @@ where
 
         // --- resp_rx を送出可能な限りドレイン ---
         loop {
-            let recv = {
-                let st = streams.get_mut(&sid).unwrap();
-                st.resp_rx.try_recv()
-            };
+            let recv = st.resp_rx.try_recv();
             let msg = match recv {
                 TryRecv::Item(m) => m,
                 TryRecv::Empty => break,
                 TryRecv::Closed => {
-                    let st = streams.get_mut(&sid).unwrap();
                     if st.head_sent && !st.end_sent {
                         // EOF: head 送出済みで END_STREAM 未送なら空 DATA で閉じる。
                         conn.queue_data_frames(sid, &[], true)?;
@@ -1345,7 +1343,6 @@ where
                     // （1 レスポンスにつき 1 回のヒープ確保）が不要になった。
                     conn.send_headers_buffered_end(sid, status, &headers, end_stream)
                         .await?;
-                    let st = streams.get_mut(&sid).unwrap();
                     st.head_sent = true;
                     if end_stream {
                         st.end_sent = true;
@@ -1357,7 +1354,6 @@ where
                         conn.flush_write_buf().await?;
                     }
                     if queued < bytes.len() {
-                        let st = streams.get_mut(&sid).unwrap();
                         st.pending_body = Some((bytes, queued));
                         break;
                     }
@@ -1383,7 +1379,6 @@ where
                             .send_grpc_trailers(sid, grpc_status, grpc_message.as_deref())
                             .await;
                     }
-                    let st = streams.get_mut(&sid).unwrap();
                     st.head_sent = true;
                     st.end_sent = true;
                 }
@@ -1391,7 +1386,6 @@ where
                 H2RespMsg::HandlerTrailers(trailers) => {
                     conn.flush_write_buf().await?;
                     let _ = conn.send_trailers(sid, &trailers).await;
-                    let st = streams.get_mut(&sid).unwrap();
                     st.head_sent = true;
                     st.end_sent = true;
                 }
@@ -1400,7 +1394,6 @@ where
                     let _ = conn
                         .send_rst_stream(sid, http2::Http2ErrorCode::from_u32(code))
                         .await;
-                    let st = streams.get_mut(&sid).unwrap();
                     st.end_sent = true;
                     done.push(sid);
                     break;
@@ -7513,7 +7506,7 @@ async fn handle_websocket_proxy_https(
 /// WebSocket 双方向転送（HTTP バックエンド）
 ///
 /// クライアント ⇔ バックエンド間でデータを双方向に転送。
-/// monoio の select! 相当を手動で実装し、どちらの方向も待機。
+/// 2 方向の読み取りを、タイムアウト付きで交互に待つ（select の代わり）。
 ///
 /// ## ポーリングモード
 ///
@@ -7528,8 +7521,8 @@ async fn handle_websocket_proxy_https(
 ///
 /// ## 将来的な改善
 ///
-/// monoio が epoll/io_uring ベースのselect風APIをサポートした場合、
-/// イベント駆動型の実装に移行することで、さらなる効率化が可能。
+/// 2 方向の読み取りを `FuturesUnordered` 等で同時に待つイベント駆動型に移行すれば、
+/// タイムアウトの周回が無くなる（同時待ちで `futures::join!` を使わない。F-173）。
 async fn websocket_bidirectional_transfer(
     client: &mut ServerTls,
     backend: &mut TcpStream,
@@ -10626,7 +10619,7 @@ async fn transfer_uncompressed_fallback(
 ) -> (u64, bool) {
     let mut total = 0u64;
 
-    // ヘッダー送信（monoio は所有権を要求するため to_vec、clone は不要）
+    // ヘッダー送信（所有権ベースの I/O なので to_vec、clone は不要）
     let headers_len = original_headers.len();
     let write_result = timeout(
         WRITE_TIMEOUT,
@@ -10651,7 +10644,7 @@ async fn transfer_uncompressed_fallback(
 
 /// 圧縮用にヘッダーを書き換え
 // compression feature 有効時のみ呼び出される
-#[cfg_attr(not(feature = "compression"), allow(dead_code))]
+#[cfg(feature = "compression")]
 fn build_compressed_headers(
     original_headers: &[u8],
     encoding: AcceptedEncoding,
@@ -12234,7 +12227,7 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
 //
 // ## プロキシ転送でのsplice使用
 //
-// libc::read/write を直接使用し、monoio の所有権ベース I/O を回避。
+// libc::read/write を直接使用し、ランタイムの所有権ベース I/O を回避。
 // 非同期待機は TcpStream::readable()/writable() を使用。
 //
 // ### 対応状況

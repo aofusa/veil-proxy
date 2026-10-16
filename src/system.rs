@@ -362,8 +362,8 @@ pub fn raise_nofile_limit() {
 // Task-Level Panic Recovery (Layer 1)
 // ====================
 //
-// monoio::spawn does NOT catch panics like Tokio does.
-// A panic in a monoio::spawn task kills the entire runtime thread.
+// runtime::spawn does NOT catch panics like Tokio does.
+// A panic in a runtime::spawn task kills the entire runtime thread.
 // This wrapper uses std::panic::catch_unwind to prevent thread death.
 //
 // Note: We cannot use FutureExt::catch_unwind from futures crate since
@@ -428,8 +428,8 @@ where
 
 /// Spawn a task with panic catching
 ///
-/// Unlike Tokio, monoio does not catch panics in spawned tasks.
-/// A panic in a monoio::spawn task kills the entire runtime thread,
+/// Unlike Tokio, veil's runtime (`src/runtime/`) does not catch panics in spawned tasks.
+/// A panic in a runtime::spawn task kills the entire runtime thread,
 /// causing all other connections on that worker to be lost.
 ///
 /// This wrapper catches panics and logs them, preventing thread death.

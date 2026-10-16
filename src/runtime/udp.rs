@@ -252,14 +252,18 @@ impl UdpSocket {
                 )
             };
             if ret < 0 {
+                let e = io::Error::last_os_error();
+                // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
                 unsafe { libc::close(fd) };
-                return Err(io::Error::last_os_error());
+                return Err(e);
             }
             let (storage, len) = sockaddr_to_storage(&addr);
             let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
             if ret < 0 {
+                let e = io::Error::last_os_error();
+                // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
                 unsafe { libc::close(fd) };
-                return Err(io::Error::last_os_error());
+                return Err(e);
             }
         }
 

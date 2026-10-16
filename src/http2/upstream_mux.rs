@@ -922,7 +922,7 @@ fn pump_streams(g: &mut Inner, ids: &mut Vec<u32>) {
                     st.resp_queue.push_front(msg);
                     break;
                 }
-                Err(TrySendError::Closed(_)) => break,
+                Err(TrySendError::Closed) => break,
             }
         }
         conn_delivered += delivered;

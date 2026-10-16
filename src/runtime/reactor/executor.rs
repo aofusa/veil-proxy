@@ -107,12 +107,9 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
 /// 「1 回余分な read syscall」のみで、既存の epoll 版のレベルトリガ相当の
 /// spurious wake と同程度）。
 ///
-/// **epoll の `EPOLLET`（F-166 A-2）とヒントの関係**: ET はエッジ検出のみを担い、
-/// 「readable かどうか」の意味論は本ヒント + `poll(2)` フォールバックが担う。
-/// ヒントを消費した側は必ず直後に非ブロッキング I/O を試すため、たとえエッジを
-/// 取りこぼしても「データは残っているが `read_hint` が立っていない」状態は
-/// 次の `poll(2)` フォールバックで検出できる（ヒントは「省略してよい」ことの
-/// 十分条件であって必要条件ではない）。
+/// ヒントは「確認の `poll(2)` を省略してよい」ことの十分条件であって必要条件ではない。
+/// ヒントを消費した側は必ず直後に非ブロッキング I/O を試し、ヒントが立っていないときは
+/// `poll(2)` で確かめる（F-141。epoll は B-75 以降レベルトリガなので、この関数は kqueue 専用）。
 ///
 /// reactor 未初期化のスレッドや、その fd に対する read イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
@@ -186,22 +183,20 @@ pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
 }
 
-/// fd の interest（READ/WRITE いずれか）を登録する（epoll 版、F-166 A-2）。
+/// fd の interest（READ/WRITE いずれか）を登録する（epoll 版）。
 ///
-/// **fd あたり `epoll_ctl` は生涯 1 回だけ**（初回登録時の `EPOLL_CTL_ADD`）。
-/// `EPOLLONESHOT` + 毎回 `EPOLL_CTL_MOD` だった旧実装をやめ、`EPOLLIN|EPOLLOUT|
-/// EPOLLRDHUP|EPOLLET`（エッジトリガ、読み書き両方向を常時）で 1 回 ADD したら、
-/// 以降の `register()` 呼び出しは **syscall を一切発行せず** `FD_TABLE` へ Waker を
-/// 積むだけになる（`known_to_kernel` が唯一の ADD/MOD ならぬ「ADD 済みか否か」判定軸）。
+/// **呼び出しごとに `epoll_ctl` を 1 回発行する**（初回は `EPOLL_CTL_ADD`、以降は
+/// `EPOLL_CTL_MOD`）。マスクは `EPOLLONESHOT` 付きのレベルトリガで、待機者のいる方向
+/// （`armed`）だけを載せる。発火すると interest が外れるので、次の待機で MOD により
+/// 再武装する。
 ///
-/// 読み書き両方向を常時 armed にすることの安全性: 待機者がいない方向の
-/// `EPOLLOUT`/`EPOLLIN` 起床は `dispatch_event` が Waker を探しても見つからず
-/// 何もしない（`WakerSlot::is_empty()` なら wake 対象なしで即終了）ため実害が無い
-/// （F-166 詳細設計の「正しさの根拠」4 参照）。
+/// F-166 A-2 で一度「`EPOLLET` + fd あたり生涯 1 回の ADD（以降の `register()` は
+/// syscall 無し）」に変えたが、kTLS ソケットで「`poll(2)` は readable なのに `recvmsg` が
+/// `EAGAIN`」になる状況で恒久ハングしたため元に戻した（B-75。`epoll.rs` の冒頭）。
+/// 毎回の MOD でカーネルがレベル状態を再評価するので、その状況でも次の周回で起床できる。
 ///
-/// ET のエッジ取りこぼしを起こさない理由は `take_read_hint`/`take_write_hint` の
-/// doc と `poller::FdRecord` の doc を参照（ヒント consume-once + `poll(2)`
-/// フォールバックの組で塞ぐ）。
+/// ADD と MOD の判定は `known_to_kernel`（一度でも ADD したか）だけで行う
+/// （`poller::FdRecord` の doc）。
 #[cfg(veil_poller_epoll)]
 fn register(fd: RawFd, interest: Interest, waker: Waker) {
     let (needs_add, mask) = FD_TABLE.with(|t| {

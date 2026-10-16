@@ -173,7 +173,7 @@ impl FilterEngine {
     }
 
     /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
-    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     ///
     /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_request_headers_with_modules_async(
@@ -580,7 +580,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for specified modules ASYNCHRONOUSLY
-    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     ///
     /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_response_headers_with_modules_async(
@@ -923,7 +923,7 @@ impl FilterEngine {
     }
 
     /// Execute on_request_body for specified modules ASYNCHRONOUSLY
-    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_request_body_with_modules_async(
         self: Arc<Self>,
         modules: Vec<ModuleRef>,
@@ -1094,7 +1094,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_body for specified modules ASYNCHRONOUSLY
-    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_response_body_with_modules_async(
         self: Arc<Self>,
         modules: Vec<ModuleRef>,
@@ -1232,7 +1232,7 @@ impl FilterEngine {
     }
 
     /// Execute on_log for specified modules ASYNCHRONOUSLY
-    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_log_with_modules_async(self: Arc<Self>, modules: Arc<Vec<ModuleRef>>) {
         self.on_log_with_modules(&modules).await;
     }

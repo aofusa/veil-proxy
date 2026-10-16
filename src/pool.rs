@@ -239,7 +239,7 @@ unsafe impl IoBufMut for SafeReadBuffer {
 pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
 pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
                                                   // http2 (H2C/gRPC) 経路でのみ使用
-#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+#[cfg(feature = "http2")]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
 // タイムアウト設定

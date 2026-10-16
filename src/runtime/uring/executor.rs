@@ -960,7 +960,7 @@ pub fn submit_sqes() -> std::io::Result<()> {
 // eventfd + POLL_ADD で **起点スレッドへ** 通知して同スレッドで wake する（Waker をクロス
 // スレッドで呼ばない）。`std::task::Waker` の `Send + Sync` 契約上クロススレッド送信は型的に
 // 可能だが、本ランタイムは上記不変条件を満たすため index ベースの軽量 Waker が
-// スレッドローカル状態へアクセスしても健全である（monoio / glommio と同方針）。Waker は
+// スレッドローカル状態へアクセスしても健全である（thread-per-core のランタイムで一般的な方針）。Waker は
 // ワーカースレッドより長生きしない（OP_TABLE もスレッドローカルで同時に破棄される）。
 
 /// プールされたタスクの poll フック（F-46）。

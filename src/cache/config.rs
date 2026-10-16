@@ -132,7 +132,7 @@ pub struct CacheConfig {
 
     /// ディスクキャッシュで非同期I/Oを使用するかどうか（io_uring有効時のみ）
     ///
-    /// - true: monoio::fsを使用した非同期I/O（io_uring）
+    /// - true: ランタイムの非同期ファイル I/O（offload）
     /// - false: 同期I/O（std::fs）
     ///
     /// デフォルト: true（パフォーマンス向上のため）

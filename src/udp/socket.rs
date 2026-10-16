@@ -1,6 +1,6 @@
 //! # QUIC 用 UDP ソケット
 //!
-//! monoio と統合した UDP ソケット実装。
+//! 独自ランタイムと統合した UDP ソケット実装。
 //! Linux GSO/GRO をサポートして高スループットを実現。
 //!
 //! ## 改善点 (v2)
@@ -15,8 +15,8 @@ use crate::runtime::handle::AsRawFd;
 use std::io;
 use std::net::SocketAddr;
 
-// 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
-// monoio::net::udp::UdpSocket を削除し、std を使用する
+// 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）。待機はランタイムの
+// readiness（`wait_readable_fd` / `wait_writable_fd`）で行う
 use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
 use std::net::UdpSocket;
 
@@ -113,117 +113,7 @@ impl QuicUdpSocket {
     /// GSO/GRO も同時に設定されます。
     #[cfg(target_os = "linux")]
     pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
-        use std::os::unix::io::FromRawFd;
-
-        // ソケットを作成
-        let domain = if addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-
-        let fd = unsafe {
-            libc::socket(
-                domain,
-                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // SO_REUSEADDR を設定
-        let optval: libc::c_int = 1;
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // SO_REUSEPORT を設定
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // アドレスをバインド
-        let ret = match addr {
-            SocketAddr::V4(v4) => {
-                let sin = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                    },
-                    sin_zero: [0; 8],
-                };
-                unsafe {
-                    libc::bind(
-                        fd,
-                        &sin as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    )
-                }
-            }
-            SocketAddr::V6(v6) => {
-                let sin6 = libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: v6.port().to_be(),
-                    sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: libc::in6_addr {
-                        s6_addr: v6.ip().octets(),
-                    },
-                    sin6_scope_id: v6.scope_id(),
-                };
-                unsafe {
-                    libc::bind(
-                        fd,
-                        &sin6 as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                    )
-                }
-            }
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // std::net::UdpSocket を作成（非ブロッキングモードで設定）
-        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-        let socket = std_socket;
-        socket.set_nonblocking(true)?;
-        let local_addr = socket.local_addr()?;
-
-        let mut instance = Self {
-            socket,
-            gso_enabled: false,
-            gro_enabled: false,
-            local_addr,
-        };
-
-        // GSO/GRO を設定
-        instance.configure_gso_gro()?;
-
-        Ok(instance)
+        Self::bind_reuseport_with_gso(addr, true)
     }
 
     /// SO_REUSEPORT を設定してバインド（GSO/GRO の有効化オプション付き）
@@ -254,14 +144,21 @@ impl QuicUdpSocket {
 
         // SO_REUSEADDR を設定
         let reuseaddr: libc::c_int = 1;
-        unsafe {
+        // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し、長さはその大きさ
+        let ret = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_REUSEADDR,
                 &reuseaddr as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（以降この fd は使わない）
+            unsafe { libc::close(fd) };
+            return Err(e);
         }
 
         // SO_REUSEPORT を設定
@@ -276,8 +173,10 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // バインド
@@ -319,8 +218,10 @@ impl QuicUdpSocket {
             }
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // std::net::UdpSocket を作成（非ブロッキングモードで設定）
@@ -644,8 +545,8 @@ impl QuicUdpSocket {
 
     /// 複数パケットを GSO で送信（非同期ラッパー）
     ///
-    /// monoio は sendmsg を直接サポートしていないため、
-    /// 非ブロッキングソケットで同期 API を使用します。
+    /// 非ブロッキングソケットで `sendmsg` を直接呼び、`EAGAIN` のときだけ
+    /// ランタイムの書き込み可能待ちに入ります。
     ///
     /// **非推奨**: `send_gso_async()` を使用してください。
     /// この関数は EAGAIN を適切に処理しません。
@@ -932,13 +833,12 @@ pub struct MmsgRecvScratch {
     /// 送信元アドレス（per-msg）。
     addrs: Box<[libc::sockaddr_storage]>,
     /// 各 msg の iovec（bufs 内の自分の区画を指す）。
-    /// mmsghdr.msg_iov が指すバッキングストアのため、Rust 側の直接読みは不要だが Drop まで生存必須。
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_iov）のバッキングストア
-    iovecs: Box<[libc::iovec]>,
+    /// mmsghdr.msg_iov が指すバッキングストアのため、Rust 側の直接読みは不要だが Drop まで生存必須
+    /// （`_` 始まりは「読まないが持つ」ことを示す）。
+    _iovecs: Box<[libc::iovec]>,
     /// 各 msg の cmsg 受信バッファ（UDP_GRO を per-msg で受ける）。連続領域。
-    /// mmsghdr.msg_control が指すバッキングストア。
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_control）のバッキングストア
-    cmsg_bufs: Box<[u8]>,
+    /// mmsghdr.msg_control が指すバッキングストア（読まないが Drop まで生存必須）。
+    _cmsg_bufs: Box<[u8]>,
     /// recvmmsg へ渡す mmsghdr 配列。
     hdrs: Box<[libc::mmsghdr]>,
 }
@@ -988,8 +888,8 @@ impl MmsgRecvScratch {
             batch,
             bufs,
             addrs,
-            iovecs,
-            cmsg_bufs,
+            _iovecs: iovecs,
+            _cmsg_bufs: cmsg_bufs,
             hdrs,
         }
     }
@@ -1364,8 +1264,10 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // FreeBSD: SO_REUSEPORT はバインド共存のみでカーネル分散を行わない。
@@ -1385,15 +1287,19 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         let (storage, len) = socket_addr_to_raw(addr);
         let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // 高スループット向けにソケットバッファを拡大（Linux 版 configure_gso_gro と同方針）。
@@ -1989,7 +1895,7 @@ mod tests {
         assert_eq!(original, recovered);
     }
 
-    // 注: 実際のソケット操作（bind, recv, send）はmonoioランタイムが必要
+    // 注: 実際のソケット操作（bind, recv, send）はランタイムのワーカーが必要
     // これらは統合テストで実施することを推奨
 
     // ====================
@@ -2081,7 +1987,7 @@ mod tests {
         let scratch = MmsgRecvScratch::new();
         assert_eq!(scratch.batch_size(), MMSG_BATCH_DEFAULT);
         for i in 0..scratch.batch_size() {
-            let iov = &scratch.iovecs[i];
+            let iov = &scratch._iovecs[i];
             assert_eq!(iov.iov_len, RECV_BUFFER_SIZE);
             let expected = scratch.bufs[i * RECV_BUFFER_SIZE..].as_ptr();
             assert_eq!(iov.iov_base as *const u8, expected);
@@ -2089,7 +1995,7 @@ mod tests {
             let hdr = &scratch.hdrs[i].msg_hdr;
             assert_eq!(
                 hdr.msg_iov as *const libc::iovec,
-                &scratch.iovecs[i] as *const libc::iovec
+                &scratch._iovecs[i] as *const libc::iovec
             );
         }
     }

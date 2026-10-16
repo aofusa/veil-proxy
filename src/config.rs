@@ -3059,14 +3059,16 @@ struct Config {
     #[serde(default)]
     static_file_cache: cache::StaticContentCacheConfig,
     /// HTTP/2 設定セクション
+    #[cfg(feature = "http2")]
     #[serde(default)]
-    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http2: Http2ConfigSection,
+    /// `http2` feature 無しのビルドでは `[http2]` を解釈しない。キーは拒否せずに受け取り、
+    /// あれば読み込み時に無視した旨を警告する（[`warn_unbuilt_sections`]）。
+    #[cfg(not(feature = "http2"))]
+    #[serde(default)]
+    http2: Option<toml::Value>,
     /// HTTP/3 設定セクション
     #[serde(default)]
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
@@ -3779,8 +3781,6 @@ pub struct ServerConfigSection {
     ///
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
-    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub http2_enabled: bool,
 
     // ====================
@@ -4092,8 +4092,6 @@ pub struct PerformanceConfigSection {
     ///   - 1MB超: 1MB
     /// - "manual": 固定チャンクサイズを使用
     #[serde(default = "default_chunk_size_mode")]
-    #[cfg_attr(not(veil_ktls), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub chunk_size_mode: ChunkSizeMode,
 
     /// 手動チャンクサイズ（バイト）
@@ -4101,8 +4099,6 @@ pub struct PerformanceConfigSection {
     /// chunk_size_mode = "manual" 時に使用します。
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
-    #[cfg_attr(not(veil_ktls), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub manual_chunk_size: usize,
 
     // ====================
@@ -4117,8 +4113,6 @@ pub struct PerformanceConfigSection {
     ///
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
-    #[cfg_attr(not(veil_ktls), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub per_stream_pipe_enabled: bool,
 
     /// HTTP/1.1 のキープアライブで、応答を返した直後に次の要求を蓄積バッファへ直接読みにいく時間（ミリ秒、F-205）。
@@ -5703,7 +5697,7 @@ impl UpstreamGroup {
 /// 非同期読み込みトレイト（SafeReadBuffer対応）
 ///
 /// 読み込み操作で `SafeReadBuffer` を受け取り、返却します。
-/// monoio の `set_init()` コールバックにより、読み込み完了時に
+/// ランタイムの `IoBufMut::set_init()` コールバック（`src/runtime/buf.rs`）により、読み込み完了時に
 /// 自動的に `valid_len` が設定されます。
 #[allow(async_fn_in_trait)]
 pub trait AsyncReader {
@@ -6056,6 +6050,15 @@ fn validate_listeners(config: &Config) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// ビルドに含まれていない feature の設定セクションが書かれていたら、無視することを警告する
+/// （キーを拒否すると、同じ設定ファイルを feature の違うビルドで使えなくなる）。
+fn warn_unbuilt_sections(_config: &Config) {
+    #[cfg(not(feature = "http2"))]
+    if _config.http2.is_some() {
+        warn!("[config] [http2] is ignored: this build does not include the http2 feature");
+    }
 }
 
 fn validate_config(config: &Config) -> io::Result<()> {
@@ -6926,12 +6929,8 @@ pub struct LoadedConfig {
     pub unix_socket_permissions: String,
     pub tls_config: Arc<ServerConfig>,
     /// TLS証明書パス（ログ・表示用）
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_path: String,
     /// 証明書の自動リロードを有効にするか（F-03）
     pub tls_auto_reload: bool,
@@ -6944,15 +6943,11 @@ pub struct LoadedConfig {
     /// Landlock適用前に読み込まれた証明書データ。
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
     ///
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    // 理由: 設定キーはどの feature のビルドでも受理する（無効時は読まないだけ）
     pub tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,
@@ -7263,6 +7258,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
 
     // 設定ファイルのバリデーション
     validate_config(&config)?;
+    warn_unbuilt_sections(&config);
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -7436,6 +7432,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // 設定ファイルのバリデーション
     validate_config(&config)?;
+    warn_unbuilt_sections(&config);
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
@@ -8486,7 +8483,7 @@ pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>) {
 
 /// High-Performance Reverse Proxy Server
 ///
-/// io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー
+/// io_uring（独自ランタイム）と rustls を使用した高性能リバースプロキシサーバー
 #[derive(Parser, Debug)]
 #[command(name = "veil")]
 #[command(author, version, about, long_about = None)]

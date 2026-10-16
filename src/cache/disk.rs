@@ -1,7 +1,7 @@
 //! ディスクキャッシュ
 //!
 //! 大きいレスポンス用のディスクベースキャッシュを提供します。
-//! monoio::fsを使用した非同期I/Oにより、ワーカースレッドのブロッキングを防ぎます。
+//! ランタイムの非同期ファイル I/O（`runtime::offload` へ退避した std::fs）により、ワーカースレッドのブロッキングを防ぎます。
 
 use super::key::CacheKey;
 use std::io;
@@ -20,7 +20,7 @@ pub struct DiskCacheConfig {
     pub extension: String,
     /// 非同期I/Oを使用するかどうか（io_uring有効時のみ）
     ///
-    /// - true: monoio::fsを使用した非同期I/O（io_uring）
+    /// - true: ランタイムの非同期ファイル I/O（offload）
     /// - false: 同期I/O（std::fs）
     ///
     /// デフォルト: true（パフォーマンス向上のため）
@@ -43,7 +43,7 @@ impl Default for DiskCacheConfig {
 /// ディスクキャッシュ
 ///
 /// ファイルシステムベースのキャッシュストレージ。
-/// monoio::fsを使用した非同期I/Oをサポート。
+/// ランタイムの非同期ファイル I/O をサポート。
 pub struct DiskCache {
     /// 設定
     config: DiskCacheConfig,
@@ -331,7 +331,7 @@ impl DiskCache {
     }
 }
 
-/// monoio非同期I/O操作
+/// 非同期ファイル I/O 操作
 ///
 /// io_uringを使用した非同期ファイルI/Oを提供します。
 /// Linux環境でのみ利用可能です。

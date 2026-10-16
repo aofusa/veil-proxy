@@ -1,7 +1,7 @@
-//! 非同期 I/O トレイト（monoio 互換レイヤー）
+//! 非同期 I/O トレイト（所有権ベース）
 //!
-//! monoio の `AsyncReadRent` / `AsyncWriteRentExt` に相当するトレイトを自前定義する。
-//! 所有権ベースの I/O モデルを維持しつつ、monoio への依存を排除する。
+//! `AsyncReadRent` / `AsyncWriteRentExt` を自前定義する。io_uring の完了型 I/O に合わせ、
+//! バッファの所有権を I/O の間カーネル側へ渡し、完了時に返す。
 
 use super::buf::{IoBuf, IoBufMut};
 use std::io;
@@ -26,10 +26,10 @@ pub unsafe trait IoVecBufMut: 'static {}
 /// （現状 stub のため実装型なし）。
 pub unsafe trait IoVecBuf: 'static {}
 
-// BufResult: monoio 互換の結果型エイリアス
+// BufResult: 結果とバッファを一緒に返す型エイリアス
 pub type BufResult<T, B> = (io::Result<T>, B);
 
-/// 非同期読み取りトレイト（所有権ベース、monoio::io::AsyncReadRent 互換）
+/// 非同期読み取りトレイト（所有権ベース）
 pub trait AsyncReadRent {
     /// バッファに読み取る（バッファの所有権を取る）
     fn read<T: IoBufMut>(
@@ -46,7 +46,7 @@ pub trait AsyncReadRent {
     }
 }
 
-/// 非同期書き込みトレイト（所有権ベース、monoio::io::AsyncWriteRent 互換）
+/// 非同期書き込みトレイト（所有権ベース）
 pub trait AsyncWriteRent {
     /// バッファを書き込む（バッファの所有権を取る）
     fn write<T: IoBuf>(&mut self, buf: T)
@@ -69,7 +69,7 @@ pub trait AsyncWriteRent {
     fn shutdown(&mut self) -> impl std::future::Future<Output = io::Result<()>>;
 }
 
-/// AsyncWriteRent の拡張メソッド（monoio::io::AsyncWriteRentExt 互換）
+/// AsyncWriteRent の拡張メソッド
 ///
 /// バイナリクレート内部専用のトレイトのため、auto trait 境界（Send 等）を
 /// 呼び出し側で指定する必要がなく、`async fn` のままで問題ない。
@@ -150,12 +150,12 @@ impl BufferedReadState for super::tcp::TcpStream {
 }
 
 // ====================
-// 非同期ファイル I/O（monoio::fs 互換）
+// 非同期ファイル I/O
 // ====================
 
 /// ファイルを読み取る（std::fs::read の非同期版）
 ///
-/// monoio::fs::read の互換実装。ホットパス（静的ファイル配信の memory モード等）からも
+/// ファイル全体の読み込み。ホットパス（静的ファイル配信の memory モード等）からも
 /// 呼ばれるため、ブロッキング FS を offload（専用スレッドプール + eventfd 完了待機）へ
 /// 退避してイベントループを塞がない（B-26。リング未初期化のコンテキストでは inline 実行）。
 pub async fn read(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
@@ -165,7 +165,7 @@ pub async fn read(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
     crate::runtime::offload::offload(move || std::fs::read(path)).await
 }
 
-/// ファイルを削除する（monoio::fs::remove_file の互換実装）
+/// ファイルを削除する
 ///
 /// B-26: offload 経由でイベントループを塞がない。
 pub async fn remove_file(path: impl AsRef<std::path::Path>) -> io::Result<()> {
@@ -176,7 +176,7 @@ pub async fn remove_file(path: impl AsRef<std::path::Path>) -> io::Result<()> {
 }
 
 // ====================
-// 非同期ファイル（monoio::fs::File 互換）
+// 非同期ファイル
 // ====================
 
 /// 非同期ファイル（簡略実装、コールドパスのみ使用）
@@ -331,7 +331,7 @@ impl std::os::windows::io::AsRawHandle for File {
     }
 }
 
-/// OpenOptions（monoio::fs::OpenOptions 互換）
+/// OpenOptions
 pub struct OpenOptions {
     inner: std::fs::OpenOptions,
     // F-123/F-153: FreeBSD capability mode / Linux openat2 で読み取り専用 open を

@@ -609,7 +609,7 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
 // cache feature 有効時のみ参照される
-#[cfg_attr(not(feature = "cache"), allow(dead_code))]
+#[cfg(feature = "cache")]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_size_bytes", "Current cache size in bytes").namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
@@ -620,7 +620,7 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
 // cache feature 有効時のみ参照される
-#[cfg_attr(not(feature = "cache"), allow(dead_code))]
+#[cfg(feature = "cache")]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts =
         Opts::new("cache_entries", "Current number of cache entries").namespace("veil_proxy");
@@ -671,7 +671,7 @@ pub(crate) fn record_cache_miss(_host: &str) {
 /// メトリクス: キャッシュ保存を記録
 #[inline]
 // cache feature 有効時のみ呼び出される
-#[cfg_attr(not(feature = "cache"), allow(dead_code))]
+#[cfg(feature = "cache")]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
     CACHE_STORES_TOTAL

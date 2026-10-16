@@ -1,13 +1,15 @@
-//! # HTTP/3 サーバー (monoio + quiche ベース)
+//! # HTTP/3 サーバー（独自ランタイム + quiche）
 //!
-//! monoio (io_uring) と Cloudflare quiche を使用した HTTP/3 サーバー実装。
-//! thread-per-core モデルで、各コネクションを独立した非同期タスクで処理します。
+//! veil の独自ランタイム（`src/runtime/`。Linux 既定は io_uring、`epoll`・BSD・macOS・Windows は
+//! readiness reactor）と Cloudflare quiche を使用した HTTP/3 サーバー実装。thread-per-core モデルで、
+//! ワーカーごとに 1 本のメインループが自分の UDP ソケットの全接続を処理する。
 //!
 //! ## 設計ポイント
 //!
-//! - **io_uring 活用**: monoio の UdpSocket で高効率な UDP I/O
-//! - **コネクションごとのタスク分離**: monoio::spawn で各接続を独立管理
-//! - **タイマー管理**: quiche::timeout() と monoio::time::sleep の連携
+//! - **UDP I/O**: io_uring は `recvmsg` のバッチ（`[http3] mmsg_batch_size`）、reactor は
+//!   `recv_drain_max` まで読み切る。送信は GSO（F-111/F-115）
+//! - **イベント駆動**: 仕事のある接続だけをダーティ集合で回す（全接続スイープ禁止。B-12/F-151）
+//! - **タイマー管理**: quiche::timeout() と `runtime::time` の連携
 //! - **H3 インスタンスの永続化**: QPACK 動的テーブル等の状態を維持
 //!
 //! ## 機能
@@ -4061,7 +4063,7 @@ fn drive_request_pump(
                 ps.req_pending.push_front(item); // バックプレッシャ: recv_body も止める。
                 return did_work;
             }
-            Err(TrySendError::Closed(_)) => {
+            Err(TrySendError::Closed) => {
                 abandon_request_body(conn, stream_id, ps);
                 return true;
             }
@@ -4100,7 +4102,7 @@ fn drive_request_pump(
                             ps.req_pending.push_back(b);
                             return did_work;
                         }
-                        Err(TrySendError::Closed(_)) => {
+                        Err(TrySendError::Closed) => {
                             abandon_request_body(conn, stream_id, ps);
                             return true;
                         }
@@ -4509,7 +4511,7 @@ fn send_simple_h3_error(
 }
 
 // ====================
-// 非同期バックエンドプロキシ（monoio TcpStream 使用）
+// 非同期バックエンドプロキシ（`runtime::tcp::TcpStream` 使用）
 // ====================
 
 /// バックエンドプロキシ結果
@@ -4681,9 +4683,9 @@ fn conn_map_hasher() -> foldhash::quality::RandomState {
     foldhash::quality::RandomState::default()
 }
 
-/// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
+/// HTTP/3 サーバーを起動（独自ランタイム上で実行）
 ///
-/// この関数は monoio のスレッド内から呼び出す必要があります。
+/// この関数はランタイムのワーカースレッド（`runtime::block_on` の中）から呼び出す必要があります。
 /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポートします。
 ///
 /// ## セキュリティ
@@ -4836,7 +4838,7 @@ pub async fn run_http3_server_async(
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 
-    // F-149(B.9): monoio は F-28 で除去済みで現存しない。ビルドバックエンドに応じて実態の
+    // F-149(B.9): F-28 より前の外部ランタイムの名前ではなく、ビルドバックエンドに応じて実態の
     // ランタイム名（io_uring / readiness reactor）を報告する（build.rs 発行の cfg、
     // veil_rt_uring = Linux 既定 io_uring、veil_rt_reactor = epoll/kqueue readiness）。
     #[cfg(veil_rt_uring)]
@@ -6202,7 +6204,7 @@ fn put_h3_send_scratch(mut scratch: H3SendScratch) {
 
 /// HTTP/3 サーバーを起動（同期ラッパー）
 ///
-/// 別スレッドで monoio ランタイムを作成して実行します。
+/// 別スレッドで独自ランタイム（`runtime::block_on`）を作成して実行します。
 pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io::Result<()> {
     // カスタム io_uring ランタイムで非同期 HTTP/3 サーバーを実行
     let r =

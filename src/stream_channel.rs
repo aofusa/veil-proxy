@@ -119,10 +119,8 @@ pub struct Receiver<T> {
 pub enum TrySendError<T> {
     /// 容量上限（バックプレッシャ）。アイテムは返却される。
     Full(T),
-    /// 受信端が drop 済み。アイテムは返却される。
-    // 理由付き allow: std の `TrySendError` と同じく、送れなかった値の所有権を呼び出し側へ返すための
-    // フィールド。現在の呼び出し側はすべて破棄する（`Closed(_)`）が、値を取り戻せる API を保つ。
-    Closed(#[allow(dead_code)] T),
+    /// 受信端が drop 済み。アイテムは破棄される（呼び出し側はすべて破棄していたので返さない）。
+    Closed,
 }
 
 /// [`Sender::send`] の失敗: 受信端が drop 済み（アイテムは破棄される）。
@@ -158,7 +156,8 @@ impl<T> Sender<T> {
         let waker = {
             let mut s = self.sh.borrow_mut();
             if s.receiver_closed {
-                return Err(TrySendError::Closed(item));
+                drop(item);
+                return Err(TrySendError::Closed);
             }
             if s.queue.len() >= s.cap {
                 return Err(TrySendError::Full(item));
@@ -354,7 +353,7 @@ mod tests {
     fn channel_receiver_drop_blocks_send() {
         let (tx, rx) = channel::<u32>(1);
         drop(rx);
-        assert!(matches!(tx.try_send(1), Err(TrySendError::Closed(1))));
+        assert!(matches!(tx.try_send(1), Err(TrySendError::Closed)));
     }
 
     #[test]

@@ -92,10 +92,8 @@ pub struct SlotMeta {
 struct RecvSlot {
     buf: Box<[u8]>,
     addr: Box<libc::sockaddr_storage>,
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（msg.msg_control）のバッキングストア
     cmsg: Box<[u8]>,
     msg: Box<libc::msghdr>,
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（msg.msg_iov）のバッキングストア
     iov: Box<libc::iovec>,
     /// 現在 in-flight な op の user_data（未提出時は 0）。
     user_data: u64,

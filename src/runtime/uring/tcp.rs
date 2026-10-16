@@ -1,7 +1,7 @@
 //! 非同期 TcpListener / TcpStream
 //!
 //! io_uring の ACCEPT / READ / WRITE / CONNECT オペコードを使用した
-//! 非同期 TCP ソケット実装。monoio の同名型との API 互換を持つ。
+//! 非同期 TCP ソケット実装（io_uring。reactor 版と同じ API）。
 //!
 //! ## 設計
 //!
@@ -153,14 +153,18 @@ impl TcpListener {
         let (storage, len) = sockaddr_to_storage(&addr);
         let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         Ok(Self { fd, is_unix: false })
@@ -202,14 +206,18 @@ impl TcpListener {
         let (storage, len) = sockaddr_to_storage(&addr);
         let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         Ok(Self { fd, is_unix: false })
