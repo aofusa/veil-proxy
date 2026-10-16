@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 /// 組み込みハンドラの名前（`is_builtin_enabled` が `[api] openapi_enabled` で出し分ける）。
 pub const JSON_HANDLER: &str = "__veil_openapi_json";
+/// Swagger UI を返す組み込みハンドラの名前。
 pub const DOCS_HANDLER: &str = "__veil_openapi_docs";
 
 static DOC: RwLock<Option<Bytes>> = RwLock::new(None);

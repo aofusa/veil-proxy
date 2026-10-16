@@ -357,7 +357,7 @@ pub struct UpstreamGroup {
     /// H2C (HTTP/2 over cleartext) を強制するかどうか
     pub use_h2c: bool,
     /// Weighted Round Robin 用の累積重みオフセット（構築時計算、O(1) 選択用）
-    /// servers と同じ順序。weighted_offsets[i] は servers[0..=i] の重みの累積和。
+    /// servers と同じ順序。`weighted_offsets[i]` は `servers[0..=i]` の重みの累積和。
     pub weighted_offsets: Vec<u32>,
     /// 全サーバーの重み合計（0 の場合は Weighted を使わない）
     pub total_weight: u32,

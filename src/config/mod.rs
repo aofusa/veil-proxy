@@ -673,7 +673,7 @@ fn default_l4_weight() -> u32 {
     1
 }
 
-/// L4 リスナー設定（TOML: [[l4]]）
+/// L4 リスナー設定（TOML: `[[l4]]`）
 #[derive(Deserialize, Clone, Debug)]
 pub struct L4ListenerConfig {
     /// リスナー名（ログ・メトリクス識別用）
@@ -1422,7 +1422,7 @@ fn default_server_header_value() -> String {
 #[derive(Deserialize)]
 pub struct TlsConfigSection {
     /// 証明書のパス。`[tls]` 自体を省略した場合・空文字の場合は「TLS 無し」。
-    /// TLS 無しが許されるのは平文専用サーバ構成（[`plaintext_only_server`]）だけ。
+    /// TLS 無しが許されるのは平文専用サーバ構成（`plaintext_only_server`）だけ。
     #[serde(default)]
     pub cert_path: String,
     #[serde(default)]
@@ -1596,7 +1596,7 @@ pub struct PerformanceConfigSection {
     /// RFC 7230 Section 5.7.1 に従い、プロキシ経由のリクエスト/レスポンスに
     /// Via ヘッダーを追加します。
     ///
-    /// 形式: Via: 1.1 <hostname>
+    /// 形式: Via: 1.1 `<hostname>`
     ///
     /// - true: Viaヘッダーを追加
     /// - false: Viaヘッダーを追加しない（デフォルト）
@@ -1668,7 +1668,7 @@ pub struct PerformanceConfigSection {
     ///   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
     ///
     /// ルーティングごとの設定:
-    ///   - 各ルーティング（[[route]]）で`open_file_cache`セクションを指定可能
+    ///   - 各ルーティング（`[[route]]`）で`open_file_cache`セクションを指定可能
     ///   - ルーティング設定がない場合は、このグローバル設定が使用される
     ///
     /// デフォルト: false（無効）

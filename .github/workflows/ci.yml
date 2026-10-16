@@ -49,6 +49,21 @@ jobs:
       - run: cargo clippy --all-targets --features full -- -D warnings
       - run: cargo clippy --all-targets --features full,epoll -- -D warnings
 
+  # F-239: docs.rs と同じ構成（full + api）で API 文書をビルドし、壊れたリンクと doctest の失敗を検出する。
+  docs:
+    name: docs (full,api)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --no-default-features --features full,api
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: cargo test --doc --no-default-features --features full,api
+
   build:
     name: build (${{ matrix.features }})
     runs-on: ubuntu-latest

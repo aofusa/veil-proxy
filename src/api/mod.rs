@@ -21,6 +21,8 @@
 //!
 //! 設計: `docs/backlog/features/F-188-api-library-core.md`。利用者向けガイド: `docs/guide/library.md`。
 
+#![warn(missing_docs)]
+
 pub mod app;
 /// ワーカーとハンドラ用プールの間の有界キュー（C・Python のストリーミング・gRPC・L4。F-210）
 pub mod bridge;

@@ -74,6 +74,14 @@ include = [
 ]
 build = "build.rs"
 
+# F-239: docs.rs のビルド。ビルド時間の上限に収めるためターゲットは 1 つ。`docsrs` cfg で
+# `doc_cfg`（どの feature が要る項目かの表示）を有効にする。
+[package.metadata.docs.rs]
+features = ["full", "api"]
+no-default-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
 [lib]
 name = "veil"
 path = "src/lib.rs"

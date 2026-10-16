@@ -13,7 +13,7 @@ use super::*;
 pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// 設定リロード要求フラグ（SIGHUP でトリガー）
-/// Arc<AtomicBool> として初期化（signal-hook の要件）
+/// `Arc<AtomicBool>` として初期化（signal-hook の要件）
 pub static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
 /// TLS 証明書リロード要求フラグ（SIGHUP でトリガー、F-03）

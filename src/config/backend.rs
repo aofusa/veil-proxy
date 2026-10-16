@@ -13,9 +13,9 @@ pub enum Backend {
     /// 固定応答（F-219: `type = "Respond"`・フォルトの中断・CORS のプリフライト）
     Respond(Arc<crate::route_traffic::FixedResponse>),
     /// Proxy バックエンド（ロードバランシング対応）
-    /// - Arc<UpstreamGroup>: アップストリームグループ（単一または複数バックエンド）
-    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
-    /// - Arc<CompressionConfig>: 圧縮設定
+    /// - `Arc<UpstreamGroup>`: アップストリームグループ（単一または複数バックエンド）
+    /// - `Arc<SecurityConfig>`: ルートごとのセキュリティ設定
+    /// - `Arc<CompressionConfig>`: 圧縮設定
     /// - Arc<buffering::BufferingConfig>: バッファリング設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
     Proxy(
@@ -29,9 +29,9 @@ pub enum Backend {
         Option<Arc<Vec<ModuleRef>>>,
     ),
     /// MemoryFile バックエンド
-    /// - Arc<Vec<u8>>: ファイルコンテンツ
-    /// - Arc<str>: MIMEタイプ
-    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
+    /// - `Arc<Vec<u8>>`: ファイルコンテンツ
+    /// - `Arc<str>`: MIMEタイプ
+    /// - `Arc<SecurityConfig>`: ルートごとのセキュリティ設定
     MemoryFile(
         Arc<Vec<u8>>,
         Arc<str>,
@@ -40,14 +40,14 @@ pub enum Backend {
         Option<Arc<Vec<ModuleRef>>>,
     ),
     /// SendFile バックエンド
-    /// - Arc<PathBuf>: ベースパス（設定に書かれた原形。パストラバーサル検査の
+    /// - `Arc<PathBuf>`: ベースパス（設定に書かれた原形。パストラバーサル検査の
     ///   フォールバック・capsicum のルート照合キーとして使う）
     /// - bool: ディレクトリかどうか
-    /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
-    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
+    /// - `Option<Arc<str>>`: インデックスファイル名（None = "index.html"）
+    /// - `Arc<SecurityConfig>`: ルートごとのセキュリティ設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
     /// - Option<Arc<cache::OpenFileCacheConfig>>: OpenFileCache設定（ルーティングごと）
-    /// - Option<Arc<Path>>: base_path の canonical 形（F-145、`load_backend` で
+    /// - `Option<Arc<Path>>`: base_path の canonical 形（F-145、`load_backend` で
     ///   config ロード時に一度だけ解決。ディレクトリルートでのみ Some になり得る。
     ///   解決失敗時は None＝リクエスト時は生の base_path へフォールバック）
     /// - Option<Arc<cache::StaticContentCacheRouteConfig>>: 静的コンテンツキャッシュ
@@ -65,7 +65,7 @@ pub enum Backend {
         Option<Arc<Vec<ModuleRef>>>,
     ),
     /// Redirect バックエンド
-    /// - Arc<str>: リダイレクト先URL
+    /// - `Arc<str>`: リダイレクト先URL
     /// - u16: ステータスコード（301, 302, 307, 308）
     /// - bool: 元のパスを保持するか
     Redirect(

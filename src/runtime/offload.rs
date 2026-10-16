@@ -35,7 +35,7 @@ use crate::runtime::tcp::wait_readable_fd;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// ブロッキング FS 用スレッドプール（MPMC: Mutex<VecDeque> + Condvar）。
+/// ブロッキング FS 用スレッドプール（MPMC: `Mutex<VecDeque>` + Condvar）。
 struct OffloadPool {
     queue: Mutex<VecDeque<Job>>,
     cv: Condvar,

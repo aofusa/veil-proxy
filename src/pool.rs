@@ -943,7 +943,7 @@ pub(crate) fn buf_get() -> SafeReadBuffer {
 /// バッファ返却ヘルパー（SafeReadBuffer版）
 ///
 /// SafeReadBuffer をプールに返却します。
-/// 内部の Vec<u8> を取り出してプールに格納します。
+/// 内部の `Vec<u8>` を取り出してプールに格納します。
 ///
 /// # セキュリティ
 ///
@@ -954,9 +954,9 @@ pub(crate) fn buf_put(buf: SafeReadBuffer) {
     buf_put_vec(buf.into_inner());
 }
 
-/// バッファ返却ヘルパー（Vec<u8>版、書き込み後の返却用）
+/// バッファ返却ヘルパー（`Vec<u8>` 版、書き込み後の返却用）
 ///
-/// 書き込み操作で使用された Vec<u8> をプールに返却します。
+/// 書き込み操作で使用された `Vec<u8>` をプールに返却します。
 /// 主に `into_truncated()` 後の書き込み完了時に使用されます。
 #[inline(always)]
 #[allow(clippy::uninit_vec)]

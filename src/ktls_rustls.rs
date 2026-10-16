@@ -5,8 +5,8 @@
 //!
 //! ## 主要コンポーネント
 //!
-//! - [`RustlsConfig`]: TLS 設定を管理
-//! - [`KtlsTlsStream`]: ランタイムの AsyncReadRent/AsyncWriteRent を実装した TLS ストリーム
+//! - `RustlsConfig`: TLS 設定を管理
+//! - `KtlsTlsStream`: ランタイムの AsyncReadRent/AsyncWriteRent を実装した TLS ストリーム
 //! - [`RustlsAcceptor`]: サーバー側の TLS アクセプター
 //! - [`RustlsConnector`]: クライアント側の TLS コネクター
 //!

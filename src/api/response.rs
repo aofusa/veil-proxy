@@ -158,14 +158,17 @@ impl Response {
         self
     }
 
+    /// HTTP ステータスコード。
     pub fn status_code(&self) -> u16 {
         self.status
     }
 
+    /// 応答ヘッダ（名前, 値）の一覧。
     pub fn headers(&self) -> &[(Bytes, Bytes)] {
         &self.headers
     }
 
+    /// 応答本文。
     pub fn body(&self) -> &Bytes {
         &self.body
     }
@@ -181,6 +184,7 @@ impl Response {
 
 /// ハンドラの戻り値から `Response` を作る。
 pub trait IntoResponse {
+    /// 応答に変換する。
     fn into_response(self) -> Response;
 }
 
@@ -286,23 +290,29 @@ impl<T: Into<String>> IntoResponse for Html<T> {
 /// ハンドラが `?` で返せる汎用エラー（ステータス + メッセージ、本文は `{"detail": ...}`）。
 #[derive(Debug, Clone)]
 pub struct ApiError {
+    /// HTTP ステータスコード。
     pub status: u16,
+    /// `{"detail": ...}` として返すメッセージ。
     pub message: String,
 }
 
 impl ApiError {
+    /// ステータスコードとメッセージから作る。
     pub fn new(status: u16, message: impl Into<String>) -> ApiError {
         ApiError {
             status,
             message: message.into(),
         }
     }
+    /// 400 Bad Request。
     pub fn bad_request(message: impl Into<String>) -> ApiError {
         ApiError::new(400, message)
     }
+    /// 404 Not Found。
     pub fn not_found(message: impl Into<String>) -> ApiError {
         ApiError::new(404, message)
     }
+    /// 500 Internal Server Error。
     pub fn internal(message: impl Into<String>) -> ApiError {
         ApiError::new(500, message)
     }

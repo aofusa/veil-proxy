@@ -30,8 +30,11 @@ pub struct HealthCheckResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i32)]
 pub enum ServingStatus {
+    /// 状態が不明。
     Unknown = 0,
+    /// リクエストを処理できる。
     Serving = 1,
+    /// リクエストを処理できない。
     NotServing = 2,
     /// `Watch` だけが使う（未登録のサービス）
     ServiceUnknown = 3,

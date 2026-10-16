@@ -29,7 +29,9 @@ static COLLAPSED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Example
 ///
-/// ```rust
+/// 擬似コードのため doctest では実行しない（`...` と未定義の変数を含む）。
+///
+/// ```rust,ignore
 /// if try_start_revalidation(cache_key.hash_value()) {
 ///     // バックグラウンド更新を実行
 ///     spawn_background_revalidation(...);

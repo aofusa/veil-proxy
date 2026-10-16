@@ -738,7 +738,7 @@ pub(crate) fn secure_zero(data: &mut [u8]) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Arc<Vec<u8>> をセキュアにゼロ化して解放
+/// `Arc<Vec<u8>>` をセキュアにゼロ化して解放
 ///
 /// Arc の参照カウントが 1（自分だけ）の場合、
 /// 内部の Vec をゼロ化してからドロップします。

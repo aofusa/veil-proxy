@@ -146,7 +146,7 @@ pub(super) async fn proxy_to_h2c_backend_async(
     })
 }
 
-/// コネクション管理（Rc<RefCell> で共有）
+/// コネクション管理（`Rc<RefCell>` で共有）
 /// 接続マップ本体。キーはサーバが HMAC で導出した接続 ID（B-94）で、データグラムごとに
 /// 数回引くため、既定の SipHash ではなく乱数シード付きの foldhash を使う
 /// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは

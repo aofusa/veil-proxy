@@ -1,7 +1,7 @@
 //! gRPC Status Codes (0-16)
 //!
 //! gRPC uses numeric status codes transmitted via the `grpc-status` trailer.
-//! See: https://grpc.github.io/grpc/core/md_doc_statuscodes.html
+//! See: <https://grpc.github.io/grpc/core/md_doc_statuscodes.html>
 
 use std::fmt;
 

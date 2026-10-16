@@ -52,6 +52,7 @@ impl<T> std::ops::Deref for State<T> {
 }
 
 impl Headers {
+    /// ヘッダの値を UTF-8 文字列として返す（名前は大文字小文字を区別しない）。無い・UTF-8 でない場合は `None`。
     pub fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
@@ -62,6 +63,7 @@ impl Headers {
 
 /// リクエストから値を取り出す（失敗したらその応答を返す）。
 pub trait FromRequest: Sized {
+    /// `req` から値を取り出す。取り出せなければ、そのまま返す応答（400・422 等）を `Err` で返す。
     fn from_request(req: &Request) -> Result<Self, Response>;
 }
 
