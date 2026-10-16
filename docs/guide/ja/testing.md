@@ -215,7 +215,7 @@ veil-proxy/
 │   └── ...
 ├── tests/
 │   ├── integration_tests.rs  # 13統合テスト
-│   ├── e2e_tests.rs          # 24 E2Eテスト
+│   ├── e2e_tests/            # E2E テスト（main.rs が共通のヘルパー、機能ごとに 1 ファイル。F-233）
 │   ├── e2e_setup.sh          # E2E環境セットアップ
 │   ├── run_bench.sh          # ベンチマーク自動化
 │   └── common/

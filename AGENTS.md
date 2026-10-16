@@ -12,7 +12,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - クレート名 `veil`（ディレクトリ名 `veil-proxy`）。リリースバイナリは `target/release/veil`。
 - **ライブラリ + バイナリ構成**。mod 宣言・公開 API は [src/lib.rs](src/lib.rs)、サーバ起動配線は
   [src/entry.rs](src/entry.rs)（`veil::run()`）、[src/main.rs](src/main.rs) は `veil::run()` を呼ぶだけ。
-- 設定は TOML（`serde`）。全キーのリファレンスは [examples/config.toml](examples/config.toml)（`src/config.rs` と同期）。
+- 設定は TOML（`serde`）。全キーのリファレンスは [examples/config.toml](examples/config.toml)（`src/config/` と同期。設定の型は `src/config/mod.rs`）。
 
 ---
 
@@ -283,8 +283,11 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `src/runtime/` | 独自ランタイム。共有（buf/io/offload）+ `uring/`（io_uring）+ `reactor/`（epoll/kqueue/WSAPoll） |
 | `src/tls_writev.rs` | rustls 暗号文の `writev(2)` 直接送出（F-150） |
 | `src/veil_alloc/` | veil 専用アロケータ（F-183、`veil-alloc`）。`src/alloc_tune.rs` はアイドル時回収 |
+| `src/proxy/` | HTTP/1.1・HTTP/2 の接続・要求処理・上流への転送（F-233 で機能ごとのファイルに分割。子は `use super::*`） |
+| `src/config/` | 設定の型・読み込み・検証・TLS・LB・Backend（F-233 で分割） |
+| `src/http3_server/` | HTTP/3 のサーバ（メインループ・バッファ経路のタスク・ストリーミング。F-233 で分割） |
 | `src/wasm_plugin_config.rs` | Proxy-Wasm プラグイン設定（`wasm` feature 非依存で常にコンパイル） |
-| `tests/`、`benches/` | 単体以外のテスト・E2E・ベンチ |
+| `tests/`、`benches/` | 単体以外のテスト・E2E（`tests/e2e_tests/`）・ベンチ |
 | `examples/config.toml` | 設定リファレンス（全キー網羅） |
 | `docs/guide/` | 利用者向けガイド（英語、`ja/` に日本語） |
 | `docs/readme/` | 日本語 README |
