@@ -898,8 +898,8 @@ time of the server's cores (including the kernel's loopback processing) divided 
 | axum + `veil::tokio`, `axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
 | axum + `veil::tokio`, per-core | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
 | axum + `veil::tokio`, per-core (epoll) | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
-| veil `App` + axum `Router` (`tokio_service`) | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
-| veil `App` + axum `Router` (epoll) | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
+| veil `App` + axum `Router` (`tokio_service`) | 49,960 | 46,013 | 3.37 | 41.5 | 12.0 |
+| veil `App` + axum `Router` (epoll) | 46,905 | 44,225 | 3.34 | 44.0 | 9.8 |
 | veil native handler (`#[veil::route]`) | 68,832 | 63,069 | 2.83 | 29.4 | 11.4 |
 | veil native handler (epoll) | 67,013 | 61,303 | 2.78 | 30.2 | 10.0 |
 
@@ -918,8 +918,12 @@ against axum + tokio per-core at 66,980 / 61,184 req/s in the same run; `docs/ar
   equal CPU per request (29.4 / 30.2 µs against 30.5 µs). On io_uring a keep-alive connection that sends its next
   request quickly is read with one bounded `RECV` instead of a readiness poll followed by a read (F-205,
   `[performance] keepalive_direct_read_ms`); idle connections still hold no read buffer. Mounting an axum `Router`
-  adds a conversion to and from `http::Request`/`http::Response` (most of its 30 allocations per request are in
-  http/axum).
+  adds a conversion to and from `http::Request`/`http::Response`. Since F-235 the conversion shares the request's
+  path and header values (`Bytes`) instead of copying them, takes the response body without collecting it into a
+  queue, and no longer puts the veil `Request` into the extensions of a mounted service: 30 → 22 allocations per
+  request (the native handler: 4), and the mount went from 67% to 76% of the native handler (49,960 against
+  65,945 req/s in the same alternating run, 2026-10-16). Of the 22, about 12 are inside axum (routing, extensions,
+  boxed futures).
 
 ### HTTP/2 (h2c) and HTTP/3
 

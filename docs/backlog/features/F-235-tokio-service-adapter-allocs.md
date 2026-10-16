@@ -1,6 +1,6 @@
 # F-235: `App::tokio_service`（tower / axum のマウント）の変換のアロケーションを減らす
 
-**状態: 未着手（2026-10-16 起票・設計。出典: docs/artifacts/veil-comprehensive-review-and-comparison.md の §3.2・§5 Phase 3 の 8）**
+**状態: 完了（feat/v080-release、2026-10-16。目標の 85% には届かず、残りの内訳を下に記録して閉じる）**
 
 ## 目的
 
@@ -42,6 +42,38 @@
 - 目標: ネイティブのハンドラの 85% 以上。届かない場合は、残りの内訳を書いて閉じる。
 - ネイティブのハンドラの経路と、既存のプロキシの性能が退行しない（`suite_ab.sh`・`tools/api-bench`）。
 - `tests/api/library_e2e.sh` の tower の試験と、`nonregression`（full のバイナリに API ライブラリのコードが入らない）が通る。
+
+
+## 実装の結果
+
+### 段階 0（測り直し、改修前）
+
+`allocs.py`（wrk の負荷の前後の差を要求数で割る）: ネイティブ 4.00、マウント 30.00 allocs/req。報告の「約 26 増える」と一致した。
+`ALLOC_TRACE` で 1 要求の確保を追うと、veil 側は次のとおりだった。
+
+| 場所 | 回数 | 対策 |
+|---|---:|---|
+| `to_http_request` の URI（`String` → `Bytes` へもう一度） | 2 | クエリが無ければパスの `Bytes` をそのまま、あれば 1 回の連結 → 0〜1 |
+| ヘッダの値の複製（`HeaderValue::from_bytes`） | ヘッダ数 | `HeaderValue::from_maybe_shared` で共有 → 0 |
+| extensions への veil の `Request`（Box と表） | 3 | マウントしたサービスは読まないので入れない → 0（`layer` の経路は入れたまま） |
+| 応答の本文の `collect()`（1 フレームでもキューを確保） | 1 | フレームが 1 つならその `Bytes` を使う → 0 |
+| 応答のヘッダの名前の複製 | ヘッダ数 | よく使う名前は表で静的な `Bytes` に → 0（`http` 1.x には `HeaderName`・`HeaderValue` を `Bytes` へ移す API が無いので、値は 1 回複製する） |
+| `HeaderMap`（索引と本体）・応答のヘッダの `Vec`・ハンドラの Future の Box・tokio 互換の Waker・パスのパラメータ | 6 | 残す（`HeaderMap` は axum が要る、他はネイティブと共通か tokio 互換の仕組み） |
+
+### 結果（同じ回の交互の計測、2 スレッド、wrk -t2 -c64）
+
+| 対象 | plaintext req/s | json req/s | CPU µs/req | allocs/req |
+|---|---:|---:|---:|---:|
+| veil のネイティブハンドラ | 65,945 | 61,807 | 30.9 | 4 |
+| マウント（改修後） | 49,960 | 46,013 | 41.5 | 22 |
+| （参考）tokio 上の axum（スレッドごと） | 66,587 | — | 30.5 | — |
+| マウント（改修前、docs/guide/library.md の表） | 45,765 | 41,560 | 44.5 | 30 |
+
+- ネイティブに対する比は 67% → 76%（plaintext）・74%（json）。目標の 85% には届いていない。
+- 残りの 22 回のうち約 12 回は axum の中（`OriginalUri`・`MatchedPath`・`UrlParams` の extensions、ルートの Box、axum の本文の型）。
+- perf（特権のコンテナから。ホストは `perf_event_paranoid=4`）で見ると、平らで、目立つ一点が無い。差の 10 µs/req は、
+  axum のルーティングと変換と確保に分かれている。
+- これ以上は axum を通さない（ネイティブのハンドラにする）しかない。`docs/guide/library.md`（英日）の性能の節に書いた。
 
 ## 関連
 
