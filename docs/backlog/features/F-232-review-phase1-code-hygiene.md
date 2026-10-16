@@ -1,6 +1,6 @@
 # F-232: コード監査の第 1 段（ホットパスの重複検索・古いコメント・`allow(dead_code)`・UDP ソケットの重複と SAFETY）
 
-**状態: 未着手（2026-10-16 起票・設計。出典: docs/artifacts/veil-comprehensive-review-and-comparison.md の §4.2 ②〜⑤・§5 Phase 1）**
+**状態: 完了（feat/v080-release、2026-10-16）**
 
 ## 目的
 
@@ -65,6 +65,17 @@ AGENTS.md の「`allow(dead_code)` は禁止」に合わせて、`cfg_attr` の�
   - `git grep -n monoio -- src`
 - `cargo test`（単体・統合）、E2E（io_uring・epoll）、clippy の全 feature の組み合わせが通る。
 - BSD・macOS・Windows のクロスビルドが通る。
+
+
+## 実装の結果
+
+- `drive_h2_streams` の再検索 9 回 → 1 回（`let Some(st) = streams.get_mut(&sid) else { continue }`）。
+- `register` の doc を B-75 の実装に合わせた。`src/` の monoio の記述 67 箇所を消した（`git grep monoio -- src` は 0）。
+- `allow(dead_code)` は 0（`git grep -nE 'allow\(dead_code\)' -- src crates` はコメントだけ）。
+  `[http2]` は http2 feature 無しのとき生の値で受けて警告する。
+- UDP: `bind_reuseport` の重複をやめ、`SO_REUSEADDR` の失敗を見る。`close` の前に errno を読む（12 箇所）。
+- 4 ファイル（`udp/socket.rs`・`runtime/udp.rs`・`reactor/tcp/unix.rs`・`uring/tcp.rs`）の全 `unsafe` に SAFETY を付け、
+  `#![warn(clippy::undocumented_unsafe_blocks)]`。理由の無い `disallowed_methods` の allow に理由。
 
 ## 関連
 

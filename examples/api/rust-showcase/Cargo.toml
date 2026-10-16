@@ -26,5 +26,3 @@ http = "1"
 
 # veil 本体と同じ vendoring 版 quiche を使う（HTTP/3 で複数ストリームの STREAM フレームを 1 パケットへ
 # 詰める差分。外すと小さな応答が 1 リクエスト 1 パケットに戻る。F-172）。
-[patch.crates-io]
-quiche = { path = "../../../third_party/quiche" }

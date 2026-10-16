@@ -32,4 +32,3 @@ epoll = ["veil/epoll"]
 
 [patch.crates-io]
 tokio = { path = "../../../crates/veil-tokio/tokio-shim" }
-quiche = { path = "../../../third_party/quiche" }

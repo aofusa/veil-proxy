@@ -1,6 +1,6 @@
 # F-231: バージョンを v0.8.0 にする（版の出所を 1 つにする）
 
-**状態: 未着手（2026-10-16 起票・設計）**
+**状態: 完了（feat/v080-release、2026-10-16）**
 
 ## 目的
 
@@ -50,6 +50,13 @@ F-237（コンテナイメージ）と F-238（crates.io・PyPI）は、タグ�
 - `--no-default-features`・default・`full`・`full,epoll` の clippy とビルドが通る。
 - `bump-version.sh` を同じ版で 2 回実行しても、差分が出ない（冪等）。
 - `docs/guide/building.md`（英日）に版の上げ方を書き、`packaging/README.md` のリリース手順を更新する。
+
+
+## 実装の結果
+
+- `[workspace.package] version = "0.8.0"`。ルートと `crates/*` は `version.workspace = true`、pyproject は `dynamic = ["version"]`。
+- `tools/release/bump-version.sh`（2 回実行して差分が出ないことを確認）、`tools/release/verify-tag.sh`（タグと版・main）。
+- `docs/guide/building.md`（英日）の「版とリリース」、`packaging/README.md` の「公開」。
 
 ## 関連
 

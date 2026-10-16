@@ -22,5 +22,3 @@ futures = "0.3"
 veil-build = { package = "veil-proxy-build", path = "../../../crates/veil-build" }
 
 # veil 本体と同じ vendoring 版 quiche を使う（F-172）。
-[patch.crates-io]
-quiche = { path = "../../../third_party/quiche" }
