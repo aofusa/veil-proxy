@@ -129,6 +129,13 @@ fn parse_len_prefixed_path(data: &[u8]) -> Option<String> {
     }
 
     let num_parts = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    // 要素の数はゲストが渡すバイト列の値。各要素は少なくとも長さの 4 バイトを持つので、それより多い数は
+    // 長さ付きの形式ではない（NUL 区切りの `plug...` を数として読むと 17 億になり、`with_capacity` が 41GB を
+    // 確保しようとして OpenBSD で abort した。Linux は overcommit で気付かない。Wasm のモジュールが
+    // ホストを落とせる確保なので、確保の前に断る）
+    if num_parts > (data.len() - 4) / 4 {
+        return None;
+    }
     let mut parts = Vec::with_capacity(num_parts);
     let mut pos = 4;
 
@@ -283,7 +290,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_path;
+    use super::{parse_len_prefixed_path, parse_path};
 
     #[test]
     fn parse_path_accepts_sdk_nul_separated_paths() {
@@ -301,6 +308,15 @@ mod tests {
             Some("request.path")
         );
         assert_eq!(parse_path(b""), None);
+    }
+
+    /// 要素の数にデータに収まらない値（ゲストが任意に渡せる）が来ても、その数で確保しない
+    #[test]
+    fn parse_len_prefixed_path_rejects_counts_larger_than_data() {
+        assert_eq!(parse_len_prefixed_path(&u32::MAX.to_le_bytes()), None);
+        let mut b = u32::MAX.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0u8; 16]);
+        assert_eq!(parse_len_prefixed_path(&b), None);
     }
 
     #[test]
