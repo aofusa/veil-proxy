@@ -221,7 +221,9 @@ pub mod cache;
 /// FreeBSD capsicum の capability mode 下の上流接続ブローカー（F-182）。プロトコルは unix 共通で、
 /// Linux の単体テストでも検証する。macOS は `SOCK_CLOEXEC`・`SOCK_NONBLOCK`・`MSG_CMSG_CLOEXEC` が無く
 /// （B-81）、使う場面も無いので単体テストからも外す。
-#[cfg(any(target_os = "freebsd", all(test, unix, not(target_os = "macos"))))]
+// 単体テストは FreeBSD（使う OS）と Linux（CI）で回す。NetBSD・OpenBSD は使わない OS で、テストの前提
+// （SOCK_SEQPACKET・errno の受け渡し）も違う（以前は sin_len の欠落でテストがビルドすらできていなかった）
+#[cfg(any(target_os = "freebsd", all(test, target_os = "linux")))]
 #[doc(hidden)]
 pub mod connect_broker;
 #[doc(hidden)]
