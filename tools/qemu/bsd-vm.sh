@@ -1284,14 +1284,16 @@ cmd_sync() {
     # メンバー名は `./` 無し（`tools/...`）なので、GNU tar では `./` 付きのパターンが一致しない
     # （macOS の bsdtar は一致する）。両方の形を書く。root 所有の sanitizer ビルド成果物を
     # 読もうとして Permission denied で同期ごと失敗した（Linux ホスト、2026-10-07）。
+    # `*/target-*`（api-bench の target-count・target-epoll 等）も送らない。ゲストの tools も一度消してから
+    # 展開する（以前に送った古い results 等が残り、OpenBSD の /usr/obj（8GB）が埋まった。2026-10-17）。
     (cd "${ROOT}" && tar czf - \
-        --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
+        --exclude='./target' --exclude='*/target' --exclude='*/target-*' --exclude='.git' --exclude='*.sock' --no-xattrs \
         --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
         --exclude='tools/container_security/results' --exclude='tools/perf/results' \
         src benches tests examples contrib docker/assets third_party tools crates proto \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
-          && rm -rf src benches tests examples contrib docker/assets third_party crates proto .cargo \
+          && rm -rf src benches tests examples contrib docker/assets third_party tools crates proto .cargo \
           && tar xzf - \
           && sed -i'' -e 's|\"fuzz\", ||' Cargo.toml"
 }
