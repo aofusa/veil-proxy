@@ -295,7 +295,22 @@ run_python() {
     local VB="$V/bin"; [ "$OS" = Windows ] && VB="$V/Scripts"
     [ -x "$VB/python$EXE" ] || "$PY3" -m venv "$V"
     "$VB/python$EXE" -m pip -q install maturin >/dev/null
-    (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1 || { bad "maturin develop"; tail -20 "$TMPD/maturin.log"; return; }
+    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
+      # maturin の wheel の platform タグと pip が受け付けるタグが違う OS がある（NetBSD aarch64 は maturin が
+      # netbsd_10_1_arm64、pip は evbarm 系）。wheel を作り、pip が受け付けるタグに付け直して入れる
+      if grep -q "is not a supported wheel on this platform" "$TMPD/maturin.log"; then
+        local tag
+        tag=$("$VB/python$EXE" -c 'from pip._vendor.packaging import tags; print(next(iter(tags.sys_tags())).platform)')
+        "$VB/python$EXE" -m pip -q install wheel >/dev/null
+        rm -rf "$TMPD/wheels"
+        (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin build -q --release -o "$TMPD/wheels") >> "$TMPD/maturin.log" 2>&1 \
+          && "$VB/python$EXE" -m wheel tags --remove --platform-tag "$tag" "$TMPD"/wheels/*.whl >> "$TMPD/maturin.log" 2>&1 \
+          && "$VB/python$EXE" -m pip -q install --force-reinstall "$TMPD"/wheels/*"$tag"*.whl >> "$TMPD/maturin.log" 2>&1 \
+          || { bad "maturin develop (retag $tag)"; tail -20 "$TMPD/maturin.log"; return; }
+      else
+        bad "maturin develop"; tail -20 "$TMPD/maturin.log"; return
+      fi
+    fi
     PY="$VB/python$EXE"
   fi
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_binding.py) >/dev/null 2>&1 && ok "unit tests" || bad "unit tests"
