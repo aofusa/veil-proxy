@@ -341,8 +341,32 @@ async fn forward_direction(
     };
 
     let mut total = 0usize;
+    // kqueue: 直前の read がバッファを満たさなかったら、受信キューは空になっている見込みが高い。
+    // 次は read を先に試さず（EAGAIN の空打ち）、kevent の通知を待ってから読む
+    // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照。EVFILT_READ はレベルトリガなので
+    // 登録の時点でデータがあればすぐ通知され、取りこぼさない）。FreeBSD の `l4_tcp` 3B で read 4.0 → 2.0/req。
+    #[cfg(veil_poller_kqueue)]
+    let mut wait_first = false;
     'outer: loop {
         // read(): buf の ownership を渡し、完了後に (result, buf) として返ってくる
+        #[cfg(veil_poller_kqueue)]
+        let read = async {
+            if wait_first {
+                if let Err(e) = src.readable_lazy().await {
+                    return (Err(e), buf);
+                }
+            }
+            src.read(buf).await
+        };
+        #[cfg(veil_poller_kqueue)]
+        let (res, mut b) = match timeout(idle_timeout, read).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!("[L4:{}] idle timeout", name);
+                break;
+            }
+        };
+        #[cfg(not(veil_poller_kqueue))]
         let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
             Ok(r) => r,
             Err(_) => {
@@ -354,6 +378,10 @@ async fn forward_direction(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        #[cfg(veil_poller_kqueue)]
+        {
+            wait_first = n < BUF_SIZE;
+        }
         // ReadFuture<Vec<u8>> の set_init は grow-only のため、read 後も b.len() は BUF_SIZE の
         // ままで n には縮まらない。実際に読み取った n バイトのみを送信するよう長さを切り詰める。
         // これを怠ると未初期化の末尾バイトまで送信して転送データを破損させる（生 TCP 中継では

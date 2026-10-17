@@ -740,7 +740,13 @@ pub(super) const MAX_GSO_SEGMENTS: usize = 64;
 /// reactor バックエンド（FreeBSD/OpenBSD/NetBSD/macOS・Linux の `--features epoll`）
 /// でのみ参照する。Linux 既定の io_uring 経路は `mmsg_batch_size` 本の
 /// `IORING_OP_RECVMSG` パイプライン（F-130）なので本値を使わない。
-pub const H3_RECV_DRAIN_MAX_DEFAULT: usize = 64;
+///
+/// v0.8.0 で 64 → 1024（FreeBSD aarch64 の `h3_file` 3B、64 接続 × 32 ストリーム）。負荷が高いと
+/// 受信キューは常に溜まっていて drain は EAGAIN まで行かずにこの上限で止まる。64 だと 1 イテレーションの
+/// データグラムが 32 接続に散り、1 送信あたりの応答が約 1.5 個（nginx は約 3.4 個）になって、
+/// 小さいパケットとクライアントの ACK が増えていた。1024 で 205k → 280k req/s（nginx 266k）、
+/// p99 は 11 → 14ms。2048 以上はスループットがほぼ横ばいで p99 だけ伸びた。
+pub const H3_RECV_DRAIN_MAX_DEFAULT: usize = 1024;
 
 /// F-152: `[http3] recv_drain_max` のクランプ上限。
 ///

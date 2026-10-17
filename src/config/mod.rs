@@ -1116,7 +1116,7 @@ pub struct Http3ConfigSection {
     ///
     /// 範囲: 1..=4096。範囲外はクランプする。
     ///
-    /// デフォルト: `64`
+    /// デフォルト: `1024`（v0.8.0 で 64 から変更。FreeBSD の HTTP/3 3B で +37%）
     #[serde(default = "default_h3_recv_drain_max")]
     pub recv_drain_max: usize,
 
@@ -1167,9 +1167,9 @@ fn default_h3_mmsg_batch_size() -> usize {
     64
 }
 /// F-152: reactor 経路の 1 イテレーションあたり drain 上限の既定値
-/// （従来ハードコードされていた `H3_RECV_DRAIN_MAX` と同値）。
+/// （`http3_server::H3_RECV_DRAIN_MAX_DEFAULT` と同値。v0.8.0 で 64 → 1024）。
 fn default_h3_recv_drain_max() -> usize {
-    64
+    1024
 }
 
 impl Default for Http3ConfigSection {

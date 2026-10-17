@@ -610,7 +610,7 @@ pub struct Http3ServerConfig {
     /// UDP mmsg / multishot バッチ幅（1..=128）。デフォルト: 64
     pub mmsg_batch_size: usize,
     /// reactor バックエンド専用: 1 イテレーションあたりに掻き出す UDP データグラム数の上限
-    /// （`[http3] recv_drain_max`、1..=`H3_RECV_DRAIN_MAX_LIMIT`）。デフォルト: 64（F-152）
+    /// （`[http3] recv_drain_max`、1..=`H3_RECV_DRAIN_MAX_LIMIT`）。デフォルト: 1024（F-152、v0.8.0 で 64 から変更）
     pub recv_drain_max: usize,
 }
 
@@ -2314,13 +2314,13 @@ mod tests {
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり
     /// データグラム drain 上限）の既定値とクランプ範囲。
     ///
-    /// 既定値は従来ハードコードされていた `H3_RECV_DRAIN_MAX`（= 64）と同値であること
-    /// （設定を書かなければ挙動が変わらないことの担保）。
+    /// 既定値は設定側の既定（`default_h3_recv_drain_max`）と同値であること
+    /// （v0.8.0 で 64 → 1024）。
     #[test]
     fn test_recv_drain_max_default_and_clamp() {
         assert_eq!(
-            H3_RECV_DRAIN_MAX_DEFAULT, 64,
-            "既定値は従来の定数と同値であること"
+            H3_RECV_DRAIN_MAX_DEFAULT, 1024,
+            "既定値は設定の既定（default_h3_recv_drain_max）と同値であること"
         );
         assert_eq!(
             Http3ServerConfig::default().recv_drain_max,
