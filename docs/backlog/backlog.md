@@ -428,6 +428,7 @@
 | B-131 | P2 | 完了 | [bugs/B-131-proxy-wasm-cpp-sdk-compat.md](bugs/B-131-proxy-wasm-cpp-sdk-compat.md) | Proxy-Wasm の C++ SDK 製のモジュールが `proxy_get_property` を読めず異常終了していた（パスの NUL 区切りを読まない・`malloc` のエクスポートを使わない・`plugin_root_id` が数値）。Istio の WasmPlugin の試験で発見 |
 | B-132 | P1 | 完了 | [bugs/B-132-security-check-order-and-h3-body-length.md](bugs/B-132-security-check-order-and-h3-body-length.md) | HTTP/2・HTTP/3 は本文の上限の前にレート制限を数え（413 の要求が枠を使い、413 と 429 の優先がプロトコルで違った）、HTTP/3 は content-length の無い要求の本文の上限を見ていなかった。検査を src/l7.rs に 1 つにまとめた（F-234） |
 | B-133 | P0 | 完了 | [bugs/B-133-respond-redirect-ignore-route-security.md](bugs/B-133-respond-redirect-ignore-route-security.md) | `Respond`・`Redirect` のルート（とトラフィック制御・JWT の応答）が `[route.security]` を無視し、IP 制限等が効いていなかった（3 経路とも） |
+| B-134 | P1 | 完了 | [bugs/B-134-wasm-property-path-huge-alloc.md](bugs/B-134-wasm-property-path-huge-alloc.md) | Proxy-Wasm の get_property がゲストの渡す要素数で `with_capacity` し、NUL 区切りのパスで 41GB を確保しようとした（OpenBSD で abort。モジュールがホストを落とせた） |
 
 ---
 
