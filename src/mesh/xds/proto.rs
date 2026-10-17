@@ -1236,6 +1236,18 @@ pub struct HttpConnectionManager {
     pub stream_idle_timeout: Option<Duration>,
     #[prost(message, optional, tag = "14")]
     pub use_remote_address: Option<BoolValue>,
+    /// X-Forwarded-For の右から信頼するホップの数（F-236 の F3）
+    #[prost(uint32, tag = "19")]
+    pub xff_num_trusted_hops: u32,
+    /// RFC 3986 のパスの正規化（F-236 の F5）
+    #[prost(message, optional, tag = "30")]
+    pub normalize_path: Option<BoolValue>,
+    #[prost(bool, tag = "33")]
+    pub merge_slashes: bool,
+    /// 0 = IMPLEMENTATION_SPECIFIC_DEFAULT, 1 = KEEP_UNCHANGED, 2 = REJECT_REQUEST,
+    /// 3 = UNESCAPE_AND_REDIRECT, 4 = UNESCAPE_AND_FORWARD
+    #[prost(int32, tag = "45")]
+    pub path_with_escaped_slashes_action: i32,
     #[prost(message, optional, tag = "15")]
     pub generate_request_id: Option<BoolValue>,
     /// 0 = SANITIZE, 1 = FORWARD_ONLY, 2 = APPEND_FORWARD, 3 = SANITIZE_SET, 4 = ALWAYS_FORWARD_ONLY

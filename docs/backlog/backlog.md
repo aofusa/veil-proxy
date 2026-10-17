@@ -266,7 +266,7 @@
 | F-233 | P2 | 完了 | [features/F-233-split-monolith-modules.md](features/F-233-split-monolith-modules.md) | 巨大ファイルの分割（proxy.rs 13,352 行・config.rs 10,097 行・http3_server.rs・tests/e2e_tests.rs 26,037 行）。中身は変えず移すだけ、公開パスは再エクスポートで維持、CGU の境界によるインライン化の差は A/B で確かめる |
 | F-234 | P2 | 完了 | [features/F-234-l7-common-request-pipeline.md](features/F-234-l7-common-request-pipeline.md) | HTTP/1.1・2・3 の要求処理（セキュリティ検査・JWT・Wasm・Backend の分岐）を同期の判定関数 `L7Decision` に共通化（B-99 の類の片側漏れを防ぐ。F-233 の後、F-226・F-229 の前提） |
 | F-235 | P3 | 完了（85% には届かず 76%） | [features/F-235-tokio-service-adapter-allocs.md](features/F-235-tokio-service-adapter-allocs.md) | `App::tokio_service`（tower / axum のマウント）の変換のアロケーションを減らし、ネイティブのハンドラの 67% → 85% 以上に（まず内訳を測り直す） |
-| F-236 | P1 | 未着手 | [features/F-236-claude-security-audit.md](features/F-236-claude-security-audit.md) | Claude Security のプラグインでセキュリティ監査（攻撃面ごとに 10 の範囲を effort high で）。公開の前に CRITICAL・HIGH を 0 に、直す前の詳細は docs/artifacts に留める |
+| F-236 | P1 | 完了 | [features/F-236-claude-security-audit.md](features/F-236-claude-security-audit.md) | Claude Security のプラグインでセキュリティ監査（攻撃面ごとに 10 の範囲を effort high で）。公開の前に CRITICAL・HIGH を 0 に、直す前の詳細は docs/artifacts に留める |
 | F-237 | P1 | 完了（公開はタグの push で） | [features/F-237-publish-container-images.md](features/F-237-publish-container-images.md) | コンテナイメージの公開（ghcr.io/aofusa/veil、amd64・arm64）: `latest`=`musl`=`musl-vX.Y.Z`・`glibc`=`glibc-vX.Y.Z`、タグの push で自動。io_uring が使えなければ同梱の epoll 版へ `execve` |
 | F-238 | P1 | 完了（公開はタグの push で） | [features/F-238-publish-crates-and-pypi.md](features/F-238-publish-crates-and-pypi.md) | crates.io（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`。`veil`・`veil-macros` は他のプロジェクトが使用）と PyPI（`veil-api`）へタグの push で自動公開（trusted publishing）。vendoring の quiche・wasmtime の公開、AWS_LC_SYS_NO_PREFIX の検査 |
 | F-239 | P1 | 完了（公開はタグの push で） | [features/F-239-api-docs-docsrs-readthedocs.md](features/F-239-api-docs-docsrs-readthedocs.md) | API の文書: docs.rs（`[package.metadata.docs.rs]`・`doc(hidden)` で利用者向けだけ・missing_docs・doctest）と Read the Docs（`.pyi` の型と docstring、sphinx-autoapi、stubtest） |
@@ -429,6 +429,13 @@
 | B-132 | P1 | 完了 | [bugs/B-132-security-check-order-and-h3-body-length.md](bugs/B-132-security-check-order-and-h3-body-length.md) | HTTP/2・HTTP/3 は本文の上限の前にレート制限を数え（413 の要求が枠を使い、413 と 429 の優先がプロトコルで違った）、HTTP/3 は content-length の無い要求の本文の上限を見ていなかった。検査を src/l7.rs に 1 つにまとめた（F-234） |
 | B-133 | P0 | 完了 | [bugs/B-133-respond-redirect-ignore-route-security.md](bugs/B-133-respond-redirect-ignore-route-security.md) | `Respond`・`Redirect` のルート（とトラフィック制御・JWT の応答）が `[route.security]` を無視し、IP 制限等が効いていなかった（3 経路とも） |
 | B-134 | P1 | 完了 | [bugs/B-134-wasm-property-path-huge-alloc.md](bugs/B-134-wasm-property-path-huge-alloc.md) | Proxy-Wasm の get_property がゲストの渡す要素数で `with_capacity` し、NUL 区切りのパスで 41GB を確保しようとした（OpenBSD で abort。モジュールがホストを落とせた） |
+| B-135 | P0 | 完了 | [bugs/B-135-h2-h3-to-h1-request-smuggling.md](bugs/B-135-h2-h3-to-h1-request-smuggling.md) | HTTP/2・HTTP/3 のフィールド（CR・LF 入りの値・空白入りの `:method`/`:path`）を検査せず HTTP/1.1 の上流へ書いていた（要求の密輸）。メッシュは content-length を本文と照らしていなかった |
+| B-136 | P1 | 完了 | [bugs/B-136-h2-h3-ignore-request-header-policy.md](bugs/B-136-h2-h3-ignore-request-header-policy.md) | `remove_request_headers`・`add_request_headers` が HTTP/1.1 のクライアントにしか効かなかった |
+| B-137 | P1 | 完了 | [bugs/B-137-mesh-rbac-leftmost-xff.md](bugs/B-137-mesh-rbac-leftmost-xff.md) | メッシュの RBAC の remote_ip が X-Forwarded-For の左端（クライアントが書ける）だった |
+| B-138 | P1 | 完了 | [bugs/B-138-mesh-path-not-normalized.md](bugs/B-138-mesh-path-not-normalized.md) | メッシュのルート・RBAC・JWT が正規化していないパスで照合し、`/%61dmin`・`/./admin` で DENY を素通りできた |
+| B-139 | P2 | 完了 | [bugs/B-139-route-cache-fixed-seed-hash.md](bugs/B-139-route-cache-fixed-seed-hash.md) | ルートのキャッシュのキーが固定シードの 64 ビットのハッシュで、衝突を作ると保護の無いルートへ入れた |
+| B-140 | P1 | 完了 | [bugs/B-140-shared-cache-per-user-responses.md](bugs/B-140-shared-cache-per-user-responses.md) | 応答のキャッシュが Authorization 付きの要求・Set-Cookie の応答も保存し、Vary を照合で見ていなかった |
+| B-141 | P2 | 完了 | [bugs/B-141-ipv4-mapped-ipv6-bypasses-ip-lists.md](bugs/B-141-ipv4-mapped-ipv6-bypasses-ip-lists.md) | IPv4 射影の IPv6（`::ffff:10.0.0.1`）が IPv4 の拒否リストをすり抜けた |
 
 ---
 

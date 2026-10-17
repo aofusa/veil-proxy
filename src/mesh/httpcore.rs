@@ -215,6 +215,8 @@ pub enum ResponseFlag {
     UpstreamOverflow,
     /// NFCF: ECDS のフィルタの設定が届いていない
     NoFilterConfigFound,
+    /// DPE: 下流の要求がプロトコルに合わない（拒否するパス等）
+    DownstreamProtocolError,
 }
 
 impl ResponseFlag {
@@ -233,6 +235,7 @@ impl ResponseFlag {
             ResponseFlag::NoCluster => "NC",
             ResponseFlag::NoFilterConfigFound => "NFCF",
             ResponseFlag::UpstreamOverflow => "UO",
+            ResponseFlag::DownstreamProtocolError => "DPE",
         }
     }
 }

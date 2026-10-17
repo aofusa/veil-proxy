@@ -887,6 +887,32 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
     memchr3(b'\r', b'\n', 0, value).is_none()
 }
 
+/// HTTP/2・HTTP/3 のフィールドの値が RFC 9113 §8.2.1・RFC 9114 §4.2 の条件を満たすか:
+/// NUL・LF・CR を含まず、空白（SP・HTAB）で始まらず終わらない。HPACK・QPACK は任意のバイトを運べるので、
+/// HTTP/1.1 の上流へ渡すと要求の密輸になる（F-236 の F1・F2）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_h2_field_value(value: &[u8]) -> bool {
+    if !is_valid_header_value(value) {
+        return false;
+    }
+    !matches!(value.first(), Some(b' ' | b'\t')) && !matches!(value.last(), Some(b' ' | b'\t'))
+}
+
+/// `:method` が token か（RFC 9110 §9.1）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_method(method: &[u8]) -> bool {
+    is_valid_header_name(method)
+}
+
+/// `:path` に空白・制御文字（0x00〜0x20・0x7F）が無いか（要求行に書いたとき分割されない）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_request_target(path: &[u8]) -> bool {
+    !path.is_empty() && path.iter().all(|&b| b > 0x20 && b != 0x7f)
+}
+
 // ====================
 // Transfer-Encoding: chunked 検出（改善版）
 // ====================

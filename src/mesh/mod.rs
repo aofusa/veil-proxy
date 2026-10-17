@@ -31,6 +31,7 @@ pub mod l7;
 pub mod mirror;
 pub mod model;
 pub mod net;
+pub mod path_norm;
 pub mod peer;
 pub mod server;
 pub mod state;

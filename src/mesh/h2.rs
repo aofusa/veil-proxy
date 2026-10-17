@@ -800,9 +800,32 @@ async fn to_h1(
             }
         },
     };
-    let has_len = req_headers
+    let declared_len: Option<Option<u64>> = req_headers
         .iter()
-        .any(|(k, _)| k.as_ref() == b"content-length");
+        .find(|(k, _)| k.as_ref() == b"content-length")
+        .map(|(_, v)| {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        });
+    let has_len = declared_len.is_some();
+    // F-236（F1）: 宣言された content-length と本文が合わない要求は malformed（RFC 9113 §8.1.1）。そのまま
+    // HTTP/1.1 の上流へ送ると、足りない分を次の要求（プールの接続）で埋められて密輸になる
+    if let Some(d) = declared_len {
+        if d.is_none() || (req_rx.is_none() && d != Some(first_body.len() as u64)) {
+            picked.end(false, false);
+            out.status = 400;
+            local(
+                tx,
+                notify,
+                &LocalReply::new(400, ResponseFlag::None),
+                is_grpc,
+                &c.hcm,
+            )
+            .await;
+            return out;
+        }
+    }
     let streaming = req_rx.is_some() && !has_len;
     let mut head = BytesMut::with_capacity(512);
     head.put_slice(method);
@@ -845,6 +868,7 @@ async fn to_h1(
             b
         }
     };
+    let mut body_total = first_body.len() as u64;
     let ok = async {
         up.write_all(head.freeze()).await.0?;
         if !first_body.is_empty() {
@@ -854,6 +878,12 @@ async fn to_h1(
             while let Some(b) = rx.recv().await {
                 notify.notify();
                 out.req_bytes += b.len() as u64;
+                body_total += b.len() as u64;
+                if matches!(declared_len, Some(Some(d)) if body_total > d) {
+                    return Err(std::io::Error::other(
+                        "request body longer than content-length",
+                    ));
+                }
                 if !b.is_empty() {
                     up.write_all(write_chunk(b)).await.0?;
                 }
@@ -865,6 +895,21 @@ async fn to_h1(
         Ok::<(), std::io::Error>(())
     }
     .await;
+    // 宣言より短い・長い本文: 上流の接続は捨てる（プールへ返さない）、クライアントへは 400
+    if matches!(declared_len, Some(Some(d)) if body_total != d) {
+        drop(up);
+        picked.end(false, false);
+        out.status = 400;
+        local(
+            tx,
+            notify,
+            &LocalReply::new(400, ResponseFlag::None),
+            is_grpc,
+            &c.hcm,
+        )
+        .await;
+        return out;
+    }
     if ok.is_err() {
         picked.end(false, true);
         out.status = 503;

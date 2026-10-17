@@ -134,6 +134,8 @@ pub(super) fn build_h1_request_head(
     method: &[u8],
     final_path: &str,
     headers: &[h3::Header],
+    security: &SecurityConfig,
+    added: &[(Vec<u8>, Vec<u8>)],
 ) -> Vec<u8> {
     let mut req = Vec::with_capacity(512);
     req.extend_from_slice(method);
@@ -148,24 +150,14 @@ pub(super) fn build_h1_request_head(
     }
     req.extend_from_slice(b"\r\n");
 
-    for header in headers {
-        let name = header.name();
-        // B-11: expect はプロキシが終端する（ボディを無条件転送するため、バックエンドに
-        // 100 Continue 中間応答を出させない）。
-        if name.starts_with(b":")
-            || name.eq_ignore_ascii_case(b"connection")
-            || name.eq_ignore_ascii_case(b"keep-alive")
-            || name.eq_ignore_ascii_case(b"transfer-encoding")
-            || name.eq_ignore_ascii_case(b"content-length")
-            || name.eq_ignore_ascii_case(b"expect")
-        {
-            continue;
-        }
-        req.extend_from_slice(name);
-        req.extend_from_slice(b": ");
-        req.extend_from_slice(header.value());
-        req.extend_from_slice(b"\r\n");
-    }
+    // F-236（F2・F4）: 名前・値の検査（QPACK は任意のバイトを運べる）、content-length・host・expect の除去、
+    // [route.security] の要求ヘッダの方針
+    crate::proxy::write_h1_forward_headers(
+        &mut req,
+        headers.iter().map(|h| (h.name(), h.value())),
+        security,
+        added,
+    );
 
     // ボディフレーミングと末尾空行はタスク側で付与する。
     req

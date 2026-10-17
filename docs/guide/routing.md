@@ -889,6 +889,10 @@ IP restrictions are evaluated in **deny → allow** order (deny takes priority).
 | Single IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
 
+IPv4-mapped IPv6 addresses (`::ffff:192.0.2.1`, how an IPv4 client appears on a dual-stack `[::]` listener) are
+matched as IPv4, so `192.0.2.0/24` covers them. A range written in mapped form (`::ffff:192.0.2.0/120`) is treated as
+the IPv4 range.
+
 ## Per-Route Traffic Control (F-219)
 
 `type = "Respond"` returns a fixed response, and `[route.traffic]` adds weighted splits, fault injection (abort) and
@@ -1020,7 +1024,9 @@ Add or remove request/response headers. Configure security headers such as X-Rea
 
 ### Request Header Manipulation
 
-Add or remove headers before forwarding to the backend.
+Add or remove headers before forwarding to the backend. Both options apply to every client protocol
+(HTTP/1.1, HTTP/2, HTTP/3) and every upstream protocol (HTTP/1.1, h2c, HTTPS h2). Header values that would contain
+CR, LF or NUL after variable expansion are not sent.
 
 | Option | Description | Example |
 |--------|-------------|---------|

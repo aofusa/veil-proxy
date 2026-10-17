@@ -968,6 +968,8 @@ pub fn http_cm(
         xfcc_dns: false,
         generate_request_id: false,
         use_remote_address: false,
+        xff_num_trusted_hops: 0,
+        path_normalization: Default::default(),
         websocket: true,
         filters,
         peer_metadata: false,

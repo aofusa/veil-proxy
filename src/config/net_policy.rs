@@ -114,10 +114,24 @@ impl CidrRange {
         }
 
         // IPv6をパース
-        if let Some(ipv6) = Self::parse_ipv6(ip_str) {
+        if let Some(ipv6) = ip_str
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(u128::from)
+            .or_else(|| Self::parse_ipv6(ip_str))
+        {
             let prefix = if prefix_len == 255 { 128 } else { prefix_len };
             if prefix > 128 {
                 return None;
+            }
+            // IPv4 射影の範囲（::ffff:0:0/96 より細かいもの）は IPv4 の範囲として持つ（照合側が IPv4 に直すため）
+            if prefix >= 96 && (ipv6 >> 32) == 0xffff {
+                let v4_prefix = prefix - 96;
+                return Some(CidrRange {
+                    network: (ipv6 & 0xffff_ffff) & Self::mask_v4(v4_prefix),
+                    prefix_len: v4_prefix,
+                    is_ipv6: false,
+                });
             }
             let network = ipv6 & Self::mask_v6(prefix);
             return Some(CidrRange {
@@ -231,6 +245,10 @@ impl CidrRange {
 
     /// IPアドレスがこのCIDR範囲に含まれるかチェック
     pub fn contains(&self, ip: &str) -> bool {
+        // 標準の形なら IpAddr を経由して、IPv4 射影の IPv6（::ffff:a.b.c.d）を IPv4 として見る（F-236 の F8）
+        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+            return self.contains_addr(addr);
+        }
         if self.is_ipv6 {
             // IPv6
             if let Some(ipv6) = Self::parse_ipv6(ip) {
@@ -253,7 +271,9 @@ impl CidrRange {
     /// 介さないため接続ごとのヒープ確保が発生しない。
     #[inline]
     pub fn contains_addr(&self, ip: std::net::IpAddr) -> bool {
-        match ip {
+        // IPv4 射影の IPv6（デュアルスタックのソケットで受けた IPv4 のクライアント）は IPv4 として比べる。
+        // そのままだと `10.0.0.0/8` の拒否を `::ffff:10.0.0.1` で素通りできた（F-236 の F8）
+        match ip.to_canonical() {
             std::net::IpAddr::V4(v4) => {
                 if self.is_ipv6 {
                     return false;
@@ -611,5 +631,28 @@ impl Default for SecurityConfig {
             websocket_poll_max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             websocket_poll_backoff_multiplier: default_websocket_backoff_multiplier(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_mapped_ipv6_matches_ipv4_ranges() {
+        let r = CidrRange::parse("10.0.0.0/8").unwrap();
+        assert!(r.contains("::ffff:10.0.0.1"));
+        assert!(r.contains_addr("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!r.contains("::ffff:11.0.0.1"));
+        let f = IpFilter::from_lists(&[], &["10.0.0.0/8".to_string()]);
+        assert!(!f.is_allowed("::ffff:10.0.0.1"));
+        // 射影の形で書いた範囲も IPv4 のクライアントに効く
+        let m = CidrRange::parse("::ffff:192.168.0.0/112").unwrap();
+        assert!(m.contains("192.168.3.4"));
+        assert!(!m.contains("192.169.0.1"));
+        // 通常の IPv6 は変わらない
+        let v6 = CidrRange::parse("2001:db8::/32").unwrap();
+        assert!(v6.contains("2001:db8::1"));
+        assert!(!v6.contains("10.0.0.1"));
     }
 }

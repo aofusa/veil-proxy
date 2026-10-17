@@ -136,6 +136,10 @@ where
     let mut host_seen = false;
     let mut scheme_needs_authority = false;
     for (name, value) in fields {
+        // F-236（F2）: 値に CR・LF・NUL・前後の空白があれば malformed（RFC 9114 §4.2）
+        if !crate::http_utils::is_valid_h2_field_value(value) {
+            return Err("invalid field value");
+        }
         if let Some(pseudo) = name.strip_prefix(b":") {
             if regular_seen {
                 return Err("pseudo-header after regular field");
@@ -152,16 +156,24 @@ where
             }
             seen |= bit;
             if bit == METHOD {
+                if !crate::http_utils::is_valid_method(value) {
+                    return Err("invalid :method");
+                }
                 is_connect = value == b"CONNECT";
             } else if bit == SCHEME {
                 scheme_needs_authority = value == b"https" || value == b"http";
             } else if bit == PATH && value.is_empty() {
                 return Err("empty :path");
+            } else if bit == PATH && !crate::http_utils::is_valid_request_target(value) {
+                return Err("invalid :path");
             }
         } else {
             regular_seen = true;
             if name.iter().any(u8::is_ascii_uppercase) {
                 return Err("uppercase field name");
+            }
+            if !crate::http_utils::is_valid_header_name(name) {
+                return Err("invalid field name");
             }
             match name {
                 b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
@@ -1585,6 +1597,12 @@ impl Http3Handler {
             .map(AcceptedEncoding::parse)
             .unwrap_or(AcceptedEncoding::Identity);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
+        let added = crate::proxy::expanded_added_headers(
+            security,
+            self.client_ip.as_str(),
+            authority,
+            std::str::from_utf8(path).unwrap_or("/"),
+        );
         #[cfg(feature = "http2")]
         let h2 = (h2_upstream || h2_tls).then(|| {
             // gRPC はサービス/メソッドのフルパスを保持する（B-39）。
@@ -1598,7 +1616,7 @@ impl Http3Handler {
                 method: Bytes::copy_from_slice(method),
                 path: Bytes::from(final_path),
                 authority: Bytes::copy_from_slice(server.target.host.as_bytes()),
-                headers: pack_h3_request_headers(headers),
+                headers: pack_h3_request_headers(headers, security, &added),
                 connect_timeout: Duration::from_secs(security.backend_connect_timeout_secs),
             }
         });
@@ -1607,12 +1625,26 @@ impl Http3Handler {
             Vec::new()
         } else {
             let final_path = compute_backend_path(&server.target, path, &prefix);
-            build_h1_request_head(&server.target, method, &final_path, headers)
+            build_h1_request_head(
+                &server.target,
+                method,
+                &final_path,
+                headers,
+                security,
+                &added,
+            )
         };
         #[cfg(not(feature = "http2"))]
         let request_head = {
             let final_path = compute_backend_path(&server.target, path, &prefix);
-            build_h1_request_head(&server.target, method, &final_path, headers)
+            build_h1_request_head(
+                &server.target,
+                method,
+                &final_path,
+                headers,
+                security,
+                &added,
+            )
         };
 
         // F-44: TLS バックエンドもストリーミング対象（バックエンドタスクが全二重 TLS で貫通）。
@@ -2095,6 +2127,27 @@ mod tests {
         (":authority", "example.com"),
         (":path", "/"),
     ];
+
+    /// F-236 の F2: HTTP/1.1 の上流へ渡すと要求の密輸になるフィールドを拒否する
+    #[test]
+    fn test_h3_field_section_rejects_smuggling_fields() {
+        let with = |n: &'static str, v: &'static str| {
+            let mut f = GOOD.to_vec();
+            f.push((n, v));
+            check(&f)
+        };
+        assert!(with("x-a", "fine").is_ok());
+        assert!(with("x-a", "v\r\nx-injected: 1").is_err());
+        assert!(with("x-a", "v\0").is_err());
+        assert!(with("x-a", " lead").is_err());
+        assert!(with("x a", "v").is_err());
+        let mut bad_path = GOOD.to_vec();
+        bad_path[3] = (":path", "/a b");
+        assert!(check(&bad_path).is_err());
+        let mut bad_method = GOOD.to_vec();
+        bad_method[0] = (":method", "GET /x");
+        assert!(check(&bad_method).is_err());
+    }
 
     #[test]
     fn test_h3_field_section_accepts_valid_request_and_trailers() {

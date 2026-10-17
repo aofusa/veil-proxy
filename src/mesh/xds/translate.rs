@@ -897,6 +897,16 @@ fn http_cm(
             .as_ref()
             .map(|b| b.value)
             .unwrap_or(false),
+        xff_num_trusted_hops: hcm.xff_num_trusted_hops,
+        // normalize_path を書かない HCM も正規化する（Envoy の既定は実行時の設定で off だが、Istio は常に on で送る。
+        // 照合と上流の解釈のずれを既定で残さない）
+        path_normalization: crate::mesh::path_norm::PathNormalization {
+            normalize: hcm.normalize_path.as_ref().map(|b| b.value).unwrap_or(true),
+            merge_slashes: hcm.merge_slashes,
+            escaped_slashes: crate::mesh::path_norm::EscapedSlashes::from_xds(
+                hcm.path_with_escaped_slashes_action,
+            ),
+        },
         websocket: hcm.upgrade_configs.iter().any(|u| {
             u.upgrade_type.eq_ignore_ascii_case("websocket")
                 && u.enabled.as_ref().map(|b| b.value).unwrap_or(true)

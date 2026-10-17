@@ -60,7 +60,10 @@ pub(super) async fn handle_proxy(
     // ===================
     if cache_config.enabled {
         // キャッシュ対象かチェック
-        if cache_config.is_cacheable_method(method) && !cache_config.should_bypass(path_str) {
+        if cache_config.is_cacheable_method(method)
+            && !cache_config.should_bypass(path_str)
+            && !cache_config.bypass_for_authorization(headers)
+        {
             // キャッシュキー生成（key_headers を使用）
             let query = path_str.find('?').map(|i| &path_str[i + 1..]);
             let path_only = path_str
@@ -281,6 +284,7 @@ pub(super) async fn handle_proxy(
     if cache_config.enabled
         && cache_config.is_cacheable_method(method)
         && !cache_config.should_bypass(path_str)
+        && !cache_config.bypass_for_authorization(headers)
     {
         let query = path_str.find('?').map(|i| &path_str[i + 1..]);
         let path_only = path_str
@@ -533,6 +537,13 @@ pub(super) async fn handle_proxy(
         && wasm_modules.is_empty()
         && !buffering_config.is_enabled()
     {
+        // F-236（F4）: HTTP/2 の上流にも [route.security] の要求ヘッダの方針を当てる
+        let added = expanded_added_headers(
+            security,
+            client_ip,
+            host_str.as_bytes(),
+            std::str::from_utf8(req_path).unwrap_or("/"),
+        );
         match proxy_h1_via_https_h2(
             client_stream,
             target,
@@ -545,6 +556,7 @@ pub(super) async fn handle_proxy(
             initial_body,
             client_wants_close,
             tls_profile,
+            &added,
         )
         .await
         {
@@ -597,6 +609,12 @@ pub(super) async fn handle_proxy(
                 let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                 Some((client_stream, 413, 0, true))
             } else {
+                let added = expanded_added_headers(
+                    security,
+                    client_ip,
+                    host_str.as_bytes(),
+                    std::str::from_utf8(req_path).unwrap_or("/"),
+                );
                 proxy_h2c(
                     client_stream,
                     target,
@@ -606,6 +624,7 @@ pub(super) async fn handle_proxy(
                     headers,
                     initial_body,
                     client_wants_close,
+                    &added,
                 )
                 .await
             }
@@ -1064,6 +1083,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     request_body: &[u8],
     client_wants_close: bool,
     tls_profile: crate::upstream_tls::TlsProfile,
+    added: &[(Vec<u8>, Vec<u8>)],
 ) -> H1ViaH2 {
     use crate::http2::upstream_mux::{HttpsOpen, UpResp};
     let addr = target.conn_addr();
@@ -1077,7 +1097,11 @@ pub(super) async fn proxy_h1_via_https_h2(
         method,
         path,
         target.host.as_bytes(),
-        headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        headers
+            .iter()
+            .filter(|(k, _)| forward_allowed(security, k))
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
         request_body.is_empty(),
     )
     .await;
@@ -1324,6 +1348,7 @@ pub(super) async fn proxy_h2c(
     headers: &[(Bytes, Bytes)],
     request_body: &[u8],
     client_wants_close: bool,
+    added: &[(Vec<u8>, Vec<u8>)],
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）を使う
     // （従来は要求ごとに TCP 接続 + HTTP/2 ハンドシェイクしていた）。
@@ -1339,7 +1364,11 @@ pub(super) async fn proxy_h2c(
         method,
         path,
         target.host.as_bytes(),
-        headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        headers
+            .iter()
+            .filter(|(k, _)| forward_allowed(security, k))
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
         body,
         crate::http_utils::is_idempotent_method(method),
     )

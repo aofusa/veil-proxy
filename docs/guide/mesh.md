@@ -65,6 +65,11 @@ Supported (checked with `tools/k8s/mesh-e2e.sh`, stock / veil / mixed):
 - Traffic management tasks: fault injection (abort, delay), timeouts, retries, header changes, traffic shifting,
   rewrites and subsets, mirroring, circuit breaking and outlier detection, consistent hashing.
 - Security: `AuthorizationPolicy` (HTTP and TCP), `RequestAuthentication` (JWT with inline JWKS).
+  - Paths are normalized once before routing, RBAC and JWT matching, and the normalized path is sent upstream
+    (HCM `normalize_path`, `merge_slashes`, `path_with_escaped_slashes_action`; Istio's `BASE` normalization by
+    default, also when the HCM does not set `normalize_path`). A request the escaped-slash action rejects gets 400 (`DPE`).
+  - `remoteIpBlocks` uses Envoy's original client address: the peer with `use_remote_address`, otherwise the
+    X-Forwarded-For entry `xff_num_trusted_hops` from the right. The client-controlled leftmost entry is never used.
 - Telemetry: Istio's standard metrics (`istio_requests_total` etc. through pilot-agent's merged metrics),
   Telemetry API access logs (Envoy's default format), distributed tracing (Zipkin / B3).
 - WasmPlugin (ECDS → veil's Proxy-Wasm, including C++ SDK modules; `FAIL_CLOSE` returns 503 when the module traps).

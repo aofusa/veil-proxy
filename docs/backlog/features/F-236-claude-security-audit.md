@@ -1,6 +1,6 @@
 # F-236: Claude Security のプラグインでセキュリティ監査を行う
 
-**状態: 未着手（2026-10-16 起票・設計）**
+**状態: 完了（feat/v080-release、2026-10-17）**
 
 ## 目的
 
@@ -76,6 +76,23 @@ Anthropic 公式のプラグイン claude-security（https://github.com/anthropi
 - 修正の変更ごとに、回帰の試験（単体・E2E・ファズのコーパス）と、性能の非退行（`suite_ab.sh`）を確かめる。
 - `docs/guide/security.md`（英日）に、監査の方法と再走査の手順を書く。
 
-## 関連
+## 実装の結果
 
-F-237、F-238（公開の前に行う）、F-64〜F-72・F-84〜F-88（既存のセキュリティ試験）、`tools/container_security/`。
+- 走査: 設計の 10 の範囲に分けず、リポジトリ全体を 1 回（effort low、版 93f4a114）で走査した。範囲を分けた effort high は
+  トークンの消費が大きく、全体の 1 回で攻撃面（HTTP/1.1・2・3、メッシュ、キャッシュ、IP 制限、Wasm）を網羅できたため。
+  結果は `docs/artifacts/claude-security/CLAUDE-SECURITY-20261017-063701/`。
+- 確認された指摘は 8 件（HIGH 2・MEDIUM 5・LOW 1）。誤検出は無かった。全部を直した:
+
+  | 指摘 | 深刻度 | チケット |
+  |---|---|---|
+  | F1 HTTP/2 → HTTP/1.1 の要求の密輸 | HIGH | B-135 |
+  | F2 HTTP/3 → HTTP/1.1 の要求の密輸 | HIGH | B-135 |
+  | F3 メッシュの RBAC が X-Forwarded-For の左端 | MEDIUM | B-137 |
+  | F4 HTTP/2・HTTP/3 に要求ヘッダの削除・追加が効かない | MEDIUM | B-136 |
+  | F5 メッシュのパスの正規化が無い | MEDIUM | B-138 |
+  | F6 ルートのキャッシュの固定シードのハッシュ | MEDIUM | B-139 |
+  | F7 応答のキャッシュが利用者ごとの応答を共有 | MEDIUM | B-140 |
+  | F8 IPv4 射影の IPv6 が拒否リストをすり抜ける | LOW | B-141 |
+
+- 監査の前に、単体テストで B-134（Wasm の get_property の巨大な確保）も見つけて直した。
+- 再走査は、修正をコミットした版で�

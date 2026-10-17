@@ -1840,11 +1840,19 @@ pub(super) async fn h2_proxy(
             .headers
             .iter()
             .any(|h| header_pair_is_grpc(&h.name, &h.value));
+        let added = expanded_added_headers(
+            security,
+            client_ip,
+            &ctx.authority,
+            std::str::from_utf8(req_path).unwrap_or("/"),
+        );
         let headers_iter = ctx
             .headers
             .iter()
             .filter(|h| is_grpc || !h.name.eq_ignore_ascii_case(b"te"))
-            .map(|h| (h.name.as_ref(), h.value.as_ref()));
+            .filter(|h| forward_allowed(security, &h.name))
+            .map(|h| (h.name.as_ref(), h.value.as_ref()))
+            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
         let body = (!ctx.body.is_empty()).then(|| ctx.body.clone());
         match http2::upstream_mux::request_https_buffered(
             target,
@@ -1914,21 +1922,20 @@ pub(super) async fn h2_proxy(
         request.extend_from_slice(port_buf.format(target.port).as_bytes());
     }
     request.extend_from_slice(b"\r\n");
-    for header in ctx.headers.iter() {
-        if header.name.starts_with(b":") {
-            continue;
-        }
-        if header.name.eq_ignore_ascii_case(b"connection")
-            || header.name.eq_ignore_ascii_case(b"keep-alive")
-            || header.name.eq_ignore_ascii_case(b"transfer-encoding")
-        {
-            continue;
-        }
-        request.extend_from_slice(&header.name);
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(&header.value);
-        request.extend_from_slice(b"\r\n");
-    }
+    let added = expanded_added_headers(
+        security,
+        client_ip,
+        &ctx.authority,
+        std::str::from_utf8(req_path).unwrap_or("/"),
+    );
+    write_h1_forward_headers(
+        &mut request,
+        ctx.headers
+            .iter()
+            .map(|h| (h.name.as_ref(), h.value.as_ref())),
+        security,
+        &added,
+    );
     if !ctx.body.is_empty() {
         request.extend_from_slice(b"Content-Length: ");
         let mut len_buf = itoa::Buffer::new();
@@ -2402,11 +2409,19 @@ pub(super) async fn h2_proxy_h2c(
         .any(|h| header_pair_is_grpc(&h.name, &h.value));
     // F-166/F-165(A2): フィルタ済みイテレータを直接渡す（中間 `Vec` の `collect()` を回避）。
     // ホップバイホップ・`te`（gRPC 以外）の除外は上流クライアント側（F-174）でも行う。
+    let added = expanded_added_headers(
+        security,
+        &ctx.client_ip,
+        &ctx.authority,
+        std::str::from_utf8(&ctx.path).unwrap_or("/"),
+    );
     let headers_iter = ctx
         .headers
         .iter()
         .filter(|h| is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
-        .map(|h| (h.name.as_ref(), h.value.as_ref()));
+        .filter(|h| forward_allowed(security, &h.name))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()))
+        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
 
     // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）でストリームを開く。
     let key = crate::http_utils::PoolKeyStr::plain_addr(addr);
@@ -3405,11 +3420,14 @@ pub(super) async fn h2_relay_h2_streaming(
     let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
     let final_path = compute_upstream_path(path_str, prefix, &target.path_prefix, is_grpc);
     let addr = target.conn_addr();
+    let added = expanded_added_headers(security, &ctx.client_ip, &ctx.authority, path_str);
     let headers_iter = ctx
         .headers
         .iter()
         .filter(|h| is_grpc || !h.name.eq_ignore_ascii_case(b"te"))
-        .map(|h| (h.name.as_ref(), h.value.as_ref()));
+        .filter(|h| forward_allowed(security, &h.name))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()))
+        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
     let idle_timeout = Duration::from_secs(security.idle_connection_timeout_secs);
     let opened = if target.use_tls {
@@ -3717,22 +3735,15 @@ pub(super) async fn h2_serve_streaming(
         request.extend_from_slice(port_buf.format(target.port).as_bytes());
     }
     request.extend_from_slice(b"\r\n");
-    for header in ctx.headers.iter() {
-        if header.name.starts_with(b":") {
-            continue;
-        }
-        if header.name.eq_ignore_ascii_case(b"connection")
-            || header.name.eq_ignore_ascii_case(b"keep-alive")
-            || header.name.eq_ignore_ascii_case(b"transfer-encoding")
-            || header.name.eq_ignore_ascii_case(b"content-length")
-        {
-            continue;
-        }
-        request.extend_from_slice(&header.name);
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(&header.value);
-        request.extend_from_slice(b"\r\n");
-    }
+    let added = expanded_added_headers(&security, &ctx.client_ip, &ctx.authority, path_str);
+    write_h1_forward_headers(
+        &mut request,
+        ctx.headers
+            .iter()
+            .map(|h| (h.name.as_ref(), h.value.as_ref())),
+        &security,
+        &added,
+    );
     request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
 
     // F-175: ALPN で HTTP/1.1 を選んだ HTTPS 上流の接続（ネゴシエーション済み）をそのまま使う。

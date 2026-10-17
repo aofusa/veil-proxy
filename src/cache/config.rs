@@ -183,6 +183,17 @@ impl CacheConfig {
             .any(|m| m.as_bytes().eq_ignore_ascii_case(method))
     }
 
+    /// `Authorization` の付いた要求でキャッシュを使わないか。`key_headers` に `authorization` があれば
+    /// 利用者ごとのキーになるので使う（RFC 9111 §3.5。F-236 の F7）
+    #[inline]
+    pub fn bypass_for_authorization(&self, headers: &[(bytes::Bytes, bytes::Bytes)]) -> bool {
+        super::policy::CachePolicy::request_has_authorization(headers)
+            && !self
+                .key_headers
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case("authorization"))
+    }
+
     /// ステータスコードがキャッシュ対象かチェック
     #[inline]
     pub fn is_cacheable_status(&self, status: u16) -> bool {

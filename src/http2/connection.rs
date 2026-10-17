@@ -1057,6 +1057,16 @@ where
         for header in headers {
             let name = &header.name;
 
+            // F-236（F1）: 値に CR・LF・NUL・前後の空白があれば malformed（RFC 9113 §8.2.1）。HPACK は任意の
+            // バイトを運べるので、そのまま HTTP/1.1 の上流へ渡すと要求の密輸になる
+            if !crate::http_utils::is_valid_h2_field_value(&header.value) {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    "Invalid header field value",
+                ));
+            }
+
             // ヘッダー名に大文字が含まれていないことを確認 (RFC 7540 8.1.2)
             if name.iter().any(|&b| b.is_ascii_uppercase()) {
                 return Err(Http2Error::stream_error(
@@ -1090,6 +1100,13 @@ where
                 match name.as_ref() {
                     b":method" => {
                         method_count += 1;
+                        if !crate::http_utils::is_valid_method(&header.value) {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Invalid :method",
+                            ));
+                        }
                         #[cfg(feature = "mesh")]
                         if header.value.as_ref() == b"CONNECT" {
                             is_connect = true;
@@ -1106,6 +1123,13 @@ where
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,
                                 "Empty :path pseudo-header",
+                            ));
+                        }
+                        if !crate::http_utils::is_valid_request_target(&header.value) {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Invalid :path",
                             ));
                         }
                     }
@@ -1133,9 +1157,18 @@ where
                 // 通常ヘッダーの処理
                 seen_regular = true;
 
-                // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)
-                let lower = name.to_ascii_lowercase();
-                match lower.as_slice() {
+                // 名前は token（RFC 9113 §8.2.1。大文字は上で拒否済み）
+                if !crate::http_utils::is_valid_header_name(name) {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Invalid header field name",
+                    ));
+                }
+
+                // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)。名前は大文字を拒否済みなので小文字にし直さない
+                // （以前は要求のヘッダごとに to_ascii_lowercase で確保していた）
+                match name.as_ref() {
                     b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
                     | b"upgrade" => {
                         return Err(Http2Error::stream_error(
@@ -2431,6 +2464,34 @@ pub struct H2RequestParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-236 の F1: HTTP/1.1 の上流へ渡すと要求の密輸になるフィールドを拒否する
+    #[test]
+    fn request_headers_reject_smuggling_fields() {
+        use crate::http2::hpack::HeaderField as HF;
+        let req = |extra: &[(&[u8], &[u8])], method: &[u8], path: &[u8]| {
+            let mut h = vec![
+                HF::new(b":method".to_vec(), method.to_vec()),
+                HF::new(b":scheme".to_vec(), b"https".to_vec()),
+                HF::new(b":path".to_vec(), path.to_vec()),
+                HF::new(b":authority".to_vec(), b"example.com".to_vec()),
+            ];
+            for (n, v) in extra {
+                h.push(HF::new(n.to_vec(), v.to_vec()));
+            }
+            Http2Connection::<NullIo>::validate_request_headers(&h, 1, false)
+        };
+        assert!(req(&[(b"x-a", b"ok value")], b"GET", b"/").is_ok());
+        assert!(req(&[(b"x-a", b"v\r\nx-injected: 1")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"v\nx")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"v\0")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b" lead")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"trail\t")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x a", b"v")], b"GET", b"/").is_err());
+        assert!(req(&[], b"GET /x HTTP/1.1\r\n", b"/").is_err());
+        assert!(req(&[], b"GET", b"/a b").is_err());
+        assert!(req(&[], b"GET", b"/a\r\nb").is_err());
+    }
 
     /// 読むと EOF、書いたものは捨てるだけのソケット（フレーム処理の単体テスト用）。
     struct NullIo;

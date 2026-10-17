@@ -264,6 +264,15 @@ impl CachePolicy {
     ///
     /// F-168: 呼び出し元（proxy.rs）のリクエストヘッダーが `Bytes`（accumulated からの
     /// ゼロコピー切り出し）になったため、こちらもそれに合わせる。
+    /// 要求が `Authorization` を持つか。持つ要求の応答は共有キャッシュから返さず、保存もしない
+    /// （RFC 9111 §3.5。利用者ごとの応答をほかの利用者へ返さない。F-236 の F7）
+    #[inline]
+    pub fn request_has_authorization(request_headers: &[(bytes::Bytes, bytes::Bytes)]) -> bool {
+        request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(b"authorization"))
+    }
+
     pub fn get_if_none_match(request_headers: &[(bytes::Bytes, bytes::Bytes)]) -> Option<&[u8]> {
         request_headers
             .iter()

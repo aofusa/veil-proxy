@@ -299,11 +299,18 @@ pub(super) fn pack_resp_headers(
 /// F-171: HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を 1 回の確保に詰めて所有ペアにする
 /// （上流 HTTP/2 への転送用。ホップバイホップは上流クライアントが落とす）。
 #[cfg(feature = "http2")]
-pub(super) fn pack_h3_request_headers(headers: &[h3::Header]) -> crate::http3_stream::RespHeaders {
+pub(super) fn pack_h3_request_headers(
+    headers: &[h3::Header],
+    security: &SecurityConfig,
+    added: &[(Vec<u8>, Vec<u8>)],
+) -> crate::http3_stream::RespHeaders {
+    // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を HTTP/2 の上流にも当てる
     let refs: Vec<(&[u8], &[u8])> = headers
         .iter()
         .filter(|h| !h.name().starts_with(b":"))
+        .filter(|h| crate::proxy::forward_allowed(security, h.name()))
         .map(|h| (h.name(), h.value()))
+        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())))
         .collect();
     pack_resp_headers(&refs, None)
 }
@@ -1296,6 +1303,26 @@ impl H3BufferedTask {
             .map(|h| (h.name().to_vec(), h.value().to_vec()))
             .collect();
 
+        // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を、上流の種類（HTTP/1.1・h2c・
+        // HTTPS の HTTP/2）に関わらず当てる（以前は HTTP/1.1 で受けた要求にだけ当てていた）
+        let mut header_pairs = header_pairs;
+        if !security.remove_request_headers.is_empty() {
+            header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n));
+        }
+        if !security.add_request_headers.is_empty() {
+            let authority = headers
+                .iter()
+                .find(|h| h.name() == b":authority")
+                .map(|h| h.value())
+                .unwrap_or_default();
+            header_pairs.extend(crate::proxy::expanded_added_headers(
+                security,
+                self.client_ip.as_str(),
+                authority,
+                path_str,
+            ));
+        }
+
         // gRPC はサービス/メソッドのフルパスを保持（B-39）
         #[cfg(feature = "grpc")]
         let is_grpc_req = header_pairs_indicate_grpc(&header_pairs);
@@ -1412,12 +1439,15 @@ impl H3BufferedTask {
                     }
                     request.extend_from_slice(b"\r\n");
 
-                    for (name, value) in &header_pairs {
-                        request.extend_from_slice(name);
-                        request.extend_from_slice(b": ");
-                        request.extend_from_slice(value);
-                        request.extend_from_slice(b"\r\n");
-                    }
+                    // F-236（F2）: 名前・値の検査、content-length・host の除去（本文から付け直す）
+                    crate::proxy::write_h1_forward_headers(
+                        &mut request,
+                        header_pairs
+                            .iter()
+                            .map(|(n, v)| (n.as_slice(), v.as_slice())),
+                        security,
+                        &[],
+                    );
 
                     if !request_body.is_empty() {
                         request.extend_from_slice(b"Content-Length: ");

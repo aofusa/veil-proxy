@@ -478,6 +478,88 @@ fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
 }
 
 // ====================
+// 上流へ転送する要求ヘッダの方針（F-236 の監査の F1・F2・F4）
+// ====================
+
+/// `[route.security] remove_request_headers` に入っていない（上流へ送ってよい）名前か。
+/// 設定が空なら分岐 1 個で抜ける。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn forward_allowed(security: &SecurityConfig, name: &[u8]) -> bool {
+    security.remove_request_headers.is_empty()
+        || !security
+            .remove_request_headers
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
+}
+
+/// `[route.security] add_request_headers` を展開する（`$client_ip`・`$host`・`$request_uri`）。設定が無ければ
+/// 確保しない（空の `Vec`）。値に CR・LF・NUL が入るもの（展開した値も含む）は送らない。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) fn expanded_added_headers(
+    security: &SecurityConfig,
+    client_ip: &str,
+    host: &[u8],
+    request_uri: &str,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if security.add_request_headers.is_empty() {
+        return Vec::new();
+    }
+    let host = std::str::from_utf8(host).unwrap_or("-");
+    let mut out = Vec::with_capacity(security.add_request_headers.len());
+    for (name, value) in &security.add_request_headers {
+        let mut v = Vec::with_capacity(value.len());
+        expand_request_header_value(value, client_ip, host, request_uri, &mut v);
+        if is_valid_header_name(name.as_bytes()) && is_valid_header_value(&v) {
+            out.push((name.as_bytes().to_ascii_lowercase(), v));
+        }
+    }
+    out
+}
+
+/// HTTP/2・HTTP/3 で受けた要求のヘッダを、HTTP/1.1 の上流への要求に書く。
+///
+/// 送らないもの: 疑似ヘッダ・ホップバイホップ（connection・keep-alive・transfer-encoding・upgrade・proxy-connection）・
+/// `content-length`（本文から付け直す）・`host`（`:authority` から作った Host を先に書いている）・`expect`（プロキシが終端する）・
+/// `remove_request_headers`・名前が token でないもの・値に CR・LF・NUL を含むもの（HPACK・QPACK は任意のバイトを
+/// 運べるので、HTTP/1.1 では要求の密輸になる。F1・F2）。最後に `add_request_headers` を足す（F4）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) fn write_h1_forward_headers<'a>(
+    out: &mut Vec<u8>,
+    headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    security: &SecurityConfig,
+    added: &[(Vec<u8>, Vec<u8>)],
+) {
+    for (name, value) in headers {
+        if name.starts_with(b":")
+            || name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"upgrade")
+            || name.eq_ignore_ascii_case(b"proxy-connection")
+            || name.eq_ignore_ascii_case(b"content-length")
+            || name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"expect")
+            || !forward_allowed(security, name)
+            || !is_valid_header_name(name)
+            || !is_valid_header_value(value)
+        {
+            continue;
+        }
+        out.extend_from_slice(name);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+    for (name, value) in added {
+        out.extend_from_slice(name);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
+// ====================
 // ロギング
 // ====================
 
@@ -490,6 +572,35 @@ fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    /// F-236 の F1・F4: HTTP/2・HTTP/3 の要求を HTTP/1.1 へ書くとき、密輸になるもの・削除の指定を落とし、追加を足す
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn h1_forward_headers_apply_policy_and_drop_smuggling() {
+        let sec = SecurityConfig {
+            remove_request_headers: vec!["x-internal-user".to_string()],
+            add_request_headers: [("x-real-ip".to_string(), "$client_ip".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let added = expanded_added_headers(&sec, "192.0.2.1", b"example.com", "/p");
+        let hdrs: Vec<(&[u8], &[u8])> = vec![
+            (b":method", b"GET"),
+            (b"x-ok", b"1"),
+            (b"X-Internal-User", b"admin"),
+            (b"content-length", b"0"),
+            (b"transfer-encoding", b"chunked"),
+            (b"x-evil", b"a\r\nTransfer-Encoding: chunked"),
+            (b"bad name", b"v"),
+        ];
+        let mut out = Vec::new();
+        write_h1_forward_headers(&mut out, hdrs.into_iter(), &sec, &added);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "x-ok: 1\r\nx-real-ip: 192.0.2.1\r\n");
+        assert!(forward_allowed(&sec, b"x-ok"));
+        assert!(!forward_allowed(&sec, b"x-INTERNAL-user"));
+    }
 
     /// B-40: gRPC はルート /* プレフィックスを剥がさずフルパスを維持する。
     #[test]

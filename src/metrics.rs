@@ -579,7 +579,7 @@ pub(crate) static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
-#[cfg(feature = "metrics")]
+#[cfg(all(feature = "metrics", feature = "cache"))]
 /// キャッシュ保存数カウンター（host, storage ラベル付き）
 /// storage: "memory" or "disk"
 pub(crate) static CACHE_STORES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {

@@ -2194,7 +2194,8 @@ revalidate_mtime = false
 #   bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
 #   
 #   # Varyヘッダーを尊重するか
-#   # trueの場合、Varyに基づいて別々のキャッシュエントリを作成
+#   # trueの場合、Vary: * と、key_headers に無いヘッダで Vary する応答は保存しない
+#   # （Set-Cookie の応答は常に保存しない。Authorization の付いた要求は key_headers に無ければキャッシュを使わない）
 #   respect_vary = true
 #   
 #   # ETag検証を有効化
