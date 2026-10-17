@@ -1183,7 +1183,7 @@ if [ ! -x /usr/pkg/bin/pkgin ]; then
   /usr/sbin/pkg_add -v pkgin >/tmp/pkg_add.log 2>&1 || { tail -40 /tmp/pkg_add.log; exit 1; }
 fi
 /usr/pkg/bin/pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
-/usr/pkg/bin/pkgin -y install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
+/usr/pkg/bin/pkgin -y install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl python313 >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
 /usr/pkg/sbin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || /usr/pkg/bin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
 # NetBSD の base openssl(3.0) は /etc/openssl/openssl.cnf を必須とするが、配布イメージ
 # には置かれていない（evbarm の gzimg で実測）。無いと E2E の証明書生成
@@ -1191,6 +1191,9 @@ fi
 # \"Can't open /etc/openssl/openssl.cnf\" で失敗し、E2E が証明書生成の時点で止まる。
 # base に同梱のサンプルをそのまま配置する。
 [ -f /etc/openssl/openssl.cnf ] || cp /usr/share/examples/openssl/openssl.cnf /etc/openssl/openssl.cnf
+# pkgsrc の python は python3.13 の名前だけで python3 が無い。library_e2e・standalone_e2e（VDS の Python の
+# 制御プレーン）が python3 を呼ぶので名前を足す（aarch64 の VM で無くて失敗した。2026-10-17）
+[ -e /usr/pkg/bin/python3 ] || ln -s python3.13 /usr/pkg/bin/python3
 "
     else
         # OpenBSD も同様に protobuf（protoc）と gmake が要る
