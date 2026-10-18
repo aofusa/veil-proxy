@@ -383,7 +383,11 @@ pub(super) fn drive_response_flush(
                 }
             }
             BodySend::Partial(new_off) => {
-                did_work = true; // 一部でも送れたので進捗あり。
+                // 一部だけ送れた = ストリームの送れる量（フロー制御・輻輳ウィンドウ）を使い切った。続きは
+                // ACK・MAX_DATA の受信（受信でダーティになる）かタイマーでしか送れないので、これだけでは
+                // 再投入しない。以前は進捗ありとして再投入し、送れない周回を sleep 0 で回し続けた
+                // （FreeBSD の h3_file 54KB で空の kevent が 80 回/要求。v0.8.0）。送った分のパケットは
+                // この周回の送出で出る（send_targets は did_work に関わらず全部を回る）。
                 ps.body_pending = Some((buf, new_off, fin));
                 return did_work;
             }
@@ -453,7 +457,7 @@ pub(super) fn drive_response_flush(
                         }
                     }
                     BodySend::Partial(off) => {
-                        did_work = true;
+                        // 送れる量を使い切った（上の body_pending の Partial と同じ理由で再投入しない）
                         ps.body_pending = Some((b, off, fin));
                         return did_work;
                     }

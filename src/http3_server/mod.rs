@@ -2011,14 +2011,15 @@ impl Http3Handler {
         for stream_id in writable_streams {
             // 部分レスポンスがあるかチェック
             if let Some(pr) = self.partial_responses.get_mut(&stream_id) {
-                let written_before = pr.written;
                 let head_present_before = pr.head.is_some();
                 if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
                     completed.push(stream_id);
                     did_work = true;
-                } else if pr.written != written_before || pr.head.is_some() != head_present_before {
+                } else if pr.head.is_some() != head_present_before {
                     did_work = true;
                 }
+                // 本文が一部だけ進んだ（`pr.written` が増えた）だけなら再投入しない: 送れる量を使い切っており、
+                // 続きは ACK・MAX_DATA の受信かタイマーでしか送れない（streaming.rs の Partial と同じ。v0.8.0）
             }
         }
         for stream_id in completed {
