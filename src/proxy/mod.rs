@@ -483,7 +483,6 @@ fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
 
 /// `[route.security] remove_request_headers` に入っていない（上流へ送ってよい）名前か。
 /// 設定が空なら分岐 1 個で抜ける。
-#[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 pub(crate) fn forward_allowed(security: &SecurityConfig, name: &[u8]) -> bool {
     security.remove_request_headers.is_empty()
@@ -495,7 +494,6 @@ pub(crate) fn forward_allowed(security: &SecurityConfig, name: &[u8]) -> bool {
 
 /// `[route.security] add_request_headers` を展開する（`$client_ip`・`$host`・`$request_uri`）。設定が無ければ
 /// 確保しない（空の `Vec`）。値に CR・LF・NUL が入るもの（展開した値も含む）は送らない。
-#[cfg(any(feature = "http2", feature = "http3"))]
 pub(crate) fn expanded_added_headers(
     security: &SecurityConfig,
     client_ip: &str,

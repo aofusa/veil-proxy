@@ -671,6 +671,28 @@ pub struct GlobalSecurityConfig {
     /// 必要があり、これは運用側の設定責任である。
     #[serde(default)]
     pub chroot_dir: Option<String>,
+
+    /// 要求のパスの正規化（HTTP/1.1・HTTP/2・HTTP/3。ルートの照合・`[route.security]` の検査の前に 1 回だけ行い、
+    /// 正規化したパスを上流へ送る。F-236 の再走査の F7）。
+    ///
+    /// - `"base"`（既定）: 予約されていない文字の `%XX` を戻し、`\` を `/` にし、ドットのセグメントを取り除く
+    /// - `"merge_slashes"`: `base` に加えて、連続する `/` を 1 つにする
+    /// - `"off"`: 正規化しない（以前の動作。照合と上流の解釈がずれ得る）
+    #[serde(default)]
+    pub path_normalization: PathNormalizationMode,
+}
+
+/// `[security] path_normalization` の値
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PathNormalizationMode {
+    /// 正規化しない
+    Off,
+    /// ドットのセグメントの除去と、予約されていない文字の復号
+    #[default]
+    Base,
+    /// `Base` + 連続するスラッシュの統合
+    MergeSlashes,
 }
 
 pub(super) fn default_allow_security_failures() -> bool {

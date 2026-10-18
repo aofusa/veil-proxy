@@ -127,6 +127,15 @@ elif ! command -v docker >/dev/null 2>&1; then
 else
     NATIVE=0
 fi
+# qemu が SSH・シリアルコンソール（telnet）・QMP を待つアドレス。native はホストのループバックだけ、
+# Docker はコンテナの中なので全アドレスで待ち、`docker run -p 127.0.0.1:...` でホストのループバックだけに
+# 公開する（以前は両方とも 0.0.0.0 で、同じネットワークの誰でも root のコンソール・QMP に届いた。
+# F-236 の再走査の F10）。
+if [[ "${NATIVE}" == "1" ]]; then
+    GUEST_BIND="127.0.0.1"
+else
+    GUEST_BIND="0.0.0.0"
+fi
 VM_SMP="${VM_SMP:-4}"
 # 既定メモリは OS/アーキ別（F-176）。NetBSD x86_64 は 4GB だと単体テストのリンクで ld が
 # OOM kill され、VM ごと落ちることもあった（v0.7.0 の検証で実測。7GB で解消）。
@@ -434,8 +443,8 @@ _write_cloudinit_seed() {
 disable_root: false
 ssh_pwauth: false
 # シリアルコンソールからのデバッグ用に root パスワードを設定する。
-# SSH は鍵認証のみ（ssh_pwauth: false）で、VM のポートは 127.0.0.1 のみに
-# フォワードされるローカル開発用 VM なので、固定パスワードで問題ない。
+# SSH は鍵認証のみ（ssh_pwauth: false）。SSH・コンソール・QMP はホストの 127.0.0.1 だけで待つ
+# （GUEST_BIND・docker run -p 127.0.0.1:...）ので、固定パスワードはホストの利用者にしか使えない。
 chpasswd:
   expire: false
   list: |
@@ -586,7 +595,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -597,7 +606,7 @@ set -e
 cd "${WORKDIR}"
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -629,7 +638,7 @@ exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -700,8 +709,8 @@ _write_boot() {
     # provision のようにプロンプトを確実に掴みたい場面で使う。
     local con_mode="nowait"
     [[ "${CONSOLE_WAIT:-0}" == "1" ]] && con_mode="wait"
-    local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,${con_mode} \\
-  -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none"
+    local console_args="-nographic -serial telnet:${GUEST_BIND}:${CON_PORT},server,${con_mode} \\
+  -qmp telnet:${GUEST_BIND}:${QMP_PORT},server,nowait -monitor none"
 
     if [[ "${NATIVE}" == "1" ]]; then
         _write_boot_native "${drives}" "${seed_drive}" "${console_args}"
@@ -726,7 +735,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -740,7 +749,7 @@ set -e
 cd /w
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -759,7 +768,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -837,7 +846,8 @@ cmd_up() {
     fi
     # shellcheck disable=SC2046  # _kvm_args は 0/1 個の引数を意図的に展開する
     docker run -d --name "${NAME}" $(_kvm_args) "${base_mount[@]}" \
-        -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" -p "${QMP_PORT}:${QMP_PORT}" \
+        -p "127.0.0.1:${SSH_PORT}:${SSH_PORT}" -p "127.0.0.1:${CON_PORT}:${CON_PORT}" \
+        -p "127.0.0.1:${QMP_PORT}:${QMP_PORT}" \
         -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" bash /w/boot.sh >/dev/null
     log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}"
     [[ "${ARCH}" == "aarch64" ]] && log "aarch64 は TCG のため multi-user 到達に数分〜数十分かかる"

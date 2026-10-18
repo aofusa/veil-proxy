@@ -38,6 +38,9 @@ pub(super) async fn handle_websocket_proxy(
     prefix: &[u8],
     headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
+    content_length: usize,
+    client_ip: &str,
+    host: &[u8],
 ) -> Option<(u16, u64)> {
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
 
@@ -74,9 +77,17 @@ pub(super) async fn handle_websocket_proxy(
 
     request.extend_from_slice(HEADER_CRLF);
 
-    // すべてのヘッダーを転送（Host 以外）
+    // ヘッダーを転送する。Host（上で書いた）・Connection と Upgrade 以外のホップバイホップ・
+    // `remove_request_headers` に入っている名前・不正な名前と値は送らず、`add_request_headers` を足す
+    // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case(b"host") {
+        if name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"proxy-connection")
+            || name.eq_ignore_ascii_case(b"te")
+            || !forward_allowed(security, name)
+        {
             continue;
         }
 
@@ -89,12 +100,21 @@ pub(super) async fn handle_websocket_proxy(
         request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
+    for (name, value) in expanded_added_headers(security, client_ip, host, path_str) {
+        request.extend_from_slice(&name);
+        request.extend_from_slice(HEADER_COLON);
+        request.extend_from_slice(&value);
+        request.extend_from_slice(HEADER_CRLF);
+    }
     request.extend_from_slice(HEADER_CRLF);
 
-    // 初期ボディがあれば追加
-    if !initial_body.is_empty() {
-        request.extend_from_slice(initial_body);
-    }
+    // 要求の本文（Content-Length の分）だけをハンドシェイクと一緒に送る。それより後ろのバイトは
+    // 上流が 101 を返したときだけ送る（WebSocket のフレーム）。上流がアップグレードしなければ捨てる
+    // （以前はハンドシェイクの後ろに全部付けて送り、アップグレードしない上流では veil が経路・検査を
+    // 通していない次の要求として処理された。F-236 の再走査の F6）。
+    let body_len = content_length.min(initial_body.len());
+    request.extend_from_slice(&initial_body[..body_len]);
+    let after_upgrade = &initial_body[body_len..];
 
     // WebSocketポーリング設定を取得
     let poll_config = security.websocket_poll_config();
@@ -108,6 +128,7 @@ pub(super) async fn handle_websocket_proxy(
             tls_profile,
             connect_timeout,
             request,
+            after_upgrade,
             &poll_config,
         )
         .await
@@ -118,6 +139,7 @@ pub(super) async fn handle_websocket_proxy(
             target,
             connect_timeout,
             request,
+            after_upgrade,
             &poll_config,
         )
         .await
@@ -130,6 +152,7 @@ pub(super) async fn handle_websocket_proxy_http(
     target: &ProxyTarget,
     connect_timeout: Duration,
     request: Vec<u8>,
+    after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
@@ -216,6 +239,13 @@ pub(super) async fn handle_websocket_proxy_http(
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
                 debug!("WebSocket upgrade successful, starting bidirectional transfer");
+                // ハンドシェイクと同じ読み取りで届いていたクライアントのフレーム
+                if !after_upgrade.is_empty() {
+                    let (w, _) = backend_stream.write_all(after_upgrade.to_vec()).await;
+                    if w.is_err() {
+                        return Some((101, 0));
+                    }
+                }
                 let total = websocket_bidirectional_transfer(
                     &mut client_stream,
                     &mut backend_stream,
@@ -245,6 +275,7 @@ pub(super) async fn handle_websocket_proxy_https(
     tls_profile: crate::upstream_tls::TlsProfile,
     connect_timeout: Duration,
     request: Vec<u8>,
+    after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
@@ -354,6 +385,13 @@ pub(super) async fn handle_websocket_proxy_https(
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
                 debug!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
+                // ハンドシェイクと同じ読み取りで届いていたクライアントのフレーム
+                if !after_upgrade.is_empty() {
+                    let (w, _) = backend_stream.write_all(after_upgrade.to_vec()).await;
+                    if w.is_err() {
+                        return Some((101, 0));
+                    }
+                }
                 let total = websocket_bidirectional_transfer_tls(
                     &mut client_stream,
                     &mut backend_stream,

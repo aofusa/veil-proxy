@@ -85,6 +85,8 @@ where
         {
             ChunkedTransferResult::Complete => {}
             ChunkedTransferResult::Failed => return None,
+            // 不正なチャンク形式（要求の密輸の防止で打ち切る）
+            ChunkedTransferResult::Invalid => return None,
             ChunkedTransferResult::SizeLimitExceeded => return None,
         }
     } else {

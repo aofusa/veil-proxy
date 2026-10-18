@@ -104,6 +104,8 @@ pub(super) enum ChunkedTransferResult {
     Failed,
     /// サイズ制限超過（DoS対策）
     SizeLimitExceeded,
+    /// フレーミングが RFC 9112 §7.1 に合わない（厳格な解析。要求の密輸の防止）
+    Invalid,
 }
 
 /// Chunkedボディを転送（ステートマシンベース）
@@ -124,7 +126,10 @@ pub(super) async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
     initial_body: &[u8],
     max_body_size: u64,
 ) -> ChunkedTransferResult {
-    let mut decoder = ChunkedDecoder::new(max_body_size);
+    // 要求の本文は厳格に読み、終端（0 チャンク + トレーラーの空行）より後ろのバイトを上流へ送らない
+    // （緩い解析や終端の後ろの転送は、上流で別の要求になる。F-236 の再走査の F1・F5）。
+    // 呼び出し側（h1.rs）は、終端より後ろを次の要求として切り離してから initial_body を渡す。
+    let mut decoder = ChunkedDecoder::new_request(max_body_size);
 
     // 初期ボディが既に終端を含んでいるかチェック
     if !initial_body.is_empty() {
@@ -133,6 +138,7 @@ pub(super) async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
             ChunkedFeedResult::SizeLimitExceeded => {
                 return ChunkedTransferResult::SizeLimitExceeded
             }
+            ChunkedFeedResult::Invalid => return ChunkedTransferResult::Invalid,
             ChunkedFeedResult::Continue => {}
         }
     }
@@ -162,15 +168,27 @@ pub(super) async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
         returned_buf.set_valid_len(n);
 
         // ステートマシンにデータをフィード（型安全なアクセス）
-        let feed_result = decoder.feed(returned_buf.as_valid_slice());
+        let (feed_result, consumed) = decoder.feed_counted(returned_buf.as_valid_slice());
 
-        // サイズ制限超過チェック
-        if feed_result == ChunkedFeedResult::SizeLimitExceeded {
-            buf_put(returned_buf);
-            return ChunkedTransferResult::SizeLimitExceeded;
+        // サイズ制限超過・不正なフレーミング
+        match feed_result {
+            ChunkedFeedResult::SizeLimitExceeded => {
+                buf_put(returned_buf);
+                return ChunkedTransferResult::SizeLimitExceeded;
+            }
+            ChunkedFeedResult::Invalid => {
+                buf_put(returned_buf);
+                return ChunkedTransferResult::Invalid;
+            }
+            ChunkedFeedResult::Complete | ChunkedFeedResult::Continue => {}
         }
 
-        // バックエンドに転送（有効データのみを含むVecに変換）
+        // バックエンドに転送（有効データのみを含むVecに変換）。終端より後ろ（同じ読み取りに入った
+        // パイプラインの次の要求）は送らずに捨てる（上流で veil の検査を通らない要求にさせない）。
+        if consumed < n {
+            debug!("[proxy] dropping {} bytes after the chunked terminator", n - consumed);
+            returned_buf.set_valid_len(consumed);
+        }
         let write_buf = returned_buf.into_truncated();
 
         let write_result = timeout(WRITE_TIMEOUT, writer.write_buf(write_buf)).await;

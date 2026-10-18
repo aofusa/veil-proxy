@@ -985,7 +985,7 @@ where
         })?;
 
         let header_block = stream.take_header_block();
-        let headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
+        let mut headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
             // HPACKエラーを適切に処理
             ftlog::warn!(
                 "[HTTP/2] HPACK decode error for stream {}: {}",
@@ -997,6 +997,14 @@ where
 
         // ヘッダーを検証 (RFC 7540 Section 8.1.2)
         Self::validate_request_headers(&headers, stream_id, is_trailer)?;
+        // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。F-236 の再走査の F7）
+        if !is_trailer {
+            if let Some(h) = headers.iter_mut().find(|h| h.name.as_ref() == b":path") {
+                if let Some(n) = crate::path_norm::normalize_request_path(&h.value) {
+                    h.value = bytes::Bytes::from(n);
+                }
+            }
+        }
 
         let stream = self.streams.get(stream_id).unwrap();
 
@@ -1125,7 +1133,10 @@ where
                                 "Empty :path pseudo-header",
                             ));
                         }
-                        if !crate::http_utils::is_valid_request_target(&header.value) {
+                        // origin 形式か `*` だけ（RFC 9113 §8.3.1。絶対形式はルートの照合を素通りする）
+                        if !crate::http_utils::is_valid_request_target(&header.value)
+                            || (header.value[0] != b'/' && header.value.as_ref() != b"*")
+                        {
                             return Err(Http2Error::stream_error(
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,

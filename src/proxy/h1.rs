@@ -349,6 +349,28 @@ pub(super) async fn handle_requests(
                 let path_bytes: Bytes = path_range
                     .map(|(off, len)| header_bytes.slice(off..off + len))
                     .unwrap_or_else(|| Bytes::from_static(b"/"));
+                // 要求先の形式（RFC 9112 §3.2）: 絶対形式（`http://host/path`）は origin 形式に直し、
+                // それ以外（`/` で始まらないもの。CONNECT と OPTIONS の `*` を除く）は 400 にする。
+                // そのあとパスを正規化し、ルートの照合・検査・上流への要求に同じパスを使う
+                // （以前は生のまま照合して上流へ送り、`/%61dmin`・`/public/../admin` でルートの制限を
+                // 素通りできた。F-236 の再走査の F7）。
+                let path_bytes: Bytes = match crate::http_utils::origin_form_target(
+                    &method_bytes,
+                    &path_bytes,
+                ) {
+                    Some(r) => {
+                        let p = path_bytes.slice(r);
+                        match crate::path_norm::normalize_request_path(&p) {
+                            Some(n) => Bytes::from(n),
+                            None => p,
+                        }
+                    }
+                    None => {
+                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                };
 
                 let user_agent: Bytes = user_agent_range
                     .map(|(off, len)| header_bytes.slice(off..off + len))
@@ -789,12 +811,33 @@ pub(super) async fn handle_requests(
                 // （header_len によるオフセット計算は不要）。
                 // B-129: 本文の長さが決まっている要求（chunked・WebSocket 以外）は、本文より後ろのデータを
                 // 次の要求（パイプライン）として残す（以前は本文の先頭として扱い、次の要求を失っていた）
-                let pipelined: BytesMut =
-                    if !is_chunked && !is_websocket && accumulated.len() > content_length {
-                        accumulated.split_off(content_length)
-                    } else {
-                        BytesMut::new()
-                    };
+                // chunked の要求は、読み取り済みの範囲に終端があればその直後で切る（以前は切らず、終端より
+                // 後ろのバイト＝veil が経路・検査を通していない次の要求を上流へそのまま送っていた。
+                // F-236 の再走査の F1）。不正なチャンク形式は 400 で閉じる（F5）。
+                let chunked_end = if is_chunked && !is_websocket {
+                    let mut dec = ChunkedDecoder::new_request(0);
+                    match dec.feed_counted(&accumulated) {
+                        (ChunkedFeedResult::Complete, k) => Some(k),
+                        (ChunkedFeedResult::Invalid, _) => {
+                            let _ = timeout(
+                                WRITE_TIMEOUT,
+                                tls_stream.write_all(ERR_MSG_BAD_REQUEST.to_vec()),
+                            )
+                            .await;
+                            return;
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let pipelined: BytesMut = if let Some(k) = chunked_end {
+                    accumulated.split_off(k)
+                } else if !is_chunked && !is_websocket && accumulated.len() > content_length {
+                    accumulated.split_off(content_length)
+                } else {
+                    BytesMut::new()
+                };
                 let initial_body: Vec<u8> = accumulated.to_vec();
 
                 // WASMモジュールの適用
@@ -968,6 +1011,9 @@ pub(super) async fn handle_requests(
                             &prefix,
                             &headers_for_proxy,
                             &initial_body,
+                            content_length,
+                            client_ip,
+                            &host_bytes,
                         )
                         .await;
 
@@ -1124,10 +1170,10 @@ pub(super) async fn drain_request_body(
 ) -> bool {
     if is_chunked {
         // DoS 対策の上限は MAX_BODY_SIZE を流用（リクエスト本文の上限）。
-        let mut decoder = ChunkedDecoder::new(MAX_BODY_SIZE as u64);
+        let mut decoder = ChunkedDecoder::new_request(MAX_BODY_SIZE as u64);
         match decoder.feed(initial_body) {
             ChunkedFeedResult::Complete => return true,
-            ChunkedFeedResult::SizeLimitExceeded => return false,
+            ChunkedFeedResult::SizeLimitExceeded | ChunkedFeedResult::Invalid => return false,
             ChunkedFeedResult::Continue => {}
         }
         loop {
@@ -1143,7 +1189,9 @@ pub(super) async fn drain_request_body(
                     buf_put(b);
                     match res {
                         ChunkedFeedResult::Complete => return true,
-                        ChunkedFeedResult::SizeLimitExceeded => return false,
+                        ChunkedFeedResult::SizeLimitExceeded | ChunkedFeedResult::Invalid => {
+                            return false
+                        }
                         ChunkedFeedResult::Continue => {}
                     }
                 }
@@ -1634,7 +1682,7 @@ pub(super) async fn read_api_request_body(
     limit: usize,
 ) -> Result<Bytes, u16> {
     if is_chunked {
-        let mut decoder = ChunkedDecoder::new(limit as u64);
+        let mut decoder = ChunkedDecoder::new_request(limit as u64);
         let mut raw: Vec<u8> = initial_body.to_vec();
         let mut state = decoder.feed(initial_body);
         while matches!(state, ChunkedFeedResult::Continue) {
@@ -1656,7 +1704,7 @@ pub(super) async fn read_api_request_body(
         match state {
             ChunkedFeedResult::Complete => Ok(Bytes::from(decode_chunked_body(&raw))),
             ChunkedFeedResult::SizeLimitExceeded => Err(413),
-            ChunkedFeedResult::Continue => Err(400),
+            ChunkedFeedResult::Continue | ChunkedFeedResult::Invalid => Err(400),
         }
     } else {
         if content_length > limit {

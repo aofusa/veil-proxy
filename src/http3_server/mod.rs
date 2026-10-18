@@ -110,6 +110,8 @@ const H3_MESSAGE_ERROR: u64 = 0x10e;
 const H3_NO_ERROR_CODE: u64 = 0x100;
 /// HTTP/3 の H3_REQUEST_REJECTED（RFC 9114 §8.1。GOAWAY 後に届いた要求。クライアントは再送してよい）。
 const H3_REQUEST_REJECTED: u64 = 0x10b;
+/// HTTP/3 の H3_EXCESSIVE_LOAD（RFC 9114 §8.1）。バッファ経路の要求本文が上限を超えたストリームを断る。
+const H3_EXCESSIVE_LOAD: u64 = 0x107;
 
 /// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
 ///
@@ -164,7 +166,11 @@ where
                 scheme_needs_authority = value == b"https" || value == b"http";
             } else if bit == PATH && value.is_empty() {
                 return Err("empty :path");
-            } else if bit == PATH && !crate::http_utils::is_valid_request_target(value) {
+            } else if bit == PATH
+                && (!crate::http_utils::is_valid_request_target(value)
+                    || (value[0] != b'/' && value != b"*"))
+            {
+                // origin 形式か `*` だけ（RFC 9114 §4.3.1。絶対形式はルートの照合を素通りする）
                 return Err("invalid :path");
             }
         } else {
@@ -1089,6 +1095,16 @@ impl Http3Handler {
                                     );
                                 } else {
                                     self.next_req_stream = self.next_req_stream.max(stream_id + 4);
+                                    // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。
+                                    // F-236 の再走査の F7）。要るときだけ作り直す
+                                    let mut list = list;
+                                    if let Some(i) = list.iter().position(|h| h.name() == b":path") {
+                                        if let Some(n) =
+                                            crate::path_norm::normalize_request_path(list[i].value())
+                                        {
+                                            list[i] = quiche::h3::Header::new(b":path", &n);
+                                        }
+                                    }
                                     new_headers.push((stream_id, list, more_frames));
                                 }
                             }
@@ -1120,7 +1136,24 @@ impl Http3Handler {
                         } else {
                             // バッファ経路（または未分類の初回バッチ）: stream_bodies へ排出。
                             let body = self.stream_bodies.entry(stream_id).or_default();
+                            let limit = crate::l7::max_buffered_request_body();
                             loop {
+                                // どのルートでも許されない大きさになったら、読むのをやめてストリームを断る
+                                // （読み続けると quiche がクレジットを返し続け、無限に溜まる。F-236 の再走査の F4）
+                                if body.len() > limit {
+                                    let _ = self.conn.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Read,
+                                        H3_EXCESSIVE_LOAD,
+                                    );
+                                    let _ = self.conn.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Write,
+                                        H3_EXCESSIVE_LOAD,
+                                    );
+                                    reset.push(stream_id);
+                                    break;
+                                }
                                 body.reserve(REQ_RECV_CHUNK);
                                 let spare = body.spare_capacity_mut();
                                 // SAFETY: recv_body は書き込み専用で read バイトのみ初期化する。

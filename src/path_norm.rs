@@ -1,8 +1,9 @@
 //! 要求のパスの正規化（Envoy の HCM の `normalize_path`・`merge_slashes`・
-//! `path_with_escaped_slashes_action`。F-236 の F5）。
+//! `path_with_escaped_slashes_action`。F-236 の F5（メッシュ）・再走査の F7（TOML のルート））。
 //!
-//! ルート・RBAC・JWT の照合の前に 1 回だけ行い、正規化したパスを上流へも送る。照合は生のパスで、上流は
-//! 正規化したパスで解釈すると、`/%61dmin`・`/./admin`・`/public/../admin` で `/admin/*` の拒否を素通りできる。
+//! ルート・RBAC・JWT・`[route.security]` の照合の前に 1 回だけ行い、正規化したパスを上流へも送る。照合は
+//! 生のパスで、上流は正規化したパスで解釈すると、`/%61dmin`・`/./admin`・`/public/../admin` で `/admin/*` の
+//! 制限を素通りできる。メッシュは xDS の HCM の設定で、TOML の設定は `[security] path_normalization` で決める。
 //!
 //! 正規化の中身（Envoy の `PathUtil::canonicalPath` と同じ範囲）:
 //! - 予約されていない文字（`ALPHA DIGIT - . _ ~`）の `%XX` を元の文字に戻す。ほかの `%xx` は大文字の 16 進にする
@@ -197,6 +198,37 @@ pub fn normalize(path: &[u8], cfg: &PathNormalization) -> Result<Option<Vec<u8>>
     }
     out.extend_from_slice(query);
     Ok(Some(out))
+}
+
+/// TOML の設定（`[security] path_normalization`）のモード。0 = off、1 = base、2 = merge_slashes
+static REQUEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// 設定のロード・リロードで TOML の経路のモードを決める
+pub fn set_request_mode(mode: crate::config::PathNormalizationMode) {
+    use crate::config::PathNormalizationMode as M;
+    let v = match mode {
+        M::Off => 0,
+        M::Base => 1,
+        M::MergeSlashes => 2,
+    };
+    REQUEST_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// TOML の経路（HTTP/1.1・HTTP/2・HTTP/3）の要求のパスを正規化する。変わらなければ `None`。
+///
+/// 正規化の要らないパスは 1 回の走査だけで、確保しない（ホットパス）。`%2F`・`%5C` はそのまま残す。
+#[inline]
+pub fn normalize_request_path(path: &[u8]) -> Option<Vec<u8>> {
+    let cfg = match REQUEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return None,
+        1 => PathNormalization::default(),
+        _ => PathNormalization {
+            merge_slashes: true,
+            ..PathNormalization::default()
+        },
+    };
+    // Keep のときは拒否しない
+    normalize(path, &cfg).ok().flatten()
 }
 
 #[cfg(test)]

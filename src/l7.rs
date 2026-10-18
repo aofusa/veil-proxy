@@ -18,7 +18,34 @@ use crate::constants::{
     ERR_MSG_TOO_MANY_REQUESTS,
 };
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// HTTP/2・HTTP/3 のバッファ経路で、ストリームに溜める要求本文の上限（全ルートの `max_request_body_size` の
+/// 最大。最低でも [`crate::pool::MAX_BODY_SIZE`]）。
+///
+/// バッファ経路はルートの検査（`check_security` の本文の上限）が END_STREAM の後にしか走らず、受信の
+/// フロー制御のクレジットは受け取るたびに返すので、上限が無いと終わらない本文で無限に溜められた
+/// （F-236 の再走査の F3・F4）。ストリームに積む時点で、どのルートでも許されない大きさを断る。
+static MAX_BUFFERED_REQUEST_BODY: AtomicUsize = AtomicUsize::new(crate::pool::MAX_BODY_SIZE);
+
+/// 設定のロード・リロードで [`max_buffered_request_body`] を決め直す
+pub fn set_max_buffered_request_body(routes: &[crate::config::Route]) {
+    let max = routes
+        .iter()
+        .filter_map(|r| r.security.as_ref())
+        .map(|s| s.max_request_body_size)
+        .max()
+        .unwrap_or(0)
+        .max(crate::pool::MAX_BODY_SIZE);
+    MAX_BUFFERED_REQUEST_BODY.store(max, Ordering::Relaxed);
+}
+
+/// バッファ経路の要求本文の上限（[`set_max_buffered_request_body`] 参照）
+#[inline]
+pub fn max_buffered_request_body() -> usize {
+    MAX_BUFFERED_REQUEST_BODY.load(Ordering::Relaxed)
+}
 
 /// 照合したルート: パスの前置き・Backend・圧縮の設定（どれもルートが持つ解決済みの値の `Arc` の複製）。
 pub type RouteMatch = (Arc<[u8]>, Backend, Arc<CompressionConfig>);

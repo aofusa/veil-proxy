@@ -293,6 +293,9 @@ pub mod route_traffic;
 // HTTP/1.1・2・3 で共通の L7 の段（ルートの照合・セキュリティの検査。F-234）
 #[doc(hidden)]
 pub mod l7;
+// 要求のパスの正規化（TOML の経路とメッシュで共有。F-236）
+#[doc(hidden)]
+pub mod path_norm;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 #[doc(hidden)]
 pub mod tls_provider;
