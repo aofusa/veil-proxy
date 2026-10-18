@@ -676,6 +676,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
 | `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
+| `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) get 400 | `"base"` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 
 #### Security Feature Failure Handling
@@ -1025,8 +1026,8 @@ Add or remove request/response headers. Configure security headers such as X-Rea
 ### Request Header Manipulation
 
 Add or remove headers before forwarding to the backend. Both options apply to every client protocol
-(HTTP/1.1, HTTP/2, HTTP/3) and every upstream protocol (HTTP/1.1, h2c, HTTPS h2). Header values that would contain
-CR, LF or NUL after variable expansion are not sent.
+(HTTP/1.1, HTTP/2, HTTP/3) and every upstream protocol (HTTP/1.1, h2c, HTTPS h2), including WebSocket upgrade
+requests. Header values that would contain CR, LF or NUL after variable expansion are not sent.
 
 | Option | Description | Example |
 |--------|-------------|---------|

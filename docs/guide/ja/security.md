@@ -360,7 +360,7 @@ Veilは接続レベルのパニックキャッチを実装し、高可用性を�
 
 リリースの前に、Anthropic の [claude-security](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/claude-security)
 プラグインでリポジトリを走査します。確認された指摘は、`docs/backlog/bugs/` の `B-` チケットと同じ変更で直します。v0.8.0 の監査では
-B-135〜B-141 を直しました。
+B-135〜B-151 を直しました（最初の走査と再走査）。
 
 走査のやり直し方（未コミットのファイルを読ませないよう、監査する版のきれいな worktree で行う）:
 
@@ -385,4 +385,13 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
 - 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`Authorization` の要求への応答
   （`key_headers` に `Authorization` が無いとき）を保存しない。
 - IP の許可・拒否リストは、IPv4 射影の IPv6 のアドレスを IPv4 として照合する。
+- 要求のパスは、ルートの照合・`[route.security]` の検査の前に正規化し、正規化したまま上流へ送る
+  （`[security] path_normalization`）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないものは 400。
+- chunked の要求の本文は厳格に読み（RFC 9112 §7.1。不正なフレーミングは断る）、終端のチャンクより後ろを
+  その要求の一部として上流へ送らない。
+- WebSocket のアップグレードにも `remove_request_headers`・`add_request_headers` が効く。ハンドシェイクの後ろの
+  クライアントのバイトは、上流が `101` を返したときだけ送る。
+- HTTP/2・HTTP/3 のバッファ経路の要求本文は、溜める途中で上限（全ルートの `max_request_body_size` の最大。
+  最低 10MB）を見て、超えたストリームを断る。
+- Linkerd の管理ポートの `/shutdown`・`/env.json` はループバックからだけ受ける。
 - メッシュは、ルート・RBAC・JWT の前にパスを正規化し、`remoteIpBlocks` を Envoy の「元のクライアントのアドレス」で判定する。

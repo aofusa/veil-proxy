@@ -145,6 +145,14 @@ drop_privileges_user = "nobody"
 drop_privileges_group = "nogroup"
 # グローバル同時接続上限（0 = 無制限）
 max_concurrent_connections = 10000
+# 要求のパスの正規化。ルートの照合・[route.security] の検査の前に行い、正規化したパスを上流へも送る
+# （veil と上流でパスの解釈が揃う。HTTP/1.1・HTTP/2・HTTP/3）。
+# "base"（既定）: 予約されていない文字の %XX を戻し、"\" を "/" にし、"." と ".." のセグメントを取り除く
+# "merge_slashes": base + 連続する "/" を 1 つにする
+# "off": 生のパスで照合して送る（v0.8.0 より前の動作）
+# %2F・%5C はそのまま残す。絶対形式の要求先（http://host/path）は origin 形式に直し、
+# それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400。
+# path_normalization = "base"
 
 # seccomp システムコール制限（Linux専用）
 # まずログモードで動作確認後、filterモードに変更推奨

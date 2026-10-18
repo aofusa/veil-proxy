@@ -436,6 +436,16 @@
 | B-139 | P2 | 完了 | [bugs/B-139-route-cache-fixed-seed-hash.md](bugs/B-139-route-cache-fixed-seed-hash.md) | ルートのキャッシュのキーが固定シードの 64 ビットのハッシュで、衝突を作ると保護の無いルートへ入れた |
 | B-140 | P1 | 完了 | [bugs/B-140-shared-cache-per-user-responses.md](bugs/B-140-shared-cache-per-user-responses.md) | 応答のキャッシュが Authorization 付きの要求・Set-Cookie の応答も保存し、Vary を照合で見ていなかった |
 | B-141 | P2 | 完了 | [bugs/B-141-ipv4-mapped-ipv6-bypasses-ip-lists.md](bugs/B-141-ipv4-mapped-ipv6-bypasses-ip-lists.md) | IPv4 射影の IPv6（`::ffff:10.0.0.1`）が IPv4 の拒否リストをすり抜けた |
+| B-142 | P0 | 完了 | [bugs/B-142-chunked-request-bytes-after-terminator.md](bugs/B-142-chunked-request-bytes-after-terminator.md) | chunked の要求で、終端より後ろのバイト（検査していない次の要求）を上流へ送っていた（要求の密輸） |
+| B-143 | P1 | 完了 | [bugs/B-143-lenient-chunked-request-parser.md](bugs/B-143-lenient-chunked-request-parser.md) | chunked の要求の本文を緩く解析し、上流と本文の境界の解釈がずれ得た（要求は厳格に読む） |
+| B-144 | P1 | 完了 | [bugs/B-144-websocket-ignores-request-header-policy.md](bugs/B-144-websocket-ignores-request-header-policy.md) | WebSocket のアップグレードの要求に要求ヘッダの削除・追加が効いていなかった |
+| B-145 | P1 | 完了 | [bugs/B-145-websocket-forwards-trailing-bytes.md](bugs/B-145-websocket-forwards-trailing-bytes.md) | WebSocket のハンドシェイクの後ろのバイトを、上流の 101 の前に送っていた（アップグレードしない上流で次の要求になる） |
+| B-146 | P1 | 完了 | [bugs/B-146-h2-buffered-request-body-unbounded.md](bugs/B-146-h2-buffered-request-body-unbounded.md) | HTTP/2 のバッファ経路の要求本文に上限が無く、ウィンドウを補充し続けていた（メモリの枯渇） |
+| B-147 | P1 | 完了 | [bugs/B-147-h3-buffered-request-body-unbounded.md](bugs/B-147-h3-buffered-request-body-unbounded.md) | HTTP/3 のバッファ経路の要求本文に上限が無かった |
+| B-148 | P1 | 完了 | [bugs/B-148-toml-routes-match-raw-path.md](bugs/B-148-toml-routes-match-raw-path.md) | TOML のルートが正規化していないパスで照合し、`/%61dmin`・絶対形式でルートの制限を素通りできた |
+| B-149 | P1 | 完了 | [bugs/B-149-linkerd-admin-shutdown-any-peer.md](bugs/B-149-linkerd-admin-shutdown-any-peer.md) | Linkerd の管理ポートの `/shutdown`・`/env.json` をループバック以外にも返していた |
+| B-150 | P2 | 完了 | [bugs/B-150-aarch64-vm-ssh-on-all-interfaces.md](bugs/B-150-aarch64-vm-ssh-on-all-interfaces.md) | 試験用の Linux aarch64 VM の SSH を全アドレスで公開し、パスワード認証を許していた |
+| B-151 | P2 | 完了 | [bugs/B-151-bsd-vm-console-on-all-interfaces.md](bugs/B-151-bsd-vm-console-on-all-interfaces.md) | 試験用の BSD の VM のコンソール・QMP・SSH を全アドレスで待っていた |
 
 ---
 

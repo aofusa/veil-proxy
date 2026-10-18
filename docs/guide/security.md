@@ -358,7 +358,7 @@ When a panic is caught:
 
 Before each release the repository is scanned with Anthropic's
 [claude-security](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/claude-security) plugin.
-Confirmed findings are fixed together with a `B-` ticket in `docs/backlog/bugs/`; the v0.8.0 audit produced B-135 to B-141.
+Confirmed findings are fixed together with a `B-` ticket in `docs/backlog/bugs/`; the v0.8.0 audit and its re-scan produced B-135 to B-151.
 
 How to re-run the scan (from a clean worktree of the revision to audit, so the scan cannot see uncommitted files):
 
@@ -384,4 +384,13 @@ Request-level hardening that came out of the audit:
 - The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
   or responses to `Authorization` requests (unless `key_headers` includes `Authorization`).
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
+- Request paths are normalized before routing and `[route.security]` checks and forwarded normalized
+  (`[security] path_normalization`); absolute-form targets become origin-form, other non-origin targets get 400.
+- Chunked request bodies are parsed strictly (RFC 9112 §7.1; malformed framing is rejected) and nothing after
+  the terminating chunk is forwarded upstream as part of that request.
+- WebSocket upgrades apply `remove_request_headers` / `add_request_headers`; client bytes that follow the
+  handshake are sent upstream only after a `101`.
+- HTTP/2 and HTTP/3 buffered request bodies are capped while they accumulate (the largest
+  `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
+- The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.
 - The mesh normalizes paths before routing/RBAC/JWT and derives `remoteIpBlocks` from Envoy's original client address.

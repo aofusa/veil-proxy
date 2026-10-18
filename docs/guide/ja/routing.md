@@ -672,6 +672,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
 | `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
+| `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）は 400 | `"base"` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 
 #### セキュリティ機能失敗時の動作
@@ -1018,7 +1019,7 @@ redirect_status = 301
 ### リクエストヘッダー操作
 
 バックエンドへ転送する前にヘッダーを追加・削除します。どちらも、クライアントのプロトコル（HTTP/1.1・HTTP/2・HTTP/3）と
-上流のプロトコル（HTTP/1.1・h2c・HTTPS の h2）のすべてに効きます。変数を展開した値に CR・LF・NUL が入るヘッダーは送りません。
+上流のプロトコル（HTTP/1.1・h2c・HTTPS の h2）のすべて（WebSocket のアップグレードの要求を含む）に効きます。変数を展開した値に CR・LF・NUL が入るヘッダーは送りません。
 
 | オプション | 説明 | 例 |
 |-----------|------|-----|

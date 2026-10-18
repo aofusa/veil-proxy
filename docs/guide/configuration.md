@@ -149,6 +149,14 @@ drop_privileges_user = "nobody"
 drop_privileges_group = "nogroup"
 # Global concurrent connection limit (0 = unlimited)
 max_concurrent_connections = 10000
+# Request path normalization before routing and [route.security] checks; the normalized path is
+# also sent upstream, so veil and the backend agree on it (HTTP/1.1, HTTP/2, HTTP/3).
+# "base" (default): decode %XX of unreserved characters, turn "\" into "/", remove "." / ".." segments
+# "merge_slashes": base + collapse repeated "/"
+# "off": match and forward the raw path (pre-v0.8.0 behavior)
+# %2F / %5C are kept encoded. Absolute-form targets (http://host/path) are converted to origin form;
+# other non-origin targets (except CONNECT and OPTIONS *) get 400.
+# path_normalization = "base"
 
 # seccomp system call restriction (Linux only)
 # Recommended to verify with log mode first, then switch to filter mode
