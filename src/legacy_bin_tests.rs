@@ -741,7 +741,8 @@ mod config_parse_tests {
         let config = Http3ConfigSection::default();
 
         assert_eq!(config.max_idle_timeout, 30000);
-        assert_eq!(config.max_udp_payload_size, 1350);
+        assert_eq!(config.max_udp_payload_size, 1452);
+        assert!(config.discover_pmtu);
         assert_eq!(config.initial_max_data, 10_000_000);
         assert_eq!(config.initial_max_streams_bidi, 100);
         assert_eq!(config.initial_max_streams_uni, 100);
