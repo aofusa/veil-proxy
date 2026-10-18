@@ -45,6 +45,12 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+> The allowlist includes `faccessat2` (issued by glibc 2.33+/musl for `access()`/`faccessat()`) and
+> `openat2` (used to resolve static files with `RESOLVE_BENEATH`, F-153). The container profiles
+> (`docker/assets/security/seccomp.json` / `seccomp-epoll.json`) include both; `openat2` was added in
+> v0.8.0 (without it veil falls back to `canonicalize()` on every request, and before B-154 the first
+> static request after startup returned 404).
+
 **Recommended Deployment Procedure:**
 
 ```bash

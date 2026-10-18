@@ -49,6 +49,9 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > `access()`/`faccessat()` の実体として発行）を含みます。これが無いと seccomp 有効時に
 > ファイル解決が `EPERM` で失敗し、静的配信が 404 になります（コンテナ用
 > `docker/assets/security/seccomp.json` にも同システムコールを含めています）。
+> 静的配信のパス解決（`RESOLVE_BENEATH` での封じ込め、F-153）に使う `openat2` も含みます。
+> コンテナ用のプロファイルには v0.8.0 で足しました（無いと毎回 `canonicalize()` の経路に戻ります。
+> 以前は起動後最初の静的配信の要求だけが 404 になっていました。B-154）。
 
 **推奨導入手順:**
 
