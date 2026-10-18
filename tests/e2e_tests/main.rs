@@ -629,3 +629,5 @@ mod h3_grpc_coverage;
 #[cfg(any(feature = "http3", feature = "grpc", feature = "grpc-web"))]
 mod h3_grpc_coverage2;
 mod upstream;
+// F-236 の監査で直した要求の扱い（B-142・B-143・B-148）
+mod security_audit;
