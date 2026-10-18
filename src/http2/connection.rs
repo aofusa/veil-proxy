@@ -106,6 +106,22 @@ struct ZcSeg {
     _hold: Bytes,
 }
 
+/// `TCP_NOPUSH` を切り替える（失敗は無視する。ゼロコピーの送出の間だけ立てる）
+#[cfg(all(target_os = "freebsd", feature = "cache"))]
+fn set_tcp_nopush(fd: std::os::unix::io::RawFd, on: bool) {
+    let v: libc::c_int = on as libc::c_int;
+    // SAFETY: fd は接続のソケット（Http2Connection が生きている間は閉じない）。v は生存する c_int。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOPUSH,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// この大きさ以上の DATA の本体だけをゼロコピーで送る（小さいとコピーの方が安い）
 #[cfg(all(target_os = "freebsd", feature = "cache"))]
 const ZC_MIN_CHUNK: usize = 4096;
@@ -598,6 +614,10 @@ where
         };
         let segs = std::mem::take(&mut self.zc_segs);
         self.zc_bytes = 0;
+        // TCP_NOPUSH: sendfile(2) を何回かに分けて送る間、セグメントを MSS 一杯まで溜めてから出させる（nginx の
+        // `tcp_nopush on` と同じ。外すと sendfile の呼び出しの境目ごとに短いセグメントが出て、受け手の処理が増える。
+        // FreeBSD の h2c 54KB。解除で残りが出る）。フラッシュ 1 回あたり 2 回の setsockopt
+        set_tcp_nopush(sock, true);
         let mut cursor = 0usize;
         let mut result = Ok(());
         for seg in &segs {
@@ -618,16 +638,20 @@ where
         segs.clear();
         self.zc_segs = segs;
         if let Err(e) = result {
+            set_tcp_nopush(sock, false);
             self.write_buf.clear();
             return Err(Http2Error::Io(e));
         }
         let mut buf = std::mem::take(&mut self.write_buf);
         buf.drain(..cursor);
         if buf.is_empty() {
+            set_tcp_nopush(sock, false);
             self.write_buf = buf;
             return Ok(());
         }
-        let mut returned = self.write_all_raw(buf).await?;
+        let written = self.write_all_raw(buf).await;
+        set_tcp_nopush(sock, false);
+        let mut returned = written?;
         returned.clear();
         self.write_buf = returned;
         Ok(())
