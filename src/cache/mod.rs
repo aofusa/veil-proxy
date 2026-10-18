@@ -52,8 +52,6 @@ pub mod compressed;
 #[cfg(feature = "cache")]
 mod content_cache;
 // FreeBSD: 静的コンテンツキャッシュの本体を共有メモリに置き、h2c の DATA を sendfile(2) で送る（v0.8.0）
-#[cfg(all(feature = "cache", target_os = "freebsd"))]
-pub(crate) mod shm;
 #[cfg(feature = "cache")]
 mod disk;
 #[cfg(feature = "cache")]
@@ -66,6 +64,8 @@ mod manager;
 mod memory;
 #[cfg(feature = "cache")]
 mod revalidation;
+#[cfg(all(feature = "cache", target_os = "freebsd"))]
+pub(crate) mod shm;
 // B-65: 静的配信のメタデータ+本体を1回のoffloadで取得する複合API。file_cache/content_cache
 // の両方に依存するため cache feature 有効時のみコンパイルする。
 #[cfg(feature = "cache")]

@@ -927,7 +927,9 @@ pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::op
         return None;
     };
     // authority の後ろの最初の `/`（クエリだけの `http://h?x` は不正として断る）
-    let slash = target[rest..].iter().position(|&b| b == b'/' || b == b'?')?;
+    let slash = target[rest..]
+        .iter()
+        .position(|&b| b == b'/' || b == b'?')?;
     if target[rest + slash] != b'/' {
         return None;
     }
@@ -1932,26 +1934,37 @@ mod chunked_span_tests {
         assert_eq!(r, ChunkedFeedResult::Complete);
         assert_eq!(&ok[k..], b"GET /admin HTTP/1.1\r\n");
         let bad: [&[u8]; 9] = [
-            b"4x\r\nWiki\r\n0\r\n\r\n",      // 16 進でない文字
-            b"4\nWiki\r\n0\r\n\r\n",          // 裸の LF
-            b"4\r\nWikiXX0\r\n\r\n",           // データの後に CRLF が無い
-            b"\r\n",                             // サイズが空
-            b"10000000000000000\r\n",            // 桁あふれ
-            b"4 5\r\n",                          // 空白の後の桁
-            b"4;a\nb\r\n",                      // 拡張の中の LF
-            b"0\r\nX: 1\n\r\n",                // トレーラーの裸の LF
-            b";x\r\n",                           // サイズの無い拡張
+            b"4x\r\nWiki\r\n0\r\n\r\n", // 16 進でない文字
+            b"4\nWiki\r\n0\r\n\r\n",    // 裸の LF
+            b"4\r\nWikiXX0\r\n\r\n",    // データの後に CRLF が無い
+            b"\r\n",                    // サイズが空
+            b"10000000000000000\r\n",   // 桁あふれ
+            b"4 5\r\n",                 // 空白の後の桁
+            b"4;a\nb\r\n",              // 拡張の中の LF
+            b"0\r\nX: 1\n\r\n",         // トレーラーの裸の LF
+            b";x\r\n",                  // サイズの無い拡張
         ];
         for b in bad {
             let mut d = ChunkedDecoder::new_request(0);
-            assert_eq!(d.feed(b), ChunkedFeedResult::Invalid, "{:?}", String::from_utf8_lossy(b));
+            assert_eq!(
+                d.feed(b),
+                ChunkedFeedResult::Invalid,
+                "{:?}",
+                String::from_utf8_lossy(b)
+            );
         }
         // BWS の後の拡張は通る
         let mut d = ChunkedDecoder::new_request(0);
-        assert_eq!(d.feed(b"3 ;e\r\nabc\r\n0\r\n\r\n"), ChunkedFeedResult::Complete);
+        assert_eq!(
+            d.feed(b"3 ;e\r\nabc\r\n0\r\n\r\n"),
+            ChunkedFeedResult::Complete
+        );
         // 応答用（緩い）は従来どおり
         let mut d = ChunkedDecoder::new_unlimited();
-        assert_ne!(d.feed(b"4x\r\nWiki\r\n0\r\n\r\n"), ChunkedFeedResult::Invalid);
+        assert_ne!(
+            d.feed(b"4x\r\nWiki\r\n0\r\n\r\n"),
+            ChunkedFeedResult::Invalid
+        );
     }
 
     fn drive(decoder: &mut ChunkedDecoder, buffers: &[&[u8]]) -> (Vec<u8>, bool, bool) {

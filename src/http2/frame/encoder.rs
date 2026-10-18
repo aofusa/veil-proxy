@@ -62,7 +62,11 @@ impl FrameEncoder {
         len: usize,
         end_stream: bool,
     ) {
-        let flags = if end_stream { FrameFlags::END_STREAM } else { 0 };
+        let flags = if end_stream {
+            FrameFlags::END_STREAM
+        } else {
+            0
+        };
         let header = FrameHeader::new(FrameType::Data, flags, stream_id, len as u32);
         let mut header_buf = [0u8; 9];
         header.encode(&mut header_buf);

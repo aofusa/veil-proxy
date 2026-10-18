@@ -354,23 +354,21 @@ pub(super) async fn handle_requests(
                 // そのあとパスを正規化し、ルートの照合・検査・上流への要求に同じパスを使う
                 // （以前は生のまま照合して上流へ送り、`/%61dmin`・`/public/../admin` でルートの制限を
                 // 素通りできた。F-236 の再走査の F7）。
-                let path_bytes: Bytes = match crate::http_utils::origin_form_target(
-                    &method_bytes,
-                    &path_bytes,
-                ) {
-                    Some(r) => {
-                        let p = path_bytes.slice(r);
-                        match crate::path_norm::normalize_request_path(&p) {
-                            Some(n) => Bytes::from(n),
-                            None => p,
+                let path_bytes: Bytes =
+                    match crate::http_utils::origin_form_target(&method_bytes, &path_bytes) {
+                        Some(r) => {
+                            let p = path_bytes.slice(r);
+                            match crate::path_norm::normalize_request_path(&p) {
+                                Some(n) => Bytes::from(n),
+                                None => p,
+                            }
                         }
-                    }
-                    None => {
-                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                        return;
-                    }
-                };
+                        None => {
+                            let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                            return;
+                        }
+                    };
 
                 let user_agent: Bytes = user_agent_range
                     .map(|(off, len)| header_bytes.slice(off..off + len))

@@ -592,7 +592,9 @@ where
     #[cfg(all(target_os = "freebsd", feature = "cache"))]
     async fn flush_zero_copy(&mut self) -> Http2Result<()> {
         let Some(sock) = self.zc_sock else {
-            return Err(Http2Error::Io(io::Error::other("zero-copy flush without socket")));
+            return Err(Http2Error::Io(io::Error::other(
+                "zero-copy flush without socket",
+            )));
         };
         let segs = std::mem::take(&mut self.zc_segs);
         self.zc_bytes = 0;

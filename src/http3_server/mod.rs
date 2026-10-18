@@ -1098,10 +1098,11 @@ impl Http3Handler {
                                     // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。
                                     // F-236 の再走査の F7）。要るときだけ作り直す
                                     let mut list = list;
-                                    if let Some(i) = list.iter().position(|h| h.name() == b":path") {
-                                        if let Some(n) =
-                                            crate::path_norm::normalize_request_path(list[i].value())
-                                        {
+                                    if let Some(i) = list.iter().position(|h| h.name() == b":path")
+                                    {
+                                        if let Some(n) = crate::path_norm::normalize_request_path(
+                                            list[i].value(),
+                                        ) {
                                             list[i] = quiche::h3::Header::new(b":path", &n);
                                         }
                                     }

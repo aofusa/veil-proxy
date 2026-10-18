@@ -186,7 +186,10 @@ pub(super) async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
         // バックエンドに転送（有効データのみを含むVecに変換）。終端より後ろ（同じ読み取りに入った
         // パイプラインの次の要求）は送らずに捨てる（上流で veil の検査を通らない要求にさせない）。
         if consumed < n {
-            debug!("[proxy] dropping {} bytes after the chunked terminator", n - consumed);
+            debug!(
+                "[proxy] dropping {} bytes after the chunked terminator",
+                n - consumed
+            );
             returned_buf.set_valid_len(consumed);
         }
         let write_buf = returned_buf.into_truncated();

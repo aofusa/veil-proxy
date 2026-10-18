@@ -28,7 +28,10 @@ pub(super) async fn test_f236_path_normalization_keeps_route_restrictions() {
         "/api/zzz/../ip-restricted/x",
         "https://localhost/api/ip-restricted/x",
     ] {
-        let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", target);
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            target
+        );
         let resp = send_raw_tls_request(req.as_bytes()).expect("response");
         assert_eq!(
             status_codes(&resp).first().copied(),
@@ -39,8 +42,9 @@ pub(super) async fn test_f236_path_normalization_keeps_route_restrictions() {
         );
     }
     // origin 形式でない要求先は 400
-    let resp = send_raw_tls_request(b"GET api/x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("response");
+    let resp =
+        send_raw_tls_request(b"GET api/x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("response");
     assert_eq!(status_codes(&resp).first().copied(), Some(400), "{}", resp);
 }
 

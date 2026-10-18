@@ -256,138 +256,152 @@ pub(super) async fn transfer_response_with_compression(
                     ctx.append_body(body_start);
                 }
 
-                // ヘッダーを修正（security.add_response_headersを追加、remove_response_headersを削除）
-                let mut modified_headers = accumulated[..header_len].to_vec();
+                // ヘッダーを修正（security.add_response_headersを追加、remove_response_headersを削除）。
+                // WASM のフィルタが無ければ、1 本のバッファへ直接書く（以前はヘッダの行ごとに `format!` と
+                // `Vec` を作って連結していた。FreeBSD の h1_proxy_tls 3B のプロファイルで fmt・realloc が上位。v0.8.0）
+                #[cfg(feature = "wasm")]
+                let wasm_active = !wasm_modules.is_empty();
+                #[cfg(not(feature = "wasm"))]
+                let wasm_active = false;
+                let modified_headers = if !wasm_active {
+                    render_response_head(&accumulated[..header_len], status_code, security)
+                } else {
+                    let mut modified_headers = accumulated[..header_len].to_vec();
 
-                // ヘッダーをパースして操作
-                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-                let mut response = httparse::Response::new(&mut headers_storage);
-                if response.parse(&modified_headers).is_ok() {
-                    let mut new_header_lines = Vec::new();
+                    // ヘッダーをパースして操作
+                    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                    let mut response = httparse::Response::new(&mut headers_storage);
+                    if response.parse(&modified_headers).is_ok() {
+                        let mut new_header_lines = Vec::new();
 
-                    // ステータス行を追加
-                    let status_line = format!(
-                        "HTTP/1.1 {} {}\r\n",
-                        status_code,
-                        status_code_to_reason(status_code)
-                    );
-                    new_header_lines.push(status_line.into_bytes());
+                        // ステータス行を追加
+                        let status_line = format!(
+                            "HTTP/1.1 {} {}\r\n",
+                            status_code,
+                            status_code_to_reason(status_code)
+                        );
+                        new_header_lines.push(status_line.into_bytes());
 
-                    // 既存のヘッダーを追加（削除対象を除外）
-                    // eq_ignore_ascii_case でアロケーションなしに比較
-                    for header in response.headers.iter() {
-                        if !security
-                            .remove_response_headers
-                            .iter()
-                            .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
-                        {
+                        // 既存のヘッダーを追加（削除対象を除外）
+                        // eq_ignore_ascii_case でアロケーションなしに比較
+                        for header in response.headers.iter() {
+                            if !security
+                                .remove_response_headers
+                                .iter()
+                                .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
+                            {
+                                new_header_lines.push(
+                                    format!(
+                                        "{}: {}\r\n",
+                                        header.name,
+                                        std::str::from_utf8(header.value).unwrap_or("")
+                                    )
+                                    .into_bytes(),
+                                );
+                            }
+                        }
+
+                        // 追加するヘッダーを追加
+                        for (header_name, header_value) in &security.add_response_headers {
                             new_header_lines.push(
-                                format!(
-                                    "{}: {}\r\n",
-                                    header.name,
-                                    std::str::from_utf8(header.value).unwrap_or("")
-                                )
-                                .into_bytes(),
+                                format!("{}: {}\r\n", header_name, header_value).into_bytes(),
                             );
                         }
-                    }
+                        // F-94: HTTP/3 広告（Alt-Svc）
+                        if let Some(g) = get_alt_svc_guard() {
+                            let mut line = Vec::with_capacity(16 + g.value().len());
+                            line.extend_from_slice(b"Alt-Svc: ");
+                            line.extend_from_slice(g.value());
+                            line.extend_from_slice(b"\r\n");
+                            new_header_lines.push(line);
+                        }
 
-                    // 追加するヘッダーを追加
-                    for (header_name, header_value) in &security.add_response_headers {
-                        new_header_lines
-                            .push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
-                    }
-                    // F-94: HTTP/3 広告（Alt-Svc）
-                    if let Some(g) = get_alt_svc_guard() {
-                        let mut line = Vec::with_capacity(16 + g.value().len());
-                        line.extend_from_slice(b"Alt-Svc: ");
-                        line.extend_from_slice(g.value());
-                        line.extend_from_slice(b"\r\n");
-                        new_header_lines.push(line);
-                    }
+                        // WASMレスポンスヘッダーフィルタを適用
+                        #[cfg(feature = "wasm")]
+                        {
+                            if !wasm_modules.is_empty() {
+                                let config = CURRENT_CONFIG.load();
+                                if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                    // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
+                                    let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines
+                                        .iter()
+                                        .skip(1) // ステータス行をスキップ
+                                        .filter_map(|line| {
+                                            let line_str = std::str::from_utf8(line).ok()?;
+                                            let line_trimmed = line_str.trim_end_matches("\r\n");
+                                            if line_trimmed.is_empty() {
+                                                return None;
+                                            }
+                                            let colon_pos = line_trimmed.find(':')?;
+                                            let name =
+                                                line_trimmed.as_bytes()[..colon_pos].to_vec();
+                                            let value = line_trimmed[colon_pos + 1..]
+                                                .trim_start()
+                                                .as_bytes()
+                                                .to_vec();
+                                            Some((name, value))
+                                        })
+                                        .collect();
 
-                    // WASMレスポンスヘッダーフィルタを適用
-                    #[cfg(feature = "wasm")]
-                    {
-                        if !wasm_modules.is_empty() {
-                            let config = CURRENT_CONFIG.load();
-                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
-                                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines
-                                    .iter()
-                                    .skip(1) // ステータス行をスキップ
-                                    .filter_map(|line| {
-                                        let line_str = std::str::from_utf8(line).ok()?;
-                                        let line_trimmed = line_str.trim_end_matches("\r\n");
-                                        if line_trimmed.is_empty() {
-                                            return None;
-                                        }
-                                        let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
-                                        let value = line_trimmed[colon_pos + 1..]
-                                            .trim_start()
-                                            .as_bytes()
-                                            .to_vec();
-                                        Some((name, value))
-                                    })
-                                    .collect();
-
-                                // WASMフィルタを実行（レスポンスヘッダー処理）
-                                let wasm_result = wasm_engine
-                                    .clone()
-                                    .on_response_headers_with_modules_async(
-                                        wasm_modules.clone(),
-                                        status_code,
-                                        current_headers,
-                                        true, // end_of_stream
-                                    )
-                                    .await;
-
-                                match wasm_result {
-                                    crate::wasm::FilterResult::Continue {
-                                        headers: modified_headers,
-                                        ..
-                                    } => {
-                                        // WASMから修正されたヘッダーで置き換え
-                                        new_header_lines.clear();
-
-                                        // ステータス行を再追加
-                                        let status_line = format!(
-                                            "HTTP/1.1 {} {}\r\n",
+                                    // WASMフィルタを実行（レスポンスヘッダー処理）
+                                    let wasm_result = wasm_engine
+                                        .clone()
+                                        .on_response_headers_with_modules_async(
+                                            wasm_modules.clone(),
                                             status_code,
-                                            status_code_to_reason(status_code)
-                                        );
-                                        new_header_lines.push(status_line.into_bytes());
+                                            current_headers,
+                                            true, // end_of_stream
+                                        )
+                                        .await;
 
-                                        // WASMから返されたヘッダーを追加
-                                        for (name, value) in modified_headers {
-                                            let mut line =
-                                                Vec::with_capacity(name.len() + value.len() + 4);
-                                            line.extend_from_slice(&name);
-                                            line.extend_from_slice(b": ");
-                                            line.extend_from_slice(&value);
-                                            line.extend_from_slice(b"\r\n");
-                                            new_header_lines.push(line);
+                                    match wasm_result {
+                                        crate::wasm::FilterResult::Continue {
+                                            headers: modified_headers,
+                                            ..
+                                        } => {
+                                            // WASMから修正されたヘッダーで置き換え
+                                            new_header_lines.clear();
+
+                                            // ステータス行を再追加
+                                            let status_line = format!(
+                                                "HTTP/1.1 {} {}\r\n",
+                                                status_code,
+                                                status_code_to_reason(status_code)
+                                            );
+                                            new_header_lines.push(status_line.into_bytes());
+
+                                            // WASMから返されたヘッダーを追加
+                                            for (name, value) in modified_headers {
+                                                let mut line = Vec::with_capacity(
+                                                    name.len() + value.len() + 4,
+                                                );
+                                                line.extend_from_slice(&name);
+                                                line.extend_from_slice(b": ");
+                                                line.extend_from_slice(&value);
+                                                line.extend_from_slice(b"\r\n");
+                                                new_header_lines.push(line);
+                                            }
                                         }
-                                    }
-                                    crate::wasm::FilterResult::LocalResponse(_) => {
-                                        // レスポンスヘッダー処理ではLocalResponseは無視
-                                        // （すでにバックエンドレスポンスを受信しているため）
-                                    }
-                                    crate::wasm::FilterResult::Pause => {
-                                        // 非同期処理待ち（現在は未実装）
+                                        crate::wasm::FilterResult::LocalResponse(_) => {
+                                            // レスポンスヘッダー処理ではLocalResponseは無視
+                                            // （すでにバックエンドレスポンスを受信しているため）
+                                        }
+                                        crate::wasm::FilterResult::Pause => {
+                                            // 非同期処理待ち（現在は未実装）
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        // ヘッダー終了マーカーを追加
+                        new_header_lines.push(b"\r\n".to_vec());
+
+                        // 結合
+                        modified_headers = new_header_lines.into_iter().flatten().collect();
                     }
-
-                    // ヘッダー終了マーカーを追加
-                    new_header_lines.push(b"\r\n".to_vec());
-
-                    // 結合
-                    modified_headers = new_header_lines.into_iter().flatten().collect();
-                }
+                    modified_headers
+                };
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
@@ -449,6 +463,60 @@ pub(super) async fn transfer_response_with_compression(
             return (0, 502, false, true);
         }
     }
+}
+
+/// 上流の応答のヘッダ（ステータス行から空行まで）を、クライアントへ返す形にする（WASM のフィルタが無いとき）。
+///
+/// ステータス行は `HTTP/1.1 <code> <reason>` に直し、`remove_response_headers` を除き、`add_response_headers` と
+/// Alt-Svc を足す。確保は返すバッファ 1 本だけ。解析できなければ受け取ったまま返す（従来どおり）。
+pub(super) fn render_response_head(raw: &[u8], status: u16, security: &SecurityConfig) -> Vec<u8> {
+    let mut storage = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut storage);
+    if response.parse(raw).is_err() {
+        return raw.to_vec();
+    }
+    let added: usize = security
+        .add_response_headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 4)
+        .sum();
+    let alt_svc = get_alt_svc_guard();
+    let mut out = Vec::with_capacity(
+        raw.len() + added + alt_svc.as_ref().map(|g| g.value().len() + 11).unwrap_or(0) + 16,
+    );
+    out.extend_from_slice(b"HTTP/1.1 ");
+    let mut code = itoa::Buffer::new();
+    out.extend_from_slice(code.format(status).as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(status_code_to_reason(status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for header in response.headers.iter() {
+        if security
+            .remove_response_headers
+            .iter()
+            .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
+        {
+            continue;
+        }
+        out.extend_from_slice(header.name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(header.value);
+        out.extend_from_slice(b"\r\n");
+    }
+    for (name, value) in &security.add_response_headers {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    // F-94: HTTP/3 広告（Alt-Svc）
+    if let Some(g) = alt_svc {
+        out.extend_from_slice(b"Alt-Svc: ");
+        out.extend_from_slice(g.value());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// 圧縮してレスポンスを転送
@@ -922,4 +990,34 @@ pub(super) async fn transfer_exact_bytes_from_backend_with_cache(
     }
 
     total
+}
+
+#[cfg(test)]
+mod response_head_tests {
+    use super::*;
+
+    /// ヘッダの削除・追加とステータス行の書き直し（v0.8.0 の 1 本のバッファへの書き出し）
+    #[test]
+    fn render_response_head_applies_policy() {
+        let sec = SecurityConfig {
+            remove_response_headers: vec!["X-Powered-By".to_string()],
+            add_response_headers: [("X-Frame-Options".to_string(), "DENY".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let raw =
+            b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\nx-powered-by: php\r\nX-Bin: \xff\x01\r\n\r\n";
+        let out = render_response_head(raw, 200, &sec);
+        let want: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Bin: \xff\x01\r\nX-Frame-Options: DENY\r\n\r\n";
+        if get_alt_svc_guard().is_none() {
+            assert_eq!(out, want);
+        }
+        // 解析できないものはそのまま
+        assert_eq!(
+            render_response_head(b"garbage", 200, &sec),
+            b"garbage".to_vec()
+        );
+    }
 }

@@ -356,7 +356,9 @@ pub(super) async fn handle_proxy(
         .servers
         .iter()
         .position(|s| std::ptr::eq(s, server));
-    let resilience_start = std::time::Instant::now();
+    // 粗い時計（起床時に読んだ時刻）を使う: 遅延は負荷分散・異常検知の平均にしか使わず、ミリ秒の精度で足りる。
+    // 要求ごとに 2 回の `Instant::now()`（FreeBSD aarch64 のプロファイルで `__vdso_gettc` が上位）を減らす
+    let resilience_start = crate::runtime::time::coarse_now();
 
     let target = &server.target;
     // コネクションプールキーの生成（F-170: 接続先表記＝conn_addr() を第 1 要素にする。
@@ -565,7 +567,9 @@ pub(super) async fn handle_proxy(
                 // F-06: HTTP/1.1 経路と同じくサーキットブレーカー・異常検知へ反映する。
                 if let Some(idx) = resilience_server_idx {
                     let success = matches!(&r, Some((_, status, _, _)) if *status < 500);
-                    let latency_ms = resilience_start.elapsed().as_millis() as u64;
+                    let latency_ms = crate::runtime::time::coarse_now()
+                        .saturating_duration_since(resilience_start)
+                        .as_millis() as u64;
                     upstream_group.record_outcome(idx, success, latency_ms);
                 }
                 return r;
@@ -677,7 +681,9 @@ pub(super) async fn handle_proxy(
 
     // F-06: リクエスト結果をサーキットブレーカー・異常検知へ反映
     if let Some(idx) = resilience_server_idx {
-        let latency_ms = resilience_start.elapsed().as_millis() as u64;
+        let latency_ms = crate::runtime::time::coarse_now()
+            .saturating_duration_since(resilience_start)
+            .as_millis() as u64;
         // 5xx をバックエンド障害として扱う
         let success = match &result {
             Some((_, status, _, _)) => *status < 500,
