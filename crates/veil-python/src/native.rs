@@ -14,7 +14,7 @@ use bytes::Bytes;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use veil::api::bridge::HandlerContext;
@@ -28,12 +28,12 @@ fn lossy(b: &[u8]) -> std::borrow::Cow<'_, str> {
 #[pyclass(name = "NativeRequest", module = "veil._veil", dict)]
 pub struct NativeRequest {
     pub(crate) req: Request,
-    path: GILOnceCell<Py<PyString>>,
-    query: GILOnceCell<Py<PyString>>,
-    body: GILOnceCell<Py<PyBytes>>,
-    params: GILOnceCell<Py<PyDict>>,
-    client_ip: GILOnceCell<Py<PyString>>,
-    query_params: GILOnceCell<Py<PyAny>>,
+    path: PyOnceLock<Py<PyString>>,
+    query: PyOnceLock<Py<PyString>>,
+    body: PyOnceLock<Py<PyBytes>>,
+    params: PyOnceLock<Py<PyDict>>,
+    client_ip: PyOnceLock<Py<PyString>>,
+    query_params: PyOnceLock<Py<PyAny>>,
     /// ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0。F-210）
     pub(crate) ctx: AtomicUsize,
 }
@@ -42,12 +42,12 @@ impl NativeRequest {
     pub fn new(req: Request) -> NativeRequest {
         NativeRequest {
             req,
-            path: GILOnceCell::new(),
-            query: GILOnceCell::new(),
-            body: GILOnceCell::new(),
-            params: GILOnceCell::new(),
-            client_ip: GILOnceCell::new(),
-            query_params: GILOnceCell::new(),
+            path: PyOnceLock::new(),
+            query: PyOnceLock::new(),
+            body: PyOnceLock::new(),
+            params: PyOnceLock::new(),
+            client_ip: PyOnceLock::new(),
+            query_params: PyOnceLock::new(),
             ctx: AtomicUsize::new(0),
         }
     }
@@ -64,7 +64,7 @@ impl NativeRequest {
         if !ctx.has_body_stream() {
             return None;
         }
-        py.allow_threads(|| ctx.read_body())
+        py.detach(|| ctx.read_body())
     }
 }
 
@@ -79,7 +79,7 @@ struct Helpers {
     stream_of: Py<PyAny>,
 }
 
-static HELPERS: GILOnceCell<Helpers> = GILOnceCell::new();
+static HELPERS: PyOnceLock<Helpers> = PyOnceLock::new();
 
 fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
     HELPERS.get_or_try_init(py, || {
@@ -393,7 +393,7 @@ pub fn to_response(
     if result.is_none() {
         return Ok(Response::new(if status == 200 { 204 } else { status }));
     }
-    if let Ok(s) = result.downcast::<PyString>() {
+    if let Ok(s) = result.cast::<PyString>() {
         let s: PyBackedStr = s.extract()?;
         return Ok(ok(CT_TEXT, Bytes::from_owner(PyStrOwner(s))));
     }
@@ -442,17 +442,17 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
         return true;
     }
     // bool は int の派生型なので先に見る
-    if let Ok(b) = v.downcast_exact::<PyBool>() {
+    if let Ok(b) = v.cast_exact::<PyBool>() {
         out.extend_from_slice(if b.is_true() { b"true" } else { b"false" });
         return true;
     }
-    if let Ok(s) = v.downcast_exact::<PyString>() {
+    if let Ok(s) = v.cast_exact::<PyString>() {
         return match s.to_cow() {
             Ok(s) => serde_json::to_writer(&mut *out, &*s).is_ok(),
             Err(_) => false,
         };
     }
-    if let Ok(i) = v.downcast_exact::<PyInt>() {
+    if let Ok(i) = v.cast_exact::<PyInt>() {
         return match i.extract::<i64>() {
             Ok(n) => {
                 out.extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
@@ -461,10 +461,10 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
             Err(_) => false, // 64 ビットを超える整数は Python に任せる
         };
     }
-    if let Ok(d) = v.downcast_exact::<PyDict>() {
+    if let Ok(d) = v.cast_exact::<PyDict>() {
         out.push(b'{');
         for (i, (k, val)) in d.iter().enumerate() {
-            let Ok(k) = k.downcast_exact::<PyString>() else {
+            let Ok(k) = k.cast_exact::<PyString>() else {
                 return false;
             };
             let Ok(k) = k.to_cow() else { return false };
@@ -482,7 +482,7 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
         out.push(b'}');
         return true;
     }
-    if let Ok(l) = v.downcast_exact::<PyList>() {
+    if let Ok(l) = v.cast_exact::<PyList>() {
         out.push(b'[');
         for (i, item) in l.iter().enumerate() {
             if i > 0 {
@@ -495,7 +495,7 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
         out.push(b']');
         return true;
     }
-    if let Ok(t) = v.downcast_exact::<PyTuple>() {
+    if let Ok(t) = v.cast_exact::<PyTuple>() {
         out.push(b'[');
         for (i, item) in t.iter().enumerate() {
             if i > 0 {
@@ -544,7 +544,7 @@ fn stream_response(
         if b.is_empty() {
             continue;
         }
-        if !py.allow_threads(|| writer.write(b)) {
+        if !py.detach(|| writer.write(b)) {
             closed = true;
             break;
         }
@@ -558,7 +558,7 @@ fn stream_response(
     if let Some(tr) = trailers.filter(|t| !t.is_none()) {
         for item in tr.try_iter()? {
             let item = item?;
-            let tup = item.downcast::<PyTuple>()?;
+            let tup = item.cast::<PyTuple>()?;
             let n: PyBackedStr = tup.get_item(0)?.extract()?;
             let v: PyBackedStr = tup.get_item(1)?.extract()?;
             t.push((
@@ -570,14 +570,14 @@ fn stream_response(
     if t.is_empty() {
         drop(writer);
     } else {
-        py.allow_threads(|| writer.finish_with_trailers(t));
+        py.detach(|| writer.finish_with_trailers(t));
     }
     Ok(Response::new(200))
 }
 
 /// 断片を `Bytes` にする（`bytes` は複製しない、`str` は UTF-8、`bytearray`・`memoryview` は複製）。
 fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
-    if let Ok(s) = item.downcast::<PyString>() {
+    if let Ok(s) = item.cast::<PyString>() {
         let s: PyBackedStr = s.extract()?;
         return Ok(Bytes::from_owner(PyStrOwner(s)));
     }
@@ -597,7 +597,7 @@ fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
-        let t = item.downcast::<PyTuple>()?;
+        let t = item.cast::<PyTuple>()?;
         let n: PyBackedStr = t.get_item(0)?.extract()?;
         let v: PyBackedStr = t.get_item(1)?.extract()?;
         r = r.with_header(known_header(&n), Bytes::copy_from_slice(v.as_bytes()));
@@ -615,7 +615,7 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
-        let t = item.downcast::<PyTuple>()?;
+        let t = item.cast::<PyTuple>()?;
         let n: PyBackedStr = t.get_item(0)?.extract()?;
         let v: PyBackedStr = t.get_item(1)?.extract()?;
         r = r.with_header(known_header(&n), Bytes::copy_from_slice(v.as_bytes()));

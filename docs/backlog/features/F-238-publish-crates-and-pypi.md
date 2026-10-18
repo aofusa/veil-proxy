@@ -35,7 +35,7 @@ git のタグ `vX.Y.Z` を push したら、CI が次の 2 つを自動で公開
    - 状況: NetBSD・FreeBSD/OpenBSD aarch64 の `veil-wasmtime`（`third_party/wasmtime`）には版が無い。crates.io は、
      target 別の依存でも、全部が crates.io にあることを求める。
    - 対策: `third_party/wasmtime` を `veil-proxy-wasmtime` として公開する。
-     - 中身は wasmtime 36.0.17 の `wasmtime` クレートだけ。下位の `wasmtime-*` は crates.io の版を使う。
+     - 中身は wasmtime 36.0.18 の `wasmtime` クレートだけ。下位の `wasmtime-*` は crates.io の版を使う。
      - ライセンスは Apache-2.0 WITH LLVM-exception。NOTICE と、veil の差分の説明（README.veil.md）を含める。
 2. **quiche の `[patch.crates-io]`。**
    - 状況: patch は依存する側のビルドには効かない。crates.io から入れた利用者は、STREAM フレームを詰め合わせる差分（F-172）の
@@ -117,7 +117,7 @@ git のタグ `vX.Y.Z` を push したら、CI が次の 2 つを自動で公開
 
 | 項目 | 結果 |
 |---|---|
-| 1. vendoring の wasmtime | `veil-proxy-wasmtime`（36.0.17）として公開する。`Cargo.toml.orig`（cargo の予約名）を除いた |
+| 1. vendoring の wasmtime | `veil-proxy-wasmtime`（36.0.18）として公開する。`Cargo.toml.orig`（cargo の予約名）を除いた |
 | 2. quiche の `[patch]` | `veil-proxy-quiche`（`=0.24.9-veil.1`）を各ターゲットの依存に直接書く。patch は外した |
 | 3. `AWS_LC_SYS_NO_PREFIX` | 確かめた: リポジトリの外のプロジェクトで設定が無いと、veil の build.rs が設定を示して止まる。設定すると通る |
 | （3 の調査で見つかった別の問題） | 利用者の解決では aws-lc-rs の最新が aws-lc-sys 0.46 を引き、veil の 0.45 と 2 つになって libcrypto が見つからずに失敗した。`aws-lc-sys = ">=0.45, <0.48"` にして 1 つに寄せた |

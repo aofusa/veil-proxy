@@ -20,7 +20,7 @@ rust-version = "1.86.0"
 # 詳細は third_party/wasmtime/README.veil.md 参照。
 # veil: 公開名（F-238。`[lib] name = "wasmtime"` はそのまま）
 name = "veil-proxy-wasmtime"
-version = "36.0.17"
+version = "36.0.18"
 authors = ["The Wasmtime Project Developers"]
 build = "build.rs"
 autolib = false
@@ -309,7 +309,7 @@ features = ["alloc"]
 default-features = false
 
 [dependencies.pulley-interpreter]
-version = "=36.0.17"
+version = "=36.0.18"
 
 [dependencies.rayon]
 version = "1.0"
@@ -354,74 +354,74 @@ features = ["simd"]
 default-features = false
 
 [dependencies.wasmtime-asm-macros]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-asm-macros"
 
 [dependencies.wasmtime-cache]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-cache"
 
 [dependencies.wasmtime-component-macro]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-component-macro"
 
 [dependencies.wasmtime-component-util]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-component-util"
 
 [dependencies.wasmtime-cranelift]
-version = "=36.0.17"
+version = "=36.0.18"
 features = ["pulley"]
 optional = true
 package = "wasmtime-internal-cranelift"
 
 [dependencies.wasmtime-environ]
-version = "=36.0.17"
+version = "=36.0.18"
 
 [dependencies.wasmtime-fiber]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-fiber"
 
 [dependencies.wasmtime-jit-debug]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-jit-debug"
 
 [dependencies.wasmtime-jit-icache-coherence]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-jit-icache-coherence"
 
 [dependencies.wasmtime-math]
-version = "=36.0.17"
+version = "=36.0.18"
 package = "wasmtime-internal-math"
 
 [dependencies.wasmtime-slab]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-slab"
 
 [dependencies.wasmtime-unwinder]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-unwinder"
 
 [dependencies.wasmtime-versioned-export-macros]
-version = "=36.0.17"
+version = "=36.0.18"
 package = "wasmtime-internal-versioned-export-macros"
 
 [dependencies.wasmtime-winch]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-winch"
 
 [dependencies.wasmtime-wmemcheck]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-wmemcheck"
 
@@ -430,7 +430,7 @@ version = "1.236.0"
 optional = true
 
 [dev-dependencies.cranelift-native]
-version = "0.123.17"
+version = "0.123.18"
 
 [dev-dependencies.env_logger]
 version = "0.11.5"
@@ -453,7 +453,7 @@ version = "1.0"
 optional = true
 
 [build-dependencies.wasmtime-versioned-export-macros]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-versioned-export-macros"
 

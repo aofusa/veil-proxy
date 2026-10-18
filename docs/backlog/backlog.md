@@ -450,6 +450,7 @@
 | B-152 | P1 | 完了 | [bugs/B-152-reactor-submillisecond-timer-spin.md](bugs/B-152-reactor-submillisecond-timer-spin.md) | reactor がタイマーの待ち時間をミリ秒に切り捨て、1ms 未満の先のタイマーで poller を空回りさせていた（HTTP/3 で空の kevent 80 回/要求） |
 | B-153 | P2 | 完了 | [bugs/B-153-bsd-perf-harness-bias.md](bugs/B-153-bsd-perf-harness-bias.md) | BSD の性能の計測が nginx を固定せず、上流を計測対象と共有し、いつも nginx を先に測っていた |
 | B-154 | P1 | 完了 | [bugs/B-154-static-first-request-404-when-openat2-blocked.md](bugs/B-154-static-first-request-404-when-openat2-blocked.md) | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 になる（コンテナの seccomp プロファイルに openat2 が無かった） |
+| B-155 | P1 | 完了 | [bugs/B-155-dependency-advisories-v080.md](bugs/B-155-dependency-advisories-v080.md) | 依存の RUSTSEC 勧告（rustls 0.23.45 に 4 件・quinn-proto・pyo3 0.23・wasmtime 36.0.17）。rustls 0.23.46・pyo3 0.29・wasmtime 36.0.18 へ。container_security の resource_exhaustion の集計と gitleaks の許可リスト |
 
 ---
 

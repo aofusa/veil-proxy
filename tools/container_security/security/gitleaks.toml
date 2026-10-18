@@ -27,6 +27,14 @@ paths = [
   # "dGhpcyBpcyBhIHNlY3JldCBrZXkgZm9yIEhTMjU2" は "this is a secret key for HS256"
   # の base64 で、読者に形式を示すためのプレースホルダ。
   '''(^|/)examples/wasm-filters/jwt-filter/README\.md$''',
+  # --- トリアージ済み誤検知（2026-10-18、v0.8.0）---
+  # Istio の security/tools/jwt/samples の公開サンプル（groups-scope.jwt と同じトークン）。メッシュの
+  # JWT 検証の単体試験と kind の E2E が使う。鍵は Istio のリポジトリで公開されている試験用。
+  '''(^|/)tools/k8s/testdata/[^/]+\.jwt$''',
+  # 計測・試験の作業ディレクトリ（git 管理外。生成した自己署名の鍵・クロスビルドの依存のソース）と
+  # エージェントの作業ツリー（.claude/worktrees は本リポジトリの複製）
+  '''(^|/)tools/perf/results/''',
+  '''(^|/)\.claude/''',
 ]
 regexes = [
   # --- トリアージ済み誤検知（2026-08-17）---
@@ -34,4 +42,8 @@ regexes = [
   # の base64）。WebSocket ハンドシェイクのテスト・プローブで多数使っている。
   # generic-api-key ルールが base64 文字列として拾うが秘密情報ではない。
   '''dGhlIHNhbXBsZSBub25jZQ==''',
+  # 上の Istio のサンプルトークン（src/mesh/jwt.rs の単体試験に埋め込んである）の署名部の先頭
+  '''EdJnEZSH6X8hcyEii7c8H5lnhgjB5dwo07M5oheC8Xz8mOllyg''',
+  # kind の E2E（tools/k8s/mesh-e2e.sh）で WasmPlugin の basic_auth に渡す試験用の資格情報
+  '''^ok:(test|wrong)$''',
 ]
