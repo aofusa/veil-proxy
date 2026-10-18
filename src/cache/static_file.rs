@@ -155,7 +155,7 @@ pub async fn get_static_file_with_content(
             .await;
             let outcome = loaded?;
 
-            return Some(match outcome {
+            match outcome {
                 FastOutcome::File(meta, data) => {
                     // 両方のキャッシュへ登録する（各キャッシュの既存の有効化・上限判定を
                     // そのまま使う）。
@@ -166,13 +166,17 @@ pub async fn get_static_file_with_content(
                         meta.mime_type.clone(),
                         content_cfg,
                     );
-                    StaticFileOutcome::File(meta, data)
+                    return Some(StaticFileOutcome::File(meta, data));
                 }
                 FastOutcome::Directory(meta) => {
                     file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
-                    StaticFileOutcome::Directory(meta)
+                    return Some(StaticFileOutcome::Directory(meta));
                 }
-            });
+                // 高速経路が使えないと分かった（seccomp が openat2 を EPERM にする等）。下の
+                // canonicalize の経路で判定する（以前は None = 404 を返し、それを最初に観測した
+                // 要求だけが 404 になっていた。v0.8.0）。
+                FastOutcome::Unavailable => {}
+            }
         }
     }
 
@@ -248,6 +252,9 @@ fn route_fast_path_available(root: &Path) -> bool {
 enum FastOutcome {
     File(CachedFileInfo, Bytes),
     Directory(CachedFileInfo),
+    /// 高速経路で判定できない（openat2 が使えない・登録済みルートでない）。呼び出し側は
+    /// canonicalize の経路へ進む（404 ではない）。
+    Unavailable,
 }
 
 /// offload 専用ワーカースレッド内で実行する同期関数: 登録済みルート配下の
@@ -277,7 +284,10 @@ fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
             // されないため、クロスルートの懸念が無い）。
             None => resolve::open_beneath_for_request(path),
         };
-        match opened? {
+        let Some(opened) = opened else {
+            return Some(FastOutcome::Unavailable);
+        };
+        match opened {
             Ok((file, meta)) => finish_fast(path, file, meta),
             // 登録済みルート配下と判定された上での失敗（404 相当）。
             Err(_) => None,
@@ -286,7 +296,10 @@ fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
     #[cfg(target_os = "freebsd")]
     {
         let _ = root;
-        match crate::security::capsicum::open_static_ro(path)? {
+        let Some(opened) = crate::security::capsicum::open_static_ro(path) else {
+            return Some(FastOutcome::Unavailable);
+        };
+        match opened {
             Ok(file) => {
                 // fstat は開いた File から取得する（F-123 の `stat_static` は open を
                 // 伴わないため、本体読み込みが必須の本関数では fd を再利用できる
@@ -460,6 +473,24 @@ mod tests {
             }
             _ => panic!("通常ファイルは File を返すべき"),
         }
+    }
+
+    /// 高速経路で判定できないとき（登録済みルートでない・openat2 が seccomp で EPERM）は 404 の
+    /// `None` ではなく `Unavailable` を返し、呼び出し側が canonicalize の経路へ進むこと
+    /// （以前は openat2 の EPERM を最初に観測した要求だけが 404 になっていた。v0.8.0）。
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn fast_path_without_registered_root_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = write_file(&dir, "fallback.txt", b"fallback");
+        assert!(matches!(
+            open_and_read_fast(&path, Some(dir.path())),
+            Some(FastOutcome::Unavailable)
+        ));
+        assert!(matches!(
+            open_and_read_fast(&path, None),
+            Some(FastOutcome::Unavailable)
+        ));
     }
 
     /// 存在しないファイルは `None` になること。

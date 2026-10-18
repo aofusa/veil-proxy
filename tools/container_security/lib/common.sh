@@ -174,7 +174,7 @@ run_harness() {
         --name "${HARNESS_CONTAINER}-${phase}" \
         --network "${NET_NAME}" \
         -e "VEIL_HOST=${veil_host}" \
-        -e "VEIL_HTTP_PORT=80" \
+        -e "VEIL_HTTP_PORT=8443" \
         -e "VEIL_HTTPS_PORT=443" \
         -e "VEIL_H2C_PORT=8443" \
         -e "VEIL_L4_PORT=4443" \
