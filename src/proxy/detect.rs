@@ -345,7 +345,12 @@ pub async fn handle_h2c_connection(
     // Http2ConnectionはTcpStreamでも動作可能
     // 既に読み込んだデータ（プリフェース）を初期バッファとして渡す
     // これにより、不要な再読み込みを回避できる
+    // FreeBSD: 平文なので、静的コンテンツキャッシュ（共有メモリ）の DATA を sendfile(2) で送ってよい
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    let sock_fd = stream.as_raw_fd();
     let mut conn = Http2Connection::new_with_initial_buffer(stream, settings, initial_data);
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    conn.enable_zero_copy(sock_fd);
 
     // ハンドシェイク（プリフェース確認 + SETTINGS 交換）
     // expect_preface()は初期バッファからプリフェースを読み取る

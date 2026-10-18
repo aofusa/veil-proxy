@@ -51,6 +51,9 @@ pub mod compressed;
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
 mod content_cache;
+// FreeBSD: 静的コンテンツキャッシュの本体を共有メモリに置き、h2c の DATA を sendfile(2) で送る（v0.8.0）
+#[cfg(all(feature = "cache", target_os = "freebsd"))]
+pub(crate) mod shm;
 #[cfg(feature = "cache")]
 mod disk;
 #[cfg(feature = "cache")]

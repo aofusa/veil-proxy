@@ -183,6 +183,12 @@ impl ContentCache {
     /// 上限を満たす場合のみ挿入する（admission control）。既存キーへの上書きの
     /// 場合は古いエントリ分を先に `total_bytes` から差し引いて判定する。
     fn try_insert(&self, path: &Path, content: CachedContent, cfg: &StaticContentCacheConfig) {
+        // FreeBSD: 本体を共有メモリへ写す（h2c の DATA を sendfile(2) で送れるようにする。`super::shm` 参照）
+        #[cfg(target_os = "freebsd")]
+        let content = CachedContent {
+            data: super::shm::to_shm(content.data),
+            ..content
+        };
         let new_len = content.len;
         // **`entry()` を呼ぶ前にエントリ数を読む**こと。`DashMap::entry()` は該当シャードの
         // write ロックを取得し、返り値の `Entry` が生きている間はそれを保持し続ける。

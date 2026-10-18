@@ -807,7 +807,8 @@ where
         // --- pending_body（ウィンドウ待ち残）を先に再送 ---
         {
             if let Some((buf, off)) = st.pending_body.take() {
-                let queued = conn.queue_data_frames(sid, &buf[off..], false)?;
+                // 本体の持ち主ごと渡す（FreeBSD の平文 h2c は共有メモリの本体を sendfile(2) で送る）
+                let queued = conn.queue_data_frames_bytes(sid, &buf.slice(off..), false)?;
                 let new_off = off + queued;
                 if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                     conn.flush_write_buf().await?;
@@ -862,7 +863,7 @@ where
                     }
                 }
                 H2RespMsg::Body(bytes) => {
-                    let queued = conn.queue_data_frames(sid, &bytes, false)?;
+                    let queued = conn.queue_data_frames_bytes(sid, &bytes, false)?;
                     if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                         conn.flush_write_buf().await?;
                     }
