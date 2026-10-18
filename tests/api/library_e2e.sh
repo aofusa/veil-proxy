@@ -138,11 +138,13 @@ TOML
   wait_port "$P2" && expect "no config.toml -> library defaults" "Hello, World!" curl -s "http://127.0.0.1:$P2/hello" || bad "no-config start"
   expect "defaults are plaintext h2c-only + HTTP/1.1" "H2C (HTTP/2 Cleartext) Server" cat "$W2/log"
   # 環境変数 VEIL_OVERRIDE_<n> もライブラリで効く
-  kill "$PID2"; sleep 1
+  # 別のポートで起動する（同じポートだと SO_REUSEPORT で終了処理中の前のサーバと並んで待ち受け、
+  # wait_port が前のサーバで通ってしまう。以前は P3 を取りながら P2 を使っていた）
+  kill "$PID2"; for _ in $(seq 1 50); do kill -0 "$PID2" 2>/dev/null || break; sleep 0.2; done
   local P3; P3=$(free_port)
-  (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P2" VEIL_OVERRIDE_1="api.openapi_enabled = false" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log3" 2>&1 &
-  PIDS+=("$!"); wait_port "$P2"
-  expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P2/openapi.json"
+  (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P3" VEIL_OVERRIDE_1="api.openapi_enabled = false" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log3" 2>&1 &
+  PIDS+=("$!"); wait_port "$P3" "$!"
+  expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P3/openapi.json"
   kill "$!" 2>/dev/null
 }
 

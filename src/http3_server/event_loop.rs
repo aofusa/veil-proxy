@@ -323,8 +323,14 @@ pub(super) fn process_datagram_segments(
                         let scid = derived_ref.into_owned();
 
                         let mut config_ref = quic_config.borrow_mut();
-                        let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        let conn = quiche::accept_with_buf_factory::<ZcFactory>(
+                            &scid,
+                            None,
+                            local_addr,
+                            from,
+                            &mut config_ref,
+                        )
+                        .map_err(|e| io::Error::other(e.to_string()))?;
 
                         debug!("[HTTP/3] New connection from {}", from);
 

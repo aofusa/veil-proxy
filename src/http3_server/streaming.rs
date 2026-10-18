@@ -168,7 +168,7 @@ pub(super) fn build_h1_request_head(
 /// `proxy_streams` から除去する。
 pub(super) fn drive_proxy_stream(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     ps: &mut ProxyStream,
 ) -> (bool, bool) {
@@ -187,7 +187,7 @@ pub(super) fn drive_proxy_stream(
 /// B-12 の不変条件（イベントが残っているのに誰も見なくなる経路を作らない）を安全側に倒す。
 pub(super) fn drive_request_pump(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     ps: &mut ProxyStream,
 ) -> bool {
@@ -304,11 +304,7 @@ pub(super) fn drive_request_pump(
 /// （B-68 の 30 秒待ちの直接の原因）。RFC 9114 §4.1.1 に従い `STOP_SENDING(H3_NO_ERROR)` で
 /// 送信停止を求める（quiche は以後の受信データを破棄し、クライアントは応答を読める）。
 /// クライアントが既に本文を送り切っている（fin 受信済み）場合は何もしない。
-pub(super) fn abandon_request_body(
-    conn: &mut quiche::Connection,
-    stream_id: u64,
-    ps: &mut ProxyStream,
-) {
+pub(super) fn abandon_request_body(conn: &mut H3Conn, stream_id: u64, ps: &mut ProxyStream) {
     /// RFC 9114 §8.1 H3_NO_ERROR
     const H3_NO_ERROR: u64 = 0x100;
     ps.req_pending.clear();
@@ -325,7 +321,7 @@ pub(super) fn abandon_request_body(
 /// 進捗なしとして扱い、ビジーループ再投入を避ける。
 pub(super) fn drive_response_flush(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     ps: &mut ProxyStream,
 ) -> bool {
@@ -532,7 +528,7 @@ pub(super) enum BodySend {
 /// レスポンス head（`:status` + ヘッダ）を `send_response(fin=false)` で送る。
 pub(super) fn send_h3_head(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     status: u16,
     headers: &[(Bytes, Bytes)],
@@ -543,7 +539,7 @@ pub(super) fn send_h3_head(
 /// レスポンス head を送る。`fin` なら HEADERS でストリームを閉じる（本文の無い応答）。
 pub(super) fn send_h3_head_fin(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     status: u16,
     headers: &[(Bytes, Bytes)],
@@ -577,7 +573,7 @@ pub(super) fn send_h3_head_fin(
 #[cfg(any(feature = "grpc", feature = "handler"))]
 pub(super) fn send_h3_trailers(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     trailers: &[(Bytes, Bytes)],
 ) -> HeadSend {
@@ -601,19 +597,22 @@ pub(super) fn send_h3_trailers(
     }
 }
 
-/// ボディ断片を `send_body` で送る（`off` から）。`fin` は最後の断片に終端を載せる。
+/// ボディ断片を `send_body_zc` で送る（`off` から）。`fin` は最後の断片に終端を載せる。
+///
+/// 本文は `Bytes` のまま quiche の送信バッファへ渡す（コピーしない。[`ZcFactory`]）。
 pub(super) fn send_h3_body(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
-    buf: &[u8],
+    buf: &Bytes,
     off: usize,
     fin: bool,
 ) -> BodySend {
     if off >= buf.len() && !fin {
         return BodySend::Done;
     }
-    match h3.send_body(conn, stream_id, &buf[off..], fin) {
+    let mut zb = ZcBuf(buf.slice(off..));
+    match h3.send_body_zc(conn, stream_id, &mut zb, fin) {
         Ok(n) => {
             let new_off = off + n;
             if new_off >= buf.len() {
@@ -631,11 +630,7 @@ pub(super) fn send_h3_body(
 }
 
 /// 空ボディ + fin を送る。`true` で fin 送出完了、`false` でブロック（再試行）。
-pub(super) fn try_send_h3_fin(
-    h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
-    stream_id: u64,
-) -> bool {
+pub(super) fn try_send_h3_fin(h3: &mut h3::Connection, conn: &mut H3Conn, stream_id: u64) -> bool {
     match h3.send_body(conn, stream_id, b"", true) {
         Ok(_) => true,
         Err(h3::Error::Done) => false,
@@ -649,7 +644,7 @@ pub(super) fn try_send_h3_fin(
 /// 簡易エラーレスポンス（head + 小ボディ + fin）を送る。
 pub(super) fn send_simple_h3_error(
     h3: &mut h3::Connection,
-    conn: &mut quiche::Connection,
+    conn: &mut H3Conn,
     stream_id: u64,
     status: u16,
 ) {

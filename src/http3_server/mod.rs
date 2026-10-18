@@ -860,18 +860,58 @@ impl std::hash::Hasher for StreamIdHasher {
     }
 }
 
+/// 応答の本文を quiche の送信バッファへコピーせずに渡すためのバッファの作り方（v0.8.0）。
+///
+/// quiche の既定（`DefaultBufFactory`）は `send_body` のたびに本文を新しい確保へコピーする。本文は
+/// 静的配信のキャッシュや上流の受信バッファの `Bytes` なので、参照カウントのまま渡す
+/// （`h3::Connection::send_body_zc`）。quiche は ACK まで保持して再送にも使う。スライスで渡される
+/// 経路（ヘッダのフレーム・エラー応答の短い本文）は `buf_from_slice` で 1 回コピーする（既定と同じ）。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ZcFactory;
+
+/// [`ZcFactory`] のバッファ（`Bytes` の薄い包み）。
+#[derive(Clone, Debug)]
+pub(crate) struct ZcBuf(Bytes);
+
+impl AsRef<[u8]> for ZcBuf {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl quiche::BufFactory for ZcFactory {
+    type Buf = ZcBuf;
+
+    #[inline]
+    fn buf_from_slice(buf: &[u8]) -> ZcBuf {
+        ZcBuf(Bytes::copy_from_slice(buf))
+    }
+}
+
+impl quiche::BufSplit for ZcBuf {
+    /// 先頭 `at` バイトを残し、残りを返す（`Bytes::split_off` は参照カウントだけでコピーしない）。
+    #[inline]
+    fn split_at(&mut self, at: usize) -> Self {
+        ZcBuf(self.0.split_off(at))
+    }
+}
+
+/// HTTP/3 の QUIC 接続（本文をコピーせずに送る [`ZcFactory`] 版）。
+pub(crate) type H3Conn = quiche::Connection<ZcFactory>;
+
 type StreamIdHasherBuilder = std::hash::BuildHasherDefault<StreamIdHasher>;
 type StreamMap<V> = HashMap<u64, V, StreamIdHasherBuilder>;
 
 /// HTTP/3 コネクションハンドラー
 ///
-/// quiche::Connection と h3::Connection をセットで保持し、
+/// `quiche::Connection`（[`H3Conn`]）と h3::Connection をセットで保持し、
 /// コネクションの寿命の間、同一のインスタンスを維持します。
 ///
 /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
 struct Http3Handler {
     /// QUIC コネクション
-    conn: quiche::Connection,
+    conn: H3Conn,
     /// HTTP/3 コネクション (確立後に Some)
     h3_conn: Option<h3::Connection>,
     /// リモートアドレス
@@ -930,7 +970,7 @@ struct Http3Handler {
 impl Http3Handler {
     /// 新しいハンドラーを作成
     fn new(
-        conn: quiche::Connection,
+        conn: H3Conn,
         peer_addr: SocketAddr,
         notify: crate::http3_stream::ConnWaker,
         backend_spawner: crate::http3_stream::BackendSpawner,
@@ -1898,7 +1938,7 @@ impl Http3Handler {
     ///   Done は保持、その他エラーは warn の上で破棄。
     fn try_flush_partial(
         h3_conn: &mut h3::Connection,
-        conn: &mut quiche::Connection,
+        conn: &mut H3Conn,
         stream_id: u64,
         pr: &mut PartialResponse,
     ) -> bool {
@@ -2136,6 +2176,22 @@ pub(crate) fn compress_body_h3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本文のバッファの分割はコピーせず（同じ領域を指したまま）、前半・後半に分かれる。
+    #[test]
+    fn zc_buf_split_keeps_the_same_memory() {
+        use quiche::{BufFactory, BufSplit};
+        let body = Bytes::from(vec![7u8; 4096]);
+        let mut head = ZcBuf(body.slice(100..));
+        let tail = head.split_at(1000);
+        assert_eq!(head.as_ref().len(), 1000);
+        assert_eq!(tail.as_ref().len(), 4096 - 100 - 1000);
+        assert_eq!(head.as_ref().as_ptr(), body[100..].as_ptr());
+        assert_eq!(tail.as_ref().as_ptr(), body[1100..].as_ptr());
+        // スライスで渡される経路は 1 回コピーする
+        let copied = ZcFactory::buf_from_slice(b"abc");
+        assert_eq!(copied.as_ref(), b"abc");
+    }
 
     /// F-186: 接続が減ってアイドルになった表は縮み、小さい表・まだ埋まっている表は縮まない。
     #[test]
