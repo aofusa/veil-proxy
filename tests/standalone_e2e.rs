@@ -261,6 +261,7 @@ path = "{www}"
     }
 }
 
+#[cfg(unix)]
 fn pem_to_der(pem: &str) -> Vec<u8> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes())

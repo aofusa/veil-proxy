@@ -127,7 +127,10 @@ pub(super) fn schedule_timer(
     // ヒープに同じか早いエントリが既にあれば積まない（そのエントリが満了したときに本当の期限を確かめ直す。
     // `expire_due_timers`）。以前は接続を処理するたびに積み、期限が延びた古いエントリをヒープに溜めては
     // 捨てていた（FreeBSD の h3_file 54KB で expire_due_timers・HashMap::get_mut が上位。v0.8.0）。
-    if handler.timer_deadline.is_some_and(|queued| queued <= deadline) {
+    if handler
+        .timer_deadline
+        .is_some_and(|queued| queued <= deadline)
+    {
         return;
     }
     handler.timer_deadline = Some(deadline);
