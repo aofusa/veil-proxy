@@ -616,12 +616,25 @@ run_scenario() {
       *) die "未知のシナリオ: $sc" ;;
     esac
 
-    # ---- nginx ----
+    # 順番の偏りを打ち消すため、反復ごとに nginx と veil の順を入れ替える（奇数回は nginx が先、偶数回は veil が先）。
+    # VM ではラウンドの中で後に測るほどスループットが下がる傾向があり、常に nginx を先に測ると veil に不利に出ていた
+    # （FreeBSD aarch64 の l4_tcp 3B で、固定の順の 0.85 に対して交互では 1.04〜1.13）。
+    if [ $((iter % 2)) = 0 ]; then
+        measure_veil_side
+        measure_nginx_side
+    else
+        measure_nginx_side
+        measure_veil_side
+    fi
+}
+
+measure_nginx_side() {
     log "[$sc iter=$iter] nginx 計測"
     r=$(measure "$tool" "$n_url")
     printf '%s\t%s\t%s\t%s\n' "$sc" nginx "$iter" "$r" >> "${OUT_TSV}"
+}
 
-    # ---- veil ----
+measure_veil_side() {
     log "[$sc iter=$iter] veil 計測"
     start_veil "${WORK}/conf/${v_cfg}"
     case "$sc" in
