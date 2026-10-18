@@ -33,6 +33,15 @@ FreeBSD の計測（`tools/perf/bsd/run_perf_bsd.sh`）は、次の 3 点で vei
 | 負荷分散の遅延の記録に粗い時計 | 中継 | 要求ごとの `Instant::now()` 2 回を減らす |
 | L4: 短い read の後は kevent を待ってから読む・アイドル監視を 1 本のタイマー・2 方向を別タスク | Linux 以外の L4 | read 4.0 → 3.1/req、CPU/要求 −6%。3B 0.90 → 0.98〜1.0 |
 | `TCP_NOPUSH` を 128KB 以上の応答だけに | FreeBSD の平文 HTTP/1.1 静的配信 | 54KB で 2 syscall/req 減 |
+| HTTP/3 の本文を quiche の送信バッファへコピーせず `Bytes` のまま渡す（`BufFactory` + `send_body_zc`） | HTTP/3 | FreeBSD の h3_file 54KB の CPU/要求 113 → 103µs（−8.6%、nginx 98µs）。memcpy のサンプル 901 → 411。Linux の交互 A/B（h2load、下の時刻と合わせて）は h3_proxy +2.7%・h3_file_cache +1.6% |
+| 受信の束・1 接続ぶんの送出で 1 回だけ時刻を読み、quiche に渡す（vendoring の quiche に `set_time_hint`） | HTTP/3 | quiche は recv・send のたびに `Instant::now()` を読んでいた（54KB 1 つで約 60 回）。`__vdso_gettc` のサンプル 330 → 115、3B の CPU/要求 −2〜3% |
+
+quiche の `send_body_zc` には、ストリームの容量で一部しか書けない回に、流量制御で止まっていないのに相手の上限で
+STREAM_DATA_BLOCKED を送る不具合があった（バッファの全長を「送りたい量」として渡していた）。ngtcp2 のクライアント
+（h2load・curl）はその上限が最終的なサイズより大きいので FINAL_SIZE_ERROR で接続を閉じる。E2E の HTTP/3 の
+クライアントは quinn で、これを無視するため試験は通り、Linux の計測（h2load）で 2〜87 req/s になって見つかった。
+vendoring の quiche で、送る分に切ったバッファを渡すように直した（`third_party/quiche/README.veil.md` の 3c、
+単体試験 `zc_body_send_does_not_signal_false_stream_blocked`）。
 
 結果の全体は `docs/perf/README.md`。
 
