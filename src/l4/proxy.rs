@@ -10,7 +10,7 @@ use crate::runtime::offload::offload;
 #[cfg(target_os = "linux")]
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
-use crate::runtime::time::timeout;
+use crate::runtime::time::{coarse_now, sleep, timeout};
 
 #[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
@@ -344,9 +344,14 @@ async fn forward_direction(
     // kqueue: 直前の read がバッファを満たさなかったら、受信キューは空になっている見込みが高い。
     // 次は read を先に試さず（EAGAIN の空打ち）、kevent の通知を待ってから読む
     // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照。EVFILT_READ はレベルトリガなので
-    // 登録の時点でデータがあればすぐ通知され、取りこぼさない）。FreeBSD の `l4_tcp` 3B で read 4.0 → 2.0/req。
+    // 登録の時点でデータがあればすぐ通知され、取りこぼさない）。FreeBSD の `l4_tcp` 3B で read 4.0 → 3.1/req。
     #[cfg(veil_poller_kqueue)]
     let mut wait_first = false;
+    // アイドルの監視は方向ごとに 1 本のタイマーで行う。read のたびに `timeout()` で包むと、そのたびに
+    // タイマーの登録と取り消し（タイマー表の操作と時刻の読み出し）が要る。最後に動いた時刻だけを覚え、
+    // タイマーが満了したときに「本当に idle_timeout だけ動いていないか」を確かめて、まだなら残りで張り直す。
+    let mut last_active = coarse_now();
+    let mut watchdog = std::pin::pin!(futures::FutureExt::fuse(sleep(idle_timeout)));
     'outer: loop {
         // read(): buf の ownership を渡し、完了後に (result, buf) として返ってくる
         #[cfg(veil_poller_kqueue)]
@@ -358,22 +363,23 @@ async fn forward_direction(
             }
             src.read(buf).await
         };
-        #[cfg(veil_poller_kqueue)]
-        let (res, mut b) = match timeout(idle_timeout, read).await {
-            Ok(r) => r,
-            Err(_) => {
-                debug!("[L4:{}] idle timeout", name);
-                break;
-            }
-        };
         #[cfg(not(veil_poller_kqueue))]
-        let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
-            Ok(r) => r,
-            Err(_) => {
-                debug!("[L4:{}] idle timeout", name);
-                break;
+        let read = src.read(buf);
+        let mut read = std::pin::pin!(futures::FutureExt::fuse(read));
+        let (res, mut b) = loop {
+            futures::select_biased! {
+                r = read => break r,
+                _ = watchdog => {
+                    let idle_for = coarse_now().saturating_duration_since(last_active);
+                    if idle_for >= idle_timeout {
+                        debug!("[L4:{}] idle timeout", name);
+                        break 'outer;
+                    }
+                    watchdog.set(futures::FutureExt::fuse(sleep(idle_timeout - idle_for)));
+                }
             }
         };
+        last_active = coarse_now();
         let n = match res {
             Ok(0) | Err(_) => break,
             Ok(n) => n,

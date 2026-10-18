@@ -68,6 +68,9 @@ LOAD_THREADS="${LOAD_THREADS:-2}"
 # 計測対象を固定するコア / 負荷生成を固定するコア
 SRV_CPUS="${SRV_CPUS:-0,1}"
 GEN_CPUS="${GEN_CPUS:-2,3}"
+# proxy・L4 の上流（別プロセスの nginx）のコア。計測対象（SRV_CPUS）と分け、負荷生成と共有する
+# （veil・nginx のどちらの計測でも同じ条件になる）。
+UP_CPUS="${UP_CPUS:-${GEN_CPUS}}"
 SRV_THREADS="${SRV_THREADS:-2}"
 
 # ポート割り当て（veil / nginx / 共通上流）
@@ -189,13 +192,6 @@ http {
     open_file_cache_min_uses 1;
     open_file_cache_errors on;
 
-    # ---- 共通上流（veil / nginx の proxy・L4 計測の双方が使う）----
-    server {
-        listen 127.0.0.1:${UPSTREAM} reuseport;
-        root ${WORK}/www;
-        location / { index index.html; }
-    }
-
     upstream backend { server 127.0.0.1:${UPSTREAM}; keepalive 128; }
 
     # ---- 計測対象 nginx: 平文 HTTP/1.1（静的 + プロキシ）----
@@ -238,6 +234,36 @@ stream {
     server {
         listen ${NGX_L4} reuseport;
         proxy_pass l4backend;
+    }
+}
+EOF
+
+    # ---- 共通上流（veil / nginx の proxy・L4 計測の双方が使う）----
+    # 計測対象の nginx とは別のプロセス（別の pid）にして、UP_CPUS に固定する。同じ nginx の中に置くと、
+    # nginx の計測では中継と上流が同じワーカーのイベントループで済む一方、veil の計測では veil と上流が
+    # 2 コアを取り合い、条件が揃わない（v0.8.0 で計測対象のコアへの固定を入れたときに見つかった）。
+    cat > "${WORK}/conf/nginx-up.conf" <<EOF
+worker_processes ${SRV_THREADS};
+daemon on;
+pid ${WORK}/nginx/nginx-up.pid;
+error_log ${WORK}/logs/nginx_up_error.log warn;
+events { worker_connections 8192; }
+http {
+    default_type application/octet-stream;
+    access_log off;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 1000000;
+    open_file_cache max=1024 inactive=60s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 1;
+    open_file_cache_errors on;
+    server {
+        listen 127.0.0.1:${UPSTREAM} reuseport;
+        root ${WORK}/www;
+        location / { index index.html; }
     }
 }
 EOF
@@ -402,14 +428,22 @@ stop_all() {
     if [ -f "${WORK}/nginx/nginx.pid" ]; then
         nginx -c "${WORK}/conf/nginx.conf" -s quit >/dev/null 2>&1 || true
     fi
+    if [ -f "${WORK}/nginx/nginx-up.pid" ]; then
+        nginx -c "${WORK}/conf/nginx-up.conf" -s quit >/dev/null 2>&1 || true
+    fi
     pkill -x nginx >/dev/null 2>&1 || true
     sleep 1
 }
 
 start_nginx() {
-    nginx -c "${WORK}/conf/nginx.conf" >/dev/null 2>&1 \
-        || die "nginx 起動に失敗（${WORK}/logs/nginx_error.log）"
+    # nginx も veil と同じコア（SRV_CPUS）に固定する（冒頭の公平化のルール）。以前は固定しておらず、
+    # nginx のワーカーが負荷生成側のコアにも載れた。daemon で fork したワーカーも cpuset を引き継ぐ。
+    # proxy・L4 の上流（同じ nginx）も同じコアに載るので、veil の計測でも「計測対象 + 上流」は 2 コアに収まる。
+    pinned "${UP_CPUS}" nginx -c "${WORK}/conf/nginx-up.conf" >/dev/null 2>&1 \
+        || die "上流の nginx の起動に失敗（${WORK}/logs/nginx_up_error.log）"
     wait_port "${UPSTREAM}" || die "nginx 上流が上がらない"
+    pinned "${SRV_CPUS}" nginx -c "${WORK}/conf/nginx.conf" >/dev/null 2>&1 \
+        || die "nginx 起動に失敗（${WORK}/logs/nginx_error.log）"
 }
 
 start_veil() {
