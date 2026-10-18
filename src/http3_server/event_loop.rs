@@ -124,6 +124,12 @@ pub(super) fn schedule_timer(
         Some(t) => t,
         None => Instant::now() + H3_DEFAULT_TIMER,
     };
+    // ヒープに同じか早いエントリが既にあれば積まない（そのエントリが満了したときに本当の期限を確かめ直す。
+    // `expire_due_timers`）。以前は接続を処理するたびに積み、期限が延びた古いエントリをヒープに溜めては
+    // 捨てていた（FreeBSD の h3_file 54KB で expire_due_timers・HashMap::get_mut が上位。v0.8.0）。
+    if handler.timer_deadline.is_some_and(|queued| queued <= deadline) {
+        return;
+    }
     handler.timer_deadline = Some(deadline);
     timers.push(Reverse(TimerKey(deadline, key.clone())));
 }
@@ -151,6 +157,15 @@ pub(super) fn expire_due_timers(
         };
         if !timer_entry_is_current(dl, handler.timer_deadline) {
             continue; // 期限が更新済みの古いエントリ（遅延削除）。
+        }
+        handler.timer_deadline = None;
+        // 積んだ後に期限が延びていたら（`schedule_timer` は早くなるときだけ積み直す）、本当の期限で積み直す
+        if let Some(actual) = handler.conn.timeout_instant() {
+            if actual > now {
+                handler.timer_deadline = Some(actual);
+                timers.push(Reverse(TimerKey(actual, key)));
+                continue;
+            }
         }
         handler.conn.on_timeout();
         if handler.conn.is_closed() {
@@ -465,7 +480,16 @@ pub(super) async fn send_pending_packets(
         let mut sent_any = false;
 
         loop {
-            let (write, send_info) = match handler.conn.send(&mut send_buf[..max_payload]) {
+            // パケットを batch の空き領域へ直接書かせる（以前は send_buf に書いてから batch へコピーしていた。
+            // 1 パケットにつき 1 回の memcpy。FreeBSD の h3_file 54KB のプロファイルで memcpy が上位。v0.8.0）
+            batch.reserve(max_payload);
+            let spare = batch.spare_capacity_mut();
+            // SAFETY: quiche の send は out に書くだけで読まない。書いた write バイトだけを下で set_len に反映する
+            // （recv_body の spare と同じ扱い。未初期化の部分は読まない）。
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, max_payload)
+            };
+            let (write, send_info) = match handler.conn.send(out) {
                 Ok(v) => {
                     sent_any = true;
                     v
@@ -511,7 +535,8 @@ pub(super) async fn send_pending_packets(
                 seg_size = write;
             }
             let start = batch.len();
-            batch.extend_from_slice(&send_buf[..write]);
+            // SAFETY: 直前の send が batch の [start, start + write) を書いた（reserve で容量は確保済み）。
+            unsafe { batch.set_len(start + write) };
             offsets.push((start, write));
             cur_dest = Some(send_info.to);
 
