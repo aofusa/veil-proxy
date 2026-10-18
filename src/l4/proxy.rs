@@ -316,6 +316,8 @@ impl DirectionDone {
 /// （FreeBSD aarch64 の `l4_tcp` 3B で `read` 6.0/req = 1 方向 3 回のうち 1 回が空打ち）。
 /// `FuturesUnordered` は起床した子だけを poll する。子タスクのノード確保は接続あたり 2 回で、
 /// リクエストごとには発生しない（既存の 64KB 転送バッファと同じ接続単位の固定費）。
+/// Linux 以外は 2 方向を別々のタスクにする（`bidirectional_forward` 参照）ので、splice の経路だけが使う。
+#[cfg(target_os = "linux")]
 async fn join_directions<F>(c2u: F, u2c: F) -> (usize, usize)
 where
     F: std::future::Future<Output = usize>,
