@@ -21,6 +21,9 @@ set -e
 ulimit -n 65536 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Windows の Git Bash（MSYS）では設定ファイルに書くパスを veil.exe が読める "C:/..." の形にする
+# （"/c/..." のままだと TLS 証明書などが見つからない）。bash も "C:/..." をそのまま扱える。
+case "$(uname -s)" in MINGW*|MSYS*) SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)" ;; esac
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # ワークスペース構成の場合、バイナリはワークスペースルートにある
 WORKSPACE_DIR="$(dirname "$PROJECT_DIR")"
@@ -212,11 +215,14 @@ prepare_fixtures() {
         log_info "Generating ECDSA test certificates..."
         
         # OpenSSLでECDSA自己署名証明書を生成（end-entity証明書）
+        # Windows の Git Bash（MSYS）は "/CN=..." をパスとみなして変換するので "//CN=..." と書く
+        local subj="/CN=localhost"
+        case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) subj="//CN=localhost" ;; esac
         openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
             -keyout "${FIXTURES_DIR}/key.pem" \
             -out "${FIXTURES_DIR}/cert.pem" \
             -days 365 \
-            -subj "/CN=localhost" \
+            -subj "$subj" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
             -addext "basicConstraints=critical,CA:FALSE" \
             -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
