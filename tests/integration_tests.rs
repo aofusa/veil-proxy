@@ -1701,6 +1701,22 @@ path = "{d}/"
             assert!(Instant::now() < deadline, "veil did not start listening");
             std::thread::sleep(Duration::from_millis(100));
         }
+        // ポートに繋がっただけでは、並行する他の試験が同じポートを使っている可能性が残る（そのとき
+        // シグナルハンドラを入れる前の veil にシグナルを送ると既定の動作で死ぬ。macOS で観測）。
+        // ワーカーの起動のログ（シグナルハンドラの設定とリスナーの bind の後に出る）まで待つ。
+        while !log_of(dir).contains("Worker started") {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "veil exited during startup: {}",
+                log_of(dir)
+            );
+            assert!(
+                Instant::now() < deadline,
+                "veil did not log its worker start: {}",
+                log_of(dir)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         (child, port)
     }
 
