@@ -67,6 +67,14 @@ veil は 1 回の受信の束・1 接続ぶんの送出の束で 1 回だけ時�
 呼び、終わったら `set_time_hint(None)` に戻す。`Connection` に `time_hint` を足し、上の 4 か所の
 `Instant::now()` を `self.now()`（ヒントがあればそれ、無ければ `Instant::now()`）にした。
 
+### 3c. `src/h3/mod.rs`: `send_body_zc` が誤った STREAM_DATA_BLOCKED を送る（v0.8.0）
+
+`send_body_zc` は本文のバッファの全長を `stream_send_zc` に渡し、書く量を `Some(body_len)` で絞っていた。
+`stream_do_send` は渡されたバッファの全長を「送りたい量」として扱うので、ストリームの容量で `body_len` に
+切られると流量制御で止まったと見なし、相手の上限で STREAM_DATA_BLOCKED を送る。その上限は最終的なサイズより
+大きいので、ngtcp2（h2load・curl 等）は FINAL_SIZE_ERROR で接続を閉じていた（quinn は無視する）。
+`body_len` に切ったバッファを渡し、残りは元のバッファを `split_at(n)` して返すようにした。
+
 ### 4. `src/lib.rs`: 予約ビットの検査（B-100）
 
 `Connection::recv_single` で、ヘッダ保護を外した先頭バイトを `decrypt_hdr` 直後に控え、

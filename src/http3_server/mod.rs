@@ -2328,6 +2328,151 @@ mod tests {
         assert_eq!(a.len(), quiche::MAX_CONN_ID_LEN);
     }
 
+    /// 本文をコピーせずに送る経路（`send_h3_body` → `send_body_zc`）が、輻輳ウィンドウで一部しか
+    /// 書けない回に誤った STREAM_DATA_BLOCKED を送らず、本文を全部届ける。修正前の quiche は
+    /// バッファの全長を渡して流量制御で止まったと見なし、相手の上限で STREAM_DATA_BLOCKED を送って
+    /// いた（ngtcp2 のクライアントは FINAL_SIZE_ERROR で接続を閉じる）。
+    #[test]
+    fn zc_body_send_does_not_signal_false_stream_blocked() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut server_cfg = new_quic_config_with_certs(
+            ck.cert.pem().as_bytes(),
+            ck.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(10 << 20);
+        server_cfg.set_initial_max_stream_data_bidi_remote(10 << 20);
+        server_cfg.set_initial_max_streams_bidi(10);
+        server_cfg.set_initial_max_streams_uni(10);
+        server_cfg.set_initial_max_stream_data_uni(1 << 20);
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        client_cfg.set_initial_max_data(10 << 20);
+        client_cfg.set_initial_max_stream_data_bidi_local(10 << 20);
+        client_cfg.set_initial_max_streams_uni(10);
+        client_cfg.set_initial_max_stream_data_uni(1 << 20);
+        let c_addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let s_addr: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[3u8; 16]),
+            c_addr,
+            s_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let mut server: H3Conn = quiche::accept_with_buf_factory::<ZcFactory>(
+            &ConnectionId::from_ref(&[4u8; 16]),
+            None,
+            s_addr,
+            c_addr,
+            &mut server_cfg,
+        )
+        .unwrap();
+        // 両者の送れるパケットを全部相手へ渡す（ネットワークの代わり）
+        fn pump(
+            client: &mut quiche::Connection,
+            server: &mut H3Conn,
+            c: SocketAddr,
+            s: SocketAddr,
+        ) {
+            let mut buf = [0u8; 1500];
+            loop {
+                let mut moved = false;
+                while let Ok((n, _)) = client.send(&mut buf) {
+                    let _ = server.recv(&mut buf[..n], quiche::RecvInfo { from: c, to: s });
+                    moved = true;
+                }
+                while let Ok((n, _)) = server.send(&mut buf) {
+                    let _ = client.recv(&mut buf[..n], quiche::RecvInfo { from: s, to: c });
+                    moved = true;
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        pump(&mut client, &mut server, c_addr, s_addr);
+        assert!(client.is_established() && server.is_established());
+
+        let h3_cfg = h3::Config::new().unwrap();
+        let mut ch3 = h3::Connection::with_transport(&mut client, &h3_cfg).unwrap();
+        let mut sh3 = h3::Connection::with_transport(&mut server, &h3_cfg).unwrap();
+        let req = [
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":path", b"/"),
+        ];
+        let sid = ch3.send_request(&mut client, &req, true).unwrap();
+        pump(&mut client, &mut server, c_addr, s_addr);
+        loop {
+            match sh3.poll(&mut server) {
+                Ok((id, h3::Event::Headers { .. })) => {
+                    assert_eq!(id, sid);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("server poll: {e:?}"),
+            }
+        }
+
+        // 初期の輻輳ウィンドウ（約 13KB）より大きい本文を、書けた分ずつ送る
+        let body = Bytes::from(vec![b'x'; 200 * 1024]);
+        assert!(matches!(
+            send_h3_head(&mut sh3, &mut server, sid, 200, &[]),
+            HeadSend::Sent
+        ));
+        let mut off = 0usize;
+        let mut received = 0usize;
+        let mut finished = false;
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..10_000 {
+            if off < body.len() {
+                match send_h3_body(&mut sh3, &mut server, sid, &body, off, true) {
+                    BodySend::Done => off = body.len(),
+                    BodySend::Partial(n) => off = n,
+                    BodySend::Blocked => {}
+                    BodySend::Error => panic!("send_h3_body error"),
+                }
+            }
+            pump(&mut client, &mut server, c_addr, s_addr);
+            loop {
+                match ch3.poll(&mut client) {
+                    Ok((_, h3::Event::Data)) => {
+                        while let Ok(n) = ch3.recv_body(&mut client, sid, &mut buf) {
+                            received += n;
+                        }
+                    }
+                    Ok((_, h3::Event::Finished)) => finished = true,
+                    Ok(_) => {}
+                    Err(h3::Error::Done) => break,
+                    Err(e) => panic!("client poll: {e:?}"),
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "the response must finish (sent {off}, received {received})"
+        );
+        assert_eq!(received, body.len());
+        assert_eq!(
+            server.stats().stream_data_blocked_sent_count,
+            0,
+            "the stream was never flow-control blocked"
+        );
+        assert!(!client.is_closed(), "{:?}", client.peer_error());
+    }
+
     /// B-94: 同じ元 DCID の Initial が 2 回届いても（クライアントの PTO 再送・複数パケットに
     /// またがる ClientHello）新規接続は 1 つだけ作られる。修正前は届くたびに乱数 SCID で
     /// 別接続を `accept` していた。
