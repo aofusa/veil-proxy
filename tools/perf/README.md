@@ -250,7 +250,7 @@ veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirec
   nginx 10,080 / 6,188）。L4 平文素通しは **2.04×**。圧縮結果キャッシュ有効の
   `h2_1_feat_compression_cached` は HTTP/2 で **3.02×**。
 - FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/freebsd/`）は 16 項目中 12 項目で nginx 以上。
-- **対 nginx は同じ仕事の相手と比べる**（v0.8.0。`docs/artifacts/vs_nginx.py` の対応）: `*_proxy*` は
+- **対 nginx は同じ仕事の相手と比べる**（v0.8.0。`tools/perf/vs_nginx.py` の対応）: `*_proxy*` は
   `base_proxy`、キャッシュ無しの `*_compression` は `base_compression`、`*_proxy_compression` は
   `base_proxy_compression`、`h2c_*` は同名、HTTP/3 の静的は `base`（http3）・中継は `base_proxy`（http3）、
   それ以外は `base`（TLS 静的）。v0.8.0 より前は nginx の中継・圧縮の相手が無く、`feat_proxy` 等を
