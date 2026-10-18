@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::runtime::handle::RawFd;
 
@@ -409,14 +409,14 @@ const EVENT_BATCH: usize = 256;
 
 /// 1 回分の poller wait + イベント/タイマー処理。
 #[cfg(veil_poller_epoll)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<libc::epoll_event>> =
             RefCell::new(vec![unsafe { std::mem::zeroed() }; EVENT_BATCH]);
     }
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&mut buf, timeout_ms_ceil(timeout))) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -496,14 +496,14 @@ fn dispatch_event(fd: RawFd, flags: u32) {
 
 /// kqueue バージョンの 1 回分の poller wait + イベント/タイマー処理。
 #[cfg(veil_poller_kqueue)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<libc::kevent>> =
             RefCell::new(vec![unsafe { std::mem::zeroed() }; EVENT_BATCH]);
     }
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&mut buf, timeout)) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -621,14 +621,14 @@ fn with_poller<R>(f: impl FnOnce(&WsaPollPoller) -> R) -> R {
 /// （`super::wsapoll` のドキュメント参照。カーネル側に登録状態を持たないため
 /// epoll/kqueue のような差分登録ができない）。
 #[cfg(veil_poller_wsapoll)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<(RawFd, u32)>> = RefCell::new(Vec::with_capacity(EVENT_BATCH));
     }
     let entries = FD_TABLE.with(|t| t.borrow().armed_entries());
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&entries, &mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&entries, &mut buf, timeout_ms_ceil(timeout))) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -682,18 +682,23 @@ fn dispatch_event(fd: RawFd, flags: u32) {
 
 /// poller wait のタイムアウト（ミリ秒）を最近接タイマーデッドラインから計算する。
 /// タイマーが無ければ無期限待機（-1）。
-fn next_timeout_ms() -> i32 {
-    match super::timer::next_deadline() {
-        Some(deadline) => {
-            let now = Instant::now();
-            if deadline <= now {
-                0
-            } else {
-                let ms = (deadline - now).as_millis();
-                ms.min(i32::MAX as u128) as i32
-            }
-        }
+/// 次のタイマーまでの時間（`None` は無期限）。期限を過ぎていれば 0。
+fn next_timeout() -> Option<Duration> {
+    super::timer::next_deadline().map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+/// ミリ秒の単位の poller（epoll・WSAPoll）へ渡す値。**切り上げる**: 以前は `as_millis` で切り捨てていたため、
+/// 1ms 未満の先のタイマーが 0（待たない）になり、期限まで poller を空回りさせていた（FreeBSD の HTTP/3 で
+/// 空の kevent が 1 スレッドで 50 万回/秒。v0.8.0。kqueue はナノ秒で渡す）。
+#[cfg(any(veil_poller_epoll, veil_poller_wsapoll))]
+fn timeout_ms_ceil(timeout: Option<Duration>) -> i32 {
+    match timeout {
         None => -1,
+        Some(d) if d.is_zero() => 0,
+        Some(d) => {
+            let ms = d.as_nanos().div_ceil(1_000_000);
+            ms.min(i32::MAX as u128) as i32
+        }
     }
 }
 
@@ -942,14 +947,14 @@ impl Executor {
                 break;
             }
 
-            let timeout_ms = next_timeout_ms();
+            let timeout = next_timeout();
             #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
-            park(timeout_ms);
+            park(timeout);
             #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll)))]
             {
                 // veil_rt_reactor は必ずどちらかの poller cfg を伴う（build.rs）ため、
                 // ここへ到達することは cfg 上あり得ない。
-                let _ = timeout_ms;
+                let _ = timeout;
                 unreachable!("reactor backend without a poller cfg");
             }
         }

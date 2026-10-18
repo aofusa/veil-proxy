@@ -1972,13 +1972,13 @@ impl Http3Handler {
         let mut did_work = false;
         for (&stream_id, pr) in &mut self.partial_responses {
             // 進捗判定用に呼び出し前の状態を控える（try_flush_partial 自体は変更しない）。
-            let written_before = pr.written;
             let head_present_before = pr.head.is_some();
             if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
                 completed.push(stream_id);
                 did_work = true;
-            } else if pr.written != written_before || pr.head.is_some() != head_present_before {
-                // 未完了でもヘッダ送出/部分バイト送出があった＝進捗あり。
+            } else if pr.head.is_some() != head_present_before {
+                // 未完了でもヘッダを送れた＝進捗あり。本文が一部だけ進んだのは、送れる量を使い切った
+                // ということなので再投入しない（handle_writable_streams・streaming.rs の Partial と同じ。v0.8.0）
                 did_work = true;
             }
         }
