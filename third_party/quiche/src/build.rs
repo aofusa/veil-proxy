@@ -257,11 +257,8 @@ fn main() {
         println!("cargo:rustc-link-lib=static=crypto");
     }
 
-    // MacOS: Allow cdylib to link with undefined symbols
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
-    if target_os == "macos" {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
-    }
+    // veil: crate-type は lib だけ（F-184）なので cdylib のリンク引数は出さない（出すと macOS のビルドのたびに
+    // 「package does not contain a cdylib target」の警告になる。upstream は MacOS で cdylib の未定義シンボルを許すため）。
 
     #[cfg(feature = "openssl")]
     {
@@ -281,7 +278,7 @@ fn main() {
     }
 
     #[cfg(feature = "ffi")]
-    if target_os != "windows" {
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
         cdylib_link_lines::metabuild();
     }
 }

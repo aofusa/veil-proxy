@@ -55,6 +55,8 @@ incremental ストリームの末尾への並べ替え（ラウンドロビン�
   cargo-zigbuild 0.23.4（zig 0.16）の macOS クロスビルドでは、この cdylib のリンクが
   `unable to read exported symbols list '-dead_strip'` で失敗し、`full` の macOS ビルドが
   通らなくなっていた。rlib だけにするとリンク自体が無くなり、全ターゲットでビルドも短くなる。
+- あわせて `src/build.rs` の macOS 向けの `cargo:rustc-cdylib-link-arg` を出さないようにした（cdylib が無いので
+  意味が無く、macOS のビルドのたびに cargo の警告になる。v0.8.0）。
 
 それ以外は無変更。
 

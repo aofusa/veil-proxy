@@ -895,7 +895,7 @@ fn pump_streams(g: &mut Inner, ids: &mut Vec<u32>) {
 
         // 下流が応答ハンドルを捨てた → キャンセル。
         if st.resp_tx.is_closed() {
-            if !st.reset && !(st.local_closed && st.remote_closed) {
+            if !(st.reset || (st.local_closed && st.remote_closed)) {
                 inner_out.extend_from_slice(&fenc.encode_rst_stream(id, ERR_CANCEL));
             }
             // 保留していた DATA の接続ウィンドウは返す。
