@@ -144,6 +144,8 @@ impl QuicUdpSocket {
             return Err(io::Error::last_os_error());
         }
 
+        set_dont_fragment(fd, addr.is_ipv4());
+
         // SO_REUSEADDR を設定
         let reuseaddr: libc::c_int = 1;
         // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し、長さはその大きさ
@@ -785,7 +787,12 @@ impl QuicUdpSocket {
                     continue;
                 }
                 // 先頭メッセージの恒久エラー: 当該メッセージのみ skip して継続（QUIC 再送で回復）。
-                warn!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                // EMSGSIZE は DF を立てた経路 MTU の探索で大きすぎた探索のパケット（想定内）
+                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                    ftlog::debug!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                } else {
+                    warn!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                }
                 sent += 1;
                 continue;
             }
@@ -1218,6 +1225,52 @@ const QUIC_SOCKET_BUFFER_WANT: libc::c_int = 2 * 1024 * 1024;
 #[cfg(all(not(target_os = "linux"), unix))]
 const QUIC_SOCKET_BUFFER_MIN: libc::c_int = 64 * 1024;
 
+/// QUIC の UDP ソケットに DF（分割しない）を立てる（失敗は無視する）。
+///
+/// quiche の経路 MTU の探索（`[http3] discover_pmtu`）は、探索のパケットが経路の MTU を超えたら**落ちる**ことを前提に
+/// する。DF が無いと IPv4 では途中で分割されて届き、大きすぎる値を確定してしまう（v0.8.0、F-240）。Linux は
+/// `IP_PMTUDISC_PROBE`（DF を立て、カーネルの PMTU のキャッシュには従わない。探索は quiche が行う）。
+#[cfg(unix)]
+fn set_dont_fragment(fd: libc::c_int, ipv4: bool) {
+    let set = |level: libc::c_int, name: libc::c_int, val: libc::c_int| {
+        // SAFETY: fd は呼び出し側が作った有効なソケット。val は生存する c_int で、長さはその大きさ。
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        set(
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_PROBE,
+        );
+        if !ipv4 {
+            set(
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IPV6_PMTUDISC_PROBE,
+            );
+        }
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    if ipv4 {
+        set(libc::IPPROTO_IP, libc::IP_DONTFRAG, 1);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !ipv4 {
+        set(libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+    let _ = ipv4;
+}
+
 /// B-95: `SO_RCVBUF`/`SO_SNDBUF` を「通る最大値」で設定する。設定できたサイズを返す。
 ///
 /// Linux は `net.core.rmem_max` で黙って切り詰めるだけで失敗しないが、**BSD は上限を超えると
@@ -1292,6 +1345,8 @@ impl QuicUdpSocket {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+
+        set_dont_fragment(fd, addr.is_ipv4());
 
         let optval: libc::c_int = 1;
         // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し長さはその大きさ。
@@ -1536,7 +1591,11 @@ impl QuicUdpSocket {
                         wait_writable_fd(fd).await?;
                         continue;
                     }
-                    warn!("[HTTP/3] send entry skipped: {}", err);
+                    if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                        ftlog::debug!("[HTTP/3] send entry skipped: {}", err);
+                    } else {
+                        warn!("[HTTP/3] send entry skipped: {}", err);
+                    }
                     break;
                 }
             }
@@ -1646,7 +1705,12 @@ impl QuicUdpSocket {
                                 wait_writable_fd(self.socket.as_raw_fd()).await?;
                                 continue;
                             }
-                            warn!("[HTTP/3] send entry skipped: {}", err);
+                            // WSAEMSGSIZE（10040）: DF の経路 MTU の探索で大きすぎた探索のパケット（想定内）
+                            if err.raw_os_error() == Some(10040) {
+                                ftlog::debug!("[HTTP/3] send entry skipped: {}", err);
+                            } else {
+                                warn!("[HTTP/3] send entry skipped: {}", err);
+                            }
                             break;
                         }
                     }

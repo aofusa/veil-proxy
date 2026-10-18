@@ -992,10 +992,19 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_max_idle_timeout")]
     pub max_idle_timeout: u64,
 
-    /// 最大UDPペイロードサイズ
-    /// デフォルト: 1350 (MTU考慮)
+    /// 最大UDPペイロードサイズ（経路 MTU の探索の上限）
+    ///
+    /// デフォルト: 1452（v0.8.0 で 1350 から変更。MTU 1500 の IPv6 で載る最大）。`discover_pmtu` が有効なら quiche は
+    /// 1200 から始めて、探索で確かめた大きさまでしか使わないので、MTU の小さい経路でも届かなくはならない。
+    /// 1350 固定だと 54KB の応答に 42 パケット（nginx 39）で、Linux の Docker で HTTP/3 が 6.7% 遅かった。
     #[serde(default = "default_h3_max_udp_payload_size")]
     pub max_udp_payload_size: u64,
+
+    /// 経路 MTU の探索（quiche `discover_pmtu`、RFC 8899 の DPLPMTUD）。UDP のソケットには DF を立てる。
+    ///
+    /// デフォルト: `true`（v0.8.0）
+    #[serde(default = "default_true")]
+    pub discover_pmtu: bool,
 
     /// 初期最大データサイズ（コネクション全体）
     /// デフォルト: 10000000 (10MB)
@@ -1148,7 +1157,7 @@ fn default_h3_max_idle_timeout() -> u64 {
     30000
 }
 fn default_h3_max_udp_payload_size() -> u64 {
-    1350
+    1452
 }
 fn default_h3_initial_max_data() -> u64 {
     10_000_000
@@ -1181,6 +1190,7 @@ impl Default for Http3ConfigSection {
             listen: None,
             max_idle_timeout: default_h3_max_idle_timeout(),
             max_udp_payload_size: default_h3_max_udp_payload_size(),
+            discover_pmtu: true,
             initial_max_data: default_h3_initial_max_data(),
             initial_max_stream_data_bidi_local: default_h3_initial_max_stream_data(),
             initial_max_stream_data_bidi_remote: default_h3_initial_max_stream_data(),
@@ -1218,6 +1228,7 @@ impl Http3ConfigSection {
             key_pem: None,
             max_idle_timeout: self.max_idle_timeout,
             max_udp_payload_size: self.max_udp_payload_size,
+            discover_pmtu: self.discover_pmtu,
             initial_max_data: self.initial_max_data,
             initial_max_stream_data_bidi_local: self.initial_max_stream_data_bidi_local,
             initial_max_stream_data_bidi_remote: self.initial_max_stream_data_bidi_remote,

@@ -67,7 +67,8 @@
 | `[http2]` | `max_header_block_size` | `65536` | 最大ヘッダーブロック（64KB） |
 | `[http2]` | `stream_idle_timeout_secs` | `60` | ストリームアイドルタイムアウト（秒） |
 | `[http3]` | `max_idle_timeout` | `30000` | 最大アイドルタイムアウト（ミリ秒、30秒） |
-| `[http3]` | `max_udp_payload_size` | `1350` | 最大UDPペイロードサイズ |
+| `[http3]` | `max_udp_payload_size` | `1452` | 最大UDPペイロードサイズ。経路 MTU の探索の上限（v0.8.0 より前は `1350`。1350 固定だと 54KB の応答に 42 パケット（nginx 39）で、Linux で 6.7% 遅かった） |
+| `[http3]` | `discover_pmtu` | `true` | 経路 MTU の探索（quiche、RFC 8899 の DPLPMTUD）。1200 バイトから始め、探索のパケットが届いた大きさだけを使うので、MTU の小さい経路でも動く。UDP のソケットに DF を立てる（Linux は `IP_PMTUDISC_PROBE`、BSD・macOS は `IP_DONTFRAG`/`IPV6_DONTFRAG`） |
 | `[http3]` | `initial_max_data` | `10000000` | 初期最大データ（10MB） |
 | `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | ストリームデータ双方向ローカル（1MB） |
 | `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | ストリームデータ双方向リモート（1MB） |

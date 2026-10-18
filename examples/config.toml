@@ -1217,10 +1217,15 @@ revalidate_mtime = false
 # 長寿命接続: 60000 (60秒)
 # max_idle_timeout = 30000
 
-# 最大UDPペイロードサイズ
-# デフォルト: 1350 (MTU考慮)
+# 最大UDPペイロードサイズ（経路 MTU の探索の上限）
+# デフォルト: 1452（v0.8.0 で 1350 から変更。MTU 1500 の IPv6 で載る最大）
 # ジャンボフレーム環境: 9000
-# max_udp_payload_size = 1350
+# max_udp_payload_size = 1452
+
+# 経路 MTU の探索（quiche の DPLPMTUD）。1200 バイトから始め、探索のパケットが届いた大きさまでしか使わない
+# （UDP のソケットに DF を立てる）。false にすると max_udp_payload_size を確かめずに使う。
+# デフォルト: true
+# discover_pmtu = true
 
 # 初期最大データサイズ（コネクション全体）
 # デフォルト: 10000000 (10MB)

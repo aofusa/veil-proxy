@@ -69,7 +69,8 @@ The following table lists default values for major configuration options:
 | `[http2]` | `max_header_block_size` | `65536` | Max header block (64KB) |
 | `[http2]` | `stream_idle_timeout_secs` | `60` | Stream idle timeout (seconds) |
 | `[http3]` | `max_idle_timeout` | `30000` | Max idle timeout (ms, 30s) |
-| `[http3]` | `max_udp_payload_size` | `1350` | Max UDP payload size |
+| `[http3]` | `max_udp_payload_size` | `1452` | Max UDP payload size: the upper bound of path MTU discovery (`1350` before v0.8.0; a fixed 1350 needed 42 packets per 54 KB response vs nginx's 39 and was 6.7% slower on Linux) |
+| `[http3]` | `discover_pmtu` | `true` | Path MTU discovery (quiche, RFC 8899 DPLPMTUD). Starts at 1200 bytes and only uses sizes whose probes arrived, so small-MTU paths keep working; the UDP sockets set DF (Linux `IP_PMTUDISC_PROBE`, BSD/macOS `IP_DONTFRAG`/`IPV6_DONTFRAG`) |
 | `[http3]` | `initial_max_data` | `10000000` | Initial max data (10MB) |
 | `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | Stream data bidi local (1MB) |
 | `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | Stream data bidi remote (1MB) |

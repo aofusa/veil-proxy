@@ -453,6 +453,8 @@ fn configure_quic_transport(
     quic_config.set_max_idle_timeout(config.max_idle_timeout);
     quic_config.set_max_recv_udp_payload_size(config.max_udp_payload_size as usize);
     quic_config.set_max_send_udp_payload_size(config.max_udp_payload_size as usize);
+    // 経路 MTU の探索: 1200 から始め、探索のパケットが届いた大きさまで上げる（UDP のソケットは DF。F-240）
+    quic_config.discover_pmtu(config.discover_pmtu);
     quic_config.set_initial_max_data(config.initial_max_data);
     quic_config.set_initial_max_stream_data_bidi_local(config.initial_max_stream_data_bidi_local);
     quic_config.set_initial_max_stream_data_bidi_remote(config.initial_max_stream_data_bidi_remote);
@@ -589,8 +591,10 @@ pub struct Http3ServerConfig {
     pub key_pem: Option<Vec<u8>>,
     /// 最大アイドルタイムアウト（ミリ秒）
     pub max_idle_timeout: u64,
-    /// 最大 UDP ペイロードサイズ
+    /// 最大 UDP ペイロードサイズ（経路 MTU の探索の上限）
     pub max_udp_payload_size: u64,
+    /// 経路 MTU の探索（quiche `discover_pmtu`）
+    pub discover_pmtu: bool,
     /// 初期最大データサイズ
     pub initial_max_data: u64,
     /// 初期最大ストリームデータサイズ（双方向）
@@ -628,7 +632,8 @@ impl Default for Http3ServerConfig {
             cert_pem: None,
             key_pem: None,
             max_idle_timeout: 30000,
-            max_udp_payload_size: 1350,
+            max_udp_payload_size: 1452,
+            discover_pmtu: true,
             initial_max_data: 10_000_000,
             initial_max_stream_data_bidi_local: 1_000_000,
             initial_max_stream_data_bidi_remote: 1_000_000,
@@ -2381,7 +2386,8 @@ mod tests {
         let config = Http3ServerConfig::default();
         assert_eq!(config.recv_drain_max, H3_RECV_DRAIN_MAX_DEFAULT);
         assert_eq!(config.max_idle_timeout, 30000);
-        assert_eq!(config.max_udp_payload_size, 1350);
+        assert_eq!(config.max_udp_payload_size, 1452);
+        assert!(config.discover_pmtu);
     }
 
     // ====================

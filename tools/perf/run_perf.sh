@@ -20,8 +20,10 @@ K6DIR="$HERE/k6"                     # k6 スクリプト・proto の所在
 
 # 負荷パラメータ（環境変数で上書き可）
 WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
-H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
-H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
+# v0.8.0: h2load は既定で 1 スレッドで、HTTP/3 では h2load 自体が律速になっていた（veil・nginx とも CPU は 4 コア中
+# 1.5〜1.7 コアしか使っていなかった）。サーバを測るため 4 スレッドにする（-c はスレッド数の倍数に）。
+H2_ARGS="${H2_ARGS:--t4 -n 30000 -c100 -m10}"
+H3_ARGS="${H3_ARGS:---alpn-list=h3 -t4 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
 H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: listen_cleartext / nginx: listen 8080 http2）
 H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
 
@@ -417,6 +419,7 @@ if wait_ready nginx-perf; then
     # gzip で毎回圧縮する静的配信（veil のキャッシュ無しの *_compression 構成の相手）
     run_load nginx base_proxy nginx-perf 1 8443
     run_load nginx base_compression nginx-perf 1 8444
+    run_load nginx base_proxy_compression nginx-perf 1 8445
     # HTTP/3（QUIC）の相手: 静的配信（veil の h3_file* / feat_http3）と中継（veil の h3_proxy*）
     run_http3 nginx base nginx-perf 443
     run_http3 nginx base_proxy nginx-perf 8443
