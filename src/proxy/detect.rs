@@ -129,7 +129,9 @@ impl<S: crate::runtime::io::AsyncWriteRent + Unpin> crate::runtime::io::AsyncWri
 /// - 最初のバイトまでは、キープアライブで次の要求を待つのと同じアイドル待ち（`IDLE_TIMEOUT`、graceful shutdown で
 ///   即座に満了）。ブラウザの事前接続や接続プールは、接続してから要求を送るまで間を空けることがある
 ///   （以前は 200ms で打ち切って Unknown とし、HTTP/1.1 のクライアントへ HTTP/2 の GOAWAY を返していた）。
-/// - 判別に足りない断片（5 バイト未満・HTTP/2 プリフェースの途中）の続きは短い上限（200ms）で待つ。
+/// - 判別に足りない断片（5 バイト未満・HTTP/2 プリフェースの途中）の続きは短い上限（1 秒）で待つ。覗き直しの間隔は
+///   1ms から倍々に 50ms まで延ばす（止まった断片 1 本あたりの起床は約 25 回。以前は 200ms を 1ms 間隔で 200 回。
+///   200ms では負荷の高いホストで 50ms 遅れの続きが間に合わないことがあった。v0.8.0）。
 /// - 1 バイトも届かずに閉じられた・タイムアウトした接続は `Closed`、判別できないバイト列は `Unknown`。
 pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolType, Vec<u8>) {
     // ソケットバッファを MSG_PEEK で覗き見て（消費せず）プロトコルを判別する。
@@ -140,12 +142,15 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     // （h2c 検出が有効な全接続で発生しうる）。MSG_PEEK ならバイトはソケットに残るため、
     // 判別後に TLS/H2C/HTTP1.1 各ハンドラがそのまま読み直せる（initial_data は常に空）。
     const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    const PARTIAL_TIMEOUT: Duration = Duration::from_millis(200);
+    const PARTIAL_TIMEOUT: Duration = Duration::from_secs(1);
+    const PARTIAL_POLL_MAX: Duration = Duration::from_millis(50);
     let fd = stream.as_raw_fd();
     let mut peeked = [0u8; 24];
     let mut n = 0usize;
     // 断片を最初に覗いた時刻（続きを待つ上限の起点）
     let mut partial_since: Option<std::time::Instant> = None;
+    // 断片の続きを覗き直す間隔（倍々に延ばす）
+    let mut partial_poll = Duration::from_millis(1);
 
     loop {
         // データ到着を待つ（MSG_PEEK は消費しないのでタイムアウトキャンセルしても安全）。
@@ -160,7 +165,8 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
                 }
                 // 断片はソケットに残ったまま（覗いただけ）なので readable は即座に成立する。
                 // 続きを待つ間は readiness ではなく短い sleep で覗き直す（断片は稀な経路）。
-                crate::runtime::time::sleep(Duration::from_millis(1)).await;
+                crate::runtime::time::sleep(partial_poll).await;
+                partial_poll = (partial_poll * 2).min(PARTIAL_POLL_MAX);
             }
         }
 
