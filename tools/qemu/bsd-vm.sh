@@ -1382,6 +1382,11 @@ _guest_env_prefix() {
             pre="${pre} CARGO_HOME=/work/cargo TMPDIR=/work/tmp"
         fi
     fi
+    # 配布ビルド（`--profile dist`、fat LTO）が VM のメモリで落ちるときの逃げ道。ホストで
+    # `CARGO_PROFILE_DIST_LTO=thin` を指定すればゲストの cargo に渡す（v0.8.0）。
+    if [[ -n "${CARGO_PROFILE_DIST_LTO:-}" ]]; then
+        pre="${pre} CARGO_PROFILE_DIST_LTO=${CARGO_PROFILE_DIST_LTO}"
+    fi
     echo "${pre}"
 }
 
@@ -1413,7 +1418,8 @@ CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
 # **【注意】`dist` は既定の VM メモリ（4096MB）では OOM で失敗する**（実測: fat LTO の
 # 全プログラムリンク段階で `Killed`）。`codegen-units = 1` の fat LTO はリンク時に
 # 大量のメモリを要求するため、`VM_MEM_MB=8192` 以上で VM を作り直すこと
-# （`down` → `VM_MEM_MB=8192 up`）。
+# （`down` → `VM_MEM_MB=8192 up`）。8192MB でも足りないときは `CARGO_PROFILE_DIST_LTO=thin` で
+# thin LTO に落とす（ゲストの cargo に渡す）。
 #
 # メモリを増やせない場合は既定の `release` のままビルドし、
 # `packaging/scripts/build-bsd.sh` が行う strip でサイズ削減する

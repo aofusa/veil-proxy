@@ -28,6 +28,7 @@ process didn't exit successfully: `rustc --crate-name veil ... -C lto=fat -C cod
 
 対処（いずれか）:
 - `VM_MEM_MB=8192` 以上でリトライする
+- それでも足りなければ `CARGO_PROFILE_DIST_LTO=thin` を付けて thin LTO に落とす（`bsd-vm.sh` がゲストの cargo へ渡す）
 - `CARGO_PROFILE=release` でビルドする（LTO 無しのぶんバイナリは大きくなるが機能は同一）
 
 ### ビルドの失敗をパイプで握り潰さないこと
