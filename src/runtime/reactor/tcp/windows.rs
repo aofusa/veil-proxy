@@ -848,9 +848,9 @@ fn poll_ready_now(fd: RawFd, want_write: bool) -> bool {
     };
     let ret = unsafe { WinSock::WSAPoll(&mut pfd, 1, 0) };
     let mask = if want_write {
-        (WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP)
+        WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP
     } else {
-        (WinSock::POLLRDNORM | WinSock::POLLERR | WinSock::POLLHUP)
+        WinSock::POLLRDNORM | WinSock::POLLERR | WinSock::POLLHUP
     };
     ret > 0 && pfd.revents & mask != 0
 }
