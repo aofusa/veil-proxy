@@ -51,12 +51,12 @@ fn check_aws_lc_no_prefix() {
         .or_else(|_| std::env::var("AWS_LC_SYS_NO_PREFIX"))
         .unwrap_or_default();
     let v = value.trim().to_ascii_lowercase();
-    let truthy = !v.is_empty()
-        && !(v.starts_with('0')
-            || v.starts_with('n')
-            || v.starts_with("off")
-            || v.starts_with('f'));
-    if !truthy {
+    let falsy = v.is_empty()
+        || v.starts_with('0')
+        || v.starts_with('n')
+        || v.starts_with("off")
+        || v.starts_with('f');
+    if falsy {
         panic!(
             "veil-proxy: the `http3` feature on Linux needs aws-lc-sys built without symbol prefixes.\n\
              Add this to `.cargo/config.toml` of your project (or workspace) and rebuild:\n\n\
