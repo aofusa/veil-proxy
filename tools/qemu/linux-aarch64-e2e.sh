@@ -92,10 +92,11 @@ fi
 
 log "VM 内の Rust ツールチェーン / E2E 依存を用意"
 # Ubuntu の apt 版 rustc は古く本クレートをビルドできないため rustup の stable を使う
-"${VM}" ssh 'set -e; if ! command -v cmake >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1; then sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev cmake nasm curl openssl protobuf-compiler clang libclang-dev python3 python3-venv python3-pip >/dev/null; fi; dpkg -s python3-venv >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip >/dev/null; [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'
+"${VM}" ssh 'set -e; if ! command -v cmake >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1; then sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev cmake nasm curl openssl protobuf-compiler clang libclang-dev python3 python3-venv python3-pip >/dev/null; fi; dpkg -s python3-venv >/dev/null 2>&1 || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip >/dev/null; }; [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'
 
 # 4) E2E 実行
 log "VM 内で tests/e2e_setup.sh test を実行（features=${CARGO_FEATURES}）"
-"${VM}" ssh "export PATH=\$HOME/.cargo/bin:\$PATH; cd ${GUEST_ROOT} && ${SKIP_ENV} VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
+# 4GB の VM では debug 情報付きの full のリンクが OOM で落ちる（ld が SIGKILL）。debug 情報を付けず 2 並列でビルドする
+"${VM}" ssh "export PATH=\$HOME/.cargo/bin:\$PATH CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=2; cd ${GUEST_ROOT} && ${SKIP_ENV} VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
 
 log "完了"

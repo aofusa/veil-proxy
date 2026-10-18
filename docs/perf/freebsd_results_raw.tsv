@@ -1,100 +1,258 @@
-# ==== 2026-10-07 FreeBSD 14.3 aarch64（QEMU + HVF）d8126b6、3B（/small.html）、-r 3 -d 10 ====
-scenario	server	iter	rps	mbps	p50_ms	p99_ms	errors
-h1_file_tls	nginx	1	471066.63	851.76	0.127	0.202	0
-h1_file_tls	veil	1	503470.30	430.24	0.084	0.127	0
-h2_file_tls	nginx	1	467709.76	446.16	0.000	0.000	0
-h2_file_tls	veil	1	605404.18	148.00	0.000	0.000	0
-h1_file_plain	nginx	1	548839.68	992.40	0.058	9.530	0
-h1_file_plain	veil	1	597295.06	510.40	0.099	0.195	0
-h2c_file_plain	nginx	1	264119.56	251.92	0.000	0.000	0
-h2c_file_plain	veil	1	664517.37	162.40	0.000	0.000	0
-h3_file	nginx	1	240949.39	5.51	7.720	14.530	0
-h3_file	veil	1	182116.46	4.17	11.480	12.370	0
-h1_proxy_tls	nginx	1	157533.62	284.88	0.399	0.604	0
-h1_proxy_tls	veil	1	151348.49	273.68	0.394	0.635	0
-h2_proxy_tls	nginx	1	100405.47	103.44	0.000	0.000	0
-h2_proxy_tls	veil	1	108618.82	31.60	0.000	0.000	0
-l4_tcp	nginx	1	210660.86	380.88	0.284	0.555	0
-l4_tcp	veil	1	179765.39	325.04	0.304	0.733	0
-h1_file_tls	nginx	2	224320.78	405.60	0.263	0.472	0
-h1_file_tls	veil	2	231319.10	197.68	0.190	0.343	0
-h2_file_tls	nginx	2	467398.92	445.84	0.000	0.000	0
-h2_file_tls	veil	2	565428.47	138.24	0.000	0.000	0
-h1_file_plain	nginx	2	260641.56	471.28	0.112	21.860	0
-h1_file_plain	veil	2	301146.61	257.36	0.191	0.420	0
-h2c_file_plain	nginx	2	551213.32	525.76	0.000	0.000	0
-h2c_file_plain	veil	2	694248.58	169.68	0.000	0.000	0
-h3_file	nginx	2	123244.53	2.82	15.550	31.210	0
-h3_file	veil	2	112913.97	2.58	18.300	21.090	0
-h1_proxy_tls	nginx	2	116156.08	210.00	0.536	0.930	0
-h1_proxy_tls	veil	2	121580.14	219.84	0.493	0.716	0
-h2_proxy_tls	nginx	2	98361.74	101.36	0.000	0.000	0
-h2_proxy_tls	veil	2	156450.15	45.44	0.000	0.000	0
-l4_tcp	nginx	2	189142.03	342.00	0.318	0.583	0
-l4_tcp	veil	2	184499.65	333.60	0.296	0.718	0
-h1_file_tls	nginx	3	248053.47	448.56	0.243	0.388	0
-h1_file_tls	veil	3	266333.38	227.60	0.166	0.246	0
-h2_file_tls	nginx	3	461832.10	440.56	0.000	0.000	0
-h2_file_tls	veil	3	616594.09	150.72	0.000	0.000	0
-h1_file_plain	nginx	3	314048.01	567.84	0.110	11.770	0
-h1_file_plain	veil	3	334955.08	286.24	0.167	0.405	0
-h2c_file_plain	nginx	3	535329.67	510.64	0.000	0.000	0
-h2c_file_plain	veil	3	749814.01	183.28	0.000	0.000	0
-h3_file	nginx	3	136742.69	3.13	14.290	27.620	0
-h3_file	veil	3	121533.86	2.78	17.030	19.900	0
-h1_proxy_tls	nginx	3	122086.78	220.72	0.518	0.794	0
-h1_proxy_tls	veil	3	122428.86	221.36	0.489	0.732	0
-h2_proxy_tls	nginx	3	80720.63	83.12	0.000	0.000	0
-h2_proxy_tls	veil	3	187409.86	54.48	0.000	0.000	0
-l4_tcp	nginx	3	187495.17	339.04	0.319	0.636	0
-l4_tcp	veil	3	182911.31	330.72	0.298	0.729	0
-# ==== 2026-10-07 FreeBSD 14.3 aarch64（QEMU + HVF）d8126b6、54,576B（/index.html）、-r 3 -d 10 ====
-scenario	server	iter	rps	mbps	p50_ms	p99_ms	errors
-h1_file_tls	nginx	1	25442.68	10649.60	2.600	3.730	0
-h1_file_tls	veil	1	29088.69	12124.16	2.160	2.880	0
-h2_file_tls	nginx	1	21136.57	8847.36	0.000	0.000	0
-h2_file_tls	veil	1	29369.04	12206.08	0.000	0.000	0
-h1_file_plain	nginx	1	49359.36	20643.84	0.689	1.090	0
-h1_file_plain	veil	1	50712.61	21135.36	0.661	0.950	0
-h2c_file_plain	nginx	1	67181.90	28098.56	0.000	0.000	0
-h2c_file_plain	veil	1	52800.18	22036.48	0.000	0.000	0
-h3_file	nginx	1	3425.09	1426.14	486.660	1407.100	0
-h3_file	veil	1	3355.96	1397.36	494.680	1970.460	0
-h1_proxy_tls	nginx	1	15756.60	6589.84	4.150	5.500	0
-h1_proxy_tls	veil	1	16540.35	6917.60	3.800	4.600	0
-h2_proxy_tls	nginx	1	11357.38	4747.20	0.000	0.000	0
-h2_proxy_tls	veil	1	17126.35	7139.20	0.000	0.000	0
-l4_tcp	nginx	1	35032.45	14663.68	1.870	2.570	0
-l4_tcp	veil	1	40329.58	16875.52	1.550	2.310	0
-h1_file_tls	nginx	2	22916.70	9584.64	2.820	3.800	0
-h1_file_tls	veil	2	27743.41	11550.72	2.210	2.920	0
-h2_file_tls	nginx	2	22244.95	9256.96	0.000	0.000	0
-h2_file_tls	veil	2	28681.23	11960.32	0.000	0.000	0
-h1_file_plain	nginx	2	48757.62	20398.08	0.695	1.660	0
-h1_file_plain	veil	2	49454.05	20643.84	0.682	0.960	0
-h2c_file_plain	nginx	2	75596.10	31621.12	0.000	0.000	0
-h2c_file_plain	veil	2	52089.06	21708.80	0.000	0.000	0
-h3_file	nginx	2	3310.08	1378.26	505.480	1504.060	0
-h3_file	veil	2	2654.35	1105.22	500.100	2056.980	0
-h1_proxy_tls	nginx	2	17011.22	7127.04	4.050	5.550	0
-h1_proxy_tls	veil	2	16315.04	6823.28	3.880	4.790	0
-h2_proxy_tls	nginx	2	11508.21	4810.24	0.000	0.000	0
-h2_proxy_tls	veil	2	16948.25	7064.96	0.000	0.000	0
-l4_tcp	nginx	2	34410.55	14417.92	2.020	3.130	0
-l4_tcp	veil	2	39885.86	16711.68	1.580	2.330	0
-h1_file_tls	nginx	3	22488.35	9420.80	2.850	4.030	0
-h1_file_tls	veil	3	27354.05	11386.88	2.210	2.970	0
-h2_file_tls	nginx	3	18590.71	7766.64	0.000	0.000	0
-h2_file_tls	veil	3	27649.74	11550.72	0.000	0.000	0
-h1_file_plain	nginx	3	47738.13	19988.48	0.711	1.290	0
-h1_file_plain	veil	3	47876.13	19988.48	0.704	0.980	0
-h2c_file_plain	nginx	3	70576.18	29491.20	0.000	0.000	0
-h2c_file_plain	veil	3	50582.47	21053.44	0.000	0.000	0
-h3_file	nginx	3	3251.38	1353.82	511.370	1552.130	0
-h3_file	veil	3	2894.13	1205.06	496.910	2124.000	0
-h1_proxy_tls	nginx	3	15681.95	6558.64	4.170	6.070	0
-h1_proxy_tls	veil	3	15680.18	6557.76	4.050	5.090	0
-h2_proxy_tls	nginx	3	11487.40	4801.52	0.000	0.000	0
-h2_proxy_tls	veil	3	15073.09	6283.28	0.000	0.000	0
-l4_tcp	nginx	3	33621.54	14090.24	1.930	2.790	0
-l4_tcp	veil	3	38734.50	16220.16	1.610	2.230	0
+# FreeBSD 14.3 aarch64、run_perf_bsd.sh。mode=standard（計測対象 2 コア）/ server_bound（1 コア）、size=54KB / 3B
+mode	size	scenario	server	iter	rps	mbps	p50_ms	p99_ms	errors
+standard	54KB	h1_file_tls	nginx	1	47769.91	19988.48	1.320	1.620	0
+standard	54KB	h1_file_tls	veil	1	60523.51	25231.36	1.000	1.560	0
+standard	54KB	h2_file_tls	nginx	1	43124.74	18022.40	0.000	0.000	0
+standard	54KB	h2_file_tls	veil	1	64859.26	27033.60	0.000	0.000	0
+standard	54KB	h1_file_plain	nginx	1	96667.23	40468.48	0.348	0.505	0
+standard	54KB	h1_file_plain	veil	1	97969.70	40878.08	0.344	0.474	0
+standard	54KB	h2c_file_plain	nginx	1	109189.77	45629.44	0.000	0.000	0
+standard	54KB	h2c_file_plain	veil	1	101788.29	42434.56	0.000	0.000	0
+standard	54KB	h3_file	nginx	1	6611.62	2752.96	249.800	795.010	0
+standard	54KB	h3_file	veil	1	5985.02	2492.06	306.350	1215.390	0
+standard	54KB	h1_proxy_tls	nginx	1	27812.14	11632.64	2.220	3.160	0
+standard	54KB	h1_proxy_tls	veil	1	29749.11	12451.84	2.120	2.640	0
+standard	54KB	h2_proxy_tls	nginx	1	18497.12	7731.52	0.000	0.000	0
+standard	54KB	h2_proxy_tls	veil	1	27235.83	11386.88	0.000	0.000	0
+standard	54KB	l4_tcp	nginx	1	56388.49	23592.96	1.110	1.760	0
+standard	54KB	l4_tcp	veil	1	61410.42	25722.88	1.000	1.770	0
+standard	54KB	h1_file_tls	veil	2	42111.69	17530.88	1.540	1.760	0
+standard	54KB	h1_file_tls	nginx	2	32167.25	13434.88	1.880	2.540	0
+standard	54KB	h2_file_tls	veil	2	43214.88	18022.40	0.000	0.000	0
+standard	54KB	h2_file_tls	nginx	2	29088.25	12124.16	0.000	0.000	0
+standard	54KB	h1_file_plain	veil	2	66275.46	27688.96	0.509	0.713	0
+standard	54KB	h1_file_plain	nginx	2	64681.76	27033.60	0.525	0.779	0
+standard	54KB	h2c_file_plain	veil	2	75340.56	31375.36	0.000	0.000	0
+standard	54KB	h2c_file_plain	nginx	2	72133.73	30146.56	0.000	0.000	0
+standard	54KB	h3_file	veil	2	4175.05	1738.41	429.350	2167.010	0
+standard	54KB	h3_file	nginx	2	4669.50	1944.29	350.030	1126.510	0
+standard	54KB	h1_proxy_tls	veil	2	23636.36	9912.32	2.460	3.830	0
+standard	54KB	h1_proxy_tls	nginx	2	21082.52	8847.36	3.040	4.130	0
+standard	54KB	h2_proxy_tls	veil	2	22891.34	9502.72	0.000	0.000	0
+standard	54KB	h2_proxy_tls	nginx	2	14660.16	6127.68	0.000	0.000	0
+standard	54KB	l4_tcp	veil	2	55182.26	23101.44	1.100	1.980	0
+standard	54KB	l4_tcp	nginx	2	48917.31	20480.00	1.270	2.160	0
+standard	54KB	h1_file_tls	nginx	3	29550.35	12369.92	2.150	2.690	0
+standard	54KB	h1_file_tls	veil	3	38589.00	16138.24	1.610	1.950	0
+standard	54KB	h2_file_tls	nginx	3	28095.12	11714.56	0.000	0.000	0
+standard	54KB	h2_file_tls	veil	3	42760.95	17858.56	0.000	0.000	0
+standard	54KB	h1_file_plain	nginx	3	66993.32	28016.64	0.504	0.758	0
+standard	54KB	h1_file_plain	veil	3	66275.85	27688.96	0.508	0.708	0
+standard	54KB	h2c_file_plain	nginx	3	98689.44	41205.76	0.000	0.000	0
+standard	54KB	h2c_file_plain	veil	3	82037.87	34160.64	0.000	0.000	0
+standard	54KB	h3_file	nginx	3	4673.64	1946.02	352.690	1100.400	0
+standard	54KB	h3_file	veil	3	4350.90	1811.64	419.370	1768.020	0
+standard	54KB	h1_proxy_tls	nginx	3	20907.53	8765.44	2.770	4.660	0
+standard	54KB	h1_proxy_tls	veil	3	23122.28	9666.56	2.730	3.310	0
+standard	54KB	h2_proxy_tls	nginx	3	16650.29	6959.52	0.000	0.000	0
+standard	54KB	h2_proxy_tls	veil	3	19316.70	8052.24	0.000	0.000	0
+standard	54KB	l4_tcp	nginx	3	46722.00	19578.88	1.350	2.140	0
+standard	54KB	l4_tcp	veil	3	52339.13	21872.64	1.180	1.820	0
+standard	54KB	h1_file_tls	veil	4	39080.90	16302.08	1.660	2.010	0
+standard	54KB	h1_file_tls	nginx	4	29568.20	12369.92	2.140	2.770	0
+standard	54KB	h2_file_tls	veil	4	41260.34	17203.20	0.000	0.000	0
+standard	54KB	h2_file_tls	nginx	4	30771.33	12861.44	0.000	0.000	0
+standard	54KB	h1_file_plain	veil	4	62187.80	25968.64	0.543	0.741	0
+standard	54KB	h1_file_plain	nginx	4	63095.29	26378.24	0.536	0.798	0
+standard	54KB	h2c_file_plain	veil	4	72666.62	30310.40	0.000	0.000	0
+standard	54KB	h2c_file_plain	nginx	4	94492.56	39485.44	0.000	0.000	0
+standard	54KB	h3_file	veil	4	3986.55	1659.93	459.390	2158.690	0
+standard	54KB	h3_file	nginx	4	4175.21	1738.48	395.740	1194.950	0
+standard	54KB	h1_proxy_tls	veil	4	21298.54	8929.28	2.890	4.050	0
+standard	54KB	h1_proxy_tls	nginx	4	19611.94	8192.00	3.310	4.360	0
+standard	54KB	h2_proxy_tls	veil	4	21046.51	8765.44	0.000	0.000	0
+standard	54KB	h2_proxy_tls	nginx	4	14385.92	6013.12	0.000	0.000	0
+standard	54KB	l4_tcp	veil	4	51343.27	21463.04	1.230	1.970	0
+standard	54KB	l4_tcp	nginx	4	44615.43	18677.76	1.410	2.350	0
+standard	3B	h1_file_tls	nginx	1	307576.81	556.16	0.202	0.312	0
+standard	3B	h1_file_tls	veil	1	268796.43	229.68	0.225	0.324	0
+standard	3B	h2_file_tls	nginx	1	457916.41	436.80	0.000	0.000	0
+standard	3B	h2_file_tls	veil	1	646598.54	158.08	0.000	0.000	0
+standard	3B	h1_file_plain	nginx	1	378526.28	684.40	0.145	0.354	0
+standard	3B	h1_file_plain	veil	1	377553.67	322.64	0.149	0.374	0
+standard	3B	h2c_file_plain	nginx	1	245980.24	234.64	0.000	0.000	0
+standard	3B	h2c_file_plain	veil	1	758298.33	185.36	0.000	0.000	0
+standard	3B	h3_file	nginx	1	160077.60	3.66	11.860	19.130	0
+standard	3B	h3_file	veil	1	160832.51	3.68	12.620	19.910	0
+standard	3B	h1_proxy_tls	nginx	1	145232.05	262.64	0.323	18.390	0
+standard	3B	h1_proxy_tls	veil	1	153618.79	277.76	0.385	0.672	0
+standard	3B	h2_proxy_tls	nginx	1	77619.13	79.92	0.000	0.000	0
+standard	3B	h2_proxy_tls	veil	1	94381.08	27.44	0.000	0.000	0
+standard	3B	l4_tcp	nginx	1	223204.01	403.60	0.239	0.694	0
+standard	3B	l4_tcp	veil	1	201948.96	365.12	0.273	0.598	0
+standard	3B	h1_file_tls	veil	2	267332.94	228.40	0.219	0.372	0
+standard	3B	h1_file_tls	nginx	2	272776.29	493.20	0.226	0.344	0
+standard	3B	h2_file_tls	veil	2	466889.17	114.16	0.000	0.000	0
+standard	3B	h2_file_tls	nginx	2	429828.77	410.00	0.000	0.000	0
+standard	3B	h1_file_plain	veil	2	377875.64	322.88	0.148	0.371	0
+standard	3B	h1_file_plain	nginx	2	329900.78	596.48	0.165	0.414	0
+standard	3B	h2c_file_plain	veil	2	535943.83	130.96	0.000	0.000	0
+standard	3B	h2c_file_plain	nginx	2	305833.78	291.76	0.000	0.000	0
+standard	3B	h3_file	veil	2	164004.80	3.75	12.860	21.200	0
+standard	3B	h3_file	nginx	2	162349.72	3.72	11.520	19.830	0
+standard	3B	h1_proxy_tls	veil	2	143552.93	259.60	0.333	0.842	0
+standard	3B	h1_proxy_tls	nginx	2	170496.50	308.32	0.343	0.699	0
+standard	3B	h2_proxy_tls	veil	2	147796.28	42.96	0.000	0.000	0
+standard	3B	h2_proxy_tls	nginx	2	86973.89	89.60	0.000	0.000	0
+standard	3B	l4_tcp	veil	2	210037.83	379.76	0.262	0.605	0
+standard	3B	l4_tcp	nginx	2	219308.92	396.56	0.249	0.608	0
+standard	3B	h1_file_tls	nginx	3	264075.17	477.52	0.229	0.323	0
+standard	3B	h1_file_tls	veil	3	260229.95	222.40	0.234	0.394	0
+standard	3B	h2_file_tls	nginx	3	452844.07	431.92	0.000	0.000	0
+standard	3B	h2_file_tls	veil	3	630209.69	154.08	0.000	0.000	0
+standard	3B	h1_file_plain	nginx	3	358319.02	647.92	0.154	0.364	0
+standard	3B	h1_file_plain	veil	3	365617.68	312.40	0.152	0.383	0
+standard	3B	h2c_file_plain	nginx	3	345757.18	329.84	0.000	0.000	0
+standard	3B	h2c_file_plain	veil	3	732705.57	179.12	0.000	0.000	0
+standard	3B	h3_file	nginx	3	153389.40	3.51	12.990	24.640	0
+standard	3B	h3_file	veil	3	157036.62	3.59	12.860	19.900	0
+standard	3B	h1_proxy_tls	nginx	3	140876.98	254.72	0.326	17.140	0
+standard	3B	h1_proxy_tls	veil	3	151787.41	274.48	0.367	0.737	0
+standard	3B	h2_proxy_tls	nginx	3	88057.60	90.72	0.000	0.000	0
+standard	3B	h2_proxy_tls	veil	3	185639.08	53.92	0.000	0.000	0
+standard	3B	l4_tcp	nginx	3	211693.29	382.80	0.251	1.660	0
+standard	3B	l4_tcp	veil	3	201147.21	363.68	0.274	0.598	0
+standard	3B	h1_file_tls	veil	4	261520.79	223.44	0.231	0.370	0
+standard	3B	h1_file_tls	nginx	4	266856.54	482.56	0.231	0.353	0
+standard	3B	h2_file_tls	veil	4	509523.71	124.56	0.000	0.000	0
+standard	3B	h2_file_tls	nginx	4	462422.73	441.12	0.000	0.000	0
+standard	3B	h1_file_plain	veil	4	369466.02	315.68	0.152	0.382	0
+standard	3B	h1_file_plain	nginx	4	341913.90	618.24	0.162	0.376	0
+standard	3B	h2c_file_plain	veil	4	528707.15	129.20	0.000	0.000	0
+standard	3B	h2c_file_plain	nginx	4	300964.73	287.04	0.000	0.000	0
+standard	3B	h3_file	veil	4	161240.06	3.69	12.970	21.790	0
+standard	3B	h3_file	nginx	4	145074.28	3.32	13.200	25.510	0
+standard	3B	h1_proxy_tls	veil	4	131474.00	237.76	0.363	0.930	0
+standard	3B	h1_proxy_tls	nginx	4	166737.74	301.52	0.350	0.794	0
+standard	3B	h2_proxy_tls	veil	4	152726.95	44.40	0.000	0.000	0
+standard	3B	h2_proxy_tls	nginx	4	49815.20	51.28	0.000	0.000	0
+standard	3B	l4_tcp	veil	4	206764.19	373.84	0.260	0.650	0
+standard	3B	l4_tcp	nginx	4	199009.51	359.84	0.274	0.831	0
+server_bound	54KB	h1_file_tls	nginx	1	16124.34	6743.60	4.130	4.840	0
+server_bound	54KB	h1_file_tls	veil	1	19051.67	7946.24	3.290	3.620	0
+server_bound	54KB	h2_file_tls	nginx	1	16365.12	6836.88	0.000	0.000	0
+server_bound	54KB	h2_file_tls	veil	1	26210.36	10895.36	0.000	0.000	0
+server_bound	54KB	h1_file_plain	nginx	1	82372.58	34488.32	0.426	0.683	0
+server_bound	54KB	h1_file_plain	veil	1	79630.81	33259.52	0.425	0.792	0
+server_bound	54KB	h2c_file_plain	nginx	1	84126.34	35143.68	0.000	0.000	0
+server_bound	54KB	h2c_file_plain	veil	1	86832.53	36208.64	0.000	0.000	0
+server_bound	54KB	h3_file	nginx	1	5571.75	2319.97	303.440	908.610	0
+server_bound	54KB	h3_file	veil	1	5671.31	2361.43	309.180	1595.690	0
+server_bound	54KB	h1_proxy_tls	nginx	1	11899.23	4976.56	5.320	6.050	0
+server_bound	54KB	h1_proxy_tls	veil	1	12769.98	5340.72	5.060	5.270	0
+server_bound	54KB	h2_proxy_tls	nginx	1	9385.08	3922.80	0.000	0.000	0
+server_bound	54KB	h2_proxy_tls	veil	1	13938.84	5810.48	0.000	0.000	0
+server_bound	54KB	l4_tcp	nginx	1	24829.74	10403.84	2.630	3.100	0
+server_bound	54KB	l4_tcp	veil	1	27219.79	11386.88	2.330	2.560	0
+server_bound	54KB	h1_file_tls	veil	2	21318.31	8929.28	3.070	3.540	0
+server_bound	54KB	h1_file_tls	nginx	2	16121.92	6742.56	4.070	4.430	0
+server_bound	54KB	h2_file_tls	veil	2	26911.99	11223.04	0.000	0.000	0
+server_bound	54KB	h2_file_tls	nginx	2	17654.23	7375.44	0.000	0.000	0
+server_bound	54KB	h1_file_plain	veil	2	80696.87	33669.12	0.422	0.787	0
+server_bound	54KB	h1_file_plain	nginx	2	84788.64	35471.36	0.416	0.664	0
+server_bound	54KB	h2c_file_plain	veil	2	86146.79	35880.96	0.000	0.000	0
+server_bound	54KB	h2c_file_plain	nginx	2	86212.88	36044.80	0.000	0.000	0
+server_bound	54KB	h3_file	veil	2	5581.05	2323.85	316.300	1413.630	0
+server_bound	54KB	h3_file	nginx	2	5640.79	2348.72	297.500	898.690	0
+server_bound	54KB	h1_proxy_tls	veil	2	12825.90	5364.08	5.000	5.270	0
+server_bound	54KB	h1_proxy_tls	nginx	2	11951.89	4998.56	5.310	6.060	0
+server_bound	54KB	h2_proxy_tls	veil	2	13963.65	5820.80	0.000	0.000	0
+server_bound	54KB	h2_proxy_tls	nginx	2	9281.05	3879.36	0.000	0.000	0
+server_bound	54KB	l4_tcp	veil	2	27546.45	11550.72	2.300	2.610	0
+server_bound	54KB	l4_tcp	nginx	2	24806.79	10403.84	2.640	3.110	0
+server_bound	54KB	h1_file_tls	nginx	3	16343.71	6835.36	3.770	4.360	0
+server_bound	54KB	h1_file_tls	veil	3	18777.73	7864.32	3.430	4.170	0
+server_bound	54KB	h2_file_tls	nginx	3	16956.63	7084.00	0.000	0.000	0
+server_bound	54KB	h2_file_tls	veil	3	25339.85	10567.68	0.000	0.000	0
+server_bound	54KB	h1_file_plain	nginx	3	84554.66	35389.44	0.416	0.646	0
+server_bound	54KB	h1_file_plain	veil	3	80973.09	33751.04	0.419	0.767	0
+server_bound	54KB	h2c_file_plain	nginx	3	85435.34	35717.12	0.000	0.000	0
+server_bound	54KB	h2c_file_plain	veil	3	89865.36	37437.44	0.000	0.000	0
+server_bound	54KB	h3_file	nginx	3	5596.92	2330.46	301.260	876.760	0
+server_bound	54KB	h3_file	veil	3	5749.81	2394.12	302.200	1172.270	0
+server_bound	54KB	h1_proxy_tls	nginx	3	11890.34	4972.88	5.320	6.040	0
+server_bound	54KB	h1_proxy_tls	veil	3	12816.75	5360.24	5.040	5.280	0
+server_bound	54KB	h2_proxy_tls	nginx	3	9363.43	3913.76	0.000	0.000	0
+server_bound	54KB	h2_proxy_tls	veil	3	13947.59	5814.16	0.000	0.000	0
+server_bound	54KB	l4_tcp	nginx	3	24781.70	10403.84	2.640	3.100	0
+server_bound	54KB	l4_tcp	veil	3	27554.13	11550.72	2.300	2.530	0
+server_bound	54KB	h1_file_tls	veil	4	21038.00	8765.44	3.090	3.580	0
+server_bound	54KB	h1_file_tls	nginx	4	16130.58	6746.16	3.990	4.460	0
+server_bound	54KB	h2_file_tls	veil	4	27177.19	11304.96	0.000	0.000	0
+server_bound	54KB	h2_file_tls	nginx	4	17990.24	7515.76	0.000	0.000	0
+server_bound	54KB	h1_file_plain	veil	4	81741.81	34078.72	0.418	0.776	0
+server_bound	54KB	h1_file_plain	nginx	4	86641.01	36208.64	0.405	0.642	0
+server_bound	54KB	h2c_file_plain	veil	4	85720.85	35717.12	0.000	0.000	0
+server_bound	54KB	h2c_file_plain	nginx	4	85869.27	35880.96	0.000	0.000	0
+server_bound	54KB	h3_file	veil	4	5768.98	2402.10	308.310	1357.270	0
+server_bound	54KB	h3_file	nginx	4	5801.03	2415.44	291.840	876.850	0
+server_bound	54KB	h1_proxy_tls	veil	4	12995.28	5434.88	4.750	5.240	0
+server_bound	54KB	h1_proxy_tls	nginx	4	12157.11	5084.40	5.270	6.020	0
+server_bound	54KB	h2_proxy_tls	veil	4	14147.98	5897.68	0.000	0.000	0
+server_bound	54KB	h2_proxy_tls	nginx	4	9431.96	3942.40	0.000	0.000	0
+server_bound	54KB	l4_tcp	veil	4	27418.66	11468.80	2.320	2.520	0
+server_bound	54KB	l4_tcp	nginx	4	24888.68	10403.84	2.630	3.100	0
+server_bound	3B	h1_file_tls	nginx	1	188351.60	340.56	0.335	0.481	0
+server_bound	3B	h1_file_tls	veil	1	174429.80	149.04	0.345	0.498	0
+server_bound	3B	h2_file_tls	nginx	1	312259.10	297.84	0.000	0.000	0
+server_bound	3B	h2_file_tls	veil	1	392159.27	95.84	0.000	0.000	0
+server_bound	3B	h1_file_plain	nginx	1	264564.93	478.40	0.233	0.342	0
+server_bound	3B	h1_file_plain	veil	1	288267.28	246.32	0.206	0.309	0
+server_bound	3B	h2c_file_plain	nginx	1	296668.51	282.96	0.000	0.000	0
+server_bound	3B	h2c_file_plain	veil	1	420910.02	102.88	0.000	0.000	0
+server_bound	3B	h3_file	nginx	1	202284.26	4.63	3.920	97.960	0
+server_bound	3B	h3_file	veil	1	190415.26	4.36	10.930	13.240	0
+server_bound	3B	h1_proxy_tls	nginx	1	103240.63	186.64	0.614	0.834	0
+server_bound	3B	h1_proxy_tls	veil	1	102304.11	184.96	0.600	0.788	0
+server_bound	3B	h2_proxy_tls	nginx	1	62738.36	64.64	0.000	0.000	0
+server_bound	3B	h2_proxy_tls	veil	1	71362.35	20.72	0.000	0.000	0
+server_bound	3B	l4_tcp	nginx	1	243401.67	440.08	0.257	0.443	0
+server_bound	3B	l4_tcp	veil	1	203393.05	367.76	0.289	0.460	0
+server_bound	3B	h1_file_tls	veil	2	181319.13	154.96	0.344	0.486	0
+server_bound	3B	h1_file_tls	nginx	2	169950.48	307.28	0.367	0.515	0
+server_bound	3B	h2_file_tls	veil	2	351469.72	85.92	0.000	0.000	0
+server_bound	3B	h2_file_tls	nginx	2	309542.12	295.28	0.000	0.000	0
+server_bound	3B	h1_file_plain	veil	2	299635.12	256.00	0.202	0.309	0
+server_bound	3B	h1_file_plain	nginx	2	257916.30	466.32	0.238	0.349	0
+server_bound	3B	h2c_file_plain	veil	2	372136.29	90.96	0.000	0.000	0
+server_bound	3B	h2c_file_plain	nginx	2	300583.79	286.72	0.000	0.000	0
+server_bound	3B	h3_file	veil	2	194454.90	4.45	11.060	13.640	0
+server_bound	3B	h3_file	nginx	2	109824.51	2.51	3.940	97.720	0
+server_bound	3B	h1_proxy_tls	veil	2	139274.92	251.84	0.376	0.790	0
+server_bound	3B	h1_proxy_tls	nginx	2	105416.99	190.64	0.600	0.813	0
+server_bound	3B	h2_proxy_tls	veil	2	108388.69	31.52	0.000	0.000	0
+server_bound	3B	h2_proxy_tls	nginx	2	65135.67	67.12	0.000	0.000	0
+server_bound	3B	l4_tcp	veil	2	219272.87	396.48	0.277	0.436	0
+server_bound	3B	l4_tcp	nginx	2	214216.44	387.36	0.275	0.495	0
+server_bound	3B	h1_file_tls	nginx	3	158382.52	286.40	0.382	0.529	0
+server_bound	3B	h1_file_tls	veil	3	172195.50	147.12	0.350	0.482	0
+server_bound	3B	h2_file_tls	nginx	3	311342.35	296.96	0.000	0.000	0
+server_bound	3B	h2_file_tls	veil	3	388123.42	94.88	0.000	0.000	0
+server_bound	3B	h1_file_plain	nginx	3	259552.05	469.28	0.240	0.351	0
+server_bound	3B	h1_file_plain	veil	3	282663.10	241.52	0.210	0.314	0
+server_bound	3B	h2c_file_plain	nginx	3	298744.34	284.96	0.000	0.000	0
+server_bound	3B	h2c_file_plain	veil	3	427866.12	104.56	0.000	0.000	0
+server_bound	3B	h3_file	nginx	3	192240.17	4.40	4.150	99.720	0
+server_bound	3B	h3_file	veil	3	187749.05	4.30	11.070	13.350	0
+server_bound	3B	h1_proxy_tls	nginx	3	102754.89	185.76	0.617	0.836	0
+server_bound	3B	h1_proxy_tls	veil	3	103720.59	187.52	0.592	0.778	0
+server_bound	3B	h2_proxy_tls	nginx	3	64664.03	66.64	0.000	0.000	0
+server_bound	3B	h2_proxy_tls	veil	3	68434.45	19.92	0.000	0.000	0
+server_bound	3B	l4_tcp	nginx	3	225480.64	407.68	0.271	0.506	0
+server_bound	3B	l4_tcp	veil	3	207598.36	375.36	0.284	0.453	0
+server_bound	3B	h1_file_tls	veil	4	183341.63	156.64	0.340	0.480	0
+server_bound	3B	h1_file_tls	nginx	4	171455.04	310.00	0.364	0.508	0
+server_bound	3B	h2_file_tls	veil	4	349408.87	85.44	0.000	0.000	0
+server_bound	3B	h2_file_tls	nginx	4	312099.97	297.68	0.000	0.000	0
+server_bound	3B	h1_file_plain	veil	4	302501.45	258.48	0.200	0.309	0
+server_bound	3B	h1_file_plain	nginx	4	260736.09	471.44	0.236	0.345	0
+server_bound	3B	h2c_file_plain	veil	4	377472.00	92.24	0.000	0.000	0
+server_bound	3B	h2c_file_plain	nginx	4	300934.31	287.04	0.000	0.000	0
+server_bound	3B	h3_file	veil	4	197699.25	4.52	10.850	13.290	0
+server_bound	3B	h3_file	nginx	4	194299.04	4.45	3.940	97.980	0
+server_bound	3B	h1_proxy_tls	veil	4	106026.09	191.68	0.580	0.765	0
+server_bound	3B	h1_proxy_tls	nginx	4	104167.19	188.32	0.609	0.818	0
+server_bound	3B	h2_proxy_tls	veil	4	109537.27	31.84	0.000	0.000	0
+server_bound	3B	h2_proxy_tls	nginx	4	63124.77	65.04	0.000	0.000	0
+server_bound	3B	l4_tcp	veil	4	222613.62	402.56	0.274	0.440	0
+server_bound	3B	l4_tcp	nginx	4	226802.61	410.08	0.266	0.467	0
