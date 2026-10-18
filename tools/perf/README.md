@@ -133,7 +133,7 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `H2_ARGS` | `-t4 -n 30000 -c100 -m10` | HTTP/2（h2load）: 4 スレッド・30000 リクエスト・100 接続・多重化 10 |
 | `H3_ARGS` | `--alpn-list=h3 -t4 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・4 スレッド・30000 リクエスト・100 接続・多重化 10。v0.8.0 までは 1 スレッドで、h2load 自体が律速だった（veil・nginx とも 4 コア中 1.5〜1.7 コアしか使っていなかった） |
 | `H2C_PORT` | `8080` | h2c（平文 HTTP/2 prior knowledge）: veil の `listen_cleartext` / nginx の `listen 8080 http2` のポート |
-| `H2C_ARGS` | `$H2_ARGS`（既定 `-t4 -n 30000 -c100 -m10`） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
+| `H2C_ARGS` | `-t4 -n 120000 -c100 -m10`（v0.8.0。3 万要求だと 1 秒で終わり ±10% ぶれる） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
 | `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |

@@ -25,7 +25,9 @@ WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
 H2_ARGS="${H2_ARGS:--t4 -n 30000 -c100 -m10}"
 H3_ARGS="${H3_ARGS:---alpn-list=h3 -t4 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
 H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: listen_cleartext / nginx: listen 8080 http2）
-H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
+# h2c は速い（3B で 3 万 req/s 前後）ので、HTTP/2 と同じ 3 万要求だと 1 秒で終わり、立ち上がりと末尾の揺れで
+# ±10% ぶれる（v0.8.0 の交互 A/B で同じイメージが 27k〜31.5k）。4 倍の要求数で 4 秒前後にする。
+H2C_ARGS="${H2C_ARGS:--t4 -n 120000 -c100 -m10}"   # h2c 負荷
 
 # 計測クライアント 1 回あたりの上限時間（秒）。**サーバ側のハングでスイート全体が
 # 止まらないための安全弁**（B-75: epoll + kTLS のハングで h2load が 36 分間ぶら下がり、

@@ -73,10 +73,12 @@ log "aarch64 VM を起動して SSH 到達を待つ（TCG では非常に時間�
 # 3) 転送 + ツールチェーン
 log "VM へリポジトリを転送"
 "${VM}" ssh "rm -rf ${GUEST_ROOT} && mkdir -p ${GUEST_ROOT}"
+# crates/（veil-macros 等のワークスペースのメンバー）と proto/ も送る。fuzz/ は送らないのでメンバーから外す
+# （以前は crates/ を送らず、ワークスペースを読めずに cargo が止まっていた。v0.8.0）。
 (cd "${ROOT}" && tar czf - \
-    src benches tests examples contrib docker/assets third_party \
+    src benches tests examples contrib docker/assets third_party crates proto \
     Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
-  | "${VM}" ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
+  | "${VM}" ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i 's|\"fuzz\", ||' Cargo.toml"
 
 SKIP_ENV="VEIL_E2E_SKIP_VEIL_BUILD=1"
 if [[ "${NATIVE_BUILD}" == "1" ]]; then
@@ -90,7 +92,7 @@ fi
 
 log "VM 内の Rust ツールチェーン / E2E 依存を用意"
 # Ubuntu の apt 版 rustc は古く本クレートをビルドできないため rustup の stable を使う
-"${VM}" ssh 'set -e; if ! command -v cmake >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1; then sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev cmake nasm curl openssl protobuf-compiler clang libclang-dev python3 >/dev/null; fi; [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'
+"${VM}" ssh 'set -e; if ! command -v cmake >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1; then sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev cmake nasm curl openssl protobuf-compiler clang libclang-dev python3 python3-venv python3-pip >/dev/null; fi; dpkg -s python3-venv >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip >/dev/null; [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'
 
 # 4) E2E 実行
 log "VM 内で tests/e2e_setup.sh test を実行（features=${CARGO_FEATURES}）"
