@@ -474,6 +474,17 @@ wait_port() {
     return 1
 }
 
+# 実際に HTTP の応答が返るまで待つ。ポートの LISTEN（wait_port）だけでは、起動直後の veil へ h2load を
+# 当てたときに全要求がすぐ失敗して 0 rps になることがあった（v0.8.0、h2_file_tls 54KB の 1 回）。
+wait_http() {
+    u="$1"; n=0
+    while [ $n -lt 50 ]; do
+        if curl -sk -o /dev/null -m 2 "$u" 2>/dev/null; then return 0; fi
+        sleep 0.2; n=$((n+1))
+    done
+    return 1
+}
+
 wait_udp_port() {
     p="$1"; n=0
     while [ $n -lt 100 ]; do
@@ -642,6 +653,10 @@ measure_veil_side() {
       l4_tcp)                       wait_port "${VEIL_L4}"    || die "veil(l4) 起動失敗" ;;
       h3_file)                      wait_udp_port "${VEIL_HTTPS}" || die "veil(h3) 起動失敗" ;;
       *)                            wait_port "${VEIL_HTTPS}" || die "veil(https) 起動失敗" ;;
+    esac
+    case "$sc" in
+      h3_file) ;;  # curl は HTTP/3 を話せない（pkg の curl）
+      *) wait_http "$v_url" || log "警告: veil が ${v_url} に応答しない（そのまま計測する）" ;;
     esac
     r=$(measure "$tool" "$v_url")
     printf '%s\t%s\t%s\t%s\n' "$sc" veil "$iter" "$r" >> "${OUT_TSV}"
