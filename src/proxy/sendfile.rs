@@ -366,7 +366,9 @@ pub(super) async fn handle_sendfile(
             // ただしヘッダー + 本文が小さい応答（1 回の sendfile でまとめて送り切れる
             // サイズ）では早期送出の抑制に意味が無く、setsockopt 2 回（ON/OFF）が丸ごと
             // 無駄になる（FreeBSD の DTrace 実測で 2 syscall/req、プロファイル上位）。
-            const NOPUSH_MIN_BYTES: u64 = 16 * 1024;
+            // v0.8.0 で 16KB → 128KB: ヘッダ + 本文を sf_hdtr 付きの sendfile(2) 1 回で出すので、1 回で送り切れる
+            // 大きさ（54KB 等）では早期送出の抑制が要らない（FreeBSD aarch64 の h1_file_plain 54KB で +1〜1.5%）。
+            const NOPUSH_MIN_BYTES: u64 = 128 * 1024;
             let nopush = if transfer_length + header_buf.len() as u64 > NOPUSH_MIN_BYTES {
                 tls_stream.get_ref().nopush_guard()
             } else {
