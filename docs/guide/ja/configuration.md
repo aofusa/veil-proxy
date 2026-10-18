@@ -74,7 +74,7 @@
 | `[http3]` | `initial_max_stream_data_uni` | `1000000` | ストリームデータ単方向（1MB） |
 | `[http3]` | `initial_max_streams_bidi` | `100` | 最大双方向ストリーム数 |
 | `[http3]` | `initial_max_streams_uni` | `100` | 最大単方向ストリーム数 |
-| `[http3]` | `cc_algorithm` | `"bbr"` | QUIC 輻輳制御（`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`） |
+| `[http3]` | `cc_algorithm` | `"cubic"` | QUIC 輻輳制御（`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`）。v0.8.0 より前の既定は `"bbr"`。veil は quiche の pacing の送出時刻まで待たずに送るので、BBR は送出が一気になって受け手で捨てられ再送が増えていた（CUBIC で HTTP/3 の 54KB が FreeBSD +8〜20%・Linux +4〜6%） |
 | `[http3]` | `pacing` | `true` | Packet Pacing を有効化 |
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |

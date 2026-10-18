@@ -466,10 +466,10 @@ fn configure_quic_transport(
     let cc_name = config.cc_algorithm.trim();
     if let Err(e) = quic_config.set_cc_algorithm_name(cc_name) {
         warn!(
-            "[HTTP/3] unknown cc_algorithm '{}': {}; falling back to bbr",
+            "[HTTP/3] unknown cc_algorithm '{}': {}; falling back to cubic",
             cc_name, e
         );
-        let _ = quic_config.set_cc_algorithm_name("bbr");
+        let _ = quic_config.set_cc_algorithm_name("cubic");
     }
     quic_config.enable_pacing(config.pacing);
     if let Some(rate) = config.max_pacing_rate {
@@ -605,7 +605,7 @@ pub struct Http3ServerConfig {
     pub initial_max_streams_uni: u64,
     /// GSO/GRO を有効化するかどうか（デフォルト: false）
     pub gso_gro_enabled: bool,
-    /// QUIC 輻輳制御アルゴリズム名（quiche `set_cc_algorithm_name`）。デフォルト: `"bbr"`
+    /// QUIC 輻輳制御アルゴリズム名（quiche `set_cc_algorithm_name`）。デフォルト: `"cubic"`（v0.8.0）
     pub cc_algorithm: String,
     /// Packet Pacing を有効にするか（quiche `enable_pacing`）。デフォルト: true
     pub pacing: bool,
@@ -636,7 +636,7 @@ impl Default for Http3ServerConfig {
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
             gso_gro_enabled: false,
-            cc_algorithm: "bbr".to_string(),
+            cc_algorithm: "cubic".to_string(),
             pacing: true,
             max_pacing_rate: None,
             hystart: true,

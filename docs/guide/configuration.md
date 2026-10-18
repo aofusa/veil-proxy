@@ -76,7 +76,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `initial_max_stream_data_uni` | `1000000` | Stream data uni (1MB) |
 | `[http3]` | `initial_max_streams_bidi` | `100` | Max bidirectional streams |
 | `[http3]` | `initial_max_streams_uni` | `100` | Max unidirectional streams |
-| `[http3]` | `cc_algorithm` | `"bbr"` | QUIC congestion control (`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`) |
+| `[http3]` | `cc_algorithm` | `"cubic"` | QUIC congestion control (`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`). The default was `"bbr"` before v0.8.0; veil does not hold packets until quiche's pacing time, so unpaced BBR bursts were dropped at the receiver and retransmitted (cubic: FreeBSD HTTP/3 54KB +8–20%, Linux +4–6%) |
 | `[http3]` | `pacing` | `true` | Enable packet pacing |
 | `[http3]` | `max_pacing_rate` | *(none)* | Max pacing rate (bytes/s); omit for unlimited |
 | `[http3]` | `hystart` | `true` | Enable HyStart++ |

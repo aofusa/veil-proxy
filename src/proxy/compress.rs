@@ -1007,10 +1007,10 @@ mod response_head_tests {
             ..Default::default()
         };
         let raw =
-            b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\nx-powered-by: php\r\nX-Bin: \xff\x01\r\n\r\n";
+            b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\nx-powered-by: php\r\nX-Bin: \xff\xfe\r\n\r\n";
         let out = render_response_head(raw, 200, &sec);
         let want: &[u8] =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Bin: \xff\x01\r\nX-Frame-Options: DENY\r\n\r\n";
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Bin: \xff\xfe\r\nX-Frame-Options: DENY\r\n\r\n";
         if get_alt_svc_guard().is_none() {
             assert_eq!(out, want);
         }

@@ -1065,10 +1065,12 @@ pub struct Http3ConfigSection {
     /// 受け付ける値（大小無視）:
     /// - `"reno"` / `"cubic"` / `"bbr"` / `"bbr2"` / `"bbr2_gcongestion"`
     ///
-    /// リバースプロキシの短時間バーストでは CUBIC のスロースタートが RPS を抑えやすいため、
-    /// 既定は `"bbr"`。未知の値は起動時に警告して `"bbr"` にフォールバックする。
+    /// 既定は `"cubic"`（v0.8.0 で `"bbr"` から変更）。veil は quiche の pacing の送出時刻を守らずに送るので、
+    /// BBR は送出が一気になり、受け手のソケットのバッファで捨てられて再送が増えていた（FreeBSD のループバックで
+    /// 6 秒に 70 万パケットの破棄、54KB の応答 1 つに 61 パケット。CUBIC は 46）。CUBIC で HTTP/3 は FreeBSD の
+    /// 54KB が +8〜20%、Linux の Docker が静的 +5.6%・中継 +4.1%。未知の値は起動時に警告して `"cubic"` にする。
     ///
-    /// デフォルト: `"bbr"`
+    /// デフォルト: `"cubic"`
     #[serde(default = "default_h3_cc_algorithm")]
     pub cc_algorithm: String,
 
@@ -1161,7 +1163,7 @@ fn default_h3_alt_svc_ma() -> u64 {
     86400
 }
 fn default_h3_cc_algorithm() -> String {
-    "bbr".to_string()
+    "cubic".to_string()
 }
 fn default_h3_mmsg_batch_size() -> usize {
     64

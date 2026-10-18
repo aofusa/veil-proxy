@@ -1251,9 +1251,10 @@ revalidate_mtime = false
 # ------------------------------------------
 # QUIC 輻輳制御アルゴリズム（quiche set_cc_algorithm_name）
 # 受け付ける値: "reno" | "cubic" | "bbr" | "bbr2" | "bbr2_gcongestion"
-# リバースプロキシの短時間バーストでは BBR が RPS に効きやすい。
-# デフォルト: "bbr"
-# cc_algorithm = "bbr"
+# v0.8.0 で既定を "bbr" から "cubic" に変えた（veil は pacing の送出時刻を守らずに送るため、BBR は
+# 送出が一気になって受け手で捨てられ再送が増えた。CUBIC で HTTP/3 の 54KB が FreeBSD +8〜20%・Linux +4〜6%）。
+# デフォルト: "cubic"
+# cc_algorithm = "cubic"
 
 # Packet Pacing（quiche enable_pacing）。パケットロス抑制。
 # デフォルト: true

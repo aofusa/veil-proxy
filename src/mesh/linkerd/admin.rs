@@ -158,9 +158,10 @@ impl H2Service for AdminH2 {
             .headers
             .iter()
             .any(|h| h.name.eq_ignore_ascii_case(b"l5d-orig-proto"));
+        let peer = self.peer;
         crate::runtime::spawn(async move {
             let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-            let (status, ctype, body) = route(&method, path, query, self.peer);
+            let (status, ctype, body) = route(&method, path, query, peer);
             let mut headers = vec![
                 (
                     Bytes::from_static(b"content-type"),
