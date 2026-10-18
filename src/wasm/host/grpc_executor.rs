@@ -953,9 +953,9 @@ fn wait_sockets(entries: &[(RawFd, bool)], timeout_ms: i32) {
     let mut fds: Vec<WSAPOLLFD> = entries
         .iter()
         .map(|(fd, want_write)| {
-            let mut events: i16 = POLLRDNORM as i16;
+            let mut events: i16 = POLLRDNORM;
             if *want_write {
-                events |= POLLWRNORM as i16;
+                events |= POLLWRNORM;
             }
             WSAPOLLFD {
                 fd: win::to_socket(*fd),

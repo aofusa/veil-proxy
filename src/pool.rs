@@ -363,7 +363,7 @@ fn peek_pooled_peer(fd: crate::runtime::handle::RawFd) -> PooledPeerState {
             crate::runtime::handle::win::to_socket(fd),
             &mut b,
             1,
-            MSG_PEEK as i32,
+            MSG_PEEK,
         )
     };
     if r == 0 {

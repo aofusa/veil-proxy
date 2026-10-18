@@ -435,11 +435,11 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
                     };
                     let mut pfd = WSAPOLLFD {
                         fd: win::to_socket(self.read_fd),
-                        events: POLLRDNORM as i16,
+                        events: POLLRDNORM,
                         revents: 0,
                     };
                     let ret = unsafe { WSAPoll(&mut pfd, 1, 0) };
-                    ret > 0 && pfd.revents & ((POLLRDNORM | POLLERR | POLLHUP) as i16) != 0
+                    ret > 0 && pfd.revents & (POLLRDNORM | POLLERR | POLLHUP) != 0
                 };
                 if now_readable {
                     let drained = drain_notify(self.read_fd);

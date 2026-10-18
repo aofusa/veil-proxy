@@ -226,7 +226,7 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
 fn new_nonblocking_dgram_socket(domain: i32) -> io::Result<RawFd> {
     ensure_wsa_started();
     // SAFETY: socket は整数引数のみを取り、失敗は直後に INVALID_SOCKET で検査する。
-    let sock = unsafe { ws_socket(domain, SOCK_DGRAM as i32, IPPROTO_UDP as i32) };
+    let sock = unsafe { ws_socket(domain, SOCK_DGRAM, IPPROTO_UDP) };
     if sock == INVALID_SOCKET {
         return Err(last_wsa_error());
     }
