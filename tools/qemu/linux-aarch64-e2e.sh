@@ -74,9 +74,10 @@ log "aarch64 VM を起動して SSH 到達を待つ（TCG では非常に時間�
 log "VM へリポジトリを転送"
 "${VM}" ssh "rm -rf ${GUEST_ROOT} && mkdir -p ${GUEST_ROOT}"
 # crates/（veil-macros 等のワークスペースのメンバー）と proto/ も送る。fuzz/ は送らないのでメンバーから外す
-# （以前は crates/ を送らず、ワークスペースを読めずに cargo が止まっていた。v0.8.0）。
-(cd "${ROOT}" && tar czf - \
-    src benches tests examples contrib docker/assets third_party crates proto \
+# （以前は crates/ を送らず、ワークスペースを読めずに cargo が止まっていた。v0.8.0）。tools/vds/ は
+# standalone_e2e の VDS の試験が使う参照制御プレーン（Python・Rust）。
+(cd "${ROOT}" && tar czf - --exclude=tools/vds/server/target \
+    src benches tests examples contrib docker/assets third_party crates proto tools/vds \
     Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
   | "${VM}" ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i 's|\"fuzz\", ||' Cargo.toml"
 
