@@ -569,9 +569,11 @@ pub async fn run_http3_server_async(
                 };
 
                 // F-151: タイマーヒープから期限到来分だけ pop して on_timeout する。
+                // この周回の「今」（タイマーの満了と、受信した束の処理に使う）
+                let now = Instant::now();
                 {
                     let mut conns = connections.borrow_mut();
-                    expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, Instant::now());
+                    expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, now);
                     drain_wake_queue(&wake_queue, &mut conns, &mut dirty_queue);
                 }
 
@@ -605,6 +607,7 @@ pub async fn run_http3_server_async(
                                             &backend_spawner,
                                             &wake_queue,
                                             &mut dirty_queue,
+                                            now,
                                         )?;
                                     }
                                     Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
@@ -650,9 +653,11 @@ pub async fn run_http3_server_async(
                 _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
             };
 
+            // この周回の「今」（タイマーの満了と、最初に受信したデータグラムの処理に使う）
+            let now = Instant::now();
             {
                 let mut conns = connections.borrow_mut();
-                expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, Instant::now());
+                expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, now);
                 drain_wake_queue(&wake_queue, &mut conns, &mut dirty_queue);
             }
 
@@ -689,6 +694,7 @@ pub async fn run_http3_server_async(
                     &backend_spawner,
                     &wake_queue,
                     &mut dirty_queue,
+                    now,
                 )?;
 
                 let mut drained = 0usize;
@@ -697,6 +703,8 @@ pub async fn run_http3_server_async(
                         Ok(n) => n,
                         Err(_) => break,
                     };
+                    // recvmmsg 1 回ぶんの束の「今」
+                    let batch_now = Instant::now();
                     for i in 0..n {
                         let (len, from, gro) = match mmsg_scratch.meta(i) {
                             Ok(v) => v,
@@ -717,6 +725,7 @@ pub async fn run_http3_server_async(
                             &backend_spawner,
                             &wake_queue,
                             &mut dirty_queue,
+                            batch_now,
                         )?;
                     }
                     drained += n;

@@ -170,7 +170,9 @@ pub(super) fn expire_due_timers(
                 continue;
             }
         }
+        handler.conn.set_time_hint(Some(now));
         handler.conn.on_timeout();
+        handler.conn.set_time_hint(None);
         if handler.conn.is_closed() {
             debug!("[HTTP/3] Connection closed (timeout)");
             conns.remove(&*key);
@@ -270,6 +272,7 @@ pub(super) fn process_datagram_segments(
     backend_spawner: &crate::http3_stream::BackendSpawner,
     wake_queue: &crate::http3_stream::WakeQueue,
     dirty_queue: &mut VecDeque<ConnKey>,
+    now: Instant,
 ) -> io::Result<()> {
     let total = data.len();
     // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
@@ -375,6 +378,9 @@ pub(super) fn process_datagram_segments(
                 to: local_addr,
             };
 
+            // 受信の束の時刻（呼び出し側が束ごとに 1 回読む）を「今」として渡す。束のデータグラムはどれも
+            // 読む前にカーネルへ届いているので、1 個ずつ読み直すより早くも遅くもならない（v0.8.0）。
+            handler.conn.set_time_hint(Some(now));
             match handler.conn.recv(&mut data[start..end], recv_info) {
                 Ok(_) => {}
                 Err(e) => {
@@ -382,6 +388,7 @@ pub(super) fn process_datagram_segments(
                     // エラー時も送信処理は続行
                 }
             }
+            handler.conn.set_time_hint(None);
 
             // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
             // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
@@ -488,6 +495,9 @@ pub(super) async fn send_pending_packets(
         // 生成があればダーティのまま残す）。
         let mut sent_any = false;
 
+        // この接続のパケットはこの周回の末尾でまとめて送る（sendmmsg / GSO）ので、生成するたびに時刻を
+        // 読み直さず 1 回だけ読んで渡す（quiche は send のたびに `Instant::now()` を読んでいた。v0.8.0）。
+        handler.conn.set_time_hint(Some(Instant::now()));
         loop {
             // パケットを batch の空き領域へ直接書かせる（以前は send_buf に書いてから batch へコピーしていた。
             // 1 パケットにつき 1 回の memcpy。FreeBSD の h3_file 54KB のプロファイルで memcpy が上位。v0.8.0）
@@ -571,9 +581,12 @@ pub(super) async fn send_pending_packets(
                     sends.clear();
                     cur_batch_start = 0;
                     cur_offsets_start = 0;
+                    // 途中で送った（待った）ので、続きのパケットの「今」を読み直す
+                    handler.conn.set_time_hint(Some(Instant::now()));
                 }
             }
         }
+        handler.conn.set_time_hint(None);
 
         // 接続末尾: 構築中エントリを確定（送信は閾値到達時 or sweep 末尾）。
         finalize_send_entry(

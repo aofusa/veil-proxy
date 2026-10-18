@@ -2390,6 +2390,7 @@ mod tests {
                 &spawner,
                 &wake_queue,
                 &mut dirty,
+                Instant::now(),
             )
             .unwrap();
         }

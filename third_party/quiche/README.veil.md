@@ -60,6 +60,13 @@ incremental ストリームの末尾への並べ替え（ラウンドロビン�
 
 それ以外は無変更。
 
+### 3b. `src/lib.rs`: 呼び出し側が渡す「今」（`Connection::set_time_hint`、v0.8.0）
+
+`recv`・`send`・`timeout`・`on_timeout` は呼ばれるたびに `Instant::now()` を読む（54KB の応答 1 つで約 60 回）。
+veil は 1 回の受信の束・1 接続ぶんの送出の束で 1 回だけ時刻を読み、`set_time_hint(Some(now))` で渡してから
+呼び、終わったら `set_time_hint(None)` に戻す。`Connection` に `time_hint` を足し、上の 4 か所の
+`Instant::now()` を `self.now()`（ヒントがあればそれ、無ければ `Instant::now()`）にした。
+
 ### 4. `src/lib.rs`: 予約ビットの検査（B-100）
 
 `Connection::recv_single` で、ヘッダ保護を外した先頭バイトを `decrypt_hdr` 直後に控え、
