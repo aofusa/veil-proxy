@@ -355,8 +355,10 @@ async fn forward_direction(
     'outer: loop {
         // read(): buf の ownership を渡し、完了後に (result, buf) として返ってくる
         #[cfg(veil_poller_kqueue)]
+        let wait = wait_first;
+        #[cfg(veil_poller_kqueue)]
         let read = async {
-            if wait_first {
+            if wait {
                 if let Err(e) = src.readable_lazy().await {
                     return (Err(e), buf);
                 }
