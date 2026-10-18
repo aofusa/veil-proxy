@@ -208,6 +208,13 @@ sysctl -w net.core.netdev_max_backlog=65535
 sysctl -w kernel.io_uring_setup_flags=0
 ```
 
+### FreeBSD: h2c の静的配信のゼロコピー（F-240）
+
+FreeBSD では、静的コンテンツキャッシュ（`[static_file_cache]` + `[route.open_file_cache]`）は 16KB 以上のファイルの本体を
+無名の共有メモリに置きます。平文の h2c の応答は、DATA フレームの本体を書き込みバッファへコピーせず、`sendfile(2)`（9 バイトの
+フレームのヘッダは `sf_hdtr`）で `TCP_NOPUSH` を立てて送ります。TLS の接続は従来どおりコピーします。FreeBSD 14.3 aarch64 の
+実測（54KB、計測対象 1 コア）で nginx の 1.33 倍、サーバの CPU は 1 要求あたり 6.2µs（nginx 8.6µs）。
+
 ### バッファサイズとタイムアウト
 
 コード内の定数（コンパイル時に設定、再ビルドが必要）：
