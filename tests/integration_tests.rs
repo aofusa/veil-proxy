@@ -1641,7 +1641,7 @@ mod f150_tls_writev_roundtrip {
 #[cfg(unix)]
 mod b115_shutdown_signals {
     use std::path::Path;
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::{Child, Command, ExitStatus};
     use std::time::{Duration, Instant};
 
     fn start(dir: &Path) -> Child {
@@ -1653,14 +1653,17 @@ mod b115_shutdown_signals {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
         std::fs::write(dir.join("key.pem"), cert.signing_key.serialize_pem()).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // 選んだポートを並行する他の試験が先に取ると veil は bind に失敗して終了する（macOS で観測）。
+        // そのときは別のポートで起動し直す。
         let d = dir.display();
-        let cfg = format!(
-            r#"[server]
+        for attempt in 0..5 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let cfg = format!(
+                r#"[server]
 listen = "127.0.0.1:{port}"
 threads = 1
 {server_extra}
@@ -1680,44 +1683,49 @@ path = "/"
 type = "File"
 path = "{d}/"
 "#
-        );
-        let cfg_path = dir.join("veil.toml");
-        std::fs::write(&cfg_path, cfg).unwrap();
-        let log = std::fs::File::create(dir.join("veil.log")).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
-            .arg("-c")
-            .arg(&cfg_path)
-            .stdout(log)
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn veil");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            );
+            let cfg_path = dir.join("veil.toml");
+            std::fs::write(&cfg_path, cfg).unwrap();
+            let log = std::fs::File::create(dir.join("veil.log")).unwrap();
+            let err = std::fs::File::create(dir.join("veil.err")).unwrap();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
+                .arg("-c")
+                .arg(&cfg_path)
+                .stdout(log)
+                .stderr(err)
+                .spawn()
+                .expect("spawn veil");
+            // ポートに繋がっただけでは、並行する他の試験が同じポートを使っている可能性が残る（そのとき
+            // シグナルハンドラを入れる前の veil にシグナルを送ると既定の動作で死ぬ）。ワーカーの起動の
+            // ログ（シグナルハンドラの設定とリスナーの bind の後に出る）まで待つ。
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let started = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break false;
+                }
+                if log_of(dir).contains("Worker started")
+                    && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+                {
+                    break true;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "veil did not start: {}",
+                    log_of(dir)
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            if started {
+                return (child, port);
+            }
+            let err = std::fs::read_to_string(dir.join("veil.err")).unwrap_or_default();
             assert!(
-                child.try_wait().unwrap().is_none(),
-                "veil exited during startup: {}",
+                attempt < 4,
+                "veil exited during startup: {}\n{err}",
                 log_of(dir)
             );
-            assert!(Instant::now() < deadline, "veil did not start listening");
-            std::thread::sleep(Duration::from_millis(100));
         }
-        // ポートに繋がっただけでは、並行する他の試験が同じポートを使っている可能性が残る（そのとき
-        // シグナルハンドラを入れる前の veil にシグナルを送ると既定の動作で死ぬ。macOS で観測）。
-        // ワーカーの起動のログ（シグナルハンドラの設定とリスナーの bind の後に出る）まで待つ。
-        while !log_of(dir).contains("Worker started") {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "veil exited during startup: {}",
-                log_of(dir)
-            );
-            assert!(
-                Instant::now() < deadline,
-                "veil did not log its worker start: {}",
-                log_of(dir)
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        (child, port)
+        unreachable!()
     }
 
     fn log_of(dir: &Path) -> String {
