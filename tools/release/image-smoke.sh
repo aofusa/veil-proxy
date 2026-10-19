@@ -34,8 +34,11 @@ bad() {
 # 失敗したときの手がかり（コンテナのログの最後）を注釈に出す
 annotate_logs() {
     [ -n "${GITHUB_ACTIONS:-}" ] || return 0
-    tail -40 <<<"$1" | while IFS= read -r l; do echo "::warning title=container log::${l:0:900}"; done
-    echo "::warning title=container state::$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$NAME" 2>&1)"
+    # 注釈は 1 手順につき 10 件までなので、状態とログの最後を 1 件にまとめる（改行は %0A）
+    local st body
+    st="$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$NAME" 2>&1)"
+    body="$(tail -40 <<<"$1" | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+    echo "::warning title=container ($st)::${body}"
 }
 
 # HTTP/3 のクライアントのイメージは先に取っておく（取得のメッセージが curl の結果に混ざらないように）
