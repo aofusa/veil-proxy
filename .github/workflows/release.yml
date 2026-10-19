@@ -255,6 +255,9 @@ jobs:
         run: |
           choco install nasm -y --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # 試験の e2e.sh は h2c（--http2-prior-knowledge）を使う。Windows・Git for Windows の curl は HTTP/2 が無いので
+          # curl.se のビルド（HTTP/2・HTTP/3 入り）を入れる（試験の手順で PATH の先頭に置く）
+          choco install curl -y --no-progress
       - id: maturin
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -286,8 +289,12 @@ jobs:
           if [ -x "$RUNNER_TEMP/venv/bin/python" ]; then PY="$RUNNER_TEMP/venv/bin/python"; else PY="$RUNNER_TEMP/venv/Scripts/python.exe"; fi
           "$PY" -m pip install -q crates/veil-python/dist/*.whl pydantic
           # 単体（引数束縛・検証・OpenAPI）と、各サンプルを起動して curl で確かめる E2E
-          "$PY" crates/veil-python/tests/test_binding.py
-          PYTHON="$PY" PYTHON3="$PY" crates/veil-python/tests/e2e.sh
+          case "$RUNNER_OS" in Windows) export PATH="/c/ProgramData/chocolatey/bin:$PATH";; esac
+          set -o pipefail
+          # 失敗した確認はログイン無しで読める注釈にも出す
+          annotate() { grep -E "FAIL|Error|Traceback|error:" "$1" | tail -30 | while IFS= read -r l; do echo "::error title=wheel test::${l:0:900}"; done; }
+          "$PY" crates/veil-python/tests/test_binding.py 2>&1 | tee "$RUNNER_TEMP/unit.log" || { annotate "$RUNNER_TEMP/unit.log"; exit 1; }
+          PYTHON="$PY" PYTHON3="$PY" crates/veil-python/tests/e2e.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log" || { annotate "$RUNNER_TEMP/e2e.log"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.name }}

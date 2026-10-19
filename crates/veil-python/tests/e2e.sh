@@ -21,6 +21,10 @@ stop() { # stop <pid>
 cleanup() { [ -n "$PID" ] && stop "$PID"; wait "$PID" 2>/dev/null; PID=""; }
 trap 'cleanup; rm -f "$LOG"' EXIT
 
+# h2c（--http2-prior-knowledge）の確認があるので、HTTP/2 の無い curl（Windows・Git for Windows の同梱）では先に止める
+if ! curl -V 2>/dev/null | grep -q HTTP2; then
+  echo "FAIL curl has no HTTP/2 support ($(command -v curl)); install a curl with HTTP/2 (e.g. curl.se builds)"; exit 1
+fi
 free_port() { "$PYTHON" -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 
 start() { # $1 = app.py
