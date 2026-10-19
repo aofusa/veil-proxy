@@ -78,9 +78,9 @@ Anthropic 公式のプラグイン claude-security（https://github.com/anthropi
 
 ## 実装の結果
 
-- 走査: 設計の 10 の範囲に分けず、リポジトリ全体を effort low で走査した（版 93f4a114）。範囲を分けた effort high は
+- 走査: 設計の 10 の範囲に分けず、リポジトリ全体を effort low で走査した（版 93bb1bec）。範囲を分けた effort high は
   トークンの消費が大きく、全体の走査で攻撃面（HTTP/1.1・2・3、メッシュ、キャッシュ、IP 制限、Wasm）を網羅できたため。
-  修正の後に同じ範囲を再走査した（版 472d1582）。結果は `docs/artifacts/claude-security/` の 2 つのディレクトリ。
+  修正の後に同じ範囲を再走査した（版 df11568e）。結果は `docs/artifacts/claude-security/` の 2 つのディレクトリ。
 - 最初の走査で確認された指摘は 8 件（HIGH 2・MEDIUM 5・LOW 1）。誤検出は無かった。全部を直した:
 
   | 指摘 | 深刻度 | チケット |
