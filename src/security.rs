@@ -495,6 +495,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     228, // mlock
     229, // munlock
     230, // mlockall
+    284, // mlock2 (io_uring 登録バッファ。x86_64 と揃える。B-156)
     231, // munlockall
     279, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
     // ============================================
@@ -511,6 +512,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     178, // gettid
     220, // clone
     435, // clone3
+    293, // rseq（glibc 2.35+ がスレッドごとに登録する。ENOSYS 以外で失敗すると "Fatal glibc error: rseq registration failed" で abort。B-156）
+    124, // sched_yield（x86_64 と揃える。B-156）
+    168, // getcpu（x86_64 と揃える。B-156）
     // ============================================
     // シグナル処理
     // ============================================
@@ -628,6 +632,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     228, // mlock
     229, // munlock
     230, // mlockall
+    284, // mlock2 (io_uring 登録バッファ。x86_64 と揃える。B-156)
     231, // munlockall
     279, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
     // ============================================
@@ -644,6 +649,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     178, // gettid
     220, // clone
     435, // clone3
+    293, // rseq（glibc 2.35+ がスレッドごとに登録する。ENOSYS 以外で失敗すると "Fatal glibc error: rseq registration failed" で abort。B-156）
+    124, // sched_yield（x86_64 と揃える。B-156）
+    168, // getcpu（x86_64 と揃える。B-156）
     // ============================================
     // シグナル処理
     // ============================================
@@ -4153,6 +4161,11 @@ mod tests {
             ("futex", libc::SYS_futex),
             ("openat2", libc::SYS_openat2),
             ("eventfd2", libc::SYS_eventfd2),
+            // glibc 2.35+ は新しいスレッドごとに rseq を登録し、EPERM だと abort する（B-156。aarch64 に無かった）
+            ("rseq", libc::SYS_rseq),
+            ("sched_yield", libc::SYS_sched_yield),
+            ("getcpu", libc::SYS_getcpu),
+            ("mlock2", libc::SYS_mlock2),
         ];
         for (name, nr) in required {
             assert!(
