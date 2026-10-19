@@ -4,7 +4,7 @@
 
 すべて **docker コマンドのみ** で完結し、ホストへの追加インストールは不要です（証明書生成に `openssl` を使う場合を除く）。
 
-計測結果は [docs/perf/](../../docs/perf/) を参照してください（Linux/Docker の生データは [`docs/perf/results_raw.tsv`](../../docs/perf/results_raw.tsv)、**FreeBSD ネイティブ計測の生データは [`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv)**）。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
+計測結果は [docs/perf/](../../docs/perf/) を参照してください（Linux/Docker の生データは [`docs/perf/linux_suite_ab_raw.tsv`](../../docs/perf/linux_suite_ab_raw.tsv)、**FreeBSD ネイティブ計測の生データは [`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv)**）。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
 
 ---
 
@@ -18,7 +18,7 @@
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える）。v0.8.0 で同じ仕事の相手を足した: `base`（443、TLS 静的、HTTP/3 も）・`base_proxy`（8443、TLS で受けて perf-backend へ中継、HTTP/3 も）・`base_compression`（8444、毎回 gzip）・`base_proxy_compression`（8445、中継 + gzip） |
-| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
+| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/linux_suite_ab_raw.tsv](../../docs/perf/linux_suite_ab_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
 
@@ -241,25 +241,24 @@ veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirec
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
-2026-10-07（`3746594`、全 69 構成 × glibc/musl × 3 反復 = 810 計測、Non-2xx = 0、NA なし）**）:
+2026-10-19（`3736732d`、`suite_ab.sh` で main と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
 
-- **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
-  HTTP/1.1 glibc 9,667 / musl 9,527 vs nginx 6,437 = **1.50×**、HTTP/2 glibc 7,243 / musl 7,166
-  vs nginx 5,932 = **1.22×**。
-- **h2c は静的 2.39×・逆プロキシ 1.75×**（`h2c_file` 24,135 / `h2c_proxy` 10,858 vs
-  nginx 10,080 / 6,188）。L4 平文素通しは **2.04×**。圧縮結果キャッシュ有効の
-  `h2_1_feat_compression_cached` は HTTP/2 で **3.02×**。
-- FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/freebsd/`）は 16 項目中 12 項目で nginx 以上。
+- 対 nginx（同じ仕事の相手）の中央値は HTTP/1.1 **1.29×**・HTTP/2 **1.76×**・HTTP/3 **1.21×**・h2c **2.48×**、
+  全 120 構成で nginx 以上（最小 1.02×）。最良の静的配信 `h2_1_ktls_0_lb_kernel_ofc_1` は HTTP/1.1 1.42×・HTTP/2 1.76×、
+  h2c は静的 3.24×・中継 1.71×、L4 平文素通しは 2.01×、圧縮結果キャッシュ有効の `h2_1_feat_compression_cached` は 4.44×。
+- main との交互 A/B は全体 1.002（HTTP/3 1.138）。0.95 未満の組は 5〜6 反復で測り直して 0.967 以上。
+- FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/bsd/`）は CPU/要求の効率が 16 項目中 15 項目で nginx 以上
+  （残りは `h3_file` 54KB の 0.94、スループットは同等）。
 - **対 nginx は同じ仕事の相手と比べる**（v0.8.0。`tools/perf/vs_nginx.py` の対応）: `*_proxy*` は
   `base_proxy`、キャッシュ無しの `*_compression` は `base_compression`、`*_proxy_compression` は
   `base_proxy_compression`、`h2c_*` は同名、HTTP/3 の静的は `base`（http3）・中継は `base_proxy`（http3）、
   それ以外は `base`（TLS 静的）。v0.8.0 より前は nginx の中継・圧縮の相手が無く、`feat_proxy` 等を
   nginx の静的配信と比べていた。
-- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 6,946、2026-10-07）は
-  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **96〜100%**、
-  proxy / buffering が **86〜87%**（バックエンドホップそのもの）、
-  キャッシュ無効の compression が **56%**（54,576B を毎リクエスト zstd 圧縮する CPU バウンド処理）、
-  圧縮結果キャッシュ有効（`compression_cached`）は **258%**（圧縮後 16KB を返すため）。
+- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 8,684、2026-10-19）は
+  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **98〜103%**、
+  proxy / buffering が **77〜78%**（バックエンドホップそのもの）、
+  キャッシュ無効の compression が **49%**（54,576B を毎リクエスト圧縮する CPU バウンド処理）、
+  圧縮結果キャッシュ有効（`compression_cached`）は **284%**（圧縮後 16KB を返すため）。
 - glibc と musl の差は代表構成のいずれでも **数 % 以内でノイズ範囲**。
 - コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
 - `cbpf` と `kernel` の振り分けは同等（`h2_1_ktls_0_lb_{cbpf,kernel}_ofc_1` の HTTP/1.1 で 9,721 / 9,667）。B-76 以前は cBPF が全接続をワーカー 0 に寄せていた。
