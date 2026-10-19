@@ -34,8 +34,12 @@ bad() {
 # 失敗したときの手がかり（コンテナのログの最後）を注釈に出す
 annotate_logs() {
     [ -n "${GITHUB_ACTIONS:-}" ] || return 0
-    tail -15 <<<"$1" | while IFS= read -r l; do echo "::warning title=container log::${l:0:900}"; done
+    tail -40 <<<"$1" | while IFS= read -r l; do echo "::warning title=container log::${l:0:900}"; done
+    echo "::warning title=container state::$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$NAME" 2>&1)"
 }
+
+# HTTP/3 のクライアントのイメージは先に取っておく（取得のメッセージが curl の結果に混ざらないように）
+docker pull -q "$H3_CURL_IMAGE" >/dev/null
 
 VERSION="$(awk '/^\[workspace.package\]/{w=1;next} /^\[/{w=0} w && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' "$ROOT/Cargo.toml")"
 
@@ -91,7 +95,8 @@ run_case() { # run_case <label> <docker run の追加引数...>
         -v "$WORK/config.toml:/etc/veil/conf.d/config.toml:ro" \
         -v "$WORK/cert.pem:/etc/veil/ssl/cert.pem:ro" -v "$WORK/key.pem:/etc/veil/ssl/key.pem:ro" \
         "$IMAGE" >/dev/null
-    for _ in $(seq 1 50); do
+    # 起動を最大 30 秒待つ（arm64 のランナーは起動が遅いことがある）
+    for _ in $(seq 1 150); do
         curl -fsS -o /dev/null http://127.0.0.1:18080/ 2>/dev/null && break
         sleep 0.2
     done
@@ -104,8 +109,10 @@ run_case() { # run_case <label> <docker run の追加引数...>
     if curl -fsS http://127.0.0.1:18080/ -o /dev/null; then ok "$label: HTTP/1.1"; else bad "$label: HTTP/1.1"; echo "$logs" | tail -20; annotate_logs "$logs"; fi
     local v; v="$(curl -ksS --http2 -o /dev/null -w '%{http_version}' https://127.0.0.1:18443/ || true)"
     if [ "$v" = 2 ]; then ok "$label: HTTP/2"; else bad "$label: HTTP/2 (got '$v')"; fi
-    v="$(docker run --rm --network host --entrypoint curl "$H3_CURL_IMAGE" -ksS --http3-only -o /dev/null -w '%{http_version}' https://127.0.0.1:18443/ 2>&1 || true)"
-    if [ "$v" = 3 ]; then ok "$label: HTTP/3"; else bad "$label: HTTP/3 (got '$v')"; fi
+    local err
+    v="$(docker run --rm --network host --entrypoint curl "$H3_CURL_IMAGE" -ksS --http3-only -o /dev/null -w '%{http_version}' https://127.0.0.1:18443/ 2>"$WORK/h3.err" || true)"
+    err="$(tr '\n' ' ' < "$WORK/h3.err")"
+    if [ "$v" = 3 ]; then ok "$label: HTTP/3"; else bad "$label: HTTP/3 (got '$v' $err)"; fi
     docker rm -f "$NAME" >/dev/null 2>&1 || true
 }
 
