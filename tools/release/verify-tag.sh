@@ -14,7 +14,11 @@ if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
 fi
 TAG_VERSION="${BASH_REMATCH[1]}"
 WS_VERSION="$(awk '/^\[workspace.package\]/{w=1;next} /^\[/{w=0} w && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' Cargo.toml)"
-if [ "$TAG_VERSION" != "$WS_VERSION" ]; then
+# プレリリースのタグ（v0.8.0-rc.1）は、- より前の版（0.8.0）と比べる。rc のために版を書き換えて
+# コミットしなくても、同じコミットで rc の通し → 本公開ができる（rc の成果物は 0.8.0 の版で作られ、
+# crates は検証だけ・PyPI は TestPyPI・イメージは版のタグだけなので、本公開とぶつからない）。
+BASE_VERSION="${TAG_VERSION%%-*}"
+if [ "$BASE_VERSION" != "$WS_VERSION" ]; then
     echo "error: tag $TAG does not match the workspace version $WS_VERSION (run tools/release/bump-version.sh)" >&2
     exit 1
 fi

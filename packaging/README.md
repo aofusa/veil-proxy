@@ -578,7 +578,8 @@ git tag v0.8.0-rc.1 && git push origin v0.8.0-rc.1   # まず rc で通しを確
 git tag v0.8.0      && git push origin v0.8.0        # 本公開
 ```
 
-- プレリリースのタグ（`-` を含む）では、イメージは版のタグ（`musl-v0.8.0-rc.1` 等）だけを付けて `latest`・`musl`・`glibc` を
+- プレリリースのタグ（`-` を含む）は、`-` より前（`v0.8.0-rc.1` なら `0.8.0`）を `Cargo.toml` の版と比べる（rc のために版を書き換えない。
+  成果物の版は `0.8.0` になる）。イメージは版のタグ（`musl-v0.8.0-rc.1` 等）だけを付けて `latest`・`musl`・`glibc` を
   動かさない。crates は `cargo package --workspace` の検証だけ（crates.io の公開は取り消せない）。PyPI は TestPyPI へ送る。
 - 版のタグのイメージは上書きしない（同じタグがあれば失敗する）。crates は既にある版を飛ばすので、途中で失敗しても再実行できる。
 - イメージはダイジェストで push → アーキごとのランナー（arm64 は `ubuntu-24.04-arm`）で `tools/release/image-smoke.sh`
