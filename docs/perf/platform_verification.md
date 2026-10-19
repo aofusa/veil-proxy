@@ -55,6 +55,7 @@ SKIP_SYSCALL_CHAOS=0 SKIP_DIFFERENTIAL=0 RUN_E2E_ASAN=1` で全フェーズを�
 |---|---|---|
 | [B-154](../backlog/bugs/B-154-static-first-request-404-when-openat2-blocked.md) | Linux（container_security） | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 |
 | [B-155](../backlog/bugs/B-155-dependency-advisories-v080.md) | Linux（container_security の cargo-audit） | 依存の RUSTSEC 勧告（rustls・quinn-proto・pyo3・wasmtime） |
+| [B-156](../backlog/bugs/B-156-aarch64-seccomp-missing-rseq.md) | Linux aarch64（release.yml のイメージの試験） | seccomp の aarch64 の許可リストに rseq が無く、glibc の arm64 が seccomp 有効で起動直後に abort（E2E は seccomp を有効にしないので見えなかった） |
 | F-240（quiche の `send_body_zc`） | Linux（perf の h2load） | 本文のゼロコピーで偽の STREAM_DATA_BLOCKED を送り、ngtcp2 のクライアントが FINAL_SIZE_ERROR で閉じる（E2E の quinn は無視） |
 | B-122（追記） | Linux（standalone の並列実行） | 平文リスナーで判別に足りない断片の続きが 200ms に間に合わず RST |
 | — | Windows・macOS | clippy の指摘（上の表）・quiche の build.rs が macOS のビルドのたびに出す警告 |

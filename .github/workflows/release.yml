@@ -357,6 +357,7 @@ jobs:
           host=pypi.org; [ "$PRERELEASE" = true ] && host=test.pypi.org
           ver="$(ls dist/*.tar.gz | sed -E 's/.*veil_api-(.*)\.tar\.gz/\1/')"
           have="$(curl -s "https://$host/pypi/veil-api/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
-          missing=""; for f in dist/*; do b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
+          # 公開の action が dist/ に置く *.publish.attestation は配布物ではないので数えない
+          missing=""; n=0; for f in dist/*.whl dist/*.tar.gz; do n=$((n+1)); b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
           if [ -n "$missing" ]; then echo "::error title=PyPI ($host $ver)::missing:$missing"; exit 1; fi
-          echo "::notice title=PyPI ($host $ver)::all $(ls dist | wc -l) files are on $host"
+          echo "::notice title=PyPI ($host $ver)::all $n files are on $host"
