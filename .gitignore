@@ -28,6 +28,9 @@ tests/fixtures/f150_cache/*
 # サンプルフィルタのビルド成果物
 examples/wasm-filters/*/target/
 examples/api/*/target/
+# 試験用の独立したクレート（本体のワークスペース外）のビルド出力
+tests/*/target/
+tests/api/*/target/
 tools/api-bench/*/target/
 tools/api-bench/*/target-*/
 examples/wasm-filters/*/Cargo.lock
