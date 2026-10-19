@@ -98,10 +98,14 @@ COPY . /app
 # 環境依存テスト（例: 同梱 examples/config.toml 読込）はテスト側で存在チェックしスキップ済み）
 #
 # cacher 段はスタブの src/main.rs / src/lib.rs で release プロファイルの成果物をキャッシュする。
+# 単体テストは 1 回落ちたら直列でもう 1 回だけ回す（4 コアの CI ランナーで負荷により時間に依存する
+# 試験が 1 度落ち、公開が止まった。v0.8.0-rc.4。直列でも落ちれば本物の失敗として止める）。
 # 実ソースへ差し替えた後は全 .rs の mtime を更新して cargo に再コンパイルを強制する
 # （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
 RUN find src -name '*.rs' -exec touch {} + \
-    && cargo test --lib --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && { cargo test --lib --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+         || { echo "unit tests failed once (timing-dependent under load?); retrying serially" >&2; \
+              cargo test --lib --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked -- --test-threads=1; }; } \
     && cargo zigbuild --profile dist --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
     && mkdir -p /app/out && cp target/${RUST_TARGET}/dist/veil /app/out/veil \
     && if [ -n "${CARGO_FEATURES_FALLBACK}" ]; then cargo zigbuild --profile dist --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES_FALLBACK}" --locked \

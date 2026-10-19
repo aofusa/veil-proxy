@@ -61,6 +61,8 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # 1 つの失敗で他のアーキのビルドを取り消さない（どれが通るかを 1 回で見る）
+      fail-fast: false
       fail-fast: true
       matrix:
         include:
@@ -337,8 +339,25 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
+          # rc の wheel の版は Cargo.toml の版（0.8.0）なので、2 回目以降の rc では既にある
+          skip-existing: true
       - name: publish to PyPI
         if: needs.verify.outputs.prerelease == 'false'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist
+          # 途中で失敗した公開をやり直せるように（既にあるファイルは飛ばす）
+          skip-existing: true
+      # 失敗したときに、レジストリに載ったファイルと載っていないファイルを注釈に出す（ログはログイン無しで読めない）
+      - name: report the uploaded files
+        if: always()
+        shell: bash
+        env:
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          host=pypi.org; [ "$PRERELEASE" = true ] && host=test.pypi.org
+          ver="$(ls dist/*.tar.gz | sed -E 's/.*veil_api-(.*)\.tar\.gz/\1/')"
+          have="$(curl -s "https://$host/pypi/veil-api/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
+          missing=""; for f in dist/*; do b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
+          if [ -n "$missing" ]; then echo "::error title=PyPI ($host $ver)::missing:$missing"; exit 1; fi
+          echo "::notice title=PyPI ($host $ver)::all $(ls dist | wc -l) files are on $host"
