@@ -45,13 +45,15 @@ for c in "${crates[@]}"; do
     fi
 done
 
+if [ "${#exclude[@]}" -eq $((${#crates[@]} * 2)) ]; then
+    # 全部が公開済み（最初の版を手元から公開した後の rc など）。cargo package は対象が 0 個だと失敗するので何もしない
+    echo "nothing to publish (all crates are already on crates.io)"
+    exit 0
+fi
+
 if [ "$DRY" = 1 ]; then
     # 公開前のクレートに依存するクレートも、cargo package --workspace はまとめて検証できる
     cargo package --workspace "${exclude[@]}" --allow-dirty
 else
-    if [ "${#exclude[@]}" -eq $((${#crates[@]} * 2)) ]; then
-        echo "nothing to publish"
-        exit 0
-    fi
     cargo publish --workspace "${exclude[@]}" --allow-dirty
 fi

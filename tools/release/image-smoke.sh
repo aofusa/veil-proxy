@@ -26,7 +26,16 @@ cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 ok() { echo "ok   $*"; }
-bad() { echo "FAIL $*"; fail=1; }
+# GitHub Actions では失敗を注釈にも出す（公開リポジトリの注釈はログイン無しで API から読める）
+bad() {
+    echo "FAIL $*"; fail=1
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error title=image smoke::$*"; fi
+}
+# 失敗したときの手がかり（コンテナのログの最後）を注釈に出す
+annotate_logs() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    tail -15 <<<"$1" | while IFS= read -r l; do echo "::warning title=container log::${l:0:900}"; done
+}
 
 VERSION="$(awk '/^\[workspace.package\]/{w=1;next} /^\[/{w=0} w && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' "$ROOT/Cargo.toml")"
 
@@ -88,11 +97,11 @@ run_case() { # run_case <label> <docker run の追加引数...>
     done
     local logs; logs="$(docker logs "$NAME" 2>&1 || true)"
     if [ "$label" = epoll ]; then
-        if grep -q "Switching to the epoll build" <<<"$logs"; then ok "$label: switched to /veil.epoll"; else bad "$label: no switch to the epoll build"; fi
+        if grep -q "Switching to the epoll build" <<<"$logs"; then ok "$label: switched to /veil.epoll"; else bad "$label: no switch to the epoll build"; annotate_logs "$logs"; fi
     else
         if grep -q "Switching to the epoll build" <<<"$logs"; then bad "$label: switched although io_uring should be allowed"; else ok "$label: stayed on io_uring"; fi
     fi
-    if curl -fsS http://127.0.0.1:18080/ -o /dev/null; then ok "$label: HTTP/1.1"; else bad "$label: HTTP/1.1"; echo "$logs" | tail -20; fi
+    if curl -fsS http://127.0.0.1:18080/ -o /dev/null; then ok "$label: HTTP/1.1"; else bad "$label: HTTP/1.1"; echo "$logs" | tail -20; annotate_logs "$logs"; fi
     local v; v="$(curl -ksS --http2 -o /dev/null -w '%{http_version}' https://127.0.0.1:18443/ || true)"
     if [ "$v" = 2 ]; then ok "$label: HTTP/2"; else bad "$label: HTTP/2 (got '$v')"; fi
     v="$(docker run --rm --network host --entrypoint curl "$H3_CURL_IMAGE" -ksS --http3-only -o /dev/null -w '%{http_version}' https://127.0.0.1:18443/ 2>&1 || true)"
