@@ -1,6 +1,6 @@
 # B-120: 単体テスト全体の並列実行が高負荷時に「thread local panicked on drop」で abort することがある
 
-**状態: 未修正（P3、テストのみ。feat/f188-api-library-vds-k8s の作業中に 1 回観測）**
+**状態: 完了（P3、テストのみ。464fa24d で試験の補助関数 `run` が `block_on` の後に `shutdown_thread` を呼ぶようにした）**
 
 ## 事象
 
