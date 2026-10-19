@@ -96,16 +96,31 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
    curl -k https://localhost/static/index.html
    ```
 
+   コンテナイメージでも動かせる（`latest` は musl 版。glibc 版もある。`linux/amd64` と `linux/arm64`）:
+
+   ```bash
+   docker run --rm -p 443:443 -p 443:443/udp \
+     -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+     -v "$PWD/cert.pem:/etc/veil/ssl/cert.pem:ro" -v "$PWD/key.pem:/etc/veil/ssl/key.pem:ro" \
+     ghcr.io/aofusa/veil:latest
+   ```
+
+   イメージは io_uring 版で起動し、コンテナの seccomp が io_uring を禁じていれば（Docker の既定）同梱の epoll 版に
+   切り替わる。
+
 全設定キーをコメント付きで網羅したリファレンスは [examples/config.toml](../../examples/config.toml) です。
 
 ### ライブラリとして使う
 
 ```toml
-# Cargo.toml
+# Cargo.toml（crates.io の名前は veil-proxy。マクロが veil の名前を使うので、依存のキーは veil のままにする）
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 ```
+
+Linux で HTTP/3 を使うときは `.cargo/config.toml` の `[env]` に `AWS_LC_SYS_NO_PREFIX_<ターゲット> = "1"` も要る
+（[ライブラリのガイド](../guide/ja/library.md#cargotoml)）。Python は `pip install veil-api`（`import veil`）。
 
 ```rust
 use veil::prelude::*;

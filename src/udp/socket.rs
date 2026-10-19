@@ -1,6 +1,6 @@
 //! # QUIC 用 UDP ソケット
 //!
-//! monoio と統合した UDP ソケット実装。
+//! 独自ランタイムと統合した UDP ソケット実装。
 //! Linux GSO/GRO をサポートして高スループットを実現。
 //!
 //! ## 改善点 (v2)
@@ -10,13 +10,14 @@
 //! - 非ブロッキング I/O 統合
 
 #![allow(unused_imports)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use crate::runtime::handle::AsRawFd;
 use std::io;
 use std::net::SocketAddr;
 
-// 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
-// monoio::net::udp::UdpSocket を削除し、std を使用する
+// 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）。待機はランタイムの
+// readiness（`wait_readable_fd` / `wait_writable_fd`）で行う
 use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
 use std::net::UdpSocket;
 
@@ -113,117 +114,7 @@ impl QuicUdpSocket {
     /// GSO/GRO も同時に設定されます。
     #[cfg(target_os = "linux")]
     pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
-        use std::os::unix::io::FromRawFd;
-
-        // ソケットを作成
-        let domain = if addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-
-        let fd = unsafe {
-            libc::socket(
-                domain,
-                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // SO_REUSEADDR を設定
-        let optval: libc::c_int = 1;
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // SO_REUSEPORT を設定
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // アドレスをバインド
-        let ret = match addr {
-            SocketAddr::V4(v4) => {
-                let sin = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                    },
-                    sin_zero: [0; 8],
-                };
-                unsafe {
-                    libc::bind(
-                        fd,
-                        &sin as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    )
-                }
-            }
-            SocketAddr::V6(v6) => {
-                let sin6 = libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: v6.port().to_be(),
-                    sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: libc::in6_addr {
-                        s6_addr: v6.ip().octets(),
-                    },
-                    sin6_scope_id: v6.scope_id(),
-                };
-                unsafe {
-                    libc::bind(
-                        fd,
-                        &sin6 as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                    )
-                }
-            }
-        };
-        if ret < 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // std::net::UdpSocket を作成（非ブロッキングモードで設定）
-        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-        let socket = std_socket;
-        socket.set_nonblocking(true)?;
-        let local_addr = socket.local_addr()?;
-
-        let mut instance = Self {
-            socket,
-            gso_enabled: false,
-            gro_enabled: false,
-            local_addr,
-        };
-
-        // GSO/GRO を設定
-        instance.configure_gso_gro()?;
-
-        Ok(instance)
+        Self::bind_reuseport_with_gso(addr, true)
     }
 
     /// SO_REUSEPORT を設定してバインド（GSO/GRO の有効化オプション付き）
@@ -241,6 +132,7 @@ impl QuicUdpSocket {
             libc::AF_INET6
         };
 
+        // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に fd < 0 で検査する。
         let fd = unsafe {
             libc::socket(
                 domain,
@@ -252,20 +144,30 @@ impl QuicUdpSocket {
             return Err(io::Error::last_os_error());
         }
 
+        set_dont_fragment(fd, addr.is_ipv4());
+
         // SO_REUSEADDR を設定
         let reuseaddr: libc::c_int = 1;
-        unsafe {
+        // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し、長さはその大きさ
+        let ret = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_REUSEADDR,
                 &reuseaddr as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（以降この fd は使わない）
+            unsafe { libc::close(fd) };
+            return Err(e);
         }
 
         // SO_REUSEPORT を設定
         let reuseport: libc::c_int = 1;
+        // SAFETY: fd は有効なソケット。reuseport は c_int を指し長さはその大きさ。
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -276,8 +178,10 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // バインド
@@ -291,6 +195,7 @@ impl QuicUdpSocket {
                     },
                     sin_zero: [0; 8],
                 };
+                // SAFETY: fd は有効なソケット。sin は sockaddr_in で、長さは sockaddr_in の大きさ。sin は bind の呼び出し中スタックに生きている。
                 unsafe {
                     libc::bind(
                         fd,
@@ -309,6 +214,7 @@ impl QuicUdpSocket {
                     },
                     sin6_scope_id: v6.scope_id(),
                 };
+                // SAFETY: fd は有効なソケット。sin6 は sockaddr_in6 で、長さは sockaddr_in6 の大きさ。sin6 は bind の呼び出し中スタックに生きている。
                 unsafe {
                     libc::bind(
                         fd,
@@ -319,11 +225,14 @@ impl QuicUdpSocket {
             }
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // std::net::UdpSocket を作成（非ブロッキングモードで設定）
+        // SAFETY: fd は上で作成して検証済みの、自分だけが所有する UDP ソケット。所有権は UdpSocket へ移り、以後この fd を直接 close しない。
         let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
         let socket = std_socket;
         socket.set_nonblocking(true)?;
@@ -357,6 +266,7 @@ impl QuicUdpSocket {
             // 注意: setsockopt での設定はデフォルト値。実際の GSO は
             // sendmsg の CMSG で指定する必要がある
             let gso_size: libc::c_int = GSO_SEGMENT_SIZE as libc::c_int;
+            // SAFETY: fd は self.socket が所有する有効なソケット。gso_size は c_int を指し長さはその大きさ。
             let result = unsafe {
                 libc::setsockopt(
                     fd,
@@ -370,6 +280,7 @@ impl QuicUdpSocket {
 
             // UDP_GRO を有効化
             let gro_enabled: libc::c_int = 1;
+            // SAFETY: fd は self.socket が所有する有効なソケット。gro_enabled は c_int を指し長さはその大きさ。
             let result = unsafe {
                 libc::setsockopt(
                     fd,
@@ -383,6 +294,7 @@ impl QuicUdpSocket {
 
             // 受信バッファサイズを増加
             let recv_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+                                                              // SAFETY: fd は self.socket が所有する有効なソケット。recv_buf_size は c_int を指し長さはその大きさ。失敗しても致命ではない。
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -395,6 +307,7 @@ impl QuicUdpSocket {
 
             // 送信バッファサイズを増加
             let send_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+                                                              // SAFETY: fd は self.socket が所有する有効なソケット。send_buf_size は c_int を指し長さはその大きさ。失敗しても致命ではない。
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -416,6 +329,7 @@ impl QuicUdpSocket {
 
         // 受信バッファサイズを増加
         let recv_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+                                                          // SAFETY: fd は self.socket が所有する有効なソケット。recv_buf_size は c_int を指し長さはその大きさ。失敗しても致命ではない。
         unsafe {
             libc::setsockopt(
                 fd,
@@ -428,6 +342,7 @@ impl QuicUdpSocket {
 
         // 送信バッファサイズを増加
         let send_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+                                                          // SAFETY: fd は self.socket が所有する有効なソケット。send_buf_size は c_int を指し長さはその大きさ。失敗しても致命ではない。
         unsafe {
             libc::setsockopt(
                 fd,
@@ -540,6 +455,7 @@ impl QuicUdpSocket {
         let cmsg_len = build_gso_cmsg(&mut cmsg_buf, segment_size)?;
 
         // msghdr を構築
+        // SAFETY: msghdr は整数とポインタだけの POD で、全ビット 0（NULL・長さ 0）が有効な初期値。
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = &sockaddr as *const _ as *mut libc::c_void;
         msg.msg_namelen = sockaddr_len;
@@ -550,6 +466,7 @@ impl QuicUdpSocket {
         msg.msg_flags = 0;
 
         // sendmsg を呼び出し
+        // SAFETY: msg の msg_name/msg_iov/msg_control は sockaddr・iov・cmsg_buf を指し、いずれもこの呼び出しの間ローカルに生存する。fd は self.socket が所有する有効なソケット。
         let result = unsafe { libc::sendmsg(fd, &msg, 0) };
 
         if result < 0 {
@@ -568,6 +485,7 @@ impl QuicUdpSocket {
         let fd = self.socket.as_raw_fd();
         let (sockaddr, sockaddr_len) = socket_addr_to_raw(target);
 
+        // SAFETY: fd は self.socket が所有する有効なソケット。data は data.len() バイトの読み取り可能なスライス、sockaddr は socket_addr_to_raw が sockaddr_len バイト分を初期化した sockaddr_storage。
         let result = unsafe {
             libc::sendto(
                 fd,
@@ -601,6 +519,7 @@ impl QuicUdpSocket {
         let fd = self.socket.as_raw_fd();
 
         // sockaddr バッファ
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut sockaddr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
         // iovec を構築
@@ -613,6 +532,7 @@ impl QuicUdpSocket {
         let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
 
         // msghdr を構築
+        // SAFETY: msghdr は整数とポインタだけの POD で、全ビット 0（NULL・長さ 0）が有効な初期値。
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = &mut sockaddr_storage as *mut _ as *mut libc::c_void;
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -623,6 +543,7 @@ impl QuicUdpSocket {
         msg.msg_flags = 0;
 
         // recvmsg を呼び出し
+        // SAFETY: msg の msg_name/msg_iov/msg_control は sockaddr_storage・iov・cmsg_buf を指し、いずれもこの呼び出しの間ローカルに生存して書き込み可能。iov は buf を指す。fd は self.socket が所有する有効なソケット。
         let result = unsafe { libc::recvmsg(fd, &mut msg, 0) };
 
         if result < 0 {
@@ -644,8 +565,8 @@ impl QuicUdpSocket {
 
     /// 複数パケットを GSO で送信（非同期ラッパー）
     ///
-    /// monoio は sendmsg を直接サポートしていないため、
-    /// 非ブロッキングソケットで同期 API を使用します。
+    /// 非ブロッキングソケットで `sendmsg` を直接呼び、`EAGAIN` のときだけ
+    /// ランタイムの書き込み可能待ちに入ります。
     ///
     /// **非推奨**: `send_gso_async()` を使用してください。
     /// この関数は EAGAIN を適切に処理しません。
@@ -772,7 +693,7 @@ impl QuicUdpSocket {
             scratch.hdrs[i].msg_len = 0;
         }
 
-        // 安全性: hdrs は Box 固定アドレス。各 mmsghdr のポインタ群は同一 scratch 内の
+        // SAFETY: hdrs は Box 固定アドレス。各 mmsghdr のポインタ群は同一 scratch 内の
         // Box（bufs/addrs/iovecs/cmsg_bufs）を指し、いずれも有効。MSG_DONTWAIT で非ブロック。
         let n = unsafe {
             libc::recvmmsg(
@@ -846,7 +767,7 @@ impl QuicUdpSocket {
         let mut sent = 0usize;
         while sent < count {
             let remaining = count - sent;
-            // 安全性: hdrs[sent..] は Box 固定アドレスの連続 mmsghdr。各ポインタは同一 scratch の
+            // SAFETY: hdrs[sent..] は Box 固定アドレスの連続 mmsghdr。各ポインタは同一 scratch の
             // Box を指す。MSG_DONTWAIT で非ブロッキング。
             let ret = unsafe {
                 libc::sendmmsg(
@@ -866,7 +787,12 @@ impl QuicUdpSocket {
                     continue;
                 }
                 // 先頭メッセージの恒久エラー: 当該メッセージのみ skip して継続（QUIC 再送で回復）。
-                warn!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                // EMSGSIZE は DF を立てた経路 MTU の探索で大きすぎた探索のパケット（想定内）
+                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                    ftlog::debug!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                } else {
+                    warn!("[HTTP/3] sendmmsg entry skipped: {}", err);
+                }
                 sent += 1;
                 continue;
             }
@@ -932,13 +858,12 @@ pub struct MmsgRecvScratch {
     /// 送信元アドレス（per-msg）。
     addrs: Box<[libc::sockaddr_storage]>,
     /// 各 msg の iovec（bufs 内の自分の区画を指す）。
-    /// mmsghdr.msg_iov が指すバッキングストアのため、Rust 側の直接読みは不要だが Drop まで生存必須。
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_iov）のバッキングストア
-    iovecs: Box<[libc::iovec]>,
+    /// mmsghdr.msg_iov が指すバッキングストアのため、Rust 側の直接読みは不要だが Drop まで生存必須
+    /// （`_` 始まりは「読まないが持つ」ことを示す）。
+    _iovecs: Box<[libc::iovec]>,
     /// 各 msg の cmsg 受信バッファ（UDP_GRO を per-msg で受ける）。連続領域。
-    /// mmsghdr.msg_control が指すバッキングストア。
-    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_control）のバッキングストア
-    cmsg_bufs: Box<[u8]>,
+    /// mmsghdr.msg_control が指すバッキングストア（読まないが Drop まで生存必須）。
+    _cmsg_bufs: Box<[u8]>,
     /// recvmmsg へ渡す mmsghdr 配列。
     hdrs: Box<[libc::mmsghdr]>,
 }
@@ -954,20 +879,24 @@ impl MmsgRecvScratch {
     pub fn with_batch(batch: usize) -> Self {
         let batch = clamp_mmsg_batch(batch);
         let mut bufs = vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice();
-        // 安全性: sockaddr_storage / iovec / mmsghdr はすべて POD（全ビットゼロが有効表現）。
+        // SAFETY: sockaddr_storage / iovec / mmsghdr はすべて POD（全ビットゼロが有効表現）。
         let mut addrs =
             vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; batch].into_boxed_slice();
+        // SAFETY: iovec は POD で、全ビット 0 が有効な初期値。
         let mut iovecs =
             vec![unsafe { std::mem::zeroed::<libc::iovec>() }; batch].into_boxed_slice();
         let mut cmsg_bufs = vec![0u8; batch * CMSG_BUFFER_SIZE].into_boxed_slice();
+        // SAFETY: mmsghdr は POD で、全ビット 0 が有効な初期値。
         let mut hdrs =
             vec![unsafe { std::mem::zeroed::<libc::mmsghdr>() }; batch].into_boxed_slice();
 
         for i in 0..batch {
+            // SAFETY: i < batch で bufs は batch * RECV_BUFFER_SIZE バイトなので、add(i * RECV_BUFFER_SIZE) は同一確保の範囲内。
             let buf_ptr =
                 unsafe { bufs.as_mut_ptr().add(i * RECV_BUFFER_SIZE) } as *mut libc::c_void;
             let addr_ptr = (&mut addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
             let iov_ptr = &mut iovecs[i] as *mut libc::iovec;
+            // SAFETY: i < batch で cmsg_bufs は batch * CMSG_BUFFER_SIZE バイトなので、add(i * CMSG_BUFFER_SIZE) は同一確保の範囲内。
             let cmsg_ptr =
                 unsafe { cmsg_bufs.as_mut_ptr().add(i * CMSG_BUFFER_SIZE) } as *mut libc::c_void;
 
@@ -988,8 +917,8 @@ impl MmsgRecvScratch {
             batch,
             bufs,
             addrs,
-            iovecs,
-            cmsg_bufs,
+            _iovecs: iovecs,
+            _cmsg_bufs: cmsg_bufs,
             hdrs,
         }
     }
@@ -1071,18 +1000,21 @@ impl MmsgSendScratch {
     /// 指定バッチ幅でスクラッチを確保し、mmsghdr のポインタ配線を 1 回だけ行う。
     pub fn with_batch(batch: usize) -> Self {
         let batch = clamp_mmsg_batch(batch);
-        // 安全性: いずれも POD（全ビットゼロが有効表現）。
+        // SAFETY: いずれも POD（全ビットゼロが有効表現）。
         let mut addrs =
             vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; batch].into_boxed_slice();
+        // SAFETY: iovec は POD で、全ビット 0 が有効な初期値。
         let mut iovecs =
             vec![unsafe { std::mem::zeroed::<libc::iovec>() }; batch].into_boxed_slice();
         let mut cmsg_bufs = vec![0u8; batch * CMSG_BUFFER_SIZE].into_boxed_slice();
+        // SAFETY: mmsghdr は POD で、全ビット 0 が有効な初期値。
         let mut hdrs =
             vec![unsafe { std::mem::zeroed::<libc::mmsghdr>() }; batch].into_boxed_slice();
 
         for i in 0..batch {
             let addr_ptr = (&mut addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
             let iov_ptr = &mut iovecs[i] as *mut libc::iovec;
+            // SAFETY: i < batch で cmsg_bufs は batch * CMSG_BUFFER_SIZE バイトなので、add(i * CMSG_BUFFER_SIZE) は同一確保の範囲内。
             let cmsg_ptr =
                 unsafe { cmsg_bufs.as_mut_ptr().add(i * CMSG_BUFFER_SIZE) } as *mut libc::c_void;
 
@@ -1131,6 +1063,7 @@ impl Default for MmsgSendScratch {
 #[cfg(target_os = "linux")]
 pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<usize> {
     // CMSG ヘッダサイズの計算
+    // SAFETY: CMSG_SPACE は引数の長さから計算するだけでメモリに触れない。
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
 
     if buf.len() < cmsg_space {
@@ -1142,6 +1075,7 @@ pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<us
 
     // cmsghdr を構築
     let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
+    // SAFETY: buf.len() >= cmsg_space を確認済みなので cmsghdr とその直後の u16 データ領域は buf 内に収まる。cmsghdr の整列は呼び出し側の CMSG バッファ（スタック上の配列）に依存する。
     unsafe {
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
         (*cmsg).cmsg_level = libc::SOL_UDP;
@@ -1161,17 +1095,22 @@ pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<us
 #[cfg(target_os = "linux")]
 fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
     // CMSG を走査
+    // SAFETY: msg は有効な msghdr への参照で、msg_control/msg_controllen は recvmsg が埋めた領域を指す。CMSG_FIRSTHDR はそれらだけを読む。
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
 
     while !cmsg.is_null() {
+        // SAFETY: while の条件で cmsg が非 NULL を確認済みで、CMSG_FIRSTHDR/CMSG_NXTHDR が返す msg_control 領域内の cmsghdr を指す。
         let cmsg_ref = unsafe { &*cmsg };
 
         if cmsg_ref.cmsg_level == libc::SOL_UDP && cmsg_ref.cmsg_type == libc::UDP_GRO {
             // GRO セグメントサイズを読み取り
+            // SAFETY: cmsg_level/cmsg_type が UDP_GRO の cmsghdr で、CMSG_DATA はそのデータ領域の先頭を返す。
             let data_ptr = unsafe { libc::CMSG_DATA(cmsg) as *const u16 };
+            // SAFETY: UDP_GRO の cmsg データは u16 一つ分。カーネルが書き込んだ領域で、読み取りは 1 回のみ。
             return Some(unsafe { *data_ptr });
         }
 
+        // SAFETY: cmsg は上で非 NULL を確認した msg 内の cmsghdr。CMSG_NXTHDR は msg の領域内で次を返す（末尾なら NULL）。
         cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
     }
 
@@ -1186,11 +1125,13 @@ fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
 // F-130 C3: `runtime::uring::udp_send` からも再利用するため pub(crate)。
 #[cfg(unix)]
 pub(crate) fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
     match addr {
         SocketAddr::V4(v4) => {
             let sin = &mut storage as *mut _ as *mut libc::sockaddr_in;
+            // SAFETY: sin は storage の先頭を指し、sockaddr_storage は sockaddr_in を収める大きさ・アラインメントを持つ。storage はこのブロック内で排他的に使う。
             unsafe {
                 (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
                 (*sin).sin_port = v4.port().to_be();
@@ -1203,6 +1144,7 @@ pub(crate) fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, l
         }
         SocketAddr::V6(v6) => {
             let sin6 = &mut storage as *mut _ as *mut libc::sockaddr_in6;
+            // SAFETY: sin6 は storage の先頭を指し、sockaddr_storage は sockaddr_in6 を収める大きさ・アラインメントを持つ。storage はこのブロック内で排他的に使う。
             unsafe {
                 (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 (*sin6).sin6_port = v6.port().to_be();
@@ -1224,6 +1166,7 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
             let sin = storage as *const _ as *const libc::sockaddr_in;
+            // SAFETY: ss_family が AF_INET なので storage の中身は sockaddr_in。sockaddr_storage は sockaddr_in に十分な大きさとアラインメントを持つ。
             let sin_ref = unsafe { &*sin };
             let ip = std::net::Ipv4Addr::from(sin_ref.sin_addr.s_addr.to_ne_bytes());
             let port = u16::from_be(sin_ref.sin_port);
@@ -1231,6 +1174,7 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr
         }
         libc::AF_INET6 => {
             let sin6 = storage as *const _ as *const libc::sockaddr_in6;
+            // SAFETY: ss_family が AF_INET6 なので storage の中身は sockaddr_in6。sockaddr_storage は sockaddr_in6 に十分な大きさとアラインメントを持つ。
             let sin6_ref = unsafe { &*sin6 };
             let ip = std::net::Ipv6Addr::from(sin6_ref.sin6_addr.s6_addr);
             let port = u16::from_be(sin6_ref.sin6_port);
@@ -1280,6 +1224,52 @@ const QUIC_SOCKET_BUFFER_WANT: libc::c_int = 2 * 1024 * 1024;
 /// 既定（約 40KB）のまま残っていたので、64KB まで下げて通る最大値を探す。
 #[cfg(all(not(target_os = "linux"), unix))]
 const QUIC_SOCKET_BUFFER_MIN: libc::c_int = 64 * 1024;
+
+/// QUIC の UDP ソケットに DF（分割しない）を立てる（失敗は無視する）。
+///
+/// quiche の経路 MTU の探索（`[http3] discover_pmtu`）は、探索のパケットが経路の MTU を超えたら**落ちる**ことを前提に
+/// する。DF が無いと IPv4 では途中で分割されて届き、大きすぎる値を確定してしまう（v0.8.0、F-240）。Linux は
+/// `IP_PMTUDISC_PROBE`（DF を立て、カーネルの PMTU のキャッシュには従わない。探索は quiche が行う）。
+#[cfg(unix)]
+fn set_dont_fragment(fd: libc::c_int, ipv4: bool) {
+    let set = |level: libc::c_int, name: libc::c_int, val: libc::c_int| {
+        // SAFETY: fd は呼び出し側が作った有効なソケット。val は生存する c_int で、長さはその大きさ。
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        set(
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_PROBE,
+        );
+        if !ipv4 {
+            set(
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IPV6_PMTUDISC_PROBE,
+            );
+        }
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    if ipv4 {
+        set(libc::IPPROTO_IP, libc::IP_DONTFRAG, 1);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !ipv4 {
+        set(libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+    let _ = ipv4;
+}
 
 /// B-95: `SO_RCVBUF`/`SO_SNDBUF` を「通る最大値」で設定する。設定できたサイズを返す。
 ///
@@ -1331,10 +1321,12 @@ impl QuicUdpSocket {
 
         #[cfg(target_os = "macos")]
         let fd = {
+            // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に fd < 0 で検査する。
             let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: fd は直前に作った有効なソケット。fcntl は整数引数のみ。
             unsafe {
                 libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -1342,6 +1334,7 @@ impl QuicUdpSocket {
             fd
         };
         #[cfg(not(target_os = "macos"))]
+        // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に fd < 0 で検査する。
         let fd = unsafe {
             libc::socket(
                 domain,
@@ -1353,7 +1346,10 @@ impl QuicUdpSocket {
             return Err(io::Error::last_os_error());
         }
 
+        set_dont_fragment(fd, addr.is_ipv4());
+
         let optval: libc::c_int = 1;
+        // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し長さはその大きさ。
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -1364,8 +1360,10 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // FreeBSD: SO_REUSEPORT はバインド共存のみでカーネル分散を行わない。
@@ -1375,6 +1373,7 @@ impl QuicUdpSocket {
         let reuseport_opt = libc::SO_REUSEPORT_LB;
         #[cfg(not(target_os = "freebsd"))]
         let reuseport_opt = libc::SO_REUSEPORT;
+        // SAFETY: fd は有効なソケット。optval は c_int を指し長さはその大きさ。
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -1385,15 +1384,20 @@ impl QuicUdpSocket {
             )
         };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         let (storage, len) = socket_addr_to_raw(addr);
+        // SAFETY: fd は有効なソケット。storage は socket_addr_to_raw が len バイト分を初期化した sockaddr_storage。
         let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
 
         // 高スループット向けにソケットバッファを拡大（Linux 版 configure_gso_gro と同方針）。
@@ -1415,6 +1419,7 @@ impl QuicUdpSocket {
             );
         }
 
+        // SAFETY: fd は上で作成して検証済みの、自分だけが所有する UDP ソケット。所有権は UdpSocket へ移り、以後この fd を直接 close しない。
         let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
         socket.set_nonblocking(true)?;
         let local_addr = socket.local_addr()?;
@@ -1446,6 +1451,7 @@ impl QuicUdpSocket {
         let seg = (segment_size as usize).max(1);
         let mut sent_total = 0usize;
         for chunk in data.chunks(seg) {
+            // SAFETY: fd は self.socket が所有する有効なソケット。chunk は chunk.len() バイトの読み取り可能なスライス、sockaddr は socket_addr_to_raw が sockaddr_len バイト分を初期化した sockaddr_storage。
             let ret = unsafe {
                 libc::sendto(
                     fd,
@@ -1470,8 +1476,10 @@ impl QuicUdpSocket {
     /// 非 Linux 版 `recv_with_gro_sync`: 単発 `recvfrom`（GRO 集約なし）。
     pub fn recv_with_gro_sync(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
         let fd = self.socket.as_raw_fd();
+        // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: fd は self.socket が所有する有効なソケット。buf は buf.len() バイトの書き込み可能なスライス、storage と addr_len は生存する可変領域で addr_len は storage の大きさ。
         let ret = unsafe {
             libc::recvfrom(
                 fd,
@@ -1516,8 +1524,10 @@ impl QuicUdpSocket {
         while count < batch {
             let start = count * RECV_BUFFER_SIZE;
             let buf = &mut scratch.bufs[start..start + RECV_BUFFER_SIZE];
+            // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            // SAFETY: fd は self.socket が所有する有効なソケット。buf は buf.len() バイトの書き込み可能なスライス、storage と addr_len は生存する可変領域で addr_len は storage の大きさ。
             let ret = unsafe {
                 libc::recvfrom(
                     fd,
@@ -1561,6 +1571,7 @@ impl QuicUdpSocket {
             };
             for chunk in e.data.chunks(seg) {
                 loop {
+                    // SAFETY: fd は self.socket が所有する有効なソケット。chunk は chunk.len() バイトの読み取り可能なスライス、sockaddr は socket_addr_to_raw が sockaddr_len バイト分を初期化した sockaddr_storage。
                     let ret = unsafe {
                         libc::sendto(
                             fd,
@@ -1580,7 +1591,11 @@ impl QuicUdpSocket {
                         wait_writable_fd(fd).await?;
                         continue;
                     }
-                    warn!("[HTTP/3] send entry skipped: {}", err);
+                    if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                        ftlog::debug!("[HTTP/3] send entry skipped: {}", err);
+                    } else {
+                        warn!("[HTTP/3] send entry skipped: {}", err);
+                    }
                     break;
                 }
             }
@@ -1690,7 +1705,12 @@ impl QuicUdpSocket {
                                 wait_writable_fd(self.socket.as_raw_fd()).await?;
                                 continue;
                             }
-                            warn!("[HTTP/3] send entry skipped: {}", err);
+                            // WSAEMSGSIZE（10040）: DF の経路 MTU の探索で大きすぎた探索のパケット（想定内）
+                            if err.raw_os_error() == Some(10040) {
+                                ftlog::debug!("[HTTP/3] send entry skipped: {}", err);
+                            } else {
+                                warn!("[HTTP/3] send entry skipped: {}", err);
+                            }
                             break;
                         }
                     }
@@ -1724,7 +1744,7 @@ impl MmsgRecvScratch {
         Self {
             batch,
             bufs: vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice(),
-            // 安全性: sockaddr_storage は POD（全ビットゼロが有効表現）。
+            // SAFETY: sockaddr_storage は POD（全ビットゼロが有効表現）。
             metas: vec![(0, unsafe { std::mem::zeroed() }); batch].into_boxed_slice(),
         }
     }
@@ -1989,7 +2009,7 @@ mod tests {
         assert_eq!(original, recovered);
     }
 
-    // 注: 実際のソケット操作（bind, recv, send）はmonoioランタイムが必要
+    // 注: 実際のソケット操作（bind, recv, send）はランタイムのワーカーが必要
     // これらは統合テストで実施することを推奨
 
     // ====================
@@ -2081,7 +2101,7 @@ mod tests {
         let scratch = MmsgRecvScratch::new();
         assert_eq!(scratch.batch_size(), MMSG_BATCH_DEFAULT);
         for i in 0..scratch.batch_size() {
-            let iov = &scratch.iovecs[i];
+            let iov = &scratch._iovecs[i];
             assert_eq!(iov.iov_len, RECV_BUFFER_SIZE);
             let expected = scratch.bufs[i * RECV_BUFFER_SIZE..].as_ptr();
             assert_eq!(iov.iov_base as *const u8, expected);
@@ -2089,7 +2109,7 @@ mod tests {
             let hdr = &scratch.hdrs[i].msg_hdr;
             assert_eq!(
                 hdr.msg_iov as *const libc::iovec,
-                &scratch.iovecs[i] as *const libc::iovec
+                &scratch._iovecs[i] as *const libc::iovec
             );
         }
     }

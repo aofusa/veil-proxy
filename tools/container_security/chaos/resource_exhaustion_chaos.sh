@@ -120,3 +120,7 @@ done
 # io_uring SQ/CQ リング飽和については、B-24（SQ 満杯時の I/O Future 永久ハング）を
 # 本フェーズの設計中に検出・修正済み。ここでは cgroup 圧迫で CQ 溢れ経路を間接的に加圧する。
 echo "resource_exhaustion: done (findings=${fail}; SQ/CQ 飽和は B-24 で修正済み)" | tee -a "${REPORT}"
+# lib/report.sh は「<フェーズ>: ok」の行で合格と判定する（以前は done だけで、検出 0 件でも failed と集計されていた）
+if [[ "${fail}" -eq 0 ]]; then
+    echo "resource_exhaustion: ok" | tee -a "${REPORT}"
+fi

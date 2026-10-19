@@ -23,7 +23,7 @@
 //!   （`proto/veil/vds/v1/vds.proto`、`src/vds_grpc.rs`）。サーバが版を押し出すので長輪詢の待ちが無い。
 //! - `"rest"`: 上の `POST /v1/discovery` の長輪詢。
 //!
-//! 適用・ACK/NACK・状態は両者で共通（[`apply_snapshot`]・[`record_applied`]・[`record_rejected`]）。
+//! 適用・ACK/NACK・状態は両者で共通（`apply_snapshot`・`record_applied`・`record_rejected`）。
 //!
 //! 通信は専用スレッドで行い、データプレーン（ワーカーのイベントループ）には一切触れない。
 

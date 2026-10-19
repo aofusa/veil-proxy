@@ -53,6 +53,9 @@ impl WsaPollPoller {
             // 待機はこの関数を呼ばず executor 側で sleep するべきだが、防御的に
             // タイムアウト分だけ素朴に待つ（fd 監視なしの block_on ループ用）。
             if timeout_ms > 0 {
+                // reactor の park そのもの（epoll_wait / kevent の待機と同じ位置。待つ fd が無いときだけ）。
+                // ワーカースレッドに他にやることが無い状態でしか呼ばれない。
+                #[allow(clippy::disallowed_methods)]
                 std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
             }
             return Ok(0);
@@ -63,10 +66,10 @@ impl WsaPollPoller {
             .map(|(fd, armed)| {
                 let mut events: i16 = 0;
                 if armed & READ != 0 {
-                    events |= POLLRDNORM as i16;
+                    events |= POLLRDNORM;
                 }
                 if armed & WRITE != 0 {
-                    events |= POLLWRNORM as i16;
+                    events |= POLLWRNORM;
                 }
                 WSAPOLLFD {
                     fd: win::to_socket(*fd),
@@ -89,13 +92,13 @@ impl WsaPollPoller {
                 continue;
             }
             let mut bits = 0u32;
-            if pfd.revents & (POLLRDNORM as i16) != 0 {
+            if pfd.revents & POLLRDNORM != 0 {
                 bits |= READ;
             }
-            if pfd.revents & (POLLWRNORM as i16) != 0 {
+            if pfd.revents & POLLWRNORM != 0 {
                 bits |= WRITE;
             }
-            if pfd.revents & ((POLLERR | POLLHUP) as i16) != 0 {
+            if pfd.revents & (POLLERR | POLLHUP) != 0 {
                 bits |= ERR_HUP;
             }
             if bits != 0 {

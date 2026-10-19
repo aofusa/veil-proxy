@@ -67,19 +67,20 @@
 | `[http2]` | `max_header_block_size` | `65536` | 最大ヘッダーブロック（64KB） |
 | `[http2]` | `stream_idle_timeout_secs` | `60` | ストリームアイドルタイムアウト（秒） |
 | `[http3]` | `max_idle_timeout` | `30000` | 最大アイドルタイムアウト（ミリ秒、30秒） |
-| `[http3]` | `max_udp_payload_size` | `1350` | 最大UDPペイロードサイズ |
+| `[http3]` | `max_udp_payload_size` | `1452` | 最大UDPペイロードサイズ。経路 MTU の探索の上限（v0.8.0 より前は `1350`。1350 固定だと 54KB の応答に 42 パケット（nginx 39）で、Linux で 6.7% 遅かった） |
+| `[http3]` | `discover_pmtu` | `true` | 経路 MTU の探索（quiche、RFC 8899 の DPLPMTUD）。1200 バイトから始め、探索のパケットが届いた大きさだけを使うので、MTU の小さい経路でも動く。UDP のソケットに DF を立てる（Linux は `IP_PMTUDISC_PROBE`、BSD・macOS は `IP_DONTFRAG`/`IPV6_DONTFRAG`） |
 | `[http3]` | `initial_max_data` | `10000000` | 初期最大データ（10MB） |
 | `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | ストリームデータ双方向ローカル（1MB） |
 | `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | ストリームデータ双方向リモート（1MB） |
 | `[http3]` | `initial_max_stream_data_uni` | `1000000` | ストリームデータ単方向（1MB） |
 | `[http3]` | `initial_max_streams_bidi` | `100` | 最大双方向ストリーム数 |
 | `[http3]` | `initial_max_streams_uni` | `100` | 最大単方向ストリーム数 |
-| `[http3]` | `cc_algorithm` | `"bbr"` | QUIC 輻輳制御（`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`） |
+| `[http3]` | `cc_algorithm` | `"cubic"` | QUIC 輻輳制御（`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`）。v0.8.0 より前の既定は `"bbr"`。veil は quiche の pacing の送出時刻まで待たずに送るので、BBR は送出が一気になって受け手で捨てられ再送が増えていた（CUBIC で HTTP/3 の 54KB が FreeBSD +8〜20%・Linux +4〜6%） |
 | `[http3]` | `pacing` | `true` | Packet Pacing を有効化 |
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring パイプライン化 RECVMSG/SENDMSG バッチ幅（1..=128） |
-| `[http3]` | `recv_drain_max` | `64` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
+| `[http3]` | `recv_drain_max` | `1024` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。v0.8.0 より前の既定は 64。1024 で FreeBSD の HTTP/3 3B が 37% 伸びた（p99 は 11 → 14ms）。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
 | `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`[http3] enabled = true` 時のみ） |
@@ -145,6 +146,14 @@ drop_privileges_user = "nobody"
 drop_privileges_group = "nogroup"
 # グローバル同時接続上限（0 = 無制限）
 max_concurrent_connections = 10000
+# 要求のパスの正規化。ルートの照合・[route.security] の検査の前に行い、正規化したパスを上流へも送る
+# （veil と上流でパスの解釈が揃う。HTTP/1.1・HTTP/2・HTTP/3）。
+# "base"（既定）: 予約されていない文字の %XX を戻し、"\" を "/" にし、"." と ".." のセグメントを取り除く
+# "merge_slashes": base + 連続する "/" を 1 つにする
+# "off": 生のパスで照合して送る（v0.8.0 より前の動作）
+# %2F・%5C はそのまま残す。絶対形式の要求先（http://host/path）は origin 形式に直し、
+# それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400。
+# path_normalization = "base"
 
 # seccomp システムコール制限（Linux専用）
 # まずログモードで動作確認後、filterモードに変更推奨

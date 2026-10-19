@@ -11,12 +11,16 @@ use std::net::IpAddr;
 /// リクエストを受けたプロトコル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVersion {
+    /// HTTP/1.1
     Http11,
+    /// HTTP/2
     Http2,
+    /// HTTP/3
     Http3,
 }
 
 impl HttpVersion {
+    /// `"HTTP/1.1"`・`"HTTP/2"`・`"HTTP/3"` のいずれか。
     pub fn as_str(&self) -> &'static str {
         match self {
             HttpVersion::Http11 => "HTTP/1.1",

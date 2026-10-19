@@ -14,6 +14,8 @@
 //! この try-first + 既存 readiness 待機の組み合わせは io_uring / reactor の両バックエンドで
 //! 完全に共通のコードで実現できるため、非 Linux / Windows でも同一設計で動作する。
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use crate::runtime::handle::{AsRawFd, RawFd};
 use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
 use std::io;
@@ -32,9 +34,11 @@ use windows_sys::Win32::Networking::WinSock::{
 
 #[cfg(unix)]
 fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: sockaddr_storage は整数とバイト配列だけの POD で、全ビット 0 が有効な初期値。
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(v4) => {
+            // SAFETY: storage は sockaddr_in を収める大きさ・アラインメントの sockaddr_storage で、可変参照は storage を排他借用している間だけ使う。
             let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
             sin.sin_family = libc::AF_INET as _;
             sin.sin_port = v4.port().to_be();
@@ -42,6 +46,7 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::sock
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
         SocketAddr::V6(v6) => {
+            // SAFETY: storage は sockaddr_in6 を収める大きさ・アラインメントの sockaddr_storage で、可変参照は storage を排他借用している間だけ使う。
             let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
             sin6.sin6_family = libc::AF_INET6 as _;
             sin6.sin6_port = v6.port().to_be();
@@ -58,12 +63,14 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::sock
 fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
+            // SAFETY: ss_family が AF_INET なので storage の中身は sockaddr_in。sockaddr_storage は sockaddr_in に十分な大きさとアラインメントを持つ。
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         }
         libc::AF_INET6 => {
+            // SAFETY: ss_family が AF_INET6 なので storage の中身は sockaddr_in6。sockaddr_storage は sockaddr_in6 に十分な大きさとアラインメントを持つ。
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
@@ -84,6 +91,7 @@ fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAdd
 #[cfg(windows)]
 fn ensure_wsa_started() {
     static INIT: Once = Once::new();
+    // SAFETY: WSADATA は POD で全ビット 0 が有効。WSAStartup は有効な可変ポインタを受け、Once により 1 回だけ呼ぶ。
     INIT.call_once(|| unsafe {
         let mut data: WSADATA = std::mem::zeroed();
         WSAStartup(0x0202, &mut data);
@@ -93,6 +101,7 @@ fn ensure_wsa_started() {
 #[cfg(windows)]
 #[inline]
 fn last_wsa_error() -> io::Error {
+    // SAFETY: WSAGetLastError は引数を取らずスレッドローカルのエラーコードを返すだけ。
     io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
 }
 
@@ -100,10 +109,12 @@ fn last_wsa_error() -> io::Error {
 fn sockaddr_to_storage(addr: &SocketAddr) -> (Vec<u8>, i32) {
     match addr {
         SocketAddr::V4(v4) => {
+            // SAFETY: SOCKADDR_IN は POD で全ビット 0 が有効な初期値。
             let mut sin: SOCKADDR_IN = unsafe { std::mem::zeroed() };
             sin.sin_family = AF_INET;
             sin.sin_port = v4.port().to_be();
             sin.sin_addr.S_un.S_addr = u32::from_ne_bytes(v4.ip().octets());
+            // SAFETY: sin は直前までスタックに生きており、size_of::<SOCKADDR_IN>() バイト全体が初期化済み（zeroed 後に代入）。to_vec で即コピーするので参照は残らない。
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     &sin as *const _ as *const u8,
@@ -114,12 +125,14 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (Vec<u8>, i32) {
             (bytes, std::mem::size_of::<SOCKADDR_IN>() as i32)
         }
         SocketAddr::V6(v6) => {
+            // SAFETY: SOCKADDR_IN6 は POD で全ビット 0 が有効な初期値。
             let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
             sin6.sin6_family = AF_INET6;
             sin6.sin6_port = v6.port().to_be();
             sin6.sin6_addr.u.Byte = v6.ip().octets();
             sin6.sin6_flowinfo = v6.flowinfo();
             sin6.Anonymous.sin6_scope_id = v6.scope_id();
+            // SAFETY: sin6 は直前までスタックに生きており、size_of::<SOCKADDR_IN6>() バイト全体が初期化済み。to_vec で即コピーするので参照は残らない。
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     &sin6 as *const _ as *const u8,
@@ -135,17 +148,23 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (Vec<u8>, i32) {
 #[cfg(windows)]
 fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
     if buf.len() >= std::mem::size_of::<SOCKADDR_IN>() {
+        // SAFETY: buf.len() >= size_of::<SOCKADDR_IN>() を確認済みで、SOCKADDR の sa_family は先頭の読み取りのみ。
         let family = unsafe { (*(buf.as_ptr() as *const SOCKADDR)).sa_family };
         if family == AF_INET {
+            // SAFETY: family が AF_INET で buf は SOCKADDR_IN 以上の長さ。
             let sin = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN) };
+            // SAFETY: union フィールド S_addr は IPv4 アドレスとして常に有効な 32 ビット整数。
             let ip = std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
             let port = u16::from_be(sin.sin_port);
             return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
         }
         if family == AF_INET6 && buf.len() >= std::mem::size_of::<SOCKADDR_IN6>() {
+            // SAFETY: family が AF_INET6 で buf.len() >= size_of::<SOCKADDR_IN6>() を確認済み。
             let sin6 = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN6) };
+            // SAFETY: union フィールド Byte は 16 バイト配列で任意のビットパターンが有効。
             let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
             let port = u16::from_be(sin6.sin6_port);
+            // SAFETY: union フィールド sin6_scope_id は u32 で任意のビットパターンが有効。
             let scope_id = unsafe { sin6.Anonymous.sin6_scope_id };
             return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
                 ip,
@@ -162,10 +181,12 @@ fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
 fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
     #[cfg(target_os = "macos")]
     let fd = {
+        // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に戻り値で検査する。
         let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: fd は直前に作った有効なソケット。fcntl は整数引数のみ。
         unsafe {
             libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
             libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -173,6 +194,7 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
         fd
     };
     #[cfg(not(target_os = "macos"))]
+    // SAFETY: socket(2) は整数引数のみを取り、失敗は直後に戻り値で検査する。
     let fd = unsafe {
         libc::socket(
             domain,
@@ -186,6 +208,7 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
     #[cfg(target_os = "macos")]
     {
         let optval: libc::c_int = 1;
+        // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し長さはその大きさ。
         unsafe {
             libc::setsockopt(
                 fd,
@@ -202,13 +225,16 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
 #[cfg(windows)]
 fn new_nonblocking_dgram_socket(domain: i32) -> io::Result<RawFd> {
     ensure_wsa_started();
-    let sock = unsafe { ws_socket(domain, SOCK_DGRAM as i32, IPPROTO_UDP as i32) };
+    // SAFETY: socket は整数引数のみを取り、失敗は直後に INVALID_SOCKET で検査する。
+    let sock = unsafe { ws_socket(domain, SOCK_DGRAM, IPPROTO_UDP) };
     if sock == INVALID_SOCKET {
         return Err(last_wsa_error());
     }
     let mut nonblocking: u32 = 1;
+    // SAFETY: sock は直前に作った有効なソケット。nonblocking は生存する u32 への可変ポインタ。
     if unsafe { ioctlsocket(sock, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
         let e = last_wsa_error();
+        // SAFETY: sock は直前に作った自分の所有するソケットで、ここで 1 度だけ閉じる。
         unsafe { closesocket(sock) };
         return Err(e);
     }
@@ -242,6 +268,7 @@ impl UdpSocket {
         #[cfg(unix)]
         {
             let optval: libc::c_int = 1;
+            // SAFETY: fd は new_nonblocking_dgram_socket が返した有効なソケット。optval は c_int を指し長さはその大きさ。
             let ret = unsafe {
                 libc::setsockopt(
                     fd,
@@ -252,14 +279,19 @@ impl UdpSocket {
                 )
             };
             if ret < 0 {
+                let e = io::Error::last_os_error();
+                // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
                 unsafe { libc::close(fd) };
-                return Err(io::Error::last_os_error());
+                return Err(e);
             }
             let (storage, len) = sockaddr_to_storage(&addr);
+            // SAFETY: fd は有効なソケット。storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
             let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
             if ret < 0 {
+                let e = io::Error::last_os_error();
+                // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
                 unsafe { libc::close(fd) };
-                return Err(io::Error::last_os_error());
+                return Err(e);
             }
         }
 
@@ -267,6 +299,7 @@ impl UdpSocket {
         {
             let sock = crate::runtime::handle::win::to_socket(fd);
             let optval: i32 = 1;
+            // SAFETY: sock は有効なソケット。optval は i32 を指し長さはその大きさ。
             let ret = unsafe {
                 ws_setsockopt(
                     sock,
@@ -277,12 +310,15 @@ impl UdpSocket {
                 )
             };
             if ret == SOCKET_ERROR {
+                // SAFETY: sock は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる。
                 unsafe { closesocket(sock) };
                 return Err(last_wsa_error());
             }
             let (storage, len) = sockaddr_to_storage(&addr);
+            // SAFETY: sock は有効なソケット。storage は sockaddr_to_storage が作った len バイトの SOCKADDR バイト列。
             let ret = unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
             if ret == SOCKET_ERROR {
+                // SAFETY: sock は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる。
                 unsafe { closesocket(sock) };
                 return Err(last_wsa_error());
             }
@@ -297,6 +333,7 @@ impl UdpSocket {
         let (storage, len) = sockaddr_to_storage(&addr);
         #[cfg(unix)]
         {
+            // SAFETY: self.fd は自分の所有する有効なソケット。storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
             let ret = unsafe {
                 libc::connect(self.fd, &storage as *const _ as *const libc::sockaddr, len)
             };
@@ -307,6 +344,7 @@ impl UdpSocket {
         #[cfg(windows)]
         {
             let sock = crate::runtime::handle::win::to_socket(self.fd);
+            // SAFETY: self.fd は有効なソケット。storage は sockaddr_to_storage が作った len バイトの SOCKADDR バイト列。
             let ret = unsafe { ws_connect(sock, storage.as_ptr() as *const SOCKADDR, len) };
             if ret == SOCKET_ERROR {
                 return Err(last_wsa_error());
@@ -319,9 +357,11 @@ impl UdpSocket {
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         loop {
             #[cfg(unix)]
+            // SAFETY: self.fd は有効なソケット。buf は buf.len() バイトの読み取り可能なスライス。
             let ret =
                 unsafe { libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
             #[cfg(windows)]
+            // SAFETY: ソケットは有効。buf は buf.len() バイトの読み取り可能なスライスで、長さは i32 に収まる範囲で渡す。
             let ret = unsafe {
                 ws_send(
                     crate::runtime::handle::win::to_socket(self.fd),
@@ -351,9 +391,11 @@ impl UdpSocket {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             #[cfg(unix)]
+            // SAFETY: self.fd は有効なソケット。buf は buf.len() バイトの書き込み可能なスライス。
             let ret =
                 unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             #[cfg(windows)]
+            // SAFETY: ソケットは有効。buf は buf.len() バイトの書き込み可能なスライスで、長さは i32 に収まる範囲で渡す。
             let ret = unsafe {
                 ws_recv(
                     crate::runtime::handle::win::to_socket(self.fd),
@@ -384,6 +426,7 @@ impl UdpSocket {
         let (storage, len) = sockaddr_to_storage(&addr);
         loop {
             #[cfg(unix)]
+            // SAFETY: self.fd は有効なソケット。buf は buf.len() バイトの読み取り可能なスライス、storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
             let ret = unsafe {
                 libc::sendto(
                     self.fd,
@@ -395,6 +438,7 @@ impl UdpSocket {
                 )
             };
             #[cfg(windows)]
+            // SAFETY: ソケットは有効。buf は読み取り可能なスライス、storage は sockaddr_to_storage が作った len バイトの SOCKADDR バイト列。
             let ret = unsafe {
                 ws_sendto(
                     crate::runtime::handle::win::to_socket(self.fd),
@@ -427,8 +471,10 @@ impl UdpSocket {
         loop {
             #[cfg(unix)]
             let (ret, from) = {
+                // SAFETY: sockaddr_storage は POD で全ビット 0 が有効な初期値。
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                // SAFETY: self.fd は有効なソケット。buf は書き込み可能なスライス、storage と len は生存する可変領域で len は storage の大きさ。
                 let r = unsafe {
                     libc::recvfrom(
                         self.fd,
@@ -453,6 +499,7 @@ impl UdpSocket {
             let (ret, from) = {
                 let mut buf_storage = [0u8; 128];
                 let mut len = buf_storage.len() as i32;
+                // SAFETY: ソケットは有効。buf は書き込み可能なスライス、buf_storage と len は生存する可変領域で len は buf_storage の大きさ。
                 let r = unsafe {
                     ws_recvfrom(
                         crate::runtime::handle::win::to_socket(self.fd),
@@ -497,8 +544,10 @@ impl UdpSocket {
     fn query_local_addr(fd: RawFd) -> io::Result<SocketAddr> {
         #[cfg(unix)]
         {
+            // SAFETY: sockaddr_storage は POD で全ビット 0 が有効な初期値。
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            // SAFETY: fd は有効なソケット。storage と len は生存する可変領域で len は storage の大きさ。
             let ret = unsafe {
                 libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
             };
@@ -511,6 +560,7 @@ impl UdpSocket {
         {
             let mut buf = [0u8; 128];
             let mut len = buf.len() as i32;
+            // SAFETY: ソケットは有効。buf と len は生存する可変領域で len は buf の大きさ。
             let ret = unsafe {
                 ws_getsockname(
                     crate::runtime::handle::win::to_socket(fd),
@@ -535,10 +585,12 @@ impl AsRawFd for UdpSocket {
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
+        // SAFETY: self.fd は自分の所有する有効なソケットで、Drop により 1 度だけ閉じる。
         unsafe {
             libc::close(self.fd);
         }
         #[cfg(windows)]
+        // SAFETY: self.fd は自分の所有するソケットで、Drop により 1 度だけ閉じる。
         unsafe {
             closesocket(crate::runtime::handle::win::to_socket(self.fd));
         }

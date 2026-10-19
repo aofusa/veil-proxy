@@ -2,8 +2,12 @@
 
 ## 由来
 
-crates.io の [`wasmtime` 36.0.17](https://crates.io/crates/wasmtime/36.0.17)（LTS）をそのままコピー
-（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.17/` から）。
+crates.io の [`wasmtime` 36.0.18](https://crates.io/crates/wasmtime/36.0.18)（LTS）をそのままコピー
+（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.18/` から）。
+
+> **2026-10-18: 36.0.17 → 36.0.18（v0.8.0）。** RUSTSEC-2026-0363（component model のハンドル表の上限が
+> インスタンスごとにしか掛からない）の修正版。veil は core module しか使わないが、同じ LTS の修正版に揃えた。
+> 差分（下記）は 36.0.17 のときのものをそのまま当て直した（`Cargo.toml` のパッケージ名の行だけ手で当てた）。
 
 > **2026-10: 40.0.4 → 36.0.17（LTS）へ移した（B-79）。** cargo-audit が wasmtime 40 系に
 > 16 件の勧告（RUSTSEC-2026-0096 = aarch64 Cranelift の誤コンパイルによるサンドボックス脱出
@@ -13,7 +17,7 @@ crates.io の [`wasmtime` 36.0.17](https://crates.io/crates/wasmtime/36.0.17)（
 > MSRV 1.86 の LTS 36 系を選んだ。veil が使う API（core module・async + fuel yield・
 > epoch 割り込み・プーリングアロケータ・Cranelift / Pulley）は 36 でもそのまま使える。
 > 本体の crates.io 依存（Linux / macOS / Windows / FreeBSD x86_64 / OpenBSD x86_64）も
-> 同じ 36.0.17 に揃えてある。
+> 同じ版に揃えてある（現在 36.0.18）。
 `Cargo.toml` / `Cargo.toml.orig` / `LICENSE` / `README.md` / `build.rs` / `src/` を取り込み、
 `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込んでいない
 （veil のワークスペースビルドには不要で、`tests/` は crates.io 公開物とは無関係の
@@ -76,7 +80,7 @@ wasmtime 36 / 40 の `signals.rs` には（OpenBSD aarch64・NetBSD 向けの）
 ## なぜパッケージ名だけ変えて `[lib] name` は変えないのか
 
 Linux / Windows / macOS / FreeBSD(x86_64) / OpenBSD(x86_64) は crates.io の
-`wasmtime` 36.0.17 をそのまま使い、ソースも依存も一切変えない設計（B-55 の影響範囲限定）。
+`wasmtime` 36.0.18 をそのまま使い、ソースも依存も一切変えない設計（B-55 の影響範囲限定）。
 `[target.'cfg(...)'.dependencies]` でターゲット別に依存を出し分けているが、
 もし依存キーを両方とも `wasmtime` のままにすると、cargo は
 

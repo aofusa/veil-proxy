@@ -23,26 +23,35 @@ pub type HandlerFn = Arc<dyn Fn(Request) -> HandlerFuture + Send + Sync>;
 /// OpenAPI のパラメータ 1 件。
 #[derive(Debug, Clone)]
 pub struct ParamMeta {
+    /// パラメータ名。
     pub name: String,
     /// `"path"` / `"query"` / `"header"`
     pub location: &'static str,
+    /// 必須か。
     pub required: bool,
+    /// JSON Schema。
     pub schema: Value,
+    /// 説明文。
     pub description: Option<String>,
 }
 
 /// OpenAPI のリクエスト本文。
 #[derive(Debug, Clone)]
 pub struct BodyMeta {
+    /// 本文の `Content-Type`。
     pub content_type: &'static str,
+    /// 本文の JSON Schema。
     pub schema: Value,
+    /// 本文が必須か。
     pub required: bool,
 }
 
 /// OpenAPI の応答 1 件。
 #[derive(Debug, Clone)]
 pub struct ResponseMeta {
+    /// HTTP ステータスコード。
     pub status: u16,
+    /// 応答の説明文。
     pub description: String,
     /// (content-type, schema)
     pub content: Option<(&'static str, Value)>,
@@ -51,12 +60,19 @@ pub struct ResponseMeta {
 /// ルート 1 件の OpenAPI 用メタデータ（マクロ・C・Python から集める）。
 #[derive(Debug, Clone, Default)]
 pub struct OperationMeta {
+    /// OpenAPI の `operationId`（ルートごとに一意）。
     pub operation_id: String,
+    /// OpenAPI の `summary`。
     pub summary: Option<String>,
+    /// OpenAPI の `description`。
     pub description: Option<String>,
+    /// OpenAPI の `tags`。
     pub tags: Vec<String>,
+    /// パス・クエリ・ヘッダのパラメータ。
     pub parameters: Vec<ParamMeta>,
+    /// 要求本文。
     pub request_body: Option<BodyMeta>,
+    /// 応答の一覧。
     pub responses: Vec<ResponseMeta>,
     /// 参照される名前付きスキーマ（components.schemas に入る）。
     pub definitions: Definitions,
@@ -71,10 +87,15 @@ pub struct OperationMeta {
 
 /// マクロ（`#[veil::route]`）が静的に登録するルート定義。
 pub struct RouteDef {
+    /// ルートの名前（関数名。`operation_id` の既定にもなる）。
     pub name: &'static str,
+    /// パスのパターン（`/users/{id}` 形式）。
     pub path: &'static str,
+    /// 受け付けるメソッド（大文字）。空なら全メソッド。
     pub methods: &'static [&'static str],
+    /// ハンドラ本体。
     pub handler: fn(Request) -> HandlerFuture,
+    /// OpenAPI 用メタデータを返す関数（文書の生成時に呼ぶ）。
     pub meta: fn() -> OperationMeta,
     /// 要求本文をストリーミングで受け取る（HTTP/2。`#[veil::route(streaming = true)]`、F-197）
     pub streaming_request: bool,
@@ -84,11 +105,15 @@ inventory::collect!(RouteDef);
 
 /// 登録済みのハンドラ 1 件。
 pub struct HandlerEntry {
+    /// ハンドラの名前（`[[route]]` の `handler` で参照される）。
     pub name: Arc<str>,
+    /// パスのパターン。
     pub pattern: PathPattern,
     /// 大文字のメソッド名。空なら全メソッド。
     pub methods: Vec<String>,
+    /// ハンドラ本体。
     pub func: HandlerFn,
+    /// OpenAPI 用メタデータ。
     pub meta: OperationMeta,
     /// 要求本文をストリーミングで受け取る（HTTP/2 で `Request::take_body_stream` に届いた順に流す。F-197）
     pub streaming_request: bool,

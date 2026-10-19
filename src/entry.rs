@@ -127,6 +127,11 @@ impl WorkerListenerSource {
 // ====================
 
 pub fn run() {
+    // F-237: io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）、同じイメージの epoll 版へ
+    // 切り替える（切り替え先が無ければ何もしない）。メッシュの起動（F-227）より前に行う。
+    #[cfg(veil_rt_uring)]
+    crate::runtime::fallback::exec_reactor_if_uring_unavailable();
+
     // F-182: capsicum の capability mode 用の接続ブローカーとして再実行された場合（隠し引数）。
     // 設定・ログ・ランタイムを一切初期化せずにブローカーのループへ入る。
     #[cfg(target_os = "freebsd")]
@@ -570,6 +575,8 @@ pub fn run_server(opts: ServerOptions) {
     };
     // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（config::reload と同じ）。
     crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
+    crate::l7::set_max_buffered_request_body(&runtime_config.route);
+    crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
 

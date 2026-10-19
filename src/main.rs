@@ -1,10 +1,10 @@
 //! # High-Performance Reverse Proxy Server
 //!
-//! io_uring (monoio) と rustls + ktls2 を使用した高性能リバースプロキシサーバー。
+//! io_uring（独自ランタイム）と rustls + ktls2 を使用した高性能リバースプロキシサーバー。
 //!
 //! ## 特徴
 //!
-//! - **非同期I/O**: monoio (io_uring) による効率的なI/O処理
+//! - **非同期I/O**: 独自ランタイム（`src/runtime/`。io_uring / readiness reactor）による効率的なI/O処理
 //! - **TLS**: rustls によるPure Rust TLS実装
 //! - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応
 //! - **コネクションプール**: バックエンド接続の再利用

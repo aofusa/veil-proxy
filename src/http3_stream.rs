@@ -13,11 +13,11 @@
 //! 本モジュールは次の 2 アクターを **単一スレッド非同期チャネル + Notify** で接続する:
 //!
 //! - **メインループ（QUIC/H3 アクター）**: `conn.send/recv`・`h3.poll/send_response/send_body/
-//!   recv_body` を唯一駆動する。レスポンスは [`Receiver`]`<`[`RespMsg`]`>` から受け取って
+//!   recv_body` を唯一駆動する。レスポンスは [`Receiver`]`<``RespMsg``>` から受け取って
 //!   `send_body`、リクエストボディは `recv_body` して [`Sender`]`<`[`bytes::Bytes`]`>` へ流す。
 //! - **バックエンドタスク（TCP I/O アクター）**: [`crate::runtime::tcp::TcpStream`]（io_uring）で
 //!   バックエンドへ非同期接続し、リクエスト head 送出 → リクエストボディを chunked 逐次転送 →
-//!   レスポンス head/body を逐次受信して [`RespMsg`] としてメインループへ送る。
+//!   レスポンス head/body を逐次受信して `RespMsg` としてメインループへ送る。
 //!
 //! チャネルは [`Rc`]`<`[`RefCell`]`>` ベースで **アトミック・ロックを一切使わない**
 //! （同一スレッド内の瞬間的 borrow のみ。本クレートの `ConnectionMap` 等と同方針）。

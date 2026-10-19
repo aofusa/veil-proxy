@@ -1,6 +1,6 @@
 //! カスタム io_uring ランタイム
 //!
-//! monoio を削除して自前の io_uring 実装に置き換えたランタイムモジュール。
+//! 自前の io_uring 実装（と readiness reactor）によるランタイムモジュール（F-28 で外部ランタイムから置き換えた）。
 //!
 //! ## 設計方針
 //!
@@ -48,6 +48,9 @@ pub mod udp;
 mod reactor;
 #[cfg(veil_rt_uring)]
 mod uring;
+// io_uring が使えないときの epoll 版への切り替え（F-237）
+#[cfg(veil_rt_uring)]
+pub mod fallback;
 
 #[cfg(veil_rt_reactor)]
 pub use reactor::{executor, tcp, timer};
@@ -134,7 +137,7 @@ impl Default for RuntimeConfig {
 
 /// 現在のスレッドでランタイムを初期化して Future を実行する
 ///
-/// monoio の `RuntimeBuilder::new_current_thread().build()?.block_on(...)` に相当。
+/// 単一スレッドのランタイムを作り、Future を完了まで駆動する。
 ///
 /// # 使用例
 ///
@@ -218,10 +221,10 @@ where
 }
 
 // ====================
-// time モジュール（monoio 互換）
+// time モジュール
 // ====================
 
-/// 時間関連ユーティリティ（monoio::time 互換）
+/// 時間関連ユーティリティ（`sleep`・`timeout`・`Instant`）
 pub mod time {
     // timer モジュールの sleep/timeout/Elapsed を re-export
     pub use super::timer::{

@@ -215,6 +215,7 @@ macro_rules! status_ctor {
 }
 
 impl Status {
+    /// 指定したコードとメッセージで `Status` を作る（メタデータ・詳細は空）。
     pub fn new(code: Code, message: impl Into<String>) -> Status {
         Status {
             code,
@@ -243,10 +244,12 @@ impl Status {
         unauthenticated => Unauthenticated,
     }
 
+    /// `grpc-status` に載るコード。
     pub fn code(&self) -> Code {
         self.code
     }
 
+    /// `grpc-message` に載るメッセージ。
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -382,14 +385,17 @@ impl<T> Request<T> {
         }
     }
 
+    /// デコード済みの要求メッセージへの参照。
     pub fn get_ref(&self) -> &T {
         &self.message
     }
 
+    /// デコード済みの要求メッセージへの可変参照。
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.message
     }
 
+    /// 要求メッセージを取り出す（メタデータは捨てる）。
     pub fn into_inner(self) -> T {
         self.message
     }
@@ -412,6 +418,7 @@ impl<T> Request<T> {
         self.deadline
     }
 
+    /// クライアントの IP アドレス（`Request::new` で作ったものは `127.0.0.1`）。
     pub fn client_ip(&self) -> IpAddr {
         self.client_ip
     }
@@ -443,6 +450,7 @@ pub struct Response<T> {
 }
 
 impl<T> Response<T> {
+    /// 応答メッセージから `Response` を作る（メタデータ・トレーラは空、圧縮は設定に従う）。
     pub fn new(message: T) -> Response<T> {
         Response {
             metadata: Vec::new(),
@@ -459,10 +467,12 @@ impl<T> Response<T> {
         self
     }
 
+    /// 応答メッセージへの参照。
     pub fn get_ref(&self) -> &T {
         &self.message
     }
 
+    /// 応答メッセージを取り出す（メタデータ・トレーラは捨てる）。
     pub fn into_inner(self) -> T {
         self.message
     }
@@ -479,6 +489,7 @@ impl<T> Response<T> {
         self
     }
 
+    /// 応答ヘッダに足したメタデータ。
     pub fn metadata(&self) -> &[(Bytes, Bytes)] {
         &self.metadata
     }

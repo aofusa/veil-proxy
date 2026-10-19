@@ -2,9 +2,9 @@
 //!
 //! `[[wasm.modules]]` の `configuration` は TOML では「文字列」（従来互換、多くは
 //! JSON をそのまま渡す）または「テーブル」（JSON オブジェクトへ変換してから渡す）
-//! のいずれかで書ける。ここではその型 [`PluginConfiguration`] と、
-//! ルート単位の上書きを合成する [`merge_over`]、TOML → JSON への変換
-//! ([`PluginConfiguration::to_bytes`]) を提供する。
+//! のいずれかで書ける。ここではその型 `PluginConfiguration` と、
+//! ルート単位の上書きを合成する `merge_over`、TOML → JSON への変換
+//! (`PluginConfiguration::to_bytes`) を提供する。
 //!
 //! `feature = "wasm"` に依存せず常にコンパイルされる（`src/config.rs` が
 //! `wasm` 無効ビルドでも `Route::module_configuration` の型として使うため）。

@@ -7,7 +7,7 @@
 //!
 //! - **インメモリインデックス**: DashMapによるロックフリーな並行アクセス
 //! - **メモリキャッシュ**: 小さいレスポンス用の高速アクセス
-//! - **ディスクキャッシュ**: 大きいレスポンス用のmonoio::fs非同期I/O
+//! - **ディスクキャッシュ**: 大きいレスポンス用の非同期ファイル I/O（`runtime::offload`）
 //! - **LRU Eviction**: メモリ制限に達した際の自動削除
 //! - **Cache-Control対応**: TTL、Vary、ETagのサポート
 //!
@@ -20,7 +20,7 @@
 //! │  CacheManager                           │
 //! │  ├─ CacheIndex (DashMap)                │← キャッシュメタデータ
 //! │  ├─ MemoryCache (LruCache)              │← 小さいレスポンス
-//! │  └─ DiskCache (monoio::fs)              │← 大きいレスポンス
+//! │  └─ DiskCache (offload)                 │← 大きいレスポンス
 //! └─────────────────────────────────────────┘
 //! ```
 //!
@@ -51,6 +51,7 @@ pub mod compressed;
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
 mod content_cache;
+// FreeBSD: 静的コンテンツキャッシュの本体を共有メモリに置き、h2c の DATA を sendfile(2) で送る（v0.8.0）
 #[cfg(feature = "cache")]
 mod disk;
 #[cfg(feature = "cache")]
@@ -63,6 +64,8 @@ mod manager;
 mod memory;
 #[cfg(feature = "cache")]
 mod revalidation;
+#[cfg(all(feature = "cache", target_os = "freebsd"))]
+pub(crate) mod shm;
 // B-65: 静的配信のメタデータ+本体を1回のoffloadで取得する複合API。file_cache/content_cache
 // の両方に依存するため cache feature 有効時のみコンパイルする。
 #[cfg(feature = "cache")]

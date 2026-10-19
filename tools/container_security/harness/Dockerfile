@@ -56,7 +56,7 @@ COPY fixtures/ /fixtures/
 RUN chmod +x /scripts/*.sh 2>/dev/null || true
 
 ENV VEIL_HOST=veil-proxy \
-    VEIL_HTTP_PORT=80 \
+    VEIL_HTTP_PORT=8443 \
     VEIL_HTTPS_PORT=443
 
 ENTRYPOINT ["/scripts/entrypoint.sh"]

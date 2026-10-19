@@ -7,10 +7,10 @@
 //! Notify** で接続するための共通プリミティブを提供する（元は [`crate::http3_stream`] に存在し、
 //! HTTP/2 多重化（F-116）で共有するため抽出した）。
 //!
-//! - [`Notify`]: タスク → メインループの起床通知。メインループはソケット I/O 待機と本 Notify を
+//! - `Notify`: タスク → メインループの起床通知。メインループはソケット I/O 待機と本 Notify を
 //!   同時に待つ（`select`）。タスクがレスポンスチャネルへ push した／リクエストチャネルを消費した
-//!   際に [`Notify::notify`] を呼ぶと、メインループが起きて各ストリームを再駆動する。
-//! - [`channel`]: 容量 `cap`（アイテム数）の有界 SPSC チャネル。[`Rc`]`<`[`RefCell`]`>` ベースで
+//!   際に `Notify::notify` を呼ぶと、メインループが起きて各ストリームを再駆動する。
+//! - `channel`: 容量 `cap`（アイテム数）の有界 SPSC チャネル。`Rc``<``RefCell``>` ベースで
 //!   **アトミック・ロックを一切使わない**（同一スレッド内の瞬間的 borrow のみ）。有界チャネルに
 //!   より、クライアント遅延 → レスポンスチャネル満杯 → バックエンド read 停止、バックエンド遅延 →
 //!   リクエストチャネル満杯 → 送信停止、という**バックプレッシャ**が双方向に自然伝播する。
@@ -119,10 +119,8 @@ pub struct Receiver<T> {
 pub enum TrySendError<T> {
     /// 容量上限（バックプレッシャ）。アイテムは返却される。
     Full(T),
-    /// 受信端が drop 済み。アイテムは返却される。
-    // 理由付き allow: std の `TrySendError` と同じく、送れなかった値の所有権を呼び出し側へ返すための
-    // フィールド。現在の呼び出し側はすべて破棄する（`Closed(_)`）が、値を取り戻せる API を保つ。
-    Closed(#[allow(dead_code)] T),
+    /// 受信端が drop 済み。アイテムは破棄される（呼び出し側はすべて破棄していたので返さない）。
+    Closed,
 }
 
 /// [`Sender::send`] の失敗: 受信端が drop 済み（アイテムは破棄される）。
@@ -158,7 +156,8 @@ impl<T> Sender<T> {
         let waker = {
             let mut s = self.sh.borrow_mut();
             if s.receiver_closed {
-                return Err(TrySendError::Closed(item));
+                drop(item);
+                return Err(TrySendError::Closed);
             }
             if s.queue.len() >= s.cap {
                 return Err(TrySendError::Full(item));
@@ -354,7 +353,7 @@ mod tests {
     fn channel_receiver_drop_blocks_send() {
         let (tx, rx) = channel::<u32>(1);
         drop(rx);
-        assert!(matches!(tx.try_send(1), Err(TrySendError::Closed(1))));
+        assert!(matches!(tx.try_send(1), Err(TrySendError::Closed)));
     }
 
     #[test]

@@ -887,6 +887,62 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
     memchr3(b'\r', b'\n', 0, value).is_none()
 }
 
+/// HTTP/2・HTTP/3 のフィールドの値が RFC 9113 §8.2.1・RFC 9114 §4.2 の条件を満たすか:
+/// NUL・LF・CR を含まず、空白（SP・HTAB）で始まらず終わらない。HPACK・QPACK は任意のバイトを運べるので、
+/// HTTP/1.1 の上流へ渡すと要求の密輸になる（F-236 の F1・F2）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_h2_field_value(value: &[u8]) -> bool {
+    if !is_valid_header_value(value) {
+        return false;
+    }
+    !matches!(value.first(), Some(b' ' | b'\t')) && !matches!(value.last(), Some(b' ' | b'\t'))
+}
+
+/// `:method` が token か（RFC 9110 §9.1）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_method(method: &[u8]) -> bool {
+    is_valid_header_name(method)
+}
+
+/// HTTP/1.1 の要求先を origin 形式の範囲にする（RFC 9112 §3.2）。
+///
+/// - origin 形式（`/` で始まる）: そのまま
+/// - 絶対形式（`http://host/path`・`https://...`）: authority の後ろのパスの部分（パスの無い絶対形式は `None`）
+/// - CONNECT（authority 形式）と OPTIONS の `*`: そのまま
+/// - それ以外: `None`（呼び出し側は 400）
+pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::ops::Range<usize>> {
+    if target.first() == Some(&b'/')
+        || method.eq_ignore_ascii_case(b"CONNECT")
+        || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
+    {
+        return Some(0..target.len());
+    }
+    let rest = if target.len() >= 7 && target[..7].eq_ignore_ascii_case(b"http://") {
+        7
+    } else if target.len() >= 8 && target[..8].eq_ignore_ascii_case(b"https://") {
+        8
+    } else {
+        return None;
+    };
+    // authority の後ろの最初の `/`（クエリだけの `http://h?x` は不正として断る）
+    let slash = target[rest..]
+        .iter()
+        .position(|&b| b == b'/' || b == b'?')?;
+    if target[rest + slash] != b'/' {
+        return None;
+    }
+    Some(rest + slash..target.len())
+}
+
+/// `:path` に空白・制御文字（0x00〜0x20・0x7F）が無いか（要求行に書いたとき分割されない）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn is_valid_request_target(path: &[u8]) -> bool {
+    !path.is_empty() && path.iter().all(|&b| b > 0x20 && b != 0x7f)
+}
+
 // ====================
 // Transfer-Encoding: chunked 検出（改善版）
 // ====================
@@ -1152,6 +1208,8 @@ pub(crate) enum ChunkedState {
     Complete,
     /// サイズ制限超過（DoS対策）
     SizeLimitExceeded,
+    /// フレーミングが RFC 9112 §7.1 に合わない（厳格モードのみ。F-236 の再走査の F5）
+    Invalid,
 }
 
 /// Chunkedデコーダのフィード結果
@@ -1163,6 +1221,8 @@ pub(crate) enum ChunkedFeedResult {
     Complete,
     /// サイズ制限超過
     SizeLimitExceeded,
+    /// フレーミングが不正（厳格モードのみ）
+    Invalid,
 }
 
 /// [`ChunkedDecoder::next_data_span`] の戻り値。
@@ -1171,7 +1231,7 @@ pub(crate) enum ChunkedFeedResult {
 /// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
 /// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
 // ストリーミング転送（F-32）は http2 / http3 経路でのみ使用する
-#[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+#[cfg(any(feature = "http2", feature = "http3"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkedSpan {
     /// 入力スライス内のボディデータ開始オフセット。
@@ -1183,7 +1243,8 @@ pub(crate) struct ChunkedSpan {
     pub(crate) consumed: usize,
     /// この呼び出しで終端（0 サイズチャンク + トレーラー終端）に達したか。
     pub(crate) complete: bool,
-    /// `max_body_size` 設定時、累積ボディサイズが上限を超えたか。
+    /// `max_body_size` 設定時、累積ボディサイズが上限を超えたか。厳格モードの不正なフレーミングも
+    /// ここに立てる（どちらも転送を打ち切る）。
     pub(crate) limit_exceeded: bool,
 }
 
@@ -1209,6 +1270,14 @@ pub(crate) struct ChunkedDecoder {
     pub(crate) total_body_size: u64,
     /// 最大許容ボディサイズ（0の場合は制限なし）
     pub(crate) max_body_size: u64,
+    /// 厳格モード（要求の本文。RFC 9112 §7.1 に合わないフレーミングを `Invalid` にする）。
+    ///
+    /// 要求の本文は veil が終端を決めて生のバイトを上流へ送るので、緩い解析だと上流と本文の境界の
+    /// 解釈がずれ、後ろのバイトが上流で別の要求になる（要求の密輸。F-236 の再走査の F5）。
+    /// 応答（上流から）は従来どおり緩く読む。
+    pub(crate) strict: bool,
+    /// チャンクサイズの後に空白（BWS）を読んだ（厳格モード。この後は `;` か CR だけ）
+    pub(crate) size_ended: bool,
 }
 
 impl ChunkedDecoder {
@@ -1225,7 +1294,50 @@ impl ChunkedDecoder {
             trailer_line_empty: true,
             total_body_size: 0,
             max_body_size,
+            strict: false,
+            size_ended: false,
         }
+    }
+
+    /// 要求の本文用の厳格なデコーダ（[`ChunkedDecoder::strict`] 参照）
+    pub(crate) fn new_request(max_body_size: u64) -> Self {
+        Self {
+            strict: true,
+            ..Self::new(max_body_size)
+        }
+    }
+
+    /// [`ChunkedDecoder::feed`] と同じだが、終端（または不正・上限超過）に達したとき、そのバイトまでの
+    /// 消費バイト数も返す（`Continue` なら `data.len()`）。終端より後ろのバイトを上流へ送らないために使う。
+    pub(crate) fn feed_counted(&mut self, data: &[u8]) -> (ChunkedFeedResult, usize) {
+        for (i, &byte) in data.iter().enumerate() {
+            match self.feed_byte(byte) {
+                ChunkedFeedResult::Continue => continue,
+                result => return (result, i + 1),
+            }
+        }
+        (ChunkedFeedResult::Continue, data.len())
+    }
+
+    #[inline]
+    fn invalid(&mut self) -> ChunkedFeedResult {
+        self.state = ChunkedState::Invalid;
+        ChunkedFeedResult::Invalid
+    }
+
+    /// サイズに 16 進の 1 桁を足す（厳格モードでは桁あふれを不正にする）
+    #[inline]
+    fn push_size_digit(&mut self, d: u64) -> ChunkedFeedResult {
+        if self.strict {
+            if self.size_ended || self.size_accumulator > (u64::MAX >> 4) {
+                return self.invalid();
+            }
+            self.size_accumulator = (self.size_accumulator << 4) | d;
+        } else {
+            self.size_accumulator = self.size_accumulator.saturating_mul(16).saturating_add(d);
+        }
+        self.size_has_digit = true;
+        ChunkedFeedResult::Continue
     }
 
     /// 新しいChunkedDecoderを作成（制限なし - レスポンス用）
@@ -1258,35 +1370,27 @@ impl ChunkedDecoder {
         match self.state {
             ChunkedState::ReadingChunkSize => {
                 match byte {
-                    b'0'..=b'9' => {
-                        self.size_accumulator = self
-                            .size_accumulator
-                            .saturating_mul(16)
-                            .saturating_add((byte - b'0') as u64);
-                        self.size_has_digit = true;
-                    }
-                    b'a'..=b'f' => {
-                        self.size_accumulator = self
-                            .size_accumulator
-                            .saturating_mul(16)
-                            .saturating_add((byte - b'a' + 10) as u64);
-                        self.size_has_digit = true;
-                    }
-                    b'A'..=b'F' => {
-                        self.size_accumulator = self
-                            .size_accumulator
-                            .saturating_mul(16)
-                            .saturating_add((byte - b'A' + 10) as u64);
-                        self.size_has_digit = true;
-                    }
+                    b'0'..=b'9' => return self.push_size_digit((byte - b'0') as u64),
+                    b'a'..=b'f' => return self.push_size_digit((byte - b'a' + 10) as u64),
+                    b'A'..=b'F' => return self.push_size_digit((byte - b'A' + 10) as u64),
                     b';' => {
+                        if self.strict && !self.size_has_digit {
+                            return self.invalid();
+                        }
                         // チャンク拡張の開始
                         self.state = ChunkedState::ReadingChunkExtension;
                     }
                     b'\r' => {
                         self.state = ChunkedState::ExpectingChunkSizeLF;
                     }
+                    b' ' | b'\t' if self.strict && self.size_has_digit => {
+                        // chunk-ext の前の BWS（RFC 9112 §7.1.1）。この後は `;` か CR だけ
+                        self.size_ended = true;
+                    }
                     _ => {
+                        if self.strict {
+                            return self.invalid();
+                        }
                         // 不正な文字 - 回復のためスキップ（緩い解析）
                     }
                 }
@@ -1296,10 +1400,16 @@ impl ChunkedDecoder {
                 // チャンク拡張はCRまでスキップ
                 if byte == b'\r' {
                     self.state = ChunkedState::ExpectingChunkSizeLF;
+                } else if self.strict && (byte == b'\n' || byte == 0) {
+                    return self.invalid();
                 }
             }
 
             ChunkedState::ExpectingChunkSizeLF => {
+                if self.strict && (byte != b'\n' || !self.size_has_digit) {
+                    return self.invalid();
+                }
+                self.size_ended = false;
                 if byte == b'\n' {
                     if !self.size_has_digit {
                         // サイズが解析できなかった場合、リセット
@@ -1344,6 +1454,8 @@ impl ChunkedDecoder {
             ChunkedState::ExpectingChunkDataCR => {
                 if byte == b'\r' {
                     self.state = ChunkedState::ExpectingChunkDataLF;
+                } else if self.strict {
+                    return self.invalid();
                 } else {
                     // 不正な形式 - 次のチャンクを探す（緩い解析）
                     self.state = ChunkedState::ReadingChunkSize;
@@ -1353,6 +1465,8 @@ impl ChunkedDecoder {
             ChunkedState::ExpectingChunkDataLF => {
                 if byte == b'\n' {
                     self.state = ChunkedState::ReadingChunkSize;
+                } else if self.strict {
+                    return self.invalid();
                 } else {
                     // 不正な形式 - リセット
                     self.state = ChunkedState::ReadingChunkSize;
@@ -1364,6 +1478,7 @@ impl ChunkedDecoder {
                     b'\r' => {
                         self.state = ChunkedState::ExpectingTrailerLF;
                     }
+                    b'\n' | 0 if self.strict => return self.invalid(),
                     _ => {
                         // トレーラーヘッダーの内容
                         self.trailer_line_empty = false;
@@ -1382,6 +1497,8 @@ impl ChunkedDecoder {
                         self.state = ChunkedState::ReadingTrailerLine;
                         self.trailer_line_empty = true;
                     }
+                } else if self.strict {
+                    return self.invalid();
                 } else {
                     // 不正な形式だが、トレーラー読み取りを継続
                     self.state = ChunkedState::ReadingTrailerLine;
@@ -1395,6 +1512,10 @@ impl ChunkedDecoder {
 
             ChunkedState::SizeLimitExceeded => {
                 return ChunkedFeedResult::SizeLimitExceeded;
+            }
+
+            ChunkedState::Invalid => {
+                return ChunkedFeedResult::Invalid;
             }
         }
         ChunkedFeedResult::Continue
@@ -1412,7 +1533,7 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))] // 理由: ストリーミング転送（F-32）は http2 / http3 経路のみ
+    #[cfg(any(feature = "http2", feature = "http3"))] // ストリーミング転送（F-32）は http2 / http3 経路のみ
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {
@@ -1425,7 +1546,7 @@ impl ChunkedDecoder {
                     limit_exceeded: false,
                 };
             }
-            ChunkedState::SizeLimitExceeded => {
+            ChunkedState::SizeLimitExceeded | ChunkedState::Invalid => {
                 return ChunkedSpan {
                     data_start: 0,
                     data_len: 0,
@@ -1470,7 +1591,7 @@ impl ChunkedDecoder {
                         limit_exceeded: false,
                     };
                 }
-                ChunkedFeedResult::SizeLimitExceeded => {
+                ChunkedFeedResult::SizeLimitExceeded | ChunkedFeedResult::Invalid => {
                     i += 1;
                     return ChunkedSpan {
                         data_start: 0,
@@ -1797,13 +1918,55 @@ mod idempotent_method_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "http2", feature = "http3")))]
 mod chunked_span_tests {
     use super::*;
 
     /// `next_data_span` を入力バッファ列に対して駆動し、デコードされたボディを再構成する
     /// テストヘルパー。各バッファを `input[consumed..]` で繰り返し処理し、データ run を連結する。
     /// 戻り値: (再構成したボディ, 終端に達したか, 制限超過したか)。
+    /// F-236 の再走査の F1・F5: 要求の本文は厳格に読み、終端の位置を正確に返す
+    #[test]
+    fn strict_request_decoder_rejects_lenient_framing_and_reports_end() {
+        let ok = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nGET /admin HTTP/1.1\r\n";
+        let mut d = ChunkedDecoder::new_request(0);
+        let (r, k) = d.feed_counted(ok);
+        assert_eq!(r, ChunkedFeedResult::Complete);
+        assert_eq!(&ok[k..], b"GET /admin HTTP/1.1\r\n");
+        let bad: [&[u8]; 9] = [
+            b"4x\r\nWiki\r\n0\r\n\r\n", // 16 進でない文字
+            b"4\nWiki\r\n0\r\n\r\n",    // 裸の LF
+            b"4\r\nWikiXX0\r\n\r\n",    // データの後に CRLF が無い
+            b"\r\n",                    // サイズが空
+            b"10000000000000000\r\n",   // 桁あふれ
+            b"4 5\r\n",                 // 空白の後の桁
+            b"4;a\nb\r\n",              // 拡張の中の LF
+            b"0\r\nX: 1\n\r\n",         // トレーラーの裸の LF
+            b";x\r\n",                  // サイズの無い拡張
+        ];
+        for b in bad {
+            let mut d = ChunkedDecoder::new_request(0);
+            assert_eq!(
+                d.feed(b),
+                ChunkedFeedResult::Invalid,
+                "{:?}",
+                String::from_utf8_lossy(b)
+            );
+        }
+        // BWS の後の拡張は通る
+        let mut d = ChunkedDecoder::new_request(0);
+        assert_eq!(
+            d.feed(b"3 ;e\r\nabc\r\n0\r\n\r\n"),
+            ChunkedFeedResult::Complete
+        );
+        // 応答用（緩い）は従来どおり
+        let mut d = ChunkedDecoder::new_unlimited();
+        assert_ne!(
+            d.feed(b"4x\r\nWiki\r\n0\r\n\r\n"),
+            ChunkedFeedResult::Invalid
+        );
+    }
+
     fn drive(decoder: &mut ChunkedDecoder, buffers: &[&[u8]]) -> (Vec<u8>, bool, bool) {
         let mut out = Vec::new();
         let mut complete = false;

@@ -291,14 +291,53 @@ fn rbac_allows(
         sni: ctx.sni.as_deref(),
         principal: ctx.peer_principal.as_deref(),
         direct_remote: Some(ctx.peer.ip()),
-        remote: req.header("x-forwarded-for").and_then(|v| {
-            let s = std::str::from_utf8(&v).ok()?;
-            s.split(',').next()?.trim().parse().ok()
-        }),
+        remote: Some(client_address(
+            ctx.peer.ip(),
+            req.header("x-forwarded-for").as_deref(),
+            ctx.hcm.use_remote_address,
+            ctx.hcm.xff_num_trusted_hops,
+        )),
         metadata: &md,
         http: true,
     };
     super::xds::rbac::allowed(cfg, &input)
+}
+
+/// RBAC の remote_ip に使うクライアントのアドレス（Envoy の「元のクライアントのアドレス」と同じ規則。F-236 の F3）。
+///
+/// - `use_remote_address` あり: 接続の相手。`xff_num_trusted_hops` が N なら X-Forwarded-For の右から N 番目
+/// - なし: X-Forwarded-For の右端から `xff_num_trusted_hops` だけ左。ヘッダが無い・足りない・読めないなら接続の相手
+///
+/// 左端（クライアントが自由に書ける）は使わない（以前は左端を使い、IP の規則をヘッダ 1 つで回避できた）。
+fn client_address(
+    peer: std::net::IpAddr,
+    xff: Option<&[u8]>,
+    use_remote_address: bool,
+    trusted_hops: u32,
+) -> std::net::IpAddr {
+    let entries: Vec<&str> = xff
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let n = entries.len();
+    let hops = trusted_hops as usize;
+    let pick = if use_remote_address {
+        if hops == 0 || n < hops {
+            None
+        } else {
+            entries.get(n - hops)
+        }
+    } else if n > hops {
+        entries.get(n - 1 - hops)
+    } else {
+        None
+    };
+    pick.and_then(|e| e.parse().ok()).unwrap_or(peer)
 }
 
 fn chance(per_million: u32) -> bool {
@@ -309,7 +348,10 @@ fn chance(per_million: u32) -> bool {
 #[cfg(feature = "wasm")]
 pub type WasmRan = super::wasm::Ran;
 #[cfg(not(feature = "wasm"))]
-pub type WasmRan = ();
+/// Wasm 無しのビルドの置き物（`()` や単位構造体だと `let ran = WasmRan::default()` が clippy の
+/// let_unit_value / default_constructed_unit_structs になる）
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WasmRan(());
 
 /// 要求の可変の部分（Wasm のフィルタがヘッダ・疑似ヘッダを書き換える）。
 pub struct ReqParts<'a> {
@@ -340,6 +382,18 @@ pub async fn request_filters(
     ctx: &ConnCtx,
     rq: &mut ReqParts<'_>,
 ) -> Result<(super::jwt::JwtOutcome, WasmRan), LocalReply> {
+    // パスの正規化はルート・RBAC・JWT の照合より前に 1 回だけ。正規化したパスを上流へも送る（F-236 の F5）
+    match super::path_norm::normalize(rq.path, &ctx.hcm.path_normalization) {
+        Ok(None) => {}
+        Ok(Some(p)) => *rq.path = Bytes::from(p),
+        Err(super::path_norm::Rejected) => {
+            let mut lr = LocalReply::new(400, ResponseFlag::DownstreamProtocolError);
+            if rq.view().is_grpc() {
+                lr.grpc_status = Some(3);
+            }
+            return Err(lr);
+        }
+    }
     let mut jwt = super::jwt::JwtOutcome::default();
     #[cfg_attr(not(feature = "wasm"), allow(unused_mut))]
     let mut ran = WasmRan::default();
@@ -1289,6 +1343,31 @@ pub fn finish_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_address_never_uses_leftmost_xff() {
+        let peer: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+        let xff = Some(&b"1.1.1.1, 2.2.2.2, 3.3.3.3"[..]);
+        // 既定: 右端
+        assert_eq!(
+            client_address(peer, xff, false, 0),
+            "3.3.3.3".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_address(peer, xff, false, 1),
+            "2.2.2.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        // 足りなければ接続の相手
+        assert_eq!(client_address(peer, xff, false, 3), peer);
+        // use_remote_address: 相手、または右から N 番目
+        assert_eq!(client_address(peer, xff, true, 0), peer);
+        assert_eq!(
+            client_address(peer, xff, true, 1),
+            "3.3.3.3".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(client_address(peer, None, false, 0), peer);
+        assert_eq!(client_address(peer, Some(&b"junk"[..]), false, 0), peer);
+    }
 
     fn loc(r: &RedirectCfg, authority: &str, path: &str, m: &PathMatch) -> String {
         let req = ReqView {

@@ -49,6 +49,21 @@ jobs:
       - run: cargo clippy --all-targets --features full -- -D warnings
       - run: cargo clippy --all-targets --features full,epoll -- -D warnings
 
+  # F-239: docs.rs と同じ構成（full + api）で API 文書をビルドし、壊れたリンクと doctest の失敗を検出する。
+  docs:
+    name: docs (full,api)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --no-default-features --features full,api
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: cargo test --doc --no-default-features --features full,api
+
   build:
     name: build (${{ matrix.features }})
     runs-on: ubuntu-latest
@@ -99,3 +114,34 @@ jobs:
       # E2E は専用バックエンドを自動セットアップ・実行・クリーンアップする。
       - name: Run E2E suite
         run: ./tests/e2e_setup.sh test
+
+  python-docs:
+    name: python docs + stubs (F-239)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Read the Docs と同じ設定で警告をエラーにしてビルドする（Rust の拡張はコンパイルしない）。
+      - name: Build the Sphinx docs (warnings are errors)
+        run: |
+          pip install -r crates/veil-python/docs/requirements.txt
+          sphinx-build -W -b html crates/veil-python/docs _build
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # wheel をビルドして入れ、_veil.pyi と実物のずれを stubtest で検出する。
+      - name: Build the wheel
+        run: |
+          pip install maturin
+          cd crates/veil-python && maturin build --release -o dist
+      - name: stubtest (veil._veil.pyi vs the built extension)
+        run: |
+          pip install mypy crates/veil-python/dist/*.whl
+          if [ -f crates/veil-python/stubtest-allowlist.txt ]; then
+            python -m mypy.stubtest veil._veil --allowlist crates/veil-python/stubtest-allowlist.txt
+          else
+            python -m mypy.stubtest veil._veil
+          fi

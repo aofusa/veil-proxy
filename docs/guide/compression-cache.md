@@ -236,6 +236,12 @@ Cache keys are generated from:
 - When `streaming` buffering mode is used, kTLS zero-copy transfer is preserved
 - Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
 - `Vary: *` responses are not cached when `respect_vary = true`
+- With `respect_vary = true`, a response whose `Vary` names a header that is not in `key_headers` is not cached
+  (the cache key would not tell those requests apart). Add the header to `key_headers` (for example
+  `key_headers = ["Accept-Encoding"]`) to cache such responses per value
+- Responses carrying `Set-Cookie` are never stored
+- Requests carrying `Authorization` neither read nor fill the cache (RFC 9111 §3.5), unless `key_headers` contains
+  `Authorization`, which makes the cache per user
 
 > [!CAUTION]
 > **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour old) when the backend returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.

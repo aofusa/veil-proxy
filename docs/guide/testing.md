@@ -207,7 +207,7 @@ veil-proxy/
 │   └── ...
 ├── tests/
 │   ├── integration_tests.rs  # 13 integration tests
-│   ├── e2e_tests.rs          # 24 E2E tests
+│   ├── e2e_tests/            # E2E tests (main.rs = shared helpers, one file per feature area; F-233)
 │   ├── e2e_setup.sh         # E2E environment setup
 │   ├── run_bench.sh         # Benchmark automation
 │   └── common/

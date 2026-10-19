@@ -3,7 +3,7 @@
 set -euo pipefail
 
 VEIL_HOST="${VEIL_HOST:-veil-proxy}"
-VEIL_HTTP_PORT="${VEIL_HTTP_PORT:-80}"
+VEIL_HTTP_PORT="${VEIL_HTTP_PORT:-8443}"
 VEIL_HTTPS_PORT="${VEIL_HTTPS_PORT:-443}"
 SLOWLORIS_COUNT="${SLOWLORIS_COUNT:-20}"
 RESULTS="/results/slowloris_chaos_report.txt"

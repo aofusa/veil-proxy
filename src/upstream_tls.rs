@@ -4,7 +4,7 @@
 //! `tls_ca`（上流の証明書の信頼アンカー。省略時は既定の公開 CA）、`expected_san`（上流の証明書の SAN の期待値。
 //! 指定するとホスト名の代わりにこれで照合する。SPIFFE の URI SAN 等）。
 //!
-//! 設定のロード時に rustls の設定を作って [`UpstreamTlsClient`] として `ProxyTarget` に持たせ、接続のたびに
+//! 設定のロード時に rustls の設定を作って `UpstreamTlsClient` として `ProxyTarget` に持たせ、接続のたびに
 //! 作らない（ホットパスは `Arc` の参照だけ）。接続のプールの鍵には設定ごとのタグを足し、別の証明書の接続を
 //! 共有しない。
 

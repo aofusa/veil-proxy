@@ -37,60 +37,150 @@ pub type VeilBody = http_body_util::Full<Bytes>;
 /// veil の `Request` を `http::Request` にする（元の `Request` は extensions にも入れる。
 /// パスパラメータ等を内側のハンドラへ引き継ぐため）。
 pub fn to_http_request(req: Request) -> http::Request<VeilBody> {
-    let mut uri = String::with_capacity(req.path.len() + req.query.len() + 1);
-    uri.push_str(req.path());
-    if !req.query.is_empty() {
-        uri.push('?');
-        uri.push_str(req.query());
+    let mut out = build_http_request(&req);
+    out.extensions_mut().insert(req);
+    out
+}
+
+/// `http::Request` を作る（extensions には何も入れない）。F-235: 要求のバイト列を複製しない。
+/// - URI はクエリが無ければパスの `Bytes` をそのまま使い、あれば 1 回だけ連結する。
+/// - ヘッダの値は `HeaderValue::from_maybe_shared` で受信バッファの `Bytes` を共有する
+///   （名前は標準のものなら静的。`HeaderMap` は数で容量を取る）。
+fn build_http_request(req: &Request) -> http::Request<VeilBody> {
+    let mut out = http::Request::new(VeilBody::new(req.body.clone()));
+    if let Ok(m) = http::Method::from_bytes(&req.method) {
+        *out.method_mut() = m;
     }
-    let mut b = http::Request::builder()
-        .method(req.method())
-        .uri(uri)
-        .version(match req.version {
-            super::request::HttpVersion::Http11 => http::Version::HTTP_11,
-            super::request::HttpVersion::Http2 => http::Version::HTTP_2,
-            super::request::HttpVersion::Http3 => http::Version::HTTP_3,
-        });
+    let target = if req.query.is_empty() {
+        req.path.clone()
+    } else {
+        let mut t = bytes::BytesMut::with_capacity(req.path.len() + 1 + req.query.len());
+        t.extend_from_slice(&req.path);
+        t.extend_from_slice(b"?");
+        t.extend_from_slice(&req.query);
+        t.freeze()
+    };
+    if let Ok(u) = http::Uri::from_maybe_shared(target) {
+        *out.uri_mut() = u;
+    }
+    *out.version_mut() = match req.version {
+        super::request::HttpVersion::Http11 => http::Version::HTTP_11,
+        super::request::HttpVersion::Http2 => http::Version::HTTP_2,
+        super::request::HttpVersion::Http3 => http::Version::HTTP_3,
+    };
+    let headers = out.headers_mut();
+    headers.reserve(req.headers.len());
     for (n, v) in req.headers.iter() {
         if let (Ok(n), Ok(v)) = (
             http::HeaderName::from_bytes(n),
-            http::HeaderValue::from_bytes(v),
+            http::HeaderValue::from_maybe_shared(v.clone()),
         ) {
-            b = b.header(n, v);
+            headers.append(n, v);
         }
     }
-    let body = VeilBody::new(req.body.clone());
-    let mut out = b
-        .body(body)
-        .unwrap_or_else(|_| http::Request::new(VeilBody::new(Bytes::new())));
-    out.extensions_mut().insert(req);
     out
+}
+
+/// よく使うヘッダの名前は静的な `Bytes` にする（`http` 1.x には `HeaderName` を `Bytes` へ移す手段が無いため、
+/// 表で引く。表に無い名前だけ複製する）。
+fn header_name_bytes(n: &http::HeaderName) -> Bytes {
+    use http::header::*;
+    static COMMON: &[(HeaderName, &[u8])] = &[
+        (CONTENT_TYPE, b"content-type"),
+        (CONTENT_LENGTH, b"content-length"),
+        (CONTENT_ENCODING, b"content-encoding"),
+        (CACHE_CONTROL, b"cache-control"),
+        (DATE, b"date"),
+        (ETAG, b"etag"),
+        (LAST_MODIFIED, b"last-modified"),
+        (LOCATION, b"location"),
+        (SET_COOKIE, b"set-cookie"),
+        (VARY, b"vary"),
+        (SERVER, b"server"),
+        (ACCESS_CONTROL_ALLOW_ORIGIN, b"access-control-allow-origin"),
+        (HOST, b"host"),
+        (USER_AGENT, b"user-agent"),
+        (ACCEPT, b"accept"),
+        (ACCEPT_ENCODING, b"accept-encoding"),
+        (AUTHORIZATION, b"authorization"),
+        (COOKIE, b"cookie"),
+        (CONNECTION, b"connection"),
+    ];
+    for (k, v) in COMMON {
+        if k == n {
+            return Bytes::from_static(v);
+        }
+    }
+    Bytes::copy_from_slice(n.as_str().as_bytes())
+}
+
+/// `HeaderMap` を veil のヘッダの列にする（F-235: よく使う名前は複製しない。値は 1 回だけ複製する）。
+fn headers_into_vec(map: http::HeaderMap, out: &mut Vec<(Bytes, Bytes)>) {
+    out.reserve(map.len());
+    let mut last: Option<Bytes> = None;
+    for (n, v) in map {
+        // 同じ名前が続くときは None（直前の名前を使う）
+        let name = match n {
+            Some(n) => {
+                let b = header_name_bytes(&n);
+                last = Some(b.clone());
+                b
+            }
+            None => match &last {
+                Some(b) => b.clone(),
+                None => continue,
+            },
+        };
+        out.push((name, Bytes::copy_from_slice(v.as_bytes())));
+    }
+}
+
+/// 本文をまとめて読む。F-235: データのフレームが 1 つ（`Full` 等）ならその `Bytes` をそのまま返し、
+/// 2 つ以上のときだけ連結する（`collect()` は 1 フレームでも内部のキューを確保していた）。
+async fn body_bytes<B>(body: B) -> Result<Bytes, B::Error>
+where
+    B: http_body::Body<Data = Bytes>,
+{
+    let mut body = std::pin::pin!(body);
+    let mut first: Option<Bytes> = None;
+    let mut rest: Option<bytes::BytesMut> = None;
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame?.into_data() else {
+            continue; // トレイラーは捨てる（collect().to_bytes() と同じ）
+        };
+        if data.is_empty() {
+            continue;
+        }
+        match (&mut first, &mut rest) {
+            (None, _) => first = Some(data),
+            (Some(f), None) => {
+                let mut m = bytes::BytesMut::with_capacity(f.len() + data.len());
+                m.extend_from_slice(f);
+                m.extend_from_slice(&data);
+                rest = Some(m);
+            }
+            (Some(_), Some(m)) => m.extend_from_slice(&data),
+        }
+    }
+    Ok(match (first, rest) {
+        (_, Some(m)) => m.freeze(),
+        (Some(f), None) => f,
+        (None, None) => Bytes::new(),
+    })
 }
 
 /// `http::Request` を veil の `Request` に戻す（層が書き換えたメソッド・URI・ヘッダ・本文を反映する）。
 pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
     let (parts, body) = req.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
+    let body = body_bytes(body).await.unwrap_or_default();
     let orig = parts.extensions.get::<Request>().cloned();
     let target = parts
         .uri
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    let headers: Vec<(Bytes, Bytes)> = parts
-        .headers
-        .iter()
-        .map(|(n, v)| {
-            (
-                Bytes::copy_from_slice(n.as_str().as_bytes()),
-                Bytes::copy_from_slice(v.as_bytes()),
-            )
-        })
-        .collect();
+    let mut headers = Vec::new();
+    headers_into_vec(parts.headers, &mut headers);
     let mut req = Request::new(parts.method.as_str().to_string(), target, headers, body);
     if let Some(o) = orig {
         req.params = o.params;
@@ -140,25 +230,15 @@ where
         .and_then(|c| c.0.lock().ok().and_then(|mut g| g.take()));
     if let Some(stream) = carried {
         let mut r = Response::stream(parts.status.as_u16(), stream);
-        for (n, v) in parts.headers.iter() {
-            r.headers.push((
-                Bytes::copy_from_slice(n.as_str().as_bytes()),
-                Bytes::copy_from_slice(v.as_bytes()),
-            ));
-        }
+        headers_into_vec(parts.headers, &mut r.headers);
         return r;
     }
-    let body = match body.collect().await {
-        Ok(c) => c.to_bytes(),
+    let body = match body_bytes(body).await {
+        Ok(b) => b,
         Err(e) => return Response::error(502, &format!("response body error: {}", e)),
     };
     let mut r = Response::new(parts.status.as_u16()).with_body(body);
-    for (n, v) in parts.headers.iter() {
-        r.headers.push((
-            Bytes::copy_from_slice(n.as_str().as_bytes()),
-            Bytes::copy_from_slice(v.as_bytes()),
-        ));
-    }
+    headers_into_vec(parts.headers, &mut r.headers);
     r
 }
 
@@ -252,7 +332,10 @@ impl App {
         let func: HandlerFn = Arc::new(move |req: Request| {
             let svc = svc.clone();
             Box::pin(async move {
-                let http_req = to_http_request(req);
+                // F-235: マウントしたサービス（axum 等）は veil の Request を読まないので extensions に入れない
+                // （入れると Box と extensions の表で要求ごとに 3 回確保していた）
+                let http_req = build_http_request(&req);
+                drop(req);
                 let res = super::tokio_compat::try_run(async move {
                     match oneshot(svc, http_req).await {
                         Ok(resp) => Ok(from_http_response(resp).await),

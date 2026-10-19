@@ -45,6 +45,12 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+> The allowlist includes `faccessat2` (issued by glibc 2.33+/musl for `access()`/`faccessat()`) and
+> `openat2` (used to resolve static files with `RESOLVE_BENEATH`, F-153). The container profiles
+> (`docker/assets/security/seccomp.json` / `seccomp-epoll.json`) include both; `openat2` was added in
+> v0.8.0 (without it veil falls back to `canonicalize()` on every request, and before B-154 the first
+> static request after startup returned 404).
+
 **Recommended Deployment Procedure:**
 
 ```bash
@@ -353,3 +359,44 @@ When a panic is caught:
 - This feature is automatically enabled; no configuration required
 - Only protects against panics inside `monoio::spawn` tasks
 - Panics in the accept loop or runtime initialization still terminate the worker thread
+
+## Security Audit (F-236)
+
+Before each release the repository is scanned with Anthropic's
+[claude-security](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/claude-security) plugin.
+Confirmed findings are fixed together with a `B-` ticket in `docs/backlog/bugs/`; the v0.8.0 audit and its re-scan produced B-135 to B-151.
+
+How to re-run the scan (from a clean worktree of the revision to audit, so the scan cannot see uncommitted files):
+
+```bash
+git worktree add ../veil-secscan <revision>
+cd ../veil-secscan
+CLAUDE_CODE_WORKFLOWS=1 claude -p \
+  "/claude-security:claude-security Scan codebase at medium effort. I understand it will use a lot of tokens." \
+  --permission-mode auto
+```
+
+The report (`CLAUDE-SECURITY-RESULTS.md`, `.jsonl`, `.sarif`) is written to the worktree. Keep it under
+`docs/artifacts/claude-security/` (not committed) until the findings are fixed. Compare a re-scan with the previous
+one by `claudeSecurityPluginFindingId`; findings judged to be false positives are recorded with the reason in
+`docs/artifacts/claude-security/triage.md`.
+
+Request-level hardening that came out of the audit:
+
+- HTTP/2 and HTTP/3 field names must be tokens and values must not contain NUL, CR or LF or start/end with
+  whitespace; `:method` must be a token and `:path` must not contain spaces or control characters (RFC 9113 §8.2.1,
+  RFC 9114 §4.2). Violations are stream errors, so they can never reach an HTTP/1.1 upstream.
+- `remove_request_headers` / `add_request_headers` apply to every client and upstream protocol.
+- The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
+  or responses to `Authorization` requests (unless `key_headers` includes `Authorization`).
+- IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
+- Request paths are normalized before routing and `[route.security]` checks and forwarded normalized
+  (`[security] path_normalization`); absolute-form targets become origin-form, other non-origin targets get 400.
+- Chunked request bodies are parsed strictly (RFC 9112 §7.1; malformed framing is rejected) and nothing after
+  the terminating chunk is forwarded upstream as part of that request.
+- WebSocket upgrades apply `remove_request_headers` / `add_request_headers`; client bytes that follow the
+  handshake are sent upstream only after a `101`.
+- HTTP/2 and HTTP/3 buffered request bodies are capped while they accumulate (the largest
+  `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
+- The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.
+- The mesh normalizes paths before routing/RBAC/JWT and derives `remoteIpBlocks` from Envoy's original client address.

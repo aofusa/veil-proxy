@@ -625,6 +625,16 @@ revalidate_mtime = false
 # 例: blocked_ips = ["203.0.113.0/24", "198.51.100.7", "2001:db8::/32"]
 # blocked_ips = []
 
+# 要求のパスの正規化（HTTP/1.1・HTTP/2・HTTP/3。v0.8.0、F-236）
+# ルートの照合・[route.security] の検査の前に 1 回だけ行い、正規化したパスを上流へも送る
+# （veil と上流でパスの解釈がずれて、ルートの制限を素通りされないようにする）。
+# "base"（既定）: 予約されていない文字の %XX を戻し、"\" を "/" にし、"." と ".." のセグメントを取り除く
+# "merge_slashes": base + 連続する "/" を 1 つにする
+# "off": 正規化しない（v0.8.0 より前の動作）
+# %2F・%5C はそのまま残す。絶対形式の要求先（http://host/path）は origin 形式に直し、
+# それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400 にする。
+# path_normalization = "base"
+
 # セキュリティ機能の有効化に失敗した場合の動作
 # false: 有効化に失敗した場合はサーバーの起動を失敗させる（デフォルト、推奨）
 # true: 有効化に失敗しても警告を出して起動を続行する（開発・デバッグ用）
@@ -1207,10 +1217,15 @@ revalidate_mtime = false
 # 長寿命接続: 60000 (60秒)
 # max_idle_timeout = 30000
 
-# 最大UDPペイロードサイズ
-# デフォルト: 1350 (MTU考慮)
+# 最大UDPペイロードサイズ（経路 MTU の探索の上限）
+# デフォルト: 1452（v0.8.0 で 1350 から変更。MTU 1500 の IPv6 で載る最大）
 # ジャンボフレーム環境: 9000
-# max_udp_payload_size = 1350
+# max_udp_payload_size = 1452
+
+# 経路 MTU の探索（quiche の DPLPMTUD）。1200 バイトから始め、探索のパケットが届いた大きさまでしか使わない
+# （UDP のソケットに DF を立てる）。false にすると max_udp_payload_size を確かめずに使う。
+# デフォルト: true
+# discover_pmtu = true
 
 # 初期最大データサイズ（コネクション全体）
 # デフォルト: 10000000 (10MB)
@@ -1241,9 +1256,10 @@ revalidate_mtime = false
 # ------------------------------------------
 # QUIC 輻輳制御アルゴリズム（quiche set_cc_algorithm_name）
 # 受け付ける値: "reno" | "cubic" | "bbr" | "bbr2" | "bbr2_gcongestion"
-# リバースプロキシの短時間バーストでは BBR が RPS に効きやすい。
-# デフォルト: "bbr"
-# cc_algorithm = "bbr"
+# v0.8.0 で既定を "bbr" から "cubic" に変えた（veil は pacing の送出時刻を守らずに送るため、BBR は
+# 送出が一気になって受け手で捨てられ再送が増えた。CUBIC で HTTP/3 の 54KB が FreeBSD +8〜20%・Linux +4〜6%）。
+# デフォルト: "cubic"
+# cc_algorithm = "cubic"
 
 # Packet Pacing（quiche enable_pacing）。パケットロス抑制。
 # デフォルト: true
@@ -1284,12 +1300,13 @@ revalidate_mtime = false
 #
 # ただし drain 中は送信・タイムアウト処理・バックエンド通知が待たされるため、
 # 大きくしすぎるとレイテンシ（特に p99）が悪化する。スループット重視なら 256〜1024、
-# レイテンシ重視なら既定の 64 付近を推奨する。
+# レイテンシ重視なら 64 付近を推奨する（v0.8.0 より前の既定は 64。1024 で FreeBSD の
+# HTTP/3 3B が 37% 伸び、p99 は 11 → 14ms）。
 # 受信バッファは mmsg_batch_size 個ぶんを使い回すだけなので、本値を大きくしても
 # メモリ使用量は増えない。
 #
-# デフォルト: 64
-# recv_drain_max = 64
+# デフォルト: 1024
+# recv_drain_max = 1024
 
 # ------------------------------------------
 # HTTP/3 専用圧縮設定
@@ -2194,7 +2211,8 @@ revalidate_mtime = false
 #   bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
 #   
 #   # Varyヘッダーを尊重するか
-#   # trueの場合、Varyに基づいて別々のキャッシュエントリを作成
+#   # trueの場合、Vary: * と、key_headers に無いヘッダで Vary する応答は保存しない
+#   # （Set-Cookie の応答は常に保存しない。Authorization の付いた要求は key_headers に無ければキャッシュを使わない）
 #   respect_vary = true
 #   
 #   # ETag検証を有効化

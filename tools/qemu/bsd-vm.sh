@@ -127,6 +127,15 @@ elif ! command -v docker >/dev/null 2>&1; then
 else
     NATIVE=0
 fi
+# qemu が SSH・シリアルコンソール（telnet）・QMP を待つアドレス。native はホストのループバックだけ、
+# Docker はコンテナの中なので全アドレスで待ち、`docker run -p 127.0.0.1:...` でホストのループバックだけに
+# 公開する（以前は両方とも 0.0.0.0 で、同じネットワークの誰でも root のコンソール・QMP に届いた。
+# F-236 の再走査の F10）。
+if [[ "${NATIVE}" == "1" ]]; then
+    GUEST_BIND="127.0.0.1"
+else
+    GUEST_BIND="0.0.0.0"
+fi
 VM_SMP="${VM_SMP:-4}"
 # 既定メモリは OS/アーキ別（F-176）。NetBSD x86_64 は 4GB だと単体テストのリンクで ld が
 # OOM kill され、VM ごと落ちることもあった（v0.7.0 の検証で実測。7GB で解消）。
@@ -434,8 +443,8 @@ _write_cloudinit_seed() {
 disable_root: false
 ssh_pwauth: false
 # シリアルコンソールからのデバッグ用に root パスワードを設定する。
-# SSH は鍵認証のみ（ssh_pwauth: false）で、VM のポートは 127.0.0.1 のみに
-# フォワードされるローカル開発用 VM なので、固定パスワードで問題ない。
+# SSH は鍵認証のみ（ssh_pwauth: false）。SSH・コンソール・QMP はホストの 127.0.0.1 だけで待つ
+# （GUEST_BIND・docker run -p 127.0.0.1:...）ので、固定パスワードはホストの利用者にしか使えない。
 chpasswd:
   expire: false
   list: |
@@ -586,7 +595,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -597,7 +606,7 @@ set -e
 cd "${WORKDIR}"
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -629,7 +638,7 @@ exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -700,8 +709,8 @@ _write_boot() {
     # provision のようにプロンプトを確実に掴みたい場面で使う。
     local con_mode="nowait"
     [[ "${CONSOLE_WAIT:-0}" == "1" ]] && con_mode="wait"
-    local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,${con_mode} \\
-  -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none"
+    local console_args="-nographic -serial telnet:${GUEST_BIND}:${CON_PORT},server,${con_mode} \\
+  -qmp telnet:${GUEST_BIND}:${QMP_PORT},server,nowait -monitor none"
 
     if [[ "${NATIVE}" == "1" ]]; then
         _write_boot_native "${drives}" "${seed_drive}" "${console_args}"
@@ -726,7 +735,7 @@ exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -
   -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
   -drive if=pflash,format=raw,file=efi_vars.fd \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -740,7 +749,7 @@ set -e
 cd /w
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
@@ -759,7 +768,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
-  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
   -device virtio-net-pci,netdev=net0,romfile= \
   ${console_args}
 EOF
@@ -837,7 +846,8 @@ cmd_up() {
     fi
     # shellcheck disable=SC2046  # _kvm_args は 0/1 個の引数を意図的に展開する
     docker run -d --name "${NAME}" $(_kvm_args) "${base_mount[@]}" \
-        -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" -p "${QMP_PORT}:${QMP_PORT}" \
+        -p "127.0.0.1:${SSH_PORT}:${SSH_PORT}" -p "127.0.0.1:${CON_PORT}:${CON_PORT}" \
+        -p "127.0.0.1:${QMP_PORT}:${QMP_PORT}" \
         -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" bash /w/boot.sh >/dev/null
     log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}"
     [[ "${ARCH}" == "aarch64" ]] && log "aarch64 は TCG のため multi-user 到達に数分〜数十分かかる"
@@ -1183,7 +1193,7 @@ if [ ! -x /usr/pkg/bin/pkgin ]; then
   /usr/sbin/pkg_add -v pkgin >/tmp/pkg_add.log 2>&1 || { tail -40 /tmp/pkg_add.log; exit 1; }
 fi
 /usr/pkg/bin/pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
-/usr/pkg/bin/pkgin -y install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
+/usr/pkg/bin/pkgin -y install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl python313 >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
 /usr/pkg/sbin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || /usr/pkg/bin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
 # NetBSD の base openssl(3.0) は /etc/openssl/openssl.cnf を必須とするが、配布イメージ
 # には置かれていない（evbarm の gzimg で実測）。無いと E2E の証明書生成
@@ -1191,6 +1201,9 @@ fi
 # \"Can't open /etc/openssl/openssl.cnf\" で失敗し、E2E が証明書生成の時点で止まる。
 # base に同梱のサンプルをそのまま配置する。
 [ -f /etc/openssl/openssl.cnf ] || cp /usr/share/examples/openssl/openssl.cnf /etc/openssl/openssl.cnf
+# pkgsrc の python は python3.13 の名前だけで python3 が無い。library_e2e・standalone_e2e（VDS の Python の
+# 制御プレーン）が python3 を呼ぶので名前を足す（aarch64 の VM で無くて失敗した。2026-10-17）
+[ -e /usr/pkg/bin/python3 ] || ln -s python3.13 /usr/pkg/bin/python3
 "
     else
         # OpenBSD も同様に protobuf（protoc）と gmake が要る
@@ -1284,14 +1297,16 @@ cmd_sync() {
     # メンバー名は `./` 無し（`tools/...`）なので、GNU tar では `./` 付きのパターンが一致しない
     # （macOS の bsdtar は一致する）。両方の形を書く。root 所有の sanitizer ビルド成果物を
     # 読もうとして Permission denied で同期ごと失敗した（Linux ホスト、2026-10-07）。
+    # `*/target-*`（api-bench の target-count・target-epoll 等）も送らない。ゲストの tools も一度消してから
+    # 展開する（以前に送った古い results 等が残り、OpenBSD の /usr/obj（8GB）が埋まった。2026-10-17）。
     (cd "${ROOT}" && tar czf - \
-        --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
+        --exclude='./target' --exclude='*/target' --exclude='*/target-*' --exclude='.git' --exclude='*.sock' --no-xattrs \
         --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
         --exclude='tools/container_security/results' --exclude='tools/perf/results' \
         src benches tests examples contrib docker/assets third_party tools crates proto \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
-          && rm -rf src benches tests examples contrib docker/assets third_party crates proto .cargo \
+          && rm -rf src benches tests examples contrib docker/assets third_party tools crates proto .cargo \
           && tar xzf - \
           && sed -i'' -e 's|\"fuzz\", ||' Cargo.toml"
 }
@@ -1367,6 +1382,11 @@ _guest_env_prefix() {
             pre="${pre} CARGO_HOME=/work/cargo TMPDIR=/work/tmp"
         fi
     fi
+    # 配布ビルド（`--profile dist`、fat LTO）が VM のメモリで落ちるときの逃げ道。ホストで
+    # `CARGO_PROFILE_DIST_LTO=thin` を指定すればゲストの cargo に渡す（v0.8.0）。
+    if [[ -n "${CARGO_PROFILE_DIST_LTO:-}" ]]; then
+        pre="${pre} CARGO_PROFILE_DIST_LTO=${CARGO_PROFILE_DIST_LTO}"
+    fi
     echo "${pre}"
 }
 
@@ -1398,7 +1418,8 @@ CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
 # **【注意】`dist` は既定の VM メモリ（4096MB）では OOM で失敗する**（実測: fat LTO の
 # 全プログラムリンク段階で `Killed`）。`codegen-units = 1` の fat LTO はリンク時に
 # 大量のメモリを要求するため、`VM_MEM_MB=8192` 以上で VM を作り直すこと
-# （`down` → `VM_MEM_MB=8192 up`）。
+# （`down` → `VM_MEM_MB=8192 up`）。8192MB でも足りないときは `CARGO_PROFILE_DIST_LTO=thin` で
+# thin LTO に落とす（ゲストの cargo に渡す）。
 #
 # メモリを増やせない場合は既定の `release` のままビルドし、
 # `packaging/scripts/build-bsd.sh` が行う strip でサイズ削減する
@@ -1458,7 +1479,7 @@ cmd_e2e() {
 }
 
 # unit: VM 内で単体テスト（--lib）と統合テストを実行する。
-#   E2E は `tests/e2e_tests.rs` しか走らせないため、ライブラリ側の単体テストが BSD で
+#   E2E は `tests/e2e_tests/` しか走らせないため、ライブラリ側の単体テストが BSD で
 #   コンパイル・通過するかはこれで確かめる（Linux 専用定数を参照するテストが BSD で
 #   コンパイル不能だった B-88 の再発防止）。feature は e2e と同じ規則で決める。
 cmd_unit() {

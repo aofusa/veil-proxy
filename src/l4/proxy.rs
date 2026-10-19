@@ -10,7 +10,7 @@ use crate::runtime::offload::offload;
 #[cfg(target_os = "linux")]
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
-use crate::runtime::time::timeout;
+use crate::runtime::time::{coarse_now, sleep, timeout};
 
 #[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
@@ -279,6 +279,35 @@ pub fn select_upstream<'a>(
 /// バッファサイズ（64KB: io_uring の一般的な推奨値）
 const BUF_SIZE: usize = 64 * 1024;
 
+/// spawn した方向の転送の終わり（単一スレッドの実行器の中だけで使う。転送バイト数と、待っているタスクの Waker）
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+struct DirectionDone {
+    bytes: std::cell::Cell<Option<usize>>,
+    waker: std::cell::Cell<Option<std::task::Waker>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl DirectionDone {
+    fn complete(&self, n: usize) {
+        self.bytes.set(Some(n));
+        if let Some(w) = self.waker.take() {
+            w.wake();
+        }
+    }
+
+    async fn wait(&self) -> usize {
+        std::future::poll_fn(|cx| match self.bytes.get() {
+            Some(n) => std::task::Poll::Ready(n),
+            None => {
+                self.waker.set(Some(cx.waker().clone()));
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
 /// c→u / u→c の 2 方向転送を同時に走らせ、両方の転送バイト数を返す。
 ///
 /// `futures::join!` は**どちらか片方が起床するたびに両方を poll する**（子ごとの Waker を
@@ -287,6 +316,8 @@ const BUF_SIZE: usize = 64 * 1024;
 /// （FreeBSD aarch64 の `l4_tcp` 3B で `read` 6.0/req = 1 方向 3 回のうち 1 回が空打ち）。
 /// `FuturesUnordered` は起床した子だけを poll する。子タスクのノード確保は接続あたり 2 回で、
 /// リクエストごとには発生しない（既存の 64KB 転送バッファと同じ接続単位の固定費）。
+/// Linux 以外は 2 方向を別々のタスクにする（`bidirectional_forward` 参照）ので、splice の経路だけが使う。
+#[cfg(target_os = "linux")]
 async fn join_directions<F>(c2u: F, u2c: F) -> (usize, usize)
 where
     F: std::future::Future<Output = usize>,
@@ -341,19 +372,55 @@ async fn forward_direction(
     };
 
     let mut total = 0usize;
+    // kqueue: 直前の read がバッファを満たさなかったら、受信キューは空になっている見込みが高い。
+    // 次は read を先に試さず（EAGAIN の空打ち）、kevent の通知を待ってから読む
+    // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照。EVFILT_READ はレベルトリガなので
+    // 登録の時点でデータがあればすぐ通知され、取りこぼさない）。FreeBSD の `l4_tcp` 3B で read 4.0 → 3.1/req。
+    #[cfg(veil_poller_kqueue)]
+    let mut wait_first = false;
+    // アイドルの監視は方向ごとに 1 本のタイマーで行う。read のたびに `timeout()` で包むと、そのたびに
+    // タイマーの登録と取り消し（タイマー表の操作と時刻の読み出し）が要る。最後に動いた時刻だけを覚え、
+    // タイマーが満了したときに「本当に idle_timeout だけ動いていないか」を確かめて、まだなら残りで張り直す。
+    let mut last_active = coarse_now();
+    let mut watchdog = std::pin::pin!(futures::FutureExt::fuse(sleep(idle_timeout)));
     'outer: loop {
         // read(): buf の ownership を渡し、完了後に (result, buf) として返ってくる
-        let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
-            Ok(r) => r,
-            Err(_) => {
-                debug!("[L4:{}] idle timeout", name);
-                break;
+        #[cfg(veil_poller_kqueue)]
+        let wait = wait_first;
+        #[cfg(veil_poller_kqueue)]
+        let read = async {
+            if wait {
+                if let Err(e) = src.readable_lazy().await {
+                    return (Err(e), buf);
+                }
+            }
+            src.read(buf).await
+        };
+        #[cfg(not(veil_poller_kqueue))]
+        let read = src.read(buf);
+        let mut read = std::pin::pin!(futures::FutureExt::fuse(read));
+        let (res, mut b) = loop {
+            futures::select_biased! {
+                r = read => break r,
+                _ = watchdog => {
+                    let idle_for = coarse_now().saturating_duration_since(last_active);
+                    if idle_for >= idle_timeout {
+                        debug!("[L4:{}] idle timeout", name);
+                        break 'outer;
+                    }
+                    watchdog.set(futures::FutureExt::fuse(sleep(idle_timeout - idle_for)));
+                }
             }
         };
+        last_active = coarse_now();
         let n = match res {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        #[cfg(veil_poller_kqueue)]
+        {
+            wait_first = n < BUF_SIZE;
+        }
         // ReadFuture<Vec<u8>> の set_init は grow-only のため、read 後も b.len() は BUF_SIZE の
         // ままで n には縮まらない。実際に読み取った n バイトのみを送信するよう長さを切り詰める。
         // これを怠ると未初期化の末尾バイトまで送信して転送データを破損させる（生 TCP 中継では
@@ -725,13 +792,24 @@ pub async fn bidirectional_forward(
     // Linux 専用のため使わず、常にユーザースペース read/write 転送（`forward_direction`。
     // コネクション確立時に一度だけバッファを確保しリクエストごとの再確保は発生しない）
     // へフォールバックする。
+    // 2 方向は別々のタスクにする（c→u を spawn し、u→c はこのタスクで回す）。同じタスクで FuturesUnordered に
+    // 入れると、起床のたびに Arc の Waker・キューの操作・Map/Fuse の層を通っていた（FreeBSD の l4_tcp 3B の
+    // プロファイルで約 6%）。タスクの確保は接続あたり 1 回だけ。
     #[cfg(not(target_os = "linux"))]
     {
-        let (c2u_bytes, u2c_bytes) = join_directions(
-            forward_direction(&client, &upstream, idle_timeout, listener_name),
-            forward_direction(&upstream, &client, idle_timeout, listener_name),
-        )
-        .await;
+        let client = std::rc::Rc::new(client);
+        let upstream = std::rc::Rc::new(upstream);
+        let done = std::rc::Rc::new(DirectionDone::default());
+        {
+            let (c, u, d) = (client.clone(), upstream.clone(), done.clone());
+            let name: std::rc::Rc<str> = std::rc::Rc::from(listener_name);
+            crate::runtime::spawn(async move {
+                let n = forward_direction(&c, &u, idle_timeout, &name).await;
+                d.complete(n);
+            });
+        }
+        let u2c_bytes = forward_direction(&upstream, &client, idle_timeout, listener_name).await;
+        let c2u_bytes = done.wait().await;
         debug!(
             "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
             listener_name, c2u_bytes, u2c_bytes

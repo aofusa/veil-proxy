@@ -1,0 +1,2 @@
+# veil: 第三者のコード（vendoring）なので cargo fmt で書き換えない（F-238 で path 依存になり、cargo fmt の対象に入った）
+disable_all_formatting = true

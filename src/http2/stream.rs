@@ -235,6 +235,14 @@ impl Stream {
     pub fn recv_data(&mut self, data: &[u8], end_stream: bool) -> Result<(), Http2Error> {
         // フロー制御・受信量カウント・content-length 検証・状態遷移はアカウンティングに集約。
         // バッファリングのみ本関数で行う（ストリーミング経路は accounting だけを使う）。
+        // どのルートでも許されない大きさは、溜める前にストリームを断る（F-236 の再走査の F3）
+        if self.request_body.len() + data.len() > crate::l7::max_buffered_request_body() {
+            return Err(Http2Error::stream_error(
+                self.id,
+                Http2ErrorCode::EnhanceYourCalm,
+                "request body exceeds the buffered body limit",
+            ));
+        }
         self.recv_data_accounting(data.len(), end_stream)?;
         self.request_body.extend_from_slice(data);
         Ok(())

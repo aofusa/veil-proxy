@@ -1,12 +1,12 @@
-//! # rustls + monoio + kTLS 統合モジュール
+//! # rustls + 独自ランタイム + kTLS 統合モジュール
 //!
-//! このモジュールは、rustls を monoio ランタイムと統合し、
+//! このモジュールは、rustls を veil の独自ランタイム（`src/runtime/`）と統合し、
 //! 自前実装の kTLS（Kernel TLS）サポートを提供します。
 //!
 //! ## 主要コンポーネント
 //!
-//! - [`RustlsConfig`]: TLS 設定を管理
-//! - [`KtlsTlsStream`]: monoio の AsyncReadRent/AsyncWriteRent を実装した TLS ストリーム
+//! - `RustlsConfig`: TLS 設定を管理
+//! - `KtlsTlsStream`: ランタイムの AsyncReadRent/AsyncWriteRent を実装した TLS ストリーム
 //! - [`RustlsAcceptor`]: サーバー側の TLS アクセプター
 //! - [`RustlsConnector`]: クライアント側の TLS コネクター
 //!

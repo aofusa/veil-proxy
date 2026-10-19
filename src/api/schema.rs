@@ -199,22 +199,28 @@ pub fn with_constraints(schema: Value, constraints: Map<String, Value>) -> Value
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldError {
     #[serde(rename = "type")]
+    /// エラーの種類（JSON では `type`。`missing`・`string_too_short` 等）。
     pub kind: String,
+    /// エラーの位置（フィールド名・配列の添字の並び）。
     pub loc: Vec<Value>,
+    /// 人が読むメッセージ。
     pub msg: String,
 }
 
 /// 検証エラーの集合。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValidationErrors {
+    /// 集まったエラー。
     pub errors: Vec<FieldError>,
 }
 
 impl ValidationErrors {
+    /// エラーが 1 件も無いか。
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty()
     }
 
+    /// 位置 `loc`・種類 `kind`・メッセージ `msg` のエラーを足す。
     pub fn push(&mut self, loc: &[Value], kind: &str, msg: impl Into<String>) {
         self.errors.push(FieldError {
             kind: kind.to_string(),
@@ -296,6 +302,7 @@ impl<T: Validate + ?Sized> Validate for Box<T> {
 
 /// 数値制約の検査用（derive の生成コードが使う）。
 pub trait AsNumber {
+    /// 数値として見た値（`ge`・`le` 等の検査に使う。数値でなければ `None`）。
     fn as_number(&self) -> Option<f64>;
 }
 
@@ -312,6 +319,7 @@ impl<T: AsNumber> AsNumber for Option<T> {
 
 /// 長さ制約の検査用（文字列は文字数、配列は要素数）。
 pub trait AsLength {
+    /// 長さ（文字列は文字数、配列は要素数。対象外なら `None`）。
     fn as_length(&self) -> Option<usize>;
 }
 
@@ -353,6 +361,7 @@ impl<T: AsLength> AsLength for Option<T> {
 
 /// 文字列制約（email・url）の検査用。
 pub trait AsText {
+    /// 文字列として見た値（`email`・`url` の検査に使う。対象外なら `None`）。
     fn as_text(&self) -> Option<&str>;
 }
 

@@ -486,13 +486,28 @@ pub struct RouteCacheKey {
     hash: u64,
 }
 
+/// キャッシュキーの xxh3 のシード（プロセスごとの乱数）。
+///
+/// 固定シードだと、64 ビットの衝突（2^32 程度の試行）を手元で探して、ほかのルートの結果をキャッシュから
+/// 引かせる要求を作れる（キャッシュはハッシュだけを比べる。F-236 の F6）。起動後の最初の参照で 1 回だけ作る。
+#[inline]
+fn route_key_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0xdead_beef_cafe_0000);
+        h.finish()
+    })
+}
+
 impl RouteCacheKey {
     /// ゼロアロケーションでキャッシュキーを生成
     ///
     /// &[u8] から直接ハッシュを計算するため String 生成なし。
     #[inline]
     pub fn new(host: &[u8], path: &[u8], method: &[u8], source_ip: &SocketAddr) -> Self {
-        let h1 = xxh3_64_with_seed(host, 0xdead_beef_cafe_0000);
+        let h1 = xxh3_64_with_seed(host, route_key_seed());
         let h2 = xxh3_64_with_seed(path, h1);
         let h3 = xxh3_64_with_seed(method, h2);
         let hash = match source_ip.ip() {
@@ -507,7 +522,7 @@ impl RouteCacheKey {
 // スレッドローカルキャッシュ（ロックフリー）
 // ====================
 //
-// monoio は Thread-per-Core モデルのため、各ワーカースレッドが
+// ランタイムは Thread-per-Core モデルのため、各ワーカースレッドが
 // 独自の LRU キャッシュを持つことで Mutex 競合を完全に排除する。
 //
 // キャッシュ無効化: AtomicU64 の世代カウンターを bump すると

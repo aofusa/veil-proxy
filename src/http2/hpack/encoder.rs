@@ -176,7 +176,7 @@ impl HpackEncoder {
     }
 
     /// Indexed Header Field (Section 6.1)
-    /// ```
+    /// ```text
     ///   0   1   2   3   4   5   6   7
     /// +---+---+---+---+---+---+---+---+
     /// | 1 |        Index (7+)         |
@@ -187,7 +187,7 @@ impl HpackEncoder {
     }
 
     /// Literal Header Field with Incremental Indexing (Section 6.2.1)
-    /// ```
+    /// ```text
     ///   0   1   2   3   4   5   6   7
     /// +---+---+---+---+---+---+---+---+
     /// | 0 | 1 |      Index (6+)       |
@@ -220,7 +220,7 @@ impl HpackEncoder {
     }
 
     /// Literal Header Field Never Indexed (Section 6.2.3)
-    /// ```
+    /// ```text
     ///   0   1   2   3   4   5   6   7
     /// +---+---+---+---+---+---+---+---+
     /// | 0 | 0 | 0 | 1 |  Index (4+)   |
@@ -251,7 +251,7 @@ impl HpackEncoder {
     }
 
     /// Dynamic Table Size Update (Section 6.3)
-    /// ```
+    /// ```text
     ///   0   1   2   3   4   5   6   7
     /// +---+---+---+---+---+---+---+---+
     /// | 0 | 0 | 1 |   Max size (5+)   |
@@ -262,7 +262,7 @@ impl HpackEncoder {
     }
 
     /// 文字列をエンコード
-    /// ```
+    /// ```text
     ///   0   1   2   3   4   5   6   7
     /// +---+---------------------------+
     /// | H |     String Length (7+)    |

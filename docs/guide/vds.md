@@ -152,7 +152,7 @@ request carries `Authorization: Bearer <token>`.
     "id": "edge-1",
     "cluster": "prod",
     "user_agent_name": "veil",
-    "user_agent_version": "0.7.0"
+    "user_agent_version": "0.8.0"
   },
   "type_url": "type.veil.dev/veil.v1.Snapshot",
   "response_nonce": "17",

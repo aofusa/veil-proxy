@@ -60,14 +60,23 @@ fn freeze_state() {
 /// `[api]` セクション（本体の設定には無いキー。フックが取り除いて読む）。
 #[derive(Debug, Clone)]
 pub struct ApiSettings {
+    /// OpenAPI（`/openapi.json` と Swagger UI）を提供するか。既定 `true`。
     pub openapi_enabled: bool,
+    /// Swagger UI のパス。既定 `/docs`。
     pub openapi_path: String,
+    /// OpenAPI JSON のパス。既定 `/openapi.json`。
     pub openapi_json_path: String,
+    /// OpenAPI 文書の `info.title`。既定 `veil API`。
     pub openapi_title: String,
+    /// OpenAPI 文書の `info.version`。既定 `0.1.0`。
     pub openapi_version: String,
+    /// OpenAPI 文書の `info.description`（省略可）。
     pub openapi_description: Option<String>,
+    /// ハンドラが受け取る要求本文の上限バイト数。既定 10MiB。
     pub max_body_size: usize,
+    /// ブロッキングなハンドラ用プールのスレッド数。`0` なら既定の数を自動で決める。
     pub handler_threads: usize,
+    /// tokio 互換ランタイムのワーカー数。既定 `2`。
     pub tokio_threads: usize,
     /// gRPC の受信メッセージ上限（F-197、`grpc-handler`）
     pub grpc_max_message_size: usize,
@@ -305,6 +314,7 @@ impl App {
         self
     }
 
+    /// `GET` メソッドのルートを登録する（`route(&["GET"], path, f)` の短縮形）。
     pub fn get<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -314,6 +324,7 @@ impl App {
         self.route(&["GET"], path, f)
     }
 
+    /// `POST` メソッドのルートを登録する（`route(&["POST"], path, f)` の短縮形）。
     pub fn post<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -323,6 +334,7 @@ impl App {
         self.route(&["POST"], path, f)
     }
 
+    /// `PUT` メソッドのルートを登録する（`route(&["PUT"], path, f)` の短縮形）。
     pub fn put<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -332,6 +344,7 @@ impl App {
         self.route(&["PUT"], path, f)
     }
 
+    /// `DELETE` メソッドのルートを登録する（`route(&["DELETE"], path, f)` の短縮形）。
     pub fn delete<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -341,6 +354,7 @@ impl App {
         self.route(&["DELETE"], path, f)
     }
 
+    /// `PATCH` メソッドのルートを登録する（`route(&["PATCH"], path, f)` の短縮形）。
     pub fn patch<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,

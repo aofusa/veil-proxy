@@ -19,9 +19,11 @@ use std::time::Duration;
 /// L4 ハンドラのエラー。
 #[derive(Debug)]
 pub enum L4Error {
+    /// 入出力エラー。
     Io(std::io::Error),
     /// アイドルタイムアウト（`[[l4]] idle_timeout_secs`）
     Timeout,
+    /// その他のエラー（メッセージのみ）。
     Other(String),
 }
 
@@ -163,8 +165,11 @@ impl L4Connection {
 /// UDP ハンドラに渡すデータグラム。戻り値の `Some(bytes)` は送信元へ返信する。
 #[derive(Debug, Clone)]
 pub struct L4Datagram {
+    /// 受信したデータグラムの内容。
     pub data: Bytes,
+    /// 送信元のアドレス。
     pub peer: SocketAddr,
+    /// 受信した `[[l4]]` リスナーの名前。
     pub listener: Arc<str>,
 }
 
@@ -181,7 +186,9 @@ pub type L4UdpFn =
 
 /// マクロ（`#[veil::l4_handler(protocol = "tcp")]`）の静的登録。
 pub struct L4HandlerDef {
+    /// ハンドラの名前（`[[l4]]` の `handler` で参照される）。
     pub name: &'static str,
+    /// ハンドラ本体。
     pub handler:
         for<'a> fn(&'a mut L4Connection) -> Pin<Box<dyn Future<Output = Result<(), L4Error>> + 'a>>,
 }
@@ -189,7 +196,9 @@ inventory::collect!(L4HandlerDef);
 
 /// マクロ（`#[veil::l4_handler(protocol = "udp")]`）の静的登録。
 pub struct L4UdpHandlerDef {
+    /// ハンドラの名前（`[[l4]]` の `handler` で参照される）。
     pub name: &'static str,
+    /// ハンドラ本体。
     pub handler: fn(L4Datagram) -> Pin<Box<dyn Future<Output = Option<Bytes>>>>,
 }
 inventory::collect!(L4UdpHandlerDef);

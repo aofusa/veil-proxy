@@ -20,10 +20,14 @@ K6DIR="$HERE/k6"                     # k6 スクリプト・proto の所在
 
 # 負荷パラメータ（環境変数で上書き可）
 WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
-H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
-H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
+# v0.8.0: h2load は既定で 1 スレッドで、HTTP/3 では h2load 自体が律速になっていた（veil・nginx とも CPU は 4 コア中
+# 1.5〜1.7 コアしか使っていなかった）。サーバを測るため 4 スレッドにする（-c はスレッド数の倍数に）。
+H2_ARGS="${H2_ARGS:--t4 -n 30000 -c100 -m10}"
+H3_ARGS="${H3_ARGS:---alpn-list=h3 -t4 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
 H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: listen_cleartext / nginx: listen 8080 http2）
-H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
+# h2c は速い（3B で 3 万 req/s 前後）ので、HTTP/2 と同じ 3 万要求だと 1 秒で終わり、立ち上がりと末尾の揺れで
+# ±10% ぶれる（v0.8.0 の交互 A/B で同じイメージが 27k〜31.5k）。4 倍の要求数で 4 秒前後にする。
+H2C_ARGS="${H2C_ARGS:--t4 -n 120000 -c100 -m10}"   # h2c 負荷
 
 # 計測クライアント 1 回あたりの上限時間（秒）。**サーバ側のハングでスイート全体が
 # 止まらないための安全弁**（B-75: epoll + kTLS のハングで h2load が 36 分間ぶら下がり、
@@ -218,18 +222,18 @@ run_grpc_h3() { # label cfg container
 # HTTP/3 計測: QUIC 対応 h2load（local/h2load-h3）の QUIC モード（--alpn-list=h3）で
 # veil の静的配信を UDP/QUIC で叩く。QUIC h2load イメージが無い場合はスキップする
 # （既定の local/h2load は ngtcp2 非搭載で HTTP/3 を計測できない）。
-run_http3() { # label cfg container
-    local label="$1" cfg="$2" c="$3" iter reqps tput latmean non2xx cpu mem
+run_http3() { # label cfg container [port]
+    local label="$1" cfg="$2" c="$3" port="${4:-443}" iter reqps tput latmean non2xx cpu mem
     if ! docker image inspect "$H3_IMG" >/dev/null 2>&1; then
         echo "!! $H3_IMG が無いため HTTP/3 計測をスキップ（tools/perf/h2load-http3 でビルド）" >&2
         emit "$label" "$cfg" "http3" 1 NA NA NA NA NA NA NA
         return
     fi
-    run_client /dev/null --network $NET --entrypoint h2load $H3_IMG $H3_ARGS -n 1000 -c 10 "https://$c:443/"
+    run_client /dev/null --network $NET --entrypoint h2load $H3_IMG $H3_ARGS -n 1000 -c 10 "https://$c:$port/"
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" ) &
         run_client "$LOGDIR/${label}_${cfg}_h3_${iter}.log" \
-            --network $NET --entrypoint h2load $H3_IMG $H3_ARGS "https://$c:443/"
+            --network $NET --entrypoint h2load $H3_IMG $H3_ARGS "https://$c:$port/"
         wait
         read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h3_${iter}.log")
         read cpu mem < "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -255,8 +259,8 @@ run_h2c() { # label cfg container [path]
     done
 }
 
-run_load() { # target_label config_label container has_http2
-    local label="$1" cfg="$2" c="$3" h2="$4" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
+run_load() { # target_label config_label container has_http2 [https_port]
+    local label="$1" cfg="$2" c="$3" h2="$4" port="${5:-443}" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
 
     # 専用クライアントを要する構成は wrk/h2load ではなく専用計測へ委譲する。
     # 命名から汎用パターンで判定（grpc_h3* はフェイルセーフ、その他 *grpc* は k6 gRPC、
@@ -279,7 +283,7 @@ run_load() { # target_label config_label container has_http2
 
     # HTTP/1.1 負荷の宛先。L4 ストリームプロキシ構成は 443 の HTTPS ではなく
     # 平文 L4 リスナー（9080 → perf-backend:80 素通し）を計測する。
-    local h1_url="https://$c:443/"
+    local h1_url="https://$c:$port/"
     case "$cfg" in
         *feat_l4*) h1_url="http://$c:9080/" ;;
     esac
@@ -300,11 +304,11 @@ run_load() { # target_label config_label container has_http2
 
     # HTTP/2 (h2load) × ITERATIONS
     if [ "$h2" = "1" ]; then
-        run_client /dev/null --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:443/"
+        run_client /dev/null --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:$port/"
         for iter in $(seq 1 "$ITERATIONS"); do
             ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" ) &
             run_client "$LOGDIR/${label}_${cfg}_h2_${iter}.log" \
-                --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "${h2_extra[@]}" "https://$c:443/"
+                --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "${h2_extra[@]}" "https://$c:$port/"
             wait
             read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2_${iter}.log")
             read cpu mem < "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -413,6 +417,14 @@ docker run -d --rm --network $NET \
     --name nginx-perf nginx:alpine >/dev/null
 if wait_ready nginx-perf; then
     run_load nginx base nginx-perf 1
+    # 同じ仕事の比較用（v0.8.0）: TLS で受けて perf-backend へ中継（veil の *_proxy* 構成の相手）と、
+    # gzip で毎回圧縮する静的配信（veil のキャッシュ無しの *_compression 構成の相手）
+    run_load nginx base_proxy nginx-perf 1 8443
+    run_load nginx base_compression nginx-perf 1 8444
+    run_load nginx base_proxy_compression nginx-perf 1 8445
+    # HTTP/3（QUIC）の相手: 静的配信（veil の h3_file* / feat_http3）と中継（veil の h3_proxy*）
+    run_http3 nginx base nginx-perf 443
+    run_http3 nginx base_proxy nginx-perf 8443
     # h2c ベースライン（veil の h2c_file / h2c_proxy と同じ config 名で比較できるようにする）
     run_h2c nginx h2c_file  nginx-perf "/"
     run_h2c nginx h2c_proxy nginx-perf "/proxy/"

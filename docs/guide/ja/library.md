@@ -75,25 +75,34 @@ tokio の橋渡しを使うときは `features = ["full", "api-core", "tokio-com
 
 ### Cargo.toml
 
-veil は crates.io には公開されていません。git 依存か path 依存を使います。feature は用途で選びます。`full` は HTTP/3・kTLS・
-gRPC・WASM などプロキシ機能を一通り含み、コンテナ向けは `full-container` です。`default-features` は切ります
-（アロケータの選び方は [メモリアロケータ](#メモリアロケータ) を参照）。
+crates.io には **`veil-proxy`** の名前で公開しています（`veil` は別のプロジェクトの名前）。依存のキーは `veil` のままにします。
+ライブラリ名が `veil` で、マクロが生成するコードも `::veil::` を参照するためです。feature は用途で選びます。`full` は
+HTTP/3・kTLS・gRPC・WASM などプロキシ機能を一通り含み、コンテナ向けは `full-container` です。`default-features` は切ります
+（アロケータの選び方は [メモリアロケータ](#メモリアロケータ) を参照）。API の文書は [docs.rs/veil-proxy](https://docs.rs/veil-proxy)。
 
 ```toml
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
-# ローカルのチェックアウトを使う場合:
-# veil = { path = "../veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+# リポジトリやローカルのチェックアウトを使う場合:
+# veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+# veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# HTTP/3 を使うときの推奨: veil がビルドに使う vendoring 版 quiche を使う。
-# 複数ストリームの STREAM フレームを 1 パケットへ詰める差分で、外すと小さな応答が
-# 1 リクエスト 1 パケットに戻る（F-172）。cargo は最上位パッケージの [patch] しか見ない。
-[patch.crates-io]
-quiche = { git = "https://github.com/aofusa/veil-proxy" }
-# または: quiche = { path = "../veil-proxy/third_party/quiche" }
 ```
+
+**Linux で HTTP/3 を使う**ときは、利用する側のプロジェクトの `.cargo/config.toml` に設定が 1 つ要ります。quiche は rustls と
+同じ `aws-lc-sys` をシンボルのプレフィックス無しで使います。veil を依存として使うと、cargo は veil 自身の
+`.cargo/config.toml` を読みません。設定が無いと、veil のビルドスクリプトがこの内容を示して止まります。
+
+```toml
+# 利用する側の .cargo/config.toml（ビルドするターゲットごとに 1 行）
+[env]
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
+```
+
+複数ストリームの STREAM フレームを 1 パケットへ詰める vendoring 版 quiche（F-172）は通常の依存（`veil-proxy-quiche`）なので、
+`[patch]` は要りません。
 
 平文 HTTP の API だけなら `default-features = false` と `features = ["api"]` で足ります（TLS・HTTP/3 なし）。
 `examples/api/rust-showcase` はすべての機能を使った完全なプロジェクトです。
@@ -428,13 +437,16 @@ tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が v
 
 ```toml
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # シムに解決される
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 
 [patch.crates-io]
-tokio = { git = "https://github.com/aofusa/veil-proxy", package = "tokio" }   # crates/veil-tokio/tokio-shim
+# シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
+# 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.0", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.0" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は
@@ -810,6 +822,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
+文書全体（入門・FastAPI からの移行の対応表・API 一覧）は <https://veil-api.readthedocs.io> にあります（英語が正。日本語版は gettext で作る。手順は crates/veil-python/docs/conf.py の冒頭）。
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは
 [examples/api/python-hello/](../../../examples/api/python-hello/)・
 [examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/)・
@@ -847,8 +860,8 @@ CPU 0-1、サーバのスレッド・ワーカーは 2）、wrk はもう 1 つ�
 | axum + `veil::tokio`、`axum::serve` | 38,218 | 35,099 | 2.27 | 28.1 | 8.7 |
 | axum + `veil::tokio`、スレッドごと | 54,491 | 49,930 | 1.48 | 37.2 | 8.2 |
 | axum + `veil::tokio`、スレッドごと（epoll） | 56,607 | 52,010 | 1.35 | 35.8 | 7.0 |
-| veil の `App` + axum の `Router`（`tokio_service`） | 45,765 | 41,560 | 2.07 | 44.5 | 11.5 |
-| veil の `App` + axum の `Router`（epoll） | 47,282 | 43,520 | 2.08 | 43.0 | 9.8 |
+| veil の `App` + axum の `Router`（`tokio_service`） | 49,960 | 46,013 | 3.37 | 41.5 | 12.0 |
+| veil の `App` + axum の `Router`（epoll） | 46,905 | 44,225 | 3.34 | 44.0 | 9.8 |
 | veil のネイティブハンドラ（`#[veil::route]`） | 68,832 | 63,069 | 2.83 | 29.4 | 11.4 |
 | veil のネイティブハンドラ（epoll） | 67,013 | 61,303 | 2.78 | 30.2 | 10.0 |
 
@@ -867,7 +880,10 @@ tokio 上の axum（スレッドごと、68,343 / 61,675 req/s）と同じ回で
   CPU は同じか少ない（29.4 / 30.2 µs、axum は 30.5 µs）です。io_uring では、すぐ次の要求を送ってくるキープアライブの接続を
   readiness の確認 → 読み取りの 2 段ではなく期限付きの `RECV` 1 回で読みます（F-205、`[performance] keepalive_direct_read_ms`）。
   アイドル接続は今まで通り読み取りバッファを持ちません。axum の `Router` を載せる場合は `http::Request`/`http::Response`
-  との変換が加わります（1 要求あたり 30 回の確保の大半は http・axum の中）。
+  との変換が加わります。F-235 で、変換は要求のパスとヘッダの値（`Bytes`）を複製せずに共有し、応答の本文をキューに集めずに受け取り、
+  載せたサービスの extensions に veil の `Request` を入れなくなりました。1 要求あたりの確保は 30 → 22 回（ネイティブは 4 回）、
+  ネイティブハンドラに対する比は 67% → 76% です（同じ回の交互の計測で 49,960 対 65,945 req/s、2026-10-16）。22 回のうち
+  約 12 回は axum の中（ルーティング・extensions・Box の Future）です。
 
 ### HTTP/2（h2c）と HTTP/3
 

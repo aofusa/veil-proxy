@@ -439,6 +439,10 @@ pub struct HttpCm {
     pub generate_request_id: bool,
     /// 接続の相手のアドレスを X-Forwarded-For に足す（Envoy の `use_remote_address`。ゲートウェイ）
     pub use_remote_address: bool,
+    /// X-Forwarded-For の右から信頼するホップの数（Envoy の `xff_num_trusted_hops`）。RBAC の remote_ip の元
+    pub xff_num_trusted_hops: u32,
+    /// 要求のパスの正規化（ルート・RBAC・JWT の照合の前。F-236 の F5）
+    pub path_normalization: crate::mesh::path_norm::PathNormalization,
     pub websocket: bool,
     /// HTTP フィルタ（順序どおり。fault・cors・rbac 等。未知で任意のものは除いてある）
     pub filters: Vec<HttpFilterCfg>,

@@ -427,7 +427,7 @@ impl io::Write for LogRoutingWriter {
 ///
 /// grokはtokio::sync::mpscを使った非同期化を提案しましたが、これは以下の理由で不適切です：
 /// 1. ftlogは既に非同期（内部でチャネル＋バックグラウンドスレッドを使用）
-/// 2. tokio::sync::mpscはmonoioランタイムと互換性がない
+/// 2. tokio::sync::mpscはveilの独自ランタイム（`src/runtime/`。tokio を使わない）と互換性がない
 /// 3. 追加の非同期化層はオーバーヘッドを増やすだけ
 ///
 /// ftlog公式ドキュメントより：

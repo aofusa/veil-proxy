@@ -239,7 +239,7 @@ unsafe impl IoBufMut for SafeReadBuffer {
 pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
 pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
                                                   // http2 (H2C/gRPC) 経路でのみ使用
-#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+#[cfg(feature = "http2")]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
 // タイムアウト設定
@@ -363,7 +363,7 @@ fn peek_pooled_peer(fd: crate::runtime::handle::RawFd) -> PooledPeerState {
             crate::runtime::handle::win::to_socket(fd),
             &mut b,
             1,
-            MSG_PEEK as i32,
+            MSG_PEEK,
         )
     };
     if r == 0 {
@@ -943,7 +943,7 @@ pub(crate) fn buf_get() -> SafeReadBuffer {
 /// バッファ返却ヘルパー（SafeReadBuffer版）
 ///
 /// SafeReadBuffer をプールに返却します。
-/// 内部の Vec<u8> を取り出してプールに格納します。
+/// 内部の `Vec<u8>` を取り出してプールに格納します。
 ///
 /// # セキュリティ
 ///
@@ -954,9 +954,9 @@ pub(crate) fn buf_put(buf: SafeReadBuffer) {
     buf_put_vec(buf.into_inner());
 }
 
-/// バッファ返却ヘルパー（Vec<u8>版、書き込み後の返却用）
+/// バッファ返却ヘルパー（`Vec<u8>` 版、書き込み後の返却用）
 ///
-/// 書き込み操作で使用された Vec<u8> をプールに返却します。
+/// 書き込み操作で使用された `Vec<u8>` をプールに返却します。
 /// 主に `into_truncated()` 後の書き込み完了時に使用されます。
 #[inline(always)]
 #[allow(clippy::uninit_vec)]

@@ -49,6 +49,9 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > `access()`/`faccessat()` の実体として発行）を含みます。これが無いと seccomp 有効時に
 > ファイル解決が `EPERM` で失敗し、静的配信が 404 になります（コンテナ用
 > `docker/assets/security/seccomp.json` にも同システムコールを含めています）。
+> 静的配信のパス解決（`RESOLVE_BENEATH` での封じ込め、F-153）に使う `openat2` も含みます。
+> コンテナ用のプロファイルには v0.8.0 で足しました（無いと毎回 `canonicalize()` の経路に戻ります。
+> 以前は起動後最初の静的配信の要求だけが 404 になっていました。B-154）。
 
 **推奨導入手順:**
 
@@ -355,3 +358,43 @@ Veilは接続レベルのパニックキャッチを実装し、高可用性を�
 - この機能は自動的に有効化されます（設定不要）
 - `monoio::spawn` タスク内のパニックのみを保護
 - accept ループやランタイム初期化時のパニックはワーカースレッドを終了させます
+
+## セキュリティ監査（F-236）
+
+リリースの前に、Anthropic の [claude-security](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/claude-security)
+プラグインでリポジトリを走査します。確認された指摘は、`docs/backlog/bugs/` の `B-` チケットと同じ変更で直します。v0.8.0 の監査では
+B-135〜B-151 を直しました（最初の走査と再走査）。
+
+走査のやり直し方（未コミットのファイルを読ませないよう、監査する版のきれいな worktree で行う）:
+
+```bash
+git worktree add ../veil-secscan <revision>
+cd ../veil-secscan
+CLAUDE_CODE_WORKFLOWS=1 claude -p \
+  "/claude-security:claude-security Scan codebase at medium effort. I understand it will use a lot of tokens." \
+  --permission-mode auto
+```
+
+結果（`CLAUDE-SECURITY-RESULTS.md`・`.jsonl`・`.sarif`）は worktree に書かれます。指摘を直すまでは
+`docs/artifacts/claude-security/`（コミットしない）に置きます。前回との比較は `claudeSecurityPluginFindingId` で行い、誤検出と
+判断した指摘は理由を `docs/artifacts/claude-security/triage.md` に書きます。
+
+監査から入った要求の検査:
+
+- HTTP/2・HTTP/3 のフィールドの名前は token、値は NUL・CR・LF を含まず空白で始まらず終わらないこと。`:method` は token、
+  `:path` は空白・制御文字を含まないこと（RFC 9113 §8.2.1・RFC 9114 §4.2）。違反はストリームのエラーなので、HTTP/1.1 の上流に
+  届かない。
+- `remove_request_headers`・`add_request_headers` は、すべてのクライアント・上流のプロトコルに効く。
+- 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`Authorization` の要求への応答
+  （`key_headers` に `Authorization` が無いとき）を保存しない。
+- IP の許可・拒否リストは、IPv4 射影の IPv6 のアドレスを IPv4 として照合する。
+- 要求のパスは、ルートの照合・`[route.security]` の検査の前に正規化し、正規化したまま上流へ送る
+  （`[security] path_normalization`）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないものは 400。
+- chunked の要求の本文は厳格に読み（RFC 9112 §7.1。不正なフレーミングは断る）、終端のチャンクより後ろを
+  その要求の一部として上流へ送らない。
+- WebSocket のアップグレードにも `remove_request_headers`・`add_request_headers` が効く。ハンドシェイクの後ろの
+  クライアントのバイトは、上流が `101` を返したときだけ送る。
+- HTTP/2・HTTP/3 のバッファ経路の要求本文は、溜める途中で上限（全ルートの `max_request_body_size` の最大。
+  最低 10MB）を見て、超えたストリームを断る。
+- Linkerd の管理ポートの `/shutdown`・`/env.json` はループバックからだけ受ける。
+- メッシュは、ルート・RBAC・JWT の前にパスを正規化し、`remoteIpBlocks` を Envoy の「元のクライアントのアドレス」で判定する。

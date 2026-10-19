@@ -1,6 +1,6 @@
 # F-236: Claude Security のプラグインでセキュリティ監査を行う
 
-**状態: 未着手（2026-10-16 起票・設計）**
+**状態: 完了（feat/v080-release、2026-10-18）**
 
 ## 目的
 
@@ -75,6 +75,42 @@ Anthropic 公式のプラグイン claude-security（https://github.com/anthropi
 - CRITICAL・HIGH の指摘が 0 になる（修正したか、誤検出と根拠を付けて判断した）。
 - 修正の変更ごとに、回帰の試験（単体・E2E・ファズのコーパス）と、性能の非退行（`suite_ab.sh`）を確かめる。
 - `docs/guide/security.md`（英日）に、監査の方法と再走査の手順を書く。
+
+## 実装の結果
+
+- 走査: 設計の 10 の範囲に分けず、リポジトリ全体を effort low で走査した（版 93f4a114）。範囲を分けた effort high は
+  トークンの消費が大きく、全体の走査で攻撃面（HTTP/1.1・2・3、メッシュ、キャッシュ、IP 制限、Wasm）を網羅できたため。
+  修正の後に同じ範囲を再走査した（版 472d1582）。結果は `docs/artifacts/claude-security/` の 2 つのディレクトリ。
+- 最初の走査で確認された指摘は 8 件（HIGH 2・MEDIUM 5・LOW 1）。誤検出は無かった。全部を直した:
+
+  | 指摘 | 深刻度 | チケット |
+  |---|---|---|
+  | F1 HTTP/2 → HTTP/1.1 の要求の密輸 | HIGH | B-135 |
+  | F2 HTTP/3 → HTTP/1.1 の要求の密輸 | HIGH | B-135 |
+  | F3 メッシュの RBAC が X-Forwarded-For の左端 | MEDIUM | B-137 |
+  | F4 HTTP/2・HTTP/3 に要求ヘッダの削除・追加が効かない | MEDIUM | B-136 |
+  | F5 メッシュのパスの正規化が無い | MEDIUM | B-138 |
+  | F6 ルートのキャッシュの固定シードのハッシュ | MEDIUM | B-139 |
+  | F7 応答のキャッシュが利用者ごとの応答を共有 | MEDIUM | B-140 |
+  | F8 IPv4 射影の IPv6 が拒否リストをすり抜ける | LOW | B-141 |
+
+- 再走査: 最初の 8 件は再び出なかった。新しく 10 件（HIGH 1・MEDIUM 7・LOW 2）が確認され、全部を直した:
+
+  | 指摘 | 深刻度 | チケット |
+  |---|---|---|
+  | F1 chunked の要求の終端より後ろを上流へ送る | HIGH | B-142 |
+  | F2 WebSocket に要求ヘッダの削除・追加が効かない | MEDIUM | B-144 |
+  | F3 HTTP/2 のバッファ経路の本文に上限が無い | MEDIUM | B-146 |
+  | F4 HTTP/3 のバッファ経路の本文に上限が無い | MEDIUM | B-147 |
+  | F5 chunked の要求を緩く解析する | MEDIUM | B-143 |
+  | F6 WebSocket のハンドシェイクの後ろのバイトを先に送る | MEDIUM | B-145 |
+  | F7 TOML のルートが生のパスで照合する | MEDIUM | B-148 |
+  | F8 Linkerd の管理の `/shutdown`・`/env.json` | MEDIUM | B-149 |
+  | F9 aarch64 の試験 VM の SSH | LOW | B-150 |
+  | F10 BSD の試験 VM のコンソール・QMP | LOW | B-151 |
+
+- 監査の前に、単体テストで B-134（Wasm の get_property の巨大な確保）も見つけて直した。
+- `docs/guide/security.md`（英日）に、監査の方法と再走査の手順、監査から入った検査を書いた。
 
 ## 関連
 

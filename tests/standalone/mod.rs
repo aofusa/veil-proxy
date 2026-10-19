@@ -88,6 +88,7 @@ impl VeilProcess {
         }
     }
 
+    #[cfg(unix)]
     pub fn pid(&self) -> i32 {
         self.child.as_ref().unwrap().id() as i32
     }
@@ -277,6 +278,8 @@ fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// TLS ハンドシェイクしてサーバ証明書（DER の先頭 1 枚）を返す（検証しない）。
+/// 使うのは unix 専用の試験（シンボリックリンクの付け替え）だけ。
+#[cfg(unix)]
 pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
     use std::sync::Arc;
     let _ = veil::tls_provider::provider::default_provider().install_default();
@@ -299,9 +302,11 @@ pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
         .ok_or_else(|| std::io::Error::other("no peer certificate"))
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct NoVerify;
 
+#[cfg(unix)]
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,

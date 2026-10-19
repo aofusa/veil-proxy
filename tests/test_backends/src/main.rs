@@ -569,6 +569,13 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(9020);
     let echo2_addr: SocketAddr = format!("127.0.0.1:{}", echo2_port).parse().unwrap();
+    // 3 つ目の echo。B-104 の「順に送った HTTP/3 の要求が上流接続を再利用する」検証だけが使う
+    // （F-233 でテストの順が変わり、/echo-upload を使う他のテストと同時に走って偽の失敗になった）。
+    let echo3_port: u16 = std::env::var("ECHO3_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9021);
+    let echo3_addr: SocketAddr = format!("127.0.0.1:{}", echo3_port).parse().unwrap();
 
     info!(
         "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, udp-echo={}, bad={}",
@@ -581,6 +588,7 @@ async fn main() {
         run_chunked_server(chunked_addr),
         run_echo_server(echo_addr),
         run_echo_server(echo2_addr),
+        run_echo_server(echo3_addr),
         run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
         run_udp_echo_server(udp_echo_addr),
         run_bad_backend_server(bad_addr),

@@ -86,7 +86,7 @@ fn register_l4_udp(name: String, listen: String, handler_id: u64) {
 }
 
 /// 設定（`veil::api::Config` のラッパ）。
-#[pyclass(name = "Config", module = "veil._veil")]
+#[pyclass(name = "Config", module = "veil._veil", from_py_object)]
 #[derive(Clone)]
 struct PyConfig {
     inner: VeilConfig,
@@ -194,7 +194,7 @@ struct PyRoute {
 /// ルートの呼び出し口を GIL 下で呼び、応答を組み立てる。`ctx` はハンドラ用プールで動くとき（ストリーミングの
 /// 応答・要求本文の順次受信ができる。F-210）。
 fn call_python(route: &PyRoute, req: Request, ctx: Option<&mut HandlerContext>) -> Response {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let r = (|| -> PyResult<Response> {
             let native_req = native::NativeRequest::new(req);
             let ctx_ptr = ctx.map(|c| c as *mut HandlerContext);
@@ -321,7 +321,7 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         };
     }
     drop(handlers);
-    py.allow_threads(move || app.run())
+    py.detach(move || app.run())
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
@@ -331,6 +331,7 @@ fn shutdown() {
     veil::api::app::shutdown();
 }
 
+/// Native extension of the veil API server library (use the `veil` package instead).
 #[pymodule]
 fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConfig>()?;

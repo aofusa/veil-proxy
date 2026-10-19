@@ -150,12 +150,14 @@ users:
     lock_passwd: false
     ssh_authorized_keys:
       - ${pub}
+# シリアルコンソール用のパスワード（SSH は鍵認証だけ。SSH のポートはホストの 127.0.0.1 だけに公開する。
+# F-236 の再走査の F9）
 chpasswd:
   list: |
     veil:veil
     root:root
   expire: false
-ssh_pwauth: true
+ssh_pwauth: false
 # TCG エミュレーションを軽くするため不要サービスを無効化（起動高速化）
 bootcmd:
   - systemctl mask snapd.service snapd.seeded.service snapd.socket multipathd.service || true
@@ -244,7 +246,7 @@ exec qemu-system-aarch64 \
 BOOT
 
     log "VM を起動: コンテナ ${CONTAINER}（SSH → 127.0.0.1:${SSH_PORT}）"
-    docker run -d --name "${CONTAINER}" -p "${SSH_PORT}:2222" \
+    docker run -d --name "${CONTAINER}" -p "127.0.0.1:${SSH_PORT}:2222" \
         -e VM_SMP="${VM_SMP}" -e VM_MEM_MB="${VM_MEM_MB}" \
         -v "${VEIL_QEMU_DIR}:/w" -w /w \
         "${HELPER_IMAGE}" bash /w/boot.sh

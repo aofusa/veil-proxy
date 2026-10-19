@@ -4,16 +4,27 @@ build-backend = "maturin"
 
 [project]
 name = "veil-api"
-version = "0.7.0"
+# 版は crates/veil-python/Cargo.toml（ワークスペースの版、F-231）から maturin が読む
+dynamic = ["version"]
 description = "veil API server library: FastAPI-like Python bindings (io_uring / HTTP/1.1, 2, 3)"
 requires-python = ">=3.9"
+readme = "README.md"
 license = { text = "Apache-2.0 OR MIT" }
 authors = [{ name = "aofusa" }]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
 ]
+
+[project.urls]
+Documentation = "https://veil-api.readthedocs.io"
+Source = "https://github.com/aofusa/veil-proxy"
+Changelog = "https://github.com/aofusa/veil-proxy/releases"
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]

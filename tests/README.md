@@ -12,7 +12,7 @@ veil のテスト構成と実行手順。機能・ビルドの正典は [../READ
 | 統合 | `tests/integration_tests.rs` | `cargo test --test integration_tests --features full` |
 | プロパティ（proptest） | `tests/{config,routing}_proptest.rs` | `cargo test --test config_proptest --features full` 等 |
 | ランタイム cancel | `tests/runtime_cancellation_test.rs` | `cargo test --test runtime_cancellation_test --features full` |
-| E2E（バックエンド実起動） | `tests/e2e_tests.rs` + `tests/e2e_setup.sh` | **`./tests/e2e_setup.sh test`**（下記） |
+| E2E（バックエンド実起動） | `tests/e2e_tests/`（`main.rs` + 機能ごとのファイル）+ `tests/e2e_setup.sh` | **`./tests/e2e_setup.sh test`**（下記） |
 | 自己完結 E2E（プロセス単位） | `tests/standalone_e2e.rs` + `tests/standalone/` | `cargo test --test standalone_e2e --features full`（環境変数上書き・証明書差し替え・平文専用サーバ・VDS） |
 | API ライブラリ E2E | `tests/api/library_e2e.sh` | `tests/api/library_e2e.sh all`（Rust・gRPC・C・Python・本体非退行。Linux・macOS・BSD・Windows の Git Bash） |
 | ACME E2E | `tests/acme/pebble_e2e.sh` | Pebble（docker）で HTTP-01 の発行と差し替え |

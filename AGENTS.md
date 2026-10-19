@@ -12,7 +12,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - クレート名 `veil`（ディレクトリ名 `veil-proxy`）。リリースバイナリは `target/release/veil`。
 - **ライブラリ + バイナリ構成**。mod 宣言・公開 API は [src/lib.rs](src/lib.rs)、サーバ起動配線は
   [src/entry.rs](src/entry.rs)（`veil::run()`）、[src/main.rs](src/main.rs) は `veil::run()` を呼ぶだけ。
-- 設定は TOML（`serde`）。全キーのリファレンスは [examples/config.toml](examples/config.toml)（`src/config.rs` と同期）。
+- 設定は TOML（`serde`）。全キーのリファレンスは [examples/config.toml](examples/config.toml)（`src/config/` と同期。設定の型は `src/config/mod.rs`）。
 
 ---
 
@@ -86,10 +86,16 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ### HTTP/2・HTTP/3・静的配信・プロキシ
 
 - HTTP/3 メインループはダーティ接続集合でイベント駆動（全接続スイープ禁止）。仕事をした接続はダーティのまま再投入し、
-  ダーティが残る間は sleep 0（B-12 / F-151）。起床通知はコアレッシングする（F-161）。
+  ダーティが残る間は sleep 0（B-12 / F-151）。起床通知はコアレッシングする（F-161）。ただし本文を一部だけ送れた
+  （送れる量を使い切った）だけの進捗は再投入しない（続きは ACK・タイマーで再びダーティになる。F-240）。
+- QUIC の輻輳制御の既定は cubic（veil は pacing の送出時刻を守らずに送るので、BBR は受け手で捨てられて再送が増える。F-240）。
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- HTTP/3 の応答本文は `ZcFactory`（`Bytes`）で quiche へコピーせず渡す（`send_h3_body` → `send_body_zc`）。vendoring の quiche の
+  `send_body_zc` は送る分に切ったバッファを渡す（全長を渡すと偽の STREAM_DATA_BLOCKED を送り ngtcp2 が FINAL_SIZE_ERROR で
+  切断する。E2E の HTTP/3 クライアントは quinn で素通りするので、送出を変えたら h2load でも確かめる）。quiche の
+  `set_time_hint` は受信の束・1 接続の送出の束を処理する間だけ `Some` にし、終わったら必ず `None` に戻す（v0.8.0）。
 - HTTP/3 のバッファ経路（静的配信・gRPC・Wasm・`buffering = full` 等）の要求は、メインループで await しない。
   ワーカーの `FuturesUnordered` に置いて作成直後に 1 回 poll し、応答は `ProxyStream` のチャネルで返す。
   別タスクとして spawn すると `yield_now` まで走らず応答が 1 イテレーション遅れる（3B で −12%。B-97）。
@@ -112,6 +118,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   絶対シンボリックリンクは Linux=`EXDEV`・FreeBSD=`ENOTCAPABLE` で拒否されるので、その場合だけ従来経路で再判定する（B-89）。
 - FreeBSD の静的配信はヘッダも `sendfile(2)` の `sf_hdtr` で 1 syscall（平文 HTTP/1.1 のみ。TLS 経路に通すと平文漏洩。F-155）。
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
+- FreeBSD の平文 h2c は、静的コンテンツキャッシュの本体（共有メモリ。`cache::shm`）の DATA を `sendfile(2)` + `sf_hdtr`
+  で送る（`Http2Connection::enable_zero_copy` は平文の h2c のリスナーだけで呼ぶ。TLS で呼ぶと平文漏洩。F-240）。
 - HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
   カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して
@@ -132,6 +140,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - epoll は `EPOLLONESHOT` + 再武装と確認用 `poll(2)` を省略しない（B-75）。kqueue の readiness ヒントは維持し、
   ヒントが無いときの `poll(2)` フォールバックを消さない（F-141）。
 - fd ごとの待機者は `WakerSlot`（F-166）。accept は `accept_batch` で 1 周回に複数（reactor のみ。F-155）。
+- 実行器の poller の待ち時間はタイマーまでの時間を切り捨てない（kqueue はナノ秒、epoll・WSAPoll はミリ秒へ切り上げ。
+  切り捨てると 1ms 未満の先のタイマーで空回りする。B-152）。
 - Windows の WSAPoll はローカル `shutdown` を通知しないので、`shutdown` 時に読み取り待機者を起こす（B-88）。
 
 ### リスナー・ワーカー
@@ -283,8 +293,11 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `src/runtime/` | 独自ランタイム。共有（buf/io/offload）+ `uring/`（io_uring）+ `reactor/`（epoll/kqueue/WSAPoll） |
 | `src/tls_writev.rs` | rustls 暗号文の `writev(2)` 直接送出（F-150） |
 | `src/veil_alloc/` | veil 専用アロケータ（F-183、`veil-alloc`）。`src/alloc_tune.rs` はアイドル時回収 |
+| `src/proxy/` | HTTP/1.1・HTTP/2 の接続・要求処理・上流への転送（F-233 で機能ごとのファイルに分割。子は `use super::*`） |
+| `src/config/` | 設定の型・読み込み・検証・TLS・LB・Backend（F-233 で分割） |
+| `src/http3_server/` | HTTP/3 のサーバ（メインループ・バッファ経路のタスク・ストリーミング。F-233 で分割） |
 | `src/wasm_plugin_config.rs` | Proxy-Wasm プラグイン設定（`wasm` feature 非依存で常にコンパイル） |
-| `tests/`、`benches/` | 単体以外のテスト・E2E・ベンチ |
+| `tests/`、`benches/` | 単体以外のテスト・E2E（`tests/e2e_tests/`）・ベンチ |
 | `examples/config.toml` | 設定リファレンス（全キー網羅） |
 | `docs/guide/` | 利用者向けガイド（英語、`ja/` に日本語） |
 | `docs/readme/` | 日本語 README |
@@ -292,7 +305,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `docs/perf/` | 最新のベンチマーク結果 |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
-| `third_party/wasmtime/` | wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79） |
+| `third_party/wasmtime/` | wasmtime 36.0.18（LTS）の vendoring（B-55 / B-79 / B-155） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
 | `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.14 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |

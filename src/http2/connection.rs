@@ -1,9 +1,11 @@
 //! # HTTP/2 コネクション管理 (RFC 7540)
 //!
 //! HTTP/2 コネクションの確立、フレーム処理、ストリーム管理を行います。
-//! monoio 非同期ランタイムと統合して動作します。
+//! veil の独自ランタイム（`src/runtime/`）と統合して動作します。
 
 use std::io;
+
+use bytes::Bytes;
 
 use crate::runtime::buf::OffsetBufMut;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -80,7 +82,49 @@ pub struct Http2Connection<S> {
     /// 1 回にまとめる再利用バッファ。呼び出し境界では常に空（`flush_write_buf` 済み）。
     /// 接続をまたいでスレッドローカルプールで再利用する（F-73 続き）。
     write_buf: Vec<u8>,
+
+    /// FreeBSD の平文 h2c のゼロコピーの送出（v0.8.0）: ソケットの fd（`enable_zero_copy` で設定）
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    zc_sock: Option<std::os::unix::io::RawFd>,
+    /// `write_buf` のどの位置に、どの共有メモリの範囲を `sendfile(2)` で差し込むか（位置の昇順）。
+    /// 各要素のフレームのヘッダは `write_buf` に積んである（本体だけを差し込む）。
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    zc_segs: Vec<ZcSeg>,
+    /// `zc_segs` の本体の合計（フラッシュの閾値に数える）
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    zc_bytes: usize,
 }
+
+/// 共有メモリの範囲（`write_buf` の `at` の位置に差し込む DATA の本体）
+#[cfg(all(target_os = "freebsd", feature = "cache"))]
+struct ZcSeg {
+    at: usize,
+    fd: std::os::unix::io::RawFd,
+    off: u64,
+    len: usize,
+    /// 送り終えるまで共有メモリの領域（と fd）を生かしておく
+    _hold: Bytes,
+}
+
+/// `TCP_NOPUSH` を切り替える（失敗は無視する。ゼロコピーの送出の間だけ立てる）
+#[cfg(all(target_os = "freebsd", feature = "cache"))]
+fn set_tcp_nopush(fd: std::os::unix::io::RawFd, on: bool) {
+    let v: libc::c_int = on as libc::c_int;
+    // SAFETY: fd は接続のソケット（Http2Connection が生きている間は閉じない）。v は生存する c_int。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOPUSH,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// この大きさ以上の DATA の本体だけをゼロコピーで送る（小さいとコピーの方が安い）
+#[cfg(all(target_os = "freebsd", feature = "cache"))]
+const ZC_MIN_CHUNK: usize = 4096;
 
 // ====================
 // コネクション読み込みバッファのスレッドローカル再利用プール（F-34）
@@ -245,7 +289,22 @@ where
             control_frame_window_start: now,
             continuation_count: 0,
             write_buf: acquire_h2_write_buf(),
+            #[cfg(all(target_os = "freebsd", feature = "cache"))]
+            zc_sock: None,
+            #[cfg(all(target_os = "freebsd", feature = "cache"))]
+            zc_segs: Vec::new(),
+            #[cfg(all(target_os = "freebsd", feature = "cache"))]
+            zc_bytes: 0,
         }
+    }
+
+    /// FreeBSD の平文 h2c で、静的コンテンツキャッシュ（共有メモリ）の DATA を `sendfile(2)` で送る。
+    ///
+    /// **平文の接続だけで呼ぶこと**（TLS の接続で呼ぶと本体を暗号化せずに送る）。呼び出し側は h2c の
+    /// 平文のリスナー（`handle_h2c_connection`）だけ。
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    pub fn enable_zero_copy(&mut self, sock_fd: std::os::unix::io::RawFd) {
+        self.zc_sock = Some(sock_fd);
     }
 
     /// HTTP/2 ハンドシェイクを実行
@@ -533,8 +592,66 @@ where
         if self.write_buf.is_empty() {
             return Ok(());
         }
+        #[cfg(all(target_os = "freebsd", feature = "cache"))]
+        if !self.zc_segs.is_empty() {
+            return self.flush_zero_copy().await;
+        }
         let buf = std::mem::take(&mut self.write_buf);
         let mut returned = self.write_all_raw(buf).await?;
+        returned.clear();
+        self.write_buf = returned;
+        Ok(())
+    }
+
+    /// `write_buf` と共有メモリの範囲を交互に送る（各範囲は、その前の `write_buf` の分を `sf_hdtr` のヘッダに
+    /// した `sendfile(2)` 1 回。範囲の後ろの残りは `write(2)`）。
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    async fn flush_zero_copy(&mut self) -> Http2Result<()> {
+        let Some(sock) = self.zc_sock else {
+            return Err(Http2Error::Io(io::Error::other(
+                "zero-copy flush without socket",
+            )));
+        };
+        let segs = std::mem::take(&mut self.zc_segs);
+        self.zc_bytes = 0;
+        // TCP_NOPUSH: sendfile(2) を何回かに分けて送る間、セグメントを MSS 一杯まで溜めてから出させる（nginx の
+        // `tcp_nopush on` と同じ。外すと sendfile の呼び出しの境目ごとに短いセグメントが出て、受け手の処理が増える。
+        // FreeBSD の h2c 54KB。解除で残りが出る）。フラッシュ 1 回あたり 2 回の setsockopt
+        set_tcp_nopush(sock, true);
+        let mut cursor = 0usize;
+        let mut result = Ok(());
+        for seg in &segs {
+            if result.is_ok() {
+                result = crate::runtime::sendfile::sendfile_all_with_header(
+                    sock,
+                    seg.fd,
+                    seg.off as i64,
+                    seg.len,
+                    &self.write_buf[cursor..seg.at],
+                )
+                .await;
+            }
+            cursor = seg.at;
+        }
+        // 範囲の領域は、ここまで送り終えたので放す（容量は使い回す）
+        let mut segs = segs;
+        segs.clear();
+        self.zc_segs = segs;
+        if let Err(e) = result {
+            set_tcp_nopush(sock, false);
+            self.write_buf.clear();
+            return Err(Http2Error::Io(e));
+        }
+        let mut buf = std::mem::take(&mut self.write_buf);
+        buf.drain(..cursor);
+        if buf.is_empty() {
+            set_tcp_nopush(sock, false);
+            self.write_buf = buf;
+            return Ok(());
+        }
+        let written = self.write_all_raw(buf).await;
+        set_tcp_nopush(sock, false);
+        let mut returned = written?;
         returned.clear();
         self.write_buf = returned;
         Ok(())
@@ -985,7 +1102,7 @@ where
         })?;
 
         let header_block = stream.take_header_block();
-        let headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
+        let mut headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
             // HPACKエラーを適切に処理
             ftlog::warn!(
                 "[HTTP/2] HPACK decode error for stream {}: {}",
@@ -997,6 +1114,14 @@ where
 
         // ヘッダーを検証 (RFC 7540 Section 8.1.2)
         Self::validate_request_headers(&headers, stream_id, is_trailer)?;
+        // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。F-236 の再走査の F7）
+        if !is_trailer {
+            if let Some(h) = headers.iter_mut().find(|h| h.name.as_ref() == b":path") {
+                if let Some(n) = crate::path_norm::normalize_request_path(&h.value) {
+                    h.value = bytes::Bytes::from(n);
+                }
+            }
+        }
 
         let stream = self.streams.get(stream_id).unwrap();
 
@@ -1057,6 +1182,16 @@ where
         for header in headers {
             let name = &header.name;
 
+            // F-236（F1）: 値に CR・LF・NUL・前後の空白があれば malformed（RFC 9113 §8.2.1）。HPACK は任意の
+            // バイトを運べるので、そのまま HTTP/1.1 の上流へ渡すと要求の密輸になる
+            if !crate::http_utils::is_valid_h2_field_value(&header.value) {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    "Invalid header field value",
+                ));
+            }
+
             // ヘッダー名に大文字が含まれていないことを確認 (RFC 7540 8.1.2)
             if name.iter().any(|&b| b.is_ascii_uppercase()) {
                 return Err(Http2Error::stream_error(
@@ -1090,6 +1225,13 @@ where
                 match name.as_ref() {
                     b":method" => {
                         method_count += 1;
+                        if !crate::http_utils::is_valid_method(&header.value) {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Invalid :method",
+                            ));
+                        }
                         #[cfg(feature = "mesh")]
                         if header.value.as_ref() == b"CONNECT" {
                             is_connect = true;
@@ -1106,6 +1248,16 @@ where
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,
                                 "Empty :path pseudo-header",
+                            ));
+                        }
+                        // origin 形式か `*` だけ（RFC 9113 §8.3.1。絶対形式はルートの照合を素通りする）
+                        if !crate::http_utils::is_valid_request_target(&header.value)
+                            || (header.value[0] != b'/' && header.value.as_ref() != b"*")
+                        {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Invalid :path",
                             ));
                         }
                     }
@@ -1133,9 +1285,18 @@ where
                 // 通常ヘッダーの処理
                 seen_regular = true;
 
-                // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)
-                let lower = name.to_ascii_lowercase();
-                match lower.as_slice() {
+                // 名前は token（RFC 9113 §8.2.1。大文字は上で拒否済み）
+                if !crate::http_utils::is_valid_header_name(name) {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Invalid header field name",
+                    ));
+                }
+
+                // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)。名前は大文字を拒否済みなので小文字にし直さない
+                // （以前は要求のヘッダごとに to_ascii_lowercase で確保していた）
+                match name.as_ref() {
                     b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
                     | b"upgrade" => {
                         return Err(Http2Error::stream_error(
@@ -1518,6 +1679,9 @@ where
     /// `queue_data_frames` は決してフラッシュしないため、メインループは本値が
     /// フラッシュ閾値（128KB）を超えたら明示的に `flush_write_buf` する。
     pub fn pending_write_len(&self) -> usize {
+        #[cfg(all(target_os = "freebsd", feature = "cache"))]
+        return self.write_buf.len() + self.zc_bytes;
+        #[cfg(not(all(target_os = "freebsd", feature = "cache")))]
         self.write_buf.len()
     }
 
@@ -2238,6 +2402,38 @@ where
         data: &[u8],
         end_stream: bool,
     ) -> Http2Result<usize> {
+        self.queue_data_inner(stream_id, data, None, end_stream)
+    }
+
+    /// [`queue_data_frames`](Self::queue_data_frames) と同じだが、本体の持ち主（`Bytes`）を受け取る。FreeBSD の
+    /// 平文 h2c（[`enable_zero_copy`](Self::enable_zero_copy) 済み）で本体が静的コンテンツキャッシュの共有メモリ
+    /// なら、本体をコピーせずに `sendfile(2)` で送る。それ以外は `queue_data_frames` と同じ。
+    pub fn queue_data_frames_bytes(
+        &mut self,
+        stream_id: u32,
+        data: &Bytes,
+        end_stream: bool,
+    ) -> Http2Result<usize> {
+        self.queue_data_inner(stream_id, data, Some(data), end_stream)
+    }
+
+    fn queue_data_inner(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        #[cfg_attr(
+            not(all(target_os = "freebsd", feature = "cache")),
+            allow(unused_variables)
+        )]
+        owner: Option<&Bytes>,
+        end_stream: bool,
+    ) -> Http2Result<usize> {
+        // ゼロコピーで送れる本体なら、その共有メモリの fd と先頭のオフセット
+        #[cfg(all(target_os = "freebsd", feature = "cache"))]
+        let zc_src = match (self.zc_sock, owner) {
+            (Some(_), Some(_)) if data.len() >= ZC_MIN_CHUNK => crate::cache::shm::lookup(data),
+            _ => None,
+        };
         // 空ボディ + END_STREAM: 0 長 DATA フレームで終端を伝える（send_data と同挙動）。
         if data.is_empty() {
             if end_stream {
@@ -2278,6 +2474,29 @@ where
             self.conn_send_window -= len;
             if let Some(stream) = self.streams.get(stream_id) {
                 stream.send_window -= len;
+            }
+
+            // FreeBSD の平文 h2c: 共有メモリの本体はフレームのヘッダだけを積み、本体は flush で sendfile(2)
+            #[cfg(all(target_os = "freebsd", feature = "cache"))]
+            if let (Some((fd, base)), Some(owner)) = (zc_src, owner) {
+                if chunk_len >= ZC_MIN_CHUNK {
+                    self.frame_encoder.encode_data_header_into(
+                        &mut self.write_buf,
+                        stream_id,
+                        chunk_len,
+                        end_stream && is_last,
+                    );
+                    self.zc_segs.push(ZcSeg {
+                        at: self.write_buf.len(),
+                        fd,
+                        off: base + offset as u64,
+                        len: chunk_len,
+                        _hold: owner.slice(offset..offset + chunk_len),
+                    });
+                    self.zc_bytes += chunk_len;
+                    offset += chunk_len;
+                    continue;
+                }
             }
 
             // DATA フレームを連結バッファへ追記（per-frame Vec 確保を排除）。
@@ -2431,6 +2650,34 @@ pub struct H2RequestParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-236 の F1: HTTP/1.1 の上流へ渡すと要求の密輸になるフィールドを拒否する
+    #[test]
+    fn request_headers_reject_smuggling_fields() {
+        use crate::http2::hpack::HeaderField as HF;
+        let req = |extra: &[(&[u8], &[u8])], method: &[u8], path: &[u8]| {
+            let mut h = vec![
+                HF::new(b":method".to_vec(), method.to_vec()),
+                HF::new(b":scheme".to_vec(), b"https".to_vec()),
+                HF::new(b":path".to_vec(), path.to_vec()),
+                HF::new(b":authority".to_vec(), b"example.com".to_vec()),
+            ];
+            for (n, v) in extra {
+                h.push(HF::new(n.to_vec(), v.to_vec()));
+            }
+            Http2Connection::<NullIo>::validate_request_headers(&h, 1, false)
+        };
+        assert!(req(&[(b"x-a", b"ok value")], b"GET", b"/").is_ok());
+        assert!(req(&[(b"x-a", b"v\r\nx-injected: 1")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"v\nx")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"v\0")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b" lead")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x-a", b"trail\t")], b"GET", b"/").is_err());
+        assert!(req(&[(b"x a", b"v")], b"GET", b"/").is_err());
+        assert!(req(&[], b"GET /x HTTP/1.1\r\n", b"/").is_err());
+        assert!(req(&[], b"GET", b"/a b").is_err());
+        assert!(req(&[], b"GET", b"/a\r\nb").is_err());
+    }
 
     /// 読むと EOF、書いたものは捨てるだけのソケット（フレーム処理の単体テスト用）。
     struct NullIo;

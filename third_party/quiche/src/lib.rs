@@ -1231,6 +1231,10 @@ where
     /// QUIC wire version used for the connection.
     version: u32,
 
+    /// veil: 呼び出し側が渡す「今」（`set_time_hint`）。Some の間は recv・send・timeout・on_timeout が
+    /// `Instant::now()` を読む代わりにこれを使う（1 回の受信の束・1 接続ぶんの送出で 1 回だけ時刻を読む）。
+    time_hint: Option<Instant>,
+
     /// Connection Identifiers.
     ids: cid::ConnectionIdentifiers,
 
@@ -1822,6 +1826,8 @@ impl<F: BufFactory> Connection<F> {
 
         let mut conn = Connection {
             version: config.version,
+
+            time_hint: None,
 
             ids,
 
@@ -2677,7 +2683,7 @@ impl<F: BufFactory> Connection<F> {
     fn recv_single(
         &mut self, buf: &mut [u8], info: &RecvInfo, recv_pid: Option<usize>,
     ) -> Result<usize> {
-        let now = Instant::now();
+        let now = self.now();
 
         if buf.is_empty() {
             return Err(Error::Done);
@@ -3686,7 +3692,7 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
-        let now = Instant::now();
+        let now = self.now();
 
         if self.local_error.is_none() {
             self.do_handshake(now)?;
@@ -6469,6 +6475,20 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
+    /// veil: 次に `set_time_hint(None)` するまで、`recv`・`send`・`timeout`・`on_timeout` が「今」として使う
+    /// 時刻を渡す（`None` で `Instant::now()` に戻す）。同じ瞬間に起きたこと（1 回の受信の束・1 接続ぶんの
+    /// 送出の束）に 1 回だけ時刻を読むために使う。渡したまま放置すると時間が止まるので、束を処理したら
+    /// 必ず `None` に戻すこと。
+    #[inline]
+    pub fn set_time_hint(&mut self, now: Option<Instant>) {
+        self.time_hint = now;
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        self.time_hint.unwrap_or_else(Instant::now)
+    }
+
     /// Returns the amount of time until the next timeout event.
     ///
     /// Once the given duration has elapsed, the [`on_timeout()`] method should
@@ -6477,7 +6497,7 @@ impl<F: BufFactory> Connection<F> {
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout_instant().map(|timeout| {
-            let now = Instant::now();
+            let now = self.now();
 
             if timeout <= now {
                 Duration::ZERO
@@ -6491,7 +6511,7 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// If no timeout has occurred it does nothing.
     pub fn on_timeout(&mut self) {
-        let now = Instant::now();
+        let now = self.now();
 
         if let Some(draining_timer) = self.draining_timer {
             if draining_timer <= now {

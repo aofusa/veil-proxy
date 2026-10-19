@@ -50,7 +50,7 @@ impl ModuleRegistry {
         // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
         // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
         // `veil_wasm_nosignals`（B-55: netbsd 全アーキ・freebsd/openbsd の aarch64。
-        // build.rs 発行）のターゲットは third_party/wasmtime（veil-wasmtime）を使い、
+        // build.rs 発行）のターゲットは third_party/wasmtime（veil-proxy-wasmtime）を使い、
         // ネイティブコードを生成しない Pulley 実行のみを前提にしているため常に Pulley。
         let pulley = cfg!(target_os = "openbsd")
             || cfg!(target_os = "netbsd")
@@ -139,7 +139,7 @@ impl ModuleRegistry {
         // 使えるようにする。
         //
         // OpenBSD/NetBSD、および `veil_wasm_nosignals`（B-55: netbsd 全アーキ・
-        // freebsd/openbsd の aarch64。third_party/wasmtime = veil-wasmtime を使う
+        // freebsd/openbsd の aarch64。third_party/wasmtime = veil-proxy-wasmtime を使う
         // ターゲット）は設定値を無視して常に Pulley（B-52/F-140/B-55）。
         // 他ターゲットは `[wasm] interpreter = true` のときだけ Pulley を選択する。
         let use_pulley = cfg!(target_os = "openbsd")

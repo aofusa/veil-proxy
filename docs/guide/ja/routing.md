@@ -672,6 +672,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
 | `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
+| `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）は 400 | `"base"` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 
 #### セキュリティ機能失敗時の動作
@@ -856,6 +857,19 @@ url = "http://localhost:9000/"
   allowed_methods = ["GET", "POST"]
 ```
 
+#### 検査の順
+
+`[route.security]` はすべてのルートの種類に効く（`Respond`・`Redirect`、`[route.traffic]` が返す応答〈フォルトの中断・
+CORS のプリフライト〉と `[route.jwt]` の応答も含む）。HTTP/1.1・HTTP/2・HTTP/3 は同じ順で検査し、最初に失敗した検査で
+応答が決まる。
+
+1. IP 制限（`allowed_ips` / `denied_ips`）→ 403
+2. `allowed_methods` → 405
+3. `max_request_body_size` → 413（HTTP/3・HTTP/2 は `content-length` が無くても受け取った本文の長さで数える）
+4. `rate_limit_requests_per_min` → 429
+
+状態を持たない検査を先にするので、大きさで拒否する要求はレート制限の枠を使わない。
+
 #### IP制限の評価順序
 
 IP制限は **deny → allow** の順で評価されます（denyが優先）。
@@ -871,6 +885,9 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 | IPv4 CIDR | `192.168.0.0/24` |
 | 単一IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
+
+IPv4 射影の IPv6 のアドレス（`::ffff:192.0.2.1`。デュアルスタックの `[::]` のリスナーで IPv4 のクライアントがこう見える）は
+IPv4 として照合するので、`192.0.2.0/24` に含まれる。射影の形で書いた範囲（`::ffff:192.0.2.0/120`）は IPv4 の範囲として扱う。
 
 ## ルート単位のトラフィック制御（F-219）
 
@@ -1001,7 +1018,8 @@ redirect_status = 301
 
 ### リクエストヘッダー操作
 
-バックエンドへ転送する前にヘッダーを追加・削除します。
+バックエンドへ転送する前にヘッダーを追加・削除します。どちらも、クライアントのプロトコル（HTTP/1.1・HTTP/2・HTTP/3）と
+上流のプロトコル（HTTP/1.1・h2c・HTTPS の h2）のすべて（WebSocket のアップグレードの要求を含む）に効きます。変数を展開した値に CR・LF・NUL が入るヘッダーは送りません。
 
 | オプション | 説明 | 例 |
 |-----------|------|-----|

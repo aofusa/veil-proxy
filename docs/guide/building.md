@@ -80,12 +80,12 @@ Install:
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i packaging/output/veil_0.7.0_amd64.deb
+sudo dpkg -i packaging/output/veil_0.8.0_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 
 # Amazon Linux 2023
-sudo dnf install -y packaging/output/veil-0.7.0-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.8.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
@@ -149,3 +149,21 @@ Output: `veil-lib-<version>-<arch>-linux-gnu.zip` with `c/` (`libveil.so`, `libv
   `catch_unwind` so a panic in one request is logged and the worker survives; aborting would
   turn a single malformed request into a full proxy outage, and `ConnectionGuard`'s `Drop`
   (connection accounting) would not run either.
+
+### Versions and releases
+
+The version is defined once, in `[workspace.package] version` of the root `Cargo.toml`. The root crate and
+`crates/*` inherit it (`version.workspace = true`), and the Python wheel takes it from `crates/veil-python`
+(`dynamic = ["version"]` in `pyproject.toml`). To change it:
+
+```bash
+tools/release/bump-version.sh 0.8.0
+```
+
+The script also updates the `veil-macros` dependency version, `Cargo.lock` of the workspace and of the crates
+outside it (`examples/api/*`, `tools/*`), and the places in the docs that show the current version as an example.
+Versions written as a measurement baseline (`docs/perf/`, `docs/guide/performance.md`, `tools/perf/`) are left as
+they are. Running it twice with the same version changes nothing.
+
+A release is a tag `vX.Y.Z` on a commit that is on `main`. The release workflow refuses to publish anything when
+the tag and the workspace version differ.

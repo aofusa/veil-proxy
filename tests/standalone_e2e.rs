@@ -261,6 +261,7 @@ path = "{www}"
     }
 }
 
+#[cfg(unix)]
 fn pem_to_der(pem: &str) -> Vec<u8> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes())
@@ -1704,4 +1705,199 @@ path = "{www}"
         !matches!(&denied, Ok(l) if l.starts_with("HTTP/1.1 200")),
         "identity outside client_allowed_sans must be rejected: {denied:?}"
     );
+}
+
+// ===================== F-234 / B-132 =====================
+
+/// HTTP/3 で要求を 1 つ送り、(状態コード, 本文) を返す（F-234 のプロトコルの行列の試験）。
+#[cfg(feature = "http3")]
+fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    use bytes::Buf;
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let _ = veil::tls_provider::provider::default_provider().install_default();
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifyServer))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let qc = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+        let conn = ep
+            .connect(([127, 0, 0, 1], port).into(), "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let drive = tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
+        let req = http::Request::builder()
+            .method(method)
+            .uri(format!("https://localhost:{port}{path}"))
+            .body(())
+            .unwrap();
+        let mut stream = send.send_request(req).await.unwrap();
+        if !body.is_empty() {
+            stream
+                .send_data(bytes::Bytes::copy_from_slice(body))
+                .await
+                .unwrap();
+        }
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        let mut out = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            out.extend_from_slice(chunk.chunk());
+            let n = chunk.remaining();
+            chunk.advance(n);
+        }
+        drop(send);
+        drive.abort();
+        ep.close(0u32.into(), b"");
+        (resp.status().as_u16(), out)
+    })
+}
+
+/// 同じ設定に対して HTTP/1.1・h2c・HTTP/3 が同じ判定をする（F-234 の共通の段）。
+/// B-132: 本文の大きさの上限を超えた要求は 413 で、レート制限の枠を使わない（3 経路とも）。
+#[test]
+fn f234_protocol_matrix_same_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let port = free_port();
+    let tls_port = free_port();
+    let mut routes = String::new();
+    for p in ["h1", "h2", "h3"] {
+        routes.push_str(&format!(
+            r#"
+[[route]]
+[route.conditions]
+path = "/big-{p}"
+[route.action]
+type = "Respond"
+body = "small"
+[route.security]
+max_request_body_size = 4
+rate_limit_requests_per_min = 1
+"#
+        ));
+    }
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+[http3]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/ok"
+[route.action]
+type = "Respond"
+body = "ok"
+
+[[route]]
+[route.conditions]
+path = "/deny"
+[route.action]
+type = "Respond"
+body = "never"
+[route.security]
+allowed_ips = ["10.0.0.0/8"]
+
+[[route]]
+[route.conditions]
+path = "/post-only"
+[route.action]
+type = "Respond"
+body = "posted"
+[route.security]
+allowed_methods = ["POST"]
+{routes}"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    // (経路, 要求) → 状態コード。3 経路で同じでなければならない
+    let h1 = |m: &str, p: &str, body: &[u8]| http1_request(port, m, p, &[], body).unwrap().status;
+    let h2 = |m: &str, p: &str, body: &[u8]| -> u16 {
+        if m == "GET" {
+            h2c_get(port, p).0
+        } else {
+            h2c_post(port, p, body.len(), Duration::from_secs(10)).unwrap_or(0)
+        }
+    };
+    let cases: &[(&str, &str, &[u8], u16)] = &[
+        ("GET", "/ok", b"", 200),
+        ("GET", "/no-such-route", b"", 404),
+        ("GET", "/deny", b"", 403),
+        ("GET", "/post-only", b"", 405),
+        ("POST", "/post-only", b"x", 200),
+    ];
+    for &(m, p, body, want) in cases {
+        assert_eq!(h1(m, p, body), want, "HTTP/1.1 {m} {p}\n{}", veil.log());
+        assert_eq!(h2(m, p, body), want, "h2c {m} {p}\n{}", veil.log());
+        #[cfg(feature = "http3")]
+        assert_eq!(
+            h3_request(tls_port, m, p, body).0,
+            want,
+            "HTTP/3 {m} {p}\n{}",
+            veil.log()
+        );
+    }
+
+    // 上限超過は何回送っても 413（枠を使わない）→ 小さい要求は 1 回だけ通り、次は 429
+    let check_order = |name: &str, send: &dyn Fn(&str, &[u8]) -> u16| {
+        let path = format!("/big-{name}");
+        for _ in 0..3 {
+            assert_eq!(
+                send(&path, b"0123456789"),
+                413,
+                "{name}: oversized\n{}",
+                veil.log()
+            );
+        }
+        assert_eq!(
+            send(&path, b"ok"),
+            200,
+            "{name}: first small\n{}",
+            veil.log()
+        );
+        assert_eq!(
+            send(&path, b"ok"),
+            429,
+            "{name}: second small\n{}",
+            veil.log()
+        );
+    };
+    check_order("h1", &|p, b| h1("POST", p, b));
+    check_order("h2", &|p, b| h2("POST", p, b));
+    #[cfg(feature = "http3")]
+    check_order("h3", &|p, b| h3_request(tls_port, "POST", p, b).0);
 }

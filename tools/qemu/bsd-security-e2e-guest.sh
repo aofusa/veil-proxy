@@ -370,10 +370,11 @@ url = \"http://127.0.0.1:18081\""
   grep -q 'panicked at' "$WORK/veil-br.log" && { echo "FAIL: panic (broker)"; grep -A5 'panicked at' "$WORK/veil-br.log"; ok=0; }
   kill "$BPID1" "$BPID2" 2>/dev/null; sleep 1
 fi
-# F-181: capability mode を要求したのに入れない構成（HTTP リダイレクトリスナー。cap_enter 後の
-# bind が要る）は起動を中止する。allow_security_failures = true なら警告して rights 制限のみで起動する。
+# F-181: capability mode を要求したのに入れない構成（平文のリスナー `listen_cleartext`。F-200 より前は
+# `[server].http` の HTTP リダイレクトリスナーで、F-200 でこのキーは無くなった）は起動を中止する。
+# allow_security_failures = true なら警告して rights 制限のみで起動する。
 if [ "$OS" = "freebsd" ]; then
-  SERVER_EXTRA='http = "127.0.0.1:9080"'
+  SERVER_EXTRA='listen_cleartext = "127.0.0.1:9080"'
   write_cfg ""
   "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fc.log" 2>&1 &
   FPID=$!

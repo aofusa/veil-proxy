@@ -210,6 +210,14 @@ sysctl -w net.core.netdev_max_backlog=65535
 sysctl -w kernel.io_uring_setup_flags=0
 ```
 
+### FreeBSD: zero-copy h2c static files (F-240)
+
+On FreeBSD, the static content cache (`[static_file_cache]` + `[route.open_file_cache]`) keeps file bodies of 16 KB
+or more in anonymous shared memory. Cleartext h2c responses then send each DATA frame body with `sendfile(2)` (the
+9-byte frame header goes in `sf_hdtr`) under `TCP_NOPUSH`, instead of copying it into a write buffer. TLS
+connections keep the copy path. Measured on FreeBSD 14.3 aarch64 (54 KB, one server core): 1.33x nginx, 6.2 µs of
+server CPU per request (nginx 8.6 µs).
+
 ### Buffer Sizes and Timeouts
 
 Constants in code (set at compile time, requires rebuild):

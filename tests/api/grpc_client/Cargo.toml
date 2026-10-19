@@ -29,3 +29,9 @@ flate2 = "1"
 
 [build-dependencies]
 tonic-build = "0.12"
+
+# B-62: NetBSD/aarch64 の libc の `_ALIGNBYTES` 誤りを避ける CMSG 実装を足した vendoring 版（veil 本体の [patch] と同じ）。
+# この試験クライアントは別のワークスペースなので本体の [patch] が効かず、crates.io 版が NetBSD aarch64 で
+# `cmsg/mod.rs` の assert（20 と 16）で panic していた（2026-10-17）。
+[patch.crates-io]
+quinn-udp = { path = "../../../third_party/quinn-udp" }

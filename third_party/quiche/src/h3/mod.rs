@@ -1574,19 +1574,27 @@ impl Connection {
                     body_len += header.len();
                 }
 
-                let (mut n, rem) = conn.stream_send_zc(
-                    stream_id,
-                    body.clone(),
-                    Some(body_len),
-                    fin,
-                )?;
+                // veil: 送る分（body_len）だけに切ってから渡す。以前は全長を渡して長さを
+                // Some(body_len) で絞っていたが、stream_do_send は渡されたバッファの全長を
+                // 「送りたい量」として扱うため、書けた量（body_len）が全長より少ないと
+                // ストリームの流量制御で止まったと見なし、相手の上限（実際には止まって
+                // いない）で STREAM_DATA_BLOCKED を送っていた。その上限は最終的なサイズより
+                // 大きいので、ngtcp2 は FINAL_SIZE_ERROR で接続を閉じる（copy 版の
+                // send_body はスライスを body_len に切って渡すので起きない）。
+                let mut head = body.clone();
+                if head.as_ref().len() > body_len {
+                    let _ = head.split_at(body_len);
+                }
+
+                let (mut n, _) = conn.stream_send_zc(stream_id, head, None, fin)?;
+
+                // 送れなかった残り（n 以降）を呼び出し側へ返す
+                let mut rest = body.clone();
+                let rem = rest.split_at(n);
+                let _ = std::mem::replace(body, rem);
 
                 if with_prefix {
                     n -= header.len();
-                }
-
-                if let Some(rem) = rem {
-                    let _ = std::mem::replace(body, rem);
                 }
 
                 Ok((n, n))

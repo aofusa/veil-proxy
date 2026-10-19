@@ -50,7 +50,8 @@ pub fn run(workers: usize) {
         let msg = format!(
             "[mesh] io_uring is not available ({}): the container's seccomp profile forbids it \
              (RuntimeDefault, which Linkerd's proxy injector sets, blocks io_uring). \
-             Use the image built with the `epoll` feature",
+             Use the image built with the `epoll` feature, or put the epoll build next to this one as \
+             `<this binary>.epoll` (or set VEIL_FALLBACK_BIN) to switch to it at start-up",
             e
         );
         ftlog::error!("{}", msg);
@@ -370,6 +371,7 @@ async fn tls_accept(
         crate::runtime::time::sleep(Duration::from_millis(50)).await;
         waited += 1;
     }
+    // クライアントの ALPN に合う設定（kTLS の有無に関わらず同じ。以前は kTLS 無しのビルドだけ ALPN を見ていなかった）
     let server_config = tls.config_for(client_alpn);
     let fut = async {
         #[cfg(veil_ktls)]
@@ -387,12 +389,7 @@ async fn tls_accept(
         }
         #[cfg(not(veil_ktls))]
         {
-            crate::simple_tls::accept_with_peer_cert(
-                stream,
-                tls.server_config.clone(),
-                Some(initial),
-            )
-            .await
+            crate::simple_tls::accept_with_peer_cert(stream, server_config, Some(initial)).await
         }
     };
     match crate::runtime::timeout(Duration::from_secs(15), fut).await {

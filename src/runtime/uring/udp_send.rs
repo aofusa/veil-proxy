@@ -228,7 +228,12 @@ impl Future for SendBatch<'_> {
                     progressed = true;
                     if res < 0 {
                         let err = io::Error::from_raw_os_error(-res);
-                        warn!("[HTTP/3] sendmsg entry skipped: {}", err);
+                        // EMSGSIZE は DF を立てた経路 MTU の探索で大きすぎた探索のパケット（想定内。quiche が下げる）
+                        if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                            ftlog::debug!("[HTTP/3] sendmsg entry skipped: {}", err);
+                        } else {
+                            warn!("[HTTP/3] sendmsg entry skipped: {}", err);
+                        }
                     }
                 }
             }

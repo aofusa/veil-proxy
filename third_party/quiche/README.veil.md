@@ -55,8 +55,25 @@ incremental ストリームの末尾への並べ替え（ラウンドロビン�
   cargo-zigbuild 0.23.4（zig 0.16）の macOS クロスビルドでは、この cdylib のリンクが
   `unable to read exported symbols list '-dead_strip'` で失敗し、`full` の macOS ビルドが
   通らなくなっていた。rlib だけにするとリンク自体が無くなり、全ターゲットでビルドも短くなる。
+- あわせて `src/build.rs` の macOS 向けの `cargo:rustc-cdylib-link-arg` を出さないようにした（cdylib が無いので
+  意味が無く、macOS のビルドのたびに cargo の警告になる。v0.8.0）。
 
 それ以外は無変更。
+
+### 3b. `src/lib.rs`: 呼び出し側が渡す「今」（`Connection::set_time_hint`、v0.8.0）
+
+`recv`・`send`・`timeout`・`on_timeout` は呼ばれるたびに `Instant::now()` を読む（54KB の応答 1 つで約 60 回）。
+veil は 1 回の受信の束・1 接続ぶんの送出の束で 1 回だけ時刻を読み、`set_time_hint(Some(now))` で渡してから
+呼び、終わったら `set_time_hint(None)` に戻す。`Connection` に `time_hint` を足し、上の 4 か所の
+`Instant::now()` を `self.now()`（ヒントがあればそれ、無ければ `Instant::now()`）にした。
+
+### 3c. `src/h3/mod.rs`: `send_body_zc` が誤った STREAM_DATA_BLOCKED を送る（v0.8.0）
+
+`send_body_zc` は本文のバッファの全長を `stream_send_zc` に渡し、書く量を `Some(body_len)` で絞っていた。
+`stream_do_send` は渡されたバッファの全長を「送りたい量」として扱うので、ストリームの容量で `body_len` に
+切られると流量制御で止まったと見なし、相手の上限で STREAM_DATA_BLOCKED を送る。その上限は最終的なサイズより
+大きいので、ngtcp2（h2load・curl 等）は FINAL_SIZE_ERROR で接続を閉じていた（quinn は無視する）。
+`body_len` に切ったバッファを渡し、残りは元のバッファを `split_at(n)` して返すようにした。
 
 ### 4. `src/lib.rs`: 予約ビットの検査（B-100）
 
@@ -82,3 +99,13 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 `[lints.rust]` で allow しない理由: この lint を知らない古い rustc（BSD の pkg 版など）で
 `unknown lint` 警告に変わるだけになるため。呼び出し側は戻り値を使っておらず、ABI 上も
 `()` と `void` は等価。
+
+## 公開用の変更（F-238）
+
+veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
+
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.1`（`[lib] name = "quiche"` はそのまま）。
+  既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
+  `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
+- `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
+- ソースの差分は上の「差分」の節のまま。

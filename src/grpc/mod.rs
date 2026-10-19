@@ -1,7 +1,7 @@
 //! gRPC Protocol Support for Veil-Proxy
 //!
 //! gRPC ワイヤプロトコル（framing, headers, trailers）を実装します。
-//! tonic を使用せず、monoio + HTTP/2 基盤上でネイティブに動作します。
+//! tonic を使用せず、独自ランタイム + HTTP/2 基盤上でネイティブに動作します。
 //!
 //! ## 機能
 //!

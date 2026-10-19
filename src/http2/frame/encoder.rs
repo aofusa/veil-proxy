@@ -52,6 +52,27 @@ impl FrameEncoder {
         out.extend_from_slice(data);
     }
 
+    /// DATA フレームのヘッダ（9 バイト）だけを `out` へ追記する（本体は呼び出し側が別に送る。FreeBSD の
+    /// h2c のゼロコピーの送出）
+    #[cfg(all(target_os = "freebsd", feature = "cache"))]
+    pub fn encode_data_header_into(
+        &self,
+        out: &mut Vec<u8>,
+        stream_id: u32,
+        len: usize,
+        end_stream: bool,
+    ) {
+        let flags = if end_stream {
+            FrameFlags::END_STREAM
+        } else {
+            0
+        };
+        let header = FrameHeader::new(FrameType::Data, flags, stream_id, len as u32);
+        let mut header_buf = [0u8; 9];
+        header.encode(&mut header_buf);
+        out.extend_from_slice(&header_buf);
+    }
+
     /// HEADERS フレームをエンコード
     pub fn encode_headers(
         &self,

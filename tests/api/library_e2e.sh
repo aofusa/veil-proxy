@@ -138,11 +138,13 @@ TOML
   wait_port "$P2" && expect "no config.toml -> library defaults" "Hello, World!" curl -s "http://127.0.0.1:$P2/hello" || bad "no-config start"
   expect "defaults are plaintext h2c-only + HTTP/1.1" "H2C (HTTP/2 Cleartext) Server" cat "$W2/log"
   # 環境変数 VEIL_OVERRIDE_<n> もライブラリで効く
-  kill "$PID2"; sleep 1
+  # 別のポートで起動する（同じポートだと SO_REUSEPORT で終了処理中の前のサーバと並んで待ち受け、
+  # wait_port が前のサーバで通ってしまう。以前は P3 を取りながら P2 を使っていた）
+  kill "$PID2"; for _ in $(seq 1 50); do kill -0 "$PID2" 2>/dev/null || break; sleep 0.2; done
   local P3; P3=$(free_port)
-  (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P2" VEIL_OVERRIDE_1="api.openapi_enabled = false" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log3" 2>&1 &
-  PIDS+=("$!"); wait_port "$P2"
-  expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P2/openapi.json"
+  (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P3" VEIL_OVERRIDE_1="api.openapi_enabled = false" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log3" 2>&1 &
+  PIDS+=("$!"); wait_port "$P3" "$!"
+  expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P3/openapi.json"
   kill "$!" 2>/dev/null
 }
 
@@ -295,7 +297,22 @@ run_python() {
     local VB="$V/bin"; [ "$OS" = Windows ] && VB="$V/Scripts"
     [ -x "$VB/python$EXE" ] || "$PY3" -m venv "$V"
     "$VB/python$EXE" -m pip -q install maturin >/dev/null
-    (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1 || { bad "maturin develop"; tail -20 "$TMPD/maturin.log"; return; }
+    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
+      # maturin の wheel の platform タグと pip が受け付けるタグが違う OS がある（NetBSD aarch64 は maturin が
+      # netbsd_10_1_arm64、pip は evbarm 系）。wheel を作り、pip が受け付けるタグに付け直して入れる
+      if grep -q "is not a supported wheel on this platform" "$TMPD/maturin.log"; then
+        local tag
+        tag=$("$VB/python$EXE" -c 'from pip._vendor.packaging import tags; print(next(iter(tags.sys_tags())).platform)')
+        "$VB/python$EXE" -m pip -q install wheel >/dev/null
+        rm -rf "$TMPD/wheels"
+        (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin build -q --release -o "$TMPD/wheels") >> "$TMPD/maturin.log" 2>&1 \
+          && "$VB/python$EXE" -m wheel tags --remove --platform-tag "$tag" "$TMPD"/wheels/*.whl >> "$TMPD/maturin.log" 2>&1 \
+          && "$VB/python$EXE" -m pip -q install --force-reinstall "$TMPD"/wheels/*"$tag"*.whl >> "$TMPD/maturin.log" 2>&1 \
+          || { bad "maturin develop (retag $tag)"; tail -20 "$TMPD/maturin.log"; return; }
+      else
+        bad "maturin develop"; tail -20 "$TMPD/maturin.log"; return
+      fi
+    fi
     PY="$VB/python$EXE"
   fi
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_binding.py) >/dev/null 2>&1 && ok "unit tests" || bad "unit tests"

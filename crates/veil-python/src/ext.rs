@@ -41,7 +41,7 @@ impl NativeGrpcCall {
 impl NativeGrpcCall {
     /// 次の受信メッセージ（終わりは None）。壊れた・大きすぎるメッセージは `(code, message)` の RuntimeError。
     fn recv(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
-        match self.with_call(|call| py.allow_threads(|| call.recv()))? {
+        match self.with_call(|call| py.detach(|| call.recv()))? {
             Ok(Some(b)) => Ok(Some(PyBytes::new(py, &b).unbind())),
             Ok(None) => Ok(None),
             Err(s) => Err(PyRuntimeError::new_err((
@@ -54,7 +54,7 @@ impl NativeGrpcCall {
     /// 送る。クライアントが切断していたら False。
     fn send(&self, py: Python<'_>, data: &[u8]) -> PyResult<bool> {
         let b = Bytes::copy_from_slice(data);
-        self.with_call(|call| py.allow_threads(|| call.send(b)))
+        self.with_call(|call| py.detach(|| call.send(b)))
     }
 
     /// 応答ヘッダに足す（最初の send より前だけ。後なら False）。
@@ -63,6 +63,7 @@ impl NativeGrpcCall {
         self.with_call(|call| call.add_header(lower(name), v))
     }
 
+    /// Add a response trailer (sent after the last message).
     fn add_trailer(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let v = meta_value(value)?;
         self.with_call(|call| call.add_trailer(lower(name), v))
@@ -88,6 +89,7 @@ impl NativeGrpcCall {
         })
     }
 
+    /// Full method path of the call, e.g. `/pkg.Svc/Method`.
     fn method(&self) -> PyResult<String> {
         self.with_call(|call| call.method().to_string())
     }
@@ -102,6 +104,7 @@ impl NativeGrpcCall {
         })
     }
 
+    /// False once the client has cancelled or disconnected.
     fn is_active(&self) -> PyResult<bool> {
         self.with_call(|call| !call.is_cancelled())
     }
@@ -112,7 +115,7 @@ fn lower(name: &str) -> Bytes {
 }
 
 fn meta_value(v: &Bound<'_, PyAny>) -> PyResult<Bytes> {
-    if let Ok(s) = v.downcast::<PyString>() {
+    if let Ok(s) = v.cast::<PyString>() {
         return Ok(Bytes::from(s.to_cow()?.into_owned()));
     }
     let b: Vec<u8> = v.extract()?;
@@ -121,7 +124,7 @@ fn meta_value(v: &Bound<'_, PyAny>) -> PyResult<Bytes> {
 
 /// Python のハンドラ（`handle(call) -> (code, message)`）で 1 回の呼び出しを処理する。
 pub fn run_grpc(handle: &Py<PyAny>, call: &mut GrpcCall) -> Status {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let native = match Py::new(
             py,
             NativeGrpcCall {
@@ -172,6 +175,7 @@ impl NativeTransport {
 
 #[pymethods]
 impl NativeTransport {
+    /// Send bytes to the peer (valid only inside the protocol callbacks).
     fn write(&self, data: &[u8]) -> PyResult<()> {
         let b = Bytes::copy_from_slice(data);
         self.with_out(|o| o.write(b))
@@ -184,6 +188,7 @@ impl NativeTransport {
         Ok(())
     }
 
+    /// True after `close()` was called.
     fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
@@ -237,7 +242,7 @@ impl PySession {
         peer: SocketAddr,
         out: &mut L4Out,
     ) -> Option<Box<dyn L4Session>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let proto = match factory.call0(py) {
                 Ok(p) => p,
                 Err(e) => {
@@ -267,7 +272,7 @@ impl PySession {
 
 impl L4Session for PySession {
     fn on_data(&mut self, data: &[u8], out: &mut L4Out) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let b = PyBytes::new(py, data);
             self.invoke(py, out, || {
                 self.proto
@@ -278,7 +283,7 @@ impl L4Session for PySession {
     }
 
     fn on_close(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Err(e) = self.proto.call_method1(py, "connection_lost", (py.None(),)) {
                 e.print(py);
             }
@@ -288,7 +293,7 @@ impl L4Session for PySession {
 
 /// UDP: `f(data: bytes, peer: (host, port)) -> bytes | None`。
 pub fn run_udp(f: &Py<PyAny>, data: Bytes, peer: SocketAddr) -> Option<Bytes> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let r = (|| -> PyResult<Option<Bytes>> {
             let peer = PyTuple::new(
                 py,

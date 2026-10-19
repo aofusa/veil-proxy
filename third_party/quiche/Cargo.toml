@@ -12,8 +12,9 @@
 [package]
 edition = "2021"
 rust-version = "1.85"
-name = "quiche"
-version = "0.24.9"
+# veil: 公開名と版（F-238。`[lib] name = "quiche"` はそのまま）
+name = "veil-proxy-quiche"
+version = "0.24.9-veil.1"
 authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
 build = "src/build.rs"
 include = [
@@ -36,7 +37,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "🥧 Savoury implementation of the QUIC transport protocol and HTTP/3"
+description = "quiche 0.24.9 (Cloudflare) vendored for veil-proxy: always coalesces STREAM frames into one packet (see README.veil.md)"
 readme = "README.md"
 keywords = [
     "quic",
@@ -44,7 +45,8 @@ keywords = [
 ]
 categories = ["network-programming"]
 license = "BSD-2-Clause"
-repository = "https://github.com/cloudflare/quiche"
+repository = "https://github.com/aofusa/veil-proxy"
+homepage = "https://github.com/cloudflare/quiche"
 
 [package.metadata.release]
 tag-prefix = ""
@@ -66,7 +68,8 @@ boringssl-boring-crate = [
     "foreign-types-shared",
 ]
 boringssl-vendored = []
-default = ["boringssl-vendored"]
+# veil: deps/boringssl を取り込んでいないので既定では有効にしない（veil は使わない）
+default = []
 ffi = ["dep:cdylib-link-lines"]
 fuzzing = []
 gcongestion = []
@@ -162,3 +165,12 @@ features = [
     "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
 ]
+
+# veil: 第三者のコードなので veil の clippy（`-D warnings`）の対象にしない。F-238 で `[patch]` から
+# 名前を変えた path 依存にしたため、cargo がローカルのパッケージとして lint するようになった。
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+[lints.rust]
+warnings = { level = "allow", priority = -1 }

@@ -68,6 +68,9 @@ LOAD_THREADS="${LOAD_THREADS:-2}"
 # 計測対象を固定するコア / 負荷生成を固定するコア
 SRV_CPUS="${SRV_CPUS:-0,1}"
 GEN_CPUS="${GEN_CPUS:-2,3}"
+# proxy・L4 の上流（別プロセスの nginx）のコア。計測対象（SRV_CPUS）と分け、負荷生成と共有する
+# （veil・nginx のどちらの計測でも同じ条件になる）。
+UP_CPUS="${UP_CPUS:-${GEN_CPUS}}"
 SRV_THREADS="${SRV_THREADS:-2}"
 
 # ポート割り当て（veil / nginx / 共通上流）
@@ -189,13 +192,6 @@ http {
     open_file_cache_min_uses 1;
     open_file_cache_errors on;
 
-    # ---- 共通上流（veil / nginx の proxy・L4 計測の双方が使う）----
-    server {
-        listen 127.0.0.1:${UPSTREAM} reuseport;
-        root ${WORK}/www;
-        location / { index index.html; }
-    }
-
     upstream backend { server 127.0.0.1:${UPSTREAM}; keepalive 128; }
 
     # ---- 計測対象 nginx: 平文 HTTP/1.1（静的 + プロキシ）----
@@ -238,6 +234,36 @@ stream {
     server {
         listen ${NGX_L4} reuseport;
         proxy_pass l4backend;
+    }
+}
+EOF
+
+    # ---- 共通上流（veil / nginx の proxy・L4 計測の双方が使う）----
+    # 計測対象の nginx とは別のプロセス（別の pid）にして、UP_CPUS に固定する。同じ nginx の中に置くと、
+    # nginx の計測では中継と上流が同じワーカーのイベントループで済む一方、veil の計測では veil と上流が
+    # 2 コアを取り合い、条件が揃わない（v0.8.0 で計測対象のコアへの固定を入れたときに見つかった）。
+    cat > "${WORK}/conf/nginx-up.conf" <<EOF
+worker_processes ${SRV_THREADS};
+daemon on;
+pid ${WORK}/nginx/nginx-up.pid;
+error_log ${WORK}/logs/nginx_up_error.log warn;
+events { worker_connections 8192; }
+http {
+    default_type application/octet-stream;
+    access_log off;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 1000000;
+    open_file_cache max=1024 inactive=60s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 1;
+    open_file_cache_errors on;
+    server {
+        listen 127.0.0.1:${UPSTREAM} reuseport;
+        root ${WORK}/www;
+        location / { index index.html; }
     }
 }
 EOF
@@ -402,14 +428,22 @@ stop_all() {
     if [ -f "${WORK}/nginx/nginx.pid" ]; then
         nginx -c "${WORK}/conf/nginx.conf" -s quit >/dev/null 2>&1 || true
     fi
+    if [ -f "${WORK}/nginx/nginx-up.pid" ]; then
+        nginx -c "${WORK}/conf/nginx-up.conf" -s quit >/dev/null 2>&1 || true
+    fi
     pkill -x nginx >/dev/null 2>&1 || true
     sleep 1
 }
 
 start_nginx() {
-    nginx -c "${WORK}/conf/nginx.conf" >/dev/null 2>&1 \
-        || die "nginx 起動に失敗（${WORK}/logs/nginx_error.log）"
+    # nginx も veil と同じコア（SRV_CPUS）に固定する（冒頭の公平化のルール）。以前は固定しておらず、
+    # nginx のワーカーが負荷生成側のコアにも載れた。daemon で fork したワーカーも cpuset を引き継ぐ。
+    # proxy・L4 の上流（同じ nginx）も同じコアに載るので、veil の計測でも「計測対象 + 上流」は 2 コアに収まる。
+    pinned "${UP_CPUS}" nginx -c "${WORK}/conf/nginx-up.conf" >/dev/null 2>&1 \
+        || die "上流の nginx の起動に失敗（${WORK}/logs/nginx_up_error.log）"
     wait_port "${UPSTREAM}" || die "nginx 上流が上がらない"
+    pinned "${SRV_CPUS}" nginx -c "${WORK}/conf/nginx.conf" >/dev/null 2>&1 \
+        || die "nginx 起動に失敗（${WORK}/logs/nginx_error.log）"
 }
 
 start_veil() {
@@ -435,6 +469,17 @@ wait_port() {
     p="$1"; n=0
     while [ $n -lt 100 ]; do
         if sockstat -4 -l -p "$p" 2>/dev/null | grep -q ":$p"; then return 0; fi
+        sleep 0.2; n=$((n+1))
+    done
+    return 1
+}
+
+# 実際に HTTP の応答が返るまで待つ。ポートの LISTEN（wait_port）だけでは、起動直後の veil へ h2load を
+# 当てたときに全要求がすぐ失敗して 0 rps になることがあった（v0.8.0、h2_file_tls 54KB の 1 回）。
+wait_http() {
+    u="$1"; n=0
+    while [ $n -lt 50 ]; do
+        if curl -sk -o /dev/null -m 2 "$u" 2>/dev/null; then return 0; fi
         sleep 0.2; n=$((n+1))
     done
     return 1
@@ -582,12 +627,25 @@ run_scenario() {
       *) die "未知のシナリオ: $sc" ;;
     esac
 
-    # ---- nginx ----
+    # 順番の偏りを打ち消すため、反復ごとに nginx と veil の順を入れ替える（奇数回は nginx が先、偶数回は veil が先）。
+    # VM ではラウンドの中で後に測るほどスループットが下がる傾向があり、常に nginx を先に測ると veil に不利に出ていた
+    # （FreeBSD aarch64 の l4_tcp 3B で、固定の順の 0.85 に対して交互では 1.04〜1.13）。
+    if [ $((iter % 2)) = 0 ]; then
+        measure_veil_side
+        measure_nginx_side
+    else
+        measure_nginx_side
+        measure_veil_side
+    fi
+}
+
+measure_nginx_side() {
     log "[$sc iter=$iter] nginx 計測"
     r=$(measure "$tool" "$n_url")
     printf '%s\t%s\t%s\t%s\n' "$sc" nginx "$iter" "$r" >> "${OUT_TSV}"
+}
 
-    # ---- veil ----
+measure_veil_side() {
     log "[$sc iter=$iter] veil 計測"
     start_veil "${WORK}/conf/${v_cfg}"
     case "$sc" in
@@ -595,6 +653,10 @@ run_scenario() {
       l4_tcp)                       wait_port "${VEIL_L4}"    || die "veil(l4) 起動失敗" ;;
       h3_file)                      wait_udp_port "${VEIL_HTTPS}" || die "veil(h3) 起動失敗" ;;
       *)                            wait_port "${VEIL_HTTPS}" || die "veil(https) 起動失敗" ;;
+    esac
+    case "$sc" in
+      h3_file) ;;  # curl は HTTP/3 を話せない（pkg の curl）
+      *) wait_http "$v_url" || log "警告: veil が ${v_url} に応答しない（そのまま計測する）" ;;
     esac
     r=$(measure "$tool" "$v_url")
     printf '%s\t%s\t%s\t%s\n' "$sc" veil "$iter" "$r" >> "${OUT_TSV}"

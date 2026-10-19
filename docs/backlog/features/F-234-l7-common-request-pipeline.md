@@ -1,6 +1,6 @@
 # F-234: HTTP/1.1・HTTP/2・HTTP/3 の要求処理の共通化（L7 の共通の段）
 
-**状態: 未着手（2026-10-16 起票・設計。出典: docs/artifacts/veil-comprehensive-review-and-comparison.md の §4.2 ①・§5 Phase 2 の 5。F-233 の後）**
+**状態: 完了（feat/v080-release、2026-10-16。範囲は下の「判断」）**
 
 ## 目的
 
@@ -66,6 +66,30 @@
 - 3 経路の判定の関数が 1 つになり、ルートの判定の分岐（`match backend`）が `src/l7/` の外に無い。
 - プロトコルの行列の E2E が通る。既存の E2E（io_uring・epoll）・mesh の kind の試験も通る。
   mesh は `src/mesh/` の独自の L7 なので対象外だが、`jwt_verify` などの共有部品が壊れないことを確かめる。
+
+
+## 実装の結果
+
+### 段階 1 の表（3 経路の違い）
+
+| 段 | HTTP/1.1 | HTTP/2 | HTTP/3 | 扱い |
+|---|---|---|---|---|
+| 検査の順 | IP → メソッド → 本文 → レート制限（手書き） | IP → メソッド → レート制限 → 本文 | HTTP/2 と同じ | バグ（B-132）。HTTP/1.1 の順に揃えた |
+| 本文の長さ | content-length | 受け取った本文 | content-length だけ（省略できる） | バグ（B-132） |
+| ルートが無いとき | 404 | authority を空にしてもう一度 | HTTP/2 と同じ | 2 回目は何も見つけない照合だった（ホストの条件の無いルートは常に候補）。削った |
+| Respond・Redirect のセキュリティ | 既定値 | 既定値 | 既定値 | バグ（B-133）。ルートの設定を持たせた |
+
+### 判断
+
+- 共通にしたのは「ルートの照合」と「セキュリティの検査」（`src/l7.rs` の `resolve_route`・`check_security`）。3 経路とも
+  これだけを使う。
+- Backend ごとの分岐（`match backend`）は各プロトコルに残した。分岐の各腕は、そのプロトコルの書き出し（HTTP/1.1 の
+  splice・kTLS、HTTP/2 のアクターのチャネル、HTTP/3 の quiche のストリームとワーカーのタスク）そのもので、共通の
+  `L7Decision` に置き換えても各経路に同じ数の腕の `match` が残るだけになる。代わりに、片側だけ直し忘れる類の不具合
+  （B-99）は、プロトコルの行列の E2E（`standalone_e2e::f234_protocol_matrix_same_decisions`。同じ設定に HTTP/1.1・h2c・
+  HTTP/3 が同じ状態コードを返す）で防ぐ。この試験を足した時点で B-132・B-133 が見つかった。
+- Wasm の要求ヘッダの段は、3 経路のヘッダの型（HTTP/1.1 の `Bytes` の組・hpack の `HeaderField`・`h3::Header`）が違い、
+  変換のコスト（ホスト API の境界の `Vec<u8>`）も同じなので、共通化しても得が無い。今の形のままにした。
 
 ## 関連
 

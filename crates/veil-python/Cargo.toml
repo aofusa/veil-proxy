@@ -1,10 +1,11 @@
 [package]
 name = "veil-python"
-version = "0.7.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Python bindings (PyO3) for the veil API server library"
-license = "Apache-2.0 OR MIT"
-authors = ["aofusa"]
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 publish = false
 
 [lib]
@@ -12,16 +13,16 @@ name = "_veil"
 crate-type = ["cdylib"]
 
 [dependencies]
-veil = { path = "../..", default-features = false, features = [
+veil = { package = "veil-proxy", path = "../..", default-features = false, features = [
     "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
     "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
     "handler", "openapi", "macro", "grpc-handler", "l4-handler",
 ] }
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 bytes = "1.9"
 serde_json = "1"
 itoa = "1"
 
 # epoll feature は Linux でだけ指定できる（他の OS は kqueue / WSAPoll の reactor が自動で選ばれる）。
 [target.'cfg(target_os = "linux")'.dependencies]
-veil = { path = "../..", default-features = false, features = ["epoll"] }
+veil = { package = "veil-proxy", path = "../..", default-features = false, features = ["epoll"] }

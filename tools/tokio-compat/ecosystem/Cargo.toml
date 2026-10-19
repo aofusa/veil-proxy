@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-veil = { path = "../../..", default-features = false, features = ["tokio-compat"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["tokio-compat"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
@@ -32,4 +32,3 @@ epoll = ["veil/epoll"]
 
 [patch.crates-io]
 tokio = { path = "../../../crates/veil-tokio/tokio-shim" }
-quiche = { path = "../../../third_party/quiche" }

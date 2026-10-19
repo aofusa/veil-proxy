@@ -8,7 +8,7 @@
 //!
 //! ## 依存ライブラリの選定方針（AGENTS.md 参照）
 //!
-//! veil は **`quiche` を本番データプレーン専用**（`src/http3_server.rs`）と位置づけ、
+//! veil は **`quiche` を本番データプレーン専用**（`src/http3_server/`）と位置づけ、
 //! **テスト・計測ツールは `quinn` + `h3`** を使う方針にしている
 //! （`tests/common/http3_client.rs` と本ツールが該当）。本ツールは perf 計測用であり
 //! データプレーンではないため、後者の方針に従い `quiche` ではなく `quinn` + `h3` で

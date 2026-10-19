@@ -4,7 +4,7 @@
 
 すべて **docker コマンドのみ** で完結し、ホストへの追加インストールは不要です（証明書生成に `openssl` を使う場合を除く）。
 
-計測結果は [docs/perf/](../../docs/perf/) を参照してください（Linux/Docker の生データは [`docs/perf/results_raw.tsv`](../../docs/perf/results_raw.tsv)、**FreeBSD ネイティブ計測の生データは [`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv)**）。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
+計測結果は [docs/perf/](../../docs/perf/) を参照してください（Linux/Docker の生データは [`docs/perf/linux_suite_ab_raw.tsv`](../../docs/perf/linux_suite_ab_raw.tsv)、**FreeBSD ネイティブ計測の生データは [`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv)**）。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
 
 ---
 
@@ -17,8 +17,8 @@
 | `h2c_proxy_lab.sh` | h2c 単一構成のラボハーネス（`run_perf.sh` は 1 構成の計測が終わるとコンテナを落とすため、**負荷をかけたまま**の CPU 内訳・syscall 集計・メモリ推移が取れない）。`up`/`upnginx` で veil と比較対象 nginx を起動しっぱなしにし、`load`（rps）・`cpu`（クライアント/プロキシ/上流の 3 者同時サンプル）・`strace`（**1 リクエストあたりの syscall 回数**）・`mem`（持続負荷中の RSS 推移）を差し込む。ペイロードは `/`（54,576B）と `/3b.html`（3B）の 2 サイズを配信し、**バイト単価と固定費を切り分けられる**ようにしてある |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
-| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える） |
-| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
+| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える）。v0.8.0 で同じ仕事の相手を足した: `base`（443、TLS 静的、HTTP/3 も）・`base_proxy`（8443、TLS で受けて perf-backend へ中継、HTTP/3 も）・`base_compression`（8444、毎回 gzip）・`base_proxy_compression`（8445、中継 + gzip） |
+| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/linux_suite_ab_raw.tsv](../../docs/perf/linux_suite_ab_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
 
@@ -130,10 +130,10 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 |------|------|------|
 | `ITERATIONS` | `3` | 各 (config, proto) の反復回数（median±stdev 集計用） |
 | `WRK_ARGS` | `-t4 -c100 -d10s --timeout 5s --latency` | HTTP/1.1（wrk）: 4 スレッド・100 接続・10 秒 |
-| `H2_ARGS` | `-n 30000 -c100 -m10` | HTTP/2（h2load）: 30000 リクエスト・100 接続・多重化 10 |
-| `H3_ARGS` | `--alpn-list=h3 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・30000 リクエスト・100 接続・多重化 10 |
+| `H2_ARGS` | `-t4 -n 30000 -c100 -m10` | HTTP/2（h2load）: 4 スレッド・30000 リクエスト・100 接続・多重化 10 |
+| `H3_ARGS` | `--alpn-list=h3 -t4 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・4 スレッド・30000 リクエスト・100 接続・多重化 10。v0.8.0 までは 1 スレッドで、h2load 自体が律速だった（veil・nginx とも 4 コア中 1.5〜1.7 コアしか使っていなかった） |
 | `H2C_PORT` | `8080` | h2c（平文 HTTP/2 prior knowledge）: veil の `listen_cleartext` / nginx の `listen 8080 http2` のポート |
-| `H2C_ARGS` | `$H2_ARGS`（既定 `-n 30000 -c100 -m10`） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
+| `H2C_ARGS` | `-t4 -n 120000 -c100 -m10`（v0.8.0。3 万要求だと 1 秒で終わり ±10% ぶれる） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
 | `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |
@@ -241,25 +241,24 @@ veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirec
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
-2026-10-07（`3746594`、全 69 構成 × glibc/musl × 3 反復 = 810 計測、Non-2xx = 0、NA なし）**）:
+2026-10-19（`3736732d`、`suite_ab.sh` で main と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
 
-- **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
-  HTTP/1.1 glibc 9,667 / musl 9,527 vs nginx 6,437 = **1.50×**、HTTP/2 glibc 7,243 / musl 7,166
-  vs nginx 5,932 = **1.22×**。
-- **h2c は静的 2.39×・逆プロキシ 1.75×**（`h2c_file` 24,135 / `h2c_proxy` 10,858 vs
-  nginx 10,080 / 6,188）。L4 平文素通しは **2.04×**。圧縮結果キャッシュ有効の
-  `h2_1_feat_compression_cached` は HTTP/2 で **3.02×**。
-- FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/freebsd/`）は 16 項目中 12 項目で nginx 以上。
-- **`feat_proxy` / `feat_buffering` の「対 nginx」を額面どおり読まないこと。**
-  nginx ベースライン（`base` 構成）は **TLS 静的配信**であり逆プロキシではない
-  （`nginx/nginx.conf` の 443 サーバは `root /var/www`）。したがってこれらの比は
-  「veil の逆プロキシ」対「nginx の静的配信」であって同条件比較ではない。
-  **プロキシ同士の同条件比較になっているのは h2c だけ**（nginx 側も `/proxy/` で中継する）。
-- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 6,946、2026-10-07）は
-  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **96〜100%**、
-  proxy / buffering が **86〜87%**（バックエンドホップそのもの）、
-  キャッシュ無効の compression が **56%**（54,576B を毎リクエスト zstd 圧縮する CPU バウンド処理）、
-  圧縮結果キャッシュ有効（`compression_cached`）は **258%**（圧縮後 16KB を返すため）。
+- 対 nginx（同じ仕事の相手）の中央値は HTTP/1.1 **1.29×**・HTTP/2 **1.76×**・HTTP/3 **1.21×**・h2c **2.48×**、
+  全 120 構成で nginx 以上（最小 1.02×）。最良の静的配信 `h2_1_ktls_0_lb_kernel_ofc_1` は HTTP/1.1 1.42×・HTTP/2 1.76×、
+  h2c は静的 3.24×・中継 1.71×、L4 平文素通しは 2.01×、圧縮結果キャッシュ有効の `h2_1_feat_compression_cached` は 4.44×。
+- main との交互 A/B は全体 1.002（HTTP/3 1.138）。0.95 未満の組は 5〜6 反復で測り直して 0.967 以上。
+- FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/bsd/`）は CPU/要求の効率が 16 項目中 15 項目で nginx 以上
+  （残りは `h3_file` 54KB の 0.94、スループットは同等）。
+- **対 nginx は同じ仕事の相手と比べる**（v0.8.0。`tools/perf/vs_nginx.py` の対応）: `*_proxy*` は
+  `base_proxy`、キャッシュ無しの `*_compression` は `base_compression`、`*_proxy_compression` は
+  `base_proxy_compression`、`h2c_*` は同名、HTTP/3 の静的は `base`（http3）・中継は `base_proxy`（http3）、
+  それ以外は `base`（TLS 静的）。v0.8.0 より前は nginx の中継・圧縮の相手が無く、`feat_proxy` 等を
+  nginx の静的配信と比べていた。
+- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 8,684、2026-10-19）は
+  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **98〜103%**、
+  proxy / buffering が **77〜78%**（バックエンドホップそのもの）、
+  キャッシュ無効の compression が **49%**（54,576B を毎リクエスト圧縮する CPU バウンド処理）、
+  圧縮結果キャッシュ有効（`compression_cached`）は **284%**（圧縮後 16KB を返すため）。
 - glibc と musl の差は代表構成のいずれでも **数 % 以内でノイズ範囲**。
 - コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
 - `cbpf` と `kernel` の振り分けは同等（`h2_1_ktls_0_lb_{cbpf,kernel}_ofc_1` の HTTP/1.1 で 9,721 / 9,667）。B-76 以前は cBPF が全接続をワーカー 0 に寄せていた。
@@ -334,6 +333,21 @@ F-158（HTTP/2 インライン初回 poll）の A/B 結果は
 （`docs/perf` は最新の計測だけを載せるため、過去の A/B の生データは git 履歴にある）。
 **同一の変更が kqueue で +27.3%、io_uring で −4.6% と正反対になった**ため、
 **ホットパス最適化は必ず両バックエンドで A/B を取ること**。
+
+## BSD のネイティブ計測（`bsd/`）
+
+- `bsd/run_perf_bsd.sh`: veil と nginx をゲストの中のループバックで比べる。計測対象（veil・nginx）は `SRV_CPUS`
+  （既定 0,1）、負荷生成は `GEN_CPUS`（既定 2,3）、proxy・L4 の上流は **別プロセスの nginx**（`nginx-up.conf`）で
+  `UP_CPUS`（既定は `GEN_CPUS`）に固定する。反復ごとに veil と nginx の順を入れ替え、veil は HTTP の応答が返るまで
+  待ってから測る（v0.8.0、B-153: 以前は nginx を固定せず、上流を計測対象の nginx と共有し、いつも nginx を先に測って
+  いた）。
+- **サーバ律速**: h2c・HTTP/3 の 54KB 等はクライアント（2 コア）やホストが律速になる。計測対象 1 コア・負荷 3 コアで
+  測ると、サーバの差が出る:
+  `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3 sh tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10`。
+- `bsd/cpu_per_req.sh`: 全シナリオのサーバの CPU 時間 / 要求（ns）と rps を veil・nginx で交互に測る。VM はホストの
+  負荷で rps が大きく揺れる（同じバイナリでラウンドごとに 3 割下がることがある）ので、効率の比較はこれを主にする。
+- `bsd/syscalls_per_req.sh`・`bsd/profile_cpu.sh`: 1 要求あたりの syscall（DTrace）と関数別の CPU。profile プローブの
+  `ustack` は aarch64 の FreeBSD では取れないので、呼び出し元はコードを読んで追う。
 
 ## フルスイートの交互 A/B（`suite_ab.sh`、リリース間の退行確認）
 

@@ -5,7 +5,7 @@
 //! 返せる（クラッシュ・ハングしていない）ことを health で確認する。
 //!
 //! 環境変数:
-//!   VEIL_HOST(=veil-proxy) / VEIL_HTTP_PORT(=80) / VEIL_HTTPS_PORT(=443)
+//!   VEIL_HOST(=veil-proxy) / VEIL_HTTP_PORT(=8443) / VEIL_HTTPS_PORT(=443)
 //!   FUZZ_ITERATIONS(=200)
 //! 出力: /results/fuzz_report.txt / 応答不能なら exit 1。
 
@@ -165,7 +165,7 @@ fn main() {
     let http_port: u16 = env::var("VEIL_HTTP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(80);
+        .unwrap_or(8443);
     let https_port: u16 = env::var("VEIL_HTTPS_PORT")
         .ok()
         .and_then(|s| s.parse().ok())

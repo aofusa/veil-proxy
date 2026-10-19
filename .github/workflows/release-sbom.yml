@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "SBOM を添付するリリースのタグ（例: v0.7.0）"
+        description: "SBOM を添付するリリースのタグ（例: v0.8.0）"
         required: true
 
 permissions:

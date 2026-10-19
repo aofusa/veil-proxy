@@ -93,16 +93,31 @@ for feature flags, packaging and BSD/macOS/Windows builds.
    curl -k https://localhost/static/index.html
    ```
 
+   Or run the container image (`latest` = musl; `glibc` is also published, for `linux/amd64` and `linux/arm64`):
+
+   ```bash
+   docker run --rm -p 443:443 -p 443:443/udp \
+     -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+     -v "$PWD/cert.pem:/etc/veil/ssl/cert.pem:ro" -v "$PWD/key.pem:/etc/veil/ssl/key.pem:ro" \
+     ghcr.io/aofusa/veil:latest
+   ```
+
+   The image runs the io_uring build and switches to its bundled epoll build when the container's seccomp profile
+   forbids io_uring (Docker's default does).
+
 A fully commented reference of every key is in [examples/config.toml](examples/config.toml).
 
 ### Use veil as a library
 
 ```toml
-# Cargo.toml
+# Cargo.toml (the crate is `veil-proxy` on crates.io; keep the name `veil`, the macros refer to it)
 [dependencies]
-veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 ```
+
+With HTTP/3 on Linux, also add `AWS_LC_SYS_NO_PREFIX_<target> = "1"` to `[env]` in `.cargo/config.toml`
+([library guide](docs/guide/library.md#cargotoml)). Python: `pip install veil-api` (`import veil`).
 
 ```rust
 use veil::prelude::*;

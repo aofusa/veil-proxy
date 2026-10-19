@@ -9,7 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
-veil = { path = "../../..", default-features = false, features = ["http2", "api"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["http2", "api"] }
 axum = { version = "0.8", features = ["http2"] }   # h2c の計測（--proto h2c）
 tokio = { version = "1", features = ["full"] }   # crates/veil-tokio/tokio-shim に解決される
 serde_json = "1"
@@ -24,8 +24,6 @@ http3 = ["veil/http3"]
 
 [patch.crates-io]
 tokio = { path = "../../../crates/veil-tokio/tokio-shim" }
-# veil 本体と同じ vendoring 版 quiche（http3 feature のとき。F-172）
-quiche = { path = "../../../third_party/quiche" }
 
 [profile.release]
 codegen-units = 1

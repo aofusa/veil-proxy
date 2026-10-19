@@ -159,6 +159,14 @@ impl CacheManager {
             None => return false,
         };
 
+        // Set-Cookie を持つ応答は利用者ごとのものなので共有キャッシュに置かない（F-236 の F7）
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(b"set-cookie"))
+        {
+            return false;
+        }
+
         // Varyチェック（Vary: * はキャッシュ不可）
         use super::policy::VaryResult;
         let vary_result = CachePolicy::parse_vary_ex(&headers);
@@ -167,6 +175,19 @@ impl CacheManager {
             // Vary: * の場合はキャッシュしない
             if !vary_result.is_cacheable() {
                 return false;
+            }
+            // キャッシュのキーは `key_headers` の値だけで作る。Vary が挙げるヘッダがキーに無いと、
+            // 別の値の要求（例: Accept-Encoding の違い）へこの応答を返してしまうので保存しない（F-236 の F7）
+            if let VaryResult::Headers(ref names) = vary_result {
+                let covered = names.iter().all(|n| {
+                    self.config
+                        .key_headers
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(n))
+                });
+                if !covered {
+                    return false;
+                }
             }
         }
 
@@ -440,6 +461,45 @@ mod tests {
 
         assert!(manager.is_enabled());
         assert_eq!(manager.stats().entries, 0);
+    }
+
+    /// F-236 の F7: Set-Cookie の応答と、キーに無いヘッダで Vary する応答は共有キャッシュに置かない
+    #[test]
+    fn test_store_rejects_per_user_responses() {
+        let h = |n: &str, v: &str| {
+            (
+                n.as_bytes().to_vec().into_boxed_slice(),
+                v.as_bytes().to_vec().into_boxed_slice(),
+            )
+        };
+        let manager = CacheManager::new(create_test_config()).unwrap();
+        assert!(!manager.store(
+            create_test_key("/c"),
+            200,
+            vec![h("set-cookie", "sid=1")],
+            b"x".to_vec()
+        ));
+        assert!(!manager.store(
+            create_test_key("/v"),
+            200,
+            vec![h("vary", "Accept-Encoding")],
+            b"x".to_vec()
+        ));
+        let mut cfg = create_test_config();
+        cfg.key_headers = vec!["accept-encoding".to_string()];
+        let manager = CacheManager::new(cfg).unwrap();
+        assert!(manager.store(
+            create_test_key("/v"),
+            200,
+            vec![h("vary", "Accept-Encoding")],
+            b"x".to_vec()
+        ));
+        assert!(!manager.store(
+            create_test_key("/w"),
+            200,
+            vec![h("vary", "Accept-Encoding, Cookie")],
+            b"x".to_vec()
+        ));
     }
 
     #[test]

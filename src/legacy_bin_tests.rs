@@ -111,10 +111,11 @@ mod cidr_tests {
 
     #[test]
     fn test_ipv4_mapped_ipv6() {
-        // IPv4をIPv6で確認した場合（異なるアドレスファミリー）
+        // IPv4 射影の IPv6 は IPv4 として照合する（拒否リストを射影の形で素通りさせない。F-236 の F8）
         let cidr_v4 = CidrRange::parse("192.168.1.0/24").unwrap();
-        // IPv4 CIDRにIPv6アドレスは含まれない
-        assert!(!cidr_v4.contains("::ffff:192.168.1.1"));
+        assert!(cidr_v4.contains("::ffff:192.168.1.1"));
+        // 射影でない IPv6 は IPv4 の範囲に含まれない
+        assert!(!cidr_v4.contains("::c0a8:101"));
     }
 }
 
@@ -740,7 +741,8 @@ mod config_parse_tests {
         let config = Http3ConfigSection::default();
 
         assert_eq!(config.max_idle_timeout, 30000);
-        assert_eq!(config.max_udp_payload_size, 1350);
+        assert_eq!(config.max_udp_payload_size, 1452);
+        assert!(config.discover_pmtu);
         assert_eq!(config.initial_max_data, 10_000_000);
         assert_eq!(config.initial_max_streams_bidi, 100);
         assert_eq!(config.initial_max_streams_uni, 100);

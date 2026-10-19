@@ -140,16 +140,23 @@ impl KqueuePoller {
     /// F-141: `update`/`delete` が溜めた changelist を **eventlist と同一の `kevent()`
     /// 呼び出し**で渡す（io_uring の `submit_and_wait` 相当。型 doc 参照）。changelist は
     /// 呼び出し後に空にする（次周回分は `update`/`delete` が新たに積む）。
-    pub fn wait(&self, events: &mut [libc::kevent], timeout_ms: i32) -> io::Result<usize> {
+    /// `timeout` が `None` なら無期限に待つ。ナノ秒の精度で渡す（ミリ秒に丸めると、1ms 未満の先のタイマーで
+    /// 待たずに戻る空回りになる。`executor::timeout_ms_ceil` 参照）。
+    pub fn wait(
+        &self,
+        events: &mut [libc::kevent],
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<usize> {
         let ts;
-        let ts_ptr = if timeout_ms < 0 {
-            std::ptr::null()
-        } else {
-            ts = libc::timespec {
-                tv_sec: (timeout_ms / 1000) as libc::time_t,
-                tv_nsec: ((timeout_ms % 1000) * 1_000_000) as libc::c_long,
-            };
-            &ts as *const libc::timespec
+        let ts_ptr = match timeout {
+            None => std::ptr::null(),
+            Some(d) => {
+                ts = libc::timespec {
+                    tv_sec: d.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+                    tv_nsec: d.subsec_nanos() as libc::c_long,
+                };
+                &ts as *const libc::timespec
+            }
         };
         let mut changes = self.changelist.borrow_mut();
         // F-140: `kevent(2)` の個数引数は **NetBSD だけ `size_t`**（他 BSD/macOS は `c_int`）。

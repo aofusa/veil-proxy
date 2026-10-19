@@ -62,6 +62,11 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
 - トラフィック管理のタスク: フォルト注入（abort・delay）、タイムアウト、リトライ、ヘッダの変更、トラフィックの移行、
   書き換えとサブセット、ミラーリング、サーキットブレーカと外れ値検出、一貫性ハッシュ。
 - セキュリティ: `AuthorizationPolicy`（HTTP・TCP）、`RequestAuthentication`（インラインの JWKS の JWT）。
+  - パスは、ルート・RBAC・JWT の照合の前に 1 回だけ正規化し、正規化したパスを上流へ送る（HCM の `normalize_path`・
+    `merge_slashes`・`path_with_escaped_slashes_action`。既定は Istio の `BASE` と同じで、HCM が `normalize_path` を
+    書かないときも正規化する）。エスケープされたスラッシュの扱いで拒否する要求は 400（`DPE`）。
+  - `remoteIpBlocks` は Envoy の「元のクライアントのアドレス」を使う: `use_remote_address` なら接続の相手、そうでなければ
+    X-Forwarded-For の右から `xff_num_trusted_hops` 番目。クライアントが書ける左端は使わない。
 - 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
 - WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く。`FAIL_CLOSE` はモジュールが落ちたら 503）。

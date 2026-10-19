@@ -13,7 +13,7 @@ publish = false
 [workspace]
 
 [dependencies]
-veil = { path = "../../..", default-features = false, features = ["tokio-compat"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["tokio-compat"] }
 
 # tokio の機能フラグはすべて受け付ける（有効・無効で API は変わらない）
 [features]

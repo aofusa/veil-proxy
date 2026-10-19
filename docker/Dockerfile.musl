@@ -33,6 +33,10 @@ RUN mkdir -p /etc_minimal/etc \
 FROM tool-builder AS cacher
 
 ARG CARGO_FEATURES=full
+# F-237: 空でなければ、この feature で 2 本目（epoll 版）もビルドして /veil.epoll に置く。io_uring 版の /veil は
+# 起動時に io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）これへ切り替える
+# （src/runtime/fallback.rs）。公開イメージは CARGO_FEATURES_FALLBACK=full-container でビルドする
+ARG CARGO_FEATURES_FALLBACK=
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
 # 一元管理する（Linux ターゲットは "1" = quiche と aws-lc-sys のシンボル共有）。
@@ -70,6 +74,7 @@ RUN mkdir src benches \
        | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
     && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && cargo build --profile dist --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && if [ -n "${CARGO_FEATURES_FALLBACK}" ]; then cargo build --profile dist --target "${RUST_TARGET}" --features "${CARGO_FEATURES_FALLBACK}" --locked; fi \
     && rm -rf src/
 
 
@@ -79,6 +84,10 @@ RUN mkdir src benches \
 FROM tool-builder AS builder
 
 ARG CARGO_FEATURES=full
+# F-237: 空でなければ、この feature で 2 本目（epoll 版）もビルドして /veil.epoll に置く。io_uring 版の /veil は
+# 起動時に io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）これへ切り替える
+# （src/runtime/fallback.rs）。公開イメージは CARGO_FEATURES_FALLBACK=full-container でビルドする
+ARG CARGO_FEATURES_FALLBACK=
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 
 # cacher ステージから「ビルド済みの依存関係アセット（target/）」をコピー
@@ -100,7 +109,10 @@ COPY . /app
 # （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
 RUN find src -name '*.rs' -exec touch {} + \
     && cargo test --lib --features "${CARGO_FEATURES}" --locked \
-    && cargo build --profile dist --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
+    && cargo build --profile dist --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && mkdir -p /app/out && cp target/${RUST_TARGET}/dist/veil /app/out/veil \
+    && if [ -n "${CARGO_FEATURES_FALLBACK}" ]; then cargo build --profile dist --target "${RUST_TARGET}" --features "${CARGO_FEATURES_FALLBACK}" --locked \
+        && cp target/${RUST_TARGET}/dist/veil /app/out/veil.epoll; fi
 
 
 # ==========================================
@@ -121,7 +133,8 @@ COPY --from=builder --chown=65532:65532 /var/cache/veil /var/cache/veil
 COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
 
 # アプリケーションバイナリと設定アセット
-COPY --from=builder /app/target/${RUST_TARGET}/dist/veil /veil
+# /veil と（ビルドしていれば）/veil.epoll
+COPY --from=builder /app/out/ /
 COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
 COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
 

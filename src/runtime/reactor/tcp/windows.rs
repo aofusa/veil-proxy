@@ -126,7 +126,7 @@ fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
 /// ノンブロッキングソケットを作成する。
 pub(crate) fn create_nonblocking_socket(domain: i32) -> io::Result<RawFd> {
     ensure_wsa_started();
-    let sock = unsafe { socket(domain, SOCK_STREAM, IPPROTO_TCP as i32) };
+    let sock = unsafe { socket(domain, SOCK_STREAM, IPPROTO_TCP) };
     if sock == INVALID_SOCKET {
         return Err(last_wsa_error());
     }
@@ -449,7 +449,7 @@ impl TcpStream {
         let ret = unsafe {
             setsockopt(
                 win::to_socket(self.fd),
-                IPPROTO_TCP as i32,
+                IPPROTO_TCP,
                 WIN_TCP_NODELAY,
                 &optval as *const _ as *const u8,
                 std::mem::size_of::<i32>() as i32,
@@ -621,7 +621,7 @@ impl Future for Connect {
         let sock = win::to_socket(self.fd);
         let mut pfd = WinSock::WSAPOLLFD {
             fd: sock,
-            events: WinSock::POLLWRNORM as i16,
+            events: WinSock::POLLWRNORM,
             revents: 0,
         };
         let ret = unsafe { WinSock::WSAPoll(&mut pfd, 1, 0) };
@@ -630,8 +630,7 @@ impl Future for Connect {
             return Poll::Ready(Err(self.fail(e)));
         }
         if ret <= 0
-            || pfd.revents & ((WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP) as i16)
-                == 0
+            || pfd.revents & (WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP) == 0
         {
             register_write(self.fd, cx.waker().clone());
             self.registered = true;
@@ -841,17 +840,17 @@ fn poll_ready_now(fd: RawFd, want_write: bool) -> bool {
     let mut pfd = WinSock::WSAPOLLFD {
         fd: win::to_socket(fd),
         events: if want_write {
-            WinSock::POLLWRNORM as i16
+            WinSock::POLLWRNORM
         } else {
-            WinSock::POLLRDNORM as i16
+            WinSock::POLLRDNORM
         },
         revents: 0,
     };
     let ret = unsafe { WinSock::WSAPoll(&mut pfd, 1, 0) };
     let mask = if want_write {
-        (WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP) as i16
+        WinSock::POLLWRNORM | WinSock::POLLERR | WinSock::POLLHUP
     } else {
-        (WinSock::POLLRDNORM | WinSock::POLLERR | WinSock::POLLHUP) as i16
+        WinSock::POLLRDNORM | WinSock::POLLERR | WinSock::POLLHUP
     };
     ret > 0 && pfd.revents & mask != 0
 }

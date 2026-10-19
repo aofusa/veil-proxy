@@ -1,6 +1,6 @@
 # F-233: 巨大ファイルの分割（proxy.rs・config.rs・http3_server.rs・tests/e2e_tests.rs）
 
-**状態: 未着手（2026-10-16 起票・設計。出典: docs/artifacts/veil-comprehensive-review-and-comparison.md の §4.2 ①・§5 Phase 2 の 4）**
+**状態: 完了（feat/v080-release、2026-10-16）**
 
 ## 目的
 
@@ -89,6 +89,16 @@
 - ファイルの上限の目安を守る: 1 ファイル 3,000 行以下。超えるファイルは、理由を `mod.rs` の冒頭に書く。
 - `cargo test`・E2E（io_uring・epoll）・BSD・macOS・Windows のクロスビルドが通る。
 - AGENTS.md の「ディレクトリ要約」を更新する。
+
+
+## 実装の結果
+
+- `src/proxy.rs` → `src/proxy/`（13 ファイル）、`src/config.rs` → `src/config/`（15）、`src/http3_server.rs` → `src/http3_server/`（5）、
+  `tests/e2e_tests.rs` → `tests/e2e_tests/`（16。テストの数 556 は同じ）。中身は移しただけ（子は `use super::*`、
+  非公開の項目は `pub(super)`、親の再エクスポートは元の公開範囲）。`http3_stream.rs`・`http3_wire.rs` は大きくないので移していない。
+- 3,000 行を超えるのは `proxy/h2.rs`（4,151 行。1 つの接続のアクター）と `config/mod.rs`（設定の型とテスト）で、理由をファイルの冒頭に書いた。
+- `cargo public-api` はこの環境に無いので使っていない。代わりに、外から見えるパスは再エクスポートで保ち、mesh・api・fuzz・統合テストが
+  無変更でビルドできることで確かめた。性能の非退行は v0.8.0 の計測（docs/perf）で確かめる。
 
 ## 関連
 

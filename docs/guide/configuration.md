@@ -69,19 +69,20 @@ The following table lists default values for major configuration options:
 | `[http2]` | `max_header_block_size` | `65536` | Max header block (64KB) |
 | `[http2]` | `stream_idle_timeout_secs` | `60` | Stream idle timeout (seconds) |
 | `[http3]` | `max_idle_timeout` | `30000` | Max idle timeout (ms, 30s) |
-| `[http3]` | `max_udp_payload_size` | `1350` | Max UDP payload size |
+| `[http3]` | `max_udp_payload_size` | `1452` | Max UDP payload size: the upper bound of path MTU discovery (`1350` before v0.8.0; a fixed 1350 needed 42 packets per 54 KB response vs nginx's 39 and was 6.7% slower on Linux) |
+| `[http3]` | `discover_pmtu` | `true` | Path MTU discovery (quiche, RFC 8899 DPLPMTUD). Starts at 1200 bytes and only uses sizes whose probes arrived, so small-MTU paths keep working; the UDP sockets set DF (Linux `IP_PMTUDISC_PROBE`, BSD/macOS `IP_DONTFRAG`/`IPV6_DONTFRAG`) |
 | `[http3]` | `initial_max_data` | `10000000` | Initial max data (10MB) |
 | `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | Stream data bidi local (1MB) |
 | `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | Stream data bidi remote (1MB) |
 | `[http3]` | `initial_max_stream_data_uni` | `1000000` | Stream data uni (1MB) |
 | `[http3]` | `initial_max_streams_bidi` | `100` | Max bidirectional streams |
 | `[http3]` | `initial_max_streams_uni` | `100` | Max unidirectional streams |
-| `[http3]` | `cc_algorithm` | `"bbr"` | QUIC congestion control (`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`) |
+| `[http3]` | `cc_algorithm` | `"cubic"` | QUIC congestion control (`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`). The default was `"bbr"` before v0.8.0; veil does not hold packets until quiche's pacing time, so unpaced BBR bursts were dropped at the receiver and retransmitted (cubic: FreeBSD HTTP/3 54KB +8–20%, Linux +4–6%) |
 | `[http3]` | `pacing` | `true` | Enable packet pacing |
 | `[http3]` | `max_pacing_rate` | *(none)* | Max pacing rate (bytes/s); omit for unlimited |
 | `[http3]` | `hystart` | `true` | Enable HyStart++ |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring pipelined RECVMSG/SENDMSG batch width (1..=128) |
-| `[http3]` | `recv_drain_max` | `64` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
+| `[http3]` | `recv_drain_max` | `1024` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The default was 64 before v0.8.0; 1024 raised FreeBSD HTTP/3 3B throughput by 37% (p99 11 → 14 ms). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
 | `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `[http3] enabled = true`) |
@@ -149,6 +150,14 @@ drop_privileges_user = "nobody"
 drop_privileges_group = "nogroup"
 # Global concurrent connection limit (0 = unlimited)
 max_concurrent_connections = 10000
+# Request path normalization before routing and [route.security] checks; the normalized path is
+# also sent upstream, so veil and the backend agree on it (HTTP/1.1, HTTP/2, HTTP/3).
+# "base" (default): decode %XX of unreserved characters, turn "\" into "/", remove "." / ".." segments
+# "merge_slashes": base + collapse repeated "/"
+# "off": match and forward the raw path (pre-v0.8.0 behavior)
+# %2F / %5C are kept encoded. Absolute-form targets (http://host/path) are converted to origin form;
+# other non-origin targets (except CONNECT and OPTIONS *) get 400.
+# path_normalization = "base"
 
 # seccomp system call restriction (Linux only)
 # Recommended to verify with log mode first, then switch to filter mode

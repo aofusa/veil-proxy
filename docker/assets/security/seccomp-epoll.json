@@ -85,6 +85,7 @@
         "newfstatat",
         "open",
         "openat",
+        "openat2",
         "personality",
         "pipe2",
         "poll",

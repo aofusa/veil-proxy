@@ -1,11 +1,18 @@
 [package]
-name = "veil-build"
-version = "0.7.0"
-edition = "2021"
+name = "veil-proxy-build"
+version.workspace = true
+edition.workspace = true
 description = "Code generator for veil gRPC services (prost messages + veil::api::grpc service traits, no tokio/tonic)"
-license = "Apache-2.0 OR MIT"
-authors = ["aofusa"]
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 # build.rs から使う（build-dependency）。生成コードは veil（feature grpc-handler）と prost だけに依存する。
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+name = "veil_build"
+
 [dependencies]
 prost-build = "0.13"

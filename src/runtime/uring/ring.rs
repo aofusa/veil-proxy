@@ -455,8 +455,10 @@ impl IoUring {
             )
         };
         if sq_ring_ptr == libc::MAP_FAILED {
+            let e = io::Error::last_os_error();
+            // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
             unsafe { libc::close(fd) };
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
         let sq_ring_ptr = sq_ring_ptr as *mut u8;
 

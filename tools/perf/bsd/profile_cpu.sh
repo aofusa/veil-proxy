@@ -26,7 +26,10 @@ case "$SCEN" in
 esac
 [ "$bsd_os" = freebsd ] && { kldload dtraceall 2>/dev/null || true; }
 pkill -x veil 2>/dev/null || true; sleep 1
-pgrep -x nginx >/dev/null || nginx -c "${WORK}/conf/nginx.conf"
+if ! pgrep -x nginx >/dev/null; then  # run_perf_bsd.sh と同じ固定（上流は負荷生成側、計測対象は 0,1）
+    pinned 2,3 nginx -c "${WORK}/conf/nginx-up.conf"
+    pinned 0,1 nginx -c "${WORK}/conf/nginx.conf"
+fi
 pinned 0,1 "${VEIL_BIN}" -c "${WORK}/conf/${cfg}" > "${WORK}/logs/veil_prof.log" 2>&1 &
 sleep 2
 if [ "$SCEN" = h2c_file_plain ]; then

@@ -183,6 +183,12 @@ impl ContentCache {
     /// 上限を満たす場合のみ挿入する（admission control）。既存キーへの上書きの
     /// 場合は古いエントリ分を先に `total_bytes` から差し引いて判定する。
     fn try_insert(&self, path: &Path, content: CachedContent, cfg: &StaticContentCacheConfig) {
+        // FreeBSD: 本体を共有メモリへ写す（h2c の DATA を sendfile(2) で送れるようにする。`super::shm` 参照）
+        #[cfg(target_os = "freebsd")]
+        let content = CachedContent {
+            data: super::shm::to_shm(content.data),
+            ..content
+        };
         let new_len = content.len;
         // **`entry()` を呼ぶ前にエントリ数を読む**こと。`DashMap::entry()` は該当シャードの
         // write ロックを取得し、返り値の `Entry` が生きている間はそれを保持し続ける。
@@ -420,7 +426,7 @@ fn guess_mime(path: &Path) -> Arc<str> {
 
 /// ファイル本体をキャッシュ優先で取得する（グローバルシングルトン、`mime_guess`
 /// フォールバック版）。詳細はモジュール doc および
-/// [`ContentCache::get_or_load_with_mime`] を参照。
+/// `ContentCache::get_or_load_with_mime` を参照。
 pub async fn get_or_load(path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
     // フォールバックの MIME 推定用クロージャは `path` を**借用**する（`to_path_buf()` で
     // 事前に所有権を取ると、キャッシュヒット時にも 1 リクエストあたり PathBuf の
@@ -447,13 +453,13 @@ where
 }
 
 /// キャッシュヒット時のみ内容を返す（グローバルシングルトン、F-150）。
-/// ミス時は一切ロードしない。詳細は [`ContentCache::get_cached`] 参照。
+/// ミス時は一切ロードしない。詳細は `ContentCache::get_cached` 参照。
 pub async fn get_cached(path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
     CONTENT_CACHE.get_cached(path, cfg).await
 }
 
 /// 既に読み込み済みのバイト列をキャッシュへ登録する（グローバルシングルトン、F-150）。
-/// 詳細は [`ContentCache::insert_bytes`] 参照。
+/// 詳細は `ContentCache::insert_bytes` 参照。
 pub fn insert_bytes(path: &Path, data: Bytes, mime: Arc<str>, cfg: &StaticContentCacheConfig) {
     CONTENT_CACHE.insert_bytes(path, data, mime, cfg);
 }

@@ -1,12 +1,17 @@
 [package]
-name = "veil-macros"
-version = "0.7.0"
-edition = "2021"
+name = "veil-proxy-macros"
+version.workspace = true
+edition.workspace = true
 description = "Procedural macros for the veil API server library (#[veil::route], #[veil::main], #[derive(veil::Schema)])"
-license = "Apache-2.0 OR MIT"
-authors = ["aofusa"]
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
+name = "veil_macros"
 proc-macro = true
 
 [dependencies]

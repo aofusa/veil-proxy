@@ -42,12 +42,12 @@ pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr
     let (det, acc) = super::conn::read_classify(&mut ds, acc).await;
     match det {
         Detected::H2c => serve_h2(ds, acc, peer).await,
-        Detected::Http1 => serve_h1(ds, acc).await,
+        Detected::Http1 => serve_h1(ds, acc, peer.ip()).await,
         _ => {}
     }
 }
 
-async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
+async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, peer: std::net::IpAddr) {
     loop {
         let head_end = loop {
             if let Some(i) = memchr::memmem::find(&acc, b"\r\n\r\n") {
@@ -109,7 +109,7 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
         }
         acc.drain(..head_end + body_len);
         let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-        let (status, ctype, body) = route(&method, path, query);
+        let (status, ctype, body) = route(&method, path, query, peer);
         let head = format!(
             "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}\r\n",
             status,
@@ -126,7 +126,10 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>) {
     }
 }
 
-struct AdminH2;
+/// HTTP/2 の管理ポートの要求の処理（`/shutdown`・`/env.json` の判定に接続の相手を使う）
+struct AdminH2 {
+    peer: std::net::IpAddr,
+}
 
 impl H2Service for AdminH2 {
     fn streaming_plan<S>(
@@ -155,9 +158,10 @@ impl H2Service for AdminH2 {
             .headers
             .iter()
             .any(|h| h.name.eq_ignore_ascii_case(b"l5d-orig-proto"));
+        let peer = self.peer;
         crate::runtime::spawn(async move {
             let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-            let (status, ctype, body) = route(&method, path, query);
+            let (status, ctype, body) = route(&method, path, query, peer);
             let mut headers = vec![
                 (
                     Bytes::from_static(b"content-type"),
@@ -205,13 +209,24 @@ async fn serve_h2(ds: DownStream, acc: Vec<u8>, peer: SocketAddr) {
     }
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
     let ip = peer.ip().to_string();
-    let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &AdminH2)
-        .await;
+    let svc = AdminH2 { peer: peer.ip() };
+    let _ =
+        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &svc).await;
 }
 
-pub fn route(method: &str, path: &str, _query: &str) -> (u16, &'static str, String) {
+pub fn route(
+    method: &str,
+    path: &str,
+    _query: &str,
+    peer: std::net::IpAddr,
+) -> (u16, &'static str, String) {
     let cfg = super::conn::CONFIG.get();
+    // `/shutdown`・`/env.json` はポッドの中（ループバック）からだけ受ける（linkerd2-proxy と同じ）。
+    // 管理ポートは 0.0.0.0 で待つので、以前はクラスタ内のどこからでも止め・設定を読めた
+    // （F-236 の再走査の F8）。IPv4 射影のループバックもループバックとして扱う。
+    let local = peer.to_canonical().is_loopback();
     match path {
+        "/shutdown" | "/env.json" if !local => (403, "text/plain", "forbidden\n".into()),
         "/ready" => {
             if super::identity::READY.load(Ordering::Relaxed) {
                 (200, "text/plain", "ready\n".into())
@@ -255,5 +270,21 @@ pub fn route(method: &str, path: &str, _query: &str) -> (u16, &'static str, Stri
             cfg.map(|c| c.log.clone()).unwrap_or_default(),
         ),
         _ => (404, "text/plain", "not found\n".into()),
+    }
+}
+
+#[cfg(test)]
+mod admin_access_tests {
+    use super::*;
+
+    /// F-236 の再走査の F8: `/shutdown`・`/env.json` はループバックからだけ受ける
+    #[test]
+    fn shutdown_and_env_are_loopback_only() {
+        let remote: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        assert_eq!(route("POST", "/shutdown", "", remote).0, 403);
+        assert_eq!(route("GET", "/env.json", "", remote).0, 403);
+        let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(route("GET", "/env.json", "", mapped).0, 200);
+        assert_eq!(route("GET", "/live", "", remote).0, 200);
     }
 }

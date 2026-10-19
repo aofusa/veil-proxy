@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::runtime::handle::RawFd;
 
@@ -107,12 +107,9 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
 /// 「1 回余分な read syscall」のみで、既存の epoll 版のレベルトリガ相当の
 /// spurious wake と同程度）。
 ///
-/// **epoll の `EPOLLET`（F-166 A-2）とヒントの関係**: ET はエッジ検出のみを担い、
-/// 「readable かどうか」の意味論は本ヒント + `poll(2)` フォールバックが担う。
-/// ヒントを消費した側は必ず直後に非ブロッキング I/O を試すため、たとえエッジを
-/// 取りこぼしても「データは残っているが `read_hint` が立っていない」状態は
-/// 次の `poll(2)` フォールバックで検出できる（ヒントは「省略してよい」ことの
-/// 十分条件であって必要条件ではない）。
+/// ヒントは「確認の `poll(2)` を省略してよい」ことの十分条件であって必要条件ではない。
+/// ヒントを消費した側は必ず直後に非ブロッキング I/O を試し、ヒントが立っていないときは
+/// `poll(2)` で確かめる（F-141。epoll は B-75 以降レベルトリガなので、この関数は kqueue 専用）。
 ///
 /// reactor 未初期化のスレッドや、その fd に対する read イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
@@ -186,22 +183,20 @@ pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
 }
 
-/// fd の interest（READ/WRITE いずれか）を登録する（epoll 版、F-166 A-2）。
+/// fd の interest（READ/WRITE いずれか）を登録する（epoll 版）。
 ///
-/// **fd あたり `epoll_ctl` は生涯 1 回だけ**（初回登録時の `EPOLL_CTL_ADD`）。
-/// `EPOLLONESHOT` + 毎回 `EPOLL_CTL_MOD` だった旧実装をやめ、`EPOLLIN|EPOLLOUT|
-/// EPOLLRDHUP|EPOLLET`（エッジトリガ、読み書き両方向を常時）で 1 回 ADD したら、
-/// 以降の `register()` 呼び出しは **syscall を一切発行せず** `FD_TABLE` へ Waker を
-/// 積むだけになる（`known_to_kernel` が唯一の ADD/MOD ならぬ「ADD 済みか否か」判定軸）。
+/// **呼び出しごとに `epoll_ctl` を 1 回発行する**（初回は `EPOLL_CTL_ADD`、以降は
+/// `EPOLL_CTL_MOD`）。マスクは `EPOLLONESHOT` 付きのレベルトリガで、待機者のいる方向
+/// （`armed`）だけを載せる。発火すると interest が外れるので、次の待機で MOD により
+/// 再武装する。
 ///
-/// 読み書き両方向を常時 armed にすることの安全性: 待機者がいない方向の
-/// `EPOLLOUT`/`EPOLLIN` 起床は `dispatch_event` が Waker を探しても見つからず
-/// 何もしない（`WakerSlot::is_empty()` なら wake 対象なしで即終了）ため実害が無い
-/// （F-166 詳細設計の「正しさの根拠」4 参照）。
+/// F-166 A-2 で一度「`EPOLLET` + fd あたり生涯 1 回の ADD（以降の `register()` は
+/// syscall 無し）」に変えたが、kTLS ソケットで「`poll(2)` は readable なのに `recvmsg` が
+/// `EAGAIN`」になる状況で恒久ハングしたため元に戻した（B-75。`epoll.rs` の冒頭）。
+/// 毎回の MOD でカーネルがレベル状態を再評価するので、その状況でも次の周回で起床できる。
 ///
-/// ET のエッジ取りこぼしを起こさない理由は `take_read_hint`/`take_write_hint` の
-/// doc と `poller::FdRecord` の doc を参照（ヒント consume-once + `poll(2)`
-/// フォールバックの組で塞ぐ）。
+/// ADD と MOD の判定は `known_to_kernel`（一度でも ADD したか）だけで行う
+/// （`poller::FdRecord` の doc）。
 #[cfg(veil_poller_epoll)]
 fn register(fd: RawFd, interest: Interest, waker: Waker) {
     let (needs_add, mask) = FD_TABLE.with(|t| {
@@ -414,14 +409,14 @@ const EVENT_BATCH: usize = 256;
 
 /// 1 回分の poller wait + イベント/タイマー処理。
 #[cfg(veil_poller_epoll)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<libc::epoll_event>> =
             RefCell::new(vec![unsafe { std::mem::zeroed() }; EVENT_BATCH]);
     }
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&mut buf, timeout_ms_ceil(timeout))) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -501,14 +496,14 @@ fn dispatch_event(fd: RawFd, flags: u32) {
 
 /// kqueue バージョンの 1 回分の poller wait + イベント/タイマー処理。
 #[cfg(veil_poller_kqueue)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<libc::kevent>> =
             RefCell::new(vec![unsafe { std::mem::zeroed() }; EVENT_BATCH]);
     }
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&mut buf, timeout)) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -626,14 +621,14 @@ fn with_poller<R>(f: impl FnOnce(&WsaPollPoller) -> R) -> R {
 /// （`super::wsapoll` のドキュメント参照。カーネル側に登録状態を持たないため
 /// epoll/kqueue のような差分登録ができない）。
 #[cfg(veil_poller_wsapoll)]
-fn park(timeout_ms: i32) {
+fn park(timeout: Option<Duration>) {
     thread_local! {
         static EVENT_BUF: RefCell<Vec<(RawFd, u32)>> = RefCell::new(Vec::with_capacity(EVENT_BATCH));
     }
     let entries = FD_TABLE.with(|t| t.borrow().armed_entries());
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&entries, &mut buf, timeout_ms)) {
+        match with_poller(|p| p.wait(&entries, &mut buf, timeout_ms_ceil(timeout))) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -687,18 +682,23 @@ fn dispatch_event(fd: RawFd, flags: u32) {
 
 /// poller wait のタイムアウト（ミリ秒）を最近接タイマーデッドラインから計算する。
 /// タイマーが無ければ無期限待機（-1）。
-fn next_timeout_ms() -> i32 {
-    match super::timer::next_deadline() {
-        Some(deadline) => {
-            let now = Instant::now();
-            if deadline <= now {
-                0
-            } else {
-                let ms = (deadline - now).as_millis();
-                ms.min(i32::MAX as u128) as i32
-            }
-        }
+/// 次のタイマーまでの時間（`None` は無期限）。期限を過ぎていれば 0。
+fn next_timeout() -> Option<Duration> {
+    super::timer::next_deadline().map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+/// ミリ秒の単位の poller（epoll・WSAPoll）へ渡す値。**切り上げる**: 以前は `as_millis` で切り捨てていたため、
+/// 1ms 未満の先のタイマーが 0（待たない）になり、期限まで poller を空回りさせていた（FreeBSD の HTTP/3 で
+/// 空の kevent が 1 スレッドで 50 万回/秒。v0.8.0。kqueue はナノ秒で渡す）。
+#[cfg(any(veil_poller_epoll, veil_poller_wsapoll))]
+fn timeout_ms_ceil(timeout: Option<Duration>) -> i32 {
+    match timeout {
         None => -1,
+        Some(d) if d.is_zero() => 0,
+        Some(d) => {
+            let ms = d.as_nanos().div_ceil(1_000_000);
+            ms.min(i32::MAX as u128) as i32
+        }
     }
 }
 
@@ -947,14 +947,14 @@ impl Executor {
                 break;
             }
 
-            let timeout_ms = next_timeout_ms();
+            let timeout = next_timeout();
             #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
-            park(timeout_ms);
+            park(timeout);
             #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll)))]
             {
                 // veil_rt_reactor は必ずどちらかの poller cfg を伴う（build.rs）ため、
                 // ここへ到達することは cfg 上あり得ない。
-                let _ = timeout_ms;
+                let _ = timeout;
                 unreachable!("reactor backend without a poller cfg");
             }
         }
