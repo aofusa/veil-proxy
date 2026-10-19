@@ -1,23 +1,23 @@
 # v0.8.0 全プラットフォーム検証
 
 リリース前に、対象のすべての OS・アーキテクチャで単体・統合・standalone・E2E・ライブラリの試験を回した結果
-（2026-10-18〜19）。ソースは `3736732d` 以降変わっていない（その後のコミットは文書・試験のハーネス・VM のスクリプトだけ）。
+（2026-10-18〜19）。ソースは `34528afb` 以降変わっていない（その後のコミットは文書・試験のハーネス・VM のスクリプトだけ）。
 Linux x86_64 以外は実機（macOS・Windows）または実カーネルの VM（`tools/qemu/`）上で、ネイティブビルドしたものを
 試験している。
 
 | OS | アーキ | 環境 | feature | 単体 | 統合 | standalone | E2E | ライブラリ | コミット |
 |---|---|---|---|---|---|---|---|---|---|
-| Linux | x86_64 | ホスト（io_uring） | `full` | 1085 | 60 | 23 | 569 | 230 | `5375c528` |
-| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | — | 569 | — | `5375c528` |
-| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 1083 | 60 | 23 | 569 | 230 | `5375c528` |
-| macOS | aarch64 | 実機（kqueue reactor） | `full-macos` | 1001 | 60 | 23 | 569 | 196 | `5375c528` |
-| Windows | x86_64 | 実機（WSAPoll reactor） | `full-windows` | 954 | 54 | 22 | スモーク※1 | 195 | `5375c528` |
-| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `5375c528` |
-| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `9907170f` |
-| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `5375c528` |
-| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `9907170f` |
-| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `5375c528` |
-| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `9907170f` |
+| Linux | x86_64 | ホスト（io_uring） | `full` | 1085 | 60 | 23 | 569 | 230 | `7b23beba` |
+| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | — | 569 | — | `7b23beba` |
+| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 1083 | 60 | 23 | 569 | 230 | `7b23beba` |
+| macOS | aarch64 | 実機（kqueue reactor） | `full-macos` | 1001 | 60 | 23 | 569 | 196 | `7b23beba` |
+| Windows | x86_64 | 実機（WSAPoll reactor） | `full-windows` | 954 | 54 | 22 | スモーク※1 | 195 | `7b23beba` |
+| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `7b23beba` |
+| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `d438059b` |
+| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `7b23beba` |
+| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `d438059b` |
+| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `7b23beba` |
+| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `d438059b` |
 
 すべて失敗 0。件数の違いは feature とプラットフォームの `cfg` による（Windows は Unix 専用の試験が、BSD は
 `full-*` に含まれない機能の試験が対象外）。ライブラリは `tests/api/library_e2e.sh all` の確認の数（Rust・GraphQL・

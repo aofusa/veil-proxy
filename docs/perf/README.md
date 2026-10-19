@@ -18,7 +18,7 @@ v0.8.0 の性能の改善の内容は [F-240](../backlog/features/F-240-v080-per
 
 ## Linux x86_64（2026-10-19、Docker コンテナ間）
 
-- コミット: `3736732d`（feat/v080-release。以降はソースの変更なし）。比較対象は main（`60999877`、`veil:main-ab`）と `nginx:alpine`
+- コミット: `34528afb`（feat/v080-release。以降はソースの変更なし）。比較対象は main（`60999877`、`veil:main-ab`）と `nginx:alpine`
 - イメージ: `veil:glibc`（`full`、io_uring、`--profile dist`）
 - 実行: `BASE=main-ab NEW=glibc bash tools/perf/suite_ab.sh`（69 構成 × 3 反復、構成ごとに順を入れ替えて交互）。
   h2c の 2 構成は 12 万要求・5 反復で測り直した（`linux_h2c_raw.tsv`）
@@ -93,7 +93,7 @@ ngtcp2 のクライアントが FINAL_SIZE_ERROR で閉じる）は h2load の�
 
 ## FreeBSD 14.3 aarch64（2026-10-19、QEMU + HVF、ネイティブ）
 
-- コミット: `3736732d`（Linux と同じソース）。VM のメモリ 8GB
+- コミット: `34528afb`（Linux と同じソース）。VM のメモリ 8GB
 - 実行: `tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10`（54KB と `-p /small.html` の 3B）、サーバ律速は
   `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3`、CPU/要求は `tools/perf/bsd/cpu_per_req.sh`
 - **全計測でエラー 0**

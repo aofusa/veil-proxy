@@ -241,7 +241,7 @@ veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirec
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
-2026-10-19（`3736732d`、`suite_ab.sh` で main と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
+2026-10-19（`34528afb`、`suite_ab.sh` で main と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
 
 - 対 nginx（同じ仕事の相手）の中央値は HTTP/1.1 **1.29×**・HTTP/2 **1.76×**・HTTP/3 **1.21×**・h2c **2.48×**、
   全 120 構成で nginx 以上（最小 1.02×）。最良の静的配信 `h2_1_ktls_0_lb_kernel_ofc_1` は HTTP/1.1 1.42×・HTTP/2 1.76×、

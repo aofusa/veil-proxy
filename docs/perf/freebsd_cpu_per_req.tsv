@@ -1,4 +1,4 @@
-# FreeBSD 14.3 aarch64、cpu_per_req.sh（3736732d）。cpu_ns_per_req はサーバのプロセスの CPU 時間 / 要求
+# FreeBSD 14.3 aarch64、cpu_per_req.sh（34528afb）。cpu_ns_per_req はサーバのプロセスの CPU 時間 / 要求
 scenario	size	server	round	rps	cpu_ns_per_req
 h1_file_tls	3B	veil	1	297402	3446
 h1_file_tls	3B	nginx	1	232723	4350
