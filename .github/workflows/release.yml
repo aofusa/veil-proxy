@@ -63,7 +63,6 @@ jobs:
     strategy:
       # 1 つの失敗で他のアーキのビルドを取り消さない（どれが通るかを 1 回で見る）
       fail-fast: false
-      fail-fast: true
       matrix:
         include:
           - { variant: musl, arch: amd64, file: docker/Dockerfile.musl }
