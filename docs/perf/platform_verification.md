@@ -1,74 +1,92 @@
-# v0.7.0 全プラットフォーム検証
+# v0.8.0 全プラットフォーム検証
 
-リリース前に、対象のすべての OS・アーキテクチャで単体・統合・E2E を回した結果（2026-10-06〜08）。
-最終コミット（`65c7a18`）で Linux（x86_64 / aarch64）・macOS・Windows を回し直している。BSD は x86_64 が
-`0ff5442`（B-102 = HTTP/2 の不正プリフェース処理まで）、aarch64 が `c881dd9`（B-102 の手前）の結果。その後の変更は
-B-102（全 OS 共通のエラー経路。上記の Linux・macOS・Windows と BSD x86_64 で確認済み）と、BSD のバイナリに
-影響しないもの（Linux 専用の seccomp 修正 B-103、テストと `#[cfg(test)]` の整理、io_uring 構造体の整理）だけ。
-Linux 以外は実機（macOS・Windows）または実カーネルの VM（`tools/qemu/`）上で、ネイティブビルドしたものを
-テストしている。
+リリース前に、対象のすべての OS・アーキテクチャで単体・統合・standalone・E2E・ライブラリの試験を回した結果
+（2026-10-18〜19）。ソースは `3736732d` 以降変わっていない（その後のコミットは文書・試験のハーネス・VM のスクリプトだけ）。
+Linux x86_64 以外は実機（macOS・Windows）または実カーネルの VM（`tools/qemu/`）上で、ネイティブビルドしたものを
+試験している。
 
-| OS | アーキ | 環境 | feature | 単体 | 統合 | E2E | コミット |
-|---|---|---|---|---|---|---|---|
-| Linux | x86_64 | ホスト（io_uring） | `full` | 995 | 54 | 555 | `65c7a18` |
-| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | 555 | `65c7a18` |
-| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 993 | 54 | 555 | `65c7a18` |
-| macOS | aarch64 | 実機（kqueue reactor） | `full` | 943 | 54 | 555 | `65c7a18` |
-| Windows | x86_64 | 実機（WSAPoll reactor） | `full` | 902 | 54 | スモーク※ | `65c7a18`（スモークは `0ff5442` の配布物） |
-| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 952 | 54 | 555 | `c881dd9` |
-| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 953 | 54 | 555 | `0ff5442` |
-| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 940 | 54 | 554（無視 1） | `c881dd9` |
-| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 941 | 54 | 554（無視 1） | `0ff5442` |
-| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 900 | 53 | 429 | `c881dd9` |
-| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 941※2 | 54 | 555 | `d837bc5`（E2E は `0ff5442`） |
+| OS | アーキ | 環境 | feature | 単体 | 統合 | standalone | E2E | ライブラリ | コミット |
+|---|---|---|---|---|---|---|---|---|---|
+| Linux | x86_64 | ホスト（io_uring） | `full` | 1085 | 60 | 23 | 569 | 230 | `5375c528` |
+| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | — | 569 | — | `5375c528` |
+| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 1083 | 60 | 23 | 569 | 230 | `5375c528` |
+| macOS | aarch64 | 実機（kqueue reactor） | `full-macos` | 1001 | 60 | 23 | 569 | 196 | `5375c528` |
+| Windows | x86_64 | 実機（WSAPoll reactor） | `full-windows` | 954 | 54 | 22 | スモーク※1 | 195 | `5375c528` |
+| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `5375c528` |
+| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `9907170f` |
+| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `5375c528` |
+| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `9907170f` |
+| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `5375c528` |
+| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `9907170f` |
 
-すべて失敗 0。件数の違いは feature とプラットフォームの `cfg` による（Windows は Unix 専用の
-テストが、NetBSD は `full-netbsd` に含まれない機能のテストが対象外）。
+すべて失敗 0。件数の違いは feature とプラットフォームの `cfg` による（Windows は Unix 専用の試験が、BSD は
+`full-*` に含まれない機能の試験が対象外）。ライブラリは `tests/api/library_e2e.sh all` の確認の数（Rust・GraphQL・
+gRPC・C・Python。OS によって載らない機能がある）。
 
-※2 NetBSD x86_64 の単体は、ビルド直後の 1 回目に `wasm::host::grpc_executor::tests::measure_pooled_vs_fresh_connection`
-（100 本の新規接続で gRPC を呼ぶ計測テスト。応答待ち 5 秒）がタイムアウトすることがあった（2 回）。同じバイナリで
-単独 5 回・全体 3 回を回し直してすべて通過したため、負荷の高い起動直後の時間依存と判断した。
+BSD の 3 OS は、それぞれの OS 固有のサンドボックス（FreeBSD の capsicum・OpenBSD の pledge/unveil・NetBSD の chroot +
+特権降格）の下での E2E（`bsd-vm.sh <os> <arch> security-e2e`）も通った。
 
-※ Windows には bash の E2E ハーネスが無いため、前段（静的配信 + プロキシ）と後段の veil を 2 つ起動して
-疎通を確認した（静的 200・プロキシ 200・後段停止時 502）。
+※1 Windows は bash の E2E ハーネスの構成が UDS のバックエンドなど Windows で使えない機能を含むため、配布物（`--profile dist`）で
+前段（静的配信 + プロキシ）と後段の veil を 2 つ起動して疎通を確かめた（下の「Windows のスモーク」）。
 
-## ビルド
+## ビルド・静的解析
 
-Linux x86_64 で `default` / `--no-default-features` / `full` / `full-container` と、各 feature 単独
-（`--no-default-features --features <f>`）をビルドし、警告ゼロ。clippy は `full` と `full,epoll` の
-`--all-targets -D warnings` で指摘ゼロ。macOS でも `full` の clippy `-D warnings` が通る。
-
-`aio` 単独は Linux では build.rs が意図的に止める（FreeBSD 専用。POSIX AIO の経路）。
-
-| ビルド | 結果 |
+| 対象 | 結果 |
 |---|---|
-| `default` / `--no-default-features` / `full` / `full-container` | 警告 0 |
-| `--no-default-features --features <f>`（ktls・http2・http3・epoll・wasm・grpc・grpc-web・grpc-full・mimalloc・jemalloc・system-allocator・alloc-stats・compression・cache・metrics・websocket・rate-limit・buffering・opentelemetry・admin・access-log・l4-proxy） | すべて警告 0 |
-| `cargo clippy --all-targets -D warnings`（`full` / `full,epoll`） | 指摘 0 |
+| Linux x86_64: `default` / `--no-default-features` / `full` / `full,epoll` / `full-container` / `full,api` / メッシュ、各 feature の単独（`--no-default-features --features <f>`）と既定 + 1 feature（`docs/artifacts/feature-check.sh`） | 92 通りすべて clippy `-D warnings` で指摘 0 |
+| macOS: `cargo clippy --no-default-features --features full-macos --all-targets -D warnings` | 指摘 0 |
+| Windows: `cargo clippy --no-default-features --features full-windows --all-targets -D warnings` | 指摘 0（v0.8.0 で初めて通した。windows-sys の定数への同じ型へのキャスト 20 件など） |
+| 各プラットフォームの試験のビルド | 警告 0 |
 | `cargo fmt --check` | 差分なし |
+| `#[allow(dead_code)]` | 追加なし（Windows の試験だけが警告を出していた unix 専用の補助関数は `cfg(unix)` にした） |
+
+Rust のツールチェーンは全プラットフォームで 1.99。Windows（1.95）と macOS（1.94）は古い clippy だけが出す指摘
+（`nonminimal_bool`・`collapsible_match`）があったので直してから更新した。
+
+## container_security（Linux x86_64、`veil:glibc`）
+
+`SKIP_LIBFUZZER=0 SKIP_CARGO_AUDIT=0 SKIP_CARGO_DENY=0 SKIP_ZAP=0 SKIP_BAD_BACKEND=0 SKIP_PUMBA=0 SKIP_RESOURCE_EXHAUSTION=0
+SKIP_SYSCALL_CHAOS=0 SKIP_DIFFERENTIAL=0 RUN_E2E_ASAN=1` で全フェーズを回し、**32 合格・失敗 0**（libFuzzer の ASAN/TSAN 版と
+カーネル能力のフェーズは既定で無効）。syscall 障害注入・ASAN の E2E カオスも検出 0。
 
 ## 検証の過程で見つけて直した不具合
 
-Linux の既定ビルドでは 1 行もコンパイルされない経路（reactor、BSD の暗号・ソケット・アロケータ、
-Windows の Winsock）で、それまでのテストをすり抜けていたもの。詳細は各チケット。
-
 | チケット | 見つかった環境 | 内容 |
 |---|---|---|
-| [B-86](../backlog/bugs/B-86-http3-tls-backend-plaintext-overflow.md) | macOS | HTTP/3 の TLS 上流で応答本文が途中で切れ、200 のまま終わる |
-| [B-87](../backlog/bugs/B-87-macos-nofile-limit-not-raised.md) | macOS | fd 上限が 256 のまま |
-| [B-88](../backlog/bugs/B-88-windows-unit-tests-and-platform-gaps.md) | Windows | 単体テストがコンパイル不能。ディレクトリ open と L4 半クローズの本番不具合 2 件 |
-| [B-89](../backlog/bugs/B-89-freebsd-jemalloc-hooks-and-static-containment.md) | FreeBSD | jemalloc が libthr のフックを上書きして SIGSEGV。静的配信の封じ込め |
-| [B-90](../backlog/bugs/B-90-tls-handshake-drops-coalesced-records.md) | FreeBSD | TLS ハンドシェイクで 4KB 超の暗号文を捨てる（長年のフレーク B-68 の正体） |
-| [B-91](../backlog/bugs/B-91-netbsd-connect-timeout-refused-ok.md) | NetBSD | 落ちた上流を healthy と判定 |
-| [B-93](../backlog/bugs/B-93-pooled-upstream-closed-while-idle.md) | Linux（E2E のフレーク） | 上流が閉じたプール接続を再利用して 502 |
-| [B-94](../backlog/bugs/B-94-http3-retransmitted-initial-new-connection.md) | FreeBSD（perf） | HTTP/3 の Initial 再送で別接続を作る |
-| [B-95](../backlog/bugs/B-95-bsd-udp-socket-buffer-enobufs.md) | FreeBSD（perf） | BSD で UDP バッファ拡大が ENOBUFS で失敗し 42KB のまま |
-| [B-98](../backlog/bugs/B-98-pulley-unoptimized-in-debug-builds.md) | FreeBSD（E2E） | デバッグビルドの Pulley が 100 倍遅く HTTP/3 + WASM の E2E がタイムアウト |
-| [B-100](../backlog/bugs/B-100-http3-malformed-request-accepted.md) | Linux（container_security の h3spec） | HTTP/3 で疑似ヘッダ違反のリクエストに 200 を返す |
-| [B-102](../backlog/bugs/B-102-h2c-invalid-preface-rst.md) | Linux（container_security の h2spec） | h2c で不正なプリフェースに GOAWAY を返さず RST |
-| [B-103](../backlog/bugs/B-103-seccomp-wrong-syscall-numbers.md) | Linux（container_security の E2E サニタイザ） | seccomp 許可リストの syscall 番号ずれ（x86_64 の prctl など） |
+| [B-154](../backlog/bugs/B-154-static-first-request-404-when-openat2-blocked.md) | Linux（container_security） | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 |
+| [B-155](../backlog/bugs/B-155-dependency-advisories-v080.md) | Linux（container_security の cargo-audit） | 依存の RUSTSEC 勧告（rustls・quinn-proto・pyo3・wasmtime） |
+| F-240（quiche の `send_body_zc`） | Linux（perf の h2load） | 本文のゼロコピーで偽の STREAM_DATA_BLOCKED を送り、ngtcp2 のクライアントが FINAL_SIZE_ERROR で閉じる（E2E の quinn は無視） |
+| B-122（追記） | Linux（standalone の並列実行） | 平文リスナーで判別に足りない断片の続きが 200ms に間に合わず RST |
+| — | Windows・macOS | clippy の指摘（上の表）・quiche の build.rs が macOS のビルドのたびに出す警告 |
+| — | 試験のハーネス | Linux aarch64 の VM へ `tools/vds` を送っていない・library の再起動の確認が同じポート（SO_REUSEPORT で前のサーバに繋がる）・シグナルの試験が他の試験のポートと衝突・container_security のハーネスが F-200 後の平文ポートを見ていない |
 
-未対応で残したもの: [B-97](../backlog/bugs/B-97-http3-wasm-blocks-main-loop.md)（HTTP/3 の WASM 実行が
-メインループを止める。Pulley ターゲットで顕在化。設計変更が必要）、
-[B-101](../backlog/bugs/B-101-tls-connection-memory-footprint.md)（同時 TLS 接続あたり約 200〜250KB。
-64MB 以下のコンテナで OOM）。
+## Windows のスモーク
+
+配布物 `veil-0.8.0-x86_64-pc-windows-msvc.zip`（`build-cross.sh --target windows`、`--profile dist`）の `veil.exe` で、
+前段（`listen_cleartext`、静的配信と `/proxy/` の中継）と後段（静的配信）を起動して確かめた。
+
+| 確認 | 結果 |
+|---|---|
+| `veil.exe --version` | `veil 0.8.0` |
+| 前段の静的配信（HTTP/1.1） | 200 |
+| 前段の静的配信（h2c prior knowledge） | 200（HTTP/2） |
+| `/proxy/` → 後段 | 200（後段の本文） |
+| 後段を止めた後の `/proxy/` | 502（接続エラーをログに出す） |
+
+## 配布物（`--profile dist`、2026-10-19）
+
+`packaging/README.md` の手順で、ビルドは直列に回した（Linux・Windows・macOS は Docker、BSD x86_64 はこのホストの QEMU + KVM、
+BSD aarch64 は Apple Silicon の QEMU + HVF。VM のメモリは 7〜8GB で、fat LTO のまま通った）。
+
+| 成果物 | 作り方 |
+|---|---|
+| `veil_0.8.0_amd64.deb`・`veil-0.8.0-1.x86_64.rpm`・`veil-0.8.0-x86_64-unknown-linux-{gnu,musl}.tar.gz` | `build.sh --docker` |
+| `veil_0.8.0_arm64.deb`・`veil-0.8.0-1.aarch64.rpm`・`veil-0.8.0-aarch64-unknown-linux-{gnu,musl}.tar.gz` | `RUST_TARGET=aarch64-unknown-linux-gnu build.sh --docker` |
+| `veil-0.8.0-universal2-apple-darwin.tar.gz` | `build-cross.sh --target macos` |
+| `veil-0.8.0-{x86_64,aarch64}-pc-windows-msvc.zip` | `build-cross.sh --target windows` |
+| `veil-0.8.0-{x86_64,aarch64}-unknown-{freebsd,openbsd,netbsd}.tar.gz` | `bsd-vm.sh <os> <arch> build`（`CARGO_PROFILE=dist`）→ `fetch` → `build-bsd.sh --all` |
+| `lib/veil-lib-0.8.0-x86_64-linux-gnu.zip`（C ライブラリ・Python wheel・Rust ソース） | `build-lib.sh --docker` |
+
+`verify-artifacts.sh rustls-0.23.46 discover_pmtu` で 15 件すべて OK（rpm の 2 件は `rpm2cpio` を別に使って同じ確認をした）。
+ライブラリの zip の `libveil.so`・`libveil.a`・wheel の拡張モジュールも同じ文字列を含む（wheel は pyo3 0.29.3）。
+

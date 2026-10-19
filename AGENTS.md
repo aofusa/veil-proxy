@@ -92,6 +92,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- HTTP/3 の応答本文は `ZcFactory`（`Bytes`）で quiche へコピーせず渡す（`send_h3_body` → `send_body_zc`）。vendoring の quiche の
+  `send_body_zc` は送る分に切ったバッファを渡す（全長を渡すと偽の STREAM_DATA_BLOCKED を送り ngtcp2 が FINAL_SIZE_ERROR で
+  切断する。E2E の HTTP/3 クライアントは quinn で素通りするので、送出を変えたら h2load でも確かめる）。quiche の
+  `set_time_hint` は受信の束・1 接続の送出の束を処理する間だけ `Some` にし、終わったら必ず `None` に戻す（v0.8.0）。
 - HTTP/3 のバッファ経路（静的配信・gRPC・Wasm・`buffering = full` 等）の要求は、メインループで await しない。
   ワーカーの `FuturesUnordered` に置いて作成直後に 1 回 poll し、応答は `ProxyStream` のチャネルで返す。
   別タスクとして spawn すると `yield_now` まで走らず応答が 1 イテレーション遅れる（3B で −12%。B-97）。
