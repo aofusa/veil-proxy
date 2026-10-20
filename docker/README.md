@@ -12,10 +12,9 @@ Dockerイメージのビルドとコンテナの実行
 | `latest`・`musl`・`musl-vX.Y.Z` | musl 版（`Dockerfile.musl`、scratch） |
 | `glibc`・`glibc-vX.Y.Z` | glibc 版（`Dockerfile.glibc`、distroless） |
 
-どちらも `/veil`（`full`、io_uring）と `/veil.epoll`（`full-container`、epoll）を持つ。`/veil` は起動の最初に io_uring を
-作れるかを確かめ、作れなければ（Docker の既定の seccomp・Kubernetes の `RuntimeDefault`）`/veil.epoll` を同じ引数で
-exec する（`src/runtime/fallback.rs`。`VEIL_FALLBACK_BIN` で切り替え先を変えられる）。io_uring で動かすには
-`--security-opt seccomp=unconfined` か io_uring を許す独自のプロファイルを使う。
+どちらも `/veil` は `full-container`（epoll の readiness reactor）の 1 本だけ。Docker の既定の seccomp・Kubernetes の
+`RuntimeDefault` は io_uring を拒否するので、そのまま動く epoll 版を公開する（v0.8.2 から。v0.8.0・v0.8.1 のイメージは
+`/veil` = `full`（io_uring）と、io_uring を作れないときに切り替える `/veil.epoll` = `full-container` の 2 本）。
 
 ```sh
 docker run --rm -p 443:443 -p 443:443/udp \
@@ -23,14 +22,17 @@ docker run --rm -p 443:443 -p 443:443/udp \
   -v "$PWD/ssl:/etc/veil/ssl:ro" ghcr.io/aofusa/veil:latest
 ```
 
-同じ構成を手元でビルドするには `CARGO_FEATURES_FALLBACK` を付ける（付けなければ `/veil` だけの従来のイメージ）。
-起動の試験は `tools/release/image-smoke.sh <image>`。
+同じものを手元でビルドして起動を試すには次のようにする。
 
 ```sh
-docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=full \
-  --build-arg CARGO_FEATURES_FALLBACK=full-container -t veil:musl .
-tools/release/image-smoke.sh veil:musl
+docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=full-container -t veil:musl .
+tools/release/image-smoke.sh veil:musl container
 ```
+
+io_uring で動かしたいときは `CARGO_FEATURES=full` に `CARGO_FEATURES_FALLBACK=full-container` を付けてビルドする
+（`/veil` = io_uring 版が起動の最初に io_uring を作れるかを確かめ、作れなければ `/veil.epoll` を同じ引数で exec する。
+`src/runtime/fallback.rs`、`VEIL_FALLBACK_BIN` で切り替え先を変えられる）。io_uring を使うには `--security-opt seccomp=unconfined`
+か io_uring を許す独自のプロファイルで起動する。試験は `tools/release/image-smoke.sh <image> auto`。
 
 
 ビルド

@@ -86,15 +86,16 @@ jobs:
           file: ${{ matrix.file }}
           # aarch64 の Dockerfile は x86_64 のビルダーでクロスビルドし、最後の段だけ arm64 にする
           platforms: linux/${{ matrix.arch }}
+          # 公開イメージは full-container（epoll の readiness reactor）の 1 本だけ。コンテナ既定の seccomp
+          # （Docker の既定・Kubernetes の RuntimeDefault）は io_uring を拒否するので、io_uring 版は入れない
           build-args: |
-            CARGO_FEATURES=full
-            CARGO_FEATURES_FALLBACK=full-container
+            CARGO_FEATURES=full-container
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.verify.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0 OR MIT
-            org.opencontainers.image.description=veil reverse proxy (${{ matrix.variant }}; /veil = io_uring, /veil.epoll = epoll fallback)
+            org.opencontainers.image.description=veil reverse proxy (${{ matrix.variant }}; full-container = epoll readiness reactor)
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
@@ -140,11 +141,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: smoke test (default seccomp → epoll, unconfined → io_uring, HTTP/1.1・2・3)
+      - name: smoke test (io_uring denied / default seccomp, HTTP/1.1・2・3)
         run: |
           digest="$(cat "digests/${{ matrix.variant }}-${{ matrix.arch }}")"
           docker pull "$IMAGE@$digest"
-          tools/release/image-smoke.sh "$IMAGE@$digest" auto
+          tools/release/image-smoke.sh "$IMAGE@$digest" container
 
   image-publish:
     name: image publish

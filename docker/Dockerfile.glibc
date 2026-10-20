@@ -26,7 +26,7 @@ FROM tool-builder AS cacher
 ARG CARGO_FEATURES=full
 # F-237: 空でなければ、この feature で 2 本目（epoll 版）もビルドして /veil.epoll に置く。io_uring 版の /veil は
 # 起動時に io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）これへ切り替える
-# （src/runtime/fallback.rs）。公開イメージは CARGO_FEATURES_FALLBACK=full-container でビルドする
+# （src/runtime/fallback.rs）。公開イメージは使わない（CARGO_FEATURES=full-container の 1 本。docker/README.md）
 ARG CARGO_FEATURES_FALLBACK=
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28
@@ -78,7 +78,7 @@ FROM tool-builder AS builder
 ARG CARGO_FEATURES=full
 # F-237: 空でなければ、この feature で 2 本目（epoll 版）もビルドして /veil.epoll に置く。io_uring 版の /veil は
 # 起動時に io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）これへ切り替える
-# （src/runtime/fallback.rs）。公開イメージは CARGO_FEATURES_FALLBACK=full-container でビルドする
+# （src/runtime/fallback.rs）。公開イメージは使わない（CARGO_FEATURES=full-container の 1 本。docker/README.md）
 ARG CARGO_FEATURES_FALLBACK=
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28

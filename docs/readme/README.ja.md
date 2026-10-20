@@ -105,8 +105,8 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
      ghcr.io/aofusa/veil:latest
    ```
 
-   イメージは io_uring 版で起動し、コンテナの seccomp が io_uring を禁じていれば（Docker の既定）同梱の epoll 版に
-   切り替わる。
+   イメージは `full-container`（epoll の readiness reactor）のビルドなので、コンテナ既定の seccomp（Docker の既定・
+   Kubernetes の `RuntimeDefault` は io_uring を禁じる）のまま動く。
 
 全設定キーをコメント付きで網羅したリファレンスは [examples/config.toml](../../examples/config.toml) です。
 

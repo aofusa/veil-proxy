@@ -539,10 +539,10 @@ veil-<version>-<target>/
 例:
 
 ```
-packaging/output/veil_0.8.1_amd64.deb
-packaging/output/veil-0.8.1-1.x86_64.rpm
-packaging/output/veil-0.8.1-x86_64-unknown-linux-gnu.tar.gz
-packaging/output/veil-0.8.1-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil_0.8.2_amd64.deb
+packaging/output/veil-0.8.2-1.x86_64.rpm
+packaging/output/veil-0.8.2-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-0.8.2-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ### ビルド処理の流れ
@@ -566,7 +566,7 @@ packaging/output/veil-0.8.1-x86_64-unknown-linux-musl.tar.gz
 
 | 公開先 | 中身 | 鍵 |
 |---|---|---|
-| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`。`linux/amd64`・`linux/arm64`。`/veil`（io_uring）と `/veil.epoll`（epoll、io_uring が使えないときに切り替える） | `GITHUB_TOKEN` |
+| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`。`linux/amd64`・`linux/arm64`。`/veil` は `full-container`（epoll の readiness reactor。コンテナ既定の seccomp で動く） | `GITHUB_TOKEN` |
 | crates.io | `veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`、vendoring の `veil-proxy-quiche`・`veil-proxy-wasmtime` | trusted publishing（OIDC） |
 | PyPI | `veil-api` の wheel（manylinux・musllinux の x86_64・aarch64、macOS の arm64・x86_64、Windows の x86_64）と sdist | trusted publishing（OIDC） |
 
@@ -613,7 +613,7 @@ CI ではできないので、最初の公開の前に 1 回だけ行う。
 ### Debian / Ubuntu
 
 ```bash
-sudo dpkg -i packaging/output/veil_0.8.1_amd64.deb
+sudo dpkg -i packaging/output/veil_0.8.2_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 ```
@@ -621,7 +621,7 @@ sudo systemctl enable --now veil
 ### Amazon Linux 2023
 
 ```bash
-sudo dnf install -y packaging/output/veil-0.8.1-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.8.2-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 

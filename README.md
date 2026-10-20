@@ -102,8 +102,8 @@ for feature flags, packaging and BSD/macOS/Windows builds.
      ghcr.io/aofusa/veil:latest
    ```
 
-   The image runs the io_uring build and switches to its bundled epoll build when the container's seccomp profile
-   forbids io_uring (Docker's default does).
+   The image is the `full-container` build (epoll readiness reactor), so it runs under the container's default
+   seccomp profile (Docker's default and Kubernetes' `RuntimeDefault` forbid io_uring).
 
 A fully commented reference of every key is in [examples/config.toml](examples/config.toml).
 
