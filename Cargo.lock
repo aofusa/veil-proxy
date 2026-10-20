@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "veil-capi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "bytes",
  "serde_json",
@@ -4319,7 +4319,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4403,14 +4403,14 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-build"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "veil-proxy-macros"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4509,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "veil-python"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "bytes",
  "itoa",

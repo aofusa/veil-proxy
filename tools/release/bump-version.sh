@@ -66,6 +66,8 @@ DOC_FILES=(
     docs/guide/vds.md docs/guide/ja/vds.md
     packaging/README.md
     .github/workflows/release-sbom.yml
+    docs/guide/library.md docs/guide/ja/library.md
+    crates/veil-tokio/README.md
 )
 python3 - "$NEW" "${DOC_FILES[@]}" <<'PY'
 import re, sys
@@ -77,6 +79,8 @@ pats = [
     (rf'(veil-){V}(-(?:x86_64|aarch64)-unknown-linux-(?:gnu|musl)\.tar\.gz)', rf'\g<1>{new}\g<2>'),
     (rf'("user_agent_version": "){V}(")', rf'\g<1>{new}\g<2>'),
     (rf'(リリースのタグ（例: v){V}(）)', rf'\g<1>{new}\g<2>'),
+    # tokio-shim を git のタグから当てる [patch.crates-io] の例（crates.io の veil-proxy と同じ版にする）
+    (rf'(github\.com/aofusa/veil-proxy", tag = "v){V}(")', rf'\g<1>{new}\g<2>'),
 ]
 for f in files:
     s = open(f).read()
