@@ -451,7 +451,7 @@
 | B-153 | P2 | 完了 | [bugs/B-153-bsd-perf-harness-bias.md](bugs/B-153-bsd-perf-harness-bias.md) | BSD の性能の計測が nginx を固定せず、上流を計測対象と共有し、いつも nginx を先に測っていた |
 | B-154 | P1 | 完了 | [bugs/B-154-static-first-request-404-when-openat2-blocked.md](bugs/B-154-static-first-request-404-when-openat2-blocked.md) | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 になる（コンテナの seccomp プロファイルに openat2 が無かった） |
 | B-155 | P1 | 完了 | [bugs/B-155-dependency-advisories-v080.md](bugs/B-155-dependency-advisories-v080.md) | 依存の RUSTSEC 勧告（rustls 0.23.45 に 4 件・quinn-proto・pyo3 0.23・wasmtime 36.0.17）。rustls 0.23.46・pyo3 0.29・wasmtime 36.0.18 へ。container_security の resource_exhaustion の集計と gitleaks の許可リスト |
-| B-156 | P1 | 完了 | [bugs/B-156-aarch64-seccomp-missing-rseq.md](bugs/B-156-aarch64-seccomp-missing-rseq.md) | aarch64 の seccomp 許可リストに rseq（293）が無く、glibc 2.35+ の glibc/arm64 のイメージ・配布物が seccomp 有効で起動直後に abort（`Fatal glibc error: rseq registration failed`）。sched_yield・getcpu・mlock2 も x86_64 と揃えた |
+| B-156 | P1 | 完了 | [bugs/B-156-aarch64-seccomp-missing-rseq.md](bugs/B-156-aarch64-seccomp-missing-rseq.md) | aarch64 の seccomp 許可リストに rseq（293）が無く、glibc 2.35+ の glibc/arm64 のイメージ・配布物が seccomp 有効で起動直後に abort（`Fatal glibc error: rseq registration failed`）。sched_yield・getcpu・mlock2 も x86_64 と揃えた。crates.io の 0.8.0 は修正前のため 0.8.1 で公開し直した |
 
 ---
 

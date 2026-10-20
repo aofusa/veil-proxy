@@ -29,3 +29,9 @@ Linux aarch64 の VM（`tools/qemu/aarch64-vm.sh`）で、同じバイナリが 
   `poll` 等）と、seccomp の前に終わる権限降格（`setuid`/`setgid`）は対象外。
 - `test_allowed_syscalls_match_libc_numbers` に `libc::SYS_*` で 4 つを足した（aarch64 のビルドで番号を固定する）。
 - Linux aarch64 glibc の配布物を作り直した。
+
+## 公開した版
+
+crates.io の 0.8.0（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）はこの修正より前の `f976c06f` から公開していた
+（crates.io は同じ版を差し替えられない）。修正を含む **0.8.1** を crates.io・PyPI（`veil-api`）・ghcr.io に公開し直した。
+PyPI の 0.8.0 とイメージの `*-v0.8.0` はタグ `v0.8.0`（修正後）から作ったので修正を含む。
