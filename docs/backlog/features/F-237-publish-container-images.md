@@ -118,6 +118,18 @@ veil のコンテナイメージをレジストリに公開する。musl 版を�
 - このホストの Docker（29.8）は既定の seccomp で io_uring を許していた。そこで試験は io_uring を拒否するプロファイルを明示する。
 - 実際の ghcr への公開・arm64 のランナーでの試験は、タグを push したときに CI で行う（`packaging/README.md` の「公開」）。
 
+## v0.8.2: 公開イメージを full-container の 1 本にした
+
+公開イメージの `/veil` を `full-container`（epoll の readiness reactor）の 1 本だけにした（`release.yml` の
+`CARGO_FEATURES=full-container`、`CARGO_FEATURES_FALLBACK` は付けない）。コンテナ既定の seccomp（Docker の既定・
+Kubernetes の `RuntimeDefault`）は io_uring を拒否するので、公開イメージの利用者のほとんどは切り替え後の epoll 版で
+動いていた。io_uring 版と切り替え（`src/runtime/fallback.rs`・`CARGO_FEATURES_FALLBACK`）は自前のビルド向けに残す。
+
+- イメージの試験は `tools/release/image-smoke.sh <image> container`: `/veil.epoll` が無いこと、io_uring を拒否する
+  seccomp と Docker の既定の seccomp の両方で切り替え無しに起動し HTTP/1.1・2・3 で応答すること（`full` の 1 本だと
+  io_uring を拒否する側で起動できないので、full-container であることの確認になる）。
+- v0.8.0・v0.8.1 のイメージ（`*-v0.8.0`・`*-v0.8.1`）は従来の 2 本の構成のまま（版のタグは上書きしない）。
+
 ## 関連
 
 F-231（版の検査）、F-227（同じ切り替え）、F-236（公開の前の監査）、F-238（同じ workflow）、`docker/`、`release-sbom.yml`。

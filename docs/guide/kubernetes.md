@@ -13,11 +13,10 @@ client Pod ──(mesh mTLS)──▶ [istio-proxy / linkerd-proxy] ─▶ veil 
 ## Image
 
 The published image `ghcr.io/aofusa/veil:latest` (musl; `:glibc` is equivalent, both for `linux/amd64` and
-`linux/arm64`) works as is: it starts the io_uring build and switches to its bundled epoll build when the Pod's
-seccomp profile (`RuntimeDefault`) forbids io_uring ([docker/README.md](../../docker/README.md)).
+`linux/arm64`) works as is: it is the `full-container` build (epoll readiness reactor), which runs under the Pod's
+seccomp profile (`RuntimeDefault` forbids io_uring) ([docker/README.md](../../docker/README.md)).
 
-To build your own, use the `full-container` feature set (epoll readiness reactor, which works under the default
-container seccomp profile). The **musl** image is the main one; the glibc image is equivalent.
+To build your own, use the same `full-container` feature set. The **musl** image is the main one; the glibc image is equivalent.
 
 ```bash
 docker build -f docker/Dockerfile.musl  --build-arg CARGO_FEATURES=full-container -t veil:musl-k8s .

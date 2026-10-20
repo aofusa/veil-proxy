@@ -12,10 +12,10 @@ client Pod ──(メッシュ mTLS)──▶ [istio-proxy / linkerd-proxy] ─�
 ## イメージ
 
 公開イメージ `ghcr.io/aofusa/veil:latest`（musl 版。`:glibc` も同等。どちらも `linux/amd64`・`linux/arm64`）はそのまま使える。
-io_uring 版で起動し、Pod の seccomp（`RuntimeDefault`）が io_uring を禁じていれば同梱の epoll 版に切り替わる
+`full-container`（epoll の readiness リアクタ）のビルドなので、Pod の seccomp（`RuntimeDefault` は io_uring を禁じる）のまま動く
 （[docker/README.md](../../../docker/README.md)）。
 
-自分でビルドするときは `full-container`（epoll の readiness リアクタ。コンテナ既定の seccomp プロファイルで動く）でビルドする。
+自分でビルドするときも同じ `full-container` でビルドする。
 **musl 版をメイン**にし、glibc 版も同等に使える。
 
 ```bash

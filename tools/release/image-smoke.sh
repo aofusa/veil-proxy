@@ -4,6 +4,8 @@
 #   tools/release/image-smoke.sh <image> [expect]
 #
 # expect（既定 auto）:
+#   container … 公開イメージ（full-container の /veil の 1 本、/veil.epoll は無い）。io_uring を拒否する seccomp と
+#               Docker の既定の seccomp で起動し、そのまま動くこと（io_uring 版への依存も切り替えも無いこと）を確かめる
 #   epoll  … io_uring を拒否する seccomp で起動し、io_uring 版から epoll 版へ切り替わることを確かめる
 #            （Docker の既定の seccomp が io_uring を許すホスト・版もあるので、拒否するプロファイルを明示する）
 #   uring  … seccomp を外して起動し、io_uring のまま動くことを確かめる
@@ -14,7 +16,7 @@
 # snap の docker は /tmp と $HOME の隠しディレクトリを読めないので、作業ディレクトリは $HOME/veil-image-smoke に作る（SMOKE_DIR で変更可）。
 set -euo pipefail
 
-IMAGE="${1:?usage: $0 <image> [epoll|uring|auto]}"
+IMAGE="${1:?usage: $0 <image> [container|epoll|uring|auto]}"
 EXPECT="${2:-auto}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 H3_CURL_IMAGE="${H3_CURL_IMAGE:-alpine/curl-http3:latest}"
@@ -104,7 +106,9 @@ run_case() { # run_case <label> <docker run の追加引数...>
         sleep 0.2
     done
     local logs; logs="$(docker logs "$NAME" 2>&1 || true)"
-    if [ "$label" = epoll ]; then
+    if [ "${label%%-*}" = container ]; then
+        if grep -q "Switching to the epoll build" <<<"$logs"; then bad "$label: exec'd a fallback (expected a single epoll build)"; else ok "$label: no fallback exec"; fi
+    elif [ "$label" = epoll ]; then
         if grep -q "Switching to the epoll build" <<<"$logs"; then ok "$label: switched to /veil.epoll"; else bad "$label: no switch to the epoll build"; annotate_logs "$logs"; fi
     else
         if grep -q "Switching to the epoll build" <<<"$logs"; then bad "$label: switched although io_uring should be allowed"; else ok "$label: stayed on io_uring"; fi
@@ -121,9 +125,16 @@ run_case() { # run_case <label> <docker run の追加引数...>
 
 out="$(docker run --rm --security-opt seccomp=unconfined --entrypoint /veil "$IMAGE" --version 2>&1 || true)"
 if grep -q "$VERSION" <<<"$out"; then ok "--version is $VERSION"; else bad "--version: '$out' (want $VERSION)"; fi
-if docker run --rm --entrypoint /veil.epoll "$IMAGE" --version >/dev/null 2>&1; then ok "/veil.epoll exists"; else bad "/veil.epoll missing"; fi
+if [ "$EXPECT" = container ]; then
+    if docker run --rm --entrypoint /veil.epoll "$IMAGE" --version >/dev/null 2>&1; then bad "/veil.epoll exists (expected a single full-container build)"; else ok "no /veil.epoll"; fi
+elif docker run --rm --entrypoint /veil.epoll "$IMAGE" --version >/dev/null 2>&1; then ok "/veil.epoll exists"; else bad "/veil.epoll missing"; fi
 
 case "$EXPECT" in
+    container)
+        # io_uring を拒否しても（io_uring 版なら起動できない）、Docker の既定の seccomp でも動くこと
+        run_case container-no-uring --security-opt "seccomp=$WORK/no-uring.json"
+        run_case container-default
+        ;;
     epoll) run_case epoll --security-opt "seccomp=$WORK/no-uring.json" ;;
     uring) run_case uring --security-opt seccomp=unconfined ;;
     auto)
