@@ -475,8 +475,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # the shim is not on crates.io (its package name is `tokio`), so it comes from the repository. Take veil from the
 # same tag so that the shim and your code use one copy of veil (two copies would mean two runtimes).
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3" }
 ```
 
 Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.
