@@ -6,6 +6,9 @@
 # 使い方（BSD ゲスト内・root。run_perf_bsd.sh を一度実行して ${WORK} がある状態）:
 #   sh tools/perf/bsd/profile_cpu.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file|l4_tcp|h2c_file_plain> [path]
 # 出力: ユーザー空間の関数別サンプル数（上位）とカーネル関数別サンプル数（上位）
+#
+# FreeBSD だけ: STACK_FUNC=<libc の関数名>（例 memcpy・malloc）を付けると、その関数の呼び出しを
+# 呼び出し元のスタック（STACK_DEPTH、既定 8 段）ごとのサンプル数を出す（先頭のフレームがその関数のサンプル）。
 # =============================================================================
 set -eu
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
@@ -43,6 +46,17 @@ sleep 2
 rm -f "${WORK}/prof.txt"  # dtrace -o は追記するので毎回消す
 case "$bsd_os" in
   freebsd)
+    if [ -n "${STACK_FUNC:-}" ]; then
+      # pid プロバイダ（fasttrap）は FreeBSD arm64 に無いので、プロファイルのサンプルをスタックごとに数え、
+      # 先頭のフレームが STACK_FUNC のものだけを残す（サンプル数 = その関数で使った時間の割合）。
+      dtrace -q -x aggsize=64m -x bufsize=16m -x ustackframes="${STACK_DEPTH:-8}" -n "profile-997 /execname == \"veil\" && arg1/ { @[ustack()] = count(); } tick-$((DUR - 4))s { exit(0); }" \
+        -o "${WORK}/prof.txt"
+      pkill -x veil || true
+      echo "== sampled stacks whose top frame is ${STACK_FUNC} ($SCEN)"
+      awk -v f="$STACK_FUNC" 'BEGIN { RS = ""; } { n = split($0, l, "\n"); if (l[1] ~ ("`" f "(\\+|$)")) { gsub(/\n[ \t]+/, " <- "); print } }' \
+        "${WORK}/prof.txt" | sort -t' ' -k1 | awk '{ print $NF "\t" $0 }' | sort -n -r | cut -f2- | head -25
+      exit 0
+    fi
     dtrace -q -x ustackframes=1 -n "profile-1999 /execname == \"veil\" && arg1/ { @[ufunc(arg1)] = count(); } profile-1999 /execname == \"veil\" && arg0/ { @k[func(arg0)] = count(); } tick-$((DUR - 4))s { exit(0); }" \
       -o "${WORK}/prof.txt"
     pkill -x veil || true
