@@ -152,6 +152,10 @@ http2_enabled = true
 [logging]
 level = "info"
 
+[access_log]
+enabled = true         # 要求ごとに 1 行を標準出力に出す（プロキシのバイナリの既定は false）
+format = "text"
+
 [security]
 enable_seccomp = false # ホスト言語やユーザコードを制限しない
 enable_landlock = false
@@ -171,6 +175,18 @@ openapi_version = "0.1.0"
 コンテナ内やロードバランサの背後などで外部に公開するときはアドレスを明示します（`config.toml` の `listen_cleartext = "0.0.0.0:8080"`、
 Rust の `.listen_cleartext("0.0.0.0:8080")`、C の `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")`、
 Python の `veil.run(listen_cleartext="0.0.0.0:8080")`、または `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`）。
+
+### アクセスログ
+
+ライブラリモードでは、既定で要求ごとに 1 行のアクセスログを **標準出力** に `text` 形式で出します
+（`timestamp=… type=access method=… path=… status=… duration_ms=…`。アプリケーションのログと同じ出力先です）。
+行は専用のスレッドが書き、`flush_interval_ms`（既定 1000 ミリ秒）ごとにフラッシュするので、応答から最大 1 秒遅れて出ます。
+
+- 止める: `config.toml` の `[access_log] enabled = false`、ビルダの `.set("access_log.enabled = false")?`、
+  `VEIL_OVERRIDE_1='access_log.enabled = false'`（Python の `veil.run(...)` と C も `VEIL_OVERRIDE_<n>` を読みます）。
+- JSON やファイルへ: `format = "json"`、`file_path = "/var/log/app/access.log"`、`fields = [...]`。キーはプロキシの
+  [`[access_log]`](observability.md) と同じです。
+- 要求ごとに処理が増えます。ログを出さないサーバと性能を比べるときは止めてください。
 
 ### 設定の合成と優先順位
 

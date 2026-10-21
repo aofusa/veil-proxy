@@ -1,24 +1,31 @@
-# veil API ライブラリの既定設定（F-188）。
+# Default configuration of the veil API library.
 #
-# config.toml が無くてもこの設定で起動する。config.toml があればこの上に深くマージされ、
-# さらに Rust コード（`Config::builder()`）・環境変数 `VEIL_OVERRIDE_<n>` で上書きできる。
-# 既定は「TLS 無し・平文 HTTP/1.1 + h2c（prior knowledge）を 127.0.0.1:8080 で受ける」
-# （`[server].listen_cleartext`。TLS を使うときは `[server].listen` と `[tls]` を足す）。
-# スレッド数（server.threads）は CPU 数（実行時に入れる）。
+# The server starts with this configuration when there is no config.toml. A config.toml is deep-merged over it,
+# and Rust code (`Config::builder()`) and `VEIL_OVERRIDE_<n>` environment variables override both.
+# By default there is no TLS: plaintext HTTP/1.1 and h2c (prior knowledge) on 127.0.0.1:8080
+# (`[server].listen_cleartext`; add `[server].listen` and `[tls]` for TLS).
+# The thread count (server.threads) is set to the number of CPUs at startup.
 
 [server]
-# 平文のリスナー（HTTP/1.1 + h2c）。TLS のリスナー（listen）は既定では無い（F-200）。
-# 既定はループバックだけで受け、外部に公開しない。公開するときは "0.0.0.0:8080" 等を明示する。
+# Plaintext listener (HTTP/1.1 + h2c). There is no TLS listener (listen) by default.
+# Loopback only, so the server is not reachable from other hosts; set "0.0.0.0:8080" or similar to expose it.
 listen_cleartext = "127.0.0.1:8080"
-# TLS のリスナーが無いので https へのリダイレクトはしない（平文で配信する）。
+# No TLS listener, so do not redirect to https (serve plaintext).
 enable_secure_redirect = false
 http2_enabled = true
 
 [logging]
 level = "info"
 
+# Access log: written to standard output as text (the proxy binary's default is off).
+# Turn it off with `[access_log] enabled = false` in config.toml, `VEIL_OVERRIDE_<n>="access_log.enabled=false"`
+# or `Config::builder().set("access_log.enabled=false")`. Lines are flushed every flush_interval_ms (default 1000).
+[access_log]
+enabled = true
+format = "text"
+
 [security]
-# ホスト言語（Python・C）やユーザコードの syscall・ファイルアクセスを制限しないよう既定では無効。
+# Off by default so that the host language (Python, C) and your code are not restricted.
 enable_seccomp = false
 enable_landlock = false
 

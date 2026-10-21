@@ -373,6 +373,32 @@ mod tests {
         assert!(v.get("tls").is_none());
     }
 
+    // F-244: ライブラリの既定はアクセスログを標準出力に text で出す。ファイル・ビルダで止められる。
+    #[test]
+    fn access_log_is_on_by_default_and_can_be_turned_off() {
+        let v = Config::new().to_value().unwrap();
+        assert_eq!(v["access_log"]["enabled"].as_bool(), Some(true));
+        assert_eq!(v["access_log"]["format"].as_str(), Some("text"));
+        assert!(v["access_log"].get("file_path").is_none());
+
+        let v = Config::from_toml_str("[access_log]\nenabled = false\n")
+            .unwrap()
+            .to_value()
+            .unwrap();
+        assert_eq!(v["access_log"]["enabled"].as_bool(), Some(false));
+        // ファイルで書かなかったキーは既定が残る
+        assert_eq!(v["access_log"]["format"].as_str(), Some("text"));
+
+        let v = Config::new()
+            .builder()
+            .set("access_log.enabled = false")
+            .unwrap()
+            .build()
+            .to_value()
+            .unwrap();
+        assert_eq!(v["access_log"]["enabled"].as_bool(), Some(false));
+    }
+
     #[test]
     fn inline_merges_over_defaults_and_builder_wins() {
         let cfg = Config::from_toml_str(

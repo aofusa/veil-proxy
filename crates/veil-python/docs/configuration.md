@@ -18,6 +18,13 @@ The environment variables `VEIL_OVERRIDE_<n>` work as usual, e.g.
 `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`. The precedence is default, file, environment,
 inline arguments. The keys are those of veil's `config.toml` (`examples/config.toml` in the repository).
 
+## Access log
+
+Every request is logged to standard output by default, one `text` line per request
+(`timestamp=… type=access method=… path=… status=… duration_ms=…`). Lines are flushed every
+`access_log.flush_interval_ms` (default 1000 ms). Turn it off with `overrides={"access_log.enabled": False}`
+(or `VEIL_OVERRIDE_1='access_log.enabled = false'`); switch to JSON with `{"access_log.format": "json"}`.
+
 `veil.Config` (`from_file`, `set`, `listen_cleartext`, `listen`, `tls`, `threads`, `to_toml`) can also be built
 directly; it lives in the native extension, see {py:class}`veil._veil.Config`.
 

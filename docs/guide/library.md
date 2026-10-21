@@ -156,6 +156,10 @@ http2_enabled = true
 [logging]
 level = "info"
 
+[access_log]
+enabled = true         # one line per request on standard output (the proxy binary's default is false)
+format = "text"
+
 [security]
 enable_seccomp = false # do not restrict the host language / your code
 enable_landlock = false
@@ -177,6 +181,20 @@ is not reachable from other hosts. To expose it (for example inside a container 
 address explicitly: `listen_cleartext = "0.0.0.0:8080"` in `config.toml`, `.listen_cleartext("0.0.0.0:8080")` in
 Rust, `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")` in C, `veil.run(listen_cleartext="0.0.0.0:8080")` in
 Python, or `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`.
+
+### Access log
+
+In library mode every request is logged to **standard output** by default, as one `text` line
+(`timestamp=… type=access method=… path=… status=… duration_ms=…`), next to the application log. Lines are
+written by a background thread and flushed every `flush_interval_ms` (default 1000 ms), so they can appear up to
+one second after the response.
+
+- Turn it off: `[access_log] enabled = false` in `config.toml`, `.set("access_log.enabled = false")?` on the
+  builder, `VEIL_OVERRIDE_1='access_log.enabled = false'`, or the same override from Python
+  (`veil.run(...)` reads `VEIL_OVERRIDE_<n>`) and C.
+- JSON or a file: `format = "json"`, `file_path = "/var/log/app/access.log"`, `fields = [...]` — the keys are the
+  proxy's [`[access_log]`](observability.md) keys.
+- Logging costs some throughput per request; turn it off when you benchmark against servers that do not log.
 
 ### Sources and precedence
 

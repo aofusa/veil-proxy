@@ -210,6 +210,9 @@ def load(path, duration, conns, proto):
 def run_one(name, spec, endpoint, duration, conns, warmup, proto="h1"):
     cmd, env, cwd = spec
     e = dict(os.environ, **env)
+    # F-244: ライブラリの既定はアクセスログを出す。比較相手（axum・FastAPI）はログを出さないので、veil 側も止めて
+    # 0.8.2 以前と同じ条件で測る（VEIL_OVERRIDE は veil 以外のサーバには影響しない）。
+    e.setdefault("VEIL_OVERRIDE_90", "access_log.enabled=false")
     if proto == "h3":
         e.update(BENCH_TLS_CERT=TLS[0], BENCH_TLS_KEY=TLS[1])
     p = subprocess.Popen(["taskset", "-c", SERVER_CPUS] + cmd, env=e, cwd=cwd,
