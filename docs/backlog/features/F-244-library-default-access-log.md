@@ -1,6 +1,6 @@
 # F-244: ライブラリとして使うとき、既定でアクセスログを標準出力に出す
 
-**状態: 設計（feat/v083-release、2026-10-21。v0.8.3 で公開）**
+**状態: 完了（feat/v083-release、2026-10-21。v0.8.3 で公開）**
 
 ## 目的
 
@@ -89,6 +89,13 @@ API ライブラリ（Rust の `handler` feature・Python の `veil-api`・C の
 - 上の 3 つの方法のどれでも止められる。
 - プロキシのバイナリは、設定を書かなければ今と同じでアクセスログを出さない。
 - API のベンチで、`enabled = false` の条件の値が 0.8.2 と同等（交互 A/B で ±2% 以内）。
+
+## 実装の結果
+
+- 既定の設定に `[access_log] enabled = true`・`format = "text"`。単体試験 1 件。
+- `library_e2e.sh rust` で、既定で `type=access ... path=/hello` が標準出力に出ること、`VEIL_OVERRIDE` で止まることを確かめた
+  （C・Python は e2e に確認を足し、全プラットフォームの試験で回す）。
+- API ベンチは `VEIL_OVERRIDE_90="access_log.enabled=false"` を既定にした。
 
 ## 関連
 

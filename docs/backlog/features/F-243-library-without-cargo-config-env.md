@@ -180,6 +180,25 @@
 - `veil-proxy-quiche 0.24.9-veil.2` を展開したものから、`[env]` 無しでビルドできる。
 - 0.8.3 の公開の後、crates.io から入れた新しいプロジェクトで同じことを確かめる（F-245）。
 
+## 実装の結果
+
+- `third_party/quiche/src/veil_ffi.rs`: `veil_ffi!` と `Conv`。86 個の宣言のうち型を合わせる必要があったのは次のとおり。
+  - ポインタの cast
+  - コールバック（`Option<fn>`）
+  - `crypto::Level` ↔ `c_uint`
+  - `ssl_early_data_reason_t`
+  - `ERR_error_string_n` の戻り値（aws-lc はポインタ、quiche は void）
+  - `SSL_get_ex_new_index` の `*const c_void` の引数（aws-lc は `Option<fn>`）
+  - `sk_num`・`sk_value` → `OPENSSL_sk_*`
+- 段階 0 で分かったこと: aws-lc-sys 0.46 が接頭辞を付けるのは libcrypto だけで、libssl の `SSL_*` はどちらでも接頭辞無し。
+  `[env]` 無しで以前失敗していたのは quiche の libcrypto の呼び出し（`EVP_*`・`HKDF_*`・`CRYPTO_*`）である。
+- veil のリポジトリのビルド（`[env]` あり）は今までどおり接頭辞無しの名前にリンクする（`nm`）。警告は 0（clippy `full`・`full,epoll` も）。
+- `tests/api/library_e2e.sh external`: 外のプロジェクトで `[env]` 無し・有りの両方が ALL OK。
+  - 接頭辞の付き方が期待どおり。
+  - `boring` が無く、aws-lc-sys は 1 つ。
+  - HTTP/1.1・HTTP/2（TLS）・HTTP/3 で 200。
+- 機械語の比較の代わりに、性能の A/B（v0.8.3 のデグレ確認の perf、Linux x86_64 の HTTP/3 を含む）で確かめる。
+
 ## 関連
 
 - [F-238](F-238-publish-crates-and-pypi.md)（今の build.rs の検査を入れた）

@@ -1,6 +1,6 @@
 # F-241: docs.rs・PyPI の文書と Python の docstring を英語だけにし、チケット番号と経緯を出さない
 
-**状態: 設計（feat/v083-release、2026-10-21。2026-10-21 に PyPI・Python の docstring を範囲に追加。v0.8.3 で公開）**
+**状態: 完了（feat/v083-release、2026-10-21。v0.8.3 で公開）**
 
 ## 目的
 
@@ -150,6 +150,16 @@
 
 - `docs/guide/`（英日の両方がある）と、GitHub だけで読む README。
 - C の API（`crates/veil-capi/README.md`）。配布は zip で、パッケージのページが無い。
+
+## 実装の結果
+
+- 翻訳: `src/api`（約 840 行）・`src/tokio`（約 450 行）・`src/veil_alloc`・`src/lib.rs`/`entry.rs` の公開項目・`crates/veil-macros`・
+  `crates/veil-build`（生成するコードの doc を含む）。番号は `//` へ移した。
+- 目次から辿れる隠しモジュールの項目も出る（`api::grpc` が再公開する `Code`・`Compression` は `src/grpc/` の doc）。
+  `api::config::DEFAULT_CONFIG_TOML` は値が出るので、`src/api/default_config.toml` のコメントも英語にした。
+- 旧い doc の誤りを直した: `veil::tokio::time` の `pause`・`advance` は実装済み（未対応と書いていた）。
+- Python: PyPI の README を英語で書き直し、docstring 12 個・PyO3 の doc を英語に。
+- `tools/release/check-docs.sh` は rustdoc の 507 ファイルと Python のソースで 0 件（CI の docs のジョブ・wheel の試験で回す）。
 
 ## 関連
 
