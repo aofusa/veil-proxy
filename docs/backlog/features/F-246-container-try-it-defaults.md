@@ -86,6 +86,16 @@
 
 `--version` の不一致は、版を 0.8.3 に上げる前のソースでビルドしたため（rc の workflow で改めて確かめる）。
 
+### 公開の後に分かったこと（v0.8.3）
+
+- ghcr.io のページは、最後に push された版の index の注釈を説明に出していた。
+- 公開の最後に push されるのは cosign の署名（`sha256-<digest>` のタグの index）なので、index とラベルに説明を付けても出なかった。
+  「Install」も署名のタグを指している。v0.8.2 以前と同じ。
+- `tools/release/ghcr-page.sh` で、署名の index に同じ注釈を付けて push し直すようにした。
+  - 手元の registry と cosign v3 で確かめたこと: 注釈を足した後も `cosign verify` が通る。
+  - `publish-images.sh` の最後と `.github/workflows/ghcr-page.yml`（main への push）で回す。
+  - musl の署名を最後にする。
+
 ## 関連
 
 - [F-237](F-237-publish-container-images.md)（公開イメージ）

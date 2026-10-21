@@ -61,3 +61,8 @@ for variant in musl glibc; do
         done
     fi
 done
+
+# ページの説明: 最後に push された署名の index にも同じ注釈を付ける（tools/release/ghcr-page.sh）
+if command -v cosign >/dev/null; then
+    "$ROOT/tools/release/ghcr-page.sh" "$IMAGE" "$TAG"
+fi
