@@ -1,6 +1,6 @@
 # F-246: 公開イメージを `docker run` だけで試せるようにし、コンテナの使い方の文書を足す
 
-**状態: 実装中（feat/v083-release、2026-10-21。v0.8.3 で公開）**
+**状態: 完了（feat/v083-release、2026-10-21。v0.8.3 で公開）**
 
 ## 目的
 
@@ -71,6 +71,20 @@
   - Docker の既定の seccomp と、io_uring を拒否する seccomp の両方で確かめる。
 - release.yml のイメージの試験（rc のタグ）で回す。
 - 公開の後、ghcr.io から pull し、`docker run` だけで `/` が返ることと、パッケージのページに説明が出ることを確かめる（F-245）。
+
+## 実装の結果
+
+手元で `docker/Dockerfile.musl`（`CARGO_FEATURES=full-container`）をビルドし、`image-smoke.sh` を回した。
+
+- `defaults`: Docker の既定の seccomp と、io_uring を拒否する seccomp の両方で、次の 5 つがすべて ok。
+  - `GET /` が内蔵の `index.html` を返す
+  - `GET /quickstart.html`
+  - h2c
+  - 無いファイルは 404
+  - アクセスログが標準出力に出る
+- `container`（試験用の設定を渡す）: HTTP/1.1・2・3 が ok。
+
+`--version` の不一致は、版を 0.8.3 に上げる前のソースでビルドしたため（rc の workflow で改めて確かめる）。
 
 ## 関連
 
