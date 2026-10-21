@@ -9,6 +9,8 @@
 !src/
 # コンテナ同梱の設定は docker/assets/conf.d/config.toml を使用する（ルートの config.toml は含めない）
 !docker/assets
+# 公開イメージの既定の設定とページ（F-246）
+!packaging/container/
 # fuzz ワークスペースメンバ（[workspace] members = [".", "fuzz"]）の解決に必要。
 # 本体はコンテナではビルドしないが、マニフェストとターゲットが無いと cargo が
 # ワークスペース解決に失敗する。

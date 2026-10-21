@@ -16,17 +16,27 @@ Dockerイメージのビルドとコンテナの実行
 `RuntimeDefault` は io_uring を拒否するので、そのまま動く epoll 版を公開する（v0.8.2 から。v0.8.0・v0.8.1 のイメージは
 `/veil` = `full`（io_uring）と、io_uring を作れないときに切り替える `/veil.epoll` = `full-container` の 2 本）。
 
+何もマウントしなければ、内蔵の設定（`packaging/container/config.toml`）で `/var/www` の内蔵のページ
+（`packaging/container/www/`。`/` と `/quickstart.html`）を 8080 番（平文の HTTP/1.1・h2c）で配り、アクセスログを標準出力に出す
+（v0.8.3 から。F-246）。使い方は [docs/guide/container.md](../docs/guide/container.md)（[日本語](../docs/guide/ja/container.md)）。
+ghcr.io のページの説明は `packaging/container/description.txt`（index の注釈。512 文字まで）。
+
 ```sh
+docker run --rm -p 8080:8080 ghcr.io/aofusa/veil          # http://localhost:8080/
 docker run --rm -p 443:443 -p 443:443/udp \
   -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
   -v "$PWD/ssl:/etc/veil/ssl:ro" ghcr.io/aofusa/veil:latest
 ```
 
+`docker/assets/conf.d/config.toml`（TLS の 443 と https への 301 の 80）は試験用（`tools/container_security/` が `-v` で渡す）で、
+イメージには入れない。
+
 同じものを手元でビルドして起動を試すには次のようにする。
 
 ```sh
 docker build -f docker/Dockerfile.musl --build-arg CARGO_FEATURES=full-container -t veil:musl .
-tools/release/image-smoke.sh veil:musl container
+tools/release/image-smoke.sh veil:musl container   # 試験用の設定を渡して HTTP/1.1・2・3
+tools/release/image-smoke.sh veil:musl defaults    # 何も渡さずに内蔵のページ
 ```
 
 io_uring で動かしたいときは `CARGO_FEATURES=full` に `CARGO_FEATURES_FALLBACK=full-container` を付けてビルドする

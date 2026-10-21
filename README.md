@@ -93,7 +93,14 @@ for feature flags, packaging and BSD/macOS/Windows builds.
    curl -k https://localhost/static/index.html
    ```
 
-   Or run the container image (`latest` = musl; `glibc` is also published, for `linux/amd64` and `linux/arm64`):
+   Or run the container image (`latest` = musl; `glibc` is also published, for `linux/amd64` and `linux/arm64`).
+   With nothing mounted it serves a built-in page on port 8080:
+
+   ```bash
+   docker run --rm -p 8080:8080 ghcr.io/aofusa/veil      # open http://localhost:8080/
+   ```
+
+   With your own configuration, certificate and files ([Container guide](docs/guide/container.md)):
 
    ```bash
    docker run --rm -p 443:443 -p 443:443/udp \

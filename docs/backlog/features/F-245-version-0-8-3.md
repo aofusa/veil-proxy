@@ -4,7 +4,7 @@
 
 ## 目的
 
-F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI・ghcr.io に公開する。
+F-241〜F-244・F-246 を 1 つのリリース（v0.8.3）として、crates.io・PyPI・ghcr.io に公開する。
 
 | チケット | 内容 | 利用者から見える変更 |
 |---|---|---|
@@ -12,6 +12,7 @@ F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI�
 | [F-242](F-242-english-only-log-messages.md) | ログ・エラー・panic の文を英語だけにし、チケット番号を出さない | ログの文（キーと形式は不変） |
 | [F-243](F-243-library-without-cargo-config-env.md) | `.cargo/config.toml` の `[env]` 無しで Linux の `http3` を使える（quiche の FFI を aws-lc-sys の Rust のバインディング経由にし、接頭辞の有無を問わない） | 依存の書き方が `Cargo.toml` だけで済む |
 | [F-244](F-244-library-default-access-log.md) | ライブラリの既定でアクセスログを stdout に出す | ライブラリの既定の設定 |
+| [F-246](F-246-container-try-it-defaults.md) | 公開イメージを `docker run` だけで試せるようにし、コンテナの文書を足す（2026-10-21 に追加） | イメージの既定の設定・ページ、ghcr.io の説明 |
 
 ## 版
 
@@ -49,7 +50,7 @@ F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI�
 
 ## 受け入れ条件
 
-- F-241〜F-244 の受け入れ条件をすべて満たす。
+- F-241〜F-244・F-246 の受け入れ条件をすべて満たす。
 - `v0.8.3-rc.1` と `v0.8.3` の release workflow が成功する。
 - 上の「公開の後の確認」がすべて通る。
 

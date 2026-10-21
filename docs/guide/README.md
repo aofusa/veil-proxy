@@ -10,6 +10,7 @@ User guides split out of the top-level README. Each page keeps the original sect
 | Platforms & runtime backends | [platforms.md](platforms.md) |
 | Building & packaging | [building.md](building.md) |
 | Running, validation, reload & shutdown | [running.md](running.md) |
+| Container image (try it, your own config and files) | [container.md](container.md) |
 | Configuration reference | [configuration.md](configuration.md) |
 | TLS, kTLS & certificate reload | [tls.md](tls.md) |
 | Routing, redirects & headers | [routing.md](routing.md) |
