@@ -91,7 +91,7 @@ mod conv {
         #[inline(always)]
         fn conv(self) -> Option<G> {
             const {
-                assert!(std::mem::size_of::<Option<F>>() == std::mem::size_of::<Option<G>>());
+                assert!(size_of::<Option<F>>() == size_of::<Option<G>>());
             }
             // SAFETY: どちらも関数ポインタの Option で、大きさは上で確かめた。呼び出し規約と引数の並びは
             // BoringSSL / aws-lc の同じ C の宣言に従う（quiche の宣言と aws-lc-sys の bindgen の出力）。
@@ -111,7 +111,7 @@ mod conv {
         #[inline(always)]
         fn conv(self) -> Option<G> {
             const {
-                assert!(std::mem::size_of::<Option<G>>() == std::mem::size_of::<*const std::os::raw::c_void>());
+                assert!(size_of::<Option<G>>() == size_of::<*const std::os::raw::c_void>());
             }
             // SAFETY: 関数ポインタの Option はポインタと同じ大きさで、null は None になる。
             unsafe { std::mem::transmute_copy(&self) }
@@ -155,13 +155,13 @@ pub(crate) mod sys {
 
     /// BoringSSL の `sk_num`（aws-lc のバインディングは `OPENSSL_sk_num`）。
     #[inline(always)]
-    pub(crate) unsafe fn sk_num(sk: *const aws_lc_sys::OPENSSL_STACK) -> usize {
-        aws_lc_sys::OPENSSL_sk_num(sk)
+    pub(crate) unsafe fn sk_num(sk: *const OPENSSL_STACK) -> usize {
+        OPENSSL_sk_num(sk)
     }
 
     /// BoringSSL の `sk_value`（aws-lc のバインディングは `OPENSSL_sk_value`）。
     #[inline(always)]
-    pub(crate) unsafe fn sk_value(sk: *const aws_lc_sys::OPENSSL_STACK, i: usize) -> *mut std::os::raw::c_void {
-        aws_lc_sys::OPENSSL_sk_value(sk, i)
+    pub(crate) unsafe fn sk_value(sk: *const OPENSSL_STACK, i: usize) -> *mut std::os::raw::c_void {
+        OPENSSL_sk_value(sk, i)
     }
 }
