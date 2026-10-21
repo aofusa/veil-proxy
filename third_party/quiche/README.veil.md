@@ -84,6 +84,30 @@ veil は 1 回の受信の束・1 接続ぶんの送出の束で 1 回だけ時�
 「reserved bits in Handshake/Short are non-zero」で検出）。認証後にだけ判定するので、
 偽造パケットで接続を切らせることはできない。`grep -n 'veil: RFC 9000' src/lib.rs`。
 
+### 5. aws-lc-sys の Rust のバインディング経由の FFI（`aws-lc-sys` feature、F-243、0.24.9-veil.2）
+
+upstream は BoringSSL の関数を `extern "C" { .. }` で宣言し、その名前のシンボルをリンク時に要求する。veil は Linux で
+rustls と同じ aws-lc-sys を使うので、以前は aws-lc-sys を接頭辞無し（`AWS_LC_SYS_NO_PREFIX=1`）でビルドして名前を合わせていた。
+この値は環境変数でしか渡せず、veil を依存にする利用者にも `.cargo/config.toml` の `[env]` を要求していた。
+
+- `Cargo.toml`: feature `aws-lc-sys = ["dep:aws-lc-sys"]` と、optional の依存 `aws-lc-sys`（`>=0.45, <0.48`、`ssl`・`bindgen`。
+  veil 本体と同じ。`links` があるので必ず 1 つの版になる）。
+- `src/veil_ffi.rs`（新規）: マクロ `veil_ffi!`。feature が無ければ今までと同じ `extern "C"` を出す。feature があれば、各宣言を
+  同じ名前・同じシグネチャの `#[inline(always)] unsafe fn` にし、`aws_lc_sys::<名前>` を呼ぶ。aws-lc-sys の bindgen は
+  名前から接頭辞を外して `#[link_name = "aws_lc_<版>_<名前>"]` を付ける（接頭辞無しのビルドでは付けない）ので、
+  接頭辞の有無を aws-lc-sys が吸収する。型の違いは `Conv` で埋める:
+  - 不透明な型のポインタ: `cast`
+  - コールバック（`Option<extern "C" fn>`）と `*const c_void` で宣言した `SSL_get_ex_new_index` の引数: 大きさを確かめて `transmute_copy`
+  - `crypto::Level` ↔ `c_uint`、`ssl_early_data_reason_t` ← `c_uint`（後者は `src/tls/boringssl.rs` の型の隣）
+  - `ERR_error_string_n` の戻り値（aws-lc はポインタを返す）は捨てる
+  - 名前が違う `sk_num`・`sk_value` は `OPENSSL_sk_num`・`OPENSSL_sk_value` を呼ぶ（`veil_ffi::sys`）
+- `src/lib.rs`: `#[macro_use] mod veil_ffi;`。
+- `src/tls/mod.rs`・`src/tls/boringssl.rs`・`src/crypto/mod.rs`・`src/crypto/boringssl.rs`・`src/rand.rs`: `extern "C" {` を
+  `veil_ffi! {` にしただけ（中の宣言は upstream のまま）。
+
+quiche を上げるときは、この 5 つの宣言の塊を upstream の新しい宣言で置き換えて `veil_ffi! {` に戻す。宣言が増えて
+aws-lc-sys に同じ名前が無い・型が合わない場合はコンパイルエラーになるので、`sys` か `Conv` に足す。
+
 ## 追従手順
 
 quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜4 を再適用する
@@ -104,7 +128,7 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.1`（`[lib] name = "quiche"` はそのまま）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.2`（`[lib] name = "quiche"` はそのまま。veil.2 は下の 5）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。

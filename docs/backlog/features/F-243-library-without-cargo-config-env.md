@@ -21,13 +21,14 @@
   **自分の `extern "C"` の宣言**で呼ぶ。TLS の C ライブラリは自分ではリンクしない。
   - そのシンボルは、rustls（aws-lc-rs）が引く aws-lc-sys が満たす。名前が一致する必要があるので、aws-lc-sys を
     **シンボルの接頭辞無し**でビルドしている（`AWS_LC_SYS_NO_PREFIX_<triple>=1`、B-47）。
-- aws-lc-sys の既定は接頭辞付き（`aws_lc_0_46_0_SSL_new` のような名前）である。接頭辞無しにするには環境変数しか無い。
+- aws-lc-sys の既定は接頭辞付き（`aws_lc_0_46_0_EVP_AEAD_CTX_init` のような名前）である。実装の段階 0 で分かったが、
+  接頭辞が付くのは libcrypto だけで、libssl の `SSL_*` はどちらでも接頭辞無しである。接頭辞無しにするには環境変数しか無い。
   cargo は依存の `.cargo/config.toml` を読まないので、利用者が自分の `[env]` に書く必要がある。
   - 書かないと、veil の build.rs（`check_aws_lc_no_prefix`）が設定の例を示して止まる（F-238）。
 - **aws-lc-sys の Rust のバインディングは、接頭辞を隠している。**
   - aws-lc-sys は bindgen の `ParseCallbacks`（`builder/sys_bindgen.rs` の `StripPrefixCallback`）で、関数名から接頭辞を外す。
-    そのうえで `#[link_name = "aws_lc_0_46_0_SSL_new"]` を付けて出す。
-  - そのため、Rust から `aws_lc_sys::SSL_new` と書けば、接頭辞の有無に関係なく正しいシンボルにリンクされる。
+    そのうえで `#[link_name = "aws_lc_0_46_0_EVP_AEAD_CTX_init"]` のように付けて出す。
+  - そのため、Rust から `aws_lc_sys::EVP_AEAD_CTX_init` と書けば、接頭辞の有無に関係なく正しいシンボルにリンクされる。
     aws-lc-rs が `[env]` 無しで動くのも、この仕組みによる。
   - 接頭辞無しのビルドでは `link_name` が付かない。今の veil のビルド（`target/debug/build/aws-lc-sys-*/out/bindings.rs`）では 0 件だった。
 - veil は Linux で既に `aws-lc-sys = { version = ">=0.45, <0.48", features = ["ssl", "bindgen"] }` に依存している。
@@ -128,8 +129,8 @@
    - 作り方: `docs/artifacts/f243/` の下に作る。`.cargo/config.toml` は無し。`cargo config get env` で veil の設定が見えないことを確かめる。
      依存は `veil-proxy` を path で、`full`・`api`。
    - `cargo build --release` が通る。
-   - `nm` で、quiche の呼ぶ関数が `aws_lc_<版>_SSL_*` の接頭辞付きのシンボルにリンクされている。
-   - 接頭辞無しの `SSL_new` が無い。
+   - `nm` で、quiche の呼ぶ libcrypto の関数が接頭辞付きのシンボル（`aws_lc_<版>_EVP_AEAD_CTX_seal_scatter`）にリンクされ、
+     接頭辞無しの同名が無い（libssl の `SSL_*` は接頭辞無しのまま）。
    - `cargo tree -i boring` が空。
 4. 同じプロジェクトに `[env]` を足した場合も、通って接頭辞無しになることを確かめる。
 

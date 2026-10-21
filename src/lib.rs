@@ -50,16 +50,11 @@
 //! for example `#[global_allocator] static A: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;`
 //! (on unix with the `veil-alloc` feature) or mimalloc.
 //!
-//! # HTTP/3 on Linux
+//! # Build requirements
 //!
-//! quiche shares rustls' `aws-lc-sys`, which must be built without symbol prefixes. Cargo does not read veil's
-//! own `.cargo/config.toml` when veil is a dependency, so add this to your project's `.cargo/config.toml`
-//! (one line per target triple you build for):
-//!
-//! ```toml
-//! [env]
-//! AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-//! ```
+//! Nothing beyond the `Cargo.toml` entry is needed: there is no `.cargo/config.toml` setting to add. On
+//! Linux, quiche (HTTP/3) and rustls share one copy of `aws-lc-sys`; building it needs a C compiler, CMake
+//! (for `libssl`) and libclang (for bindgen).
 //!
 //! # Guides
 //!

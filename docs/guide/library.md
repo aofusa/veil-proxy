@@ -93,16 +93,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**HTTP/3 on Linux** needs one setting in your project's `.cargo/config.toml`. quiche shares rustls' `aws-lc-sys`
-and needs it built without symbol prefixes; Cargo does not read veil's own `.cargo/config.toml` when veil is a
-dependency. veil's build script stops with this message when it is missing:
-
-```toml
-# .cargo/config.toml of your project (one line per target triple you build for)
-[env]
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
-```
+Nothing else is needed — no `.cargo/config.toml` settings, also for HTTP/3 on Linux. quiche and rustls share
+one `aws-lc-sys`; quiche calls it through `aws-lc-sys`'s Rust bindings, so the build works whether `aws-lc-sys`
+uses its default symbol prefix or not. (An `AWS_LC_SYS_NO_PREFIX_<triple>` entry that you added for earlier
+versions is harmless and can be removed.) Building `aws-lc-sys` needs a C compiler, CMake and libclang (bindgen).
 
 The vendored quiche that packs STREAM frames of several streams into one packet (F-172) is a normal dependency
 (`veil-proxy-quiche`), so no `[patch]` is needed.

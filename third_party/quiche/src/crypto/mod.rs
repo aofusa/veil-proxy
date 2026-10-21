@@ -519,7 +519,8 @@ pub fn verify_slices_are_equal(a: &[u8], b: &[u8]) -> Result<()> {
     Err(Error::CryptoFail)
 }
 
-extern "C" {
+// veil: aws-lc-sys feature ではバインディング経由の包みにする（src/veil_ffi.rs、F-243）
+veil_ffi! {
     fn EVP_sha256() -> *const EVP_MD;
 
     fn EVP_sha384() -> *const EVP_MD;

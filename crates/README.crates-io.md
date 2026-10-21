@@ -35,18 +35,10 @@ async fn main() -> Result<(), veil::api::Error> {
 }
 ```
 
-## HTTP/3 on Linux needs one line of Cargo configuration
+## Build requirements
 
-On Linux, quiche shares rustls' `aws-lc-sys` and needs it built without symbol prefixes. Add this to
-`.cargo/config.toml` of your project (use your target triple; the build stops with this message when it is missing):
-
-```toml
-[env]
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-# AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
-```
-
-Builds without the `http3` feature, and other operating systems, do not need it.
+The `Cargo.toml` entry is all you need; there is nothing to add to `.cargo/config.toml`, also for HTTP/3 on Linux.
+quiche and rustls share one `aws-lc-sys`, whose build needs a C compiler, CMake and libclang (bindgen).
 
 ## Documentation
 

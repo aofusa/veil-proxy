@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.85"
 # veil: 公開名と版（F-238。`[lib] name = "quiche"` はそのまま）
 name = "veil-proxy-quiche"
-version = "0.24.9-veil.1"
+version = "0.24.9-veil.2"
 authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
 build = "src/build.rs"
 include = [
@@ -63,6 +63,9 @@ rustdoc-args = [
 ]
 
 [features]
+# veil: BoringSSL の API を aws-lc-sys の Rust のバインディング経由で呼ぶ（README.veil.md の 5、F-243）。
+# aws-lc-sys のシンボルの接頭辞の有無（AWS_LC_SYS_NO_PREFIX）を問わずリンクできる。
+aws-lc-sys = ["dep:aws-lc-sys"]
 boringssl-boring-crate = [
     "boring",
     "foreign-types-shared",
@@ -82,6 +85,12 @@ name = "quiche"
 # veil: rlib だけを作る（upstream は C FFI 用に staticlib・cdylib も作る。README.veil.md）
 crate-type = ["lib"]
 path = "src/lib.rs"
+
+[dependencies.aws-lc-sys]
+# veil 本体（Cargo.toml の Linux の依存）と同じ範囲・同じ feature（links があるので必ず 1 つの版になる）
+version = ">=0.45, <0.48"
+features = ["ssl", "bindgen"]
+optional = true
 
 [dependencies.boring]
 version = "4.3"

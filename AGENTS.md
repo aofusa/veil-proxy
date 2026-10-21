@@ -75,6 +75,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - rustls プロバイダ: OpenBSD/NetBSD = `ring`、それ以外 = `aws_lc_rs`（`src/tls_provider.rs` と Cargo.toml を一致させる）。
 - quiche（http3）: **Linux のみ** `aws-lc-sys` 共有（memfd 経路）、他 OS は `boringssl-boring-crate` + `boring = "4.3"`。
+  Linux の quiche は BoringSSL の FFI を aws-lc-sys の Rust のバインディング経由で呼ぶ（`veil-proxy-quiche` の `aws-lc-sys`
+  feature、`third_party/quiche/src/veil_ffi.rs`。接頭辞の有無を問わない。F-243）。利用者に `[env]` を要求しない。
   **Linux に `boring` を依存させない**（重複シンボル）。`AWS_LC_SYS_NO_PREFIX_<triple>` は
   [.cargo/config.toml](.cargo/config.toml) の `[env]` 1 箇所のみで設定する（Dockerfile 等で設定しない。B-47）。
 - HTTP/3: `quiche` は本番データプレーン専用、テスト・計測ツールは `quinn` + `h3`。

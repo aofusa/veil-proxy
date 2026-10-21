@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|external|all]   （既定 all）
+#
+# external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
+# プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
+# VEIL_EXTERNAL_SRC で依存先（既定はこのリポジトリ。公開物の確認では展開した .crate のディレクトリを渡す）を変えられる。
 #
 # 前提: cargo・cc・make・curl（HTTP/2 対応）・python3。Python は PYTHON（既定: 作業用 venv を自動作成し maturin で導入）。
 # Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動く。python3 の名前が違う環境は PY3 で指定する
@@ -436,6 +440,85 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   kill "$PID"
 }
 
+run_external() { # F-243: [env] 無しの利用者のビルド（と、[env] を書いた利用者のビルド）
+  echo "== external project without / with .cargo/config.toml [env] (F-243)"
+  [ "$OS" = Linux ] || { echo "  skip: Linux only"; return; }
+  local SRC="${VEIL_EXTERNAL_SRC:-$ROOT}" H3IMG="${H3_CURL_IMAGE:-alpine/curl-http3:latest}"
+  # cargo は作業ディレクトリから上へ .cargo/config.toml を探すので、リポジトリの外（$HOME の下）に作る
+  local BASE; BASE="$(mktemp -d "${VEIL_EXTERNAL_DIR:-$HOME}/veil-external.XXXXXX")"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -keyout "$BASE/key.pem" -out "$BASE/cert.pem" 2>/dev/null
+  local mode
+  for mode in noenv env; do
+    local W="$BASE/$mode"; mkdir -p "$W/src"
+    cat > "$W/Cargo.toml" <<TOML
+[package]
+name = "veil-external-$mode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+veil = { package = "veil-proxy", path = "$SRC", default-features = false, features = ["full", "api"] }
+
+[workspace]
+TOML
+    if [ "$mode" = env ]; then
+      mkdir -p "$W/.cargo"
+      printf '[env]\nAWS_LC_SYS_NO_PREFIX_%s = { value = "1", force = true }\n' "$(rustc -vV | sed -n 's/^host: //p' | tr - _)" > "$W/.cargo/config.toml"
+    fi
+    cat > "$W/src/main.rs" <<'RS'
+use veil::prelude::*;
+
+#[veil::route(path = "/hello", method = "GET")]
+async fn hello() -> &'static str {
+    "hello from an external crate"
+}
+
+#[veil::main]
+async fn main() -> Result<(), veil::api::Error> {
+    let e = |k: &str| std::env::var(k).unwrap();
+    let cfg = Config::new()
+        .builder()
+        .listen_cleartext(&e("PLAIN"))
+        .listen(&e("TLS"))
+        .tls(&e("CERT"), &e("KEY"))
+        .http3(&e("TLS"))
+        .build();
+    veil::serve(cfg).await
+}
+RS
+    if ! (cd "$W" && env -u AWS_LC_SYS_NO_PREFIX cargo build -q) > "$W/build.log" 2>&1; then
+      bad "$mode: build"; tail -30 "$W/build.log"; continue
+    fi
+    ok "$mode: build"
+    local bin="$W/target/debug/veil-external-$mode"
+    # quiche の FFI が、[env] 無しは接頭辞付き（aws_lc_<版>_EVP_AEAD_CTX_seal_scatter）、有りは接頭辞無しの aws-lc に
+    # リンクされている（aws-lc-sys が接頭辞を付けるのは libcrypto だけで、libssl の SSL_* はどちらでも接頭辞無し）
+    local sym=EVP_AEAD_CTX_seal_scatter
+    nm "$bin" > "$W/nm.txt"   # pipefail の下で `nm | grep -q` は grep が先に終わると SIGPIPE で失敗扱いになる
+    if [ "$mode" = noenv ]; then
+      grep -Eq " [Tt] aws_lc_[0-9_]+_$sym\$" "$W/nm.txt" && ! grep -Eq " [Tt] $sym\$" "$W/nm.txt" \
+        && ok "$mode: quiche links the prefixed aws-lc symbols" || bad "$mode: unexpected $sym symbols: $(grep -E "$sym\$" "$W/nm.txt" | head -3 | tr '\n' ' ')"
+    else
+      grep -Eq " [Tt] $sym\$" "$W/nm.txt" && ok "$mode: quiche links the unprefixed aws-lc symbols" || bad "$mode: no unprefixed $sym"
+    fi
+    # cargo tree -i は見つからなくても 0 で終わり何も出さない
+    [ -z "$(cd "$W" && cargo tree -q -i boring 2>/dev/null)" ] && ok "$mode: no boring crate" || bad "$mode: depends on boring"
+    local n; n=$(cd "$W" && cargo tree -q -i aws-lc-sys --depth 0 2>/dev/null | grep -c '^aws-lc-sys')
+    [ "$n" = 1 ] && ok "$mode: one aws-lc-sys" || bad "$mode: $n aws-lc-sys"
+    local P T; P=$(free_port); T=$(free_port)
+    PLAIN="127.0.0.1:$P" TLS="127.0.0.1:$T" CERT="$BASE/cert.pem" KEY="$BASE/key.pem" "$bin" > "$W/run.log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "$mode: start"; tail -20 "$W/run.log"; continue; }
+    expect "$mode: HTTP/1.1" "hello from an external crate" curl -s "http://127.0.0.1:$P/hello"
+    expect "$mode: HTTP/2 (TLS)" "2" curl -ks --http2 -o /dev/null -w '%{http_version}' "https://127.0.0.1:$T/hello"
+    expect "$mode: HTTP/3" "3 hello from an external crate" docker run --rm --network host --entrypoint sh "$H3IMG" -c \
+      "curl -ks --http3-only -w '%{http_version} ' -o /tmp/b https://127.0.0.1:$T/hello && cat /tmp/b"
+    kill "$PID"
+  done
+  rm -rf "$BASE"
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない（${FULL}）"
   (cd "$ROOT" && cargo build -q $NODEF --features "$FULL") || { bad "build $FULL"; return; }
@@ -478,6 +561,7 @@ case "$WHAT" in
   c) run_c; run_c_features ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
+  external) run_external ;;
   all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_c_features; run_python ;;
   *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
 esac

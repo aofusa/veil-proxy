@@ -126,8 +126,8 @@ veil = { package = "veil-proxy", version = "0.8", default-features = false, feat
 serde_json = "1"
 ```
 
-Linux で HTTP/3 を使うときは `.cargo/config.toml` の `[env]` に `AWS_LC_SYS_NO_PREFIX_<ターゲット> = "1"` も要る
-（[ライブラリのガイド](../guide/ja/library.md#cargotoml)）。Python は `pip install veil-api`（`import veil`）。
+`.cargo/config.toml` の設定は要らない（[ライブラリのガイド](../guide/ja/library.md#cargotoml)）。
+Python は `pip install veil-api`（`import veil`）。
 
 ```rust
 use veil::prelude::*;

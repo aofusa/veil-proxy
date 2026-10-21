@@ -99,7 +99,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 
 > **注意**: `--features full` でビルドする場合、`http3` フィーチャーが aws-lc-sys の `libssl` をビルドするため cmake が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
 >
-> **`AWS_LC_SYS_NO_PREFIX`（ターゲット別、B-47）**: `http3` / `full` ビルドでのこの値は [`.cargo/config.toml`](../../../.cargo/config.toml) の `[env]` テーブル**のみ**で設定します。aws-lc-sys がターゲット別に優先して読む変数名（`AWS_LC_SYS_NO_PREFIX_<トリプルの - を _ にしたもの>`）を列挙する方式です。
+> **`AWS_LC_SYS_NO_PREFIX`（ターゲット別、B-47）**: `http3` / `full` ビルドでのこの値は [`.cargo/config.toml`](../../../.cargo/config.toml) の `[env]` テーブル**のみ**で設定します。aws-lc-sys がターゲット別に優先して読む変数名（`AWS_LC_SYS_NO_PREFIX_<トリプルの - を _ にしたもの>`）を列挙する方式です。値が変えるのはシンボルの名前だけです。Linux の quiche は `aws-lc-sys` の Rust のバインディング経由で呼ぶ（`third_party/quiche/src/veil_ffi.rs`）ので、接頭辞の有無にかかわらず正しい名前にリンクされます。そのため、veil を依存にするプロジェクトは `[env]` を書く必要がありません。リポジトリの値は、veil 自身のビルドを今のまま保つために残しています。
 > - **Linux → `1`**: quiche が rustls と同じ**非プレフィックス**の AWS-LC シンボルへリンクする（`aws-lc-sys` を 1 つ共有）。
 > - **FreeBSD / Windows / macOS / OpenBSD → `0`**: quiche は外部 `boringssl-boring-crate`（`boring`）を使うため、`aws-lc-sys` 側はプレフィックスを維持して共存させる。FreeBSD は F-136 で capsicum capability mode 下の証明書ホットリロード（quiche の in-memory `SSL_CTX` API が `boringssl-boring-crate` 限定）のためここへ移った。
 >

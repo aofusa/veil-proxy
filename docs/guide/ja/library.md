@@ -90,16 +90,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**Linux で HTTP/3 を使う**ときは、利用する側のプロジェクトの `.cargo/config.toml` に設定が 1 つ要ります。quiche は rustls と
-同じ `aws-lc-sys` をシンボルのプレフィックス無しで使います。veil を依存として使うと、cargo は veil 自身の
-`.cargo/config.toml` を読みません。設定が無いと、veil のビルドスクリプトがこの内容を示して止まります。
+ほかの設定は要りません。Linux で HTTP/3 を使う場合も、`.cargo/config.toml` に何も書かなくて構いません。
 
-```toml
-# 利用する側の .cargo/config.toml（ビルドするターゲットごとに 1 行）
-[env]
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
-```
+- quiche と rustls は 1 つの `aws-lc-sys` を共有します。
+- quiche は `aws-lc-sys` の Rust のバインディング経由で呼ぶので、`aws-lc-sys` のシンボルの接頭辞の有無にかかわらずビルドできます。
+- 以前の版のために足した `AWS_LC_SYS_NO_PREFIX_<triple>` は、あっても害はなく、消して構いません。
+- `aws-lc-sys` のビルドには C コンパイラ・CMake・libclang（bindgen）が要ります。
 
 複数ストリームの STREAM フレームを 1 パケットへ詰める vendoring 版 quiche（F-172）は通常の依存（`veil-proxy-quiche`）なので、
 `[patch]` は要りません。
