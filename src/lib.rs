@@ -116,7 +116,7 @@ use tikv_jemallocator::Jemalloc;
 // 元から jemalloc なので、FreeBSD では `jemalloc` feature を使わせない。
 #[cfg(all(feature = "jemalloc", target_os = "freebsd"))]
 compile_error!(
-    "the `jemalloc` feature must not be used on FreeBSD (B-89): tikv-jemalloc overrides \
+    "the `jemalloc` feature must not be used on FreeBSD: tikv-jemalloc overrides \
      libthr's malloc hooks and corrupts the libc allocator; FreeBSD's malloc(3) already is jemalloc"
 );
 

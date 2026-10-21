@@ -32,6 +32,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # F-242: ログ・エラー・panic の文字列は英語で、チケット番号を入れない（テストとコメントは対象外）。
+  messages:
+    name: messages (English, no ticket IDs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/lint/test_check_messages.py
+      - run: python3 tools/lint/check-messages.py
+
   clippy:
     name: clippy (full)
     runs-on: ubuntu-latest

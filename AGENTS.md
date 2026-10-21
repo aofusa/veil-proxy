@@ -241,6 +241,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ## コーディング規約
 
 - 既存に合わせる（多くは日本語のコメント）。英語への統一リファクタはしない。
+- ただし利用者に見える文字列（ログ・エラー・panic・`expect` の文、rustdoc、Python の docstring）は英語で書き、
+  チケット番号を入れない（番号はすぐ上の `//`・`#` のコメントへ。`tools/lint/check-messages.py`・`tools/release/check-docs.sh`。F-241/F-242）。
 - `cargo fmt`、`cargo clippy`。`#[allow(clippy::…)]` を論拠なく増やさない。**`allow(dead_code)` は禁止**。
 - [clippy.toml](clippy.toml) の `disallowed-methods` がホットパスのブロッキングを検出する。正当な利用（offload 閉包内・
   専用スレッド・起動/リロード・テスト）は理由コメント付きの個別 `#[allow(clippy::disallowed_methods)]` で明示する。

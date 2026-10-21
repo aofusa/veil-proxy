@@ -84,41 +84,41 @@ use std::io;
 /// ```
 pub const SYSTEMD_SYSCALL_FILTER: &str = r#"
 # ============================================
-# veil 必須システムコール一覧
+# System calls veil needs
 # ============================================
-# systemd SystemCallFilter 形式
-# 
-# 基本セット (@system-service に含まれる):
+# systemd SystemCallFilter format
+#
+# Base sets (included in @system-service):
 #   @basic-io @file-system @io-event @ipc @network-io
 #   @process @signal @timer
 #
-# 追加で必要なシステムコール:
+# Additional system calls:
 #   io_uring_setup io_uring_enter io_uring_register
-#   mlock mlock2 mlockall (io_uring登録バッファ、Huge Pages用)
-#   sched_setaffinity sched_getaffinity (CPUピンニング用)
+#   mlock mlock2 mlockall (io_uring registered buffers, huge pages)
+#   sched_setaffinity sched_getaffinity (CPU pinning)
 #
 # ============================================
 
-# --- 必須: io_uring (カスタム io_uring ランタイム) ---
+# --- required: io_uring (custom io_uring runtime) ---
 io_uring_setup
 io_uring_enter
 io_uring_register
 
-# --- 必須: メモリロック (io_uring 登録バッファ) ---
+# --- required: memory locking (io_uring registered buffers) ---
 mlock
 mlock2
 mlockall
 munlock
 munlockall
 
-# --- オプション: CPUアフィニティ ---
+# --- optional: CPU affinity ---
 sched_setaffinity
 sched_getaffinity
 
-# --- オプション: kTLS ---
-# splice (kTLS ゼロコピー用、kTLS feature 使用時)
+# --- optional: kTLS ---
+# splice (kTLS zero-copy, with the ktls feature)
 
-# --- @system-service に含まれるため明示不要 ---
+# --- included in @system-service, no need to list ---
 # socket, bind, listen, accept, accept4, connect
 # sendto, recvfrom, sendmsg, recvmsg, setsockopt, getsockopt
 # read, write, openat, close, fstat, mmap, munmap
@@ -2606,7 +2606,7 @@ pub mod capsicum {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
-                        "capsicum: static root {:?} を canonicalize できず登録をスキップ: {}",
+                        "capsicum: skipping static root {:?}: canonicalize failed: {}",
                         root, e
                     );
                     continue;
@@ -2629,7 +2629,7 @@ pub mod capsicum {
                 // capability mode の静的配信が全滅するため、そのルートだけ飛ばす
                 // （単一ファイルは起動時に読み込み済み、または従来経路で扱う）。
                 warn!(
-                    "capsicum: static root {:?} をディレクトリとして開けず登録をスキップ: {}",
+                    "capsicum: skipping static root {:?}: cannot open it as a directory: {}",
                     root,
                     io::Error::last_os_error()
                 );
@@ -2637,8 +2637,8 @@ pub mod capsicum {
             }
             limit_static_dir_rights(fd)?;
             info!(
-                "capsicum: 静的ルート dirfd={} を登録（{:?} → canonical {:?}）",
-                fd, root, canonical
+                "capsicum: registered static root {:?} (dirfd={}, canonical {:?})",
+                root, fd, canonical
             );
             dirs.push((root.clone(), canonical, fd));
         }
@@ -2894,7 +2894,7 @@ pub mod capsicum {
         let _ = TLS_KEY_ENTRY.set((key.to_path_buf(), key_fd, key_name));
         TLS_CERT_ACTIVE.store(true, Ordering::Release);
         info!(
-            "capsicum: TLS 証明書/秘密鍵の dirfd を登録（cert={:?}, key={:?}）",
+            "capsicum: registered directory fds for the TLS certificate and key (cert={:?}, key={:?})",
             cert, key
         );
         Ok(())
@@ -3089,7 +3089,7 @@ pub mod capsicum {
             return Ok(());
         }
         info!(
-            "capsicum: 設定ファイル {:?} の dirfd を登録（capability mode 下でも SIGHUP で再読込できる）",
+            "capsicum: registered the directory fd of config file {:?} (SIGHUP reload works in capability mode)",
             path
         );
         Ok(())
@@ -3136,7 +3136,7 @@ pub mod capsicum {
             return Ok(());
         }
         info!(
-            "capsicum: アクセスログ {:?} の dirfd を登録（capability mode 下でも SIGHUP で開き直せる）",
+            "capsicum: registered the directory fd of access log {:?} (SIGHUP reopen works in capability mode)",
             path
         );
         Ok(())

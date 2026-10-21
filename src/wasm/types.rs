@@ -184,13 +184,13 @@ impl WasmConfig {
         #[cfg(target_os = "openbsd")]
         if !self.interpreter {
             ftlog::warn!(
-                "[wasm] interpreter=false is ignored on OpenBSD; Pulley interpreter is always used (B-52)"
+                "[wasm] interpreter=false is ignored on OpenBSD; the Pulley interpreter is always used"
             );
         }
         #[cfg(target_os = "netbsd")]
         if !self.interpreter {
             ftlog::warn!(
-                "[wasm] interpreter=false is ignored on NetBSD; Pulley interpreter is always used (F-140)"
+                "[wasm] interpreter=false is ignored on NetBSD; the Pulley interpreter is always used"
             );
         }
 

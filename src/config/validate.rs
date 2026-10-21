@@ -194,11 +194,12 @@ pub(super) fn validate_removed_keys(server: &ServerConfigSection) -> io::Result<
             "use [http3].enabled",
         ),
     ];
+    // F-200 で廃止したキー。エラーの文にはチケット番号を入れず、移行先を hint で示す。
     for (key, present, hint) in removed {
         if present {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} was removed (F-200): {}", key, hint),
+                format!("{} was removed: {}", key, hint),
             ));
         }
     }

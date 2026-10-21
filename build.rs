@@ -154,10 +154,11 @@ fn emit_runtime_backend_cfg() {
             println!("cargo::rustc-cfg=veil_poller_wsapoll");
         }
         other => {
+            // F-120/F-125/F-140: 対応 OS の一覧。
             panic!(
                 "veil build.rs: unsupported target_os \"{other}\" — veil currently \
                  supports target_os = \"linux\", \"freebsd\", \"openbsd\", \"macos\", \
-                 \"netbsd\", \"windows\" only (F-120/F-125/F-140)"
+                 \"netbsd\", \"windows\" only"
             );
         }
     }

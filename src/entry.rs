@@ -1307,8 +1307,8 @@ pub fn run_server(opts: ServerOptions) {
                                         "capsicum: TLS certificate hot-reload will remain functional under capability mode (dirfd relative openat/fstatat)"
                                     ),
                                     Err(e) => error!(
-                                        "capsicum: TLS 証明書 dirfd 登録に失敗（capability mode 下で\
-                                         証明書ホットリロードが機能しなくなる可能性）: {}",
+                                        "capsicum: failed to register the TLS certificate directory fds; \
+                                         certificate hot reload may not work in capability mode: {}",
                                         e
                                     ),
                                 }
@@ -1316,8 +1316,8 @@ pub fn run_server(opts: ServerOptions) {
                             match crate::security::capsicum::init_config_dirfd(&config_path) {
                                 Ok(()) => {}
                                 Err(e) => error!(
-                                    "capsicum: 設定ファイル dirfd の登録に失敗（capability mode 下で\
-                                     SIGHUP の設定リロードが機能しない）: {}",
+                                    "capsicum: failed to register the config file directory fd; \
+                                     SIGHUP config reload will not work in capability mode: {}",
                                     e
                                 ),
                             }
@@ -1327,8 +1327,8 @@ pub fn run_server(opts: ServerOptions) {
                                     crate::security::capsicum::init_access_log_dirfd(p)
                                 {
                                     error!(
-                                        "capsicum: アクセスログ dirfd の登録に失敗（capability mode 下で\
-                                         SIGHUP によるログの開き直しが機能しない）: {}",
+                                        "capsicum: failed to register the access log directory fd; \
+                                         reopening the log on SIGHUP will not work in capability mode: {}",
                                         e
                                     );
                                 }

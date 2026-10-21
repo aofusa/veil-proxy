@@ -48,16 +48,17 @@ static STARTUP_LOG_ONCE: Once = Once::new();
 static RUNTIME_FALLBACK_LOG_ONCE: Once = Once::new();
 
 fn log_registration_result(beneath_active: bool) {
+    // F-153: 静的配信のパス解決の方式を起動時に 1 回だけ出す。
     STARTUP_LOG_ONCE.call_once(|| {
         if beneath_active {
             info!(
-                "F-153: 静的配信のパス解決にカーネル封じ込め（openat2 RESOLVE_BENEATH / \
-                 capsicum O_RESOLVE_BENEATH）を使用します（canonicalize の readlink 連発を回避）"
+                "static files: resolving paths inside the kernel \
+                 (openat2 RESOLVE_BENEATH / capsicum O_RESOLVE_BENEATH)"
             );
         } else {
             info!(
-                "F-153: 静的配信のパス解決はフォールバック canonicalize() を使用します \
-                 （静的ルート未登録、または本プラットフォーム未対応）"
+                "static files: resolving paths with canonicalize() \
+                 (no static root registered, or not supported on this platform)"
             );
         }
     });
@@ -66,10 +67,11 @@ fn log_registration_result(beneath_active: bool) {
 /// Linux 経路専用（上記 `RUNTIME_FALLBACK_LOG_ONCE` のコメント参照）。
 #[cfg(target_os = "linux")]
 fn log_runtime_fallback_engaged(reason: &str) {
+    // F-153: プロセス全体で 1 回だけ判定し、以後は再試行しない。
     RUNTIME_FALLBACK_LOG_ONCE.call_once(|| {
         warn!(
-            "F-153: openat2(RESOLVE_BENEATH) が利用できないため（{}）、以後 canonicalize \
-             フォールバックへ切り替えます（プロセス全体で 1 回だけ判定・以後は再試行しません）",
+            "static files: openat2(RESOLVE_BENEATH) is unavailable ({}); \
+             using canonicalize() from now on",
             reason
         );
     });
@@ -97,8 +99,8 @@ pub fn register_static_roots(roots: &[PathBuf]) {
             Ok(()) => log_registration_result(crate::security::capsicum::static_serving_active()),
             Err(e) => {
                 warn!(
-                    "F-153: capsicum 静的ルート dirfd 登録に失敗（フォールバック canonicalize \
-                     を使用します）: {}",
+                    "static files: failed to register capsicum directory fds for static roots \
+                     (using canonicalize() instead): {}",
                     e
                 );
                 log_registration_result(false);
@@ -372,8 +374,8 @@ mod linux_impl {
                 continue;
             }
             info!(
-                "F-153: 静的ルート dirfd={} を登録（{:?}、openat2 RESOLVE_BENEATH 相対化対象）",
-                fd, root
+                "static files: registered static root {:?} (dirfd={}, resolved with openat2 RESOLVE_BENEATH)",
+                root, fd
             );
             dirs.push(LinuxRoot {
                 root: root.clone(),
@@ -386,8 +388,8 @@ mod linux_impl {
 
     fn warn_skip(root: &Path, reason: &str) {
         warn!(
-            "F-153: 静的ルート {:?} の dirfd 登録をスキップ（このルートは canonicalize \
-             フォールバックのまま動作します）: {}",
+            "static files: could not open static root {:?} as a directory; \
+             this root is resolved with canonicalize() instead: {}",
             root, reason
         );
     }

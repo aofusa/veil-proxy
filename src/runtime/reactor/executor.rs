@@ -1030,7 +1030,7 @@ fn spawn_body_and_poll(body: TaskBody) -> bool {
     // poll 対象の body を取り出す（EXEC_STATE 借用外で poll するため）。
     let mut body = EXEC_STATE
         .with(|s| s.borrow_mut().slots[index].body.take())
-        .expect("reserve_slot 直後のスロットに body が無い");
+        .expect("slot has no body right after reserve_slot");
 
     let waker = make_waker(index, generation);
     let mut cx = Context::from_waker(&waker);
