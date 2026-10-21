@@ -1,8 +1,9 @@
-//! L4（TCP/UDP）ネイティブハンドラ（F-192、`l4-handler` feature）。
+// F-192
+//! Native L4 (TCP/UDP) handlers (the `l4-handler` feature).
 //!
-//! `[[l4]]` に `handler = "<name>"` を書くと、そのリスナーは上流へ転送せず登録した Rust 関数で
-//! 接続（TCP）・データグラム（UDP）を処理する。`handler` の無いリスナーは従来の splice 経路のまま
-//! （コード経路・性能とも不変）。
+//! With `handler = "<name>"` in `[[l4]]`, that listener does not forward to an upstream; it handles
+//! connections (TCP) or datagrams (UDP) with the registered Rust function. A listener without `handler`
+//! keeps the existing splice path (code path and performance are unchanged).
 
 use super::app::App;
 use crate::runtime::io::AsyncWriteRentExt as _;
@@ -16,14 +17,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-/// L4 ハンドラのエラー。
+/// Errors of an L4 handler.
 #[derive(Debug)]
 pub enum L4Error {
-    /// 入出力エラー。
+    /// An I/O error.
     Io(std::io::Error),
-    /// アイドルタイムアウト（`[[l4]] idle_timeout_secs`）
+    /// Idle timeout (`[[l4]] idle_timeout_secs`).
     Timeout,
-    /// その他のエラー（メッセージのみ）。
+    /// Any other error (message only).
     Other(String),
 }
 
@@ -51,18 +52,18 @@ impl From<String> for L4Error {
     }
 }
 
-/// ハンドラに渡す TCP 接続。読み書きはイベントループ上の非同期 I/O（ブロックしない）。
+/// A TCP connection passed to the handler. Reads and writes are asynchronous I/O on the event loop (they do not block).
 pub struct L4Connection {
     stream: TcpStream,
     peer: SocketAddr,
     listener: Arc<str>,
     idle_timeout: Duration,
-    /// 読み取り用の再利用バッファ（接続ごとに 1 回だけ確保）。`rbuf[rpos..]` が未消費のデータ。
+    /// A reusable read buffer (allocated once per connection). `rbuf[rpos..]` is the unconsumed data.
     rbuf: Vec<u8>,
     rpos: usize,
 }
 
-/// 1 回の受信で読む最大バイト数（読み取りバッファの容量）。
+/// Maximum number of bytes read in one receive (the capacity of the read buffer).
 const L4_READ_CHUNK: usize = 16 * 1024;
 
 impl L4Connection {
@@ -82,17 +83,17 @@ impl L4Connection {
         }
     }
 
-    /// 相手のアドレス。
+    /// The peer's address.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer
     }
 
-    /// `[[l4]]` のリスナー名。
+    /// The name of the `[[l4]]` listener.
     pub fn listener_name(&self) -> &str {
         &self.listener
     }
 
-    /// 最大 `buf.len()` バイト読む。0 は相手が送信を閉じた（EOF）。
+    /// Reads at most `buf.len()` bytes. 0 means the peer closed its sending side (EOF).
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, L4Error> {
         let avail = self.fill().await?;
         let n = avail.min(buf.len());
@@ -101,7 +102,7 @@ impl L4Connection {
         Ok(n)
     }
 
-    /// 最大 `max` バイト読んで `Bytes` で返す（空なら EOF）。
+    /// Reads at most `max` bytes and returns them as `Bytes` (empty means EOF).
     pub async fn read_bytes(&mut self, max: usize) -> Result<Bytes, L4Error> {
         let avail = self.fill().await?;
         let n = avail.min(max);
@@ -110,7 +111,7 @@ impl L4Connection {
         Ok(out)
     }
 
-    /// 未消費のデータが無ければ 1 回受信する。戻り値は未消費のバイト数（0 は EOF）。
+    /// Receives once if there is no unconsumed data. Returns the number of unconsumed bytes (0 means EOF).
     async fn fill(&mut self) -> Result<usize, L4Error> {
         if self.rpos < self.rbuf.len() {
             return Ok(self.rbuf.len() - self.rpos);
@@ -129,18 +130,18 @@ impl L4Connection {
         Ok(n)
     }
 
-    /// 全部書く（書いたバイト数を返す）。
+    /// Writes everything (returns the number of bytes written).
     pub async fn write(&mut self, data: &[u8]) -> Result<usize, L4Error> {
         self.write_all(data).await?;
         Ok(data.len())
     }
 
-    /// 全部書く。
+    /// Writes everything.
     pub async fn write_all(&mut self, data: &[u8]) -> Result<(), L4Error> {
         self.write_bytes(Bytes::copy_from_slice(data)).await
     }
 
-    /// `Bytes` をコピーせずに全部書く。
+    /// Writes all of a `Bytes` without copying it.
     pub async fn write_bytes(&mut self, data: Bytes) -> Result<(), L4Error> {
         if data.is_empty() {
             return Ok(());
@@ -154,7 +155,7 @@ impl L4Connection {
         }
     }
 
-    /// 送信側を閉じる（相手に EOF を知らせる）。
+    /// Closes the sending side (signals EOF to the peer).
     pub fn shutdown_write(&mut self) -> Result<(), L4Error> {
         self.stream
             .shutdown(std::net::Shutdown::Write)
@@ -162,43 +163,43 @@ impl L4Connection {
     }
 }
 
-/// UDP ハンドラに渡すデータグラム。戻り値の `Some(bytes)` は送信元へ返信する。
+/// A datagram passed to a UDP handler. A returned `Some(bytes)` is sent back to the sender.
 #[derive(Debug, Clone)]
 pub struct L4Datagram {
-    /// 受信したデータグラムの内容。
+    /// The contents of the received datagram.
     pub data: Bytes,
-    /// 送信元のアドレス。
+    /// The sender's address.
     pub peer: SocketAddr,
-    /// 受信した `[[l4]]` リスナーの名前。
+    /// The name of the `[[l4]]` listener that received it.
     pub listener: Arc<str>,
 }
 
-/// TCP ハンドラ関数。
+/// A TCP handler function.
 pub type L4TcpFn = Arc<
     dyn for<'a> Fn(&'a mut L4Connection) -> Pin<Box<dyn Future<Output = Result<(), L4Error>> + 'a>>
         + Send
         + Sync,
 >;
 
-/// UDP ハンドラ関数。
+/// A UDP handler function.
 pub type L4UdpFn =
     Arc<dyn Fn(L4Datagram) -> Pin<Box<dyn Future<Output = Option<Bytes>>>> + Send + Sync>;
 
-/// マクロ（`#[veil::l4_handler(protocol = "tcp")]`）の静的登録。
+/// Static registration by the macro (`#[veil::l4_handler(protocol = "tcp")]`).
 pub struct L4HandlerDef {
-    /// ハンドラの名前（`[[l4]]` の `handler` で参照される）。
+    /// The name of the handler (referenced by `handler` in `[[l4]]`).
     pub name: &'static str,
-    /// ハンドラ本体。
+    /// The handler body.
     pub handler:
         for<'a> fn(&'a mut L4Connection) -> Pin<Box<dyn Future<Output = Result<(), L4Error>> + 'a>>,
 }
 inventory::collect!(L4HandlerDef);
 
-/// マクロ（`#[veil::l4_handler(protocol = "udp")]`）の静的登録。
+/// Static registration by the macro (`#[veil::l4_handler(protocol = "udp")]`).
 pub struct L4UdpHandlerDef {
-    /// ハンドラの名前（`[[l4]]` の `handler` で参照される）。
+    /// The name of the handler (referenced by `handler` in `[[l4]]`).
     pub name: &'static str,
-    /// ハンドラ本体。
+    /// The handler body.
     pub handler: fn(L4Datagram) -> Pin<Box<dyn Future<Output = Option<Bytes>>>>,
 }
 inventory::collect!(L4UdpHandlerDef);
@@ -212,7 +213,7 @@ pub(crate) enum L4Handler {
 static HANDLERS: once_cell::sync::Lazy<RwLock<HashMap<String, L4Handler>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// `App::l4_tcp` / `l4_udp` が注入する `[[l4]]` テーブル。
+/// The `[[l4]]` tables injected by `App::l4_tcp` / `l4_udp`.
 pub(crate) static INJECTED: Mutex<Vec<toml::Value>> = Mutex::new(Vec::new());
 
 fn register(name: &str, h: L4Handler) -> Result<(), String> {
@@ -224,7 +225,7 @@ fn register(name: &str, h: L4Handler) -> Result<(), String> {
     Ok(())
 }
 
-/// マクロで定義した L4 ハンドラを登録する（何度呼んでも 1 回だけ）。
+/// Registers the L4 handlers defined by macros (only once, however often it is called).
 pub(crate) fn register_macro_handlers() -> Result<(), String> {
     static DONE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     DONE.get_or_init(|| {
@@ -241,12 +242,12 @@ pub(crate) fn register_macro_handlers() -> Result<(), String> {
     .clone()
 }
 
-/// 名前でハンドラを引く（`[[l4]] handler` の解決）。
+/// Looks up a handler by name (resolves `[[l4]] handler`).
 pub(crate) fn lookup(name: &str) -> Option<L4Handler> {
     HANDLERS.read().unwrap().get(name).cloned()
 }
 
-/// `[[l4]] handler` の名前が TCP / UDP のどちらで登録されているか（設定検証用）。
+/// Whether the `[[l4]] handler` name is registered as TCP or UDP (for configuration validation).
 pub(crate) fn protocol_of(name: &str) -> Option<&'static str> {
     lookup(name).map(|h| match h {
         L4Handler::Tcp(_) => "tcp",
@@ -265,7 +266,7 @@ fn l4_table(name: &str, listen: &str, protocol: &str) -> toml::Value {
 }
 
 impl App {
-    /// TCP リスナー `listen` を開き、接続を `f` で処理する（`[[l4]]` を注入する）。
+    /// Opens the TCP listener `listen` and handles connections with `f` (injects an `[[l4]]` entry).
     pub fn l4_tcp<F>(self, name: &str, listen: &str, f: F) -> App
     where
         F: for<'a> Fn(
@@ -284,7 +285,7 @@ impl App {
         })
     }
 
-    /// UDP リスナー `listen` を開き、データグラムを `f` で処理する（`Some` を返すと送信元へ返信）。
+    /// Opens the UDP listener `listen` and handles datagrams with `f` (returning `Some` replies to the sender).
     pub fn l4_udp<F, Fut>(self, name: &str, listen: &str, f: F) -> App
     where
         F: Fn(L4Datagram) -> Fut + Send + Sync + 'static,
@@ -307,7 +308,7 @@ impl App {
 
 // ===================== ブロッキングな L4 ハンドラ（C・Python 用、F-210） =====================
 
-/// ブロッキングな L4 ハンドラの出力（コールバックの中で書いたデータと、閉じるかどうか）。
+/// Output of a blocking L4 handler (data written inside the callback, and whether to close).
 #[derive(Default)]
 pub struct L4Out {
     writes: Vec<Bytes>,
@@ -315,28 +316,28 @@ pub struct L4Out {
 }
 
 impl L4Out {
-    /// 送るデータを足す（コールバックから戻った後にまとめて送る）。
+    /// Adds data to send (sent together after the callback returns).
     pub fn write(&mut self, data: Bytes) {
         if !data.is_empty() {
             self.writes.push(data);
         }
     }
 
-    /// 送り終えたら接続を閉じる。
+    /// Closes the connection after the data has been sent.
     pub fn close(&mut self) {
         self.close = true;
     }
 }
 
-/// 1 つの TCP 接続の状態（接続ごとに作る。コールバックは接続ごとに 1 つずつ順に呼ばれる）。
+/// The state of one TCP connection (created per connection; callbacks are called one at a time, in order, per connection).
 pub trait L4Session: Send {
-    /// 受信したデータ。
+    /// Received data.
     fn on_data(&mut self, data: &[u8], out: &mut L4Out);
-    /// 接続が閉じた（相手が閉じた・`close` した・エラー）。
+    /// The connection closed (the peer closed, `close` was called, or an error occurred).
     fn on_close(&mut self) {}
 }
 
-/// ブロッキングなコールバックをハンドラ用プールで呼ぶ（panic は接続を閉じる）。
+/// Calls a blocking callback on the handler pool (a panic closes the connection).
 async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Option<R> {
     crate::runtime::offload::offload_handler(f).await
 }
@@ -349,9 +350,10 @@ async fn flush(conn: &mut L4Connection, out: &mut L4Out) -> Result<(), L4Error> 
 }
 
 impl App {
-    /// ブロッキングなコールバックの TCP ハンドラ（C・Python 用、F-210）。`connect` は接続ごとにハンドラ用プールで
-    /// 呼ばれ、[`L4Session`] を返す（`None` なら閉じる）。読み書きはワーカーの非同期 I/O で、コールバックは
-    /// 受信のたびにプールで 1 つずつ呼ばれる（同じ接続のコールバックは並行しない）。
+    // F-210: C・Python 用。
+    /// A TCP handler with blocking callbacks. `connect` is called on the handler pool for each connection and
+    /// returns an [`L4Session`] (`None` closes the connection). Reads and writes use the worker's asynchronous I/O,
+    /// and the callback is called on the pool once per receive (callbacks of the same connection never run concurrently).
     pub fn l4_tcp_blocking<F>(self, name: &str, listen: &str, connect: F) -> App
     where
         F: Fn(SocketAddr, &mut L4Out) -> Option<Box<dyn L4Session>> + Send + Sync + 'static,
@@ -411,8 +413,9 @@ impl App {
         })
     }
 
-    /// ブロッキングなコールバックの UDP ハンドラ（C・Python 用、F-210）。`f` はデータグラムごとにハンドラ用
-    /// プールで呼ばれ、`Some` を返すと送信元へ返信する。
+    // F-210: C・Python 用。
+    /// A UDP handler with blocking callbacks. `f` is called on the handler pool for each datagram, and returning
+    /// `Some` replies to the sender.
     pub fn l4_udp_blocking<F>(self, name: &str, listen: &str, f: F) -> App
     where
         F: Fn(Bytes, SocketAddr) -> Option<Bytes> + Send + Sync + 'static,
@@ -425,7 +428,7 @@ impl App {
     }
 }
 
-/// 設定フック: `App::l4_*` の `[[l4]]` を注入する（同名の `[[l4]]` が TOML にあれば注入しない）。
+/// Configuration hook: injects the `[[l4]]` entries of `App::l4_*` (not injected if TOML already has an `[[l4]]` of the same name).
 pub(crate) fn inject_l4(root: &mut toml::Value) -> Result<(), String> {
     let injected = INJECTED.lock().unwrap().clone();
     if injected.is_empty() {
@@ -451,7 +454,7 @@ pub(crate) fn inject_l4(root: &mut toml::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// TCP ハンドラで接続を処理する（`l4::server` の accept ループから呼ばれる）。
+/// Handles a connection with a TCP handler (called from the accept loop of `l4::server`).
 pub(crate) async fn serve_tcp(
     handler: L4TcpFn,
     stream: TcpStream,
@@ -465,7 +468,7 @@ pub(crate) async fn serve_tcp(
     }
 }
 
-/// UDP ハンドラでリスナーを処理する（1 データグラムごとに呼ぶ。返信は同じソケットから）。
+/// Serves a listener with a UDP handler (called once per datagram; the reply goes out from the same socket).
 pub(crate) async fn serve_udp(handler: L4UdpFn, listen_addr: SocketAddr, listener: Arc<str>) {
     use crate::config::SHUTDOWN_FLAG;
     use std::sync::atomic::Ordering;

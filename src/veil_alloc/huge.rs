@@ -1,15 +1,16 @@
-//! 256KiB を超える確保（F-183）。OS から直接マップし、解放で即座に `munmap` する
-//! （大きな領域を手元に残さない＝ピーク後の RSS がすぐ下がる）。
+// F-183: 256KiB 超の確保。大きな領域を手元に残さないので、ピーク後の RSS がすぐ下がる。
+//! Allocations larger than 256 KiB.
 //!
-//! `GlobalAlloc` は解放時にもサイズを渡すので、ヘッダや管理表を持たない。
-//! Linux の `realloc` は `mremap` でコピー無しに伸縮する。
+//! They are mapped directly from the OS and unmapped with `munmap` as soon as they are freed.
+//! `GlobalAlloc` passes the size on deallocation too, so there is no header or bookkeeping table.
+//! On Linux, `realloc` grows and shrinks the mapping with `mremap` without copying.
 
 use core::ptr;
 use core::sync::atomic::Ordering;
 
 use super::{os, stats, SLOT_SIZE};
 
-/// mmap が保証する最小アライメント（すべての対応プラットフォームのページサイズ以下）。
+/// The minimum alignment `mmap` guarantees (at most the page size of every supported platform).
 const MAP_ALIGN: usize = 4096;
 
 #[inline]
@@ -40,8 +41,9 @@ pub(crate) fn free(p: *mut u8, size: usize) {
     }
 }
 
-/// huge → huge の伸縮。マップ長が同じなら同じポインタ、Linux は `mremap`。
-/// それ以外（他 OS の伸長）は null を返し、呼び出し側が確保・コピー・解放する。
+/// Resizes a huge allocation into another huge allocation. The same pointer is returned when
+/// the mapped length is unchanged; Linux uses `mremap`.
+/// On other OSes a growing resize returns null, and the caller allocates, copies and frees.
 pub(crate) fn realloc(p: *mut u8, old: usize, new: usize, align: usize) -> *mut u8 {
     let (Some(old_len), Some(new_len)) = (mapped_size(old.max(1)), mapped_size(new.max(1))) else {
         return ptr::null_mut();

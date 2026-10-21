@@ -297,6 +297,8 @@ jobs:
           annotate() { grep -E "FAIL|Error|Traceback|error:" "$1" | tail -30 | while IFS= read -r l; do echo "::error title=wheel test::${l:0:900}"; done; }
           "$PY" crates/veil-python/tests/test_binding.py 2>&1 | tee "$RUNNER_TEMP/unit.log" || { annotate "$RUNNER_TEMP/unit.log"; exit 1; }
           PYTHON="$PY" PYTHON3="$PY" crates/veil-python/tests/e2e.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log" || { annotate "$RUNNER_TEMP/e2e.log"; exit 1; }
+          # F-241: help() に出る __doc__ が英語だけで、チケット番号が無い
+          PYTHON="$PY" tools/release/check-docs.sh --wheel 2>&1 | tee "$RUNNER_TEMP/docs.log" || { annotate "$RUNNER_TEMP/docs.log"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.name }}

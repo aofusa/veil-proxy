@@ -1,4 +1,4 @@
-//! ライブラリの起動（F-188）: `App` ビルダ・`serve`・共有状態・停止。
+//! Library startup: the [`App`] builder, `serve`, shared state and shutdown.
 
 use super::config::{compose, Config, ConfigError};
 use super::handler::{self, HandlerEntry, HandlerFn, OperationMeta, RouteDef};
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// ライブラリの起動・実行時エラー。
+/// Errors raised while starting or running the library.
 #[derive(Debug, Clone)]
 pub struct Error(pub String);
 
@@ -39,12 +39,12 @@ impl From<String> for Error {
 
 type StateMap = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
-/// 起動前に登録された状態（`App::state`）。
+/// State registered before startup (see `App::state`).
 static PENDING_STATE: Mutex<Option<StateMap>> = Mutex::new(None);
-/// 起動時に凍結した状態（リクエスト時はロック無しで読む）。
+/// State frozen at startup (read without locking at request time).
 static STATE: OnceLock<StateMap> = OnceLock::new();
 
-/// `App::state` で登録した値を型で引く。
+/// Looks up a value registered with `App::state` by its type.
 pub fn state<T: Send + Sync + 'static>() -> Option<Arc<T>> {
     let any = STATE.get()?.get(&TypeId::of::<T>())?.clone();
     any.downcast::<T>().ok()
@@ -57,36 +57,41 @@ fn freeze_state() {
 
 // ===================== ライブラリ設定（[api]） =====================
 
-/// `[api]` セクション（本体の設定には無いキー。フックが取り除いて読む）。
+/// The `[api]` section (keys absent from the main configuration; a hook strips and reads them).
 #[derive(Debug, Clone)]
 pub struct ApiSettings {
-    /// OpenAPI（`/openapi.json` と Swagger UI）を提供するか。既定 `true`。
+    /// Whether to serve OpenAPI (`/openapi.json` and Swagger UI). Defaults to `true`.
     pub openapi_enabled: bool,
-    /// Swagger UI のパス。既定 `/docs`。
+    /// Path of the Swagger UI. Defaults to `/docs`.
     pub openapi_path: String,
-    /// OpenAPI JSON のパス。既定 `/openapi.json`。
+    /// Path of the OpenAPI JSON document. Defaults to `/openapi.json`.
     pub openapi_json_path: String,
-    /// OpenAPI 文書の `info.title`。既定 `veil API`。
+    /// `info.title` of the OpenAPI document. Defaults to `veil API`.
     pub openapi_title: String,
-    /// OpenAPI 文書の `info.version`。既定 `0.1.0`。
+    /// `info.version` of the OpenAPI document. Defaults to `0.1.0`.
     pub openapi_version: String,
-    /// OpenAPI 文書の `info.description`（省略可）。
+    /// `info.description` of the OpenAPI document (optional).
     pub openapi_description: Option<String>,
-    /// ハンドラが受け取る要求本文の上限バイト数。既定 10MiB。
+    /// Maximum request body size, in bytes, that a handler accepts. Defaults to 10 MiB.
     pub max_body_size: usize,
-    /// ブロッキングなハンドラ用プールのスレッド数。`0` なら既定の数を自動で決める。
+    /// Number of threads in the blocking handler pool. `0` chooses a default automatically.
     pub handler_threads: usize,
-    /// tokio 互換ランタイムのワーカー数。既定 `2`。
+    /// Number of workers of the tokio-compatible runtime. Defaults to `2`.
     pub tokio_threads: usize,
-    /// gRPC の受信メッセージ上限（F-197、`grpc-handler`）
+    // F-197: gRPC の受信メッセージ上限。
+    /// Maximum size of a received gRPC message (`grpc-handler`).
     pub grpc_max_message_size: usize,
-    /// gRPC の応答の圧縮（`none`・`gzip`・`deflate`。F-209）
+    // F-209: gRPC の応答の圧縮。
+    /// Compression of gRPC responses (`none`, `gzip` or `deflate`).
     pub grpc_response_compression: String,
-    /// この大きさ未満の gRPC メッセージは圧縮しない（F-209）
+    // F-209
+    /// gRPC messages smaller than this size are not compressed.
     pub grpc_response_compression_min_size: usize,
-    /// gRPC-Web の CORS で許す Origin（`"*"` で全部、空なら CORS 無し。F-209）
+    // F-209
+    /// Origins allowed by gRPC-Web CORS (`"*"` allows all; empty disables CORS).
     pub grpc_web_cors_origins: Vec<String>,
-    /// gRPC の送信メッセージの上限（0 = 無制限。F-209）
+    // F-209
+    /// Maximum size of a sent gRPC message (0 = unlimited).
     pub grpc_max_send_message_size: usize,
 }
 
@@ -139,22 +144,22 @@ impl ApiSettings {
     }
 }
 
-/// ハンドラが受け取る本文の上限（`[api] max_body_size`）。リクエスト経路から読む。
+/// Maximum body size a handler accepts (`[api] max_body_size`); read on the request path.
 static MAX_BODY_SIZE: AtomicUsize = AtomicUsize::new(10 * 1024 * 1024);
 
-/// 現在の本文上限。
+/// The current body size limit.
 #[inline]
 pub fn max_body_size() -> usize {
     MAX_BODY_SIZE.load(Ordering::Relaxed)
 }
 
-/// tokio 互換ランタイムのワーカー数（`[api] tokio_threads`）。
+/// Number of workers of the tokio-compatible runtime (`[api] tokio_threads`).
 pub(crate) static TOKIO_THREADS: AtomicUsize = AtomicUsize::new(2);
 
-/// 最後にフックで読んだ `[api]` 設定。
+/// The `[api]` settings most recently read by the hook.
 pub(crate) static SETTINGS: Mutex<Option<ApiSettings>> = Mutex::new(None);
 
-/// 現在の `[api]` 設定（起動前は既定値）。
+/// The current `[api]` settings (defaults before startup).
 pub fn settings() -> ApiSettings {
     SETTINGS
         .lock()
@@ -165,7 +170,7 @@ pub fn settings() -> ApiSettings {
 
 // ===================== App =====================
 
-/// 登録待ちのルート（起動時にレイヤー適用・レジストリ登録する）。
+/// A route awaiting registration (layers are applied and the registry is filled at startup).
 pub(crate) struct PendingRoute {
     pub name: String,
     pub path: String,
@@ -175,13 +180,13 @@ pub(crate) struct PendingRoute {
     pub streaming_request: bool,
 }
 
-/// ハンドラ関数を包むミドルウェア（`layer_on` 等）。`prefix` に一致するルートだけに掛かる。
+/// Middleware wrapping handler functions (such as `layer_on`); applies only to routes matching `prefix`.
 pub(crate) struct Middleware {
     pub prefix: String,
     pub wrap: Box<dyn Fn(HandlerFn) -> HandlerFn + Send + Sync>,
 }
 
-/// API サーバのビルダ（設計書の `Router` も同じもの）。
+/// Builder for an API server.
 ///
 /// ```no_run
 /// use veil::prelude::*;
@@ -198,10 +203,10 @@ pub struct App {
     setup: Vec<SetupFn>,
 }
 
-/// 起動時の初期化処理（`App::on_setup`）。
+/// Initialization run at startup (see `App::on_setup`).
 type SetupFn = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
-/// 設計書の `veil::Router`（`App` と同じ）。
+/// Alias of [`App`].
 pub type Router = App;
 
 impl Default for App {
@@ -211,7 +216,7 @@ impl Default for App {
 }
 
 impl App {
-    /// カレントディレクトリに `config.toml` があれば取り込み、無ければライブラリ既定設定で作る。
+    /// Creates an app, loading `config.toml` from the current directory if present and the library defaults otherwise.
     pub fn new() -> App {
         App {
             config: Config::load(),
@@ -222,25 +227,25 @@ impl App {
         }
     }
 
-    /// 設定を指定する（`Config::from_file(..)?.builder()...build()` 等）。
+    /// Sets the configuration (for example `Config::from_file(..)?.builder()...build()`).
     pub fn config(mut self, config: Config) -> App {
         self.config = Ok(config);
         self
     }
 
-    /// マクロ（`#[veil::route]`）のルートを含める（既定で含む。設計書の記法との互換用）。
+    /// Includes the routes declared with `#[veil::route]` (the default).
     pub fn route_from_macros(mut self) -> App {
         self.include_macro_routes = true;
         self
     }
 
-    /// マクロのルートを含めない。
+    /// Excludes the routes declared with macros.
     pub fn without_macro_routes(mut self) -> App {
         self.include_macro_routes = false;
         self
     }
 
-    /// 共有状態を登録する（ハンドラは `State<T>` 抽出子・`req.state::<T>()` で受け取る）。
+    /// Registers shared state, which handlers receive through the `State<T>` extractor or `req.state::<T>()`.
     pub fn state<T: Send + Sync + 'static>(self, value: T) -> App {
         let mut g = PENDING_STATE.lock().unwrap();
         g.get_or_insert_with(HashMap::new)
@@ -249,7 +254,7 @@ impl App {
         self
     }
 
-    /// async 関数をハンドラとして登録する（`methods` が空なら全メソッド）。
+    /// Registers an async function as a handler (all methods when `methods` is empty).
     pub fn route<F, Fut, R>(self, methods: &[&str], path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -264,7 +269,7 @@ impl App {
         self.route_fn(&name, methods, path, handler::handler_fn(f), meta)
     }
 
-    /// ブロッキングな関数をハンドラとして登録する（ハンドラ用プールで実行）。
+    /// Registers a blocking function as a handler (run on the handler pool).
     pub fn route_blocking<F, R>(self, methods: &[&str], path: &str, f: F) -> App
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -278,7 +283,7 @@ impl App {
         self.route_fn(&name, methods, path, handler::blocking_handler_fn(f), meta)
     }
 
-    /// 名前・メタデータ付きでハンドラ関数を登録する（C・Python のバインディングが使う）。
+    /// Registers a handler function with a name and metadata (used by the C and Python bindings).
     pub fn route_fn(
         mut self,
         name: &str,
@@ -298,7 +303,8 @@ impl App {
         self
     }
 
-    /// 要求本文をストリーミングで受け取るハンドラ関数を登録する（`Request::take_body_stream`、F-197）。
+    // F-197
+    /// Registers a handler function that receives the request body as a stream (see `Request::take_body_stream`).
     pub fn route_fn_streaming(
         mut self,
         name: &str,
@@ -314,7 +320,7 @@ impl App {
         self
     }
 
-    /// `GET` メソッドのルートを登録する（`route(&["GET"], path, f)` の短縮形）。
+    /// Registers a `GET` route (shorthand for `route(&["GET"], path, f)`).
     pub fn get<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -324,7 +330,7 @@ impl App {
         self.route(&["GET"], path, f)
     }
 
-    /// `POST` メソッドのルートを登録する（`route(&["POST"], path, f)` の短縮形）。
+    /// Registers a `POST` route (shorthand for `route(&["POST"], path, f)`).
     pub fn post<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -334,7 +340,7 @@ impl App {
         self.route(&["POST"], path, f)
     }
 
-    /// `PUT` メソッドのルートを登録する（`route(&["PUT"], path, f)` の短縮形）。
+    /// Registers a `PUT` route (shorthand for `route(&["PUT"], path, f)`).
     pub fn put<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -344,7 +350,7 @@ impl App {
         self.route(&["PUT"], path, f)
     }
 
-    /// `DELETE` メソッドのルートを登録する（`route(&["DELETE"], path, f)` の短縮形）。
+    /// Registers a `DELETE` route (shorthand for `route(&["DELETE"], path, f)`).
     pub fn delete<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -354,7 +360,7 @@ impl App {
         self.route(&["DELETE"], path, f)
     }
 
-    /// `PATCH` メソッドのルートを登録する（`route(&["PATCH"], path, f)` の短縮形）。
+    /// Registers a `PATCH` route (shorthand for `route(&["PATCH"], path, f)`).
     pub fn patch<F, Fut, R>(self, path: &str, f: F) -> App
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -364,8 +370,8 @@ impl App {
         self.route(&["PATCH"], path, f)
     }
 
-    /// ハンドラ関数を包むミドルウェアを登録する（`prefix` が `"/"` なら全ルート）。
-    /// tower の層は `layer` / `layer_on`（`api-core`）を使う。
+    /// Registers middleware that wraps handler functions (all routes when `prefix` is `"/"`).
+    /// Use `layer` / `layer_on` (`api-core`) for tower layers.
     pub fn wrap_on(
         mut self,
         prefix: &str,
@@ -378,7 +384,7 @@ impl App {
         self
     }
 
-    /// 試験用: 最後に登録したルートの関数に、起動時と同じ順でミドルウェアを掛けたもの（gRPC の試験が使う）。
+    /// For tests: the function of the last registered route with the middleware applied in the same order as at startup (used by the gRPC tests).
     #[cfg(all(test, feature = "grpc-handler"))]
     pub(crate) fn last_route_wrapped(&self) -> HandlerFn {
         let route = self.routes.last().expect("registered");
@@ -391,13 +397,13 @@ impl App {
         func
     }
 
-    /// 起動時（ハンドラ登録の前）に実行する初期化処理を足す（DB 接続の確立・L4 ハンドラ等の拡張が使う）。
+    /// Adds initialization to run at startup, before handlers are registered (used by extensions such as database connection setup and L4 handlers).
     pub fn on_setup(mut self, f: impl FnOnce() -> Result<(), String> + Send + 'static) -> App {
         self.setup.push(Box::new(f));
         self
     }
 
-    /// 起動して停止（SIGINT/SIGTERM・`veil::shutdown()`）までブロックする。
+    /// Starts the server and blocks until shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
     pub fn run(self) -> Result<(), Error> {
         let config = self.config?;
         for f in self.setup {
@@ -436,7 +442,7 @@ impl App {
     }
 }
 
-/// `prefix` がパスのセグメント境界での前方一致か（`"/"` は全部）。
+/// Whether `prefix` is a prefix of the path on a segment boundary (`"/"` matches everything).
 fn path_has_prefix(path: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
@@ -449,7 +455,7 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// メソッドとパスから自動のハンドラ名を作る（例: `GET /users/{id}` → `get_users_id`）。
+/// Builds an automatic handler name from the methods and path (for example `GET /users/{id}` becomes `get_users_id`).
 fn auto_name(methods: &[&str], path: &str) -> String {
     let mut name = methods
         .first()
@@ -468,7 +474,7 @@ fn auto_name(methods: &[&str], path: &str) -> String {
     name
 }
 
-/// 設定フックを入れて本体の起動経路（`run_server`）で起動する。
+/// Installs the configuration hook and starts through the main server entry point (`run_server`).
 fn start(config: Config) -> Result<(), Error> {
     let inline = config.inline.clone();
     let overrides = config.overrides.clone();
@@ -528,7 +534,7 @@ fn start(config: Config) -> Result<(), Error> {
     Ok(())
 }
 
-/// 注入するハンドラ（利用者のもの + 有効な組み込み（OpenAPI 等））。
+/// The handlers to inject: the user's own plus the enabled built-ins (such as OpenAPI).
 fn builtin_and_user_entries(settings: &ApiSettings) -> Result<Vec<Arc<HandlerEntry>>, String> {
     #[cfg(feature = "openapi")]
     super::openapi::refresh(settings)?;
@@ -539,28 +545,28 @@ fn builtin_and_user_entries(settings: &ApiSettings) -> Result<Vec<Arc<HandlerEnt
         .collect())
 }
 
-/// 起動して停止までブロックする（`Config` だけで、ルートはマクロのもの）。
+/// Starts and blocks until shutdown (takes only a `Config`; the routes are the macro-declared ones).
 pub fn serve_blocking(config: Config) -> Result<(), Error> {
     App::new().config(config).run()
 }
 
-/// 設計書の `veil::serve(config).await`（`#[veil::main]` の中で使う）。
-/// 中では `serve_blocking` を呼ぶ（呼び出したスレッドは停止までブロックする）。
+/// Starts the server from within `#[veil::main]`, as `veil::serve(config).await`.
+/// It calls `serve_blocking`, so the calling thread blocks until shutdown.
 pub async fn serve(config: Config) -> Result<(), Error> {
     serve_blocking(config)
 }
 
-/// ルータ（`App`）を指定して起動する（設計書の `veil::run_with_router` 相当）。
+/// Starts the server with the given router ([`App`]).
 pub async fn serve_with_router(config: Config, router: Router) -> Result<(), Error> {
     router.config(config).run()
 }
 
-/// 実行中のサーバを停止する（SIGTERM と同じ graceful shutdown）。
+/// Stops the running server (graceful shutdown, the same as SIGTERM).
 pub fn shutdown() {
     crate::config::SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
 }
 
-/// `#[veil::main]` が使う最小の executor（main の async ブロックを実行する）。
+/// The minimal executor used by `#[veil::main]` to run the async block of `main`.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }

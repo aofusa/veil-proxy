@@ -1,14 +1,14 @@
-//! tokio 互換レイヤー（F-198、`tokio-compat` feature。API ライブラリ専用）。
+// F-198: tokio 互換レイヤー。設計は docs/backlog/features/F-198-tokio-free-compat-layer.md、互換表は docs/guide/library.md。
+//! A tokio-compatible API layer (requires the `tokio-compat` feature; intended for the API library).
 //!
-//! tokio に依存せず、veil のランタイム（io_uring / reactor）の上に tokio の API の形を提供する。
-//! `use veil::tokio as tokio;` で使うか、`crates/veil-tokio/tokio-shim`（パッケージ名 `tokio`）を
-//! `[patch.crates-io]` に当てて依存ツリーの tokio を置き換える。
+//! It does not depend on tokio. Instead it provides the shape of tokio's API on top of veil's own
+//! runtime (io_uring or the readiness reactor). Use it as `use veil::tokio as tokio;`, or patch the
+//! `tokio` package in your dependency tree with the `tokio-shim` crate through `[patch.crates-io]`.
 //!
-//! - スレッド越しの wake は `waker` の受け口で所有スレッドへ返す（veil のランタイムは変えない）。
-//! - タスクは spawn したスレッドで動く（work stealing なし）。I/O オブジェクトも作ったスレッドで使う。
-//! - `process`・ランタイムのメトリクス・タスクダンプは未対応。
-//!
-//! 設計: docs/backlog/features/F-198-tokio-free-compat-layer.md。互換表: docs/guide/library.md。
+//! - Wake-ups from other threads are forwarded to the owning thread; veil's runtime is unchanged.
+//! - A task runs on the thread that spawned it (there is no work stealing). Use an I/O object on the
+//!   thread that created it.
+//! - `process`, runtime metrics and task dumps are not supported.
 
 pub mod fs;
 pub mod future;
@@ -31,11 +31,11 @@ pub use crate::__veil_tokio_select as select;
 pub use crate::__veil_tokio_task_local as task_local;
 pub use crate::__veil_tokio_try_join as try_join;
 
-/// `#[tokio::main]` / `#[tokio::test]`（tokio-macros。`veil::tokio` を直接使うときは
-/// `#[veil::tokio::main(crate = "veil::tokio")]` のように `crate` を指定する）。
+/// Re-export of `#[tokio::main]` / `#[tokio::test]` (from tokio-macros). When you use `veil::tokio`
+/// directly, name the crate explicitly, for example `#[veil::tokio::main(crate = "veil::tokio")]`.
 pub use tokio_macros::{main, test};
 
-/// `tokio::pin!`（変数をその場でピン留めする）。
+/// Equivalent of `tokio::pin!`: pins a variable in place.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __veil_tokio_pin {

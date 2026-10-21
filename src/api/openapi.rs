@@ -1,7 +1,8 @@
-//! OpenAPI 3.1 の自動生成と Swagger UI（F-189、`openapi` feature）。
+// F-189
+//! OpenAPI 3.1 generation and Swagger UI (the `openapi` feature).
 //!
-//! 起動時（とリロードのたび）に登録済みハンドラのメタデータから 1 回だけ生成して `Bytes` で持つ。
-//! リクエスト時は保持した `Bytes` を返すだけ（ホットパスで生成しない）。
+//! The document is generated once from the metadata of the registered handlers at startup (and on every
+//! reload) and kept as `Bytes`. At request time the kept `Bytes` is simply returned; nothing is generated on the hot path.
 
 use super::app::ApiSettings;
 use super::handler::{self, HandlerEntry, OperationMeta};
@@ -11,21 +12,21 @@ use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, OnceLock, RwLock};
 
-/// 組み込みハンドラの名前（`is_builtin_enabled` が `[api] openapi_enabled` で出し分ける）。
+/// The name of the built-in handler (`is_builtin_enabled` shows or hides it according to `[api] openapi_enabled`).
 pub const JSON_HANDLER: &str = "__veil_openapi_json";
-/// Swagger UI を返す組み込みハンドラの名前。
+/// The name of the built-in handler that serves Swagger UI.
 pub const DOCS_HANDLER: &str = "__veil_openapi_docs";
 
 static DOC: RwLock<Option<Bytes>> = RwLock::new(None);
 static DOCS_HTML: RwLock<Option<Bytes>> = RwLock::new(None);
 static REGISTERED: OnceLock<()> = OnceLock::new();
 
-/// 現在の OpenAPI ドキュメント（JSON）。
+/// The current OpenAPI document (JSON).
 pub fn document_json() -> Option<Bytes> {
     DOC.read().unwrap().clone()
 }
 
-/// 組み込みルートを登録し（初回のみ）、ドキュメントを作り直す。
+/// Registers the built-in routes (the first time only) and regenerates the document.
 pub(crate) fn refresh(settings: &ApiSettings) -> Result<(), String> {
     if REGISTERED.get().is_none() {
         let hidden = OperationMeta {
@@ -70,7 +71,7 @@ pub(crate) fn refresh(settings: &ApiSettings) -> Result<(), String> {
     Ok(())
 }
 
-/// Swagger UI（swagger-ui-dist を CDN から読む）。
+/// Swagger UI (loads swagger-ui-dist from a CDN).
 fn swagger_ui_html(settings: &ApiSettings) -> String {
     let title = html_escape(&settings.openapi_title);
     let url = serde_json::to_string(&settings.openapi_json_path)
@@ -103,12 +104,12 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// `{*rest}` → `{rest}`（OpenAPI のパステンプレート）。
+/// Converts `{*rest}` to `{rest}` (an OpenAPI path template).
 fn openapi_path(pattern: &str) -> String {
     pattern.replace("{*", "{")
 }
 
-/// FastAPI と同じ形の検証エラーのスキーマ。
+/// The schemas of validation errors, in the same shape as FastAPI.
 fn validation_error_schemas(components: &mut Map<String, Value>) {
     components.insert(
         "ValidationError".into(),
@@ -219,7 +220,7 @@ fn operation(meta: &OperationMeta, components: &mut Map<String, Value>) -> Value
     Value::Object(op)
 }
 
-/// 登録済みハンドラから OpenAPI ドキュメントを作る。
+/// Generates the OpenAPI document from the registered handlers.
 pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value {
     let mut paths = Map::new();
     let mut components = Map::new();

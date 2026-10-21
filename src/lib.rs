@@ -66,6 +66,8 @@
 //! See <https://github.com/aofusa/veil-proxy/tree/main/docs/guide> (start with `library.md`).
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// F-241: docs.rs にソースの表示を出さない（コメントは日本語のため。ソースは crates.io と GitHub で読める）。
+#![doc(html_no_source)]
 
 // ====================
 // メモリアロケータ選択
@@ -137,7 +139,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[doc(hidden)]
 pub mod alloc_stats;
 
-/// F-183: アロケータのアイドル時回収（ワーカーのアイドル点から呼ぶ）。
+// F-183
+/// Idle-time reclamation of allocator memory (called from the workers' idle points).
 pub(crate) mod alloc_tune;
 
 #[cfg(all(feature = "alloc-stats", veil_alloc_active))]
@@ -279,10 +282,11 @@ pub mod l4;
 #[doc(hidden)]
 pub mod simple_tls;
 
-/// rustls 暗号文チャンクを `writev(2)`（Windows は `WSASend`）で直接カーネルへ渡す
-/// ゼロコピー送信ヘルパー（F-150）。`simple_tls`（`veil_ktls` 無効時）・
-/// `ktls_rustls`（`veil_ktls` 時の rustls フォールバック経路）の両方が使うため、
-/// `veil_ktls` の有無に関わらず常にコンパイルする。
+// F-150
+/// Zero-copy send helper that hands rustls ciphertext chunks directly to the kernel with
+/// `writev(2)` (`WSASend` on Windows). Both `simple_tls` (when `veil_ktls` is disabled) and
+/// `ktls_rustls` (the rustls fallback path when `veil_ktls` is enabled) use it, so it is
+/// always compiled regardless of `veil_ktls`.
 pub(crate) mod tls_writev;
 
 #[cfg(feature = "jwt")]
@@ -366,7 +370,8 @@ mod entry;
 pub use entry::run;
 pub use entry::{run_server, ServerOptions};
 
-/// API サーバ基盤ライブラリ（F-188〜F-192）。`handler` feature（`api` 等）のときだけ存在する。
+// F-188〜F-192
+/// The API server foundation library. Present only with the `handler` feature (for example through `api`).
 #[cfg(feature = "handler")]
 pub mod api;
 #[cfg(feature = "handler")]

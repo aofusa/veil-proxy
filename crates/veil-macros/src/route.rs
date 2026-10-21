@@ -87,14 +87,14 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
     Ok(a)
 }
 
-/// 引数 1 個の扱い。
+/// How one argument is handled.
 enum ArgKind {
     RequestRef,
     RequestOwned,
     Json(Type),
     Query(Type),
     Form(Type),
-    /// `FromRequest` で取り出す（State・Headers・Bytes 等）
+    /// Extracted with `FromRequest` (State, Headers, Bytes and so on).
     FromRequest(Type),
     PathParam(String, Type),
     QueryParam {
@@ -144,7 +144,7 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
     }
 }
 
-/// 戻り値型から OpenAPI の応答スキーマを推測する（`Json<T>`・`Result<Json<T>, _>`・`(u16, Json<T>)`・文字列）。
+/// Infers the OpenAPI response schema from the return type (`Json<T>`, `Result<Json<T>, _>`, `(u16, Json<T>)` or a string).
 fn response_content(ret: &ReturnType) -> TokenStream {
     let ty = match ret {
         ReturnType::Default => return quote!(None),

@@ -71,8 +71,8 @@ impl GrpcStatusCode {
         }
     }
 
+    // std::str::FromStr と紛らわしいため独自名。
     /// Parse from string (grpc-status header value)
-    /// （std::str::FromStr と紛らわしいため独自名）
     pub fn parse_str(s: &str) -> Option<Self> {
         s.parse::<u8>().ok().and_then(Self::from_u8)
     }

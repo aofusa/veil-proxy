@@ -79,16 +79,17 @@ impl GrpcCompression {
         }
     }
 
-    /// このビルドで実際に解凍できるか（`compression` feature 無しでは gzip・deflate を扱えない。B-127）
+    // B-127: `compression` feature 無しでは gzip・deflate を扱えない。
+    /// Whether this build can decompress this encoding (gzip and deflate need the `compression` feature).
     pub fn is_supported(&self) -> bool {
         matches!(self, Self::Identity) || cfg!(feature = "compression")
     }
 
-    /// 解凍後の大きさが `limit` を超えたら打ち切る（B-127）。
+    // B-127: 全部解凍してから大きさを比べると、高圧縮率の小さなメッセージで巨大な確保をさせられる。
+    /// Decompresses `data`, stopping as soon as the output would exceed `limit` bytes.
     ///
-    /// 全部解凍してから大きさを比べると、高圧縮率の小さなメッセージで巨大な確保をさせられる。
-    /// `limit + 1` バイトまでしか読まず、超えたら `MessageTooLarge`（`size` は `limit + 1`）を返す。
-    /// 確保も `limit + 1` バイトを超えない。
+    /// At most `limit + 1` bytes are read and allocated; if the output is larger, this returns
+    /// `MessageTooLarge` with `size` set to `limit + 1`.
     pub fn decompress_limited(&self, data: &[u8], limit: usize) -> Result<Vec<u8>, GrpcError> {
         match self {
             Self::Identity => {

@@ -1,4 +1,4 @@
-//! gRPC サーバ層の単体テスト（ワーカーを起動せず、ハンドラ関数を直接呼ぶ）。
+//! Unit tests of the gRPC server layer (the handler functions are called directly, without starting a worker).
 
 use super::health::{HealthCheckRequest, HealthCheckResponse, HealthCodec};
 use super::*;
@@ -36,7 +36,7 @@ fn grpc_request(version: HttpVersion, frames: Vec<Bytes>, extra: &[(&str, &str)]
     req
 }
 
-/// 応答を (ヘッダ, DATA の連結, トレーラ) にする。
+/// Splits a response into (headers, concatenated DATA, trailers).
 fn collect(mut resp: crate::api::response::Response) -> (Metadata, Vec<u8>, Metadata) {
     let headers = resp.headers().to_vec();
     let mut data = Vec::new();
@@ -247,7 +247,7 @@ fn gzip_compressed_request() {
     assert_eq!(decode_all::<HealthCheckRequest>(&data)[0].service, ":gz");
 }
 
-/// 応答の `grpc-status`（Trailers-Only ならヘッダ、そうでなければトレーラ）。
+/// The `grpc-status` of a response (from the headers for Trailers-Only, otherwise from the trailers).
 fn status_of(resp: crate::api::response::Response) -> Option<Vec<u8>> {
     if let Some(v) = field(&resp.headers().to_vec(), "grpc-status") {
         return Some(v.to_vec());
@@ -256,7 +256,8 @@ fn status_of(resp: crate::api::response::Response) -> Option<Vec<u8>> {
     field(&t, "grpc-status").map(|v| v.to_vec())
 }
 
-/// B-127: 解凍すると上限を大きく超えるメッセージは、全部解凍せずに RESOURCE_EXHAUSTED。
+// B-127
+/// A message that expands far beyond the limit when decompressed gives RESOURCE_EXHAUSTED without being fully decompressed.
 #[cfg(feature = "compression")]
 #[test]
 fn gzip_bomb_is_resource_exhausted() {
@@ -282,7 +283,8 @@ fn gzip_bomb_is_resource_exhausted() {
     }
 }
 
-/// B-127: `compression` feature 無しのビルドは gzip を解凍せずに通していた。UNIMPLEMENTED で断る。
+// B-127: 以前は `compression` feature 無しのビルドで gzip を解凍せずに通していた。
+/// A build without the `compression` feature refuses gzip with UNIMPLEMENTED.
 #[cfg(not(feature = "compression"))]
 #[test]
 fn gzip_without_compression_feature_is_unimplemented() {
@@ -315,7 +317,7 @@ fn web_request(version: HttpVersion, ct: &str, body: Bytes, extra: &[(&str, &str
     req
 }
 
-/// 本文の枠を (フラグ, 中身) に分ける。
+/// Splits a body into frames of (flag, contents).
 fn web_frames(mut body: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
     while body.len() >= 5 {
@@ -342,7 +344,8 @@ fn unb64(data: &[u8]) -> Vec<u8> {
     out.to_vec()
 }
 
-/// F-209 #4: gRPC-Web（バイナリ）は HTTP/1.1 でも受け、トレーラを本文の最後の枠（0x80）で返す。
+// F-209 #4
+/// gRPC-Web (binary) is accepted over HTTP/1.1 too, and the trailers are returned in the last frame (0x80) of the body.
 #[test]
 fn grpc_web_binary_over_http1() {
     let f = handler_of(echo_app());
@@ -373,7 +376,8 @@ fn grpc_web_binary_over_http1() {
     assert!(trailers.contains("x-tail: t\r\n"), "{}", trailers);
 }
 
-/// F-209 #4: `-text` は要求も応答も base64。エラーは状態をヘッダと本文のトレーラの枠の両方に載せる。
+// F-209 #4
+/// `-text` is base64 for both request and response. An error puts the status in both the headers and the body's trailer frame.
 #[test]
 fn grpc_web_text_and_errors() {
     let f = handler_of(echo_app());
@@ -431,7 +435,8 @@ fn grpc_web_text_and_errors() {
     );
 }
 
-/// F-209 #4: CORS（`[api] grpc_web_cors_origins`）。許された Origin にだけプリフライトと応答のヘッダを返す。
+// F-209 #4
+/// CORS (`[api] grpc_web_cors_origins`): the preflight and response headers are returned only for an allowed origin.
 #[test]
 fn grpc_web_cors() {
     let f = handler_of(echo_app());
@@ -626,7 +631,8 @@ fn health_check_and_watch() {
     assert_eq!(status(second), 2);
 }
 
-/// F-208: 手書きのヘルスチェックの符号化が prost（dev-dependency）と同じバイト列で、互いに読めること。
+// F-208
+/// The hand-written health-check encoding produces the same bytes as prost (a dev-dependency) and each can read the other.
 #[test]
 fn health_codec_matches_prost() {
     #[derive(Clone, PartialEq, prost::Message)]
@@ -672,7 +678,8 @@ fn health_codec_matches_prost() {
     assert_eq!(r.unwrap_err().code(), Code::Internal);
 }
 
-/// F-208: `BytesCodec` は符号化前のバイト列をそのまま受け渡す（C・Python の橋渡しと生成コード無しの利用）。
+// F-208
+/// `BytesCodec` passes unencoded bytes through as they are (the C and Python bridge, and use without generated code).
 #[test]
 fn bytes_codec_roundtrip() {
     let f = handler_of(App::new().grpc_unary(
@@ -698,7 +705,8 @@ fn bytes_codec_roundtrip() {
     );
 }
 
-/// F-209 #2: 応答の圧縮は呼び出しの指定（または設定）とクライアントの `grpc-accept-encoding` の両方が要る。
+// F-209 #2
+/// Response compression needs both the call's choice (or the setting) and the client's `grpc-accept-encoding`.
 #[cfg(feature = "compression")]
 #[test]
 fn response_compression_needs_client_acceptance() {
@@ -753,7 +761,8 @@ fn response_encoding_negotiation() {
     );
 }
 
-/// F-209 #6: `with_details` は `grpc-status-details-bin`（base64、`=` 無し）で送る。
+// F-209 #6
+/// `with_details` sends `grpc-status-details-bin` (base64, without `=`).
 #[test]
 fn status_details_bin() {
     let t = Status::invalid_argument("bad")
@@ -767,7 +776,8 @@ fn status_details_bin() {
     assert_eq!(&out[..], b"\x08\x03\x12\x03bad");
 }
 
-/// F-209 #7: インターセプタはメタデータを見て断れる（Trailers-Only）。gRPC 以外の要求は素通し。
+// F-209 #7
+/// An interceptor can refuse a call by looking at the metadata (Trailers-Only). Requests that are not gRPC pass through.
 #[test]
 fn interceptor_rejects_and_passes() {
     let app = App::new()
@@ -801,7 +811,8 @@ fn interceptor_rejects_and_passes() {
     assert_eq!(field(&t, "grpc-status"), Some(&b"0"[..]));
 }
 
-/// F-209 #8: 送信メッセージの上限。
+// F-209 #8
+/// The limit on sent messages.
 #[test]
 fn send_limit() {
     assert!(send_limit_error(10, 0).is_none());
@@ -812,7 +823,8 @@ fn send_limit() {
     );
 }
 
-/// F-209 #9: どのルートにも当たらない通常の gRPC は Trailers-Only の UNIMPLEMENTED。gRPC-Web・他は 404 のまま。
+// F-209 #9
+/// An ordinary gRPC request matching no route gets a Trailers-Only UNIMPLEMENTED. gRPC-Web and others still get 404.
 #[test]
 fn unknown_route_is_unimplemented_for_grpc() {
     let h = |ct: &'static [u8]| vec![(&b"content-type"[..], ct)];

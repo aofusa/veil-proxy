@@ -34,7 +34,7 @@ For each service the output has a module `<service>_server` with:
 | `SERVICE_NAME`, `METHODS` | `<package>.<Service>` and the `/<package>.<Service>/<Method>` paths |
 | `FILE_DESCRIPTOR_SET` | the compiled `FileDescriptorSet` (with imports), for `App::grpc_reflection` (written to `OUT_DIR` as `veil_fds_<first proto>.bin`) |
 
-veil itself does not depend on prost: the codec lives in the generated code (F-208). Options:
+veil itself does not depend on prost: the codec lives in the generated code. Options:
 `veil_build::configure().veil_path("::my_veil")` changes the path of the `veil` crate, and `config_mut()` exposes the
 `prost_build::Config`.
 

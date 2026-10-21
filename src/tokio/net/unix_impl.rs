@@ -1,4 +1,5 @@
-//! Unix ドメインソケット・`AsyncFd`（unix だけ。F-204 で `net.rs` から移しただけ）。
+// F-204: `net.rs` から移しただけ。
+//! Unix domain sockets and `AsyncFd` (unix only).
 
 use super::sys::{cvt, cvt_i, new_socket, set_nonblocking_cloexec, sys_recv};
 use super::*;
@@ -52,7 +53,7 @@ impl UnixStream {
         Ok(UnixStream { inner: s })
     }
 
-    /// アドレス（抽象名前空間を含む）へ接続する。
+    /// Connects to an address (including the abstract namespace).
     pub async fn connect_addr(addr: &std::os::unix::net::SocketAddr) -> io::Result<UnixStream> {
         UnixStream::from_std(std::os::unix::net::UnixStream::connect_addr(addr)?)
     }
@@ -63,7 +64,7 @@ impl UnixStream {
         Ok(std::os::unix::net::UnixStream::from(fd))
     }
 
-    /// 相手の資格情報。
+    /// The peer's credentials.
     pub fn peer_cred(&self) -> io::Result<UCred> {
         peer_cred(self.inner.io.raw())
     }
@@ -262,7 +263,7 @@ impl UnixListener {
     }
 }
 
-/// 相手の資格情報（`UnixStream::peer_cred`）。
+/// The peer's credentials (`UnixStream::peer_cred`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UCred {
     pid: Option<libc::pid_t>,
@@ -536,7 +537,7 @@ impl AsRawFd for UnixDatagram {
     }
 }
 
-/// `tokio::net::UnixSocket`（bind・設定してから listen / connect / datagram にする）。
+/// Equivalent of `tokio::net::UnixSocket`: configure and bind, then turn it into a listener, a stream or a datagram socket.
 #[derive(Debug)]
 pub struct UnixSocket {
     fd: OwnedFd,
@@ -656,20 +657,20 @@ impl AsRawFd for UnixSocket {
 
 // ===================== AsyncFd（io::unix） =====================
 
-/// 任意の fd の準備待ち（`tokio::io::unix::AsyncFd`）。準備の状態は「待ちが完了した」ことを覚え、
-/// `clear_ready` か `try_io` の `WouldBlock` で忘れる。
+/// Readiness waiting for an arbitrary fd (equivalent of `tokio::io::unix::AsyncFd`). The readiness state remembers that a
+/// wait completed, and forgets it on `clear_ready` or when `try_io` gets `WouldBlock`.
 pub struct AsyncFd<T: AsRawFd> {
     inner: Option<T>,
     io: IoSourceRef,
     interest: Interest,
     read_ready: std::sync::atomic::AtomicBool,
     write_ready: std::sync::atomic::AtomicBool,
-    /// `WouldBlock` で忘れた（tokio はエッジで覚えるので、次の準備待ちが完了するまで poll(2) で見直さない）
+    /// Forgotten after `WouldBlock` (tokio is edge-triggered, so poll(2) is not used to re-check until the next readiness wait completes).
     read_cleared: std::sync::atomic::AtomicBool,
     write_cleared: std::sync::atomic::AtomicBool,
 }
 
-/// fd を所有しない準備待ち（AsyncFd 用）。
+/// Readiness waiting that does not own the fd (for `AsyncFd`).
 struct IoSourceRef {
     fd: RawFd,
     read: Mutex<WaitSlot>,
@@ -677,7 +678,7 @@ struct IoSourceRef {
 }
 
 impl IoSourceRef {
-    /// `single` は `poll_*_ready`（最後の Waker だけを覚える）。
+    /// `single` is for `poll_*_ready` (only the last waker is remembered).
     fn poll_ready(&self, write: bool, single: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // tokio と同じく、ランタイムが止まった後の準備待ちはエラー
         if !crate::runtime::has_driver() {
@@ -734,7 +735,7 @@ impl Drop for IoSourceRef {
     }
 }
 
-/// `AsyncFd::try_new` の失敗（元の値を返す）。
+/// The error of `AsyncFd::try_new` (it gives back the original value).
 pub struct AsyncFdTryNewError<T> {
     inner: T,
     cause: io::Error,
@@ -760,7 +761,7 @@ impl<T> std::fmt::Display for AsyncFdTryNewError<T> {
 
 impl<T> std::error::Error for AsyncFdTryNewError<T> {}
 
-/// `try_io` で `WouldBlock` だった。
+/// `try_io` got `WouldBlock`.
 #[derive(Debug)]
 pub struct TryIoError(());
 
@@ -953,7 +954,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         self.ready_mut(Interest::WRITABLE).await
     }
 
-    /// 準備を待って `f` を呼ぶ（`WouldBlock` なら準備を忘れて待ち直す）。
+    /// Waits for readiness and calls `f` (on `WouldBlock` it forgets the readiness and waits again).
     pub async fn async_io<R>(
         &self,
         interest: Interest,
@@ -982,8 +983,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         }
     }
 
-    /// 準備を待たずに `f` を呼ぶ（`WouldBlock` なら準備を忘れる）。
-    /// 準備できているか（覚えていなければ poll(2) で今の状態を見る）。
+    /// Whether the fd is ready (if nothing is remembered, the current state is read with poll(2)).
     fn probe_ready(&self, interest: Interest) -> bool {
         let mut ready = (interest.is_readable()
             && self.read_ready.load(std::sync::atomic::Ordering::Acquire))
@@ -1023,7 +1023,7 @@ impl<T: AsRawFd> AsyncFd<T> {
         ready
     }
 
-    /// 準備できていれば `f` を呼ぶ（できていなければ呼ばずに `WouldBlock`。`WouldBlock` なら準備を忘れる）。
+    /// Calls `f` if the fd is ready (if not, returns `WouldBlock` without calling it; on `WouldBlock` it forgets the readiness).
     pub fn try_io_mut<R>(
         &mut self,
         interest: Interest,
@@ -1084,7 +1084,7 @@ impl<T: AsRawFd> AsRawFd for AsyncFd<T> {
     }
 }
 
-/// 準備ができたことを示すガード。
+/// A guard showing that the fd is ready.
 pub struct AsyncFdReadyGuard<'a, T: AsRawFd> {
     fd: &'a AsyncFd<T>,
     ready: Ready,
@@ -1136,7 +1136,7 @@ impl<'a, T: AsRawFd> AsyncFdReadyGuard<'a, T> {
     }
 }
 
-/// 準備ができたことを示すガード（可変）。
+/// A guard showing that the fd is ready (mutable).
 pub struct AsyncFdReadyMutGuard<'a, T: AsRawFd> {
     fd: &'a mut AsyncFd<T>,
     ready: Ready,
@@ -1202,7 +1202,7 @@ impl AsRawFd for UnixListener {
     }
 }
 
-/// `tokio::net::unix`（分割した半分の型は TCP と共通）。
+/// Equivalent of `tokio::net::unix` (the split half types are shared with TCP).
 pub mod unix {
     pub use super::tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
     pub use super::UCred;

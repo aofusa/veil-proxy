@@ -1,4 +1,4 @@
-//! `#[veil::main]`: `async fn main()` を同期の `main` にして中身を実行する。
+//! `#[veil::main]`: turns `async fn main()` into a synchronous `main` that runs its body.
 
 use proc_macro2::TokenStream;
 use quote::quote;

@@ -126,6 +126,9 @@ impl WorkerListenerSource {
 // メイン関数
 // ====================
 
+/// Runs the `veil` proxy binary: parses the command line (`-c`, `-t`, `--override`, ...), loads the
+/// configuration and serves until SIGINT / SIGTERM. This is what `src/main.rs` calls; API servers use
+/// [`serve`](crate::serve) instead.
 pub fn run() {
     // F-237: io_uring が使えなければ（Docker の既定の seccomp・RuntimeDefault）、同じイメージの epoll 版へ
     // 切り替える（切り替え先が無ければ何もしない）。メッシュの起動（F-227）より前に行う。
@@ -183,17 +186,17 @@ pub fn run() {
     });
 }
 
-/// サーバの起動オプション（CLI 解析から独立。API ライブラリからも使う）。
+/// Startup options of the server (independent of CLI parsing; also used by the API library).
 pub struct ServerOptions {
-    /// 設定ファイルのパス（SIGHUP リロードでも同じパスを読み直す）。
+    /// Path of the configuration file (the same path is read again on a SIGHUP reload).
     pub config_path: std::path::PathBuf,
-    /// `-t` 相当（設定を検証して終了する）。
+    /// Equivalent of `-t`: validate the configuration and exit.
     pub test_config: bool,
 }
 
-/// 設定ファイルを読み込んでサーバを起動し、停止（SIGINT/SIGTERM・`server::request_shutdown`）まで
-/// ブロックする。`--override`・環境変数の上書きは呼び出し側が
-/// `config_override::set_global_overrides` で先に確定させておくこと。
+/// Loads the configuration file, starts the server and blocks until it stops (SIGINT / SIGTERM or
+/// `server::request_shutdown`). The caller must settle `--override` and environment-variable
+/// overrides beforehand with `config_override::set_global_overrides`.
 pub fn run_server(opts: ServerOptions) {
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
     CONFIG_PATH.store(Arc::new(opts.config_path.clone()));

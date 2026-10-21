@@ -1,10 +1,11 @@
-//! ハンドラのパスパターン（`/users/{id}`・`/files/{*rest}`）の解析と照合（F-188）。
+// F-188
+//! Parsing and matching of handler path patterns (`/users/{id}`, `/files/{*rest}`).
 //!
-//! - `{name}`: 1 セグメント（空は不可）
-//! - `{*name}`: 末尾のみ。残り全部（空も可）
-//! - それ以外: 静的セグメント（完全一致）
+//! - `{name}`: one segment (must not be empty).
+//! - `{*name}`: allowed only at the end; matches the whole remainder (which may be empty).
+//! - Anything else: a static segment (exact match).
 //!
-//! 照合は割り当て無しで行い、パラメータは元のパス `Bytes` のスライス（参照カウントのみ）で返す。
+//! Matching allocates nothing, and parameters are returned as slices of the original path `Bytes` (reference counting only).
 
 use bytes::Bytes;
 use std::sync::Arc;
@@ -16,18 +17,18 @@ enum Segment {
     CatchAll(Arc<str>),
 }
 
-/// 解析済みのパスパターン。
+/// A parsed path pattern.
 #[derive(Debug, Clone)]
 pub struct PathPattern {
     raw: Arc<str>,
     segments: Vec<Segment>,
 }
 
-/// パターン照合で得たパスパラメータ（名前と、パスの該当部分）。
+/// Path parameters obtained from pattern matching (the name and the matching part of the path).
 pub type PathParams = Vec<(Arc<str>, Bytes)>;
 
 impl PathPattern {
-    /// パターン文字列を解析する。構文エラーは説明付きの `Err`。
+    /// Parses a pattern string. A syntax error is returned as an `Err` with an explanation.
     pub fn parse(pattern: &str) -> Result<PathPattern, String> {
         if !pattern.starts_with('/') {
             return Err(format!("path pattern '{}' must start with '/'", pattern));
@@ -89,12 +90,12 @@ impl PathPattern {
         })
     }
 
-    /// 元のパターン文字列。
+    /// The original pattern string.
     pub fn as_str(&self) -> &str {
         &self.raw
     }
 
-    /// パラメータ名（出現順）。
+    /// The parameter names, in order of appearance.
     pub fn param_names(&self) -> impl Iterator<Item = &str> {
         self.segments.iter().filter_map(|s| match s {
             Segment::Param(n) | Segment::CatchAll(n) => Some(&**n),
@@ -102,19 +103,19 @@ impl PathPattern {
         })
     }
 
-    /// パラメータを含むか（含まなければ静的パス）。
+    /// Whether the pattern contains parameters (otherwise it is a static path).
     pub fn has_params(&self) -> bool {
         self.segments
             .iter()
             .any(|s| !matches!(s, Segment::Static(_)))
     }
 
-    /// `path`（クエリを除いたもの）がパターンに一致するか（パラメータは取り出さない）。
+    /// Whether `path` (without the query) matches the pattern (parameters are not extracted).
     pub fn matches(&self, path: &[u8]) -> bool {
         self.walk(path, |_, _, _| {})
     }
 
-    /// `path` が一致すればパラメータを返す。`path` は `Bytes`（スライスは参照カウントのみ）。
+    /// Returns the parameters if `path` matches. `path` is a `Bytes` (slices cost only reference counting).
     pub fn captures(&self, path: &Bytes) -> Option<PathParams> {
         let mut params: PathParams = Vec::new();
         if self.walk(path, |name, start, end| {
@@ -126,7 +127,7 @@ impl PathPattern {
         }
     }
 
-    /// セグメント単位で照合し、パラメータの (名前, 開始, 終了) を `on_param` に渡す。
+    /// Matches segment by segment, passing each parameter's (name, start, end) to `on_param`.
     fn walk(&self, path: &[u8], mut on_param: impl FnMut(&Arc<str>, usize, usize)) -> bool {
         if path.first() != Some(&b'/') {
             return false;
@@ -176,8 +177,8 @@ impl PathPattern {
         true
     }
 
-    /// ルート並べ替え用の具体性（大きいほど具体的）。
-    /// (静的セグメント数, -パラメータ数, キャッチオールが無い)
+    /// Specificity for ordering routes (greater is more specific):
+    /// (number of static segments, minus the number of parameters, no catch-all).
     pub fn specificity(&self) -> (usize, isize, bool) {
         let mut statics = 0usize;
         let mut params = 0isize;
@@ -192,7 +193,7 @@ impl PathPattern {
         (statics, -params, !catch_all)
     }
 
-    /// 衝突検査用の正規化形（パラメータ名を `{}` に置き換えたもの）。
+    /// The normalized form for conflict checks (parameter names replaced by `{}`).
     pub fn normalized(&self) -> String {
         let mut out = String::new();
         for s in &self.segments {
@@ -210,10 +211,10 @@ impl PathPattern {
     }
 }
 
-/// ルーティング層（`routing::PathRouter` / `upstream::matches_path_pattern`）用:
-/// `{` を含むパターンをセグメント単位で照合する（`handler` feature 時のみ呼ばれる）。
-/// リクエストごとに呼ばれるため割り当てをしない（パターンを解析せずに文字列のまま辿る）。
-/// 構文は設定ロード時に `PathPattern::parse` で検査済みの前提。
+/// For the routing layer (`routing::PathRouter` / `upstream::matches_path_pattern`):
+/// matches a pattern containing `{` segment by segment (called only with the `handler` feature).
+/// It is called per request, so it allocates nothing (it walks the pattern as a string without parsing it).
+/// The syntax is assumed to have been checked by `PathPattern::parse` when the configuration was loaded.
 pub fn route_pattern_matches(pattern: &str, path: &[u8]) -> bool {
     let (mut pat, mut p) = match (pattern.as_bytes().split_first(), path.split_first()) {
         (Some((b'/', pr)), Some((b'/', rest))) => (pr, rest),
@@ -250,7 +251,7 @@ pub fn route_pattern_matches(pattern: &str, path: &[u8]) -> bool {
     }
 }
 
-/// パーセントエンコードを復号する（`+` は空白にしない＝パス用）。不正な列はそのまま残す。
+/// Decodes percent-encoding (`+` is not turned into a space, as befits paths). Malformed sequences are left as is.
 pub fn percent_decode(input: &[u8]) -> std::borrow::Cow<'_, str> {
     if !input.contains(&b'%') {
         return String::from_utf8_lossy(input);

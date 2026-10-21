@@ -1,4 +1,4 @@
-//! `tokio::sync::mpsc`（有界はセマフォで容量を数える。無界は数えない）。
+//! Equivalent of `tokio::sync::mpsc`. A bounded channel counts its capacity with a semaphore; an unbounded channel does not count.
 
 use super::semaphore::Semaphore;
 use crate::tokio::waker::WakerSlot;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 pub mod error {
-    /// 受け手が閉じていて送れなかった（値を返す）。
+    /// The receiver is closed, so the value could not be sent (the value is returned).
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct SendError<T>(pub T);
 
@@ -26,7 +26,7 @@ pub mod error {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// `try_send` の失敗。
+    /// The error of `try_send`.
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub enum TrySendError<T> {
         Full(T),
@@ -67,7 +67,7 @@ pub mod error {
         }
     }
 
-    /// `try_recv` の失敗。
+    /// The error of `try_recv`.
     #[derive(PartialEq, Eq, Clone, Copy, Debug)]
     pub enum TryRecvError {
         Empty,
@@ -85,7 +85,7 @@ pub mod error {
 
     impl std::error::Error for TryRecvError {}
 
-    /// `send_timeout` の失敗。
+    /// The error of `send_timeout`.
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub enum SendTimeoutError<T> {
         Timeout(T),
@@ -118,7 +118,7 @@ use error::{SendError, SendTimeoutError, TryRecvError, TrySendError};
 struct Queue<T> {
     items: VecDeque<T>,
     rx_closed: bool,
-    /// 受け手が drop された（閉じただけなら予約済みの送信は受け付ける）
+    /// The receiver was dropped (if it was only closed, sends that already hold a reserved permit are still accepted).
     rx_dropped: bool,
     rx_waker: WakerSlot,
     closed_wakers: Vec<WakerSlot>,
@@ -126,7 +126,7 @@ struct Queue<T> {
 
 struct Chan<T> {
     q: Mutex<Queue<T>>,
-    /// 有界なら容量のセマフォ
+    /// The capacity semaphore, for a bounded channel.
     sem: Option<Semaphore>,
     cap: usize,
     tx_count: AtomicUsize,
@@ -150,8 +150,8 @@ impl<T> Chan<T> {
         })
     }
 
-    /// 値を積む（受け手が drop されていれば返す）。容量の許可は呼び出し側が取得済み。
-    /// tokio と同じく、受け手が `close` しただけなら閉じる前に取った許可での送信は届く。
+    /// Queues a value (returns it if the receiver was dropped). The caller has already acquired the capacity permit.
+    /// As in tokio, if the receiver only called `close`, a send that uses a permit acquired before closing is still delivered.
     fn push(&self, v: T) -> Result<(), T> {
         let w = {
             let mut q = self.q.lock().unwrap();
@@ -171,14 +171,14 @@ impl<T> Chan<T> {
         self.q.lock().unwrap().rx_closed
     }
 
-    /// 予約された（まだ送られていない）許可が無い。
+    /// There are no reserved permits that have not been used yet.
     fn idle(&self) -> bool {
         self.sem
             .as_ref()
             .is_none_or(|s| s.available_permits() == self.cap)
     }
 
-    /// 許可を返す。受け手が閉じていれば、最後の予約が消えたことを受け手に知らせる。
+    /// Returns permits. If the receiver is closed, it tells the receiver that the last reservation is gone.
     fn release(&self, n: usize) {
         if let Some(s) = &self.sem {
             s.release(n);
@@ -282,7 +282,7 @@ impl<T> Chan<T> {
 
 // ===================== 有界 =====================
 
-/// 有界チャネル（`buffer` は 1 以上）。
+/// A bounded channel (`buffer` must be at least 1).
 #[track_caller]
 pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     assert!(buffer > 0, "mpsc bounded channel requires buffer > 0");
@@ -290,17 +290,17 @@ pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     (Sender { chan: c.clone() }, Receiver { chan: c })
 }
 
-/// 有界チャネルの送り手。
+/// The sender of a bounded channel.
 pub struct Sender<T> {
     chan: Arc<Chan<T>>,
 }
 
-/// 有界チャネルの弱い送り手（チャネルを生かさない）。
+/// A weak sender of a bounded channel (it does not keep the channel alive).
 pub struct WeakSender<T> {
     chan: Arc<Chan<T>>,
 }
 
-/// 有界チャネルの受け手。
+/// The receiver of a bounded channel.
 pub struct Receiver<T> {
     chan: Arc<Chan<T>>,
 }
@@ -434,7 +434,7 @@ impl<T> Sender<T> {
         futures::executor::block_on(self.send(value))
     }
 
-    /// 容量を 1 つ予約する。
+    /// Reserves one unit of capacity.
     pub async fn reserve(&self) -> Result<Permit<'_, T>, SendError<()>> {
         self.sem().acquire_raw(1).await.map_err(|_| SendError(()))?;
         Ok(Permit { chan: &self.chan })
@@ -523,7 +523,7 @@ impl<T> Sender<T> {
     }
 }
 
-/// 予約した容量（`send` で使う。drop で返す）。
+/// Reserved capacity (used by `send`; returned when dropped).
 pub struct Permit<'a, T> {
     chan: &'a Arc<Chan<T>>,
 }
@@ -543,7 +543,7 @@ impl<T> Drop for Permit<'_, T> {
     }
 }
 
-/// `reserve_many` の予約。
+/// The reservation made by `reserve_many`.
 pub struct PermitIterator<'a, T> {
     chan: &'a Arc<Chan<T>>,
     n: usize,
@@ -575,7 +575,7 @@ impl<T> Drop for PermitIterator<'_, T> {
     }
 }
 
-/// 所有の予約。
+/// An owned reservation.
 pub struct OwnedPermit<T> {
     tx: Option<Sender<T>>,
 }
@@ -613,7 +613,7 @@ impl<T> Receiver<T> {
         self.chan.poll_recv(cx)
     }
 
-    /// 届いている分を `limit` 個まで `buffer` に足す（無ければ 1 つ届くまで待つ）。足した数（0 は終わり）。
+    /// Appends up to `limit` available values to `buffer` (waits until one arrives if there are none). Returns the number added (0 means the channel is closed).
     pub async fn recv_many(&mut self, buffer: &mut Vec<T>, limit: usize) -> usize {
         recv_many(&self.chan, buffer, limit).await
     }
@@ -736,7 +736,7 @@ async fn recv_many<T>(chan: &Chan<T>, buffer: &mut Vec<T>, limit: usize) -> usiz
 
 // ===================== 無界 =====================
 
-/// 無界チャネル。
+/// An unbounded channel.
 pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
     let c = Chan::new(None);
     (
@@ -745,17 +745,17 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
     )
 }
 
-/// 無界チャネルの送り手。
+/// The sender of an unbounded channel.
 pub struct UnboundedSender<T> {
     chan: Arc<Chan<T>>,
 }
 
-/// 無界チャネルの弱い送り手。
+/// A weak sender of an unbounded channel.
 pub struct WeakUnboundedSender<T> {
     chan: Arc<Chan<T>>,
 }
 
-/// 無界チャネルの受け手。
+/// The receiver of an unbounded channel.
 pub struct UnboundedReceiver<T> {
     chan: Arc<Chan<T>>,
 }

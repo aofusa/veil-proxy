@@ -1,25 +1,27 @@
-//! ライブラリモードの設定（F-188）: 既定設定・config.toml の取り込み・Rust コードからの上書き。
+// F-188: ライブラリモードの設定。
+//! Library-mode configuration: the default settings, importing `config.toml`, and overrides from Rust code.
 //!
-//! 内部は `toml::Value`。起動時（と SIGHUP リロードのたび）に、設定ロードの単一チョークポイント
-//! （`config_override::apply_to_toml_str`）に置いたフックが次の順で値木を組み立てる:
+//! Internally the configuration is a `toml::Value`. At startup (and on every SIGHUP reload), a hook placed at
+//! the single choke point of configuration loading (`config_override::apply_to_toml_str`) builds the value
+//! tree in this order:
 //!
-//! 1. ライブラリ既定（`default_config.toml` + `server.threads = CPU 数`）
-//! 2. config.toml（あれば。1 の上に深くマージ）。環境変数 `VEIL_OVERRIDE_<n>`（本体と同じ規則）と
-//!    VDS のオーバーレイはこのファイルの内容に当たってからマージされる
-//! 3. `Config::from_toml_str` のインライン TOML
-//! 4. `ConfigBuilder` の上書き（`set` や `listen` 等）
-//! 5. ハンドラルート・組み込みルート（OpenAPI 等）の注入、具体性による並べ替えと衝突検査
+//! 1. The library defaults (`default_config.toml` plus `server.threads = number of CPUs`).
+//! 2. `config.toml`, if present, deep-merged on top of 1. The `VEIL_OVERRIDE_<n>` environment variables
+//!    (same rules as the main binary) and the VDS overlay are applied to the contents of this file before it is merged.
+//! 3. The inline TOML given to `Config::from_toml_str`.
+//! 4. The overrides of `ConfigBuilder` (such as `set` and `listen`).
+//! 5. Injection of the handler routes and built-in routes (such as OpenAPI), reordering by specificity, and conflict checks.
 //!
-//! つまり優先順位は 既定 < ファイル < VDS < 環境変数 < インライン < ビルダ。
-//! 上書きはリロード後も保たれる（フックが毎回同じものを当てる）。
+//! The precedence is therefore defaults < file < VDS < environment variables < inline < builder.
+//! Overrides survive a reload because the hook applies the same ones each time.
 
 use crate::config_override::ConfigOverride;
 use std::path::{Path, PathBuf};
 
-/// ライブラリ既定設定（TOML）。
+/// The library default configuration (TOML).
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 
-/// 設定の読み込み・上書きのエラー。
+/// Errors from loading or overriding the configuration.
 #[derive(Debug, Clone)]
 pub struct ConfigError(pub String);
 
@@ -31,14 +33,14 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// ライブラリモードの設定（prelude では `Config`）。
+/// Library-mode configuration (`Config` in the prelude).
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 読み込んだ config.toml のパス（SIGHUP リロードで読み直す）。無ければ `None`。
+    /// Path of the loaded `config.toml` (re-read on SIGHUP reload), or `None` if there is none.
     pub(crate) file: Option<PathBuf>,
-    /// `from_toml_str` で与えた TOML（ファイルの代わり）。
+    /// TOML given to `from_toml_str` (in place of a file).
     pub(crate) inline: Option<toml::Value>,
-    /// ビルダの上書き（後勝ち）。
+    /// Builder overrides (later ones win).
     pub(crate) overrides: Vec<ConfigOverride>,
 }
 
@@ -49,7 +51,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// ライブラリ既定設定だけ（config.toml を読まない）。
+    /// The library defaults only (no `config.toml` is read).
     pub fn new() -> Config {
         Config {
             file: None,
@@ -58,7 +60,7 @@ impl Config {
         }
     }
 
-    /// カレントディレクトリの `config.toml` があれば取り込み、無ければ既定設定。
+    /// Imports `config.toml` from the current directory if present, and uses the defaults otherwise.
     pub fn load() -> Result<Config, ConfigError> {
         let p = Path::new("config.toml");
         if p.exists() {
@@ -68,8 +70,8 @@ impl Config {
         }
     }
 
-    /// config.toml を取り込む（既定設定の上に深くマージ）。ファイルが無い・構文エラーはエラー。
-    /// SIGHUP でこのファイルを読み直す。
+    /// Imports a `config.toml`, deep-merged over the defaults. A missing file or a syntax error is an error.
+    /// The file is re-read on SIGHUP.
     // 理由付き allow: 起動前の設定読み込み（データプレーン外）。
     #[allow(clippy::disallowed_methods)]
     pub fn from_file(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
@@ -85,7 +87,7 @@ impl Config {
         })
     }
 
-    /// TOML 文字列を取り込む（ファイルの代わり。既定設定の上に深くマージ）。
+    /// Imports a TOML string in place of a file, deep-merged over the defaults.
     pub fn from_toml_str(text: &str) -> Result<Config, ConfigError> {
         let v: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError(format!("TOML parse error: {}", e)))?;
@@ -96,32 +98,32 @@ impl Config {
         })
     }
 
-    /// ビルダへ（設計書の `Config::from_file(..)?.builder().listen(..).build()` の形）。
+    /// Converts into the builder (`Config::from_file(..)?.builder().listen(..).build()`).
     pub fn builder(self) -> ConfigBuilder {
         ConfigBuilder { config: self }
     }
 
-    /// 任意のキーを上書きする（`--override` と同じ構文: `"server.threads = 4"`）。
+    /// Overrides an arbitrary key, using the same syntax as `--override` (for example `"server.threads = 4"`).
     pub fn set_override(&mut self, expr: &str) -> Result<(), ConfigError> {
         let ov = ConfigOverride::parse(expr).map_err(ConfigError)?;
         self.overrides.push(ov);
         Ok(())
     }
 
-    /// パスと TOML 値で上書きする。
+    /// Overrides a key given by path with a TOML value.
     pub fn set_value(&mut self, path: &str, value: toml::Value) -> Result<(), ConfigError> {
         let ov = ConfigOverride::from_parts(path, value).map_err(ConfigError)?;
         self.overrides.push(ov);
         Ok(())
     }
 
-    /// 取り込んだ config.toml のパス。
+    /// Path of the imported `config.toml`.
     pub fn file(&self) -> Option<&Path> {
         self.file.as_deref()
     }
 
-    /// ライブラリ既定 + ファイル/インライン + ビルダ上書きを合成した値木（ルート注入前）。
-    /// 環境変数の上書きは含まない（起動時に本体と同じ経路で当たる）。
+    /// The value tree composed from the library defaults, the file or inline TOML, and the builder overrides (before route injection).
+    /// Environment-variable overrides are not included; they are applied at startup through the same path as the main binary.
     pub fn to_value(&self) -> Result<toml::Value, ConfigError> {
         let mut root = toml::Value::Table(toml::Table::new());
         if let Some(path) = &self.file {
@@ -136,14 +138,14 @@ impl Config {
         Ok(root)
     }
 
-    /// 合成結果を TOML 文字列で返す（デバッグ・`-t` 相当の確認用）。
+    /// Returns the composed result as a TOML string (for debugging and for checks equivalent to `-t`).
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         let v = self.to_value()?;
         toml::to_string_pretty(&v).map_err(|e| ConfigError(e.to_string()))
     }
 }
 
-/// `Config` の上書きビルダ。各メソッドは `--override` 1 件に相当する。
+/// Override builder for [`Config`]. Each method corresponds to one `--override`.
 #[derive(Debug, Clone)]
 pub struct ConfigBuilder {
     config: Config,
@@ -167,47 +169,48 @@ impl ConfigBuilder {
     }
 
     setter!(
-        /// `[server].listen_cleartext`（平文 HTTP/1.1・h2c のリスナー。ライブラリ既定は `"127.0.0.1:8080"`）。
+        /// `[server].listen_cleartext`: the listener for cleartext HTTP/1.1 and h2c (the library default is `"127.0.0.1:8080"`).
         listen_cleartext, "server.listen_cleartext", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[server].listen`（TLS のリスナー。`tls(cert, key)` と一緒に使う。F-200）。
+        // F-200
+        /// `[server].listen`: the TLS listener. Use it together with `tls(cert, key)`.
         listen, "server.listen", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[server].allow_http`（平文リスナーで HTTP/1.1 を受けるか）。
+        /// `[server].allow_http`: whether the cleartext listener accepts HTTP/1.1.
         allow_http, "server.allow_http", v: bool => toml::Value::Boolean(v)
     );
     setter!(
-        /// `[server].allow_h2c`（平文リスナーで h2c を受けるか）。
+        /// `[server].allow_h2c`: whether the cleartext listener accepts h2c.
         allow_h2c, "server.allow_h2c", v: bool => toml::Value::Boolean(v)
     );
     setter!(
-        /// `[server].enable_secure_redirect`（平文リスナーの要求を https へ 301 で返すか）。
+        /// `[server].enable_secure_redirect`: whether requests on the cleartext listener are answered with a 301 redirect to https.
         secure_redirect, "server.enable_secure_redirect", v: bool => toml::Value::Boolean(v)
     );
     setter!(
-        /// `[server].threads`（ワーカースレッド数。既定は CPU 数）。
+        /// `[server].threads`: the number of worker threads (defaults to the number of CPUs).
         threads, "server.threads", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
-        /// `[server].http2_enabled`（TLS の ALPN で h2 を選べるようにする）。
+        /// `[server].http2_enabled`: allows h2 to be selected through TLS ALPN.
         http2_enabled, "server.http2_enabled", v: bool => toml::Value::Boolean(v)
     );
     setter!(
-        /// `[logging].level`（`"error"`・`"warn"`・`"info"`・`"debug"`）。
+        /// `[logging].level` (`"error"`, `"warn"`, `"info"` or `"debug"`).
         log_level, "logging.level", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[api].openapi_enabled`（`/openapi.json` と Swagger UI を公開するか）。
+        /// `[api].openapi_enabled`: whether to serve `/openapi.json` and Swagger UI.
         openapi_enabled, "api.openapi_enabled", v: bool => toml::Value::Boolean(v)
     );
     setter!(
-        /// `[api].openapi_path`（Swagger UI のパス、既定 `/docs`）。
+        /// `[api].openapi_path`: the path of Swagger UI (default `/docs`).
         openapi_path, "api.openapi_path", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[api].openapi_json_path`（OpenAPI JSON のパス、既定 `/openapi.json`）。
+        /// `[api].openapi_json_path`: the path of the OpenAPI JSON (default `/openapi.json`).
         openapi_json_path, "api.openapi_json_path", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
@@ -215,35 +218,40 @@ impl ConfigBuilder {
         openapi_title, "api.openapi_title", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[api].openapi_version`（API 自体のバージョン）。
+        /// `[api].openapi_version`: the version of the API itself.
         openapi_version, "api.openapi_version", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[api].max_body_size`（ハンドラが受け取る本文の上限バイト数）。
+        /// `[api].max_body_size`: the maximum body size, in bytes, that a handler accepts.
         max_body_size, "api.max_body_size", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
-        /// `[api].handler_threads`（ブロッキングなハンドラ・Python・C の実行プールのスレッド数）。
+        /// `[api].handler_threads`: the number of threads in the pool that runs blocking, Python and C handlers.
         handler_threads, "api.handler_threads", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
-        /// `[api].grpc_max_message_size`（gRPC の受信メッセージ上限、既定 4MiB。F-197）。
+        // F-197
+        /// `[api].grpc_max_message_size`: the maximum size of a received gRPC message (default 4 MiB).
         grpc_max_message_size, "api.grpc_max_message_size", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
-        /// `[api].grpc_max_send_message_size`（gRPC の送信メッセージの上限、0 = 無制限。F-209）。
+        // F-209
+        /// `[api].grpc_max_send_message_size`: the maximum size of a sent gRPC message (0 = unlimited).
         grpc_max_send_message_size, "api.grpc_max_send_message_size", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
-        /// `[api].grpc_response_compression`（gRPC の応答の圧縮: `"none"`・`"gzip"`・`"deflate"`、既定 `"none"`。F-209）。
+        // F-209
+        /// `[api].grpc_response_compression`: compression of gRPC responses (`"none"`, `"gzip"` or `"deflate"`; default `"none"`).
         grpc_response_compression, "api.grpc_response_compression", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
-        /// `[api].grpc_response_compression_min_size`（これ未満のメッセージは圧縮しない、既定 1024。F-209）。
+        // F-209
+        /// `[api].grpc_response_compression_min_size`: messages smaller than this are not compressed (default 1024).
         grpc_response_compression_min_size, "api.grpc_response_compression_min_size", v: usize => toml::Value::Integer(v as i64)
     );
 
-    /// `[api].grpc_web_cors_origins`（gRPC-Web の CORS で許す Origin。`"*"` で全部。F-209）。
+    // F-209
+    /// `[api].grpc_web_cors_origins`: the origins allowed by gRPC-Web CORS (`"*"` allows all).
     pub fn grpc_web_cors_origins(self, origins: &[&str]) -> Self {
         self.push(
             "api.grpc_web_cors_origins",
@@ -256,13 +264,14 @@ impl ConfigBuilder {
         )
     }
 
-    /// TLS の証明書・秘密鍵（`[tls]`）。TLS のリスナーは `listen(addr)` で別に指定する（F-200）。
+    // F-200: TLS のリスナーは `listen(addr)` で別に指定する。
+    /// The TLS certificate and private key (`[tls]`). Specify the TLS listener separately with `listen(addr)`.
     pub fn tls(self, cert_path: &str, key_path: &str) -> Self {
         self.push("tls.cert_path", toml::Value::String(cert_path.to_string()))
             .push("tls.key_path", toml::Value::String(key_path.to_string()))
     }
 
-    /// HTTP/3 を有効にする（要 `listen`・TLS・`http3` feature）。引数は UDP のアドレス。
+    /// Enables HTTP/3 (requires `listen`, TLS and the `http3` feature). The argument is a UDP address.
     pub fn http3(mut self, listen: &str) -> Self {
         for (p, v) in [
             ("http3.enabled", toml::Value::Boolean(true)),
@@ -275,13 +284,13 @@ impl ConfigBuilder {
         self
     }
 
-    /// 任意のキーを上書きする（`--override` と同じ構文）。構文エラーは panic せず `Err`。
+    /// Overrides an arbitrary key using the `--override` syntax. A syntax error returns `Err` instead of panicking.
     pub fn set(mut self, expr: &str) -> Result<Self, ConfigError> {
         self.config.set_override(expr)?;
         Ok(self)
     }
 
-    /// 任意のキーを値で上書きする。
+    /// Overrides an arbitrary key with a value.
     pub fn set_value(
         mut self,
         path: &str,
@@ -291,13 +300,13 @@ impl ConfigBuilder {
         Ok(self)
     }
 
-    /// `Config` に戻す。
+    /// Converts back into a [`Config`].
     pub fn build(self) -> Config {
         self.config
     }
 }
 
-/// ライブラリ既定設定の値木（`server.threads` に CPU 数を入れる）。
+/// The value tree of the library defaults (`server.threads` is set to the number of CPUs).
 pub fn default_value() -> toml::Value {
     let mut v: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).expect("default_config.toml");
     if let Some(server) = v.get_mut("server").and_then(|s| s.as_table_mut()) {
@@ -309,7 +318,7 @@ pub fn default_value() -> toml::Value {
     v
 }
 
-/// `base` を `over` で上書きする深いマージ（テーブルは再帰、それ以外は置き換え）。
+/// Deep-merges `over` into `base` (tables recursively, everything else is replaced).
 pub fn deep_merge(base: &mut toml::Value, over: toml::Value) {
     match (base, over) {
         (toml::Value::Table(b), toml::Value::Table(o)) => {
@@ -326,8 +335,8 @@ pub fn deep_merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// フックの前半: `root`（ファイル + 環境変数 + CLI の上書き済み）を
-/// 「既定 < root < インライン < ビルダ上書き」に組み替える。
+/// First half of the hook: rearranges `root` (with the file, environment variables and CLI overrides already applied)
+/// into "defaults < root < inline < builder overrides".
 pub(crate) fn compose(
     root: &mut toml::Value,
     inline: Option<&toml::Value>,

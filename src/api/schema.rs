@@ -1,28 +1,29 @@
-//! JSON Schema（OpenAPI 3.1 の Schema Object）と自動バリデーション（F-189）。
+// F-189
+//! JSON Schema (the OpenAPI 3.1 Schema Object) and automatic validation.
 //!
-//! `#[derive(veil::Schema)]` が構造体・列挙に `ApiSchema` と `Validate` を実装する。
-//! 属性は `validator` クレートと同じ記法（`#[validate(range(min = 1, max = 100))]`・
-//! `length(min, max)`・`email`・`url`・`nested`・`custom = "path"`）を受け、同じ定義から
-//! OpenAPI の `minimum`/`maximum`/`minLength`/`maxLength`/`format` と実行時の検証（422）を作る。
+//! `#[derive(veil::Schema)]` implements `ApiSchema` and `Validate` for structs and enums.
+//! The attributes use the same notation as the `validator` crate (`#[validate(range(min = 1, max = 100))]`,
+//! `length(min, max)`, `email`, `url`, `nested` and `custom = "path"`), and from the same definition produce
+//! the OpenAPI `minimum`/`maximum`/`minLength`/`maxLength`/`format` and the runtime validation (422).
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-/// 名前付きスキーマの集合（OpenAPI の `components.schemas`）。
+/// A set of named schemas (`components.schemas` in OpenAPI).
 pub type Definitions = BTreeMap<String, Value>;
 
-/// JSON Schema を持つ型。
+/// A type that has a JSON Schema.
 pub trait ApiSchema {
-    /// この型のスキーマ。名前付きの型（構造体・列挙）は `defs` に定義を登録して `$ref` を返す。
+    /// The schema of this type. A named type (a struct or an enum) registers its definition in `defs` and returns a `$ref`.
     fn schema(defs: &mut Definitions) -> Value;
 
-    /// `Option<T>` なら true（必須でないフィールド・クエリ）。
+    /// True for `Option<T>` (a field or query parameter that is not required).
     fn is_optional() -> bool {
         false
     }
 }
 
-/// 名前付きスキーマへの参照。
+/// A reference to a named schema.
 pub fn schema_ref(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{}", name) })
 }
@@ -173,7 +174,7 @@ impl<T: ApiSchema> ApiSchema for super::response::Json<T> {
     }
 }
 
-/// フィールドにバリデーション制約を付ける（`$ref` の場合は `allOf` で包む）。
+/// Adds validation constraints to a field (a `$ref` is wrapped in `allOf`).
 pub fn with_constraints(schema: Value, constraints: Map<String, Value>) -> Value {
     if constraints.is_empty() {
         return schema;
@@ -195,32 +196,32 @@ pub fn with_constraints(schema: Value, constraints: Map<String, Value>) -> Value
 
 // ===================== バリデーション =====================
 
-/// 1 件の検証エラー（FastAPI の `detail` 要素と同じ形: `type`・`loc`・`msg`）。
+/// One validation error (the same shape as a FastAPI `detail` element: `type`, `loc` and `msg`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FieldError {
     #[serde(rename = "type")]
-    /// エラーの種類（JSON では `type`。`missing`・`string_too_short` 等）。
+    /// The kind of error (`type` in JSON, such as `missing` or `string_too_short`).
     pub kind: String,
-    /// エラーの位置（フィールド名・配列の添字の並び）。
+    /// The location of the error (a sequence of field names and array indices).
     pub loc: Vec<Value>,
-    /// 人が読むメッセージ。
+    /// A human-readable message.
     pub msg: String,
 }
 
-/// 検証エラーの集合。
+/// A collection of validation errors.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValidationErrors {
-    /// 集まったエラー。
+    /// The collected errors.
     pub errors: Vec<FieldError>,
 }
 
 impl ValidationErrors {
-    /// エラーが 1 件も無いか。
+    /// Whether there are no errors at all.
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty()
     }
 
-    /// 位置 `loc`・種類 `kind`・メッセージ `msg` のエラーを足す。
+    /// Adds an error with location `loc`, kind `kind` and message `msg`.
     pub fn push(&mut self, loc: &[Value], kind: &str, msg: impl Into<String>) {
         self.errors.push(FieldError {
             kind: kind.to_string(),
@@ -229,7 +230,7 @@ impl ValidationErrors {
         });
     }
 
-    /// 先頭に `loc` 要素（例: `"body"`）を付ける。
+    /// Prepends a `loc` element (for example `"body"`).
     pub fn prefixed(mut self, first: &str) -> ValidationErrors {
         for e in &mut self.errors {
             e.loc.insert(0, Value::String(first.to_string()));
@@ -237,7 +238,7 @@ impl ValidationErrors {
         self
     }
 
-    /// 422 応答（`{"detail": [...]}`）。
+    /// The 422 response (`{"detail": [...]}`).
     pub fn into_response(self) -> super::response::Response {
         let body = json!({ "detail": self.errors });
         super::response::Response::json(&body).with_status(422)
@@ -258,12 +259,12 @@ impl std::fmt::Display for ValidationErrors {
 
 impl std::error::Error for ValidationErrors {}
 
-/// 自動バリデーションの対象になる型（`#[derive(veil::Schema)]` が実装する）。
+/// A type subject to automatic validation (implemented by `#[derive(veil::Schema)]`).
 pub trait Validate {
-    /// `loc` はこの値の位置（エラーの `loc` の接頭辞）。
+    /// `loc` is the location of this value (the prefix of each error's `loc`).
     fn validate_at(&self, loc: &mut Vec<Value>, errors: &mut ValidationErrors);
 
-    /// 検証してエラーがあれば返す。
+    /// Validates and returns the errors, if any.
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::default();
         let mut loc = Vec::new();
@@ -300,9 +301,9 @@ impl<T: Validate + ?Sized> Validate for Box<T> {
     }
 }
 
-/// 数値制約の検査用（derive の生成コードが使う）。
+/// For checking numeric constraints (used by derive-generated code).
 pub trait AsNumber {
-    /// 数値として見た値（`ge`・`le` 等の検査に使う。数値でなければ `None`）。
+    /// The value as a number (used for checks such as `ge` and `le`; `None` if it is not numeric).
     fn as_number(&self) -> Option<f64>;
 }
 
@@ -317,9 +318,9 @@ impl<T: AsNumber> AsNumber for Option<T> {
     }
 }
 
-/// 長さ制約の検査用（文字列は文字数、配列は要素数）。
+/// For checking length constraints (the number of characters for strings, of elements for arrays).
 pub trait AsLength {
-    /// 長さ（文字列は文字数、配列は要素数。対象外なら `None`）。
+    /// The length (characters for strings, elements for arrays; `None` if not applicable).
     fn as_length(&self) -> Option<usize>;
 }
 
@@ -359,9 +360,9 @@ impl<T: AsLength> AsLength for Option<T> {
     }
 }
 
-/// 文字列制約（email・url）の検査用。
+/// For checking string constraints (email and url).
 pub trait AsText {
-    /// 文字列として見た値（`email`・`url` の検査に使う。対象外なら `None`）。
+    /// The value as a string (used for the `email` and `url` checks; `None` if not applicable).
     fn as_text(&self) -> Option<&str>;
 }
 
@@ -383,7 +384,7 @@ impl<T: AsText> AsText for Option<T> {
     }
 }
 
-/// 範囲制約（`range(min, max, exclusive_min, exclusive_max)`）。
+/// The range constraint (`range(min, max, exclusive_min, exclusive_max)`).
 #[allow(clippy::too_many_arguments)]
 pub fn check_range(
     value: Option<f64>,
@@ -433,7 +434,7 @@ pub fn check_range(
     }
 }
 
-/// 長さ制約（`length(min, max, equal)`）。
+/// The length constraint (`length(min, max, equal)`).
 pub fn check_length(
     len: Option<usize>,
     min: Option<usize>,
@@ -472,7 +473,7 @@ pub fn check_length(
     }
 }
 
-/// メールアドレスの簡易検査（`local@domain.tld`、空白なし）。
+/// A simple email address check (`local@domain.tld`, no whitespace).
 pub fn check_email(text: Option<&str>, loc: &[Value], errors: &mut ValidationErrors) {
     let Some(s) = text else { return };
     let ok = match s.split_once('@') {
@@ -492,7 +493,7 @@ pub fn check_email(text: Option<&str>, loc: &[Value], errors: &mut ValidationErr
     }
 }
 
-/// URL の簡易検査（`scheme://host...`）。
+/// A simple URL check (`scheme://host...`).
 pub fn check_url(text: Option<&str>, loc: &[Value], errors: &mut ValidationErrors) {
     let Some(s) = text else { return };
     let ok = match s.split_once("://") {

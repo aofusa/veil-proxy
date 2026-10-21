@@ -1,22 +1,25 @@
-//! サイズクラス（F-183）。
+// F-183: クラスの決定は alloc / dealloc の両方で Layout から同じ関数で行う。
+//! Size classes.
 //!
-//! - 16〜128B は 16B 刻み（8 クラス）。
-//! - 128B 超は 2 倍ごとに 4 分割（160, 192, 224, 256, 320, …, 256KiB）。内部断片化は最大 25%。
-//! - 2 の冪はすべてクラスに含まれる（アライメント要求の解決に使う）。
-//! - 256KiB を超える要求はクラスを持たず、OS から直接マップする（`huge`）。
+//! - 16 to 128 bytes use 16-byte steps (8 classes).
+//! - Above 128 bytes, each power-of-two range is split into 4 (160, 192, 224, 256, 320, ...,
+//!   256 KiB). Internal fragmentation is at most 25%.
+//! - Every power of two is a class (used to resolve alignment requests).
+//! - Requests above 256 KiB have no class and are mapped directly from the OS (`huge`).
 //!
-//! クラスの決定は `alloc` と `dealloc` の両方で `Layout` から同じ関数で行う（`GlobalAlloc`
-//! は解放時にもサイズとアライメントを渡すので、ブロックからクラスを引く必要がない）。
+//! `alloc` and `dealloc` pick the class from the `Layout` with the same function
+//! (`GlobalAlloc` passes the size and alignment on deallocation too, so there is no need to
+//! look the class up from the block).
 
 use super::SLOT_SIZE;
 
-/// クラス数。
+/// Number of classes.
 pub(crate) const NCLASS: usize = 52;
 
-/// 最大クラスのブロックサイズ（これを超えると huge）。
+/// Block size of the largest class (anything bigger is huge).
 pub(crate) const MAX_CLASS_SIZE: usize = 256 * 1024;
 
-/// 最小アライメント（すべてのブロックは 16B 境界）。
+/// Minimum alignment (every block is on a 16-byte boundary).
 pub(crate) const MIN_ALIGN: usize = 16;
 
 const fn class_size_of(c: usize) -> usize {
@@ -29,7 +32,7 @@ const fn class_size_of(c: usize) -> usize {
     }
 }
 
-/// クラスごとのブロックサイズ。
+/// Block size of each class.
 pub(crate) static CLASS_SIZE: [u32; NCLASS] = {
     let mut t = [0u32; NCLASS];
     let mut c = 0;
@@ -40,10 +43,11 @@ pub(crate) static CLASS_SIZE: [u32; NCLASS] = {
     t
 };
 
-/// スパン（同じクラスのブロックを切り出す連続スロット）のスロット数。
+/// Number of slots in a span (contiguous slots that blocks of one class are carved from).
 ///
-/// ブロックが 8 個以上入り、端数の無駄がスパンの 1/8 以下になる最小のスロット数を選ぶ
-/// （上限 16 スロット。8KiB 以下は 1 スロット、最大クラス 256KiB は 16 スロットに 4 個）。
+/// Chooses the smallest slot count that fits at least 8 blocks and wastes at most 1/8 of the
+/// span on the remainder (at most 16 slots; classes up to 8 KiB use 1 slot, and the largest
+/// class, 256 KiB, gets 4 blocks in 16 slots).
 pub(crate) static CLASS_SLOTS: [u8; NCLASS] = {
     let mut t = [0u8; NCLASS];
     let mut c = 0;
@@ -68,7 +72,7 @@ pub(crate) static CLASS_SLOTS: [u8; NCLASS] = {
     t
 };
 
-/// 1024B 以下の要求サイズ → クラスの表（`(size + 15) / 16` で引く）。
+/// Lookup table from request sizes up to 1024 bytes to classes (indexed by `(size + 15) / 16`).
 static SMALL_LUT: [u8; 65] = {
     let mut t = [0u8; 65];
     let mut i = 1;
@@ -95,7 +99,7 @@ const fn class_of_slow(size: usize) -> usize {
     }
 }
 
-/// 要求サイズ（`<= MAX_CLASS_SIZE`、アライメント 16 以下）のクラス。
+/// The class for a request size (`<= MAX_CLASS_SIZE`, alignment of 16 or less).
 #[inline(always)]
 pub(crate) fn class_of(size: usize) -> usize {
     if size <= 1024 {
@@ -106,9 +110,10 @@ pub(crate) fn class_of(size: usize) -> usize {
     }
 }
 
-/// アライメント要求付きのクラス。ブロックはスパン先頭（64KiB 境界）から `block_size` 刻みで
-/// 並ぶので、`block_size` が `align` の倍数なら全ブロックが `align` 境界に乗る
-/// （`align <= SLOT_SIZE` の範囲。呼び出し側で保証する）。
+/// The class for a request with an alignment. Blocks are laid out from the start of the span
+/// (a 64 KiB boundary) in steps of `block_size`, so when `block_size` is a multiple of `align`
+/// every block lies on an `align` boundary (valid for `align <= SLOT_SIZE`; the caller
+/// guarantees this).
 #[cold]
 pub(crate) fn class_of_aligned(size: usize, align: usize) -> Option<usize> {
     let size = size.max(align);

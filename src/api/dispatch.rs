@@ -1,4 +1,5 @@
-//! プロトコル（HTTP/1.1・HTTP/2・HTTP/3）の各経路から `Backend::Handler` を呼ぶ共通処理（F-188）。
+// F-188
+//! Common code through which the HTTP/1.1, HTTP/2 and HTTP/3 paths call `Backend::Handler`.
 
 use super::handler::HandlerEntry;
 use super::request::{split_target, HttpVersion, Request};
@@ -7,7 +8,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use std::net::IpAddr;
 
-/// リクエストを組み立てる（`target` はクエリを含む `:path` / リクエストライン）。
+/// Builds a request (`target` is the `:path` or request line, including the query).
 pub(crate) fn build_request(
     method: Bytes,
     target: Bytes,
@@ -32,20 +33,21 @@ pub(crate) fn build_request(
     }
 }
 
-/// 接続ごとに持ち、要求をまたいで使い回す状態（F-202）。今は tokio 互換レイヤーの包んだ Waker だけ。
+// F-202: 今は tokio 互換レイヤーの包んだ Waker だけ。
+/// State kept per connection and reused across requests.
 #[derive(Default)]
 pub(crate) struct CallCache {
     #[cfg(feature = "tokio-compat")]
     waker: crate::tokio::waker::SafeWakerCache,
 }
 
-/// ハンドラを呼ぶ。本文の上限超過は 413、ハンドラの panic は 500、HEAD は本文を落として
-/// `content-length` に元の長さを入れる。
+/// Calls the handler. A body over the limit gives 413 and a handler panic gives 500; for HEAD the body is dropped
+/// and `content-length` carries the original length.
 pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
     call_with(entry, req, &mut CallCache::default()).await
 }
 
-/// [`call`] の、接続ごとの [`CallCache`] を使う版（HTTP/1.1 のキープアライブで要求ごとの確保を減らす）。
+/// Like [`call`], but uses the per-connection [`CallCache`] (reduces per-request allocation on HTTP/1.1 keep-alive).
 pub(crate) async fn call_with(
     entry: &HandlerEntry,
     req: Request,
@@ -98,7 +100,7 @@ pub(crate) async fn call_with(
     resp
 }
 
-/// HTTP/2・HTTP/3 用にヘッダ名を小文字にし、接続固有ヘッダを取り除く（RFC 9113 §8.2.2）。
+/// Lowercases header names for HTTP/2 and HTTP/3 and removes connection-specific headers (RFC 9113 section 8.2.2).
 pub(crate) fn h2_h3_headers(resp: &mut Response) {
     resp.headers.retain(|(n, _)| {
         !(n.eq_ignore_ascii_case(b"connection")
@@ -110,7 +112,7 @@ pub(crate) fn h2_h3_headers(resp: &mut Response) {
     lowercase_names(&mut resp.headers);
 }
 
-/// フィールド名を小文字にする（HTTP/2・HTTP/3 のヘッダ・トレーラ）。小文字だけなら何も確保しない。
+/// Lowercases field names (HTTP/2 and HTTP/3 headers and trailers). Nothing is allocated if they are already lowercase.
 pub(crate) fn lowercase_names(fields: &mut [(Bytes, Bytes)]) {
     for (n, _) in fields.iter_mut() {
         if n.iter().any(|b| b.is_ascii_uppercase()) {
@@ -119,17 +121,19 @@ pub(crate) fn lowercase_names(fields: &mut [(Bytes, Bytes)]) {
     }
 }
 
-/// HTTP/1.1 の応答ヘッダ部（ステータス行〜空行）を作る。本文の長さで `Content-Length` を付ける
-/// （ハンドラが付けていればそれを使う。HEAD では `call` が付けている）。ストリーミング応答は
-/// `Transfer-Encoding: chunked`（F-197）。
+// F-197: ストリーミング応答は chunked。
+/// Builds the HTTP/1.1 response head (status line through the blank line). `Content-Length` is set from the body
+/// length (the handler's own value is used if present; for HEAD, `call` sets it). A streaming response uses
+/// `Transfer-Encoding: chunked`.
 pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + resp.headers.len() * 32);
     write_http1_head(&mut out, resp, keep_alive);
     out
 }
 
-/// [`http1_head`] を `out` の末尾に書く（呼び出し側がプールのバッファを使う。F-202）。
-/// chunked かどうかは `resp.stream` で決めるので、ストリームを取り出す前に呼ぶこと。
+// F-202
+/// Writes [`http1_head`] to the end of `out` (the caller supplies a pooled buffer).
+/// Whether the response is chunked is decided by `resp.stream`, so call this before taking the stream out.
 pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: bool) {
     let chunked = resp.stream.is_some()
         || resp.headers.iter().any(|(n, v)| {
@@ -171,7 +175,7 @@ pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: b
     }
 }
 
-/// 理由句（API でよく使うものを本体の表に足す）。
+/// Reason phrases (adds the ones commonly used by APIs to the main table).
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         202 => "Accepted",

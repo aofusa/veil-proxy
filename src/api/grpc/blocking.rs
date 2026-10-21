@@ -1,10 +1,12 @@
-//! ブロッキングな gRPC のハンドラ（C・Python。F-210）。
+// F-210
+//! Blocking gRPC handlers (C and Python).
 //!
-//! メッセージは符号化されたバイト列のまま受け渡す（`super::BytesCodec`）。直列化は利用者（C の protobuf-c・
-//! Python の protobuf 等）が行う。4 種類の RPC はワイヤ上は同じ形なので、どれも双方向ストリーミングとして登録し、
-//! 単項・サーバストリーミングなら受信は 1 通、単項・クライアントストリーミングなら送信は 1 通に絞るのは呼び出し側
-//! （C・Python の層）の役目。ハンドラはハンドラ用プールで動き、受信と送信は [`crate::api::bridge`] のキューで
-//! ワーカーとやり取りする（全二重）。
+//! Messages are passed as encoded bytes (`super::BytesCodec`); serialization is done by the user (protobuf-c in
+//! C, protobuf in Python and so on). The four kinds of RPC have the same shape on the wire, so all are registered
+//! as bidirectional streaming; narrowing the receive side to one message for unary and server-streaming calls,
+//! and the send side to one message for unary and client-streaming calls, is the job of the caller (the C and
+//! Python layers). The handler runs on the handler pool and exchanges received and sent messages with the worker
+//! through the queues of [`crate::api::bridge`] (full duplex).
 
 use super::{BoxStream, BytesCodec, Code, Metadata, Request, Response, Status, Streaming};
 use crate::api::app::App;
@@ -15,14 +17,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 enum Event {
-    /// 応答ヘッダ（最初の送信か終わりのとき 1 回）
+    /// The response headers (once, at the first send or at the end).
     Head(Metadata),
     Msg(Bytes),
-    /// 最後の状態（OK でもトレーラを載せる）
+    /// The final status (trailers are sent even for OK).
     Finish(Status),
 }
 
-/// ハンドラに渡す 1 回の呼び出し（ハンドラ用プールのスレッドで使う）。
+/// One call passed to the handler (used on a handler-pool thread).
 pub struct GrpcCall {
     method: Bytes,
     metadata: Metadata,
@@ -37,22 +39,22 @@ pub struct GrpcCall {
 }
 
 impl GrpcCall {
-    /// 呼ばれたメソッド（`/<package>.<Service>/<Method>`）。
+    /// The method called (`/<package>.<Service>/<Method>`).
     pub fn method(&self) -> &str {
         std::str::from_utf8(&self.method).unwrap_or("")
     }
 
-    /// 要求メタデータ。
+    /// The request metadata.
     pub fn metadata(&self) -> &[(Bytes, Bytes)] {
         &self.metadata
     }
 
-    /// 期限（`grpc-timeout`）。
+    /// The deadline (`grpc-timeout`).
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
-    /// 次の受信メッセージ（終わりは `Ok(None)`、壊れた・大きすぎるメッセージは `Err`）。届くまで待つ。
+    /// The next received message (`Ok(None)` at the end; a malformed or oversized message gives `Err`). Waits until one arrives.
     pub fn recv(&mut self) -> Result<Option<Bytes>, Status> {
         match self.incoming.recv() {
             Some(Ok(b)) => {
@@ -64,12 +66,12 @@ impl GrpcCall {
         }
     }
 
-    /// これまでに受け取った・送ったメッセージの数。
+    /// The number of messages received and sent so far.
     pub fn counts(&self) -> (usize, usize) {
         (self.received, self.sent)
     }
 
-    /// 応答ヘッダに足す（最初の送信より前だけ。後なら `false`）。
+    /// Adds a response header (only before the first send; `false` afterwards).
     pub fn add_header(&mut self, name: Bytes, value: Bytes) -> bool {
         if self.head_sent {
             return false;
@@ -78,7 +80,7 @@ impl GrpcCall {
         true
     }
 
-    /// 正常終了のトレーラに足す。
+    /// Adds a trailer for a normal completion.
     pub fn add_trailer(&mut self, name: Bytes, value: Bytes) {
         self.trailers.push((name, value));
     }
@@ -93,7 +95,7 @@ impl GrpcCall {
             .is_ok()
     }
 
-    /// メッセージを送る（満杯なら待つ）。クライアントが切断していたら `false`。
+    /// Sends a message (waits if the queue is full). Returns `false` if the client has disconnected.
     pub fn send(&mut self, msg: Bytes) -> bool {
         if !self.send_head() {
             return false;
@@ -102,7 +104,7 @@ impl GrpcCall {
         self.events.send(Event::Msg(msg)).is_ok()
     }
 
-    /// クライアントが切断したか。
+    /// Whether the client has disconnected.
     pub fn is_cancelled(&self) -> bool {
         self.events.is_closed()
     }
@@ -123,8 +125,9 @@ impl GrpcCall {
 }
 
 impl App {
-    /// ブロッキングな gRPC のハンドラを登録する（C・Python 用、F-210）。`f` はハンドラ用プールで動き、
-    /// [`GrpcCall`] で受信・送信し、最後の状態を返す（`Status::new(Code::Ok, "")` で正常終了）。
+    // F-210: C・Python 用。
+    /// Registers a blocking gRPC handler. `f` runs on the handler pool, receives and sends through the [`GrpcCall`],
+    /// and returns the final status (`Status::new(Code::Ok, "")` for a normal completion).
     pub fn grpc_blocking<F>(self, path: &str, f: F) -> App
     where
         F: Fn(&mut GrpcCall) -> Status + Send + Sync + 'static,

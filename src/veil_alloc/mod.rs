@@ -1,35 +1,44 @@
-//! veil 専用アロケータ（F-183、`veil-alloc` feature）。
+// F-183: veil 専用アロケータ（`veil-alloc` feature）。既定値は計測で決めた（F-183 チケット参照）。
+//! The veil-specific global allocator (`veil-alloc` feature).
 //!
-//! thread-per-core のワーカーに合わせた、スレッドローカルなサイズクラス・ページ単位
-//! フリーリストのアロケータ。設計の要点:
+//! A thread-local, size-class allocator with page-granular free lists, designed for
+//! thread-per-core workers. Key design points:
 //!
-//! - **高速パスはロック・アトミック・分岐の少ない pop / push だけ**（`heap`）。
-//!   `GlobalAlloc` は解放時にもサイズとアライメントを渡すので、サイズクラスを `Layout`
-//!   から直接計算し、ブロックごとのヘッダや「ポインタ → サイズ」の表を持たない。
-//! - **24 時間 365 日の RSS 安定性**: ページ（スパン）単位のフリーリストで空いたスパンを
-//!   特定し、遅延付きで OS へ返す（`purge_delay_ms`）。dirty の上限、空セグメントの
-//!   キャッシュ上限、huge の即時 `munmap` で、負荷のピーク後に RSS が元へ戻る。
-//!   ワーカーのアイドル時フック（[`collect`]）で、確保が止まったスレッドも返却する。
-//! - **スレッドの増減に強い**: 終了したスレッドのヒープは掃除して放棄リストに置き、
-//!   次のスレッドがそのまま引き継ぐ（オフロード等のスレッドが入れ替わっても増え続けない）。
-//! - **他スレッドの解放**（ロガー・オフロード・チャネル越しの受け渡し）は所有ヒープへ
-//!   ロックフリーに投函し、所有者が遅いパスで一括回収する。
-//! - **fork 安全**: グローバルロックを `pthread_atfork` で fork の前後に獲得・解放する。
+//! - **The fast path is only a pop / push with no locks, atomics or hard-to-predict branches**
+//!   (`heap`). `GlobalAlloc` passes the size and alignment on deallocation too, so the size
+//!   class is computed directly from the `Layout`; there are no per-block headers and no
+//!   pointer-to-size table.
+//! - **Stable RSS for long-running processes**: free spans are found through page (span)
+//!   granular free lists and returned to the OS after a delay (`purge_delay_ms`). A cap on
+//!   dirty memory, a cap on cached empty segments and an immediate `munmap` for huge
+//!   allocations bring RSS back down after a load peak. The worker idle hook ([`collect`])
+//!   also returns memory for threads that have stopped allocating.
+//! - **Robust against threads coming and going**: the heap of an exited thread is cleaned up
+//!   and put on an abandoned list, and the next thread takes it over as is, so memory does
+//!   not keep growing when threads (for example offload threads) are replaced.
+//! - **Frees from other threads** (loggers, offload threads, hand-offs over channels) are
+//!   pushed lock-free to the owning heap, and the owner reclaims them in bulk on its slow path.
+//! - **fork safety**: the global lock is acquired before and released after `fork` through
+//!   `pthread_atfork`.
 //!
-//! メモリ配置: 4MiB 境界のセグメント（64KiB スロット × 64、先頭スロットにヘッダ）。
-//! 256KiB 以下はサイズクラス（52 クラス）、1MiB 以下はスロット単位の large スパン、
-//! それを超えるものは OS から直接マップする。
+//! Memory layout: segments aligned to 4 MiB (64 slots of 64 KiB, with the header in the first
+//! slot). Requests of up to 256 KiB use size classes (52 classes), requests of up to 1 MiB use
+//! large spans made of whole slots, and anything bigger is mapped directly from the OS.
 //!
-//! チューニング（起動時に環境変数で上書き可。既定値は計測で決めた。F-183 チケット参照）:
+//! # Tuning
 //!
-//! | 環境変数 | 既定 | 意味 |
+//! The following environment variables override the defaults at startup:
+//!
+//! | Environment variable | Default | Meaning |
 //! |---|---|---|
-//! | `VEIL_ALLOC_PURGE_DELAY_MS` | 1000 | 空いたスパンを OS へ返すまでの遅延 |
-//! | `VEIL_ALLOC_DIRTY_MAX_MB` | 16 | ヒープあたり purge 待ちにできる量の上限 |
-//! | `VEIL_ALLOC_SEGMENT_CACHE` | 8 | 空セグメント（4MiB、purge 済み）のプロセス全体キャッシュ数 |
+//! | `VEIL_ALLOC_PURGE_DELAY_MS` | 1000 | Delay before a free span is returned to the OS |
+//! | `VEIL_ALLOC_DIRTY_MAX_MB` | 16 | Upper bound on the amount each heap may keep waiting to be purged |
+//! | `VEIL_ALLOC_SEGMENT_CACHE` | 8 | Process-wide number of cached empty (purged) 4 MiB segments |
 //!
-//! 対応 OS は unix（Linux / FreeBSD / OpenBSD / NetBSD / macOS）。Windows では使わない
-//! （`src/lib.rs` で他のアロケータへフォールバックする）。
+//! # Platform support
+//!
+//! Unix (Linux, FreeBSD, OpenBSD, NetBSD, macOS). It is not used on Windows, where the crate
+//! falls back to another allocator.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -44,27 +53,27 @@ pub(crate) mod size_class;
 
 use size_class::{class_of, class_of_aligned, CLASS_SIZE, MAX_CLASS_SIZE, MIN_ALIGN};
 
-/// セグメント（4MiB、同じ境界に揃える）。
+/// A segment (4 MiB, aligned to its own size).
 pub(crate) const SEGMENT_SIZE: usize = 1 << 22;
-/// スロット（64KiB）。スパンと purge の単位。
+/// A slot (64 KiB), the unit of spans and of purging.
 pub(crate) const SLOT_SHIFT: usize = 16;
 pub(crate) const SLOT_SIZE: usize = 1 << SLOT_SHIFT;
 pub(crate) const SLOTS: usize = SEGMENT_SIZE / SLOT_SIZE;
 
-/// veil 専用のグローバルアロケータ。
+/// The veil-specific global allocator.
 pub struct VeilAlloc;
 
-/// large の上限（これを超えると huge）。セグメント 1 個の使用可能スロット 63 に十分収まる。
+/// Upper bound of a large allocation; anything bigger is huge. It fits in the 63 usable slots of one segment.
 pub(crate) const LARGE_MAX: usize = 1 << 20;
 
-/// 確保の種別。確保と解放で `Layout` から同じ関数で決める。
+/// The kind of an allocation. Allocation and deallocation decide it from the `Layout` with the same function.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// サイズクラス（256KiB 以下）。
+    /// A size class (256 KiB or less).
     Small(usize),
-    /// スロット数（256KiB 超〜LARGE_MAX、アライメント 64KiB 以下）。
+    /// A number of slots (more than 256 KiB up to `LARGE_MAX`, alignment of 64 KiB or less).
     Large(usize),
-    /// OS 直接。
+    /// Mapped directly from the OS.
     Huge,
 }
 
@@ -161,7 +170,7 @@ unsafe impl GlobalAlloc for VeilAlloc {
     }
 }
 
-/// クラスのブロックサイズ（テスト・診断用）。
+/// The block size of the class that serves `layout` (for tests and diagnostics).
 pub fn usable_size(layout: Layout) -> usize {
     match classify(&layout) {
         Kind::Small(c) => CLASS_SIZE[c] as usize,
@@ -170,37 +179,37 @@ pub fn usable_size(layout: Layout) -> usize {
     }
 }
 
-/// アイドル時の回収。
+/// Idle-time reclamation.
 ///
-/// 現在のスレッドのヒープについて、他スレッドからの解放の回収・空ページの返却・
-/// 期限切れ（`force` なら全部）の purge・余分な空セグメントの返却を行い、
-/// 放棄されたヒープと共有ヒープも（ロックが取れれば）同様に掃除する。
-/// ワーカーのアイドル時（accept の 1 秒タイムアウト）から呼ぶ。負荷中に呼ばれても
-/// 正しく、コストは空いたスパン数と所有セグメント数に比例する（ブロック数ではない）。
+/// For the current thread's heap, this collects frees from other threads, returns empty pages,
+/// purges expired memory (everything if `force` is set) and returns surplus empty segments.
+/// Abandoned heaps and the shared heap are cleaned the same way when their lock can be taken.
+/// Call it from a worker's idle point. It is also correct when called under load; its cost is
+/// proportional to the number of free spans and owned segments, not the number of blocks.
 pub fn collect(force: bool) {
     heap::collect(force);
 }
 
-/// アロケータの状態（プロセス全体、遅いパスで更新する近似値）。
+/// Allocator state (process-wide approximate values, updated on the slow path).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// OS からマップ中のセグメント数（キャッシュ分を含む）。
+    /// Number of segments mapped from the OS, including cached ones.
     pub segments: usize,
-    /// 再利用キャッシュ中の空セグメント数。
+    /// Number of empty segments in the reuse cache.
     pub cached_segments: usize,
-    /// スパンに使われているバイト数。
+    /// Bytes used by spans.
     pub active_bytes: usize,
-    /// 空きだが OS へ返していない（purge 待ちの）バイト数。
+    /// Bytes that are free but not yet returned to the OS (waiting to be purged).
     pub dirty_bytes: usize,
-    /// huge（OS 直接）のバイト数。
+    /// Bytes of huge allocations (mapped directly from the OS).
     pub huge_bytes: usize,
-    /// これまでに purge したバイト数の累計。
+    /// Total bytes purged so far.
     pub purged_bytes_total: usize,
-    /// ヒープ数（放棄中を含む）。
+    /// Number of heaps, including abandoned ones.
     pub heaps: usize,
-    /// 放棄中のヒープ数。
+    /// Number of abandoned heaps.
     pub abandoned_heaps: usize,
-    /// 他スレッドからの解放の累計回数。
+    /// Total number of frees from other threads.
     pub remote_frees_total: usize,
 }
 
@@ -232,7 +241,7 @@ pub(crate) mod stats {
     pub(crate) static REMOTE_FREES: AtomicUsize = AtomicUsize::new(0);
 }
 
-/// 環境変数のチューニング値を読む（最初のヒープ生成時に 1 回。アロケーションしない）。
+/// Reads the tuning values from the environment (once, when the first heap is created; does not allocate).
 pub(crate) fn read_env_tuning() {
     fn env_usize(name: &core::ffi::CStr) -> Option<usize> {
         // SAFETY: NUL 終端の静的文字列。getenv はアロケーションしない。

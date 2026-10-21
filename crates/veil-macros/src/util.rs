@@ -1,8 +1,8 @@
-//! マクロ共通の小物。
+//! Small helpers shared by the macros.
 
 use syn::{Attribute, Expr, ExprLit, GenericArgument, Lit, PathArguments, Type};
 
-/// doc コメント（`///`）を連結する。
+/// Joins the doc comments (`///`).
 pub fn doc_text(attrs: &[Attribute]) -> Option<String> {
     let mut lines = Vec::new();
     for a in attrs {
@@ -26,7 +26,7 @@ pub fn doc_text(attrs: &[Attribute]) -> Option<String> {
     }
 }
 
-/// 型の最後のセグメント名（`veil::api::Json<T>` → `Json`）。
+/// The name of the last segment of a type (`veil::api::Json<T>` becomes `Json`).
 pub fn last_ident(ty: &Type) -> Option<String> {
     match ty {
         Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
@@ -37,7 +37,7 @@ pub fn last_ident(ty: &Type) -> Option<String> {
     }
 }
 
-/// `Name<T>` の最初の型引数。
+/// The first type argument of `Name<T>`.
 pub fn first_generic(ty: &Type) -> Option<&Type> {
     let Type::Path(p) = strip(ty) else {
         return None;
@@ -52,7 +52,7 @@ pub fn first_generic(ty: &Type) -> Option<&Type> {
     })
 }
 
-/// 括弧・グループを外す。
+/// Strips parentheses and groups.
 pub fn strip(ty: &Type) -> &Type {
     match ty {
         Type::Group(g) => strip(&g.elem),
@@ -61,7 +61,7 @@ pub fn strip(ty: &Type) -> &Type {
     }
 }
 
-/// `Option<T>` なら `T`。
+/// `T` if the type is `Option<T>`.
 pub fn option_inner(ty: &Type) -> Option<&Type> {
     if last_ident(ty).as_deref() == Some("Option") {
         first_generic(ty)
@@ -70,7 +70,7 @@ pub fn option_inner(ty: &Type) -> Option<&Type> {
     }
 }
 
-/// パスパターンの構文検査とパラメータ名の取り出し（本体の `PathPattern::parse` と同じ規則）。
+/// Checks the syntax of a path pattern and extracts the parameter names (the same rules as `PathPattern::parse` in the main crate).
 pub fn parse_path_params(pattern: &str) -> Result<Vec<String>, String> {
     if !pattern.starts_with('/') {
         return Err(format!("path '{}' must start with '/'", pattern));
@@ -119,7 +119,7 @@ pub fn parse_path_params(pattern: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// 文字列リテラルの値。
+/// The value of a string literal.
 pub fn lit_str(e: &Expr) -> Option<String> {
     match e {
         Expr::Lit(ExprLit {

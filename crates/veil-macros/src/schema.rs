@@ -1,11 +1,11 @@
-//! `#[derive(veil::Schema)]`: JSON Schema（`ApiSchema`）と自動バリデーション（`Validate`）。
+//! `#[derive(veil::Schema)]`: JSON Schema (`ApiSchema`) and automatic validation (`Validate`).
 
 use crate::util::{doc_text, lit_str, option_inner};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{spanned::Spanned, Attribute, Data, DeriveInput, Error, Expr, Fields, Lit, LitStr, Type};
 
-/// フィールド（またはコンテナ）の serde 属性のうち、スキーマに効くもの。
+/// The serde attributes of a field (or container) that affect the schema.
 #[derive(Default)]
 struct SerdeAttrs {
     rename: Option<String>,
@@ -73,7 +73,7 @@ fn serde_attrs(attrs: &[Attribute]) -> SerdeAttrs {
     out
 }
 
-/// serde の `rename_all` を適用する。
+/// Applies serde's `rename_all`.
 fn rename(name: &str, rule: Option<&str>) -> String {
     let words: Vec<String> = split_words(name);
     match rule {
@@ -108,7 +108,7 @@ fn capitalize(w: &str) -> String {
     }
 }
 
-/// `snake_case`・`PascalCase` の両方から単語に分ける。
+/// Splits both `snake_case` and `PascalCase` into words.
 fn split_words(name: &str) -> Vec<String> {
     let mut words = Vec::new();
     for part in name.split('_').filter(|p| !p.is_empty()) {
@@ -131,7 +131,7 @@ fn split_words(name: &str) -> Vec<String> {
     words
 }
 
-/// `#[validate(...)]` と `#[schema(...)]` の内容。
+/// The contents of `#[validate(...)]` and `#[schema(...)]`.
 #[derive(Default)]
 struct Rules {
     min: Option<f64>,
@@ -308,7 +308,7 @@ fn opt_usize(v: Option<u64>) -> TokenStream {
     }
 }
 
-/// フィールドのスキーマに付ける制約（JSON Schema のキーワード）。
+/// The constraints (JSON Schema keywords) attached to a field's schema.
 fn constraint_inserts(r: &Rules, desc: &Option<String>) -> TokenStream {
     let mut ins = Vec::new();
     let put = |k: &str, v: TokenStream| quote!(__c.insert(#k.into(), ::veil::api::__private::serde_json::json!(#v)););

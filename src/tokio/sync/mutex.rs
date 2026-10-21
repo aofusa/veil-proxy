@@ -1,4 +1,4 @@
-//! `tokio::sync::Mutex` / `RwLock`（セマフォの上に作る。FIFO で公平）。
+//! Equivalents of `tokio::sync::Mutex` and `RwLock`, built on the semaphore (fair, FIFO).
 
 use super::semaphore::Semaphore;
 use std::cell::UnsafeCell;
@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-/// `try_lock` の失敗。
+/// The error of `try_lock`.
 #[derive(Debug)]
 pub struct TryLockError(pub(super) ());
 
@@ -18,7 +18,7 @@ impl std::fmt::Display for TryLockError {
 
 impl std::error::Error for TryLockError {}
 
-/// ランタイムのスレッドで同期的に待とうとした。
+/// Panics if a synchronous (blocking) wait is attempted from within a runtime.
 #[track_caller]
 fn assert_not_in_runtime(what: &str) {
     if crate::runtime::has_driver() {
@@ -128,7 +128,7 @@ impl<T: ?Sized> Mutex<T> {
     }
 }
 
-/// `Mutex::lock` のガード。
+/// The guard returned by `Mutex::lock`.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct MutexGuard<'a, T: ?Sized> {
     lock: &'a Mutex<T>,
@@ -138,7 +138,7 @@ pub struct MutexGuard<'a, T: ?Sized> {
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<'a, T: ?Sized> MutexGuard<'a, T> {
-    /// ガードを部分への参照に写す。
+    /// Maps the guard to a reference to a part of the data.
     pub fn map<U: ?Sized, F: FnOnce(&mut T) -> &mut U>(
         this: Self,
         f: F,
@@ -208,7 +208,7 @@ impl<T: ?Sized + std::fmt::Display> std::fmt::Display for MutexGuard<'_, T> {
     }
 }
 
-/// `Mutex::lock_owned` のガード。
+/// The guard returned by `Mutex::lock_owned`.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct OwnedMutexGuard<T: ?Sized> {
     lock: Arc<Mutex<T>>,
@@ -247,7 +247,7 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for OwnedMutexGuard<T> {
     }
 }
 
-/// `MutexGuard::map` のガード。
+/// The guard returned by `MutexGuard::map`.
 pub struct MappedMutexGuard<'a, T: ?Sized> {
     s: &'a Semaphore,
     data: *mut T,
@@ -283,7 +283,7 @@ impl<T: ?Sized> Drop for MappedMutexGuard<'_, T> {
 
 const MAX_READS: u32 = u32::MAX >> 3;
 
-/// `tokio::sync::RwLock`（書き手を優先する FIFO）。
+/// Equivalent of `tokio::sync::RwLock`: a FIFO lock that favours writers.
 pub struct RwLock<T: ?Sized> {
     mr: u32,
     s: Semaphore,
@@ -446,7 +446,7 @@ impl<T: ?Sized> RwLock<T> {
     }
 }
 
-/// 読み手のガード。
+/// The guard of a reader.
 #[must_use = "if unused the RwLock will immediately unlock"]
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     s: &'a Semaphore,
@@ -508,7 +508,7 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for RwLockReadGuard<'_, T> {
     }
 }
 
-/// 書き手のガード。
+/// The guard of a writer.
 #[must_use = "if unused the RwLock will immediately unlock"]
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     s: &'a Semaphore,
@@ -522,7 +522,7 @@ unsafe impl<T: ?Sized + Send + Sync> Send for RwLockWriteGuard<'_, T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for RwLockWriteGuard<'_, T> {}
 
 impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
-    /// 書きの許可を読み 1 つに落とす（他の読み手を通す）。
+    /// Downgrades the write permit to a single read permit (other readers may proceed).
     pub fn downgrade(self) -> RwLockReadGuard<'a, T> {
         let s = self.s;
         let data = self.data as *const T;
@@ -536,7 +536,7 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         }
     }
 
-    /// 部分への参照に写して読みに落とす。
+    /// Maps to a reference to a part of the data and downgrades to a read guard.
     pub fn downgrade_map<U: ?Sized, F: FnOnce(&T) -> &U>(
         this: Self,
         f: F,
@@ -552,7 +552,7 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         }
     }
 
-    /// `f` が `Some` を返したら写して読みに落とす（`None` ならガードを返す）。
+    /// If `f` returns `Some`, maps and downgrades to a read guard; on `None` it gives the guard back.
     pub fn try_downgrade_map<U: ?Sized, F: FnOnce(&T) -> Option<&U>>(
         this: Self,
         f: F,
@@ -614,7 +614,7 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for RwLockWriteGuard<'_, T> {
     }
 }
 
-/// `RwLockWriteGuard::map` のガード。
+/// The guard returned by `RwLockWriteGuard::map`.
 pub struct RwLockMappedWriteGuard<'a, T: ?Sized> {
     s: &'a Semaphore,
     permits: u32,
@@ -647,7 +647,7 @@ impl<T: ?Sized> Drop for RwLockMappedWriteGuard<'_, T> {
     }
 }
 
-/// 所有の読み手のガード。
+/// The owned guard of a reader.
 pub struct OwnedRwLockReadGuard<T: ?Sized> {
     lock: Arc<RwLock<T>>,
 }
@@ -666,7 +666,7 @@ impl<T: ?Sized> Drop for OwnedRwLockReadGuard<T> {
     }
 }
 
-/// 所有の書き手のガード。
+/// The owned guard of a writer.
 pub struct OwnedRwLockWriteGuard<T: ?Sized> {
     lock: Arc<RwLock<T>>,
 }

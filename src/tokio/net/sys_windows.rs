@@ -1,8 +1,10 @@
-//! `veil::tokio::net` の OS 依存の呼び出し（Windows、Winsock。F-204）。
+// F-204
+//! OS-specific calls for `veil::tokio::net` (Windows, Winsock).
 //!
-//! `sys_unix.rs` と同じ名前・同じ意味の関数を Winsock で書く。エラーは `WSAGetLastError()`
-//! （`io::Error::from_raw_os_error` は WSA のコードも `WouldBlock` 等へ写す）。準備待ちは veil の
-//! reactor（WSAPoll）。ソケットの作成は reactor の `create_nonblocking_socket`（`WSAStartup` 済み・FIONBIO）。
+//! These are functions with the same names and meaning as in `sys_unix.rs`, written with Winsock. Errors come from
+//! `WSAGetLastError()` (`io::Error::from_raw_os_error` also maps WSA codes to `WouldBlock` and so on). Readiness waits
+//! use veil's reactor (WSAPoll). Sockets are created with the reactor's `create_nonblocking_socket` (`WSAStartup`
+//! already done, FIONBIO set).
 
 use super::Opt;
 use crate::runtime::handle::win;
@@ -18,9 +20,9 @@ use windows_sys::Win32::Networking::WinSock::{
     WSAPOLLFD,
 };
 
-/// 所有するソケット。
+/// An owned socket.
 pub(crate) type Owned = OwnedSocket;
-/// ランタイムの準備待ちに渡すソケットの番号（`runtime::handle::RawFd` = `isize`）。
+/// The socket number passed to the runtime's readiness wait (`runtime::handle::RawFd` = `isize`).
 pub(crate) type Raw = crate::runtime::handle::RawFd;
 
 pub(crate) fn raw(o: &Owned) -> Raw {
@@ -43,25 +45,25 @@ fn cvt(r: i32) -> io::Result<i32> {
     }
 }
 
-/// 1 回の呼び出しで渡す長さ（Winsock は `i32`）。
+/// The length passed in one call (Winsock uses `i32`).
 fn clamp_len(len: usize) -> i32 {
     len.min(i32::MAX as usize) as i32
 }
 
-/// ソケットを std の型として借りる（アドレスの取得・ソケットオプション用。閉じない）。
+/// Borrows a socket as a std type (for address queries and socket options; it is not closed).
 pub(crate) fn with_std<T: FromRawSocket + IntoRawSocket, R>(fd: Raw, f: impl FnOnce(&T) -> R) -> R {
     // SAFETY: 借りるだけで、終わったら forget で手放す
     let s = std::mem::ManuallyDrop::new(unsafe { T::from_raw_socket(fd as RawSocket) });
     f(&s)
 }
 
-/// std から取り込んだ・accept したソケットの準備（ノンブロッキング。Windows に close-on-exec・SIGPIPE は無い）。
+/// Prepares a socket adopted from std or accepted (non-blocking; Windows has no close-on-exec or SIGPIPE).
 pub(crate) fn prepare(fd: Raw) -> io::Result<()> {
     let mut on: u32 = 1;
     cvt(unsafe { ws::ioctlsocket(sock(fd), FIONBIO, &mut on) }).map(drop)
 }
 
-/// TCP のソケットを作る。
+/// Creates a TCP socket.
 pub(crate) fn new_stream_socket(v6: bool) -> io::Result<Owned> {
     let fd = crate::runtime::tcp::create_nonblocking_socket(if v6 {
         AF_INET6 as i32
@@ -88,7 +90,7 @@ pub(crate) fn recv_buf(fd: Raw, buf: &mut ReadBuf<'_>, peek: bool) -> io::Result
     Ok(n)
 }
 
-/// `dst` へ読む（未初期化でよい）。
+/// Receives into `dst` (which may be uninitialised).
 pub(crate) fn recv_into(fd: Raw, dst: *mut u8, len: usize) -> io::Result<usize> {
     cvt(unsafe { ws::recv(sock(fd), dst, clamp_len(len), 0) }).map(|n| n as usize)
 }
@@ -184,8 +186,8 @@ fn from_storage(ss: &SOCKADDR_STORAGE) -> io::Result<SocketAddr> {
     }
 }
 
-/// 非ブロッキングの connect を始める（進行中は `Ok`。結果は書き込み可能になってから `sock_err` で見る。
-/// WSAPoll は失敗した connect を `POLLHUP|POLLERR` で返すことがあるので、`SO_ERROR` を必ず読む）。
+/// Starts a non-blocking connect (`Ok` while in progress; check the result with `sock_err` once it is writable).
+/// WSAPoll can report a failed connect as `POLLHUP|POLLERR`, so `SO_ERROR` is always read.
 pub(crate) fn connect(fd: Raw, addr: &SocketAddr) -> io::Result<()> {
     let (ss, len) = to_storage(addr);
     let r = unsafe { ws::connect(sock(fd), &ss as *const _ as *const SOCKADDR, len) };
@@ -220,7 +222,7 @@ pub(crate) fn accept(fd: Raw) -> io::Result<(Owned, SocketAddr)> {
     Ok((owned, from_storage(&ss)?))
 }
 
-/// `recvfrom`（`dst` は未初期化でよい。`peek` は `MSG_PEEK`）。
+/// `recvfrom` (`dst` may be uninitialised; `peek` uses `MSG_PEEK`).
 pub(crate) fn recv_from_into(
     fd: Raw,
     dst: *mut u8,
@@ -335,7 +337,7 @@ pub(crate) fn set_linger(fd: Raw, dur: Option<std::time::Duration>) -> io::Resul
     .map(drop)
 }
 
-/// 今の状態（相手が閉じた・切れた・エラー）を待たずに見る（`(read_closed, hup, error)`）。
+/// Reads the current state (peer closed, hung up, error) without waiting, as `(read_closed, hup, error)`.
 pub(crate) fn closed_state(fd: Raw) -> (bool, bool, bool) {
     let mut pfd = WSAPOLLFD {
         fd: sock(fd),
@@ -353,8 +355,9 @@ pub(crate) fn closed_state(fd: Raw) -> (bool, bool, bool) {
     }
 }
 
-/// `shutdown` の後始末: WSAPoll はローカルの `shutdown(SD_RECEIVE)` を通知しないので、読み取りの待ち手を
-/// 起こして `recv` をやり直させる（B-88。reactor の `TcpStream::shutdown` と同じ）。
+// B-88: reactor の `TcpStream::shutdown` と同じ。
+/// Cleanup after `shutdown`. WSAPoll does not report a local `shutdown(SD_RECEIVE)`, so the readers
+/// are woken to retry `recv`.
 pub(crate) fn after_shutdown(fd: Raw, how: std::net::Shutdown) {
     if how != std::net::Shutdown::Write && crate::runtime::has_driver() {
         crate::runtime::executor::wake_all_readers(fd);

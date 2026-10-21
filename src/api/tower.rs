@@ -1,11 +1,13 @@
-//! Tower の `Service` / `Layer` 互換（F-190、`tower-compat` feature。`api-core` に含む）。
+// F-190: `api-core` に含む。
+//! Compatibility with Tower's `Service` and `Layer` (the `tower-compat` feature).
 //!
-//! - `App::layer(L)` / `App::layer_on("/admin", L)`: ハンドラを tower のサービスとして包み、層を掛ける。
-//!   veil のワーカー上でそのまま実行する（tokio の時計・I/O を使わない層向け: 認証・ヘッダ付与・CORS 等）。
-//! - `App::tokio_service(path, svc)`: tower のサービス（axum の Router 等）を tokio 互換ランタイムで
-//!   実行してマウントする（tokio に依存する層・ライブラリ向け）。
+//! - `App::layer(L)` / `App::layer_on("/admin", L)`: wraps handlers as tower services and applies the layer.
+//!   They run directly on veil's workers (for layers that use no tokio clock or I/O: authentication, adding
+//!   headers, CORS and so on).
+//! - `App::tokio_service(path, svc)`: mounts a tower service (such as an axum `Router`) and runs it on the
+//!   tokio-compatible runtime (for layers and libraries that depend on tokio).
 //!
-//! リクエスト・応答は `http` クレートの型（本文は `http_body_util::Full<Bytes>`）で受け渡す。
+//! Requests and responses are exchanged as types of the `http` crate (the body is `http_body_util::Full<Bytes>`).
 
 use super::app::App;
 use super::handler::HandlerFn;
@@ -21,8 +23,8 @@ use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
 
-/// `tower::ServiceExt::oneshot` と同じ（準備を待ってから 1 回呼ぶ）。tower クレートに依存しないため
-/// （tower の tokio を使う機能が有効だと、tokio を veil の互換レイヤーに置き換えたとき依存が循環する。F-198）。
+// F-198: tower クレートに依存しない理由。tower の tokio を使う機能が有効だと、tokio を veil の互換レイヤーに置き換えたとき依存が循環する。
+/// Same as `tower::ServiceExt::oneshot` (waits for readiness, then calls once). It exists so as not to depend on the tower crate.
 async fn oneshot<S, R>(mut svc: S, req: R) -> Result<S::Response, S::Error>
 where
     S: Service<R>,
@@ -31,21 +33,22 @@ where
     svc.call(req).await
 }
 
-/// tower 側に渡す本文の型。
+/// The body type handed to the tower side.
 pub type VeilBody = http_body_util::Full<Bytes>;
 
-/// veil の `Request` を `http::Request` にする（元の `Request` は extensions にも入れる。
-/// パスパラメータ等を内側のハンドラへ引き継ぐため）。
+/// Converts a veil `Request` into an `http::Request`. The original `Request` is also placed in the extensions,
+/// to carry path parameters and the like to the inner handler.
 pub fn to_http_request(req: Request) -> http::Request<VeilBody> {
     let mut out = build_http_request(&req);
     out.extensions_mut().insert(req);
     out
 }
 
-/// `http::Request` を作る（extensions には何も入れない）。F-235: 要求のバイト列を複製しない。
-/// - URI はクエリが無ければパスの `Bytes` をそのまま使い、あれば 1 回だけ連結する。
-/// - ヘッダの値は `HeaderValue::from_maybe_shared` で受信バッファの `Bytes` を共有する
-///   （名前は標準のものなら静的。`HeaderMap` は数で容量を取る）。
+// F-235: 要求のバイト列を複製しない。
+/// Builds an `http::Request` (nothing is placed in the extensions); request bytes are not copied.
+/// - Without a query, the URI uses the path `Bytes` as is; with one, it is concatenated once.
+/// - Header values share the receive buffer's `Bytes` through `HeaderValue::from_maybe_shared`
+///   (names are static if standard; the `HeaderMap` reserves capacity by count).
 fn build_http_request(req: &Request) -> http::Request<VeilBody> {
     let mut out = http::Request::new(VeilBody::new(req.body.clone()));
     if let Ok(m) = http::Method::from_bytes(&req.method) {
@@ -81,8 +84,8 @@ fn build_http_request(req: &Request) -> http::Request<VeilBody> {
     out
 }
 
-/// よく使うヘッダの名前は静的な `Bytes` にする（`http` 1.x には `HeaderName` を `Bytes` へ移す手段が無いため、
-/// 表で引く。表に無い名前だけ複製する）。
+/// Names of commonly used headers become static `Bytes`. `http` 1.x has no way to move a `HeaderName` into
+/// `Bytes`, so a table is used; only names missing from the table are copied.
 fn header_name_bytes(n: &http::HeaderName) -> Bytes {
     use http::header::*;
     static COMMON: &[(HeaderName, &[u8])] = &[
@@ -114,7 +117,8 @@ fn header_name_bytes(n: &http::HeaderName) -> Bytes {
     Bytes::copy_from_slice(n.as_str().as_bytes())
 }
 
-/// `HeaderMap` を veil のヘッダの列にする（F-235: よく使う名前は複製しない。値は 1 回だけ複製する）。
+// F-235
+/// Turns a `HeaderMap` into a list of veil headers (commonly used names are not copied; values are copied once).
 fn headers_into_vec(map: http::HeaderMap, out: &mut Vec<(Bytes, Bytes)>) {
     out.reserve(map.len());
     let mut last: Option<Bytes> = None;
@@ -135,8 +139,9 @@ fn headers_into_vec(map: http::HeaderMap, out: &mut Vec<(Bytes, Bytes)>) {
     }
 }
 
-/// 本文をまとめて読む。F-235: データのフレームが 1 つ（`Full` 等）ならその `Bytes` をそのまま返し、
-/// 2 つ以上のときだけ連結する（`collect()` は 1 フレームでも内部のキューを確保していた）。
+// F-235: `collect()` は 1 フレームでも内部のキューを確保していた。
+/// Reads the whole body. If there is a single data frame (such as `Full`), its `Bytes` is returned as is;
+/// frames are concatenated only when there are two or more.
 async fn body_bytes<B>(body: B) -> Result<Bytes, B::Error>
 where
     B: http_body::Body<Data = Bytes>,
@@ -169,7 +174,7 @@ where
     })
 }
 
-/// `http::Request` を veil の `Request` に戻す（層が書き換えたメソッド・URI・ヘッダ・本文を反映する）。
+/// Converts an `http::Request` back into a veil `Request` (reflecting the method, URI, headers and body rewritten by layers).
 pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
     let (parts, body) = req.into_parts();
     let body = body_bytes(body).await.unwrap_or_default();
@@ -191,7 +196,7 @@ pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
     req
 }
 
-/// veil の `Response` を `http::Response` にする。
+/// Converts a veil `Response` into an `http::Response`.
 pub fn to_http_response(resp: Response) -> http::Response<VeilBody> {
     let mut b = http::Response::builder().status(resp.status);
     for (n, v) in &resp.headers {
@@ -213,11 +218,11 @@ pub fn to_http_response(resp: Response) -> http::Response<VeilBody> {
     out
 }
 
-/// 層を通す間ストリーミング本文を預ける入れ物（http の extensions は `Clone + Sync` を要求する）。
+/// A container that holds the streaming body while the response passes through layers (http extensions require `Clone + Sync`).
 #[derive(Clone)]
 struct StreamCarrier(Arc<Mutex<Option<super::stream::BodyStream>>>);
 
-/// `http::Response` を veil の `Response` にする（本文はまとめて読む）。
+/// Converts an `http::Response` into a veil `Response` (the body is read in full).
 pub async fn from_http_response<B>(resp: http::Response<B>) -> Response
 where
     B: http_body::Body<Data = Bytes>,
@@ -242,7 +247,7 @@ where
     r
 }
 
-/// veil のハンドラを tower の `Service` として見せる（層の内側）。
+/// Presents a veil handler as a tower `Service` (the innermost layer).
 #[derive(Clone)]
 pub struct HandlerService {
     func: HandlerFn,
@@ -267,7 +272,7 @@ impl Service<http::Request<VeilBody>> for HandlerService {
 }
 
 impl App {
-    /// 全ルートに tower の層を掛ける（veil のワーカー上で実行）。
+    /// Applies a tower layer to all routes (run on veil's workers).
     pub fn layer<L, B>(self, layer: L) -> App
     where
         L: Layer<HandlerService> + Clone + Send + Sync + 'static,
@@ -284,7 +289,7 @@ impl App {
         self.layer_on("/", layer)
     }
 
-    /// `prefix`（セグメント境界の前方一致）以下のルートだけに tower の層を掛ける。
+    /// Applies a tower layer only to routes under `prefix` (a prefix match on a segment boundary).
     pub fn layer_on<L, B>(self, prefix: &str, layer: L) -> App
     where
         L: Layer<HandlerService> + Clone + Send + Sync + 'static,
@@ -313,9 +318,9 @@ impl App {
         })
     }
 
-    /// tower のサービス（axum の `Router` 等）を tokio 互換ランタイムで実行して `path` にマウントする。
+    /// Mounts a tower service (such as an axum `Router`) at `path`, running it on the tokio-compatible runtime.
     #[cfg(any(feature = "tokio-compat", feature = "tokio-compat-bridge"))]
-    /// `path` は `{*rest}` で下位パスをまとめて渡せる（例: `"/legacy/{*rest}"`）。
+    /// `path` can pass the whole subpath with `{*rest}` (for example `"/legacy/{*rest}"`).
     pub fn tokio_service<S, B>(self, methods: &[&str], path: &str, svc: S) -> App
     where
         S: Service<http::Request<VeilBody>, Response = http::Response<B>>

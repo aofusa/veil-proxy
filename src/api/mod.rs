@@ -1,8 +1,10 @@
-//! veil API サーバ基盤ライブラリ（F-188〜F-192）。`handler` feature（`api` 等）のときだけ存在する。
+// F-188〜F-192: API サーバ基盤ライブラリ。設計は docs/backlog/features/F-188-api-library-core.md、利用者向けガイドは docs/guide/library.md。
+//! API server foundation library. Present only when a `handler` feature (such as `api`) is enabled.
 //!
-//! veil のネットワーク層・TLS・HTTP/1.1・2・3・独自ランタイムの上で、Rust の関数をハンドラとして
-//! 登録して API サーバを書く。ルートは `#[veil::route]` マクロ（`macro` feature）か `App` で登録し、
-//! 内部的には `type = "Handler"` の `[[route]]` として既存のルーティングに載る。
+//! Write an API server by registering Rust functions as handlers on top of veil's network layer, TLS,
+//! HTTP/1.1, HTTP/2, HTTP/3 and its own runtime. Routes are registered with the `#[veil::route]` macro
+//! (the `macro` feature) or with [`App`]; internally they become `[[route]]` entries of
+//! `type = "Handler"` in the existing routing table.
 //!
 //! ```no_run
 //! use veil::prelude::*;
@@ -18,13 +20,12 @@
 //!     veil::serve(config).await
 //! }
 //! ```
-//!
-//! 設計: `docs/backlog/features/F-188-api-library-core.md`。利用者向けガイド: `docs/guide/library.md`。
 
 #![warn(missing_docs)]
 
 pub mod app;
-/// ワーカーとハンドラ用プールの間の有界キュー（C・Python のストリーミング・gRPC・L4。F-210）
+// F-210: C・Python のストリーミング・gRPC・L4 が使う。
+/// Bounded queues between the workers and the handler pool.
 pub mod bridge;
 pub mod config;
 pub(crate) mod dispatch;
@@ -63,7 +64,7 @@ pub use response::{ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
 pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
 
-/// よく使う型をまとめて取り込む（`use veil::prelude::*;`）。
+/// Re-exports of the most commonly used types (`use veil::prelude::*;`).
 pub mod prelude {
     pub use super::app::{serve, serve_blocking, serve_with_router, shutdown, App, Router};
     pub use super::config::{Config, ConfigBuilder};
@@ -78,7 +79,7 @@ pub mod prelude {
     pub use veil_macros::Schema;
 }
 
-/// 組み込みのハンドラ（`__veil_` で始まる名前）を、現在の設定で公開するか。
+/// Returns whether a built-in handler (a name starting with `__veil_`) is exposed under the current settings.
 pub(crate) fn is_builtin_enabled(entry: &HandlerEntry, settings: &app::ApiSettings) -> bool {
     if !entry.name.starts_with("__veil_openapi") {
         return true;
@@ -86,7 +87,7 @@ pub(crate) fn is_builtin_enabled(entry: &HandlerEntry, settings: &app::ApiSettin
     settings.openapi_enabled
 }
 
-/// マクロの生成コードが使う内部 API（利用者は直接使わない。互換性は保証しない）。
+/// Internal API used by macro-generated code (not for direct use; no compatibility guarantee).
 #[doc(hidden)]
 pub mod __private {
     pub use super::extract::{
@@ -114,10 +115,10 @@ pub mod __private {
     use serde_json::Value;
     use std::marker::PhantomData;
 
-    /// autoref 特殊化で「`T: ApiSchema` ならそのスキーマ、そうでなければ汎用」を選ぶ。
-    /// 呼び出しは `(&SchemaProbe::<T>(..)).veil_schema(..)`: 受け手 `&Probe` に対し、境界付きの impl
-    /// （`Self = Probe`、`&self`）が最初の探索段で一致し、満たさなければ自動参照の段で
-    /// 予備の impl（`Self = &Probe`）が選ばれる。
+    /// Selects, by autoref specialization, the schema of `T` when `T: ApiSchema` and a generic fallback otherwise.
+    /// It is called as `(&SchemaProbe::<T>(..)).veil_schema(..)`: for the receiver `&Probe`, the bounded impl
+    /// (`Self = Probe`, `&self`) matches in the first lookup step; when the bound is not met, the autoref step
+    /// picks the fallback impl (`Self = &Probe`).
     pub struct SchemaProbe<T: ?Sized>(pub PhantomData<T>);
 
     pub trait ViaApiSchema {
@@ -145,7 +146,7 @@ pub mod __private {
         }
     }
 
-    /// autoref 特殊化で「`T: Validate` なら検証、そうでなければ何もしない」を選ぶ。
+    /// Selects, by autoref specialization, validation when `T: Validate` and a no-op otherwise.
     pub struct ValidateProbe<'a, T: ?Sized>(pub &'a T);
 
     pub trait ViaValidate {
@@ -175,7 +176,7 @@ pub mod __private {
         }
     }
 
-    /// 型だけで「Validate を実装しているか」を調べる（OpenAPI の 422 記載用）。
+    /// Detects from the type alone whether it implements `Validate` (used to document the 422 response in OpenAPI).
     pub struct ValidateTypeProbe<T: ?Sized>(pub PhantomData<T>);
     pub trait ViaValidateType {
         fn veil_validates(&self) -> bool;
@@ -194,7 +195,7 @@ pub mod __private {
         }
     }
 
-    /// `Query<T>` の T のスキーマ（オブジェクト）を、OpenAPI のクエリパラメータの並びに展開する。
+    /// Expands the schema (an object) of `T` in `Query<T>` into a list of OpenAPI query parameters.
     pub fn query_params_from_schema(schema: &Value, defs: &Definitions) -> Vec<ParamMeta> {
         let resolved = match schema.get("$ref").and_then(|r| r.as_str()) {
             Some(r) => defs
@@ -226,7 +227,7 @@ pub mod __private {
         out
     }
 
-    /// ブロッキングなハンドラ本体をハンドラ用プールで実行する（`offload = true`）。
+    /// Runs a blocking handler body on the handler pool (`offload = true`).
     pub async fn offload<F, R>(f: F) -> Response
     where
         F: FnOnce() -> R + Send + 'static,
@@ -260,7 +261,7 @@ mod tests {
     }
     struct Plain;
 
-    /// autoref 特殊化が「実装していれば使う・無ければ予備」を正しく選ぶ（マクロの生成コードと同じ呼び方）。
+    /// Autoref specialization picks the bounded impl when it exists and the fallback otherwise (called the same way as macro-generated code).
     // 理由付き allow: `(&Probe).method()` の明示的な借用こそが検証対象（予備の impl は `&Probe` にある）。
     #[allow(clippy::needless_borrow)]
     #[test]

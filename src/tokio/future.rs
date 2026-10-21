@@ -1,13 +1,13 @@
-//! `tokio::future`（`join!`・`try_join!` が使う `maybe_done`）。
+//! Helpers behind `tokio::future`, such as `maybe_done`, which `join!` and `try_join!` use.
 
 pub mod maybe_done {
-    //! 完了した出力を後で取り出せる Future の包み。
+    //! A wrapper around a future that lets you take its output after it completes.
 
     use std::future::{Future, IntoFuture};
     use std::pin::Pin;
     use std::task::{ready, Context, Poll};
 
-    /// まだ動いている / 完了して出力を持っている / 出力を取り出した。
+    /// Still running, completed and holding its output, or output already taken.
     #[derive(Debug)]
     #[repr(C)]
     pub enum MaybeDone<Fut: Future> {

@@ -1,17 +1,19 @@
-//! セグメントとスパン（F-183）。
+// F-183
+//! Segments and spans.
 //!
-//! セグメントは `SEGMENT_SIZE`（4MiB）境界に揃えた 4MiB のマッピングで、64KiB の
-//! スロット 64 個に分かれる。スロット 0 の先頭にヘッダ（[`Segment`]）を置き、残り 63 スロットを
-//! スパン（同じサイズクラスのブロックを切り出す連続スロット）に割り当てる。
-//! ポインタ `p` の属するセグメントは `p & !(SEGMENT_SIZE - 1)` で引ける。
+//! A segment is a 4 MiB mapping aligned to `SEGMENT_SIZE` (4 MiB) and divided into 64 slots of
+//! 64 KiB. The header ([`Segment`]) sits at the start of slot 0, and the remaining 63 slots
+//! are assigned to spans (contiguous slots that blocks of one size class are carved from).
+//! The segment a pointer `p` belongs to is found with `p & !(SEGMENT_SIZE - 1)`.
 //!
-//! セグメントは常にちょうど 1 つのヒープ（[`Heap`]）が所有し、ヘッダの可変状態は所有者だけが
-//! 触る（`owner` を除く）。他スレッドからの解放は所有ヒープの `remote` リストへ投函される。
+//! A segment is owned by exactly one heap ([`Heap`]) at any time, and only the owner touches the
+//! mutable state of the header (except `owner`). Frees from other threads are pushed onto the
+//! owning heap's `remote` list.
 //!
-//! 空きスロットの状態（ビットマスク）:
-//! - `free_mask`: スパンに使われていない
-//! - `dirty_mask`: 空きだが物理ページが残っている可能性がある（purge 待ち）
-//! - `zero_mask`: 内容がゼロと分かっている（未使用、または Linux で purge 済み）
+//! State of the free slots (bit masks):
+//! - `free_mask`: not used by any span
+//! - `dirty_mask`: free, but physical pages may remain (waiting to be purged)
+//! - `zero_mask`: known to be zero-filled (never used, or purged on Linux)
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -20,40 +22,41 @@ use super::heap::Heap;
 use super::lock::SpinLock;
 use super::{os, stats, SEGMENT_SIZE, SLOTS, SLOT_SHIFT, SLOT_SIZE};
 
-/// フリーリストのノード（空きブロック自身の先頭 8 バイトに置く侵入型リスト）。
+/// A free-list node (an intrusive list stored in the first 8 bytes of the free block itself).
 #[repr(C)]
 pub(crate) struct Block {
     pub(crate) next: *mut Block,
 }
 
-/// ページフラグ: 空きが無いのでヒープのキューから外れている。
+/// Page flag: the page has no free blocks and is therefore off the heap queue.
 pub(crate) const PAGE_FULL: u8 = 1;
-/// ページフラグ: フリーリストの全ブロックがゼロ（先頭 8 バイトの next を除く）。
+/// Page flag: every block on the free list is zero (except the 8-byte `next` at its start).
 pub(crate) const PAGE_FRESH_FREE: u8 = 2;
-/// ページフラグ: `capacity` 以降（まだ切り出していない部分）がゼロ。
+/// Page flag: everything from `capacity` on (the part not carved yet) is zero.
 pub(crate) const PAGE_ZERO_TAIL: u8 = 4;
-/// ページフラグ: 空のままキューに残している（`Heap::retained` に数えている）。
+/// Page flag: the page is kept on the queue while empty (counted in `Heap::retained`).
 pub(crate) const PAGE_RETAINED: u8 = 8;
 
-/// スパンの記述子。セグメントヘッダ内にスロットと同数並び、スパン先頭スロットのものだけを使う。
+/// A span descriptor. There are as many as there are slots in the segment header, and only the
+/// one of the span's first slot is used.
 ///
-/// 高速パスが触るのは `free`・`used`・`flags` だけ（先頭 16 バイト）。
+/// The fast path touches only `free`, `used` and `flags` (the first 16 bytes).
 #[repr(C)]
 pub(crate) struct Page {
     pub(crate) free: *mut Block,
-    /// 使用中ブロック数（他スレッドが解放して `remote` に溜まっている分を含む）。
+    /// Number of blocks in use (including blocks freed by other threads that are pending in `remote`).
     pub(crate) used: u32,
     pub(crate) flags: u8,
     pub(crate) class: u8,
-    /// スパンのスロット数（0 = スパン先頭ではない）。
+    /// Number of slots in the span (0 means this is not the first slot of a span).
     pub(crate) slots: u8,
     _pad: u8,
-    /// 切り出し済みブロック数。
+    /// Number of blocks carved so far.
     pub(crate) capacity: u32,
-    /// スパンに入るブロック数。
+    /// Number of blocks that fit in the span.
     pub(crate) reserved: u32,
     pub(crate) block_size: u32,
-    /// 満杯ページをキューへ戻す使用数のしきい値（空きがブロック数の 1/8 に達したら戻す）。
+    /// Threshold of used blocks at which a full page returns to the queue (when the free blocks reach 1/8 of the block count).
     pub(crate) requeue_at: u32,
     pub(crate) start: *mut u8,
     pub(crate) prev: *mut Page,
@@ -80,21 +83,21 @@ impl Page {
     }
 }
 
-/// スロット 1..63 のマスク（スロット 0 はヘッダ）。
+/// Mask of slots 1..63 (slot 0 holds the header).
 pub(crate) const ALL_SLOTS: u64 = !1u64;
 
 #[repr(C)]
 pub(crate) struct Segment {
-    /// 所有ヒープ。他スレッドの解放が投函先を決めるために読む（ブロックが生きている間は不変）。
+    /// The owning heap. Read by other threads' frees to decide where to post (constant while a block is live).
     pub(crate) owner: AtomicPtr<Heap>,
     pub(crate) prev: *mut Segment,
     pub(crate) next: *mut Segment,
     pub(crate) free_mask: u64,
     pub(crate) dirty_mask: u64,
     pub(crate) zero_mask: u64,
-    /// スロットが dirty になった時刻（`os::now_ms`）。
+    /// Time at which a slot became dirty (`os::now_ms`).
     pub(crate) dirty_time: [u32; SLOTS],
-    /// スロット → 属するスパンの先頭スロット。
+    /// Slot to first slot of the span it belongs to.
     pub(crate) slot_head: [u8; SLOTS],
     pub(crate) pages: [Page; SLOTS],
 }
@@ -102,20 +105,20 @@ pub(crate) struct Segment {
 const _: () = assert!(core::mem::size_of::<Segment>() <= 4096);
 const _: () = assert!(core::mem::size_of::<Page>() == 56);
 
-/// ポインタの属するセグメント。
+/// The segment a pointer belongs to.
 #[inline(always)]
 pub(crate) fn segment_of<T>(p: *const T) -> *mut Segment {
     (p as usize & !(SEGMENT_SIZE - 1)) as *mut Segment
 }
 
-/// ページ記述子の添字（= スパン先頭スロット番号）。
+/// Index of a page descriptor (equal to the number of the span's first slot).
 #[inline]
 pub(crate) fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
     // SAFETY: page は seg.pages の要素。
     (page as usize - unsafe { (*seg).pages.as_ptr() } as usize) / core::mem::size_of::<Page>()
 }
 
-/// ポインタが属するスパンのページ記述子。
+/// The page descriptor of the span a pointer belongs to.
 #[inline(always)]
 pub(crate) unsafe fn page_of(seg: *mut Segment, p: *const u8) -> *mut Page {
     let idx = (p as usize - seg as usize) >> SLOT_SHIFT;
@@ -131,7 +134,7 @@ const fn run_mask(first: usize, n: usize) -> u64 {
     (if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }) << first
 }
 
-/// `mask` 中で連続 `n` ビットが立つ位置の先頭集合。
+/// The set of start positions of runs of `n` consecutive set bits in `mask`.
 #[inline]
 fn runs_of(mask: u64, n: usize) -> u64 {
     let mut m = mask;
@@ -144,8 +147,8 @@ fn runs_of(mask: u64, n: usize) -> u64 {
 }
 
 impl Segment {
-    /// 連続 `n` スロットの空きを探す。物理ページが残っている（dirty）並びを優先する
-    /// （ページフォルトを避け、RSS を既存の常駐ページへ寄せる）。
+    /// Finds a run of `n` consecutive free slots. Runs whose physical pages remain (dirty) are
+    /// preferred, which avoids page faults and keeps RSS on pages that are already resident.
     pub(crate) fn find_run(&self, n: usize) -> Option<usize> {
         let dirty = runs_of(self.free_mask & self.dirty_mask, n);
         if dirty != 0 {
@@ -159,7 +162,7 @@ impl Segment {
         }
     }
 
-    /// スロット `first..first+n` をスパンとして使用中にする。内容がゼロなら true。
+    /// Marks slots `first..first+n` as in use by a span. Returns true if their contents are zero.
     pub(crate) fn take_run(&mut self, first: usize, n: usize) -> bool {
         let m = run_mask(first, n);
         debug_assert_eq!(self.free_mask & m, m);
@@ -176,7 +179,7 @@ impl Segment {
         zero
     }
 
-    /// スパンを空きに戻す（dirty として purge 待ちにする）。
+    /// Returns a span to the free state (as dirty, waiting to be purged).
     pub(crate) fn give_run(&mut self, first: usize, n: usize, now: u32) {
         let m = run_mask(first, n);
         debug_assert_eq!(self.free_mask & m, 0);
@@ -193,8 +196,8 @@ impl Segment {
         self.free_mask == ALL_SLOTS
     }
 
-    /// `delay_ms` 以上 dirty のスロット（`force` なら全 dirty スロット）を purge する。
-    /// 戻り値は（purge したスロット数, 残った dirty スロットの最早期限）。
+    /// Purges slots that have been dirty for at least `delay_ms` (all dirty slots if `force` is set).
+    /// Returns (the number of slots purged, the earliest deadline among the dirty slots left).
     pub(crate) fn purge(&mut self, now: u32, delay_ms: u32, force: bool) -> (usize, Option<u32>) {
         let mut todo = 0u64;
         let mut earliest: Option<u32> = None;
@@ -240,8 +243,8 @@ impl Segment {
 // グローバルセグメントキャッシュ
 // ====================
 
-/// 空になったセグメント（全スロット purge 済み）の再利用キャッシュ。
-/// 上限を超えた分は `munmap` する（仮想アドレスと VMA 数を有界に保つ）。
+/// Reuse cache of segments that became empty (every slot purged).
+/// Segments beyond the limit are unmapped, which keeps the virtual address space and the number of VMAs bounded.
 pub(crate) struct SegCache {
     head: *mut Segment,
     count: usize,
@@ -255,10 +258,10 @@ pub(crate) static SEG_CACHE: SpinLock<SegCache> = SpinLock::new(SegCache {
     count: 0,
 });
 
-/// キャッシュに保持するセグメント数の上限（`VEIL_ALLOC_SEGMENT_CACHE` で上書き可）。
+/// Upper bound on the number of segments kept in the cache (override with `VEIL_ALLOC_SEGMENT_CACHE`).
 pub(crate) static SEG_CACHE_MAX: AtomicUsize = AtomicUsize::new(8);
 
-/// セグメントを 1 つ得る（キャッシュ優先、無ければ OS から）。所有者は `owner`。
+/// Obtains a segment (from the cache first, otherwise from the OS). The owner is `owner`.
 pub(crate) fn acquire(owner: *mut Heap) -> *mut Segment {
     let cached = {
         let mut c = SEG_CACHE.lock();
@@ -302,7 +305,7 @@ pub(crate) fn acquire(owner: *mut Heap) -> *mut Segment {
     seg
 }
 
-/// 空になったセグメントを手放す（全 dirty スロットを purge してキャッシュへ、溢れたら unmap）。
+/// Gives up a segment that became empty (purges every dirty slot and caches it, or unmaps it if the cache is full).
 pub(crate) fn release(seg: *mut Segment) {
     // SAFETY: 呼び出し側は seg の所有者で、全スロットが空き。
     unsafe {
@@ -324,7 +327,7 @@ pub(crate) fn release(seg: *mut Segment) {
     }
 }
 
-/// キャッシュ中のセグメントをすべて OS へ返す。
+/// Returns every cached segment to the OS.
 pub(crate) fn flush_cache() {
     let mut head = {
         let mut c = SEG_CACHE.lock();

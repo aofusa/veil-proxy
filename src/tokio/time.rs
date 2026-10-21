@@ -1,8 +1,10 @@
-//! `tokio::time` 互換（F-198）。
+// F-198
+//! Compatible with `tokio::time`.
 //!
-//! タイマーはプロセスに 1 本のタイマースレッドが期限順に起こす（どのスレッドで作った `Sleep` も同じように
-//! 動き、ランタイムの外でも使える）。起こす Waker はスレッドセーフに包んだもの（`waker::WakerSlot`）なので、
-//! veil のタスクへは所有スレッドの受け口を通って届く。`pause`・`advance`（tokio の test-util）は未対応。
+//! One timer thread per process wakes timers in deadline order (a `Sleep` behaves the same on whichever
+//! thread created it, and can be used outside a runtime). The waker it calls is wrapped to be thread-safe
+//! (`waker::WakerSlot`), so wake-ups reach veil tasks through the owning thread's entry point.
+//! `pause` and `advance` (tokio's test-util) are supported.
 
 use super::waker::WakerSlot;
 use std::cmp::Reverse;
@@ -16,12 +18,12 @@ pub use std::time::Duration;
 
 // ===================== Instant =====================
 
-/// `tokio::time::Instant`（`std::time::Instant` の薄い包み）。
+/// Equivalent of `tokio::time::Instant`: a thin wrapper around `std::time::Instant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant(std::time::Instant);
 
 impl Instant {
-    /// 今（時計を止めているときは止めた時計の時刻）。
+    /// Now (the time of the paused clock while the clock is paused).
     pub fn now() -> Instant {
         Instant(clock_now())
     }
@@ -49,7 +51,7 @@ impl Instant {
     pub fn checked_sub(&self, d: Duration) -> Option<Instant> {
         self.0.checked_sub(d).map(Instant)
     }
-    /// 遠い将来（`Sleep` の「期限なし」に使う）。
+    /// A distant future (used as "no deadline" for `Sleep`).
     pub(crate) fn far_future() -> Instant {
         Instant::now() + Duration::from_secs(86400 * 365 * 30)
     }
@@ -102,7 +104,7 @@ impl std::ops::Sub<Instant> for Instant {
 
 // ===================== 時計（tokio の test-util の pause / advance） =====================
 
-/// 時計。止めていないときは `virt_at + (実時間 - real_at)`、止めているときは `virt_at`。
+/// The clock. While running it is `virt_at + (real time - real_at)`; while paused it is `virt_at`.
 struct Clock {
     paused: bool,
     virt_at: std::time::Instant,
@@ -121,13 +123,13 @@ fn clock() -> &'static Mutex<Clock> {
     })
 }
 
-/// 時計を一度でも動かした（pause / advance）か。触っていなければ実時間をそのまま使う（速い経路）。
+/// Whether the clock has ever been touched (pause / advance). If not, real time is used as it is (fast path).
 static CLOCK_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// タスクが動いた回数（時計を止めているときの自動前進の判断に使う。動いている間は進めない）。
+/// Number of times tasks ran (used to decide automatic advancing while paused; it does not advance while tasks are running).
 static ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// タスクの poll ごとに呼ぶ（時計を止めているときだけ数える）。
+/// Called on every task poll (counted only while the clock is paused).
 pub(crate) fn note_activity() {
     if CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Relaxed) {
         ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -151,7 +153,7 @@ fn is_paused() -> bool {
         && clock().lock().unwrap_or_else(|e| e.into_inner()).paused
 }
 
-/// 時計の時刻（仮想）を実時間に直す（タイマースレッドの待ち時間用）。
+/// Converts a clock (virtual) time to real time (for the timer thread's wait).
 fn to_real(deadline: std::time::Instant) -> std::time::Instant {
     if !CLOCK_TOUCHED.load(std::sync::atomic::Ordering::Acquire) {
         return deadline;
@@ -160,7 +162,7 @@ fn to_real(deadline: std::time::Instant) -> std::time::Instant {
     c.real_at + deadline.saturating_duration_since(c.virt_at)
 }
 
-/// 時計を止める（テスト用）。止めている間は `advance` か、どのタスクも動かなくなったときに次のタイマーまで進む。
+/// Pauses the clock (for tests). While paused, time moves forward only through `advance`, or to the next timer when no task can run.
 #[track_caller]
 pub fn pause() {
     CLOCK_TOUCHED.store(true, std::sync::atomic::Ordering::Release);
@@ -178,14 +180,14 @@ pub fn pause() {
     timer().cv.notify_one();
 }
 
-/// 止まっていなければ止める（`start_paused` のランタイムを複数作るとき用）。
+/// Pauses the clock if it is not already paused (for creating several `start_paused` runtimes).
 pub(crate) fn pause_if_running() {
     if !is_paused() {
         pause();
     }
 }
 
-/// 止めた時計を動かす。
+/// Resumes the paused clock.
 #[track_caller]
 pub fn resume() {
     let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
@@ -199,7 +201,7 @@ pub fn resume() {
     timer().cv.notify_one();
 }
 
-/// 止めた時計を `duration` だけ進め、期限の来たタイマーを起こしてから 1 回譲る。
+/// Advances the paused clock by `duration`, wakes the timers that became due, and then yields once.
 pub async fn advance(duration: Duration) {
     {
         let mut c = clock().lock().unwrap_or_else(|e| e.into_inner());
@@ -212,7 +214,7 @@ pub async fn advance(duration: Duration) {
     crate::tokio::task::yield_now().await;
 }
 
-/// 時計の設定（ランタイムの文脈で timers が無効なら panic する）。
+/// Clock settings (panics when timers are disabled in the runtime context).
 #[track_caller]
 fn check_time_enabled() {
     if !crate::runtime::has_driver() && crate::tokio::runtime::Handle::try_current().is_err() {
@@ -285,7 +287,7 @@ fn timer() -> &'static TimerThread {
     })
 }
 
-/// 期限の来たタイマーを起こす（`now` は時計の時刻）。
+/// Wakes the timers that are due (`now` is the clock's time).
 fn fire_due(now: std::time::Instant) {
     let t = timer();
     let due: Vec<Arc<Entry>> = {
@@ -385,7 +387,7 @@ pub struct Sleep {
     elapsed: bool,
 }
 
-/// `Sleep` が持つ登録（drop でタイマースレッドの項目は無効になる）。
+/// The registration held by a `Sleep` (dropping it invalidates the entry on the timer thread).
 struct EntryHandle(Arc<Entry>);
 
 impl std::fmt::Debug for EntryHandle {
@@ -407,7 +409,7 @@ impl Sleep {
         self.deadline
     }
 
-    /// 期限が来たのを poll で確かめたか（tokio と同じく、作っただけ・poll していないなら `false`）。
+    /// Whether the deadline has been observed as reached by a poll (as in tokio, `false` if it was only created and never polled).
     pub fn is_elapsed(&self) -> bool {
         self.elapsed
             || self
@@ -416,7 +418,7 @@ impl Sleep {
                 .is_some_and(|e| e.0.fired.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// 期限を変える（`Pin<&mut Sleep>` で呼ぶ）。
+    /// Changes the deadline (call it through `Pin<&mut Sleep>`).
     pub fn reset(self: Pin<&mut Self>, deadline: Instant) {
         let this = self.get_mut();
         this.deadline = deadline;
@@ -459,7 +461,7 @@ impl Sleep {
     }
 }
 
-/// `duration` 後に完了する。
+/// Completes after `duration`.
 #[track_caller]
 pub fn sleep(duration: Duration) -> Sleep {
     check_time_enabled();
@@ -470,7 +472,7 @@ pub fn sleep(duration: Duration) -> Sleep {
     )
 }
 
-/// `deadline` に完了する。
+/// Completes at `deadline`.
 #[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
     check_time_enabled();
@@ -480,7 +482,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 // ===================== timeout =====================
 
 pub mod error {
-    /// 期限切れ（`tokio::time::error::Elapsed`）。
+    /// The deadline elapsed (`tokio::time::error::Elapsed`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Elapsed(pub(crate) ());
 
@@ -498,7 +500,7 @@ pub mod error {
         }
     }
 
-    /// タイマーのエラー（互換のため。このレイヤーでは発生しない）。
+    /// Timer error (for compatibility; this layer never produces it).
     #[derive(Debug)]
     pub struct Error(());
 
@@ -551,7 +553,7 @@ impl<T: Future> Future for Timeout<T> {
     }
 }
 
-/// `duration` を過ぎたら `Err(Elapsed)`。
+/// Returns `Err(Elapsed)` if `duration` passes first.
 #[track_caller]
 pub fn timeout<F: std::future::IntoFuture>(
     duration: Duration,
@@ -563,7 +565,7 @@ pub fn timeout<F: std::future::IntoFuture>(
     }
 }
 
-/// `deadline` を過ぎたら `Err(Elapsed)`。
+/// Returns `Err(Elapsed)` if `deadline` passes first.
 #[track_caller]
 pub fn timeout_at<F: std::future::IntoFuture>(
     deadline: Instant,
@@ -577,15 +579,15 @@ pub fn timeout_at<F: std::future::IntoFuture>(
 
 // ===================== Interval =====================
 
-/// 予定の時刻を過ぎたときの振る舞い。
+/// What to do when a scheduled tick is missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MissedTickBehavior {
-    /// 遅れを取り戻すまで続けて返す（既定）。
+    /// Keeps returning ticks until it catches up (the default).
     #[default]
     Burst,
-    /// 今から `period` ごとにする。
+    /// Restarts the schedule so ticks come every `period` from now.
     Delay,
-    /// 次の予定の時刻まで飛ばす。
+    /// Skips ahead to the next scheduled tick.
     Skip,
 }
 
@@ -597,14 +599,14 @@ pub struct Interval {
     missed_tick_behavior: MissedTickBehavior,
 }
 
-/// すぐに 1 回目、以後 `period` ごと。
+/// First tick immediately, then every `period`.
 #[track_caller]
 pub fn interval(period: Duration) -> Interval {
     assert!(period > Duration::ZERO, "`period` must be non-zero.");
     interval_at(Instant::now(), period)
 }
 
-/// `start` に 1 回目、以後 `period` ごと。
+/// First tick at `start`, then every `period`.
 #[track_caller]
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     assert!(period > Duration::ZERO, "`period` must be non-zero.");

@@ -157,7 +157,7 @@ class Request(metaclass=abc.ABCMeta):
 
 
 def _query_params(query):
-    """クエリの辞書（同名キーは最初の値）。``Request.query_params`` と ``NativeRequest`` が共有する。"""
+    """Return the query string as a dict (the first value wins for repeated keys); shared by ``Request.query_params`` and ``NativeRequest``."""
     parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
     return {k: v[0] for k, v in parsed.items()}
 
@@ -166,7 +166,7 @@ _LOOPS = threading.local()
 
 
 def _run_coro(coro):
-    """``async def`` のハンドラをスレッドごとに 1 つのイベントループで動かす（要求ごとに作らない。F-212）。"""
+    """Run an ``async def`` handler on a per-thread event loop (created once per thread, not per request)."""
     loop = getattr(_LOOPS, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
@@ -209,7 +209,7 @@ class Response:
 
 
 def _aiter_sync(agen):
-    """非同期反復子を、スレッドのイベントループで回す同期の反復子にする（F-210）。"""
+    """Wrap an async iterator as a synchronous iterator driven by the thread's event loop."""
     it = agen.__aiter__()
     while True:
         try:
@@ -240,7 +240,7 @@ class StreamingResponse(Response):
 
     @property
     def body(self):
-        """本文全体（単体テスト・``offload=False`` 用。サーバの中のストリーミングでは使わない）。"""
+        """The whole body joined into ``bytes`` (for unit tests and ``offload=False`` routes; the server streams instead)."""
         if self._body is None:
             self._body = b"".join(x.encode("utf-8") if isinstance(x, str) else bytes(x) for x in self._iter())
         return self._body
@@ -285,7 +285,7 @@ class EventSourceResponse(StreamingResponse):
 
 
 def _stream_of(result, status):
-    """ジェネレータ・非同期ジェネレータを返したハンドラをストリーミングの応答にする（Rust から呼ぶ）。"""
+    """Turn a generator or async generator returned by a handler into a streaming response (called from Rust); otherwise return ``None``."""
     if inspect.isgenerator(result) or inspect.isasyncgen(result):
         return StreamingResponse(result, status, media_type="text/plain; charset=utf-8")
     return None
@@ -358,7 +358,7 @@ def _is_model(ann):
 
 
 def _unwrap_optional(ann):
-    """``Optional[X]`` → (X, True)。それ以外は (ann, False)。"""
+    """Return ``(X, True)`` for ``Optional[X]`` and ``(ann, False)`` otherwise."""
     if typing.get_origin(ann) is typing.Union:
         args = [a for a in typing.get_args(ann) if a is not type(None)]
         if len(args) == 1 and len(typing.get_args(ann)) == 2:
@@ -385,7 +385,7 @@ _BOOL_FALSE = ("false", "0", "no", "off", "f", "n")
 
 
 def _convert_scalar(value, ann):
-    """文字列を注釈（int/float/bool/str）で変換する。失敗は ValueError(msg, type)。"""
+    """Convert a string according to the annotation (int/float/bool/str); raises ``ValueError(msg, type)`` on failure."""
     if ann is int:
         try:
             return int(value)
@@ -471,7 +471,7 @@ def _is_num(v):
 
 
 def _field_rules(rules):
-    """OpenAPI に出す規則（フィールド単位の ``required`` は除く）。"""
+    """Rules to publish in OpenAPI (without the field-level ``required``)."""
     return {k: v for k, v in rules.items() if k != "required"}
 
 
@@ -706,9 +706,11 @@ class Route:
     # ---- サーバからの呼び出し（F-212） ----
 
     def _make_call(self):
-        """サーバ（Rust）が要求ごとに呼ぶ関数を、引数の種類から前もって選ぶ。戻り値は変換前の値
-        （``str``・``dict``・``Response`` 等。Rust が応答にし、扱えないものは ``to_response`` に回す）。
-        検証エラー・``HTTPException`` は ``handle`` と同じ応答にする。"""
+        """Pick, ahead of time and from the kinds of parameters, the function the server (Rust) calls per request.
+
+        It returns the raw handler result (``str``, ``dict``, ``Response`` and so on); Rust turns it into a response and
+        passes unsupported types to ``to_response``. Validation errors and ``HTTPException`` give the same response as ``handle``.
+        """
         func = self.func
         is_async = self.is_async
         positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
@@ -845,7 +847,7 @@ _HANDLERS = []  # handler_id → Route（プロセス全体）
 
 
 def _dispatch(handler_id, method, path, query, headers, body, params, client_ip):
-    """Rust から GIL 下で呼ばれる。``(status, headers, body)`` を返す。"""
+    """Called from Rust with the GIL held; returns ``(status, headers, body)``."""
     route = _HANDLERS[handler_id]
     req = Request(method, path, query, headers, body, params, client_ip)
     return route.handle(req)._triple()

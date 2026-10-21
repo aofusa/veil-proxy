@@ -1,8 +1,9 @@
-//! veil API サーバライブラリの Python バインディング（F-194）。
+// F-194: Python バインディング本体。F-212: 要求ごとの呼び出しは NativeRequest 1 つだけを渡す。
+//! Python bindings for the veil API server library.
 //!
-//! Python 側（`python/veil/__init__.py`）がデコレータでルートを集め、`register_route` で
-//! ここへ登録し、`run` で起動する。リクエストごとにルートの呼び出し口（`Route._call`）を GIL 下で
-//! [`native::NativeRequest`] 1 つを渡して呼び、戻り値を Rust で応答にする（F-212）。
+//! The Python side (`python/veil/__init__.py`) collects routes with decorators, registers them here with
+//! `register_route` and starts the server with `run`. For every request the route entry point (`Route._call`) is
+//! called with the GIL held and a single [`native::NativeRequest`]; Rust turns the return value into the response.
 
 mod ext;
 mod native;
@@ -14,22 +15,23 @@ use std::sync::{Arc, Mutex};
 use veil::api::bridge::HandlerContext;
 use veil::api::{App, Config as VeilConfig, HandlerFn, OperationMeta, Request, Response};
 
-/// `register_route` で登録された、起動前のルート。
+/// A route registered with `register_route`, kept until the server starts.
 struct PendingRoute {
     path: String,
     methods: Vec<String>,
     handler_id: u64,
     offload: bool,
     openapi: Option<serde_json::Value>,
-    /// 既定のステータス（デコレータの `status_code`）
+    // 既定のステータス（デコレータの `status_code`）
     status_code: u16,
-    /// 要求本文をストリーミングで受ける（`stream_body=True`、F-210）
+    // F-210: 要求本文をストリーミングで受ける（`stream_body=True`）
     stream_body: bool,
 }
 
 static PENDING: Mutex<Vec<PendingRoute>> = Mutex::new(Vec::new());
 
-/// gRPC・L4 の登録（`run` までの間に溜める。F-210）。
+// F-210: gRPC・L4 の登録（`run` までの間に溜める）。
+/// gRPC and L4 registrations, kept until `run`.
 enum PendingExtra {
     Grpc {
         path: String,
@@ -50,7 +52,7 @@ enum PendingExtra {
 
 static PENDING_EXTRA: Mutex<Vec<PendingExtra>> = Mutex::new(Vec::new());
 
-/// gRPC のメソッドを登録する（`handlers[handler_id]` は `handle(call) -> (code, message)` を持つ）。
+/// Register a gRPC method; `handlers[handler_id].handle(call)` returns `(code, message)`.
 #[pyfunction]
 fn register_grpc(path: String, handler_id: u64) {
     PENDING_EXTRA
@@ -59,13 +61,13 @@ fn register_grpc(path: String, handler_id: u64) {
         .push(PendingExtra::Grpc { path, handler_id });
 }
 
-/// `grpc.health.v1.Health`（Check・Watch）を登録する。
+/// Register `grpc.health.v1.Health` (Check and Watch).
 #[pyfunction]
 fn register_grpc_health() {
     PENDING_EXTRA.lock().unwrap().push(PendingExtra::GrpcHealth);
 }
 
-/// L4 の TCP リスナー（`handlers[handler_id]` はプロトコルを作る呼び出し可能オブジェクト）。
+/// Register an L4 TCP listener; `handlers[handler_id]` creates the protocol.
 #[pyfunction]
 fn register_l4_tcp(name: String, listen: String, handler_id: u64) {
     PENDING_EXTRA.lock().unwrap().push(PendingExtra::L4Tcp {
@@ -75,7 +77,7 @@ fn register_l4_tcp(name: String, listen: String, handler_id: u64) {
     });
 }
 
-/// L4 の UDP リスナー（`handlers[handler_id]` は `f(data, peer) -> bytes | None`）。
+/// Register an L4 UDP listener; `handlers[handler_id](data, peer)` returns `bytes | None`.
 #[pyfunction]
 fn register_l4_udp(name: String, listen: String, handler_id: u64) {
     PENDING_EXTRA.lock().unwrap().push(PendingExtra::L4Udp {
@@ -85,7 +87,7 @@ fn register_l4_udp(name: String, listen: String, handler_id: u64) {
     });
 }
 
-/// 設定（`veil::api::Config` のラッパ）。
+/// Server configuration (a wrapper of `veil::api::Config`).
 #[pyclass(name = "Config", module = "veil._veil", from_py_object)]
 #[derive(Clone)]
 struct PyConfig {
@@ -98,7 +100,7 @@ fn cfg_err(e: impl std::fmt::Display) -> PyErr {
 
 #[pymethods]
 impl PyConfig {
-    /// ライブラリ既定設定。
+    /// Create the library default configuration.
     #[new]
     fn new() -> Self {
         PyConfig {
@@ -106,7 +108,7 @@ impl PyConfig {
         }
     }
 
-    /// config.toml を取り込む。
+    /// Load a `config.toml`.
     #[staticmethod]
     fn from_file(path: &str) -> PyResult<Self> {
         Ok(PyConfig {
@@ -114,26 +116,26 @@ impl PyConfig {
         })
     }
 
-    /// 任意のキーを TOML リテラルで上書きする（例: `set("server.threads", "4")`）。
+    /// Override any key with a TOML literal, e.g. `set("server.threads", "4")`.
     fn set(&mut self, path: &str, toml_value: &str) -> PyResult<()> {
         self.inner
             .set_override(&format!("{} = {}", path, toml_value))
             .map_err(cfg_err)
     }
 
-    /// `[server].listen`（TLS のリスナー。`tls(cert, key)` と併用する）。
+    /// Set `[server].listen` (TLS listener; use together with `tls`).
     fn listen(&mut self, addr: &str) -> PyResult<()> {
         let lit = serde_json::to_string(addr).map_err(cfg_err)?;
         self.set("server.listen", &lit)
     }
 
-    /// `[server].listen_cleartext`（平文 HTTP/1.1 + h2c のリスナー。ライブラリ既定は `127.0.0.1:8080`）。
+    /// Set `[server].listen_cleartext` (HTTP/1.1 + h2c; default `127.0.0.1:8080`).
     fn listen_cleartext(&mut self, addr: &str) -> PyResult<()> {
         let lit = serde_json::to_string(addr).map_err(cfg_err)?;
         self.set("server.listen_cleartext", &lit)
     }
 
-    /// `[tls].cert_path` / `key_path`。
+    /// Set `[tls].cert_path` and `key_path`.
     fn tls(&mut self, cert_path: &str, key_path: &str) -> PyResult<()> {
         let cert = serde_json::to_string(cert_path).map_err(cfg_err)?;
         let key = serde_json::to_string(key_path).map_err(cfg_err)?;
@@ -141,18 +143,18 @@ impl PyConfig {
         self.set("tls.key_path", &key)
     }
 
-    /// `[server].threads`。
+    /// Set `[server].threads`.
     fn threads(&mut self, n: usize) -> PyResult<()> {
         self.set("server.threads", &n.to_string())
     }
 
-    /// 合成後の設定を TOML 文字列で返す（デバッグ用）。
+    /// Return the merged configuration as a TOML string (for debugging).
     fn to_toml(&self) -> PyResult<String> {
         self.inner.to_toml_string().map_err(cfg_err)
     }
 }
 
-/// ルートを登録する（`run` までの間に溜める）。
+/// Register an HTTP route (collected until `run`).
 #[pyfunction]
 #[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false))]
 #[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
@@ -184,15 +186,16 @@ fn register_route(
     Ok(())
 }
 
-/// 1 ルートの Python 側の呼び出し口（`Route._call` と、扱わない戻り値の変換 `Route.to_response`）。
+/// The Python entry points of one route: `Route._call`, and `Route.to_response` for return values Rust does not convert.
 struct PyRoute {
     call: Py<PyAny>,
     fallback: Py<PyAny>,
     status: u16,
 }
 
-/// ルートの呼び出し口を GIL 下で呼び、応答を組み立てる。`ctx` はハンドラ用プールで動くとき（ストリーミングの
-/// 応答・要求本文の順次受信ができる。F-210）。
+// F-210: `ctx` があればストリーミングの応答・要求本文の順次受信ができる。
+/// Call the route entry point with the GIL held and build the response. `ctx` is present when running on the
+/// handler pool (streaming responses and incremental request bodies are possible).
 fn call_python(route: &PyRoute, req: Request, ctx: Option<&mut HandlerContext>) -> Response {
     Python::attach(|py| {
         let r = (|| -> PyResult<Response> {
@@ -252,8 +255,9 @@ fn make_handler(route: PyRoute, offload: bool) -> HandlerFn {
     })
 }
 
-/// サーバを起動し、停止（SIGINT/SIGTERM・`shutdown()`）までブロックする。GIL は解放する。
-/// `handlers` は handler_id → Python の `Route`（`_call` と `to_response` を持つ）。
+/// Start the server and block until it stops (SIGINT, SIGTERM or `shutdown()`); the GIL is released.
+///
+/// `handlers` maps `handler_id` to the Python `Route` registered for it (with `_call` and `to_response`).
 #[pyfunction]
 fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<()> {
     let routes = std::mem::take(&mut *PENDING.lock().unwrap());
@@ -325,7 +329,7 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-/// 実行中のサーバを graceful に停止する。
+/// Stop the running server gracefully.
 #[pyfunction]
 fn shutdown() {
     veil::api::app::shutdown();

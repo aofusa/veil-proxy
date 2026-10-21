@@ -1,4 +1,4 @@
-//! `tokio::sync::Semaphore`（FIFO で公平。`Mutex`・`RwLock`・`mpsc` の土台）。
+//! Equivalent of `tokio::sync::Semaphore` (fair, FIFO). It is the foundation of `Mutex`, `RwLock` and `mpsc`.
 
 use crate::tokio::waker::WakerSlot;
 use std::collections::VecDeque;
@@ -33,7 +33,7 @@ impl std::fmt::Debug for Semaphore {
     }
 }
 
-/// 閉じたセマフォを待った。
+/// Waited on a closed semaphore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquireError(());
 
@@ -45,7 +45,7 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// `try_acquire` の失敗。
+/// The error of `try_acquire`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TryAcquireError {
     Closed,
@@ -64,7 +64,7 @@ impl std::fmt::Display for TryAcquireError {
 impl std::error::Error for TryAcquireError {}
 
 impl Semaphore {
-    /// 許可数の上限。
+    /// The maximum number of permits.
     pub const MAX_PERMITS: usize = usize::MAX >> 3;
 
     #[track_caller]
@@ -97,12 +97,12 @@ impl Semaphore {
         self.state.lock().unwrap().permits
     }
 
-    /// 許可を足す（待っている先頭から順に渡す）。
+    /// Adds permits (handing them to the waiters from the front).
     pub fn add_permits(&self, n: usize) {
         self.release(n);
     }
 
-    /// 許可を `n` 個まで減らす（減らせた数）。
+    /// Removes up to `n` permits and returns how many were removed.
     pub fn forget_permits(&self, n: usize) -> usize {
         let mut st = self.state.lock().unwrap();
         let m = st.permits.min(n);
@@ -247,7 +247,7 @@ impl Semaphore {
     }
 }
 
-/// 許可を待つ Future（drop で列から抜ける。渡された後なら返す）。
+/// A future that waits for permits (dropping it leaves the queue; permits already handed over are returned).
 pub(crate) struct Acquire<'a> {
     sem: &'a Semaphore,
     n: usize,
@@ -353,7 +353,7 @@ impl Drop for Acquire<'_> {
     }
 }
 
-/// 借用の許可（drop で返す）。
+/// A borrowed permit (returned when dropped).
 #[must_use]
 pub struct SemaphorePermit<'a> {
     sem: &'a Semaphore,
@@ -369,7 +369,7 @@ impl std::fmt::Debug for SemaphorePermit<'_> {
 }
 
 impl SemaphorePermit<'_> {
-    /// 返さずに捨てる。
+    /// Discards the permit without returning it.
     pub fn forget(mut self) {
         self.permits = 0;
     }
@@ -406,7 +406,7 @@ impl Drop for SemaphorePermit<'_> {
     }
 }
 
-/// 所有の許可（drop で返す）。
+/// An owned permit (returned when dropped).
 #[must_use]
 pub struct OwnedSemaphorePermit {
     sem: Arc<Semaphore>,

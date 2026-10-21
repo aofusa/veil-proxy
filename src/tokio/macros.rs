@@ -1,12 +1,13 @@
-//! `select!`・`join!`・`try_join!`（F-198）。
+// F-198: 生成元は docs/backlog/features/F-198-tokio-free-compat-layer.md の「結果」。
+//! `select!`, `join!` and `try_join!`.
 //!
-//! tokio 1.53.2 の `src/macros/{select,join,try_join}.rs` の macro_rules をそのまま取り込み、内部の
-//! パスだけを `$crate::tokio::macros::support` と `__veil_tokio_*` に置き換えたもの（MIT License,
-//! Copyright (c) Tokio Contributors）。select の分岐の解析はランタイムに依存しない手続きマクロ
-//! `tokio-macros` を使う。生成元: docs/backlog/features/F-198-tokio-free-compat-layer.md の「結果」。
+//! The `macro_rules` of tokio 1.53.2 (`src/macros/{select,join,try_join}.rs`) are taken over as they are,
+//! with only the internal paths replaced by `$crate::tokio::macros::support` and `__veil_tokio_*`
+//! (MIT License, Copyright (c) Tokio Contributors). The parsing of `select!` branches uses the
+//! runtime-independent procedural macro crate `tokio-macros`.
 #![allow(clippy::all)]
 
-/// マクロが使う補助（tokio の `macros::support` と同じ名前）。
+/// Helpers used by the macros (same names as tokio's `macros::support`).
 #[doc(hidden)]
 pub mod support {
     pub use super::{BiasedRotator, Rotator, RotatorSelect, SelectBiased, SelectNormal};
@@ -18,7 +19,7 @@ pub mod support {
     pub use std::task::{ready, Context, Poll};
     pub use tokio_macros::{select_priv_clean_pattern, select_priv_declare_output_enum};
 
-    /// 0..n の乱数（select! の公平性）。
+    /// A random number in `0..n` (for the fairness of `select!`).
     #[doc(hidden)]
     pub fn thread_rng_n(n: u32) -> u32 {
         use std::cell::Cell;

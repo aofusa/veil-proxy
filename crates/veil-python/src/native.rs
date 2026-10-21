@@ -1,14 +1,16 @@
-//! 要求ごとの Python オブジェクトを減らす経路（F-212）。
+// F-212: 要求ごとの Python オブジェクトを減らす経路。
+//! Native request, headers and response conversion objects handed to Python handlers.
 //!
-//! - [`NativeRequest`]: Rust の `veil::api::Request` を包み、ハンドラが触った属性だけを Python のオブジェクトにする
-//!   （`method` はよく使うものを intern した文字列、`path`・`body` 等は初回アクセスで作ってキャッシュ）。
-//!   Python の `veil.Request` と同じ属性・メソッドを持ち、`isinstance(req, veil.Request)` も真（`veil.Request` に
-//!   仮想サブクラスとして登録する）。任意の属性も足せる（`__dict__`、abi3-py39 が必要）。
-//! - [`NativeHeaders`]: 大文字小文字を区別しない読み取り専用のヘッダ。`get`・`[]`・`in` は Rust のヘッダ配列を
-//!   直接照合して、返す値の `str` だけを作る。
-//! - [`to_response`]: ハンドラの戻り値を Rust で直接 `Response` にする（`str`・`bytes`・`dict`・`list`・`None`・
-//!   `veil.Response`）。`bytes` と JSON の本文は Python のバイト列を複製せずに持つ（`PyBackedBytes`）。
-//!   それ以外（タプル・pydantic のモデル等）は Python の `Route.to_response` に回す。
+//! - [`NativeRequest`]: wraps the Rust `veil::api::Request` and creates Python objects only for the attributes a
+//!   handler touches (`method` is an interned string; `path`, `body` and the like are built on first access and
+//!   cached). It has the same attributes and methods as the Python `veil.Request`, and `isinstance(req, veil.Request)`
+//!   is true because it is registered as a virtual subclass. Arbitrary attributes can be added (`__dict__`; needs
+//!   abi3-py39).
+//! - [`NativeHeaders`]: read-only, case-insensitive headers. `get`, `[]` and `in` match directly against the Rust
+//!   header array and only create the `str` that is returned.
+//! - [`to_response`]: turns a handler return value into a `Response` directly in Rust (`str`, `bytes`, `dict`, `list`,
+//!   `None`, `veil.Response`). `bytes` and JSON bodies borrow the Python bytes without copying (`PyBackedBytes`).
+//!   Anything else (tuples, pydantic models, ...) is passed to the Python `Route.to_response`.
 
 use bytes::Bytes;
 use pyo3::exceptions::PyKeyError;
@@ -24,7 +26,7 @@ fn lossy(b: &[u8]) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(b)
 }
 
-/// ハンドラへ渡す要求（Python の `veil.Request` と同じ形）。
+/// The request object passed to handlers (same shape as `veil.Request`).
 #[pyclass(name = "NativeRequest", module = "veil._veil", dict)]
 pub struct NativeRequest {
     pub(crate) req: Request,
@@ -34,7 +36,7 @@ pub struct NativeRequest {
     params: PyOnceLock<Py<PyDict>>,
     client_ip: PyOnceLock<Py<PyString>>,
     query_params: PyOnceLock<Py<PyAny>>,
-    /// ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0。F-210）
+    // F-210: ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0）
     pub(crate) ctx: AtomicUsize,
 }
 
@@ -52,7 +54,7 @@ impl NativeRequest {
         }
     }
 
-    /// 要求本文の次の断片（ストリーミング受信のルートで、ハンドラの呼び出しの間だけ。GIL を外して待つ）。
+    /// Next chunk of the request body (only on streaming-body routes, during the handler call; waits with the GIL released).
     fn read_chunk(&self, py: Python<'_>) -> Option<Bytes> {
         let p = self.ctx.load(Ordering::Acquire);
         if p == 0 {
@@ -68,13 +70,13 @@ impl NativeRequest {
     }
 }
 
-/// Python 側の補助（`veil` モジュールの `_query_params`・`_dumps`、`json.loads`）。
+/// Python-side helpers (`_query_params` and `_dumps` of the `veil` module, and `json.loads`).
 struct Helpers {
     query_params: Py<PyAny>,
     dumps: Py<PyAny>,
     loads: Py<PyAny>,
     response_type: Py<PyAny>,
-    /// `veil.StreamingResponse`・`veil._stream_of`（ジェネレータ等をストリーミングの応答にする。F-210）
+    // F-210: `veil.StreamingResponse`・`veil._stream_of`（ジェネレータ等をストリーミングの応答にする）
     streaming_type: Py<PyAny>,
     stream_of: Py<PyAny>,
 }
@@ -97,7 +99,7 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
 
 #[pymethods]
 impl NativeRequest {
-    /// 試験・直接呼び出し用（Python の `veil.Request` と同じ引数）。
+    /// Build a request directly (tests); takes the same arguments as `veil.Request`.
     #[new]
     #[pyo3(signature = (method="GET", path="/", query="", headers=None, body=None, params=None, client_ip=""))]
     fn py_new(
@@ -206,7 +208,7 @@ impl NativeRequest {
         NativeHeaders { req: slf.unbind() }
     }
 
-    /// クエリの辞書（同名キーは最初の値。Python の `veil.Request.query_params` と同じ解釈）。
+    /// Query parameters (the first value of a repeated key), interpreted like `veil.Request.query_params`.
     #[getter]
     fn query_params(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if let Some(q) = self.query_params.get(py) {
@@ -217,7 +219,7 @@ impl NativeRequest {
         Ok(q)
     }
 
-    /// 要求本文を届いた順に返す反復子（`stream_body=True` のルート。それ以外は全量の本文を 1 回）。
+    /// Iterate over the body chunks as they arrive (`stream_body=True` routes; other routes yield the whole body once).
     fn stream(slf: Bound<'_, Self>) -> NativeBodyIter {
         NativeBodyIter {
             req: slf.unbind(),
@@ -241,7 +243,7 @@ impl NativeRequest {
     }
 }
 
-/// `NativeRequest.stream()` の反復子。
+/// Iterator returned by `NativeRequest.stream()`.
 #[pyclass(name = "NativeBodyIter", module = "veil._veil")]
 pub struct NativeBodyIter {
     req: Py<NativeRequest>,
@@ -274,7 +276,7 @@ impl NativeBodyIter {
     }
 }
 
-/// 大文字小文字を区別しない読み取り専用のヘッダ（Python の `veil.Headers` と同じ形）。
+/// Case-insensitive read-only request headers (same shape as `veil.Headers`).
 #[pyclass(name = "NativeHeaders", module = "veil._veil")]
 pub struct NativeHeaders {
     req: Py<NativeRequest>,
@@ -333,7 +335,7 @@ impl NativeHeaders {
         self.with(py, |h| h.len())
     }
 
-    /// 名前の一覧（大文字小文字を区別せず重複を除き、最初に現れた綴り）。
+    /// Distinct header names (first spelling seen).
     fn keys(&self, py: Python<'_>) -> Vec<String> {
         self.with(py, |h| {
             let mut out: Vec<String> = Vec::new();
@@ -368,7 +370,7 @@ impl NativeHeaders {
     }
 }
 
-/// 既知の content-type（静的なバイト列。要求ごとに作らない）。
+/// Well-known content types as static byte strings (not allocated per request).
 const CT_TEXT: &[u8] = b"text/plain; charset=utf-8";
 const CT_JSON: &[u8] = b"application/json";
 const CT_OCTET: &[u8] = b"application/octet-stream";
@@ -377,7 +379,8 @@ fn backed(b: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     Ok(Bytes::from_owner(b.extract::<PyBackedBytes>()?))
 }
 
-/// ハンドラの戻り値を応答にする（F-212）。`fallback` は Python の `Route.to_response`（扱わない型用）。
+// F-212: `fallback` は Python の `Route.to_response`（扱わない型用）。
+/// Convert a handler return value into a response; `fallback` (Python `Route.to_response`) handles unsupported types.
 pub fn to_response(
     py: Python<'_>,
     result: Bound<'_, PyAny>,
@@ -429,9 +432,11 @@ pub fn to_response(
     response_object(&resp)
 }
 
-/// `json.dumps(obj, separators=(",", ":"), ensure_ascii=False)` と同じ出力を Rust で書く（F-212）。
-/// 扱わない型（float は Python の repr と表記が違い得るので Python に任せる）・str 以外のキー・深すぎる入れ子・
-/// 書けない文字列（孤立サロゲート）なら `false`（呼び出し側が Python の `_dumps` に戻す）。
+/// Write the same output as `json.dumps(obj, separators=(",", ":"), ensure_ascii=False)`.
+///
+/// Returns `false` for unsupported types (floats, whose spelling may differ from Python's repr), non-`str` keys,
+/// nesting that is too deep, or strings that cannot be written (lone surrogates); the caller then falls back to
+/// Python's `_dumps`.
 fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
     use pyo3::types::{PyBool, PyInt};
     if depth > 64 {
@@ -511,15 +516,15 @@ fn json_fast(v: &Bound<'_, PyAny>, out: &mut Vec<u8>, depth: usize) -> bool {
     false
 }
 
-/// 試験用: Rust の JSON 化（`json_fast`）の結果。扱わない値は `None`。
+/// Test helper: the Rust JSON encoding of `v`, or `None` if unsupported.
 #[pyfunction]
 pub fn _json_fast(v: Bound<'_, PyAny>) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     json_fast(&v, &mut out, 0).then_some(out)
 }
 
-/// `veil.StreamingResponse` を送る。ハンドラ用プールなら本文を断片ごとに送り（GIL を外して書く）、
-/// INLINE（`offload=False`）なら全部集めて 1 つの本文にする。
+/// Send a `veil.StreamingResponse`. On the handler pool the body is sent chunk by chunk (writing with the GIL
+/// released); for `offload=False` routes all chunks are collected into a single body.
 fn stream_response(
     py: Python<'_>,
     sr: &Bound<'_, PyAny>,
@@ -575,7 +580,7 @@ fn stream_response(
     Ok(Response::new(200))
 }
 
-/// 断片を `Bytes` にする（`bytes` は複製しない、`str` は UTF-8、`bytearray`・`memoryview` は複製）。
+/// Turn a chunk into `Bytes` (`bytes` is not copied, `str` is UTF-8, `bytearray` and `memoryview` are copied).
 fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
     if let Ok(s) = item.cast::<PyString>() {
         let s: PyBackedStr = s.extract()?;
@@ -588,7 +593,7 @@ fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
     Ok(Bytes::from(v))
 }
 
-/// `status`・`headers` だけを読む（ストリーミングの head）。
+/// Read only `status` and `headers` (the head of a streaming response).
 fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let status: u16 = resp
         .getattr(pyo3::intern!(resp.py(), "status"))?
@@ -605,7 +610,7 @@ fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     Ok(r)
 }
 
-/// Python の `veil.Response`（`status`・`headers`・`body`）を応答にする。
+/// Turn a Python `veil.Response` (`status`, `headers`, `body`) into a response.
 fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let status: u16 = resp
         .getattr(pyo3::intern!(resp.py(), "status"))?
@@ -623,7 +628,7 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     Ok(r)
 }
 
-/// よく使うヘッダ名は静的なバイト列に寄せる（名前の複製を省く）。
+/// Map common header names to static byte strings (avoids copying the name).
 fn known_header(n: &str) -> Bytes {
     match n {
         "content-type" => Bytes::from_static(b"content-type"),
@@ -634,7 +639,7 @@ fn known_header(n: &str) -> Bytes {
     }
 }
 
-/// `PyBackedStr` を `Bytes` の持ち主にする（UTF-8 のバイト列として）。
+/// Lets `Bytes` own a `PyBackedStr` (as UTF-8 bytes).
 struct PyStrOwner(PyBackedStr);
 
 impl AsRef<[u8]> for PyStrOwner {

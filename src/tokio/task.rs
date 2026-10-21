@@ -1,10 +1,11 @@
-//! `tokio::task` 互換（F-198）。
+// F-198
+//! Compatible with `tokio::task`.
 //!
-//! タスクは veil のランタイムのタスクとして、`spawn` したスレッドのエグゼキュータで動く（tokio の
-//! work stealing のようなスレッド間の移動はしない）。ランタイムの外のスレッドから呼ばれたら、
-//! 文脈の `Handle`（`Runtime::enter`・`block_on` の中）のスレッドへ受け口経由で送る。
-//! タスクの中の Future にはスレッドセーフな Waker（`waker::safe_waker`）を渡すので、別スレッドから
-//! 起こされても所有スレッドで再開する。
+//! A task runs as a veil runtime task on the executor of the thread that called `spawn`; unlike tokio's
+//! work stealing, tasks do not move between threads. When `spawn` is called from a thread outside the
+//! runtime, the task is sent through the entry point to the thread of the `Handle` in context (inside
+//! `Runtime::enter` or `block_on`). The future inside a task gets a thread-safe waker
+//! (`waker::safe_waker`), so a wake-up from another thread resumes it on the owning thread.
 
 use super::waker::{safe_waker, WakerSlot};
 use std::any::Any;
@@ -18,7 +19,7 @@ use std::task::{Context, Poll, Waker};
 
 // ===================== Id =====================
 
-/// タスクの ID。
+/// The ID of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id(u64);
 
@@ -34,12 +35,12 @@ thread_local! {
     static CURRENT_ID: std::cell::Cell<Option<Id>> = const { std::cell::Cell::new(None) };
 }
 
-/// 実行中のタスクの ID（タスクの外では panic）。
+/// Returns the ID of the running task. Panics when called outside a task.
 pub fn id() -> Id {
     try_id().expect("can't get a task id when not inside a task")
 }
 
-/// 実行中のタスクの ID。
+/// Returns the ID of the running task, or `None` outside a task.
 pub fn try_id() -> Option<Id> {
     CURRENT_ID.with(|c| c.get())
 }
@@ -51,7 +52,7 @@ enum Repr {
     Panic(Mutex<Box<dyn Any + Send + 'static>>),
 }
 
-/// タスクが完了しなかった理由。
+/// The reason a task did not complete.
 pub struct JoinError {
     repr: Repr,
     id: Id,
@@ -137,7 +138,7 @@ impl From<JoinError> for std::io::Error {
 
 // ===================== 共有状態 =====================
 
-/// 中止・完了の状態（出力の型に依存しない。`AbortHandle` はこれだけを持つので `Send + Sync`）。
+/// Abort and completion state. It does not depend on the output type; `AbortHandle` holds only this, so it is `Send + Sync`.
 struct Core {
     id: Id,
     inner: Mutex<CoreInner>,
@@ -151,7 +152,7 @@ struct CoreInner {
 }
 
 impl Core {
-    /// 中止を要求してタスクを起こす（タスクは次の poll で Future を捨てる）。
+    /// Requests an abort and wakes the task (the task drops its future on its next poll).
     fn abort(&self) {
         let w = {
             let mut g = self.inner.lock().unwrap();
@@ -219,7 +220,7 @@ fn abort_state<T>(s: &State<T>) {
 
 // ===================== タスク本体 =====================
 
-/// spawn したタスクの本体（veil のタスクとして動く）。
+/// The body of a spawned task (it runs as a veil task).
 pub(crate) struct TaskCell<F: Future> {
     future: Option<Pin<Box<F>>>,
     state: Arc<State<F::Output>>,
@@ -306,7 +307,7 @@ impl<F: Future> Drop for TaskCell<F> {
     }
 }
 
-/// タスクと JoinHandle を作る。
+/// Creates a task and its `JoinHandle`.
 pub(crate) fn task<F: Future>(future: F) -> (TaskCell<F>, JoinHandle<F::Output>) {
     let state = State::new();
     (TaskCell::new(future, state.clone()), JoinHandle { state })
@@ -314,7 +315,7 @@ pub(crate) fn task<F: Future>(future: F) -> (TaskCell<F>, JoinHandle<F::Output>)
 
 // ===================== JoinHandle =====================
 
-/// `tokio::task::JoinHandle`。drop してもタスクは止まらない（`abort` で止める）。
+/// Equivalent of `tokio::task::JoinHandle`. Dropping it does not stop the task; use `abort` for that.
 pub struct JoinHandle<T> {
     state: Arc<State<T>>,
 }
@@ -397,7 +398,7 @@ impl AbortHandle {
 
 // ===================== spawn =====================
 
-/// 現在のスレッドのエグゼキュータで動かす。
+/// Runs the future on the current thread's executor.
 pub(crate) fn spawn_here<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -422,7 +423,7 @@ where
     }
 }
 
-/// `tokio::task::spawn_local`（現在のスレッドで動かす。`Send` を要求しない）。
+/// Equivalent of `tokio::task::spawn_local`: runs the future on the current thread and does not require `Send`.
 #[track_caller]
 pub fn spawn_local<F>(future: F) -> JoinHandle<F::Output>
 where
@@ -446,7 +447,7 @@ where
     })
 }
 
-/// `tokio::task::spawn_blocking`（ハンドラ用のブロッキングプールで動かす）。
+/// Equivalent of `tokio::task::spawn_blocking`: runs the closure on the handler blocking pool.
 #[track_caller]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
@@ -487,7 +488,7 @@ where
     handle
 }
 
-/// `tokio::task::block_in_place`（そのまま呼ぶ。veil のワーカーでは他のタスクを止める点に注意）。
+/// Equivalent of `tokio::task::block_in_place`: calls the closure directly. On a veil worker this blocks the other tasks of that worker.
 #[track_caller]
 pub fn block_in_place<F, R>(f: F) -> R
 where
@@ -499,7 +500,7 @@ where
     coop::with_unconstrained(f)
 }
 
-/// 1 回だけ他のタスクに譲る。
+/// Yields to other tasks once.
 pub async fn yield_now() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
@@ -515,15 +516,16 @@ pub async fn yield_now() {
     .await
 }
 
-/// 協調的スケジューリングの予算を 1 つ使う（使い切っていれば 1 回譲る）。
+/// Consumes one unit of the cooperative scheduling budget (yields once if the budget is exhausted).
 pub async fn consume_budget() {
     coop::consume_budget().await
 }
 
 pub use coop::{unconstrained, Unconstrained};
 
-/// `tokio::task::coop`（協調的スケジューリングの予算）。tokio と同じく、タスクの 1 回の poll に 128 の予算を与え、
-/// 葉のリソース（チャネル・タイマー・I/O 等）が 1 つずつ使う。使い切ると `Pending` を返して他のタスクに譲る。
+/// Equivalent of `tokio::task::coop` (the cooperative scheduling budget). As in tokio, each poll of a task
+/// gets a budget of 128, and each leaf resource (channels, timers, I/O and so on) consumes one unit. When the
+/// budget is exhausted it returns `Pending` and yields to other tasks.
 pub mod coop {
     use std::cell::Cell;
     use std::future::Future;
@@ -533,16 +535,16 @@ pub mod coop {
     const INITIAL: u8 = 128;
 
     thread_local! {
-        /// `None` は制限なし（タスクの外・`unconstrained` の中）
+        /// `None` means no limit (outside a task, or inside `unconstrained`).
         static BUDGET: Cell<Option<u8>> = const { Cell::new(None) };
     }
 
-    /// `f` をタスクの 1 回の poll として、新しい予算で動かす。
+    /// Runs `f` as one poll of a task with a fresh budget.
     pub(crate) fn with_budget<R>(f: impl FnOnce() -> R) -> R {
         with_value(Some(INITIAL), f)
     }
 
-    /// `f` を予算なしで動かす。
+    /// Runs `f` without a budget.
     pub(crate) fn with_unconstrained<R>(f: impl FnOnce() -> R) -> R {
         with_value(None, f)
     }
@@ -559,7 +561,7 @@ pub mod coop {
         f()
     }
 
-    /// `poll_proceed` が返す印。進めなかったら（`made_progress` を呼ばずに drop したら）予算を返す。
+    /// Marker returned by `poll_proceed`. If it is dropped without calling `made_progress`, the budget unit is returned.
     #[derive(Debug)]
     pub struct RestoreOnPending(Cell<Option<u8>>);
 
@@ -577,7 +579,7 @@ pub mod coop {
         }
     }
 
-    /// 予算を 1 つ使う。使い切っていれば Waker を起こして `Pending`。
+    /// Consumes one unit of the budget. If the budget is exhausted, it wakes the waker and returns `Pending`.
     pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<RestoreOnPending> {
         BUDGET.with(|b| match b.get() {
             None => Poll::Ready(RestoreOnPending(Cell::new(None))),
@@ -592,7 +594,7 @@ pub mod coop {
         })
     }
 
-    /// 予算を使って進めたことにする（葉のリソース用）。
+    /// Consumes budget and records progress (for leaf resources).
     pub(crate) fn poll_proceed_and_make_progress(cx: &mut Context<'_>) -> Poll<()> {
         match poll_proceed(cx) {
             Poll::Ready(r) => {
@@ -611,7 +613,7 @@ pub mod coop {
         std::future::poll_fn(poll_proceed_and_make_progress).await
     }
 
-    /// 予算の制限を外した Future。
+    /// A future with the budget limit removed.
     #[derive(Debug)]
     #[must_use = "Unconstrained does nothing unless polled"]
     pub struct Unconstrained<F> {
@@ -631,12 +633,12 @@ pub mod coop {
         Unconstrained { inner }
     }
 
-    /// 予算に従う Future（poll ごとに予算を 1 つ使う）。
+    /// Makes a future obey the budget (each poll consumes one unit).
     pub fn cooperative<F: Future>(fut: F) -> Cooperative<F> {
         Cooperative { fut }
     }
 
-    /// `cooperative` の Future。
+    /// The future returned by `cooperative`.
     #[derive(Debug)]
     pub struct Cooperative<F> {
         fut: F,
@@ -658,7 +660,7 @@ pub mod coop {
 
 // ===================== JoinSet =====================
 
-/// `tokio::task::JoinSet`（drop で残りを abort する）。
+/// Equivalent of `tokio::task::JoinSet`. Dropping it aborts the remaining tasks.
 pub struct JoinSet<T> {
     handles: Vec<JoinHandle<T>>,
 }
@@ -741,12 +743,12 @@ impl<T: 'static> JoinSet<T> {
         a
     }
 
-    /// どれか 1 つの完了を待つ（空なら `None`）。
+    /// Waits for any one task to complete. Returns `None` when the set is empty.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         std::future::poll_fn(|cx| self.poll_join_next(cx)).await
     }
 
-    /// `join_next` と同じで、タスク ID も返す。
+    /// Same as `join_next`, but also returns the task ID.
     pub async fn join_next_with_id(&mut self) -> Option<Result<(Id, T), JoinError>> {
         std::future::poll_fn(|cx| self.poll_join_next_with_id(cx)).await
     }
@@ -773,7 +775,7 @@ impl<T: 'static> JoinSet<T> {
         Poll::Pending
     }
 
-    /// 完了しているものを 1 つ取る（待たない）。
+    /// Takes one completed task without waiting.
     pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
         let i = self.handles.iter().position(|h| h.is_finished())?;
         let mut h = self.handles.swap_remove(i);
@@ -797,7 +799,7 @@ impl<T: 'static> JoinSet<T> {
         self.handles.clear();
     }
 
-    /// すべて abort して終わるのを待つ。
+    /// Aborts all tasks and waits for them to finish.
     pub async fn shutdown(&mut self)
     where
         T: Send,
@@ -806,7 +808,7 @@ impl<T: 'static> JoinSet<T> {
         while self.join_next().await.is_some() {}
     }
 
-    /// すべての完了を待って結果を返す（panic したタスクがあれば再 panic）。
+    /// Waits for all tasks and returns their results. Panics again if any task panicked.
     pub async fn join_all(mut self) -> Vec<T> {
         let mut out = Vec::with_capacity(self.len());
         while let Some(r) = self.join_next().await {
@@ -862,7 +864,7 @@ thread_local! {
     static LOCAL_SET: RefCell<Option<LocalQueue>> = const { RefCell::new(None) };
 }
 
-/// `tokio::task::LocalSet`（`Send` でないタスクを現在のスレッドで動かす）。
+/// Equivalent of `tokio::task::LocalSet`: runs tasks that are not `Send` on the current thread.
 pub struct LocalSet {
     queue: LocalQueue,
 }
@@ -886,7 +888,7 @@ impl LocalSet {
         }
     }
 
-    /// タスクを積む（`run_until`・`block_on` の中、またはランタイムのスレッドではすぐ動く）。
+    /// Queues a task. It runs immediately inside `run_until` or `block_on`, or on a runtime thread.
     pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
@@ -908,7 +910,7 @@ impl LocalSet {
         }
     }
 
-    /// `future` が終わるまで、このセットのタスクと一緒に動かす。
+    /// Runs the set's tasks together with `future` until `future` completes.
     pub async fn run_until<F: Future>(&self, future: F) -> F::Output {
         self.flush();
         let prev = LOCAL_SET.with(|l| l.replace(Some(self.queue.clone())));
@@ -927,14 +929,14 @@ impl LocalSet {
         rt.block_on(self.run_until(future))
     }
 
-    /// 現在のスレッドの文脈に入る（`spawn_local` が積めるようになる）。
+    /// Enters the current thread's context so that `spawn_local` can queue tasks.
     pub fn enter(&self) -> LocalEnterGuard {
         let prev = LOCAL_SET.with(|l| l.replace(Some(self.queue.clone())));
         LocalEnterGuard { prev }
     }
 }
 
-/// `LocalSet::enter` のガード。
+/// Guard returned by `LocalSet::enter`.
 pub struct LocalEnterGuard {
     prev: Option<LocalQueue>,
 }
@@ -956,13 +958,13 @@ impl Future for LocalSet {
 
 // ===================== task_local =====================
 
-/// `tokio::task_local!` の鍵。
+/// Key of `tokio::task_local!`.
 pub struct LocalKey<T: 'static> {
     #[doc(hidden)]
     pub inner: std::thread::LocalKey<RefCell<Option<T>>>,
 }
 
-/// 値が設定されていない。
+/// The value is not set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessError(());
 
@@ -975,7 +977,7 @@ impl std::fmt::Display for AccessError {
 impl std::error::Error for AccessError {}
 
 impl<T: 'static> LocalKey<T> {
-    /// `value` を設定して `f` を動かす（poll のたびに設定し、抜けるときに戻す）。
+    /// Sets `value` and runs `f` (the value is set on every poll and restored when leaving).
     pub fn scope<F: Future>(&'static self, value: T, f: F) -> TaskLocalFuture<T, F> {
         TaskLocalFuture {
             key: self,
@@ -984,7 +986,7 @@ impl<T: 'static> LocalKey<T> {
         }
     }
 
-    /// 同期版の `scope`。
+    /// Synchronous version of `scope`.
     #[track_caller]
     pub fn sync_scope<F: FnOnce() -> R, R>(&'static self, value: T, f: F) -> R {
         let prev = self.inner.with(|c| c.replace(Some(value)));
@@ -1031,7 +1033,7 @@ impl<T: Clone + 'static> LocalKey<T> {
     }
 }
 
-/// `LocalKey::scope` の Future。
+/// The future returned by `LocalKey::scope`.
 pub struct TaskLocalFuture<T: 'static, F> {
     key: &'static LocalKey<T>,
     slot: Option<T>,
@@ -1039,7 +1041,7 @@ pub struct TaskLocalFuture<T: 'static, F> {
 }
 
 impl<T: 'static, F> TaskLocalFuture<T, F> {
-    /// 設定した値を取り出す（Future の完了後・未 poll なら取れる）。
+    /// Takes the value that was set (available after the future completes, or if it was never polled).
     pub fn take_value(self: Pin<&mut Self>) -> Option<T> {
         // SAFETY: slot だけを動かす（future は動かさない）
         unsafe { self.get_unchecked_mut() }.slot.take()

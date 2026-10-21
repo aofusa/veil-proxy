@@ -1,4 +1,5 @@
-//! `tokio::fs` 互換（F-198）。同期のファイル操作をブロッキング用プール（`task::spawn_blocking`）で行う。
+// F-198: tokio::fs 互換。
+//! Compatible with `tokio::fs`. Synchronous file operations run on the blocking pool (`task::spawn_blocking`).
 // 理由付き allow: このモジュールの std::fs 呼び出しはすべて spawn_blocking の中（ワーカーのスレッドでは動かない）。
 #![allow(clippy::disallowed_methods)]
 
@@ -114,13 +115,13 @@ pub async fn set_permissions(path: impl AsRef<Path>, perm: std::fs::Permissions)
     asyncify(move || std::fs::set_permissions(p, perm)).await
 }
 
-/// `tokio::fs::read_dir` の結果。
+/// Result of `tokio::fs::read_dir`.
 #[derive(Debug)]
 pub struct ReadDir {
     entries: std::vec::IntoIter<io::Result<std::fs::DirEntry>>,
 }
 
-/// ディレクトリの 1 項目。
+/// One entry of a directory.
 #[derive(Debug)]
 pub struct DirEntry(std::fs::DirEntry);
 
@@ -173,11 +174,11 @@ enum Op {
     Seek(io::Result<u64>),
 }
 
-/// `tokio::fs::File`（読み書きは 1 回ずつブロッキング用プールで行う）。
+/// Equivalent of `tokio::fs::File`. Each read or write runs once on the blocking pool.
 pub struct File {
     std: Arc<Mutex<std::fs::File>>,
     busy: Option<JoinHandle<Op>>,
-    /// 読み込み済みでまだ渡していない分
+    /// Data that has been read but not yet handed out.
     buf: Vec<u8>,
     pos: usize,
     last_write_err: Option<io::Error>,
@@ -259,7 +260,7 @@ impl File {
         asyncify(move || f(&mut std.lock().unwrap())).await
     }
 
-    /// 1 回の読み書きでブロッキング用プールへ渡す最大のバイト数。
+    /// Sets the maximum number of bytes handed to the blocking pool per read or write.
     pub fn set_max_buf_size(&mut self, max_buf_size: usize) {
         self.max_buf_size = max_buf_size.max(1);
     }
@@ -299,7 +300,7 @@ impl File {
         std::future::poll_fn(|cx| self.poll_busy(cx).map(|r| r.map(drop))).await
     }
 
-    /// 進行中の操作の完了を待つ。
+    /// Waits for the operation in progress to complete.
     fn poll_busy(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Op>>> {
         let Some(h) = self.busy.as_mut() else {
             return Poll::Ready(Ok(None));

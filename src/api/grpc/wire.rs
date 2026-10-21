@@ -1,12 +1,13 @@
-//! 組み込みのサービス（`grpc.health.v1` 等）のための最小の protobuf の符号化（F-208）。
+// F-208
+//! Minimal protobuf encoding for the built-in services (such as `grpc.health.v1`).
 //!
-//! veil は protobuf の実装に依存しないので、組み込みのサービスの小さなメッセージ（文字列・列挙・入れ子のメッセージ）は
-//! ここで手書きする。未知のフィールドは読み飛ばす（proto3 の前方互換）。
+//! veil does not depend on a protobuf implementation, so the small messages of the built-in services (strings,
+//! enums and nested messages) are hand-written here. Unknown fields are skipped (proto3 forward compatibility).
 
 use super::Status;
 use bytes::{BufMut, BytesMut};
 
-/// ワイヤ型。
+/// Wire types.
 pub(crate) const VARINT: u8 = 0;
 pub(crate) const I64: u8 = 1;
 pub(crate) const LEN: u8 = 2;
@@ -33,7 +34,7 @@ fn put_key(out: &mut BytesMut, field: u32, wire: u8) {
     put_varint(out, ((field as u64) << 3) | wire as u64);
 }
 
-/// 長さ付きのフィールド（文字列・バイト列・入れ子のメッセージ）。proto3 の既定値（空）は書かない。
+/// A length-delimited field (string, bytes or nested message). The proto3 default (empty) is not written.
 pub(crate) fn put_bytes_field(out: &mut BytesMut, field: u32, v: &[u8]) {
     if v.is_empty() {
         return;
@@ -43,14 +44,14 @@ pub(crate) fn put_bytes_field(out: &mut BytesMut, field: u32, v: &[u8]) {
     out.put_slice(v);
 }
 
-/// 入れ子のメッセージ（空でも書く。oneof の選択を表すため）。
+/// A nested message (written even when empty, since it represents a oneof selection).
 pub(crate) fn put_message_field(out: &mut BytesMut, field: u32, v: &[u8]) {
     put_key(out, field, LEN);
     put_varint(out, v.len() as u64);
     out.put_slice(v);
 }
 
-/// repeated int32（proto3 の既定の packed 形式）。空なら書かない。
+/// A repeated int32 (proto3's default packed form). Not written when empty.
 pub(crate) fn put_packed_int32_field(out: &mut BytesMut, field: u32, v: &[i32]) {
     if v.is_empty() {
         return;
@@ -63,7 +64,7 @@ pub(crate) fn put_packed_int32_field(out: &mut BytesMut, field: u32, v: &[i32]) 
     }
 }
 
-/// int32・列挙（負の値は 10 バイトの varint）。proto3 の既定値（0）は書かない。
+/// An int32 or enum (a negative value is a 10-byte varint). The proto3 default (0) is not written.
 pub(crate) fn put_int32_field(out: &mut BytesMut, field: u32, v: i32) {
     if v == 0 {
         return;
@@ -80,7 +81,7 @@ pub(crate) fn bytes_field_len(field: u32, len: usize) -> usize {
     }
 }
 
-/// メッセージを先頭から読むカーソル。
+/// A cursor that reads a message from the start.
 pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -108,7 +109,7 @@ impl<'a> Reader<'a> {
         Err(malformed())
     }
 
-    /// 次のフィールドの (番号, ワイヤ型)。終わりなら `None`。
+    /// The (number, wire type) of the next field, or `None` at the end.
     pub(crate) fn next_key(&mut self) -> Result<Option<(u32, u8)>, Status> {
         if self.pos >= self.buf.len() {
             return Ok(None);
@@ -139,7 +140,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| Status::internal("failed to decode message: invalid UTF-8 in string"))
     }
 
-    /// 知らないフィールドを読み飛ばす。
+    /// Skips an unknown field.
     pub(crate) fn skip(&mut self, wire: u8) -> Result<(), Status> {
         let n = match wire {
             VARINT => {
