@@ -52,7 +52,7 @@ env RUST_BACKTRACE=1 nohup "$BIN" --config veil.toml > veil.log 2>&1 &
 sleep 6
 
 echo "===== capability mode log ====="
-grep -iE 'capability mode|静的ルート dirfd|cap_enter|capsicum' veil.log | head -10 || true
+grep -iE 'capability mode|static root|cap_enter|capsicum' veil.log | head -10 || true
 
 root_code=$(curl -sk -o r_root.txt -w '%{http_code}' "https://localhost:$PORT/" || echo 000)
 nested_code=$(curl -sk -o r_nest.txt -w '%{http_code}' "https://localhost:$PORT/sub/nested.html" || echo 000)

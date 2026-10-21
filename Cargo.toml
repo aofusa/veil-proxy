@@ -40,7 +40,7 @@ resolver = "2"
 # （ルートから veil-macros への依存の版と、ワークスペース外の Cargo.lock も一緒に更新する）。
 # 公開の workflow（.github/workflows/release.yml）はタグとこの版が違えば何も公開しない。
 [workspace.package]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
@@ -677,7 +677,7 @@ regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
-veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.8.2", optional = true }
+veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.8.3", optional = true }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }
@@ -715,7 +715,7 @@ ring = "0.17"
 rcgen = { version = "0.14.6", optional = true, default-features = false, features = ["crypto", "pem", "ring"] }
 # OpenBSD/NetBSD の quiche(http3) は vendored BoringSSL（`boringssl-boring-crate` feature、
 # 外部 `boring` crate 経由）を無条件で使う（FreeBSD/macOS/Windows と同じ構成、F-136）。
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.1", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
 # `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD/macOS/Windows と
 # 同じ理由で optional にしない。
@@ -933,7 +933,10 @@ required-features = ["wasm"]
 # **Linux は無変更**（AGENTS.md「Linux 経路は不変」）: `boring` crate を Linux の依存に
 # 入れてはならない（重複シンボルでリンクが壊れる）。
 [target.'cfg(target_os = "linux")'.dependencies]
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.1", default-features = false, optional = true }
+# F-243: quiche の BoringSSL の FFI を aws-lc-sys の Rust のバインディング経由で呼ぶ（`aws-lc-sys` feature、
+# third_party/quiche/src/veil_ffi.rs）。aws-lc-sys の接頭辞の有無（AWS_LC_SYS_NO_PREFIX）を問わずリンクできるので、
+# veil を依存にする利用者は .cargo/config.toml に何も書かなくてよい。
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["aws-lc-sys"], optional = true }
 # F-238: rustls（aws-lc-rs）が引く aws-lc-sys と必ず同じ 1 つの版にする（2 つになると、プレフィックス無しの
 # シンボルが衝突し、ビルドが libcrypto を見つけられずに失敗する）。crates.io から入れた利用者の解決では
 # aws-lc-rs の最新が新しい aws-lc-sys を要求するので、範囲で受けて同じ版に寄せる。
@@ -944,7 +947,7 @@ aws-lc-sys = { version = ">=0.45, <0.48", features = ["ssl", "bindgen"] }
 # `boringssl-boring-crate` feature 経由でしか提供されないため、常時これを使う
 # （macOS/Windows と同じ構成）。
 [target.'cfg(target_os = "freebsd")'.dependencies]
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.1", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
 # `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD は常に
 # BoringSSL 固定のため optional にしない（http3 feature 無効時の追加コストは
@@ -953,7 +956,7 @@ boring = "4.3"
 
 # macOS/Windows: 従来どおり vendored BoringSSL（boring crate）を無条件で使う（不変）。
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.1", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # `src/http3_server.rs` が `boring::ssl::SslContextBuilder` 等を直接使うための直接依存
 # （quiche 内部の boring 依存とは別に、自クレートのコードから使うには直接宣言が要る）。
 # Cargo の feature はターゲット非依存（`http3 = ["dep:quiche"]` に `dep:boring` を
@@ -983,7 +986,7 @@ tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
 # ビルド時のみ複数フレームを詰める）。小さい応答を多数多重化する HTTP/3 ではリクエストごとに
 # 1 パケット（sendto + AEAD + ヘッダ保護）を払うことになり、FreeBSD aarch64 の 3B 静的配信で
 # 送信 syscall が 1.01/req（nginx 0.22/req）だった。常に詰めるよう 1 箇所だけ差し替えた
-# vendoring 版を `veil-proxy-quiche`（版 0.24.9-veil.1）として各ターゲットの依存に直接書く（上の
+# vendoring 版を `veil-proxy-quiche`（版 0.24.9-veil.2）として各ターゲットの依存に直接書く（上の
 # target 別の quiche。依存のキーは `quiche` のままなのでコードは `quiche::` のまま）。以前は
 # `[patch.crates-io]` で差し替えていたが、patch は crates.io から入れた利用者のビルドには効かない（F-238）。
 # 詳細は third_party/quiche/README.veil.md。

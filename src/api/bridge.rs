@@ -1,14 +1,18 @@
-//! ワーカー（非同期）とハンドラ用プールのスレッド（ブロッキング）の間の有界キュー（F-210）。
+// F-210
+//! Bounded queues between the workers (asynchronous) and the handler-pool threads (blocking).
 //!
-//! C・Python のハンドラはプールのスレッドで動き、ワーカーのイベントループはブロックできない。この 2 つの間で
-//! ストリーミングの本文・gRPC のメッセージ・L4 のデータをやり取りする。
+//! C and Python handlers run on pool threads, and a worker's event loop must not block. Streaming bodies, gRPC
+//! messages and L4 data are exchanged between the two through these queues.
 //!
-//! - `to_worker`: プール → ワーカー。プール側は満杯なら待ち（背圧）、ワーカー側は届くまで非同期に待つ。
-//! - `to_pool`: ワーカー → プール。ワーカー側は満杯なら非同期に待ち、プール側は届くまで待つ。
+//! - `to_worker`: pool to worker. The pool side waits when the queue is full (backpressure); the worker side
+//!   waits asynchronously until a value arrives.
+//! - `to_pool`: worker to pool. The worker side waits asynchronously when the queue is full; the pool side waits
+//!   until a value arrives.
 //!
-//! プール側の待ちは `Condvar`、ワーカー側の待ちは `WakeFlag`（旗 + そのワーカーの通知 fd）。スレッド越しに
-//! Waker を呼ばない（AGENTS.md）。どちらかの端が drop されたら、もう一方の送受信は終わる（`Err` / `None`）。
-//! 非同期の端は作ったワーカーのスレッドで使うこと（通知 fd がそのスレッドのもの）。
+//! The pool side waits on a `Condvar`, and the worker side on a `WakeFlag` (a flag plus that worker's
+//! notification fd); no waker is called across threads. When either end is dropped, sending and receiving on the
+//! other end finish (`Err` / `None`). Use the asynchronous end on the thread of the worker that created it
+//! (the notification fd belongs to that thread).
 
 use crate::runtime::offload::WakeFlag;
 use std::collections::VecDeque;
@@ -19,11 +23,11 @@ struct Shared<T> {
     q: Mutex<VecDeque<T>>,
     cv: Condvar,
     cap: usize,
-    /// 送る側が閉じた
+    /// The sending side is closed.
     tx_closed: AtomicBool,
-    /// 受ける側が閉じた
+    /// The receiving side is closed.
     rx_closed: AtomicBool,
-    /// ワーカー側を起こす
+    /// Wakes the worker side.
     wake: WakeFlag,
 }
 
@@ -42,19 +46,19 @@ impl<T> Shared<T> {
 
 // ===================== プール → ワーカー =====================
 
-/// プール → ワーカーの有界キューを作る（ワーカーのスレッドで呼ぶ）。
+/// Creates a bounded pool-to-worker queue (call it on the worker's thread).
 pub fn to_worker<T: Send>(cap: usize) -> (BlockingSender<T>, AsyncReceiver<T>) {
     let s = Shared::new(cap);
     (BlockingSender { s: s.clone() }, AsyncReceiver { s })
 }
 
-/// プール側の送り手（ブロックする）。
+/// The pool-side sender (blocking).
 pub struct BlockingSender<T> {
     s: Arc<Shared<T>>,
 }
 
 impl<T> BlockingSender<T> {
-    /// 送る。満杯なら空くまで待つ。受け手が閉じていたら値を返す。
+    /// Sends, waiting for space if the queue is full. If the receiver is closed, the value is handed back.
     pub fn send(&self, v: T) -> Result<(), T> {
         let mut q = self.s.q.lock().unwrap();
         while q.len() >= self.s.cap && !self.s.rx_closed.load(Ordering::Acquire) {
@@ -69,7 +73,7 @@ impl<T> BlockingSender<T> {
         Ok(())
     }
 
-    /// 受け手が閉じたか（クライアントが切断した等）。
+    /// Whether the receiver is closed (for example because the client disconnected).
     pub fn is_closed(&self) -> bool {
         self.s.rx_closed.load(Ordering::Acquire)
     }
@@ -82,13 +86,13 @@ impl<T> Drop for BlockingSender<T> {
     }
 }
 
-/// ワーカー側の受け手（非同期）。
+/// The worker-side receiver (asynchronous).
 pub struct AsyncReceiver<T> {
     s: Arc<Shared<T>>,
 }
 
 impl<T> AsyncReceiver<T> {
-    /// 次の値（送り手が閉じて空なら `None`）。
+    /// The next value (`None` once the sender is closed and the queue is empty).
     pub async fn recv(&self) -> Option<T> {
         loop {
             self.s.wake.reset();
@@ -107,7 +111,7 @@ impl<T> AsyncReceiver<T> {
         }
     }
 
-    /// 待たずに取り出す。
+    /// Takes a value without waiting.
     pub fn try_recv(&self) -> Option<T> {
         let v = self.s.q.lock().unwrap().pop_front();
         if v.is_some() {
@@ -116,7 +120,7 @@ impl<T> AsyncReceiver<T> {
         v
     }
 
-    /// `futures::Stream` にする（応答本文等に渡す）。
+    /// Turns this into a `futures::Stream` (to hand to a response body and the like).
     pub fn into_stream(self) -> impl futures::Stream<Item = T> + Send + 'static
     where
         T: Send + 'static,
@@ -137,19 +141,19 @@ impl<T> Drop for AsyncReceiver<T> {
 
 // ===================== ワーカー → プール =====================
 
-/// ワーカー → プールの有界キューを作る（ワーカーのスレッドで呼ぶ）。
+/// Creates a bounded worker-to-pool queue (call it on the worker's thread).
 pub fn to_pool<T: Send>(cap: usize) -> (AsyncSender<T>, BlockingReceiver<T>) {
     let s = Shared::new(cap);
     (AsyncSender { s: s.clone() }, BlockingReceiver { s })
 }
 
-/// ワーカー側の送り手（非同期）。
+/// The worker-side sender (asynchronous).
 pub struct AsyncSender<T> {
     s: Arc<Shared<T>>,
 }
 
 impl<T> AsyncSender<T> {
-    /// 送る。満杯なら空くまで非同期に待つ。受け手が閉じていたら値を返す。
+    /// Sends, waiting asynchronously for space if the queue is full. If the receiver is closed, the value is handed back.
     pub async fn send(&self, v: T) -> Result<(), T> {
         let mut v = Some(v);
         loop {
@@ -178,13 +182,13 @@ impl<T> Drop for AsyncSender<T> {
     }
 }
 
-/// プール側の受け手（ブロックする）。
+/// The pool-side receiver (blocking).
 pub struct BlockingReceiver<T> {
     s: Arc<Shared<T>>,
 }
 
 impl<T> BlockingReceiver<T> {
-    /// 次の値（送り手が閉じて空なら `None`）。届くまで待つ。
+    /// The next value (`None` once the sender is closed and the queue is empty). Waits until a value arrives.
     pub fn recv(&self) -> Option<T> {
         let mut q = self.s.q.lock().unwrap();
         loop {
@@ -219,19 +223,20 @@ use super::response::Response;
 use super::stream::BodyChunk;
 use bytes::Bytes;
 
-/// プールのハンドラからワーカーへ届くもの。
+/// What reaches the worker from a pool handler.
 enum Event {
-    /// 全量の応答（ストリーミングしなかった）
+    /// A complete response (not streamed).
     Full(Response),
-    /// ストリーミングの応答の始まり（ステータスとヘッダ）
+    /// The start of a streaming response (status and headers).
     Head(Response),
     Chunk(BodyChunk),
 }
 
-/// ブロッキングなハンドラが応答をストリーミングにする・要求本文を順に読むための文脈（F-210）。
+// F-210
+/// The context through which a blocking handler streams its response and reads the request body in order.
 ///
-/// ハンドラ用プールのスレッドで使う。[`HandlerContext::start_stream`] で返る [`ResponseWriter`] は
-/// ハンドラから戻った後も別のスレッドで使え、drop で本文を終える。
+/// It is used on a handler-pool thread. The [`ResponseWriter`] returned by [`HandlerContext::start_stream`] can
+/// be used on another thread even after the handler returns, and finishes the body when dropped.
 pub struct HandlerContext {
     events: Arc<BlockingSender<Event>>,
     started: bool,
@@ -239,8 +244,8 @@ pub struct HandlerContext {
 }
 
 impl HandlerContext {
-    /// 応答をストリーミングにする（`head` のステータスとヘッダを先に送る。本文は `ResponseWriter` で）。
-    /// 2 回目は `None`。
+    /// Turns the response into a stream (the status and headers of `head` are sent first; the body goes through
+    /// the [`ResponseWriter`]). The second call returns `None`.
     pub fn start_stream(&mut self, head: Response) -> Option<ResponseWriter> {
         if self.started {
             return None;
@@ -252,29 +257,29 @@ impl HandlerContext {
         })
     }
 
-    /// ストリーミングを始めたか。
+    /// Whether streaming has started.
     pub fn is_streaming(&self) -> bool {
         self.started
     }
 
-    /// 要求本文の次の断片（ストリーミング受信のルートだけ。終わり・それ以外は `None`）。届くまで待つ。
+    /// The next chunk of the request body (only for streaming-reception routes; `None` at the end or otherwise). Waits until it arrives.
     pub fn read_body(&mut self) -> Option<Bytes> {
         self.body.as_ref()?.recv()
     }
 
-    /// 要求本文をストリーミングで受けているか。
+    /// Whether the request body is received as a stream.
     pub fn has_body_stream(&self) -> bool {
         self.body.is_some()
     }
 }
 
-/// ストリーミングの応答の本文を書く（どのスレッドからでも。drop で終わる）。
+/// Writes the body of a streaming response (from any thread; dropping it finishes the body).
 pub struct ResponseWriter {
     events: Option<Arc<BlockingSender<Event>>>,
 }
 
 impl ResponseWriter {
-    /// 本文の断片を送る（満杯なら待つ）。クライアントが切断していたら `false`。
+    /// Sends a chunk of the body (waits if the queue is full). Returns `false` if the client has disconnected.
     pub fn write(&self, data: Bytes) -> bool {
         match &self.events {
             Some(e) => e.send(Event::Chunk(BodyChunk::Data(data))).is_ok(),
@@ -282,7 +287,7 @@ impl ResponseWriter {
         }
     }
 
-    /// トレーラを送って本文を終える。
+    /// Sends the trailers and finishes the body.
     pub fn finish_with_trailers(mut self, trailers: Vec<(Bytes, Bytes)>) -> bool {
         match self.events.take() {
             Some(e) => e.send(Event::Chunk(BodyChunk::Trailers(trailers))).is_ok(),
@@ -290,24 +295,26 @@ impl ResponseWriter {
         }
     }
 
-    /// 途中で中断する（HTTP/2 は RST_STREAM、HTTP/1.1 は接続を閉じる）。
+    /// Aborts midway (RST_STREAM on HTTP/2, closing the connection on HTTP/1.1).
     pub fn abort(mut self, reason: &str) {
         if let Some(e) = self.events.take() {
             let _ = e.send(Event::Chunk(BodyChunk::Abort(reason.to_string())));
         }
     }
 
-    /// クライアントが切断したか。
+    /// Whether the client has disconnected.
     pub fn is_closed(&self) -> bool {
         self.events.as_ref().is_none_or(|e| e.is_closed())
     }
 }
 
-/// ブロッキングなハンドラ `f` をハンドラ用プールで実行する（C・Python の既定の経路、F-210）。
+// F-210: C・Python の既定の経路。
+/// Runs a blocking handler `f` on the handler pool.
 ///
-/// `f` は全量の応答を返すか、[`HandlerContext::start_stream`] で応答をストリーミングにする（その後の戻り値は
-/// 使わない）。ストリーミング受信のルートでは要求本文を [`HandlerContext::read_body`] で順に読める。
-/// 応答が始まった時点で（`f` が戻るのを待たずに）返るので、本文の送信と受信が同時に進む。
+/// `f` either returns a complete response or turns the response into a stream with [`HandlerContext::start_stream`]
+/// (its return value is then ignored). On a streaming-reception route, the request body can be read in order with
+/// [`HandlerContext::read_body`]. It returns as soon as the response starts (without waiting for `f` to return),
+/// so sending and receiving the body proceed concurrently.
 pub async fn call_blocking<F>(req: Request, f: F) -> Response
 where
     F: FnOnce(Request, &mut HandlerContext) -> Response + Send + 'static,
@@ -372,7 +379,7 @@ where
     }
 }
 
-/// 次の出来事を待ちながら、要求本文（gRPC は受信メッセージ）の中継も進める。
+/// Waits for the next event while also relaying the request body (received messages, for gRPC).
 pub(crate) async fn next_event<T>(
     rx: &AsyncReceiver<T>,
     pump: &mut Option<futures::future::BoxFuture<'static, ()>>,
@@ -445,8 +452,9 @@ mod tests {
         assert_eq!(h.join().unwrap(), (0..50).collect::<Vec<_>>());
     }
 
-    /// ランタイム（通知 fd のドライバ）の上で `call_blocking` を呼び、応答を最後まで読む。ドライバが無いと
-    /// 待ちがポーリングになり、要求本文の中継が進まない。io_uring・epoll が使えない環境ではスキップ（None）。
+    /// Calls `call_blocking` on top of the runtime (the notification-fd driver) and reads the response to the end.
+    /// Without the driver, waiting degrades to polling and relaying the request body does not progress. Skipped (None)
+    /// where neither io_uring nor epoll is available.
     fn run<F>(req: Request, f: F) -> Option<(u16, Vec<u8>, Vec<(Bytes, Bytes)>)>
     where
         F: FnOnce(Request, &mut HandlerContext) -> Response + Send + 'static,

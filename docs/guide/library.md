@@ -93,16 +93,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**HTTP/3 on Linux** needs one setting in your project's `.cargo/config.toml`. quiche shares rustls' `aws-lc-sys`
-and needs it built without symbol prefixes; Cargo does not read veil's own `.cargo/config.toml` when veil is a
-dependency. veil's build script stops with this message when it is missing:
-
-```toml
-# .cargo/config.toml of your project (one line per target triple you build for)
-[env]
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
-```
+Nothing else is needed — no `.cargo/config.toml` settings, also for HTTP/3 on Linux. quiche and rustls share
+one `aws-lc-sys`; quiche calls it through `aws-lc-sys`'s Rust bindings, so the build works whether `aws-lc-sys`
+uses its default symbol prefix or not. (An `AWS_LC_SYS_NO_PREFIX_<triple>` entry that you added for earlier
+versions is harmless and can be removed.) Building `aws-lc-sys` needs a C compiler, CMake and libclang (bindgen).
 
 The vendored quiche that packs STREAM frames of several streams into one packet (F-172) is a normal dependency
 (`veil-proxy-quiche`), so no `[patch]` is needed.
@@ -156,6 +150,10 @@ http2_enabled = true
 [logging]
 level = "info"
 
+[access_log]
+enabled = true         # one line per request on standard output (the proxy binary's default is false)
+format = "text"
+
 [security]
 enable_seccomp = false # do not restrict the host language / your code
 enable_landlock = false
@@ -177,6 +175,20 @@ is not reachable from other hosts. To expose it (for example inside a container 
 address explicitly: `listen_cleartext = "0.0.0.0:8080"` in `config.toml`, `.listen_cleartext("0.0.0.0:8080")` in
 Rust, `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")` in C, `veil.run(listen_cleartext="0.0.0.0:8080")` in
 Python, or `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`.
+
+### Access log
+
+In library mode every request is logged to **standard output** by default, as one `text` line
+(`timestamp=… type=access method=… path=… status=… duration_ms=…`), next to the application log. Lines are
+written by a background thread and flushed every `flush_interval_ms` (default 1000 ms), so they can appear up to
+one second after the response.
+
+- Turn it off: `[access_log] enabled = false` in `config.toml`, `.set("access_log.enabled = false")?` on the
+  builder, `VEIL_OVERRIDE_1='access_log.enabled = false'`, or the same override from Python
+  (`veil.run(...)` reads `VEIL_OVERRIDE_<n>`) and C.
+- JSON or a file: `format = "json"`, `file_path = "/var/log/app/access.log"`, `fields = [...]` — the keys are the
+  proxy's [`[access_log]`](observability.md) keys.
+- Logging costs some throughput per request; turn it off when you benchmark against servers that do not log.
 
 ### Sources and precedence
 
@@ -463,8 +475,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # the shim is not on crates.io (its package name is `tokio`), so it comes from the repository. Take veil from the
 # same tag so that the shim and your code use one copy of veil (two copies would mean two runtimes).
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3" }
 ```
 
 Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.

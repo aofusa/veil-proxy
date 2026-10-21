@@ -1,12 +1,14 @@
-//! `tokio::io` 互換（F-198）。トレイト（`AsyncRead`・`AsyncWrite`・`AsyncBufRead`・`AsyncSeek`）は tokio と同じ
-//! poll ベースの定義で、`ReadBuf` も同じ。拡張トレイト・バッファ・分割・`duplex`・`copy` はランタイムに依存しない。
+// F-198
+//! Compatible with `tokio::io`. The traits (`AsyncRead`, `AsyncWrite`, `AsyncBufRead`, `AsyncSeek`) have the same
+//! poll-based definitions as tokio's, and so does `ReadBuf`. The extension traits, buffers, splitting, `duplex`
+//! and `copy` do not depend on the runtime.
 
 mod read_buf;
 mod util;
 
 pub use read_buf::ReadBuf;
 
-/// `tokio::io::unix`（任意の fd の準備待ち）。
+/// Equivalent of `tokio::io::unix` (readiness waiting for an arbitrary fd).
 #[cfg(unix)]
 pub mod unix {
     pub use crate::tokio::net::{
@@ -349,7 +351,7 @@ impl<T: ?Sized + AsyncSeek + Unpin> AsyncSeek for &mut T {
 
 // ===================== 準備状態（net の readiness API） =====================
 
-/// 待つ向き（`tokio::io::Interest`）。
+/// The direction to wait for (`tokio::io::Interest`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Interest(u8);
 
@@ -393,7 +395,7 @@ impl std::ops::BitOrAssign for Interest {
     }
 }
 
-/// 準備できた向き（`tokio::io::Ready`）。
+/// The directions that are ready (`tokio::io::Ready`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Ready(u8);
 

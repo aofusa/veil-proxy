@@ -383,6 +383,11 @@
 #[macro_use]
 extern crate log;
 
+// veil: BoringSSL の FFI の宣言を、aws-lc-sys の Rust のバインディング経由の呼び出しに切り替えるマクロ
+// （`aws-lc-sys` feature。README.veil.md の 5、F-243）。宣言を使う各モジュールより前に置く。
+#[macro_use]
+mod veil_ffi;
+
 use std::cmp;
 
 use std::collections::VecDeque;

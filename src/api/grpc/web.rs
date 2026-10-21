@@ -1,33 +1,36 @@
-//! gRPC-Web をハンドラで直接受ける（F-209 #4）。ブラウザ（grpc-web・Connect 等）から Envoy 等の変換無しで呼べる。
+// F-209 #4
+//! gRPC-Web served directly by handlers, so browsers (grpc-web, Connect and so on) can call without a translator such as Envoy.
 //!
-//! - `application/grpc-web`・`application/grpc-web+proto` 等: 本文は gRPC と同じ 5 バイトの枠。トレーラは HTTP の
-//!   トレーラではなく本文の最後の枠（先頭バイト 0x80、中身は `name: value\r\n` の並び）で返す。
-//! - `application/grpc-web-text`（`+proto`）: 上の本文全体を base64 にしたもの（要求も応答も）。断片の境目は
-//!   base64 の 4 文字 / 3 バイトの区切りと合わないので、余りを持ち越して途中に `=` を出さない。
-//! - HTTP/1.1 でも受ける（ブラウザは HTTP/1.1 で来ることがある）。
-//! - CORS: `[api] grpc_web_cors_origins` に許す Origin を並べる（`"*"` で全部）。空なら CORS のヘッダを付けず、
-//!   プリフライト（`OPTIONS`）は 403。
+//! - `application/grpc-web`, `application/grpc-web+proto` and similar: the body uses the same 5-byte framing as
+//!   gRPC. Trailers are not HTTP trailers; they are returned as the last frame of the body (first byte 0x80,
+//!   content a sequence of `name: value\r\n`).
+//! - `application/grpc-web-text` (`+proto`): the whole body above encoded as base64 (both request and response).
+//!   Chunk boundaries do not line up with base64's 4-characters / 3-bytes groups, so the remainder is carried
+//!   over and no `=` is emitted in the middle.
+//! - HTTP/1.1 is also accepted (browsers may arrive over HTTP/1.1).
+//! - CORS: list the allowed origins in `[api] grpc_web_cors_origins` (`"*"` allows all). When empty, no CORS
+//!   headers are added and a preflight (`OPTIONS`) gets 403.
 //!
-//! プロキシの gRPC-Web 変換（`src/grpc/web.rs`、`grpc-web` feature）とは独立（`grpc-handler` だけで使える）。
+//! This is independent of the proxy's gRPC-Web translation (`src/grpc/web.rs`, the `grpc-web` feature) and works with `grpc-handler` alone.
 
 use super::Metadata;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 
-/// gRPC-Web の要求の形。
+/// The shape of a gRPC-Web request.
 #[derive(Clone, Debug)]
 pub(crate) struct WebMode {
-    /// `-text`（base64）か
+    /// Whether it is `-text` (base64).
     pub text: bool,
-    /// 応答の `content-type`（要求と同じもの）
+    /// The `content-type` of the response (the same as the request's).
     pub content_type: Bytes,
-    /// 応答に付ける CORS のヘッダ（Origin が許されているときだけ）
+    /// CORS headers for the response (only when the origin is allowed).
     pub cors: Metadata,
 }
 
 const PREFIX: &[u8] = b"application/grpc-web";
 
-/// `content-type` が gRPC-Web なら `Some`（`-text` は base64）。
+/// `Some` if the `content-type` is gRPC-Web (`-text` means base64).
 pub(crate) fn web_mode(content_type: &[u8]) -> Option<(bool, Bytes)> {
     if content_type.len() < PREFIX.len()
         || !content_type[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
@@ -44,7 +47,7 @@ pub(crate) fn web_mode(content_type: &[u8]) -> Option<(bool, Bytes)> {
     Some((text, Bytes::copy_from_slice(content_type)))
 }
 
-/// 本文の最後に置くトレーラの枠。
+/// The trailer frame placed at the end of the body.
 pub(crate) fn trailer_frame(trailers: &Metadata) -> Bytes {
     let len: usize = trailers.iter().map(|(n, v)| n.len() + v.len() + 4).sum();
     let mut b = BytesMut::with_capacity(5 + len);
@@ -74,8 +77,8 @@ fn sextet(c: u8) -> Option<u8> {
     }
 }
 
-/// 要求本文（`-text`）の base64 を断片ごとに戻す。4 文字に満たない余りは次の断片へ持ち越す。
-/// 途中の `=`（独立に base64 した断片を連結したもの）も受ける。
+/// Decodes the base64 of a request body (`-text`) chunk by chunk. A remainder shorter than 4 characters is
+/// carried over to the next chunk. A `=` in the middle (chunks base64-encoded independently and concatenated) is accepted too.
 #[derive(Default)]
 pub(crate) struct Base64Decoder {
     quad: [u8; 4],
@@ -114,7 +117,7 @@ impl Base64Decoder {
         Ok(())
     }
 
-    /// 本文の終わり。4 文字に満たない余りがあれば壊れている。
+    /// The end of the body. A remainder shorter than 4 characters means the body is corrupt.
     pub(crate) fn finish(&self) -> Result<(), ()> {
         if self.n == 0 {
             Ok(())
@@ -124,7 +127,7 @@ impl Base64Decoder {
     }
 }
 
-/// 応答本文（`-text`）を断片ごとに base64 にする。3 バイトに満たない余りは次へ持ち越し、最後に `finish` で出す。
+/// Base64-encodes a response body (`-text`) chunk by chunk. A remainder shorter than 3 bytes is carried over and emitted by `finish` at the end.
 #[derive(Default)]
 pub(crate) struct Base64Encoder {
     carry: [u8; 2],
@@ -192,14 +195,14 @@ impl Base64Encoder {
 
 // ===================== CORS =====================
 
-/// `[api] grpc_web_cors_origins`（空 = CORS 無し）。設定のロード・リロードで差し替える。
+/// `[api] grpc_web_cors_origins` (empty means no CORS). Replaced when the configuration is loaded or reloaded.
 static CORS_ORIGINS: arc_swap::ArcSwapOption<Vec<String>> = arc_swap::ArcSwapOption::const_empty();
 
 pub(crate) fn set_cors_origins(origins: Vec<String>) {
     CORS_ORIGINS.store((!origins.is_empty()).then(|| Arc::new(origins)));
 }
 
-/// 許された Origin なら、返す `access-control-allow-origin` の値。
+/// The `access-control-allow-origin` value to return if the origin is allowed.
 fn allowed_origin(origin: &[u8]) -> Option<Bytes> {
     let guard = CORS_ORIGINS.load();
     let origins = guard.as_deref()?;
@@ -212,7 +215,7 @@ fn allowed_origin(origin: &[u8]) -> Option<Bytes> {
         .then(|| Bytes::copy_from_slice(origin))
 }
 
-/// 実際の応答に付ける CORS のヘッダ。
+/// CORS headers for the actual response.
 pub(crate) fn cors_response_headers(origin: Option<&str>) -> Metadata {
     let Some(allow) = origin.and_then(|o| allowed_origin(o.as_bytes())) else {
         return Vec::new();
@@ -227,7 +230,7 @@ pub(crate) fn cors_response_headers(origin: Option<&str>) -> Metadata {
     ]
 }
 
-/// プリフライト（`OPTIONS`）への応答。
+/// The response to a preflight (`OPTIONS`) request.
 pub(crate) fn preflight(req: &crate::api::request::Request) -> crate::api::response::Response {
     let allow = req
         .header("origin")

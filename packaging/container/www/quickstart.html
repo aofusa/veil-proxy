@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>veil container quickstart</title>
+<style>
+  :root {
+    --bg: #0b0d12; --fg: #e6e9ef; --muted: #9aa3b2; --accent: #00f0ff; --accent2: #ff4fd8;
+    --card: #141823; --border: #262c3b; --code: #0f131c;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f7f8fb; --fg: #161a22; --muted: #566074; --accent: #0077a8; --accent2: #b0258f;
+            --card: #ffffff; --border: #dde2ea; --code: #f0f3f8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 2rem; margin: 0 0 4px; letter-spacing: 0.02em; }
+  h1 span { color: var(--accent); }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.02rem; margin: 22px 0 6px; }
+  p, li { max-width: 72ch; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+  :not(pre) > code { background: var(--code); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  pre { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px;
+        overflow-x: auto; margin: 8px 0 14px; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 4px 18px 10px; }
+  .links { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; padding: 0; list-style: none; }
+  .links a { display: block; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+             background: var(--card); text-decoration: none; }
+  .links a small { display: block; color: var(--muted); }
+  .note { border-left: 3px solid var(--accent2); padding: 2px 12px; color: var(--muted); }
+  footer { margin-top: 40px; color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>veil</span> container quickstart</h1>
+  <p class="lead">You are looking at the page built into the <code>ghcr.io/aofusa/veil</code> image. Here is how to
+    serve your own files, use your own configuration, and where to read more.</p>
+
+  <h2>1. Try it</h2>
+  <pre><code>docker run --rm -p 8080:8080 ghcr.io/aofusa/veil
+# open http://localhost:8080/   (h2c works too: curl --http2-prior-knowledge http://localhost:8080/)</code></pre>
+  <p>The built-in configuration serves <code>/var/www</code> over plaintext HTTP/1.1 and HTTP/2 (h2c) on port 8080.
+    No certificate is needed. Every request is logged to standard output, so <code>docker logs</code> shows it.</p>
+  <p>Tags: <code>latest</code> / <code>musl</code> (static binary on <code>scratch</code>), <code>glibc</code>
+    (distroless), and versioned tags such as <code>musl-v0.8.3</code>. All are multi-arch (amd64, arm64).</p>
+
+  <h2>2. Serve your own HTML</h2>
+  <p>Mount a directory over <code>/var/www</code>. <code>index.html</code> is served for <code>/</code>.</p>
+  <pre><code>mkdir -p site &amp;&amp; echo '&lt;h1&gt;Hello from veil&lt;/h1&gt;' &gt; site/index.html
+docker run --rm -p 8080:8080 -v "$PWD/site:/var/www:ro" ghcr.io/aofusa/veil</code></pre>
+
+  <h2>3. Use your own config.toml</h2>
+  <p>The configuration file is <code>/etc/veil/conf.d/config.toml</code>. Mount yours over it. Start from the
+    built-in one, which is shown below, and change what you need.</p>
+  <pre><code>docker run --rm -p 8080:8080 \
+  -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+  -v "$PWD/site:/var/www:ro" \
+  ghcr.io/aofusa/veil
+
+# check a configuration without starting the server
+docker run --rm -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+  ghcr.io/aofusa/veil /veil -t -c /etc/veil/conf.d/config.toml</code></pre>
+
+  <h3>The built-in configuration (minimal form)</h3>
+  <pre><code>[server]
+listen_cleartext = "0.0.0.0:8080"   # plaintext HTTP/1.1 + h2c
+enable_secure_redirect = false      # no TLS listener, so do not redirect to https
+
+[access_log]
+enabled = true                      # one line per request on stdout
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"</code></pre>
+
+  <h3>Reverse proxy to another service</h3>
+  <pre><code>[[route]]                           # put this route before the "/" route
+[route.conditions]
+path = "/api/"
+[route.action]
+type = "Proxy"
+url = "http://backend:3000"</code></pre>
+  <p>Routes are evaluated in the order they are written and the first match wins, so put <code>/api/</code>
+    above the <code>/</code> route: <code>/api/</code> goes to the backend and everything else is served from
+    <code>/var/www</code>. Put the containers on the same Docker network so that <code>backend</code> resolves.</p>
+
+  <h3>TLS and HTTP/3</h3>
+  <pre><code>[server]
+listen = "0.0.0.0:443"              # TLS (HTTP/1.1 and HTTP/2 via ALPN)
+listen_cleartext = "0.0.0.0:8080"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+
+[http3]
+enabled = true
+listen = "0.0.0.0:443"</code></pre>
+  <pre><code>docker run --rm -p 8080:8080 -p 443:443/tcp -p 443:443/udp \
+  -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
+  -v "$PWD/ssl:/etc/veil/ssl:ro" -v "$PWD/site:/var/www:ro" \
+  ghcr.io/aofusa/veil</code></pre>
+
+  <h2>4. Good to know</h2>
+  <ul>
+    <li>The image works under Docker's default seccomp profile and Kubernetes <code>RuntimeDefault</code>
+      (it uses the epoll backend, not io_uring).</li>
+    <li>veil starts as root, binds its listeners, then drops to the <code>nonroot</code> user, with its own
+      seccomp filter and Landlock. Paths you mount must be readable by uid/gid 65532. Paths outside the
+      default Landlock list need to be added to <code>[security] landlock_read_paths</code>.</li>
+    <li>Reload the configuration without downtime: <code>docker kill -s HUP &lt;container&gt;</code>.</li>
+  </ul>
+
+  <h2>Documentation</h2>
+  <ul class="links">
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/container.md">Container guide<small>run, mount, TLS, Kubernetes</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/configuration.md">Configuration<small>every section and key</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml">examples/config.toml<small>annotated reference</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/routing.md">Routing<small>files, proxy, redirects</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/tls.md">TLS<small>certificates, kTLS, reload</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/security.md">Security<small>seccomp, Landlock, privileges</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/kubernetes.md">Kubernetes<small>manifests and sidecars</small></a></li>
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/README.md">All guides<small>docs/guide</small></a></li>
+  </ul>
+
+  <footer>veil &middot; <a href="https://github.com/aofusa/veil-proxy">github.com/aofusa/veil-proxy</a></footer>
+</main>
+</body>
+</html>

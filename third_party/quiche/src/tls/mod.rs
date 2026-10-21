@@ -1077,7 +1077,8 @@ fn log_ssl_error() {
     );
 }
 
-extern "C" {
+// veil: aws-lc-sys feature ではバインディング経由の包みにする（src/veil_ffi.rs、F-243）
+veil_ffi! {
     // Note: some vendor-specific methods are implemented by each vendor's
     // submodule (openssl-quictls / boringssl).
 

@@ -1,0 +1,65 @@
+# Default configuration of the published veil container image (ghcr.io/aofusa/veil).
+#
+#   docker run --rm -p 8080:8080 ghcr.io/aofusa/veil      # then open http://localhost:8080/
+#
+# It serves the built-in page in /var/www over plaintext HTTP/1.1 and h2c on port 8080, with no TLS
+# certificate needed, and logs every request to standard output (`docker logs`).
+#
+# Use your own files by mounting them over these paths:
+#   -v "$PWD/site:/var/www:ro"                                  your HTML
+#   -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro"       your configuration
+# Quickstart:  http://localhost:8080/quickstart.html  and
+#              https://github.com/aofusa/veil-proxy/blob/main/docs/guide/container.md
+# Every key:   https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml
+
+[server]
+# Plaintext HTTP/1.1 + h2c (prior knowledge). Port 8080 also works when the container runs as a non-root user.
+listen_cleartext = "0.0.0.0:8080"
+# There is no TLS listener, so serve plaintext instead of redirecting to https.
+enable_secure_redirect = false
+http2_enabled = true
+# 0 = one worker per CPU available to the container.
+threads = 0
+
+[logging]
+level = "info"
+
+[access_log]
+enabled = true
+format = "text"
+
+[security]
+# Same hardening as the image's previous default: seccomp and Landlock on, privileges dropped to nonroot.
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = [
+  "/var/www",
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  "/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr",
+]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "cbpf"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]

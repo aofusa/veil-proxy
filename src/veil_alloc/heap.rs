@@ -1,32 +1,38 @@
-//! スレッドローカルヒープ（F-183）。
+// F-183
+//! Thread-local heaps.
 //!
-//! ## 構造
+//! # Structure
 //!
-//! - スレッドごとに 1 つの [`Heap`]。サイズクラスごとに「現在のページ」（`direct`）と、
-//!   空きのあるページの双方向キュー（`queue`）を持つ。空きの無いページはキューから外し
-//!   `PAGE_FULL` を立てる（確保時に満杯ページを走査しない）。
-//! - 確保の高速パスは `direct[class].free` からの pop だけ（ロック・アトミック無し）。
-//! - 解放の高速パスはセグメントの所有ヒープが自分なら、そのページのフリーリストへ push。
-//!   ページ単位にフリーリストを持つので、ページが丸ごと空くとスパンを返せる（長時間運用で
-//!   断片化した空きが RSS に居座らない）。
-//! - 他スレッドの解放は所有ヒープの `remote`（Treiber スタック）へ CAS で投函し、所有者が
-//!   遅いパス・アイドル時に一括回収する。
+//! - One [`Heap`] per thread. For each size class it keeps the current page (`direct`) and a
+//!   doubly linked queue of pages that still have free blocks (`queue`). A page with no free
+//!   blocks is taken off the queue and flagged `PAGE_FULL`, so allocation never scans full pages.
+//! - The allocation fast path is only a pop from `direct[class].free` (no locks, no atomics).
+//! - The free fast path pushes onto the page's free list when the segment's owning heap is the
+//!   current one. Because every page has its own free list, a span can be returned as soon as
+//!   its page becomes completely empty, so fragmented free space does not sit in RSS in
+//!   long-running processes.
+//! - Frees from other threads are pushed with CAS onto the owning heap's `remote` list (a
+//!   Treiber stack), and the owner reclaims them in bulk on its slow path and when idle.
 //!
-//! ## 寿命
+//! # Lifetime
 //!
-//! - ヒープ構造体は専用マッピングから切り出し、**解放しない**（投函先として常に有効）。
-//! - スレッド終了時（pthread キーのデストラクタ）にヒープを掃除して「放棄」リストへ置き、
-//!   次に生まれたスレッドがそのまま引き継ぐ（セグメントの所有者を書き換えない）。
-//! - 終了処理後に同じスレッドで確保が起きた場合は、ロック付きの共有ヒープから確保する。
+//! - Heap structures are carved from a dedicated mapping and are **never freed**, so they stay
+//!   valid as a place to post remote frees.
+//! - When a thread exits (the pthread key destructor), its heap is cleaned up and put on the
+//!   "abandoned" list, and the next thread to start takes it over as is (segment owners are
+//!   not rewritten).
+//! - If the same thread allocates again after that cleanup, it allocates from the shared heap,
+//!   which is protected by a lock.
 //!
-//! ## メモリ返却（24 時間 365 日の RSS 安定性）
+//! # Returning memory (stable RSS for long-running processes)
 //!
-//! - 空いたスパンは dirty（物理ページ保持）としてセグメントへ戻し、`purge_delay_ms` 経過後に
-//!   `madvise` で OS へ返す。再確保は dirty なスロットを優先するので、負荷中は
-//!   ページフォルト無しで再利用され、負荷が去ると遅延後に RSS が下がる。
-//! - dirty の総量がヒープあたり `dirty_max_slots` を超えたら遅延を待たずに返す（上限）。
-//! - ワーカーのアイドル時フック（[`collect`]）が空ページの返却・期限切れ purge・
-//!   放棄ヒープの掃除を行う（確保が止まったスレッドでも RSS が下がる）。
+//! - A freed span goes back to its segment as dirty (physical pages kept) and is returned to
+//!   the OS with `madvise` after `purge_delay_ms`. Reallocation prefers dirty slots, so memory
+//!   is reused without page faults under load, and RSS drops after the delay once the load is gone.
+//! - When the total dirty amount exceeds `dirty_max_slots` per heap, memory is returned
+//!   without waiting for the delay (an upper bound).
+//! - The worker idle hook ([`collect`]) returns empty pages, purges expired memory and cleans
+//!   abandoned heaps, so RSS also drops for threads that have stopped allocating.
 
 use core::cell::Cell;
 use core::ptr;
@@ -40,27 +46,27 @@ use super::segment::{
 use super::size_class::{CLASS_SIZE, CLASS_SLOTS, NCLASS};
 use super::{os, stats, SLOT_SHIFT, SLOT_SIZE};
 
-/// 他スレッドからの解放を受けるリスト。所有者の書き込みと別キャッシュラインに置く。
+/// The list that receives frees from other threads. Placed on a different cache line from the owner's writes.
 #[repr(C, align(64))]
 pub(crate) struct RemoteList(pub(crate) AtomicPtr<Block>);
 
 #[repr(C, align(64))]
 pub(crate) struct Heap {
-    /// サイズクラスごとの現在のページ（無ければ `EMPTY_PAGE`）。
+    /// The current page of each size class (`EMPTY_PAGE` if none).
     pub(crate) direct: [*mut Page; NCLASS],
-    /// サイズクラスごとの空きのあるページのキュー先頭。
+    /// The head of the queue of pages with free blocks, for each size class.
     queue: [*mut Page; NCLASS],
-    /// 所有セグメントの双方向リスト。
+    /// Doubly linked list of owned segments.
     segments: *mut Segment,
-    /// 所有セグメントのうち完全に空のものの数。
+    /// Number of owned segments that are completely empty.
     empty_segments: u32,
-    /// クラスごとに、キューに残している空ページ（direct 以外）の数。
+    /// Per class, the number of empty pages (other than `direct`) kept on the queue.
     retained: [u8; NCLASS],
-    /// 所有セグメントの dirty スロット数。
+    /// Number of dirty slots in owned segments.
     dirty_slots: u32,
-    /// dirty スロットの最早 purge 期限（`dirty_slots > 0` のときだけ有効）。
+    /// The earliest purge deadline of the dirty slots (valid only while `dirty_slots > 0`).
     next_purge: u32,
-    /// 放棄リスト・全ヒープリストのリンク。
+    /// Link for the abandoned list and the list of all heaps.
     abandoned_next: *mut Heap,
     pub(crate) remote: RemoteList,
 }
@@ -70,7 +76,7 @@ pub(crate) struct Heap {
 unsafe impl Sync for Heap {}
 unsafe impl Send for Heap {}
 
-/// 空ページ（`free` が常に null。書き込まない）。
+/// The empty page (`free` is always null; never written to).
 struct SyncPage(Page);
 // SAFETY: 読み取り専用。
 unsafe impl Sync for SyncPage {}
@@ -97,9 +103,9 @@ impl Heap {
     }
 }
 
-/// まだヒープを持たないスレッドの初期値（全クラスが空ページ → 最初の確保で遅いパスへ）。
+/// Initial value for a thread that has no heap yet (every class points to the empty page, so the first allocation takes the slow path).
 static EMPTY_HEAP: Heap = Heap::sentinel();
-/// 終了処理を済ませたスレッドの印。
+/// Marker for a thread that has finished its exit cleanup.
 static DEAD_HEAP: Heap = Heap::sentinel();
 
 #[inline(always)]
@@ -127,26 +133,26 @@ pub(crate) fn current() -> *mut Heap {
 // チューニング値（起動時に環境変数で上書き可）
 // ====================
 
-/// 空いたスパンを OS へ返すまでの遅延（ミリ秒）。
+/// Delay before a free span is returned to the OS (milliseconds).
 pub(crate) static PURGE_DELAY_MS: AtomicUsize = AtomicUsize::new(1000);
-/// ヒープあたりの dirty スロット上限（超えたら即 purge）。
+/// Upper bound of dirty slots per heap (purged immediately when exceeded).
 pub(crate) static DIRTY_MAX_SLOTS: AtomicUsize = AtomicUsize::new(256);
-/// ヒープあたり保持する完全に空のセグメント数。
+/// Number of completely empty segments each heap keeps.
 pub(crate) static KEEP_EMPTY_SEGMENTS: AtomicUsize = AtomicUsize::new(1);
 
-/// クラスごとに direct とは別にキューへ残す空ページ数。
+/// Number of empty pages, per class, kept on the queue besides `direct`.
 const RETAIN_EMPTY_PAGES: u8 = 1;
 
-/// 1 回の切り出しで触るバイト数の目安（未使用領域を RSS にしない）。
+/// Approximate number of bytes touched by one carve (so unused space does not count towards RSS).
 const EXTEND_BYTES: usize = 16 * 1024;
-/// スパンの最初の切り出しで触るバイト数。
+/// Number of bytes touched by the first carve of a span.
 const FIRST_EXTEND_BYTES: usize = 4096;
 
 // ====================
 // 確保
 // ====================
 
-/// 高速パス: 現在のページのフリーリストから pop する。
+/// Fast path: pops from the free list of the current page.
 #[inline(always)]
 pub(crate) unsafe fn alloc(class: usize) -> *mut u8 {
     // SAFETY: heap は EMPTY_HEAP/DEAD_HEAP か所有ヒープ。direct は常に有効なページを指す。
@@ -163,7 +169,7 @@ pub(crate) unsafe fn alloc(class: usize) -> *mut u8 {
     }
 }
 
-/// ゼロ埋め確保。新品のブロックはゼロなので先頭 8 バイト（next）だけを消す。
+/// Zeroed allocation. Fresh blocks are already zero, so only the first 8 bytes (`next`) are cleared.
 #[inline(always)]
 pub(crate) unsafe fn alloc_zeroed(class: usize, size: usize) -> *mut u8 {
     // SAFETY: alloc と同じ。返すブロックは class のサイズ（>= size）以上。
@@ -181,7 +187,7 @@ pub(crate) unsafe fn alloc_zeroed(class: usize, size: usize) -> *mut u8 {
     }
 }
 
-/// pop したブロックをゼロにする（ページのフリーリストが新品だけなら next を消すだけ）。
+/// Zeroes a popped block (if the page's free list holds only fresh blocks, only `next` needs clearing).
 #[inline(always)]
 unsafe fn zero_block(page: *mut Page, b: *mut Block, size: usize) {
     // SAFETY: b は page から pop した size バイト以上のブロック。
@@ -208,7 +214,7 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8
     unsafe { heap_alloc(heap, class, zero_size) }
 }
 
-/// ヒープからの確保（所有者またはロック保持者が呼ぶ）。`zero_size > 0` ならその長さをゼロにする。
+/// Allocation from a heap (called by the owner or by the holder of the lock). Zeroes `zero_size` bytes if it is greater than 0.
 unsafe fn heap_alloc(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8 {
     // SAFETY: heap の非アトミック状態は呼び出し側が排他的に持つ。
     unsafe {
@@ -253,7 +259,7 @@ unsafe fn heap_alloc(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8
     }
 }
 
-/// OS からのマップに失敗したとき: 自ヒープ・キャッシュを掃除して 1 回だけ再試行する。
+/// When mapping from the OS fails: cleans up the own heap and the cache, then retries once.
 #[cold]
 unsafe fn oom_retry(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8 {
     // SAFETY: heap は呼び出し側が排他的に持つ。
@@ -269,7 +275,7 @@ unsafe fn oom_retry(heap: *mut Heap, class: usize, zero_size: usize) -> *mut u8 
     }
 }
 
-/// 未切り出し領域からブロックを切り出してフリーリストにする（`free` が空のときだけ呼ぶ）。
+/// Carves blocks from the uncarved area into the free list (called only when `free` is empty).
 unsafe fn extend(page: *mut Page) {
     // SAFETY: page は所有ページで free は空。
     unsafe {
@@ -300,8 +306,8 @@ unsafe fn extend(page: *mut Page) {
     }
 }
 
-/// 連続 `n` スロットのスパンを所有セグメント（無ければ新しいセグメント）から取る。
-/// 戻り値は（ページ記述子, 内容がゼロか）。
+/// Takes a span of `n` contiguous slots from an owned segment (or from a new segment if none fits).
+/// Returns (the page descriptor, whether the contents are zero).
 unsafe fn span_take(heap: *mut Heap, n: usize) -> Option<(*mut Page, bool)> {
     // SAFETY: heap の非アトミック状態は呼び出し側が排他的に持つ。
     unsafe {
@@ -349,7 +355,7 @@ unsafe fn span_take(heap: *mut Heap, n: usize) -> Option<(*mut Page, bool)> {
     }
 }
 
-/// 新しいスパンを割り当て、キュー先頭に置く。
+/// Allocates a new span and puts it at the head of the queue.
 unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
     let n = CLASS_SLOTS[class] as usize;
     // SAFETY: heap の非アトミック状態は呼び出し側が排他的に持つ。
@@ -376,11 +382,11 @@ unsafe fn page_new(heap: *mut Heap, class: usize) -> *mut Page {
 // large（256KiB 超〜LARGE_MAX）: スロット単位のスパンを 1 ブロックとして使う
 // ====================
 
-/// large スパンの印（サイズクラスの代わりに `Page::class` へ入れる）。
+/// Marker of a large span (stored in `Page::class` instead of a size class).
 pub(crate) const LARGE_CLASS: u8 = 255;
 
-/// large の確保。`slots` スロットのスパンをそのまま返す（dirty なスロットを再利用し、
-/// 解放後は小さいクラスと同じ遅延 purge に乗る。huge の mmap/munmap より速い）。
+/// Large allocation. Returns a span of `slots` slots as is (it reuses dirty slots, and after
+/// being freed it follows the same delayed purge as small classes).
 pub(crate) unsafe fn alloc_large(slots: usize, zero_size: usize) -> *mut u8 {
     let mut heap = current();
     if heap == empty_heap() {
@@ -433,7 +439,7 @@ unsafe fn heap_alloc_large(heap: *mut Heap, slots: usize, zero_size: usize) -> *
     }
 }
 
-/// large の解放（所有者なら即スパン返却、他スレッドなら投函）。
+/// Large free (the owner returns the span immediately; other threads post it to the owner).
 pub(crate) unsafe fn free_large(p: *mut u8) {
     // SAFETY: p は alloc_large が返した生きているブロック。
     unsafe {
@@ -453,7 +459,7 @@ pub(crate) unsafe fn free_large(p: *mut u8) {
 // 解放
 // ====================
 
-/// 高速パス: 自分のヒープのブロックならページへ戻す。他スレッドのものは投函する。
+/// Fast path: returns the block to its page if it belongs to this heap; posts it to the owner otherwise.
 #[inline(always)]
 pub(crate) unsafe fn free(p: *mut u8) {
     // SAFETY: p はこのアロケータが返した生きているブロック（huge ではない）。
@@ -509,7 +515,7 @@ unsafe fn free_remote(seg: *mut Segment, p: *mut u8) {
     stats::REMOTE_FREES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// 投函された解放をまとめて自ヒープへ戻す。
+/// Returns the posted frees to this heap in bulk.
 unsafe fn drain_remote(heap: *mut Heap) {
     // SAFETY: heap は呼び出し側が排他的に持つ。投函されたブロックは heap の所有セグメント内。
     unsafe {
@@ -523,7 +529,7 @@ unsafe fn drain_remote(heap: *mut Heap) {
     }
 }
 
-/// ページが空になった、または満杯ページに空きが出たとき。
+/// Called when a page became empty or when a full page got free blocks.
 #[cold]
 #[inline(never)]
 unsafe fn page_freed_slow(heap: *mut Heap, page: *mut Page) {
@@ -553,7 +559,7 @@ unsafe fn page_freed_slow(heap: *mut Heap, page: *mut Page) {
     }
 }
 
-/// スパンをセグメントへ返す（dirty として purge 待ち）。
+/// Returns a span to its segment (as dirty, waiting to be purged).
 unsafe fn span_free(heap: *mut Heap, page: *mut Page, now: u32) {
     // SAFETY: page は heap の所有ページで、キューから外れ、使用中ブロックが無い。
     unsafe {
@@ -576,7 +582,7 @@ unsafe fn span_free(heap: *mut Heap, page: *mut Page, now: u32) {
     }
 }
 
-/// 期限が来ていれば（または dirty が上限を超えていれば）purge する。
+/// Purges if the deadline has passed (or if dirty memory exceeds the limit).
 unsafe fn maybe_purge(heap: *mut Heap, now: u32) {
     // SAFETY: heap は呼び出し側が排他的に持つ。
     unsafe {
@@ -590,7 +596,7 @@ unsafe fn maybe_purge(heap: *mut Heap, now: u32) {
     }
 }
 
-/// 所有セグメントの期限切れ dirty スロットを purge し、余分な空セグメントを手放す。
+/// Purges expired dirty slots of owned segments and gives up surplus empty segments.
 unsafe fn heap_purge(heap: *mut Heap, now: u32, force: bool) {
     let delay = PURGE_DELAY_MS.load(Ordering::Relaxed) as u32;
     let keep = KEEP_EMPTY_SEGMENTS.load(Ordering::Relaxed) as u32;
@@ -624,8 +630,8 @@ unsafe fn heap_purge(heap: *mut Heap, now: u32, force: bool) {
     }
 }
 
-/// ヒープの掃除: 投函の回収、空ページの返却、期限切れ（`force` なら全部）の purge、
-/// 余分な空セグメントの返却。
+/// Cleans a heap: reclaims posted frees, returns empty pages, purges expired memory
+/// (everything if `force` is set) and returns surplus empty segments.
 pub(crate) unsafe fn heap_collect(heap: *mut Heap, force: bool) {
     // SAFETY: heap は呼び出し側が排他的に持つ。
     unsafe {
@@ -725,9 +731,9 @@ unsafe fn segment_unlink(heap: *mut Heap, seg: *mut Segment) {
 // ====================
 
 struct Heaps {
-    /// 放棄されたヒープ（次のスレッドが引き継ぐ）。
+    /// Abandoned heaps (the next thread takes them over).
     abandoned: *mut Heap,
-    /// ヒープ構造体の切り出し元。
+    /// The memory heap structures are carved from.
     arena: *mut u8,
     arena_left: usize,
 }
@@ -741,13 +747,13 @@ static HEAPS: SpinLock<Heaps> = SpinLock::new(Heaps {
     arena_left: 0,
 });
 
-/// 終了処理後のスレッドが使う共有ヒープ（ロック付き、遅延生成）。
+/// The shared heap used by threads after their exit cleanup (protected by a lock, created lazily).
 struct GlobalHeap(*mut Heap);
 // SAFETY: ロック下でだけ触る。
 unsafe impl Send for GlobalHeap {}
 static GLOBAL_HEAP: SpinLock<GlobalHeap> = SpinLock::new(GlobalHeap(ptr::null_mut()));
 
-/// 新しいヒープ構造体を切り出す（HEAPS のロック下）。
+/// Carves out a new heap structure (under the `HEAPS` lock).
 fn heap_new(h: &mut Heaps) -> *mut Heap {
     let size = core::mem::size_of::<Heap>();
     if h.arena_left < size {
@@ -767,7 +773,7 @@ fn heap_new(h: &mut Heaps) -> *mut Heap {
     heap
 }
 
-/// pthread キー（スレッド終了の検出）。0 = 未作成、1 = 作成中、2 = 作成済み。
+/// The pthread key (detects thread exit). 0 = not created, 1 = being created, 2 = created.
 static INIT_STATE: AtomicU8 = AtomicU8::new(0);
 static mut THREAD_KEY: libc::pthread_key_t = 0;
 
@@ -796,7 +802,7 @@ fn global_init() {
     }
 }
 
-/// スレッドの最初の確保: 放棄されたヒープを引き継ぐか、新しく作る。
+/// First allocation of a thread: takes over an abandoned heap or creates a new one.
 #[cold]
 fn thread_init() -> *mut Heap {
     global_init();
@@ -824,7 +830,7 @@ fn thread_init() -> *mut Heap {
     heap
 }
 
-/// pthread キーのデストラクタ: ヒープを掃除して放棄リストへ置く。
+/// Destructor of the pthread key: cleans the heap and puts it on the abandoned list.
 unsafe extern "C" fn thread_done(p: *mut libc::c_void) {
     let heap = p as *mut Heap;
     if heap.is_null() {
@@ -841,7 +847,7 @@ unsafe extern "C" fn thread_done(p: *mut libc::c_void) {
     stats::ABANDONED_HEAPS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// 終了処理後のスレッドの確保（共有ヒープ、ロック付き）。
+/// Allocation by a thread after its exit cleanup (shared heap, with the lock).
 #[cold]
 #[inline(never)]
 fn alloc_global(class: usize, zero_size: usize) -> *mut u8 {
@@ -861,7 +867,7 @@ fn alloc_global(class: usize, zero_size: usize) -> *mut u8 {
 // アイドル時の回収
 // ====================
 
-/// 現在のスレッドのヒープを掃除し、放棄ヒープ・共有ヒープも（取れれば）掃除する。
+/// Cleans the current thread's heap and, when the locks can be taken, the abandoned and shared heaps too.
 pub(crate) fn collect(force: bool) {
     let heap = current();
     if heap != empty_heap() && heap != dead_heap() {

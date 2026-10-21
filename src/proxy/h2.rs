@@ -2623,7 +2623,7 @@ where
         fn as_slice(&self) -> &[u8] {
             self.0
                 .as_ref()
-                .expect("PooledBuf は drop まで常に Some")
+                .expect("PooledBuf holds a buffer until drop")
                 .as_valid_slice()
         }
 
@@ -2637,7 +2637,7 @@ where
         fn into_vec(mut self) -> Vec<u8> {
             self.0
                 .take()
-                .expect("PooledBuf は into_vec まで常に Some")
+                .expect("PooledBuf holds a buffer until into_vec")
                 .into_truncated()
         }
     }

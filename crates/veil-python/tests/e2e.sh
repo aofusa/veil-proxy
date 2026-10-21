@@ -73,6 +73,9 @@ for needle in '"/ping"' '"/hello/{name}"' '"/users"' '"maximum":120' '"minLength
   [[ "$SPEC" == *"$needle"* ]] && ok "openapi has $needle" || bad "openapi missing $needle: $SPEC"
 done
 [[ "$(curl -s "$(U /docs)")" == *swagger* || "$(curl -s "$(U /docs)")" == *Swagger* ]] && ok "/docs" || bad "/docs"
+# 既定でアクセスログが出る（専用スレッドが最大 1 秒ごとにフラッシュする）
+sleep 1.5
+grep 'type=access' "$LOG" | grep -q 'path=/ping' && ok "access log by default" || bad "access log by default: $(grep -c . "$LOG") log lines"
 if [ -n "$WINDOWS" ]; then
   echo "  skip graceful shutdown (SIGTERM): Windows"; stop "$PID"; wait "$PID" 2>/dev/null
 else

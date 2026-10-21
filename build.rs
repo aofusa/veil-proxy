@@ -7,10 +7,10 @@
 //! `std::env::set_var` してもこれらへは一切伝播しない（B-47）。
 //! ターゲット別の値と理由は `.cargo/config.toml` のコメントを参照。
 //!
-//! F-238: その `.cargo/config.toml` は、veil を依存として（crates.io・git から）使う側のビルドでは
-//! 読まれない。Linux の `http3` で値が無いと、リンクの段で quiche の BoringSSL のシンボルが見つからない
-//! という分かりにくい失敗になるので、ここで値を確かめ、要る設定を示して先に止める
-//! （[`check_aws_lc_no_prefix`]）。
+//! F-243: Linux の quiche は aws-lc-sys の Rust のバインディング経由で BoringSSL の API を呼ぶ
+//! （`third_party/quiche/src/veil_ffi.rs`）ので、接頭辞の有無を問わずリンクできる。veil を依存として使う側は
+//! `[env]` を書かなくてよい（以前はここで値を確かめて止めていた。F-238）。veil のリポジトリの `[env]` は、
+//! 配布物のシンボル名を揃えるためだけに残している。
 //!
 //! F-120: クロスプラットフォーム対応（Phase 1）向けに、target_os / feature の
 //! 組み合わせから `veil_rt_uring` / `veil_rt_reactor` / `veil_poller_epoll` /
@@ -28,44 +28,6 @@ fn main() {
     emit_runtime_backend_cfg();
     emit_wasm_nosignals_cfg();
     emit_allocator_cfg();
-    check_aws_lc_no_prefix();
-}
-
-/// F-238: Linux の `http3` は、quiche が rustls と同じ aws-lc-sys を BoringSSL 互換の非プレフィックスの
-/// シンボルで使う（B-47）。そのため aws-lc-sys のビルドに `AWS_LC_SYS_NO_PREFIX_<triple>=1` が要る。
-/// 値は aws-lc-sys のビルドスクリプトが読むので、ここでは設定できない（確かめるだけ）。docs.rs は
-/// リンクしない（rustdoc）ので確かめない。
-fn check_aws_lc_no_prefix() {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let suffixed = format!("AWS_LC_SYS_NO_PREFIX_{}", target.replace('-', "_"));
-    println!("cargo:rerun-if-env-changed={suffixed}");
-    println!("cargo:rerun-if-env-changed=AWS_LC_SYS_NO_PREFIX");
-    println!("cargo:rerun-if-env-changed=DOCS_RS");
-    let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
-    if !linux || !feature_enabled("HTTP3") || std::env::var_os("DOCS_RS").is_some() {
-        return;
-    }
-    // aws-lc-sys の parse_to_bool と同じ解釈（先頭が 0/n/off/f なら偽、数字/y/on/t なら真）。
-    // 接尾辞付きの変数を優先する（aws-lc-sys と同じ順）。
-    let value = std::env::var(&suffixed)
-        .or_else(|_| std::env::var("AWS_LC_SYS_NO_PREFIX"))
-        .unwrap_or_default();
-    let v = value.trim().to_ascii_lowercase();
-    let falsy = v.is_empty()
-        || v.starts_with('0')
-        || v.starts_with('n')
-        || v.starts_with("off")
-        || v.starts_with('f');
-    if falsy {
-        panic!(
-            "veil-proxy: the `http3` feature on Linux needs aws-lc-sys built without symbol prefixes.\n\
-             Add this to `.cargo/config.toml` of your project (or workspace) and rebuild:\n\n\
-             [env]\n\
-             {suffixed} = {{ value = \"1\", force = true }}\n\n\
-             (quiche shares rustls' aws-lc-sys and needs its BoringSSL-compatible names; see\n\
-             https://docs.rs/veil-proxy and docs/guide/library.md. Building without `http3` does not need it.)"
-        );
-    }
 }
 
 /// F-183: veil 専用アロケータ（`veil-alloc` feature）を実際に使うかの cfg エイリアス。
@@ -154,10 +116,11 @@ fn emit_runtime_backend_cfg() {
             println!("cargo::rustc-cfg=veil_poller_wsapoll");
         }
         other => {
+            // F-120/F-125/F-140: 対応 OS の一覧。
             panic!(
                 "veil build.rs: unsupported target_os \"{other}\" — veil currently \
                  supports target_os = \"linux\", \"freebsd\", \"openbsd\", \"macos\", \
-                 \"netbsd\", \"windows\" only (F-120/F-125/F-140)"
+                 \"netbsd\", \"windows\" only"
             );
         }
     }

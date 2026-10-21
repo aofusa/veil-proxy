@@ -79,6 +79,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # F-246: ghcr.io のページと docker inspect に出る説明（index の注釈は publish-images.sh が付ける）
+      - id: desc
+        run: echo "text=$(cat packaging/container/description.txt)" >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -95,7 +98,7 @@ jobs:
             org.opencontainers.image.version=${{ needs.verify.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0 OR MIT
-            org.opencontainers.image.description=veil reverse proxy (${{ matrix.variant }}; full-container = epoll readiness reactor)
+            org.opencontainers.image.description=${{ steps.desc.outputs.text }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
@@ -146,6 +149,8 @@ jobs:
           digest="$(cat "digests/${{ matrix.variant }}-${{ matrix.arch }}")"
           docker pull "$IMAGE@$digest"
           tools/release/image-smoke.sh "$IMAGE@$digest" container
+          # F-246: 設定を渡さずに起動して、内蔵のページを 8080 で返す
+          tools/release/image-smoke.sh "$IMAGE@$digest" defaults
 
   image-publish:
     name: image publish
@@ -297,6 +302,8 @@ jobs:
           annotate() { grep -E "FAIL|Error|Traceback|error:" "$1" | tail -30 | while IFS= read -r l; do echo "::error title=wheel test::${l:0:900}"; done; }
           "$PY" crates/veil-python/tests/test_binding.py 2>&1 | tee "$RUNNER_TEMP/unit.log" || { annotate "$RUNNER_TEMP/unit.log"; exit 1; }
           PYTHON="$PY" PYTHON3="$PY" crates/veil-python/tests/e2e.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log" || { annotate "$RUNNER_TEMP/e2e.log"; exit 1; }
+          # F-241: help() に出る __doc__ が英語だけで、チケット番号が無い
+          PYTHON="$PY" tools/release/check-docs.sh --wheel 2>&1 | tee "$RUNNER_TEMP/docs.log" || { annotate "$RUNNER_TEMP/docs.log"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.name }}

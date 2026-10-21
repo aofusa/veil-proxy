@@ -1,8 +1,8 @@
-//! `tokio::io::ReadBuf`（初期化済み・読み込み済みの範囲を持つバッファ）。
+//! Equivalent of `tokio::io::ReadBuf`: a buffer that tracks its initialised and filled ranges.
 
 use std::mem::MaybeUninit;
 
-/// 読み込み先のバッファ（tokio と同じ意味のメソッド）。
+/// The buffer to read into (the methods have the same meaning as in tokio).
 pub struct ReadBuf<'a> {
     buf: &'a mut [MaybeUninit<u8>],
     filled: usize,
@@ -72,13 +72,13 @@ impl<'a> ReadBuf<'a> {
     }
 
     /// # Safety
-    /// 返したスライスに未初期化を書き戻してはならない。
+    /// The caller must not write uninitialised bytes back into the returned slice.
     pub unsafe fn inner_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         self.buf
     }
 
     /// # Safety
-    /// 返したスライスに未初期化を書き戻してはならない。
+    /// The caller must not write uninitialised bytes back into the returned slice.
     pub unsafe fn unfilled_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         &mut self.buf[self.filled..]
     }
@@ -127,7 +127,7 @@ impl<'a> ReadBuf<'a> {
     }
 
     /// # Safety
-    /// `filled + n` までが本当に初期化済みであること。
+    /// The bytes up to `filled + n` must really be initialised.
     pub unsafe fn assume_init(&mut self, n: usize) {
         let new = self.filled + n;
         if new > self.initialized {

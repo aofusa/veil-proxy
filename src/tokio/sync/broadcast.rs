@@ -1,4 +1,4 @@
-//! `tokio::sync::broadcast`（全受け手に配る。遅れた受け手は `Lagged`）。
+//! Equivalent of `tokio::sync::broadcast`: delivers to every receiver; a receiver that falls behind gets `Lagged`.
 
 use super::watch::WaitList;
 use std::collections::VecDeque;
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 pub mod error {
-    /// 受け手がいない（値を返す）。
+    /// There are no receivers (the value is returned).
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct SendError<T>(pub T);
 
@@ -25,7 +25,7 @@ pub mod error {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// `recv` の失敗。
+    /// The error of `recv`.
     #[derive(Debug, PartialEq, Eq, Clone)]
     pub enum RecvError {
         Closed,
@@ -43,7 +43,7 @@ pub mod error {
 
     impl std::error::Error for RecvError {}
 
-    /// `try_recv` の失敗。
+    /// The error of `try_recv`.
     #[derive(Debug, PartialEq, Eq, Clone)]
     pub enum TryRecvError {
         Empty,
@@ -67,9 +67,9 @@ pub mod error {
 use error::{RecvError, SendError, TryRecvError};
 
 struct Buf<T> {
-    /// (位置, 値, まだ読んでいない受け手の数)
+    /// (position, value, number of receivers that have not read it yet)
     items: VecDeque<(u64, T, usize)>,
-    /// 次に書く位置
+    /// The next position to write.
     tail: u64,
     closed: bool,
 }
@@ -83,7 +83,7 @@ struct Shared<T> {
     wait: WaitList,
 }
 
-/// 容量 `capacity` の放送チャネル。
+/// A broadcast channel with the given `capacity`.
 #[track_caller]
 pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "broadcast channel capacity cannot be zero");
@@ -109,18 +109,18 @@ pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     )
 }
 
-/// 送り手。
+/// The sender.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
-/// 受け手。
+/// The receiver.
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
     next: u64,
 }
 
-/// 受け手を持たない送り手の弱参照。
+/// A weak reference to a sender that holds no receiver.
 pub struct WeakSender<T> {
     shared: Arc<Shared<T>>,
 }
@@ -147,7 +147,7 @@ impl<T> Sender<T> {
         tx
     }
 
-    /// 全受け手へ送る。受け取る受け手の数を返す（いなければ失敗）。
+    /// Sends to every receiver. Returns the number of receivers that will get it (fails if there are none).
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         let n = self.shared.rx_count.load(Ordering::Acquire);
         if n == 0 {
@@ -409,7 +409,7 @@ impl<T> Receiver<T> {
     }
 }
 
-/// 全員が読んだ値を先頭から捨てる（捨てた値は呼び出し側がロックの外で drop する）。
+/// Drops values that everyone has read, from the front (the caller drops the removed values outside the lock).
 fn drain_consumed<T>(b: &mut Buf<T>) -> Vec<T> {
     let mut out = Vec::new();
     while b.items.front().is_some_and(|(_, _, left)| *left == 0) {

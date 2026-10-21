@@ -248,6 +248,7 @@ level = "info"
 # スレッドローカルバッファを使用してヒープアロケーションを最小化。
 #
 [access_log]
+# プロキシのバイナリの既定は無効。API ライブラリとして使う場合の既定は enabled = true・format = "text"（標準出力。F-244）
 # enabled = true
 # format = "json"              # "json" または "text"
 # file_path = "/var/log/veil/access.log"  # 省略時は標準出力 (stdout)。指定時は親ディレクトリを landlock_write_paths へ自動追加

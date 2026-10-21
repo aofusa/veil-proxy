@@ -1,9 +1,11 @@
-//! gRPC サーバ（API ライブラリ、F-197）。ワイヤ処理は veil の `src/grpc/`
-//! （5 バイトのフレーミング・`grpc-status`/`grpc-message`・`grpc-timeout`・gzip/deflate）。tokio・tonic に依存しない。
+// F-197, F-208: メッセージの符号化は `Codec` が担い、veil は protobuf の実装に依存しない。実体は F-188 のハンドラ。
+//! gRPC server for the API library. Wire handling uses veil's `src/grpc/` (5-byte framing,
+//! `grpc-status`/`grpc-message`, `grpc-timeout`, gzip/deflate). It depends on neither tokio nor tonic.
 //!
-//! メッセージの符号化と復号は [`Codec`] が担い、veil 自身は protobuf の実装に依存しない（F-208）。
-//! `.proto` から `veil-build` で生成したコードは prost のメッセージと `ProstCodec` を使う。
-//! 別の protobuf 実装・JSON 等は `Codec` を実装すれば使える。[`BytesCodec`] は符号化前のバイト列をそのまま渡す。
+//! Encoding and decoding of messages is done by a [`Codec`]; veil itself does not depend on a protobuf implementation.
+//! Code generated from a `.proto` file by `veil-build` uses prost messages and `ProstCodec`.
+//! Another protobuf implementation, JSON and so on can be used by implementing `Codec`. [`BytesCodec`] passes the
+//! unencoded bytes through as they are.
 //!
 //! ```ignore
 //! use veil::api::grpc::{Request, Response, Status};
@@ -14,18 +16,20 @@
 //!     .run()
 //! ```
 //!
-//! 実体は F-188 のハンドラ（`POST /<package>.<Service>/<Method>`、要求本文はストリーミング受信）。
-//! 応答はストリーミング応答（DATA の後にトレーラ `grpc-status`）で送る。HTTP/2・HTTP/3 で動き、
-//! HTTP/1.1 で来た要求には `grpc-status: 13` を返す。`.proto` からのコード生成は `veil-build` クレート。
+//! Under the hood this is an ordinary handler (`POST /<package>.<Service>/<Method>`, with the request body
+//! received as a stream). The response is sent as a streaming response (DATA followed by the `grpc-status`
+//! trailer). It works over HTTP/2 and HTTP/3; a request arriving over HTTP/1.1 gets `grpc-status: 13`. Code
+//! generation from `.proto` files is provided by the `veil-build` crate.
 
-/// ブロッキングな gRPC のハンドラ（C・Python 用、F-210）
+// F-210: C・Python 用。
+/// Blocking gRPC handlers (for C and Python).
 pub mod blocking;
 pub mod health;
 pub mod reflection;
 mod web;
 pub(crate) mod wire;
 
-/// `veil-build` が `OUT_DIR` に書いた `<package>.rs` を取り込む（`veil::include_proto!("helloworld");`）。
+/// Includes the `<package>.rs` that `veil-build` wrote to `OUT_DIR` (`veil::include_proto!("helloworld");`).
 #[macro_export]
 macro_rules! include_proto {
     ($package:literal) => {
@@ -49,31 +53,32 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-/// 応答の圧縮方式（`Response::with_compression`）。
+/// The compression method of a response (`Response::with_compression`).
 pub use crate::grpc::compression::GrpcCompression as Compression;
 pub use crate::grpc::status::GrpcStatusCode as Code;
-/// codec の実装（生成コードの `ProstCodec` 等）が使うバッファの型。
+/// The buffer types used by codec implementations (such as the generated `ProstCodec`).
 pub use bytes::{Bytes, BytesMut};
 
 // ===================== Codec =====================
 
-/// メッセージ型 `T` の符号化と復号（F-208）。
+// F-208
+/// Encoding and decoding of the message type `T`.
 ///
-/// 「メッセージ型に実装する trait」ではなく「codec の型に実装する trait」にしている。生成コードは利用者の
-/// クレートにローカルな codec の型（`ProstCodec`）を置き、`impl<T: prost::Message + Default> Codec<T> for ProstCodec`
-/// と書ける（orphan rule。外部クレートのメッセージ型 `prost_types::Empty` 等も rpc に使える）。
+/// This is a trait implemented on a codec type, not on the message type. Generated code places a codec type
+/// (`ProstCodec`) local to the user's crate and writes `impl<T: prost::Message + Default> Codec<T> for ProstCodec`
+/// (orphan rule; message types from external crates such as `prost_types::Empty` can also be used in an RPC).
 pub trait Codec<T>: Clone + Send + Sync + 'static {
-    /// `out` の末尾にメッセージを書く（veil が先に 5 バイトの見出しの領域を空け、書いた後に長さを入れる）。
+    /// Writes the message at the end of `out` (veil first reserves room for the 5-byte header and fills in the length afterwards).
     fn encode(&self, message: &T, out: &mut BytesMut) -> Result<(), Status>;
-    /// 1 メッセージ分（解凍済み）を復号する。
+    /// Decodes one message (already decompressed).
     fn decode(&self, buf: Bytes) -> Result<T, Status>;
-    /// 符号化後の大きさ（分かれば。送信バッファを 1 回で確保するため。0 = 不明）。
+    /// The encoded size, if known (so the send buffer can be allocated at once; 0 means unknown).
     fn encoded_len(&self, _message: &T) -> usize {
         0
     }
 }
 
-/// 符号化前のバイト列をそのまま受け渡す codec（生成コード無しで使う・C や Python の橋渡し）。
+/// A codec that passes unencoded bytes through as they are (usable without generated code, and as a bridge for C and Python).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BytesCodec;
 
@@ -90,7 +95,7 @@ impl Codec<Bytes> for BytesCodec {
     }
 }
 
-/// 受信ストリームが持つ復号関数（ルートの登録時に 1 回作り、呼び出しごとには `Arc` を複製するだけ）。
+/// The decode function held by a receive stream (created once when the route is registered; each call only clones the `Arc`).
 type DecodeFn<T> = Arc<dyn Fn(Bytes) -> Result<T, Status> + Send + Sync>;
 
 fn decode_fn<T: 'static, C: Codec<T>>(codec: &C) -> DecodeFn<T> {
@@ -98,40 +103,42 @@ fn decode_fn<T: 'static, C: Codec<T>>(codec: &C) -> DecodeFn<T> {
     Arc::new(move |b| codec.decode(b))
 }
 
-/// メタデータ（要求ヘッダ・応答ヘッダ・トレーラ）。名前は小文字。
+/// Metadata (request headers, response headers and trailers). Names are lower case.
 pub type Metadata = Vec<(Bytes, Bytes)>;
 
-/// 応答ストリームの型（生成コードのサーバ/双方向ストリーミングの戻り値）。
+/// The type of a response stream (the return value of server and bidirectional streaming in generated code).
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// 受信メッセージの上限（`[api] grpc_max_message_size`、既定 4MiB）。
+/// Limit on received messages (`[api] grpc_max_message_size`, default 4 MiB).
 static MAX_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MESSAGE_SIZE);
 
-/// gRPC の慣習的な既定上限。
+/// The conventional default limit of gRPC.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 pub(crate) fn set_max_message_size(n: usize) {
     MAX_MESSAGE_SIZE.store(n.max(1), Ordering::Relaxed);
 }
 
-/// 現在の受信メッセージ上限。
+/// The current limit on received messages.
 pub fn max_message_size() -> usize {
     MAX_MESSAGE_SIZE.load(Ordering::Relaxed)
 }
 
-/// 送信メッセージの上限（`[api] grpc_max_send_message_size`、0 = 無制限。F-209 #8）。
+// F-209 #8
+/// Limit on sent messages (`[api] grpc_max_send_message_size`, 0 = unlimited).
 static MAX_SEND_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn set_max_send_message_size(n: usize) {
     MAX_SEND_MESSAGE_SIZE.store(n, Ordering::Relaxed);
 }
 
-/// 応答の圧縮（`[api] grpc_response_compression`、0 = しない・1 = gzip・2 = deflate。F-209 #2）。
+// F-209 #2
+/// Compression of responses (`[api] grpc_response_compression`; 0 = none, 1 = gzip, 2 = deflate).
 static RESPONSE_COMPRESSION: AtomicU8 = AtomicU8::new(0);
-/// この大きさ未満のメッセージは圧縮しない（`[api] grpc_response_compression_min_size`）。
+/// Messages smaller than this are not compressed (`[api] grpc_response_compression_min_size`).
 static RESPONSE_COMPRESSION_MIN: AtomicUsize = AtomicUsize::new(1024);
 
-/// `[api] grpc_response_compression`（`"none"`・`"gzip"`・`"deflate"`）を反映する。知らない値は `none` にして返す。
+/// Applies `[api] grpc_response_compression` (`"none"`, `"gzip"` or `"deflate"`). An unknown value is reported as an error and treated as `none`.
 pub(crate) fn set_response_compression(name: &str, min_size: usize) -> Result<(), String> {
     let (v, r) = match name.to_ascii_lowercase().as_str() {
         "" | "none" | "identity" => (0, Ok(())),
@@ -150,7 +157,8 @@ pub(crate) fn set_response_compression(name: &str, min_size: usize) -> Result<()
     r
 }
 
-/// `[api] grpc_web_cors_origins` を反映する（F-209 #4）。
+// F-209 #4
+/// Applies `[api] grpc_web_cors_origins`.
 pub(crate) fn set_grpc_web_cors_origins(origins: Vec<String>) {
     web::set_cors_origins(origins);
 }
@@ -163,7 +171,7 @@ fn configured_compression() -> Compression {
     }
 }
 
-/// 要求の `grpc-accept-encoding` が受けると言っている方式（ビット: 1 = gzip・2 = deflate）。
+/// The methods the request's `grpc-accept-encoding` says it accepts (bits: 1 = gzip, 2 = deflate).
 fn accepted_encodings(v: Option<&str>) -> u8 {
     let mut out = 0;
     for e in v.unwrap_or("").split(',') {
@@ -176,7 +184,7 @@ fn accepted_encodings(v: Option<&str>) -> u8 {
     out
 }
 
-/// 応答に使う圧縮方式: 呼び出しの指定 > 設定。クライアントが受けると言っていない・このビルドで使えない方式は使わない。
+/// The compression method to use for the response: the call's choice takes precedence over the setting. A method the client did not say it accepts, or one unavailable in this build, is not used.
 fn response_encoding(want: Option<Compression>, accepts: u8) -> Compression {
     let want = want.unwrap_or_else(configured_compression);
     let bit = match want {
@@ -193,20 +201,21 @@ fn response_encoding(want: Option<Compression>, accepts: u8) -> Compression {
 
 // ===================== Status =====================
 
-/// gRPC のステータス（コード・メッセージ・追加のトレーラ）。
+/// A gRPC status (code, message and extra trailers).
 #[derive(Debug, Clone)]
 pub struct Status {
     code: Code,
     message: String,
     metadata: Metadata,
-    /// `grpc-status-details-bin`（符号化済みの `google.rpc.Status`。F-209 #6）
+    // F-209 #6
+    /// `grpc-status-details-bin` (an encoded `google.rpc.Status`).
     details: Option<Bytes>,
 }
 
 macro_rules! status_ctor {
     ($($name:ident => $code:ident),* $(,)?) => {
         $(
-            #[doc = concat!("`", stringify!($code), "` のステータス。")]
+            #[doc = concat!("A `", stringify!($code), "` status.")]
             pub fn $name(message: impl Into<String>) -> Status {
                 Status::new(Code::$code, message)
             }
@@ -215,7 +224,7 @@ macro_rules! status_ctor {
 }
 
 impl Status {
-    /// 指定したコードとメッセージで `Status` を作る（メタデータ・詳細は空）。
+    /// Creates a `Status` with the given code and message (metadata and details are empty).
     pub fn new(code: Code, message: impl Into<String>) -> Status {
         Status {
             code,
@@ -244,36 +253,37 @@ impl Status {
         unauthenticated => Unauthenticated,
     }
 
-    /// `grpc-status` に載るコード。
+    /// The code carried in `grpc-status`.
     pub fn code(&self) -> Code {
         self.code
     }
 
-    /// `grpc-message` に載るメッセージ。
+    /// The message carried in `grpc-message`.
     pub fn message(&self) -> &str {
         &self.message
     }
 
-    /// トレーラに足すメタデータ（名前は小文字にする）。
+    /// Metadata to add to the trailers (names are lowercased).
     pub fn with_metadata(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Status {
         self.metadata.push((lower(name.into()), value.into()));
         self
     }
 
-    /// エラーの詳細（`grpc-status-details-bin` で送る、符号化済みの `google.rpc.Status`。F-209）。
-    /// `google.rpc.BadRequest` 等を入れた `google.rpc.Status` を利用者の protobuf ライブラリで符号化して渡す
-    /// （veil は中身を解釈しない。`code`・`message` はこの `Status` と同じにするのが gRPC の約束）。
+    // F-209
+    /// Error details, sent in `grpc-status-details-bin` as an encoded `google.rpc.Status`.
+    /// Encode a `google.rpc.Status` containing `google.rpc.BadRequest` and the like with your own protobuf library and
+    /// pass it in (veil does not interpret the contents; by the gRPC convention `code` and `message` should match this `Status`).
     pub fn with_details(mut self, details: impl Into<Bytes>) -> Status {
         self.details = Some(details.into());
         self
     }
 
-    /// `with_details` で付けた詳細。
+    /// The details set with `with_details`.
     pub fn details(&self) -> Option<&Bytes> {
         self.details.as_ref()
     }
 
-    /// `grpc-status`・`grpc-message`（パーセントエンコード）と追加のメタデータ。
+    /// `grpc-status`, `grpc-message` (percent-encoded) and the extra metadata.
     pub(crate) fn to_trailers(&self) -> Metadata {
         let mut out = Vec::with_capacity(2 + self.metadata.len());
         let mut buf = itoa::Buffer::new();
@@ -316,7 +326,7 @@ impl std::fmt::Display for Status {
 
 impl std::error::Error for Status {}
 
-/// gRPC の `grpc-message` のパーセントエンコード（UTF-8 のバイト単位。0x20〜0x7E の `%` 以外はそのまま）。
+/// Percent-encoding of the gRPC `grpc-message` (per UTF-8 byte; bytes in 0x20 to 0x7E other than `%` are kept as they are).
 fn percent_encode(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -333,7 +343,7 @@ fn percent_encode(s: &str) -> Vec<u8> {
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// `percent_encode` の逆（クライアント・テスト用）。
+/// The inverse of `percent_encode` (for clients and tests).
 pub fn percent_decode(v: &[u8]) -> String {
     let mut out = Vec::with_capacity(v.len());
     let mut i = 0;
@@ -362,7 +372,7 @@ fn lower(b: Bytes) -> Bytes {
 
 // ===================== Request / Response =====================
 
-/// gRPC の要求（メタデータ + メッセージ、またはメッセージのストリーム）。
+/// A gRPC request (metadata plus a message, or a stream of messages).
 #[derive(Debug)]
 pub struct Request<T> {
     metadata: Metadata,
@@ -374,7 +384,7 @@ pub struct Request<T> {
 }
 
 impl<T> Request<T> {
-    /// テスト・直接呼び出し用。
+    /// For tests and direct calls.
     pub fn new(message: T) -> Request<T> {
         Request {
             metadata: Vec::new(),
@@ -385,27 +395,27 @@ impl<T> Request<T> {
         }
     }
 
-    /// デコード済みの要求メッセージへの参照。
+    /// A reference to the decoded request message.
     pub fn get_ref(&self) -> &T {
         &self.message
     }
 
-    /// デコード済みの要求メッセージへの可変参照。
+    /// A mutable reference to the decoded request message.
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.message
     }
 
-    /// 要求メッセージを取り出す（メタデータは捨てる）。
+    /// Takes out the request message (the metadata is discarded).
     pub fn into_inner(self) -> T {
         self.message
     }
 
-    /// 要求メタデータ（予約済みヘッダ `content-type`・`te`・`grpc-timeout`・`grpc-encoding` 等を除く要求ヘッダ）。
+    /// The request metadata (request headers other than reserved ones such as `content-type`, `te`, `grpc-timeout` and `grpc-encoding`).
     pub fn metadata(&self) -> &[(Bytes, Bytes)] {
         &self.metadata
     }
 
-    /// メタデータの値（名前は大文字小文字を区別しない）。
+    /// A metadata value (the name is case-insensitive).
     pub fn metadata_value(&self, name: &str) -> Option<&[u8]> {
         self.metadata
             .iter()
@@ -413,22 +423,22 @@ impl<T> Request<T> {
             .map(|(_, v)| v.as_ref())
     }
 
-    /// `grpc-timeout` から求めた期限。
+    /// The deadline derived from `grpc-timeout`.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
-    /// クライアントの IP アドレス（`Request::new` で作ったものは `127.0.0.1`）。
+    /// The client's IP address (`127.0.0.1` for a request built with `Request::new`).
     pub fn client_ip(&self) -> IpAddr {
         self.client_ip
     }
 
-    /// 呼ばれたメソッド（`/<package>.<Service>/<Method>`。`Request::new` で作ったものは空）。
+    /// The method called (`/<package>.<Service>/<Method>`; empty for a request built with `Request::new`).
     pub fn method(&self) -> &str {
         std::str::from_utf8(&self.path).unwrap_or("")
     }
 
-    /// メッセージだけ差し替える（メタデータ・期限は保つ）。
+    /// Replaces only the message (metadata and deadline are kept).
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Request<U> {
         Request {
             metadata: self.metadata,
@@ -440,7 +450,7 @@ impl<T> Request<T> {
     }
 }
 
-/// gRPC の応答（メタデータ = 応答ヘッダ、メッセージまたはストリーム、トレーラ）。
+/// A gRPC response (metadata = response headers, a message or a stream, and trailers).
 #[derive(Debug)]
 pub struct Response<T> {
     metadata: Metadata,
@@ -450,7 +460,7 @@ pub struct Response<T> {
 }
 
 impl<T> Response<T> {
-    /// 応答メッセージから `Response` を作る（メタデータ・トレーラは空、圧縮は設定に従う）。
+    /// Creates a `Response` from a response message (metadata and trailers are empty; compression follows the settings).
     pub fn new(message: T) -> Response<T> {
         Response {
             metadata: Vec::new(),
@@ -460,36 +470,36 @@ impl<T> Response<T> {
         }
     }
 
-    /// この呼び出しの応答の圧縮方式（`[api] grpc_response_compression` より優先。`Compression::Identity` で圧縮しない）。
-    /// クライアントが `grpc-accept-encoding` で受けると言っていない方式は使わない（非圧縮で送る）。
+    /// The compression method for this call's response; it takes precedence over `[api] grpc_response_compression`
+    /// (`Compression::Identity` disables compression). A method the client did not say it accepts in `grpc-accept-encoding` is not used (the response is sent uncompressed).
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = Some(compression);
         self
     }
 
-    /// 応答メッセージへの参照。
+    /// A reference to the response message.
     pub fn get_ref(&self) -> &T {
         &self.message
     }
 
-    /// 応答メッセージを取り出す（メタデータ・トレーラは捨てる）。
+    /// Takes out the response message (metadata and trailers are discarded).
     pub fn into_inner(self) -> T {
         self.message
     }
 
-    /// 応答ヘッダに足す（名前は小文字にする）。
+    /// Adds a response header (the name is lowercased).
     pub fn with_metadata(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         self.metadata.push((lower(name.into()), value.into()));
         self
     }
 
-    /// 正常終了のトレーラに足す（`grpc-status: 0` の後ろ）。
+    /// Adds a trailer for a normal completion (after `grpc-status: 0`).
     pub fn with_trailer(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         self.trailers.push((lower(name.into()), value.into()));
         self
     }
 
-    /// 応答ヘッダに足したメタデータ。
+    /// The metadata added to the response headers.
     pub fn metadata(&self) -> &[(Bytes, Bytes)] {
         &self.metadata
     }
@@ -497,14 +507,15 @@ impl<T> Response<T> {
 
 // ===================== Streaming（受信） =====================
 
-/// 受信メッセージのストリーム（client streaming・bidi の要求）。届いた本文を gRPC のフレームに切り出し、
-/// 圧縮を戻して codec で復号する。上限超過は `RESOURCE_EXHAUSTED`、壊れたメッセージは `INTERNAL`。
+/// A stream of received messages (the request of client streaming and bidi). It cuts the received body into gRPC
+/// frames, undoes compression and decodes with the codec. Exceeding the limit gives `RESOURCE_EXHAUSTED`; a malformed message gives `INTERNAL`.
 pub struct Streaming<T> {
     body: RequestBodyStream,
     decoder: GrpcFrameDecoder,
     encoding: GrpcCompression,
     decode: DecodeFn<T>,
-    /// gRPC-Web の `-text`（本文が base64）なら戻しながら読む（F-209 #4）
+    // F-209 #4
+    /// For gRPC-Web `-text` (base64 body), decodes while reading.
     text: Option<web::Base64Decoder>,
     body_done: bool,
     finished: bool,
@@ -536,7 +547,7 @@ impl<T> Streaming<T> {
         }
     }
 
-    /// 次のメッセージ（終わりなら `Ok(None)`）。
+    /// The next message (`Ok(None)` at the end).
     pub async fn message(&mut self) -> Result<Option<T>, Status> {
         self.next().await.transpose()
     }
@@ -643,7 +654,7 @@ impl<T> Stream for Streaming<T> {
 
 // ===================== 送信 =====================
 
-/// メッセージを 5 バイトの見出し付きで符号化する（非圧縮）。見出しの領域を空けて codec に書かせ、後で長さを入れる。
+/// Encodes a message with the 5-byte header (uncompressed). Room for the header is reserved, the codec writes the message, and the length is filled in afterwards.
 pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, Status> {
     let mut buf = BytesMut::with_capacity(5 + codec.encoded_len(m));
     buf.put_bytes(0, 5);
@@ -658,7 +669,7 @@ pub(crate) fn encode_message<T, C: Codec<T>>(codec: &C, m: &T) -> Result<Bytes, 
     Ok(buf.freeze())
 }
 
-/// 圧縮する設定なら、最小サイズ以上のメッセージを圧縮した枠に作り直す（圧縮フラグ 1）。
+/// When compression is configured, rebuilds a message of at least the minimum size as a compressed frame (compression flag 1).
 fn compress_frame(frame: Bytes, encoding: Compression) -> Result<Bytes, Status> {
     if encoding == Compression::Identity
         || frame.len() - 5 < RESPONSE_COMPRESSION_MIN.load(Ordering::Relaxed)
@@ -675,7 +686,7 @@ fn compress_frame(frame: Bytes, encoding: Compression) -> Result<Bytes, Status> 
     Ok(buf.freeze())
 }
 
-/// 送信メッセージの上限を超えていたら `RESOURCE_EXHAUSTED`（0 = 無制限）。
+/// `RESOURCE_EXHAUSTED` if the sent message exceeds the limit (0 = unlimited).
 fn send_limit_error(len: usize, max: usize) -> Option<Status> {
     (max > 0 && len > max).then(|| {
         Status::resource_exhausted(format!(
@@ -685,20 +696,22 @@ fn send_limit_error(len: usize, max: usize) -> Option<Status> {
     })
 }
 
-/// 応答のメッセージ列を本文の断片とトレーラに変える（最後に `grpc-status`、途中の `Err` はその状態で終える）。
+/// Turns a sequence of response messages into body chunks and trailers (`grpc-status` at the end; an `Err` midway ends the stream with that status).
 struct GrpcBody<S, C> {
     inner: S,
     codec: C,
-    /// 応答の圧縮（F-209 #2）。`Identity` なら圧縮しない
+    // F-209 #2
+    /// Response compression (`Identity` means none).
     encoding: Compression,
-    /// gRPC-Web（F-209 #4）: トレーラを本文の最後の枠で送る。`Some(Some(_))` は `-text`（base64）
+    // F-209 #4
+    /// gRPC-Web: sends the trailers as the last frame of the body. `Some(Some(_))` is `-text` (base64).
     web: Option<Option<web::Base64Encoder>>,
     trailers: Option<Metadata>,
     deadline: Option<Instant>,
 }
 
 impl<S, C> GrpcBody<S, C> {
-    /// 本文の断片（gRPC-Web の `-text` なら base64 にする）。
+    /// A chunk of the body (base64-encoded for gRPC-Web `-text`).
     fn data(&mut self, b: Bytes) -> BodyChunk {
         match &mut self.web {
             Some(Some(enc)) => BodyChunk::Data(enc.encode(&b)),
@@ -706,7 +719,7 @@ impl<S, C> GrpcBody<S, C> {
         }
     }
 
-    /// 最後のトレーラ（gRPC-Web は本文の最後の枠）。この後は `None` を返す。
+    /// The final trailers (for gRPC-Web, the last frame of the body). Returns `None` afterwards.
     fn end(&mut self, trailers: Metadata) -> BodyChunk {
         self.trailers = None;
         match &mut self.web {
@@ -755,7 +768,8 @@ where
     }
 }
 
-/// 受け付ける `grpc-encoding`（`compression` feature 無しのビルドでは identity だけ。B-127）。
+// B-127
+/// The accepted `grpc-encoding` (identity only in a build without the `compression` feature).
 const GRPC_ACCEPT_ENCODING: &str = if cfg!(feature = "compression") {
     "identity,gzip,deflate"
 } else {
@@ -768,7 +782,7 @@ fn grpc_head(status: u16) -> super::response::Response {
         .with_header("grpc-accept-encoding", GRPC_ACCEPT_ENCODING)
 }
 
-/// gRPC-Web の応答ヘッダ（要求と同じ `content-type`・CORS）。
+/// Response head for gRPC-Web (the same `content-type` as the request, and CORS).
 fn web_head(w: &web::WebMode) -> super::response::Response {
     let mut r = super::response::Response::new(200)
         .with_header("content-type", w.content_type.clone())
@@ -777,8 +791,8 @@ fn web_head(w: &web::WebMode) -> super::response::Response {
     r
 }
 
-/// エラーだけを返す応答。gRPC-Web は状態をヘッダにも載せ、本文にトレーラの枠を置く
-/// （ブラウザは CORS で公開されていないヘッダを読めないことがあるため両方に置く）。
+/// A response carrying only an error. For gRPC-Web the status goes into both the headers and the body's trailer frame
+/// (browsers may be unable to read headers that CORS does not expose).
 fn error_response(web: &Option<web::WebMode>, status: &Status) -> super::response::Response {
     let Some(w) = web else {
         return trailers_only(status);
@@ -797,14 +811,14 @@ fn error_response(web: &Option<web::WebMode>, status: &Status) -> super::respons
     }
 }
 
-/// エラーだけを返す応答（Trailers-Only: `grpc-status` を応答ヘッダに載せて本文無しで終える）。
+/// A response carrying only an error (Trailers-Only: `grpc-status` goes into the response headers and the body is empty).
 fn trailers_only(status: &Status) -> super::response::Response {
     let mut r = grpc_head(200);
     r.headers.extend(status.to_trailers());
     r
 }
 
-/// メッセージ列の応答。
+/// A response made of a sequence of messages.
 fn stream_response<S, T, C>(
     resp: Response<S>,
     deadline: Option<Instant>,
@@ -850,20 +864,21 @@ where
 
 // ===================== 受け付け =====================
 
-/// 要求ヘッダから読み取った呼び出しの情報。
+/// Call information read from the request headers.
 struct Call {
     metadata: Metadata,
     deadline: Option<Instant>,
     encoding: GrpcCompression,
-    /// `grpc-accept-encoding`（`accepted_encodings` のビット）
+    /// `grpc-accept-encoding` (the bits of `accepted_encodings`).
     accepts: u8,
-    /// gRPC-Web の要求なら `Some`（F-209 #4）
+    // F-209 #4
+    /// `Some` for a gRPC-Web request.
     web: Option<web::WebMode>,
     client_ip: IpAddr,
     path: Bytes,
 }
 
-/// gRPC の要求として受け付けられるかを見る（だめなら返す応答）。
+/// Checks whether the request can be accepted as a gRPC request (the response to return if not).
 fn accept(req: &super::request::Request) -> Result<Call, super::response::Response> {
     let ct = req.header("content-type").unwrap_or_default();
     // gRPC-Web（`application/grpc-web*`）は本文の最後の枠でトレーラを返す（F-209 #4）。HTTP/1.1 でも受ける
@@ -929,9 +944,9 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
     })
 }
 
-/// どのルートにも当たらなかった要求が通常の gRPC（gRPC-Web を除く）なら、Trailers-Only の `UNIMPLEMENTED` の
-/// 応答ヘッダ（`:status` 200 で送る）。プロトコル側の 404 の代わりに使う（F-209 #9）。gRPC の仕様では
-/// HTTP の 404 は `UNIMPLEMENTED` と読み替えられるが、ログ・メトリクスに 404 が出てクライアントのメッセージも曖昧になる。
+// F-209 #9: gRPC の仕様では HTTP の 404 は `UNIMPLEMENTED` と読み替えられるが、ログ・メトリクスに 404 が出てクライアントのメッセージも曖昧になる。
+/// If a request that matched no route is an ordinary gRPC request (not gRPC-Web), the response head of a
+/// Trailers-Only `UNIMPLEMENTED` (sent with `:status` 200). Used in place of the protocol layer's 404.
 pub(crate) fn unknown_route_response<'a>(
     mut headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
     path: &[u8],
@@ -960,7 +975,7 @@ pub(crate) fn unknown_route_response<'a>(
     Some(out)
 }
 
-/// 期限付きで Future を待つ（期限切れは `DEADLINE_EXCEEDED`）。
+/// Awaits a future with a deadline (expiry gives `DEADLINE_EXCEEDED`).
 async fn with_deadline<F, T>(deadline: Option<Instant>, fut: F) -> Result<T, Status>
 where
     F: Future<Output = Result<T, Status>>,
@@ -980,7 +995,7 @@ where
     }
 }
 
-/// 単項の要求メッセージを 1 つ読む（0 個・2 個以上はエラー）。
+/// Reads the single request message of a unary call (zero or two or more messages is an error).
 async fn read_single<T>(mut s: Streaming<T>) -> Result<T, Status> {
     let Some(first) = s.message().await? else {
         return Err(Status::internal("missing request message"));
@@ -1020,7 +1035,7 @@ fn make_request<T>(call: Call, message: T) -> (Request<T>, Option<Instant>) {
     )
 }
 
-/// 単発のメッセージを 1 要素のストリームにする。
+/// Turns a single message into a one-element stream.
 fn once<T: Send + 'static>(
     m: T,
 ) -> futures::stream::Once<futures::future::Ready<Result<T, Status>>> {
@@ -1028,9 +1043,10 @@ fn once<T: Send + 'static>(
 }
 
 impl App {
-    /// gRPC のメソッドを呼ぶ前に `f` を呼ぶ（認証・メタデータの検査等。F-209 #7）。`prefix` は `"/"` で全部、
-    /// `"/pkg.Svc/"` でそのサービスだけ。`Err` を返すとメソッドを呼ばずにその状態で終える（Trailers-Only）。
-    /// gRPC・gRPC-Web 以外の要求（同じ前置きの HTTP のルート）には何もしない。
+    // F-209 #7
+    /// Calls `f` before a gRPC method is called (for authentication, metadata checks and so on). A `prefix` of `"/"`
+    /// covers everything and `"/pkg.Svc/"` only that service. Returning `Err` ends the call with that status without
+    /// calling the method (Trailers-Only). Requests that are neither gRPC nor gRPC-Web (HTTP routes under the same prefix) are left alone.
     pub fn grpc_interceptor<F>(self, prefix: &str, f: F) -> App
     where
         F: Fn(&Request<()>) -> Result<(), Status> + Send + Sync + 'static,
@@ -1061,7 +1077,8 @@ impl App {
     }
 }
 
-/// gRPC-Web のプリフライト（`OPTIONS`）をハンドラの前で返す（F-209 #4）。
+// F-209 #4
+/// Answers a gRPC-Web preflight (`OPTIONS`) before the handler.
 fn with_preflight(func: HandlerFn) -> HandlerFn {
     Arc::new(move |req: super::request::Request| -> HandlerFuture {
         if req.method() == "OPTIONS" {
@@ -1119,8 +1136,8 @@ fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
 }
 
 impl App {
-    /// 単項 RPC（1 要求 → 1 応答）を登録する。`path` は `/<package>.<Service>/<Method>`。
-    /// `codec` が要求と応答のメッセージを符号化・復号する（`veil-build` の生成コードは `ProstCodec`）。
+    /// Registers a unary RPC (one request, one response). `path` is `/<package>.<Service>/<Method>`.
+    /// `codec` encodes and decodes the request and response messages (`ProstCodec` in code generated by `veil-build`).
     pub fn grpc_unary<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
         C: Codec<Req> + Codec<Resp> + Unpin,
@@ -1178,7 +1195,7 @@ impl App {
         grpc_route(self, path, func)
     }
 
-    /// サーバストリーミング RPC（1 要求 → 応答のストリーム）を登録する。
+    /// Registers a server-streaming RPC (one request, a stream of responses).
     pub fn grpc_server_streaming<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
         C: Codec<Req> + Codec<Resp> + Unpin,
@@ -1218,7 +1235,7 @@ impl App {
         grpc_route(self, path, func)
     }
 
-    /// クライアントストリーミング RPC（要求のストリーム → 1 応答）を登録する。
+    /// Registers a client-streaming RPC (a stream of requests, one response).
     pub fn grpc_client_streaming<C, Req, Resp, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
         C: Codec<Req> + Codec<Resp> + Unpin,
@@ -1270,8 +1287,9 @@ impl App {
         grpc_route(self, path, func)
     }
 
-    /// 双方向ストリーミング RPC（要求のストリーム → 応答のストリーム）を登録する。
-    /// HTTP/2・HTTP/3 とも要求と応答が全二重で流れる（F-209）。
+    // F-209: HTTP/2・HTTP/3 とも全二重。
+    /// Registers a bidirectional-streaming RPC (a stream of requests, a stream of responses).
+    /// Requests and responses flow full duplex over both HTTP/2 and HTTP/3.
     pub fn grpc_bidi<C, Req, Resp, S, F, Fut>(self, path: &str, codec: C, f: F) -> App
     where
         C: Codec<Req> + Codec<Resp> + Unpin,
@@ -1306,7 +1324,7 @@ impl App {
     }
 }
 
-/// 応答ストリームを `Unpin` にする（利用者のストリームは `Unpin` とは限らない）。
+/// Makes a response stream `Unpin` (a user's stream is not necessarily `Unpin`).
 fn boxed<S, T>(resp: Response<S>) -> Response<BoxStream<T>>
 where
     S: Stream<Item = Result<T, Status>> + Send + 'static,

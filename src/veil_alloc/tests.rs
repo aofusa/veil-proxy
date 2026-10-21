@@ -1,4 +1,4 @@
-//! veil-alloc の単体テスト（F-183）。グローバルアロケータとは独立に `VeilAlloc` を直接呼ぶ。
+//! Unit tests for veil-alloc. They call `VeilAlloc` directly, independent of the global allocator.
 
 use super::*;
 use core::alloc::{GlobalAlloc, Layout};
@@ -12,7 +12,7 @@ fn layout(size: usize, align: usize) -> Layout {
     Layout::from_size_align(size, align).unwrap()
 }
 
-/// 簡単な xorshift（外部クレート無しで再現可能な乱数）。
+/// A simple xorshift (reproducible random numbers without an external crate).
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

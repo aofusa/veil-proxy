@@ -90,16 +90,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**Linux で HTTP/3 を使う**ときは、利用する側のプロジェクトの `.cargo/config.toml` に設定が 1 つ要ります。quiche は rustls と
-同じ `aws-lc-sys` をシンボルのプレフィックス無しで使います。veil を依存として使うと、cargo は veil 自身の
-`.cargo/config.toml` を読みません。設定が無いと、veil のビルドスクリプトがこの内容を示して止まります。
+ほかの設定は要りません。Linux で HTTP/3 を使う場合も、`.cargo/config.toml` に何も書かなくて構いません。
 
-```toml
-# 利用する側の .cargo/config.toml（ビルドするターゲットごとに 1 行）
-[env]
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
-```
+- quiche と rustls は 1 つの `aws-lc-sys` を共有します。
+- quiche は `aws-lc-sys` の Rust のバインディング経由で呼ぶので、`aws-lc-sys` のシンボルの接頭辞の有無にかかわらずビルドできます。
+- 以前の版のために足した `AWS_LC_SYS_NO_PREFIX_<triple>` は、あっても害はなく、消して構いません。
+- `aws-lc-sys` のビルドには C コンパイラ・CMake・libclang（bindgen）が要ります。
 
 複数ストリームの STREAM フレームを 1 パケットへ詰める vendoring 版 quiche（F-172）は通常の依存（`veil-proxy-quiche`）なので、
 `[patch]` は要りません。
@@ -152,6 +148,10 @@ http2_enabled = true
 [logging]
 level = "info"
 
+[access_log]
+enabled = true         # 要求ごとに 1 行を標準出力に出す（プロキシのバイナリの既定は false）
+format = "text"
+
 [security]
 enable_seccomp = false # ホスト言語やユーザコードを制限しない
 enable_landlock = false
@@ -171,6 +171,18 @@ openapi_version = "0.1.0"
 コンテナ内やロードバランサの背後などで外部に公開するときはアドレスを明示します（`config.toml` の `listen_cleartext = "0.0.0.0:8080"`、
 Rust の `.listen_cleartext("0.0.0.0:8080")`、C の `veil_config_listen_cleartext(cfg, "0.0.0.0:8080")`、
 Python の `veil.run(listen_cleartext="0.0.0.0:8080")`、または `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`）。
+
+### アクセスログ
+
+ライブラリモードでは、既定で要求ごとに 1 行のアクセスログを **標準出力** に `text` 形式で出します
+（`timestamp=… type=access method=… path=… status=… duration_ms=…`。アプリケーションのログと同じ出力先です）。
+行は専用のスレッドが書き、`flush_interval_ms`（既定 1000 ミリ秒）ごとにフラッシュするので、応答から最大 1 秒遅れて出ます。
+
+- 止める: `config.toml` の `[access_log] enabled = false`、ビルダの `.set("access_log.enabled = false")?`、
+  `VEIL_OVERRIDE_1='access_log.enabled = false'`（Python の `veil.run(...)` と C も `VEIL_OVERRIDE_<n>` を読みます）。
+- JSON やファイルへ: `format = "json"`、`file_path = "/var/log/app/access.log"`、`fields = [...]`。キーはプロキシの
+  [`[access_log]`](observability.md) と同じです。
+- 要求ごとに処理が増えます。ログを出さないサーバと性能を比べるときは止めてください。
 
 ### 設定の合成と優先順位
 
@@ -445,8 +457,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
 # 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.2" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.8.3" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は

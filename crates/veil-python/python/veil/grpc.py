@@ -79,7 +79,7 @@ class StatusCode(enum.IntEnum):
 
 
 def _code(c):
-    """int・StatusCode・grpcio の grpc.StatusCode（value が (int, str)）を int にする。"""
+    """Convert an int, a :class:`StatusCode` or a grpcio ``grpc.StatusCode`` (whose value is ``(int, str)``) to an int."""
     if c is None:
         return 0
     v = getattr(c, "value", c)
@@ -191,7 +191,7 @@ def _identity(x):
 
 
 class _Method:
-    """登録した 1 メソッド（Rust が ``handle(call) -> (code, message)`` を呼ぶ）。"""
+    """One registered method (Rust calls ``handle(call) -> (code, message)``)."""
 
     def __init__(self, behavior, request_streaming, response_streaming, deserializer, serializer):
         self.behavior = behavior

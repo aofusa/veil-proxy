@@ -37,6 +37,8 @@ veil_run(cfg);                                      /* 停止までブロック�
   OpenAPI の Operation Object（JSON）を渡すと説明が反映されます。
 - 任意の設定は `veil_config_set(cfg, "server.threads", "4")` のように `--override` と同じ構文で上書きできます。
   文字列値は引用符込みで渡します（`"\"warn\""`）。環境変数 `VEIL_OVERRIDE_<n>` も本体と同じ規則で効きます。
+- アクセスログは既定で標準出力に出ます（`[access_log] enabled = true`・`format = "text"`）。止めるときは
+  `veil_config_set(cfg, "access_log.enabled", "false")`。
 - 停止は SIGINT / SIGTERM、または別スレッドからの `veil_shutdown()`。
 
 ## スレッドモデル

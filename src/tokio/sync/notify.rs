@@ -1,4 +1,4 @@
-//! `tokio::sync::Notify`・`Barrier`・`OnceCell`。
+//! Equivalents of `tokio::sync::Notify`, `Barrier` and `OnceCell`.
 
 use crate::tokio::waker::WakerSlot;
 use std::collections::VecDeque;
@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 struct Waiter {
     notified: AtomicBool,
-    /// notify_last で起こされた（drop で回すときも同じ向きで回す）
+    /// Woken by `notify_last` (when cycling on drop, it cycles in the same direction).
     by_last: AtomicBool,
     waker: Mutex<WakerSlot>,
 }
@@ -53,7 +53,7 @@ impl Notify {
         }
     }
 
-    /// 通知を待つ Future（作った時点より後の `notify_waiters` でも完了する）。
+    /// A future that waits for a notification (it also completes on a `notify_waiters` that happens after it was created).
     pub fn notified(&self) -> Notified<'_> {
         let generation = self.state.lock().unwrap().generation;
         Notified {
@@ -64,7 +64,7 @@ impl Notify {
         }
     }
 
-    /// 待っている先頭を 1 つ起こす（誰もいなければ次の 1 回のために許可を残す）。
+    /// Wakes the first waiter (if nobody is waiting, it leaves a permit for the next wait).
     pub fn notify_one(&self) {
         let w = {
             let mut st = self.state.lock().unwrap();
@@ -84,7 +84,7 @@ impl Notify {
         }
     }
 
-    /// 最後に待ち始めたものを 1 つ起こす。
+    /// Wakes the waiter that started waiting last.
     pub fn notify_last(&self) {
         let w = {
             let mut st = self.state.lock().unwrap();
@@ -105,7 +105,7 @@ impl Notify {
         }
     }
 
-    /// 今待っているもの（と、作られたがまだ poll されていない `Notified`）をすべて起こす。許可は残さない。
+    /// Wakes every current waiter (and every `Notified` that was created but not yet polled). It does not leave a permit.
     pub fn notify_waiters(&self) {
         let ws: Vec<_> = {
             let mut st = self.state.lock().unwrap();
@@ -120,7 +120,7 @@ impl Notify {
 }
 
 impl Notify {
-    /// `notified` の所有版（`Arc<Notify>` を持つ）。
+    /// The owned version of `notified` (it holds an `Arc<Notify>`).
     pub fn notified_owned(self: Arc<Self>) -> OwnedNotified {
         // SAFETY: `inner` は `notify` が指す Notify を借りる。Arc を同じ構造体に持ち、inner を先に drop する
         // （フィールドの宣言順）ので、借用より先に Notify が消えることはない
@@ -132,7 +132,7 @@ impl Notify {
     }
 }
 
-/// `Notify::notified_owned` の Future。
+/// The future returned by `Notify::notified_owned`.
 pub struct OwnedNotified {
     inner: Notified<'static>,
     _notify: Arc<Notify>,
@@ -157,7 +157,7 @@ impl Future for OwnedNotified {
     }
 }
 
-/// `Notify::notified` の Future。
+/// The future returned by `Notify::notified`.
 pub struct Notified<'a> {
     notify: &'a Notify,
     generation: u64,
@@ -172,7 +172,7 @@ impl std::fmt::Debug for Notified<'_> {
 }
 
 impl Notified<'_> {
-    /// poll せずに待ちの列へ入る（`notify_one` を受け取れるようにする）。既に通知済みなら `true`。
+    /// Enters the wait queue without polling (so that it can receive `notify_one`). Returns `true` if it was already notified.
     pub fn enable(self: Pin<&mut Self>) -> bool {
         let this = self.get_mut();
         this.register(None)
@@ -260,11 +260,11 @@ pub struct Barrier {
     notify: Notify,
 }
 
-/// (世代, 到着数)
+/// (generation, number of arrivals)
 #[derive(Debug)]
 struct BarrierStateDbg(u64, usize);
 
-/// `Barrier::wait` の結果（1 つだけがリーダー）。
+/// The result of `Barrier::wait` (exactly one waiter is the leader).
 #[derive(Debug, Clone)]
 pub struct BarrierWaitResult(bool);
 
@@ -313,7 +313,7 @@ impl Barrier {
 
 // ===================== OnceCell =====================
 
-/// `OnceCell::set` の失敗。
+/// The error of `OnceCell::set`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetError<T> {
     AlreadyInitializedError(T),
@@ -340,7 +340,7 @@ impl<T> std::fmt::Display for SetError<T> {
 
 impl<T: std::fmt::Debug> std::error::Error for SetError<T> {}
 
-/// `tokio::sync::OnceCell`（初期化を 1 つの Future だけが走らせる）。
+/// Equivalent of `tokio::sync::OnceCell`: only one future runs the initialisation.
 pub struct OnceCell<T> {
     value: std::sync::OnceLock<T>,
     init: super::Semaphore,
@@ -494,7 +494,7 @@ impl<T> OnceCell<T> {
 
 // ===================== SetOnce =====================
 
-/// `SetOnce::set` の失敗（値を返す）。
+/// The error of `SetOnce::set` (it gives back the value).
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetOnceError<T>(pub T);
 
@@ -506,7 +506,7 @@ impl<T> std::fmt::Display for SetOnceError<T> {
 
 impl<T: std::fmt::Debug> std::error::Error for SetOnceError<T> {}
 
-/// `tokio::sync::SetOnce`（1 回だけ値を置け、置かれるまで `wait` で待てる）。
+/// Equivalent of `tokio::sync::SetOnce`: the value can be set once, and `wait` waits until it is set.
 pub struct SetOnce<T> {
     value: std::sync::OnceLock<T>,
     notify: Notify,

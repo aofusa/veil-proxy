@@ -1,14 +1,17 @@
-//! ハンドラの応答（F-188）と、さまざまな戻り値型からの変換（`IntoResponse`）。
+// F-188
+//! Handler responses and the conversion from various return types (`IntoResponse`).
 
 use bytes::Bytes;
 
-/// ハンドラが返す応答。本文は `Bytes`（ゼロコピーで各プロトコルの送信経路へ渡る）か、
-/// ストリーム（`Response::stream`。断片とトレーラ、F-197）。
+// F-197: ストリームは断片とトレーラ。
+/// A response returned by a handler. The body is either `Bytes` (passed zero-copy to each protocol's send path)
+/// or a stream (`Response::stream`).
 pub struct Response {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(Bytes, Bytes)>,
     pub(crate) body: Bytes,
-    /// ストリーミング本文（あれば `body` の代わりに送る）
+    // F-197
+    /// Streaming body (sent in place of `body` when present).
     pub(crate) stream: Option<super::stream::BodyStream>,
 }
 
@@ -29,7 +32,7 @@ const CT_JSON: &[u8] = b"application/json";
 const CT_OCTET: &[u8] = b"application/octet-stream";
 
 impl Response {
-    /// 空の本文・ヘッダ無しの応答。
+    /// A response with an empty body and no headers.
     pub fn new(status: u16) -> Response {
         Response {
             status,
@@ -51,17 +54,17 @@ impl Response {
         }
     }
 
-    /// `text/plain; charset=utf-8`（200）。
+    /// `text/plain; charset=utf-8` (200).
     pub fn text(body: impl Into<String>) -> Response {
         Self::with_type(200, CT_TEXT, Bytes::from(body.into()))
     }
 
-    /// `text/html; charset=utf-8`（200）。
+    /// `text/html; charset=utf-8` (200).
     pub fn html(body: impl Into<String>) -> Response {
         Self::with_type(200, CT_HTML, Bytes::from(body.into()))
     }
 
-    /// `application/json`（200）。シリアライズに失敗したら 500。
+    /// `application/json` (200). A serialization failure gives 500.
     pub fn json<T: serde::Serialize + ?Sized>(value: &T) -> Response {
         match serde_json::to_vec(value) {
             Ok(v) => Self::with_type(200, CT_JSON, Bytes::from(v)),
@@ -69,18 +72,19 @@ impl Response {
         }
     }
 
-    /// 既にシリアライズ済みの JSON（200）。
+    /// Already serialized JSON (200).
     pub fn json_bytes(body: impl Into<Bytes>) -> Response {
         Self::with_type(200, CT_JSON, body.into())
     }
 
-    /// `application/octet-stream`（200）。
+    /// `application/octet-stream` (200).
     pub fn bytes(body: impl Into<Bytes>) -> Response {
         Self::with_type(200, CT_OCTET, body.into())
     }
 
-    /// ストリーミング応答（本文を断片で送り、最後にトレーラを送れる。F-197）。
-    /// `content-type` は `with_header` で付ける。
+    // F-197
+    /// A streaming response: the body is sent in chunks and trailers can follow at the end.
+    /// Set `content-type` with `with_header`.
     pub fn stream<S>(status: u16, body: S) -> Response
     where
         S: futures::Stream<Item = super::stream::BodyChunk> + Send + 'static,
@@ -94,12 +98,12 @@ impl Response {
         }
     }
 
-    /// ストリーミング応答か。
+    /// Whether this is a streaming response.
     pub fn is_streaming(&self) -> bool {
         self.stream.is_some()
     }
 
-    /// ストリームを取り出す（アダプタ・テスト用）。
+    /// Takes the stream out (for adapters and tests).
     pub fn take_stream(&mut self) -> Option<super::stream::BodyStream> {
         self.stream.take()
     }
@@ -109,7 +113,7 @@ impl Response {
         Response::new(204)
     }
 
-    /// JSON のエラー応答 `{"detail": "<message>"}`（FastAPI と同じ形）。
+    /// A JSON error response `{"detail": "<message>"}` (the same shape as FastAPI).
     pub fn error(status: u16, message: &str) -> Response {
         let body = serde_json::json!({ "detail": message });
         let mut r = Response::json(&body);
@@ -117,34 +121,34 @@ impl Response {
         r
     }
 
-    /// 404 Not Found（JSON）。
+    /// 404 Not Found (JSON).
     pub fn not_found() -> Response {
         Response::error(404, "Not Found")
     }
 
-    /// 400 Bad Request（JSON）。
+    /// 400 Bad Request (JSON).
     pub fn bad_request(message: &str) -> Response {
         Response::error(400, message)
     }
 
-    /// ステータスを変える。
+    /// Changes the status.
     pub fn with_status(mut self, status: u16) -> Response {
         self.status = status;
         self
     }
 
-    /// 設計書の記法（`Response::json(&x).status(201)`）に合わせた別名。
+    /// Alias of `with_status`, so that `Response::json(&x).status(201)` works.
     pub fn status(self, status: u16) -> Response {
         self.with_status(status)
     }
 
-    /// ヘッダを追加する（同名があれば置き換えない＝追加）。
+    /// Adds a header (an existing header of the same name is not replaced; this appends).
     pub fn with_header(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Response {
         self.headers.push((name.into(), value.into()));
         self
     }
 
-    /// 同名のヘッダを置き換える（大文字小文字を区別しない）。
+    /// Replaces the header of the same name (case-insensitive).
     pub fn set_header(&mut self, name: &str, value: impl Into<Bytes>) {
         self.headers
             .retain(|(n, _)| !n.eq_ignore_ascii_case(name.as_bytes()));
@@ -152,28 +156,28 @@ impl Response {
             .push((Bytes::copy_from_slice(name.as_bytes()), value.into()));
     }
 
-    /// 本文を差し替える。
+    /// Replaces the body.
     pub fn with_body(mut self, body: impl Into<Bytes>) -> Response {
         self.body = body.into();
         self
     }
 
-    /// HTTP ステータスコード。
+    /// The HTTP status code.
     pub fn status_code(&self) -> u16 {
         self.status
     }
 
-    /// 応答ヘッダ（名前, 値）の一覧。
+    /// The list of response headers (name, value).
     pub fn headers(&self) -> &[(Bytes, Bytes)] {
         &self.headers
     }
 
-    /// 応答本文。
+    /// The response body.
     pub fn body(&self) -> &Bytes {
         &self.body
     }
 
-    /// ヘッダ（大文字小文字を区別しない）。
+    /// A header (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&[u8]> {
         self.headers
             .iter()
@@ -182,9 +186,9 @@ impl Response {
     }
 }
 
-/// ハンドラの戻り値から `Response` を作る。
+/// Builds a `Response` from a handler's return value.
 pub trait IntoResponse {
-    /// 応答に変換する。
+    /// Converts into a response.
     fn into_response(self) -> Response;
 }
 
@@ -254,7 +258,7 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
     }
 }
 
-/// JSON 本文（抽出子・戻り値の両方に使う）。戻り値では `application/json` で返す。
+/// A JSON body (usable both as an extractor and as a return value). As a return value it is sent as `application/json`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Json<T>(pub T);
 
@@ -277,7 +281,7 @@ impl<T: serde::Serialize> IntoResponse for Json<T> {
     }
 }
 
-/// HTML 本文の戻り値。
+/// An HTML body as a return value.
 #[derive(Debug, Clone)]
 pub struct Html<T>(pub T);
 
@@ -287,17 +291,17 @@ impl<T: Into<String>> IntoResponse for Html<T> {
     }
 }
 
-/// ハンドラが `?` で返せる汎用エラー（ステータス + メッセージ、本文は `{"detail": ...}`）。
+/// A general-purpose error a handler can return with `?` (a status plus a message; the body is `{"detail": ...}`).
 #[derive(Debug, Clone)]
 pub struct ApiError {
-    /// HTTP ステータスコード。
+    /// The HTTP status code.
     pub status: u16,
-    /// `{"detail": ...}` として返すメッセージ。
+    /// The message returned as `{"detail": ...}`.
     pub message: String,
 }
 
 impl ApiError {
-    /// ステータスコードとメッセージから作る。
+    /// Creates an error from a status code and a message.
     pub fn new(status: u16, message: impl Into<String>) -> ApiError {
         ApiError {
             status,

@@ -303,7 +303,17 @@ pub(super) const TLS_ERROR: c_int = 3;
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ssl_early_data_reason_t(pub ::std::os::raw::c_uint);
-extern "C" {
+
+// veil: aws-lc-sys のバインディングは `c_uint` で返す（src/veil_ffi.rs、F-243）
+#[cfg(feature = "aws-lc-sys")]
+impl crate::veil_ffi::Conv<ssl_early_data_reason_t> for ::std::os::raw::c_uint {
+    #[inline(always)]
+    fn conv(self) -> ssl_early_data_reason_t {
+        ssl_early_data_reason_t(self)
+    }
+}
+// veil: aws-lc-sys feature ではバインディング経由の包みにする（src/veil_ffi.rs、F-243）
+veil_ffi! {
     // SSL_METHOD specific for boringssl.
     pub(super) fn SSL_CTX_set_tlsext_ticket_keys(
         ctx: *mut SSL_CTX, key: *const u8, key_len: usize,

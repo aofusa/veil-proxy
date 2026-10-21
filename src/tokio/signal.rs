@@ -1,9 +1,11 @@
-//! `tokio::signal` 互換（F-198。Windows は F-204）。
+// F-198（Windows は F-204）。
+//! Compatible with `tokio::signal`.
 //!
-//! - unix: signal-hook でシグナルを数え、待っている Future を起こす。veil 本体の SIGINT / SIGTERM / SIGHUP の扱い
-//!   （終了・リロード）とは独立に受け取れる（signal-hook は複数登録できる）。
-//! - Windows: `SetConsoleCtrlHandler` のハンドラで種類（Ctrl-C・Ctrl-Break・閉じる・ログオフ・シャットダウン）ごとに
-//!   数える。受け手がいる種類だけ「処理済み」（TRUE）を返し、いなければ次のハンドラ（veil 本体の ctrlc の終了処理）へ回す。
+//! - unix: counts signals with signal-hook and wakes the waiting futures. It is independent of veil's own
+//!   handling of SIGINT, SIGTERM and SIGHUP (shutdown and reload), because signal-hook allows several registrations.
+//! - Windows: a `SetConsoleCtrlHandler` handler counts events per kind (Ctrl-C, Ctrl-Break, close, logoff,
+//!   shutdown). It returns "handled" (TRUE) only for kinds that have a receiver; otherwise it passes the
+//!   event to the next handler (veil's own shutdown handling).
 
 use super::sync::Notify;
 use std::io;
@@ -13,7 +15,7 @@ use std::sync::Arc;
 struct Slot {
     count: AtomicU64,
     notify: Notify,
-    /// 生きている受け手の数（Windows: 0 ならハンドラは FALSE を返して既定の処理に回す）
+    /// Number of live receivers (Windows: when 0, the handler returns FALSE and the default handling runs).
     #[cfg(windows)]
     listeners: std::sync::atomic::AtomicUsize,
 }
@@ -34,7 +36,7 @@ impl Slot {
     }
 }
 
-/// 1 つの種類のシグナルを受け取る側（数を覚えて、増えたら 1 回返す）。
+/// Receives one kind of signal (remembers a count and returns once each time it grows).
 struct Receiver {
     slot: Arc<Slot>,
     seen: u64,
@@ -112,7 +114,7 @@ fn slot(sig: libc::c_int) -> io::Result<Arc<Slot>> {
     Ok(s)
 }
 
-/// Ctrl-C（unix は SIGINT、Windows は `CTRL_C_EVENT`）を 1 回待つ。
+/// Waits once for Ctrl-C (SIGINT on unix, `CTRL_C_EVENT` on Windows).
 pub async fn ctrl_c() -> io::Result<()> {
     #[cfg(unix)]
     let mut s = unix::signal(unix::SignalKind::interrupt())?;
@@ -126,7 +128,7 @@ pub async fn ctrl_c() -> io::Result<()> {
 pub mod unix {
     use super::*;
 
-    /// シグナルの種類。
+    /// A kind of signal.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SignalKind(libc::c_int);
 
@@ -178,7 +180,7 @@ pub mod unix {
         }
     }
 
-    /// シグナルの流れ。
+    /// A stream of signals.
     pub struct Signal(Receiver);
 
     impl std::fmt::Debug for Signal {
@@ -187,13 +189,13 @@ pub mod unix {
         }
     }
 
-    /// `kind` のシグナルを受け取る。
+    /// Receives signals of the given `kind`.
     pub fn signal(kind: SignalKind) -> io::Result<Signal> {
         Ok(Signal(Receiver::new(slot(kind.0)?)))
     }
 
     impl Signal {
-        /// 次のシグナルを待つ（このレイヤーでは終わらない）。
+        /// Waits for the next signal (never ends with `None` in this layer).
         pub async fn recv(&mut self) -> Option<()> {
             std::future::poll_fn(|cx| self.poll_recv(cx)).await
         }
@@ -207,7 +209,7 @@ pub mod unix {
     }
 }
 
-/// `tokio::signal::windows`（コンソールの制御イベント）。
+/// Equivalent of `tokio::signal::windows` (console control events).
 #[cfg(windows)]
 pub mod windows {
     use super::*;
@@ -231,7 +233,7 @@ pub mod windows {
         SLOTS.get_or_init(|| std::array::from_fn(|_| Arc::new(Slot::new())))
     }
 
-    /// コンソールの制御ハンドラ（システムが作るスレッドで呼ばれる）。
+    /// Console control handler (called on a thread created by the system).
     unsafe extern "system" fn handler(ctrl: u32) -> BOOL {
         let Some(i) = KINDS.iter().position(|&k| k == ctrl) else {
             return FALSE;
@@ -285,7 +287,7 @@ pub mod windows {
             }
 
             impl $ty {
-                /// 次のイベントを待つ（このレイヤーでは終わらない）。
+                /// Waits for the next event (never ends with `None` in this layer).
                 pub async fn recv(&mut self) -> Option<()> {
                     std::future::poll_fn(|cx| self.poll_recv(cx)).await
                 }
@@ -305,29 +307,24 @@ pub mod windows {
         };
     }
 
-    ctrl_kind!(CtrlC, ctrl_c, 0, "Ctrl-C（`CTRL_C_EVENT`）。");
-    ctrl_kind!(
-        CtrlBreak,
-        ctrl_break,
-        1,
-        "Ctrl-Break（`CTRL_BREAK_EVENT`）。"
-    );
+    ctrl_kind!(CtrlC, ctrl_c, 0, "Ctrl-C (`CTRL_C_EVENT`).");
+    ctrl_kind!(CtrlBreak, ctrl_break, 1, "Ctrl-Break (`CTRL_BREAK_EVENT`).");
     ctrl_kind!(
         CtrlClose,
         ctrl_close,
         2,
-        "コンソールを閉じた（`CTRL_CLOSE_EVENT`）。"
+        "The console was closed (`CTRL_CLOSE_EVENT`)."
     );
     ctrl_kind!(
         CtrlLogoff,
         ctrl_logoff,
         3,
-        "ログオフ（`CTRL_LOGOFF_EVENT`。サービスだけが受け取る）。"
+        "Logoff (`CTRL_LOGOFF_EVENT`; only services receive it)."
     );
     ctrl_kind!(
         CtrlShutdown,
         ctrl_shutdown,
         4,
-        "シャットダウン（`CTRL_SHUTDOWN_EVENT`。サービスだけが受け取る）。"
+        "Shutdown (`CTRL_SHUTDOWN_EVENT`; only services receive it)."
     );
 }

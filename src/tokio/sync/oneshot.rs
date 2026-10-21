@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 struct State<T> {
     value: Option<T>,
-    /// 値が送られた（受け取り済みを含む）
+    /// A value was sent (including the case where it has already been received).
     complete: bool,
     tx_dropped: bool,
     rx_closed: bool,
@@ -18,12 +18,12 @@ struct State<T> {
 
 type Shared<T> = Arc<Mutex<State<T>>>;
 
-/// 送り手。
+/// The sending half.
 pub struct Sender<T> {
     inner: Option<Shared<T>>,
 }
 
-/// 受け手（`await` で値を待つ）。
+/// The receiving half (`await` it to wait for the value).
 pub struct Receiver<T> {
     inner: Option<Shared<T>>,
 }
@@ -41,7 +41,7 @@ impl<T> std::fmt::Debug for Receiver<T> {
 }
 
 pub mod error {
-    /// 送り手が値を送らずに消えた。
+    /// The sender went away without sending a value.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RecvError(pub(super) ());
 
@@ -53,7 +53,7 @@ pub mod error {
 
     impl std::error::Error for RecvError {}
 
-    /// `try_recv` の失敗。
+    /// The error of `try_recv`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum TryRecvError {
         Empty,
@@ -74,7 +74,7 @@ pub mod error {
 
 use error::{RecvError, TryRecvError};
 
-/// 1 回だけ値を送れるチャネル。
+/// A channel that can send a value only once.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let s = Arc::new(Mutex::new(State {
         value: None,
@@ -93,7 +93,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
-    /// 値を送る（受け手が閉じていれば値を返す）。
+    /// Sends a value. Returns the value if the receiver has been closed.
     pub fn send(mut self, t: T) -> Result<(), T> {
         let inner = self.inner.take().unwrap();
         let w = {
@@ -117,7 +117,7 @@ impl<T> Sender<T> {
             .is_none_or(|i| i.lock().unwrap().rx_closed)
     }
 
-    /// 受け手が閉じる（drop・`close`）まで待つ。
+    /// Waits until the receiver is closed (dropped or `close`d).
     pub async fn closed(&mut self) {
         std::future::poll_fn(|cx| self.poll_closed(cx)).await
     }
@@ -151,7 +151,7 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T> Receiver<T> {
-    /// 受け取りを止める（以後の `send` は失敗する。送られていた値は `try_recv` で取れる）。
+    /// Stops receiving (later `send`s fail; a value that was already sent can be taken with `try_recv`).
     pub fn close(&mut self) {
         if let Some(inner) = &self.inner {
             let w = {

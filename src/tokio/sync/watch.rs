@@ -1,4 +1,4 @@
-//! `tokio::sync::watch`（最新の値を共有し、変化を知らせる）。
+//! Equivalent of `tokio::sync::watch`: shares the latest value and notifies receivers of changes.
 
 use crate::tokio::waker::WakerSlot;
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll};
 
 pub mod error {
-    /// 受け手がいない（値を返す）。
+    /// There are no receivers (the value is returned).
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct SendError<T>(pub T);
 
@@ -26,7 +26,7 @@ pub mod error {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// 送り手がいない。
+    /// There is no sender.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RecvError(pub(super) ());
 
@@ -41,7 +41,7 @@ pub mod error {
 
 use error::{RecvError, SendError};
 
-/// 待っている受け手（・送り手の closed）の Waker の表。
+/// Table of the wakers of waiting receivers (and of the sender's `closed`).
 #[derive(Default)]
 pub(crate) struct WaitList {
     next: AtomicU64,
@@ -95,7 +95,7 @@ struct Shared<T> {
     tx_wait: WaitList,
 }
 
-/// 値を持つチャネル（受け手は最新の値だけを見る）。
+/// A channel that holds a value (receivers see only the latest value).
 pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
     let s = Arc::new(Shared {
         value: RwLock::new(init),
@@ -115,12 +115,12 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
     )
 }
 
-/// 送り手。
+/// The sender.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
-/// 受け手。
+/// The receiver.
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
     version: u64,
@@ -138,7 +138,7 @@ impl<T> std::fmt::Debug for Receiver<T> {
     }
 }
 
-/// 値への参照（読みロック）。
+/// A reference to the value (holds a read lock).
 pub struct Ref<'a, T> {
     inner: RwLockReadGuard<'a, T>,
     has_changed: bool,
@@ -170,7 +170,7 @@ impl<T> Sender<T> {
         tx
     }
 
-    /// 値を変える（受け手がいなければ失敗し、値は変わらない）。
+    /// Changes the value (fails if there are no receivers, and then the value is unchanged).
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         if self.shared.rx_count.load(Ordering::Acquire) == 0 {
             return Err(SendError(value));
@@ -179,7 +179,7 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    /// 受け手の有無にかかわらず値を変え、前の値を返す。
+    /// Changes the value whether or not there are receivers, and returns the previous value.
     pub fn send_replace(&self, value: T) -> T {
         let old = {
             let mut g = self.shared.value.write().unwrap_or_else(|e| e.into_inner());
@@ -315,7 +315,7 @@ impl<T> Receiver<T> {
         self.version = self.shared.version.load(Ordering::Acquire);
     }
 
-    /// 前に見た版から変わるまで待つ（送り手が全部消えたら `Err`）。
+    /// Waits until the value changes from the version last seen (returns `Err` when all senders are gone).
     pub async fn changed(&mut self) -> Result<(), RecvError> {
         let mut key = None;
         let shared = self.shared.clone();
@@ -347,7 +347,7 @@ impl<T> Receiver<T> {
         r
     }
 
-    /// 値が条件を満たすまで待つ。
+    /// Waits until the value satisfies the condition.
     pub async fn wait_for<F: FnMut(&T) -> bool>(
         &mut self,
         mut f: F,

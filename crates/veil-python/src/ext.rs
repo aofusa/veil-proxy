@@ -1,10 +1,11 @@
-//! Python の gRPC・L4（F-210）の Rust 側。
+// F-210: Python の gRPC・L4 の Rust 側。
+//! Rust side of the Python gRPC and L4 support.
 //!
-//! - gRPC: 1 回の呼び出しを [`NativeGrpcCall`] で Python へ渡す（受信・送信は GIL を外して待つ）。4 種類の RPC・
-//!   直列化（`request_deserializer` / `response_serializer`）・grpcio の生成コードへの対応は Python 側
-//!   （`veil/grpc.py`）。メッセージはバイト列のまま。
-//! - L4: TCP は接続ごとに Python のプロトコル（`connection_made` / `data_received` / `connection_lost`）と
-//!   [`NativeTransport`]（`write` / `close` / `get_extra_info`）を作る。UDP は関数を呼ぶ。
+//! - gRPC: each call is handed to Python as a [`NativeGrpcCall`]; receiving and sending wait with the GIL released.
+//!   The four RPC kinds, (de)serialization (`request_deserializer` / `response_serializer`) and the grpcio
+//!   generated-code adapter live on the Python side (`veil/grpc.py`). Messages stay as raw bytes.
+//! - L4: for every TCP connection a Python protocol (`connection_made` / `data_received` / `connection_lost`) and a
+//!   [`NativeTransport`] (`write` / `close` / `get_extra_info`) are created. UDP calls a plain function.
 
 use bytes::Bytes;
 use pyo3::exceptions::PyRuntimeError;
@@ -18,10 +19,10 @@ use veil::api::l4::{L4Out, L4Session};
 
 // ===================== gRPC =====================
 
-/// 1 回の gRPC の呼び出し（Python のハンドラの間だけ有効。終わったら操作は例外）。
+/// One gRPC call; valid only while the handler runs (operations raise once it has finished).
 #[pyclass(name = "NativeGrpcCall", module = "veil._veil")]
 pub struct NativeGrpcCall {
-    /// `*mut GrpcCall`（呼び出しの外は 0）
+    // `*mut GrpcCall`（呼び出しの外は 0）
     ptr: AtomicUsize,
 }
 
@@ -39,7 +40,9 @@ impl NativeGrpcCall {
 
 #[pymethods]
 impl NativeGrpcCall {
-    /// 次の受信メッセージ（終わりは None）。壊れた・大きすぎるメッセージは `(code, message)` の RuntimeError。
+    /// Next request message, or `None` at the end of the stream.
+    ///
+    /// A malformed or oversized message raises `RuntimeError` with `(code, message)`.
     fn recv(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
         match self.with_call(|call| py.detach(|| call.recv()))? {
             Ok(Some(b)) => Ok(Some(PyBytes::new(py, &b).unbind())),
@@ -51,13 +54,13 @@ impl NativeGrpcCall {
         }
     }
 
-    /// 送る。クライアントが切断していたら False。
+    /// Send a response message. `False` if the client has gone.
     fn send(&self, py: Python<'_>, data: &[u8]) -> PyResult<bool> {
         let b = Bytes::copy_from_slice(data);
         self.with_call(|call| py.detach(|| call.send(b)))
     }
 
-    /// 応答ヘッダに足す（最初の send より前だけ。後なら False）。
+    /// Add a response header (before the first `send`; otherwise `False`).
     fn add_header(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<bool> {
         let v = meta_value(value)?;
         self.with_call(|call| call.add_header(lower(name), v))
@@ -69,7 +72,7 @@ impl NativeGrpcCall {
         self.with_call(|call| call.add_trailer(lower(name), v))
     }
 
-    /// 要求メタデータ `[(name, value)]`（`-bin` の値は bytes、他は str）。
+    /// Request metadata as `[(name, value)]` (`-bin` values are `bytes`, the others `str`).
     fn metadata(&self, py: Python<'_>) -> PyResult<Vec<(String, Py<PyAny>)>> {
         self.with_call(|call| {
             call.metadata()
@@ -94,7 +97,7 @@ impl NativeGrpcCall {
         self.with_call(|call| call.method().to_string())
     }
 
-    /// 期限までの残り秒（期限なしは None）。
+    /// Seconds until the deadline, or `None` if there is none.
     fn time_remaining(&self) -> PyResult<Option<f64>> {
         self.with_call(|call| {
             call.deadline().map(|d| {
@@ -122,7 +125,7 @@ fn meta_value(v: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     Ok(Bytes::from(b))
 }
 
-/// Python のハンドラ（`handle(call) -> (code, message)`）で 1 回の呼び出しを処理する。
+/// Run one call through the Python handler (`handle(call) -> (code, message)`).
 pub fn run_grpc(handle: &Py<PyAny>, call: &mut GrpcCall) -> Status {
     Python::attach(|py| {
         let native = match Py::new(
@@ -151,10 +154,10 @@ pub fn run_grpc(handle: &Py<PyAny>, call: &mut GrpcCall) -> Status {
 
 // ===================== L4 =====================
 
-/// L4 の TCP 接続の送り口（asyncio の Transport と同じ名前のメソッド）。`write` はコールバックの中でだけ。
+/// Send side of an L4 TCP connection (asyncio-transport-like). `write` is valid only inside the protocol callbacks.
 #[pyclass(name = "NativeTransport", module = "veil._veil")]
 pub struct NativeTransport {
-    /// コールバックの間だけ指す `*mut L4Out`
+    // コールバックの間だけ指す `*mut L4Out`
     out: AtomicUsize,
     peer: SocketAddr,
     closing: std::sync::atomic::AtomicBool,
@@ -181,7 +184,7 @@ impl NativeTransport {
         self.with_out(|o| o.write(b))
     }
 
-    /// 送り終えたら閉じる。
+    /// Close after the pending data has been sent.
     fn close(&self) -> PyResult<()> {
         self.closing.store(true, Ordering::Release);
         let _ = self.with_out(|o| o.close());
@@ -193,7 +196,7 @@ impl NativeTransport {
         self.closing.load(Ordering::Acquire)
     }
 
-    /// `"peername"` は `(host, port)`。
+    /// `"peername"` gives `(host, port)`; other names give `default`.
     #[pyo3(signature = (name, default=None))]
     fn get_extra_info(
         &self,
@@ -215,7 +218,7 @@ impl NativeTransport {
     }
 }
 
-/// 1 つの TCP 接続の Python のプロトコル。
+/// The Python protocol object of one TCP connection.
 pub struct PySession {
     proto: Py<PyAny>,
     transport: Py<NativeTransport>,
@@ -236,7 +239,7 @@ impl PySession {
         }
     }
 
-    /// 接続（`factory()` でプロトコルを作り `connection_made(transport)`）。
+    /// Accept a connection: create the protocol with `factory()` and call `connection_made(transport)`.
     pub fn connect(
         factory: &Py<PyAny>,
         peer: SocketAddr,

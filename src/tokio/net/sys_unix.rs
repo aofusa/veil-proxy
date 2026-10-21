@@ -1,8 +1,9 @@
-//! `veil::tokio::net` の OS 依存の呼び出し（unix、libc。F-204 で `net.rs` から移しただけで挙動は同じ）。
+// F-204: `net.rs` から移しただけで挙動は同じ。
+//! OS-specific calls for `veil::tokio::net` (unix, libc).
 //!
-//! `mod.rs` の TCP・UDP は OS に依らない下の関数（`recv`・`send`・`connect`・`getopt` 等）だけを使い、
-//! Windows では `sys_windows.rs` が同じ名前で Winsock を呼ぶ。Unix ドメインソケット（`unix.rs`）は
-//! ここの libc の補助関数（`new_socket`・`sockaddr`・`with_std` 等）を直接使う。
+//! The TCP and UDP code in `mod.rs` uses only the OS-independent functions below (`recv`, `send`, `connect`,
+//! `getopt` and so on); on Windows, `sys_windows.rs` provides the same names on top of Winsock. The Unix
+//! domain socket code (`unix.rs`) uses the libc helpers here (`new_socket`, `sockaddr`, `with_std` and so on) directly.
 
 use super::Opt;
 use crate::tokio::io::ReadBuf;
@@ -10,9 +11,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-/// 所有するソケット。
+/// An owned socket.
 pub(crate) type Owned = OwnedFd;
-/// ランタイムの準備待ちに渡すソケットの番号。
+/// The socket number passed to the runtime's readiness wait.
 pub(crate) type Raw = RawFd;
 
 pub(crate) fn raw(o: &Owned) -> Raw {
@@ -139,7 +140,7 @@ pub(crate) fn sock_err(fd: RawFd) -> io::Result<Option<io::Error>> {
     Ok((err != 0).then(|| io::Error::from_raw_os_error(err)))
 }
 
-/// fd を std の型として借りる（アドレスの取得・ソケットオプション用。閉じない）。
+/// Borrows an fd as a std type (for address queries and socket options; it is not closed).
 pub(crate) fn with_std<T: FromRawFd + IntoRawFd, R>(fd: RawFd, f: impl FnOnce(&T) -> R) -> R {
     // SAFETY: 借りるだけで、終わったら into_raw_fd で手放す
     let s = std::mem::ManuallyDrop::new(unsafe { T::from_raw_fd(fd) });
@@ -227,7 +228,7 @@ pub(crate) fn accept_fd(fd: RawFd) -> io::Result<(OwnedFd, SocketAddr)> {
     Ok((owned, addr))
 }
 
-/// sockaddr_storage を SocketAddr にする。
+/// Converts a sockaddr_storage into a `SocketAddr`.
 pub(crate) fn from_sockaddr(ss: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match ss.ss_family as libc::c_int {
         libc::AF_INET => {
@@ -257,12 +258,12 @@ pub(crate) fn from_sockaddr(ss: &libc::sockaddr_storage) -> io::Result<SocketAdd
 
 // ===================== OS に依らない入口（mod.rs から使う） =====================
 
-/// std から取り込んだ・accept したソケットの準備（ノンブロッキング・close-on-exec・SIGPIPE 無し）。
+/// Prepares a socket adopted from std or accepted (non-blocking, close-on-exec, no SIGPIPE).
 pub(crate) fn prepare(fd: Raw) -> io::Result<()> {
     set_nonblocking_cloexec(fd)
 }
 
-/// TCP のソケットを作る。
+/// Creates a TCP socket.
 pub(crate) fn new_stream_socket(v6: bool) -> io::Result<Owned> {
     new_socket(
         if v6 { libc::AF_INET6 } else { libc::AF_INET },
@@ -274,7 +275,7 @@ pub(crate) fn recv_buf(fd: Raw, buf: &mut ReadBuf<'_>, peek: bool) -> io::Result
     sys_recv(fd, buf, if peek { libc::MSG_PEEK } else { 0 })
 }
 
-/// `dst` へ読む（未初期化でよい）。
+/// Receives into `dst` (which may be uninitialised).
 pub(crate) fn recv_into(fd: Raw, dst: *mut u8, len: usize) -> io::Result<usize> {
     cvt(unsafe { libc::recv(fd, dst.cast(), len, 0) })
 }
@@ -297,7 +298,7 @@ pub(crate) fn readv(fd: Raw, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usiz
     })
 }
 
-/// 非ブロッキングの connect を始める（進行中は `Ok`。結果は書き込み可能になってから `sock_err` で見る）。
+/// Starts a non-blocking connect (`Ok` while in progress; check the result with `sock_err` once it is writable).
 pub(crate) fn connect(fd: Raw, addr: &SocketAddr) -> io::Result<()> {
     let (ss, len) = sockaddr(addr);
     let r = unsafe { libc::connect(fd, &ss as *const _ as *const libc::sockaddr, len) };
@@ -323,7 +324,7 @@ pub(crate) fn accept(fd: Raw) -> io::Result<(Owned, SocketAddr)> {
     accept_fd(fd)
 }
 
-/// `recvfrom`（`dst` は未初期化でよい。`peek` は `MSG_PEEK`）。
+/// `recvfrom` (`dst` may be uninitialised; `peek` uses `MSG_PEEK`).
 pub(crate) fn recv_from_into(
     fd: Raw,
     dst: *mut u8,
@@ -378,7 +379,7 @@ pub(crate) fn set_linger(fd: Raw, dur: Option<std::time::Duration>) -> io::Resul
     set_linger_raw(fd, dur)
 }
 
-/// 今の状態（相手が閉じた・切れた・エラー）を待たずに見る（`(read_closed, hup, error)`）。
+/// Reads the current state (peer closed, hung up, error) without waiting, as `(read_closed, hup, error)`.
 pub(crate) fn closed_state(fd: Raw) -> (bool, bool, bool) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let rdhup = libc::POLLRDHUP;
@@ -400,5 +401,5 @@ pub(crate) fn closed_state(fd: Raw) -> (bool, bool, bool) {
     }
 }
 
-/// `shutdown` の後始末（unix はローカルの shutdown で待ちが起きるので何もしない）。
+/// Cleanup after `shutdown` (nothing to do on unix, because a local shutdown wakes the waiters).
 pub(crate) fn after_shutdown(_fd: Raw, _how: std::net::Shutdown) {}

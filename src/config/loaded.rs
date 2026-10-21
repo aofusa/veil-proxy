@@ -917,7 +917,7 @@ pub(super) fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
         Ok(c) => Some(Arc::from(c.as_path())),
         Err(e) => {
             warn!(
-                "File ルート {:?} の canonicalize に失敗（リクエスト時は生パスへフォールバック）: {}",
+                "file route {:?}: canonicalize failed; using the path as written at request time: {}",
                 path, e
             );
             None

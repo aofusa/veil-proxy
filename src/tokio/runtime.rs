@@ -1,10 +1,13 @@
-//! `tokio::runtime` 互換（F-198）。
+// F-198
+//! Compatible with `tokio::runtime`.
 //!
-//! - `Runtime::block_on` は呼んだスレッドで veil のランタイム（io_uring / reactor）を動かして Future を実行する。
-//!   同じスレッドで何度呼んでもよく、`spawn` したタスクはスレッドのエグゼキュータに残って次の `block_on` でも動く。
-//! - マルチスレッドのランタイムはワーカースレッド（それぞれ veil のランタイム）を持ち、ランタイムの外から
-//!   `Handle::spawn` されたタスクを受け口（`waker::Injector`）経由で順に割り振る。タスクはスレッド間を移動しない。
-//! - API ライブラリのワーカー（ハンドラ）の中では、そのワーカーのスレッドが現在のランタイムになる。
+//! - `Runtime::block_on` runs veil's runtime (io_uring or the reactor) on the calling thread and drives the
+//!   future. It may be called any number of times on the same thread; tasks spawned with `spawn` stay on the
+//!   thread's executor and keep running in the next `block_on`.
+//! - A multi-thread runtime owns worker threads (each with its own veil runtime) and assigns tasks spawned
+//!   with `Handle::spawn` from outside the runtime to them in turn through the entry point (`waker::Injector`).
+//!   Tasks do not move between threads.
+//! - Inside a worker of the API library (a handler), that worker's thread is the current runtime.
 
 use super::task::JoinHandle;
 use super::waker::{current_injector, Injector, Job};
@@ -20,7 +23,7 @@ enum Kind {
     MultiThread,
 }
 
-/// ランタイムの種類。
+/// The kind of runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeFlavor {
@@ -32,14 +35,14 @@ struct HandleInner {
     kind: Kind,
     name: Option<String>,
     id: u64,
-    /// `enable_time` / `enable_io`（無効ならタイマー・I/O を作ると panic する。tokio と同じ）
+    /// `enable_time` / `enable_io` (when disabled, creating a timer or I/O object panics, as in tokio).
     time_enabled: bool,
     io_enabled: bool,
-    /// `LocalRuntime`（`spawn_local` を受け付ける）
+    /// `LocalRuntime` (accepts `spawn_local`).
     local: bool,
-    /// ワーカー（マルチスレッド）または `block_on` しているスレッド（カレントスレッド）の受け口
+    /// Entry points of the workers (multi-thread) or of the thread running `block_on` (current thread).
     workers: Mutex<Vec<Arc<Injector>>>,
-    /// 受け口ができる前に送られたタスク
+    /// Tasks sent before an entry point existed.
     pending: Mutex<Vec<Job>>,
     next: AtomicUsize,
     shutdown: AtomicBool,
@@ -62,11 +65,12 @@ impl std::fmt::Debug for Handle {
 thread_local! {
     static CONTEXT: RefCell<Vec<Handle>> = const { RefCell::new(Vec::new()) };
     static IN_BLOCK_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// このスレッドのドライバをこのレイヤーが初期化した
+    /// This layer initialised the driver of this thread.
     static OWN_DRIVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// スレッドの終わりに残ったタスク（受け口の常駐タスク・spawn したタスク）を片付ける（B-118 と同じ理由）。
-    /// 最初の `block_on` の後に触れて登録する: スレッドローカルの破棄は登録の逆順なので、ランタイムの
-    /// スレッドローカル（実行キュー・op 表）より先にこれが走る。
+    // B-118 と同じ理由。
+    /// Cleans up the tasks left at thread exit (the resident entry-point task and spawned tasks). It is touched
+    /// and registered after the first `block_on`: thread-local destruction runs in reverse order of registration,
+    /// so this runs before the runtime's thread-locals (run queue, op table).
     static DRIVER_GUARD: DriverGuard = const { DriverGuard };
 }
 
@@ -80,7 +84,7 @@ impl Drop for DriverGuard {
     }
 }
 
-/// ランタイムの ID。
+/// The ID of a runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(u64);
 
@@ -90,7 +94,7 @@ impl std::fmt::Display for Id {
     }
 }
 
-/// 文脈の Handle が無い。
+/// There is no `Handle` in context.
 #[derive(Debug)]
 pub struct TryCurrentError {
     _p: (),
@@ -125,7 +129,7 @@ impl Handle {
         }
     }
 
-    /// 現在の Handle（ランタイムの文脈の外では panic）。
+    /// Returns the current `Handle`. Panics outside a runtime context.
     #[track_caller]
     pub fn current() -> Handle {
         match Handle::try_current() {
@@ -147,12 +151,12 @@ impl Handle {
         Err(TryCurrentError { _p: () })
     }
 
-    /// ランタイムの名前（`Builder::name`）。
+    /// The runtime's name (`Builder::name`).
     pub fn name(&self) -> Option<&str> {
         self.inner.name.as_deref()
     }
 
-    /// ランタイムの ID。
+    /// The runtime's ID.
     pub fn id(&self) -> Id {
         Id(self.inner.id)
     }
@@ -164,7 +168,7 @@ impl Handle {
         }
     }
 
-    /// 文脈に入る（ガードの間 `Handle::current`・`spawn` がこの Handle を使う）。
+    /// Enters the context; while the guard lives, `Handle::current` and `spawn` use this `Handle`.
     pub fn enter(&self) -> EnterGuard<'_> {
         CONTEXT.with(|c| c.borrow_mut().push(self.clone()));
         EnterGuard {
@@ -230,14 +234,14 @@ impl Handle {
         super::task::spawn_blocking(f)
     }
 
-    /// 呼んだスレッドで `future` を完了まで動かす（ランタイムのスレッドの中では panic）。
+    /// Runs `future` to completion on the calling thread. Panics when called from inside a runtime thread.
     #[track_caller]
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         run_block_on(self, future)
     }
 }
 
-/// `Handle::enter` / `Runtime::enter` のガード。
+/// Guard returned by `Handle::enter` / `Runtime::enter`.
 pub struct EnterGuard<'a> {
     _p: std::marker::PhantomData<&'a Handle>,
 }
@@ -250,7 +254,7 @@ impl Drop for EnterGuard<'_> {
     }
 }
 
-/// 文脈がカレントスレッドのランタイム（`block_in_place` 不可）か。
+/// Whether the context is a current-thread runtime (`block_in_place` is not allowed there).
 pub(crate) fn in_current_thread_runtime() -> bool {
     CONTEXT
         .try_with(|c| {
@@ -263,8 +267,8 @@ pub(crate) fn in_current_thread_runtime() -> bool {
         .unwrap_or(false)
 }
 
-/// `spawn_local` してよい文脈か（tokio のランタイムの文脈なら LocalRuntime だけ。文脈の無い veil の
-/// ワーカー（API ライブラリのハンドラ）は可）。
+/// Whether `spawn_local` is allowed in this context: in a tokio runtime context only a `LocalRuntime` allows it;
+/// a veil worker with no context (a handler of the API library) allows it.
 pub(crate) fn in_local_capable_context() -> bool {
     CONTEXT
         .try_with(|c| c.borrow().last().map(|h| h.inner.local))
@@ -273,7 +277,7 @@ pub(crate) fn in_local_capable_context() -> bool {
         .unwrap_or_else(crate::runtime::has_driver)
 }
 
-/// 文脈のランタイムでタイマーが使えるか（文脈が無い＝veil のワーカー等なら使える）。
+/// Whether timers can be used in the context's runtime (they can when there is no context, such as on a veil worker).
 pub(crate) fn time_enabled_in_context() -> bool {
     CONTEXT
         .try_with(|c| c.borrow().last().map(|h| h.inner.time_enabled))
@@ -282,7 +286,7 @@ pub(crate) fn time_enabled_in_context() -> bool {
         .unwrap_or(true)
 }
 
-/// 文脈のランタイムで I/O が使えるか（`net` が使う）。
+/// Whether I/O can be used in the context's runtime (used by `net`).
 pub(crate) fn io_enabled_in_context() -> bool {
     CONTEXT
         .try_with(|c| c.borrow().last().map(|h| h.inner.io_enabled))
@@ -291,7 +295,7 @@ pub(crate) fn io_enabled_in_context() -> bool {
         .unwrap_or(true)
 }
 
-/// このスレッドで veil のランタイムを使えるようにする（一度だけ初期化する）。
+/// Makes veil's runtime usable on this thread (initialised once).
 fn ensure_driver() {
     if crate::runtime::has_driver() {
         return;
@@ -398,7 +402,7 @@ impl std::fmt::Debug for Runtime {
 }
 
 impl Runtime {
-    /// マルチスレッドのランタイム（`Builder::new_multi_thread().enable_all().build()`）。
+    /// A multi-thread runtime, equivalent to `Builder::new_multi_thread().enable_all().build()`.
     pub fn new() -> std::io::Result<Runtime> {
         Builder::new_multi_thread().enable_all().build()
     }
@@ -463,7 +467,7 @@ impl Drop for Runtime {
     }
 }
 
-/// `tokio::runtime::LocalRuntime`（`Send` でないタスクも spawn できるカレントスレッドのランタイム）。
+/// Equivalent of `tokio::runtime::LocalRuntime`: a current-thread runtime that can also spawn tasks that are not `Send`.
 pub struct LocalRuntime {
     rt: Runtime,
     queue: RefCell<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>>,
@@ -475,7 +479,7 @@ impl std::fmt::Debug for LocalRuntime {
     }
 }
 
-/// `Builder::build_local` の設定（互換のため）。
+/// Settings for `Builder::build_local` (for compatibility).
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct LocalOptions {}
@@ -536,7 +540,7 @@ impl LocalRuntime {
     }
 }
 
-/// `tokio::runtime::Builder`。I/O・時計の有効化などの設定は受け付けるだけ（常に有効）。
+/// Equivalent of `tokio::runtime::Builder`. Settings such as enabling I/O or the clock are accepted but have no effect (both are always enabled).
 pub struct Builder {
     kind: Kind,
     worker_threads: Option<usize>,
@@ -556,7 +560,7 @@ impl std::fmt::Debug for Builder {
 macro_rules! accept {
     ($($name:ident($($a:ident: $t:ty),*)),* $(,)?) => {
         $(
-            #[doc = concat!("互換のため受け付ける（`", stringify!($name), "`）。")]
+            #[doc = concat!("Accepted for compatibility; `", stringify!($name), "` has no effect.")]
             pub fn $name(&mut self, $(_ : $t),*) -> &mut Self { $(let _ = stringify!($a);)* self }
         )*
     };
@@ -593,7 +597,7 @@ impl Builder {
         self
     }
 
-    /// ランタイムの名前（`Handle::name` で読める）。
+    /// The runtime's name (readable through `Handle::name`).
     pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
@@ -604,7 +608,8 @@ impl Builder {
         self
     }
 
-    /// 時計の停止（test-util）は未対応。`true` は `build` でエラーになる。
+    /// Starts the runtime with the clock paused (the test-util behaviour). Requires the time driver: `build`
+    /// panics when `enable_time` is not set.
     pub fn start_paused(&mut self, paused: bool) -> &mut Self {
         self.start_paused = paused;
         self
@@ -657,7 +662,7 @@ impl Builder {
         self
     }
 
-    /// `LocalRuntime` を作る（種類にかかわらずカレントスレッド）。
+    /// Builds a `LocalRuntime` (always on the current thread, regardless of the runtime kind).
     pub fn build_local(&mut self, _options: LocalOptions) -> std::io::Result<LocalRuntime> {
         self.kind = Kind::CurrentThread;
         let mut rt = self.build()?;

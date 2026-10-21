@@ -75,6 +75,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - rustls プロバイダ: OpenBSD/NetBSD = `ring`、それ以外 = `aws_lc_rs`（`src/tls_provider.rs` と Cargo.toml を一致させる）。
 - quiche（http3）: **Linux のみ** `aws-lc-sys` 共有（memfd 経路）、他 OS は `boringssl-boring-crate` + `boring = "4.3"`。
+  Linux の quiche は BoringSSL の FFI を aws-lc-sys の Rust のバインディング経由で呼ぶ（`veil-proxy-quiche` の `aws-lc-sys`
+  feature、`third_party/quiche/src/veil_ffi.rs`。接頭辞の有無を問わない。F-243）。利用者に `[env]` を要求しない。
   **Linux に `boring` を依存させない**（重複シンボル）。`AWS_LC_SYS_NO_PREFIX_<triple>` は
   [.cargo/config.toml](.cargo/config.toml) の `[env]` 1 箇所のみで設定する（Dockerfile 等で設定しない。B-47）。
 - HTTP/3: `quiche` は本番データプレーン専用、テスト・計測ツールは `quinn` + `h3`。
@@ -241,6 +243,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ## コーディング規約
 
 - 既存に合わせる（多くは日本語のコメント）。英語への統一リファクタはしない。
+- ただし利用者に見える文字列（ログ・エラー・panic・`expect` の文、rustdoc、Python の docstring）は英語で書き、
+  チケット番号を入れない（番号はすぐ上の `//`・`#` のコメントへ。`tools/lint/check-messages.py`・`tools/release/check-docs.sh`。F-241/F-242）。
 - `cargo fmt`、`cargo clippy`。`#[allow(clippy::…)]` を論拠なく増やさない。**`allow(dead_code)` は禁止**。
 - [clippy.toml](clippy.toml) の `disallowed-methods` がホットパスのブロッキングを検出する。正当な利用（offload 閉包内・
   専用スレッド・起動/リロード・テスト）は理由コメント付きの個別 `#[allow(clippy::disallowed_methods)]` で明示する。

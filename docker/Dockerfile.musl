@@ -139,9 +139,11 @@ COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
 # アプリケーションバイナリと設定アセット
 # /veil と（ビルドしていれば）/veil.epoll
 COPY --from=builder /app/out/ /
-COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
-COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
+# 既定の設定とページ（F-246）: 何もマウントしなくても `docker run -p 8080:8080 <image>` で /var/www を 8080 で配る。
+# 試験（tools/container_security）は docker/assets/conf.d/config.toml を -v で渡して使う。
+COPY --from=builder /app/packaging/container/config.toml /etc/veil/conf.d/config.toml
+COPY --from=builder /app/packaging/container/www/ /var/www/
 
-EXPOSE 80/tcp 443/tcp
+EXPOSE 8080/tcp 80/tcp 443/tcp 443/udp
 
 CMD ["/veil", "-c", "/etc/veil/conf.d/config.toml"]

@@ -319,7 +319,8 @@ pub(crate) fn hkdf_expand(
     Ok(())
 }
 
-extern "C" {
+// veil: aws-lc-sys feature ではバインディング経由の包みにする（src/veil_ffi.rs、F-243）
+veil_ffi! {
     fn EVP_aead_aes_128_gcm_tls13() -> *const EVP_AEAD;
 
     fn EVP_aead_aes_256_gcm_tls13() -> *const EVP_AEAD;

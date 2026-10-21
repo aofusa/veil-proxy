@@ -1,18 +1,21 @@
-//! OS ページ管理（F-183）。`mmap` / `munmap` / `madvise` / `mremap` と粗い単調時計だけを使う。
+// F-183: seccomp の許可リスト（security::ALLOWED_SYSCALLS）には mmap/munmap/madvise/mremap/
+// clock_gettime/sched_yield が元から含まれている（mimalloc と同じ syscall 集合）。
+//! OS page management.
 //!
-//! すべて libc を直接呼び、Rust のアロケーションを一切しない（アロケータ自身から呼ばれる）。
-//! seccomp の許可リスト（`security::ALLOWED_SYSCALLS`）には mmap/munmap/madvise/mremap/
-//! clock_gettime/sched_yield が元から含まれている（mimalloc と同じ syscall 集合）。
+//! Uses only `mmap` / `munmap` / `madvise` / `mremap` and a coarse monotonic clock.
+//! Everything calls libc directly and never performs a Rust allocation, because the allocator
+//! itself calls into this module.
 
 use core::ptr;
 
-/// purge（`madvise`）した領域を次に触ったときゼロで埋まっているか。
+/// Whether a purged (`madvise`) region reads as zeroes the next time it is touched.
 ///
-/// Linux の `MADV_DONTNEED` は匿名マッピングを即座に解放し、次のアクセスでゼロページを
-/// 割り当てる（RSS が即座に下がる）。BSD/macOS は `MADV_FREE`（遅延解放。内容は不定）。
+/// Linux `MADV_DONTNEED` releases an anonymous mapping immediately and hands out zero pages on
+/// the next access (RSS drops at once). BSD and macOS use `MADV_FREE` (lazy release; the
+/// contents are undefined).
 pub(crate) const PURGE_ZEROES: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
-/// 読み書き可能な匿名マッピングを作る。失敗時は null。
+/// Creates a readable and writable anonymous mapping. Returns null on failure.
 #[inline]
 pub(crate) fn map(size: usize) -> *mut u8 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -37,9 +40,9 @@ pub(crate) fn map(size: usize) -> *mut u8 {
     }
 }
 
-/// `align`（2 の冪、ページサイズ以上）境界に揃えたマッピングを作る。
+/// Creates a mapping aligned to `align` (a power of two, at least the page size).
 ///
-/// `size + align` をマップしてから前後の余りを `munmap` する。
+/// Maps `size + align` bytes and then `munmap`s the surplus before and after.
 pub(crate) fn map_aligned(size: usize, align: usize) -> *mut u8 {
     let Some(total) = size.checked_add(align) else {
         return ptr::null_mut();
@@ -61,7 +64,7 @@ pub(crate) fn map_aligned(size: usize, align: usize) -> *mut u8 {
     aligned as *mut u8
 }
 
-/// マッピングを解放する。
+/// Releases a mapping.
 #[inline]
 pub(crate) fn unmap(p: *mut u8, size: usize) {
     // SAFETY: 呼び出し側が自分でマップした範囲だけを渡す。
@@ -70,7 +73,7 @@ pub(crate) fn unmap(p: *mut u8, size: usize) {
     }
 }
 
-/// 範囲の物理ページを OS へ返す（仮想アドレスは保持する）。
+/// Returns the physical pages of a range to the OS (the virtual addresses are kept).
 #[inline]
 pub(crate) fn purge(p: *mut u8, size: usize) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -83,7 +86,7 @@ pub(crate) fn purge(p: *mut u8, size: usize) {
     }
 }
 
-/// huge 領域の伸縮（Linux の `mremap(MREMAP_MAYMOVE)`）。失敗時は null。
+/// Resizes a huge region (Linux `mremap(MREMAP_MAYMOVE)`). Returns null on failure.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[inline]
 pub(crate) fn remap(p: *mut u8, old: usize, new: usize) -> *mut u8 {
@@ -96,7 +99,7 @@ pub(crate) fn remap(p: *mut u8, old: usize, new: usize) -> *mut u8 {
     }
 }
 
-/// 粗い単調時計（ミリ秒、32bit で巡回）。遅いパスの purge 判定にだけ使う。
+/// A coarse monotonic clock (milliseconds, wrapping at 32 bits). Used only for purge decisions on the slow path.
 #[inline]
 pub(crate) fn now_ms() -> u32 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -118,13 +121,13 @@ pub(crate) fn now_ms() -> u32 {
         .wrapping_add(ts.tv_nsec as u64 / 1_000_000) as u32
 }
 
-/// `a` が `b` 以降か（巡回する 32bit ミリ秒の比較）。
+/// Whether `a` is at or after `b` (comparison of wrapping 32-bit milliseconds).
 #[inline]
 pub(crate) fn time_reached(now: u32, deadline: u32) -> bool {
     (now.wrapping_sub(deadline) as i32) >= 0
 }
 
-/// スピンロックの待ちで CPU を譲る。
+/// Yields the CPU while waiting on a spin lock.
 #[inline]
 pub(crate) fn yield_now() {
     // SAFETY: 引数なしの syscall。

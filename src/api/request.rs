@@ -1,14 +1,15 @@
-//! ハンドラに渡すリクエスト（F-188）。
+// F-188
+//! The request passed to handlers.
 //!
-//! ヘッダ・本文・パスは受信バッファ由来の `Bytes`（参照カウントのみ）で持ち、プロトコル
-//! （HTTP/1.1・HTTP/2・HTTP/3）に依存しない形でハンドラへ渡す。
+//! Headers, body and path are held as `Bytes` taken from the receive buffer (reference counting only) and are
+//! passed to the handler in a form independent of the protocol (HTTP/1.1, HTTP/2 or HTTP/3).
 
 use super::pattern::{percent_decode, PathParams};
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::net::IpAddr;
 
-/// リクエストを受けたプロトコル。
+/// The protocol on which the request was received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVersion {
     /// HTTP/1.1
@@ -20,7 +21,7 @@ pub enum HttpVersion {
 }
 
 impl HttpVersion {
-    /// `"HTTP/1.1"`・`"HTTP/2"`・`"HTTP/3"` のいずれか。
+    /// One of `"HTTP/1.1"`, `"HTTP/2"` or `"HTTP/3"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             HttpVersion::Http11 => "HTTP/1.1",
@@ -30,26 +31,28 @@ impl HttpVersion {
     }
 }
 
-/// ハンドラに渡すリクエスト。`clone()` は参照カウントの増分だけ（本文・ヘッダはコピーしない）。
+/// The request passed to a handler. `clone()` only increments reference counts (body and headers are not copied).
 #[derive(Debug, Clone)]
 pub struct Request {
     pub(crate) method: Bytes,
-    /// クエリを除いたパス。
+    /// The path without the query.
     pub(crate) path: Bytes,
-    /// `?` の後ろ（無ければ空）。
+    /// What follows `?` (empty if absent).
     pub(crate) query: Bytes,
-    /// 受信したままのヘッダ（要求ごとの `Arc` を作らない。`Headers` 抽出子が使われたときだけ包む。F-202）
+    // F-202: 要求ごとの `Arc` を作らない。`Headers` 抽出子が使われたときだけ包む。
+    /// The headers as received.
     pub(crate) headers: Vec<(Bytes, Bytes)>,
     pub(crate) body: Bytes,
     pub(crate) params: PathParams,
     pub(crate) client_ip: IpAddr,
     pub(crate) version: HttpVersion,
-    /// ストリーミング受信の本文（`streaming_request` のルートで HTTP/2 のとき。F-197）
+    // F-197
+    /// The body when received as a stream (for a `streaming_request` route over HTTP/2).
     pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
 }
 
 impl Request {
-    /// テスト・アダプタ（tower / C / Python）用の構築関数。`target` はクエリを含んでよい。
+    /// Constructor for tests and adapters (tower, C, Python). `target` may include the query.
     pub fn new(
         method: impl Into<Bytes>,
         target: impl Into<Bytes>,
@@ -71,39 +74,39 @@ impl Request {
         }
     }
 
-    /// パスパラメータを差し替えた複製（テスト用）。
+    /// A copy with the path parameters replaced (for tests).
     pub fn with_params(mut self, params: PathParams) -> Request {
         self.params = params;
         self
     }
 
-    /// 送信元 IP を差し替えた複製。
+    /// A copy with the client IP replaced.
     pub fn with_client_ip(mut self, ip: IpAddr) -> Request {
         self.client_ip = ip;
         self
     }
 
-    /// メソッド（`GET` 等）。
+    /// The method (such as `GET`).
     pub fn method(&self) -> &str {
         std::str::from_utf8(&self.method).unwrap_or("")
     }
 
-    /// クエリを除いたパス（パーセントエンコードのまま）。
+    /// The path without the query (still percent-encoded).
     pub fn path(&self) -> &str {
         std::str::from_utf8(&self.path).unwrap_or("/")
     }
 
-    /// クエリ文字列（`?` の後ろ。無ければ空文字）。
+    /// The query string (what follows `?`; empty if absent).
     pub fn query(&self) -> &str {
         std::str::from_utf8(&self.query).unwrap_or("")
     }
 
-    /// クエリパラメータ（最初に出現した値、`application/x-www-form-urlencoded` として復号）。
+    /// A query parameter (the first occurrence, decoded as `application/x-www-form-urlencoded`).
     pub fn query_param(&self, name: &str) -> Option<Cow<'_, str>> {
         form_lookup(&self.query, name)
     }
 
-    /// ヘッダ（大文字小文字を区別しない、最初の値）。
+    /// A header (case-insensitive; the first value).
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -111,15 +114,16 @@ impl Request {
             .and_then(|(_, v)| std::str::from_utf8(v).ok())
     }
 
-    /// 全ヘッダ（受信順、名前は受信したままの大文字小文字）。
+    /// All headers, in the order received, with names in the case received.
     pub fn headers(&self) -> &[(Bytes, Bytes)] {
         &self.headers
     }
 
-    /// 本文を届いた順の断片で受け取る（1 回だけ取れる。F-197）。
+    // F-197
+    /// Receives the body as chunks in arrival order (can be taken only once).
     ///
-    /// ストリーミング受信のルート（HTTP/2）では届いた DATA を順に返す。それ以外では全量の本文を
-    /// 1 断片（空なら 0 断片）として返す。
+    /// On a route with streaming reception (HTTP/2), the received DATA is returned in order. Otherwise the whole body
+    /// is returned as one chunk (zero chunks if it is empty).
     pub fn take_body_stream(&self) -> super::stream::RequestBodyStream {
         if let Some(slot) = &self.body_stream {
             if let Some(s) = slot.lock().unwrap().take() {
@@ -135,27 +139,27 @@ impl Request {
         s
     }
 
-    /// ストリーミング受信のルートか（本文が `take_body_stream` で届く）。
+    /// Whether this is a streaming-reception route (the body arrives through `take_body_stream`).
     pub fn is_body_streaming(&self) -> bool {
         self.body_stream.is_some()
     }
 
-    /// 本文。
+    /// The body.
     pub fn body(&self) -> &Bytes {
         &self.body
     }
 
-    /// 本文を UTF-8 として（不正なバイトは置換）。
+    /// The body as UTF-8 (invalid bytes are replaced).
     pub fn text(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body)
     }
 
-    /// 本文を JSON としてデシリアライズする。
+    /// Deserializes the body as JSON.
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
     }
 
-    /// パスパラメータ（`{name}`、パーセント復号済み）。
+    /// A path parameter (`{name}`, percent-decoded).
     pub fn param(&self, name: &str) -> Option<Cow<'_, str>> {
         self.params
             .iter()
@@ -163,33 +167,33 @@ impl Request {
             .map(|(_, v)| percent_decode(v))
     }
 
-    /// パスパラメータを `FromStr` で変換する。
+    /// Converts a path parameter with `FromStr`.
     pub fn param_as<T: std::str::FromStr>(&self, name: &str) -> Option<Result<T, T::Err>> {
         self.param(name).map(|v| v.parse::<T>())
     }
 
-    /// 全パスパラメータ（名前, 生の値）。
+    /// All path parameters (name, raw value).
     pub fn params(&self) -> &PathParams {
         &self.params
     }
 
-    /// 送信元 IP。
+    /// The client IP.
     pub fn client_ip(&self) -> IpAddr {
         self.client_ip
     }
 
-    /// 受信プロトコル。
+    /// The protocol of the request.
     pub fn version(&self) -> HttpVersion {
         self.version
     }
 
-    /// `App::state` で登録した共有状態。
+    /// Shared state registered with `App::state`.
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<T>> {
         super::app::state::<T>()
     }
 }
 
-/// `target`（パス + クエリ）を分割する（`Bytes` のスライスのみ）。
+/// Splits `target` (path plus query) into its two parts (only slices of `Bytes`).
 pub(crate) fn split_target(target: &Bytes) -> (Bytes, Bytes) {
     match target.iter().position(|&b| b == b'?') {
         Some(i) => (target.slice(..i), target.slice(i + 1..)),
@@ -197,7 +201,7 @@ pub(crate) fn split_target(target: &Bytes) -> (Bytes, Bytes) {
     }
 }
 
-/// `a=1&b=2` 形式から `name` の最初の値を探して復号する。
+/// Finds the first value of `name` in the `a=1&b=2` form and decodes it.
 pub(crate) fn form_lookup<'a>(data: &'a [u8], name: &str) -> Option<Cow<'a, str>> {
     for pair in data.split(|&b| b == b'&') {
         if pair.is_empty() {
@@ -214,7 +218,7 @@ pub(crate) fn form_lookup<'a>(data: &'a [u8], name: &str) -> Option<Cow<'a, str>
     None
 }
 
-/// `application/x-www-form-urlencoded` の 1 要素を復号する（`+` は空白）。
+/// Decodes one `application/x-www-form-urlencoded` element (`+` is a space).
 pub(crate) fn form_decode(input: &[u8]) -> Cow<'_, str> {
     if !input.contains(&b'+') {
         return percent_decode(input);

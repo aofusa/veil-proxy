@@ -1,12 +1,13 @@
-//! tokio 前提のライブラリをハンドラから使うための入口（F-190 / F-198）。
+// F-190, F-198
+//! Entry points for using tokio-based libraries from handlers.
 //!
-//! - `tokio-compat`（`api` の既定）: tokio 無し。`run` はハンドラのワーカーでそのまま Future を動かす
-//!   （中で `veil::tokio` / 置き換えた tokio の API が使える）。`spawn` は `veil::tokio::spawn`。
-//! - `tokio-compat-bridge`: 遅延起動する tokio マルチスレッドランタイム（ワーカー数は `[api] tokio_threads`、
-//!   既定 2）で `Send` な Future を実行し、完了を veil の `offload` と同じ「結果スロット + 通知 fd」で
-//!   ワーカースレッドへ返す（スレッド越しに Waker を呼ばない）。
+//! - `tokio-compat` (the default of `api`): no tokio. `run` drives the future directly on the handler's worker
+//!   (the `veil::tokio` or replaced tokio APIs are usable inside). `spawn` is `veil::tokio::spawn`.
+//! - `tokio-compat-bridge`: runs `Send` futures on a lazily started tokio multi-thread runtime (the number of
+//!   workers is `[api] tokio_threads`, default 2) and returns the completion to the worker thread through the
+//!   same result slot plus notification fd as veil's `offload` (no waker is called across threads).
 
-/// 互換ランタイムのタスクの panic。
+/// A panic in a task of the compatibility runtime.
 #[derive(Debug, Clone)]
 pub struct TokioTaskPanicked;
 
@@ -23,7 +24,7 @@ mod imp {
     use super::TokioTaskPanicked;
     use std::future::Future;
 
-    /// `fut` を（ハンドラのワーカーで）実行する。panic は `Err`。
+    /// Runs `fut` (on the handler's worker). A panic gives `Err`.
     pub async fn try_run<F>(fut: F) -> Result<F::Output, TokioTaskPanicked>
     where
         F: Future + Send + 'static,
@@ -34,7 +35,7 @@ mod imp {
             .map_err(|_| TokioTaskPanicked)
     }
 
-    /// `try_run` の panic を呼び出し側へ伝える版。
+    /// Like `try_run`, but propagates a panic to the caller.
     pub async fn run<F>(fut: F) -> F::Output
     where
         F: Future + Send + 'static,
@@ -43,7 +44,7 @@ mod imp {
         fut.await
     }
 
-    /// 投げっぱなしのタスクを起動する（`veil::tokio::spawn`）。
+    /// Starts a fire-and-forget task (`veil::tokio::spawn`).
     pub fn spawn<F>(fut: F) -> crate::tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -52,7 +53,7 @@ mod imp {
         crate::tokio::spawn(fut)
     }
 
-    /// 現在のランタイムのハンドル（ハンドラのワーカーのスレッド）。
+    /// The handle of the current runtime (the handler's worker thread).
     pub fn handle() -> crate::tokio::runtime::Handle {
         crate::tokio::runtime::Handle::current()
     }
@@ -67,7 +68,7 @@ mod imp {
 
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-    /// 互換用の tokio ランタイム（初回呼び出しで起動）。
+    /// The tokio runtime for compatibility (started on first call).
     pub fn runtime() -> &'static tokio::runtime::Runtime {
         RUNTIME.get_or_init(|| {
             let n = crate::api::app::TOKIO_THREADS
@@ -82,12 +83,12 @@ mod imp {
         })
     }
 
-    /// tokio ランタイムのハンドル（`tokio::spawn` 相当を自分で呼びたい場合）。
+    /// The handle of the tokio runtime (for when you want to call the equivalent of `tokio::spawn` yourself).
     pub fn handle() -> tokio::runtime::Handle {
         runtime().handle().clone()
     }
 
-    /// `fut` を tokio ランタイムで実行し、結果を（veil のイベントループをブロックせずに）待つ。
+    /// Runs `fut` on the tokio runtime and awaits the result without blocking veil's event loop.
     ///
     /// ```ignore
     /// let body = veil::api::tokio_compat::run(async move {
@@ -110,7 +111,7 @@ mod imp {
         .ok_or(TokioTaskPanicked)
     }
 
-    /// `try_run` の panic を呼び出し側へ伝える版（ハンドラ内の panic は 500 になる）。
+    /// Like `try_run`, but propagates a panic to the caller (a panic inside a handler becomes a 500).
     pub async fn run<F>(fut: F) -> F::Output
     where
         F: Future + Send + 'static,
@@ -122,7 +123,7 @@ mod imp {
         }
     }
 
-    /// tokio ランタイムで投げっぱなしのタスクを起動する。
+    /// Starts a fire-and-forget task on the tokio runtime.
     pub fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,

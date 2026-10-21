@@ -10,6 +10,7 @@
 | プラットフォーム・ランタイムバックエンド | [docs/guide/ja/platforms.md](platforms.md) |
 | ビルドとパッケージ | [docs/guide/ja/building.md](building.md) |
 | 起動・設定検証・リロード・停止 | [docs/guide/ja/running.md](running.md) |
+| コンテナイメージ（すぐ試す・自分の設定とファイル） | [docs/guide/ja/container.md](container.md) |
 | 設定リファレンス | [docs/guide/ja/configuration.md](configuration.md) |
 | TLS・kTLS・証明書リロード | [docs/guide/ja/tls.md](tls.md) |
 | ルーティング・リダイレクト・ヘッダー | [docs/guide/ja/routing.md](routing.md) |

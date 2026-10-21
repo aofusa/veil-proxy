@@ -93,7 +93,14 @@ for feature flags, packaging and BSD/macOS/Windows builds.
    curl -k https://localhost/static/index.html
    ```
 
-   Or run the container image (`latest` = musl; `glibc` is also published, for `linux/amd64` and `linux/arm64`):
+   Or run the container image (`latest` = musl; `glibc` is also published, for `linux/amd64` and `linux/arm64`).
+   With nothing mounted it serves a built-in page on port 8080:
+
+   ```bash
+   docker run --rm -p 8080:8080 ghcr.io/aofusa/veil      # open http://localhost:8080/
+   ```
+
+   With your own configuration, certificate and files ([Container guide](docs/guide/container.md)):
 
    ```bash
    docker run --rm -p 443:443 -p 443:443/udp \
@@ -116,8 +123,8 @@ veil = { package = "veil-proxy", version = "0.8", default-features = false, feat
 serde_json = "1"
 ```
 
-With HTTP/3 on Linux, also add `AWS_LC_SYS_NO_PREFIX_<target> = "1"` to `[env]` in `.cargo/config.toml`
-([library guide](docs/guide/library.md#cargotoml)). Python: `pip install veil-api` (`import veil`).
+No `.cargo/config.toml` settings are needed ([library guide](docs/guide/library.md#cargotoml)).
+Python: `pip install veil-api` (`import veil`).
 
 ```rust
 use veil::prelude::*;

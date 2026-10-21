@@ -96,7 +96,14 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
    curl -k https://localhost/static/index.html
    ```
 
-   コンテナイメージでも動かせる（`latest` は musl 版。glibc 版もある。`linux/amd64` と `linux/arm64`）:
+   コンテナイメージでも動かせる（`latest` は musl 版。glibc 版もある。`linux/amd64` と `linux/arm64`）。
+   何もマウントしなければ、内蔵のページを 8080 番で配る:
+
+   ```bash
+   docker run --rm -p 8080:8080 ghcr.io/aofusa/veil      # http://localhost:8080/ を開く
+   ```
+
+   自分の設定・証明書・ファイルを使う場合（[コンテナのガイド](../guide/ja/container.md)）:
 
    ```bash
    docker run --rm -p 443:443 -p 443:443/udp \
@@ -119,8 +126,8 @@ veil = { package = "veil-proxy", version = "0.8", default-features = false, feat
 serde_json = "1"
 ```
 
-Linux で HTTP/3 を使うときは `.cargo/config.toml` の `[env]` に `AWS_LC_SYS_NO_PREFIX_<ターゲット> = "1"` も要る
-（[ライブラリのガイド](../guide/ja/library.md#cargotoml)）。Python は `pip install veil-api`（`import veil`）。
+`.cargo/config.toml` の設定は要らない（[ライブラリのガイド](../guide/ja/library.md#cargotoml)）。
+Python は `pip install veil-api`（`import veil`）。
 
 ```rust
 use veil::prelude::*;

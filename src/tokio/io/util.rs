@@ -1,4 +1,4 @@
-//! `tokio::io` のユーティリティ（拡張トレイト・バッファ・分割・duplex・copy・標準入出力）。
+//! Utilities of `tokio::io`: extension traits, buffers, splitting, `duplex`, `copy` and standard I/O.
 
 use super::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf, Result, SeekFrom};
 use crate::tokio::waker::WakerSlot;
@@ -13,7 +13,7 @@ use std::task::{ready, Context, Poll};
 macro_rules! read_num {
     ($($name:ident, $t:ty, $from:ident;)*) => {
         $(
-            #[doc = concat!("`", stringify!($t), "` を読む。")]
+            #[doc = concat!("`", stringify!($t), "` from the stream.")]
             fn $name(&mut self) -> impl Future<Output = Result<$t>> + '_
             where
                 Self: Unpin,
@@ -149,7 +149,7 @@ pub trait AsyncReadExt: AsyncRead {
 
 impl<R: AsyncRead + ?Sized> AsyncReadExt for R {}
 
-/// `Buf` の中身を 1 回書く（書き手が vectored を使えるなら最大 64 断片をまとめる）。
+/// Writes the contents of a `Buf` once (if the writer supports vectored writes, it combines up to 64 chunks).
 fn poll_write_buf_once<W: AsyncWrite + ?Sized, B: bytes::Buf + ?Sized>(
     w: Pin<&mut W>,
     cx: &mut Context<'_>,
@@ -164,7 +164,7 @@ fn poll_write_buf_once<W: AsyncWrite + ?Sized, B: bytes::Buf + ?Sized>(
     }
 }
 
-/// 読んだバイト列を文字列に足す（tokio と同じ: 入出力のエラーでも、そこまでが UTF-8 なら足す）。
+/// Appends the bytes read to the string (as in tokio: even on an I/O error, the bytes read so far are appended if they are valid UTF-8).
 fn finish_string_read(r: Result<usize>, bytes: Vec<u8>, dst: &mut String) -> Result<usize> {
     match (r, String::from_utf8(bytes)) {
         (Ok(n), Ok(s)) => {
@@ -183,8 +183,8 @@ fn finish_string_read(r: Result<usize>, bytes: Vec<u8>, dst: &mut String) -> Res
     }
 }
 
-/// `read_to_end` の読み込み先（tokio の VecWithInitialized と同じく、確保済みで初期化済みの範囲を覚え、
-/// 初めの容量が埋まったら小さな読み込みで EOF を確かめてから伸ばす）。
+/// The destination of `read_to_end`. As in tokio's `VecWithInitialized`, it remembers the allocated and initialised
+/// range, and once the initial capacity is filled it checks for EOF with a small read before growing.
 struct VecInit<'a> {
     vec: &'a mut Vec<u8>,
     num_initialized: usize,
@@ -259,7 +259,7 @@ impl<'a> VecInit<'a> {
     }
 }
 
-/// `BufMut` へ読み込む（tokio-util の `poll_read_buf` と同じ）。
+/// Reads into a `BufMut` (same as `poll_read_buf` in tokio-util).
 pub(crate) fn poll_read_buf<R: AsyncRead + ?Sized, B: bytes::BufMut + ?Sized>(
     io: Pin<&mut R>,
     cx: &mut Context<'_>,
@@ -288,7 +288,7 @@ pub(crate) fn poll_read_buf<R: AsyncRead + ?Sized, B: bytes::BufMut + ?Sized>(
 macro_rules! write_num {
     ($($name:ident, $t:ty, $to:ident;)*) => {
         $(
-            #[doc = concat!("`", stringify!($t), "` を書く。")]
+            #[doc = concat!("`", stringify!($t), "` to the stream.")]
             fn $name(&mut self, n: $t) -> impl Future<Output = Result<()>> + '_
             where
                 Self: Unpin,
@@ -532,7 +532,7 @@ fn poll_read_until<R: AsyncBufRead + ?Sized>(
     }
 }
 
-/// `lines()` の行の列。
+/// The stream of lines returned by `lines()`.
 #[derive(Debug)]
 pub struct Lines<R> {
     reader: R,
@@ -584,7 +584,7 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
     }
 }
 
-/// `split(byte)` の断片の列。
+/// The stream of segments returned by `split(byte)`.
 #[derive(Debug)]
 pub struct Split<R> {
     reader: R,
@@ -652,7 +652,7 @@ impl<S: AsyncSeek + ?Sized> AsyncSeekExt for S {}
 
 // ===================== Chain / Take =====================
 
-/// `chain` の連結。
+/// The chained reader returned by `chain`.
 #[derive(Debug)]
 pub struct Chain<T, U> {
     first: T,
@@ -688,7 +688,7 @@ impl<T: AsyncRead + Unpin, U: AsyncRead + Unpin> AsyncRead for Chain<T, U> {
     }
 }
 
-/// `take` の制限付き読み。
+/// The limited reader returned by `take`.
 #[derive(Debug)]
 pub struct Take<R> {
     inner: R,
@@ -738,7 +738,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for Take<R> {
 
 // ===================== empty / sink / repeat =====================
 
-/// 常に EOF の読み手・何でも捨てる書き手。
+/// A reader that is always at EOF, and a writer that discards everything.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Empty(());
 
@@ -789,7 +789,7 @@ impl AsyncSeek for Empty {
     }
 }
 
-/// 何でも捨てる書き手。
+/// A writer that discards everything.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Sink(());
 
@@ -812,7 +812,7 @@ impl AsyncWrite for Sink {
     }
 }
 
-/// 同じバイトを無限に返す読み手。
+/// A reader that returns the same byte forever.
 #[derive(Debug, Clone, Copy)]
 pub struct Repeat(u8);
 
@@ -1244,7 +1244,7 @@ impl<W: AsyncWrite + AsyncBufRead> AsyncBufRead for BufWriter<W> {
     }
 }
 
-/// 読み書き両方をバッファする（`BufReader<BufWriter<RW>>`）。
+/// Buffers both reading and writing (`BufReader<BufWriter<RW>>`).
 #[derive(Debug)]
 pub struct BufStream<RW> {
     inner: BufReader<BufWriter<RW>>,
@@ -1389,7 +1389,7 @@ impl CopyBuffer {
     }
 }
 
-/// 読み手から EOF まで書き手へ写す（写したバイト数）。
+/// Copies from a reader to a writer until EOF. Returns the number of bytes copied.
 pub async fn copy<'a, R, W>(reader: &'a mut R, writer: &'a mut W) -> Result<u64>
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -1399,7 +1399,7 @@ where
     poll_fn(|cx| b.poll_copy(cx, Pin::new(&mut *reader), Pin::new(&mut *writer))).await
 }
 
-/// `AsyncBufRead` から写す。
+/// Copies from an `AsyncBufRead`.
 pub async fn copy_buf<'a, R, W>(reader: &'a mut R, writer: &'a mut W) -> Result<u64>
 where
     R: AsyncBufRead + Unpin + ?Sized,
@@ -1422,7 +1422,7 @@ where
     .await
 }
 
-/// 双方向に写す（片方の EOF で相手を shutdown し、両方終わるまで）。(a→b, b→a) のバイト数。
+/// Copies in both directions until both finish, shutting down the other side when one side reaches EOF. Returns the number of bytes copied as (a to b, b to a).
 pub async fn copy_bidirectional<A, B>(a: &mut A, b: &mut B) -> Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -1484,12 +1484,12 @@ struct SplitInner<T> {
     stream: Mutex<T>,
 }
 
-/// 読みの半分。
+/// The read half.
 pub struct ReadHalf<T> {
     inner: Arc<SplitInner<T>>,
 }
 
-/// 書きの半分。
+/// The write half.
 pub struct WriteHalf<T> {
     inner: Arc<SplitInner<T>>,
 }
@@ -1506,7 +1506,7 @@ impl<T> std::fmt::Debug for WriteHalf<T> {
     }
 }
 
-/// 読みと書きの半分に分ける（`unsplit` で戻す）。
+/// Splits into a read half and a write half (join them again with `unsplit`).
 pub fn split<T: AsyncRead + AsyncWrite>(stream: T) -> (ReadHalf<T>, WriteHalf<T>) {
     let inner = Arc::new(SplitInner {
         stream: Mutex::new(stream),
@@ -1589,7 +1589,7 @@ impl<T: AsyncWrite> AsyncWrite for WriteHalf<T> {
     }
 }
 
-/// 読み手と書き手を 1 つにまとめる。
+/// Combines a reader and a writer into one value.
 #[derive(Debug)]
 pub struct Join<R, W> {
     reader: R,
@@ -1747,7 +1747,7 @@ impl Pipe {
     }
 }
 
-/// メモリ上の双方向の流れ（`duplex`）の片端。
+/// One end of an in-memory bidirectional stream (see `duplex`).
 #[derive(Debug)]
 pub struct DuplexStream {
     read: Arc<Mutex<Pipe>>,
@@ -1762,7 +1762,7 @@ impl std::fmt::Debug for Pipe {
     }
 }
 
-/// 容量 `max_buf_size` の双方向の流れの両端。
+/// Creates both ends of a bidirectional stream with capacity `max_buf_size`.
 pub fn duplex(max_buf_size: usize) -> (DuplexStream, DuplexStream) {
     let one = Arc::new(Mutex::new(Pipe::new(max_buf_size)));
     let two = Arc::new(Mutex::new(Pipe::new(max_buf_size)));
@@ -1818,7 +1818,7 @@ impl Drop for DuplexStream {
     }
 }
 
-/// 片方向の流れ（`simplex`）。
+/// A one-directional stream (see `simplex`).
 #[derive(Debug)]
 pub struct SimplexStream {
     pipe: Pipe,
@@ -1867,11 +1867,11 @@ impl AsyncWrite for SimplexStream {
 
 // ===================== 標準入出力 =====================
 
-/// 標準出力（書き込みは小さな同期書き込み。大量の出力には向かない）。
+/// Standard output. Writes are small synchronous writes, so it is not suited to large amounts of output.
 #[derive(Debug)]
 pub struct Stdout(());
 
-/// 標準エラー出力。
+/// Standard error.
 #[derive(Debug)]
 pub struct Stderr(());
 
@@ -1906,7 +1906,7 @@ macro_rules! std_writer {
 std_writer!(Stdout, std::io::stdout());
 std_writer!(Stderr, std::io::stderr());
 
-/// 標準入力（専用スレッドで読む）。
+/// Standard input (read on a dedicated thread).
 #[derive(Debug)]
 pub struct Stdin {
     rx: crate::tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,

@@ -1,15 +1,17 @@
-//! ライブラリモードのルート注入・並べ替え・衝突検査（F-188）。
+// F-188
+//! Route injection, ordering and conflict checks in library mode.
 //!
-//! 登録済みハンドラ（マクロ・`App::route`・C・Python）を `type = "Handler"` の `[[route]]` として
-//! 設定へ注入し、TOML で書いたルートと合わせて **具体性の高い順** に安定ソートする（first-match の
-//! ルーティングで記述順を意識しなくてよいように）。条件が同一で到達不能になるルートは起動エラー。
+//! Registered handlers (macros, `App::route`, C and Python) are injected into the configuration as
+//! `[[route]]` entries of `type = "Handler"` and stably sorted together with the routes written in TOML,
+//! **most specific first**, so that the order of declaration does not matter under first-match routing.
+//! Routes with identical conditions, one of which would be unreachable, are a startup error.
 
 use super::handler::HandlerEntry;
 use super::pattern::PathPattern;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// ハンドラ 1 件を `[[route]]` テーブルにする。
+/// Turns one handler into a `[[route]]` table.
 pub(crate) fn handler_route_table(entry: &HandlerEntry) -> toml::Value {
     let mut cond = toml::Table::new();
     cond.insert(
@@ -40,8 +42,8 @@ pub(crate) fn handler_route_table(entry: &HandlerEntry) -> toml::Value {
     toml::Value::Table(route)
 }
 
-/// `route` 配列へハンドラのルートを注入する。TOML 側で既に同じハンドラ名を参照しているもの
-/// （利用者が条件やセキュリティ設定を明示したもの）は注入しない。
+/// Injects the handler routes into the `route` array. A handler already referenced by name from TOML
+/// (where the user specified conditions or security settings explicitly) is not injected.
 pub(crate) fn inject_handler_routes(
     root: &mut toml::Value,
     entries: &[Arc<HandlerEntry>],
@@ -74,23 +76,23 @@ pub(crate) fn inject_handler_routes(
     Ok(())
 }
 
-/// ルート 1 件の並べ替えキー（大きいほど先に評価する）。
+/// The sort key of one route (greater keys are evaluated first).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RouteRank {
-    /// 深さ（静的セグメント + パラメータの数）。深いものほど先（`/api` の前方一致が
-    /// `/api/{id}` を先取りしないように）。
+    /// Depth (the number of static segments plus parameters). Deeper routes come first, so that a prefix match on
+    /// `/api` does not take precedence over `/api/{id}`.
     depth: usize,
-    /// 静的セグメント数（同じ深さなら静的が多いほど具体的）
+    /// Number of static segments (at equal depth, more static segments is more specific).
     statics: usize,
-    /// 完全一致か（前方一致・ワイルドカード・キャッチオールでない）
+    /// Whether this is an exact match (not a prefix match, wildcard or catch-all).
     exact: bool,
-    /// メソッド条件があるか
+    /// Whether a method condition is present.
     has_method: bool,
-    /// その他の条件（host・header・query・source_ip）の数
+    /// Number of other conditions (host, header, query and source_ip).
     other_conditions: usize,
 }
 
-/// ルートの照合条件の正規形（衝突検査用）。
+/// The normalized form of a route's matching conditions (for conflict checks).
 #[derive(Debug, Clone, PartialEq)]
 struct RouteKey {
     host: Option<String>,
@@ -184,7 +186,7 @@ fn describe(route: &toml::Value) -> String {
     format!("conditions = {} / action = {}", cond.trim(), action.trim())
 }
 
-/// `route` 配列を具体性の高い順に安定ソートし、条件が同一のルートを検出する。
+/// Stably sorts the `route` array with the most specific first and detects routes with identical conditions.
 pub(crate) fn sort_and_check_routes(root: &mut toml::Value) -> Result<(), String> {
     let Some(routes) = root.get_mut("route").and_then(|r| r.as_array_mut()) else {
         return Ok(());

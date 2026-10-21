@@ -59,6 +59,7 @@ pub fn rand_u64_uniform(max: u64) -> u64 {
     r / chunk_size
 }
 
-extern "C" {
+// veil: aws-lc-sys feature ではバインディング経由の包みにする（src/veil_ffi.rs、F-243）
+veil_ffi! {
     fn RAND_bytes(buf: *mut u8, len: libc::size_t) -> libc::c_int;
 }

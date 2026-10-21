@@ -1,9 +1,11 @@
-//! 標準のヘルスチェックサービス `grpc.health.v1.Health`（F-197）。`App::grpc_health()` で登録する。
+// F-197
+//! The standard health-check service `grpc.health.v1.Health`, registered with `App::grpc_health()`.
 //!
-//! - `Check`: 登録済みのサービス名（空文字 = サーバ全体）の状態を返す。未登録は `NOT_FOUND`。
-//! - `Watch`: 現在の状態を送り、`set_serving_status` で変わるたびに送る。
+//! - `Check`: returns the status of a registered service name (the empty string means the whole server).
+//!   An unregistered name gives `NOT_FOUND`.
+//! - `Watch`: sends the current status, then again every time `set_serving_status` changes it.
 //!
-//! 状態はプロセス共有（どのワーカーで受けても同じ）。サーバ全体（`""`）は登録時に `SERVING`。
+//! The status is shared by the process (the same whichever worker receives the call). The whole server (`""`) is `SERVING` once registered.
 
 use super::{wire, Codec, Request, Response, Status};
 use crate::api::app::App;
@@ -22,7 +24,7 @@ pub struct HealthCheckRequest {
 /// `grpc.health.v1.HealthCheckResponse`
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HealthCheckResponse {
-    /// 1: `ServingStatus status`（列挙の数値）
+    /// Field 1: `ServingStatus status` (the numeric value of the enum).
     pub status: i32,
 }
 
@@ -30,17 +32,18 @@ pub struct HealthCheckResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i32)]
 pub enum ServingStatus {
-    /// 状態が不明。
+    /// The status is unknown.
     Unknown = 0,
-    /// リクエストを処理できる。
+    /// The service can handle requests.
     Serving = 1,
-    /// リクエストを処理できない。
+    /// The service cannot handle requests.
     NotServing = 2,
-    /// `Watch` だけが使う（未登録のサービス）
+    /// Used only by `Watch` (for an unregistered service).
     ServiceUnknown = 3,
 }
 
-/// ヘルスチェックの 2 メッセージの手書きの符号化（veil は protobuf の実装に依存しない。F-208）。
+// F-208: veil は protobuf の実装に依存しない。
+/// Hand-written encoding of the two health-check messages.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HealthCodec;
 
@@ -93,7 +96,7 @@ struct Entry {
 
 static REGISTRY: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
 
-/// サービスの状態を設定する（`Watch` 中のクライアントへ送る）。
+/// Sets the status of a service (sent to clients that are in `Watch`).
 pub fn set_serving_status(service: &str, status: ServingStatus) {
     let mut g = REGISTRY.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
@@ -105,7 +108,7 @@ pub fn set_serving_status(service: &str, status: ServingStatus) {
     e.watchers.retain(|w| w.unbounded_send(status).is_ok());
 }
 
-/// サービスの現在の状態（未登録なら `None`）。
+/// The current status of a service (`None` if it is not registered).
 pub fn serving_status(service: &str) -> Option<ServingStatus> {
     REGISTRY
         .lock()
@@ -139,7 +142,7 @@ fn watch(service: &str) -> mpsc::UnboundedReceiver<ServingStatus> {
 }
 
 impl App {
-    /// `grpc.health.v1.Health`（Check・Watch）を登録する。サーバ全体（`""`）は `SERVING`。
+    /// Registers `grpc.health.v1.Health` (`Check` and `Watch`). The whole server (`""`) is `SERVING`.
     pub fn grpc_health(self) -> App {
         if serving_status("").is_none() {
             set_serving_status("", ServingStatus::Serving);

@@ -282,7 +282,7 @@ impl HpackEncoder {
                 debug_assert_eq!(
                     buf.len() - before,
                     huffman_len,
-                    "huffman_encoded_len と huffman_encode_into の出力バイト数が不一致"
+                    "huffman_encoded_len and huffman_encode_into disagree on the output length"
                 );
                 return Ok(());
             }

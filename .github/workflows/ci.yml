@@ -32,6 +32,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # F-242: ログ・エラー・panic の文字列は英語で、チケット番号を入れない（テストとコメントは対象外）。
+  messages:
+    name: messages (English, no ticket IDs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/lint/test_check_messages.py
+      - run: python3 tools/lint/check-messages.py
+
   clippy:
     name: clippy (full)
     runs-on: ubuntu-latest
@@ -63,6 +72,9 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --doc --no-default-features --features full,api
+      # F-241: docs.rs に出る文書（と Python の文書）が英語だけで、チケット番号が無い
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: tools/release/check-docs.sh
 
   build:
     name: build (${{ matrix.features }})

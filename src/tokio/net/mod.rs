@@ -1,12 +1,14 @@
-//! `tokio::net` 互換（F-198。Windows は F-204）。
+// F-198（Windows は F-204）。
+//! Compatible with `tokio::net`.
 //!
-//! ノンブロッキングのソケットへ直接 `recv`/`send` し、`EAGAIN` のときだけ veil のランタイムの準備待ち
-//! （`runtime::tcp::wait_readable_fd` / `wait_writable_fd`。io_uring は POLL_ADD、reactor は poller 登録）で待つ。
-//! poll ベースの `AsyncRead`/`AsyncWrite` を veil の完了型 I/O の上に作るための橋で、データプレーンは通らない。
+//! Sockets are non-blocking, and `recv`/`send` are called on them directly. Only on `EAGAIN` does the task wait
+//! for readiness through veil's runtime (`runtime::tcp::wait_readable_fd` / `wait_writable_fd`: POLL_ADD on
+//! io_uring, poller registration on the reactor). This is a bridge that builds poll-based `AsyncRead` /
+//! `AsyncWrite` on top of veil's completion-style I/O; it is not part of the data plane.
 //!
-//! 準備待ちはそれを始めたスレッドのランタイムに属する。ソケットを別のスレッドで poll し直したら、前の待ちは
-//! 捨てずに手放す（`mem::forget`。他スレッドのランタイムの表に触れないため）。タスクはスレッド間を移動しないので
-//! 通常は起きない。
+//! A readiness wait belongs to the runtime of the thread that started it. If a socket is polled again on a
+//! different thread, the previous wait is leaked rather than dropped (`mem::forget`), so that no other
+//! thread's runtime tables are touched. Tasks do not move between threads, so this normally does not happen.
 
 use super::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready};
 use std::future::{poll_fn, Future};
@@ -38,7 +40,7 @@ pub use unix_impl::*;
 
 use sys::{sock_err, with_std};
 
-/// fd（unix）・SOCKET（Windows）の trait を tokio と同じく付ける。
+/// Implements the fd (unix) / SOCKET (Windows) traits, as tokio does.
 macro_rules! socket_traits {
     ($t:ty, |$s:ident| $owned:expr) => {
         #[cfg(unix)]
@@ -72,7 +74,7 @@ macro_rules! socket_traits {
     };
 }
 
-/// ソケットオプション（`sys::getopt` / `sys::setopt` が OS ごとの番号にする）。
+/// Socket options (`sys::getopt` / `sys::setopt` map them to the OS-specific numbers).
 #[derive(Clone, Copy)]
 pub(crate) enum Opt {
     ReuseAddr,
@@ -107,20 +109,20 @@ impl Wait {
 #[derive(Default)]
 struct WaitSlot {
     pending: Option<(ThreadId, Wait)>,
-    /// 同じ向きを待っている全員（準備できたら全員を起こす。tokio と同じ）
+    /// Everyone waiting in the same direction (all are woken when ready, as in tokio).
     waiters: Arc<WaitAll>,
 }
 
-/// 登録された Waker を全部起こす Waker。
+/// A waker that wakes every registered waker.
 #[derive(Default)]
 struct WaitAll {
     list: Mutex<Vec<std::task::Waker>>,
-    /// `poll_*_ready` の待ち手（tokio と同じく最後に poll した 1 つだけを覚える）
+    /// The waiter of `poll_*_ready` (as in tokio, only the last one that polled is remembered).
     last: Mutex<Option<std::task::Waker>>,
 }
 
 impl WaitAll {
-    /// `AsyncFd` の `poll_*_ready`（unix だけ）が使う。
+    /// Used by `poll_*_ready` of `AsyncFd` (unix only).
     #[cfg(unix)]
     fn set_last(&self, w: &std::task::Waker) {
         let old = self
@@ -170,12 +172,12 @@ impl WaitSlot {
 // SAFETY: 待ちの Future は fd と整数だけを持つ。触るのは作ったスレッドだけ（他スレッドでは forget する）
 unsafe impl Send for WaitSlot {}
 
-/// fd と、読み・書きの準備待ち。
+/// An fd together with its read and write readiness waits.
 pub(crate) struct IoSource {
     fd: sys::Owned,
     read: Mutex<WaitSlot>,
     write: Mutex<WaitSlot>,
-    /// 準備できたことを覚える（tokio と同じく、操作が `WouldBlock` を返すまで準備できたままとみなす）
+    /// Remembers that the fd became ready (as in tokio, it stays ready until an operation returns `WouldBlock`).
     read_ready: std::sync::atomic::AtomicBool,
     write_ready: std::sync::atomic::AtomicBool,
 }
@@ -186,7 +188,7 @@ impl std::fmt::Debug for IoSource {
     }
 }
 
-/// ソケットを作る・std から取り込むときの検査（tokio と同じく、ランタイムの外・I/O 無効なら panic）。
+/// Checks done when creating a socket or adopting one from std (as in tokio, panics outside a runtime or when I/O is disabled).
 #[track_caller]
 fn check_io_context() {
     if !crate::runtime::has_driver() && crate::tokio::runtime::Handle::try_current().is_err() {
@@ -222,7 +224,7 @@ impl IoSource {
         }
     }
 
-    /// 相手が閉じた・エラーの状態を `ready` に足す（tokio の `READ_CLOSED`・`WRITE_CLOSED`。poll(2) で今の状態を見る）。
+    /// Adds the peer-closed and error states to `ready` (tokio's `READ_CLOSED` and `WRITE_CLOSED`; the current state is read with poll(2)).
     fn with_closed(&self, mut ready: Ready) -> Ready {
         let (read_closed, hup, err) = sys::closed_state(self.raw());
         if read_closed && ready.is_readable() {
@@ -237,7 +239,7 @@ impl IoSource {
         ready
     }
 
-    /// 操作の結果を見て、`WouldBlock` なら準備の記憶を消す。
+    /// Inspects the result of an operation and clears the remembered readiness on `WouldBlock`.
     fn track<R>(&self, write: bool, r: io::Result<R>) -> io::Result<R> {
         if matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
             self.ready_flag(write)
@@ -246,8 +248,8 @@ impl IoSource {
         r
     }
 
-    /// `coop` は協調スケジューリングの予算を使うか（tokio と同じく `poll_*_ready` と読み書きは使い、
-    /// `readable()`・`writable()`・`ready()` は使わない）。
+    /// `coop` selects whether to consume cooperative scheduling budget (as in tokio, `poll_*_ready` and reads/writes
+    /// do, while `readable()`, `writable()` and `ready()` do not).
     fn poll_ready(&self, write: bool, coop: bool, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // tokio と同じく、ランタイムが止まった後の準備待ちはエラー
         if !crate::runtime::has_driver() {
@@ -313,7 +315,7 @@ impl IoSource {
         self.poll_ready(true, false, cx)
     }
 
-    /// 準備ができるまで `f` を繰り返す（`WouldBlock` なら準備待ち）。
+    /// Repeats `f` until the fd is ready (waits for readiness on `WouldBlock`).
     fn poll_io<R>(
         &self,
         write: bool,
@@ -335,8 +337,8 @@ impl IoSource {
 }
 
 impl IoSource {
-    /// fd を手放す前の後始末: 準備待ちを取り消し（io_uring の POLL_ADD が fd を握ったままにならないように）、
-    /// reactor の fd の記録を消す（同じ番号の fd が次に使われたとき、登録が ADD からやり直しになるように）。
+    /// Cleanup before giving up the fd: cancels the readiness wait (so that io_uring's POLL_ADD does not keep holding the fd)
+    /// and clears the reactor's record of the fd (so that a later fd with the same number is registered from ADD again).
     fn release(&mut self) {
         self.read.get_mut().unwrap().clear();
         self.write.get_mut().unwrap().clear();
@@ -459,7 +461,7 @@ impl<T: ToSocketAddrs + ?Sized + Sync> sealed::ToSocketAddrsPriv for &T {
 }
 impl<T: ToSocketAddrs + ?Sized + Sync> ToSocketAddrs for &T {}
 
-/// 名前を解決する（`tokio::net::lookup_host`）。
+/// Resolves a name (`tokio::net::lookup_host`).
 pub async fn lookup_host<T: ToSocketAddrs>(
     host: T,
 ) -> io::Result<impl Iterator<Item = SocketAddr>> {
@@ -475,7 +477,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// 順に接続を試す（最初に成功したもの）。
+    /// Tries each address in turn and returns the first connection that succeeds.
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
         let addrs = addr.to_addrs().await?;
         let mut last = None;
@@ -512,7 +514,7 @@ impl TcpStream {
         Ok(s)
     }
 
-    /// std の接続から作る（ノンブロッキングにする）。
+    /// Creates a stream from a std connection (and makes it non-blocking).
     #[track_caller]
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         check_io_context();
@@ -524,7 +526,7 @@ impl TcpStream {
         })
     }
 
-    /// std の接続に戻す（ブロッキングに戻す）。
+    /// Converts back into a std connection (and makes it blocking again).
     pub fn into_std(self) -> io::Result<std::net::TcpStream> {
         let io = Arc::try_unwrap(self.io)
             .map_err(|_| io::Error::other("TcpStream is still shared (split halves alive)"))?;
@@ -675,12 +677,12 @@ impl TcpStream {
         self.io.poll_io(false, cx, || sys::recv_buf(fd, buf, true))
     }
 
-    /// 借用の読み・書きの半分。
+    /// Splits into borrowed read and write halves.
     pub fn split(&mut self) -> (tcp::ReadHalf<'_>, tcp::WriteHalf<'_>) {
         (tcp::ReadHalf(self), tcp::WriteHalf(self))
     }
 
-    /// 所有の読み・書きの半分（`reunite` で戻す）。
+    /// Splits into owned read and write halves (join them again with `reunite`).
     pub fn into_split(self) -> (tcp::OwnedReadHalf, tcp::OwnedWriteHalf) {
         (
             tcp::OwnedReadHalf {
@@ -773,15 +775,15 @@ impl TryFrom<std::net::TcpStream> for TcpStream {
     }
 }
 
-/// `tokio::net::tcp`（分割した半分）。
+/// Equivalent of `tokio::net::tcp` (the split halves).
 pub mod tcp {
     use super::*;
 
-    /// 借用の読みの半分。
+    /// Borrowed read half.
     #[derive(Debug)]
     pub struct ReadHalf<'a>(pub(super) &'a TcpStream);
 
-    /// 借用の書きの半分。
+    /// Borrowed write half.
     #[derive(Debug)]
     pub struct WriteHalf<'a>(pub(super) &'a TcpStream);
 
@@ -832,20 +834,20 @@ pub mod tcp {
         }
     }
 
-    /// 所有の読みの半分。
+    /// Owned read half.
     #[derive(Debug)]
     pub struct OwnedReadHalf {
         pub(super) inner: TcpStream,
     }
 
-    /// 所有の書きの半分（drop で書き方向を閉じる）。
+    /// Owned write half (dropping it shuts down the write direction).
     #[derive(Debug)]
     pub struct OwnedWriteHalf {
         pub(super) inner: TcpStream,
         pub(super) shutdown_on_drop: bool,
     }
 
-    /// 対でない半分を `reunite` しようとした。
+    /// Tried to `reunite` halves that do not belong together.
     #[derive(Debug)]
     pub struct ReuniteError(pub OwnedReadHalf, pub OwnedWriteHalf);
 
@@ -965,7 +967,7 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// 待ち受ける（最初に bind できたアドレス）。
+    /// Binds and listens, using the first address that can be bound.
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         let addrs = addr.to_addrs().await?;
         let mut last = None;
@@ -1043,7 +1045,7 @@ impl TryFrom<std::net::TcpListener> for TcpListener {
 
 // ===================== TcpSocket =====================
 
-/// `tokio::net::TcpSocket`（bind・オプションを設定してから connect / listen する）。
+/// Equivalent of `tokio::net::TcpSocket`: set options and bind, then connect or listen.
 #[derive(Debug)]
 pub struct TcpSocket {
     fd: sys::Owned,
@@ -1106,7 +1108,7 @@ impl TcpSocket {
         self.flag(Opt::ReuseAddr)
     }
 
-    /// unix だけ（tokio と同じ）。
+    /// Unix only (as in tokio).
     #[cfg(unix)]
     pub fn set_reuseport(&self, v: bool) -> io::Result<()> {
         self.set_flag(Opt::ReusePort, v)
@@ -1576,8 +1578,9 @@ impl UdpSocket {
 
 socket_traits!(UdpSocket, |s| s.io.fd);
 
-/// `tokio::net::windows::named_pipe`（Windows の名前付きパイプ）。veil の tokio 互換レイヤーは名前付きパイプを
-/// 提供しない（開く関数は `Unsupported` を返す）。型は依存クレート（hyper-util 等）が名前で参照するので用意する。
+/// Equivalent of `tokio::net::windows::named_pipe` (Windows named pipes). veil's tokio-compatible layer does not
+/// provide named pipes (the functions that open them return `Unsupported`). The types exist because dependent crates
+/// (hyper-util and others) refer to them by name.
 #[cfg(windows)]
 pub mod windows {
     pub mod named_pipe {
@@ -1593,19 +1596,19 @@ pub mod windows {
             )
         }
 
-        /// 名前付きパイプのクライアント（作れない）。
+        /// Named pipe client (cannot be created).
         #[derive(Debug)]
         pub struct NamedPipeClient {
             _private: (),
         }
 
-        /// 名前付きパイプのサーバ（作れない）。
+        /// Named pipe server (cannot be created).
         #[derive(Debug)]
         pub struct NamedPipeServer {
             _private: (),
         }
 
-        /// パイプの種類。
+        /// Kind of pipe.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum PipeMode {
@@ -1613,7 +1616,7 @@ pub mod windows {
             Message,
         }
 
-        /// クライアントの設定（`open` は `Unsupported`。設定の関数は tokio と同じ形で、値は使わない）。
+        /// Client options (`open` returns `Unsupported`; the setters have the same shape as tokio's and their values are not used).
         #[derive(Debug, Clone, Default)]
         pub struct ClientOptions {
             _private: (),
@@ -1637,7 +1640,7 @@ pub mod windows {
             }
         }
 
-        /// サーバの設定（`create` は `Unsupported`。設定の関数は tokio と同じ形・同じ検査で、値は使わない）。
+        /// Server options (`create` returns `Unsupported`; the setters have the same shape and checks as tokio's and their values are not used).
         #[derive(Debug, Clone, Default)]
         pub struct ServerOptions {
             _private: (),
@@ -1662,7 +1665,7 @@ pub mod windows {
             pub fn reject_remote_clients(&mut self, _reject: bool) -> &mut Self {
                 self
             }
-            /// tokio と同じく 255 以上は panic（`PIPE_UNLIMITED_INSTANCES` と区別できないため）。
+            /// Panics for 255 or more, as in tokio (it cannot be told apart from `PIPE_UNLIMITED_INSTANCES`).
             #[track_caller]
             pub fn max_instances(&mut self, instances: usize) -> &mut Self {
                 assert!(instances < 255, "cannot specify more than 254 instances");

@@ -1,12 +1,13 @@
-//! ハンドラ経路のストリーミング本文とトレーラ（F-197）。gRPC 以外（大きな応答・SSE 等）にも使える。
+// F-197
+//! Streaming bodies and trailers on the handler path. Usable beyond gRPC (large responses, SSE and so on).
 //!
-//! - 応答: `Response::stream(..)` で本文を断片（`BodyChunk::Data`）で送り、最後に `BodyChunk::Trailers`
-//!   （HTTP/2・HTTP/3 のトレーラ、HTTP/1.1 は chunked のトレーラ）を送れる。`BodyChunk::Abort` は途中で
-//!   ストリームを中断する（HTTP/2 は RST_STREAM、HTTP/3 はストリームリセット、HTTP/1.1 は接続を閉じる）。
-//! - 要求: ストリーミング受信を有効にしたルート（`streaming_request`）では `Request::take_body_stream()`
-//!   で本文を届いた順に受け取れる（HTTP/2。HTTP/1.1・HTTP/3 では全量を 1 断片として渡す）。
+//! - Response: `Response::stream(..)` sends the body in chunks (`BodyChunk::Data`) and can finish with
+//!   `BodyChunk::Trailers` (trailers on HTTP/2 and HTTP/3; chunked trailers on HTTP/1.1). `BodyChunk::Abort`
+//!   aborts the stream midway (RST_STREAM on HTTP/2, a stream reset on HTTP/3, closing the connection on HTTP/1.1).
+//! - Request: on a route with streaming reception enabled (`streaming_request`), `Request::take_body_stream()`
+//!   yields the body in arrival order (HTTP/2; on HTTP/1.1 and HTTP/3 the whole body is passed as one chunk).
 //!
-//! 本文の流れはワーカースレッドの中で完結する（送り手・受け手とも同じスレッドの Future）。
+//! The body flow completes within a worker thread (both sender and receiver are futures on the same thread).
 
 use bytes::Bytes;
 use futures::Stream;
@@ -14,21 +15,21 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-/// 応答本文の 1 要素。
+/// One element of a response body.
 #[derive(Debug, Clone)]
 pub enum BodyChunk {
-    /// 本文の断片
+    /// A chunk of the body.
     Data(Bytes),
-    /// トレーラ（これでストリームを終える）
+    /// Trailers (these end the stream).
     Trailers(Vec<(Bytes, Bytes)>),
-    /// 途中で中断する（理由はログ用）
+    /// Aborts midway (the reason is for logging).
     Abort(String),
 }
 
-/// 応答本文のストリーム（`Send` を要求するのは、ブロッキングなハンドラが別スレッドで作ることがあるため）。
+/// A stream of the response body (`Send` is required because a blocking handler may build it on another thread).
 pub type BodyStream = Pin<Box<dyn Stream<Item = BodyChunk> + Send + 'static>>;
 
-/// 要求本文のストリーム（届いた順の断片）。
+/// A stream of the request body (chunks in arrival order).
 pub struct RequestBodyStream {
     pub(crate) rx: futures::channel::mpsc::Receiver<Bytes>,
 }
@@ -46,10 +47,10 @@ impl std::fmt::Debug for RequestBodyStream {
     }
 }
 
-/// `Request` が持つ受信本文ストリームの置き場（`Request` の複製で共有し、最初に取った者が使う）。
+/// The place where a `Request` keeps its receive-body stream (shared across clones of the `Request`; whoever takes it first uses it).
 pub(crate) type BodyStreamSlot = Arc<Mutex<Option<RequestBodyStream>>>;
 
-/// 送り手（プロトコル側）と、ハンドラへ渡す受け手を作る。容量は断片の個数。
+/// Creates a sender (on the protocol side) and the receiver handed to the handler. The capacity is a number of chunks.
 pub(crate) fn request_body_channel(
     capacity: usize,
 ) -> (futures::channel::mpsc::Sender<Bytes>, BodyStreamSlot) {
@@ -57,14 +58,15 @@ pub(crate) fn request_body_channel(
     (tx, Arc::new(Mutex::new(Some(RequestBodyStream { rx }))))
 }
 
-/// 送出側が 1 回にまとめる本文の上限（HTTP/2 の既定 DATA フレーム長に合わせる）。
+/// Upper limit of body data the sender combines into one send (matches the default HTTP/2 DATA frame size).
 pub(crate) const COALESCE_MAX: usize = 16 * 1024;
 
-/// 既に用意できている後続の `Data` を `max` バイトまで `first` に連結する（待たない）。
+/// Appends the already available following `Data` chunks to `first`, up to `max` bytes (without waiting).
 ///
-/// 小さな断片（gRPC の小さなメッセージ等）を 1 つずつ送るとフレーム数・syscall が断片の数だけ増え、
-/// クライアントが取り消した直後に届く大量のフレームを相手が攻撃と見なす（h2 の
-/// `max_local_error_reset_streams`）。連結できない要素（トレーラ・中断・上限を超える断片）は `carry` に返す。
+/// Sending small chunks (such as small gRPC messages) one by one multiplies the number of frames and syscalls by
+/// the number of chunks, and the peer treats the flood of frames arriving right after the client cancels as an
+/// attack (`max_local_error_reset_streams` in h2). Elements that cannot be combined (trailers, an abort, or a chunk
+/// exceeding the limit) are returned in `carry`.
 pub(crate) fn coalesce(
     first: Bytes,
     stream: &mut BodyStream,

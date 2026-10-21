@@ -1,5 +1,7 @@
-//! `tokio::sync` 互換（F-198）。ランタイムに依存しない同期プリミティブ。待っている Future の Waker は
-//! スレッドセーフに包んで持つ（`waker::WakerSlot`）ので、別スレッドから起こしても所有スレッドで再開する。
+// F-198
+//! Compatible with `tokio::sync`: runtime-independent synchronisation primitives. The wakers of waiting futures
+//! are stored wrapped to be thread-safe (`waker::WakerSlot`), so a wake-up from another thread still resumes the
+//! future on its owning thread.
 
 pub mod broadcast;
 pub mod mpsc;

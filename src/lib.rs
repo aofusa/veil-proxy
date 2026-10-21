@@ -50,22 +50,19 @@
 //! for example `#[global_allocator] static A: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;`
 //! (on unix with the `veil-alloc` feature) or mimalloc.
 //!
-//! # HTTP/3 on Linux
+//! # Build requirements
 //!
-//! quiche shares rustls' `aws-lc-sys`, which must be built without symbol prefixes. Cargo does not read veil's
-//! own `.cargo/config.toml` when veil is a dependency, so add this to your project's `.cargo/config.toml`
-//! (one line per target triple you build for):
-//!
-//! ```toml
-//! [env]
-//! AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
-//! ```
+//! Nothing beyond the `Cargo.toml` entry is needed: there is no `.cargo/config.toml` setting to add. On
+//! Linux, quiche (HTTP/3) and rustls share one copy of `aws-lc-sys`; building it needs a C compiler, CMake
+//! (for `libssl`) and libclang (for bindgen).
 //!
 //! # Guides
 //!
 //! See <https://github.com/aofusa/veil-proxy/tree/main/docs/guide> (start with `library.md`).
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// F-241: docs.rs にソースの表示を出さない（コメントは日本語のため。ソースは crates.io と GitHub で読める）。
+#![doc(html_no_source)]
 
 // ====================
 // メモリアロケータ選択
@@ -116,7 +113,7 @@ use tikv_jemallocator::Jemalloc;
 // 元から jemalloc なので、FreeBSD では `jemalloc` feature を使わせない。
 #[cfg(all(feature = "jemalloc", target_os = "freebsd"))]
 compile_error!(
-    "the `jemalloc` feature must not be used on FreeBSD (B-89): tikv-jemalloc overrides \
+    "the `jemalloc` feature must not be used on FreeBSD: tikv-jemalloc overrides \
      libthr's malloc hooks and corrupts the libc allocator; FreeBSD's malloc(3) already is jemalloc"
 );
 
@@ -137,7 +134,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[doc(hidden)]
 pub mod alloc_stats;
 
-/// F-183: アロケータのアイドル時回収（ワーカーのアイドル点から呼ぶ）。
+// F-183
+/// Idle-time reclamation of allocator memory (called from the workers' idle points).
 pub(crate) mod alloc_tune;
 
 #[cfg(all(feature = "alloc-stats", veil_alloc_active))]
@@ -279,10 +277,11 @@ pub mod l4;
 #[doc(hidden)]
 pub mod simple_tls;
 
-/// rustls 暗号文チャンクを `writev(2)`（Windows は `WSASend`）で直接カーネルへ渡す
-/// ゼロコピー送信ヘルパー（F-150）。`simple_tls`（`veil_ktls` 無効時）・
-/// `ktls_rustls`（`veil_ktls` 時の rustls フォールバック経路）の両方が使うため、
-/// `veil_ktls` の有無に関わらず常にコンパイルする。
+// F-150
+/// Zero-copy send helper that hands rustls ciphertext chunks directly to the kernel with
+/// `writev(2)` (`WSASend` on Windows). Both `simple_tls` (when `veil_ktls` is disabled) and
+/// `ktls_rustls` (the rustls fallback path when `veil_ktls` is enabled) use it, so it is
+/// always compiled regardless of `veil_ktls`.
 pub(crate) mod tls_writev;
 
 #[cfg(feature = "jwt")]
@@ -366,7 +365,8 @@ mod entry;
 pub use entry::run;
 pub use entry::{run_server, ServerOptions};
 
-/// API サーバ基盤ライブラリ（F-188〜F-192）。`handler` feature（`api` 等）のときだけ存在する。
+// F-188〜F-192
+/// The API server foundation library. Present only with the `handler` feature (for example through `api`).
 #[cfg(feature = "handler")]
 pub mod api;
 #[cfg(feature = "handler")]
