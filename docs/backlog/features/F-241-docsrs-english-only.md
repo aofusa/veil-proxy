@@ -1,10 +1,17 @@
-# F-241: docs.rs の文書を英語だけにし、チケット番号と経緯を出さない
+# F-241: docs.rs・PyPI の文書と Python の docstring を英語だけにし、チケット番号と経緯を出さない
 
-**状態: 設計（feat/v083-release、2026-10-21。v0.8.3 で公開）**
+**状態: 設計（feat/v083-release、2026-10-21。2026-10-21 に PyPI・Python の docstring を範囲に追加。v0.8.3 で公開）**
 
 ## 目的
 
-docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）に出る文書を次のようにする。
+利用者が読む API の文書を次のようにする。対象は 2 つ。
+
+- docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）
+- Python のパッケージ `veil-api`
+  - PyPI のプロジェクトのページ
+  - docstring（`help()`・IDE・Read the Docs の API の一覧に出るもの）
+
+どちらも次のようにする。
 
 - 英語だけで書く。
 - チケット番号（`F-123`・`B-45` など）を出さない。
@@ -36,6 +43,18 @@ docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）に出る文
 - `crates/README.crates-io.md`（crates.io のページ）は英語で、チケット番号も無い。ただし `.cargo/config.toml` の `[env]` の
   説明があるので、F-243 で書き直す。
 - `crates/veil-build/README.md` の 37 行目に `(F-208)` がある。
+
+### Python（`crates/veil-python/`）
+
+| 場所 | 利用者に見える場所 | 今 |
+|---|---|---|
+| `README.md` | PyPI のページ（pyproject の `readme = "README.md"`） | 全体が日本語（日本語を含む行 71、チケット番号 5） |
+| `python/veil/__init__.py`・`grpc.py` の docstring | `help()`・IDE・Read the Docs の API の一覧（sphinx-autoapi が `.py` を読む） | 91 個のうち 12 個が日本語、2 個にチケット番号 |
+| `src/lib.rs`・`ext.rs`・`native.rs` の `///`（PyO3 の `#[pyclass]`・`#[pyfunction]`・`#[pymethods]`） | 拡張モジュールの `__doc__`（`help(veil._veil.X)`） | 日本語を含む行 63 |
+| `python/veil/_veil.pyi` | IDE・Read the Docs の API の一覧 | 英語。チケット番号も無い |
+| `docs/*.md`（Read the Docs） | Read the Docs | 英語。日本語の版は `locale/ja` の gettext で作る（F-239 の方針） |
+
+- `docs/conf.py` のコメントは日本語だが、文書には出ない。
 
 ## 設計
 
@@ -71,6 +90,20 @@ docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）に出る文
 - 代わりに `//` のコメントもすべて英語にする案は、採らない。AGENTS.md の規約（日本語のコメント）と食い違ううえ、
   訳す量が 1 桁増えるため。
 
+### Python
+
+- `crates/veil-python/README.md`（PyPI のページ）を英語で書き直す。チケット番号と経緯を消し、今の使い方と注意だけにする。
+  - 中身は Read the Docs の入門（`docs/quickstart.md`）と重ならないようにする。README には「入れ方・最小の例・対応環境・
+    文書へのリンク」だけを書く。
+  - 日本語の説明は Read the Docs の日本語の版（`locale/ja`）に置く。README には日本語を書かない（PyPI は言語を切り替えられない）。
+- `python/veil/*.py` の docstring を英語にする。チケット番号は `#` のコメントへ移す（Rust の `//` と同じ扱い）。
+- PyO3 の `///` を英語にする。
+  - `#[pyclass]`・`#[pyfunction]`・`#[pymethods]` の項目は、Python から見える公開の API である。これらの doc は `__doc__` になる。
+  - 非公開の Rust の関数の `///` も、同じファイルの中で揃えるため英語にする（Rust の `src/api/` と同じ扱い）。
+- `_veil.pyi` は英語のままにする。PyO3 の `__doc__` と `.pyi` の docstring の内容を揃える。
+  - `help()` と IDE で説明が違わないようにする。
+  - 書く場所は `.pyi` を正にし、PyO3 の側は要約の 1 文と引数だけにする。
+
 ### 戻りを防ぐ検査
 
 - `tools/release/check-docs.sh` を足す。
@@ -86,6 +119,12 @@ docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）に出る文
      - CJK の文字（ひらがな・カタカナ・漢字）
      - チケット番号の形（`\b[FB]-[0-9]+\b`）
   3. veil-build の生成物は、`tests/api/` の gRPC の例で生成したコードの `cargo doc` を同じ条件で検査する。
+- Python の検査を、同じ台本に足す。
+  - `crates/veil-python/README.md`・`python/veil/*.py` の docstring（`ast` で取り出す）・`_veil.pyi`、
+    PyO3 の `///` が対象で、CJK とチケット番号の形を検査する。
+  - wheel をビルドした後に、`help()` で出る `__doc__` を全公開の型・関数について取り出して同じく検査する
+    （`release.yml` の wheel の試験のジョブ）。
+  - Read the Docs の英語の版は、Sphinx の `-W` のビルドの出力（HTML）を同じ規則で検査する。日本語の版（`-D language=ja`）は対象外。
 - CI（`ci.yml` の既存の `cargo doc` のジョブ）でこの台本を回す。nightly が要るので、そのジョブだけ nightly を入れる。
   - stable の `cargo doc`（`-D warnings`）は、そのまま残す。
   - nightly が要るのは `doc_cfg` のためである。
@@ -102,13 +141,15 @@ docs.rs（`veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`）に出る文
 - docs.rs にソースの表示が出ない。
 - `cargo test --doc --no-default-features --features full,api` が通る（訳したときに例を壊していない）。
 - `missing_docs` の警告が増えていない。
+- 0.8.3 の公開の後、次の 2 つが英語だけで、チケット番号が無い。
+  - PyPI の `https://pypi.org/project/veil-api/0.8.3/`
+  - 入れた wheel での `help(veil)`・`help(veil.App)` など、公開の全項目
+- `python -m mypy.stubtest veil` と Read the Docs のビルド（`-W`）が通る。
 
 ## 範囲外
 
-- **PyPI のページ（`crates/veil-python/README.md`）と Python の docstring。**
-  今も日本語で、チケット番号もある。PyPI と Read the Docs は docs.rs と同じ問題を持つが、依頼の範囲が docs.rs だけなので、
-  別のチケットにする。
 - `docs/guide/`（英日の両方がある）と、GitHub だけで読む README。
+- C の API（`crates/veil-capi/README.md`）。配布は zip で、パッケージのページが無い。
 
 ## 関連
 

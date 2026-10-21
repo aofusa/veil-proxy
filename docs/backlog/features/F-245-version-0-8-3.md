@@ -8,9 +8,9 @@ F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI�
 
 | チケット | 内容 | 利用者から見える変更 |
 |---|---|---|
-| [F-241](F-241-docsrs-english-only.md) | docs.rs を英語だけにし、チケット番号と経緯を出さない | docs.rs の文書 |
+| [F-241](F-241-docsrs-english-only.md) | docs.rs・PyPI の文書と Python の docstring を英語だけにし、チケット番号と経緯を出さない | docs.rs・PyPI のページ、`help()` |
 | [F-242](F-242-english-only-log-messages.md) | ログ・エラー・panic の文を英語だけにし、チケット番号を出さない | ログの文（キーと形式は不変） |
-| [F-243](F-243-library-without-cargo-config-env.md) | `.cargo/config.toml` の `[env]` 無しで Linux の `http3` を使える（無ければ quiche 同梱の BoringSSL） | 依存の書き方が `Cargo.toml` だけで済む |
+| [F-243](F-243-library-without-cargo-config-env.md) | `.cargo/config.toml` の `[env]` 無しで Linux の `http3` を使える（quiche の FFI を aws-lc-sys の Rust のバインディング経由にし、接頭辞の有無を問わない） | 依存の書き方が `Cargo.toml` だけで済む |
 | [F-244](F-244-library-default-access-log.md) | ライブラリの既定でアクセスログを stdout に出す | ライブラリの既定の設定 |
 
 ## 版
@@ -22,12 +22,13 @@ F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI�
 
 ## 順番
 
-1. F-242（ログ）と F-241（docs.rs）
+1. F-242（ログ）と F-241（docs.rs・PyPI・docstring）
    - 文字列と doc の変更だけなので先に入れる。検査の台本（`check-messages.py`・`check-docs.sh`）もここで CI に入れる。
 2. F-244（アクセスログ）
    - 既定の設定の変更と試験。API のベンチの設定を先に直し、条件を揃えてから既定を変える。
-3. F-243（BoringSSL の同梱）
-   - いちばん大きい。段階 0（外部のプロジェクトで両方式のリンクを確かめる）が通らなければ、方式から見直す。
+3. F-243（quiche の FFI を aws-lc-sys のバインディング経由に）
+   - いちばん大きい。段階 0（86 個の FFI がバインディングで足りること・veil のビルドの機械語が変わらないこと・外部のプロジェクトで
+     接頭辞付きにリンクされること）が通らなければ、方式から見直す。
    - crate の doc の「HTTP/3 on Linux」の節は、この変更で書き直す（F-241 の規則で）。
 4. `tools/release/bump-version.sh 0.8.3`。`main` へマージし、rc のタグ（`v0.8.3-rc.1`）で workflow を最後まで通す。
    - crates: dry-run。F-243 の `.crate` から `[env]` 無しでビルドする確認を含む。
@@ -42,9 +43,8 @@ F-241〜F-244 を 1 つのリリース（v0.8.3）として、crates.io・PyPI�
 - docs.rs の 0.8.3 の 3 つのページが英語だけで、チケット番号が無い（F-241 の受け入れ条件）。
 - **crates.io から入れる新しいプロジェクト**（`.cargo/config.toml` 無し）で、`veil-proxy = "0.8.3"`（`full`・`api`）がビルドでき、
   HTTP/3 に応答し、アクセスログが stdout に出る（F-243・F-244）。
-- PyPI の `veil-api` 0.8.3 の wheel で、アクセスログが既定で出る。
+- PyPI の `veil-api` 0.8.3 のページと wheel の `help()` が英語だけで、チケット番号が無い（F-241）。wheel でアクセスログが既定で出る（F-244）。
 - ghcr.io の `latest`・`musl`・`glibc` と `*-v0.8.3` の 2 つの系列が `veil 0.8.3` を返す。
-  - イメージは veil のリポジトリでのビルド（`[env]` あり）なので、BoringSSL を含まない。起動ログの `HTTP/3: TLS backend:` で確かめる。
 - `docs/artifacts/v0.8.3_release_note.md` を書く。
 
 ## 受け入れ条件

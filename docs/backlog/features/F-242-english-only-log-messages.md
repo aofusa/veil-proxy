@@ -39,7 +39,7 @@ veil が実行中に出す文字列を、英語だけにし、チケット番号
 
 - テストの中（`#[cfg(test)]`・`tests.rs`・`tests/`）の `assert!` などのメッセージには日本語が多い。これらは利用者には出ないので対象外にする。
 - Python（`crates/veil-python/python/`）と C（`crates/veil-capi/`）のメッセージには、日本語もチケット番号も無かった。
-  docstring は F-241 の範囲外の項に挙げた。
+  docstring は F-241 で英語にする。
 
 ## 設計
 
