@@ -1,0 +1,39 @@
+# F-246: ghcr.io のパッケージのページの説明を、公開済みの版に付け直す。
+#
+# release.yml は公開の最後に tools/release/ghcr-page.sh を回す。説明の文（packaging/container/description.txt）や
+# その台本を変えたときは、main への push でこの workflow が今の版（Cargo.toml の版のタグ）に付け直す。
+name: ghcr-page
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - packaging/container/description.txt
+      - tools/release/ghcr-page.sh
+      - .github/workflows/ghcr-page.yml
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/veil
+
+jobs:
+  annotate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: annotate the latest signature indexes
+        run: |
+          version="$(awk '/^\[workspace.package\]/{w=1;next} /^\[/{w=0} w && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' Cargo.toml)"
+          if ! docker buildx imagetools inspect "$IMAGE:musl-v$version" >/dev/null 2>&1; then
+            echo "v$version is not published yet; nothing to do"; exit 0
+          fi
+          tools/release/ghcr-page.sh "$IMAGE" "v$version"
