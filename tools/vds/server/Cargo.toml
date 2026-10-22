@@ -14,14 +14,16 @@ publish = false
 [workspace]
 
 [dependencies]
-tonic = { version = "0.12", features = ["tls"] }
-prost = "0.13"
+# 0.12 は保守終了の rustls-pemfile（RUSTSEC-2025-0134）に依存していたので 0.14 に上げた（B-158）
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tonic-prost = "0.14"
+prost = "0.14"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-axum = "0.7"
+axum = "0.8"
 serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"

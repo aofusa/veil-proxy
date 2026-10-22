@@ -37,6 +37,12 @@ crates.io の [`wasmtime` 36.0.19](https://crates.io/crates/wasmtime/36.0.19)（
 - `[lints.rust]` に `dead_code = "allow"` と `unused_variables = "allow"` を追加
   （no-signals ビルドで cfg により使われなくなる項目・引数の警告。36.0.17 で後者が増えた）。
 - `[[test]]`（crates.io 版の統合テスト宣言。`tests/` を取り込んでいないため）を削除。
+- `profiling`・`profile-pulley` の feature（perf の jitdump・VTune・Pulley のプロファイラ）と、それだけが使う任意の依存 `fxprof-processed-profile`・`ittapi` を
+  消した（36.0.19、B-158）。veil は使わず、`fxprof-processed-profile` が保守終了の `fxhash`（RUSTSEC-2025-0057）を
+  `Cargo.lock` に持ち込むため（このクレートはワークスペースの暗黙のメンバーなので、使わない任意の依存も `Cargo.lock` に
+  載る）。`src/` のその 2 つの `cfg(feature = ...)` は常に偽になるので、`[lints.rust.unexpected_cfgs]` の `check-cfg` に
+  `cfg(feature, values("profiling", "profile-pulley"))` を足した。本体（`Cargo.toml`）の依存は `default-features = false` で
+  `profiling` 以外の既定を並べている（crates.io の `wasmtime` も同じ）。
 - `[lints.rust]` の `unused-lifetimes` / `unused-macro-rules` をアンダースコア表記
   （`unused_lifetimes` / `unused_macro_rules`）へ変更。cargo 1.99 以降はハイフン表記を
   非推奨としてビルドのたびに manifest 警告を出すため（2026-10、Linux aarch64 VM の

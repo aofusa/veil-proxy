@@ -104,7 +104,6 @@ default = [
     "gc-drc",
     "gc-null",
     "wat",
-    "profiling",
     "parallel-compilation",
     "cranelift",
     "pooling-allocator",
@@ -151,20 +150,6 @@ parallel-compilation = [
 pooling-allocator = [
     "runtime",
     "std",
-]
-profile-pulley = [
-    "pulley",
-    "profiling",
-    "pulley-interpreter/profile",
-]
-profiling = [
-    "dep:fxprof-processed-profile",
-    "dep:ittapi",
-    "dep:rustix",
-    "rustix/thread",
-    "dep:serde_json",
-    "std",
-    "wasmtime-jit-debug/perf_jitdump",
 ]
 pulley = []
 reexport-wasmparser = []
@@ -262,10 +247,6 @@ version = "0.3.27"
 features = ["alloc"]
 optional = true
 default-features = false
-
-[dependencies.fxprof-processed-profile]
-version = "0.6.0"
-optional = true
 
 [dependencies.gimli]
 version = "0.32.0"
@@ -457,18 +438,6 @@ version = "=36.0.19"
 optional = true
 package = "wasmtime-internal-versioned-export-macros"
 
-[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies.ittapi]
-version = "0.4.0"
-optional = true
-
-[target.'cfg(all(target_arch = "x86_64", target_os = "macos"))'.dependencies.ittapi]
-version = "0.4.0"
-optional = true
-
-[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies.ittapi]
-version = "0.4.0"
-optional = true
-
 [target.'cfg(target_os = "linux")'.dependencies.memfd]
 version = "0.6.2"
 optional = true
@@ -544,4 +513,6 @@ check-cfg = [
     "cfg(pulley_tail_calls)",
     "cfg(pulley_assume_llvm_makes_tail_calls)",
     "cfg(pulley_disable_interp_simd)",
+    # veil: `profiling`・`profile-pulley` の feature を消した（B-158、README.veil.md）。src のその cfg は常に偽
+    'cfg(feature, values("profiling", "profile-pulley"))',
 ]
