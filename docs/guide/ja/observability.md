@@ -66,6 +66,20 @@ GET /__metrics
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |
 
+ラベルの値は決まった範囲に収めます。クライアントが自由な値を送っても、新しい系列は増えません（系列はメモリとスクレイプの
+応答に残り続けるため）。
+
+- `host` は、要求の Host が当たったルートの `host` 条件を、設定に書いたまま使います（`api.example.com`、1 段のサブドメイン
+  なら何でも当たる `*.example.com`）。どのルートの `host` 条件にも当たらない Host は `other` です。設定に `host` 条件が
+  無ければ、すべて `other` になります。
+- `method` は `GET`・`HEAD`・`POST`・`PUT`・`DELETE`・`CONNECT`・`OPTIONS`・`TRACE`・`PATCH` のどれか、ほかは `OTHER` です。
+- gRPC の `method` は要求のパス（`/package.Service/Method`）です。次の場合は `other` になります。
+  - 上流が `UNIMPLEMENTED`（12）を返した。
+  - パスがこの形でない。
+  - 種類が 1024 を超えた。
+
+  `status_code` は `0`〜`16`、ほかは `other` です。
+
 ### ランタイム有効/無効切り替え
 
 再起動不要でメトリクスを動的にオン/オフできます。無効時は `/__metrics` が `404 Not Found` を返し、全記録関数がno-opになります。

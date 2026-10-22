@@ -57,6 +57,195 @@ use prometheus::{
     TextEncoder,
 };
 
+// ====================
+// ラベルの値を有限にする（B-158）
+// ====================
+//
+// クライアントが決められる値（Host ヘッダ・メソッド・gRPC のパス）をそのままラベルにすると、でたらめな値を
+// 送るだけで系列が際限なく増える（系列は消えないので、プロセスのメモリと /__metrics の応答が増え続ける。
+// 実測で Host 5000 種類で応答 10.8MB・RSS +35MB）。host は設定のルートの host 条件（パターンそのもの。
+// `*.example.com` に当たった Host は `*.example.com`）だけ、メソッドは標準のものだけ、gRPC のメソッドは
+// 上流が UNIMPLEMENTED 以外を返したものを上限つきでラベルにし、ほかは `other` にまとめる。
+
+/// どの値にも当たらないもののラベル
+pub(crate) const OTHER_LABEL: &str = "other";
+
+/// gRPC のメソッドのラベルの種類の上限（超えた分は `other`）
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+const MAX_GRPC_METHOD_LABELS: usize = 1024;
+
+/// 設定のルートの host 条件から作る host ラベルの表（設定のロード・リロードで作り直す）
+#[cfg(feature = "metrics")]
+#[derive(Default)]
+pub(crate) struct HostLabels {
+    /// 完全一致（小文字）→ ラベル
+    exact: std::collections::HashMap<Box<str>, std::sync::Arc<str>>,
+    /// `*.example.com` → (`example.com`, ラベル `*.example.com`)
+    suffix: Vec<(Box<str>, std::sync::Arc<str>)>,
+    /// `api.*` → (`api`, ラベル `api.*`)
+    prefix: Vec<(Box<str>, std::sync::Arc<str>)>,
+}
+
+#[cfg(feature = "metrics")]
+impl HostLabels {
+    /// ルートの host 条件から作る（分類は `routing::HostRouter::add_route` と同じ）
+    pub(crate) fn from_routes(routes: &[crate::config::Route]) -> Self {
+        let mut t = Self::default();
+        for route in routes {
+            let Some(pattern) = route.conditions.host.as_deref() else {
+                continue;
+            };
+            let lower = pattern.to_ascii_lowercase();
+            if let Some(suffix) = lower.strip_prefix("*.") {
+                if !t.suffix.iter().any(|(s, _)| &**s == suffix) {
+                    t.suffix.push((suffix.into(), lower.as_str().into()));
+                }
+            } else if let Some(prefix) = lower.strip_suffix(".*") {
+                if !t.prefix.iter().any(|(p, _)| &**p == prefix) {
+                    t.prefix.push((prefix.into(), lower.as_str().into()));
+                }
+            } else {
+                let label: std::sync::Arc<str> = lower.as_str().into();
+                t.exact.entry(lower.into_boxed_str()).or_insert(label);
+            }
+        }
+        t
+    }
+
+    /// 要求の Host（ポート付きでもよい）に当たるラベル。当たらなければ None（ホットパス: アロケーションしない）
+    pub(crate) fn lookup(&self, host: &str) -> Option<&std::sync::Arc<str>> {
+        // ポートを外す（`routing::HostRouter::get_candidates` と同じく最初の ':' まで）
+        let host = host.split(':').next().unwrap_or(host);
+        // DNS 名は 253 文字まで。それより長いものはどの条件にも当たらない
+        let mut buf = [0u8; 253];
+        let lower = buf.get_mut(..host.len())?;
+        lower.copy_from_slice(host.as_bytes());
+        lower.make_ascii_lowercase();
+        // ASCII の小文字化は UTF-8 の妥当性を変えない
+        let lower = std::str::from_utf8(lower).ok()?;
+        if let Some(l) = self.exact.get(lower) {
+            return Some(l);
+        }
+        // `routing::HostRouter` と同じく localhost と 127.0.0.1 は同じものとして扱う
+        let alt = match lower {
+            "localhost" => Some("127.0.0.1"),
+            "127.0.0.1" => Some("localhost"),
+            _ => None,
+        };
+        if let Some(l) = alt.and_then(|a| self.exact.get(a)) {
+            return Some(l);
+        }
+        for (suffix, l) in &self.suffix {
+            if let Some(sub) = lower
+                .strip_suffix(&**suffix)
+                .and_then(|s| s.strip_suffix('.'))
+            {
+                if !sub.contains('.') {
+                    return Some(l);
+                }
+            }
+        }
+        for (prefix, l) in &self.prefix {
+            if lower
+                .strip_prefix(&**prefix)
+                .is_some_and(|rest| rest.starts_with('.'))
+            {
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    /// 要求の Host のラベル（当たらなければ `other`）
+    pub(crate) fn label<'a>(&'a self, host: &str) -> &'a str {
+        self.lookup(host).map(|l| &**l).unwrap_or(OTHER_LABEL)
+    }
+}
+
+#[cfg(feature = "metrics")]
+static HOST_LABELS: Lazy<arc_swap::ArcSwap<HostLabels>> =
+    Lazy::new(|| arc_swap::ArcSwap::from_pointee(HostLabels::default()));
+
+#[cfg(feature = "metrics")]
+static OTHER_LABEL_ARC: Lazy<std::sync::Arc<str>> = Lazy::new(|| OTHER_LABEL.into());
+
+/// 設定のルートの host 条件を host ラベルの表に反映する（設定のロード・リロードで呼ぶ）
+pub(crate) fn set_host_labels(_routes: &[crate::config::Route]) {
+    #[cfg(feature = "metrics")]
+    HOST_LABELS.store(std::sync::Arc::new(HostLabels::from_routes(_routes)));
+}
+
+/// HTTP のメソッドのラベル（RFC 9110 §9 と PATCH 以外は `OTHER`）
+#[cfg(feature = "metrics")]
+fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "CONNECT" => "CONNECT",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "PATCH" => "PATCH",
+        _ => "OTHER",
+    }
+}
+
+/// gRPC の状態コードのラベル（0〜16 以外は `other`。値は上流が決める）
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+fn grpc_status_label(code: &str) -> &str {
+    match code.parse::<u8>() {
+        Ok(0..=16) => code,
+        _ => OTHER_LABEL,
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+static GRPC_METHOD_LABELS: Lazy<std::sync::RwLock<std::collections::HashSet<Box<str>>>> =
+    Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// gRPC のメソッド（`/package.Service/Method`）のラベルで `f` を呼ぶ。
+///
+/// UNIMPLEMENTED（12）は上流に無いメソッドなので、パスがでたらめでも返る。これはラベルにしない。
+/// 残りも形が `/<service>/<method>` でないもの・上限（[`MAX_GRPC_METHOD_LABELS`]）を超えた新しいものは `other`。
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+fn with_grpc_method_label(path: &str, status: &str, f: impl FnOnce(&str)) {
+    let well_formed = path.len() <= 256
+        && path
+            .strip_prefix('/')
+            .and_then(|p| p.split_once('/'))
+            .is_some_and(|(svc, m)| {
+                !svc.is_empty()
+                    && !m.is_empty()
+                    && !m.contains('/')
+                    && path.bytes().all(|b| b.is_ascii_graphic())
+            });
+    if status == "12" || !well_formed {
+        return f(OTHER_LABEL);
+    }
+    {
+        let known = GRPC_METHOD_LABELS.read().unwrap_or_else(|e| e.into_inner());
+        if known.contains(path) {
+            return f(path);
+        }
+        if known.len() >= MAX_GRPC_METHOD_LABELS {
+            return f(OTHER_LABEL);
+        }
+    }
+    let mut known = GRPC_METHOD_LABELS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if known.contains(path) || known.len() < MAX_GRPC_METHOD_LABELS {
+        known.insert(path.into());
+        drop(known);
+        f(path)
+    } else {
+        drop(known);
+        f(OTHER_LABEL)
+    }
+}
+
 #[cfg(feature = "metrics")]
 /// Prometheusメトリクスレジストリ（グローバル）
 pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -146,7 +335,7 @@ pub(crate) static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
 /// アクティブ接続メトリクスの自動管理（Dropトレイトで自動デクリメント）
 pub(crate) struct ActiveConnectionMetric {
     #[cfg(feature = "metrics")]
-    host_name: Option<String>,
+    host_name: Option<std::sync::Arc<str>>,
     #[cfg(feature = "metrics")]
     enabled: bool,
 }
@@ -164,8 +353,14 @@ impl ActiveConnectionMetric {
     pub(crate) fn set_host(&mut self, _host: &str) {
         #[cfg(feature = "metrics")]
         if self.enabled && self.host_name.is_none() {
-            self.host_name = Some(_host.to_string());
-            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[_host]).inc();
+            // ラベルは設定の host 条件か `other`（B-158）。表の Arc を持つので接続ごとの確保はしない
+            let label = HOST_LABELS
+                .load()
+                .lookup(_host)
+                .cloned()
+                .unwrap_or_else(|| OTHER_LABEL_ARC.clone());
+            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&*label]).inc();
+            self.host_name = Some(label);
         }
     }
 }
@@ -175,7 +370,7 @@ impl Drop for ActiveConnectionMetric {
         #[cfg(feature = "metrics")]
         if self.enabled {
             if let Some(ref host) = self.host_name {
-                HTTP_ACTIVE_CONNECTIONS.with_label_values(&[host]).dec();
+                HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&**host]).dec();
             }
         }
     }
@@ -658,14 +853,22 @@ pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: b
 #[inline]
 pub(crate) fn record_cache_hit(_host: &str) {
     #[cfg(feature = "metrics")]
-    CACHE_HITS_TOTAL.with_label_values(&[_host]).inc();
+    if metrics_runtime_enabled() {
+        CACHE_HITS_TOTAL
+            .with_label_values(&[HOST_LABELS.load().label(_host)])
+            .inc();
+    }
 }
 
 /// メトリクス: キャッシュミスを記録
 #[inline]
 pub(crate) fn record_cache_miss(_host: &str) {
     #[cfg(feature = "metrics")]
-    CACHE_MISSES_TOTAL.with_label_values(&[_host]).inc();
+    if metrics_runtime_enabled() {
+        CACHE_MISSES_TOTAL
+            .with_label_values(&[HOST_LABELS.load().label(_host)])
+            .inc();
+    }
 }
 
 /// メトリクス: キャッシュ保存を記録
@@ -674,9 +877,11 @@ pub(crate) fn record_cache_miss(_host: &str) {
 #[cfg(feature = "cache")]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
-    CACHE_STORES_TOTAL
-        .with_label_values(&[_host, _storage])
-        .inc();
+    if metrics_runtime_enabled() {
+        CACHE_STORES_TOTAL
+            .with_label_values(&[HOST_LABELS.load().label(_host), _storage])
+            .inc();
+    }
 }
 
 /// メトリクス: キャッシュ削除を記録
@@ -710,7 +915,11 @@ pub(crate) fn update_cache_size_metrics(_stats: &crate::cache::CacheStats) {
 #[inline]
 pub(crate) fn record_buffering_used(_host: &str) {
     #[cfg(feature = "metrics")]
-    BUFFERING_USED_TOTAL.with_label_values(&[_host]).inc();
+    if metrics_runtime_enabled() {
+        BUFFERING_USED_TOTAL
+            .with_label_values(&[HOST_LABELS.load().label(_host)])
+            .inc();
+    }
 }
 
 // ====================
@@ -922,9 +1131,12 @@ pub(crate) static GRPC_STREAM_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|
 pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
     #[cfg(all(feature = "metrics", feature = "grpc"))]
     if metrics_runtime_enabled() {
-        GRPC_REQUESTS_TOTAL
-            .with_label_values(&[_method, _status_code, _upstream])
-            .inc();
+        let status = grpc_status_label(_status_code);
+        with_grpc_method_label(_method, status, |method| {
+            GRPC_REQUESTS_TOTAL
+                .with_label_values(&[method, status, _upstream])
+                .inc();
+        });
     }
 }
 
@@ -933,9 +1145,12 @@ pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
 pub fn observe_grpc_stream_duration(_method: &str, _duration_secs: f64) {
     #[cfg(all(feature = "metrics", feature = "grpc"))]
     if metrics_runtime_enabled() {
-        GRPC_STREAM_DURATION_SECONDS
-            .with_label_values(&[_method])
-            .observe(_duration_secs);
+        // 状態コードを知らない経路なので、UNIMPLEMENTED の除外は効かない（形と上限だけで絞る）
+        with_grpc_method_label(_method, "", |method| {
+            GRPC_STREAM_DURATION_SECONDS
+                .with_label_values(&[method])
+                .observe(_duration_secs);
+        });
     }
 }
 
@@ -1217,12 +1432,17 @@ pub(crate) fn record_request_metrics(
         let mut status_buf = itoa::Buffer::new();
         let status_str = status_buf.format(_status);
 
+        // ラベルの値を有限にする（B-158）
+        let labels = HOST_LABELS.load();
+        let host = labels.label(_host);
+        let method = method_label(_method);
+
         HTTP_REQUESTS_TOTAL
-            .with_label_values(&[_method, status_str, _host])
+            .with_label_values(&[method, status_str, host])
             .inc();
 
         HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[_method, _host])
+            .with_label_values(&[method, host])
             .observe(_duration_secs);
 
         HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
@@ -1328,6 +1548,71 @@ mod tests {
             http3_streams_closed_n(3);
         }
         set_metrics_runtime_enabled(true);
+    }
+
+    /// B-158: host のラベルは設定の host 条件（パターン）か `other` だけ。でたらめな Host で系列が増えない
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn host_labels_are_bounded_by_config() {
+        let routes: Vec<crate::config::Route> = ["Example.COM", "*.svc.example", "api.*"]
+            .iter()
+            .map(|h| {
+                toml::from_str(&format!(
+                    "[conditions]\nhost = \"{h}\"\n[action]\ntype = \"File\"\npath = \"/x\"\n"
+                ))
+                .unwrap()
+            })
+            .collect();
+        let t = HostLabels::from_routes(&routes);
+        assert_eq!(t.label("example.com"), "example.com");
+        assert_eq!(t.label("EXAMPLE.com:8443"), "example.com");
+        assert_eq!(t.label("a.svc.example"), "*.svc.example");
+        assert_eq!(t.label("random123.svc.example"), "*.svc.example");
+        assert_eq!(t.label("a.b.svc.example"), OTHER_LABEL);
+        assert_eq!(t.label("api.internal"), "api.*");
+        assert_eq!(t.label("attacker-chosen.invalid"), OTHER_LABEL);
+        assert_eq!(t.label(""), OTHER_LABEL);
+        assert_eq!(t.label(&"a".repeat(300)), OTHER_LABEL);
+        assert_eq!(t.label("ｅｘａｍｐｌｅ.com"), OTHER_LABEL);
+        // host 条件の無い設定では全部 `other`
+        assert_eq!(HostLabels::default().label("example.com"), OTHER_LABEL);
+    }
+
+    /// B-158: 標準以外のメソッドは `OTHER`
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn method_labels_are_bounded() {
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("PATCH"), "PATCH");
+        assert_eq!(method_label("get"), "OTHER");
+        assert_eq!(method_label("XYZZY"), "OTHER");
+    }
+
+    /// B-158: gRPC のメソッドは UNIMPLEMENTED・形の崩れたもの・上限を超えたものを `other` にする
+    #[test]
+    #[cfg(all(feature = "metrics", feature = "grpc"))]
+    fn grpc_method_labels_are_bounded() {
+        let _guard = metrics_test_lock();
+        let got = |path: &str, status: &str| {
+            let mut out = String::new();
+            with_grpc_method_label(path, status, |m| out = m.to_string());
+            out
+        };
+        assert_eq!(got("/pkg.Svc/Method", "0"), "/pkg.Svc/Method");
+        assert_eq!(got("/pkg.Svc/Nope", "12"), OTHER_LABEL);
+        assert_eq!(got("/no-method", "0"), OTHER_LABEL);
+        assert_eq!(got("/a/b/c", "0"), OTHER_LABEL);
+        assert_eq!(got("/pkg.Svc/with space", "0"), OTHER_LABEL);
+        assert_eq!(grpc_status_label("5"), "5");
+        assert_eq!(grpc_status_label("17"), OTHER_LABEL);
+        assert_eq!(grpc_status_label("x"), OTHER_LABEL);
+        for i in 0..(MAX_GRPC_METHOD_LABELS + 10) {
+            let _ = got(&format!("/flood.Svc/M{i}"), "0");
+        }
+        assert!(GRPC_METHOD_LABELS.read().unwrap().len() <= MAX_GRPC_METHOD_LABELS);
+        assert_eq!(got("/flood.Svc/Late", "0"), OTHER_LABEL);
+        // 既に入っているものは上限に達した後もそのまま
+        assert_eq!(got("/pkg.Svc/Method", "0"), "/pkg.Svc/Method");
     }
 
     /// F-99: HTTP/3 接続ガードが Drop で dec し、ストリーム open/close が対称であること

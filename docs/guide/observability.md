@@ -66,6 +66,17 @@ Use the `path` option to change the endpoint path.
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
 
+Label values are kept to a fixed set, so a client cannot create new time series by sending arbitrary values
+(each series stays in memory and in every scrape):
+
+- `host` is the `host` condition of the route the request's Host matched, written as in the configuration
+  (`api.example.com`, or `*.example.com` for any single-label subdomain). A Host that matches no route `host`
+  condition is `other`. With no `host` conditions in the configuration, every request is `other`.
+- `method` is one of `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE` and `PATCH`, or `OTHER`.
+- For gRPC, `method` is the request path (`/package.Service/Method`). It is `other` when the upstream answers
+  `UNIMPLEMENTED` (12), when the path is not of that form, or after 1024 distinct methods. `status_code` is
+  `0` to `16`, or `other`.
+
 ### Runtime Enable/Disable
 
 Prometheus metrics can be toggled at runtime without restarting:
