@@ -154,7 +154,7 @@ build_binary_glibc_docker() {
     # 「最終イメージの OCI Architecture」だけ。
     #
     # glibc は **build には付けない**。ランタイムの
-    # `FROM --platform=${RUNTIME_PLATFORM} distroless` で最終イメージが arm64 になるため
+    # `FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic` で最終イメージが arm64 になるため
     # 不要であり、付けるとビルダーの cargo-zigbuild まで arm64 として解決されて
     # **rustc が QEMU 上で動き極端に遅くなる**（実測で数時間規模になった）。
     # 一方 `docker create` は「できた arm64 イメージ」から作るので --platform が要る。

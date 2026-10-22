@@ -232,7 +232,7 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 | | `docker build --platform` | 理由 |
 |---|---|---|
-| glibc | **付けない** | ランタイムが `FROM --platform=${RUNTIME_PLATFORM} distroless` なので Dockerfile 内だけで最終イメージが arm64 になる |
+| glibc | **付けない** | ランタイムが `FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic` なので Dockerfile 内だけで最終イメージが arm64 になる |
 | musl | **付ける** | ランタイムが `FROM scratch`（空・アーキ非依存）で、Dockerfile 内だけでは OCI Architecture を確定できない |
 
 > **glibc に `--platform linux/arm64` を付けてはならない。** ビルダーの

@@ -50,11 +50,29 @@ jobs:
         run: tools/release/verify-tag.sh "$TAG" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
+  # 依存の勧告（B-158）: 既知の脆弱性・保守終了・unsound・yanked の依存があれば何も公開しない
+  # ---------------------------------------------------------------------------
+  advisories:
+    name: dependency advisories
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+      - name: cargo audit (every Cargo.lock, warnings are errors)
+        run: tools/container_security/security/run_cargo_audit.sh
+      - name: cargo deny (advisories, licenses)
+        env:
+          SKIP_CARGO_DENY: "0"
+        run: tools/container_security/security/run_cargo_deny.sh
+
+  # ---------------------------------------------------------------------------
   # コンテナイメージ（F-237）
   # ---------------------------------------------------------------------------
   image:
     name: image ${{ matrix.variant }}/${{ matrix.arch }}
-    needs: verify
+    needs: [verify, advisories]
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     permissions:
@@ -145,12 +163,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: smoke test (io_uring denied / default seccomp, HTTP/1.1・2・3)
+        id: smoke
         run: |
           digest="$(cat "digests/${{ matrix.variant }}-${{ matrix.arch }}")"
+          echo "ref=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
           docker pull "$IMAGE@$digest"
           tools/release/image-smoke.sh "$IMAGE@$digest" container
           # F-246: 設定を渡さずに起動して、内蔵のページを 8080 で返す
           tools/release/image-smoke.sh "$IMAGE@$digest" defaults
+      # B-158: 公開する前にイメージの脆弱性を照合する。High 以上があれば、直す版の無いものでも公開しない
+      - name: vulnerability scan (grype, High and above, including unfixed)
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ steps.smoke.outputs.ref }}
+          severity-cutoff: high
+          only-fixed: false
+          output-format: table
 
   image-publish:
     name: image publish
@@ -197,7 +225,7 @@ jobs:
   # ---------------------------------------------------------------------------
   crates:
     name: crates.io
-    needs: verify
+    needs: [verify, advisories]
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     environment: crates-io
@@ -232,7 +260,7 @@ jobs:
   # ---------------------------------------------------------------------------
   wheels:
     name: wheel ${{ matrix.name }}
-    needs: verify
+    needs: [verify, advisories]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -311,7 +339,7 @@ jobs:
 
   sdist:
     name: sdist
-    needs: verify
+    needs: [verify, advisories]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

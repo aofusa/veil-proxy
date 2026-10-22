@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# glibc 2.28 向けビルド + distroless/base-nossl ランタイム
+# glibc 2.28 向けビルド + Wolfi（Chainguard の glibc-dynamic）ランタイム
 
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
@@ -113,9 +113,14 @@ RUN find src -name '*.rs' -exec touch {} + \
 
 
 # ==========================================
-# 4. 最終実行用ランタイム（distroless/base-nossl）
+# 4. 最終実行用ランタイム（Chainguard の glibc-dynamic）
 # ==========================================
-FROM gcr.io/distroless/base-nossl-debian13 AS runtime
+# B-158: 以前の distroless/base-nossl-debian13 は Debian の libc6 に、Debian が直さない（won't fix）High の脆弱性が
+# 残っていた。Wolfi の glibc は上流の修正を取り込んで更新されるので、glibc 版はこちらにする（grype で High 以上 0 件）。
+# 中身は distroless と同じ最小構成（glibc・libgcc・CA 証明書・/etc/passwd の nonroot=65532）で、シェルは無い。
+# 既定のユーザーは nonroot（65532）だが、distroless（root で起動し、設定の drop_privileges で降格する）と
+# 同じ振る舞いにするため root で起動する。作業ディレクトリも CMD の `./veil` のために / に固定する。
+FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
 
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28
@@ -131,6 +136,9 @@ COPY --from=builder /app/out/ /
 # 試験（tools/container_security）は docker/assets/conf.d/config.toml を -v で渡して使う。
 COPY --from=builder /app/packaging/container/config.toml /etc/veil/conf.d/config.toml
 COPY --from=builder /app/packaging/container/www/ /var/www/
+
+USER 0:0
+WORKDIR /
 
 EXPOSE 8080/tcp 80/tcp 443/tcp 443/udp
 

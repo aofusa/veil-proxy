@@ -5,11 +5,12 @@ veil is published as a multi-arch (amd64, arm64) container image at **`ghcr.io/a
 | Tag | Contents |
 |-----|----------|
 | `latest`, `musl`, `musl-vX.Y.Z` | static musl binary on `scratch` |
-| `glibc`, `glibc-vX.Y.Z` | glibc binary on distroless |
+| `glibc`, `glibc-vX.Y.Z` | glibc binary on Wolfi ([Chainguard `glibc-dynamic`](https://images.chainguard.dev/directory/image/glibc-dynamic/overview); distroless up to v0.8.3) |
 
 Both run under Docker's default seccomp profile and Kubernetes `RuntimeDefault`: the binary is the
 `full-container` build (epoll readiness reactor; see [Building](building.md)). Versioned tags are never
-overwritten.
+overwritten. Every image is scanned with grype before it is published, and a release is not published
+if any image has a High or Critical vulnerability, including ones that have no fixed version yet.
 
 ## Try it
 

@@ -76,6 +76,7 @@ run_trivy_scan() {
     log "Trivy イメージスキャン: ${VEIL_IMAGE}"
 
     docker pull aquasec/trivy:latest >/dev/null 2>&1 || true
+    # B-158: 直す版の無い脆弱性も数える（以前は --ignore-unfixed で、distroless の libc6 の won't fix を見逃していた）
     docker save "${VEIL_IMAGE}" -o "${image_tar}"
 
     if docker run --rm \
@@ -87,7 +88,6 @@ run_trivy_scan() {
         --scanners vuln \
         --timeout 10m \
         --severity "${TRIVY_SEVERITY}" \
-        --ignore-unfixed \
         --exit-code 0 \
         2>&1 | tee "${report}"; then
         log "Trivy スキャン完了"
