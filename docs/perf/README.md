@@ -84,7 +84,8 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 
 - quiche の FFI を aws-lc-sys のバインディング経由にした（F-243）。`#[inline(always)]` の包みで、呼び出し先は同じ関数。HTTP/3 は 0.994。
 - ログの文の英語化（F-242）は、文字列の変更だけ。
-- HTTP/2 の END_STREAM を最後の DATA フレームに付ける改善は、Linux では揺れの範囲（HTTP/2 0.999）。FreeBSD では TLS で +2.5〜5%（下）。
+- HTTP/2 の END_STREAM を最後の DATA フレームに付ける改善は、Linux では揺れの範囲（HTTP/2 0.999）。
+  FreeBSD の h2c 54KB では +9%（下）。
 
 ---
 
@@ -126,13 +127,14 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
   （効率は 16 項目中 15 項目で 1.00 以上）。
 - ※ `l4_tcp` 3B は、反復の順で偏っていた（nginx を先に測った回だけ nginx が大きい）。サーバ律速を 8 反復で測り直すと、
   ラウンドごとの比は 0.88〜1.32、中央値 **1.07**。syscall は veil 5.1 / 要求に対し nginx 8.2。
-- `h2c_file_plain` 54KB の標準（負荷生成が律速）は、100 万要求の交互でも veil 約 103k / nginx 約 110k req/s（0.94）。
-  - 1 接続あたりの多重度で変わる: `-m1` 1.02、`-m4` 同等、`-m32` 0.94。
+- `h2c_file_plain` 54KB の標準（負荷生成が律速。上の表は v0.8.3 のタグ）は 0.89。
   - サーバの CPU は veil が 4 割少なく、サーバ律速では 1.23。
+  - 1 接続あたりの多重度で変わる: `-m1` 1.02、`-m32` 0.94（100 万要求の交互）。
+  - 原因: 応答の終わりに長さ 0 の DATA フレーム（END_STREAM）を別に送っていた（16384×3 + 5424 + 0）。END_STREAM を最後の DATA フレームに
+    付けるようにした（`403f79bf`、v0.8.3 の後）。
+  - 交互 3 反復で h2c 54KB は 101.9k → 111.3k req/s（**+9.2%、対 nginx 0.98**）。TLS の HTTP/2 は 5 反復で静的 +6.1%・中継 0.98（揺れの範囲）。
   - 次のものは違いにならなかった: 共有メモリ + `sendfile(2)` の有無（無効にすると 5% 下がる）、TCP のセグメント数
     （veil 3.5 / nginx 4.6 / 要求）、書き込みの閾値（128KB → 32KB）。
-  - 応答の終わりの空の DATA フレームは無くした（HTTP/2 の END_STREAM を最後の DATA フレームに付ける）。h2c は変わらず、
-    TLS の HTTP/2 は +2.5〜5%。
 - `h3_file` 54KB の効率 0.92（スループットは同等）は、v0.8.0 と同じ残り。
   - 上位は `memcpy`（本文をパケットへ詰めるコピー。nginx も同じ）、`malloc`/`free`（quiche の内部と FreeBSD の libc の jemalloc）、
     quiche の送出。
