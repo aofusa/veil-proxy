@@ -68,6 +68,7 @@ use prometheus::{
 // 上流が UNIMPLEMENTED 以外を返したものを上限つきでラベルにし、ほかは `other` にまとめる。
 
 /// どの値にも当たらないもののラベル
+#[cfg(feature = "metrics")]
 pub(crate) const OTHER_LABEL: &str = "other";
 
 /// gRPC のメソッドのラベルの種類の上限（超えた分は `other`）
