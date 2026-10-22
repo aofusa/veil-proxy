@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2553,14 +2553,14 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-build"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "veil-proxy-macros"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "proc-macro2",
  "quote",

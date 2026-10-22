@@ -4233,7 +4233,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "veil-capi"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "bytes",
  "serde_json",
@@ -4251,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4335,14 +4335,14 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-build"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "veil-proxy-macros"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4440,7 +4440,7 @@ dependencies = [
 
 [[package]]
 name = "veil-python"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "bytes",
  "itoa",
