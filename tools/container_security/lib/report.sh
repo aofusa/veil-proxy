@@ -56,7 +56,12 @@ aggregate_reports() {
             local path="${RESULTS_DIR}/${file}"
             local status="missing"
             if [[ -f "${path}" ]]; then
-                if grep -qE ': ok([[:space:]]|$)|healthy_after_fuzz=true|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
+                # 明示的な失敗の印を先に見る（B-158: metrics_probe の FAIL が、同じレポートの別の行の
+                # 「post_flood_health: ok」で passed に数えられ、full_features_security も同じだった）
+                if grep -qE '^FAIL([[:space:]]|$)|: FAILURES|: FAIL([[:space:]]|$)|: fail([[:space:]]|$)' "${path}" 2>/dev/null; then
+                    status="failed"
+                    failed=$((failed + 1))
+                elif grep -qE ': ok([[:space:]]|$)|healthy_after_fuzz=true|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
                     status="passed"
                     passed=$((passed + 1))
                 elif grep -qiE 'skipped|skip' "${path}" 2>/dev/null; then

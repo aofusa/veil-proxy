@@ -17,7 +17,9 @@ COPY tools/vds/server /src/tools/vds/server
 RUN cd tools/vds/server && cargo build --release --locked \
     && cp target/release/veil-vds-server /veil-vds-server
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+# distroless の Debian の libc6 には直す版の無い（won't fix）High の脆弱性が残るので、本体の glibc 版と同じ
+# Wolfi の glibc-dynamic にする（libgcc・libstdc++ を含み、既定のユーザーは nonroot=65532。B-158）
+FROM cgr.dev/chainguard/glibc-dynamic:latest
 COPY --from=builder /veil-vds-server /usr/local/bin/veil-vds-server
 USER 65532:65532
 EXPOSE 18000

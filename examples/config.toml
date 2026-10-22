@@ -1404,6 +1404,12 @@ revalidate_mtime = false
 #   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
 #   veil_proxy_vds_connected 等             VDS の状態（[vds] 有効時のみ。F-211、[vds] の節を参照）
 #
+# ラベルの値は決まった範囲に収める（でたらめな Host・メソッド・gRPC のパスで系列を増やされないように。B-158）:
+#   host   … 要求の Host が当たったルートの host 条件（設定に書いたまま。"*.example.com" など）。当たらなければ "other"
+#            （host 条件の無い設定では全部 "other"）
+#   method … GET / HEAD / POST / PUT / DELETE / CONNECT / OPTIONS / TRACE / PATCH、ほかは "OTHER"
+#   gRPC の method … 要求のパス。上流が UNIMPLEMENTED を返したもの・形の崩れたもの・1024 種類を超えた分は "other"
+#
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"
 #

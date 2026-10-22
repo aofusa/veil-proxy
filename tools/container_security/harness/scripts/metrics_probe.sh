@@ -15,10 +15,14 @@ log() { printf '%s\n' "$*" | tee -a "${RESULTS}"; }
 
 log "metrics_probe start requests=${REQUESTS}"
 
+metrics() { curl -sk --max-time 3 "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}${METRICS_PATH}" 2>/dev/null || true; }
+
 ok=0
 for ((i = 1; i <= REQUESTS; i++)); do
-    if curl -sk --max-time 3 "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}${METRICS_PATH}" 2>/dev/null \
-        | grep -q 'veil_'; then
+    # 本文を変数に受けてから調べる（`curl | grep -q` は pipefail の下で、本文が大きいと grep が先に終わって
+    # curl が書き込みに失敗し、偽の失敗になる）
+    body="$(metrics)"
+    if grep -q 'veil_' <<<"${body}"; then
         ok=$((ok + 1))
     fi
 done
@@ -29,6 +33,23 @@ if [[ "${ok}" -ge $((REQUESTS * 8 / 10)) ]]; then
     log "PASS metrics_flood_survives"
 else
     log "FAIL metrics_flood_survives"
+    fails=$((fails + 1))
+fi
+
+# B-158: でたらめな Host を送っても系列が増えないこと（以前は Host ごとに系列が増え、5000 種類で応答 10.8MB）
+series() { grep -c '^veil_proxy_http_requests_total{' <<<"$(metrics)" || true; }
+before="$(series)"
+for ((i = 1; i <= 200; i++)); do
+    curl -sk -o /dev/null --max-time 3 -H "Host: flood-${RANDOM}-${i}.invalid" \
+        "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || true
+done
+after="$(series)"
+log "requests_total_series: before=${before} after=${after} (200 random Host headers)"
+# 状態コードの種類の分だけは増え得るので、少しの余裕を見る
+if [[ "${after}" -le $((before + 5)) ]]; then
+    log "PASS metrics_host_label_bounded"
+else
+    log "FAIL metrics_host_label_bounded"
     fails=$((fails + 1))
 fi
 

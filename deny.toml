@@ -3,17 +3,16 @@
 [advisories]
 version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
-yanked = "warn"
+yanked = "deny"
 # cargo-deny 0.18 以降、`unmaintained` は重大度（"warn" 等）ではなく
 # **対象範囲**（"all" | "workspace" | "transitive" | "none"）を取る。
 # 旧来の `unmaintained = "warn"` は
 #   error[unexpected-value]: expected '["all", "workspace", "transitive", "none"]'
 # で設定のデシリアライズごと失敗し、cargo-deny が一度も動かなくなる。
 #
-# "workspace" にしているのは、veil が直接依存するクレートの unmaintained 化は
-# 検出したい一方、間接依存（現状 wasmtime -> wasm-compose -> im-rc/sized-chunks/bitmaps）は
-# 上流の更新でしか解消できず、B-79（wasmtime 47.x へのアップグレード）で追跡しているため。
-unmaintained = "workspace"
+# "all" にして、間接依存の unmaintained 化も失敗にする（B-158。以前は "workspace" で、wasmtime 経由の
+# fxhash のような間接依存を見逃していた）。やむを得ず残すものは `ignore` に理由付きで書く。
+unmaintained = "all"
 # `notice` は advisories 設定 version 2 で廃止された（重大度の個別指定は不可）。
 
 [licenses]

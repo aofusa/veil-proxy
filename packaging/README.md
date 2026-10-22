@@ -232,7 +232,7 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 | | `docker build --platform` | 理由 |
 |---|---|---|
-| glibc | **付けない** | ランタイムが `FROM --platform=${RUNTIME_PLATFORM} distroless` なので Dockerfile 内だけで最終イメージが arm64 になる |
+| glibc | **付けない** | ランタイムが `FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic` なので Dockerfile 内だけで最終イメージが arm64 になる |
 | musl | **付ける** | ランタイムが `FROM scratch`（空・アーキ非依存）で、Dockerfile 内だけでは OCI Architecture を確定できない |
 
 > **glibc に `--platform linux/arm64` を付けてはならない。** ビルダーの
@@ -539,10 +539,10 @@ veil-<version>-<target>/
 例:
 
 ```
-packaging/output/veil_0.8.3_amd64.deb
-packaging/output/veil-0.8.3-1.x86_64.rpm
-packaging/output/veil-0.8.3-x86_64-unknown-linux-gnu.tar.gz
-packaging/output/veil-0.8.3-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil_0.8.4_amd64.deb
+packaging/output/veil-0.8.4-1.x86_64.rpm
+packaging/output/veil-0.8.4-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-0.8.4-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ### ビルド処理の流れ
@@ -613,7 +613,7 @@ CI ではできないので、最初の公開の前に 1 回だけ行う。
 ### Debian / Ubuntu
 
 ```bash
-sudo dpkg -i packaging/output/veil_0.8.3_amd64.deb
+sudo dpkg -i packaging/output/veil_0.8.4_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 ```
@@ -621,7 +621,7 @@ sudo systemctl enable --now veil
 ### Amazon Linux 2023
 
 ```bash
-sudo dnf install -y packaging/output/veil-0.8.3-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.8.4-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 

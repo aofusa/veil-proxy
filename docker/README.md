@@ -10,7 +10,7 @@ Dockerイメージのビルドとコンテナの実行
 | タグ | 中身 |
 |---|---|
 | `latest`・`musl`・`musl-vX.Y.Z` | musl 版（`Dockerfile.musl`、scratch） |
-| `glibc`・`glibc-vX.Y.Z` | glibc 版（`Dockerfile.glibc`、distroless） |
+| `glibc`・`glibc-vX.Y.Z` | glibc 版（`Dockerfile.glibc`、Wolfi の `cgr.dev/chainguard/glibc-dynamic`。v0.8.3 までは distroless。B-158） |
 
 どちらも `/veil` は `full-container`（epoll の readiness reactor）の 1 本だけ。Docker の既定の seccomp・Kubernetes の
 `RuntimeDefault` は io_uring を拒否するので、そのまま動く epoll 版を公開する（v0.8.2 から。v0.8.0・v0.8.1 のイメージは

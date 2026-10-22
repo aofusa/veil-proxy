@@ -5,10 +5,11 @@ veil はマルチアーキ（amd64・arm64）のコンテナイメージとし�
 | タグ | 中身 |
 |------|------|
 | `latest`・`musl`・`musl-vX.Y.Z` | musl の静的バイナリ（`scratch`） |
-| `glibc`・`glibc-vX.Y.Z` | glibc のバイナリ（distroless） |
+| `glibc`・`glibc-vX.Y.Z` | glibc のバイナリ（Wolfi。[Chainguard の `glibc-dynamic`](https://images.chainguard.dev/directory/image/glibc-dynamic/overview)。v0.8.3 までは distroless） |
 
 どちらも Docker の既定の seccomp と Kubernetes の `RuntimeDefault` の下で動きます。中のバイナリは `full-container` のビルド
-（epoll の readiness reactor。[ビルド](building.md)）です。版のタグは上書きしません。
+（epoll の readiness reactor。[ビルド](building.md)）です。版のタグは上書きしません。公開する前にすべてのイメージを grype で調べ、
+High 以上の脆弱性が 1 つでもあれば（直す版がまだ無いものも含めて）公開しません。
 
 ## すぐ試す
 

@@ -137,7 +137,11 @@ run_defaults() { # run_defaults <label> <docker run の追加引数...>
     done
     local body; body="$(curl -fsS http://127.0.0.1:18088/ 2>/dev/null || true)"
     if grep -q 'class="quickstart-link"' <<<"$body"; then ok "$label: GET / returns the built-in index.html"; else bad "$label: GET / (got ${#body} bytes)"; fi
-    if curl -fsS http://127.0.0.1:18088/quickstart.html 2>/dev/null | grep -q 'container quickstart'; then ok "$label: GET /quickstart.html"; else bad "$label: GET /quickstart.html"; fi
+    # 本文を変数に受けてから調べる（`curl | grep -q` は pipefail の下で、grep が先に終わると curl が書き込みに失敗して
+    # 偽の失敗になる。v0.8.4 の準備で 1 回だけ出た）。失敗したら curl の終了コードと応答を出す
+    local qrc=0 qs; qs="$(curl -fsS -w '\n%{http_code} %{size_download}' http://127.0.0.1:18088/quickstart.html 2>"$WORK/qs.err")" || qrc=$?
+    if [ "$qrc" = 0 ] && grep -q 'container quickstart' <<<"$qs"; then ok "$label: GET /quickstart.html"
+    else bad "$label: GET /quickstart.html (curl rc=$qrc, status/size: $(tail -1 <<<"$qs"), $(tr '\n' ' ' < "$WORK/qs.err"))"; fi
     local v; v="$(curl -sS --http2-prior-knowledge -o /dev/null -w '%{http_version}' http://127.0.0.1:18088/ || true)"
     if [ "$v" = 2 ]; then ok "$label: h2c"; else bad "$label: h2c (got '$v')"; fi
     if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18088/nope.html)" = 404 ]; then ok "$label: 404 for a missing file"; else bad "$label: missing file is not 404"; fi

@@ -22,10 +22,19 @@ docker run --rm \
     "${RUST_IMAGE}" \
     bash -c '
         set -euo pipefail
+        # B-158: 保守終了（unmaintained）・unsound・yanked の警告も失敗にする（黙って残さない。やむを得ず残すものは
+        # .cargo/audit.toml の ignore に理由付きで書く）
         if ! command -v cargo-audit >/dev/null 2>&1; then
             cargo install cargo-audit --locked --quiet
         fi
-        timeout 300 cargo audit --color never 2>&1 | tee /results/cargo_audit_report.txt
+        timeout 300 cargo audit --color never --deny warnings 2>&1 | tee /results/cargo_audit_report.txt
+        # 本体以外の Cargo.lock（例・試験用のクレート・計測ツール・VDS の参照サーバ）も見る（B-158。本体だけを
+        # 見ていたので、例の rustls-webpki などが修正前のまま残っていた）
+        for lock in $(find . -name target -prune -o -path ./third_party -prune -o -name Cargo.lock -print | sort); do
+            [ "$lock" = ./Cargo.lock ] && continue
+            echo "== $lock" | tee -a /results/cargo_audit_report.txt
+            timeout 300 cargo audit --color never --deny warnings -f "$lock" 2>&1 | tee -a /results/cargo_audit_report.txt
+        done
         # 判定マーカーはレポートファイルへ書く（lib/report.sh がファイルを grep する）。
         echo "cargo_audit: ok" | tee -a /results/cargo_audit_report.txt
     '

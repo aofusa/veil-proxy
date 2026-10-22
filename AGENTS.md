@@ -216,6 +216,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - container_security の判定は「本当に走ったか」を見る。h3spec の打ち切り・testssl の常時スキップ・サニタイザの
   起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。LeakSanitizer は
   終了時にしか走らず、veil の seccomp・Landlock・特権降格があると ptrace できずに落ちる（B-116）。
+- 脆弱性の検査（grype・Trivy・cargo-audit・cargo-deny）は、直す版の無いもの・保守終了・yanked も失敗にする
+  （`only-fixed`・`--ignore-unfixed` を戻さない）。直せないものは土台のイメージや依存を替えて取り除き、やむを得ず残すときは
+  理由付きの ignore にする。cargo-audit はリポジトリ内の全 Cargo.lock を見る（B-158）。
 
 ---
 
@@ -309,7 +312,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `docs/perf/` | 最新のベンチマーク結果 |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
-| `third_party/wasmtime/` | wasmtime 36.0.18（LTS）の vendoring（B-55 / B-79 / B-155） |
+| `third_party/wasmtime/` | wasmtime 36.0.19（LTS）の vendoring（B-55 / B-79 / B-155 / B-157。`profiling` は外した。B-158） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
 | `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.14 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |

@@ -1,4 +1,4 @@
-# docs/perf — パフォーマンス計測サマリ（v0.8.3）
+# docs/perf — パフォーマンス計測サマリ（v0.8.4）
 
 Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスループットを、nginx を基準に計測した
 **最新の結果だけ**をまとめる（過去の計測は git 履歴で辿れる）。
@@ -9,7 +9,8 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 | [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.8.2 との比が 0.95 を下回った 2 構成を 5 反復で測り直した生データ |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B）の生データ |
 | [`freebsd_cpu_per_req.tsv`](freebsd_cpu_per_req.tsv) | FreeBSD のサーバの CPU 時間 / 要求（`cpu_per_req.sh`）の生データ |
-| [`platform_verification.md`](platform_verification.md) | v0.8.3 の全プラットフォームの試験（単体・統合・E2E・ライブラリ・セキュリティ） |
+| [`linux_v084_ab_raw.tsv`](linux_v084_ab_raw.tsv) | v0.8.4 の変更の退行確認（Prometheus を有効にした 6 構成と静的配信の 4 構成。v0.8.3 の main と交互）の生データ |
+| [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.8.3 の全件と、v0.8.4 で回し直したもの） |
 
 ---
 
@@ -86,6 +87,26 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 - ログの文の英語化（F-242）は、文字列の変更だけ。
 - HTTP/2 の END_STREAM を最後の DATA フレームに付ける改善は、Linux では揺れの範囲（HTTP/2 0.999）。
   FreeBSD の h2c 54KB では +9%（下）。
+
+### v0.8.4 の退行確認（交互 A/B、2026-10-22）
+
+v0.8.4 の変更のうち性能に効き得るのは 2 つ。
+
+- メトリクスのラベルを有限にした（B-159）: Prometheus が有効なとき、要求ごとに host ラベルの表の読み出しとスタック上の小文字化が増える。
+- glibc イメージの土台を distroless（Debian の glibc 2.41）から Wolfi（glibc 2.42）にした（B-158）。
+
+そこで、Prometheus を有効にした 6 構成（`*_metrics`）と、Prometheus を使わない静的配信の 4 構成を、v0.8.3 の main（`d72f39bc`、
+`veil:base084`）と v0.8.4（`veil:new084`）で交互に測った（どちらも `docker/Dockerfile.glibc` の `full`、3 反復）。
+
+| 対象 | 組数 | 比の中央値 | 最小 | 最大 |
+|---|---|---|---|---|
+| Prometheus 有効（gRPC・gRPC over HTTP/3・HTTP/1.1・HTTP/2・HTTP/3） | 12 | 0.996 | 0.949 | 1.027 |
+| 静的配信（HTTP/1.1・HTTP/2・h2c・HTTP/3） | 7 | 1.000 | 0.953 | 1.021 |
+
+- 0.95 を下回った 1 組（`h3_proxy_metrics` の HTTP/3、0.949）は、5 反復で測り直して 0.998（同じ構成の HTTP/1.1・HTTP/2 は 0.990）。
+- 全計測で Non-2xx = 0。
+
+**退行なし。** nginx との比較は上の v0.8.3 のフルスイートの結果のまま（v0.8.4 はフルスイートを測り直していない）。
 
 ---
 

@@ -262,6 +262,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     // 一度も呼ばれておらず、無効設定・既定値でも毎リクエストのメトリクス記録が走っていた）。
     crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
+    crate::metrics::set_host_labels(&runtime_config.route);
     crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 

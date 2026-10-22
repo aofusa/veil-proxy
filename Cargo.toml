@@ -40,7 +40,7 @@ resolver = "2"
 # （ルートから veil-macros への依存の版と、ワークスペース外の Cargo.lock も一緒に更新する）。
 # 公開の workflow（.github/workflows/release.yml）はタグとこの版が違えば何も公開しない。
 [workspace.package]
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
@@ -677,7 +677,7 @@ regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
-veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.8.3", optional = true }
+veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.8.4", optional = true }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }
@@ -751,13 +751,15 @@ boring = "4.3"
 # - cranelift: AOT コンパイル（<BSD_NOSIG> 側は Pulley 強制のため実質未使用）
 # - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
 #   `[wasm] interpreter = true`（F-135）・OpenBSD（B-52）・<BSD_NOSIG>（B-55）で常時使用。
+# - 既定の feature のうち `profiling`（perf の jitdump・VTune）だけを外す。veil は使わず、保守終了の `fxhash`
+#   （RUSTSEC-2025-0057、`fxprof-processed-profile` 経由）を依存に持ち込むため。残りは既定のまま（B-158）。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "36.0.19", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 # 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
 # キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
-veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）
