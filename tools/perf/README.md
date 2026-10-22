@@ -241,24 +241,24 @@ veil の平文リスナー `listen_cleartext` は既定（`enable_secure_redirec
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
-2026-10-19（`34528afb`、`suite_ab.sh` で main と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
+2026-10-22（v0.8.3、`suite_ab.sh` で v0.8.2 と交互、69 構成 × 3 反復 = 834 計測、Non-2xx = 0、NA なし）**）:
 
-- 対 nginx（同じ仕事の相手）の中央値は HTTP/1.1 **1.29×**・HTTP/2 **1.76×**・HTTP/3 **1.21×**・h2c **2.48×**、
-  全 120 構成で nginx 以上（最小 1.02×）。最良の静的配信 `h2_1_ktls_0_lb_kernel_ofc_1` は HTTP/1.1 1.42×・HTTP/2 1.76×、
-  h2c は静的 3.24×・中継 1.71×、L4 平文素通しは 2.01×、圧縮結果キャッシュ有効の `h2_1_feat_compression_cached` は 4.44×。
-- main との交互 A/B は全体 1.002（HTTP/3 1.138）。0.95 未満の組は 5〜6 反復で測り直して 0.967 以上。
+- 対 nginx（同じ仕事の相手）の中央値は HTTP/1.1 **1.34×**・HTTP/2 **1.75×**・HTTP/3 **1.23×**・h2c **2.55×**、
+  全 120 構成で nginx 以上（最小 1.05×）。最良の静的配信 `h2_1_ktls_0_lb_kernel_ofc_1` は HTTP/1.1 1.45×・HTTP/2 1.74×、
+  h2c は静的 3.46×・中継 1.65×、L4 平文素通しは 2.04×、圧縮結果キャッシュ有効の `h2_1_feat_compression_cached` は 4.81×。
+- v0.8.2 との交互 A/B は全体 0.998（HTTP/3 0.994）。0.95 未満の 2 組は 5 反復で測り直して 0.994 以上。
 - FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/bsd/`）は CPU/要求の効率が 16 項目中 15 項目で nginx 以上
-  （残りは `h3_file` 54KB の 0.94、スループットは同等）。
+  （残りは `h3_file` 54KB の 0.92、スループットは同等）。
 - **対 nginx は同じ仕事の相手と比べる**（v0.8.0。`tools/perf/vs_nginx.py` の対応）: `*_proxy*` は
   `base_proxy`、キャッシュ無しの `*_compression` は `base_compression`、`*_proxy_compression` は
   `base_proxy_compression`、`h2c_*` は同名、HTTP/3 の静的は `base`（http3）・中継は `base_proxy`（http3）、
   それ以外は `base`（TLS 静的）。v0.8.0 より前は nginx の中継・圧縮の相手が無く、`feat_proxy` 等を
   nginx の静的配信と比べていた。
-- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 8,684、2026-10-19）は
-  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **98〜103%**、
-  proxy / buffering が **77〜78%**（バックエンドホップそのもの）、
-  キャッシュ無効の compression が **49%**（54,576B を毎リクエスト圧縮する CPU バウンド処理）、
-  圧縮結果キャッシュ有効（`compression_cached`）は **284%**（圧縮後 16KB を返すため）。
+- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 8,452、2026-10-22）は
+  観測系（metrics / otel / admin / rate-limit / wasm / cache）が **99〜102%**、access-log が **95%**、
+  proxy / buffering が **78〜79%**（バックエンドホップそのもの）、
+  キャッシュ無効の compression が **46%**（54,576B を毎リクエスト圧縮する CPU バウンド処理）、
+  圧縮結果キャッシュ有効（`compression_cached`）は **294%**（圧縮後 16KB を返すため）。
 - glibc と musl の差は代表構成のいずれでも **数 % 以内でノイズ範囲**。
 - コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
 - `cbpf` と `kernel` の振り分けは同等（`h2_1_ktls_0_lb_{cbpf,kernel}_ofc_1` の HTTP/1.1 で 9,721 / 9,667）。B-76 以前は cBPF が全接続をワーカー 0 に寄せていた。

@@ -1,93 +1,67 @@
-# v0.8.0 全プラットフォーム検証
+# v0.8.3 全プラットフォーム検証
 
-リリース前に、対象のすべての OS・アーキテクチャで単体・統合・standalone・E2E・ライブラリの試験を回した結果
-（2026-10-18〜19）。ソースは `34528afb` 以降変わっていない（その後のコミットは文書・試験のハーネス・VM のスクリプトだけ）。
-Linux x86_64 以外は実機（macOS・Windows）または実カーネルの VM（`tools/qemu/`）上で、ネイティブビルドしたものを
-試験している。
+v0.8.3 の公開（タグ `v0.8.3` = `ff15ea56`）の後、対象のすべての OS・アーキテクチャで、単体・統合・standalone・E2E・ライブラリの試験を回した結果
+（2026-10-21〜22）。
 
-| OS | アーキ | 環境 | feature | 単体 | 統合 | standalone | E2E | ライブラリ | コミット |
-|---|---|---|---|---|---|---|---|---|---|
-| Linux | x86_64 | ホスト（io_uring） | `full` | 1085 | 60 | 23 | 569 | 230 | `7b23beba` |
-| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | — | 569 | — | `7b23beba` |
-| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 1083 | 60 | 23 | 569 | 230 | `7b23beba` |
-| macOS | aarch64 | 実機（kqueue reactor） | `full-macos` | 1001 | 60 | 23 | 569 | 196 | `7b23beba` |
-| Windows | x86_64 | 実機（WSAPoll reactor） | `full-windows` | 954 | 54 | 22 | スモーク※1 | 195 | `7b23beba` |
-| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `7b23beba` |
-| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 169 | `d438059b` |
-| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `7b23beba` |
-| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 169 | `d438059b` |
-| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `7b23beba` |
-| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 169 | `d438059b` |
+- Linux x86_64 以外は、実機（macOS・Windows）か実カーネルの VM（`tools/qemu/`）の上で、ネイティブにビルドしたものを試験している。
+- 試験の後に入れた変更は、`main` に入れる前に Linux で単体・E2E（両バックエンド）を回し直した。変更は 2 つ。
+  - HTTP/2 の最後の DATA フレームに END_STREAM を付ける（`403f79bf`）
+  - 試験とハーネスの修正
 
-すべて失敗 0。件数の違いは feature とプラットフォームの `cfg` による（Windows は Unix 専用の試験が、BSD は
-`full-*` に含まれない機能の試験が対象外）。ライブラリは `tests/api/library_e2e.sh all` の確認の数（Rust・GraphQL・
-gRPC・C・Python。OS によって載らない機能がある）。
+| OS | アーキ | 環境 | feature | 単体 | 統合 | standalone | E2E | ライブラリ |
+|---|---|---|---|---|---|---|---|---|
+| Linux | x86_64 | ホスト（io_uring） | `full` | 1085 | 60 | 23 | 569 | 234 |
+| Linux | x86_64 | ホスト（epoll reactor） | `full,epoll` | — | — | — | 569 | — |
+| Linux | aarch64 | QEMU + HVF（Ubuntu、io_uring） | `full` | 1083 | 60 | 23 | 569 | 234 |
+| macOS | aarch64 | 実機（kqueue reactor） | `full-macos` | 1001 | 60 | 23 | 569 | 200 |
+| Windows | x86_64 | 実機（WSAPoll reactor） | `full-windows` | 954 | 54 | 22 | スモーク※1 | 199 |
+| FreeBSD | aarch64 | QEMU + HVF（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 173 |
+| FreeBSD | x86_64 | QEMU + KVM（14.3） | `full-freebsd` | 1022 | 60 | 23 | 569 | 172 + C 47※2 |
+| OpenBSD | aarch64 | QEMU + HVF（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 173 |
+| OpenBSD | x86_64 | QEMU + KVM（7.9） | `full-openbsd` | 999 | 60 | 22 | 568（無視 1） | 173 |
+| NetBSD | aarch64 | QEMU + HVF（10.1） | `full-netbsd` | 999 | 60 | 22 | 569 | 173 |
+| NetBSD | x86_64 | QEMU + KVM（10.1） | `full-netbsd` | 999※3 | 60 | 22 | 569 | 175※3 |
 
-BSD の 3 OS は、それぞれの OS 固有のサンドボックス（FreeBSD の capsicum・OpenBSD の pledge/unveil・NetBSD の chroot +
-特権降格）の下での E2E（`bsd-vm.sh <os> <arch> security-e2e`）も通った。
+すべて失敗 0（下の注のとおり、試験の側を直して回し直したものを含む）。
 
-※1 Windows は bash の E2E ハーネスの構成が UDS のバックエンドなど Windows で使えない機能を含むため、配布物（`--profile dist`）で
-前段（静的配信 + プロキシ）と後段の veil を 2 つ起動して疎通を確かめた（下の「Windows のスモーク」）。
+- 件数の違いは、feature とプラットフォームの `cfg` による。
+  - Windows: Unix 専用の試験が対象外。
+  - BSD: `full-*` に含まれない機能の試験が対象外。
+- ライブラリの件数は `tests/api/library_e2e.sh all` の確認の数（Rust・GraphQL・gRPC・C・Python）。
+  - BSD は grpcio が入らないので、その 1 件を飛ばす。
+  - 数え方は v0.8.3 で 4 件増えた（アクセスログの確認。F-244）。
+- BSD の 3 OS は、両アーキで OS 固有のサンドボックス（FreeBSD の capsicum・OpenBSD の pledge/unveil・NetBSD の chroot + 特権降格）の下での
+  E2E（`bsd-vm.sh <os> <arch> security-e2e`）も通った。
 
-## ビルド・静的解析
+※1 Windows は bash の E2E のハーネスが UDS のバックエンドなど Windows で使えない機能を含むので、`veil.exe` を前段（静的配信 + `/proxy/`
+の中継）と後段の 2 つ起動して確かめた: 静的配信 200・h2c 200（HTTP/2）・中継 200・後段を止めた後 502・アクセスログ（JSON）が標準出力に出る。
+
+※2 FreeBSD x86_64 のライブラリは、C の `hello-static` のアクセスログの確認だけが、grep の「Binary file matches」で 1 件落ちた。確認を `grep -a` にし、
+ログに制御文字が無いことの確認を足して C を回し直し、47 件すべて通った（ログは制御文字を含まない）。
+
+※3 NetBSD x86_64 は 2 件。
+- 単体の `measure_pooled_vs_fresh_connection` が並列の試験の負荷で 1 回落ちた（模擬サーバへの 5 秒の期限で EAGAIN）。単独では 3 回とも通る。
+  期限を 30 秒にした。
+- ライブラリの 1 回目は、VM が GraphQL の例のビルドの途中で応答しなくなった（ゲストのメモリ逼迫）。VM を立て直して回し直し、175 件すべて通った。
+
+Linux aarch64 の単体の 1 回目は、VM のメモリ（4GB）でリンカが落ちた。6GB・1 ジョブで回し直して通した（試験の失敗ではない）。
+
+## ビルド・静的解析（Linux x86_64）
 
 | 対象 | 結果 |
 |---|---|
-| Linux x86_64: `default` / `--no-default-features` / `full` / `full,epoll` / `full-container` / `full,api` / メッシュ、各 feature の単独（`--no-default-features --features <f>`）と既定 + 1 feature（`docs/artifacts/feature-check.sh`） | 92 通りすべて clippy `-D warnings` で指摘 0 |
-| macOS: `cargo clippy --no-default-features --features full-macos --all-targets -D warnings` | 指摘 0 |
-| Windows: `cargo clippy --no-default-features --features full-windows --all-targets -D warnings` | 指摘 0（v0.8.0 で初めて通した。windows-sys の定数への同じ型へのキャスト 20 件など） |
-| 各プラットフォームの試験のビルド | 警告 0 |
+| clippy `-D warnings`。`default` / `--no-default-features` / `full` / `full,epoll` / `full-container` / `full,api` / メッシュと、各 feature の単独（`--no-default-features --features <f>`）・既定 + 1 feature（`docs/artifacts/feature-check.sh`） | 全組み合わせで指摘 0 |
+| macOS（`full-macos`）・Windows（`full-windows`）の clippy `--all-targets -D warnings` | 指摘 0 |
 | `cargo fmt --check` | 差分なし |
-| `#[allow(dead_code)]` | 追加なし（Windows の試験だけが警告を出していた unix 専用の補助関数は `cfg(unix)` にした） |
+| `#[allow(dead_code)]` | 追加なし |
+| `tools/lint/check-messages.py`（ログ・エラーの文字列が英語でチケット番号なし。F-242）・`tools/release/check-docs.sh`（docs.rs・PyPI の文書。F-241） | 0 件 |
 
-Rust のツールチェーンは全プラットフォームで 1.99。Windows（1.95）と macOS（1.94）は古い clippy だけが出す指摘
-（`nonminimal_bool`・`collapsible_match`）があったので直してから更新した。
+## 公開物の確認（v0.8.3）
 
-## container_security（Linux x86_64、`veil:glibc`）
+crates.io・PyPI・ghcr.io から取得して、何も設定せずに動くことを確かめた（`docs/artifacts/v0.8.3_release_note.md`）。
 
-`SKIP_LIBFUZZER=0 SKIP_CARGO_AUDIT=0 SKIP_CARGO_DENY=0 SKIP_ZAP=0 SKIP_BAD_BACKEND=0 SKIP_PUMBA=0 SKIP_RESOURCE_EXHAUSTION=0
-SKIP_SYSCALL_CHAOS=0 SKIP_DIFFERENTIAL=0 RUN_E2E_ASAN=1` で全フェーズを回し、**32 合格・失敗 0**（libFuzzer の ASAN/TSAN 版と
-カーネル能力のフェーズは既定で無効）。syscall 障害注入・ASAN の E2E カオスも検出 0。
-
-## 検証の過程で見つけて直した不具合
-
-| チケット | 見つかった環境 | 内容 |
-|---|---|---|
-| [B-154](../backlog/bugs/B-154-static-first-request-404-when-openat2-blocked.md) | Linux（container_security） | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 |
-| [B-155](../backlog/bugs/B-155-dependency-advisories-v080.md) | Linux（container_security の cargo-audit） | 依存の RUSTSEC 勧告（rustls・quinn-proto・pyo3・wasmtime） |
-| [B-156](../backlog/bugs/B-156-aarch64-seccomp-missing-rseq.md) | Linux aarch64（release.yml のイメージの試験） | seccomp の aarch64 の許可リストに rseq が無く、glibc の arm64 が seccomp 有効で起動直後に abort（E2E は seccomp を有効にしないので見えなかった） |
-| F-240（quiche の `send_body_zc`） | Linux（perf の h2load） | 本文のゼロコピーで偽の STREAM_DATA_BLOCKED を送り、ngtcp2 のクライアントが FINAL_SIZE_ERROR で閉じる（E2E の quinn は無視） |
-| B-122（追記） | Linux（standalone の並列実行） | 平文リスナーで判別に足りない断片の続きが 200ms に間に合わず RST |
-| — | Windows・macOS | clippy の指摘（上の表）・quiche の build.rs が macOS のビルドのたびに出す警告 |
-| — | 試験のハーネス | Linux aarch64 の VM へ `tools/vds` を送っていない・library の再起動の確認が同じポート（SO_REUSEPORT で前のサーバに繋がる）・シグナルの試験が他の試験のポートと衝突・container_security のハーネスが F-200 後の平文ポートを見ていない |
-
-## Windows のスモーク
-
-配布物 `veil-0.8.0-x86_64-pc-windows-msvc.zip`（`build-cross.sh --target windows`、`--profile dist`）の `veil.exe` で、
-前段（`listen_cleartext`、静的配信と `/proxy/` の中継）と後段（静的配信）を起動して確かめた。
-
-| 確認 | 結果 |
-|---|---|
-| `veil.exe --version` | `veil 0.8.0` |
-| 前段の静的配信（HTTP/1.1） | 200 |
-| 前段の静的配信（h2c prior knowledge） | 200（HTTP/2） |
-| `/proxy/` → 後段 | 200（後段の本文） |
-| 後段を止めた後の `/proxy/` | 502（接続エラーをログに出す） |
-
-## 配布物（`--profile dist`、2026-10-19）
-
-`packaging/README.md` の手順で、ビルドは直列に回した（Linux・Windows・macOS は Docker、BSD x86_64 はこのホストの QEMU + KVM、
-BSD aarch64 は Apple Silicon の QEMU + HVF。VM のメモリは 7〜8GB で、fat LTO のまま通った）。
-
-| 成果物 | 作り方 |
-|---|---|
-| `veil_0.8.0_amd64.deb`・`veil-0.8.0-1.x86_64.rpm`・`veil-0.8.0-x86_64-unknown-linux-{gnu,musl}.tar.gz` | `build.sh --docker` |
-| `veil_0.8.0_arm64.deb`・`veil-0.8.0-1.aarch64.rpm`・`veil-0.8.0-aarch64-unknown-linux-{gnu,musl}.tar.gz` | `RUST_TARGET=aarch64-unknown-linux-gnu build.sh --docker` |
-| `veil-0.8.0-universal2-apple-darwin.tar.gz` | `build-cross.sh --target macos` |
-| `veil-0.8.0-{x86_64,aarch64}-pc-windows-msvc.zip` | `build-cross.sh --target windows` |
-| `veil-0.8.0-{x86_64,aarch64}-unknown-{freebsd,openbsd,netbsd}.tar.gz` | `bsd-vm.sh <os> <arch> build`（`CARGO_PROFILE=dist`）→ `fetch` → `build-bsd.sh --all` |
-| `lib/veil-lib-0.8.0-x86_64-linux-gnu.zip`（C ライブラリ・Python wheel・Rust ソース） | `build-lib.sh --docker` |
-
-`verify-artifacts.sh rustls-0.23.46 discover_pmtu` で 15 件すべて OK（rpm の 2 件は `rpm2cpio` を別に使って同じ確認をした）。
-ライブラリの zip の `libveil.so`・`libveil.a`・wheel の拡張モジュールも同じ文字列を含む（wheel は pyo3 0.29.3）。
-
+- Rust: `.cargo/config.toml` 無しのプロジェクトで `veil-proxy = "=0.8.3"`（`full`・`api`）をビルドした。
+  HTTP/1.1・h2c・HTTP/2（TLS）・HTTP/3・OpenAPI が応答し、アクセスログが英語で標準出力に出た。
+- Python: `pip install veil-api==0.8.3` の HTTP/1.1・h2c・アクセスログ。`help()` が英語でチケット番号なし。
+- コンテナ（`latest`・`glibc`・`musl-v0.8.3`・`glibc-v0.8.3`）: `docker run` だけで内蔵のページと `/quickstart.html` を返した。
+  自分の `config.toml` と HTML をマウントした場合も確かめた。
