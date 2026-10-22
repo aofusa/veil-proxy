@@ -518,6 +518,10 @@ pub(super) struct H2ActiveStream {
     end_sent: bool,
     /// フロー制御ウィンドウ待ちの未送信ボディ残 `(buf, 送信済みオフセット)`。
     pending_body: Option<(Bytes, usize)>,
+    /// `pending_body` を送り切ったら END_STREAM を付けて終える（応答の最後の断片だった）。
+    end_with_pending: bool,
+    /// 最後の断片かを見るために先読みしたメッセージ（次の周回で最初に処理する）。
+    peeked: Option<H2RespMsg>,
 }
 
 /// per-stream リクエストタスクのスポーナ型（F-46: 型付きタスクプールで Box 確保を回避）。
@@ -702,6 +706,8 @@ pub(super) fn h2_spawn_for_request<S, V>(
             head_sent: false,
             end_sent: false,
             pending_body: None,
+            end_with_pending: false,
+            peeked: None,
         },
     );
 }
@@ -808,7 +814,8 @@ where
         {
             if let Some((buf, off)) = st.pending_body.take() {
                 // 本体の持ち主ごと渡す（FreeBSD の平文 h2c は共有メモリの本体を sendfile(2) で送る）
-                let queued = conn.queue_data_frames_bytes(sid, &buf.slice(off..), false)?;
+                let end = st.end_with_pending;
+                let queued = conn.queue_data_frames_bytes(sid, &buf.slice(off..), end)?;
                 let new_off = off + queued;
                 if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                     conn.flush_write_buf().await?;
@@ -818,12 +825,21 @@ where
                     st.pending_body = Some((buf, new_off));
                     continue;
                 }
+                if end {
+                    // 最後の断片を送り切った（END_STREAM はその DATA フレームに付けた）
+                    st.end_sent = true;
+                    done.push(sid);
+                    continue;
+                }
             }
         }
 
         // --- resp_rx を送出可能な限りドレイン ---
         loop {
-            let recv = st.resp_rx.try_recv();
+            let recv = match st.peeked.take() {
+                Some(m) => TryRecv::Item(m),
+                None => st.resp_rx.try_recv(),
+            };
             let msg = match recv {
                 TryRecv::Item(m) => m,
                 TryRecv::Empty => break,
@@ -863,12 +879,30 @@ where
                     }
                 }
                 H2RespMsg::Body(bytes) => {
-                    let queued = conn.queue_data_frames_bytes(sid, &bytes, false)?;
+                    // 次のメッセージを先読みし、送り手が閉じていればこの断片が最後: END_STREAM を
+                    // 最後の DATA フレームに付ける（空の DATA フレームを別に送らない。1 応答につき
+                    // フレーム 1 つと、TCP のセグメント・相手の起床が 1 回減る）。
+                    let last = match st.resp_rx.try_recv() {
+                        TryRecv::Closed => true,
+                        TryRecv::Item(m) => {
+                            st.peeked = Some(m);
+                            false
+                        }
+                        TryRecv::Empty => false,
+                    };
+                    let last = last && st.head_sent && !st.end_sent;
+                    let queued = conn.queue_data_frames_bytes(sid, &bytes, last)?;
                     if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                         conn.flush_write_buf().await?;
                     }
                     if queued < bytes.len() {
                         st.pending_body = Some((bytes, queued));
+                        st.end_with_pending = last;
+                        break;
+                    }
+                    if last {
+                        st.end_sent = true;
+                        done.push(sid);
                         break;
                     }
                 }

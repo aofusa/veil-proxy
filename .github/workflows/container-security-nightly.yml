@@ -264,11 +264,14 @@ jobs:
           sbom: tools/container_security/results/sbom_source.cdx.json
           severity-cutoff: high
           output-format: table
+      # イメージは distroless（Debian）の libc6 などを含む。Debian が「won't fix」とした脆弱性は直す版が無く、
+      # 毎晩失敗し続けるだけなので、直す版がある脆弱性だけで失敗させる（表には全部出る）。
       - name: Scan image SBOM with grype
         uses: anchore/scan-action@v6
         with:
           sbom: tools/container_security/results/sbom_image.spdx.json
           severity-cutoff: high
+          only-fixed: true
           output-format: table
       - name: Upload SBOM
         if: always()

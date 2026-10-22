@@ -458,6 +458,7 @@
 | B-154 | P1 | 完了 | [bugs/B-154-static-first-request-404-when-openat2-blocked.md](bugs/B-154-static-first-request-404-when-openat2-blocked.md) | openat2 が seccomp で拒否される環境で、起動後最初の静的配信の要求が 404 になる（コンテナの seccomp プロファイルに openat2 が無かった） |
 | B-155 | P1 | 完了 | [bugs/B-155-dependency-advisories-v080.md](bugs/B-155-dependency-advisories-v080.md) | 依存の RUSTSEC 勧告（rustls 0.23.45 に 4 件・quinn-proto・pyo3 0.23・wasmtime 36.0.17）。rustls 0.23.46・pyo3 0.29・wasmtime 36.0.18 へ。container_security の resource_exhaustion の集計と gitleaks の許可リスト |
 | B-156 | P1 | 完了 | [bugs/B-156-aarch64-seccomp-missing-rseq.md](bugs/B-156-aarch64-seccomp-missing-rseq.md) | aarch64 の seccomp 許可リストに rseq（293）が無く、glibc 2.35+ の glibc/arm64 のイメージ・配布物が seccomp 有効で起動直後に abort（`Fatal glibc error: rseq registration failed`）。sched_yield・getcpu・mlock2 も x86_64 と揃えた。crates.io の 0.8.0 は修正前のため 0.8.1 で公開し直した |
+| B-157 | P1 | 完了 | [bugs/B-157-dependency-advisories-v083.md](bugs/B-157-dependency-advisories-v083.md) | v0.8.3 の後に出た RUSTSEC 勧告（rustls-webpki 0.103.15・wasmtime 36.0.18 の Cranelift 2 件・webpki-roots / webpki-root-certs 1.0.8）で毎晩の cargo_audit・cargo_deny が失敗。rustls-webpki 0.103.16・wasmtime 36.0.19（vendoring 版も取り込み直し）・webpki-roots 1.0.10。イメージの grype は only-fixed（distroless の libc6 は won't fix） |
 
 ---
 

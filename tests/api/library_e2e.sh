@@ -143,7 +143,7 @@ TOML
   expect "defaults are plaintext h2c-only + HTTP/1.1" "H2C (HTTP/2 Cleartext) Server" cat "$W2/log"
   # F-244: ライブラリの既定はアクセスログを標準出力に出す（専用スレッドが最大 1 秒ごとにフラッシュする）
   sleep 1.5
-  expect "access log on stdout by default" "path=/hello" bash -c "grep 'type=access' '$W2/log'"
+  expect "access log on stdout by default" "path=/hello" bash -c "grep -a 'type=access' '$W2/log'"
   # 環境変数 VEIL_OVERRIDE_<n> もライブラリで効く
   # 別のポートで起動する（同じポートだと SO_REUSEPORT で終了処理中の前のサーバと並んで待ち受け、
   # wait_port が前のサーバで通ってしまう。以前は P3 を取りながら P2 を使っていた）
@@ -153,7 +153,7 @@ TOML
   PIDS+=("$!"); wait_port "$P3" "$!"
   expect "VEIL_OVERRIDE disables OpenAPI" "404" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$P3/openapi.json"
   curl -s -o /dev/null "http://127.0.0.1:$P3/hello"; sleep 1.5
-  if grep -q 'type=access' "$W2/log3"; then bad "access_log.enabled = false stops the access log"; else ok "access_log.enabled = false stops the access log"; fi
+  if grep -a -q 'type=access' "$W2/log3"; then bad "access_log.enabled = false stops the access log"; else ok "access_log.enabled = false stops the access log"; fi
   kill "$!" 2>/dev/null
 }
 
@@ -214,7 +214,15 @@ run_c() {
     expect "$bin inline route h2c" "pong" curl -s --http2-prior-knowledge "$B/ping"
     expect "$bin OpenAPI from C metadata" '"summary":"Get a user"' curl -s "$B/openapi.json"
     sleep 1.5
-    expect "$bin access log by default" "path=/users/" bash -c "grep 'type=access' '$TMPD/c.log'"
+    # -a: ログに想定外のバイトがあっても grep が「Binary file matches」だけを返さないように（FreeBSD x86_64 で起きた）
+    expect "$bin access log by default" "path=/users/" bash -c "grep -a 'type=access' '$TMPD/c.log'"
+    # ログに NUL などの制御文字（改行・タブ・ESC 以外）が混ざっていないこと（混ざっていれば中身を出す）
+    if LC_ALL=C grep -q -P '[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]' "$TMPD/c.log" 2>/dev/null \
+       || [ "$(LC_ALL=C tr -d -c '\000' < "$TMPD/c.log" | wc -c)" -gt 0 ]; then
+      bad "$bin log has control bytes: $(od -c "$TMPD/c.log" | grep -n -E '\\0|[0-9]{3}' | head -3 | tr '\n' ' ')"
+    else
+      ok "$bin log is plain text"
+    fi
     kill "$PID"; sleep 0.5
   done
 }

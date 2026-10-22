@@ -752,12 +752,12 @@ boring = "4.3"
 # - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
 #   `[wasm] interpreter = true`（F-135）・OpenBSD（B-52）・<BSD_NOSIG>（B-55）で常時使用。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "36.0.18", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+wasmtime = { version = "36.0.19", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 # 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
 # キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
-veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.18", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）

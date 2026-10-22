@@ -2,8 +2,13 @@
 
 ## 由来
 
-crates.io の [`wasmtime` 36.0.18](https://crates.io/crates/wasmtime/36.0.18)（LTS）をそのままコピー
-（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.18/` から）。
+crates.io の [`wasmtime` 36.0.19](https://crates.io/crates/wasmtime/36.0.19)（LTS）をそのままコピー
+（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.19/` から）。
+
+> **2026-10-22: 36.0.18 → 36.0.19（v0.8.3 の後、B-157）。** RUSTSEC-2026-0379（aarch64 の Cranelift が大きな `br_table` で
+> 誤った飛び先へ飛ぶ）・RUSTSEC-2026-0380（Cranelift のビットの詰め込みの桁あふれによる誤コンパイル）の修正版。
+> 36.0.18 と 36.0.19 の `wasmtime` クレート自体の差は `Cargo.toml`（依存の版）だけで、修正は Cranelift の
+> クレートにある。差分（下記）は 36.0.18 のものを `patch` で当て直した（`Cargo.toml` のパッケージ名の行だけ手で当てた）。
 
 > **2026-10-18: 36.0.17 → 36.0.18（v0.8.0）。** RUSTSEC-2026-0363（component model のハンドル表の上限が
 > インスタンスごとにしか掛からない）の修正版。veil は core module しか使わないが、同じ LTS の修正版に揃えた。
@@ -17,7 +22,7 @@ crates.io の [`wasmtime` 36.0.18](https://crates.io/crates/wasmtime/36.0.18)（
 > MSRV 1.86 の LTS 36 系を選んだ。veil が使う API（core module・async + fuel yield・
 > epoch 割り込み・プーリングアロケータ・Cranelift / Pulley）は 36 でもそのまま使える。
 > 本体の crates.io 依存（Linux / macOS / Windows / FreeBSD x86_64 / OpenBSD x86_64）も
-> 同じ版に揃えてある（現在 36.0.18）。
+> 同じ版に揃えてある（現在 36.0.19）。
 `Cargo.toml` / `Cargo.toml.orig` / `LICENSE` / `README.md` / `build.rs` / `src/` を取り込み、
 `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込んでいない
 （veil のワークスペースビルドには不要で、`tests/` は crates.io 公開物とは無関係の

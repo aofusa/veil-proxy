@@ -1739,7 +1739,9 @@ mod tests {
                 "/bench.Service/Call",
                 &GrpcMetadataBlob::empty(),
                 &[Bytes::from_static(b"")],
-                5000,
+                // 並列の試験で模擬サーバのスレッドが待たされても落ちないよう長めにする（NetBSD x86_64 の VM で
+                // 5 秒を超えて EAGAIN になったことがある。時間は測るだけで assert しない）
+                30_000,
             );
             assert!(result.is_ok(), "unary call should succeed: {result:?}");
         }
@@ -1784,7 +1786,7 @@ mod tests {
                 path: "/bench.Service/Call".to_string(),
                 initial_metadata: GrpcMetadataBlob::empty(),
                 messages: vec![Bytes::from_static(b"")],
-                timeout_ms: 5000,
+                timeout_ms: 30_000, // 上と同じ理由で長め
             };
             let mut events = runner.ingest(vec![call], Vec::new(), Vec::new(), &upstream_groups);
             let mut closed = events
