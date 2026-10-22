@@ -76,7 +76,8 @@
   - `tools/release/image-smoke.sh`（`container`・`defaults`）。
   - container_security: Trivy（直す版の無いものも数える）で HIGH・CRITICAL 0 件。全フェーズ。
     この実行で、メトリクスの系列が際限なく増える問題（B-159）と、集計が失敗を passed に数える問題が見つかった。
-- VDS の standalone E2E（Rust の参照サーバ）。
+- VDS の standalone E2E（Rust の参照サーバ、tonic 0.14 の gRPC h2c・TLS）。
+- vendoring 版 wasmtime（`profiling` を消した）を使う NetBSD x86_64 の単体 1002 件・統合 60 件。
 - jwt-filter の単体試験（25 件 + 結合 8 件）。`RUSTFLAGS=-Clink-arg=--allow-undefined` で wasm32-wasip1 のビルド。
 
 ## 残っていること

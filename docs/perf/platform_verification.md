@@ -1,4 +1,27 @@
-# v0.8.3 全プラットフォーム検証
+# 全プラットフォーム検証（v0.8.3 の全件と v0.8.4 の回し直し）
+
+## v0.8.4（2026-10-22〜23）
+
+v0.8.4 の変更（B-158・B-159。依存・イメージの土台・メトリクスのラベル・試験のハーネス）について、影響を受けるところを回し直した。
+コードの変更は `src/metrics.rs` と設定のロードの 2 か所、依存の変更は wasmtime の feature（vendoring 版を含む）。
+
+| 対象 | 環境 | 結果 |
+|---|---|---|
+| Linux x86_64 単体・統合・standalone | ホスト（`full`） | 1088・60・23（VDS の Rust の参照サーバ（tonic 0.14）の gRPC h2c・TLS を含む） |
+| Linux x86_64 E2E | io_uring・epoll | 569・569 |
+| clippy `-D warnings` | Linux（`feature-check.sh` の 92 組）・macOS（`full-macos`）・Windows（`full-windows`） | 指摘 0 |
+| macOS aarch64 単体 | 実機（`full-macos`） | 1004 |
+| Windows x86_64 単体 | 実機（`full-windows`） | 957 |
+| NetBSD x86_64 単体・統合 | QEMU + KVM（`full-netbsd`、vendoring 版 wasmtime） | 1002・60 |
+| container_security | `veil:new084`（glibc・`full`。土台は Wolfi） | 26 成功・失敗 0（判定を厳しくした後。B-159） |
+| イメージの起動 | `full-container` の glibc（`image-smoke.sh` の `container`・`defaults`） | すべて ok |
+| grype（High 以上で失敗、直す版の無いものを含む） | `full-container` の glibc イメージ・glibc の土台（amd64・arm64） | 0 件 |
+| cargo-audit（全 Cargo.lock、警告も失敗）・cargo-deny | — | 0 件・ok |
+| crates.io の公開の dry-run | `publish-crates.sh --dry-run` | 4 クレートとも検証のビルドまで ok |
+
+---
+
+## v0.8.3
 
 v0.8.3 の公開（タグ `v0.8.3` = `ff15ea56`）の後、対象のすべての OS・アーキテクチャで、単体・統合・standalone・E2E・ライブラリの試験を回した結果
 （2026-10-21〜22）。
@@ -46,7 +69,7 @@ v0.8.3 の公開（タグ `v0.8.3` = `ff15ea56`）の後、対象のすべての
 
 Linux aarch64 の単体の 1 回目は、VM のメモリ（4GB）でリンカが落ちた。6GB・1 ジョブで回し直して通した（試験の失敗ではない）。
 
-## ビルド・静的解析（Linux x86_64）
+### ビルド・静的解析（Linux x86_64）
 
 | 対象 | 結果 |
 |---|---|
@@ -56,7 +79,7 @@ Linux aarch64 の単体の 1 回目は、VM のメモリ（4GB）でリンカが
 | `#[allow(dead_code)]` | 追加なし |
 | `tools/lint/check-messages.py`（ログ・エラーの文字列が英語でチケット番号なし。F-242）・`tools/release/check-docs.sh`（docs.rs・PyPI の文書。F-241） | 0 件 |
 
-## 公開物の確認（v0.8.3）
+### 公開物の確認（v0.8.3）
 
 crates.io・PyPI・ghcr.io から取得して、何も設定せずに動くことを確かめた（`docs/artifacts/v0.8.3_release_note.md`）。
 
