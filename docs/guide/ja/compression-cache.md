@@ -233,6 +233,8 @@ url = "http://localhost:8080"
 
 ### 注意事項
 
+- プロキシのキャッシュは **HTTP/1.1 のクライアント**の要求に効きます。HTTP/2・HTTP/3 の要求は上流へ送り、キャッシュを読みも
+  埋めもしません（F-257）。
 - `streaming` バッファリングモード使用時、kTLSのゼロコピー転送は維持されます
 - キャッシュは `Cache-Control: no-cache`、`no-store`、`private` ヘッダーを尊重します
 - `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません

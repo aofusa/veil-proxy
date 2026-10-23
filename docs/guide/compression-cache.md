@@ -233,6 +233,8 @@ Cache keys are generated from:
 
 ### Notes
 
+- The proxy cache serves requests from **HTTP/1.1 clients**. Requests over HTTP/2 and HTTP/3 are sent to the backend
+  and do not read or fill the cache yet (F-257).
 - When `streaming` buffering mode is used, kTLS zero-copy transfer is preserved
 - Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
 - `Vary: *` responses are not cached when `respect_vary = true`

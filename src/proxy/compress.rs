@@ -448,6 +448,13 @@ pub(super) async fn transfer_response_with_compression(
                         );
                         return (total, status_code, false, true);
                     }
+                } else if parsed.content_length.is_some() {
+                    // B-162: 本文が最初の読み込みに収まった（小さい応答）ときも保存する。以前は残りを転送する
+                    // `transfer_response_body_with_cache` の中でしか保存せず、小さい応答は一度もキャッシュされなかった。
+                    // Content-Length のある完全な本文だけ（接続の終わりで区切る応答は途中かもしれないので保存しない）。
+                    if let Some(ctx) = cache_ctx {
+                        ctx.save_to_cache();
+                    }
                 }
 
                 return (total, status_code, backend_wants_keep_alive, false);
