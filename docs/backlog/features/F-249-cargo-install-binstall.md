@@ -6,8 +6,10 @@
 
 - `cargo install veil-proxy --locked`（ソースからビルド）で、`veil` のバイナリが入るようにする。
 - `cargo binstall veil-proxy`（ビルド済みのバイナリを取る）で、`veil` のバイナリが入るようにする。
-- どちらも、入れた後に `veil` を引数無しで起動すれば内蔵の既定の設定で動く（F-247）。
-  `curl http://127.0.0.1:8080/` で確かめられる。
+- どちらも入るのはバイナリだけ。設定ファイルとページは利用者が用意する前提にする（F-247）。
+  - 既定のパス（`/etc/veil/config.toml`、Windows は `%ProgramData%\veil\config.toml`）に置くか、`-c`・`VEIL_CONFIG` で渡す。
+  - その前提と、最小の設定・ページの用意のしかたを、文書と `--help` に明記する。
+  - 設定ファイルが無いときは、置き場所と対処を示すエラーで止まる（F-247）。
 
 ## 今の状態
 
@@ -22,7 +24,8 @@
   default は変えない（AGENTS.md）。
 - **binstall:** `[package.metadata.binstall]` が無い。
   binstall は GitHub Release の成果物を名前から推測するが、v0.8.1 以降は成果物が無い（F-247）。
-- **設定ファイル:** 引数無しの `veil` は `/etc/veil/config.toml` が無いと起動しない（F-247 で直す）。
+- **設定ファイル:** 引数無しの `veil` は `/etc/veil/config.toml` が無いと起動しない。
+  エラーは置き場所を示さない（F-247 で文を直す。内蔵の設定には落とさない）。
 
 ## 設計
 
@@ -44,7 +47,9 @@
 - **試験:** `release.yml` に `cargo-install` ジョブを足す。
   - crates.io へ公開した後に、各 runner（Linux x86_64・aarch64、macOS、Windows）で回す。
     1. `cargo install veil-proxy@<ver> --locked --features <OS のセット>`
-    2. 引数無しで起動して `/`・h2c・（`full` なら）HTTP/3 を確かめる。
+    2. 設定ファイルを置かずに引数無しで起動し、F-247 のエラーで止まることを確かめる。
+    3. 文書の「最小の設定」を書いた `config.toml` と `index.html` を用意し、`-c` で起動する。
+       `/`・h2c・（`full` なら）HTTP/3 を確かめる。
   - rc では crates.io に公開しない（dry-run）。そこで、パッケージの tarball（`cargo package` の出力）を展開し、
     同じコマンドを `--path` で回す。crates.io から入れるときと同じく、`third_party/` の無い状態で確かめる。
   - BSD は F-247 の VM の workflow で `cargo install --path` を回す。
@@ -80,26 +85,36 @@
 - **binstall が見るのは crates.io に公開した `Cargo.toml`:** metadata は次の版から効く。
   - 古い版（〜v0.8.4）は推測に頼る。成果物が無いので、ソースからのビルドに落ちる。
 - **試験:**
-  - 公開の後に各 runner で `cargo binstall veil-proxy@<ver> --no-confirm --disable-strategies compile` を回し、起動を確かめる。
+  - 公開の後に各 runner で `cargo binstall veil-proxy@<ver> --no-confirm --disable-strategies compile` を回す。
+    起動は `cargo install` と同じ手順（設定が無いときのエラー、用意した設定での起動）で確かめる。
+  - binstall はアーカイブの中のバイナリだけを入れる。アーカイブの `examples/` は入らないことを文書に書く。
     `compile` を止めて、ビルド済みのバイナリを取れたことを確かめる。
-  - rc では `--manifest-path` で手元の `Cargo.toml` を使い、rc の pre-release の成果物で同じことをする。
+  - rc では成果物が draft にある（公開されていない）。次の手順で同じことをする。
+    1. `gh release download` で取り、runner の中の HTTP サーバで配る。
+    2. `--manifest-path` で手元の `Cargo.toml` を使い、`--pkg-url` でその URL に差し替える。
 
 ### 文書
 
 - README（英日）の「Install」に、`cargo binstall` と `cargo install` を足す。
+  - 「入るのはバイナリだけで、設定ファイルとページは自分で用意する」ことを、コマンドのすぐ下に書く。
+- `docs/guide/running.md`（英日）の「Configuration file」の節（F-247）に、最小の設定とページを書く。
+  - 既定のパスへの置き方を書く。
+  - アーカイブの `examples/` を写す方法も書く。
 - `docs/guide/building.md`（英日）に、feature のセットと前提のツールを書く。
 
 ## 受け入れ条件
 
 - Linux（gnu・musl のどちらが選ばれても）・macOS（arm64・x86_64）・Windows（x64・arm64）で、`cargo binstall veil-proxy` がビルド済みのバイナリを入れる。
   - 署名の検証が通る。
-  - 引数無しの `veil` が `http://127.0.0.1:8080/` を返す。
-- 同じ OS で、`cargo install veil-proxy --locked --features <セット>` がビルドでき、同じく起動する。
+  - 設定が無いときは F-247 のエラーで止まる。
+  - 文書の手順で用意した設定で `http://127.0.0.1:8080/` を返す。
+- 同じ OS で、`cargo install veil-proxy --locked --features <セット>` がビルドでき、同じ手順で起動する。
+- 文書に「設定ファイルとページは自分で用意する」ことと、その手順が書いてある。
 - BSD は、`cargo install --path` でビルドできるか、できない組み合わせが文書とエラーで分かる。
 
 ## 依存・リスク
 
-- F-247（成果物・内蔵の既定の設定・署名）が先。
+- F-247（成果物・設定ファイルの決まり方・署名）が先。
 - `cargo install` の full のビルドは、CI で 30 分〜1 時間かかる。公開の後の試験は並列にし、公開そのものは待たせない。
 
 ## 関連

@@ -54,7 +54,9 @@
   - 専用の OpenPGP の鍵を作る。主鍵はオフラインに置き、CI には署名用の副鍵だけを environment `release` の secret で渡す。
   - 鍵の失効・入れ替えの手順と、指紋を文書に書く。
 - **保持:** 最新の 3 版だけを置く（GitHub Pages の 1GB の上限）。古い版は GitHub Release から取ってもらう。
-- **rc:** `veil-packages` の `testing` の component（apt）・`veil-testing.repo`（dnf）に置き、本番の利用者の `stable` には入れない。
+- **rc:** 成果物は draft にある（F-247）ので、公開のリポジトリには置かない。
+  - runner の中で、draft の `.deb`・`.rpm` から同じ手順でリポジトリを作り、本番と同じ副鍵で署名する。
+  - それを手元の HTTP サーバで配って試験する。
 
 ### パッケージの作り直し
 
@@ -63,7 +65,8 @@
     上げたときに、利用者の書き換えを上書きしない。
   - **前の版からの移行:** `/var/etc/veil/config.toml` が既にあるときは、その場所を使い続ける。
     - postinst が `/etc/default/veil`（deb）・`/etc/sysconfig/veil`（rpm）に `VEIL_CONFIG=/var/etc/veil/config.toml` を書く。
-    - ユニットは `EnvironmentFile=-...` と `-c ${VEIL_CONFIG}` で読む。
+    - ユニットは `ExecStart=/usr/bin/veil`（`-c` 無し。新しく入れた人は既定のパス `/etc/veil/config.toml` を読む）。
+      `EnvironmentFile=-...` で `VEIL_CONFIG` を渡す（F-247 の決まり方で、既定のパスより優先される）。
     - 黙って移さない。移し方は文書に書く。
 - **既定の設定:** F-247 の雛形から作る。
   - リスナーは `127.0.0.1:8080` の平文、ページは `/usr/share/veil/www/`。
@@ -95,7 +98,9 @@
 `test-deb.sh`・`test-rpm.sh` を、上の配布の行列（systemd が動くコンテナか VM）に広げる。
 
 - **新しく入れる:**
-  - 実際のリポジトリの URL（rc は testing）から、署名の検証込みで入れる。
+  - リポジトリから、署名の検証込みで入れる。
+    - 本番の版: 公開した後の実際の URL。
+    - rc: runner の中のリポジトリ。
   - 起動したら、`/`・`/quickstart.html`・h2c が 200。アクセスログが journald に出る。
   - RPM 系は `systemctl enable --now veil` の後に確かめる。
 - **上げる:** 前の版から上げる。
@@ -113,7 +118,7 @@
 
 ## 受け入れ条件
 
-- 上の配布で、文書の手順どおりに入れると `curl http://127.0.0.1:8080/` が内蔵のページを返す。
+- 上の配布で、文書の手順どおりに入れると `curl http://127.0.0.1:8080/` が、入れた既定のページ（`/usr/share/veil/www/`）を返す。
   - Debian 系は入れただけ、RPM 系は `systemctl enable --now veil` の後。
 - リリースを公開すると、人の手無しでリポジトリが新しい版になる。
 - 署名の検証と、上げる・消す・移行の試験が通る。

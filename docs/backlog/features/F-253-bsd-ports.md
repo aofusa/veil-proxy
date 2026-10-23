@@ -38,8 +38,18 @@
   - `packaging/bsd/ports/netbsd/www/veil/`
   - 各 OS の ports の木へ出すのは、この雛形を VM で試験してから。
 - **feature:** `full-freebsd`・`full-openbsd`・`full-netbsd`。
-- **既定の設定:** F-247 の雛形から作る。
-  - リスナーは `127.0.0.1:8080` の平文、ページは `share/veil/www/`。
+- **既定の設定とページ:** F-247 の雛形から作り、入れるときに各 OS の場所へ置く。
+
+  | OS | 設定 | ページ | veil が既定で読む方法 |
+  |---|---|---|---|
+  | FreeBSD | `/usr/local/etc/veil/config.toml` | `/usr/local/share/veil/www/` | ビルド時に `VEIL_DEFAULT_CONFIG_PATH=${PREFIX}/etc/veil/config.toml` |
+  | OpenBSD | `/etc/veil/config.toml`（ports の `SYSCONFDIR`） | `/usr/local/share/veil/www/` | バイナリの既定のパスと同じ |
+  | NetBSD | `/usr/pkg/etc/veil/config.toml`（`PKG_SYSCONFDIR`） | `/usr/pkg/share/veil/www/` | ビルド時に `VEIL_DEFAULT_CONFIG_PATH=${PKG_SYSCONFDIR}/veil/config.toml` |
+
+  - ports はソースからビルドするので、既定のパスをビルド時に入れる（F-247）。
+    rc にも `-c` を書かなくてよく、手で `veil` を引数無しで起動しても同じ設定を読む。
+  - rc の `veil_config`（`-c`）は、利用者が別の場所を使いたいときのために残す。既定は空。
+  - リスナーは `127.0.0.1:8080` の平文。
   - root で起動し、`www`（FreeBSD・OpenBSD は `_veil` を作るのが ports の慣習なら、それに合わせる）へ降格する。
 - **設定ファイルの扱い:**
   - `config.toml.sample` を置き、無ければ `config.toml` を作る。
@@ -103,14 +113,14 @@
 
 ## 受け入れ条件
 
-- 3 つの OS の VM で、雛形から作ったパッケージを入れると、サービスの仕組みで起動し `curl http://127.0.0.1:8080/` が内蔵のページを返す。
+- 3 つの OS の VM で、雛形から作ったパッケージを入れると、サービスの仕組みで起動し `curl http://127.0.0.1:8080/` が、入れた既定のページを返す。
   - その OS のサンドボックスが有効になっている。
 - 各 OS の検査（`portlint`・`make test`・pkglint）が通る。
 - 各 ports の木への提出（FreeBSD の Bugzilla・ports@・pkgsrc-wip）をした。取り込まれるかは相手の審査に依る。
 
 ## 依存・リスク
 
-- F-247（既定の設定の雛形・内蔵のページ）が先。バイナリの成果物には依らない（ソースからビルド）。
+- F-247（既定の設定とページの雛形・`VEIL_DEFAULT_CONFIG_PATH`）が先。バイナリの成果物には依らない（ソースからビルド）。
 - VM の試験が要る（ssh llm の VM・手元の QEMU）。
 - 審査の時間は読めない。木への取り込みの前は、雛形と GitHub Release の tar.gz で使ってもらう。
 

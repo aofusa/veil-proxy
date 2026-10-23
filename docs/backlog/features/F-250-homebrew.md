@@ -5,9 +5,11 @@
 ## 目的
 
 - `brew install aofusa/tap/veil` で macOS（arm64・x86_64）と Linux（x86_64・aarch64）に入れられるようにする。
-- 入れた直後に次のどちらかで既定の設定で起動し、`curl http://127.0.0.1:8080/` で確かめられるようにする。
-  - `veil -c $(brew --prefix)/etc/veil/config.toml`
-  - `brew services start veil`
+- 入れるときに、既定の設定とページを Homebrew の場所に置く（F-247 の表）。
+  - 設定: `$(brew --prefix)/etc/veil/config.toml`
+  - ページ: `$(brew --prefix)/share/veil/www/`
+- 入れた直後に `veil`（引数無し）か `brew services start veil` で、その既定の設定で起動するようにする。
+  `curl http://127.0.0.1:8080/` で確かめられる。
 - 版を上げるのを、リリースの公開から自動にする。
 
 ## 今の状態
@@ -31,15 +33,21 @@
     glibc の版に依らないよう musl にする。
   - `sha256` は F-247 の `SHA256SUMS` から入れる。
   - インストール:
-    - `bin.install "veil"`、`pkgshare.install "www"`。
-    - 設定: アーカイブの `config.toml` の `/var/www/` を `#{pkgshare}/www/` に `inreplace` し、`(etc/"veil").install "config.toml"` で置く。
-      利用者が書き換えた設定を、上げたときに上書きしない（Homebrew の `etc` の扱い）。
+    - 実体は `libexec.install "veil"`。
+    - ページ: `pkgshare.install "examples/www"`。
+    - 設定: アーカイブの `examples/config.toml`（F-247 の雛形の例）の `./www/` を `#{pkgshare}/www/` に `inreplace` し、
+      `(etc/"veil").install "examples/config.toml"` で置く。
+      利用者が書き換えた設定は、上げたときに上書きしない（Homebrew の `etc` の扱い）。
+    - **既定で読ませる:** `bin.write_env_script libexec/"veil", VEIL_CONFIG: etc/"veil/config.toml"`。
+      - バイナリの既定のパス（`/etc/veil/config.toml`）は Homebrew の prefix と違うので、wrapper で `VEIL_CONFIG` を渡す（F-247 の決まり方）。
+      - 引数無しの `veil` が Homebrew の設定を読む。`-c` を渡せば、そちらが勝つ。
   - `service do`:
-    - `run [opt_bin/"veil", "-c", etc/"veil/config.toml"]`、`keep_alive true`。
+    - `run [opt_bin/"veil"]`（wrapper が `VEIL_CONFIG` を設定する）、`keep_alive true`。
     - `log_path`・`error_log_path` は `var/"log/veil.log"`。
   - `caveats`: 設定の場所、`brew services start veil`、`http://127.0.0.1:8080/`。
   - `test do`:
-    - 空きポートに書き換えた設定で起動し、`/` と `/quickstart.html` が 200。
+    - 入れた既定の設定を空きポートに書き換えた写しで起動し、`/` と `/quickstart.html` が 200。
+    - wrapper が既定の設定を読むことを確かめる。`veil -t` の出力に `etc/veil/config.toml` が出る。
     - `veil --version` が版と一致。
 - **macOS で確かめること:**
   - 利用者の権限で動く設定にする（特権の降格は無し）。
@@ -60,7 +68,8 @@
   - `brew test veil`
   - `brew audit --strict --online veil`
   - `brew services start veil` の後の `curl`
-- **rc:** tap の別の formula（`veil@rc` などにはせず、試験用の一時ブランチ）で rc の pre-release の成果物を使い、同じ試験を回す。
+- **rc:** tap の試験用の一時ブランチで、同じ試験を回す。
+  - 成果物は draft にあるので、`gh release download` で取り、runner の中の HTTP サーバで配って URL を差し替える。
   本番の formula は変えない。
 
 ### homebrew-core（後で）
@@ -75,7 +84,7 @@
 ## 受け入れ条件
 
 - macOS arm64・x86_64、Linux x86_64・aarch64 で、次のことができる。
-  - `brew install aofusa/tap/veil` → `brew services start veil` → `curl http://127.0.0.1:8080/` が内蔵のページを返す。
+  - `brew install aofusa/tap/veil` → `veil`（引数無し）か `brew services start veil` → `curl http://127.0.0.1:8080/` が、置いた既定のページを返す。
   - `brew test` と `brew audit --strict --online` が通る。
 - リリースを公開すると、人の手無しで tap の formula が新しい版になる。
   - 書き換えた設定は、上げても残る。

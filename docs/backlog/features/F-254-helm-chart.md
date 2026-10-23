@@ -6,7 +6,7 @@
 
 - `helm install veil oci://ghcr.io/aofusa/charts/veil` だけで、veil が Kubernetes で動くようにする。
   - 動かし方は、既定の設定の Deployment + Service。
-  - `kubectl port-forward svc/veil 8080:8080` → `curl http://127.0.0.1:8080/` で、内蔵のページが返る（公開イメージの既定と同じ。F-246）。
+  - `kubectl port-forward svc/veil 8080:8080` → `curl http://127.0.0.1:8080/` で、イメージに入っている既定のページが返る（公開イメージの既定と同じ。F-246）。
 - values で、次のことを変えられるようにする。
   - 自分の設定（TOML）・ページ・TLS
   - HTTP/3（UDP）
@@ -89,7 +89,7 @@
 
 ## 受け入れ条件
 
-- `helm install veil oci://ghcr.io/aofusa/charts/veil` → port-forward → `curl http://127.0.0.1:8080/` が内蔵のページを返す。
+- `helm install veil oci://ghcr.io/aofusa/charts/veil` → port-forward → `curl http://127.0.0.1:8080/` が既定のページを返す。
 - 上の試験が CI（rc のタグを含む）で通る。chart に署名があり、検証できる。
 
 ## 依存・リスク
