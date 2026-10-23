@@ -108,6 +108,11 @@ pub use policy::{CacheControl, CachePolicy, VaryResult};
 /// それでは dirfd 経路を外れて従来経路へ落ちたパス（登録済みルート外・
 /// `ENOTCAPABLE` の再判定。B-89）の封じ込めが効かない（BSD 実機の単体テストで検出）。
 /// `cache` feature の有無に依存しないため feature ゲート外（このファイル）に置く。
+///
+/// B-160: Linux の openat2（F-153）で開けた場合も同じく生パスになる。`base_path` が相対パス
+/// （`path = "examples/www/"`）だと canonical 形（絶対パス）とは決して一致せず、HTTP/1.1 の静的配信が
+/// 全件 403 になっていた。生の `base_path` 配下の許可を FreeBSD だけでなく全 OS に広げる（上と同じ理由で安全）。
+/// 先に canonical 形と比べ、外れたときだけ生パスと比べる（通常は 1 回の比較で済む）。
 #[inline]
 pub fn sendfile_base_contains(
     file_canonical_path: &std::path::Path,
@@ -115,11 +120,7 @@ pub fn sendfile_base_contains(
     base_path: &std::path::Path,
 ) -> bool {
     let base = canonical_base.unwrap_or(base_path);
-    #[cfg(target_os = "freebsd")]
-    if path_has_prefix(file_canonical_path, base_path) {
-        return true;
-    }
-    path_has_prefix(file_canonical_path, base)
+    path_has_prefix(file_canonical_path, base) || path_has_prefix(file_canonical_path, base_path)
 }
 
 /// `Path::starts_with` と同じ判定を、まずバイト列の前方一致（要素境界つき）で行う。
@@ -557,7 +558,7 @@ fn open_and_read_uncached(
                 let meta = file.metadata().ok()?;
                 if let Some((canonical_base, base_path)) = containment.as_ref() {
                     // dirfd 相対 openat（O_RESOLVE_BENEATH）で開けた生パスを渡す。
-                    // `sendfile_base_contains` は FreeBSD では生の base_path 配下も許可する
+                    // `sendfile_base_contains` は生の base_path 配下も許可する
                     // （このファイル冒頭の doc 参照）ので、ルート内なら判定は真になる。
                     if !sendfile_base_contains(path, canonical_base.as_deref(), base_path) {
                         return Some(StaticFileOutcome::Forbidden);
@@ -791,5 +792,67 @@ mod nocache_file_info_tests {
         // 存在しないファイルは None
         let missing = futures::executor::block_on(get_file_info(&dir.path().join("nope.txt")));
         assert!(missing.is_none());
+    }
+}
+
+#[cfg(test)]
+mod base_contains_tests {
+    // B-160: 相対パスのルート（`path = "examples/www/"`）の配下は、canonical 形（絶対パス）と一致しなくても
+    // 生パスで許可する。ルート外・`..` を含む比較は今までどおり拒む。
+    use super::sendfile_base_contains;
+    use std::path::Path;
+
+    #[test]
+    fn relative_root_allows_raw_paths_under_it() {
+        let canonical = Path::new("/home/u/veil/examples/www");
+        let base = Path::new("examples/www/");
+        assert!(sendfile_base_contains(
+            Path::new("examples/www/index.html"),
+            Some(canonical),
+            base
+        ));
+        assert!(sendfile_base_contains(
+            Path::new("examples/www"),
+            Some(canonical),
+            base
+        ));
+        // canonicalize の経路の絶対パスも、canonical 形の配下なら許可
+        assert!(sendfile_base_contains(
+            Path::new("/home/u/veil/examples/www/a.css"),
+            Some(canonical),
+            base
+        ));
+    }
+
+    #[test]
+    fn outside_paths_are_still_rejected() {
+        let canonical = Path::new("/home/u/veil/examples/www");
+        let base = Path::new("examples/www/");
+        assert!(!sendfile_base_contains(
+            Path::new("/etc/passwd"),
+            Some(canonical),
+            base
+        ));
+        assert!(!sendfile_base_contains(
+            Path::new("examples/wwwx/a"),
+            Some(canonical),
+            base
+        ));
+        assert!(!sendfile_base_contains(
+            Path::new("examples/other"),
+            Some(canonical),
+            base
+        ));
+        let abs = Path::new("/var/www/");
+        assert!(!sendfile_base_contains(
+            Path::new("/var/wwwx/a"),
+            Some(Path::new("/var/www")),
+            abs
+        ));
+        assert!(sendfile_base_contains(
+            Path::new("/var/www/a"),
+            Some(Path::new("/var/www")),
+            abs
+        ));
     }
 }
