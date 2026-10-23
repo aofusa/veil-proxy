@@ -53,7 +53,11 @@ serve_check() {
         code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/no-such-file")"
         [ "$code" = 404 ] && ok "$label: missing file is 404" || bad "$label: missing file -> $code"
     else
-        bad "$label: did not start"; tail -30 "$LOG"
+        if kill -0 "$pid" 2>/dev/null; then bad "$label: running but not answering on 127.0.0.1:$PORT"
+        else wait "$pid"; bad "$label: exited with status $?"; fi
+        grep -iE 'error|warn|panic|denied|capab' "$LOG" | tail -20
+        tail -15 "$LOG"
+        (netstat -an 2>/dev/null || ss -ltn 2>/dev/null) | grep -E "[.:]$PORT\b" | head -5
     fi
     # アクセスログは非同期に書き出される。止める前に出るのを待つ（止めた後の書き出しに頼らない）
     local j=0
