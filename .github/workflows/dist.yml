@@ -360,6 +360,9 @@ jobs:
         run: |
           if [ -f out/build.log ]; then
             grep -E '^(ok|FAIL|BINARY SMOKE|test result)' out/build.log | sed 's/^/::notice title=${{ matrix.os }}::/' || true
+            # 起動の試験で落ちたときの veil の ERROR・WARN の行
+            grep -E 'ERROR|WARN|panicked|running but not|exited with' out/build.log | grep -v 'type=access' | head -15 \
+              | while IFS= read -r l; do echo "::warning title=${{ matrix.os }} veil::${l:0:600}"; done || true
             if grep -q BUILD_FAILED out/build.log; then
               grep -E 'error(\[|:)|No space|Killed|panicked|FAIL' out/build.log | head -20 | while IFS= read -r l; do echo "::error title=${{ matrix.os }} build::${l:0:800}"; done
               tail -20 out/build.log | while IFS= read -r l; do echo "::warning title=tail::${l:0:800}"; done

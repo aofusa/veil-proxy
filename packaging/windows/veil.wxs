@@ -28,9 +28,11 @@
           <File Id="VeilExeFile" Source="$(var.SourceDir)\veil.exe" KeyPath="yes" />
           <Environment Id="VeilPath" Name="PATH" Value="[INSTALLDIR]" Action="set" Part="last" System="yes" Permanent="no" />
         </Component>
-        <Component Id="VeilDocs">
+        <Component Id="VeilLicenseApache">
           <File Id="LicenseApache" Source="$(var.SourceDir)\LICENSE-APACHE" KeyPath="yes" />
-          <File Id="LicenseMit" Source="$(var.SourceDir)\LICENSE-MIT" />
+        </Component>
+        <Component Id="VeilLicenseMit">
+          <File Id="LicenseMit" Source="$(var.SourceDir)\LICENSE-MIT" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
@@ -48,9 +50,11 @@
           <File Id="ConfigToml" Source="$(var.DefaultsDir)\config.toml" KeyPath="yes" />
         </Component>
         <Directory Id="WWWDIR" Name="www">
-          <Component Id="VeilWww">
+          <Component Id="VeilIndexHtml">
             <File Id="IndexHtml" Source="$(var.DefaultsDir)\www\index.html" KeyPath="yes" />
-            <File Id="QuickstartHtml" Source="$(var.DefaultsDir)\www\quickstart.html" />
+          </Component>
+          <Component Id="VeilQuickstartHtml">
+            <File Id="QuickstartHtml" Source="$(var.DefaultsDir)\www\quickstart.html" KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
@@ -58,10 +62,12 @@
 
     <Feature Id="Main" Title="veil">
       <ComponentRef Id="VeilExe" />
-      <ComponentRef Id="VeilDocs" />
+      <ComponentRef Id="VeilLicenseApache" />
+      <ComponentRef Id="VeilLicenseMit" />
       <ComponentRef Id="VeilDataDirAcl" />
       <ComponentRef Id="VeilConfig" />
-      <ComponentRef Id="VeilWww" />
+      <ComponentRef Id="VeilIndexHtml" />
+      <ComponentRef Id="VeilQuickstartHtml" />
     </Feature>
   </Package>
 </Wix>

@@ -8,7 +8,15 @@ DIST="$(cd "${1:?dist dir}" && pwd)"
 FAILS=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; echo "::error title=homebrew ($(uname -sm))::$*"; FAILS=$((FAILS+1)); }
-step() { local label="$1"; shift; local out; if out="$("$@" 2>&1)"; then ok "$label"; else bad "$label: $(tail -5 <<<"$out" | tr '\n' ' ' | cut -c1-700)"; echo "$out" | tail -40; return 1; fi; }
+step() {
+    local label="$1"; shift; local out
+    if out="$("$@" 2>&1)"; then ok "$label"; return 0; fi
+    # 出力の要点（エラー・違反の行）をすべて注釈にする
+    bad "$label"
+    grep -E 'Error|error|: [CWEF]: |offense|failed|Timeout' <<<"$out" | head -15 | while IFS= read -r l; do echo "::error title=homebrew $label::${l:0:600}"; done
+    echo "$out" | tail -40
+    return 1
+}
 
 if ! command -v brew >/dev/null; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null || true)"; fi
 if ! command -v brew >/dev/null; then

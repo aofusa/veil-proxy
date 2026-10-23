@@ -347,7 +347,8 @@ build_deb() {
         # Installed-Size（KiB）
         echo "Installed-Size: $(du -sk --exclude=DEBIAN "${staging}" | cut -f1)" >> "${staging}/DEBIAN/control"
 
-        dpkg-deb --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
+        # xz で圧縮する（Ubuntu の dpkg-deb の既定は zstd で、Debian の lintian・古い dpkg が読めない）
+        dpkg-deb -Zxz --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
         echo "==> Created ${OUTPUT_DIR}/${DEB_NAME}"
     else
         echo "==> dpkg-deb not found; using Docker (ubuntu:24.04)"

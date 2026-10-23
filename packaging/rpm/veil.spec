@@ -12,10 +12,9 @@ Requires(pre):  shadow-utils
 AutoReqProv:    no
 
 %description
-Veil is a reverse proxy and web server for HTTP/1.1, HTTP/2 and HTTP/3 with
-kTLS, io_uring, Proxy-Wasm filters, and seccomp / Landlock sandboxing. The
-package installs a default configuration (/etc/veil/config.toml) that serves a
-page on http://127.0.0.1:8080/. Start it with: systemctl enable --now veil
+Veil is a reverse proxy and web server for HTTP/1.1, HTTP/2 and HTTP/3. The
+package installs a default configuration in /etc/veil that serves a page on
+http://127.0.0.1:8080/ once the veil service is enabled and started.
 
 %prep
 %build
