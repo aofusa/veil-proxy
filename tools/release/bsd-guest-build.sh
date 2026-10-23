@@ -84,14 +84,15 @@ if [ "${VEIL_BSD_UNIT_TESTS:-1}" = 1 ]; then
 fi
 
 log "archive"
-bash packaging/scripts/stage-archive.sh "$BIN" "$TARGET" "$OS" "$OUT/stage" >/dev/null
 VER="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
 NAME="veil-${VER}-${TARGET}"
-tar -C "$OUT/stage" -czf "$OUT/$NAME.tar.gz" "$NAME"
+bash packaging/scripts/build-bsd.sh --os "$OS" --arch "$ARCH" --binary "$BIN" --os-version "$(uname -r)"
+mv "packaging/output/$NAME.tar.gz" "$OUT/"
 log "smoke test"
-if ! bash tools/release/binary-smoke.sh "$OUT/stage/$NAME" "$VER" > "$OUT/smoke-$TARGET.log" 2>&1; then
+mkdir -p "$OUT/smoke" && tar -C "$OUT/smoke" -xzf "$OUT/$NAME.tar.gz"
+if ! bash tools/release/binary-smoke.sh "$OUT/smoke/$NAME" "$VER" > "$OUT/smoke-$TARGET.log" 2>&1; then
     cat "$OUT/smoke-$TARGET.log"; exit 1
 fi
 cat "$OUT/smoke-$TARGET.log"
-rm -rf "$OUT/stage"
+rm -rf "$OUT/smoke"
 ls -l "$OUT"

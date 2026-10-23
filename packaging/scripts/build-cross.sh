@@ -181,40 +181,12 @@ build_macos() {
         file "${binary_path}" || true
     fi
 
+    # F-247: アーカイブの中身（バイナリ・ライセンス・README・examples/）は全 OS で stage-archive.sh が作る
     mkdir -p "${OUTPUT_DIR}"
     local stage_parent="${BUILD_DIR}/tarball-${rust_target}"
     local dir_name="veil-${VERSION}-${rust_target}"
     rm -rf "${stage_parent}"
-    mkdir -p "${stage_parent}/${dir_name}/www"
-
-    install -m 0755 "${binary_path}" "${stage_parent}/${dir_name}/veil"
-    install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
-    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html"
-
-    cat > "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
-veil ${VERSION} — ${rust_target}
-
-universal2 バイナリ（x86_64 + aarch64 fat binary、cargo-zigbuild クロスビルド）。
-QEMU 実機検証は行っていません（Docker クロスビルドが通ることのみ確認済み。
-F-125: docs/artifacts/f125_windows_macos_design.md）。
-
-インストール手順:
-
-  install -m 0755 veil /usr/local/bin/veil
-  mkdir -p /usr/local/etc/veil
-  cp config.toml.default /usr/local/etc/veil/config.toml
-  veil --config /usr/local/etc/veil/config.toml
-
-macOS ネイティブのセキュリティ（sandbox_init/Seatbelt）:
-  config.toml で [security] enable_sandbox_macos = true を設定すると、
-  設定から導出した静的ファイルルート・TLS証明書/鍵・ログ/キャッシュディレクトリを
-  基にした SBPL プロファイルを sandbox_init(3) で適用します（実機未検証のため
-  保守的な最小プロファイル。ネットワーク・ファイル読み取りは無条件許可し、
-  ファイル書き込みのみログ/キャッシュディレクトリへ限定します）。
-
-含まれる feature: ${features}
-（TLS 暗号は aws_lc_rs プロバイダ、HTTP/3 (quiche) には内蔵 BoringSSL を使用します）
-EOF
+    "${SCRIPT_DIR}/stage-archive.sh" "${binary_path}" "${rust_target}" macos "${stage_parent}" >/dev/null
 
     tar -C "${stage_parent}" -czf "${OUTPUT_DIR}/${archive_name}" "${dir_name}"
     rm -rf "${stage_parent}"
@@ -252,37 +224,10 @@ _build_one_windows() {
     local stage_parent="${BUILD_DIR}/zip-${rust_target}"
     local dir_name="veil-${VERSION}-${rust_target}"
     rm -rf "${stage_parent}"
-    mkdir -p "${stage_parent}/${dir_name}/www"
+    "${SCRIPT_DIR}/stage-archive.sh" "${binary_path}" "${rust_target}" windows "${stage_parent}" >/dev/null
 
-    install -m 0755 "${binary_path}" "${stage_parent}/${dir_name}/veil.exe"
-    install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
-    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html"
-
-    cat > "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
-veil ${VERSION} — ${rust_target}
-
-Windows バイナリ（cargo-xwin クロスビルド、TLS プロバイダ=${provider}）。
-QEMU/実機検証は行っていません（Docker クロスビルドが通ることのみ確認済み。
-docs/artifacts/f125_windows_macos_design.md の Windows 節）。
-
-インストール手順:
-
-  1. veil.exe を任意のディレクトリへコピー
-  2. config.toml.default を config.toml としてコピーし、必要に応じて編集
-  3. veil.exe --config config.toml を実行
-
-Windows ネイティブのセキュリティ（Job Object、best-effort）:
-  config.toml で [security] enable_job_object_windows = true を設定すると、
-  CreateJobObjectW + SetInformationJobObject でプロセスに最小限のリソース制限
-  （ACTIVE_PROCESS=1、KILL_ON_JOB_CLOSE）を適用します。seccomp/Landlock相当の
-  システムコールフィルタではなく、粗粒度のプロセス制限にとどまります
-  （実機検証不可のため保守的な最小構成）。
-
-含まれる feature: ${features}
-（TLS 暗号は ${provider} プロバイダ、HTTP/3 には BoringSSL を使用します）
-EOF
-
-    (cd "${stage_parent}" && zip -r "${OUTPUT_DIR}/${archive_name}" "${dir_name}" >/dev/null)
+    rm -f "${OUTPUT_DIR}/${archive_name}"
+    (cd "${stage_parent}" && zip -qr "${OUTPUT_DIR}/${archive_name}" "${dir_name}")
     rm -rf "${stage_parent}"
     echo "==> Created ${OUTPUT_DIR}/${archive_name}"
 }
