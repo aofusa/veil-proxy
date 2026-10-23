@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # F-251: deb / rpm を systemd の動くコンテナで入れて、既定の設定で動くか・上げる・消すを確かめる。
 #
-#   packaging/scripts/test-package.sh <deb|rpm> <base-image> <package-file | --repo SETUP_SCRIPT>
+#   packaging/scripts/test-package.sh <deb|rpm> <base-image> <package-file>
+#   packaging/scripts/test-package.sh <deb|rpm> <base-image> --repo <setup-script> <repo-url>
 #
-#   --repo SETUP_SCRIPT: パッケージのファイルではなく、リポジトリから入れる（SETUP_SCRIPT はコンテナの中で
-#   リポジトリを足すシェルの断片。F-251 の apt・dnf のリポジトリの試験）。
+#   --repo: パッケージのファイルではなく、署名付きのリポジトリから入れる（setup-script は packaging/repos/ の
+#   apt-setup.sh・dnf-setup.sh。文書と同じ手順で、VEIL_REPO_URL を <repo-url> に置き換える。F-251）。
 #
 # 確かめること:
 #   1. 新しく入れる: deb は入れただけで有効・起動、rpm は enable --now の後に起動。/・/quickstart.html・h2c が 200、
@@ -45,7 +46,9 @@ install_pkg() {
         else x 'dnf install -y -q /root/veil.rpm'; fi
     fi
 }
-[ "$SRC" = --repo ] && REPO_SETUP="$(cat "${4:?setup script}")"
+if [ "$SRC" = --repo ]; then
+    REPO_SETUP="$(sed "s|VEIL_REPO_URL|${5:?repo url}|g" "${4:?setup script}")"
+fi
 
 wait_active() {
     for _ in $(seq 1 30); do x 'systemctl is-active -q veil' && return 0; sleep 1; done
