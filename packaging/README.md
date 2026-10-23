@@ -10,8 +10,8 @@ Debian/Ubuntu 向け `.deb` と Amazon Linux 2023 向け `.rpm` を生成・検�
 | ビルドスクリプト | `packaging/scripts/build.sh`（deb / rpm / 両バイナリ tar.gz を一括生成） |
 | ライブラリ成果物 | `packaging/scripts/build-lib.sh`（C ライブラリ・Python wheel・Rust ソースを `packaging/output/lib/veil-lib-*.zip` 1 個に。F-195） |
 | デフォルトビルド | `--features full`（全オプションフィーチャー有効） |
-| 設定ファイル | `contrib/config/config.toml`（`examples/config.toml` ベース） |
-| 設定配置先 | `/var/etc/veil/config.toml` |
+| 設定ファイル | `packaging/defaults/`（`tools/release/render-defaults.sh linux-package` で作る。F-247） |
+| 設定配置先 | `/etc/veil/config.toml`（veil の既定のパス。deb の conffile・rpm の `%config(noreplace)`。F-251） |
 | systemd ユニット | `contrib/systemd/veil.service` |
 | 実行ユーザー | `veil:veil` |
 
@@ -559,110 +559,88 @@ packaging/output/veil-0.9.0-x86_64-unknown-linux-musl.tar.gz
 5. `dpkg-deb` で `.deb` を生成
 6. `rpmbuild` で `.rpm` を生成
 
-## 公開（リリース。F-237・F-238）
+## 公開（リリース。F-237・F-238・F-247〜F-254）
 
-タグ `vX.Y.Z` を push すると `.github/workflows/release.yml` が次を公開する。版はタグの版で、タグ（`v` を除く）と
-`Cargo.toml` の `[workspace.package] version` が違えば何も公開しない（`tools/release/verify-tag.sh`）。
+タグ `vX.Y.Z` を push すると `.github/workflows/release.yml` が次を行う。版はタグの版で、タグ（`v` を除く）と
+`Cargo.toml` の `[workspace.package] version` が違えば何も公開しない。`docs/releases/v<版>.md`（リリースノート）が無くても
+止まる（`tools/release/verify-tag.sh`）。
 
-| 公開先 | 中身 | 鍵 |
-|---|---|---|
-| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`。`linux/amd64`・`linux/arm64`。`/veil` は `full-container`（epoll の readiness reactor。コンテナ既定の seccomp で動く） | `GITHUB_TOKEN` |
-| crates.io | `veil-proxy`・`veil-proxy-macros`・`veil-proxy-build`、vendoring の `veil-proxy-quiche`・`veil-proxy-wasmtime` | trusted publishing（OIDC） |
-| PyPI | `veil-api` の wheel（manylinux・musllinux の x86_64・aarch64、macOS の arm64・x86_64、Windows の x86_64）と sdist | trusted publishing（OIDC） |
+| 公開先 | 中身 | いつ | 鍵 |
+|---|---|---|---|
+| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`（`linux/amd64`・`linux/arm64`、`full-container`） | タグ | `GITHUB_TOKEN` |
+| crates.io | `veil-proxy`・`-macros`・`-build`・`-quiche`・`-wasmtime` | タグ | trusted publishing |
+| PyPI | `veil-api` の wheel と sdist | タグ | trusted publishing |
+| GitHub Release（**draft**） | 全 OS のアーカイブ・deb・rpm・MSI・BSD の ports・`SHA256SUMS`（Sigstore の署名）・出自の証明・リリースノート | タグ | `GITHUB_TOKEN` |
+| Docker Hub・Homebrew・apt/dnf・winget・minisign の署名 | `release-downstream.yml` | **人がページを公開したとき** | environment `release` の secrets |
+
+- **成果物（`dist.yml`）:** Linux は `build.sh --docker`（glibc 2.28・musl、x86_64・aarch64、deb・rpm）、macOS・Windows は
+  `build-cross.sh`、BSD は VM の中（`tools/release/bsd-guest-build.sh`。x86_64）。各 OS の runner で
+  `tools/release/binary-smoke.sh`、deb・rpm は 8 つの配布 × 2 アーキの `test-package.sh` と署名付きのリポジトリ・改ざんの試験、
+  Homebrew は `homebrew-test.sh`、MSI は `test-msi.ps1` と winget のマニフェスト。どれかが落ちると draft を作らない。
+- **draft（`release-draft`）:** `tools/release/github-draft.sh`。あれば差し替え、公開済みには触れない。rc も draft（`--prerelease`）。
+- **公開の後（`release-downstream.yml`）:** 鍵・token が無ければ失敗する（止めるときはリポジトリの変数
+  `DOCKERHUB_MIRROR`・`HOMEBREW_TAP`・`PACKAGE_REPOS`・`WINGET`・`MINISIGN` を `off`）。
 
 手順:
 
 ```bash
-tools/release/bump-version.sh 0.8.0       # 版を揃える（F-231）→ コミットして main にマージ
-git tag v0.8.0-rc.1 && git push origin v0.8.0-rc.1   # まず rc で通しを確かめる
-git tag v0.8.0      && git push origin v0.8.0        # 本公開
+tools/release/bump-version.sh 0.9.0       # 版を揃える（Helm chart も）→ docs/releases/v0.9.0.md を書く → main にマージ
+git tag v0.9.0-rc.1 && git push origin v0.9.0-rc.1   # rc で通しを確かめる（draft の pre-release ができる）
+git tag v0.9.0      && git push origin v0.9.0        # 本番の draft を作る → 人が確かめて公開する
 ```
 
-- プレリリースのタグ（`-` を含む）は、`-` より前（`v0.8.0-rc.1` なら `0.8.0`）を `Cargo.toml` の版と比べる（rc のために版を書き換えない。
-  成果物の版は `0.8.0` になる）。イメージは版のタグ（`musl-v0.8.0-rc.1` 等）だけを付けて `latest`・`musl`・`glibc` を
-  動かさない。crates は `cargo package --workspace` の検証だけ（crates.io の公開は取り消せない）。PyPI は TestPyPI へ送る。
-- 版のタグのイメージは上書きしない（同じタグがあれば失敗する）。crates は既にある版を飛ばすので、途中で失敗しても再実行できる。
-- イメージはダイジェストで push → アーキごとのランナー（arm64 は `ubuntu-24.04-arm`）で `tools/release/image-smoke.sh`
-  （既定の seccomp で epoll 版に切り替わること、seccomp 無しで io_uring のままのこと、HTTP/1.1・2・3）→ マニフェストに
-  まとめてタグ付けと cosign のキーレス署名。
-- Docker Hub にも置く場合は、リポジトリの secret に `DOCKERHUB_USERNAME`・`DOCKERHUB_TOKEN` を入れる（無ければ飛ばす）。
+- プレリリースのタグ（`-` を含む）は、`-` より前（`v0.9.0-rc.1` なら `0.9.0`）を `Cargo.toml` の版と比べる。成果物の版は
+  `0.9.0`。イメージは版のタグだけ、crates は検証だけ、PyPI は TestPyPI、GitHub Release は draft の pre-release。
+- 版のタグのイメージは上書きしない（同じタグがあれば失敗する）。crates は既にある版を飛ばす。
 
 ### 最初の 1 回だけ人が行う準備
 
-CI ではできないので、最初の公開の前に 1 回だけ行う。
+1. **GitHub**: Settings → Environments に `crates-io`・`pypi`・`release` を作る。
+2. **crates.io・PyPI・ghcr.io・Read the Docs**: v0.8.0 で済み（trusted publishing、パッケージの可視性）。
+3. **公開の後の配布先**（`release-downstream.yml`。environment `release` の secrets）:
 
-1. **GitHub**: リポジトリの Settings → Environments に `crates-io` と `pypi` を作る（必要なら承認者を付ける）。
-2. **crates.io**: trusted publishing は既にあるクレートにしか登録できない。最初の版（0.8.0）だけ、API の鍵で手元から
-   公開する。`tools/release/publish-crates.sh` が依存の順に公開し、既にある版を飛ばす。
-
-   ```bash
-   CARGO_REGISTRY_TOKEN=... tools/release/publish-crates.sh
-   ```
-
-   そのあと 5 つのクレートの Settings → Trusted Publishing に、リポジトリ `aofusa/veil-proxy`・workflow `release.yml`・
-   environment `crates-io` を登録し、API の鍵を失効させる。
-3. **PyPI**: プロジェクトを作る前に、Publishing の「pending publisher」に `veil-api`・`aofusa/veil-proxy`・`release.yml`・
-   environment `pypi` を登録する（TestPyPI にも同じものを登録する）。
-4. **ghcr.io**: 最初の公開の後、パッケージ `veil` の Package settings で可視性を public にし、リポジトリと紐付ける。
-5. **Read the Docs**（F-239）: `veil-api` のプロジェクトを GitHub のリポジトリから作る（`.readthedocs.yaml` を読む）。
-   Automation rules で「新しいタグを有効にし、`stable` を最新のタグに向ける」を有効にする。docs.rs は crates.io に
-   公開すると自動でビルドされる。
+   | secret | 用途 |
+   |---|---|
+   | `MINISIGN_SECRET_KEY` | アーカイブの minisign の署名（公開鍵は `Cargo.toml` の `[package.metadata.binstall.signing]`） |
+   | `DOCKERHUB_USERNAME`・`DOCKERHUB_TOKEN` | `docker.io/aofusa/veil`（Read・Write・Delete の権限、そのリポジトリだけ） |
+   | `HOMEBREW_TAP_TOKEN` | `aofusa/homebrew-tap` の Contents の書き込み（fine-grained） |
+   | `PACKAGES_TOKEN`・`PACKAGES_GPG_KEY` | `aofusa/veil-packages`（GitHub Pages）の Contents の書き込みと、署名用の副鍵 |
+   | `WINGET_TOKEN` | winget-pkgs の fork への push と PR（最初の版は人が `wingetcreate submit` で出す） |
 
 ## インストール
 
-### Debian / Ubuntu
+[docs/guide/running.md](../docs/guide/running.md#installing)（apt・dnf のリポジトリ、Homebrew、winget、cargo、BSD の ports）。
+手元で作ったパッケージを入れるときは:
 
 ```bash
-sudo dpkg -i packaging/output/veil_0.9.0_amd64.deb
-sudo apt-get install -f
-sudo systemctl enable --now veil
-```
-
-### Amazon Linux 2023
-
-```bash
-sudo dnf install -y packaging/output/veil-0.9.0-1.x86_64.rpm
-sudo systemctl enable --now veil
+sudo apt install ./packaging/output/veil_0.9.0_amd64.deb      # 入れると起動する
+sudo dnf install ./packaging/output/veil-0.9.0-1.x86_64.rpm && sudo systemctl enable --now veil
+curl http://127.0.0.1:8080/
 ```
 
 ### postinstall が行うこと
 
 | 処理 | 詳細 |
 |------|------|
-| ユーザー作成 | `veil` ユーザー / グループ（未存在時のみ） |
-| ディレクトリ作成 | `/var/www`, `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil`, `/var/etc/veil` |
-| 設定配置 | `/var/etc/veil/config.toml`（既存がなければ `config.toml.default` をコピー） |
-| サンプル HTML | `/var/www` が存在しなかった場合のみ `index.html` を配置 |
-| TLS 証明書 | `/var/etc/veil/ssl/` に自己署名証明書を生成（未存在時のみ） |
-| 権限設定 | ログ・キャッシュ・一時ディレクトリを `veil:veil`、設定を `root:veil` に |
+| ユーザー作成 | `veil` ユーザー / グループ（未存在時のみ。rpm は `%pre`） |
+| ディレクトリ作成 | `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil` |
+| 設定 | パッケージのファイル `/etc/veil/config.toml`（新しく入れたときに `root:veil 0640`）。0.8.x の `/var/etc/veil/config.toml` があればそれを使い続ける（`/etc/default/veil`・`/etc/sysconfig/veil` に `VEIL_CONFIG`） |
+| ページ | パッケージのファイル `/usr/share/veil/www/` |
+| サービス | deb は新しく入れたら有効にして起動、上げたら `try-restart`。rpm は起動しない（上げたら `try-restart`） |
+
+TLS の証明書は作らない（既定の設定は `127.0.0.1:8080` の平文）。
 
 ## 動作確認
 
-### 両パッケージを一括検証
-
 ```bash
-./packaging/scripts/build.sh          # または Docker ビルド
-./packaging/scripts/test-install.sh
+./packaging/scripts/test-deb.sh                      # ubuntu:24.04（VEIL_TEST_BASE で変える）
+./packaging/scripts/test-rpm.sh                      # amazonlinux:2023
+./packaging/scripts/test-package.sh deb debian:12 packaging/output/veil_0.9.0_amd64.deb
 ```
 
-### Debian/Ubuntu（.deb）のみ
-
-```bash
-./packaging/scripts/test-deb.sh
-```
-
-### Amazon Linux 2023（.rpm）のみ
-
-```bash
-./packaging/scripts/test-rpm.sh
-```
-
-検証内容（共通）:
-
-1. systemd 入りコンテナ起動
-2. パッケージのインストール
-3. `systemctl enable` / `systemctl start veil`
-4. コンテナ内 `curl` で HTTP リダイレクト（80）と HTTPS 応答（443）を確認
+`test-package.sh` は systemd の動くコンテナで、新しく入れる（deb は入れただけで有効・起動、rpm は `enable --now`）→
+`/`・`/quickstart.html`・h2c・journald のアクセスログ・既定のパス・`veil` の利用者 → 書き換えて入れ直す（残る）→ 消す
+（deb の purge で消える）→ 0.8.x の `/var/etc/veil` からの移行、を確かめる。
 
 ## systemd ユニットの設計上の注意
 
