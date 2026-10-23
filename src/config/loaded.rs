@@ -192,13 +192,80 @@ impl Default for RuntimeConfig {
 pub static CURRENT_CONFIG: Lazy<ArcSwap<RuntimeConfig>> =
     Lazy::new(|| ArcSwap::from_pointee(RuntimeConfig::default()));
 
-/// デフォルトの設定ファイルパス
-pub(super) const DEFAULT_CONFIG_PATH: &str = "/etc/veil/config.toml";
+/// unix の既定の設定ファイルのパス（F-247。ビルド時の `VEIL_DEFAULT_CONFIG_PATH` が無いとき）
+#[cfg(not(windows))]
+const UNIX_DEFAULT_CONFIG_PATH: &str = "/etc/veil/config.toml";
+
+// F-247: ビルド時の環境変数 `VEIL_DEFAULT_CONFIG_PATH` があればその値（ソースからビルドする BSD の ports が、
+// `/usr/local/etc` などその OS の prefix を入れる。build.rs が絶対パスであることを検査する）。
+/// The configuration file read when neither `-c` nor `VEIL_CONFIG` is given.
+///
+/// This is `VEIL_DEFAULT_CONFIG_PATH` when it was set at build time, otherwise `/etc/veil/config.toml`
+/// on unix and `%ProgramData%\veil\config.toml` on Windows.
+pub fn default_config_path() -> PathBuf {
+    if let Some(p) = option_env!("VEIL_DEFAULT_CONFIG_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // ProgramData が無い（サービスの特殊な環境など）ときは既定の場所に落とす
+        let base = std::env::var_os("ProgramData")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        base.join("veil").join("config.toml")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(UNIX_DEFAULT_CONFIG_PATH)
+    }
+}
+
+// F-247: 起動ログとエラーの文に出す
+/// Where the configuration file path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPathSource {
+    /// `-c` / `--config`.
+    CommandLine,
+    /// The `VEIL_CONFIG` environment variable.
+    Environment,
+    /// [`default_config_path`].
+    Default,
+}
+
+impl ConfigPathSource {
+    /// A short label for logs and error messages.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ConfigPathSource::CommandLine => "-c",
+            ConfigPathSource::Environment => "VEIL_CONFIG",
+            ConfigPathSource::Default => "default path",
+        }
+    }
+}
+
+// F-247: 環境変数は引数で受け取る（試験で環境を書き換えないため）
+/// Chooses the configuration file: `-c`, then `VEIL_CONFIG` (ignored when empty), then
+/// [`default_config_path`].
+pub fn resolve_config_path(
+    cli: Option<PathBuf>,
+    env_value: Option<std::ffi::OsString>,
+) -> (PathBuf, ConfigPathSource) {
+    if let Some(p) = cli {
+        return (p, ConfigPathSource::CommandLine);
+    }
+    if let Some(v) = env_value.filter(|v| !v.is_empty()) {
+        return (PathBuf::from(v), ConfigPathSource::Environment);
+    }
+    (default_config_path(), ConfigPathSource::Default)
+}
 
 /// グローバルな設定ファイルパス（ホットリロード用）
 /// コマンドライン引数で指定されたパス、またはデフォルトパスを保持
 pub static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
-    Lazy::new(|| ArcSwap::from_pointee(PathBuf::from(DEFAULT_CONFIG_PATH)));
+    Lazy::new(|| ArcSwap::from_pointee(default_config_path()));
 
 /// HTTPSリダイレクト先のポート（listen設定から抽出）
 ///
@@ -1499,5 +1566,78 @@ pub(super) fn build_backend(
                 format!("unknown handler '{}' (not registered)", handler),
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    // F-247: 設定ファイルの決まり方（-c → VEIL_CONFIG → 既定のパス）と、--help に出る文
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn command_line_wins_over_environment() {
+        let (p, src) = resolve_config_path(
+            Some(PathBuf::from("/tmp/a.toml")),
+            Some("/tmp/b.toml".into()),
+        );
+        assert_eq!(p, PathBuf::from("/tmp/a.toml"));
+        assert_eq!(src, ConfigPathSource::CommandLine);
+    }
+
+    #[test]
+    fn environment_wins_over_default() {
+        let (p, src) = resolve_config_path(None, Some("/tmp/b.toml".into()));
+        assert_eq!(p, PathBuf::from("/tmp/b.toml"));
+        assert_eq!(src, ConfigPathSource::Environment);
+    }
+
+    #[test]
+    fn empty_environment_falls_back_to_default() {
+        let (p, src) = resolve_config_path(None, Some("".into()));
+        assert_eq!(p, default_config_path());
+        assert_eq!(src, ConfigPathSource::Default);
+        let (p, src) = resolve_config_path(None, None);
+        assert_eq!(p, default_config_path());
+        assert_eq!(src, ConfigPathSource::Default);
+    }
+
+    #[test]
+    fn default_path_per_platform() {
+        let p = default_config_path();
+        if let Some(built) = option_env!("VEIL_DEFAULT_CONFIG_PATH").filter(|s| !s.is_empty()) {
+            assert_eq!(p, PathBuf::from(built));
+            return;
+        }
+        #[cfg(windows)]
+        assert!(p.ends_with(r"veil\config.toml"), "{}", p.display());
+        #[cfg(not(windows))]
+        assert_eq!(p, PathBuf::from("/etc/veil/config.toml"));
+        assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn config_flag_is_optional() {
+        let a = CliArgs::try_parse_from(["veil"]).unwrap();
+        assert!(a.config.is_none());
+        let a = CliArgs::try_parse_from(["veil", "-c", "/x/config.toml", "-t"]).unwrap();
+        assert_eq!(a.config, Some(PathBuf::from("/x/config.toml")));
+        assert!(a.test_config);
+    }
+
+    #[test]
+    fn help_explains_the_configuration_file_in_english() {
+        let help = match CliArgs::try_parse_from(["veil", "--help"]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("--help should print the help"),
+        };
+        assert!(help.contains("VEIL_CONFIG"), "{}", help);
+        assert!(
+            help.contains(&default_config_path().display().to_string()),
+            "{}",
+            help
+        );
+        assert!(help.contains("create the file"), "{}", help);
+        assert!(help.is_ascii(), "help must be English: {}", help);
     }
 }

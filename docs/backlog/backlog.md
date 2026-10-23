@@ -471,6 +471,8 @@
 | B-157 | P1 | 完了 | [bugs/B-157-dependency-advisories-v083.md](bugs/B-157-dependency-advisories-v083.md) | v0.8.3 の後に出た RUSTSEC 勧告（rustls-webpki 0.103.15・wasmtime 36.0.18 の Cranelift 2 件・webpki-roots / webpki-root-certs 1.0.8）で毎晩の cargo_audit・cargo_deny が失敗。rustls-webpki 0.103.16・wasmtime 36.0.19（vendoring 版も取り込み直し）・webpki-roots 1.0.10。イメージの grype は only-fixed（distroless の libc6 は won't fix。B-158 で撤回） |
 | B-158 | P1 | 完了 | [bugs/B-158-unfixed-image-vulns-and-advisory-gaps.md](bugs/B-158-unfixed-image-vulns-and-advisory-gaps.md) | glibc イメージ（distroless）の libc6 に直す版の無い High が 2 件あり、grype の only-fixed・Trivy の --ignore-unfixed で見逃していた。cargo-audit はルートの Cargo.lock だけを見ていて、例・試験用のクレートに rustls-webpki 0.103.15 などが残っていた。glibc の土台を Wolfi（chainguard/glibc-dynamic）に、直す版の無いものも失敗に、公開の workflow に勧告とイメージの関門、全 Cargo.lock を警告も失敗で検査。wasmtime の profiling（fxhash）・jwt-filter の rsa（修正版なし）・VDS の tonic 0.12（rustls-pemfile）を外した |
 | B-159 | P1 | 完了 | [bugs/B-159-metrics-label-cardinality.md](bugs/B-159-metrics-label-cardinality.md) | 要求の Host・メソッド・gRPC のパスがそのままメトリクスのラベルになり、でたらめな値で系列が際限なく増えた（Host 5000 種類で /__metrics 10.8MB・RSS +35MB）。host は設定の host 条件か other、メソッドは標準のもの、gRPC は UNIMPLEMENTED を除き 1024 種類まで。container_security の集計が FAIL を含むレポートを passed に数えていた |
+| B-160 | P1 | 完了 | [bugs/B-160-relative-file-root-403-http1.md](bugs/B-160-relative-file-root-403-http1.md) | File のルートを相対パスで書くと Linux の HTTP/1.1 の静的配信が全件 403（openat2 で開いた生パスを canonical 形とだけ比べていた）。生の `base_path` 配下の許可を全 OS に広げた |
+| B-161 | P1 | 完了 | [bugs/B-161-startup-failure-exit-zero.md](bugs/B-161-startup-failure-exit-zero.md) | 設定・bind などで起動に失敗しても終了コードが 0（systemd の Restart=on-failure などが気づけない）。起動を終える前に戻ったら終了コード 1 |
 
 ---
 

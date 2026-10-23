@@ -77,38 +77,42 @@ pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>) {
     let _ = timeout(Duration::from_secs(5), stream.write_all(response)).await;
 }
 
-/// High-Performance Reverse Proxy Server
-///
-/// io_uring（独自ランタイム）と rustls を使用した高性能リバースプロキシサーバー
+// F-247: `--help` は利用者に見える文なので英語にする（F-241/F-242）。設定ファイルは
+// `-c` → 環境変数 `VEIL_CONFIG` → 既定のパス（`default_config_path`）の順で決まる。
+/// High-performance reverse proxy server.
 #[derive(Parser, Debug)]
 #[command(name = "veil")]
 #[command(author, version, about, long_about = None)]
+#[command(after_help = config_file_help())]
 pub struct CliArgs {
-    /// 設定ファイルのパス
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
-    pub config: PathBuf,
+    /// Configuration file [default: $VEIL_CONFIG, then the default path below]
+    #[arg(short, long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 
-    /// 設定ファイルの構文と内容を検証して終了（nginx -t 相当）
+    /// Check the configuration file and exit (like `nginx -t`)
     #[arg(short = 't', long = "test")]
     pub test_config: bool,
 
-    /// config.toml の値をコマンドラインから上書きする（繰り返し指定可）。
+    /// Override a configuration value, e.g. -o "server.threads = 1" (repeatable)
     ///
-    /// 構文: `<path> = <toml-value>`（`=` 前後の空白は任意）。
-    /// - `<path>` はドット区切りのキーパス（例: `server.threads`）。セグメントは
-    ///   裸のキー（`[A-Za-z0-9_-]+`）・クオート文字列（`"a.b"`/`'a.b'`、キーに
-    ///   ドットを含む場合用）・10 進数の配列インデックス（親が配列の場合。
-    ///   例: `l4.0.listen`）のいずれか。セクション記法風に `[server].threads = 1`
-    ///   のように先頭（または任意のセグメント）を `[ ]` で囲んでもよい。
-    /// - `<toml-value>` は TOML 値としてパースする（`1`、`"str"`、`true`、`1.5`、
-    ///   `[1, 2]`、`{ a = 1 }` 等）。クオート・角括弧・波括弧のいずれも含まない
-    ///   裸のトークンが TOML 値として不正な場合は文字列として扱う
-    ///   （例: `-o "tls.cert_path = /etc/veil/cert.pem"`）。
-    /// - 例: `-o "server.threads = 1" -o '[server].threads = 1'`
-    ///
-    /// 起動時のみならず SIGHUP によるホットリロード・`-t` 検証にも同じ内容が適用される。
+    /// `<path>` is a dotted key path (`server.threads`, `l4.0.listen`, `"a.b"` for a key with a dot,
+    /// `[server].threads`); `<toml-value>` is parsed as TOML and falls back to a string. Also applied on
+    /// a SIGHUP reload and with -t.
     #[arg(short = 'o', long = "override", value_name = "KEY=VALUE")]
     pub overrides: Vec<String>,
+}
+
+/// `--help` の末尾に出す、設定ファイルの決まり方（F-247）。既定のパスはビルドごとに違うので実際の値を出す。
+fn config_file_help() -> String {
+    format!(
+        "Configuration file:\n  \
+         veil reads -c FILE, otherwise $VEIL_CONFIG, otherwise {}.\n  \
+         Packages (deb, rpm, Homebrew, winget, BSD ports) install a default file and page there.\n  \
+         A plain binary (release archive, cargo install, cargo binstall) does not: create the file\n  \
+         yourself (the release archive has an example in examples/). See\n  \
+         https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md#configuration-file",
+        default_config_path().display()
+    )
 }
 
 /// 設定ファイルを検証（読み込みとバリデーションのみ、起動しない）

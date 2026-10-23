@@ -28,6 +28,23 @@ fn main() {
     emit_runtime_backend_cfg();
     emit_wasm_nosignals_cfg();
     emit_allocator_cfg();
+    check_default_config_path();
+}
+
+/// F-247: ソースからビルドするパッケージ（BSD の ports）が `VEIL_DEFAULT_CONFIG_PATH` で既定の設定ファイルの
+/// パスを入れる（`src/config/loaded.rs` の `option_env!`）。相対パスだと起動したディレクトリで意味が変わるので、
+/// 絶対パスだけを受け付ける。
+fn check_default_config_path() {
+    println!("cargo:rerun-if-env-changed=VEIL_DEFAULT_CONFIG_PATH");
+    if let Ok(p) = std::env::var("VEIL_DEFAULT_CONFIG_PATH") {
+        let windows_abs = p.len() > 2 && p.as_bytes()[1] == b':';
+        if !p.is_empty() && !p.starts_with('/') && !windows_abs {
+            panic!(
+                "VEIL_DEFAULT_CONFIG_PATH must be an absolute path, got {:?}",
+                p
+            );
+        }
+    }
 }
 
 /// F-183: veil 専用アロケータ（`veil-alloc` feature）を実際に使うかの cfg エイリアス。

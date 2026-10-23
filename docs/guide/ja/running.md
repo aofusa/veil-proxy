@@ -5,7 +5,7 @@
 ## 起動
 
 ```bash
-# デフォルト設定ファイル（/etc/veil/config.toml）で起動
+# 既定のパスの設定ファイルで起動（下の「設定ファイル」）
 ./veil
 
 # 設定ファイルを指定して起動
@@ -23,11 +23,82 @@
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
-| `-c, --config <PATH>` | 設定ファイルのパス | `/etc/veil/config.toml` |
+| `-c, --config <PATH>` | 設定ファイルのパス | `$VEIL_CONFIG`、無ければ既定のパス（下記） |
 | `-t, --test` | 設定ファイルの構文と内容を検証して終了（nginx -t 相当） | - |
 | `-o, --override <KEY=VALUE>` | config.toml の値をコマンドラインから上書き（繰り返し指定可、後述） | - |
 | `-h, --help` | ヘルプメッセージを表示 | - |
 | `-V, --version` | バージョン情報を表示 | - |
+
+### 設定ファイル
+
+veil は常に設定ファイルを読みます。設定は内蔵していません。読むファイルは次の順で決まります。
+
+1. `-c FILE` / `--config FILE`
+2. 環境変数 `VEIL_CONFIG`（空なら無視）
+3. 既定のパス
+
+   | ビルド | 既定のパス |
+   |---|---|
+   | Linux・macOS・FreeBSD・OpenBSD・NetBSD | `/etc/veil/config.toml` |
+   | Windows | `%ProgramData%\veil\config.toml` |
+   | ビルド時に `VEIL_DEFAULT_CONFIG_PATH=/絶対パス` を設定した場合（BSD の ports） | その値 |
+
+   実行するバイナリの既定のパスは `veil --help` に出ます。
+
+ファイルが無いときは、探したパスを示して終了コード 1 で止まります。起動ログには、ファイルとそのパスの決まり方が出ます
+（`Config File: /etc/veil/config.toml (from default path)`）。SIGHUP のリロードも同じファイルを読み直します。
+
+#### パッケージが既定の設定を置く場所
+
+各パッケージは既定の設定と既定のページを置き、veil はオプション無しでそれを読みます。既定の設定は、そのページを
+`127.0.0.1:8080`（コンテナは `0.0.0.0:8080`）の平文の HTTP/1.1・h2c で配り、要求ごとにアクセスログを出します。
+ページ（`/quickstart.html`）にもこの表があります。
+
+| 入れ方 | 設定 | ページ | veil がファイルを見つける方法 | 起動 |
+|---|---|---|---|---|
+| コンテナイメージ | `/etc/veil/conf.d/config.toml` | `/var/www/` | イメージの `CMD` が `-c` を渡す | `docker run -p 8080:8080 ghcr.io/aofusa/veil` |
+| deb・rpm | `/etc/veil/config.toml` | `/usr/share/veil/www/` | 既定のパス | Debian・Ubuntu は入れると起動、RPM は `sudo systemctl enable --now veil` |
+| Homebrew | `$(brew --prefix)/etc/veil/config.toml` | `$(brew --prefix)/share/veil/www/` | `veil` の wrapper が `VEIL_CONFIG` を設定 | `brew services start veil` か `veil` |
+| winget | `%ProgramData%\veil\config.toml` | `%ProgramData%\veil\www\` | 既定のパス | `veil` |
+| FreeBSD ports | `/usr/local/etc/veil/config.toml` | `/usr/local/share/veil/www/` | ビルド時に入れた既定のパス | `sysrc veil_enable=YES && service veil start` |
+| OpenBSD ports | `/etc/veil/config.toml` | `/usr/local/share/veil/www/` | 既定のパス | `rcctl enable veil && rcctl start veil` |
+| NetBSD pkgsrc | `/usr/pkg/etc/veil/config.toml` | `/usr/pkg/share/veil/www/` | ビルド時に入れた既定のパス | `/etc/rc.conf` に `veil=YES`、`service veil start` |
+
+パッケージを上げても、書き換えた設定は上書きされません。
+
+#### バイナリだけを使う場合は設定を自分で用意する
+
+リリースのアーカイブ・`cargo install veil-proxy`・`cargo binstall veil-proxy` で入るのは `veil` のバイナリだけです。
+設定ファイルとページは入りません（cargo にはデータのファイルを入れる仕組みが無く、veil も自分では書きません）。
+自分で用意してください。既定の設定とページが入った状態で使いたいときは、パッケージかコンテナイメージを使ってください。
+
+リリースのアーカイブの `examples/` に、出発点になる例があります。
+
+```bash
+cd veil-<version>-<target>
+./veil -c examples/config.toml        # examples/www/ を http://127.0.0.1:8080/ で配る
+```
+
+最初から書く場合の最小の設定（`/srv/www` に `index.html` を置く）:
+
+```toml
+[server]
+listen_cleartext = "127.0.0.1:8080"   # 平文の HTTP/1.1 + h2c
+enable_secure_redirect = false        # TLS のリスナーが無いので https へリダイレクトしない
+
+[access_log]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/srv/www/"
+```
+
+`veil -c /path/to/config.toml` で起動するか、`VEIL_CONFIG=/path/to/config.toml` を設定するか、既定のパスに置いてください。
+設定の中の相対パスは、veil を起動したディレクトリからの相対です。
 
 ### 設定の上書き（`-o`/`--override`）
 

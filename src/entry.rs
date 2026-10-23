@@ -180,11 +180,46 @@ pub fn run() {
     overrides.extend(cli_overrides);
     crate::config_override::set_global_overrides(overrides);
 
+    // F-247: 設定ファイルは -c → 環境変数 VEIL_CONFIG → 既定のパスの順で決める。設定は内蔵しない
+    // （無ければ置き場所を示して止まる。パッケージは既定のパスに既定の設定を置く）。
+    let (config_path, source) =
+        crate::config::resolve_config_path(cli_args.config, std::env::var_os("VEIL_CONFIG"));
+    if !config_path.exists() {
+        eprintln!(
+            "veil: configuration file not found: {} (from {})",
+            config_path.display(),
+            source.describe()
+        );
+        eprintln!(
+            "veil: pass a file with -c FILE or set VEIL_CONFIG; packages install a default file at {}",
+            crate::config::default_config_path().display()
+        );
+        eprintln!("veil: see {}", CONFIG_FILE_DOC_URL);
+        std::process::exit(1);
+    }
+    let _ = CONFIG_PATH_SOURCE.set(source);
+
     run_server(ServerOptions {
-        config_path: cli_args.config,
+        config_path,
         test_config: cli_args.test_config,
     });
+    // F-247: 起動の途中のエラー（設定の読み込み・bind など）で run_server から戻ったときは終了コード 1 にする
+    // （今まで 0 で終わり、systemd の Restart=on-failure やスクリプトが失敗に気づけなかった）
+    if !STARTUP_COMPLETED.load(std::sync::atomic::Ordering::Acquire) {
+        std::process::exit(1);
+    }
 }
+
+/// 設定ファイルの決まり方の文書（F-247。エラーの文に出す）
+const CONFIG_FILE_DOC_URL: &str =
+    "https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md#configuration-file";
+
+/// 設定ファイルのパスがどこから決まったか（F-247。起動ログに出す。ライブラリからの起動では未設定）
+static CONFIG_PATH_SOURCE: std::sync::OnceLock<crate::config::ConfigPathSource> =
+    std::sync::OnceLock::new();
+
+/// 全リスナー・ワーカーの起動を終えたら true（F-247。run_server が起動の途中で戻ったかの判定）
+static STARTUP_COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Startup options of the server (independent of CLI parsing; also used by the API library).
 pub struct ServerOptions {
@@ -623,7 +658,14 @@ pub fn run_server(opts: ServerOptions) {
 
     info!("============================================");
     info!("High-Performance Reverse Proxy Server");
-    info!("Config File: {}", config_path.display());
+    match CONFIG_PATH_SOURCE.get() {
+        Some(src) => info!(
+            "Config File: {} (from {})",
+            config_path.display(),
+            src.describe()
+        ),
+        None => info!("Config File: {}", config_path.display()),
+    }
     info!("Hostname: {}", hostname);
     info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
     info!(
@@ -1913,6 +1955,8 @@ pub fn run_server(opts: ServerOptions) {
             "TLS private key (LoadedConfig)",
         );
     }
+
+    STARTUP_COMPLETED.store(true, std::sync::atomic::Ordering::Release);
 
     for (index, handle) in handles.into_iter().enumerate() {
         match handle.join() {

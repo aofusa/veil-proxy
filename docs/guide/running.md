@@ -5,7 +5,7 @@
 ## Startup
 
 ```bash
-# Start with default config file (/etc/veil/config.toml)
+# Start with the configuration file at the default path (see "Configuration file" below)
 ./veil
 
 # Start with specified config file
@@ -23,11 +23,84 @@
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --config <PATH>` | Path to config file | `/etc/veil/config.toml` |
+| `-c, --config <PATH>` | Path to config file | `$VEIL_CONFIG`, then the default path (below) |
 | `-t, --test` | Test config file syntax and validity, then exit (nginx -t equivalent) | - |
 | `-o, --override <KEY=VALUE>` | Override a config.toml value from the command line (repeatable, see below) | - |
 | `-h, --help` | Show help message | - |
 | `-V, --version` | Show version information | - |
+
+### Configuration file
+
+veil always reads a configuration file; there is no built-in configuration. The file is chosen in this order:
+
+1. `-c FILE` / `--config FILE`
+2. the `VEIL_CONFIG` environment variable (ignored when empty)
+3. the default path:
+
+   | Build | Default path |
+   |---|---|
+   | Linux, macOS, FreeBSD, OpenBSD, NetBSD | `/etc/veil/config.toml` |
+   | Windows | `%ProgramData%\veil\config.toml` |
+   | Built with `VEIL_DEFAULT_CONFIG_PATH=/abs/path` set at build time (BSD ports) | that path |
+
+   `veil --help` prints the default path of the binary you run.
+
+When the file does not exist, veil exits with status 1 and names the path it looked for. The startup log shows the
+file and where its path came from (`Config File: /etc/veil/config.toml (from default path)`). A SIGHUP reload reads the
+same file again.
+
+#### Where the packages put the default configuration
+
+Each package installs a default configuration and a default page, and veil reads them without any option. The default
+configuration serves the page over plaintext HTTP/1.1 and h2c on `127.0.0.1:8080` (the container on `0.0.0.0:8080`) and
+logs every request; the page also lists these paths (`/quickstart.html`).
+
+| Installed with | Configuration | Page | How veil finds the file | Start |
+|---|---|---|---|---|
+| Container image | `/etc/veil/conf.d/config.toml` | `/var/www/` | the image's `CMD` passes `-c` | `docker run -p 8080:8080 ghcr.io/aofusa/veil` |
+| deb / rpm | `/etc/veil/config.toml` | `/usr/share/veil/www/` | default path | Debian / Ubuntu: started on install; RPM: `sudo systemctl enable --now veil` |
+| Homebrew | `$(brew --prefix)/etc/veil/config.toml` | `$(brew --prefix)/share/veil/www/` | the `veil` wrapper sets `VEIL_CONFIG` | `brew services start veil` or `veil` |
+| winget | `%ProgramData%\veil\config.toml` | `%ProgramData%\veil\www\` | default path | `veil` |
+| FreeBSD ports | `/usr/local/etc/veil/config.toml` | `/usr/local/share/veil/www/` | default path built in | `sysrc veil_enable=YES && service veil start` |
+| OpenBSD ports | `/etc/veil/config.toml` | `/usr/local/share/veil/www/` | default path | `rcctl enable veil && rcctl start veil` |
+| NetBSD pkgsrc | `/usr/pkg/etc/veil/config.toml` | `/usr/pkg/share/veil/www/` | default path built in | `veil=YES` in `/etc/rc.conf`, `service veil start` |
+
+Package upgrades never overwrite a configuration you changed.
+
+#### Binary only: create the configuration yourself
+
+The release archives, `cargo install veil-proxy` and `cargo binstall veil-proxy` install the `veil` binary only. They
+do **not** install a configuration file or a page (cargo has no way to install data files, and veil does not write one
+for you): create them yourself. If you want a default configuration and page installed for you, use a package or the
+container image instead.
+
+The release archive has an example in `examples/` to start from:
+
+```bash
+cd veil-<version>-<target>
+./veil -c examples/config.toml        # serves examples/www/ on http://127.0.0.1:8080/
+```
+
+A minimal configuration, if you start from scratch (`/srv/www` holds your `index.html`):
+
+```toml
+[server]
+listen_cleartext = "127.0.0.1:8080"   # plaintext HTTP/1.1 + h2c
+enable_secure_redirect = false        # no TLS listener, so serve instead of redirecting to https
+
+[access_log]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/srv/www/"
+```
+
+Then run `veil -c /path/to/config.toml`, set `VEIL_CONFIG=/path/to/config.toml`, or put the file at the default path.
+Relative paths in the file are relative to the directory you start veil from.
 
 ### Configuration Override (`-o`/`--override`)
 
