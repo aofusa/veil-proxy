@@ -61,8 +61,7 @@ netbsd)
 esac
 
 cd "$ROOT"
-# fuzz はワークスペースのメンバーだが BSD では使わない（ビルドの対象外にする。bsd-vm.sh と同じ）
-sed -i.bak -e 's|"fuzz", ||' Cargo.toml && rm -f Cargo.toml.bak
+# bsd-vm.sh は fuzz/ を VM へ送らないので Cargo.toml から外しているが、ここは checkout した木そのまま（--locked が通る）
 cargo --version
 log "cargo build --profile dist --features $FEATURES"
 cargo build --locked --profile dist --no-default-features --features "$FEATURES"
