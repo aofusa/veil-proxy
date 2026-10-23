@@ -35,8 +35,23 @@ Performance against nginx is published in [docs/perf/README.md](docs/perf/README
 
 ## Install
 
-Prebuilt binaries and packages (`.deb`, `.rpm`, tarballs for Linux/BSD/macOS/Windows) are
-attached to each [GitHub release](https://github.com/aofusa/veil-proxy/releases).
+The packages and the container image install a default configuration and page: run veil and open
+<http://127.0.0.1:8080/> (the container: <http://localhost:8080/>).
+
+| | Command |
+|---|---|
+| Container | `docker run --rm -p 8080:8080 ghcr.io/aofusa/veil` (also `aofusa/veil` on Docker Hub) |
+| Debian / Ubuntu, RHEL / Fedora / Amazon Linux | add the [apt or dnf repository](docs/guide/running.md#apt-and-dnf-repositories), then `apt install veil` / `dnf install veil` |
+| Homebrew (macOS, Linux) | `brew install aofusa/tap/veil` |
+| Windows | `winget install Aofusa.Veil` |
+| FreeBSD, OpenBSD, NetBSD | the ports in [packaging/bsd/ports](packaging/bsd/ports/README.md) |
+| Rust | `cargo binstall veil-proxy` or `cargo install veil-proxy --locked --features full` |
+
+`cargo install`, `cargo binstall` and the archives attached to each
+[GitHub release](https://github.com/aofusa/veil-proxy/releases) install the `veil` binary only: create the
+configuration file yourself (the archive has an example in `examples/`). veil reads `-c FILE`, then
+`VEIL_CONFIG`, then the default path (`/etc/veil/config.toml`; `%ProgramData%\veil\config.toml` on Windows).
+See [Configuration file](docs/guide/running.md#configuration-file).
 
 To build from source (Rust stable, `cmake` and `nasm`):
 

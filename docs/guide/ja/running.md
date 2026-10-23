@@ -66,6 +66,74 @@ veil は常に設定ファイルを読みます。設定は内蔵していませ
 
 パッケージを上げても、書き換えた設定は上書きされません。
 
+#### 入れ方
+
+バイナリだけのもの以外は、上の既定の設定とページも一緒に入ります。
+
+##### apt・dnf のリポジトリ
+
+Debian・Ubuntu（amd64・arm64）と、RHEL 互換・Fedora・Amazon Linux（x86_64・aarch64）向けの署名付きのリポジトリです。
+署名の鍵の指紋は `42FF D5A9 145A BEAD 9CDE  F997 AF5B 42F9 5AC9 AEB9` です。
+
+```bash
+# Debian 12・13、Ubuntu 22.04・24.04
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://aofusa.github.io/veil-packages/veil.gpg | sudo tee /etc/apt/keyrings/veil.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/veil.gpg] https://aofusa.github.io/veil-packages/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/veil.list
+sudo apt update && sudo apt install veil      # サービスが起動する
+curl http://127.0.0.1:8080/
+
+# RHEL 9・10 と互換、Fedora、Amazon Linux 2023
+sudo curl -fsSL https://aofusa.github.io/veil-packages/veil.repo -o /etc/yum.repos.d/veil.repo
+sudo dnf install veil
+sudo systemctl enable --now veil
+curl http://127.0.0.1:8080/
+```
+
+`.deb`・`.rpm` は GitHub のリリースにも付いています。ログは journal に出ます（`journalctl -u veil`）。設定を変えたら
+`sudo systemctl reload veil` で読み直します。`apt remove` は `/etc/veil/config.toml` を残し、`apt purge` は消します。
+
+0.8.x（設定を `/var/etc/veil/config.toml` に置いていた）から上げる場合: パッケージはそのファイルを使い続けます
+（`/etc/default/veil` か `/etc/sysconfig/veil` に `VEIL_CONFIG=/var/etc/veil/config.toml` を書く）。既定のパスへ移すときは、
+設定を `/etc/veil/config.toml` に写し、その行を消して `sudo systemctl restart veil` を実行してください。0.8.x が
+`/var/etc/veil/ssl/` に作った自己署名の証明書は、そのまま残ります。
+
+##### Homebrew（macOS・Linux）
+
+```bash
+brew install aofusa/tap/veil
+brew services start veil        # または端末で veil を起動
+curl http://127.0.0.1:8080/
+```
+
+`veil` コマンドは wrapper で、自分で `VEIL_CONFIG` を設定していなければ `$(brew --prefix)/etc/veil/config.toml` を
+設定します。`veil -t` と `veil` はそのファイルを使います。設定を変えたら `brew services restart veil` で反映します。
+
+##### winget（Windows）
+
+```powershell
+winget install Aofusa.Veil      # 管理者で。全利用者向けに入る
+veil                            # 新しい端末で。http://127.0.0.1:8080/ を開く
+```
+
+MSI は `C:\Program Files\veil\veil.exe`（`PATH` に足す）、設定 `%ProgramData%\veil\config.toml`、ページ
+`%ProgramData%\veil\www\` を入れます。`%ProgramData%\veil` のファイルを変えられるのは管理者だけです。上げても
+`winget uninstall` しても、設定は残ります。Windows のサービスには登録しません。サービスとして動かすときは
+`sc.exe create veil binPath= "C:\Program Files\veil\veil.exe"` か、サービスの wrapper を使ってください。
+
+##### Rust（`cargo binstall`・`cargo install`）
+
+```bash
+cargo binstall veil-proxy                                   # GitHub のリリースのビルド済みのバイナリ
+cargo install veil-proxy --locked --features full           # crates.io からビルド（Linux）
+```
+
+どちらもバイナリだけを入れます（下記）。`cargo binstall` は各アーカイブの minisign の署名を確かめます。
+`cargo install` の feature は OS に合わせて選んでください: `full`（Linux）・`full-macos`・`full-windows`・
+`full-freebsd`・`full-openbsd`・`full-netbsd`。`--features` を付けないと既定の feature（kTLS・HTTP/2）だけになります。
+ビルドには C コンパイラと `cmake`、Windows では `nasm` が要ります（[ビルド](building.md)）。
+
 #### バイナリだけを使う場合は設定を自分で用意する
 
 リリースのアーカイブ・`cargo install veil-proxy`・`cargo binstall veil-proxy` で入るのは `veil` のバイナリだけです。
