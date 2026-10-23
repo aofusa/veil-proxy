@@ -9,6 +9,36 @@ client Pod ──(メッシュ mTLS)──▶ [istio-proxy / linkerd-proxy] ─�
                                                                 veil :8443 (TLS、Secret の証明書)
 ```
 
+## Helm
+
+chart は veil を単独の Deployment と Service（ゲートウェイ・静的なサイト・リバースプロキシ）として入れます。サイドカーの
+構成とメッシュには、下のマニフェストを使ってください。
+
+```bash
+helm install veil oci://ghcr.io/aofusa/charts/veil --version <版>
+kubectl port-forward svc/veil 8080:8080
+curl http://127.0.0.1:8080/        # イメージに入っているページ
+```
+
+既定の設定（values から ConfigMap に作る）は、イメージの `/var/www` を 8080 番の平文の HTTP/1.1・h2c で配ります。Pod は
+非 root（65532）・読み取り専用のルート・全ケイパビリティを落とす・`RuntimeDefault` の seccomp で動き、veil が自分の seccomp と
+Landlock を足します。設定を変えると Pod が入れ替わります（checksum の注釈）。chart はイメージと同じく cosign（keyless）で
+署名しています。
+
+| 値 | 既定 | |
+|---|---|---|
+| `image.repository` / `tag` / `digest` | `ghcr.io/aofusa/veil` / `musl-v<appVersion>` / — | `docker.io/aofusa/veil` も使える |
+| `config` / `existingConfigMap` | — | 自分の `config.toml`（`--set-file config=config.toml`） |
+| `tls.secretName` | — | `kubernetes.io/tls` の Secret。TLS のリスナー（8443 番、Service は `service.tlsPort`）を足す |
+| `http3.enabled` | `false` | UDP 8443 の QUIC。別の Service `<release>-veil-h3`（`tls.secretName` が要る） |
+| `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | `/__metrics` と Prometheus Operator の ServiceMonitor |
+| `grafanaDashboard.enabled` | `false` | [ダッシュボードの例](observability.md) を Grafana の sidecar 向けの ConfigMap にする |
+| `extraVolumes` / `extraVolumeMounts` | — | 自分のファイル。例: `/var/www` にマウントした ConfigMap |
+| `autoscaling` / `podDisruptionBudget` / `networkPolicy` | 無効 | |
+
+すべての値の説明は [deploy/helm/veil/values.yaml](../../../deploy/helm/veil/values.yaml) にあります。Service に `appProtocol` は
+付けません（下のメッシュの注意）。chart は kind で `tools/release/helm-kind-test.sh` を回して試験しています。
+
 ## イメージ
 
 公開イメージ `ghcr.io/aofusa/veil:latest`（musl 版。`:glibc` も同等。どちらも `linux/amd64`・`linux/arm64`）はそのまま使える。
