@@ -10,10 +10,13 @@
 # <out-dir> に distinfo とパッケージ・ログを置く（提出のときに distinfo を使う）。
 set -eu
 OS="$1"; TAG="$2"; OUT="$3"
+STEP="start"
+# 失敗したら、どの段階で落ちたかと空き容量を出す（ログはログイン無しで読めないので、CI の注釈に出す）
+trap 'rc=$?; [ "$rc" = 0 ] || { echo "PORT STEP FAILED: $STEP (exit $rc)"; df -h / /usr 2>/dev/null | tail -3; }' EXIT
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VER="${TAG#v}"
 mkdir -p "$OUT"
-log() { echo "==> $*"; }
+log() { STEP="$*"; echo "==> $*"; }
 check() { # <label> <cmd...>
     label="$1"; shift
     if "$@" >"$OUT/check.log" 2>&1; then echo "ok   $label"; else echo "FAIL $label"; tail -20 "$OUT/check.log"; FAILED=1; fi

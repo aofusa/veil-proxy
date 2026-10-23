@@ -420,7 +420,9 @@ jobs:
         run: |
           grep -E '^(ok|FAIL|PORT TEST)' ports-out/test.log | sed 's/^/::notice title=port ${{ matrix.os }}::/' || true
           if grep -q PORT_FAILED ports-out/test.log; then
-            tail -25 ports-out/test.log | while IFS= read -r l; do echo "::warning title=port ${{ matrix.os }} tail::${l:0:800}"; done
+            grep -E 'PORT STEP FAILED|^==>|[Ee]rror|No space|not found|fatal|Stop\.|\*\*\*' ports-out/test.log | tail -25 \
+              | while IFS= read -r l; do echo "::error title=port ${{ matrix.os }}::${l:0:800}"; done
+            tail -12 ports-out/test.log | while IFS= read -r l; do echo "::warning title=port ${{ matrix.os }} tail::${l:0:800}"; done
             exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
