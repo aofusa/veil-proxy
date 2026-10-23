@@ -1,0 +1,15 @@
+#!/bin/ksh
+
+daemon="${TRUEPREFIX}/bin/veil"
+daemon_flags=""
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=YES
+
+rc_pre() {
+	${daemon} -t ${daemon_flags}
+}
+
+rc_cmd $1

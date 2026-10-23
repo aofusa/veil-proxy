@@ -374,3 +374,62 @@ jobs:
           path: out/*.tar.gz
           if-no-files-found: error
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # BSD の ports（F-253）: bsd-ports.py の port を各 OS の ports の仕組みでビルドし、入れてサービスとして起動する。
+  # ports の木への提出の前の確認で、配布物ではないので失敗しても release の draft は止めない（結果は注釈と artifact）。
+  # ---------------------------------------------------------------------------
+  bsd-ports:
+    name: port ${{ matrix.os }}
+    if: inputs.bsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: freebsd, version: "14.3" }
+          - { os: openbsd, version: "7.9" }
+          - { os: netbsd, version: "10.1" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: build the port, install the package, start the service
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        with:
+          operating_system: ${{ matrix.os }}
+          architecture: x86-64
+          version: ${{ matrix.version }}
+          memory: 12G
+          cpu_count: 4
+          shell: bash
+          environment_variables: VEIL_PORT_LOCAL_SRC
+          run: |
+            mkdir -p ports-out
+            tag="$(git describe --tags --exact-match 2>/dev/null || echo "v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)")"
+            sudo sh tools/release/bsd-port-test.sh ${{ matrix.os }} "$tag" ports-out > ports-out/test.log 2>&1 || echo PORT_FAILED >> ports-out/test.log
+            sudo chown -R "$(id -u)" ports-out || true
+        env:
+          # タグの tarball がまだ GitHub に無いときは、checkout した木から作る
+          VEIL_PORT_LOCAL_SRC: ${{ startsWith(inputs.ref, 'v') && '0' || '1' }}
+      - name: report
+        if: always()
+        run: |
+          grep -E '^(ok|FAIL|PORT TEST)' ports-out/test.log | sed 's/^/::notice title=port ${{ matrix.os }}::/' || true
+          if grep -q PORT_FAILED ports-out/test.log; then
+            tail -25 ports-out/test.log | while IFS= read -r l; do echo "::warning title=port ${{ matrix.os }} tail::${l:0:800}"; done
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ports-test-${{ matrix.os }}
+          path: |
+            ports-out/distinfo.*
+            ports-out/*.log
+            ports-out/ports/
+          retention-days: 30
+

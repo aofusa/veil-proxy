@@ -1,0 +1,13 @@
++-------------------------------------------------------------------------------
+| Running ${PKGSTEM} on OpenBSD
++-------------------------------------------------------------------------------
+
+veil reads ${SYSCONFDIR}/veil/config.toml. The default one serves
+${TRUEPREFIX}/share/veil/www on http://127.0.0.1:8080/, drops privileges to
+_veil and restricts itself with pledge(2) and unveil(2).
+
+    # rcctl enable veil
+    # rcctl start veil
+    $ curl http://127.0.0.1:8080/
+
+Edit the configuration and run `rcctl reload veil`.

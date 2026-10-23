@@ -420,6 +420,13 @@ jobs:
           pattern: dist-*
           path: assets
           merge-multiple: true
+      - name: BSD ports (the port directories to submit, F-253)
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python3 tools/release/bsd-ports.py "$TAG" "$RUNNER_TEMP/ports"
+          tar -C "$RUNNER_TEMP/ports" -czf "assets/veil-$VERSION-bsd-ports.tar.gz" freebsd openbsd netbsd
       - name: checksums
         run: |
           cd assets
