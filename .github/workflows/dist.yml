@@ -1,0 +1,407 @@
+# F-247: リリースの成果物（各 OS のアーカイブ・deb・rpm・MSI）を作り、各 OS で起動・入れる・上げる・消すを試験する。
+#
+# release.yml（タグ）から呼ぶ。成果物は artifact（dist-*）に置き、release.yml の release-draft が GitHub Release の draft に付ける。
+# 外部の action はコミットの SHA で固定する（F-236）。
+#
+# 入れ方ごとの試験:
+#   アーカイブ   … tools/release/binary-smoke.sh（設定が無いと止まる・-c・VEIL_CONFIG・--version）
+#   deb・rpm     … packaging/scripts/test-package.sh（systemd のコンテナで 8 つの配布 × 2 アーキ）と、
+#                   署名付きのリポジトリから入れる・改ざんを拒否する（F-251）
+#   Homebrew     … 手元の tap に formula を置いて brew install・brew test・brew services（F-250）
+#   MSI・winget  … tools/release/test-msi.ps1 と winget validate / install --manifest（F-252）
+#   BSD          … VM の中でビルド・単体試験・binary-smoke（tools/release/bsd-guest-build.sh）
+name: dist
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "checkout する ref（タグ）"
+        required: true
+        type: string
+      bsd:
+        description: "BSD の VM のビルドも回す"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux（glibc 2.28・musl のアーカイブと deb・rpm）
+  # ---------------------------------------------------------------------------
+  linux:
+    name: build linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      # glibc・musl の 2 つの dist（fat LTO）のビルドで、既定の空き（約 14GB）では足りない
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker system prune -af >/dev/null
+          df -h /
+      - name: build (docker; glibc 2.28 + musl, deb, rpm)
+        env:
+          RUST_TARGET: ${{ matrix.arch }}-unknown-linux-gnu
+          CARGO_FEATURES: full
+        run: packaging/scripts/build.sh --docker
+      - name: check the artifacts
+        run: |
+          ls -l packaging/output
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          for f in "veil-$v-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" "veil-$v-${{ matrix.arch }}-unknown-linux-musl.tar.gz"; do
+            test -s "packaging/output/$f" || { echo "::error title=dist linux::missing $f"; exit 1; }
+          done
+          ls packaging/output/*.deb packaging/output/*.rpm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: |
+            packaging/output/*.tar.gz
+            packaging/output/*.deb
+            packaging/output/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-smoke:
+    name: smoke linux ${{ matrix.arch }} ${{ matrix.libc }}
+    needs: linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, libc: gnu, runner: ubuntu-24.04 }
+          - { arch: x86_64, libc: musl, runner: ubuntu-24.04 }
+          - { arch: aarch64, libc: gnu, runner: ubuntu-24.04-arm }
+          - { arch: aarch64, libc: musl, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist
+      - name: binary smoke test
+        run: |
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          n="veil-$v-${{ matrix.arch }}-unknown-linux-${{ matrix.libc }}"
+          mkdir -p x && tar -C x -xzf "dist/$n.tar.gz"
+          tools/release/binary-smoke.sh "x/$n" "$v"
+
+  linux-packages:
+    name: package ${{ matrix.kind }} ${{ matrix.image }} ${{ matrix.arch }}
+    needs: linux
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "debian:13", "rockylinux/rockylinux:9", "almalinux:10", "amazonlinux:2023", "fedora:latest"]
+        include:
+          - { image: "ubuntu:22.04", kind: deb }
+          - { image: "ubuntu:24.04", kind: deb }
+          - { image: "debian:12", kind: deb }
+          - { image: "debian:13", kind: deb }
+          - { image: "rockylinux/rockylinux:9", kind: rpm }
+          - { image: "almalinux:10", kind: rpm }
+          - { image: "amazonlinux:2023", kind: rpm }
+          - { image: "fedora:latest", kind: rpm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist
+      - name: install, reinstall, remove, migrate
+        run: |
+          if [ "${{ matrix.kind }}" = deb ]; then f="$(ls dist/veil_*.deb)"; else f="$(ls dist/veil-*.rpm)"; fi
+          packaging/scripts/test-package.sh "${{ matrix.kind }}" "${{ matrix.image }}" "$f"
+
+  linux-lint-and-repos:
+    name: lintian, rpmlint, signed repositories
+    needs: linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-linux-*
+          path: dist
+          merge-multiple: true
+      - name: lintian and rpmlint (errors fail)
+        run: |
+          docker run --rm -v "$PWD/dist:/d" debian:13 bash -c 'apt-get update -qq && apt-get install -y -qq lintian >/dev/null && lintian --fail-on error --no-tag-display-limit /d/*.deb'
+          docker run --rm -v "$PWD/dist:/d" fedora:latest bash -c 'dnf install -y -q rpmlint >/dev/null && rpmlint /d/*.rpm' || {
+            echo "::error title=rpmlint::rpmlint reported errors"; exit 1; }
+      - name: build signed repositories with a throwaway key and install from them
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c rpm gnupg >/dev/null
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"; mkdir -m 700 -p "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key "veil test <test@invalid>" ed25519 sign 1d
+          key="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr/ {print $10; exit}')"
+          repo="$HOME/repo"; mkdir -p "$repo"
+          VEIL_REPO_URL=http://172.17.0.1:18555 tools/release/build-repos.sh "$repo" dist "$key"
+          (cd "$repo" && nohup python3 -m http.server 18555 --bind 0.0.0.0 >/dev/null 2>&1 &)
+          sleep 1
+          packaging/scripts/test-package.sh deb ubuntu:24.04 --repo packaging/repos/apt-setup.sh http://172.17.0.1:18555
+          packaging/scripts/test-package.sh rpm fedora:latest --repo packaging/repos/dnf-setup.sh http://172.17.0.1:18555
+          tools/release/test-repo-tamper.sh "$repo" 18556
+
+  # ---------------------------------------------------------------------------
+  # macOS（universal2）・Windows（x86_64・aarch64）のクロスビルド
+  # ---------------------------------------------------------------------------
+  cross:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [macos, windows]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: build
+        run: packaging/scripts/build-cross.sh --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            packaging/output/*.tar.gz
+            packaging/output/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-smoke:
+    name: smoke macOS ${{ matrix.runner }}
+    needs: cross
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-macos
+          path: dist
+      - name: binary smoke test
+        run: |
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          n="veil-$v-universal2-apple-darwin"
+          mkdir -p x && tar -C x -xzf "dist/$n.tar.gz"
+          lipo -archs "x/$n/veil"
+          codesign -v "x/$n/veil" || echo "::warning title=macOS::the binary has no valid code signature"
+          tools/release/binary-smoke.sh "x/$n" "$v"
+
+  homebrew:
+    name: homebrew ${{ matrix.runner }}
+    needs: [cross, linux]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "dist-{macos,linux-*}"
+          path: dist
+          merge-multiple: true
+      - name: brew install from a local tap, brew test, brew services
+        run: |
+          set -euo pipefail
+          if ! command -v brew >/dev/null; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null || true)"; fi
+          if ! command -v brew >/dev/null; then
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
+          (cd dist && nohup python3 -m http.server 18600 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 1
+          tools/release/homebrew-formula.sh "$v" http://127.0.0.1:18600 dist/SHA256SUMS > veil.rb
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_NO_ANALYTICS=1
+          brew tap-new --no-git aofusa/localtest
+          cp veil.rb "$(brew --repository)/Library/Taps/aofusa/homebrew-localtest/Formula/veil.rb"
+          brew style aofusa/localtest/veil
+          brew install aofusa/localtest/veil
+          brew test aofusa/localtest/veil
+          prefix="$(brew --prefix)"
+          test -f "$prefix/etc/veil/config.toml" && grep -q "$prefix/opt/veil/share/veil/www" "$prefix/etc/veil/config.toml"
+          if [ "$(uname)" = Darwin ]; then
+            brew services start aofusa/localtest/veil
+            for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+            curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q '<title>veil quickstart</title>'
+            brew services stop aofusa/localtest/veil
+          else
+            # Linux の brew services は systemd のユーザーのセッションが要るので、wrapper をそのまま起動する
+            veil > "$RUNNER_TEMP/veil.log" 2>&1 & pid=$!
+            for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+            curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q '<title>veil quickstart</title>'
+            kill "$pid"; grep -q "from VEIL_CONFIG" "$RUNNER_TEMP/veil.log"
+          fi
+          # 書き換えた設定は入れ直しても残る
+          echo "# edited by test" >> "$prefix/etc/veil/config.toml"
+          brew reinstall aofusa/localtest/veil
+          grep -q "edited by test" "$prefix/etc/veil/config.toml"
+          brew uninstall aofusa/localtest/veil
+
+  windows-msi:
+    name: build MSI
+    needs: cross
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-windows
+          path: dist
+      - name: render the winget defaults
+        shell: bash
+        run: tools/release/render-defaults.sh winget "$RUNNER_TEMP/defaults"
+      - name: build the MSIs (WiX)
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force msi | Out-Null
+          pwsh tools/release/build-msi.ps1 -Zip "dist/veil-$v-x86_64-pc-windows-msvc.zip" -Arch x64 -Defaults "$env:RUNNER_TEMP/defaults" -Out "msi/veil-$v-x86_64-pc-windows-msvc.msi"
+          pwsh tools/release/build-msi.ps1 -Zip "dist/veil-$v-aarch64-pc-windows-msvc.zip" -Arch arm64 -Defaults "$env:RUNNER_TEMP/defaults" -Out "msi/veil-$v-aarch64-pc-windows-msvc.msi"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-windows-msi
+          path: msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-test:
+    name: test Windows ${{ matrix.arch }}
+    needs: windows-msi
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: windows-2022 }
+          - { arch: aarch64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "dist-windows*"
+          path: dist
+          merge-multiple: true
+      - name: binary smoke test (zip)
+        shell: bash
+        run: |
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          n="veil-$v-${{ matrix.arch }}-pc-windows-msvc"
+          mkdir -p x && (cd x && unzip -q "../dist/$n.zip")
+          tools/release/binary-smoke.sh "x/$n" "$v"
+      - name: MSI install, repair, uninstall
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          pwsh tools/release/test-msi.ps1 -Msi "dist/veil-$v-${{ matrix.arch }}-pc-windows-msvc.msi" -Version $v
+      - name: winget manifest (validate, install from a local manifest)
+        shell: bash
+        run: |
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          (cd dist && sha256sum *.msi > SHA256SUMS)
+          tools/release/winget-manifest.sh "$v" winget http://127.0.0.1:18601 dist/SHA256SUMS
+          if ! command -v winget >/dev/null; then echo "::notice title=winget::winget is not on this runner; validated the MSI only"; exit 0; fi
+          (cd dist && nohup python -m http.server 18601 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          d="winget/manifests/a/Aofusa/Veil/$v"
+          winget validate --manifest "$d"
+          winget settings --enable LocalManifestFiles
+          winget install --manifest "$d" --accept-package-agreements --accept-source-agreements --disable-interactivity
+          "/c/Program Files/veil/veil.exe" --version
+          winget uninstall --id Aofusa.Veil --disable-interactivity || winget uninstall --manifest "$d" --disable-interactivity
+
+  # ---------------------------------------------------------------------------
+  # BSD（VM の中でネイティブビルド。cross-platform-actions）
+  # ---------------------------------------------------------------------------
+  bsd:
+    name: build ${{ matrix.os }} ${{ matrix.arch }}
+    if: inputs.bsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: freebsd, version: "14.3", vm_arch: x86-64, arch: x86_64 }
+          - { os: openbsd, version: "7.9", vm_arch: x86-64, arch: x86_64 }
+          - { os: netbsd, version: "10.1", vm_arch: x86-64, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: build, unit tests and smoke test in the VM
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        with:
+          operating_system: ${{ matrix.os }}
+          architecture: ${{ matrix.vm_arch }}
+          version: ${{ matrix.version }}
+          memory: 12G
+          cpu_count: 4
+          shell: bash
+          run: |
+            mkdir -p out
+            sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out > out/build.log 2>&1 || { echo "BUILD_FAILED" >> out/build.log; }
+            sudo chown -R "$(id -u)" out || true
+      - name: report
+        if: always()
+        run: |
+          if [ -f out/build.log ]; then
+            grep -E '^(ok|FAIL|BINARY SMOKE|test result)' out/build.log | sed 's/^/::notice title=${{ matrix.os }}::/' || true
+            if grep -q BUILD_FAILED out/build.log; then
+              grep -E 'error(\[|:)|No space|Killed|panicked|FAIL' out/build.log | head -20 | while IFS= read -r l; do echo "::error title=${{ matrix.os }} build::${l:0:800}"; done
+              tail -20 out/build.log | while IFS= read -r l; do echo "::warning title=tail::${l:0:800}"; done
+              exit 1
+            fi
+          else
+            echo "::error title=${{ matrix.os }}::no build log"; exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
