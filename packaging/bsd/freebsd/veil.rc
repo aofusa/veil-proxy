@@ -24,10 +24,13 @@ load_rc_config "$name"
 : ${veil_config:="/usr/local/etc/veil/config.toml"}
 : ${veil_user:="root"}
 
-pidfile="/var/run/${name}.pid"
+# daemon(8) が veil を監視する（-r で再起動）。pidfile は daemon 自身の pid（stop は daemon へ SIGTERM、daemon が veil へ
+# 転送して終わる）。veil の pid は child_pidfile（reload の SIGHUP は daemon が転送しないので veil へ直接送る）
+pidfile="/var/run/${name}_daemon.pid"
+child_pidfile="/var/run/${name}.pid"
+veil_bin="/usr/local/bin/veil"
 command="/usr/sbin/daemon"
-procname="/usr/local/bin/veil"
-command_args="-P ${pidfile} -r -f ${procname} -c ${veil_config}"
+command_args="-P ${pidfile} -p ${child_pidfile} -r -f ${veil_bin} -c ${veil_config}"
 
 # 設定リロード（SIGHUP でホットリロード）
 extra_commands="reload configtest"
@@ -36,8 +39,8 @@ configtest_cmd="veil_configtest"
 
 veil_reload()
 {
-    if [ -f "${pidfile}" ]; then
-        kill -HUP "$(cat "${pidfile}")" && echo "veil: reloaded"
+    if [ -f "${child_pidfile}" ]; then
+        kill -HUP "$(cat "${child_pidfile}")" && echo "veil: reloaded"
     else
         echo "veil: not running"
     fi
@@ -45,7 +48,7 @@ veil_reload()
 
 veil_configtest()
 {
-    ${procname} -t -c "${veil_config}"
+    ${veil_bin} -t -c "${veil_config}"
 }
 
 run_rc_command "$1"

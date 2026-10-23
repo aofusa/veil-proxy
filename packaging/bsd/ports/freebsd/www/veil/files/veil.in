@@ -18,10 +18,13 @@ load_rc_config "$name"
 : ${veil_enable:="NO"}
 : ${veil_config:="%%PREFIX%%/etc/veil/config.toml"}
 
-pidfile="/var/run/${name}.pid"
-procname="%%PREFIX%%/bin/veil"
+# daemon(8) supervises veil (-r restarts it). pidfile is the supervisor's: stop sends SIGTERM to daemon, which
+# forwards it to veil and exits. veil's own pid is in child_pidfile, used for reload (daemon does not forward SIGHUP).
+pidfile="/var/run/${name}_daemon.pid"
+child_pidfile="/var/run/${name}.pid"
+veil_bin="%%PREFIX%%/bin/veil"
 command="/usr/sbin/daemon"
-command_args="-P ${pidfile} -r -f -o /var/log/veil.log ${procname} -c ${veil_config}"
+command_args="-P ${pidfile} -p ${child_pidfile} -r -f -o /var/log/veil.log ${veil_bin} -c ${veil_config}"
 required_files="${veil_config}"
 
 extra_commands="reload configtest"
@@ -31,8 +34,8 @@ start_precmd="veil_configtest"
 
 veil_reload()
 {
-	if [ -f "${pidfile}" ]; then
-		kill -HUP "$(cat "${pidfile}")" && echo "veil: reloaded"
+	if [ -f "${child_pidfile}" ]; then
+		kill -HUP "$(cat "${child_pidfile}")" && echo "veil: reloaded"
 	else
 		echo "veil: not running"
 	fi
@@ -40,7 +43,7 @@ veil_reload()
 
 veil_configtest()
 {
-	${procname} -t -c "${veil_config}"
+	${veil_bin} -t -c "${veil_config}"
 }
 
 run_rc_command "$1"

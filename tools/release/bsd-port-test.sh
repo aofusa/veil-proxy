@@ -64,6 +64,7 @@ freebsd)
     make package BATCH=yes NO_DEPENDS=yes >"$OUT/build.log" 2>&1 || { grep -E 'error|Error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     check "portlint-like: make check-plist" make check-plist BATCH=yes
     PKG="$(ls work/pkg/veil-*.pkg)"; cp "$PKG" "$OUT/"
+    log "入れる・サービスの試験"
     env ASSUME_ALWAYS_YES=yes pkg add "$PKG"
     check "config at /usr/local/etc/veil/config.toml" test -f /usr/local/etc/veil/config.toml
     sysrc veil_enable=YES >/dev/null
@@ -73,7 +74,12 @@ freebsd)
     check "default path built in" sh -c '/usr/local/bin/veil --help | grep -q /usr/local/etc/veil/config.toml'
     check "runs as www" sh -c 'ps -axo user,comm | grep -E "^www +veil" >/dev/null'
     check "service veil reload" service veil reload
+    sleep 2
+    check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "reload reached veil" grep -q "SIGHUP received" /var/log/veil.log
     check "service veil stop" service veil stop
+    sleep 2
+    check "no veil left after stop" sh -c '! pgrep -x veil'
     check "pkg delete" env ASSUME_ALWAYS_YES=yes pkg delete -y veil
     ;;
 openbsd)
@@ -89,7 +95,8 @@ openbsd)
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
     DIST="$(make show=FULLDISTDIR)"; mkdir -p "$DIST"
-    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show=DISTFILES | tr ' ' '\n' | grep -i veil-proxy | sed 's/{.*}//; s/:.*//')"
+    # DIST_TUPLE（github）の配布物は DISTFILES に出ない。名前は <account>-<project>-<tag>.tar.gz
+    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/aofusa-veil-proxy-$TAG.tar.gz"
     log "make makesum"
     make makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
     cp distinfo "$OUT/distinfo.openbsd"
@@ -97,6 +104,7 @@ openbsd)
     ulimit -d unlimited 2>/dev/null || true
     make package NO_DEPENDS=Yes >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/ports/packages/*/all/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
+    log "入れる・サービスの試験"
     env TRUSTED_PKG_PATH=/usr/ports/packages/$(uname -p)/all pkg_add -D unsigned "$PKG"
     check "config at /etc/veil/config.toml" test -f /etc/veil/config.toml
     check "rcctl enable veil" rcctl enable veil
@@ -105,7 +113,11 @@ openbsd)
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "runs as _veil" sh -c 'ps -axo user,comm | grep -E "^_veil +veil" >/dev/null'
     check "rcctl reload veil" rcctl reload veil
+    sleep 2
+    check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "rcctl stop veil" rcctl stop veil
+    sleep 2
+    check "no veil left after stop" sh -c '! pgrep -x veil'
     check "pkg_delete" pkg_delete veil
     ;;
 netbsd)
@@ -123,6 +135,15 @@ netbsd)
     fi
     mkdir -p "$(dirname /usr/pkgsrc/www/veil)" && rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
+    # buildlink3.mk・compiler の mk は他の package の makefile を間接に読む（lang/libunwind・lang/gccNN など）。
+    # 足りないと「Could not find ../../<cat>/<pkg>/...」で止まるので、それを sparse の木に足して読み直す
+    i=0
+    while miss="$(make show-var VARNAME=PKGNAME 2>&1 | sed -n 's|.*Could not find \.\./\.\./\([^/]*/[^/]*\)/.*|\1|p' | sort -u)"; [ -n "$miss" ]; do
+        i=$((i + 1)); [ "$i" -le 20 ] || { echo "pkgsrc: still missing: $miss"; exit 1; }
+        echo "pkgsrc: adding $miss"
+        # shellcheck disable=SC2086
+        git -C /usr/pkgsrc sparse-checkout add $miss
+    done
     DIST="$(make show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
     log "make makesum"
@@ -131,6 +152,7 @@ netbsd)
     log "make package"
     make package >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/pkgsrc/packages/All/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
+    log "入れる・サービスの試験"
     pkg_add "$PKG"
     cp /usr/pkg/share/examples/rc.d/veil /etc/rc.d/veil
     check "config at /usr/pkg/etc/veil/config.toml" test -f /usr/pkg/etc/veil/config.toml
@@ -140,6 +162,8 @@ netbsd)
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "runs as veil" sh -c 'ps -axo user,comm | grep -E "^veil +veil" >/dev/null'
     check "service veil stop" /etc/rc.d/veil stop
+    sleep 2
+    check "no veil left after stop" sh -c '! pgrep -x veil'
     check "pkg_delete" pkg_delete veil
     ;;
 esac
