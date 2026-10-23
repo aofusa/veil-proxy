@@ -39,7 +39,7 @@ pf 18080:8080
 curl -s http://127.0.0.1:18080/quickstart.html | grep -q '<title>veil quickstart</title>\|quickstart' && ok "GET /quickstart.html" || bad "GET /quickstart.html"
 [ "$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_version}' http://127.0.0.1:18080/)" = 2 ] && ok "h2c" || bad "h2c"
 seen=0; for _ in $(seq 1 15); do kubectl logs deploy/veil | grep -q 'type=access' && { seen=1; break; }; sleep 1; done
-[ "$seen" = 1 ] && ok "access log in kubectl logs" || bad "no access log"
+[ "$seen" = 1 ] && ok "access log in kubectl logs" || { bad "no access log"; kubectl logs deploy/veil --tail 20; }
 sc="$(kubectl get pod -l app.kubernetes.io/instance=veil -o jsonpath='{.items[0].spec.securityContext.runAsNonRoot} {.items[0].spec.securityContext.seccompProfile.type} {.items[0].spec.containers[0].securityContext.readOnlyRootFilesystem} {.items[0].spec.containers[0].securityContext.capabilities.drop[0]}')"
 [ "$sc" = "true RuntimeDefault true ALL" ] && ok "securityContext: $sc" || bad "securityContext: $sc"
 kubectl get svc veil -o jsonpath='{.spec.ports[*].appProtocol}' | grep -q . && bad "Service has appProtocol" || ok "Service has no appProtocol"

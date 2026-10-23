@@ -30,8 +30,13 @@ cp -R "$M/www" "$W/www"; chmod -R a+rX "$W"
 fetch() { # <base-url> <method> <host> <path> <out-prefix>
     local h=(); [ "$3" != - ] && h=(-H "Host: $3")
     local d=(); [ "$2" = POST ] && d=(--data-binary '{"n":1}' -H 'Content-Type: application/json')
-    local m=(-X "$2"); [ "$2" = HEAD ] && m=(-I)
-    docker run --rm --network "$NET" curlimages/curl:8.17.0 -s -o /dev/stdout -D /dev/stderr "${m[@]}" "${h[@]}" "${d[@]}" "$1$4" \
+    if [ "$2" = HEAD ]; then
+        # HEAD は本文が無い（curl -I は標準出力にヘッダを出すので、本文は空のファイルにする）
+        docker run --rm --network "$NET" curlimages/curl:8.17.0 -s -I "${h[@]}" "$1$4" > "$5.head" 2>/dev/null
+        : > "$5.body"
+        return
+    fi
+    docker run --rm --network "$NET" curlimages/curl:8.17.0 -s -o /dev/stdout -D /dev/stderr -X "$2" "${h[@]}" "${d[@]}" "$1$4" \
         > "$5.body" 2> "$5.head"
 }
 

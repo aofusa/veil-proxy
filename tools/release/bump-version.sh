@@ -95,4 +95,9 @@ for f in files:
         print("updated", f)
 PY
 
+# 4. Helm chart（F-254）: chart の版と appVersion を veil の版にそろえる（同時に公開する）
+sed -i.bak -E -e "s/^version: .*/version: ${NEW}/" -e "s/^appVersion: .*/appVersion: \"${NEW}\"/" deploy/helm/veil/Chart.yaml
+rm -f deploy/helm/veil/Chart.yaml.bak
+echo "updated deploy/helm/veil/Chart.yaml"
+
 echo "done. check: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | .name + \" \" + .version'"
