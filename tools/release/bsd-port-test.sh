@@ -15,7 +15,7 @@ STEP="start"
 trap 'rc=$?; [ "$rc" = 0 ] || { echo "PORT STEP FAILED: $STEP (exit $rc)"; df -h / /usr 2>/dev/null | tail -3; }' EXIT
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VER="${TAG#v}"
-mkdir -p "$OUT"
+mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"   # 下で ports の木へ cd するので絶対パスにする
 log() { STEP="$*"; echo "==> $*"; }
 check() { # <label> <cmd...>
     label="$1"; shift
@@ -52,7 +52,7 @@ freebsd)
     fi
     LLVM_DEFAULT="$(make -C /usr/ports/www/nginx -V LLVM_DEFAULT 2>/dev/null || echo 19)"
     env ASSUME_ALWAYS_YES=yes pkg install -y "llvm${LLVM_DEFAULT}"
-    rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/freebsd/www/veil" /usr/ports/www/veil
+    mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/freebsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
     DIST="$(make -V DISTDIR)"; mkdir -p "$DIST"
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make -V DISTFILES | tr ' ' '\n' | grep -E '_GH0\.tar\.gz' | sed 's/:.*//')"
@@ -85,7 +85,7 @@ openbsd)
         git clone -q --depth 1 --filter=blob:none --sparse https://github.com/openbsd/ports.git /usr/ports
         git -C /usr/ports sparse-checkout set infrastructure devel/cargo lang/rust lang/clang lang/python devel/llvm
     fi
-    rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
+    mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
     DIST="$(make show=FULLDISTDIR)"; mkdir -p "$DIST"
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show=DISTFILES | tr ' ' '\n' | grep -i veil-proxy | sed 's/{.*}//; s/:.*//')"
@@ -120,7 +120,7 @@ netbsd)
         git -C /usr/pkgsrc sparse-checkout set mk lang/rust lang/python devel/cmake devel/protobuf shells/bash lang/clang \
             devel/nasm devel/gmake pkgtools
     fi
-    rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
+    mkdir -p "$(dirname /usr/pkgsrc/www/veil)" && rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
     DIST="$(bmake show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(bmake show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
