@@ -13,7 +13,7 @@ step() {
     if out="$("$@" 2>&1)"; then ok "$label"; return 0; fi
     # 出力の要点（エラー・違反の行）をすべて注釈にする
     bad "$label"
-    grep -E 'Error|error|: [CWEF]: |offense|failed|Timeout' <<<"$out" | head -15 | while IFS= read -r l; do echo "::error title=homebrew $label::${l:0:600}"; done
+    sed 's/\x1b\[[0-9;]*m//g' <<<"$out" | grep -E 'Error|error|: [CWEF]: |offense|failed|Timeout' | head -15 | while IFS= read -r l; do echo "::error title=homebrew $label::${l:0:600}"; done
     echo "$out" | tail -40
     return 1
 }
@@ -23,7 +23,7 @@ if ! command -v brew >/dev/null; then
     NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" >/dev/null
     eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 fi
-export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_COLOR=1 NO_COLOR=1
 v="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT/Cargo.toml")"
 (cd "$DIST" && shasum -a 256 ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
 (cd "$DIST" && nohup python3 -m http.server 18600 --bind 127.0.0.1 >/dev/null 2>&1 &)

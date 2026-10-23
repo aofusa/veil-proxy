@@ -381,6 +381,9 @@ build_rpm_tree() {
     rm -rf "${rpm_top}/BUILD" "${rpm_top}/BUILDROOT" "${rpm_top}/RPMS" "${rpm_top}/SRPMS"
     mkdir -p "${rpm_top}/BUILD" "${rpm_top}/BUILDROOT" "${rpm_top}/RPMS" "${rpm_top}/SRPMS" "${rpm_top}/SPECS"
     cp "${PKG_ROOT}/rpm/veil.spec" "${rpm_top}/SPECS/veil.spec"
+    # %changelog（版ごとの変更はリリースノート。ここには版と日付だけを書く）
+    printf '* %s aofusa <aofusa@users.noreply.github.com> - %s-1\n- Release %s: https://github.com/aofusa/veil-proxy/releases/tag/v%s\n' \
+        "$(LC_ALL=C date -u '+%a %b %d %Y')" "${VERSION}" "${VERSION}" "${VERSION}" >> "${rpm_top}/SPECS/veil.spec"
 
     # --target はクロスアーキ時に必須（x86_64 ホストで BuildArch: aarch64 の spec を
     # ビルドすると rpmbuild が "No compatible architectures found for build" で失敗する）。

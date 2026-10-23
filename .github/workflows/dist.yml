@@ -153,7 +153,7 @@ jobs:
           docker run --rm -v "$PWD/dist:/d" debian:13 bash -c 'apt-get update -qq >/dev/null && apt-get install -y -qq lintian >/dev/null 2>&1 && lintian --fail-on error --no-tag-display-limit /d/*.deb' > lintian.log 2>&1 || rc=1
           cat lintian.log
           grep -E '^E: ' lintian.log | head -30 | while IFS= read -r l; do echo "::error title=lintian::$l"; done
-          docker run --rm -v "$PWD/dist:/d" fedora:latest bash -c 'dnf install -y -q rpmlint >/dev/null 2>&1 && rpmlint /d/*.rpm' > rpmlint.log 2>&1 || rc=1
+          docker run --rm -v "$PWD/dist:/d" -v "$PWD/packaging/rpm:/r:ro" fedora:latest bash -c 'dnf install -y -q rpmlint >/dev/null 2>&1 && rpmlint -r /r/veil.rpmlintrc /d/*.rpm' > rpmlint.log 2>&1 || rc=1
           cat rpmlint.log
           grep -E ': E: ' rpmlint.log | head -30 | while IFS= read -r l; do echo "::error title=rpmlint::$l"; done
           exit "$rc"

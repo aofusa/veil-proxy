@@ -10,15 +10,13 @@
     （%ProgramData% の既定では Users が新しいファイルを作れるので、設定を書き換えられないように絞る）
   UpgradeCode は版をまたいで変えない（MajorUpgrade で前の版を消して入れ直す）。
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="veil" Manufacturer="aofusa" Version="$(var.Version)"
            UpgradeCode="C791D869-DE64-4FA4-974F-E7AB53309B69" Scope="perMachine" Compressed="yes"
            Language="1033">
     <SummaryInformation Description="veil reverse proxy and web server" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of veil is already installed." />
     <MediaTemplate EmbedCab="yes" />
-    <!-- 表示名が OS の言語で変わるので、既知の SID から解決したアカウント名（WIX_ACCOUNT_*）を使う -->
-    <util:QueryWindowsWellKnownSIDs />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/aofusa/veil-proxy" />
     <Property Id="ARPHELPLINK" Value="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md" />
 
@@ -41,9 +39,9 @@
       <Directory Id="DATADIR" Name="veil">
         <Component Id="VeilDataDirAcl" Guid="99D3920B-C6DA-44F6-90A2-CB21CCE74DC0" KeyPath="yes" Permanent="yes">
           <CreateFolder>
-            <util:PermissionEx User="[WIX_ACCOUNT_ADMINISTRATORS]" GenericAll="yes" />
-            <util:PermissionEx User="[WIX_ACCOUNT_LOCALSYSTEM]" GenericAll="yes" />
-            <util:PermissionEx User="[WIX_ACCOUNT_USERS]" GenericRead="yes" GenericExecute="yes" />
+            <!-- 継承を切って（P）DACL を置き換える（MsiLockPermissionsEx）。SYSTEM・Administrators は全権、Users は読み取りと
+                 実行だけ（0x1200a9）。%ProgramData% から継承する「Users は作成・書き込みできる」を残さない。SID の略号なので言語に依らない -->
+            <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
           </CreateFolder>
         </Component>
         <Component Id="VeilConfig" Guid="4BC85004-5A97-4BD8-BF36-46E25B9FD9F9" NeverOverwrite="yes" Permanent="yes">

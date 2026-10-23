@@ -1,0 +1,3 @@
+# rpmlint の例外（理由付き）。CI: rpmlint -r packaging/rpm/veil.rpmlintrc
+# /etc/veil/config.toml は root:veil 0640（利用者が秘密の値を書くことがあるので、他の利用者に読ませない。F-251）
+addFilter("non-readable /etc/veil/config.toml")

@@ -17,13 +17,10 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
   dotnet tool install --global wix --version $WixVersion 2>&1 | Out-Host
   $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
 }
-$ext = wix extension add -g "WixToolset.Util.wixext/$WixVersion" 2>&1
-$ext | Out-Host
-if ($LASTEXITCODE -ne 0) { $ext | ForEach-Object { Write-Host "::error title=wix extension::$_" }; throw "wix extension add failed" }
 $work = Join-Path ([IO.Path]::GetTempPath()) ("veil-msi-" + [guid]::NewGuid())
 Expand-Archive -Path $Zip -DestinationPath $work
 $src = (Get-ChildItem $work -Directory | Select-Object -First 1).FullName
-$log = wix build -arch $Arch -ext WixToolset.Util.wixext `
+$log = wix build -arch $Arch `
   -d "Version=$version" -d "SourceDir=$src" -d "DefaultsDir=$((Resolve-Path $Defaults).Path)" `
   -o $Out "$root/packaging/windows/veil.wxs" 2>&1
 $rc = $LASTEXITCODE

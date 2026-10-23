@@ -21,6 +21,8 @@ function Check-Serving($label) {
       try { $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8080$p"; if ($r.StatusCode -eq 200) { Ok "$label GET $p" } else { Bad "$label GET $p -> $($r.StatusCode)" } } catch { Bad "$label GET $p -> $_" }
     }
   } else { Bad "$label did not start"; Get-Content "$env:RUNNER_TEMP\veil.err","$env:RUNNER_TEMP\veil.out" -ErrorAction SilentlyContinue | Select-Object -Last 30 | Write-Host }
+  # アクセスログは非同期に書き出される。止める前に出るのを待つ
+  for ($i = 0; $i -lt 15; $i++) { if ((Get-Content "$env:RUNNER_TEMP\veil.out" -Raw -ErrorAction SilentlyContinue) -match 'type=access') { break }; Start-Sleep 1 }
   Stop-Process -Id $job.Id -Force -ErrorAction SilentlyContinue; Start-Sleep 1
   $out = Get-Content "$env:RUNNER_TEMP\veil.out" -Raw -ErrorAction SilentlyContinue
   if ($out -match [regex]::Escape("Config File: $data\config.toml (from default path)")) { Ok "$label reads %ProgramData%\veil\config.toml from the default path" } else { Bad "$label did not read the default path" }
@@ -34,8 +36,14 @@ $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
 if ($machinePath -like "*$env:ProgramFiles\veil*") { Ok "PATH has the install dir" } else { Bad "PATH lacks the install dir" }
 $v = & $exe --version; if ($v -match [regex]::Escape($Version)) { Ok "--version $v" } else { Bad "--version $v (want $Version)" }
 $acl = Get-Acl $data
-$usersWrite = $acl.Access | Where-Object { $_.IdentityReference -match 'Users$' -and $_.FileSystemRights.ToString() -match 'Write|Modify|FullControl' }
-if (-not $usersWrite) { Ok "Users cannot write %ProgramData%\veil" } else { Bad "Users can write %ProgramData%\veil: $($usersWrite | Out-String)" }
+# Users・Authenticated Users・Everyone・CREATOR OWNER が書き込めないこと（継承した許可も含めて）
+$weak = $acl.Access | Where-Object {
+  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference -match 'Users$|Everyone|Authenticated Users|CREATOR OWNER' -and
+  ($_.FileSystemRights.ToString() -match 'Write|Modify|FullControl|CreateFiles|AppendData|Delete')
+}
+if (-not $weak) { Ok "only administrators can change %ProgramData%\veil" }
+else { Bad "%ProgramData%\veil is writable by: $(($weak | ForEach-Object { "$($_.IdentityReference)=$($_.FileSystemRights)" }) -join ', ')" }
+if ($acl.AreAccessRulesProtected) { Ok "%ProgramData%\veil does not inherit permissions" } else { Bad "%ProgramData%\veil inherits permissions" }
 Check-Serving "fresh install:"
 
 # 2. 書き換えて入れ直す（上げるのと同じ扱い）
