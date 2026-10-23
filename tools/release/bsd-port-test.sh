@@ -45,7 +45,11 @@ freebsd)
     log "pkg install（依存）"
     env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y git rust cmake-core gmake nasm protobuf bash curl pkgconf
     log "ports の木"
-    [ -d /usr/ports/Mk ] || git clone -q --depth 1 https://git.FreeBSD.org/ports.git /usr/ports
+    # VM のディスクが小さい（8.5GB）ので、ports の仕組み（Mk など）だけを浅く取る。依存はパッケージで入れてある（NO_DEPENDS）
+    if [ ! -d /usr/ports/Mk ]; then
+        git clone -q --depth 1 --filter=blob:none --sparse https://git.FreeBSD.org/ports.git /usr/ports
+        git -C /usr/ports sparse-checkout set Mk Templates Keywords Tools www/nginx
+    fi
     LLVM_DEFAULT="$(make -C /usr/ports/www/nginx -V LLVM_DEFAULT 2>/dev/null || echo 19)"
     env ASSUME_ALWAYS_YES=yes pkg install -y "llvm${LLVM_DEFAULT}"
     rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/freebsd/www/veil" /usr/ports/www/veil
@@ -77,7 +81,10 @@ openbsd)
     env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash
     LLVM="$(env PKG_PATH="$P" pkg_info -Q llvm 2>/dev/null | grep -E '^llvm-[0-9]' | sort -V | tail -1)"; env PKG_PATH="$P" pkg_add -I "$LLVM"
     log "ports の木"
-    [ -d /usr/ports/infrastructure ] || git clone -q --depth 1 https://github.com/openbsd/ports.git /usr/ports
+    if [ ! -d /usr/ports/infrastructure ]; then
+        git clone -q --depth 1 --filter=blob:none --sparse https://github.com/openbsd/ports.git /usr/ports
+        git -C /usr/ports sparse-checkout set infrastructure devel/cargo lang/rust lang/clang lang/python devel/llvm
+    fi
     rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
     DIST="$(make show=FULLDISTDIR)"; mkdir -p "$DIST"
@@ -108,7 +115,11 @@ netbsd)
     pkgin -y update
     pkgin -y install git-base rust cmake gmake protobuf bash clang nasm pkgconf mozilla-rootcerts-openssl
     log "pkgsrc の木"
-    [ -d /usr/pkgsrc/mk ] || git clone -q --depth 1 https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
+    if [ ! -d /usr/pkgsrc/mk ]; then
+        git clone -q --depth 1 --filter=blob:none --sparse https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
+        git -C /usr/pkgsrc sparse-checkout set mk lang/rust lang/python devel/cmake devel/protobuf shells/bash lang/clang \
+            devel/nasm devel/gmake pkgtools
+    fi
     rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
     DIST="$(bmake show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
