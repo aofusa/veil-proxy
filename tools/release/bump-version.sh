@@ -68,7 +68,7 @@ DOC_FILES=(
     .github/workflows/release-sbom.yml
     docs/guide/library.md docs/guide/ja/library.md
     crates/veil-tokio/README.md
-    packaging/container/www/quickstart.html
+    packaging/defaults/www/quickstart.html
 )
 python3 - "$NEW" "${DOC_FILES[@]}" <<'PY'
 import re, sys

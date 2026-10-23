@@ -2,41 +2,43 @@
 #
 #   docker run --rm -p 8080:8080 ghcr.io/aofusa/veil      # then open http://localhost:8080/
 #
-# It serves the built-in page in /var/www over plaintext HTTP/1.1 and h2c on port 8080, with no TLS
-# certificate needed, and logs every request to standard output (`docker logs`).
-#
+# It serves the page in /var/www on port 8080 and logs every request to standard output (`docker logs`).
 # Use your own files by mounting them over these paths:
 #   -v "$PWD/site:/var/www:ro"                                  your HTML
 #   -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro"       your configuration
-# Quickstart:  http://localhost:8080/quickstart.html  and
-#              https://github.com/aofusa/veil-proxy/blob/main/docs/guide/container.md
-# Every key:   https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml
+# Quickstart: http://localhost:8080/quickstart.html and
+#             https://github.com/aofusa/veil-proxy/blob/main/docs/guide/container.md
+# The default configuration listens on plaintext HTTP/1.1 + h2c only, so no TLS certificate is needed.
+# Check a change with `veil -t` and reload without downtime with SIGHUP.
+# Every key:  https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml
+# Guides:     https://github.com/aofusa/veil-proxy/blob/main/docs/guide/README.md
 
 [server]
-# Plaintext HTTP/1.1 + h2c (prior knowledge). Port 8080 also works when the container runs as a non-root user.
+# Plaintext HTTP/1.1 + h2c (prior knowledge).
 listen_cleartext = "0.0.0.0:8080"
 # There is no TLS listener, so serve plaintext instead of redirecting to https.
 enable_secure_redirect = false
 http2_enabled = true
-# 0 = one worker per CPU available to the container.
+# 0 = one worker per CPU.
 threads = 0
 
 [logging]
 level = "info"
 
 [access_log]
+# One line per request on standard output.
 enabled = true
 format = "text"
 
 [security]
-# Same hardening as the image's previous default: seccomp and Landlock on, privileges dropped to nonroot.
+# veil starts as root, binds its listeners, then drops to nonroot, with its own seccomp filter and Landlock.
 allow_security_failures = false
 drop_privileges_user = "nonroot"
 drop_privileges_group = "nonroot"
 enable_seccomp = true
+seccomp_mode = "filter"
 enable_landlock = true
 enable_sandbox = false
-seccomp_mode = "filter"
 landlock_read_paths = [
   "/var/www",
   "/var/cache/veil",
@@ -55,11 +57,28 @@ landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 huge_pages_enabled = false
 reuseport_balancing = "cbpf"
 
+# TLS (HTTP/1.1 and HTTP/2) and HTTP/3: add a certificate, add `listen = "0.0.0.0:443"` to [server] and
+# uncomment:
+# [tls]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
+# [http3]
+# enabled = true
+# listen = "0.0.0.0:443"
+
+# Reverse proxy: put a route like this before the "/" route (the first matching route wins).
+# [[route]]
+# [route.conditions]
+# path = "/api/"
+# [route.action]
+# type = "Proxy"
+# url = "http://127.0.0.1:3000"
+
 [[route]]
 [route.conditions]
 path = "/"
 [route.action]
 type = "File"
-path = "/var/www/"
+path = '/var/www/'
 [route.security]
 allowed_methods = ["HEAD", "GET"]

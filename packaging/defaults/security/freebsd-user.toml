@@ -1,0 +1,4 @@
+# veil runs as the user who started it and enters capability mode (capsicum) after binding its listeners.
+allow_security_failures = false
+enable_capsicum = true
+capsicum_capability_mode = true

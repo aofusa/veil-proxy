@@ -1,0 +1,7 @@
+# rc.d starts veil as root; it binds its listeners, then drops to the _veil user and restricts itself
+# with pledge(2) and unveil(2).
+allow_security_failures = false
+drop_privileges_user = "_veil"
+drop_privileges_group = "_veil"
+enable_pledge = true
+enable_unveil = true

@@ -1,0 +1,4 @@
+# veil runs as the user who started it, in a macOS sandbox (sandbox_init) applied after the listeners are
+# bound.
+allow_security_failures = false
+enable_sandbox_macos = true

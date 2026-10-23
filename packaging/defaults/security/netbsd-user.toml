@@ -1,0 +1,2 @@
+# veil runs as the user who started it (NetBSD has no unprivileged sandbox; chroot needs root).
+allow_security_failures = false

@@ -1,0 +1,4 @@
+# rc.d starts veil as root; it binds its listeners, then drops to the veil user.
+allow_security_failures = false
+drop_privileges_user = "veil"
+drop_privileges_group = "veil"
