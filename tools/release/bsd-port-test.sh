@@ -132,7 +132,9 @@ netbsd)
     [ -x /usr/pkg/bin/pkgin ] || /usr/sbin/pkg_add pkgin
     pkgin -y update
     pkgin -y install git-base rust cmake gmake protobuf bash clang nasm pkgconf mozilla-rootcerts-openssl
-    # pkgsrc は PKG_PATH があると止まる（pkg_add の取得先。pkgin は repositories.conf を使う）
+    # pkgsrc は PKG_PATH があると止まる（pkg_add の取得先。pkgin は repositories.conf を使う）。足りない依存は
+    # ソースからビルドせず（clang などは何時間もかかる）、同じ取得先のバイナリのパッケージで入れる
+    grep -q '^DEPENDS_TARGET' /etc/mk.conf 2>/dev/null || printf 'DEPENDS_TARGET=\tbin-install\nBINPKG_SITES=\t%s\n' "${PKG_PATH%/All/}" >> /etc/mk.conf
     unset PKG_PATH
     log "pkgsrc の木"
     if [ ! -d /usr/pkgsrc/mk ]; then

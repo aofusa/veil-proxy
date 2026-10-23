@@ -412,7 +412,8 @@ jobs:
     name: port ${{ matrix.os }}
     if: inputs.bsd
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
+    # 呼ぶ側（release の draft）は dist の全 job を待つので、止めない試験でも長くは待たせない（FreeBSD は 15 分ほど）
+    timeout-minutes: 90
     continue-on-error: true
     strategy:
       fail-fast: false
