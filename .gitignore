@@ -9,6 +9,8 @@ docs/*
 !docs/perf
 !docs/guide
 !docs/history
+# F-247: GitHub Release の本文の元（release.yml が読む）
+!docs/releases
 
 # テスト実行時に作成される一時ファイル
 # E2Eテスト・ベンチマークテスト用の一時ファイル
