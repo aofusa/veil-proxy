@@ -89,9 +89,11 @@ openbsd)
     env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash cargo-generate-vendor
     LLVM="$(env PKG_PATH="$P" pkg_info -Q llvm 2>/dev/null | grep -E '^llvm-[0-9]' | sort -V | tail -1)"; env PKG_PATH="$P" pkg_add -I "$LLVM"
     log "ports の木"
+    # ports の木はパッケージと同じ版（リリースの ports.tar.gz）を使う。GitHub の mirror は -current だけで、
+    # -current の devel/cargo はリリースの cargo-generate-vendor が知らない引数を渡す。要る所だけを展開する
     if [ ! -d /usr/ports/infrastructure ]; then
-        git clone -q --depth 1 --filter=blob:none --sparse https://github.com/openbsd/ports.git /usr/ports
-        git -C /usr/ports sparse-checkout set infrastructure devel/cargo lang/rust lang/clang lang/python devel/llvm
+        ftp -o - "https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/ports.tar.gz" | tar -xzf - -C /usr \
+            ports/infrastructure ports/devel/cargo ports/lang/rust ports/lang/clang ports/lang/python ports/devel/llvm
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
@@ -132,7 +134,10 @@ netbsd)
     unset PKG_PATH
     log "pkgsrc の木"
     if [ ! -d /usr/pkgsrc/mk ]; then
-        git clone -q --depth 1 --filter=blob:none --sparse https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
+        # バイナリのパッケージ（pkgin）と同じ四半期の枝を使う（HEAD の lang/rust・cargo.mk はパッケージとずれる）
+        BRANCH="$(git ls-remote --heads https://github.com/NetBSD/pkgsrc.git 'pkgsrc-20*' | sed 's|.*refs/heads/||' | sort | tail -1)"
+        echo "pkgsrc branch: $BRANCH"
+        git clone -q --depth 1 --branch "$BRANCH" --filter=blob:none --sparse https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
         git -C /usr/pkgsrc sparse-checkout set mk lang/rust lang/python devel/cmake devel/protobuf shells/bash lang/clang \
             devel/nasm devel/gmake pkgtools
     fi
@@ -151,6 +156,8 @@ netbsd)
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
     log "make makesum"
     make makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
+    # クレートが distinfo に入ったか（入っていなければ make package の checksum で止まる）
+    echo "distfiles: $(make show-var VARNAME=DISTFILES | wc -w), in distinfo: $(grep -c '^SHA512' distinfo)"
     cp distinfo "$OUT/distinfo.netbsd"
     log "make package"
     make package >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
