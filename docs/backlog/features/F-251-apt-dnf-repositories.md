@@ -129,6 +129,14 @@
 - 人の作業が要る: `veil-packages` のリポジトリと Pages、OpenPGP の鍵、token。
 - **設定の場所を変えるのは外部契約の変更。** 前の版の利用者は自動では移さない方針で、リリースノートに書く。
 
+
+## 実装の結果
+
+- deb は xz で圧縮する（Ubuntu の dpkg-deb の既定の zstd は Debian の lintian が読めない）。lintian・rpmlint はエラー 0
+  （rpmlint の `non-readable /etc/veil/config.toml` だけは理由付きの例外。`packaging/rpm/veil.rpmlintrc`）。
+- `tools/release/build-repos.sh`・`repos-publish.sh`: Pages の履歴に版が積もらないよう、毎回 1 commit の履歴で置き換える。
+- 試験: 8 つの配布 × 2 アーキ（`test-package.sh`）、署名付きのリポジトリから入れる、改ざんの拒否（`test-repo-tamper.sh`）。
+
 ## 関連
 
 - [F-247](F-247-distribution-foundation.md)

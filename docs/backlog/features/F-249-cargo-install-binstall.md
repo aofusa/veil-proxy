@@ -146,6 +146,13 @@ cargo・binstall の自然な動きではないので、**バイナリだけを�
 - F-247（成果物・設定ファイルの決まり方・署名）が先。
 - `cargo install` の full のビルドは、CI で 30 分〜1 時間かかる。公開の後の試験は並列にし、公開そのものは待たせない。
 
+
+## 実装の結果
+
+- `[package.metadata.binstall]`（universal2・zip の override、minisign の公開鍵）。署名（`<アーカイブ>.sig`）は公開のときに
+  `tools/release/minisign-assets.sh` が付ける（SHA256SUMS の cosign の署名とハッシュを確かめてから）。
+- 文書（running.md・README）に「バイナリだけが入る。設定とページは自分で用意する」と、最小の設定を書いた。
+
 ## 関連
 
 - [F-238](F-238-publish-crates-and-pypi.md)

@@ -91,6 +91,13 @@
 - 依存は無い。Helm の部分は F-254 と一緒に入れる。
 - Grafana の schema の版の変化に追随する。CI の Grafana のイメージの版を上げるときに、試験で確かめる。
 
+
+## 実装の結果
+
+- `tools/grafana/gen_dashboard.py` が JSON を作る（examples と Helm chart の写しを `--check` で一致させる）。
+- `tools/grafana/test-dashboard.sh`（nightly）: compose を立ち上げ、全パネルの式を Prometheus に問い合わせる。
+  この試験で B-162（小さい応答がキャッシュされない）を見つけた。
+
 ## 関連
 
 - [B-159](../bugs/B-159-metrics-label-cardinality.md)（ラベルの値の制限）

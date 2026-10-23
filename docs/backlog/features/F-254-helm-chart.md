@@ -97,6 +97,13 @@
 - F-246（イメージの既定）は済み。Docker Hub（F-248）・ダッシュボード（F-256）は任意の値として後から足せる。
 - 非 root で始めたときの降格の設定の挙動を、実装の最初に確かめる。
 
+
+## 実装の結果
+
+- HTTP/3（UDP）は別の Service（`<release>-veil-h3`）にした。同じ番号の TCP・UDP を 1 つの Service に置くと `helm upgrade` の
+  マージで 1 つにまとめられる（kind の試験で発見）。
+- release.yml の `helm`: 公開したイメージで helm-check・kind の試験を回し、OCI に push して cosign で署名する（rc は chart も rc の版）。
+
 ## 関連
 
 - [F-196](F-196-kubernetes-sidecar-mesh.md)

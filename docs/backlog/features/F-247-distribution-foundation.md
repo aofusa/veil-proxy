@@ -203,6 +203,23 @@
 - **外部契約の変更:** Windows の既定のパスの変更、`VEIL_CONFIG` の追加。リリースノートに書く。
 - 版の目安は v0.9.0。
 
+
+## 実装の結果
+
+- 設計どおり: `-c` → `VEIL_CONFIG` → 既定のパス（ビルド時の `VEIL_DEFAULT_CONFIG_PATH`・Windows は `%ProgramData%`）、無ければ
+  終了コード 1 で置き場所を示す。`--help` は英語で既定のパスを出す。既定の設定とページは `packaging/defaults/`
+  （`render-defaults.sh` が 12 の入手経路の設定を作り、`--check` で全部を `veil -t` に通す）。
+- **設計から変えたこと:**
+  - `cargo auditable` + バイナリの grype はやめた。`--locked` でビルドするので、依存は公開の前の `advisories`
+    （全 Cargo.lock の cargo-audit・cargo-deny、警告も失敗）で同じものを検査している。
+  - BSD のビルド済みのバイナリは x86_64 だけ。CI の BSD の VM（cross-platform-actions）は arm64 の runner で動かず、
+    x86 の runner の arm64 の VM は TCG で 6 時間に収まらない。
+  - rc のタグも draft（pre-release）にした（人の指示: リリースのページは draft で作る）。下流の試験は draft の成果物を
+    runner の中の HTTP サーバで配って行う。
+  - Docker Hub のコピー・minisign の署名は、タグの時点ではなく、ページを公開したとき（`release-downstream.yml`）。
+- 作業で見つけて直したもの: B-160（相対パスの File の 403）、B-161（起動の失敗が終了コード 0）、B-162（小さい応答が
+  キャッシュされない）、B-163（平文だけの設定で BSD・macOS のサンドボックスが掛からない）。
+
 ## 関連
 
 - [F-246](F-246-container-try-it-defaults.md)（コンテナの既定）

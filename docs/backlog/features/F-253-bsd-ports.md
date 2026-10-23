@@ -124,6 +124,13 @@
 - VM の試験が要る（ssh llm の VM・手元の QEMU）。
 - 審査の時間は読めない。木への取り込みの前は、雛形と GitHub Release の tar.gz で使ってもらう。
 
+
+## 実装の結果
+
+- `tools/release/bsd-ports.py`（3 つの port を版と Cargo.lock から作る）を release の draft に `veil-<版>-bsd-ports.tar.gz` として付ける。
+- `tools/release/bsd-port-test.sh`（dist.yml の `bsd-ports`）: ports の木を sparse に取り、依存はパッケージで入れて
+  `make makesum`・`package`・入れる・サービスで起動・curl。配布物ではないので、失敗しても draft は止めない（結果は注釈と artifact）。
+
 ## 関連
 
 - [F-247](F-247-distribution-foundation.md)

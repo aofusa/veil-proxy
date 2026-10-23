@@ -94,6 +94,15 @@
 - F-247（CI の成果物・アーカイブの中身・署名）が先。
 - 人の作業（tap のリポジトリ・token）が要る。
 
+
+## 実装の結果
+
+- `packaging/homebrew/veil.rb.in` と `tools/release/homebrew-formula.sh`。設定は `etc/veil/config.toml`、ページは
+  `share/veil/www`、`veil` は `VEIL_CONFIG` を設定する wrapper（自分で設定していればそちらが勝つ）。
+- `tools/release/homebrew-test.sh`（CI の macOS arm64・x86_64、Linux x86_64・aarch64）: 手元の tap に置いて
+  `brew style`・`install`・`test`・`brew services`（macOS）・入れ直しで設定が残る・`uninstall`。
+- `brew test` はサーバを起動しない（`--version`・`-t`・設定が無いときのエラー）。起動の確認は homebrew-test.sh が行う。
+
 ## 関連
 
 - [F-247](F-247-distribution-foundation.md)

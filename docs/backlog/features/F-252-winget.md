@@ -105,6 +105,13 @@ rc の成果物は draft にあるので、`gh release download` で取り、run
 - 審査の時間は読めない。公開の速さは winget-pkgs に依る。
 - **arm64 の MSI:** WiX の arm64 の対応（`-arch arm64`）を、windows-11-arm の runner で確かめる。
 
+
+## 実装の結果
+
+- `%ProgramData%\veil` の ACL は、継承を切った SDDL（MsiLockPermissionsEx）で SYSTEM・Administrators だけが書き込める
+  ようにした（util の PermissionEx では %ProgramData% から継承する Users の書き込みが残った）。
+- `tools/release/test-msi.ps1`: 入れる・ファイルと ACL・PATH・既定のパスで起動・修復で設定が残る・消しても設定が残る。
+
 ## 関連
 
 - [F-184](F-184-windows-macos-feature-sets.md)（Windows の feature セット）

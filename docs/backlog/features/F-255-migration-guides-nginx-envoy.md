@@ -87,6 +87,14 @@
 - nginx・Envoy の版で振る舞いが変わるので、比べた版をガイドに書く。
 - 設定の変換ツール（nginx.conf → config.toml）は範囲外。要望があれば別のチケットにする。
 
+
+## 実装の結果
+
+- 英日の 2 つのガイド。完全な設定例 22 個を CI で `veil -t` に通す（`tools/lint/check-guide-configs.py`）。
+- `tests/migration/run.sh`（nightly）: nginx の 3 つ・Envoy の 1 つの組で 17 の要求が同じ応答になる。
+- 書く途中で確かめたこと: `path` の `*` 無しは完全一致（`"/"` だけは全部）、プロキシのルートは gRPC-Web を変換しない、
+  プロキシのキャッシュは HTTP/1.1 のクライアントと平文の上流だけ（F-257）。
+
 ## 関連
 
 - [F-215](F-215-service-mesh-dataplane.md)

@@ -68,6 +68,13 @@
 - 人の作業（リポジトリ・トークン・secrets）が要る。
 - Docker Hub の無料の名前空間の保持の方針（使われないタグの削除など）を確かめる。
 
+
+## 実装の結果
+
+- `tools/release/mirror-dockerhub.sh`: `cosign copy` で index・署名・SBOM を写し、digest の一致と `cosign verify` を確かめ、
+  説明（`packaging/container/dockerhub.md`）を API で更新する。リリースのページの公開のとき（`release-downstream.yml`）に回す。
+- secrets が無ければ失敗する（変数 `DOCKERHUB_MIRROR=off` で明示的に止める）。タグの workflow の以前の「secrets が無ければ飛ばす」段は消した。
+
 ## 関連
 
 - [F-237](F-237-publish-container-images.md)
