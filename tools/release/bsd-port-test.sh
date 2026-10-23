@@ -85,7 +85,8 @@ freebsd)
 openbsd)
     P="https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -p)/"
     log "pkg_add（依存）"
-    env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash
+    # cargo-generate-vendor: devel/cargo の module がクレートの metadata を作るのに使う
+    env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash cargo-generate-vendor
     LLVM="$(env PKG_PATH="$P" pkg_info -Q llvm 2>/dev/null | grep -E '^llvm-[0-9]' | sort -V | tail -1)"; env PKG_PATH="$P" pkg_add -I "$LLVM"
     log "ports の木"
     if [ ! -d /usr/ports/infrastructure ]; then
@@ -127,6 +128,8 @@ netbsd)
     [ -x /usr/pkg/bin/pkgin ] || /usr/sbin/pkg_add pkgin
     pkgin -y update
     pkgin -y install git-base rust cmake gmake protobuf bash clang nasm pkgconf mozilla-rootcerts-openssl
+    # pkgsrc は PKG_PATH があると止まる（pkg_add の取得先。pkgin は repositories.conf を使う）
+    unset PKG_PATH
     log "pkgsrc の木"
     if [ ! -d /usr/pkgsrc/mk ]; then
         git clone -q --depth 1 --filter=blob:none --sparse https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
