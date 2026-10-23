@@ -63,7 +63,8 @@ if missing:
 sys.exit(1 if fails else 0)
 PY
 
-# Grafana がダッシュボードとデータソースを読み込んでいる
+# Grafana がダッシュボードとデータソースを読み込んでいる（初回の起動は DB の移行で数分かかることがある）
+for _ in $(seq 1 120); do curl -fsS -o /dev/null http://127.0.0.1:3000/api/health 2>/dev/null && break; sleep 2; done
 if curl -fsS -u "admin:$PW" http://127.0.0.1:3000/api/dashboards/uid/veil-overview | grep -q '"title":"veil overview"'; then ok "Grafana: the dashboard is provisioned"
 else bad "Grafana: dashboard not found"; fi
 if curl -fsS -u "admin:$PW" http://127.0.0.1:3000/api/datasources/uid/prometheus/health | grep -q '"status":"OK"'; then ok "Grafana: the Prometheus data source is healthy"
