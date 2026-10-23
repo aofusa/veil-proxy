@@ -1,11 +1,13 @@
 Package: veil
 Version: __VERSION__
-Section: web
+Section: httpd
 Priority: optional
 Architecture: amd64
-Maintainer: aofusa <aofusa@localhost>
-Depends: openssl, libc6 (>= 2.28), adduser | shadow
-Description: High-performance reverse proxy server using io_uring and rustls
- Veil is a Linux-native high-performance reverse proxy supporting
- HTTP/1.1, HTTP/2, HTTP/3, kTLS, Proxy-Wasm, and advanced security
- features (seccomp, Landlock).
+Maintainer: aofusa <aofusa@users.noreply.github.com>
+Depends: libc6 (>= 2.28), adduser | passwd
+Homepage: https://github.com/aofusa/veil-proxy
+Description: High-performance reverse proxy and web server
+ Veil is a reverse proxy and web server for HTTP/1.1, HTTP/2 and HTTP/3
+ with kTLS, io_uring, Proxy-Wasm filters, and seccomp / Landlock
+ sandboxing. The package installs a default configuration that serves a
+ page on http://127.0.0.1:8080/ and starts the veil service.

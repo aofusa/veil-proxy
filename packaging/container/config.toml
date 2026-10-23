@@ -56,7 +56,6 @@ landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 [performance]
 huge_pages_enabled = false
 reuseport_balancing = "cbpf"
-
 # TLS (HTTP/1.1 and HTTP/2) and HTTP/3: add a certificate, add `listen = "0.0.0.0:443"` to [server] and
 # uncomment:
 # [tls]

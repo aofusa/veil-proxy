@@ -91,20 +91,25 @@ render() {
     [ -n "$www_override" ] && www="$www_override"
     local www_path="${www%/}"; www_path="${www_path%\\}"
     mkdir -p "$out"
-    python3 - "$DEF" "$out/config.toml" "$listen" "$www" "$www_path" "$sec" "$perf" "$(header "$hdr")" <<'PY'
-import sys
-d, out, listen, www, www_path, sec, perf, hdr = sys.argv[1:]
-s = open(f"{d}/config.toml.in", encoding="utf-8").read()
-security = open(f"{d}/security/{sec}.toml", encoding="utf-8").read().replace("@WWW_PATH@", www_path).rstrip("\n")
-performance = "" if perf == "none" else "\n" + open(f"{d}/performance-{perf}.toml", encoding="utf-8").read()
-s = (s.replace("@HEADER@", hdr.rstrip("\n"))
-      .replace("@LISTEN@", listen)
-      .replace("@WWW_DIR@", "'" + www + "'")
-      .replace("@SECURITY@", security)
-      .replace("@PERFORMANCE@", performance))
-assert "@" not in s.replace("@ ", ""), "unreplaced placeholder"
-open(out, "w", encoding="utf-8", newline="\n").write(s)
-PY
+    # python 等に頼らず bash だけで埋める（deb・rpm を作るコンテナ・macOS の bash 3.2 でも動く）
+    local sec_file="$DEF/security/$sec.toml" perf_file="$DEF/performance-$perf.toml"
+    [ -f "$sec_file" ] || { echo "error: missing $sec_file" >&2; exit 2; }
+    local www_lit="'$www'" l
+    {
+        while IFS= read -r l || [ -n "$l" ]; do
+            case "$l" in
+                @HEADER@) header "$hdr" ;;
+                @SECURITY@)
+                    while IFS= read -r x || [ -n "$x" ]; do printf '%s\n' "${x//@WWW_PATH@/"$www_path"}"; done < "$sec_file" ;;
+                @PERFORMANCE@)
+                    if [ "$perf" != none ]; then echo; cat "$perf_file"; fi ;;
+                *)
+                    l="${l//@LISTEN@/"$listen"}"
+                    printf '%s\n' "${l//@WWW_DIR@/"$www_lit"}" ;;
+            esac
+        done < "$DEF/config.toml.in"
+    } > "$out/config.toml"
+    if grep -q '@[A-Z_]*@' "$out/config.toml"; then echo "error: unreplaced placeholder in $out/config.toml" >&2; exit 2; fi
     rm -rf "$out/www"; cp -R "$DEF/www" "$out/www"
 }
 
@@ -128,7 +133,7 @@ case "${1:-}" in
         # コンテナの Dockerfile は git に入っている生成物をコピーする（ビルドの段に python が無い）。雛形と一致すること
         render container "$tmp/container-as-is"
         if cmp -s "$tmp/container-as-is/config.toml" "$ROOT/packaging/container/config.toml"; then echo "ok   packaging/container/config.toml is up to date"
-        else echo "FAIL packaging/container/config.toml differs from the template (run: $0 container packaging/container && rm -rf packaging/container/www)"; fail=1; fi
+        else echo "FAIL packaging/container/config.toml differs from the template (regenerate it: $0 container DIR, then copy DIR/config.toml)"; fail=1; fi
         exit "$fail"
         ;;
     ""|-h|--help) sed -n '2,10p' "$0"; exit 0 ;;
