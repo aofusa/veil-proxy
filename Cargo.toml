@@ -91,7 +91,7 @@ pkg-fmt = "tgz"
 
 [package.metadata.binstall.signing]
 algorithm = "minisign"
-pubkey = "RWSlKKV/iZ73/wsvBPC0whb/k7Jm+CiP3PzCB9BYDRUVT3BTHbUJvt7s"
+pubkey = "RWSK8B6kNYXiqr3pLFklRgQoKpg+W3/GEAvZfXo+9qnhzgO6bXxQz+tl"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-{ target }.zip"
