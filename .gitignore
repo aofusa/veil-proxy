@@ -33,7 +33,6 @@ tests/*/target/
 tests/api/*/target/
 tools/api-bench/*/target/
 tools/api-bench/*/target-*/
-examples/wasm-filters/*/Cargo.lock
 tests/wasm/*.wasm
 
 # WASM AOT サイドカーキャッシュ（F-36、起動時に <module>.wasm から自動生成される成果物）
@@ -58,7 +57,6 @@ packaging/rpm/SRPM/
 packaging/rpm/SOURCES/rootfs/
 # container_security ハーネス Rust ツールのビルド成果物
 tools/container_security/harness/tools/target/
-tools/container_security/harness/tools/Cargo.lock
 # container_security 実行レポート（run.sh 毎回生成）
 tools/container_security/results/
 

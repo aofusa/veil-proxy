@@ -78,13 +78,18 @@
     この実行で、メトリクスの系列が際限なく増える問題（B-159）と、集計が失敗を passed に数える問題が見つかった。
 - VDS の standalone E2E（Rust の参照サーバ、tonic 0.14 の gRPC h2c・TLS）。
 - vendoring 版 wasmtime（`profiling` を消した）を使う NetBSD x86_64 の単体 1002 件・統合 60 件。
-- jwt-filter の単体試験（25 件 + 結合 8 件）。`RUSTFLAGS=-Clink-arg=--allow-undefined` で wasm32-wasip1 のビルド。
+- jwt-filter の単体試験（25 件 + 結合 8 件）。wasm32-wasip1 のビルド。
 
 ## 残っていること
 
-- `examples/wasm-filters/*` は、rustc 1.99 の rust-lld では `proxy_*` の未定義シンボルのためにリンクできない。
-  - 変更の前から、すべてのフィルタで起きている（`--allow-undefined` を付ければ通る）。
-  - 脆弱性とは別の問題として扱う。
+- 追記（v0.8.4 の後）: 上の版で「`examples/wasm-filters/*` はすべて rust-lld でリンクできない」と書いたのは誤り。
+  - リンクできなかったのは、手元の（git 管理外だった）Cargo.lock が proxy-wasm 0.2.4 に固定されていた 5 つ
+    （cache・header・jwt・lua・waf）だけ。0.2.4 はホスト関数の `extern "C"` に `#[link(wasm_import_module = "env")]`
+    が無く、リンカに `--allow-undefined` が渡らないと未定義シンボルになる。0.2.5 は付いているので取り込みになる。
+  - 新しく clone した場合は 0.2.5 に解決されるので起きない。0.2.5 に上げて 10 個ともビルドできることを確かめた。
+  - `examples/wasm-filters/*/Cargo.lock` と `tools/container_security/harness/tools/Cargo.lock` は `.gitignore`
+    で除外されていて、公開の workflow の cargo-audit（checkout した木を見る）はこれらを調べていなかった。
+    git で管理するようにした（他の例と同じ。依存の解決を固定し、CI でも勧告を調べる）。
 - h3spec の 49 件中 11 件の不一致は B-100 の時点（38/49）から変わっていない。調べた結果、安全性の問題ではなかった。
   - トランスポートパラメータの 8 件: quiche は不正な値を検出している（veil のログに `recv error: InvalidTransportParam`）。
     - その接続で 1 つもパケットを処理できていないうちのエラーなので、quiche は CONNECTION_CLOSE を送らずにその場で閉じる
