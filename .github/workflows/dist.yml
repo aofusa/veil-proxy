@@ -149,9 +149,14 @@ jobs:
           merge-multiple: true
       - name: lintian and rpmlint (errors fail)
         run: |
-          docker run --rm -v "$PWD/dist:/d" debian:13 bash -c 'apt-get update -qq && apt-get install -y -qq lintian >/dev/null && lintian --fail-on error --no-tag-display-limit /d/*.deb'
-          docker run --rm -v "$PWD/dist:/d" fedora:latest bash -c 'dnf install -y -q rpmlint >/dev/null && rpmlint /d/*.rpm' || {
-            echo "::error title=rpmlint::rpmlint reported errors"; exit 1; }
+          rc=0
+          docker run --rm -v "$PWD/dist:/d" debian:13 bash -c 'apt-get update -qq >/dev/null && apt-get install -y -qq lintian >/dev/null 2>&1 && lintian --fail-on error --no-tag-display-limit /d/*.deb' > lintian.log 2>&1 || rc=1
+          cat lintian.log
+          grep -E '^E: ' lintian.log | head -30 | while IFS= read -r l; do echo "::error title=lintian::$l"; done
+          docker run --rm -v "$PWD/dist:/d" fedora:latest bash -c 'dnf install -y -q rpmlint >/dev/null 2>&1 && rpmlint /d/*.rpm' > rpmlint.log 2>&1 || rc=1
+          cat rpmlint.log
+          grep -E ': E: ' rpmlint.log | head -30 | while IFS= read -r l; do echo "::error title=rpmlint::$l"; done
+          exit "$rc"
       - name: build signed repositories with a throwaway key and install from them
         run: |
           set -euo pipefail
@@ -240,43 +245,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: brew install from a local tap, brew test, brew services
-        run: |
-          set -euo pipefail
-          if ! command -v brew >/dev/null; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null || true)"; fi
-          if ! command -v brew >/dev/null; then
-            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          fi
-          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
-          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
-          (cd dist && nohup python3 -m http.server 18600 --bind 127.0.0.1 >/dev/null 2>&1 &)
-          sleep 1
-          tools/release/homebrew-formula.sh "$v" http://127.0.0.1:18600 dist/SHA256SUMS > veil.rb
-          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_NO_ANALYTICS=1
-          brew tap-new --no-git aofusa/localtest
-          cp veil.rb "$(brew --repository)/Library/Taps/aofusa/homebrew-localtest/Formula/veil.rb"
-          brew style aofusa/localtest/veil
-          brew install aofusa/localtest/veil
-          brew test aofusa/localtest/veil
-          prefix="$(brew --prefix)"
-          test -f "$prefix/etc/veil/config.toml" && grep -q "$prefix/opt/veil/share/veil/www" "$prefix/etc/veil/config.toml"
-          if [ "$(uname)" = Darwin ]; then
-            brew services start aofusa/localtest/veil
-            for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
-            curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q '<title>veil quickstart</title>'
-            brew services stop aofusa/localtest/veil
-          else
-            # Linux の brew services は systemd のユーザーのセッションが要るので、wrapper をそのまま起動する
-            veil > "$RUNNER_TEMP/veil.log" 2>&1 & pid=$!
-            for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
-            curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q '<title>veil quickstart</title>'
-            kill "$pid"; grep -q "from VEIL_CONFIG" "$RUNNER_TEMP/veil.log"
-          fi
-          # 書き換えた設定は入れ直しても残る
-          echo "# edited by test" >> "$prefix/etc/veil/config.toml"
-          brew reinstall aofusa/localtest/veil
-          grep -q "edited by test" "$prefix/etc/veil/config.toml"
-          brew uninstall aofusa/localtest/veil
+        run: tools/release/homebrew-test.sh dist
 
   windows-msi:
     name: build MSI

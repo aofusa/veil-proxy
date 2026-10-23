@@ -17,10 +17,8 @@
     <SummaryInformation Description="veil reverse proxy and web server" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of veil is already installed." />
     <MediaTemplate EmbedCab="yes" />
-    <!-- 表示名が OS の言語で変わるので、既知の SID から解決したアカウント名を使う -->
-    <PropertyRef Id="WIX_ACCOUNT_ADMINISTRATORS" />
-    <PropertyRef Id="WIX_ACCOUNT_LOCALSYSTEM" />
-    <PropertyRef Id="WIX_ACCOUNT_USERS" />
+    <!-- 表示名が OS の言語で変わるので、既知の SID から解決したアカウント名（WIX_ACCOUNT_*）を使う -->
+    <util:QueryWindowsWellKnownSIDs />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/aofusa/veil-proxy" />
     <Property Id="ARPHELPLINK" Value="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md" />
 
