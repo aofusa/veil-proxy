@@ -55,6 +55,9 @@ serve_check() {
     else
         bad "$label: did not start"; tail -30 "$LOG"
     fi
+    # アクセスログは非同期に書き出される。止める前に出るのを待つ（止めた後の書き出しに頼らない）
+    local j=0
+    while [ "$j" -lt 15 ] && ! grep -q 'type=access' "$LOG"; do sleep 1; j=$((j+1)); done
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     if grep -q 'type=access' "$LOG"; then ok "$label: access log on stdout"; else bad "$label: no access log"; tail -20 "$LOG"; fi
 }

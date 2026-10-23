@@ -14,16 +14,24 @@ $ErrorActionPreference = 'Stop'
 $root = Resolve-Path "$PSScriptRoot/../.."
 $version = (Select-String -Path "$root/Cargo.toml" -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-  dotnet tool install --global wix --version $WixVersion | Out-Host
+  dotnet tool install --global wix --version $WixVersion 2>&1 | Out-Host
   $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
 }
-wix extension add -g "WixToolset.Util.wixext/$WixVersion" | Out-Host
+$ext = wix extension add -g "WixToolset.Util.wixext/$WixVersion" 2>&1
+$ext | Out-Host
+if ($LASTEXITCODE -ne 0) { $ext | ForEach-Object { Write-Host "::error title=wix extension::$_" }; throw "wix extension add failed" }
 $work = Join-Path ([IO.Path]::GetTempPath()) ("veil-msi-" + [guid]::NewGuid())
 Expand-Archive -Path $Zip -DestinationPath $work
 $src = (Get-ChildItem $work -Directory | Select-Object -First 1).FullName
-wix build -arch $Arch -ext WixToolset.Util.wixext `
+$log = wix build -arch $Arch -ext WixToolset.Util.wixext `
   -d "Version=$version" -d "SourceDir=$src" -d "DefaultsDir=$((Resolve-Path $Defaults).Path)" `
-  -o $Out "$root/packaging/windows/veil.wxs"
-if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
+  -o $Out "$root/packaging/windows/veil.wxs" 2>&1
+$rc = $LASTEXITCODE
+$log | Out-Host
+if ($rc -ne 0) {
+  # 公開リポジトリの注釈はログイン無しで読めるので、WiX のエラーを注釈に出す
+  $log | Select-String -Pattern 'error|warning' | Select-Object -First 20 | ForEach-Object { Write-Host "::error title=wix ($Arch)::$($_.Line)" }
+  throw "wix build failed ($rc)"
+}
 Remove-Item -Recurse -Force $work
 Get-Item $Out | Format-List Name, Length
