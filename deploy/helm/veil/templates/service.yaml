@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "veil.fullname" . }}
+  labels:
+    {{- include "veil.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "veil.selectorLabels" . | nindent 4 }}
+  # No appProtocol: Linkerd reads appProtocol: http as HTTP/1.1 only, which breaks h2c on the same port.
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.tls.secretName }}
+    - name: https
+      port: {{ .Values.service.tlsPort }}
+      targetPort: https
+      protocol: TCP
+    {{- end }}
+{{- if .Values.http3.enabled }}
+---
+# HTTP/3 (QUIC, UDP) is a separate Service: a TCP and a UDP port with the same number in one Service are merged into
+# one by `helm upgrade` (the ports' merge key is the port number), and some load balancers reject mixed protocols.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "veil.fullname" . }}-h3
+  labels:
+    {{- include "veil.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "veil.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: h3
+      port: {{ .Values.service.tlsPort }}
+      targetPort: h3
+      protocol: UDP
+{{- end }}

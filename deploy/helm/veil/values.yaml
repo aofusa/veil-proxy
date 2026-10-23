@@ -1,0 +1,121 @@
+# Default values for the veil chart (F-254). `helm install veil oci://ghcr.io/aofusa/charts/veil` with these
+# values serves the page built into the image on port 8080:
+#   kubectl port-forward svc/veil 8080:8080 && curl http://127.0.0.1:8080/
+
+image:
+  # Also on Docker Hub: docker.io/aofusa/veil (same digests).
+  repository: ghcr.io/aofusa/veil
+  # Defaults to musl-v<appVersion>. "glibc-v<version>" is the glibc build.
+  tag: ""
+  # Pin the image by digest (sha256:...); takes precedence over the tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 1
+
+# The veil configuration (config.toml). Empty: the chart writes the default one (templates/configmap.yaml) from
+# the values below. Set it to your own TOML to replace it entirely; the pod restarts when it changes.
+config: ""
+# Use an existing ConfigMap (key config.toml) instead of `config`.
+existingConfigMap: ""
+
+# Used by the default configuration only.
+defaults:
+  logLevel: info
+  # 0 = one worker per CPU available to the container.
+  threads: 0
+  # Request log on standard output (kubectl logs).
+  accessLog: true
+
+# TLS (HTTP/1.1 and HTTP/2 over TLS on containerPort 8443): a kubernetes.io/tls Secret. With the default
+# configuration, setting it adds the TLS listener; the certificate is reloaded when the Secret changes.
+tls:
+  secretName: ""
+
+# HTTP/3 (QUIC on UDP 8443). Needs tls.secretName.
+http3:
+  enabled: false
+
+# Prometheus metrics on /__metrics (port 8080), and a ServiceMonitor for the Prometheus Operator.
+metrics:
+  enabled: false
+  # Source addresses allowed to scrape (the pod network by default).
+  allowedIps: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# The example Grafana dashboard as a ConfigMap for the Grafana sidecar (label grafana_dashboard: "1").
+grafanaDashboard:
+  enabled: false
+  labels:
+    grafana_dashboard: "1"
+  namespace: ""
+
+service:
+  type: ClusterIP
+  # Port of the plaintext HTTP/1.1 + h2c listener on the Service.
+  port: 8080
+  # Port of the TLS listener on the Service (when tls.secretName is set).
+  tlsPort: 443
+  annotations: {}
+  # Do not set appProtocol on these ports: Linkerd treats appProtocol: http as HTTP/1.1 only and breaks h2c.
+
+podAnnotations: {}
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 256Mi
+
+# The image's veil also runs as root and drops privileges; in Kubernetes it runs as non-root from the start.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Your files: mount them over /var/www (the default page) or elsewhere, e.g.
+#   extraVolumes: [{name: site, configMap: {name: my-site}}]
+#   extraVolumeMounts: [{name: site, mountPath: /var/www, readOnly: true}]
+extraVolumes: []
+extraVolumeMounts: []
+extraEnv: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+networkPolicy:
+  enabled: false
+  # Extra ingress rules (the listener ports are always allowed from these peers).
+  from: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automount: false
+
+terminationGracePeriodSeconds: 30
+nodeSelector: {}
+tolerations: []
+affinity: {}

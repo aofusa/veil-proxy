@@ -1,0 +1,4 @@
+bin/veil
+@sample %%ETCDIR%%/config.toml.sample
+%%DATADIR%%/www/index.html
+%%DATADIR%%/www/quickstart.html

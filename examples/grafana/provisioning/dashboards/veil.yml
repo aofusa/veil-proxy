@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: veil
+    folder: veil
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

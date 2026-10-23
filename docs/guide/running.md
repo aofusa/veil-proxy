@@ -5,7 +5,7 @@
 ## Startup
 
 ```bash
-# Start with default config file (/etc/veil/config.toml)
+# Start with the configuration file at the default path (see "Configuration file" below)
 ./veil
 
 # Start with specified config file
@@ -23,11 +23,155 @@
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --config <PATH>` | Path to config file | `/etc/veil/config.toml` |
+| `-c, --config <PATH>` | Path to config file | `$VEIL_CONFIG`, then the default path (below) |
 | `-t, --test` | Test config file syntax and validity, then exit (nginx -t equivalent) | - |
 | `-o, --override <KEY=VALUE>` | Override a config.toml value from the command line (repeatable, see below) | - |
 | `-h, --help` | Show help message | - |
 | `-V, --version` | Show version information | - |
+
+### Configuration file
+
+veil always reads a configuration file; there is no built-in configuration. The file is chosen in this order:
+
+1. `-c FILE` / `--config FILE`
+2. the `VEIL_CONFIG` environment variable (ignored when empty)
+3. the default path:
+
+   | Build | Default path |
+   |---|---|
+   | Linux, macOS, FreeBSD, OpenBSD, NetBSD | `/etc/veil/config.toml` |
+   | Windows | `%ProgramData%\veil\config.toml` |
+   | Built with `VEIL_DEFAULT_CONFIG_PATH=/abs/path` set at build time (BSD ports) | that path |
+
+   `veil --help` prints the default path of the binary you run.
+
+When the file does not exist, veil exits with status 1 and names the path it looked for. The startup log shows the
+file and where its path came from (`Config File: /etc/veil/config.toml (from default path)`). A SIGHUP reload reads the
+same file again.
+
+#### Where the packages put the default configuration
+
+Each package installs a default configuration and a default page, and veil reads them without any option. The default
+configuration serves the page over plaintext HTTP/1.1 and h2c on `127.0.0.1:8080` (the container on `0.0.0.0:8080`) and
+logs every request; the page also lists these paths (`/quickstart.html`).
+
+| Installed with | Configuration | Page | How veil finds the file | Start |
+|---|---|---|---|---|
+| Container image | `/etc/veil/conf.d/config.toml` | `/var/www/` | the image's `CMD` passes `-c` | `docker run -p 8080:8080 ghcr.io/aofusa/veil` |
+| deb / rpm | `/etc/veil/config.toml` | `/usr/share/veil/www/` | default path | Debian / Ubuntu: started on install; RPM: `sudo systemctl enable --now veil` |
+| Homebrew | `$(brew --prefix)/etc/veil/config.toml` | `$(brew --prefix)/share/veil/www/` | the `veil` wrapper sets `VEIL_CONFIG` | `brew services start veil` or `veil` |
+| winget | `%ProgramData%\veil\config.toml` | `%ProgramData%\veil\www\` | default path | `veil` |
+| FreeBSD ports | `/usr/local/etc/veil/config.toml` | `/usr/local/share/veil/www/` | default path built in | `sysrc veil_enable=YES && service veil start` |
+| OpenBSD ports | `/etc/veil/config.toml` | `/usr/local/share/veil/www/` | default path | `rcctl enable veil && rcctl start veil` |
+| NetBSD pkgsrc | `/usr/pkg/etc/veil/config.toml` | `/usr/pkg/share/veil/www/` | default path built in | `veil=YES` in `/etc/rc.conf`, `service veil start` |
+
+Package upgrades never overwrite a configuration you changed.
+
+#### Installing
+
+Each of these installs veil with the default configuration and page above, except the binary-only ones.
+
+##### apt and dnf repositories
+
+Signed repositories for Debian / Ubuntu (amd64, arm64) and RHEL-compatible / Fedora / Amazon Linux (x86_64,
+aarch64). The signing key's fingerprint is `42FF D5A9 145A BEAD 9CDE  F997 AF5B 42F9 5AC9 AEB9`.
+
+```bash
+# Debian 12 / 13, Ubuntu 22.04 / 24.04
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://aofusa.github.io/veil-packages/veil.gpg | sudo tee /etc/apt/keyrings/veil.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/veil.gpg] https://aofusa.github.io/veil-packages/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/veil.list
+sudo apt update && sudo apt install veil      # starts the service
+curl http://127.0.0.1:8080/
+
+# RHEL 9 / 10 and compatibles, Fedora, Amazon Linux 2023
+sudo curl -fsSL https://aofusa.github.io/veil-packages/veil.repo -o /etc/yum.repos.d/veil.repo
+sudo dnf install veil
+sudo systemctl enable --now veil
+curl http://127.0.0.1:8080/
+```
+
+The `.deb` and `.rpm` files are also attached to each GitHub release. Logs go to the journal
+(`journalctl -u veil`); reload a changed configuration with `sudo systemctl reload veil`. `apt remove` keeps
+`/etc/veil/config.toml`, `apt purge` deletes it.
+
+Upgrading from 0.8.x, which kept its configuration in `/var/etc/veil/config.toml`: the package leaves that file
+in use (it writes `VEIL_CONFIG=/var/etc/veil/config.toml` to `/etc/default/veil` or `/etc/sysconfig/veil`).
+To move to the default path, copy your settings into `/etc/veil/config.toml`, delete that line and run
+`sudo systemctl restart veil`. 0.8.x also generated a self-signed certificate in `/var/etc/veil/ssl/`; it is
+left as it was.
+
+##### Homebrew (macOS, Linux)
+
+```bash
+brew install aofusa/tap/veil
+brew services start veil        # or run `veil` in a terminal
+curl http://127.0.0.1:8080/
+```
+
+The `veil` command is a wrapper that sets `VEIL_CONFIG` to `$(brew --prefix)/etc/veil/config.toml` unless you set
+it yourself, so `veil -t` and `veil` use that file. `brew services restart veil` applies a changed configuration.
+
+##### winget (Windows)
+
+```powershell
+winget install Aofusa.Veil      # as an administrator; installs for all users
+veil                            # in a new terminal; then open http://127.0.0.1:8080/
+```
+
+The MSI installs `C:\Program Files\veil\veil.exe` (added to `PATH`), the configuration
+`%ProgramData%\veil\config.toml` and the page `%ProgramData%\veil\www\`. Only administrators can change files
+in `%ProgramData%\veil`. Upgrades and `winget uninstall` keep the configuration. veil is not registered as a
+Windows service; to run it as one, use `sc.exe create veil binPath= "C:\Program Files\veil\veil.exe"` or a
+service wrapper.
+
+##### Rust (`cargo binstall`, `cargo install`)
+
+```bash
+cargo binstall veil-proxy                                   # the prebuilt binary of a GitHub release
+cargo install veil-proxy --locked --features full           # build from crates.io (Linux)
+```
+
+Both install the `veil` binary only (see below). `cargo binstall` checks each archive's minisign signature.
+For `cargo install`, pick the feature set for your OS: `full` (Linux), `full-macos`, `full-windows`,
+`full-freebsd`, `full-openbsd`, `full-netbsd`; without `--features`, only the default features (kTLS, HTTP/2)
+are built. Building needs a C compiler, `cmake` and, on Windows, `nasm` ([Building](building.md)).
+
+#### Binary only: create the configuration yourself
+
+The release archives, `cargo install veil-proxy` and `cargo binstall veil-proxy` install the `veil` binary only. They
+do **not** install a configuration file or a page (cargo has no way to install data files, and veil does not write one
+for you): create them yourself. If you want a default configuration and page installed for you, use a package or the
+container image instead.
+
+The release archive has an example in `examples/` to start from:
+
+```bash
+cd veil-<version>-<target>
+./veil -c examples/config.toml        # serves examples/www/ on http://127.0.0.1:8080/
+```
+
+A minimal configuration, if you start from scratch (`/srv/www` holds your `index.html`):
+
+```toml
+[server]
+listen_cleartext = "127.0.0.1:8080"   # plaintext HTTP/1.1 + h2c
+enable_secure_redirect = false        # no TLS listener, so serve instead of redirecting to https
+
+[access_log]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/srv/www/"
+```
+
+Then run `veil -c /path/to/config.toml`, set `VEIL_CONFIG=/path/to/config.toml`, or put the file at the default path.
+Relative paths in the file are relative to the directory you start veil from.
 
 ### Configuration Override (`-o`/`--override`)
 

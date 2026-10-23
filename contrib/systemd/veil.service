@@ -16,19 +16,24 @@
 #   sudo systemctl enable veil
 #   sudo systemctl start veil
 #
-# 設定ファイル: /var/etc/veil/config.toml
+# 設定ファイル: /etc/veil/config.toml（veil の既定のパス。F-251）。0.8.x 以前の /var/etc/veil を使い続ける場合は
+# パッケージが /etc/default/veil（deb）・/etc/sysconfig/veil（rpm）に VEIL_CONFIG を書く。
 #
 # ============================================
 
 [Unit]
 Description=Veil - High-Performance Reverse Proxy Server (io_uring + rustls)
-Documentation=https://github.com/aofusa/veil
+Documentation=https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/veil -c /var/etc/veil/config.toml
+# -c を付けない: VEIL_CONFIG（下の EnvironmentFile）が無ければ既定のパス /etc/veil/config.toml を読む
+EnvironmentFile=-/etc/default/veil
+EnvironmentFile=-/etc/sysconfig/veil
+ExecStartPre=/usr/bin/veil -t
+ExecStart=/usr/bin/veil
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -85,7 +90,8 @@ PrivateDevices=yes
 # 設定・証明書は読み取り専用、ログ・キャッシュは systemd が管理
 LogsDirectory=veil
 CacheDirectory=veil
-ReadOnlyPaths=/var/etc/veil
+ReadOnlyPaths=/etc/veil
+ReadOnlyPaths=-/var/etc/veil
 
 # 注: /var/tmp/veil は ProtectSystem=strict 下で書き込み可能。
 # ReadWritePaths への明示指定はマウント名前空間エラーの原因になるため使用しない。

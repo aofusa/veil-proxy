@@ -1,0 +1,6 @@
+@comment $NetBSD$
+bin/veil
+share/examples/rc.d/veil
+share/examples/veil/config.toml
+share/veil/www/index.html
+share/veil/www/quickstart.html

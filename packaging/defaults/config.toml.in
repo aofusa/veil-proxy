@@ -1,0 +1,51 @@
+@HEADER@
+# The default configuration listens on plaintext HTTP/1.1 + h2c only, so no TLS certificate is needed.
+# Check a change with `veil -t` and reload without downtime with SIGHUP.
+# Every key:  https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml
+# Guides:     https://github.com/aofusa/veil-proxy/blob/main/docs/guide/README.md
+
+[server]
+# Plaintext HTTP/1.1 + h2c (prior knowledge).
+listen_cleartext = "@LISTEN@"
+# There is no TLS listener, so serve plaintext instead of redirecting to https.
+enable_secure_redirect = false
+http2_enabled = true
+# 0 = one worker per CPU.
+threads = 0
+
+[logging]
+level = "info"
+
+[access_log]
+# One line per request on standard output.
+enabled = true
+format = "text"
+
+[security]
+@SECURITY@
+@PERFORMANCE@
+# TLS (HTTP/1.1 and HTTP/2) and HTTP/3: add a certificate, add `listen = "0.0.0.0:443"` to [server] and
+# uncomment:
+# [tls]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
+# [http3]
+# enabled = true
+# listen = "0.0.0.0:443"
+
+# Reverse proxy: put a route like this before the "/" route (the first matching route wins).
+# [[route]]
+# [route.conditions]
+# path = "/api/"
+# [route.action]
+# type = "Proxy"
+# url = "http://127.0.0.1:3000"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = @WWW_DIR@
+[route.security]
+allowed_methods = ["HEAD", "GET"]

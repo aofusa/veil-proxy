@@ -1,0 +1,12 @@
+@newgroup _veil:@UID@
+@newuser _veil:@UID@:_veil::veil daemon:/var/empty:/sbin/nologin
+@rcscript ${RCDIR}/veil
+@bin bin/veil
+share/examples/veil/
+share/examples/veil/config.toml
+@sample ${SYSCONFDIR}/veil/
+@sample ${SYSCONFDIR}/veil/config.toml
+share/veil/
+share/veil/www/
+share/veil/www/index.html
+share/veil/www/quickstart.html

@@ -1,0 +1,17 @@
+# veil runs as the user who started it, with its own seccomp filter and Landlock (only the paths below are
+# readable afterwards). Add the directories you serve to landlock_read_paths.
+allow_security_failures = false
+enable_seccomp = true
+seccomp_mode = "filter"
+enable_landlock = true
+enable_sandbox = false
+landlock_read_paths = [
+  "@WWW_PATH@",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr",
+]
+landlock_write_paths = []

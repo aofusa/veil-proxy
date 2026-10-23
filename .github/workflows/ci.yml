@@ -109,6 +109,15 @@ jobs:
         run: cargo test --test integration_tests --features full
       - name: Routing property tests
         run: cargo test --test routing_proptest --features full
+      # F-247 / F-255 / F-256: 既定の設定の雛形・文書の中の設定例・ダッシュボードの JSON を、このコミットの veil で検査する
+      - name: Default configurations, guide examples and the Grafana dashboard
+        run: |
+          cargo build --features full
+          tools/release/render-defaults.sh --check "$PWD/target/debug/veil"
+          python3 tools/lint/check-guide-configs.py target/debug/veil \
+            docs/guide/migration-nginx.md docs/guide/ja/migration-nginx.md \
+            docs/guide/migration-envoy.md docs/guide/ja/migration-envoy.md
+          python3 tools/grafana/gen_dashboard.py --check
 
   e2e:
     name: e2e (features full)

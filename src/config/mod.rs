@@ -2883,7 +2883,6 @@ mod f178_capability_mode_blocker_tests {
     fn no_facts() -> CapModeFacts {
         CapModeFacts {
             has_l4: false,
-            cleartext: false,
             http3: false,
         }
     }
@@ -2933,13 +2932,6 @@ mod f178_capability_mode_blocker_tests {
                     ..no_facts()
                 },
                 CapModeBlocker::L4,
-            ),
-            (
-                CapModeFacts {
-                    cleartext: true,
-                    ..no_facts()
-                },
-                CapModeBlocker::Cleartext,
             ),
             (
                 CapModeFacts {

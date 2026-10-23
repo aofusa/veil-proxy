@@ -1,0 +1,5 @@
+GET - /api/users
+GET - /api/users?id=7
+POST - /api/orders
+GET - /index.html
+GET - /missing

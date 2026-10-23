@@ -68,7 +68,7 @@ DOC_FILES=(
     .github/workflows/release-sbom.yml
     docs/guide/library.md docs/guide/ja/library.md
     crates/veil-tokio/README.md
-    packaging/container/www/quickstart.html
+    packaging/defaults/www/quickstart.html
 )
 python3 - "$NEW" "${DOC_FILES[@]}" <<'PY'
 import re, sys
@@ -94,5 +94,10 @@ for f in files:
         open(f, "w").write(t)
         print("updated", f)
 PY
+
+# 4. Helm chart（F-254）: chart の版と appVersion を veil の版にそろえる（同時に公開する）
+sed -i.bak -E -e "s/^version: .*/version: ${NEW}/" -e "s/^appVersion: .*/appVersion: \"${NEW}\"/" deploy/helm/veil/Chart.yaml
+rm -f deploy/helm/veil/Chart.yaml.bak
+echo "updated deploy/helm/veil/Chart.yaml"
 
 echo "done. check: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | .name + \" \" + .version'"

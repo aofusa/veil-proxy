@@ -1,0 +1,16 @@
+apiVersion: v2
+name: veil
+description: High-performance reverse proxy and web server (HTTP/1.1, HTTP/2, HTTP/3, gRPC, Proxy-Wasm)
+type: application
+# The chart is released together with veil, with the same version (tools/release/bump-version.sh).
+version: 0.9.0
+appVersion: "0.9.0"
+home: https://github.com/aofusa/veil-proxy
+sources:
+  - https://github.com/aofusa/veil-proxy
+keywords: [proxy, reverse-proxy, web-server, http3, grpc]
+maintainers:
+  - name: aofusa
+    url: https://github.com/aofusa
+annotations:
+  artifacthub.io/license: Apache-2.0 OR MIT

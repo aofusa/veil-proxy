@@ -147,10 +147,10 @@ mkdir -p "${OUTPUT_DIR}"
 stage_parent="${BUILD_DIR}/tarball-${TARGET}"
 dir_name="veil-${VERSION}-${TARGET}"
 rm -rf "${stage_parent}"
-mkdir -p "${stage_parent}/${dir_name}"
 
-# バイナリ
-install -m 0755 "${BINARY}" "${stage_parent}/${dir_name}/veil"
+# F-247: バイナリ・ライセンス・README・examples/（自動では読まない例）は全 OS 共通の stage-archive.sh で置く。
+# ここではその上に rc.d・BUILD_INFO.txt・INSTALL.txt を足す。
+"${SCRIPT_DIR}/stage-archive.sh" "${BINARY}" "${TARGET}" "${OS}" "${stage_parent}" >/dev/null
 
 # 配布パッケージのバイナリはシンボル表まで除去する（実測 36.8MB → 28.7MB、-22%）。
 # release ビルドは元々 debug=0 で DWARF がほぼ無いため、効くのはシンボル表の除去である
@@ -195,13 +195,6 @@ if [[ "${OS}" == "netbsd" ]]; then
     fi
 fi
 
-# 設定リファレンス・静的コンテンツ
-install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
-install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html" 2>/dev/null || {
-    mkdir -p "${stage_parent}/${dir_name}/www"
-    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html"
-}
-
 # rc.d サービススクリプト（+ FreeBSD は jail.conf サンプル）
 if [[ "${OS}" == "freebsd" ]]; then
     install -m 0555 "${BSD_ASSETS}/freebsd/veil.rc" "${stage_parent}/${dir_name}/rc.d/veil" 2>/dev/null || {
@@ -237,12 +230,12 @@ veil ${VERSION} — ${TARGET}
   # バイナリ
   install -m 0755 veil /usr/local/bin/veil
 
-  # 設定（初回のみ）
+  # 設定（初回のみ。このアーカイブは設定を入れない。examples/ の例を写して直す。README.md）
 EOF
 if [[ "${OS}" == "freebsd" ]]; then
     cat >> "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
   mkdir -p /usr/local/etc/veil
-  cp config.toml.default /usr/local/etc/veil/config.toml
+  cp examples/config.toml /usr/local/etc/veil/config.toml   # 中の examples/www/ を絶対パスに直す
 
   # rc.d サービス
   install -m 0555 rc.d/veil /usr/local/etc/rc.d/veil
@@ -255,7 +248,7 @@ EOF
 elif [[ "${OS}" == "openbsd" ]]; then
     cat >> "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
   mkdir -p /etc/veil
-  cp config.toml.default /etc/veil/config.toml
+  cp examples/config.toml /etc/veil/config.toml   # 中の examples/www/ を絶対パスに直す
 
   # rc.d サービス
   install -m 0555 rc.d/veil /etc/rc.d/veil
@@ -270,7 +263,7 @@ EOF
 else
     cat >> "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
   mkdir -p /etc/veil
-  cp config.toml.default /etc/veil/config.toml
+  cp examples/config.toml /etc/veil/config.toml   # 中の examples/www/ を絶対パスに直す
 
   # rc.d サービス（NetBSD には rcctl が無いため rc.conf を直接編集する）
   install -m 0555 rc.d/veil /etc/rc.d/veil

@@ -1,0 +1,16 @@
+[
+{ type: install
+  message: <<EOM
+veil reads %%PREFIX%%/etc/veil/config.toml. The default one serves
+%%DATADIR%%/www on http://127.0.0.1:8080/ (plaintext HTTP/1.1 and h2c),
+drops privileges to www and enters capability mode (capsicum).
+
+  sysrc veil_enable=YES
+  service veil start
+  curl http://127.0.0.1:8080/
+
+Edit the configuration and run `service veil reload`.
+Documentation: https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md
+EOM
+}
+]

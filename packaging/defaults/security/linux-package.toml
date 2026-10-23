@@ -1,0 +1,22 @@
+# systemd starts veil as root; it binds its listeners, then drops to the veil user, with its own seccomp
+# filter and Landlock (only the paths below are readable / writable afterwards).
+allow_security_failures = false
+drop_privileges_user = "veil"
+drop_privileges_group = "veil"
+enable_seccomp = true
+seccomp_mode = "filter"
+enable_landlock = true
+enable_sandbox = false
+landlock_read_paths = [
+  "@WWW_PATH@",
+  "/etc/veil",
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr",
+]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil", "/var/log/veil"]

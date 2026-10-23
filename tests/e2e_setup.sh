@@ -1039,6 +1039,20 @@ enabled = true
 default_ttl_secs = 1
 methods = ["GET"]
 cacheable_statuses = [200]
+
+# B-162: 平文の上流（HTTPS の上流はキャッシュに保存しない。F-257）で、小さい応答がキャッシュから返ること
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/cached-plain/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
+[route.cache]
+enabled = true
+default_ttl_secs = 5
+methods = ["GET"]
+cacheable_statuses = [200]
 EOF
     fi
 

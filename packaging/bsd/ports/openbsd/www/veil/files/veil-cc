@@ -1,0 +1,4 @@
+#!/bin/sh
+# C files only: read <pthread.h> first (BoringSSL expects pthread_rwlock_t from <sys/types.h>). Not for assembly.
+for a in "$@"; do case "$a" in *.S|*.s) exec /usr/bin/cc "$@" ;; esac; done
+exec /usr/bin/cc -include pthread.h "$@"

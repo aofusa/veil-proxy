@@ -180,11 +180,46 @@ pub fn run() {
     overrides.extend(cli_overrides);
     crate::config_override::set_global_overrides(overrides);
 
+    // F-247: 設定ファイルは -c → 環境変数 VEIL_CONFIG → 既定のパスの順で決める。設定は内蔵しない
+    // （無ければ置き場所を示して止まる。パッケージは既定のパスに既定の設定を置く）。
+    let (config_path, source) =
+        crate::config::resolve_config_path(cli_args.config, std::env::var_os("VEIL_CONFIG"));
+    if !config_path.exists() {
+        eprintln!(
+            "veil: configuration file not found: {} (from {})",
+            config_path.display(),
+            source.describe()
+        );
+        eprintln!(
+            "veil: pass a file with -c FILE or set VEIL_CONFIG; packages install a default file at {}",
+            crate::config::default_config_path().display()
+        );
+        eprintln!("veil: see {}", CONFIG_FILE_DOC_URL);
+        std::process::exit(1);
+    }
+    let _ = CONFIG_PATH_SOURCE.set(source);
+
     run_server(ServerOptions {
-        config_path: cli_args.config,
+        config_path,
         test_config: cli_args.test_config,
     });
+    // F-247: 起動の途中のエラー（設定の読み込み・bind など）で run_server から戻ったときは終了コード 1 にする
+    // （今まで 0 で終わり、systemd の Restart=on-failure やスクリプトが失敗に気づけなかった）
+    if !STARTUP_COMPLETED.load(std::sync::atomic::Ordering::Acquire) {
+        std::process::exit(1);
+    }
 }
+
+/// 設定ファイルの決まり方の文書（F-247。エラーの文に出す）
+const CONFIG_FILE_DOC_URL: &str =
+    "https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md#configuration-file";
+
+/// 設定ファイルのパスがどこから決まったか（F-247。起動ログに出す。ライブラリからの起動では未設定）
+static CONFIG_PATH_SOURCE: std::sync::OnceLock<crate::config::ConfigPathSource> =
+    std::sync::OnceLock::new();
+
+/// 全リスナー・ワーカーの起動を終えたら true（F-247。run_server が起動の途中で戻ったかの判定）
+static STARTUP_COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Startup options of the server (independent of CLI parsing; also used by the API library).
 pub struct ServerOptions {
@@ -623,7 +658,14 @@ pub fn run_server(opts: ServerOptions) {
 
     info!("============================================");
     info!("High-Performance Reverse Proxy Server");
-    info!("Config File: {}", config_path.display());
+    match CONFIG_PATH_SOURCE.get() {
+        Some(src) => info!(
+            "Config File: {} (from {})",
+            config_path.display(),
+            src.describe()
+        ),
+        None => info!("Config File: {}", config_path.display()),
+    }
     info!("Hostname: {}", hostname);
     info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
     info!(
@@ -927,8 +969,6 @@ pub fn run_server(opts: ServerOptions) {
             let has_l4 = !loaded_config.l4_listeners.is_empty();
             #[cfg(not(feature = "l4-proxy"))]
             let has_l4 = false;
-            // F-200: 平文リスナー（HTTP/1.1・h2c）は bind 待ちの対象外なので capability mode を阻む。
-            let cleartext = loaded_config.listen_cleartext.is_some();
             #[cfg(feature = "http3")]
             let http3 = loaded_config.http3_enabled;
             #[cfg(not(feature = "http3"))]
@@ -938,11 +978,7 @@ pub fn run_server(opts: ServerOptions) {
             // HTTP→HTTPS リダイレクトリスナーは cap_enter 後の bind になるため不可。
             // 判定はリロード時（F-178）と共用する。上流への接続は接続ブローカー（F-182）が
             // 代行するので、プロキシ・upstream は阻害要因ではない。
-            let facts = crate::config::CapModeFacts {
-                has_l4,
-                cleartext,
-                http3,
-            };
+            let facts = crate::config::CapModeFacts { has_l4, http3 };
             // F-181: 要求したのに入れない構成は、既定で起動を中止する（fail-closed）。
             use crate::config::CapModeDecision;
             match crate::config::capability_mode_decision(
@@ -1065,6 +1101,14 @@ pub fn run_server(opts: ServerOptions) {
     // 保守的に揃えるため同じく「全ワーカー bind 完了後」に適用する。
     #[cfg(target_os = "macos")]
     let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // 上の 3 つのバリアが待つ bind の数。TLS のリスナーと平文のリスナー（`listen_cleartext`）のワーカーを両方数える
+    // （以前は TLS のワーカーだけで、待つスレッド自体も TLS のリスナーがあるときだけ起動していた。平文だけの設定
+    // ＝パッケージの既定の設定では capability mode・pledge・sandbox_init が掛からず、FreeBSD は起動を中止していた。B-163）。
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+    let barrier_expected = num_threads
+        * (usize::from(listen_kind.is_some())
+            + usize::from(loaded_config.listen_cleartext.is_some()));
 
     // メイン TLS リスナーの UDS ソケットファイルパス（bind した場合のみ）。
     // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
@@ -1254,222 +1298,236 @@ pub fn run_server(opts: ServerOptions) {
             });
             handles.push(handle);
         }
+    } else {
+        info!("No TLS listener ([server].listen is not set): plaintext-only server");
+    }
 
-        // FreeBSD capability mode（オプトイン）: 全 TLS ワーカーの bind 完了を待って
-        // `cap_enter(2)` する。cap_enter はプロセス全体に即時に効くため、bind が
-        // 終わる前に入ると全ワーカーが Bind error で死ぬ（バリアの根拠は前段コメント）。
-        #[cfg(target_os = "freebsd")]
-        if capsicum_capability_mode_requested {
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            let expected = num_threads;
-            // F-123/F-153: 静的ルート dirfd の登録は設定ロード直後（この関数の先頭付近、
-            // `cache::resolve::register_static_roots` 呼び出し）で **cap_enter よりずっと前**
-            // に完了済み（`capsicum::init_static_dirfds` 経由。canonicalize/絶対パス open が
-            // まだ許可されているタイミングで実行される）。ここで二重に登録し直すと
-            // `capsicum::STATIC_DIRS`（`OnceLock`）への 2 回目の `set` が黙って無視され、
-            // 1 回目に open した fd がリークするため、ここでは登録し直さない。
-            // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
-            // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
-            // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
-            let allow_failures = loaded_config.global_security.allow_security_failures;
-            let tls_auto_reload = loaded_config.tls_auto_reload;
-            let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
-            let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
-            // F-178: 設定ファイルとアクセスログの親ディレクトリ fd も cap_enter 前に登録し、
-            // capability mode 下の SIGHUP でも設定を読み直し・ログを開き直せるようにする。
-            let config_path = (**crate::config::CONFIG_PATH.load()).clone();
-            #[cfg(feature = "access-log")]
-            let access_log_path = {
-                let cfg = &loaded_config.access_log_config;
-                if cfg.enabled {
-                    cfg.file_path.clone().map(std::path::PathBuf::from)
-                } else {
-                    None
-                }
-            };
-            std::thread::Builder::new()
-                .name("veil-cap-enter".to_string())
-                .spawn(move || {
-                    use std::sync::atomic::Ordering;
-                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
-                    // ポーリング sleep でよい。最大 ~30 秒待つ。
-                    for _ in 0..3000 {
-                        if listeners_ready.load(Ordering::Acquire) >= expected {
-                            // cap_enter 後の初回オフロードでワーカースレッドを遅延生成
-                            // すると、capability mode 下のスレッド生成がスタックガード設定
-                            // 等で失敗し得る。cap_enter 前にプールを暖機しておく（F-123）。
-                            crate::runtime::offload::warmup();
-                            // F-153: 静的ルート dirfd は既に `register_static_roots`
-                            // （関数冒頭）で登録済み。
-                            // F-136: TLS 証明書 dirfd の登録（auto_reload 有効時のみ）。
-                            if tls_auto_reload {
-                                match crate::security::capsicum::init_tls_cert_dirfds(
-                                    &tls_cert_path,
-                                    &tls_key_path,
-                                ) {
-                                    Ok(()) => info!(
-                                        "capsicum: TLS certificate hot-reload will remain functional under capability mode (dirfd relative openat/fstatat)"
-                                    ),
-                                    Err(e) => error!(
-                                        "capsicum: failed to register the TLS certificate directory fds; \
-                                         certificate hot reload may not work in capability mode: {}",
-                                        e
-                                    ),
-                                }
-                            }
-                            match crate::security::capsicum::init_config_dirfd(&config_path) {
-                                Ok(()) => {}
+    // FreeBSD capability mode（オプトイン）: 全リスナー（TLS・平文）のワーカーの bind 完了を待って
+    // `cap_enter(2)` する。cap_enter はプロセス全体に即時に効くため、bind が
+    // 終わる前に入ると全ワーカーが Bind error で死ぬ（バリアの根拠は前段コメント）。
+    #[cfg(target_os = "freebsd")]
+    if capsicum_capability_mode_requested {
+        let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+        let expected = barrier_expected;
+        // F-123/F-153: 静的ルート dirfd の登録は設定ロード直後（この関数の先頭付近、
+        // `cache::resolve::register_static_roots` 呼び出し）で **cap_enter よりずっと前**
+        // に完了済み（`capsicum::init_static_dirfds` 経由。canonicalize/絶対パス open が
+        // まだ許可されているタイミングで実行される）。ここで二重に登録し直すと
+        // `capsicum::STATIC_DIRS`（`OnceLock`）への 2 回目の `set` が黙って無視され、
+        // 1 回目に open した fd がリークするため、ここでは登録し直さない。
+        // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
+        // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
+        // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
+        let allow_failures = loaded_config.global_security.allow_security_failures;
+        let tls_auto_reload = loaded_config.tls_auto_reload;
+        let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
+        let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
+        // F-178: 設定ファイルとアクセスログの親ディレクトリ fd も cap_enter 前に登録し、
+        // capability mode 下の SIGHUP でも設定を読み直し・ログを開き直せるようにする。
+        let config_path = (**crate::config::CONFIG_PATH.load()).clone();
+        #[cfg(feature = "access-log")]
+        let access_log_path = {
+            let cfg = &loaded_config.access_log_config;
+            if cfg.enabled {
+                cfg.file_path.clone().map(std::path::PathBuf::from)
+            } else {
+                None
+            }
+        };
+        std::thread::Builder::new()
+            .name("veil-cap-enter".to_string())
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                // ポーリング sleep でよい。最大 ~30 秒待つ。
+                for _ in 0..3000 {
+                    if listeners_ready.load(Ordering::Acquire) >= expected {
+                        // cap_enter 後の初回オフロードでワーカースレッドを遅延生成
+                        // すると、capability mode 下のスレッド生成がスタックガード設定
+                        // 等で失敗し得る。cap_enter 前にプールを暖機しておく（F-123）。
+                        crate::runtime::offload::warmup();
+                        // F-153: 静的ルート dirfd は既に `register_static_roots`
+                        // （関数冒頭）で登録済み。
+                        // F-136: TLS 証明書 dirfd の登録（auto_reload 有効時のみ）。
+                        if tls_auto_reload {
+                            match crate::security::capsicum::init_tls_cert_dirfds(
+                                &tls_cert_path,
+                                &tls_key_path,
+                            ) {
+                                Ok(()) => info!(
+                                    "capsicum: TLS certificate hot-reload will remain functional under capability mode (dirfd relative openat/fstatat)"
+                                ),
                                 Err(e) => error!(
-                                    "capsicum: failed to register the config file directory fd; \
-                                     SIGHUP config reload will not work in capability mode: {}",
+                                    "capsicum: failed to register the TLS certificate directory fds; \
+                                     certificate hot reload may not work in capability mode: {}",
                                     e
                                 ),
                             }
-                            #[cfg(feature = "access-log")]
-                            if let Some(p) = &access_log_path {
-                                if let Err(e) =
-                                    crate::security::capsicum::init_access_log_dirfd(p)
-                                {
-                                    error!(
-                                        "capsicum: failed to register the access log directory fd; \
-                                         reopening the log on SIGHUP will not work in capability mode: {}",
-                                        e
-                                    );
-                                }
-                            }
-                            match crate::security::capsicum::enter_capability_mode() {
-                                Ok(()) => info!(
-                                    "capsicum: capability mode active ({} listeners bound)",
-                                    expected
-                                ),
-                                Err(e) => {
-                                    error!("capsicum: cap_enter failed: {}", e);
-                                    // F-181: 要求した防御が効かないまま動かさない。
-                                    if !allow_failures {
-                                        eprintln!("capsicum: cap_enter failed: {}; aborting", e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            return;
                         }
-                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
-                        // ブロックしない。
-                        #[allow(clippy::disallowed_methods)]
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        match crate::security::capsicum::init_config_dirfd(&config_path) {
+                            Ok(()) => {}
+                            Err(e) => error!(
+                                "capsicum: failed to register the config file directory fd; \
+                                 SIGHUP config reload will not work in capability mode: {}",
+                                e
+                            ),
+                        }
+                        #[cfg(feature = "access-log")]
+                        if let Some(p) = &access_log_path {
+                            if let Err(e) =
+                                crate::security::capsicum::init_access_log_dirfd(p)
+                            {
+                                error!(
+                                    "capsicum: failed to register the access log directory fd; \
+                                     reopening the log on SIGHUP will not work in capability mode: {}",
+                                    e
+                                );
+                            }
+                        }
+                        match crate::security::capsicum::enter_capability_mode() {
+                            Ok(()) => info!(
+                                "capsicum: capability mode active ({} listeners bound)",
+                                expected
+                            ),
+                            Err(e) => {
+                                error!("capsicum: cap_enter failed: {}", e);
+                                // F-181: 要求した防御が効かないまま動かさない。
+                                if !allow_failures {
+                                    eprintln!("capsicum: cap_enter failed: {}; aborting", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        return;
                     }
-                    error!(
-                        "capsicum: timed out waiting for {} listeners; capability mode NOT applied",
+                    // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                    // ブロックしない。
+                    #[allow(clippy::disallowed_methods)]
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                error!(
+                    "capsicum: timed out waiting for {} listeners; capability mode NOT applied",
+                    expected
+                );
+                // F-181: 要求した防御が効かないまま動かさない。
+                if !allow_failures {
+                    eprintln!(
+                        "capsicum: timed out waiting for {} listeners; aborting",
                         expected
                     );
-                    // F-181: 要求した防御が効かないまま動かさない。
-                    if !allow_failures {
-                        eprintln!(
-                            "capsicum: timed out waiting for {} listeners; aborting",
-                            expected
-                        );
-                        std::process::exit(1);
-                    }
-                })
-                .expect("failed to spawn veil-cap-enter thread");
-        }
+                    std::process::exit(1);
+                }
+            })
+            .expect("failed to spawn veil-cap-enter thread");
+    }
 
-        // OpenBSD pledge（オプトイン）: 全 TLS ワーカーの bind 完了を待って pledge する
-        // （バリアの根拠は前段コメント。promise 集合は E2E で実証した最小構成
-        //   — docs/backlog/features/F-120 の Phase 5 記録を参照）。
-        #[cfg(target_os = "openbsd")]
-        if loaded_config.global_security.enable_pledge {
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            let expected = num_threads;
-            let allow_failures = loaded_config.global_security.allow_security_failures;
-            std::thread::Builder::new()
-                .name("veil-pledge".to_string())
-                .spawn(move || {
-                    use std::sync::atomic::Ordering;
-                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
-                    // ポーリング sleep でよい。最大 ~30 秒待つ。
-                    for _ in 0..3000 {
-                        if listeners_ready.load(Ordering::Acquire) >= expected {
-                            match crate::security::pledge_unveil::pledge_promises(PLEDGE_PROMISES) {
-                                Ok(()) => info!(
-                                    "pledge: promises restricted ({} listeners bound)",
-                                    expected
-                                ),
-                                Err(e) => {
-                                    error!("pledge: failed to apply: {}", e);
-                                    if !allow_failures {
-                                        std::process::exit(1);
-                                    }
+    // OpenBSD pledge（オプトイン）: 全リスナー（TLS・平文）のワーカーの bind 完了を待って pledge する
+    // （バリアの根拠は前段コメント。promise 集合は E2E で実証した最小構成
+    //   — docs/backlog/features/F-120 の Phase 5 記録を参照）。
+    #[cfg(target_os = "openbsd")]
+    if loaded_config.global_security.enable_pledge {
+        let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+        let expected = barrier_expected;
+        let allow_failures = loaded_config.global_security.allow_security_failures;
+        std::thread::Builder::new()
+            .name("veil-pledge".to_string())
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                // ポーリング sleep でよい。最大 ~30 秒待つ。
+                for _ in 0..3000 {
+                    if listeners_ready.load(Ordering::Acquire) >= expected {
+                        match crate::security::pledge_unveil::pledge_promises(PLEDGE_PROMISES) {
+                            Ok(()) => {
+                                info!("pledge: promises restricted ({} listeners bound)", expected)
+                            }
+                            Err(e) => {
+                                error!("pledge: failed to apply: {}", e);
+                                if !allow_failures {
+                                    std::process::exit(1);
                                 }
                             }
-                            return;
                         }
-                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
-                        // ブロックしない。
-                        #[allow(clippy::disallowed_methods)]
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        return;
                     }
-                    error!(
-                        "pledge: timed out waiting for {} listeners; pledge NOT applied",
+                    // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                    // ブロックしない。
+                    #[allow(clippy::disallowed_methods)]
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                error!(
+                    "pledge: timed out waiting for {} listeners; pledge NOT applied",
+                    expected
+                );
+                // B-163: 要求した防御が効かないまま動かさない（FreeBSD の capability mode と同じく fail-closed）
+                if !allow_failures {
+                    eprintln!(
+                        "pledge: timed out waiting for {} listeners; aborting",
                         expected
                     );
-                })
-                .expect("failed to spawn veil-pledge thread");
-        }
+                    std::process::exit(1);
+                }
+            })
+            .expect("failed to spawn veil-pledge thread");
+    }
 
-        // macOS sandbox_init（オプトイン）: 全 TLS ワーカーの bind 完了を待って適用する
-        // （バリアの根拠は前段コメント。プロファイル生成は `crate::security::macos_sandbox`、
-        // 設定から導出するパス集合は `crate::config::collect_macos_sandbox_paths`）。
-        #[cfg(target_os = "macos")]
-        if loaded_config.global_security.enable_sandbox_macos {
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            let expected = num_threads;
-            let allow_failures = loaded_config.global_security.allow_security_failures;
-            let config_path_for_sandbox = config_path.clone();
-            std::thread::Builder::new()
-                .name("veil-macos-sandbox".to_string())
-                .spawn(move || {
-                    use std::sync::atomic::Ordering;
-                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
-                    // ポーリング sleep でよい。最大 ~30 秒待つ。
-                    for _ in 0..3000 {
-                        if listeners_ready.load(Ordering::Acquire) >= expected {
-                            let result = crate::config::collect_macos_sandbox_paths(
-                                &config_path_for_sandbox,
-                            )
-                            .and_then(|paths| {
-                                let profile =
-                                    crate::security::macos_sandbox::build_profile(&paths);
-                                crate::security::macos_sandbox::apply(&profile)
-                            });
-                            match result {
-                                Ok(()) => info!(
-                                    "macos sandbox: sandbox_init applied ({} listeners bound)",
-                                    expected
-                                ),
-                                Err(e) => {
-                                    error!("macos sandbox: failed to apply: {}", e);
-                                    if !allow_failures {
-                                        std::process::exit(1);
-                                    }
+    // macOS sandbox_init（オプトイン）: 全リスナー（TLS・平文）のワーカーの bind 完了を待って適用する
+    // （バリアの根拠は前段コメント。プロファイル生成は `crate::security::macos_sandbox`、
+    // 設定から導出するパス集合は `crate::config::collect_macos_sandbox_paths`）。
+    #[cfg(target_os = "macos")]
+    if loaded_config.global_security.enable_sandbox_macos {
+        let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+        let expected = barrier_expected;
+        let allow_failures = loaded_config.global_security.allow_security_failures;
+        let config_path_for_sandbox = config_path.clone();
+        std::thread::Builder::new()
+            .name("veil-macos-sandbox".to_string())
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                // ポーリング sleep でよい。最大 ~30 秒待つ。
+                for _ in 0..3000 {
+                    if listeners_ready.load(Ordering::Acquire) >= expected {
+                        let result =
+                            crate::config::collect_macos_sandbox_paths(&config_path_for_sandbox)
+                                .and_then(|paths| {
+                                    let profile =
+                                        crate::security::macos_sandbox::build_profile(&paths);
+                                    crate::security::macos_sandbox::apply(&profile)
+                                });
+                        match result {
+                            Ok(()) => info!(
+                                "macos sandbox: sandbox_init applied ({} listeners bound)",
+                                expected
+                            ),
+                            Err(e) => {
+                                error!("macos sandbox: failed to apply: {}", e);
+                                if !allow_failures {
+                                    std::process::exit(1);
                                 }
                             }
-                            return;
                         }
-                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
-                        // ブロックしない。
-                        #[allow(clippy::disallowed_methods)]
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        return;
                     }
-                    error!(
-                        "macos sandbox: timed out waiting for {} listeners; sandbox_init NOT applied",
+                    // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                    // ブロックしない。
+                    #[allow(clippy::disallowed_methods)]
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                error!(
+                    "macos sandbox: timed out waiting for {} listeners; sandbox_init NOT applied",
+                    expected
+                );
+                // B-163: 要求した防御が効かないまま動かさない（fail-closed）
+                if !allow_failures {
+                    eprintln!(
+                        "macos sandbox: timed out waiting for {} listeners; aborting",
                         expected
                     );
-                })
-                .expect("failed to spawn veil-macos-sandbox thread");
-        }
-    } else {
-        info!("No TLS listener ([server].listen is not set): plaintext-only server");
+                    std::process::exit(1);
+                }
+            })
+            .expect("failed to spawn veil-macos-sandbox thread");
     }
 
     // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
@@ -1658,6 +1716,12 @@ pub fn run_server(opts: ServerOptions) {
                 ids[core_index]
             });
 
+            #[cfg(target_os = "freebsd")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            #[cfg(target_os = "openbsd")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            #[cfg(target_os = "macos")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
             let h2c_handle = spawn_worker_thread(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 if let Some(core_id) = assigned_core {
@@ -1683,6 +1747,9 @@ pub fn run_server(opts: ServerOptions) {
                                 return;
                             }
                         };
+                    // capability mode・pledge・sandbox_init のバリア: bind 完了を通知（コールドパス。B-163）
+                    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
 
                     info!("[H2C Worker {}] Started", thread_id);
 
@@ -1913,6 +1980,8 @@ pub fn run_server(opts: ServerOptions) {
             "TLS private key (LoadedConfig)",
         );
     }
+
+    STARTUP_COMPLETED.store(true, std::sync::atomic::Ordering::Release);
 
     for (index, handle) in handles.into_iter().enumerate() {
         match handle.join() {

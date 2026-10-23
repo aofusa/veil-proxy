@@ -1,0 +1,3 @@
+# veil runs as the user who started it, in a Windows Job Object.
+allow_security_failures = false
+enable_job_object_windows = true

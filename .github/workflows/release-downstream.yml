@@ -1,0 +1,182 @@
+# F-248〜F-252: GitHub Release のページを人が公開したとき（release.yml が作った draft を公開）、下流の配布先を更新する。
+#
+#   minisign … アーカイブに cargo binstall が検証する署名（.sig）を付ける（F-249）
+#   dockerhub … ghcr.io のイメージを docker.io/aofusa/veil に写す（F-248）
+#   homebrew … aofusa/homebrew-tap の formula を新しい版にする（F-250）
+#   repos    … aofusa/veil-packages の apt・dnf のリポジトリに足す（F-251）
+#   winget   … microsoft/winget-pkgs に版を上げる PR を出す（F-252）
+#
+# どれも CI が作ったものだけを扱う（SHA256SUMS の cosign の署名とハッシュを確かめてから）。
+# 鍵・token が無いときは失敗にする（黙って飛ばさない）。止めたい配布先は、リポジトリの変数で明示的に止める:
+#   DOCKERHUB_MIRROR=off・HOMEBREW_TAP=off・PACKAGE_REPOS=off・WINGET=off・MINISIGN=off
+# プレリリース（rc）は何もしない。手で回すとき（workflow_dispatch）はタグを渡す。
+name: release-downstream
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "公開済みのリリースのタグ（例: v0.9.0）"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-downstream-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.c.outputs.run }}
+    steps:
+      - id: c
+        env:
+          PRE: ${{ github.event.release.prerelease || 'false' }}
+        run: |
+          case "$TAG" in v*-*) PRE=true ;; esac
+          if [ "$PRE" = true ]; then echo "::notice title=downstream::$TAG is a pre-release; nothing to do"; echo run=false >> "$GITHUB_OUTPUT"
+          else echo run=true >> "$GITHUB_OUTPUT"; fi
+
+  minisign:
+    needs: check
+    if: needs.check.outputs.run == 'true' && vars.MINISIGN != 'off'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+      - name: sign the archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "::error title=minisign::the secret MINISIGN_SECRET_KEY is not set (set it, or set the variable MINISIGN=off)"; exit 1; }
+          tools/release/minisign-assets.sh "$TAG"
+
+  dockerhub:
+    needs: check
+    if: needs.check.outputs.run == 'true' && vars.DOCKERHUB_MIRROR != 'off'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: copy to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error title=Docker Hub::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set (set them, or set the variable DOCKERHUB_MIRROR=off)"; exit 1
+          fi
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          tools/release/mirror-dockerhub.sh "$TAG" false
+      - name: pull from Docker Hub and run the defaults smoke test
+        run: |
+          docker logout
+          tools/release/image-smoke.sh "docker.io/aofusa/veil:musl-$TAG" defaults
+
+  homebrew:
+    needs: check
+    if: needs.check.outputs.run == 'true' && vars.HOMEBREW_TAP != 'off'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: push the formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [ -n "$HOMEBREW_TAP_TOKEN" ] || { echo "::error title=Homebrew::the secret HOMEBREW_TAP_TOKEN is not set (set it, or set the variable HOMEBREW_TAP=off)"; exit 1; }
+          tools/release/homebrew-publish.sh "$TAG"
+
+  repos:
+    needs: check
+    if: needs.check.outputs.run == 'true' && vars.PACKAGE_REPOS != 'off'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c rpm gnupg
+      - name: add the packages to the apt and dnf repositories
+        env:
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          PACKAGES_GPG_KEY: ${{ secrets.PACKAGES_GPG_KEY }}
+        run: |
+          if [ -z "$PACKAGES_TOKEN" ] || [ -z "$PACKAGES_GPG_KEY" ]; then
+            echo "::error title=apt/dnf::PACKAGES_TOKEN / PACKAGES_GPG_KEY are not set (set them, or set the variable PACKAGE_REPOS=off)"; exit 1
+          fi
+          tools/release/repos-publish.sh "$TAG"
+      - name: install from the published repositories
+        run: |
+          # GitHub Pages の反映を待つ
+          for i in $(seq 1 30); do
+            curl -fsS https://aofusa.github.io/veil-packages/apt/dists/stable/Release | grep -q "veil" && break; sleep 20
+          done
+          packaging/scripts/test-package.sh deb ubuntu:24.04 --repo packaging/repos/apt-setup.sh https://aofusa.github.io/veil-packages
+          packaging/scripts/test-package.sh rpm fedora:latest --repo packaging/repos/dnf-setup.sh https://aofusa.github.io/veil-packages
+
+  winget:
+    needs: check
+    if: needs.check.outputs.run == 'true' && vars.WINGET != 'off'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - name: manifests
+        run: |
+          v="${TAG#v}"
+          base="https://github.com/aofusa/veil-proxy/releases/download/$TAG"
+          curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
+          tools/release/winget-manifest.sh "$v" winget "$base" SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: winget-manifests
+          path: winget/
+      - name: open a pull request in microsoft/winget-pkgs
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          [ -n "$WINGET_TOKEN" ] || { echo "::error title=winget::the secret WINGET_TOKEN is not set (set it, or set the variable WINGET=off)"; exit 1; }
+          v="${TAG#v}"; base="https://github.com/aofusa/veil-proxy/releases/download/$TAG"
+          code="$(curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/a/Aofusa/Veil)"
+          if [ "$code" = 404 ]; then
+            # 最初の版は人が出す（wingetcreate submit で、この job の artifact winget-manifests を使う。docs/guide/running.md）
+            echo "::warning title=winget::Aofusa.Veil is not in winget-pkgs yet; submit the first version by hand with the artifact winget-manifests"
+            exit 0
+          fi
+          # komac は版とハッシュを固定する（供給網。F-236）
+          curl -fsSL -o komac.tar.gz https://github.com/russellbanks/Komac/releases/download/v2.17.1/komac-2.17.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "e694e79cd451afabf47bead66ed34586fef4814f7b94e4b61a098f419978d5d7  komac.tar.gz" | sha256sum -c -
+          tar xzf komac.tar.gz
+          ./komac update Aofusa.Veil --version "$v" \
+            --urls "$base/veil-$v-x86_64-pc-windows-msvc.msi" "$base/veil-$v-aarch64-pc-windows-msvc.msi" \
+            --release-notes-url "https://github.com/aofusa/veil-proxy/releases/tag/$TAG" \
+            --submit --token "$WINGET_TOKEN"

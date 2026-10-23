@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>veil container quickstart</title>
+<title>veil quickstart</title>
 <style>
   :root {
     --bg: #0b0d12; --fg: #e6e9ef; --muted: #9aa3b2; --accent: #00f0ff; --accent2: #ff4fd8;
@@ -34,31 +34,60 @@
              background: var(--card); text-decoration: none; }
   .links a small { display: block; color: var(--muted); }
   .note { border-left: 3px solid var(--accent2); padding: 2px 12px; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
   footer { margin-top: 40px; color: var(--muted); font-size: 0.9rem; }
 </style>
 </head>
 <body>
 <main>
-  <h1><span>veil</span> container quickstart</h1>
-  <p class="lead">You are looking at the page built into the <code>ghcr.io/aofusa/veil</code> image. Here is how to
-    serve your own files, use your own configuration, and where to read more.</p>
+  <h1><span>veil</span> quickstart</h1>
+  <p class="lead">You are looking at the default page installed with veil. It is served by the default
+    configuration over plaintext HTTP/1.1 and HTTP/2 (h2c) on port 8080, and every request is logged.
+    Here is where things are, how to serve your own files and configuration, and where to read more.</p>
 
-  <h2>1. Try it</h2>
+  <h2>1. Where things are</h2>
+  <p>veil reads the configuration file given with <code>-c FILE</code>, otherwise the one in
+    <code>VEIL_CONFIG</code>, otherwise the default path. Packages put a default configuration and this page there.</p>
+  <table>
+    <tr><th>Installed with</th><th>Configuration</th><th>This page</th><th>Start</th></tr>
+    <tr><td>Container image</td><td><code>/etc/veil/conf.d/config.toml</code></td><td><code>/var/www/</code></td>
+      <td><code>docker run --rm -p 8080:8080 ghcr.io/aofusa/veil</code></td></tr>
+    <tr><td>deb / rpm</td><td><code>/etc/veil/config.toml</code></td><td><code>/usr/share/veil/www/</code></td>
+      <td><code>sudo systemctl enable --now veil</code></td></tr>
+    <tr><td>Homebrew</td><td><code>$(brew --prefix)/etc/veil/config.toml</code></td><td><code>$(brew --prefix)/share/veil/www/</code></td>
+      <td><code>brew services start veil</code> or <code>veil</code></td></tr>
+    <tr><td>winget (Windows)</td><td><code>%ProgramData%\veil\config.toml</code></td><td><code>%ProgramData%\veil\www\</code></td>
+      <td><code>veil</code></td></tr>
+    <tr><td>FreeBSD ports</td><td><code>/usr/local/etc/veil/config.toml</code></td><td><code>/usr/local/share/veil/www/</code></td>
+      <td><code>sysrc veil_enable=YES &amp;&amp; service veil start</code></td></tr>
+    <tr><td>OpenBSD ports</td><td><code>/etc/veil/config.toml</code></td><td><code>/usr/local/share/veil/www/</code></td>
+      <td><code>rcctl enable veil &amp;&amp; rcctl start veil</code></td></tr>
+    <tr><td>NetBSD pkgsrc</td><td><code>/usr/pkg/etc/veil/config.toml</code></td><td><code>/usr/pkg/share/veil/www/</code></td>
+      <td>add <code>veil=YES</code> to <code>/etc/rc.conf</code>, then <code>service veil start</code></td></tr>
+    <tr><td>Binary only (release archive, <code>cargo install</code>, <code>cargo binstall</code>)</td>
+      <td colspan="3">No file is installed: create the configuration and the page yourself and pass the file with
+        <code>-c</code> (the release archive has an example: <code>./veil -c examples/config.toml</code>).</td></tr>
+  </table>
+  <p>Outside the container, the default configuration listens on <code>127.0.0.1:8080</code> only, so nothing is
+    exposed to the network until you change it. Check a configuration with <code>veil -t</code> and reload it without
+    downtime with <code>SIGHUP</code> (for example <code>systemctl reload veil</code>).</p>
+
+  <h2>2. Container image</h2>
   <pre><code>docker run --rm -p 8080:8080 ghcr.io/aofusa/veil
 # open http://localhost:8080/   (h2c works too: curl --http2-prior-knowledge http://localhost:8080/)</code></pre>
-  <p>The built-in configuration serves <code>/var/www</code> over plaintext HTTP/1.1 and HTTP/2 (h2c) on port 8080.
-    No certificate is needed. Every request is logged to standard output, so <code>docker logs</code> shows it.</p>
+  <p>No certificate is needed. Every request is logged to standard output, so <code>docker logs</code> shows it.</p>
   <p>Tags: <code>latest</code> / <code>musl</code> (static binary on <code>scratch</code>), <code>glibc</code>
-    (glibc on Wolfi), and versioned tags such as <code>musl-v0.8.4</code>. All are multi-arch (amd64, arm64).</p>
+    (glibc on Wolfi), and versioned tags such as <code>musl-v0.9.0</code>. All are multi-arch (amd64, arm64).</p>
 
-  <h2>2. Serve your own HTML</h2>
+  <h3>Serve your own HTML</h3>
   <p>Mount a directory over <code>/var/www</code>. <code>index.html</code> is served for <code>/</code>.</p>
   <pre><code>mkdir -p site &amp;&amp; echo '&lt;h1&gt;Hello from veil&lt;/h1&gt;' &gt; site/index.html
 docker run --rm -p 8080:8080 -v "$PWD/site:/var/www:ro" ghcr.io/aofusa/veil</code></pre>
 
-  <h2>3. Use your own config.toml</h2>
-  <p>The configuration file is <code>/etc/veil/conf.d/config.toml</code>. Mount yours over it. Start from the
-    built-in one, which is shown below, and change what you need.</p>
+  <h3>Use your own config.toml</h3>
+  <p>The configuration file is <code>/etc/veil/conf.d/config.toml</code>. Mount yours over it.</p>
   <pre><code>docker run --rm -p 8080:8080 \
   -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
   -v "$PWD/site:/var/www:ro" \
@@ -68,7 +97,9 @@ docker run --rm -p 8080:8080 -v "$PWD/site:/var/www:ro" ghcr.io/aofusa/veil</cod
 docker run --rm -v "$PWD/config.toml:/etc/veil/conf.d/config.toml:ro" \
   ghcr.io/aofusa/veil /veil -t -c /etc/veil/conf.d/config.toml</code></pre>
 
-  <h3>The built-in configuration (minimal form)</h3>
+  <h2>3. Edit the configuration</h2>
+  <p>The default configuration in its minimal form (the container listens on <code>0.0.0.0</code>, the other
+    installs on <code>127.0.0.1</code>; replace <code>/var/www/</code> with the page directory of your install):</p>
   <pre><code>[server]
 listen_cleartext = "0.0.0.0:8080"   # plaintext HTTP/1.1 + h2c
 enable_secure_redirect = false      # no TLS listener, so do not redirect to https
@@ -92,7 +123,8 @@ type = "Proxy"
 url = "http://backend:3000"</code></pre>
   <p>Routes are evaluated in the order they are written and the first match wins, so put <code>/api/</code>
     above the <code>/</code> route: <code>/api/</code> goes to the backend and everything else is served from
-    <code>/var/www</code>. Put the containers on the same Docker network so that <code>backend</code> resolves.</p>
+    <code>/var/www</code>. In a container, put both containers on the same Docker network so that
+    <code>backend</code> resolves.</p>
 
   <h3>TLS and HTTP/3</h3>
   <pre><code>[server]
@@ -113,9 +145,9 @@ listen = "0.0.0.0:443"</code></pre>
 
   <h2>4. Good to know</h2>
   <ul>
-    <li>The image works under Docker's default seccomp profile and Kubernetes <code>RuntimeDefault</code>
+    <li>The container image works under Docker's default seccomp profile and Kubernetes <code>RuntimeDefault</code>
       (it uses the epoll backend, not io_uring).</li>
-    <li>veil starts as root, binds its listeners, then drops to the <code>nonroot</code> user, with its own
+    <li>In the container, veil starts as root, binds its listeners, then drops to the <code>nonroot</code> user, with its own
       seccomp filter and Landlock. Paths you mount must be readable by uid/gid 65532. Paths outside the
       default Landlock list need to be added to <code>[security] landlock_read_paths</code>.</li>
     <li>Reload the configuration without downtime: <code>docker kill -s HUP &lt;container&gt;</code>.</li>
@@ -123,6 +155,7 @@ listen = "0.0.0.0:443"</code></pre>
 
   <h2>Documentation</h2>
   <ul class="links">
+    <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md">Running veil<small>install, configuration file, service</small></a></li>
     <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/container.md">Container guide<small>run, mount, TLS, Kubernetes</small></a></li>
     <li><a href="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/configuration.md">Configuration<small>every section and key</small></a></li>
     <li><a href="https://github.com/aofusa/veil-proxy/blob/main/examples/config.toml">examples/config.toml<small>annotated reference</small></a></li>

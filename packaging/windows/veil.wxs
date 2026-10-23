@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  F-252: winget 用の MSI（端末全体に入れる）。tools/release/build-msi.ps1 が WiX v5 でビルドする。
+
+  - C:\Program Files\veil\veil.exe（システムの PATH に足す）
+  - %ProgramData%\veil\config.toml: 既定の設定（render-defaults.sh の winget）。上げても消しても残す
+    （NeverOverwrite・Permanent）。veil は Windows の既定のパスとしてこれを読む（F-247）
+  - %ProgramData%\veil\www\: 既定のページ（上げたときは新しいものに替える）
+  - %ProgramData%\veil の ACL は Administrators・SYSTEM が書き込み、Users は読み取りだけ
+    （%ProgramData% の既定では Users が新しいファイルを作れるので、設定を書き換えられないように絞る）
+  UpgradeCode は版をまたいで変えない（MajorUpgrade で前の版を消して入れ直す）。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="veil" Manufacturer="aofusa" Version="$(var.Version)"
+           UpgradeCode="C791D869-DE64-4FA4-974F-E7AB53309B69" Scope="perMachine" Compressed="yes"
+           Language="1033">
+    <SummaryInformation Description="veil reverse proxy and web server" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of veil is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/aofusa/veil-proxy" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="veil">
+        <Component Id="VeilExe">
+          <File Id="VeilExeFile" Source="$(var.SourceDir)\veil.exe" KeyPath="yes" />
+          <Environment Id="VeilPath" Name="PATH" Value="[INSTALLDIR]" Action="set" Part="last" System="yes" Permanent="no" />
+        </Component>
+        <Component Id="VeilLicenseApache">
+          <File Id="LicenseApache" Source="$(var.SourceDir)\LICENSE-APACHE" KeyPath="yes" />
+        </Component>
+        <Component Id="VeilLicenseMit">
+          <File Id="LicenseMit" Source="$(var.SourceDir)\LICENSE-MIT" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATADIR" Name="veil">
+        <Component Id="VeilDataDirAcl" Guid="99D3920B-C6DA-44F6-90A2-CB21CCE74DC0" KeyPath="yes" Permanent="yes">
+          <CreateFolder>
+            <!-- 継承を切って（P）DACL を置き換える（MsiLockPermissionsEx）。SYSTEM・Administrators は全権、Users は読み取りと
+                 実行だけ（0x1200a9）。%ProgramData% から継承する「Users は作成・書き込みできる」を残さない。SID の略号なので言語に依らない -->
+            <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+          </CreateFolder>
+        </Component>
+        <Component Id="VeilConfig" Guid="4BC85004-5A97-4BD8-BF36-46E25B9FD9F9" NeverOverwrite="yes" Permanent="yes">
+          <File Id="ConfigToml" Source="$(var.DefaultsDir)\config.toml" KeyPath="yes" />
+        </Component>
+        <Directory Id="WWWDIR" Name="www">
+          <Component Id="VeilIndexHtml">
+            <File Id="IndexHtml" Source="$(var.DefaultsDir)\www\index.html" KeyPath="yes" />
+          </Component>
+          <Component Id="VeilQuickstartHtml">
+            <File Id="QuickstartHtml" Source="$(var.DefaultsDir)\www\quickstart.html" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="veil">
+      <ComponentRef Id="VeilExe" />
+      <ComponentRef Id="VeilLicenseApache" />
+      <ComponentRef Id="VeilLicenseMit" />
+      <ComponentRef Id="VeilDataDirAcl" />
+      <ComponentRef Id="VeilConfig" />
+      <ComponentRef Id="VeilIndexHtml" />
+      <ComponentRef Id="VeilQuickstartHtml" />
+    </Feature>
+  </Package>
+</Wix>

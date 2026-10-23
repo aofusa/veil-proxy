@@ -1,0 +1,3 @@
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "cbpf"

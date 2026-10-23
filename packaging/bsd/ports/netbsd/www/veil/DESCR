@@ -1,0 +1,3 @@
+veil is a reverse proxy and web server for HTTP/1.1, HTTP/2 and HTTP/3 with
+Proxy-Wasm filters, load balancing and a proxy cache. The package installs a
+default configuration that serves a page on http://127.0.0.1:8080/.

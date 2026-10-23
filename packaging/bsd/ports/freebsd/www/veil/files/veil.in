@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# PROVIDE: veil
+# REQUIRE: LOGIN cleanvar
+# KEYWORD: shutdown
+#
+# veil_enable (bool):	Set to YES to enable veil. Default: NO
+# veil_config (str):	Configuration file. Default: %%PREFIX%%/etc/veil/config.toml
+#			(veil's built-in default path; set it only to use another file)
+
+. /etc/rc.subr
+
+name="veil"
+rcvar="veil_enable"
+
+load_rc_config "$name"
+
+: ${veil_enable:="NO"}
+: ${veil_config:="%%PREFIX%%/etc/veil/config.toml"}
+
+pidfile="/var/run/${name}.pid"
+procname="%%PREFIX%%/bin/veil"
+command="/usr/sbin/daemon"
+command_args="-P ${pidfile} -r -f -o /var/log/veil.log ${procname} -c ${veil_config}"
+required_files="${veil_config}"
+
+extra_commands="reload configtest"
+reload_cmd="veil_reload"
+configtest_cmd="veil_configtest"
+start_precmd="veil_configtest"
+
+veil_reload()
+{
+	if [ -f "${pidfile}" ]; then
+		kill -HUP "$(cat "${pidfile}")" && echo "veil: reloaded"
+	else
+		echo "veil: not running"
+	fi
+}
+
+veil_configtest()
+{
+	${procname} -t -c "${veil_config}"
+}
+
+run_rc_command "$1"

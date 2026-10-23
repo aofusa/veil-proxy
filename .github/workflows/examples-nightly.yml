@@ -1,0 +1,43 @@
+# F-255 / F-256: 移行ガイドの等価性の試験（nginx・Envoy と veil に同じ要求を送って比べる）と、Grafana のダッシュボードの試験
+# （compose を立ち上げて全パネルの式を問い合わせる）。このコミットの veil のイメージで回す。
+name: examples-nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "examples/grafana/**"
+      - "tests/migration/**"
+      - "tools/grafana/**"
+      - "docs/guide/migration-*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-nightly
+  cancel-in-progress: true
+
+jobs:
+  examples:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build the image of this commit
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.musl
+          build-args: CARGO_FEATURES=full-container
+          tags: veil:nightly
+          load: true
+          cache-from: type=gha,scope=musl-amd64
+      - name: migration equivalence (nginx, Envoy)
+        run: tests/migration/run.sh veil:nightly
+      - name: Grafana dashboard
+        run: tools/grafana/test-dashboard.sh veil:nightly

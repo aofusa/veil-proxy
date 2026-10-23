@@ -1,0 +1,12 @@
+#!/bin/sh
+# F-251: purge で、パッケージが作ったログ・キャッシュ・移行用の環境ファイルを消す（conffile の /etc/veil/config.toml は dpkg が消す）
+set -e
+if [ "${1:-}" = purge ]; then
+    rm -rf /var/log/veil /var/cache/veil /var/tmp/veil
+    rm -f /etc/default/veil
+    rmdir /etc/veil 2>/dev/null || true
+fi
+if [ "${1:-}" = remove ] || [ "${1:-}" = purge ]; then
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+fi
+exit 0

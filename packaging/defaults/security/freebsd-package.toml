@@ -1,0 +1,7 @@
+# rc.d starts veil as root; it binds its listeners, then drops to the www user and enters capability mode
+# (capsicum).
+allow_security_failures = false
+drop_privileges_user = "www"
+drop_privileges_group = "www"
+enable_capsicum = true
+capsicum_capability_mode = true

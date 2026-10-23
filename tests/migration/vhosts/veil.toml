@@ -1,0 +1,25 @@
+[server]
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
+[[route]]
+[route.conditions]
+host = "old.example.com"
+[route.action]
+type = "Redirect"
+redirect_url = "https://new.example.com$request_uri"
+redirect_status = 301
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/healthz"
+[route.action]
+type = "Respond"
+status = 200
+body = "ok"
+content_type = "text/plain"
+[[route]]
+[route.conditions]
+host = "api.example.com"
+[route.action]
+type = "Proxy"
+url = "http://app1:9000"

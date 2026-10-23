@@ -39,6 +39,11 @@ if git rev-parse -q --verify origin/main >/dev/null; then
 else
     echo "warning: origin/main not found; skipping the main-branch check" >&2
 fi
+# F-247: GitHub Release の draft の本文の元（git で管理するリリースノート）。rc も同じ版のファイルを使う
+if [ ! -s "docs/releases/v$BASE_VERSION.md" ]; then
+    echo "error: docs/releases/v$BASE_VERSION.md (the release notes) is missing" >&2
+    exit 1
+fi
 pre=false
 case "$TAG_VERSION" in *-*) pre=true ;; esac
 echo "tag=$TAG"

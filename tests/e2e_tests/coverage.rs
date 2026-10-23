@@ -39,6 +39,35 @@ pub(super) async fn test_e2e_cached_route_hit() {
     );
 }
 
+/// B-162: 本文が最初の読み込みに収まる小さい応答も、2 回目は必ずキャッシュから返る（X-Cache: HIT）。
+/// 以前は残りの本文を転送するときにしか保存しておらず、小さい応答は一度もキャッシュされなかった
+/// （上の試験は本文の一致でも通るので気づけなかった）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+pub(super) async fn test_e2e_cached_small_response_hits() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 平文の上流のルート（HTTPS の上流はキャッシュに保存しない。F-257）。ほかで使わないクエリを付ける
+    let path = "/cached-plain/index.html?b162";
+    let r1 = send_request(PROXY_PORT, path, &[]).await;
+    assert!(r1.is_some(), "First /cached/ request should succeed");
+    assert_eq!(get_status_code(&r1.unwrap()), Some(200));
+
+    let r2 = send_request(PROXY_PORT, path, &[]).await;
+    assert!(r2.is_some(), "Second /cached/ request should succeed");
+    let r2 = r2.unwrap();
+    assert_eq!(get_status_code(&r2), Some(200));
+    assert_eq!(
+        get_header_value(&r2, "X-Cache").as_deref(),
+        Some("HIT"),
+        "the second request for a small response should be served from the cache: {}",
+        r2.lines().take(12).collect::<Vec<_>>().join(" | ")
+    );
+}
+
 /// /rate-limited/* ルートでレート制限（429）を検証する
 #[tokio::test]
 #[ntest::timeout(30000)]

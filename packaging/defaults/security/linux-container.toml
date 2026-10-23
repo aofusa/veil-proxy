@@ -1,0 +1,21 @@
+# veil starts as root, binds its listeners, then drops to nonroot, with its own seccomp filter and Landlock.
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+seccomp_mode = "filter"
+enable_landlock = true
+enable_sandbox = false
+landlock_read_paths = [
+  "/var/www",
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  "/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr",
+]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]

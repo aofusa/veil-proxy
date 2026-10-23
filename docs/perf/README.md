@@ -1,4 +1,4 @@
-# docs/perf — パフォーマンス計測サマリ（v0.8.4）
+# docs/perf — パフォーマンス計測サマリ（v0.9.0）
 
 Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスループットを、nginx を基準に計測した
 **最新の結果だけ**をまとめる（過去の計測は git 履歴で辿れる）。
@@ -10,6 +10,7 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B）の生データ |
 | [`freebsd_cpu_per_req.tsv`](freebsd_cpu_per_req.tsv) | FreeBSD のサーバの CPU 時間 / 要求（`cpu_per_req.sh`）の生データ |
 | [`linux_v084_ab_raw.tsv`](linux_v084_ab_raw.tsv) | v0.8.4 の変更の退行確認（Prometheus を有効にした 6 構成と静的配信の 4 構成。v0.8.3 の main と交互）の生データ |
+| [`linux_v090_ab_raw.tsv`](linux_v090_ab_raw.tsv) | v0.9.0 の変更の退行確認（静的配信の 2 構成・キャッシュ・プロキシ。v0.8.4 と交互）の生データ |
 | [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.8.3 の全件と、v0.8.4 で回し直したもの） |
 
 ---
@@ -87,6 +88,28 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 - ログの文の英語化（F-242）は、文字列の変更だけ。
 - HTTP/2 の END_STREAM を最後の DATA フレームに付ける改善は、Linux では揺れの範囲（HTTP/2 0.999）。
   FreeBSD の h2c 54KB では +9%（下）。
+
+### v0.9.0 の退行確認（交互 A/B、2026-10-23）
+
+v0.9.0 の変更のうち要求の経路に入るのは 2 つ（どちらも分岐 1 つ）。
+
+- B-160: 静的配信の包含の判定で、canonical 形と一致しないときだけ生の `base_path` とも比べる
+- B-162: 本文が最初の読み込みに収まった応答をキャッシュに保存する（キャッシュの有効なルートだけ）
+
+設定ファイルの決め方（F-247）・起動の終了コード（B-161）・サンドボックスのバリア（B-163）は起動時だけ。
+
+- 比較: v0.8.4（タグ）と v0.9.0（`feat/distribution-tickets` の `13b1045b`）を、同じ手元の `cargo build --profile dist --features full`
+  でビルドし、同じ実行イメージ（v0.8.4 の `docker/Dockerfile.glibc` の段。`/veil` だけ差し替え）に入れた。
+  ルートの容量が足りず `docker build` で両方を作れなかったため（Docker のビルドのキャッシュ）
+- 実行: `NGINX=0 BASE=abbase NEW=abnew bash tools/perf/suite_ab.sh`（構成ごとに順を入れ替えて交互、3 反復）
+
+| 構成 | HTTP/1.1 | HTTP/2 |
+|---|---|---|
+| 静的配信（`h2_*_ktls_0_lb_cbpf_ofc_1`） | 0.999（2 組: 0.987・1.010） | 1.041 |
+| キャッシュ（`h2_1_feat_cache`） | 0.993 | 0.994 |
+| プロキシ（`h2_1_feat_proxy`） | 0.987 | 0.994 |
+
+比はすべて 0.95 以上で、ばらつきの範囲（同じイメージでもラン間で数 % 振れる）。退行は無い。
 
 ### v0.8.4 の退行確認（交互 A/B、2026-10-22）
 

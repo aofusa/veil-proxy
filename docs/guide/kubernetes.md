@@ -10,6 +10,36 @@ client Pod ──(mesh mTLS)──▶ [istio-proxy / linkerd-proxy] ─▶ veil 
                                                              veil :8443 (TLS, certificate from a Secret)
 ```
 
+## Helm
+
+The chart installs veil as its own Deployment and Service (a gateway, a static site, a reverse proxy). For the
+sidecar layout and the meshes, use the manifests below.
+
+```bash
+helm install veil oci://ghcr.io/aofusa/charts/veil --version <version>
+kubectl port-forward svc/veil 8080:8080
+curl http://127.0.0.1:8080/        # the page built into the image
+```
+
+The default configuration (rendered from the values into a ConfigMap) serves the image's `/var/www` over plaintext
+HTTP/1.1 and h2c on port 8080. The pod runs as non-root (65532) with a read-only root filesystem, all capabilities
+dropped and `RuntimeDefault` seccomp, and veil adds its own seccomp filter and Landlock. A changed configuration
+restarts the pods (a checksum annotation). The chart is signed with cosign (keyless) like the images.
+
+| Value | Default | |
+|---|---|---|
+| `image.repository` / `tag` / `digest` | `ghcr.io/aofusa/veil` / `musl-v<appVersion>` / — | `docker.io/aofusa/veil` also works |
+| `config` / `existingConfigMap` | — | your own `config.toml` (`--set-file config=config.toml`) |
+| `tls.secretName` | — | a `kubernetes.io/tls` Secret: adds the TLS listener (port 8443, Service port `service.tlsPort`) |
+| `http3.enabled` | `false` | QUIC on UDP 8443, as a separate Service `<release>-veil-h3` (needs `tls.secretName`) |
+| `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | `/__metrics` and a Prometheus Operator ServiceMonitor |
+| `grafanaDashboard.enabled` | `false` | the [example dashboard](observability.md#grafana-dashboard) as a ConfigMap for the Grafana sidecar |
+| `extraVolumes` / `extraVolumeMounts` | — | your files, e.g. a ConfigMap mounted on `/var/www` |
+| `autoscaling` / `podDisruptionBudget` / `networkPolicy` | off | |
+
+Every value is described in [deploy/helm/veil/values.yaml](../../deploy/helm/veil/values.yaml). The Service has no
+`appProtocol` (see the mesh notes below). The chart is tested on kind with `tools/release/helm-kind-test.sh`.
+
 ## Image
 
 The published image `ghcr.io/aofusa/veil:latest` (musl; `:glibc` is equivalent, both for `linux/amd64` and

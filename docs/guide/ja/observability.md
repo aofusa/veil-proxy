@@ -84,7 +84,31 @@ GET /__metrics
 
 再起動不要でメトリクスを動的にオン/オフできます。無効時は `/__metrics` が `404 Not Found` を返し、全記録関数がno-opになります。
 
-### Grafanaダッシュボード例
+### Grafana のダッシュボード
+
+`examples/grafana/veil-overview.json` は、そのまま使えるダッシュボードです。状態コード・ホストごとのトラフィック、5xx の
+割合、遅延の分位、接続数、上流の健康状態、サーキットブレーカー、再試行、外れ値の排除、接続プール、キャッシュ、gRPC、
+Proxy-Wasm、VDS のパネルがあります。変数は `datasource`・`job`・`instance`・`host`・`upstream` です。使っていない機能の
+パネルは空のままです。
+
+- **読み込む:** Grafana → Dashboards → New → Import で JSON を読み込み、Prometheus のデータソースを選ぶ。
+- **手元で試す:** `examples/grafana/docker-compose.yml` が、veil・小さな上流・負荷・Prometheus・ダッシュボードを読み込んだ
+  Grafana を立ち上げます（ポートはすべて `127.0.0.1`）。
+
+  ```sh
+  cd examples/grafana
+  cp .env.example .env      # GRAFANA_ADMIN_PASSWORD を設定する
+  docker compose up -d
+  # http://127.0.0.1:3000/d/veil-overview を開く（利用者は admin）
+  ```
+
+- **Kubernetes:** Helm chart が Grafana の sidecar 向けの ConfigMap として作ります
+  （`--set grafanaDashboard.enabled=true`、[kubernetes.md](kubernetes.md)）。
+
+JSON は `tools/grafana/gen_dashboard.py` で作ります。`tools/grafana/test-dashboard.sh` は compose の例を立ち上げ、全パネルの式が
+結果を返すことを確かめます（メトリクスの名前を変えると試験が落ちます）。
+
+単独の式の例:
 
 ```promql
 # リクエストレート（リクエスト/秒）

@@ -1,0 +1,7 @@
+# F-247: Windows の runner（core.autocrlf=true）でも、bash のスクリプトと雛形は LF のまま取り出す
+# （CRLF だと tools/release/render-defaults.sh などが \r の付いた行を読み違える）
+*.sh text eol=lf
+*.in text eol=lf
+packaging/defaults/** text eol=lf
+packaging/archive/** text eol=lf
+packaging/repos/** text eol=lf

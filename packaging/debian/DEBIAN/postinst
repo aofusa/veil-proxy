@@ -1,4 +1,4 @@
 #!/bin/sh
 set -e
-/usr/share/veil/scripts/postinstall.sh "$@"
+VEIL_PKG_KIND=deb /usr/share/veil/scripts/postinstall.sh "$@"
 exit 0

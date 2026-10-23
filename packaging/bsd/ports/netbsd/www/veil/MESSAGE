@@ -1,0 +1,9 @@
+===========================================================================
+veil reads ${PKG_SYSCONFDIR}/config.toml. The default one serves
+${PREFIX}/share/veil/www on http://127.0.0.1:8080/ and drops privileges to
+the veil user.
+
+	echo veil=YES >> /etc/rc.conf
+	service veil start
+	curl http://127.0.0.1:8080/
+===========================================================================

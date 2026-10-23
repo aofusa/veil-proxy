@@ -214,7 +214,7 @@ build_binary_musl_docker() {
     BINARY_PATH_MUSL="${BUILD_DIR}/veil-musl"
 }
 
-# 単体バイナリを tar.gz にまとめ packaging/output へ配置
+# 単体バイナリを tar.gz にまとめ packaging/output へ配置（F-247: バイナリ・ライセンス・README・examples/）
 package_binary_tarball() {
     local binary_path="$1"
     local target_name="$2"
@@ -229,8 +229,7 @@ package_binary_tarball() {
     local stage_parent="${BUILD_DIR}/tarball-${target_name}"
     local dir_name="veil-${VERSION}-${target_name}"
     rm -rf "${stage_parent}"
-    mkdir -p "${stage_parent}/${dir_name}"
-    install -m 0755 "${binary_path}" "${stage_parent}/${dir_name}/veil"
+    "${SCRIPT_DIR}/stage-archive.sh" "${binary_path}" "${target_name}" linux "${stage_parent}" >/dev/null
     tar -C "${stage_parent}" -czf "${OUTPUT_DIR}/${archive_name}" "${dir_name}"
     rm -rf "${stage_parent}"
     echo "==> Created ${OUTPUT_DIR}/${archive_name}"
@@ -305,20 +304,25 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
+# F-251: 既定の設定は /etc/veil/config.toml（veil の既定のパス。deb の conffile・rpm の %config(noreplace)）、
+# 既定のページは /usr/share/veil/www/。どちらも render-defaults.sh の linux-package から作る。
 stage_rootfs() {
     local dest="$1"
     rm -rf "${dest}"
-    mkdir -p "${dest}/usr/bin"
-    mkdir -p "${dest}/usr/share/veil/www"
-    mkdir -p "${dest}/usr/share/veil/scripts"
-    mkdir -p "${dest}/lib/systemd/system"
+    mkdir -p "${dest}/usr/bin" "${dest}/usr/share/veil/scripts" "${dest}/usr/lib/systemd/system" \
+        "${dest}/usr/share/doc/veil" "${dest}/etc/veil"
 
     install -m 0755 "${BINARY_PATH}" "${dest}/usr/bin/veil"
-    install -m 0644 "${ROOT}/contrib/config/config.toml" "${dest}/usr/share/veil/config.toml.default"
-    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${dest}/usr/share/veil/www/index.html"
-    install -m 0644 "${ROOT}/contrib/systemd/veil.service" "${dest}/lib/systemd/system/veil.service"
+    local defaults="${BUILD_DIR}/defaults-linux-package"
+    "${ROOT}/tools/release/render-defaults.sh" linux-package "${defaults}"
+    install -m 0644 "${defaults}/config.toml" "${dest}/etc/veil/config.toml"
+    mkdir -p "${dest}/usr/share/veil/www"
+    install -m 0644 "${defaults}"/www/* "${dest}/usr/share/veil/www/"
+    rm -rf "${defaults}"
+    install -m 0644 "${ROOT}/contrib/systemd/veil.service" "${dest}/usr/lib/systemd/system/veil.service"
     install -m 0755 "${SCRIPT_DIR}/postinstall.sh" "${dest}/usr/share/veil/scripts/postinstall.sh"
     install -m 0755 "${SCRIPT_DIR}/preuninstall.sh" "${dest}/usr/share/veil/scripts/preuninstall.sh"
+    install -m 0644 "${PKG_ROOT}/debian/copyright" "${dest}/usr/share/doc/veil/copyright"
 }
 
 build_deb() {
@@ -332,8 +336,19 @@ build_deb() {
         sed -i "s/^Architecture: .*/Architecture: ${DEB_ARCH}/" "${staging}/DEBIAN/control"
         install -m 0755 "${PKG_ROOT}/debian/DEBIAN/postinst" "${staging}/DEBIAN/postinst"
         install -m 0755 "${PKG_ROOT}/debian/DEBIAN/prerm" "${staging}/DEBIAN/prerm"
+        install -m 0755 "${PKG_ROOT}/debian/DEBIAN/postrm" "${staging}/DEBIAN/postrm"
+        install -m 0644 "${PKG_ROOT}/debian/DEBIAN/conffiles" "${staging}/DEBIAN/conffiles"
+        # Debian の changelog（版ごとの変更はリリースノート。ここには版と日付だけを書く）
+        printf 'veil (%s) stable; urgency=medium\n\n  * Release %s: https://github.com/aofusa/veil-proxy/releases/tag/v%s\n\n -- aofusa <aofusa@users.noreply.github.com>  %s\n' \
+            "${VERSION}" "${VERSION}" "${VERSION}" "$(LC_ALL=C date -u -R)" | gzip -9n > "${staging}/usr/share/doc/veil/changelog.Debian.gz"
+        # 作業者の umask に依らず、ディレクトリ 755・ファイル 644（実行ファイルは 755）にする
+        find "${staging}" -path "${staging}/DEBIAN" -prune -o -type d -exec chmod 0755 {} +
+        find "${staging}" -path "${staging}/DEBIAN" -prune -o -type f ! -perm -u+x -exec chmod 0644 {} +
+        # Installed-Size（KiB）
+        echo "Installed-Size: $(du -sk --exclude=DEBIAN "${staging}" | cut -f1)" >> "${staging}/DEBIAN/control"
 
-        dpkg-deb --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
+        # xz で圧縮する（Ubuntu の dpkg-deb の既定は zstd で、Debian の lintian・古い dpkg が読めない）
+        dpkg-deb -Zxz --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
         echo "==> Created ${OUTPUT_DIR}/${DEB_NAME}"
     else
         echo "==> dpkg-deb not found; using Docker (ubuntu:24.04)"
@@ -366,6 +381,9 @@ build_rpm_tree() {
     rm -rf "${rpm_top}/BUILD" "${rpm_top}/BUILDROOT" "${rpm_top}/RPMS" "${rpm_top}/SRPMS"
     mkdir -p "${rpm_top}/BUILD" "${rpm_top}/BUILDROOT" "${rpm_top}/RPMS" "${rpm_top}/SRPMS" "${rpm_top}/SPECS"
     cp "${PKG_ROOT}/rpm/veil.spec" "${rpm_top}/SPECS/veil.spec"
+    # %changelog（版ごとの変更はリリースノート。ここには版と日付だけを書く）
+    printf '* %s aofusa <aofusa@users.noreply.github.com> - %s-1\n- Release %s: https://github.com/aofusa/veil-proxy/releases/tag/v%s\n' \
+        "$(LC_ALL=C date -u '+%a %b %d %Y')" "${VERSION}" "${VERSION}" "${VERSION}" >> "${rpm_top}/SPECS/veil.spec"
 
     # --target はクロスアーキ時に必須（x86_64 ホストで BuildArch: aarch64 の spec を
     # ビルドすると rpmbuild が "No compatible architectures found for build" で失敗する）。

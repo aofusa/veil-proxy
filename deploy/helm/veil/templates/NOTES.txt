@@ -1,0 +1,20 @@
+veil {{ .Chart.AppVersion }} is installed as {{ include "veil.fullname" . }} in {{ .Release.Namespace }}.
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "veil.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/
+{{- if not (or .Values.config .Values.existingConfigMap) }}
+
+The default configuration serves the page built into the image ({{ include "veil.image" . }}) from /var/www.
+Serve your own files with extraVolumes / extraVolumeMounts on /var/www, or replace the configuration with --set-file config=config.toml.
+{{- end }}
+{{- if .Values.tls.secretName }}
+TLS: port {{ .Values.service.tlsPort }} of the Service (certificate from the Secret {{ .Values.tls.secretName }}).
+{{- if .Values.http3.enabled }}
+HTTP/3: UDP port {{ .Values.service.tlsPort }} of the Service {{ include "veil.fullname" . }}-h3.
+{{- end }}
+{{- end }}
+{{- if .Values.metrics.enabled }}
+Metrics: http://{{ include "veil.fullname" . }}:{{ .Values.service.port }}/__metrics
+{{- end }}
+Guide: https://github.com/aofusa/veil-proxy/blob/main/docs/guide/kubernetes.md#helm

@@ -17,7 +17,7 @@ Dockerイメージのビルドとコンテナの実行
 `/veil` = `full`（io_uring）と、io_uring を作れないときに切り替える `/veil.epoll` = `full-container` の 2 本）。
 
 何もマウントしなければ、内蔵の設定（`packaging/container/config.toml`）で `/var/www` の内蔵のページ
-（`packaging/container/www/`。`/` と `/quickstart.html`）を 8080 番（平文の HTTP/1.1・h2c）で配り、アクセスログを標準出力に出す
+（`packaging/defaults/www/`。`/` と `/quickstart.html`）を 8080 番（平文の HTTP/1.1・h2c）で配り、アクセスログを標準出力に出す
 （v0.8.3 から。F-246）。使い方は [docs/guide/container.md](../docs/guide/container.md)（[日本語](../docs/guide/ja/container.md)）。
 ghcr.io のページの説明は `packaging/container/description.txt`（index の注釈。512 文字まで）。
 

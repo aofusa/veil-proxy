@@ -1,0 +1,4 @@
+# veil runs as the user who started it and restricts itself with pledge(2) and unveil(2).
+allow_security_failures = false
+enable_pledge = true
+enable_unveil = true

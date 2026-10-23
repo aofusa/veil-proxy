@@ -40,7 +40,7 @@ resolver = "2"
 # （ルートから veil-macros への依存の版と、ワークスペース外の Cargo.lock も一緒に更新する）。
 # 公開の workflow（.github/workflows/release.yml）はタグとこの版が違えば何も公開しない。
 [workspace.package]
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
@@ -81,6 +81,34 @@ features = ["full", "api"]
 no-default-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
+
+# F-249: `cargo binstall veil-proxy` が GitHub Release のアーカイブから veil のバイナリだけを入れる（設定とページは入らない。
+# docs/guide/running.md#configuration-file）。各アーカイブの minisign の署名（<アーカイブ>.sig）を下の公開鍵で検証する。
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-{ target }.tar.gz"
+bin-dir = "veil-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWSK8B6kNYXiqr3pLFklRgQoKpg+W3/GEAvZfXo+9qnhzgO6bXxQz+tl"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+# macOS は universal2 の 1 つのアーカイブを両方の target で使う
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-universal2-apple-darwin.tar.gz"
+bin-dir = "veil-{ version }-universal2-apple-darwin/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/veil-{ version }-universal2-apple-darwin.tar.gz"
+bin-dir = "veil-{ version }-universal2-apple-darwin/{ bin }"
 
 [lib]
 name = "veil"
@@ -677,7 +705,7 @@ regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
-veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.8.4", optional = true }
+veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.9.0", optional = true }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }

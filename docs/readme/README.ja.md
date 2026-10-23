@@ -38,8 +38,22 @@ nginx との性能比較は [docs/perf/README.md](../perf/README.md) にあり�
 
 ## インストール
 
-ビルド済みバイナリとパッケージ（`.deb`・`.rpm`、Linux/BSD/macOS/Windows 向け tarball）は
-各 [GitHub リリース](https://github.com/aofusa/veil-proxy/releases) に添付しています。
+パッケージとコンテナイメージは、既定の設定とページも入れます。veil を起動して <http://127.0.0.1:8080/>
+（コンテナは <http://localhost:8080/>）を開いてください。
+
+| | コマンド |
+|---|---|
+| コンテナ | `docker run --rm -p 8080:8080 ghcr.io/aofusa/veil`（Docker Hub の `aofusa/veil` も同じ） |
+| Debian・Ubuntu、RHEL・Fedora・Amazon Linux | [apt・dnf のリポジトリ](../guide/ja/running.md#aptdnf-のリポジトリ) を足して `apt install veil`・`dnf install veil` |
+| Homebrew（macOS・Linux） | `brew install aofusa/tap/veil` |
+| Windows | `winget install Aofusa.Veil` |
+| FreeBSD・OpenBSD・NetBSD | [packaging/bsd/ports](../../packaging/bsd/ports/README.md) の ports |
+| Rust | `cargo binstall veil-proxy`・`cargo install veil-proxy --locked --features full` |
+
+`cargo install`・`cargo binstall`・各 [GitHub リリース](https://github.com/aofusa/veil-proxy/releases) のアーカイブで入るのは
+`veil` のバイナリだけです。設定ファイルは自分で用意してください（アーカイブの `examples/` に例があります）。veil は
+`-c FILE`、無ければ `VEIL_CONFIG`、無ければ既定のパス（`/etc/veil/config.toml`、Windows は `%ProgramData%\veil\config.toml`）を
+読みます。詳しくは [設定ファイル](../guide/ja/running.md#設定ファイル)。
 
 ソースからビルドする場合（Rust stable、`cmake`、`nasm` が必要）:
 
