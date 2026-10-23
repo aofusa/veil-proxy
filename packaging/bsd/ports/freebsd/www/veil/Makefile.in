@@ -13,7 +13,9 @@ LICENSE_COMB=	dual
 LICENSE_FILE_APACHE20=	${WRKSRC}/LICENSE-APACHE
 LICENSE_FILE_MIT=	${WRKSRC}/LICENSE-MIT
 
+# git: boring-sys (BoringSSL for HTTP/3) applies its patches with git init / git apply
 BUILD_DEPENDS=	bash:shells/bash \
+		git:devel/git@tiny \
 		cmake:devel/cmake-core \
 		gmake:devel/gmake \
 		nasm:devel/nasm \

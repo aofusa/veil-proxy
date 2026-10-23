@@ -14,7 +14,9 @@ WANTLIB +=		${COMPILER_LIBCXX} c c++abi m pthread
 
 MODULES =		devel/cargo lang/clang
 MODCLANG_COMPILER_LINKS =	No
+# devel/git: boring-sys (BoringSSL for HTTP/3) applies its patches with git init / git apply
 BUILD_DEPENDS =		devel/cmake \
+			devel/git \
 			devel/gmake \
 			devel/protobuf \
 			shells/bash

@@ -61,7 +61,7 @@ freebsd)
     make makesum BATCH=yes >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
     cp distinfo "$OUT/distinfo.freebsd"
     log "make package"
-    make package BATCH=yes NO_DEPENDS=yes >"$OUT/build.log" 2>&1 || { grep -E 'error|Error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
+    make package BATCH=yes NO_DEPENDS=yes >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     check "portlint-like: make check-plist" make check-plist BATCH=yes
     PKG="$(ls work/pkg/veil-*.pkg)"; cp "$PKG" "$OUT/"
     log "入れる・サービスの試験"
@@ -87,7 +87,6 @@ openbsd)
     log "pkg_add（依存）"
     # cargo-generate-vendor: devel/cargo の module がクレートの metadata を作るのに使う
     env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash cargo-generate-vendor
-    LLVM="$(env PKG_PATH="$P" pkg_info -Q llvm 2>/dev/null | grep -E '^llvm-[0-9]' | sort -V | tail -1)"; env PKG_PATH="$P" pkg_add -I "$LLVM"
     log "ports の木"
     # ports の木はパッケージと同じ版（リリースの ports.tar.gz）を使う。GitHub の mirror は -current だけで、
     # -current の devel/cargo はリリースの cargo-generate-vendor が知らない引数を渡す。要る所だけを展開する
@@ -97,6 +96,9 @@ openbsd)
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
+    # lang/clang の module が使う版の llvm（LIBCLANG_PATH は ${LOCALBASE}/llvm${MODCLANG_VERSION}/lib）
+    MODCLANG_VERSION="$(make show=MODCLANG_VERSION)"; echo "MODCLANG_VERSION=$MODCLANG_VERSION"
+    env PKG_PATH="$P" pkg_add -I "llvm%$MODCLANG_VERSION"
     DIST="$(make show=FULLDISTDIR)"; mkdir -p "$DIST"
     # DIST_TUPLE（github）の配布物は DISTFILES に出ない。名前は <account>-<project>-<tag>.tar.gz
     [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/aofusa-veil-proxy-$TAG.tar.gz"
@@ -105,7 +107,7 @@ openbsd)
     cp distinfo "$OUT/distinfo.openbsd"
     log "make package"
     ulimit -d unlimited 2>/dev/null || true
-    make package NO_DEPENDS=Yes >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
+    make package NO_DEPENDS=Yes >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/ports/packages/*/all/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
     log "入れる・サービスの試験"
     env TRUSTED_PKG_PATH=/usr/ports/packages/$(uname -p)/all pkg_add -D unsigned "$PKG"
@@ -160,7 +162,7 @@ netbsd)
     echo "distfiles: $(make show-var VARNAME=DISTFILES | wc -w), in distinfo: $(grep -c '^SHA512' distinfo)"
     cp distinfo "$OUT/distinfo.netbsd"
     log "make package"
-    make package >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
+    make package >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/pkgsrc/packages/All/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
     log "入れる・サービスの試験"
     pkg_add "$PKG"

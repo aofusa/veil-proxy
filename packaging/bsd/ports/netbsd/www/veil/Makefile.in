@@ -13,6 +13,8 @@ COMMENT=	High-performance reverse proxy and web server
 LICENSE=	apache-2.0 OR mit
 
 TOOL_DEPENDS+=	cmake-[0-9]*:../../devel/cmake
+# git: boring-sys (BoringSSL for HTTP/3) applies its patches with git init / git apply
+TOOL_DEPENDS+=	git-base-[0-9]*:../../devel/git-base
 TOOL_DEPENDS+=	protobuf-[0-9]*:../../devel/protobuf
 TOOL_DEPENDS+=	bash-[0-9]*:../../shells/bash
 TOOL_DEPENDS+=	clang-[0-9]*:../../lang/clang
