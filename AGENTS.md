@@ -202,6 +202,16 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー。Dockerfile の cacher 段と `.dockerignore` に `crates/`・`benches/` が要る。
 - Kubernetes の Service に `appProtocol` を付けない（Linkerd は `http` を HTTP/1.1 固定と解釈し h2c が壊れる。F-196）。
 
+### 配布（F-247〜F-256）
+
+- 設定ファイルは `-c` → 環境変数 `VEIL_CONFIG` → 既定のパス（`config::default_config_path`。ビルド時の
+  `VEIL_DEFAULT_CONFIG_PATH`、Windows は `%ProgramData%\veil\config.toml`）で決める。**設定を内蔵しない**（無ければ止まる）。
+- 既定の設定とページの正本は `packaging/defaults/`（`tools/release/render-defaults.sh` が入手経路ごとに作る）。
+  `packaging/container/config.toml` は生成物（`render-defaults.sh --check` が一致を確かめる）。各パッケージは既定の設定と
+  ページを OS の場所に置き、上げても利用者の設定を上書きしない。バイナリだけの入手経路は設定を入れない（文書に書く）。
+- 公開は GitHub Release の **draft** まで（`release.yml`）。本文は `docs/releases/v<版>.md`（git で管理。無ければ止まる）。
+  ページの公開は人が行い、その契機で `release-downstream.yml` が下流の配布先を更新する。
+
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
