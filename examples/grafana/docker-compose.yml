@@ -1,0 +1,53 @@
+# F-256: veil + Prometheus + Grafana + a small load, with the example dashboard provisioned.
+#
+#   cp .env.example .env   # and set GRAFANA_ADMIN_PASSWORD
+#   docker compose up -d
+#   open http://127.0.0.1:3000/d/veil-overview  (user admin)
+#
+# Every port is bound to 127.0.0.1 only. Images are pinned by digest (update them deliberately).
+name: veil-grafana
+services:
+  veil:
+    image: ${VEIL_IMAGE:-ghcr.io/aofusa/veil:latest}
+    command: ["/veil", "-c", "/etc/veil/conf.d/config.toml"]
+    volumes:
+      - ./veil.toml:/etc/veil/conf.d/config.toml:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+  app:
+    # a tiny HTTP server for the proxied routes (/health answers 200)
+    image: traefik/whoami:v1.11@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+    command: ["--port", "9000"]
+  load:
+    image: curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        while true; do
+          curl -s -o /dev/null http://veil:8080/;
+          curl -s -o /dev/null http://veil:8080/no-such-page;
+          curl -s -o /dev/null -H 'Host: api.example' http://veil:8080/api;
+          curl -s -o /dev/null -H 'Host: api.example' http://veil:8080/cached/item;
+          curl -s -o /dev/null --http2-prior-knowledge http://veil:8080/quickstart.html;
+          sleep 0.2;
+        done
+    depends_on: [veil]
+  prometheus:
+    image: prom/prometheus:v3.7.2@sha256:23031bfe0e74a13004252caaa74eccd0d62b6c6e7a04711d5b8bf5b7e113adc7
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+  grafana:
+    image: grafana/grafana:12.2.1@sha256:35c41e0fd0295f5d0ee5db7e780cf33506abfaf47686196f825364889dee878b
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/veil-overview.json
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./veil-overview.json:/var/lib/grafana/dashboards/veil-overview.json:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on: [prometheus]

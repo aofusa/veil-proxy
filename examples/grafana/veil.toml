@@ -1,0 +1,64 @@
+# veil for the Grafana example (F-256): a page, a load-balanced proxy with health checks, a circuit breaker and
+# a cache, and metrics on /__metrics. One of the two upstream servers does not exist, so the upstream panels move.
+[server]
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
+http2_enabled = true
+threads = 2
+
+[logging]
+level = "warn"
+
+[prometheus]
+enabled = true
+path = "/__metrics"
+allowed_ips = ["0.0.0.0/0"]
+
+[upstreams."app"]
+algorithm = "round_robin"
+servers = ["http://app:9000", "http://missing-app:9000"]
+
+  [upstreams."app".health_check]
+  check_type = "http"
+  interval_secs = 5
+  path = "/health"
+  timeout_secs = 2
+  healthy_statuses = [200]
+  unhealthy_threshold = 2
+  healthy_threshold = 2
+
+  [upstreams."app".circuit_breaker]
+  enabled = true
+  failure_threshold = 5
+  failure_window_secs = 30
+  open_duration_secs = 10
+  half_open_probes = 2
+  success_threshold = 2
+
+[[route]]
+[route.conditions]
+host = "api.example"
+path = "/cached/"
+[route.action]
+type = "Proxy"
+upstream = "app"
+  [route.cache]
+  enabled = true
+  default_ttl_secs = 5
+  methods = ["GET", "HEAD"]
+  cacheable_statuses = [200]
+
+[[route]]
+[route.conditions]
+host = "api.example"
+path = "/"
+[route.action]
+type = "Proxy"
+upstream = "app"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
