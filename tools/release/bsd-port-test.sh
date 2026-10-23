@@ -34,10 +34,11 @@ python3 "$ROOT/tools/release/bsd-ports.py" "$TAG" "$OUT/ports" 2>/dev/null || {
 }
 # VEIL_PORT_LOCAL_SRC=1: GitHub のタグの tarball と同じ形（veil-proxy-<ver>/ の下に木）を checkout した木から作って使う
 # （タグを打つ前の試験）。0（既定）なら、ports の仕組みが GitHub からタグの tarball を取る（distinfo は本物のチェックサム）
+# （CI では VM に入る前に runner が <out-dir>/src.tar.gz を git archive で作っておく。VM にはまだ git が無い）
 SRCTAR=""
 if [ "${VEIL_PORT_LOCAL_SRC:-0}" = 1 ]; then
     SRCTAR="$OUT/src.tar.gz"
-    ( cd "$ROOT" && git archive --format=tar.gz --prefix="veil-proxy-$VER/" -o "$SRCTAR" HEAD )
+    [ -s "$SRCTAR" ] || ( cd "$ROOT" && git archive --format=tar.gz --prefix="veil-proxy-$VER/" -o "$SRCTAR" HEAD )
 fi
 
 case "$OS" in

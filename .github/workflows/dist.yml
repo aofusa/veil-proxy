@@ -401,6 +401,12 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
+      - name: source tarball (before the tag exists)
+        if: ${{ !startsWith(inputs.ref, 'v') }}
+        run: |
+          mkdir -p ports-out
+          v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          git archive --format=tar.gz --prefix="veil-proxy-$v/" -o ports-out/src.tar.gz HEAD
       - name: build the port, install the package, start the service
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
