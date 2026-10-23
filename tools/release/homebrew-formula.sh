@@ -16,5 +16,5 @@ sha() {
 M="$(sha "veil-$VER-universal2-apple-darwin.tar.gz")"
 X="$(sha "veil-$VER-x86_64-unknown-linux-musl.tar.gz")"
 A="$(sha "veil-$VER-aarch64-unknown-linux-musl.tar.gz")"
-sed -e "s|@VERSION@|$VER|g" -e "s|@BASE@|$BASE|g" -e "s|@SHA_MACOS@|$M|" \
+sed -e "s|@VERSION@|$VER|g" -e "s|@BASE@|$BASE|g" -e "s|@SHA_MACOS@|$M|g" \
     -e "s|@SHA_LINUX_X86_64@|$X|" -e "s|@SHA_LINUX_AARCH64@|$A|" "$ROOT/packaging/homebrew/veil.rb.in"
