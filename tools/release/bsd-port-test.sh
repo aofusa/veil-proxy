@@ -122,13 +122,13 @@ netbsd)
     fi
     mkdir -p "$(dirname /usr/pkgsrc/www/veil)" && rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
-    DIST="$(bmake show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
-    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(bmake show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
+    DIST="$(make show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
+    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
     log "make makesum"
-    bmake makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
+    make makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
     cp distinfo "$OUT/distinfo.netbsd"
     log "make package"
-    bmake package >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
+    make package >"$OUT/build.log" 2>&1 || { grep -E 'error' "$OUT/build.log" | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/pkgsrc/packages/All/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
     pkg_add "$PKG"
     cp /usr/pkg/share/examples/rc.d/veil /etc/rc.d/veil

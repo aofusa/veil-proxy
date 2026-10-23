@@ -392,7 +392,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: freebsd, version: "14.3" }
+          # FreeBSD の ports の木（main）は、サポート中のリリースでしか動かない（14.3 は ALLOW_UNSUPPORTED_SYSTEM を求められる）
+          - { os: freebsd, version: "14.4" }
           - { os: openbsd, version: "7.9" }
           - { os: netbsd, version: "10.1" }
     steps:
@@ -413,7 +414,8 @@ jobs:
           run: |
             mkdir -p ports-out
             tag="$(git describe --tags --exact-match 2>/dev/null || echo "v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)")"
-            sudo sh tools/release/bsd-port-test.sh ${{ matrix.os }} "$tag" ports-out > ports-out/test.log 2>&1 || echo PORT_FAILED >> ports-out/test.log
+            # sudo は環境変数を落とすので、渡すものは env で明示する
+            sudo env VEIL_PORT_LOCAL_SRC="${VEIL_PORT_LOCAL_SRC:-0}" sh tools/release/bsd-port-test.sh ${{ matrix.os }} "$tag" ports-out > ports-out/test.log 2>&1 || echo PORT_FAILED >> ports-out/test.log
             sudo chown -R "$(id -u)" ports-out || true
         env:
           # タグの tarball がまだ GitHub に無いときは、checkout した木から作る
