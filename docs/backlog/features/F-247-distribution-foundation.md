@@ -1,6 +1,6 @@
 # F-247: 配布の土台（既定のパス・パッケージの既定の設定とページ・GitHub Release の draft を CI で作る）
 
-**状態: 設計（feat/distribution-tickets、2026-10-23。2026-10-23 に方針を改訂）**
+**状態: 実装済み（feat/distribution-tickets、2026-10-23。v0.9.0 で公開）**
 
 パッケージマネージャでの公開（F-248〜F-253）・Helm chart（F-254）の前提になるチケット。
 

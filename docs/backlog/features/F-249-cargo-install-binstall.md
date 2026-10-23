@@ -1,6 +1,6 @@
 # F-249: `cargo install`・`cargo binstall` で入れられるようにする
 
-**状態: 設計（feat/distribution-tickets、2026-10-23。既定の設定を入れない理由を追記）**
+**状態: 実装済み（feat/distribution-tickets、2026-10-23。v0.9.0 で公開）**
 
 ## 目的
 

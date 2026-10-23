@@ -1,6 +1,6 @@
 # F-252: winget で公開する
 
-**状態: 設計（feat/distribution-tickets、2026-10-23。2026-10-23 に MSI へ改訂）**
+**状態: 実装済み（feat/distribution-tickets、2026-10-23。v0.9.0 で公開）**
 
 ## 目的
 
