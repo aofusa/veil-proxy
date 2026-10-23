@@ -43,7 +43,7 @@ cat <<EOF
 |---|---|
 EOF
 for f in $(ls "$ASSETS" | sort); do
-    case "$f" in SHA256SUMS*|*.sigstore.json|*.minisig) continue ;; esac
+    case "$f" in SHA256SUMS*|*.sigstore.json|*.sig) continue ;; esac
     sz="$(wc -c < "$ASSETS/$f" | tr -d ' ')"
     printf '| `%s` | %s MB |\n' "$f" "$(awk -v b="$sz" 'BEGIN{printf "%.1f", b/1048576}')"
 done
