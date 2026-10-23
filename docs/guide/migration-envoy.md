@@ -22,7 +22,7 @@ compared response by response (`tests/migration/`).
 | `filter_chains[].transport_socket` (`DownstreamTlsContext`) | `[tls]` | One certificate set (SNI selection between several certificates is not available on TOML listeners). |
 | `http_connection_manager` | built in | HTTP/1.1, HTTP/2, h2c and HTTP/3 on the listeners above. |
 | `route_config.virtual_hosts[].domains` | `[route.conditions] host` | Exact names and `*.example.com`. |
-| `routes[].match` | `[route.conditions]` | `prefix` → `path = "/x/*"`, `path` → exact `path`, `headers` → `header`, `query_parameters` → `query`. No `safe_regex`. |
+| `routes[].match` | `[route.conditions]` | `prefix` → `path = "/x/*"`, `path` → `path = "/x"` (exact), `headers` → `header`, `query_parameters` → `query`. No `safe_regex`. |
 | `routes[].route.cluster` | `[route.action] type = "Proxy"`, `upstream = "<cluster>"` | |
 | `clusters[]` | `[upstreams."<name>"]` | `lb_policy`, health checks, outlier detection, circuit breaker. |
 | `load_assignment.endpoints` | `servers = [...]` | URLs with weights. |
@@ -39,8 +39,8 @@ routes first. veil has no separate virtual-host level: write the `host` conditio
 
 | Envoy | veil | |
 |---|---|---|
-| `match: { prefix: "/api/" }` | `path = "/api/*"` | = |
-| `match: { path: "/healthz" }` | `path = "/healthz"` | ≈ exact on File routes; other actions also match `/healthz/...` |
+| `match: { prefix: "/api/" }` | `path = "/api/*"` | = (also matches `/api`) |
+| `match: { path: "/healthz" }` | `path = "/healthz"` | = exact (a `path` without `*` is exact, except `"/"`, which matches every path) |
 | `match: { safe_regex: ... }` | — | — use prefixes, or a Proxy-Wasm filter |
 | `headers: [{ name, string_match }]` | `header = { "X-Version" = "v2" }` | ≈ exact values |
 | `query_parameters` | `query = { "token" = "..." }` | ≈ exact values |
@@ -70,7 +70,7 @@ routes first. veil has no separate virtual-host level: write the `host` conditio
 | `rbac` | `allowed_ips` / `denied_ips` / `allowed_methods`, `[tls] client_allowed_sans` | ≈ |
 | `ext_authz` | — | — planned (F-229) |
 | `compressor` (gzip, brotli, zstd) | `[route.compression]` | = |
-| `cache` | `[route.cache]` | = |
+| `cache` | `[route.cache]` | ≈ for HTTP/1.1 clients (HTTP/2 and HTTP/3: F-257) |
 | `buffer` | `[route.buffering] mode = "full"` | = |
 | `grpc_web` | — on proxy routes | — the API library serves gRPC-Web itself ([library.md](library.md)); on proxy routes translate in the backend |
 | `wasm` | Proxy-Wasm `modules` | = |
@@ -176,6 +176,7 @@ path = "/healthz"
 type = "Respond"
 status = 200
 body = "ok"
+content_type = "text/plain"   # Envoy's direct_response sends text/plain
 
 [[route]]
 [route.conditions]

@@ -1,0 +1,26 @@
+[server]
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
+[upstreams."app"]
+algorithm = "least_conn"
+servers = ["http://app1:9000", "http://app2:9000"]
+  [upstreams."app".health_check]
+  path = "/health"
+  interval_secs = 10
+  timeout_secs = 2
+  unhealthy_threshold = 3
+  healthy_threshold = 2
+[[route]]
+[route.conditions]
+path = "/healthz"
+[route.action]
+type = "Respond"
+status = 200
+body = "ok"
+content_type = "text/plain"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+upstream = "app"

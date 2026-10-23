@@ -1,0 +1,21 @@
+[server]
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
+[upstreams."app"]
+algorithm = "least_conn"
+servers = ["http://app1:9000/api/", "http://app2:9000/api/"]
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "app"
+[route.security]
+add_request_headers = { "X-Real-IP" = "$client_ip" }
+add_response_headers = { "X-Frame-Options" = "DENY" }
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"

@@ -1,0 +1,6 @@
+GET - /
+GET - /index.html
+GET - /sub/style.css
+GET - /data.json
+GET - /missing.html
+HEAD - /sub/style.css

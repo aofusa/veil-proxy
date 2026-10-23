@@ -22,7 +22,7 @@ nginx の設定を veil の `config.toml` に置き換えるためのガイド�
 | `listen 443 ssl; listen 80;` | `[server] listen`（TLS）と `listen_cleartext`（平文） | TLS のリスナーと平文のリスナーが 1 つずつ。バーチャルホストは `host` 条件の付いたルート。 |
 | `server_name` | `[route.conditions] host` | 完全一致と `*.example.com`。正規表現は無い。 |
 | `location` | `[[route]]` | **書いた順に**試し、最初に当たったものを使う（nginx は最長の前方一致・最初の正規表現）。具体的なルートを先に書く。 |
-| `location /static/` | `path = "/static/*"`（または `"/static/"`） | 前方一致。ファイルを指す File のルートの `path = "/robots.txt"` は完全一致。正規表現の location は無い。 |
+| `location /static/` | `path = "/static/*"` | 前方一致（`/static` にも当たる）。`*` の無い `path` は完全一致（`"/"` だけは全パスに当たる）。正規表現の location は無い。 |
 | `root` / `alias` | `type = "File"`、`path = "/var/www/..."` | 常に **alias** の意味。当たった接頭辞を外し、残りを `path` に繋ぐ。 |
 | `proxy_pass` | `type = "Proxy"`、`url` か `upstream` | 当たった接頭辞を外し、URL のパスに繋ぐ（[プロキシのパス](#プロキシのパス)）。 |
 | `upstream { server ...; }` | `[upstreams."name"] servers = [...]` | 能動的なヘルスチェック・サーキットブレーカー・外れ値の検出もある。 |
@@ -68,7 +68,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 
 | nginx | veil | |
 |---|---|---|
-| `location = /x` | `path = "/x"` | ≈ ファイルを指す File のルートは完全一致。他の action では `"/x"` は `/x/...` にも当たる |
+| `location = /x` | `path = "/x"` | = 完全一致 |
 | `location ~ \.php$`（正規表現） | — | — 前方一致・完全一致で書くか、Proxy-Wasm のフィルタ |
 | `root` / `alias` / `index` | `type = "File"`、`path`、`index` | = alias の意味 |
 | `try_files $uri $uri/ /index.html;`（SPA） | — | — 無い。資産の接頭辞ごとのルートと、最後に `index.html` を返す `type = "File"` のルートを置くか、フィルタ |
@@ -104,7 +104,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |
 | `max_fails=` / `fail_timeout=`（受動的） | `[upstreams.X.outlier_detection]` / `circuit_breaker` | ≈ 能動的な `health_check` もある（nginx は Plus のみ） |
 | `split_clients`（カナリア） | `[route.traffic] split` | = |
-| `proxy_cache` | `[route.cache]` | = メモリとディスク、`stale_while_revalidate`、`stale_if_error` |
+| `proxy_cache` | `[route.cache]` | ≈ メモリとディスク、`stale_while_revalidate`、`stale_if_error`。HTTP/1.1 のクライアントの要求だけ（HTTP/2・HTTP/3 は F-257） |
 | `proxy_cache_key` | `include_query`・`key_headers` | ≈ |
 | UNIX ソケットの上流（`unix:/run/app.sock`） | `url = "http://unix:/run/app.sock"` | = |
 

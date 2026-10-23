@@ -23,7 +23,7 @@ examples marked *(tested)* are also run side by side with nginx and compared res
 | `listen 443 ssl; listen 80;` | `[server] listen` (TLS) and `listen_cleartext` (plaintext) | One TLS listener and one plaintext listener; virtual hosts are routes with a `host` condition. |
 | `server_name` | `[route.conditions] host` | Exact names and `*.example.com`. No regular expressions. |
 | `location` | `[[route]]` | Routes are tried **in the order they are written**; the first match wins (nginx picks the longest prefix / first regex). Put specific routes first. |
-| `location /static/` | `path = "/static/*"` (or `"/static/"`) | Prefix match. `path = "/robots.txt"` on a file is an exact match. No regex locations. |
+| `location /static/` | `path = "/static/*"` | Prefix match (also matches `/static`). A `path` without `*` is an exact match, except `"/"`, which matches every path. No regex locations. |
 | `root` / `alias` | `type = "File"`, `path = "/var/www/..."` | Always **alias** semantics: the matched prefix is removed and the rest is joined to `path`. |
 | `proxy_pass` | `type = "Proxy"`, `url` or `upstream` | The matched prefix is removed, then joined to the URL's path (see [Proxy paths](#proxy-paths)). |
 | `upstream { server ...; }` | `[upstreams."name"] servers = [...]` | Plus active health checks, circuit breaker and outlier detection. |
@@ -69,7 +69,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 
 | nginx | veil | |
 |---|---|---|
-| `location = /x` | `path = "/x"` | ≈ a File route on a file matches exactly; on other actions `"/x"` also matches `/x/...` |
+| `location = /x` | `path = "/x"` | = exact match |
 | `location ~ \.php$` (regex) | — | — use prefixes / exact paths, or a Proxy-Wasm filter |
 | `root` / `alias` / `index` | `type = "File"`, `path`, `index` | = alias semantics |
 | `try_files $uri $uri/ /index.html;` (SPA) | — | — not available; use a route per asset prefix and a final `type = "File"` route on `index.html`, or a filter |
@@ -105,7 +105,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |
 | `max_fails=` / `fail_timeout=` (passive) | `[upstreams.X.outlier_detection]` / `circuit_breaker` | ≈ plus active `health_check` (nginx Plus only) |
 | `split_clients` (canary) | `[route.traffic] split` | = |
-| `proxy_cache` | `[route.cache]` | = memory and disk, `stale_while_revalidate`, `stale_if_error` |
+| `proxy_cache` | `[route.cache]` | ≈ memory and disk, `stale_while_revalidate`, `stale_if_error`; for HTTP/1.1 clients (HTTP/2 and HTTP/3: F-257) |
 | `proxy_cache_key` | `include_query`, `key_headers` | ≈ |
 | unix socket upstream (`unix:/run/app.sock`) | `url = "http://unix:/run/app.sock"` | = |
 

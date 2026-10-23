@@ -22,7 +22,7 @@ Envoy 1.36 と veil 0.9 で確かめました。下の完全な設定例はす�
 | `filter_chains[].transport_socket`（`DownstreamTlsContext`） | `[tls]` | 証明書は 1 組（TOML のリスナーでは、複数の証明書を SNI で選べない）。 |
 | `http_connection_manager` | 組み込み | 上のリスナーで HTTP/1.1・HTTP/2・h2c・HTTP/3。 |
 | `route_config.virtual_hosts[].domains` | `[route.conditions] host` | 完全一致と `*.example.com`。 |
-| `routes[].match` | `[route.conditions]` | `prefix` → `path = "/x/*"`、`path` → 完全一致の `path`、`headers` → `header`、`query_parameters` → `query`。`safe_regex` は無い。 |
+| `routes[].match` | `[route.conditions]` | `prefix` → `path = "/x/*"`、`path` → `path = "/x"`（完全一致）、`headers` → `header`、`query_parameters` → `query`。`safe_regex` は無い。 |
 | `routes[].route.cluster` | `[route.action] type = "Proxy"`、`upstream = "<cluster>"` | |
 | `clusters[]` | `[upstreams."<name>"]` | `lb_policy`、ヘルスチェック、外れ値の検出、サーキットブレーカー。 |
 | `load_assignment.endpoints` | `servers = [...]` | 重み付きの URL。 |
@@ -39,8 +39,8 @@ virtual host の階層が無いので、各ルートに `host` 条件を書き�
 
 | Envoy | veil | |
 |---|---|---|
-| `match: { prefix: "/api/" }` | `path = "/api/*"` | = |
-| `match: { path: "/healthz" }` | `path = "/healthz"` | ≈ File のルートでは完全一致。他の action では `/healthz/...` にも当たる |
+| `match: { prefix: "/api/" }` | `path = "/api/*"` | = （`/api` にも当たる） |
+| `match: { path: "/healthz" }` | `path = "/healthz"` | = 完全一致（`*` の無い `path` は完全一致。`"/"` だけは全パスに当たる） |
 | `match: { safe_regex: ... }` | — | — 前方一致で書くか、Proxy-Wasm のフィルタ |
 | `headers: [{ name, string_match }]` | `header = { "X-Version" = "v2" }` | ≈ 完全一致の値 |
 | `query_parameters` | `query = { "token" = "..." }` | ≈ 完全一致の値 |
@@ -70,7 +70,7 @@ virtual host の階層が無いので、各ルートに `host` 条件を書き�
 | `rbac` | `allowed_ips` / `denied_ips` / `allowed_methods`、`[tls] client_allowed_sans` | ≈ |
 | `ext_authz` | — | — 予定（F-229） |
 | `compressor`（gzip・brotli・zstd） | `[route.compression]` | = |
-| `cache` | `[route.cache]` | = |
+| `cache` | `[route.cache]` | ≈ HTTP/1.1 のクライアントの要求だけ（HTTP/2・HTTP/3 は F-257） |
 | `buffer` | `[route.buffering] mode = "full"` | = |
 | `grpc_web` | プロキシのルートには無い | — API ライブラリは gRPC-Web を自分で受ける（[library.md](library.md)）。プロキシのルートでは上流で変換する |
 | `wasm` | Proxy-Wasm の `modules` | = |
@@ -176,6 +176,7 @@ path = "/healthz"
 type = "Respond"
 status = 200
 body = "ok"
+content_type = "text/plain"   # Envoy's direct_response sends text/plain
 
 [[route]]
 [route.conditions]

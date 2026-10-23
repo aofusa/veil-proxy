@@ -1,0 +1,10 @@
+[server]
+listen_cleartext = "0.0.0.0:8080"
+enable_secure_redirect = false
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+index = "index.html"

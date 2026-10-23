@@ -38,7 +38,7 @@ servers = ["http://app:9000", "http://missing-app:9000"]
 [[route]]
 [route.conditions]
 host = "api.example"
-path = "/cached/"
+path = "/cached/*"
 [route.action]
 type = "Proxy"
 upstream = "app"

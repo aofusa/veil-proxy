@@ -1,0 +1,3 @@
+GET old.example.com /some/page?x=1
+GET api.example.com /healthz
+GET api.example.com /v1/items
