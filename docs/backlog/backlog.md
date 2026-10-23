@@ -475,6 +475,7 @@
 | B-160 | P1 | 完了 | [bugs/B-160-relative-file-root-403-http1.md](bugs/B-160-relative-file-root-403-http1.md) | File のルートを相対パスで書くと Linux の HTTP/1.1 の静的配信が全件 403（openat2 で開いた生パスを canonical 形とだけ比べていた）。生の `base_path` 配下の許可を全 OS に広げた |
 | B-161 | P1 | 完了 | [bugs/B-161-startup-failure-exit-zero.md](bugs/B-161-startup-failure-exit-zero.md) | 設定・bind などで起動に失敗しても終了コードが 0（systemd の Restart=on-failure などが気づけない）。起動を終える前に戻ったら終了コード 1 |
 | B-162 | P1 | 完了 | [bugs/B-162-proxy-cache-small-responses-never-stored.md](bugs/B-162-proxy-cache-small-responses-never-stored.md) | プロキシのキャッシュが、最初の読み込みに収まる小さい応答を一度も保存しない（残りの本文を転送するときにしか保存していなかった）。E2E は本文の一致で通っていた |
+| B-163 | P1 | 完了 | [bugs/B-163-sandbox-barrier-cleartext-only.md](bugs/B-163-sandbox-barrier-cleartext-only.md) | 平文のリスナーだけの設定で、FreeBSD は capability mode の要求で起動を中止し、OpenBSD の pledge・macOS の sandbox_init は黙って掛からない（bind のバリアが TLS のワーカーだけを数えていた）。平文のワーカーも数え、時間切れは fail-closed |
 
 ---
 

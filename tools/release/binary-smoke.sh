@@ -69,6 +69,17 @@ serve_check() {
 # 2. -c
 serve_check "-c examples/config.toml" "$BIN" -c examples/smoke.toml
 grep -q 'from -c' "$LOG" && ok "-c: startup log names the source" || bad "-c: no 'from -c' in the startup log"
+# その OS のサンドボックスが例の設定で掛かったこと（掛からないまま動いていないこと。B-163）
+case "$(uname -s)" in
+    Linux) expect=("seccomp filter applied" "Landlock filesystem restrictions applied") ;;
+    FreeBSD) expect=("capsicum: capability mode active") ;;
+    OpenBSD) expect=("pledge: promises restricted" "unveil: locked") ;;
+    Darwin) expect=("macos sandbox: sandbox_init applied") ;;
+    *) expect=() ;;
+esac
+for e in "${expect[@]}"; do
+    grep -qF "$e" "$LOG" && ok "sandbox: $e" || bad "sandbox not applied: no '$e' in the startup log"
+done
 # 3. VEIL_CONFIG
 serve_check "VEIL_CONFIG" env VEIL_CONFIG=examples/smoke.toml "$BIN"
 grep -q 'from VEIL_CONFIG' "$LOG" && ok "VEIL_CONFIG: startup log names the source" || bad "VEIL_CONFIG: no 'from VEIL_CONFIG'"

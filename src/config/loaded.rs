@@ -1039,8 +1039,6 @@ pub fn reresolve_routes_after_chroot(
 pub enum CapModeBlocker {
     /// `[[l4]]` リスナーがある
     L4,
-    /// 平文のリスナー（`[server].listen_cleartext`、F-200）がある
-    Cleartext,
     /// HTTP/3 が有効
     Http3,
 }
@@ -1050,7 +1048,6 @@ impl CapModeBlocker {
     pub fn as_str(self) -> &'static str {
         match self {
             CapModeBlocker::L4 => "[[l4]] listeners require bind(2)/connect(2)",
-            CapModeBlocker::Cleartext => "[server].listen_cleartext requires an extra listener",
             CapModeBlocker::Http3 => "HTTP/3 requires an extra UDP listener",
         }
     }
@@ -1092,8 +1089,7 @@ pub fn capability_mode_decision(
 #[cfg(any(target_os = "freebsd", test))]
 pub struct CapModeFacts {
     pub has_l4: bool,
-    /// `[server].listen_cleartext` がある（F-200）
-    pub cleartext: bool,
+    // B-163: 平文のリスナー（listen_cleartext）は阻害要因ではない（そのワーカーの bind もバリアで待つ）
     pub http3: bool,
 }
 
@@ -1102,9 +1098,6 @@ pub struct CapModeFacts {
 pub fn capability_mode_blocker(facts: &CapModeFacts) -> Option<CapModeBlocker> {
     if facts.has_l4 {
         return Some(CapModeBlocker::L4);
-    }
-    if facts.cleartext {
-        return Some(CapModeBlocker::Cleartext);
     }
     if facts.http3 {
         return Some(CapModeBlocker::Http3);
@@ -1203,11 +1196,7 @@ pub(super) fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
     let http3 = config.http3.enabled;
     #[cfg(not(feature = "http3"))]
     let http3 = false;
-    let facts = CapModeFacts {
-        has_l4,
-        cleartext: config.server.listen_cleartext.is_some(),
-        http3,
-    };
+    let facts = CapModeFacts { has_l4, http3 };
     if let Some(b) = capability_mode_blocker(&facts) {
         return reject(b.as_str().to_string());
     }
