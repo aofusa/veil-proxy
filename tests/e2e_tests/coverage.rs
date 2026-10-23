@@ -50,8 +50,8 @@ pub(super) async fn test_e2e_cached_small_response_hits() {
         return;
     }
 
-    // ルートの TTL は 1 秒。直前の試験の保存と混ざらないように、ほかで使わないクエリを付ける
-    let path = "/cached/index.html?b162";
+    // 平文の上流のルート（HTTPS の上流はキャッシュに保存しない。F-257）。ほかで使わないクエリを付ける
+    let path = "/cached-plain/index.html?b162";
     let r1 = send_request(PROXY_PORT, path, &[]).await;
     assert!(r1.is_some(), "First /cached/ request should succeed");
     assert_eq!(get_status_code(&r1.unwrap()), Some(200));

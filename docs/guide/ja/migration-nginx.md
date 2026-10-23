@@ -104,7 +104,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |
 | `max_fails=` / `fail_timeout=`（受動的） | `[upstreams.X.outlier_detection]` / `circuit_breaker` | ≈ 能動的な `health_check` もある（nginx は Plus のみ） |
 | `split_clients`（カナリア） | `[route.traffic] split` | = |
-| `proxy_cache` | `[route.cache]` | ≈ メモリとディスク、`stale_while_revalidate`、`stale_if_error`。HTTP/1.1 のクライアントの要求だけ（HTTP/2・HTTP/3 は F-257） |
+| `proxy_cache` | `[route.cache]` | ≈ メモリとディスク、`stale_while_revalidate`、`stale_if_error`。HTTP/1.1 のクライアントと `http://` の上流だけ（ほかは F-257） |
 | `proxy_cache_key` | `include_query`・`key_headers` | ≈ |
 | UNIX ソケットの上流（`unix:/run/app.sock`） | `url = "http://unix:/run/app.sock"` | = |
 

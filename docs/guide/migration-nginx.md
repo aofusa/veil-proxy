@@ -105,7 +105,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |
 | `max_fails=` / `fail_timeout=` (passive) | `[upstreams.X.outlier_detection]` / `circuit_breaker` | ≈ plus active `health_check` (nginx Plus only) |
 | `split_clients` (canary) | `[route.traffic] split` | = |
-| `proxy_cache` | `[route.cache]` | ≈ memory and disk, `stale_while_revalidate`, `stale_if_error`; for HTTP/1.1 clients (HTTP/2 and HTTP/3: F-257) |
+| `proxy_cache` | `[route.cache]` | ≈ memory and disk, `stale_while_revalidate`, `stale_if_error`; for HTTP/1.1 clients and `http://` upstreams (the rest: F-257) |
 | `proxy_cache_key` | `include_query`, `key_headers` | ≈ |
 | unix socket upstream (`unix:/run/app.sock`) | `url = "http://unix:/run/app.sock"` | = |
 

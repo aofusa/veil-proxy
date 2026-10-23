@@ -70,7 +70,7 @@ routes first. veil has no separate virtual-host level: write the `host` conditio
 | `rbac` | `allowed_ips` / `denied_ips` / `allowed_methods`, `[tls] client_allowed_sans` | ≈ |
 | `ext_authz` | — | — planned (F-229) |
 | `compressor` (gzip, brotli, zstd) | `[route.compression]` | = |
-| `cache` | `[route.cache]` | ≈ for HTTP/1.1 clients (HTTP/2 and HTTP/3: F-257) |
+| `cache` | `[route.cache]` | ≈ for HTTP/1.1 clients and `http://` upstreams (the rest: F-257) |
 | `buffer` | `[route.buffering] mode = "full"` | = |
 | `grpc_web` | — on proxy routes | — the API library serves gRPC-Web itself ([library.md](library.md)); on proxy routes translate in the backend |
 | `wasm` | Proxy-Wasm `modules` | = |
