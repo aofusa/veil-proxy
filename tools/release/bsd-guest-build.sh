@@ -16,14 +16,16 @@ log() { echo "==> $*"; }
 case "$OS" in
 freebsd)
     log "pkg install"
-    env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf
+    env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm pkgconf
     LIBCLANG_PATH="$(find /usr/local -name 'libclang.so*' 2>/dev/null | head -1 | xargs dirname)"; export LIBCLANG_PATH
     FEATURES=full-freebsd
     ;;
 openbsd)
     P="https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -p)/"
     log "pkg_add ($P)"
-    env PKG_PATH="$P" pkg_add -I rust cmake gmake protobuf bash curl git
+    # curl はイメージに新しい版が入っていることがあり、パッケージと衝突する（入っていなければ入れる）
+    env PKG_PATH="$P" pkg_add -I rust cmake gmake protobuf bash
+    command -v curl >/dev/null || env PKG_PATH="$P" pkg_add -I curl
     if ! find /usr/local -name 'libclang*so*' 2>/dev/null | grep -q .; then
         LLVM="$(env PKG_PATH="$P" pkg_info -Q llvm 2>/dev/null | grep -E '^llvm-[0-9]' | sort -V | tail -1)"
         env PKG_PATH="$P" pkg_add -I "$LLVM"
@@ -49,7 +51,7 @@ netbsd)
     log "pkgin ($PKG_PATH)"
     [ -x /usr/pkg/bin/pkgin ] || /usr/sbin/pkg_add pkgin
     pkgin -y update
-    pkgin -y install rust-bin cmake llvm clang protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl
+    pkgin -y install rust-bin cmake llvm clang protobuf gmake bash curl nasm pkgconf mozilla-rootcerts-openssl
     mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
     LIBCLANG_PATH="$(find -L /usr/pkg -name 'libclang.so*' 2>/dev/null | head -1 | xargs dirname)"; export LIBCLANG_PATH
     [ "$ARCH" = aarch64 ] && export CFLAGS_aarch64_unknown_netbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'
