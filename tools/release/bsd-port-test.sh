@@ -89,11 +89,10 @@ openbsd)
     env PKG_PATH="$P" pkg_add -I git rust cmake gmake protobuf bash cargo-generate-vendor
     log "ports の木"
     # ports の木はパッケージと同じ版（リリースの ports.tar.gz）を使う。GitHub の mirror は -current だけで、
-    # -current の devel/cargo はリリースの cargo-generate-vendor が知らない引数を渡す。要る所だけを展開する
+    # -current の devel/cargo はリリースの cargo-generate-vendor が知らない引数を渡す。package を作るときに
+    # 依存の依存まで ports の木を辿る（archivers/zstd → archivers/lz4 …）ので、一部ではなく全部を展開する
     if [ ! -d /usr/ports/infrastructure ]; then
-        ftp -o - "https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/ports.tar.gz" | tar -xzf - -C /usr \
-            ports/infrastructure ports/devel/cargo ports/lang/rust ports/lang/clang ports/lang/python ports/devel/llvm \
-            ports/archivers/zstd
+        ftp -o - "https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/ports.tar.gz" | tar -xzf - -C /usr
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
@@ -149,6 +148,10 @@ netbsd)
     fi
     mkdir -p "$(dirname /usr/pkgsrc/www/veil)" && rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
+    # port の依存（DEPENDS・TOOL_DEPENDS の ../../<cat>/<pkg>）も木に要る（無いと依存を入れる所で
+    # 「reduce-depends.awk: ... does not exist」で止まる）
+    # shellcheck disable=SC2046
+    git -C /usr/pkgsrc sparse-checkout add $(sed -n 's|.*\.\./\.\./\([a-z0-9]*/[A-Za-z0-9_.+-]*\).*|\1|p' Makefile | grep -v "^mk/" | sort -u)
     # buildlink3.mk・compiler の mk は他の package の makefile を間接に読む（lang/libunwind・lang/gccNN など）。
     # 足りないと「Could not find ../../<cat>/<pkg>/...」で止まるので、それを sparse の木に足して読み直す
     i=0
