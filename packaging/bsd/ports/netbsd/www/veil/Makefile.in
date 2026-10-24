@@ -25,8 +25,8 @@ USE_TOOLS+=	gmake pkg-config
 
 CARGO_NO_DEFAULT_FEATURES=	yes
 CARGO_FEATURES=	full-netbsd
-# veil reads ${PKG_SYSCONFDIR}/veil/config.toml by default (built in at compile time).
-MAKE_ENV+=	VEIL_DEFAULT_CONFIG_PATH=${PKG_SYSCONFDIR}/veil/config.toml
+# veil reads ${PKG_SYSCONFDIR}/config.toml by default (built in at compile time; PKG_SYSCONFDIR already ends in veil).
+MAKE_ENV+=	VEIL_DEFAULT_CONFIG_PATH=${PKG_SYSCONFDIR}/config.toml
 MAKE_ENV+=	LIBCLANG_PATH=${PREFIX}/lib
 .if ${MACHINE_ARCH} == "aarch64"
 MAKE_ENV+=	CFLAGS_aarch64_unknown_netbsd="-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON"
