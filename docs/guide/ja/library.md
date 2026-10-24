@@ -457,8 +457,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
 # 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.0", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.0" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.1" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は

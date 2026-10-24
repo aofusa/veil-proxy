@@ -11,8 +11,8 @@ veil = { package = "veil-proxy", version = "0.8", default-features = false, feat
 hyper = { version = "1", features = ["server", "http1"] }   # tokio を使うクレート
 
 [patch.crates-io]
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.0", package = "tokio" }   # crates/veil-tokio/tokio-shim（パッケージ名 tokio、版 1.99.0）
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.0" }   # シムと同じ 1 つの veil にする
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.1", package = "tokio" }   # crates/veil-tokio/tokio-shim（パッケージ名 tokio、版 1.99.0）
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.9.1" }   # シムと同じ 1 つの veil にする
 ```
 
 シムはパッケージ名が `tokio` なので crates.io には公開しない（F-238。crates.io の依存を crates.io の別名のパッケージで

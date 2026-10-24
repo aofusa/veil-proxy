@@ -40,7 +40,7 @@ resolver = "2"
 # （ルートから veil-macros への依存の版と、ワークスペース外の Cargo.lock も一緒に更新する）。
 # 公開の workflow（.github/workflows/release.yml）はタグとこの版が違えば何も公開しない。
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
@@ -705,7 +705,7 @@ regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
-veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.9.0", optional = true }
+veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.9.1", optional = true }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }
