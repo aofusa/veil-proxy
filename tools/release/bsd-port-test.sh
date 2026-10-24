@@ -92,7 +92,8 @@ openbsd)
     # -current の devel/cargo はリリースの cargo-generate-vendor が知らない引数を渡す。要る所だけを展開する
     if [ ! -d /usr/ports/infrastructure ]; then
         ftp -o - "https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/ports.tar.gz" | tar -xzf - -C /usr \
-            ports/infrastructure ports/devel/cargo ports/lang/rust ports/lang/clang ports/lang/python ports/devel/llvm
+            ports/infrastructure ports/devel/cargo ports/lang/rust ports/lang/clang ports/lang/python ports/devel/llvm \
+            ports/archivers/zstd
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     cd /usr/ports/www/veil
@@ -131,7 +132,8 @@ netbsd)
     log "pkgin（依存）"
     [ -x /usr/pkg/bin/pkgin ] || /usr/sbin/pkg_add pkgin
     pkgin -y update
-    pkgin -y install git-base rust cmake gmake protobuf bash clang nasm pkgconf mozilla-rootcerts-openssl
+    # digest: make makesum・checksum が使う（無いと distinfo にクレートの SHA512 が入らず、checksum で止まる）
+    pkgin -y install git-base rust cmake gmake protobuf bash clang nasm pkgconf mozilla-rootcerts-openssl digest
     # pkgsrc は PKG_PATH があると止まる（pkg_add の取得先。pkgin は repositories.conf を使う）。足りない依存は
     # ソースからビルドせず（clang などは何時間もかかる）、同じ取得先のバイナリのパッケージで入れる
     grep -q '^DEPENDS_TARGET' /etc/mk.conf 2>/dev/null || printf 'DEPENDS_TARGET=\tbin-install\nBINPKG_SITES=\t%s\n' "${PKG_PATH%/All/}" >> /etc/mk.conf
