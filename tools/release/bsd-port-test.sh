@@ -95,6 +95,16 @@ openbsd)
         ftp -o - "https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/ports.tar.gz" | tar -xzf - -C /usr
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
+    # @newuser は infrastructure/db/user.list に登録されていないと pkg_create が止まる（提出のときに空きの番号を取る。
+    # 試験では port の雛形の番号で登録する）
+    uid="$(sed -n 's|^@newuser _veil:\([0-9]*\):.*|\1|p' /usr/ports/www/veil/pkg/PLIST)"
+    UL=/usr/ports/infrastructure/db/user.list
+    if ! grep -q '[[:space:]]_veil[[:space:]]' "$UL"; then
+        # 利用者は「番号 名前 group port」、group は「番号 名前 port」の行
+        printf '%s _veil\t\t_veil\t\twww/veil\n' "$uid" >> "$UL"
+        printf '%s _veil\t\twww/veil\n' "$uid" >> "$UL"
+    fi
+    grep -n '_veil\|^# *[A-Z]' "$UL" | tail -8
     cd /usr/ports/www/veil
     # lang/clang の module が使う版の llvm（LIBCLANG_PATH は ${LOCALBASE}/llvm${MODCLANG_VERSION}/lib）
     MODCLANG_VERSION="$(make show=MODCLANG_VERSION)"; echo "MODCLANG_VERSION=$MODCLANG_VERSION"
@@ -168,6 +178,16 @@ netbsd)
     # クレートが distinfo に入ったか（入っていなければ make package の checksum で止まる）
     echo "distfiles: $(make show-var VARNAME=DISTFILES | wc -w), in distinfo: $(grep -c '^SHA512' distinfo)"
     cp distinfo "$OUT/distinfo.netbsd"
+    # 依存を入れる所（reduce-depends.awk）は依存の dir も読む（buildlink3.mk が足す devel/pkgconf など）。
+    # 「... does not exist」の dir を疎な木に足して入れ直す
+    i=0
+    while ! make depends >"$OUT/depends.log" 2>&1; do
+        miss="$(sed -n 's|.*reduce-depends.awk\] \.\./\.\./\([^ ]*\) does not exist.*|\1|p' "$OUT/depends.log" | sort -u)"
+        i=$((i + 1)); [ -n "$miss" ] && [ "$i" -le 20 ] || { tail -30 "$OUT/depends.log"; exit 1; }
+        echo "pkgsrc: adding $miss"
+        # shellcheck disable=SC2086
+        git -C /usr/pkgsrc sparse-checkout add $miss
+    done
     log "make package"
     make package >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/pkgsrc/packages/All/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
