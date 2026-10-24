@@ -204,6 +204,9 @@ netbsd)
     sleep 3
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "runs as veil" sh -c 'ps -axo user,comm | grep -E "^veil +veil" >/dev/null'
+    # 降格の結果（失敗したときの手掛かり）
+    ps -axo user,uid,ruser,comm,args | grep '[v]eil' || true
+    tail -20 /var/log/messages 2>/dev/null | grep -i veil || true
     check "service veil stop" /etc/rc.d/veil stop
     sleep 2
     check "no veil left after stop" sh -c '! pgrep -x veil'
