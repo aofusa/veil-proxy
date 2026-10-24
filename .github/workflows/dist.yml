@@ -385,7 +385,7 @@ jobs:
         if: always()
         run: |
           if [ -f out/build.log ]; then
-            grep -E '^(ok|FAIL|BINARY SMOKE|test result)' out/build.log | sed 's/^/::notice title=${{ matrix.os }}::/' || true
+            grep -E '^(ok|FAIL|FLAKY|BINARY SMOKE|test result)' out/build.log | sed 's/^/::notice title=${{ matrix.os }}::/' || true
             # 起動の試験で落ちたときの veil の ERROR・WARN の行
             grep -E 'ERROR|WARN|panicked|running but not|exited with' out/build.log | grep -v 'type=access' | head -15 \
               | while IFS= read -r l; do echo "::warning title=${{ matrix.os }} veil::${l:0:600}"; done || true
@@ -412,8 +412,10 @@ jobs:
     name: port ${{ matrix.os }}
     if: inputs.bsd
     runs-on: ubuntu-24.04
-    # 呼ぶ側（release の draft）は dist の全 job を待つので、止めない試験でも長くは待たせない（FreeBSD は 15 分ほど）
-    timeout-minutes: 90
+    # 呼ぶ側（release の draft）は dist の全 job を待つので、止めない試験でも長くは待たせない（FreeBSD は 15 分ほど）。
+    # 時間切れは job ではなく VM の step に付ける: job の時間切れは cancelled になり、continue-on-error でも
+    # dist 全体が cancelled になって draft が飛ばされる（v0.9.0 の NetBSD）。step の時間切れは失敗で済む
+    timeout-minutes: 110
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -435,6 +437,9 @@ jobs:
           v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
           git archive --format=tar.gz --prefix="veil-proxy-$v/" -o ports-out/src.tar.gz HEAD
       - name: build the port, install the package, start the service
+        id: vm
+        timeout-minutes: 85
+        continue-on-error: true
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
           operating_system: ${{ matrix.os }}
@@ -457,6 +462,11 @@ jobs:
         if: always()
         run: |
           grep -E '^(ok|FAIL|PORT TEST)' ports-out/test.log | sed 's/^/::notice title=port ${{ matrix.os }}::/' || true
+          if [ "${{ steps.vm.outcome }}" != success ]; then
+            echo "::error title=port ${{ matrix.os }}::the VM step did not finish (timed out or the VM stopped)"
+            tail -12 ports-out/test.log 2>/dev/null | while IFS= read -r l; do echo "::warning title=port ${{ matrix.os }} tail::${l:0:800}"; done
+            exit 1
+          fi
           if grep -q PORT_FAILED ports-out/test.log; then
             grep -E 'PORT STEP FAILED|^==>|[Ee]rror|No space|not found|fatal|Stop\.|\*\*\*' ports-out/test.log | tail -25 \
               | while IFS= read -r l; do echo "::error title=port ${{ matrix.os }}::${l:0:800}"; done

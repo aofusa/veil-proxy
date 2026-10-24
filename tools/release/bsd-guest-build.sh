@@ -94,11 +94,25 @@ if [ "${VEIL_BSD_UNIT_TESTS:-1}" = 1 ]; then
         export CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_RUNNER=/tmp/paxrun.sh
     fi
     # パイプで繋がない（sh に pipefail が無い OS があり、失敗が tail の終了コードに隠れる）
-    if CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
-        cargo test --locked --lib --no-default-features --features "$FEATURES" > "$OUT/unit-$TARGET.log" 2>&1; then
+    unit() {
+        CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
+            cargo test --locked --lib --no-default-features --features "$FEATURES" "$@"
+    }
+    if unit > "$OUT/unit-$TARGET.log" 2>&1; then
         grep '^test result' "$OUT/unit-$TARGET.log"
     else
-        tail -60 "$OUT/unit-$TARGET.log"; exit 1
+        # 負荷のかかった VM では、ローカルの模擬サーバを使う試験がまれに時間切れで落ちる（v0.9.0 の OpenBSD で
+        # test_perform_grpc_health_check_success）。落ちた試験だけを 1 回やり直し、通れば FLAKY として報告して続ける。
+        failed="$(sed -n 's/^---- \([^ ]*\) stdout ----$/\1/p' "$OUT/unit-$TARGET.log")"
+        tail -60 "$OUT/unit-$TARGET.log"
+        [ -n "$failed" ] || exit 1
+        # shellcheck disable=SC2086
+        if unit -- --exact $failed > "$OUT/unit-retry-$TARGET.log" 2>&1; then
+            for t in $failed; do echo "FLAKY: $t failed once and passed on retry"; done
+            grep '^test result' "$OUT/unit-retry-$TARGET.log"
+        else
+            tail -40 "$OUT/unit-retry-$TARGET.log"; exit 1
+        fi
     fi
 fi
 
