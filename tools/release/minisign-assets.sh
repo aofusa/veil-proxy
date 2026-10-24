@@ -16,7 +16,13 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
     --certificate-identity-regexp '^https://github.com/aofusa/veil-proxy/\.github/workflows/release\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c --ignore-missing SHA256SUMS
-umask 077; printf '%s\n' "${MINISIGN_SECRET_KEY:?}" > "$W/minisign.key"
+# 鍵のファイルは「untrusted comment: …」の行と鍵の行の 2 行。secret に鍵の行だけを入れると minisign は
+# 「Error while loading the secret key file」で止まるので、コメントの行が無ければ足す
+umask 077
+case "${MINISIGN_SECRET_KEY:?}" in
+    "untrusted comment:"*) printf '%s\n' "$MINISIGN_SECRET_KEY" > "$W/minisign.key" ;;
+    *) printf 'untrusted comment: veil release signing\n%s\n' "$(printf '%s' "$MINISIGN_SECRET_KEY" | tr -d '\r\n ')" > "$W/minisign.key" ;;
+esac
 for f in *.tar.gz *.zip; do
     minisign -S -s "$W/minisign.key" -m "$f" -x "$f.sig" -t "veil $TAG $f" </dev/null
 done

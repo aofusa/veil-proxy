@@ -26,5 +26,15 @@ cd "$W/tap"
 git add Formula/veil.rb .github/workflows/test.yml README.md
 if git diff --cached --quiet; then echo "formula already at $VER"; exit 0; fi
 git -c user.name="veil release" -c user.email="aofusa@users.noreply.github.com" commit -q -m "veil $VER"
-git push -q origin HEAD
+if ! git push -q origin HEAD 2>"$W/push.err"; then
+    cat "$W/push.err" >&2
+    # token に Workflows の書き込みが無いと .github/workflows を含む push は拒まれる。formula と README だけを置き、
+    # tap の CI は token に権限を足した後の版で置く
+    grep -q 'without `workflow` scope' "$W/push.err" || exit 1
+    echo "::warning title=Homebrew::HOMEBREW_TAP_TOKEN cannot write workflows: pushed the formula without the tap's CI (.github/workflows/test.yml). Give the token Workflows: Read and write to add it"
+    git reset -q --soft HEAD~1 2>/dev/null || git update-ref -d HEAD
+    git rm -q --cached .github/workflows/test.yml
+    git -c user.name="veil release" -c user.email="aofusa@users.noreply.github.com" commit -q -m "veil $VER"
+    git push -q origin HEAD
+fi
 echo "pushed veil $VER to $TAP"

@@ -3,7 +3,8 @@
 #
 #   tools/release/mirror-dockerhub.sh <tag> <prerelease:true|false>
 #
-# - cosign copy で、版のタグの index・署名・SBOM の添付をそのまま写す（digest は ghcr.io と同じ）
+# - oras copy -r で、版のタグの index と、それを指す署名・SBOM（OCI の referrer）をそのまま写す（digest は ghcr.io と同じ）。
+#   cosign v3 の署名は referrer なので、cosign copy（非推奨）では Docker Hub の cosign verify が署名を見つけられない
 # - 正式版なら latest・musl・glibc を同じ digest に付ける
 # - 写した後、digest が ghcr.io と同じで cosign verify が通ることを確かめる
 # - Docker Hub の説明（短い説明と packaging/container/dockerhub.md）を API で更新する
@@ -18,7 +19,7 @@ digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}
 for variant in musl glibc; do
     src="$SRC:$variant-$TAG"
     d="$(digest_of "$src")"
-    cosign copy --force "$src" "$DST:$variant-$TAG"
+    oras copy -r "$src" "$DST:$variant-$TAG"
     got="$(digest_of "$DST:$variant-$TAG")"
     [ "$got" = "$d" ] || { echo "::error title=Docker Hub::$DST:$variant-$TAG is $got, ghcr.io has $d"; exit 1; }
     if [ "$PRE" != true ]; then

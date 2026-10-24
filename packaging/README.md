@@ -601,10 +601,10 @@ git tag v0.9.0      && git push origin v0.9.0        # 本番の draft を作る
 
    | secret | 用途 |
    |---|---|
-   | `MINISIGN_SECRET_KEY` | アーカイブの minisign の署名（公開鍵は `Cargo.toml` の `[package.metadata.binstall.signing]`） |
+   | `MINISIGN_SECRET_KEY` | アーカイブの minisign の署名（鍵のファイルの中身。公開鍵は `Cargo.toml` の `[package.metadata.binstall.signing]`） |
    | `DOCKERHUB_USERNAME`・`DOCKERHUB_TOKEN` | `docker.io/aofusa/veil`（Read・Write・Delete の権限、そのリポジトリだけ） |
-   | `HOMEBREW_TAP_TOKEN` | `aofusa/homebrew-tap` の Contents の書き込み（fine-grained） |
-   | `PACKAGES_TOKEN`・`PACKAGES_GPG_KEY` | `aofusa/veil-packages`（GitHub Pages）の Contents の書き込みと、署名用の副鍵 |
+   | `HOMEBREW_TAP_TOKEN` | `aofusa/homebrew-tap` の Contents と Workflows の書き込み（fine-grained。Workflows が無いと tap の CI を置かずに formula だけを push する） |
+   | `PACKAGES_TOKEN`・`PACKAGES_GPG_KEY` | `aofusa/veil-packages`（GitHub Pages）の Contents の書き込みと、署名用の副鍵。空のリポジトリでは Pages を設定できないので、最初の公開で main ができた後に Pages を main / (root) にする |
    | `WINGET_TOKEN` | winget-pkgs の fork への push と PR（最初の版は人が `wingetcreate submit` で出す） |
 
 ## インストール
