@@ -20,14 +20,15 @@ fi
 
 echo "sbom start image=${VEIL_IMAGE}" | tee "${REPORT}"
 
-# 1) ソースツリー（Cargo.lock）から CycloneDX JSON
+# 1) ソースツリー（Cargo.lock）から CycloneDX JSON。スキーマの版は固定する（syft の既定の 1.7 は、scan-action の
+#    grype 0.97 が「sbom format not recognized」で読めない）
 docker run --rm \
     -v "${REPO_ROOT}:/src:ro" \
     -v "${RESULTS_DIR}:/results:rw" \
     "${SYFT_IMAGE}" \
     scan dir:/src --source-name veil-src \
     --exclude './target/**' --exclude './fuzz/target/**' --exclude './.git/**' \
-    -o cyclonedx-json=/results/sbom_source.cdx.json 2>&1 | tee -a "${REPORT}" || true
+    -o cyclonedx-json@1.6=/results/sbom_source.cdx.json 2>&1 | tee -a "${REPORT}" || true
 
 # 2) コンテナイメージ（docker デーモン経由）から SPDX JSON
 docker run --rm \

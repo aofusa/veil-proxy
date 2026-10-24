@@ -66,6 +66,14 @@ jobs:
             -t "veil:${{ matrix.libc }}" \
             --build-arg CARGO_FEATURES='full' ..
 
+      # 試験用の自己署名証明書（git に入れない。docker/README.md と同じ作り方。無いと run.sh が起動の前に止まる）
+      - name: TLS certificate for the tests
+        run: |
+          openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
+            -keyout docker/assets/ssl/key.pem -out docker/assets/ssl/cert.pem -days 30 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints=critical,CA:FALSE"
+          chmod 644 docker/assets/ssl/key.pem
       - name: Run container security suite
         env:
           VEIL_IMAGE: "veil:${{ matrix.libc }}"
@@ -124,6 +132,14 @@ jobs:
         run: |
           docker build -f Dockerfile.glibc -t "veil:glibc" \
             --build-arg CARGO_FEATURES='full' ..
+      # 試験用の自己署名証明書（git に入れない。docker/README.md と同じ作り方。無いと run.sh が起動の前に止まる）
+      - name: TLS certificate for the tests
+        run: |
+          openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
+            -keyout docker/assets/ssl/key.pem -out docker/assets/ssl/cert.pem -days 30 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints=critical,CA:FALSE"
+          chmod 644 docker/assets/ssl/key.pem
       - name: Run extended chaos + DAST
         env:
           VEIL_IMAGE: "veil:glibc"
@@ -173,6 +189,14 @@ jobs:
         run: |
           docker build -f Dockerfile.glibc -t "veil:glibc" \
             --build-arg CARGO_FEATURES='full' ..
+      # 試験用の自己署名証明書（git に入れない。docker/README.md と同じ作り方。無いと run.sh が起動の前に止まる）
+      - name: TLS certificate for the tests
+        run: |
+          openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
+            -keyout docker/assets/ssl/key.pem -out docker/assets/ssl/cert.pem -days 30 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints=critical,CA:FALSE"
+          chmod 644 docker/assets/ssl/key.pem
       - name: Run sanitizer phases
         env:
           VEIL_IMAGE: "veil:glibc"
