@@ -157,7 +157,7 @@ netbsd)
         echo "pkgsrc branch: $BRANCH"
         git clone -q --depth 1 --branch "$BRANCH" --filter=blob:none --sparse https://github.com/NetBSD/pkgsrc.git /usr/pkgsrc
         git -C /usr/pkgsrc sparse-checkout set mk lang/rust lang/python devel/cmake devel/protobuf shells/bash lang/clang \
-            devel/nasm devel/gmake pkgtools
+            devel/nasm devel/gmake pkgtools sysutils/install-sh
     fi
     mkdir -p "$(dirname /usr/pkgsrc/www/veil)" && rm -rf /usr/pkgsrc/www/veil && cp -R "$OUT/ports/netbsd/www/veil" /usr/pkgsrc/www/veil
     cd /usr/pkgsrc/www/veil
@@ -179,7 +179,10 @@ netbsd)
     # 木の外の無視されたファイルだけの dir＝distfiles を消す）
     i=0
     while ! make depends >"$OUT/depends.log" 2>&1; do
-        miss="$(sed -n 's|.*reduce-depends.awk\] \.\./\.\./\([^ ]*\) does not exist.*|\1|p' "$OUT/depends.log" | sort -u)"
+        # 「reduce-depends.awk] ../../<cat>/<pkg> does not exist」と、道具を作るときの「/usr/pkgsrc/<cat>/<pkg>/...: No such file」
+        # （pkgtools/mktools → libnbcompat が sysutils/install-sh を読む）
+        miss="$( { sed -n 's|.*reduce-depends.awk\] \.\./\.\./\([^ ]*\) does not exist.*|\1|p' "$OUT/depends.log"
+            sed -n 's|.*/usr/pkgsrc/\([a-z0-9]*/[A-Za-z0-9_.+-]*\)/[^ ]*: No such file or directory.*|\1|p' "$OUT/depends.log"; } | sort -u)"
         i=$((i + 1)); [ -n "$miss" ] && [ "$i" -le 20 ] || { tail -30 "$OUT/depends.log"; exit 1; }
         echo "pkgsrc: adding $miss"
         # shellcheck disable=SC2086
