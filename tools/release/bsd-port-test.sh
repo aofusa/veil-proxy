@@ -96,13 +96,16 @@ openbsd)
     fi
     mkdir -p "$(dirname /usr/ports/www/veil)" && rm -rf /usr/ports/www/veil && cp -R "$OUT/ports/openbsd/www/veil" /usr/ports/www/veil
     # @newuser は infrastructure/db/user.list に登録されていないと pkg_create が止まる（提出のときに空きの番号を取る。
-    # 試験では port の雛形の番号で登録する）
-    uid="$(sed -n 's|^@newuser _veil:\([0-9]*\):.*|\1|p' /usr/ports/www/veil/pkg/PLIST)"
+    # 試験では空いている番号で登録する）
     UL=/usr/ports/infrastructure/db/user.list
     if ! grep -q '[[:space:]]_veil[[:space:]]' "$UL"; then
-        # 利用者は「番号 名前 group port」、group は「番号 名前 port」の行
+        # 雛形の番号（bsd-ports.py の OPENBSD_UID）が使われていたら、空いている番号に替える
+        uid="$(sed -n 's|^@newuser _veil:\([0-9]*\):.*|\1|p' /usr/ports/www/veil/pkg/PLIST)"
+        while awk -v u="$uid" '$1 == u { f = 1 } END { exit !f }' "$UL"; do uid=$((uid + 1)); done
+        sed -i "s|^@newgroup _veil:[0-9]*|@newgroup _veil:$uid|; s|^@newuser _veil:[0-9]*:|@newuser _veil:$uid:|" /usr/ports/www/veil/pkg/PLIST
+        echo "user.list: _veil gets id $uid"
+        # 「番号 利用者 group port」の 1 行で利用者と同じ番号の group を表す（group の行を別に足すと Duplicate id）
         printf '%s _veil\t\t_veil\t\twww/veil\n' "$uid" >> "$UL"
-        printf '%s _veil\t\twww/veil\n' "$uid" >> "$UL"
     fi
     grep -n '_veil\|^# *[A-Z]' "$UL" | tail -8
     cd /usr/ports/www/veil
@@ -171,15 +174,9 @@ netbsd)
         # shellcheck disable=SC2086
         git -C /usr/pkgsrc sparse-checkout add $miss
     done
-    DIST="$(make show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
-    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
-    log "make makesum"
-    make makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
-    # クレートが distinfo に入ったか（入っていなければ make package の checksum で止まる）
-    echo "distfiles: $(make show-var VARNAME=DISTFILES | wc -w), in distinfo: $(grep -c '^SHA512' distinfo)"
-    cp distinfo "$OUT/distinfo.netbsd"
     # 依存を入れる所（reduce-depends.awk）は依存の dir も読む（buildlink3.mk が足す devel/pkgconf など）。
-    # 「... does not exist」の dir を疎な木に足して入れ直す
+    # 「... does not exist」の dir を疎な木に足して入れ直す。distfiles を置く前に済ませる（sparse-checkout は
+    # 木の外の無視されたファイルだけの dir＝distfiles を消す）
     i=0
     while ! make depends >"$OUT/depends.log" 2>&1; do
         miss="$(sed -n 's|.*reduce-depends.awk\] \.\./\.\./\([^ ]*\) does not exist.*|\1|p' "$OUT/depends.log" | sort -u)"
@@ -188,6 +185,13 @@ netbsd)
         # shellcheck disable=SC2086
         git -C /usr/pkgsrc sparse-checkout add $miss
     done
+    DIST="$(make show-var VARNAME=DISTDIR)"; mkdir -p "$DIST"
+    [ -n "$SRCTAR" ] && cp "$SRCTAR" "$DIST/$(make show-var VARNAME=DISTFILES | tr ' ' '\n' | grep veil-proxy)"
+    log "make makesum"
+    make makesum >"$OUT/makesum.log" 2>&1 || { tail -30 "$OUT/makesum.log"; exit 1; }
+    # クレートが distinfo に入ったか（入っていなければ make package の checksum で止まる）
+    echo "distfiles: $(make show-var VARNAME=DISTFILES | wc -w), in distinfo: $(grep -c '^SHA512' distinfo)"
+    cp distinfo "$OUT/distinfo.netbsd"
     log "make package"
     make package >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/pkgsrc/packages/All/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
