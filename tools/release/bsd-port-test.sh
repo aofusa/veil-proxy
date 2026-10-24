@@ -72,7 +72,7 @@ freebsd)
     sleep 3
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "default path built in" sh -c '/usr/local/bin/veil --help | grep -q /usr/local/etc/veil/config.toml'
-    check "runs as www" sh -c 'ps -axo user,comm | grep -E "^www +veil" >/dev/null'
+    check "runs as www" sh -c 'ps -axo user,args | grep -E "^www +[^ ]*veil( |$)" >/dev/null'
     check "service veil reload" service veil reload
     sleep 2
     check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
@@ -129,7 +129,7 @@ openbsd)
     check "rcctl start veil" rcctl start veil
     sleep 3
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
-    check "runs as _veil" sh -c 'ps -axo user,comm | grep -E "^_veil +veil" >/dev/null'
+    check "runs as _veil" sh -c 'ps -axo user,args | grep -E "^_veil +[^ ]*veil( |$)" >/dev/null'
     check "rcctl reload veil" rcctl reload veil
     sleep 2
     check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
@@ -203,10 +203,9 @@ netbsd)
     check "service veil start" /etc/rc.d/veil start
     sleep 3
     check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
-    check "runs as veil" sh -c 'ps -axo user,comm | grep -E "^veil +veil" >/dev/null'
-    # 降格の結果（失敗したときの手掛かり）
-    ps -axo user,uid,ruser,comm,args | grep '[v]eil' || true
-    tail -20 /var/log/messages 2>/dev/null | grep -i veil || true
+    check "runs as veil" sh -c 'ps -axo user,args | grep -E "^veil +[^ ]*veil( |$)" >/dev/null'
+    # 降格の結果（NetBSD の ps の comm は実行ファイルのパスで、桁で切れる。上の検査は args の先頭で見る）
+    ps -axo user,uid,args | grep '[v]eil' || true
     check "service veil stop" /etc/rc.d/veil stop
     sleep 2
     check "no veil left after stop" sh -c '! pgrep -x veil'
