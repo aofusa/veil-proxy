@@ -10,10 +10,13 @@ MAINTAINER =		aofusa <aofusa@users.noreply.github.com>
 # Apache-2.0 OR MIT
 PERMIT_PACKAGE =	Yes
 
-WANTLIB +=		${COMPILER_LIBCXX} c c++abi m pthread
+WANTLIB +=		${COMPILER_LIBCXX} c c++abi m pthread zstd
 
 MODULES =		devel/cargo lang/clang
 MODCLANG_COMPILER_LINKS =	No
+# the cargo module patches zstd-sys to link archivers/zstd
+LIB_DEPENDS =		archivers/zstd
+
 # devel/git: boring-sys (BoringSSL for HTTP/3) applies its patches with git init / git apply
 BUILD_DEPENDS =		devel/cmake \
 			devel/git \
@@ -32,8 +35,10 @@ MAKE_ENV +=		VEIL_DEFAULT_CONFIG_PATH=${SYSCONFDIR}/veil/config.toml \
 			LIBCLANG_PATH=${LOCALBASE}/llvm${MODCLANG_VERSION}/lib \
 			CC_${MACHINE_ARCH:S/amd64/x86_64/:S/arm64/aarch64/}_unknown_openbsd=${WRKDIR}/veil-cc \
 			BINDGEN_EXTRA_CLANG_ARGS="-include pthread.h" \
-			CFLAGS_aarch64_unknown_openbsd="-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON" \
-			RUSTFLAGS="-L ${WRKDIR}/lib"
+			CFLAGS_aarch64_unknown_openbsd="-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON"
+# RUSTFLAGS in MAKE_ENV is replaced by the cargo module's: the library paths go through MODCARGO_RUSTFLAGS
+# (${WRKDIR}/lib has the libstdc++ link to libc++, ${LOCALBASE}/lib has libzstd)
+MODCARGO_RUSTFLAGS +=	-L ${WRKDIR}/lib -L ${LOCALBASE}/lib
 
 pre-configure:
 	${INSTALL_SCRIPT} ${FILESDIR}/veil-cc ${WRKDIR}/veil-cc
