@@ -79,6 +79,8 @@ struct Helpers {
     // F-210: `veil.StreamingResponse`・`veil._stream_of`（ジェネレータ等をストリーミングの応答にする）
     streaming_type: Py<PyAny>,
     stream_of: Py<PyAny>,
+    // F-263: `veil.SwitchingProtocols`（`Response.switching_protocols` の戻り値）
+    switching_type: Py<PyAny>,
 }
 
 static HELPERS: PyOnceLock<Helpers> = PyOnceLock::new();
@@ -93,6 +95,7 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
             response_type: veil.getattr("Response")?.unbind(),
             streaming_type: veil.getattr("StreamingResponse")?.unbind(),
             stream_of: veil.getattr("_stream_of")?.unbind(),
+            switching_type: veil.getattr("SwitchingProtocols")?.unbind(),
         })
     })
 }
@@ -418,6 +421,9 @@ pub fn to_response(
     if result.is_instance(h.streaming_type.bind(py))? {
         return stream_response(py, &result, ctx);
     }
+    if result.is_instance(h.switching_type.bind(py))? {
+        return switching_protocols(&result);
+    }
     let resp = if result.is_instance(h.response_type.bind(py))? {
         result
     } else if let Some(sr) = {
@@ -580,8 +586,32 @@ fn stream_response(
     Ok(Response::new(200))
 }
 
+// F-263: Python のハンドラからのプロトコルアップグレード（`veil.Protocol` / `veil.AsyncProtocol` で受ける）
+/// Turn a `veil.SwitchingProtocols` into a 101 whose connection is served by the protocol `factory()` returns
+/// (callbacks on the handler pool, like an L4 TCP listener).
+fn switching_protocols(sp: &Bound<'_, PyAny>) -> PyResult<Response> {
+    let py = sp.py();
+    let protocol: String = sp.getattr(pyo3::intern!(py, "protocol"))?.extract()?;
+    let make = sp.getattr(pyo3::intern!(py, "_make_protocol"))?.unbind();
+    let head = response_object_head(sp)?;
+    let mut r =
+        Response::switching_protocols(&protocol, move |up: veil::api::Upgraded| async move {
+            let peer = up
+                .client_ip()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            up.serve_blocking(move |out| crate::ext::PySession::connect(&make, peer, out))
+                .await
+        });
+    for (n, v) in head.headers() {
+        r = r.with_header(n.clone(), v.clone());
+    }
+    Ok(r)
+}
+
 /// Turn a chunk into `Bytes` (`bytes` is not copied, `str` is UTF-8, `bytearray` and `memoryview` are copied).
-fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
+pub(crate) fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
     if let Ok(s) = item.cast::<PyString>() {
         let s: PyBackedStr = s.extract()?;
         return Ok(Bytes::from_owner(PyStrOwner(s)));
@@ -594,7 +624,7 @@ fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
 }
 
 /// Read only `status` and `headers` (the head of a streaming response).
-fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
+pub(crate) fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let status: u16 = resp
         .getattr(pyo3::intern!(resp.py(), "status"))?
         .extract()?;

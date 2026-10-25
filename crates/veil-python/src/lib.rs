@@ -5,6 +5,7 @@
 //! `register_route` and starts the server with `run`. For every request the route entry point (`Route._call`) is
 //! called with the GIL held and a single [`native::NativeRequest`]; Rust turns the return value into the response.
 
+mod aio;
 mod ext;
 mod native;
 
@@ -29,6 +30,52 @@ struct PendingRoute {
     status_code: u16,
     // F-210: 要求本文をストリーミングで受ける（`stream_body=True`）
     stream_body: bool,
+    // F-263: `async def` を常駐のイベントループで動かす
+    on_loop: bool,
+}
+
+// F-263: `@app.websocket` のルート（`run` までの間に溜める）。
+/// A WebSocket route registered with `register_websocket`.
+struct PendingWs {
+    path: String,
+    handler_id: u64,
+    openapi: Option<serde_json::Value>,
+    // `WebSocketEndpoint` のクラス（コールバックはハンドラ用プール）。偽なら `async def`（常駐のループ）
+    endpoint: bool,
+    hidden: bool,
+}
+
+static PENDING_WS: Mutex<Vec<PendingWs>> = Mutex::new(Vec::new());
+
+/// Register a WebSocket route (collected until `run`).
+#[pyfunction]
+#[pyo3(signature = (path, handler_id, openapi_json=None, endpoint=false, hidden=false))]
+fn register_websocket(
+    path: String,
+    handler_id: u64,
+    openapi_json: Option<String>,
+    endpoint: bool,
+    hidden: bool,
+) -> PyResult<()> {
+    let openapi = parse_openapi(openapi_json)?;
+    PENDING_WS.lock().unwrap().push(PendingWs {
+        path,
+        handler_id,
+        openapi,
+        endpoint,
+        hidden,
+    });
+    Ok(())
+}
+
+fn parse_openapi(openapi_json: Option<String>) -> PyResult<Option<serde_json::Value>> {
+    match openapi_json {
+        Some(s) => Ok(Some(
+            serde_json::from_str::<serde_json::Value>(&s)
+                .map_err(|e| PyValueError::new_err(format!("invalid openapi_json: {}", e)))?,
+        )),
+        None => Ok(None),
+    }
 }
 
 static PENDING: Mutex<Vec<PendingRoute>> = Mutex::new(Vec::new());
@@ -209,6 +256,23 @@ impl PyConfig {
         self.inner.add_listener(l);
     }
 
+    // F-263: Python 側が読む `[api] python_*` のキー
+    /// The value of `[api] <name>` in the merged configuration (`str`, `int`, `float` or `bool`), or `None`.
+    fn api_setting(&self, py: Python<'_>, name: &str) -> PyResult<Option<Py<PyAny>>> {
+        let text = self.inner.to_toml_string().map_err(cfg_err)?;
+        let v: toml::Value = toml::from_str(&text).map_err(cfg_err)?;
+        let Some(x) = v.get("api").and_then(|a| a.get(name)) else {
+            return Ok(None);
+        };
+        Ok(Some(match x {
+            toml::Value::String(s) => s.into_pyobject(py)?.into_any().unbind(),
+            toml::Value::Integer(i) => i.into_pyobject(py)?.into_any().unbind(),
+            toml::Value::Float(f) => f.into_pyobject(py)?.into_any().unbind(),
+            toml::Value::Boolean(b) => b.into_pyobject(py)?.to_owned().into_any().unbind(),
+            _ => return Ok(None),
+        }))
+    }
+
     /// Return the merged configuration as a TOML string (for debugging).
     fn to_toml(&self) -> PyResult<String> {
         self.inner.to_toml_string().map_err(cfg_err)
@@ -217,7 +281,7 @@ impl PyConfig {
 
 /// Register an HTTP route (collected until `run`).
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false))]
 #[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
 fn register_route(
     path: String,
@@ -227,14 +291,9 @@ fn register_route(
     openapi_json: Option<String>,
     status_code: u16,
     stream_body: bool,
+    on_loop: bool,
 ) -> PyResult<()> {
-    let openapi = match openapi_json {
-        Some(s) => Some(
-            serde_json::from_str::<serde_json::Value>(&s)
-                .map_err(|e| PyValueError::new_err(format!("invalid openapi_json: {}", e)))?,
-        ),
-        None => None,
-    };
+    let openapi = parse_openapi(openapi_json)?;
     PENDING.lock().unwrap().push(PendingRoute {
         path,
         methods,
@@ -243,6 +302,7 @@ fn register_route(
         openapi,
         status_code,
         stream_body,
+        on_loop,
     });
     Ok(())
 }
@@ -290,11 +350,20 @@ fn call_python(route: &PyRoute, req: Request, ctx: Option<&mut HandlerContext>) 
     })
 }
 
-fn internal_error() -> Response {
+pub(crate) fn internal_error() -> Response {
     Response::json_bytes(Bytes::from_static(
         b"{\"detail\":\"Internal Server Error\"}",
     ))
     .with_status(500)
+}
+
+// F-263: `async def` を常駐のループで動かす経路（ワーカーは GIL を取らず、キュー + 通知で待つ）
+fn make_loop_handler(route: PyRoute, handler_id: u64) -> HandlerFn {
+    let route = Arc::new(route);
+    Arc::new(move |req: Request| {
+        let r = Arc::clone(&route);
+        Box::pin(aio::call_on_loop(r, handler_id, req))
+    })
 }
 
 fn make_handler(route: PyRoute, offload: bool) -> HandlerFn {
@@ -329,14 +398,16 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
             .get(r.handler_id as usize)
             .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", r.handler_id)))?
             .bind(py);
-        let func = make_handler(
-            PyRoute {
-                call: route.getattr("_call")?.unbind(),
-                fallback: route.getattr("to_response")?.unbind(),
-                status: r.status_code,
-            },
-            r.offload,
-        );
+        let py_route = PyRoute {
+            call: route.getattr("_call")?.unbind(),
+            fallback: route.getattr("to_response")?.unbind(),
+            status: r.status_code,
+        };
+        let func = if r.on_loop {
+            make_loop_handler(py_route, r.handler_id)
+        } else {
+            make_handler(py_route, r.offload)
+        };
         let meta = OperationMeta {
             operation_id: format!("py_{}", r.handler_id),
             raw: r.openapi,
@@ -349,6 +420,39 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         } else {
             app.route_fn(&name, &methods, &r.path, func, meta)
         };
+    }
+    for (i, w) in std::mem::take(&mut *PENDING_WS.lock().unwrap())
+        .into_iter()
+        .enumerate()
+    {
+        let id = w.handler_id;
+        let func: HandlerFn = if w.endpoint {
+            let route = Arc::new(
+                handlers
+                    .get(id as usize)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", id)))?
+                    .clone_ref(py),
+            );
+            Arc::new(move |req: Request| {
+                let route = Arc::clone(&route);
+                Box::pin(async move { aio::websocket_endpoint(route, req) })
+            })
+        } else {
+            Arc::new(move |req: Request| Box::pin(aio::websocket_on_loop(id, req)))
+        };
+        let meta = OperationMeta {
+            operation_id: format!("py_ws_{}", id),
+            raw: w.openapi,
+            hidden: w.hidden,
+            ..Default::default()
+        };
+        app = app.route_fn(
+            &format!("py_ws_{}_{}", i, id),
+            &["GET"],
+            &w.path,
+            func,
+            meta,
+        );
     }
     let handler = |id: u64| -> PyResult<Py<PyAny>> {
         handlers
@@ -405,6 +509,13 @@ fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<native::NativeBodyIter>()?;
     m.add_class::<ext::NativeGrpcCall>()?;
     m.add_class::<ext::NativeTransport>()?;
+    m.add_class::<aio::AioJob>()?;
+    m.add_class::<aio::AioStream>()?;
+    m.add_class::<aio::NativeWebSocket>()?;
+    m.add_class::<aio::NativeWsSender>()?;
+    m.add_function(wrap_pyfunction!(aio::aio_setup, m)?)?;
+    m.add_function(wrap_pyfunction!(aio::aio_take, m)?)?;
+    m.add_function(wrap_pyfunction!(register_websocket, m)?)?;
     m.add_function(wrap_pyfunction!(register_grpc, m)?)?;
     m.add_function(wrap_pyfunction!(register_grpc_health, m)?)?;
     m.add_function(wrap_pyfunction!(register_l4_tcp, m)?)?;

@@ -246,6 +246,10 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `websocket_idle_timeout_secs` | `0` | フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限） |
 | `websocket_compression` | `false` | クライアントが申し出たら permessage-deflate（RFC 7692）を交渉する（`compression` feature が必要） |
 | `openapi_websocket` | `true` | WebSocket のルートを OpenAPI に載せる |
+| `python_event_loops` | `1` | Python: `async def` のハンドラと WebSocket を動かす常駐のイベントループの数 |
+| `python_event_loop` | `"auto"` | Python: `"auto"`（uvloop が入っていれば使う）・`"asyncio"`・`"uvloop"` |
+| `python_event_loop_queue` | `65536` | Python: 1 つのループで待てる呼び出しの数（一杯なら 503） |
+| `python_async_mode` | `"loop"` | Python: `async def` の実行先。`"loop"`（常駐のループ）か `"pool"`（0.10 より前と同じ） |
 
 ## ルーティングマクロ
 
@@ -962,7 +966,21 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 - **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）ではハンドラ用プールで実行されるので、
   イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
   純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
-- **サーバの中では**、ハンドラに Rust 側の要求（`veil._veil.NativeRequest`。`isinstance` では `veil.Request`）が渡ります。属性・メソッドは同じで、ハンドラが読んだ属性だけを作ります。よくある戻り値（`str`・`bytes`・`dict`/`list`・`None`・`veil.Response`）は Rust で本文を複製せずに応答にします（F-212）。`async def` のハンドラはハンドラ用プールのスレッドごとに 1 つのイベントループで動きます。Python 3.9 以上が必要です。
+- **サーバの中では**、ハンドラに Rust 側の要求（`veil._veil.NativeRequest`。`isinstance` では `veil.Request`）が渡ります。属性・メソッドは同じで、ハンドラが読んだ属性だけを作ります。よくある戻り値（`str`・`bytes`・`dict`/`list`・`None`・`veil.Response`）は Rust で本文を複製せずに応答にします（F-212）。Python 3.9 以上が必要です。
+- **async def とイベントループ（F-263）。** `async def` のハンドラは **常駐の asyncio のイベントループ**（uvicorn と同じく専用のスレッド。
+  uvloop が入っていれば uvloop）で動きます。`await` の間はスレッドを握らないので、数千の要求が同時に待て、`asyncio.create_task` の
+  タスクは要求の後も動き続けます。中でブロックするとループ全体が止まるので、`await veil.run_in_threadpool(f, ...)` か普通の `def`
+  にしてください。クライアントが切断するとハンドラのタスクはキャンセルされます。`[api] python_event_loops`・`python_event_loop`・
+  `python_event_loop_queue` でループを調整し、`async_mode="pool"`（ルートごと、または `[api] python_async_mode = "pool"`）で 0.10 より
+  前の動き（ハンドラ用プールのスレッドごとのイベントループ）に戻せます。`veil.App(lifespan=...)`・`@app.on_startup` / `@app.on_shutdown`・
+  `@app.on_event("startup" | "shutdown")` はリスナーを開く前とサーバが止まった後にループで走ります（開始で失敗すると終了コード 1）。
+  lifespan が yield した dict は `app.state` に入ります。
+- **WebSocket（F-263）** は Starlette / FastAPI と同じ名前です。`@app.websocket("/ws")` を `async def f(websocket: veil.WebSocket)`
+  に付けます（`accept`・`receive_text/bytes/json`・`iter_text/bytes/json`・`send_text/bytes/json`・`close`・`veil.WebSocketDisconnect`）。
+  `veil.WebSocketEndpoint` のクラスも使えます。フレーム・Ping / Pong・UTF-8 の検査・クローズの手順・上限は Rust で処理し（`[api] websocket_*`
+  が効く）、Python は組み立て済みのメッセージだけを見ます。WebSocket のルートは `x-veil-websocket` 付きで OpenAPI に載ります（`receive=` /
+  `send=` に pydantic のモデル、`validate=True` で型に合わなければ 1007）。`veil.Response.switching_protocols(protocol, factory)` で任意の
+  プロトコルへアップグレードできます（`veil.Protocol` か `veil.AsyncProtocol`）。
 - **ストリーミング（F-210）。** ジェネレータ・非同期ジェネレータを返す（`text/plain` で断片ごとに送る）か、
   `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`、Server-Sent Events なら `veil.EventSourceResponse(iterable)`
   （要素は文字列・JSON にできる値・`{"event", "data", "id", "retry"}` の dict）。`@veil.post(..., stream_body=True)` は本文が
@@ -988,7 +1006,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 [examples/api/python-hello/](../../../examples/api/python-hello/)・
 [examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/)・
 [examples/api/python-features/](../../../examples/api/python-features/)（ストリーミング・L4）・
-[examples/api/python-grpc/](../../../examples/api/python-grpc/)（grpcio の生成コードと基本の層）です。
+[examples/api/python-grpc/](../../../examples/api/python-grpc/)（grpcio の生成コードと基本の層）・
+[examples/api/python-websocket/](../../../examples/api/python-websocket/)（WebSocket・アップグレード・lifespan・イベントループ）です。
 
 ## ライブラリ成果物のビルド
 
@@ -1106,17 +1125,18 @@ tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
-OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`websocket` は WebSocket の試験（ハンドシェイク・エコー・断片化・まとめ送り・プロトコル違反・2,000 接続〈`WS_E2E_CONNS=16384` で増やせる〉・繋ぎ直しの繰り返し・graceful shutdown の 1001、平文・TLS・kTLS。docker と `crossbario/autobahn-testsuite` があれば Autobahn TestSuite の fuzzingclient も）です。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
+OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`websocket` は WebSocket の試験（ハンドシェイク・エコー・断片化・まとめ送り・プロトコル違反・2,000 接続〈`WS_E2E_CONNS=16384` で増やせる〉・繋ぎ直しの繰り返し・graceful shutdown の 1001、平文・TLS・kTLS。docker と `crossbario/autobahn-testsuite` があれば Autobahn TestSuite の fuzzingclient も）です。`python` は `examples/api/python-websocket` に同じ試験と Autobahn の 1.*〜7.* を行い、`await asyncio.sleep(1)` の要求 2,000 本の同時実行（`PY_E2E_SLEEPERS` で増やせる）・lifespan・アップグレードも確かめます。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
 cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
-（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
+（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` と `tests/test_aio.py` です。
 [テスト](testing.md)も参照してください。
 
 ## 制限事項
 
 - gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
-- Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
+- Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
+  そのイベントループが止まります（上記）。
 - プロトコルアップグレードと WebSocket は HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります
   （`/openapi.json` はオフラインでも使えます）。

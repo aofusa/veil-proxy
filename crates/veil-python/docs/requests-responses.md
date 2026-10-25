@@ -75,4 +75,4 @@ def upload(req: veil.Request):
 
 ## Server-Sent events and long-lived connections
 
-See {doc}`websocket` for what to use instead of WebSocket endpoints.
+WebSocket endpoints and other protocol upgrades (`veil.Response.switching_protocols`) are described in {doc}`websocket`.

@@ -7,6 +7,9 @@
 #   ws_check.py many <port> <n> [tls]       n 本を同時に開いてエコー（16,384 本は ulimit -n を上げて）
 #   ws_check.py churn <port> <n>            10 メッセージごとに切断して開き直すのを n 回（ハンドシェイクの費用）
 #   ws_check.py hold <port> <secs>          開いたまま待ち、graceful shutdown の Close 1001 を受けたら "close 1001"
+#   ws_check.py python <port>               basic に加えて examples/api/python-websocket の /chat・/typed・/noaccept・
+#                                           /endpoint・/echo（x-echo へのアップグレード）・/state・/threadpool（F-263）
+#   ws_check.py sleepers <port> <n>         GET /sleep（await asyncio.sleep(1)）を n 本同時に（常駐のループで並ぶか）
 import asyncio
 import base64
 import hashlib
@@ -226,6 +229,103 @@ async def rust(port, tls):
     t.close()
 
 
+async def http_get(port, path, extra=b""):
+    r, w = await asyncio.open_connection("127.0.0.1", port, limit=1 << 20)
+    w.write(b"GET " + path.encode() + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n" + extra + b"\r\n")
+    await w.drain()
+    head = await r.readuntil(b"\r\n\r\n")
+    n = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            n = int(line.split(b":")[1])
+    body = await r.readexactly(n)
+    return r, w, int(head.split(b" ", 2)[1]), head, body
+
+
+async def python(port):
+    await basic(port, False, "/ws")
+    a = await WS.connect(port, "/ws", extra=b"Sec-WebSocket-Protocol: echo.v1\r\n")
+    check("py subprotocol selected", a.header(b"sec-websocket-protocol") == b"echo.v1")
+    a.close()
+    m = [await WS.connect(port, "/chat") for _ in range(3)]
+    await asyncio.sleep(0.3)
+    await m[0].send(1, b"hi all")
+    got = [await c.recv() for c in m]
+    check("py chat broadcast to 3 members", all(g == (1, b"hi all", True) for g in got), got)
+    m[1].close()
+    await asyncio.sleep(0.3)
+    await m[0].send(1, b"after leave")
+    got = [await m[0].recv(), await m[2].recv()]
+    check("py chat after a member left", all(g == (1, b"after leave", True) for g in got), got)
+    for c in m:
+        c.close()
+    t = await WS.connect(port, "/typed")
+    if t.status() == 101:
+        await t.send(1, b'{"room":"r","text":"h\xc3\xa9"}')
+        op, data, _ = await t.recv()
+        check("py typed message", data == b'{"room":"r","text":"h\xc3\xa9","length":2}', data)
+        await t.send(1, b'{"room":1}')
+        check("py typed message violation -> 1007", await t.recv_close() == 1007)
+    else:
+        print("skip py typed (no pydantic)", flush=True)
+    t.close()
+    c = await WS.connect(port, "/noaccept")
+    check("py handler without accept -> 403", c.status() == 403, c.head[:80])
+    c.close()
+    e = await WS.connect(port, "/endpoint")
+    check("py WebSocketEndpoint on_connect", await e.recv() == (1, b"welcome", True))
+    await e.send(1, b"x")
+    check("py WebSocketEndpoint on_receive", await e.recv() == (1, b"endpoint:x", True))
+    await e.send(2, b"bin")
+    check("py WebSocketEndpoint wrong kind -> 1003", await e.recv_close() == 1003)
+    e.close()
+    # x-echo へのアップグレード（AsyncProtocol の data_received はループで走る）
+    r, w, st, head, _ = await http_get(port, "/echo", b"Connection: Upgrade\r\nUpgrade: x-echo\r\n")
+    ok_up = st == 101
+    if ok_up:
+        w.write(b"ping-upgrade")
+        await w.drain()
+        got = await asyncio.wait_for(r.readexactly(12), 5)
+        ok_up = got == b"ping-upgrade"
+    check("py upgrade to x-echo (AsyncProtocol)", ok_up, head[:80])
+    w.close()
+    r, w, st, _, _ = await http_get(port, "/echo")
+    check("py upgrade without Upgrade header -> 400", st == 400, st)
+    w.close()
+    _, w, st, _, body = await http_get(port, "/state")
+    check("py lifespan state", st == 200 and b"hello from lifespan" in body, body)
+    w.close()
+    _, w, st, _, body = await http_get(port, "/threadpool")
+    check("py run_in_threadpool", st == 200 and b"from pool" in body, body)
+    w.close()
+    _, w, st, _, body = await http_get(port, "/pool-sleep")
+    check("py async_mode=pool", st == 200 and b"pool" in body, body)
+    w.close()
+
+
+async def sleepers(port, n):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, n + 256)), hard))
+    sem = asyncio.Semaphore(500)
+
+    async def one():
+        async with sem:
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(b"GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n")
+            await w.drain()
+        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 120)
+        w.close()
+        return int(head.split(b" ", 2)[1])
+
+    t0 = time.time()
+    rs = await asyncio.gather(*(one() for _ in range(n)), return_exceptions=True)
+    dt = time.time() - t0
+    good = sum(1 for r in rs if r == 200)
+    # 1 本ずつ待つ（ハンドラ用プールのスレッド数で並ぶ）なら n 秒 / スレッド数かかる
+    check(f"{n} concurrent awaits of asyncio.sleep(1) ({dt:.1f}s)", good == n and dt < 1 + n / 400 + 10,
+          f"{good}/{n} {[r for r in rs if r != 200][:3]}")
+
+
 async def many(port, n, tls):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, n + 256)), hard))
@@ -292,6 +392,10 @@ def main():
         asyncio.run(many(port, int(args[0]), tls))
     elif mode == "churn":
         asyncio.run(churn(port, int(args[0])))
+    elif mode == "python":
+        asyncio.run(python(port))
+    elif mode == "sleepers":
+        asyncio.run(sleepers(port, int(args[0])))
     elif mode == "hold":
         asyncio.run(hold(port, float(args[0])))
         return

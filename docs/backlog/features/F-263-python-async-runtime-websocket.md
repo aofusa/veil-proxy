@@ -1,6 +1,6 @@
 # F-263: Python: 常駐の asyncio イベントループ・WebSocket・プロトコルアップグレード・lifespan
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)。前提は [F-261](F-261-handler-http11-upgrade.md)・[F-262](F-262-handler-websocket-rust.md)）**
+**状態: 完了（2026-10-25 起票・設計、同日実装。親は [F-258](F-258-v0100-plan.md)。前提は [F-261](F-261-handler-http11-upgrade.md)・[F-262](F-262-handler-websocket-rust.md)）**
 
 ## 背景
 
@@ -119,3 +119,60 @@ async def ws(websocket: veil.WebSocket):
 
 - 上の E2E が通り、同期のハンドラの性能が変わらない。本体のバイナリが変わらない（`nonregression`）。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **常駐のループ**（`crates/veil-python/python/veil/_aio.py`・`src/aio.rs`）: `veil.run()` がループのスレッドを
+  `[api] python_event_loops` 本起動する（`"auto"` なら uvloop があれば使う）。ワーカー → ループはループごとの有界の
+  `Mutex<VecDeque>`（`python_event_loop_queue`、満杯なら 503）と、Python で作ったソケットの組への 1 バイトの通知（`armed` の
+  `AtomicBool` でまとめる。eventfd でなくソケットの組にしたのは Windows・macOS でも同じ形にするため）。ループは
+  `add_reader` で起こされ `_veil.aio_take` で溜まった仕事をまとめて取る。結果は呼び出しごとの出口のキュー + `WakeFlag`
+  （ワーカーの通知 fd。スレッド越しに Waker を呼ばない）。ワーカーは GIL を取らない。
+- **呼び出し**: `async def` の既定の実行先を常駐のループに（`Route.async_mode`、`@app.get(..., async_mode="pool")`・
+  `[api] python_async_mode = "pool"` で旧来）。`stream_body=True` のルートは常に旧来（`request.stream()` が同期で読むため）。
+  切断でワーカーの Future が drop されたら `CancelGuard` が `Job::Cancel` を送り `task.cancel()`。例外は 500、`HTTPException`・
+  検証の誤りは今までどおり。ストリーミング応答はループで回し、出口のキュー（16 件）で背圧をかける（一杯なら Python 側が少し待って再試行）。
+- **WebSocket**（`veil/websockets.py`・`src/aio.rs` の `NativeWebSocket`）: F-262 の `WebSocketUpgrade::on_upgrade` の上に、
+  `accept()` までハンドシェイクを保留する形（ワーカーは 101 を書かずに待つ。403・500・422 で断れる）。受信は 256 件の有界の
+  キュー（溜まったら読み取りを止める＝ TCP の背圧。その間も 5ms ごとに送信を書き出す）、送信は F-262 の `WsSender`。
+  Starlette の名前（`accept`・`receive*`・`iter_*`・`send*`・`close`・`WebSocketDisconnect`・`WebSocketState`・`client`・`headers`・
+  `query_params`・`path_params`・`url`・`subprotocols`・`state`）。`WebSocketEndpoint` はハンドラ用プールで 1 本ずつ（`async def`
+  のコールバックはループで）、`encoding` に合わないメッセージは 1003。OpenAPI は純 Python の `WebSocketRoute.openapi()` を
+  `register_websocket` の `openapi_json` で渡す（`x-veil-websocket`、`receive=`/`send=` の pydantic のモデル、`validate=True` で 1007、
+  `include_in_schema=False`）。
+- **アップグレード**: `veil.Response.switching_protocols(protocol, factory)`（F-261 の `Upgraded::serve_blocking` + L4 の
+  `PySession`）。`veil.AsyncProtocol` は `async def` のコールバックをループで実行する。
+- **lifespan**: `App(lifespan=, on_startup=, on_shutdown=)`・`@app.on_startup`・`@app.on_shutdown`・`@app.on_event`・`app.state`
+  （lifespan が yield した dict を入れる）。開始はリスナーを開く前に最初のループで、失敗すれば終了コード 1。終了はサーバが
+  止まった後（graceful shutdown の完了後）。`veil.run_in_threadpool`（専用の `ThreadPoolExecutor`「veil-threadpool」）。
+- **設定**: `[api] python_event_loops`・`python_event_loop`・`python_event_loop_queue`・`python_async_mode`（`examples/config.toml`・
+  `docs/guide/library.md` 英日）。`veil.run(event_loops=, event_loop=, async_mode=)` でも渡せる。`Config.api_setting` を追加。
+- **例・文書**: `examples/api/python-websocket/app.py`。`crates/veil-python/docs/websocket.md`（書き直し）・`async.md`（新規）・
+  `index.md`・`quickstart.md`・`requests-responses.md`・README、`docs/guide/library.md`（英日）の Python の節・Testing・Limitations、
+  `_veil.pyi` に新しいネイティブの API。
+- **試験**: `crates/veil-python/tests/test_aio.py`（ネイティブ無しで: WebSocket のエコー・403/1011/500・受信の種類と送信の再試行・
+  1007・422・同期のハンドラの拒否・OpenAPI・`WebSocketEndpoint`・ループでの完了/失敗/ストリーミング・`run_in_threadpool`・
+  `AsyncProtocol`・lifespan の順序・`async_mode`）。E2E は `library_e2e.sh python` の `run_python_ws`（`ws_check.py python`:
+  basic 一式・サブプロトコル・チャット〈抜けた後も〉・`/typed`・`accept` 無しの 403・`WebSocketEndpoint`〈1003 も〉・`x-echo` への
+  アップグレードと 400・lifespan の state・`run_in_threadpool`・`async_mode="pool"`、2,000 同時接続のエコー、`await asyncio.sleep(1)`
+  の 2,000 同時要求〈`PY_E2E_SLEEPERS`〉、OpenAPI〈`include_in_schema=False`〉、h2c で 400、graceful shutdown の 1001 と lifespan の
+  終了、lifespan の開始の失敗で終了コード 1）と Autobahn の 1.*〜7.*（Python のエコー）。
+
+### 決めたこと
+
+- ループの選び方は「接続の fd」ではなく要求ごとの順番（`NEXT_LOOP`）。Python のハンドラからは fd が見えず、同じ WebSocket の
+  仕事は最初に選んだループへ送るので順序の問題は無い。
+- WebSocket のハンドラは `async def` だけ（同期の書き方は `WebSocketEndpoint`。`def` を付けると登録時に `TypeError`）。
+- `_SyncWebSocket`（`WebSocketEndpoint` の `websocket`）の送信は待たない（キューが一杯なら `RuntimeError`）。プールのスレッドを
+  送信の待ちで握らないため。
+- lifespan の資源は最初のループのもの（`python_event_loops > 1` のときの注意を `async.md` に書いた）。
+- 大きな同時数は手で確かめた（`ulimit -n 200000`、`tests/api/ws_check.py` を直接）: `await asyncio.sleep(1)` の 32,768 同時要求が
+  全部 200（16.3 秒。クライアントは 1 本の Python の asyncio で接続を 500 本ずつ開くので、クライアント側の律速）、WebSocket の
+  16,384 同時接続のエコーが全部返る（24.7 秒、同じくクライアント律速）。既定の E2E は 2,000 本（`PY_E2E_SLEEPERS`・`WS_E2E_CONNS`）。
+
+### 残したこと
+
+- 性能の交互比較（`tools/api-bench/python` の `async def` の `/plaintext`・`/json` を `pool`・常駐のループ・FastAPI + uvicorn で）、
+  asyncpg・`redis.asyncio` の 32K 同時の確認、uvloop 有りの E2E（この環境に uvloop を入れていない）、FastAPI の公式文書のチャットを
+  import の差し替えだけで動かす確認（同じ書き方の `/chat` は E2E で確かめた）はやっていない（HttpArena の提出の準備で行う）。
+- リリースノート（`docs/releases/v0.10.0.md`）はまだ無いので、`async def` の既定の実行先の変更は F-276 で書く。

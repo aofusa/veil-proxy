@@ -30,6 +30,7 @@ quickstart
 routing
 requests-responses
 dependency-injection
+async
 websocket
 grpc
 configuration

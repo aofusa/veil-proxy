@@ -57,7 +57,9 @@ Like FastAPI you can also create an application object: `app = veil.App(title=..
 | `Response`, `JSONResponse`, `StreamingResponse` | `veil.Response`, `veil.JSONResponse`, `veil.StreamingResponse`; also `veil.EventSourceResponse` |
 | `status_code=201` in the decorator | `status_code=201` in the decorator |
 | `Depends(...)` | not provided; see {doc}`dependency-injection` |
-| WebSocket endpoints | not provided; see {doc}`websocket` |
+| `@app.websocket("/ws")` with `WebSocket` (`accept`, `receive_text`, `send_text`, `iter_text`, ...), `WebSocketDisconnect`, `WebSocketEndpoint` | the same names on `veil` (`veil.WebSocket`, ...); listed in OpenAPI too; see {doc}`websocket` |
+| `async def` handlers on the event loop | the same (a persistent asyncio loop, uvloop when installed); `veil.run_in_threadpool`; see {doc}`async` |
+| `FastAPI(lifespan=...)`, `@app.on_event("startup")` | `veil.App(lifespan=...)`, `@app.on_event(...)`, `@app.on_startup`, `app.state`; see {doc}`async` |
 | OpenAPI at `/openapi.json`, docs at `/docs` | the same |
 
 Differences worth knowing:
@@ -66,5 +68,6 @@ Differences worth knowing:
   event loop (the network workers) never waits for the GIL. `offload=False` runs the handler directly on the
   network worker and is only for trivially cheap handlers (a constant response, say). Pure-Python handlers are
   limited by the GIL's parallelism; for CPU-bound work consider several processes.
-- `async def` handlers are supported. They run on one event loop per handler-pool thread.
+- `async def` handlers run on a persistent asyncio event loop (like uvicorn; do not block in them, use
+  `veil.run_in_threadpool`). See {doc}`async`.
 - Validation without pydantic is available through `body_constraints`.

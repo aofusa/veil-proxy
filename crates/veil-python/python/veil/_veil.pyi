@@ -62,6 +62,8 @@ class Config:
         """Add a ``[[listener]]`` (one port); see :class:`veil.Listener`."""
     def to_toml(self) -> str:
         """Return the merged configuration as a TOML string (for debugging)."""
+    def api_setting(self, name: str) -> Any:
+        """The value of ``[api].<name>`` in the merged configuration, or ``None``."""
 
 @final
 class NativeHeaders:
@@ -173,6 +175,80 @@ class NativeTransport:
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         """``"peername"`` gives ``(host, port)``; other names give ``default``."""
 
+@final
+class AioJob:
+    """One unit of work for a persistent event loop (a call, a cancellation, a WebSocket or a wake-up)."""
+
+    kind: int
+    id: int
+    handler_id: int
+    @property
+    def request(self) -> NativeRequest | None:
+        """The request of a call or WebSocket job."""
+    @property
+    def websocket(self) -> NativeWebSocket | None:
+        """The connection of a WebSocket job."""
+    def complete(self, result: Any) -> None:
+        """Answer the call with a handler return value."""
+    def fail(self) -> None:
+        """Answer the call with 500."""
+    def cancelled(self) -> None:
+        """Acknowledge that the call was cancelled."""
+    def start_stream(self, response: Any) -> AioStream:
+        """Answer the call with a streaming response and return its writer."""
+
+@final
+class AioStream:
+    """Writer of a streaming response produced on the event loop."""
+
+    def try_write(self, item: bytes | str) -> bool:
+        """Queue a chunk; ``False`` when the queue is full (retry later)."""
+    def closed(self) -> bool:
+        """``True`` once the client disconnected."""
+    def finish(self, trailers: Any = None) -> None:
+        """End the response (with optional trailers)."""
+
+@final
+class NativeWebSocket:
+    """Native side of one WebSocket connection (see :class:`veil.WebSocket`)."""
+
+    def accept(self, subprotocol: str | None = None, headers: list[tuple[str, str]] = ...) -> None:
+        """Answer the handshake with 101."""
+    def reject(self, status: int) -> None:
+        """Answer the handshake with an error status."""
+    def take(self) -> tuple[str, Any] | None:
+        """The next received message (``("text", str)``, ``("bytes", bytes)``, ``("close", code)``) or ``None``."""
+    def send(self, opcode: int, data: bytes | str) -> int:
+        """Queue a message: 0 = queued, 1 = queue full, 2 = closed."""
+    def close(self, code: int, reason: str) -> None:
+        """Start the closing handshake."""
+    def finish(self) -> None:
+        """The handler returned (closes the connection when still open)."""
+
+@final
+class NativeWsSender:
+    """Send side of a :class:`veil.WebSocketEndpoint` connection."""
+
+    def send(self, opcode: int, data: bytes | str) -> int:
+        """Queue a message: 0 = queued, 1 = queue full, 2 = closed."""
+    def close(self, code: int, reason: str) -> None:
+        """Start the closing handshake."""
+
+def aio_setup(fds: list[int], queue: int) -> None:
+    """Register the wake-up sockets of the persistent event loops (one per loop) and the queue size."""
+
+def aio_take(index: int) -> list[AioJob]:
+    """Take the queued jobs of event loop ``index``."""
+
+def register_websocket(
+    path: str,
+    handler_id: int,
+    openapi_json: str | None = None,
+    endpoint: bool = False,
+    hidden: bool = False,
+) -> None:
+    """Register an ``@app.websocket`` route (collected until ``run``)."""
+
 def register_grpc(path: str, handler_id: int) -> None:
     """Register a gRPC method; ``handlers[handler_id].handle(call)`` returns ``(code, message)``."""
 
@@ -193,8 +269,9 @@ def register_route(
     openapi_json: str | None = None,
     status_code: int = 200,
     stream_body: bool = False,
+    on_loop: bool = False,
 ) -> None:
-    """Register an HTTP route (collected until ``run``)."""
+    """Register an HTTP route (collected until ``run``; ``on_loop`` runs it on the persistent event loop)."""
 
 def run(config: Config, handlers: list[Any]) -> None:
     """Start the server and block until it stops (the GIL is released).

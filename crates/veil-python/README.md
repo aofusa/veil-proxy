@@ -72,8 +72,11 @@ The server also serves `/openapi.json` and Swagger UI at `/docs` (disable with `
 - **Streaming**: generators (sync or async), `veil.StreamingResponse`, `veil.EventSourceResponse` (Server-Sent
   Events) and `@veil.post(..., stream_body=True)` for streamed request bodies.
 - **gRPC**: `veil.grpc.unary_unary` and friends (no dependencies), or `veil.grpc.Server` with grpcio-generated code.
-- **WebSocket**: Python handlers cannot terminate WebSocket connections; use Server-Sent Events or streaming
-  responses for server push.
+- **WebSocket**: `@app.websocket("/ws")` with the Starlette / FastAPI API (`veil.WebSocket`, `accept`,
+  `receive_text`, `send_text`, `iter_text`, `veil.WebSocketDisconnect`, `veil.WebSocketEndpoint`); frames are
+  handled in Rust. WebSocket routes are listed in OpenAPI. Other upgrades: `veil.Response.switching_protocols`.
+- **async and lifespan**: `async def` handlers run on a persistent asyncio event loop (uvloop when installed);
+  `veil.run_in_threadpool`, `veil.App(lifespan=...)`, `@app.on_event("startup")`, `app.state`.
 - **L4**: `@veil.l4_tcp` and `@veil.l4_udp` for raw TCP and UDP listeners.
 - **Configuration**: `veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None, tls_key=None,
   threads=None, overrides=None, openapi=True)`. `overrides` maps config keys to Python values, for example
@@ -86,8 +89,9 @@ The server also serves `/openapi.json` and Swagger UI at `/docs` (disable with `
 Python handlers run while holding the GIL.
 
 - By default (`offload=True`) a handler runs on veil's handler thread pool (`[api] handler_threads`), so the
-  I/O worker threads never wait for the GIL and keep serving connections. `async def` handlers run on one event
-  loop per pool thread.
+  I/O worker threads never wait for the GIL and keep serving connections. `async def` handlers run on the
+  persistent event loop (`[api] python_event_loops`, default 1); the workers queue calls for it without taking
+  the GIL. `async_mode="pool"` keeps the previous behaviour (one event loop per pool thread).
 - With `offload=False` the handler runs directly on the I/O worker thread. Use it only for trivially cheap
   handlers: blocking I/O or long GIL holds stall every connection that worker owns.
 - Pure Python handlers are limited by the GIL; for CPU-bound work consider a multi-process deployment.

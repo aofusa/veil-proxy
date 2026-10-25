@@ -256,6 +256,10 @@ for debugging.
 | `websocket_idle_timeout_secs` | `0` | seconds without a received frame before a WebSocket is closed with 1001 (0 = no limit) |
 | `websocket_compression` | `false` | negotiate permessage-deflate (RFC 7692) when the client offers it (needs the `compression` feature) |
 | `openapi_websocket` | `true` | list WebSocket routes in the OpenAPI document |
+| `python_event_loops` | `1` | Python: number of persistent event loops for `async def` handlers and WebSockets |
+| `python_event_loop` | `"auto"` | Python: `"auto"` (uvloop when installed), `"asyncio"` or `"uvloop"` |
+| `python_event_loop_queue` | `65536` | Python: calls that may wait for one loop (503 when full) |
+| `python_async_mode` | `"loop"` | Python: where `async def` handlers run: `"loop"` (persistent loop) or `"pool"` (as before 0.10) |
 
 ## Routing macros
 
@@ -1007,8 +1011,23 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
 - **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
   `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
   handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
-  into the response in Rust without copying the body (F-212). `async def` handlers run on one event loop per
-  handler-pool thread. Python 3.9 or later is required.
+  into the response in Rust without copying the body (F-212). Python 3.9 or later is required.
+- **async def and the event loop (F-263).** `async def` handlers run on a **persistent asyncio event loop** (a
+  thread of its own, as with uvicorn; uvloop when installed): an `await` does not hold a thread, so thousands of
+  requests can wait at once and `asyncio.create_task` tasks outlive the request. Blocking code inside them stalls the
+  loop: use `await veil.run_in_threadpool(f, ...)` or a plain `def`. A disconnected client cancels the handler's
+  task. `[api] python_event_loops` / `python_event_loop` / `python_event_loop_queue` tune the loops, and
+  `async_mode="pool"` (per route, or `[api] python_async_mode = "pool"`) restores the behaviour before 0.10 (an event
+  loop per handler-pool thread). `veil.App(lifespan=...)`, `@app.on_startup` / `@app.on_shutdown` and
+  `@app.on_event("startup" | "shutdown")` run on the loop before the listeners open and after the server stopped
+  (a failing startup exits with status 1); a dict yielded by the lifespan is merged into `app.state`.
+- **WebSocket (F-263)** with the names of Starlette / FastAPI: `@app.websocket("/ws")` on
+  `async def f(websocket: veil.WebSocket)` (`accept`, `receive_text/bytes/json`, `iter_text/bytes/json`,
+  `send_text/bytes/json`, `close`, `veil.WebSocketDisconnect`) and `veil.WebSocketEndpoint` classes. The frames,
+  Ping / Pong, UTF-8 checks, close handshake and limits are handled in Rust (the `[api] websocket_*` keys apply);
+  Python only sees complete messages. WebSocket routes are listed in OpenAPI with `x-veil-websocket` (`receive=` /
+  `send=` pydantic models, `validate=True` closes with 1007 on a mismatch). `veil.Response.switching_protocols(protocol,
+  factory)` upgrades to any other protocol (`veil.Protocol` or `veil.AsyncProtocol`).
 - **Streaming (F-210).** Return a generator or async generator (sent chunk by chunk as `text/plain`), a
   `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`, or a `veil.EventSourceResponse(iterable)` for
   Server-Sent Events (items are strings, JSON-able values or `{"event", "data", "id", "retry"}` dicts).
@@ -1036,7 +1055,8 @@ Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Exa
 [examples/api/python-hello/](../../examples/api/python-hello/),
 [examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/),
 [examples/api/python-features/](../../examples/api/python-features/) (streaming, L4),
-[examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer).
+[examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer),
+[examples/api/python-websocket/](../../examples/api/python-websocket/) (WebSocket, upgrade, lifespan, the event loop).
 
 ## Building library artifacts
 
@@ -1164,12 +1184,14 @@ subscriptions through `examples/api/rust-graphql`), runs the gRPC
 interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
 the WebSocket checks (`websocket`: handshake, echo, fragmentation, pipelining, protocol errors, 2,000 connections —
 `WS_E2E_CONNS=16384` for more —, reconnect churn, graceful shutdown with 1001, plaintext, TLS and kTLS, and the
-Autobahn TestSuite fuzzingclient when docker and `crossbario/autobahn-testsuite` are available),
+Autobahn TestSuite fuzzingclient when docker and `crossbario/autobahn-testsuite` are available; the `python` step
+runs the same checks and Autobahn 1.*–7.* against `examples/api/python-websocket`, plus 2,000 concurrent
+`await asyncio.sleep(1)` requests — `PY_E2E_SLEEPERS` for more —, lifespan and the upgrade),
 and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
 (GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
 another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
---lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` for Python. See also
+--lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
 [Testing](testing.md).
 
 ## Limitations
@@ -1177,7 +1199,8 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
 - gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
-- Python handlers are bound by the GIL; C callbacks must be thread-safe.
+- Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
+  stalls its event loop (see above).
 - Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
   is not supported).
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`

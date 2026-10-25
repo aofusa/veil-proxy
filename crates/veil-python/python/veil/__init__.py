@@ -26,6 +26,9 @@ import re
 import typing
 import urllib.parse
 
+from ._aio import run_in_threadpool
+from .websockets import WebSocket, WebSocketDisconnect, WebSocketEndpoint, WebSocketState
+
 __all__ = [
     "App",
     "Request",
@@ -36,13 +39,26 @@ __all__ = [
     "StreamingResponse",
     "EventSourceResponse",
     "Protocol",
+    "AsyncProtocol",
     "Listener",
+    "WebSocket",
+    "WebSocketDisconnect",
+    "WebSocketEndpoint",
+    "WebSocketState",
+    "run_in_threadpool",
     "route",
     "get",
     "post",
     "put",
     "delete",
     "patch",
+    "websocket",
+    "on_startup",
+    "on_shutdown",
+    "on_event",
+    "State",
+    "SwitchingProtocols",
+    "WebSocketRoute",
     "run",
     "shutdown",
 ]
@@ -208,6 +224,16 @@ class Response:
     def _triple(self):
         return (self.status, self.headers, self.body)
 
+    @staticmethod
+    def switching_protocols(protocol, factory, headers=None):
+        """Answer ``101 Switching Protocols`` to ``protocol`` (HTTP/1.1 only) and serve the connection with ``factory()``.
+
+        ``factory`` returns a :class:`Protocol` (callbacks on the handler pool) or an :class:`AsyncProtocol`
+        (``async def`` callbacks on the event loop). The request must ask for the upgrade
+        (``Connection: upgrade`` and ``Upgrade``); otherwise veil answers 400.
+        """
+        return SwitchingProtocols(protocol, factory, headers)
+
 
 def _aiter_sync(agen):
     """Wrap an async iterator as a synchronous iterator driven by the thread's event loop."""
@@ -238,6 +264,16 @@ class StreamingResponse(Response):
         if hasattr(c, "__aiter__"):
             return _aiter_sync(c)
         return iter(c)
+
+    async def _aiter(self):
+        # 常駐のイベントループで送るとき（非同期のイテレータはループの上でそのまま回す）
+        c = self.content
+        if hasattr(c, "__aiter__"):
+            async for x in c:
+                yield x
+        else:
+            for x in c:
+                yield x
 
     @property
     def body(self):
@@ -284,6 +320,10 @@ class EventSourceResponse(StreamingResponse):
     def _iter(self):
         return (_sse_event(x) for x in super()._iter())
 
+    async def _aiter(self):
+        async for x in super()._aiter():
+            yield _sse_event(x)
+
 
 def _stream_of(result, status):
     """Turn a generator or async generator returned by a handler into a streaming response (called from Rust); otherwise return ``None``."""
@@ -310,6 +350,52 @@ class Protocol:
     def connection_lost(self, exc):
         """Called when the connection is closed."""
         pass
+
+
+class AsyncProtocol(Protocol):
+    """Like :class:`Protocol`, but ``data_received`` and ``connection_lost`` may be ``async def`` (run on the event loop).
+
+    The callbacks still run one at a time per connection; ``self.transport.write`` is valid while one runs.
+    """
+
+
+class _AsyncProtocolShim:
+    """Runs the ``async def`` callbacks of an :class:`AsyncProtocol` on the event loop (called on the handler pool)."""
+
+    def __init__(self, proto):
+        self.proto = proto
+
+    def _run(self, r):
+        if inspect.iscoroutine(r):
+            from . import _aio
+
+            el = _aio.first()
+            if el is None:
+                raise RuntimeError("AsyncProtocol needs the event loop")
+            el.run_sync(r)
+
+    def connection_made(self, transport):
+        self._run(self.proto.connection_made(transport))
+
+    def data_received(self, data):
+        self._run(self.proto.data_received(data))
+
+    def connection_lost(self, exc):
+        self._run(self.proto.connection_lost(exc))
+
+
+class SwitchingProtocols(Response):
+    """``101 Switching Protocols`` returned by :meth:`Response.switching_protocols`."""
+
+    def __init__(self, protocol, factory, headers=None):
+        super().__init__(b"", 101, headers)
+        self.protocol = str(protocol)
+        self._factory = factory
+
+    def _make_protocol(self):
+        # Rust（ハンドラ用プール）から接続ごとに呼ぶ
+        p = self._factory()
+        return _AsyncProtocolShim(p) if isinstance(p, AsyncProtocol) else p
 
 
 class JSONResponse(Response):
@@ -441,6 +527,8 @@ def _build_params(func, path_names):
         base, _ = _unwrap_optional(ann)
         if name in ("req", "request") or (isinstance(base, type) and issubclass(base, Request)):
             out.append(_Param(name, "request", base, None, p.default))
+        elif name == "websocket" or (isinstance(base, type) and issubclass(base, WebSocket)):
+            out.append(_Param(name, "websocket", base, None, p.default))
         elif name in path_names:
             out.append(_Param(name, "path", base, None, p.default))
         elif _is_model(base):
@@ -571,8 +659,14 @@ def _is_validation_error(exc):
 class Route:
     """One registered route. ``handle()`` is independent of Rust and can be unit-tested."""
 
-    def __init__(self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False):
+    def __init__(
+        self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False, async_mode=None
+    ):
         self.func = func
+        # async def の実行先（None = [api] python_async_mode の既定、"loop" = 常駐のループ、"pool" = 旧来）
+        if async_mode not in (None, "loop", "pool"):
+            raise ValueError('async_mode must be "loop" or "pool"')
+        self.async_mode = async_mode
         self.stream_body = stream_body
         self.path = path
         self.methods = [m.upper() for m in methods]
@@ -763,7 +857,20 @@ class Route:
             except HTTPException as e:
                 return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
 
+        self._invoke = invoke
         return call
+
+    async def _acall(self, req):
+        """Like ``_call``, on the persistent event loop (the coroutine is awaited instead of run to completion)."""
+        try:
+            result = self._invoke(req)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except _ValidationFailed as e:
+            return JSONResponse({"detail": e.errors}, 422)
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, e.status_code, e.headers)
 
     # ---- OpenAPI ----
 
@@ -838,6 +945,112 @@ class Route:
     def openapi_json(self):
         """Return the Operation Object as a JSON string."""
         return json.dumps(self.openapi(), separators=(",", ":"), ensure_ascii=False)
+
+
+class WebSocketRoute(Route):
+    """A WebSocket route (``@app.websocket``). The handler gets a :class:`WebSocket`; path and query parameters
+    are bound as for HTTP routes."""
+
+    def __init__(
+        self,
+        func,
+        path,
+        receive=None,
+        send=None,
+        subprotocols=None,
+        tags=None,
+        summary=None,
+        include_in_schema=True,
+        validate=False,
+    ):
+        self.endpoint = func if inspect.isclass(func) and issubclass(func, WebSocketEndpoint) else None
+        target = func if self.endpoint is None else (lambda websocket: None)
+        super().__init__(target, path, ["GET"], True, None, tags, summary, 101)
+        if self.endpoint is not None:
+            self.func = func
+        self.receive = receive
+        self.send = send
+        self.subprotocols = list(subprotocols or [])
+        self.include_in_schema = include_in_schema
+        self.validate = validate
+        if self.endpoint is None and not self.is_async:
+            raise TypeError("@app.websocket needs an async def handler or a WebSocketEndpoint subclass")
+        if any(p.kind == "body" for p in self.params):
+            raise TypeError("WebSocket handlers cannot take a request body")
+
+    async def call(self, ws, req):
+        """Bind the parameters and run the handler (called on the event loop)."""
+        try:
+            kwargs = self.bind(req)
+        except _ValidationFailed:
+            ws._n.reject(422)
+            ws.application_state = WebSocketState.DISCONNECTED
+            return
+        for p in self.params:
+            if p.kind == "websocket":
+                kwargs[p.name] = ws
+        await self.func(**kwargs)
+
+    def _endpoint_session(self, sender, req):
+        # WebSocketEndpoint の接続ごとのセッション（Rust のハンドラ用プールから呼ぶ）
+        from .websockets import _EndpointSession
+
+        return _EndpointSession(self.endpoint, sender, req)
+
+    def openapi(self):
+        """The Operation Object of the handshake (``GET`` → 101) with ``x-veil-websocket``."""
+        func = self.func
+        doc = inspect.getdoc(func) or ""
+        lines = doc.strip().splitlines()
+        name = func.__name__
+        summary = self.summary or (lines[0].strip() if lines else name.replace("_", " ").title())
+        op = {"operationId": name, "summary": summary}
+        if len(lines) > 1:
+            op["description"] = "\n".join(lines[1:]).strip()
+        if self.tags:
+            op["tags"] = self.tags
+        params = []
+        for p in self.params:
+            if p.kind in ("path", "query"):
+                schema = _scalar_schema(p.ann)
+                if p.default is not _EMPTY and p.default is not None and not isinstance(p.default, (dict, list)):
+                    schema["default"] = p.default
+                params.append(
+                    {"name": p.name, "in": p.kind, "required": p.kind == "path" or p.required, "schema": schema}
+                )
+        if self.subprotocols:
+            params.append(
+                {
+                    "name": "Sec-WebSocket-Protocol",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string", "enum": self.subprotocols},
+                }
+            )
+        if params:
+            op["parameters"] = params
+        comps = {}
+        x = {}
+        if self.subprotocols:
+            x["subprotocols"] = self.subprotocols
+        if self.receive is not None:
+            x["receive"] = self._model_ref(self.receive, comps)
+        if self.send is not None:
+            x["send"] = self._model_ref(self.send, comps)
+        if self.receive is not None or self.send is not None:
+            x["messageFormat"] = "text/json"
+        # 応答（101・400・426）・maxMessageSize・接続の例は Rust の OpenAPI の生成が足す
+        op["x-veil-websocket"] = x
+        if comps:
+            op["x-veil-components"] = comps
+        return op
+
+
+class State:
+    """Free-form attributes shared by the application (``app.state``; the lifespan may fill it)."""
+
+    def __init__(self, values=None):
+        self.__dict__.update(values or {})
 
 
 # --------------------------------------------------------------------------
@@ -927,10 +1140,21 @@ class Listener:
 class App:
     """A set of routes. Register with ``@app.get(...)`` and start with ``app.run()``."""
 
-    def __init__(self, title="veil API", version="0.1.0"):
-        """Create an application with the OpenAPI ``title`` and ``version``."""
+    def __init__(self, title="veil API", version="0.1.0", lifespan=None, on_startup=None, on_shutdown=None):
+        """Create an application with the OpenAPI ``title`` and ``version``.
+
+        ``lifespan`` is FastAPI's: a function taking the app and returning an async context manager (for example
+        an ``@contextlib.asynccontextmanager`` generator). Its code before ``yield`` runs on the event loop before
+        the listeners open (an exception stops the start with exit code 1), the code after ``yield`` once the
+        server stopped. A dict it yields is merged into ``app.state``.
+        """
         self.title = title
         self.version = version
+        self.lifespan = lifespan
+        self.startup_handlers = list(on_startup or [])
+        self.shutdown_handlers = list(on_shutdown or [])
+        self.state = State()
+        self.websocket_routes = []
         self.routes = []
         self.grpc_methods = []  # (path, handler)  handler.handle(call) -> (code, message)
         self.grpc_health = False
@@ -946,6 +1170,7 @@ class App:
         summary=None,
         status_code=200,
         stream_body=False,
+        async_mode=None,
     ):
         """Register a handler for ``path`` and ``methods`` (default ``["GET"]``); use as a decorator.
 
@@ -953,15 +1178,106 @@ class App:
         handlers only). ``body_constraints`` validates dict bodies without pydantic. ``tags`` and ``summary`` go
         to OpenAPI, ``status_code`` is the default status. With ``stream_body=True`` the handler is called before
         the request body has arrived and ``req.stream()`` reads it as it comes.
+
+        ``async def`` handlers run on the persistent event loop (like uvicorn: do not block in them, use
+        :func:`run_in_threadpool`). ``async_mode="pool"`` runs them to completion on the handler pool instead, as
+        before (one pool thread per waiting request); ``stream_body=True`` routes always do.
         """
 
         def deco(func):
             self.routes.append(
-                Route(func, path, methods or ["GET"], offload, body_constraints, tags, summary, status_code, stream_body)
+                Route(
+                    func,
+                    path,
+                    methods or ["GET"],
+                    offload,
+                    body_constraints,
+                    tags,
+                    summary,
+                    status_code,
+                    stream_body,
+                    async_mode,
+                )
             )
             return func
 
         return deco
+
+    def websocket(
+        self,
+        path,
+        *,
+        receive=None,
+        send=None,
+        subprotocols=None,
+        tags=None,
+        summary=None,
+        include_in_schema=True,
+        validate=False,
+    ):
+        """Register a WebSocket handler for ``path`` (HTTP/1.1); use as a decorator.
+
+        Decorate an ``async def handler(websocket: veil.WebSocket, ...)`` (it runs on the event loop and must call
+        ``await websocket.accept()``) or a :class:`WebSocketEndpoint` subclass. ``receive`` / ``send`` are pydantic
+        models of the JSON messages for OpenAPI (``x-veil-websocket``); with ``validate=True``
+        ``websocket.receive_json()`` closes with 1007 when a message does not match ``receive``. ``subprotocols``
+        lists the ``Sec-WebSocket-Protocol`` values for OpenAPI. ``include_in_schema=False`` leaves the route out
+        of OpenAPI.
+        """
+
+        def deco(func):
+            self.websocket_routes.append(
+                WebSocketRoute(func, path, receive, send, subprotocols, tags, summary, include_in_schema, validate)
+            )
+            return func
+
+        return deco
+
+    # ---- 起動と終了（lifespan） ----
+
+    def on_startup(self, func):
+        """Register a function (``def`` or ``async def``) run before the server starts; use as a decorator."""
+        self.startup_handlers.append(func)
+        return func
+
+    def on_shutdown(self, func):
+        """Register a function (``def`` or ``async def``) run after the server stopped; use as a decorator."""
+        self.shutdown_handlers.append(func)
+        return func
+
+    def on_event(self, event):
+        """FastAPI's ``@app.on_event("startup" | "shutdown")``."""
+        if event == "startup":
+            return self.on_startup
+        if event == "shutdown":
+            return self.on_shutdown
+        raise ValueError('event must be "startup" or "shutdown"')
+
+    async def _startup(self):
+        if self.lifespan is not None:
+            self._lifespan_cm = self.lifespan(self)
+            v = await self._lifespan_cm.__aenter__()
+            if isinstance(v, dict):
+                self.state.__dict__.update(v)
+        for f in self.startup_handlers:
+            r = f()
+            if inspect.isawaitable(r):
+                await r
+
+    async def _shutdown(self):
+        for f in self.shutdown_handlers:
+            try:
+                r = f()
+                if inspect.isawaitable(r):
+                    await r
+            except Exception:  # noqa: BLE001  残りの終了処理も行う
+                import traceback
+
+                traceback.print_exc()
+        cm = getattr(self, "_lifespan_cm", None)
+        if cm is not None:
+            self._lifespan_cm = None
+            await cm.__aexit__(None, None, None)
 
     # ---- L4（F-210） ----
 
@@ -1068,6 +1384,9 @@ class App:
         openapi=True,
         listeners=None,
         http3=None,
+        event_loops=None,
+        event_loop=None,
+        async_mode=None,
     ):
         """Start the server and block until it stops (Ctrl-C, SIGTERM or :func:`shutdown`).
 
@@ -1077,8 +1396,13 @@ class App:
         the same keys) for several ports; with any listener the default ``127.0.0.1:8080`` is not opened unless
         ``listen_cleartext`` is given. ``overrides`` maps config keys to Python values, e.g.
         ``{"server.threads": 4}``. ``openapi=False`` disables ``/openapi.json`` and ``/docs``.
+
+        ``event_loops`` (``[api] python_event_loops``, default 1) is the number of persistent event loops,
+        ``event_loop`` (``[api] python_event_loop``: ``"auto"``, ``"asyncio"`` or ``"uvloop"``) their kind, and
+        ``async_mode`` (``[api] python_async_mode``: ``"loop"`` or ``"pool"``) where ``async def`` handlers run
+        by default.
         """
-        from . import _veil
+        from . import _aio, _veil
 
         cfg = self.build_config(
             config_path,
@@ -1095,10 +1419,28 @@ class App:
         # サーバの中で渡る Rust 側の型も isinstance(x, veil.Request / veil.Headers) で真にする
         Request.register(_veil.NativeRequest)
         Headers.register(_veil.NativeHeaders)
+
+        def setting(arg, key, default):
+            if arg is not None:
+                return arg
+            v = cfg.api_setting(key)
+            return default if v is None else v
+
+        mode = setting(async_mode, "python_async_mode", "loop")
+        if mode not in ("loop", "pool"):
+            raise ValueError('python_async_mode must be "loop" or "pool", not %r' % (mode,))
         for r in self.routes:
             hid = len(_HANDLERS)
             _HANDLERS.append(r)
-            _veil.register_route(r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code, r.stream_body)
+            on_loop = r.is_async and not r.stream_body and (r.async_mode or mode) == "loop"
+            _veil.register_route(
+                r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code, r.stream_body, on_loop
+            )
+        for r in self.websocket_routes:
+            hid = len(_HANDLERS)
+            _HANDLERS.append(r)
+            meta = r.openapi_json() if r.include_in_schema else None
+            _veil.register_websocket(r.path, hid, meta, r.endpoint is not None, not r.include_in_schema)
         for path, handler in self.grpc_methods:
             hid = len(_HANDLERS)
             _HANDLERS.append(handler)
@@ -1109,7 +1451,28 @@ class App:
             hid = len(_HANDLERS)
             _HANDLERS.append(f)
             (_veil.register_l4_tcp if kind == "tcp" else _veil.register_l4_udp)(name, listen, hid)
-        _veil.run(cfg, _HANDLERS)
+        # 常駐のイベントループ（ワーカーは GIL を取らず、キュー + ソケットの組で投入する）
+        fds = _aio.start(
+            setting(event_loops, "python_event_loops", 1), setting(event_loop, "python_event_loop", "auto")
+        )
+        _veil.aio_setup(fds, int(setting(None, "python_event_loop_queue", 65536)))
+        el = _aio.first()
+        try:
+            el.run_sync(self._startup())
+        except Exception:  # noqa: BLE001  起動を止める（終了コード 1）
+            import sys
+            import traceback
+
+            traceback.print_exc()
+            print("veil: application startup failed; exiting", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            _veil.run(cfg, _HANDLERS)
+        finally:
+            try:
+                el.run_sync(self._shutdown(), 30)
+            finally:
+                _aio.stop()
 
 
 # モジュールレベルの既定 App（``@veil.get(...)`` / ``veil.run(...)``）
@@ -1121,6 +1484,10 @@ put = _default_app.put
 delete = _default_app.delete
 patch = _default_app.patch
 run = _default_app.run
+websocket = _default_app.websocket
+on_startup = _default_app.on_startup
+on_shutdown = _default_app.on_shutdown
+on_event = _default_app.on_event
 l4_tcp = _default_app.l4_tcp
 l4_udp = _default_app.l4_udp
 

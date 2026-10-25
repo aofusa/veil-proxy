@@ -358,6 +358,68 @@ run_python() {
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
   run_python_f210 "$PY"
+  run_python_ws "$PY"
+}
+
+run_python_ws() { # F-263: 常駐のイベントループ・WebSocket・アップグレード・lifespan（examples/api/python-websocket）
+  local PY="$1"
+  echo "== Python: event loop / WebSocket / upgrade / lifespan (F-263)"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_aio.py) > "$TMPD/aio.log" 2>&1 && ok "py test_aio.py" || { bad "py test_aio.py"; tail -20 "$TMPD/aio.log"; }
+  "$PY" -m pip -q install pydantic >/dev/null 2>&1 || echo "  skip py /typed: pydantic is not installable here"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$ROOT/examples/api/python-websocket/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "python-websocket start"; cat "$W/log"; return; }
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" python "$P" | sed "s|^|  |" | tee "$W/r"
+  grep -q "FAIL" "$W/r" && FAIL=1
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" "${WS_E2E_CONNS:-2000}" | sed "s|^|  py |" | tee "$W/r"
+  grep -q "^  py ok" "$W/r" || FAIL=1
+  # 常駐のループ: await asyncio.sleep(1) を同時に（既定 2,000 本。PY_E2E_SLEEPERS=32768 で多くの接続を）
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" sleepers "$P" "${PY_E2E_SLEEPERS:-2000}" | sed "s|^|  py |" | tee "$W/r"
+  grep -q "^  py ok" "$W/r" || FAIL=1
+  expect "py OpenAPI lists /ws with x-veil-websocket" "True ['echo.v1'] False" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; ps=json.load(sys.stdin)[\"paths\"]; o=ps[\"/ws\"][\"get\"]; print(\"101\" in o[\"responses\"], o[\"x-veil-websocket\"][\"subprotocols\"], \"/hidden\" in ps)'"
+  expect "py WebSocket on h2c is 400" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/ws"
+  if [ "$OS" != Windows ]; then
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+    local HP=$!
+    for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+    kill "$PID"; wait "$HP"
+    grep -q "close 1001" "$W/hold" && ok "py graceful shutdown sends Close 1001" || bad "py graceful shutdown sends Close 1001: $(cat "$W/hold")"
+    for _ in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+    grep -q "lifespan: shutdown" "$W/log" && ok "py lifespan shutdown runs after the server stopped" || bad "py lifespan shutdown: $(tail -5 "$W/log")"
+  fi
+  py_stop "$PID" 2>/dev/null
+  # lifespan の開始で例外なら起動しない（終了コード 1）
+  printf 'import contextlib, veil\n@contextlib.asynccontextmanager\nasync def ls(app):\n    raise RuntimeError("no db")\n    yield\napp = veil.App(lifespan=ls)\napp.run(listen_cleartext="127.0.0.1:%s")\n' "$(free_port)" > "$W/bad.py"
+  tmo 60 "$PY" "$W/bad.py" > "$W/bad.log" 2>&1
+  local rc=$?
+  [ "$rc" = 1 ] && grep -q "no db" "$W/bad.log" && ok "py lifespan startup failure exits 1" || bad "py lifespan startup failure (exit $rc): $(tail -3 "$W/bad.log")"
+  run_python_autobahn "$PY"
+}
+
+run_python_autobahn() { # Autobahn TestSuite の 1.*〜7.*（Python の /ws のエコー）
+  local PY="$1"
+  if ! command -v docker >/dev/null || ! docker image inspect crossbario/autobahn-testsuite >/dev/null 2>&1; then
+    echo "  skip py Autobahn TestSuite (docker or crossbario/autobahn-testsuite is missing)"
+    return
+  fi
+  mkdir -p "$ROOT/target"
+  local W; W="$(mktemp -d "$ROOT/target/autobahn-py.XXXXXX")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$ROOT/examples/api/python-websocket/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "python-websocket start (autobahn)"; cat "$W/log"; return; }
+  cat > "$W/fuzzingclient.json" <<JSON
+{ "outdir": "/w/reports", "servers": [ {"agent": "veil-python", "url": "ws://127.0.0.1:$P/ws"} ],
+  "cases": ["1.*", "2.*", "3.*", "4.*", "5.*", "6.*", "7.*"], "exclude-cases": [], "exclude-agent-cases": {} }
+JSON
+  tmo 3600 docker run --rm --network host --user "$(id -u):$(id -g)" -v "$W:/w" crossbario/autobahn-testsuite \
+    wstest -m fuzzingclient -s /w/fuzzingclient.json > "$W/autobahn.log" 2>&1 || { bad "py Autobahn fuzzingclient run"; tail -20 "$W/autobahn.log"; }
+  autobahn_summary "$W/reports/index.json" | tee "$W/r"
+  grep -q "^  ok" "$W/r" && ! grep -q "FAIL" "$W/r" || FAIL=1
+  py_stop "$PID" 2>/dev/null
+  rm -rf "$W"
 }
 
 autobahn_summary() { # autobahn_summary <index.json>
