@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|upgrade|c|python|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|c|python|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -314,6 +314,11 @@ head, _, body = d.partition(b"\r\n\r\n")
 ok = head.startswith(b"HTTP/1.1 101 ") and b"x-from: c" in head
 print(body.decode().replace("\n", "|") + ("|x-from: c" if ok else "|bad head " + head.decode()))' "$P"
   expect "C upgrade on h2c is 400" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "$B/upgrade"
+  # F-262: C の WebSocket（veil_ws_accept。コールバックはハンドラ用プール）
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" basic "$P" /ws | sed "s|\$| (C)|; s|^|  |" | tee "$W/wsr"
+  grep -q "FAIL" "$W/wsr" && FAIL=1
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" 200 | sed "s|\$| (C)|; s|^|  |" | tee "$W/wsr"
+  grep -q "^  ok" "$W/wsr" || FAIL=1
   expect "C L4 UDP echo" "echo:c-udp" l4_echo udp "$U" c-udp
   (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
@@ -353,6 +358,24 @@ run_python() {
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
   run_python_f210 "$PY"
+}
+
+autobahn_summary() { # autobahn_summary <index.json>
+  "$PY3" -I - "$1" <<'PY' | sed "s|^|  |"
+import json, sys
+idx = json.load(open(sys.argv[1]))
+for agent, cases in sorted(idx.items()):
+    # 13.* の UNIMPLEMENTED は「申し出のパラメータ（サーバの窓を 15 より小さく）を断った」もので、RFC 7692 で許される
+    def good(c, r):
+        ok = ("OK", "NON-STRICT", "INFORMATIONAL") + (("UNIMPLEMENTED",) if c.startswith("13.") else ())
+        return r["behavior"] in ok and r["behaviorClose"] in ("OK", "INFORMATIONAL")
+    badc = [(c, r["behavior"], r["behaviorClose"]) for c, r in cases.items() if not good(c, r)]
+    unimpl = sum(1 for r in cases.values() if r["behavior"] == "UNIMPLEMENTED")
+    if badc:
+        print(f"FAIL Autobahn {agent}: {len(badc)} of {len(cases)} cases failed: {badc[:20]}")
+    else:
+        print(f"ok   Autobahn {agent}: {len(cases)} cases OK / NON-STRICT / INFORMATIONAL ({unimpl} UNIMPLEMENTED in 13.*)")
+PY
 }
 
 py_stop() { # py_stop <pid>（Windows の venv の python はランチャなので子ごと止める）
@@ -607,6 +630,95 @@ RS
   rm -rf "$BASE"
 }
 
+run_websocket() { # F-262: ハンドラの WebSocket（examples/api/rust-websocket の /ws・/chat・/typed）と Autobahn TestSuite
+  echo "== WebSocket (examples/api/rust-websocket, F-262)"
+  websocket_suite "$ROOT/target/examples-api" ""
+  [ "$OS" = Linux ] && websocket_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+  run_autobahn
+}
+
+websocket_suite() { # websocket_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build websocket example ($label)"; return; }
+  local BIN="$T/debug/veil-example-websocket$EXE"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  # 同時接続の数（既定 2,000。WS_E2E_CONNS=16384 で HttpArena の echo-ws の最大。ulimit -n を上げてから）
+  local CONNS="${WS_E2E_CONNS:-2000}"
+  local ktls_modes="0"; [ "$OS" = Linux ] && ktls_modes="0 1"
+  local K
+  for K in $ktls_modes; do
+    local P S; P=$(free_port); S=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+      VEIL_KTLS=$K VEIL_SHUTDOWN_SECS=10 exec "$BIN") > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
+    local tag="$label, ktls=$K"
+    if [ "$K" = 0 ]; then
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" rust "$P" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" "$CONNS" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" churn "$P" 200 | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      expect "OpenAPI lists /ws with x-veil-websocket ($tag)" "echo.v1" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; o=json.load(sys.stdin)[\"paths\"][\"/ws\"][\"get\"]; print(\"101\" in o[\"responses\"], o[\"x-veil-websocket\"][\"subprotocols\"])'"
+      expect "OpenAPI /typed has receive/send schemas ($tag)" "ChatIn ChatOut" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; x=json.load(sys.stdin)[\"paths\"][\"/typed\"][\"get\"][\"x-veil-websocket\"]; print(x[\"receive\"][\"\$ref\"].split(\"/\")[-1], x[\"send\"][\"\$ref\"].split(\"/\")[-1])'"
+      expect "WebSocket on h2c is 400 ($tag)" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/ws"
+    fi
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" rust "$S" tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "FAIL" "$W/r" && FAIL=1
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$S" 500 tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    if [ "$OS" != Windows ] && [ "$K" = 0 ]; then
+      # graceful shutdown: 開いている WebSocket に Close 1001 を送ってから閉じる
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+      local HP=$!
+      for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+      kill "$PID"; wait "$HP"
+      grep -q "close 1001" "$W/hold" && ok "graceful shutdown sends Close 1001 ($tag)" || bad "graceful shutdown sends Close 1001 ($tag): $(cat "$W/hold")"
+      for _ in $(seq 1 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+      kill -0 "$PID" 2>/dev/null && bad "process exits after closing WebSockets ($tag)" || ok "process exits after closing WebSockets ($tag)"
+    fi
+    kill "$PID" 2>/dev/null; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  done
+}
+
+run_autobahn() { # Autobahn TestSuite の fuzzingclient（docker と crossbario/autobahn-testsuite が要る。無ければ飛ばす）
+  if ! command -v docker >/dev/null || ! docker image inspect crossbario/autobahn-testsuite >/dev/null 2>&1; then
+    echo "  skip Autobahn TestSuite (docker or crossbario/autobahn-testsuite is missing; docker pull crossbario/autobahn-testsuite)"
+    return
+  fi
+  local T="$ROOT/target/examples-api"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q --release) || { bad "build websocket example (release)"; return; }
+  local BIN="$T/release/veil-example-websocket$EXE"
+  # snap の docker は /tmp を見られないので作業場所は target/ の下に置く
+  mkdir -p "$ROOT/target"
+  local W; W="$(mktemp -d "$ROOT/target/autobahn.XXXXXX")"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  # 1.*〜7.*・9.*（性能）・10.* は圧縮無しで、12.*・13.*（permessage-deflate）は websocket_compression = true で回す。
+  # TLS は 1.*〜7.* だけ（同じ復号器なので時間を抑える）
+  local P S; P=$(free_port); S=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_WS_COMPRESSION=1 exec "$BIN") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start (autobahn)"; cat "$W/log"; return; }
+  cat > "$W/fuzzingclient.json" <<JSON
+{ "outdir": "/w/reports", "servers": [
+    {"agent": "veil", "url": "ws://127.0.0.1:$P/ws"},
+    {"agent": "veil-tls", "url": "wss://127.0.0.1:$S/ws"} ],
+  "cases": ["*"], "exclude-cases": [], "exclude-agent-cases": {"veil-tls": ["9.*", "10.*", "12.*", "13.*"]} }
+JSON
+  tmo 3600 docker run --rm --network host --user "$(id -u):$(id -g)" -v "$W:/w" crossbario/autobahn-testsuite \
+    wstest -m fuzzingclient -s /w/fuzzingclient.json > "$W/autobahn.log" 2>&1 || { bad "Autobahn fuzzingclient run"; tail -20 "$W/autobahn.log"; }
+  autobahn_summary "$W/reports/index.json" | tee "$W/r"
+  grep -q "^  ok" "$W/r" && ! grep -q "FAIL" "$W/r" || FAIL=1
+  [ -n "${AUTOBAHN_REPORTS:-}" ] && cp -r "$W/reports" "$AUTOBAHN_REPORTS"
+  kill "$PID" 2>/dev/null
+  rm -rf "$W"
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない（${FULL}）"
   (cd "$ROOT" && cargo build -q $NODEF --features "$FULL") || { bad "build $FULL"; return; }
@@ -624,6 +736,9 @@ run_nonregression() {
   # F-261: アップグレードの記号（veil::api::upgrade）も入らない
   n=$(grep -cE "veil::api::upgrade|veil_response_upgrade" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::upgrade in the full binary" || bad "upgrade symbols found ($n)"
+  # F-262: WebSocket の終端（veil::api::ws・C の veil_ws_*）も入らない
+  n=$(grep -cE "veil::api::ws|veil_ws_" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::ws in the full binary" || bad "WebSocket handler symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-198: api の既定（tokio-compat）は tokio に依存しない
@@ -650,11 +765,13 @@ case "$WHAT" in
   rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
   upgrade) run_upgrade ;;
+  websocket) run_websocket ;;
+  autobahn) run_autobahn ;;
   c) run_c; run_c_features ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
   external) run_external ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_c; run_c_features; run_python ;;
-  *) echo "usage: $0 [rust|grpc|upgrade|c|python|nonregression|external|all]"; exit 2 ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_c; run_c_features; run_python ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|c|python|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

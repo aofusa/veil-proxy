@@ -83,6 +83,23 @@ pub struct OperationMeta {
     /// An OpenAPI Operation Object given as is (the metadata JSON of Python and C).
     /// When present, it is merged and takes precedence over the fields above.
     pub raw: Option<Value>,
+    // F-262
+    /// The route is a WebSocket endpoint (documented as `GET` → 101 with `x-veil-websocket`).
+    pub websocket: Option<WebSocketMeta>,
+}
+
+// F-262: OpenAPI に WebSocket のルートを載せるための情報（`x-veil-websocket`）。
+/// OpenAPI metadata of a WebSocket route.
+#[derive(Debug, Clone, Default)]
+pub struct WebSocketMeta {
+    /// The subprotocols the route accepts (`Sec-WebSocket-Protocol`).
+    pub subprotocols: Vec<String>,
+    /// The schema of the messages the client sends.
+    pub receive: Option<Value>,
+    /// The schema of the messages the server sends.
+    pub send: Option<Value>,
+    /// The format of the messages (such as `text/json`), if known.
+    pub message_format: Option<String>,
 }
 
 /// A route definition registered statically by the `#[veil::route]` macro.

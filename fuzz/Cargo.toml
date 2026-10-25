@@ -16,6 +16,8 @@ veil = { package = "veil-proxy", path = "..", features = ["http2", "grpc"] }
 # wasm_abi ターゲット用の passthrough。既定ビルドに wasmtime を強制しないため
 # opt-in（`cargo fuzz run wasm_abi --features wasm`）。
 wasm = ["veil/wasm"]
+# ws_frame_decode ターゲット用（WebSocket はライブラリ専用のコード。`cargo fuzz run ws_frame_decode --features api`）
+api = ["veil/handler", "veil/compression"]
 
 [[bin]]
 name = "hpack_decode"
@@ -92,3 +94,11 @@ path = "fuzz_targets/qpack_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ws_frame_decode"
+path = "fuzz_targets/ws_frame_decode.rs"
+test = false
+doc = false
+bench = false
+required-features = ["api"]

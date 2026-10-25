@@ -240,6 +240,12 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
 | `grpc_web_cors_origins` | `[]` | ブラウザから gRPC-Web で呼んでよい Origin（`["*"]` で全部）。空なら CORS のヘッダを付けず、プリフライトは 403 |
 | `upgrade_idle_timeout_secs` | `0` | アップグレードした HTTP/1.1 の接続で `read` が待てる秒数（0 = 無制限） |
+| `websocket_max_message_size` | `16777216` | 組み立て後の WebSocket のメッセージの上限（超えたら 1009 で閉じる） |
+| `websocket_max_frame_size` | `16777216` | WebSocket の 1 フレームの上限 |
+| `websocket_ping_interval_secs` | `0` | サーバから WebSocket に Ping を送る間隔（0 = 送らない） |
+| `websocket_idle_timeout_secs` | `0` | フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限） |
+| `websocket_compression` | `false` | クライアントが申し出たら permessage-deflate（RFC 7692）を交渉する（`compression` feature が必要） |
+| `openapi_websocket` | `true` | WebSocket のルートを OpenAPI に載せる |
 
 ## ルーティングマクロ
 
@@ -379,6 +385,74 @@ async fn echo(req: Request) -> Response {
   `on_close`、`veil_l4_write`）で受けます。Rust でも `Upgraded::serve_blocking`（`l4-handler`）で同じ形にできます。
 
 例: [examples/api/rust-websocket/](../../../examples/api/rust-websocket/)。
+
+### WebSocket
+
+`veil::api::ws` でハンドラが WebSocket（RFC 6455）を終端します。`WebSocketUpgrade` はハンドシェイク（HTTP/1.1・`GET`・
+`Upgrade: websocket`・`Connection: upgrade`・`Sec-WebSocket-Version: 13`・16 バイトの `Sec-WebSocket-Key`）を検査する抽出子で、
+正しくなければ 400、版違いは 426 と `Sec-WebSocket-Version: 13` を返します。`on_upgrade` は `Sec-WebSocket-Accept` 付きの
+101 を返し、接続を渡して関数を呼びます。
+
+```rust
+use veil::api::ws::{Message, WebSocket, WebSocketUpgrade};
+
+#[veil::route(path = "/ws", method = "GET", ws_protocols = ["chat.v1"])]
+async fn ws(upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .protocols(["chat.v1"])          // 任意: Sec-WebSocket-Protocol の選択
+        .max_message_size(1 << 20)       // 任意: 既定は [api] websocket_max_message_size
+        .on_upgrade(|mut ws: WebSocket| async move {
+            while let Some(Ok(msg)) = ws.recv().await {
+                match msg {
+                    Message::Text(_) | Message::Binary(_) => { if ws.send(msg).await.is_err() { break } }
+                    Message::Close(_) => break,
+                    _ => {}              // Ping には自動で Pong を返す
+                }
+            }
+        })
+}
+```
+
+- `Message` は `Text(Utf8Bytes) | Binary(Bytes) | Ping(Bytes) | Pong(Bytes) | Close(Option<CloseFrame>)`。`Utf8Bytes` は
+  `Bytes` の包み（検査は 1 回、複製は参照カウントだけ）です。
+- `WebSocket`: `recv()`・`send(msg)`・`send_batch(&[msg])`（1 回の書き込み）・`flush()`・`ping(bytes)`・`close(code, reason)`・
+  `protocol()`・`client_ip()`・`split()`。`split` は `WsReceiver`（接続を進める側。`recv` を呼び続ける）と `WsSender`
+  （`Clone + Send`。どのタスク・スレッドからも待たずに積めるキュー。ブロードキャスト等に。積める量は 16 MiB まで）を返します。
+- プロトコルの処理は veil が行います: 断片化したメッセージの組み立て（途中の制御フレームも可）、断片をまたぐ UTF-8 の検査
+  （1007）、マスクの無いクライアントのフレーム・予約ビット・未知の opcode・不正な制御フレームは 1002、上限超えは 1009、
+  受けた Close には同じコードを返します。関数が戻ると未送信を送り、閉じる手順を終えます（1000）。graceful shutdown では
+  Close 1001 を送ります（`recv` は `Message::Close(Some(1001))` を返します）。
+- フレームはプールの受信バッファの中で復号します（マスクは 8 バイトずつ外し、本文は `Bytes` の切り出し）。待っている接続は
+  バッファを持ちません。サーバのフレームはヘッダと本文を 1 回の `writev` で送り、まとめて届いたメッセージへの返信は次の
+  読み取りの前にまとめて送ります。
+- `auto_pong(false)` で Ping に自動で応えず渡します。`[api] websocket_ping_interval_secs` で Ping を送り、
+  `websocket_idle_timeout_secs` で黙った接続を閉じます。
+- `origin(&["https://app.example"])` で許す `Origin` を絞れます（違えば 403）。既定は検査しません。ブラウザはクロスサイトの
+  WebSocket のハンドシェイクにも Cookie を付けるので、Cookie で認証するなら絞ってください（クロスサイト WebSocket ハイジャック）。
+- permessage-deflate（RFC 7692）は `[api] websocket_compression = true` のときだけ交渉します（既定は off。展開後の大きさは
+  `websocket_max_message_size` で制限）。
+- WebSocket は HTTP/1.1 だけです。HTTP/2・HTTP/3 のハンドシェイクは 400 になります（RFC 8441 / RFC 9220 は非対応）。
+- メトリクス（`metrics` feature）: `veil_proxy_websocket_connections`（開いている接続数）と
+  `veil_proxy_websocket_messages_total{direction="received"|"sent"}`。
+- アップグレードした接続と同じく `[security] max_concurrent_connections` に数えます。
+
+**OpenAPI.** WebSocket のルートは（`[api] openapi_websocket = false` でなければ）`GET` の操作として載ります。応答は 101・400・426、
+ヘッダの引数 `Sec-WebSocket-Protocol`（`ws_protocols` から）、拡張 `x-veil-websocket` に `subprotocols`・`maxMessageSize`、
+`ws_receive = T` / `ws_send = T`（`derive(veil::Schema)` の型）を書けばメッセージのスキーマ `receive`（クライアント → サーバ）・
+`send`（サーバ → クライアント）と `messageFormat: "text/json"` が入ります。Swagger UI ではこれらの操作の「Try it out」を出しません。
+`upgrade.messages::<In, Out>().validate(true)` で受けたテキストを `In` として検査し、合わなければ 1007 で閉じます。
+
+**tokio のライブラリ.** `Upgraded::into_tokio_io()`（`tokio-compat`）を使えば、素の `Response::switching_protocols` の上で
+tokio-tungstenite・fastwebsockets が `veil::tokio` 上で動きます。axum の `WebSocketUpgrade` は hyper の `OnUpgrade` が要るので
+tower の橋渡しでは動きません。`veil::api::ws` か tokio-tungstenite を使ってください。
+
+**C.** ルートのコールバックの中で `veil_ws_accept(req, resp, &callbacks, ud)` を呼ぶと応答が 101 になります（正しくなければ
+400 / 426 で `VEIL_ERR_STATE`）。`on_open`・`on_message(ws, opcode, data, len, ud)`・`on_close(ws, code, ud)` はハンドラ用プールで
+接続ごとに 1 つずつ順に呼ばれます。`veil_ws_send(ws, VEIL_WS_TEXT | VEIL_WS_BINARY, data, len)`（コピーする。どのスレッドからでも）と
+`veil_ws_close(ws, code)` はフレームを積みます。OpenAPI には `x-veil-websocket` を含む操作の JSON を `veil_register_route_ex` に渡して載せます。
+
+例: [examples/api/rust-websocket/](../../../examples/api/rust-websocket/)（`/ws` のエコー、`split` を使う `/chat` のブロードキャスト、
+JSON の `/typed`）。C は [examples/api/c-features/](../../../examples/api/c-features/) の `/ws`。
 
 ## バリデーションと OpenAPI
 
@@ -850,6 +924,7 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
   `veil_register_l4_udp(cfg, name, listen, fn, ud)`（`veil_l4_reply` でデータグラムに応答）。
 - プロトコルアップグレード（HTTP/1.1）: `veil_response_upgrade(resp, protocol, &callbacks, ud)` で 101 を返し、接続を L4 の
   TCP と同じコールバックで受けます（[プロトコルアップグレード](#プロトコルアップグレードhttp11)）。
+- WebSocket: `veil_ws_accept(req, resp, &callbacks, ud)`・`veil_ws_send`・`veil_ws_close`（[WebSocket](#websocket)）。
 - ストリーミングの関数は `VEIL_ROUTE_INLINE` のルートでは使えません（`VEIL_ERR_STATE`）。
 
 全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
@@ -1027,11 +1102,11 @@ F-212 の後に測り直した値です（前のバインディングと 5 ラ�
 ## テスト
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # 既定: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # 既定: all
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
-OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
+OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`websocket` は WebSocket の試験（ハンドシェイク・エコー・断片化・まとめ送り・プロトコル違反・2,000 接続〈`WS_E2E_CONNS=16384` で増やせる〉・繋ぎ直しの繰り返し・graceful shutdown の 1001、平文・TLS・kTLS。docker と `crossbario/autobahn-testsuite` があれば Autobahn TestSuite の fuzzingclient も）です。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
 cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
 （python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` です。
@@ -1042,7 +1117,7 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
-- プロトコルアップグレードは HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
+- プロトコルアップグレードと WebSocket は HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります
   （`/openapi.json` はオフラインでも使えます）。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

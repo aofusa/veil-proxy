@@ -55,3 +55,21 @@ pub use ring::rand::{SecureRandom, SystemRandom};
 pub use aws_lc_rs::hmac;
 #[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
 pub use ring::hmac;
+
+// F-262: WebSocket の `Sec-WebSocket-Accept`（SHA-1(key + GUID)）。依存を増やさずプラットフォームの暗号プロバイダを使う
+// （ライブラリ専用。本体のバイナリには入らない）。
+/// SHA-1 of the concatenation of `parts` (legacy use only: the WebSocket handshake).
+#[cfg(feature = "handler")]
+pub(crate) fn sha1_legacy(parts: &[&[u8]]) -> [u8; 20] {
+    #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+    use aws_lc_rs::digest;
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    use ring::digest;
+    let mut ctx = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
+    for p in parts {
+        ctx.update(p);
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}

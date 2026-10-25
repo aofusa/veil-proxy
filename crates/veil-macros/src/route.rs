@@ -19,6 +19,10 @@ struct RouteArgs {
     offload: Option<bool>,
     hidden: bool,
     streaming: bool,
+    // F-262: WebSocket のルートの OpenAPI（`x-veil-websocket`）
+    ws_receive: Option<Type>,
+    ws_send: Option<Type>,
+    ws_protocols: Vec<String>,
 }
 
 fn str_list(e: &Expr) -> syn::Result<Vec<String>> {
@@ -42,6 +46,16 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
             .get_ident()
             .map(|i| i.to_string())
             .unwrap_or_default();
+        // 型を取る引数（`Vec<T>` のような総称型は式として読めないので先に型として読む）
+        if key == "ws_receive" || key == "ws_send" {
+            let ty: Type = meta.value()?.parse()?;
+            if key == "ws_receive" {
+                a.ws_receive = Some(ty);
+            } else {
+                a.ws_send = Some(ty);
+            }
+            return Ok(());
+        }
         let value: Expr = meta.value()?.parse()?;
         match key.as_str() {
             "path" => {
@@ -53,6 +67,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
             "tags" | "tag" => a.tags.extend(str_list(&value)?),
             "summary" => a.summary = lit_str(&value),
             "description" => a.description = lit_str(&value),
+            "ws_protocols" => a.ws_protocols.extend(str_list(&value)?),
             "status" => match &value {
                 Expr::Lit(l) => match &l.lit {
                     Lit::Int(i) => a.status = Some(i.base10_parse()?),
@@ -76,7 +91,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
             }
             other => {
                 return Err(meta.error(format!(
-                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming)",
+                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming, ws_receive, ws_send, ws_protocols)",
                     other
                 )))
             }
@@ -96,6 +111,8 @@ enum ArgKind {
     Form(Type),
     /// Extracted with `FromRequest` (State, Headers, Bytes and so on).
     FromRequest(Type),
+    /// `WebSocketUpgrade` (extracted with `FromRequest`; the route is documented as a WebSocket endpoint).
+    WebSocket(Type),
     PathParam(String, Type),
     QueryParam {
         name: String,
@@ -124,6 +141,7 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
             }
         }
         "State" | "Headers" | "Bytes" | "Body" => return ArgKind::FromRequest(ty.clone()),
+        "WebSocketUpgrade" => return ArgKind::WebSocket(ty.clone()),
         _ => {}
     }
     let name = name.unwrap_or("").trim_start_matches("r#").to_string();
@@ -219,6 +237,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let mut call_args = Vec::new();
     let mut meta_stmts = Vec::new();
     let mut can_fail = false;
+    let mut is_ws = false;
     for (i, input) in func.sig.inputs.iter().enumerate() {
         let FnArg::Typed(pt) = input else {
             return Err(Error::new(
@@ -279,7 +298,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                     });
                 }
             }
-            ArgKind::FromRequest(t) => {
+            ArgKind::FromRequest(t) | ArgKind::WebSocket(t) => {
+                is_ws |= last_ident(&t).as_deref() == Some("WebSocketUpgrade");
                 extract.push(quote! {
                     let #var: #t = match <#t as ::veil::api::__private::FromRequest>::from_request(&__veil_req) {
                         Ok(v) => v,
@@ -387,6 +407,38 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let streaming = args.streaming;
     let resp_content = response_content(&func.sig.output);
     let ok_status = args.status.unwrap_or(200);
+    if !is_ws
+        && (args.ws_receive.is_some() || args.ws_send.is_some() || !args.ws_protocols.is_empty())
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            "`ws_receive`, `ws_send` and `ws_protocols` need a `WebSocketUpgrade` argument",
+        ));
+    }
+    let ws_schema = |t: &Option<Type>| match t {
+        Some(t) => quote! {
+            Some({
+                use ::veil::api::__private::{ViaApiSchema as _, ViaNoSchema as _};
+                (&::veil::api::__private::SchemaProbe::<#t>(::core::marker::PhantomData)).veil_schema(&mut __veil_defs)
+            })
+        },
+        None => quote!(None),
+    };
+    let websocket = if is_ws {
+        let recv = ws_schema(&args.ws_receive);
+        let send = ws_schema(&args.ws_send);
+        let protos = &args.ws_protocols;
+        quote! {
+            Some(::veil::api::__private::WebSocketMeta {
+                subprotocols: ::veil::api::__private::Vec::from([#(::veil::api::__private::String::from(#protos)),*]),
+                receive: #recv,
+                send: #send,
+                message_format: None,
+            })
+        }
+    } else {
+        quote!(None)
+    };
     let ok_desc = if ok_status == 204 {
         "No Content"
     } else {
@@ -415,6 +467,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             let mut __veil_body: ::core::option::Option<::veil::api::__private::BodyMeta> = None;
             #(#meta_stmts)*
             let __veil_content = #resp_content;
+            let __veil_ws: ::core::option::Option<::veil::api::__private::WebSocketMeta> = #websocket;
             ::veil::api::__private::OperationMeta {
                 operation_id: #name.into(),
                 summary: #summary,
@@ -431,6 +484,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 validates: #can_fail,
                 hidden: #hidden,
                 raw: None,
+                websocket: __veil_ws,
             }
         }
 

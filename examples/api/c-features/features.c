@@ -1,7 +1,8 @@
 /*
  * veil C API の F-210 の機能のサンプル: 応答のストリーミング (SSE)・要求本文のストリーミング受信・
  * gRPC (examples/api/rust-grpc と同じ demo.v1.Demo)・L4 (TCP・UDP のエコー)・
- * HTTP/1.1 のアップグレード (GET /upgrade で x-echo に切り替えてエコー、F-261)。
+ * HTTP/1.1 のアップグレード (GET /upgrade で x-echo に切り替えてエコー、F-261)・
+ * WebSocket のエコー (GET /ws、F-262)。
  *
  * gRPC のメッセージは小さな protobuf を手で符号化している (veil は protobuf の実装に依存しない。
  * 実際のアプリでは protobuf-c・nanopb・upb 等を使う)。
@@ -331,6 +332,20 @@ static int upgrade(const veil_request_t *req, veil_response_t *resp, void *ud) {
     return veil_response_upgrade(resp, "x-echo", &cb, NULL) == VEIL_OK ? 0 : 1;
 }
 
+/* GET /ws : WebSocket のエコー (F-262)。Ping・閉じる手順・断片の組み立て・UTF-8 の検査は veil が行う */
+static int ws_message(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len, void *ud) {
+    (void)ud;
+    return veil_ws_send(ws, opcode, data, len) == VEIL_OK ? 0 : 1;
+}
+
+static int ws_echo(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)ud;
+    static const veil_ws_callbacks_t cb = {NULL, ws_message, NULL};
+    /* ハンドシェイクが正しくなければ resp は 400 か 426 になっている (そのまま返す) */
+    veil_ws_accept(req, resp, &cb, NULL);
+    return 0;
+}
+
 static int udp_echo(const uint8_t *data, size_t len, const char *peer, veil_l4_reply_t *reply, void *ud) {
     (void)peer;
     (void)ud;
@@ -371,6 +386,7 @@ int main(void) {
     check(veil_register_route(cfg, "/sse", "GET", sse, NULL), "sse");
     check(veil_register_route_ex(cfg, "/count", "POST", count, NULL, VEIL_ROUTE_STREAM_BODY, NULL), "count");
     check(veil_register_route(cfg, "/upgrade", "GET", upgrade, NULL), "upgrade");
+    check(veil_register_route(cfg, "/ws", "GET", ws_echo, NULL), "ws");
 
     check(veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL), "SayHello");
     check(veil_register_grpc(cfg, "/demo.v1.Demo/CountUp", VEIL_GRPC_SERVER_STREAMING, count_up, NULL), "CountUp");

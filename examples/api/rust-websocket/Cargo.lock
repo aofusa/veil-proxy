@@ -2505,6 +2505,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "serde",
+ "serde_json",
  "veil-proxy",
 ]
 

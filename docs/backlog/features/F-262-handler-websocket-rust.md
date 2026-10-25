@@ -1,6 +1,6 @@
 # F-262: API ライブラリのハンドラで WebSocket を終端する（Rust・C）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)。前提は [F-261](F-261-handler-http11-upgrade.md)。Python は [F-263](F-263-python-async-runtime-websocket.md)）**
+**状態: 完了（2026-10-25 起票・設計、同日実装。親は [F-258](F-258-v0100-plan.md)。前提は [F-261](F-261-handler-http11-upgrade.md)。Python は [F-263](F-263-python-async-runtime-websocket.md)）**
 
 ## 背景
 
@@ -157,3 +157,55 @@ OpenAPI 3.1 に WebSocket の型は無いので、ハンドシェイク（HTTP �
 
 - Autobahn の fuzzingclient が通り、HttpArena の echo-ws 系の validate を満たす。
 - 本体のバイナリが変わらない（`nonregression`）。文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **API**（`src/api/ws/`、`cfg(feature = "handler")`。依存は増やしていない）: `mod.rs` に `WebSocketUpgrade`（抽出子。`protocols`・
+  `origin`・`max_message_size`・`auto_pong`・`messages::<In, Out>()`・`validate`・`on_upgrade`・C / Python 用の `on_upgrade_blocking`）、
+  `WebSocket`（`recv`・`send`・`send_batch`・`flush`・`ping`・`close`・`protocol`・`client_ip`・`split`）、`WsReceiver`・`WsSender`
+  （`Clone`、どのスレッドからでも送れる送信キュー）、`Message`・`Utf8Bytes`・`CloseFrame`・`WsError`。`codec.rs` が RFC 6455 の
+  復号器・符号化（マスク外しは `u64` の XOR でその場、断片の UTF-8 の途中状態）、`deflate.rs` が permessage-deflate。
+  `Sec-WebSocket-Accept` の SHA-1 は `tls_provider::sha1_legacy`（aws-lc-rs / ring の `SHA1_FOR_LEGACY_USE_ONLY`）。
+- **受信バッファ**: 待っている間はバッファを持たない（`Upgraded::readable` を待ってから `pool::accum_buf_get` で借り、読み切ったら返す）。
+  1 フレームがバッファに収まる限り本文は `Bytes` の切り出し（複製無し）。
+- **送信**: ヘッダだけ作って本文の `Bytes` と並べて `writev`。受信バッファにまだ入力が残っている間に `send` されたものは溜めて、
+  次に読むとき（または `flush`）に 1 回の `writev` で送る（echo-ws-pipeline の 16 件が 1 回の書き込みになる）。
+- **設定**: `[api] websocket_max_message_size`・`websocket_max_frame_size`・`websocket_ping_interval_secs`・`websocket_idle_timeout_secs`・
+  `websocket_compression`・`openapi_websocket`（`examples/config.toml`・`docs/guide/library.md` 英日）。
+- **OpenAPI**（`src/api/openapi.rs`）: `OperationMeta.websocket`（`WebSocketMeta`）か操作の JSON の `x-veil-websocket` で WebSocket のルートと
+  判定し、`GET` だけ・101/400/426・`Sec-WebSocket-Protocol` のヘッダ引数・`x-veil-websocket`（`subprotocols`・`maxMessageSize`・
+  `receive`/`send` の `$ref`）で載せる。Swagger UI はプラグインで WebSocket の操作の Try it out を隠す。マクロは
+  `#[veil::route(..., ws_receive = T, ws_send = T, ws_protocols = [..])]`、引数に `WebSocketUpgrade` があれば WebSocket のルート。
+- **C**: `veil_ws_accept(req, resp, const veil_ws_callbacks_t *, void *ud)`・`veil_ws_send`・`veil_ws_close`・`veil_ws_peer`・
+  `veil_ws_set_data`・`veil_ws_data`、`VEIL_WS_TEXT`・`VEIL_WS_BINARY`（`include/veil.h`・`crates/veil-capi/README.md`）。
+  コールバックはハンドラ用プールで 1 本ずつ。
+- **メトリクス**（`metrics` feature）: `veil_proxy_websocket_connections`・`veil_proxy_websocket_messages_total{direction}`。
+- **ファジング**: `fuzz/fuzz_targets/ws_frame_decode.rs`（`fuzz/Cargo.toml` に `api` の feature で追加）と `src/fuzz_api.rs` の smoke。
+- **例**: `examples/api/rust-websocket` に `/ws`（エコー、`echo.v1`）・`/chat`（`split` した `WsSender` で配る）・`/typed`
+  （`messages::<ChatIn, ChatOut>().validate(true)`）・`VEIL_WS_COMPRESSION`。`examples/api/c-features` に `/ws`。
+- **試験**: 単体（`api::ws::` の符号化・復号・断片化・制御フレームの割り込み・UTF-8 の断片またぎ・上限・予約ビット・Accept の
+  RFC の例・ハンドシェイク・deflate の往復と大きなメッセージ・OpenAPI の形）。E2E は `tests/api/library_e2e.sh websocket`
+  （`tests/api/ws_check.py`。io_uring と epoll、平文・rustls・kTLS: HttpArena の validate-ws の項目・16 件まとめ送り・断片化の
+  中の Ping・1 MiB・プロトコル違反 7 種・2,000 同時接続〈`WS_E2E_CONNS`〉・TLS 500 同時接続・10 メッセージごとの繋ぎ直し 200 回・
+  OpenAPI・h2c で 400・graceful shutdown の 1001 とプロセスの終了）と `library_e2e.sh autobahn`（Autobahn TestSuite の
+  fuzzingclient、平文は全項目〈12.*・13.* は圧縮あり〉、TLS は 1.*〜7.*）。C の E2E は `/ws` の basic と 200 同時接続。
+  `nonregression` に `veil::api::ws`・`veil_ws_` が full のバイナリに無いことを足した。
+
+### 決めたこと
+
+- 圧縮は常に `server_no_context_takeover`（圧縮器をメッセージごとに初期化して使い回す。接続ごとに 32KB 超の窓を常駐させない）。
+  `server_max_window_bits` < 15 の申し出は断る（その申し出だけを外し、他の申し出があればそちらを受ける）。Autobahn の 13.* の
+  一部はこれで UNIMPLEMENTED になる（RFC 7692 で許される断り方）ので、集計は 13.* の UNIMPLEMENTED だけ許す。
+- 圧縮は最悪の大きさの出力バッファで 1 回の `compress_vec` にする。flate2（miniz_oxide）は出力の足りない `compress_vec` を
+  繰り返すと入力の一部を失うことがあった（Autobahn の 12.2.9・12.5.* 等の「エコーの長さが違う」。lena512.bmp の巡回で再現）。
+  1 回で入り切らない・失敗したときは圧縮せずに送る。
+- メトリクス名は既存のライブラリのメトリクスに揃えて `veil_proxy_` 接頭辞にした（設計の `veil_websocket_*` から変更）。
+- Autobahn は snap の docker が `/tmp` を見られないので作業場所を `target/autobahn.*` にし、終わったら消す（`AUTOBAHN_REPORTS` で
+  報告を残せる）。TLS は 9.*・10.*・12.*・13.* を除く（同じ復号器で時間を抑える）。
+- tokio の生態系（tokio-tungstenite・fastwebsockets）は F-261 の `Upgraded::into_tokio_io` で動く形を文書に書いた。
+
+### 残したこと
+
+- `tools/api-bench` の echo の負荷と axum・fastwebsockets との交互比較、`tools/tokio-compat/ecosystem` への tokio-tungstenite の追加、
+  `tools/perf/leak_check.sh` の WebSocket の開閉はこのチケットではやっていない（HttpArena の提出の準備〈F-27x〉で行う）。
+- 16,384 接続は `WS_E2E_CONNS=16384` で回せるが、既定の E2E は 2,000（このホストの負荷を抑えるため）。

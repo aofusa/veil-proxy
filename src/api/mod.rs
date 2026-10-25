@@ -41,6 +41,8 @@ pub mod schema;
 pub mod stream;
 // F-261
 pub mod upgrade;
+// F-262
+pub mod ws;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
@@ -60,7 +62,7 @@ pub use app::{
 };
 pub use config::{Config, ConfigBuilder, ConfigError, Listener};
 pub use extract::{Body, Form, FromRequest, Headers, Json, Query, State};
-pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta};
+pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta, WebSocketMeta};
 pub use request::{HttpVersion, Request};
 pub use response::{ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
@@ -98,7 +100,7 @@ pub mod __private {
         form_body, json_body, path_param, query_param, query_param_opt, query_struct, FromRequest,
     };
     pub use super::handler::{
-        BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef,
+        BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef, WebSocketMeta,
     };
     pub use super::request::Request;
     pub use super::response::{IntoResponse, Response};

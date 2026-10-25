@@ -142,12 +142,35 @@ static int upgrade(const veil_request_t *req, veil_response_t *resp, void *ud) {
 バイト列も最初の `on_data` に渡ります。要求に `Connection: upgrade` と `Upgrade` が無い・本文付き・HTTP/1.0・HTTP/2・HTTP/3 なら
 veil が 400 に置き換えます（`h2c` は予約済みで 500）。
 
+### WebSocket（F-262）
+
+```c
+static int on_message(veil_ws_t *ws, int opcode, const uint8_t *d, size_t n, void *ud) {
+    return veil_ws_send(ws, opcode, d, n);                     /* エコー */
+}
+static const veil_ws_callbacks_t wcb = { .on_message = on_message };
+
+static int ws(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    veil_ws_accept(req, resp, &wcb, NULL);   /* 101（ハンドシェイクが正しくなければ 400 / 426 のまま） */
+    return 0;
+}
+```
+
+`veil_ws_accept` はハンドシェイクを検査して応答を 101（`Sec-WebSocket-Accept` 付き）にし、その後のメッセージを
+`on_open` → `on_message`（`VEIL_WS_TEXT`・`VEIL_WS_BINARY`。テキストは UTF-8 検査済み、断片は組み立て済み）… → `on_close`
+（相手の Close のコード。無ければ 1005、切断は 1006）で渡します。コールバックはハンドラ用プールで接続ごとに 1 つずつ順に呼ばれ、
+非 0 を返すと 1000 で閉じます。`veil_ws_send`（コピーして送信キューに積む。キューは 16 MiB まで）・`veil_ws_close` は
+`on_open` から `on_close` が戻るまでの間ならどのスレッドからでも呼べます。Ping・閉じる手順・プロトコル違反（1002・1007・1009）は
+veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）。接続ごとのデータは `veil_ws_set_data` / `veil_ws_data`、
+相手の IP は `veil_ws_peer`。
+
 ### 所有権
 
 | 対象 | 規則 |
 |------|------|
 | `veil_stream_t *` | `veil_stream_close` で必ず閉じる（閉じるまで応答は終わらない）。コールバックの後も別スレッドで使える。 |
 | `veil_grpc_call_t *` / `veil_l4_conn_t *` / `veil_l4_reply_t *` | コールバックの中でだけ有効。 |
+| `veil_ws_t *` | `on_open` から `on_close` が戻るまで有効（その間はどのスレッドからでも `veil_ws_send`・`veil_ws_close` を呼べる）。 |
 | `VEIL_ROUTE_INLINE` のルート | ストリーミング・本文の読み取りは使えない（`VEIL_ERR_STATE` / `NULL`）。 |
 
 ## エラーコード

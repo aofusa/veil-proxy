@@ -89,7 +89,15 @@ fn swagger_ui_html(settings: &ApiSettings) -> String {
 <div id="swagger-ui"></div>
 <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
 <script>
-window.ui = SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui", deepLinking: true }});
+// WebSocket operations (x-veil-websocket) cannot be tried from the browser: hide "Try it out"
+const VeilNoTryItOut = () => ({{
+  statePlugins: {{ spec: {{ wrapSelectors: {{
+    allowTryItOutFor: (ori, system) => (state, path, method) =>
+      ori(state, path, method) &&
+      !system.specSelectors.specJson().getIn(["paths", path, method, "x-veil-websocket"])
+  }} }} }}
+}});
+window.ui = SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui", deepLinking: true, plugins: [VeilNoTryItOut] }});
 </script>
 </body>
 </html>
@@ -148,6 +156,9 @@ fn operation(meta: &OperationMeta, components: &mut Map<String, Value>) -> Value
             }
             obj.entry("operationId")
                 .or_insert_with(|| Value::String(meta.operation_id.clone()));
+            if obj.contains_key("x-veil-websocket") && !obj.contains_key("responses") {
+                obj.insert("responses".into(), websocket_responses());
+            }
             if !obj.contains_key("responses") {
                 obj.insert(
                     "responses".into(),
@@ -195,6 +206,10 @@ fn operation(meta: &OperationMeta, components: &mut Map<String, Value>) -> Value
             json!({ "required": b.required, "content": { b.content_type: { "schema": b.schema } } }),
         );
     }
+    if let Some(ws) = &meta.websocket {
+        websocket_operation(&mut op, ws);
+        return Value::Object(op);
+    }
     let mut responses = Map::new();
     if meta.responses.is_empty() {
         responses.insert("200".into(), json!({"description": "Successful Response"}));
@@ -220,6 +235,74 @@ fn operation(meta: &OperationMeta, components: &mut Map<String, Value>) -> Value
     Value::Object(op)
 }
 
+// F-262: OpenAPI 3.1 に WebSocket の型は無いので、ハンドシェイク（GET → 101）を操作として書き、
+// メッセージは拡張 `x-veil-websocket` で書く（設計は F-262 の 1.1）。
+/// The responses of a WebSocket handshake.
+fn websocket_responses() -> Value {
+    json!({
+        "101": {
+            "description": "Switching Protocols (WebSocket)",
+            "headers": {
+                "Upgrade": {"schema": {"const": "websocket"}},
+                "Sec-WebSocket-Accept": {"schema": {"type": "string"}},
+                "Sec-WebSocket-Protocol": {"schema": {"type": "string"}}
+            }
+        },
+        "400": {"description": "Not a valid WebSocket handshake"},
+        "426": {"description": "Unsupported Sec-WebSocket-Version"}
+    })
+}
+
+/// Fills the responses, the `Sec-WebSocket-Protocol` parameter and `x-veil-websocket` of a WebSocket route.
+fn websocket_operation(op: &mut Map<String, Value>, ws: &handler::WebSocketMeta) {
+    if !ws.subprotocols.is_empty() {
+        let p = json!({
+            "name": "Sec-WebSocket-Protocol",
+            "in": "header",
+            "required": false,
+            "schema": {"type": "string", "enum": ws.subprotocols},
+        });
+        match op.get_mut("parameters").and_then(Value::as_array_mut) {
+            Some(a) => a.push(p),
+            None => {
+                op.insert("parameters".into(), Value::Array(vec![p]));
+            }
+        }
+    }
+    op.insert("responses".into(), websocket_responses());
+    let mut x = Map::new();
+    if !ws.subprotocols.is_empty() {
+        x.insert("subprotocols".into(), json!(ws.subprotocols));
+    }
+    x.insert(
+        "maxMessageSize".into(),
+        json!(super::ws::max_message_size()),
+    );
+    if let Some(r) = &ws.receive {
+        x.insert("receive".into(), r.clone());
+    }
+    if let Some(s) = &ws.send {
+        x.insert("send".into(), s.clone());
+    }
+    let format = ws
+        .message_format
+        .clone()
+        .or_else(|| (ws.receive.is_some() || ws.send.is_some()).then(|| "text/json".to_string()));
+    if let Some(f) = format {
+        x.insert("messageFormat".into(), f.into());
+    }
+    op.insert("x-veil-websocket".into(), Value::Object(x));
+    // Swagger UI では送れないので、接続の例を説明に足す
+    let note =
+        "WebSocket endpoint: connect with `new WebSocket(\"ws://HOST/PATH\")` in a browser or \
+                `websocat ws://HOST/PATH`. Try it out is disabled for this operation.";
+    let d = match op.get("description").and_then(Value::as_str) {
+        Some(d) => format!("{}\n\n{}", d, note),
+        None => note.to_string(),
+    };
+    op.insert("description".into(), d.into());
+}
+
 /// Generates the OpenAPI document from the registered handlers.
 pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value {
     let mut paths = Map::new();
@@ -229,11 +312,20 @@ pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value 
         if e.meta.hidden || e.name.starts_with("__veil_") {
             continue;
         }
+        let is_ws = e.meta.websocket.is_some()
+            || e.meta
+                .raw
+                .as_ref()
+                .is_some_and(|r| r.get("x-veil-websocket").is_some());
+        if is_ws && !settings.openapi_websocket {
+            continue;
+        }
         let op = operation(&e.meta, &mut components);
         let item = paths
             .entry(openapi_path(e.pattern.as_str()))
             .or_insert_with(|| Value::Object(Map::new()));
-        let methods: Vec<String> = if e.methods.is_empty() {
+        // WebSocket のルートはハンドシェイクの GET だけを載せる
+        let methods: Vec<String> = if is_ws || e.methods.is_empty() {
             vec!["get".into()]
         } else {
             e.methods
@@ -323,5 +415,75 @@ mod tests {
             1.0
         );
         assert!(doc["components"]["schemas"]["HTTPValidationError"].is_object());
+    }
+
+    fn ws_entry(name: &str, path: &str, meta: OperationMeta) -> Arc<HandlerEntry> {
+        Arc::new(
+            HandlerEntry::new(
+                name,
+                path,
+                &["GET"],
+                Arc::new(|_r| Box::pin(async { Response::no_content() })),
+                meta,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn websocket_routes() {
+        let meta = OperationMeta {
+            operation_id: "chat".into(),
+            parameters: vec![ParamMeta {
+                name: "room".into(),
+                location: "query",
+                required: false,
+                schema: json!({"type": "string"}),
+                description: None,
+            }],
+            websocket: Some(handler::WebSocketMeta {
+                subprotocols: vec!["chat.v1".into()],
+                receive: Some(json!({"$ref": "#/components/schemas/ChatIn"})),
+                send: None,
+                message_format: None,
+            }),
+            ..Default::default()
+        };
+        let raw = OperationMeta {
+            operation_id: "c_ws".into(),
+            raw: Some(json!({"summary": "C", "x-veil-websocket": {"messageFormat": "binary"}})),
+            ..Default::default()
+        };
+        let entries = [ws_entry("chat", "/chat", meta), ws_entry("c_ws", "/c", raw)];
+        let doc = generate(&ApiSettings::from_value(None), &entries);
+        let op = &doc["paths"]["/chat"]["get"];
+        assert_eq!(doc["paths"]["/chat"].as_object().unwrap().len(), 1);
+        let mut st: Vec<&String> = op["responses"].as_object().unwrap().keys().collect();
+        st.sort();
+        assert_eq!(st, ["101", "400", "426"]);
+        assert_eq!(
+            op["responses"]["101"]["headers"]["Upgrade"]["schema"]["const"],
+            "websocket"
+        );
+        assert_eq!(op["parameters"][0]["name"], "room");
+        assert_eq!(op["parameters"][1]["name"], "Sec-WebSocket-Protocol");
+        assert_eq!(op["parameters"][1]["schema"]["enum"][0], "chat.v1");
+        let x = &op["x-veil-websocket"];
+        assert_eq!(x["subprotocols"][0], "chat.v1");
+        assert_eq!(x["receive"]["$ref"], "#/components/schemas/ChatIn");
+        assert!(x.get("send").is_none());
+        assert_eq!(x["messageFormat"], "text/json");
+        assert!(x["maxMessageSize"].as_u64().unwrap() > 0);
+        assert!(op["description"].as_str().unwrap().contains("WebSocket"));
+        // C・Python の Operation Object も応答を補う
+        let c = &doc["paths"]["/c"]["get"];
+        assert!(c["responses"]["101"].is_object());
+        assert_eq!(c["x-veil-websocket"]["messageFormat"], "binary");
+        // openapi_websocket = false で載せない
+        let v: toml::Value = toml::from_str("openapi_websocket = false").unwrap();
+        let doc = generate(&ApiSettings::from_value(Some(&v)), &entries);
+        assert!(doc["paths"].as_object().unwrap().is_empty());
+        // Swagger UI は x-veil-websocket の操作で Try it out を出さない
+        assert!(swagger_ui_html(&ApiSettings::from_value(None)).contains("x-veil-websocket"));
     }
 }

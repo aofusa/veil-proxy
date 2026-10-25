@@ -252,6 +252,32 @@ int veil_register_l4_udp(veil_config_t *cfg, const char *name, const char *liste
                          void *user_data);
 int veil_l4_reply(veil_l4_reply_t *reply, const uint8_t *data, size_t len);
 
+/* ---- WebSocket (RFC 6455、F-262) ----
+ *
+ * ハンドラの中で veil_ws_accept を呼ぶと応答が 101 になり、その後の接続をコールバックで受ける
+ * (ハンドラ用プールで、接続ごとに 1 つずつ順に呼ばれる)。Ping への Pong・閉じる手順・断片の組み立て・
+ * UTF-8 の検査は veil が行う。veil_ws_send・veil_ws_close は on_open から on_close が戻るまでの間なら
+ * どのスレッドからでも呼べる (送信キューに積んで戻る)。HTTP/1.1 だけ (HTTP/2・HTTP/3 では 400)。
+ */
+#define VEIL_WS_TEXT   1
+#define VEIL_WS_BINARY 2
+typedef struct veil_ws veil_ws_t;
+typedef struct {
+    int (*on_open)(veil_ws_t *ws, void *user_data);                                          /* 非 0 で閉じる (on_close は呼ばれない) */
+    int (*on_message)(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len, void *user_data); /* 非 0 で閉じる (1000) */
+    void (*on_close)(veil_ws_t *ws, uint16_t code, void *user_data); /* 相手の Close のコード (無ければ 1005、切断は 1006) */
+} veil_ws_callbacks_t;
+/* 0 = 受け入れた (resp は 101)。VEIL_ERR_STATE = ハンドシェイクが正しくない (resp は 400 か 426。そのまま返してよい)。 */
+int veil_ws_accept(const veil_request_t *req, veil_response_t *resp, const veil_ws_callbacks_t *callbacks,
+                   void *user_data);
+/* 送る (コピーする)。VEIL_ERR_CLOSED = 閉じた後、VEIL_ERR_STATE = 送信キューが一杯 (16 MiB)、VEIL_ERR_UTF8 = テキストが UTF-8 でない。 */
+int veil_ws_send(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len);
+/* code の Close を送って閉じる手順を始める。 */
+int veil_ws_close(veil_ws_t *ws, uint16_t code);
+const char *veil_ws_peer(const veil_ws_t *ws, size_t *len);
+void veil_ws_set_data(veil_ws_t *ws, void *data);
+void *veil_ws_data(const veil_ws_t *ws);
+
 /* ---- その他 ---- */
 
 /* 呼び出しスレッドで最後に起きたエラーのメッセージ (NUL 終端)。無ければ NULL。 */

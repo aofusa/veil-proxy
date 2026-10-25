@@ -145,6 +145,13 @@ pub fn native_grpc_content_type_smoke(data: &[u8]) {
     let _ = crate::proxy::is_native_grpc_content_type(data);
 }
 
+// F-262: WebSocket のフレームの復号器（ライブラリ専用。`handler` feature のときだけ）
+/// Feeds `data` to the WebSocket decoder in one piece and byte by byte (must not panic).
+#[cfg(feature = "handler")]
+pub fn ws_frame_decode_smoke(data: &[u8]) {
+    crate::api::ws::fuzz_decode(data);
+}
+
 #[cfg(test)]
 mod io_uring_executor_tests {
     use super::*;

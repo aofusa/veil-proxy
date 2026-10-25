@@ -250,6 +250,12 @@ for debugging.
 | `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
 | `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
 | `upgrade_idle_timeout_secs` | `0` | seconds a `read` on an upgraded HTTP/1.1 connection may wait (0 = no limit) |
+| `websocket_max_message_size` | `16777216` | maximum size of an assembled WebSocket message (larger closes with 1009) |
+| `websocket_max_frame_size` | `16777216` | maximum size of one WebSocket frame |
+| `websocket_ping_interval_secs` | `0` | seconds between Pings the server sends on a WebSocket (0 = none) |
+| `websocket_idle_timeout_secs` | `0` | seconds without a received frame before a WebSocket is closed with 1001 (0 = no limit) |
+| `websocket_compression` | `false` | negotiate permessage-deflate (RFC 7692) when the client offers it (needs the `compression` feature) |
+| `openapi_websocket` | `true` | list WebSocket routes in the OpenAPI document |
 
 ## Routing macros
 
@@ -397,6 +403,81 @@ async fn echo(req: Request) -> Response {
   `on_close`, `veil_l4_write`). Rust can do the same with `Upgraded::serve_blocking` (`l4-handler`).
 
 Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/).
+
+### WebSocket
+
+`veil::api::ws` terminates WebSocket (RFC 6455) in a handler. `WebSocketUpgrade` is an extractor that checks the
+handshake (HTTP/1.1, `GET`, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a 16-byte
+`Sec-WebSocket-Key`); a malformed handshake is answered with 400 and another version with 426 and
+`Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
+connection:
+
+```rust
+use veil::api::ws::{Message, WebSocket, WebSocketUpgrade};
+
+#[veil::route(path = "/ws", method = "GET", ws_protocols = ["chat.v1"])]
+async fn ws(upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .protocols(["chat.v1"])          // optional: Sec-WebSocket-Protocol selection
+        .max_message_size(1 << 20)       // optional: default [api] websocket_max_message_size
+        .on_upgrade(|mut ws: WebSocket| async move {
+            while let Some(Ok(msg)) = ws.recv().await {
+                match msg {
+                    Message::Text(_) | Message::Binary(_) => { if ws.send(msg).await.is_err() { break } }
+                    Message::Close(_) => break,
+                    _ => {}              // Pings are answered automatically
+                }
+            }
+        })
+}
+```
+
+- `Message` is `Text(Utf8Bytes) | Binary(Bytes) | Ping(Bytes) | Pong(Bytes) | Close(Option<CloseFrame>)`.
+  `Utf8Bytes` wraps `Bytes` (validated once, cheap to clone).
+- `WebSocket`: `recv()`, `send(msg)`, `send_batch(&[msg])` (one write), `flush()`, `ping(bytes)`,
+  `close(code, reason)`, `protocol()`, `client_ip()` and `split()`, which returns a `WsReceiver` (drives the
+  connection; keep calling `recv`) and a `WsSender` (`Clone + Send`, a queue any task or thread can push to without
+  waiting, e.g. to broadcast; up to 16 MiB queued).
+- veil handles the protocol: fragmented messages are reassembled (control frames may be interleaved), text is
+  checked as UTF-8 across fragments (1007), unmasked client frames, reserved bits, unknown opcodes and bad control
+  frames close with 1002, oversized messages with 1009, and a received Close is answered with the same code. When
+  your function returns, unsent messages are flushed and the closing handshake is completed (1000). Graceful
+  shutdown sends Close 1001 (`recv` returns `Message::Close(Some(1001))`).
+- Frames are decoded in place in a pooled receive buffer (the mask is removed 8 bytes at a time and payloads are
+  `Bytes` slices); a waiting connection holds no buffer. Server frames are written header + payload with one
+  vectored write, and replies to messages that arrived together (pipelining) are written together before the next read.
+- `auto_pong(false)` hands Pings to you without answering them. `[api] websocket_ping_interval_secs` sends Pings and
+  `websocket_idle_timeout_secs` closes connections that stay silent.
+- `origin(&["https://app.example"])` accepts only those `Origin` values (403 otherwise). The default does not check
+  the origin: browsers send cookies with cross-site WebSocket handshakes, so restrict it if you authenticate with
+  cookies (cross-site WebSocket hijacking).
+- permessage-deflate (RFC 7692) is negotiated only with `[api] websocket_compression = true` (default off; the
+  decompressed size is limited by `websocket_max_message_size`).
+- WebSocket works on HTTP/1.1 only: over HTTP/2 and HTTP/3 the handshake is answered with 400 (RFC 8441 / RFC 9220
+  are not supported).
+- Metrics (`metrics` feature): `veil_proxy_websocket_connections` (open connections) and
+  `veil_proxy_websocket_messages_total{direction="received"|"sent"}`.
+- The connection counts against `[security] max_concurrent_connections` like any upgraded connection.
+
+**OpenAPI.** WebSocket routes are listed (unless `[api] openapi_websocket = false`) as a `GET` operation with the
+responses 101, 400 and 426, the `Sec-WebSocket-Protocol` header parameter (from `ws_protocols`) and an
+`x-veil-websocket` extension: `subprotocols`, `maxMessageSize`, and with `ws_receive = T` / `ws_send = T`
+(`derive(veil::Schema)` types) the message schemas `receive` (client to server) and `send` (server to client) and
+`messageFormat: "text/json"`. The Swagger UI disables "Try it out" for these operations. `upgrade.messages::<In, Out>()
+.validate(true)` also checks received text messages against `In` and closes with 1007 when they do not deserialize.
+
+**tokio libraries.** `Upgraded::into_tokio_io()` (`tokio-compat`) lets tokio-tungstenite or fastwebsockets run on
+`veil::tokio` with a plain `Response::switching_protocols`. axum's `WebSocketUpgrade` needs hyper's `OnUpgrade` and
+does not work through the tower bridge; use `veil::api::ws` or tokio-tungstenite.
+
+**C.** `veil_ws_accept(req, resp, &callbacks, ud)` inside a route callback turns the response into the 101 (or a
+400 / 426 with `VEIL_ERR_STATE`); `on_open`, `on_message(ws, opcode, data, len, ud)` and `on_close(ws, code, ud)`
+run on the handler pool, one at a time per connection. `veil_ws_send(ws, VEIL_WS_TEXT | VEIL_WS_BINARY, data, len)`
+(copies; any thread) and `veil_ws_close(ws, code)` queue frames. Describe the route in OpenAPI by passing an
+Operation Object with `x-veil-websocket` to `veil_register_route_ex`.
+
+Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/) (`/ws` echo, `/chat` broadcast with
+`split`, `/typed` JSON messages); C: `/ws` in [examples/api/c-features/](../../examples/api/c-features/).
 
 ## Validation and OpenAPI
 
@@ -883,6 +964,7 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
   and `veil_register_l4_udp(cfg, name, listen, fn, ud)` (`veil_l4_reply` answers a datagram).
 - Protocol upgrade (HTTP/1.1): `veil_response_upgrade(resp, protocol, &callbacks, ud)` answers 101 and serves the
   connection with the L4 TCP callbacks (see [Protocol upgrades](#protocol-upgrades-http11)).
+- WebSocket: `veil_ws_accept(req, resp, &callbacks, ud)`, `veil_ws_send`, `veil_ws_close` (see [WebSocket](#websocket)).
 - Streaming functions cannot be used on `VEIL_ROUTE_INLINE` routes (`VEIL_ERR_STATE`).
 
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
@@ -1073,13 +1155,16 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
 with curl (routing, validation, OpenAPI, tower, L4 echo, streaming, HTTP/1.1 and h2c, and GraphQL with SSE
 subscriptions through `examples/api/rust-graphql`), runs the gRPC
 interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
+the WebSocket checks (`websocket`: handshake, echo, fragmentation, pipelining, protocol errors, 2,000 connections —
+`WS_E2E_CONNS=16384` for more —, reconnect churn, graceful shutdown with 1001, plaintext, TLS and kTLS, and the
+Autobahn TestSuite fuzzingclient when docker and `crossbario/autobahn-testsuite` are available),
 and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
 (GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
@@ -1093,7 +1178,8 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
   second call returns an error.
 - gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
 - Python handlers are bound by the GIL; C callbacks must be thread-safe.
-- Protocol upgrades exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220, is not supported).
+- Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
+  is not supported).
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
   (`/openapi.json` works offline).
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path

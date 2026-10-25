@@ -96,6 +96,24 @@ pub struct ApiSettings {
     // F-261
     /// Seconds a read on an upgraded connection may wait before failing (0 = no limit).
     pub upgrade_idle_timeout_secs: u64,
+    // F-262
+    /// Maximum size of an assembled WebSocket message (larger closes with 1009).
+    pub websocket_max_message_size: usize,
+    // F-262
+    /// Maximum size of one WebSocket frame.
+    pub websocket_max_frame_size: usize,
+    // F-262
+    /// Seconds between server Pings on idle WebSocket connections (0 = none).
+    pub websocket_ping_interval_secs: u64,
+    // F-262
+    /// Seconds without a received message before a WebSocket connection is closed (0 = no limit).
+    pub websocket_idle_timeout_secs: u64,
+    // F-262
+    /// Negotiate permessage-deflate (RFC 7692) when the client offers it.
+    pub websocket_compression: bool,
+    // F-262
+    /// List WebSocket routes in the OpenAPI document.
+    pub openapi_websocket: bool,
 }
 
 impl ApiSettings {
@@ -144,6 +162,12 @@ impl ApiSettings {
                 .unwrap_or_default(),
             grpc_max_send_message_size: n("grpc_max_send_message_size", 0),
             upgrade_idle_timeout_secs: n("upgrade_idle_timeout_secs", 0) as u64,
+            websocket_max_message_size: n("websocket_max_message_size", 16 * 1024 * 1024),
+            websocket_max_frame_size: n("websocket_max_frame_size", 16 * 1024 * 1024),
+            websocket_ping_interval_secs: n("websocket_ping_interval_secs", 0) as u64,
+            websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 0) as u64,
+            websocket_compression: b("websocket_compression", false),
+            openapi_websocket: b("openapi_websocket", true),
         }
     }
 }
@@ -489,6 +513,7 @@ fn start(config: Config) -> Result<(), Error> {
         MAX_BODY_SIZE.store(settings.max_body_size, Ordering::Relaxed);
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
         super::upgrade::set_idle_timeout_secs(settings.upgrade_idle_timeout_secs);
+        super::ws::apply_settings(&settings);
         #[cfg(feature = "grpc-handler")]
         {
             super::grpc::set_max_message_size(settings.grpc_max_message_size);
