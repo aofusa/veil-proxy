@@ -223,6 +223,22 @@ pub fn run_server(opts: ServerOptions) {
         }
     };
 
+    // F-259: OS の信頼ストア（`"system"`）は load_config で読み終えた。以後（リロード）に初めて
+    // `"system"` が現れても、サンドボックスの下では読めないので拒否する
+    {
+        let sec = &loaded_config.global_security;
+        crate::trust_store::set_sandboxed(
+            sec.enable_seccomp
+                || sec.enable_landlock
+                || sec.enable_capsicum
+                || sec.capsicum_capability_mode
+                || sec.enable_unveil
+                || sec.enable_pledge
+                || sec.enable_sandbox_macos
+                || sec.chroot_dir.is_some(),
+        );
+    }
+
     // F-153: 静的配信のパス解決をカーネル封じ込め（Linux: openat2 RESOLVE_BENEATH、
     // FreeBSD: F-123 の capsicum O_RESOLVE_BENEATH）へ切り替えるため、File ルートの
     // ルートディレクトリを設定ロード直後（**FreeBSD の `cap_enter`・OpenBSD の

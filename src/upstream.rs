@@ -218,7 +218,7 @@ pub(crate) fn perform_health_check(
     healthy_statuses: &[u16],
 ) -> bool {
     use rustls::pki_types::ServerName;
-    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use rustls::{ClientConfig, ClientConnection};
     use std::io::{ErrorKind, Read, Write};
     use std::sync::Arc;
 
@@ -232,14 +232,8 @@ pub(crate) fn perform_health_check(
     if use_tls {
         // rustls クライアント設定
         let config: Arc<ClientConfig> = if verify_cert {
-            // 証明書検証を有効化（デフォルトのルート証明書ストアを使用）
-            let mut root_store = RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
+            // 証明書検証を有効化（`[tls_client] ca` の既定。設定のロード時に作ったものを使い回す）
+            crate::trust_store::probe_client_config()
         } else {
             // 証明書検証を完全に無効化（自己署名証明書を許可）
             use rustls::client::danger::{
@@ -616,17 +610,11 @@ pub(crate) fn perform_grpc_health_check(
 
     let send_result: bool = if use_tls {
         use rustls::pki_types::ServerName;
-        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        use rustls::{ClientConfig, ClientConnection};
         use std::sync::Arc;
 
         let config: Arc<ClientConfig> = if verify_cert {
-            let mut root_store = RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
+            crate::trust_store::probe_client_config()
         } else {
             use rustls::client::danger::{
                 HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,

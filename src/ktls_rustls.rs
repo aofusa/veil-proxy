@@ -35,7 +35,7 @@ use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::{IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
 // ====================
 // TLS ストリーム状態
@@ -1844,11 +1844,8 @@ pub fn is_ktls_available() -> bool {
 ///
 /// * `enable_ktls` - kTLS を有効化する場合は true。true の場合、シークレット抽出が有効化される。
 pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
 
     // kTLS が有効な場合のみシークレット抽出を有効化

@@ -1,13 +1,14 @@
 //! 上流の mTLS（F-217、メッシュ無しでも使える一般機能）。
 //!
 //! `[upstreams.<name>]`・Proxy の action の `tls_client_cert` / `tls_client_key`（自分のクライアント証明書）、
-//! `tls_ca`（上流の証明書の信頼アンカー。省略時は既定の公開 CA）、`expected_san`（上流の証明書の SAN の期待値。
+//! `tls_ca`（上流の証明書の信頼アンカー。省略時は `[tls_client] ca`、その既定は組み込みの公開 CA。F-259）、`expected_san`（上流の証明書の SAN の期待値。
 //! 指定するとホスト名の代わりにこれで照合する。SPIFFE の URI SAN 等）。
 //!
 //! 設定のロード時に rustls の設定を作って `UpstreamTlsClient` として `ProxyTarget` に持たせ、接続のたびに
 //! 作らない（ホットパスは `Arc` の参照だけ）。接続のプールの鍵には設定ごとのタグを足し、別の証明書の接続を
 //! 共有しない。
 
+use crate::trust_store::CaSources;
 use crate::x509_san::{parse_sans, San};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
@@ -28,9 +29,10 @@ pub struct UpstreamTlsSettings {
     pub tls_client_cert: String,
     #[serde(default)]
     pub tls_client_key: String,
-    /// 上流の証明書の信頼アンカー（PEM）
+    /// 上流の証明書の信頼アンカー（`"builtin"`・`"system"`・PEM のパス、またはその配列。F-259）。
+    /// 書かなければ `[tls_client] ca`
     #[serde(default)]
-    pub tls_ca: String,
+    pub tls_ca: CaSources,
     /// 上流の証明書の SAN の期待値（DNS 名・URI・IP のどれかが一致すれば受ける）
     #[serde(default)]
     pub expected_san: Vec<String>,
@@ -95,7 +97,7 @@ impl TlsProfile {
     /// 接続のプールの鍵のタグ（検証の設定・クライアント証明書の違う接続を共有しない。B-30）。
     pub fn tag(self) -> &'static str {
         match self {
-            TlsProfile::Verify => "verify",
+            TlsProfile::Verify => crate::trust_store::verify_tag(),
             TlsProfile::Insecure => "insecure",
             TlsProfile::Custom(c) => c.pool_tag,
         }
@@ -106,19 +108,23 @@ impl TlsProfile {
 /// ファイルの中身も鍵に入れるので、証明書を差し替えて SIGHUP すれば新しい証明書で作り直す。
 /// 作ったものはプロセスの終わりまで持つ（古い設定の接続がプールに残っていてもよいように）。
 pub fn intern(s: &UpstreamTlsSettings, ktls: bool) -> io::Result<&'static UpstreamTlsClient> {
-    type Key = (UpstreamTlsSettings, bool, Vec<u8>);
+    // 末尾の u32 は `[tls_client] ca` の世代（`tls_ca` を書かない設定は既定の変更で作り直す）
+    type Key = (UpstreamTlsSettings, bool, Vec<u8>, u32);
     static INTERNED: std::sync::Mutex<
         Option<std::collections::HashMap<Key, &'static UpstreamTlsClient>>,
     > = std::sync::Mutex::new(None);
     let mut contents = Vec::new();
-    for f in [&s.tls_ca, &s.tls_client_cert, &s.tls_client_key] {
-        if !f.is_empty() {
-            let b = crate::tls_reload::read_pem(Path::new(f))?;
-            contents.extend_from_slice(&(b.len() as u64).to_le_bytes());
-            contents.extend_from_slice(&b);
-        }
+    let files = s
+        .tls_ca
+        .pem_paths()
+        .chain([&s.tls_client_cert, &s.tls_client_key].map(Path::new))
+        .filter(|f| !f.as_os_str().is_empty());
+    for f in files {
+        let b = crate::tls_reload::read_pem(f)?;
+        contents.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        contents.extend_from_slice(&b);
     }
-    let key = (s.clone(), ktls, contents);
+    let key = (s.clone(), ktls, contents, crate::trust_store::generation());
     let mut g = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(std::collections::HashMap::new);
     if let Some(c) = m.get(&key) {
@@ -215,22 +221,11 @@ impl ServerCertVerifier for ExpectedSanVerifier {
 /// 設定から読み込む（設定のロード時。`ktls` は kTLS へ渡すために鍵の取り出しを許すか）。
 fn build(s: &UpstreamTlsSettings, ktls: bool) -> io::Result<UpstreamTlsClient> {
     let provider = Arc::new(crate::tls_provider::provider::default_provider());
-    let mut roots = RootCertStore::empty();
-    if s.tls_ca.is_empty() {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let roots = if s.tls_ca.is_empty() {
+        crate::trust_store::default_roots()
     } else {
-        let pem = crate::tls_reload::read_pem(Path::new(&s.tls_ca))?;
-        for c in CertificateDer::pem_slice_iter(&pem) {
-            let c = c.map_err(|e| err(format!("tls_ca {}: {:?}", s.tls_ca, e)))?;
-            roots
-                .add(c)
-                .map_err(|e| err(format!("tls_ca {}: {}", s.tls_ca, e)))?;
-        }
-        if roots.is_empty() {
-            return Err(err(format!("tls_ca {}: no certificates", s.tls_ca)));
-        }
-    }
-    let roots = Arc::new(roots);
+        crate::trust_store::roots(s.tls_ca.as_slice())?
+    };
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| err(e.to_string()))?;

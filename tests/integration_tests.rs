@@ -1962,3 +1962,135 @@ path = "{d}/"
         assert!(wait_exit(&mut child, Duration::from_secs(20)).is_some());
     }
 }
+
+/// F-259: 外向きの TLS の信頼アンカー（`builtin` / `system` / PEM）。
+/// HTTPS の上流（生成した CA が署名）に対して、信頼アンカーごとに検証が通る・通らないを確かめる。
+/// `system` は OS の信頼ストアをプロセスで 1 回だけ読むので、`SSL_CERT_FILE` を設定した子プロセスで試す。
+mod f259_trust_store {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use veil::trust_store::{roots, CaSource};
+
+    const HOST: &str = "backend.f259.test";
+
+    /// 生成した CA（PEM）と、それが署名したサーバ証明書を持つ HTTPS サーバ。受理は無限に繰り返す。
+    fn spawn_server() -> (String, u16) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![]).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = rcgen::CertifiedIssuer::self_signed(p, ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec![HOST.to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca)
+            .unwrap();
+        let provider = Arc::new(veil::tls_provider::provider::default_provider());
+        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let cfg = Arc::new(cfg);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                let cfg = cfg.clone();
+                std::thread::spawn(move || {
+                    let Ok(mut conn) = rustls::ServerConnection::new(cfg) else {
+                        return;
+                    };
+                    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+                    let mut buf = [0u8; 256];
+                    if tls.read(&mut buf).is_ok() {
+                        let _ = tls.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        );
+                    }
+                });
+            }
+        });
+        (ca.pem(), port)
+    }
+
+    /// 与えた信頼アンカーで上流へ HTTPS の GET を送り、ステータス行を返す（検証に失敗したら `Err`）。
+    fn get(roots: Arc<rustls::RootCertStore>, port: u16) -> Result<String, String> {
+        let provider = Arc::new(veil::tls_provider::provider::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(HOST.to_string()).unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+        tls.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        let _ = tls.read_to_end(&mut out);
+        let s = String::from_utf8_lossy(&out).to_string();
+        if s.is_empty() {
+            return Err("no response".into());
+        }
+        Ok(s.lines().next().unwrap_or_default().to_string())
+    }
+
+    #[test]
+    fn builtin_rejects_and_pem_accepts_and_union_accepts() {
+        let (ca_pem, port) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, &ca_pem).unwrap();
+
+        assert!(get(roots(&[CaSource::Builtin]).unwrap(), port).is_err());
+        let r = roots(&[CaSource::Pem(path.clone())]).unwrap();
+        assert_eq!(get(r, port).unwrap(), "HTTP/1.1 200 OK");
+        let r = roots(&[CaSource::Builtin, CaSource::Pem(path)]).unwrap();
+        assert_eq!(get(r, port).unwrap(), "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn system_with_ssl_cert_file_accepts_and_builtin_rejects() {
+        let (ca_pem, port) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.pem");
+        std::fs::write(&path, &ca_pem).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "f259_trust_store::child_system_store",
+                "--nocapture",
+            ])
+            .env("SSL_CERT_FILE", &path)
+            .env("SSL_CERT_DIR", dir.path().join("none"))
+            .env("VEIL_F259_CHILD_PORT", port.to_string())
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("f259 child ok"), "{text}");
+    }
+
+    #[test]
+    fn child_system_store() {
+        let Ok(port) = std::env::var("VEIL_F259_CHILD_PORT") else {
+            return;
+        };
+        let port: u16 = port.parse().unwrap();
+        let sys = roots(&[CaSource::System]).unwrap();
+        assert_eq!(get(sys, port).unwrap(), "HTTP/1.1 200 OK");
+        assert!(get(roots(&[CaSource::Builtin]).unwrap(), port).is_err());
+        println!("f259 child ok");
+    }
+}

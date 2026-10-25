@@ -568,6 +568,9 @@ struct Config {
     tls: TlsConfigSection,
     #[serde(default)]
     performance: PerformanceConfigSection,
+    /// 外向きの TLS 全体の既定の信頼アンカー（F-259）
+    #[serde(default)]
+    tls_client: crate::trust_store::TlsClientConfig,
     /// グローバルセキュリティ設定（権限降格など）
     #[serde(default)]
     security: GlobalSecurityConfig,

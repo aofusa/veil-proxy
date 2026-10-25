@@ -12,7 +12,7 @@ use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::{IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
 // ====================
 // TLS ストリーム状態
@@ -937,11 +937,8 @@ impl SimpleTlsConnector {
 
 /// デフォルトのクライアント設定を作成
 pub fn default_client_config() -> Arc<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
 
     Arc::new(config)

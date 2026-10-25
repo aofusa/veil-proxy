@@ -523,6 +523,12 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     warn_listener_changes(&config);
     let listeners = normalize_listeners(&config)?;
 
+    // F-259: 外向きの TLS の既定の信頼アンカー。上流の `intern`（`tls_ca` を書かない mTLS の設定が
+    // 既定を使う）より先に反映する。サンドボックス下で初めて `"system"` が現れたらここで拒否し、
+    // 何も変えない（後続の手順が失敗しても既定だけは新しいまま残るが、読み込めない設定は稀）
+    crate::trust_store::set_default(&config.tls_client.ca)
+        .map_err(|e| io::Error::new(e.kind(), format!("[tls_client] ca: {e}")))?;
+
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
@@ -705,6 +711,11 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // リロードの比較の基準（最初に読んだ設定を残す）
     let _ = STARTUP_LISTENERS.set(ListenerSettings::from_config(&config));
     let _ = STARTUP_LISTENER_SPECS.set(listeners.clone());
+
+    // F-259: 外向きの TLS の既定の信頼アンカー。上流の `intern` より先に決める。
+    // `"system"` はここ（サンドボックスを掛ける前）で OS の信頼ストアを読む
+    crate::trust_store::set_default(&config.tls_client.ca)
+        .map_err(|e| io::Error::new(e.kind(), format!("[tls_client] ca: {e}")))?;
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {

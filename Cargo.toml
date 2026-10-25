@@ -592,6 +592,8 @@ full-container = [
 # provider feature は下の [target.*] で付与し、ここでは共通 feature のみ指定する。
 rustls = { version = "0.23.35", default-features = false, features = ["std", "tls12", "logging"] }
 webpki-roots = "1.0.4"
+# 外向きの TLS の信頼アンカーに OS の信頼ストアを使う（F-259）。Cargo.lock に間接依存で入っていた版
+rustls-native-certs = "0.8.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
 # mimalloc 高速メモリアロケータ（mimalloc feature で有効化）

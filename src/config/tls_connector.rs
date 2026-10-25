@@ -213,12 +213,82 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
 }
 
+// F-259: `[tls_client] ca` がリロードで変わったあと（世代が 1 以上）の既定のコネクタ。
+// 世代が 0 の間は上のスレッドローカルをそのまま使う（ホットパスは世代の読み出し 1 回だけ増える）。
+// 変わった後はスレッドごとに世代が合わなくなった時点で作り直す。
+#[cfg(veil_ktls)]
+type VerifyConnector = RustlsConnector;
+#[cfg(not(veil_ktls))]
+type VerifyConnector = simple_tls::SimpleTlsConnector;
+
+fn build_verify_connector(h2: bool) -> VerifyConnector {
+    #[cfg(veil_ktls)]
+    {
+        let config_guard = CURRENT_CONFIG.load();
+        let k = &config_guard.ktls_config;
+        let config = (*crate::ktls_rustls::client_config(k.enabled)).clone();
+        let config = alpn_for(config, h2);
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(k.enabled)
+            .with_fallback(k.fallback_enabled)
+            .with_tcp_cork(k.tcp_cork_enabled)
+    }
+    #[cfg(not(veil_ktls))]
+    {
+        let config = (*simple_tls::default_client_config()).clone();
+        simple_tls::SimpleTlsConnector::new(Arc::new(alpn_for(config, h2)))
+    }
+}
+
+#[cfg(feature = "http2")]
+fn alpn_for(config: rustls::ClientConfig, h2: bool) -> rustls::ClientConfig {
+    if h2 {
+        protocol::configure_alpn_h2_client(config)
+    } else {
+        protocol::configure_alpn_http11_client(config)
+    }
+}
+
+#[cfg(not(feature = "http2"))]
+fn alpn_for(config: rustls::ClientConfig, _h2: bool) -> rustls::ClientConfig {
+    config
+}
+
+thread_local! {
+    static VERIFY_REBUILT: std::cell::RefCell<[Option<(u32, VerifyConnector)>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// 既定（`TlsProfile::Verify`）のコネクタ。`h2` は ALPN `h2, http/1.1`。
+fn verify_connector(h2: bool) -> VerifyConnector {
+    let gen = crate::trust_store::generation();
+    if gen == 0 {
+        #[cfg(feature = "http2")]
+        if h2 {
+            return get_tls_connector_h2(false);
+        }
+        return get_tls_connector();
+    }
+    VERIFY_REBUILT.with(|c| {
+        let mut c = c.borrow_mut();
+        let slot = &mut c[usize::from(h2)];
+        match slot {
+            Some((g, conn)) if *g == gen => conn.clone(),
+            _ => {
+                let conn = build_verify_connector(h2);
+                *slot = Some((gen, conn.clone()));
+                conn
+            }
+        }
+    })
+}
+
 /// 上流の TLS の種類に合ったコネクタ（HTTP/1.1。F-217）。
 #[cfg(veil_ktls)]
 pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> RustlsConnector {
     use crate::upstream_tls::TlsProfile;
     match p {
-        TlsProfile::Verify => get_tls_connector(),
+        TlsProfile::Verify => verify_connector(false),
         TlsProfile::Insecure => get_tls_connector_insecure(),
         TlsProfile::Custom(c) => {
             let k = &CURRENT_CONFIG.load().ktls_config;
@@ -235,7 +305,7 @@ pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> RustlsConnector {
 pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> crate::simple_tls::SimpleTlsConnector {
     use crate::upstream_tls::TlsProfile;
     match p {
-        TlsProfile::Verify => get_tls_connector(),
+        TlsProfile::Verify => verify_connector(false),
         TlsProfile::Insecure => get_tls_connector_insecure(),
         TlsProfile::Custom(c) => crate::simple_tls::SimpleTlsConnector::new(c.h1.clone()),
     }
@@ -246,7 +316,7 @@ pub fn tls_connector(p: crate::upstream_tls::TlsProfile) -> crate::simple_tls::S
 pub fn tls_connector_h2(p: crate::upstream_tls::TlsProfile) -> RustlsConnector {
     use crate::upstream_tls::TlsProfile;
     match p {
-        TlsProfile::Verify => get_tls_connector_h2(false),
+        TlsProfile::Verify => verify_connector(true),
         TlsProfile::Insecure => get_tls_connector_h2(true),
         TlsProfile::Custom(c) => {
             let k = &CURRENT_CONFIG.load().ktls_config;
@@ -265,7 +335,7 @@ pub fn tls_connector_h2(
 ) -> crate::simple_tls::SimpleTlsConnector {
     use crate::upstream_tls::TlsProfile;
     match p {
-        TlsProfile::Verify => get_tls_connector_h2(false),
+        TlsProfile::Verify => verify_connector(true),
         TlsProfile::Insecure => get_tls_connector_h2(true),
         TlsProfile::Custom(c) => crate::simple_tls::SimpleTlsConnector::new(c.h2.clone()),
     }

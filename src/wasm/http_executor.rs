@@ -156,14 +156,9 @@ fn execute_https_request(
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
 
-    // Create TLS config with system roots
-    let mut root_store = rustls::RootCertStore::empty();
-
-    // Add webpki roots
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
+    // Trust anchors from `[tls_client] ca` (built-in roots by default)
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
 
     let server_name = ServerName::try_from(host.to_string())

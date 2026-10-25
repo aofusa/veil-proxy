@@ -298,6 +298,9 @@ pub mod path_norm;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 #[doc(hidden)]
 pub mod tls_provider;
+/// 外向きの TLS の信頼アンカー（`"builtin"`・`"system"`・PEM。F-259）
+#[doc(hidden)]
+pub mod trust_store;
 /// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
 #[doc(hidden)]
 pub mod upstream_tls;
