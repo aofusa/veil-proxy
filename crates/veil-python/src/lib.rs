@@ -13,7 +13,10 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
 use veil::api::bridge::HandlerContext;
-use veil::api::{App, Config as VeilConfig, HandlerFn, OperationMeta, Request, Response};
+use veil::api::{
+    App, Config as VeilConfig, HandlerFn, Listener as VeilListener, OperationMeta, Request,
+    Response,
+};
 
 /// A route registered with `register_route`, kept until the server starts.
 struct PendingRoute {
@@ -146,6 +149,64 @@ impl PyConfig {
     /// Set `[server].threads`.
     fn threads(&mut self, n: usize) -> PyResult<()> {
         self.set("server.threads", &n.to_string())
+    }
+
+    // F-260: 待ち受けを 1 個足す（`veil.Listener` と `run(listeners=...)` が使う）
+    /// Add a `[[listener]]` (one port). Listeners added here replace the `[[listener]]` array of the file;
+    /// with any listener, the default `listen_cleartext` (`127.0.0.1:8080`) is not opened unless set explicitly.
+    #[pyo3(signature = (listen, tls=false, *, name=None, http2=None, http3=false, http3_listen=None, allow_http=None, allow_h2c=None, secure_redirect=None, redirect_to=None, threads=None, unix_socket_permissions=None))]
+    #[allow(clippy::too_many_arguments)] // 理由: Python のキーワード引数（`[[listener]]` のキーと 1 対 1）
+    fn add_listener(
+        &mut self,
+        listen: &str,
+        tls: bool,
+        name: Option<&str>,
+        http2: Option<bool>,
+        http3: bool,
+        http3_listen: Option<&str>,
+        allow_http: Option<bool>,
+        allow_h2c: Option<bool>,
+        secure_redirect: Option<bool>,
+        redirect_to: Option<&str>,
+        threads: Option<usize>,
+        unix_socket_permissions: Option<&str>,
+    ) {
+        let mut l = if tls {
+            VeilListener::tls(listen)
+        } else {
+            VeilListener::cleartext(listen)
+        };
+        if let Some(v) = name {
+            l = l.name(v);
+        }
+        if let Some(v) = http2 {
+            l = l.http2(v);
+        }
+        if http3 {
+            l = l.http3(true);
+        }
+        if let Some(v) = http3_listen {
+            l = l.http3_listen(v);
+        }
+        if let Some(v) = allow_http {
+            l = l.allow_http(v);
+        }
+        if let Some(v) = allow_h2c {
+            l = l.allow_h2c(v);
+        }
+        if let Some(v) = secure_redirect {
+            l = l.secure_redirect(v);
+        }
+        if let Some(v) = redirect_to {
+            l = l.redirect_to(v);
+        }
+        if let Some(v) = threads {
+            l = l.threads(v);
+        }
+        if let Some(v) = unix_socket_permissions {
+            l = l.unix_socket_permissions(v);
+        }
+        self.inner.add_listener(l);
     }
 
     /// Return the merged configuration as a TOML string (for debugging).

@@ -335,6 +335,33 @@ class TestOpenAPI(Base):
         self.assertEqual(veil._toml_literal(["x", 1]), '["x", 1]')
         self.assertEqual(veil._toml_literal({"k": 1}), '{"k" = 1}')
 
+    # F-260: 待ち受けの列（Listener・辞書）はネイティブの Config.add_listener に 1 個ずつ渡る
+    def test_listener_values(self):
+        calls = []
+
+        class FakeConfig:
+            def add_listener(self, listen, tls, **kw):
+                calls.append((listen, tls, kw))
+
+        for value in (
+            veil.Listener("0.0.0.0:8443", tls=True, http3=True, name="https"),
+            {"listen": "0.0.0.0:8082", "allow_http": False},
+        ):
+            veil.Listener.from_value(value).add_to(FakeConfig())
+        self.assertEqual(
+            calls,
+            [
+                ("0.0.0.0:8443", True, {"http3": True, "name": "https"}),
+                ("0.0.0.0:8082", False, {"allow_http": False}),
+            ],
+        )
+        with self.assertRaises(TypeError):
+            veil.Listener("0.0.0.0:1", alow_http=True)
+        with self.assertRaises(ValueError):
+            veil.Listener.from_value({"tls": True})
+        with self.assertRaises(TypeError):
+            veil.Listener.from_value("0.0.0.0:1")
+
 
 @unittest.skipUnless(HAVE_PYDANTIC, "pydantic 未インストール")
 class TestPydantic(Base):

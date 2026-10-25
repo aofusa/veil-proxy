@@ -71,6 +71,32 @@ int veil_config_tls(veil_config_t *cfg, const char *cert_path, const char *key_p
 /* ワーカースレッド数 ([server].threads)。 */
 int veil_config_threads(veil_config_t *cfg, uint32_t n);
 
+/*
+ * 待ち受け 1 個 ([[listener]]、F-260)。veil_config_add_listener に渡す。
+ * 文字列は NULL なら省略 (既定)。http2・allow_http・allow_h2c・secure_redirect は負なら省略 (既定)、
+ * 0 で false、正で true。threads は 0 なら省略 ([server].threads)。
+ */
+typedef struct {
+    const char *name;                    /* ログ・redirect_to の名前 (NULL = "listener-<添字>") */
+    const char *listen;                  /* 必須。"host:port" か "unix:<path>" */
+    int tls;                             /* 0 = 平文 (HTTP/1.1 + h2c)、非 0 = TLS (veil_config_tls の証明書) */
+    int http2;                           /* TLS: ALPN に h2 を出すか (既定 [server].http2_enabled) */
+    int http3;                           /* TLS: 非 0 なら同じポートの UDP で HTTP/3 */
+    const char *http3_listen;            /* HTTP/3 の UDP を別のアドレスにするとき */
+    int allow_http;                      /* 平文: HTTP/1.1 を受けるか (既定 1) */
+    int allow_h2c;                       /* 平文: h2c を受けるか (既定 1) */
+    int secure_redirect;                 /* 平文: https へ 301 で返すか (既定 0) */
+    const char *redirect_to;             /* 平文: リダイレクト先のポートを取る TLS のリスナー名 */
+    uint32_t threads;                    /* このリスナーのワーカー数 */
+    const char *unix_socket_permissions; /* unix:<path> のパーミッション ("0660" 等) */
+} veil_listener_t;
+
+/*
+ * 待ち受けを 1 個足す ([[listener]])。ポートごとに 1 回呼ぶ。1 個でも足すと、ライブラリ既定の
+ * 127.0.0.1:8080 (listen_cleartext) は veil_config_listen_cleartext で明示しない限り開かない。
+ */
+int veil_config_add_listener(veil_config_t *cfg, const veil_listener_t *listener);
+
 /* 設定を解放する。veil_run に渡した後は呼ばない。NULL は何もしない。 */
 void veil_config_free(veil_config_t *cfg);
 

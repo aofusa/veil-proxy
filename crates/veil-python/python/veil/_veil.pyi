@@ -43,6 +43,23 @@ class Config:
         """Set ``[tls].cert_path`` and ``key_path``."""
     def threads(self, n: int) -> None:
         """Set ``[server].threads``."""
+    def add_listener(
+        self,
+        listen: str,
+        tls: bool = False,
+        *,
+        name: str | None = None,
+        http2: bool | None = None,
+        http3: bool = False,
+        http3_listen: str | None = None,
+        allow_http: bool | None = None,
+        allow_h2c: bool | None = None,
+        secure_redirect: bool | None = None,
+        redirect_to: str | None = None,
+        threads: int | None = None,
+        unix_socket_permissions: str | None = None,
+    ) -> None:
+        """Add a ``[[listener]]`` (one port); see :class:`veil.Listener`."""
     def to_toml(self) -> str:
         """Return the merged configuration as a TOML string (for debugging)."""
 

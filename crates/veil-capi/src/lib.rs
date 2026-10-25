@@ -19,7 +19,7 @@ use std::ptr;
 
 use bytes::Bytes;
 use veil::api::bridge::HandlerContext;
-use veil::api::{App, Config, HandlerFn, OperationMeta, Request, Response};
+use veil::api::{App, Config, HandlerFn, Listener, OperationMeta, Request, Response};
 
 // ===================== BoringSSL 互換シンボルの橋渡し =====================
 
@@ -369,6 +369,97 @@ pub unsafe extern "C" fn veil_config_threads(cfg: *mut veil_config_t, n: u32) ->
         Ok(()) => VEIL_OK,
         Err(e) => fail(VEIL_ERR_CONFIG, e.0),
     }
+}
+
+/// 待ち受け 1 個（`[[listener]]`、F-260）。`veil_config_add_listener` に渡す。
+///
+/// 文字列は NULL なら省略（既定）。`int` のうち `http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+/// 負なら省略（既定）、0 で false、正で true。`threads` は 0 なら省略。
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct veil_listener_t {
+    pub name: *const c_char,
+    /// 必須。`host:port` か `unix:<path>`
+    pub listen: *const c_char,
+    /// 0 = 平文（HTTP/1.1 + h2c）、非 0 = TLS（`veil_config_tls` の証明書）
+    pub tls: c_int,
+    pub http2: c_int,
+    /// 非 0 = 同じポートの UDP で HTTP/3（TLS のみ）
+    pub http3: c_int,
+    pub http3_listen: *const c_char,
+    pub allow_http: c_int,
+    pub allow_h2c: c_int,
+    pub secure_redirect: c_int,
+    pub redirect_to: *const c_char,
+    pub threads: u32,
+    pub unix_socket_permissions: *const c_char,
+}
+
+/// NULL なら `None`、それ以外は UTF-8 の文字列
+unsafe fn opt_cstr<'a>(p: *const c_char) -> Result<Option<&'a str>, c_int> {
+    if p.is_null() {
+        Ok(None)
+    } else {
+        cstr(p).map(Some)
+    }
+}
+
+/// 待ち受けを 1 個足す（`[[listener]]`、F-260）。ポートごとに 1 回呼ぶ。1 個でも足すと、ライブラリ既定の
+/// `127.0.0.1:8080`（`listen_cleartext`）は `veil_config_listen_cleartext` で明示しない限り開かない。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`listener` は有効な `veil_listener_t` へのポインタ（文字列は NUL 終端か NULL）。
+#[no_mangle]
+pub unsafe extern "C" fn veil_config_add_listener(
+    cfg: *mut veil_config_t,
+    listener: *const veil_listener_t,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    let Some(l) = listener.as_ref() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL listener");
+    };
+    let listen = tryc!(cstr(l.listen));
+    let mut b = if l.tls != 0 {
+        Listener::tls(listen)
+    } else {
+        Listener::cleartext(listen)
+    };
+    if let Some(v) = tryc!(opt_cstr(l.name)) {
+        b = b.name(v);
+    }
+    if l.http2 >= 0 {
+        b = b.http2(l.http2 != 0);
+    }
+    if l.http3 != 0 {
+        b = b.http3(true);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.http3_listen)) {
+        b = b.http3_listen(v);
+    }
+    if l.allow_http >= 0 {
+        b = b.allow_http(l.allow_http != 0);
+    }
+    if l.allow_h2c >= 0 {
+        b = b.allow_h2c(l.allow_h2c != 0);
+    }
+    if l.secure_redirect >= 0 {
+        b = b.secure_redirect(l.secure_redirect != 0);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.redirect_to)) {
+        b = b.redirect_to(v);
+    }
+    if l.threads > 0 {
+        b = b.threads(l.threads as usize);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.unix_socket_permissions)) {
+        b = b.unix_socket_permissions(v);
+    }
+    cfg.config.add_listener(b);
+    VEIL_OK
 }
 
 /// 設定を解放する（`veil_run` に渡した後は呼ばない。NULL は何もしない）。
@@ -919,6 +1010,57 @@ mod tests {
         )
         .with_params(vec![(Arc::from("id"), Bytes::from_static(b"4%202"))]);
         veil_request_t::new(req)
+    }
+
+    // F-260
+    #[test]
+    fn add_listener_builds_the_listener_array() {
+        let listen = c("0.0.0.0:8081");
+        let name = c("h1tls");
+        let l = veil_listener_t {
+            name: name.as_ptr(),
+            listen: listen.as_ptr(),
+            tls: 1,
+            http2: 0,
+            http3: 0,
+            http3_listen: ptr::null(),
+            allow_http: -1,
+            allow_h2c: -1,
+            secure_redirect: -1,
+            redirect_to: ptr::null(),
+            threads: 2,
+            unix_socket_permissions: ptr::null(),
+        };
+        unsafe {
+            let cfg = veil_config_new();
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            let plain = c("0.0.0.0:8082");
+            let l2 = veil_listener_t {
+                listen: plain.as_ptr(),
+                tls: 0,
+                name: ptr::null(),
+                threads: 0,
+                allow_http: 0,
+                ..l
+            };
+            assert_eq!(veil_config_add_listener(cfg, &l2), VEIL_OK);
+            assert_eq!(
+                veil_config_add_listener(cfg, ptr::null()),
+                VEIL_ERR_INVALID_ARG
+            );
+            let v = (*cfg).config.to_value().unwrap();
+            let ls = v["listener"].as_array().unwrap();
+            assert_eq!(ls.len(), 2);
+            assert_eq!(ls[0]["name"].as_str(), Some("h1tls"));
+            assert_eq!(ls[0]["tls"].as_bool(), Some(true));
+            assert_eq!(ls[0]["http2"].as_bool(), Some(false));
+            assert_eq!(ls[0]["threads"].as_integer(), Some(2));
+            assert!(ls[0].get("allow_http").is_none());
+            assert_eq!(ls[1]["allow_http"].as_bool(), Some(false));
+            assert!(ls[1].get("threads").is_none());
+            assert!(v["server"].get("listen_cleartext").is_none());
+            veil_config_free(cfg);
+        }
     }
 
     #[test]

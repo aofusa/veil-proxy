@@ -36,6 +36,7 @@ __all__ = [
     "StreamingResponse",
     "EventSourceResponse",
     "Protocol",
+    "Listener",
     "route",
     "get",
     "post",
@@ -867,6 +868,62 @@ def _toml_literal(v):
     raise TypeError("TOML に変換できない値: %r" % (v,))
 
 
+# F-260: 待ち受け 1 個（``[[listener]]``）。``run(listeners=[...])`` に渡す（辞書でも同じキー）。
+_LISTENER_KEYS = (
+    "name",
+    "http2",
+    "http3",
+    "http3_listen",
+    "allow_http",
+    "allow_h2c",
+    "secure_redirect",
+    "redirect_to",
+    "threads",
+    "unix_socket_permissions",
+)
+
+
+class Listener:
+    """One listening port (a ``[[listener]]`` entry) for ``run(listeners=[...])``.
+
+    ``listen`` is ``host:port`` or ``unix:<path>``. ``tls=True`` serves TLS with the ``tls_cert`` / ``tls_key``
+    certificate; ``http2`` (TLS only, default ``[server].http2_enabled``) offers h2 through ALPN and ``http3``
+    (TLS only) also serves HTTP/3 on the same UDP port (or ``http3_listen``). Plaintext listeners accept
+    HTTP/1.1 (``allow_http``) and h2c (``allow_h2c``), both on by default; ``secure_redirect=True`` answers
+    with a 301 redirect to https (to the port of the TLS listener ``redirect_to``, default the first one).
+    ``threads`` is the number of worker threads of this listener (default ``[server].threads``).
+    """
+
+    def __init__(self, listen, tls=False, **options):
+        """Create a listener on ``listen``; ``options`` are the ``[[listener]]`` keys listed above."""
+        unknown = set(options) - set(_LISTENER_KEYS)
+        if unknown:
+            raise TypeError("unknown listener option(s): %s" % ", ".join(sorted(unknown)))
+        self.listen = listen
+        self.tls = bool(tls)
+        self.options = {k: v for k, v in options.items() if v is not None}
+
+    def __repr__(self):
+        opts = "".join(", %s=%r" % kv for kv in sorted(self.options.items()))
+        return "Listener(%r, tls=%r%s)" % (self.listen, self.tls, opts)
+
+    @classmethod
+    def from_value(cls, value):
+        """Return ``value`` as a :class:`Listener` (a ``Listener`` or a dict with the same keys)."""
+        if isinstance(value, Listener):
+            return value
+        if isinstance(value, dict):
+            d = dict(value)
+            if "listen" not in d:
+                raise ValueError("a listener needs 'listen'")
+            return cls(d.pop("listen"), d.pop("tls", False), **d)
+        raise TypeError("a listener must be veil.Listener or a dict, not %r" % (value,))
+
+    def add_to(self, cfg):
+        """Add this listener to the native ``Config``."""
+        cfg.add_listener(self.listen, self.tls, **self.options)
+
+
 class App:
     """A set of routes. Register with ``@app.get(...)`` and start with ``app.run()``."""
 
@@ -964,6 +1021,8 @@ class App:
         threads=None,
         overrides=None,
         openapi=True,
+        listeners=None,
+        http3=None,
     ):
         """Build the native ``Config`` from the arguments of :meth:`run` (requires the native extension)."""
         from . import _veil
@@ -979,6 +1038,13 @@ class App:
             cfg.listen_cleartext(listen_cleartext)
         if listen:
             cfg.listen(listen)
+        for listener in listeners or ():
+            Listener.from_value(listener).add_to(cfg)
+        if http3:
+            # [server].listen の TLS のリスナーで HTTP/3 も受ける（文字列なら UDP のアドレス）
+            cfg.set("http3.enabled", "true")
+            if isinstance(http3, str):
+                cfg.set("http3.listen", _toml_literal(http3))
         if tls_cert or tls_key:
             if not (tls_cert and tls_key):
                 raise ValueError("tls_cert and tls_key must be given together")
@@ -1000,12 +1066,17 @@ class App:
         threads=None,
         overrides=None,
         openapi=True,
+        listeners=None,
+        http3=None,
     ):
         """Start the server and block until it stops (Ctrl-C, SIGTERM or :func:`shutdown`).
 
         ``listen_cleartext`` is the plaintext HTTP/1.1 + h2c address (default ``127.0.0.1:8080``); ``listen`` is
-        the TLS address and needs ``tls_cert`` and ``tls_key``. ``overrides`` maps config keys to Python values,
-        e.g. ``{"server.threads": 4}``. ``openapi=False`` disables ``/openapi.json`` and ``/docs``.
+        the TLS address and needs ``tls_cert`` and ``tls_key``. ``http3=True`` also serves HTTP/3 on the UDP port
+        of ``listen`` (a string is the UDP address). ``listeners`` is a list of :class:`Listener` (or dicts with
+        the same keys) for several ports; with any listener the default ``127.0.0.1:8080`` is not opened unless
+        ``listen_cleartext`` is given. ``overrides`` maps config keys to Python values, e.g.
+        ``{"server.threads": 4}``. ``openapi=False`` disables ``/openapi.json`` and ``/docs``.
         """
         from . import _veil
 
@@ -1018,6 +1089,8 @@ class App:
             threads=threads,
             overrides=overrides,
             openapi=openapi,
+            listeners=listeners,
+            http3=http3,
         )
         # サーバの中で渡る Rust 側の型も isinstance(x, veil.Request / veil.Headers) で真にする
         Request.register(_veil.NativeRequest)

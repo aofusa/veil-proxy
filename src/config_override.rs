@@ -124,6 +124,16 @@ impl ConfigOverride {
         })
     }
 
+    /// 上書きするキーのパスが `keys`（添字を含まないキーの列）と同じか（ライブラリの既定の扱いの判定。F-260）。
+    pub fn targets(&self, keys: &[&str]) -> bool {
+        self.path.len() == keys.len()
+            && self
+                .path
+                .iter()
+                .zip(keys)
+                .all(|(seg, k)| matches!(seg, Segment::Key(s) if s == k))
+    }
+
     /// TOML 値木へ適用する（ライブラリのビルダが使う）。
     pub fn apply(&self, root: &mut toml::Value) -> Result<(), String> {
         apply_override(root, self)

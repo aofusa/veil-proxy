@@ -56,7 +56,7 @@ pub use app::{
     block_on, serve, serve_blocking, serve_with_router, settings, shutdown, state, ApiSettings,
     App, Error, Router,
 };
-pub use config::{Config, ConfigBuilder, ConfigError};
+pub use config::{Config, ConfigBuilder, ConfigError, Listener};
 pub use extract::{Body, Form, FromRequest, Headers, Json, Query, State};
 pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta};
 pub use request::{HttpVersion, Request};
@@ -67,7 +67,7 @@ pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
 /// Re-exports of the most commonly used types (`use veil::prelude::*;`).
 pub mod prelude {
     pub use super::app::{serve, serve_blocking, serve_with_router, shutdown, App, Router};
-    pub use super::config::{Config, ConfigBuilder};
+    pub use super::config::{Config, ConfigBuilder, Listener};
     pub use super::extract::{Body, Form, Headers, Json, Query, State};
     #[cfg(feature = "l4-handler")]
     pub use super::l4::{L4Connection, L4Datagram, L4Error};

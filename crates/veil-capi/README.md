@@ -40,6 +40,15 @@ veil_run(cfg);                                      /* 停止までブロック�
 - アクセスログは既定で標準出力に出ます（`[access_log] enabled = true`・`format = "text"`）。止めるときは
   `veil_config_set(cfg, "access_log.enabled", "false")`。
 - 停止は SIGINT / SIGTERM、または別スレッドからの `veil_shutdown()`。
+- プロトコルの違うポートを複数開くときは `veil_listener_t` を埋めてポートごとに `veil_config_add_listener` を呼びます
+  （`[[listener]]` の 1 項目）。`http2`・`allow_http`・`allow_h2c`・`secure_redirect` は負の値で既定、文字列は `NULL` で省略です。
+  1 個でも足すと、既定の `127.0.0.1:8080` は `veil_config_listen_cleartext` を呼ばない限り開きません。
+
+  ```c
+  veil_listener_t l = { .listen = "0.0.0.0:8443", .tls = 1, .http2 = -1, .http3 = 1,
+                        .allow_http = -1, .allow_h2c = -1, .secure_redirect = -1 };
+  veil_config_add_listener(cfg, &l);
+  ```
 
 ## スレッドモデル
 

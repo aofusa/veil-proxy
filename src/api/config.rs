@@ -42,6 +42,9 @@ pub struct Config {
     pub(crate) inline: Option<toml::Value>,
     /// Builder overrides (later ones win).
     pub(crate) overrides: Vec<ConfigOverride>,
+    // F-260: `add_listener` で足した `[[listener]]`（`overrides` の `listener_override` 番目に配列ごと入れる）
+    listeners: Vec<toml::Value>,
+    listener_override: Option<usize>,
 }
 
 impl Default for Config {
@@ -57,6 +60,8 @@ impl Config {
             file: None,
             inline: None,
             overrides: Vec::new(),
+            listeners: Vec::new(),
+            listener_override: None,
         }
     }
 
@@ -82,8 +87,7 @@ impl Config {
             .map_err(|e| ConfigError(format!("{}: {}", path.display(), e)))?;
         Ok(Config {
             file: Some(path.to_path_buf()),
-            inline: None,
-            overrides: Vec::new(),
+            ..Config::new()
         })
     }
 
@@ -92,9 +96,8 @@ impl Config {
         let v: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError(format!("TOML parse error: {}", e)))?;
         Ok(Config {
-            file: None,
             inline: Some(v),
-            overrides: Vec::new(),
+            ..Config::new()
         })
     }
 
@@ -115,6 +118,24 @@ impl Config {
         let ov = ConfigOverride::from_parts(path, value).map_err(ConfigError)?;
         self.overrides.push(ov);
         Ok(())
+    }
+
+    // F-260: `[[listener]]` は配列なので、足すたびに配列全体を 1 個の上書きとして置き直す（`deep_merge` は配列を
+    // 丸ごと置き換えるため、1 個ずつの上書きでは前の分が消える）。
+    /// Adds a `[[listener]]` entry. Listeners added this way replace any `[[listener]]` array of the file or the
+    /// inline TOML (arrays are not merged). When at least one listener is configured, the library default
+    /// `[server].listen_cleartext = "127.0.0.1:8080"` is not opened unless it is set explicitly.
+    pub fn add_listener(&mut self, listener: Listener) {
+        self.listeners.push(listener.to_value());
+        let ov = ConfigOverride::from_parts("listener", toml::Value::Array(self.listeners.clone()))
+            .expect("static override path");
+        match self.listener_override {
+            Some(i) => self.overrides[i] = ov,
+            None => {
+                self.listener_override = Some(self.overrides.len());
+                self.overrides.push(ov);
+            }
+        }
     }
 
     /// Path of the imported `config.toml`.
@@ -142,6 +163,113 @@ impl Config {
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         let v = self.to_value()?;
         toml::to_string_pretty(&v).map_err(|e| ConfigError(e.to_string()))
+    }
+}
+
+// F-260: 待ち受け 1 個（`[[listener]]`）のビルダ。キーは設定ファイルの `[[listener]]` と同じ。
+/// One listener (`[[listener]]`), for [`ConfigBuilder::listener`] and [`Config::add_listener`].
+///
+/// ```
+/// use veil::api::config::{Config, Listener};
+/// let config = Config::new()
+///     .builder()
+///     .tls("cert.pem", "key.pem")
+///     .listener(Listener::tls("0.0.0.0:8443").http3(true))
+///     .listener(Listener::tls("0.0.0.0:8081").http2(false))
+///     .listener(Listener::cleartext("0.0.0.0:8080"))
+///     .listener(Listener::cleartext("0.0.0.0:8082").allow_http(false))
+///     .build();
+/// # let _ = config;
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listener {
+    table: toml::Table,
+}
+
+impl Listener {
+    fn with(listen: &str, tls: bool) -> Listener {
+        let mut table = toml::Table::new();
+        table.insert("listen".into(), toml::Value::String(listen.to_string()));
+        table.insert("tls".into(), toml::Value::Boolean(tls));
+        Listener { table }
+    }
+
+    fn set(mut self, key: &str, value: toml::Value) -> Listener {
+        self.table.insert(key.into(), value);
+        self
+    }
+
+    /// A TLS listener (`tls = true`; the certificate is `[tls]`, see [`ConfigBuilder::tls`]). `listen` is
+    /// `host:port` or `unix:<path>`.
+    pub fn tls(listen: &str) -> Listener {
+        Listener::with(listen, true)
+    }
+
+    /// A plaintext listener (`tls = false`) for HTTP/1.1 and h2c.
+    pub fn cleartext(listen: &str) -> Listener {
+        Listener::with(listen, false)
+    }
+
+    /// `name`: used in logs, errors and `redirect_to` (default `listener-<index>`).
+    pub fn name(self, name: &str) -> Listener {
+        self.set("name", toml::Value::String(name.to_string()))
+    }
+
+    /// `http2` (TLS only): whether ALPN offers h2 (default `[server].http2_enabled`).
+    pub fn http2(self, on: bool) -> Listener {
+        self.set("http2", toml::Value::Boolean(on))
+    }
+
+    /// `http3` (TLS only): also serve HTTP/3 on the same port over UDP (requires the `http3` feature).
+    pub fn http3(self, on: bool) -> Listener {
+        self.set("http3", toml::Value::Boolean(on))
+    }
+
+    /// `http3_listen`: the UDP address of HTTP/3 when it differs from `listen` (implies `http3(true)`).
+    pub fn http3_listen(self, addr: &str) -> Listener {
+        self.http3(true)
+            .set("http3_listen", toml::Value::String(addr.to_string()))
+    }
+
+    /// `allow_http` (plaintext only): accept HTTP/1.1 (default true).
+    pub fn allow_http(self, on: bool) -> Listener {
+        self.set("allow_http", toml::Value::Boolean(on))
+    }
+
+    /// `allow_h2c` (plaintext only): accept h2c (default true).
+    pub fn allow_h2c(self, on: bool) -> Listener {
+        self.set("allow_h2c", toml::Value::Boolean(on))
+    }
+
+    /// `secure_redirect` (plaintext only): answer every request with a 301 redirect to https (default false).
+    pub fn secure_redirect(self, on: bool) -> Listener {
+        self.set("secure_redirect", toml::Value::Boolean(on))
+    }
+
+    /// `redirect_to` (plaintext only): the TLS listener whose port the redirect uses (implies `secure_redirect(true)`).
+    pub fn redirect_to(self, listener_name: &str) -> Listener {
+        self.secure_redirect(true).set(
+            "redirect_to",
+            toml::Value::String(listener_name.to_string()),
+        )
+    }
+
+    /// `threads`: the worker threads of this listener (default `[server].threads`).
+    pub fn threads(self, n: usize) -> Listener {
+        self.set("threads", toml::Value::Integer(n as i64))
+    }
+
+    /// `unix_socket_permissions`: the file mode of a `unix:<path>` socket (default `[server].unix_socket_permissions`).
+    pub fn unix_socket_permissions(self, mode: &str) -> Listener {
+        self.set(
+            "unix_socket_permissions",
+            toml::Value::String(mode.to_string()),
+        )
+    }
+
+    /// The `[[listener]]` table.
+    pub fn to_value(&self) -> toml::Value {
+        toml::Value::Table(self.table.clone())
     }
 }
 
@@ -284,6 +412,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Adds a listener (`[[listener]]`); call it once per port. See [`Config::add_listener`].
+    pub fn listener(mut self, listener: Listener) -> Self {
+        self.config.add_listener(listener);
+        self
+    }
+
     /// Overrides an arbitrary key using the `--override` syntax. A syntax error returns `Err` instead of panicking.
     pub fn set(mut self, expr: &str) -> Result<Self, ConfigError> {
         self.config.set_override(expr)?;
@@ -343,6 +477,12 @@ pub(crate) fn compose(
     overrides: &[ConfigOverride],
 ) -> Result<(), String> {
     let file_root = std::mem::replace(root, default_value());
+    // F-260: 既定の平文のリスナー（127.0.0.1:8080）は、`[[listener]]` を書いた人には開かない（明示した人には開く）
+    let explicit_cleartext = has_listen_cleartext(&file_root)
+        || inline.is_some_and(has_listen_cleartext)
+        || overrides
+            .iter()
+            .any(|o| o.targets(&["server", "listen_cleartext"]));
     deep_merge(root, file_root);
     if let Some(inline) = inline {
         deep_merge(root, inline.clone());
@@ -350,7 +490,22 @@ pub(crate) fn compose(
     for ov in overrides {
         ov.apply(root)?;
     }
+    let has_listeners = root
+        .get("listener")
+        .and_then(|l| l.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if has_listeners && !explicit_cleartext {
+        if let Some(server) = root.get_mut("server").and_then(|s| s.as_table_mut()) {
+            server.remove("listen_cleartext");
+        }
+    }
     Ok(())
+}
+
+fn has_listen_cleartext(v: &toml::Value) -> bool {
+    v.get("server")
+        .and_then(|s| s.get("listen_cleartext"))
+        .is_some()
 }
 
 #[cfg(test)]
@@ -439,6 +594,62 @@ mod tests {
             v["server"]["listen_cleartext"].as_str(),
             Some("127.0.0.1:8080")
         );
+    }
+
+    // F-260
+    #[test]
+    fn listeners_replace_the_default_cleartext_listener() {
+        let v = Config::new()
+            .builder()
+            .listener(Listener::tls("0.0.0.0:8443").http3(true).name("https"))
+            .listener(Listener::cleartext("0.0.0.0:8082").allow_http(false))
+            .build()
+            .to_value()
+            .unwrap();
+        let ls = v["listener"].as_array().unwrap();
+        assert_eq!(ls.len(), 2);
+        assert_eq!(ls[0]["listen"].as_str(), Some("0.0.0.0:8443"));
+        assert_eq!(ls[0]["tls"].as_bool(), Some(true));
+        assert_eq!(ls[0]["http3"].as_bool(), Some(true));
+        assert_eq!(ls[0]["name"].as_str(), Some("https"));
+        assert_eq!(ls[1]["allow_http"].as_bool(), Some(false));
+        // 既定の 127.0.0.1:8080 は開かない
+        assert!(v["server"].get("listen_cleartext").is_none());
+
+        // 明示した listen_cleartext は残る
+        let v = Config::new()
+            .builder()
+            .listen_cleartext("127.0.0.1:9000")
+            .listener(Listener::cleartext("127.0.0.1:9001"))
+            .build()
+            .to_value()
+            .unwrap();
+        assert_eq!(
+            v["server"]["listen_cleartext"].as_str(),
+            Some("127.0.0.1:9000")
+        );
+        // ファイル（インライン）の [[listener]] でも同じ
+        let v = Config::from_toml_str("[[listener]]\nlisten = \"127.0.0.1:9002\"\ntls = false\n")
+            .unwrap()
+            .to_value()
+            .unwrap();
+        assert!(v["server"].get("listen_cleartext").is_none());
+    }
+
+    #[test]
+    fn listener_builder_keys() {
+        let l = Listener::cleartext("0.0.0.0:80")
+            .redirect_to("https")
+            .threads(2);
+        let v = l.to_value();
+        assert_eq!(v["secure_redirect"].as_bool(), Some(true));
+        assert_eq!(v["redirect_to"].as_str(), Some("https"));
+        assert_eq!(v["threads"].as_integer(), Some(2));
+        let v = Listener::tls("0.0.0.0:443")
+            .http3_listen("0.0.0.0:8443")
+            .to_value();
+        assert_eq!(v["http3"].as_bool(), Some(true));
+        assert_eq!(v["http3_listen"].as_str(), Some("0.0.0.0:8443"));
     }
 
     #[test]
