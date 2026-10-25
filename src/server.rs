@@ -829,7 +829,7 @@ pub fn spawn_health_check_thread() {
 // SO_REUSEPORT CBPF ロードバランシング
 // ====================
 
-// CBPF_ATTACHED, create_reuseport_cbpf_program, attach_reuseport_cbpf は
+// create_reuseport_cbpf_program, attach_reuseport_cbpf は
 // crate::system モジュールに移動しました。
 
 /// リスナーソケットを作成する（SO_REUSEPORT + オプションのCBPF振り分け）
@@ -838,7 +838,7 @@ pub fn spawn_health_check_thread() {
 /// * `addr` - バインドするアドレス
 /// * `balancing` - 振り分け方式
 /// * `num_workers` - ワーカースレッド数（CBPF使用時に必要）
-/// * `worker_id` - このワーカーのID（最初のワーカーがCBPFをアタッチ）
+/// * `worker_id` - このワーカーのID（0 のワーカーがリスナーごとにCBPFをアタッチ）
 pub fn create_listener(
     addr: SocketAddr,
     #[allow(unused_variables)] balancing: ReuseportBalancing,
@@ -865,30 +865,25 @@ pub fn create_listener(
         }
     }
 
-    // Linux環境でCBPF振り分けが有効な場合、最初のワーカーのみCBPFプログラムをアタッチ
-    // 後続のワーカーはreuseportグループに参加し、自動的にBPFプログラムを継承する
+    // Linux環境でCBPF振り分けが有効な場合、リスナー（reuseport グループ）ごとに最初のワーカー
+    // （worker_id == 0）だけがCBPFプログラムをアタッチする。後続のワーカーはグループに参加し、
+    // 自動的にBPFプログラムを継承する。全呼び出し元は 0..num_workers を渡す。
     #[cfg(target_os = "linux")]
-    if balancing == ReuseportBalancing::Cbpf {
-        // CAS操作で最初の1回だけアタッチを実行
-        let prev = CBPF_ATTACHED.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
-
-        if prev.is_ok() {
-            // このワーカーが最初にリスナーを作成した
-            let fd = listener.as_raw_fd();
-            match attach_reuseport_cbpf(fd, num_workers) {
-                Ok(()) => {
-                    info!("[Worker {}] CBPF reuseport load balancing enabled (flow hash -> {} workers)",
-                          worker_id, num_workers);
-                }
-                Err(e) => {
-                    // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
-                    warn!(
-                        "[Worker {}] CBPF attach failed, falling back to kernel default: {}",
-                        worker_id, e
-                    );
-                    // フラグをリセットして他のワーカーも試行できるようにする（オプション）
-                    // CBPF_ATTACHED.store(0, Ordering::SeqCst);
-                }
+    if balancing == ReuseportBalancing::Cbpf && worker_id == 0 {
+        let fd = listener.as_raw_fd();
+        match attach_reuseport_cbpf(fd, num_workers) {
+            Ok(()) => {
+                info!(
+                    "[Worker {}] CBPF reuseport load balancing enabled on {} (flow hash -> {} workers)",
+                    worker_id, addr, num_workers
+                );
+            }
+            Err(e) => {
+                // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
+                warn!(
+                    "[Worker {}] CBPF attach failed on {}, falling back to kernel default: {}",
+                    worker_id, addr, e
+                );
             }
         }
     }

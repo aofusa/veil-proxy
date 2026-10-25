@@ -767,12 +767,6 @@ pub(crate) fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
 // SO_REUSEPORT CBPF 振り分け
 // ====================
 
-/// CBPFプログラムがアタッチ済みかどうかを追跡するグローバルカウンター
-/// 最初のワーカーのみがCBPFプログラムをアタッチする
-#[cfg(target_os = "linux")]
-pub(crate) static CBPF_ATTACHED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 // classic BPF の "ancillary load"（拡張オフセット）関連定数。
 // libc クレートには定義が無いため、Linux の
 // include/uapi/linux/filter.h / net/core/filter.c (bpf_common.h) の値をそのまま持ち込む。
