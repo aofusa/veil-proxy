@@ -501,7 +501,7 @@ pub async fn get_cached(path: &Path, cfg: &StaticContentCacheConfig) -> Option<B
 /// 詳細は `ContentCache::insert_bytes` 参照。
 ///
 /// 監視しているルートの世代は登録の時点で読む（F-272。読む前に読んだ世代を持っている呼び出し元は
-/// [`insert_bytes_stamped`] を使う）。
+/// `insert_bytes_stamped` を使う）。
 pub fn insert_bytes(path: &Path, data: Bytes, mime: Arc<str>, cfg: &StaticContentCacheConfig) {
     let stamp = super::watch::stamp(cfg.watch_gen);
     CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp);
