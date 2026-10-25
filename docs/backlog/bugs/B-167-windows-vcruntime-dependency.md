@@ -32,7 +32,16 @@ v0.9.1 の winget の最初の提出（microsoft/winget-pkgs#461268）。検証�
 - 試験: `tools/release/check-pe-imports.py`（PE の import 表に C ランタイムの DLL が無いこと。dist.yml の cross の Windows）と、
   `windows-test` の x86_64 で Nano Server のコンテナ（再頒布パッケージが無い）で `veil.exe --version`。
 
+## 確認（GitHub Actions、ci-exp の一時的な workflow で dist.yml と同じクロスビルド）
+
+- import 表: x86_64・aarch64 とも C ランタイムの DLL 無し（kernel32・ntdll・api-ms-win-core-synch・bcryptprimitives・ws2_32・advapi32 だけ）
+- Nano Server（ltsc2022）のコンテナで `veil.exe --version`: 新しいビルドは `veil 0.9.1`・終了コード 0、0.9.1 の配布物は
+  `-1073741515`（0xC0000135 STATUS_DLL_NOT_FOUND）
+- windows-2022・windows-11-arm の binary-smoke はすべて ok
+
 ## winget
 
 - 0.9.1 のマニフェストは依存（`Microsoft.VCRedist.2015+.x64`・`.arm64`）を足して出した。
 - 次の版からは静的にリンクするので依存は要らない（komac は前の版のマニフェストを引き継ぐので、依存が残っても害は無い）。
+- 検証は入れた後に veil.exe を起動する。引数なしの veil はサーバとして動き続けるので、マニフェストの
+  `InstallationMetadata`（`FileType: launch`・`InvocationParameter: --version`）で起動の仕方を書く（winget-manifest.sh も）。
