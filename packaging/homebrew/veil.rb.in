@@ -2,7 +2,6 @@
 class Veil < Formula
   desc "High-performance reverse proxy and web server (HTTP/1.1, HTTP/2, HTTP/3)"
   homepage "https://github.com/aofusa/veil-proxy"
-  version "@VERSION@"
   license any_of: ["MIT", "Apache-2.0"]
 
   # One universal2 archive for both Apple silicon and Intel.

@@ -33,6 +33,8 @@ step "brew tap-new" brew tap-new --no-git aofusa/localtest
 tap="$(brew --repository)/Library/Taps/aofusa/homebrew-localtest"
 cp "$DIST/veil.rb" "$tap/Formula/veil.rb"
 step "brew style" brew style "$tap/Formula/veil.rb"
+# tap の CI（tap-test.yml）と同じ --strict（--online は公開した URL が要るので tap の CI だけ）
+step "brew audit" brew audit --strict aofusa/localtest/veil
 step "brew install" brew install --formula aofusa/localtest/veil || { echo "FAIL HOMEBREW TEST"; exit 1; }
 step "brew test" brew test aofusa/localtest/veil
 prefix="$(brew --prefix)"
