@@ -56,7 +56,17 @@ ENV CMAKE_SYSTEM_NAME=Windows \
     BORING_BSSL_NO_ASM=1 \
     XWIN_CACHE_DIR=/xwin-cache \
     CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
-    CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+    CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
+    CMAKE=/usr/local/bin/cmake-msvc-static
+
+# B-167: cargo-xwin が作る CMake の toolchain は `set(CMAKE_MSVC_RUNTIME_LIBRARY CACHE STRING "MultiThreaded")` で、値が
+# 説明の欄に入って変数が空のままになる（cargo-xwin 0.23 で確認）。CMake 3.15 以降の既定（/MD）で BoringSSL（boring-sys）が
+# 組み立てられ、/MT の Rust・cc の物とリンクで RuntimeLibrary の不一致になる。cmake の crate は環境変数 CMAKE の
+# 実行ファイルを使うので、構成のときだけ -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded を足す
+RUN printf '%s\n' '#!/bin/sh' \
+      'case " $* " in *" --build "*|*" -E "*|*" -P "*|*" --version "*|*" --install "*) exec cmake "$@" ;; esac' \
+      'exec cmake -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "$@"' > /usr/local/bin/cmake-msvc-static \
+    && chmod +x /usr/local/bin/cmake-msvc-static
 
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ
