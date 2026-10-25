@@ -2740,6 +2740,12 @@ revalidate_mtime = false
 # python_event_loop = "auto"              # Python: "auto"（uvloop があれば使う）・"asyncio"・"uvloop"
 # python_event_loop_queue = 65536         # Python: 1 つのループで待てる呼び出しの数（一杯なら 503）
 # python_async_mode = "loop"              # Python: async def の実行先（"loop" = 常駐のループ、"pool" = 0.10 より前と同じ）
+# multipart_max_parts = 100               # multipart/form-data のパート数の上限（超えたら 413。F-266）
+# multipart_max_field_size = 1048576      # ファイルでないパートの大きさの上限
+# multipart_max_file_size = 0             # ファイルのパートの大きさの上限（0 = max_body_size）
+# multipart_max_header_size = 8192        # 1 パートのヘッダの大きさの上限
+# multipart_spool_threshold = 1048576     # Python の UploadFile・C の VEIL_ROUTE_FORM: これを超えるファイルは一時ファイルへ
+# upload_tmp_dir = "/var/tmp/veil"        # アップロードの名前の無い一時ファイルの置き場（既定は OS の一時ディレクトリ）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）

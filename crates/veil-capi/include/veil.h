@@ -27,12 +27,21 @@ extern "C" {
 #define VEIL_ERR_UTF8        (-4) /* 文字列が UTF-8 ではない */
 #define VEIL_ERR_CLOSED      (-5) /* 相手が切断した・ストリームが閉じている (F-210) */
 #define VEIL_ERR_STATE       (-6) /* 呼べない状態 (INLINE でのストリーミング・単項の 2 回目の送信等) */
+#define VEIL_ERR_FORM        (-7) /* フォームの本文が壊れている (400 を返す。F-266) */
+#define VEIL_ERR_TOO_LARGE   (-8) /* フォームの本文が [api] multipart_* の上限を超えた (413 を返す。F-266) */
 
 /* ---- ルートのフラグ ---- */
 /* コールバックをワーカースレッド上で直接実行する (既定はハンドラ用プール)。 */
 #define VEIL_ROUTE_INLINE 1u
 /* 要求本文を溜めずにコールバックを呼ぶ (veil_request_body_read で順に読む。INLINE とは併用不可)。 */
 #define VEIL_ROUTE_STREAM_BODY 2u
+/*
+ * コールバックの前に本文を読み、multipart/form-data はパートに分ける (F-266。STREAM_BODY とは併用不可)。
+ * [api] multipart_spool_threshold を超えるファイルは名前の無い一時ファイル ([api] upload_tmp_dir) に書き、
+ * veil_multipart_next の fd で渡す (本文全体をメモリに溜めない)。壊れた本文は 400、上限超えは 413 を
+ * コールバックの前に返す。
+ */
+#define VEIL_ROUTE_FORM 4u
 
 /* ---- 不透明型 ---- */
 typedef struct veil_config   veil_config_t;   /* 設定 + 登録待ちルート */
@@ -149,6 +158,29 @@ const char *veil_request_param(const veil_request_t *req, const char *name, size
 const char *veil_request_query_param(const veil_request_t *req, const char *name, size_t *len);
 /* 送信元 IP の文字列表現。 */
 const char *veil_request_client_ip(const veil_request_t *req, size_t *len);
+
+/* ---- multipart/form-data (F-266) ---- */
+
+/* 1 パート。ポインタはコールバックの間だけ有効 (NUL 終端ではない)。 */
+typedef struct {
+    const char *name;          /* Content-Disposition の name (無ければ NULL) */
+    size_t name_len;
+    const char *filename;      /* filename (ファイルでなければ NULL。filename* は UTF-8 に復号済み) */
+    size_t filename_len;
+    const char *content_type;  /* パートの Content-Type (無ければ NULL) */
+    size_t content_type_len;
+    const char *data;          /* 中身 (一時ファイルに書いたときは NULL) */
+    size_t data_len;
+    intptr_t fd;               /* 一時ファイルの fd (Windows は HANDLE)。先頭に位置づけ済み。メモリなら -1。
+                                  コールバックから戻ると veil が閉じる (残すなら dup する) */
+    uint64_t size;             /* 中身のバイト数 */
+} veil_part_t;
+
+/*
+ * 次のパートを *out に入れる。1 = 入れた、0 = 終わり。VEIL_ERR_FORM (400)・VEIL_ERR_TOO_LARGE (413)・
+ * VEIL_ERR_STATE (multipart の本文ではない)。VEIL_ROUTE_FORM の無いルートは溜めた本文を解析する。
+ */
+int veil_multipart_next(const veil_request_t *req, veil_part_t *out);
 
 /* ---- レスポンスのセッター (成功で 0、失敗で負のエラーコード) ---- */
 

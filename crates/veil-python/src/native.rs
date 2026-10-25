@@ -13,7 +13,7 @@
 //!   Anything else (tuples, pydantic models, ...) is passed to the Python `Route.to_response`.
 
 use bytes::Bytes;
-use pyo3::exceptions::PyKeyError;
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
@@ -38,9 +38,22 @@ pub struct NativeRequest {
     query_params: PyOnceLock<Py<PyAny>>,
     // F-210: ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0）
     pub(crate) ctx: AtomicUsize,
+    // F-266: 本文を読む前に解析した multipart のパート（大きなファイルは名前の無い一時ファイル）
+    parts: std::sync::Mutex<Option<Vec<veil::api::multipart::SpooledPart>>>,
 }
 
 impl NativeRequest {
+    // F-266
+    /// A request whose multipart body was read beforehand (`multipart::prepare_form`).
+    pub fn with_parts(
+        req: Request,
+        parts: Option<Vec<veil::api::multipart::SpooledPart>>,
+    ) -> NativeRequest {
+        let r = NativeRequest::new(req);
+        *r.parts.lock().unwrap() = parts;
+        r
+    }
+
     pub fn new(req: Request) -> NativeRequest {
         NativeRequest {
             req,
@@ -51,6 +64,7 @@ impl NativeRequest {
             client_ip: PyOnceLock::new(),
             query_params: PyOnceLock::new(),
             ctx: AtomicUsize::new(0),
+            parts: std::sync::Mutex::new(None),
         }
     }
 
@@ -228,6 +242,30 @@ impl NativeRequest {
             req: slf.unbind(),
             whole_done: false,
         }
+    }
+
+    // F-266
+    /// The parts of a `multipart/form-data` body: tuples `(name, filename, content_type, headers, data, fd, size)`
+    /// where `data` is `bytes` (or `None` when the file was spooled to the temporary file descriptor `fd`; on
+    /// Windows `fd` is a handle). Malformed bodies raise `ValueError(status, message)`.
+    fn multipart(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        if let Some(parts) = self.parts.lock().unwrap().take() {
+            return parts.into_iter().map(|p| spooled_tuple(py, p)).collect();
+        }
+        let parts = veil::api::multipart::request_parts(&self.req)
+            .map_err(|e| PyValueError::new_err((e.status(), e.message().to_string())))?;
+        parts
+            .into_iter()
+            .map(|p| {
+                spooled_tuple(
+                    py,
+                    veil::api::multipart::SpooledPart {
+                        info: p.info,
+                        data: veil::api::multipart::SpooledData::Memory(p.data),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Parse the body as JSON.
@@ -676,4 +714,82 @@ impl AsRef<[u8]> for PyStrOwner {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes()
     }
+}
+
+// F-266
+/// One multipart part as the tuple `NativeRequest.multipart` returns.
+pub(crate) fn spooled_tuple(
+    py: Python<'_>,
+    p: veil::api::multipart::SpooledPart,
+) -> PyResult<Py<PyAny>> {
+    use veil::api::multipart::SpooledData;
+    let i = p.info;
+    let headers: Vec<(String, String)> = i.headers;
+    let (data, fd, size): (Option<Py<PyAny>>, Option<i64>, u64) = match p.data {
+        SpooledData::Memory(b) => {
+            let n = b.len() as u64;
+            (Some(PyBytes::new(py, &b).into_any().unbind()), None, n)
+        }
+        SpooledData::File { file, len } => {
+            #[cfg(unix)]
+            let fd = {
+                use std::os::unix::io::IntoRawFd;
+                file.into_raw_fd() as i64
+            };
+            #[cfg(windows)]
+            let fd = {
+                use std::os::windows::io::IntoRawHandle;
+                file.into_raw_handle() as usize as i64
+            };
+            (None, Some(fd), len)
+        }
+    };
+    Ok(
+        (i.name, i.filename, i.content_type, headers, data, fd, size)
+            .into_pyobject(py)?
+            .into_any()
+            .unbind(),
+    )
+}
+
+// F-266
+/// Parse a buffered `multipart/form-data` body (for requests built in Python); see `NativeRequest.multipart`.
+#[pyfunction]
+pub fn parse_multipart(
+    py: Python<'_>,
+    body: &[u8],
+    content_type: &str,
+) -> PyResult<Vec<Py<PyAny>>> {
+    let b = veil::api::multipart::boundary(content_type).ok_or_else(|| {
+        PyValueError::new_err((
+            400u16,
+            "expected a multipart/form-data body with a boundary".to_string(),
+        ))
+    })?;
+    let parts: Result<Vec<_>, _> = veil::api::multipart::parse(
+        Bytes::copy_from_slice(body),
+        &b,
+        veil::api::multipart::Limits::current(),
+    )
+    .collect();
+    let parts = parts.map_err(|e| PyValueError::new_err((e.status(), e.message().to_string())))?;
+    parts
+        .into_iter()
+        .map(|p| {
+            spooled_tuple(
+                py,
+                veil::api::multipart::SpooledPart {
+                    info: p.info,
+                    data: veil::api::multipart::SpooledData::Memory(p.data),
+                },
+            )
+        })
+        .collect()
+}
+
+// F-266
+/// `[api] multipart_spool_threshold` (uploads up to this size stay in memory).
+#[pyfunction]
+pub fn spool_threshold() -> usize {
+    veil::api::multipart::spool_threshold()
 }

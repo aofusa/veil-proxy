@@ -164,6 +164,29 @@ static int ws(const veil_request_t *req, veil_response_t *resp, void *ud) {
 veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）。接続ごとのデータは `veil_ws_set_data` / `veil_ws_data`、
 相手の IP は `veil_ws_peer`。
 
+### フォームとファイルのアップロード（F-266）
+
+```c
+static int upload(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    veil_part_t p;
+    int rc;
+    while ((rc = veil_multipart_next(req, &p)) == 1) {
+        if (p.fd >= 0) { /* 一時ファイル（先頭から read する。コールバックから戻ると閉じる） */ }
+        else { /* p.data / p.data_len */ }
+    }
+    if (rc < 0) { veil_response_set_status(resp, rc == VEIL_ERR_TOO_LARGE ? 413 : 400); }
+    return 0;
+}
+/* VEIL_ROUTE_FORM: 本文をコールバックの前に読み、大きなファイルは一時ファイルへ（本文全体を溜めない） */
+veil_register_route_ex(cfg, "/upload", "POST", upload, NULL, VEIL_ROUTE_FORM, NULL);
+```
+
+`veil_multipart_next` は `multipart/form-data` のパートを 1 つずつ返します（1 = 返した、0 = 終わり）。`name`・`filename`（ファイルでなければ
+NULL）・`content_type` と、中身の `data`/`data_len` か一時ファイルの `fd`（Windows は HANDLE。メモリなら -1）・`size` を持ちます。
+`VEIL_ROUTE_FORM` を付けたルートは本文をコールバックの前に読み、`[api] multipart_spool_threshold` を超えるファイルを `[api] upload_tmp_dir`
+の名前の無い一時ファイルに書きます（壊れた本文の 400・上限超えの 413 はコールバックの前に返す）。付けないルートは溜めた本文
+（`[api] max_body_size` まで）を解析します。上限は `[api] multipart_*`（`veil_config_set(cfg, "api.multipart_max_file_size", "209715200")`）。
+
 ### 所有権
 
 | 対象 | 規則 |
@@ -171,6 +194,7 @@ veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）�
 | `veil_stream_t *` | `veil_stream_close` で必ず閉じる（閉じるまで応答は終わらない）。コールバックの後も別スレッドで使える。 |
 | `veil_grpc_call_t *` / `veil_l4_conn_t *` / `veil_l4_reply_t *` | コールバックの中でだけ有効。 |
 | `veil_ws_t *` | `on_open` から `on_close` が戻るまで有効（その間はどのスレッドからでも `veil_ws_send`・`veil_ws_close` を呼べる）。 |
+| `veil_part_t` の中身・`fd` | コールバックの中でだけ有効（`fd` は veil が閉じる。残すなら dup する）。 |
 | `VEIL_ROUTE_INLINE` のルート | ストリーミング・本文の読み取りは使えない（`VEIL_ERR_STATE` / `NULL`）。 |
 
 ## エラーコード
@@ -183,7 +207,9 @@ veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）�
 | -3 | `VEIL_ERR_RUNTIME` | 起動・実行時のエラー（ルート衝突、ポート使用中 など） |
 | -4 | `VEIL_ERR_UTF8` | 文字列が UTF-8 ではない |
 | -5 | `VEIL_ERR_CLOSED` | 相手が切断した・ストリームが閉じている（F-210） |
-| -6 | `VEIL_ERR_STATE` | 呼べない状態（INLINE でのストリーミング・単項の 2 回目の送信等） |
+| -6 | `VEIL_ERR_STATE` | 呼べない状態（INLINE でのストリーミング・単項の 2 回目の送信・multipart でない本文での `veil_multipart_next` 等） |
+| -7 | `VEIL_ERR_FORM` | フォームの本文が壊れている（400 を返す。F-266） |
+| -8 | `VEIL_ERR_TOO_LARGE` | フォームの本文が `[api] multipart_*` の上限を超えた（413 を返す。F-266） |
 
 理由は `veil_last_error()` で取れます。
 

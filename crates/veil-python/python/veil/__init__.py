@@ -27,6 +27,8 @@ import typing
 import urllib.parse
 
 from ._aio import run_in_threadpool
+from . import _forms
+from ._forms import File, Form, UploadFile
 from .websockets import WebSocket, WebSocketDisconnect, WebSocketEndpoint, WebSocketState
 
 __all__ = [
@@ -41,6 +43,9 @@ __all__ = [
     "Protocol",
     "AsyncProtocol",
     "Listener",
+    "Form",
+    "File",
+    "UploadFile",
     "WebSocket",
     "WebSocketDisconnect",
     "WebSocketEndpoint",
@@ -504,19 +509,49 @@ _STR_ANN = {"int": int, "float": float, "bool": bool, "str": str, "dict": dict, 
 
 
 class _Param:
-    __slots__ = ("name", "kind", "ann", "model", "default", "required")
+    __slots__ = ("name", "kind", "ann", "model", "default", "required", "alias", "many")
 
-    def __init__(self, name, kind, ann, model, default):
+    def __init__(self, name, kind, ann, model, default, alias=None, many=False):
         self.name = name
-        self.kind = kind  # request / path / body / query
+        self.kind = kind  # request / path / body / query / form / file
         self.ann = ann
         self.model = model
         self.default = default
         self.required = default is _EMPTY
+        # F-266: フォームのフィールド名（既定は引数名）と、繰り返しを list で受けるか
+        self.alias = alias or name
+        self.many = many
+
+
+def _form_marker(p, extra):
+    """The ``Form()`` / ``File()`` marker of a parameter (its default or an ``Annotated`` metadata), if any."""
+    if isinstance(p.default, _forms._FormMarker):
+        return p.default
+    if typing.get_origin(extra) is typing.Annotated:
+        for m in extra.__metadata__:
+            if isinstance(m, _forms._FormMarker):
+                return m
+    return None
+
+
+def _form_param(name, base, marker, default):
+    # F-266: list[X] は繰り返し、UploadFile は File() を付けなくてもファイル
+    many = typing.get_origin(base) is list
+    item = typing.get_args(base)[0] if many and typing.get_args(base) else (str if many else base)
+    is_file = item is UploadFile or (marker is not None and marker.file)
+    if marker is not None:
+        default = _EMPTY if marker.default is ... else marker.default
+    return _Param(
+        name, "file" if is_file else "form", item, None, default, marker.alias if marker else None, many
+    )
 
 
 def _build_params(func, path_names):
     hints = _resolve_hints(func)
+    try:
+        extras = typing.get_type_hints(func, include_extras=True)
+    except Exception:
+        extras = {}
     out = []
     for name, p in inspect.signature(func).parameters.items():
         if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
@@ -524,8 +559,15 @@ def _build_params(func, path_names):
         ann = hints.get(name, p.annotation)
         if isinstance(ann, str):
             ann = _STR_ANN.get(ann, _EMPTY)
-        base, _ = _unwrap_optional(ann)
-        if name in ("req", "request") or (isinstance(base, type) and issubclass(base, Request)):
+        base, optional = _unwrap_optional(ann)
+        marker = _form_marker(p, extras.get(name, p.annotation))
+        uploads = base is UploadFile or (typing.get_origin(base) is list and typing.get_args(base) == (UploadFile,))
+        if marker is not None or uploads:
+            default = p.default
+            if optional and default is _EMPTY:
+                default = None
+            out.append(_form_param(name, base, marker, default))
+        elif name in ("req", "request") or (isinstance(base, type) and issubclass(base, Request)):
             out.append(_Param(name, "request", base, None, p.default))
         elif name == "websocket" or (isinstance(base, type) and issubclass(base, WebSocket)):
             out.append(_Param(name, "websocket", base, None, p.default))
@@ -689,6 +731,7 @@ class Route:
         errors = []
         qp = None
         body_checked = False
+        form = None
         for p in self.params:
             if p.kind == "request":
                 kwargs[p.name] = req
@@ -715,11 +758,62 @@ class Route:
             elif p.kind == "body":
                 body_checked = True
                 self._bind_body(p, req, kwargs, errors)
+            elif p.kind in ("form", "file"):
+                if form is None:
+                    form = self._form_parts(req)
+                self._bind_form(p, form, kwargs, errors)
         if self.body_constraints and not body_checked:
             self._bind_body(None, req, kwargs, errors)
         if errors:
             raise _ValidationFailed(errors)
         return kwargs
+
+    @staticmethod
+    def _form_parts(req):
+        # F-266: 名前ごとのパートの一覧（本文が壊れている・大きすぎるときは 400・413）
+        try:
+            parts = _forms.parts_of(req)
+        except _forms.FormError as e:
+            raise HTTPException(e.status, e.message)
+        by_name = {}
+        for part in parts:
+            by_name.setdefault(part.name, []).append(part)
+        return by_name
+
+    @staticmethod
+    def _bind_form(p, form, kwargs, errors):
+        found = form.get(p.alias, [])
+        if p.kind == "file":
+            found = [x for x in found if x.is_file()]
+        else:
+            found = [x for x in found if not x.is_file() or p.ann is bytes]
+        if not found:
+            if p.required:
+                errors.append(_err(["body", p.alias], "Field required", "missing"))
+            elif p.default is not _EMPTY:
+                kwargs[p.name] = p.default
+            return
+        values = []
+        for part in found if p.many else found[:1]:
+            if p.kind == "file" and p.ann is UploadFile:
+                values.append(part.upload())
+                continue
+            data = part.content()
+            if p.ann is bytes:
+                values.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+                continue
+            if isinstance(data, bytes):
+                try:
+                    data = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    errors.append(_err(["body", p.alias], "Input should be a valid string", "string_unicode"))
+                    return
+            try:
+                values.append(_convert_scalar(data, p.ann))
+            except ValueError as e:
+                errors.append(_err(["body", p.alias], e.args[0], e.args[1]))
+                return
+        kwargs[p.name] = values if p.many else values[0]
 
     def _bind_body(self, p, req, kwargs, errors):
         required = p is None or p.required
@@ -907,6 +1001,24 @@ class Route:
         body = next((p for p in self.params if p.kind == "body"), None)
         schema = None
         required = True
+        form = [p for p in self.params if p.kind in ("form", "file")]
+        if form:
+            # F-266: ファイルがあれば multipart/form-data、無ければ urlencoded
+            props = {}
+            for p in form:
+                if p.kind == "file":
+                    one = {"type": "string", "format": "binary"}
+                else:
+                    one = _scalar_schema(p.ann)
+                    if p.default is not _EMPTY and p.default is not None:
+                        one["default"] = p.default
+                props[p.alias] = {"type": "array", "items": one} if p.many else one
+            fs = {"type": "object", "properties": props}
+            req_names = [p.alias for p in form if p.required]
+            if req_names:
+                fs["required"] = req_names
+            media = "multipart/form-data" if any(p.kind == "file" for p in form) else "application/x-www-form-urlencoded"
+            op["requestBody"] = {"required": bool(req_names), "content": {media: {"schema": fs}}}
         if body is not None and body.model is not None:
             schema = self._model_ref(body.model, comps)
             required = body.required
@@ -924,7 +1036,7 @@ class Route:
         else:
             ok["content"] = {_JSON_CT: {"schema": {}}}
         responses = {str(self.status_code): ok}
-        if params or schema is not None:
+        if params or schema is not None or form:
             responses["422"] = {
                 "description": "Validation Error",
                 "content": {_JSON_CT: {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}},
@@ -1434,7 +1546,15 @@ class App:
             _HANDLERS.append(r)
             on_loop = r.is_async and not r.stream_body and (r.async_mode or mode) == "loop"
             _veil.register_route(
-                r.path, r.methods, hid, r.offload, r.openapi_json(), r.status_code, r.stream_body, on_loop
+                r.path,
+                r.methods,
+                hid,
+                r.offload,
+                r.openapi_json(),
+                r.status_code,
+                r.stream_body,
+                on_loop,
+                any(p.kind in ("form", "file") for p in r.params),
             )
         for r in self.websocket_routes:
             hid = len(_HANDLERS)

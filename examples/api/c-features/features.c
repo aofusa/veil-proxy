@@ -2,7 +2,7 @@
  * veil C API の F-210 の機能のサンプル: 応答のストリーミング (SSE)・要求本文のストリーミング受信・
  * gRPC (examples/api/rust-grpc と同じ demo.v1.Demo)・L4 (TCP・UDP のエコー)・
  * HTTP/1.1 のアップグレード (GET /upgrade で x-echo に切り替えてエコー、F-261)・
- * WebSocket のエコー (GET /ws、F-262)。
+ * WebSocket のエコー (GET /ws、F-262)・フォームとファイルのアップロード (POST /upload・/parse、F-266)。
  *
  * gRPC のメッセージは小さな protobuf を手で符号化している (veil は protobuf の実装に依存しない。
  * 実際のアプリでは protobuf-c・nanopb・upb 等を使う)。
@@ -19,6 +19,7 @@
 static void sleep_ms(unsigned ms) { Sleep(ms); }
 #else
 #include <time.h>
+#include <unistd.h>
 static void sleep_ms(unsigned ms) {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
@@ -358,6 +359,63 @@ static int udp_echo(const uint8_t *data, size_t len, const char *peer, veil_l4_r
     return veil_l4_reply(reply, out, len + 5);
 }
 
+/* ===================== フォーム (F-266) ===================== */
+
+/* バイトの総和 (中身の確認用) */
+static uint64_t byte_sum(uint64_t h, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        h += p[i];
+    }
+    return h;
+}
+
+/* 一時ファイルに書かれたパートを読む (fd は veil が閉じる) */
+static uint64_t sum_fd(intptr_t fd) {
+    uint64_t h = 0;
+    uint8_t buf[16384];
+#ifdef _WIN32
+    DWORD n;
+    while (ReadFile((HANDLE)fd, buf, sizeof buf, &n, NULL) && n > 0) {
+        h = byte_sum(h, buf, n);
+    }
+#else
+    ssize_t n;
+    while ((n = read((int)fd, buf, sizeof buf)) > 0) {
+        h = byte_sum(h, buf, (size_t)n);
+    }
+#endif
+    return h;
+}
+
+/* パートごとに "名前[:ファイル名]=バイト数/総和(mem|disk)" を ; で並べて返す */
+static int list_parts(const veil_request_t *req, veil_response_t *resp) {
+    char out[4096];
+    size_t off = 0;
+    veil_part_t part;
+    int rc;
+    while ((rc = veil_multipart_next(req, &part)) == 1 && off < sizeof out - 256) {
+        uint64_t h = part.fd >= 0 ? sum_fd(part.fd) : byte_sum(0, (const uint8_t *)part.data, part.data_len);
+        off += (size_t)snprintf(out + off, sizeof out - off, "%.*s%s%.*s=%llu/%llu(%s);",
+                                (int)part.name_len, part.name ? part.name : "", part.filename ? ":" : "",
+                                (int)part.filename_len, part.filename ? part.filename : "",
+                                (unsigned long long)part.size, (unsigned long long)h,
+                                part.fd >= 0 ? "disk" : "mem");
+    }
+    if (rc < 0) {
+        /* 壊れた本文は 400、上限超えは 413 */
+        veil_response_set_status(resp, rc == VEIL_ERR_TOO_LARGE ? 413 : 400);
+        return veil_response_set_text(resp, veil_last_error());
+    }
+    out[off] = 0;
+    return veil_response_set_text(resp, out);
+}
+
+/* POST /upload : 本文を先に読み、大きなファイルは一時ファイルで受ける (VEIL_ROUTE_FORM) */
+static int upload(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)ud;
+    return list_parts(req, resp);
+}
+
 static int check(int rc, const char *what) {
     if (rc != VEIL_OK) {
         fprintf(stderr, "%s: %s\n", what, veil_last_error());
@@ -387,6 +445,10 @@ int main(void) {
     check(veil_register_route_ex(cfg, "/count", "POST", count, NULL, VEIL_ROUTE_STREAM_BODY, NULL), "count");
     check(veil_register_route(cfg, "/upgrade", "GET", upgrade, NULL), "upgrade");
     check(veil_register_route(cfg, "/ws", "GET", ws_echo, NULL), "ws");
+    check(veil_register_route_ex(cfg, "/upload", "POST", upload, NULL, VEIL_ROUTE_FORM, NULL), "upload");
+    /* 溜めた本文を解析する (VEIL_ROUTE_FORM 無し。ファイルもメモリ上) */
+    check(veil_register_route(cfg, "/parse", "POST", upload, NULL), "parse");
+    check(veil_config_set(cfg, "api.multipart_max_file_size", "209715200"), "multipart");
 
     check(veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL), "SayHello");
     check(veil_register_grpc(cfg, "/demo.v1.Demo/CountUp", VEIL_GRPC_SERVER_STREAMING, count_up, NULL), "CountUp");

@@ -1516,13 +1516,8 @@ impl Http3Handler {
                 return Decision::Buffer;
             }
             let security = backend.security();
-            let check = check_security(
-                security,
-                self.client_ip.as_str(),
-                method,
-                content_length,
-                false,
-            );
+            // F-266: ストリーミング受信のハンドラは本文の大きさを見ない（HTTP/2 と同じ）
+            let check = check_security(security, self.client_ip.as_str(), method, 0, false);
             if check != SecurityCheckResult::Allowed {
                 let status = check.status_code();
                 let msg = check.message();
@@ -1567,7 +1562,9 @@ impl Http3Handler {
             return Decision::StreamHandler(Box::new(H3HandlerStream {
                 entry: entry.clone(),
                 req,
-                max_request_body: crate::api::app::max_body_size() as u64,
+                // F-266: ストリーミング受信のハンドラは本文の累計に上限を掛けない（HTTP/2・HTTP/1.1 と同じ。
+                // gRPC はメッセージごと、multipart はパートごとに上限を見る）
+                max_request_body: 0,
                 log: H3AccessLog {
                     method: Bytes::copy_from_slice(method),
                     authority: Bytes::copy_from_slice(authority),

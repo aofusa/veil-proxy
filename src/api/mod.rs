@@ -43,6 +43,8 @@ pub mod stream;
 pub mod upgrade;
 // F-262
 pub mod ws;
+// F-266
+pub mod multipart;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
@@ -63,6 +65,7 @@ pub use app::{
 pub use config::{Config, ConfigBuilder, ConfigError, Listener};
 pub use extract::{Body, Form, FromRequest, Headers, Json, Query, State};
 pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta, WebSocketMeta};
+pub use multipart::{Multipart, MultipartForm, UploadFile};
 pub use request::{HttpVersion, Request};
 pub use response::{ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
@@ -76,6 +79,7 @@ pub mod prelude {
     pub use super::extract::{Body, Form, Headers, Json, Query, State};
     #[cfg(feature = "l4-handler")]
     pub use super::l4::{L4Connection, L4Datagram, L4Error};
+    pub use super::multipart::{Multipart, MultipartForm, UploadFile};
     pub use super::request::Request;
     pub use super::response::{ApiError, Html, IntoResponse, Response};
     pub use super::schema::{ApiSchema, Validate};
@@ -101,6 +105,10 @@ pub mod __private {
     };
     pub use super::handler::{
         BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef, WebSocketMeta,
+    };
+    pub use super::multipart::{
+        multipart_body_meta, multipart_form, upload_file, upload_file_opt, upload_files,
+        MultipartForm, UploadFile,
     };
     pub use super::request::Request;
     pub use super::response::{IntoResponse, Response};

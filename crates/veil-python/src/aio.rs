@@ -40,6 +40,8 @@ enum Job {
         handler_id: u64,
         route: Arc<PyRoute>,
         req: Request,
+        // F-266: 先に読んだ multipart のパート
+        parts: Option<Vec<veil::api::multipart::SpooledPart>>,
         out: Arc<Out>,
     },
     Cancel(u64),
@@ -160,13 +162,14 @@ pub fn aio_take(py: Python<'_>, index: usize) -> PyResult<Vec<Py<AioJob>>> {
                 handler_id,
                 route,
                 req,
+                parts,
                 out,
             } => AioJob {
                 kind: JOB_CALL,
                 id,
                 handler_id,
                 route: Some(route),
-                request: Some(Py::new(py, NativeRequest::new(req))?),
+                request: Some(Py::new(py, NativeRequest::with_parts(req, parts))?),
                 out: Some(out),
                 ws: None,
             },
@@ -269,7 +272,12 @@ fn overloaded() -> Response {
 }
 
 /// Run an `async def` route on a persistent event loop and wait for its response (on the network worker).
-pub async fn call_on_loop(route: Arc<PyRoute>, handler_id: u64, req: Request) -> Response {
+pub async fn call_on_loop(
+    route: Arc<PyRoute>,
+    handler_id: u64,
+    req: Request,
+    parts: Option<Vec<veil::api::multipart::SpooledPart>>,
+) -> Response {
     let Some((_, lq)) = pick() else {
         return Response::error(500, "Internal Server Error");
     };
@@ -280,6 +288,7 @@ pub async fn call_on_loop(route: Arc<PyRoute>, handler_id: u64, req: Request) ->
         handler_id,
         route,
         req,
+        parts,
         out: out.clone(),
     };
     if !lq.push(job, false) {

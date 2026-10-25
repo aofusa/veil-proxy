@@ -22,6 +22,8 @@ __all__ = [
     "run",
     "shutdown",
     "_json_fast",
+    "parse_multipart",
+    "spool_threshold",
 ]
 
 @final
@@ -140,6 +142,14 @@ class NativeRequest:
         """Parse the body as JSON."""
     def text(self) -> str:
         """Body decoded as UTF-8 (lossy)."""
+    def multipart(
+        self,
+    ) -> list[tuple[str | None, str | None, str | None, list[tuple[str, str]], bytes | None, int | None, int]]:
+        """Parts of a ``multipart/form-data`` body: ``(name, filename, content_type, headers, data, fd, size)``.
+
+        ``data`` is ``None`` when the file was written to the temporary file descriptor ``fd``. Malformed
+        bodies raise ``ValueError((status, message))``.
+        """
 
 @final
 class NativeGrpcCall:
@@ -270,8 +280,10 @@ def register_route(
     status_code: int = 200,
     stream_body: bool = False,
     on_loop: bool = False,
+    form: bool = False,
 ) -> None:
-    """Register an HTTP route (collected until ``run``; ``on_loop`` runs it on the persistent event loop)."""
+    """Register an HTTP route (collected until ``run``; ``on_loop`` runs it on the persistent event loop; ``form``
+    reads the body first and splits a ``multipart/form-data`` body into parts)."""
 
 def run(config: Config, handlers: list[Any]) -> None:
     """Start the server and block until it stops (the GIL is released).
@@ -284,3 +296,11 @@ def shutdown() -> None:
 
 def _json_fast(v: Any) -> bytes | None:
     """Test helper: the Rust JSON encoding of ``v``, or ``None`` if unsupported."""
+
+def parse_multipart(
+    body: bytes, content_type: str
+) -> list[tuple[str | None, str | None, str | None, list[tuple[str, str]], bytes | None, int | None, int]]:
+    """Parse a buffered ``multipart/form-data`` body (same tuples as ``NativeRequest.multipart``)."""
+
+def spool_threshold() -> int:
+    """``[api] multipart_spool_threshold``: uploads up to this size stay in memory."""

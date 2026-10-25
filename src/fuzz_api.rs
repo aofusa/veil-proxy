@@ -152,6 +152,13 @@ pub fn ws_frame_decode_smoke(data: &[u8]) {
     crate::api::ws::fuzz_decode(data);
 }
 
+// F-266
+/// Parses `data` as a multipart body buffered and streamed in two pieces (must not panic; both give the same parts).
+#[cfg(feature = "handler")]
+pub fn multipart_parse_smoke(data: &[u8]) {
+    crate::api::multipart::fuzz_parse(data);
+}
+
 #[cfg(test)]
 mod io_uring_executor_tests {
     use super::*;

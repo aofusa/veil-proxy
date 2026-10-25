@@ -250,6 +250,12 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `python_event_loop` | `"auto"` | Python: `"auto"`（uvloop が入っていれば使う）・`"asyncio"`・`"uvloop"` |
 | `python_event_loop_queue` | `65536` | Python: 1 つのループで待てる呼び出しの数（一杯なら 503） |
 | `python_async_mode` | `"loop"` | Python: `async def` の実行先。`"loop"`（常駐のループ）か `"pool"`（0.10 より前と同じ） |
+| `multipart_max_parts` | `100` | `multipart/form-data` の本文のパート数の上限（超えたら 413） |
+| `multipart_max_field_size` | `1048576` | ファイルでないパートの大きさの上限 |
+| `multipart_max_file_size` | `0` | ファイルのパートの大きさの上限（`0` = `max_body_size`） |
+| `multipart_max_header_size` | `8192` | 1 パートのヘッダの大きさの上限 |
+| `multipart_spool_threshold` | `1048576` | Python の `UploadFile`・C の `VEIL_ROUTE_FORM`: これより大きいファイルはメモリでなく一時ファイルに書く |
+| `upload_tmp_dir` | OS の一時ディレクトリ | アップロードの名前の無い一時ファイルを置くディレクトリ（Landlock・unveil の書き込み許可に足す） |
 
 ## ルーティングマクロ
 
@@ -277,7 +283,8 @@ async fn get_user(id: u64, verbose: Option<bool>) -> Result<Json<User>, ApiError
 | `&Request` / `Request` | リクエスト全体 |
 | `Json<T>` | JSON 本文 |
 | `Query<T>` | クエリ文字列全体を `T` にデシリアライズ |
-| `Form<T>` | `application/x-www-form-urlencoded` の本文 |
+| `Form<T>` | `application/x-www-form-urlencoded` の本文（`multipart/form-data` の本文のファイル以外のフィールドも） |
+| `MultipartForm<T>`・`UploadFile`・`Vec<UploadFile>`・`Option<UploadFile>`・`Multipart` | `multipart/form-data` の本文（[フォームとファイルのアップロード](#フォームとファイルのアップロード)） |
 | `State<T>` | `App::state` で登録した共有状態 |
 | `Headers`・`Bytes`（別名 `Body`） | リクエストヘッダ / 生の本文 |
 | パスの `{name}` と同名の引数 | パスパラメータ（`FromStr` で変換） |
@@ -457,6 +464,60 @@ tower の橋渡しでは動きません。`veil::api::ws` か tokio-tungstenite 
 
 例: [examples/api/rust-websocket/](../../../examples/api/rust-websocket/)（`/ws` のエコー、`split` を使う `/chat` のブロードキャスト、
 JSON の `/typed`）。C は [examples/api/c-features/](../../../examples/api/c-features/) の `/ws`。
+
+## フォームとファイルのアップロード
+
+veil は `multipart/form-data`（RFC 7578）を依存を足さずに自前で解析します。溜めた本文のパートは本文の切り出し（複製しない）で、
+ストリーミングの本文は届いた順に解析します。
+
+```rust
+use veil::api::prelude::*;
+
+#[derive(Deserialize, veil::Schema)]
+struct Profile { name: String, #[validate(range(min = 0, max = 150))] age: u32 }
+
+// 本文を溜める（[api] max_body_size まで）。ファイル以外のフィールドは T へ、ファイルは引数名で対応づける
+#[veil::route(path = "/profile", method = "POST")]
+async fn profile(form: MultipartForm<Profile>, avatar: UploadFile, banner: Option<UploadFile>) -> Json<Value> {
+    Json(json!({"name": form.name, "avatar": avatar.file_name(), "size": avatar.len()}))
+}
+
+#[veil::route(path = "/docs", method = "POST")]
+async fn docs(docs: Vec<UploadFile>) -> Json<Vec<usize>> { Json(docs.iter().map(|d| d.len()).collect()) }
+
+// ストリーミング: ルートは自動で `streaming = true` になり、ファイルはメモリに溜まらない
+#[veil::route(path = "/upload", method = "POST")]
+async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
+    while let Some(mut part) = form.next_part().await? {
+        if part.file_name().is_some() {
+            let tmp = part.save_to_temp().await?;   // [api] upload_tmp_dir の名前の無いファイル。part.save_to(path) も可
+            // tmp.file()・tmp.len()・tmp.into_file()
+        } else {
+            let value = part.text().await?;          // part.chunk().await・part.bytes().await も可
+        }
+    }
+    Ok(Json(json!({"ok": true})))
+}
+```
+
+- `MultipartForm<T>` はファイル以外のフィールドを `Form<T>` と同じ規則で `T` にします（`T` が `Schema` を derive していれば検証も）。
+  `Form<T>` も multipart の本文を受け、ファイルは無視します。ファイルが無ければ `loc = ["body", 名前]` の 422、本文が壊れていれば 400、
+  `[api] multipart_*` の上限を超えたら 413（`{"detail": "..."}`）です。
+- `Multipart` は溜める抽出子と併用できません。ストリーミングのルートは `max_body_size` の制限を受けず（パートごとの上限が効く）、
+  HTTP/1.1（`Content-Length` のある本文。chunked は溜める）・HTTP/2・HTTP/3 で同じです。名前の無いファイル（Linux は `O_TMPFILE`、
+  他は作ってすぐ消す、Windows は閉じたら消す）への書き込みは offload のプールで行い、閉じると消えます。
+- OpenAPI は本文を `multipart/form-data`、ファイルを `{"type": "string", "format": "binary"}` で書くので、Swagger UI でファイルを選べます。
+- **Python:** `name: str = veil.Form()`・`avatar: veil.UploadFile = veil.File()`・`files: list[veil.UploadFile]`・
+  `data: bytes = veil.File()`（FastAPI と同じ名前。`Annotated[str, veil.Form()]` も可。urlencoded のフォームも同じ `Form()`）。
+  本文はハンドラの前に Rust で解析し、テキストと小さなファイルはメモリ、`multipart_spool_threshold` を超えるファイルは一時ファイルとして
+  Python に渡すので、大きなアップロードでプロセスが膨らみません。`UploadFile` は `filename`・`content_type`・`headers`・`size`・`file` と
+  `async` の `read`・`write`・`seek`・`close`（と `read_bytes()`）を持ちます。
+- **C:** `veil_multipart_next(req, &part)` がパートを 1 つずつ返します（`name`・`filename`・`content_type` と、`data`/`data_len` か一時ファイルの
+  `fd`）。ルートのフラグ `VEIL_ROUTE_FORM` を付けるとコールバックの前に本文を読み、大きなファイルは一時ファイルに書きます（コールバックから
+  戻ると閉じる）。付けなければ溜めた本文を解析します。
+
+例: [examples/api/rust-showcase/](../../../examples/api/rust-showcase/) の `/profile`・`/files-upload`・`/upload-stream`、
+[examples/api/python-features/](../../../examples/api/python-features/) と [examples/api/c-features/](../../../examples/api/c-features/) の `/upload`。
 
 ## バリデーションと OpenAPI
 
@@ -929,6 +990,7 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 - プロトコルアップグレード（HTTP/1.1）: `veil_response_upgrade(resp, protocol, &callbacks, ud)` で 101 を返し、接続を L4 の
   TCP と同じコールバックで受けます（[プロトコルアップグレード](#プロトコルアップグレードhttp11)）。
 - WebSocket: `veil_ws_accept(req, resp, &callbacks, ud)`・`veil_ws_send`・`veil_ws_close`（[WebSocket](#websocket)）。
+- フォーム: `veil_multipart_next` とルートのフラグ `VEIL_ROUTE_FORM`（[フォームとファイルのアップロード](#フォームとファイルのアップロード)）。
 - ストリーミングの関数は `VEIL_ROUTE_INLINE` のルートでは使えません（`VEIL_ERR_STATE`）。
 
 全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
@@ -997,6 +1059,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 - **L4（F-210）:** `veil.Protocol` のサブクラスに `@veil.l4_tcp(name, listen)`（asyncio と同じ `connection_made` /
   `data_received` / `connection_lost`。`self.transport.write` はコールバックの中で）、`def f(data, peer) -> bytes | None` に
   `@veil.l4_udp(name, listen)`。
+- **フォームとファイル（F-266）:** FastAPI と同じ `veil.Form()`・`veil.File()`・`veil.UploadFile`（`python-multipart` は要りません。
+  [フォームとファイルのアップロード](#フォームとファイルのアップロード)）。
 - **GraphQL:** 好きなライブラリを普通のルートとして載せます。[examples/api/python-graphql/](../../../examples/api/python-graphql/)
   は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。

@@ -417,5 +417,104 @@ class TestPydantic(Base):
         self.assertEqual(self.j(r)["age"], 1)
 
 
+# F-266
+def _multipart(fields, boundary="XyZ"):
+    out = b""
+    for name, value, filename, ctype in fields:
+        disp = 'form-data; name="%s"' % name
+        if filename is not None:
+            disp += '; filename="%s"' % filename
+        out += b"--" + boundary.encode() + b"\r\ncontent-disposition: " + disp.encode() + b"\r\n"
+        if ctype:
+            out += b"content-type: " + ctype.encode() + b"\r\n"
+        out += b"\r\n" + value + b"\r\n"
+    return out + b"--" + boundary.encode() + b"--\r\n"
+
+
+class TestForms(Base):
+    MP = (("content-type", "multipart/form-data; boundary=XyZ"),)
+
+    def setUp(self):
+        super().setUp()
+
+        @self.app.post("/profile")
+        async def profile(
+            name: str = veil.Form(),
+            age: int = veil.Form(0),
+            tags: list[str] = veil.Form([]),
+            avatar: veil.UploadFile = veil.File(),
+            extra: veil.UploadFile = None,
+        ):
+            data = await avatar.read()
+            return {
+                "name": name,
+                "age": age,
+                "tags": tags,
+                "file": avatar.filename,
+                "ct": avatar.content_type,
+                "len": len(data),
+                "size": avatar.size,
+                "extra": extra.filename if extra else None,
+            }
+
+        self.route = self.last()
+
+    def test_multipart_fields_and_file(self):
+        body = _multipart(
+            [
+                ("name", b"al", None, None),
+                ("age", b"7", None, None),
+                ("tags", b"a", None, None),
+                ("tags", b"b", None, None),
+                ("avatar", b"\x00\x01png", "a.png", "image/png"),
+            ]
+        )
+        r = self.req(self.route, body=body, headers=self.MP)
+        self.assertEqual(r.status, 200, r.body)
+        self.assertEqual(
+            self.j(r),
+            {"name": "al", "age": 7, "tags": ["a", "b"], "file": "a.png", "ct": "image/png", "len": 5, "size": 5, "extra": None},
+        )
+
+    def test_missing_and_invalid(self):
+        r = self.req(self.route, body=_multipart([("age", b"x", None, None)]), headers=self.MP)
+        self.assertEqual(r.status, 422)
+        locs = [e["loc"] for e in self.j(r)["detail"]]
+        self.assertIn(["body", "name"], locs)
+        self.assertIn(["body", "age"], locs)
+        self.assertIn(["body", "avatar"], locs)
+
+    def test_malformed_is_400(self):
+        r = self.req(self.route, body=b"--XyZ\r\nbroken", headers=self.MP)
+        self.assertEqual(r.status, 400)
+
+    def test_urlencoded_and_bytes_file(self):
+        @self.app.post("/login")
+        def login(user: str = veil.Form(), remember: bool = veil.Form(False)):
+            return {"user": user, "remember": remember}
+
+        r = self.req(
+            self.last(), body=b"user=a%20b&remember=on", headers=(("content-type", "application/x-www-form-urlencoded"),)
+        )
+        self.assertEqual(self.j(r), {"user": "a b", "remember": True})
+
+        @self.app.post("/raw")
+        def raw(doc: bytes = veil.File(), docs: list[veil.UploadFile] = veil.File([])):
+            return {"n": len(doc), "docs": [d.filename for d in docs]}
+
+        body = _multipart([("doc", b"abc", "d.txt", None), ("docs", b"1", "x", None), ("docs", b"2", "y", None)])
+        r = self.req(self.last(), body=body, headers=self.MP)
+        self.assertEqual(self.j(r), {"n": 3, "docs": ["x", "y"]})
+
+    def test_openapi_multipart(self):
+        op = self.route.openapi()
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["properties"]["avatar"], {"type": "string", "format": "binary"})
+        self.assertEqual(schema["properties"]["tags"]["type"], "array")
+        self.assertEqual(schema["properties"]["age"], {"type": "integer", "default": 0})
+        self.assertEqual(schema["required"], ["name", "avatar"])
+        self.assertIn("422", op["responses"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

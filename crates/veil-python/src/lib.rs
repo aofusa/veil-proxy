@@ -32,6 +32,8 @@ struct PendingRoute {
     stream_body: bool,
     // F-263: `async def` を常駐のイベントループで動かす
     on_loop: bool,
+    // F-266: Form・File の引数がある（本文を先に読み、multipart はパートに分けて渡す）
+    form: bool,
 }
 
 // F-263: `@app.websocket` のルート（`run` までの間に溜める）。
@@ -281,7 +283,7 @@ impl PyConfig {
 
 /// Register an HTTP route (collected until `run`).
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false, form=false))]
 #[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
 fn register_route(
     path: String,
@@ -292,6 +294,7 @@ fn register_route(
     status_code: u16,
     stream_body: bool,
     on_loop: bool,
+    form: bool,
 ) -> PyResult<()> {
     let openapi = parse_openapi(openapi_json)?;
     PENDING.lock().unwrap().push(PendingRoute {
@@ -303,6 +306,7 @@ fn register_route(
         status_code,
         stream_body,
         on_loop,
+        form,
     });
     Ok(())
 }
@@ -317,10 +321,15 @@ struct PyRoute {
 // F-210: `ctx` があればストリーミングの応答・要求本文の順次受信ができる。
 /// Call the route entry point with the GIL held and build the response. `ctx` is present when running on the
 /// handler pool (streaming responses and incremental request bodies are possible).
-fn call_python(route: &PyRoute, req: Request, ctx: Option<&mut HandlerContext>) -> Response {
+fn call_python(
+    route: &PyRoute,
+    req: Request,
+    parts: Option<Vec<veil::api::multipart::SpooledPart>>,
+    ctx: Option<&mut HandlerContext>,
+) -> Response {
     Python::attach(|py| {
         let r = (|| -> PyResult<Response> {
-            let native_req = native::NativeRequest::new(req);
+            let native_req = native::NativeRequest::with_parts(req, parts);
             let ctx_ptr = ctx.map(|c| c as *mut HandlerContext);
             if let Some(p) = ctx_ptr {
                 native_req
@@ -358,28 +367,47 @@ pub(crate) fn internal_error() -> Response {
 }
 
 // F-263: `async def` を常駐のループで動かす経路（ワーカーは GIL を取らず、キュー + 通知で待つ）
-fn make_loop_handler(route: PyRoute, handler_id: u64) -> HandlerFn {
-    let route = Arc::new(route);
-    Arc::new(move |req: Request| {
-        let r = Arc::clone(&route);
-        Box::pin(aio::call_on_loop(r, handler_id, req))
-    })
-}
-
-fn make_handler(route: PyRoute, offload: bool) -> HandlerFn {
+fn make_loop_handler(route: PyRoute, handler_id: u64, form: bool) -> HandlerFn {
     let route = Arc::new(route);
     Arc::new(move |req: Request| {
         let r = Arc::clone(&route);
         Box::pin(async move {
+            let (req, parts) = if form {
+                match veil::api::multipart::prepare_form(req).await {
+                    Ok(x) => x,
+                    Err(resp) => return resp,
+                }
+            } else {
+                (req, None)
+            };
+            aio::call_on_loop(r, handler_id, req, parts).await
+        })
+    })
+}
+
+fn make_handler(route: PyRoute, offload: bool, form: bool) -> HandlerFn {
+    let route = Arc::new(route);
+    Arc::new(move |req: Request| {
+        let r = Arc::clone(&route);
+        Box::pin(async move {
+            // F-266: Form・File の引数があるルートは本文を先に読む（大きなファイルは一時ファイルへ）
+            let (req, parts) = if form {
+                match veil::api::multipart::prepare_form(req).await {
+                    Ok(x) => x,
+                    Err(resp) => return resp,
+                }
+            } else {
+                (req, None)
+            };
             if offload {
                 // GIL を握る呼び出しはイベントループ（ワーカー）を止めないようハンドラ用プールへ退避する。
                 // 応答のストリーミング・要求本文の順次受信は call_blocking の文脈で（F-210）
                 veil::api::bridge::call_blocking(req, move |req, ctx| {
-                    call_python(&r, req, Some(ctx))
+                    call_python(&r, req, parts, Some(ctx))
                 })
                 .await
             } else {
-                call_python(&r, req, None)
+                call_python(&r, req, parts, None)
             }
         })
     })
@@ -404,9 +432,9 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
             status: r.status_code,
         };
         let func = if r.on_loop {
-            make_loop_handler(py_route, r.handler_id)
+            make_loop_handler(py_route, r.handler_id, r.form)
         } else {
-            make_handler(py_route, r.offload)
+            make_handler(py_route, r.offload, r.form)
         };
         let meta = OperationMeta {
             operation_id: format!("py_{}", r.handler_id),
@@ -415,7 +443,7 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
             ..Default::default()
         };
         let name = format!("py_{}_{}", i, r.handler_id);
-        app = if r.stream_body {
+        app = if r.stream_body || r.form {
             app.route_fn_streaming(&name, &methods, &r.path, func, meta)
         } else {
             app.route_fn(&name, &methods, &r.path, func, meta)
@@ -524,5 +552,7 @@ fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
     m.add_function(wrap_pyfunction!(native::_json_fast, m)?)?;
+    m.add_function(wrap_pyfunction!(native::parse_multipart, m)?)?;
+    m.add_function(wrap_pyfunction!(native::spool_threshold, m)?)?;
     Ok(())
 }

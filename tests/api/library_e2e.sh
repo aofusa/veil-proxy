@@ -83,6 +83,9 @@ run_rust() {
 listen_cleartext = "127.0.0.1:$P"
 [logging]
 level = "info"
+[api]
+multipart_max_file_size = 209715200
+upload_tmp_dir = "$W/up"
 [[l4]]
 name = "tcp_echo"
 listen = "127.0.0.1:$L4"
@@ -93,6 +96,7 @@ listen = "127.0.0.1:$U"
 protocol = "udp"
 handler = "udp_echo"
 TOML
+  mkdir -p "$W/up"
   (cd "$W" && exec "$T/debug/veil-example-showcase$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
   wait_port "$P" "$PID" || { bad "start"; cat "$W/log"; return; }
@@ -121,6 +125,7 @@ TOML
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
+  run_rust_multipart "$B" "$W" "$PID"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
@@ -155,6 +160,62 @@ TOML
   curl -s -o /dev/null "http://127.0.0.1:$P3/hello"; sleep 1.5
   if grep -a -q 'type=access' "$W2/log3"; then bad "access_log.enabled = false stops the access log"; else ok "access_log.enabled = false stops the access log"; fi
   kill "$!" 2>/dev/null
+}
+
+run_rust_multipart() { # F-266: multipart/form-data（examples/api/rust-showcase の /profile・/files-upload・/upload-stream）
+  local B="$1" W="$2" PID="$3"
+  printf 'PNGDATA' > "$W/a.png"; printf 'one' > "$W/d1.txt"; printf 'second' > "$W/d2.txt"
+  expect "multipart form + file" '"avatar":"a.png","avatar_size":7,"avatar_type":"image/png","banner_size":null,"name":"al"' \
+    curl -s -F name=al -F age=30 -F "avatar=@$W/a.png;type=image/png" "$B/profile"
+  expect "multipart optional file" '"banner_size":3' curl -s -F name=al -F age=30 -F "avatar=@$W/a.png" -F "banner=@$W/d1.txt" "$B/profile"
+  expect "multipart validation 422" '"less_than_equal"' curl -s -F name=al -F age=500 -F "avatar=@$W/a.png" "$B/profile"
+  expect "multipart missing file 422" '"loc":["body","avatar"]' curl -s -F name=al -F age=3 "$B/profile"
+  expect "multipart several files" '"sizes":[3,6]' curl -s -F "docs=@$W/d1.txt" -F "docs=@$W/d2.txt" "$B/files-upload"
+  expect "multipart malformed 400" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/files-upload"
+  expect "multipart (h2c)" '"sizes":[3,6]' curl -s --http2-prior-knowledge -F "docs=@$W/d1.txt" -F "docs=@$W/d2.txt" "$B/files-upload"
+  expect "streaming multipart (HTTP/1.1)" '{"parts":[{"name":"t","value":"v"},{"file":"d2.txt","name":"f","size":6}]}' \
+    curl -s -F t=v -F "f=@$W/d2.txt" "$B/upload-stream"
+  expect "streaming multipart (h2c)" '"size":6' curl -s --http2-prior-knowledge -F t=v -F "f=@$W/d2.txt" "$B/upload-stream"
+  # 100 MB のファイル: 本文を溜めずに一時ファイルへ書く（常駐メモリが増えない）
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  local rss0 rss1
+  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  expect "streaming multipart 100 MB (HTTP/1.1)" '"size":104857600' curl -s -F "big=@$W/big.bin" "$B/upload-stream"
+  expect "streaming multipart 100 MB (h2c)" '"size":104857600' curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload-stream"
+  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+  fi
+  rm -f "$W/big.bin"
+  [ -z "$(ls -A "$W/up")" ] && ok "no temporary upload files remain" || bad "temporary upload files remain: $(ls "$W/up")"
+  expect "OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/profile\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
+}
+
+run_python_multipart() { # F-266: Python の Form・File・UploadFile（examples/api/python-features の /upload・/upload-many・/login）
+  local B="$1" W="$2" PID="$3"
+  printf 'hello' > "$W/s.txt"; printf 'n1' > "$W/n.txt"
+  expect "py multipart form + small file (memory)" '"title":"t","count":2,"filename":"s.txt","size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","where":"memory","note":null' \
+    curl -s -F title=t -F count=2 -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart optional file" '"note":"n1"' curl -s -F title=t -F "doc=@$W/s.txt" -F "note=@$W/n.txt" "$B/upload"
+  expect "py multipart (h2c)" '"where":"memory"' curl -s --http2-prior-knowledge -F title=t -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart missing file 422" '"loc":["body","doc"]' curl -s -F title=t "$B/upload"
+  expect "py multipart bad int 422" '"loc":["body","count"]' curl -s -F title=t -F count=x -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart malformed 400" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
+  expect "py several files" '[{"filename":"s.txt","size":5},{"filename":"n.txt","size":2}]' curl -s -F "docs=@$W/s.txt" -F "docs=@$W/n.txt" "$B/upload-many"
+  expect "py urlencoded form" '{"user":"a b","remember":true}' curl -s -d 'user=a%20b&remember=on' "$B/login"
+  # 100 MB のファイル: Rust が一時ファイルへ書き、Python は fd で読む（常駐メモリが増えない）
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  local sum rss0 rss1
+  sum=$("$PY3" -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$W/big.bin")
+  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  expect "py 100 MB upload (HTTP/1.1, disk)" "\"size\":104857600,\"sha256\":\"$sum\",\"where\":\"disk\"" curl -s -F title=b -F "doc=@$W/big.bin" "$B/upload"
+  expect "py 100 MB upload (h2c)" "\"sha256\":\"$sum\"" curl -s --http2-prior-knowledge -F title=b -F "doc=@$W/big.bin" "$B/upload"
+  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "py 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "py 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+  fi
+  rm -f "$W/big.bin"
+  expect "py OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/upload\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
 }
 
 run_graphql() {
@@ -325,7 +386,41 @@ print(body.decode().replace("\n", "|") + ("|x-from: c" if ok else "|bad head " +
   local rc=$?
   echo "$out" | sed 's/^/  /'
   [ "$rc" = 0 ] && ok "C gRPC interop (tonic + HTTP/3, exit 0)" || bad "C gRPC interop (exit $rc)"
+  run_c_multipart "$B" "$W" "$PID" "$S"
   kill "$PID"
+}
+
+run_c_multipart() { # F-266: C の veil_multipart_next（VEIL_ROUTE_FORM の /upload と溜めた本文の /parse）
+  local B="$1" W="$2" PID="$3" S="$4"
+  printf 'hello' > "$W/s.txt"
+  # バイトの総和: hello = 532、v = 118
+  expect "C multipart (form route, memory)" "t=1/118(mem);f:s.txt=5/532(mem);" curl -s -F t=v -F "f=@$W/s.txt" "$B/upload"
+  expect "C multipart (buffered body)" "f:s.txt=5/532(mem);" curl -s -F "f=@$W/s.txt" "$B/parse"
+  expect "C multipart (h2c)" "f:s.txt=5/532(mem);" curl -s --http2-prior-knowledge -F "f=@$W/s.txt" "$B/upload"
+  expect "C multipart malformed 400 (form route)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
+  expect "C multipart malformed 400 (buffered)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary $'--x\r\nbroken' "$B/parse"
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  local h rss0 rss1
+  h=$("$PY3" -I -c 'import sys; print(sum(open(sys.argv[1], "rb").read()))' "$W/big.bin")
+  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  expect "C 100 MB upload (HTTP/1.1, temp file)" "big:big.bin=104857600/$h(disk);" curl -s -F "big=@$W/big.bin" "$B/upload"
+  expect "C 100 MB upload (h2c)" "big:big.bin=104857600/$h(disk);" curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload"
+  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "C 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "C 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+  fi
+  rm -f "$W/big.bin"
+  # HTTP/3（curl に HTTP/3 が無いので quinn + h3 の試験クライアントで送る）: 30 MB は [api] max_body_size（10 MiB）を超える
+  local sum3; sum3=$("$PY3" -I -c '
+import os, sys
+data = os.urandom(30 << 20)
+body = (b"--BND\r\ncontent-disposition: form-data; name=\"t\"\r\n\r\nv\r\n--BND\r\n"
+        b"content-disposition: form-data; name=\"big\"; filename=\"b.bin\"\r\n\r\n" + data + b"\r\n--BND--\r\n")
+open(sys.argv[1], "wb").write(body)
+print(sum(data))' "$W/mp.bin")
+  expect "C multipart 30 MB (HTTP/3)" "t=1/118(mem);big:b.bin=31457280/$sum3(disk);" \
+    "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "127.0.0.1:$S" POST /upload -H 'content-type: multipart/form-data; boundary=BND' --data-file "$W/mp.bin"
+  rm -f "$W/mp.bin"
 }
 
 run_python() {
@@ -460,6 +555,7 @@ run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio
     expect "py streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
     expect "py L4 TCP echo" "py-tcp" l4_echo tcp "$L4" py-tcp
     expect "py L4 UDP echo" "echo:py-udp" l4_echo udp "$U" py-udp
+    run_python_multipart "$B" "$W" "$PID"
   else
     bad "python-features start"; cat "$W/f.log"
   fi
@@ -801,6 +897,9 @@ run_nonregression() {
   # F-262: WebSocket の終端（veil::api::ws・C の veil_ws_*）も入らない
   n=$(grep -cE "veil::api::ws|veil_ws_" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::ws in the full binary" || bad "WebSocket handler symbols found ($n)"
+  # F-266: multipart（veil::api::multipart・C の veil_multipart_next）も入らない
+  n=$(grep -cE "veil::api::multipart|veil_multipart_|multipart_parse" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::multipart in the full binary" || bad "multipart symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-198: api の既定（tokio-compat）は tokio に依存しない

@@ -453,8 +453,17 @@ pub(super) async fn handle_requests(
 
                 let is_websocket: bool = is_upgrade_connection && is_websocket_upgrade;
 
+                // F-266: ライブラリのビルドでは、上限を超える本文は経路を見てから判断する（ストリーミング受信の
+                // ハンドラは本文を溜めないので通す）。本体のビルドは今までどおりここで 413
+                #[cfg(feature = "handler")]
+                let defer_size = !is_chunked && content_length > MAX_BODY_SIZE;
+                #[cfg(not(feature = "handler"))]
+                let defer_size = false;
+                #[cfg(feature = "handler")]
+                let expect_continue = check_expect_continue(&headers_for_proxy);
+
                 // ボディサイズ制限
-                if !is_chunked && content_length > MAX_BODY_SIZE {
+                if !is_chunked && content_length > MAX_BODY_SIZE && !defer_size {
                     let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
@@ -471,7 +480,7 @@ pub(super) async fn handle_requests(
                 let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
 
                 // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す
-                if content_length > 0 && check_expect_continue(&headers_for_proxy) {
+                if content_length > 0 && !defer_size && check_expect_continue(&headers_for_proxy) {
                     // ボディサイズが制限内であることを確認済みなので 100 Continue を送信
                     let write_result = timeout(
                         WRITE_TIMEOUT,
@@ -793,12 +802,39 @@ pub(super) async fn handle_requests(
                 // セキュリティ設定を取得
                 let security = backend.security();
 
+                // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文の大きさを見ない（HTTP/2 と同じ。
+                // multipart はパートごとの上限を見る）
+                #[cfg(feature = "handler")]
+                let checked_length = match &backend {
+                    Backend::Handler(e, _, _) if e.streaming_request => 0,
+                    _ => content_length,
+                };
+                #[cfg(not(feature = "handler"))]
+                let checked_length = content_length;
+                #[cfg(feature = "handler")]
+                if defer_size {
+                    if checked_length != 0 {
+                        let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                    if expect_continue {
+                        let write_result = timeout(
+                            WRITE_TIMEOUT,
+                            tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
+                        )
+                        .await;
+                        if let Err(_) | Ok((Err(_), _)) = write_result {
+                            return;
+                        }
+                    }
+                }
                 // IP 制限・許可メソッド・本文の大きさ（chunked 以外）・レート制限（F-234: 3 経路で共通の検査と順）
                 let check = check_security(
                     security,
                     client_ip,
                     &method_bytes,
-                    content_length,
+                    checked_length,
                     is_chunked,
                 );
                 if let Some(resp) = check.http1_response() {
@@ -1559,6 +1595,23 @@ pub(super) async fn handle_api_handler(
     client_ip: &str,
     api_cache: &mut crate::api::dispatch::CallCache,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文を待たずに呼び、届いた順に渡す。
+    // chunked は従来どおり全部を読んでから 1 つの断片で渡す（`take_body_stream` の既定）
+    if entry.streaming_request && !is_chunked && content_length > 0 {
+        return handle_api_streaming(
+            tls_stream,
+            entry,
+            method,
+            req_path,
+            content_length,
+            headers,
+            initial_body,
+            client_wants_close,
+            client_ip,
+            api_cache,
+        )
+        .await;
+    }
     let limit = crate::api::app::max_body_size();
     let body = match read_api_request_body(
         &mut tls_stream,
@@ -1594,7 +1647,18 @@ pub(super) async fn handle_api_handler(
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
-    let mut resp = crate::api::dispatch::call_with(entry, req, api_cache).await;
+    let resp = crate::api::dispatch::call_with(entry, req, api_cache).await;
+    write_api_response(tls_stream, resp, client_wants_close, api_cache).await
+}
+
+/// ハンドラの応答を HTTP/1.1 で書く（`handle_api_handler` とストリーミング受信の経路で共通）。
+#[cfg(feature = "handler")]
+async fn write_api_response(
+    mut tls_stream: ServerTls,
+    mut resp: crate::api::response::Response,
+    client_wants_close: bool,
+    api_cache: &mut crate::api::dispatch::CallCache,
+) -> Option<(ServerTls, u16, u64, bool)> {
     // F-261: 検査を通ったアップグレード（101）。ヘッダを書き、接続は呼び出し側のループが関数へ渡す
     if let Some(up) = resp.upgrade.take() {
         let mut head = crate::pool::request_buf_get(API_HEAD_ESTIMATE);
@@ -1634,6 +1698,153 @@ pub(super) async fn handle_api_handler(
         }
     }
     Some((tls_stream, status, len, client_wants_close))
+}
+
+/// ストリーミング受信のハンドラ（F-266）: 本文（Content-Length）を読みながらハンドラを呼ぶ。読み取りと
+/// ハンドラは同じタスクの `FuturesUnordered` で待つ（片方の起床でもう片方を poll しない。F-173）。
+/// ハンドラが本文を読み終える前に全量の応答を返したら、残りは読まずに応答の後で接続を閉じる。
+/// ストリーミング応答を返したら（要求本文を応答へ流すエコー等）、本文を読み終えるまで応答の断片を
+/// 溜めて要求本文のチャネルを空け続け、読み終えてから送る（HTTP/1.1 の接続は読みと書きを同時にしない）。
+#[cfg(feature = "handler")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_api_streaming(
+    mut tls_stream: ServerTls,
+    entry: &crate::api::handler::HandlerEntry,
+    method: &Bytes,
+    req_path: &Bytes,
+    content_length: usize,
+    headers: Vec<(Bytes, Bytes)>,
+    initial_body: &[u8],
+    client_wants_close: bool,
+    client_ip: &str,
+    api_cache: &mut crate::api::dispatch::CallCache,
+) -> Option<(ServerTls, u16, u64, bool)> {
+    use crate::api::stream::{BodyChunk, BodyStream};
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use futures::FutureExt;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    enum Ev {
+        Resp(crate::api::response::Response),
+        Pumped(bool),
+        Held,
+    }
+    let (tx, slot) = crate::api::stream::request_body_channel(8);
+    let mut req = crate::api::dispatch::build_request(
+        method.clone(),
+        req_path.clone(),
+        headers,
+        Bytes::new(),
+        client_ip,
+        crate::api::request::HttpVersion::Http11,
+    );
+    req.body_stream = Some(slot);
+    let first = &initial_body[..initial_body.len().min(content_length)];
+    let first = (!first.is_empty()).then(|| Bytes::copy_from_slice(first));
+    let mut body_done = false;
+    // 本文を読み終える前に返ったストリーミング応答の本文と、その間に溜めた断片
+    let held_stream: Rc<RefCell<Option<BodyStream>>> = Rc::new(RefCell::new(None));
+    let held: Rc<RefCell<Vec<BodyChunk>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut resp = {
+        let mut set: FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Ev> + '_>>,
+        > = FuturesUnordered::new();
+        set.push(Box::pin(
+            crate::api::dispatch::call_with(entry, req, api_cache).map(Ev::Resp),
+        ));
+        set.push(Box::pin(
+            pump_api_body(&mut tls_stream, content_length, first, tx).map(Ev::Pumped),
+        ));
+        let mut early: Option<crate::api::response::Response> = None;
+        loop {
+            match set.next().await {
+                Some(Ev::Resp(mut r)) => {
+                    if body_done || !r.is_streaming() {
+                        break r;
+                    }
+                    *held_stream.borrow_mut() = r.take_stream();
+                    early = Some(r);
+                    let (hs, h) = (held_stream.clone(), held.clone());
+                    set.push(Box::pin(async move {
+                        loop {
+                            let next =
+                                futures::future::poll_fn(|cx| match hs.borrow_mut().as_mut() {
+                                    Some(s) => s.poll_next_unpin(cx),
+                                    None => std::task::Poll::Ready(None),
+                                })
+                                .await;
+                            match next {
+                                Some(c) => h.borrow_mut().push(c),
+                                None => break Ev::Held,
+                            }
+                        }
+                    }));
+                }
+                Some(Ev::Pumped(ok)) => {
+                    body_done = ok;
+                    if let Some(r) = early.take() {
+                        break r;
+                    }
+                }
+                Some(Ev::Held) => {}
+                None => match early.take() {
+                    Some(r) => break r,
+                    None => return None,
+                },
+            }
+        }
+    };
+    if let Some(rest) = held_stream.borrow_mut().take() {
+        let before: Vec<BodyChunk> = std::mem::take(&mut *held.borrow_mut());
+        resp.stream = Some(Box::pin(futures::stream::iter(before).chain(rest)));
+    }
+    write_api_response(
+        tls_stream,
+        resp,
+        client_wants_close || !body_done,
+        api_cache,
+    )
+    .await
+}
+
+/// 要求本文（Content-Length）を読みながらハンドラの本文のチャネルへ送る（F-266）。全部読めたら `true`。
+#[cfg(feature = "handler")]
+async fn pump_api_body(
+    stream: &mut ServerTls,
+    content_length: usize,
+    first: Option<Bytes>,
+    mut tx: futures::channel::mpsc::Sender<Bytes>,
+) -> bool {
+    use futures::SinkExt;
+    let mut got = 0usize;
+    if let Some(b) = first {
+        got += b.len();
+        if tx.send(b).await.is_err() {
+            return false;
+        }
+    }
+    while got < content_length {
+        let buf = buf_get();
+        match timeout(READ_TIMEOUT, stream.read(buf)).await {
+            Ok((Ok(n), mut b)) if n > 0 => {
+                b.set_valid_len(n);
+                let s = b.as_valid_slice();
+                let take = &s[..s.len().min(content_length - got)];
+                got += take.len();
+                let chunk = Bytes::copy_from_slice(take);
+                buf_put(b);
+                if tx.send(chunk).await.is_err() {
+                    return false;
+                }
+            }
+            Ok((_, b)) => {
+                buf_put(b);
+                return false;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧。要求ごとに `Arc` を作らないよう

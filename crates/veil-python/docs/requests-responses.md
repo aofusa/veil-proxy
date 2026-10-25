@@ -73,6 +73,56 @@ def upload(req: veil.Request):
     return str(sum(len(c) for c in req.stream()))   # read in arrival order
 ```
 
+## Forms and file uploads
+
+The names are FastAPI's, and no `python-multipart` is needed: the body is parsed in Rust.
+
+```python
+from typing import Annotated, Optional
+
+import veil
+from veil import File, Form, UploadFile
+
+
+@veil.post("/profile")
+async def profile(
+    name: str = Form(),                       # required text field
+    age: int = Form(0),                       # converted like a query parameter
+    tags: list[str] = Form([]),               # repeated fields
+    avatar: UploadFile = File(),              # required file
+    banner: Optional[UploadFile] = None,      # optional file (UploadFile needs no File())
+):
+    data = await avatar.read()
+    return {"name": name, "file": avatar.filename, "type": avatar.content_type, "size": avatar.size}
+
+
+@veil.post("/files")
+def files(docs: list[UploadFile], note: Annotated[str, Form()] = ""):
+    return [d.filename for d in docs]
+
+
+@veil.post("/raw")
+def raw(doc: bytes = File()):                  # the content as bytes
+    return len(doc)
+
+
+@veil.post("/login")                          # application/x-www-form-urlencoded uses the same Form()
+def login(user: str = Form(), remember: bool = Form(False)):
+    return {"user": user}
+```
+
+- The form is read **before** the handler runs. Text fields and files up to `[api] multipart_spool_threshold`
+  (1 MiB) stay in memory; larger files are written by Rust to an anonymous temporary file in `[api] upload_tmp_dir`
+  and `UploadFile.file` reads it, so a 1 GB upload does not grow the process. The temporary file disappears when it
+  is closed (`await upload.close()`, or when the object is collected).
+- `UploadFile` has `filename`, `content_type`, `headers` (a dict, lower-case names), `size`, `file` (a binary file
+  object positioned at the start), `async` `read(size=-1)` / `write` / `seek` / `close`, and `read_bytes()` for
+  synchronous handlers.
+- A missing field or file gives 422 with `loc = ["body", name]` (`Form(alias="other")` changes the name); a
+  malformed body gives 400 and one over the `[api] multipart_*` limits 413 (`{"detail": "..."}`).
+- OpenAPI describes the body as `multipart/form-data` (files are `{"type": "string", "format": "binary"}`) or as
+  `application/x-www-form-urlencoded` when there are no files, so the Swagger UI can send files.
+
 ## Server-Sent events and long-lived connections
 
 WebSocket endpoints and other protocol upgrades (`veil.Response.switching_protocols`) are described in {doc}`websocket`.

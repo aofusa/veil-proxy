@@ -14,7 +14,8 @@ pub use super::response::Json;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Query<T>(pub T);
 
-/// An `application/x-www-form-urlencoded` body. Validated automatically.
+/// An `application/x-www-form-urlencoded` or `multipart/form-data` body (file parts are ignored). Validated
+/// automatically.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Form<T>(pub T);
 
@@ -191,8 +192,12 @@ pub fn query_struct<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, 
         .map_err(|e| single_error("query", None, "value_error", &e.to_string()))
 }
 
-/// Deserializes a form body into `T`.
+// F-266: multipart も受ける
+/// Deserializes a form body into `T` (`multipart/form-data` too: its non-file fields).
 pub fn form_body<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    if super::multipart::is_multipart(req) {
+        return super::multipart::multipart_form(req);
+    }
     serde_urlencoded::from_bytes::<T>(&req.body)
         .map_err(|e| single_error("body", None, "value_error", &e.to_string()))
 }

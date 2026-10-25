@@ -6,6 +6,7 @@
 //! - tower の層（`/admin` だけに認証、全体に応答ヘッダ）
 //! - L4 ネイティブハンドラ（TCP エコー・UDP エコー）
 //! - ストリーミング応答とトレーラ・ストリーミング受信（F-197）
+//! - multipart/form-data のフォームとファイルのアップロード（F-266）
 //! - config.toml の取り込みと Rust コードでの上書き
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -136,6 +137,59 @@ async fn upper(req: &Request) -> Response {
     Response::stream(200, body).with_header("content-type", "text/plain")
 }
 
+/// プロフィールのフォーム（multipart/form-data のファイルでないフィールド。F-266）
+#[derive(Debug, Deserialize, veil::Schema)]
+struct Profile {
+    #[validate(length(min = 1, max = 50))]
+    name: String,
+    #[validate(range(min = 0, max = 150))]
+    age: u32,
+}
+
+/// フォームとファイル（溜めた本文から。ファイルの中身は本文の切り出しで複製しない）
+#[veil::route(path = "/profile", method = "POST", tags = ["upload"])]
+async fn profile(
+    form: MultipartForm<Profile>,
+    avatar: UploadFile,
+    banner: Option<UploadFile>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": form.name,
+        "age": form.age,
+        "avatar": avatar.file_name(),
+        "avatar_type": avatar.content_type(),
+        "avatar_size": avatar.len(),
+        "banner_size": banner.map(|b| b.len()),
+    }))
+}
+
+/// 同じ名前の複数のファイル
+#[veil::route(path = "/files-upload", method = "POST", tags = ["upload"])]
+async fn files_upload(docs: Vec<UploadFile>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "names": docs.iter().map(|d| d.file_name()).collect::<Vec<_>>(),
+        "sizes": docs.iter().map(|d| d.len()).collect::<Vec<_>>(),
+    }))
+}
+
+/// 本文を届いた順に読み、ファイルは名前の無い一時ファイルへ書く（大きなファイルでもメモリに溜めない）
+#[veil::route(path = "/upload-stream", method = "POST", tags = ["upload"])]
+async fn upload_stream(mut form: Multipart) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut parts = Vec::new();
+    while let Some(mut part) = form.next_part().await? {
+        let name = part.name().unwrap_or("").to_string();
+        if part.file_name().is_some() {
+            let tmp = part.save_to_temp().await?;
+            parts.push(
+                serde_json::json!({"name": name, "file": tmp.file_name(), "size": tmp.len()}),
+            );
+        } else {
+            parts.push(serde_json::json!({"name": name, "value": part.text().await?}));
+        }
+    }
+    Ok(Json(serde_json::json!({ "parts": parts })))
+}
+
 /// 管理用（tower の層で認証する）
 #[veil::route(path = "/admin/stats", method = "GET", tags = ["admin"])]
 async fn admin_stats(counter: State<Counter>) -> Json<serde_json::Value> {
@@ -183,14 +237,20 @@ type VeilBody = veil::api::tower::VeilBody;
 
 impl<S> tower::Service<http::Request<VeilBody>> for RequireTokenService<S>
 where
-    S: tower::Service<http::Request<VeilBody>, Response = http::Response<VeilBody>> + Clone + 'static,
+    S: tower::Service<http::Request<VeilBody>, Response = http::Response<VeilBody>>
+        + Clone
+        + 'static,
     S::Future: 'static,
 {
     type Response = http::Response<VeilBody>;
     type Error = S::Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>>>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>>>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), S::Error>> {
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
         self.inner.poll_ready(cx)
     }
 

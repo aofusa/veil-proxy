@@ -1,6 +1,6 @@
 # F-266: API ライブラリで multipart/form-data（ファイルのアップロード）とフォームを受ける（Rust・Python・C）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（2026-10-25 起票・設計、同日実装。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景
 
@@ -101,3 +101,53 @@ async def upload(name: str = Form(...), files: list[UploadFile] = File(...)):
 
 - Rust・Python・C でフォームとファイルを受けられ、大きなファイルでメモリが増えない。本体のバイナリが変わらない。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **解析器**（`src/api/multipart.rs`）: 溜めた本文とストリーミングで同じ同期の状態機械（`Core`: Start・AfterDelim・Headers・Data・
+  DataEnd・Done）を使う。区切りは `\r\n--boundary` を `memchr::memmem::Finder` で探し、本体は届いた `Bytes` の切り出し。
+  複製するのは断片をまたいだパートのヘッダと、次の断片に続き得る区切りの頭（`partial_suffix`）だけ。前置きは
+  `max(multipart_max_header_size, 8 KiB)` まで、区切りの後の空白は 64 バイトまで。`filename*` は RFC 5987 の UTF-8 だけ。
+  上限超えは 413、書式の誤りは 400（`{"detail": ...}`）。単体試験は RFC の例・全分割位置・上限・不正な本文・乱数の 20,000 本
+  （溜めた結果とストリーミングの結果が一致すること）。ファジングの対象 `fuzz/fuzz_targets/multipart_parse.rs`（同じ一致を assert）。
+- **Rust**: `MultipartForm<T>`（ファイル以外を `serde_urlencoded` の規則で `T`、`Schema` なら検証）・`UploadFile`・`Vec<UploadFile>`・
+  `Option<UploadFile>`（引数名 = パート名、無ければ `loc = ["body", 名前]` の 422）・`Multipart`（`next_part` → `Field` の
+  `chunk`・`bytes`・`text`・`save_to_temp`・`save_to`）。マクロは型名で選び、`Multipart` があればルートを `streaming = true` にし、
+  溜める抽出子との併用はコンパイルエラー。`Form<T>` も multipart を受ける。OpenAPI はインラインの object（ファイルは
+  `{"type": "string", "format": "binary"}`）。`[api] multipart_*`・`upload_tmp_dir`（`ApiSettings`）。
+- **一時ファイル**: Linux は `O_TMPFILE`（`EOPNOTSUPP`・`EISDIR` のときだけ作って消す）、他の unix は作ってすぐ消す、Windows は
+  `FILE_FLAG_DELETE_ON_CLOSE`。開く・書くのは `offload` の中。Landlock の書き込みパスと OpenBSD の unveil（rwc）に
+  `upload_tmp_dir` を足した（`cfg(feature = "handler")`）。capsicum（FreeBSD の cap-mode）では一時ファイルを開けないので未対応
+  （ライブラリの利用者は既定で cap-mode にしない）。seccomp は `unlink` を許していないので、`O_TMPFILE` の無いファイルシステムで
+  seccomp を有効にすると後片付けが失敗する（Linux の既定の tmpfs・ext4・xfs・btrfs は `O_TMPFILE` がある）。
+- **HTTP/1.1 の本文のストリーミング受信**（`src/proxy/h1.rs`）: 今まで HTTP/1.1 の `streaming_request` のルートも本文を溜めてから
+  呼んでいた。`Content-Length` のある本文は、ハンドラの呼び出しと本文の汲み上げ（`pump_api_body`）を同じタスクの
+  `FuturesUnordered` で並べて回す（F-173: `join!` を使わない）。ハンドラが本文を読み終える前に全量の応答を返したら、応答の後に接続を閉じる。
+  ストリーミング応答を返したら（要求本文を応答へ流すエコー等）、本文を読み終えるまで応答の断片を溜めて要求本文のチャネルを空け続け、
+  読み終えてから送る（同じ接続の読みと書きは同時にしない。最初の E2E で `/upper` の HTTP/1.1 が空の応答になって見つかった）。
+  chunked の本文は今までどおり溜める。ストリーミング受信のハンドラのルートは HTTP/1.1・HTTP/3 でもルートの
+  `max_request_body_size` と `[api] max_body_size` を見ない（HTTP/2 と同じ。パートごとの上限が効く）。HTTP/1.1 のルーティング前の
+  10 MiB の検査（`pool::MAX_BODY_SIZE`）と `100 Continue` は、`handler` のビルドだけルーティングの後へ回した（本体のバイナリは変わらない）。
+  HTTP/3 のストリーミング受信のハンドラの `max_request_body` も 0（無制限）にした。
+- **Python**: `veil.Form()`・`veil.File()`・`veil.UploadFile`（`filename`・`content_type`・`headers`・`size`・`file`・`async` の
+  `read`・`write`・`seek`・`close`・`read_bytes()`）。`Annotated[..., Form()]`・`list[...]`・`bytes = File()`・`alias=`。urlencoded も同じ
+  `Form()`。Form・File の引数があるルートは登録時に `form=True`（`register_route`）でストリーミング受信にし、Rust の
+  `multipart::prepare_form` がハンドラの前に本文を読む: テキストと `multipart_spool_threshold`（1 MiB）までのファイルはメモリ、
+  超えるものは名前の無い一時ファイルの fd として `NativeRequest.multipart()` で渡す（Python が `os.fdopen` する。使われなかった fd は
+  `Part.__del__` が閉じる）。GIL の下で境界を探さない。`python-multipart` に依存しない。ネイティブ無しの単体試験のために純 Python の
+  小さな解析器を残した（サーバでは使わない）。`_veil.parse_multipart`・`spool_threshold` を足した。
+- **C**: `veil_multipart_next(req, &part)`（`veil_part_t`: `name`・`filename`・`content_type`・`data`/`data_len` か一時ファイルの `fd`・`size`）、
+  ルートのフラグ `VEIL_ROUTE_FORM`（コールバックの前に `prepare_form` で読み、大きなファイルは一時ファイル。`fd` はコールバックから
+  戻ると閉じる）、`VEIL_ERR_FORM`（400）・`VEIL_ERR_TOO_LARGE`（413）。設計にあった `veil_multipart_stream_*`（C で境界を順に読む API）は
+  作らず、`VEIL_ROUTE_FORM` の一時ファイルで大きなファイルを扱う形にした（C の呼び出し側が非同期の読み取りを組まずに済む）。
+- **試験**: `tests/api/library_e2e.sh` の `run_rust_multipart`（rust-showcase: フォーム + ファイル・省略可能なファイル・検証の 422・ファイル
+  無しの 422・複数ファイル・不正な本文の 400・h2c・ストリーミングの HTTP/1.1・h2c、100 MB を HTTP/1.1・h2c で送って常駐メモリの
+  増加が 50 MiB 未満・一時ファイルが残らない・OpenAPI）、`run_python_multipart`（python-features: メモリと一時ファイルの両方を
+  SHA-256 で照合、100 MB の HTTP/1.1・h2c、urlencoded、OpenAPI）、`run_c_multipart`（c-features: `VEIL_ROUTE_FORM` と溜めた本文、
+  100 MB の HTTP/1.1・h2c、HTTP/3 で 30 MB）。HTTP/3 は curl が対応していないので試験クライアント（`tests/api/grpc_client`）に
+  `--h3-fetch` を足した。`nonregression` に `veil::api::multipart`・`veil_multipart_` を足した。単体: `api::multipart` 10 件・
+  C の `multipart_next_iterates_parts`・Python の `TestForms` 5 件。
+- **文書**: `docs/guide/library.md`（英日）に「Forms and file uploads」の節と `[api] multipart_*`・`upload_tmp_dir`、
+  `crates/veil-python/docs/requests-responses.md`、`crates/veil-capi/README.md`・`veil.h`、`examples/config.toml` の `[api]`。
+- **残り**: Landlock を有効にしたライブラリでの E2E（`upload_tmp_dir` に書けること）と、FastAPI + uvicorn との 100 MB の CPU 時間の比較は
+  していない。

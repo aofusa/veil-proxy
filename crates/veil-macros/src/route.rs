@@ -113,6 +113,16 @@ enum ArgKind {
     FromRequest(Type),
     /// `WebSocketUpgrade` (extracted with `FromRequest`; the route is documented as a WebSocket endpoint).
     WebSocket(Type),
+    /// `MultipartForm<T>`: the non-file fields of a multipart body.
+    MultipartForm(Type),
+    /// `UploadFile` (`Vec<UploadFile>`, `Option<UploadFile>`): the file field named after the argument.
+    Upload {
+        name: String,
+        many: bool,
+        optional: bool,
+    },
+    /// `Multipart`: the body read as it arrives (the route receives its body as a stream).
+    Multipart(Type),
     PathParam(String, Type),
     QueryParam {
         name: String,
@@ -142,9 +152,34 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
         }
         "State" | "Headers" | "Bytes" | "Body" => return ArgKind::FromRequest(ty.clone()),
         "WebSocketUpgrade" => return ArgKind::WebSocket(ty.clone()),
+        "Multipart" => return ArgKind::Multipart(ty.clone()),
+        "MultipartForm" => {
+            if let Some(inner) = first_generic(ty) {
+                return ArgKind::MultipartForm(inner.clone());
+            }
+        }
         _ => {}
     }
     let name = name.unwrap_or("").trim_start_matches("r#").to_string();
+    let upload_inner = |t: &Type| last_ident(t).as_deref() == Some("UploadFile");
+    if last == "UploadFile" {
+        return ArgKind::Upload {
+            name,
+            many: false,
+            optional: false,
+        };
+    }
+    if last == "Vec" || last == "Option" {
+        if let Some(inner) = first_generic(ty) {
+            if upload_inner(inner) {
+                return ArgKind::Upload {
+                    name,
+                    many: last == "Vec",
+                    optional: last == "Option",
+                };
+            }
+        }
+    }
     if path_params.contains(&name) {
         return ArgKind::PathParam(name, ty.clone());
     }
@@ -238,6 +273,10 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let mut meta_stmts = Vec::new();
     let mut can_fail = false;
     let mut is_ws = false;
+    // F-266: multipart の引数（OpenAPI の requestBody を 1 つにまとめる）
+    let mut mp_form: Option<Type> = None;
+    let mut mp_files: Vec<(String, bool, bool)> = Vec::new();
+    let mut mp_stream = false;
     for (i, input) in func.sig.inputs.iter().enumerate() {
         let FnArg::Typed(pt) = input else {
             return Err(Error::new(
@@ -308,6 +347,61 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 });
                 call_args.push(quote!(#var));
             }
+            ArgKind::MultipartForm(inner) => {
+                can_fail = true;
+                extract.push(quote! {
+                    let #var: #inner = match ::veil::api::__private::multipart_form::<#inner>(&__veil_req) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                    {
+                        use ::veil::api::__private::{ViaValidate as _, ViaNoValidate as _};
+                        if let Err(r) = (&::veil::api::__private::ValidateProbe(&#var)).veil_validate("body") {
+                            return r;
+                        }
+                    }
+                });
+                call_args.push(quote!(::veil::api::__private::MultipartForm(#var)));
+                mp_form = Some(inner);
+            }
+            ArgKind::Upload {
+                name: fname,
+                many,
+                optional,
+            } => {
+                if fname.is_empty() {
+                    return Err(Error::new(
+                        pt.pat.span(),
+                        "use a plain identifier for an UploadFile argument (it names the form field)",
+                    ));
+                }
+                can_fail = true;
+                let getter = if many {
+                    quote!(upload_files)
+                } else if optional {
+                    quote!(upload_file_opt)
+                } else {
+                    quote!(upload_file)
+                };
+                extract.push(quote! {
+                    let #var = match ::veil::api::__private::#getter(&__veil_req, #fname) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
+                mp_files.push((fname, many, !optional));
+            }
+            ArgKind::Multipart(t) => {
+                mp_stream = true;
+                extract.push(quote! {
+                    let #var: #t = match <#t as ::veil::api::__private::FromRequest>::from_request(&__veil_req) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
+            }
             ArgKind::PathParam(pname, t) => {
                 can_fail = true;
                 extract.push(quote! {
@@ -369,6 +463,36 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         }
     }
 
+    if mp_stream && (mp_form.is_some() || !mp_files.is_empty()) {
+        return Err(Error::new(
+            Span::call_site(),
+            "`Multipart` reads the body as it arrives and cannot be combined with `MultipartForm` or `UploadFile`",
+        ));
+    }
+    if mp_stream || mp_form.is_some() || !mp_files.is_empty() {
+        let form_schema = match &mp_form {
+            Some(t) => quote! {
+                Some({
+                    use ::veil::api::__private::{ViaApiSchema as _, ViaNoSchema as _};
+                    (&::veil::api::__private::SchemaProbe::<#t>(::core::marker::PhantomData)).veil_schema(&mut __veil_defs)
+                })
+            },
+            None => quote!(None),
+        };
+        let names = mp_files.iter().map(|f| &f.0);
+        let manys = mp_files.iter().map(|f| f.1);
+        let reqs = mp_files.iter().map(|f| f.2);
+        meta_stmts.push(quote! {
+            {
+                let __veil_form: ::core::option::Option<::veil::api::__private::serde_json::Value> = #form_schema;
+                __veil_body = Some(::veil::api::__private::multipart_body_meta(
+                    __veil_form,
+                    &__veil_defs,
+                    &[#((#names, #manys, #reqs)),*],
+                ));
+            }
+        });
+    }
     let call = if offload {
         // 同期関数: 引数を取り出してからハンドラ用プールで実行する（引数・戻り値は Send が必要）。
         quote! {
@@ -404,7 +528,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let description = opt_string(args.description.clone().or(doc_desc));
     let tags = &args.tags;
     let hidden = args.hidden;
-    let streaming = args.streaming;
+    // F-266: `Multipart` は本文をストリーミングで受ける
+    let streaming = args.streaming || mp_stream;
     let resp_content = response_content(&func.sig.output);
     let ok_status = args.status.unwrap_or(200);
     if !is_ws

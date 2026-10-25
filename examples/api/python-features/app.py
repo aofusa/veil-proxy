@@ -1,10 +1,12 @@
 """veil の Python の F-210 の機能: ストリーミング応答（ジェネレータ・SSE・非同期ジェネレータ）・
-要求本文のストリーミング受信・L4（TCP・UDP のエコー）。
+要求本文のストリーミング受信・L4（TCP・UDP のエコー）・フォームとファイルのアップロード（F-266）。
 
     VEIL_LISTEN=127.0.0.1:8000 VEIL_L4_TCP=127.0.0.1:7000 VEIL_L4_UDP=127.0.0.1:7001 python app.py
 """
 
 import asyncio
+import hashlib
+import io
 import os
 import time
 
@@ -44,6 +46,42 @@ def count(req: veil.Request):
     return str(sum(len(chunk) for chunk in req.stream()))
 
 
+@veil.post("/upload")
+async def upload(
+    title: str = veil.Form(),
+    count: int = veil.Form(1),
+    doc: veil.UploadFile = veil.File(),
+    note: veil.UploadFile = None,
+):
+    # 小さいファイルはメモリ、[api] multipart_spool_threshold を超えるものは名前の無い一時ファイル
+    h = hashlib.sha256()
+    while True:
+        chunk = await doc.read(1 << 20)
+        if not chunk:
+            break
+        h.update(chunk)
+    await doc.close()
+    return {
+        "title": title,
+        "count": count,
+        "filename": doc.filename,
+        "size": doc.size,
+        "sha256": h.hexdigest(),
+        "where": "memory" if isinstance(doc.file, io.BytesIO) else "disk",
+        "note": note.read_bytes().decode() if note else None,
+    }
+
+
+@veil.post("/upload-many")
+def upload_many(docs: list[veil.UploadFile]):
+    return [{"filename": d.filename, "size": d.size} for d in docs]
+
+
+@veil.post("/login")
+def login(user: str = veil.Form(), remember: bool = veil.Form(False)):
+    return {"user": user, "remember": remember}
+
+
 L4T, L4U = os.environ.get("VEIL_L4_TCP"), os.environ.get("VEIL_L4_UDP")
 if L4T:
 
@@ -61,4 +99,7 @@ if L4U:
 
 
 if __name__ == "__main__":
-    veil.run(listen_cleartext=os.environ.get("VEIL_LISTEN", "127.0.0.1:8000"), overrides={"logging.level": "warn"})
+    veil.run(
+        listen_cleartext=os.environ.get("VEIL_LISTEN", "127.0.0.1:8000"),
+        overrides={"logging.level": "warn", "api.multipart_max_file_size": 209715200},
+    )

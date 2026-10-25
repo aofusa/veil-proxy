@@ -114,6 +114,24 @@ pub struct ApiSettings {
     // F-262
     /// List WebSocket routes in the OpenAPI document.
     pub openapi_websocket: bool,
+    // F-266
+    /// Maximum number of parts of a `multipart/form-data` body.
+    pub multipart_max_parts: usize,
+    // F-266
+    /// Maximum size of a multipart part that is not a file.
+    pub multipart_max_field_size: usize,
+    // F-266
+    /// Maximum size of a multipart file part (0 = `max_body_size`).
+    pub multipart_max_file_size: usize,
+    // F-266
+    /// Maximum size of the headers of one multipart part.
+    pub multipart_max_header_size: usize,
+    // F-266
+    /// Uploads up to this size stay in memory in the Python `UploadFile` (larger ones go to a temporary file).
+    pub multipart_spool_threshold: usize,
+    // F-266
+    /// Directory for temporary upload files (default: the system temporary directory).
+    pub upload_tmp_dir: Option<String>,
 }
 
 impl ApiSettings {
@@ -168,6 +186,16 @@ impl ApiSettings {
             websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 0) as u64,
             websocket_compression: b("websocket_compression", false),
             openapi_websocket: b("openapi_websocket", true),
+            multipart_max_parts: n("multipart_max_parts", 100),
+            multipart_max_field_size: n("multipart_max_field_size", 1024 * 1024),
+            multipart_max_file_size: n("multipart_max_file_size", 0),
+            multipart_max_header_size: n("multipart_max_header_size", 8 * 1024),
+            multipart_spool_threshold: n("multipart_spool_threshold", 1024 * 1024),
+            upload_tmp_dir: v
+                .and_then(|t| t.get("upload_tmp_dir"))
+                .and_then(|x| x.as_str())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.to_string()),
         }
     }
 }
@@ -514,6 +542,7 @@ fn start(config: Config) -> Result<(), Error> {
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
         super::upgrade::set_idle_timeout_secs(settings.upgrade_idle_timeout_secs);
         super::ws::apply_settings(&settings);
+        super::multipart::apply_settings(&settings);
         #[cfg(feature = "grpc-handler")]
         {
             super::grpc::set_max_message_size(settings.grpc_max_message_size);

@@ -991,7 +991,7 @@ pub unsafe extern "C" fn veil_ws_accept(
     let mut peer = q.req.client_ip().to_string();
     peer.push('\0');
     let mut ws = up.on_upgrade_blocking(move |tx| {
-        let mut s = CWsSession {
+        let s = CWsSession {
             cb,
             ud,
             ws: Box::new(veil_ws_t {

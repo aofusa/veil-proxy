@@ -334,6 +334,14 @@ pub fn run_server(opts: ServerOptions) {
     if loaded_config.global_security.enable_unveil {
         match crate::config::collect_unveil_paths(&config_path) {
             Ok(paths) => {
+                // F-266: ライブラリのアップロードの一時ファイルの置き場
+                #[cfg(feature = "handler")]
+                let paths = {
+                    let mut p = paths;
+                    p.read_write_create
+                        .push(crate::api::multipart::upload_tmp_dir());
+                    p
+                };
                 let mut all_ok = true;
                 for p in &paths.read_only {
                     if let Err(e) = crate::security::pledge_unveil::unveil_path(p, "r") {
@@ -816,6 +824,16 @@ pub fn run_server(opts: ServerOptions) {
         let s = p.to_string_lossy().into_owned();
         if !landlock_write_paths.contains(&s) {
             landlock_write_paths.push(s);
+        }
+    }
+    // F-266: ライブラリのアップロードの一時ファイルの置き場（[api] upload_tmp_dir）
+    #[cfg(feature = "handler")]
+    {
+        let d = crate::api::multipart::upload_tmp_dir()
+            .to_string_lossy()
+            .into_owned();
+        if !landlock_write_paths.contains(&d) {
+            landlock_write_paths.push(d);
         }
     }
 

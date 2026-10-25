@@ -260,6 +260,12 @@ for debugging.
 | `python_event_loop` | `"auto"` | Python: `"auto"` (uvloop when installed), `"asyncio"` or `"uvloop"` |
 | `python_event_loop_queue` | `65536` | Python: calls that may wait for one loop (503 when full) |
 | `python_async_mode` | `"loop"` | Python: where `async def` handlers run: `"loop"` (persistent loop) or `"pool"` (as before 0.10) |
+| `multipart_max_parts` | `100` | maximum number of parts of a `multipart/form-data` body (more gives 413) |
+| `multipart_max_field_size` | `1048576` | maximum size of a part that is not a file |
+| `multipart_max_file_size` | `0` | maximum size of a file part (`0` = `max_body_size`) |
+| `multipart_max_header_size` | `8192` | maximum size of the headers of one part |
+| `multipart_spool_threshold` | `1048576` | Python `UploadFile` and C `VEIL_ROUTE_FORM`: larger files are written to a temporary file instead of memory |
+| `upload_tmp_dir` | OS temp dir | directory of the anonymous temporary files for uploads (added to the Landlock / unveil write paths) |
 
 ## Routing macros
 
@@ -287,7 +293,8 @@ Arguments are bound by type and name:
 | `&Request` / `Request` | the whole request |
 | `Json<T>` | JSON body |
 | `Query<T>` | the whole query string deserialized into `T` |
-| `Form<T>` | `application/x-www-form-urlencoded` body |
+| `Form<T>` | `application/x-www-form-urlencoded` body (or the text fields of a `multipart/form-data` body) |
+| `MultipartForm<T>`, `UploadFile`, `Vec<UploadFile>`, `Option<UploadFile>`, `Multipart` | `multipart/form-data` body (see [Forms and file uploads](#forms-and-file-uploads)) |
 | `State<T>` | shared state registered with `App::state` |
 | `Headers`, `Bytes` (alias `Body`) | request headers / raw body |
 | a name that matches `{name}` in the path | path parameter, parsed with `FromStr` |
@@ -482,6 +489,66 @@ Operation Object with `x-veil-websocket` to `veil_register_route_ex`.
 
 Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/) (`/ws` echo, `/chat` broadcast with
 `split`, `/typed` JSON messages); C: `/ws` in [examples/api/c-features/](../../examples/api/c-features/).
+
+## Forms and file uploads
+
+veil parses `multipart/form-data` (RFC 7578) itself, with no extra dependency. Buffered parts are slices of the body
+(no copy); a streamed body is parsed as it arrives.
+
+```rust
+use veil::api::prelude::*;
+
+#[derive(Deserialize, veil::Schema)]
+struct Profile { name: String, #[validate(range(min = 0, max = 150))] age: u32 }
+
+// the body is buffered (up to [api] max_body_size); text fields go into T, files are matched by argument name
+#[veil::route(path = "/profile", method = "POST")]
+async fn profile(form: MultipartForm<Profile>, avatar: UploadFile, banner: Option<UploadFile>) -> Json<Value> {
+    Json(json!({"name": form.name, "avatar": avatar.file_name(), "size": avatar.len()}))
+}
+
+#[veil::route(path = "/docs", method = "POST")]
+async fn docs(docs: Vec<UploadFile>) -> Json<Vec<usize>> { Json(docs.iter().map(|d| d.len()).collect()) }
+
+// streamed: the route is made `streaming = true` automatically and files never sit in memory
+#[veil::route(path = "/upload", method = "POST")]
+async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
+    while let Some(mut part) = form.next_part().await? {
+        if part.file_name().is_some() {
+            let tmp = part.save_to_temp().await?;   // anonymous file in [api] upload_tmp_dir; or part.save_to(path)
+            // tmp.file(), tmp.len(), tmp.into_file()
+        } else {
+            let value = part.text().await?;          // or part.chunk().await / part.bytes().await
+        }
+    }
+    Ok(Json(json!({"ok": true})))
+}
+```
+
+- `MultipartForm<T>` deserializes the text fields like `Form<T>` (and validates `T` when it derives `Schema`);
+  `Form<T>` also accepts a multipart body and ignores its files. A missing file gives 422 with
+  `loc = ["body", name]`, a malformed body 400 and a body over the `[api] multipart_*` limits 413
+  (`{"detail": "..."}`).
+- `Multipart` cannot be combined with the buffered extractors. Streamed routes are not limited by
+  `max_body_size` (the per-part limits apply); this holds on HTTP/1.1 (bodies with a `Content-Length`; chunked bodies
+  are buffered), HTTP/2 and HTTP/3. The anonymous files (`O_TMPFILE` on Linux, created and removed elsewhere, delete
+  on close on Windows) are written on the offload pool and disappear when closed.
+- OpenAPI describes the body as `multipart/form-data` with files as `{"type": "string", "format": "binary"}`, so
+  the Swagger UI offers a file picker.
+- **Python:** `name: str = veil.Form()`, `avatar: veil.UploadFile = veil.File()`, `files: list[veil.UploadFile]`,
+  `data: bytes = veil.File()` (FastAPI's names; `Annotated[str, veil.Form()]` works too, and urlencoded forms use the
+  same `Form()`). The body is parsed in Rust before the handler runs: text and small files stay in memory, files over
+  `multipart_spool_threshold` are handed to Python as temporary files, so a large upload does not grow the process.
+  `UploadFile` has `filename`, `content_type`, `headers`, `size`, `file` and `async` `read` / `write` / `seek` /
+  `close` (plus `read_bytes()`).
+- **C:** `veil_multipart_next(req, &part)` returns the parts one by one (`name`, `filename`, `content_type`, and
+  `data` / `data_len` or a temporary file `fd`). With the route flag `VEIL_ROUTE_FORM` the body is read before the
+  callback and large files are written to temporary files (closed when the callback returns); without it the buffered
+  body is parsed.
+
+Examples: `/profile`, `/files-upload` and `/upload-stream` in [examples/api/rust-showcase/](../../examples/api/rust-showcase/),
+`/upload` in [examples/api/python-features/](../../examples/api/python-features/) and
+[examples/api/c-features/](../../examples/api/c-features/).
 
 ## Validation and OpenAPI
 
@@ -969,6 +1036,7 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
 - Protocol upgrade (HTTP/1.1): `veil_response_upgrade(resp, protocol, &callbacks, ud)` answers 101 and serves the
   connection with the L4 TCP callbacks (see [Protocol upgrades](#protocol-upgrades-http11)).
 - WebSocket: `veil_ws_accept(req, resp, &callbacks, ud)`, `veil_ws_send`, `veil_ws_close` (see [WebSocket](#websocket)).
+- Forms: `veil_multipart_next` and the route flag `VEIL_ROUTE_FORM` (see [Forms and file uploads](#forms-and-file-uploads)).
 - Streaming functions cannot be used on `VEIL_ROUTE_INLINE` routes (`VEIL_ERR_STATE`).
 
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
@@ -1045,6 +1113,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
 - **L4 (F-210):** `@veil.l4_tcp(name, listen)` on a `veil.Protocol` subclass (`connection_made` /
   `data_received` / `connection_lost`, like asyncio; `self.transport.write` inside a callback) and
   `@veil.l4_udp(name, listen)` on `def f(data, peer) -> bytes | None`.
+- **Forms and files (F-266):** `veil.Form()`, `veil.File()` and `veil.UploadFile`, as in FastAPI (no
+  `python-multipart` needed; see [Forms and file uploads](#forms-and-file-uploads)).
 - **GraphQL:** mount any library as an ordinary route; [examples/api/python-graphql/](../../examples/api/python-graphql/)
   uses strawberry (queries, mutations, and subscriptions over SSE).
 - Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`;
