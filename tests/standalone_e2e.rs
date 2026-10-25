@@ -2485,6 +2485,8 @@ allow_origins = ["*"]
     );
 
     type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<(String, String)>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut protocols: Vec<(&str, Get)> = vec![
         (
             "HTTP/1.1",
@@ -2666,6 +2668,8 @@ watch = false
     );
 
     type Get<'a> = Box<dyn Fn(&str) -> (u16, Vec<u8>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut protocols: Vec<(&str, Get)> = vec![
         (
             "HTTP/1.1",
@@ -3149,6 +3153,8 @@ body = "plain"
     );
 
     type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<u8>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut protocols: Vec<(&str, Get)> = vec![
         (
             "HTTP/1.1",
