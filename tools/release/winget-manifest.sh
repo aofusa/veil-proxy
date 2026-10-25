@@ -15,6 +15,11 @@ SX64="$(sha "$X64")"; SARM="$(sha "$ARM")"
 [ -n "$SX64" ] && [ -n "$SARM" ] || { echo "error: $X64 / $ARM not in $SUMS" >&2; exit 1; }
 D="$OUT/manifests/a/Aofusa/Veil/$VER"; mkdir -p "$D"
 pc() { [ -n "$1" ] && printf '    ProductCode: "%s"\n' "$1"; true; }
+# 入れた後の確認（winget の検証）は veil.exe を起動する。引数なしの veil はサーバとして動き続けるので --version で起動させる
+launch() {
+    printf '    InstallationMetadata:\n      DefaultInstallLocation: %s\n      Files:\n' "'%ProgramFiles%\\veil'"
+    printf '        - RelativeFilePath: veil.exe\n          FileType: launch\n          InvocationParameter: --version\n'
+}
 cat > "$D/Aofusa.Veil.yaml" <<Y
 # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
 PackageIdentifier: Aofusa.Veil
@@ -40,12 +45,14 @@ Installers:
     InstallerSha256: $SX64
 Y
 pc "$PC_X64"
+launch
 cat <<Y
   - Architecture: arm64
     InstallerUrl: $BASE/$ARM
     InstallerSha256: $SARM
 Y
 pc "$PC_ARM"
+launch
 cat <<Y
 ManifestType: installer
 ManifestVersion: 1.9.0
