@@ -206,7 +206,7 @@ Then the handler routes and the built-in OpenAPI routes are injected, and all ro
 (see [Routing macros](#routing-macros)).
 
 The same composition runs again on every SIGHUP reload, so builder and environment overrides **survive a
-reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[tls]`, `[[l4]]` and the thread
+reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[[listener]]`, `[tls]`, `[[l4]]` and the thread
 count still cannot change without a restart (same as the proxy).
 
 ### Builder
@@ -718,6 +718,32 @@ feature, included in `full`) for HTTP/3 on a UDP port (`[http3] enabled = true` 
 `set(..)`. The security sandbox is **off** by default in library mode; enabling `enable_seccomp` /
 `enable_landlock` is possible but must allow whatever your handlers do (files, sockets, DNS).
 
+### Several listeners
+
+To open several ports with different protocols (for example HTTP/1.1-only TLS, h2c-only and HTTP/2 + HTTP/3),
+add one `Listener` per port. Each one becomes a `[[listener]]` entry (see
+[Multiple listeners](configuration.md#multiple-listeners-listener) for the rules):
+
+```rust
+use veil::api::{Config, Listener};
+
+let config = Config::load()?
+    .builder()
+    .tls("/etc/veil/cert.pem", "/etc/veil/key.pem")
+    .listener(Listener::cleartext("0.0.0.0:8080").name("plain"))
+    .listener(Listener::tls("0.0.0.0:8081").name("h1tls").http2(false))
+    .listener(Listener::cleartext("0.0.0.0:8082").name("h2c").allow_http(false))
+    .listener(Listener::tls("0.0.0.0:8443").name("https").http3(true))
+    .build();
+```
+
+`Listener` methods: `tls(addr)` / `cleartext(addr)`, `name`, `http2`, `http3`, `http3_listen` (implies `http3`),
+`allow_http`, `allow_h2c`, `secure_redirect`, `redirect_to(name)` (implies `secure_redirect`), `threads` and
+`unix_socket_permissions`. Once any listener is added, the library's default plaintext listener
+(`listen_cleartext = "127.0.0.1:8080"`) is not opened unless you set `listen_cleartext` yourself. In C, fill a
+`veil_listener_t` and call `veil_config_add_listener(cfg, &l)` once per port; in Python, pass
+`veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`.
+
 ## Memory allocator
 
 When veil is used as a library (any build with the `handler` feature, which `api` includes), it does **not**
@@ -868,7 +894,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   `@veil.l4_udp(name, listen)` on `def f(data, peer) -> bytes | None`.
 - **GraphQL:** mount any library as an ordinary route; [examples/api/python-graphql/](../../examples/api/python-graphql/)
   uses strawberry (queries, mutations, and subscriptions over SSE).
-- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
+- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
 Full documentation (quickstart, FastAPI migration table, API reference): <https://veil-api.readthedocs.io>.

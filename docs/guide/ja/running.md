@@ -265,6 +265,9 @@ SIGHUP のリロードはルート・アップストリーム・セキュリテ�
 - `[server] http2_enabled`（TLS の ALPN は起動時に作る。h2 を選んだ接続は HTTP/2 のまま処理される）
 - `[http3] enabled`・`listen`
 - `[[l4]]` のリスナー（`name`・`listen`・`protocol`）
+- `[[listener]]`（追加・削除、`name`・`listen`・`tls`・`http2`・`http3`・`http3_listen`・`threads`・`unix_socket_permissions`）。
+  平文の方針（`allow_http`・`allow_h2c`・`secure_redirect`・`redirect_to`）は `listen_cleartext` の `[server]` のキーと同じく
+  リロードで **反映される**。ただしリスナーの列そのものが変わったリロードでは、再起動まで起動時の方針のまま
 - TLS 証明書は設定のリロードではなく、別の証明書ホットリロードで更新される
 
 ## 設定ファイルバリデーション

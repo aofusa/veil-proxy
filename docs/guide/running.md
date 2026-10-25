@@ -272,6 +272,10 @@ Changing any of the following in the file and reloading does **not** take effect
 - `[server] http2_enabled` (the TLS ALPN list is built at startup; connections that negotiated h2 keep using HTTP/2)
 - `[http3] enabled`, `listen`
 - the `[[l4]]` listeners (`name`, `listen`, `protocol`)
+- the `[[listener]]` entries (adding or removing one, `name`, `listen`, `tls`, `http2`, `http3`, `http3_listen`,
+  `threads`, `unix_socket_permissions`). Their plaintext policy (`allow_http`, `allow_h2c`, `secure_redirect`,
+  `redirect_to`) **is** applied by reload, like the `[server]` keys of `listen_cleartext`; when the listener set
+  itself changed, the policies opened at startup stay in effect until the restart
 - TLS certificates are reloaded separately (certificate hot reload), not by the configuration reload
 
 ## Configuration File Validation

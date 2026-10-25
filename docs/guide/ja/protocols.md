@@ -138,6 +138,9 @@ curl --http2-prior-knowledge http://localhost:8080/
 - ALPNネゴシエーションは行われません（Prior Knowledgeモード）
 - プロトコル検出は接続開始時の最初の数バイトを確認して行われます
 - 規則と移行表は[リスナー](configuration.md#リスナーlisten-と-listen_cleartext)を参照
+- 1 つのプロセスで TLS と平文のリスナーを複数動かす（例: HTTP/1.1 だけの TLS、h2c だけ、HTTP/2 + HTTP/3 を別ポートで）には
+  `[[listener]]` を使います。`http2`・`http3`・`allow_http`・`allow_h2c` はリスナーごとに設定します。
+  [複数のリスナー](configuration.md#複数のリスナーlistener)を参照
 
 ## HTTP/3サポート
 
@@ -167,6 +170,10 @@ listen = "0.0.0.0:443"
 [http3]
 enabled = true  # HTTP/3を有効化（QUIC/UDP）。listen と同じアドレスで起動。`listen` と [tls] が必要
 ```
+
+`[http3] enabled` は `[server].listen` に効きます。`[[listener]]` はそれぞれの `http3 = true` で HTTP/3 を有効にします
+（UDP は同じアドレス、または `http3_listen`）。その他の `[http3]` のキーはすべての HTTP/3 リスナーに効き、`Alt-Svc` は
+最初のものを広告します。[複数のリスナー](configuration.md#複数のリスナーlistener)を参照。
 
 ### 詳細設定
 

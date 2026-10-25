@@ -1,6 +1,6 @@
 # F-260: 複数ポートでの待ち受け（リスナーごとのプロトコル・TLS の ALPN・HTTP/3）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（feat/v0100、2026-10-25。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景
 
@@ -206,3 +206,40 @@ struct ListenerCtx {
 - 上の 4 ポートの構成が 1 プロセスで動き、HttpArena の validate のプロトコルの検査（8081 で h2 を選ばない等）を満たす。
 - 既存の設定（`listen`・`listen_cleartext`）は挙動・スレッド数・性能が変わらない。
 - 文書（英日）・`examples/config.toml`・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **設定**: `src/config/listeners.rs`（新規）。`[[listener]]`（`ListenerConfigSection`）と、`[server] listen`・`listen_cleartext`
+  を名前 `tls`・`cleartext` の暗黙のリスナーとして先頭に並べた `ListenerSpec` の列（`normalize_listeners`）。F-200 の検査
+  （エラーの文言の要所も）をそのまま引き継ぎ、名前の重複・種類違いのキー・`http3` の条件・`redirect_to`・アドレスの重複
+  （TCP: リスナー・`[[l4]]` tcp・`[acme] challenge_listen`、UDP: HTTP/3・`[[l4]]` udp。`0.0.0.0:p` と特定アドレスの `:p`、
+  `[::]:p` と IPv4 の `:p` も重複）を足した。`[server]` は省略可能にした（`[[listener]]` だけの設定のため）。
+- **TLS**: `tls_reload::AlpnProfile`（`H2AndH1`・`H1Only`）ごとに `ServerConfig` のスロットを持ち、証明書のリロードは
+  使う全プロファイルを作り直してから差し替える。`H1Only` は ALPN を出さない（HttpArena の 8081 の検査）。
+- **平文の方針**: `RuntimeConfig.cleartext` をリスナーの添字で引く表（`Arc<[CleartextPolicy]>`）にし、リダイレクト先の
+  ポートを方針に入れた（`HTTPS_REDIRECT_PORT` は削除）。接続ごとに 1 回 `load` して `Copy` するだけ（割り当て無し）。
+- **起動**: `src/listener_workers.rs`（新規）に 1 リスナーのワーカーを起こす関数を移し、TLS と平文で同じ汎用の accept ループ
+  （`serve` の閉包で単相化）を使う。バリアの期待値は TCP リスナーの `threads` の和。HTTP/3 はリスナーごとに起こし、PEM は
+  全 HTTP/3 ワーカーが写し終えた数を数えてから消す（最大 5 秒）。UDS は全部消す。起動時に 1 リスナー 1 行のログ。
+- **リロード**: リスナーの集合（名前・アドレス・TLS か・ALPN・HTTP/3）の変更は B-165 の警告（`listener` キー）で、
+  `allow_http`・`allow_h2c`・`secure_redirect` は効く。集合が変わったリロードでは添字がずれるので平文の表は前のものを残す。
+- **ライブラリ**: Rust `Listener`（`ConfigBuilder::listener`・`Config::add_listener`）、Python `veil.Listener`・
+  `veil.run(listeners=, http3=)`・`Config.add_listener`、C `veil_listener_t`・`veil_config_add_listener`。リスナーを 1 個でも
+  足すと、利用者が `listen_cleartext` を書かない限りライブラリ既定の `127.0.0.1:8080` を入れない。
+
+### 決めたこと
+
+- `[[listener]]` の `tls` は必須（書き忘れで平文の公開ポートになるのを避ける）。未知のキーは `deny_unknown_fields` でエラー。
+- 違う種類のキー（平文に `http2`・`http3`、TLS に `allow_http` 等）は無視せずエラー。
+- `secure_redirect` の既定は false（`[server] enable_secure_redirect` の既定 true と違う。新しいキーは明示した方だけが動く）。
+  `redirect_to` を書くと `secure_redirect` も要る（ライブラリの `redirect_to` は `secure_redirect` を含む）。
+- 暗黙の平文リスナーのリダイレクト先は最初の TLS のリスナー（今の `listen` のポートと同じ）。UDS の TLS のリスナーへの
+  リダイレクトは 443。
+- `[http3] enabled` は `[server] listen` の暗黙のリスナーだけに効く。`[[listener]]` は自分の `http3` で決める。Alt-Svc は
+  HTTP/3 を持つ最初のリスナー。
+- L4 が使う TLS 設定は、ある最初のプロファイル（`current_global_tls_config`）。
+- E2E は `tests/standalone_e2e.rs`（自分で veil を起動して確かめる試験の置き場。`tests/README.md`）に置いた
+  （`f260_multiple_listeners_in_one_process`: HttpArena と同じ 4 ポート + リダイレクトのポート、ALPN・426・Alt-Svc・HTTP/3・
+  301 の Location・SIGHUP での方針のリロードと集合の変更の警告。`f260_listener_rules_are_validated`）。
+- 性能の交互 A/B（暗黙のリスナー 2 個の構成）と、4 リスナー 1 プロセス対 2 プロセスのアイドル CPU・RSS の記録は
+  F-276 の計測でまとめて行う（この変更ではホットパスの増分は接続ごとの表の添字 1 回だけ）。

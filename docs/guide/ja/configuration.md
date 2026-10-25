@@ -22,6 +22,9 @@
 | `[server]` | `allow_http` | `true` | `listen_cleartext` で平文 HTTP/1.1 を受ける（false なら 426） |
 | `[server]` | `allow_h2c` | `true` | `listen_cleartext` で h2c を受ける（false なら GOAWAY） |
 | `[http3]` | `enabled` | `false` | `listen` と同じアドレス（UDP）、または `[http3].listen` で HTTP/3 を有効化 |
+| `[[listener]]` | `tls` | 必須 | 待ち受けのポートを足す。`true` = TLS、`false` = 平文（[複数のリスナー](#複数のリスナーlistener)を参照） |
+| `[[listener]]` | `http2` | `[server].http2_enabled` | TLS: ALPN で h2 を出す |
+| `[[listener]]` | `secure_redirect` | `false` | 平文: HTTPS へ 301 で返す（`[server].enable_secure_redirect` の既定は `true` なので注意） |
 | `[logging]` | `level` | `"info"` | ログレベル |
 | `[logging]` | `format` | `"text"` | ログ形式 |
 | `[logging]` | `channel_size` | `16384` | ログチャネルバッファサイズ（全スロットを起動時に確保して常駐。1 件 約 88 バイト。満杯時はブロックせず破棄） |
@@ -349,6 +352,8 @@ path = "/var/www/index.html"
 - UDS: `listen`・`listen_cleartext` は `unix:<path>` を受けます。HTTP/3 は UDS 不可
 - 下の削除されたキーは、移行先を示すエラーで起動しません（黙って無視しません）
 
+TLS や平文のポートを 2 つ以上開くときは [`[[listener]]`](#複数のリスナーlistener) を足します。
+
 `listen_cleartext` は `listen` と同じく全ワーカースレッドで受け付けます（旧 `http` のリダイレクト専用リスナーは
 1 スレッドでした）。待機中のワーカーはおよそ 1 つあたり 2 MB の RSS を使うので、TLS + リダイレクトの構成は以前より
 数 MB 多くなります。`listen` のスループットは変わりません。
@@ -366,9 +371,109 @@ path = "/var/www/index.html"
 | `tls_only = false` + `h2c_enabled = true`（同一ポートで自動判別） | `listen` と別ポートの `listen_cleartext` + `enable_secure_redirect = false` |
 | `http3_enabled = true`（+ `[http3] listen`） | `[http3] enabled = true`（+ 必要なら `[http3] listen`） |
 
-`http`（リダイレクト）と `h2c_listen`（h2c 配信）の両方を使っていた構成は、目的の違う 2 つのリスナーが要りましたが、
-`listen_cleartext` は 1 つのアドレスです。リダイレクトは別の veil インスタンス（またはロードバランサ）に任せるか、
-どちらかの動作を選んでください。
+`http`（リダイレクト）と `h2c_listen`（h2c 配信）の両方を使っていた構成は、目的の違う 2 つのリスナーが要ります。
+片方を `listen_cleartext` にし、もう片方を [`[[listener]]`](#複数のリスナーlistener) で足してください。
+
+### 複数のリスナー（`[[listener]]`）
+
+`[[listener]]`（`[[route]]` と同じ最上位の表の配列）で、同じプロセスにポートを足し、ポートごとにプロトコルの設定を
+変えられます（F-260）。`[server].listen`・`listen_cleartext` はそのまま使えます。veil はこれを `"tls"`・`"cleartext"`
+という名前の暗黙のリスナーにして（スレッド数・経路は今までと同じ）先に開き、続けて `[[listener]]` を書いた順に開きます。
+どちらの書き方でも、両方を混ぜても構いません。`[server]` 自体も省略できます。
+
+| キー | 既定 | 意味 |
+|------|------|------|
+| `name` | `"listener-<添字>"` | ログ・エラー・`redirect_to` で使う名前。重複は不可（`"tls"`・`"cleartext"` は暗黙のリスナーの名前） |
+| `listen` | 必須 | `host:port` か `unix:<path>` |
+| `tls` | 必須 | `true`: `[tls]` の証明書で TLS（HTTP/1.1 + ALPN の h2）。`false`: 平文の HTTP/1.1 + h2c（接続ごとにプロトコル検出） |
+| `http2` | `[server].http2_enabled` | TLS のみ。`false` は ALPN を出さないので、クライアントは必ず HTTP/1.1 で話す（h2 は選ばれない） |
+| `http3` | `false` | TLS のみ。同じアドレスの UDP で HTTP/3 も受ける（TCP のリスナーのみ。`http3` feature が要る） |
+| `http3_listen` | `listen` と同じ | HTTP/3 の UDP を別のアドレスにするとき（`http3 = true` が要る） |
+| `allow_http` | `true` | 平文のみ。`false` なら HTTP/1.1 は `426` |
+| `allow_h2c` | `true` | 平文のみ。`false` なら h2c は `GOAWAY(PROTOCOL_ERROR)` |
+| `secure_redirect` | **`false`** | 平文のみ。`true` なら要求をすべて `https://<Host>[:<ポート>]` へ `301` で返す |
+| `redirect_to` | 最初の TLS のリスナー | 平文のみ。リダイレクト先のポートを取る TLS のリスナー名（`secure_redirect = true` が要る） |
+| `unix_socket_permissions` | `[server].unix_socket_permissions` | `unix:<path>` のソケットファイルのパーミッション |
+| `threads` | `[server].threads` | このリスナーのワーカースレッド数 |
+
+`secure_redirect` の既定は `false` で、`[server].enable_secure_redirect`（既定 `true`）と違います。`[server]` の既定は
+平文だけの設定をうっかり公開しないためのもので、`[[listener]]` は 1 個ずつ明示して書くので、リダイレクトを頼まない限り
+平文のリスナーは平文で配ります。暗黙の `"cleartext"` リスナーは `[server]` の既定のままです。
+
+全リスナーで共有するもの（プロセスに 1 個）: 証明書（`[tls]`。SNI の複数証明書を含む）、ルート（`[[route]]`。分けたいときは
+`host`・`path` の条件で）、`[http2]`・`[http3]` のチューニング、`max_concurrent_connections`、`[admin]`・`[prometheus]`。
+`Alt-Svc` は HTTP/3 の最初のリスナーの UDP ポートを広告します。各リスナーは自分の `threads` 本のワーカースレッドを持ちます
+（`http3 = true` なら HTTP/3 のワーカーも同じ数）。
+
+検証規則（`veil -t`）。上の規則に加えて:
+
+- アドレスはすべて違うこと。リスナー同士・HTTP/3 の UDP・`[[l4]]` のリスナー・`[acme] challenge_listen` を比べ、
+  `0.0.0.0:p`（`[::]:p`）は任意の `addr:p` と重なるとみなします（`SO_REUSEPORT` では 2 回目の bind が失敗せず、接続が黙って分かれるため）。
+- 平文のリスナーに TLS のキー（`http2`・`http3`）、TLS のリスナーに平文のキー（`allow_http`・`allow_h2c`・`secure_redirect`・
+  `redirect_to`）を書くとエラー。知らないキーもエラー。
+- `redirect_to` は TLS のリスナーの名前であること。`secure_redirect = true` には TLS のリスナーが 1 個以上要る。
+- `[http3] enabled`・`[http3].listen` は `[server].listen` にだけ効く。`[[listener]]` では `http3 = true` を使う。
+- `[tls] client_auth` は HTTP/3 のリスナーと併用できない。
+
+リロード（SIGHUP）では `allow_http`・`allow_h2c`・`secure_redirect`・`redirect_to` が反映されます。リスナーの追加・削除・変更
+（名前・アドレス・`tls`・`http2`・`http3`・`threads` など）は警告を出して起動時の待ち受けのままにします。反映には再起動が要ります
+（[リロードで変えられない設定](running.md#リロードで変えられない設定)）。
+
+1 プロセスで 4 ポート（ベンチマーク HttpArena のプロトコルの構成）:
+
+```toml
+[server]
+http2_enabled = true
+
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path = "/etc/veil/key.pem"
+
+[[listener]]
+name = "plain"            # HTTP/1.1 + h2c
+listen = "0.0.0.0:8080"
+tls = false
+
+[[listener]]
+name = "https-h1"         # TLS で HTTP/1.1 だけ（ALPN で h2 を選ばない）
+listen = "0.0.0.0:8081"
+tls = true
+http2 = false
+
+[[listener]]
+name = "h2c"              # h2c だけ（HTTP/1.1 は 426）
+listen = "0.0.0.0:8082"
+tls = false
+allow_http = false
+
+[[listener]]
+name = "https"            # TLS の h2 + HTTP/1.1 と、UDP 8443 の HTTP/3
+listen = "0.0.0.0:8443"
+tls = true
+http3 = true
+```
+
+80 番を 443 へリダイレクトし、社内向けに別ポートで h2c を配る:
+
+```toml
+[[listener]]
+name = "https"
+listen = "0.0.0.0:443"
+tls = true
+
+[[listener]]
+name = "http"
+listen = "0.0.0.0:80"
+tls = false
+secure_redirect = true    # https://<Host>/ へ 301（443 はポートを省略）
+redirect_to = "https"
+
+[[listener]]
+name = "internal"
+listen = "10.0.0.5:8080"
+tls = false
+allow_http = false        # h2c だけ
+```
 
 ## HTTP to HTTPS リダイレクト
 
@@ -386,7 +491,8 @@ listen_cleartext = "0.0.0.0:80"  # HTTPS へリダイレクト（既定の動作
 
 - `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト（h2c クライアントには HTTP/2 の 301）
 - Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
-- **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用
+- **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用（`[[listener]]` では `redirect_to` のリスナー、
+  既定は最初の TLS のリスナーのポート）
   - listenポートが443の場合（デフォルト）: `https://example.com/path`（ポート省略）
   - listenポートが8443の場合: `https://example.com:8443/path`（ポート包含）
 

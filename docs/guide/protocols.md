@@ -125,6 +125,9 @@ Notes:
   (a separate port). With no `listen`, the server is plaintext-only and needs no `[tls]`.
 - There is no ALPN negotiation (prior knowledge). Do not expose plaintext listeners to untrusted networks.
 - See [Listeners](configuration.md#listeners-listen-and-listen_cleartext) for the full rules and the migration table.
+- To run several TLS and plaintext listeners in one process (for example HTTP/1.1-only TLS, h2c-only and
+  HTTP/2 + HTTP/3 on different ports), use `[[listener]]`; each listener sets its own `http2`, `http3`, `allow_http`
+  and `allow_h2c`. See [Multiple listeners](configuration.md#multiple-listeners-listener).
 
 ## HTTP/3 Support
 
@@ -156,6 +159,10 @@ listen = "0.0.0.0:443"
 [http3]
 enabled = true  # Enable HTTP/3 (QUIC/UDP) on listen's address; needs `listen` and [tls]
 ```
+
+`[http3] enabled` applies to `[server].listen`. A `[[listener]]` turns HTTP/3 on with its own `http3 = true`
+(UDP on the same address, or `http3_listen`); the other `[http3]` keys apply to every HTTP/3 listener, and
+`Alt-Svc` advertises the first one. See [Multiple listeners](configuration.md#multiple-listeners-listener).
 
 ### Advanced Configuration
 

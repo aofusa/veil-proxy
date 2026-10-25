@@ -177,6 +177,65 @@ server_header_enabled = true
 # server_header_value = "veil/1.0"
 
 
+# ====================
+# 複数のリスナー（[[listener]]、F-260）
+# ====================
+#
+# プロトコルの違う TCP ポートを 1 プロセスで複数開くときは、[[listener]] を並べます。
+# [server] の listen / listen_cleartext（と [http3] enabled）は名前 "tls" / "cleartext" の暗黙の
+# リスナーとして先頭に並び、併用できます。証明書（[tls]）・ルート・[http2]・[http3] の詳細キー・
+# セキュリティ設定は全リスナーで共通です。
+#
+# キー（name・listen・tls は全種類、http2/http3/http3_listen は TLS だけ、
+# allow_http/allow_h2c/secure_redirect/redirect_to は平文だけ。違う種類のキーは設定エラー）:
+#   name                    ログ・redirect_to で使う名前（既定 "listener-<添字>"。重複はエラー）
+#   listen                  "host:port" か "unix:<path>"（必須）
+#   tls                     true = TLS（[tls] の証明書）、false = 平文 HTTP/1.1 + h2c（必須）
+#   http2                   ALPN に h2 を出すか（既定: [server] http2_enabled）。false なら ALPN を出さない HTTP/1.1
+#   http3                   同じアドレスの UDP で HTTP/3 も受けるか（既定: false。http3 feature が必要）
+#   http3_listen            HTTP/3 の UDP を別アドレスにする（http3 = true のときだけ）
+#   allow_http / allow_h2c  平文で HTTP/1.1 / h2c を受けるか（既定: true。両方 false はエラー）
+#   secure_redirect         https へ 301 で返すか（既定: false。[server] の enable_secure_redirect と既定が違う）
+#   redirect_to             リダイレクト先のポートを取る TLS のリスナー名（既定: 最初の TLS のリスナー）
+#   threads                 このリスナーのワーカー数（既定: [server] threads）
+#   unix_socket_permissions unix:<path> のパーミッション（既定: [server] unix_socket_permissions）
+#
+# 同じアドレス（0.0.0.0:p と特定アドレスの :p も同じとみなす）をリスナー・[[l4]]・[acme] challenge_listen・
+# HTTP/3 の UDP で重ねるとエラーです。リロードではリスナーの増減・アドレスの変更は効かず（警告）、
+# allow_http・allow_h2c・secure_redirect は効きます。
+#
+# 例: 平文 HTTP/1.1 + h2c、HTTP/1.1 だけの TLS、h2c だけ、HTTP/1.1 + HTTP/2 + HTTP/3
+# [[listener]]
+# name = "plain"
+# listen = "0.0.0.0:8080"
+# tls = false
+#
+# [[listener]]
+# name = "h1tls"
+# listen = "0.0.0.0:8081"
+# tls = true
+# http2 = false
+#
+# [[listener]]
+# name = "h2c"
+# listen = "0.0.0.0:8082"
+# tls = false
+# allow_http = false
+#
+# [[listener]]
+# name = "https"
+# listen = "0.0.0.0:8443"
+# tls = true
+# http3 = true
+#
+# 例: 80 番を https（443）への 301 にする
+# [[listener]]
+# name = "redirect"
+# listen = "0.0.0.0:80"
+# tls = false
+# secure_redirect = true
+# redirect_to = "https"
+
 
 # ====================
 # ログ設定（非同期ログの最適化）
@@ -752,8 +811,10 @@ revalidate_mtime = false
 # 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
 # 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
 # allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
-#   - L4 リスナー・平文リスナー（listen_cleartext）・HTTP/3 の追加リスナーが無い
+#   - L4 リスナー（[[l4]]）と HTTP/3（[http3] enabled・[[listener]] の http3）が無い
 #     （cap_enter 後の bind が要るため）
+# 平文リスナー（listen_cleartext・[[listener]] の平文）と複数の TCP リスナーは阻害要因ではない
+# （全リスナーの全ワーカーの bind をバリアで待ってから入る。B-163）。
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
 # 上流へのプロキシ（F-182）: Proxy ルート・[upstreams] があっても capability mode に入れる。
 # cap_enter の前（特権降格の後）にサンドボックス外の接続ブローカー（veil 自身を再実行した

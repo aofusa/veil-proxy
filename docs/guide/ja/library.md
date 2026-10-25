@@ -198,7 +198,7 @@ Python の `veil.run(listen_cleartext="0.0.0.0:8080")`、または `VEIL_OVERRID
 （[ルーティングマクロ](#ルーティングマクロ)）。
 
 同じ合成が SIGHUP リロードのたびに行われるので、ビルダと環境変数の上書きは **リロード後も保たれます**。読み直されるのは
-`config.toml` の内容だけです。`[server] listen` / `listen_cleartext`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
+`config.toml` の内容だけです。`[server] listen` / `listen_cleartext`・`[[listener]]`・`[tls]`・`[[l4]]`・スレッド数の変更に再起動が要るのはプロキシと同じです。
 
 ### ビルダ
 
@@ -693,6 +693,31 @@ let config = Config::load()?.builder().listen("0.0.0.0:8443").tls("/etc/veil/cer
 サンドボックスは **既定でオフ** です。`enable_seccomp` / `enable_landlock` を有効にすることもできますが、ハンドラが行う操作
 （ファイル・ソケット・DNS）を許可する必要があります。
 
+### 複数のリスナー
+
+プロトコルの違うポートを複数開く（例: HTTP/1.1 だけの TLS、h2c だけ、HTTP/2 + HTTP/3）には、ポートごとに `Listener` を
+1 個足します。それぞれが `[[listener]]` の 1 項目になります（規則は[複数のリスナー](configuration.md#複数のリスナーlistener)）。
+
+```rust
+use veil::api::{Config, Listener};
+
+let config = Config::load()?
+    .builder()
+    .tls("/etc/veil/cert.pem", "/etc/veil/key.pem")
+    .listener(Listener::cleartext("0.0.0.0:8080").name("plain"))
+    .listener(Listener::tls("0.0.0.0:8081").name("h1tls").http2(false))
+    .listener(Listener::cleartext("0.0.0.0:8082").name("h2c").allow_http(false))
+    .listener(Listener::tls("0.0.0.0:8443").name("https").http3(true))
+    .build();
+```
+
+`Listener` のメソッド: `tls(addr)` / `cleartext(addr)`、`name`、`http2`、`http3`、`http3_listen`（`http3` を含む）、
+`allow_http`、`allow_h2c`、`secure_redirect`、`redirect_to(name)`（`secure_redirect` を含む）、`threads`、
+`unix_socket_permissions`。リスナーを 1 個でも足すと、ライブラリ既定の平文リスナー（`listen_cleartext = "127.0.0.1:8080"`）は
+`listen_cleartext` を自分で設定しない限り開きません。C では `veil_listener_t` を埋めてポートごとに
+`veil_config_add_listener(cfg, &l)` を呼び、Python では `veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`
+を渡します。
+
 ## メモリアロケータ
 
 veil をライブラリとして使う場合（`handler` feature を含むビルド。`api` は含む）は、veil は `#[global_allocator]` を
@@ -832,7 +857,7 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   `@veil.l4_udp(name, listen)`。
 - **GraphQL:** 好きなライブラリを普通のルートとして載せます。[examples/api/python-graphql/](../../../examples/api/python-graphql/)
   は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
-- 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
+- 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 文書全体（入門・FastAPI からの移行の対応表・API 一覧）は <https://veil-api.readthedocs.io> にあります（英語が正。日本語版は gettext で作る。手順は crates/veil-python/docs/conf.py の冒頭）。
 詳細は [crates/veil-python/README.md](../../../crates/veil-python/README.md)、サンプルは

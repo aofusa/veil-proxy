@@ -22,6 +22,9 @@ The following table lists default values for major configuration options:
 | `[server]` | `allow_http` | `true` | `listen_cleartext` accepts plaintext HTTP/1.1 (else 426) |
 | `[server]` | `allow_h2c` | `true` | `listen_cleartext` accepts h2c (else GOAWAY) |
 | `[http3]` | `enabled` | `false` | Enable HTTP/3 on `listen`'s address (UDP), or on `[http3].listen` |
+| `[[listener]]` | `tls` | required | One more listening port: `true` = TLS, `false` = plaintext (see [Multiple listeners](#multiple-listeners-listener)) |
+| `[[listener]]` | `http2` | `[server].http2_enabled` | TLS: offer h2 through ALPN |
+| `[[listener]]` | `secure_redirect` | `false` | Plaintext: answer with a 301 to HTTPS (note: `[server].enable_secure_redirect` defaults to `true`) |
 | `[logging]` | `level` | `"info"` | Log level |
 | `[logging]` | `format` | `"text"` | Log format |
 | `[logging]` | `channel_size` | `16384` | Log channel buffer size (slots are preallocated and resident, ~88 bytes each; full → messages are dropped, never blocking) |
@@ -356,6 +359,8 @@ Validation rules (`veil -t` reports them):
 - UDS: `listen` and `listen_cleartext` accept `unix:<path>`; HTTP/3 does not.
 - The removed keys below are a startup error naming the replacement; they are not silently ignored.
 
+For more than one TLS or plaintext port, add [`[[listener]]`](#multiple-listeners-listener) entries.
+
 `listen_cleartext` is served by every worker thread, like `listen` (the old `http` redirect listener ran on one
 thread). An idle worker set costs roughly 2 MB of RSS per worker, so a TLS + redirect setup uses a few MB more than
 before; throughput on `listen` is unchanged.
@@ -374,9 +379,111 @@ with no compatibility layer.
 | `tls_only = false` + `h2c_enabled = true` (one port auto-detecting) | `listen` and a separate `listen_cleartext` port + `enable_secure_redirect = false` |
 | `http3_enabled = true` (+ `[http3] listen`) | `[http3] enabled = true` (+ `[http3] listen` if needed) |
 
-A configuration that had both `http` (redirect) and `h2c_listen` (served h2c) needs two listeners for two purposes;
-`listen_cleartext` is a single address, so run the redirect on a separate veil instance (or let your load balancer
-do it) or choose one behavior.
+A configuration that had both `http` (redirect) and `h2c_listen` (served h2c) needs two listeners for two purposes:
+keep one as `listen_cleartext` and add the other as a [`[[listener]]`](#multiple-listeners-listener).
+
+### Multiple listeners (`[[listener]]`)
+
+`[[listener]]` (a top-level array, like `[[route]]`) opens more ports in the same process, each with its own protocol
+settings (F-260). `[server].listen` and `listen_cleartext` keep working: veil turns them into implicit listeners named
+`"tls"` and `"cleartext"` (same threads and code path as before) and opens them first, followed by the
+`[[listener]]` entries in order. A configuration may use either form or both; `[server]` itself may be omitted.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `name` | `"listener-<index>"` | Used in logs, errors and `redirect_to`. Names must be unique (`"tls"` and `"cleartext"` are taken by the implicit listeners) |
+| `listen` | required | `host:port` or `unix:<path>` |
+| `tls` | required | `true`: TLS with the `[tls]` certificate (HTTP/1.1 + h2 through ALPN). `false`: plaintext HTTP/1.1 + h2c, detected per connection |
+| `http2` | `[server].http2_enabled` | TLS only. `false` offers no ALPN, so clients always speak HTTP/1.1 (h2 is never selected) |
+| `http3` | `false` | TLS only. Also serve HTTP/3 on the same address over UDP (TCP listeners only; needs the `http3` feature) |
+| `http3_listen` | same as `listen` | The UDP address of HTTP/3 when it differs (needs `http3 = true`) |
+| `allow_http` | `true` | Plaintext only. `false` answers HTTP/1.1 with `426` |
+| `allow_h2c` | `true` | Plaintext only. `false` answers h2c with `GOAWAY(PROTOCOL_ERROR)` |
+| `secure_redirect` | **`false`** | Plaintext only. `true` answers every request with `301` to `https://<Host>[:<port>]` |
+| `redirect_to` | first TLS listener | Plaintext only. The TLS listener whose port the redirect uses (needs `secure_redirect = true`) |
+| `unix_socket_permissions` | `[server].unix_socket_permissions` | Mode of a `unix:<path>` socket file |
+| `threads` | `[server].threads` | Worker threads of this listener |
+
+`secure_redirect` defaults to `false`, unlike `[server].enable_secure_redirect` (`true`): the `[server]` default
+keeps a plaintext-only configuration from being published by accident, while every `[[listener]]` is written out
+explicitly, so a plaintext listener serves plaintext unless you ask for the redirect. The implicit `"cleartext"`
+listener keeps the `[server]` default.
+
+Shared by all listeners (one per process): the certificate (`[tls]`, including SNI certificates), the routes
+(`[[route]]` — use `host` / `path` conditions to separate traffic), the `[http2]` / `[http3]` tuning,
+`max_concurrent_connections`, `[admin]` and `[prometheus]`. `Alt-Svc` advertises the UDP port of the first listener
+with HTTP/3. Each listener runs its own `threads` worker threads (and as many HTTP/3 workers when `http3 = true`).
+
+Validation rules (`veil -t`), in addition to the ones above:
+
+- Every address must be different: listeners, HTTP/3 UDP addresses, `[[l4]]` listeners and `[acme] challenge_listen`
+  are compared, and `0.0.0.0:p` (or `[::]:p`) overlaps any `addr:p` (with `SO_REUSEPORT` a second bind would
+  silently split the connections instead of failing).
+- TLS keys on plaintext listeners (`http2`, `http3`) and plaintext keys on TLS listeners (`allow_http`, `allow_h2c`,
+  `secure_redirect`, `redirect_to`) are errors, as are unknown keys.
+- `redirect_to` must name a TLS listener; `secure_redirect = true` needs at least one TLS listener.
+- `[http3] enabled` / `[http3].listen` apply only to `[server].listen`; use `http3 = true` on a `[[listener]]`.
+- `[tls] client_auth` cannot be combined with any HTTP/3 listener.
+
+A reload (SIGHUP) applies `allow_http`, `allow_h2c`, `secure_redirect` and `redirect_to`. Adding, removing or
+changing a listener (name, address, `tls`, `http2`, `http3`, `threads`, ...) logs a warning and keeps the listeners
+opened at startup; restart veil to apply it (see [Settings that reload cannot change](running.md#settings-that-reload-cannot-change)).
+
+Four ports in one process (the protocol layout of the HttpArena benchmark):
+
+```toml
+[server]
+http2_enabled = true
+
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path = "/etc/veil/key.pem"
+
+[[listener]]
+name = "plain"            # HTTP/1.1 + h2c
+listen = "0.0.0.0:8080"
+tls = false
+
+[[listener]]
+name = "https-h1"         # TLS, HTTP/1.1 only (ALPN never selects h2)
+listen = "0.0.0.0:8081"
+tls = true
+http2 = false
+
+[[listener]]
+name = "h2c"              # h2c only (HTTP/1.1 gets 426)
+listen = "0.0.0.0:8082"
+tls = false
+allow_http = false
+
+[[listener]]
+name = "https"            # TLS h2 + HTTP/1.1, and HTTP/3 on UDP 8443
+listen = "0.0.0.0:8443"
+tls = true
+http3 = true
+```
+
+Redirect port 80 to 443 and serve h2c to internal clients on another port:
+
+```toml
+[[listener]]
+name = "https"
+listen = "0.0.0.0:443"
+tls = true
+
+[[listener]]
+name = "http"
+listen = "0.0.0.0:80"
+tls = false
+secure_redirect = true    # 301 to https://<Host>/ (port 443 is omitted)
+redirect_to = "https"
+
+[[listener]]
+name = "internal"
+listen = "10.0.0.5:8080"
+tls = false
+allow_http = false        # h2c only
+```
 
 ## HTTP to HTTPS Redirect
 
@@ -394,7 +501,8 @@ listen_cleartext = "0.0.0.0:80"  # redirects to HTTPS (the default behavior)
 
 - Access to `http://example.com/path` is redirected to `https://example.com/path` with 301 (h2c clients get an HTTP/2 301)
 - Domain name is extracted from the Host header to construct the redirect URL
-- **Port handling**: The redirect URL uses the port from the `[server].listen` setting
+- **Port handling**: The redirect URL uses the port from the `[server].listen` setting (for a `[[listener]]`, the
+  port of its `redirect_to` listener, by default the first TLS listener)
   - If listen port is 443 (default): `https://example.com/path` (port omitted)
   - If listen port is 8443: `https://example.com:8443/path` (port included)
 
