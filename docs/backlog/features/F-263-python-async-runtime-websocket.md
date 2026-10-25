@@ -66,7 +66,11 @@ async def ws(websocket: veil.WebSocket):
   （ワーカーは 101 を書かずに待つ。F-261 の `switching_protocols` を「承認を待つ」形で使う）。
 - 同期の書き方: `class Echo(veil.WebSocketEndpoint)` の `on_connect` / `on_receive` / `on_disconnect`（Starlette と同じ名前）を
   ハンドラ用プールで 1 本ずつ呼ぶ（L4 の `veil.Protocol` と同じイベント型。プールを長く占有しない）。
-- OpenAPI には載せない（FastAPI と同じ）。
+- **OpenAPI に載せる**（2026-10-25 の依頼。FastAPI は載せないが veil は載せる）: 形は F-262 の「1.1 OpenAPI への掲載」と同じ
+  （`GET` + 101・パラメータ・`x-veil-websocket`）。`@app.websocket("/ws", receive=ChatIn, send=ChatOut, subprotocols=["chat.v1"], tags=[...], summary=...)`
+  の pydantic のモデルを `receive`・`send` のスキーマにする（`model_json_schema`）。`validate=True` なら `receive_json` で受けた値を検証し、
+  違反は 1007 で閉じる。Python の OpenAPI は今どおり純 Python で作り（`Route.openapi()`）、`OperationMeta.raw` で Rust へ渡す。
+  `include_in_schema=False` で載せない（FastAPI と同じ名前）。
 
 ### 4. プロトコルアップグレード（WebSocket 以外）
 
@@ -94,6 +98,10 @@ async def ws(websocket: veil.WebSocket):
   エコー（16,384 接続・16 件まとめ送り・10 メッセージごとの切断）、`WebSocketEndpoint`、`accept` しないと 403、
   アップグレードの独自プロトコル、Autobahn の fuzzingclient（Python のエコーで 1.*〜7.*）。
 - 互換: FastAPI の `WebSocket` のサンプル（公式文書のチャット）を import の差し替えだけで動かす。
+- OpenAPI: `@app.websocket` のルートが F-262 と同じ形で載り、`include_in_schema=False` で消える。
+- DB・キャッシュのクライアント（2026-10-25 追記。HttpArena の async-db・gateway・production-stack は framework で採点対象で、Postgres・Redis を使う）:
+  asyncpg（`create_pool`・`DATABASE_MAX_CONN` で大きさを決める）と `redis.asyncio` が常駐のループの上で動き、32K の同時要求でも
+  プールが詰まらないこと。`uvloop` の有無の両方で。
 - 性能（`tools/api-bench/python`）: `async def` の `/plaintext`・`/json` を旧来（`pool`）・常駐のループ・FastAPI + uvicorn で交互に比べる
   （常駐のループが旧来より遅くならないこと。遅いなら既定を見直す）。同期のハンドラの数値が変わらないこと。
 

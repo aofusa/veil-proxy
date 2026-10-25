@@ -63,6 +63,7 @@ gRPC-JSON の変換（transcoding）は範囲外。
 - `[api] openapi_grpc`（新設、既定 `true`。依頼どおり既定で載せる）。`false` で今と同じ。
 - Swagger UI（F-264 の同梱版）で gRPC の操作の「Try it out」を消す: 初期化スクリプトの `plugins` に、`x-grpc` を持つ操作の
   `tryItOutEnabled` を false にする小さなプラグインを入れる（同梱する JS は 1 個のまま。HTML の初期化スクリプトの中）。
+  同じプラグインで WebSocket の操作（`x-veil-websocket`、F-262・F-263）も対象にする。
   タグ「gRPC: <service>」の説明に、grpcurl の例（`grpcurl -plaintext host:port list`）を入れる（リフレクションが有効なとき）。
 
 ## 試験

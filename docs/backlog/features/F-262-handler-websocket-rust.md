@@ -48,7 +48,35 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
 - `WebSocket`: `recv()`・`send(Message)`・`send_batch(&[Message])`（まとめて 1 回の `writev`）・`close(code, reason)`・
   `split()`（読み手と書き手。書き手は `Clone` できる送信キュー。別タスクから送る用途）・`ping(Bytes)`。
   `Message = Text(Utf8Bytes) | Binary(Bytes) | Ping(Bytes) | Pong(Bytes) | Close(Option<CloseFrame>)`。
-- マクロ・OpenAPI: `WebSocketUpgrade` を引数に持つルートは OpenAPI に `GET` + 応答 `101` で載せる（`x-veil-websocket: true`）。
+- マクロ・OpenAPI: WebSocket のルートを **OpenAPI に載せる**（2026-10-25 の依頼。下の「OpenAPI への掲載」）。
+
+### 1.1 OpenAPI への掲載（Rust・C・Python で共通の形）
+
+OpenAPI 3.1 に WebSocket の型は無いので、ハンドシェイク（HTTP の `GET` → 101）を操作として書き、メッセージは拡張で書く:
+
+```json
+"/ws": { "get": {
+  "operationId": "ws_chat", "tags": ["chat"], "summary": "Chat (WebSocket)",
+  "parameters": [ {"name": "room", "in": "query", "schema": {"type": "string"}},
+                  {"name": "Sec-WebSocket-Protocol", "in": "header", "schema": {"type": "string", "enum": ["chat.v1"]}} ],
+  "responses": {
+    "101": { "description": "Switching Protocols (WebSocket)",
+             "headers": { "Upgrade": {"schema": {"const": "websocket"}}, "Sec-WebSocket-Accept": {"schema": {"type": "string"}},
+                          "Sec-WebSocket-Protocol": {"schema": {"type": "string"}} } },
+    "400": { "description": "Not a valid WebSocket handshake" },
+    "426": { "description": "Unsupported Sec-WebSocket-Version" } },
+  "x-veil-websocket": { "subprotocols": ["chat.v1"], "maxMessageSize": 16777216,
+    "receive": { "$ref": "#/components/schemas/ChatIn" }, "send": { "$ref": "#/components/schemas/ChatOut" },
+    "messageFormat": "text/json" } } }
+```
+
+- パス引数・クエリ引数・ヘッダは通常のルートと同じ規則で載る。`receive`（クライアント → サーバ）・`send`（サーバ → クライアント）は任意:
+  Rust は `upgrade.messages::<ChatIn, ChatOut>()`（`derive(Schema)` の型。指定すると受信した JSON のテキストを検証し、違反は 1007 で閉じる
+  オプション `validate(true)` も付く）、マクロの属性 `#[veil::route(..., ws_receive = ChatIn, ws_send = ChatOut)]` でも書ける。
+  C は `veil_register_route_ex` の操作の JSON（`OperationMeta.raw`）に書く。Python は F-263 の `@app.websocket(..., receive=Model, send=Model)`。
+- Swagger UI（F-264 の同梱版）: WebSocket の操作は「Try it out」を消し（F-265 の gRPC と同じプラグインで `x-veil-websocket` も対象にする）、
+  説明に接続の例（`websocat ws://host/ws`・ブラウザの `new WebSocket(...)`）とメッセージの例を出す。
+- `[api] openapi_websocket`（新設、既定 `true`）で載せない選択もできる。AsyncAPI の文書の生成は範囲外（後続の候補）。
 
 ### 2. フレームの処理（`src/api/ws/codec.rs`）
 
@@ -91,11 +119,23 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
 | `websocket_ping_interval_secs` | 0 | サーバからの Ping の間隔（0 = 送らない） |
 | `websocket_idle_timeout_secs` | 0 | 受信の無い接続を閉じるまで（0 = 無し） |
 | `websocket_compression` | false | permessage-deflate（第 2 段） |
+| `openapi_websocket` | true | WebSocket のルートを OpenAPI に載せる（1.1） |
+
+### 6. メトリクス（2026-10-25 追記）
+
+- `veil_websocket_connections`（開いている WebSocket の数の `IntGauge`、ラベル無し）と `veil_websocket_messages_total{direction}`
+  （`metrics` feature のとき）。アップグレードで接続を引き取る点（F-261）で増やし、drop の守り（`ActiveConnectionMetric` と同じ形）で減らす。
+  プロキシの WebSocket の中継にはゲージが無いが、本チケットでは触れない（本体の変更になるため。必要なら別チケット）。
 
 ## 試験
 
 - 単体: フレームの符号化・復号（断片化・制御フレームの割り込み・マスク・UTF-8 の断片またぎ・上限・予約ビット・未知の opcode）、
   `Sec-WebSocket-Accept` の RFC 6455 §1.3 の例、ハンドシェイクの検査（版違い 426・鍵の長さ）。ファジング: `fuzz/` に復号器の対象を 1 個。
+- HttpArena の `scripts/validate-ws.py` と同じ確認（2026-10-25 の調査で追記）: 接続ごとに違う `Sec-WebSocket-Accept`、テキストのエコー、
+  **バイナリ（opcode 2、256 バイト）のエコー**、続けて送った 5 件が順に返る、**Close 1000 に 1000 の Close を返す**、
+  **アップグレードのヘッダの無い `GET /ws` は 4xx（400 か 426。5xx・101 は不可）**、一連の試験の後もサーバが応答する。
+- OpenAPI: WebSocket のルートが上の形で載る（パラメータ・サブプロトコル・`receive`/`send` のスキーマ）、`openapi_websocket = false` で消える、
+  Swagger UI で Try it out が出ない。
 - **Autobahn TestSuite**（`crossbario/autobahn-testsuite` の fuzzingclient、1.* 〜 7.*・9.*（性能）・12/13（圧縮、第 2 段））を
   `tests/api/library_e2e.sh websocket` から回し、全項目 OK / NON-STRICT（INFORMATIONAL を除く）。io_uring・epoll・TLS。
 - E2E: 16,384 接続のエコー（`ulimit` を上げて）、16 件まとめ送りの往復、10 メッセージごとの切断の繰り返し（ハンドシェイクの費用）、

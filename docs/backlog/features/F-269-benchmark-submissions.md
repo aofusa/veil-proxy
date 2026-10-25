@@ -28,6 +28,18 @@
 作業の場所は今の計画と同じく `docs/artifacts/benchmark/`（git 管理外）。task.md は v0.10.0 用に改訂する（v0.8.4 の版は
 `task-v0.8.4.md` として残す）。
 
+### 作業場所の決まり（2026-10-25 の依頼）
+
+- **veil のリポジトリに影響を出さない**: 提出物・clone した各ベンチマークのリポジトリ・fork の作業ツリー・計測の記録は、すべて
+  `docs/artifacts/benchmark/` の下（`.gitignore` の `docs/*` で git の管理外）に置く。
+  - `docs/artifacts/benchmark/entries/`（提出物の正本: `httparena/veil`・`httparena/veil-api`・`httparena/veil-python`・`the-benchmarker/veil`）
+  - `docs/artifacts/benchmark/work/HttpArena`・`work/web-frameworks`（clone と fork の作業ツリー。各リポジトリの中で branch を切って PR にする）
+  - `docs/artifacts/benchmark/results/`・`pr/`・`findings.md`
+- veil のリポジトリ側のファイル（`src/`・`crates/`・`docs/guide` 等）は本チケットでは変えない。作業の前後で `git status` が clean
+  （`docs/artifacts/` は管理外なので出ない）であることを確かめる。clone したリポジトリは入れ子の git なので、veil の `git add` に
+  巻き込まない（ディレクトリごと `git add` しない）。
+- 本体の不具合・不足が見つかったら、本体のチケットを起票して（直すのは本チケットの外）、そのプロファイルは購読から外す。
+
 ## 手順
 
 ### 0. 前提の確認（公開の前に本体側で済ませること）
@@ -40,11 +52,38 @@
   - 1 プロセス 4 リスナーの構成で、8081 が h2 を選ばない・8082 が h2c・8443 が h2 + h3。
   - Python の wheel の README の「Linux uses io_uring」の誤り（epoll）を直す（文書の修正。v0.10.0 の前に入れる）。
 
+### 0.1 2026-10-25 の調査で分かった検証・規則の要点（HttpArena main @2454978、web-frameworks @c9e3667）
+
+- **採点の対象**（`scripts/gen_leaderboard_data.py`）:
+  - infrastructure: baseline・pipelined・limited-conn・json-tls・static-tls・baseline-h2・static-h2・baseline-h3・static-h3。
+  - framework: baseline・limited-conn・async・latency-10k・latency-1m・json-comp・json-tls・8gbit・baseline-h2・static-h2・baseline-h2c・json-h2c・
+    baseline-h3・static-h3・unary-grpc・unary-grpc-tls・gateway-64・gateway-h3・production-stack・echo-ws 系 3 つ。pipelined・static-tls・
+    async-db・fortunes・latency-500k-8cpu は参考のみ。**出さないプロファイルはその列が 0** なので、幅が効く。
+- **validate はブリッジ網 + `-p`** で動く（DB・gateway を除く）。全リスナーを `0.0.0.0` に bind する（ライブラリの既定の `127.0.0.1` では落ちる）。
+  30 秒以内に応答すること。UDP 8443 は Docker の NAT 越し。
+- **分割到着の検査**（`scripts/validate-frag.py`）: 9 種の要求を全バイト位置で分割（chunked のサイズ行の途中・`0\r\n\r\n` の途中を含む）、
+  `Connection: close` の後に閉じる、小文字のヘッダ名。**本体の実装前に今の main の veil へ当てて、不具合があれば本体のチケットにする**。
+- **json-comp**: `Accept-Encoding: gzip, br` → `Content-Encoding: gzip|br` 必須、無ければ付けない、点は小ささの 2 乗。F-270 が前提。
+- **静的配信の追従**: 同じサイズの `mv` の差し替えに framework は 2 秒・infrastructure は 30 秒。F-272 が前提。
+- **8gbit**: `POST /echo` の空の本文に 200（411 は不可）、1B〜100KB・chunked をバイト一致。
+- **TLS の姿勢**: マウントした RSA-2048 の証明書（指紋で確認）、TLS 1.3 を選ぶ、提示されていない ALPN を返さない、古い版・弱い暗号を拒否。
+- **gRPC**: 8080 で HTTP/1.1 と h2c の自動判別、standard は「標準の gRPC ライブラリ」→ Rust は prost + `veil-build`、Python は grpcio-tools の
+  生成コード + `veil.grpc.Server`（F-268）。
+- **WebSocket**: F-262 の試験に追記した `validate-ws.py` の項目。
+- **async-db・fortunes**（参考）・**gateway-64・gateway-h3・production-stack**（framework で採点）: Postgres 18（`DATABASE_URL`・`DATABASE_MAX_CONN=256`）、
+  Redis、fortunes は自動エスケープするテンプレートエンジン（Rust は askama 等、Python は Jinja2）を別ファイルで。gateway の standard は
+  プロキシに「広く使われる本番級」（nginx・Caddy・Envoy・HAProxy・Traefik）を要るので、**veil-api・veil-python はサーバ側として nginx の後ろに置く**。
+  Rust は tokio-postgres・sqlx・redis を `veil::tokio` 上で、Python は asyncpg・`redis.asyncio` を常駐のループ上で使う（F-263 に試験を追記）。
+- **standard の設定**: 「公式の本番ガイドが推奨する設定」だけ → F-274 のガイドに書いた設定だけを使う。
+- **ルールに無いもの**: 複数プロセスを禁じる規則は無い（fastapi が先例）が、F-260 で 1 プロセスにする。
+- **the benchmarker**: `python:3.15-slim`（abi3 の wheel が入る）、既定のエンジンは gunicorn なので `config.yaml` の `language.engines.veil.command`
+  で上書き、`POST /user` は本文の無い要求で 2xx、CI は `curl -f http://127.0.0.1:3000/` を最大 120 秒待つ、Docker 既定の seccomp。
+
 ### 1. A（infrastructure、`veil`）
 
 - 設定: `[[listener]]` 4 個（8080 平文 HTTP/1.1 + h2c、8081 TLS `http2 = false`、8082 h2c のみ、8443 TLS `http3 = true`）、
-  `/static` の File（`open_file_cache` + `static_file_cache`、追従は 30 秒未満）、動的なエンドポイントは Proxy-Wasm（JSON は要求ごとに直列化）、
-  アクセスログ無効。
+  `/static` の File（`open_file_cache` + `static_file_cache`、`watch = true`（F-272））、動的なエンドポイントは Proxy-Wasm（JSON は要求ごとに直列化）を
+  `type = "Respond"` + モジュール（F-271）で、データセットは `data_files`（F-271）、POST の本文は本文フェーズ（F-271）、アクセスログ無効。
 - task.md の 2 章（Wasm のモジュール・R2・R3）と 5 章（複数プロセス）を見直す: 5 章は不要になる。
 - `tests` は validate を通ったものだけ。WebSocket は infrastructure ではスコア対象外なので購読しない。
 

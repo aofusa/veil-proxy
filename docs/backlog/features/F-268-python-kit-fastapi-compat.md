@@ -21,6 +21,18 @@ Python のライブラリ利用でも Rust（[F-267](F-267-rust-kit-crate.md)）
 - **本体・性能への影響を出さない**: どちらも `crates/veil-python` と純 Python の範囲（本体のバイナリは変わらない）。FastAPI 互換の
   束縛は登録時に解決し、使わないルートの要求の経路は今と同じ（`tools/api-bench/python` で確かめる）。
 
+## 使う外部のライブラリ（2026-10-25 追記。依存は `veil-api-kit` の extras に閉じ、`veil-api` 本体は増やさない）
+
+| 用途 | ライブラリ | どこで・どう使うか |
+|---|---|---|
+| GraphQL | **strawberry**（`veil-api-kit[graphql]`） | `veil_kit.graphql.mount(app, "/graphql", schema)`。strawberry の `Schema.execute`（非同期）を常駐のループ（F-263）で呼ぶ。サブスクリプションは strawberry の非同期ジェネレータを SSE と WebSocket（`graphql-transport-ws`）へ流す。GraphiQL は同梱（オフライン、F-264 と同じ方法）。graphene・ariadne は同じ形で書ける例を文書に置く（依存にはしない） |
+| gRPC のコード生成 | **grpcio-tools**（開発時の依存。`python -m grpc_tools.protoc`） | 生成した `_pb2.py`・`_pb2_grpc.py` をそのまま使う: サーバは `veil.grpc.Server` に `add_XxxServicer_to_server(servicer, server)` を呼ぶ（今の互換層）、クライアントは生成した `XxxStub(channel)` に 4. の `veil_kit.grpc.Channel` を渡す |
+| gRPC の実行時 | **protobuf**（メッセージの `SerializeToString`・`FromString`）。**grpcio は任意**（`veil-api-kit[grpcio]`） | veil の経路では grpcio の C 拡張・スレッドを使わない（直列化だけ protobuf）。grpcio の本物のチャネル・`grpc.aio` を併用してもよい（干渉しないことを試験で確かめる） |
+| JWT | PyJWT（`veil-api-kit[jwt]`） | `veil_kit.security` の JWT の検証 |
+| pydantic | pydantic v2（任意、今と同じ） | 引数・`response_model`・WebSocket の `receive`/`send` のスキーマ |
+| ASGI のアプリ | FastAPI・Starlette 等（利用者が入れる） | `veil.asgi`（下の 2.）。veil は FastAPI に依存しない |
+| イベントループ | uvloop（任意） | F-263 の常駐のループ |
+
 ## 設計
 
 ### 1. FastAPI の書き方との互換（`veil-api`）
@@ -62,6 +74,19 @@ app.mount("/legacy", api)                           # /legacy 以下を ASGI へ
   重いルートからネイティブへ移す手順を書く。
 - WSGI（Flask・Django）は範囲外（後続の候補。`a2wsgi` のような変換で ASGI 経由なら動くことは文書に書く）。
 
+#### ASGI を入れたときの影響（2026-10-25 追記）
+
+| 対象 | 影響 | 対策 |
+|---|---|---|
+| veil 本体（プロキシ・Web サーバのバイナリ） | **無し**（`crates/veil-python` の中だけ。`nonregression` で確かめる） | – |
+| ASGI を使わないアプリ | **無し**（`veil.asgi` を import しなければ何も起動しない。常駐のループも F-263 の `async def` のためのもので、ASGI のためには増えない） | – |
+| 同じプロセスのネイティブのルート（`mount` で混ぜたとき） | ASGI のアプリはループのスレッドで GIL を長く持つ（1 要求でスコープの dict・`receive`/`send` のコルーチン・ミドルウェアの層を Python で回す）。同期のハンドラ（プールのスレッド）・`async def` のハンドラ（同じループ）と GIL・ループを取り合い、ネイティブのルートの遅延とスループットが下がる | `app.mount("/legacy", api, event_loops=1)` で **ASGI 専用のループ** を分けられるようにする（既定は分ける）。GIL の取り合いは残るので、文書に「高い要求率のルートはネイティブへ移す」と書き、混ぜたときの性能を計測して載せる |
+| ASGI のアプリ自身の性能 | ASGI のアプリが律速（FastAPI の依存の解決・pydantic・Starlette のミドルウェア）。veil が受け持つ HTTP の解析・TLS・HTTP/2・HTTP/3・圧縮の分だけ uvicorn より軽い見込み。本文は ASGI の仕様上 `bytes` に 1 回写す | uvicorn・granian と交互に測って文書に載せる（目標: uvicorn より速い） |
+| ループを止める同期の処理 | ASGI のアプリの `async def` の中の同期の I/O はループ全体を止める（uvicorn と同じ） | ASGI 専用のループに分けて、ネイティブの `async def` に波及させない |
+| メモリ | FastAPI・Starlette・pydantic の import（数十 MB） | `veil.asgi` を使ったときだけ |
+| 機能の差 | ASGI のアプリには veil の Python の機能（`Depends` の登録時の解決・OpenAPI の統合）が効かない。OpenAPI は FastAPI のものが `/legacy/openapi.json` に出る | 文書の対応表に書く。veil の `/openapi.json` に ASGI 側の文書を合成するかは後続の候補 |
+| ベンチマーク | HttpArena の veil-python はネイティブのルートで出す（ASGI は使わない）。ASGI のホストとしての提出（engine 区分）は後続の候補 | – |
+
 ### 3. `veil-api-kit`（`veil_kit`）
 
 | モジュール | extras | 内容 |
@@ -87,6 +112,9 @@ app.mount("/legacy", api)                           # /legacy 以下を ASGI へ
   - grpcio を入れずに使える（protobuf のメッセージの `SerializeToString` / `FromString` だけ使う）。grpcio の本物のチャネルも
     そのまま使えることを文書に書く（grpcio は自前のスレッドを持つので、veil のプールと干渉しないことを確かめる）。
 - Rust の土台に Python の束縛を足すのは `crates/veil-python/src/`（`grpc_client.rs`）。
+- ベンチマーク（HttpArena の unary-grpc）の standard は「その言語の標準の gRPC ライブラリを使い、protobuf の直列化を自前で書かない」。
+  依存の無い `veil.grpc.unary_unary`（直列化を利用者が渡す低水準の口）は自前の実装と見なされる恐れがあるので、提出物は
+  **grpcio-tools で生成した `_pb2.py`・`_pb2_grpc.py` + `veil.grpc.Server`（`add_XxxServicer_to_server` をそのまま呼ぶ）** を使う（F-269）。
 
 ### 5. 動的な DI（`veil_kit.di`）
 

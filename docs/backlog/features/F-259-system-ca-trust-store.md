@@ -131,6 +131,12 @@ pub fn default_roots() -> Arc<RootCertStore>;
   リリースノートに書く。
 - パッケージの更新は利用者の設定を上書きしない（F-251 等の約束）ので、既に入れている人の既定は変わらない。新しく入れた人から `"system"`。
 
+## 他のチケットとの関係（2026-10-25 追記）
+
+- [F-267](F-267-rust-kit-crate.md) の `veil::api::client`（HTTP・gRPC のクライアント）と [F-268](F-268-python-kit-fastapi-compat.md) の Python の gRPC の
+  チャネルは、信頼アンカーに `[tls_client] ca` と上流ごとの `tls_ca` と同じ値（`"system"`・`"builtin"`・PEM・配列）を使う
+  （本チケットの `trust_store::roots` を共有する。クライアントの builder の `.ca(..)` も同じ型を受ける）。
+
 ## 試験
 
 - 単体（`src/trust_store.rs`）: 文字列・配列の解析、`"./system"` はパス、`builtin` と PEM の和、0 個はエラー、
