@@ -22,6 +22,12 @@ http2_enabled = true
 # 0 = one worker per CPU.
 threads = 0
 
+[tls_client]
+# Trust anchors for TLS connections that veil makes (upstream HTTPS, health checks, VDS/ACME, Wasm calls):
+# "builtin" = the CA list compiled into veil, "system" = the OS trust store, or a PEM file path (or an array).
+# The OS store is read once at startup (restart veil after the OS updates its CAs).
+ca = "builtin"
+
 [logging]
 level = "info"
 

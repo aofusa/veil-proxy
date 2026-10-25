@@ -12,20 +12,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEF="$ROOT/packaging/defaults"
 
-# channel | listen | www dir | security | performance | header
+# channel | listen | www dir | security | performance | header | trust store for outgoing TLS (F-259)
 CHANNELS="
-container|0.0.0.0:8080|/var/www/|linux-container|linux|container
-linux-package|127.0.0.1:8080|/usr/share/veil/www/|linux-package|linux|linux-package
-archive-linux|127.0.0.1:8080|examples/www/|linux-user|linux|archive
-archive-macos|127.0.0.1:8080|examples/www/|macos|none|archive
-archive-windows|127.0.0.1:8080|examples/www/|windows|none|archive
-archive-freebsd|127.0.0.1:8080|examples/www/|freebsd-user|none|archive
-archive-openbsd|127.0.0.1:8080|examples/www/|openbsd-user|none|archive
-archive-netbsd|127.0.0.1:8080|examples/www/|netbsd-user|none|archive
-winget|127.0.0.1:8080|C:\\ProgramData\\veil\\www\\|windows|none|winget
-ports-freebsd|127.0.0.1:8080|/usr/local/share/veil/www/|freebsd-package|none|ports-freebsd
-ports-openbsd|127.0.0.1:8080|/usr/local/share/veil/www/|openbsd-package|none|ports-openbsd
-ports-netbsd|127.0.0.1:8080|/usr/pkg/share/veil/www/|netbsd-package|none|ports-netbsd
+container|0.0.0.0:8080|/var/www/|linux-container|linux|container|builtin
+linux-package|127.0.0.1:8080|/usr/share/veil/www/|linux-package|linux|linux-package|system
+archive-linux|127.0.0.1:8080|examples/www/|linux-user|linux|archive|system
+archive-macos|127.0.0.1:8080|examples/www/|macos|none|archive|system
+archive-windows|127.0.0.1:8080|examples/www/|windows|none|archive|system
+archive-freebsd|127.0.0.1:8080|examples/www/|freebsd-user|none|archive|system
+archive-openbsd|127.0.0.1:8080|examples/www/|openbsd-user|none|archive|system
+archive-netbsd|127.0.0.1:8080|examples/www/|netbsd-user|none|archive|system
+winget|127.0.0.1:8080|C:\\ProgramData\\veil\\www\\|windows|none|winget|system
+ports-freebsd|127.0.0.1:8080|/usr/local/share/veil/www/|freebsd-package|none|ports-freebsd|system
+ports-openbsd|127.0.0.1:8080|/usr/local/share/veil/www/|openbsd-package|none|ports-openbsd|system
+ports-netbsd|127.0.0.1:8080|/usr/pkg/share/veil/www/|netbsd-package|none|ports-netbsd|system
 "
 
 header() {
@@ -86,8 +86,8 @@ render() {
     local channel="$1" out="$2" www_override="${3:-}"
     local line; line="$(grep "^${channel}|" <<<"$CHANNELS" || true)"
     [ -n "$line" ] || { echo "error: unknown channel: $channel (see --list)" >&2; exit 2; }
-    local listen www sec perf hdr
-    IFS='|' read -r _ listen www sec perf hdr <<<"$line"
+    local listen www sec perf hdr client_ca
+    IFS='|' read -r _ listen www sec perf hdr client_ca <<<"$line"
     [ -n "$www_override" ] && www="$www_override"
     local www_path="${www%/}"; www_path="${www_path%\\}"
     mkdir -p "$out"
@@ -105,6 +105,7 @@ render() {
                     if [ "$perf" != none ]; then echo; cat "$perf_file"; fi ;;
                 *)
                     l="${l//@LISTEN@/"$listen"}"
+                    l="${l//@CLIENT_CA@/"\"$client_ca\""}"
                     printf '%s\n' "${l//@WWW_DIR@/"$www_lit"}" ;;
             esac
         done < "$DEF/config.toml.in"
