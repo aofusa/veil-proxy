@@ -262,6 +262,18 @@ veil: TLS certificate not found: /path/to/cert.pem
 
 **Note**: When reloading configuration via SIGHUP, if the new configuration is invalid, the reload is rejected and the server continues running with the previous valid configuration.
 
+### Settings that reload cannot change
+
+A SIGHUP reload applies routes, upstreams, security and most other settings, but the listeners are fixed at startup.
+Changing any of the following in the file and reloading does **not** take effect; veil logs one warning
+(`Listener settings changed (...); restart veil to apply them`) naming the keys, and keeps the old listeners:
+
+- `[server] listen`, `listen_cleartext`, `threads`
+- `[server] http2_enabled` (the TLS ALPN list is built at startup; connections that negotiated h2 keep using HTTP/2)
+- `[http3] enabled`, `listen`
+- the `[[l4]]` listeners (`name`, `listen`, `protocol`)
+- TLS certificates are reloaded separately (certificate hot reload), not by the configuration reload
+
 ## Configuration File Validation
 
 Performs detailed validation of the configuration file at startup and outputs clear error messages if problems are found.

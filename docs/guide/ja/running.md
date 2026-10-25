@@ -255,6 +255,18 @@ veil: TLS certificate not found: /path/to/cert.pem
 
 **注意**: SIGHUPによる設定リロード時、新しい設定が不正な場合はリロードが拒否され、サーバーは以前の有効な設定で動作を継続します。
 
+### リロードで変えられない設定
+
+SIGHUP のリロードはルート・アップストリーム・セキュリティなど大半の設定を反映しますが、待ち受けは起動時に確定します。
+次の項目をファイルで変えてリロードしても **反映されません**。veil は項目名を列挙した警告を 1 回出し
+（`Listener settings changed (...); restart veil to apply them`）、古い待ち受けのまま動き続けます。
+
+- `[server] listen`・`listen_cleartext`・`threads`
+- `[server] http2_enabled`（TLS の ALPN は起動時に作る。h2 を選んだ接続は HTTP/2 のまま処理される）
+- `[http3] enabled`・`listen`
+- `[[l4]]` のリスナー（`name`・`listen`・`protocol`）
+- TLS 証明書は設定のリロードではなく、別の証明書ホットリロードで更新される
+
 ## 設定ファイルバリデーション
 
 起動時に設定ファイルの詳細な検証を行い、問題があれば明確なエラーメッセージを出力します。

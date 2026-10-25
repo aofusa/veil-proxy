@@ -1,6 +1,6 @@
 # B-165: リロードで待ち受けの設定を変えても黙って無視される
 
-**状態: 未着手（2026-10-25 起票。F-260 の調査で見つけた）**
+**状態: 完了（2026-10-25）**
 
 ## 事象
 
@@ -21,3 +21,7 @@ SIGHUP のリロード（`src/config/loaded.rs` `reload_config` → `load_config
 ## 関連
 
 - [F-260](../features/F-260-multiple-listeners.md)
+
+## 実施内容
+
+`src/config/loaded.rs` に `ListenerSettings`（listen・listen_cleartext・threads・http2_enabled・[http3] enabled/listen・[[l4]] の name+listen+protocol）を追加。起動時の値を `OnceLock` に持ち、リロードのたびに比べて違えば項目名つきで `warn!` を 1 回出す。単体試験あり。`docs/guide/running.md`（英日）に一覧を追記。admin のリロードはフラグを立てるだけで応答を持たないため、警告はログのみ。

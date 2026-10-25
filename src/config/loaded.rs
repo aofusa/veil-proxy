@@ -394,6 +394,91 @@ pub(crate) fn read_config_text(path: &Path) -> io::Result<String> {
     fs::read_to_string(path)
 }
 
+/// リロードでは反映できない待ち受け関連の設定の写し（起動時の値と比べる）。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub(super) struct ListenerSettings {
+    listen: Option<String>,
+    listen_cleartext: Option<String>,
+    threads: Option<usize>,
+    http2_enabled: bool,
+    http3_enabled: bool,
+    http3_listen: Option<String>,
+    /// `[[l4]]` の (name, listen, protocol)
+    l4: Vec<(String, String, String)>,
+}
+
+impl ListenerSettings {
+    pub(super) fn from_config(config: &Config) -> Self {
+        Self {
+            listen: config.server.listen.clone(),
+            listen_cleartext: config.server.listen_cleartext.clone(),
+            threads: config.server.threads,
+            http2_enabled: config.server.http2_enabled,
+            http3_enabled: config.http3.enabled,
+            http3_listen: config.http3.listen.clone(),
+            #[cfg(feature = "l4-proxy")]
+            l4: config
+                .l4
+                .iter()
+                .flatten()
+                .map(|l| {
+                    (
+                        l.name.clone(),
+                        l.listen.clone(),
+                        format!("{:?}", l.protocol),
+                    )
+                })
+                .collect(),
+            #[cfg(not(feature = "l4-proxy"))]
+            l4: Vec::new(),
+        }
+    }
+
+    /// `self`（起動時）と `new`（リロード後）で違う項目名を返す。
+    pub(super) fn changed_keys(&self, new: &Self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.listen != new.listen {
+            keys.push("server.listen");
+        }
+        if self.listen_cleartext != new.listen_cleartext {
+            keys.push("server.listen_cleartext");
+        }
+        if self.threads != new.threads {
+            keys.push("server.threads");
+        }
+        if self.http2_enabled != new.http2_enabled {
+            keys.push("server.http2_enabled");
+        }
+        if self.http3_enabled != new.http3_enabled {
+            keys.push("http3.enabled");
+        }
+        if self.http3_listen != new.http3_listen {
+            keys.push("http3.listen");
+        }
+        if self.l4 != new.l4 {
+            keys.push("l4");
+        }
+        keys
+    }
+}
+
+/// 起動時に有効になった待ち受け関連の設定（リロードの比較の基準）
+static STARTUP_LISTENERS: std::sync::OnceLock<ListenerSettings> = std::sync::OnceLock::new();
+
+/// リロードした設定が起動時の待ち受け設定と違えば、再起動が要ることを 1 回警告する。
+fn warn_listener_changes(config: &Config) {
+    let Some(startup) = STARTUP_LISTENERS.get() else {
+        return;
+    };
+    let keys = startup.changed_keys(&ListenerSettings::from_config(config));
+    if !keys.is_empty() {
+        warn!(
+            "Listener settings changed ({}); these are not applied by reload, restart veil to apply them",
+            keys.join(", ")
+        );
+    }
+}
+
 /// TLS証明書を除いた設定をロード（ホットリロード用）
 ///
 /// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
@@ -418,6 +503,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     // 設定ファイルのバリデーション
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
+    warn_listener_changes(&config);
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -592,6 +678,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 設定ファイルのバリデーション
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
+    // リロードの比較の基準（最初に読んだ設定を残す）
+    let _ = STARTUP_LISTENERS.set(ListenerSettings::from_config(&config));
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
@@ -1628,5 +1716,52 @@ mod config_path_tests {
         );
         assert!(help.contains("create the file"), "{}", help);
         assert!(help.is_ascii(), "help must be English: {}", help);
+    }
+}
+
+#[cfg(test)]
+mod listener_settings_tests {
+    use super::*;
+
+    fn cfg(s: &str) -> ListenerSettings {
+        ListenerSettings::from_config(&toml::from_str::<Config>(s).unwrap())
+    }
+
+    #[test]
+    fn same_config_has_no_changes() {
+        let a = cfg("[server]\nlisten = \"127.0.0.1:443\"\n");
+        assert!(a.changed_keys(&a.clone()).is_empty());
+    }
+
+    #[test]
+    fn detects_changed_keys() {
+        let a = cfg("[server]\nlisten = \"127.0.0.1:443\"\nthreads = 2\n");
+        let b = cfg(
+            "[server]\nlisten = \"127.0.0.1:8443\"\nlisten_cleartext = \"127.0.0.1:80\"\nthreads = 4\nhttp2_enabled = true\n[http3]\nenabled = true\n",
+        );
+        assert_eq!(
+            a.changed_keys(&b),
+            vec![
+                "server.listen",
+                "server.listen_cleartext",
+                "server.threads",
+                "server.http2_enabled",
+                "http3.enabled"
+            ]
+        );
+    }
+
+    #[cfg(feature = "l4-proxy")]
+    #[test]
+    fn detects_l4_identity_change() {
+        let l4 = |listen: &str, proto: &str| {
+            cfg(&format!(
+                "[server]\n[[l4]]\nname = \"db\"\nlisten = \"{listen}\"\nprotocol = \"{proto}\"\n[[l4.upstreams]]\naddr = \"127.0.0.1:1\"\n"
+            ))
+        };
+        let a = l4("0.0.0.0:5432", "tcp");
+        assert!(a.changed_keys(&l4("0.0.0.0:5432", "tcp")).is_empty());
+        assert_eq!(a.changed_keys(&l4("0.0.0.0:5433", "tcp")), vec!["l4"]);
+        assert_eq!(a.changed_keys(&l4("0.0.0.0:5432", "udp")), vec!["l4"]);
     }
 }
