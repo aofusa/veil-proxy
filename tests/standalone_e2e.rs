@@ -2175,6 +2175,13 @@ fn f273_h2_get(
     path: &str,
     req: &[(&str, &str)],
 ) -> (u16, Vec<(String, String)>) {
+    let (status, headers, _) = h2_get_full(port, tls, path, req);
+    (status, headers)
+}
+
+/// [`f273_h2_get`] の本文も返す版（F-272）
+type H2Full = (u16, Vec<(String, String)>, Vec<u8>);
+fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full {
     use std::sync::Arc;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2192,7 +2199,7 @@ fn f273_h2_get(
             b = b.header(*k, *v);
         }
         let request = b.body(()).unwrap();
-        async fn go<T>(io: T, request: http::Request<()>) -> (u16, Vec<(String, String)>)
+        async fn go<T>(io: T, request: http::Request<()>) -> H2Full
         where
             T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         {
@@ -2214,11 +2221,13 @@ fn f273_h2_get(
                 })
                 .collect();
             let mut body = resp.into_body();
+            let mut out = Vec::new();
             while let Some(chunk) = body.data().await {
                 let chunk = chunk.expect("data");
                 let _ = body.flow_control().release_capacity(chunk.len());
+                out.extend_from_slice(&chunk);
             }
-            (status, headers)
+            (status, headers, out)
         }
         if tls {
             let _ = veil::tls_provider::provider::default_provider().install_default();
@@ -2540,4 +2549,180 @@ allow_origins = ["*"]
             "{proto} {hs:?}"
         );
     }
+}
+
+// ===================== F-272 =====================
+
+/// 静的配信のキャッシュがディスクの変更に追従する（F-272）。`open_file_cache`・`static_file_cache` を有効期限 600 秒で
+/// 有効にし、`watch = true` のルートは同じサイズの `mv` の差し替え・元に戻す・中身の上書き（`cp`）・後から作った
+/// ディレクトリの中の差し替えに 2 秒以内に追従し、`watch = false` のルートは古い中身のまま（有効期限まで）なことを、
+/// HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。
+#[cfg(target_os = "linux")]
+#[test]
+fn f272_static_cache_follows_disk_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let www_w = dir.path().join("www_w");
+    let www_n = dir.path().join("www_n");
+    for d in [&www_w, &www_n] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("a.txt"), "AAAA").unwrap();
+    }
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+[performance]
+open_file_cache_enabled = true
+open_file_cache_valid_duration_secs = 600
+[static_file_cache]
+enabled = true
+valid_duration_secs = 600
+
+[[route]]
+[route.conditions]
+path = "/w/*"
+[route.action]
+type = "File"
+path = "{www_w}"
+mode = "sendfile"
+[route.open_file_cache]
+watch = true
+[route.static_file_cache]
+watch = true
+
+[[route]]
+[route.conditions]
+path = "/n/*"
+[route.action]
+type = "File"
+path = "{www_n}"
+mode = "sendfile"
+[route.open_file_cache]
+watch = false
+[route.static_file_cache]
+watch = false
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www_w = tp(&www_w),
+        www_n = tp(&www_n),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str) -> (u16, Vec<u8>) + 'a>;
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str| {
+                let r = http1_request(port, "GET", p, &[], b"").unwrap();
+                (r.status, r.body)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str| {
+                let (st, _, body) = h2_get_full(port, false, p, &[]);
+                (st, body)
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str| {
+                let (st, _, body) = h2_get_full(tls_port, true, p, &[]);
+                (st, body)
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str| h3_request(tls_port, "GET", p, b"")),
+    ));
+
+    let body_of = |get: &Get, p: &str| -> String {
+        let (st, body) = get(p);
+        assert_eq!(st, 200, "{p}\n{}", veil.log());
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    // 全プロトコルで 2 秒以内に `want` になるのを待つ
+    let wait_all = |p: &str, want: &str, what: &str| {
+        let t = std::time::Instant::now();
+        for (proto, get) in &protocols {
+            loop {
+                let got = body_of(get, p);
+                if got == want {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(2),
+                    "{proto} {p}: still {got:?} after {what} (want {want:?})\n{}",
+                    veil.log()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    // 同じサイズで `mv` の差し替え（inode が変わる）
+    let mv_replace = |root: &std::path::Path, name: &str, body: &str| {
+        let tmp = dir.path().join(format!(".tmp-{name}"));
+        std::fs::write(&tmp, body).unwrap();
+        std::fs::rename(&tmp, root.join(name)).unwrap();
+    };
+
+    // キャッシュを温める（各プロトコルで 2 回）
+    for (_, get) in &protocols {
+        for _ in 0..2 {
+            assert_eq!(body_of(get, "/w/a.txt"), "AAAA");
+            assert_eq!(body_of(get, "/n/a.txt"), "AAAA");
+        }
+    }
+
+    mv_replace(&www_w, "a.txt", "BBBB");
+    mv_replace(&www_n, "a.txt", "BBBB");
+    wait_all("/w/a.txt", "BBBB", "same-size mv");
+    // 監視しないルートは有効期限（600 秒）まで古い中身のまま
+    std::thread::sleep(Duration::from_millis(500));
+    for (proto, get) in &protocols {
+        assert_eq!(body_of(get, "/n/a.txt"), "AAAA", "{proto} unwatched route");
+    }
+
+    // 元に戻す
+    mv_replace(&www_w, "a.txt", "AAAA");
+    wait_all("/w/a.txt", "AAAA", "mv back");
+
+    // 中身の上書き（同じ inode）
+    std::fs::write(www_w.join("a.txt"), "CCCC").unwrap();
+    wait_all("/w/a.txt", "CCCC", "in-place overwrite");
+
+    // 起動後に作ったディレクトリの中の差し替え
+    std::fs::create_dir(www_w.join("sub")).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(www_w.join("sub").join("b.txt"), "x1").unwrap();
+    wait_all("/w/sub/b.txt", "x1", "new file in a new directory");
+    mv_replace(&www_w.join("sub"), "b.txt", "x2");
+    wait_all("/w/sub/b.txt", "x2", "mv in a new directory");
 }

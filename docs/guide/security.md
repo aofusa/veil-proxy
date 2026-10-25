@@ -50,6 +50,11 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > (`docker/assets/security/seccomp.json` / `seccomp-epoll.json`) include both; `openat2` was added in
 > v0.8.0 (without it veil falls back to `canonicalize()` on every request, and before B-154 the first
 > static request after startup returned 404).
+>
+> For `watch = true` on the static file caches ([Compression & Cache](compression-cache.md#static-file-caches-follow-disk-changes)),
+> the allowlist and both container profiles also include `inotify_init1`, `inotify_add_watch` and
+> `inotify_rm_watch`; the in-process allowlist adds `getdents64` (the watcher thread walks the static root).
+> Only the dedicated watcher thread issues them, at startup, on reload and when a directory is created.
 
 **Recommended Deployment Procedure:**
 

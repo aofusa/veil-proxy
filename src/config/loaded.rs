@@ -589,6 +589,19 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         }
     }
 
+    // グローバルOpenFileCache設定を適用（F-272: ルートの Backend の組み立てがディスク監視の既定値を
+    // 読むので、ルートより先に適用する）
+    let performance_config = &config.performance;
+    cache::configure_global_open_file_cache(
+        performance_config.open_file_cache_enabled,
+        performance_config.open_file_cache_valid_duration_secs,
+        performance_config.open_file_cache_max_entries,
+    );
+    cache::configure_global_open_file_cache_watch(performance_config.open_file_cache_watch);
+
+    // F-146: グローバル静的コンテンツキャッシュ設定を適用
+    cache::configure_global_static_content_cache(&config.static_file_cache);
+
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
@@ -604,10 +617,10 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
             // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
-            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_backend = build_backend_loaded(&route, &upstream_groups).ok();
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
-                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
+                crate::route_traffic::resolve(&route, &upstream_groups, build_backend_loaded)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -620,17 +633,6 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
 
     // OptimizedRouter を構築（Phase 1-4 最適化）
     let optimized_router = build_optimized_router(&routes);
-
-    // グローバルOpenFileCache設定を適用
-    let performance_config = &config.performance;
-    cache::configure_global_open_file_cache(
-        performance_config.open_file_cache_enabled,
-        performance_config.open_file_cache_valid_duration_secs,
-        performance_config.open_file_cache_max_entries,
-    );
-
-    // F-146: グローバル静的コンテンツキャッシュ設定を適用
-    cache::configure_global_static_content_cache(&config.static_file_cache);
 
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
@@ -809,6 +811,19 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     }
 
+    // グローバルOpenFileCache設定を適用（F-272: ルートの Backend の組み立てがディスク監視の既定値を
+    // 読むので、ルートより先に適用する）
+    let performance_config = &config.performance;
+    cache::configure_global_open_file_cache(
+        performance_config.open_file_cache_enabled,
+        performance_config.open_file_cache_valid_duration_secs,
+        performance_config.open_file_cache_max_entries,
+    );
+    cache::configure_global_open_file_cache_watch(performance_config.open_file_cache_watch);
+
+    // F-146: グローバル静的コンテンツキャッシュ設定を適用
+    cache::configure_global_static_content_cache(&config.static_file_cache);
+
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
@@ -824,10 +839,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
-            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_backend = build_backend_loaded(&route, &upstream_groups).ok();
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
-                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
+                crate::route_traffic::resolve(&route, &upstream_groups, build_backend_loaded)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -840,17 +855,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // OptimizedRouter を構築（Phase 1-4 最適化）
     let optimized_router = build_optimized_router(&routes);
-
-    // グローバルOpenFileCache設定を適用
-    let performance_config = &config.performance;
-    cache::configure_global_open_file_cache(
-        performance_config.open_file_cache_enabled,
-        performance_config.open_file_cache_valid_duration_secs,
-        performance_config.open_file_cache_max_entries,
-    );
-
-    // F-146: グローバル静的コンテンツキャッシュ設定を適用
-    cache::configure_global_static_content_cache(&config.static_file_cache);
 
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
@@ -1155,7 +1159,7 @@ pub fn reresolve_routes_after_chroot(
             .iter()
             .map(|route| {
                 let mut route = route.clone();
-                route.resolved_backend = build_backend(&route, upstream_groups).ok();
+                route.resolved_backend = build_backend_loaded(&route, upstream_groups).ok();
                 route
             })
             .collect(),
@@ -1385,6 +1389,59 @@ pub fn load_backend(
         return Ok(b.clone());
     }
     build_backend(route, upstream_groups)
+}
+
+/// 設定ロード時の Backend の組み立て（F-272: File のルートにディスクの監視を付ける）。
+///
+/// リクエスト時の組み立て（`load_backend` の後方互換の経路）は監視を付けない（`build_backend`。
+/// 監視の登録はロックと syscall を伴うため、データプレーンから呼ばない）。
+pub(super) fn build_backend_loaded(
+    route: &Route,
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+) -> io::Result<Backend> {
+    let backend = build_backend(route, upstream_groups)?;
+    #[cfg(feature = "cache")]
+    let backend = attach_static_watch(backend);
+    Ok(backend)
+}
+
+/// File のルートが `watch = true` なら、ルートの `path` を監視して世代をキャッシュの設定に持たせる（F-272）
+#[cfg(feature = "cache")]
+fn attach_static_watch(backend: Backend) -> Backend {
+    let Backend::SendFile(path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules) =
+        backend
+    else {
+        return backend;
+    };
+    let want_ofc = cache::open_file_cache_watch_enabled(ofc.as_deref());
+    let want_sfc = cache::static_file_cache_watch_enabled(sfc.as_deref());
+    let gen = if want_ofc || want_sfc {
+        cache::watch::register(&path)
+    } else {
+        None
+    };
+    let (ofc, sfc) = match gen {
+        Some(g) => (
+            if want_ofc {
+                let mut c = ofc.as_deref().cloned().unwrap_or_default();
+                c.watch_gen = Some(g);
+                Some(Arc::new(c))
+            } else {
+                ofc
+            },
+            if want_sfc {
+                let mut c = sfc.as_deref().cloned().unwrap_or_default();
+                c.watch_gen = Some(g);
+                Some(Arc::new(c))
+            } else {
+                sfc
+            },
+        ),
+        None => (ofc, sfc),
+    };
+    Backend::SendFile(
+        path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules,
+    )
 }
 
 /// `load_backend` の実体。ログ出力・エラーメッセージ・メモ化を含め従来の

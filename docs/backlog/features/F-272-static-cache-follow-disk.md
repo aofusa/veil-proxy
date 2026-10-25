@@ -1,6 +1,6 @@
 # F-272: 静的配信のキャッシュ（`open_file_cache`・`static_file_cache`）がディスクの変更に追従する（ファイルの変更通知）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（Linux。wt/core → feat/v0100、2026-10-25。他の OS は有効期限の動きに戻す。2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景（調査で確認）
 
@@ -73,3 +73,44 @@ watch = true            # 新設。既定 false（open_file_cache と同じ値�
 ## 受け入れ条件
 
 - 全 OS で差し替えに 2 秒以内に追従し、キャッシュに当たった要求の性能が変わらない。文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **世代番号**: `src/cache/watch.rs`。ルート（File バックエンドの `path`）ごとに `&'static AtomicU64` の世代（`WatchGen`）を持ち、
+  設定ロード時（`config::loaded::build_backend_loaded` → `attach_static_watch`）に `watch::register` が返したものを
+  `OpenFileCacheConfig::watch_gen`・`StaticContentCacheConfig::watch_gen`・`RouteConfig::watch_gen`（`#[serde(skip)]`）に入れる。
+  エントリ（`CachedFileInfo`・`CachedContent`・圧縮結果の `CachedVariant`）は **ファイルを開く前・読む前に読んだ世代**（`Stamp`）を持ち、
+  当たったときは `watch::fresh(stamp, want_gen)`（原子変数の読み取り 1 回）と有効期限の両方を見る。開く前に読むので、読み込みの
+  途中で差し替えられても古い中身が新しい世代で残らない。
+- **通知（Linux）**: 専用スレッド `veil-fswatch` が inotify をブロッキングの `read` で受ける（`IN_CLOSE_WRITE`・`IN_MOVED_TO`・
+  `IN_MOVED_FROM`・`IN_CREATE`・`IN_DELETE`・`IN_ATTRIB`・`IN_DELETE_SELF`・`IN_MOVE_SELF`）。配下のディレクトリは登録時に辿り、
+  作られたディレクトリにも付ける。ルートのディレクトリそのものの差し替え（`mv`・シンボリックリンクの付け替え）は親ディレクトリの
+  監視（名前で絞る）で捉えて付け直す。`IN_Q_OVERFLOW` で全部の世代を増やす。監視を付けられなかった（上限など）ら警告して
+  有効期限の動きに戻す。
+- **設定**: `[route.open_file_cache] watch`・`[route.static_file_cache] watch`・`[performance] open_file_cache_watch`・
+  `[static_file_cache] watch`（大域）。既定は全部 `false`（今と同じ動き）。大域のキャッシュ設定は、ルートの組み立ての前に
+  反映するよう `loaded.rs` の順序を入れ替えた（ルートの組み立てで大域の `watch` を見るため）。
+- **seccomp**: `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch`・`getdents64`（ディレクトリを辿る `read_dir`）を
+  `ALLOWED_SYSCALLS`（x86_64・aarch64 の 4 表）・`test_allowed_syscalls_match_libc_numbers`・`docker/assets/security/seccomp*.json` に足した。
+- **試験**: 単体 `cache::watch::tests`（世代の比較・印の無いエントリ・溢れで全部・イベントの解析・inotify の実地（同じサイズの `mv`
+  の差し替え・上書き・新しいディレクトリ・ルートの差し替え））と、既存のキャッシュの単体の更新。E2E `tests/standalone_e2e.rs` の
+  `f272_static_cache_follows_disk_changes`（HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で、有効期限 600 秒の `watch = true` のルートは
+  同じサイズの `mv` の差し替え・元に戻す・上書き・新しいサブディレクトリに 2 秒以内に追従し、`watch = false` のルートは古い中身のまま）。
+
+### 決めたこと
+
+- **Linux だけ実装した**。FreeBSD・OpenBSD・NetBSD・macOS（kqueue の `EVFILT_VNODE`）・Windows（`ReadDirectoryChangesW`）は、
+  `watch = true` を警告して有効期限だけの動きに戻す（黙って追従しないままにはしない）。VM・実機の試験を回せていないため。
+- 有効期限は `watch = true` でも残す（通知が届かないときの上限）。
+- 事前圧縮の兄弟ファイル（`.br`・`.gz`）を配る機能は veil に無いので対象外（veil が作る圧縮結果のキャッシュには世代を付けた）。
+- 設定から外れたルートの監視はプロセスの終了まで外さない（数は一度でも設定したルートの数で抑えられる。世代はリロードをまたいで
+  同じルートに使い回す）。
+- HTTP/1.1 の TLS の経路（F-150）の `insert_bytes` は入れるときに世代を読む（読んだ後・入れる前の差し替えは有効期限で追従する狭い窓）。
+- Landlock を使うときは、静的配信のルートが `landlock_read_paths` に入っている必要がある（今までと同じ。監視も同じパスにしか付けない）。
+- ライブラリの `App::serve_dir`（F-267）・Python の `StaticFiles`（F-268）の既定は、それぞれのチケットで `watch = true` にする。
+
+### 残したこと
+
+- kqueue・`ReadDirectoryChangesW` の実装と、BSD・macOS・Windows の E2E。
+- 性能の交互 A/B（`watch = true` と `false` の静的配信 3B・54KB、offload ゼロの確認）は F-276 の計測に回す。当たった要求に
+  増えたのは原子変数の読み取り 1 回と `Option` の分岐だけ。

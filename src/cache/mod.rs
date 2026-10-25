@@ -66,6 +66,9 @@ mod memory;
 mod revalidation;
 #[cfg(all(feature = "cache", target_os = "freebsd"))]
 pub(crate) mod shm;
+// F-272: 静的配信のキャッシュをディスクの変更に追従させる（通知 + 世代番号）
+#[cfg(feature = "cache")]
+pub mod watch;
 // B-65: 静的配信のメタデータ+本体を1回のoffloadで取得する複合API。file_cache/content_cache
 // の両方に依存するため cache feature 有効時のみコンパイルする。
 #[cfg(feature = "cache")]
@@ -207,15 +210,16 @@ pub use content_cache::{
     get_or_load as get_or_load_content_cache,
     get_or_load_with_mime as get_or_load_content_cache_with_mime, hits as content_cache_hits,
     insert_bytes as insert_content_cache_bytes, invalidate as invalidate_content_cache,
-    len as content_cache_len, misses as content_cache_misses, StaticContentCacheConfig,
-    StaticContentCacheRouteConfig,
+    len as content_cache_len, misses as content_cache_misses, static_file_cache_watch_enabled,
+    StaticContentCacheConfig, StaticContentCacheRouteConfig,
 };
 #[cfg(feature = "cache")]
 pub use disk::DiskCache;
 #[cfg(feature = "cache")]
 pub use file_cache::{
-    configure_global_open_file_cache, get_file_cache, get_file_info, get_file_info_with_config,
-    invalidate_file_cache, CachedFileInfo, OpenFileCache, OpenFileCacheConfig,
+    configure_global_open_file_cache, configure_global_open_file_cache_watch, get_file_cache,
+    get_file_info, get_file_info_with_config, invalidate_file_cache, open_file_cache_watch_enabled,
+    CachedFileInfo, OpenFileCache, OpenFileCacheConfig,
 };
 #[cfg(feature = "cache")]
 pub use index::CacheIndex;
@@ -342,6 +346,9 @@ pub struct OpenFileCacheConfig {
     pub valid_duration_secs: Option<u64>,
     #[serde(default, rename = "max_entries")]
     pub max_entries: Option<usize>,
+    /// F-272: `cache` 無効時はキャッシュが無いので常に最新（キーだけ受け付ける）
+    #[serde(default)]
+    pub watch: Option<bool>,
 }
 
 /// キャッシュされたファイル情報（スタブ）
@@ -381,6 +388,9 @@ pub fn configure_global_open_file_cache(
     _max_entries: usize,
 ) {
 }
+
+#[cfg(not(feature = "cache"))]
+pub fn configure_global_open_file_cache_watch(_watch: bool) {}
 
 #[cfg(not(feature = "cache"))]
 pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
@@ -647,6 +657,7 @@ pub struct StaticContentCacheConfig {
     pub max_file_size_bytes: u64,
     pub max_total_bytes: u64,
     pub revalidate_mtime: bool,
+    pub watch: bool,
 }
 
 /// ルートごとの静的コンテンツキャッシュ上書き設定（`cache` feature 無効時のスタブ）。
@@ -665,6 +676,8 @@ pub struct StaticContentCacheRouteConfig {
     pub max_total_bytes: Option<u64>,
     #[serde(default)]
     pub revalidate_mtime: Option<bool>,
+    #[serde(default)]
+    pub watch: Option<bool>,
 }
 
 #[cfg(not(feature = "cache"))]

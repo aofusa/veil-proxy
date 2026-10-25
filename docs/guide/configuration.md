@@ -41,12 +41,14 @@ The following table lists default values for major configuration options:
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries |
+| `[performance]` | `open_file_cache_watch` | `false` | Follow disk changes by change notification (default for routes; see [Compression & Cache](compression-cache.md#static-file-caches-follow-disk-changes)) |
 | `[static_file_cache]` | `enabled` | `false` | Enable static content cache (F-146/F-150; HTTP/2/HTTP/3, and HTTP/1.1 when kTLS is disabled) |
 | `[static_file_cache]` | `valid_duration_secs` | `60` | Cache validity (seconds) |
 | `[static_file_cache]` | `max_entries` | `1024` | Max cache entries |
 | `[static_file_cache]` | `max_file_size_bytes` | `1048576` | Max file size to cache (bytes) |
 | `[static_file_cache]` | `max_total_bytes` | `67108864` | Max total cached bytes |
 | `[static_file_cache]` | `revalidate_mtime` | `false` | Re-stat mtime on hit (true reintroduces a syscall on the hot path) |
+| `[static_file_cache]` | `watch` | `false` | Follow disk changes by change notification (one atomic load on a hit; default for routes) |
 | `[static_file_cache]` | *(no separate key)* | — | F-169: when this section is enabled, compressed variants of File-route static responses (per path/encoding/level) are also cached, reusing this section's `max_entries`/`max_total_bytes`; invalidated together with the body cache entry |
 | `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
@@ -275,12 +277,14 @@ mode = "sendfile"
 enabled = true
 valid_duration_secs = 300  # 5 minutes (static files change infrequently)
 max_entries = 50000
+watch = true  # follow disk changes by change notification
 # Static content cache configuration (route-specific, overrides global setting).
 # HTTP/2/HTTP/3 only — HTTP/1.1 already uses sendfile(2) and is unaffected.
 [route.static_file_cache]
 enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 2097152  # 2 MiB
+watch = true
 
 # Directory serving (without trailing slash - same behavior, no redirect)
 [[route]]

@@ -252,6 +252,54 @@ Cache keys are generated from:
 > [!CAUTION]
 > **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour old) when the backend returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.
 
+## Static File Caches Follow Disk Changes
+
+The static file caches (`open_file_cache` for file metadata and open fds, `static_file_cache` for file bodies,
+and the compressed-variant cache) normally keep an entry until `valid_duration_secs` (60 seconds by default)
+runs out, so a file replaced on disk is served stale until then. With `watch = true`, veil watches the
+File route's `path` and rebuilds the cached entries on the next request after a change: replacing a file with
+`mv` (even with the same size), overwriting it in place (`cp`), creating files and directories, and swapping
+the whole directory (`mv` or a symlink switch of the route's `path`).
+
+```toml
+[performance]
+open_file_cache_enabled = true
+open_file_cache_watch = true    # default for routes without [route.open_file_cache] watch
+
+[static_file_cache]
+enabled = true
+watch = true                    # default for routes without [route.static_file_cache] watch
+
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "/var/www/assets/"
+[route.open_file_cache]
+watch = true
+[route.static_file_cache]
+watch = true                    # keep both caches on the same setting
+```
+
+- **Cost on a cache hit**: one atomic load (a per-route generation number). Unlike `revalidate_mtime = true`,
+  no `stat` is issued, so HTTP/2 and HTTP/3 static serving stays free of offloaded syscalls.
+- **How it works**: a dedicated thread receives change notifications (Linux: inotify on every directory under
+  `path`, plus the parent directory to catch a swap of `path` itself) and bumps the route's generation.
+  Entries remember the generation read before the file was opened, so a replacement during a read never
+  leaves the old content cached under the new generation. A notification queue overflow rebuilds every
+  watched route.
+- **Fallback**: `valid_duration_secs` still applies. If watching cannot be set up (the inotify watch limit
+  `fs.inotify.max_user_watches` is reached, or the OS has no implementation yet), veil logs a warning and the
+  route follows disk changes after `valid_duration_secs` as before.
+- **Platforms**: Linux (io_uring and epoll builds). On FreeBSD, OpenBSD, NetBSD, macOS and Windows, `watch = true`
+  logs a warning and falls back to `valid_duration_secs` for now.
+- **Sandbox**: the seccomp allow-list includes `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` and
+  `getdents64` (see [Security](security.md)). With Landlock, list the static root in `landlock_read_paths` as
+  usual (the watcher reads the directory tree).
+- Routes added by a reload are watched from that reload on. A route removed by a reload stays watched until the
+  process restarts (bounded by the number of distinct roots ever configured).
+
 ## Buffering Control
 
 Controls response buffering to prevent slow clients from blocking backend connections.

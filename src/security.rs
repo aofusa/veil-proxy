@@ -176,6 +176,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     275, // splice (kTLS ゼロコピー転送)
     332, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    217, // getdents64 (監視するディレクトリを辿る)
+    254, // inotify_add_watch
+    255, // inotify_rm_watch
+    294, // inotify_init1
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -318,6 +323,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     275, // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
     332, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    217, // getdents64 (監視するディレクトリを辿る)
+    254, // inotify_add_watch
+    255, // inotify_rm_watch
+    294, // inotify_init1
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -462,6 +472,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     80,  // fstat
     291, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    61,  // getdents64 (監視するディレクトリを辿る)
+    27,  // inotify_add_watch
+    28,  // inotify_rm_watch
+    26,  // inotify_init1
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -599,6 +614,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     80,  // fstat
     291, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    61,  // getdents64 (監視するディレクトリを辿る)
+    27,  // inotify_add_watch
+    28,  // inotify_rm_watch
+    26,  // inotify_init1
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -4166,6 +4186,11 @@ mod tests {
             ("sched_yield", libc::SYS_sched_yield),
             ("getcpu", libc::SYS_getcpu),
             ("mlock2", libc::SYS_mlock2),
+            // F-272: 静的配信のディスク監視（専用スレッド）
+            ("getdents64", libc::SYS_getdents64),
+            ("inotify_init1", libc::SYS_inotify_init1),
+            ("inotify_add_watch", libc::SYS_inotify_add_watch),
+            ("inotify_rm_watch", libc::SYS_inotify_rm_watch),
         ];
         for (name, nr) in required {
             assert!(

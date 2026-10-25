@@ -570,6 +570,16 @@ reuseport_balancing = "cbpf"
 # デフォルト: 10000
 # open_file_cache_max_entries = 10000
 
+# OpenFileCacheがディスクの変更を通知で追従するか（グローバルデフォルト、F-272）
+# true にすると File ルートの `path` の配下を監視し（Linux は inotify。専用スレッド）、
+# ファイルの差し替え（同じサイズの mv・cp の上書き・ディレクトリごとの差し替え）を
+# 有効期間を待たずに反映する。キャッシュに当たった要求に増えるのは原子変数の読み取り 1 回だけ。
+# 監視の上限（fs.inotify.max_user_watches）に当たった・監視できない OS では警告して
+# 従来どおり有効期間だけで追従する（有効期間の確認は watch = true でも残る）。
+# ルーティングごとの `[route.open_file_cache] watch` で上書きできる。
+# デフォルト: false
+# open_file_cache_watch = false
+
 
 
 # ==========================================
@@ -637,6 +647,13 @@ max_total_bytes = 67108864
 # 復活する（即時反映が必要な場合のみ有効化を検討）
 # デフォルト: false
 revalidate_mtime = false
+
+# ディスクの変更を通知で追従するか（F-272。`[performance] open_file_cache_watch` と同じ仕組み）
+# revalidate_mtime と違いヒット時に syscall を出さない（原子変数の読み取り 1 回だけ）。
+# 圧縮結果キャッシュも同じく作り直す。open_file_cache と同じ値にすること（片方だけ追従すると
+# もう片方の古い内容が残る）。ルーティングごとの `[route.static_file_cache] watch` で上書きできる。
+# デフォルト: false
+watch = false
 
 # ------------------------------------------
 # 圧縮結果キャッシュ（F-169、専用の設定キーは無い）
@@ -1925,6 +1942,7 @@ revalidate_mtime = false
 # enabled = true
 # valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
 # max_entries = 50000
+# watch = true  # ディスクの変更を通知で追従する（F-272。既定は [performance] open_file_cache_watch）
 # # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き）
 # # HTTP/2・HTTP/3 のファイル本体をユーザ空間メモリに保持し、リクエストごとの
 # # オフロード読み込みを削減します（HTTP/1.1 は sendfile(2) 使用のため対象外）
@@ -1932,6 +1950,7 @@ revalidate_mtime = false
 # enabled = true
 # valid_duration_secs = 300
 # max_file_size_bytes = 2097152  # 2 MiB
+# watch = true  # ディスクの変更を通知で追従する（F-272。既定は [static_file_cache] watch）
 
 # カスタムインデックス (profile.html)
 # [[route]]

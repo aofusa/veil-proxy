@@ -250,6 +250,52 @@ url = "http://localhost:8080"
 > [!CAUTION]
 > **stale_if_error**: この機能を有効にすると、バックエンドが502/504エラーを返した際に、veil-proxyは古いキャッシュコンテンツ（最大1時間前のデータ）を提供する場合があります。これにより可用性は向上しますが、リアルタイムの正確性が重要なアプリケーション（金融データ、医療記録、在庫管理システムなど）では**データ整合性の問題**を引き起こす可能性があります。この機能を有効にする前に、ユースケースを慎重に評価してください。
 
+## 静的配信のキャッシュがディスクの変更に追従する
+
+静的配信のキャッシュ（ファイルのメタデータと開いた fd の `open_file_cache`、本体の `static_file_cache`、圧縮結果の
+キャッシュ）は、通常 `valid_duration_secs`（既定 60 秒）が切れるまでエントリを持ち続けるので、ディスクで差し替えた
+ファイルもそれまで古いまま返す。`watch = true` にすると、veil は File ルートの `path` を監視し、変更の後の最初の要求で
+エントリを作り直す。対象は `mv` によるファイルの差し替え（同じサイズでも）、中身の上書き（`cp`）、ファイル・
+ディレクトリの作成、ディレクトリごとの差し替え（ルートの `path` の `mv`・シンボリックリンクの付け替え）。
+
+```toml
+[performance]
+open_file_cache_enabled = true
+open_file_cache_watch = true    # [route.open_file_cache] watch の無いルートの既定値
+
+[static_file_cache]
+enabled = true
+watch = true                    # [route.static_file_cache] watch の無いルートの既定値
+
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "/var/www/assets/"
+[route.open_file_cache]
+watch = true
+[route.static_file_cache]
+watch = true                    # 2 つのキャッシュは同じ設定にする
+```
+
+- **キャッシュに当たった要求の費用**: 原子変数の読み取り 1 回（ルートごとの世代番号）。`revalidate_mtime = true` と違い
+  `stat` を出さないので、HTTP/2・HTTP/3 の静的配信は offload ゼロのまま。
+- **仕組み**: 専用のスレッドが変更の通知を受け（Linux: `path` の配下の全ディレクトリの inotify と、`path` そのものの
+  差し替えを捉える親ディレクトリの inotify）、ルートの世代を 1 増やす。エントリはファイルを開く前に読んだ世代を
+  持つので、読み込みの途中で差し替えられても古い中身が新しい世代で残ることは無い。通知が溢れたら監視している
+  全ルートを作り直す。
+- **戻り先**: `valid_duration_secs` は今までどおり効く。監視を付けられない（inotify の上限
+  `fs.inotify.max_user_watches` に当たった・その OS の実装がまだ無い）ときは警告を出し、そのルートは従来どおり
+  `valid_duration_secs` の後に追従する。
+- **対応 OS**: Linux（io_uring・epoll のビルド）。FreeBSD・OpenBSD・NetBSD・macOS・Windows では今のところ `watch = true` は
+  警告を出して `valid_duration_secs` の動きに戻る。
+- **サンドボックス**: seccomp の許可リストに `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch`・`getdents64` を
+  含む（[セキュリティ](security.md)）。Landlock では今までどおり静的配信のルートを `landlock_read_paths` に書く
+  （監視のスレッドがディレクトリを辿る）。
+- リロードで足したルートはそのリロードから監視する。リロードで外したルートの監視はプロセスを再起動するまで残る
+  （一度でも設定したルートの数で抑えられる）。
+
 ## バッファリング制御
 
 低速クライアントによるバックエンド接続の占有を防止するためのレスポンスバッファリングを制御します。

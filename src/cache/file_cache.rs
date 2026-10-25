@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 static OPEN_FILE_CACHE: Lazy<OpenFileCache> = Lazy::new(OpenFileCache::new);
 
 /// OpenFileCacheの設定（ルーティングごと）
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct OpenFileCacheConfig {
     /// 有効化フラグ（Noneの場合はグローバル設定を使用）
     #[serde(default)]
@@ -33,6 +33,12 @@ pub struct OpenFileCacheConfig {
     /// 最大エントリ数（Noneの場合はグローバル設定を使用）
     #[serde(default, rename = "max_entries")]
     pub max_entries: Option<usize>,
+    /// ディスクの変更を通知で追従する（F-272。None は `[performance] open_file_cache_watch`）
+    #[serde(default)]
+    pub watch: Option<bool>,
+    /// 監視しているルートの世代（設定ロード時に解決。監視しないルートは None）
+    #[serde(skip)]
+    pub watch_gen: Option<super::watch::WatchGen>,
 }
 
 /// OpenFileCacheのグローバル設定（デフォルト値）
@@ -41,6 +47,20 @@ static OPEN_FILE_CACHE_GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS: AtomicU64 = AtomicU64::new(60_000_000_000);
 /// グローバル最大エントリ数（ロックフリー）。デフォルト 10000。
 static OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES: AtomicUsize = AtomicUsize::new(10_000);
+/// グローバルの `open_file_cache_watch`（F-272。設定ロード時にルートの監視を決めるのにだけ使う）
+static OPEN_FILE_CACHE_GLOBAL_WATCH: AtomicBool = AtomicBool::new(false);
+
+/// グローバルの `open_file_cache_watch` を設定する（ルートの解決より前に呼ぶ）
+pub fn configure_global_open_file_cache_watch(watch: bool) {
+    OPEN_FILE_CACHE_GLOBAL_WATCH.store(watch, Ordering::Relaxed);
+}
+
+/// ルートの `open_file_cache` がディスクの変更を監視するか（設定ロード時）
+pub fn open_file_cache_watch_enabled(config: Option<&OpenFileCacheConfig>) -> bool {
+    config
+        .and_then(|c| c.watch)
+        .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_WATCH.load(Ordering::Relaxed))
+}
 
 /// グローバルOpenFileCache設定を適用
 pub fn configure_global_open_file_cache(
@@ -83,6 +103,8 @@ pub struct CachedFileInfo {
     shared_file: Option<std::sync::Arc<std::fs::File>>,
     /// キャッシュ時刻
     cached_at: Instant,
+    /// 作る前に読んだ監視の世代（F-272。監視しないルートで作ったものは None）
+    stamp: Option<super::watch::Stamp>,
 }
 
 impl CachedFileInfo {
@@ -111,6 +133,7 @@ impl CachedFileInfo {
             is_file: meta.is_file(),
             shared_file: None,
             cached_at: Instant::now(),
+            stamp: None,
         }
     }
 
@@ -126,6 +149,19 @@ impl CachedFileInfo {
         // 毎ヒットで呼ばれるため、reactor では起床ごとに 1 回読む粗い時計を使う
         // （有効期間は秒単位なので誤差は問題にならない）。
         crate::runtime::time::coarse_now().saturating_duration_since(self.cached_at) < max_age
+    }
+
+    /// 有効期限内で、監視しているルートが作った後に変わっていないか（F-272。原子変数の読み取り 1 回）
+    #[inline]
+    fn usable(&self, max_age: Duration, gen: Option<super::watch::WatchGen>) -> bool {
+        super::watch::fresh(self.stamp, gen) && self.is_valid(max_age)
+    }
+
+    /// 作る前に読んだ監視の世代を付ける（F-272。呼ぶのは Linux/FreeBSD の高速経路だけ）
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[inline]
+    pub(crate) fn set_stamp(&mut self, stamp: Option<super::watch::Stamp>) {
+        self.stamp = stamp;
     }
 
     /// HTTP Last-Modified ヘッダー用のRFC 7231形式文字列を生成
@@ -249,7 +285,7 @@ impl OpenFileCache {
 
         // まずキャッシュから検索（ヒット時は syscall ゼロ・非同期待機なし）
         if let Some(entry) = self.entries.get(path_key(path)) {
-            if entry.is_valid(valid_duration) {
+            if entry.usable(valid_duration, None) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(entry.clone());
             }
@@ -312,6 +348,7 @@ impl OpenFileCache {
                             is_file,
                             shared_file: is_file.then(|| std::sync::Arc::new(file)),
                             cached_at: Instant::now(),
+                            stamp: None,
                         })
                     }
                     // 登録済みルート配下と判定された上での失敗（404 相当）。ここで
@@ -342,6 +379,7 @@ impl OpenFileCache {
                     is_file,
                     shared_file: is_file.then(|| std::sync::Arc::new(file)),
                     cached_at: Instant::now(),
+                    stamp: None,
                 });
             }
             // フォールバック: パスを正規化（シンボリックリンク解決・パストラバーサル防止）
@@ -371,6 +409,7 @@ impl OpenFileCache {
                 is_file,
                 shared_file,
                 cached_at: Instant::now(),
+                stamp: None,
             })
         })
         .await
@@ -477,7 +516,7 @@ impl OpenFileCache {
                 )
             });
         let entry = self.entries.get(path_key(path))?;
-        if entry.is_valid(valid_duration) {
+        if entry.usable(valid_duration, config.and_then(|c| c.watch_gen)) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.clone())
         } else {
@@ -521,11 +560,12 @@ impl OpenFileCache {
         path: &Path,
         valid_duration: Duration,
         max_entries: usize,
+        watch_gen: Option<super::watch::WatchGen>,
     ) -> Option<CachedFileInfo> {
         // まずキャッシュから検索（ヒット時は非同期待機なし）
         if let Some(entry) = self.entries.get(path_key(path)) {
             // ルーティングごとの有効期間で判定
-            if entry.is_valid(valid_duration) {
+            if entry.usable(valid_duration, watch_gen) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(entry.clone());
             }
@@ -534,7 +574,10 @@ impl OpenFileCache {
         // キャッシュミス: ファイルシステムから取得（オフロードで非同期）
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let info = self.fetch_file_info(path).await?;
+        // F-272: 開く前に世代を読む（読み込み中の差し替えを新しい世代で残さない）
+        let stamp = super::watch::stamp(watch_gen);
+        let mut info = self.fetch_file_info(path).await?;
+        info.stamp = stamp;
 
         // ルーティングごとの最大エントリ数で判定
         let current_max_entries = self.max_entries.load(Ordering::Relaxed);
@@ -590,7 +633,12 @@ pub async fn get_file_info_with_config(
 
     // キャッシュから取得（有効期間と最大エントリ数を考慮）
     OPEN_FILE_CACHE
-        .get_or_fetch_with_config(path, valid_duration, max_entries)
+        .get_or_fetch_with_config(
+            path,
+            valid_duration,
+            max_entries,
+            config.and_then(|c| c.watch_gen),
+        )
         .await
 }
 

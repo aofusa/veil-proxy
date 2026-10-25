@@ -39,12 +39,14 @@
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数 |
+| `[performance]` | `open_file_cache_watch` | `false` | ディスクの変更を通知で追従する（ルートの既定値。[圧縮・キャッシュ](compression-cache.md#静的配信のキャッシュがディスクの変更に追従する)） |
 | `[static_file_cache]` | `enabled` | `false` | 静的ファイル本体キャッシュ（F-146/F-150。HTTP/2・HTTP/3、および kTLS 無効時の HTTP/1.1）を有効化 |
 | `[static_file_cache]` | `valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
 | `[static_file_cache]` | `max_entries` | `1024` | 最大キャッシュエントリ数 |
 | `[static_file_cache]` | `max_file_size_bytes` | `1048576` | キャッシュ対象の最大ファイルサイズ（バイト） |
 | `[static_file_cache]` | `max_total_bytes` | `67108864` | キャッシュ全体の最大バイト数 |
 | `[static_file_cache]` | `revalidate_mtime` | `false` | ヒット時に mtime を再検証するか（true でホットパスに syscall が復活） |
+| `[static_file_cache]` | `watch` | `false` | ディスクの変更を通知で追従する（ヒット時は原子変数の読み取り 1 回。ルートの既定値） |
 | `[static_file_cache]` | *(専用キー無し)* | — | F-169: 本セクションが有効なとき、File ルート静的配信の圧縮結果（パス/エンコーディング/レベル単位）もキャッシュする。上限は本セクションの `max_entries`/`max_total_bytes` を共用し、本体キャッシュのエントリと連動して無効化される |
 | `[tls]` | `ktls_enabled` | `false` | kTLSを有効化 |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS失敗時のrustlsフォールバック |
@@ -268,12 +270,14 @@ mode = "sendfile"
 enabled = true
 valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
 max_entries = 50000
+watch = true  # ディスクの変更を通知で追従する
 # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き。
 # HTTP/2・HTTP/3 限定。HTTP/1.1 は sendfile(2) を使うため対象外）
 [route.static_file_cache]
 enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 2097152  # 2 MiB
+watch = true
 
 # ディレクトリ配信（末尾スラッシュなし - 同じ動作、リダイレクトなし）
 [[route]]

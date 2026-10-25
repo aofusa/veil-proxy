@@ -1743,6 +1743,12 @@ pub struct PerformanceConfigSection {
     /// デフォルト: 10000
     #[serde(default = "default_open_file_cache_max_entries")]
     pub open_file_cache_max_entries: usize,
+
+    /// OpenFileCache がディスクの変更を通知で追従するか（グローバルデフォルト、F-272）
+    /// ルートの `[route.open_file_cache] watch` が無いルートに効く。
+    /// デフォルト: false（有効期限だけで追従する）
+    #[serde(default)]
+    pub open_file_cache_watch: bool,
 }
 
 impl PerformanceConfigSection {
