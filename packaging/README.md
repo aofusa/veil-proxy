@@ -539,10 +539,10 @@ veil-<version>-<target>/
 例:
 
 ```
-packaging/output/veil_0.9.1_amd64.deb
-packaging/output/veil-0.9.1-1.x86_64.rpm
-packaging/output/veil-0.9.1-x86_64-unknown-linux-gnu.tar.gz
-packaging/output/veil-0.9.1-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil_0.9.2_amd64.deb
+packaging/output/veil-0.9.2-1.x86_64.rpm
+packaging/output/veil-0.9.2-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-0.9.2-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ### ビルド処理の流れ
@@ -613,8 +613,8 @@ git tag v0.9.0      && git push origin v0.9.0        # 本番の draft を作る
 手元で作ったパッケージを入れるときは:
 
 ```bash
-sudo apt install ./packaging/output/veil_0.9.1_amd64.deb      # 入れると起動する
-sudo dnf install ./packaging/output/veil-0.9.1-1.x86_64.rpm && sudo systemctl enable --now veil
+sudo apt install ./packaging/output/veil_0.9.2_amd64.deb      # 入れると起動する
+sudo dnf install ./packaging/output/veil-0.9.2-1.x86_64.rpm && sudo systemctl enable --now veil
 curl http://127.0.0.1:8080/
 ```
 
@@ -635,7 +635,7 @@ TLS の証明書は作らない（既定の設定は `127.0.0.1:8080` の平文�
 ```bash
 ./packaging/scripts/test-deb.sh                      # ubuntu:24.04（VEIL_TEST_BASE で変える）
 ./packaging/scripts/test-rpm.sh                      # amazonlinux:2023
-./packaging/scripts/test-package.sh deb debian:12 packaging/output/veil_0.9.1_amd64.deb
+./packaging/scripts/test-package.sh deb debian:12 packaging/output/veil_0.9.2_amd64.deb
 ```
 
 `test-package.sh` は systemd の動くコンテナで、新しく入れる（deb は入れただけで有効・起動、rpm は `enable --now`）→

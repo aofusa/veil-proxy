@@ -141,7 +141,7 @@ TLS + ALPN `h2`（`https://`）で開きます（veil 自身の HTTP/2 クライ
     "id": "edge-1",
     "cluster": "prod",
     "user_agent_name": "veil",
-    "user_agent_version": "0.9.1"
+    "user_agent_version": "0.9.2"
   },
   "type_url": "type.veil.dev/veil.v1.Snapshot",
   "response_nonce": "17",
