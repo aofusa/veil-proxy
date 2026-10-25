@@ -1511,7 +1511,7 @@ impl Http3Handler {
         // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
         // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
         #[cfg(feature = "handler")]
-        if let Backend::Handler(entry, _, _) = &backend {
+        if let Backend::Handler(entry, _, _, comp) = &backend {
             if !entry.streaming_request || !more_frames {
                 return Decision::Buffer;
             }
@@ -1561,6 +1561,7 @@ impl Http3Handler {
             );
             return Decision::StreamHandler(Box::new(H3HandlerStream {
                 entry: entry.clone(),
+                comp: comp.clone(),
                 req,
                 // F-266: ストリーミング受信のハンドラは本文の累計に上限を掛けない（HTTP/2・HTTP/1.1 と同じ。
                 // gRPC はメッセージごと、multipart はパートごとに上限を見る）

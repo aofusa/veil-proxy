@@ -114,6 +114,9 @@ pub struct ApiSettings {
     // F-262
     /// List WebSocket routes in the OpenAPI document.
     pub openapi_websocket: bool,
+    // F-270
+    /// Compress handler responses by default (handler routes without their own `[route.compression]`).
+    pub compression: bool,
     // F-266
     /// Maximum number of parts of a `multipart/form-data` body.
     pub multipart_max_parts: usize,
@@ -186,6 +189,7 @@ impl ApiSettings {
             websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 0) as u64,
             websocket_compression: b("websocket_compression", false),
             openapi_websocket: b("openapi_websocket", true),
+            compression: b("compression", false),
             multipart_max_parts: n("multipart_max_parts", 100),
             multipart_max_field_size: n("multipart_max_field_size", 1024 * 1024),
             multipart_max_file_size: n("multipart_max_file_size", 0),
@@ -234,6 +238,8 @@ pub(crate) struct PendingRoute {
     pub func: HandlerFn,
     pub meta: OperationMeta,
     pub streaming_request: bool,
+    // F-270
+    pub compress: bool,
 }
 
 /// Middleware wrapping handler functions (such as `layer_on`); applies only to routes matching `prefix`.
@@ -355,7 +361,18 @@ impl App {
             func,
             meta,
             streaming_request: false,
+            compress: true,
         });
+        self
+    }
+
+    // F-270
+    /// Sets whether the responses of the route registered last may be compressed (`[route.compression]`,
+    /// `[api] compression`); routes allow it by default.
+    pub fn route_compression(mut self, on: bool) -> App {
+        if let Some(last) = self.routes.last_mut() {
+            last.compress = on;
+        }
         self
     }
 
@@ -476,6 +493,7 @@ impl App {
                     func: Arc::new(move |req| f(req)),
                     meta: (def.meta)(),
                     streaming_request: def.streaming_request,
+                    compress: def.compress,
                 });
             }
         }
@@ -491,7 +509,8 @@ impl App {
             let methods: Vec<&str> = route.methods.iter().map(|s| s.as_str()).collect();
             let entry =
                 HandlerEntry::new(route.name.as_str(), &route.path, &methods, func, route.meta)?
-                    .with_streaming_request(route.streaming_request);
+                    .with_streaming_request(route.streaming_request)
+                    .with_compression(route.compress);
             handler::register(entry)?;
         }
         start(config)
@@ -559,6 +578,7 @@ fn start(config: Config) -> Result<(), Error> {
             crate::runtime::offload::set_handler_pool_threads(settings.handler_threads);
         }
         let entries = builtin_and_user_entries(&settings)?;
+        let settings_compression = settings.compression;
         *SETTINGS.lock().unwrap() = Some(settings);
         #[cfg(feature = "l4-handler")]
         {
@@ -566,6 +586,10 @@ fn start(config: Config) -> Result<(), Error> {
             super::l4::inject_l4(root)?;
         }
         super::routes::inject_handler_routes(root, &entries)?;
+        // F-270: [api] compression = true は、自分の [route.compression] の無いハンドラのルートに既定の圧縮を入れる
+        if settings_compression {
+            super::compress::apply_library_default(root);
+        }
         super::routes::sort_and_check_routes(root)?;
         Ok(())
     }))

@@ -81,6 +81,8 @@ pub const VEIL_ROUTE_STREAM_BODY: u32 = 2;
 /// コールバックの前に本文を読み、`multipart/form-data` はパートに分ける（大きなファイルは名前の無い
 /// 一時ファイル。`veil_multipart_next` の `fd`。F-266）。
 pub const VEIL_ROUTE_FORM: u32 = 4;
+/// このルートの応答を `[route.compression]`・`[api] compression` で圧縮しない（F-270）。
+pub const VEIL_ROUTE_NO_COMPRESS: u32 = 8;
 
 // ===================== 最後のエラー =====================
 
@@ -139,6 +141,8 @@ struct CRoute {
     inline: bool,
     stream_body: bool,
     form: bool,
+    // F-270: 応答の圧縮を許す（`VEIL_ROUTE_NO_COMPRESS` が無い）
+    compress: bool,
     meta: OperationMeta,
 }
 
@@ -560,7 +564,10 @@ pub unsafe extern "C" fn veil_register_route_ex(
     let Some(func) = handler else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL handler");
     };
-    if flags & !(VEIL_ROUTE_INLINE | VEIL_ROUTE_STREAM_BODY | VEIL_ROUTE_FORM) != 0 {
+    if flags
+        & !(VEIL_ROUTE_INLINE | VEIL_ROUTE_STREAM_BODY | VEIL_ROUTE_FORM | VEIL_ROUTE_NO_COMPRESS)
+        != 0
+    {
         return fail(VEIL_ERR_INVALID_ARG, "unknown route flags");
     }
     if flags & VEIL_ROUTE_INLINE != 0 && flags & VEIL_ROUTE_STREAM_BODY != 0 {
@@ -618,6 +625,7 @@ pub unsafe extern "C" fn veil_register_route_ex(
         inline: flags & VEIL_ROUTE_INLINE != 0,
         stream_body: flags & VEIL_ROUTE_STREAM_BODY != 0,
         form: flags & VEIL_ROUTE_FORM != 0,
+        compress: flags & VEIL_ROUTE_NO_COMPRESS == 0,
         meta,
     });
     VEIL_OK
@@ -699,7 +707,8 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
             app.route_fn_streaming(&r.name, &methods, &r.path, func, r.meta)
         } else {
             app.route_fn(&r.name, &methods, &r.path, func, r.meta)
-        };
+        }
+        .route_compression(r.compress);
     }
     for f in cfg.extra {
         app = f(app);
@@ -1042,6 +1051,20 @@ pub unsafe extern "C" fn veil_response_set_status(
         return fail(VEIL_ERR_INVALID_ARG, "status out of range");
     }
     r.resp = std::mem::replace(&mut r.resp, Response::new(200)).with_status(status);
+    VEIL_OK
+}
+
+/// この応答を圧縮しない（ルートが `[route.compression]`・`[api] compression` で圧縮するときも。F-270）。
+///
+/// # Safety
+///
+/// `resp` はコールバックに渡されたハンドル。
+#[no_mangle]
+pub unsafe extern "C" fn veil_response_no_compression(resp: *mut veil_response_t) -> c_int {
+    let Some(r) = resp.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL response");
+    };
+    r.resp = std::mem::replace(&mut r.resp, Response::new(200)).no_compression();
     VEIL_OK
 }
 

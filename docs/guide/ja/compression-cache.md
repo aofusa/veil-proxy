@@ -33,6 +33,9 @@ url = "http://localhost:8080"
   enabled = true
 ```
 
+同じ表は API ライブラリの `type = "Handler"` のルートにも効く（HTTP/1.1・HTTP/2・HTTP/3、バッファ・ストリーミングの応答）。
+`[api] compression = true` でハンドラのルートに JSON の API 向けの既定が入る。[library.md](library.md#応答の圧縮) を参照。
+
 ### 設定オプション
 
 | オプション | 説明 | デフォルト |

@@ -117,6 +117,9 @@ pub struct RouteDef {
     // F-197: `#[veil::route(streaming = true)]`
     /// Receive the request body as a stream (HTTP/2).
     pub streaming_request: bool,
+    // F-270: `#[veil::route(compress = false)]`
+    /// Whether responses may be compressed by the route's `[route.compression]`.
+    pub compress: bool,
 }
 
 inventory::collect!(RouteDef);
@@ -136,6 +139,9 @@ pub struct HandlerEntry {
     // F-197
     /// Receive the request body as a stream (on HTTP/2, chunks reach `Request::take_body_stream` in arrival order).
     pub streaming_request: bool,
+    // F-270
+    /// Whether responses may be compressed by the route's `[route.compression]` (default `true`).
+    pub compress: bool,
 }
 
 impl std::fmt::Debug for HandlerEntry {
@@ -175,7 +181,15 @@ impl HandlerEntry {
             func,
             meta,
             streaming_request: false,
+            compress: true,
         })
+    }
+
+    // F-270
+    /// Allows or forbids compressing this handler's responses.
+    pub fn with_compression(mut self, on: bool) -> HandlerEntry {
+        self.compress = on;
+        self
     }
 
     /// Enables streaming reception of the request body.
@@ -237,7 +251,8 @@ pub fn register_macro_routes() -> Result<(), String> {
             let f = def.handler;
             let func: HandlerFn = Arc::new(move |req| f(req));
             let entry = HandlerEntry::new(def.name, def.path, def.methods, func, (def.meta)())?
-                .with_streaming_request(def.streaming_request);
+                .with_streaming_request(def.streaming_request)
+                .with_compression(def.compress);
             register(entry)?;
         }
         Ok(())

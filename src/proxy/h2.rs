@@ -1034,7 +1034,7 @@ where
     let (_prefix, backend, _rc) = backend_result?;
     // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
     #[cfg(feature = "handler")]
-    if let Backend::Handler(entry, _, _) = &backend {
+    if let Backend::Handler(entry, _, _, _) = &backend {
         return entry.streaming_request.then_some(0);
     }
     let (upstream_group, security, buffering) = match &backend {
@@ -1606,8 +1606,9 @@ pub(super) async fn h2_dispatch(
             .await
         }
         #[cfg(feature = "handler")]
-        Backend::Handler(entry, _, _) => {
-            let (status, size, _) = h2_api_handler(ctx, &entry, None, resp_tx, notify).await;
+        Backend::Handler(entry, _, _, comp) => {
+            let (status, size, _) =
+                h2_api_handler(ctx, &entry, comp.as_deref(), None, resp_tx, notify).await;
             (status, size)
         }
     };
@@ -1638,6 +1639,7 @@ pub(super) async fn h2_dispatch(
 pub(super) async fn h2_api_handler(
     ctx: &H2RequestCtx,
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     req_rx: Option<&crate::stream_channel::Receiver<Bytes>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -1660,7 +1662,7 @@ pub(super) async fn h2_api_handler(
         crate::api::request::HttpVersion::Http2,
     );
     let Some(rx) = req_rx else {
-        let (status, size) = h2_api_respond(entry, req, resp_tx, notify).await;
+        let (status, size) = h2_api_respond(entry, comp, req, resp_tx, notify).await;
         return (status, size, ctx.body.len() as u64);
     };
 
@@ -1684,7 +1686,7 @@ pub(super) async fn h2_api_handler(
         }
         // body_tx の drop で受信ストリームが終わる
     };
-    let work = h2_api_respond(entry, req, resp_tx, notify);
+    let work = h2_api_respond(entry, comp, req, resp_tx, notify);
     let (status, size) =
         match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
             futures::future::Either::Left((r, _pump)) => r,
@@ -1697,11 +1699,12 @@ pub(super) async fn h2_api_handler(
 #[cfg(all(feature = "http2", feature = "handler"))]
 pub(super) async fn h2_api_respond(
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     req: crate::api::request::Request,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    let mut resp = crate::api::dispatch::call(entry, req).await;
+    let mut resp = crate::api::dispatch::call(entry, req, comp).await;
     crate::api::dispatch::h2_h3_headers(&mut resp);
     let status = resp.status_code();
     let crate::api::response::Response {
@@ -3677,8 +3680,9 @@ pub(super) async fn h2_serve_streaming(
         }
         // ストリーミング受信のハンドラ（F-197）
         #[cfg(feature = "handler")]
-        Some((_prefix, Backend::Handler(entry, _, _), _rc)) if entry.streaming_request => {
-            return h2_api_handler(ctx, &entry, Some(req_rx), resp_tx, notify).await;
+        Some((_prefix, Backend::Handler(entry, _, _, comp), _rc)) if entry.streaming_request => {
+            return h2_api_handler(ctx, &entry, comp.as_deref(), Some(req_rx), resp_tx, notify)
+                .await;
         }
         // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
         Some((_prefix, Backend::Respond(r), _rc)) => {

@@ -187,6 +187,21 @@ NULL）・`content_type` と、中身の `data`/`data_len` か一時ファイル
 の名前の無い一時ファイルに書きます（壊れた本文の 400・上限超えの 413 はコールバックの前に返す）。付けないルートは溜めた本文
 （`[api] max_body_size` まで）を解析します。上限は `[api] multipart_*`（`veil_config_set(cfg, "api.multipart_max_file_size", "209715200")`）。
 
+### 応答の圧縮（F-270）
+
+```c
+/* [route.compression] の無いハンドラのルートに既定（br・gzip、256 バイト以上、JSON・text/*・JavaScript・SVG）を入れる */
+veil_config_set(cfg, "api.compression", "true");
+/* このルートは圧縮しない */
+veil_register_route_ex(cfg, "/raw", "GET", raw, NULL, VEIL_ROUTE_NO_COMPRESS, NULL);
+/* コールバックの中で、この応答だけ圧縮しない */
+veil_response_no_compression(resp);
+```
+
+クライアントの `Accept-Encoding` に応じて br・gzip を選び、`Content-Encoding`・`Vary` を付けます（無ければ圧縮しない）。
+`veil_response_stream` のストリーミングの応答は書くたびに圧縮して flush します（`text/event-stream` は圧縮しない）。HTTP/1.1・
+HTTP/2・HTTP/3 のどれでも同じです。規則の全体はガイドの `library.md` の「応答の圧縮」。
+
 ### 所有権
 
 | 対象 | 規則 |

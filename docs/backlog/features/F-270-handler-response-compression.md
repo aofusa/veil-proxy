@@ -1,6 +1,6 @@
 # F-270: API ライブラリのハンドラの応答に `[route.compression]` を効かせる（HTTP/1.1・HTTP/2・HTTP/3、バッファ・ストリーミング）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（2026-10-25 起票・設計・実装。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景（調査で確認）
 
@@ -63,3 +63,38 @@
 ## 受け入れ条件
 
 - 3 プロトコルでハンドラの応答が圧縮され、本体のバイナリと圧縮しない応答の性能が変わらない。文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- 設定: `Backend::Handler` に 4 つ目の欄 `Option<Arc<CompressionConfig>>` を足し、設定ロード時に解決する（ルートの
+  `[route.compression]` が無効、またはハンドラが `compress = false` なら `None`。`src/config/loaded.rs`）。`[api] compression = true` は
+  設定の合成のフック（`src/api/app.rs`）で、`compression` の表の無い `type = "Handler"` のルートに既定の表
+  （`preferred_encodings = ["br", "gzip"]`・`min_size = 256`・`compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"]`）を入れる。
+- 経路: `src/api/compress.rs`（新設）の `apply` を `dispatch::call`/`call_with` から呼ぶ（HTTP/1.1・HTTP/2・HTTP/3 の 3 経路は `comp` を渡すだけ）。
+  `Accept-Encoding` は要求がハンドラへ移る前に `Bytes` の参照カウントで取っておく。圧縮しないルート（`comp = None`）は `Option` の確認だけで、
+  確保を足さない。
+  - バッファ: スレッドローカルの `flate2::Compress`（gzip は手書きのヘッダ・トレーラ、deflate は zlib）・`zstd::bulk::Compressor`、brotli は
+    `BrotliCompress`。`content-length` を外し（各経路が圧縮後の長さで付け直す）、`Content-Encoding`・`Vary: Accept-Encoding`、強い ETag は `W/`。
+  - ストリーミング: `Compressing` のストリームで断片ごとに圧縮して flush、トレーラの前に終端を書く。
+  - 選び方: `preferred_encodings` のうち q 値が最大のもの（同点は設定の順。`q=0`・`*` を扱う）。受け付ける方式が無いときは `Vary` だけ付ける。
+  - 圧縮しない条件: 1xx・204・206・304、アップグレード、`Response::no_compression()`、既存の `Content-Encoding`、`Cache-Control: no-transform`、
+    `Content-Range`、`skip_types`・`compressible_types` の外の型、`min_size` 未満のバッファ本文、SSE（`compressible_types` に `text/event-stream` を書いたときだけ圧縮）。
+  - HEAD は本文を圧縮せず、GET と同じヘッダ（`Content-Encoding`・`Vary`）を付けて `content-length` を付けない（設計の「HEAD は圧縮しない」から変えた。
+    GET と HEAD のヘッダを揃えるため）。
+- API: Rust はビルダの `.compression(bool)`（`api.compression`）・`App::route_compression(bool)`・`#[veil::route(..., compress = false)]`・
+  `Response::no_compression()`。Python は `veil.run(compression=True)`・`@app.get(..., compress=False)`・`veil.Response`/`JSONResponse`/
+  `StreamingResponse(..., compress=False)`（または属性 `compress = False`）。C は `VEIL_ROUTE_NO_COMPRESS`（8）・`veil_response_no_compression`・
+  `veil_config_set(cfg, "api.compression", "true")`。
+- 設計からの差分: `App::compression(Compression::default())` ではなく設定のビルダの `compression(bool)`（既定の表は固定。細かい指定は
+  `[route.compression]`）。設定のキーは本体の `CompressionConfig` のまま（`algorithms`・`level`・`content_types` ではなく
+  `preferred_encodings`・`gzip_level`/`brotli_level`/`zstd_level`・`compressible_types`/`skip_types`。既定の level は本体と同じ gzip 4・br 4）。
+  `[http3] compression*` はプロキシの HTTP/3 の応答だけに効き、ハンドラはルートの表を使う。`compression` feature は `api` に入れない
+  （無い構成では `apply` は何もしない。`full` と veil-capi・veil-python は入れている）。
+- 試験: 単体（`api::compress::tests`: q 値・圧縮しない条件・gzip/br/zstd/deflate の往復・ストリーミングの往復とトレーラ・HEAD・既定の表の注入）、
+  Python（`TestCompressFlags`）。E2E（`tests/api/library_e2e.sh`）: Rust・Python・C の HTTP/1.1・h2c で br・gzip を復号して元と一致、
+  q 値・設定の順、`Accept-Encoding` 無し・`identity` で圧縮しない、`compress = false`・応答ごとの停止、ストリーミングの gzip・br、
+  256 バイト未満は圧縮しない、HEAD のヘッダ、C の SSE は圧縮しない、C の HTTP/3（試験クライアントの `--h3-fetch` で gzip を復号）の
+  バッファ・ストリーミング。HttpArena の json-comp の確認（`Accept-Encoding: gzip, br` で `Content-Encoding: gzip|br`、無ければ付けない）を含む。
+- 文書: `docs/guide/library.md`（英日）の「Response compression」と `[api]`・マクロの表、`compression-cache.md`（英日）、
+  `crates/veil-python/docs/configuration.md`、`crates/veil-capi/README.md`、`examples/config.toml` の `[api] compression`。
+- 残り: 性能の比較（axum + `CompressionLayer`・FastAPI + `GZipMiddleware`）と提出物のレベルは [F-269](F-269-benchmark-submissions.md) で行う。

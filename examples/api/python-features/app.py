@@ -1,5 +1,6 @@
 """veil の Python の F-210 の機能: ストリーミング応答（ジェネレータ・SSE・非同期ジェネレータ）・
-要求本文のストリーミング受信・L4（TCP・UDP のエコー）・フォームとファイルのアップロード（F-266）。
+要求本文のストリーミング受信・L4（TCP・UDP のエコー）・フォームとファイルのアップロード（F-266）・
+応答の圧縮（``veil.run(compression=True)``・``compress=False``。F-270）。
 
     VEIL_LISTEN=127.0.0.1:8000 VEIL_L4_TCP=127.0.0.1:7000 VEIL_L4_UDP=127.0.0.1:7001 python app.py
 """
@@ -82,6 +83,35 @@ def login(user: str = veil.Form(), remember: bool = veil.Form(False)):
     return {"user": user, "remember": remember}
 
 
+def _items():
+    return {"items": [{"id": i, "name": "item-%d" % i} for i in range(100)]}
+
+
+@veil.get("/data")
+def data():
+    # veil.run(compression=True) なので Accept-Encoding に応じて br・gzip で返る（256 バイト未満は圧縮しない）
+    return _items()
+
+
+@veil.get("/data-raw", compress=False)
+def data_raw():
+    # このルートは圧縮しない
+    return _items()
+
+
+@veil.get("/data-nc")
+def data_nc():
+    # 応答ごとに止める（veil.Response・JSONResponse の compress=False）
+    return veil.JSONResponse(_items(), compress=False)
+
+
+@veil.get("/lines")
+def lines():
+    # ストリーミング応答も断片ごとに flush しながら圧縮する
+    for i in range(1, 51):
+        yield "line %04d %s\n" % (i, "x" * 200)
+
+
 L4T, L4U = os.environ.get("VEIL_L4_TCP"), os.environ.get("VEIL_L4_UDP")
 if L4T:
 
@@ -102,4 +132,5 @@ if __name__ == "__main__":
     veil.run(
         listen_cleartext=os.environ.get("VEIL_LISTEN", "127.0.0.1:8000"),
         overrides={"logging.level": "warn", "api.multipart_max_file_size": 209715200},
+        compression=True,
     )

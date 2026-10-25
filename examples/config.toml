@@ -2746,6 +2746,8 @@ revalidate_mtime = false
 # multipart_max_header_size = 8192        # 1 パートのヘッダの大きさの上限
 # multipart_spool_threshold = 1048576     # Python の UploadFile・C の VEIL_ROUTE_FORM: これを超えるファイルは一時ファイルへ
 # upload_tmp_dir = "/var/tmp/veil"        # アップロードの名前の無い一時ファイルの置き場（既定は OS の一時ディレクトリ）
+# compression = false                     # ハンドラの応答を br・gzip で圧縮する（[route.compression] の無いハンドラのルートに
+#                                         # br・gzip、256 バイト以上、JSON・text/*・JavaScript・SVG の既定を入れる。compression feature が必要。F-270）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）

@@ -431,6 +431,25 @@ def _multipart(fields, boundary="XyZ"):
     return out + b"--" + boundary.encode() + b"--\r\n"
 
 
+class TestCompressFlags(Base):
+    # F-270: ルートと応答の圧縮の可否（圧縮そのものは Rust 側。ここでは Rust へ渡す値を確かめる）
+    def test_route_and_response_flags(self):
+        @self.app.get("/a")
+        def a():
+            return {"x": 1}
+
+        @self.app.get("/b", compress=False)
+        def b():
+            return {"x": 1}
+
+        self.assertEqual([r.compress for r in self.app.routes], [True, False])
+        self.assertTrue(veil.Response(b"x").compress)
+        self.assertFalse(veil.Response(b"x", compress=False).compress)
+        self.assertFalse(veil.JSONResponse({"a": 1}, compress=False).compress)
+        self.assertFalse(veil.StreamingResponse(iter([b"x"]), compress=False).compress)
+        self.assertTrue(veil.EventSourceResponse(iter([])).compress)
+
+
 class TestForms(Base):
     MP = (("content-type", "multipart/form-data; boundary=XyZ"),)
 

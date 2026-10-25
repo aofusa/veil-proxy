@@ -667,6 +667,7 @@ pub(crate) fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response
         .getattr(pyo3::intern!(resp.py(), "status"))?
         .extract()?;
     let mut r = Response::new(status);
+    no_compression(resp, &mut r)?;
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
@@ -685,6 +686,7 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
         .extract()?;
     let body = resp.getattr(pyo3::intern!(resp.py(), "body"))?;
     let mut r = Response::new(status).with_body(backed(&body)?);
+    no_compression(resp, &mut r)?;
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
@@ -694,6 +696,17 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
         r = r.with_header(known_header(&n), Bytes::copy_from_slice(v.as_bytes()));
     }
     Ok(r)
+}
+
+// F-270
+/// Applies `Response.compress = False` (the class default is `True`; objects without the attribute are compressible).
+fn no_compression(resp: &Bound<'_, PyAny>, r: &mut Response) -> PyResult<()> {
+    if let Ok(v) = resp.getattr(pyo3::intern!(resp.py(), "compress")) {
+        if !v.is_truthy()? {
+            *r = std::mem::replace(r, Response::new(200)).no_compression();
+        }
+    }
+    Ok(())
 }
 
 /// Map common header names to static byte strings (avoids copying the name).

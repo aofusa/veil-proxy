@@ -209,10 +209,19 @@ def _dumps(obj):
 
 
 class Response:
-    """A raw response. ``body`` is ``bytes`` or ``str``; ``media_type`` sets ``content-type`` if no such header is given."""
+    """A raw response. ``body`` is ``bytes`` or ``str``; ``media_type`` sets ``content-type`` if no such header is given.
 
-    def __init__(self, body=b"", status=200, headers=None, media_type=None):
+    ``compress=False`` (or setting ``compress = False`` on an instance or a subclass) keeps the server from
+    compressing it even when the route has ``[route.compression]`` or ``[api] compression`` on.
+    """
+
+    # 応答の圧縮を許すか（F-270）
+    compress = True
+
+    def __init__(self, body=b"", status=200, headers=None, media_type=None, compress=True):
         """Create a response from a body, status, optional headers (dict or pairs) and media type."""
+        if not compress:
+            self.compress = False
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.body = bytes(body)
@@ -258,9 +267,9 @@ class StreamingResponse(Response):
     list of ``(name, value)`` pairs sent after the body.
     """
 
-    def __init__(self, content, status=200, headers=None, media_type=None, trailers=None):
+    def __init__(self, content, status=200, headers=None, media_type=None, trailers=None, compress=True):
         """Create a streaming response from ``content`` (see the class documentation)."""
-        super().__init__(b"", status, headers, media_type)
+        super().__init__(b"", status, headers, media_type, compress)
         self.content = content
         self.trailers = list(trailers) if trailers else None
 
@@ -405,9 +414,9 @@ class SwitchingProtocols(Response):
 
 class JSONResponse(Response):
     """A response whose body is ``content`` encoded as JSON (``application/json``)."""
-    def __init__(self, content=None, status=200, headers=None):
+    def __init__(self, content=None, status=200, headers=None, compress=True):
         """Create a JSON response from a JSON-serialisable ``content``."""
-        super().__init__(_dumps(content), status, headers, _JSON_CT)
+        super().__init__(_dumps(content), status, headers, _JSON_CT, compress)
 
 
 class HTTPException(Exception):
@@ -702,9 +711,22 @@ class Route:
     """One registered route. ``handle()`` is independent of Rust and can be unit-tested."""
 
     def __init__(
-        self, func, path, methods, offload, body_constraints, tags, summary, status_code, stream_body=False, async_mode=None
+        self,
+        func,
+        path,
+        methods,
+        offload,
+        body_constraints,
+        tags,
+        summary,
+        status_code,
+        stream_body=False,
+        async_mode=None,
+        compress=True,
     ):
         self.func = func
+        # 応答を圧縮してよいか（F-270。``[route.compression]``・``[api] compression``）
+        self.compress = bool(compress)
         # async def の実行先（None = [api] python_async_mode の既定、"loop" = 常駐のループ、"pool" = 旧来）
         if async_mode not in (None, "loop", "pool"):
             raise ValueError('async_mode must be "loop" or "pool"')
@@ -1283,6 +1305,7 @@ class App:
         status_code=200,
         stream_body=False,
         async_mode=None,
+        compress=True,
     ):
         """Register a handler for ``path`` and ``methods`` (default ``["GET"]``); use as a decorator.
 
@@ -1294,6 +1317,9 @@ class App:
         ``async def`` handlers run on the persistent event loop (like uvicorn: do not block in them, use
         :func:`run_in_threadpool`). ``async_mode="pool"`` runs them to completion on the handler pool instead, as
         before (one pool thread per waiting request); ``stream_body=True`` routes always do.
+
+        ``compress=False`` keeps the server from compressing this route's responses (``[route.compression]`` and
+        ``[api] compression``, see :meth:`run`).
         """
 
         def deco(func):
@@ -1309,6 +1335,7 @@ class App:
                     status_code,
                     stream_body,
                     async_mode,
+                    compress,
                 )
             )
             return func
@@ -1499,6 +1526,7 @@ class App:
         event_loops=None,
         event_loop=None,
         async_mode=None,
+        compression=None,
     ):
         """Start the server and block until it stops (Ctrl-C, SIGTERM or :func:`shutdown`).
 
@@ -1513,8 +1541,15 @@ class App:
         ``event_loop`` (``[api] python_event_loop``: ``"auto"``, ``"asyncio"`` or ``"uvloop"``) their kind, and
         ``async_mode`` (``[api] python_async_mode``: ``"loop"`` or ``"pool"``) where ``async def`` handlers run
         by default.
+
+        ``compression=True`` (``[api] compression``) compresses handler responses with gzip or brotli when the
+        client accepts it (``Accept-Encoding``), for routes without their own ``[route.compression]``.
         """
         from . import _aio, _veil
+
+        if compression is not None:
+            overrides = dict(overrides or {})
+            overrides["api.compression"] = bool(compression)
 
         cfg = self.build_config(
             config_path,
@@ -1555,6 +1590,7 @@ class App:
                 r.stream_body,
                 on_loop,
                 any(p.kind in ("form", "file") for p in r.params),
+                r.compress,
             )
         for r in self.websocket_routes:
             hid = len(_HANDLERS)

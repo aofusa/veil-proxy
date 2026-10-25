@@ -17,6 +17,9 @@ pub struct Response {
     /// Protocol upgrade (`101 Switching Protocols`): the protocol name and the function that takes the connection.
     // Box: 応答の大きさを増やさない（ハンドラの戻り値・抽出子の `Err` として毎要求ムーブされる）
     pub(crate) upgrade: Option<Box<super::upgrade::UpgradeHook>>,
+    // F-270
+    /// Set by [`Response::no_compression`]: the route's `[route.compression]` leaves this response alone.
+    pub(crate) no_compress: bool,
 }
 
 impl std::fmt::Debug for Response {
@@ -45,6 +48,7 @@ impl Response {
             body: Bytes::new(),
             stream: None,
             upgrade: None,
+            no_compress: false,
         }
     }
 
@@ -58,6 +62,7 @@ impl Response {
             body,
             stream: None,
             upgrade: None,
+            no_compress: false,
         }
     }
 
@@ -103,6 +108,7 @@ impl Response {
             // fuse: 送出側は終端の後にもう一度 poll することがある（`stream::coalesce`）
             stream: Some(Box::pin(futures::StreamExt::fuse(body))),
             upgrade: None,
+            no_compress: false,
         }
     }
 
@@ -124,6 +130,13 @@ impl Response {
             protocol, on_upgrade,
         )));
         r
+    }
+
+    // F-270
+    /// Keeps this response uncompressed even when the route compresses responses (`[route.compression]`).
+    pub fn no_compression(mut self) -> Response {
+        self.no_compress = true;
+        self
     }
 
     /// Whether this is a protocol upgrade response ([`Response::switching_protocols`]).

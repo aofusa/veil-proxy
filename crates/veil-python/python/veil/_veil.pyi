@@ -281,9 +281,11 @@ def register_route(
     stream_body: bool = False,
     on_loop: bool = False,
     form: bool = False,
+    compress: bool = True,
 ) -> None:
     """Register an HTTP route (collected until ``run``; ``on_loop`` runs it on the persistent event loop; ``form``
-    reads the body first and splits a ``multipart/form-data`` body into parts)."""
+    reads the body first and splits a ``multipart/form-data`` body into parts; ``compress=False`` keeps its
+    responses uncompressed)."""
 
 def run(config: Config, handlers: list[Any]) -> None:
     """Start the server and block until it stops (the GIL is released).

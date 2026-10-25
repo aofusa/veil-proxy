@@ -91,6 +91,8 @@ pub(super) async fn buffered_request_task(
 #[cfg(feature = "handler")]
 pub(super) struct H3HandlerStream {
     pub(super) entry: std::sync::Arc<crate::api::handler::HandlerEntry>,
+    // F-270: ルートの応答の圧縮
+    pub(super) comp: Option<std::sync::Arc<crate::config::CompressionConfig>>,
     pub(super) req: crate::api::request::Request,
     pub(super) max_request_body: u64,
     pub(super) log: H3AccessLog,
@@ -119,6 +121,7 @@ pub(super) async fn h3_api_stream_task(
     let start = Instant::now();
     let H3HandlerStream {
         entry,
+        comp,
         mut req,
         log,
         ..
@@ -147,7 +150,7 @@ pub(super) async fn h3_api_stream_task(
             }
         }
     };
-    let work = h3_api_respond(&entry, req, &resp_tx, &notify);
+    let work = h3_api_respond(&entry, comp.as_deref(), req, &resp_tx, &notify);
     let (status, sent) =
         match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
             futures::future::Either::Left((r, _pump)) => r,
@@ -173,6 +176,7 @@ pub(super) async fn h3_api_stream_task(
 #[cfg(feature = "handler")]
 pub(super) async fn h3_api_respond(
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     req: crate::api::request::Request,
     resp_tx: &crate::http3_stream::Sender<crate::http3_stream::RespMsg>,
     notify: &crate::http3_stream::ConnWaker,
@@ -185,7 +189,7 @@ pub(super) async fn h3_api_respond(
         notify.notify();
         r.is_ok()
     };
-    let mut resp = crate::api::dispatch::call(entry, req).await;
+    let mut resp = crate::api::dispatch::call(entry, req, comp).await;
     crate::api::dispatch::h2_h3_headers(&mut resp);
     let status = resp.status_code();
     let stream = resp.take_stream();
@@ -1151,7 +1155,7 @@ impl H3BufferedTask {
                 .await
                 .unwrap_or((500, 0)),
             #[cfg(feature = "handler")]
-            Backend::Handler(entry, _, _) => {
+            Backend::Handler(entry, _, _, comp) => {
                 // ネイティブハンドラ（API ライブラリ、F-188）
                 let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 1);
                 let mut has_host = false;
@@ -1176,7 +1180,7 @@ impl H3BufferedTask {
                     self.client_ip.as_str(),
                     crate::api::request::HttpVersion::Http3,
                 );
-                let mut resp = crate::api::dispatch::call(&entry, req).await;
+                let mut resp = crate::api::dispatch::call(&entry, req, comp.as_deref()).await;
                 crate::api::dispatch::h2_h3_headers(&mut resp);
                 let status = resp.status_code();
                 if let Some(stream) = resp.take_stream() {

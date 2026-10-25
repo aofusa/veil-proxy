@@ -2,7 +2,8 @@
  * veil C API の F-210 の機能のサンプル: 応答のストリーミング (SSE)・要求本文のストリーミング受信・
  * gRPC (examples/api/rust-grpc と同じ demo.v1.Demo)・L4 (TCP・UDP のエコー)・
  * HTTP/1.1 のアップグレード (GET /upgrade で x-echo に切り替えてエコー、F-261)・
- * WebSocket のエコー (GET /ws、F-262)・フォームとファイルのアップロード (POST /upload・/parse、F-266)。
+ * WebSocket のエコー (GET /ws、F-262)・フォームとファイルのアップロード (POST /upload・/parse、F-266)・
+ * 応答の圧縮 (GET /json・/json-raw・/json-nc・/lines、api.compression。F-270)。
  *
  * gRPC のメッセージは小さな protobuf を手で符号化している (veil は protobuf の実装に依存しない。
  * 実際のアプリでは protobuf-c・nanopb・upb 等を使う)。
@@ -410,6 +411,46 @@ static int list_parts(const veil_request_t *req, veil_response_t *resp) {
     return veil_response_set_text(resp, out);
 }
 
+/* GET /json : 100 件の JSON (api.compression = true なので Accept-Encoding に応じて gzip・br で返る)。
+ * /json-raw は VEIL_ROUTE_NO_COMPRESS のルート、/json-nc は veil_response_no_compression で同じ本文を圧縮せずに返す。 */
+static int json_items(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    char buf[8192];
+    size_t off = 0;
+    off += (size_t)snprintf(buf + off, sizeof buf - off, "{\"items\":[");
+    for (int i = 0; i < 100; i++) {
+        off += (size_t)snprintf(buf + off, sizeof buf - off, "%s{\"id\":%d,\"name\":\"item-%d\"}", i ? "," : "", i, i);
+    }
+    snprintf(buf + off, sizeof buf - off, "]}");
+    if (ud != NULL) {
+        veil_response_no_compression(resp);
+    }
+    return veil_response_set_json(resp, buf);
+}
+
+/* GET /lines : 長い行を 50 回に分けて書く (ストリーミング応答の圧縮は書くたびに flush する) */
+static int lines(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    veil_response_set_header(resp, "content-type", "text/plain");
+    veil_stream_t *s = veil_response_stream(resp);
+    if (s == NULL) {
+        return 1;
+    }
+    char line[256];
+    memset(line, 'x', sizeof line);
+    for (int i = 1; i <= 50; i++) {
+        int n = snprintf(line, 16, "line %04d ", i);
+        line[n] = 'x';
+        line[sizeof line - 1] = '\n';
+        if (veil_stream_write(s, (const uint8_t *)line, sizeof line) != VEIL_OK) {
+            break;
+        }
+    }
+    veil_stream_close(s);
+    return 0;
+}
+
 /* POST /upload : 本文を先に読み、大きなファイルは一時ファイルで受ける (VEIL_ROUTE_FORM) */
 static int upload(const veil_request_t *req, veil_response_t *resp, void *ud) {
     (void)ud;
@@ -449,6 +490,12 @@ int main(void) {
     /* 溜めた本文を解析する (VEIL_ROUTE_FORM 無し。ファイルもメモリ上) */
     check(veil_register_route(cfg, "/parse", "POST", upload, NULL), "parse");
     check(veil_config_set(cfg, "api.multipart_max_file_size", "209715200"), "multipart");
+    /* 応答の圧縮: [route.compression] の無いハンドラのルートへ既定 (br・gzip、256 バイト以上) を入れる (F-270) */
+    check(veil_config_set(cfg, "api.compression", "true"), "api compression");
+    check(veil_register_route(cfg, "/json", "GET", json_items, NULL), "json");
+    check(veil_register_route_ex(cfg, "/json-raw", "GET", json_items, NULL, VEIL_ROUTE_NO_COMPRESS, NULL), "json-raw");
+    check(veil_register_route(cfg, "/json-nc", "GET", json_items, (void *)1), "json-nc");
+    check(veil_register_route(cfg, "/lines", "GET", lines, NULL), "lines");
 
     check(veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL), "SayHello");
     check(veil_register_grpc(cfg, "/demo.v1.Demo/CountUp", VEIL_GRPC_SERVER_STREAMING, count_up, NULL), "CountUp");

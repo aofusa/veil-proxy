@@ -1679,11 +1679,16 @@ pub(super) fn build_backend(
         )),
         #[cfg(feature = "handler")]
         BackendConfig::Handler { handler } => match crate::api::handler::lookup(handler) {
-            Some(entry) => Ok(Backend::Handler(
-                entry,
-                Arc::new(security),
-                modules_arc.clone(),
-            )),
+            Some(entry) => {
+                // F-270: 応答の圧縮はロード時に解決する（無効なら None で、要求ごとの判定は Option の確認 1 回）
+                let comp = (compression.enabled && entry.compress).then(|| Arc::new(compression));
+                Ok(Backend::Handler(
+                    entry,
+                    Arc::new(security),
+                    modules_arc.clone(),
+                    comp,
+                ))
+            }
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unknown handler '{}' (not registered)", handler),

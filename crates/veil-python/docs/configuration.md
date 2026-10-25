@@ -2,7 +2,7 @@
 
 ```python
 veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None, tls_key=None,
-         threads=None, overrides=None, openapi=True, listeners=None, http3=None)
+         threads=None, overrides=None, openapi=True, listeners=None, http3=None, compression=None)
 ```
 
 | Argument | Meaning |
@@ -15,10 +15,38 @@ veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None,
 | `threads` | Number of network workers (`[server].threads`) |
 | `overrides` | Keys to Python values, converted to TOML: `{"server.threads": 4, "api.max_body_size": 1048576}` |
 | `openapi` | `False` disables `/openapi.json` and `/docs` |
+| `compression` | `True` compresses handler responses with br or gzip when the client accepts it (`[api] compression`); see below |
 
 The environment variables `VEIL_OVERRIDE_<n>` work as usual, e.g.
 `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`. The precedence is default, file, environment,
 inline arguments. The keys are those of veil's `config.toml` (`examples/config.toml` in the repository).
+
+## Response compression
+
+`veil.run(compression=True)` (or `overrides={"api.compression": True}`) compresses handler responses with brotli or
+gzip, chosen from the request's `Accept-Encoding` (nothing is compressed without it). The default applies to bodies of
+256 bytes or more of type `application/json`, `text/*`, `application/javascript` and `image/svg+xml`; a
+`[route.compression]` table in `config.toml` for a handler route overrides it. Generators and `StreamingResponse` are
+compressed chunk by chunk; Server-Sent Events are not compressed.
+
+```python
+@veil.get("/report")
+def report():
+    return {"rows": rows()}                      # compressed when the client accepts it
+
+@veil.get("/raw", compress=False)                # never compress this route
+def raw():
+    return {"rows": rows()}
+
+@veil.get("/once")
+def once():
+    return veil.JSONResponse({"rows": rows()}, compress=False)   # or veil.Response(..., compress=False)
+
+veil.run(compression=True)
+```
+
+The compression runs in Rust on the network worker; the handler is unchanged. See "Response compression" in veil's
+library guide for the full rules.
 
 ## Several listeners
 

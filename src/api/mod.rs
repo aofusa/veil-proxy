@@ -44,6 +44,7 @@ pub mod upgrade;
 // F-262
 pub mod ws;
 // F-266
+pub(crate) mod compress;
 pub mod multipart;
 
 #[cfg(feature = "openapi")]

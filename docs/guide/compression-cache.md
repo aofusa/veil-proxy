@@ -33,6 +33,10 @@ url = "http://localhost:8080"
   enabled = true
 ```
 
+The same table applies to `type = "Handler"` routes of the API library (HTTP/1.1, HTTP/2 and HTTP/3, buffered and
+streaming responses); `[api] compression = true` gives handler routes a default for JSON APIs. See
+[library.md](library.md#response-compression).
+
 ### Configuration Options
 
 | Option | Description | Default |

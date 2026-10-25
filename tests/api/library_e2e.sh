@@ -72,6 +72,50 @@ expect() { # expect <name> <expected-substring> <command...>
   local got; got="$("$@" 2>&1)"
   if [[ "$got" == *"$want"* ]]; then ok "$name"; else bad "$name: want '$want' got '${got:0:300}'"; fi
 }
+sha_of() { "$PY3" -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+# F-270: comp_probe <accept-encoding|-> <url> [curl の引数...]: 応答の content-encoding・Vary の有無と、復号した本文の sha256
+comp_probe() {
+  local ae="$1" u="$2"; shift 2
+  local h="$TMPD/comp.h" b="$TMPD/comp.b"
+  if [ "$ae" = - ]; then curl -s -D "$h" -o "$b" "$@" "$u"; else curl -s --compressed -H "accept-encoding: $ae" -D "$h" -o "$b" "$@" "$u"; fi
+  local ce vary
+  ce=$(tr -d '\r' < "$h" | tr A-Z a-z | sed -n 's/^content-encoding: *//p' | tail -1)
+  vary=$(tr -d '\r' < "$h" | tr A-Z a-z | grep -c '^vary:.*accept-encoding')
+  echo "ce=${ce:-none} vary=$vary sha=$(sha_of "$b")"
+}
+# F-270: comp_suite <label> <base> <json> <compress=false のルート> <応答ごとに止めるルート|-> <ストリーミング> [curl の引数...]
+comp_suite() {
+  local L="$1" B="$2" J="$3" R="$4" N="$5" S="$6"; shift 6
+  local want sw
+  want=$(comp_probe - "$B$J" "$@" | sed 's/.*sha=//')
+  sw=$(comp_probe - "$B$S" "$@" | sed 's/.*sha=//')
+  expect "$L compression: br decodes to the original" "ce=br vary=1 sha=$want" comp_probe br "$B$J" "$@"
+  expect "$L compression: gzip decodes to the original" "ce=gzip vary=1 sha=$want" comp_probe gzip "$B$J" "$@"
+  expect "$L compression: q-values (gzip;q=1, br;q=0.5)" "ce=gzip" comp_probe "gzip;q=1, br;q=0.5" "$B$J" "$@"
+  expect "$L compression: configured order (gzip, deflate, br)" "ce=br" comp_probe "gzip, deflate, br" "$B$J" "$@"
+  expect "$L compression: none without Accept-Encoding" "ce=none vary=0" comp_probe - "$B$J" "$@"
+  expect "$L compression: identity only" "ce=none" comp_probe identity "$B$J" "$@"
+  expect "$L compression: compress=false route" "ce=none vary=0 sha=$want" comp_probe br "$B$R" "$@"
+  [ "$N" = - ] || expect "$L compression: per-response opt-out" "ce=none vary=0 sha=$want" comp_probe br "$B$N" "$@"
+  expect "$L compression: streaming gzip" "ce=gzip vary=1 sha=$sw" comp_probe gzip "$B$S" "$@"
+  expect "$L compression: streaming br" "ce=br vary=1 sha=$sw" comp_probe br "$B$S" "$@"
+}
+# F-270: comp_h3 <h3 の host:port> <path> <want sha>: HTTP/3 で gzip を受けて復号する（curl に HTTP/3 が無いので試験クライアント）
+comp_h3() {
+  "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "$1" GET "$2" -H 'accept-encoding: gzip' > "$TMPD/h3.out" 2>&1
+  "$PY3" -I -c '
+import gzip, hashlib, sys
+d = open(sys.argv[1], "rb").read()
+head, _, body = d.partition(b"\r\n\r\n")
+ce = "none"
+for line in head.split(b"\r\n")[1:]:
+    k, _, v = line.partition(b":")
+    if k.strip().lower() == b"content-encoding":
+        ce = v.strip().decode()
+if ce == "gzip":
+    body = gzip.decompress(body)
+print("ce=%s sha=%s" % (ce, hashlib.sha256(body).hexdigest()))' "$TMPD/h3.out"
+}
 
 run_rust() {
   echo "== Rust (examples/api/rust-showcase)"
@@ -86,6 +130,7 @@ level = "info"
 [api]
 multipart_max_file_size = 209715200
 upload_tmp_dir = "$W/up"
+compression = true
 [[l4]]
 name = "tcp_echo"
 listen = "127.0.0.1:$L4"
@@ -126,6 +171,11 @@ TOML
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
   run_rust_multipart "$B" "$W" "$PID"
+  # F-270: [api] compression = true（ルートの compress = false・256 バイト未満・ストリーミング）
+  comp_suite "rust" "$B" /dataset/200 /dataset-raw/200 - /stream-big
+  comp_suite "rust h2c" "$B" /dataset/200 /dataset-raw/200 - /stream-big --http2-prior-knowledge
+  expect "rust compression: small body stays identity" "ce=none" comp_probe br "$B/hello"
+  expect "rust compression: HEAD has no body" "content-encoding: br" bash -c "curl -s -I -H 'accept-encoding: br' '$B/dataset/200' | tr A-Z a-z"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
@@ -387,6 +437,14 @@ print(body.decode().replace("\n", "|") + ("|x-from: c" if ok else "|bad head " +
   echo "$out" | sed 's/^/  /'
   [ "$rc" = 0 ] && ok "C gRPC interop (tonic + HTTP/3, exit 0)" || bad "C gRPC interop (exit $rc)"
   run_c_multipart "$B" "$W" "$PID" "$S"
+  # F-270: api.compression（VEIL_ROUTE_NO_COMPRESS・veil_response_no_compression・ストリーミング・HTTP/3）
+  comp_suite "C" "$B" /json /json-raw /json-nc /lines
+  comp_suite "C h2c" "$B" /json /json-raw /json-nc /lines --http2-prior-knowledge
+  expect "C compression: SSE stays identity" "ce=none" comp_probe gzip "$B/sse" -N
+  local jsha lsha
+  jsha=$(comp_probe - "$B/json" | sed 's/.*sha=//'); lsha=$(comp_probe - "$B/lines" | sed 's/.*sha=//')
+  expect "C compression (HTTP/3, gzip)" "ce=gzip sha=$jsha" comp_h3 "127.0.0.1:$S" /json
+  expect "C streaming compression (HTTP/3, gzip)" "ce=gzip sha=$lsha" comp_h3 "127.0.0.1:$S" /lines
   kill "$PID"
 }
 
@@ -556,6 +614,9 @@ run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio
     expect "py L4 TCP echo" "py-tcp" l4_echo tcp "$L4" py-tcp
     expect "py L4 UDP echo" "echo:py-udp" l4_echo udp "$U" py-udp
     run_python_multipart "$B" "$W" "$PID"
+    # F-270: veil.run(compression=True)・compress=False・Response.compress = False・ジェネレータ
+    comp_suite "py" "$B" /data /data-raw /data-nc /lines
+    comp_suite "py h2c" "$B" /data /data-raw /data-nc /lines --http2-prior-knowledge
   else
     bad "python-features start"; cat "$W/f.log"
   fi
@@ -900,6 +961,9 @@ run_nonregression() {
   # F-266: multipart（veil::api::multipart・C の veil_multipart_next）も入らない
   n=$(grep -cE "veil::api::multipart|veil_multipart_|multipart_parse" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::multipart in the full binary" || bad "multipart symbols found ($n)"
+  # F-270: ハンドラの応答の圧縮（veil::api::compress・C の veil_response_no_compression）も入らない
+  n=$(grep -cE "veil::api::compress|veil_response_no_compression" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::compress in the full binary" || bad "handler compression symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-198: api の既定（tokio-compat）は tokio に依存しない

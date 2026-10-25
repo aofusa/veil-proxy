@@ -84,6 +84,8 @@ pub enum Backend {
         Arc<crate::api::handler::HandlerEntry>,
         Arc<SecurityConfig>,
         Option<Arc<Vec<ModuleRef>>>,
+        /// F-270: 応答の圧縮（ルートの `[route.compression]`。無効・ルートが `compress = false` なら None）
+        Option<Arc<CompressionConfig>>,
     ),
 }
 
@@ -115,7 +117,7 @@ impl Backend {
             Backend::Redirect(_, _, _, _, security) => security,
             Backend::Respond(r) => &r.security,
             #[cfg(feature = "handler")]
-            Backend::Handler(_, security, _) => security,
+            Backend::Handler(_, security, _, _) => security,
         }
     }
 
@@ -130,7 +132,7 @@ impl Backend {
             Backend::Redirect(_, _, _, modules, _) => modules.as_ref(),
             Backend::Respond(_) => None,
             #[cfg(feature = "handler")]
-            Backend::Handler(_, _, modules) => modules.as_ref(),
+            Backend::Handler(_, _, modules, _) => modules.as_ref(),
         }
     }
 
@@ -150,7 +152,7 @@ impl Backend {
             }
             Backend::Respond(_) => None,
             #[cfg(feature = "handler")]
-            Backend::Handler(_, _, modules) => {
+            Backend::Handler(_, _, modules, _) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
         }

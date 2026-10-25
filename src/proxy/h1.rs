@@ -806,7 +806,7 @@ pub(super) async fn handle_requests(
                 // multipart はパートごとの上限を見る）
                 #[cfg(feature = "handler")]
                 let checked_length = match &backend {
-                    Backend::Handler(e, _, _) if e.streaming_request => 0,
+                    Backend::Handler(e, _, _, _) if e.streaming_request => 0,
                     _ => content_length,
                 };
                 #[cfg(not(feature = "handler"))]
@@ -1548,10 +1548,11 @@ pub(super) async fn handle_backend(
             .await
         }
         #[cfg(feature = "handler")]
-        Backend::Handler(entry, _, _) => {
+        Backend::Handler(entry, _, _, comp) => {
             Box::pin(handle_api_handler(
                 tls_stream,
                 &entry,
+                comp.as_deref(),
                 method,
                 req_path,
                 content_length,
@@ -1585,6 +1586,7 @@ pub(super) fn backend_consumes_request_body(backend: &Backend) -> bool {
 pub(super) async fn handle_api_handler(
     mut tls_stream: ServerTls,
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     method: &Bytes,
     req_path: &Bytes,
     content_length: usize,
@@ -1601,6 +1603,7 @@ pub(super) async fn handle_api_handler(
         return handle_api_streaming(
             tls_stream,
             entry,
+            comp,
             method,
             req_path,
             content_length,
@@ -1647,7 +1650,7 @@ pub(super) async fn handle_api_handler(
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
-    let resp = crate::api::dispatch::call_with(entry, req, api_cache).await;
+    let resp = crate::api::dispatch::call_with(entry, req, api_cache, comp).await;
     write_api_response(tls_stream, resp, client_wants_close, api_cache).await
 }
 
@@ -1710,6 +1713,7 @@ async fn write_api_response(
 async fn handle_api_streaming(
     mut tls_stream: ServerTls,
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     method: &Bytes,
     req_path: &Bytes,
     content_length: usize,
@@ -1750,7 +1754,7 @@ async fn handle_api_streaming(
             std::pin::Pin<Box<dyn std::future::Future<Output = Ev> + '_>>,
         > = FuturesUnordered::new();
         set.push(Box::pin(
-            crate::api::dispatch::call_with(entry, req, api_cache).map(Ev::Resp),
+            crate::api::dispatch::call_with(entry, req, api_cache, comp).map(Ev::Resp),
         ));
         set.push(Box::pin(
             pump_api_body(&mut tls_stream, content_length, first, tx).map(Ev::Pumped),

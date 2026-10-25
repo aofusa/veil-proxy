@@ -354,6 +354,11 @@ impl ConfigBuilder {
         max_body_size, "api.max_body_size", v: usize => toml::Value::Integer(v as i64)
     );
     setter!(
+        // F-270
+        /// `[api].compression`: compress handler responses with br or gzip when the client accepts them (default `false`).
+        compression, "api.compression", v: bool => toml::Value::Boolean(v)
+    );
+    setter!(
         /// `[api].handler_threads`: the number of threads in the pool that runs blocking, Python and C handlers.
         handler_threads, "api.handler_threads", v: usize => toml::Value::Integer(v as i64)
     );

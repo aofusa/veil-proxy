@@ -266,6 +266,7 @@ for debugging.
 | `multipart_max_header_size` | `8192` | maximum size of the headers of one part |
 | `multipart_spool_threshold` | `1048576` | Python `UploadFile` and C `VEIL_ROUTE_FORM`: larger files are written to a temporary file instead of memory |
 | `upload_tmp_dir` | OS temp dir | directory of the anonymous temporary files for uploads (added to the Landlock / unveil write paths) |
+| `compression` | `false` | compress handler responses with br or gzip when the client accepts it: handler routes without their own `[route.compression]` get `{ preferred_encodings = ["br", "gzip"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` (needs the `compression` feature; see [Response compression](#response-compression)) |
 
 ## Routing macros
 
@@ -283,6 +284,7 @@ async fn get_user(id: u64, verbose: Option<bool>) -> Result<Json<User>, ApiError
 | `status = 201` | default success status for OpenAPI |
 | `offload = true/false` | run on the handler pool; default `true` for a sync `fn`, `false` for `async fn` |
 | `hidden = true` | leave the route out of the OpenAPI document |
+| `compress = false` | never compress this route's responses (see [Response compression](#response-compression)) |
 
 ### Arguments (FastAPI style)
 
@@ -548,6 +550,52 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
 
 Examples: `/profile`, `/files-upload` and `/upload-stream` in [examples/api/rust-showcase/](../../examples/api/rust-showcase/),
 `/upload` in [examples/api/python-features/](../../examples/api/python-features/) and
+[examples/api/c-features/](../../examples/api/c-features/).
+
+## Response compression
+
+Handler responses are compressed with the same `[route.compression]` table as proxied responses
+([compression-cache.md](compression-cache.md)), on HTTP/1.1, HTTP/2 and HTTP/3, for buffered and streaming bodies
+(needs the `compression` feature, which `full` includes and `api` does not). `[api] compression = true` (builder
+`.compression(true)`, Python `veil.run(compression=True)`, C `veil_config_set(cfg, "api.compression", "true")`) gives
+every handler route without its own `[route.compression]` a default that suits JSON APIs: br, then gzip, from 256
+bytes, for `application/json`, `text/*`, `application/javascript` and `image/svg+xml`.
+
+```toml
+[api]
+compression = true            # default for all handler routes
+
+[[route]]                     # or per route (the route's table wins over [api] compression)
+[route.conditions]
+path = "/reports"
+[route.action]
+type = "Handler"
+handler = "reports"
+[route.compression]
+enabled = true
+preferred_encodings = ["br", "gzip"]
+brotli_level = 5
+```
+
+- The coding is chosen from `Accept-Encoding` by q-value, ties broken by `preferred_encodings` order (`q=0` and `*`
+  are honoured). Without `Accept-Encoding`, or when nothing listed is acceptable, the response is sent as is.
+- A compressed response gets `Content-Encoding`, `Vary: Accept-Encoding` and a recomputed `Content-Length` (a
+  strong `ETag` becomes weak). `HEAD` gets the same headers as `GET` without a body.
+- Not compressed: bodies under `min_size`, content types outside `compressible_types` (or in `skip_types`), responses
+  that already have `Content-Encoding`, `Cache-Control: no-transform`, `Content-Range`, status 1xx, 204, 206 and 304,
+  protocol upgrades, WebSockets and gRPC. Streaming bodies (`Response::stream`, Python generators, C
+  `veil_response_stream`) are compressed chunk by chunk with a flush after each chunk; `text/event-stream` is left
+  alone unless `compressible_types` lists it.
+- Opting out: `#[veil::route(..., compress = false)]` / `App::route_compression(false)` for a route,
+  `Response::no_compression()` for one response; Python `@app.get(..., compress=False)` and
+  `veil.Response(..., compress=False)` (also `JSONResponse` and `StreamingResponse`); C `VEIL_ROUTE_NO_COMPRESS` and
+  `veil_response_no_compression(resp)`.
+- Routes and responses that are not compressed take no extra allocation; the encoders' work areas are reused per
+  thread. `[http3] compression*` keys apply to proxied HTTP/3 responses only.
+
+Examples: `/dataset/{count}`, `/dataset-raw/{count}` and `/stream-big` in
+[examples/api/rust-showcase/](../../examples/api/rust-showcase/), `/data`, `/data-raw`, `/data-nc` and `/lines` in
+[examples/api/python-features/](../../examples/api/python-features/), `/json`, `/json-raw`, `/json-nc` and `/lines` in
 [examples/api/c-features/](../../examples/api/c-features/).
 
 ## Validation and OpenAPI

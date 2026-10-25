@@ -55,8 +55,13 @@ impl CallCache {
 
 /// Calls the handler. A body over the limit gives 413 and a handler panic gives 500; for HEAD the body is dropped
 /// and `content-length` carries the original length.
-pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
-    call_with(entry, req, &mut CallCache::default()).await
+/// `comp` is the route's compression (`Backend::Handler`; `None` when off).
+pub(crate) async fn call(
+    entry: &HandlerEntry,
+    req: Request,
+    comp: Option<&crate::config::CompressionConfig>,
+) -> Response {
+    call_with(entry, req, &mut CallCache::default(), comp).await
 }
 
 /// Like [`call`], but uses the per-connection [`CallCache`] (reduces per-request allocation on HTTP/1.1 keep-alive).
@@ -64,11 +69,17 @@ pub(crate) async fn call_with(
     entry: &HandlerEntry,
     req: Request,
     cache: &mut CallCache,
+    comp: Option<&crate::config::CompressionConfig>,
 ) -> Response {
     if req.body.len() > super::app::max_body_size() {
         return Response::error(413, "Payload Too Large");
     }
     let head = &req.method[..] == b"HEAD";
+    // F-270: 圧縮するルートだけ、要求が handler へ移る前に Accept-Encoding を取っておく（参照カウントのみ）
+    let accept = match comp {
+        Some(_) => super::compress::accept_encoding(&req.headers),
+        None => None,
+    };
     // tokio 互換レイヤー（F-198）: ハンドラの中で使う同期プリミティブ・チャネルが別スレッドから
     // 起こしても、所有スレッドで再開するように Waker を包む
     #[cfg(feature = "tokio-compat")]
@@ -89,6 +100,15 @@ pub(crate) async fn call_with(
     if resp.upgrade.is_some() {
         super::upgrade::check_response(&mut resp, cache.upgrade_allowed && !head);
     }
+    let mut head_encoded = false;
+    if let (Some(c), Some(a)) = (comp, accept.as_deref()) {
+        if head {
+            // HEAD は本文を圧縮せず、GET と同じヘッダだけ付ける（圧縮した長さは分からないので content-length も付けない）
+            head_encoded = super::compress::apply_head(&mut resp, Some(a), c);
+        } else {
+            super::compress::apply(&mut resp, Some(a), c);
+        }
+    }
     if head {
         // HEAD はストリームを送らない（drop でハンドラ側の生成を止める）。長さは不明なので付けない。
         if resp.stream.take().is_some() {
@@ -101,10 +121,11 @@ pub(crate) async fn call_with(
         }
         let len = resp.body.len();
         resp.body = Bytes::new();
-        if !resp
-            .headers
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
+        if !head_encoded
+            && !resp
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
         {
             let mut buf = itoa::Buffer::new();
             resp.headers.push((
@@ -264,7 +285,7 @@ mod tests {
             "127.0.0.1",
             HttpVersion::Http11,
         );
-        let resp = futures::executor::block_on(call(&entry, req));
+        let resp = futures::executor::block_on(call(&entry, req, None));
         assert!(!resp.is_streaming());
         let h = String::from_utf8(http1_head(&resp, true)).unwrap();
         assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{}", h);

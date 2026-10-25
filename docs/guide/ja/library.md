@@ -256,6 +256,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `multipart_max_header_size` | `8192` | 1 パートのヘッダの大きさの上限 |
 | `multipart_spool_threshold` | `1048576` | Python の `UploadFile`・C の `VEIL_ROUTE_FORM`: これより大きいファイルはメモリでなく一時ファイルに書く |
 | `upload_tmp_dir` | OS の一時ディレクトリ | アップロードの名前の無い一時ファイルを置くディレクトリ（Landlock・unveil の書き込み許可に足す） |
+| `compression` | `false` | クライアントが受け付けるときハンドラの応答を br・gzip で圧縮する。自前の `[route.compression]` の無いハンドラのルートに `{ preferred_encodings = ["br", "gzip"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` を入れる（`compression` feature が必要。[応答の圧縮](#応答の圧縮)） |
 
 ## ルーティングマクロ
 
@@ -273,6 +274,7 @@ async fn get_user(id: u64, verbose: Option<bool>) -> Result<Json<User>, ApiError
 | `status = 201` | OpenAPI に載せる成功ステータス |
 | `offload = true/false` | ハンドラ用プールで実行するか。同期 `fn` は既定 `true`、`async fn` は既定 `false` |
 | `hidden = true` | OpenAPI ドキュメントに載せない |
+| `compress = false` | このルートの応答を圧縮しない（[応答の圧縮](#応答の圧縮)） |
 
 ### 引数の束縛（FastAPI 方式）
 
@@ -518,6 +520,48 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
 
 例: [examples/api/rust-showcase/](../../../examples/api/rust-showcase/) の `/profile`・`/files-upload`・`/upload-stream`、
 [examples/api/python-features/](../../../examples/api/python-features/) と [examples/api/c-features/](../../../examples/api/c-features/) の `/upload`。
+
+## 応答の圧縮
+
+ハンドラの応答は、プロキシの応答と同じ `[route.compression]` の表（[compression-cache.md](compression-cache.md)）で圧縮する。
+HTTP/1.1・HTTP/2・HTTP/3、バッファの本文・ストリーミングの本文のどちらも対象（`compression` feature が必要。`full` には入り、
+`api` には入らない）。`[api] compression = true`（ビルダの `.compression(true)`、Python の `veil.run(compression=True)`、C の
+`veil_config_set(cfg, "api.compression", "true")`）にすると、自前の `[route.compression]` の無いハンドラのルートに JSON の API 向けの
+既定（br、次に gzip、256 バイト以上、`application/json`・`text/*`・`application/javascript`・`image/svg+xml`）が入る。
+
+```toml
+[api]
+compression = true            # ハンドラのルート全体の既定
+
+[[route]]                     # ルートごとにも書ける（ルートの表が [api] compression より優先）
+[route.conditions]
+path = "/reports"
+[route.action]
+type = "Handler"
+handler = "reports"
+[route.compression]
+enabled = true
+preferred_encodings = ["br", "gzip"]
+brotli_level = 5
+```
+
+- 方式は `Accept-Encoding` の q 値で選び、同じ q 値なら `preferred_encodings` の順（`q=0`・`*` も扱う）。`Accept-Encoding` が無い、
+  または受け付ける方式が無いときはそのまま送る。
+- 圧縮した応答には `Content-Encoding`・`Vary: Accept-Encoding` を付け、`Content-Length` を付け直す（強い `ETag` は弱い ETag にする）。
+  `HEAD` には本文無しで `GET` と同じヘッダを付ける。
+- 圧縮しないもの: `min_size` 未満の本文、`compressible_types` に無い（または `skip_types` にある）型、既に `Content-Encoding` がある応答、
+  `Cache-Control: no-transform`、`Content-Range`、状態 1xx・204・206・304、プロトコルのアップグレード・WebSocket・gRPC。
+  ストリーミングの本文（`Response::stream`・Python のジェネレータ・C の `veil_response_stream`）は断片ごとに圧縮して毎回 flush する。
+  `text/event-stream` は `compressible_types` に書いたときだけ圧縮する。
+- 止め方: ルートは `#[veil::route(..., compress = false)]`・`App::route_compression(false)`、応答ごとは `Response::no_compression()`。
+  Python は `@app.get(..., compress=False)`・`veil.Response(..., compress=False)`（`JSONResponse`・`StreamingResponse` も）、
+  C は `VEIL_ROUTE_NO_COMPRESS`・`veil_response_no_compression(resp)`。
+- 圧縮しないルート・応答は確保を増やさない。エンコーダの作業領域はスレッドごとに使い回す。`[http3] compression*` のキーは
+  プロキシの HTTP/3 の応答だけに効く。
+
+例: [examples/api/rust-showcase/](../../../examples/api/rust-showcase/) の `/dataset/{count}`・`/dataset-raw/{count}`・`/stream-big`、
+[examples/api/python-features/](../../../examples/api/python-features/) の `/data`・`/data-raw`・`/data-nc`・`/lines`、
+[examples/api/c-features/](../../../examples/api/c-features/) の `/json`・`/json-raw`・`/json-nc`・`/lines`。
 
 ## バリデーションと OpenAPI
 

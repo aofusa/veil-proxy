@@ -753,7 +753,7 @@ mod tests {
             "127.0.0.1",
             super::super::HttpVersion::Http2,
         );
-        let resp = futures::executor::block_on(super::super::dispatch::call(&entry, req));
+        let resp = futures::executor::block_on(super::super::dispatch::call(&entry, req, None));
         assert_eq!(resp.status_code(), 400);
     }
 }

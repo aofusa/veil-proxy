@@ -42,6 +42,8 @@ extern "C" {
  * コールバックの前に返す。
  */
 #define VEIL_ROUTE_FORM 4u
+/* このルートの応答を [route.compression] / [api] compression で圧縮しない (F-270)。 */
+#define VEIL_ROUTE_NO_COMPRESS 8u
 
 /* ---- 不透明型 ---- */
 typedef struct veil_config   veil_config_t;   /* 設定 + 登録待ちルート */
@@ -194,6 +196,8 @@ int veil_response_set_body(veil_response_t *resp, const uint8_t *data, size_t le
 int veil_response_set_text(veil_response_t *resp, const char *text);
 /* application/json の本文 (呼び出し側が正しい JSON を渡す)。 */
 int veil_response_set_json(veil_response_t *resp, const char *json);
+/* この応答を圧縮しない (ルートが [route.compression] / [api] compression で圧縮するときも。F-270)。 */
+int veil_response_no_compression(veil_response_t *resp);
 
 /* ---- ストリーミング (F-210。ハンドラ用プールのルートだけ) ----
  *

@@ -19,6 +19,8 @@ struct RouteArgs {
     offload: Option<bool>,
     hidden: bool,
     streaming: bool,
+    // F-270: `compress = false` で応答を圧縮しない
+    no_compress: bool,
     // F-262: WebSocket のルートの OpenAPI（`x-veil-websocket`）
     ws_receive: Option<Type>,
     ws_send: Option<Type>,
@@ -75,7 +77,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                 },
                 _ => return Err(Error::new(value.span(), "expected an integer")),
             },
-            "offload" | "hidden" | "streaming" => {
+            "offload" | "hidden" | "streaming" | "compress" => {
                 let b = match &value {
                     Expr::Lit(l) => match &l.lit {
                         Lit::Bool(b) => b.value,
@@ -86,12 +88,13 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                 match key.as_str() {
                     "offload" => a.offload = Some(b),
                     "hidden" => a.hidden = b,
+                    "compress" => a.no_compress = !b,
                     _ => a.streaming = b,
                 }
             }
             other => {
                 return Err(meta.error(format!(
-                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming, ws_receive, ws_send, ws_protocols)",
+                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming, compress, ws_receive, ws_send, ws_protocols)",
                     other
                 )))
             }
@@ -530,6 +533,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let hidden = args.hidden;
     // F-266: `Multipart` は本文をストリーミングで受ける
     let streaming = args.streaming || mp_stream;
+    let compress = !args.no_compress;
     let resp_content = response_content(&func.sig.output);
     let ok_status = args.status.unwrap_or(200);
     if !is_ws
@@ -621,6 +625,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 handler: #handler_ident,
                 meta: #meta_ident,
                 streaming_request: #streaming,
+                compress: #compress,
             }
         }
     })

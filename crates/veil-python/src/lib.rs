@@ -34,6 +34,8 @@ struct PendingRoute {
     on_loop: bool,
     // F-266: Form・File の引数がある（本文を先に読み、multipart はパートに分けて渡す）
     form: bool,
+    // F-270: 応答を `[route.compression]`・`[api] compression` で圧縮してよい
+    compress: bool,
 }
 
 // F-263: `@app.websocket` のルート（`run` までの間に溜める）。
@@ -283,7 +285,7 @@ impl PyConfig {
 
 /// Register an HTTP route (collected until `run`).
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false, form=false))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false, form=false, compress=true))]
 #[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
 fn register_route(
     path: String,
@@ -295,6 +297,7 @@ fn register_route(
     stream_body: bool,
     on_loop: bool,
     form: bool,
+    compress: bool,
 ) -> PyResult<()> {
     let openapi = parse_openapi(openapi_json)?;
     PENDING.lock().unwrap().push(PendingRoute {
@@ -307,6 +310,7 @@ fn register_route(
         stream_body,
         on_loop,
         form,
+        compress,
     });
     Ok(())
 }
@@ -447,7 +451,8 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
             app.route_fn_streaming(&name, &methods, &r.path, func, meta)
         } else {
             app.route_fn(&name, &methods, &r.path, func, meta)
-        };
+        }
+        .route_compression(r.compress);
     }
     for (i, w) in std::mem::take(&mut *PENDING_WS.lock().unwrap())
         .into_iter()

@@ -7,6 +7,7 @@
 //! - L4 ネイティブハンドラ（TCP エコー・UDP エコー）
 //! - ストリーミング応答とトレーラ・ストリーミング受信（F-197）
 //! - multipart/form-data のフォームとファイルのアップロード（F-266）
+//! - 応答の圧縮（`[api] compression`・`[route.compression]`、ルート単位の `compress = false`。F-270）
 //! - config.toml の取り込みと Rust コードでの上書き
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,6 +125,38 @@ async fn stream_lines() -> Response {
             bytes::Bytes::from_static(b"x-lines"),
             bytes::Bytes::from_static(b"3"),
         )])));
+    Response::stream(200, futures::stream::iter(chunks)).with_header("content-type", "text/plain")
+}
+
+/// 件数ぶんの JSON（`[api] compression = true` なら Accept-Encoding に応じて gzip・br で返る。F-270）
+#[veil::route(path = "/dataset/{count}", method = "GET", tags = ["demo"])]
+async fn dataset(count: u32) -> Json<serde_json::Value> {
+    Json(dataset_json(count))
+}
+
+fn dataset_json(count: u32) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = (0..count.min(10_000))
+        .map(|i| serde_json::json!({"id": i, "name": format!("item-{}", i), "price": i * 3, "tags": ["a", "b"]}))
+        .collect();
+    serde_json::json!({ "count": items.len(), "items": items })
+}
+
+/// 同じ本文でも圧縮しないルート（`compress = false`）
+#[veil::route(path = "/dataset-raw/{count}", method = "GET", compress = false, tags = ["demo"])]
+async fn dataset_raw(count: u32) -> Json<serde_json::Value> {
+    Json(dataset_json(count))
+}
+
+/// 長い行を断片で返す（ストリーミング応答の圧縮は断片ごとに flush する）
+#[veil::route(path = "/stream-big", method = "GET", tags = ["demo"])]
+async fn stream_big() -> Response {
+    let chunks = (1..=50).map(|i| {
+        BodyChunk::Data(bytes::Bytes::from(format!(
+            "line {:04} {}\n",
+            i,
+            "x".repeat(200)
+        )))
+    });
     Response::stream(200, futures::stream::iter(chunks)).with_header("content-type", "text/plain")
 }
 
