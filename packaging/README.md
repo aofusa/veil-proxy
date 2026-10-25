@@ -578,6 +578,10 @@ packaging/output/veil-0.9.2-x86_64-unknown-linux-musl.tar.gz
   `tools/release/binary-smoke.sh`、deb・rpm は 8 つの配布 × 2 アーキの `test-package.sh` と署名付きのリポジトリ・改ざんの試験、
   Homebrew は `homebrew-test.sh`、MSI は `test-msi.ps1` と winget のマニフェスト。どれかが落ちると draft を作らない。
 - **draft（`release-draft`）:** `tools/release/github-draft.sh`。あれば差し替え、公開済みには触れない。rc も draft（`--prerelease`）。
+  公開済みのタグの run を再実行したとき（公開の後に試験の job だけを確かめ直す）は、draft・SHA256SUMS・署名・attestation を
+  作り直さずに成功で終わる（B-168）ので、公開の後も画面から試験の job を再実行してよい。
+- **BSD の port の試験:** 本番のタグ（`v<版>`）の run だけ GitHub のタグの tarball を取る。rc のタグ・ブランチは checkout した木から
+  tarball を作って試す（B-169）。
 - **公開の後（`release-downstream.yml`）:** 鍵・token が無ければ失敗する（止めるときはリポジトリの変数
   `DOCKERHUB_MIRROR`・`HOMEBREW_TAP`・`PACKAGE_REPOS`・`WINGET`・`MINISIGN` を `off`）。
 

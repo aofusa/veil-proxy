@@ -477,8 +477,8 @@
 | B-162 | P1 | 完了 | [bugs/B-162-proxy-cache-small-responses-never-stored.md](bugs/B-162-proxy-cache-small-responses-never-stored.md) | プロキシのキャッシュが、最初の読み込みに収まる小さい応答を一度も保存しない（残りの本文を転送するときにしか保存していなかった）。E2E は本文の一致で通っていた |
 | B-163 | P1 | 完了 | [bugs/B-163-sandbox-barrier-cleartext-only.md](bugs/B-163-sandbox-barrier-cleartext-only.md) | 平文のリスナーだけの設定で、FreeBSD は capability mode の要求で起動を中止し、OpenBSD の pledge・macOS の sandbox_init は黙って掛からない（bind のバリアが TLS のワーカーだけを数えていた）。平文のワーカーも数え、時間切れは fail-closed |
 | B-167 | P1 | 完了 | [bugs/B-167-windows-vcruntime-dependency.md](bugs/B-167-windows-vcruntime-dependency.md) | 配布する Windows の veil.exe が VCRUNTIME140.dll を読み込み、Visual C++ 再頒布パッケージの無い Windows で起動しない（winget の検証で発覚）。C ランタイムを静的にリンクし、import 表の検査と Nano Server での起動を release に足す（v0.9.2） |
-| B-168 | P2 | 未修正 | [bugs/B-168-release-rerun-after-publish.md](bugs/B-168-release-rerun-after-publish.md) | 公開の後に release の job（試験だけの port 等）を再実行すると draft の job も走り、公開物と合わない SHA256SUMS の署名・attestation を作ってから失敗する。公開済みなら draft の job を飛ばす |
-| B-169 | P3 | 未修正 | [bugs/B-169-rc-port-test-fetches-final-tag.md](bugs/B-169-rc-port-test-fetches-final-tag.md) | rc のタグでは BSD の port の試験がまだ無い本番のタグのソースを取りに行き 404 で失敗する（rc で port を確かめられない） |
+| B-168 | P2 | 修正済み（v0.10.0） | [bugs/B-168-release-rerun-after-publish.md](bugs/B-168-release-rerun-after-publish.md) | 公開の後に release の job（試験だけの port 等）を再実行すると draft の job も走り、公開物と合わない SHA256SUMS の署名・attestation を作ってから失敗する。公開済みなら draft の job を飛ばす |
+| B-169 | P3 | 修正済み（v0.10.0） | [bugs/B-169-rc-port-test-fetches-final-tag.md](bugs/B-169-rc-port-test-fetches-final-tag.md) | rc のタグでは BSD の port の試験がまだ無い本番のタグのソースを取りに行き 404 で失敗する（rc で port を確かめられない） |
 
 ---
 

@@ -448,12 +448,22 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-      - name: source tarball (before the tag exists)
-        if: ${{ !startsWith(inputs.ref, 'v') }}
+      # B-169: GitHub のタグの tarball を取るのは、ref が Cargo.toml の版の本番のタグ（v<版>、`-` を含まない）のときだけ。
+      # rc のタグ・ブランチでは port が指す v<版> のタグがまだ無いので、checkout した木から作る
+      - name: source tarball (unless the ref is the final tag of this version)
+        id: src
+        env:
+          REF: ${{ inputs.ref }}
         run: |
           mkdir -p ports-out
           v="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
-          git archive --format=tar.gz --prefix="veil-proxy-$v/" -o ports-out/src.tar.gz HEAD
+          if [ "$REF" = "v$v" ] && [ "${v#*-}" = "$v" ]; then
+            echo "local=0" >> "$GITHUB_OUTPUT"
+          else
+            git archive --format=tar.gz --prefix="veil-proxy-$v/" -o ports-out/src.tar.gz HEAD
+            echo "local=1" >> "$GITHUB_OUTPUT"
+            echo "::notice title=port source::$REF is not the final tag v$v; using the checked-out tree"
+          fi
       - name: build the port, install the package, start the service
         id: vm
         timeout-minutes: 85
@@ -469,13 +479,14 @@ jobs:
           environment_variables: VEIL_PORT_LOCAL_SRC
           run: |
             mkdir -p ports-out
-            tag="$(git describe --tags --exact-match 2>/dev/null || echo "v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)")"
+            # port は Cargo.toml の版のタグを指す（rc でも同じ。ソースは上の step が決める。B-169）
+            tag="v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
             # sudo は環境変数を落とすので、渡すものは env で明示する
             sudo env VEIL_PORT_LOCAL_SRC="${VEIL_PORT_LOCAL_SRC:-0}" sh tools/release/bsd-port-test.sh ${{ matrix.os }} "$tag" ports-out > ports-out/test.log 2>&1 || echo PORT_FAILED >> ports-out/test.log
             sudo chown -R "$(id -u)" ports-out || true
         env:
-          # タグの tarball がまだ GitHub に無いときは、checkout した木から作る
-          VEIL_PORT_LOCAL_SRC: ${{ startsWith(inputs.ref, 'v') && '0' || '1' }}
+          # タグの tarball がまだ GitHub に無いとき（rc・ブランチ）は、checkout した木から作る
+          VEIL_PORT_LOCAL_SRC: ${{ steps.src.outputs.local }}
       - name: report
         if: always()
         run: |

@@ -36,3 +36,12 @@ GitHub Actions の画面から再実行しようとしたところ、`GitHub Rel
 
 公開の後に試験だけを確かめ直すときは、画面から再実行せず、その job だけを抜き出した一時的な workflow を一時ブランチで
 回す（v0.9.2 の NetBSD の port はそうした）。
+
+## 実施内容（2026-10-25）
+
+- `release.yml` の `release-draft` の checkout の直後に `release state` の step を足し、`gh release view --json isDraft` が
+  `false`（公開済み）なら notice を出して output `published=true` にし、以降の全 step（成果物の取得・ports の tarball・
+  SHA256SUMS・cosign・attestation・ノート・draft）を `if: steps.state.outputs.published != 'true'` で飛ばす。job は成功で終わる。
+- `github-draft.sh` の「公開済みなら失敗」は多重の安全網として残した。
+- packaging/README.md の公開の節に、公開の後も試験の job を画面から再実行してよいことを書いた。
+- 試験: 次の rc・本番の run で、公開前は従来どおり（published=false）に全 step が走ることを確かめる。公開済みの再実行は v0.10.0 の公開の後に port の job を 1 つ再実行して、署名・attestation の step が skipped になることを確かめる。
