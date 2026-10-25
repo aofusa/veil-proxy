@@ -196,38 +196,78 @@ impl FilterEngine {
         .await
     }
 
-    /// Proxy-Wasm SDK ライフサイクル（_start → root/HTTP コンテキスト生成 → vm_start →
-    /// configure → 指定ヘッダコールバック）を実行して action を返す（ヘッダ系フィルタ共通）。
-    async fn run_headers_module(
-        &self,
-        module: &LoadedModule,
-        configuration: &Arc<[u8]>,
-        store: &mut Store<HostState>,
-        callback_name: &str,
-        num_headers: i32,
-        end_of_stream: bool,
-    ) -> anyhow::Result<(i32, wasmtime::Instance)> {
+    /// Store に 1 回のコールバックの燃料と締切を入れる
+    fn arm_store(&self, store: &mut Store<HostState>) -> anyhow::Result<()> {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
+        Ok(())
+    }
 
-        // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut *store).await?;
+    /// 1 回の HTTP のコールバックに使うインスタンスを用意する（F-271）。
+    ///
+    /// `instance_reuse` のモジュールは、同じ設定で作ったインスタンスがプールにあればそれに `http_ctx` を入れて
+    /// http context を作るだけにする。無ければ（または使い回さないモジュールは）新しいインスタンスで
+    /// Proxy-Wasm SDK のライフサイクル（_start → root コンテキスト生成 → vm_start → configure → HTTP コンテキスト生成）を
+    /// 実行する。失敗したら `http_ctx` を返す（呼び出し元はヘッダ等を回収できる）。
+    async fn open_session(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        http_ctx: HttpContext,
+    ) -> Result<Session, (anyhow::Error, Box<HttpContext>)> {
+        let root_context_id = 1i32;
+        if module.instance_reuse {
+            if let Some(mut p) = module.pool.take(configuration) {
+                p.store.data_mut().http_ctx = http_ctx;
+                let context_id = p.next_context_id;
+                let mut sess = Session {
+                    store: p.store,
+                    instance: p.instance,
+                    context_id,
+                    configuration: p.configuration,
+                    reuse: true,
+                };
+                if let Err(e) = self.arm_store(&mut sess.store) {
+                    return Err((e, Box::new(sess.into_ctx())));
+                }
+                if let Ok(func) = sess
+                    .instance
+                    .get_typed_func::<(i32, i32), ()>(&mut sess.store, "proxy_on_context_create")
+                {
+                    if let Err(e) = func
+                        .call_async(&mut sess.store, (context_id, root_context_id))
+                        .await
+                    {
+                        return Err((e, Box::new(sess.into_ctx())));
+                    }
+                }
+                return Ok(sess);
+            }
+        }
+
+        let mut store = Store::new(self.registry.engine(), HostState::new(http_ctx));
+        if let Err(e) = self.arm_store(&mut store) {
+            return Err((e, Box::new(store.into_data().http_ctx)));
+        }
+        let instance = match module.instance_pre.instantiate_async(&mut store).await {
+            Ok(i) => i,
+            Err(e) => return Err((e, Box::new(store.into_data().http_ctx))),
+        };
 
         // === Proxy-Wasm SDK Lifecycle ===
         // Step 0: Call _start to initialize the SDK
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, "_start") {
-            if let Err(e) = func.call_async(&mut *store, ()).await {
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            if let Err(e) = func.call_async(&mut store, ()).await {
                 ftlog::error!("[wasm:{}] _start() failed: {}", module.name, e);
             }
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, "_initialize") {
-            if let Err(e) = func.call_async(&mut *store, ()).await {
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            if let Err(e) = func.call_async(&mut store, ()).await {
                 ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e);
             }
         }
 
-        let root_context_id = 1i32; // Root context ID (SDK uses 1)
         let http_context_id = 2i32; // HTTP context ID
         let config_size = configuration.len() as i32;
 
@@ -235,45 +275,95 @@ impl FilterEngine {
         // （get_typed_func：エクスポート表のハッシュ探索 + 型チェック）は 1 回で済ませ、
         // 得た関数ハンドルを両方の呼び出しで再利用する（ホットパスの重複解決を排除）。
         let on_context_create =
-            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create");
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create");
 
         // Step 1: Create ROOT context first (parent=0 means root)
         if let Ok(ref func) = on_context_create {
-            let _ = func.call_async(&mut *store, (root_context_id, 0)).await;
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         // Step 2: Call proxy_on_vm_start
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut *store, "proxy_on_vm_start")
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
             let _ = func
-                .call_async(&mut *store, (root_context_id, config_size))
+                .call_async(&mut store, (root_context_id, config_size))
                 .await;
         }
 
         // Step 3: Call proxy_on_configure
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut *store, "proxy_on_configure")
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
             let _ = func
-                .call_async(&mut *store, (root_context_id, config_size))
+                .call_async(&mut store, (root_context_id, config_size))
                 .await;
         }
 
         // Step 4: Create HTTP context with root as parent（Step 1 と同じハンドルを再利用）
         if let Ok(ref func) = on_context_create {
             let _ = func
-                .call_async(&mut *store, (http_context_id, root_context_id))
+                .call_async(&mut store, (http_context_id, root_context_id))
                 .await;
         }
 
-        // 指定されたヘッダコールバックを呼ぶ
-        let callback = instance.get_typed_func::<(i32, i32, i32), i32>(&mut *store, callback_name);
+        Ok(Session {
+            store,
+            instance,
+            context_id: http_context_id,
+            configuration: configuration.clone(),
+            reuse: module.instance_reuse,
+        })
+    }
+
+    /// コールバックが済んだインスタンスを片付ける（F-271）。`ok` はコールバックが成功したか。
+    ///
+    /// `instance_reuse` のモジュールで成功したときだけ、http context を消して（`proxy_on_delete`）プールに戻す。
+    /// トラップ・エラーのインスタンスは捨てる（次の要求は新しいインスタンスで作り直す）。
+    async fn close_session(&self, module: &LoadedModule, mut sess: Session, ok: bool) {
+        if !sess.reuse || !ok || sess.context_id >= i32::MAX - 1 {
+            return;
+        }
+        if let Ok(func) = sess
+            .instance
+            .get_typed_func::<i32, ()>(&mut sess.store, "proxy_on_delete")
+        {
+            if self.arm_store(&mut sess.store).is_err()
+                || func
+                    .call_async(&mut sess.store, sess.context_id)
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+        // 要求の中身（ヘッダ・本文）をプールの間に持ち続けない
+        sess.store.data_mut().http_ctx = HttpContext::new(1, module.capabilities.clone());
+        module.pool.put(super::instance_pool::PooledInstance {
+            store: sess.store,
+            instance: sess.instance,
+            configuration: sess.configuration,
+            next_context_id: sess.context_id + 1,
+        });
+    }
+
+    /// 指定ヘッダコールバックを呼んで action を返す（ヘッダ系フィルタ共通）。
+    async fn run_headers_module(
+        &self,
+        module: &LoadedModule,
+        sess: &mut Session,
+        callback_name: &str,
+        num_headers: i32,
+        end_of_stream: bool,
+    ) -> anyhow::Result<i32> {
+        let callback = sess
+            .instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, callback_name);
 
         let action = match callback {
             Ok(func) => {
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut *store, (http_context_id, num_headers, eos))
+                func.call_async(&mut sess.store, (sess.context_id, num_headers, eos))
                     .await?
             }
             Err(_) => 0, // Callback not exported, continue
@@ -282,7 +372,7 @@ impl FilterEngine {
         // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分）。
         let consumed = self
             .fuel_limit
-            .saturating_sub(store.get_fuel().unwrap_or(0));
+            .saturating_sub(sess.store.get_fuel().unwrap_or(0));
         let phase = if callback_name == "proxy_on_request_headers" {
             "request_headers"
         } else {
@@ -290,9 +380,7 @@ impl FilterEngine {
         };
         crate::metrics::observe_wasm_fuel_consumed(&module.name, phase, consumed);
 
-        // F-62: Pause/resume（proxy_on_http_call_response）で同一インスタンスを
-        // 再度呼び出せるようインスタンスも返す。
-        Ok((action, instance))
+        Ok(action)
     }
 
     /// F-62: Pause 中に登録された HTTP コールをインラインで解決し、
@@ -311,8 +399,8 @@ impl FilterEngine {
         module: &LoadedModule,
         store: &mut Store<HostState>,
         instance: wasmtime::Instance,
+        http_context_id: i32,
     ) -> anyhow::Result<bool> {
-        let http_context_id = 2i32;
         let mut resumed = false;
         let max_rounds = module.capabilities.max_http_calls.max(1);
 
@@ -450,29 +538,37 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
-        // Create store with fuel limit
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
+        let mut sess = match self.open_session(module, configuration, http_ctx).await {
+            Ok(s) => s,
+            Err((e, ctx)) => return (ctx.request_headers, Err(e)),
+        };
 
         let run = self
             .run_headers_module(
                 module,
-                configuration,
-                &mut store,
+                &mut sess,
                 "proxy_on_request_headers",
                 num_headers,
                 end_of_stream,
             )
             .await;
 
+        let mut ok = run.is_ok();
         let result = match run {
-            Ok((action, instance)) => {
+            Ok(action) => {
                 // F-62: Pause かつ pending HTTP コールあり → インラインで解決して resume
                 let action = match FilterAction::from(action) {
                     FilterAction::Pause => {
+                        let (instance, ctx_id) = (sess.instance, sess.context_id);
                         match self
-                            .resolve_pending_http_calls_inline(module, &mut store, instance)
+                            .resolve_pending_http_calls_inline(
+                                module,
+                                &mut sess.store,
+                                instance,
+                                ctx_id,
+                            )
                             .await
                         {
                             Ok(true) => FilterAction::Continue,
@@ -483,13 +579,14 @@ impl FilterEngine {
                                     module.name,
                                     e
                                 );
+                                ok = false;
                                 FilterAction::Continue
                             }
                         }
                     }
                     other => other,
                 };
-                let state = store.data();
+                let state = sess.store.data();
                 if let Some(local_response) = &state.http_ctx.local_response {
                     Ok(ModuleAction::LocalResponse(local_response.clone()))
                 } else {
@@ -503,7 +600,8 @@ impl FilterEngine {
         };
 
         // ヘッダをコンテキストから回収（ゼロコピー・ムーブ。resume 中の変更も反映される）
-        let headers = std::mem::take(&mut store.data_mut().http_ctx.request_headers);
+        let headers = std::mem::take(&mut sess.store.data_mut().http_ctx.request_headers);
+        self.close_session(module, sess, ok).await;
         (headers, result)
     }
 
@@ -613,29 +711,37 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
-        // Create store with fuel limit
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
+        let mut sess = match self.open_session(module, configuration, http_ctx).await {
+            Ok(s) => s,
+            Err((e, ctx)) => return (ctx.response_headers, Err(e)),
+        };
 
         let run = self
             .run_headers_module(
                 module,
-                configuration,
-                &mut store,
+                &mut sess,
                 "proxy_on_response_headers",
                 num_headers,
                 end_of_stream,
             )
             .await;
 
+        let mut ok = run.is_ok();
         let result = match run {
-            Ok((action, instance)) => {
+            Ok(action) => {
                 // F-62: Pause かつ pending HTTP コールあり → インラインで解決して resume
                 let action = match FilterAction::from(action) {
                     FilterAction::Pause => {
+                        let (instance, ctx_id) = (sess.instance, sess.context_id);
                         match self
-                            .resolve_pending_http_calls_inline(module, &mut store, instance)
+                            .resolve_pending_http_calls_inline(
+                                module,
+                                &mut sess.store,
+                                instance,
+                                ctx_id,
+                            )
                             .await
                         {
                             Ok(true) => FilterAction::Continue,
@@ -646,13 +752,14 @@ impl FilterEngine {
                                     module.name,
                                     e
                                 );
+                                ok = false;
                                 FilterAction::Continue
                             }
                         }
                     }
                     other => other,
                 };
-                let state = store.data();
+                let state = sess.store.data();
                 if let Some(local_response) = &state.http_ctx.local_response {
                     Ok(ModuleAction::LocalResponse(local_response.clone()))
                 } else {
@@ -666,7 +773,8 @@ impl FilterEngine {
         };
 
         // ヘッダをコンテキストから回収（ゼロコピー・ムーブ。resume 中の変更も反映される）
-        let headers = std::mem::take(&mut store.data_mut().http_ctx.response_headers);
+        let headers = std::mem::take(&mut sess.store.data_mut().http_ctx.response_headers);
+        self.close_session(module, sess, ok).await;
         (headers, result)
     }
 
@@ -751,6 +859,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         // Store the response in context
         http_ctx.http_call_responses.insert(token, response.clone());
@@ -884,6 +993,7 @@ impl FilterEngine {
         modules: &[ModuleRef],
         body: bytes::Bytes,
         end_of_stream: bool,
+        request: Option<&RequestMeta<'_>>,
     ) -> BodyFilterResult {
         let resolved = resolve_effective_modules(&self.registry, modules);
 
@@ -897,7 +1007,13 @@ impl FilterEngine {
 
         for (module, config) in &resolved {
             let result = self
-                .execute_on_request_body(module, config, current_body.clone(), end_of_stream)
+                .execute_on_request_body(
+                    module,
+                    config,
+                    current_body.clone(),
+                    end_of_stream,
+                    request,
+                )
                 .await;
 
             match result {
@@ -930,8 +1046,27 @@ impl FilterEngine {
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_request_body_with_modules(&modules, body, end_of_stream)
+        self.on_request_body_with_modules(&modules, body, end_of_stream, None)
             .await
+    }
+
+    /// テスト用: モジュールのプールにあるインスタンスの数（F-271）
+    #[cfg(test)]
+    pub(crate) fn pooled_instances(&self, name: &str) -> usize {
+        self.registry
+            .get_module(name)
+            .map(|m| m.pool.len())
+            .unwrap_or(0)
+    }
+
+    /// 要求本文のコールバックを呼ぶモジュール（`allow_request_body_read`）が含まれるか（F-271。HTTP/1.1・HTTP/2 は
+    /// これが真の要求だけ本文を読み切ってから上流へ送る）
+    pub fn wants_request_body(&self, modules: &[ModuleRef]) -> bool {
+        modules.iter().any(|r| {
+            self.registry
+                .get_module(&r.name)
+                .is_some_and(|m| m.capabilities.allow_request_body_read)
+        })
     }
 
     /// Execute on_request_body for a single module
@@ -941,6 +1076,7 @@ impl FilterEngine {
         configuration: &Arc<[u8]>,
         body: bytes::Bytes,
         end_of_stream: bool,
+        request: Option<&RequestMeta<'_>>,
     ) -> anyhow::Result<BodyModuleResult> {
         // Check capability
         if !module.capabilities.allow_request_body_read {
@@ -949,101 +1085,67 @@ impl FilterEngine {
             });
         }
 
-        // Create context
+        // Create context（F-271: 要求のメソッド・パス・ヘッダも見えるようにする）
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        if let Some(r) = request {
+            http_ctx.set_request(
+                r.method.clone(),
+                r.path.clone(),
+                r.headers.to_vec(),
+                r.client_ip.clone(),
+            );
+        }
         let body_len = body.len();
         http_ctx.set_request_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
-        // Create store with fuel limit
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
-        store.set_fuel(self.fuel_limit)?;
-        store.fuel_async_yield_interval(Some(10_000))?;
-        store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
-
-        // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut store).await?;
-
-        // Proxy-Wasm SDK Lifecycle
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call_async(&mut store, ()).await;
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call_async(&mut store, ()).await;
-        }
-
-        let root_context_id = 1i32;
-        let http_context_id = 2i32;
-        let config_size = configuration.len() as i32;
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await;
-        }
+        let mut sess = match self.open_session(module, configuration, http_ctx).await {
+            Ok(s) => s,
+            Err((e, _)) => return Err(e),
+        };
 
         // Call proxy_on_request_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback =
-            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_body");
+        let callback = sess
+            .instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, "proxy_on_request_body");
 
         let action = match callback {
             Ok(func) => {
                 let body_size = body_len as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut store, (http_context_id, body_size, eos))
-                    .await?
+                match func
+                    .call_async(&mut sess.store, (sess.context_id, body_size, eos))
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => return Err(e),
+                }
             }
             Err(_) => 0, // Continue if not exported
         };
 
-        // Check for local response
-        let state = store.data();
-        if let Some(local_response) = &state.http_ctx.local_response {
-            return Ok(BodyModuleResult::LocalResponse(local_response.clone()));
-        }
-
-        // Check for modifications
+        // Check for local response / modifications
         // F-61: 変更時は store からムーブで取り出す（clone による deep copy を排除）
-        let body_modified = state.http_ctx.request_body_modified;
-        let modified_body = if body_modified {
-            let taken = std::mem::take(&mut store.data_mut().http_ctx.request_body);
-            Some(taken.into_bytes())
+        let ctx = &mut sess.store.data_mut().http_ctx;
+        let result = if let Some(local_response) = ctx.local_response.take() {
+            BodyModuleResult::LocalResponse(local_response)
         } else {
-            None
+            let modified_body = if ctx.request_body_modified {
+                Some(std::mem::take(&mut ctx.request_body).into_bytes())
+            } else {
+                None
+            };
+            match FilterAction::from(action) {
+                FilterAction::Continue => BodyModuleResult::Continue { modified_body },
+                FilterAction::Pause => BodyModuleResult::Pause,
+            }
         };
-
-        match FilterAction::from(action) {
-            FilterAction::Continue => Ok(BodyModuleResult::Continue { modified_body }),
-            FilterAction::Pause => Ok(BodyModuleResult::Pause),
-        }
+        self.close_session(module, sess, true).await;
+        Ok(result)
     }
 
     /// Execute on_response_body callback for specified modules
@@ -1127,94 +1229,52 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
-        // Create store with fuel limit
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
-        store.set_fuel(self.fuel_limit)?;
-        store.fuel_async_yield_interval(Some(10_000))?;
-        store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
-
-        // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut store).await?;
-
-        // Proxy-Wasm SDK Lifecycle
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call_async(&mut store, ()).await;
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call_async(&mut store, ()).await;
-        }
-
-        let root_context_id = 1i32;
-        let http_context_id = 2i32;
-        let config_size = configuration.len() as i32;
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await;
-        }
+        let mut sess = match self.open_session(module, configuration, http_ctx).await {
+            Ok(s) => s,
+            Err((e, _)) => return Err(e),
+        };
 
         // Call proxy_on_response_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback =
-            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_body");
+        let callback = sess
+            .instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, "proxy_on_response_body");
 
         let action = match callback {
             Ok(func) => {
                 let body_size = body_len as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut store, (http_context_id, body_size, eos))
-                    .await?
+                match func
+                    .call_async(&mut sess.store, (sess.context_id, body_size, eos))
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => return Err(e),
+                }
             }
             Err(_) => 0, // Continue if not exported
         };
 
-        // Check for local response
-        let state = store.data();
-        if let Some(local_response) = &state.http_ctx.local_response {
-            return Ok(BodyModuleResult::LocalResponse(local_response.clone()));
-        }
-
-        // Check for modifications
+        // Check for local response / modifications
         // F-61: 変更時は store からムーブで取り出す（clone による deep copy を排除）
-        let body_modified = state.http_ctx.response_body_modified;
-        let modified_body = if body_modified {
-            let taken = std::mem::take(&mut store.data_mut().http_ctx.response_body);
-            Some(taken.into_bytes())
+        let ctx = &mut sess.store.data_mut().http_ctx;
+        let result = if let Some(local_response) = ctx.local_response.take() {
+            BodyModuleResult::LocalResponse(local_response)
         } else {
-            None
+            let modified_body = if ctx.response_body_modified {
+                Some(std::mem::take(&mut ctx.response_body).into_bytes())
+            } else {
+                None
+            };
+            match FilterAction::from(action) {
+                FilterAction::Continue => BodyModuleResult::Continue { modified_body },
+                FilterAction::Pause => BodyModuleResult::Pause,
+            }
         };
-
-        match FilterAction::from(action) {
-            FilterAction::Continue => Ok(BodyModuleResult::Continue { modified_body }),
-            FilterAction::Pause => Ok(BodyModuleResult::Pause),
-        }
+        self.close_session(module, sess, true).await;
+        Ok(result)
     }
 
     /// Execute on_log callback for specified modules
@@ -1238,85 +1298,48 @@ impl FilterEngine {
     }
 
     /// Execute on_log for a single module
+    ///
+    /// F-271: `instance_reuse` のモジュールはプールのインスタンスで呼ぶ（要求ごとに `_start`・`on_configure` を
+    /// 走らせない）。
     async fn execute_on_log(
         &self,
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
     ) -> anyhow::Result<()> {
-        // Create context
-        // F-148: 下で `config_size` に `configuration.len()` を渡すため、実体のバッファも
-        // 必ず同じものを積む（サイズだけ非ゼロで中身が空だと、モジュールが
-        // proxy_get_buffer(PluginConfiguration) で空を読んでしまう）。
+        // F-148: `config_size` に `configuration.len()` を渡すため、実体のバッファも必ず同じものを積む
+        // （サイズだけ非ゼロで中身が空だと、モジュールが proxy_get_buffer(PluginConfiguration) で空を読む）。
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
-        store.set_fuel(self.fuel_limit)?;
-        store.fuel_async_yield_interval(Some(10_000))?;
-        store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
-
-        // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut store).await?;
-
-        // Initialize module
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call_async(&mut store, ()).await;
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call_async(&mut store, ()).await;
-        }
-
-        let root_context_id = 1i32;
-        let http_context_id = 2i32;
-        let config_size = configuration.len() as i32;
-
-        // Create contexts
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await;
-        }
+        http_ctx.plugin_data = module.data_files.clone();
+        let mut sess = self
+            .open_session(module, configuration, http_ctx)
+            .await
+            .map_err(|(e, _)| e)?;
 
         // Call proxy_on_log
         // Signature: (context_id) -> void
-        if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_log") {
-            match func.call_async(&mut store, http_context_id).await {
+        let mut ok = true;
+        if let Ok(func) = sess
+            .instance
+            .get_typed_func::<i32, ()>(&mut sess.store, "proxy_on_log")
+        {
+            match func.call_async(&mut sess.store, sess.context_id).await {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_log({}) OK",
                         module.name,
-                        http_context_id
+                        sess.context_id
                     )
                 }
-                Err(e) => ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e),
+                Err(e) => {
+                    ok = false;
+                    ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e)
+                }
             }
         }
+        self.close_session(module, sess, ok).await;
 
         Ok(())
     }
@@ -1358,6 +1381,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
@@ -1573,6 +1597,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -1721,6 +1746,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -1943,6 +1969,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
         // F-134: MapType::GrpcReceiveInitialMetadata(4) のバックストア。
         // ゲストが proxy_on_grpc_receive_initial_metadata 内で
         // proxy_get_header_map_pairs(GrpcReceiveInitialMetadata) を呼べるようにする。
@@ -2068,6 +2095,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
         // F-134: BufferType::GrpcReceiveBuffer(5) のバックストア。
         http_ctx.grpc_receive_message = bytes::Bytes::copy_from_slice(message);
 
@@ -2190,6 +2218,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
         // F-134: MapType::GrpcReceiveTrailingMetadata(5) のバックストア。
         // F-160: `grpc_receive_trailing_metadata` の型は headers.rs 共通のため
         // 変更しない。境界の `to_vec()` はここでの 1 回のみ。
@@ -2311,6 +2340,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2429,6 +2459,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2577,6 +2608,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2715,6 +2747,7 @@ impl FilterEngine {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2828,6 +2861,32 @@ enum ModuleResult {
 }
 
 /// ヘッダ系フィルタの実行結果（F-43: ヘッダ本体はムーブスルーで別途返すため持たない）
+/// 要求の本文のコールバックに見せる要求の情報（F-271。モジュールが本文の段でパス・ヘッダを読める）
+pub struct RequestMeta<'a> {
+    pub method: &'a Arc<str>,
+    pub path: &'a Arc<str>,
+    pub headers: &'a [(Vec<u8>, Vec<u8>)],
+    pub client_ip: &'a Arc<str>,
+}
+
+/// 1 回の HTTP のコールバックに使うインスタンス（F-271。[`FilterEngine::open_session`]）
+struct Session {
+    store: Store<HostState>,
+    instance: wasmtime::Instance,
+    /// このコールバックの http context の ID
+    context_id: i32,
+    /// インスタンスを作ったときのプラグインの設定
+    configuration: Arc<[u8]>,
+    /// 終わったらプールに戻す
+    reuse: bool,
+}
+
+impl Session {
+    fn into_ctx(self) -> HttpContext {
+        self.store.into_data().http_ctx
+    }
+}
+
 enum ModuleAction {
     Continue,
     Pause,
@@ -2887,6 +2946,7 @@ mod exec_smoke_tests {
                 path: path.to_string(),
                 configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
+                ..Default::default()
             }],
             interpreter,
         };
@@ -2950,6 +3010,7 @@ mod exec_smoke_tests {
                     allow_http_calls: true,
                     ..Default::default()
                 },
+                ..Default::default()
             }],
             interpreter: false,
         };
@@ -3000,22 +3061,30 @@ mod exec_smoke_tests {
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
-
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(engine.registry.engine(), host_state);
+        http_ctx.plugin_data = module.data_files.clone();
 
         // 本命リクエストの `proxy_on_request_headers` を実行する。
         // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
         let configuration = module.configuration.clone();
-        let (action, instance) = futures::executor::block_on(engine.run_headers_module(
+        let mut sess = match futures::executor::block_on(engine.open_session(
             &module,
             &configuration,
-            &mut store,
+            http_ctx,
+        )) {
+            Ok(s) => s,
+            Err((e, _)) => panic!("open_session must not error: {e}"),
+        };
+        let action = futures::executor::block_on(engine.run_headers_module(
+            &module,
+            &mut sess,
             "proxy_on_request_headers",
             num_headers,
             true,
         ))
         .expect("run_headers_module must not error");
+        let instance = sess.instance;
+        let ctx_id = sess.context_id;
+        let store = &mut sess.store;
 
         assert_eq!(
             FilterAction::from(action),
@@ -3039,7 +3108,7 @@ mod exec_smoke_tests {
         // upstream 未解決で 502 応答を返すが、`proxy_on_http_call_response` は
         // 必ず呼ばれるため resume 機構自体の検証には十分）。
         let resumed = futures::executor::block_on(
-            engine.resolve_pending_http_calls_inline(&module, &mut store, instance),
+            engine.resolve_pending_http_calls_inline(&module, store, instance, ctx_id),
         );
 
         match resumed {

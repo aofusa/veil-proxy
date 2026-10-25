@@ -27,6 +27,12 @@ pub struct LoadedModule {
     pub configuration: Arc<[u8]>,
     /// Proxy-Wasm の root_id（`plugin_root_id`）。未設定なら従来どおりルートコンテキストの ID を返す
     pub root_id: Option<Arc<str>>,
+    /// HTTP のコールバックで VM の文脈を使い回す（F-271）
+    pub instance_reuse: bool,
+    /// 使い回すインスタンス（`instance_reuse` のときだけ使う）
+    pub(crate) pool: super::instance_pool::InstancePool,
+    /// 起動時に読んだファイル（`data_files`。F-271）
+    pub data_files: super::context::PluginData,
 }
 
 /// Module registry
@@ -194,6 +200,23 @@ impl ModuleRegistry {
         // Create InstancePre for fast instantiation
         let instance_pre = linker.instantiate_pre(&module)?;
 
+        // F-271: data_files は設定ロード時に読む（読むのは設定に書いたパスだけ）
+        let mut data_files = std::collections::HashMap::new();
+        for (name, file) in &config.data_files {
+            // 理由付き allow: モジュールのロードは設定適用時（起動/リロード）のコールドパス
+            #[allow(clippy::disallowed_methods)]
+            let bytes = std::fs::read(file).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read data file '{}' ({}) for module '{}': {}",
+                    name,
+                    file,
+                    config.name,
+                    e
+                )
+            })?;
+            data_files.insert(name.clone(), Arc::<[u8]>::from(bytes));
+        }
+
         // Store module
         let loaded = LoadedModule {
             name: config.name.clone(),
@@ -201,6 +224,9 @@ impl ModuleRegistry {
             capabilities: config.capabilities.clone(),
             configuration: config.configuration.to_bytes(),
             root_id: None,
+            instance_reuse: config.instance_reuse,
+            pool: super::instance_pool::InstancePool::new(),
+            data_files: Arc::new(data_files),
         };
 
         ftlog::info!(
@@ -273,11 +299,18 @@ impl ModuleRegistry {
 
         // AOT バイナリをサイドカーへ書き出す（ベストエフォート、失敗は無視）。
         // tmp へ書いて rename することで部分書き込み/競合を避ける。
+        // tmp の名前は書き手ごとに分ける（同じ名前だと、別の書き手が rename 済みの inode を切り詰めて書き直し、
+        // それを mmap している側が SIGBUS になる。同じモジュールを並行してロードする単体試験で起きた。F-271）。
         match module.serialize() {
             Ok(bytes) => {
+                static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let tmp_path: PathBuf = {
                     let mut s = cache_path.clone().into_os_string();
-                    s.push(".tmp");
+                    s.push(format!(
+                        ".{}.{}.tmp",
+                        std::process::id(),
+                        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
                     PathBuf::from(s)
                 };
                 let written = std::fs::write(&tmp_path, &bytes)

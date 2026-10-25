@@ -131,6 +131,67 @@ path = "./www"
 合成と TOML → JSON 変換は**設定ロード時（起動・SIGHUP リロード）に 1 回だけ**実行され、
 リクエスト経路では `Arc` の clone しか行いません。
 
+### プロトコルごとのフィルタのフェーズ
+
+| フェーズ | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| `on_http_request_headers` | ○ | ○ | ○ |
+| `on_http_request_body` | ○ | ○ | ○ |
+| `on_http_request_trailers` | – | h2c の gRPC | – |
+| `on_http_response_headers` | ○ | ○ | ○ |
+| `on_http_response_body` | – | – | ○ |
+| `on_log` | ○ | ○ | ○ |
+
+要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
+veil は本文を全部読んでから（Content-Length・chunked。上限は `max_request_body_size`・`max_chunked_body_size`、超えたら
+`413`）`on_http_request_body` を `end_of_stream = true` で 1 回呼ぶ。コールバックからは要求のパス・メソッド・ヘッダも読める。
+モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送る）。
+そういうモジュールの無いルートは、今までどおり本文を上流へ流す。
+
+### VM の文脈の使い回し（`instance_reuse`）
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+instance_reuse = true   # 既定 false
+```
+
+既定ではコールバックごとに新しいインスタンスで動く（`_start`・`proxy_on_vm_start`・`proxy_on_configure` が毎回走る）。
+`instance_reuse = true` なら、インスタンスを 1 回作って設定し、後の要求で使い回す。要求ごとは HTTP context の作成
+（`proxy_on_context_create`）とコールバックだけで、要求が終わると `proxy_on_delete` が走る（Envoy と同じ寿命）。
+フィルタのグローバル変数と root context の状態は要求をまたいで残る。トラップ・エラーを返したインスタンスは捨て、次の要求は
+新しいインスタンスを使う。ワーカーはモジュールごと（とルートの `module_configuration` ごと）に設定済みのインスタンスを
+いくつか持つので、プーリングアロケータの `total_memories` に余裕を残すこと。
+
+### フィルタだけで要求に答える（`Respond` + モジュール）
+
+`type = "Respond"` のルートにも `modules` を付けられる。フィルタが `send_local_response` で答えればその応答を返し、
+答えなければルートの固定応答を返す。上流の無い、フィルタだけで答えるルートを作れる。
+
+```toml
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+```
+
+### 起動時に読むファイル（`data_files`）
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+data_files = { dataset = "/etc/veil/data/dataset.json" }
+```
+
+各ファイルは設定のロード時（起動・リロード）に読み、プロパティ `plugin_data.<名前>` としてフィルタに見せる
+（`get_property(["plugin_data", "dataset"])`）。要求ごとのディスクの読み取りは無い。ファイルが無ければ設定のエラー。
+モジュールに `allowed_properties` を書くなら `"plugin_data.*"` を含める。
+
 ### デフォルト設定
 
 `[wasm.defaults]` セクションでは、WASMランタイムのグローバル設定を行えます：

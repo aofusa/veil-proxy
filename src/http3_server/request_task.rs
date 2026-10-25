@@ -883,13 +883,16 @@ impl H3BufferedTask {
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
+                    let path_arc: std::sync::Arc<str> = std::sync::Arc::from(path_str);
+                    let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str);
+                    let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(self.client_ip.as_str());
                     let wasm_result = wasm_engine
                         .on_request_headers_with_modules(
                             &modules_to_apply,
-                            &std::sync::Arc::from(path_str),
-                            &std::sync::Arc::from(method_str),
+                            &path_arc,
+                            &method_arc,
                             headers_vec,
-                            &std::sync::Arc::from(self.client_ip.as_str()),
+                            &ip_arc,
                             request_body.is_empty(),
                         )
                         .await;
@@ -935,17 +938,25 @@ impl H3BufferedTask {
                             headers: modified, ..
                         } => {
                             // B-38: 変更後ヘッダを上流リクエストへ反映
-                            wasm_request_headers = Some(modified);
+                            let modified = wasm_request_headers.insert(modified);
 
                             // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
                             // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
                             // end_of_stream=true の 1 回呼びで実装できる）。
                             if !request_body.is_empty() {
+                                // F-271: 本文の段からも要求のパス・ヘッダが見える
+                                let meta = crate::wasm::RequestMeta {
+                                    method: &method_arc,
+                                    path: &path_arc,
+                                    headers: modified,
+                                    client_ip: &ip_arc,
+                                };
                                 match crate::wasm::http_executor::apply_wasm_request_body(
                                     wasm_engine,
                                     &modules_to_apply,
                                     request_body.clone(),
                                     true,
+                                    Some(&meta),
                                 )
                                 .await
                                 {

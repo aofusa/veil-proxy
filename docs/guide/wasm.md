@@ -130,6 +130,72 @@ Naming a module in `module_configuration` that is not listed in that route's `mo
 Merging and TOML → JSON conversion run **once at config load time** (startup and SIGHUP
 reload); the request path only clones an `Arc`.
 
+### Filter Phases by Protocol
+
+| Phase | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| `on_http_request_headers` | yes | yes | yes |
+| `on_http_request_body` | yes | yes | yes |
+| `on_http_request_trailers` | – | gRPC over h2c | – |
+| `on_http_response_headers` | yes | yes | yes |
+| `on_http_response_body` | – | – | yes |
+| `on_log` | yes | yes | yes |
+
+The request-body phase runs when the request has a body and at least one of the route's modules has
+`allow_request_body_read = true`. veil reads the whole body first (Content-Length or chunked, up to
+`max_request_body_size` / `max_chunked_body_size`; larger bodies get `413`) and calls
+`on_http_request_body` once with `end_of_stream = true`. The callback can read the request path, method
+and headers as well. If the module replaces the body, veil sends the new body upstream with a matching
+`Content-Length` (a chunked request is forwarded with `Content-Length`). Routes without such a module
+keep streaming the body upstream as before.
+
+### Reusing the VM Context (`instance_reuse`)
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+instance_reuse = true   # default: false
+```
+
+By default every callback runs in a fresh instance (`_start`, `proxy_on_vm_start` and `proxy_on_configure`
+run each time). With `instance_reuse = true` an instance is created and configured once, then reused for
+later requests: each request only creates an HTTP context (`proxy_on_context_create`) and runs the callbacks,
+and `proxy_on_delete` runs when the request is done. This is the same lifetime as Envoy. The filter's
+global variables and root-context state persist across requests. An instance that traps or returns an error
+is discarded, and the next request gets a new one. Each worker keeps a few configured instances per module
+(and per route `module_configuration`), so the pooling allocator's `total_memories` must leave room for them.
+
+### Answering Requests from a Filter (`Respond` + modules)
+
+A `type = "Respond"` route can carry `modules`. If a filter answers with `send_local_response`, veil returns
+that response; otherwise it returns the route's fixed response. This makes routes that are answered entirely by
+a filter, with no upstream:
+
+```toml
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+```
+
+### Files Loaded at Startup (`data_files`)
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+data_files = { dataset = "/etc/veil/data/dataset.json" }
+```
+
+Each file is read when the configuration is loaded (startup and reload) and exposed to the filter as the
+property `plugin_data.<name>` (`get_property(["plugin_data", "dataset"])`). Nothing is read from disk per
+request. A missing file is a configuration error. If the module sets `allowed_properties`, include
+`"plugin_data.*"`.
+
 ### Default Settings
 
 The `[wasm.defaults]` section allows you to configure global WASM runtime settings:

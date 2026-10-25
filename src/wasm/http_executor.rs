@@ -33,17 +33,21 @@ pub enum WasmBodyOutcome {
 /// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
 /// `end_of_stream` は呼び出し元がボディ全体を保持しているかどうかを示す
 /// （HTTP/3 の Proxy 経路は WASM 適用時に必ず `Decision::Buffer` に落ちるため常に true）。
+///
+/// F-271: HTTP/1.1・HTTP/2・HTTP/3 の 3 経路がこの関数を共有する。`request` を渡すと、本文のコールバックから
+/// 要求のメソッド・パス（プロパティ `request.path`）・ヘッダが見える。
 pub async fn apply_wasm_request_body(
     engine: &FilterEngine,
     modules: &[crate::wasm_plugin_config::ModuleRef],
     body: bytes::Bytes,
     end_of_stream: bool,
+    request: Option<&super::RequestMeta<'_>>,
 ) -> WasmBodyOutcome {
     if modules.is_empty() {
         return WasmBodyOutcome::Continue(body);
     }
     match engine
-        .on_request_body_with_modules(modules, body.clone(), end_of_stream)
+        .on_request_body_with_modules(modules, body.clone(), end_of_stream, request)
         .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),

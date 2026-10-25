@@ -822,6 +822,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
                 allow_request_body_read: true,
                 ..ModuleCapabilities::default()
             },
+            ..Default::default()
         }],
         ..WasmConfig::default()
     };
@@ -846,6 +847,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk1"),
             false,
+            None,
         )
         .await;
     assert!(matches!(
@@ -859,6 +861,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk2"),
             true,
+            None,
         )
         .await;
     assert!(matches!(

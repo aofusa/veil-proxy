@@ -381,6 +381,7 @@ mod interpreter_tests {
                 path: FIXTURE.to_string(),
                 configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
+                ..Default::default()
             }],
             interpreter,
         }
@@ -491,6 +492,7 @@ mod f132_h3_lifecycle_tests {
                 path: FIXTURE.to_string(),
                 configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
+                ..Default::default()
             }],
             interpreter: false,
         };
@@ -554,6 +556,7 @@ mod f132_h3_lifecycle_tests {
             &[], // モジュール未指定 -> ゼロコピーでそのまま
             body.clone(),
             true,
+            None,
         ));
         match req_result {
             WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
@@ -1504,6 +1507,7 @@ mod f133_network_filter_tests {
                     allow_upstream_data_write: true,
                     ..Default::default()
                 },
+                ..Default::default()
             }],
             interpreter: false,
         };
@@ -1644,5 +1648,197 @@ mod f133_network_filter_tests {
         )];
         futures::executor::block_on(engine.on_downstream_close_with_modules(&modules));
         futures::executor::block_on(engine.on_upstream_close_with_modules(&modules));
+    }
+}
+
+// F-271: VM の文脈の使い回し・data_files・要求本文のフェーズ（baseline_filter.wasm）
+mod instance_reuse_tests {
+    use crate::wasm::{
+        BodyFilterResult, FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig,
+        RequestMeta, WasmConfig,
+    };
+    use std::sync::Arc;
+
+    const FIXTURE: &str = "tests/fixtures/wasm/baseline_filter.wasm";
+
+    fn engine(reuse: bool, data: Option<&std::path::Path>) -> Option<FilterEngine> {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return None;
+        }
+        let mut data_files = std::collections::BTreeMap::new();
+        if let Some(d) = data {
+            data_files.insert("dataset".to_string(), d.to_string_lossy().into_owned());
+        }
+        let capabilities = ModuleCapabilities {
+            allow_send_local_response: true,
+            allow_request_headers_read: true,
+            allow_request_body_read: true,
+            allow_request_body_write: true,
+            allowed_properties: vec!["request.*".into(), "plugin_data.*".into()],
+            ..Default::default()
+        };
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "baseline".to_string(),
+                path: FIXTURE.to_string(),
+                capabilities,
+                instance_reuse: reuse,
+                data_files,
+                ..Default::default()
+            }],
+            interpreter: false,
+        };
+        Some(FilterEngine::new(&config).expect("engine should build"))
+    }
+
+    fn modules() -> Vec<crate::wasm_plugin_config::ModuleRef> {
+        vec![crate::wasm_plugin_config::ModuleRef::from_name("baseline")]
+    }
+
+    /// 要求ヘッダのフェーズの応答 → (状態, 本文, x-configure-count, x-instance-seq)
+    fn get(engine: &FilterEngine, path: &str) -> (u16, String, u32, u32) {
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from(path),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+        ));
+        let FilterResult::LocalResponse(resp) = r else {
+            panic!("expected a local response for {path}");
+        };
+        let h = |n: &[u8]| -> u32 {
+            let v = &resp.headers.iter().find(|(k, _)| k == n).unwrap().1;
+            std::str::from_utf8(v).unwrap().parse().unwrap()
+        };
+        (
+            resp.status_code,
+            String::from_utf8(resp.body.clone()).unwrap(),
+            h(b"x-configure-count"),
+            h(b"x-instance-seq"),
+        )
+    }
+
+    #[test]
+    fn reused_instance_is_configured_once_and_trap_discards_it() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let (st, body, c1, s1) = get(&engine, "/baseline11?a=1&b=2");
+        assert_eq!((st, body.as_str()), (200, "3"));
+        let (_, _, c2, s2) = get(&engine, "/baseline11");
+        let (_, _, c3, s3) = get(&engine, "/baseline11");
+        // on_configure は 1 回、http context は要求ごとに増える
+        assert_eq!((c1, c2, c3), (1, 1, 1));
+        assert!(s1 < s2 && s2 < s3, "{s1} {s2} {s3}");
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+
+        // トラップしたインスタンスは捨てる（ローカル応答にならずに続く）
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from("/trap"),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+        let (_, _, c4, s4) = get(&engine, "/baseline11");
+        assert_eq!((c4, s4), (1, 1));
+    }
+
+    #[test]
+    fn without_reuse_every_callback_gets_a_new_instance() {
+        let Some(engine) = engine(false, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            let (_, _, c, s) = get(&engine, "/baseline11");
+            assert_eq!((c, s), (1, 1));
+        }
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+    }
+
+    #[test]
+    // 理由付き allow: テストの一時ファイルの用意（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn data_files_are_readable_as_plugin_data_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("dataset.json");
+        std::fs::write(&data, b"[1,2,3]").unwrap();
+        let Some(engine) = engine(true, Some(&data)) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let (st, body, _, _) = get(&engine, "/dataset");
+        assert_eq!((st, body.as_str()), (200, "[1,2,3]"));
+    }
+
+    #[test]
+    // 理由付き allow: テストの一時ファイルの用意（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn missing_data_file_is_a_load_error() {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "baseline".to_string(),
+                path: FIXTURE.to_string(),
+                data_files: [(
+                    "dataset".to_string(),
+                    missing.to_string_lossy().into_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }],
+            interpreter: false,
+        };
+        assert!(FilterEngine::new(&config).is_err());
+    }
+
+    #[test]
+    fn request_body_phase_sees_path_and_can_answer_or_rewrite() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        assert!(engine.wants_request_body(&modules()));
+        let method: Arc<str> = Arc::from("POST");
+        let ip: Arc<str> = Arc::from("127.0.0.1");
+        let run = |path: &str, body: &'static [u8]| {
+            let path: Arc<str> = Arc::from(path);
+            let meta = RequestMeta {
+                method: &method,
+                path: &path,
+                headers: &[],
+                client_ip: &ip,
+            };
+            futures::executor::block_on(engine.on_request_body_with_modules(
+                &modules(),
+                bytes::Bytes::from_static(body),
+                true,
+                Some(&meta),
+            ))
+        };
+        match run("/baseline11?a=1&b=2", b"10") {
+            BodyFilterResult::LocalResponse(r) => assert_eq!(r.body, b"13"),
+            _ => panic!("expected a local response"),
+        }
+        match run("/rewrite", b"hi") {
+            BodyFilterResult::Continue { body } => assert_eq!(&body[..], b"rewritten:hi"),
+            _ => panic!("expected the rewritten body"),
+        }
     }
 }

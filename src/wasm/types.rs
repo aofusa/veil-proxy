@@ -92,7 +92,7 @@ fn default_max_memory_size() -> usize {
 }
 
 /// Module configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModuleConfig {
     /// Module name (unique identifier)
     pub name: String,
@@ -107,6 +107,16 @@ pub struct ModuleConfig {
     /// Capability settings
     #[serde(default)]
     pub capabilities: ModuleCapabilities,
+
+    /// HTTP のコールバックで VM の文脈（インスタンスと root context）を使い回す（F-271）。
+    /// 既定は false（コールバックごとに新しいインスタンスで `_start`・`on_vm_start`・`on_configure` を実行する）
+    #[serde(default)]
+    pub instance_reuse: bool,
+
+    /// 起動時（設定ロード時）に veil が読むファイル（F-271）。名前 → パス。モジュールはプロパティ
+    /// `plugin_data.<名前>` で中身を読める（WASI の `path_open` は足さない）
+    #[serde(default)]
+    pub data_files: std::collections::BTreeMap<String, String>,
 }
 
 /// Filter action returned by callbacks

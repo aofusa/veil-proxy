@@ -209,6 +209,9 @@ pub struct FixedResponse {
     /// `Backend::security()` が既定値を返し、`type = "Respond"` とトラフィック制御の応答（フォルト・CORS・JWT）は
     /// ルートのセキュリティ設定を無視していた
     pub security: Arc<SecurityConfig>,
+    /// `type = "Respond"` のルートに付けた Wasm のモジュール（F-271。フィルタが `send_local_response` しなければ
+    /// この固定応答を返す）。トラフィック制御の応答（フォルト・CORS・JWT）は持たない
+    pub modules: Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
 }
 
 impl FixedResponse {
@@ -244,7 +247,17 @@ impl FixedResponse {
             h1_keepalive,
             h1_close,
             security: default_security(),
+            modules: None,
         }
+    }
+
+    /// ルートの Wasm のモジュールを付ける（ロード時に 1 回。F-271）
+    pub fn with_modules(
+        mut self,
+        modules: Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    ) -> Self {
+        self.modules = modules;
+        self
     }
 
     /// ルートのセキュリティ設定を付ける（ロード時に 1 回）
@@ -731,7 +744,9 @@ fn cors_variant(b: &Backend, actual: Option<Arc<crate::route_cors::CorsActual>>)
         let mut h = r.headers.clone();
         actual.apply_bytes(&mut h);
         return Backend::Respond(Arc::new(
-            FixedResponse::new(r.status, h, r.body.clone()).with_security(r.security.clone()),
+            FixedResponse::new(r.status, h, r.body.clone())
+                .with_security(r.security.clone())
+                .with_modules(r.modules.clone()),
         ));
     }
     let base_sec = b.security();

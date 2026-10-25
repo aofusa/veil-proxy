@@ -82,6 +82,15 @@ impl Default for BodyBuffer {
     }
 }
 
+/// 起動時に読んだファイル（名前 → 中身。F-271）
+pub type PluginData = Arc<HashMap<String, Arc<[u8]>>>;
+
+/// 空の [`PluginData`]（共有。要求ごとに確保しない）
+pub fn empty_plugin_data() -> PluginData {
+    static EMPTY: std::sync::OnceLock<PluginData> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(HashMap::new())).clone()
+}
+
 /// HTTP context for a single request
 pub struct HttpContext {
     // === Context IDs ===
@@ -129,6 +138,8 @@ pub struct HttpContext {
     pub plugin_configuration: Arc<[u8]>,
     /// VM configuration
     pub vm_configuration: Arc<[u8]>,
+    /// 起動時に読んだファイル（`[[wasm.modules]] data_files`。プロパティ `plugin_data.<名前>`。F-271）
+    pub plugin_data: PluginData,
 
     // === Modification Flags ===
     /// Request headers modified
@@ -285,6 +296,7 @@ impl HttpContext {
             plugin_root_id: None,
             plugin_configuration: crate::wasm_plugin_config::empty_configuration(),
             vm_configuration: crate::wasm_plugin_config::empty_configuration(),
+            plugin_data: empty_plugin_data(),
             request_headers_modified: false,
             request_body_modified: false,
             response_headers_modified: false,

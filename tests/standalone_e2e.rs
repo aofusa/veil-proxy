@@ -2182,7 +2182,20 @@ fn f273_h2_get(
 /// [`f273_h2_get`] の本文も返す版（F-272）
 type H2Full = (u16, Vec<(String, String)>, Vec<u8>);
 fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full {
+    h2_request_full(port, tls, "GET", path, req, b"")
+}
+
+/// h2c / TLS の h2 で任意のメソッド・本文の要求を 1 つ送る（F-271）
+fn h2_request_full(
+    port: u16,
+    tls: bool,
+    method: &str,
+    path: &str,
+    req: &[(&str, &str)],
+    req_body: &[u8],
+) -> H2Full {
     use std::sync::Arc;
+    let req_body = bytes::Bytes::copy_from_slice(req_body);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2193,13 +2206,13 @@ fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full
             .expect("connect");
         let scheme = if tls { "https" } else { "http" };
         let mut b = http::Request::builder()
-            .method("GET")
+            .method(method)
             .uri(format!("{scheme}://localhost:{port}{path}"));
         for (k, v) in req {
             b = b.header(*k, *v);
         }
         let request = b.body(()).unwrap();
-        async fn go<T>(io: T, request: http::Request<()>) -> H2Full
+        async fn go<T>(io: T, request: http::Request<()>, req_body: bytes::Bytes) -> H2Full
         where
             T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         {
@@ -2207,7 +2220,12 @@ fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full
             tokio::spawn(async move {
                 let _ = conn.await;
             });
-            let (resp, _) = client.send_request(request, true).expect("send");
+            let (resp, mut send) = client
+                .send_request(request, req_body.is_empty())
+                .expect("send");
+            if !req_body.is_empty() {
+                send.send_data(req_body, true).expect("send body");
+            }
             let resp = resp.await.expect("response");
             let status = resp.status().as_u16();
             let headers = resp
@@ -2239,9 +2257,9 @@ fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full
             let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
             let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
             let io = connector.connect(name, tcp).await.expect("tls");
-            go(io, request).await
+            go(io, request, req_body).await
         } else {
-            go(tcp, request).await
+            go(tcp, request, req_body).await
         }
     })
 }
@@ -2725,4 +2743,328 @@ watch = false
     wait_all("/w/sub/b.txt", "x1", "new file in a new directory");
     mv_replace(&www_w.join("sub"), "b.txt", "x2");
     wait_all("/w/sub/b.txt", "x2", "mv in a new directory");
+}
+
+// ===================== F-271 =====================
+
+/// 1 本の接続で生の HTTP/1.1 の要求を順に送り、応答を Content-Length で区切って読む（F-271。keep-alive の確認用）
+#[cfg(feature = "wasm")]
+fn http1_raw_keepalive(port: u16, reqs: &[Vec<u8>]) -> Vec<HttpResponse> {
+    use std::io::{Read, Write};
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut out = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    for req in reqs {
+        s.write_all(req).unwrap();
+        loop {
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let cl: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse().unwrap())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + cl {
+                    let rest = buf.split_off(end + 4 + cl);
+                    out.push(parse_http1_response(&buf).unwrap());
+                    buf = rest;
+                    break;
+                }
+            }
+            let mut tmp = [0u8; 4096];
+            let n = s.read(&mut tmp).unwrap();
+            assert!(n > 0, "connection closed after {} responses", out.len());
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    out
+}
+
+/// 要求の本文を返すだけの上流（F-271 の `/rewrite`。`Connection: close`）
+#[cfg(feature = "wasm")]
+fn spawn_body_echo() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (end, cl) = loop {
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let cl: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        break (end + 4, cl);
+                    }
+                    match s.read(&mut tmp) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                        _ => return,
+                    }
+                };
+                while buf.len() < end + cl {
+                    match s.read(&mut tmp) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                        _ => return,
+                    }
+                }
+                let body = &buf[end..end + cl];
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body);
+                let _ = s.write_all(&resp);
+            });
+        }
+    });
+    port
+}
+
+/// Proxy-Wasm（F-271）: `type = "Respond"` のルートに付けたモジュールが、HTTP/1.1（Content-Length・chunked・
+/// keep-alive）・h2c・TLS の HTTP/2・HTTP/3 で要求ヘッダと要求本文のフェーズから答える。`data_files` がプロパティで
+/// 読め、本文の書き換えが上流に届く。`instance_reuse = true` は `on_configure` が 1 回だけで http context が増え、
+/// トラップの後は新しいインスタンスになる。`false` は要求ごとに新しいインスタンス。
+#[cfg(feature = "wasm")]
+#[test]
+fn f271_wasm_respond_body_phase_reuse_and_data_files() {
+    let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wasm/baseline_filter.wasm");
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    // 生成される .cwasm を作業ツリーに残さないよう一時ディレクトリへ写す
+    let wasm_copy = dir.path().join("baseline_filter.wasm");
+    std::fs::copy(&wasm, &wasm_copy).unwrap();
+    let dataset = dir.path().join("dataset.json");
+    std::fs::write(&dataset, r#"{"items":[1,2,3]}"#).unwrap();
+    let echo = spawn_body_echo();
+    let port = free_port();
+    let tls_port = free_port();
+    let caps = r#"
+allow_send_local_response = true
+allow_request_headers_read = true
+allow_request_body_read = true
+allow_request_body_write = true
+allowed_properties = ["request.*", "plugin_data.*"]
+"#;
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "baseline"
+path = "{wasm}"
+instance_reuse = true
+data_files = {{ dataset = "{dataset}" }}
+[wasm.modules.capabilities]
+{caps}
+
+[[wasm.modules]]
+name = "fresh"
+path = "{wasm}"
+[wasm.modules.capabilities]
+{caps}
+
+[[route]]
+modules = ["fresh"]
+[route.conditions]
+path = "/fresh/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/dataset"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/trap"
+[route.action]
+type = "Respond"
+status = 503
+body = "fallback"
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/rewrite"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        wasm = tp(&wasm_copy),
+        dataset = tp(&dataset),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30))
+            && wait_for_port(tls_port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+
+    // (メソッド, パス, 本文) → (状態, 本文)
+    type Req<'a> = Box<dyn Fn(&str, &str, &[u8]) -> (u16, String) + 'a>;
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    let mut protocols: Vec<(&str, Req)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let r = http1_request(port, m, p, &[], b).unwrap();
+                (r.status, text(r.body))
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let (st, _, body) = h2_request_full(port, false, m, p, &[], b);
+                (st, text(body))
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let (st, _, body) = h2_request_full(tls_port, true, m, p, &[], b);
+                (st, text(body))
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|m: &str, p: &str, b: &[u8]| {
+            let (st, body) = h3_request(tls_port, m, p, b);
+            (st, text(body))
+        }),
+    ));
+
+    for (proto, req) in &protocols {
+        let ctx = |what: &str| format!("{proto} {what}\n{}", veil.log());
+        // 要求ヘッダのフェーズ（本文なし）
+        assert_eq!(
+            req("GET", "/baseline11?a=1&b=2", b""),
+            (200, "3".into()),
+            "{}",
+            ctx("GET")
+        );
+        // 要求本文のフェーズ
+        assert_eq!(
+            req("POST", "/baseline11?a=1&b=2", b"10"),
+            (200, "13".into()),
+            "{}",
+            ctx("POST")
+        );
+        // data_files
+        assert_eq!(
+            req("GET", "/dataset", b""),
+            (200, r#"{"items":[1,2,3]}"#.into()),
+            "{}",
+            ctx("dataset")
+        );
+        // 本文の書き換えが上流に届く
+        assert_eq!(
+            req("POST", "/rewrite", b"hello"),
+            (200, "rewritten:hello".into()),
+            "{}",
+            ctx("rewrite")
+        );
+    }
+
+    // HTTP/1.1 の chunked と keep-alive（フィルタの応答の後も接続を続ける）
+    let rs = http1_raw_keepalive(
+        port,
+        &[
+            b"GET /baseline11?a=1&b=2 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            b"POST /baseline11?a=5 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n2\r\n1\r\n0\r\n0\r\n\r\n".to_vec(),
+            b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n9".to_vec(),
+            b"POST /rewrite HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n".to_vec(),
+        ],
+    );
+    let bodies: Vec<String> = rs.iter().map(|r| r.text()).collect();
+    assert_eq!(bodies, ["3", "25", "10", "rewritten:ab"], "{}", veil.log());
+
+    // instance_reuse = true: on_configure は 1 回、http context は増えていく（同じワーカーの HTTP/1.1）
+    let seq = |r: &HttpResponse| -> (u32, u32) {
+        (
+            r.header("x-configure-count").unwrap().parse().unwrap(),
+            r.header("x-instance-seq").unwrap().parse().unwrap(),
+        )
+    };
+    let rs = http1_raw_keepalive(
+        port,
+        &[
+            b"GET /baseline11 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            b"GET /baseline11 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        ],
+    );
+    let (c1, s1) = seq(&rs[0]);
+    let (c2, s2) = seq(&rs[1]);
+    assert_eq!((c1, c2), (1, 1), "{}", veil.log());
+    assert!(s2 > s1 && s1 > 1, "{s1} {s2}\n{}", veil.log());
+
+    // トラップしたら固定応答に落ち、次の要求は新しいインスタンス（http context の数が振り出しに戻る。
+    // トラップした要求の on_log が新しいインスタンスで 1 つ作るので 2 以下）
+    let r = http1_request(port, "GET", "/trap", &[], b"").unwrap();
+    assert_eq!(
+        (r.status, r.text()),
+        (503, "fallback".into()),
+        "{}",
+        veil.log()
+    );
+    let r = http1_request(port, "GET", "/baseline11", &[], b"").unwrap();
+    let (c3, s3) = seq(&r);
+    assert!(
+        c3 == 1 && s3 <= 2 && s3 < s2,
+        "{c3} {s3} (before {s2})\n{}",
+        veil.log()
+    );
+
+    // instance_reuse = false: 毎回新しいインスタンス
+    for _ in 0..2 {
+        let r = http1_request(port, "GET", "/fresh/baseline11?a=4", &[], b"").unwrap();
+        assert_eq!(r.text(), "4", "{}", veil.log());
+        assert_eq!(seq(&r), (1, 1), "{}", veil.log());
+    }
 }

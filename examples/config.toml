@@ -1588,6 +1588,16 @@ watch = false
 # # max_body_size = 65536
 # # patterns = ["union select", "<script"]
 #
+# # F-271: VM の文脈を要求をまたいで使い回す（既定 false）。true なら `_start`・`proxy_on_vm_start`・
+# # `proxy_on_configure` はインスタンスを作るときに 1 回だけ走り、要求ごとは http context の作成
+# # （`proxy_on_context_create`）とコールバックだけになる（Envoy と同じ寿命。フィルタのグローバル変数・
+# # root context の状態が要求をまたいで残る）。トラップしたインスタンスは捨てて作り直す。
+# instance_reuse = false
+#
+# # F-271: 起動時（と設定のリロード時）に読むファイル。値はプロパティ `plugin_data.<名前>` で読める
+# # （capabilities の allowed_properties を書くなら "plugin_data.*" を含める）。要求ごとのファイルの読み取りは無い。
+# # data_files = { dataset = "/etc/veil/data/dataset.json" }
+#
 # # F-148: ルート単位で configuration を上書きしたい場合は [[route]] 側の
 # # [route.module_configuration.<モジュール名>] を使う（下記 [[route]] セクション参照）。
 # # 両方 TOML テーブルならディープマージ（同名キーはルート優先）、
@@ -2489,6 +2499,17 @@ watch = false
 # status = 200                 # 既定 200
 # body = "ok"
 # content_type = "text/plain"  # 任意
+#
+# F-271: Respond のルートにも [[route]] の modules を付けられる。フィルタが send_local_response で応答すれば
+# それを返し、しなければこの固定応答を返す（上流の無い、フィルタだけで答えるルート）。要求本文のフェーズ
+# （on_http_request_body）も HTTP/1.1・HTTP/2・HTTP/3 の全部で走る（allow_request_body_read のモジュールがあるとき）。
+# [[route]]
+# modules = ["baseline"]
+# [route.conditions]
+# path = "/baseline11"
+# [route.action]
+# type = "Respond"
+# status = 404
 #
 # [route.traffic] は任意のルートに書ける（ロード時に解決。無いルートには影響しない）
 # [route.traffic]

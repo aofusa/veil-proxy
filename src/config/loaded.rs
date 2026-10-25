@@ -1720,7 +1720,8 @@ pub(super) fn build_backend(
                     headers,
                     bytes::Bytes::from(body.clone()),
                 )
-                .with_security(Arc::new(security)),
+                .with_security(Arc::new(security))
+                .with_modules(modules_arc.clone()),
             )))
         }
         BackendConfig::Redirect {

@@ -55,6 +55,7 @@ pub fn load(
             String::from_utf8_lossy(&configuration).into_owned(),
         ),
         capabilities: capabilities(),
+        ..Default::default()
     };
     // Envoy の Wasm にはメモリの上限が無い（C++ SDK の emscripten 製は最小で 16MB を要求する）。
     // プーリングアロケータは 1 スロットごとに仮想アドレスを予約するだけなので、上限を大きめにする

@@ -53,6 +53,13 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
             None => Some(state.http_ctx.root_context_id.to_string().into_bytes()),
         },
 
+        // 起動時に読んだファイル（`[[wasm.modules]] data_files`。F-271）
+        p if p.starts_with("plugin_data.") => state
+            .http_ctx
+            .plugin_data
+            .get(&p["plugin_data.".len()..])
+            .map(|d| d.to_vec()),
+
         // Check custom_properties for user-defined properties
         _ => state.http_ctx.custom_properties.get(path).cloned(),
     }

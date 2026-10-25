@@ -1479,19 +1479,95 @@ pub(super) async fn h2_dispatch(
         }
     }
 
+    // F-271: 要求本文のフェーズ。Wasm のルートはバッファ経路（`ctx.body` に本文全体がある）なので、本文のある
+    // 要求で本文を読むモジュール（`allow_request_body_read`）があれば `on_request_body` を 1 回呼ぶ。
+    #[cfg(feature = "wasm")]
+    let mut wasm_request_body_override: Option<Bytes> = None;
+    #[cfg(feature = "wasm")]
+    if !ctx.body.is_empty() && !wasm_modules_to_apply.is_empty() {
+        let config = CURRENT_CONFIG.load();
+        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+            if wasm_engine.wants_request_body(&wasm_modules_to_apply) {
+                let method_arc: Arc<str> = Arc::from(std::str::from_utf8(method).unwrap_or("GET"));
+                let path_arc: Arc<str> = Arc::from(std::str::from_utf8(path).unwrap_or("/"));
+                let ip_arc: Arc<str> = Arc::from(client_ip);
+                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = wasm_request_headers_override
+                    .as_ref()
+                    .unwrap_or(&ctx.headers)
+                    .iter()
+                    .map(|h| (h.name.to_vec(), h.value.to_vec()))
+                    .collect();
+                let meta = crate::wasm::RequestMeta {
+                    method: &method_arc,
+                    path: &path_arc,
+                    headers: &headers_vec,
+                    client_ip: &ip_arc,
+                };
+                match crate::wasm::http_executor::apply_wasm_request_body(
+                    wasm_engine,
+                    &wasm_modules_to_apply,
+                    ctx.body.clone(),
+                    true,
+                    Some(&meta),
+                )
+                .await
+                {
+                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                        if b != ctx.body {
+                            wasm_request_body_override = Some(b);
+                        }
+                    }
+                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(resp) => {
+                        let mut headers: Vec<(Bytes, Bytes)> = resp
+                            .headers
+                            .into_iter()
+                            .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
+                            .collect();
+                        for (n, v) in h2_base_headers(false) {
+                            headers.push((n, v));
+                        }
+                        let (st, sz) = h2_emit_full(
+                            resp_tx,
+                            notify,
+                            resp.status_code,
+                            headers,
+                            Bytes::from(resp.body),
+                        )
+                        .await;
+                        crate::wasm::on_request_complete_async(
+                            wasm_engine.clone(),
+                            wasm_modules_to_apply.clone(),
+                        )
+                        .await;
+                        return (st, sz);
+                    }
+                }
+            }
+        }
+    }
+
     // F-133: WASM がリクエストヘッダを変更した場合のみ、ヘッダを差し替えた `H2RequestCtx` を
     // ローカルに構築して `ctx` をシャドウイングする（ホットパス絶対規則: WASM 未適用時は
     // `None` 分岐のみでコスト増なし。`body` は `Bytes` の clone のため参照カウント増加のみ）。
     #[cfg(feature = "wasm")]
     let modified_ctx;
     #[cfg(feature = "wasm")]
-    let ctx = if let Some(headers) = wasm_request_headers_override {
+    let ctx = if wasm_request_headers_override.is_some() || wasm_request_body_override.is_some() {
+        let mut headers = wasm_request_headers_override.unwrap_or_else(|| ctx.headers.clone());
+        // F-271: 本文を差し替えたら content-length も合わせる
+        if let Some(b) = &wasm_request_body_override {
+            headers.retain(|h| !h.name.eq_ignore_ascii_case(b"content-length"));
+            headers.push(crate::http2::hpack::HeaderField {
+                name: Bytes::from_static(b"content-length"),
+                value: Bytes::from(b.len().to_string()),
+            });
+        }
         modified_ctx = H2RequestCtx {
             method: ctx.method.clone(),
             path: ctx.path.clone(),
             authority: ctx.authority.clone(),
             headers,
-            body: ctx.body.clone(),
+            body: wasm_request_body_override.unwrap_or_else(|| ctx.body.clone()),
             trailers: ctx.trailers.clone(),
             client_ip: ctx.client_ip.clone(),
             client_socket_addr: ctx.client_socket_addr,

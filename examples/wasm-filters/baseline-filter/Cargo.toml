@@ -1,0 +1,19 @@
+[package]
+name = "baseline-filter"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy-Wasm filter that answers HttpArena-style /baseline11 requests (query + body sum) for veil-proxy"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+
+[profile.release]
+lto = true
+opt-level = "s"
+panic = "abort"
+
+# Exclude from parent workspace
+[workspace]

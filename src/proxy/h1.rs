@@ -917,7 +917,7 @@ pub(super) async fn handle_requests(
                                     Arc::from(method_str),
                                     headers_vec,
                                     Arc::from(client_ip),
-                                    initial_body.is_empty() && !is_chunked, // end_of_stream
+                                    content_length == 0 && !is_chunked, // end_of_stream
                                 )
                                 .await;
 
@@ -936,69 +936,54 @@ pub(super) async fn handle_requests(
                                         .collect()
                                 }
                                 crate::wasm::FilterResult::LocalResponse(resp) => {
-                                    // ローカルレスポンスを返送
-                                    let status_line = format!(
-                                        "HTTP/1.1 {} {}\r\n",
-                                        resp.status_code,
-                                        match resp.status_code {
-                                            200 => "OK",
-                                            404 => "Not Found",
-                                            403 => "Forbidden",
-                                            500 => "Internal Server Error",
-                                            _ => "Unknown",
-                                        }
-                                    );
-                                    let mut response = status_line.into_bytes();
-                                    for (k, v) in &resp.headers {
-                                        response.extend_from_slice(k);
-                                        response.extend_from_slice(b": ");
-                                        response.extend_from_slice(v);
-                                        response.extend_from_slice(b"\r\n");
-                                    }
-                                    // F-62: モジュールが Content-Length を設定していない場合は
-                                    // 補完する（欠落するとクライアントは接続クローズまで
-                                    // ボディを待ち続け、TLS では close_notify 無しの EOF
-                                    // エラーになる）
-                                    let has_content_length = resp
-                                        .headers
-                                        .iter()
-                                        .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"));
-                                    if !has_content_length {
-                                        response.extend_from_slice(
-                                            format!("Content-Length: {}\r\n", resp.body.len())
-                                                .as_bytes(),
-                                        );
-                                    }
-                                    response.extend_from_slice(b"\r\n");
-                                    response.extend_from_slice(&resp.body);
-
+                                    // ローカルレスポンスを返送。F-271: 本文を読み切れたら接続を続ける
+                                    // （以前は毎回閉じていた）
                                     let start_instant = Instant::now();
+                                    let response = wasm_local_response_h1(&resp);
                                     let resp_size = response.len() as u64;
                                     let write_result =
                                         timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
                                             .await;
-                                    if let Ok((Ok(_), _)) = write_result {
-                                        log_access(
-                                            &method_bytes,
-                                            &host_bytes,
-                                            &path_bytes,
-                                            &user_agent,
-                                            0,
-                                            resp.status_code,
-                                            resp_size,
-                                            start_instant,
-                                            client_ip,
-                                            "",
-                                        );
-                                        // WASMライフサイクルコールバック: リクエスト完了
-                                        crate::wasm::on_request_complete_async(
-                                            wasm_engine.clone(),
-                                            modules_to_apply.clone(),
-                                        )
-                                        .await;
+                                    if !matches!(write_result, Ok((Ok(_), _))) {
+                                        return;
                                     }
+                                    log_access(
+                                        &method_bytes,
+                                        &host_bytes,
+                                        &path_bytes,
+                                        &user_agent,
+                                        0,
+                                        resp.status_code,
+                                        resp_size,
+                                        start_instant,
+                                        client_ip,
+                                        "",
+                                    );
+                                    // WASMライフサイクルコールバック: リクエスト完了
+                                    crate::wasm::on_request_complete_async(
+                                        wasm_engine.clone(),
+                                        modules_to_apply.clone(),
+                                    )
+                                    .await;
                                     accumulated.clear();
-                                    return;
+                                    if client_wants_close
+                                        || is_websocket
+                                        || !drain_request_body(
+                                            &mut tls_stream,
+                                            content_length,
+                                            is_chunked && chunked_end.is_none(),
+                                            &initial_body,
+                                        )
+                                        .await
+                                    {
+                                        return;
+                                    }
+                                    if !pipelined.is_empty() {
+                                        accumulated.extend_from_slice(&pipelined);
+                                        pipelined_ready =
+                                            accumulated.windows(4).any(|w| w == b"\r\n\r\n");
+                                    }
+                                    continue;
                                 }
                                 crate::wasm::FilterResult::Pause => {
                                     // 非同期処理待ち（現在は未実装）
@@ -1013,6 +998,128 @@ pub(super) async fn handle_requests(
                         headers_for_proxy
                     }
                 };
+
+                // F-271: 要求本文のフェーズ（本文を読むモジュール＝`allow_request_body_read` があり、本文のある
+                // 要求だけ）。本文を上限付きで読み切って `on_request_body` を呼び、結果の本文を Content-Length 付きで
+                // バックエンドへ渡す（chunked は外す）。Wasm の無いルートは `is_empty` の分岐だけ
+                #[cfg(feature = "wasm")]
+                let (initial_body, content_length, is_chunked, headers_for_proxy) =
+                    if modules_to_apply.is_empty()
+                        || is_websocket
+                        || !(is_chunked || content_length > 0)
+                    {
+                        (initial_body, content_length, is_chunked, headers_for_proxy)
+                    } else {
+                        let config = CURRENT_CONFIG.load();
+                        match config.wasm_filter_engine.as_ref() {
+                            Some(wasm_engine)
+                                if wasm_engine.wants_request_body(&modules_to_apply) =>
+                            {
+                                let limit = if is_chunked {
+                                    security.max_chunked_body_size
+                                } else {
+                                    security.max_request_body_size
+                                };
+                                let body = match read_full_request_body(
+                                    &mut tls_stream,
+                                    content_length,
+                                    is_chunked,
+                                    &initial_body,
+                                    limit,
+                                )
+                                .await
+                                {
+                                    Ok(b) => b,
+                                    Err(status) => {
+                                        let err: &[u8] = if status == 413 {
+                                            ERR_MSG_REQUEST_TOO_LARGE
+                                        } else {
+                                            ERR_MSG_BAD_REQUEST
+                                        };
+                                        let _ = timeout(
+                                            WRITE_TIMEOUT,
+                                            tls_stream.write_all(err.to_vec()),
+                                        )
+                                        .await;
+                                        // 未読の本文を残して閉じると RST で応答が届かないことがある（B-102）
+                                        lingering_drain_before_close(&mut tls_stream).await;
+                                        return;
+                                    }
+                                };
+                                let method_arc: Arc<str> =
+                                    Arc::from(std::str::from_utf8(&method_bytes).unwrap_or("GET"));
+                                let path_arc: Arc<str> =
+                                    Arc::from(std::str::from_utf8(&path_bytes).unwrap_or("/"));
+                                let ip_arc: Arc<str> = Arc::from(client_ip);
+                                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers_for_proxy
+                                    .iter()
+                                    .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                                    .collect();
+                                let meta = crate::wasm::RequestMeta {
+                                    method: &method_arc,
+                                    path: &path_arc,
+                                    headers: &headers_vec,
+                                    client_ip: &ip_arc,
+                                };
+                                match crate::wasm::http_executor::apply_wasm_request_body(
+                                    wasm_engine,
+                                    &modules_to_apply,
+                                    body,
+                                    true,
+                                    Some(&meta),
+                                )
+                                .await
+                                {
+                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                        let mut headers = headers_for_proxy;
+                                        set_body_framing_headers(&mut headers, b.len());
+                                        (b.to_vec(), b.len(), false, headers)
+                                    }
+                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                        resp,
+                                    ) => {
+                                        let start_instant = Instant::now();
+                                        let response = wasm_local_response_h1(&resp);
+                                        let resp_size = response.len() as u64;
+                                        let write_result =
+                                            timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
+                                                .await;
+                                        if !matches!(write_result, Ok((Ok(_), _))) {
+                                            return;
+                                        }
+                                        log_access(
+                                            &method_bytes,
+                                            &host_bytes,
+                                            &path_bytes,
+                                            &user_agent,
+                                            content_length as u64,
+                                            resp.status_code,
+                                            resp_size,
+                                            start_instant,
+                                            client_ip,
+                                            "",
+                                        );
+                                        crate::wasm::on_request_complete_async(
+                                            wasm_engine.clone(),
+                                            modules_to_apply.clone(),
+                                        )
+                                        .await;
+                                        accumulated.clear();
+                                        if client_wants_close {
+                                            return;
+                                        }
+                                        if !pipelined.is_empty() {
+                                            accumulated.extend_from_slice(&pipelined);
+                                            pipelined_ready =
+                                                accumulated.windows(4).any(|w| w == b"\r\n\r\n");
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => (initial_body, content_length, is_chunked, headers_for_proxy),
+                        }
+                    };
 
                 // 処理時間計測開始（アクセスログ・メトリクスが無効なら時刻を読まない）
                 let start_instant = crate::logging::request_start_instant();
@@ -1621,7 +1728,7 @@ pub(super) async fn handle_api_handler(
         .await;
     }
     let limit = crate::api::app::max_body_size();
-    let body = match read_api_request_body(
+    let body = match read_full_request_body(
         &mut tls_stream,
         content_length,
         is_chunked,
@@ -1858,6 +1965,53 @@ async fn pump_api_body(
     true
 }
 
+/// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答にする（Content-Length が無ければ補う。F-62）
+#[cfg(feature = "wasm")]
+fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse) -> Vec<u8> {
+    let mut response = Vec::with_capacity(64 + resp.body.len() + resp.headers.len() * 32);
+    let _ = std::io::Write::write_fmt(
+        &mut response,
+        format_args!(
+            "HTTP/1.1 {} {}\r\n",
+            resp.status_code,
+            crate::http_utils::status_reason_phrase(resp.status_code)
+        ),
+    );
+    for (k, v) in &resp.headers {
+        response.extend_from_slice(k);
+        response.extend_from_slice(b": ");
+        response.extend_from_slice(v);
+        response.extend_from_slice(b"\r\n");
+    }
+    // F-62: モジュールが Content-Length を設定していない場合は補完する（欠落するとクライアントは接続
+    // クローズまでボディを待ち続け、TLS では close_notify 無しの EOF エラーになる）
+    if !resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"))
+    {
+        let _ = std::io::Write::write_fmt(
+            &mut response,
+            format_args!("Content-Length: {}\r\n", resp.body.len()),
+        );
+    }
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(&resp.body);
+    response
+}
+
+/// 本文を差し替えた要求のヘッダ（Transfer-Encoding・Content-Length を外して新しい Content-Length を付ける。F-271）
+#[cfg(feature = "wasm")]
+fn set_body_framing_headers(headers: &mut Vec<(Bytes, Bytes)>, len: usize) {
+    headers.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case(b"content-length") && !k.eq_ignore_ascii_case(b"transfer-encoding")
+    });
+    headers.push((
+        Bytes::from_static(b"Content-Length"),
+        Bytes::from(len.to_string()),
+    ));
+}
+
 /// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧。要求ごとに `Arc` を作らないよう
 /// スレッドごとに 1 つを使い回す（F-202）。
 #[cfg(not(feature = "wasm"))]
@@ -1941,9 +2095,9 @@ pub(super) async fn write_api_chunked(
 }
 
 /// ハンドラ用に HTTP/1.1 のリクエスト本文を全部読む（Content-Length / chunked、上限 `limit`）。
-/// 失敗はステータス（上限超過 413、それ以外 400）。
-#[cfg(feature = "handler")]
-pub(super) async fn read_api_request_body(
+/// 失敗はステータス（上限超過 413、それ以外 400）。Wasm の要求本文のフェーズ（F-271）も使う。
+#[cfg(any(feature = "handler", feature = "wasm"))]
+pub(super) async fn read_full_request_body(
     stream: &mut ServerTls,
     content_length: usize,
     is_chunked: bool,

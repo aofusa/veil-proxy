@@ -160,7 +160,7 @@ impl Backend {
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
             Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules, _) => modules.as_ref(),
-            Backend::Respond(_) => None,
+            Backend::Respond(r) => r.modules.as_ref(),
             #[cfg(feature = "handler")]
             Backend::Handler(_, _, modules, _) => modules.as_ref(),
         }
@@ -180,7 +180,7 @@ impl Backend {
             Backend::Redirect(_, _, _, modules, _) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
-            Backend::Respond(_) => None,
+            Backend::Respond(r) => r.modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice()),
             #[cfg(feature = "handler")]
             Backend::Handler(_, _, modules, _) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
