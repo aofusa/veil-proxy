@@ -231,6 +231,14 @@ typedef struct {
 } veil_l4_tcp_callbacks_t;
 int veil_register_l4_tcp(veil_config_t *cfg, const char *name, const char *listen,
                          const veil_l4_tcp_callbacks_t *callbacks, void *user_data);
+/*
+ * HTTP/1.1 のプロトコルアップグレード (F-261): 応答を 101 Switching Protocols (Upgrade: protocol) にし、
+ * 101 を書いた後の接続を上の L4 の TCP コールバックで受ける (on_connect → on_data … → on_close。
+ * veil_l4_write・veil_l4_close が使える)。resp に設定済みのヘッダは 101 と一緒に送る。
+ * 要求が Connection: upgrade + Upgrade を持たない・本文付き・HTTP/2・HTTP/3 なら 400 になる。h2c は予約 (500)。
+ */
+int veil_response_upgrade(veil_response_t *resp, const char *protocol, const veil_l4_tcp_callbacks_t *callbacks,
+                          void *user_data);
 int veil_l4_write(veil_l4_conn_t *conn, const uint8_t *data, size_t len);
 void veil_l4_close(veil_l4_conn_t *conn);
 const char *veil_l4_peer(const veil_l4_conn_t *conn, size_t *len);

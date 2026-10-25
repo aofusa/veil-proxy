@@ -249,6 +249,7 @@ for debugging.
 | `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
 | `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
 | `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
+| `upgrade_idle_timeout_secs` | `0` | seconds a `read` on an upgraded HTTP/1.1 connection may wait (0 = no limit) |
 
 ## Routing macros
 
@@ -347,6 +348,55 @@ async fn upper(req: &Request) -> Response {
     Response::stream(200, body).with_header("content-type", "text/plain")
 }
 ```
+
+### Protocol upgrades (HTTP/1.1)
+
+A handler can take over the connection with `101 Switching Protocols`. `Request::upgrade_protocol()` returns the
+`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; always `None` on HTTP/2 and
+HTTP/3), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
+`veil::api::upgrade::Upgraded` connection:
+
+```rust
+use veil::api::upgrade::Upgraded;
+
+#[veil::route(path = "/echo", method = "GET")]
+async fn echo(req: Request) -> Response {
+    if req.upgrade_protocol() != Some(&b"x-echo"[..]) {
+        return Response::error(426, "Upgrade Required");
+    }
+    Response::switching_protocols("x-echo", |mut up: Upgraded| async move {
+        let mut buf = bytes::BytesMut::with_capacity(4096);
+        loop {
+            let (res, b) = up.read(buf).await;          // ownership-passing read, as in veil's runtime
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => { if up.write_all(buf.split().freeze()).await.is_err() { break } }
+                _ => break,
+            }
+        }
+    })
+}
+```
+
+- `Upgraded` is the same type for plaintext, rustls and kTLS connections: `read(BytesMut)`, `readable()` (safe to
+  drop; `select` on it rather than on `read`, whose data would be lost on io_uring if dropped), `write_all(Bytes)`,
+  `write_vectored_all(&[Bytes])` (header + payload in one write), `shutdown()`, `client_ip()` and
+  `shutdown_signal()` (resolves when graceful shutdown starts; connections still open after
+  `[server] graceful_shutdown_timeout_secs` are dropped).
+- Bytes the client sent right after the request headers (even in the same packet) are returned by the first `read`.
+- The 101 carries `Connection: Upgrade`, `Upgrade: <protocol>` and the headers you add with `with_header`; it has no
+  `Content-Length` and the connection never returns to HTTP. The access log records the 101.
+- veil answers 400 instead when the request is not an upgrade request (no `Connection: upgrade` / `Upgrade`),
+  is HTTP/1.0, has a body, or arrived over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220 extended CONNECT is not supported).
+  `h2c` is reserved (500 and a warning).
+- An upgraded connection still counts against `[security] max_concurrent_connections`. `[api] upgrade_idle_timeout_secs`
+  (default 0 = none) makes a `read` that waits longer fail with `TimedOut`.
+- With `tokio-compat`, `up.into_tokio_io()` returns an object implementing `veil::tokio::io::{AsyncRead, AsyncWrite}`
+  for tokio-based protocol libraries (one extra copy through a task on the same worker).
+- C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)` with the L4 TCP callbacks (`on_connect` / `on_data` /
+  `on_close`, `veil_l4_write`). Rust can do the same with `Upgraded::serve_blocking` (`l4-handler`).
+
+Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/).
 
 ## Validation and OpenAPI
 
@@ -831,6 +881,8 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
 - L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)` with `on_connect` / `on_data` / `on_close`
   (called on the handler pool, one at a time per connection; `veil_l4_write` / `veil_l4_close` inside a callback),
   and `veil_register_l4_udp(cfg, name, listen, fn, ud)` (`veil_l4_reply` answers a datagram).
+- Protocol upgrade (HTTP/1.1): `veil_response_upgrade(resp, protocol, &callbacks, ud)` answers 101 and serves the
+  connection with the L4 TCP callbacks (see [Protocol upgrades](#protocol-upgrades-http11)).
 - Streaming functions cannot be used on `VEIL_ROUTE_INLINE` routes (`VEIL_ERR_STATE`).
 
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
@@ -1041,6 +1093,7 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
   second call returns an error.
 - gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
 - Python handlers are bound by the GIL; C callbacks must be thread-safe.
+- Protocol upgrades exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220, is not supported).
 - The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
   (`/openapi.json` works offline).
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path

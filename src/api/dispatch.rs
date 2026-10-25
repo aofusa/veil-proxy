@@ -39,6 +39,18 @@ pub(crate) fn build_request(
 pub(crate) struct CallCache {
     #[cfg(feature = "tokio-compat")]
     waker: crate::tokio::waker::SafeWakerCache,
+    // F-261: HTTP/1.1 の経路が要求ごとに立てる（`Connection: upgrade`・`Upgrade` があり、HTTP/1.1 で本文が無い）。
+    // HTTP/2・HTTP/3 は既定の false のまま（アップグレードは 400）。
+    pub(crate) upgrade_allowed: bool,
+    // F-261: 101 を書いた後に接続を渡す関数（HTTP/1.1 の接続のループが受け取る）。
+    pub(crate) pending_upgrade: Option<super::upgrade::UpgradeFn>,
+}
+
+impl CallCache {
+    #[cfg(feature = "tokio-compat")]
+    pub(crate) fn waker_cache(&mut self) -> &mut crate::tokio::waker::SafeWakerCache {
+        &mut self.waker
+    }
 }
 
 /// Calls the handler. A body over the limit gives 413 and a handler panic gives 500; for HEAD the body is dropped
@@ -73,6 +85,10 @@ pub(crate) async fn call_with(
             Response::error(500, "Internal Server Error")
         }
     };
+    // F-261: アップグレードの応答のときだけ検査する（通常の応答は `Option` の確認 1 回）
+    if resp.upgrade.is_some() {
+        super::upgrade::check_response(&mut resp, cache.upgrade_allowed && !head);
+    }
     if head {
         // HEAD はストリームを送らない（drop でハンドラ側の生成を止める）。長さは不明なので付けない。
         if resp.stream.take().is_some() {

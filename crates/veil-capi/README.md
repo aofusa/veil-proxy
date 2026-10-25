@@ -126,6 +126,22 @@ veil_register_l4_tcp(cfg, "echo", "127.0.0.1:7000", &cb, NULL);
 接続ごとのデータは `veil_l4_set_conn_data` / `veil_l4_conn_data`。UDP は `veil_register_l4_udp` のコールバックで
 `veil_l4_reply` を呼ぶと応答します。
 
+### HTTP/1.1 のプロトコルアップグレード（F-261）
+
+```c
+static int on_data(veil_l4_conn_t *c, const uint8_t *d, size_t n, void *ud) { return veil_l4_write(c, d, n); }
+static const veil_l4_tcp_callbacks_t cb = { .on_data = on_data };
+
+static int upgrade(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    return veil_response_upgrade(resp, "x-echo", &cb, NULL);   /* 101 → 以後は L4 と同じコールバック */
+}
+```
+
+`veil_response_upgrade` は応答を `101 Switching Protocols`（`Upgrade: x-echo`）にし、101 を書いた後の接続を L4 の TCP と同じ
+コールバック（`on_connect` → `on_data` … → `on_close`、`veil_l4_write`・`veil_l4_close`）で受けます。ヘッダの直後に届いていた
+バイト列も最初の `on_data` に渡ります。要求に `Connection: upgrade` と `Upgrade` が無い・本文付き・HTTP/1.0・HTTP/2・HTTP/3 なら
+veil が 400 に置き換えます（`h2c` は予約済みで 500）。
+
 ### 所有権
 
 | 対象 | 規則 |

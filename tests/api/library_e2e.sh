@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|c|python|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -127,7 +127,7 @@ TOML
   expect "404 for unknown" "404" curl -s -o /dev/null -w "%{http_code}" "$B/nope"
   expect "L4 TCP echo" "hello-tcp" l4_echo tcp "$L4" hello-tcp
   expect "L4 UDP echo" "echo:hi" l4_echo udp "$U" hi
-  expect "threads default = CPU count" "Workers: $(ncpu)" cat "$W/log"
+  expect "threads default = CPU count" "workers=$(ncpu)" cat "$W/log"
   # SIGHUP: ファイルを読み直しても組み込みのルート（マクロ）とコード側の上書きは保たれる
   if [ "$OS" != Windows ]; then  # Windows に SIGHUP は無い
     sed -i.bak 's/level = "info"/level = "warn"/' "$W/config.toml"; kill -HUP "$PID"; sleep 1
@@ -140,7 +140,7 @@ TOML
   (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P2" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log" 2> "$W2/err" &
   local PID2=$!; PIDS+=("$PID2")
   wait_port "$P2" && expect "no config.toml -> library defaults" "Hello, World!" curl -s "http://127.0.0.1:$P2/hello" || bad "no-config start"
-  expect "defaults are plaintext h2c-only + HTTP/1.1" "H2C (HTTP/2 Cleartext) Server" cat "$W2/log"
+  expect "defaults are plaintext h2c-only + HTTP/1.1" "cleartext http1=on h2c=on" cat "$W2/log"
   # F-244: ライブラリの既定はアクセスログを標準出力に出す（専用スレッドが最大 1 秒ごとにフラッシュする）
   sleep 1.5
   expect "access log on stdout by default" "path=/hello" bash -c "grep -a 'type=access' '$W2/log'"
@@ -203,10 +203,11 @@ run_c() {
     fi
   fi
   for bin in hello hello-static; do
+    # ログは実行ファイルごとに分ける（前のプロセスが終わる前に同じファイルを切り詰めると、残った書き込みで NUL の穴が空く）
     local P; P=$(free_port)
-    VEIL_LISTEN="127.0.0.1:$P" PATH="$ROOT/target/release:$PATH" "$CH/$bin$EXE" > "$TMPD/c.log" 2>&1 &
+    VEIL_LISTEN="127.0.0.1:$P" PATH="$ROOT/target/release:$PATH" "$CH/$bin$EXE" > "$TMPD/c-$bin.log" 2>&1 &
     local PID=$!; PIDS+=("$PID")
-    wait_port "$P" "$PID" || { bad "$bin start"; cat "$TMPD/c.log"; continue; }
+    wait_port "$P" "$PID" || { bad "$bin start"; cat "$TMPD/c-$bin.log"; continue; }
     local B="http://127.0.0.1:$P"
     expect "$bin GET /" "Hello from C" curl -s "$B/"
     expect "$bin path param (decoded)" '{"id":"a b"}' curl -s "$B/users/a%20b"
@@ -215,11 +216,11 @@ run_c() {
     expect "$bin OpenAPI from C metadata" '"summary":"Get a user"' curl -s "$B/openapi.json"
     sleep 1.5
     # -a: ログに想定外のバイトがあっても grep が「Binary file matches」だけを返さないように（FreeBSD x86_64 で起きた）
-    expect "$bin access log by default" "path=/users/" bash -c "grep -a 'type=access' '$TMPD/c.log'"
+    expect "$bin access log by default" "path=/users/" bash -c "grep -a 'type=access' '$TMPD/c-$bin.log'"
     # ログに NUL などの制御文字（改行・タブ・ESC 以外）が混ざっていないこと（混ざっていれば中身を出す）
-    if LC_ALL=C grep -q -P '[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]' "$TMPD/c.log" 2>/dev/null \
-       || [ "$(LC_ALL=C tr -d -c '\000' < "$TMPD/c.log" | wc -c)" -gt 0 ]; then
-      bad "$bin log has control bytes: $(od -c "$TMPD/c.log" | grep -n -E '\\0|[0-9]{3}' | head -3 | tr '\n' ' ')"
+    if LC_ALL=C grep -q -P '[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]' "$TMPD/c-$bin.log" 2>/dev/null \
+       || [ "$(LC_ALL=C tr -d -c '\000' < "$TMPD/c-$bin.log" | wc -c)" -gt 0 ]; then
+      bad "$bin log has control bytes: $(od -c "$TMPD/c-$bin.log" | grep -n -E '\\0|[0-9]{3}' | head -3 | tr '\n' ' ')"
     else
       ok "$bin log is plain text"
     fi
@@ -299,6 +300,20 @@ run_c_features() {
   expect "C streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
   expect "C streaming request body (h2c)" "300000" bash -c "dd if=/dev/zero bs=1000 count=300 2>/dev/null | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/count'"
   expect "C L4 TCP echo" "c-tcp" l4_echo tcp "$L4" c-tcp
+  # F-261: C のハンドラのアップグレード（101 の後は L4 と同じコールバック。ヘッダと同じパケットの行も届く）
+  expect "C upgrade (101 + L4 callbacks)" "hello|c-up|x-from: c" "$PY3" -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"GET /upgrade HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: x-echo\r\n\r\nc-up")
+d = b""
+while not d.endswith(b"c-up"):
+    b = s.recv(4096)
+    if not b: break
+    d += b
+head, _, body = d.partition(b"\r\n\r\n")
+ok = head.startswith(b"HTTP/1.1 101 ") and b"x-from: c" in head
+print(body.decode().replace("\n", "|") + ("|x-from: c" if ok else "|bad head " + head.decode()))' "$P"
+  expect "C upgrade on h2c is 400" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "$B/upgrade"
   expect "C L4 UDP echo" "echo:c-udp" l4_echo udp "$U" c-udp
   (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
@@ -448,6 +463,71 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   kill "$PID"
 }
 
+run_upgrade() { # F-261: ハンドラの HTTP/1.1 アップグレード（examples/api/rust-websocket の x-echo）
+  echo "== HTTP/1.1 upgrade (examples/api/rust-websocket, F-261)"
+  upgrade_suite "$ROOT/target/examples-api" ""
+  # Linux は既定の io_uring に加えて epoll の reactor でも確かめる
+  [ "$OS" = Linux ] && upgrade_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+}
+
+upgrade_suite() { # upgrade_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build websocket example ($label)"; return; }
+  local BIN="$T/debug/veil-example-websocket$EXE"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  local ktls_modes="0"; [ "$OS" = Linux ] && ktls_modes="0 1"
+  local K
+  for K in $ktls_modes; do
+    local P S; P=$(free_port); S=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+      VEIL_KTLS=$K VEIL_SHUTDOWN_SECS=10 exec "$BIN") > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
+    local tag="$label, ktls=$K"
+    if [ "$K" = 0 ]; then
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" basic "$P" | sed "s|\$| ($tag, plaintext)|; s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$P" 1000 | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      expect "h2c: upgrade response is 400 ($tag)" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/raw-upgrade"
+      expect "HTTP/2 (TLS): upgrade response is 400 ($tag)" "400" curl -ks --http2 -o /dev/null -w "%{http_code}" "https://127.0.0.1:$S/raw-upgrade"
+    fi
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" basic "$S" tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "FAIL" "$W/r" && FAIL=1
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$S" 200 tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    if [ "$OS" != Windows ] && [ "$K" = 0 ]; then
+      # graceful shutdown: 開いているアップグレード済みの接続は合図を受けて閉じ、プロセスは待ち時間より前に終わる
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+      local HP=$!
+      for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+      kill "$PID"; wait "$HP"
+      sed "s|\$| ($tag)|; s|^|  |" "$W/hold" | grep -v held
+      grep -q "^ok" "$W/hold" || FAIL=1
+      for _ in $(seq 1 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+      kill -0 "$PID" 2>/dev/null && bad "process exits after closing upgraded connections ($tag)" || ok "process exits after closing upgraded connections ($tag)"
+    fi
+    kill "$PID" 2>/dev/null; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  done
+  # max_concurrent_connections にアップグレードした接続も数える
+  if [ "$OS" != Windows ]; then
+    local P; P=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_MAX_CONN=5 VEIL_SHUTDOWN_SECS=1 exec "$BIN") > "$W/log2" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "start max_conn ($label)"; cat "$W/log2"; return; }
+    sleep 0.5  # wait_port の接続が閉じて数から外れるまで
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" hold "$P" 5 > "$W/hold" 2>&1 &
+    local HP=$!
+    for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+    grep -q held "$W/hold" || { bad "open 5 upgraded connections ($label)"; cat "$W/hold"; }
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" refused "$P" | sed "s|\$| ($label)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    kill "$PID"; wait "$HP" 2>/dev/null
+  fi
+}
+
 run_external() { # F-243: [env] 無しの利用者のビルド（と、[env] を書いた利用者のビルド）
   echo "== external project without / with .cargo/config.toml [env] (F-243)"
   [ "$OS" = Linux ] || { echo "  skip: Linux only"; return; }
@@ -541,6 +621,9 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no inventory/async-graphql/tokio/pyo3 in the full binary" || bad "library dependencies linked ($n)"
   n=$(grep -cE "veil_build::|prost_build::|(^|[^a-z_])tonic::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil-build/prost-build/tonic in the full binary" || bad "gRPC library code linked ($n)"
+  # F-261: アップグレードの記号（veil::api::upgrade）も入らない
+  n=$(grep -cE "veil::api::upgrade|veil_response_upgrade" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::upgrade in the full binary" || bad "upgrade symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-198: api の既定（tokio-compat）は tokio に依存しない
@@ -566,11 +649,12 @@ run_nonregression() {
 case "$WHAT" in
   rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
+  upgrade) run_upgrade ;;
   c) run_c; run_c_features ;;
   python) run_python ;;
   nonregression) run_nonregression ;;
   external) run_external ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_c_features; run_python ;;
-  *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_c; run_c_features; run_python ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|c|python|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

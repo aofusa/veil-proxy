@@ -1,6 +1,6 @@
 # F-261: API ライブラリのハンドラで HTTP/1.1 のプロトコルアップグレード（101 Switching Protocols）を扱う
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)。WebSocket（[F-262](F-262-handler-websocket-rust.md)）の土台）**
+**状態: 完了（2026-10-25 実装。起票・設計も同日。親は [F-258](F-258-v0100-plan.md)。WebSocket（[F-262](F-262-handler-websocket-rust.md)）の土台）**
 
 ## 背景
 
@@ -102,3 +102,44 @@ impl Upgraded {
 
 - Rust・C のハンドラで HTTP/1.1 のアップグレードができ、本体のバイナリが変わらない（`nonregression`）。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **API**: `src/api/upgrade.rs`（新規）。`Response::switching_protocols(protocol, on_upgrade)`・`Response::is_upgrade`・
+  `Request::upgrade_protocol`・`Upgraded`（`read`（先読みの残りを先に返す）・`readable`（捨ててよい可読待ち）・`has_buffered`・
+  `write_all`・`write_vectored_all`・`shutdown`・`client_ip`・`shutdown_signal`、`tokio-compat` で `into_tokio_io`、
+  `l4-handler` で `serve_blocking`）・`ShutdownSignal`・`is_shutting_down`。`[api] upgrade_idle_timeout_secs`（既定 0）。
+- **HTTP/1.1 の経路**（`src/proxy/h1.rs`、全部 `cfg(feature = "handler")`）: `Backend::Handler` の `Upgrade: websocket` を
+  400 にせずハンドラへ渡す。要求ごとに `CallCache::upgrade_allowed`（`Connection: upgrade` があるときだけ `Upgrade` の有無・
+  HTTP/1.0・本文を確かめる）を立て、`dispatch::call_with` の後で `upgrade::check_response` が 400/500 に置き換える。
+  101 のヘッダは要求バッファのプールで書き、接続のループは `status == 101` のとき `upgrade::run` を await して抜ける
+  （パイプラインの残り `pipelined` を `Upgraded` の先頭に渡す）。
+- **tower**: 層を通るとき応答の拡張にフックを載せて運ぶ（`UpgradeCarrier`）。
+- **C**: `veil_response_upgrade(resp, protocol, const veil_l4_tcp_callbacks_t *cb, void *ud)`。L4 の TCP ハンドラ（F-210）の
+  コールバックと `veil_l4_write` 等をそのまま使う（`Upgraded::serve_blocking` → ハンドラ用プール）。
+- **例**: `examples/api/rust-websocket`（F-262 の WebSocket の例を兼ねる。この時点では `x-echo` の行エコー・`/raw-upgrade`・
+  `/h2c-upgrade`・`/plaintext`）、`examples/api/c-features` に `GET /upgrade`。
+- **試験**: 単体（101 のヘッダ・拒否の条件・予約・トークン検査・HTTP/2 で 400）。E2E は `tests/api/library_e2e.sh upgrade`
+  （`tests/api/upgrade_check.py`。io_uring と epoll、平文・rustls・kTLS: 同じパケットの最初の行・パイプライン・400/500/426・
+  同時 1,000 接続（TLS は 200）・graceful shutdown で閉じてプロセスが終わる・`max_concurrent_connections` に数える・
+  h2c と HTTP/2（TLS）で 400）と C の E2E（101 + L4 コールバック、h2c で 400）。`nonregression` に `veil::api::upgrade`・
+  `veil_response_upgrade` が full バイナリに無いことを足した。
+
+### 決めたこと
+
+- `on_upgrade` の Future は spawn せず、接続のタスクの中で await する（`ConnectionGuard` が外側のタスクにあるので
+  同時接続数にそのまま数えられ、移す仕組みが要らない）。`F` は `Send`（`Response` が C・Python のプールを越えるため）、
+  `Fut` は `Send` でなくてよい。
+- tokio の `AsyncRead`/`AsyncWrite` は `Upgraded` に直接は実装せず `into_tokio_io()`（中継のタスクで所有権渡しの I/O を回す）
+  にした。io_uring の読み取りは途中で捨てるとデータを失うので、poll 型の trait を直接被せられない。
+- `shutdown_signal()` は F-187 のアイドル待ち（`timeout_idle(.., true, ..)`）で作る。要求ごとの登録・フラグ監視は足さない。
+  `[server] graceful_shutdown_timeout_secs` の後は既存の経路どおり接続ごと落ちる。
+- `Upgrade` の値はトークン（`token` か `token/token`）だけ通し、それ以外と予約の `h2c` は 500 + `warn!`（開発時の誤り）。
+- HTTP/1.0 でも `Request::upgrade_protocol` は値を返す（`Request` の版に 1.0 の区別が無い）が、h1 側で 400 にする。
+  HTTP/2・HTTP/3 は `call_with` の既定（`upgrade_allowed = false`）で 400。
+- C は設計の `veil_l4_callbacks_t` ではなく既存の `veil_l4_tcp_callbacks_t` を使う（同じもの。新しい型を増やさない）。
+- TLS の接続の `shutdown` は TCP の送信側を閉じるだけ（close_notify は送らない。プロキシの WebSocket の中継と同じ）。
+- HTTP/3 の 400 は単体試験（`call_with` の共通の経路）で確かめ、E2E は h2c と HTTP/2（TLS）で確かめた。
+- `tests/api/library_e2e.sh` の既存の試験の直し（同じ変更で見つけたもの）: C の例のログを実行ファイルごとに分けた（前のプロセスが
+  終わる前に同じファイルを切り詰めると NUL の穴が空いて「ログに制御文字」で落ちていた）。rust-showcase の起動ログの確認を
+  F-260 の 1 リスナー 1 行の書式（`workers=N`・`cleartext http1=on h2c=on`）に合わせた。

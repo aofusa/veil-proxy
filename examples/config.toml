@@ -2729,6 +2729,7 @@ revalidate_mtime = false
 #                                      # 受けるときだけ。compression feature が必要。F-209）
 # grpc_response_compression_min_size = 1024   # これ未満の gRPC メッセージは圧縮しない（バイト）
 # grpc_web_cors_origins = []      # ブラウザから gRPC-Web で呼んでよい Origin（["*"] で全部。空ならプリフライトは 403。F-209）
+# upgrade_idle_timeout_secs = 0    # アップグレードした HTTP/1.1 の接続で読み取りが待てる秒数（0 = 無制限。F-261）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）

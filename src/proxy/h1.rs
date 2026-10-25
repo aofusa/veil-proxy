@@ -282,6 +282,9 @@ pub(super) async fn handle_requests(
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
                     .map(|h| slice_range(&accumulated, h.value));
+                // F-261: HTTP/1.0 の要求はアップグレードできない（ハンドラの判定にだけ使う）
+                #[cfg(feature = "handler")]
+                let http10 = req.version == Some(0);
                 // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
                 // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
                 // 位置は u16 に収まる（配列を 512 バイトに抑え、要求ごとの初期化を小さくする）。
@@ -782,6 +785,11 @@ pub(super) async fn handle_requests(
                     }
                 };
 
+                // F-261: ハンドラのルートの WebSocket の要求は 400 にせず、通常のハンドラの経路へ進める
+                // （ハンドラが 101 を返して接続を引き取る）。先読みの残りはパイプラインの分として取っておく。
+                #[cfg(feature = "handler")]
+                let is_websocket = is_websocket && !matches!(backend, Backend::Handler(..));
+
                 // セキュリティ設定を取得
                 let security = backend.security();
 
@@ -1056,6 +1064,19 @@ pub(super) async fn handle_requests(
                     }
                 }
 
+                // F-261: ハンドラがアップグレードを返してよい要求か（`Connection: upgrade` の要求だけ
+                // ヘッダを見る。それ以外の要求は bool の代入だけ）
+                #[cfg(feature = "handler")]
+                {
+                    api_cache.upgrade_allowed = is_upgrade_connection
+                        && !http10
+                        && !is_chunked
+                        && content_length == 0
+                        && headers_for_proxy
+                            .iter()
+                            .any(|(n, _)| n.eq_ignore_ascii_case(b"upgrade"));
+                }
+
                 // Backend処理
                 let result = handle_backend(
                     tls_stream,
@@ -1115,6 +1136,23 @@ pub(super) async fn handle_requests(
                         }
 
                         tls_stream = stream_back;
+
+                        // F-261: ハンドラが 101 を書いた。接続（と先読みの残り）をハンドラの関数へ渡し、
+                        // 終わったら閉じる（この接続のタスクのまま待つので同時接続数に数え続ける）
+                        #[cfg(feature = "handler")]
+                        if status == 101 {
+                            if let Some(on_upgrade) = api_cache.pending_upgrade.take() {
+                                crate::api::upgrade::run(
+                                    on_upgrade,
+                                    tls_stream,
+                                    pipelined,
+                                    client_ip,
+                                    &mut api_cache,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
 
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
                         if should_close {
@@ -1557,6 +1595,17 @@ pub(super) async fn handle_api_handler(
         crate::api::request::HttpVersion::Http11,
     );
     let mut resp = crate::api::dispatch::call_with(entry, req, api_cache).await;
+    // F-261: 検査を通ったアップグレード（101）。ヘッダを書き、接続は呼び出し側のループが関数へ渡す
+    if let Some(up) = resp.upgrade.take() {
+        let mut head = crate::pool::request_buf_get(API_HEAD_ESTIMATE);
+        crate::api::upgrade::write_http1_101(&mut head, &resp, &up.protocol);
+        match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
+            Ok((Ok(_), buf)) => crate::pool::request_buf_put(buf),
+            _ => return None,
+        }
+        api_cache.pending_upgrade = Some(up.on_upgrade);
+        return Some((tls_stream, 101, 0, false));
+    }
     let status = resp.status_code();
     let body = resp.body().clone();
     // ステータス行・ヘッダはスレッドローカルのプールのバッファに書き、小さな本文は同じバッファに続けて

@@ -239,6 +239,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `grpc_response_compression` | `"none"` | gRPC の応答メッセージの圧縮: `"none"`・`"gzip"`・`"deflate"`（クライアントが `grpc-accept-encoding` で受けるときだけ。`compression` feature が必要） |
 | `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
 | `grpc_web_cors_origins` | `[]` | ブラウザから gRPC-Web で呼んでよい Origin（`["*"]` で全部）。空なら CORS のヘッダを付けず、プリフライトは 403 |
+| `upgrade_idle_timeout_secs` | `0` | アップグレードした HTTP/1.1 の接続で `read` が待てる秒数（0 = 無制限） |
 
 ## ルーティングマクロ
 
@@ -332,6 +333,52 @@ async fn upper(req: &Request) -> Response {
     Response::stream(200, body).with_header("content-type", "text/plain")
 }
 ```
+
+### プロトコルアップグレード（HTTP/1.1）
+
+ハンドラは `101 Switching Protocols` で接続を引き取れます。`Request::upgrade_protocol()` は要求がアップグレードを求めているとき
+（`Connection: upgrade` と `Upgrade` がある。HTTP/2・HTTP/3 では常に `None`）に `Upgrade` の値を返し、
+`Response::switching_protocols(protocol, f)` は 101 を書いてから `veil::api::upgrade::Upgraded` の接続で `f` を呼びます。
+
+```rust
+use veil::api::upgrade::Upgraded;
+
+#[veil::route(path = "/echo", method = "GET")]
+async fn echo(req: Request) -> Response {
+    if req.upgrade_protocol() != Some(&b"x-echo"[..]) {
+        return Response::error(426, "Upgrade Required");
+    }
+    Response::switching_protocols("x-echo", |mut up: Upgraded| async move {
+        let mut buf = bytes::BytesMut::with_capacity(4096);
+        loop {
+            let (res, b) = up.read(buf).await;          // veil のランタイムと同じ所有権渡しの読み取り
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => { if up.write_all(buf.split().freeze()).await.is_err() { break } }
+                _ => break,
+            }
+        }
+    })
+}
+```
+
+- `Upgraded` は平文・rustls・kTLS で同じ型です: `read(BytesMut)`、`readable()`（途中で捨ててよい。`read` は io_uring では
+  捨てると読んだデータを失うので、`select` には `readable` を使います）、`write_all(Bytes)`、`write_vectored_all(&[Bytes])`
+  （ヘッダと本文を 1 回で書く）、`shutdown()`、`client_ip()`、`shutdown_signal()`（graceful shutdown の開始で解決。
+  `[server] graceful_shutdown_timeout_secs` を過ぎても開いている接続は drop されます）。
+- 要求ヘッダの直後にクライアントが送ったバイト列（同じパケットでも）は最初の `read` で返ります。
+- 101 には `Connection: Upgrade`・`Upgrade: <protocol>` と `with_header` で足したヘッダが付きます。`Content-Length` は付かず、
+  接続は HTTP に戻りません。アクセスログには 101 が 1 行残ります。
+- 要求がアップグレードの要求でない（`Connection: upgrade` / `Upgrade` が無い）・HTTP/1.0・本文付き・HTTP/2 や HTTP/3 で届いた
+  （RFC 8441 / RFC 9220 の拡張 CONNECT は非対応）ときは、veil が 400 に置き換えます。`h2c` は予約済みです（500 と警告）。
+- アップグレードした接続も `[security] max_concurrent_connections` に数えます。`[api] upgrade_idle_timeout_secs`
+  （既定 0 = 無し）を設定すると、それより長く待った `read` は `TimedOut` で失敗します。
+- `tokio-compat` では `up.into_tokio_io()` が `veil::tokio::io::{AsyncRead, AsyncWrite}` を実装したものを返し、tokio 前提の
+  プロトコル実装を載せられます（同じワーカーのタスクを経由するので 1 回余分に写します）。
+- C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)`。L4 の TCP と同じコールバック（`on_connect` / `on_data` /
+  `on_close`、`veil_l4_write`）で受けます。Rust でも `Upgraded::serve_blocking`（`l4-handler`）で同じ形にできます。
+
+例: [examples/api/rust-websocket/](../../../examples/api/rust-websocket/)。
 
 ## バリデーションと OpenAPI
 
@@ -801,6 +848,8 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 - L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)`（`on_connect` / `on_data` / `on_close`。ハンドラ用プールで
   接続ごとに 1 つずつ順に呼ばれ、`veil_l4_write` / `veil_l4_close` はコールバックの中で）と
   `veil_register_l4_udp(cfg, name, listen, fn, ud)`（`veil_l4_reply` でデータグラムに応答）。
+- プロトコルアップグレード（HTTP/1.1）: `veil_response_upgrade(resp, protocol, &callbacks, ud)` で 101 を返し、接続を L4 の
+  TCP と同じコールバックで受けます（[プロトコルアップグレード](#プロトコルアップグレードhttp11)）。
 - ストリーミングの関数は `VEIL_ROUTE_INLINE` のルートでは使えません（`VEIL_ERR_STATE`）。
 
 全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
@@ -993,6 +1042,7 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。
+- プロトコルアップグレードは HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
 - Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります
   （`/openapi.json` はオフラインでも使えます）。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

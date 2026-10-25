@@ -13,6 +13,10 @@ pub struct Response {
     // F-197
     /// Streaming body (sent in place of `body` when present).
     pub(crate) stream: Option<super::stream::BodyStream>,
+    // F-261
+    /// Protocol upgrade (`101 Switching Protocols`): the protocol name and the function that takes the connection.
+    // Box: 応答の大きさを増やさない（ハンドラの戻り値・抽出子の `Err` として毎要求ムーブされる）
+    pub(crate) upgrade: Option<Box<super::upgrade::UpgradeHook>>,
 }
 
 impl std::fmt::Debug for Response {
@@ -22,6 +26,7 @@ impl std::fmt::Debug for Response {
             .field("headers", &self.headers)
             .field("body_len", &self.body.len())
             .field("streaming", &self.stream.is_some())
+            .field("upgrade", &self.upgrade.is_some())
             .finish()
     }
 }
@@ -39,6 +44,7 @@ impl Response {
             headers: Vec::new(),
             body: Bytes::new(),
             stream: None,
+            upgrade: None,
         }
     }
 
@@ -51,6 +57,7 @@ impl Response {
             )],
             body,
             stream: None,
+            upgrade: None,
         }
     }
 
@@ -95,7 +102,33 @@ impl Response {
             body: Bytes::new(),
             // fuse: 送出側は終端の後にもう一度 poll することがある（`stream::coalesce`）
             stream: Some(Box::pin(futures::StreamExt::fuse(body))),
+            upgrade: None,
         }
+    }
+
+    // F-261
+    /// `101 Switching Protocols` to `protocol` (HTTP/1.1 only). After the response head is written, the connection
+    /// (with any bytes the client already sent after the request) is passed to `on_upgrade`, which runs on the
+    /// worker thread until it returns; the connection closes when the [`Upgraded`](super::upgrade::Upgraded) is dropped.
+    ///
+    /// The request must carry `Connection: upgrade` and `Upgrade`, be HTTP/1.1 and have no body; otherwise the
+    /// response is replaced with 400 (HTTP/2 and HTTP/3 have no upgrades). Headers added with `with_header` are sent
+    /// with the 101. `h2c` is reserved (500).
+    pub fn switching_protocols<F, Fut>(protocol: &str, on_upgrade: F) -> Response
+    where
+        F: FnOnce(super::upgrade::Upgraded) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let mut r = Response::new(101);
+        r.upgrade = Some(Box::new(super::upgrade::UpgradeHook::new(
+            protocol, on_upgrade,
+        )));
+        r
+    }
+
+    /// Whether this is a protocol upgrade response ([`Response::switching_protocols`]).
+    pub fn is_upgrade(&self) -> bool {
+        self.upgrade.is_some()
     }
 
     /// Whether this is a streaming response.

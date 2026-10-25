@@ -1,6 +1,7 @@
 /*
  * veil C API の F-210 の機能のサンプル: 応答のストリーミング (SSE)・要求本文のストリーミング受信・
- * gRPC (examples/api/rust-grpc と同じ demo.v1.Demo)・L4 (TCP・UDP のエコー)。
+ * gRPC (examples/api/rust-grpc と同じ demo.v1.Demo)・L4 (TCP・UDP のエコー)・
+ * HTTP/1.1 のアップグレード (GET /upgrade で x-echo に切り替えてエコー、F-261)。
  *
  * gRPC のメッセージは小さな protobuf を手で符号化している (veil は protobuf の実装に依存しない。
  * 実際のアプリでは protobuf-c・nanopb・upb 等を使う)。
@@ -316,6 +317,20 @@ static int tcp_data(veil_l4_conn_t *conn, const uint8_t *data, size_t len, void 
     return veil_l4_write(conn, data, len) == VEIL_OK ? 0 : 1;
 }
 
+/* GET /upgrade : x-echo にアップグレードし、以後のバイト列を L4 と同じコールバックでエコーする (F-261) */
+static int upgrade_connect(veil_l4_conn_t *conn, void *ud) {
+    (void)ud;
+    return veil_l4_write(conn, (const uint8_t *)"hello\n", 6) == VEIL_OK ? 0 : 1;
+}
+
+static int upgrade(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    static const veil_l4_tcp_callbacks_t cb = {upgrade_connect, tcp_data, NULL};
+    veil_response_set_header(resp, "x-from", "c");
+    return veil_response_upgrade(resp, "x-echo", &cb, NULL) == VEIL_OK ? 0 : 1;
+}
+
 static int udp_echo(const uint8_t *data, size_t len, const char *peer, veil_l4_reply_t *reply, void *ud) {
     (void)peer;
     (void)ud;
@@ -355,6 +370,7 @@ int main(void) {
 
     check(veil_register_route(cfg, "/sse", "GET", sse, NULL), "sse");
     check(veil_register_route_ex(cfg, "/count", "POST", count, NULL, VEIL_ROUTE_STREAM_BODY, NULL), "count");
+    check(veil_register_route(cfg, "/upgrade", "GET", upgrade, NULL), "upgrade");
 
     check(veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL), "SayHello");
     check(veil_register_grpc(cfg, "/demo.v1.Demo/CountUp", VEIL_GRPC_SERVER_STREAMING, count_up, NULL), "CountUp");

@@ -187,6 +187,31 @@ impl Request {
         self.version
     }
 
+    // F-261
+    /// The `Upgrade` header when the request asks for a protocol upgrade (`Connection` lists `upgrade` and
+    /// `Upgrade` is present). Always `None` on HTTP/2 and HTTP/3, which have no upgrades.
+    pub fn upgrade_protocol(&self) -> Option<&[u8]> {
+        if self.version != HttpVersion::Http11 {
+            return None;
+        }
+        let mut wants = false;
+        let mut proto = None;
+        for (n, v) in &self.headers {
+            if n.eq_ignore_ascii_case(b"connection") {
+                wants |= v
+                    .split(|&b| b == b',')
+                    .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"));
+            } else if n.eq_ignore_ascii_case(b"upgrade") && proto.is_none() {
+                proto = Some(v.as_ref());
+            }
+        }
+        if wants {
+            proto
+        } else {
+            None
+        }
+    }
+
     /// Shared state registered with `App::state`.
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<T>> {
         super::app::state::<T>()

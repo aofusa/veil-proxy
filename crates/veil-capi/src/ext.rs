@@ -660,6 +660,61 @@ pub unsafe extern "C" fn veil_register_l4_tcp(
     VEIL_OK
 }
 
+/// 応答を `101 Switching Protocols`（`protocol` へのアップグレード。HTTP/1.1 だけ。F-261）にする。
+/// 101 を書いた後の接続は L4 の TCP ハンドラと同じコールバックで受ける（`on_connect` → `on_data` … →
+/// `on_close`。ハンドラ用プールで 1 つずつ順に呼ばれ、`veil_l4_write`・`veil_l4_close` が使える）。
+/// `resp` に設定済みのヘッダは 101 と一緒に送る。要求がアップグレードでない・HTTP/2・HTTP/3 では 400 になる。
+///
+/// # Safety
+///
+/// `resp` はコールバックに渡されたハンドル、`protocol` は NUL 終端の C 文字列、`cb` は有効な構造体（コピーされる）。
+/// `user_data` の契約は `veil_register_route` と同じ。
+#[no_mangle]
+pub unsafe extern "C" fn veil_response_upgrade(
+    resp: *mut veil_response_t,
+    protocol: *const c_char,
+    cb: *const veil_l4_tcp_callbacks_t,
+    user_data: *mut c_void,
+) -> c_int {
+    let Some(r) = resp.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL response");
+    };
+    let Some(cb) = cb.as_ref().copied() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL callbacks");
+    };
+    let protocol = tryc!(cstr(protocol)).to_string();
+    let ud = UserData(user_data);
+    let mut up = veil::api::Response::switching_protocols(&protocol, move |up| async move {
+        let peer = up.client_ip().to_string();
+        up.serve_blocking(move |out| {
+            let mut s = CSession {
+                cb,
+                ud,
+                conn: Box::new(veil_l4_conn_t {
+                    peer,
+                    data: ptr::null_mut(),
+                    out: ptr::null_mut(),
+                }),
+            };
+            if let Some(f) = cb.on_connect {
+                let rc = s.with_out(out, |c, ud| {
+                    catch_unwind(AssertUnwindSafe(|| unsafe { f(c, ud) }))
+                });
+                if !matches!(rc, Ok(0)) {
+                    out.close();
+                }
+            }
+            Some(Box::new(s) as Box<dyn L4Session>)
+        })
+        .await
+    });
+    for (n, v) in r.resp.headers() {
+        up = up.with_header(n.clone(), v.clone());
+    }
+    r.resp = up;
+    VEIL_OK
+}
+
 /// 送るデータを足す（コピーする。コールバック（`on_connect`・`on_data`）の中でだけ呼べる）。
 ///
 /// # Safety

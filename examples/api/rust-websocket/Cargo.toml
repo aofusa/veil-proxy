@@ -1,0 +1,20 @@
+# veil API ライブラリの HTTP/1.1 アップグレードと WebSocket のサンプル（F-261・F-262）。
+# E2E（tests/api/library_e2e.sh upgrade / websocket）がこれを起動して試験する。
+#
+#   cargo run --release                      # 127.0.0.1:8080（VEIL_LISTEN で変えられる）
+#   websocat ws://127.0.0.1:8080/ws          # エコー
+[package]
+name = "veil-example-websocket"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# veil 本体のワークスペースとは独立させる（`[[example]]` を本体に足すとコンテナビルドが壊れるため）。
+[workspace]
+
+[dependencies]
+# 実際に使うときは git 依存:
+# veil = { git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["full", "api"] }
+bytes = "1"
+futures = "0.3"

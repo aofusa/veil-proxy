@@ -93,6 +93,9 @@ pub struct ApiSettings {
     // F-209
     /// Maximum size of a sent gRPC message (0 = unlimited).
     pub grpc_max_send_message_size: usize,
+    // F-261
+    /// Seconds a read on an upgraded connection may wait before failing (0 = no limit).
+    pub upgrade_idle_timeout_secs: u64,
 }
 
 impl ApiSettings {
@@ -140,6 +143,7 @@ impl ApiSettings {
                 })
                 .unwrap_or_default(),
             grpc_max_send_message_size: n("grpc_max_send_message_size", 0),
+            upgrade_idle_timeout_secs: n("upgrade_idle_timeout_secs", 0) as u64,
         }
     }
 }
@@ -484,6 +488,7 @@ fn start(config: Config) -> Result<(), Error> {
         let settings = ApiSettings::from_value(api.as_ref());
         MAX_BODY_SIZE.store(settings.max_body_size, Ordering::Relaxed);
         TOKIO_THREADS.store(settings.tokio_threads.max(1), Ordering::Relaxed);
+        super::upgrade::set_idle_timeout_secs(settings.upgrade_idle_timeout_secs);
         #[cfg(feature = "grpc-handler")]
         {
             super::grpc::set_max_message_size(settings.grpc_max_message_size);

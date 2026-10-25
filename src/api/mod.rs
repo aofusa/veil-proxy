@@ -39,6 +39,8 @@ pub mod response;
 pub(crate) mod routes;
 pub mod schema;
 pub mod stream;
+// F-261
+pub mod upgrade;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
@@ -63,6 +65,7 @@ pub use request::{HttpVersion, Request};
 pub use response::{ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
 pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
+pub use upgrade::{ShutdownSignal, Upgraded};
 
 /// Re-exports of the most commonly used types (`use veil::prelude::*;`).
 pub mod prelude {
@@ -75,6 +78,7 @@ pub mod prelude {
     pub use super::response::{ApiError, Html, IntoResponse, Response};
     pub use super::schema::{ApiSchema, Validate};
     pub use super::stream::{BodyChunk, RequestBodyStream};
+    pub use super::upgrade::Upgraded;
     #[cfg(feature = "macro")]
     pub use veil_macros::Schema;
 }
