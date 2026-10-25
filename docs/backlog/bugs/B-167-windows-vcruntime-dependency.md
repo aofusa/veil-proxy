@@ -25,8 +25,10 @@ v0.9.1 の winget の最初の提出（microsoft/winget-pkgs#461268）。検証�
   `set(CMAKE_MSVC_RUNTIME_LIBRARY CACHE STRING "MultiThreaded")` で値が説明の欄に入り、変数が空のまま CMake の既定（`/MD`）で
   BoringSSL（boring-sys）が組み立てられる（lld-link の `/failifmismatch: RuntimeLibrary`、quiche の `tls_method.cc.obj` が
   `MD_DynamicRelease`）。cmake の crate は環境変数 `CMAKE` の実行ファイルを使うので、構成のときだけ
-  `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` を足す wrapper（`/usr/local/bin/cmake-msvc-static`）を置く。`.cargo/config.toml` には置かない（同じ木から作る Python の wheel の拡張や、
-  Windows の手元のビルドの CRT は変えない）。
+  `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` を足す wrapper（`/usr/local/bin/cmake-msvc-static`）を置く。BoringSSL は
+  `cmake_minimum_required(VERSION 3.10)` で CMP0091 が未設定（変数を見ずにフラグの既定の `/MD` を使う）なので、
+  `-DCMAKE_POLICY_DEFAULT_CMP0091=NEW` も足す。
+- `.cargo/config.toml` には置かない（同じ木から作る Python の wheel の拡張や、Windows の手元のビルドの CRT は変えない）。
 - 試験: `tools/release/check-pe-imports.py`（PE の import 表に C ランタイムの DLL が無いこと。dist.yml の cross の Windows）と、
   `windows-test` の x86_64 で Nano Server のコンテナ（再頒布パッケージが無い）で `veil.exe --version`。
 

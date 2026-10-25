@@ -61,11 +61,12 @@ ENV CMAKE_SYSTEM_NAME=Windows \
 
 # B-167: cargo-xwin が作る CMake の toolchain は `set(CMAKE_MSVC_RUNTIME_LIBRARY CACHE STRING "MultiThreaded")` で、値が
 # 説明の欄に入って変数が空のままになる（cargo-xwin 0.23 で確認）。CMake 3.15 以降の既定（/MD）で BoringSSL（boring-sys）が
-# 組み立てられ、/MT の Rust・cc の物とリンクで RuntimeLibrary の不一致になる。cmake の crate は環境変数 CMAKE の
-# 実行ファイルを使うので、構成のときだけ -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded を足す
+# 組み立てられ、/MT の Rust・cc の物とリンクで RuntimeLibrary の不一致になる。BoringSSL は cmake_minimum_required(3.10) で
+# CMP0091 が未設定（変数を見ずに CMAKE_<LANG>_FLAGS_<CONFIG> の既定の /MD を使う）なので、その既定も NEW にする。
+# cmake の crate は環境変数 CMAKE の実行ファイルを使うので、構成のときだけこの 2 つを足す
 RUN printf '%s\n' '#!/bin/sh' \
       'case " $* " in *" --build "*|*" -E "*|*" -P "*|*" --version "*|*" --install "*) exec cmake "$@" ;; esac' \
-      'exec cmake -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "$@"' > /usr/local/bin/cmake-msvc-static \
+      'exec cmake -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "$@"' > /usr/local/bin/cmake-msvc-static \
     && chmod +x /usr/local/bin/cmake-msvc-static
 
 # ==========================================
