@@ -34,6 +34,8 @@ if ! git push -q origin HEAD 2>"$W/push.err"; then
     echo "::warning title=Homebrew::HOMEBREW_TAP_TOKEN cannot write workflows: pushed the formula without the tap's CI (.github/workflows/test.yml). Give the token Workflows: Read and write to add it"
     git reset -q --soft HEAD~1 2>/dev/null || git update-ref -d HEAD
     git rm -q --cached .github/workflows/test.yml
+    # 足りないのが tap の CI だけ（formula と README は前の版で置いた）なら、push するものは無い
+    if git diff --cached --quiet HEAD 2>/dev/null; then echo "formula already at $VER (without the tap's CI)"; exit 0; fi
     git -c user.name="veil release" -c user.email="aofusa@users.noreply.github.com" commit -q -m "veil $VER"
     git push -q origin HEAD
 fi
