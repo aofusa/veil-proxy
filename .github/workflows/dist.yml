@@ -193,6 +193,14 @@ jobs:
           df -h /
       - name: build
         run: packaging/scripts/build-cross.sh --target ${{ matrix.target }}
+      # B-167: Windows の runner には Visual C++ 再頒布パッケージが入っていて、VCRUNTIME140.dll を読み込む exe でも
+      # 試験が通ってしまう（素の Windows では起動しない）。import 表で C ランタイムの DLL が無いことを確かめる
+      - name: no C runtime DLL in veil.exe
+        if: matrix.target == 'windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pe"
+          for z in packaging/output/*.zip; do unzip -q -o "$z" -d "$RUNNER_TEMP/pe"; done
+          python3 tools/release/check-pe-imports.py "$RUNNER_TEMP"/pe/*/veil.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
@@ -302,6 +310,16 @@ jobs:
           n="veil-$v-${{ matrix.arch }}-pc-windows-msvc"
           mkdir -p x && (cd x && unzip -q "../dist/$n.zip")
           tools/release/binary-smoke.sh "x/$n" "$v"
+      # B-167: runner には Visual C++ 再頒布パッケージが入っているので、それが無い Windows（Nano Server のコンテナ）でも起動する
+      - name: run on a Windows without the Visual C++ runtime (Nano Server)
+        if: matrix.arch == 'x86_64'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $d = (Resolve-Path "x/veil-$v-x86_64-pc-windows-msvc").Path
+          $out = docker run --rm -v "${d}:C:\veil" mcr.microsoft.com/windows/nanoserver:ltsc2022 C:\veil\veil.exe --version 2>&1
+          "$out"
+          if ($LASTEXITCODE -ne 0 -or "$out" -notmatch "veil $v") { Write-Output "::error title=Windows::veil.exe does not start without the Visual C++ runtime (exit $LASTEXITCODE)"; exit 1 }
       - name: MSI install, repair, uninstall
         shell: pwsh
         run: |

@@ -39,7 +39,11 @@ RUN apt-get update -y \
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
 # MSVC ABI 向けの C/C++ ツールチェーン（clang-cl / llvm-ar）と、
-# アセンブリ実装を避けるためのフラグ（MSVC 向け ml64/armasm が無いため）
+# アセンブリ実装を避けるためのフラグ（MSVC 向け ml64/armasm が無いため）。
+# B-167: 配布する veil.exe は C ランタイムを静的にリンクする（+crt-static）。動的だと VCRUNTIME140.dll（Visual C++
+# 再頒布パッケージ）を読み込み、それが入っていない素の Windows（winget の検証の sandbox など）で起動できない。
+# cc・cmake のクレートは crt-static を見て C の依存（aws-lc-sys・boring-sys・libmimalloc-sys）も /MT で組み立てる。
+# cargo-xwin はこの変数を自分の rustflags に足して使う。dist.yml が成果物の import を check-pe-imports.py で確かめる
 ENV CMAKE_SYSTEM_NAME=Windows \
     CC_x86_64_pc_windows_msvc=clang-cl \
     CXX_x86_64_pc_windows_msvc=clang-cl \
@@ -50,7 +54,9 @@ ENV CMAKE_SYSTEM_NAME=Windows \
     CFLAGS=-DOPENSSL_NO_ASM \
     CXXFLAGS=-DOPENSSL_NO_ASM \
     BORING_BSSL_NO_ASM=1 \
-    XWIN_CACHE_DIR=/xwin-cache
+    XWIN_CACHE_DIR=/xwin-cache \
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
+    CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
 
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ
