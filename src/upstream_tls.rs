@@ -108,8 +108,9 @@ impl TlsProfile {
 /// ファイルの中身も鍵に入れるので、証明書を差し替えて SIGHUP すれば新しい証明書で作り直す。
 /// 作ったものはプロセスの終わりまで持つ（古い設定の接続がプールに残っていてもよいように）。
 pub fn intern(s: &UpstreamTlsSettings, ktls: bool) -> io::Result<&'static UpstreamTlsClient> {
-    // 末尾の u32 は `[tls_client] ca` の世代（`tls_ca` を書かない設定は既定の変更で作り直す）
-    type Key = (UpstreamTlsSettings, bool, Vec<u8>, u32);
+    // 末尾は `[tls_client] ca` の中身の識別子（`tls_ca` を書かない設定は既定の変更で作り直す。
+    // 世代でなく中身にするのは、失敗したリロードの未反映の既定と混ざらないため）
+    type Key = (UpstreamTlsSettings, bool, Vec<u8>, Vec<u8>);
     static INTERNED: std::sync::Mutex<
         Option<std::collections::HashMap<Key, &'static UpstreamTlsClient>>,
     > = std::sync::Mutex::new(None);
@@ -124,7 +125,12 @@ pub fn intern(s: &UpstreamTlsSettings, ktls: bool) -> io::Result<&'static Upstre
         contents.extend_from_slice(&(b.len() as u64).to_le_bytes());
         contents.extend_from_slice(&b);
     }
-    let key = (s.clone(), ktls, contents, crate::trust_store::generation());
+    let key = (
+        s.clone(),
+        ktls,
+        contents,
+        crate::trust_store::default_key_id(),
+    );
     let mut g = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(std::collections::HashMap::new);
     if let Some(c) = m.get(&key) {

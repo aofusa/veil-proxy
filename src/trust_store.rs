@@ -294,7 +294,7 @@ static GENERATION: AtomicU32 = AtomicU32::new(0);
 static COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// 解決済みで、まだ反映していない既定。
-pub struct PendingDefault(Option<DefaultState>);
+pub struct PendingDefault(Option<Arc<DefaultState>>);
 
 fn default_key(sources: &CaSources) -> io::Result<Vec<u8>> {
     let mut key = format!("{:?}", sources.as_slice()).into_bytes();
@@ -324,21 +324,25 @@ pub fn resolve_default(sources: &CaSources) -> io::Result<PendingDefault> {
         // 8 文字まで。上流の mTLS の `mtls<n>` とは別の接頭辞
         Box::leak(format!("vf{}", gen % 10_000).into_boxed_str())
     };
-    Ok(PendingDefault(Some(DefaultState {
+    Ok(PendingDefault(Some(Arc::new(DefaultState {
         roots,
         key,
         tag,
         probe: OnceLock::new(),
-    })))
+    }))))
 }
 
 /// 解決した既定を反映する。
 pub fn commit_default(p: PendingDefault) {
     let Some(state) = p.0 else { return };
     let _g = COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let first = DEFAULT.load().is_none();
-    DEFAULT.store(Some(Arc::new(state)));
-    if !first {
+    let current = DEFAULT.load_full();
+    // 同じ中身を同時に 2 か所から反映しても世代を進めない
+    if current.as_ref().is_some_and(|c| c.key == state.key) {
+        return;
+    }
+    DEFAULT.store(Some(state));
+    if current.is_some() {
         GENERATION.fetch_add(1, Ordering::Release);
     }
 }
@@ -349,7 +353,37 @@ pub fn set_default(sources: &CaSources) -> io::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// リロード中だけ、まだ反映していない既定を見せる（このスレッドだけ。失敗したら捨てるので何も変わらない）
+    static PENDING: std::cell::RefCell<Option<Arc<DefaultState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`PendingDefault`] をこのスレッドの間だけ見せる。drop で外れる（反映は `commit_default`）。
+pub struct PendingGuard;
+
+impl PendingGuard {
+    pub fn new(p: &PendingDefault) -> Self {
+        PENDING.with(|c| *c.borrow_mut() = p.0.clone());
+        PendingGuard
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        PENDING.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// 既定の中身の識別子（`intern` の鍵用。リロード中は未反映の既定のもの）。
+pub fn default_key_id() -> Vec<u8> {
+    default_state().key.clone()
+}
+
 fn default_state() -> Arc<DefaultState> {
+    if let Some(p) = PENDING.with(|c| c.borrow().clone()) {
+        return p;
+    }
     if let Some(s) = DEFAULT.load_full() {
         return s;
     }
@@ -393,6 +427,10 @@ pub fn probe_client_config() -> Arc<ClientConfig> {
         })
         .clone()
 }
+
+/// 既定（グローバル）を書き換える・読み比べる試験を直列にする。
+#[cfg(test)]
+pub(crate) static DEFAULT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 // 理由付き allow: 一時ディレクトリへ試験用の PEM を書く（データプレーン外のテスト）。
@@ -473,6 +511,30 @@ mod tests {
         assert_eq!(both.roots.len(), builtin.roots.len() + 1);
         let only = roots(&[CaSource::Pem(path)]).unwrap();
         assert_eq!(only.roots.len(), 1);
+    }
+
+    #[test]
+    fn pending_default_is_visible_only_until_dropped_and_commit_publishes() {
+        let _l = DEFAULT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pem, _) = gen_ca("pending-ca");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, pem).unwrap();
+        set_default(&CaSources::default()).unwrap();
+        let before = default_roots();
+        let gen = generation();
+        let pending = resolve_default(&CaSources::new(vec![CaSource::Pem(path)])).unwrap();
+        {
+            let _g = PendingGuard::new(&pending);
+            assert_eq!(default_roots().roots.len(), 1);
+        }
+        // 反映していなければ何も変わらない
+        assert!(Arc::ptr_eq(&before, &default_roots()));
+        assert_eq!(gen, generation());
+        commit_default(pending);
+        assert_eq!(default_roots().roots.len(), 1);
+        assert_eq!(generation(), gen + 1);
+        set_default(&CaSources::default()).unwrap();
     }
 
     #[test]

@@ -320,6 +320,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
     crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
+    crate::trust_store::commit_default(loaded.default_ca);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
@@ -331,6 +332,8 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
 /// Landlock適用後はTLS証明書ファイルへのアクセスが制限されるため、
 /// ホットリロード時はルーティング設定等のみを更新します。
 pub struct LoadedConfigWithoutTls {
+    /// 解決済みの `[tls_client] ca`（`reload_config` が最後に反映する。F-259）
+    pub default_ca: crate::trust_store::PendingDefault,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,
     /// 最適化ルーター（Phase 1-4最適化適用）
@@ -523,11 +526,13 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     warn_listener_changes(&config);
     let listeners = normalize_listeners(&config)?;
 
-    // F-259: 外向きの TLS の既定の信頼アンカー。上流の `intern`（`tls_ca` を書かない mTLS の設定が
-    // 既定を使う）より先に反映する。サンドボックス下で初めて `"system"` が現れたらここで拒否し、
-    // 何も変えない（後続の手順が失敗しても既定だけは新しいまま残るが、読み込めない設定は稀）
-    crate::trust_store::set_default(&config.tls_client.ca)
+    // F-259: 外向きの TLS の既定の信頼アンカーは先に解決するだけで公開しない。上流の `intern`
+    // （`tls_ca` を書かない mTLS の設定が既定を使う）はこのスレッドの間だけ未反映の値を見て、
+    // 反映（`commit_default`）は `reload_config` がリロードの最後まで通ったときだけ行う。
+    // サンドボックス下で初めて `"system"` が現れたらここで拒否する
+    let default_ca = crate::trust_store::resolve_default(&config.tls_client.ca)
         .map_err(|e| io::Error::new(e.kind(), format!("[tls_client] ca: {e}")))?;
+    let _pending_ca = crate::trust_store::PendingGuard::new(&default_ca);
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -641,6 +646,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     };
 
     Ok(LoadedConfigWithoutTls {
+        default_ca,
         route: routes,
         optimized_router,
         global_security: config.security,
@@ -1803,5 +1809,51 @@ mod listener_settings_tests {
         assert!(a.changed_keys(&l4("0.0.0.0:5432", "tcp")).is_empty());
         assert_eq!(a.changed_keys(&l4("0.0.0.0:5433", "tcp")), vec!["l4"]);
         assert_eq!(a.changed_keys(&l4("0.0.0.0:5432", "udp")), vec!["l4"]);
+    }
+}
+
+#[cfg(test)]
+// 理由付き allow: 一時ディレクトリへ試験用の設定・PEM を書く（データプレーン外のテスト）。
+#[allow(clippy::disallowed_methods)]
+mod f259_reload_tests {
+    use super::*;
+
+    /// F-259: リロードの後続の手順が失敗したら、`[tls_client] ca` の既定は何も変わらない。
+    #[test]
+    fn failed_reload_leaves_default_trust_unchanged() {
+        let _l = crate::trust_store::DEFAULT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![]).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = rcgen::CertifiedIssuer::self_signed(p, key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("ca.pem");
+        std::fs::write(&pem, ca.pem()).unwrap();
+        let cfg = dir.path().join("config.toml");
+        // [tls_client] ca は有効だが、上流の tls_ca が無いファイルを指すので後続の手順で失敗する
+        std::fs::write(
+            &cfg,
+            format!(
+                "[server]\nlisten_cleartext = \"127.0.0.1:0\"\nenable_secure_redirect = false\n\
+                 [tls_client]\nca = [\"builtin\", {pem:?}]\n\
+                 [upstreams.u]\nservers = [\"https://127.0.0.1:1\"]\ntls_ca = \"/nonexistent/veil-ca.pem\"\n\
+                 [[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"Proxy\"\nupstream = \"u\"\n"
+            ),
+        )
+        .unwrap();
+        let before_roots = crate::trust_store::default_roots();
+        let before_gen = crate::trust_store::generation();
+        let before_tag = crate::trust_store::verify_tag();
+        let e = reload_config(&cfg).unwrap_err();
+        // 上流の tls_ca の読み込みで失敗する（[tls_client] ca の解決より後の手順）
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        assert!(Arc::ptr_eq(
+            &before_roots,
+            &crate::trust_store::default_roots()
+        ));
+        assert_eq!(before_gen, crate::trust_store::generation());
+        assert_eq!(before_tag, crate::trust_store::verify_tag());
     }
 }

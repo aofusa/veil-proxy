@@ -191,7 +191,10 @@ pub fn default_roots() -> Arc<RootCertStore>;
 - 既定が変わったリロード後のコネクタ: 世代が 0 の間は既存のスレッドローカルをそのまま使い（ホットパスの追加は世代の読み出し 1 回）、
   1 以上になったら世代ごとにスレッド内で作り直す（`config/tls_connector.rs` の `verify_connector`）。プールのタグは
   `verify` → `vf<世代>`。
-- リロードの途中で後続の手順が失敗した場合でも、`[tls_client] ca` だけは新しい値が残る（`tls_ca` を書かない mTLS の
+- リロードは `[tls_client] ca` を先に解決するだけで公開しない（`resolve_default` → `PendingGuard`）。上流の `intern` / `build` は
+  そのスレッドの間だけ未反映の既定を見て（`intern` の鍵は既定の中身の識別子で、世代ではない。失敗したリロードの値と混ざらない）、
+  `commit_default`（ArcSwap の store と世代の加算）はリロード全体が成功した後の `reload_config` の最後でだけ行う。
+  失敗したリロードは `default_roots()`・`generation()`・プールのタグを変えない（単体試験 `failed_reload_leaves_default_trust_unchanged`）。
   `intern` が新しい既定を使うため、既定の反映を先にした）。
 - `tls_ca = "builtin"` 単独を `Verify` へ寄せる最適化はしていない（`Custom` として同じ `RootCertStore` を共有するのでプールが分かれるだけ）。
 - ヘルスチェックの同期プローブは今までどおり上流の `tls_ca` ではなく既定（`[tls_client] ca`）で検証する。
