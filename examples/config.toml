@@ -571,10 +571,12 @@ reuseport_balancing = "cbpf"
 # open_file_cache_max_entries = 10000
 
 # OpenFileCacheがディスクの変更を通知で追従するか（グローバルデフォルト、F-272）
-# true にすると File ルートの `path` の配下を監視し（Linux は inotify。専用スレッド）、
+# true にすると File ルートの `path` の配下を監視し（専用スレッド。Linux は inotify、
+# BSD・macOS は kqueue、Windows は ReadDirectoryChangesW）、
 # ファイルの差し替え（同じサイズの mv・cp の上書き・ディレクトリごとの差し替え）を
 # 有効期間を待たずに反映する。キャッシュに当たった要求に増えるのは原子変数の読み取り 1 回だけ。
-# 監視の上限（fs.inotify.max_user_watches）に当たった・監視できない OS では警告して
+# 監視の上限（Linux の fs.inotify.max_user_watches、kqueue は RLIMIT_NOFILE の 4 分の 1 の fd）に
+# 当たったときは警告して
 # 従来どおり有効期間だけで追従する（有効期間の確認は watch = true でも残る）。
 # ルーティングごとの `[route.open_file_cache] watch` で上書きできる。
 # デフォルト: false

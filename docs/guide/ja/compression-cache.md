@@ -281,15 +281,21 @@ watch = true                    # 2 つのキャッシュは同じ設定にす�
 
 - **キャッシュに当たった要求の費用**: 原子変数の読み取り 1 回（ルートごとの世代番号）。`revalidate_mtime = true` と違い
   `stat` を出さないので、HTTP/2・HTTP/3 の静的配信は offload ゼロのまま。
-- **仕組み**: 専用のスレッドが変更の通知を受け（Linux: `path` の配下の全ディレクトリの inotify と、`path` そのものの
-  差し替えを捉える親ディレクトリの inotify）、ルートの世代を 1 増やす。エントリはファイルを開く前に読んだ世代を
-  持つので、読み込みの途中で差し替えられても古い中身が新しい世代で残ることは無い。通知が溢れたら監視している
-  全ルートを作り直す。
-- **戻り先**: `valid_duration_secs` は今までどおり効く。監視を付けられない（inotify の上限
-  `fs.inotify.max_user_watches` に当たった・その OS の実装がまだ無い）ときは警告を出し、そのルートは従来どおり
+- **仕組み**: 専用のスレッドが変更の通知を受け、ルートの世代を 1 増やす。エントリはファイルを開く前に読んだ世代を
+  持つので、読み込みの途中で差し替えられても古い中身が新しい世代で残ることは無い。
+  - Linux: `path` の配下の全ディレクトリの inotify と、`path` そのものの差し替えを捉える親ディレクトリの inotify。
+    通知が溢れたら監視している全ルートを作り直す。
+  - FreeBSD・OpenBSD・NetBSD・macOS: `path` の配下の全ディレクトリと通常ファイルの kqueue `EVFILT_VNODE`（監視の
+    スレッドがそれぞれの fd を 1 つ持つ。ファイルの fd で同じ inode への上書きを捉える）と、親ディレクトリ。木は設定の
+    ロード時（サンドボックスに入る前）に開き、後の変更は持っているディレクトリの fd からの相対の `openat`・`fstatat`
+    で辿るので、Capsicum の capability mode・`unveil`・Seatbelt の下でも動く。
+  - Windows: `path` の配下ごとの `ReadDirectoryChangesW` と親ディレクトリを、ルートごとの専用スレッドで待つ。
+- **戻り先**: `valid_duration_secs` は今までどおり効く。監視を付けられないときは警告を出し、そのルートは従来どおり
+  `valid_duration_secs` の後に追従する。当たる上限は、Linux の inotify の `fs.inotify.max_user_watches`
+  （と `fs.inotify.max_user_instances`）、kqueue の OS では監視の fd に使うソフトの `RLIMIT_NOFILE` の 4 分の 1。
+  後から作られたディレクトリ・ファイルで上限に当たったときはルートごとに 1 回警告し、その部分は
   `valid_duration_secs` の後に追従する。
-- **対応 OS**: Linux（io_uring・epoll のビルド）。FreeBSD・OpenBSD・NetBSD・macOS・Windows では今のところ `watch = true` は
-  警告を出して `valid_duration_secs` の動きに戻る。
+- **対応 OS**: Linux（io_uring・epoll のビルド）・FreeBSD・OpenBSD・NetBSD・macOS・Windows。
 - **サンドボックス**: seccomp の許可リストに `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch`・`getdents64` を
   含む（[セキュリティ](security.md)）。Landlock では今までどおり静的配信のルートを `landlock_read_paths` に書く
   （監視のスレッドがディレクトリを辿る）。

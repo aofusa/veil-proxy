@@ -284,16 +284,25 @@ watch = true                    # keep both caches on the same setting
 
 - **Cost on a cache hit**: one atomic load (a per-route generation number). Unlike `revalidate_mtime = true`,
   no `stat` is issued, so HTTP/2 and HTTP/3 static serving stays free of offloaded syscalls.
-- **How it works**: a dedicated thread receives change notifications (Linux: inotify on every directory under
-  `path`, plus the parent directory to catch a swap of `path` itself) and bumps the route's generation.
+- **How it works**: a dedicated thread receives change notifications and bumps the route's generation.
   Entries remember the generation read before the file was opened, so a replacement during a read never
-  leaves the old content cached under the new generation. A notification queue overflow rebuilds every
-  watched route.
-- **Fallback**: `valid_duration_secs` still applies. If watching cannot be set up (the inotify watch limit
-  `fs.inotify.max_user_watches` is reached, or the OS has no implementation yet), veil logs a warning and the
-  route follows disk changes after `valid_duration_secs` as before.
-- **Platforms**: Linux (io_uring and epoll builds). On FreeBSD, OpenBSD, NetBSD, macOS and Windows, `watch = true`
-  logs a warning and falls back to `valid_duration_secs` for now.
+  leaves the old content cached under the new generation.
+  - Linux: inotify on every directory under `path`, plus the parent directory to catch a swap of `path`
+    itself. A notification queue overflow rebuilds every watched route.
+  - FreeBSD, OpenBSD, NetBSD and macOS: kqueue `EVFILT_VNODE` on every directory and regular file under
+    `path` (the watcher holds one fd for each; the file fds catch in-place overwrites), plus the parent
+    directory. The tree is opened when the configuration is loaded, before the sandbox is entered, and later
+    changes are followed with `openat`/`fstatat` relative to the directory fds already held, so it keeps
+    working under Capsicum capability mode, `unveil` and Seatbelt.
+  - Windows: `ReadDirectoryChangesW` on `path` with its subtree, plus the parent directory, on a dedicated
+    thread per route.
+- **Fallback**: `valid_duration_secs` still applies. If watching cannot be set up, veil logs a warning and the
+  route follows disk changes after `valid_duration_secs` as before. Limits that trigger this: the inotify
+  watch limit `fs.inotify.max_user_watches` (and `fs.inotify.max_user_instances`) on Linux, and on kqueue
+  platforms a budget of a quarter of the soft `RLIMIT_NOFILE` for the watcher's fds. When the limit is hit
+  while following a new directory or file later on, veil warns once per route and that part of the tree is
+  followed after `valid_duration_secs`.
+- **Platforms**: Linux (io_uring and epoll builds), FreeBSD, OpenBSD, NetBSD, macOS and Windows.
 - **Sandbox**: the seccomp allow-list includes `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` and
   `getdents64` (see [Security](security.md)). With Landlock, list the static root in `landlock_read_paths` as
   usual (the watcher reads the directory tree).

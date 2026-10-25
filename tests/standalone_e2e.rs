@@ -2574,8 +2574,8 @@ allow_origins = ["*"]
 /// 静的配信のキャッシュがディスクの変更に追従する（F-272）。`open_file_cache`・`static_file_cache` を有効期限 600 秒で
 /// 有効にし、`watch = true` のルートは同じサイズの `mv` の差し替え・元に戻す・中身の上書き（`cp`）・後から作った
 /// ディレクトリの中の差し替えに 2 秒以内に追従し、`watch = false` のルートは古い中身のまま（有効期限まで）なことを、
-/// HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。
-#[cfg(target_os = "linux")]
+/// HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。通知は Linux が inotify、BSD・macOS が kqueue、Windows が
+/// ReadDirectoryChangesW（どの OS でも同じ手順で回す）。
 #[test]
 fn f272_static_cache_follows_disk_changes() {
     let dir = tempfile::tempdir().unwrap();

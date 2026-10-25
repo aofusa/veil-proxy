@@ -1,6 +1,6 @@
 # F-272: 静的配信のキャッシュ（`open_file_cache`・`static_file_cache`）がディスクの変更に追従する（ファイルの変更通知）
 
-**状態: 完了（Linux。wt/core → feat/v0100、2026-10-25。他の OS は有効期限の動きに戻す。2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（wt/core → feat/v0100、2026-10-25。Linux・BSD・macOS・Windows。2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景（調査で確認）
 
@@ -99,8 +99,7 @@ watch = true            # 新設。既定 false（open_file_cache と同じ値�
 
 ### 決めたこと
 
-- **Linux だけ実装した**。FreeBSD・OpenBSD・NetBSD・macOS（kqueue の `EVFILT_VNODE`）・Windows（`ReadDirectoryChangesW`）は、
-  `watch = true` を警告して有効期限だけの動きに戻す（黙って追従しないままにはしない）。VM・実機の試験を回せていないため。
+- 第 1 段は Linux だけ実装した（kqueue・`ReadDirectoryChangesW` は第 2 段で実装）。
 - 有効期限は `watch = true` でも残す（通知が届かないときの上限）。
 - 事前圧縮の兄弟ファイル（`.br`・`.gz`）を配る機能は veil に無いので対象外（veil が作る圧縮結果のキャッシュには世代を付けた）。
 - 設定から外れたルートの監視はプロセスの終了まで外さない（数は一度でも設定したルートの数で抑えられる。世代はリロードをまたいで
@@ -109,8 +108,38 @@ watch = true            # 新設。既定 false（open_file_cache と同じ値�
 - Landlock を使うときは、静的配信のルートが `landlock_read_paths` に入っている必要がある（今までと同じ。監視も同じパスにしか付けない）。
 - ライブラリの `App::serve_dir`（F-267）・Python の `StaticFiles`（F-268）の既定は、それぞれのチケットで `watch = true` にする。
 
+### 第 2 段（kqueue・ReadDirectoryChangesW、2026-10-25）
+
+- **kqueue（FreeBSD・OpenBSD・NetBSD・macOS）**: `src/cache/watch.rs` の `kq`。専用スレッド `veil-fswatch` がブロッキングの
+  `kevent` で `EVFILT_VNODE`（`NOTE_WRITE`・`NOTE_DELETE`・`NOTE_RENAME`・`NOTE_ATTRIB`・`NOTE_EXTEND`、`EV_CLEAR`）を受ける。
+  ルートの配下のディレクトリと通常ファイルを監視スレッドが開いて付け（macOS は `O_EVTONLY`）、`udata` は節の添字。
+  ディレクトリの `NOTE_WRITE` でそのディレクトリを `fdopendir` で読み直し、増えた・inode が変わった子に付け、消えた子を閉じる。
+  ファイルの fd で `rename` を伴わない上書きを捉える。ルートの親ディレクトリも見て、ルートの名前の inode が変わったら
+  `openat(親の fd, 名前)` で付け直す。開くのは設定ロード時の絶対パス（サンドボックスに入る前）と、持っている fd からの相対
+  （`openat`・`fstatat`・`fdopendir`）だけなので capsicum・unveil・Seatbelt の下でも読み直しが動く。NetBSD の `struct kevent` の
+  型の差（`filter`・`flags` が `u32`）は libc の定数がそれぞれの型なのでそのまま代入して吸収する。
+- **Windows**: `windows`。ルートごとの専用スレッドが `ReadDirectoryChangesW`（配下ごと、overlapped）と親ディレクトリ
+  （ルートと同じ名前の追加・改名で開き直す）を `WaitForMultipleObjects` で待つ。何が届いても（溢れた 0 バイトの完了も）世代を
+  増やす。ハンドルは `FILE_SHARE_DELETE` で開き、監視中もルートの改名・削除を妨げない。`windows-sys` に
+  `Win32_Storage_FileSystem` を足した。
+- **監視の上限**: Linux は `inotify_add_watch` の `ENOSPC`・`inotify_init1` の `EMFILE` を上限の言葉で警告する。kqueue は
+  監視の fd を `RLIMIT_NOFILE`（ソフト）の 4 分の 1 までにし、設定ロード時に超えたらそのルートを警告して有効期限の動きに戻す。
+  後から増えた分で超えたらルートごとに 1 回警告し、その部分は有効期限で追従する。
+- **試験**: 単体 `cache::watch::tests::watcher_bumps_on_replace_overwrite_new_dir_and_root_swap`（inotify の実地の試験を
+  全 OS に広げた）を、watch.rs だけを持つ小さなクレートで Linux・macOS（ssh llm の実機、arm64）・Windows（ssh aofish の実機）で
+  通した。E2E `f272_static_cache_follows_disk_changes` は Linux 限定を外した（BSD・macOS・Windows の VM・実機で回す）。
+  BSD 向けの `bump_all`・`WatchGen::current` が dead_code になっていた（Linux だけで使う）のを cfg で直した。
+
+#### 決めたこと（第 2 段）
+
+- kqueue で上書きを捉える fd は `open_file_cache` が持つ fd ではなく、監視スレッドが自分で開いた fd にした。`open_file_cache`
+  が fd を持つのは `fetch_file_info` の経路だけで、B-65 の高速経路（open + fstat + read を 1 回の offload）や `static_file_cache`
+  だけのルートは fd を持たないため、それに付けると上書きを捉えられない経路が残る。データプレーンに `kevent` の登録も足さずに済む。
+  代わりに fd の数がファイルの数になるので上限（`RLIMIT_NOFILE` の 4 分の 1）を設けた。
+- シンボリックリンク（ファイル・ディレクトリとも）は辿らない（Linux の監視と同じ）。
+
 ### 残したこと
 
-- kqueue・`ReadDirectoryChangesW` の実装と、BSD・macOS・Windows の E2E。
+- BSD・macOS・Windows の E2E（コーディネーターが VM・実機で回す）。
 - 性能の交互 A/B（`watch = true` と `false` の静的配信 3B・54KB、offload ゼロの確認）は F-276 の計測に回す。当たった要求に
   増えたのは原子変数の読み取り 1 回と `Option` の分岐だけ。
