@@ -387,13 +387,6 @@ pub async fn handle_connection(stream: TcpStream, acceptor: RustlsAcceptor, peer
     // F-200: TLS のリスナー（`[server].listen`）は常に TLS だけを受ける（平文は `listen_cleartext`）。
     let initial_buffer = None;
 
-    // HTTP/2 が有効な場合のみ設定を読み込む
-    #[cfg(feature = "http2")]
-    let http2_enabled = {
-        let config = CURRENT_CONFIG.load();
-        config.http2_enabled
-    };
-
     // TLSハンドシェイクにタイムアウトを設定
     // rustls でハンドシェイク後、ktls2 で kTLS を有効化
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream, initial_buffer)).await;
@@ -413,9 +406,11 @@ pub async fn handle_connection(stream: TcpStream, acceptor: RustlsAcceptor, peer
     // クライアントIPアドレスをスタックバッファへ変換（F-41: 接続ごとのヒープ確保排除）
     let client_ip = IpStr::new(peer_addr.ip());
 
-    // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
+    // ALPN で h2 がネゴシエートされたら HTTP/2 ハンドラーを使用する。ALPN は起動時の
+    // `http2_enabled` で決まり、リロードでは変わらないので、振り分けもネゴシエート結果だけで決める
+    // （リロード後の設定を見ると、h2 を出したまま HTTP/1.1 で処理してしまう）。
     #[cfg(feature = "http2")]
-    if http2_enabled && tls_stream.is_http2() {
+    if tls_stream.is_http2() {
         handle_http2_connection(tls_stream, client_ip.as_str()).await;
         return;
     }
@@ -433,13 +428,6 @@ pub async fn handle_connection(
 ) {
     // F-200: TLS のリスナー（`[server].listen`）は常に TLS だけを受ける（平文は `listen_cleartext`）。
     let initial_buffer = None;
-
-    // HTTP/2 が有効な場合のみ設定を読み込む
-    #[cfg(feature = "http2")]
-    let http2_enabled = {
-        let config = CURRENT_CONFIG.load();
-        config.http2_enabled
-    };
 
     // TLSハンドシェイクにタイムアウトを設定
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream, initial_buffer)).await;
@@ -459,9 +447,11 @@ pub async fn handle_connection(
     // クライアントIPアドレスをスタックバッファへ変換（F-41: 接続ごとのヒープ確保排除）
     let client_ip = IpStr::new(peer_addr.ip());
 
-    // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
+    // ALPN で h2 がネゴシエートされたら HTTP/2 ハンドラーを使用する。ALPN は起動時の
+    // `http2_enabled` で決まり、リロードでは変わらないので、振り分けもネゴシエート結果だけで決める
+    // （リロード後の設定を見ると、h2 を出したまま HTTP/1.1 で処理してしまう）。
     #[cfg(feature = "http2")]
-    if http2_enabled && tls_stream.is_http2() {
+    if tls_stream.is_http2() {
         handle_http2_connection(tls_stream, client_ip.as_str()).await;
         return;
     }
