@@ -690,6 +690,9 @@ struct ProxyStream {
     max_request_body: u64,
     /// ボディ上限超過（413 + ストリームリセット）。
     req_too_large: bool,
+    /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ストリーミング経路だけ。バッファ経路は
+    /// `H3BufferedTask` が head を送るときに足す）
+    cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
 }
 
 impl ProxyStream {
@@ -715,6 +718,7 @@ impl ProxyStream {
             req_bytes_total: 0,
             max_request_body,
             req_too_large: false,
+            cors: None,
         }
     }
 
@@ -736,6 +740,7 @@ impl ProxyStream {
             req_bytes_total: 0,
             max_request_body: 0,
             req_too_large: false,
+            cors: None,
         }
     }
 }
@@ -1254,6 +1259,7 @@ impl Http3Handler {
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
                     let mut ps =
                         ProxyStream::new(resp_rx, req_tx, more_frames, params.max_request_body);
+                    ps.cors = params.cors.clone();
                     // 初回バッチで届いていたボディを取り込む。
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
@@ -1270,6 +1276,7 @@ impl Http3Handler {
                     let (resp_tx, resp_rx) =
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
                     let mut ps = ProxyStream::new(resp_rx, req_tx, more_frames, h.max_request_body);
+                    ps.cors = h.cors.clone();
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
                             ps.req_bytes_total += body.len() as u64;
@@ -1350,6 +1357,7 @@ impl Http3Handler {
                     client_ip: self.client_ip,
                     resp_tx: Some(resp_tx),
                     notify: self.notify.clone(),
+                    cors: None,
                 },
                 br.headers,
                 body,
@@ -1566,6 +1574,7 @@ impl Http3Handler {
                 // F-266: ストリーミング受信のハンドラは本文の累計に上限を掛けない（HTTP/2・HTTP/1.1 と同じ。
                 // gRPC はメッセージごと、multipart はパートごとに上限を見る）
                 max_request_body: 0,
+                cors: security.cors_actual.clone(),
                 log: H3AccessLog {
                     method: Bytes::copy_from_slice(method),
                     authority: Bytes::copy_from_slice(authority),
@@ -1746,6 +1755,7 @@ impl Http3Handler {
             retry_idempotent: crate::http_utils::is_idempotent_method(method),
             #[cfg(feature = "http2")]
             h2,
+            cors: security.cors_actual.clone(),
         })
     }
 

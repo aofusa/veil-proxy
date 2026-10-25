@@ -1593,22 +1593,31 @@ pub(super) async fn h2_dispatch(
             headers.extend(r.headers.iter().cloned());
             h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _, security) => {
             h2_redirect(
                 ctx,
                 &redirect_url,
                 status_code,
                 preserve_path,
                 &prefix,
+                &security,
                 resp_tx,
                 notify,
             )
             .await
         }
         #[cfg(feature = "handler")]
-        Backend::Handler(entry, _, _, comp) => {
-            let (status, size, _) =
-                h2_api_handler(ctx, &entry, comp.as_deref(), None, resp_tx, notify).await;
+        Backend::Handler(entry, security, _, comp) => {
+            let (status, size, _) = h2_api_handler(
+                ctx,
+                &entry,
+                comp.as_deref(),
+                &security,
+                None,
+                resp_tx,
+                notify,
+            )
+            .await;
             (status, size)
         }
     };
@@ -1640,6 +1649,7 @@ pub(super) async fn h2_api_handler(
     ctx: &H2RequestCtx,
     entry: &crate::api::handler::HandlerEntry,
     comp: Option<&crate::config::CompressionConfig>,
+    security: &SecurityConfig,
     req_rx: Option<&crate::stream_channel::Receiver<Bytes>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -1662,7 +1672,7 @@ pub(super) async fn h2_api_handler(
         crate::api::request::HttpVersion::Http2,
     );
     let Some(rx) = req_rx else {
-        let (status, size) = h2_api_respond(entry, comp, req, resp_tx, notify).await;
+        let (status, size) = h2_api_respond(entry, comp, security, req, resp_tx, notify).await;
         return (status, size, ctx.body.len() as u64);
     };
 
@@ -1686,7 +1696,7 @@ pub(super) async fn h2_api_handler(
         }
         // body_tx の drop で受信ストリームが終わる
     };
-    let work = h2_api_respond(entry, comp, req, resp_tx, notify);
+    let work = h2_api_respond(entry, comp, security, req, resp_tx, notify);
     let (status, size) =
         match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
             futures::future::Either::Left((r, _pump)) => r,
@@ -1700,12 +1710,15 @@ pub(super) async fn h2_api_handler(
 pub(super) async fn h2_api_respond(
     entry: &crate::api::handler::HandlerEntry,
     comp: Option<&crate::config::CompressionConfig>,
+    security: &SecurityConfig,
     req: crate::api::request::Request,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
     let mut resp = crate::api::dispatch::call(entry, req, comp).await;
     crate::api::dispatch::h2_h3_headers(&mut resp);
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_bytes(&mut resp.headers, security);
     let status = resp.status_code();
     let crate::api::response::Response {
         headers: resp_headers,
@@ -1914,6 +1927,7 @@ pub(super) async fn h2_proxy(
                     target,
                     resp,
                     Some((compression, client_encoding)),
+                    security,
                     #[cfg(feature = "wasm")]
                     wasm_modules,
                     resp_tx,
@@ -2290,6 +2304,7 @@ pub(super) async fn h2_proxy_http(
             &mut backend,
             compression,
             client_encoding,
+            security,
             resp_tx,
             notify,
             retry,
@@ -2401,6 +2416,7 @@ pub(super) async fn h2_proxy_https(
             &mut backend,
             compression,
             client_encoding,
+            security,
             resp_tx,
             notify,
             retry,
@@ -2494,6 +2510,7 @@ pub(super) async fn h2_proxy_h2c(
         target,
         h2c_resp,
         None,
+        security,
         #[cfg(feature = "wasm")]
         wasm_modules,
         resp_tx,
@@ -2513,6 +2530,7 @@ pub(super) async fn h2_emit_upstream_response(
     target: &ProxyTarget,
     h2c_resp: http2::upstream_mux::H2cResponse,
     compress: Option<(&CompressionConfig, AcceptedEncoding)>,
+    security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -2569,6 +2587,8 @@ pub(super) async fn h2_emit_upstream_response(
     for (n, v) in h2_base_headers(true) {
         header_store.push((n, v));
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_bytes(&mut header_store, security);
 
     let has_body = !h2c_resp.body.is_empty();
     let has_trailers = !h2c_resp.trailers.is_empty();
@@ -2644,6 +2664,7 @@ pub(super) async fn h2_relay_backend_response<B>(
     backend: &mut B,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     retry_on_empty: bool,
@@ -2845,6 +2866,8 @@ where
                 // ヘッダー抽出（上のループ）が済んだ時点で `data`（= `response_buf`/
                 // `body` の借用元）はもう参照されないため、ここで `Bytes` へ消費
                 // 変換してゼロコピーでボディを渡す（F-165 R4）。
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+                crate::route_cors::apply_bytes(&mut headers, security);
                 let initial_body = data.into_body_bytes(body_start);
                 let (sent, ok) = h2_stream_body_cl(
                     resp_tx,
@@ -2882,6 +2905,8 @@ where
                 ));
             }
             // 同上（F-165 R4）: ヘッダー抽出後に `data` を `Bytes` へ消費変換する。
+            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+            crate::route_cors::apply_bytes(&mut headers, security);
             let initial_body = data.into_body_bytes(body_start);
             let sent =
                 h2_stream_body_chunked(resp_tx, notify, status, headers, backend, initial_body)
@@ -3004,6 +3029,8 @@ where
         } else {
             final_body
         };
+        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+        crate::route_cors::apply_bytes(&mut headers, security);
         let (status2, sent) =
             h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
         (
@@ -3377,6 +3404,7 @@ pub(super) async fn h2_redirect(
     status_code: u16,
     preserve_path: bool,
     prefix: &[u8],
+    security: &SecurityConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -3406,6 +3434,8 @@ pub(super) async fn h2_redirect(
         Bytes::from_static(b"location"),
         Bytes::from(final_url.into_bytes()),
     ));
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::apply_bytes(&mut headers, security);
     if h2_send(
         resp_tx,
         notify,
@@ -3572,6 +3602,8 @@ pub(super) async fn h2_relay_h2_streaming(
                 }) => {
                     status = s;
                     headers.extend(h2_base_headers(true));
+                    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+                    crate::route_cors::apply_bytes(&mut headers, security);
                     // 上流が HEADERS で終わった（gRPC の trailers-only 応答など）なら、下流にも
                     // END_STREAM 付きの HEADERS 1 枚で返す（空 DATA で閉じ直さない）。
                     let end_stream = resp_rx.is_finished();
@@ -3680,9 +3712,17 @@ pub(super) async fn h2_serve_streaming(
         }
         // ストリーミング受信のハンドラ（F-197）
         #[cfg(feature = "handler")]
-        Some((_prefix, Backend::Handler(entry, _, _, comp), _rc)) if entry.streaming_request => {
-            return h2_api_handler(ctx, &entry, comp.as_deref(), Some(req_rx), resp_tx, notify)
-                .await;
+        Some((_prefix, Backend::Handler(entry, sec, _, comp), _rc)) if entry.streaming_request => {
+            return h2_api_handler(
+                ctx,
+                &entry,
+                comp.as_deref(),
+                &sec,
+                Some(req_rx),
+                resp_tx,
+                notify,
+            )
+            .await;
         }
         // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
         Some((_prefix, Backend::Respond(r), _rc)) => {
@@ -3793,6 +3833,7 @@ pub(super) async fn h2_serve_streaming(
             req_rx,
             &compression,
             client_encoding,
+            &security,
             resp_tx,
             notify,
         )
@@ -3826,6 +3867,7 @@ pub(super) async fn h2_serve_streaming(
                     req_rx,
                     &compression,
                     client_encoding,
+                    &security,
                     resp_tx,
                     notify,
                 )
@@ -3846,6 +3888,7 @@ pub(super) async fn h2_serve_streaming(
             req_rx,
             &compression,
             client_encoding,
+            &security,
             resp_tx,
             notify,
         )
@@ -3865,6 +3908,7 @@ pub(super) async fn h2_run_streaming_upload<B>(
     req_rx: &crate::stream_channel::Receiver<Bytes>,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64, u64)
@@ -3905,6 +3949,7 @@ where
         backend,
         compression,
         client_encoding,
+        security,
         resp_tx,
         notify,
         false,

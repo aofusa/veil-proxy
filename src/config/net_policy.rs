@@ -555,6 +555,16 @@ pub struct SecurityConfig {
     /// デフォルト: `2.0`
     #[serde(default = "default_websocket_backoff_multiplier")]
     pub websocket_poll_backoff_multiplier: f64,
+
+    /// 実際の応答（プリフライト以外）に足す CORS のヘッダ（F-273）。`[route.traffic.cors]` のあるルートで、
+    /// 要求の `Origin` ごとに設定ロード時に作った `Backend` の写しだけが持つ（それ以外は `None`）
+    #[serde(skip)]
+    pub cors_actual: Option<Arc<crate::route_cors::CorsActual>>,
+
+    /// レート制限の表の鍵（F-273）。0 ならこの設定のアドレス。CORS の写しは元の設定のアドレスを持ち、
+    /// オリジンごとに枠が分かれないようにする
+    #[serde(skip)]
+    pub rate_limit_zone: usize,
 }
 
 impl SecurityConfig {
@@ -630,6 +640,8 @@ impl Default for SecurityConfig {
             websocket_poll_timeout_ms: default_websocket_poll_timeout_ms(),
             websocket_poll_max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             websocket_poll_backoff_multiplier: default_websocket_backoff_multiplier(),
+            cors_actual: None,
+            rate_limit_zone: 0,
         }
     }
 }

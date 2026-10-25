@@ -61,7 +61,7 @@ virtual host の階層が無いので、各ルートに `host` 条件を書き�
 | Envoy のフィルタ | veil | |
 |---|---|---|
 | `router` | 組み込み | = |
-| `cors` | `[route.traffic.cors]` | = preflight に答える。応答の `Access-Control-Allow-Origin` は `add_response_headers` で足す |
+| `cors` | `[route.traffic.cors]` | = preflight に答え、実際の応答にもヘッダを足す（`expose_headers`・`allow_credentials`。上流のヘッダは `override_upstream` でなければ残す） |
 | `fault`（abort） | `[route.traffic.fault]` | = |
 | `fault`（delay） | — | — 予定（F-226） |
 | `local_ratelimit` | `rate_limit_requests_per_min` | ≈ クライアントの IP とルートごと |
@@ -239,8 +239,6 @@ allow_methods = ["GET", "POST"]
 [route.traffic.fault]
 abort_status = 503
 abort_percent = 1.0
-[route.security]
-add_response_headers = { "Access-Control-Allow-Origin" = "https://app.example.com", "Vary" = "Origin" }
 ```
 
 ### TLS・HTTP/3・JWT

@@ -891,8 +891,8 @@ IPv4 として照合するので、`192.0.2.0/24` に含まれる。射影の形
 
 ## ルート単位のトラフィック制御（F-219）
 
-`type = "Respond"` は固定応答を返す。`[route.traffic]` は任意のルートに重み付き分割・フォルト注入（中断）・CORS の
-プリフライトへの応答を足す。どれも設定のロード時に解決し、要求のたびには作っておいたバックエンドから 1 つ選ぶだけ
+`type = "Respond"` は固定応答を返す。`[route.traffic]` は任意のルートに重み付き分割・フォルト注入（中断）・CORS
+（プリフライトへの応答と、実際の応答のヘッダ）を足す。どれも設定のロード時に解決し、要求のたびには作っておいたバックエンドから 1 つ選ぶだけ
 （分割と中断は乱数 1 個）。`[route.traffic]` の無いルートには影響しない。HTTP/1.1・HTTP/2・HTTP/3 のどれでも効く。
 
 ```toml
@@ -925,20 +925,36 @@ split = [
 abort_status = 503
 abort_percent = 5.0          # 0〜100、既定 100
 
-# CORS のプリフライト（Origin と Access-Control-Request-Method の付いた OPTIONS）
+# CORS: プリフライトへの応答と実際の応答のヘッダ
 [route.traffic.cors]
 allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
 allow_methods = ["GET", "POST"]
 allow_headers = ["content-type", "authorization"]
-expose_headers = []
+expose_headers = []          # 実際の応答（とプリフライト）の Access-Control-Expose-Headers
 max_age_secs = 600
 allow_credentials = false    # "*" とは併用できない
+override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える
+reject_disallowed = false    # true: 許可しない Origin の要求に 403 を返す
 ```
 
 - 分割先にもルートの `security`・`compression`・`buffering`・`modules` が効く（action と同じ）。
-- プリフライトへの応答は `200` と `Access-Control-Allow-*` のヘッダで、一致したオリジンをそのまま返す（`Vary: Origin`）。
-  他のオリジンからのプリフライトと、プリフライトでない要求は action へ行く。実際の応答の
-  `Access-Control-Allow-Origin` は `[route.security] add_response_headers` で付ける。
+- **プリフライト**: 許可したオリジンからの `Origin` と `Access-Control-Request-Method` の付いた `OPTIONS` には、`200` と
+  `Access-Control-Allow-*` のヘッダで答え、一致したオリジンをそのまま返す（`Vary: Origin`）。他のオリジンからの
+  プリフライトは action へ行く。
+- **実際の応答**（それ以外の要求。File・Proxy・Handler・Redirect・Respond のルート、HTTP/1.1・HTTP/2・HTTP/3）: 要求の
+  `Origin` が許可したものなら、`Access-Control-Allow-Origin`（そのオリジン。`"*"` の項に当たったときは `*`）・
+  `Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）・`Access-Control-Expose-Headers`（`expose_headers`
+  のとき）・`Vary: Origin`（項が `"*"` だけのときは付けない。既存の `Vary` の隣に足す）を足す。`Origin` の無い要求と
+  許可しないオリジンの要求は普通に処理し、`Vary: Origin` だけを付ける（ブラウザが拒否する。`reject_disallowed = true`
+  なら 403 で返す）。
+- 上流（ハンドラ、`Respond` の action のヘッダも同じ）が既に `Access-Control-Allow-Origin` を返したら、上流の CORS の
+  ヘッダを残して何も足さない。`override_upstream = true` なら上流の `Access-Control-Allow-Origin`・`-Allow-Credentials`・
+  `-Expose-Headers` を除いて veil のものを足す。
+- ヘッダは設定のロード時に組み立てる（許可したオリジンごとにルートのバックエンドの写しを 1 つ作る）。要求のたびには
+  `Origin` を 1 回照合し、組み立て済みのヘッダを足すだけ。`[route.traffic.cors]` の無いルートには影響しない。ルートを
+  選ぶ前に veil が返す応答（未知のパスの `404`、セキュリティの拒否、フォルトの中断、JWT のエラー）と WebSocket の
+  Upgrade には付かない。HTTP/1.1 で kTLS のとき、CORS のあるルートのプロキシ応答はユーザー空間の経路を通る
+  （`splice(2)` の中継ではヘッダを足せないため）。
 - フォルトの中断を設定したルートの要求は、HTTP/2・HTTP/3 ではバッファ経路を通る（判定は要求をディスパッチするときの 1 回）。
 - TOML のルートにはまだ無いもの（F-226）: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
   メッシュのデータプレーンは Istio / Linkerd のポリシーからこれらを実装している（[mesh.md](mesh.md)）。TOML のルートでは

@@ -1379,6 +1379,8 @@ pub(super) async fn handle_backend(
                 header.extend_from_slice(header_value.as_bytes());
                 header.extend_from_slice(b"\r\n");
             }
+            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+            crate::route_cors::append_h1_lines(&mut header, &security);
             // F-94: HTTP/3 広告（Alt-Svc）
             append_alt_svc_header_line(&mut header);
 
@@ -1535,7 +1537,7 @@ pub(super) async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _, security) => {
             handle_redirect(
                 tls_stream,
                 &redirect_url,
@@ -1544,15 +1546,17 @@ pub(super) async fn handle_backend(
                 req_path,
                 &prefix,
                 client_wants_close,
+                &security,
             )
             .await
         }
         #[cfg(feature = "handler")]
-        Backend::Handler(entry, _, _, comp) => {
+        Backend::Handler(entry, security, _, comp) => {
             Box::pin(handle_api_handler(
                 tls_stream,
                 &entry,
                 comp.as_deref(),
+                &security,
                 method,
                 req_path,
                 content_length,
@@ -1587,6 +1591,7 @@ pub(super) async fn handle_api_handler(
     mut tls_stream: ServerTls,
     entry: &crate::api::handler::HandlerEntry,
     comp: Option<&crate::config::CompressionConfig>,
+    security: &SecurityConfig,
     method: &Bytes,
     req_path: &Bytes,
     content_length: usize,
@@ -1673,6 +1678,8 @@ async fn write_api_response(
         api_cache.pending_upgrade = Some(up.on_upgrade);
         return Some((tls_stream, 101, 0, false));
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_bytes(&mut resp.headers, security);
     let status = resp.status_code();
     let body = resp.body().clone();
     // ステータス行・ヘッダはスレッドローカルのプールのバッファに書き、小さな本文は同じバッファに続けて
@@ -2017,6 +2024,7 @@ pub(super) async fn handle_redirect(
     req_path: &[u8],
     prefix: &[u8],
     client_wants_close: bool,
+    security: &SecurityConfig,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // リダイレクト先URLを構築
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -2063,6 +2071,8 @@ pub(super) async fn handle_redirect(
     response.extend_from_slice(b"Location: ");
     response.extend_from_slice(final_url.as_bytes());
     response.extend_from_slice(b"\r\nContent-Length: 0\r\n");
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::append_h1_lines(&mut response, security);
 
     if client_wants_close {
         response.extend_from_slice(b"Connection: close\r\n\r\n");

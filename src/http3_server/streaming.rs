@@ -419,7 +419,14 @@ pub(super) fn drive_response_flush(
             return did_work;
         }
         match ps.resp_rx.try_recv() {
-            TryRecv::Item(RespMsg::Head { status, headers }) => {
+            TryRecv::Item(RespMsg::Head {
+                status,
+                mut headers,
+            }) => {
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。ストリーミング経路。CORS の無いルートは分岐だけ）
+                if let Some(c) = &ps.cors {
+                    c.apply_bytes(&mut headers);
+                }
                 // 本文の無い応答（リダイレクト・HEAD 等）は HEADERS に fin を載せる。
                 let fin = ps.resp_rx.is_finished();
                 match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin) {

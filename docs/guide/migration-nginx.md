@@ -121,7 +121,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `auth_request` (subrequest) | — | — not on TOML routes; ext_authz is planned (F-229); JWT verification is built in (`[route.jwt]`) |
 | `add_header Strict-Transport-Security ...` | `add_response_headers` | = |
 | `server_tokens off;` | default (no `Server` header) | = `server_header_enabled` turns it on |
-| CORS (`add_header Access-Control-*`) | `[route.traffic.cors]` (preflight) + `add_response_headers` | = |
+| CORS (`add_header Access-Control-*`) | `[route.traffic.cors]` (preflight and actual responses) | = |
 | `stream {}` (TCP / UDP) | `[[l4]]` | = TCP and UDP, with health checks ([l4-proxy.md](l4-proxy.md)) |
 | process sandboxing (none in nginx) | seccomp, Landlock, privilege dropping, capsicum, pledge/unveil | veil only ([security.md](security.md)) |
 

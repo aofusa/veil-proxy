@@ -252,6 +252,8 @@ pub(super) async fn handle_sendfile(
         header_buf.extend_from_slice(header_value.as_bytes());
         header_buf.extend_from_slice(b"\r\n");
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::append_h1_lines(&mut header_buf, security);
     // F-94: HTTP/3 広告（Alt-Svc）
     append_alt_svc_header_line(&mut header_buf);
 

@@ -897,7 +897,7 @@ the IPv4 range.
 ## Per-Route Traffic Control (F-219)
 
 `type = "Respond"` returns a fixed response, and `[route.traffic]` adds weighted splits, fault injection (abort) and
-CORS preflight answers to any route. They are resolved when the configuration is loaded; per request veil only picks
+CORS (preflight answers and the headers of actual responses) to any route. They are resolved when the configuration is loaded; per request veil only picks
 one of the prebuilt backends (one random number for splits and faults), and routes without `[route.traffic]` are
 unaffected. All of them work on HTTP/1.1, HTTP/2 and HTTP/3.
 
@@ -931,20 +931,36 @@ split = [
 abort_status = 503
 abort_percent = 5.0          # 0..=100, default 100
 
-# CORS preflight (OPTIONS with Origin and Access-Control-Request-Method)
+# CORS: preflight answers and the headers of actual responses
 [route.traffic.cors]
 allow_origins = ["https://app.example.com"]   # exact matches, or "*"
 allow_methods = ["GET", "POST"]
 allow_headers = ["content-type", "authorization"]
-expose_headers = []
+expose_headers = []          # Access-Control-Expose-Headers on actual responses (and preflights)
 max_age_secs = 600
 allow_credentials = false    # cannot be combined with "*"
+override_upstream = false    # true: replace the upstream's own Access-Control-* headers
+reject_disallowed = false    # true: answer 403 to requests whose Origin is not allowed
 ```
 
 - A split entry uses the route's `security`, `compression`, `buffering` and `modules`, like the action itself.
-- The preflight answer is `200` with the `Access-Control-Allow-*` headers and echoes the matching origin
-  (`Vary: Origin`). Preflights from other origins, and all non-preflight requests, go to the action. Add
-  `Access-Control-Allow-Origin` to actual responses with `[route.security] add_response_headers`.
+- **Preflight**: an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` from an allowed origin is answered
+  with `200` and the `Access-Control-Allow-*` headers, echoing the matching origin (`Vary: Origin`). Preflights from
+  other origins go to the action.
+- **Actual responses** (every other request, on File, Proxy, Handler, Redirect and Respond routes, over HTTP/1.1,
+  HTTP/2 and HTTP/3): when the request's `Origin` is allowed, veil adds `Access-Control-Allow-Origin` (the origin, or
+  `*` for the `"*"` entry), `Access-Control-Allow-Credentials: true` (with `allow_credentials`),
+  `Access-Control-Expose-Headers` (with `expose_headers`) and `Vary: Origin` (unless the only entry is `"*"`; it is
+  added next to an existing `Vary`). Requests without `Origin` or from other origins are served normally with only
+  `Vary: Origin` (the browser blocks them; set `reject_disallowed = true` to answer `403` instead).
+- If the upstream (or a handler, or the headers of a `Respond` action) already returns `Access-Control-Allow-Origin`,
+  veil keeps the upstream's CORS headers and adds none; `override_upstream = true` removes the upstream's
+  `Access-Control-Allow-Origin` / `-Allow-Credentials` / `-Expose-Headers` and adds veil's.
+- The headers are built when the configuration is loaded, one copy of the route's backend per allowed origin; per
+  request veil compares the `Origin` once and adds prebuilt headers. Routes without `[route.traffic.cors]` are
+  unaffected. Responses that veil generates itself before the route is chosen (`404` for unknown paths, security
+  rejections, fault aborts, JWT errors) and WebSocket upgrades do not carry the headers. On HTTP/1.1 with kTLS, proxy
+  responses on a CORS route take the user-space path (the `splice(2)` relay cannot add headers).
 - When the fault abort applies to a route, its requests take the buffered path on HTTP/2 and HTTP/3 (the decision
   is made once, when the request is dispatched).
 - Not available on TOML routes yet (F-226): per-route request timeouts, conditional retries, mirroring and fault delays.

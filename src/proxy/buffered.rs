@@ -115,7 +115,9 @@ where
     let buffered = receive_and_buffer_response(backend_stream, buffering_config, cache_ctx).await;
 
     match buffered {
-        Some((status_code, headers_data, body_result, backend_wants_keep_alive)) => {
+        Some((status_code, mut headers_data, body_result, backend_wants_keep_alive)) => {
+            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+            crate::route_cors::apply_h1(&mut headers_data, security);
             // B-17: ボディのバッファリングに失敗した場合、クライアントへは未送信のため
             // ヘッダーだけ送って（CL 分のボディを待たせて）ハングさせず、
             // None → 呼び出し元の 502 送出 + クローズに委ねる

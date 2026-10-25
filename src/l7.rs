@@ -201,7 +201,11 @@ pub fn check_security(
     // レートリミットチェック（B-31: ルート × IP ごと、全ワーカー共通）
     if security.rate_limit_requests_per_min > 0
         && !crate::config::check_rate_limit(
-            security as *const SecurityConfig as usize,
+            if security.rate_limit_zone != 0 {
+                security.rate_limit_zone
+            } else {
+                security as *const SecurityConfig as usize
+            },
             client_ip,
             security.rate_limit_requests_per_min,
         )

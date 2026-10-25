@@ -2483,14 +2483,17 @@ revalidate_mtime = false
 # [route.traffic.fault]
 # abort_status = 503
 # abort_percent = 5.0          # 0〜100、既定 100
-# # CORS のプリフライト（OPTIONS + Origin + Access-Control-Request-Method）に 200 で答える
+# # CORS（F-273）: プリフライト（OPTIONS + Origin + Access-Control-Request-Method）に 200 で答え、
+# # 実際の応答（File・Proxy・Handler・Redirect・Respond）にも許可したオリジンなら Access-Control-Allow-Origin 等を足す
 # [route.traffic.cors]
 # allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
 # allow_methods = ["GET", "POST"]
 # allow_headers = ["content-type", "authorization"]
-# expose_headers = []
+# expose_headers = []          # 実際の応答の Access-Control-Expose-Headers
 # max_age_secs = 600
 # allow_credentials = false    # "*" とは併用できない
+# override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える（既定は上流のものを残す）
+# reject_disallowed = false    # true: 許可しない Origin の要求に 403（既定は処理して CORS のヘッダを付けないだけ）
 #
 # JWT の検証（F-220、`jwt` feature）。トークン無し・検証できない → 401、require_claims を満たさない → 403
 # [route.jwt]

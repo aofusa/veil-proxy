@@ -25,6 +25,8 @@ pub(super) struct H3BufferedTask {
     /// Wasm `on_log` の完了を待たずに fin を出せるようにする。
     pub(super) resp_tx: Option<crate::http3_stream::Sender<crate::http3_stream::RespMsg>>,
     pub(super) notify: crate::http3_stream::ConnWaker,
+    /// ルートの `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ルートの解決の後に入れ、応答の head に足す）
+    pub(super) cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
 }
 
 /// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
@@ -95,6 +97,8 @@ pub(super) struct H3HandlerStream {
     pub(super) comp: Option<std::sync::Arc<crate::config::CompressionConfig>>,
     pub(super) req: crate::api::request::Request,
     pub(super) max_request_body: u64,
+    /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。メインループが応答の head に足す）
+    pub(super) cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
     pub(super) log: H3AccessLog,
 }
 
@@ -321,11 +325,17 @@ pub(super) fn pack_h3_request_headers(
 
 impl H3BufferedTask {
     /// 応答断片を 1 つ送ってメインループを起こす。
-    async fn send_msg(&self, msg: crate::http3_stream::RespMsg) -> io::Result<()> {
+    async fn send_msg(&self, mut msg: crate::http3_stream::RespMsg) -> io::Result<()> {
         let tx = self
             .resp_tx
             .as_ref()
             .ok_or_else(|| io::Error::other("HTTP/3 response already sent"))?;
+        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+        if let (Some(c), crate::http3_stream::RespMsg::Head { headers, .. }) =
+            (&self.cors, &mut msg)
+        {
+            c.apply_bytes(headers);
+        }
         let r = tx.send(msg).await;
         self.notify.notify();
         r.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "HTTP/3 stream closed"))
@@ -838,6 +848,8 @@ impl H3BufferedTask {
             );
             return Ok(());
         }
+        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。以降の応答の head に `send_msg` が足す）
+        self.cors = security.cors_actual.clone();
 
         // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
         // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out

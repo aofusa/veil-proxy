@@ -263,7 +263,7 @@ pub(super) async fn transfer_response_with_compression(
                 let wasm_active = !wasm_modules.is_empty();
                 #[cfg(not(feature = "wasm"))]
                 let wasm_active = false;
-                let modified_headers = if !wasm_active {
+                let mut modified_headers = if !wasm_active {
                     render_response_head(&accumulated[..header_len], status_code, security)
                 } else {
                     let mut modified_headers = accumulated[..header_len].to_vec();
@@ -402,6 +402,8 @@ pub(super) async fn transfer_response_with_compression(
                     }
                     modified_headers
                 };
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+                crate::route_cors::apply_h1(&mut modified_headers, security);
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
@@ -635,8 +637,13 @@ pub(super) async fn transfer_compressed_response(
         AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
             Some(compressed) => compressed,
             None => {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
         },
         AcceptedEncoding::Gzip => {
@@ -644,8 +651,13 @@ pub(super) async fn transfer_compressed_response(
             let mut encoder = GzEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
                 // 圧縮失敗: 非圧縮で送信
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -654,6 +666,7 @@ pub(super) async fn transfer_compressed_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
                     .await;
                 }
@@ -667,8 +680,13 @@ pub(super) async fn transfer_compressed_response(
             };
             let mut input = std::io::Cursor::new(&body_data);
             if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             compressed
         }
@@ -676,8 +694,13 @@ pub(super) async fn transfer_compressed_response(
             let level = Compression::new(compression.gzip_level);
             let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -686,6 +709,7 @@ pub(super) async fn transfer_compressed_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
                     .await;
                 }
@@ -732,9 +756,9 @@ pub(super) async fn transfer_compressed_response(
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
     _backend_wants_keep_alive: bool,
-    _security: &SecurityConfig,
+    security: &SecurityConfig,
 ) -> (u64, bool) {
-    transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
+    transfer_uncompressed_fallback(client_stream, original_headers, initial_body, security).await
 }
 
 /// 圧縮失敗時のフォールバック（非圧縮で送信）
@@ -742,16 +766,16 @@ pub(super) async fn transfer_uncompressed_fallback(
     client_stream: &mut ServerTls,
     original_headers: &[u8],
     body_data: &[u8],
+    security: &SecurityConfig,
 ) -> (u64, bool) {
     let mut total = 0u64;
 
     // ヘッダー送信（所有権ベースの I/O なので to_vec、clone は不要）
     let headers_len = original_headers.len();
-    let write_result = timeout(
-        WRITE_TIMEOUT,
-        client_stream.write_all(original_headers.to_vec()),
-    )
-    .await;
+    let mut head = original_headers.to_vec();
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::apply_h1(&mut head, security);
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(head)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
@@ -844,6 +868,8 @@ pub(super) fn build_compressed_headers(
 
     // ヘッダー終端
     new_headers.extend_from_slice(b"\r\n");
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::apply_h1(&mut new_headers, security);
 
     new_headers
 }

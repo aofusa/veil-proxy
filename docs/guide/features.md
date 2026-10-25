@@ -29,7 +29,7 @@
 - **Header Manipulation**: Add/remove request/response headers (X-Real-IP, HSTS, etc.)
 - **Redirect**: 301/302/307/308 HTTP redirects (with path preservation option)
 - **SNI Configuration**: Specify SNI name when connecting to HTTPS backends via IP (virtual host support)
-- **Per-route traffic control (F-219)**: fixed responses (`type = "Respond"`), weighted splits across upstreams (canary), fault injection (abort) and CORS preflight answers (`[route.traffic]`, see [Routing](routing.md))
+- **Per-route traffic control (F-219)**: fixed responses (`type = "Respond"`), weighted splits across upstreams (canary), fault injection (abort) and CORS for preflights and actual responses (`[route.traffic]`, see [Routing](routing.md))
 - **Upstream mTLS (F-217)**: client certificate, trust anchors and expected SANs (e.g. SPIFFE IDs) per upstream (see [TLS](tls.md))
 
 ### HTTP Processing

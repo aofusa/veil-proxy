@@ -2165,3 +2165,379 @@ fn f260_listener_rules_are_validated() {
     let (ok, err) = run("[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\n");
     assert!(ok, "{err}");
 }
+
+// ===================== F-273 =====================
+
+/// h2c（`tls = false`）または TLS 上の h2 で、要求ヘッダ付きの GET を 1 つ送り (状態コード, 応答ヘッダ) を返す。
+fn f273_h2_get(
+    port: u16,
+    tls: bool,
+    path: &str,
+    req: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>) {
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let scheme = if tls { "https" } else { "http" };
+        let mut b = http::Request::builder()
+            .method("GET")
+            .uri(format!("{scheme}://localhost:{port}{path}"));
+        for (k, v) in req {
+            b = b.header(*k, *v);
+        }
+        let request = b.body(()).unwrap();
+        async fn go<T>(io: T, request: http::Request<()>) -> (u16, Vec<(String, String)>)
+        where
+            T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            let (mut client, conn) = h2::client::handshake(io).await.expect("h2 handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let (resp, _) = client.send_request(request, true).expect("send");
+            let resp = resp.await.expect("response");
+            let status = resp.status().as_u16();
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.as_str().to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let mut body = resp.into_body();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("data");
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            (status, headers)
+        }
+        if tls {
+            let _ = veil::tls_provider::provider::default_provider().install_default();
+            let mut cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifyServer))
+                .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let io = connector.connect(name, tcp).await.expect("tls");
+            go(io, request).await
+        } else {
+            go(tcp, request).await
+        }
+    })
+}
+
+/// HTTP/3 で要求ヘッダ付きの GET を 1 つ送り (状態コード, 応答ヘッダ) を返す。
+#[cfg(feature = "http3")]
+fn f273_h3_get(port: u16, path: &str, req: &[(&str, &str)]) -> (u16, Vec<(String, String)>) {
+    use bytes::Buf;
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let _ = veil::tls_provider::provider::default_provider().install_default();
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifyServer))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let qc = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+        let conn = ep
+            .connect(([127, 0, 0, 1], port).into(), "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let drive = tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
+        let mut b = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://localhost:{port}{path}"));
+        for (k, v) in req {
+            b = b.header(*k, *v);
+        }
+        let mut stream = send.send_request(b.body(()).unwrap()).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            let n = chunk.remaining();
+            chunk.advance(n);
+        }
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        drop(send);
+        drive.abort();
+        ep.close(0u32.into(), b"");
+        (resp.status().as_u16(), headers)
+    })
+}
+
+/// `[route.traffic.cors]` が実際の応答（プリフライト以外）にも効く（F-273）。Respond・File（sendfile / memory）・
+/// Proxy（上流が CORS のヘッダを返す・返さない、`override_upstream`）・Redirect を、HTTP/1.1・h2c・TLS の HTTP/2・
+/// HTTP/3 で確かめる。許可しないオリジンには付けず、`reject_disallowed` なら 403、CORS の無いルートは変わらない。
+#[test]
+fn f273_cors_actual_responses_all_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("a.txt"), "static file").unwrap();
+    let port = free_port();
+    let tls_port = free_port();
+    let cors = r#"[route.traffic.cors]
+allow_origins = ["https://a.example"]
+allow_methods = ["GET"]
+expose_headers = ["X-Total"]
+allow_credentials = true"#;
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+[http3]
+enabled = true
+
+# 上流役（CORS 無し）
+[[route]]
+[route.conditions]
+path = "/plain"
+[route.action]
+type = "Respond"
+body = "plain"
+
+# 上流役（自分で Access-Control-Allow-Origin を返す）
+[[route]]
+[route.conditions]
+path = "/up-acao/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+[route.security]
+add_response_headers = {{ "Access-Control-Allow-Origin" = "https://up.example" }}
+
+[[route]]
+[route.conditions]
+path = "/respond"
+[route.action]
+type = "Respond"
+body = "respond"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/mem"
+[route.action]
+type = "File"
+path = "{www}/a.txt"
+mode = "memory"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/plain"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy-keep/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/up-acao"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy-override/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/up-acao"
+{cors}
+override_upstream = true
+
+[[route]]
+[route.conditions]
+path = "/redir"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com/next"
+redirect_status = 302
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/strict"
+[route.action]
+type = "Respond"
+body = "strict"
+[route.traffic.cors]
+allow_origins = ["https://a.example"]
+reject_disallowed = true
+
+[[route]]
+[route.conditions]
+path = "/any"
+[route.action]
+type = "Respond"
+body = "any"
+[route.traffic.cors]
+allow_origins = ["*"]
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www = tp(&www),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<(String, String)>) + 'a>;
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let r = http1_request(port, "GET", p, h, b"").unwrap();
+                (r.status, r.headers)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str, h: &[(&str, &str)]| f273_h2_get(port, false, p, h)),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str, h: &[(&str, &str)]| f273_h2_get(tls_port, true, p, h)),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str, h: &[(&str, &str)]| f273_h3_get(tls_port, p, h)),
+    ));
+    let values = |hs: &[(String, String)], name: &str| -> Vec<String> {
+        hs.iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    let ok_origin: &[(&str, &str)] = &[("Origin", "https://a.example")];
+    let bad_origin: &[(&str, &str)] = &[("Origin", "https://evil.example")];
+    for (proto, get) in &protocols {
+        for (path, want_status, want_origin) in [
+            ("/respond", 200, "https://a.example"),
+            ("/static/a.txt", 200, "https://a.example"),
+            ("/mem", 200, "https://a.example"),
+            ("/proxy", 200, "https://a.example"),
+            ("/proxy-keep/a.txt", 200, "https://up.example"),
+            ("/proxy-override/a.txt", 200, "https://a.example"),
+            ("/redir", 302, "https://a.example"),
+        ] {
+            let (st, hs) = get(path, ok_origin);
+            let ctx = format!("{proto} {path}: {hs:?}\n{}", veil.log());
+            assert_eq!(st, want_status, "{ctx}");
+            assert_eq!(
+                values(&hs, "access-control-allow-origin"),
+                vec![want_origin.to_string()],
+                "{ctx}"
+            );
+            if want_origin == "https://a.example" {
+                assert_eq!(
+                    values(&hs, "access-control-allow-credentials"),
+                    vec!["true".to_string()],
+                    "{ctx}"
+                );
+                assert_eq!(
+                    values(&hs, "access-control-expose-headers"),
+                    vec!["X-Total".to_string()],
+                    "{ctx}"
+                );
+                assert!(values(&hs, "vary").iter().any(|v| v == "Origin"), "{ctx}");
+            }
+            // 許可しないオリジン: 処理はするが Access-Control-Allow-Origin は付けない（Vary だけ）
+            let (st, hs) = get(path, bad_origin);
+            let ctx = format!("{proto} {path} (evil): {hs:?}\n{}", veil.log());
+            assert_eq!(st, want_status, "{ctx}");
+            if !path.starts_with("/proxy-keep") {
+                assert!(
+                    values(&hs, "access-control-allow-origin").is_empty(),
+                    "{ctx}"
+                );
+                assert!(values(&hs, "vary").iter().any(|v| v == "Origin"), "{ctx}");
+            }
+        }
+        // reject_disallowed
+        assert_eq!(get("/strict", bad_origin).0, 403, "{proto}");
+        assert_eq!(get("/strict", ok_origin).0, 200, "{proto}");
+        assert_eq!(get("/strict", &[]).0, 200, "{proto}");
+        // "*": どのオリジンにも `*`、Vary は付けない
+        let (_, hs) = get("/any", bad_origin);
+        assert_eq!(
+            values(&hs, "access-control-allow-origin"),
+            vec!["*".to_string()],
+            "{proto}"
+        );
+        assert!(values(&hs, "vary").is_empty(), "{proto} {hs:?}");
+        // CORS の無いルートは変わらない
+        let (st, hs) = get("/plain", ok_origin);
+        assert_eq!(st, 200);
+        assert!(
+            hs.iter().all(
+                |(n, _)| !n.to_ascii_lowercase().starts_with("access-control")
+                    && !n.eq_ignore_ascii_case("vary")
+            ),
+            "{proto} {hs:?}"
+        );
+    }
+}

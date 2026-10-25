@@ -121,6 +121,36 @@ impl Backend {
         }
     }
 
+    /// セキュリティ設定だけを差し替えた写し（F-273: CORS のオリジンごとの写しを設定ロード時に作る）。
+    /// 固定応答はセキュリティ設定をそのまま使う（CORS のヘッダは応答のヘッダへ組み込む）
+    pub fn with_security(&self, sec: Arc<SecurityConfig>) -> Backend {
+        match self {
+            Backend::Proxy(a, _, c, d, e, f) => {
+                Backend::Proxy(a.clone(), sec, c.clone(), d.clone(), e.clone(), f.clone())
+            }
+            Backend::MemoryFile(a, b, _, d) => {
+                Backend::MemoryFile(a.clone(), b.clone(), sec, d.clone())
+            }
+            Backend::SendFile(a, b, c, _, e, f, g, h, i) => Backend::SendFile(
+                a.clone(),
+                *b,
+                c.clone(),
+                sec,
+                e.clone(),
+                f.clone(),
+                g.clone(),
+                h.clone(),
+                i.clone(),
+            ),
+            Backend::Redirect(a, b, c, d, _) => {
+                Backend::Redirect(a.clone(), *b, *c, d.clone(), sec)
+            }
+            Backend::Respond(r) => Backend::Respond(r.clone()),
+            #[cfg(feature = "handler")]
+            Backend::Handler(a, _, c, d) => Backend::Handler(a.clone(), sec, c.clone(), d.clone()),
+        }
+    }
+
     /// このバックエンドに適用するWASMモジュール参照のリストを取得
     #[inline]
     /// F-43/F-148: WASM モジュールリストを Arc 共有で取得する（リクエストごとの deep copy 排除）。

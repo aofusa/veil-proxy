@@ -559,6 +559,8 @@ pub(crate) struct BackendTaskParams {
     /// F-171: 上流が HTTP/2（h2c）なら `Some`。このとき `request_head` は使わない。
     #[cfg(feature = "http2")]
     pub h2: Option<H2Upstream>,
+    /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273）。メインループが応答の head に足す
+    pub cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
 }
 
 /// F-171: HTTP/2 上流へ送る要求（HTTP/1.1 の `request_head` の代わり）。

@@ -523,6 +523,8 @@ pub(super) async fn transfer_https_response_with_compression(
                     modified_headers = new_header_lines.into_iter().flatten().collect();
                 }
 
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+                crate::route_cors::apply_h1(&mut modified_headers, security);
                 // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
                 let body_data = body_start.to_vec();
                 let write_result = timeout(
@@ -683,16 +685,26 @@ pub(super) async fn transfer_compressed_https_response(
         AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
             Some(compressed) => compressed,
             None => {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
         },
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -701,6 +713,7 @@ pub(super) async fn transfer_compressed_https_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
                     .await;
                 }
@@ -714,8 +727,13 @@ pub(super) async fn transfer_compressed_https_response(
             };
             let mut input = std::io::Cursor::new(&body_data);
             if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             compressed
         }
@@ -723,8 +741,13 @@ pub(super) async fn transfer_compressed_https_response(
             let level = Compression::new(compression.gzip_level);
             let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await;
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -733,6 +756,7 @@ pub(super) async fn transfer_compressed_https_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
                     .await;
                 }
@@ -776,9 +800,9 @@ pub(super) async fn transfer_compressed_https_response(
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
     _backend_wants_keep_alive: bool,
-    _security: &SecurityConfig,
+    security: &SecurityConfig,
 ) -> (u64, bool) {
-    transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
+    transfer_uncompressed_fallback(client_stream, original_headers, initial_body, security).await
 }
 
 /// HTTPSレスポンスボディを転送（圧縮なし）

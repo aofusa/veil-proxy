@@ -236,6 +236,8 @@ pub(super) fn build_h2_compressed_file_response(
             Bytes::copy_from_slice(v.as_bytes()),
         ));
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_bytes(&mut header_store, security);
     // F-94: HTTP/3 広告（Alt-Svc）
     if let Some(g) = get_alt_svc_guard() {
         header_store.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));

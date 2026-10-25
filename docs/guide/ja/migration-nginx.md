@@ -120,7 +120,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `auth_request`（サブリクエスト） | — | — TOML のルートには無い。ext_authz は予定（F-229）。JWT の検証は組み込み（`[route.jwt]`） |
 | `add_header Strict-Transport-Security ...` | `add_response_headers` | = |
 | `server_tokens off;` | 既定（`Server` ヘッダを出さない） | = `server_header_enabled` で出す |
-| CORS（`add_header Access-Control-*`） | `[route.traffic.cors]`（preflight）+ `add_response_headers` | = |
+| CORS（`add_header Access-Control-*`） | `[route.traffic.cors]`（preflight と実際の応答） | = |
 | `stream {}`（TCP・UDP） | `[[l4]]` | = TCP と UDP、ヘルスチェック付き（[l4-proxy.md](l4-proxy.md)） |
 | プロセスのサンドボックス（nginx には無い） | seccomp・Landlock・特権の降格・capsicum・pledge/unveil | veil だけ（[security.md](security.md)） |
 

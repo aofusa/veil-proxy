@@ -289,6 +289,9 @@ pub(crate) mod tls_writev;
 pub mod jwt_verify;
 #[doc(hidden)]
 pub mod route_traffic;
+// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273）
+#[doc(hidden)]
+pub mod route_cors;
 // HTTP/1.1・2・3 で共通の L7 の段（ルートの照合・セキュリティの検査。F-234）
 #[doc(hidden)]
 pub mod l7;
