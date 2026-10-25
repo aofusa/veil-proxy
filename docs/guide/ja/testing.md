@@ -237,15 +237,13 @@ veil-proxy/
 
 ### 継続的インテグレーション
 
-CI/CDパイプライン用の例：
+| workflow | いつ | 何を |
+|---|---|---|
+| `ci.yml` | `main` への push・pull request | rustfmt・メッセージの検査・clippy（`full` と `full,epoll`）・文書・feature の組み合わせのビルド・単体と統合の試験・Python の文書と Linux の wheel の `stubtest` |
+| `bindings.yml` | `main` への push・pull request のうち `src/`・`crates/`・`examples/api/`・`tests/api/`・マニフェスト・同梱の Swagger UI に触れるもの | macOS（arm64、`macos-14`）と Windows（x86_64、`windows-2022`）で `tests/api/library_e2e.sh c` と `python`、Linux（`ubuntu-24.04`）で `c`: C のライブラリ（`veil-capi`）と例、Python の wheel と単体・E2E（HTTP/1.1・h2c・ストリーミング・async・L4・gRPC・GraphQL） |
+| `examples-nightly.yml` | 毎晩 | 移行ガイドの nginx・Envoy との等価性、Grafana のダッシュボード |
+| `container-security-nightly.yml` | 毎晩 | ファジング・カオス・h2spec / h3spec・セキュリティの検査 |
+| `release.yml` | タグ | 全プラットフォームの wheel・crates・パッケージ・コンテナイメージ（draft のリリース） |
 
-```yaml
-# GitHub Actionsワークフローの例
-- name: テストを実行
-  run: |
-    cargo test --features http2 --all-targets
-    
-- name: E2Eテストを実行
-  run: |
-    ./tests/e2e_setup.sh test
-```
+E2E（`./tests/e2e_setup.sh test`）は CI ではなく手元で回す。`bindings` の job を手元で再現するには、その OS で同じ
+台本を回す（Windows は Git Bash から `PY3=python`、HTTP/2 の使える curl を `PATH` の先頭、NASM と MSVC を入れておく）。

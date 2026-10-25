@@ -1,0 +1,100 @@
+# F-275: Python の wheel と C のライブラリ（veil-capi）を macOS・Windows（と Linux の C）でビルドして試す。
+#
+# 手順は tests/api/library_e2e.sh の `c`・`python`（ローカル・検証機と同じもの）。リリースの時に初めて OS の差で
+# 壊れていると分かることを避ける（v0.9.0 の draft が作れなかった件と同じ形）。job 単位の `paths` は無いので
+# ci.yml とは別の workflow にした。
+name: bindings
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "examples/api/**"
+      - "tests/api/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "third_party/swagger-ui-dist/**"
+      - ".github/workflows/bindings.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "examples/api/**"
+      - "tests/api/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "third_party/swagger-ui-dist/**"
+      - ".github/workflows/bindings.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "3"
+
+jobs:
+  bindings:
+    name: bindings ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, runner: macos-14, modes: "c python" }
+          - { name: windows-x86_64, runner: windows-2022, modes: "c python" }
+          # Linux の wheel は ci.yml の python-docs（stubtest）が作る。ここでは C のライブラリと例だけ
+          - { name: linux-x86_64, runner: ubuntu-24.04, modes: "c" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang protobuf-compiler
+      # 試験の証明書（openssl req -addext）は LibreSSL（/usr/bin/openssl）だと rustls が受け付けない v1 の証明書になる
+      - name: install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+      # quiche の BoringSSL（boring-sys）と aws-lc-sys は Windows の x86_64 のアセンブリに NASM を使う。試験は h2c
+      # （--http2-prior-knowledge）を使うので、HTTP/2 の無い Git for Windows の curl の代わりに curl.se のビルドを先に置く
+      - name: install build deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm curl protoc -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: tests/api/library_e2e.sh ${{ matrix.modes }}
+        shell: bash
+        env:
+          PY3: python
+          PYTHON3: python
+        run: |
+          curl -V | sed -n 1p
+          openssl version
+          rc=0
+          for m in ${{ matrix.modes }}; do
+            echo "::group::library_e2e.sh $m"
+            tests/api/library_e2e.sh "$m" 2>&1 | tee "$RUNNER_TEMP/$m.log" || rc=1
+            echo "::endgroup::"
+            # 失敗した確認はログイン無しで読める注釈にも出す
+            { grep -E "FAIL|error:" "$RUNNER_TEMP/$m.log" || true; } | tail -30 | while IFS= read -r l; do echo "::error title=library_e2e $m::${l:0:900}"; done
+          done
+          exit $rc

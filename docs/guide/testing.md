@@ -229,15 +229,14 @@ veil-proxy/
 
 ### Continuous Integration
 
-For CI/CD pipelines:
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | push / pull request to `main` | rustfmt, message lint, clippy (`full` and `full,epoll`), docs, feature-matrix builds, unit and integration tests, the Python docs and `stubtest` on a Linux wheel |
+| `bindings.yml` | push / pull request to `main` that touches `src/`, `crates/`, `examples/api/`, `tests/api/`, the manifests or the bundled Swagger UI | `tests/api/library_e2e.sh c` and `python` on macOS (arm64, `macos-14`) and Windows (x86_64, `windows-2022`), and `c` on Linux (`ubuntu-24.04`): the C library (`veil-capi`) and its examples, the Python wheel with its unit tests and E2E (HTTP/1.1, h2c, streaming, async, L4, gRPC, GraphQL) |
+| `examples-nightly.yml` | nightly | migration-guide equivalence against nginx and Envoy, the Grafana dashboard |
+| `container-security-nightly.yml` | nightly | fuzzing, chaos, h2spec / h3spec, security scans |
+| `release.yml` | tag | wheels for every platform, crates, packages, container images (draft release) |
 
-```yaml
-# Example GitHub Actions workflow
-- name: Run tests
-  run: |
-    cargo test --features http2 --all-targets
-    
-- name: Run E2E tests
-  run: |
-    ./tests/e2e_setup.sh test
-```
+The E2E suite (`./tests/e2e_setup.sh test`) runs locally, not in CI. To reproduce a `bindings` job, run the same
+script on that OS (on Windows from Git Bash with `PY3=python`, an HTTP/2-capable curl first on `PATH`, NASM and MSVC
+installed).
