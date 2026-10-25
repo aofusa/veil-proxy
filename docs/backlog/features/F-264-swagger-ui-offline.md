@@ -1,0 +1,73 @@
+# F-264: Swagger UI を完全にオフラインで使えるようにする（資産をライブラリに同梱）
+
+**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+
+## 背景
+
+`/docs`（`[api] openapi_path`）の HTML は `swagger-ui-dist@5` の CSS・JS を **unpkg の CDN** から読む
+（`src/api/openapi.rs` `swagger_ui_html`）。版も `@5` で固定していない。
+
+- 閉じたネットワーク・社内環境・機内では `/docs` が真っ白になる（`docs/guide/library.md` の Limitations にも書いてある）。
+- 第三者の CDN のスクリプトを利用者のオリジンで実行する（SRI も無い）。CSP の `script-src 'self'` と両立しない。
+- Python（`veil-api`）の `/docs` も同じ Rust の経路で配る。
+- 同じ問題が GraphQL のサンプル（`examples/api/rust-graphql` の GraphiQL、`python-graphql`）にもある（[F-267](F-267-rust-kit-crate.md)・
+  [F-268](F-268-python-kit-fastapi-compat.md) の GraphQL で同じ方法で直す）。
+
+## 制約
+
+- ライブラリ利用時だけ（`openapi` feature）。本体（`full` 等）のバイナリには資産を 1 バイトも入れない
+  （`nonregression` に「`swagger-ui` の文字列が full バイナリに無い」検査を足す）。
+- 外部への通信を 0 にする（HTML・CSS・JS・フォント・画像・source map の参照を含めて）。
+
+## 設計
+
+### 1. 資産の同梱
+
+- `third_party/swagger-ui-dist/<版>/` に `swagger-ui-bundle.js`・`swagger-ui.css`・`LICENSE`（Apache-2.0）・`NOTICE`・
+  取得元と sha256 を書いた `README.veil.md` を置く（`favicon` は同梱しない、または SVG 1 個）。版は 5.x の最新の安定版に固定する。
+  - `swagger-ui-standalone-preset.js` は使わない（トップバーの URL 入力は外部の定義を読むためのもので不要）。
+  - バンドルの末尾の `//# sourceMappingURL=` は取り除く（ブラウザの開発者ツールが外へ取りに行かないように。取り除いたことを README に書く）。
+- ビルド時に **gzip と brotli で事前圧縮** したものだけを `include_bytes!` で持つ（`build.rs` で作るのではなく、更新の台本が作って
+  リポジトリに入れる。ビルドの依存と時間を増やさない）。生の JS は持たない（約 1.4 MB → 圧縮後 約 350 KB / 300 KB）。
+  `Accept-Encoding` が gzip も br も受けないクライアントには、起動時に 1 回だけ解凍した `Bytes` を遅延生成して返す
+  （`OnceLock`。最初の要求だけ解凍の費用。`compression` feature の flate2 を使い、無いビルドでは gzip の展開だけ小さな実装を使う）。
+- 配信: `/docs/swagger-ui-bundle.js`・`/docs/swagger-ui.css`（`openapi_path` の下）を組み込みのハンドラで返す。
+  `Content-Type`・`Content-Encoding`・`Vary: Accept-Encoding`・`ETag`（版 + sha256）・`Cache-Control: public, max-age=31536000, immutable`
+  （URL に版を含める: `/docs/assets/5.x.y/swagger-ui-bundle.js`）。本文は `Bytes::from_static`（複製しない）。
+- HTML: 同じオリジンの資産を読む形にし、`Content-Security-Policy: default-src 'none'; script-src 'self' 'sha256-<初期化スクリプトのハッシュ>'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:` を付ける。
+  初期化スクリプトのハッシュは HTML を作るとき（起動・リロード時）に計算する（タイトル・JSON の URL を埋め込むため）。
+- `[api] openapi_docs_ui`（新設）: `"embedded"`（既定）・`"cdn"`（今の挙動。資産を持ちたくない人向けに `cdn_url` を指定可、
+  既定は版を固定した jsDelivr）・`"off"`（`/openapi.json` だけ）。Cargo feature `openapi-ui-embedded`（`openapi` に既定で含める）を
+  外せば資産を持たないビルドもできる（その場合 `"embedded"` は設定のエラー）。
+
+### 2. 更新の手順
+
+- `tools/release/update-swagger-ui.sh <版>`: npm のレジストリから tarball を取り、npm の `integrity`（sha512）で検査し、
+  2 ファイルを取り出し、source map の参照を外し、gz・br を作り、`README.veil.md` の版・sha256 を更新する。
+- 脆弱性の検査: `grype`・Trivy はバイナリに埋めた JS を見ないので、`tools/container_security` の依存の検査に
+  「`third_party/swagger-ui-dist` の版を npm の advisory（`npm audit` 相当の API）で照合する」項目を足す（AGENTS.md の
+  「直す版の無いものも失敗」の方針に合わせる）。
+- `cargo-deny` の licenses に Apache-2.0 の第三者資産として記録する（crate ではないので `README.veil.md` と `NOTICE` で管理）。
+
+### 3. Python
+
+- `veil-api` の wheel は同じ Rust の拡張なので、追加の作業は無い（wheel が約 0.7 MB 増える）。`veil.run(openapi_docs_ui="embedded")`
+  でも選べるようにする。
+
+## 試験
+
+- 単体: HTML に外部の URL（`http://`・`https://`・`//`）が 1 個も無い、CSP のハッシュが初期化スクリプトと一致、
+  資産の sha256 が `README.veil.md` と一致、`Accept-Encoding` ごとの応答（br・gzip・無し）と `ETag` / `If-None-Match` の 304。
+- E2E: ネットワークを切ったコンテナ（`--network none` + ループバック）で Rust・Python のアプリを起動し、ヘッドレスの Chromium
+  （Playwright。`tools/` の試験用だけ）で `/docs` を開いてエラー 0・外部への要求 0・操作一覧が描画されることを確かめる。
+- 非退行: `nonregression` に `swagger-ui` の文字列の検査。`--no-default-features --features handler,openapi`（`openapi-ui-embedded` 無し）がビルドできる。
+
+## 文書
+
+- `docs/guide/library.md`（英日）: `[api] openapi_docs_ui` の表、Limitations の CDN の行を削除、CSP の説明。
+- `crates/veil-python/docs/configuration.md`（英日）。`examples/config.toml` の `[api]`。
+
+## 受け入れ条件
+
+- ネットワークの無い環境で `/docs` が完全に動く（Rust・Python）。本体のバイナリに資産が入らない。
+- 文書（英日）・`backlog.md` が更新されている。
