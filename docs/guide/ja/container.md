@@ -106,6 +106,11 @@ docker run --rm -p 8080:8080 -p 443:443/tcp -p 443:443/udp \
 
 証明書の再読み込みと ACME は [TLS](tls.md)、HTTP/3 は [プロトコル](protocols.md) を参照してください。
 
+イメージの既定の設定は `[tls_client] ca = "builtin"` です。外向きの TLS（HTTPS の上流、ヘルスチェックなど）は
+イメージの OS のストアではなく veil に組み込んだ CA 一覧で検証します。自前の CA を信頼するときは PEM ファイルを
+足してください（例: `ca = ["builtin", "/etc/veil/internal-ca.pem"]`、[上流の信頼アンカー](tls.md#上流の信頼アンカー)）。
+パッケージ・アーカイブの既定は `"system"` です。
+
 ## コンテナの運用
 
 - **リロード**: `docker kill -s HUP <container>` で、接続を切らずに設定と証明書を読み直します（[起動と運用](running.md)）。

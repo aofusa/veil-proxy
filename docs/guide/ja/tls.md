@@ -188,7 +188,7 @@ client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # 任意�
 | キー | 意味 |
 |------|------|
 | `tls_client_cert` / `tls_client_key` | 上流へ出すクライアント証明書と秘密鍵（PEM、組で指定） |
-| `tls_ca` | 上流の証明書の信頼アンカー（PEM。省略時は既定の公開 CA） |
+| `tls_ca` | 上流の証明書の信頼アンカー。`"builtin"`・`"system"`・PEM のパス、またはその配列（[上流の信頼アンカー](#上流の信頼アンカー)）。省略時は `[tls_client] ca` |
 | `expected_san` | 上流の証明書の SAN の期待値（DNS 名・URI・IP。どれかが一致すれば受ける）。指定するとホスト名の照合の代わりにこれを使う（SPIFFE ID 等） |
 
 ```toml
@@ -203,6 +203,58 @@ expected_san    = ["spiffe://cluster.local/ns/default/sa/backend"]
 TLS の設定は設定のロード時に作る（接続ごとには作らない）。プールの接続はこの設定ごとに分けるので、クライアント
 証明書の違う上流が接続を共有することはない。証明書のファイルを差し替えたら `SIGHUP` の設定リロードで反映する。
 `tls_insecure` より優先する。
+
+### 上流の信頼アンカー
+
+veil が TLS のクライアントになる全経路（HTTPS の上流、ヘルスチェック、VDS・ACME、Proxy-Wasm の
+`dispatch_http_call` と gRPC 呼び出し）は、相手の証明書を信頼アンカーで検証する。出どころは次のどれか。
+
+| 値 | 意味 |
+|----|------|
+| `"builtin"` | veil に組み込んだ CA 一覧（webpki-roots。既定） |
+| `"system"` | OS の信頼ストア |
+| それ以外 | PEM ファイルのパス。`system`・`builtin` という名前のファイルを指すときは `./system` と書く |
+
+文字列 1 個か、文字列の配列（出どころの和集合）で書く。
+
+```toml
+# 外向きの TLS 全体の既定（tls_ca の無い上流、ヘルスチェック、VDS・ACME、Wasm の呼び出し）
+[tls_client]
+ca = "system"                              # または ["system", "/etc/veil/internal-ca.pem"]
+
+# 上流ごと: [tls_client] ca を置き換える（足し合わせない。足したいときは両方を配列に書く）
+[upstreams.billing]
+servers = ["https://billing.internal:8443"]
+tls_ca = ["system", "/etc/veil/billing-ca.pem"]
+```
+
+`[vds] ca_cert` は今までどおり `[tls_client] ca` に足す。`tls_insecure = true` はすべてに優先する。
+`[tls_client]` を書かなければ何も変わらない（組み込みの CA を使う）。
+
+OS の信頼ストアの読み先:
+
+| OS | 読み先 |
+|----|--------|
+| Linux | `SSL_CERT_FILE` / `SSL_CERT_DIR`、無ければ通常のバンドルの場所（`/etc/ssl/certs/ca-certificates.crt`・`/etc/pki/tls/certs/ca-bundle.crt`・`/etc/ssl/cert.pem` など） |
+| FreeBSD / OpenBSD / NetBSD | `/etc/ssl/cert.pem`・`/usr/local/share/certs/ca-root-nss.crt`・`/etc/openssl/certs/` |
+| macOS | Security.framework（システム・管理者のキーチェーン。信頼設定を反映） |
+| Windows | `ROOT` 証明書ストア（ローカルマシンと現在のユーザー） |
+
+- ストアは起動時に、サンドボックス（seccomp・Landlock・capsicum・pledge/unveil・Seatbelt・chroot）を掛ける前に
+  1 回だけ読み、プロセスの終わりまで持つ。`landlock_read_paths` に足す必要はない。`SIGHUP` のリロードでは
+  読み直さない。OS が CA を更新したら veil を再起動する。
+- 起動時に `"system"` を使っていなかった設定へ、リロードで `"system"` を足したとき: サンドボックスが無効なら
+  そこで読む。有効ならリロードを拒否してエラーにする（再起動が要る）。黙って組み込みの CA に切り替えることはない。
+- 使える証明書が 0 個（ストアが無い場合を含む）は設定のエラー（`veil -t` も失敗する）。解析できない証明書は
+  件数つきの警告を出して飛ばす。起動時に読み込んだ件数を `info` で 1 行出す。
+- `[tls_client] ca`（や、それが指す PEM）を変えてリロードすると、新しい接続から新しい信頼アンカーを使う。
+  古いもので確立したプールの接続は使い回さない。
+- パッケージ・アーカイブの既定の設定は `ca = "system"`。コンテナイメージと Helm チャートは `ca = "builtin"`
+  （イメージは OS のストアを当てにしない）。既に使っている設定ファイルは書き換えない。
+- `tls_ca` にディレクトリ無しで `system`・`builtin` という名前だけを書いていた場合は、キーワードの意味になる。
+  ファイルを指すなら `./system` と書く。
+- Rust・Python の API ライブラリの既定は `"builtin"`。`tls_client.ca` で選ぶ
+  （`App::builder().set("tls_client.ca", "system")`、`overrides={"tls_client.ca": "system"}`）。
 
 ## TLS証明書ホットリロード
 

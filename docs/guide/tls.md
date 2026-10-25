@@ -192,7 +192,7 @@ client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # optional
 | Key | Meaning |
 |-----|---------|
 | `tls_client_cert` / `tls_client_key` | client certificate and key (PEM) presented to the upstream; set both |
-| `tls_ca` | trust anchors (PEM) for the upstream certificate; the public roots when omitted |
+| `tls_ca` | trust anchors for the upstream certificate: `"builtin"`, `"system"`, a PEM path, or an array of them (see [Upstream trust anchors](#upstream-trust-anchors)); `[tls_client] ca` when omitted |
 | `expected_san` | accepted SANs of the upstream certificate (DNS name, URI or IP; any match). When set, it replaces the host name check, e.g. for SPIFFE IDs |
 
 ```toml
@@ -207,6 +207,60 @@ expected_san    = ["spiffe://cluster.local/ns/default/sa/backend"]
 The TLS configuration is built when the configuration is loaded (not per connection). Pooled connections are
 keyed by it, so upstreams with different client certificates never share a connection. A `SIGHUP` reload picks up
 replaced certificate files. These keys take precedence over `tls_insecure`.
+
+### Upstream trust anchors
+
+veil verifies the certificates of every TLS server it connects to as a client (HTTPS upstreams, health checks,
+VDS/ACME, `dispatch_http_call` and gRPC calls from Proxy-Wasm) against a set of trust anchors. A source is one of:
+
+| Value | Meaning |
+|-------|---------|
+| `"builtin"` | the CA list compiled into veil (webpki-roots; the default) |
+| `"system"` | the OS trust store |
+| anything else | the path of a PEM file. For a file that is really named `system` or `builtin`, write `./system` |
+
+Give one string or an array (the union of the sources).
+
+```toml
+# Default for all outgoing TLS (upstreams without tls_ca, health checks, VDS/ACME, Wasm calls)
+[tls_client]
+ca = "system"                              # or ["system", "/etc/veil/internal-ca.pem"]
+
+# Per upstream: replaces [tls_client] ca (it is not added; list both to combine)
+[upstreams.billing]
+servers = ["https://billing.internal:8443"]
+tls_ca = ["system", "/etc/veil/billing-ca.pem"]
+```
+
+`[vds] ca_cert` is still added on top of `[tls_client] ca`. `tls_insecure = true` still wins over everything.
+Without `[tls_client]` nothing changes: the built-in roots are used.
+
+Where the OS trust store comes from:
+
+| OS | Source |
+|----|--------|
+| Linux | `SSL_CERT_FILE` / `SSL_CERT_DIR`, otherwise the usual bundle locations (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, ...) |
+| FreeBSD / OpenBSD / NetBSD | `/etc/ssl/cert.pem`, `/usr/local/share/certs/ca-root-nss.crt`, `/etc/openssl/certs/` |
+| macOS | Security.framework (system and admin keychains, including trust settings) |
+| Windows | the `ROOT` certificate store (machine and current user) |
+
+- The store is read once, at startup, before the sandbox (seccomp, Landlock, capsicum, pledge/unveil, Seatbelt,
+  chroot) is applied, and kept until the process exits. No `landlock_read_paths` entry is needed. A `SIGHUP`
+  reload does not read it again: restart veil after the OS updates its CA certificates.
+- If a reload adds `"system"` to a configuration that did not use it at startup, veil reads the store when no
+  sandbox is active. With a sandbox active the reload is rejected with an error (restart veil); it never silently
+  falls back to the built-in roots.
+- Zero usable certificates (or no store at all) is a configuration error (`veil -t` fails). Certificates that cannot
+  be parsed are skipped with a warning that shows the count. One `info` line at startup shows how many were loaded.
+- Changing `[tls_client] ca` (or a PEM file it names) and reloading makes new connections use the new anchors;
+  pooled connections made with the old ones are not reused.
+- The default configuration shipped in packages and archives sets `ca = "system"`. The container image and the Helm
+  chart set `ca = "builtin"`, because an image does not depend on the OS store. Existing configuration files are
+  never rewritten.
+- A `tls_ca` that names a file called exactly `system` or `builtin` (no directory) now means the keyword; write
+  `./system` to keep the file.
+- The Rust and Python API libraries default to `"builtin"`; choose another with `tls_client.ca`
+  (`App::builder().set("tls_client.ca", "system")`, `overrides={"tls_client.ca": "system"}`).
 
 ## TLS Certificate Hot Reload
 

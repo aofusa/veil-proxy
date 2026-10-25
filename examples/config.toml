@@ -323,6 +323,19 @@ level = "info"
 
 
 # ==========================================
+# 外向きの TLS の信頼アンカー（F-259）
+# ==========================================
+# veil が TLS のクライアントになる全経路（tls_ca を書かない HTTPS 上流、ヘルスチェック、VDS・ACME、
+# Proxy-Wasm の dispatch_http_call と gRPC 呼び出し）の既定の信頼アンカー。
+#   "builtin": veil に組み込んだ公開 CA 一覧（webpki-roots。既定。書かなければこれ）
+#   "system" : OS の信頼ストア（起動時に 1 回だけ読む。サンドボックスの前。リロードでは読み直さない）
+#   それ以外 : PEM ファイルのパス（ファイル名が system・builtin のときは "./system"）
+# 文字列 1 個か配列（和集合）。上流ごとの tls_ca はこれを置き換える。[vds] ca_cert はこれに足す。
+# パッケージ・アーカイブの既定の設定は "system"、コンテナは "builtin"
+# [tls_client]
+# ca = "system"                            # 例: ["system", "/etc/veil/internal-ca.pem"]
+
+# ==========================================
 # TLS設定
 # ==========================================
 # 注意: [tls] が必要なのは TLS のリスナー（[server] listen）または HTTP/3（[http3] enabled = true）が
@@ -1804,13 +1817,15 @@ revalidate_mtime = false
 #
 # # 上流の mTLS（F-217）。Proxy の action（type = "Proxy"）にも同じキーを書ける
 # #   tls_client_cert / tls_client_key: 上流へ出すクライアント証明書と秘密鍵（PEM、組で指定）
-# #   tls_ca:       上流の証明書の信頼アンカー（PEM。省略時は既定の公開 CA）
+# #   tls_ca:       上流の証明書の信頼アンカー（F-259）。"builtin"（組み込みの公開 CA）・"system"（OS の信頼ストア）・
+# #                 PEM のパスのどれか、またはその配列（和集合）。書くと [tls_client] ca を置き換える。
+# #                 省略時は [tls_client] ca。ファイル名が system・builtin のときは "./system" と書く
 # #   expected_san: 上流の証明書の SAN の期待値（DNS 名・URI・IP。どれかが一致すれば受ける。
 # #                 指定するとホスト名の代わりにこれで照合する。SPIFFE ID 等）
 # # 設定のロード時に読み込む（証明書の差し替えは SIGHUP の設定リロードで反映）。tls_insecure より優先
 # tls_client_cert = "/etc/veil/upstream-client.pem"
 # tls_client_key = "/etc/veil/upstream-client.key"
-# tls_ca = "/etc/veil/upstream-ca.pem"
+# tls_ca = "/etc/veil/upstream-ca.pem"       # 例: tls_ca = "system" / ["system", "/etc/veil/upstream-ca.pem"]
 # expected_san = ["spiffe://cluster.local/ns/default/sa/backend"]
 #
 # # HTTPS 上流で HTTP/2 を使うか（F-175、デフォルト: "auto"）

@@ -1,6 +1,6 @@
 # F-259: 外向きの TLS の信頼アンカーに OS の CA 証明書を使えるようにする（`tls_ca = "system"`）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（2026-10-25 起票・設計・実装。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景
 
@@ -163,3 +163,40 @@ pub fn default_roots() -> Arc<RootCertStore>;
 - 既定の設定は配布物で `"system"`、コンテナで `"builtin"`。設定を書かない人の挙動は変わらない。
 - 各 OS のサンドボックスを有効にした既定の設定で起動・リロードできる。
 - 文書（英日）・`examples/config.toml`・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+実装した。主な変更:
+
+- `src/trust_store.rs` 新設: `CaSource {Builtin, System, Pem}`・`CaSources`（serde untagged で文字列 / 配列。空文字列は未設定、`./system` はパス）・
+  `[tls_client]` の `TlsClientConfig`・`roots()`・既定（`resolve_default` / `commit_default` / `set_default` / `default_roots`）・
+  プールの鍵のタグ `verify_tag()`・世代 `generation()`・ヘルスチェック用 `probe_client_config()`。
+  OS のストアは `rustls-native-certs` 0.8.4（Cargo.lock の既存の版。常に依存）で `OnceLock` に 1 回だけ読む。
+- 全経路を `default_roots()` に切り替え: `ktls_rustls::client_config`・`simple_tls::default_client_config`・`upstream_tls::build`
+  （`tls_ca` を書かない mTLS 設定も既定を使う）・ヘルスチェックの 2 か所（プローブごとの `RootCertStore` 作成をやめ、
+  既定が変わったときだけ作る `Arc<ClientConfig>` を使う）・`ctrl_http`（`[vds] ca_cert` は既定に足す）・Wasm の 2 か所。
+- `UpstreamTlsSettings::tls_ca` は `CaSources`。`intern` の鍵は PEM の中身と既定の世代を含む。
+- `config` に `tls_client` を追加。`load_config`（起動時、サンドボックスの前）で既定を解決し、
+  `entry.rs` が設定のロード直後にサンドボックスを掛ける設定かを `trust_store::set_sandboxed` に渡す。
+- `packaging/defaults/config.toml.in` に `[tls_client] ca = @CLIENT_CA@`、`render-defaults.sh` の経路表に列を追加
+  （`container` = `"builtin"`、他 = `"system"`）。`packaging/container/config.toml` を再生成。`--check` は全経路 ok。
+- 文書（英日）: `docs/guide/tls.md`・`docs/guide/ja/tls.md` の「Upstream trust anchors」、`container.md`（英日）、`examples/config.toml`。
+
+### 決定事項
+
+- 読む契機は「`"system"` が初めて解決された時」とし、設定全体を走査して `system` を探す処理は置かなかった（起動時の
+  `load_config` が `[tls_client]`・上流・ルートの `intern` をすべて通るため同じ結果になる）。リロードで初めて現れたとき、
+  サンドボックスが有効（seccomp・Landlock・capsicum・unveil・pledge・Seatbelt・chroot のどれか）ならエラーでリロードを拒否し、
+  無効なら読む。
+- 既定が変わったリロード後のコネクタ: 世代が 0 の間は既存のスレッドローカルをそのまま使い（ホットパスの追加は世代の読み出し 1 回）、
+  1 以上になったら世代ごとにスレッド内で作り直す（`config/tls_connector.rs` の `verify_connector`）。プールのタグは
+  `verify` → `vf<世代>`。
+- リロードの途中で後続の手順が失敗した場合でも、`[tls_client] ca` だけは新しい値が残る（`tls_ca` を書かない mTLS の
+  `intern` が新しい既定を使うため、既定の反映を先にした）。
+- `tls_ca = "builtin"` 単独を `Verify` へ寄せる最適化はしていない（`Custom` として同じ `RootCertStore` を共有するのでプールが分かれるだけ）。
+- ヘルスチェックの同期プローブは今までどおり上流の `tls_ca` ではなく既定（`[tls_client] ca`）で検証する。
+- NetBSD の `/etc/openssl/certs/` は openssl-probe 0.2.1 の候補に含まれていることをソースで確認した（実機では未確認）。
+- 試験は `trust_store` の単体（解析・`./system`・和集合・0 個のエラー・`SSL_CERT_FILE` を子プロセスで読む）と、
+  `tests/integration_tests.rs` の `f259_trust_store`（生成した CA が署名した HTTPS サーバに対し builtin は失敗、
+  PEM・和集合・子プロセスの `SSL_CERT_FILE` + `system` は 200）。`veil` の全プロセスを立てる E2E（上流の `tls_ca = "builtin"`
+  による上書き、ヘルスチェック・Wasm の同条件）と、各 OS のサンドボックス・Windows 実機の試験は未実施。

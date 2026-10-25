@@ -108,6 +108,11 @@ docker run --rm -p 8080:8080 -p 443:443/tcp -p 443:443/udp \
 
 See [TLS](tls.md) for certificate reload and ACME, and [Protocols](protocols.md) for HTTP/3.
 
+The image's default configuration sets `[tls_client] ca = "builtin"`: outgoing TLS (HTTPS upstreams, health
+checks, ...) is verified against the CA list built into veil, not the OS store of the image. To trust your own CA,
+add its PEM file, e.g. `ca = ["builtin", "/etc/veil/internal-ca.pem"]`
+([Upstream trust anchors](tls.md#upstream-trust-anchors)). Packages and archives use `"system"` instead.
+
 ## Operating the container
 
 - **Reload** the configuration and certificates without dropping connections:
