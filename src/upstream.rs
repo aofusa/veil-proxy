@@ -927,7 +927,38 @@ fn find_backend_inner(
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
-    let optimized_router = &config.optimized_router;
+    select_route(
+        &config.optimized_router,
+        host,
+        path,
+        method,
+        headers,
+        raw_query,
+        source_ip,
+        routes,
+        upstream_groups,
+        draw,
+    )
+}
+
+/// ルートの照合（`optimized_router` は `routes` から作ったもの）。
+///
+/// ルートのキャッシュ（Phase 4）の鍵は host・path・method・送信元だけなので、当たったルートより前に
+/// header・query の条件（鍵に入らない動的な条件）で外れた候補があったときはキャッシュに入れない
+/// （入れると、その条件に合う次の要求も後ろのルートに行く。B-170）。
+#[allow(clippy::too_many_arguments)]
+fn select_route(
+    optimized_router: &routing::OptimizedRouter,
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
+    source_ip: &SocketAddr,
+    routes: &[Route],
+    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    draw: bool,
+) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 引数の UTF-8 変換は debug が有効なときだけ評価する（以前は毎リクエスト 3 回
     // from_utf8 を計算していた。ftlog のマクロは無効レベルでは引数を評価しない）。
     debug!(
@@ -1001,13 +1032,17 @@ fn find_backend_inner(
         "[Routing] Candidates for host='{}' path='{}': {:?}",
         host_str, path_str, candidates
     );
+    // 前の候補が動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-170）
+    let mut dynamic_before = false;
     for &route_idx in &candidates {
         if let Some(route) = routes.get(route_idx) {
             // 残りの条件（header, method, query）を評価
             let matched =
                 matches_remaining_conditions(&route.conditions, method, headers, raw_query);
 
-            if matched {
+            if !matched {
+                dynamic_before |= has_uncached_conditions(&route.conditions);
+            } else {
                 debug!(
                     "[Routing] Matched route index: {} (path={:?} action={:?})",
                     route_idx, route.conditions.path, route.action
@@ -1022,8 +1057,10 @@ fn find_backend_inner(
                         let compression = route.resolved_compression.clone().unwrap_or_else(|| {
                             Arc::new(route.compression.clone().unwrap_or_default())
                         });
-                        // キャッシュに保存
-                        optimized_router.cache_result(cache_key, Some(route_idx));
+                        // キャッシュに保存（前の候補が動的な条件で外れたときは入れない。B-170）
+                        if !dynamic_before {
+                            optimized_router.cache_result(cache_key, Some(route_idx));
+                        }
                         return Some((prefix, backend, compression));
                     }
                     Err(e) => {
@@ -1031,6 +1068,7 @@ fn find_backend_inner(
                             "Route[{}] load_backend failed: {} (action={:?})",
                             route_idx, e, route.action
                         );
+                        dynamic_before = true;
                         continue;
                     }
                 }
@@ -1077,6 +1115,12 @@ pub(crate) fn extract_path_prefix(route: &Route) -> Box<[u8]> {
 #[inline]
 pub(crate) fn extract_path_prefix_arc(route: &Route) -> Arc<[u8]> {
     extract_path_prefix(route).into()
+}
+
+/// ルートのキャッシュの鍵（host・path・method・送信元）に入らない条件を持つか（B-170）
+#[inline]
+fn has_uncached_conditions(conditions: &RouteConditions) -> bool {
+    conditions.header.is_some() || conditions.query.is_some()
 }
 
 /// 残りの条件（host/path/source_ip以外）のみをチェック
@@ -1136,6 +1180,9 @@ pub(crate) fn find_backend_linear(
     draw: bool,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 配列の順序で評価（first-match）
+    // 前のルートが動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-170。
+    // host・path で外れたかは見ず、条件を持つだけで数える。安全網の経路なので控えめに倒す）
+    let mut dynamic_before = false;
     for (i, route) in routes.iter().enumerate() {
         let matched = matches_conditions(
             &route.conditions,
@@ -1147,7 +1194,9 @@ pub(crate) fn find_backend_linear(
             source_ip,
         );
 
-        if matched {
+        if !matched {
+            dynamic_before |= has_uncached_conditions(&route.conditions);
+        } else {
             debug!(
                 "Route[{}] matched (linear fallback): host={:?} path={:?} method={:?}",
                 i, route.conditions.host, route.conditions.path, route.conditions.method
@@ -1163,8 +1212,10 @@ pub(crate) fn find_backend_linear(
                         .resolved_compression
                         .clone()
                         .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
-                    // キャッシュに保存
-                    optimized_router.cache_result(*cache_key, Some(i));
+                    // キャッシュに保存（前のルートが動的な条件で外れたときは入れない。B-170）
+                    if !dynamic_before {
+                        optimized_router.cache_result(*cache_key, Some(i));
+                    }
                     return Some((prefix, backend, compression));
                 }
                 Err(e) => {
@@ -1172,6 +1223,7 @@ pub(crate) fn find_backend_linear(
                         "Route[{}] load_backend failed: {} (action={:?})",
                         i, e, route.action
                     );
+                    dynamic_before = true;
                     continue;
                 }
             }
@@ -1339,6 +1391,48 @@ mod tests {
             b"",
             &ip
         ));
+    }
+
+    /// B-170: 前にある header・query 条件のルートを、後ろのルートのキャッシュが飛ばさない。
+    #[test]
+    fn test_b170_route_cache_keeps_earlier_dynamic_routes() {
+        let route = |cond: &str, url: &str| -> Route {
+            toml::from_str(&format!(
+                "conditions = {{ path = \"/a\" {cond} }}\naction = {{ type = \"Redirect\", redirect_url = \"{url}\", redirect_status = 302, preserve_path = false }}"
+            ))
+            .unwrap()
+        };
+        let routes = vec![
+            route(r#", header = { "x-mode" = "fresh" }"#, "https://header/"),
+            route(r#", query = { "v" = "1" }"#, "https://query/"),
+            route("", "https://plain/"),
+        ];
+        let mut router = routing::OptimizedRouter::with_cache_capacity(16);
+        for (i, r) in routes.iter().enumerate() {
+            router.add_route(i, None, r.conditions.path.as_deref(), None);
+        }
+        router.finalize();
+        let groups = Arc::new(HashMap::new());
+        let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let pick = |headers: &[(&[u8], &[u8])], query: &[u8]| -> String {
+            let (_, b, _) = select_route(
+                &router, b"h", b"/a", b"GET", headers, query, &ip, &routes, &groups, false,
+            )
+            .expect("a route matches");
+            match b {
+                Backend::Redirect(url, ..) => url.to_string(),
+                _ => unreachable!("only Redirect routes"),
+            }
+        };
+        let hdr: &[(&[u8], &[u8])] = &[(b"x-mode", b"fresh")];
+        for _ in 0..3 {
+            assert_eq!(pick(&[], b""), "https://plain/");
+            assert_eq!(pick(hdr, b""), "https://header/");
+            assert_eq!(pick(&[], b"v=1"), "https://query/");
+        }
+        // 当たったルートより前に動的な条件の候補が無いとき（1 つ目のルート）は今までどおりキャッシュに入る
+        let key = routing::RouteCacheKey::new(b"h", b"/a", b"GET", &ip);
+        assert_eq!(router.try_cache(&key), Some(Some(0)));
     }
 
     // ====================

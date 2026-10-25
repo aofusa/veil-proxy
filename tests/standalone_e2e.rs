@@ -1712,6 +1712,18 @@ path = "{www}"
 /// HTTP/3 で要求を 1 つ送り、(状態コード, 本文) を返す（F-234 のプロトコルの行列の試験）。
 #[cfg(feature = "http3")]
 fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    h3_request_with_headers(port, method, path, &[], body)
+}
+
+/// [`h3_request`] に要求ヘッダを足したもの（B-170）。
+#[cfg(feature = "http3")]
+fn h3_request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     use bytes::Buf;
     use std::sync::Arc;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1739,11 +1751,13 @@ fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>
         let drive = tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
-        let req = http::Request::builder()
+        let mut req = http::Request::builder()
             .method(method)
-            .uri(format!("https://localhost:{port}{path}"))
-            .body(())
-            .unwrap();
+            .uri(format!("https://localhost:{port}{path}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = req.body(()).unwrap();
         let mut stream = send.send_request(req).await.unwrap();
         if !body.is_empty() {
             stream
@@ -3066,5 +3080,120 @@ url = "http://127.0.0.1:{echo}"
         let r = http1_request(port, "GET", "/fresh/baseline11?a=4", &[], b"").unwrap();
         assert_eq!(r.text(), "4", "{}", veil.log());
         assert_eq!(seq(&r), (1, 1), "{}", veil.log());
+    }
+}
+
+// ===================== B-170 =====================
+
+/// ルートのキャッシュが、前にある header・query 条件のルートを飛ばさない（B-170）。同じ path の 3 つのルート
+/// （header 条件・query 条件・条件なし）へ、条件なしの要求を先に送ってから条件に合う要求を送り、first-match の
+/// とおり前のルートに行くことを HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。
+#[test]
+fn b170_route_cache_keeps_earlier_header_and_query_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/a"
+header = {{ "x-mode" = "fresh" }}
+[route.action]
+type = "Respond"
+body = "header"
+
+[[route]]
+[route.conditions]
+path = "/a"
+query = {{ "v" = "1" }}
+[route.action]
+type = "Respond"
+body = "query"
+
+[[route]]
+[route.conditions]
+path = "/a"
+[route.action]
+type = "Respond"
+body = "plain"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<u8>) + 'a>;
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let r = http1_request(port, "GET", p, h, b"").unwrap();
+                (r.status, r.body)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let (st, _, body) = h2_get_full(port, false, p, h);
+                (st, body)
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let (st, _, body) = h2_get_full(tls_port, true, p, h);
+                (st, body)
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str, h: &[(&str, &str)]| h3_request_with_headers(tls_port, "GET", p, h, b"")),
+    ));
+
+    for (proto, get) in &protocols {
+        for round in 0..3 {
+            for (path, headers, want) in [
+                ("/a", &[][..], "plain"),
+                ("/a", &[("x-mode", "fresh")][..], "header"),
+                ("/a?v=1", &[][..], "query"),
+                ("/a?v=2", &[("x-mode", "stale")][..], "plain"),
+            ] {
+                let (st, body) = get(path, headers);
+                assert_eq!(st, 200, "{proto} {path} {headers:?}\n{}", veil.log());
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    want,
+                    "{proto} round {round}: {path} {headers:?}"
+                );
+            }
+        }
     }
 }
