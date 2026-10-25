@@ -30,5 +30,5 @@ packages), runs `make makesum` (which writes `distinfo`), installs the package, 
 
 - FreeBSD: a new-port report in Bugzilla (Ports & Packages) with the port directory and `distinfo`.
 - OpenBSD: a tarball of the port to ports@openbsd.org. Register the `_veil` user and group in
-  `infrastructure/db/user.list` (the template uses 937; pick a free number).
+  `infrastructure/db/user.list` (numbers are given in order; the template uses 906, the next one in October 2026. Use the next free one when submitting).
 - NetBSD: pkgsrc-wip first (`wip/veil`), then pkgsrc.

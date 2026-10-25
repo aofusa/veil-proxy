@@ -18,8 +18,9 @@ import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "packaging", "bsd", "ports")
-# OpenBSD の _veil の uid/gid。ports の infrastructure/db/user.list に登録するとき（提出のとき）に空いている番号へ直す
-OPENBSD_UID = "937"
+# OpenBSD の _veil の uid/gid。ports の infrastructure/db/user.list は番号を順に振る（2026-10 の -current の最後は 905）。
+# 提出のときに、その時点の次の番号へ直す
+OPENBSD_UID = "906"
 
 
 def crates():
