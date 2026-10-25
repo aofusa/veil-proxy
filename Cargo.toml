@@ -71,6 +71,8 @@ include = [
     "/Cargo.toml",
     "/crates/README.crates-io.md",
     "/LICENSE*",
+    # F-264: ライブラリの /docs が同梱する Swagger UI（openapi-ui-embedded）
+    "/third_party/swagger-ui-dist/**",
 ]
 build = "build.rs"
 
@@ -394,6 +396,9 @@ tower-compat = [
 macro = ["handler", "dep:veil-macros"]
 # マクロのメタデータからの OpenAPI 3.1 生成・Swagger UI（F-189）
 openapi = ["handler", "macro"]
+# `/docs` の Swagger UI の資産（swagger-ui-dist、third_party/swagger-ui-dist）をライブラリに同梱する（F-264。約 0.8 MB）。
+# 外すと `[api] openapi_docs_ui` の既定は "cdn"（"embedded" は設定のエラー）
+openapi-ui-embedded = ["openapi", "dep:flate2"]
 # tokio 互換レイヤー（F-198）。2 つは排他（両方有効は compile_error）。tower の Service/Layer 互換は api-core に含む。
 # - tokio-compat（api の既定）: tokio 無し。veil のランタイムの上に tokio の API（veil::tokio、crates/veil-tokio/tokio-shim
 #   で依存ツリーの tokio を置き換えられる）を提供する。handler に依存しない（置き換えた tokio が serde_json 等を
@@ -408,7 +413,7 @@ l4-handler = ["handler", "l4-proxy"]
 # 生成コードは prost）が符号化する。F-208）。API ライブラリ専用
 grpc-handler = ["handler", "grpc"]
 # tokio 互換レイヤー以外の API ライブラリ一式（tokio-compat-bridge と組み合わせるときに使う）
-api-core = ["handler", "macro", "openapi", "l4-handler", "grpc-handler", "tower-compat"]
+api-core = ["handler", "macro", "openapi", "openapi-ui-embedded", "l4-handler", "grpc-handler", "tower-compat"]
 # API サーバ開発向けの便利セット（C API・Python は別クレート crates/veil-capi・crates/veil-python）
 api = ["api-core", "tokio-compat"]
 

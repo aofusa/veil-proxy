@@ -1,6 +1,6 @@
 # F-264: Swagger UI を完全にオフラインで使えるようにする（資産をライブラリに同梱）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（wt/core → feat/v0100、2026-10-25。2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景
 
@@ -71,3 +71,49 @@
 
 - ネットワークの無い環境で `/docs` が完全に動く（Rust・Python）。本体のバイナリに資産が入らない。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-25）
+
+- **資産**: `third_party/swagger-ui-dist/5.34.0/`（npm の latest）に `swagger-ui-bundle.js`・`swagger-ui.css` の gzip（level 9）と
+  brotli（quality 11）だけ（生のファイルは置かない。計 約 850 KB）と `LICENSE`・`NOTICE`。`README.veil.md` に取得元・npm の
+  integrity・sha256・取り除いたもの（末尾の `sourceMappingURL`）。`assets.rs`（台本が作る定数と `include_bytes!`）を
+  `src/api/swagger_ui.rs` が `include!` する。crates.io のパッケージに入るよう `Cargo.toml` の `include` に足した。
+- **台本**: `tools/release/update-swagger-ui.sh <版>`（npm の integrity（sha512）を検査・source map の参照を外す・gz/br・
+  README と assets.rs を作り直す。node の zlib・crypto を使う）、`--check`（gz と br が同じ中身・sha256 が README と assets.rs
+  に一致・source map の参照が無い）、`--audit`（npm の bulk advisory API。該当があれば直す版の有無にかかわらず失敗）。
+  `--audit` は `tools/container_security/security/run_cargo_audit.sh`（release.yml も回す）の先頭で回す（判定マーカーの前）。
+- **配信**: `src/api/swagger_ui.rs`（新設。`openapi.rs` の変更は `/docs` のハンドラが CSP 等のヘッダを付けるのと、
+  資産のルートの登録・ページの作成をこのモジュールへ回す数行だけ）。`<openapi_path>/assets/<版>/swagger-ui-bundle.js`・
+  `swagger-ui.css`・`swagger-initializer.js` を組み込みのハンドラ（`__veil_openapi_asset_*`。`openapi_enabled = false` で
+  消える）で返す。`Accept-Encoding` で br → gzip → 無し（最初の要求で 1 回だけ flate2 で解凍した `Bytes` を `OnceLock` に
+  持つ）、`Vary: accept-encoding`・`ETag`（版 + sha256 の先頭 16 桁）・`If-None-Match` で 304・
+  `Cache-Control: public, max-age=31536000, immutable`・`nosniff`。本文は `Bytes::from_static`、ETag も `Bytes`（要求ごとの
+  確保なし）。
+- **ページ**: 同じオリジンの資産だけを読む HTML に `Content-Security-Policy: default-src 'none'; script-src 'self';
+  style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none';
+  form-action 'self'; frame-ancestors 'self'`・`nosniff`・`Referrer-Policy: no-referrer`。`validatorUrl: null`
+  （validator.swagger.io へのバッジの要求を止める）。
+- **設定**: `[api] openapi_docs_ui`（`"embedded"`（既定）・`"cdn"`・`"off"`）と `[api] openapi_docs_cdn_url`（既定は版を固定した
+  jsDelivr）。`Config::openapi_docs_ui`・`openapi_docs_cdn_url` のセッタ。Python は `veil.run(openapi_docs_ui=...)`。
+  Cargo feature `openapi-ui-embedded`（`openapi` + flate2）を `api-core`（したがって `api`）・`veil-capi`・`veil-python` に入れた。
+  無いビルドでは既定が `"cdn"` で、`"embedded"` は設定のエラー（`refresh` が返す）。
+- **試験**: 単体 `api::swagger_ui::tests`（設定の解釈、ページに外部の URL・インラインのスクリプトが無い・CSP、同梱の版と
+  CDN の既定の版が同じ、`Accept-Encoding` の解釈、資産ごとに br・gzip・無しの応答と解凍した中身の sha256 が README と一致・
+  source map の参照が無い・ETag で 304）。`tests/api/library_e2e.sh rust` に `/docs` の外部参照 0・CSP・br・gzip・無し（解凍）・
+  h2c・304 の確認、`nonregression` に full（と Linux の full-container）のバイナリに `swagger-ui`・`SwaggerUIBundle` の文字列が
+  無いことと、`--features handler,openapi`（`openapi-ui-embedded` 無し）がビルドできること。
+  `tests/api/swagger_offline.sh`（新設）: ネットワークの無いコンテナ（`docker run --network none`）の中の Playwright の Chromium で
+  Rust（`rust-hello`）・Python（`python-hello`、このリポジトリの wheel）の `/docs` を開き、コンソールのエラー（CSP の違反を含む）0・
+  他のオリジンへの要求 0・操作が描画されることを確かめる。`examples-nightly.yml` の job `swagger-offline` で毎晩回す。
+
+### 決めたこと
+
+- 初期化のスクリプトをインラインに置かず、同じオリジンの静的なファイル（`swagger-initializer.js`）にした。OpenAPI の JSON の
+  URL は `<div id="swagger-ui" data-url="...">` から読む。CSP は `script-src 'self'` だけで済み、起動・リロード時のハッシュの
+  計算（sha256・base64 の依存）が要らない。
+- 圧縮を受けないクライアントへの解凍は flate2 だけ（`openapi-ui-embedded` が flate2 を引く。小さな gzip の展開の自前実装は作らない）。
+- 資産の URL（`/docs/assets/<版>/...`）は `openapi_path` の下。資産のルートの登録は最初の 1 回だけ（`/docs` のルートと同じ。
+  リロードで `openapi_path` を変えても資産の URL は変わらない、今までの `/docs` と同じ制約）。
+- cargo-deny には記録しない（crate ではない）。`README.veil.md`・`LICENSE`・`NOTICE` で管理する。
+- GraphiQL（F-267・F-268）は対象外（それぞれのチケットで同じ方法で直す）。
+

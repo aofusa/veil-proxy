@@ -2761,6 +2761,9 @@ watch = false
 # [api]
 # openapi_enabled = true            # /openapi.json と Swagger UI を公開する
 # openapi_path = "/docs"            # Swagger UI のパス
+# openapi_docs_ui = "embedded"      # Swagger UI の配り方（F-264）: "embedded"（同梱の資産。外へ通信しない。
+#                                   # openapi-ui-embedded feature が要る）・"cdn"・"off"（/openapi.json だけ）
+# openapi_docs_cdn_url = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.34.0"  # "cdn" のときの URL
 # openapi_json_path = "/openapi.json"
 # openapi_title = "veil API"
 # openapi_version = "0.1.0"

@@ -18,7 +18,7 @@ pub const JSON_HANDLER: &str = "__veil_openapi_json";
 pub const DOCS_HANDLER: &str = "__veil_openapi_docs";
 
 static DOC: RwLock<Option<Bytes>> = RwLock::new(None);
-static DOCS_HTML: RwLock<Option<Bytes>> = RwLock::new(None);
+static DOCS_HTML: RwLock<Option<super::swagger_ui::DocsPage>> = RwLock::new(None);
 static REGISTERED: OnceLock<()> = OnceLock::new();
 
 /// The current OpenAPI document (JSON).
@@ -54,62 +54,26 @@ pub(crate) fn refresh(settings: &ApiSettings) -> Result<(), String> {
             Arc::new(|_req: Request| {
                 Box::pin(async {
                     match DOCS_HTML.read().unwrap().clone() {
-                        Some(b) => Response::html(String::new()).with_body(b),
+                        // F-264: 同梱の資産を読むページは CSP 等のヘッダも付ける
+                        Some(p) => p.headers.iter().fold(
+                            Response::html(String::new()).with_body(p.html),
+                            |r, (n, v)| r.with_header(*n, *v),
+                        ),
                         None => Response::not_found(),
                     }
                 })
             }),
             hidden,
         )?)?;
+        super::swagger_ui::register_assets(settings)?;
         let _ = REGISTERED.set(());
     }
     let doc = generate(settings, &handler::all());
     *DOC.write().unwrap() = Some(Bytes::from(
         serde_json::to_vec(&doc).map_err(|e| e.to_string())?,
     ));
-    *DOCS_HTML.write().unwrap() = Some(Bytes::from(swagger_ui_html(settings)));
+    *DOCS_HTML.write().unwrap() = super::swagger_ui::page(settings)?;
     Ok(())
-}
-
-/// Swagger UI (loads swagger-ui-dist from a CDN).
-fn swagger_ui_html(settings: &ApiSettings) -> String {
-    let title = html_escape(&settings.openapi_title);
-    let url = serde_json::to_string(&settings.openapi_json_path)
-        .unwrap_or_else(|_| "\"/openapi.json\"".into());
-    format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} - Swagger UI</title>
-<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-</head>
-<body>
-<div id="swagger-ui"></div>
-<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
-<script>
-// WebSocket operations (x-veil-websocket) cannot be tried from the browser: hide "Try it out"
-const VeilNoTryItOut = () => ({{
-  statePlugins: {{ spec: {{ wrapSelectors: {{
-    allowTryItOutFor: (ori, system) => (state, path, method) =>
-      ori(state, path, method) &&
-      !system.specSelectors.specJson().getIn(["paths", path, method, "x-veil-websocket"])
-  }} }} }}
-}});
-window.ui = SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui", deepLinking: true, plugins: [VeilNoTryItOut] }});
-</script>
-</body>
-</html>
-"##
-    )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// Converts `{*rest}` to `{rest}` (an OpenAPI path template).
@@ -499,8 +463,6 @@ mod tests {
         let v: toml::Value = toml::from_str("openapi_websocket = false").unwrap();
         let doc = generate(&ApiSettings::from_value(Some(&v)), &entries);
         assert!(doc["paths"].as_object().unwrap().is_empty());
-        // Swagger UI は x-veil-websocket の操作で Try it out を出さない
-        assert!(swagger_ui_html(&ApiSettings::from_value(None)).contains("x-veil-websocket"));
     }
 
     // F-268: Python の Security 依存（x-veil-security-schemes）は components.securitySchemes へ

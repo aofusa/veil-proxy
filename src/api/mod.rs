@@ -51,6 +51,8 @@ pub mod multipart;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
+#[cfg(feature = "openapi")]
+mod swagger_ui;
 
 #[cfg(feature = "tower-compat")]
 pub mod tower;

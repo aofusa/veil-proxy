@@ -12,6 +12,10 @@ mkdir -p "${RESULTS_DIR}"
 
 echo "cargo_audit start" | tee "${REPORT}"
 
+# F-264: ライブラリが同梱する Swagger UI（third_party/swagger-ui-dist。crate ではないので cargo-audit は見ない）を
+# npm の advisory で照合する。該当があれば直す版の有無にかかわらず失敗（判定マーカーを書く前に止める）
+"${REPO_ROOT}/tools/release/update-swagger-ui.sh" --audit 2>&1 | tee -a "${REPORT}"
+
 docker run --rm \
     -v "${REPO_ROOT}:/app:ro" \
     -v "${RESULTS_DIR}:/results:rw" \

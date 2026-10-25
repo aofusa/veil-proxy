@@ -179,6 +179,16 @@ TOML
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
+  # F-264: 同梱の Swagger UI（外への参照が無い・CSP・事前圧縮の資産・解凍・304）
+  local SV; SV=$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' "$ROOT/third_party/swagger-ui-dist/assets.rs")
+  local SA="$B/docs/assets/$SV/swagger-ui-bundle.js"
+  expect "Swagger UI has no external URL" "external=0" bash -c "echo external=\$(curl -s '$B/docs' | grep -c -E 'https?:|//cdn|unpkg|jsdelivr')"
+  expect "Swagger UI CSP" "content-security-policy: default-src 'none'; script-src 'self';" bash -c "curl -s -i '$B/docs' | tr A-Z a-z"
+  expect "Swagger UI asset (br)" "content-encoding: br" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: gzip, br' '$SA' | tr A-Z a-z"
+  expect "Swagger UI asset (gzip)" "content-encoding: gzip" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: gzip' '$SA' | tr A-Z a-z"
+  expect "Swagger UI asset (identity)" "decoded" bash -c "curl -s -H 'accept-encoding: identity' '$SA' | grep -q SwaggerUIBundle && echo decoded"
+  expect "Swagger UI asset (h2c, immutable)" "immutable" bash -c "curl -s --http2-prior-knowledge -o /dev/null -D - '$B/docs/assets/$SV/swagger-ui.css'"
+  expect "Swagger UI asset 304" "304" bash -c "e=\$(curl -s -o /dev/null -D - '$SA' | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p'); curl -s -o /dev/null -w '%{http_code}' -H \"if-none-match: \$e\" '$SA'"
   expect "404 for unknown" "404" curl -s -o /dev/null -w "%{http_code}" "$B/nope"
   expect "L4 TCP echo" "hello-tcp" l4_echo tcp "$L4" hello-tcp
   expect "L4 UDP echo" "echo:hi" l4_echo udp "$U" hi
@@ -1292,6 +1302,18 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no veil::api::client / veil_kit in the full binary" || bad "client or kit symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
+  # F-264: Swagger UI の資産・ページはライブラリだけ（本体のバイナリの中身に文字列が 1 つも無い）
+  local BIN="$ROOT/target/debug/veil$EXE"
+  n=$(grep -a -c -E "swagger-ui|SwaggerUIBundle" "$BIN") || true
+  [ "$n" = 0 ] && ok "no swagger-ui in the $FULL binary" || bad "swagger-ui strings in the $FULL binary ($n)"
+  if [ "$OS" = Linux ]; then
+    (cd "$ROOT" && cargo build -q --no-default-features --features full-container) || { bad "build full-container"; return; }
+    n=$(grep -a -c -E "swagger-ui|SwaggerUIBundle" "$BIN") || true
+    [ "$n" = 0 ] && ok "no swagger-ui in the full-container binary" || bad "swagger-ui strings in the full-container binary ($n)"
+  fi
+  # openapi だけ（openapi-ui-embedded 無し）でもビルドできる（/docs は CDN の既定になる）
+  (cd "$ROOT" && cargo check -q --lib --no-default-features --features handler,openapi) \
+    && ok "builds with openapi but without openapi-ui-embedded" || bad "build handler,openapi"
   # F-198: api の既定（tokio-compat）は tokio に依存しない
   local t; t=$(cd "$ROOT" && cargo tree -q -e normal,build --no-default-features --features "$FULL",api -i tokio 2>&1 | head -1) || true
   case "$t" in

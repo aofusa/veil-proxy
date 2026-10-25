@@ -193,6 +193,12 @@ pub struct ApiSettings {
     pub openapi_path: String,
     /// Path of the OpenAPI JSON document. Defaults to `/openapi.json`.
     pub openapi_json_path: String,
+    // F-264
+    /// How `/docs` serves Swagger UI: `embedded` (bundled assets, the default with the `openapi-ui-embedded` feature),
+    /// `cdn` or `off`.
+    pub openapi_docs_ui: Option<String>,
+    /// Base URL of swagger-ui-dist for `openapi_docs_ui = "cdn"` (a pinned jsDelivr URL by default).
+    pub openapi_docs_cdn_url: Option<String>,
     /// `info.title` of the OpenAPI document. Defaults to `veil API`.
     pub openapi_title: String,
     /// `info.version` of the OpenAPI document. Defaults to `0.1.0`.
@@ -287,6 +293,14 @@ impl ApiSettings {
             openapi_enabled: b("openapi_enabled", true),
             openapi_path: s("openapi_path", "/docs"),
             openapi_json_path: s("openapi_json_path", "/openapi.json"),
+            openapi_docs_ui: v
+                .and_then(|t| t.get("openapi_docs_ui"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            openapi_docs_cdn_url: v
+                .and_then(|t| t.get("openapi_docs_cdn_url"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
             openapi_title: s("openapi_title", "veil API"),
             openapi_version: s("openapi_version", "0.1.0"),
             openapi_description: v

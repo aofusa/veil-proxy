@@ -342,6 +342,15 @@ impl ConfigBuilder {
         openapi_json_path, "api.openapi_json_path", v: &str => toml::Value::String(v.to_string())
     );
     setter!(
+        // F-264
+        /// `[api].openapi_docs_ui`: how `/docs` serves Swagger UI (`"embedded"`, `"cdn"` or `"off"`).
+        openapi_docs_ui, "api.openapi_docs_ui", v: &str => toml::Value::String(v.to_string())
+    );
+    setter!(
+        /// `[api].openapi_docs_cdn_url`: the swagger-ui-dist base URL used by `openapi_docs_ui = "cdn"`.
+        openapi_docs_cdn_url, "api.openapi_docs_cdn_url", v: &str => toml::Value::String(v.to_string())
+    );
+    setter!(
         /// `[api].openapi_title`。
         openapi_title, "api.openapi_title", v: &str => toml::Value::String(v.to_string())
     );

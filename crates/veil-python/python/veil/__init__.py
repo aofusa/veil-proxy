@@ -2331,6 +2331,7 @@ class App:
         openapi=True,
         listeners=None,
         http3=None,
+        openapi_docs_ui=None,
     ):
         """Build the native ``Config`` from the arguments of :meth:`run` (requires the native extension)."""
         from . import _veil
@@ -2342,6 +2343,9 @@ class App:
             cfg.set("api.openapi_version", _toml_literal(self.version))
         if not openapi:
             cfg.set("api.openapi_enabled", "false")
+        if openapi_docs_ui is not None:
+            # "embedded"（同梱の Swagger UI。既定）・"cdn"・"off"（F-264）
+            cfg.set("api.openapi_docs_ui", _toml_literal(openapi_docs_ui))
         if listen_cleartext:
             cfg.listen_cleartext(listen_cleartext)
         if listen:
@@ -2380,6 +2384,7 @@ class App:
         event_loop=None,
         async_mode=None,
         compression=None,
+        openapi_docs_ui=None,
     ):
         """Start the server and block until it stops (Ctrl-C, SIGTERM or :func:`shutdown`).
 
@@ -2397,6 +2402,9 @@ class App:
 
         ``compression=True`` (``[api] compression``) compresses handler responses with gzip or brotli when the
         client accepts it (``Accept-Encoding``), for routes without their own ``[route.compression]``.
+
+        ``openapi_docs_ui`` chooses how ``/docs`` serves Swagger UI: ``"embedded"`` (the default; bundled assets,
+        no network access), ``"cdn"`` or ``"off"``.
         """
         from . import _aio, _veil
 
@@ -2415,6 +2423,7 @@ class App:
             openapi=openapi,
             listeners=listeners,
             http3=http3,
+            openapi_docs_ui=openapi_docs_ui,
         )
         # サーバの中で渡る Rust 側の型も isinstance(x, veil.Request / veil.Headers) で真にする
         Request.register(_veil.NativeRequest)

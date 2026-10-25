@@ -2,7 +2,8 @@
 
 ```python
 veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None, tls_key=None,
-         threads=None, overrides=None, openapi=True, listeners=None, http3=None, compression=None)
+         threads=None, overrides=None, openapi=True, listeners=None, http3=None, compression=None,
+         openapi_docs_ui=None)
 ```
 
 | Argument | Meaning |
@@ -16,6 +17,7 @@ veil.run(config_path=None, *, listen_cleartext=None, listen=None, tls_cert=None,
 | `overrides` | Keys to Python values, converted to TOML: `{"server.threads": 4, "api.max_body_size": 1048576}` |
 | `openapi` | `False` disables `/openapi.json` and `/docs` |
 | `compression` | `True` compresses handler responses with br or gzip when the client accepts it (`[api] compression`); see below |
+| `openapi_docs_ui` | How `/docs` serves Swagger UI: `"embedded"` (default; the wheel bundles the assets, so `/docs` works without network access and sends a same-origin `Content-Security-Policy`), `"cdn"` (the browser loads `swagger-ui-dist` from a pinned jsDelivr URL, `api.openapi_docs_cdn_url`) or `"off"` (only `/openapi.json`) |
 
 The environment variables `VEIL_OVERRIDE_<n>` work as usual, e.g.
 `VEIL_OVERRIDE_1='server.listen_cleartext = "0.0.0.0:8080"'`. The precedence is default, file, environment,

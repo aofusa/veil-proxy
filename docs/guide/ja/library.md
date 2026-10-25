@@ -68,6 +68,7 @@ GraphQL・依存性注入・バックグラウンドタスクを足します。
 | `handler` | ネイティブ `Handler` ルート、`Request`/`Response`、設定ビルダ、ライブラリ既定設定（`http2` を含意） |
 | `macro` | `#[veil::route]`・`#[veil::main]`・`#[veil::l4_handler]`・`#[derive(veil::Schema)]`（`handler` を含意） |
 | `openapi` | OpenAPI 3.1 の生成、`/openapi.json` と Swagger UI（`macro` を含意） |
+| `openapi-ui-embedded` | Swagger UI の資産を同梱し、`/docs` をオフラインで使えるようにする（約 0.8 MB。`api`・`api-core`・C のライブラリ・Python の wheel に含む。`openapi` を含意） |
 | `tokio-compat` | tokio 無しの tokio 互換レイヤー（`veil::tokio`・`App::tokio_service`・`veil::api::tokio_compat`）。[tokio 互換](#tokio-互換) を参照 |
 | `tokio-compat-bridge` | `tokio-compat` の代わりに、本物の tokio ランタイムを同梱して Future をその上で動かす（`tokio-compat` と排他） |
 | `l4-handler` | `[[l4]]` リスナーの TCP/UDP を Rust 関数で処理（`l4-proxy` を含意） |
@@ -222,7 +223,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 ```
 
 型付きのセッタは `listen_cleartext`（平文のアドレス）・`listen`（TLS のアドレス）・`allow_http`・`allow_h2c`・`secure_redirect`・`threads`・`http2_enabled`・`log_level`・`openapi_enabled`・
-`openapi_path`・`openapi_json_path`・`openapi_title`・`openapi_version`・`max_body_size`・`handler_threads`・
+`openapi_path`・`openapi_json_path`・`openapi_docs_ui`・`openapi_docs_cdn_url`・`openapi_title`・`openapi_version`・`max_body_size`・`handler_threads`・
 `grpc_max_message_size`・`grpc_response_compression`・`grpc_response_compression_min_size`・`tls(cert, key)`・`http3(listen)` です。それ以外のキーは `set("key = value")` と `set_value(path, toml_value)` で上書きできます。
 `Config::to_toml_string()` は合成結果（環境変数の上書きとルート注入の前）を返すので、デバッグに使えます。
 
@@ -233,8 +234,10 @@ let config = Config::load()?            // または Config::new()（既定設�
 | キー | 既定値 | 説明 |
 |------|--------|------|
 | `openapi_enabled` | `true` | `/openapi.json` と Swagger UI を公開する |
-| `openapi_path` | `"/docs"` | Swagger UI のパス（ブラウザが unpkg.com から `swagger-ui-dist` を読む） |
+| `openapi_path` | `"/docs"` | Swagger UI のパス |
 | `openapi_json_path` | `"/openapi.json"` | OpenAPI ドキュメントのパス |
+| `openapi_docs_ui` | `"embedded"` | `/docs` の Swagger UI の配り方: `"embedded"`（同梱の資産。外へ通信しない）・`"cdn"`（ブラウザが `openapi_docs_cdn_url` から `swagger-ui-dist` を読む）・`"off"`（`/openapi.json` だけ）。`openapi-ui-embedded` feature が無いビルドでは既定が `"cdn"` で、`"embedded"` は設定のエラー |
+| `openapi_docs_cdn_url` | `"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.34.0"` | `openapi_docs_ui = "cdn"` のときの `swagger-ui-dist` の URL |
 | `openapi_title` | `"veil API"` | `info.title` |
 | `openapi_version` | `"0.1.0"` | `info.version`（API 自体のバージョン） |
 | `openapi_description` | なし | `info.description` |
@@ -624,6 +627,17 @@ struct CreateUser {
 （`Json<T>`・`Result<Json<T>, _>`・`(u16, Json<T>)`・文字列）・`components.schemas`・検証付きルートの 422 応答）から
 OpenAPI **3.1** のドキュメントを起動時（とリロードのたび）に 1 回だけ生成してメモリに保持し、リクエスト時は保持したバイト列を返すだけです。
 `openapi_json_path`（`/openapi.json`）で JSON を、`openapi_path`（`/docs`）で Swagger UI を公開します。`[api] openapi_enabled = false` で両方を止められます。
+
+Swagger UI は既定で **同梱** です。ライブラリは `swagger-ui-dist`（版を固定し、gzip と brotli で事前圧縮。
+`third_party/swagger-ui-dist/README.veil.md`）を持ち、`<openapi_path>/assets/<版>/` から
+`Cache-Control: public, max-age=31536000, immutable`・`ETag`・`Accept-Encoding` に応じた `Content-Encoding: br`/`gzip`
+で配ります（どちらも受けないクライアントには最初の 1 回だけ解凍したものを返します）。ページは他のオリジンへ 1 本も
+要求しないので、閉じたネットワークでも `/docs` が動きます。ページには
+`Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+font-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'` を付けます
+（インラインのスクリプトは無く、初期化も同じオリジンのファイル）。オンラインの検証器のバッジは止めています。
+`openapi_docs_ui = "cdn"` で以前の CDN のページ（同梱と同じ版に固定）、`"off"` で JSON だけになります。プロキシ本体の
+バイナリ（`full` など `full*`）にはこれらの資産は入りません。
 
 ## 共有状態
 
@@ -1308,6 +1322,4 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
   そのイベントループが止まります（上記）。
 - プロトコルアップグレードと WebSocket は HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
-- Swagger UI のページは `swagger-ui-dist` を CDN から読むため、`/docs` を表示するにはブラウザがインターネットに接続できる必要があります
-  （`/openapi.json` はオフラインでも使えます）。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

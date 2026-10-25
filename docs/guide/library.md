@@ -69,6 +69,7 @@ shutdown, metrics), see [library-production.md](library-production.md).
 | `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (implies `http2`) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` (implies `handler`) |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
+| `openapi-ui-embedded` | bundles the Swagger UI assets so `/docs` works offline (about 0.8 MB; part of `api`, `api-core`, the C library and the Python wheel; implies `openapi`) |
 | `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
 | `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
@@ -231,7 +232,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
 ```
 
 Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
-`openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
+`openapi_path`, `openapi_json_path`, `openapi_docs_ui`, `openapi_docs_cdn_url`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
 `grpc_max_message_size`, `grpc_response_compression`, `grpc_response_compression_min_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
@@ -243,8 +244,10 @@ for debugging.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `openapi_enabled` | `true` | publish `/openapi.json` and the Swagger UI |
-| `openapi_path` | `"/docs"` | Swagger UI path (loads `swagger-ui-dist` from unpkg.com in the browser) |
+| `openapi_path` | `"/docs"` | Swagger UI path |
 | `openapi_json_path` | `"/openapi.json"` | OpenAPI document path |
+| `openapi_docs_ui` | `"embedded"` | how `/docs` serves Swagger UI: `"embedded"` (bundled assets, no network access), `"cdn"` (the browser loads `swagger-ui-dist` from `openapi_docs_cdn_url`) or `"off"` (only `/openapi.json`). Without the `openapi-ui-embedded` feature the default is `"cdn"` and `"embedded"` is a configuration error |
+| `openapi_docs_cdn_url` | `"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.34.0"` | base URL of `swagger-ui-dist` for `openapi_docs_ui = "cdn"` |
 | `openapi_title` | `"veil API"` | `info.title` |
 | `openapi_version` | `"0.1.0"` | `info.version` (your API's version) |
 | `openapi_description` | none | `info.description` |
@@ -662,6 +665,17 @@ the macro metadata — paths, parameters, request bodies, response types inferre
 validated routes — and kept in memory; a request just returns the stored bytes. It is served at
 `openapi_json_path` (`/openapi.json`) and a Swagger UI at `openapi_path` (`/docs`). Set `[api]
 openapi_enabled = false` to turn both off.
+
+By default the Swagger UI is **embedded**: the library bundles `swagger-ui-dist` (pinned version, gzip and brotli
+pre-compressed; see `third_party/swagger-ui-dist/README.veil.md`) and serves it from
+`<openapi_path>/assets/<version>/` with `Cache-Control: public, max-age=31536000, immutable`, an `ETag` and
+`Content-Encoding: br`/`gzip` by `Accept-Encoding` (decompressed once on first use for clients that accept
+neither). The page makes no request to another origin, so `/docs` works on a closed network, and it carries
+`Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+font-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'` (no inline
+script; the initializer is also a same-origin file). The online validator badge is turned off. `openapi_docs_ui =
+"cdn"` restores the previous CDN page (pinned to the bundled version) and `"off"` serves only the JSON. The proxy
+binary (`full` and the other `full*` sets) contains none of these assets.
 
 ## Shared state
 
@@ -1388,7 +1402,5 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
   stalls its event loop (see above).
 - Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
   is not supported).
-- The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
-  (`/openapi.json` works offline).
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path
   you pass) is the only file.

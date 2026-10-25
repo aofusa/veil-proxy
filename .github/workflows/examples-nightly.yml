@@ -1,5 +1,6 @@
 # F-255 / F-256: 移行ガイドの等価性の試験（nginx・Envoy と veil に同じ要求を送って比べる）と、Grafana のダッシュボードの試験
 # （compose を立ち上げて全パネルの式を問い合わせる）。このコミットの veil のイメージで回す。
+# F-264: ライブラリの /docs の Swagger UI のオフラインの試験（swagger-offline）。
 name: examples-nightly
 
 on:
@@ -13,6 +14,9 @@ on:
       - "tests/migration/**"
       - "tools/grafana/**"
       - "docs/guide/migration-*.md"
+      - "third_party/swagger-ui-dist/**"
+      - "src/api/swagger_ui.rs"
+      - "tests/api/swagger_offline.*"
 
 permissions:
   contents: read
@@ -41,3 +45,19 @@ jobs:
         run: tests/migration/run.sh veil:nightly
       - name: Grafana dashboard
         run: tools/grafana/test-dashboard.sh veil:nightly
+
+  # F-264: ライブラリの /docs（同梱の Swagger UI）が、ネットワークの無いコンテナの中のヘッドレスの Chromium で
+  # 外へ通信せずに描画される（Rust・Python）
+  swagger-offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Swagger UI offline (Playwright, --network none)
+        run: tests/api/swagger_offline.sh all
