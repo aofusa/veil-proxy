@@ -4,7 +4,8 @@
 #
 #   tests/api/swagger_offline.sh [rust|python|all]   （既定 all。Linux・docker が要る）
 #
-# Rust は examples/api/rust-hello、Python は examples/api/python-hello（このリポジトリの wheel を入れる）。
+# Rust は examples/api/rust-hello と rust-websocket（F-262: WebSocket の操作に Try it out が出ない）、Python は
+# examples/api/python-hello（このリポジトリの wheel を入れる）。
 # どちらもホストでビルドしたものをコンテナへ読み取り専用で渡す（コンテナの中ではビルドしない）。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -44,6 +45,10 @@ if [ "$WHAT" = rust ] || [ "$WHAT" = all ]; then
   (cd "$ROOT/examples/api/rust-hello" && CARGO_TARGET_DIR="$T" cargo build -q)
   cp "$T/debug/veil-example-hello" "$W/"
   run_in_box "/w/veil-example-hello" "/hello/{name}"
+  echo "== Rust (examples/api/rust-websocket)"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q)
+  cp "$T/debug/veil-example-websocket" "$W/"
+  run_in_box "/w/veil-example-websocket" "ws:/ws" "ws:/typed" "try:/plaintext"
 fi
 
 if [ "$WHAT" = python ] || [ "$WHAT" = all ]; then

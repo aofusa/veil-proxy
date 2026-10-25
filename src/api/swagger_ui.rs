@@ -127,10 +127,22 @@ pub(crate) fn asset_base(settings: &ApiSettings) -> String {
     )
 }
 
+// F-262: WebSocket の操作（x-veil-websocket）はブラウザから試せないので Try it out を出さない Swagger UI の
+// プラグイン。同梱の初期化のスクリプトと CDN のページの両方が使う（JS のコメントは入れない。初期化のスクリプトに
+// `//` が無いことを試験で見ている）
+macro_rules! no_try_it_out_plugin {
+    () => {
+        "const VeilNoTryItOut = () => ({\n  statePlugins: { spec: { wrapSelectors: {\n    allowTryItOutFor: (ori, system) => (state, path, method) =>\n      ori(state, path, method) &&\n      !system.specSelectors.specJson().getIn([\"paths\", path, method, \"x-veil-websocket\"])\n  } } }\n});\n"
+    };
+}
+
 /// The initializer is a same-origin script (no inline script, so the CSP needs no hash); it reads the URL of the
 /// OpenAPI document from `data-url`. `validatorUrl: null` keeps the page from calling validator.swagger.io.
 #[cfg(feature = "openapi-ui-embedded")]
-pub(crate) const INITIALIZER_JS: &str = "window.ui = SwaggerUIBundle({\n  url: document.getElementById(\"swagger-ui\").dataset.url,\n  dom_id: \"#swagger-ui\",\n  deepLinking: true,\n  validatorUrl: null\n});\n";
+pub(crate) const INITIALIZER_JS: &str = concat!(
+    no_try_it_out_plugin!(),
+    "window.ui = SwaggerUIBundle({\n  url: document.getElementById(\"swagger-ui\").dataset.url,\n  dom_id: \"#swagger-ui\",\n  deepLinking: true,\n  validatorUrl: null,\n  plugins: [VeilNoTryItOut]\n});\n"
+);
 
 fn embedded_html(settings: &ApiSettings) -> String {
     let title = html_escape(&settings.openapi_title);
@@ -160,6 +172,7 @@ fn cdn_html(settings: &ApiSettings, base: &str) -> String {
     let url = serde_json::to_string(&settings.openapi_json_path)
         .unwrap_or_else(|_| "\"/openapi.json\"".into());
     let base = html_escape(base);
+    let plugin = no_try_it_out_plugin!();
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -173,7 +186,7 @@ fn cdn_html(settings: &ApiSettings, base: &str) -> String {
 <div id="swagger-ui"></div>
 <script src="{base}/swagger-ui-bundle.js" crossorigin></script>
 <script>
-window.ui = SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui", deepLinking: true, validatorUrl: null }});
+{plugin}window.ui = SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui", deepLinking: true, validatorUrl: null, plugins: [VeilNoTryItOut] }});
 </script>
 </body>
 </html>
@@ -390,6 +403,19 @@ mod tests {
             .any(|(n, v)| *n == "content-security-policy" && v.contains("script-src 'self';")));
         // The initializer must not reach out either.
         assert!(!INITIALIZER_JS.contains("//"));
+    }
+
+    // F-262: WebSocket の操作では Try it out を出さない（同梱・CDN の両方）
+    #[test]
+    fn websocket_operations_hide_try_it_out() {
+        let cdn = page(&settings(Some("cdn"))).unwrap().unwrap();
+        let cdn = std::str::from_utf8(&cdn.html).unwrap();
+        assert!(cdn.contains("x-veil-websocket") && cdn.contains("plugins: [VeilNoTryItOut]"));
+        #[cfg(feature = "openapi-ui-embedded")]
+        assert!(
+            INITIALIZER_JS.contains("x-veil-websocket")
+                && INITIALIZER_JS.contains("plugins: [VeilNoTryItOut]")
+        );
     }
 
     #[cfg(feature = "openapi-ui-embedded")]
