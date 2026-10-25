@@ -10,11 +10,16 @@
 //! The HTML is built at startup and on every reload; the assets are `Bytes::from_static` (nothing is copied per request).
 
 use super::app::ApiSettings;
+#[cfg(feature = "openapi-ui-embedded")]
 use super::handler::{self, HandlerEntry, OperationMeta};
+#[cfg(feature = "openapi-ui-embedded")]
 use super::request::Request;
+#[cfg(feature = "openapi-ui-embedded")]
 use super::response::Response;
 use bytes::Bytes;
-use std::sync::{Arc, RwLock};
+#[cfg(feature = "openapi-ui-embedded")]
+use std::sync::Arc;
+use std::sync::RwLock;
 
 /// The swagger-ui-dist version used by the default CDN URL (the same as the bundled one).
 pub(crate) const CDN_VERSION: &str = "5.34.0";
@@ -101,6 +106,7 @@ pub(crate) fn page(settings: &ApiSettings) -> Result<Option<DocsPage>, String> {
     Ok(page)
 }
 
+#[cfg(feature = "openapi-ui-embedded")]
 fn embedded() -> bool {
     matches!(*MODE.read().unwrap(), Some(DocsUi::Embedded))
 }
@@ -123,6 +129,7 @@ pub(crate) fn asset_base(settings: &ApiSettings) -> String {
 
 /// The initializer is a same-origin script (no inline script, so the CSP needs no hash); it reads the URL of the
 /// OpenAPI document from `data-url`. `validatorUrl: null` keeps the page from calling validator.swagger.io.
+#[cfg(feature = "openapi-ui-embedded")]
 pub(crate) const INITIALIZER_JS: &str = "window.ui = SwaggerUIBundle({\n  url: document.getElementById(\"swagger-ui\").dataset.url,\n  dom_id: \"#swagger-ui\",\n  deepLinking: true,\n  validatorUrl: null\n});\n";
 
 fn embedded_html(settings: &ApiSettings) -> String {
