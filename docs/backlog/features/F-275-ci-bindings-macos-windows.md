@@ -52,6 +52,7 @@
   - Windows（ssh aofish、x86_64、Git Bash から `PY3=python`、curl.se の curl 8.22・protoc を `PATH` の先頭）: `c` と `python` が
     ALL OK。`Start-Process -WindowStyle Hidden` で起こした bash の中の cargo はビルドスクリプトが `STATUS_DLL_INIT_FAILED`
     で落ちた（ウィンドウステーションの無い起動の問題。ssh から直接起こせば通る。CI の runner には関係しない）。
+  - Linux（手元、x86_64、`PY3=python3`）: `library_e2e.sh c` が ALL OK（a3952742 で）。
 
 ### 決めたこと
 

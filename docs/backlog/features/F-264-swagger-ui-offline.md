@@ -105,6 +105,21 @@
   `tests/api/swagger_offline.sh`（新設）: ネットワークの無いコンテナ（`docker run --network none`）の中の Playwright の Chromium で
   Rust（`rust-hello`）・Python（`python-hello`、このリポジトリの wheel）の `/docs` を開き、コンソールのエラー（CSP の違反を含む）0・
   他のオリジンへの要求 0・操作が描画されることを確かめる。`examples-nightly.yml` の job `swagger-offline` で毎晩回す。
+  イメージ（`mcr.microsoft.com/playwright/python`）はブラウザだけで Python の playwright を持たないので、ホストで wheel を落として
+  渡す。docker の既定の seccomp は io_uring を拒否するので `--security-opt seccomp=unconfined` で起こす。
+
+### 検証
+
+- Linux（手元）: 単体 5 件、`library_e2e.sh nonregression` ALL OK（full・full-container のバイナリに `swagger-ui` 無し、
+  `handler,openapi` がビルドできる）、`swagger_offline.sh all` ALL OK（Rust 1 経路・Python 3 経路が描画、CSP 違反・コンソールの
+  エラー・他オリジンへの要求 0。`script-src 'self'` のままで `unsafe-eval` は要らない）、`check-messages.py`・`check-docs.sh`・
+  `update-swagger-ui.sh --check` が通る。
+- macOS（ssh llm）: 単体（`full-macos,api`）5 件、`nonregression`・`python` ALL OK、`rust` は Swagger UI の確認がすべて ok。
+  clippy `-D warnings`（`--lib` の `handler,openapi`・`api`、`--lib --tests` の `full-macos,api`）が通る。
+- Windows（ssh aofish）: 単体（`full-windows,api`）5 件、`nonregression`・`python` ALL OK、`rust` は Swagger UI の確認がすべて ok。
+- `rust` の残りの失敗（このチケットと無関係。F-260 でログの文が変わった台本の期待）: 「threads default = CPU count」
+  （`Workers: N` を探す）と「defaults are plaintext h2c-only + HTTP/1.1」（`H2C (HTTP/2 Cleartext) Server` を探す）。Windows では
+  加えて「access log on stdout by default」。
 
 ### 決めたこと
 
