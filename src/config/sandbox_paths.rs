@@ -10,8 +10,8 @@ use super::*;
 
 /// 生の `Config`（unveil/Seatbelt 専用の再パース結果）から UDS ソケットパスを収集する。
 ///
-/// - `[server].listen` / `[server].listen_cleartext` の `unix:<path>`（F-164。リスナー側は
-///   これまで収集漏れだった）。
+/// - `[server].listen` / `[server].listen_cleartext`・`[[listener]]` の `listen` の `unix:<path>`
+///   （F-164。リスナー側はこれまで収集漏れだった。`[[listener]]` は F-260）。
 /// - `[[route]]` の Proxy URL（`http(s)://unix:<path>[:<prefix>]`）・
 ///   `[upstreams.*.servers]` の URL（F-170、単一 URL プロキシと Upstream グループの両方）。
 /// - `[[l4]].upstreams` の `addr`（`unix:<path>`、F-170、上流のみ。`[[l4]].listen` は
@@ -26,12 +26,14 @@ use super::*;
 pub(super) fn collect_uds_socket_paths(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    // F-260: `[[listener]]` の `listen` も全部集める
     for listen in [
         config.server.listen.as_ref(),
         config.server.listen_cleartext.as_ref(),
     ]
     .into_iter()
     .flatten()
+    .chain(config.listener.iter().flatten().map(|l| &l.listen))
     {
         if let Some(path) = listen.strip_prefix("unix:") {
             if !path.is_empty() {

@@ -82,7 +82,7 @@ where
     };
     let ip = ctx.peer.ip().to_string();
     if let Err(e) =
-        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &svc).await
+        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, None, &svc).await
     {
         ftlog::debug!("[mesh] h2 connection: {}", e);
     }

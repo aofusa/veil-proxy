@@ -120,39 +120,88 @@ pub fn pem_stamp(path: &Path) -> std::io::Result<PemStamp> {
     })
 }
 
-/// 証明書ビルダー型
-///
-/// 証明書・秘密鍵パスから `Arc<ServerConfig>` を構築するクロージャ。
-/// ALPN や kTLS 用のシークレット抽出など、初回ロードと同じ設定を再現する。
-pub type ServerConfigBuilder =
-    Box<dyn Fn(&PathBuf, &PathBuf) -> anyhow::Result<Arc<ServerConfig>> + Send + Sync>;
-
-/// グローバルな TLS 設定スワップ
-///
-/// アクセプタはここから毎ハンドシェイク `load_full()` でスナップショットを
-/// 取得する。`None` の場合は従来通り起動時の固定 `Arc<ServerConfig>` を使う。
-pub static GLOBAL_TLS_CONFIG: once_cell::sync::Lazy<ArcSwap<Option<Arc<ServerConfig>>>> =
-    once_cell::sync::Lazy::new(|| ArcSwap::from_pointee(None));
-
-/// グローバル TLS 設定を初期化する（起動時に呼ぶ）
-pub fn init_global_tls_config(config: Arc<ServerConfig>) {
-    GLOBAL_TLS_CONFIG.store(Arc::new(Some(config)));
+/// TLS の ALPN のプロファイル（F-260）。証明書はプロセスに 1 組なので、`ServerConfig` は高々この数だけ作る。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AlpnProfile {
+    /// ALPN で `h2, http/1.1` を出す
+    H2AndH1,
+    /// ALPN を出さない（HTTP/1.1 だけ。h2 を選ばせない）
+    H1Only,
 }
 
-/// 現在のグローバル TLS 設定のスナップショットを取得する。
+/// ALPN のプロファイルの数（`GLOBAL_TLS_CONFIGS` の長さ）
+pub const ALPN_PROFILE_COUNT: usize = 2;
+
+impl AlpnProfile {
+    /// 全プロファイル（添字の順）
+    pub const ALL: [AlpnProfile; ALPN_PROFILE_COUNT] = [AlpnProfile::H2AndH1, AlpnProfile::H1Only];
+
+    /// h2 を出すか。`http2` feature の無いビルドでは常に `H1Only`
+    pub fn from_http2(http2: bool) -> Self {
+        if cfg!(feature = "http2") && http2 {
+            AlpnProfile::H2AndH1
+        } else {
+            AlpnProfile::H1Only
+        }
+    }
+
+    /// `load_tls_config` に渡す「ALPN で h2 を出すか」
+    pub fn http2(self) -> bool {
+        self == AlpnProfile::H2AndH1
+    }
+
+    /// `GLOBAL_TLS_CONFIGS` の添字
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            AlpnProfile::H2AndH1 => 0,
+            AlpnProfile::H1Only => 1,
+        }
+    }
+}
+
+/// 証明書ビルダー型
+///
+/// 証明書・秘密鍵パスから、指定した ALPN のプロファイルの `Arc<ServerConfig>` を構築するクロージャ。
+/// ALPN や kTLS 用のシークレット抽出など、初回ロードと同じ設定を再現する。
+pub type ServerConfigBuilder =
+    Box<dyn Fn(&PathBuf, &PathBuf, AlpnProfile) -> anyhow::Result<Arc<ServerConfig>> + Send + Sync>;
+
+type GlobalTlsSlot = once_cell::sync::Lazy<ArcSwap<Option<Arc<ServerConfig>>>>;
+
+/// グローバルな TLS 設定スワップ（ALPN のプロファイルごと。F-260）
+///
+/// アクセプタは自分のプロファイルの添字のスロットから毎ハンドシェイク `load()` でスナップショットを
+/// 取得する。`None` の場合は従来通り起動時の固定 `Arc<ServerConfig>` を使う。
+pub static GLOBAL_TLS_CONFIGS: [GlobalTlsSlot; ALPN_PROFILE_COUNT] = [
+    once_cell::sync::Lazy::new(|| ArcSwap::from_pointee(None)),
+    once_cell::sync::Lazy::new(|| ArcSwap::from_pointee(None)),
+];
+
+/// プロファイルのグローバル TLS 設定を差し替える（起動時・証明書のリロード時に呼ぶ）
+pub fn init_global_tls_config(profile: AlpnProfile, config: Arc<ServerConfig>) {
+    GLOBAL_TLS_CONFIGS[profile.index()].store(Arc::new(Some(config)));
+}
+
+/// プロファイルの現在のグローバル TLS 設定のスナップショットを取得する。
 ///
 /// 未初期化の場合は None。アクセプタはハンドシェイク毎にこれを呼ぶことで、
 /// リロード後の新規ハンドシェイクが新しい証明書を使用する。
 #[inline]
+pub fn current_tls_config(profile: AlpnProfile) -> Option<Arc<ServerConfig>> {
+    GLOBAL_TLS_CONFIGS[profile.index()].load().as_ref().clone()
+}
+
+/// どれかのプロファイルの現在の TLS 設定（h2 を出すものを優先。L4 の TLS 終端は ALPN を見ない）。
 pub fn current_global_tls_config() -> Option<Arc<ServerConfig>> {
-    GLOBAL_TLS_CONFIG.load().as_ref().clone()
+    AlpnProfile::ALL.iter().find_map(|p| current_tls_config(*p))
 }
 
 // ============================================================================
 // HTTP/3 (QUIC/quiche) 証明書ホットリロード（F-105）
 // ============================================================================
 //
-// HTTP/1.1・HTTP/2 は上の `GLOBAL_TLS_CONFIG`（rustls `ServerConfig`）で無停止更新できるが、
+// HTTP/1.1・HTTP/2 は上の `GLOBAL_TLS_CONFIGS`（rustls `ServerConfig`）で無停止更新できるが、
 // HTTP/3 は各ワーカーが起動時に構築した `quiche::Config`（`Rc<RefCell<..>>`）を保持し続け、
 // 差し替え経路が無かった。ここでは cert/key の生 PEM を **ペアでアトミックに** 配信し、
 // 各 HTTP/3 ワーカーが自前の `quiche::Config` へ memfd 経由で反映する仕組みを提供する。
@@ -316,6 +365,8 @@ pub struct TlsCertReloader {
     key_path: PathBuf,
     server_config: Arc<ArcSwap<Option<Arc<ServerConfig>>>>,
     builder: ServerConfigBuilder,
+    /// 作り直す ALPN のプロファイル（先頭を `server_config` にも入れる。F-260）
+    profiles: Vec<AlpnProfile>,
     last_stamp: (PemStamp, PemStamp),
 }
 
@@ -323,12 +374,29 @@ impl TlsCertReloader {
     /// 新しいリローダーを作成する。
     ///
     /// `server_config` は差し替え対象の ArcSwap。`builder` は証明書から
-    /// `ServerConfig` を構築するクロージャ。
+    /// `ServerConfig` を構築するクロージャ。グローバルは `H2AndH1` のプロファイルだけを作り直す
+    /// （全プロファイルを作り直すのは `new_global`）。
     pub fn new(
         cert_path: PathBuf,
         key_path: PathBuf,
         server_config: Arc<ArcSwap<Option<Arc<ServerConfig>>>>,
         builder: ServerConfigBuilder,
+    ) -> anyhow::Result<Self> {
+        Self::with_profiles(
+            cert_path,
+            key_path,
+            server_config,
+            builder,
+            vec![AlpnProfile::H2AndH1],
+        )
+    }
+
+    fn with_profiles(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        server_config: Arc<ArcSwap<Option<Arc<ServerConfig>>>>,
+        builder: ServerConfigBuilder,
+        profiles: Vec<AlpnProfile>,
     ) -> anyhow::Result<Self> {
         let last_stamp = Self::combined_stamp(&cert_path, &key_path)?;
         Ok(Self {
@@ -336,21 +404,26 @@ impl TlsCertReloader {
             key_path,
             server_config,
             builder,
+            profiles,
             last_stamp,
         })
     }
 
-    /// グローバル ArcSwap を対象にしたリローダーを作成する。
+    /// グローバル ArcSwap（`profiles` の全プロファイル）を対象にしたリローダーを作成する。
+    ///
+    /// `profiles` は起動時に作ったプロファイル（TLS のリスナーが使うもの。ACME の差し替えもこれで全部に届く。F-260）。
     pub fn new_global(
         cert_path: PathBuf,
         key_path: PathBuf,
         builder: ServerConfigBuilder,
+        profiles: Vec<AlpnProfile>,
     ) -> anyhow::Result<Self> {
         // Lazy static の中身を Arc として共有する代わりに、グローバルへ書き戻すラッパを使う。
         // ここでは独立した ArcSwap を保持し、reload 時に GLOBAL へも反映する。
+        let first = profiles.first().copied().unwrap_or(AlpnProfile::H2AndH1);
         let swap: Arc<ArcSwap<Option<Arc<ServerConfig>>>> =
-            Arc::new(ArcSwap::from_pointee(current_global_tls_config()));
-        Self::new(cert_path, key_path, swap, builder)
+            Arc::new(ArcSwap::from_pointee(current_tls_config(first)));
+        Self::with_profiles(cert_path, key_path, swap, builder, profiles)
     }
 
     /// 証明書と秘密鍵のスタンプ（mtime・実体・サイズ）を返す。
@@ -396,11 +469,19 @@ impl TlsCertReloader {
     /// 新しい `ServerConfig` を構築し、ArcSwap とグローバルへ反映する。
     /// 既存接続には影響しない（ハンドシェイク時の snapshot を使うため）。
     pub fn reload_now(&mut self) -> anyhow::Result<()> {
-        let new_config = (self.builder)(&self.cert_path, &self.key_path)?;
+        // F-260: 全プロファイルを作ってから差し替える（途中で失敗したら、どのプロファイルも古い証明書のまま）
+        let mut built = Vec::with_capacity(self.profiles.len());
+        for &p in &self.profiles {
+            built.push((p, (self.builder)(&self.cert_path, &self.key_path, p)?));
+        }
         // ローカル ArcSwap を更新
-        self.server_config.store(Arc::new(Some(new_config.clone())));
+        if let Some((_, first)) = built.first() {
+            self.server_config.store(Arc::new(Some(first.clone())));
+        }
         // グローバルへも反映（アクセプタが参照）
-        init_global_tls_config(new_config);
+        for (p, c) in built {
+            init_global_tls_config(p, c);
+        }
         // F-105: HTTP/3 (quiche) ワーカーへも cert/key の生 PEM を配信する。
         // 登録ワーカーが居るときのみファイルを再読込して配信（無ければ無駄な FS 読込を避ける）。
         self.reload_http3_certs()?;
@@ -481,7 +562,7 @@ mod tests {
 
         let build_count = Arc::new(AtomicUsize::new(0));
         let bc = build_count.clone();
-        let builder: ServerConfigBuilder = Box::new(move |_c, _k| {
+        let builder: ServerConfigBuilder = Box::new(move |_c, _k, _p| {
             bc.fetch_add(1, Ordering::SeqCst);
             Ok(make_dummy_config())
         });
@@ -593,7 +674,7 @@ mod tests {
 
         let build_count = Arc::new(AtomicUsize::new(0));
         let bc = build_count.clone();
-        let builder: ServerConfigBuilder = Box::new(move |_c, _k| {
+        let builder: ServerConfigBuilder = Box::new(move |_c, _k, _p| {
             bc.fetch_add(1, Ordering::SeqCst);
             Ok(make_dummy_config())
         });
@@ -618,7 +699,7 @@ mod tests {
         let key_path = dir.path().join("key.pem");
         write_self_signed(&cert_path, &key_path);
 
-        let builder: ServerConfigBuilder = Box::new(move |_c, _k| Ok(make_dummy_config()));
+        let builder: ServerConfigBuilder = Box::new(move |_c, _k, _p| Ok(make_dummy_config()));
         let swap: Arc<ArcSwap<Option<Arc<ServerConfig>>>> = Arc::new(ArcSwap::from_pointee(None));
         let mut reloader =
             TlsCertReloader::new(cert_path, key_path, swap.clone(), builder).unwrap();
@@ -626,5 +707,37 @@ mod tests {
         reloader.reload_now().unwrap();
         assert!(swap.load().is_some());
         assert!(current_global_tls_config().is_some());
+    }
+
+    // F-260: 証明書のリロードは起動時に作った全 ALPN プロファイルを作り直す
+    #[test]
+    fn reload_now_rebuilds_every_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        write_self_signed(&cert_path, &key_path);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let builder: ServerConfigBuilder = Box::new(move |_c, _k, p| {
+            s2.lock().unwrap().push(p);
+            Ok(make_dummy_config())
+        });
+        let mut reloader =
+            TlsCertReloader::new_global(cert_path, key_path, builder, AlpnProfile::ALL.to_vec())
+                .unwrap();
+        reloader.reload_now().unwrap();
+        assert_eq!(*seen.lock().unwrap(), AlpnProfile::ALL.to_vec());
+        for p in AlpnProfile::ALL {
+            assert!(current_tls_config(p).is_some());
+        }
+    }
+
+    #[test]
+    fn alpn_profile_follows_http2() {
+        assert_eq!(AlpnProfile::from_http2(false), AlpnProfile::H1Only);
+        #[cfg(feature = "http2")]
+        assert_eq!(AlpnProfile::from_http2(true), AlpnProfile::H2AndH1);
+        assert_eq!(AlpnProfile::H1Only.index(), 1);
+        assert!(!AlpnProfile::H1Only.http2());
     }
 }

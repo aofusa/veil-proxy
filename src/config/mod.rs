@@ -76,6 +76,8 @@ mod loaded;
 pub use self::loaded::*;
 mod cli;
 pub use self::cli::*;
+mod listeners;
+pub use self::listeners::*;
 // ====================
 // WASM Response Filter Context
 // ====================
@@ -551,7 +553,16 @@ pub struct Route {
 
 #[derive(Deserialize)]
 struct Config {
+    /// 省略可（`[[listener]]` だけで待ち受けを書く設定。F-260）
+    #[serde(default = "default_server_section")]
     server: ServerConfigSection,
+    /// 待ち受けの列（F-260）。`[server] listen`・`listen_cleartext` は暗黙のリスナーとして先頭に足す。
+    #[serde(default)]
+    listener: Option<Vec<ListenerConfigSection>>,
+    /// `[acme]` のうち待ち受けの重なりの検査に使う部分（F-260。本体は `acme::bootstrap` が読む）
+    #[cfg(feature = "acme")]
+    #[serde(default)]
+    acme: AcmeListenSection,
     /// 省略可（平文専用サーバ構成のときだけ。`validate_tls_presence` 参照）。
     #[serde(default = "default_tls_section")]
     tls: TlsConfigSection,
@@ -614,6 +625,36 @@ struct Config {
     #[cfg(feature = "l4-proxy")]
     #[serde(default)]
     l4: Option<Vec<L4ListenerConfig>>,
+}
+
+/// `[server]` を省略したときの既定値（F-260）
+fn default_server_section() -> ServerConfigSection {
+    toml::from_str("").expect("ServerConfigSection must deserialize from an empty table")
+}
+
+/// `[acme]` の待ち受けに関わるキー（F-260。既定は `acme::AcmeConfig` と同じ）
+#[cfg(feature = "acme")]
+#[derive(Deserialize)]
+struct AcmeListenSection {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_acme_challenge_listen")]
+    challenge_listen: String,
+}
+
+#[cfg(feature = "acme")]
+impl Default for AcmeListenSection {
+    fn default() -> Self {
+        AcmeListenSection {
+            enabled: false,
+            challenge_listen: default_acme_challenge_listen(),
+        }
+    }
+}
+
+#[cfg(feature = "acme")]
+fn default_acme_challenge_listen() -> String {
+    crate::acme::AcmeConfig::default().challenge_listen
 }
 
 // ====================
@@ -1862,13 +1903,17 @@ mod f200_listener_tests {
 
     #[test]
     fn redirect_url_uses_listen_port() {
-        HTTPS_REDIRECT_PORT.store(443, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            https_redirect_url("a.example:80", "/x?y"),
+            https_redirect_url("a.example:80", "/x?y", 443),
             "https://a.example/x?y"
         );
-        assert_eq!(https_redirect_url("", "/"), "https://localhost/");
-        assert_eq!(https_redirect_url("[::1]:80", "/"), "https://[::1]/");
+        assert_eq!(https_redirect_url("", "/", 443), "https://localhost/");
+        assert_eq!(https_redirect_url("[::1]:80", "/", 443), "https://[::1]/");
+        // F-260: リダイレクト先のリスナーのポート
+        assert_eq!(
+            https_redirect_url("a.example:8080", "/", 8443),
+            "https://a.example:8443/"
+        );
     }
 }
 

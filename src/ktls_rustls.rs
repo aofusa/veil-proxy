@@ -1433,6 +1433,8 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
 #[derive(Clone)]
 pub struct RustlsAcceptor {
     config: Arc<ServerConfig>,
+    /// ハンドシェイクで読むグローバルの TLS 設定のスロット（ALPN のプロファイル。F-260）
+    profile: crate::tls_reload::AlpnProfile,
     /// kTLS を有効化するかどうか
     enable_ktls: bool,
     /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
@@ -1446,6 +1448,7 @@ impl RustlsAcceptor {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         RustlsAcceptor {
             config,
+            profile: crate::tls_reload::AlpnProfile::H2AndH1,
             enable_ktls: false,
             allow_fallback: true,   // デフォルトはフォールバック有効
             tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
@@ -1476,6 +1479,17 @@ impl RustlsAcceptor {
         self
     }
 
+    /// ALPN のプロファイルを設定する（`config` はそのプロファイルの起動時の設定。F-260）
+    pub fn with_profile(
+        mut self,
+        profile: crate::tls_reload::AlpnProfile,
+        config: Arc<ServerConfig>,
+    ) -> Self {
+        self.profile = profile;
+        self.config = config;
+        self
+    }
+
     /// TLS ハンドシェイクを実行
     pub async fn accept(
         &self,
@@ -1483,8 +1497,8 @@ impl RustlsAcceptor {
         initial_data: Option<Vec<u8>>,
     ) -> io::Result<KtlsServerStream> {
         // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
-        let config =
-            crate::tls_reload::current_global_tls_config().unwrap_or_else(|| self.config.clone());
+        let config = crate::tls_reload::current_tls_config(self.profile)
+            .unwrap_or_else(|| self.config.clone());
         accept(
             stream,
             config,

@@ -362,6 +362,8 @@ pub mod proxy;
 pub mod server;
 
 mod entry;
+// リスナー 1 個のワーカー群の起動（F-260。entry.rs は配線だけ）
+mod listener_workers;
 pub use entry::run;
 pub use entry::{run_server, ServerOptions};
 

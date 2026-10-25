@@ -6,17 +6,13 @@ use super::*;
 
 /// 設定読み込みの戻り値型（統一）
 pub struct LoadedConfig {
-    /// TLS のリスナー（`[server].listen`、F-200）。無ければ平文だけのサーバ。
-    pub listen_addr: Option<String>,
-    /// 平文のリスナー（`[server].listen_cleartext`、F-200）
-    pub listen_cleartext: Option<String>,
-    /// 平文リスナーの受け入れ方（F-200）
-    pub cleartext: CleartextPolicy,
-    /// UDS ソケットファイルパーミッション（`[server].unix_socket_permissions`、
-    /// F-164）。8 進数表記の文字列のまま保持し、bind 時に
-    /// `parse_unix_socket_permissions` でパースする。
-    pub unix_socket_permissions: String,
+    /// 正規化した待ち受けの列（F-260）。`[server] listen`・`listen_cleartext` は暗黙のリスナーとして先頭に入る。
+    /// 添字がリスナーの id（`RuntimeConfig::cleartext` の添字）。UDS のパーミッションも各リスナーが持つ（F-164）。
+    pub listeners: Vec<ListenerSpec>,
+    /// 既定の ALPN のプロファイル（`[server] http2_enabled`）の TLS 設定。L4 の TLS 終端もこれを使う。
     pub tls_config: Arc<ServerConfig>,
+    /// ALPN のプロファイルごとの TLS 設定（使うプロファイルだけ。`AlpnProfile::index` で引く。F-260）
+    pub tls_profiles: [Option<Arc<ServerConfig>>; crate::tls_reload::ALPN_PROFILE_COUNT],
     /// TLS証明書パス（ログ・表示用）
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
@@ -63,15 +59,9 @@ pub struct LoadedConfig {
     pub opentelemetry: OpenTelemetryConfig,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
-    /// HTTP/2 を有効化するかどうか
+    /// HTTP/2 を有効化するかどうか（`[server] http2_enabled`。TLS のリスナーの `http2` の既定）
     #[cfg(feature = "http2")]
     pub http2_enabled: bool,
-    /// HTTP/3 を有効化するかどうか
-    #[cfg(feature = "http3")]
-    pub http3_enabled: bool,
-    /// HTTP/3 リスナーアドレス (UDP)
-    #[cfg(feature = "http3")]
-    pub http3_listen: Option<String>,
     /// HTTP/2 設定（詳細設定）
     #[cfg(feature = "http2")]
     pub http2_config: Http2ConfigSection,
@@ -124,8 +114,9 @@ pub struct RuntimeConfig {
     pub tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定（ホットリロード時の参照用）
     pub ktls_config: Arc<KtlsConfig>,
-    /// 平文リスナー（`[server].listen_cleartext`）の受け入れ方（F-200）。ホットリロード対象。
-    pub cleartext: CleartextPolicy,
+    /// 平文のリスナーの受け入れ方（F-200）。リスナーの id で引く（TLS のリスナーの添字は使わない。F-260）。
+    /// ホットリロード対象（リスナーの列が変わらないときだけ差し替える）。
+    pub cleartext: Arc<[CleartextPolicy]>,
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
@@ -164,7 +155,7 @@ impl Default for RuntimeConfig {
             optimized_router: Arc::new(routing::OptimizedRouter::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
-            cleartext: CleartextPolicy::default(),
+            cleartext: Arc::new([]),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             #[cfg(feature = "admin")]
@@ -267,14 +258,6 @@ pub fn resolve_config_path(
 pub static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
     Lazy::new(|| ArcSwap::from_pointee(default_config_path()));
 
-/// HTTPSリダイレクト先のポート（listen設定から抽出）
-///
-/// HTTP→HTTPSリダイレクト時に使用するポート番号。
-/// デフォルトは443（HTTPSの標準ポート）。
-/// main関数で`[server].listen`の値から初期化される。
-pub static HTTPS_REDIRECT_PORT: std::sync::atomic::AtomicU16 =
-    std::sync::atomic::AtomicU16::new(443);
-
 /// 設定をホットリロードする
 ///
 /// 実行中のリクエストは古い設定を参照し続け、
@@ -302,7 +285,13 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
-        cleartext: loaded.cleartext,
+        // F-260: 平文の方針の表はリスナーの id で引くので、リスナーの列が起動時と同じときだけ差し替える
+        // （列が変わったリロードは警告済みで、待ち受けは起動時のまま）
+        cleartext: if same_listener_set(&loaded.listeners) {
+            cleartext_table(&loaded.listeners)
+        } else {
+            current.cleartext.clone()
+        },
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         #[cfg(feature = "admin")]
@@ -360,8 +349,8 @@ pub struct LoadedConfigWithoutTls {
     pub http2_config: Http2ConfigSection,
     #[cfg(feature = "http3")]
     pub http3_config: Http3ConfigSection,
-    /// 平文リスナーの受け入れ方（F-200）
-    pub cleartext: CleartextPolicy,
+    /// 正規化した待ち受けの列（平文の方針の表の元。F-260）
+    pub listeners: Vec<ListenerSpec>,
     pub performance: PerformanceConfigSection,
 }
 
@@ -403,6 +392,8 @@ pub(super) struct ListenerSettings {
     http2_enabled: bool,
     http3_enabled: bool,
     http3_listen: Option<String>,
+    /// `[[listener]]`（F-260。リロードで変えられるのは平文の方針だけなので、それ以外を比べる）
+    listener: Vec<ListenerConfigSection>,
     /// `[[l4]]` の (name, listen, protocol)
     l4: Vec<(String, String, String)>,
 }
@@ -416,6 +407,18 @@ impl ListenerSettings {
             http2_enabled: config.server.http2_enabled,
             http3_enabled: config.http3.enabled,
             http3_listen: config.http3.listen.clone(),
+            listener: config
+                .listener
+                .iter()
+                .flatten()
+                .map(|l| ListenerConfigSection {
+                    allow_http: None,
+                    allow_h2c: None,
+                    secure_redirect: None,
+                    redirect_to: None,
+                    ..l.clone()
+                })
+                .collect(),
             #[cfg(feature = "l4-proxy")]
             l4: config
                 .l4
@@ -455,6 +458,9 @@ impl ListenerSettings {
         if self.http3_listen != new.http3_listen {
             keys.push("http3.listen");
         }
+        if self.listener != new.listener {
+            keys.push("listener");
+        }
         if self.l4 != new.l4 {
             keys.push("l4");
         }
@@ -464,6 +470,17 @@ impl ListenerSettings {
 
 /// 起動時に有効になった待ち受け関連の設定（リロードの比較の基準）
 static STARTUP_LISTENERS: std::sync::OnceLock<ListenerSettings> = std::sync::OnceLock::new();
+
+/// 起動時に開いたリスナーの列（F-260）。リロードで平文の方針の表を差し替えてよいかの判定と、
+/// リロード後の Alt-Svc（実際に開いている HTTP/3 のポート）に使う。
+static STARTUP_LISTENER_SPECS: std::sync::OnceLock<Vec<ListenerSpec>> = std::sync::OnceLock::new();
+
+/// リロードで読んだリスナーの列が、起動時に開いた列と同じ並び（名前・アドレス・TLS か）か
+fn same_listener_set(new: &[ListenerSpec]) -> bool {
+    STARTUP_LISTENER_SPECS
+        .get()
+        .is_none_or(|old| listener_identity(old) == listener_identity(new))
+}
 
 /// リロードした設定が起動時の待ち受け設定と違えば、再起動が要ることを 1 回警告する。
 fn warn_listener_changes(config: &Config) {
@@ -504,6 +521,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
     warn_listener_changes(&config);
+    let listeners = normalize_listeners(&config)?;
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -512,7 +530,6 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
-    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を更新（リロード対応）
     init_server_header(
@@ -520,8 +537,14 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         &config.server.server_header_value,
     );
 
-    // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期
-    apply_alt_svc_from_config(&config);
+    // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期。広告するポートは起動時に開いた HTTP/3 のリスナーのもの
+    // （リスナーはリロードで開き直さない。F-260）
+    apply_alt_svc_from_config(
+        &config,
+        STARTUP_LISTENER_SPECS
+            .get()
+            .map_or(listeners.as_slice(), Vec::as_slice),
+    );
 
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -627,7 +650,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
-        cleartext,
+        listeners,
         performance: config.performance.clone(),
     })
 }
@@ -678,8 +701,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 設定ファイルのバリデーション
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
+    let listeners = normalize_listeners(&config)?;
     // リロードの比較の基準（最初に読んだ設定を残す）
     let _ = STARTUP_LISTENERS.set(ListenerSettings::from_config(&config));
+    let _ = STARTUP_LISTENER_SPECS.set(listeners.clone());
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
@@ -694,15 +719,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
-    #[cfg(feature = "http3")]
-    let http3_enabled = config.http3.enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
-    #[cfg(feature = "http3")]
-    let http3_listen = http3_config.listen.clone();
-    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を初期化
     init_server_header(
@@ -711,16 +731,31 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     );
 
     // Alt-Svc（HTTP/3 広告、F-94）
-    apply_alt_svc_from_config(&config);
+    apply_alt_svc_from_config(&config, &listeners);
 
     // バッファプール設定を初期化
     init_buffer_pool_config(config.buffer_pool.clone());
 
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
-    #[cfg(feature = "http2")]
-    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
-    #[cfg(not(feature = "http2"))]
-    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, false)?;
+    // F-260: ALPN のプロファイル（h2+http/1.1・http/1.1 のみ）ごとに作る。既定のプロファイル（`[server] http2_enabled`）は
+    // L4 の TLS 終端・平文だけのサーバのアクセプタの型のために常に作り、ほかは TLS のリスナーが使うものだけ作る。
+    let default_profile = crate::tls_reload::AlpnProfile::from_http2(config.server.http2_enabled);
+    let mut tls_profiles: [Option<Arc<ServerConfig>>; crate::tls_reload::ALPN_PROFILE_COUNT] =
+        Default::default();
+    for profile in std::iter::once(default_profile)
+        .chain(listeners.iter().filter_map(ListenerSpec::alpn_profile))
+    {
+        if tls_profiles[profile.index()].is_none() {
+            tls_profiles[profile.index()] = Some(load_tls_config(
+                &config.tls,
+                ktls_config.enabled,
+                profile.http2(),
+            )?);
+        }
+    }
+    let tls_config = tls_profiles[default_profile.index()]
+        .clone()
+        .expect("the default ALPN profile is always built");
 
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -891,11 +926,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     Ok(LoadedConfig {
-        listen_addr: config.server.listen.clone(),
-        listen_cleartext: config.server.listen_cleartext.clone(),
-        cleartext,
-        unix_socket_permissions: config.server.unix_socket_permissions.clone(),
+        listeners,
         tls_config,
+        tls_profiles,
         tls_cert_path: config.tls.cert_path.clone(),
         tls_key_path: config.tls.key_path.clone(),
         // 証明書が無い（平文専用サーバ）ならリロード対象も無い。
@@ -925,10 +958,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
-        #[cfg(feature = "http3")]
-        http3_enabled,
-        #[cfg(feature = "http3")]
-        http3_listen,
         #[cfg(feature = "http2")]
         http2_config,
         #[cfg(feature = "http3")]
@@ -1281,7 +1310,7 @@ pub(super) fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
     #[cfg(not(feature = "l4-proxy"))]
     let has_l4 = false;
     #[cfg(feature = "http3")]
-    let http3 = config.http3.enabled;
+    let http3 = config_has_http3(config);
     #[cfg(not(feature = "http3"))]
     let http3 = false;
     let facts = CapModeFacts { has_l4, http3 };

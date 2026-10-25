@@ -48,7 +48,7 @@ where
     let mut connection_metric = ActiveConnectionMetric::new(true);
 
     // カスタムリクエストハンドラーを使用してメインループ実行
-    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric, false).await;
+    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric, None).await;
 
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
@@ -70,8 +70,8 @@ pub(super) async fn handle_http2_requests<S>(
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
     // F-200: 平文リスナー（`listen_cleartext`）で `enable_secure_redirect = true` のとき、
-    // すべての要求を https へ 301 で返す（TLS の接続は常に false）。
-    redirect_https: bool,
+    // すべての要求を https へ 301 で返す（TLS の接続は常に None）。値はリダイレクト先のポート（F-260）。
+    redirect_https: Option<u16>,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent
@@ -152,7 +152,7 @@ pub(crate) async fn handle_http2_requests_with<S, V>(
     conn: &mut http2::Http2Connection<S>,
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
-    redirect_https: bool,
+    redirect_https: Option<u16>,
     svc: &V,
 ) -> Result<(), http2::Http2Error>
 where
@@ -490,8 +490,8 @@ pub(crate) struct H2RequestCtx {
     pub(crate) client_ip: std::rc::Rc<str>,
     /// `client_ip` から解決した `SocketAddr`。接続確立時に 1 回だけ解決する（F-162）。
     pub(crate) client_socket_addr: SocketAddr,
-    /// 平文リスナーの `enable_secure_redirect`（F-200）。true なら要求を https へ 301 で返す。
-    pub(crate) redirect_https: bool,
+    /// 平文リスナーの `enable_secure_redirect`（F-200）。`Some(port)` なら要求を https の `port` へ 301 で返す（F-260）。
+    pub(crate) redirect_https: Option<u16>,
     pub(crate) start: Instant,
 }
 
@@ -610,7 +610,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
     client_ip: &std::rc::Rc<str>,
     client_socket_addr: SocketAddr,
     connection_metric: &mut ActiveConnectionMetric,
-    redirect_https: bool,
+    redirect_https: Option<u16>,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
     V: H2Service,
@@ -623,7 +623,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
     // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
-    let plan = if body_pending && !redirect_https {
+    let plan = if body_pending && redirect_https.is_none() {
         svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr)
     } else {
         None
@@ -1255,10 +1255,10 @@ pub(super) async fn h2_dispatch(
     let client_ip: &str = &ctx.client_ip;
 
     // F-200: 平文リスナーの HTTPS リダイレクト。
-    if ctx.redirect_https {
+    if let Some(port) = ctx.redirect_https {
         let host = std::str::from_utf8(&ctx.authority).unwrap_or("");
         let location =
-            crate::config::https_redirect_url(host, std::str::from_utf8(path).unwrap_or("/"));
+            crate::config::https_redirect_url(host, std::str::from_utf8(path).unwrap_or("/"), port);
         let mut headers = h2_base_headers(false);
         headers.push((Bytes::from_static(b"location"), Bytes::from(location)));
         return h2_emit_full(resp_tx, notify, 301, headers, Bytes::new()).await;

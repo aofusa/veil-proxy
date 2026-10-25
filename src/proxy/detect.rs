@@ -340,7 +340,7 @@ pub async fn handle_h2c_connection(
     stream: TcpStream,
     client_ip: &str,
     initial_data: Vec<u8>,
-    redirect_https: bool,
+    redirect_https: Option<u16>,
 ) {
     use http2::Http2Connection;
 

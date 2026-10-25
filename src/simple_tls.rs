@@ -860,11 +860,27 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsClientStream {
 #[derive(Clone)]
 pub struct SimpleTlsAcceptor {
     config: Arc<ServerConfig>,
+    /// ハンドシェイクで読むグローバルの TLS 設定のスロット（ALPN のプロファイル。F-260）
+    profile: crate::tls_reload::AlpnProfile,
 }
 
 impl SimpleTlsAcceptor {
     pub fn new(config: Arc<ServerConfig>) -> Self {
-        SimpleTlsAcceptor { config }
+        SimpleTlsAcceptor {
+            config,
+            profile: crate::tls_reload::AlpnProfile::H2AndH1,
+        }
+    }
+
+    /// ALPN のプロファイルを設定する（`config` はそのプロファイルの起動時の設定。F-260）
+    pub fn with_profile(
+        mut self,
+        profile: crate::tls_reload::AlpnProfile,
+        config: Arc<ServerConfig>,
+    ) -> Self {
+        self.profile = profile;
+        self.config = config;
+        self
     }
 
     /// kTLS 設定は無視（互換性のため）
@@ -878,8 +894,8 @@ impl SimpleTlsAcceptor {
         initial_data: Option<Vec<u8>>,
     ) -> io::Result<SimpleTlsServerStream> {
         // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
-        let config =
-            crate::tls_reload::current_global_tls_config().unwrap_or_else(|| self.config.clone());
+        let config = crate::tls_reload::current_tls_config(self.profile)
+            .unwrap_or_else(|| self.config.clone());
         accept(stream, config, initial_data).await
     }
 

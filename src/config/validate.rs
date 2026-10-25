@@ -6,33 +6,28 @@ use super::*;
 
 /// HTTP/3 有効時に Alt-Svc 広告を初期化する（F-94、コールドパス）。
 ///
-/// `[http3] enabled && [http3].alt_svc_enabled` のとき、
-/// `[http3].alt_svc` 明示値、または listen ポートから自動生成した値を登録する。
+/// HTTP/3 のリスナーがあり `[http3].alt_svc_enabled` のとき、
+/// `[http3].alt_svc` 明示値、または HTTP/3 の最初のリスナーの UDP ポートから自動生成した値を登録する。
 /// Alt-Svc 関連キーはすべて `[http3]` に集約する。
-pub(super) fn apply_alt_svc_from_config(config: &Config) {
+pub(super) fn apply_alt_svc_from_config(config: &Config, listeners: &[ListenerSpec]) {
     #[cfg(feature = "http3")]
     {
-        let enabled = config.http3.enabled && config.http3.alt_svc_enabled;
-        let value = if enabled {
-            if let Some(ref explicit) = config.http3.alt_svc {
-                explicit.clone()
-            } else {
-                let listen = config
-                    .http3
-                    .listen
-                    .as_deref()
-                    .or(config.server.listen.as_deref())
-                    .unwrap_or("");
-                crate::pool::build_alt_svc_value(listen, config.http3.alt_svc_ma_secs)
+        // F-260: 広告するのは HTTP/3 の最初のリスナーの UDP ポート（同じ証明書・同じルートなので 1 個で足りる）
+        let first_h3 = listeners.iter().find_map(|l| l.http3);
+        let enabled = first_h3.is_some() && config.http3.alt_svc_enabled;
+        let value = match (enabled, &config.http3.alt_svc, first_h3) {
+            (false, _, _) => String::new(),
+            (true, Some(explicit), _) => explicit.clone(),
+            (true, None, Some(udp)) => {
+                crate::pool::build_alt_svc_value(&udp.to_string(), config.http3.alt_svc_ma_secs)
             }
-        } else {
-            String::new()
+            (true, None, None) => String::new(),
         };
         crate::pool::init_alt_svc(enabled, &value);
     }
     #[cfg(not(feature = "http3"))]
     {
-        let _ = config;
+        let _ = (config, listeners);
         crate::pool::init_alt_svc(false, "");
     }
 }
@@ -124,7 +119,8 @@ pub(super) fn default_tls_section() -> TlsConfigSection {
     toml::from_str("").expect("TlsConfigSection must deserialize from an empty table")
 }
 
-/// `[server].listen_cleartext` の受け入れ方（F-200）。リロードで変えられる（接続ごとに読む）。
+/// 平文のリスナー（`[server].listen_cleartext`・`tls = false` の `[[listener]]`）の受け入れ方（F-200・F-260）。
+/// リロードで変えられる（接続ごとに `RuntimeConfig::cleartext` をリスナーの id で引く）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleartextPolicy {
     /// 平文 HTTP/1.1 を受ける
@@ -133,6 +129,8 @@ pub struct CleartextPolicy {
     pub allow_h2c: bool,
     /// 受けた要求を https へ 301 でリダイレクトする
     pub secure_redirect: bool,
+    /// リダイレクト先のポート（`redirect_to` の TLS のリスナーのポート。443 なら URL に書かない。F-260）
+    pub redirect_port: u16,
 }
 
 impl Default for CleartextPolicy {
@@ -141,6 +139,7 @@ impl Default for CleartextPolicy {
             allow_http: true,
             allow_h2c: true,
             secure_redirect: true,
+            redirect_port: 443,
         }
     }
 }
@@ -151,13 +150,15 @@ impl CleartextPolicy {
             allow_http: server.allow_http,
             allow_h2c: server.allow_h2c,
             secure_redirect: server.enable_secure_redirect,
+            redirect_port: 443,
         }
     }
-}
 
-/// TLS が必要な構成か（`[server].listen` か HTTP/3 がある。F-200）。
-pub fn tls_required(config_server: &ServerConfigSection, http3_enabled: bool) -> bool {
-    config_server.listen.is_some() || http3_enabled
+    /// https へ返すならリダイレクト先のポート（`handle_h2c_connection` に渡す形）
+    #[inline]
+    pub fn redirect(&self) -> Option<u16> {
+        self.secure_redirect.then_some(self.redirect_port)
+    }
 }
 
 /// F-200 で削除したキーを、移行先を示すエラーにする。
@@ -206,64 +207,9 @@ pub(super) fn validate_removed_keys(server: &ServerConfigSection) -> io::Result<
     Ok(())
 }
 
-/// 待ち受けの規則（F-200）と、TLS の有無の検査。
+/// 待ち受けの規則（F-200・F-260）と、TLS の有無の検査（規則は `normalize_listeners` が持つ）。
 pub(super) fn validate_listeners(config: &Config) -> io::Result<()> {
-    let invalid = |m: String| Err(io::Error::new(io::ErrorKind::InvalidInput, m));
-    let server = &config.server;
-    validate_removed_keys(server)?;
-    if server.listen.is_none() && server.listen_cleartext.is_none() {
-        return invalid(
-            "no listener: set [server].listen (TLS) and/or [server].listen_cleartext (plaintext)"
-                .into(),
-        );
-    }
-    let parse = |key: &str, v: &str| {
-        crate::listen_addr::ListenAddr::parse(v).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid {}: {}", key, e),
-            )
-        })
-    };
-    let tls_addr = match &server.listen {
-        Some(l) => Some(parse("[server].listen", l)?),
-        None => None,
-    };
-    if let Some(c) = &server.listen_cleartext {
-        let addr = parse("[server].listen_cleartext", c)?;
-        if Some(&addr) == tls_addr.as_ref() {
-            return invalid(format!(
-                "[server].listen and [server].listen_cleartext must differ ({})",
-                c
-            ));
-        }
-        if !server.allow_http && !server.allow_h2c {
-            return invalid(
-                "[server].listen_cleartext accepts nothing: allow_http and allow_h2c are both false"
-                    .into(),
-            );
-        }
-        if server.enable_secure_redirect && server.listen.is_none() {
-            return invalid(
-                "[server].enable_secure_redirect = true needs a TLS listener ([server].listen) to \
-                 redirect to; set enable_secure_redirect = false to serve plaintext"
-                    .into(),
-            );
-        }
-    }
-    let http3 = config.http3.enabled;
-    if http3 && server.listen.is_none() {
-        return invalid("[http3].enabled = true needs [server].listen (QUIC requires TLS)".into());
-    }
-    if tls_required(server, http3) && !config.tls.is_configured() {
-        return invalid(
-            "TLS certificate is required: set [tls] cert_path and key_path \
-             ([server].listen and HTTP/3 are TLS listeners; a plaintext-only server uses only \
-             [server].listen_cleartext)"
-                .into(),
-        );
-    }
-    Ok(())
+    normalize_listeners(config).map(|_| ())
 }
 
 /// ビルドに含まれていない feature の設定セクションが書かれていたら、無視することを警告する
@@ -294,10 +240,10 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
                 "[tls] client_auth requires client_ca",
             ));
         }
-        if config.http3.enabled {
+        if config_has_http3(config) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "[tls] client_auth is not supported with [http3] enabled (HTTP/3 clients would bypass it)",
+                "[tls] client_auth is not supported with HTTP/3 ([http3] enabled or a [[listener]] with http3 = true; HTTP/3 clients would bypass it)",
             ));
         }
     }

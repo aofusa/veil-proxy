@@ -22,9 +22,8 @@ use super::*;
 // HTTP_301_REDIRECT_TEMPLATE, HTTP_301_REDIRECT_SUFFIX は
 // crate::constants モジュールに移動しました
 
-/// HTTPS へのリダイレクト先 URL（F-200）。ポートは `[server].listen` のもの（443 なら省略）。
-pub fn https_redirect_url(host: &str, path: &str) -> String {
-    let port = HTTPS_REDIRECT_PORT.load(std::sync::atomic::Ordering::Relaxed);
+/// HTTPS へのリダイレクト先 URL（F-200）。`port` はリダイレクト先の TLS のリスナーのポート（443 なら省略。F-260）。
+pub fn https_redirect_url(host: &str, path: &str, port: u16) -> String {
     // Host からポートを外す（`[v6]:port` は `]` まで残す）
     let host = match host.find(']') {
         Some(i) if host.starts_with('[') => &host[..=i],
@@ -42,7 +41,8 @@ pub fn https_redirect_url(host: &str, path: &str) -> String {
 /// 平文リスナー（`listen_cleartext`、`enable_secure_redirect = true`）の HTTP/1.1 を https へ 301 で返す。
 ///
 /// `initial` はプロトコル検出で既に読んだ先頭バイト列。要求ヘッダが揃うまで（4KiB まで）読み足す。
-pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>) {
+/// `port` はリダイレクト先の TLS のリスナーのポート（F-260）。
+pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>, port: u16) {
     let mut buffer = initial;
     while !buffer.windows(4).any(|w| w == b"\r\n\r\n") && buffer.len() < 4096 {
         let read_result = timeout(Duration::from_secs(5), stream.read(vec![0u8; 4096])).await;
@@ -63,7 +63,7 @@ pub async fn handle_http_redirect(mut stream: TcpStream, initial: Vec<u8>) {
         .find(|h| h.name.eq_ignore_ascii_case("Host"))
         .map(|h| std::str::from_utf8(h.value).unwrap_or(""))
         .unwrap_or("");
-    let redirect_url = https_redirect_url(host, path);
+    let redirect_url = https_redirect_url(host, path, port);
 
     // 301レスポンスを構築
     let mut response = Vec::with_capacity(

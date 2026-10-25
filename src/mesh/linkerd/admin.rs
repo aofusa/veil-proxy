@@ -210,8 +210,7 @@ async fn serve_h2(ds: DownStream, acc: Vec<u8>, peer: SocketAddr) {
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
     let ip = peer.ip().to_string();
     let svc = AdminH2 { peer: peer.ip() };
-    let _ =
-        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &svc).await;
+    let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, None, &svc).await;
 }
 
 pub fn route(

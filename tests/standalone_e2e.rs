@@ -1901,3 +1901,267 @@ allowed_methods = ["POST"]
     #[cfg(feature = "http3")]
     check_order("h3", &|p, b| h3_request(tls_port, "POST", p, b).0);
 }
+
+// ===================== F-260 =====================
+
+/// HttpArena と同じ 4 ポート（平文 HTTP/1.1 + h2c・TLS で h2 を選ばない HTTP/1.1・h2c だけ・TLS h2 + HTTP/3）と
+/// https へのリダイレクトのリスナーを 1 プロセスの `[[listener]]` で立てる。
+fn f260_config(dir: &std::path::Path, ports: &F260Ports, plain_extra: &str) -> String {
+    let (cert, key) = write_self_signed(dir);
+    let www = dir.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "multi").unwrap();
+    let http3 = if cfg!(feature = "http3") {
+        "http3 = true"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+[server]
+http2_enabled = true
+threads = 1
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[logging]
+level = "info"
+
+[[listener]]
+name = "plain"
+listen = "127.0.0.1:{plain}"
+tls = false
+
+[[listener]]
+name = "h1tls"
+listen = "127.0.0.1:{h1tls}"
+tls = true
+http2 = false
+
+[[listener]]
+name = "h2c"
+listen = "127.0.0.1:{h2c}"
+tls = false
+{plain_extra}
+
+[[listener]]
+name = "https"
+listen = "127.0.0.1:{https}"
+tls = true
+{http3}
+
+[[listener]]
+name = "redirect"
+listen = "127.0.0.1:{redirect}"
+tls = false
+secure_redirect = true
+redirect_to = "https"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www = tp(&www),
+        plain = ports.plain,
+        h1tls = ports.h1tls,
+        h2c = ports.h2c,
+        https = ports.https,
+        redirect = ports.redirect,
+    )
+}
+
+struct F260Ports {
+    plain: u16,
+    h1tls: u16,
+    h2c: u16,
+    https: u16,
+    redirect: u16,
+}
+
+impl F260Ports {
+    fn new() -> Self {
+        F260Ports {
+            plain: free_port(),
+            h1tls: free_port(),
+            h2c: free_port(),
+            https: free_port(),
+            redirect: free_port(),
+        }
+    }
+
+    fn all(&self) -> [u16; 5] {
+        [self.plain, self.h1tls, self.h2c, self.https, self.redirect]
+    }
+}
+
+/// F-260: 複数の `[[listener]]` を 1 プロセスで待ち受け、リスナーごとのプロトコル・ALPN・リダイレクトを守る。
+#[test]
+fn f260_multiple_listeners_in_one_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = F260Ports::new();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        f260_config(dir.path(), &ports, "allow_http = false"),
+    )
+    .unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    for p in ports.all() {
+        assert!(
+            wait_for_port(p, Duration::from_secs(20)),
+            "port {p}: {}",
+            veil.log()
+        );
+    }
+    // 1 リスナー 1 行の起動ログ
+    for name in ["plain", "h1tls", "h2c", "https", "redirect"] {
+        assert!(
+            veil.log().contains(&format!("listener \"{name}\"")),
+            "{name}: {}",
+            veil.log()
+        );
+    }
+
+    // 平文: HTTP/1.1 と h2c
+    let resp = http1_get(ports.plain, "/index.html").expect("plain HTTP/1.1");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "multi");
+    assert_eq!(
+        h2c_get(ports.plain, "/index.html"),
+        (200, b"multi".to_vec())
+    );
+
+    // TLS（http2 = false）: h2 を出しても選ばれず HTTP/1.1
+    let (alpn, resp) =
+        tls_alpn_get(ports.h1tls, &[b"h2", b"http/1.1"], "/index.html").expect("TLS h1");
+    assert_ne!(alpn.as_deref(), Some(&b"h2"[..]), "{}", veil.log());
+    let resp = resp.expect("HTTP/1.1 over TLS");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "multi");
+
+    // h2c だけ: HTTP/1.1 は 426、h2c は 200
+    let resp = http1_get(ports.h2c, "/index.html").expect("426");
+    assert_eq!(resp.status, 426, "{}", veil.log());
+    assert_eq!(h2c_get(ports.h2c, "/index.html"), (200, b"multi".to_vec()));
+
+    // TLS（http2 の既定 = [server] http2_enabled）: ALPN で h2
+    let (alpn, _) = tls_alpn_get(ports.https, &[b"h2", b"http/1.1"], "/index.html").expect("h2");
+    assert_eq!(alpn.as_deref(), Some(&b"h2"[..]), "{}", veil.log());
+    let (_, resp) = tls_alpn_get(ports.https, &[b"http/1.1"], "/index.html").expect("TLS h1");
+    let resp = resp.expect("HTTP/1.1 over TLS");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    #[cfg(feature = "http3")]
+    {
+        // Alt-Svc は HTTP/3 のリスナーの UDP ポート
+        let want = format!("h3=\":{}\"", ports.https);
+        assert!(
+            resp.header("alt-svc").is_some_and(|v| v.contains(&want)),
+            "alt-svc: {:?}",
+            resp.headers
+        );
+        assert_eq!(
+            h3_get_status(ports.https, "/index.html"),
+            Ok(200),
+            "{}",
+            veil.log()
+        );
+    }
+
+    // リダイレクトのリスナー: redirect_to のポートへ 301（HTTP/1.1・h2c とも）
+    let want = format!("https://localhost:{}/index.html", ports.https);
+    let resp = http1_get(ports.redirect, "/index.html").expect("301");
+    assert_eq!(resp.status, 301, "{}", veil.log());
+    assert_eq!(resp.header("location"), Some(want.as_str()));
+    let (status, headers, _) = h2c_get_with_headers(ports.redirect, "/index.html");
+    assert_eq!(status, 301);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(n, _)| n == "location")
+            .map(|(_, v)| v.as_str()),
+        Some(want.as_str())
+    );
+
+    // リロード: 平文の方針は反映され、リスナーの列の変更は警告して待ち受けは起動時のまま
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            &cfg_path,
+            f260_config(dir.path(), &ports, "allow_http = true"),
+        )
+        .unwrap();
+        veil.sighup();
+        assert!(
+            wait_until(Duration::from_secs(10), || http1_get(
+                ports.h2c,
+                "/index.html"
+            )
+            .is_ok_and(|r| r.status == 200)),
+            "allow_http = true must apply on reload: {}",
+            veil.log()
+        );
+        let moved = free_port();
+        let text = f260_config(dir.path(), &ports, "allow_http = true").replace(
+            &format!("127.0.0.1:{}", ports.plain),
+            &format!("127.0.0.1:{moved}"),
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        veil.sighup();
+        assert!(
+            wait_until(Duration::from_secs(10), || veil
+                .log()
+                .contains("Listener settings changed (listener)")),
+            "{}",
+            veil.log()
+        );
+        // 古い待ち受けのまま（新しいポートは開かない）。方針の表も起動時の列のまま引かれる
+        assert_eq!(
+            http1_get(ports.plain, "/index.html").map(|r| r.status).ok(),
+            Some(200)
+        );
+        assert!(http1_get(moved, "/index.html").is_err());
+        assert_eq!(
+            http1_get(ports.h2c, "/index.html").map(|r| r.status).ok(),
+            Some(200)
+        );
+    }
+}
+
+/// F-260: `[[listener]]` の規則違反は `-t` で分かる。
+#[test]
+fn f260_listener_rules_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    let run = |cfg: &str| {
+        std::fs::write(&cfg_path, cfg).unwrap();
+        let out = std::process::Command::new(veil_bin())
+            .arg("-t")
+            .arg("-c")
+            .arg(&cfg_path)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // 同じポート（ワイルドカードと個別のアドレス）
+    let (ok, err) = run(
+        "[[listener]]\nlisten = \"0.0.0.0:18080\"\ntls = false\n[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\n",
+    );
+    assert!(!ok && err.contains("same address"), "{err}");
+    // redirect_to の名前が無い
+    let (ok, err) = run(
+        "[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\nsecure_redirect = true\nredirect_to = \"nope\"\n",
+    );
+    assert!(!ok && err.contains("names no listener"), "{err}");
+    // [server] を書かずに [[listener]] だけ（平文）は通る
+    let (ok, err) = run("[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\n");
+    assert!(ok, "{err}");
+}

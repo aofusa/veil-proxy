@@ -269,7 +269,7 @@ pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
     let ip = peer.ip().to_string();
     let _ =
-        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, false, &TapH2).await;
+        crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, None, &TapH2).await;
 }
 
 struct TapH2;
