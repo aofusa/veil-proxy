@@ -803,8 +803,8 @@ servers = [
 tls_insecure = true
 
 # F-170: UDS バックエンド（Unix ドメインソケット上流）
-# `http(s)://unix:<socket-path>[:<path-prefix>]` は nginx の
-# `proxy_pass http://unix:/path:/uri;` と同じ表記。Host ヘッダは既定で "localhost"。
+# http(s)://unix:<socket-path>[:<path-prefix>] は nginx の
+# "proxy_pass http://unix:/path:/uri;" と同じ表記。Host ヘッダは既定で "localhost"。
 [upstreams."uds-tls-pool"]
 algorithm = "round_robin"
 servers = [

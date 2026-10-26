@@ -106,7 +106,8 @@ comp_suite() {
 }
 # F-270: comp_h3 <h3 の host:port> <path> <want sha>: HTTP/3 で gzip を受けて復号する（curl に HTTP/3 が無いので試験クライアント）
 comp_h3() {
-  "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "$1" GET "$2" -H 'accept-encoding: gzip' > "$TMPD/h3.out" 2>&1
+  # Git Bash が "/json" 等の要求のパスを Windows のパスに書き換えないように（W は C:/ の形）
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "$1" GET "$2" -H 'accept-encoding: gzip' > "$TMPD/h3.out" 2>&1
   "$PY3" -I -c '
 import gzip, hashlib, sys
 d = open(sys.argv[1], "rb").read()
@@ -509,7 +510,7 @@ body = (b"--BND\r\ncontent-disposition: form-data; name=\"t\"\r\n\r\nv\r\n--BND\
 open(sys.argv[1], "wb").write(body)
 print(sum(data))' "$W/mp.bin")
   expect "C multipart 30 MB (HTTP/3)" "t=1/118(mem);big:b.bin=31457280/$sum3(disk);" \
-    "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "127.0.0.1:$S" POST /upload -H 'content-type: multipart/form-data; boundary=BND' --data-file "$W/mp.bin"
+    env MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "127.0.0.1:$S" POST /upload -H 'content-type: multipart/form-data; boundary=BND' --data-file "$W/mp.bin"
   rm -f "$W/mp.bin"
 }
 

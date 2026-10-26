@@ -16,6 +16,7 @@
 #   - panic しない
 #   - SIGHUP で証明書をリロードできる（[tls] auto_reload。サンドボックス下でも新しい証明書を読める）
 #   - netbsd: ワーカーが root 以外の利用者で動く
+#   - 静的配信のキャッシュがディスクの変更に追従する（F-272 の監視。差し替え・起動後に作ったディレクトリ）
 #   - freebsd: capability mode 下でも接続ブローカー経由で上流へプロキシできる（F-182。TCP・ホスト名・
 #     UDS・upstream グループ + ヘルスチェック）。許可リスト外の上流を足すリロードは拒否し、ブローカーが
 #     死んだら本体も終了コード 1 で終わる
@@ -123,6 +124,14 @@ path = "/*"
 type = "File"
 path = "$DATA/www"
 index = "index.html"
+[route.open_file_cache]
+enabled = true
+valid_duration_secs = 300
+watch = true
+[route.static_file_cache]
+enabled = true
+valid_duration_secs = 300
+watch = true
 CFG
   mv "$WORK/veil.toml.new" "$WORK/veil.toml"
 }
@@ -151,6 +160,23 @@ echo "TRAV   http=$trav_code"
 [ "$root_code" = "200" ] && grep -q sec-root-ok r_root.txt || { echo "FAIL: root serving"; ok=0; }
 [ "$nest_code" = "200" ] && grep -q sec-nested-ok r_nest.txt || { echo "FAIL: nested serving"; ok=0; }
 grep -q SECRET r_trav.txt 2>/dev/null && { echo "FAIL: traversal leaked the secret"; ok=0; }
+
+# F-272: サンドボックスの下でもキャッシュがディスクの変更に追従する（Linux 以外は kqueue の監視スレッド。
+# 有効期間は 300 秒なので、通知が無ければ古い内容のまま）。起動後に作ったディレクトリも監視に入る。
+wfetch() { curl -sk "https://localhost:$PORT/$1" 2>/dev/null; }
+wwait() { # wwait <path> <want>
+  for i in $(seq 1 10); do [ "$(wfetch "$1")" = "$2" ] && return 0; sleep 1; done; return 1
+}
+wfetch sub/nested.html >/dev/null; wfetch sub/nested.html >/dev/null
+echo "sec-nested-NEW" > "$DATA/www/sub/nested.new"; mv "$DATA/www/sub/nested.new" "$DATA/www/sub/nested.html"
+if wwait sub/nested.html sec-nested-NEW; then echo "WATCH replace=ok"; else echo "FAIL: cache did not follow a replaced file ($(wfetch sub/nested.html))"; ok=0; fi
+mkdir -p "$DATA/www/late"; echo "late-1" > "$DATA/www/late/a.html"
+wwait late/a.html late-1 || { echo "FAIL: file in a new directory was not served"; ok=0; }
+wfetch late/a.html >/dev/null
+echo "late-2" > "$DATA/www/late/a.html"
+if wwait late/a.html late-2; then echo "WATCH new-dir=ok"; else echo "FAIL: cache did not follow a file in a new directory ($(wfetch late/a.html))"; ok=0; fi
+echo "sec-nested-ok" > "$DATA/www/sub/nested.new"; mv "$DATA/www/sub/nested.new" "$DATA/www/sub/nested.html"
+wwait sub/nested.html sec-nested-ok || { echo "FAIL: cache did not follow the restored file"; ok=0; }
 
 # 証明書のリロード（SIGHUP）
 before=$(fp); mkcert 2; kill -HUP "$PID"; sleep 4; after=$(fp)
@@ -370,17 +396,34 @@ url = \"http://127.0.0.1:18081\""
   grep -q 'panicked at' "$WORK/veil-br.log" && { echo "FAIL: panic (broker)"; grep -A5 'panicked at' "$WORK/veil-br.log"; ok=0; }
   kill "$BPID1" "$BPID2" 2>/dev/null; sleep 1
 fi
-# F-181: capability mode を要求したのに入れない構成（平文のリスナー `listen_cleartext`。F-200 より前は
-# `[server].http` の HTTP リダイレクトリスナーで、F-200 でこのキーは無くなった）は起動を中止する。
+# F-181: capability mode を要求したのに入れない構成（HTTP/3。cap_enter の後に UDP のソケットを作る）は起動を中止する。
 # allow_security_failures = true なら警告して rights 制限のみで起動する。
+# B-163 で平文のリスナー（listen_cleartext）は阻害要因ではなくなった（そのワーカーの bind もバリアで待つ）ので、
+# こちらは capability mode に入って平文でも配信できることを確かめる。
 if [ "$OS" = "freebsd" ]; then
-  SERVER_EXTRA='listen_cleartext = "127.0.0.1:9080"'
+  H3CFG='[http3]
+enabled = true'
+  SERVER_EXTRA='listen_cleartext = "127.0.0.1:9080"
+enable_secure_redirect = false'
   write_cfg ""
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-ct.log" 2>&1 &
+  CPID=$!
+  cc=000
+  for i in $(seq 1 30); do
+    cc=$(curl -s -o /dev/null -w '%{http_code}' -H 'host: localhost' "http://127.0.0.1:9080/" || echo 000)
+    [ "$cc" = "200" ] && break; sleep 1
+  done
+  echo "CLEARTEXT-CAPMODE http=$cc"
+  [ "$cc" = "200" ] || { echo "FAIL: listen_cleartext + capability mode did not serve"; tail -5 "$WORK/veil-ct.log"; ok=0; }
+  grep -q 'entered capability mode' "$WORK/veil-ct.log" || { echo "FAIL: listen_cleartext did not enter capability mode"; ok=0; }
+  kill "$CPID" 2>/dev/null; sleep 1
+  SERVER_EXTRA=""
+  write_cfg "$H3CFG"
   "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fc.log" 2>&1 &
   FPID=$!
   for i in $(seq 1 20); do kill -0 "$FPID" 2>/dev/null || break; sleep 1; done
   if kill -0 "$FPID" 2>/dev/null; then
-    echo "FAIL: capability mode + redirect listener did not abort"; kill "$FPID"; ok=0
+    echo "FAIL: capability mode + HTTP/3 did not abort"; kill "$FPID"; ok=0
   else
     wait "$FPID"; frc=$?
     echo "FAIL-CLOSED exit=$frc"
@@ -390,7 +433,7 @@ if [ "$OS" = "freebsd" ]; then
   SEC_SAVED="$SEC"
   SEC="$SEC
 allow_security_failures = true"
-  write_cfg ""
+  write_cfg "$H3CFG"
   "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-fo.log" 2>&1 &
   OPID=$!
   oc=000
@@ -402,7 +445,7 @@ allow_security_failures = true"
   [ "$oc" = "200" ] || { echo "FAIL: allow_security_failures = true did not start"; tail -5 "$WORK/veil-fo.log"; ok=0; }
   grep -q 'continuing in rights-limited mode' "$WORK/veil-fo.log" || { echo "FAIL: no rights-limited warning"; ok=0; }
   kill "$OPID" 2>/dev/null; sleep 1
-  grep -q 'panicked at' "$WORK/veil-fc.log" "$WORK/veil-fo.log" && { echo "FAIL: panic (fail-closed)"; ok=0; }
+  grep -q 'panicked at' "$WORK/veil-ct.log" "$WORK/veil-fc.log" "$WORK/veil-fo.log" && { echo "FAIL: panic (fail-closed)"; ok=0; }
   SEC="$SEC_SAVED"; SERVER_EXTRA=""
 fi
 if grep -q 'panicked at' "$WORK/veil.log"; then echo "FAIL: panic"; grep -A5 'panicked at' "$WORK/veil.log"; ok=0; fi
