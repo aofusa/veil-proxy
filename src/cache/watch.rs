@@ -680,13 +680,20 @@ mod linux {
         let created_dir = ev.mask & libc::IN_ISDIR != 0
             && ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
             && !ev.name.is_empty();
+        // B-193: ルートの中でディレクトリが移った。watch は inode に付いたまま動くが、持っているパスは古いままなので
+        // （その下に作ったディレクトリへ付けられず、外へ出たものは残る）、ルートの監視を付け直す
+        let moved_dir = ev.mask & libc::IN_ISDIR != 0
+            && ev.mask & (libc::IN_MOVED_FROM | libc::IN_MOVED_TO) != 0
+            && !ev.name.is_empty();
         for owner in owners {
             match owner {
                 Owner::Dir { root } => {
                     if let Some(r) = st.roots.get(root) {
                         r.gen.bump();
                     }
-                    if created_dir {
+                    if moved_dir {
+                        reattach(st, root);
+                    } else if created_dir {
                         let ino = st.inotify.as_mut().expect("inotify exists");
                         if let Err(e) = ino.add_tree(&dir.join(name), root) {
                             warn_partial(st, root, &e);
@@ -703,20 +710,35 @@ mod linux {
                     r.gen.bump();
                     if ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
                         // ルートが差し替わった: 新しいディレクトリに付け直す
-                        let path = r.path.clone();
-                        let ino = st.inotify.as_mut().expect("inotify exists");
-                        ino.remove_root(root);
-                        if let Err(e) = attach(ino, &path, root) {
-                            warn_partial(st, root, &e);
-                        }
-                        // 付け直す間の変更を取りこぼさない
-                        if let Some(r) = st.roots.get(root) {
-                            r.gen.bump();
-                        }
+                        reattach(st, root);
                     }
                 }
             }
         }
+    }
+
+    /// ルート `root` の監視を外して、今のパスで付け直す（付け直す間の変更を取りこぼさないよう世代を増やす）
+    fn reattach(st: &mut State, root: usize) {
+        let Some(path) = st.roots.get(root).map(|r| r.path.clone()) else {
+            return;
+        };
+        let ino = st.inotify.as_mut().expect("inotify exists");
+        ino.remove_root(root);
+        if let Err(e) = attach(ino, &path, root) {
+            warn_partial(st, root, &e);
+        }
+        if let Some(r) = st.roots.get(root) {
+            r.gen.bump();
+        }
+    }
+
+    /// テスト用: watch が持っているパスの一覧
+    #[cfg(test)]
+    pub(super) fn watched_paths(st: &State) -> Vec<PathBuf> {
+        st.inotify
+            .as_ref()
+            .map(|i| i.watches.values().map(|w| w.path.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// テスト用: 通知の領域を組み立てる
@@ -1744,6 +1766,49 @@ mod tests {
             linux::handle(&mut st, ev);
         }
         assert_eq!(a.current(), before + 1);
+    }
+
+    /// B-193: ルートの中でディレクトリを移した後も、移った先に作ったディレクトリの中の変更が届き、古いパスの
+    /// watch が残らない
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn inotify_follows_directory_moved_inside_root() {
+        use std::time::{Duration, Instant};
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("www");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let Some(g) = register(&root, 0) else {
+            eprintln!("file change notification unavailable; skipping");
+            return;
+        };
+        let wait_bump = |s: Stamp, what: &str| {
+            let t = Instant::now();
+            while fresh(Some(s), Some(g)) {
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "no notification for {what}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let s = g.stamp();
+        std::fs::rename(root.join("a"), root.join("b")).unwrap();
+        wait_bump(s, "directory moved inside the root");
+        std::thread::sleep(Duration::from_millis(100));
+        let s = g.stamp();
+        std::fs::create_dir(root.join("b").join("new")).unwrap();
+        wait_bump(s, "directory created in the moved directory");
+        std::thread::sleep(Duration::from_millis(100));
+        let s = g.stamp();
+        std::fs::write(root.join("b").join("new").join("x.txt"), b"x").unwrap();
+        wait_bump(s, "file in a directory created after the move");
+        let paths = linux::watched_paths(&lock_state());
+        assert!(
+            !paths.iter().any(|p| p.starts_with(root.join("a"))),
+            "stale watch paths: {paths:?}"
+        );
+        assert!(paths.contains(&root.join("b").join("new")), "{paths:?}");
     }
 
     /// 実際の通知（inotify・kqueue・ReadDirectoryChangesW）: 同じサイズの `mv` の差し替え・中身の上書き・

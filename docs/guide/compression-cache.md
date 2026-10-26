@@ -258,8 +258,8 @@ The static file caches (`open_file_cache` for file metadata and open fds, `stati
 and the compressed-variant cache) normally keep an entry until `valid_duration_secs` (60 seconds by default)
 runs out, so a file replaced on disk is served stale until then. With `watch = true`, veil watches the
 File route's `path` and rebuilds the cached entries on the next request after a change: replacing a file with
-`mv` (even with the same size), overwriting it in place (`cp`), creating files and directories, and swapping
-the whole directory (`mv` or a symlink switch of the route's `path`).
+`mv` (even with the same size), overwriting it in place (`cp`), creating, deleting and moving files and
+directories, and swapping the whole directory (`mv` or a symlink switch of the route's `path`).
 
 ```toml
 [performance]
