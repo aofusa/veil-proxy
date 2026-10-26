@@ -880,7 +880,10 @@ upgrade_suite() { # upgrade_suite <target-dir> <extra features>
     if [ "$K" = 0 ]; then
       "$PY3" -I "$ROOT/tests/api/upgrade_check.py" basic "$P" | sed "s|\$| ($tag, plaintext)|; s|^|  |" | tee "$W/r"
       grep -q "FAIL" "$W/r" && FAIL=1
-      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$P" 1000 | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      # 同時に開く数は fd の上限（OpenBSD の root は 1024）に収める（サーバ・クライアントの他の fd の分を残す）
+      local nmany=1000 hn; hn=$(ulimit -Hn 2>/dev/null)
+      case "$hn" in ''|unlimited) ;; *) [ $((hn - 200)) -lt "$nmany" ] && nmany=$((hn - 200)) ;; esac
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$P" "$nmany" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
       grep -q "^  ok" "$W/r" || FAIL=1
       expect "h2c: upgrade response is 400 ($tag)" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/raw-upgrade"
       expect "HTTP/2 (TLS): upgrade response is 400 ($tag)" "400" curl -ks --http2 -o /dev/null -w "%{http_code}" "https://127.0.0.1:$S/raw-upgrade"

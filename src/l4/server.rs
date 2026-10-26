@@ -236,6 +236,8 @@ pub fn spawn_l4_listeners(
 
                                     // F-46: L4 接続ハンドラの型付きタスクプール
                                     let conn_pool = crate::runtime::TaskPool::new();
+                                    let mut backoff = crate::listener_workers::AcceptBackoff::new();
+                                    let backoff_label = format!("L4:{} Worker", config.name);
 
                                     loop {
                                         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -251,12 +253,15 @@ pub fn spawn_l4_listeners(
                                                 .await;
 
                                         let (stream, peer_addr) = match accept_result {
-                                            Ok(Ok(s)) => s,
+                                            Ok(Ok(s)) => {
+                                                backoff.on_success();
+                                                s
+                                            }
                                             Ok(Err(e)) => {
-                                                error!(
-                                                    "[L4:{} Worker {}] accept error: {}",
-                                                    config.name, thread_id, e
-                                                );
+                                                // B-181: fd の上限で空回りしない
+                                                backoff
+                                                    .on_error(&e, &backoff_label, thread_id)
+                                                    .await;
                                                 continue;
                                             }
                                             Err(_) => continue,
@@ -312,10 +317,15 @@ pub fn spawn_l4_listeners(
                                             if let Err(e) =
                                                 listener.accept_batch(31, handle_accepted)
                                             {
-                                                error!(
-                                                    "[L4:{} Worker {}] accept error: {}",
-                                                    config.name, thread_id, e
-                                                );
+                                                // B-181: 資源不足は次の accept が扱う
+                                                if !crate::listener_workers::is_resource_exhausted(
+                                                    &e,
+                                                ) {
+                                                    error!(
+                                                        "[L4:{} Worker {}] accept error: {}",
+                                                        config.name, thread_id, e
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -386,77 +396,81 @@ fn spawn_l4_handler_listener(
                 let h = h.clone();
                 let listener_name = listener_name.clone();
                 let counter = counter.clone();
-                let spawned =
-                    thread::Builder::new()
-                        .stack_size(8 * 1024 * 1024)
-                        .spawn(move || {
-                            crate::runtime::block_on(async move {
-                                let listener = match crate::server::create_listener(
-                                    listen_addr,
-                                    balancing,
-                                    num_threads,
-                                    thread_id,
-                                ) {
-                                    Ok(l) => l,
-                                    Err(e) => {
-                                        error!(
-                                            "[L4:{} Worker {}] bind error on {}: {}",
-                                            listener_name, thread_id, listen_addr, e
-                                        );
-                                        return;
+                let spawned = thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        crate::runtime::block_on(async move {
+                            let listener = match crate::server::create_listener(
+                                listen_addr,
+                                balancing,
+                                num_threads,
+                                thread_id,
+                            ) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    error!(
+                                        "[L4:{} Worker {}] bind error on {}: {}",
+                                        listener_name, thread_id, listen_addr, e
+                                    );
+                                    return;
+                                }
+                            };
+                            let conn_pool = crate::runtime::TaskPool::new();
+                            let mut backoff = crate::listener_workers::AcceptBackoff::new();
+                            let backoff_label = format!("L4:{} Worker", listener_name);
+                            loop {
+                                if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let (stream, peer) = match timeout(
+                                    Duration::from_secs(1),
+                                    listener.accept(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(s)) => {
+                                        backoff.on_success();
+                                        s
                                     }
-                                };
-                                let conn_pool = crate::runtime::TaskPool::new();
-                                loop {
-                                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-                                        break;
-                                    }
-                                    let (stream, peer) =
-                                        match timeout(Duration::from_secs(1), listener.accept())
-                                            .await
-                                        {
-                                            Ok(Ok(s)) => s,
-                                            Ok(Err(e)) => {
-                                                error!(
-                                                    "[L4:{} Worker {}] accept error: {}",
-                                                    listener_name, thread_id, e
-                                                );
-                                                continue;
-                                            }
-                                            Err(_) => continue,
-                                        };
-                                    if max_conn > 0
-                                        && counter.current.load(Ordering::Relaxed) >= max_conn
-                                    {
-                                        warn!(
-                                            "[L4:{}] connection limit ({}) reached, rejecting {}",
-                                            listener_name, max_conn, peer
-                                        );
+                                    Ok(Err(e)) => {
+                                        // B-181: fd の上限で空回りしない
+                                        backoff.on_error(&e, &backoff_label, thread_id).await;
                                         continue;
                                     }
-                                    let _ = stream.set_nodelay(true);
-                                    counter.current.fetch_add(1, Ordering::Relaxed);
-                                    counter.total.fetch_add(1, Ordering::Relaxed);
-                                    let (h, name, counter) =
-                                        (h.clone(), listener_name.clone(), counter.clone());
-                                    crate::system::spawn_pooled_with_panic_catch(
-                                        &conn_pool,
-                                        async move {
-                                            struct Guard(Arc<L4ConnectionCounter>);
-                                            impl Drop for Guard {
-                                                fn drop(&mut self) {
-                                                    self.0.current.fetch_sub(1, Ordering::Relaxed);
-                                                }
-                                            }
-                                            let _g = Guard(counter);
-                                            crate::api::l4::serve_tcp(h, stream, peer, name, idle)
-                                                .await;
-                                        },
+                                    Err(_) => continue,
+                                };
+                                if max_conn > 0
+                                    && counter.current.load(Ordering::Relaxed) >= max_conn
+                                {
+                                    warn!(
+                                        "[L4:{}] connection limit ({}) reached, rejecting {}",
+                                        listener_name, max_conn, peer
                                     );
+                                    continue;
                                 }
-                            });
-                            crate::runtime::shutdown_thread();
+                                let _ = stream.set_nodelay(true);
+                                counter.current.fetch_add(1, Ordering::Relaxed);
+                                counter.total.fetch_add(1, Ordering::Relaxed);
+                                let (h, name, counter) =
+                                    (h.clone(), listener_name.clone(), counter.clone());
+                                crate::system::spawn_pooled_with_panic_catch(
+                                    &conn_pool,
+                                    async move {
+                                        struct Guard(Arc<L4ConnectionCounter>);
+                                        impl Drop for Guard {
+                                            fn drop(&mut self) {
+                                                self.0.current.fetch_sub(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        let _g = Guard(counter);
+                                        crate::api::l4::serve_tcp(h, stream, peer, name, idle)
+                                            .await;
+                                    },
+                                );
+                            }
                         });
+                        crate::runtime::shutdown_thread();
+                    });
                 if let Err(e) = spawned {
                     error!(
                         "[L4:{}] failed to spawn worker thread {}: {}",

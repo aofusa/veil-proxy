@@ -247,6 +247,7 @@ fn spawn_workers<S, Fut>(
 
                 // F-46: 接続ハンドラの型付きタスクプール（spawn ごとの Box 確保を排除）
                 let conn_pool = crate::runtime::TaskPool::new();
+                let mut backoff = AcceptBackoff::new();
 
                 loop {
                     // Shutdown チェック
@@ -259,9 +260,13 @@ fn spawn_workers<S, Fut>(
                     let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
 
                     let (stream, peer_addr) = match accept_result {
-                        Ok(Ok(s)) => s,
+                        Ok(Ok(s)) => {
+                            backoff.on_success();
+                            s
+                        }
                         Ok(Err(e)) => {
-                            error!("[{} {}] Accept error: {}", label, thread_id, e);
+                            // B-181: すぐに accept し直さない（fd の上限で空回りして接続が進まない）
+                            backoff.on_error(&e, &label, thread_id).await;
                             continue;
                         }
                         Err(_) => {
@@ -335,7 +340,10 @@ fn spawn_workers<S, Fut>(
                     #[cfg(veil_rt_reactor)]
                     {
                         if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
-                            error!("[{} {}] Accept error: {}", label, thread_id, e);
+                            // B-181: 資源不足は次の accept が待ち方ごと扱う（ここで毎回ログを出さない）
+                            if !is_resource_exhausted(&e) {
+                                error!("[{} {}] Accept error: {}", label, thread_id, e);
+                            }
                         }
                     }
                 }
@@ -496,5 +504,90 @@ pub(crate) fn spawn_http3_listener(
             info!("[{} {}] Stopped", label, thread_id);
         });
         handles.push(handle);
+    }
+}
+
+// B-181: accept の失敗の後の待ち方。
+//
+// fd の上限（EMFILE・ENFILE）やカーネルのメモリ不足（ENOBUFS・ENOMEM）では、バックログに接続が残る
+// 限りリスナーは読み取り可能のままなので、すぐに accept し直すと失敗し続ける。reactor では
+// `Accept::poll` が Pending を返さずにループが回り続け、同じワーカーの接続（閉じる処理を含む）が
+// 一切進まず、fd も空かない（OpenBSD の上限 1024 で 1000 本のアップグレード接続の E2E が固まった）。
+// nginx と同じく、資源不足のときは受理を短く止めてワーカーの他のタスクを進める。ログは
+// 資源不足が始まったときに 1 回だけ出す（受理に成功したら戻す）。
+pub(crate) struct AcceptBackoff {
+    exhausted: bool,
+}
+
+impl AcceptBackoff {
+    pub(crate) const PAUSE: Duration = Duration::from_millis(100);
+
+    pub(crate) fn new() -> Self {
+        Self { exhausted: false }
+    }
+
+    /// 受理に成功した（次の資源不足をまた記録する）。
+    #[inline]
+    pub(crate) fn on_success(&mut self) {
+        self.exhausted = false;
+    }
+
+    /// accept が `e` で失敗した後に呼ぶ。資源不足なら `PAUSE` だけ眠り、それ以外は 1 回だけ他のタスクへ譲る。
+    pub(crate) async fn on_error(&mut self, e: &std::io::Error, label: &str, thread_id: usize) {
+        if is_resource_exhausted(e) {
+            if !self.exhausted {
+                self.exhausted = true;
+                error!(
+                    "[{} {}] Accept error: {}; pausing accept for {} ms at a time until connections close \
+                     (raise the open file limit or lower max_concurrent_connections)",
+                    label,
+                    thread_id,
+                    e,
+                    Self::PAUSE.as_millis()
+                );
+            }
+            crate::runtime::time::sleep(Self::PAUSE).await;
+        } else {
+            error!("[{} {}] Accept error: {}", label, thread_id, e);
+            crate::runtime::yield_now().await;
+        }
+    }
+}
+
+/// fd・メモリの不足による accept の失敗か。
+pub(crate) fn is_resource_exhausted(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE・WSAENOBUFS
+        matches!(e.raw_os_error(), Some(10024 | 10055))
+    }
+}
+
+#[cfg(test)]
+mod accept_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_resource_exhaustion() {
+        #[cfg(unix)]
+        {
+            assert!(is_resource_exhausted(&std::io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(is_resource_exhausted(&std::io::Error::from_raw_os_error(
+                libc::ENFILE
+            )));
+            assert!(!is_resource_exhausted(&std::io::Error::from_raw_os_error(
+                libc::ECONNABORTED
+            )));
+        }
+        assert!(!is_resource_exhausted(&std::io::Error::other("x")));
     }
 }
