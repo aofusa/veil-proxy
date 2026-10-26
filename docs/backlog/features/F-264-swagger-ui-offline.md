@@ -108,18 +108,25 @@
   イメージ（`mcr.microsoft.com/playwright/python`）はブラウザだけで Python の playwright を持たないので、ホストで wheel を落として
   渡す。docker の既定の seccomp は io_uring を拒否するので `--security-opt seccomp=unconfined` で起こす。
 
+- F-262 の WebSocket の操作（`x-veil-websocket`）で Try it out を出さないプラグイン（`VeilNoTryItOut`）は、同梱の初期化の
+  スクリプトと CDN のページの両方に入れた（`swagger_ui.rs` の `no_try_it_out_plugin!`）。`swagger_offline.sh` は
+  `rust-websocket` で `/ws`・`/typed` に無く `/plaintext` に有ることも見る。
+
 ### 検証
 
-- Linux（手元）: 単体 5 件、`library_e2e.sh nonregression` ALL OK（full・full-container のバイナリに `swagger-ui` 無し、
-  `handler,openapi` がビルドできる）、`swagger_offline.sh all` ALL OK（Rust 1 経路・Python 3 経路が描画、CSP 違反・コンソールの
-  エラー・他オリジンへの要求 0。`script-src 'self'` のままで `unsafe-eval` は要らない）、`check-messages.py`・`check-docs.sh`・
-  `update-swagger-ui.sh --check` が通る。
-- macOS（ssh llm）: 単体（`full-macos,api`）5 件、`nonregression`・`python` ALL OK、`rust` は Swagger UI の確認がすべて ok。
-  clippy `-D warnings`（`--lib` の `handler,openapi`・`api`、`--lib --tests` の `full-macos,api`）が通る。
-- Windows（ssh aofish）: 単体（`full-windows,api`）5 件、`nonregression`・`python` ALL OK、`rust` は Swagger UI の確認がすべて ok。
-- `rust` の残りの失敗（このチケットと無関係。F-260 でログの文が変わった台本の期待）: 「threads default = CPU count」
-  （`Workers: N` を探す）と「defaults are plaintext h2c-only + HTTP/1.1」（`H2C (HTTP/2 Cleartext) Server` を探す）。Windows では
-  加えて「access log on stdout by default」。
+feat/v0100（F-261〜F-263 を含む）へ載せ直した後（a23b2681、Windows の python は 721d4a8d）で:
+
+- Linux（手元）: `cargo fmt --check`、clippy `-D warnings`（`full --all-targets`・`full,epoll --all-targets`・`--lib --tests` の
+  `api`・`--lib` の `handler,openapi`）、`cargo test --lib --bins --test integration_tests --features full`（1149 + 63 件）、
+  `library_e2e.sh nonregression`（full・full-container のバイナリに `swagger-ui` 無し、`handler,openapi` がビルドできる）・`rust`・
+  `python` が ALL OK、`swagger_offline.sh all` ALL OK（Rust の hello・websocket と Python が描画、CSP 違反・コンソールの
+  エラー・他オリジンへの要求 0、`/ws`・`/typed` に Try it out が無く `/plaintext` に有る。`script-src 'self'` のままで
+  `unsafe-eval` は要らない）、`check-messages.py`・`check-docs.sh`・`update-swagger-ui.sh --check` が通る。
+- macOS（ssh llm）: clippy `-D warnings`（`--lib` の `handler,openapi`・`--lib --tests` の `api`・`full-macos,api`）、単体、
+  `library_e2e.sh rust`・`nonregression`・`python` が ALL OK。
+- Windows（ssh aofish）: clippy `--lib --tests` の `full-windows,api`、単体、`rust`（2 回）・`nonregression`・`python` が ALL OK。
+  `python` は F-263 の常駐ループ（Windows の既定の ProactorEventLoop に `add_reader` が無い）と `ws_check.py`（`resource` が
+  無い）を直してから通った。
 
 ### 決めたこと
 
