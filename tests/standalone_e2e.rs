@@ -3591,3 +3591,68 @@ path = "{www}"
         veil.log()
     );
 }
+
+/// B-210: `Expect: 100-continue` の要求がルートの本文の上限（`[route.security] max_request_body_size`）を超えるなら、
+/// 100 Continue を返さずに 413 を返す（以前は先に 100 Continue を返し、クライアントが本文を送り始めてから 413 で閉じたため、
+/// Windows では未読の本文で RST になり 413 が届かなかった）。上限内の要求には従来どおり 100 Continue を返す。
+#[test]
+fn b210_expect_continue_waits_for_route_body_limit() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let echo = spawn_body_echo();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+[route.security]
+max_request_body_size = 1000
+"#
+        ),
+    )
+    .unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    // 本文を送らずに最初の応答行を読む
+    let first_line = |len: usize| -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            s,
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\nExpect: 100-continue\r\n\r\n"
+        )
+        .unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let over = first_line(5000);
+    assert!(over.starts_with("HTTP/1.1 413"), "{over:?}\n{}", veil.log());
+    let under = first_line(100);
+    assert!(
+        under.starts_with("HTTP/1.1 100"),
+        "{under:?}\n{}",
+        veil.log()
+    );
+}

@@ -479,18 +479,12 @@ pub(super) async fn handle_requests(
 
                 let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
 
-                // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す
-                if content_length > 0 && !defer_size && check_expect_continue(&headers_for_proxy) {
-                    // ボディサイズが制限内であることを確認済みなので 100 Continue を送信
-                    let write_result = timeout(
-                        WRITE_TIMEOUT,
-                        tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
-                    )
-                    .await;
-                    if let Err(_) | Ok((Err(_), _)) = write_result {
-                        return;
-                    }
-                }
+                // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す。
+                // B-210: 返すのはルートの検査（`[route.security]` の本文の上限・IP・メソッド・レート制限）を通った後
+                // （以前はここで返していたため、ルートの上限で 413 にする要求もクライアントが本文を送り始め、
+                // Windows では未読の本文を残して閉じた RST で 413 が届かなかった）
+                let early_continue =
+                    content_length > 0 && !defer_size && check_expect_continue(&headers_for_proxy);
 
                 // メトリクスエンドポイントの処理（設定可能なパス）
                 // Prometheusスクレイピング用の特別なパス
@@ -845,6 +839,16 @@ pub(super) async fn handle_requests(
                         lingering_drain_before_close(&mut tls_stream).await;
                     }
                     return;
+                }
+                if early_continue {
+                    let write_result = timeout(
+                        WRITE_TIMEOUT,
+                        tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
+                    )
+                    .await;
+                    if let Err(_) | Ok((Err(_), _)) = write_result {
+                        return;
+                    }
                 }
 
                 // 初期ボディ（ヘッダー後のデータ）

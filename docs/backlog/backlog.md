@@ -537,6 +537,7 @@
 | B-207 | P3 | 修正済み（v0.10.0） | [bugs/B-207-python-aio-jobs-dropped-and-reregistration.md](bugs/B-207-python-aio-jobs-dropped-and-reregistration.md) | Python の常駐ループ: 捨てられたジョブでワーカーが永久に待ち、登録が 1 回きりで 2 回目の run が失敗する |
 | B-208 | P3 | 修正済み（v0.10.0） | [bugs/B-208-release-draft-check-swallows-gh-errors.md](bugs/B-208-release-draft-check-swallows-gh-errors.md) | release.yml の公開済みの判定が gh のどんな失敗も「draft 無し」とみなす |
 | B-209 | P3 | 修正済み（v0.10.0） | [bugs/B-209-c-listener-zero-init-not-default.md](bugs/B-209-c-listener-zero-init-not-default.md) | C の veil_listener_t は 0 初期化で既定にならず、拡張の余地が無い |
+| B-210 | P2 | 修正済み（v0.10.0） | [bugs/B-210-expect-continue-before-route-body-limit.md](bugs/B-210-expect-continue-before-route-body-limit.md) | HTTP/1.1 で `Expect: 100-continue` の要求にルートの検査（本文の上限等）より前に 100 Continue を返し、413 で閉じるときに未読の本文で RST になって Windows では 413 が届かなかった。100 Continue をルートの検査の後に返す（v0.10.0 の Windows の検証で発覚） |
 
 ---
 
