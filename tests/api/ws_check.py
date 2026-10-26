@@ -16,11 +16,15 @@ import asyncio
 import base64
 import hashlib
 import os
-import resource
 import ssl
 import struct
 import sys
 import time
+
+try:  # Windows には無い（fd の上限を上げる処理は飛ばす）
+    import resource
+except ImportError:  # pragma: no cover
+    resource = None
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 results = []
@@ -38,6 +42,13 @@ def bad(name, why=""):
 
 def check(name, cond, why=""):
     ok(name) if cond else bad(name, why)
+
+
+def raise_nofile(want):
+    if resource is None:
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, want)), hard))
 
 
 class WS:
@@ -336,8 +347,7 @@ async def kit(port):
 
 
 async def sleepers(port, n):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, n + 256)), hard))
+    raise_nofile(n + 256)
     sem = asyncio.Semaphore(500)
 
     async def one():
@@ -359,8 +369,7 @@ async def sleepers(port, n):
 
 
 async def many(port, n, tls):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, n + 256)), hard))
+    raise_nofile(n + 256)
     sem = asyncio.Semaphore(200)
 
     async def one(i):
