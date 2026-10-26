@@ -328,7 +328,7 @@ impl FilterEngine {
                     };
                     let ctx = std::mem::replace(
                         &mut p.store.data_mut().http_ctx,
-                        HttpContext::for_module(1, &module),
+                        HttpContext::for_module(1, module),
                     );
                     (slot, p, ctx)
                 }
@@ -462,7 +462,7 @@ impl FilterEngine {
             }
         }
         // 要求の中身（ヘッダ・本文）をプールの間に持ち続けない
-        sess.store.data_mut().http_ctx = HttpContext::for_module(1, &module);
+        sess.store.data_mut().http_ctx = HttpContext::for_module(1, module);
         slot.release(PooledInstance {
             store: sess.store,
             instance: sess.instance,
@@ -655,7 +655,7 @@ impl FilterEngine {
         let num_headers = headers.len() as i32;
 
         // Create context（文字列は Arc 共有、ヘッダはムーブ）
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.set_request(method.clone(), path.clone(), headers, client_ip.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
@@ -846,7 +846,7 @@ impl FilterEngine {
         let num_headers = headers.len() as i32;
 
         // Create context（ヘッダはムーブ）
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.set_response(status, headers);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
@@ -998,7 +998,7 @@ impl FilterEngine {
         response: super::types::HttpCallResponse,
     ) -> anyhow::Result<ModuleResult> {
         // Create context with HTTP call response
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
@@ -1240,7 +1240,7 @@ impl FilterEngine {
         }
 
         // Create context（F-271: 要求のメソッド・パス・ヘッダも見えるようにする）
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         if let Some(r) = request {
             http_ctx.set_request(
                 r.method.clone(),
@@ -1393,7 +1393,7 @@ impl FilterEngine {
         }
 
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         let body_len = body.len();
         http_ctx.set_response_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
@@ -1497,7 +1497,7 @@ impl FilterEngine {
     ) -> anyhow::Result<()> {
         // F-148: `config_size` に `configuration.len()` を渡すため、実体のバッファも必ず同じものを積む
         // （サイズだけ非ゼロで中身が空だと、モジュールが proxy_get_buffer(PluginConfiguration) で空を読む）。
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
@@ -1566,7 +1566,7 @@ impl FilterEngine {
     ) -> anyhow::Result<bool> {
         // Create context
         // F-148: `execute_on_log` と同じ理由で configuration の実体も積む。
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
@@ -1662,7 +1662,7 @@ impl FilterEngine {
     /// Execute on_tick for a single module
     async fn execute_on_tick(&self, module: &LoadedModule) -> anyhow::Result<()> {
         // Create context
-        let http_ctx = HttpContext::for_module(1, &module);
+        let http_ctx = HttpContext::for_module(1, module);
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
@@ -1779,7 +1779,7 @@ impl FilterEngine {
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.request_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
@@ -1927,7 +1927,7 @@ impl FilterEngine {
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.response_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
@@ -2041,7 +2041,7 @@ impl FilterEngine {
         queue_id: u32,
     ) -> anyhow::Result<()> {
         // Create context
-        let http_ctx = HttpContext::for_module(1, &module);
+        let http_ctx = HttpContext::for_module(1, module);
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
@@ -2149,7 +2149,7 @@ impl FilterEngine {
         headers: &[(bytes::Bytes, bytes::Bytes)],
     ) -> anyhow::Result<()> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
@@ -2274,7 +2274,7 @@ impl FilterEngine {
         message: &[u8],
     ) -> anyhow::Result<()> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
@@ -2396,7 +2396,7 @@ impl FilterEngine {
         trailers: &[(bytes::Bytes, bytes::Bytes)],
     ) -> anyhow::Result<()> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
@@ -2517,7 +2517,7 @@ impl FilterEngine {
         status_code: i32,
     ) -> anyhow::Result<()> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
@@ -2635,7 +2635,7 @@ impl FilterEngine {
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
     ) -> anyhow::Result<NetworkAction> {
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
@@ -2775,7 +2775,7 @@ impl FilterEngine {
         direction: NetworkDataDirection,
     ) -> anyhow::Result<NetworkDataModuleResult> {
         let data_len = data.len() as i32;
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         match direction {
             NetworkDataDirection::Downstream => {
                 http_ctx.downstream_data = crate::wasm::context::BodyBuffer::Shared(data)
@@ -2921,7 +2921,7 @@ impl FilterEngine {
         configuration: &Arc<[u8]>,
         callback_name: &str,
     ) -> anyhow::Result<()> {
-        let mut http_ctx = HttpContext::for_module(1, &module);
+        let mut http_ctx = HttpContext::for_module(1, module);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_root_id = module.root_id.clone();
         http_ctx.plugin_configuration = configuration.clone();
