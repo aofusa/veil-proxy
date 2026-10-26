@@ -1142,6 +1142,12 @@ PY
     expect "production ($kind): small responses stay uncompressed" "none" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: br' '$B/api/items/7' | tr A-Z a-z | grep -q content-encoding && echo br || echo none"
     expect "production ($kind): body under the limit" "201" bash -c "dd if=/dev/zero bs=1000 count=1 2>/dev/null | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
     expect "production ($kind): body limit" "413" bash -c "dd if=/dev/zero bs=1000 count=2000 2>/dev/null | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
+    # B-211: Expect: 100-continue の上限超過は 100 を返さずに 413（本文を送る前の最初の応答行）
+    expect "production ($kind): Expect over the limit gets 413 first" "HTTP/1.1 413" "$PY3" -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"POST /api/items HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n")
+print(s.recv(256).decode("latin-1").splitlines()[0])' "${B##*:}"
     expect "production ($kind): Prometheus metrics" "veil_proxy_http_requests_total" curl -s "$B/metrics"
     expect "production ($kind): h2c" '"id":8' curl -s --http2-prior-knowledge "$B/api/items/8"
     [ "$kind" = python ] && expect "production (python): async def and run_in_threadpool" '"sha256"' curl -s "$B/api/hash"

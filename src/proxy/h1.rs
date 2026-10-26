@@ -810,6 +810,8 @@ pub(super) async fn handle_requests(
                     if checked_length != 0 {
                         let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        // 未読の本文を残して閉じると RST で 413 が届かない（B-102・B-211）
+                        lingering_drain_before_close(&mut tls_stream).await;
                         return;
                     }
                     if expect_continue {
@@ -839,6 +841,24 @@ pub(super) async fn handle_requests(
                         lingering_drain_before_close(&mut tls_stream).await;
                     }
                     return;
+                }
+                // B-211: 本文を溜めるハンドラのルートは `[api] max_body_size` も 100 Continue の前に見る
+                // （B-210 はルートの上限だけで、こちらは 100 を返してから本文の途中で 413 にして閉じていた）
+                #[cfg(feature = "handler")]
+                if let Backend::Handler(e, _, _, _) = &backend {
+                    if !e.streaming_request
+                        && !is_chunked
+                        && content_length > crate::api::app::max_body_size()
+                    {
+                        let resp = crate::api::response::Response::error(413, "Payload Too Large");
+                        let mut out = crate::api::dispatch::http1_head(&resp, false);
+                        out.extend_from_slice(&resp.body);
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await;
+                        if content_length > accumulated.len() {
+                            lingering_drain_before_close(&mut tls_stream).await;
+                        }
+                        return;
+                    }
                 }
                 if early_continue {
                     let write_result = timeout(
@@ -1811,6 +1831,8 @@ pub(super) async fn handle_api_handler(
             let mut out = crate::api::dispatch::http1_head(&resp, false);
             out.extend_from_slice(&resp.body);
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await;
+            // 本文の途中で打ち切った（chunked の上限超過等）: 読み捨ててから閉じる（B-102・B-211）
+            lingering_drain_before_close(&mut tls_stream).await;
             return Some((tls_stream, status, resp.body.len() as u64, true));
         }
     };
