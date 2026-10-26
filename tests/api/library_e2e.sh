@@ -30,6 +30,16 @@ case "$OS" in
 esac
 PY3="${PY3:-python3}"
 EXE=""; [ "$OS" = Windows ] && EXE=.exe
+# 同時接続の試験（WebSocket 2,000 本・asyncio の 2,000 並行）が OS の既定の上限で落ちないようにする（root のときだけ）。
+# OpenBSD の root のハード上限は 1024 fd。BSD の listen の待ち行列は既定 128 で、NetBSD は溢れた SYN に RST を返す
+# （ConnectionResetError）。veil の listen の値（1024）まで上げる。root でなければ ws_check.py が本数を上限に合わせる。
+if [ "$OS" != Windows ] && [ "$(id -u 2>/dev/null)" = 0 ]; then
+  h="$(ulimit -Hn)"; [ "$h" != unlimited ] && [ "$h" -lt 8192 ] && ulimit -Hn 8192 2>/dev/null
+  case "$OS" in NetBSD|OpenBSD) q=kern.somaxconn ;; FreeBSD) q=kern.ipc.soacceptqueue ;; *) q="" ;; esac
+  if [ -n "$q" ] && [ "$(sysctl -n "$q" 2>/dev/null || echo 1024)" -lt 1024 ]; then
+    { sysctl -w "$q=1024" || sysctl "$q=1024"; } >/dev/null 2>&1 && echo "== $q raised to 1024 for the concurrency tests"
+  fi
+fi
 TMPD="$(mktemp -d)"
 cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done; rm -rf "$TMPD"; }
 # timeout(1) は macOS・OpenBSD の基本システムに無い

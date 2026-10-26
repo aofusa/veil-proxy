@@ -210,6 +210,17 @@ sysctl -w net.core.netdev_max_backlog=65535
 sysctl -w kernel.io_uring_setup_flags=0
 ```
 
+veil listens with a backlog of 1024, but the kernel caps it. The BSDs default to 128, and NetBSD answers the SYNs
+that overflow it with a reset, so a burst of new connections fails there. Raise the limit:
+
+```bash
+sysctl kern.ipc.soacceptqueue=1024   # FreeBSD
+sysctl kern.somaxconn=1024           # OpenBSD
+sysctl -w kern.somaxconn=1024        # NetBSD
+```
+
+On OpenBSD the default login class limits even root to 1024 open files; raise `openfiles-max` in `/etc/login.conf`.
+
 ### FreeBSD: zero-copy h2c static files (F-240)
 
 On FreeBSD, the static content cache (`[static_file_cache]` + `[route.open_file_cache]`) keeps file bodies of 16 KB

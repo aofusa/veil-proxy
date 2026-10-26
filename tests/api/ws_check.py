@@ -51,6 +51,19 @@ def raise_nofile(want):
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, want)), hard))
 
 
+def fd_budget(n):
+    """fd の上限を n + 256 まで上げ、上げられない（root でない BSD のハード上限 1024 等）ときは本数を上限に合わせる。"""
+    raise_nofile(n + 256)
+    if resource is None:
+        return n
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if soft == resource.RLIM_INFINITY or soft >= n + 256:
+        return n
+    m = max(soft - 256, 100)
+    print(f"  note: {n} connections capped to {m} by RLIMIT_NOFILE ({soft})")
+    return m
+
+
 class WS:
     def __init__(self, r, w, head):
         self.r, self.w, self.head = r, w, head
@@ -347,7 +360,7 @@ async def kit(port):
 
 
 async def sleepers(port, n):
-    raise_nofile(n + 256)
+    n = fd_budget(n)
     sem = asyncio.Semaphore(500)
 
     async def one():
@@ -369,7 +382,7 @@ async def sleepers(port, n):
 
 
 async def many(port, n, tls):
-    raise_nofile(n + 256)
+    n = fd_budget(n)
     sem = asyncio.Semaphore(200)
 
     async def one(i):

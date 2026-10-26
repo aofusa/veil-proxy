@@ -208,6 +208,17 @@ sysctl -w net.core.netdev_max_backlog=65535
 sysctl -w kernel.io_uring_setup_flags=0
 ```
 
+veil は listen の待ち行列を 1024 で作りますが、カーネルが上限で切ります。BSD の既定は 128 で、NetBSD は溢れた SYN に
+リセットを返すので、新しい接続が一度に来ると失敗します。上限を上げてください:
+
+```bash
+sysctl kern.ipc.soacceptqueue=1024   # FreeBSD
+sysctl kern.somaxconn=1024           # OpenBSD
+sysctl -w kern.somaxconn=1024        # NetBSD
+```
+
+OpenBSD では既定のログインクラスが root でもファイル数を 1024 に制限します。`/etc/login.conf` の `openfiles-max` を上げてください。
+
 ### FreeBSD: h2c の静的配信のゼロコピー（F-240）
 
 FreeBSD では、静的コンテンツキャッシュ（`[static_file_cache]` + `[route.open_file_cache]`）は 16KB 以上のファイルの本体を
