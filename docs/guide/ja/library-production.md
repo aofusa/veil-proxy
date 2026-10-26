@@ -125,7 +125,10 @@ br か gzip で圧縮します（クライアントの `Accept-Encoding` で決�
 `App::serve_dir`（Rust）と `veil_kit.staticfiles.StaticFiles`・`app.serve_dir`（Python）は、プロキシのファイル配信
 （sendfile・Range・`ETag`）でディレクトリを配ります。事前圧縮した `.br`・`.gz` は使いません。ルートの
 `[route.compression]` が HTTP/2・HTTP/3 でファイルをその場で圧縮し、結果をキャッシュします（HTTP/1.1 はそのまま送ります）。
-よく読まれるディレクトリではキャッシュを有効にします:
+
+`serve_dir` はそのルートのファイルのメタデータのキャッシュ（`open_file_cache`）と HTTP/2・HTTP/3 のファイル本体のキャッシュ
+（`static_file_cache`）を有効にします（Rust は `ServeOptions { open_file_cache, static_file_cache, .. }`、Python は `cache=False`
+で無効）。手で書く `type = "File"` のルートでは自分で、必ず両方をセットで有効にします:
 
 <!-- not-a-full-config -->
 ```toml
@@ -138,14 +141,29 @@ path = "/srv/app/assets"
 [route.open_file_cache]
 enabled = true
 valid_duration_secs = 60
-watch = true                         # ディスクの変更にすぐ追従する（下の注を参照）
+watch = true                         # ディスクの変更にすぐ追従する（下を参照）
 [route.static_file_cache]
 enabled = true
 watch = true
 ```
 
-`watch` は、`valid_duration_secs` を待たずに inotify・kqueue でディスクの変更に追従させます（veil 0.10）。使わないなら、
-動いている間にファイルが変わるときは `valid_duration_secs` を短くするか、新しいファイルを新しい名前で置きます。
+既定では、キャッシュしたメタデータと本体を `valid_duration_secs` の間信用するので、動いている間に差し替えたファイルはその後で
+見えます。`watch = true`（veil 0.10）にすると、キャッシュ（と圧縮結果のキャッシュ）がディスクの変更にすぐ追従します。専用の
+スレッドがルートのディレクトリを監視し（Linux は inotify、BSD・macOS は kqueue、Windows は `ReadDirectoryChangesW`）、
+キャッシュに当たった要求に増えるのは原子変数の読み取り 1 回だけです。両方のキャッシュで同じ値にします（片方だけ追従すると
+もう片方に古い内容が残る）。`watch` を指定しない `serve_dir` のルートには、既定値で全ルートに効かせます:
+
+<!-- not-a-full-config -->
+```toml
+[performance]
+open_file_cache_watch = true
+[static_file_cache]
+watch = true
+```
+
+監視の上限（Linux は `fs.inotify.max_user_watches`、kqueue は `RLIMIT_NOFILE` の 4 分の 1）に当たると、警告を出して
+`valid_duration_secs` だけの追従に戻ります。`watch` を使わないなら、動いている間にファイルが変わるときは `valid_duration_secs` を
+短くするか、新しいファイルを新しい名前で置きます。
 
 ## Python
 

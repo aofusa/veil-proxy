@@ -128,7 +128,12 @@ Compression needs the `compression` feature (in `full`; the Python wheel has it)
 `App::serve_dir` (Rust) and `veil_kit.staticfiles.StaticFiles` / `app.serve_dir` (Python) serve a directory with
 the proxy's file backend (sendfile, Range, `ETag`). Precompressed `.br` / `.gz` siblings are not used; the route's
 `[route.compression]` compresses files on the fly for HTTP/2 and HTTP/3 and caches the result (HTTP/1.1 sends files
-as they are). Enable the caches for directories that are read often:
+as they are).
+
+`serve_dir` turns on the file metadata cache (`open_file_cache`) and the file contents cache for HTTP/2 and
+HTTP/3 (`static_file_cache`) for its route (`ServeOptions { open_file_cache, static_file_cache, .. }` in Rust,
+`cache=False` in Python turn them off). A hand-written `type = "File"` route enables them itself, always both
+together:
 
 <!-- not-a-full-config -->
 ```toml
@@ -141,15 +146,30 @@ path = "/srv/app/assets"
 [route.open_file_cache]
 enabled = true
 valid_duration_secs = 60
-watch = true                         # follow changes on disk right away (see the note below)
+watch = true                         # follow changes on disk right away (see below)
 [route.static_file_cache]
 enabled = true
 watch = true
 ```
 
-`watch` makes the caches follow changes on disk through inotify / kqueue instead of waiting for
-`valid_duration_secs` (veil 0.10). Without it, keep `valid_duration_secs` short when files change while the server
-runs, or deploy new files under new names.
+By default the cached metadata and contents are trusted for `valid_duration_secs`, so a file replaced while the
+server runs is seen only after that. `watch = true` (veil 0.10) makes the caches, and the cache of compressed
+results, follow changes on disk right away: a dedicated thread watches the route's directory (inotify on Linux,
+kqueue on the BSDs and macOS, `ReadDirectoryChangesW` on Windows), and a cache hit only reads one atomic
+variable. Set it to the same value for both caches; if only one follows, the other keeps the old content. For
+`serve_dir` routes, which do not set `watch`, turn it on for every route with the defaults:
+
+<!-- not-a-full-config -->
+```toml
+[performance]
+open_file_cache_watch = true
+[static_file_cache]
+watch = true
+```
+
+When the watch limit is reached (`fs.inotify.max_user_watches` on Linux, a quarter of `RLIMIT_NOFILE` for kqueue)
+veil logs a warning and falls back to `valid_duration_secs`. Without `watch`, keep `valid_duration_secs` short when
+files change while the server runs, or deploy new files under new names.
 
 ## Python
 
