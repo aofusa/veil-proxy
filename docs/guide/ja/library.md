@@ -807,7 +807,8 @@ let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
 graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-`POST` は JSON 本文（単発またはバッチ）、`GET` は `?query=...&variables=...` を受け、クエリの無い `GET` でブラウザ
+`POST` は JSON 本文（単発またはバッチ。`Content-Type: application/json` 以外は 415）、`GET` は `?query=...&variables=...`
+（問い合わせ・サブスクリプションだけ。mutation は 405）を受け、クエリの無い `GET` でブラウザ
 （`Accept: text/html`）なら GraphiQL を返します。クライアントが求めたときは `application/graphql-response+json`、
 それ以外は `application/json` で応答します。`Accept: text/event-stream` の要求はサブスクリプションを SSE
 （GraphQL over SSE の distinct connections モード）で返します（結果ごとに `event: next`、最後に `event: complete`）。

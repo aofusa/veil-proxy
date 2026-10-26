@@ -849,7 +849,8 @@ let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
 graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-It serves `POST` with a JSON body (single or batch) and `GET` with `?query=...&variables=...`, GraphiQL for a browser
+It serves `POST` with a JSON body (single or batch; a `Content-Type` other than `application/json` gives 415) and
+`GET` with `?query=...&variables=...` (queries and subscriptions; a mutation gives 405), GraphiQL for a browser
 `GET` without a query (`Accept: text/html`), `application/graphql-response+json` when the client asks for it
 (otherwise `application/json`), and subscriptions over SSE (GraphQL over SSE, distinct connections mode) when the
 request has `Accept: text/event-stream`: one `event: next` per result and a final `event: complete`.

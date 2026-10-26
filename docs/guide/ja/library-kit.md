@@ -216,7 +216,8 @@ let schema = Schema::build(Query, Mutation, Subscription).finish();
 App::new().with(veil_kit::graphql::mount("/graphql", schema))
 ```
 
-`POST`（単発とバッチ）と `GET`、受け付けるなら `application/graphql-response+json`、SSE（`Accept: text/event-stream`）と
+`POST`（単発とバッチ。`Content-Type` は `application/json` に限り、他は 415）と `GET`（問い合わせとサブスクリプション。
+`GET` の mutation は `Allow: POST` 付きの 405。他サイトのリンクや `SameSite=Lax` の Cookie で mutation を実行させない）、受け付けるなら `application/graphql-response+json`、SSE（`Accept: text/event-stream`）と
 WebSocket（`graphql-transport-ws`・`graphql-ws`、HTTP/1.1）のサブスクリプション、`graphiql` feature ではブラウザの `GET` に GraphiQL
 （ページはスクリプトを CDN から読む）。kit は async-graphql 7 に固定しています。
 

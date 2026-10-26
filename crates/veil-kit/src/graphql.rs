@@ -18,8 +18,9 @@
 //!
 //! One path serves:
 //!
-//! - `POST` (`application/json`, batches too) and `GET` (query string): GraphQL over HTTP. The response type is
-//!   `application/graphql-response+json` when the client accepts it, `application/json` otherwise.
+//! - `POST` (`Content-Type: application/json`, batches too; another type gives 415) and `GET` (query string; queries
+//!   and subscriptions only, a mutation gives 405 so that a cross-site link cannot run one): GraphQL over HTTP. The
+//!   response type is `application/graphql-response+json` when the client accepts it, `application/json` otherwise.
 //! - `Accept: text/event-stream`: GraphQL over SSE (distinct connections mode): `event: next` per result, then
 //!   `event: complete`.
 //! - A WebSocket upgrade with `Sec-WebSocket-Protocol: graphql-transport-ws` (or the older `graphql-ws`):
@@ -64,6 +65,36 @@ where
     }
 }
 
+/// Whether the `Content-Type` is JSON (`application/json` or the GraphQL media types, with any parameters).
+fn json_content_type(ct: Option<&str>) -> bool {
+    let Some(ct) = ct else { return false };
+    let media = ct.split(';').next().unwrap_or("").trim();
+    [
+        "application/json",
+        GRAPHQL_RESPONSE,
+        "application/graphql+json",
+    ]
+    .iter()
+    .any(|m| media.eq_ignore_ascii_case(m))
+}
+
+/// Whether the operation a `GET` request would run is a mutation (a document that does not parse is left to the
+/// executor, which reports the error).
+fn is_mutation(r: &mut async_graphql::Request) -> bool {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+    let name = r.operation_name.clone();
+    let Ok(doc) = r.parsed_query() else {
+        return false;
+    };
+    match &doc.operations {
+        DocumentOperations::Single(op) => op.node.ty == OperationType::Mutation,
+        DocumentOperations::Multiple(ops) => ops
+            .iter()
+            .filter(|(n, _)| name.as_deref().is_none_or(|want| n.as_str() == want))
+            .any(|(_, op)| op.node.ty == OperationType::Mutation),
+    }
+}
+
 fn accepts(req: &Request, media: &str) -> bool {
     req.header("accept")
         .map(|a| a.contains(media))
@@ -88,14 +119,27 @@ where
                 return graphiql(endpoint);
             }
             match async_graphql::http::parse_query_string(req.query()) {
-                Ok(r) => async_graphql::BatchRequest::Single(r),
+                Ok(mut r) => {
+                    // B-196: GET で mutation を実行しない（Lax の Cookie はトップレベルの GET 遷移に付く）
+                    if is_mutation(&mut r) {
+                        return Response::error(405, "mutations require POST")
+                            .with_header("allow", "POST");
+                    }
+                    async_graphql::BatchRequest::Single(r)
+                }
                 Err(e) => return Response::bad_request(&e.to_string()),
             }
         }
-        "POST" => match serde_json::from_slice::<async_graphql::BatchRequest>(req.body()) {
-            Ok(r) => r,
-            Err(e) => return Response::bad_request(&format!("invalid GraphQL request: {}", e)),
-        },
+        "POST" => {
+            // B-196: JSON 以外の Content-Type（text/plain のフォーム等、CORS の事前確認の要らない要求）は受けない
+            if !json_content_type(req.header("content-type")) {
+                return Response::error(415, "GraphQL requests must be application/json");
+            }
+            match serde_json::from_slice::<async_graphql::BatchRequest>(req.body()) {
+                Ok(r) => r,
+                Err(e) => return Response::bad_request(&format!("invalid GraphQL request: {}", e)),
+            }
+        }
         _ => return Response::error(405, "Method Not Allowed"),
     };
 
@@ -208,4 +252,126 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::{EmptySubscription, Object};
+
+    struct Query;
+    #[Object]
+    impl Query {
+        async fn add(&self, a: i32, b: i32) -> i32 {
+            a + b
+        }
+    }
+
+    struct Mutation;
+    #[Object]
+    impl Mutation {
+        async fn delete_account(&self) -> bool {
+            true
+        }
+    }
+
+    fn run(method: &str, target: &str, ct: Option<&str>, body: &str) -> Response {
+        let schema = Schema::new(Query, Mutation, EmptySubscription);
+        let headers = ct
+            .map(|c| {
+                vec![(
+                    Bytes::from_static(b"content-type"),
+                    Bytes::from(c.to_string()),
+                )]
+            })
+            .unwrap_or_default();
+        let req = Request::new(
+            method.to_string(),
+            target.to_string(),
+            headers,
+            body.to_string(),
+        );
+        futures::executor::block_on(execute(&schema, "/graphql", req))
+    }
+
+    // B-196: GET は query だけ、POST は JSON の Content-Type だけ
+    #[test]
+    fn get_runs_queries_only() {
+        let r = run("GET", "/graphql?query=%7Badd(a%3A1%2Cb%3A2)%7D", None, "");
+        assert_eq!(r.status_code(), 200);
+        assert!(String::from_utf8_lossy(r.body()).contains("3"));
+        let r = run(
+            "GET",
+            "/graphql?query=mutation%7BdeleteAccount%7D",
+            None,
+            "",
+        );
+        assert_eq!(r.status_code(), 405);
+        assert_eq!(r.header("allow"), Some(&b"POST"[..]));
+        // 名前付きの複数の操作: 選んだものの種類で決める（async-graphql の GET の解析は `operation_name` を読む。
+        // `operationName` は読まれず、選ばないと mutation を含む文書は 405）
+        let doc = "query%20Q%7Badd(a%3A1%2Cb%3A1)%7D%20mutation%20M%7BdeleteAccount%7D";
+        let r = run(
+            "GET",
+            &format!("/graphql?query={doc}&operation_name=Q"),
+            None,
+            "",
+        );
+        assert_eq!(
+            r.status_code(),
+            200,
+            "{}",
+            String::from_utf8_lossy(r.body())
+        );
+        let r = run(
+            "GET",
+            &format!("/graphql?query={doc}&operation_name=M"),
+            None,
+            "",
+        );
+        assert_eq!(r.status_code(), 405);
+        let r = run("GET", &format!("/graphql?query={doc}"), None, "");
+        assert_eq!(r.status_code(), 405);
+        let r = run(
+            "GET",
+            &format!("/graphql?query={doc}&operationName=Q"),
+            None,
+            "",
+        );
+        assert_eq!(r.status_code(), 405);
+    }
+
+    #[test]
+    fn post_requires_json() {
+        let body = r#"{"query":"mutation{deleteAccount}"}"#;
+        assert_eq!(
+            run("POST", "/graphql", Some("application/json"), body).status_code(),
+            200
+        );
+        assert_eq!(
+            run(
+                "POST",
+                "/graphql",
+                Some("Application/JSON; charset=utf-8"),
+                body
+            )
+            .status_code(),
+            200
+        );
+        assert_eq!(
+            run("POST", "/graphql", Some("text/plain"), body).status_code(),
+            415
+        );
+        assert_eq!(
+            run(
+                "POST",
+                "/graphql",
+                Some("application/x-www-form-urlencoded"),
+                body
+            )
+            .status_code(),
+            415
+        );
+        assert_eq!(run("POST", "/graphql", None, body).status_code(), 415);
+    }
 }

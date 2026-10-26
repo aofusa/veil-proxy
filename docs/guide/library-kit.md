@@ -225,7 +225,9 @@ let schema = Schema::build(Query, Mutation, Subscription).finish();
 App::new().with(veil_kit::graphql::mount("/graphql", schema))
 ```
 
-`POST` (single and batch) and `GET`, `application/graphql-response+json` when accepted, subscriptions over SSE
+`POST` (single and batch; the `Content-Type` must be `application/json`, otherwise 415) and `GET` (queries and
+subscriptions; a mutation over `GET` gives 405 with `Allow: POST`, so a cross-site link or a `SameSite=Lax` cookie
+cannot trigger one), `application/graphql-response+json` when accepted, subscriptions over SSE
 (`Accept: text/event-stream`) and over WebSocket (`graphql-transport-ws` and `graphql-ws`, HTTP/1.1), and GraphiQL for
 a browser `GET` with the `graphiql` feature (the page loads its scripts from a CDN). The kit pins async-graphql 7.
 
