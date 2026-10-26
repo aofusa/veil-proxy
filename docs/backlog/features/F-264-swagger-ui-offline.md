@@ -114,7 +114,7 @@
 
 ### 検証
 
-feat/v0100（F-261〜F-263 を含む）へ載せ直した後（a23b2681、Windows の python は 721d4a8d）で:
+feat/v0100（F-261〜F-263・F-266〜F-268・F-270 を含む 097da327 + b5bc84d6）へ載せ直した後（0033594e）で:
 
 - Linux（手元）: `cargo fmt --check`、clippy `-D warnings`（`full --all-targets`・`full,epoll --all-targets`・`--lib --tests` の
   `api`・`--lib` の `handler,openapi`）、`cargo test --lib --bins --test integration_tests --features full`（1149 + 63 件）、
