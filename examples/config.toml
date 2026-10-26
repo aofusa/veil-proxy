@@ -2780,11 +2780,11 @@ watch = false
 #                                      # 受けるときだけ。compression feature が必要。F-209）
 # grpc_response_compression_min_size = 1024   # これ未満の gRPC メッセージは圧縮しない（バイト）
 # grpc_web_cors_origins = []      # ブラウザから gRPC-Web で呼んでよい Origin（["*"] で全部。空ならプリフライトは 403。F-209）
-# upgrade_idle_timeout_secs = 0    # アップグレードした HTTP/1.1 の接続で読み取りが待てる秒数（0 = 無制限。F-261）
+# upgrade_idle_timeout_secs = 300  # アップグレードした HTTP/1.1 の接続で読み取りが待てる秒数（0 = 無制限。F-261、既定は B-197）
 # websocket_max_message_size = 16777216   # 組み立て後の WebSocket のメッセージの上限（超えたら 1009 で閉じる。F-262）
 # websocket_max_frame_size = 16777216     # WebSocket の 1 フレームの上限
-# websocket_ping_interval_secs = 0        # サーバから Ping を送る間隔（0 = 送らない）
-# websocket_idle_timeout_secs = 0         # フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限）
+# websocket_ping_interval_secs = 30       # 黙った WebSocket にサーバから Ping を送るまでの秒数（0 = 送らない。B-197）
+# websocket_idle_timeout_secs = 120       # フレーム（Pong を含む）を受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限。B-197）
 # websocket_compression = false           # permessage-deflate（RFC 7692）を交渉する（compression feature が必要）
 # openapi_websocket = true                # WebSocket のルートを OpenAPI に載せる
 # openapi_grpc = true                     # gRPC のメソッドを OpenAPI に載せる（POST /pkg.Svc/Method・x-grpc。F-265）

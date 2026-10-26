@@ -518,6 +518,7 @@
 | B-193 | P3 | 修正済み（v0.10.0） | [bugs/B-193-inotify-moved-directory-stale-path.md](bugs/B-193-inotify-moved-directory-stale-path.md) | inotify: ルートの中でディレクトリを移すと監視が古いパスのまま残り、移った先に作ったディレクトリの変更を追えない。移動でルートの監視を付け直す |
 | B-195 | P2 | 修正済み（v0.10.0） | [bugs/B-195-multipart-total-size-unbounded.md](bugs/B-195-multipart-total-size-unbounded.md) | ストリーミング受信の multipart に本文全体の上限が無い |
 | B-196 | P2 | 修正済み（v0.10.0） | [bugs/B-196-graphql-get-mutation-and-content-type.md](bugs/B-196-graphql-get-mutation-and-content-type.md) | veil-kit の GraphQL が GET で mutation を実行し、POST の Content-Type を見ない |
+| B-197 | P2 | 修正済み（v0.10.0） | [bugs/B-197-websocket-upgrade-no-default-timeout.md](bugs/B-197-websocket-upgrade-no-default-timeout.md) | WebSocket・アップグレード接続に既定のタイムアウトが無く、途中のフレームで大きな受信バッファを握れる |
 
 ---
 

@@ -227,7 +227,7 @@ pub struct ApiSettings {
     /// Maximum size of a sent gRPC message (0 = unlimited).
     pub grpc_max_send_message_size: usize,
     // F-261
-    /// Seconds a read on an upgraded connection may wait before failing (0 = no limit).
+    /// Seconds a read on an upgraded connection may wait before failing (0 = no limit). Defaults to 300.
     pub upgrade_idle_timeout_secs: u64,
     // F-262
     /// Maximum size of an assembled WebSocket message (larger closes with 1009).
@@ -236,10 +236,11 @@ pub struct ApiSettings {
     /// Maximum size of one WebSocket frame.
     pub websocket_max_frame_size: usize,
     // F-262
-    /// Seconds between server Pings on idle WebSocket connections (0 = none).
+    /// Seconds between server Pings on idle WebSocket connections (0 = none). Defaults to 30.
     pub websocket_ping_interval_secs: u64,
     // F-262
-    /// Seconds without a received message before a WebSocket connection is closed (0 = no limit).
+    /// Seconds without a received frame (a Pong counts) before a WebSocket connection is closed (0 = no limit).
+    /// Defaults to 120.
     pub websocket_idle_timeout_secs: u64,
     // F-262
     /// Negotiate permessage-deflate (RFC 7692) when the client offers it.
@@ -332,11 +333,12 @@ impl ApiSettings {
                 })
                 .unwrap_or_default(),
             grpc_max_send_message_size: n("grpc_max_send_message_size", 0),
-            upgrade_idle_timeout_secs: n("upgrade_idle_timeout_secs", 0) as u64,
+            // B-197: 既定で期限を付ける（何も送らない接続が同時接続の枠を握り続けない）
+            upgrade_idle_timeout_secs: n("upgrade_idle_timeout_secs", 300) as u64,
             websocket_max_message_size: n("websocket_max_message_size", 16 * 1024 * 1024),
             websocket_max_frame_size: n("websocket_max_frame_size", 16 * 1024 * 1024),
-            websocket_ping_interval_secs: n("websocket_ping_interval_secs", 0) as u64,
-            websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 0) as u64,
+            websocket_ping_interval_secs: n("websocket_ping_interval_secs", 30) as u64,
+            websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 120) as u64,
             websocket_compression: b("websocket_compression", false),
             openapi_websocket: b("openapi_websocket", true),
             openapi_grpc: b("openapi_grpc", true),
@@ -868,5 +870,19 @@ mod tests {
         assert!(s.openapi_enabled);
         assert_eq!(s.openapi_path, "/docs");
         assert_eq!(s.max_body_size, 10 * 1024 * 1024);
+        // B-197: アップグレード・WebSocket は既定で期限と Ping を持つ
+        assert_eq!(s.upgrade_idle_timeout_secs, 300);
+        assert_eq!(s.websocket_ping_interval_secs, 30);
+        assert_eq!(s.websocket_idle_timeout_secs, 120);
+        // B-195: 0 = max_body_size
+        assert_eq!(s.multipart_max_total_size, 0);
+        let t: toml::Value = toml::from_str(
+            "websocket_idle_timeout_secs = 0\nupgrade_idle_timeout_secs = 0\nmultipart_max_total_size = 5",
+        )
+        .unwrap();
+        let s = ApiSettings::from_value(Some(&t));
+        assert_eq!(s.websocket_idle_timeout_secs, 0);
+        assert_eq!(s.upgrade_idle_timeout_secs, 0);
+        assert_eq!(s.multipart_max_total_size, 5);
     }
 }

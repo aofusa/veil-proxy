@@ -259,11 +259,11 @@ for debugging.
 | `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
 | `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
 | `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
-| `upgrade_idle_timeout_secs` | `0` | seconds a `read` on an upgraded HTTP/1.1 connection may wait (0 = no limit) |
+| `upgrade_idle_timeout_secs` | `300` | seconds a `read` on an upgraded HTTP/1.1 connection may wait (0 = no limit) |
 | `websocket_max_message_size` | `16777216` | maximum size of an assembled WebSocket message (larger closes with 1009) |
 | `websocket_max_frame_size` | `16777216` | maximum size of one WebSocket frame |
-| `websocket_ping_interval_secs` | `0` | seconds between Pings the server sends on a WebSocket (0 = none) |
-| `websocket_idle_timeout_secs` | `0` | seconds without a received frame before a WebSocket is closed with 1001 (0 = no limit) |
+| `websocket_ping_interval_secs` | `30` | seconds of silence after which the server sends a Ping on a WebSocket (0 = none) |
+| `websocket_idle_timeout_secs` | `120` | seconds without a received frame (a Pong counts) before a WebSocket is closed with 1001 (0 = no limit) |
 | `websocket_compression` | `false` | negotiate permessage-deflate (RFC 7692) when the client offers it (needs the `compression` feature) |
 | `openapi_websocket` | `true` | list WebSocket routes in the OpenAPI document |
 | `openapi_grpc` | `true` | list gRPC methods in the OpenAPI document (see [gRPC in OpenAPI](#grpc-in-openapi)) |
@@ -427,7 +427,7 @@ async fn echo(req: Request) -> Response {
   is HTTP/1.0, has a body, or arrived over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220 extended CONNECT is not supported).
   `h2c` is reserved (500 and a warning).
 - An upgraded connection still counts against `[security] max_concurrent_connections`. `[api] upgrade_idle_timeout_secs`
-  (default 0 = none) makes a `read` that waits longer fail with `TimedOut`.
+  (default 300; 0 = none) makes a `read` that waits longer fail with `TimedOut`.
 - With `tokio-compat`, `up.into_tokio_io()` returns an object implementing `veil::tokio::io::{AsyncRead, AsyncWrite}`
   for tokio-based protocol libraries (one extra copy through a task on the same worker).
 - C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)` with the L4 TCP callbacks (`on_connect` / `on_data` /
@@ -477,8 +477,9 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
 - Frames are decoded in place in a pooled receive buffer (the mask is removed 8 bytes at a time and payloads are
   `Bytes` slices); a waiting connection holds no buffer. Server frames are written header + payload with one
   vectored write, and replies to messages that arrived together (pipelining) are written together before the next read.
-- `auto_pong(false)` hands Pings to you without answering them. `[api] websocket_ping_interval_secs` sends Pings and
-  `websocket_idle_timeout_secs` closes connections that stay silent.
+- `auto_pong(false)` hands Pings to you without answering them. `[api] websocket_ping_interval_secs` (default 30) sends
+  Pings and `websocket_idle_timeout_secs` (default 120) closes connections that stay silent; a client that answers the
+  Pings stays open. A frame is buffered as it arrives, not reserved at its declared length.
 - `origin(&["https://app.example"])` accepts only those `Origin` values (403 otherwise). The default does not check
   the origin: browsers send cookies with cross-site WebSocket handshakes, so restrict it if you authenticate with
   cookies (cross-site WebSocket hijacking).

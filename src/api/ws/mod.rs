@@ -51,8 +51,9 @@ use std::time::{Duration, Instant};
 
 static MAX_MESSAGE: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024);
 static MAX_FRAME: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024);
-static PING_INTERVAL_SECS: AtomicU64 = AtomicU64::new(0);
-static IDLE_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+// B-197: 既定で Ping とアイドルの切断を有効にする（[api] の既定と同じ値）
+static PING_INTERVAL_SECS: AtomicU64 = AtomicU64::new(30);
+static IDLE_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(120);
 #[cfg(feature = "compression")]
 static COMPRESSION: AtomicBool = AtomicBool::new(false);
 
@@ -544,6 +545,16 @@ const CLOSE_WAIT: Duration = Duration::from_secs(5);
 // 読み取りバッファに最低限空けておく量。
 const READ_MIN: usize = 4 * 1024;
 
+// B-197: フレームのヘッダが宣言した長さをまとめて確保しない（宣言だけで最大 websocket_max_frame_size を
+// 握られる）。届いた量に合わせて倍々に伸ばす。
+/// The spare capacity to have before the next read: what the current frame still needs, but at most as much as
+/// is already buffered (so the buffer only doubles), and at least `READ_MIN`.
+fn read_want(need: usize, buffered: usize) -> usize {
+    need.saturating_sub(buffered)
+        .min(buffered.max(READ_MIN))
+        .max(READ_MIN)
+}
+
 struct Conn {
     up: Upgraded,
     rbuf: BytesMut,
@@ -866,11 +877,7 @@ impl Conn {
             if self.rbuf.capacity() == 0 {
                 self.rbuf = crate::pool::accum_buf_get();
             }
-            let want = self
-                .dec
-                .need()
-                .saturating_sub(self.rbuf.len())
-                .max(READ_MIN);
+            let want = read_want(self.dec.need(), self.rbuf.len());
             if self.rbuf.capacity() - self.rbuf.len() < want {
                 self.rbuf.reserve(want);
             }
@@ -1284,6 +1291,24 @@ pub(crate) fn fuzz_decode(data: &[u8]) {
 mod tests {
     use super::*;
     use crate::api::extract::FromRequest;
+
+    // B-197: 16 MiB を宣言したフレームでも、届いた量の倍までしか確保しない
+    #[test]
+    fn read_reserve_follows_received_bytes() {
+        assert_eq!(read_want(0, 0), READ_MIN);
+        assert_eq!(read_want(16 << 20, 14), READ_MIN);
+        assert_eq!(read_want(16 << 20, 64 * 1024), 64 * 1024);
+        assert_eq!(read_want(100, 50), READ_MIN);
+        let mut have = 14usize;
+        let mut steps = 0;
+        while have < 16 << 20 {
+            let w = read_want(16 << 20, have);
+            assert!(w <= have.max(READ_MIN));
+            have += w;
+            steps += 1;
+        }
+        assert!(steps < 20);
+    }
 
     fn req(h: &[(&'static str, &'static str)]) -> Request {
         Request::new(

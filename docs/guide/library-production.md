@@ -186,8 +186,8 @@ files change while the server runs, or deploy new files under new names.
   `async def` handlers themselves are the bottleneck; more loops let more coroutines run, still under one GIL.
   `python_event_loop = "auto"` uses uvloop when it is installed (`pip install uvloop`), which is faster than the
   asyncio loop. `python_event_loop_queue` (65536) bounds the calls waiting for a loop; beyond it requests get 503.
-- With WebSockets, set `websocket_ping_interval_secs` and `websocket_idle_timeout_secs` so that dead connections
-  are closed.
+- With WebSockets, `websocket_ping_interval_secs` (default 30) and `websocket_idle_timeout_secs` (default 120) close
+  dead connections; lower them if proxies or NAT in front drop idle connections sooner.
 
 ## File descriptors
 

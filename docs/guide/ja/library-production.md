@@ -180,7 +180,8 @@ watch = true
   足ります。増やすと同時に動くコルーチンは増えますが、GIL は 1 つのままです。`python_event_loop = "auto"` は uvloop が
   入っていれば使い（`pip install uvloop`）、asyncio のループより速くなります。`python_event_loop_queue`（65536）は
   ループを待てる呼び出しの数で、超えた要求は 503 になります。
-- WebSocket を使うなら、`websocket_ping_interval_secs` と `websocket_idle_timeout_secs` を設定して死んだ接続を閉じます。
+- WebSocket の死んだ接続は `websocket_ping_interval_secs`（既定 30）と `websocket_idle_timeout_secs`（既定 120）で閉じます。
+  前段のプロキシ・NAT がもっと早くアイドルの接続を切るなら下げます。
 
 ## ファイル記述子
 

@@ -72,8 +72,8 @@ impl UpgradeHook {
     }
 }
 
-/// `[api] upgrade_idle_timeout_secs`（0 = 無し）。読み取りの待ちに効かせる。
-static IDLE_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+/// `[api] upgrade_idle_timeout_secs`（0 = 無し）。読み取りの待ちに効かせる。既定は [api] と同じ 300 秒（B-197）。
+static IDLE_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(300);
 
 pub(crate) fn set_idle_timeout_secs(secs: u64) {
     IDLE_TIMEOUT_SECS.store(secs, Ordering::Relaxed);

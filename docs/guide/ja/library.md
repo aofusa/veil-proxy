@@ -249,11 +249,11 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `grpc_response_compression` | `"none"` | gRPC の応答メッセージの圧縮: `"none"`・`"gzip"`・`"deflate"`（クライアントが `grpc-accept-encoding` で受けるときだけ。`compression` feature が必要） |
 | `grpc_response_compression_min_size` | `1024` | この大きさ（バイト）未満の gRPC の応答メッセージは圧縮しない |
 | `grpc_web_cors_origins` | `[]` | ブラウザから gRPC-Web で呼んでよい Origin（`["*"]` で全部）。空なら CORS のヘッダを付けず、プリフライトは 403 |
-| `upgrade_idle_timeout_secs` | `0` | アップグレードした HTTP/1.1 の接続で `read` が待てる秒数（0 = 無制限） |
+| `upgrade_idle_timeout_secs` | `300` | アップグレードした HTTP/1.1 の接続で `read` が待てる秒数（0 = 無制限） |
 | `websocket_max_message_size` | `16777216` | 組み立て後の WebSocket のメッセージの上限（超えたら 1009 で閉じる） |
 | `websocket_max_frame_size` | `16777216` | WebSocket の 1 フレームの上限 |
-| `websocket_ping_interval_secs` | `0` | サーバから WebSocket に Ping を送る間隔（0 = 送らない） |
-| `websocket_idle_timeout_secs` | `0` | フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限） |
+| `websocket_ping_interval_secs` | `30` | WebSocket が黙ってからサーバが Ping を送るまでの秒数（0 = 送らない） |
+| `websocket_idle_timeout_secs` | `120` | フレーム（Pong を含む）を受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限） |
 | `websocket_compression` | `false` | クライアントが申し出たら permessage-deflate（RFC 7692）を交渉する（`compression` feature が必要） |
 | `openapi_websocket` | `true` | WebSocket のルートを OpenAPI に載せる |
 | `openapi_grpc` | `true` | gRPC のメソッドを OpenAPI に載せる（[OpenAPI の gRPC](#openapi-の-grpc)） |
@@ -409,7 +409,7 @@ async fn echo(req: Request) -> Response {
 - 要求がアップグレードの要求でない（`Connection: upgrade` / `Upgrade` が無い）・HTTP/1.0・本文付き・HTTP/2 や HTTP/3 で届いた
   （RFC 8441 / RFC 9220 の拡張 CONNECT は非対応）ときは、veil が 400 に置き換えます。`h2c` は予約済みです（500 と警告）。
 - アップグレードした接続も `[security] max_concurrent_connections` に数えます。`[api] upgrade_idle_timeout_secs`
-  （既定 0 = 無し）を設定すると、それより長く待った `read` は `TimedOut` で失敗します。
+  （既定 300。0 = 無し）より長く待った `read` は `TimedOut` で失敗します。
 - `tokio-compat` では `up.into_tokio_io()` が `veil::tokio::io::{AsyncRead, AsyncWrite}` を実装したものを返し、tokio 前提の
   プロトコル実装を載せられます（同じワーカーのタスクを経由するので 1 回余分に写します）。
 - C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)`。L4 の TCP と同じコールバック（`on_connect` / `on_data` /
@@ -456,8 +456,9 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
 - フレームはプールの受信バッファの中で復号します（マスクは 8 バイトずつ外し、本文は `Bytes` の切り出し）。待っている接続は
   バッファを持ちません。サーバのフレームはヘッダと本文を 1 回の `writev` で送り、まとめて届いたメッセージへの返信は次の
   読み取りの前にまとめて送ります。
-- `auto_pong(false)` で Ping に自動で応えず渡します。`[api] websocket_ping_interval_secs` で Ping を送り、
-  `websocket_idle_timeout_secs` で黙った接続を閉じます。
+- `auto_pong(false)` で Ping に自動で応えず渡します。`[api] websocket_ping_interval_secs`（既定 30）で Ping を送り、
+  `websocket_idle_timeout_secs`（既定 120）で黙った接続を閉じます（Ping に応えるクライアントは閉じません）。フレームは
+  宣言された長さでなく、届いた量に合わせてバッファを伸ばします。
 - `origin(&["https://app.example"])` で許す `Origin` を絞れます（違えば 403）。既定は検査しません。ブラウザはクロスサイトの
   WebSocket のハンドシェイクにも Cookie を付けるので、Cookie で認証するなら絞ってください（クロスサイト WebSocket ハイジャック）。
 - permessage-deflate（RFC 7692）は `[api] websocket_compression = true` のときだけ交渉します（既定は off。展開後の大きさは
