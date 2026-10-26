@@ -38,7 +38,7 @@ pub enum WasmBodyOutcome {
 /// 要求のメソッド・パス（プロパティ `request.path`）・ヘッダが見える。
 pub async fn apply_wasm_request_body(
     engine: &FilterEngine,
-    modules: &[crate::wasm_plugin_config::ModuleRef],
+    modules: &crate::wasm_plugin_config::WasmModules,
     body: bytes::Bytes,
     end_of_stream: bool,
     request: Option<&super::RequestMeta<'_>>,
@@ -47,7 +47,13 @@ pub async fn apply_wasm_request_body(
         return WasmBodyOutcome::Continue(body);
     }
     match engine
-        .on_request_body_with_modules(modules, body.clone(), end_of_stream, request)
+        .on_request_body_with_modules(
+            modules,
+            body.clone(),
+            end_of_stream,
+            request,
+            modules.sessions(),
+        )
         .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
@@ -67,7 +73,7 @@ pub async fn apply_wasm_request_body(
 /// `modules` が空なら一切コストをかけずそのまま返す。
 pub async fn apply_wasm_response_body(
     engine: &FilterEngine,
-    modules: &[crate::wasm_plugin_config::ModuleRef],
+    modules: &crate::wasm_plugin_config::WasmModules,
     body: bytes::Bytes,
     end_of_stream: bool,
 ) -> WasmBodyOutcome {
@@ -75,7 +81,7 @@ pub async fn apply_wasm_response_body(
         return WasmBodyOutcome::Continue(body);
     }
     match engine
-        .on_response_body_with_modules(modules, body.clone(), end_of_stream)
+        .on_response_body_with_modules(modules, body.clone(), end_of_stream, modules.sessions())
         .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),

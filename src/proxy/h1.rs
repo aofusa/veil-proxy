@@ -888,10 +888,10 @@ pub(super) async fn handle_requests(
                 // モジュールリストをローカル変数として保持（スレッドローカルを使わない、並行タスク間の干渉を防ぐ）
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 #[cfg(feature = "wasm")]
-                let modules_to_apply: Arc<
-                    Vec<crate::wasm_plugin_config::ModuleRef>,
-                > = if let Some(backend_modules) = backend.modules_arc() {
-                    backend_modules.clone()
+                // B-177: 要求ごとの Wasm の状態（instance_reuse のモジュールは要求の間同じ context を使う）
+                let modules_to_apply: crate::wasm_plugin_config::WasmModules =
+                    if let Some(backend_modules) = backend.modules_arc() {
+                    crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
                 } else {
                     crate::wasm::empty_wasm_modules()
                 };
@@ -1453,7 +1453,7 @@ pub(super) async fn handle_backend(
     initial_body: &[u8],
     client_wants_close: bool,
     #[cfg(feature = "handler")] api_cache: &mut crate::api::dispatch::CallCache,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
     client_ip: &str,
     // 本文を読み過ぎた分（次の要求）を足す先（B-186。本文を読み終えたら呼び出し側が蓄積へ戻す）
     pipelined: &mut BytesMut,
@@ -2102,11 +2102,12 @@ fn set_body_framing_headers(headers: &mut Vec<(Bytes, Bytes)>, len: usize) {
 /// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧。要求ごとに `Arc` を作らないよう
 /// スレッドごとに 1 つを使い回す（F-202）。
 #[cfg(not(feature = "wasm"))]
-pub(super) fn no_wasm_modules() -> Arc<Vec<crate::wasm_plugin_config::ModuleRef>> {
+pub(super) fn no_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     thread_local! {
-        static EMPTY: Arc<Vec<crate::wasm_plugin_config::ModuleRef>> = Arc::new(Vec::new());
+        static EMPTY: crate::wasm_plugin_config::WasmModules =
+            crate::wasm_plugin_config::WasmModules::shared(Arc::new(Vec::new()));
     }
-    EMPTY.with(Arc::clone)
+    EMPTY.with(Clone::clone)
 }
 
 /// HTTP/1.1 のハンドラ応答で、ヘッダと同じバッファに続けて 1 回で書く本文の上限（F-202）。

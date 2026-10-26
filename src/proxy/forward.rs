@@ -28,7 +28,7 @@ pub(super) async fn handle_proxy(
     headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // クライアントの Accept-Encoding を解析
@@ -806,7 +806,7 @@ pub(super) async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     cache_ctx: Option<&mut CacheSaveContext>,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);

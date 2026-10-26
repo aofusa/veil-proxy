@@ -70,7 +70,7 @@ impl Harness {
         let module = Module::new(&engine, HARNESS_WAT).expect("abi_harness.wat should compile");
 
         let mut http_ctx = HttpContext::new(1, capabilities);
-        http_ctx.plugin_name = "conformance_harness".to_string();
+        http_ctx.plugin_name = "conformance_harness".into();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(&engine, host_state);
 
@@ -848,6 +848,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             bytes::Bytes::from_static(b"chunk1"),
             false,
             None,
+            None,
         )
         .await;
     assert!(matches!(
@@ -861,6 +862,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk2"),
             true,
+            None,
             None,
         )
         .await;

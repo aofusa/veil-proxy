@@ -179,6 +179,65 @@ fn encode_json_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// 1 つの要求に適用する WASM モジュールの並びと、その要求の HTTP context（B-177）。
+///
+/// 要求の始めにルートのモジュールから [`WasmModules::for_request`] で作り、各フェーズ（要求ヘッダ・本文・
+/// 応答ヘッダ・本文・`on_log`）に同じもの（の clone）を渡す。`instance_reuse` のモジュールはこれを手がかりに、
+/// 要求の間ずっと同じインスタンスの同じ http context でコールバックを呼ぶ（Envoy と同じ寿命）。
+/// モジュールの無いルートでは確保しない。
+#[derive(Clone, Default)]
+pub struct WasmModules {
+    modules: Arc<Vec<ModuleRef>>,
+    #[cfg(feature = "wasm")]
+    sessions: Option<std::rc::Rc<crate::wasm::RequestSessions>>,
+}
+
+impl WasmModules {
+    /// 要求ごとの状態を持たない並び（フェーズごとに context を作る。テスト・要求に紐づかない呼び出し用）
+    pub fn shared(modules: Arc<Vec<ModuleRef>>) -> Self {
+        Self {
+            modules,
+            #[cfg(feature = "wasm")]
+            sessions: None,
+        }
+    }
+
+    /// 1 つの要求の並び（モジュールがあるときだけ要求ごとの状態を 1 つ確保する）
+    pub fn for_request(modules: Arc<Vec<ModuleRef>>) -> Self {
+        Self {
+            #[cfg(feature = "wasm")]
+            sessions: (!modules.is_empty())
+                .then(|| std::rc::Rc::new(crate::wasm::RequestSessions::default())),
+            modules,
+        }
+    }
+
+    /// モジュールの並び
+    pub fn modules(&self) -> &Arc<Vec<ModuleRef>> {
+        &self.modules
+    }
+
+    /// 要求ごとの状態
+    #[cfg(feature = "wasm")]
+    pub fn sessions(&self) -> Option<&crate::wasm::RequestSessions> {
+        self.sessions.as_deref()
+    }
+}
+
+impl std::ops::Deref for WasmModules {
+    type Target = Vec<ModuleRef>;
+
+    fn deref(&self) -> &Vec<ModuleRef> {
+        &self.modules
+    }
+}
+
+impl std::fmt::Debug for WasmModules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.modules.fmt(f)
+    }
+}
+
 /// ルート / L4 リスナーに適用する WASM モジュールの参照。
 #[derive(Debug, Clone)]
 pub struct ModuleRef {

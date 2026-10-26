@@ -512,7 +512,7 @@ impl H3BufferedTask {
     ) -> io::Result<()> {
         #[cfg(feature = "wasm")]
         let mut wasm_modules_to_apply: Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+            crate::wasm_plugin_config::WasmModules,
         > = None;
 
         let result = self
@@ -535,7 +535,7 @@ impl H3BufferedTask {
         headers: &[h3::Header],
         request_body: &Bytes,
         #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+            crate::wasm_plugin_config::WasmModules,
         >,
     ) -> io::Result<()> {
         // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
@@ -872,7 +872,7 @@ impl H3BufferedTask {
 
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                    backend_modules.clone()
+                    crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
                 } else {
                     crate::wasm::empty_wasm_modules()
                 };
@@ -897,6 +897,7 @@ impl H3BufferedTask {
                             headers_vec,
                             &ip_arc,
                             request_body.is_empty(),
+                            modules_to_apply.sessions(),
                         )
                         .await;
 
@@ -1272,7 +1273,7 @@ impl H3BufferedTask {
         headers: &[h3::Header],
         request_body: &Bytes,
         #[cfg(feature = "wasm")] wasm_modules: Option<
-            &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+            &crate::wasm_plugin_config::WasmModules,
         >,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {

@@ -33,7 +33,7 @@ pub(super) async fn proxy_http_request_with_compression(
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> Option<(u16, u64, bool, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -131,7 +131,7 @@ pub(super) async fn transfer_response_with_compression(
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;

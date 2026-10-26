@@ -18,11 +18,11 @@ use super::types::{ModuleConfig, WasmConfig};
 /// Loaded WASM module
 pub struct LoadedModule {
     /// Module name
-    pub name: String,
+    pub name: Arc<str>,
     /// Pre-instantiated module for fast creation
     pub instance_pre: InstancePre<HostState>,
     /// Module capabilities
-    pub capabilities: ModuleCapabilities,
+    pub capabilities: Arc<ModuleCapabilities>,
     /// Plugin configuration
     pub configuration: Arc<[u8]>,
     /// Proxy-Wasm の root_id（`plugin_root_id`）。未設定なら従来どおりルートコンテキストの ID を返す
@@ -66,6 +66,8 @@ pub struct ModuleRegistry {
     /// AOT サイドカーキャッシュのファイル名をネイティブ JIT 版と分けるために使う
     /// （F-135。Pulley と Cranelift のキャッシュはバイナリ非互換）。
     pulley: bool,
+    /// `instance_reuse` のプールの 1 スレッドに持つインスタンスの上限（[`super::instance_pool::per_thread_capacity`]）
+    pool_per_thread: usize,
 }
 
 impl ModuleRegistry {
@@ -86,10 +88,15 @@ impl ModuleRegistry {
             || cfg!(veil_wasm_nosignals)
             || config.interpreter;
 
+        let reuse_modules = config.modules.iter().filter(|m| m.instance_reuse).count();
         let mut registry = Self {
             engine,
             modules: std::collections::HashMap::new(),
             pulley,
+            pool_per_thread: super::instance_pool::per_thread_capacity(
+                config.defaults.pooling.total_memories,
+                reuse_modules,
+            ),
         };
 
         // Load all modules
@@ -242,13 +249,13 @@ impl ModuleRegistry {
 
         // Store module
         let loaded = LoadedModule {
-            name: config.name.clone(),
+            name: Arc::from(config.name.as_str()),
             instance_pre,
-            capabilities: config.capabilities.clone(),
+            capabilities: Arc::new(config.capabilities.clone()),
             configuration: config.configuration.to_bytes(),
             root_id: None,
             instance_reuse: config.instance_reuse,
-            pool: super::instance_pool::InstancePool::new(),
+            pool: super::instance_pool::InstancePool::new(self.pool_per_thread),
             data_files: Arc::new(data_files),
         };
 

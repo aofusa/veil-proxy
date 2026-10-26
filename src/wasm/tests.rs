@@ -327,6 +327,16 @@ mod types_tests {
         // routesフィールドは削除されました（ルートレベルのmodulesフィールドを使用）
     }
 
+    /// B-175: yield の間隔は既定 1,000µs、`[wasm.defaults] yield_interval_us` で変えられる
+    #[test]
+    fn yield_interval_us_default_and_override() {
+        let d: WasmDefaults = toml::from_str("").unwrap();
+        assert_eq!(d.yield_interval_us, 1_000);
+        assert_eq!(WasmDefaults::default().yield_interval_us, 1_000);
+        let d: WasmDefaults = toml::from_str("yield_interval_us = 10").unwrap();
+        assert_eq!(d.yield_interval_us, 10);
+    }
+
     #[test]
     fn test_pooling_config_defaults() {
         let config = PoolingConfig::default();
@@ -427,6 +437,7 @@ mod interpreter_tests {
                 headers.clone(),
                 &Arc::from("127.0.0.1"),
                 true,
+                None,
             ))
         };
 
@@ -527,8 +538,9 @@ mod f132_h3_lifecycle_tests {
                 headers,
                 &Arc::from("127.0.0.1"),
                 true,
+                None,
             ));
-            futures::executor::block_on(on_request_complete_async(engine.clone(), modules.clone()));
+            futures::executor::block_on(on_request_complete_async(engine.clone(), crate::wasm_plugin_config::WasmModules::shared(modules.clone())));
         }
 
         let after = crate::wasm::get_context_stats().total_contexts;
@@ -553,7 +565,7 @@ mod f132_h3_lifecycle_tests {
 
         let req_result = futures::executor::block_on(apply_wasm_request_body(
             &engine,
-            &[], // モジュール未指定 -> ゼロコピーでそのまま
+            &crate::wasm_plugin_config::WasmModules::default(), // モジュール未指定 -> ゼロコピーでそのまま
             body.clone(),
             true,
             None,
@@ -564,7 +576,7 @@ mod f132_h3_lifecycle_tests {
         }
 
         let resp_result =
-            futures::executor::block_on(apply_wasm_response_body(&engine, &[], body.clone(), true));
+            futures::executor::block_on(apply_wasm_response_body(&engine, &crate::wasm_plugin_config::WasmModules::default(), body.clone(), true));
         match resp_result {
             WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
             WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
@@ -606,7 +618,7 @@ mod host_function_tests {
     fn create_test_context() -> HttpContext {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        ctx.plugin_name = "test_plugin".to_string();
+        ctx.plugin_name = "test_plugin".into();
         ctx.request_headers = vec![
             (b":method".to_vec(), b"GET".to_vec()),
             (b":path".to_vec(), b"/api/test".to_vec()),
@@ -1706,6 +1718,7 @@ mod instance_reuse_tests {
             vec![],
             &Arc::from("127.0.0.1"),
             true,
+            None,
         ));
         let FilterResult::LocalResponse(resp) = r else {
             panic!("expected a local response for {path}");
@@ -1745,6 +1758,7 @@ mod instance_reuse_tests {
             vec![],
             &Arc::from("127.0.0.1"),
             true,
+            None,
         ));
         assert!(matches!(r, FilterResult::Continue { .. }));
         assert_eq!(engine.pooled_instances("baseline"), 0);
@@ -1808,6 +1822,135 @@ mod instance_reuse_tests {
         assert!(FilterEngine::new(&config).is_err());
     }
 
+    /// B-177: 要求の本文のフェーズ → ローカル応答のヘッダ x-instance-seq
+    fn post_body(
+        engine: &FilterEngine,
+        sessions: Option<&crate::wasm::RequestSessions>,
+        path: &str,
+        body: &'static [u8],
+    ) -> u32 {
+        let method: Arc<str> = Arc::from("POST");
+        let ip: Arc<str> = Arc::from("127.0.0.1");
+        let path: Arc<str> = Arc::from(path);
+        let meta = RequestMeta {
+            method: &method,
+            path: &path,
+            headers: &[],
+            client_ip: &ip,
+        };
+        match futures::executor::block_on(engine.on_request_body_with_modules(
+            &modules(),
+            bytes::Bytes::from_static(body),
+            true,
+            Some(&meta),
+            sessions,
+        )) {
+            BodyFilterResult::LocalResponse(r) => {
+                let v = &r.headers.iter().find(|(k, _)| k == b"x-instance-seq").unwrap().1;
+                std::str::from_utf8(v).unwrap().parse().unwrap()
+            }
+            _ => panic!("expected a local response"),
+        }
+    }
+
+    /// B-177: 要求ヘッダのフェーズ（本文が続く）
+    fn post_headers(
+        engine: &FilterEngine,
+        sessions: Option<&crate::wasm::RequestSessions>,
+        path: &str,
+    ) {
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from(path),
+            &Arc::from("POST"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            false,
+            sessions,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+    }
+
+    #[test]
+    fn reused_instance_keeps_one_http_context_per_request() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        // 要求ヘッダ・本文・on_log は同じ http context（context は 1 つだけ作られる）
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11?a=1");
+        assert_eq!(a.len(), 1);
+        assert_eq!(post_body(&engine, Some(&a), "/baseline11?a=1", b"2"), 1);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&a)));
+        // on_log の後は context を消した（proxy_on_delete 済み）
+        assert_eq!(a.len(), 0);
+        assert_eq!(engine.pending_deletes("baseline"), 0);
+
+        // 2 つの要求が同じインスタンスに別々の context を持つ
+        let b = crate::wasm::RequestSessions::default();
+        let c = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&b), "/baseline11");
+        post_headers(&engine, Some(&c), "/baseline11");
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+        // 本文のフェーズは新しい context を作らない（作った数は b・c の 2 つを足した 3 のまま）
+        assert_eq!(post_body(&engine, Some(&b), "/baseline11", b"1"), 3);
+        assert_eq!(post_body(&engine, Some(&c), "/baseline11", b"1"), 3);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&b)));
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&c)));
+
+        // 要求ごとの状態が無い呼び出しは従来どおりコールバックごとに context を作る
+        post_headers(&engine, None, "/baseline11");
+        assert_eq!(post_body(&engine, None, "/baseline11", b"1"), 5);
+    }
+
+    #[test]
+    fn dropped_request_context_is_deleted_on_next_use() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11");
+        // on_log まで行かずに要求が終わった（接続の切断等）
+        drop(a);
+        assert_eq!(engine.pending_deletes("baseline"), 1);
+        // 次にインスタンスを使うときに proxy_on_delete する
+        let (_, _, _, seq) = get(&engine, "/baseline11");
+        assert_eq!(seq, 2);
+        assert_eq!(engine.pending_deletes("baseline"), 0);
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+    }
+
+    #[test]
+    fn trap_of_another_request_moves_later_phases_to_a_new_context() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11");
+        // 別の要求のトラップでインスタンスを捨てる
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from("/trap"),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+            None,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+        // a の context は捨てたインスタンスにあったので、本文のフェーズは新しいインスタンスの新しい context で
+        // フィルタを通る（フィルタを飛ばさない）
+        assert_eq!(post_body(&engine, Some(&a), "/baseline11", b"1"), 1);
+        assert_eq!(a.len(), 1);
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&a)));
+        assert_eq!(a.len(), 0);
+    }
+
     #[test]
     fn request_body_phase_sees_path_and_can_answer_or_rewrite() {
         let Some(engine) = engine(true, None) else {
@@ -1830,6 +1973,7 @@ mod instance_reuse_tests {
                 bytes::Bytes::from_static(body),
                 true,
                 Some(&meta),
+                None,
             ))
         };
         match run("/baseline11?a=1&b=2", b"10") {

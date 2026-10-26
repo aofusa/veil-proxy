@@ -354,7 +354,7 @@ fn proxy_grpc_call_impl(
 
     super::grpc_executor::register_global_pending_grpc_call(
         super::grpc_executor::PendingGrpcUnaryCall {
-            module_name: module_name.clone(),
+            module_name: module_name.to_string(),
             call_id,
             upstream,
             path: grpc_path,
@@ -591,7 +591,7 @@ fn proxy_grpc_send_impl(
         let path = format!("/{}/{}", stream.service, stream.method);
         super::grpc_executor::register_global_pending_grpc_send(
             super::grpc_executor::PendingGrpcSend {
-                module_name,
+                module_name: module_name.to_string(),
                 call_id: stream_id_u32,
                 upstream: stream.upstream.clone(),
                 path,

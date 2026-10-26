@@ -23,7 +23,7 @@ pub struct BackendProxyResult {
 /// B-38: HTTP/3 経路で WASM on_response_headers を適用する
 #[cfg(feature = "wasm")]
 pub(super) async fn apply_h3_wasm_response_headers(
-    wasm_modules: &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
     status: u16,
     header_store: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -63,7 +63,7 @@ pub(super) async fn apply_h3_wasm_response_headers(
 /// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
 #[cfg(feature = "wasm")]
 pub(super) async fn finish_h3_wasm_lifecycle(
-    wasm_modules_to_apply: &Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    wasm_modules_to_apply: &Option<crate::wasm_plugin_config::WasmModules>,
 ) {
     let Some(modules) = wasm_modules_to_apply else {
         return;

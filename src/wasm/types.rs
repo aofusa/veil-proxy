@@ -37,6 +37,12 @@ pub struct WasmDefaults {
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time_ms: u64,
 
+    /// コールバックがワーカーへ制御を返す間隔（マイクロ秒の目安。fuel は約 1,000 で 1µs）。
+    /// B-175: 既定 1,000（約 1ms）。小さくすると CPU を長く使うフィルタと同じワーカーの他の要求の待ちが短くなるが、
+    /// 普通のコールバックも止まって `instance_reuse` のインスタンスが同時に多く開く。
+    #[serde(default = "default_yield_interval_us")]
+    pub yield_interval_us: u64,
+
     /// Pooling allocator settings
     #[serde(default)]
     pub pooling: PoolingConfig,
@@ -46,6 +52,7 @@ impl Default for WasmDefaults {
     fn default() -> Self {
         Self {
             max_execution_time_ms: default_max_execution_time(),
+            yield_interval_us: default_yield_interval_us(),
             pooling: PoolingConfig::default(),
         }
     }
@@ -53,6 +60,10 @@ impl Default for WasmDefaults {
 
 fn default_max_execution_time() -> u64 {
     100
+}
+
+fn default_yield_interval_us() -> u64 {
+    1_000
 }
 
 /// Pooling allocator configuration

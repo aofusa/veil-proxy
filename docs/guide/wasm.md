@@ -166,10 +166,16 @@ instance_reuse = true   # default: false
 By default every callback runs in a fresh instance (`_start`, `proxy_on_vm_start` and `proxy_on_configure`
 run each time). With `instance_reuse = true` an instance is created and configured once, then reused for
 later requests: each request only creates an HTTP context (`proxy_on_context_create`) and runs the callbacks,
-and `proxy_on_delete` runs when the request is done. This is the same lifetime as Envoy. The filter's
+and `proxy_on_delete` runs when the request is done. This is the same lifetime as Envoy. All phases of a request
+(request headers, request body, response headers, response body and `on_log`) use the same HTTP context, so
+state the filter keeps in its HTTP context carries over from one phase to the next. One instance holds the
+HTTP contexts of several requests at once, as an Envoy worker's VM does. If a request ends before `on_log`
+(for example the client disconnects), its context is deleted the next time the instance is used. The filter's
 global variables and root-context state persist across requests. An instance that traps or returns an error
-is discarded, and the next request gets a new one. Each worker keeps a few configured instances per module
-(and per route `module_configuration`), so the pooling allocator's `total_memories` must leave room for them.
+is discarded and the next request gets a new one; later phases of the requests whose contexts lived in it
+run in a new HTTP context (the filter still runs, but state kept in the old context is lost). Each worker keeps
+configured instances per module (and per route `module_configuration`), up to half of the pooling allocator's
+`total_memories` divided among the workers and the modules with `instance_reuse`.
 
 ### Answering Requests from a Filter (`Respond` + modules)
 
@@ -208,6 +214,7 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 | Option | Description | Default |
 |--------|-------------|---------|
 | `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+| `yield_interval_us` | How often a running callback yields the worker to other requests (approximate microseconds, measured in fuel). Smaller values shorten the wait of other requests on the same worker behind a CPU-heavy filter, but every callback pauses more often, more `instance_reuse` instances are open at once, and each request costs more | 1000 |
 | `interpreter` | Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135). Always forced to `true` on OpenBSD (B-52) | false |
 
 #### Pooling Allocator Settings

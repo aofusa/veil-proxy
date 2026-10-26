@@ -23,17 +23,21 @@ pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[ModuleRef]) {
         return;
     }
 
-    futures::executor::block_on(engine.on_log_with_modules(modules));
+    futures::executor::block_on(engine.on_log_with_modules(modules, None));
 }
 
 /// Execute on_log callback for WASM modules at the end of request processing ASYNCHRONOUSLY
 /// 空のモジュールリスト（Arc 共有・プロセスで 1 個。F-43: リクエストごとの確保排除）。
-pub fn empty_wasm_modules() -> Arc<Vec<ModuleRef>> {
+pub fn empty_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     static EMPTY: std::sync::OnceLock<Arc<Vec<ModuleRef>>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
+    crate::wasm_plugin_config::WasmModules::shared(EMPTY.get_or_init(|| Arc::new(Vec::new())).clone())
 }
 
-pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Arc<Vec<ModuleRef>>) {
+/// 要求の終わり（`on_log`）。`instance_reuse` のモジュールはここで要求の http context を消す（B-177）
+pub async fn on_request_complete_async(
+    engine: Arc<FilterEngine>,
+    modules: crate::wasm_plugin_config::WasmModules,
+) {
     if modules.is_empty() {
         return;
     }

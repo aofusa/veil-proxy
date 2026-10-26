@@ -99,7 +99,7 @@ pub async fn on_request(
     let r = w
         .engine
         .clone()
-        .on_request_headers_with_modules_async(w.modules.clone(), path, method, hv, ip, rq.eos)
+        .on_request_headers_with_modules_async(crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()), path, method, hv, ip, rq.eos)
         .await;
     match r {
         FilterResult::Continue { headers, .. } => {
@@ -136,7 +136,7 @@ pub async fn on_response(ran: &Ran, status: u16, headers: &mut Vec<(Bytes, Bytes
         let r = w
             .engine
             .clone()
-            .on_response_headers_with_modules_async(w.modules.clone(), status, hv, false)
+            .on_response_headers_with_modules_async(crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()), status, hv, false)
             .await;
         if let FilterResult::Continue { headers: h, .. } = r {
             headers.clear();

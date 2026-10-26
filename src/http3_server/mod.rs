@@ -836,7 +836,7 @@ struct SendFileRequest<'a> {
     /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
     static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")]
-    wasm_modules: Option<&'a Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    wasm_modules: Option<&'a crate::wasm_plugin_config::WasmModules>,
 }
 
 /// QUIC ストリーム ID をキーにするマップ用の軽量ハッシャ（乗算ハッシュ 1 回）。
@@ -2917,7 +2917,7 @@ mod tests {
     #[cfg(feature = "wasm")]
     #[test]
     fn test_b38_apply_h3_wasm_empty_modules_passthrough() {
-        let modules = std::sync::Arc::new(Vec::new());
+        let modules = crate::wasm_plugin_config::WasmModules::default();
         let headers = vec![(b"x-a".to_vec(), b"1".to_vec())];
         let out = futures::executor::block_on(apply_h3_wasm_response_headers(
             &modules,

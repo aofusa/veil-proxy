@@ -164,9 +164,14 @@ instance_reuse = true   # 既定 false
 既定ではコールバックごとに新しいインスタンスで動く（`_start`・`proxy_on_vm_start`・`proxy_on_configure` が毎回走る）。
 `instance_reuse = true` なら、インスタンスを 1 回作って設定し、後の要求で使い回す。要求ごとは HTTP context の作成
 （`proxy_on_context_create`）とコールバックだけで、要求が終わると `proxy_on_delete` が走る（Envoy と同じ寿命）。
-フィルタのグローバル変数と root context の状態は要求をまたいで残る。トラップ・エラーを返したインスタンスは捨て、次の要求は
-新しいインスタンスを使う。ワーカーはモジュールごと（とルートの `module_configuration` ごと）に設定済みのインスタンスを
-いくつか持つので、プーリングアロケータの `total_memories` に余裕を残すこと。
+1 つの要求のフェーズ（要求ヘッダ・要求本文・応答ヘッダ・応答本文・`on_log`）はすべて同じ HTTP context で呼ぶので、
+フィルタが HTTP context に持つ状態はフェーズをまたいで残る。1 つのインスタンスに複数の要求の HTTP context が同時に住む
+（Envoy のワーカーの VM と同じ）。要求が `on_log` の前に終わったら（クライアントの切断等）、その context はインスタンスを
+次に使うときに消す。フィルタのグローバル変数と root context の状態は要求をまたいで残る。トラップ・エラーを返した
+インスタンスは捨て、次の要求は新しいインスタンスを使う。そこに context を持っていた要求の以後のフェーズは新しい
+HTTP context で呼ぶ（フィルタは飛ばさないが、前の context に持っていた状態は失われる）。ワーカーはモジュールごと（とルートの `module_configuration` ごと）に
+設定済みのインスタンスを持つ。上限はプーリングアロケータの `total_memories` の半分を、ワーカーと `instance_reuse` の
+モジュールで分けた数。
 
 ### フィルタだけで要求に答える（`Respond` + モジュール）
 
@@ -203,6 +208,7 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+| `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel で数える）。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
 | `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
 
 #### Poolingアロケータ設定

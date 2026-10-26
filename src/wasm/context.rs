@@ -85,6 +85,12 @@ impl Default for BodyBuffer {
 /// 起動時に読んだファイル（名前 → 中身。F-271）
 pub type PluginData = Arc<HashMap<String, Arc<[u8]>>>;
 
+/// 空の `Arc<str>`（コンテキストを作るたびに確保しない。B-175）
+fn empty_str() -> Arc<str> {
+    static EMPTY: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from("")).clone()
+}
+
 /// 空の [`PluginData`]（共有。要求ごとに確保しない）
 pub fn empty_plugin_data() -> PluginData {
     static EMPTY: std::sync::OnceLock<PluginData> = std::sync::OnceLock::new();
@@ -131,7 +137,7 @@ pub struct HttpContext {
     /// Client IP address
     pub client_ip: std::sync::Arc<str>,
     /// Plugin name
-    pub plugin_name: String,
+    pub plugin_name: Arc<str>,
     /// Proxy-Wasm の root_id（設定されたモジュールのみ。F-222）
     pub plugin_root_id: Option<Arc<str>>,
     /// Plugin configuration（ルート単位で実効値が解決されている場合はその値。F-148）
@@ -197,7 +203,7 @@ pub struct HttpContext {
 
     // === Capabilities ===
     /// Module capabilities
-    pub capabilities: ModuleCapabilities,
+    pub capabilities: Arc<ModuleCapabilities>,
 
     // === Timer ===
     /// Tick period in milliseconds (0 = disabled)
@@ -275,15 +281,18 @@ pub enum GrpcStreamState {
 
 impl HttpContext {
     /// Create a new HTTP context
-    pub fn new(context_id: i32, capabilities: ModuleCapabilities) -> Self {
+    ///
+    /// B-175: 要求ごとに作るので確保しない（権限は `Arc` で共有、空の文字列も共有）。
+    pub fn new(context_id: i32, capabilities: impl Into<Arc<ModuleCapabilities>>) -> Self {
+        let capabilities = capabilities.into();
         Self {
             context_id,
             root_context_id: 0,
             request_headers: Vec::new(),
             request_body: BodyBuffer::empty(),
             request_trailers: Vec::new(),
-            request_path: std::sync::Arc::from(""),
-            request_method: std::sync::Arc::from(""),
+            request_path: empty_str(),
+            request_method: empty_str(),
             request_query: String::new(),
             request_body_complete: false,
             response_status: 0,
@@ -291,8 +300,8 @@ impl HttpContext {
             response_body: BodyBuffer::empty(),
             response_trailers: Vec::new(),
             response_body_complete: false,
-            client_ip: std::sync::Arc::from(""),
-            plugin_name: String::new(),
+            client_ip: empty_str(),
+            plugin_name: empty_str(),
             plugin_root_id: None,
             plugin_configuration: crate::wasm_plugin_config::empty_configuration(),
             vm_configuration: crate::wasm_plugin_config::empty_configuration(),

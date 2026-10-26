@@ -1370,13 +1370,13 @@ pub(super) async fn h2_dispatch(
     #[cfg(feature = "wasm")]
     let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
     #[cfg(feature = "wasm")]
-    let wasm_modules_to_apply: Arc<Vec<crate::wasm_plugin_config::ModuleRef>> = {
+    let wasm_modules_to_apply: crate::wasm_plugin_config::WasmModules = {
         let config = CURRENT_CONFIG.load();
         if let Some(ref wasm_engine) = config.wasm_filter_engine {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let method_str = std::str::from_utf8(method).unwrap_or("GET");
             let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                backend_modules.clone()
+                crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
             } else {
                 crate::wasm::empty_wasm_modules()
             };
@@ -1907,7 +1907,7 @@ pub(super) async fn h2_proxy(
     client_encoding: AcceptedEncoding,
     prefix: &[u8],
     security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2555,7 +2555,7 @@ pub(super) async fn h2_proxy_h2c(
     method: &[u8],
     path: &[u8],
     security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2634,7 +2634,7 @@ pub(super) async fn h2_emit_upstream_response(
     h2c_resp: http2::upstream_mux::H2cResponse,
     compress: Option<(&CompressionConfig, AcceptedEncoding)>,
     security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -3378,7 +3378,7 @@ pub(super) async fn h2_sendfile(
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     canonical_base: Option<&Path>,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
