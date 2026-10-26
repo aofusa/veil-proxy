@@ -63,15 +63,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
                 };
 
-                // Get value from shared data
-                // （RwLock ガードを await 前に確実にドロップするためブロックで囲む）
-                let (value, cas) = {
-                    let state = caller.data();
-                    let shared_data = state.http_ctx.shared_data.read().unwrap();
-                    match shared_data.get(&key) {
-                        Some((v, c)) => (v.clone(), *c),
-                        None => return PROXY_RESULT_NOT_FOUND,
-                    }
+                // Get value from shared data（B-179: モジュールで共有する表。値は `Arc` の参照を増やすだけ）
+                let (value, cas) = match caller.data().http_ctx.shared_data.get(&key) {
+                    Some(found) => found,
+                    None => return PROXY_RESULT_NOT_FOUND,
                 };
 
                 // Allocate memory and write value
@@ -151,24 +146,18 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
-            // Set value with CAS check
-            let state = caller.data_mut();
-            let mut shared_data = state.http_ctx.shared_data.write().unwrap();
-
-            if cas != 0 {
-                // CAS check
-                if let Some((_, current_cas)) = shared_data.get(&key) {
-                    if *current_cas != cas as u32 {
-                        return PROXY_RESULT_CAS_MISMATCH;
-                    }
+            // Set value with CAS check（B-179: モジュールで共有する表。CAS も表で払い出す）
+            match caller
+                .data()
+                .http_ctx
+                .shared_data
+                .set(&key, &value, cas as u32)
+            {
+                crate::wasm::shared_data::SetResult::Ok => {}
+                crate::wasm::shared_data::SetResult::CasMismatch => {
+                    return PROXY_RESULT_CAS_MISMATCH
                 }
             }
-
-            // Increment CAS
-            state.http_ctx.shared_data_cas = state.http_ctx.shared_data_cas.wrapping_add(1);
-            let new_cas = state.http_ctx.shared_data_cas;
-
-            shared_data.insert(key, (value, new_cas));
 
             PROXY_RESULT_OK
         },

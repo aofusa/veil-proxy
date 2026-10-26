@@ -227,7 +227,7 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 |-----------|------|----------|
 | `allow_logging` | ログ出力 | false |
 | `allow_metrics` | メトリクス操作 | false |
-| `allow_shared_data` | 共有データ | false |
+| `allow_shared_data` | 共有データ（`proxy_set_shared_data`・`proxy_get_shared_data`）。モジュール名ごとに 1 つの表を全要求・全ワーカーで共有し、設定のリロードでも引き継ぐ（Envoy の `vm_id` ごとの共有に当たる） | false |
 | `allow_request_headers_read` | リクエストヘッダー読み取り | false |
 | `allow_request_headers_write` | リクエストヘッダー書き換え | false |
 | `allow_request_body_read` | リクエストボディ読み取り | false |

@@ -3,7 +3,7 @@
 //! Holds the state for a single HTTP request/response processing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -192,10 +192,8 @@ pub struct HttpContext {
     pub next_metric_id: i32,
 
     // === Shared Data ===
-    /// Shared data (key -> (value, cas))
-    pub shared_data: Arc<RwLock<HashMap<String, (Vec<u8>, u32)>>>,
-    /// Next CAS value
-    pub shared_data_cas: u32,
+    /// Shared data（モジュールの表の共有。B-179: 以前は context ごとに作り、要求をまたいで共有されなかった）
+    pub shared_data: Arc<super::shared_data::SharedData>,
 
     // === Custom Properties ===
     /// User-defined properties (set via proxy_set_property)
@@ -282,8 +280,26 @@ pub enum GrpcStreamState {
 impl HttpContext {
     /// Create a new HTTP context
     ///
-    /// B-175: 要求ごとに作るので確保しない（権限は `Arc` で共有、空の文字列も共有）。
+    /// モジュールに属さない context（試験等）。shared data は自分だけの表を作る。要求ごとの context は
+    /// `for_module`（B-175: 要求ごとに作るので確保しない。権限・shared data の表は `Arc` で共有、空の文字列も共有）。
     pub fn new(context_id: i32, capabilities: impl Into<Arc<ModuleCapabilities>>) -> Self {
+        Self::with_shared_data(context_id, capabilities, Arc::default())
+    }
+
+    /// モジュールの要求の context（権限と shared data の表はモジュールのものを共有する。B-179）
+    pub(crate) fn for_module(context_id: i32, module: &super::registry::LoadedModule) -> Self {
+        Self::with_shared_data(
+            context_id,
+            module.capabilities.clone(),
+            module.shared_data.clone(),
+        )
+    }
+
+    fn with_shared_data(
+        context_id: i32,
+        capabilities: impl Into<Arc<ModuleCapabilities>>,
+        shared_data: Arc<super::shared_data::SharedData>,
+    ) -> Self {
         let capabilities = capabilities.into();
         Self {
             context_id,
@@ -322,8 +338,7 @@ impl HttpContext {
             current_http_call_token: None,
             metrics: HashMap::new(),
             next_metric_id: 1,
-            shared_data: Arc::new(RwLock::new(HashMap::new())),
-            shared_data_cas: 1,
+            shared_data,
             custom_properties: HashMap::new(),
             capabilities,
             tick_period_ms: 0,

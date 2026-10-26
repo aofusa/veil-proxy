@@ -750,40 +750,53 @@ mod host_function_tests {
     #[test]
     fn test_shared_data_set_and_get() {
         let ctx = create_test_context();
-
-        // Set shared data
-        {
-            let mut data = ctx.shared_data.write().unwrap();
-            data.insert("test_key".to_string(), (b"test_value".to_vec(), 1));
-        }
-
-        // Get shared data
-        {
-            let data = ctx.shared_data.read().unwrap();
-            let (value, cas) = data.get("test_key").unwrap();
-            assert_eq!(value, b"test_value");
-            assert_eq!(*cas, 1);
-        }
+        assert_eq!(
+            ctx.shared_data.set("test_key", b"test_value", 0),
+            crate::wasm::shared_data::SetResult::Ok
+        );
+        let (value, cas) = ctx.shared_data.get("test_key").unwrap();
+        assert_eq!(&value[..], b"test_value");
+        assert_ne!(cas, 0);
     }
 
     #[test]
     fn test_shared_data_cas_increment() {
-        let mut ctx = create_test_context();
-
-        // Initial CAS
-        let cas1 = ctx.shared_data_cas;
-        ctx.shared_data_cas += 1;
-        let cas2 = ctx.shared_data_cas;
-
-        assert_eq!(cas2, cas1 + 1);
+        use crate::wasm::shared_data::SetResult;
+        let ctx = create_test_context();
+        ctx.shared_data.set("k", b"1", 0);
+        let (_, cas1) = ctx.shared_data.get("k").unwrap();
+        // 今の CAS なら書け、書いた後は古い CAS では書けない
+        assert_eq!(ctx.shared_data.set("k", b"2", cas1), SetResult::Ok);
+        let (_, cas2) = ctx.shared_data.get("k").unwrap();
+        assert_ne!(cas2, cas1);
+        assert_eq!(ctx.shared_data.set("k", b"3", cas1), SetResult::CasMismatch);
+        assert_eq!(&ctx.shared_data.get("k").unwrap().0[..], b"2");
     }
 
     #[test]
     fn test_shared_data_not_found() {
         let ctx = create_test_context();
+        assert!(ctx.shared_data.get("nonexistent_key").is_none());
+    }
 
-        let data = ctx.shared_data.read().unwrap();
-        assert!(data.get("nonexistent_key").is_none());
+    /// B-179: shared data はモジュール名ごとの表で、要求（context）をまたいで・リロードで作り直しても共有する。
+    /// 名前の違うモジュールとは共有しない。
+    #[test]
+    fn b179_shared_data_is_shared_per_module_name() {
+        use crate::wasm::shared_data::for_module;
+        let a1 = for_module("b179-module-a");
+        let a2 = for_module("b179-module-a");
+        let b = for_module("b179-module-b");
+        assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+        a1.set("counter", b"7", 0);
+        assert_eq!(&a2.get("counter").unwrap().0[..], b"7");
+        assert!(b.get("counter").is_none());
+        // 別スレッド（別のワーカー）から読んでも同じ値
+        let a3 = a1.clone();
+        let got = std::thread::spawn(move || a3.get("counter").map(|(v, _)| v.to_vec()))
+            .join()
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&b"7"[..]));
     }
 
     // === Metrics Operations Tests ===
@@ -1235,7 +1248,7 @@ mod p2_callback_tests {
         let ctx = HttpContext::new(1, caps);
 
         // Shared data should be initialized
-        assert!(ctx.shared_data.read().unwrap().is_empty());
+        assert!(ctx.shared_data.is_empty());
 
         // Verify capability for queue operations
         assert!(ctx.capabilities.allow_shared_data);

@@ -33,6 +33,8 @@ pub struct LoadedModule {
     pub(crate) pool: super::instance_pool::InstancePool,
     /// 起動時に読んだファイル（`data_files`。F-271）
     pub data_files: super::context::PluginData,
+    /// shared data の表（同じ名前のモジュールで共有し、リロードでも引き継ぐ。B-179）
+    pub shared_data: Arc<super::shared_data::SharedData>,
 }
 
 /// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
@@ -257,6 +259,7 @@ impl ModuleRegistry {
             instance_reuse: config.instance_reuse,
             pool: super::instance_pool::InstancePool::new(self.pool_per_thread),
             data_files: Arc::new(data_files),
+            shared_data: super::shared_data::for_module(&config.name),
         };
 
         ftlog::info!(

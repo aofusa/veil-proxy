@@ -233,7 +233,7 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 |-----------|-------------|---------|
 | `allow_logging` | Log output | false |
 | `allow_metrics` | Metrics operations | false |
-| `allow_shared_data` | Shared data access | false |
+| `allow_shared_data` | Shared data access (`proxy_set_shared_data`/`proxy_get_shared_data`). One table per module name, shared by every request and worker and kept across config reloads (Envoy shares it per `vm_id`) | false |
 | `allow_request_headers_read` | Read request headers | false |
 | `allow_request_headers_write` | Modify request headers | false |
 | `allow_request_body_read` | Read request body | false |
