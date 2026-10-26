@@ -292,7 +292,9 @@ watch = true                    # 2 つのキャッシュは同じ設定にす�
   - Windows: `path` の配下ごとの `ReadDirectoryChangesW` と親ディレクトリを、ルートごとの専用スレッドで待つ。
 - **戻り先**: `valid_duration_secs` は今までどおり効く。監視を付けられないときは警告を出し、そのルートは従来どおり
   `valid_duration_secs` の後に追従する。当たる上限は、Linux の inotify の `fs.inotify.max_user_watches`
-  （と `fs.inotify.max_user_instances`）、kqueue の OS では監視の fd に使うソフトの `RLIMIT_NOFILE` の 4 分の 1。
+  （と `fs.inotify.max_user_instances`）、kqueue の OS では監視の fd の予算（ソフトの `RLIMIT_NOFILE` の 4 分の 1 で、
+  接続の分として `[security] max_concurrent_connections` の 2 倍 + 1024 を残した残りを超えない。大きな木を監視しても、
+  接続の上限より前に `accept` が `EMFILE` で失敗しないようにする。予算は起動時にログに出す）。
   後から作られたディレクトリ・ファイルで上限に当たったときはルートごとに 1 回警告し、その部分は
   `valid_duration_secs` の後に追従する。
 - **対応 OS**: Linux（io_uring・epoll のビルド）・FreeBSD・OpenBSD・NetBSD・macOS・Windows。

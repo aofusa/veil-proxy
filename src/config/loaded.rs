@@ -1409,7 +1409,11 @@ pub(super) fn build_backend_loaded(
     #[cfg(feature = "cache")]
     let backend = attach_static_watch(backend, watch);
     #[cfg(not(feature = "cache"))]
-    let _ = (watch.open_file_cache, watch.static_file_cache);
+    let _ = (
+        watch.open_file_cache,
+        watch.static_file_cache,
+        watch.max_connections,
+    );
     Ok(backend)
 }
 
@@ -1421,6 +1425,8 @@ pub(super) struct WatchDefaults {
     open_file_cache: bool,
     /// `[static_file_cache] watch`
     static_file_cache: bool,
+    /// `[security] max_concurrent_connections`（kqueue の監視が持つ fd の予算。B-191）
+    max_connections: usize,
 }
 
 impl WatchDefaults {
@@ -1428,6 +1434,7 @@ impl WatchDefaults {
         Self {
             open_file_cache: config.performance.open_file_cache_watch,
             static_file_cache: config.static_file_cache.watch,
+            max_connections: config.security.max_concurrent_connections,
         }
     }
 }
@@ -1437,6 +1444,7 @@ static APPLIED_WATCH_DEFAULTS: std::sync::Mutex<WatchDefaults> =
     std::sync::Mutex::new(WatchDefaults {
         open_file_cache: false,
         static_file_cache: false,
+        max_connections: 0,
     });
 
 #[cfg(any(target_os = "netbsd", test))]
@@ -1478,7 +1486,7 @@ fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
     let want_sfc =
         cache::static_file_cache_watch_enabled(sfc.as_deref(), defaults.static_file_cache);
     let gen = if want_ofc || want_sfc {
-        cache::watch::register(&path)
+        cache::watch::register(&path, defaults.max_connections)
     } else {
         None
     };

@@ -575,8 +575,9 @@ reuseport_balancing = "cbpf"
 # BSD・macOS は kqueue、Windows は ReadDirectoryChangesW）、
 # ファイルの差し替え（同じサイズの mv・cp の上書き・ディレクトリごとの差し替え）を
 # 有効期間を待たずに反映する。キャッシュに当たった要求に増えるのは原子変数の読み取り 1 回だけ。
-# 監視の上限（Linux の fs.inotify.max_user_watches、kqueue は RLIMIT_NOFILE の 4 分の 1 の fd）に
-# 当たったときは警告して
+# 監視の上限（Linux の fs.inotify.max_user_watches、kqueue は監視するファイル・ディレクトリごとに fd を 1 つ持ち、
+# RLIMIT_NOFILE の 4 分の 1 と、RLIMIT_NOFILE から [security] max_concurrent_connections の 2 倍 + 1024 を
+# 引いた数の小さい方まで。使える数は起動時に info で出る）に当たったときは警告して
 # 従来どおり有効期間だけで追従する（有効期間の確認は watch = true でも残る）。
 # ルーティングごとの `[route.open_file_cache] watch` で上書きできる。
 # デフォルト: false

@@ -299,7 +299,10 @@ watch = true                    # keep both caches on the same setting
 - **Fallback**: `valid_duration_secs` still applies. If watching cannot be set up, veil logs a warning and the
   route follows disk changes after `valid_duration_secs` as before. Limits that trigger this: the inotify
   watch limit `fs.inotify.max_user_watches` (and `fs.inotify.max_user_instances`) on Linux, and on kqueue
-  platforms a budget of a quarter of the soft `RLIMIT_NOFILE` for the watcher's fds. When the limit is hit
+  platforms a budget for the watcher's fds: a quarter of the soft `RLIMIT_NOFILE`, and no more than what is left
+  after reserving two fds per `[security] max_concurrent_connections` plus 1024 for connections (so watching a
+  large tree does not make `accept` fail with `EMFILE` below the connection limit). veil logs the budget at
+  startup. When the limit is hit
   while following a new directory or file later on, veil warns once per route and that part of the tree is
   followed after `valid_duration_secs`.
 - **Platforms**: Linux (io_uring and epoll builds), FreeBSD, OpenBSD, NetBSD, macOS and Windows.

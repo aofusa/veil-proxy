@@ -513,6 +513,7 @@
 | B-188 | P3 | 修正済み（v0.10.0） | [bugs/B-188-wasm-local-response-head-body.md](bugs/B-188-wasm-local-response-head-body.md) | Proxy-Wasm のローカル応答が HEAD・204・304 にも本文を付け、keep-alive の HTTP/1.1 の接続で次の応答がずれる（F-271 で接続を続けるようにして表面化） |
 | B-189 | P3 | 修正済み（v0.10.0） | [bugs/B-189-wasm-body-phase-chunked-expect-continue.md](bugs/B-189-wasm-body-phase-chunked-expect-continue.md) | chunked + `Expect: 100-continue` の要求に、Proxy-Wasm の要求本文の段が 100 Continue を返さずに本文を待ち、クライアントと互いに待って止まる |
 | B-190 | P3 | 修正済み（v0.10.0） | [bugs/B-190-cors-upstream-credentials-without-origin.md](bugs/B-190-cors-upstream-credentials-without-origin.md) | CORS: 上流が ACAO 無しで `Access-Control-Allow-Credentials` を返すと、veil の値と重なって CORS が失敗するか、ルートが許可しない credentials が通る。veil が足すときは上流の Allow-Credentials・Expose-Headers を除く |
+| B-191 | P3 | 修正済み（v0.10.0） | [bugs/B-191-kqueue-watch-fd-budget-ignores-connections.md](bugs/B-191-kqueue-watch-fd-budget-ignores-connections.md) | kqueue（BSD・macOS）の静的配信の監視が RLIMIT_NOFILE の 1/4 まで fd を握り、接続の受理が max_concurrent_connections の前に EMFILE で失敗する。接続の分を残した予算にして起動時に出す |
 
 ---
 

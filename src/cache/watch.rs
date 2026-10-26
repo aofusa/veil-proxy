@@ -21,7 +21,9 @@
 //!   監視スレッドが開いて付ける（ディレクトリの `NOTE_WRITE` で中身を読み直し、増えたものに付ける）。
 //!   ファイルの fd で `rename` を伴わない上書きも捉える。開くのは設定ロード時（サンドボックスに入る前）と、
 //!   既に持っているディレクトリの fd からの相対（`openat`）だけなので、capsicum・unveil の下でも動く。
-//!   持つ fd の数は `RLIMIT_NOFILE` の 1/4 までにし、超えたら警告する。
+//!   持つ fd の数は `RLIMIT_NOFILE` の 1/4 と、`RLIMIT_NOFILE` から接続の分（`max_concurrent_connections` の
+//!   2 倍 + 1024）を引いた数の小さい方までにし、超えたら警告する（B-191: 接続の受理が上限の前に EMFILE で
+//!   失敗しないように）。使える数は起動時（と変わったリロード）に info で出す。
 //! - Windows: `ReadDirectoryChangesW`（再帰）をルートごとの専用スレッドで待つ。親ディレクトリも見て
 //!   ルートの差し替えで付け直す。
 //! - それ以外の OS: 監視しない（警告して有効期限だけの動きに戻す）。
@@ -104,6 +106,14 @@ struct State {
         target_os = "macos"
     ))]
     kq: Option<kq::Kq>,
+    /// 最後に読み込んだ設定の `max_concurrent_connections`（kqueue の fd の予算。B-191）
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    max_connections: usize,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -117,6 +127,13 @@ static STATE: Mutex<State> = Mutex::new(State {
         target_os = "macos"
     ))]
     kq: None,
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    max_connections: 0,
 });
 
 fn lock_state() -> std::sync::MutexGuard<'static, State> {
@@ -127,8 +144,27 @@ fn lock_state() -> std::sync::MutexGuard<'static, State> {
 /// ルート（ディレクトリ、または 1 つのファイル）を監視して世代を返す（設定ロード時に呼ぶ）。
 ///
 /// 監視を付けられなければ警告して `None`（そのルートは有効期限だけで追従する）。同じパスは同じ世代を返す。
-pub fn register(root: &Path) -> Option<WatchGen> {
+///
+/// `max_connections` は `[security] max_concurrent_connections`（0 は無制限）。kqueue の OS では、監視が持つ fd の
+/// 数をこの分だけ接続に残して決める（B-191）。他の OS では使わない。
+pub fn register(root: &Path, max_connections: usize) -> Option<WatchGen> {
     let mut st = lock_state();
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    {
+        st.max_connections = max_connections;
+    }
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    )))]
+    let _ = max_connections;
     let idx = match st.roots.iter().position(|r| r.path == root) {
         Some(i) if st.roots[i].active => return Some(st.roots[i].gen),
         Some(i) => i,
@@ -197,6 +233,60 @@ fn bump_all(st: &State) {
     for r in &st.roots {
         r.gen.bump();
     }
+}
+
+/// 監視のために開く fd の上限を決める `RLIMIT_NOFILE`（ソフト）の割合の分母（kqueue）
+#[cfg(any(
+    test,
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+const FD_BUDGET_DIVISOR: u64 = 4;
+/// 接続 1 本あたりに残す fd（クライアントと上流）
+#[cfg(any(
+    test,
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+const FDS_PER_CONNECTION: u64 = 2;
+/// 接続の他に残す fd（リスナー・ログ・io_uring 以外の内部の fd・上流のプールの余り）
+#[cfg(any(
+    test,
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+const FD_RESERVE_EXTRA: u64 = 1024;
+
+#[cfg(any(
+    test,
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+/// 監視が持ってよい fd の数（B-191）。`nofile` は `RLIMIT_NOFILE` のソフト（無制限は `u64::MAX`）、
+/// `max_connections` は `max_concurrent_connections`（0 は無制限で、接続の分を引かない）。
+fn fd_budget_for(nofile: Option<u64>, max_connections: usize) -> usize {
+    let Some(cur) = nofile else {
+        return 256;
+    };
+    if cur == u64::MAX {
+        return 65536;
+    }
+    let quarter = (cur / FD_BUDGET_DIVISOR).max(16);
+    if max_connections == 0 {
+        return quarter as usize;
+    }
+    let reserve = (max_connections as u64)
+        .saturating_mul(FDS_PER_CONNECTION)
+        .saturating_add(FD_RESERVE_EXTRA);
+    quarter.min(cur.saturating_sub(reserve)) as usize
 }
 
 #[cfg(target_os = "linux")]
@@ -596,9 +686,6 @@ mod kq {
         | libc::NOTE_ATTRIB
         | libc::NOTE_EXTEND;
 
-    /// 監視のために開く fd の上限を決める `RLIMIT_NOFILE`（ソフト）の割合の分母
-    const FD_BUDGET_DIVISOR: u64 = 4;
-
     /// (st_dev, st_ino)
     type FileId = (u64, u64);
 
@@ -633,6 +720,8 @@ mod kq {
         tops: HashMap<usize, Tops>,
         /// 持っている fd の数
         held: usize,
+        /// 持ってよい fd の数（設定ロードのたびに `fd_budget` で決め直す。B-191）
+        budget: usize,
         /// 上限に当たったことを警告したルート
         limit_warned: Vec<usize>,
     }
@@ -725,17 +814,20 @@ mod kq {
 
     // 理由付き allow: rlim_t は OS ごとに違う（FreeBSD は i64、他は u64）
     #[allow(clippy::unnecessary_cast)]
-    fn fd_budget() -> usize {
+    fn nofile_limit() -> Option<u64> {
         // SAFETY: rl は書き込み先
         let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
-            return 256;
+            return None;
         }
-        let cur = rl.rlim_cur as u64;
         if rl.rlim_cur == libc::RLIM_INFINITY {
-            return 65536;
+            return Some(u64::MAX);
         }
-        (cur / FD_BUDGET_DIVISOR).max(16) as usize
+        Some(rl.rlim_cur as u64)
+    }
+
+    fn fd_budget(max_connections: usize) -> usize {
+        super::fd_budget_for(nofile_limit(), max_connections)
     }
 
     /// 登録する kevent の構造体を作る（`filter`・`flags` の型は OS ごとに違う（NetBSD は `u32`）が、
@@ -771,16 +863,17 @@ mod kq {
                 free: Vec::new(),
                 tops: HashMap::new(),
                 held: 0,
+                budget: 0,
                 limit_warned: Vec::new(),
             })
         }
 
         /// 開いた fd を登録する（失敗したら fd を閉じる）
         fn add(&mut self, fd: RawFd, root: usize, id: FileId, kind: Kind) -> io::Result<usize> {
-            if self.held >= fd_budget() {
+            if self.held >= self.budget {
                 close(fd);
                 return Err(io::Error::other(
-                    "kqueue watch limit reached (a quarter of RLIMIT_NOFILE); raise the open file limit",
+                    "kqueue watch limit reached (the file descriptors left after max_concurrent_connections, at most a quarter of RLIMIT_NOFILE); raise the open file limit",
                 ));
             }
             let idx = match self.free.pop() {
@@ -986,7 +1079,16 @@ mod kq {
 
     pub(super) fn watch_root(st: &mut State, idx: usize) -> io::Result<()> {
         let path = st.roots[idx].path.clone();
+        let budget = fd_budget(st.max_connections);
         let kq = ensure_kq(st)?;
+        if kq.budget != budget {
+            // B-191: 監視が接続の fd を食うことを運用者が見積もれるように出す（設定ロード時だけ）
+            ftlog::info!(
+                "Static file watch (kqueue) holds one file descriptor per watched file and directory, up to {}",
+                budget
+            );
+            kq.budget = budget;
+        }
         kq.remove_root(idx);
         let res = kq.attach_content(idx, &path, None);
         if res.is_err() {
@@ -1439,6 +1541,23 @@ mod windows {
 mod tests {
     use super::*;
 
+    /// B-191: kqueue の監視の fd は、接続に残す分を引いた数を超えない
+    #[test]
+    fn kqueue_fd_budget_leaves_room_for_connections() {
+        // 接続の上限なし: 従来どおり 1/4
+        assert_eq!(fd_budget_for(Some(65536), 0), 16384);
+        // 60000 接続（12 万 fd + 1024）を残すと 1/4 より少ない
+        assert_eq!(fd_budget_for(Some(150_000), 60_000), 150_000 - 121_024);
+        // 残りが 1/4 より多ければ 1/4
+        assert_eq!(fd_budget_for(Some(200_000), 60_000), 50_000);
+        // 接続で使い切るなら監視しない
+        assert_eq!(fd_budget_for(Some(65536), 60_000), 0);
+        // 余裕があれば 1/4 のまま
+        assert_eq!(fd_budget_for(Some(65536), 100), 16384);
+        assert_eq!(fd_budget_for(None, 100), 256);
+        assert_eq!(fd_budget_for(Some(u64::MAX), 100), 65536);
+    }
+
     fn leaked() -> WatchGen {
         WatchGen(Box::leak(Box::new(AtomicU64::new(7))))
     }
@@ -1490,6 +1609,13 @@ mod tests {
                 target_os = "macos"
             ))]
             kq: None,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "macos"
+            ))]
+            max_connections: 0,
         };
         let (sa, sb) = (a.stamp(), b.stamp());
         bump_all(&st);
@@ -1541,13 +1667,13 @@ mod tests {
         let root = base.path().join("www");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.txt"), b"AAAA").unwrap();
-        let Some(g) = register(&root) else {
+        let Some(g) = register(&root, 0) else {
             // 通知が使えない環境（監視の上限が 0 等）では試さない
             eprintln!("file change notification unavailable; skipping");
             return;
         };
         // 同じパスは同じ世代
-        assert!(std::ptr::eq(register(&root).unwrap().0, g.0));
+        assert!(std::ptr::eq(register(&root, 0).unwrap().0, g.0));
 
         let wait_bump = |s: Stamp, what: &str| {
             let t = Instant::now();
