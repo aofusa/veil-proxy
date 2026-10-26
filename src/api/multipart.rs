@@ -1291,10 +1291,10 @@ pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn windows_delete_on_close(p: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
-    // FILE_FLAG_DELETE_ON_CLOSE
+    // FILE_FLAG_DELETE_ON_CLOSE は DELETE のアクセス権で開いたハンドルにしか付けられない（read・write だけだと
+    // ERROR_INVALID_PARAMETER で開けない）。GENERIC_READ | GENERIC_WRITE | DELETE
     std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
+        .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000)
         .custom_flags(0x0400_0000)
         .share_mode(0x7)
         .open(p)
@@ -1582,6 +1582,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut f = temp_file_in(dir.path()).unwrap();
         std::io::Write::write_all(&mut f, b"abc").unwrap();
+        // Unix は作った直後に消える。Windows は閉じたときに消える（FILE_FLAG_DELETE_ON_CLOSE）
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(f);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
