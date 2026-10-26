@@ -252,6 +252,16 @@ def _register(app, path, behavior, req_s, resp_s, des, ser):
 def _file_of(func):
     """The ``FileDescriptor`` of a protoc-generated message class whose bound method is ``func``, if any."""
     owner = getattr(func, "__self__", None)
+    if owner is None:
+        # protobuf の pure-Python 実装（upb の wheel が無い OS）の FromString は、クラスを閉包に持つ staticmethod
+        for cell in getattr(func, "__closure__", None) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(value, type) and hasattr(value, "DESCRIPTOR"):
+                owner = value
+                break
     desc = getattr(owner, "DESCRIPTOR", None)
     return getattr(desc, "file", None)
 
