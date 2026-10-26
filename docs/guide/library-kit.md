@@ -171,6 +171,11 @@ Without a store the whole session is one encrypted cookie (`veil_session`, `Http
 `SessionStore` is a synchronous trait (calls run on the worker, so keep them fast). `cycle_id()` after login,
 `destroy()` on logout. A cookie is only sent when the session changed.
 
+The encrypted cookie carries its expiry (`ttl`), which the server checks, so a copy kept by a client stops working
+after the `ttl`. It cannot be revoked before that: after `destroy()` a copy saved earlier is still accepted until it
+expires. Use a store when sessions must be revocable. `MemoryStore` drops expired sessions once a minute and holds at
+most `max_entries` (100 000 by default; when full, the tenth closest to expiry is dropped).
+
 ## HTTP client
 
 `veil::api::client` is part of veil (feature `handler`); the kit re-exports it with helpers.

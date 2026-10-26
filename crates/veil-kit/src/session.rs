@@ -17,8 +17,12 @@
 //! ```
 //!
 //! By default the whole session is kept in one encrypted, authenticated cookie (no server state; keep it small).
-//! [`Sessions::store`] keeps the data on the server ([`MemoryStore`], or your own [`SessionStore`]) and only a
-//! signed session id in the cookie. Call [`Session::cycle_id`] after logging in (session fixation).
+//! The cookie carries its expiry time (the `ttl`), checked by the server, so an old copy stops working after the
+//! `ttl` even if a client keeps it; it cannot be revoked earlier, though (a copy saved before
+//! [`Session::destroy`] stays valid until it expires). When sessions must be revocable (logout everywhere, a
+//! leaked cookie), use [`Sessions::store`]: it keeps the data on the server ([`MemoryStore`], or your own
+//! [`SessionStore`]) and only a signed session id in the cookie. Call [`Session::cycle_id`] after logging in
+//! (session fixation).
 
 use crate::cookie::{Cookie, CookieJar, Key, ResponseCookieExt, SameSite};
 use serde::de::DeserializeOwned;
@@ -43,11 +47,34 @@ pub trait SessionStore: Send + Sync + 'static {
     fn remove(&self, id: &str);
 }
 
+// B-200: 期限切れの掃除は一定間隔で、件数には上限を付ける（匿名の訪問者ごとにセッションを作るアプリで、
+// Cookie を捨てながら要求を繰り返されると上限なく伸びていた）
+/// How often [`MemoryStore`] drops expired entries.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Sessions in process memory (lost on restart, not shared between processes). Expired entries are dropped
-/// lazily when the store grows.
-#[derive(Default)]
+/// once a minute; when the store holds [`max_entries`](MemoryStore::max_entries) sessions (100 000 by default),
+/// the tenth that expires soonest is dropped to make room.
 pub struct MemoryStore {
-    map: Mutex<HashMap<String, (Data, Instant)>>,
+    inner: Mutex<MemoryInner>,
+    max_entries: usize,
+}
+
+struct MemoryInner {
+    map: HashMap<String, (Data, Instant)>,
+    last_sweep: Instant,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        MemoryStore {
+            inner: Mutex::new(MemoryInner {
+                map: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
+            max_entries: 100_000,
+        }
+    }
 }
 
 impl MemoryStore {
@@ -55,26 +82,66 @@ impl MemoryStore {
     pub fn new() -> MemoryStore {
         MemoryStore::default()
     }
+
+    /// The most sessions kept (default 100 000); beyond it the sessions closest to expiry are dropped.
+    pub fn max_entries(mut self, n: usize) -> MemoryStore {
+        self.max_entries = n.max(1);
+        self
+    }
+
+    /// The number of sessions held (expired ones not yet dropped included).
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
+    }
+
+    /// Whether no session is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl MemoryInner {
+    fn make_room(&mut self, now: Instant, max: usize) {
+        if now.duration_since(self.last_sweep) >= SWEEP_INTERVAL || self.map.len() >= max {
+            self.map.retain(|_, (_, until)| *until > now);
+            self.last_sweep = now;
+        }
+        if self.map.len() < max {
+            return;
+        }
+        // 期限の近い 1 割をまとめて捨てる（1 件ずつだと上限に張り付いた間は毎回全件を見る）
+        let drop = (max / 10).max(1).min(self.map.len());
+        let mut by_expiry: Vec<(Instant, &String)> =
+            self.map.iter().map(|(k, (_, u))| (*u, k)).collect();
+        by_expiry.select_nth_unstable_by_key(drop - 1, |(u, _)| *u);
+        let victims: Vec<String> = by_expiry[..drop]
+            .iter()
+            .map(|(_, k)| (*k).clone())
+            .collect();
+        for k in victims {
+            self.map.remove(&k);
+        }
+    }
 }
 
 impl SessionStore for MemoryStore {
     fn load(&self, id: &str) -> Option<Data> {
-        let g = self.map.lock().unwrap();
-        let (d, until) = g.get(id)?;
+        let g = self.inner.lock().unwrap();
+        let (d, until) = g.map.get(id)?;
         (Instant::now() < *until).then(|| d.clone())
     }
 
     fn save(&self, id: &str, data: &Data, ttl: Duration) {
-        let mut g = self.map.lock().unwrap();
-        if g.len() >= 1024 && g.len().is_power_of_two() {
-            let now = Instant::now();
-            g.retain(|_, (_, until)| *until > now);
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        if !g.map.contains_key(id) {
+            g.make_room(now, self.max_entries);
         }
-        g.insert(id.to_string(), (data.clone(), Instant::now() + ttl));
+        g.map.insert(id.to_string(), (data.clone(), now + ttl));
     }
 
     fn remove(&self, id: &str) {
-        self.map.lock().unwrap().remove(id);
+        self.inner.lock().unwrap().map.remove(id);
     }
 }
 
@@ -222,6 +289,34 @@ fn new_id() -> String {
     crate::b64::encode(&b)
 }
 
+// B-200: Cookie に入れる中身は「期限（UNIX 秒、8 バイトのビッグエンディアン）+ JSON」。期限はサーバで検査する
+// （Max-Age はブラウザが守るだけで、保存しておいた Cookie は何年後でも通っていた）
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The plaintext of a session cookie: the expiry (Unix seconds, big-endian) followed by the JSON data.
+fn seal_payload(data: &Data, exp: u64) -> Vec<u8> {
+    let mut out = exp.to_be_bytes().to_vec();
+    if serde_json::to_writer(&mut out, data).is_err() {
+        out.truncate(8);
+        out.extend_from_slice(b"{}");
+    }
+    out
+}
+
+/// The data of a session cookie, or `None` when it expired or is malformed.
+fn open_payload(b: &[u8], now: u64) -> Option<Data> {
+    let (exp, json) = b.split_first_chunk::<8>()?;
+    if u64::from_be_bytes(*exp) <= now {
+        return None;
+    }
+    serde_json::from_slice(json).ok()
+}
+
 struct Shared {
     key: Arc<Key>,
     cookie_name: String,
@@ -242,7 +337,7 @@ impl Shared {
                 let data = self
                     .key
                     .decrypt_value(&self.cookie_name, raw)
-                    .and_then(|b| serde_json::from_slice::<Data>(&b).ok())
+                    .and_then(|b| open_payload(&b, unix_now()))
                     .unwrap_or_default();
                 (data, None)
             }
@@ -282,8 +377,8 @@ impl Shared {
         let data = st.data.lock().unwrap();
         match &self.store {
             None => {
-                let json = serde_json::to_vec(&*data).unwrap_or_default();
-                let v = self.key.encrypt_value(&self.cookie_name, &json);
+                let payload = seal_payload(&data, unix_now().saturating_add(self.ttl.as_secs()));
+                let v = self.key.encrypt_value(&self.cookie_name, &payload);
                 if v.len() > 4000 {
                     ftlog::error!("session larger than a cookie can hold; use Sessions::store");
                     return resp;
@@ -416,6 +511,64 @@ mod tests {
         assert!(std::str::from_utf8(out.header("set-cookie").unwrap())
             .unwrap()
             .contains("Max-Age=0"));
+    }
+
+    // B-200: Cookie の期限をサーバで検査する
+    #[test]
+    fn cookie_expiry_is_checked() {
+        let (shared, _) = Sessions::new(Key::generate()).into_parts();
+        let mut d = Data::new();
+        d.insert("user".into(), "alice".into());
+        let now = unix_now();
+        assert_eq!(
+            open_payload(&seal_payload(&d, now + 10), now),
+            Some(d.clone())
+        );
+        assert_eq!(open_payload(&seal_payload(&d, now), now), None);
+        assert_eq!(open_payload(b"{}", now), None);
+        let expired = shared
+            .key
+            .encrypt_value("veil_session", &seal_payload(&d, now - 1));
+        let mw = middleware(shared.clone());
+        assert_eq!(
+            call(&mw, "/me", Some(&format!("veil_session={expired}"))).body(),
+            &Bytes::new()
+        );
+        let live = shared
+            .key
+            .encrypt_value("veil_session", &seal_payload(&d, now + 60));
+        assert_eq!(
+            call(&mw, "/me", Some(&format!("veil_session={live}"))).body(),
+            &Bytes::from_static(b"alice")
+        );
+    }
+
+    // B-200: MemoryStore は上限を超えて伸びない
+    #[test]
+    fn memory_store_is_bounded() {
+        let store = MemoryStore::new().max_entries(100);
+        let d = Data::new();
+        for i in 0..1000 {
+            store.save(&format!("s{i}"), &d, Duration::from_secs(60 + i));
+            assert!(store.len() <= 100);
+        }
+        // 期限の遠い（新しい）ものが残る
+        assert!(store.load("s999").is_some());
+        assert!(store.load("s0").is_none());
+        // 既存の ID の保存し直しでは捨てない
+        let store = MemoryStore::new().max_entries(2);
+        store.save("a", &d, Duration::from_secs(60));
+        store.save("b", &d, Duration::from_secs(60));
+        store.save("b", &d, Duration::from_secs(60));
+        assert_eq!(store.len(), 2);
+        // 期限切れは上限に当たったときに先に捨てる
+        let store = MemoryStore::new().max_entries(3);
+        store.save("x", &d, Duration::ZERO);
+        store.save("y", &d, Duration::ZERO);
+        store.save("z", &d, Duration::from_secs(60));
+        store.save("w", &d, Duration::from_secs(60));
+        assert!(store.load("z").is_some() && store.load("w").is_some());
+        assert_eq!(store.len(), 2);
     }
 
     #[test]
