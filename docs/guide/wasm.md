@@ -146,8 +146,9 @@ The request-body phase runs when the request has a body and at least one of the 
 `max_request_body_size` / `max_chunked_body_size`; larger bodies get `413`) and calls
 `on_http_request_body` once with `end_of_stream = true`. The callback can read the request path, method
 and headers as well. If the module replaces the body, veil sends the new body upstream with a matching
-`Content-Length` (a chunked request is forwarded with `Content-Length`). Routes without such a module
-keep streaming the body upstream as before.
+`Content-Length` (a chunked request is forwarded with `Content-Length`, without `Expect`). Routes without such a
+module keep streaming the body upstream as before. For a chunked request with `Expect: 100-continue`, veil sends
+`100 Continue` before reading the body (a request with `Content-Length` already gets it before the filters run).
 
 On HTTP/1.1 the connection stays open after a filter's local response (`send_local_response`), and a request that
 was pipelined behind the body is served next. The body of a local response is not sent for `HEAD` (the

@@ -145,8 +145,9 @@ path = "./www"
 要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
 veil は本文を全部読んでから（Content-Length・chunked。上限は `max_request_body_size`・`max_chunked_body_size`、超えたら
 `413`）`on_http_request_body` を `end_of_stream = true` で 1 回呼ぶ。コールバックからは要求のパス・メソッド・ヘッダも読める。
-モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送る）。
-そういうモジュールの無いルートは、今までどおり本文を上流へ流す。
+モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送り、
+`Expect` は外す）。そういうモジュールの無いルートは、今までどおり本文を上流へ流す。`Expect: 100-continue` の chunked の要求には、
+本文を読む前に `100 Continue` を返す（`Content-Length` の要求にはフィルタより前に返している）。
 
 HTTP/1.1 では、フィルタのローカル応答（`send_local_response`）の後も接続を続け、本文の後ろにパイプラインで届いた要求を
 続けて処理する。ローカル応答の本文は、`HEAD` の要求（`Content-Length` は本文の長さのまま）と `1xx`・`204`・`304` では送らない。

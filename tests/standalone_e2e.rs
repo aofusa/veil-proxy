@@ -3386,3 +3386,40 @@ fn b188_wasm_local_response_to_head_has_no_body() {
     let r2 = read_one_response(&mut s, &mut buf, false).expect("GET response");
     assert_eq!((r2.status, r2.text()), (200, "7".into()), "{}", veil.log());
 }
+
+/// B-189: chunked + `Expect: 100-continue` の要求に、Wasm の要求本文の段が本文を読む前に 100 Continue を返す
+/// （以前は返さずに本文を待ち、100 Continue を待つクライアントと互いに待って止まった）
+#[cfg(feature = "wasm")]
+#[test]
+fn b189_wasm_body_phase_sends_100_continue_for_chunked() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n").unwrap();
+    // 本文を送る前に 100 Continue が届く
+    let mut got = Vec::new();
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut tmp = [0u8; 256];
+        let n = s.read(&mut tmp).unwrap_or_else(|e| {
+            panic!(
+                "no 100 Continue ({e}): {:?}\n{}",
+                String::from_utf8_lossy(&got),
+                veil.log()
+            )
+        });
+        assert!(n > 0, "closed: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&tmp[..n]);
+    }
+    assert!(
+        got.starts_with(b"HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&got)
+    );
+    let end = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let mut buf = got.split_off(end + 4);
+    s.write_all(b"2\r\n41\r\n0\r\n\r\n").unwrap();
+    let r = read_one_response(&mut s, &mut buf, false).expect("final response");
+    assert_eq!((r.status, r.text()), (200, "42".into()), "{}", veil.log());
+}

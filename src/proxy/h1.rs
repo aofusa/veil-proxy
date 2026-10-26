@@ -971,8 +971,15 @@ pub(super) async fn handle_requests(
                                     )
                                     .await;
                                     accumulated.clear();
+                                    // B-189: chunked + `Expect: 100-continue` で本文がまだ届いていなければ、
+                                    // クライアントは 100 Continue を待っている（読み捨てを待つと止まる）ので閉じる
+                                    let expect_waiting = is_chunked
+                                        && chunked_end.is_none()
+                                        && initial_body.is_empty()
+                                        && check_expect_continue(&headers_for_proxy);
                                     if client_wants_close
                                         || is_websocket
+                                        || expect_waiting
                                         || !drain_request_body(
                                             &mut tls_stream,
                                             content_length,
@@ -1026,6 +1033,19 @@ pub(super) async fn handle_requests(
                                 } else {
                                     security.max_request_body_size
                                 };
+                                // B-189: 本文を読む前に 100 Continue を返す（Content-Length の要求は上で返して
+                                // いる。chunked は上流の 100 Continue に任せているが、この段は上流へつなぐ前に
+                                // 本文を読むので、送らないとクライアントは本文を送らずに待ち続ける）
+                                if is_chunked && check_expect_continue(&headers_for_proxy) {
+                                    let write_result = timeout(
+                                        WRITE_TIMEOUT,
+                                        tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
+                                    )
+                                    .await;
+                                    if let Err(_) | Ok((Err(_), _)) = write_result {
+                                        return;
+                                    }
+                                }
                                 let body = match read_full_request_body(
                                     &mut tls_stream,
                                     content_length,
@@ -2063,10 +2083,13 @@ fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bool) -> Vec<
 }
 
 /// 本文を差し替えた要求のヘッダ（Transfer-Encoding・Content-Length を外して新しい Content-Length を付ける。F-271）。
+/// 本文は読み終えているので `Expect` も外す（上流が 100 Continue を返すと、クライアントへ重ねて届く。B-189）
 #[cfg(feature = "wasm")]
 fn set_body_framing_headers(headers: &mut Vec<(Bytes, Bytes)>, len: usize) {
     headers.retain(|(k, _)| {
-        !k.eq_ignore_ascii_case(b"content-length") && !k.eq_ignore_ascii_case(b"transfer-encoding")
+        !k.eq_ignore_ascii_case(b"content-length")
+            && !k.eq_ignore_ascii_case(b"transfer-encoding")
+            && !k.eq_ignore_ascii_case(b"expect")
     });
     headers.push((
         Bytes::from_static(b"Content-Length"),
