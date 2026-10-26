@@ -535,5 +535,19 @@ class TestForms(Base):
         self.assertIn("422", op["responses"])
 
 
+class TestRouteOptions(unittest.TestCase):
+    # B-174: serve_dir の route_options の TOML 変換と、変換できない値の英語のエラー
+    def test_route_options_become_toml(self):
+        self.assertEqual(veil._toml_literal({"enabled": True}), '{"enabled" = true}')
+        self.assertEqual(veil._toml_literal([1, "a"]), '[1, "a"]')
+
+    def test_unconvertible_value_has_an_english_message(self):
+        with self.assertRaises(TypeError) as cm:
+            veil._toml_literal(object())
+        msg = str(cm.exception)
+        self.assertTrue(msg.startswith("cannot convert to TOML"), msg)
+        self.assertTrue(msg.isascii(), msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

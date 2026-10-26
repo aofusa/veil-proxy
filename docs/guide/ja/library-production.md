@@ -123,8 +123,9 @@ br か gzip で圧縮します（クライアントの `Accept-Encoding` で決�
 ## 静的ファイル
 
 `App::serve_dir`（Rust）と `veil_kit.staticfiles.StaticFiles`・`app.serve_dir`（Python）は、プロキシのファイル配信
-（sendfile・Range・`ETag`・圧縮済みの `.br`・`.gz`）でディレクトリを配ります。よく読まれるディレクトリではキャッシュを
-有効にします:
+（sendfile・Range・`ETag`）でディレクトリを配ります。事前圧縮した `.br`・`.gz` は使いません。ルートの
+`[route.compression]` が HTTP/2・HTTP/3 でファイルをその場で圧縮し、結果をキャッシュします（HTTP/1.1 はそのまま送ります）。
+よく読まれるディレクトリではキャッシュを有効にします:
 
 <!-- not-a-full-config -->
 ```toml

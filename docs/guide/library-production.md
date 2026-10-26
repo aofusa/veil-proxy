@@ -126,8 +126,9 @@ Compression needs the `compression` feature (in `full`; the Python wheel has it)
 ## Static files
 
 `App::serve_dir` (Rust) and `veil_kit.staticfiles.StaticFiles` / `app.serve_dir` (Python) serve a directory with
-the proxy's file backend (sendfile, Range, `ETag`, precompressed `.br` / `.gz` siblings). Enable the caches for
-directories that are read often:
+the proxy's file backend (sendfile, Range, `ETag`). Precompressed `.br` / `.gz` siblings are not used; the route's
+`[route.compression]` compresses files on the fly for HTTP/2 and HTTP/3 and caches the result (HTTP/1.1 sends files
+as they are). Enable the caches for directories that are read often:
 
 <!-- not-a-full-config -->
 ```toml

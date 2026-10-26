@@ -6,8 +6,8 @@
 
     app.mount("/static", StaticFiles(directory="public"), name="static")
 
-The directory is served by the server's file backend (Rust): ``sendfile``, kTLS, Range, ``ETag`` and precompressed
-files work as for the proxy, and requests do not reach Python. ``html=True`` serves ``index.html`` for directories.
+The directory is served by the server's file backend (Rust): ``sendfile``, kTLS, Range and ``ETag`` work as for the
+proxy, and requests do not reach Python. Precompressed ``.br`` / ``.gz`` files are not used. ``html=True`` serves ``index.html`` for directories.
 """
 
 # F-268: 本体の File バックエンドのルートを注入する（app.serve_dir と同じ）

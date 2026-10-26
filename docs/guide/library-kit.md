@@ -92,9 +92,10 @@ path on this site (not `//host` or `/\host`) or an `http(s)` URL whose host is l
 ## Static files
 
 `serve::dir("/assets", "/srv/www")` is `App::serve_dir` with the defaults: a `type = "File"` route with
-`open_file_cache` and `static_file_cache`. Requests do not go through a handler; sendfile, kTLS, Range, ETag and
-precompressed files work as for the proxy. `serve::dir_with(prefix, dir, ServeOptions { .. })` takes `index`, `mode`,
-the two caches, `compression` and extra route keys. The File backend has no SPA fallback; serve an `index.html` route
+`open_file_cache` and `static_file_cache`. Requests do not go through a handler; sendfile, kTLS, Range and ETag
+work as for the proxy. Precompressed `.br` / `.gz` files are not used; `compression` compresses files on the fly for
+HTTP/2 and HTTP/3 (HTTP/1.1 sends them as they are). `serve::dir_with(prefix, dir, ServeOptions { .. })` takes
+`index`, `mode`, the two caches, `compression` and extra route keys. The File backend has no SPA fallback; serve an `index.html` route
 with a handler if you need one.
 
 `serve::file(path, max_size).await` reads one file on the file offload pool and answers with a media type from the

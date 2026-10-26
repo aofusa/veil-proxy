@@ -89,7 +89,8 @@ App::new().state(Key::derive_from(secret_bytes)?)   // 署名付き・暗号化�
 ## 静的ファイル
 
 `serve::dir("/assets", "/srv/www")` は既定の設定の `App::serve_dir` です: `open_file_cache` と `static_file_cache` を付けた
-`type = "File"` のルートで、要求はハンドラを通りません。sendfile・kTLS・Range・ETag・事前圧縮ファイルがプロキシと同じく効きます。
+`type = "File"` のルートで、要求はハンドラを通りません。sendfile・kTLS・Range・ETag がプロキシと同じく効きます。
+事前圧縮した `.br`・`.gz` のファイルは使いません。`compression` は HTTP/2・HTTP/3 でファイルをその場で圧縮します（HTTP/1.1 はそのまま送ります）。
 `serve::dir_with(prefix, dir, ServeOptions { .. })` は `index`・`mode`・2 つのキャッシュ・`compression`・その他のルートのキーを
 取ります。File バックエンドには SPA のフォールバックがありません。必要なら `index.html` を返すルートをハンドラで書いてください。
 

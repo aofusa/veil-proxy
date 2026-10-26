@@ -1932,7 +1932,7 @@ def _toml_literal(v):
         return "[" + ", ".join(_toml_literal(x) for x in v) + "]"
     if isinstance(v, dict):
         return "{" + ", ".join("%s = %s" % (json.dumps(str(k)), _toml_literal(x)) for k, x in v.items()) + "}"
-    raise TypeError("TOML に変換できない値: %r" % (v,))
+    raise TypeError("cannot convert to TOML: %r" % (v,))
 
 
 # F-260: 待ち受け 1 個（``[[listener]]``）。``run(listeners=[...])`` に渡す（辞書でも同じキー）。

@@ -428,8 +428,9 @@ impl App {
 
     // F-267
     /// Serves the directory `dir` under `prefix` with veil's static file server (a `type = "File"` route with
-    /// `open_file_cache` and `static_file_cache`): sendfile, kTLS, Range, ETag and precompressed files work as for
-    /// the proxy, and requests do not go through a handler.
+    /// `open_file_cache` and `static_file_cache`): sendfile, kTLS, Range and ETag work as for the proxy, and requests
+    /// do not go through a handler. Precompressed `.br` / `.gz` files are not used; `ServeOptions::compression`
+    /// compresses files on the fly for HTTP/2 and HTTP/3 (HTTP/1.1 sends them as they are).
     pub fn serve_dir(
         mut self,
         prefix: &str,

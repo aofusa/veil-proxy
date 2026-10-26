@@ -503,6 +503,7 @@
 | B-169 | P3 | 修正済み（v0.10.0） | [bugs/B-169-rc-port-test-fetches-final-tag.md](bugs/B-169-rc-port-test-fetches-final-tag.md) | rc のタグでは BSD の port の試験がまだ無い本番のタグのソースを取りに行き 404 で失敗する（rc で port を確かめられない） |
 | B-170 | P2 | 修正済み（v0.10.0） | [bugs/B-170-tokio-shim-take-requires-unpin.md](bugs/B-170-tokio-shim-take-requires-unpin.md) | `veil::tokio` の `io::Take` が `AsyncRead + Unpin` の読み手しか受けず（tokio は `AsyncRead`）、tower-http の `ServeDir` がコンパイルできない。`inner` を構造的にピン留めして読む（F-267 の tower のサンプルで発覚） |
 | B-171 | P3 | 修正済み（v0.10.0） | [bugs/B-171-python-pattern-fullmatch.md](bugs/B-171-python-pattern-fullmatch.md) | Python の `body_constraints`（と pydantic が無いときの `Query()` 等）の `pattern` が `re.fullmatch` で文字列全体との一致を要求する（JSON Schema・pydantic は部分一致）。`re.search` にする（F-268 で発覚） |
+| B-174 | P3 | 修正済み（v0.10.0） | [bugs/B-174-precompressed-static-files-docs.md](bugs/B-174-precompressed-static-files-docs.md) | 静的配信（`App::serve_dir`・`StaticFiles`・ガイド）の文書が「事前圧縮した `.br`・`.gz` を配る」と書いていた（File バックエンドは使わない。`compression` は HTTP/2・HTTP/3 だけ）。文書を直し、Python の `_toml_literal` の日本語の `TypeError` を英語にする（F-269 の validate で発覚） |
 
 ---
 
