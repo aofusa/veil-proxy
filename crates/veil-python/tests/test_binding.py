@@ -549,5 +549,48 @@ class TestRouteOptions(unittest.TestCase):
         self.assertTrue(msg.isascii(), msg)
 
 
+class TestGrpcDefaultAppWarning(unittest.TestCase):
+    # B-176: 既定の App に gRPC を登録したまま別の App を run したら警告する
+    def setUp(self):
+        import veil.grpc
+
+        self.default = veil._default_app
+        self.saved = (list(self.default.grpc_methods), self.default.grpc_health)
+        self.grpc = veil.grpc
+
+    def tearDown(self):
+        self.default.grpc_methods[:] = self.saved[0]
+        self.default.grpc_health = self.saved[1]
+
+    def _warnings(self, app):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            app._warn_grpc_on_default_app()
+        return [x for x in w if issubclass(x.category, RuntimeWarning)]
+
+    def test_warns_when_another_app_is_run(self):
+        self.grpc.unary_unary("/demo.Demo/Hello")(lambda req, ctx: req)
+        w = self._warnings(App())
+        self.assertEqual(len(w), 1)
+        msg = str(w[0].message)
+        self.assertIn("veil.grpc.Server(app)", msg)
+        self.assertTrue(msg.isascii(), msg)
+
+    def test_health_on_default_app_also_warns(self):
+        self.grpc.add_health()
+        self.assertEqual(len(self._warnings(App())), 1)
+
+    def test_no_warning_when_registered_on_the_app(self):
+        app = App()
+        self.grpc.unary_unary("/demo.Demo/Hello", app=app)(lambda req, ctx: req)
+        self.assertEqual(self._warnings(app), [])
+
+    def test_no_warning_when_the_default_app_is_run(self):
+        self.grpc.unary_unary("/demo.Demo/Hello")(lambda req, ctx: req)
+        self.assertEqual(self._warnings(self.default), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

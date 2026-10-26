@@ -36,6 +36,10 @@ server.add_insecure_port("127.0.0.1:50051")
 server.start(); server.wait_for_termination()     # = veil.run(listen_cleartext=...)
 ```
 
+With your own `app = veil.App()`, pass it to `veil.grpc.Server(app)` (and `veil.grpc.add_health(app)`,
+`@veil.grpc.unary_unary(..., app=app)`) and run that app. Without it the methods are registered on the
+module-level app, and `app.run()` warns (`RuntimeWarning`) that they are not served.
+
 The `context` has the main parts of grpcio's `ServicerContext` (`abort`, `abort_with_status`, `set_code`,
 `set_details`, `invocation_metadata`, `send_initial_metadata`, `set_trailing_metadata`, `time_remaining`,
 `is_active`, `peer`). Status codes may be `grpc.StatusCode` or {py:class}`veil.grpc.StatusCode`.

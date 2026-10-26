@@ -2367,6 +2367,23 @@ class App:
             cfg.set(k, _toml_literal(v))
         return cfg
 
+    def _warn_grpc_on_default_app(self):
+        """Warn when gRPC was registered on the module-level app but another app is being run."""
+        # B-176: veil.grpc.Server() / add_health() は app を渡さないとモジュールの既定の App に登録する。
+        # 別の App を run すると登録が黙って失われ、呼び出しは UNIMPLEMENTED になる
+        d = globals().get("_default_app")
+        if d is None or d is self or not (d.grpc_methods or d.grpc_health):
+            return
+        import warnings
+
+        warnings.warn(
+            "gRPC methods were registered on the module-level app (veil.grpc.Server() or "
+            "veil.grpc.add_health() without an app), but a different App is being run, so they are not served. "
+            "Pass the app: veil.grpc.Server(app), veil.grpc.add_health(app).",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
     def run(
         self,
         config_path=None,
@@ -2460,6 +2477,7 @@ class App:
             _HANDLERS.append(r)
             meta = r.openapi_json() if r.include_in_schema else None
             _veil.register_websocket(r.path, hid, meta, r.endpoint is not None, not r.include_in_schema)
+        self._warn_grpc_on_default_app()
         for path, handler in self.grpc_methods:
             hid = len(_HANDLERS)
             _HANDLERS.append(handler)

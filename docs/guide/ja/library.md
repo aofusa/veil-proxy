@@ -1158,7 +1158,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   `send_initial_metadata`・`set_trailing_metadata`・`time_remaining`・`is_active`）を持ちます。`pip install veil-api[grpc]` を
   入れると `grpc_tools.protoc` の生成コードがそのまま動きます: `veil.grpc.Server()` を `add_<Service>Servicer_to_server` に渡し、
   `server.add_insecure_port(...)`・`server.wait_for_termination()`。`veil.grpc.add_health()` で `grpc.health.v1.Health`。
-  `async def` のメソッドと非同期ジェネレータも使えます。
+  `async def` のメソッドと非同期ジェネレータも使えます。自分で `app = veil.App()` を作るときは `veil.grpc.Server(app)`・
+  `veil.grpc.add_health(app)` と渡します（渡さないとモジュールの既定の App に登録され、`app.run()` が「配信されない」と警告します）。
 - **L4（F-210）:** `veil.Protocol` のサブクラスに `@veil.l4_tcp(name, listen)`（asyncio と同じ `connection_made` /
   `data_received` / `connection_lost`。`self.transport.write` はコールバックの中で）、`def f(data, peer) -> bytes | None` に
   `@veil.l4_udp(name, listen)`。
