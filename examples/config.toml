@@ -2784,6 +2784,8 @@ watch = false
 # websocket_idle_timeout_secs = 0         # フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限）
 # websocket_compression = false           # permessage-deflate（RFC 7692）を交渉する（compression feature が必要）
 # openapi_websocket = true                # WebSocket のルートを OpenAPI に載せる
+# openapi_grpc = true                     # gRPC のメソッドを OpenAPI に載せる（POST /pkg.Svc/Method・x-grpc。F-265）
+# openapi_grpc_builtin = false            # grpc.health.v1・grpc.reflection.* も載せる
 # python_event_loops = 1                  # Python: async def・WebSocket を動かす常駐のイベントループの数（F-263）
 # python_event_loop = "auto"              # Python: "auto"（uvloop があれば使う）・"asyncio"・"uvloop"
 # python_event_loop_queue = 65536         # Python: 1 つのループで待てる呼び出しの数（一杯なら 503）

@@ -15,6 +15,7 @@ __all__ = [
     "NativeGrpcCall",
     "NativeTransport",
     "register_grpc",
+    "register_grpc_descriptors",
     "register_grpc_health",
     "register_l4_tcp",
     "register_l4_udp",
@@ -265,8 +266,13 @@ def register_websocket(
 ) -> None:
     """Register an ``@app.websocket`` route (collected until ``run``)."""
 
-def register_grpc(path: str, handler_id: int) -> None:
+def register_grpc(
+    path: str, handler_id: int, request_streaming: bool = False, response_streaming: bool = False
+) -> None:
     """Register a gRPC method; ``handlers[handler_id].handle(call)`` returns ``(code, message)``."""
+
+def register_grpc_descriptors(descriptor_set: bytes) -> None:
+    """Use a serialized ``FileDescriptorSet`` for the types of the gRPC methods in OpenAPI."""
 
 def register_grpc_health() -> None:
     """Register ``grpc.health.v1.Health`` (Check and Watch)."""

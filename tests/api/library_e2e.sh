@@ -733,9 +733,16 @@ run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio
   for mode in $modes; do
     local GP GS; GP=$(free_port); GS=$(free_port)
     GEN_DIR="$GEN" VEIL_GRPC_MODE=$mode VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
-      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+      VEIL_TLS_KEY="$W/key.pem" VEIL_OPENAPI=1 "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
     local GPID=$!; PIDS+=("$GPID")
     wait_port "$GP" "$GPID" || { bad "python-grpc ($mode) start"; cat "$W/g.log"; continue; }
+    # F-265: 生成された型（FromString）から .proto の記述子を取り、OpenAPI に型付きで載せる
+    expect "py gRPC methods in OpenAPI ($mode)" "unary server_streaming client_streaming bidi_streaming demo.v1.HelloRequest False" \
+      bash -c "curl -s 'http://127.0.0.1:$GP/openapi.json' | $PY3 -I -c '
+import json, sys
+p = json.load(sys.stdin)[\"paths\"]
+k = [p[\"/demo.v1.Demo/\" + m][\"post\"][\"x-grpc\"] for m in (\"SayHello\", \"CountUp\", \"Sum\", \"Chat\")]
+print(*[x[\"kind\"] for x in k], k[0].get(\"requestType\"), \"/grpc.health.v1.Health/Check\" in p)'"
     local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$GP" --h3 "127.0.0.1:$GS" 2>&1)"
     local rc=$?
     echo "$out" | sed 's/^/  /'
@@ -797,6 +804,25 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   expect "grpc-web CORS preflight ($label)" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$U' | tr A-Z a-z"
   expect "unknown gRPC service is UNIMPLEMENTED, not 404 ($label)" "grpc-status: 12" bash -c "curl -s -i --http2-prior-knowledge -X POST -H 'content-type: application/grpc' -H 'te: trailers' --data-binary '' 'http://127.0.0.1:$P/nope.v1.Nope/Call' | tr A-Z a-z"
   expect "grpc-web CORS rejects other origins ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://evil.example' "$U"
+  # F-265: gRPC のメソッドが記述子の型付きで OpenAPI に載る（4 種類・コメント・組み込みのサービスは載せない）
+  expect "gRPC methods in OpenAPI ($label)" "unary server_streaming client_streaming bidi_streaming demo.v1.HelloRequest HelloRequest SayHello False" \
+    bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+p = d[\"paths\"]
+k = [p[\"/demo.v1.Demo/\" + m][\"post\"][\"x-grpc\"][\"kind\"] for m in (\"SayHello\", \"CountUp\", \"Sum\", \"Chat\")]
+op = p[\"/demo.v1.Demo/SayHello\"][\"post\"]
+ref = op[\"requestBody\"][\"content\"][\"application/grpc\"][\"schema\"][\"\$ref\"].rsplit(\"/\", 1)[1]
+name = list(d[\"components\"][\"schemas\"][ref][\"properties\"])[0] == \"name\" and \"HelloRequest\"
+print(*k, ref, name, op[\"summary\"].split()[0], \"/grpc.health.v1.Health/Check\" in p)'"
+  if [ -z "$F" ]; then
+    kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+    P=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_OVERRIDE_1='api.openapi_grpc = false' exec "$T/debug/veil-example-grpc$EXE") > "$W/log2" 2>&1 &
+    PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "start (openapi_grpc = false)"; cat "$W/log2"; return; }
+    expect "openapi_grpc = false hides gRPC methods" "False" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; print(\"/demo.v1.Demo/SayHello\" in json.load(sys.stdin)[\"paths\"])'"
+  fi
   kill "$PID"
 }
 

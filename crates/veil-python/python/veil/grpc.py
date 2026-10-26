@@ -53,6 +53,7 @@ __all__ = [
     "stream_unary",
     "stream_stream",
     "add_health",
+    "add_descriptor",
 ]
 
 
@@ -241,6 +242,60 @@ class _Method:
 def _register(app, path, behavior, req_s, resp_s, des, ser):
     app = app or _default_app
     app.grpc_methods.append((path, _Method(behavior, req_s, resp_s, des, ser)))
+    # F-265: protoc の生成した型（FromString / SerializeToString）なら、その .proto を OpenAPI の型に使う
+    for f in (des, ser):
+        fd = _file_of(f)
+        if fd is not None:
+            _add_file(app, fd)
+
+
+def _file_of(func):
+    """The ``FileDescriptor`` of a protoc-generated message class whose bound method is ``func``, if any."""
+    owner = getattr(func, "__self__", None)
+    desc = getattr(owner, "DESCRIPTOR", None)
+    return getattr(desc, "file", None)
+
+
+def _varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _add_file(app, file_descriptor):
+    """Add ``file_descriptor`` and the files it imports as a ``FileDescriptorSet`` (once per file)."""
+    seen = getattr(app, "_grpc_descriptor_files", None)
+    if seen is None:
+        seen = app._grpc_descriptor_files = set()
+    out = bytearray()
+    todo = [file_descriptor]
+    while todo:
+        fd = todo.pop()
+        if fd.name in seen:
+            continue
+        seen.add(fd.name)
+        raw = fd.serialized_pb
+        out += b"\x0a" + _varint(len(raw)) + raw  # FileDescriptorSet.file (field 1)
+        todo.extend(getattr(fd, "dependencies", ()))
+    if out:
+        app.grpc_descriptors.append(bytes(out))
+
+
+def add_descriptor(descriptor, app=None):
+    """Use the types of a ``.proto`` file in the OpenAPI document of the gRPC methods.
+
+    ``descriptor`` is the ``DESCRIPTOR`` of a ``*_pb2`` module (a ``FileDescriptor``; the files it imports are
+    included) or the bytes of a serialized ``FileDescriptorSet``. Methods registered through :class:`Server`
+    or with protoc-generated serializers find their types without this call.
+    """
+    app = app or _default_app
+    if isinstance(descriptor, (bytes, bytearray, memoryview)):
+        app.grpc_descriptors.append(bytes(descriptor))
+    else:
+        _add_file(app, descriptor)
 
 
 def _decorator(req_s, resp_s):

@@ -86,7 +86,7 @@ async fn main() -> Result<(), veil::api::Error> {
         .listen_cleartext(
             &std::env::var("VEIL_LISTEN").unwrap_or_else(|_| "127.0.0.1:50051".into()),
         )
-        .openapi_enabled(false)
+        // /openapi.json と /docs に gRPC のメソッドが型付きで載る（下の grpc_reflection の記述子から。F-265）
         // 1KB 以上の応答メッセージを gzip で圧縮する（クライアントが grpc-accept-encoding で受けるときだけ。F-209）
         .grpc_response_compression("gzip");
     if let (Ok(listen), Ok(cert), Ok(key)) = (

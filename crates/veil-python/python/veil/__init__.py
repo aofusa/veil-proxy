@@ -2015,6 +2015,8 @@ class App:
         self.routes = []
         self.grpc_methods = []  # (path, handler)  handler.handle(call) -> (code, message)
         self.grpc_health = False
+        # F-265: OpenAPI の型に使う FileDescriptorSet（veil.grpc.add_descriptor・veil.grpc.Server が足す）
+        self.grpc_descriptors = []
         self.l4 = []  # ("tcp" | "udp", name, listen, factory_or_func)
         # F-268: 依存の差し替え（試験用。変えると次の要求から依存の木を作り直す）・アプリ全体の依存・
         # ASGI のアプリ・CORS・静的ファイル
@@ -2481,7 +2483,9 @@ class App:
         for path, handler in self.grpc_methods:
             hid = len(_HANDLERS)
             _HANDLERS.append(handler)
-            _veil.register_grpc(path, hid)
+            _veil.register_grpc(path, hid, handler.request_streaming, handler.response_streaming)
+        for d in self.grpc_descriptors:
+            _veil.register_grpc_descriptors(d)
         if self.grpc_health:
             _veil.register_grpc_health()
         for m in self.asgi_mounts:

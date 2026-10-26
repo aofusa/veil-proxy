@@ -122,6 +122,12 @@ impl<'a> Reader<'a> {
         Ok(Some((field, (k & 7) as u8)))
     }
 
+    /// Whether everything has been read.
+    #[cfg(feature = "openapi")]
+    pub(crate) fn at_end(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
+
     pub(crate) fn read_varint(&mut self) -> Result<u64, Status> {
         self.varint()
     }

@@ -256,6 +256,8 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `websocket_idle_timeout_secs` | `0` | フレームを受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限） |
 | `websocket_compression` | `false` | クライアントが申し出たら permessage-deflate（RFC 7692）を交渉する（`compression` feature が必要） |
 | `openapi_websocket` | `true` | WebSocket のルートを OpenAPI に載せる |
+| `openapi_grpc` | `true` | gRPC のメソッドを OpenAPI に載せる（[OpenAPI の gRPC](#openapi-の-grpc)） |
+| `openapi_grpc_builtin` | `false` | 組み込みの `grpc.health.v1`・`grpc.reflection.*` のメソッドも載せる |
 | `python_event_loops` | `1` | Python: `async def` のハンドラと WebSocket を動かす常駐のイベントループの数 |
 | `python_event_loop` | `"auto"` | Python: `"auto"`（uvloop が入っていれば使う）・`"asyncio"`・`"uvloop"` |
 | `python_event_loop_queue` | `65536` | Python: 1 つのループで待てる呼び出しの数（一杯なら 503） |
@@ -922,8 +924,28 @@ App::new()
 | ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
 | リフレクション | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` で `grpc.reflection.v1` と `v1alpha`（`ServerReflectionInfo`）を登録する。grpcurl・Postman・grpcui が `.proto` 無しでサービスの一覧と型を取得できる。`FILE_DESCRIPTOR_SET` は `veil-build` が生成する（コンパイルしたパッケージごとに渡す）。`list_services` は登録したすべての gRPC サービスを返す。組み込みのヘルスチェックとリフレクション自身の型は返さない |
 
-gRPC のルートは OpenAPI に載りません。完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・
-ヘルスチェック）で、`tests/api/library_e2e.sh grpc` が tonic のクライアントと HTTP/3 のクライアントで試験します。
+完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・ヘルスチェック）で、
+`tests/api/library_e2e.sh grpc` が tonic のクライアントと HTTP/3 のクライアントで試験します。
+
+### OpenAPI の gRPC
+
+登録した gRPC のメソッドは（`[api] openapi_grpc = false` でなければ）`/openapi.json` と Swagger UI に
+`POST /<package>.<Service>/<Method>`（grpc-gateway の出力と同じ形）として、タグ `gRPC: <package>.<Service>` の下に載ります。
+OpenAPI は REST の記述なので、呼び出し方ではなくメソッドと型の一覧です。要求の本文は `application/grpc`・`application/grpc-web`、
+200 の応答は `application/grpc` として載り、Swagger UI の「Try it out」はこの操作では出ません。操作ごとの `x-grpc` に
+`service`・`method`・`kind`（`unary`・`server_streaming`・`client_streaming`・`bidi_streaming`）・`streaming`、型がわかれば
+`requestType`・`responseType` が入ります。ストリーミングは `summary` にも書かれ、スキーマは 1 メッセージの型です。
+
+メッセージの型は veil に渡した記述子（FileDescriptorSet）から取ります。`App::grpc_reflection(&[FILE_DESCRIPTOR_SET])` は
+リフレクションと OpenAPI の両方に、`App::grpc_descriptors(&[FILE_DESCRIPTOR_SET])` は OpenAPI だけに使います（リフレクションの
+サービスは登録しない）。型は proto3 の JSON マッピングで `components.schemas` に完全修飾名（`demo.v1.HelloRequest`）で入ります。
+64 ビット整数は文字列、`bytes` は base64 の文字列、enum は値の名前、`repeated` は配列、`map` は `additionalProperties` の
+オブジェクト、`oneof` は `oneOf`、再帰する型は `$ref`、well-known types（`Timestamp` は `date-time` の文字列、`Duration`・
+`Struct`・`Value`・`Any`・ラッパ・`FieldMask`・`Empty`）はそれぞれの JSON の形です。`.proto` のコメント（`veil-build` が残す）は
+メソッド・サービス・メッセージ・フィールドの説明になります。型のわからないメソッド（記述子が無い・自前の `Codec`）は本文が
+`{"type": "string", "format": "binary"}` で載ります。下位のルートで登録したメソッドの種類は `App::grpc_kind(path, MethodKind::...)`
+で指定します。組み込みのヘルスチェック・リフレクションと、サービスごとの `UNIMPLEMENTED` の受け皿は
+`[api] openapi_grpc_builtin = true` のときだけ載ります。文書は起動時とリロード時に作り、要求の処理には影響しません。
 
 ## L4（TCP/UDP）ハンドラ
 
@@ -1087,6 +1109,8 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
   `veil_grpc_set_header` / `_set_trailer`・`veil_grpc_metadata`・`veil_grpc_deadline_ms`。
   `veil_register_grpc_health(cfg)` で `grpc.health.v1.Health` を足します。圧縮・期限・gRPC-Web・`[api] grpc_*` のキーは
   Rust のハンドラと同じで、HTTP/2・HTTP/3 の両方で動きます。
+  `veil_grpc_descriptors(cfg, data, len)` に `FileDescriptorSet`（`protoc --include_imports --descriptor_set_out=...` の出力）を
+  渡すと、メソッドがメッセージの型付きで OpenAPI に載ります（[OpenAPI の gRPC](#openapi-の-grpc)）。
 - L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)`（`on_connect` / `on_data` / `on_close`。ハンドラ用プールで
   接続ごとに 1 つずつ順に呼ばれ、`veil_l4_write` / `veil_l4_close` はコールバックの中で）と
   `veil_register_l4_udp(cfg, name, listen, fn, ud)`（`veil_l4_reply` でデータグラムに応答）。

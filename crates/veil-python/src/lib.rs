@@ -93,7 +93,10 @@ enum PendingExtra {
     Grpc {
         path: String,
         handler_id: u64,
+        // F-265: OpenAPI に載せる種類
+        kind: veil::api::grpc::MethodKind,
     },
+    GrpcDescriptors(Vec<u8>),
     L4Tcp {
         name: String,
         listen: String,
@@ -205,11 +208,22 @@ fn is_websocket_upgrade(req: &Request) -> bool {
 
 /// Register a gRPC method; `handlers[handler_id].handle(call)` returns `(code, message)`.
 #[pyfunction]
-fn register_grpc(path: String, handler_id: u64) {
+#[pyo3(signature = (path, handler_id, request_streaming=false, response_streaming=false))]
+fn register_grpc(path: String, handler_id: u64, request_streaming: bool, response_streaming: bool) {
+    PENDING_EXTRA.lock().unwrap().push(PendingExtra::Grpc {
+        path,
+        handler_id,
+        kind: veil::api::grpc::MethodKind::from_streaming(request_streaming, response_streaming),
+    });
+}
+
+/// Use a serialized `FileDescriptorSet` for the types of the gRPC methods in OpenAPI.
+#[pyfunction]
+fn register_grpc_descriptors(descriptor_set: Vec<u8>) {
     PENDING_EXTRA
         .lock()
         .unwrap()
-        .push(PendingExtra::Grpc { path, handler_id });
+        .push(PendingExtra::GrpcDescriptors(descriptor_set));
 }
 
 /// Register `grpc.health.v1.Health` (Check and Watch).
@@ -658,10 +672,16 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
     };
     for e in std::mem::take(&mut *PENDING_EXTRA.lock().unwrap()) {
         app = match e {
-            PendingExtra::Grpc { path, handler_id } => {
+            PendingExtra::Grpc {
+                path,
+                handler_id,
+                kind,
+            } => {
                 let h = handler(handler_id)?.bind(py).getattr("handle")?.unbind();
                 app.grpc_blocking(&path, move |call| ext::run_grpc(&h, call))
+                    .grpc_kind(&path, kind)
             }
+            PendingExtra::GrpcDescriptors(d) => app.grpc_descriptors(&[&d]),
             PendingExtra::L4Tcp {
                 name,
                 listen,
@@ -713,6 +733,7 @@ fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aio::aio_take, m)?)?;
     m.add_function(wrap_pyfunction!(register_websocket, m)?)?;
     m.add_function(wrap_pyfunction!(register_grpc, m)?)?;
+    m.add_function(wrap_pyfunction!(register_grpc_descriptors, m)?)?;
     m.add_function(wrap_pyfunction!(register_grpc_health, m)?)?;
     m.add_function(wrap_pyfunction!(register_l4_tcp, m)?)?;
     m.add_function(wrap_pyfunction!(register_l4_udp, m)?)?;

@@ -80,7 +80,7 @@ if __name__ == "__main__":
     else:
         register_plain(Demo())
     veil.grpc.add_health()
-    kw = {"listen_cleartext": os.environ.get("VEIL_LISTEN", "127.0.0.1:50051"), "openapi": False, "threads": int(os.environ.get("VEIL_THREADS", "0")) or None,
+    kw = {"listen_cleartext": os.environ.get("VEIL_LISTEN", "127.0.0.1:50051"), "openapi": os.environ.get("VEIL_OPENAPI") == "1", "threads": int(os.environ.get("VEIL_THREADS", "0")) or None,
           "overrides": {"logging.level": os.environ.get("VEIL_LOG", "warn"), "api.grpc_response_compression": "gzip"}}
     tls = os.environ.get("VEIL_TLS_LISTEN")
     if tls:

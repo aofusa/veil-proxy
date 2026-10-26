@@ -1,6 +1,6 @@
 # F-265: gRPC のルートを OpenAPI（`/openapi.json`・`/docs`）に載せる
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（v0.10.0。2026-10-25 起票・設計、2026-10-26 実装。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 背景
 
@@ -80,3 +80,25 @@ gRPC-JSON の変換（transcoding）は範囲外。
 ## 受け入れ条件
 
 - Rust・Python・C の gRPC のルートが OpenAPI に型付きで載り、Swagger UI で一覧できる。文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容
+
+- `src/api/grpc/describe.rs`（新設）: 登録したメソッドの種類（`grpc_route` が記録。`App::grpc_kind` で明示）と記述子
+  （`App::grpc_reflection`・新設の `App::grpc_descriptors`）を集め、OpenAPI の生成（起動・リロード時）で `paths` の
+  `POST /pkg.Svc/Method`・`components.schemas`・トップレベルの `tags` を足す。記述子は `wire.rs` の読み手で必要なフィールドだけ読む
+  （prost に依存しない）。スキーマは参照される型だけ載せる。メソッド・サービス・メッセージ・フィールド・enum の説明は
+  `SourceCodeInfo` のコメントから取る（`veil-build` は prost-build の記述子に `source_code_info` を残すので、生成コードは変えていない）。
+  ルート自体は従来どおり `hidden: true` のまま（POST・OPTIONS・受け皿が重複して載らない）。
+- 記述子の無いメソッドは本文を `{"type":"string","format":"binary"}`、記述子の種類（`client_streaming`・`server_streaming`）は
+  登録関数から推した種類より優先し、`grpc_kind` の明示は上書きしない。
+- `[api] openapi_grpc`（既定 `true`）・`openapi_grpc_builtin`（既定 `false`。health・reflection を載せる）。
+- Swagger UI の初期化のプラグインで `x-grpc` の操作の「Try it out」も消す。タグの説明に、リフレクションが有効なら grpcurl の例。
+- Python: 素の層は `request_deserializer` の生成された `FromString` から、grpcio の層は `Server._add` から `_pb2` の
+  `FileDescriptor`（依存を含めた FileDescriptorSet）を自動で渡す。`veil.grpc.add_descriptor(...)` を公開。
+  `register_grpc` にストリーミングの種類を渡す。C: `veil_grpc_descriptors(cfg, data, len)`、`veil_register_grpc` の種類を記録。
+- 試験: 単体（proto3 JSON マッピング（スカラー・enum・oneof・map・入れ子・再帰・well-known types・`optional`）、壊れた記述子、
+  文書に 4 種類のメソッドと型が載り health が載らないこと）。E2E: `library_e2e.sh grpc` で Rust の 4 種類と
+  `openapi_grpc = false` で消えること、`python` で素の層・grpcio の層の両方。
+- 文書: `docs/guide/library.md`（英日）の `[api]` 表・「gRPC in OpenAPI」・C API、`crates/veil-python/docs/grpc.md`、
+  `crates/veil-capi/README.md`、`examples/config.toml`。
+- OpenAPI 3.1 の検証器での検証は、試験用の Python 依存を増やさないため見送った（生成物の形は単体試験で固定）。

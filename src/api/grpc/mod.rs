@@ -26,6 +26,8 @@
 pub mod blocking;
 // F-267
 mod channel;
+// F-265
+mod describe;
 pub mod health;
 pub mod reflection;
 mod web;
@@ -55,6 +57,11 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+// F-265
+#[cfg(feature = "openapi")]
+pub(crate) use describe::add_to_openapi;
+pub use describe::MethodKind;
 
 /// The compression method of a response (`Response::with_compression`).
 pub use crate::grpc::compression::GrpcCompression as Compression;
@@ -1098,7 +1105,9 @@ fn with_preflight(func: HandlerFn) -> HandlerFn {
     })
 }
 
-fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
+fn grpc_route(mut app: App, path: &str, kind: MethodKind, func: HandlerFn) -> App {
+    // F-265: OpenAPI は gRPC の記述子と種類から別に作る（ここでは一般の操作として載せない）
+    describe::record_kind(path, kind);
     let meta = OperationMeta {
         operation_id: path.trim_start_matches('/').replace(['/', '.'], "_"),
         hidden: true,
@@ -1202,7 +1211,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::Unary, func)
     }
 
     /// Registers a server-streaming RPC (one request, a stream of responses).
@@ -1242,7 +1251,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::ServerStreaming, func)
     }
 
     /// Registers a client-streaming RPC (a stream of requests, one response).
@@ -1294,7 +1303,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::ClientStreaming, func)
     }
 
     // F-209: HTTP/2・HTTP/3 とも全二重。
@@ -1330,7 +1339,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::BidiStreaming, func)
     }
 }
 

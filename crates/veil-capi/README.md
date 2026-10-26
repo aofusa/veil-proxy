@@ -106,6 +106,7 @@ static int say_hello(veil_grpc_call_t *call, void *ud) {
 }
 veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL);
 veil_register_grpc_health(cfg);                          /* grpc.health.v1.Health */
+veil_grpc_descriptors(cfg, set, set_len);                /* 任意: OpenAPI にメッセージの型を載せる */
 ```
 
 - `veil_grpc_recv`: 1 = 受け取った（ポインタは次の recv かコールバックの終わりまで有効）、0 = 終わり、負 = エラー。

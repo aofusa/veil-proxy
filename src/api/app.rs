@@ -247,6 +247,12 @@ pub struct ApiSettings {
     // F-262
     /// List WebSocket routes in the OpenAPI document.
     pub openapi_websocket: bool,
+    // F-265
+    /// List gRPC methods in the OpenAPI document.
+    pub openapi_grpc: bool,
+    // F-265
+    /// Also list the built-in gRPC services (health checking and reflection) in the OpenAPI document.
+    pub openapi_grpc_builtin: bool,
     // F-270
     /// Compress handler responses by default (handler routes without their own `[route.compression]`).
     pub compression: bool,
@@ -330,6 +336,8 @@ impl ApiSettings {
             websocket_idle_timeout_secs: n("websocket_idle_timeout_secs", 0) as u64,
             websocket_compression: b("websocket_compression", false),
             openapi_websocket: b("openapi_websocket", true),
+            openapi_grpc: b("openapi_grpc", true),
+            openapi_grpc_builtin: b("openapi_grpc_builtin", false),
             compression: b("compression", false),
             multipart_max_parts: n("multipart_max_parts", 100),
             multipart_max_field_size: n("multipart_max_field_size", 1024 * 1024),

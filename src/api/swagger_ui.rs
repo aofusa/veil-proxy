@@ -127,12 +127,12 @@ pub(crate) fn asset_base(settings: &ApiSettings) -> String {
     )
 }
 
-// F-262: WebSocket の操作（x-veil-websocket）はブラウザから試せないので Try it out を出さない Swagger UI の
+// F-262・F-265: WebSocket の操作（x-veil-websocket）と gRPC の操作（x-grpc）はブラウザから試せないので Try it out を出さない Swagger UI の
 // プラグイン。同梱の初期化のスクリプトと CDN のページの両方が使う（JS のコメントは入れない。初期化のスクリプトに
 // `//` が無いことを試験で見ている）
 macro_rules! no_try_it_out_plugin {
     () => {
-        "const VeilNoTryItOut = () => ({\n  statePlugins: { spec: { wrapSelectors: {\n    allowTryItOutFor: (ori, system) => (state, path, method) =>\n      ori(state, path, method) &&\n      !system.specSelectors.specJson().getIn([\"paths\", path, method, \"x-veil-websocket\"])\n  } } }\n});\n"
+        "const VeilNoTryItOut = () => ({\n  statePlugins: { spec: { wrapSelectors: {\n    allowTryItOutFor: (ori, system) => (state, path, method) =>\n      ori(state, path, method) &&\n      !system.specSelectors.specJson().getIn([\"paths\", path, method, \"x-veil-websocket\"]) &&\n      !system.specSelectors.specJson().getIn([\"paths\", path, method, \"x-grpc\"])\n  } } }\n});\n"
     };
 }
 
@@ -411,6 +411,7 @@ mod tests {
         let cdn = page(&settings(Some("cdn"))).unwrap().unwrap();
         let cdn = std::str::from_utf8(&cdn.html).unwrap();
         assert!(cdn.contains("x-veil-websocket") && cdn.contains("plugins: [VeilNoTryItOut]"));
+        assert!(cdn.contains("x-grpc"));
         #[cfg(feature = "openapi-ui-embedded")]
         assert!(
             INITIALIZER_JS.contains("x-veil-websocket")

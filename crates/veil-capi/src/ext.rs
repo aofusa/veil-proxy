@@ -14,7 +14,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use veil::api::bridge::ResponseWriter;
 use veil::api::grpc::blocking::GrpcCall;
-use veil::api::grpc::{Code, Status};
+use veil::api::grpc::{Code, MethodKind, Status};
 use veil::api::l4::{L4Out, L4Session};
 use veil::api::App;
 
@@ -247,11 +247,43 @@ pub unsafe extern "C" fn veil_register_grpc(
     }
     let path = path.to_string();
     let ud = UserData(user_data);
+    // F-265: OpenAPI に載せる種類
+    let method_kind = MethodKind::from_streaming(!single_in(kind), !single_out(kind));
     cfg.extra.push(Box::new(move |app: App| {
         app.grpc_blocking(&path, move |call: &mut GrpcCall| {
             grpc_invoke(func, ud, kind, call)
         })
+        .grpc_kind(&path, method_kind)
     }));
+    VEIL_OK
+}
+
+// F-265
+/// gRPC のメソッドの型を OpenAPI に載せるための `FileDescriptorSet`（`protoc --include_imports
+/// --descriptor_set_out` の出力）を渡す。`data` はこの呼び出しの間だけ読む（中で複製する）。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`data` は `len` バイト読める（`len` が 0 なら NULL 可）。
+#[no_mangle]
+pub unsafe extern "C" fn veil_grpc_descriptors(
+    cfg: *mut veil_config_t,
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    if data.is_null() && len != 0 {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL descriptor data");
+    }
+    let set = if len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    cfg.extra
+        .push(Box::new(move |app: App| app.grpc_descriptors(&[&set])));
     VEIL_OK
 }
 

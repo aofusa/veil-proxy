@@ -235,6 +235,9 @@ typedef int (*veil_grpc_fn)(veil_grpc_call_t *call, void *user_data);
 int veil_register_grpc(veil_config_t *cfg, const char *path, uint32_t kind, veil_grpc_fn fn, void *user_data);
 /* grpc.health.v1.Health (Check・Watch) を登録する。 */
 int veil_register_grpc_health(veil_config_t *cfg);
+/* gRPC のメソッドの型を OpenAPI に載せる FileDescriptorSet (protoc --include_imports --descriptor_set_out の出力)。
+ * data はこの呼び出しの間だけ読む。 */
+int veil_grpc_descriptors(veil_config_t *cfg, const uint8_t *data, size_t len);
 /*
  * 次の受信メッセージ。1 = 受け取った (*data・*len は次の recv かコールバックの終わりまで有効)、0 = 終わり、
  * 負 = エラー (壊れた・大きすぎるメッセージ)。単項・サーバストリーミングは 1 通だけ返す。

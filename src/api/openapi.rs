@@ -315,6 +315,12 @@ pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value 
             }
         }
     }
+    // F-265: gRPC のメソッド（記述子があれば型付き）
+    // gRPC の無いビルドでは足す処理が無い
+    #[cfg_attr(not(feature = "grpc-handler"), allow(unused_mut))]
+    let mut tags: Vec<Value> = Vec::new();
+    #[cfg(feature = "grpc-handler")]
+    super::grpc::add_to_openapi(settings, entries, &mut paths, &mut components, &mut tags);
     let mut info = Map::new();
     info.insert("title".into(), settings.openapi_title.clone().into());
     info.insert("version".into(), settings.openapi_version.clone().into());
@@ -326,12 +332,16 @@ pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value 
     if !schemes.is_empty() {
         comps.insert("securitySchemes".into(), Value::Object(schemes));
     }
-    json!({
+    let mut doc = json!({
         "openapi": "3.1.0",
         "info": Value::Object(info),
         "paths": Value::Object(paths),
         "components": Value::Object(comps),
-    })
+    });
+    if !tags.is_empty() {
+        doc["tags"] = Value::Array(tags);
+    }
+    doc
 }
 
 #[cfg(test)]
