@@ -106,6 +106,15 @@ struct State {
         target_os = "macos"
     ))]
     kq: Option<kq::Kq>,
+    /// 起動を待たせている監視スレッド（サンドボックスを掛けた後に [`release_threads`] で起動する。B-192）
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    held_threads: Vec<Box<dyn FnOnce() + Send>>,
     /// 最後に読み込んだ設定の `max_concurrent_connections`（kqueue の fd の予算。B-191）
     #[cfg(any(
         target_os = "freebsd",
@@ -128,6 +137,14 @@ static STATE: Mutex<State> = Mutex::new(State {
     ))]
     kq: None,
     #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    held_threads: Vec::new(),
+    #[cfg(any(
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "netbsd",
@@ -135,6 +152,78 @@ static STATE: Mutex<State> = Mutex::new(State {
     ))]
     max_connections: 0,
 });
+
+/// 監視スレッドの起動をサンドボックスの後まで待たせるか（B-192）
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+static HOLD_THREADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// B-192: seccomp・Landlock は掛けたスレッドとその後に作ったスレッドにしか効かない（TSYNC を使わない）。
+// 起動時の設定のロード（サンドボックスの前）で監視スレッドを作ると、そのスレッドだけ制限の外で動き続けるので、
+// 起動の間は作らずに預かり、サンドボックスを掛けた後に作る。通知は fd に溜まるので取りこぼさない。
+/// Defers starting the file watch thread until [`release_threads`] (call before loading the configuration at
+/// startup, so that the thread is created after the sandbox is applied).
+pub fn hold_threads() {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    HOLD_THREADS.store(true, Ordering::Release);
+}
+
+/// Starts the file watch thread deferred by [`hold_threads`] (call after the sandbox is applied). Later
+/// configuration loads start it right away.
+pub fn release_threads() {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "macos"
+    ))]
+    {
+        let mut st = lock_state();
+        HOLD_THREADS.store(false, Ordering::Release);
+        for f in st.held_threads.drain(..) {
+            if let Err(e) = std::thread::Builder::new()
+                .name("veil-fswatch".into())
+                .spawn(f)
+            {
+                ftlog::warn!(
+                    "Static file watch could not start ({}); cached files follow disk changes only after valid_duration_secs",
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// 監視スレッドを作る（[`hold_threads`] の間は預かる）
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "macos"
+))]
+fn spawn_watcher(st: &mut State, f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    if HOLD_THREADS.load(Ordering::Acquire) {
+        st.held_threads.push(Box::new(f));
+        return Ok(());
+    }
+    std::thread::Builder::new()
+        .name("veil-fswatch".into())
+        .spawn(f)
+        .map(drop)
+}
 
 fn lock_state() -> std::sync::MutexGuard<'static, State> {
     // 監視スレッドが panic しても登録は続けられるようにする（中身は表と fd だけ）
@@ -447,9 +536,11 @@ mod linux {
                 }
                 return Err(e);
             }
-            std::thread::Builder::new()
-                .name("veil-fswatch".into())
-                .spawn(move || run(fd))?;
+            if let Err(e) = super::spawn_watcher(st, move || run(fd)) {
+                // SAFETY: inotify_init1 が返した fd（誰も持っていない）
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
             st.inotify = Some(Inotify {
                 fd,
                 watches: HashMap::new(),
@@ -1065,10 +1156,7 @@ mod kq {
         if st.kq.is_none() {
             let kq = Kq::new()?;
             let fd = kq.kq;
-            if let Err(e) = std::thread::Builder::new()
-                .name("veil-fswatch".into())
-                .spawn(move || run(fd))
-            {
+            if let Err(e) = super::spawn_watcher(st, move || run(fd)) {
                 close(fd);
                 return Err(e);
             }
@@ -1610,6 +1698,14 @@ mod tests {
             ))]
             kq: None,
             #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "macos"
+            ))]
+            held_threads: Vec::new(),
+            #[cfg(any(
                 target_os = "freebsd",
                 target_os = "openbsd",
                 target_os = "netbsd",
@@ -1641,6 +1737,7 @@ mod tests {
                 active: true,
             }],
             inotify: None,
+            held_threads: Vec::new(),
         };
         let before = a.current();
         for ev in evs {

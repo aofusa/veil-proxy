@@ -307,7 +307,8 @@ watch = true                    # keep both caches on the same setting
   followed after `valid_duration_secs`.
 - **Platforms**: Linux (io_uring and epoll builds), FreeBSD, OpenBSD, NetBSD, macOS and Windows.
 - **Sandbox**: the seccomp allow-list includes `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` and
-  `getdents64` (see [Security](security.md)). With Landlock, list the static root in `landlock_read_paths` as
+  `getdents64` (see [Security](security.md)). The watcher thread is started after seccomp and Landlock are
+  applied, so it runs under the same restrictions as the workers. With Landlock, list the static root in `landlock_read_paths` as
   usual (the watcher reads the directory tree).
 - Routes added by a reload are watched from that reload on. A route removed by a reload stays watched until the
   process restarts (bounded by the number of distinct roots ever configured).

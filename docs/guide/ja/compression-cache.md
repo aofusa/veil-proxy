@@ -300,7 +300,8 @@ watch = true                    # 2 つのキャッシュは同じ設定にす�
 - **対応 OS**: Linux（io_uring・epoll のビルド）・FreeBSD・OpenBSD・NetBSD・macOS・Windows。
 - **サンドボックス**: seccomp の許可リストに `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch`・`getdents64` を
   含む（[セキュリティ](security.md)）。Landlock では今までどおり静的配信のルートを `landlock_read_paths` に書く
-  （監視のスレッドがディレクトリを辿る）。
+  （監視のスレッドがディレクトリを辿る）。監視のスレッドは seccomp・Landlock を掛けた後に作るので、ワーカーと同じ制限の
+  下で動く。
 - リロードで足したルートはそのリロードから監視する。リロードで外したルートの監視はプロセスを再起動するまで残る
   （一度でも設定したルートの数で抑えられる）。
 

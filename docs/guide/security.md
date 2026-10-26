@@ -55,6 +55,8 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > the allowlist and both container profiles also include `inotify_init1`, `inotify_add_watch` and
 > `inotify_rm_watch`; the in-process allowlist adds `getdents64` (the watcher thread walks the static root).
 > Only the dedicated watcher thread issues them, at startup, on reload and when a directory is created.
+> seccomp and Landlock apply to the thread that installs them and to threads created afterwards, not to threads
+> already running, so veil starts the watcher thread (like the workers) after the sandbox is applied.
 
 **Recommended Deployment Procedure:**
 

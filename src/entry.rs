@@ -205,6 +205,10 @@ pub fn run_server(opts: ServerOptions) {
     #[cfg(not(feature = "acme"))]
     let acme_enabled = false;
 
+    // B-192: 設定のロード（ルートの監視の登録）で監視スレッドを作らず、サンドボックスの後まで預ける
+    #[cfg(feature = "cache")]
+    crate::cache::watch::hold_threads();
+
     // http3: 証明書世代の初期化で、NetBSD: chroot 後のルート再解決で書き換える。
     #[cfg(any(feature = "http3", target_os = "netbsd"))]
     let mut loaded_config = match load_config(&config_path) {
@@ -779,8 +783,9 @@ pub fn run_server(opts: ServerOptions) {
     // 権限降格後、ワーカースレッド起動前にセキュリティ制限を適用します。
     // これにより、io_uringの悪用リスクを低減します。
     //
-    // 注意: seccompはプロセス全体に適用され、不可逆です。
-    // ワーカースレッド起動後は新しいスレッドにも自動的に継承されます。
+    // 注意: seccomp・Landlock は不可逆で、掛けたスレッド（このメインスレッド）と、その後に作るスレッド
+    // （ワーカー等）にだけ効く（TSYNC を使わないので、既に動いている背景スレッドには効かない）。
+    // 静的配信の監視スレッドは設定のロードでは作らずに預け、この後で作る（B-192）。
     // ====================
 
     // セキュリティ機能のサポート状況をレポート
@@ -889,6 +894,10 @@ pub fn run_server(opts: ServerOptions) {
             }
         }
     }
+
+    // 設定のロードで預けた静的配信の監視スレッドを、サンドボックスの後で作る（B-192）
+    #[cfg(feature = "cache")]
+    crate::cache::watch::release_threads();
 
     // FreeBSD: capsicum（F-120 Phase 4）。
     //

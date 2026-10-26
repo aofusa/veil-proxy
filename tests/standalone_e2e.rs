@@ -3423,3 +3423,89 @@ fn b189_wasm_body_phase_sends_100_continue_for_chunked() {
     let r = read_one_response(&mut s, &mut buf, false).expect("final response");
     assert_eq!((r.status, r.text()), (200, "42".into()), "{}", veil.log());
 }
+
+// ===================== B-192 =====================
+
+/// B-192: 起動時の設定に `watch = true` があっても、静的配信の監視スレッドは seccomp を掛けた後に作られ、
+/// フィルタの下で動く（以前は設定のロード＝サンドボックスの前に作られ、制限の外で動き続けた）
+#[cfg(target_os = "linux")]
+#[test]
+fn b192_fswatch_thread_runs_under_seccomp() {
+    let dir = tempfile::tempdir().unwrap();
+    let www = dir.path().join("www");
+    std::fs::create_dir(&www).unwrap();
+    std::fs::write(www.join("a.txt"), b"hello").unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[security]
+enable_seccomp = true
+seccomp_mode = "log"
+[static_file_cache]
+enabled = true
+watch = true
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        www = tp(&www),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    let task_dir = format!("/proc/{}/task", veil.pid());
+    // (スレッド名, Seccomp の値)
+    let threads = || -> Vec<(String, String)> {
+        std::fs::read_dir(&task_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|t| {
+                let status = std::fs::read_to_string(t.path().join("status")).ok()?;
+                let field = |k: &str| {
+                    status
+                        .lines()
+                        .find_map(|l| l.strip_prefix(k))
+                        .map(|v| v.trim().to_string())
+                };
+                Some((field("Name:")?, field("Seccomp:")?))
+            })
+            .collect()
+    };
+    let mut found = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            found = threads().into_iter().find(|(n, _)| n == "veil-fswatch");
+            found.is_some()
+        }),
+        "no veil-fswatch thread: {:?}\n{}",
+        threads(),
+        veil.log()
+    );
+    let (_, seccomp) = found.unwrap();
+    if threads().iter().all(|(_, s)| s == "0") {
+        // seccomp を掛けられない環境（allow_security_failures 無しなら起動しないので、ここには来ない）
+        eprintln!("seccomp is not applied in this environment; skipping");
+        return;
+    }
+    assert_eq!(
+        seccomp,
+        "2",
+        "veil-fswatch runs outside the seccomp filter: {:?}",
+        threads()
+    );
+}
