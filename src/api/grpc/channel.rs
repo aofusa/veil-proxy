@@ -50,10 +50,12 @@ impl std::fmt::Debug for Channel {
 }
 
 impl Channel {
-    /// A channel with a client of the default settings (HTTP/2 only).
+    /// A channel with a client of the default settings (HTTP/2 only). `http://unix:/path.sock:` URLs are accepted.
     pub fn connect(url: &str) -> Result<Channel, Status> {
+        // B-198: 呼び出し側が書いた URL なので Unix ソケットも受ける（従来どおり）
         let client = Client::builder()
             .http2(Http2::On)
+            .unix_sockets(true)
             .build()
             .map_err(|e| Status::unavailable(e.to_string()))?;
         Channel::with_client(&client, url)

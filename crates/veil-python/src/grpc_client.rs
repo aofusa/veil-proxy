@@ -330,7 +330,10 @@ impl GrpcChannel {
         gzip: bool,
         max_message_size: Option<usize>,
     ) -> PyResult<Self> {
-        let mut b = veil::api::client::Client::builder().http2(veil::api::client::Http2::On);
+        // B-198: チャネルの URL はアプリが書くので Unix ソケットも受ける（従来どおり）
+        let mut b = veil::api::client::Client::builder()
+            .http2(veil::api::client::Http2::On)
+            .unix_sockets(true);
         if let Some(ca) = ca {
             b = b.ca(ca);
         }

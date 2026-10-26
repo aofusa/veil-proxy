@@ -188,7 +188,10 @@ let created: Item = res.error_for_status()?.json()?;
   multiplexed upstream connections.
 - `Http2::Auto` (default): HTTPS offers `h2` and `http/1.1` by ALPN; plain HTTP uses HTTP/1.1. `Http2::On`: h2 over
   TLS, h2c with prior knowledge over plain TCP. `Http2::Off`: HTTP/1.1.
-- `http://unix:/run/app.sock:/path` talks to a Unix socket.
+- `http://unix:/run/app.sock:/path` talks to a Unix socket when the client is built with
+  `ClientBuilder::unix_sockets(true)` (off by default, so a URL taken from a user cannot reach a local socket).
+  A method, header or URL with a control character (CR, LF, ...) fails with `ErrorKind::Encode` / `ErrorKind::Url`
+  instead of being written to the request.
 - HTTP/1.1 connections are pooled per worker (`pool_idle_timeout`, default 60 s); an idempotent request whose pooled
   connection turned out to be closed is sent once more on a new connection.
 - Bodies are read whole (`max_response_size`, default 64 MiB). Errors have a `kind()` (`Connect`, `Timeout`,

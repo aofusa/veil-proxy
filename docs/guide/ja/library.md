@@ -789,7 +789,7 @@ let items: Vec<Item> = res.error_for_status()?.json()?;
 プロキシの上流の部品を使います: 名前解決は offload のプール、TLS は上流の TLS クライアント（信頼アンカーは `[tls_client] ca`、
 または `ClientBuilder::ca`。mTLS は `client_cert`）、多重化した HTTP/2 の接続と、ワーカーごとの HTTP/1.1 のプール。
 `Http2::Auto`（既定）は TLS では ALPN で h2 か HTTP/1.1 を選び、平文では HTTP/1.1。`Http2::On` は h2 と prior knowledge の h2c、
-`Http2::Off` は HTTP/1.1。`http://unix:/path.sock:/x` で Unix ソケットへ接続します。応答の本文は全部読みます（`max_response_size`、
+`Http2::Off` は HTTP/1.1。`ClientBuilder::unix_sockets(true)` を付けると `http://unix:/path.sock:/x` で Unix ソケットへ接続します（既定は無効）。応答の本文は全部読みます（`max_response_size`、
 既定 64 MiB）。エラーには `kind()` があり、502・504 の `Response` に変換できます。詳しくは [library-kit.md](library-kit.md#http-クライアント)。
 
 ## GraphQL

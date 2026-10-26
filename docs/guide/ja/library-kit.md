@@ -181,7 +181,9 @@ let created: Item = res.error_for_status()?.json()?;
   `client_cert(cert, key)`）、HTTP/2 は多重化された上流の接続。
 - `Http2::Auto`（既定）: HTTPS は ALPN で `h2` と `http/1.1` を申し出、平文の HTTP は HTTP/1.1。`Http2::On`: TLS の上の h2、
   平文の TCP は prior knowledge の h2c。`Http2::Off`: HTTP/1.1。
-- `http://unix:/run/app.sock:/path` で Unix ソケットへ。
+- `ClientBuilder::unix_sockets(true)` で作ったクライアントは `http://unix:/run/app.sock:/path` で Unix ソケットへ（既定は無効。
+  利用者から受けた URL でローカルのソケットへ届かないように）。制御文字（CR・LF 等）を含むメソッド・ヘッダ・URL は要求に書かず、
+  `ErrorKind::Encode`・`ErrorKind::Url` の失敗にします。
 - HTTP/1.1 の接続はワーカーごとにプールします（`pool_idle_timeout`、既定 60 秒）。プールの接続が切れていた冪等な要求は、新しい接続で
   1 回だけ送り直します。
 - 本文は全部読みます（`max_response_size`、既定 64 MiB）。エラーには `kind()`（`Connect`・`Timeout`・`Protocol`・`Status` 等）があり、

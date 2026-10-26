@@ -45,7 +45,8 @@ pub enum Http2 {
 /// What went wrong with a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// The URL could not be parsed (only `http://`, `https://` and `http://unix:/path:/uri` are accepted).
+    /// The URL could not be parsed or contains a space or a control character (only `http://`, `https://` and,
+    /// with [`ClientBuilder::unix_sockets`], `http://unix:/path:/uri` are accepted).
     Url,
     /// Connecting or the TLS handshake failed.
     Connect,
@@ -53,7 +54,8 @@ pub enum ErrorKind {
     Timeout,
     /// The server sent something that is not valid HTTP, or reset the stream.
     Protocol,
-    /// The request body could not be encoded (JSON or form).
+    /// The request could not be encoded: an invalid method or header (a control character such as CR or LF, or a
+    /// name that is not an HTTP token), or a JSON or form body.
     Encode,
     /// The response body could not be decoded (JSON).
     Decode,
@@ -137,6 +139,7 @@ pub struct ClientBuilder {
     client_cert: Option<(String, String)>,
     user_agent: Option<String>,
     default_headers: Vec<(Bytes, Bytes)>,
+    unix_sockets: bool,
 }
 
 impl Default for ClientBuilder {
@@ -152,6 +155,7 @@ impl Default for ClientBuilder {
             client_cert: None,
             user_agent: None,
             default_headers: Vec::new(),
+            unix_sockets: false,
         }
     }
 }
@@ -217,8 +221,29 @@ impl ClientBuilder {
         self
     }
 
+    // B-198: URL 文字列だけでローカルのソケットへ届かないよう、既定では受けない
+    /// Accept `http://unix:/path.sock:/uri` URLs, which connect to a Unix socket (default `false`, so a URL that
+    /// comes from a user cannot reach a local socket).
+    pub fn unix_sockets(mut self, on: bool) -> Self {
+        self.unix_sockets = on;
+        self
+    }
+
     /// Builds the client (reads the CA and client certificate files now).
     pub fn build(self) -> Result<Client, ClientError> {
+        if let Some((n, _)) = self
+            .default_headers
+            .iter()
+            .find(|(n, v)| !is_token(n) || !valid_header_value(v))
+        {
+            return Err(ClientError::new(
+                ErrorKind::Config,
+                format!(
+                    "invalid default header '{}'",
+                    String::from_utf8_lossy(n).escape_debug()
+                ),
+            ));
+        }
         let tls =
             if self.insecure {
                 TlsProfile::Insecure
@@ -314,8 +339,14 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// A request with any method.
+    /// A request with any method (an HTTP token; anything else makes `send` fail with [`ErrorKind::Encode`]).
     pub fn request(&self, method: &str, url: &str) -> RequestBuilder {
+        let error = (!is_token(method.as_bytes())).then(|| {
+            ClientError::new(
+                ErrorKind::Encode,
+                format!("invalid request method '{}'", method.escape_debug()),
+            )
+        });
         RequestBuilder {
             client: self.clone(),
             method: Bytes::copy_from_slice(method.as_bytes()),
@@ -323,7 +354,7 @@ impl Client {
             headers: Vec::new(),
             body: Bytes::new(),
             timeout: None,
-            error: None,
+            error,
         }
     }
 
@@ -365,13 +396,28 @@ impl Client {
 
     /// Parses `url` into its origin (cached) and the request target (path and query).
     pub(crate) fn resolve(&self, url: &str) -> Result<(Arc<Origin>, String), ClientError> {
-        let bad = || ClientError::new(ErrorKind::Url, format!("unsupported URL '{}'", url));
+        let bad = || {
+            ClientError::new(
+                ErrorKind::Url,
+                format!("unsupported URL '{}'", url.escape_debug()),
+            )
+        };
+        // B-198: 空白・制御文字（CR・LF 等）は要求行に書けない
+        if !url.bytes().all(|c| c > 0x20 && c != 0x7f) {
+            return Err(bad());
+        }
         let rest = url
             .strip_prefix("https://")
             .or_else(|| url.strip_prefix("http://"))
             .ok_or_else(bad)?;
         // オリジンの終わり（unix: は `:/` の手前まで）
         let origin_len = if let Some(u) = rest.strip_prefix("unix:") {
+            if !self.inner.cfg.unix_sockets {
+                return Err(ClientError::new(
+                    ErrorKind::Url,
+                    "Unix socket URLs are disabled (enable them with ClientBuilder::unix_sockets)",
+                ));
+            }
             let end = u.find(":/").map(|i| i + 5).unwrap_or(rest.len());
             url.len() - rest.len() + end
         } else {
@@ -998,6 +1044,22 @@ async fn exchange(
 }
 
 /// Reads a chunked body (and its trailers).
+// B-198: 16 進の数字だけを受ける（from_str_radix は先頭の `+` も受ける）
+/// The size of a chunk from its size line (before any extension).
+fn parse_chunk_size(hex: &[u8]) -> Option<usize> {
+    if hex.is_empty() || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    usize::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
+}
+
+// B-198: 巨大なチャンクの大きさで加算があふれて上限の検査を素通りしない
+/// The bytes to buffer for a chunk of `size` (data and CRLF), or `None` when the body would exceed `max`.
+fn chunk_need(have: usize, size: usize, max: usize) -> Option<usize> {
+    have.checked_add(size).filter(|&n| n <= max)?;
+    size.checked_add(2)
+}
+
 async fn read_chunked(
     conn: &mut Conn,
     buf: &mut BytesMut,
@@ -1022,10 +1084,7 @@ async fn read_chunked(
             .next()
             .unwrap_or(b"")
             .trim_ascii();
-        let size = std::str::from_utf8(hex)
-            .ok()
-            .and_then(|h| usize::from_str_radix(h, 16).ok())
-            .ok_or_else(|| proto("invalid chunk size"))?;
+        let size = parse_chunk_size(hex).ok_or_else(|| proto("invalid chunk size"))?;
         if size == 0 {
             // トレーラ（空行まで）
             let mut trailers = Vec::new();
@@ -1051,14 +1110,12 @@ async fn read_chunked(
             }
             return Ok((out.freeze(), trailers));
         }
-        if out.len() + size > max {
-            return Err((too_large(max), false));
-        }
-        while buf.len() < size + 2 {
+        let need = chunk_need(out.len(), size, max).ok_or_else(|| (too_large(max), false))?;
+        while buf.len() < need {
             fill(conn, buf).await?;
         }
         out.extend_from_slice(&buf[..size]);
-        buf.advance(size + 2);
+        buf.advance(need);
     }
 }
 
@@ -1097,9 +1154,20 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    /// Adds a header.
+    /// Adds a header. A name that is not an HTTP token or a value with a control character (CR, LF, NUL, ...)
+    /// makes `send` fail with [`ErrorKind::Encode`].
     pub fn header(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        let (name, value) = (name.into(), value.into());
+        if self.error.is_none() && (!is_token(&name) || !valid_header_value(&value)) {
+            self.error = Some(ClientError::new(
+                ErrorKind::Encode,
+                format!(
+                    "invalid header '{}'",
+                    String::from_utf8_lossy(&name).escape_debug()
+                ),
+            ));
+        }
+        self.headers.push((name, value));
         self
     }
 
@@ -1178,6 +1246,19 @@ impl RequestBuilder {
         let c = self.client.clone();
         c.send(self).await
     }
+}
+
+// B-198: 要求行・ヘッダへ CR・LF 等を書かない（ヘッダの注入・上流への要求のスマグリング）
+/// Whether `b` is an HTTP token (RFC 9110 section 5.6.2): a method or a header name.
+fn is_token(b: &[u8]) -> bool {
+    !b.is_empty()
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+}
+
+/// Whether `v` can be sent as a header value (no control characters other than HTAB).
+fn valid_header_value(v: &[u8]) -> bool {
+    v.iter().all(|&c| c == b'\t' || (c >= 0x20 && c != 0x7f))
 }
 
 /// Standard base64 with padding (for `basic_auth`).
@@ -1301,13 +1382,82 @@ mod tests {
         assert_eq!(&o.authority[..], b"example.com");
         assert!(o.target.use_tls);
         assert_eq!(t, "/?q");
+        // B-198: Unix ソケットの URL は明示的に許したクライアントだけ
+        assert_eq!(
+            c.resolve("http://unix:/run/app.sock:/v1/x")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Url
+        );
         #[cfg(unix)]
         {
-            let (o, t) = c.resolve("http://unix:/run/app.sock:/v1/x").unwrap();
+            let u = Client::builder().unix_sockets(true).build().unwrap();
+            let (o, t) = u.resolve("http://unix:/run/app.sock:/v1/x").unwrap();
             assert!(o.target.is_unix());
             assert_eq!(t, "/v1/x");
         }
         assert_eq!(c.resolve("ftp://x").unwrap_err().kind(), ErrorKind::Url);
+    }
+
+    // B-198: 制御文字・空白を要求行・ヘッダに書かない
+    #[test]
+    fn control_characters_are_rejected() {
+        let c = Client::new();
+        for u in [
+            "http://example.com/a\r\nx-injected: 1",
+            "http://example.com/a b",
+            "http://exa\nmple.com/",
+            "http://example.com/\u{7f}",
+        ] {
+            assert_eq!(c.resolve(u).unwrap_err().kind(), ErrorKind::Url, "{u:?}");
+        }
+        let kind = |r: RequestBuilder| r.error.map(|e| e.kind());
+        assert_eq!(kind(c.get("http://x/").header("a", "b\tc é")), None);
+        assert_eq!(
+            kind(c.get("http://x/").header("a", "b\r\nx: y")),
+            Some(ErrorKind::Encode)
+        );
+        assert_eq!(
+            kind(c.get("http://x/").header("a b", "c")),
+            Some(ErrorKind::Encode)
+        );
+        assert_eq!(
+            kind(c.get("http://x/").header("", "c")),
+            Some(ErrorKind::Encode)
+        );
+        assert_eq!(
+            kind(c.get("http://x/").header("a", "\0")),
+            Some(ErrorKind::Encode)
+        );
+        assert_eq!(
+            kind(c.request("GET /x HTTP/1.1\r\n", "http://x/")),
+            Some(ErrorKind::Encode)
+        );
+        assert_eq!(kind(c.request("PROPFIND", "http://x/")), None);
+        assert_eq!(
+            Client::builder()
+                .default_header("x", "a\nb")
+                .build()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Config
+        );
+    }
+
+    // B-198: チャンクの大きさのあふれで panic しない
+    #[test]
+    fn chunk_sizes_do_not_overflow() {
+        assert_eq!(parse_chunk_size(b"1a"), Some(26));
+        assert_eq!(parse_chunk_size(b"+1"), None);
+        assert_eq!(parse_chunk_size(b""), None);
+        assert_eq!(parse_chunk_size(b"-1"), None);
+        assert_eq!(parse_chunk_size(b"ffffffffffffffff"), Some(usize::MAX));
+        assert_eq!(parse_chunk_size(b"1ffffffffffffffff"), None);
+        assert_eq!(chunk_need(0, 10, 100), Some(12));
+        assert_eq!(chunk_need(1, usize::MAX, 100), None);
+        assert_eq!(chunk_need(0, usize::MAX, usize::MAX), None);
+        assert_eq!(chunk_need(0, usize::MAX - 1, usize::MAX), None);
+        assert_eq!(chunk_need(90, 11, 100), None);
     }
 
     #[test]

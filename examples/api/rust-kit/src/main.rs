@@ -264,7 +264,10 @@ async fn download() -> Response {
 // ===================== HTTP クライアント =====================
 
 fn client_for(mode: &str) -> Client {
-    let mut b = Client::builder().timeout(Duration::from_secs(10));
+    // `http://unix:` の URL は明示して有効にする（client_fetch は自分宛ての URL だけを通す）
+    let mut b = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .unix_sockets(true);
     b = match mode {
         "h2c" | "h2" => b.http2(Http2::On),
         "h1" => b.http2(Http2::Off),
