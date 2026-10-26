@@ -121,7 +121,8 @@ run_rust() {
   echo "== Rust (examples/api/rust-showcase)"
   local T="$ROOT/target/examples-api"
   (cd "$ROOT/examples/api/rust-showcase" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build"; return; }
-  local W; W="$(mktemp -d)"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
+  # 設定に書く upload_tmp_dir はネイティブの veil が開くので、Windows は C:/... の形にする
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
   cat > "$W/config.toml" <<TOML
 [server]
 listen_cleartext = "127.0.0.1:$P"
