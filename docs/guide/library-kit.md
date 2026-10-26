@@ -147,7 +147,8 @@ App::new()
 - `Jwt<C>` (feature `jwt`) verifies `Authorization: Bearer` with the `JwtVerifier` in `App::state`: `HS256/384/512`,
   `RS256/384/512`, `PS256/384/512`, `ES256`, `ES384`, `EdDSA`. Each key fixes its algorithm (a token whose `alg`
   differs is rejected; `none` never passes), `kid` selects the key, `exp`/`nbf` have 60 s leeway, `iss`/`aud` are
-  checked when configured. Keys come from secrets, PEM (`PUBLIC KEY`, `RSA PUBLIC KEY`), JWKs or a JWK Set;
+  checked when configured. `exp` is required (a token without it fails with `JwtError::MissingClaim("exp")`;
+  `.require_exp(false)` accepts it) and a non-numeric `exp`/`nbf` is `Malformed`. Keys come from secrets, PEM (`PUBLIC KEY`, `RSA PUBLIC KEY`), JWKs or a JWK Set;
   `verifier.refresh_jwks(&client, url).await` replaces them (schedule it with `Tasks::every`). `encode_hmac` issues
   HMAC tokens. No `jsonwebtoken` dependency: verification uses the TLS provider crate.
 - `OAuth2PasswordBearer::new("/token")` reads the bearer token and gives the OpenAPI `securitySchemes` entry

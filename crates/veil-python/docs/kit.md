@@ -65,7 +65,7 @@ The schemes have FastAPI's names and are used with `Depends`; they appear in Ope
 | `APIKeyHeader(name=)`, `APIKeyCookie(name=)`, `APIKeyQuery(name=)` | the key |
 | `OAuth2PasswordBearer(tokenUrl=, scopes=)`, `OAuth2AuthorizationCodeBearer(...)` | the bearer token |
 | `OAuth2PasswordRequestForm` (`Depends()`), `OAuth2PasswordRequestFormStrict` | the login form |
-| `JWT(secret=)` / `JWT(key, algorithms=["RS256"])` / `JWT(jwks_url=)` | `encode(claims)`, `decode(token)` (PyJWT; 401 when invalid) |
+| `JWT(secret=)` / `JWT(key, algorithms=["RS256"])` / `JWT(jwks_url=)` | `encode(claims)`, `decode(token)` (PyJWT; 401 when invalid; a token with `aud` needs `audience=` unless `verify_audience=False`) |
 | `requires_scopes(scheme, verify)` | a dependency for `Security(..., scopes=[...])` that answers 401 when a scope is missing |
 | `compare_digest(a, b)` | constant-time comparison for passwords and keys |
 

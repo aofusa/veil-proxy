@@ -192,6 +192,25 @@ class TestSecurity(unittest.TestCase):
         self.assertIn("application/x-www-form-urlencoded", form_op["requestBody"]["content"])
 
 
+class TestJWTAudience(unittest.TestCase):
+    # B-201: audience を渡さないとき、aud 付きのトークン（別のサービス向け）は拒否する
+    @unittest.skipIf(jwt is None, "PyJWT is not installed")
+    def test_aud_is_checked_by_default(self):
+        exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
+        tokens = security.JWT(secret="s3cret-s3cret-s3cret-s3cret-s3cret")
+        other = tokens.encode({"sub": "u", "aud": "billing", "exp": exp})
+        with self.assertRaises(veil.HTTPException) as e:
+            tokens.decode(other)
+        self.assertEqual(e.exception.status_code, 401)
+        self.assertEqual(tokens.decode(tokens.encode({"sub": "u", "exp": exp}))["sub"], "u")
+        mine = security.JWT(secret="s3cret-s3cret-s3cret-s3cret-s3cret", audience="api")
+        self.assertEqual(mine.decode(mine.encode({"sub": "u", "aud": "api", "exp": exp}))["sub"], "u")
+        with self.assertRaises(veil.HTTPException):
+            mine.decode(other)
+        lax = security.JWT(secret="s3cret-s3cret-s3cret-s3cret-s3cret", verify_audience=False)
+        self.assertEqual(lax.decode(other)["sub"], "u")
+
+
 class TestRedirects(unittest.TestCase):
     def test_is_safe_url(self):
         ok = ["/home", "/a?b=c", "https://app.example.com/x"]

@@ -141,7 +141,8 @@ App::new()
   `require` を `authenticate` より先に登録します。
 - `Jwt<C>`（feature `jwt`）は `App::state` の `JwtVerifier` で `Authorization: Bearer` を検証します: `HS256/384/512`・
   `RS256/384/512`・`PS256/384/512`・`ES256`・`ES384`・`EdDSA`。鍵ごとにアルゴリズムが決まり（`alg` が違うトークンは拒否。`none` は
-  通らない）、`kid` で鍵を選び、`exp`・`nbf` は 60 秒の猶予、`iss`・`aud` は設定したときに検査します。鍵は秘密・PEM（`PUBLIC KEY`・
+  通らない）、`kid` で鍵を選び、`exp`・`nbf` は 60 秒の猶予、`iss`・`aud` は設定したときに検査します。
+  `exp` は必須（無ければ `JwtError::MissingClaim("exp")`。`.require_exp(false)` で受ける）で、数値でない `exp`・`nbf` は `Malformed` です。鍵は秘密・PEM（`PUBLIC KEY`・
   `RSA PUBLIC KEY`）・JWK・JWK Set から作れ、`verifier.refresh_jwks(&client, url).await` で入れ替えます（`Tasks::every` で定期に）。
   `encode_hmac` は HMAC のトークンを発行します。`jsonwebtoken` に依存せず、検証は TLS のプロバイダの crate で行います。
 - `OAuth2PasswordBearer::new("/token")` はベアラートークンを読み、OpenAPI の `securitySchemes` の項目（`security_scheme()`）を返します。

@@ -522,6 +522,7 @@
 | B-198 | P2 | 修正済み（v0.10.0） | [bugs/B-198-api-client-chunk-overflow-and-header-injection.md](bugs/B-198-api-client-chunk-overflow-and-header-injection.md) | API クライアント: 上流の chunked のサイズのあふれで panic し、ヘッダ・URL・メソッドの CR/LF を検査しない |
 | B-199 | P3 | 修正済み（v0.10.0） | [bugs/B-199-permessage-deflate-bfinal-next-message.md](bugs/B-199-permessage-deflate-bfinal-next-message.md) | permessage-deflate: BFINAL の付いたメッセージの後、文脈を引き継ぐ接続で次のメッセージが 1007 になる |
 | B-200 | P3 | 修正済み（v0.10.0） | [bugs/B-200-kit-sessions-expiry-and-memory-store.md](bugs/B-200-kit-sessions-expiry-and-memory-store.md) | veil-kit の Sessions: Cookie 保存は期限をサーバで検査せず、MemoryStore は上限が無く掃除の時機が偏る |
+| B-201 | P3 | 修正済み（v0.10.0） | [bugs/B-201-jwt-exp-and-audience.md](bugs/B-201-jwt-exp-and-audience.md) | JWT: veil-kit は exp を必須にせず数値でない exp を黙って飛ばし、Python の veil_kit は audience を指定しないと aud を検査しない |
 
 ---
 

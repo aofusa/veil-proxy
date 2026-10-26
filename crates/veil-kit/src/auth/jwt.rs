@@ -124,6 +124,8 @@ pub enum JwtError {
     BadSignature,
     /// `exp` has passed.
     Expired,
+    /// A required claim is absent (`exp`, unless [`JwtVerifier::require_exp`] turned that off).
+    MissingClaim(&'static str),
     /// `nbf` is in the future.
     NotYetValid,
     /// `iss` differs from the expected issuer.
@@ -143,6 +145,7 @@ impl std::fmt::Display for JwtError {
             JwtError::UnknownKey => f.write_str("no key for the token"),
             JwtError::BadSignature => f.write_str("invalid signature"),
             JwtError::Expired => f.write_str("token expired"),
+            JwtError::MissingClaim(c) => write!(f, "token without '{}'", c),
             JwtError::NotYetValid => f.write_str("token not yet valid"),
             JwtError::BadIssuer => f.write_str("unexpected issuer"),
             JwtError::BadAudience => f.write_str("unexpected audience"),
@@ -440,6 +443,7 @@ pub struct JwtVerifier {
     issuer: Option<String>,
     audience: Option<String>,
     leeway: u64,
+    require_exp: bool,
 }
 
 impl std::fmt::Debug for JwtVerifier {
@@ -460,6 +464,7 @@ impl JwtVerifier {
             issuer: None,
             audience: None,
             leeway: 60,
+            require_exp: true,
         }
     }
 
@@ -477,6 +482,14 @@ impl JwtVerifier {
     /// Requires `aud` to contain `audience`.
     pub fn audience(mut self, audience: impl Into<String>) -> JwtVerifier {
         self.audience = Some(audience.into());
+        self
+    }
+
+    // B-201: 既定で exp を必須にする（無期限のトークンを黙って受けない）
+    /// Whether a token without `exp` is rejected with [`JwtError::MissingClaim`] (default `true`; turn it off only
+    /// for issuers that do not set an expiry).
+    pub fn require_exp(mut self, on: bool) -> JwtVerifier {
+        self.require_exp = on;
         self
     }
 
@@ -544,12 +557,18 @@ impl JwtVerifier {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(exp) = claims.get("exp").and_then(|v| v.as_f64()) {
-            if (now as f64) > exp + self.leeway as f64 {
-                return Err(JwtError::Expired);
-            }
+        // B-201: 数値でない exp・nbf（"1700000000" 等）は検査を飛ばさず Malformed にする
+        let numeric = |name: &str| match claims.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v.as_f64().map(Some).ok_or(JwtError::Malformed),
+        };
+        match numeric("exp")? {
+            Some(exp) if (now as f64) > exp + self.leeway as f64 => return Err(JwtError::Expired),
+            Some(_) => {}
+            None if self.require_exp => return Err(JwtError::MissingClaim("exp")),
+            None => {}
         }
-        if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_f64()) {
+        if let Some(nbf) = numeric("nbf")? {
             if (now as f64) + (self.leeway as f64) < nbf {
                 return Err(JwtError::NotYetValid);
             }
@@ -771,6 +790,34 @@ mod tests {
             JwtError::UnknownKey
         );
         assert_eq!(v.verify::<Claims>("a.b").unwrap_err(), JwtError::Malformed);
+    }
+
+    // B-201: exp は既定で必須。数値でない exp・nbf は Malformed
+    #[test]
+    fn exp_is_required_and_numeric() {
+        let key = JwtKey::hs256(b"0123456789abcdef0123456789abcdef");
+        let v = JwtVerifier::new([key.clone()]);
+        let no_exp = encode_hmac(&key, &serde_json::json!({"sub": "alice"})).unwrap();
+        assert_eq!(
+            v.verify::<Claims>(&no_exp).unwrap_err(),
+            JwtError::MissingClaim("exp")
+        );
+        let lax = JwtVerifier::new([key.clone()]).require_exp(false);
+        assert_eq!(
+            lax.verify::<Claims>(&no_exp).unwrap().sub.as_deref(),
+            Some("alice")
+        );
+        let s = encode_hmac(&key, &serde_json::json!({"sub": "a", "exp": "99999999999"})).unwrap();
+        assert_eq!(v.verify::<Claims>(&s).unwrap_err(), JwtError::Malformed);
+        assert_eq!(lax.verify::<Claims>(&s).unwrap_err(), JwtError::Malformed);
+        let s = encode_hmac(
+            &key,
+            &serde_json::json!({"sub": "a", "exp": now() + 60, "nbf": "0"}),
+        )
+        .unwrap();
+        assert_eq!(v.verify::<Claims>(&s).unwrap_err(), JwtError::Malformed);
+        let s = encode_hmac(&key, &serde_json::json!({"sub": "a", "exp": now() + 60})).unwrap();
+        assert!(v.verify::<Claims>(&s).is_ok());
     }
 
     #[test]

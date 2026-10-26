@@ -326,11 +326,14 @@ class JWT:
     """Issue and verify JSON Web Tokens with PyJWT (``pip install "veil-api-kit[jwt]"``).
 
     ``key`` is the secret (HMAC) or the public key (RSA, EC, EdDSA) used to verify; ``signing_key`` signs (defaults to
-    ``key``). ``audience``, ``issuer`` and ``leeway`` are checked on :meth:`decode`.
+    ``key``). ``audience``, ``issuer`` and ``leeway`` are checked on :meth:`decode`. As in PyJWT, a token with an
+    ``aud`` claim is rejected when no ``audience`` is given (it was issued for another service);
+    ``verify_audience=False`` turns the ``aud`` check off.
     """
 
+    # B-201: aud の検査は PyJWT の既定どおり（audience 無しで aud 付きのトークンは拒否）。外すときは明示する
     def __init__(self, key=None, algorithms=("HS256",), *, secret=None, signing_key=None, audience=None, issuer=None,
-                 leeway=0, jwks_url=None):
+                 leeway=0, jwks_url=None, verify_audience=True):
         """Create a verifier (``jwks_url`` fetches the keys from a JWK Set by ``kid``)."""
         import jwt  # noqa: PLC0415
 
@@ -341,6 +344,7 @@ class JWT:
         self.audience = audience
         self.issuer = issuer
         self.leeway = leeway
+        self.verify_audience = verify_audience
         self._jwks = jwt.PyJWKClient(jwks_url) if jwks_url else None
 
     def encode(self, claims, algorithm=None, headers=None):
@@ -355,7 +359,7 @@ class JWT:
             key = self._jwks.get_signing_key_from_jwt(token).key if self._jwks is not None else self.key
             return jwt.decode(token, key, algorithms=self.algorithms, audience=self.audience, issuer=self.issuer,
                               leeway=self.leeway, options={"verify_exp": verify_exp,
-                                                           "verify_aud": self.audience is not None})
+                                                           "verify_aud": self.verify_audience})
         except jwt.PyJWTError as e:
             raise HTTPException(401, "Could not validate credentials: %s" % e,
                                 {"WWW-Authenticate": 'Bearer error="invalid_token"'})
