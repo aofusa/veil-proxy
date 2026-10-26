@@ -1083,6 +1083,8 @@ run_production() { # F-274: 本番の推奨設定（examples/api/production の 
   # 文書（英日）の設定の例が examples/api/production/config.toml と同じ
   local g
   for g in docs/guide/library-production.md docs/guide/ja/library-production.md; do
+    # BSD の VM（tools/qemu/bsd-vm.sh sync）は docs/ を送らない
+    [ -f "$ROOT/$g" ] || { echo "  skip $g: not in this copy of the tree"; continue; }
     "$PY3" -I - "$ROOT/$g" "$EX/config.toml" <<'PY' && ok "$g has the example config.toml" || bad "$g differs from examples/api/production/config.toml"
 import sys
 doc, want = open(sys.argv[1], encoding="utf-8").read(), open(sys.argv[2], encoding="utf-8").read()
