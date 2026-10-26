@@ -72,6 +72,16 @@ expect() { # expect <name> <expected-substring> <command...>
   local got; got="$("$@" 2>&1)"
   if [[ "$got" == *"$want"* ]]; then ok "$name"; else bad "$name: want '$want' got '${got:0:300}'"; fi
 }
+# rss_after <pid>: 「数秒の間の最小の RSS（KiB）」と「直後の RSS」。アロケータは空き領域をワーカーのアイドル点で
+# 返す（alloc_tune::idle_tick。FreeBSD の libc jemalloc は decay）ので、直後の値だけでは解放済みの領域が残って見える
+rss_after() {
+  local a m v i; a=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' '); m=$a
+  for i in 1 2 3 4; do
+    sleep 1; v=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$v" ] && [ -n "$m" ] && [ "$v" -lt "$m" ] && m=$v
+  done
+  echo "$m $a"
+}
 sha_of() { "$PY3" -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
 # F-270: comp_probe <accept-encoding|-> <url> [curl の引数...]: 応答の content-encoding・Vary の有無と、復号した本文の sha256
 comp_probe() {
@@ -265,9 +275,9 @@ run_rust_multipart() { # F-266: multipart/form-data（examples/api/rust-showcase
   rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
   expect "streaming multipart 100 MB (HTTP/1.1)" '"size":104857600' curl -s -F "big=@$W/big.bin" "$B/upload-stream"
   expect "streaming multipart 100 MB (h2c)" '"size":104857600' curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload-stream"
-  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
   if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
   fi
   rm -f "$W/big.bin"
   [ -z "$(ls -A "$W/up")" ] && ok "no temporary upload files remain" || bad "temporary upload files remain: $(ls "$W/up")"
@@ -293,9 +303,9 @@ run_python_multipart() { # F-266: Python の Form・File・UploadFile（examples
   rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
   expect "py 100 MB upload (HTTP/1.1, disk)" "\"size\":104857600,\"sha256\":\"$sum\",\"where\":\"disk\"" curl -s -F title=b -F "doc=@$W/big.bin" "$B/upload"
   expect "py 100 MB upload (h2c)" "\"sha256\":\"$sum\"" curl -s --http2-prior-knowledge -F title=b -F "doc=@$W/big.bin" "$B/upload"
-  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
   if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "py 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "py 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "py 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "py 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
   fi
   rm -f "$W/big.bin"
   expect "py OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/upload\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
@@ -496,9 +506,9 @@ run_c_multipart() { # F-266: C の veil_multipart_next（VEIL_ROUTE_FORM の /up
   rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
   expect "C 100 MB upload (HTTP/1.1, temp file)" "big:big.bin=104857600/$h(disk);" curl -s -F "big=@$W/big.bin" "$B/upload"
   expect "C 100 MB upload (h2c)" "big:big.bin=104857600/$h(disk);" curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload"
-  rss1=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
   if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "C 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB)" || bad "C 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB"
+    [ $((rss1 - rss0)) -lt 51200 ] && ok "C 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "C 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
   fi
   rm -f "$W/big.bin"
   # HTTP/3（curl に HTTP/3 が無いので quinn + h3 の試験クライアントで送る）: 30 MB は [api] max_body_size（10 MiB）を超える
