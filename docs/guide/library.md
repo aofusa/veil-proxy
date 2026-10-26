@@ -17,6 +17,9 @@ Three front ends share the same implementation:
 For Rust, the separate crate [`veil-proxy-kit`](library-kit.md) adds cookies, redirects, static files, CORS,
 authentication (JWT), sessions, GraphQL, dependency injection and background tasks.
 
+For the settings to use in production (listen address, access log, OpenAPI, compression, threads, file descriptors,
+shutdown, metrics), see [library-production.md](library-production.md).
+
 - [Architecture](#architecture)
 - [Depending on veil](#depending-on-veil)
 - [Configuration in library mode](#configuration-in-library-mode)

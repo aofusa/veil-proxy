@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|python|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -1018,6 +1018,58 @@ JSON
   rm -rf "$W"
 }
 
+run_production() { # F-274: 本番の推奨設定（examples/api/production の config.toml を Rust と Python で読む）
+  echo "== production settings (examples/api/production)"
+  local EX="$ROOT/examples/api/production" T="$ROOT/target/examples-api"
+  # 文書（英日）の設定の例が examples/api/production/config.toml と同じ
+  local g
+  for g in docs/guide/library-production.md docs/guide/ja/library-production.md; do
+    "$PY3" -I - "$ROOT/$g" "$EX/config.toml" <<'PY' && ok "$g has the example config.toml" || bad "$g differs from examples/api/production/config.toml"
+import sys
+doc, want = open(sys.argv[1], encoding="utf-8").read(), open(sys.argv[2], encoding="utf-8").read()
+i = doc.index("```toml\n") + len("```toml\n")
+sys.exit(0 if doc[i:doc.index("```", i)] == want else 1)
+PY
+  done
+  (cd "$EX" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build production example"; return; }
+  local PY="${PYTHON:-}"
+  if [ -z "$PY" ]; then
+    PY="$ROOT/target/py-venv/bin/python$EXE"; [ "$OS" = Windows ] && PY="$ROOT/target/py-venv/Scripts/python$EXE"
+  fi
+  local kind
+  for kind in rust python; do
+    local W; W="$(mktemp -d)"; local P; P=$(free_port)
+    local cmd=("$T/debug/veil-example-production$EXE")
+    if [ "$kind" = python ]; then
+      if ! "$PY" -c 'import veil' 2>/dev/null; then echo "  skip production (python): run the python suite first (or set PYTHON)"; continue; fi
+      cmd=("$PY" "$EX/app.py")
+    fi
+    APP_CONFIG="$EX/config.toml" VEIL_OVERRIDE_1="server.listen_cleartext = \"127.0.0.1:$P\"" "${cmd[@]}" > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "production ($kind) start"; tail -20 "$W/log"; continue; }
+    local B="http://127.0.0.1:$P"
+    expect "production ($kind): health check" "ok" curl -s "$B/healthz"
+    expect "production ($kind): handler" '"id":7' curl -s "$B/api/items/7"
+    expect "production ($kind): OpenAPI is off" "404 404" bash -c "echo \$(curl -s -o /dev/null -w '%{http_code}' '$B/openapi.json') \$(curl -s -o /dev/null -w '%{http_code}' '$B/docs')"
+    expect "production ($kind): compression" "content-encoding: br" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: br' '$B/api/items' | tr A-Z a-z"
+    expect "production ($kind): small responses stay uncompressed" "none" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: br' '$B/api/items/7' | tr A-Z a-z | grep -q content-encoding && echo br || echo none"
+    expect "production ($kind): body under the limit" "201" bash -c "head -c 1000 /dev/zero | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
+    expect "production ($kind): body limit" "413" bash -c "head -c 2000000 /dev/zero | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
+    expect "production ($kind): Prometheus metrics" "veil_proxy_http_requests_total" curl -s "$B/metrics"
+    expect "production ($kind): h2c" '"id":8' curl -s --http2-prior-knowledge "$B/api/items/8"
+    [ "$kind" = python ] && expect "production (python): async def and run_in_threadpool" '"sha256"' curl -s "$B/api/hash"
+    sleep 1.5   # アクセスログの書き出し（flush_interval_ms）を待つ
+    if grep -q "type=access\|\"type\":\"access\"" "$W/log"; then bad "production ($kind): access log is off"; else ok "production ($kind): access log is off"; fi
+    if grep -q '^{' "$W/log"; then ok "production ($kind): JSON application log"; else bad "production ($kind): JSON application log: $(head -2 "$W/log")"; fi
+    if [ "$OS" != Windows ]; then
+      kill -TERM "$PID"
+      local i; for i in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+      kill -0 "$PID" 2>/dev/null && bad "production ($kind): SIGTERM stops within 10 s" || ok "production ($kind): SIGTERM stops within 10 s"
+    fi
+    py_stop "$PID" 2>/dev/null
+  done
+}
+
 run_kit() { # F-267: veil-proxy-kit（examples/api/rust-kit）と tower のサンプル（examples/api/rust-tower-recipes）
   echo "== kit (examples/api/rust-kit, examples/api/rust-tower-recipes)"
   local T="$ROOT/target/examples-api"
@@ -1268,10 +1320,11 @@ case "$WHAT" in
   autobahn) run_autobahn ;;
   c) run_c; run_c_features ;;
   python) run_python ;;
+  production) run_production ;;
   nonregression) run_nonregression ;;
   external) run_external ;;
   kit) run_kit ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_python ;;
-  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|python|nonregression|external|all]"; exit 2 ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_python; run_production ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

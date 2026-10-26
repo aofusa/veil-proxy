@@ -17,6 +17,9 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 Rust では、別のクレート [`veil-proxy-kit`](library-kit.md) が Cookie・リダイレクト・静的ファイル・CORS・認証（JWT）・セッション・
 GraphQL・依存性注入・バックグラウンドタスクを足します。
 
+本番で使う設定（待ち受けのアドレス・アクセスログ・OpenAPI・圧縮・スレッド・ファイル記述子・停止・メトリクス）は
+[library-production.md](library-production.md) にあります。
+
 - [アーキテクチャ](#アーキテクチャ)
 - [veil への依存](#veil-への依存)
 - [ライブラリモードの設定](#ライブラリモードの設定)

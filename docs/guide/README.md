@@ -21,6 +21,7 @@ User guides split out of the top-level README. Each page keeps the original sect
 | WASM extensions | [wasm.md](wasm.md) |
 | API server library (Rust, C, Python) | [library.md](library.md) |
 | Rust helper crate `veil-proxy-kit` (cookies, CORS, JWT, sessions, DI, tasks) | [library-kit.md](library-kit.md) |
+| API library in production (recommended settings) | [library-production.md](library-production.md) |
 | VDS: dynamic routes from a control plane | [vds.md](vds.md) ([schema](vds-schema.json)) |
 | ACME: automatic certificates | [acme.md](acme.md) |
 | Kubernetes (Helm chart, sidecar, Istio / Linkerd) | [kubernetes.md](kubernetes.md) |
