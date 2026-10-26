@@ -530,6 +530,7 @@
 | B-206 | P3 | 修正済み（v0.10.0） | [bugs/B-206-c-websocket-on-close-skipped.md](bugs/B-206-c-websocket-on-close-skipped.md) | C の WebSocket: on_close が呼ばれないまま veil_ws_t が解放され得る |
 | B-207 | P3 | 修正済み（v0.10.0） | [bugs/B-207-python-aio-jobs-dropped-and-reregistration.md](bugs/B-207-python-aio-jobs-dropped-and-reregistration.md) | Python の常駐ループ: 捨てられたジョブでワーカーが永久に待ち、登録が 1 回きりで 2 回目の run が失敗する |
 | B-208 | P3 | 修正済み（v0.10.0） | [bugs/B-208-release-draft-check-swallows-gh-errors.md](bugs/B-208-release-draft-check-swallows-gh-errors.md) | release.yml の公開済みの判定が gh のどんな失敗も「draft 無し」とみなす |
+| B-209 | P3 | 修正済み（v0.10.0） | [bugs/B-209-c-listener-zero-init-not-default.md](bugs/B-209-c-listener-zero-init-not-default.md) | C の veil_listener_t は 0 初期化で既定にならず、拡張の余地が無い |
 
 ---
 

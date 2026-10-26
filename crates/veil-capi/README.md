@@ -41,13 +41,19 @@ veil_run(cfg);                                      /* 停止までブロック�
   `veil_config_set(cfg, "access_log.enabled", "false")`。
 - 停止は SIGINT / SIGTERM、または別スレッドからの `veil_shutdown()`。
 - プロトコルの違うポートを複数開くときは `veil_listener_t` を埋めてポートごとに `veil_config_add_listener` を呼びます
-  （`[[listener]]` の 1 項目）。`http2`・`allow_http`・`allow_h2c`・`secure_redirect` は負の値で既定、文字列は `NULL` で省略です。
-  1 個でも足すと、既定の `127.0.0.1:8080` は `veil_config_listen_cleartext` を呼ばない限り開きません。
+  （`[[listener]]` の 1 項目）。0 で埋めたものが既定です: `http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+  `VEIL_DEFAULT`（0）で既定、`VEIL_ON`（正）で true、`VEIL_OFF`（負）で false、文字列は `NULL` で省略です。先頭の `size` は
+  `sizeof(veil_listener_t)`（`VEIL_LISTENER_INIT` が入れる。0 でもよい）で、後の版でフィールドを足しても古いヘッダでビルドした
+  プログラムはそのまま動きます。1 個でも足すと、既定の `127.0.0.1:8080` は `veil_config_listen_cleartext` を呼ばない限り開きません。
 
   ```c
-  veil_listener_t l = { .listen = "0.0.0.0:8443", .tls = 1, .http2 = -1, .http3 = 1,
-                        .allow_http = -1, .allow_h2c = -1, .secure_redirect = -1 };
-  veil_config_add_listener(cfg, &l);
+  veil_listener_t tls = VEIL_LISTENER_INIT;
+  tls.listen = "0.0.0.0:8443";
+  tls.tls = 1;
+  tls.http3 = 1;
+  veil_config_add_listener(cfg, &tls);
+  veil_listener_t plain = { .listen = "0.0.0.0:8080", .allow_h2c = VEIL_OFF };  /* HTTP/1.1 だけ */
+  veil_config_add_listener(cfg, &plain);
   ```
 
 ## スレッドモデル

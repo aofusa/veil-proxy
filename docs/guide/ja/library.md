@@ -1034,7 +1034,8 @@ let config = Config::load()?
 `allow_http`、`allow_h2c`、`secure_redirect`、`redirect_to(name)`（`secure_redirect` を含む）、`threads`、
 `unix_socket_permissions`。リスナーを 1 個でも足すと、ライブラリ既定の平文リスナー（`listen_cleartext = "127.0.0.1:8080"`）は
 `listen_cleartext` を自分で設定しない限り開きません。C では `veil_listener_t` を埋めてポートごとに
-`veil_config_add_listener(cfg, &l)` を呼び、Python では `veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`
+`veil_config_add_listener(cfg, &l)` を呼び（0 で埋めた構造体が既定。`http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+`VEIL_DEFAULT`（0）・`VEIL_ON`・`VEIL_OFF`、先頭の `size` は `sizeof(veil_listener_t)`（`VEIL_LISTENER_INIT` が入れる）か 0）、Python では `veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`
 を渡します。
 
 ## メモリアロケータ

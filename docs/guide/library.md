@@ -1086,7 +1086,9 @@ let config = Config::load()?
 `allow_http`, `allow_h2c`, `secure_redirect`, `redirect_to(name)` (implies `secure_redirect`), `threads` and
 `unix_socket_permissions`. Once any listener is added, the library's default plaintext listener
 (`listen_cleartext = "127.0.0.1:8080"`) is not opened unless you set `listen_cleartext` yourself. In C, fill a
-`veil_listener_t` and call `veil_config_add_listener(cfg, &l)` once per port; in Python, pass
+`veil_listener_t` and call `veil_config_add_listener(cfg, &l)` once per port (a zero-filled struct means the
+defaults: the `http2`, `allow_http`, `allow_h2c` and `secure_redirect` fields take `VEIL_DEFAULT` (0), `VEIL_ON` or
+`VEIL_OFF`, and the leading `size` field is `sizeof(veil_listener_t)`, set by `VEIL_LISTENER_INIT`, or 0); in Python, pass
 `veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`.
 
 ## Memory allocator

@@ -389,14 +389,26 @@ pub unsafe extern "C" fn veil_config_threads(cfg: *mut veil_config_t, n: u32) ->
     }
 }
 
+// B-209: 0 で埋めたものが既定になるよう 3 値（0 = 既定、正 = true、負 = false）にし、先頭に大きさを置く
+// （公開前の今だけ ABI を変えられる。後の版はフィールドを末尾に足し、`size` までしか読まない）。
+/// `veil_listener_t` の 3 値: 既定（省略）。
+pub const VEIL_DEFAULT: c_int = 0;
+/// `veil_listener_t` の 3 値: true。
+pub const VEIL_ON: c_int = 1;
+/// `veil_listener_t` の 3 値: false。
+pub const VEIL_OFF: c_int = -1;
+
 /// 待ち受け 1 個（`[[listener]]`、F-260）。`veil_config_add_listener` に渡す。
 ///
-/// 文字列は NULL なら省略（既定）。`int` のうち `http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
-/// 負なら省略（既定）、0 で false、正で true。`threads` は 0 なら省略。
+/// 0 で埋めたものが既定。文字列は NULL なら省略。`http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+/// `VEIL_DEFAULT`（0）で省略、正で true、負で false。`threads` は 0 なら省略。`size` は
+/// `sizeof(veil_listener_t)`（0 はこの版の大きさとして読む）。
 #[repr(C)]
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
 pub struct veil_listener_t {
+    /// `sizeof(veil_listener_t)`、または 0
+    pub size: usize,
     pub name: *const c_char,
     /// 必須。`host:port` か `unix:<path>`
     pub listen: *const c_char,
@@ -412,6 +424,17 @@ pub struct veil_listener_t {
     pub redirect_to: *const c_char,
     pub threads: u32,
     pub unix_socket_permissions: *const c_char,
+}
+
+/// この版（0.10）の `veil_listener_t` の大きさ（`size` が 0 のときに読む大きさ。後の版でも変えない）
+const LISTENER_V1_SIZE: usize = std::mem::size_of::<veil_listener_t>();
+
+/// 3 値（0 = 既定、正 = true、負 = false）
+fn tri(v: c_int) -> Option<bool> {
+    match v {
+        0 => None,
+        v => Some(v > 0),
+    }
 }
 
 /// NULL なら `None`、それ以外は UTF-8 の文字列
@@ -437,9 +460,32 @@ pub unsafe extern "C" fn veil_config_add_listener(
     let Some(cfg) = cfg.as_mut() else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL config");
     };
-    let Some(l) = listener.as_ref() else {
+    if listener.is_null() {
         return fail(VEIL_ERR_INVALID_ARG, "NULL listener");
+    }
+    // B-209: 呼び出し側の大きさ（0 = この版の大きさ）までだけ読み、残り（後の版で足すフィールド）は既定
+    let full = std::mem::size_of::<veil_listener_t>();
+    let size = match ptr::read(ptr::addr_of!((*listener).size)) {
+        0 => LISTENER_V1_SIZE,
+        n => n,
     };
+    if size < LISTENER_V1_SIZE {
+        return fail(
+            VEIL_ERR_INVALID_ARG,
+            "veil_listener_t.size must be 0 or sizeof(veil_listener_t)",
+        );
+    }
+    let mut l = std::mem::MaybeUninit::<veil_listener_t>::zeroed();
+    ptr::copy_nonoverlapping(
+        listener as *const u8,
+        l.as_mut_ptr() as *mut u8,
+        size.min(full),
+    );
+    // SAFETY: 全体を 0 で初期化してから読める分を写した（ポインタは NULL、整数は 0 が既定の値）
+    let l = l.assume_init();
+    if l.listen.is_null() {
+        return fail(VEIL_ERR_INVALID_ARG, "veil_listener_t.listen is required");
+    }
     let listen = tryc!(cstr(l.listen));
     let mut b = if l.tls != 0 {
         Listener::tls(listen)
@@ -449,8 +495,8 @@ pub unsafe extern "C" fn veil_config_add_listener(
     if let Some(v) = tryc!(opt_cstr(l.name)) {
         b = b.name(v);
     }
-    if l.http2 >= 0 {
-        b = b.http2(l.http2 != 0);
+    if let Some(v) = tri(l.http2) {
+        b = b.http2(v);
     }
     if l.http3 != 0 {
         b = b.http3(true);
@@ -458,14 +504,14 @@ pub unsafe extern "C" fn veil_config_add_listener(
     if let Some(v) = tryc!(opt_cstr(l.http3_listen)) {
         b = b.http3_listen(v);
     }
-    if l.allow_http >= 0 {
-        b = b.allow_http(l.allow_http != 0);
+    if let Some(v) = tri(l.allow_http) {
+        b = b.allow_http(v);
     }
-    if l.allow_h2c >= 0 {
-        b = b.allow_h2c(l.allow_h2c != 0);
+    if let Some(v) = tri(l.allow_h2c) {
+        b = b.allow_h2c(v);
     }
-    if l.secure_redirect >= 0 {
-        b = b.secure_redirect(l.secure_redirect != 0);
+    if let Some(v) = tri(l.secure_redirect) {
+        b = b.secure_redirect(v);
     }
     if let Some(v) = tryc!(opt_cstr(l.redirect_to)) {
         b = b.redirect_to(v);
@@ -1206,15 +1252,16 @@ mod tests {
         let listen = c("0.0.0.0:8081");
         let name = c("h1tls");
         let l = veil_listener_t {
+            size: std::mem::size_of::<veil_listener_t>(),
             name: name.as_ptr(),
             listen: listen.as_ptr(),
             tls: 1,
-            http2: 0,
+            http2: VEIL_OFF,
             http3: 0,
             http3_listen: ptr::null(),
-            allow_http: -1,
-            allow_h2c: -1,
-            secure_redirect: -1,
+            allow_http: VEIL_DEFAULT,
+            allow_h2c: VEIL_DEFAULT,
+            secure_redirect: VEIL_DEFAULT,
             redirect_to: ptr::null(),
             threads: 2,
             unix_socket_permissions: ptr::null(),
@@ -1228,7 +1275,7 @@ mod tests {
                 tls: 0,
                 name: ptr::null(),
                 threads: 0,
-                allow_http: 0,
+                allow_http: VEIL_OFF,
                 ..l
             };
             assert_eq!(veil_config_add_listener(cfg, &l2), VEIL_OK);
@@ -1247,6 +1294,60 @@ mod tests {
             assert_eq!(ls[1]["allow_http"].as_bool(), Some(false));
             assert!(ls[1].get("threads").is_none());
             assert!(v["server"].get("listen_cleartext").is_none());
+            veil_config_free(cfg);
+        }
+    }
+
+    // B-209: 0 で埋めた veil_listener_t は既定（平文で HTTP/1.1 も h2c も受ける）。size は 0 か sizeof 以上
+    #[test]
+    fn zeroed_listener_means_defaults() {
+        let listen = c("127.0.0.1:8083");
+        unsafe {
+            let cfg = veil_config_new();
+            let mut l: veil_listener_t = std::mem::zeroed();
+            l.listen = listen.as_ptr();
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            l.size = std::mem::size_of::<veil_listener_t>();
+            l.allow_h2c = VEIL_ON;
+            l.secure_redirect = VEIL_OFF;
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            // 古い（小さい）大きさは受けない
+            l.size = 8;
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_ERR_INVALID_ARG);
+            // 後の版の大きな構造体（末尾に知らないフィールド）でも、知っている分だけ読む
+            #[repr(C)]
+            struct Bigger {
+                l: veil_listener_t,
+                extra: u64,
+            }
+            let mut big: Bigger = std::mem::zeroed();
+            big.l.size = std::mem::size_of::<Bigger>();
+            big.l.listen = listen.as_ptr();
+            big.l.allow_http = VEIL_OFF;
+            big.extra = u64::MAX;
+            assert_eq!(
+                veil_config_add_listener(cfg, &big.l as *const veil_listener_t),
+                VEIL_OK
+            );
+            let mut none: veil_listener_t = std::mem::zeroed();
+            none.size = 0;
+            assert_eq!(veil_config_add_listener(cfg, &none), VEIL_ERR_INVALID_ARG);
+            let v = (*cfg).config.to_value().unwrap();
+            let ls = v["listener"].as_array().unwrap();
+            assert_eq!(ls.len(), 3);
+            for k in [
+                "allow_http",
+                "allow_h2c",
+                "secure_redirect",
+                "http2",
+                "threads",
+            ] {
+                assert!(ls[0].get(k).is_none(), "{k}");
+            }
+            assert_eq!(ls[0]["tls"].as_bool(), Some(false));
+            assert_eq!(ls[1]["allow_h2c"].as_bool(), Some(true));
+            assert_eq!(ls[1]["secure_redirect"].as_bool(), Some(false));
+            assert_eq!(ls[2]["allow_http"].as_bool(), Some(false));
             veil_config_free(cfg);
         }
     }
