@@ -215,11 +215,13 @@ pub use content_cache::{
 };
 #[cfg(feature = "cache")]
 pub use disk::DiskCache;
+#[cfg(all(test, feature = "cache"))]
+pub(crate) use file_cache::global_max_entries as open_file_cache_global_max_entries;
 #[cfg(feature = "cache")]
 pub use file_cache::{
-    configure_global_open_file_cache, configure_global_open_file_cache_watch, get_file_cache,
-    get_file_info, get_file_info_with_config, invalidate_file_cache, open_file_cache_watch_enabled,
-    CachedFileInfo, OpenFileCache, OpenFileCacheConfig,
+    configure_global_open_file_cache, get_file_cache, get_file_info, get_file_info_with_config,
+    invalidate_file_cache, open_file_cache_watch_enabled, CachedFileInfo, OpenFileCache,
+    OpenFileCacheConfig,
 };
 #[cfg(feature = "cache")]
 pub use index::CacheIndex;
@@ -388,9 +390,6 @@ pub fn configure_global_open_file_cache(
     _max_entries: usize,
 ) {
 }
-
-#[cfg(not(feature = "cache"))]
-pub fn configure_global_open_file_cache_watch(_watch: bool) {}
 
 #[cfg(not(feature = "cache"))]
 pub fn get_file_cache() -> Option<std::sync::Arc<()>> {

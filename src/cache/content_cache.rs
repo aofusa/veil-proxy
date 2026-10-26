@@ -125,11 +125,15 @@ static GLOBAL_MAX_TOTAL_BYTES: AtomicU64 = AtomicU64::new(64 * 1024 * 1024);
 static GLOBAL_REVALIDATE_MTIME: AtomicBool = AtomicBool::new(false);
 static GLOBAL_WATCH: AtomicBool = AtomicBool::new(false);
 
-/// ルートの `static_file_cache` がディスクの変更を監視するか（設定ロード時。F-272）
-pub fn static_file_cache_watch_enabled(route: Option<&StaticContentCacheRouteConfig>) -> bool {
-    route
-        .and_then(|r| r.watch)
-        .unwrap_or_else(|| GLOBAL_WATCH.load(Ordering::Relaxed))
+/// ルートの `static_file_cache` がディスクの変更を監視するか（設定ロード時。F-272）。
+///
+/// `global` は読み込み中の設定の `[static_file_cache] watch`（B-185: プロセス全体の値は、リロードが最後まで
+/// 通ってから書き換えるので、ルートの解決には引数で渡す）
+pub fn static_file_cache_watch_enabled(
+    route: Option<&StaticContentCacheRouteConfig>,
+    global: bool,
+) -> bool {
+    route.and_then(|r| r.watch).unwrap_or(global)
 }
 
 /// グローバル静的コンテンツキャッシュ設定を適用（起動時・SIGHUP リロード時）。

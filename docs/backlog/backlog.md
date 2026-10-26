@@ -507,6 +507,7 @@
 | B-173 | P1 | 修正済み（v0.10.0） | [bugs/B-173-wasm-epoch-counts-calls-across-threads.md](bugs/B-173-wasm-epoch-counts-calls-across-threads.md) | Proxy-Wasm のエポックを各コールバックの前に 1 進めていた（全スレッドの呼び出し回数）ため、複数ワーカーの負荷の下で他のスレッドの 10 回の呼び出しの間に終わらない呼び出しが `interrupt` でトラップし、フィルタが飛ばされる。エポックを 100ms ごとの専用スレッドで進める（F-269 の validate-frag で発覚） |
 | B-174 | P3 | 修正済み（v0.10.0） | [bugs/B-174-precompressed-static-files-docs.md](bugs/B-174-precompressed-static-files-docs.md) | 静的配信（`App::serve_dir`・`StaticFiles`・ガイド）の文書が「事前圧縮した `.br`・`.gz` を配る」と書いていた（File バックエンドは使わない。`compression` は HTTP/2・HTTP/3 だけ）。文書を直し、Python の `_toml_literal` の日本語の `TypeError` を英語にする（F-269 の validate で発覚） |
 | B-176 | P3 | 修正済み（v0.10.0） | [bugs/B-176-python-grpc-default-app-silently-dropped.md](bugs/B-176-python-grpc-default-app-silently-dropped.md) | Python の `veil.grpc.Server()`・`add_health()` を `app` 無しで呼ぶと既定の App に登録され、別の `App` を run すると gRPC が黙って UNIMPLEMENTED になる。`App.run()` で `RuntimeWarning` を出し、文書に `Server(app)` を書く（F-269 の veil-python の validate で発覚） |
+| B-185 | P2 | 修正済み（v0.10.0） | [bugs/B-185-rejected-reload-applies-static-cache-globals.md](bugs/B-185-rejected-reload-applies-static-cache-globals.md) | リロードがルートの解決（CORS・JWT の設定ミス）で拒否されても、open_file_cache・static_file_cache のグローバル設定だけ新しい値になる（F-272 でルートより前に適用していた）。監視の既定値は引数で渡し、グローバルはルートの解決の後で書く |
 
 ---
 

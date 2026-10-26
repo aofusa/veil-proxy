@@ -47,19 +47,18 @@ static OPEN_FILE_CACHE_GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS: AtomicU64 = AtomicU64::new(60_000_000_000);
 /// グローバル最大エントリ数（ロックフリー）。デフォルト 10000。
 static OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES: AtomicUsize = AtomicUsize::new(10_000);
-/// グローバルの `open_file_cache_watch`（F-272。設定ロード時にルートの監視を決めるのにだけ使う）
-static OPEN_FILE_CACHE_GLOBAL_WATCH: AtomicBool = AtomicBool::new(false);
-
-/// グローバルの `open_file_cache_watch` を設定する（ルートの解決より前に呼ぶ）
-pub fn configure_global_open_file_cache_watch(watch: bool) {
-    OPEN_FILE_CACHE_GLOBAL_WATCH.store(watch, Ordering::Relaxed);
+/// ルートの `open_file_cache` がディスクの変更を監視するか（設定ロード時）。
+///
+/// `global` は読み込み中の設定の `[performance] open_file_cache_watch`（B-185: プロセス全体の値は、リロードが
+/// 最後まで通ってから書き換えるので、ルートの解決には引数で渡す）
+pub fn open_file_cache_watch_enabled(config: Option<&OpenFileCacheConfig>, global: bool) -> bool {
+    config.and_then(|c| c.watch).unwrap_or(global)
 }
 
-/// ルートの `open_file_cache` がディスクの変更を監視するか（設定ロード時）
-pub fn open_file_cache_watch_enabled(config: Option<&OpenFileCacheConfig>) -> bool {
-    config
-        .and_then(|c| c.watch)
-        .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_WATCH.load(Ordering::Relaxed))
+/// テスト用: グローバルの最大エントリ数
+#[cfg(test)]
+pub(crate) fn global_max_entries() -> usize {
+    OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.load(Ordering::Relaxed)
 }
 
 /// グローバルOpenFileCache設定を適用
