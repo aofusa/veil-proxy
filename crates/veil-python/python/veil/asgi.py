@@ -31,6 +31,10 @@ import traceback
 
 __all__ = ["run", "ASGIApp"]
 
+# B-202: 応答を送り終えた後もアプリのタスク（background・後処理）は最後まで走らせる。ループはタスクを弱参照で
+# しか持たないので、終わるまでここで強参照を持つ
+_RUNNING = set()
+
 _HOP = frozenset((b"content-length", b"transfer-encoding", b"connection", b"keep-alive", b"upgrade"))
 _HOP_STR = frozenset(h.decode() for h in _HOP)
 
@@ -160,6 +164,8 @@ class ASGIApp:
                 raise RuntimeError("unsupported ASGI message %r" % (t,))
 
         task = loop.create_task(self._run(scope, receive, send, done))
+        _RUNNING.add(task)
+        task.add_done_callback(_RUNNING.discard)
         try:
             kind, value = await done
         except BaseException:
@@ -186,16 +192,20 @@ class ASGIApp:
             return Response(value, status, headers, compress=compress)
 
         async def chunks():
+            complete = False
             try:
                 while True:
                     c = await value.get()
                     if c is None:
+                        complete = True
                         break
                     yield c
             finally:
                 if not finished.done():
                     finished.set_result(None)
-                if not task.done():
+                # B-202: 最後の断片を送った後のアプリ（Starlette の background・BaseHTTPMiddleware の内側）は
+                # 取り消さない。取り消すのはクライアントが切った（途中で閉じられた）ときだけ
+                if not complete and not task.done():
                     task.cancel()
                 sr.trailers = st["trailers"] or None
 

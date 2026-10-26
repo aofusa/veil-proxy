@@ -415,6 +415,111 @@ class TestASGI(unittest.TestCase):
             self.assertEqual(cl.get("/native").text, "native")
         self.assertEqual(events, ["startup", "shutdown"])
 
+    # B-202: 最後の断片を送った後のアプリの処理（background）は取り消さない。途中で切られたときだけ取り消す
+    def test_streaming_response_keeps_background(self):
+        from veil.asgi import ASGIApp
+
+        events = []
+
+        async def asgi(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            try:
+                await send({"type": "http.response.body", "body": b"a", "more_body": True})
+                await send({"type": "http.response.body", "body": b"b", "more_body": False})
+                await asyncio.sleep(0.05)  # Starlette の background に当たる
+                events.append("background")
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+
+        async def full():
+            sr = await ASGIApp(asgi)._acall(veil.Request("GET", "/"))
+            body = b"".join([c async for c in sr._aiter()])
+            await asyncio.sleep(0.2)
+            return body
+
+        loop = asyncio.new_event_loop()
+        try:
+            self.assertEqual(loop.run_until_complete(full()), b"ab")
+            self.assertEqual(events, ["background"])
+
+            events.clear()
+
+            async def slow(scope, receive, send):
+                await receive()
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                try:
+                    for _ in range(100):
+                        await send({"type": "http.response.body", "body": b"x", "more_body": True})
+                        await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    events.append("cancelled")
+                    raise
+
+            async def disconnect():
+                sr = await ASGIApp(slow)._acall(veil.Request("GET", "/"))
+                it = sr.content  # サーバが閉じる本文のイテレータ
+                await it.__anext__()
+                await it.aclose()  # クライアントが切った
+                await asyncio.sleep(0.05)
+
+            loop.run_until_complete(disconnect())
+            self.assertEqual(events, ["cancelled"])
+        finally:
+            loop.close()
+
+    def test_streaming_response_background_with_middleware(self):
+        try:
+            import fastapi
+            import starlette.responses
+        except ImportError:
+            self.skipTest("fastapi is not installed")
+        events = []
+        api = fastapi.FastAPI()
+
+        @api.middleware("http")
+        async def mw(request, call_next):
+            return await call_next(request)
+
+        @api.get("/s")
+        async def s(tasks: fastapi.BackgroundTasks):
+            async def bg():
+                await asyncio.sleep(0.05)
+                events.append("bg")
+
+            tasks.add_task(bg)
+            return {"ok": True}
+
+        @api.get("/stream")
+        async def stream():
+            async def gen():
+                yield b"x"
+
+            async def bg():
+                await asyncio.sleep(0.05)
+                events.append("stream-bg")
+
+            return starlette.responses.StreamingResponse(
+                gen(), background=starlette.background.BackgroundTask(bg))
+
+        from veil.asgi import ASGIApp
+
+        async def go(path):
+            r = await ASGIApp(api)._acall(veil.Request("GET", path))
+            if hasattr(r, "_aiter"):
+                async for _ in r._aiter():
+                    pass
+            await asyncio.sleep(0.3)
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(go("/s"))
+            loop.run_until_complete(go("/stream"))
+        finally:
+            loop.close()
+        self.assertEqual(events, ["bg", "stream-bg"])
+
     def test_fastapi_app(self):
         try:
             import fastapi

@@ -80,6 +80,12 @@ app.run(listen_cleartext="0.0.0.0:8000")
   sees `receive` / `send` on veil's persistent event loop. `root_path` is the mount path.
 - The request body is read before the application is called (`[api] max_body_size` applies). The client port is not
   known (`client` is `(ip, 0)`). `http.response.pathsend` reads the file in Python.
+  used only from trusted proxies, as with uvicorn's `--forwarded-allow-ips`: `veil.asgi.run(api,
+  forwarded_allow_ips=["10.0.0.0/8"])` or `app.mount("/legacy", api, forwarded_allow_ips="10.0.0.1")` (`"*"` trusts
+  every client); the default is the `FORWARDED_ALLOW_IPS` environment variable, or `127.0.0.1`.
+- Background work after the response (Starlette `BackgroundTask`, FastAPI `BackgroundTasks`, also behind
+  `@app.middleware("http")`) runs to completion after the last chunk was sent; the application is cancelled only
+  when the client disconnects in the middle of a streamed response.
 - The OpenAPI of a mounted application is its own (`/legacy/openapi.json`); veil's `/openapi.json` lists the native
   routes.
 - An ASGI application runs on the same event loop as the native `async def` routes and holds the GIL while it runs, so
