@@ -90,7 +90,7 @@ HTTP/3・kTLS・gRPC・WASM などプロキシ機能を一通り含み、コン�
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 # リポジトリやローカルのチェックアウトを使う場合:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -709,7 +709,7 @@ tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が v
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # シムに解決される
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }

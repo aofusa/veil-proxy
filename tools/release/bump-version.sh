@@ -12,6 +12,9 @@
 #   - Cargo.lock（ワークスペース）と、ワークスペース外のクレートの Cargo.lock の veil 系の版
 #   - 文書の中で「今の版の例」として書いた箇所（下の DOC_FILES。計測の基準として書いた版
 #     ＝ docs/perf・docs/guide/performance.md の表・tools/perf は意味が変わるので書き換えない）
+#   - 導入例の依存の版 `package = "veil-proxy[-kit|-build|...]", version = "X.Y"`（B-205。git の管理下の
+#     文書・README・rustdoc・例の Cargo.toml を全部探す。経緯の文書＝docs/history・docs/releases・docs/backlog・
+#     docs/perf は書き換えない）
 #
 # 公開の workflow（.github/workflows/release.yml）は、タグ（v を除く）とこの版が違えば何も公開しない。
 set -euo pipefail
@@ -125,6 +128,28 @@ for f in files:
     if t != s:
         open(f, "w").write(t)
         print("updated", f)
+PY
+
+# 3b. 導入例の依存の版（X.Y。B-205: 公開前の新しいクレートの例が存在しない古い版を指していた）
+python3 - "$NEW" <<'PY'
+import re, subprocess, sys
+new = sys.argv[1]
+mm = ".".join(new.split("-", 1)[0].split(".")[:2])
+pat = re.compile(r'(package = "veil-proxy(?:-[a-z]+)?", version = ")[0-9]+\.[0-9]+(")')
+skip = ("docs/history/", "docs/releases/", "docs/backlog/", "docs/perf/", "docs/artifacts/", "third_party/")
+files = subprocess.run(["git", "ls-files", "*.md", "*.toml", "*.rs", "*.html"], capture_output=True, text=True,
+                       check=True).stdout.split()
+for f in files:
+    if f.startswith(skip):
+        continue
+    try:
+        s = open(f, encoding="utf-8").read()
+    except (OSError, UnicodeDecodeError):
+        continue
+    t = pat.sub(rf"\g<1>{mm}\g<2>", s)
+    if t != s:
+        open(f, "w", encoding="utf-8").write(t)
+        print("updated", f, "(dependency examples ->", mm + ")")
 PY
 
 # 4. Helm chart（F-254）: chart の版と appVersion を veil の版にそろえる（同時に公開する）

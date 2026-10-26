@@ -7,7 +7,7 @@ veil の tokio 互換レイヤーの置き場。実装は veil 本体の `veil::
 ```toml
 # 利用側の Cargo.toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 hyper = { version = "1", features = ["server", "http1"] }   # tokio を使うクレート
 
 [patch.crates-io]

@@ -13,8 +13,8 @@ For Python, the package `veil-api-kit` (`import veil_kit`) has the same parts wi
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }
-veil-kit = { package = "veil-proxy-kit", version = "0.9", features = ["full"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
 ```
 
 | Module | Feature | Contents |

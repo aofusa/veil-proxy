@@ -7,8 +7,8 @@ include it, and the heavy dependencies (async-graphql, prost) are behind feature
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }
-veil-kit = { package = "veil-proxy-kit", version = "0.9", features = ["full"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
 ```
 
 ```rust,no_run

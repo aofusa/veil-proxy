@@ -93,7 +93,7 @@ allocator is chosen). API reference: [docs.rs/veil-proxy](https://docs.rs/veil-p
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 # or the repository / a local checkout:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -748,7 +748,7 @@ which re-exports `veil::tokio`):
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # resolved to the shim
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }

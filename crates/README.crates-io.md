@@ -16,7 +16,7 @@ resolves:
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```

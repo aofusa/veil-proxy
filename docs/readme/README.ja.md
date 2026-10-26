@@ -136,7 +136,7 @@ BSD/macOS/Windows 向けビルドは [docs/guide/ja/building.md](../guide/ja/bui
 ```toml
 # Cargo.toml（crates.io の名前は veil-proxy。マクロが veil の名前を使うので、依存のキーは veil のままにする）
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 ```
 

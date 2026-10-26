@@ -526,6 +526,7 @@
 | B-202 | P2 | 修正済み（v0.10.0） | [bugs/B-202-asgi-streaming-cancels-background.md](bugs/B-202-asgi-streaming-cancels-background.md) | ASGI のストリーミング応答で、最後の断片の後にアプリのタスクを cancel して background が消える |
 | B-203 | P2 | 修正済み（v0.10.0） | [bugs/B-203-python-grpc-client-cancel.md](bugs/B-203-python-grpc-client-cancel.md) | Python の gRPC クライアント: 取消しが応答ヘッダの前に効かず、ストリーミングの途中の取消しで END_STREAM を送る。大きな timeout で panic |
 | B-204 | P2 | 修正済み（v0.10.0） | [bugs/B-204-asgi-scheme-forwarded-proto.md](bugs/B-204-asgi-scheme-forwarded-proto.md) | ASGI の scheme がクライアントの X-Forwarded-Proto を無条件に信じ、TLS の HTTP/1.1・2 は http になる |
+| B-205 | P3 | 修正済み（v0.10.0） | [bugs/B-205-dependency-examples-stale-minor-version.md](bugs/B-205-dependency-examples-stale-minor-version.md) | 導入例の依存の版が存在しない "0.9" を指し、bump-version.sh が major.minor の例を更新しない |
 
 ---
 

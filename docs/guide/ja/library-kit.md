@@ -12,8 +12,8 @@ Python では、パッケージ `veil-api-kit`（`import veil_kit`）が同じ�
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }
-veil-kit = { package = "veil-proxy-kit", version = "0.9", features = ["full"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
 ```
 
 | モジュール | feature | 内容 |

@@ -14,8 +14,8 @@ publish = false
 
 [dependencies]
 # 実際に使うときは crates.io:
-# veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }
-# veil-kit = { package = "veil-proxy-kit", version = "0.9", features = ["full"] }
+# veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+# veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
 veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["full", "api"] }
 veil-kit = { package = "veil-proxy-kit", path = "../../../crates/veil-kit", features = ["full"] }
 async-graphql = { version = "7", default-features = false }
