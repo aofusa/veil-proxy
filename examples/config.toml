@@ -2534,7 +2534,8 @@ watch = false
 # expose_headers = []          # 実際の応答の Access-Control-Expose-Headers
 # max_age_secs = 600
 # allow_credentials = false    # "*" とは併用できない
-# override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える（既定は上流のものを残す）
+# override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える（既定は上流が ACAO を返したら上流のものを残す。
+#                              # veil が足すときは上流の Allow-Credentials・Expose-Headers をいつも除く）
 # reject_disallowed = false    # true: 許可しない Origin の要求に 403（既定は処理して CORS のヘッダを付けないだけ）
 #
 # JWT の検証（F-220、`jwt` feature）。トークン無し・検証できない → 401、require_claims を満たさない → 403

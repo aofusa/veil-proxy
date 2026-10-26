@@ -955,7 +955,10 @@ reject_disallowed = false    # true: answer 403 to requests whose Origin is not 
   `Vary: Origin` (the browser blocks them; set `reject_disallowed = true` to answer `403` instead).
 - If the upstream (or a handler, or the headers of a `Respond` action) already returns `Access-Control-Allow-Origin`,
   veil keeps the upstream's CORS headers and adds none; `override_upstream = true` removes the upstream's
-  `Access-Control-Allow-Origin` / `-Allow-Credentials` / `-Expose-Headers` and adds veil's.
+  `Access-Control-Allow-Origin` / `-Allow-Credentials` / `-Expose-Headers` and adds veil's. Whenever veil adds its
+  headers, it removes the upstream's `Access-Control-Allow-Credentials` and `-Expose-Headers` (an upstream that
+  returns them without `Access-Control-Allow-Origin` neither duplicates veil's values nor turns on credentials
+  that the route does not allow).
 - The headers are built when the configuration is loaded, one copy of the route's backend per allowed origin; per
   request veil compares the `Origin` once and adds prebuilt headers. Routes without `[route.traffic.cors]` are
   unaffected. Responses that veil generates itself before the route is chosen (`404` for unknown paths, security

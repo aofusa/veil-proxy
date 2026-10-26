@@ -949,7 +949,9 @@ reject_disallowed = false    # true: 許可しない Origin の要求に 403 を
   なら 403 で返す）。
 - 上流（ハンドラ、`Respond` の action のヘッダも同じ）が既に `Access-Control-Allow-Origin` を返したら、上流の CORS の
   ヘッダを残して何も足さない。`override_upstream = true` なら上流の `Access-Control-Allow-Origin`・`-Allow-Credentials`・
-  `-Expose-Headers` を除いて veil のものを足す。
+  `-Expose-Headers` を除いて veil のものを足す。veil が足すときは、いつも上流の `Access-Control-Allow-Credentials`・
+  `-Expose-Headers` を除く（上流が `Access-Control-Allow-Origin` 無しで返したものが veil の値と重なったり、ルートが許可して
+  いない credentials を有効にしたりしない）。
 - ヘッダは設定のロード時に組み立てる（許可したオリジンごとにルートのバックエンドの写しを 1 つ作る）。要求のたびには
   `Origin` を 1 回照合し、組み立て済みのヘッダを足すだけ。`[route.traffic.cors]` の無いルートには影響しない。ルートを
   選ぶ前に veil が返す応答（未知のパスの `404`、セキュリティの拒否、フォルトの中断、JWT のエラー）と WebSocket の

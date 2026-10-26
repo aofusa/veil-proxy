@@ -5,7 +5,8 @@
 //!   応答を書く各経路は `security.cors_actual` を見て、ロード時に組み立てたヘッダを足すだけ（`Bytes` の参照カウント）。
 //! - `[route.traffic.cors]` の無いルートの `cors_actual` は `None` で、各経路は分岐 1 個だけ増える。
 //! - 上流（プロキシ・ハンドラ・固定応答の設定）が既に `Access-Control-Allow-Origin` を返したら足さない。
-//!   `override_upstream = true` なら上流の CORS のヘッダを除いて足す。
+//!   `override_upstream = true` なら上流の CORS のヘッダを除いて足す。veil が足すときは、上流の
+//!   `Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers` も除く（ACAO 無しで返したもの。B-190）。
 
 use crate::config::SecurityConfig;
 use bytes::Bytes;
@@ -95,8 +96,10 @@ impl CorsActual {
             return;
         }
         let mut insert_at = end;
-        if has_cors && self.override_upstream {
-            // 上流の CORS のヘッダの行を除いて組み立て直す（上書きを選んだルートだけ）
+        if has_cors {
+            // 上流の CORS のヘッダの行を除いて組み立て直す（上書きを選んだルートと、上流が ACAO 無しで
+            // credentials・expose-headers だけを返したとき。B-190: 残すと veil の行と重なるか、設定に無い
+            // credentials の許可が veil の ACAO と組になる）
             let mut out = Vec::with_capacity(head.len() + self.h1_lines.len());
             out.extend_from_slice(&head[..first + 2]);
             let mut pos = first + 2;
@@ -131,13 +134,22 @@ impl CorsActual {
         name: impl Fn(&T) -> &[u8],
         make: impl Fn(&Bytes, &Bytes) -> T,
     ) {
-        let has_origin = headers
-            .iter()
-            .any(|h| name(h).eq_ignore_ascii_case(CORS_NAMES[0]));
-        if has_origin {
-            if !self.override_upstream {
-                return;
+        let mut has_origin = false;
+        let mut has_cors = false;
+        for h in headers.iter() {
+            let n = name(h);
+            if n.eq_ignore_ascii_case(CORS_NAMES[0]) {
+                has_origin = true;
             }
+            if is_cors_name(n) {
+                has_cors = true;
+            }
+        }
+        if has_origin && !self.override_upstream {
+            return;
+        }
+        // B-190: veil が足すときは、上流の CORS のヘッダ（ACAO 無しの credentials・expose-headers も）を除く
+        if has_cors {
             headers.retain(|h| !is_cors_name(name(h)));
         }
         headers.reserve(self.fields.len());
@@ -227,6 +239,41 @@ mod tests {
             String::from_utf8(head).unwrap(),
             "HTTP/1.1 200 OK\r\nX: y\r\nAccess-Control-Allow-Origin: https://a.example\r\nVary: Origin\r\n\r\n"
         );
+    }
+
+    /// B-190: 上流が ACAO 無しで返した credentials・expose-headers は、veil が足すときに除く
+    #[test]
+    fn upstream_credentials_without_origin_are_replaced() {
+        let raw = b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials: true\r\nX: y\r\naccess-control-expose-headers: x-up\r\n\r\n";
+        for ov in [false, true] {
+            let mut head = raw.to_vec();
+            actual(ov).apply_h1(&mut head);
+            assert_eq!(
+                String::from_utf8(head).unwrap(),
+                "HTTP/1.1 200 OK\r\nX: y\r\nAccess-Control-Allow-Origin: https://a.example\r\nVary: Origin\r\n\r\n",
+                "override_upstream = {ov}"
+            );
+            let mut h = vec![
+                (
+                    Bytes::from_static(b"access-control-allow-credentials"),
+                    Bytes::from_static(b"true"),
+                ),
+                (Bytes::from_static(b"x"), Bytes::from_static(b"1")),
+            ];
+            actual(ov).apply_bytes(&mut h);
+            assert_eq!(
+                h,
+                vec![
+                    (Bytes::from_static(b"x"), Bytes::from_static(b"1")),
+                    (
+                        Bytes::from_static(b"access-control-allow-origin"),
+                        Bytes::from_static(b"https://a.example"),
+                    ),
+                    (Bytes::from_static(b"vary"), Bytes::from_static(b"Origin")),
+                ],
+                "override_upstream = {ov}"
+            );
+        }
     }
 
     #[test]
