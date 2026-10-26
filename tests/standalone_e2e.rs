@@ -3203,3 +3203,168 @@ body = "plain"
         }
     }
 }
+
+// ===================== B-186・B-188・B-189（Proxy-Wasm の HTTP/1.1 の接続の継続） =====================
+
+/// baseline-filter（F-271）のルートを平文の HTTP/1.1 で待ち受ける veil を起動する（`/rewrite` の上流は本文のエコー）
+#[cfg(feature = "wasm")]
+fn spawn_baseline_wasm(dir: &std::path::Path) -> (VeilProcess, u16) {
+    let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wasm/baseline_filter.wasm");
+    // 生成される .cwasm を作業ツリーに残さないよう一時ディレクトリへ写す
+    let wasm_copy = dir.join("baseline_filter.wasm");
+    std::fs::copy(&wasm, &wasm_copy).unwrap();
+    let echo = spawn_body_echo();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "baseline"
+path = "{wasm}"
+[wasm.modules.capabilities]
+allow_send_local_response = true
+allow_request_headers_read = true
+allow_request_body_read = true
+allow_request_body_write = true
+allowed_properties = ["request.*", "plugin_data.*"]
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/dataset"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/rewrite"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        wasm = tp(&wasm_copy),
+    );
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    (veil, port)
+}
+
+/// HTTP/1.1 の応答を 1 つ読む（`head` は HEAD の応答＝Content-Length があっても本文を読まない）。
+/// `buf` は前の応答の後ろに読んだ分を持ち越す。接続が閉じた・時間切れなら `None`
+#[cfg(feature = "wasm")]
+fn read_one_response(
+    s: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    head: bool,
+) -> Option<HttpResponse> {
+    use std::io::Read;
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let h = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let cl: usize = if head || h.starts_with("http/1.1 1") {
+                0
+            } else {
+                h.lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse().unwrap())
+                    .unwrap_or(0)
+            };
+            if buf.len() >= end + 4 + cl {
+                let rest = buf.split_off(end + 4 + cl);
+                let mut r = parse_http1_response(buf).unwrap();
+                if head {
+                    r.body.clear();
+                }
+                *buf = rest;
+                return Some(r);
+            }
+        }
+        let mut tmp = [0u8; 4096];
+        match s.read(&mut tmp) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+            _ => return None,
+        }
+    }
+}
+
+/// B-186: 本文の末尾と次の要求が同じ書き込みで届いても、次の要求を失わない（Wasm の要求本文の段の
+/// ローカル応答・本文を書き換えて上流へ送る経路・要求ヘッダの段のローカル応答の本文の読み捨て。
+/// 以前は本文の残りを読むときに次の要求を捨て、クライアントは応答を待ったまま止まった）
+#[cfg(feature = "wasm")]
+#[test]
+fn b186_wasm_paths_keep_pipelined_request_after_body() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let next = b"GET /baseline11?a=7 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    for (name, first, rest, want) in [
+        (
+            "body phase local response (Content-Length)",
+            &b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n1"[..],
+            &b"0"[..],
+            "11",
+        ),
+        (
+            "body phase local response (chunked)",
+            &b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n1"[..],
+            &b"0\r\n0\r\n\r\n"[..],
+            "11",
+        ),
+        (
+            "body rewritten and proxied",
+            &b"POST /rewrite HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\na"[..],
+            &b"b"[..],
+            "rewritten:ab",
+        ),
+        (
+            "header phase local response drains the body",
+            &b"POST /dataset HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\na"[..],
+            &b"b"[..],
+            "",
+        ),
+    ] {
+        let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(first).unwrap();
+        // veil がヘッダと本文の先頭を読んでから、本文の残りと次の要求を 1 回で送る
+        std::thread::sleep(Duration::from_millis(300));
+        let mut tail = rest.to_vec();
+        tail.extend_from_slice(next);
+        s.write_all(&tail).unwrap();
+        let mut buf = Vec::new();
+        let r1 = read_one_response(&mut s, &mut buf, false)
+            .unwrap_or_else(|| panic!("{name}: no first response\n{}", veil.log()));
+        assert_eq!(r1.status, 200, "{name}\n{}", veil.log());
+        if !want.is_empty() {
+            assert_eq!(r1.text(), want, "{name}");
+        }
+        let r2 = read_one_response(&mut s, &mut buf, false)
+            .unwrap_or_else(|| panic!("{name}: the pipelined request was lost\n{}", veil.log()));
+        assert_eq!((r2.status, r2.text()), (200, "7".into()), "{name}");
+    }
+}

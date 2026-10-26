@@ -175,6 +175,23 @@ TOML
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
+  # B-186: 本文の残りと次の要求が同じ書き込みで届いても、次の要求を失わない（以前は本文の残りを読むときに捨てた）
+  expect "streaming request pipelined (HTTP/1.1)" "HELLOWORLD|Hello, World!" "$PY3" -I -c '
+import re, socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"POST /upper HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhello")
+time.sleep(0.3)
+s.sendall(b"world" + b"GET /hello HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+out = b""
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        out += b
+except socket.timeout:
+    pass
+t = re.sub(r"\r\n[0-9a-f]+\r\n", "", out.decode("latin-1"))  # chunked の区切りを外す
+print("|".join(w for w in ("HELLOWORLD", "Hello, World!") if w in t))' "$P"
   run_rust_multipart "$B" "$W" "$PID"
   # F-270: [api] compression = true（ルートの compress = false・256 バイト未満・ストリーミング）
   comp_suite "rust" "$B" /dataset/200 /dataset-raw/200 - /stream-big

@@ -873,7 +873,9 @@ pub(super) async fn handle_requests(
                 } else {
                     None
                 };
-                let pipelined: BytesMut = if let Some(k) = chunked_end {
+                // 本文を読む経路（ローカル応答の読み捨て・Wasm の本文の段・ハンドラ）が本文の終わりより後ろまで
+                // 読んだ分も、ここへ足して次の要求として扱う（B-186）
+                let mut pipelined: BytesMut = if let Some(k) = chunked_end {
                     accumulated.split_off(k)
                 } else if !is_chunked && !is_websocket && accumulated.len() > content_length {
                     accumulated.split_off(content_length)
@@ -973,6 +975,7 @@ pub(super) async fn handle_requests(
                                             content_length,
                                             is_chunked && chunked_end.is_none(),
                                             &initial_body,
+                                            &mut pipelined,
                                         )
                                         .await
                                     {
@@ -1026,6 +1029,7 @@ pub(super) async fn handle_requests(
                                     is_chunked,
                                     &initial_body,
                                     limit,
+                                    &mut pipelined,
                                 )
                                 .await
                                 {
@@ -1245,6 +1249,7 @@ pub(super) async fn handle_requests(
                         }
                     },
                     client_ip,
+                    &mut pipelined,
                 )
                 .await;
 
@@ -1341,11 +1346,15 @@ pub(super) async fn handle_requests(
 /// `initial_body` は既にヘッダ読み取り時にソケットから消費済みの先頭バイト。残りを
 /// ソケットから読み切る。完全にドレインできた場合のみ `true` を返す（接続再利用が安全）。
 /// ドレインに失敗した場合は `false`（呼び出し側は接続を閉じる）。
+///
+/// 本文の終わりより後ろまで読んだ分（同じセグメントで届いた次の要求＝パイプライン）は `overflow` の後ろに
+/// 足す（B-186。以前は捨てていたので、接続を続けると次の要求が消えた）。
 pub(super) async fn drain_request_body(
     stream: &mut ServerTls,
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    overflow: &mut BytesMut,
 ) -> bool {
     if is_chunked {
         // DoS 対策の上限は MAX_BODY_SIZE を流用（リクエスト本文の上限）。
@@ -1364,7 +1373,11 @@ pub(super) async fn drain_request_body(
                 } // EOF: 不完全
                 Ok((Ok(n), mut b)) => {
                     b.set_valid_len(n);
-                    let res = decoder.feed(b.as_valid_slice());
+                    let data = b.as_valid_slice();
+                    let (res, used) = decoder.feed_counted(data);
+                    if matches!(res, ChunkedFeedResult::Complete) {
+                        overflow.extend_from_slice(&data[used..]);
+                    }
                     buf_put(b);
                     match res {
                         ChunkedFeedResult::Complete => return true,
@@ -1386,7 +1399,11 @@ pub(super) async fn drain_request_body(
                     buf_put(b);
                     return false;
                 } // EOF: 不完全
-                Ok((Ok(n), b)) => {
+                Ok((Ok(n), mut b)) => {
+                    if n > remaining {
+                        b.set_valid_len(n);
+                        overflow.extend_from_slice(&b.as_valid_slice()[remaining..]);
+                    }
                     buf_put(b);
                     remaining = remaining.saturating_sub(n);
                 }
@@ -1412,13 +1429,22 @@ pub(super) async fn handle_backend(
     #[cfg(feature = "handler")] api_cache: &mut crate::api::dispatch::CallCache,
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     client_ip: &str,
+    // 本文を読み過ぎた分（次の要求）を足す先（B-186。本文を読み終えたら呼び出し側が蓄積へ戻す）
+    pipelined: &mut BytesMut,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
     // Redirect 等のローカル応答）はボディを読まないため、keep-alive 接続でボディが次の
     // リクエストに混入して 400 desync を起こす。ローカル応答の前に残りのボディを読み捨てる。
     if !backend_consumes_request_body(&backend)
         && (is_chunked || content_length > initial_body.len())
-        && !drain_request_body(&mut tls_stream, content_length, is_chunked, initial_body).await
+        && !drain_request_body(
+            &mut tls_stream,
+            content_length,
+            is_chunked,
+            initial_body,
+            pipelined,
+        )
+        .await
     {
         // ドレイン失敗（接続が汚染されている可能性）→ 接続を閉じる
         return Some((tls_stream, 400, 0, true));
@@ -1673,6 +1699,7 @@ pub(super) async fn handle_backend(
                 client_wants_close,
                 client_ip,
                 api_cache,
+                pipelined,
             ))
             .await
         }
@@ -1708,6 +1735,7 @@ pub(super) async fn handle_api_handler(
     client_wants_close: bool,
     client_ip: &str,
     api_cache: &mut crate::api::dispatch::CallCache,
+    overflow: &mut BytesMut,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文を待たずに呼び、届いた順に渡す。
     // chunked は従来どおり全部を読んでから 1 つの断片で渡す（`take_body_stream` の既定）
@@ -1725,6 +1753,7 @@ pub(super) async fn handle_api_handler(
             client_wants_close,
             client_ip,
             api_cache,
+            overflow,
         )
         .await;
     }
@@ -1735,6 +1764,7 @@ pub(super) async fn handle_api_handler(
         is_chunked,
         initial_body,
         limit,
+        overflow,
     )
     .await
     {
@@ -1839,6 +1869,7 @@ async fn handle_api_streaming(
     client_wants_close: bool,
     client_ip: &str,
     api_cache: &mut crate::api::dispatch::CallCache,
+    overflow: &mut BytesMut,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     use crate::api::stream::{BodyChunk, BodyStream};
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -1874,7 +1905,7 @@ async fn handle_api_streaming(
             crate::api::dispatch::call_with(entry, req, api_cache, comp).map(Ev::Resp),
         ));
         set.push(Box::pin(
-            pump_api_body(&mut tls_stream, content_length, first, tx).map(Ev::Pumped),
+            pump_api_body(&mut tls_stream, content_length, first, tx, overflow).map(Ev::Pumped),
         ));
         let mut early: Option<crate::api::response::Response> = None;
         loop {
@@ -1930,12 +1961,14 @@ async fn handle_api_streaming(
 }
 
 /// 要求本文（Content-Length）を読みながらハンドラの本文のチャネルへ送る（F-266）。全部読めたら `true`。
+/// 本文の終わりより後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。
 #[cfg(feature = "handler")]
 async fn pump_api_body(
     stream: &mut ServerTls,
     content_length: usize,
     first: Option<Bytes>,
     mut tx: futures::channel::mpsc::Sender<Bytes>,
+    overflow: &mut BytesMut,
 ) -> bool {
     use futures::SinkExt;
     let mut got = 0usize;
@@ -1951,9 +1984,13 @@ async fn pump_api_body(
             Ok((Ok(n), mut b)) if n > 0 => {
                 b.set_valid_len(n);
                 let s = b.as_valid_slice();
-                let take = &s[..s.len().min(content_length - got)];
+                let want = content_length - got;
+                let take = &s[..s.len().min(want)];
                 got += take.len();
                 let chunk = Bytes::copy_from_slice(take);
+                if s.len() > want {
+                    overflow.extend_from_slice(&s[want..]);
+                }
                 buf_put(b);
                 if tx.send(chunk).await.is_err() {
                     return false;
@@ -2004,7 +2041,7 @@ fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse) -> Vec<u8> {
     response
 }
 
-/// 本文を差し替えた要求のヘッダ（Transfer-Encoding・Content-Length を外して新しい Content-Length を付ける。F-271）
+/// 本文を差し替えた要求のヘッダ（Transfer-Encoding・Content-Length を外して新しい Content-Length を付ける。F-271）。
 #[cfg(feature = "wasm")]
 fn set_body_framing_headers(headers: &mut Vec<(Bytes, Bytes)>, len: usize) {
     headers.retain(|(k, _)| {
@@ -2100,6 +2137,7 @@ pub(super) async fn write_api_chunked(
 
 /// ハンドラ用に HTTP/1.1 のリクエスト本文を全部読む（Content-Length / chunked、上限 `limit`）。
 /// 失敗はステータス（上限超過 413、それ以外 400）。Wasm の要求本文のフェーズ（F-271）も使う。
+/// 本文の終わりより後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。
 #[cfg(any(feature = "handler", feature = "wasm"))]
 pub(super) async fn read_full_request_body(
     stream: &mut ServerTls,
@@ -2107,6 +2145,7 @@ pub(super) async fn read_full_request_body(
     is_chunked: bool,
     initial_body: &[u8],
     limit: usize,
+    overflow: &mut BytesMut,
 ) -> Result<Bytes, u16> {
     if is_chunked {
         let mut decoder = ChunkedDecoder::new_request(limit as u64);
@@ -2117,8 +2156,13 @@ pub(super) async fn read_full_request_body(
             match timeout(READ_TIMEOUT, stream.read(buf)).await {
                 Ok((Ok(n), mut b)) if n > 0 => {
                     b.set_valid_len(n);
-                    raw.extend_from_slice(b.as_valid_slice());
-                    state = decoder.feed(b.as_valid_slice());
+                    let data = b.as_valid_slice();
+                    let (res, used) = decoder.feed_counted(data);
+                    raw.extend_from_slice(&data[..used]);
+                    if matches!(res, ChunkedFeedResult::Complete) {
+                        overflow.extend_from_slice(&data[used..]);
+                    }
+                    state = res;
                     buf_put(b);
                 }
                 Ok((_, b)) => {
@@ -2147,6 +2191,9 @@ pub(super) async fn read_full_request_body(
                     let want = content_length - body.len();
                     let got = b.as_valid_slice();
                     body.extend_from_slice(&got[..got.len().min(want)]);
+                    if got.len() > want {
+                        overflow.extend_from_slice(&got[want..]);
+                    }
                     buf_put(b);
                 }
                 Ok((_, b)) => {
@@ -2243,5 +2290,137 @@ pub(super) async fn handle_redirect(
     match write_result {
         Ok((Ok(_), _)) => Some((tls_stream, status_code, 0, client_wants_close)),
         _ => None,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod b186_overflow_tests {
+    //! B-186: 本文を読む経路が本文の終わりより後ろまで読んだ分（次の要求）を呼び出し側へ返すこと。
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::io::FromRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(not(all(veil_rt_uring, target_os = "linux")))]
+    fn runtime_available() -> bool {
+        true
+    }
+
+    /// (サーバ側の非ブロッキング `TcpStream`, クライアント側の同期 `UnixStream`)
+    fn pair() -> (crate::runtime::tcp::TcpStream, UnixStream) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds は 2 要素の有効な配列
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // SAFETY: socketpair が返した有効な fd
+        unsafe {
+            let fl = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        // SAFETY: socketpair が返した所有 fd をそれぞれ一度だけ所有権移動する
+        unsafe {
+            (
+                crate::runtime::tcp::TcpStream::from_raw_fd(fds[0]),
+                UnixStream::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    async fn server(stream: crate::runtime::tcp::TcpStream) -> ServerTls {
+        #[cfg(veil_ktls)]
+        let s = crate::ktls_rustls::accept_plain(stream, None).await;
+        #[cfg(not(veil_ktls))]
+        let s = crate::simple_tls::accept_plain(stream, None).await;
+        s.expect("plain stream")
+    }
+
+    const NEXT: &[u8] = b"GET /next HTTP/1.1\r\nHost: a\r\n\r\n";
+
+    /// 本文の残りと次の要求を 1 回で書く
+    fn send_rest(mut c: &UnixStream, rest: &[u8]) {
+        let mut buf = rest.to_vec();
+        buf.extend_from_slice(NEXT);
+        c.write_all(&buf).unwrap();
+    }
+
+    #[test]
+    fn drain_request_body_returns_pipelined_bytes() {
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            // Content-Length
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, b"lo world");
+            let mut over = BytesMut::new();
+            assert!(drain_request_body(&mut tls, 11, false, b"hel", &mut over).await);
+            assert_eq!(&over[..], NEXT);
+            // chunked（終端が次の要求と同じ読み取りに入る）
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, b"lo\r\n0\r\n\r\n");
+            let mut over = BytesMut::new();
+            assert!(drain_request_body(&mut tls, 0, true, b"5\r\nhel", &mut over).await);
+            assert_eq!(&over[..], NEXT);
+        });
+    }
+
+    #[cfg(any(feature = "handler", feature = "wasm"))]
+    #[test]
+    fn read_full_request_body_returns_pipelined_bytes() {
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, b"lo world");
+            let mut over = BytesMut::new();
+            let body = read_full_request_body(&mut tls, 11, false, b"hel", 1024, &mut over)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"hello world");
+            assert_eq!(&over[..], NEXT);
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, b"lo\r\n0\r\n\r\n");
+            let mut over = BytesMut::new();
+            let body = read_full_request_body(&mut tls, 0, true, b"5\r\nhel", 1024, &mut over)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"hello");
+            assert_eq!(&over[..], NEXT);
+        });
+    }
+
+    #[cfg(feature = "handler")]
+    #[test]
+    fn pump_api_body_returns_pipelined_bytes() {
+        use futures::StreamExt;
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, b"lo world");
+            let (tx, slot) = crate::api::stream::request_body_channel(8);
+            let mut rx = slot.lock().unwrap().take().unwrap();
+            let mut over = BytesMut::new();
+            let first = Some(Bytes::from_static(b"hel"));
+            assert!(pump_api_body(&mut tls, 11, first, tx, &mut over).await);
+            let mut got = Vec::new();
+            while let Some(b) = rx.next().await {
+                got.extend_from_slice(&b);
+            }
+            assert_eq!(&got[..], b"hello world");
+            assert_eq!(&over[..], NEXT);
+        });
     }
 }

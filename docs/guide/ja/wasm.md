@@ -148,6 +148,9 @@ veil は本文を全部読んでから（Content-Length・chunked。上限は `m
 モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送る）。
 そういうモジュールの無いルートは、今までどおり本文を上流へ流す。
 
+HTTP/1.1 では、フィルタのローカル応答（`send_local_response`）の後も接続を続け、本文の後ろにパイプラインで届いた要求を
+続けて処理する。
+
 ### VM の文脈の使い回し（`instance_reuse`）
 
 ```toml
