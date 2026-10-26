@@ -275,6 +275,7 @@ for debugging.
 | `multipart_max_parts` | `100` | maximum number of parts of a `multipart/form-data` body (more gives 413) |
 | `multipart_max_field_size` | `1048576` | maximum size of a part that is not a file |
 | `multipart_max_file_size` | `0` | maximum size of a file part (`0` = `max_body_size`) |
+| `multipart_max_total_size` | `0` | maximum size of a whole `multipart/form-data` body, also on streamed routes (`0` = `max_body_size`, or `multipart_max_file_size` when that is larger) |
 | `multipart_max_header_size` | `8192` | maximum size of the headers of one part |
 | `multipart_spool_threshold` | `1048576` | Python `UploadFile` and C `VEIL_ROUTE_FORM`: larger files are written to a temporary file instead of memory |
 | `upload_tmp_dir` | OS temp dir | directory of the anonymous temporary files for uploads (added to the Landlock / unveil write paths) |
@@ -549,7 +550,7 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
   `loc = ["body", name]`, a malformed body 400 and a body over the `[api] multipart_*` limits 413
   (`{"detail": "..."}`).
 - `Multipart` cannot be combined with the buffered extractors. Streamed routes are not limited by
-  `max_body_size` (the per-part limits apply); this holds on HTTP/1.1 (bodies with a `Content-Length`; chunked bodies
+  `max_body_size`; a multipart body is limited per part and as a whole (`multipart_max_total_size`); this holds on HTTP/1.1 (bodies with a `Content-Length`; chunked bodies
   are buffered), HTTP/2 and HTTP/3. The anonymous files (`O_TMPFILE` on Linux, created and removed elsewhere, delete
   on close on Windows) are written on the offload pool and disappear when closed.
 - OpenAPI describes the body as `multipart/form-data` with files as `{"type": "string", "format": "binary"}`, so
@@ -557,7 +558,8 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
 - **Python:** `name: str = veil.Form()`, `avatar: veil.UploadFile = veil.File()`, `files: list[veil.UploadFile]`,
   `data: bytes = veil.File()` (FastAPI's names; `Annotated[str, veil.Form()]` works too, and urlencoded forms use the
   same `Form()`). The body is parsed in Rust before the handler runs: text and small files stay in memory, files over
-  `multipart_spool_threshold` are handed to Python as temporary files, so a large upload does not grow the process.
+  `multipart_spool_threshold` are handed to Python as temporary files, so a large upload does not grow the process
+  (the whole body is limited by `multipart_max_total_size`, by default `max_body_size`).
   `UploadFile` has `filename`, `content_type`, `headers`, `size`, `file` and `async` `read` / `write` / `seek` /
   `close` (plus `read_bytes()`).
 - **C:** `veil_multipart_next(req, &part)` returns the parts one by one (`name`, `filename`, `content_type`, and

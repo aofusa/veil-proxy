@@ -265,6 +265,9 @@ pub struct ApiSettings {
     // F-266
     /// Maximum size of a multipart file part (0 = `max_body_size`).
     pub multipart_max_file_size: usize,
+    // B-195: 本文全体の上限（ストリーミング受信のルートは max_body_size を見ないため）
+    /// Maximum size of a whole multipart body (0 = `max_body_size`, or `multipart_max_file_size` when larger).
+    pub multipart_max_total_size: usize,
     // F-266
     /// Maximum size of the headers of one multipart part.
     pub multipart_max_header_size: usize,
@@ -342,6 +345,7 @@ impl ApiSettings {
             multipart_max_parts: n("multipart_max_parts", 100),
             multipart_max_field_size: n("multipart_max_field_size", 1024 * 1024),
             multipart_max_file_size: n("multipart_max_file_size", 0),
+            multipart_max_total_size: n("multipart_max_total_size", 0),
             multipart_max_header_size: n("multipart_max_header_size", 8 * 1024),
             multipart_spool_threshold: n("multipart_spool_threshold", 1024 * 1024),
             upload_tmp_dir: v

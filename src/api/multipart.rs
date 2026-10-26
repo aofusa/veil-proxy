@@ -12,8 +12,8 @@
 //! - [`Multipart`]: the body as it arrives (a `streaming` route), part by part and chunk by chunk, with
 //!   [`Field::save_to_temp`] / [`Field::save_to`] to write a large file without holding it in memory.
 //!
-//! Limits come from `[api]`: `multipart_max_parts`, `multipart_max_field_size`, `multipart_max_file_size` and
-//! `multipart_max_header_size` (413 when exceeded; a malformed body is 400).
+//! Limits come from `[api]`: `multipart_max_parts`, `multipart_max_field_size`, `multipart_max_file_size`,
+//! `multipart_max_total_size` and `multipart_max_header_size` (413 when exceeded; a malformed body is 400).
 //!
 //! [`Form`]: super::extract::Form
 
@@ -33,6 +33,8 @@ static MAX_PARTS: AtomicUsize = AtomicUsize::new(100);
 static MAX_FIELD: AtomicUsize = AtomicUsize::new(1024 * 1024);
 // 0 = [api] max_body_size と同じ
 static MAX_FILE: AtomicUsize = AtomicUsize::new(0);
+// B-195: 本文全体の上限。0 = max_body_size（multipart_max_file_size の方が大きければそちら）
+static MAX_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static MAX_HEADER: AtomicUsize = AtomicUsize::new(8 * 1024);
 static SPOOL_THRESHOLD: AtomicUsize = AtomicUsize::new(1024 * 1024);
 static TMP_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
@@ -41,6 +43,7 @@ pub(crate) fn apply_settings(s: &super::app::ApiSettings) {
     MAX_PARTS.store(s.multipart_max_parts.max(1), Ordering::Relaxed);
     MAX_FIELD.store(s.multipart_max_field_size.max(1), Ordering::Relaxed);
     MAX_FILE.store(s.multipart_max_file_size, Ordering::Relaxed);
+    MAX_TOTAL.store(s.multipart_max_total_size, Ordering::Relaxed);
     MAX_HEADER.store(s.multipart_max_header_size.max(256), Ordering::Relaxed);
     SPOOL_THRESHOLD.store(s.multipart_spool_threshold, Ordering::Relaxed);
     *TMP_DIR.write().unwrap() = s.upload_tmp_dir.as_ref().map(PathBuf::from);
@@ -69,6 +72,8 @@ pub struct Limits {
     pub max_field_size: usize,
     /// Maximum size of a file part.
     pub max_file_size: usize,
+    /// Maximum size of the whole body (preamble, part headers and data).
+    pub max_total_size: usize,
     /// Maximum size of the headers of one part.
     pub max_header_size: usize,
 }
@@ -76,14 +81,21 @@ pub struct Limits {
 impl Limits {
     /// The limits of `[api]`.
     pub fn current() -> Limits {
+        let body = super::app::max_body_size();
         let file = match MAX_FILE.load(Ordering::Relaxed) {
-            0 => super::app::max_body_size(),
+            0 => body,
+            n => n,
+        };
+        // 0 = max_body_size。ファイルの上限を明示的に上げた設定では 1 ファイル分は受けられるようにする
+        let total = match MAX_TOTAL.load(Ordering::Relaxed) {
+            0 => body.max(file),
             n => n,
         };
         Limits {
             max_parts: MAX_PARTS.load(Ordering::Relaxed),
             max_field_size: MAX_FIELD.load(Ordering::Relaxed),
             max_file_size: file,
+            max_total_size: total,
             max_header_size: MAX_HEADER.load(Ordering::Relaxed),
         }
     }
@@ -94,6 +106,7 @@ impl Limits {
             max_parts: usize::MAX,
             max_field_size: usize::MAX,
             max_file_size: usize::MAX,
+            max_total_size: usize::MAX,
             max_header_size: 64 * 1024,
         }
     }
@@ -367,6 +380,8 @@ struct Core {
     part_limit: usize,
     /// Preamble bytes discarded so far (bounded like headers).
     skipped: usize,
+    /// Bytes fed so far (bounded by `max_total_size`).
+    total: usize,
 }
 
 impl Core {
@@ -386,11 +401,15 @@ impl Core {
             part_len: 0,
             part_limit: 0,
             skipped: 0,
+            total: 0,
         }
     }
 
     /// Adds input (`None` = the end of the body).
     fn feed(&mut self, data: Option<Bytes>) {
+        if let Some(d) = &data {
+            self.total = self.total.saturating_add(d.len());
+        }
         match data {
             None => self.eof = true,
             Some(d) if self.cur.is_empty() => self.cur = d,
@@ -412,8 +431,17 @@ impl Core {
         }
     }
 
+    /// The whole body exceeded `max_total_size` (checked before parsing what was fed).
+    fn check_total(&self) -> Result<(), MultipartError> {
+        if self.total > self.limits.max_total_size {
+            return Err(MultipartError::too_large("multipart body is too large"));
+        }
+        Ok(())
+    }
+
     /// Moves to the headers of the next part (skipping the rest of the current one). `None` at the end.
     fn next_part(&mut self) -> Result<Step<Option<PartInfo>>, MultipartError> {
+        self.check_total()?;
         loop {
             match self.state {
                 State::Done => return Ok(Step::Ready(None)),
@@ -539,6 +567,7 @@ impl Core {
 
     /// The next piece of the current part's data (`None` when the part ended).
     fn next_chunk(&mut self) -> Result<Step<Option<Bytes>>, MultipartError> {
+        self.check_total()?;
         loop {
             match self.state {
                 State::Data => {}
@@ -1399,13 +1428,21 @@ mod tests {
 
     /// Streams `b` in pieces of `n` bytes and returns the parts.
     fn streamed(b: &[u8], n: usize) -> Result<Vec<(PartInfo, Vec<u8>)>, MultipartError> {
+        streamed_with(b, n, Limits::unlimited())
+    }
+
+    fn streamed_with(
+        b: &[u8],
+        n: usize,
+        limits: Limits,
+    ) -> Result<Vec<(PartInfo, Vec<u8>)>, MultipartError> {
         let (mut tx, slot) = crate::api::stream::request_body_channel(b.len() / n + 2);
         for c in b.chunks(n) {
             tx.try_send(Bytes::copy_from_slice(c)).unwrap();
         }
         drop(tx);
         let s = slot.lock().unwrap().take().unwrap();
-        let mut mp = Multipart::new(s, B, Limits::unlimited());
+        let mut mp = Multipart::new(s, B, limits);
         futures::executor::block_on(async {
             let mut out = Vec::new();
             while let Some(mut f) = mp.next_part().await? {
@@ -1514,6 +1551,32 @@ mod tests {
             "n".repeat(400)
         );
         assert_eq!(all(big.as_bytes(), l).unwrap_err().status(), 413);
+    }
+
+    // B-195: パートごとの上限の内側でも、本文全体が max_total_size を超えたら 413
+    #[test]
+    fn total_size_limit_gives_413() {
+        let parts: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| (format!("f{i}"), vec![b'x'; 1000]))
+            .collect();
+        let refs: Vec<(&str, Option<&str>, &[u8])> = parts
+            .iter()
+            .map(|(n, d)| (n.as_str(), Some("a.bin"), d.as_slice()))
+            .collect();
+        let raw = body(&refs);
+        let mut l = Limits::unlimited();
+        l.max_file_size = 1000;
+        l.max_total_size = raw.len();
+        assert!(all(&raw, l).is_ok());
+        assert_eq!(streamed_with(&raw, 777, l).unwrap().len(), 20);
+        l.max_total_size = raw.len() - 1;
+        assert_eq!(all(&raw, l).unwrap_err().status(), 413);
+        let e = streamed_with(&raw, 777, l).unwrap_err();
+        assert_eq!(e.status(), 413);
+        assert_eq!(e.message(), "multipart body is too large");
+        // 小さい本文でも途中で止まる（全部を読む前に失敗する）
+        l.max_total_size = 5000;
+        assert_eq!(streamed_with(&raw, 512, l).unwrap_err().status(), 413);
     }
 
     #[test]

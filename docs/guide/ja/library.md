@@ -265,6 +265,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `multipart_max_parts` | `100` | `multipart/form-data` の本文のパート数の上限（超えたら 413） |
 | `multipart_max_field_size` | `1048576` | ファイルでないパートの大きさの上限 |
 | `multipart_max_file_size` | `0` | ファイルのパートの大きさの上限（`0` = `max_body_size`） |
+| `multipart_max_total_size` | `0` | `multipart/form-data` の本文全体の上限。ストリーミングのルートにも効く（`0` = `max_body_size`。`multipart_max_file_size` の方が大きければそちら） |
 | `multipart_max_header_size` | `8192` | 1 パートのヘッダの大きさの上限 |
 | `multipart_spool_threshold` | `1048576` | Python の `UploadFile`・C の `VEIL_ROUTE_FORM`: これより大きいファイルはメモリでなく一時ファイルに書く |
 | `upload_tmp_dir` | OS の一時ディレクトリ | アップロードの名前の無い一時ファイルを置くディレクトリ（Landlock・unveil の書き込み許可に足す） |
@@ -522,7 +523,7 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
 - `MultipartForm<T>` はファイル以外のフィールドを `Form<T>` と同じ規則で `T` にします（`T` が `Schema` を derive していれば検証も）。
   `Form<T>` も multipart の本文を受け、ファイルは無視します。ファイルが無ければ `loc = ["body", 名前]` の 422、本文が壊れていれば 400、
   `[api] multipart_*` の上限を超えたら 413（`{"detail": "..."}`）です。
-- `Multipart` は溜める抽出子と併用できません。ストリーミングのルートは `max_body_size` の制限を受けず（パートごとの上限が効く）、
+- `Multipart` は溜める抽出子と併用できません。ストリーミングのルートは `max_body_size` の制限を受けず（multipart の本文にはパートごとの上限と本文全体の上限 `multipart_max_total_size` が効く）、
   HTTP/1.1（`Content-Length` のある本文。chunked は溜める）・HTTP/2・HTTP/3 で同じです。名前の無いファイル（Linux は `O_TMPFILE`、
   他は作ってすぐ消す、Windows は閉じたら消す）への書き込みは offload のプールで行い、閉じると消えます。
 - OpenAPI は本文を `multipart/form-data`、ファイルを `{"type": "string", "format": "binary"}` で書くので、Swagger UI でファイルを選べます。

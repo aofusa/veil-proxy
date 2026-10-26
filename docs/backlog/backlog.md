@@ -516,6 +516,7 @@
 | B-191 | P3 | 修正済み（v0.10.0） | [bugs/B-191-kqueue-watch-fd-budget-ignores-connections.md](bugs/B-191-kqueue-watch-fd-budget-ignores-connections.md) | kqueue（BSD・macOS）の静的配信の監視が RLIMIT_NOFILE の 1/4 まで fd を握り、接続の受理が max_concurrent_connections の前に EMFILE で失敗する。接続の分を残した予算にして起動時に出す |
 | B-192 | P3 | 修正済み（v0.10.0） | [bugs/B-192-fswatch-thread-outside-sandbox.md](bugs/B-192-fswatch-thread-outside-sandbox.md) | 起動時の設定で作られた静的配信の監視スレッド（veil-fswatch）が seccomp・Landlock の外で動く（スレッド単位で掛けるため）。監視スレッドをサンドボックスの後に作る |
 | B-193 | P3 | 修正済み（v0.10.0） | [bugs/B-193-inotify-moved-directory-stale-path.md](bugs/B-193-inotify-moved-directory-stale-path.md) | inotify: ルートの中でディレクトリを移すと監視が古いパスのまま残り、移った先に作ったディレクトリの変更を追えない。移動でルートの監視を付け直す |
+| B-195 | P2 | 修正済み（v0.10.0） | [bugs/B-195-multipart-total-size-unbounded.md](bugs/B-195-multipart-total-size-unbounded.md) | ストリーミング受信の multipart に本文全体の上限が無い |
 
 ---
 

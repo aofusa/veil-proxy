@@ -186,7 +186,8 @@ veil_register_route_ex(cfg, "/upload", "POST", upload, NULL, VEIL_ROUTE_FORM, NU
 NULL）・`content_type` と、中身の `data`/`data_len` か一時ファイルの `fd`（Windows は HANDLE。メモリなら -1）・`size` を持ちます。
 `VEIL_ROUTE_FORM` を付けたルートは本文をコールバックの前に読み、`[api] multipart_spool_threshold` を超えるファイルを `[api] upload_tmp_dir`
 の名前の無い一時ファイルに書きます（壊れた本文の 400・上限超えの 413 はコールバックの前に返す）。付けないルートは溜めた本文
-（`[api] max_body_size` まで）を解析します。上限は `[api] multipart_*`（`veil_config_set(cfg, "api.multipart_max_file_size", "209715200")`）。
+（`[api] max_body_size` まで）を解析します。上限は `[api] multipart_*`（`veil_config_set(cfg, "api.multipart_max_file_size", "209715200")`）。本文全体は
+`multipart_max_total_size`（既定 = `max_body_size`。`multipart_max_file_size` の方が大きければそちら）までです。
 
 ### 応答の圧縮（F-270）
 

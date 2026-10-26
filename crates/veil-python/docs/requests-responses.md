@@ -143,7 +143,9 @@ def login(user: str = Form(), remember: bool = Form(False)):
 
 - The form is read **before** the handler runs. Text fields and files up to `[api] multipart_spool_threshold`
   (1 MiB) stay in memory; larger files are written by Rust to an anonymous temporary file in `[api] upload_tmp_dir`
-  and `UploadFile.file` reads it, so a 1 GB upload does not grow the process. The temporary file disappears when it
+  and `UploadFile.file` reads it, so a 1 GB upload does not grow the process. The whole body is limited by
+  `[api] multipart_max_total_size` (by default `max_body_size`, 10 MiB, or `multipart_max_file_size` when that is
+  larger); raise both for large uploads. The temporary file disappears when it
   is closed (`await upload.close()`, or when the object is collected).
 - `UploadFile` has `filename`, `content_type`, `headers` (a dict, lower-case names), `size`, `file` (a binary file
   object positioned at the start), `async` `read(size=-1)` / `write` / `seek` / `close`, and `read_bytes()` for

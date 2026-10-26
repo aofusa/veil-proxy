@@ -2796,6 +2796,7 @@ watch = false
 # multipart_max_parts = 100               # multipart/form-data のパート数の上限（超えたら 413。F-266）
 # multipart_max_field_size = 1048576      # ファイルでないパートの大きさの上限
 # multipart_max_file_size = 0             # ファイルのパートの大きさの上限（0 = max_body_size）
+# multipart_max_total_size = 0            # 本文全体の上限。ストリーミングのルートにも効く（0 = max_body_size、multipart_max_file_size の方が大きければそちら。B-195）
 # multipart_max_header_size = 8192        # 1 パートのヘッダの大きさの上限
 # multipart_spool_threshold = 1048576     # Python の UploadFile・C の VEIL_ROUTE_FORM: これを超えるファイルは一時ファイルへ
 # upload_tmp_dir = "/var/tmp/veil"        # アップロードの名前の無い一時ファイルの置き場（既定は OS の一時ディレクトリ）
