@@ -510,6 +510,7 @@
 | B-185 | P2 | 修正済み（v0.10.0） | [bugs/B-185-rejected-reload-applies-static-cache-globals.md](bugs/B-185-rejected-reload-applies-static-cache-globals.md) | リロードがルートの解決（CORS・JWT の設定ミス）で拒否されても、open_file_cache・static_file_cache のグローバル設定だけ新しい値になる（F-272 でルートより前に適用していた）。監視の既定値は引数で渡し、グローバルはルートの解決の後で書く |
 | B-186 | P2 | 修正済み（v0.10.0） | [bugs/B-186-pipelined-request-lost-after-body.md](bugs/B-186-pipelined-request-lost-after-body.md) | HTTP/1.1 で本文の末尾と次の要求が同じセグメントで届くと、本文を読む経路（ストリーミング受信のハンドラ・Proxy-Wasm の要求本文の段・ローカル応答の後の読み捨て等）が次の要求を捨て、keep-alive の接続が止まる。読み過ぎた分を次の要求として返す |
 | B-187 | P2 | 修正済み（v0.10.0） | [bugs/B-187-streaming-request-body-truncation-looks-complete.md](bugs/B-187-streaming-request-body-truncation-looks-complete.md) | ストリーミング受信のハンドラに、切断・リセット・時間切れで途中で切れた本文が正常な終わりとして届く。`RequestBodyStream::is_aborted()` を足し、HTTP/1.1・HTTP/2・HTTP/3 で切れた終わりを伝える（gRPC は CANCELLED、`prepare_form` は 400） |
+| B-188 | P3 | 修正済み（v0.10.0） | [bugs/B-188-wasm-local-response-head-body.md](bugs/B-188-wasm-local-response-head-body.md) | Proxy-Wasm のローカル応答が HEAD・204・304 にも本文を付け、keep-alive の HTTP/1.1 の接続で次の応答がずれる（F-271 で接続を続けるようにして表面化） |
 
 ---
 

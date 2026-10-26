@@ -941,7 +941,10 @@ pub(super) async fn handle_requests(
                                     // ローカルレスポンスを返送。F-271: 本文を読み切れたら接続を続ける
                                     // （以前は毎回閉じていた）
                                     let start_instant = Instant::now();
-                                    let response = wasm_local_response_h1(&resp);
+                                    let response = wasm_local_response_h1(
+                                        &resp,
+                                        method_bytes.as_ref() == b"HEAD",
+                                    );
                                     let resp_size = response.len() as u64;
                                     let write_result =
                                         timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
@@ -1083,7 +1086,10 @@ pub(super) async fn handle_requests(
                                         resp,
                                     ) => {
                                         let start_instant = Instant::now();
-                                        let response = wasm_local_response_h1(&resp);
+                                        let response = wasm_local_response_h1(
+                                            &resp,
+                                            method_bytes.as_ref() == b"HEAD",
+                                        );
                                         let resp_size = response.len() as u64;
                                         let write_result =
                                             timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
@@ -2010,10 +2016,18 @@ async fn pump_api_body(
     true
 }
 
-/// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答にする（Content-Length が無ければ補う。F-62）
+/// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答にする（Content-Length が無ければ補う。F-62）。
+///
+/// B-188: HEAD の要求への応答と、本文を持たないステータス（1xx・204・304）では本文を書かない（接続を続けるので、
+/// 書くとクライアントは残りを次の応答の先頭として読む）。HEAD は Content-Length を本文の長さのまま付ける
+/// （GET と同じヘッダ）。1xx・204・304 は補わない。
 #[cfg(feature = "wasm")]
-fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse) -> Vec<u8> {
-    let mut response = Vec::with_capacity(64 + resp.body.len() + resp.headers.len() * 32);
+fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bool) -> Vec<u8> {
+    let no_body_status = matches!(resp.status_code, 100..=199 | 204 | 304);
+    let write_body = !head && !no_body_status;
+    let mut response = Vec::with_capacity(
+        64 + if write_body { resp.body.len() } else { 0 } + resp.headers.len() * 32,
+    );
     let _ = std::io::Write::write_fmt(
         &mut response,
         format_args!(
@@ -2030,10 +2044,11 @@ fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse) -> Vec<u8> {
     }
     // F-62: モジュールが Content-Length を設定していない場合は補完する（欠落するとクライアントは接続
     // クローズまでボディを待ち続け、TLS では close_notify 無しの EOF エラーになる）
-    if !resp
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"))
+    if !no_body_status
+        && !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"))
     {
         let _ = std::io::Write::write_fmt(
             &mut response,
@@ -2041,7 +2056,9 @@ fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse) -> Vec<u8> {
         );
     }
     response.extend_from_slice(b"\r\n");
-    response.extend_from_slice(&resp.body);
+    if write_body {
+        response.extend_from_slice(&resp.body);
+    }
     response
 }
 
@@ -2446,5 +2463,32 @@ mod b186_overflow_tests {
             assert!(rx.is_aborted());
             drop(c);
         });
+    }
+}
+
+#[cfg(all(test, feature = "wasm"))]
+mod b188_wasm_local_response_tests {
+    use super::*;
+
+    fn resp(status: u16) -> crate::wasm::LocalResponse {
+        crate::wasm::LocalResponse {
+            status_code: status,
+            headers: vec![(b"x-a".to_vec(), b"1".to_vec())],
+            body: b"hello".to_vec(),
+        }
+    }
+
+    #[test]
+    fn head_and_bodyless_statuses_have_no_body() {
+        let get = String::from_utf8(wasm_local_response_h1(&resp(200), false)).unwrap();
+        assert!(get.ends_with("Content-Length: 5\r\n\r\nhello"), "{get}");
+        // HEAD: GET と同じヘッダで本文なし
+        let head = String::from_utf8(wasm_local_response_h1(&resp(200), true)).unwrap();
+        assert!(head.ends_with("Content-Length: 5\r\n\r\n"), "{head}");
+        for st in [204, 304, 103] {
+            let r = String::from_utf8(wasm_local_response_h1(&resp(st), false)).unwrap();
+            assert!(r.ends_with("x-a: 1\r\n\r\n"), "{st}: {r}");
+            assert!(!r.contains("Content-Length"), "{st}: {r}");
+        }
     }
 }

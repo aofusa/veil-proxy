@@ -3368,3 +3368,21 @@ fn b186_wasm_paths_keep_pipelined_request_after_body() {
         assert_eq!((r2.status, r2.text()), (200, "7".into()), "{name}");
     }
 }
+
+/// B-188: HEAD の要求へのフィルタのローカル応答に本文を書かない（接続を続けるので、書くと次の応答がずれる）
+#[cfg(feature = "wasm")]
+#[test]
+fn b188_wasm_local_response_to_head_has_no_body() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"HEAD /baseline11?a=12345 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /baseline11?a=7 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut buf = Vec::new();
+    let r1 = read_one_response(&mut s, &mut buf, true).expect("HEAD response");
+    assert_eq!(r1.status, 200, "{}", veil.log());
+    assert_eq!(r1.header("content-length"), Some("5"), "{:?}", r1.headers);
+    let r2 = read_one_response(&mut s, &mut buf, false).expect("GET response");
+    assert_eq!((r2.status, r2.text()), (200, "7".into()), "{}", veil.log());
+}

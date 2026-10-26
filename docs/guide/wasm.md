@@ -150,7 +150,8 @@ and headers as well. If the module replaces the body, veil sends the new body up
 keep streaming the body upstream as before.
 
 On HTTP/1.1 the connection stays open after a filter's local response (`send_local_response`), and a request that
-was pipelined behind the body is served next.
+was pipelined behind the body is served next. The body of a local response is not sent for `HEAD` (the
+`Content-Length` stays the body's length) or for `1xx`, `204` and `304`.
 
 ### Reusing the VM Context (`instance_reuse`)
 
