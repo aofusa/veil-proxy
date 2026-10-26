@@ -1198,8 +1198,33 @@ pub trait WsSession: Send {
     /// A text or binary message.
     fn on_message(&mut self, msg: Message);
     /// The connection closed (`code` is the peer's close code: 1005 without a code, 1006 if it left without a
-    /// Close frame, or the code veil closed with after a protocol error).
+    /// Close frame, or the code veil closed with after a protocol error; 1001 when the server stopped and dropped
+    /// the connection). Called exactly once after `connect` returned a session.
     fn on_close(&mut self, _code: u16) {}
+}
+
+type SharedSession = Arc<Mutex<Box<dyn WsSession>>>;
+
+// B-206: 接続のタスクが途中で捨てられても（停止時に残ったタスクの破棄等）on_close を 1 回呼ぶ。
+// ワーカーの上でブロッキングなコールバックを呼ばないよう、ハンドラ用プールへ投げる（待たない）。
+/// Calls `on_close(1001)` on the handler pool if the connection's task is dropped before it did.
+struct CloseOnDrop(Option<SharedSession>);
+
+impl CloseOnDrop {
+    /// The session, for the normal `on_close` (the guard then does nothing).
+    fn take(&mut self) -> Option<SharedSession> {
+        self.0.take()
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            crate::runtime::offload::spawn_handler(move || {
+                s.lock().unwrap_or_else(|e| e.into_inner()).on_close(1001)
+            });
+        }
+    }
 }
 
 impl WebSocketUpgrade {
@@ -1212,11 +1237,12 @@ impl WebSocketUpgrade {
     {
         self.on_upgrade(move |ws: WebSocket| async move {
             let (tx, mut rx) = ws.split();
-            let session = match crate::runtime::offload::offload_handler(move || connect(tx)).await
-            {
-                Some(Some(s)) => Arc::new(Mutex::new(s)),
-                _ => return,
-            };
+            let session: SharedSession =
+                match crate::runtime::offload::offload_handler(move || connect(tx)).await {
+                    Some(Some(s)) => Arc::new(Mutex::new(s)),
+                    _ => return,
+                };
+            let mut guard = CloseOnDrop(Some(session.clone()));
             let mut code = 1006;
             while let Some(r) = rx.recv().await {
                 match r {
@@ -1245,13 +1271,16 @@ impl WebSocketUpgrade {
                     Err(_) => break,
                 }
             }
-            let _ = crate::runtime::offload::offload_handler(move || {
-                session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .on_close(code)
-            })
-            .await;
+            drop(session);
+            if let Some(session) = guard.take() {
+                let _ = crate::runtime::offload::offload_handler(move || {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_close(code)
+                })
+                .await;
+            }
         })
     }
 }
@@ -1291,6 +1320,28 @@ pub(crate) fn fuzz_decode(data: &[u8]) {
 mod tests {
     use super::*;
     use crate::api::extract::FromRequest;
+
+    // B-206: 接続のタスクが途中で捨てられても on_close(1001) をハンドラ用プールで 1 回呼ぶ
+    #[test]
+    fn dropped_blocking_session_gets_on_close() {
+        struct S(std::sync::mpsc::Sender<u16>);
+        impl WsSession for S {
+            fn on_message(&mut self, _m: Message) {}
+            fn on_close(&mut self, code: u16) {
+                let _ = self.0.send(code);
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s: SharedSession = Arc::new(Mutex::new(Box::new(S(tx))));
+        drop(CloseOnDrop(Some(s.clone())));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(1001));
+        // 通常の経路（take した後）は何もしない
+        let mut g = CloseOnDrop(Some(s));
+        let taken = g.take();
+        drop(g);
+        assert!(taken.is_some());
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
 
     // B-197: 16 MiB を宣言したフレームでも、届いた量の倍までしか確保しない
     #[test]

@@ -304,7 +304,7 @@ typedef struct veil_ws veil_ws_t;
 typedef struct {
     int (*on_open)(veil_ws_t *ws, void *user_data);                                          /* 非 0 で閉じる (on_close は呼ばれない) */
     int (*on_message)(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len, void *user_data); /* 非 0 で閉じる (1000) */
-    void (*on_close)(veil_ws_t *ws, uint16_t code, void *user_data); /* 相手の Close のコード (無ければ 1005、切断は 1006) */
+    void (*on_close)(veil_ws_t *ws, uint16_t code, void *user_data); /* 相手の Close のコード (無ければ 1005、切断は 1006、停止は 1001)。on_open が 0 なら必ず 1 回呼ばれる */
 } veil_ws_callbacks_t;
 /* 0 = 受け入れた (resp は 101)。VEIL_ERR_STATE = ハンドシェイクが正しくない (resp は 400 か 426。そのまま返してよい)。 */
 int veil_ws_accept(const veil_request_t *req, veil_response_t *resp, const veil_ws_callbacks_t *callbacks,

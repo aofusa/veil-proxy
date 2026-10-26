@@ -952,6 +952,29 @@ struct CWsSession {
     cb: veil_ws_callbacks_t,
     ud: UserData,
     ws: Box<veil_ws_t>,
+    /// `on_close` を呼んだ（B-206: 呼ばずに `veil_ws_t` を解放しない）
+    closed: bool,
+}
+
+impl CWsSession {
+    fn call_on_close(&mut self, code: u16) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        if let Some(f) = self.cb.on_close {
+            let ud = self.ud.get();
+            let ws = &*self.ws as *const veil_ws_t as *mut veil_ws_t;
+            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { f(ws, code, ud) }));
+        }
+    }
+}
+
+// B-206: on_close が呼ばれないまま捨てられる経路（停止時のタスクの破棄でプールが受けなかった等）の最後の守り。
+// 「veil_ws_t は on_close が戻るまで有効」の契約を守る（他のスレッドの veil_ws_send が解放後を触らない）。
+impl Drop for CWsSession {
+    fn drop(&mut self) {
+        self.call_on_close(1001);
+    }
 }
 
 // SAFETY: ws.data は C の利用者の値で、同じ接続のコールバックは 1 つずつ順に呼ばれる（並行しない）。
@@ -982,11 +1005,7 @@ impl veil::api::ws::WsSession for CWsSession {
     }
 
     fn on_close(&mut self, code: u16) {
-        if let Some(f) = self.cb.on_close {
-            let ud = self.ud.get();
-            let ws = &*self.ws as *const veil_ws_t as *mut veil_ws_t;
-            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { f(ws, code, ud) }));
-        }
+        self.call_on_close(code);
     }
 }
 
@@ -1031,11 +1050,15 @@ pub unsafe extern "C" fn veil_ws_accept(
                 peer,
                 data: std::sync::atomic::AtomicPtr::new(ptr::null_mut()),
             }),
+            closed: false,
         };
         if let Some(f) = cb.on_open {
             let ws = &*s.ws as *const veil_ws_t as *mut veil_ws_t;
             let rc = catch_unwind(AssertUnwindSafe(|| unsafe { f(ws, ud.get()) }));
             if !matches!(rc, Ok(0)) {
+                // on_open で断った接続は on_close を呼ばない（従来どおり。Drop の守りも外す）
+                let mut s = s;
+                s.closed = true;
                 return None;
             }
         }

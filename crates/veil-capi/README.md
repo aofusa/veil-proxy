@@ -159,7 +159,8 @@ static int ws(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 `veil_ws_accept` はハンドシェイクを検査して応答を 101（`Sec-WebSocket-Accept` 付き）にし、その後のメッセージを
 `on_open` → `on_message`（`VEIL_WS_TEXT`・`VEIL_WS_BINARY`。テキストは UTF-8 検査済み、断片は組み立て済み）… → `on_close`
-（相手の Close のコード。無ければ 1005、切断は 1006）で渡します。コールバックはハンドラ用プールで接続ごとに 1 つずつ順に呼ばれ、
+（相手の Close のコード。無ければ 1005、切断は 1006、サーバの停止で接続を捨てたときは 1001）で渡します。`on_open` が
+0 を返した接続では `on_close` が必ず 1 回呼ばれます（停止中でも。B-206）。コールバックはハンドラ用プールで接続ごとに 1 つずつ順に呼ばれ、
 非 0 を返すと 1000 で閉じます。`veil_ws_send`（コピーして送信キューに積む。キューは 16 MiB まで）・`veil_ws_close` は
 `on_open` から `on_close` が戻るまでの間ならどのスレッドからでも呼べます。Ping・閉じる手順・プロトコル違反（1002・1007・1009）は
 veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）。接続ごとのデータは `veil_ws_set_data` / `veil_ws_data`、
