@@ -511,9 +511,7 @@ impl H3BufferedTask {
         request_body: &Bytes,
     ) -> io::Result<()> {
         #[cfg(feature = "wasm")]
-        let mut wasm_modules_to_apply: Option<
-            crate::wasm_plugin_config::WasmModules,
-        > = None;
+        let mut wasm_modules_to_apply: Option<crate::wasm_plugin_config::WasmModules> = None;
 
         let result = self
             .handle_request_impl(
@@ -1272,9 +1270,7 @@ impl H3BufferedTask {
         prefix: &[u8],
         headers: &[h3::Header],
         request_body: &Bytes,
-        #[cfg(feature = "wasm")] wasm_modules: Option<
-            &crate::wasm_plugin_config::WasmModules,
-        >,
+        #[cfg(feature = "wasm")] wasm_modules: Option<&crate::wasm_plugin_config::WasmModules>,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
         // サーバー選択（F-97: Consistent Hash header/cookie キー対応）

@@ -467,7 +467,9 @@ mod tests {
         }
         assert!(get_property_value(&st, "plugin_data.missing").is_none());
         // 許可の無いプロパティは読めない
-        assert!(get_property_value(&state_with(&["request.path"]), "plugin_data.dataset").is_none());
+        assert!(
+            get_property_value(&state_with(&["request.path"]), "plugin_data.dataset").is_none()
+        );
     }
 
     /// B-178: 確保しない版のパスの解析は従来の [`parse_path`] と同じ結果になる

@@ -891,10 +891,10 @@ pub(super) async fn handle_requests(
                 // B-177: 要求ごとの Wasm の状態（instance_reuse のモジュールは要求の間同じ context を使う）
                 let modules_to_apply: crate::wasm_plugin_config::WasmModules =
                     if let Some(backend_modules) = backend.modules_arc() {
-                    crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
-                } else {
-                    crate::wasm::empty_wasm_modules()
-                };
+                        crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
+                    } else {
+                        crate::wasm::empty_wasm_modules()
+                    };
 
                 #[cfg(feature = "wasm")]
                 let headers_for_proxy = {

@@ -540,7 +540,10 @@ mod f132_h3_lifecycle_tests {
                 true,
                 None,
             ));
-            futures::executor::block_on(on_request_complete_async(engine.clone(), crate::wasm_plugin_config::WasmModules::shared(modules.clone())));
+            futures::executor::block_on(on_request_complete_async(
+                engine.clone(),
+                crate::wasm_plugin_config::WasmModules::shared(modules.clone()),
+            ));
         }
 
         let after = crate::wasm::get_context_stats().total_contexts;
@@ -575,8 +578,12 @@ mod f132_h3_lifecycle_tests {
             WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
         }
 
-        let resp_result =
-            futures::executor::block_on(apply_wasm_response_body(&engine, &crate::wasm_plugin_config::WasmModules::default(), body.clone(), true));
+        let resp_result = futures::executor::block_on(apply_wasm_response_body(
+            &engine,
+            &crate::wasm_plugin_config::WasmModules::default(),
+            body.clone(),
+            true,
+        ));
         match resp_result {
             WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
             WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
@@ -1846,7 +1853,12 @@ mod instance_reuse_tests {
             sessions,
         )) {
             BodyFilterResult::LocalResponse(r) => {
-                let v = &r.headers.iter().find(|(k, _)| k == b"x-instance-seq").unwrap().1;
+                let v = &r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == b"x-instance-seq")
+                    .unwrap()
+                    .1;
                 std::str::from_utf8(v).unwrap().parse().unwrap()
             }
             _ => panic!("expected a local response"),

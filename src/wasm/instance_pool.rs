@@ -247,7 +247,11 @@ pub(crate) struct SessionEntry {
 }
 
 impl RequestSessions {
-    pub(crate) fn find(&self, module: usize, configuration: &Arc<[u8]>) -> Option<(Rc<InstanceSlot>, i32)> {
+    pub(crate) fn find(
+        &self,
+        module: usize,
+        configuration: &Arc<[u8]>,
+    ) -> Option<(Rc<InstanceSlot>, i32)> {
         self.entries
             .borrow()
             .iter()

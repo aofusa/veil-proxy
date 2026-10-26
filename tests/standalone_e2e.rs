@@ -3204,7 +3204,7 @@ body = "plain"
     }
 }
 
-// ===================== B-186・B-188・B-189（Proxy-Wasm の HTTP/1.1 の接続の継続） ==============
+// ===================== B-186・B-188・B-189（Proxy-Wasm の HTTP/1.1 の接続の継続） =====================
 
 /// baseline-filter（F-271）のルートを平文の HTTP/1.1 で待ち受ける veil を起動する（`/rewrite` の上流は本文のエコー）
 #[cfg(feature = "wasm")]
@@ -3438,23 +3438,6 @@ fn b192_fswatch_thread_runs_under_seccomp() {
     let port = free_port();
     let config = format!(
         r#"
-=======
-/// B-181: fd の上限（EMFILE）で accept が失敗し続けても、ワーカーは空回りせずに他の接続を進め、
-/// 接続が閉じて fd が空いたら受理を再開する（以前は reactor で accept のループが Pending を返さず、
-/// 閉じられた接続も片付かないまま固まった）。
-#[cfg(unix)]
-#[test]
-fn b181_accept_recovers_after_running_out_of_file_descriptors() {
-    let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let www = dir.path().join("www");
-    std::fs::create_dir_all(&www).unwrap();
-    std::fs::write(www.join("index.html"), "plain").unwrap();
-    let cfg_path = dir.path().join("config.toml");
-    std::fs::write(
-        &cfg_path,
-        format!(
-            r#"
 [server]
 listen_cleartext = "127.0.0.1:{port}"
 enable_secure_redirect = false
@@ -3471,10 +3454,6 @@ watch = true
 [[route]]
 [route.conditions]
 path = "/*"
-
-[[route]]
-[route.conditions]
-path = "/"
 [route.action]
 type = "File"
 path = "{www}"
@@ -3529,7 +3508,37 @@ path = "{www}"
         "veil-fswatch runs outside the seccomp filter: {:?}",
         threads()
     );
+}
 
+/// B-181: fd の上限（EMFILE）で accept が失敗し続けても、ワーカーは空回りせずに他の接続を進め、
+/// 接続が閉じて fd が空いたら受理を再開する（以前は reactor で accept のループが Pending を返さず、
+/// 閉じられた接続も片付かないまま固まった）。
+#[cfg(unix)]
+#[test]
+fn b181_accept_recovers_after_running_out_of_file_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "plain").unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
             www = tp(&www)
         ),
     )

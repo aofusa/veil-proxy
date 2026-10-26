@@ -40,7 +40,6 @@ fn resolve_effective_modules(
         .collect()
 }
 
-
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
     /// Module registry
@@ -82,7 +81,11 @@ impl FilterEngine {
         // The ticker thread (registry::spawn_epoch_ticker) increments the epoch every 100ms, so deadline=10
         // allows about 1s. Fuel consumption is the primary timeout mechanism for CPU-bound limits.
         let epoch_deadline = 10;
-        let fuel_yield_interval = config.defaults.yield_interval_us.max(1).saturating_mul(1_000);
+        let fuel_yield_interval = config
+            .defaults
+            .yield_interval_us
+            .max(1)
+            .saturating_mul(1_000);
 
         Ok(Self {
             registry,
@@ -288,7 +291,9 @@ impl FilterEngine {
         if module.instance_reuse {
             let module_key = module as *const LoadedModule as usize;
             // 同じ要求の前のフェーズの context
-            if let Some((slot, context_id)) = sessions.and_then(|r| r.find(module_key, configuration)) {
+            if let Some((slot, context_id)) =
+                sessions.and_then(|r| r.find(module_key, configuration))
+            {
                 match slot.acquire().await {
                     Some(p) => {
                         let mut sess = Session::pooled(p, slot, context_id, true, http_ctx);

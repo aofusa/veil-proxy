@@ -48,6 +48,7 @@ pub use grpc_integration::{
 };
 #[cfg(feature = "grpc")]
 pub use grpc_integration::{process_grpc_response, status as grpc_status, GrpcCallResponse};
+pub use instance_pool::RequestSessions;
 pub use integration::{
     empty_wasm_modules, on_context_destroy, on_http_call_complete, on_queue_ready,
     on_request_complete, on_request_complete_async, on_tick, process_pending_http_calls,
@@ -76,7 +77,6 @@ pub use queue_notify::{
     get_queue_stats, notify_queue_subscribers, process_pending_notifications, queue_enqueued,
     subscribe_to_queue, unsubscribe_from_queue, QueueStats,
 };
-pub use instance_pool::RequestSessions;
 pub use registry::ModuleRegistry;
 pub use tick_manager::{
     get_min_tick_period, get_tick_stats, process_ticks, register_tick, TickStats,
