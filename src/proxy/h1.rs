@@ -1716,6 +1716,7 @@ pub(super) async fn handle_api_handler(
             tls_stream,
             entry,
             comp,
+            security,
             method,
             req_path,
             content_length,
@@ -1763,7 +1764,7 @@ pub(super) async fn handle_api_handler(
         crate::api::request::HttpVersion::Http11,
     );
     let resp = crate::api::dispatch::call_with(entry, req, api_cache, comp).await;
-    write_api_response(tls_stream, resp, client_wants_close, api_cache).await
+    write_api_response(tls_stream, resp, security, client_wants_close, api_cache).await
 }
 
 /// ハンドラの応答を HTTP/1.1 で書く（`handle_api_handler` とストリーミング受信の経路で共通）。
@@ -1771,6 +1772,7 @@ pub(super) async fn handle_api_handler(
 async fn write_api_response(
     mut tls_stream: ServerTls,
     mut resp: crate::api::response::Response,
+    security: &SecurityConfig,
     client_wants_close: bool,
     api_cache: &mut crate::api::dispatch::CallCache,
 ) -> Option<(ServerTls, u16, u64, bool)> {
@@ -1828,6 +1830,7 @@ async fn handle_api_streaming(
     mut tls_stream: ServerTls,
     entry: &crate::api::handler::HandlerEntry,
     comp: Option<&crate::config::CompressionConfig>,
+    security: &SecurityConfig,
     method: &Bytes,
     req_path: &Bytes,
     content_length: usize,
@@ -1919,6 +1922,7 @@ async fn handle_api_streaming(
     write_api_response(
         tls_stream,
         resp,
+        security,
         client_wants_close || !body_done,
         api_cache,
     )
