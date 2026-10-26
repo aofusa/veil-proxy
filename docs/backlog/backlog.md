@@ -520,6 +520,7 @@
 | B-196 | P2 | 修正済み（v0.10.0） | [bugs/B-196-graphql-get-mutation-and-content-type.md](bugs/B-196-graphql-get-mutation-and-content-type.md) | veil-kit の GraphQL が GET で mutation を実行し、POST の Content-Type を見ない |
 | B-197 | P2 | 修正済み（v0.10.0） | [bugs/B-197-websocket-upgrade-no-default-timeout.md](bugs/B-197-websocket-upgrade-no-default-timeout.md) | WebSocket・アップグレード接続に既定のタイムアウトが無く、途中のフレームで大きな受信バッファを握れる |
 | B-198 | P2 | 修正済み（v0.10.0） | [bugs/B-198-api-client-chunk-overflow-and-header-injection.md](bugs/B-198-api-client-chunk-overflow-and-header-injection.md) | API クライアント: 上流の chunked のサイズのあふれで panic し、ヘッダ・URL・メソッドの CR/LF を検査しない |
+| B-199 | P3 | 修正済み（v0.10.0） | [bugs/B-199-permessage-deflate-bfinal-next-message.md](bugs/B-199-permessage-deflate-bfinal-next-message.md) | permessage-deflate: BFINAL の付いたメッセージの後、文脈を引き継ぐ接続で次のメッセージが 1007 になる |
 
 ---
 

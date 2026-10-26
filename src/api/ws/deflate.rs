@@ -135,7 +135,7 @@ impl Inflater {
         }
         let mut out: Vec<u8> =
             Vec::with_capacity((data.len() * 4).clamp(256, 64 * 1024).min(max + 1));
-        for input in [data, &TAIL[..]] {
+        'inputs: for input in [data, &TAIL[..]] {
             let start_in = self.d.total_in();
             loop {
                 let consumed = (self.d.total_in() - start_in) as usize;
@@ -152,9 +152,11 @@ impl Inflater {
                 }
                 let done_in = (self.d.total_in() - start_in) as usize == input.len();
                 if st == flate2::Status::StreamEnd {
-                    // BFINAL のブロックの後ろは無い（文脈の引き継ぎ中なら次のメッセージは新しい流れになる）
+                    // BFINAL のブロックの後ろは無い（文脈の引き継ぎ中なら次のメッセージは新しい流れになる）。
+                    // B-199: 末尾の 00 00 ff ff を新しい展開器に流さない（格納ブロックの途中として持ち越し、
+                    // 次のメッセージの先頭が NLEN の続きに読まれて 1007 になる）
                     self.d.reset(false);
-                    break;
+                    break 'inputs;
                 }
                 if done_in && out.len() < out.capacity() {
                     break;
@@ -233,6 +235,28 @@ mod tests {
             inf.inflate(&c, 1 << 20),
             Err(crate::api::ws::codec::CLOSE_TOO_BIG)
         );
+    }
+
+    // B-199: BFINAL で終わるメッセージの後、文脈を引き継ぐ接続で次のメッセージも展開できる
+    #[test]
+    fn bfinal_message_then_next_message() {
+        let finished = |data: &[u8]| {
+            let mut c = Compress::new(Compression::default(), false);
+            let mut out = Vec::with_capacity(data.len() + 64);
+            c.compress_vec(data, &mut out, FlushCompress::Finish)
+                .unwrap();
+            out
+        };
+        let a = finished(b"first message");
+        let b = finished(b"second message");
+        let mut inf = Inflater::new(Params {
+            client_no_context_takeover: false,
+        });
+        assert_eq!(&inf.inflate(&a, 1 << 20).unwrap()[..], b"first message");
+        assert_eq!(&inf.inflate(&b, 1 << 20).unwrap()[..], b"second message");
+        // 同期の区切りで終わる普通のメッセージがその後に続いても良い
+        let c = compress(b"third").unwrap();
+        assert_eq!(&inf.inflate(&c, 1 << 20).unwrap()[..], b"third");
     }
 
     #[test]
