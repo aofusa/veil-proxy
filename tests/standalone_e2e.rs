@@ -3600,7 +3600,8 @@ fn b210_expect_continue_waits_for_route_body_limit() {
     use std::io::{Read, Write};
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let echo = spawn_body_echo();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(
         &cfg_path,
@@ -3616,11 +3617,12 @@ level = "warn"
 [route.conditions]
 path = "/"
 [route.action]
-type = "Proxy"
-url = "http://127.0.0.1:{echo}"
+type = "File"
+path = "{www}"
 [route.security]
 max_request_body_size = 1000
-"#
+"#,
+            www = tp(&www)
         ),
     )
     .unwrap();

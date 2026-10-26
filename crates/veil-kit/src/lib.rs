@@ -163,7 +163,8 @@ pub(crate) mod b64 {
     }
 }
 
-// README のコード例を doctest で確かめる
-#[cfg(doctest)]
+// README のコード例を doctest で確かめる（例は JWT を使うので jwt feature のときだけ。既定の feature で
+// `cargo test -p veil-proxy-kit` が import できずに落ちていた）
+#[cfg(all(doctest, feature = "jwt"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
