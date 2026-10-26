@@ -77,6 +77,8 @@ sha_of() { "$PY3" -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1
 comp_probe() {
   local ae="$1" u="$2"; shift 2
   local h="$TMPD/comp.h" b="$TMPD/comp.b"
+  # 前の確認の本文を読まない（curl が失敗すると -o のファイルを作らない）
+  rm -f "$h" "$b"
   if [ "$ae" = - ]; then curl -s -D "$h" -o "$b" "$@" "$u"; else curl -s --compressed -H "accept-encoding: $ae" -D "$h" -o "$b" "$@" "$u"; fi
   local ce vary
   ce=$(tr -d '\r' < "$h" | tr A-Z a-z | sed -n 's/^content-encoding: *//p' | tail -1)
@@ -89,7 +91,9 @@ comp_suite() {
   local want sw
   want=$(comp_probe - "$B$J" "$@" | sed 's/.*sha=//')
   sw=$(comp_probe - "$B$S" "$@" | sed 's/.*sha=//')
-  expect "$L compression: br decodes to the original" "ce=br vary=1 sha=$want" comp_probe br "$B$J" "$@"
+  # macOS の /usr/bin/curl は brotli を復号できない（--compressed が 61 で失敗する）。br の復号を見る確認は飛ばす
+  local br=1; curl -V | grep -qi brotli || { br=0; echo "  skip $L compression: br decoding (this curl has no brotli)"; }
+  [ "$br" = 0 ] || expect "$L compression: br decodes to the original" "ce=br vary=1 sha=$want" comp_probe br "$B$J" "$@"
   expect "$L compression: gzip decodes to the original" "ce=gzip vary=1 sha=$want" comp_probe gzip "$B$J" "$@"
   expect "$L compression: q-values (gzip;q=1, br;q=0.5)" "ce=gzip" comp_probe "gzip;q=1, br;q=0.5" "$B$J" "$@"
   expect "$L compression: configured order (gzip, deflate, br)" "ce=br" comp_probe "gzip, deflate, br" "$B$J" "$@"
@@ -98,7 +102,7 @@ comp_suite() {
   expect "$L compression: compress=false route" "ce=none vary=0 sha=$want" comp_probe br "$B$R" "$@"
   [ "$N" = - ] || expect "$L compression: per-response opt-out" "ce=none vary=0 sha=$want" comp_probe br "$B$N" "$@"
   expect "$L compression: streaming gzip" "ce=gzip vary=1 sha=$sw" comp_probe gzip "$B$S" "$@"
-  expect "$L compression: streaming br" "ce=br vary=1 sha=$sw" comp_probe br "$B$S" "$@"
+  [ "$br" = 0 ] || expect "$L compression: streaming br" "ce=br vary=1 sha=$sw" comp_probe br "$B$S" "$@"
 }
 # F-270: comp_h3 <h3 の host:port> <path> <want sha>: HTTP/3 で gzip を受けて復号する（curl に HTTP/3 が無いので試験クライアント）
 comp_h3() {
