@@ -126,7 +126,7 @@ feat/v0100（F-261〜F-263 を含む）へ載せ直した後（a23b2681、Window
   `library_e2e.sh rust`・`nonregression`・`python` が ALL OK。
 - Windows（ssh aofish）: clippy `--lib --tests` の `full-windows,api`、単体、`rust`（2 回）・`nonregression`・`python` が ALL OK。
   `python` は F-263 の常駐ループ（Windows の既定の ProactorEventLoop に `add_reader` が無い）と `ws_check.py`（`resource` が
-  無い）を直してから通った。
+  無い。feat/v0100 の b5bc84d6 と同じ直し）を直してから通った。
 
 ### 決めたこと
 

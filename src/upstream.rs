@@ -945,7 +945,7 @@ fn find_backend_inner(
 ///
 /// ルートのキャッシュ（Phase 4）の鍵は host・path・method・送信元だけなので、当たったルートより前に
 /// header・query の条件（鍵に入らない動的な条件）で外れた候補があったときはキャッシュに入れない
-/// （入れると、その条件に合う次の要求も後ろのルートに行く。B-170）。
+/// （入れると、その条件に合う次の要求も後ろのルートに行く。B-172）。
 #[allow(clippy::too_many_arguments)]
 fn select_route(
     optimized_router: &routing::OptimizedRouter,
@@ -1032,7 +1032,7 @@ fn select_route(
         "[Routing] Candidates for host='{}' path='{}': {:?}",
         host_str, path_str, candidates
     );
-    // 前の候補が動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-170）
+    // 前の候補が動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-172）
     let mut dynamic_before = false;
     for &route_idx in &candidates {
         if let Some(route) = routes.get(route_idx) {
@@ -1057,7 +1057,7 @@ fn select_route(
                         let compression = route.resolved_compression.clone().unwrap_or_else(|| {
                             Arc::new(route.compression.clone().unwrap_or_default())
                         });
-                        // キャッシュに保存（前の候補が動的な条件で外れたときは入れない。B-170）
+                        // キャッシュに保存（前の候補が動的な条件で外れたときは入れない。B-172）
                         if !dynamic_before {
                             optimized_router.cache_result(cache_key, Some(route_idx));
                         }
@@ -1117,7 +1117,7 @@ pub(crate) fn extract_path_prefix_arc(route: &Route) -> Arc<[u8]> {
     extract_path_prefix(route).into()
 }
 
-/// ルートのキャッシュの鍵（host・path・method・送信元）に入らない条件を持つか（B-170）
+/// ルートのキャッシュの鍵（host・path・method・送信元）に入らない条件を持つか（B-172）
 #[inline]
 fn has_uncached_conditions(conditions: &RouteConditions) -> bool {
     conditions.header.is_some() || conditions.query.is_some()
@@ -1180,7 +1180,7 @@ pub(crate) fn find_backend_linear(
     draw: bool,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 配列の順序で評価（first-match）
-    // 前のルートが動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-170。
+    // 前のルートが動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-172。
     // host・path で外れたかは見ず、条件を持つだけで数える。安全網の経路なので控えめに倒す）
     let mut dynamic_before = false;
     for (i, route) in routes.iter().enumerate() {
@@ -1212,7 +1212,7 @@ pub(crate) fn find_backend_linear(
                         .resolved_compression
                         .clone()
                         .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
-                    // キャッシュに保存（前のルートが動的な条件で外れたときは入れない。B-170）
+                    // キャッシュに保存（前のルートが動的な条件で外れたときは入れない。B-172）
                     if !dynamic_before {
                         optimized_router.cache_result(*cache_key, Some(i));
                     }
@@ -1393,9 +1393,9 @@ mod tests {
         ));
     }
 
-    /// B-170: 前にある header・query 条件のルートを、後ろのルートのキャッシュが飛ばさない。
+    /// B-172: 前にある header・query 条件のルートを、後ろのルートのキャッシュが飛ばさない。
     #[test]
-    fn test_b170_route_cache_keeps_earlier_dynamic_routes() {
+    fn test_b172_route_cache_keeps_earlier_dynamic_routes() {
         let route = |cond: &str, url: &str| -> Route {
             toml::from_str(&format!(
                 "conditions = {{ path = \"/a\" {cond} }}\naction = {{ type = \"Redirect\", redirect_url = \"{url}\", redirect_status = 302, preserve_path = false }}"

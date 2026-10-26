@@ -1715,7 +1715,7 @@ fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>
     h3_request_with_headers(port, method, path, &[], body)
 }
 
-/// [`h3_request`] に要求ヘッダを足したもの（B-170）。
+/// [`h3_request`] に要求ヘッダを足したもの（B-172）。
 #[cfg(feature = "http3")]
 fn h3_request_with_headers(
     port: u16,
@@ -3087,13 +3087,13 @@ url = "http://127.0.0.1:{echo}"
     }
 }
 
-// ===================== B-170 =====================
+// ===================== B-172 =====================
 
-/// ルートのキャッシュが、前にある header・query 条件のルートを飛ばさない（B-170）。同じ path の 3 つのルート
+/// ルートのキャッシュが、前にある header・query 条件のルートを飛ばさない（B-172）。同じ path の 3 つのルート
 /// （header 条件・query 条件・条件なし）へ、条件なしの要求を先に送ってから条件に合う要求を送り、first-match の
 /// とおり前のルートに行くことを HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。
 #[test]
-fn b170_route_cache_keeps_earlier_header_and_query_routes() {
+fn b172_route_cache_keeps_earlier_header_and_query_routes() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key) = write_self_signed(dir.path());
     let port = free_port();

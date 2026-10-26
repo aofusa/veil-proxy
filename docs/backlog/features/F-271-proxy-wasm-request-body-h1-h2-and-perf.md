@@ -117,7 +117,7 @@
 
 ### 残したこと
 
-- E2E で、同じ path の header 条件のルートがルートのキャッシュで飛ばされる不具合を見つけた（[B-170](../bugs/B-170-route-cache-skips-earlier-dynamic-route.md)。
+- E2E で、同じ path の header 条件のルートがルートのキャッシュで飛ばされる不具合を見つけた（[B-172](../bugs/B-172-route-cache-skips-earlier-dynamic-route.md)。
   本チケットでは直さず、試験は path で振り分けた）。
 
 - 本文の断片ごとの呼び出し（ストリーミング・`Pause` で溜める）と、1 要求の全フェーズで 1 つの http context を使う形（第 2 段）。
