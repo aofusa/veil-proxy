@@ -227,6 +227,15 @@ static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 Without a declaration the system allocator is used. The Python wheel and the C library never replace the host
 process's allocator. See [Memory allocator](library.md#memory-allocator).
 
+On FreeBSD and NetBSD the system allocator is the libc jemalloc, which by default keeps freed memory mapped. The pages
+it frees stay in the resident set until the system runs short of memory, so after a large upload a Python or C
+server can report the peak RSS for a long time. Start the process with the settings that the `veil` binary uses on
+FreeBSD:
+
+```sh
+MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py
+```
+
 ## Health checks and metrics
 
 - Write the health check as an ordinary route that does no I/O (`GET /healthz` returning `ok`), and a separate

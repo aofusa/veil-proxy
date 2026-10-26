@@ -220,6 +220,14 @@ static GLOBAL: veil::veil_alloc::VeilAlloc = veil::veil_alloc::VeilAlloc;
 宣言しなければシステムのアロケータです。Python の wheel と C のライブラリはホストのプロセスのアロケータを置き換えません。
 [メモリアロケータ](library.md#メモリアロケータ) を見てください。
 
+FreeBSD と NetBSD のシステムのアロケータは libc の jemalloc で、既定では解放したメモリをマップしたまま持ちます。解放した
+ページはメモリが逼迫するまで常駐のままなので、大きなアップロードの後の Python や C のサーバは長い間ピークの RSS を示します。
+`veil` のバイナリが FreeBSD で使う設定でプロセスを起動してください:
+
+```sh
+MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py
+```
+
 ## ヘルスチェックとメトリクス
 
 - ヘルスチェックは I/O をしない普通のルートで書きます（`ok` を返す `GET /healthz`）。依存先を確かめる必要があるなら、
