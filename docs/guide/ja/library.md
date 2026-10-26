@@ -355,6 +355,11 @@ HTTP/3 も同様（打ち切りはストリームのリセット）です。す�
 渡します。HTTP/2 のストリーミング受信のルートには `max_body_size` が掛からないので、読みながら制限してください。
 どちらの向きも tower の層をそのまま通ります。
 
+本文が途中で切れたとき（クライアントの切断・ストリームのリセット・時間切れ、HTTP/1.1 では `Content-Length` に届かない）も、
+本文のストリームは終わり（`None`）になります。本文を完全なものとして扱う前（アップロードしたファイルを確定する前など）に、
+終わりの後で `RequestBodyStream::is_aborted()` を確かめてください。`Multipart` と gRPC の要求のストリームは、切れた本文を
+自分でエラーにします。
+
 ```rust
 #[veil::route(path = "/upper", method = "POST", streaming = true)]
 async fn upper(req: &Request) -> Response {

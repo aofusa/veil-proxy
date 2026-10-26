@@ -1181,6 +1181,10 @@ pub async fn prepare_form(req: Request) -> Result<(Request, Option<Vec<SpooledPa
             }
             b.extend_from_slice(&c);
         }
+        // B-187: 途中で切れた本文を全体として渡さない
+        if s.is_aborted() {
+            return Err(Response::error(400, "Bad Request"));
+        }
         req.body = b.freeze();
         req.body_stream = None;
     }

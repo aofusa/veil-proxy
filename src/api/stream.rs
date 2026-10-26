@@ -12,6 +12,7 @@
 use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -30,14 +31,54 @@ pub enum BodyChunk {
 pub type BodyStream = Pin<Box<dyn Stream<Item = BodyChunk> + Send + 'static>>;
 
 /// A stream of the request body (chunks in arrival order).
+///
+/// The stream also ends (`None`) when the body is cut off before it is complete (the client disconnected, reset the
+/// stream or timed out). Check [`RequestBodyStream::is_aborted`] after the end before treating the body as
+/// complete (for example before committing an uploaded file).
 pub struct RequestBodyStream {
     pub(crate) rx: futures::channel::mpsc::Receiver<Bytes>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl RequestBodyStream {
+    /// Whether the body ended before it was complete (the client disconnected, reset the stream or timed out).
+    ///
+    /// Meaningful after the stream has returned `None`; until then it is `false`.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
 }
 
 impl Stream for RequestBodyStream {
     type Item = Bytes;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
         Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
+// B-187: 本文が途中で切れたことを受け手に伝える（drop は正常な終わり、`abort` は途中で切れた終わり）
+/// The protocol side of a request body stream.
+pub(crate) struct RequestBodySender {
+    tx: futures::channel::mpsc::Sender<Bytes>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl RequestBodySender {
+    /// Sends a chunk, waiting while the channel is full. `Err` when the receiver has gone away.
+    pub(crate) async fn send(&mut self, chunk: Bytes) -> Result<(), ()> {
+        use futures::SinkExt;
+        self.tx.send(chunk).await.map_err(|_| ())
+    }
+
+    /// Sends a chunk without waiting. `Err` when the channel is full or the receiver has gone away.
+    pub(crate) fn try_send(&mut self, chunk: Bytes) -> Result<(), ()> {
+        self.tx.try_send(chunk).map_err(|_| ())
+    }
+
+    /// Ends the stream as cut off ([`RequestBodyStream::is_aborted`] becomes `true`).
+    pub(crate) fn abort(self) {
+        // 印を付けてから送信端を落とす（受け手は終わり（None）を見た後に印を読む）
+        self.aborted.store(true, Ordering::Release);
     }
 }
 
@@ -51,11 +92,16 @@ impl std::fmt::Debug for RequestBodyStream {
 pub(crate) type BodyStreamSlot = Arc<Mutex<Option<RequestBodyStream>>>;
 
 /// Creates a sender (on the protocol side) and the receiver handed to the handler. The capacity is a number of chunks.
-pub(crate) fn request_body_channel(
-    capacity: usize,
-) -> (futures::channel::mpsc::Sender<Bytes>, BodyStreamSlot) {
+pub(crate) fn request_body_channel(capacity: usize) -> (RequestBodySender, BodyStreamSlot) {
     let (tx, rx) = futures::channel::mpsc::channel(capacity);
-    (tx, Arc::new(Mutex::new(Some(RequestBodyStream { rx }))))
+    let aborted = Arc::new(AtomicBool::new(false));
+    (
+        RequestBodySender {
+            tx,
+            aborted: aborted.clone(),
+        },
+        Arc::new(Mutex::new(Some(RequestBodyStream { rx, aborted }))),
+    )
 }
 
 /// Upper limit of body data the sender combines into one send (matches the default HTTP/2 DATA frame size).
@@ -108,7 +154,7 @@ pub(crate) fn coalesce(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{SinkExt, StreamExt};
+    use futures::StreamExt;
 
     #[test]
     fn request_body_channel_delivers_in_order_and_ends() {
@@ -122,6 +168,26 @@ mod tests {
             assert_eq!(rx.next().await.as_deref(), Some(&b"a"[..]));
             assert_eq!(rx.next().await.as_deref(), Some(&b"b"[..]));
             assert!(rx.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn request_body_channel_reports_abort() {
+        let (mut tx, slot) = request_body_channel(2);
+        let mut rx = slot.lock().unwrap().take().unwrap();
+        futures::executor::block_on(async move {
+            tx.send(Bytes::from_static(b"a")).await.unwrap();
+            tx.abort();
+            assert_eq!(rx.next().await.as_deref(), Some(&b"a"[..]));
+            assert!(rx.next().await.is_none());
+            assert!(rx.is_aborted());
+        });
+        let (tx, slot) = request_body_channel(1);
+        let mut rx = slot.lock().unwrap().take().unwrap();
+        drop(tx);
+        futures::executor::block_on(async move {
+            assert!(rx.next().await.is_none());
+            assert!(!rx.is_aborted());
         });
     }
 

@@ -370,6 +370,11 @@ the handler runs as soon as the headers arrive and request and response flow in 
 HTTP/1.1 and HTTP/3 the body is read first and handed over as one chunk. `max_body_size` does not apply to a
 streaming route over HTTP/2 (limit it while reading). Both directions pass through tower layers unchanged.
 
+The body stream also ends (`None`) when the body is cut off before it is complete: the client disconnects, resets
+the stream or times out, or (HTTP/1.1) fewer bytes than `Content-Length` arrive. Check
+`RequestBodyStream::is_aborted()` after the end before treating the body as complete, for example before committing
+an uploaded file. `Multipart` and gRPC request streams report a cut-off body as an error by themselves.
+
 ```rust
 #[veil::route(path = "/upper", method = "POST", streaming = true)]
 async fn upper(req: &Request) -> Response {

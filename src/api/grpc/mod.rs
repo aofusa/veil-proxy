@@ -636,6 +636,12 @@ impl<T> Stream for Streaming<T> {
             }
             if this.body_done {
                 this.finished = true;
+                // B-187: クライアントのリセット・切断で切れた要求のストリームを、正常な終わりに見せない
+                if this.body.is_aborted() {
+                    return Poll::Ready(Some(Err(Status::cancelled(
+                        "request stream ended before the client finished it",
+                    ))));
+                }
                 if this.text.as_ref().is_some_and(|d| d.finish().is_err()) {
                     return Poll::Ready(Some(Err(Status::internal(
                         "grpc-web-text request body is not valid base64",

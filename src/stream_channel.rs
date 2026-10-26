@@ -101,6 +101,8 @@ struct Shared<T> {
     cap: usize,
     sender_closed: bool,
     receiver_closed: bool,
+    /// 送信端を [`Sender::finish`] で閉じた（drop だけで閉じたものは途中で切れた終わり。B-187）
+    finished: bool,
     recv_waker: Option<Waker>,
     send_waker: Option<Waker>,
 }
@@ -144,6 +146,7 @@ pub fn channel<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
         cap,
         sender_closed: false,
         receiver_closed: false,
+        finished: false,
         recv_waker: None,
         send_waker: None,
     }));
@@ -221,6 +224,15 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Sender<T> {
+    /// 送信を終えて閉じる（受信側の [`Receiver::is_cut_off`] が `false` になる）。drop だけで閉じると
+    /// 途中で切れた終わりとして扱う（要求本文の中継で、クライアントのリセット・切断を正常な終わりと
+    /// 区別するため。B-187）。
+    pub fn finish(self) {
+        self.sh.borrow_mut().finished = true;
+    }
+}
+
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let waker = {
@@ -262,6 +274,12 @@ impl<T> Receiver<T> {
     pub fn is_finished(&self) -> bool {
         let s = self.sh.borrow();
         s.sender_closed && s.queue.is_empty()
+    }
+
+    /// 送信端が [`Sender::finish`] を呼ばずに閉じたか（途中で切れた終わり。B-187）。
+    pub fn is_cut_off(&self) -> bool {
+        let s = self.sh.borrow();
+        s.sender_closed && !s.finished
     }
 
     /// アイテムが来るまで待つ。送信端が閉じてキューも空なら `None`。

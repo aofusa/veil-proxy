@@ -3,7 +3,6 @@
 use super::health::{HealthCheckRequest, HealthCheckResponse, HealthCodec};
 use super::*;
 use crate::api::request::Request as ApiRequest;
-use futures::SinkExt;
 
 fn frame<T>(m: &T) -> Bytes
 where

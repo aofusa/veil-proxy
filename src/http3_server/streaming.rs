@@ -288,7 +288,10 @@ pub(super) fn drive_request_pump(
 
     // 3. クライアント END_STREAM 受信かつ全消化なら送信端を閉じて EOF 伝播。
     if ps.req_eof_seen && ps.req_pending.is_empty() && !ps.req_readable {
-        ps.req_tx = None;
+        // `finish` で正常な終わり（それ以外で閉じた（リセット・上限超過）ものは途中で切れた終わり。B-187）
+        if let Some(tx) = ps.req_tx.take() {
+            tx.finish();
+        }
         did_work = true;
     }
 

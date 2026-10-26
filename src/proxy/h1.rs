@@ -1967,10 +1967,9 @@ async fn pump_api_body(
     stream: &mut ServerTls,
     content_length: usize,
     first: Option<Bytes>,
-    mut tx: futures::channel::mpsc::Sender<Bytes>,
+    mut tx: crate::api::stream::RequestBodySender,
     overflow: &mut BytesMut,
 ) -> bool {
-    use futures::SinkExt;
     let mut got = 0usize;
     if let Some(b) = first {
         got += b.len();
@@ -1998,9 +1997,14 @@ async fn pump_api_body(
             }
             Ok((_, b)) => {
                 buf_put(b);
+                // B-187: Content-Length に届かずに切れた本文を正常な終わりに見せない
+                tx.abort();
                 return false;
             }
-            Err(_) => return false,
+            Err(_) => {
+                tx.abort();
+                return false;
+            }
         }
     }
     true
@@ -2296,6 +2300,7 @@ pub(super) async fn handle_redirect(
 #[cfg(all(test, unix))]
 mod b186_overflow_tests {
     //! B-186: 本文を読む経路が本文の終わりより後ろまで読んだ分（次の要求）を呼び出し側へ返すこと。
+    //! B-187: ストリーミング受信の本文が Content-Length に届かずに切れたら、受け手に切れたことが見えること。
     use super::*;
     use std::io::Write as _;
     use std::os::unix::io::FromRawFd as _;
@@ -2401,7 +2406,7 @@ mod b186_overflow_tests {
 
     #[cfg(feature = "handler")]
     #[test]
-    fn pump_api_body_returns_pipelined_bytes() {
+    fn pump_api_body_returns_pipelined_bytes_and_reports_abort() {
         use futures::StreamExt;
         if !runtime_available() {
             return;
@@ -2420,7 +2425,26 @@ mod b186_overflow_tests {
                 got.extend_from_slice(&b);
             }
             assert_eq!(&got[..], b"hello world");
+            assert!(!rx.is_aborted());
             assert_eq!(&over[..], NEXT);
+
+            // Content-Length に届かずに切れた
+            let (s, mut c) = pair();
+            let mut tls = server(s).await;
+            c.write_all(b"lo").unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            let (tx, slot) = crate::api::stream::request_body_channel(8);
+            let mut rx = slot.lock().unwrap().take().unwrap();
+            let mut over = BytesMut::new();
+            let first = Some(Bytes::from_static(b"hel"));
+            assert!(!pump_api_body(&mut tls, 11, first, tx, &mut over).await);
+            let mut got = Vec::new();
+            while let Some(b) = rx.next().await {
+                got.extend_from_slice(&b);
+            }
+            assert_eq!(&got[..], b"hello");
+            assert!(rx.is_aborted());
+            drop(c);
         });
     }
 }

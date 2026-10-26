@@ -798,8 +798,11 @@ where
                 }
             }
             if st.req_tx.is_some() && st.req_pending.is_empty() && st.req_eof {
-                // クライアント END_STREAM 済み・全量投入済み → sender drop で EOF 伝播。
-                st.req_tx = None;
+                // クライアント END_STREAM 済み・全量投入済み → 送信端を閉じて EOF 伝播（`finish` で正常な終わり。
+                // それ以外で閉じた（リセット・切断）ものは途中で切れた終わりになる。B-187）
+                if let Some(tx) = st.req_tx.take() {
+                    tx.finish();
+                }
             }
             // recv ウィンドウの消費連動補充（F-116 バックプレッシャ）: req チャネルへ転送
             // できた分だけクライアントへ新規クレジットを渡す。受信時に即補充すると
@@ -1759,16 +1762,19 @@ pub(super) async fn h2_api_handler(
     // `body_tx` は move で持たせる（中継が終わったら drop して受信ストリームを終える）
     let pump = async move {
         let req_size = req_size_ref;
-        use futures::SinkExt;
         while let Some(chunk) = rx.recv().await {
             req_size.set(req_size.get() + chunk.len() as u64);
             if body_tx.send(chunk).await.is_err() {
                 // ハンドラが受信ストリームを捨てた: 残りは読み捨てる（クライアントを止めない）。
                 req_size.set(req_size.get() + h2_drain_req(rx, notify).await);
-                break;
+                return;
             }
             // 消費したらメインループを起こして残りの補充と WINDOW_UPDATE をさせる（B-123）
             notify.notify();
+        }
+        // B-187: END_STREAM の前に切れた（RST_STREAM・接続の切断）本文は、正常な終わりに見せない
+        if rx.is_cut_off() {
+            body_tx.abort();
         }
         // body_tx の drop で受信ストリームが終わる
     };

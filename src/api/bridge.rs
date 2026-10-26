@@ -518,7 +518,6 @@ mod tests {
             return;
         }
         let got = crate::runtime::block_on(async {
-            use futures::SinkExt;
             // 本文はプロトコル側と同じくワーカーのタスクから流す（別スレッドから Waker を呼ばない）
             let (mut tx, slot) = crate::api::stream::request_body_channel(1);
             let mut req = Request::new("POST", "/", Vec::new(), "");

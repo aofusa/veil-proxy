@@ -509,6 +509,7 @@
 | B-176 | P3 | 修正済み（v0.10.0） | [bugs/B-176-python-grpc-default-app-silently-dropped.md](bugs/B-176-python-grpc-default-app-silently-dropped.md) | Python の `veil.grpc.Server()`・`add_health()` を `app` 無しで呼ぶと既定の App に登録され、別の `App` を run すると gRPC が黙って UNIMPLEMENTED になる。`App.run()` で `RuntimeWarning` を出し、文書に `Server(app)` を書く（F-269 の veil-python の validate で発覚） |
 | B-185 | P2 | 修正済み（v0.10.0） | [bugs/B-185-rejected-reload-applies-static-cache-globals.md](bugs/B-185-rejected-reload-applies-static-cache-globals.md) | リロードがルートの解決（CORS・JWT の設定ミス）で拒否されても、open_file_cache・static_file_cache のグローバル設定だけ新しい値になる（F-272 でルートより前に適用していた）。監視の既定値は引数で渡し、グローバルはルートの解決の後で書く |
 | B-186 | P2 | 修正済み（v0.10.0） | [bugs/B-186-pipelined-request-lost-after-body.md](bugs/B-186-pipelined-request-lost-after-body.md) | HTTP/1.1 で本文の末尾と次の要求が同じセグメントで届くと、本文を読む経路（ストリーミング受信のハンドラ・Proxy-Wasm の要求本文の段・ローカル応答の後の読み捨て等）が次の要求を捨て、keep-alive の接続が止まる。読み過ぎた分を次の要求として返す |
+| B-187 | P2 | 修正済み（v0.10.0） | [bugs/B-187-streaming-request-body-truncation-looks-complete.md](bugs/B-187-streaming-request-body-truncation-looks-complete.md) | ストリーミング受信のハンドラに、切断・リセット・時間切れで途中で切れた本文が正常な終わりとして届く。`RequestBodyStream::is_aborted()` を足し、HTTP/1.1・HTTP/2・HTTP/3 で切れた終わりを伝える（gRPC は CANCELLED、`prepare_form` は 400） |
 
 ---
 

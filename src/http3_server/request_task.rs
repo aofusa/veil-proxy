@@ -139,7 +139,6 @@ pub(super) async fn h3_api_stream_task(
     // `body_tx` は move で持たせる（中継が終わったら drop して受信ストリームを終える）。
     // ハンドラとこの中継はどちらもチャネルの待ちだけで、起こされていない側を poll しても syscall は出ない。
     let pump = async move {
-        use futures::SinkExt;
         while let Some(chunk) = rx.recv().await {
             req_size_ref.set(req_size_ref.get() + chunk.len() as u64);
             // 消費したらメインループを起こして残りの本文を受け取らせる（QUIC のフロー制御の補充）
@@ -150,8 +149,12 @@ pub(super) async fn h3_api_stream_task(
                     req_size_ref.set(req_size_ref.get() + c.len() as u64);
                     notify_ref.notify();
                 }
-                break;
+                return;
             }
+        }
+        // B-187: fin の前に切れた（ストリームのリセット・接続の切断・上限超過）本文は、正常な終わりに見せない
+        if rx.is_cut_off() {
+            body_tx.abort();
         }
     };
     let work = h3_api_respond(&entry, comp.as_deref(), req, &resp_tx, &notify);
