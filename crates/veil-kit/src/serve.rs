@@ -10,7 +10,7 @@
 //! App::new().with(veil_kit::serve::dir("/assets", "/srv/www/assets")).run().unwrap();
 //! ```
 //!
-//! [`file`] returns one file from a handler (for small files that a handler picks, such as downloads behind
+//! [`file()`] returns one file from a handler (for small files that a handler picks, such as downloads behind
 //! authentication).
 
 pub use veil::api::ServeOptions;
