@@ -110,6 +110,10 @@ class EventLoop:
         if self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(5)
+        # B-207: 起床のソケットを閉じる（Rust 側の登録は先に aio_teardown で外してある）
+        if not self.thread.is_alive():
+            self.rsock.close()
+            self.wsock.close()
 
 
 async def _run_call(el, job):
@@ -176,6 +180,14 @@ def first():
 
 def stop():
     """Stop the loops (after the server stopped)."""
+    # B-207: 先に Rust 側の登録を外す（以後の投入は断られ、閉じたソケットへ合図を書かない）。次の App.run は
+    # 新しいループを登録できる
+    try:
+        from . import _veil
+
+        _veil.aio_teardown()
+    except ImportError:
+        pass
     while _LOOPS:
         _LOOPS.pop().stop()
 

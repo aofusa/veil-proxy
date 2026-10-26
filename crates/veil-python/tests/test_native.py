@@ -185,6 +185,27 @@ class TestJsonFast(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_NATIVE, "native extension not built")
+class TestAioRegistration(unittest.TestCase):
+    # B-207: 常駐のループの登録は外せて、もう一度登録できる（同じプロセスで App.run を 2 回）
+    def test_setup_teardown_setup(self):
+        import socket
+
+        for _ in range(2):
+            r, w = socket.socketpair()
+            try:
+                _veil.aio_setup([w.fileno()], 16)
+                with self.assertRaises(RuntimeError):
+                    _veil.aio_setup([w.fileno()], 16)
+                self.assertEqual(_veil.aio_take(0), [])
+                _veil.aio_teardown()
+                _veil.aio_teardown()  # 2 回目は何もしない
+                self.assertEqual(_veil.aio_take(0), [])
+            finally:
+                r.close()
+                w.close()
+
+
+@unittest.skipUnless(HAVE_NATIVE, "native extension not built")
 class TestGrpcClientCancel(unittest.TestCase):
     # B-203: 応答ヘッダの前（何も返さないサーバ）でも取消しが効き、status() が戻る
     def test_cancel_before_response_headers(self):

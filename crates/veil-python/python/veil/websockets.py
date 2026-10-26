@@ -253,24 +253,27 @@ async def _run_ws(el, job):
     """Run an ``@app.websocket`` handler for one connection on the event loop."""
     from . import _HANDLERS
 
-    route = _HANDLERS[job.handler_id]
     native = job.websocket
-    ws = WebSocket(native, job.request, route)
-    el.sockets[job.id] = ws
+    ws = None
+    # B-207: WebSocket の生成で失敗しても、ワーカーが承認を待ち続けないよう try の中で作る（500 で断る）
     try:
+        route = _HANDLERS[job.handler_id]
+        ws = WebSocket(native, job.request, route)
+        el.sockets[job.id] = ws
         await route.call(ws, job.request)
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001  接続を 1011（受け入れ前なら 500）で閉じる
         traceback.print_exc()
-        if ws.application_state == WebSocketState.CONNECTING:
+        if ws is None or ws.application_state == WebSocketState.CONNECTING:
             native.reject(500)
         else:
             native.close(1011, "")
-        ws.application_state = WebSocketState.DISCONNECTED
+        if ws is not None:
+            ws.application_state = WebSocketState.DISCONNECTED
     finally:
         el.sockets.pop(job.id, None)
-        if ws.application_state == WebSocketState.CONNECTING:
+        if ws is not None and ws.application_state == WebSocketState.CONNECTING:
             # accept せずに戻った（Starlette と同じく 403）
             native.reject(403)
         native.finish()

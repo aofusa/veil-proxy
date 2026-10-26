@@ -258,6 +258,9 @@ class NativeWsSender:
 def aio_setup(fds: list[int], queue: int) -> None:
     """Register the wake-up sockets of the persistent event loops (one per loop) and the queue size."""
 
+def aio_teardown() -> None:
+    """Unregister the event loops (later jobs are refused, queued ones are settled)."""
+
 def aio_take(index: int) -> list[AioJob]:
     """Take the queued jobs of event loop ``index``."""
 

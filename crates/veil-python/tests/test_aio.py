@@ -118,6 +118,22 @@ class TestWebSocket(unittest.TestCase):
         self.run_ws(self.app.websocket_routes[-1], n)
         self.assertEqual(n.rejected, 500)
 
+    # B-207: veil.WebSocket の生成で失敗しても 500 で断り、finish する（ワーカーが待ち続けない）
+    def test_websocket_construction_failure_rejects(self):
+        @self.app.websocket("/d")
+        async def d(websocket):
+            await websocket.accept()
+
+        class BadRequest:
+            @property
+            def params(self):
+                raise RuntimeError("broken request")
+
+        n = FakeNativeWs()
+        self.run_ws(self.app.websocket_routes[-1], n, BadRequest())
+        self.assertEqual(n.rejected, 500)
+        self.assertTrue(n.finished)
+
     def test_receive_kinds_json_and_send_retry(self):
         got = {}
 

@@ -730,6 +730,7 @@ fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<aio::NativeWebSocket>()?;
     m.add_class::<aio::NativeWsSender>()?;
     m.add_function(wrap_pyfunction!(aio::aio_setup, m)?)?;
+    m.add_function(wrap_pyfunction!(aio::aio_teardown, m)?)?;
     m.add_function(wrap_pyfunction!(aio::aio_take, m)?)?;
     m.add_function(wrap_pyfunction!(register_websocket, m)?)?;
     m.add_function(wrap_pyfunction!(register_grpc, m)?)?;

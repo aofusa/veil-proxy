@@ -15,8 +15,8 @@ use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyBytes, PyString, PyTuple};
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use veil::api::ws::{
     CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade, WsError, WsSender,
 };
@@ -54,6 +54,18 @@ enum Job {
     Wake(u64),
 }
 
+// B-207: 処理されずに捨てるジョブを決着させる（ワーカーが応答・承認を永久に待たない）
+/// Settles a job that will not run: a call gets no response (the worker answers 500), a WebSocket is rejected.
+fn settle(job: Job) {
+    match job {
+        Job::Call { out, .. } => out.close_tx(),
+        Job::Ws { ws, .. } => {
+            ws.decide(Ctl::Reject(500));
+        }
+        Job::Cancel(_) | Job::Wake(_) => {}
+    }
+}
+
 // ===================== ループの投入キュー =====================
 
 // ループのソケットの組の書き込み側（Python が作り、`aio_setup` で受け取る。所有権は Python 側）。
@@ -68,21 +80,28 @@ struct LoopQueue {
     // ループに合図済み（ループが `aio_take` で下ろす）。合図の書き込みをまとめる。
     armed: AtomicBool,
     wsock: RawSock,
+    // B-207: ループが止まった（`aio_teardown`）。q のロックの中で立て・見るので、立った後にソケットへ書かない
+    closed: AtomicBool,
 }
 
 impl LoopQueue {
-    // 積む（`force` でなければ満杯のとき `false`）。
+    // 積む（`force` でなければ満杯のとき `false`。止まった後は常に `false` で、ジョブは決着させる）。
     fn push(&self, job: Job, force: bool) -> bool {
-        {
-            let mut q = self.q.lock().unwrap();
-            if !force && q.len() >= self.cap {
-                return false;
-            }
-            q.push_back(job);
+        let mut q = self.q.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            drop(q);
+            settle(job);
+            return false;
         }
+        if !force && q.len() >= self.cap {
+            return false;
+        }
+        q.push_back(job);
+        // 合図はロックの中で書く（`aio_teardown` がソケットを閉じさせた後に書かない。合図はまとめるので稀）
         if !self.armed.swap(true, Ordering::AcqRel) {
             self.signal();
         }
+        drop(q);
         true
     }
 
@@ -110,12 +129,16 @@ impl LoopQueue {
     }
 }
 
-static LOOPS: OnceLock<Vec<LoopQueue>> = OnceLock::new();
+// B-207: 同じプロセスで App.run を何度も呼べるよう、登録は外せる（OnceLock だと 2 回目の setup が失敗し、
+// 止めた後も閉じた fd 番号を持ち続けた）。外した組は解放しない（実行中の要求が `&'static` で持つ。組は数個で小さい）。
+static LOOPS: AtomicPtr<Vec<LoopQueue>> = AtomicPtr::new(std::ptr::null_mut());
 static NEXT_LOOP: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn loops() -> Option<&'static [LoopQueue]> {
-    LOOPS.get().map(|v| v.as_slice())
+    let p = LOOPS.load(Ordering::Acquire);
+    // SAFETY: p は `aio_setup` が Box::leak した Vec で、解放しない（外した後も有効）。
+    unsafe { p.as_ref() }.map(|v| v.as_slice())
 }
 
 // 要求ごとにループを選ぶ（順番に。同じ WebSocket の起床は最初に選んだループへ）。
@@ -135,14 +158,43 @@ pub fn aio_setup(fds: Vec<i64>, queue: usize) -> PyResult<()> {
             cap: queue.max(1),
             armed: AtomicBool::new(false),
             wsock: fd as RawSock,
+            closed: AtomicBool::new(false),
         })
         .collect();
     if v.is_empty() {
         return Err(PyRuntimeError::new_err("no event loop"));
     }
-    LOOPS
-        .set(v)
-        .map_err(|_| PyRuntimeError::new_err("the event loops are already set up"))
+    let p = Box::into_raw(Box::new(v));
+    if LOOPS
+        .compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // SAFETY: p は今作ったばかりで誰にも渡していない
+        drop(unsafe { Box::from_raw(p) });
+        return Err(PyRuntimeError::new_err(
+            "the event loops are already set up",
+        ));
+    }
+    Ok(())
+}
+
+/// Unregister the event loops (before their sockets are closed): later jobs are refused (503) and jobs still queued
+/// are settled, so no worker waits for a loop that stopped.
+#[pyfunction]
+pub fn aio_teardown() {
+    let p = LOOPS.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    // SAFETY: `loops()` と同じ（解放しない）
+    let Some(ls) = (unsafe { p.as_ref() }) else {
+        return;
+    };
+    for lq in ls.iter() {
+        let jobs: Vec<Job> = {
+            let mut q = lq.q.lock().unwrap();
+            lq.closed.store(true, Ordering::Release);
+            q.drain(..).collect()
+        };
+        jobs.into_iter().for_each(settle);
+    }
 }
 
 /// Take the jobs queued for loop `index` (called by the loop with the GIL held).
@@ -155,44 +207,63 @@ pub fn aio_take(py: Python<'_>, index: usize) -> PyResult<Vec<Py<AioJob>>> {
     lq.armed.store(false, Ordering::Release);
     let jobs: Vec<Job> = lq.q.lock().unwrap().drain(..).collect();
     let mut out = Vec::with_capacity(jobs.len());
+    // B-207: 途中の 1 件が失敗しても残りを捨てない。失敗したジョブは AioJob の Drop で決着する
     for j in jobs {
-        let job = match j {
-            Job::Call {
-                id,
-                handler_id,
-                route,
-                req,
-                parts,
-                out,
-            } => AioJob {
+        match aio_job(py, j).and_then(|job| Py::new(py, job)) {
+            Ok(job) => out.push(job),
+            Err(e) => e.write_unraisable(py, None),
+        }
+    }
+    Ok(out)
+}
+
+// 投入キューのジョブを Python に渡す形にする（失敗したら、途中まで作った AioJob の Drop が決着させる）。
+fn aio_job(py: Python<'_>, j: Job) -> PyResult<AioJob> {
+    Ok(match j {
+        Job::Call {
+            id,
+            handler_id,
+            route,
+            req,
+            parts,
+            out,
+        } => {
+            let mut job = AioJob {
                 kind: JOB_CALL,
                 id,
                 handler_id,
                 route: Some(route),
-                request: Some(Py::new(py, NativeRequest::with_parts(req, parts))?),
+                request: None,
                 out: Some(out),
                 ws: None,
-            },
-            Job::Cancel(id) => AioJob::bare(JOB_CANCEL, id),
-            Job::Wake(id) => AioJob::bare(JOB_WAKE, id),
-            Job::Ws {
-                id,
-                handler_id,
-                req,
-                ws,
-            } => AioJob {
+                ws_state: None,
+            };
+            job.request = Some(Py::new(py, NativeRequest::with_parts(req, parts))?);
+            job
+        }
+        Job::Cancel(id) => AioJob::bare(JOB_CANCEL, id),
+        Job::Wake(id) => AioJob::bare(JOB_WAKE, id),
+        Job::Ws {
+            id,
+            handler_id,
+            req,
+            ws,
+        } => {
+            let mut job = AioJob {
                 kind: JOB_WS,
                 id,
                 handler_id,
                 route: None,
-                request: Some(Py::new(py, NativeRequest::new(req))?),
+                request: None,
                 out: None,
-                ws: Some(Py::new(py, NativeWebSocket { s: ws })?),
-            },
-        };
-        out.push(Py::new(py, job)?);
-    }
-    Ok(out)
+                ws: None,
+                ws_state: Some(ws.clone()),
+            };
+            job.request = Some(Py::new(py, NativeRequest::new(req))?);
+            job.ws = Some(Py::new(py, NativeWebSocket { s: ws })?);
+            job
+        }
+    })
 }
 
 // ===================== 応答の送り返し（ループ → ワーカー） =====================
@@ -357,6 +428,8 @@ pub struct AioJob {
     request: Option<Py<NativeRequest>>,
     out: Option<Arc<Out>>,
     ws: Option<Py<NativeWebSocket>>,
+    // B-207: WebSocket のジョブの共有状態（承認も拒否もしないまま捨てられたら 500 で断る。GIL 無しで触る）
+    ws_state: Option<Arc<WsShared>>,
 }
 
 impl AioJob {
@@ -369,6 +442,7 @@ impl AioJob {
             request: None,
             out: None,
             ws: None,
+            ws_state: None,
         }
     }
 
@@ -387,6 +461,10 @@ impl Drop for AioJob {
         // 応答を積まずに捨てられた（ワーカーは 500 にする）
         if let Some(o) = &self.out {
             o.close_tx();
+        }
+        // B-207: 承認も拒否もされずに捨てられた WebSocket は 500 で断る（決まっていれば何もしない）
+        if let Some(w) = &self.ws_state {
+            w.decide(Ctl::Reject(500));
         }
     }
 }
