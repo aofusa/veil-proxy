@@ -184,5 +184,57 @@ class TestJsonFast(unittest.TestCase):
             self.assertIsNone(_veil._json_fast(c), c)
 
 
+@unittest.skipUnless(HAVE_NATIVE, "native extension not built")
+class TestGrpcClientCancel(unittest.TestCase):
+    # B-203: 応答ヘッダの前（何も返さないサーバ）でも取消しが効き、status() が戻る
+    def test_cancel_before_response_headers(self):
+        import socket
+        import threading
+
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        held = []
+        stop = threading.Event()
+
+        def accept():
+            srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    held.append(srv.accept()[0])  # 受けるだけで何も返さない
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=accept, daemon=True)
+        t.start()
+        try:
+            ch = _veil.GrpcChannel("http://127.0.0.1:%d" % srv.getsockname()[1])
+            call = ch.call("/demo.Demo/Hello")
+            call.send(b"")
+            out = []
+            waiter = threading.Thread(target=lambda: out.append(call.status()), daemon=True)
+            waiter.start()
+            waiter.join(0.5)
+            self.assertTrue(waiter.is_alive(), "the call should still be waiting for the server")
+            call.cancel()
+            waiter.join(10)
+            self.assertFalse(waiter.is_alive(), "status() did not return after cancel()")
+            self.assertEqual(out[0][0], 1)  # CANCELLED
+            self.assertIsNone(call.recv())
+        finally:
+            stop.set()
+            t.join(2)
+            for c in held:
+                c.close()
+            srv.close()
+
+    # B-203: 大きすぎる・負・NaN の timeout は panic せず ValueError
+    def test_invalid_timeout(self):
+        ch = _veil.GrpcChannel("http://127.0.0.1:9")
+        for t in (1e300, -1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError, msg=repr(t)):
+                ch.call("/demo.Demo/Hello", [], t)
+
+
 if __name__ == "__main__":
     unittest.main()

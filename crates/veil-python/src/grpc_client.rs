@@ -115,6 +115,9 @@ struct CallShared {
     // クライアントのスレッドで作る旗（要求の起床・取消しの起床）。作る前は None
     flag: Mutex<Option<(Arc<WakeFlag>, Arc<WakeFlag>)>>,
     cancelled: std::sync::atomic::AtomicBool,
+    // B-203: 応答側（UpStream）を捨てた後。取消しでは、これが立つまで要求のストリームを終えない
+    // （先に終えると END_STREAM ＝正常な半クローズになり、途中までの入力を完全な要求として処理される）
+    resp_gone: std::sync::atomic::AtomicBool,
     sending_done: std::sync::atomic::AtomicBool,
     resp: Mutex<RespState>,
     cond: Condvar,
@@ -218,6 +221,8 @@ fn status_final(st: &Status, initial: Vec<(Bytes, Bytes)>) -> Final {
     )
 }
 
+// B-203: 呼び出し全体（接続・応答ヘッダの待ちを含む）を取消しと競わせる。取り消したら応答側を捨てて
+// RST_STREAM(CANCEL) を送らせ、その後で要求のストリームを終える（END_STREAM を先に送らない）。
 async fn run_call(
     channel: Channel,
     path: String,
@@ -225,19 +230,64 @@ async fn run_call(
     timeout: Option<Duration>,
     call: Arc<CallShared>,
 ) {
+    use std::sync::atomic::Ordering;
     // 待ち手ごとに旗を分ける（1 つの旗を 2 か所で reset すると起床を取りこぼす）
     let flag = Arc::new(WakeFlag::new());
     let cancel_flag = Arc::new(WakeFlag::new());
     *call.flag.lock().unwrap() = Some((Arc::clone(&flag), Arc::clone(&cancel_flag)));
-    // 要求のストリーム: キューから取り出す（送り終わり・取消しで終わる）
-    let src = Arc::clone(&call);
+    let outcome = {
+        let work = call_body(channel, path, metadata, timeout, &call, &flag);
+        futures::pin_mut!(work);
+        let cancel = async {
+            loop {
+                cancel_flag.reset();
+                if call.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                cancel_flag.wait().await;
+            }
+        };
+        futures::pin_mut!(cancel);
+        match futures::future::select(work, cancel).await {
+            futures::future::Either::Left((f, _)) => Some(f),
+            futures::future::Either::Right(_) => None,
+        }
+        // ここで `work`（応答のストリーム・UpStream）を捨てる → アクターが RST_STREAM(CANCEL) を送る
+    };
+    // 要求のストリームはここから終えてよい（取消しのときも、応答側を捨てた後）
+    call.resp_gone.store(true, Ordering::Release);
+    flag.notify();
+    let f = outcome.unwrap_or_else(|| {
+        let initial = call.resp.lock().unwrap().initial.clone();
+        (1, "cancelled".into(), initial, Vec::new())
+    });
+    call.finish(f);
+}
+
+/// The call itself: sends the request stream, delivers the responses and returns the final status.
+async fn call_body(
+    channel: Channel,
+    path: String,
+    metadata: Vec<(Bytes, Bytes)>,
+    timeout: Option<Duration>,
+    call: &Arc<CallShared>,
+    flag: &Arc<WakeFlag>,
+) -> Final {
+    use std::sync::atomic::Ordering;
+    // 要求のストリーム: キューから取り出す（送り終わり・呼び出しの終わりで終わる）
+    let src = Arc::clone(call);
     let reqs = Box::pin(futures::stream::unfold(
-        (src, Arc::clone(&flag)),
+        (src, Arc::clone(flag)),
         |(s, f)| async move {
             loop {
                 f.reset();
-                if s.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                if s.resp_gone.load(Ordering::Acquire) {
                     return None;
+                }
+                if s.cancelled.load(Ordering::Acquire) {
+                    // 取消し: 応答側を捨てる（RST_STREAM）まで終端を送らない
+                    f.wait().await;
+                    continue;
                 }
                 let item = s.reqs.lock().unwrap().pop_front();
                 match item {
@@ -260,53 +310,19 @@ async fn run_call(
         .await
     {
         Ok(r) => r,
-        Err(st) => {
-            call.finish(status_final(&st, Vec::new()));
-            return;
-        }
+        Err(st) => return status_final(&st, Vec::new()),
     };
     let initial = resp.metadata().to_vec();
     call.resp.lock().unwrap().initial = initial.clone();
     let mut stream = resp.into_inner();
     loop {
-        if call.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            call.finish((1, "cancelled".into(), initial, Vec::new()));
-            return;
-        }
-        // 取消しはメッセージを待つ間にも効かせる（旗で起こす）
-        let msg = {
-            let next = stream.message();
-            futures::pin_mut!(next);
-            let cancel = async {
-                loop {
-                    cancel_flag.reset();
-                    if call.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                        return;
-                    }
-                    cancel_flag.wait().await;
-                }
-            };
-            futures::pin_mut!(cancel);
-            match futures::future::select(next, cancel).await {
-                futures::future::Either::Left((m, _)) => Some(m),
-                futures::future::Either::Right(_) => None,
-            }
-        };
-        match msg {
-            None => {
-                call.finish((1, "cancelled".into(), initial, Vec::new()));
-                return;
-            }
-            Some(Ok(Some(b))) => call.push_msg(b),
-            Some(Ok(None)) => {
+        match stream.message().await {
+            Ok(Some(b)) => call.push_msg(b),
+            Ok(None) => {
                 let trailers = stream.trailers().to_vec();
-                call.finish((0, String::new(), initial, trailers));
-                return;
+                return (0, String::new(), initial, trailers);
             }
-            Some(Err(st)) => {
-                call.finish(status_final(&st, initial));
-                return;
-            }
+            Err(st) => return status_final(&st, initial),
         }
     }
 }
@@ -372,19 +388,18 @@ impl GrpcChannel {
             };
             md.push((Bytes::from(n.to_ascii_lowercase()), v));
         }
+        // B-203: 大きすぎる値で Duration::from_secs_f64 が panic しない
         let timeout = match timeout {
-            Some(t) if !(t.is_finite() && t >= 0.0) => {
-                return Err(PyValueError::new_err(
-                    "timeout must be a non-negative number",
-                ))
-            }
-            Some(t) => Some(Duration::from_secs_f64(t)),
+            Some(t) => Some(Duration::try_from_secs_f64(t).map_err(|_| {
+                PyValueError::new_err("timeout must be a non-negative number of seconds")
+            })?),
             None => None,
         };
         let shared = Arc::new(CallShared {
             reqs: Mutex::new(VecDeque::new()),
             flag: Mutex::new(None),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            resp_gone: std::sync::atomic::AtomicBool::new(false),
             sending_done: std::sync::atomic::AtomicBool::new(false),
             resp: Mutex::new(RespState::default()),
             cond: Condvar::new(),
@@ -518,7 +533,8 @@ impl GrpcCall {
     }
 }
 
-// 終わる前に Python のオブジェクトが捨てられたら取り消す（相手に RST_STREAM を送り、task を終わらせる）
+// 終わる前に Python のオブジェクトが捨てられたら取り消す（応答側を捨てて相手に RST_STREAM(CANCEL) を送り、
+// task を終わらせる。接続・応答ヘッダの待ちの間でも効く。B-203）
 impl Drop for GrpcCall {
     fn drop(&mut self) {
         if self.shared.resp.lock().unwrap().done.is_none() {

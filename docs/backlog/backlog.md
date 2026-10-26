@@ -524,6 +524,7 @@
 | B-200 | P3 | 修正済み（v0.10.0） | [bugs/B-200-kit-sessions-expiry-and-memory-store.md](bugs/B-200-kit-sessions-expiry-and-memory-store.md) | veil-kit の Sessions: Cookie 保存は期限をサーバで検査せず、MemoryStore は上限が無く掃除の時機が偏る |
 | B-201 | P3 | 修正済み（v0.10.0） | [bugs/B-201-jwt-exp-and-audience.md](bugs/B-201-jwt-exp-and-audience.md) | JWT: veil-kit は exp を必須にせず数値でない exp を黙って飛ばし、Python の veil_kit は audience を指定しないと aud を検査しない |
 | B-202 | P2 | 修正済み（v0.10.0） | [bugs/B-202-asgi-streaming-cancels-background.md](bugs/B-202-asgi-streaming-cancels-background.md) | ASGI のストリーミング応答で、最後の断片の後にアプリのタスクを cancel して background が消える |
+| B-203 | P2 | 修正済み（v0.10.0） | [bugs/B-203-python-grpc-client-cancel.md](bugs/B-203-python-grpc-client-cancel.md) | Python の gRPC クライアント: 取消しが応答ヘッダの前に効かず、ストリーミングの途中の取消しで END_STREAM を送る。大きな timeout で panic |
 
 ---
 
