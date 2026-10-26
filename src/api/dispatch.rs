@@ -29,6 +29,8 @@ pub(crate) fn build_request(
             .parse::<IpAddr>()
             .unwrap_or(IpAddr::from([0, 0, 0, 0])),
         version,
+        // HTTP/3 は常に TLS。HTTP/1.1・HTTP/2 は呼び出し側が接続を見て立てる（B-204）
+        tls: version == HttpVersion::Http3,
         body_stream: None,
         extensions: Default::default(),
     }

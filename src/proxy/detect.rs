@@ -371,8 +371,14 @@ pub async fn handle_h2c_connection(
     let mut connection_metric = ActiveConnectionMetric::new(true);
 
     // 既存のHTTP/2リクエスト処理を使用
-    let result =
-        handle_http2_requests(&mut conn, client_ip, &mut connection_metric, redirect_https).await;
+    let result = handle_http2_requests(
+        &mut conn,
+        client_ip,
+        &mut connection_metric,
+        redirect_https,
+        false,
+    )
+    .await;
 
     if let Err(e) = result {
         warn!("[H2C] Connection error: {}", e);

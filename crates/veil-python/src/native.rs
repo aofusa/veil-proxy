@@ -118,7 +118,8 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
 impl NativeRequest {
     /// Build a request directly (tests); takes the same arguments as `veil.Request`.
     #[new]
-    #[pyo3(signature = (method="GET", path="/", query="", headers=None, body=None, params=None, client_ip=""))]
+    #[pyo3(signature = (method="GET", path="/", query="", headers=None, body=None, params=None, client_ip="", tls=false))]
+    #[allow(clippy::too_many_arguments)] // Python のキーワード引数（veil.Request と同じ形）
     fn py_new(
         method: &str,
         path: &str,
@@ -127,6 +128,7 @@ impl NativeRequest {
         body: Option<Vec<u8>>,
         params: Option<std::collections::HashMap<String, String>>,
         client_ip: &str,
+        tls: bool,
     ) -> NativeRequest {
         let target = if query.is_empty() {
             path.to_string()
@@ -138,7 +140,8 @@ impl NativeRequest {
             .into_iter()
             .map(|(n, v)| (Bytes::from(n), Bytes::from(v)))
             .collect();
-        let mut req = Request::new(method.to_string(), target, hdrs, body.unwrap_or_default());
+        let mut req =
+            Request::new(method.to_string(), target, hdrs, body.unwrap_or_default()).with_tls(tls);
         if let Ok(ip) = client_ip.parse() {
             req = req.with_client_ip(ip);
         }
@@ -303,6 +306,13 @@ impl NativeRequest {
     #[getter]
     fn http_version(&self) -> &'static str {
         self.req.version().as_str()
+    }
+
+    // B-204
+    /// Whether veil received the request over TLS (HTTP/3 always; `X-Forwarded-Proto` is not consulted).
+    #[getter]
+    fn is_tls(&self) -> bool {
+        self.req.is_tls()
     }
 
     /// Body decoded as UTF-8 (lossy).

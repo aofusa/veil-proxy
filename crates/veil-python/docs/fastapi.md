@@ -80,6 +80,7 @@ app.run(listen_cleartext="0.0.0.0:8000")
   sees `receive` / `send` on veil's persistent event loop. `root_path` is the mount path.
 - The request body is read before the application is called (`[api] max_body_size` applies). The client port is not
   known (`client` is `(ip, 0)`). `http.response.pathsend` reads the file in Python.
+- `scheme` is `https` when veil received the request over TLS (a TLS listener, or HTTP/3). `X-Forwarded-Proto` is
   used only from trusted proxies, as with uvicorn's `--forwarded-allow-ips`: `veil.asgi.run(api,
   forwarded_allow_ips=["10.0.0.0/8"])` or `app.mount("/legacy", api, forwarded_allow_ips="10.0.0.1")` (`"*"` trusts
   every client); the default is the `FORWARDED_ALLOW_IPS` environment variable, or `127.0.0.1`.

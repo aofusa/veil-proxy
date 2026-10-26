@@ -169,8 +169,9 @@ class Request(metaclass=abc.ABCMeta):
     attribute is created only when it is read) is passed, and ``isinstance(req, veil.Request)`` is true.
     """
 
-    def __init__(self, method="GET", path="/", query="", headers=(), body=b"", params=None, client_ip=""):
+    def __init__(self, method="GET", path="/", query="", headers=(), body=b"", params=None, client_ip="", tls=False):
         """Build a request directly (useful in unit tests)."""
+        self.is_tls = bool(tls)
         self.method = method
         self.path = path
         self.query = query
@@ -183,6 +184,8 @@ class Request(metaclass=abc.ABCMeta):
 
     # F-268: HTTP の版（サーバの中では NativeRequest が実際の版を返す）
     http_version = "HTTP/1.1"
+    # B-204: veil が TLS で受けたか（サーバの中では NativeRequest が返す）
+    is_tls = False
 
     @property
     def cookies(self):
@@ -2305,9 +2308,10 @@ class App:
         extra = "\n".join("%s = %s" % (k, _toml_literal(v)) for k, v in route_options.items()) or None
         self.static_dirs.append((path.rstrip("/") or "/", os.path.abspath(directory), index, bool(cache), extra))
 
-    def mount(self, path, app, name=None):
+    def mount(self, path, app, name=None, *, forwarded_allow_ips=None):
         """Mount ``app`` at ``path``: a ``veil_kit.staticfiles.StaticFiles`` or an ASGI application (FastAPI,
-        Starlette, ...; see :mod:`veil.asgi`)."""
+        Starlette, ...; see :mod:`veil.asgi`). ``forwarded_allow_ips`` lists the proxies whose ``X-Forwarded-Proto``
+        sets the ASGI ``scheme`` (default: ``FORWARDED_ALLOW_IPS`` or ``127.0.0.1``)."""
         prefix = path.rstrip("/")
         hook = getattr(app, "_veil_mount", None)
         if hook is not None:
@@ -2316,7 +2320,7 @@ class App:
         if callable(app):
             from .asgi import ASGIApp
 
-            self.asgi_mounts.append(ASGIApp(app, prefix))
+            self.asgi_mounts.append(ASGIApp(app, prefix, forwarded_allow_ips))
             return
         raise TypeError("app.mount() takes StaticFiles or an ASGI application, not %r" % (app,))
 

@@ -337,7 +337,7 @@ route settings to it.
 
 `Request` gives `method()`, `path()`, `query()`, `query_param(name)`, `header(name)`, `headers()`, `body()`
 (`&Bytes`), `text()`, `json::<T>()`, `param(name)`, `param_as::<T>(name)`, `client_ip()`, `version()`
-(HTTP/1.1, 2 or 3) and `state::<T>()`.
+(HTTP/1.1, 2 or 3), `is_tls()` (received over TLS; HTTP/3 always) and `state::<T>()`.
 
 A handler may return anything that implements `IntoResponse`:
 
@@ -1272,7 +1272,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
 - **ASGI (F-268):** `veil.asgi.run(fastapi_app)` serves a FastAPI / Starlette application in place of uvicorn, and
   `app.mount("/legacy", fastapi_app)` puts one under a path of a veil application (`http` with the trailers and
   pathsend extensions, `websocket`, `lifespan`). veil does HTTP/1.1, HTTP/2, HTTP/3, TLS and compression; the
-  application runs on the persistent event loop.
+  application runs on the persistent event loop. The ASGI `scheme` follows the TLS of the connection
+  (`Request.is_tls`); `X-Forwarded-Proto` counts only from `forwarded_allow_ips` (default `FORWARDED_ALLOW_IPS` or
+  `127.0.0.1`).
 - **`veil-api-kit` (F-268)**, a pure-Python package (`pip install veil-api-kit`, `import veil_kit`, same version as
   `veil-api`): signed cookies and sessions, `CORSMiddleware` (answered by the server), the security schemes of
   `fastapi.security` and JWT (PyJWT), `safe_redirect`, `StaticFiles` (served by the server's file backend),

@@ -520,6 +520,35 @@ class TestASGI(unittest.TestCase):
             loop.close()
         self.assertEqual(events, ["bg", "stream-bg"])
 
+    # B-204: scheme は接続の TLS で決め、X-Forwarded-Proto は信頼するプロキシからだけ使う
+    def test_scheme_from_tls_and_trusted_proxies(self):
+        from veil.asgi import ASGIApp
+
+        def scheme(app, **kw):
+            return app._scope(veil.Request("GET", "/", **kw))["scheme"]
+
+        a = ASGIApp(lambda *a: None)
+        self.assertEqual(scheme(a), "http")
+        self.assertEqual(scheme(a, tls=True), "https")
+        fwd = [("x-forwarded-proto", "https")]
+        self.assertEqual(scheme(a, headers=fwd, client_ip="203.0.113.9"), "http")
+        self.assertEqual(scheme(a, headers=fwd, client_ip="127.0.0.1"), "https")
+        down = [("x-forwarded-proto", "http")]
+        self.assertEqual(scheme(a, headers=down, client_ip="203.0.113.9", tls=True), "https")
+        b = ASGIApp(lambda *a: None, forwarded_allow_ips="10.0.0.0/8, 192.0.2.1")
+        self.assertEqual(scheme(b, headers=fwd, client_ip="10.1.2.3"), "https")
+        self.assertEqual(scheme(b, headers=fwd, client_ip="192.0.2.1"), "https")
+        self.assertEqual(scheme(b, headers=fwd, client_ip="127.0.0.1"), "http")
+        self.assertEqual(scheme(ASGIApp(lambda *a: None, forwarded_allow_ips=["*"]), headers=fwd,
+                                client_ip="198.51.100.1"), "https")
+        self.assertEqual(scheme(ASGIApp(lambda *a: None, forwarded_allow_ips=[]), headers=fwd,
+                                client_ip="127.0.0.1"), "http")
+        with self.assertRaises(ValueError):
+            ASGIApp(lambda *a: None, forwarded_allow_ips="not-an-ip")
+        app = veil.App()
+        app.mount("/x", lambda *a: None, forwarded_allow_ips="10.0.0.1")
+        self.assertEqual(app.asgi_mounts[-1].trusted[0].with_prefixlen, "10.0.0.1/32")
+
     def test_fastapi_app(self):
         try:
             import fastapi

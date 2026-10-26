@@ -18,15 +18,22 @@ terminates TLS, compresses and logs; the ASGI application runs on the persistent
 ``receive`` / ``send`` events. Supported scopes: ``http`` (with the ``http.response.trailers`` and
 ``http.response.pathsend`` extensions), ``websocket`` (HTTP/1.1) and ``lifespan``.
 
+``scheme`` is ``https`` when veil received the request over TLS (HTTP/1.1 and HTTP/2 on a TLS listener, and
+HTTP/3). As with uvicorn's ``--forwarded-allow-ips``, ``X-Forwarded-Proto`` is used only when the request comes
+from a trusted proxy: ``forwarded_allow_ips`` of :func:`run` / ``App.mount`` (a list or a comma-separated string of
+addresses and networks, ``"*"`` for any), by default the ``FORWARDED_ALLOW_IPS`` environment variable or
+``127.0.0.1``.
+
 Differences from uvicorn: the request body is read before the application is called (``[api] max_body_size``
-applies), ``scheme`` is ``https`` only for HTTP/3 (or when the client sent ``x-forwarded-proto``), and the client
-port is not known (``client`` is ``(ip, 0)``).
+applies) and the client port is not known (``client`` is ``(ip, 0)``).
 """
 
 # F-268: ASGI のアプリを veil の上で動かす。HTTP の解析・TLS・HTTP/2・HTTP/3 は Rust、ASGI のアプリには
 # receive / send のイベントだけを渡す。
 
 import asyncio
+import ipaddress
+import os
 import traceback
 
 __all__ = ["run", "ASGIApp"]
@@ -48,15 +55,49 @@ def _http_version(req):
     return {"HTTP/1.1": "1.1", "HTTP/2": "2", "HTTP/3": "3"}.get(v, "1.1")
 
 
-def _scheme(req, http_version, websocket=False):
+# B-204: scheme は veil が TLS で受けたかで決める。X-Forwarded-Proto はクライアントが自由に付けられるので、
+# 信頼するプロキシ（uvicorn の --forwarded-allow-ips と同じ。既定は 127.0.0.1）から来たときだけ使う。
+def _trusted_proxies(spec):
+    """Parse ``forwarded_allow_ips`` into ``True`` (any) or a tuple of networks."""
+    if spec is None:
+        spec = os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")
+    if isinstance(spec, str):
+        spec = [s for s in (x.strip() for x in spec.split(",")) if s]
+    nets = []
+    for s in spec:
+        if s == "*":
+            return True
+        try:
+            nets.append(ipaddress.ip_network(s, strict=False))
+        except ValueError as e:
+            raise ValueError("forwarded_allow_ips: %r is not an IP address or network" % (s,)) from e
+    return tuple(nets)
+
+
+def _is_trusted(trusted, ip):
+    if trusted is True:
+        return True
+    if not trusted or not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in n for n in trusted)
+
+
+def _scheme(req, trusted, websocket=False):
+    secure = bool(getattr(req, "is_tls", False))
     fwd = req.headers.get("x-forwarded-proto")
-    if fwd:
-        s = fwd.split(",")[0].strip().lower()
-    else:
-        s = "https" if http_version == "3" else "http"
+    if fwd and _is_trusted(trusted, req.client_ip):
+        p = fwd.split(",")[0].strip().lower()
+        if p in ("https", "wss"):
+            secure = True
+        elif p in ("http", "ws"):
+            secure = False
     if websocket:
-        return "wss" if s == "https" else "ws"
-    return s
+        return "wss" if secure else "ws"
+    return "https" if secure else "http"
 
 
 def _server(req):
@@ -77,10 +118,12 @@ class ASGIApp:
     compress = True
     params = ()
 
-    def __init__(self, app, prefix=""):
-        """Wrap ``app`` (an ASGI 3 callable) mounted at ``prefix``."""
+    def __init__(self, app, prefix="", forwarded_allow_ips=None):
+        """Wrap ``app`` (an ASGI 3 callable) mounted at ``prefix``; ``forwarded_allow_ips`` lists the proxies whose
+        ``X-Forwarded-Proto`` is trusted (see the module documentation)."""
         self.app = app
         self.prefix = prefix.rstrip("/")
+        self.trusted = _trusted_proxies(forwarded_allow_ips)
         self.state = {}
         self._lifespan = None
 
@@ -95,7 +138,7 @@ class ASGIApp:
             "asgi": {"version": "3.0", "spec_version": "2.4"},
             "http_version": hv,
             "method": req.method,
-            "scheme": _scheme(req, hv),
+            "scheme": _scheme(req, self.trusted),
             "path": path,
             "raw_path": path.encode("utf-8"),
             "query_string": q.encode("latin-1"),
@@ -271,7 +314,7 @@ class ASGIApp:
             "type": "websocket",
             "asgi": {"version": "3.0", "spec_version": "2.4"},
             "http_version": hv,
-            "scheme": _scheme(req, hv, websocket=True),
+            "scheme": _scheme(req, self.trusted, websocket=True),
             "path": req.path,
             "raw_path": req.path.encode("utf-8"),
             "query_string": q.encode("latin-1"),
@@ -380,11 +423,12 @@ def _read_file(path):
         return f.read()
 
 
-def run(app, **kwargs):
-    """Serve the ASGI application ``app`` (keyword arguments as for :meth:`veil.App.run`)."""
+def run(app, forwarded_allow_ips=None, **kwargs):
+    """Serve the ASGI application ``app`` (keyword arguments as for :meth:`veil.App.run`; ``forwarded_allow_ips``
+    as for ``App.mount``)."""
     from . import App
 
     host = App()
-    host.mount("/", app)
+    host.mount("/", app, forwarded_allow_ips=forwarded_allow_ips)
     kwargs.setdefault("openapi", False)
     host.run(**kwargs)

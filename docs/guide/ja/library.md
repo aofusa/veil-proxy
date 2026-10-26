@@ -323,7 +323,7 @@ host・正規化したパス（パラメータ名は無視）・その他の条�
 ## Request・Response・エラー
 
 `Request` には `method()`・`path()`・`query()`・`query_param(name)`・`header(name)`・`headers()`・`body()`（`&Bytes`）・`text()`・
-`json::<T>()`・`param(name)`・`param_as::<T>(name)`・`client_ip()`・`version()`（HTTP/1.1・2・3）・`state::<T>()` があります。
+`json::<T>()`・`param(name)`・`param_as::<T>(name)`・`client_ip()`・`version()`（HTTP/1.1・2・3）・`is_tls()`（TLS で受けたか。HTTP/3 は常に真）・`state::<T>()` があります。
 
 ハンドラは `IntoResponse` を実装する型なら何でも返せます。
 
@@ -1205,6 +1205,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 - **ASGI（F-268）:** `veil.asgi.run(fastapi_app)` で uvicorn の代わりに FastAPI・Starlette のアプリを動かし、
   `app.mount("/legacy", fastapi_app)` で veil のアプリのパスの下に載せます（`http`（trailers・pathsend の拡張）・`websocket`・
   `lifespan`）。HTTP/1.1・HTTP/2・HTTP/3・TLS・圧縮は veil が受け持ち、アプリは常駐のイベントループで動きます。
+  ASGI の `scheme` は接続の TLS（`Request.is_tls`）で決め、`X-Forwarded-Proto` は `forwarded_allow_ips`（既定は
+  `FORWARDED_ALLOW_IPS` か `127.0.0.1`）から来たときだけ使います。
 - **`veil-api-kit`（F-268）:** 純 Python のパッケージ（`pip install veil-api-kit`、`import veil_kit`、版は `veil-api` と同じ）。
   署名付き Cookie とセッション、`CORSMiddleware`（サーバが答える）、`fastapi.security` と同じ認証の方式と JWT（PyJWT）、
   `safe_redirect`、`StaticFiles`（サーバのファイル配信）、strawberry の GraphQL（HTTP・SSE・WebSocket）、`grpc_tools` の

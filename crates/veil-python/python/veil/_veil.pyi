@@ -111,6 +111,7 @@ class NativeRequest:
         body: bytes | None = None,
         params: dict[str, str] | None = None,
         client_ip: str = "",
+        tls: bool = False,
     ) -> NativeRequest:
         """Build a request directly (tests)."""
     @property
@@ -143,6 +144,9 @@ class NativeRequest:
     @property
     def http_version(self) -> str:
         """``"1.1"``, ``"2"`` or ``"3"``."""
+    @property
+    def is_tls(self) -> bool:
+        """Whether veil received the request over TLS (HTTP/3 always)."""
     def stream(self) -> NativeBodyIter:
         """Iterate over the body chunks as they arrive (``stream_body=True`` routes)."""
     def json(self) -> Any:

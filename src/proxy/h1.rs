@@ -1811,7 +1811,7 @@ pub(super) async fn handle_api_handler(
         }
     };
     // メソッド・パスは要求ヘッダの領域を指す Bytes（参照カウントだけ。F-202）
-    let req = crate::api::dispatch::build_request(
+    let mut req = crate::api::dispatch::build_request(
         method.clone(),
         req_path.clone(),
         headers,
@@ -1819,6 +1819,7 @@ pub(super) async fn handle_api_handler(
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
+    req.tls = !tls_stream.is_plain();
     let resp = crate::api::dispatch::call_with(entry, req, api_cache, comp).await;
     write_api_response(tls_stream, resp, security, client_wants_close, api_cache).await
 }
@@ -1916,6 +1917,7 @@ async fn handle_api_streaming(
         client_ip,
         crate::api::request::HttpVersion::Http11,
     );
+    req.tls = !tls_stream.is_plain();
     req.body_stream = Some(slot);
     let first = &initial_body[..initial_body.len().min(content_length)];
     let first = (!first.is_empty()).then(|| Bytes::copy_from_slice(first));

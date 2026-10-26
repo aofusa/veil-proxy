@@ -46,6 +46,8 @@ pub struct Request {
     pub(crate) params: PathParams,
     pub(crate) client_ip: IpAddr,
     pub(crate) version: HttpVersion,
+    // B-204: TLS で受けた要求か（ASGI の scheme 等。X-Forwarded-Proto はクライアントが自由に付けられる）
+    pub(crate) tls: bool,
     // F-197
     /// The body when received as a stream (for a `streaming_request` route over HTTP/2).
     pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
@@ -148,6 +150,7 @@ impl Request {
             params: Vec::new(),
             client_ip: IpAddr::from([127, 0, 0, 1]),
             version: HttpVersion::Http11,
+            tls: false,
             body_stream: None,
             extensions: Extensions::default(),
         }
@@ -162,6 +165,12 @@ impl Request {
     /// A copy with the client IP replaced.
     pub fn with_client_ip(mut self, ip: IpAddr) -> Request {
         self.client_ip = ip;
+        self
+    }
+
+    /// A copy marked as received over TLS or not (for tests and adapters; see [`is_tls`](Request::is_tls)).
+    pub fn with_tls(mut self, tls: bool) -> Request {
+        self.tls = tls;
         self
     }
 
@@ -264,6 +273,12 @@ impl Request {
     /// The protocol of the request.
     pub fn version(&self) -> HttpVersion {
         self.version
+    }
+
+    /// Whether the request arrived over TLS on veil's listener (HTTP/3 always does). Headers such as
+    /// `X-Forwarded-Proto` are not consulted: the client can send them.
+    pub fn is_tls(&self) -> bool {
+        self.tls
     }
 
     // F-261

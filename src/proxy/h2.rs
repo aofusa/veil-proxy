@@ -48,7 +48,8 @@ where
     let mut connection_metric = ActiveConnectionMetric::new(true);
 
     // カスタムリクエストハンドラーを使用してメインループ実行
-    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric, None).await;
+    let result =
+        handle_http2_requests(&mut conn, client_ip, &mut connection_metric, None, true).await;
 
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
@@ -72,6 +73,8 @@ pub(super) async fn handle_http2_requests<S>(
     // F-200: 平文リスナー（`listen_cleartext`）で `enable_secure_redirect = true` のとき、
     // すべての要求を https へ 301 で返す（TLS の接続は常に None）。値はリダイレクト先のポート（F-260）。
     redirect_https: Option<u16>,
+    // B-204: TLS（ALPN の h2）の接続か。平文の h2c は false
+    tls: bool,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent
@@ -82,6 +85,7 @@ where
 {
     let svc = ProxyH2Service {
         spawner: h2_task_spawner(),
+        tls,
     };
     handle_http2_requests_with(conn, client_ip, connection_metric, redirect_https, &svc).await
 }
@@ -110,12 +114,19 @@ pub(crate) trait H2Service {
         resp_tx: crate::stream_channel::Sender<H2RespMsg>,
         notify: crate::stream_channel::Notify,
     );
+
+    /// 接続が TLS か（B-204。ハンドラの `Request::is_tls` になる。既定は false）。
+    #[inline]
+    fn tls(&self) -> bool {
+        false
+    }
 }
 
 /// 通常のプロキシの per-stream 処理（ルーティング・セキュリティ・WASM・バックエンド）。
 #[cfg(feature = "http2")]
 pub(super) struct ProxyH2Service {
     spawner: H2TaskSpawner,
+    tls: bool,
 }
 
 #[cfg(feature = "http2")]
@@ -143,6 +154,11 @@ impl H2Service for ProxyH2Service {
         notify: crate::stream_channel::Notify,
     ) {
         (self.spawner)(ctx, req_rx, resp_tx, notify)
+    }
+
+    #[inline]
+    fn tls(&self) -> bool {
+        self.tls
     }
 }
 
@@ -492,6 +508,8 @@ pub(crate) struct H2RequestCtx {
     pub(crate) client_socket_addr: SocketAddr,
     /// 平文リスナーの `enable_secure_redirect`（F-200）。`Some(port)` なら要求を https の `port` へ 301 で返す（F-260）。
     pub(crate) redirect_https: Option<u16>,
+    /// TLS（ALPN の h2）の接続か。平文の h2c・メッシュは false（B-204。ハンドラの `Request::is_tls`）。
+    pub(crate) tls: bool,
     pub(crate) start: Instant,
 }
 
@@ -668,6 +686,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
         client_ip: std::rc::Rc::clone(client_ip),
         client_socket_addr,
         redirect_https,
+        tls: svc.tls(),
         // アクセスログ・メトリクスが無効なら時刻を読まない（ストリームごとの固定費）。
         start: crate::logging::request_start_instant(),
     };
@@ -1575,6 +1594,7 @@ pub(super) async fn h2_dispatch(
             client_ip: ctx.client_ip.clone(),
             client_socket_addr: ctx.client_socket_addr,
             redirect_https: ctx.redirect_https,
+            tls: ctx.tls,
             start: ctx.start,
         };
         &modified_ctx
@@ -1750,6 +1770,7 @@ pub(super) async fn h2_api_handler(
         &ctx.client_ip,
         crate::api::request::HttpVersion::Http2,
     );
+    req.tls = ctx.tls;
     let Some(rx) = req_rx else {
         let (status, size) = h2_api_respond(entry, comp, security, req, resp_tx, notify).await;
         return (status, size, ctx.body.len() as u64);

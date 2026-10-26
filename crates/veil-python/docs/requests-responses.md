@@ -26,6 +26,7 @@ def echo(req: veil.Request):
 | `client_ip` | the client address |
 | `cookies` | the `Cookie` header as a `dict` (the last value of a repeated name) |
 | `http_version` | `"1.1"`, `"2"` or `"3"` |
+| `is_tls` | whether veil received the request over TLS (HTTP/3 always) |
 | `stream()` | iterate over the body as it arrives (routes with `stream_body=True`) |
 
 Inside the server the object is a Rust-backed `veil._veil.NativeRequest` with the same attributes and methods;
