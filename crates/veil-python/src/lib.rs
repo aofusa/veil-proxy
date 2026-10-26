@@ -7,6 +7,7 @@
 
 mod aio;
 mod ext;
+mod grpc_client;
 mod native;
 
 use bytes::Bytes;
@@ -36,6 +37,8 @@ struct PendingRoute {
     form: bool,
     // F-270: 応答を `[route.compression]`・`[api] compression` で圧縮してよい
     compress: bool,
+    // F-268: OpenAPI に載せない（`include_in_schema=False`）
+    hidden: bool,
 }
 
 // F-263: `@app.websocket` のルート（`run` までの間に溜める）。
@@ -105,6 +108,100 @@ enum PendingExtra {
 }
 
 static PENDING_EXTRA: Mutex<Vec<PendingExtra>> = Mutex::new(Vec::new());
+
+// F-268: ASGI のアプリ・CORS・静的ファイル（`run` までの間に溜める）。
+/// An ASGI application mounted at a prefix.
+struct PendingAsgi {
+    prefix: String,
+    handler_id: u64,
+}
+
+static PENDING_ASGI: Mutex<Vec<PendingAsgi>> = Mutex::new(Vec::new());
+static PENDING_CORS: Mutex<Vec<veil_kit::cors::CorsPolicy>> = Mutex::new(Vec::new());
+static PENDING_STATIC: Mutex<Vec<(String, String, veil::api::ServeOptions)>> =
+    Mutex::new(Vec::new());
+
+/// Mount an ASGI application (`handlers[handler_id]` is a `veil.asgi.ASGIApp`) at `prefix` (collected until `run`).
+#[pyfunction]
+fn register_asgi(prefix: String, handler_id: u64) {
+    PENDING_ASGI
+        .lock()
+        .unwrap()
+        .push(PendingAsgi { prefix, handler_id });
+}
+
+/// Answer CORS for the routes below `prefix` (the settings are checked here; see `veil_kit::cors::Cors`).
+#[pyfunction]
+#[pyo3(signature = (prefix="/", origins=Vec::new(), any_origin=false, methods=None, headers=Vec::new(), any_header=false, expose=Vec::new(), credentials=false, max_age=None))]
+#[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
+fn register_cors(
+    prefix: &str,
+    origins: Vec<String>,
+    any_origin: bool,
+    methods: Option<Vec<String>>,
+    headers: Vec<String>,
+    any_header: bool,
+    expose: Vec<String>,
+    credentials: bool,
+    max_age: Option<u64>,
+) -> PyResult<()> {
+    let mut c = veil_kit::cors::Cors::new()
+        .allow_origins(origins)
+        .allow_headers(headers)
+        .expose_headers(expose)
+        .allow_credentials(credentials)
+        .on(prefix);
+    if any_origin {
+        c = c.allow_any_origin();
+    }
+    if any_header {
+        c = c.allow_any_header();
+    }
+    if let Some(m) = methods {
+        c = c.allow_methods(m);
+    }
+    if let Some(s) = max_age {
+        c = c.max_age(std::time::Duration::from_secs(s));
+    }
+    let policy = c
+        .build()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    PENDING_CORS.lock().unwrap().push(policy);
+    Ok(())
+}
+
+/// Serve the directory `dir` below `prefix` with the server's file backend (`extra_toml`: more `[[route]]` keys).
+#[pyfunction]
+#[pyo3(signature = (prefix, dir, index=None, cache=true, extra_toml=None))]
+fn register_static(
+    prefix: String,
+    dir: String,
+    index: Option<String>,
+    cache: bool,
+    extra_toml: Option<String>,
+) -> PyResult<()> {
+    let extra = match extra_toml {
+        Some(t) => Some(
+            toml::from_str::<toml::Table>(&t)
+                .map_err(|e| PyValueError::new_err(format!("invalid route options: {}", e)))?,
+        ),
+        None => None,
+    };
+    let opts = veil::api::ServeOptions {
+        index,
+        open_file_cache: cache,
+        static_file_cache: cache,
+        extra,
+        ..Default::default()
+    };
+    PENDING_STATIC.lock().unwrap().push((prefix, dir, opts));
+    Ok(())
+}
+
+fn is_websocket_upgrade(req: &Request) -> bool {
+    req.header("upgrade")
+        .is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
+}
 
 /// Register a gRPC method; `handlers[handler_id].handle(call)` returns `(code, message)`.
 #[pyfunction]
@@ -285,7 +382,7 @@ impl PyConfig {
 
 /// Register an HTTP route (collected until `run`).
 #[pyfunction]
-#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false, form=false, compress=true))]
+#[pyo3(signature = (path, methods, handler_id, offload=true, openapi_json=None, status_code=200, stream_body=false, on_loop=false, form=false, compress=true, hidden=false))]
 #[allow(clippy::too_many_arguments)] // 理由: Python から呼ぶ登録関数で、引数はキーワード引数として渡る
 fn register_route(
     path: String,
@@ -298,6 +395,7 @@ fn register_route(
     on_loop: bool,
     form: bool,
     compress: bool,
+    hidden: bool,
 ) -> PyResult<()> {
     let openapi = parse_openapi(openapi_json)?;
     PENDING.lock().unwrap().push(PendingRoute {
@@ -311,6 +409,7 @@ fn register_route(
         on_loop,
         form,
         compress,
+        hidden,
     });
     Ok(())
 }
@@ -424,40 +523,9 @@ fn make_handler(route: PyRoute, offload: bool, form: bool) -> HandlerFn {
 fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<()> {
     let routes = std::mem::take(&mut *PENDING.lock().unwrap());
     let mut app = App::new().config(config.inner).without_macro_routes();
-    for (i, r) in routes.into_iter().enumerate() {
-        let methods: Vec<&str> = r.methods.iter().map(|s| s.as_str()).collect();
-        let route = handlers
-            .get(r.handler_id as usize)
-            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", r.handler_id)))?
-            .bind(py);
-        let py_route = PyRoute {
-            call: route.getattr("_call")?.unbind(),
-            fallback: route.getattr("to_response")?.unbind(),
-            status: r.status_code,
-        };
-        let func = if r.on_loop {
-            make_loop_handler(py_route, r.handler_id, r.form)
-        } else {
-            make_handler(py_route, r.offload, r.form)
-        };
-        let meta = OperationMeta {
-            operation_id: format!("py_{}", r.handler_id),
-            raw: r.openapi,
-            hidden: false,
-            ..Default::default()
-        };
-        let name = format!("py_{}_{}", i, r.handler_id);
-        app = if r.stream_body || r.form {
-            app.route_fn_streaming(&name, &methods, &r.path, func, meta)
-        } else {
-            app.route_fn(&name, &methods, &r.path, func, meta)
-        }
-        .route_compression(r.compress);
-    }
-    for (i, w) in std::mem::take(&mut *PENDING_WS.lock().unwrap())
-        .into_iter()
-        .enumerate()
-    {
+    // F-268: WebSocket と同じパスの GET のルートは 1 本にまとめ、Upgrade の有無で振り分ける
+    let mut ws_routes: Vec<Option<(PendingWs, HandlerFn)>> = Vec::new();
+    for w in std::mem::take(&mut *PENDING_WS.lock().unwrap()) {
         let id = w.handler_id;
         let func: HandlerFn = if w.endpoint {
             let route = Arc::new(
@@ -473,6 +541,56 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         } else {
             Arc::new(move |req: Request| Box::pin(aio::websocket_on_loop(id, req)))
         };
+        ws_routes.push(Some((w, func)));
+    }
+    for (i, r) in routes.into_iter().enumerate() {
+        let methods: Vec<&str> = r.methods.iter().map(|s| s.as_str()).collect();
+        let route = handlers
+            .get(r.handler_id as usize)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", r.handler_id)))?
+            .bind(py);
+        let py_route = PyRoute {
+            call: route.getattr("_call")?.unbind(),
+            fallback: route.getattr("to_response")?.unbind(),
+            status: r.status_code,
+        };
+        let mut func = if r.on_loop {
+            make_loop_handler(py_route, r.handler_id, r.form)
+        } else {
+            make_handler(py_route, r.offload, r.form)
+        };
+        if r.methods.iter().any(|m| m.eq_ignore_ascii_case("GET")) {
+            if let Some(slot) = ws_routes
+                .iter_mut()
+                .find(|w| w.as_ref().is_some_and(|(w, _)| w.path == r.path))
+            {
+                let (_, ws) = slot.take().unwrap();
+                let http = func;
+                func = Arc::new(move |req: Request| {
+                    if is_websocket_upgrade(&req) {
+                        ws(req)
+                    } else {
+                        http(req)
+                    }
+                });
+            }
+        }
+        let meta = OperationMeta {
+            operation_id: format!("py_{}", r.handler_id),
+            raw: r.openapi,
+            hidden: r.hidden,
+            ..Default::default()
+        };
+        let name = format!("py_{}_{}", i, r.handler_id);
+        app = if r.stream_body || r.form {
+            app.route_fn_streaming(&name, &methods, &r.path, func, meta)
+        } else {
+            app.route_fn(&name, &methods, &r.path, func, meta)
+        }
+        .route_compression(r.compress);
+    }
+    for (i, (w, func)) in ws_routes.into_iter().flatten().enumerate() {
+        let id = w.handler_id;
         let meta = OperationMeta {
             operation_id: format!("py_ws_{}", id),
             raw: w.openapi,
@@ -486,6 +604,51 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
             func,
             meta,
         );
+    }
+    // F-268: ASGI のアプリ（接頭辞以下の全メソッド。WebSocket は Upgrade で振り分ける）
+    for (i, a) in std::mem::take(&mut *PENDING_ASGI.lock().unwrap())
+        .into_iter()
+        .enumerate()
+    {
+        let id = a.handler_id;
+        let route = handlers
+            .get(id as usize)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", id)))?
+            .bind(py);
+        let py_route = PyRoute {
+            call: route.getattr("_call")?.unbind(),
+            fallback: route.getattr("to_response")?.unbind(),
+            status: 200,
+        };
+        let http = make_loop_handler(py_route, id, false);
+        let func: HandlerFn = Arc::new(move |req: Request| {
+            if is_websocket_upgrade(&req) {
+                Box::pin(aio::websocket_on_loop(id, req))
+            } else {
+                http(req)
+            }
+        });
+        let meta = OperationMeta {
+            operation_id: format!("py_asgi_{}", id),
+            hidden: true,
+            ..Default::default()
+        };
+        let pattern = format!("{}/{{*__veil_asgi}}", a.prefix.trim_end_matches('/'));
+        app = app
+            .route_fn(
+                &format!("py_asgi_{}_{}", i, id),
+                &["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+                &pattern,
+                func,
+                meta,
+            )
+            .route_compression(true);
+    }
+    for (prefix, dir, opts) in std::mem::take(&mut *PENDING_STATIC.lock().unwrap()) {
+        app = app.serve_dir(&prefix, dir, opts);
+    }
+    for policy in std::mem::take(&mut *PENDING_CORS.lock().unwrap()) {
+        app = app.with(policy);
     }
     let handler = |id: u64| -> PyResult<Py<PyAny>> {
         handlers
@@ -554,6 +717,12 @@ fn _veil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_l4_tcp, m)?)?;
     m.add_function(wrap_pyfunction!(register_l4_udp, m)?)?;
     m.add_function(wrap_pyfunction!(register_route, m)?)?;
+    m.add_function(wrap_pyfunction!(register_asgi, m)?)?;
+    m.add_function(wrap_pyfunction!(register_cors, m)?)?;
+    m.add_function(wrap_pyfunction!(register_static, m)?)?;
+    m.add_function(wrap_pyfunction!(grpc_client::grpc_client_setup, m)?)?;
+    m.add_class::<grpc_client::GrpcChannel>()?;
+    m.add_class::<grpc_client::GrpcCall>()?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
     m.add_function(wrap_pyfunction!(native::_json_fast, m)?)?;

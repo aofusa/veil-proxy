@@ -7,6 +7,9 @@ Cookie・リダイレクト・静的ファイル・CORS・認証（Basic・API �
 GraphQL・依存性注入・バックグラウンドタスク。veil とは別のクレートで、プロキシのバイナリ・veil の既定の feature・`full*` には
 入りません。重い依存（async-graphql・prost）は kit の feature の後ろにあります。
 
+Python では、パッケージ `veil-api-kit`（`import veil_kit`）が同じ部品を FastAPI と同じ名前で持ちます。
+[library.md#python](library.md#python) と `veil-api` の文書（<https://veil-api.readthedocs.io> の「Kit」）を見てください。
+
 ```toml
 [dependencies]
 veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }

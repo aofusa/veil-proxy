@@ -273,6 +273,38 @@ impl NativeRequest {
         helpers(py)?.loads.call1(py, (self.body(py),))
     }
 
+    // F-268: Cookie の値（同じ名前は後のものが勝つ。Starlette と同じ）と HTTP の版
+    /// Request cookies as a dict (`Cookie` headers; a repeated name keeps the last value).
+    #[getter]
+    fn cookies(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = PyDict::new(py);
+        for (n, v) in self.req.headers() {
+            if !n.eq_ignore_ascii_case(b"cookie") {
+                continue;
+            }
+            for pair in lossy(v).split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, val) = pair.split_once('=').unwrap_or(("", pair));
+                let val = val.trim();
+                let val = val
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(val);
+                d.set_item(k.trim(), val)?;
+            }
+        }
+        Ok(d.unbind())
+    }
+
+    /// `HTTP/1.1`, `HTTP/2` or `HTTP/3`.
+    #[getter]
+    fn http_version(&self) -> &'static str {
+        self.req.version().as_str()
+    }
+
     /// Body decoded as UTF-8 (lossy).
     fn text(&self) -> String {
         lossy(self.req.body()).into_owned()
@@ -581,7 +613,9 @@ fn stream_response(
         for item in it.try_iter()? {
             body.extend_from_slice(&to_chunk(item?)?);
         }
-        return Ok(head.with_body(body));
+        let mut r = head.with_body(body);
+        background(sr, &mut r)?;
+        return Ok(r);
     };
     let trailers = sr.getattr(pyo3::intern!(py, "trailers")).ok();
     let Some(writer) = ctx.start_stream(std::mem::replace(&mut head, Response::new(200))) else {
@@ -620,6 +654,14 @@ fn stream_response(
         drop(writer);
     } else {
         py.detach(|| writer.finish_with_trailers(t));
+    }
+    // F-268: ストリーミングの応答の background は送り終えたここ（ハンドラ用プールのスレッド）で呼ぶ
+    if let Ok(bg) = sr.getattr(pyo3::intern!(py, "background")) {
+        if !bg.is_none() {
+            if let Err(e) = bg.call0() {
+                e.print(py);
+            }
+        }
     }
     Ok(Response::new(200))
 }
@@ -687,6 +729,7 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let body = resp.getattr(pyo3::intern!(resp.py(), "body"))?;
     let mut r = Response::new(status).with_body(backed(&body)?);
     no_compression(resp, &mut r)?;
+    background(resp, &mut r)?;
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
@@ -706,6 +749,29 @@ fn no_compression(resp: &Bound<'_, PyAny>, r: &mut Response) -> PyResult<()> {
             *r = std::mem::replace(r, Response::new(200)).no_compression();
         }
     }
+    Ok(())
+}
+
+// F-268: `Response.background`（`BackgroundTasks` 等の呼び出し可能なもの）を送り終えた後にハンドラ用プールで呼ぶ。
+// 送出したワーカーで GIL を取らない（after_send はワーカーで走るので、プールへ投げるだけにする）。
+/// Runs `Response.background` (a callable, e.g. `veil.BackgroundTasks`) on the handler pool once the response was sent.
+fn background(resp: &Bound<'_, PyAny>, r: &mut Response) -> PyResult<()> {
+    let Ok(bg) = resp.getattr(pyo3::intern!(resp.py(), "background")) else {
+        return Ok(());
+    };
+    if bg.is_none() {
+        return Ok(());
+    }
+    let bg = bg.unbind();
+    *r = std::mem::replace(r, Response::new(200)).after_send(move || {
+        veil::runtime::offload::spawn_handler(move || {
+            Python::attach(|py| {
+                if let Err(e) = bg.call0(py) {
+                    e.print(py);
+                }
+            })
+        })
+    });
     Ok(())
 }
 

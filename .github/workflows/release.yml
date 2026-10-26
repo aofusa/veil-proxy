@@ -347,9 +347,52 @@ jobs:
           name: sdist
           path: crates/veil-python/dist/*.tar.gz
 
+  # F-268: veil-api-kit（import veil_kit）。純 Python の wheel 1 個と sdist。版は veil-api と同じ（bump-version.sh）
+  kit:
+    name: veil-api-kit (wheel and sdist)
+    needs: [verify, advisories]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: build
+        shell: bash
+        run: |
+          python -m pip install -q build
+          python -m build crates/veil-python-kit --outdir crates/veil-python-kit/dist
+          # 版と veil-api への依存の版が veil-api と同じ（maturin と同じ PEP 440 の綴り）
+          python - <<'PY'
+          import glob, re, tomllib
+          kit = tomllib.load(open("crates/veil-python-kit/pyproject.toml", "rb"))["project"]
+          ws = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          m = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)(?:-([A-Za-z]+)\.?([0-9]*))?", ws)
+          base, pre, n = m.groups()
+          pep = base + ({"alpha": "a", "beta": "b", "rc": "rc"}.get(pre, ".dev") + (n or "0") if pre else "")
+          assert kit["version"] == pep, (kit["version"], pep)
+          assert "veil-api==%s" % pep in kit["dependencies"], kit["dependencies"]
+          files = sorted(glob.glob("crates/veil-python-kit/dist/*"))
+          assert len(files) == 2 and files[0].endswith(".tar.gz") and files[1].endswith("-py3-none-any.whl"), files
+          print("veil-api-kit", pep, files)
+          PY
+      # 純 Python の部分（veil の拡張無しで動く試験）。docstring は英語でチケット番号が無い（F-241）
+      - name: test
+        shell: bash
+        run: |
+          python -m pip install -q crates/veil-python-kit/dist/*.whl --no-deps
+          python -W error::SyntaxWarning -I crates/veil-python-kit/tests/test_kit.py
+          python tools/lint/check-messages.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kit
+          path: crates/veil-python-kit/dist/*
+
   pypi:
     name: PyPI
-    needs: [verify, wheels, sdist]
+    needs: [verify, wheels, sdist, kit]
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
@@ -359,7 +402,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-          pattern: "{wheel-*,sdist}"
+          pattern: "{wheel-*,sdist,kit}"
       - name: publish to TestPyPI (pre-release)
         if: needs.verify.outputs.prerelease == 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
@@ -383,12 +426,18 @@ jobs:
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           host=pypi.org; [ "$PRERELEASE" = true ] && host=test.pypi.org
-          ver="$(ls dist/*.tar.gz | sed -E 's/.*veil_api-(.*)\.tar\.gz/\1/')"
-          have="$(curl -s "https://$host/pypi/veil-api/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
-          # 公開の action が dist/ に置く *.publish.attestation は配布物ではないので数えない
-          missing=""; n=0; for f in dist/*.whl dist/*.tar.gz; do n=$((n+1)); b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
-          if [ -n "$missing" ]; then echo "::error title=PyPI ($host $ver)::missing:$missing"; exit 1; fi
-          echo "::notice title=PyPI ($host $ver)::all $n files are on $host"
+          fail=0
+          # F-268: veil-api と veil-api-kit（ファイル名の接頭辞 veil_api- と veil_api_kit- で分ける）
+          for pkg in veil-api veil-api-kit; do
+            norm="${pkg//-/_}"
+            ver="$(ls dist/"$norm"-*.tar.gz | sed -E "s/.*${norm}-(.*)\.tar\.gz/\1/")"
+            have="$(curl -s "https://$host/pypi/$pkg/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
+            # 公開の action が dist/ に置く *.publish.attestation は配布物ではないので数えない
+            missing=""; n=0; for f in dist/"$norm"-*.whl dist/"$norm"-*.tar.gz; do n=$((n+1)); b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
+            if [ -n "$missing" ]; then echo "::error title=PyPI $pkg ($host $ver)::missing:$missing"; fail=1; continue; fi
+            echo "::notice title=PyPI $pkg ($host $ver)::all $n files are on $host"
+          done
+          exit "$fail"
 
   # ---------------------------------------------------------------------------
   # 各 OS の成果物と試験（F-247。dist.yml）

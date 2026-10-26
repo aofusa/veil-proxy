@@ -53,10 +53,12 @@ Like FastAPI you can also create an application object: `app = veil.App(title=..
 | `raise HTTPException(404, "not found")` | `raise veil.HTTPException(404, "not found")` (`{"detail": "not found"}`) |
 | path and query parameters bound by name and annotation | the same (`int`/`float`/`bool`/`str`; failures give 422) |
 | pydantic `BaseModel` body | the same when pydantic is installed (422 in FastAPI's error shape) |
-| `Request` | `veil.Request` (`method`, `path`, `query`, `headers`, `body`, `json()`, `text()`, `params`, `query_params`, `client_ip`) |
-| `Response`, `JSONResponse`, `StreamingResponse` | `veil.Response`, `veil.JSONResponse`, `veil.StreamingResponse`; also `veil.EventSourceResponse` |
+| `Request` | `veil.Request` (`method`, `path`, `query`, `headers`, `cookies`, `body`, `json()`, `text()`, `params`, `query_params`, `client_ip`) |
+| `Response`, `JSONResponse`, `HTMLResponse`, `PlainTextResponse`, `RedirectResponse`, `StreamingResponse`, `FileResponse` | the same names on `veil`; also `veil.EventSourceResponse` |
 | `status_code=201` in the decorator | `status_code=201` in the decorator |
-| `Depends(...)` | not provided; see {doc}`dependency-injection` |
+| `Depends`, `Security`, `Query()`/`Header()`/`Cookie()`/`Body()`, `BackgroundTasks`, `APIRouter`, `dependency_overrides` | the same; see {doc}`dependency-injection` |
+| `CORSMiddleware`, `StaticFiles`, `fastapi.security` | `veil_kit` (see {doc}`kit`) |
+| running the FastAPI application itself | `veil.asgi.run(api)` or `app.mount("/legacy", api)`; see {doc}`fastapi` |
 | `@app.websocket("/ws")` with `WebSocket` (`accept`, `receive_text`, `send_text`, `iter_text`, ...), `WebSocketDisconnect`, `WebSocketEndpoint` | the same names on `veil` (`veil.WebSocket`, ...); listed in OpenAPI too; see {doc}`websocket` |
 | `async def` handlers on the event loop | the same (a persistent asyncio loop, uvloop when installed); `veil.run_in_threadpool`; see {doc}`async` |
 | `FastAPI(lifespan=...)`, `@app.on_event("startup")` | `veil.App(lifespan=...)`, `@app.on_event(...)`, `@app.on_startup`, `app.state`; see {doc}`async` |

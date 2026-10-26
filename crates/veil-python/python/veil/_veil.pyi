@@ -136,6 +136,12 @@ class NativeRequest:
     @property
     def query_params(self) -> dict[str, str]:
         """Query parameters (the first value of a repeated key)."""
+    @property
+    def cookies(self) -> dict[str, str]:
+        """The ``Cookie`` header as a dict (the last value of a repeated name)."""
+    @property
+    def http_version(self) -> str:
+        """``"1.1"``, ``"2"`` or ``"3"``."""
     def stream(self) -> NativeBodyIter:
         """Iterate over the body chunks as they arrive (``stream_body=True`` routes)."""
     def json(self) -> Any:
@@ -282,10 +288,71 @@ def register_route(
     on_loop: bool = False,
     form: bool = False,
     compress: bool = True,
+    hidden: bool = False,
 ) -> None:
     """Register an HTTP route (collected until ``run``; ``on_loop`` runs it on the persistent event loop; ``form``
     reads the body first and splits a ``multipart/form-data`` body into parts; ``compress=False`` keeps its
-    responses uncompressed)."""
+    responses uncompressed; ``hidden`` leaves it out of OpenAPI)."""
+
+def register_asgi(prefix: str, handler_id: int) -> None:
+    """Mount an ASGI application (``handlers[handler_id]`` is a ``veil.asgi.ASGIApp``) at ``prefix``."""
+
+def register_cors(
+    prefix: str = "/",
+    origins: list[str] = ...,
+    any_origin: bool = False,
+    methods: list[str] | None = None,
+    headers: list[str] = ...,
+    any_header: bool = False,
+    expose: list[str] = ...,
+    credentials: bool = False,
+    max_age: int | None = None,
+) -> None:
+    """Answer CORS for the routes below ``prefix`` in the server (``ValueError`` for invalid settings)."""
+
+def register_static(
+    prefix: str, dir: str, index: str | None = None, cache: bool = True, extra_toml: str | None = None
+) -> None:
+    """Serve the directory ``dir`` below ``prefix`` with the server's file backend."""
+
+def grpc_client_setup() -> None:
+    """Start the gRPC client thread now (otherwise it starts with the first call)."""
+
+class GrpcChannel:
+    """A gRPC channel on veil's HTTP/2 client (used by ``veil_kit.grpc.Channel``)."""
+
+    def __new__(
+        cls,
+        url: str,
+        ca: list[str] | None = None,
+        cert: tuple[str, str] | None = None,
+        gzip: bool = False,
+        max_message_size: int | None = None,
+    ) -> GrpcChannel: ...
+    def call(
+        self, method: str, metadata: list[tuple[str, str | bytes]] = ..., timeout: float | None = None
+    ) -> GrpcCall:
+        """Start a call of ``method`` (``/package.Service/Method``)."""
+
+class GrpcCall:
+    """One call started by :meth:`GrpcChannel.call`."""
+
+    def send(self, message: bytes) -> bool:
+        """Send one request message; ``False`` once the call has finished or sending was closed."""
+    def done_sending(self) -> None:
+        """Finish sending (half-close)."""
+    def recv(self) -> bytes | None:
+        """The next response message, or ``None`` at the end (waits with the GIL released)."""
+    def recv_cb(self, callback: Any) -> None:
+        """Call ``callback(bytes | None)`` with the next response message (from another thread)."""
+    def status(self) -> tuple[int, str, list[tuple[str, Any]], list[tuple[str, Any]]]:
+        """``(code, details, initial_metadata, trailing_metadata)``; waits for the end of the call."""
+    def status_cb(self, callback: Any) -> None:
+        """Call ``callback((code, details, initial, trailing))`` at the end of the call."""
+    def initial_metadata(self) -> list[tuple[str, Any]]:
+        """The response headers (empty until they arrived)."""
+    def cancel(self) -> None:
+        """Cancel the call."""
 
 def run(config: Config, handlers: list[Any]) -> None:
     """Start the server and block until it stops (the GIL is released).

@@ -10,6 +10,8 @@
 #   ws_check.py python <port>               basic に加えて examples/api/python-websocket の /chat・/typed・/noaccept・
 #                                           /endpoint・/echo（x-echo へのアップグレード）・/state・/threadpool（F-263）
 #   ws_check.py sleepers <port> <n>         GET /sleep（await asyncio.sleep(1)）を n 本同時に（常駐のループで並ぶか）
+#   ws_check.py kit <port>                  examples/api/python-kit の /legacy/ws（マウントした FastAPI）と
+#                                           /graphql（graphql-transport-ws の購読。同じパスの HTTP と WebSocket。F-268）
 import asyncio
 import base64
 import hashlib
@@ -303,6 +305,36 @@ async def python(port):
     w.close()
 
 
+async def kit(port):
+    import json  # noqa: PLC0415
+
+    c = await WS.connect(port, "/legacy/ws")
+    check("kit FastAPI WebSocket upgrade (ASGI mount)", c.status() == 101, c.head)
+    if c.status() == 101:
+        await c.send(1, b"hi")
+        check("kit FastAPI WebSocket echo", await c.recv() == (1, b"fastapi:hi", True))
+        check("kit FastAPI WebSocket close", await c.recv_close() == 1000)
+    c.close()
+    c = await WS.connect(port, "/graphql", extra=b"Sec-WebSocket-Protocol: graphql-transport-ws\r\n")
+    check("kit GraphQL WebSocket upgrade on the HTTP path", c.status() == 101
+          and c.header(b"sec-websocket-protocol") == b"graphql-transport-ws", c.head)
+    if c.status() == 101:
+        await c.send(1, json.dumps({"type": "connection_init"}).encode())
+        _, ack, _ = await c.recv()
+        check("kit GraphQL connection_ack", json.loads(ack)["type"] == "connection_ack", ack)
+        await c.send(1, json.dumps({"id": "1", "type": "subscribe",
+                                    "payload": {"query": "subscription { count(to: 3) }"}}).encode())
+        got = []
+        while True:
+            _, m, _ = await c.recv()
+            m = json.loads(m)
+            if m["type"] != "next":
+                break
+            got.append(m["payload"]["data"]["count"])
+        check("kit GraphQL subscription over WebSocket", got == [1, 2, 3] and m["type"] == "complete", (got, m))
+    c.close()
+
+
 async def sleepers(port, n):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, max(soft, n + 256)), hard))
@@ -394,6 +426,8 @@ def main():
         asyncio.run(churn(port, int(args[0])))
     elif mode == "python":
         asyncio.run(python(port))
+    elif mode == "kit":
+        asyncio.run(kit(port))
     elif mode == "sleepers":
         asyncio.run(sleepers(port, int(args[0])))
     elif mode == "hold":

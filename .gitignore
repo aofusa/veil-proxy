@@ -84,3 +84,7 @@ tools/perf/alloc_bench/target/
 
 # maturin develop の成果物（ビルドで作る。リポジトリには入れない）
 crates/veil-python/python/veil/*.so
+# F-268: veil-api-kit の python -m build の生成物
+crates/veil-python-kit/dist/
+crates/veil-python-kit/build/
+crates/veil-python-kit/src/*.egg-info/

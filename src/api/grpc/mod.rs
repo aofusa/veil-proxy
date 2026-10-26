@@ -267,6 +267,12 @@ impl Status {
         &self.message
     }
 
+    // F-268: クライアント（veil::api::grpc::Channel）が受けた状態の trailers を読む
+    /// The extra metadata (trailers other than `grpc-status` / `grpc-message`; on a client, those of the response).
+    pub fn metadata(&self) -> &[(Bytes, Bytes)] {
+        &self.metadata
+    }
+
     /// Metadata to add to the trailers (names are lowercased).
     pub fn with_metadata(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Status {
         self.metadata.push((lower(name.into()), value.into()));

@@ -1147,8 +1147,22 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   `@veil.l4_udp(name, listen)`。
 - **フォームとファイル（F-266）:** FastAPI と同じ `veil.Form()`・`veil.File()`・`veil.UploadFile`（`python-multipart` は要りません。
   [フォームとファイルのアップロード](#フォームとファイルのアップロード)）。
+- **FastAPI と同じ書き方の依存（F-268）:** `veil.Depends`（入れ子・1 要求で 1 回のキャッシュ・`yield` の後始末・`async`）、
+  `veil.Security`・`SecurityScopes`、引数の印 `Query()`・`Path()`・`Header()`・`Cookie()`・`Body()` と検査（FastAPI と同じ形の 422）、
+  `BackgroundTasks`（応答を送り終えた後に実行）、`APIRouter`・`include_router`、`app.dependency_overrides`、`response_model`、
+  `request.cookies`・`response.set_cookie()`、`veil.testclient.TestClient`。ルートの依存の木は署名から 1 回だけ作り、
+  これらを使わないルートの束縛は今までと同じです。
+- **ASGI（F-268）:** `veil.asgi.run(fastapi_app)` で uvicorn の代わりに FastAPI・Starlette のアプリを動かし、
+  `app.mount("/legacy", fastapi_app)` で veil のアプリのパスの下に載せます（`http`（trailers・pathsend の拡張）・`websocket`・
+  `lifespan`）。HTTP/1.1・HTTP/2・HTTP/3・TLS・圧縮は veil が受け持ち、アプリは常駐のイベントループで動きます。
+- **`veil-api-kit`（F-268）:** 純 Python のパッケージ（`pip install veil-api-kit`、`import veil_kit`、版は `veil-api` と同じ）。
+  署名付き Cookie とセッション、`CORSMiddleware`（サーバが答える）、`fastapi.security` と同じ認証の方式と JWT（PyJWT）、
+  `safe_redirect`、`StaticFiles`（サーバのファイル配信）、strawberry の GraphQL（HTTP・SSE・WebSocket）、`grpc_tools` の
+  生成スタブを veil の HTTP/2 クライアントで使う gRPC のチャネル（同期と `grpc.aio` 風。grpcio は不要）、DI のコンテナ、
+  定期・cron のタスク。
 - **GraphQL:** 好きなライブラリを普通のルートとして載せます。[examples/api/python-graphql/](../../../examples/api/python-graphql/)
-  は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。
+  は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。`veil_kit.graphql.mount` は同じことを WebSocket の
+  サブスクリプションと GraphiQL 付きで行います。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 文書全体（入門・FastAPI からの移行の対応表・API 一覧）は <https://veil-api.readthedocs.io> にあります（英語が正。日本語版は gettext で作る。手順は crates/veil-python/docs/conf.py の冒頭）。
@@ -1157,7 +1171,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
 [examples/api/python-fastapi-like/](../../../examples/api/python-fastapi-like/)・
 [examples/api/python-features/](../../../examples/api/python-features/)（ストリーミング・L4）・
 [examples/api/python-grpc/](../../../examples/api/python-grpc/)（grpcio の生成コードと基本の層）・
-[examples/api/python-websocket/](../../../examples/api/python-websocket/)（WebSocket・アップグレード・lifespan・イベントループ）です。
+[examples/api/python-websocket/](../../../examples/api/python-websocket/)（WebSocket・アップグレード・lifespan・イベントループ）・
+[examples/api/python-kit/](../../../examples/api/python-kit/)（`Depends`・`veil-api-kit`・載せた FastAPI のアプリ・gRPC のクライアント）です。
 
 ## ライブラリ成果物のビルド
 

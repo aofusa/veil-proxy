@@ -8,6 +8,9 @@ sessions, HTTP and gRPC client helpers, GraphQL, dependency injection and backgr
 the proxy binary, veil's default features and the `full*` sets do not include it, and heavy dependencies
 (async-graphql, prost) sit behind its own features.
 
+For Python, the package `veil-api-kit` (`import veil_kit`) has the same parts with FastAPI's names; see
+[library.md#python](library.md#python) and the `veil-api` documentation (<https://veil-api.readthedocs.io>, "Kit").
+
 ```toml
 [dependencies]
 veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }

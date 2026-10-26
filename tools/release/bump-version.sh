@@ -8,6 +8,7 @@
 # 版を書き写している次の場所も揃える。同じ版で 2 回実行しても差分は出ない。
 #
 #   - ルートから veil-macros への依存の version、crates/veil-kit から veil への依存の version（F-267）
+#   - crates/veil-python-kit（veil-api-kit）の版と veil-api への依存の版（PEP 440 の綴り。F-268）
 #   - Cargo.lock（ワークスペース）と、ワークスペース外のクレートの Cargo.lock の veil 系の版
 #   - 文書の中で「今の版の例」として書いた箇所（下の DOC_FILES。計測の基準として書いた版
 #     ＝ docs/perf・docs/guide/performance.md の表・tools/perf は意味が変わるので書き換えない）
@@ -48,6 +49,32 @@ p = "crates/veil-kit/Cargo.toml"
 s = open(p).read()
 s = re.sub(r'(^veil = \{ package = "veil-proxy", path = "\.\./\.\.", version = ")[^"]*(")', rf'\g<1>{new}\g<2>', s, flags=re.M)
 open(p, "w").write(s)
+PY
+
+# F-268: veil-api-kit（純 Python の wheel）の版と veil-api への依存の版。PEP 440 の綴りにする
+#        （maturin が veil-api の版を Cargo の版から作るのと同じ: 0.10.0-rc.1 → 0.10.0rc1）。
+python3 - "$NEW" <<'PY'
+import re, sys
+new = sys.argv[1]
+m = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)(?:-([A-Za-z]+)\.?([0-9]*))?", new)
+if m is None:
+    pep = new.replace("-", "+", 1)  # 他の形は local version として残す（公開には使わない）
+else:
+    base, pre, n = m.groups()
+    pep = base
+    if pre:
+        tag = {"alpha": "a", "a": "a", "beta": "b", "b": "b", "rc": "rc", "c": "rc"}.get(pre.lower())
+        pep = base + (tag + (n or "0") if tag else ".dev" + (n or "0"))
+p = "crates/veil-python-kit/pyproject.toml"
+s = open(p).read()
+s = re.sub(r'^version = "[^"]*"', 'version = "%s"' % pep, s, count=1, flags=re.M)
+s = re.sub(r'"veil-api==[^"]*"', '"veil-api==%s"' % pep, s)
+open(p, "w").write(s)
+p = "crates/veil-python-kit/src/veil_kit/__init__.py"
+s = open(p).read()
+s = re.sub(r'^__version__ = "[^"]*"', '__version__ = "%s"' % pep, s, count=1, flags=re.M)
+open(p, "w").write(s)
+print("updated crates/veil-python-kit (version %s)" % pep)
 PY
 
 # 2. Cargo.lock（ワークスペースと、path で veil に依存するワークスペース外のクレート）

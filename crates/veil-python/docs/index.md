@@ -8,6 +8,7 @@ Python only supplies handler functions, written with FastAPI-like decorators.
 pip install veil-api
 pip install pydantic        # optional: body validation and schema generation
 pip install "veil-api[grpc]"   # optional: grpcio-generated code for veil.grpc.Server
+pip install veil-api-kit       # optional: CORS, security, sessions, static files, GraphQL, gRPC client, DI, tasks
 ```
 
 The import name is `veil`. The wheel is abi3 (Python 3.9 or later, one wheel for all versions).
@@ -30,6 +31,8 @@ quickstart
 routing
 requests-responses
 dependency-injection
+fastapi
+kit
 async
 websocket
 grpc

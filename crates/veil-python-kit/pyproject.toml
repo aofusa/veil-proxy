@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veil-api-kit"
+# 版は veil-api と揃える（tools/release/bump-version.sh が書き換える。F-268）
+version = "0.9.2"
+description = "Helpers for veil-api: cookies, sessions, CORS, security, static files, GraphQL, gRPC client, DI, tasks"
+requires-python = ">=3.9"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+authors = [{ name = "aofusa" }]
+dependencies = ["veil-api==0.9.2"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[project.urls]
+Documentation = "https://veil-api.readthedocs.io"
+Source = "https://github.com/aofusa/veil-proxy"
+Changelog = "https://github.com/aofusa/veil-proxy/releases"
+
+[project.optional-dependencies]
+jwt = ["PyJWT>=2"]
+graphql = ["strawberry-graphql>=0.200"]
+grpc = ["protobuf>=4"]
+grpcio = ["grpcio", "grpcio-tools", "protobuf>=4"]
+redis = ["redis>=4.2"]
+cron = ["croniter"]
+all = ["PyJWT>=2", "strawberry-graphql>=0.200", "protobuf>=4", "grpcio", "grpcio-tools", "redis>=4.2", "croniter"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+veil_kit = ["py.typed"]

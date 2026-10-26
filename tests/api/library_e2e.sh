@@ -512,6 +512,86 @@ run_python() {
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
   run_python_f210 "$PY"
   run_python_ws "$PY"
+  run_python_kit "$PY"
+}
+
+run_python_kit() { # F-268: FastAPI 互換（Depends 等）・veil-api-kit（examples/api/python-kit）・veil_kit.grpc のクライアント
+  local PY="$1" EX="$ROOT/examples/api"
+  echo "== Python: FastAPI compatibility / veil-api-kit (F-268)"
+  "$PY" -m pip -q install --no-deps -e "$ROOT/crates/veil-python-kit" > "$TMPD/kit-pip.log" 2>&1 || { bad "pip install veil-api-kit"; tail -5 "$TMPD/kit-pip.log"; return; }
+  "$PY" -m pip -q install pydantic PyJWT >/dev/null 2>&1
+  "$PY" -m pip -q install strawberry-graphql >/dev/null 2>&1 || echo "  skip kit GraphQL: strawberry-graphql is not installable here"
+  "$PY" -m pip -q install fastapi >/dev/null 2>&1 || echo "  skip kit ASGI mount: fastapi is not installable here"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_fastapi_compat.py) > "$TMPD/fc.log" 2>&1 && ok "py test_fastapi_compat.py" || { bad "py test_fastapi_compat.py"; tail -20 "$TMPD/fc.log"; }
+  (cd "$ROOT/crates/veil-python-kit" && "$PY" -I tests/test_kit.py) > "$TMPD/kit.log" 2>&1 && ok "kit tests/test_kit.py" || { bad "kit tests/test_kit.py"; tail -20 "$TMPD/kit.log"; }
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$EX/python-kit/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  if wait_port "$P" "$PID"; then
+    local B="http://127.0.0.1:$P"
+    expect "kit Depends / Query / Header / Inject / APIRouter" '"version":"2","greeting":"hello item"' curl -s -H 'x-api-version: 2' "$B/v1/items/5?skip=2"
+    expect "kit Depends validation is 422" "422" curl -s -o /dev/null -w "%{http_code}" "$B/v1/items/5?limit=500"
+    expect "kit BackgroundTasks (response first)" '{"queued":true}' curl -s -X POST "$B/notify?email=a@example"
+    local i; for i in $(seq 1 50); do curl -s "$B/log" | grep -q "sent to a@example" && break; sleep 0.1; done
+    expect "kit BackgroundTasks ran after the response" "sent to a@example" curl -s "$B/log"
+    expect "kit OAuth2 bad password is 400" "400" curl -s -o /dev/null -w "%{http_code}" -d username=alice -d password=x "$B/token"
+    local tok tok0
+    tok=$(curl -s -d username=alice -d password=wonderland -d 'scope=items:write' "$B/token" | "$PY3" -I -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    tok0=$(curl -s -d username=alice -d password=wonderland "$B/token" | "$PY3" -I -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    expect "kit JWT bearer" '{"user":"alice"}' curl -s -H "authorization: Bearer $tok" "$B/me"
+    expect "kit missing bearer is 401 + WWW-Authenticate" "www-authenticate: bearer" bash -c "curl -s -i '$B/me' | tr A-Z a-z"
+    expect "kit Security scopes granted" "201" curl -s -o /dev/null -w "%{http_code}" -X POST -H "authorization: Bearer $tok" "$B/items?name=x"
+    expect "kit Security scopes missing is 401" "401" curl -s -o /dev/null -w "%{http_code}" -X POST -H "authorization: Bearer $tok0" "$B/items?name=x"
+    expect "kit response_model filters fields" '[{"name":"alice"}]' curl -s "$B/users"
+    curl -s -c "$W/jar" -b "$W/jar" "$B/count" >/dev/null
+    expect "kit signed cookie session" '{"n":2}' curl -s -c "$W/jar" -b "$W/jar" "$B/count"
+    expect "kit safe_redirect rejects other hosts" "location: /" bash -c "curl -s -i '$B/go?next=https://evil.example/' | tr A-Z a-z"
+    expect "kit safe_redirect keeps allowed hosts" "location: https://app.example/x" bash -c "curl -s -i '$B/go?next=https://app.example/x' | tr A-Z a-z"
+    expect "kit CORS preflight answered by the server" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$B/me' | tr A-Z a-z"
+    expect "kit CORS headers on responses" "access-control-allow-credentials: true" bash -c "curl -s -i -H 'origin: https://app.example' '$B/log' | tr A-Z a-z"
+    expect "kit StaticFiles (html=True)" "static index" curl -s "$B/static/"
+    expect "kit periodic task" "True" bash -c "curl -s '$B/ticks' | $PY3 -I -c 'import json,sys; print(json.load(sys.stdin)[\"n\"] >= 1)'"
+    expect "kit OpenAPI: router paths, hidden route, security schemes" "True False ['OAuth2PasswordBearer']" bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; d=json.load(sys.stdin); ps=d[\"paths\"]; print(\"/v1/items/{item_id}\" in ps, \"/internal\" in ps, sorted(d[\"components\"][\"securitySchemes\"]))'"
+    if "$PY" -I -c 'import strawberry' 2>/dev/null; then
+      expect "kit GraphQL query (strawberry)" '{"data":{"hello":"hello kit"}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ hello(name: \"kit\") }"}'
+    fi
+    if "$PY" -I -c 'import fastapi' 2>/dev/null; then
+      expect "kit FastAPI mounted at /legacy (ASGI)" '"from":"fastapi"' curl -s "$B/legacy/hello/x?q=2"
+      expect "kit FastAPI mounted at /legacy (h2c)" '"q":2' curl -s --http2-prior-knowledge "$B/legacy/hello/x?q=2"
+    fi
+    if "$PY" -I -c 'import strawberry, fastapi' 2>/dev/null; then
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" kit "$P" | sed "s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+    fi
+  else
+    bad "python-kit start"; cat "$W/log"
+  fi
+  py_stop "$PID"
+  # veil_kit.grpc: grpc_tools の生成スタブを veil の HTTP/2 クライアントで（examples/api/python-grpc を相手に）
+  local GEN="$W/gen"; mkdir -p "$GEN"
+  if "$PY" -m pip -q install grpcio grpcio-tools protobuf >/dev/null 2>&1 && \
+     "$PY" -m grpc_tools.protoc -I "$EX/rust-grpc/proto" --python_out="$GEN" --grpc_python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" 2>/dev/null; then
+    # rustls（webpki）は CA の証明書をサーバの証明書に使うのを拒むので、CA と CA で署名したサーバの証明書を作る
+    printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n' > "$W/ext"
+    { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/ca.key" -out "$W/ca.pem" -days 2 -subj /CN=kit-ca \
+        && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/leaf.csr" -subj /CN=localhost \
+        && openssl x509 -req -in "$W/leaf.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcreateserial -out "$W/cert.pem" -days 2 -extfile "$W/ext"; } >/dev/null 2>&1 \
+      || { bad "cert"; return; }
+    local GP GS; GP=$(free_port); GS=$(free_port)
+    GEN_DIR="$GEN" VEIL_GRPC_MODE=grpcio VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
+      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+    local GPID=$!; PIDS+=("$GPID")
+    if wait_port "$GP" "$GPID" && wait_port "$GS" "$GPID"; then
+      GEN_DIR="$GEN" tmo 120 "$PY" "$EX/python-kit/grpc_client.py" "127.0.0.1:$GP" --tls "127.0.0.1:$GS" "$W/ca.pem" 2>&1 | sed "s|^|  |" | tee "$W/gr"
+      grep -q "ok tls bidi" "$W/gr" && ! grep -q "FAIL\|Traceback" "$W/gr" && ok "kit gRPC client (h2c, TLS, asyncio)" || bad "kit gRPC client"
+    else
+      bad "python-grpc start (kit client)"; cat "$W/g.log"
+    fi
+    py_stop "$GPID"
+  else
+    echo "  skip kit gRPC client: grpcio-tools is not installable here"
+  fi
 }
 
 run_python_ws() { # F-263: 常駐のイベントループ・WebSocket・アップグレード・lifespan（examples/api/python-websocket）

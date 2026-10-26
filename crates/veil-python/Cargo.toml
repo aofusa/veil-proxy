@@ -25,6 +25,8 @@ itoa = "1"
 # F-263: `[api] python_*` のキーを読む（veil と同じ版。依存は増えない）
 toml = "0.9.8"
 futures = "0.3"
+# F-268: app.cors()（veil_kit::cors。Python の層で要求ごとにヘッダを作らない）
+veil_kit = { package = "veil-proxy-kit", path = "../veil-kit", default-features = false, features = ["cors"] }
 
 # epoll feature は Linux でだけ指定できる（他の OS は kqueue / WSAPoll の reactor が自動で選ばれる）。
 [target.'cfg(target_os = "linux")'.dependencies]

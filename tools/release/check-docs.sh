@@ -2,7 +2,7 @@
 # F-241: 利用者が読む API の文書が英語だけで、チケット番号（F-123・B-45 など）を含まないことを確かめる。
 #
 #   tools/release/check-docs.sh            # Rust（docs.rs と同じ構成の rustdoc の HTML）+ Python のソース
-#   tools/release/check-docs.sh --python   # Python のソースだけ（README・docstring・PyO3 の doc・.pyi）
+#   tools/release/check-docs.sh --python   # Python のソースだけ（veil-api と veil-api-kit の README・docstring・PyO3 の doc・.pyi）
 #   tools/release/check-docs.sh --wheel    # 入れた veil-api の help() に出る __doc__（wheel の試験の後に。PYTHON で python を選ぶ）
 #
 # Rust は `cargo +nightly doc`（docs.rs と同じ --cfg docsrs）で作った target/doc の HTML の本文と検索の索引を見る。
@@ -29,7 +29,10 @@ def chk(where, text):
 py = root / "crates/veil-python"
 for n, line in enumerate((py / "README.md").read_text(encoding="utf-8").splitlines(), 1):
     chk(f"crates/veil-python/README.md:{n}", line)
-for f in sorted((py / "python/veil").glob("*.py*")):
+kit = root / "crates/veil-python-kit"
+for n, line in enumerate((kit / "README.md").read_text(encoding="utf-8").splitlines(), 1):
+    chk(f"crates/veil-python-kit/README.md:{n}", line)
+for f in sorted((py / "python/veil").glob("*.py*")) + sorted((kit / "src/veil_kit").glob("*.py")):
     tree = ast.parse(f.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):

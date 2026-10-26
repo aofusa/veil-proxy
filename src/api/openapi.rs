@@ -144,14 +144,24 @@ fn validation_error_schemas(components: &mut Map<String, Value>) {
     );
 }
 
-fn operation(meta: &OperationMeta, components: &mut Map<String, Value>) -> Value {
+fn operation(
+    meta: &OperationMeta,
+    components: &mut Map<String, Value>,
+    schemes: &mut Map<String, Value>,
+) -> Value {
     if let Some(raw) = &meta.raw {
-        // Python・C から渡された Operation Object（`x-veil-components` は components へ移す）
+        // Python・C から渡された Operation Object（`x-veil-components` は components へ、
+        // F-268: `x-veil-security-schemes` は components.securitySchemes へ移す）
         let mut op = raw.clone();
         if let Some(obj) = op.as_object_mut() {
             if let Some(Value::Object(extra)) = obj.remove("x-veil-components") {
                 for (k, v) in extra {
                     components.insert(k, v);
+                }
+            }
+            if let Some(Value::Object(extra)) = obj.remove("x-veil-security-schemes") {
+                for (k, v) in extra {
+                    schemes.insert(k, v);
                 }
             }
             obj.entry("operationId")
@@ -307,6 +317,7 @@ fn websocket_operation(op: &mut Map<String, Value>, ws: &handler::WebSocketMeta)
 pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value {
     let mut paths = Map::new();
     let mut components = Map::new();
+    let mut schemes = Map::new();
     validation_error_schemas(&mut components);
     for e in entries {
         if e.meta.hidden || e.name.starts_with("__veil_") {
@@ -320,7 +331,7 @@ pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value 
         if is_ws && !settings.openapi_websocket {
             continue;
         }
-        let op = operation(&e.meta, &mut components);
+        let op = operation(&e.meta, &mut components, &mut schemes);
         let item = paths
             .entry(openapi_path(e.pattern.as_str()))
             .or_insert_with(|| Value::Object(Map::new()));
@@ -346,11 +357,16 @@ pub fn generate(settings: &ApiSettings, entries: &[Arc<HandlerEntry>]) -> Value 
     if let Some(d) = &settings.openapi_description {
         info.insert("description".into(), d.clone().into());
     }
+    let mut comps = Map::new();
+    comps.insert("schemas".into(), Value::Object(components));
+    if !schemes.is_empty() {
+        comps.insert("securitySchemes".into(), Value::Object(schemes));
+    }
     json!({
         "openapi": "3.1.0",
         "info": Value::Object(info),
         "paths": Value::Object(paths),
-        "components": { "schemas": Value::Object(components) },
+        "components": Value::Object(comps),
     })
 }
 
@@ -485,5 +501,40 @@ mod tests {
         assert!(doc["paths"].as_object().unwrap().is_empty());
         // Swagger UI は x-veil-websocket の操作で Try it out を出さない
         assert!(swagger_ui_html(&ApiSettings::from_value(None)).contains("x-veil-websocket"));
+    }
+
+    // F-268: Python の Security 依存（x-veil-security-schemes）は components.securitySchemes へ
+    #[test]
+    fn raw_security_schemes_move_to_components() {
+        let raw = OperationMeta {
+            operation_id: "me".into(),
+            raw: Some(json!({
+                "summary": "Me",
+                "security": [{"OAuth2PasswordBearer": ["read"]}],
+                "x-veil-security-schemes": {
+                    "OAuth2PasswordBearer": {"type": "oauth2", "flows": {"password": {"tokenUrl": "/token", "scopes": {}}}}
+                }
+            })),
+            ..Default::default()
+        };
+        let plain = OperationMeta {
+            operation_id: "plain".into(),
+            ..Default::default()
+        };
+        let entries = [ws_entry("me", "/me", raw)];
+        let doc = generate(&ApiSettings::from_value(None), &entries);
+        let op = &doc["paths"]["/me"]["get"];
+        assert!(op.get("x-veil-security-schemes").is_none());
+        assert_eq!(op["security"][0]["OAuth2PasswordBearer"][0], "read");
+        assert_eq!(
+            doc["components"]["securitySchemes"]["OAuth2PasswordBearer"]["type"],
+            "oauth2"
+        );
+        // 無ければ securitySchemes を出さない
+        let doc = generate(
+            &ApiSettings::from_value(None),
+            &[ws_entry("plain", "/p", plain)],
+        );
+        assert!(doc["components"].get("securitySchemes").is_none());
     }
 }

@@ -24,6 +24,8 @@ def echo(req: veil.Request):
 | `body`, `text()`, `json()` | the whole body as `bytes`, as text, parsed as JSON |
 | `params`, `query_params` | path parameters, query parameters (the first value of a repeated key) |
 | `client_ip` | the client address |
+| `cookies` | the `Cookie` header as a `dict` (the last value of a repeated name) |
+| `http_version` | `"1.1"`, `"2"` or `"3"` |
 | `stream()` | iterate over the body as it arrives (routes with `stream_body=True`) |
 
 Inside the server the object is a Rust-backed `veil._veil.NativeRequest` with the same attributes and methods;
@@ -42,6 +44,34 @@ def custom():
 def as_json():
     return veil.JSONResponse({"ok": True}, status=200)
 ```
+
+`status_code=` is accepted as well as `status=`, and `content=` as well as the first argument, as in FastAPI.
+`veil.HTMLResponse`, `veil.PlainTextResponse`, `veil.RedirectResponse(url, status_code=307)` and
+`veil.FileResponse(path, filename=None)` (streamed in 64 KiB chunks) are the other response classes; a route's
+`response_class=` makes a plain return value use one of them.
+
+## Cookies and redirects
+
+```python
+@veil.post("/login")
+def login(response: veil.Response):           # headers and cookies set here are merged into the response
+    response.set_cookie("session", "abc", max_age=3600, httponly=True, secure=True, samesite="lax")
+    return {"ok": True}
+
+@veil.get("/whoami")
+def whoami(req: veil.Request):
+    return {"session": req.cookies.get("session")}
+
+@veil.post("/logout")
+def logout():
+    r = veil.RedirectResponse("/", status_code=303)
+    r.delete_cookie("session")
+    return r
+```
+
+`set_cookie(key, value, max_age, expires, path, domain, secure, httponly, samesite, partitioned)` follows Starlette.
+Signed cookies, sessions and `safe_redirect` (no open redirects through `?next=`) are in the kit ({doc}`kit`).
+A `Cookie()` parameter reads one cookie ({doc}`dependency-injection`).
 
 ## Streaming (server to client)
 

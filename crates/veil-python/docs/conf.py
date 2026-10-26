@@ -46,7 +46,7 @@ gettext_compact = False
 
 # --- autoapi: ../python/veil を静的に読む（.pyi を含む） ---
 autoapi_type = "python"
-autoapi_dirs = ["../python"]
+autoapi_dirs = ["../python", "../../veil-python-kit/src"]
 autoapi_file_patterns = ["*.pyi", "*.py"]
 autoapi_root = "api"
 autoapi_add_toctree_entry = True

@@ -1,6 +1,6 @@
 # F-268: Python のヘルパーパッケージ `veil-api-kit`（`veil_kit`）と FastAPI の生態系との互換（Depends・BackgroundTasks・ASGI）
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)。前提は [F-263](F-263-python-async-runtime-websocket.md)・[F-266](F-266-multipart-file-upload.md)）**
+**状態: 完了（2026-10-26。親は [F-258](F-258-v0100-plan.md)。前提は [F-263](F-263-python-async-runtime-websocket.md)・[F-266](F-266-multipart-file-upload.md)）**
 
 ## 依頼
 
@@ -145,3 +145,76 @@ app.mount("/legacy", api)                           # /legacy 以下を ASGI へ
 
 - FastAPI の互換の試験が目標どおり通り、FastAPI のアプリが ASGI で動く。kit の全モジュールが E2E で動く。
 - ネイティブのルートの性能が変わらない。本体のバイナリが変わらない。文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-26）
+
+### `veil-api`（`crates/veil-python`）: FastAPI の書き方
+
+- `veil/params.py`（新規）: `Query`・`Path`・`Header`（`convert_underscores`）・`Cookie`・`Body`（`embed`）の印（既定値・`Annotated` の
+  どちらでも）と検査（`gt`・`ge`・`lt`・`le`・`min_length`・`max_length`・`pattern`。違反は FastAPI と同じ形の 422）、`Depends`・
+  `Security`・`SecurityScopes`・`BackgroundTasks`。
+- `veil/_deps.py`（新規）: 依存の木。ルートの初回の要求（と `app.dependency_overrides` の変更後。変更回数を数える `Overrides`）に
+  署名から 1 回だけ作り、要求ごとは決まった順に呼ぶだけ。同期・`async`・ジェネレータ・非同期ジェネレータ（`yield` の後は応答の前に
+  実行、ハンドラの例外は `yield` で投げる）、`use_cache`、失敗した依存の記憶（422 の重複を出さない）、`async def` のルートの同期の
+  依存はスレッドプール（`_veil_inline = True` は直接）。依存を使わないルートは今までの束縛のまま（`_build_params` の分岐だけ）。
+- `veil/routing.py`（新規）: `APIRouter`（`prefix`・`tags`・`dependencies`・`responses`、WebSocket のルートも）と `include_router`。
+- `veil/__init__.py`: ルートの `dependencies`・`response_model`（pydantic の `TypeAdapter`。`response_model_exclude_none`）・
+  `responses`・`response_class`・`include_in_schema`・`deprecated`・`description`・`operation_id`、`@app.head`・`@app.options`、
+  `Request.cookies`・`http_version`、`Response.set_cookie`・`delete_cookie`・`background`・`status_code`/`content` の別名、
+  `HTMLResponse`・`PlainTextResponse`・`RedirectResponse`・`FileResponse`、`app.cors()`・`app.serve_dir()`・`app.mount()`・
+  `app.add_middleware()`。OpenAPI に header・cookie の引数、埋め込みの本文、依存の木の引数と `security`（`x-veil-security-schemes` を
+  本体の `src/api/openapi.rs` が `components.securitySchemes` へ移す。単体試験 `raw_security_schemes_move_to_components`）。
+- `veil/testclient.py`（新規）: サーバ無しでルートを呼ぶ `TestClient`（Starlette と同じ使い方。Rust 側の CORS・静的ファイル・圧縮・
+  WebSocket は通らないことを docstring に書いた）。
+- `veil/asgi.py`（新規）: `veil.asgi.run(app)` と `app.mount(path, asgi_app)`。`http`（`http.response.trailers`・`http.response.pathsend`）・
+  `websocket`（F-263 の受け口から ASGI のイベントへ）・`lifespan`。Rust 側は `register_asgi`（`prefix/{*__veil_asgi}` を全メソッドで登録、
+  常駐のループで実行）。同じパスの WebSocket のルートと GET のルートは Rust 側で 1 本にまとめ、`Upgrade` ヘッダで振り分ける
+  （GraphQL の HTTP と WebSocket を同じパスに置くため）。
+- Rust（`crates/veil-python/src/`）: `NativeRequest.cookies`・`http_version`、`BackgroundTasks` を `Response::after_send`（F-267）で
+  応答の後に実行（Python の呼び出しは `spawn_handler` へ回し、ワーカーは GIL を取らない）、`register_cors`（中身は `veil_kit::cors::Cors`。
+  プリフライトは Python を呼ばない）、`register_static`（`App::serve_dir`）、`register_route(hidden=)`。
+- **gRPC のクライアント**（`src/grpc_client.rs`、新規）: `GrpcChannel`・`GrpcCall`。`veil::api::grpc::Channel`（F-267）を専用の
+  クライアントスレッドの `block_on` で動かし、Python からの命令はキュー + `WakeFlag`（そのスレッドで作り、待ち手ごとに分ける）で渡す。
+  `recv`・`status` は GIL を外して待ち、`recv_cb`・`status_cb` は handler プールから Python を呼ぶ（asyncio はこれで待つ）。
+  受けた状態の trailers を読むために本体に `Status::metadata()` を足した。
+- 不具合: `body_constraints`（と印の検査）の `pattern` が全体一致だった [B-171](../bugs/B-171-python-pattern-fullmatch.md)。
+
+### `veil-api-kit`（`crates/veil-python-kit`、純 Python、`import veil_kit`）
+
+- setuptools（`license = "Apache-2.0 OR MIT"` の SPDX）、版は `veil-api` と同じで `veil-api==<版>` に依存。extras は `jwt`・`graphql`・
+  `grpc`・`grpcio`・`redis`・`cron`・`all`。
+- モジュール: `cookies`（itsdangerous の `TimestampSigner` 互換の署名・鍵の入れ替え）、`sessions`（Starlette の `SessionMiddleware` と
+  同じ形式の Cookie、`MemoryStore`・`RedisStore`）、`cors`（`CORSMiddleware` → `app.cors`）、`security`（FastAPI と同じ名前の方式・
+  `JWT`（PyJWT、JWKS）・`requires_scopes`）、`redirects`（`safe_redirect`）、`staticfiles`（`StaticFiles` → 本体の File バックエンド）、
+  `graphql`（strawberry、HTTP・SSE・WebSocket（`graphql-transport-ws`・`graphql-ws`）・GraphiQL）、`grpc`（grpcio の `Channel` 互換・
+  `grpc.aio` 風、`RpcError` は grpcio があれば `grpc.RpcError`、`ssl_channel_credentials`）、`di`（`Container`・`Inject`、
+  singleton・scoped・transient、`override`、遅い登録）、`tasks`（`every`・`cron`（組み込みの解析、croniter があればそれ）・`background`）、
+  `testing`。単体試験 `tests/test_kit.py`（拡張無しの python3 でも通る）。
+- 公開: `release.yml` に `kit` の job（`python -m build` で sdist と `py3-none-any` の wheel、版・依存の版が veil-api と同じ PEP 440 の綴り
+  であることと 2 ファイルであることを確かめ、wheel を入れて試験）を足し、`pypi` の job が veil-api と一緒に TestPyPI（rc）・PyPI（正式）へ
+  出す。公開後の確認は veil-api と veil-api-kit の両方。`tools/release/bump-version.sh` は kit の版・依存の版・`__version__` を PEP 440 の
+  綴りで上げる（`0.10.0-rc.1` → `0.10.0rc1`、maturin と同じ）。`tools/release/check-docs.sh` は kit の README・docstring も見る。
+
+### サンプル・試験・文書
+
+- `examples/api/python-kit/`（`app.py`: Depends・Inject・APIRouter・BackgroundTasks・OAuth2 + JWT・スコープ・response_model・
+  セッション・safe_redirect・CORS・StaticFiles・定期タスク・strawberry・`/legacy` に載せた FastAPI（HTTP・WebSocket）。
+  `grpc_client.py`: grpc_tools の生成スタブで h2c・TLS・asyncio の 4 種類の呼び出し・エラー・期限）。
+- `crates/veil-python/tests/test_fastapi_compat.py`（18 本）。`tests/api/library_e2e.sh python` に `run_python_kit`（上の全機能を curl で、
+  WebSocket は `ws_check.py kit`、gRPC クライアントは `examples/api/python-grpc` を相手に h2c・TLS（CA と CA で署名した証明書）・asyncio）。
+- 文書: `crates/veil-python/docs/` の `dependency-injection.md`（書き直し）・`fastapi.md`・`kit.md`（新規）・`requests-responses.md`
+  （Cookie・リダイレクト・応答の型）・`quickstart.md`・`index.md`・`conf.py`（autoapi に kit）、`docs/guide/library.md`・`library-kit.md`（英日）。
+  `crates/veil-python/docs/locale` には日本語の訳が無い（今までどおり gettext で後から作る）。
+- 性能（`tools/api-bench/python`、改修前の HEAD を `BENCH_BASE_VENV` で交互に 3 回、wrk）: 依存を使わないルートは変わらない
+  （plaintext offload=True 12,884 / 12,966 rps、json 12,975 / 13,173、CPU µs/req は 153〜155 で同じ。差は回ごとのばらつきの範囲）。
+  記録は `docs/artifacts/f268/bench.tsv`。
+
+### 設計からの変更・残したもの
+
+- ASGI のアプリはネイティブの `async def` と同じ常駐のループで動く（専用のループ `event_loops=1` は作らなかった）。`pathsend` は
+  Python でファイルを読む（sendfile にしていない）。要求の本文は呼ぶ前に読み切る。uvicorn・granian との ASGI の性能比較はしていない。
+- `TestClient` はループバックで起動せずにルートを直接呼ぶ（Starlette と同じ）。FastAPI の公式チュートリアルを置き換えて通す
+  `tests/api/fastapi_compat/` は作らず、互換の試験は `test_fastapi_compat.py` と `fastapi.md` の対応表（「無いもの」を含む）にした。
+- `veil_kit.graphql` の GraphiQL は strawberry のページ（CDN から読む）。`@app.exception_handler`・Starlette のミドルウェアは
+  ネイティブのルートには無い（ASGI で載せれば動く）。`allow_origin_regex` は無い。
+- gRPC のサーバ側の補助は `veil.grpc` の再公開（F-265 の OpenAPI への記述子は F-265 で）。

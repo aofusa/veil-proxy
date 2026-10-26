@@ -1206,8 +1206,24 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   `@veil.l4_udp(name, listen)` on `def f(data, peer) -> bytes | None`.
 - **Forms and files (F-266):** `veil.Form()`, `veil.File()` and `veil.UploadFile`, as in FastAPI (no
   `python-multipart` needed; see [Forms and file uploads](#forms-and-file-uploads)).
+- **FastAPI-style dependencies (F-268):** `veil.Depends` (nested, cached per request, `yield` cleanup, `async`),
+  `veil.Security` / `SecurityScopes`, the markers `Query()` / `Path()` / `Header()` / `Cookie()` / `Body()` with their
+  checks (422 in FastAPI's shape), `BackgroundTasks` (run after the response is sent), `APIRouter` /
+  `include_router`, `app.dependency_overrides`, `response_model`, `request.cookies`, `response.set_cookie()` and
+  `veil.testclient.TestClient`. The dependency tree of a route is built from the signatures once; routes that do not
+  use these features keep the binding they had.
+- **ASGI (F-268):** `veil.asgi.run(fastapi_app)` serves a FastAPI / Starlette application in place of uvicorn, and
+  `app.mount("/legacy", fastapi_app)` puts one under a path of a veil application (`http` with the trailers and
+  pathsend extensions, `websocket`, `lifespan`). veil does HTTP/1.1, HTTP/2, HTTP/3, TLS and compression; the
+  application runs on the persistent event loop.
+- **`veil-api-kit` (F-268)**, a pure-Python package (`pip install veil-api-kit`, `import veil_kit`, same version as
+  `veil-api`): signed cookies and sessions, `CORSMiddleware` (answered by the server), the security schemes of
+  `fastapi.security` and JWT (PyJWT), `safe_redirect`, `StaticFiles` (served by the server's file backend),
+  strawberry GraphQL over HTTP / SSE / WebSocket, a gRPC channel for `grpc_tools` stubs on veil's HTTP/2 client
+  (sync and `grpc.aio` style; grpcio not required), a DI container and periodic / cron tasks.
 - **GraphQL:** mount any library as an ordinary route; [examples/api/python-graphql/](../../examples/api/python-graphql/)
-  uses strawberry (queries, mutations, and subscriptions over SSE).
+  uses strawberry (queries, mutations, and subscriptions over SSE), and `veil_kit.graphql.mount` does the same with
+  WebSocket subscriptions and GraphiQL.
 - Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
@@ -1217,7 +1233,9 @@ Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Exa
 [examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/),
 [examples/api/python-features/](../../examples/api/python-features/) (streaming, L4),
 [examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer),
-[examples/api/python-websocket/](../../examples/api/python-websocket/) (WebSocket, upgrade, lifespan, the event loop).
+[examples/api/python-websocket/](../../examples/api/python-websocket/) (WebSocket, upgrade, lifespan, the event loop),
+[examples/api/python-kit/](../../examples/api/python-kit/) (`Depends`, `veil-api-kit`, a mounted FastAPI application, the
+gRPC client).
 
 ## Building library artifacts
 

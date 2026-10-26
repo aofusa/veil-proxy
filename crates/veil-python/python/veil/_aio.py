@@ -142,6 +142,12 @@ async def _stream_out(job, sr):
         if aclose is not None and w.closed:
             await aclose()
     w.finish(sr.trailers)
+    # F-268: 送り終えた後の background（BackgroundTasks 等）
+    bg = getattr(sr, "background", None)
+    if bg is not None:
+        from . import _arun_background
+
+        await _arun_background(bg)
 
 
 def start(n, kind):
