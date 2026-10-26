@@ -14,6 +14,9 @@ Three front ends share the same implementation:
 | C API | [`crates/veil-capi`](../../crates/veil-capi/README.md) (`libveil.so` / `libveil.a`, `veil.h`) | C, C++ and any language with a C FFI |
 | Python | [`crates/veil-python`](../../crates/veil-python/README.md) (wheel, `import veil`) | FastAPI-style decorators |
 
+For Rust, the separate crate [`veil-proxy-kit`](library-kit.md) adds cookies, redirects, static files, CORS,
+authentication (JWT), sessions, GraphQL, dependency injection and background tasks.
+
 - [Architecture](#architecture)
 - [Depending on veil](#depending-on-veil)
 - [Configuration in library mode](#configuration-in-library-mode)
@@ -23,6 +26,7 @@ Three front ends share the same implementation:
 - [Shared state](#shared-state)
 - [tower layers and tokio libraries](#tower-layers-and-tokio-libraries)
 - [tokio compatibility](#tokio-compatibility)
+- [HTTP client](#http-client)
 - [GraphQL](#graphql)
 - [L4 (TCP/UDP) handlers](#l4-tcpudp-handlers)
 - [TLS and HTTP/3](#tls-and-http3)
@@ -782,6 +786,26 @@ FreeBSD, OpenBSD and NetBSD; see [Platforms](#platforms)): hyper server (HTTP/1.
 client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, axum 0.8 (`axum::serve`, extractors, state, graceful
 shutdown), sqlx with SQLite and PostgreSQL.
 
+## HTTP client
+
+`veil::api::client` (feature `handler`) is an asynchronous HTTP client that runs on the worker's runtime, so handlers
+and tasks call other services without tokio:
+
+```rust
+use veil::api::client::{Client, Http2};
+
+let client = Client::builder().http2(Http2::Auto).timeout(Duration::from_secs(5)).build()?;
+let res = client.get("https://api.example.com/v1/items").bearer_auth(token).send().await?;
+let items: Vec<Item> = res.error_for_status()?.json()?;
+```
+
+It uses the proxy's upstream building blocks: name resolution on the offload pool, the upstream TLS client (trust
+anchors from `[tls_client] ca`, or `ClientBuilder::ca`; `client_cert` for mTLS), multiplexed HTTP/2 connections and a
+per-worker HTTP/1.1 pool. `Http2::Auto` (default) negotiates h2 or HTTP/1.1 by ALPN over TLS and uses HTTP/1.1 in
+plain text, `Http2::On` uses h2 and h2c with prior knowledge, `Http2::Off` HTTP/1.1. `http://unix:/path.sock:/x`
+connects to a Unix socket. Response bodies are read whole (`max_response_size`, 64 MiB by default). Errors have a
+`kind()` and convert into a 502 or 504 `Response`. Details: [library-kit.md](library-kit.md#http-client).
+
 ## GraphQL
 
 veil does not depend on a GraphQL library: you pick one (async-graphql, juniper, ...) and mount it as an ordinary
@@ -803,6 +827,9 @@ It serves `POST` with a JSON body (single or batch) and `GET` with `?query=...&v
 `GET` without a query (`Accept: text/html`), `application/graphql-response+json` when the client asks for it
 (otherwise `application/json`), and subscriptions over SSE (GraphQL over SSE, distinct connections mode) when the
 request has `Accept: text/event-stream`: one `event: next` per result and a final `event: complete`.
+
+The [`veil-proxy-kit`](library-kit.md#graphql) crate has the same bridge as `veil_kit::graphql::mount`, plus
+subscriptions over WebSocket (`graphql-transport-ws`, `graphql-ws`).
 
 > Up to v0.7 the `graphql` feature provided `App::graphql(path, schema)`. It was removed (F-207) so that the API
 > library does not pull in async-graphql; copy `src/graphql.rs` from the example to keep the same behaviour.
@@ -850,6 +877,22 @@ them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)
 bidirectional streaming methods return `Response<BoxStream<T>>`; client streaming and bidirectional methods receive
 `Request<Streaming<T>>`. `veil_build::configure().veil_path("::my_veil")` changes the crate path and `config_mut()`
 exposes the `prost_build::Config`.
+
+`veil-build` also generates a client module `<service>_client` (`build_client(false)` turns it off, `build_server(false)`
+leaves only the client):
+
+```rust
+use hello::greeter_client::GreeterClient;
+
+let client = GreeterClient::connect("http://127.0.0.1:50051")?;   // https:// = h2 over TLS
+let reply = client.say_hello(hello::HelloRequest { name: "veil".into() }).await?.into_inner();
+```
+
+Unary methods take a message or a `Request<T>`; server streaming returns `Response<ClientStreaming<T>>`
+(`message().await`, `trailers()`); client streaming and bidirectional methods take any `Stream<Item = T> + Unpin`.
+The client runs over `veil::api::grpc::Channel` (`Channel::connect(url)`, `Channel::with_client(&http_client, url)`
+for custom TLS), which sends metadata, deadlines (`grpc-timeout`) and compressed messages and returns `Status` from
+the trailers. It uses the HTTP/2 client above and runs on the worker's runtime.
 
 ### Without code generation
 
@@ -1316,7 +1359,10 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
-- gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
+- gRPC client: `veil-build`'s generated clients and `Channel` use HTTP/2 only (no gRPC-Web, no HTTP/3); tonic on
+  `veil::tokio` remains an option.
+- `veil::api::client` reads bodies whole (no streaming response bodies yet) and does not follow redirects or keep
+  cookies.
 - Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
   stalls its event loop (see above).
 - Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,

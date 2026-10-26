@@ -27,6 +27,8 @@ pub mod app;
 // F-210: C・Python のストリーミング・gRPC・L4 が使う。
 /// Bounded queues between the workers and the handler pool.
 pub mod bridge;
+// F-267
+pub mod client;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod extract;
@@ -61,14 +63,14 @@ pub mod l4;
 
 pub use app::{
     block_on, serve, serve_blocking, serve_with_router, settings, shutdown, state, ApiSettings,
-    App, Error, Router,
+    App, Error, Plugin, Router, ServeOptions, WorkerInfo,
 };
 pub use config::{Config, ConfigBuilder, ConfigError, Listener};
-pub use extract::{Body, Form, FromRequest, Headers, Json, Query, State};
+pub use extract::{Body, Form, FromRequest, FromRequestAsync, Headers, Json, Query, State};
 pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta, WebSocketMeta};
 pub use multipart::{Multipart, MultipartForm, UploadFile};
-pub use request::{HttpVersion, Request};
-pub use response::{ApiError, Html, IntoResponse, Response};
+pub use request::{Extensions, HttpVersion, Request};
+pub use response::{AfterSend, ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
 pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
 pub use upgrade::{ShutdownSignal, Upgraded};
@@ -103,6 +105,7 @@ pub(crate) fn is_builtin_enabled(entry: &HandlerEntry, settings: &app::ApiSettin
 pub mod __private {
     pub use super::extract::{
         form_body, json_body, path_param, query_param, query_param_opt, query_struct, FromRequest,
+        FromRequestAsync,
     };
     pub use super::handler::{
         BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef, WebSocketMeta,

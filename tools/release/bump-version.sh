@@ -7,7 +7,7 @@
 # Python の wheel の版は maturin が crates/veil-python の版を読む）。この台本はそこを書き換え、
 # 版を書き写している次の場所も揃える。同じ版で 2 回実行しても差分は出ない。
 #
-#   - ルートから veil-macros への依存の version
+#   - ルートから veil-macros への依存の version、crates/veil-kit から veil への依存の version（F-267）
 #   - Cargo.lock（ワークスペース）と、ワークスペース外のクレートの Cargo.lock の veil 系の版
 #   - 文書の中で「今の版の例」として書いた箇所（下の DOC_FILES。計測の基準として書いた版
 #     ＝ docs/perf・docs/guide/performance.md の表・tools/perf は意味が変わるので書き換えない）
@@ -43,6 +43,11 @@ rest = re.sub(r'^version = "[^"]*"', f'version = "{new}"', rest, count=1, flags=
 s = head + sep + rest
 s = re.sub(r'(veil-(?:proxy-)?macros = \{[^}\n]*version = ")[^"]*(")', rf'\g<1>{new}\g<2>', s)
 open(p, "w").write(s)
+# F-267: veil-proxy-kit の veil への依存（同じ版で公開する）
+p = "crates/veil-kit/Cargo.toml"
+s = open(p).read()
+s = re.sub(r'(^veil = \{ package = "veil-proxy", path = "\.\./\.\.", version = ")[^"]*(")', rf'\g<1>{new}\g<2>', s, flags=re.M)
+open(p, "w").write(s)
 PY
 
 # 2. Cargo.lock（ワークスペースと、path で veil に依存するワークスペース外のクレート）
@@ -53,7 +58,7 @@ for lock in examples/api/*/Cargo.lock tools/api-bench/*/Cargo.lock tools/tokio-c
     [ -f "$lock" ] || continue
     dir="$(dirname "$lock")"
     pkgs=()
-    for name in veil veil-proxy veil-macros veil-proxy-macros veil-build veil-proxy-build; do
+    for name in veil veil-proxy veil-macros veil-proxy-macros veil-build veil-proxy-build veil-proxy-kit; do
         if grep -q "^name = \"$name\"$" "$lock"; then pkgs+=(-p "$name"); fi
     done
     [ "${#pkgs[@]}" -gt 0 ] || continue

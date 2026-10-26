@@ -30,6 +30,7 @@ pub(crate) fn build_request(
             .unwrap_or(IpAddr::from([0, 0, 0, 0])),
         version,
         body_stream: None,
+        extensions: Default::default(),
     }
 }
 
@@ -100,6 +101,15 @@ pub(crate) async fn call_with(
     if resp.upgrade.is_some() {
         super::upgrade::check_response(&mut resp, cache.upgrade_allowed && !head);
     }
+    // F-267: ストリーミング応答の after_send は本文のストリームと一緒に持ち回す（ストリームを送り終えて捨てたときに呼ぶ）
+    if resp.stream.is_some() && resp.after_send.is_some() {
+        let a = resp.after_send.take();
+        let s = resp.stream.take().expect("checked");
+        resp.stream = Some(Box::pin(AfterSendStream {
+            inner: s,
+            _after: a,
+        }));
+    }
     let mut head_encoded = false;
     if let (Some(c), Some(a)) = (comp, accept.as_deref()) {
         if head {
@@ -135,6 +145,23 @@ pub(crate) async fn call_with(
         }
     }
     resp
+}
+
+// F-267
+/// A body stream that runs the response's after-send callbacks when it is dropped.
+struct AfterSendStream {
+    inner: super::stream::BodyStream,
+    _after: Option<Box<super::response::AfterSend>>,
+}
+
+impl futures::Stream for AfterSendStream {
+    type Item = super::stream::BodyChunk;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        futures::Stream::poll_next(self.inner.as_mut(), cx)
+    }
 }
 
 /// Lowercases header names for HTTP/2 and HTTP/3 and removes connection-specific headers (RFC 9113 section 8.2.2).

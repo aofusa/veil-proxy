@@ -24,6 +24,8 @@
 // F-210: C・Python 用。
 /// Blocking gRPC handlers (for C and Python).
 pub mod blocking;
+// F-267
+mod channel;
 pub mod health;
 pub mod reflection;
 mod web;
@@ -44,7 +46,8 @@ use super::stream::{BodyChunk, RequestBodyStream};
 use crate::grpc::compression::GrpcCompression;
 use crate::grpc::framing::GrpcFrameDecoder;
 use bytes::BufMut;
-use futures::{Stream, StreamExt};
+pub use futures::Stream;
+use futures::StreamExt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -58,6 +61,7 @@ pub use crate::grpc::compression::GrpcCompression as Compression;
 pub use crate::grpc::status::GrpcStatusCode as Code;
 /// The buffer types used by codec implementations (such as the generated `ProstCodec`).
 pub use bytes::{Bytes, BytesMut};
+pub use channel::{Channel, IntoRequest, IntoStreamingRequest, Streaming as ClientStreaming};
 
 // ===================== Codec =====================
 

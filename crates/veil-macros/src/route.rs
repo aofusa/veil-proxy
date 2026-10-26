@@ -126,6 +126,8 @@ enum ArgKind {
     },
     /// `Multipart`: the body read as it arrives (the route receives its body as a stream).
     Multipart(Type),
+    /// Extracted with `FromRequestAsync` (`#[inject]` arguments and the extractor types of veil-proxy-kit).
+    Async(Type),
     PathParam(String, Type),
     QueryParam {
         name: String,
@@ -154,6 +156,10 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
             }
         }
         "State" | "Headers" | "Bytes" | "Body" => return ArgKind::FromRequest(ty.clone()),
+        // F-267: veil-proxy-kit の抽出子（型名で決める。他の型は `#[inject]` を付ける）
+        "Dep" | "Auth" | "MaybeAuth" | "CookieJar" | "SignedCookieJar" | "PrivateCookieJar"
+        | "BackgroundTasks" | "BasicAuth" | "BearerToken" | "ApiKey" | "Jwt" | "Session"
+        | "Inject" => return ArgKind::Async(ty.clone()),
         "WebSocketUpgrade" => return ArgKind::WebSocket(ty.clone()),
         "Multipart" => return ArgKind::Multipart(ty.clone()),
         "MultipartForm" => {
@@ -237,7 +243,18 @@ fn response_content(ret: &ReturnType) -> TokenStream {
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let args = parse_args(attr)?;
-    let func: ItemFn = syn::parse2(item)?;
+    let mut func: ItemFn = syn::parse2(item)?;
+    // F-267: `#[inject]` の付いた引数は FromRequestAsync で取り出す（属性は関数から外して出力する）
+    let mut injected = Vec::new();
+    for input in func.sig.inputs.iter_mut() {
+        if let FnArg::Typed(pt) = input {
+            let before = pt.attrs.len();
+            pt.attrs.retain(|a| !a.path().is_ident("inject"));
+            injected.push(pt.attrs.len() != before);
+        } else {
+            injected.push(false);
+        }
+    }
     let (path, path_span) = args
         .path
         .clone()
@@ -293,7 +310,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         };
         let var = format_ident!("__veil_arg{}", i);
         let ty = &*pt.ty;
-        match classify(arg_name.as_deref(), ty, &path_params) {
+        let kind = if injected[i] {
+            ArgKind::Async(ty.clone())
+        } else {
+            classify(arg_name.as_deref(), ty, &path_params)
+        };
+        match kind {
             ArgKind::RequestRef => call_args.push(quote!(&__veil_req)),
             ArgKind::RequestOwned => call_args.push(quote!(__veil_req.clone())),
             ArgKind::Json(inner) | ArgKind::Form(inner) | ArgKind::Query(inner) => {
@@ -394,6 +416,15 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 });
                 call_args.push(quote!(#var));
                 mp_files.push((fname, many, !optional));
+            }
+            ArgKind::Async(t) => {
+                extract.push(quote! {
+                    let #var: #t = match <#t as ::veil::api::__private::FromRequestAsync>::from_request_async(&__veil_req).await {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
             }
             ArgKind::Multipart(t) => {
                 mp_stream = true;

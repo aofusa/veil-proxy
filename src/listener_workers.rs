@@ -241,6 +241,9 @@ fn spawn_workers<S, Fut>(
                 listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
 
                 info!("[{} {}] Worker started", label, thread_id);
+                // F-267: ライブラリの `App::on_worker_start`（登録が無ければ空の確認だけ）
+                #[cfg(feature = "handler")]
+                crate::api::app::run_worker_start(&label, thread_id);
 
                 // F-46: 接続ハンドラの型付きタスクプール（spawn ごとの Box 確保を排除）
                 let conn_pool = crate::runtime::TaskPool::new();

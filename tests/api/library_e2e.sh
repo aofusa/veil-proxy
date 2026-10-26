@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|c|python|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|python|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -938,6 +938,197 @@ JSON
   rm -rf "$W"
 }
 
+run_kit() { # F-267: veil-proxy-kit（examples/api/rust-kit）と tower のサンプル（examples/api/rust-tower-recipes）
+  echo "== kit (examples/api/rust-kit, examples/api/rust-tower-recipes)"
+  local T="$ROOT/target/examples-api"
+  kit_suite "$T" ""
+  # Linux は epoll の reactor でも（クライアントの接続・TLS・HTTP/2 の多重化は reactor で別の経路を通る）
+  [ "$OS" = Linux ] && kit_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+  run_tower_recipes "$T"
+}
+
+kit_suite() { # kit_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-kit" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build kit ($label)"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port); local S; S=$(free_port)
+  [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  # クライアントの検証（webpki）は CA の証明書を末端に使うと拒むので、CA と末端の証明書を分けて作る
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/ca.key" -out "$W/ca.pem" -days 2 \
+    -subj /CN=kit-e2e-ca 2>/dev/null || { bad "cert"; return; }
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/leaf.csr" -subj /CN=localhost 2>/dev/null || { bad "cert"; return; }
+  printf 'basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$W/leaf.ext"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl x509 -req -in "$W/leaf.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcreateserial \
+    -days 2 -extfile "$W/leaf.ext" -out "$W/cert.pem" 2>/dev/null || { bad "cert"; return; }
+  mkdir -p "$W/static/sub"; printf 'hello static\n' > "$W/static/hello.txt"; printf '<h1>index</h1>\n' > "$W/static/sub/index.html"
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_CLIENT_CA="$W/ca.pem" VEIL_STATIC_DIR="$W/static" exec "$T/debug/veil-example-kit$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start kit ($label)"; cat "$W/log"; return; }
+  wait_port "$S" "$PID" || { bad "start kit TLS ($label)"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P" J="$W/jar"
+  # Cookie・リダイレクト
+  expect "cookie: Set-Cookie ($label)" "set-cookie: visits=1; path=/; httponly" bash -c "curl -s -i '$B/cookie/visit' | tr A-Z a-z"
+  expect "cookie: reads the jar ($label)" "visit 3" curl -s -H 'cookie: a=b; visits=2' "$B/cookie/visit"
+  curl -s -c "$J" -X POST "$B/cookie/signed" >/dev/null
+  expect "signed cookie roundtrip ($label)" "alice" curl -s -b "$J" "$B/cookie/signed"
+  expect "signed cookie tampering ($label)" "invalid" bash -c "curl -s -H \"cookie: user=\$(awk '\$6==\"user\"{print \$7}' '$J' | sed 's/alice/admin/')\" '$B/cookie/signed'"
+  curl -s -c "$J.p" -X POST "$B/cookie/private" >/dev/null
+  expect "private cookie roundtrip ($label)" "s3cr3t" curl -s -b "$J.p" "$B/cookie/private"
+  if grep -q s3cr3t "$J.p"; then bad "private cookie is encrypted ($label)"; else ok "private cookie is encrypted ($label)"; fi
+  expect "redirect: allowed host ($label)" "location: https://app.example.com/x" bash -c "curl -s -i '$B/redirect?next=https://app.example.com/x' | tr -d '\\r'"
+  expect "redirect: open redirect blocked ($label)" "location: /" bash -c "curl -s -i '$B/redirect?next=//evil.example/' | tr -d '\\r' | grep -i '^location'"
+  expect "redirect: 303 ($label)" "303" curl -s -o /dev/null -w "%{http_code}" -X POST "$B/moved"
+  # 静的ファイル（本体の File バックエンド）と serve::file
+  expect "serve_dir file ($label)" "hello static" curl -s "$B/static/hello.txt"
+  expect "serve_dir index ($label)" "<h1>index</h1>" curl -s "$B/static/sub/"
+  expect "serve_dir Range ($label)" "206" curl -s -o /dev/null -w "%{http_code}" -r 0-4 "$B/static/hello.txt"
+  expect "serve_dir h2c ($label)" "hello static" curl -s --http2-prior-knowledge "$B/static/hello.txt"
+  expect "serve_dir 404 ($label)" "404" curl -s -o /dev/null -w "%{http_code}" "$B/static/nope.txt"
+  expect "serve::file ($label)" "content-type: text/plain" bash -c "curl -s -i '$B/download' | tr A-Z a-z"
+  # CORS（/api だけ）
+  expect "cors preflight ($label)" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example.com' -H 'access-control-request-method: POST' '$B/api/echo' | tr A-Z a-z"
+  expect "cors preflight 204 ($label)" "204" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://x.example.org' -H 'access-control-request-method: GET' "$B/api/hello"
+  expect "cors actual + credentials ($label)" "access-control-allow-credentials: true" bash -c "curl -s -i -H 'origin: https://a.example.org' '$B/api/hello' | tr A-Z a-z"
+  if curl -s -i -H 'origin: https://evil.example' "$B/api/hello" | grep -qi access-control-allow-origin; then bad "cors rejects other origins ($label)"; else ok "cors rejects other origins ($label)"; fi
+  if curl -s -i -H 'origin: https://app.example.com' "$B/cookie/visit" | grep -qi access-control; then bad "cors only on /api ($label)"; else ok "cors only on /api ($label)"; fi
+  # 認証
+  expect "basic 401 ($label)" "www-authenticate: basic" bash -c "curl -s -i '$B/auth/basic' | tr A-Z a-z"
+  expect "basic ok ($label)" "basic admin" curl -s -u admin:pw "$B/auth/basic"
+  expect "api key ok ($label)" "key ok" curl -s -H 'x-api-key: k-123' "$B/auth/key"
+  expect "api key wrong ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -H 'x-api-key: nope' "$B/auth/key"
+  local TOK ADM; TOK="$(curl -s -X POST "$B/auth/token" -H 'content-type: application/json' -d '{"user":"bob","admin":false}')"
+  ADM="$(curl -s -X POST "$B/auth/token" -H 'content-type: application/json' -d '{"user":"root","admin":true}')"
+  expect "jwt ok ($label)" "me bob" curl -s -H "authorization: Bearer $TOK" "$B/auth/me"
+  expect "jwt invalid ($label)" 'error="invalid_token"' bash -c "curl -s -i -H 'authorization: Bearer ${TOK}x' '$B/auth/me'"
+  expect "guard 401 ($label)" "401" curl -s -o /dev/null -w "%{http_code}" "$B/admin/area"
+  expect "guard 403 without scope ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -H "authorization: Bearer $TOK" "$B/admin/area"
+  expect "guard ok with scope ($label)" "admin root" curl -s -H "authorization: Bearer $ADM" "$B/admin/area"
+  # セッション（保存先はメモリ、ログインで ID を替える）
+  local SJ="$W/sess"
+  expect "session anonymous ($label)" "anonymous 1" curl -s -c "$SJ" -b "$SJ" "$B/session/whoami"
+  local before; before="$(awk '$6=="veil_session"{print $7}' "$SJ")"
+  curl -s -c "$SJ" -b "$SJ" -X POST --data 'carol' "$B/session/login" >/dev/null
+  local after; after="$(awk '$6=="veil_session"{print $7}' "$SJ")"
+  [ -n "$after" ] && [ "$before" != "$after" ] && ok "session id cycles on login ($label)" || bad "session id cycles on login ($label)"
+  expect "session keeps data ($label)" "carol 2" curl -s -c "$SJ" -b "$SJ" "$B/session/whoami"
+  expect "session old id is gone ($label)" "anonymous 1" curl -s -H "cookie: veil_session=$before" "$B/session/whoami"
+  curl -s -c "$SJ" -b "$SJ" -X POST "$B/session/logout" >/dev/null
+  expect "session destroyed ($label)" "anonymous 1" curl -s -b "$SJ" "$B/session/whoami"
+  # 依存性注入
+  expect "di singleton ($label)" '"db":1' curl -s -H 'x-request-id: r1' "$B/di"
+  expect "di scoped shared within a request ($label)" '"scoped_shared":true' curl -s -H 'x-request-id: r1' "$B/di"
+  expect "di scoped value ($label)" '"request_id":"r2"' curl -s -H 'x-request-id: r2' "$B/di"
+  expect "di transient ($label)" '"transient_distinct":true' curl -s "$B/di"
+  expect "di #[inject] extractor ($label)" '"ua":"kit-e2e"' curl -s -A kit-e2e "$B/di"
+  expect "di singleton stays one ($label)" '"db":1' curl -s --http2-prior-knowledge "$B/di"
+  # バックグラウンドタスク（応答の後・定期・cron・起動時）
+  expect "background task queued ($label)" "queued" curl -s -X POST "$B/tasks/enqueue"
+  expect "background task queued (h2c, $label)" "queued" curl -s --http2-prior-knowledge -X POST "$B/tasks/enqueue"
+  sleep 2.2
+  expect "background tasks ran after the response ($label)" '"background":2' curl -s "$B/tasks/status"
+  expect "blocking background tasks ran ($label)" '"background_blocking":2' curl -s "$B/tasks/status"
+  expect "startup task ran once ($label)" '"started":1' curl -s "$B/tasks/status"
+  local st; st="$(curl -s "$B/tasks/status")"
+  local ticks cron; ticks="$(echo "$st" | sed -n 's/.*"ticks":\([0-9]*\).*/\1/p')"; cron="$(echo "$st" | sed -n 's/.*"cron":\([0-9]*\).*/\1/p')"
+  [ "${ticks:-0}" -ge 5 ] && ok "every() ticks ($label, $ticks)" || bad "every() ticks ($label): $st"
+  [ "${cron:-0}" -ge 1 ] && ok "cron ticks ($label, $cron)" || bad "cron ticks ($label): $st"
+  # HTTP クライアント（自分に要求する）
+  enc() { "$PY3" -I -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+  expect "client HTTP/1.1 ($label)" "status=200 version=Http11 body=hello" curl -s "$B/client/fetch?mode=h1&url=$(enc "$B/api/hello")"
+  expect "client h2c ($label)" "status=200 version=Http2 body=hello" curl -s "$B/client/fetch?mode=h2c&url=$(enc "$B/api/hello")"
+  expect "client HTTPS h2 via ALPN ($label)" "status=200 version=Http2 body=hello" curl -s "$B/client/fetch?mode=auto&url=$(enc "https://localhost:$S/api/hello")"
+  expect "client HTTPS HTTP/1.1 ($label)" "status=200 version=Http11 body=hello" curl -s "$B/client/fetch?mode=h1&url=$(enc "https://localhost:$S/api/hello")"
+  expect "client 404 status ($label)" "status=404" curl -s "$B/client/fetch?mode=h1&url=$(enc "$B/nope")"
+  expect "client keep-alive reuse ($label)" "status=200" bash -c "for i in 1 2 3; do curl -s '$B/client/fetch?mode=h1&url=$(enc "$B/api/hello")'; done"
+  expect "client JSON + retry ($label)" "json n=42 retry=hello" curl -s "$B/client/json"
+  expect "client rejects untrusted cert ($label)" "Connect" curl -s "$B/client/fetch?mode=noca&url=$(enc "https://127.0.0.1:$S/api/hello")"
+  if [ "$OS" != Windows ]; then
+    local US="$W/up.sock"
+    "$PY3" -I - "$US" <<'PY' > "$W/uds.log" 2>&1 &
+import http.server, socketserver, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = ("uds " + self.path + " " + (self.headers.get("x-from") or "")).encode()
+        self.send_response(200); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+    def address_string(self): return "uds"
+class S(socketserver.UnixStreamServer):
+    def get_request(self):
+        r, _ = super().get_request(); return r, ("uds", 0)
+S(sys.argv[1], H).serve_forever()
+PY
+    PIDS+=("$!"); for _ in $(seq 1 50); do [ -S "$US" ] && break; sleep 0.1; done
+    expect "client unix socket ($label)" "status=200 version=Http11 body=uds /v1/x kit-client" curl -s "$B/client/fetch?mode=h1&url=$(enc "http://unix:$US:/v1/x")"
+  fi
+  # gRPC: 生成したクライアント（veil-build の build_client）で自分のサービス（h2c と HTTPS の h2）
+  local G='hello=Hello kit echo=e2e trailer=t1 count=[1, 2, 3, 4, 5] sum=55 chat=A,B fail=NotFound/no such thing'
+  expect "grpc client h2c ($label)" "$G" curl -s "$B/grpc/call"
+  expect "grpc client TLS ($label)" "$G" curl -s "$B/grpc/call?tls=1"
+  # GraphQL（HTTP・SSE・WebSocket）
+  expect "graphql POST ($label)" '{"data":{"add":3}}' curl -s -X POST -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}' "$B/graphql"
+  expect "graphql GET ($label)" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7B%20add(a%3A2%2Cb%3A3)%20%7D"
+  expect "graphql SSE subscription ($label)" '{"data":{"count":3}}' curl -s -N -H 'accept: text/event-stream' -X POST -H 'content-type: application/json' -d '{"query":"subscription { count(upto: 3) }"}' "$B/graphql"
+  expect "graphql WebSocket graphql-transport-ws ($label)" 'next {"count":1} {"count":2} complete' "$PY3" -I - "$P" <<'PY'
+import base64, json, os, socket, struct, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall(("GET /graphql HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+           "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n" % key).encode())
+buf = b""
+while b"\r\n\r\n" not in buf: buf += s.recv(4096)
+head, buf = buf.split(b"\r\n\r\n", 1)
+assert b" 101 " in head.split(b"\r\n")[0], head
+def send(obj):
+    p = json.dumps(obj).encode(); m = os.urandom(4)
+    hdr = bytes([0x81]) + (bytes([0x80 | len(p)]) if len(p) < 126 else bytes([0x80 | 126]) + struct.pack(">H", len(p)))
+    s.sendall(hdr + m + bytes(b ^ m[i % 4] for i, b in enumerate(p)))
+def recv():
+    global buf
+    while True:
+        if len(buf) >= 2:
+            n = buf[1] & 0x7f; off = 2
+            if n == 126: n = struct.unpack(">H", buf[2:4])[0]; off = 4
+            if len(buf) >= off + n:
+                op, p, buf = buf[0] & 0x0f, buf[off:off + n], buf[off + n:]
+                if op == 1: return json.loads(p)
+                if op == 8: return {"type": "close"}
+                continue
+        buf += s.recv(4096)
+send({"type": "connection_init"}); assert recv()["type"] == "connection_ack"
+send({"id": "1", "type": "subscribe", "payload": {"query": "subscription { count(upto: 2) }"}})
+out = []
+while True:
+    m = recv()
+    if m["type"] == "next": out.append(json.dumps(m["payload"]["data"], separators=(",", ":")))
+    else: out.append(m["type"]); break
+print("next " + " ".join(out))
+PY
+  kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  kill -0 "$PID" 2>/dev/null && bad "kit graceful shutdown with app tasks ($label)" || ok "kit graceful shutdown with app tasks ($label)"
+}
+
+run_tower_recipes() { # run_tower_recipes <target-dir>
+  local T="$1"
+  (cd "$ROOT/examples/api/rust-tower-recipes" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build tower recipes"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port)
+  mkdir -p "$W/www/files"; printf 'tower file\n' > "$W/www/files/a.txt"; printf 'veil file\n' > "$W/www/b.txt"
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_WWW="$W/www" exec "$T/debug/veil-example-tower-recipes$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start tower recipes"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P"
+  expect "tower-http CorsLayer preflight" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example.com' -H 'access-control-request-method: GET' '$B/hello' | tr A-Z a-z"
+  expect "tower-http CorsLayer actual" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -H 'origin: https://app.example.com' '$B/hello' | tr A-Z a-z"
+  expect "tower-http SetResponseHeaderLayer" "x-powered-by: veil" bash -c "curl -s -i '$B/hello' | tr A-Z a-z"
+  expect "tower-http ValidateRequestHeaderLayer::bearer 401" "401" curl -s -o /dev/null -w "%{http_code}" "$B/admin/stats"
+  expect "tower-http ValidateRequestHeaderLayer::bearer ok" "stats" curl -s -H 'authorization: Bearer secret' "$B/admin/stats"
+  expect "cookie with the http crate" "set-cookie: theme=dark" bash -c "curl -s -i '$B/theme' | tr A-Z a-z"
+  expect "cookie read" "theme=dark" curl -s -H 'cookie: theme=dark' "$B/theme"
+  expect "redirect (http::Response 302)" "location: /hello" bash -c "curl -s -i '$B/old' | tr -d '\\r' | tr A-Z a-z"
+  expect "tower-http ServeDir on veil::tokio" "tower file" curl -s "$B/files/a.txt"
+  expect "App::serve_dir (recommended)" "veil file" curl -s "$B/www/b.txt"
+  kill "$PID"
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない（${FULL}）"
   (cd "$ROOT" && cargo build -q $NODEF --features "$FULL") || { bad "build $FULL"; return; }
@@ -964,6 +1155,9 @@ run_nonregression() {
   # F-270: ハンドラの応答の圧縮（veil::api::compress・C の veil_response_no_compression）も入らない
   n=$(grep -cE "veil::api::compress|veil_response_no_compression" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::compress in the full binary" || bad "handler compression symbols found ($n)"
+  # F-267: HTTP / gRPC クライアント（veil::api::client・Channel）と veil-proxy-kit（veil_kit::）も入らない
+  n=$(grep -cE "veil::api::client|veil::api::grpc::channel|veil_kit::" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::client / veil_kit in the full binary" || bad "client or kit symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-198: api の既定（tokio-compat）は tokio に依存しない
@@ -996,7 +1190,8 @@ case "$WHAT" in
   python) run_python ;;
   nonregression) run_nonregression ;;
   external) run_external ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_c; run_c_features; run_python ;;
-  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|c|python|nonregression|external|all]"; exit 2 ;;
+  kit) run_kit ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_python ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|python|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

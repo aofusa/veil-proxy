@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build"]
+members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build", "crates/veil-kit"]
 # third_party/wasmtime は crates.io wasmtime 36.0.18（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである

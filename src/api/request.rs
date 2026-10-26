@@ -49,6 +49,84 @@ pub struct Request {
     // F-197
     /// The body when received as a stream (for a `streaming_request` route over HTTP/2).
     pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
+    // F-267: 要求に紐づく型付きの値（認証の主体・DI の scoped の値など）。使わない要求では確保しない
+    pub(crate) extensions: Extensions,
+}
+
+// F-267
+/// Typed values attached to one request (for example the authenticated principal set by middleware, or the
+/// request-scoped values of a dependency container). Clones of a [`Request`] made after the first value was inserted share
+/// the same values; nothing is allocated until the first value is inserted.
+#[derive(Clone, Default)]
+pub struct Extensions(std::sync::OnceLock<ExtMap>);
+
+type ExtMap = std::sync::Arc<std::sync::Mutex<Vec<(std::any::TypeId, ExtValue)>>>;
+type ExtValue = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+impl std::fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.get().map(|m| m.lock().unwrap().len()).unwrap_or(0);
+        f.debug_struct("Extensions").field("len", &n).finish()
+    }
+}
+
+impl Extensions {
+    /// Stores `value`, replacing a previous value of the same type.
+    pub fn insert<T: Send + Sync + 'static>(&self, value: T) {
+        self.insert_arc(std::sync::Arc::new(value));
+    }
+
+    /// Stores an already shared value, replacing a previous value of the same type.
+    pub fn insert_arc<T: Send + Sync + 'static>(&self, value: std::sync::Arc<T>) {
+        let map = self.0.get_or_init(Default::default);
+        let mut g = map.lock().unwrap();
+        let id = std::any::TypeId::of::<T>();
+        match g.iter_mut().find(|(t, _)| *t == id) {
+            Some(slot) => slot.1 = value,
+            None => g.push((id, value)),
+        }
+    }
+
+    /// The value of type `T`, if one was stored.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<T>> {
+        let map = self.0.get()?;
+        let g = map.lock().unwrap();
+        let id = std::any::TypeId::of::<T>();
+        g.iter()
+            .find(|(t, _)| *t == id)
+            .and_then(|(_, v)| v.clone().downcast::<T>().ok())
+    }
+
+    /// The value of type `T`, creating it with `make` if absent (`make` runs without holding the lock).
+    pub fn get_or_insert_with<T: Send + Sync + 'static>(
+        &self,
+        make: impl FnOnce() -> T,
+    ) -> std::sync::Arc<T> {
+        if let Some(v) = self.get::<T>() {
+            return v;
+        }
+        let v = std::sync::Arc::new(make());
+        self.insert_arc(v.clone());
+        v
+    }
+
+    /// A handle that shares the values with this one, including values inserted later through either (allocates
+    /// the shared table if nothing was inserted yet). Middleware uses it to read what a handler stored.
+    pub fn share(&self) -> Extensions {
+        let map = self.0.get_or_init(Default::default).clone();
+        let e = Extensions::default();
+        let _ = e.0.set(map);
+        e
+    }
+
+    /// Removes the value of type `T`.
+    pub fn remove<T: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<T>> {
+        let map = self.0.get()?;
+        let mut g = map.lock().unwrap();
+        let id = std::any::TypeId::of::<T>();
+        let i = g.iter().position(|(t, _)| *t == id)?;
+        g.swap_remove(i).1.downcast::<T>().ok()
+    }
 }
 
 impl Request {
@@ -71,6 +149,7 @@ impl Request {
             client_ip: IpAddr::from([127, 0, 0, 1]),
             version: HttpVersion::Http11,
             body_stream: None,
+            extensions: Extensions::default(),
         }
     }
 
@@ -215,6 +294,12 @@ impl Request {
     /// Shared state registered with `App::state`.
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<T>> {
         super::app::state::<T>()
+    }
+
+    // F-267
+    /// Typed values attached to this request (shared by its clones; see [`Extensions`]).
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
     }
 }
 

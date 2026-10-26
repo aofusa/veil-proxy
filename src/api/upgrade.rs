@@ -316,8 +316,16 @@ pub struct ShutdownSignal {
     fut: Pin<Box<dyn Future<Output = ()>>>,
 }
 
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        ShutdownSignal::new()
+    }
+}
+
 impl ShutdownSignal {
-    fn new() -> ShutdownSignal {
+    // F-267: バックグラウンドのタスク（veil-proxy-kit）も停止の開始を待つ
+    /// A future that resolves when graceful shutdown starts (use it on a worker, for example in a background task).
+    pub fn new() -> ShutdownSignal {
         ShutdownSignal {
             fut: Box::pin(async {
                 // F-187 のアイドル待ちと同じタイマー（graceful shutdown の開始でワーカーが即満了させる）。

@@ -69,6 +69,28 @@ pub trait FromRequest: Sized {
     fn from_request(req: &Request) -> Result<Self, Response>;
 }
 
+// F-267
+/// Extracts a value from a request asynchronously (for extractors that look up state, call a dependency container or
+/// verify a token with I/O). Every [`FromRequest`] type is also a `FromRequestAsync`.
+///
+/// `#[veil::route]` uses it for arguments marked `#[inject]` and for the extractor types of `veil-proxy-kit`
+/// (`Dep<T>`, `Auth<T>`, `CookieJar`, `BackgroundTasks` and so on). The future runs on the worker that handles the
+/// request, so it does not need to be `Send`.
+pub trait FromRequestAsync: Sized {
+    /// Extracts a value from `req`; `Err` is the response to send as is.
+    fn from_request_async(
+        req: &Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>>;
+}
+
+impl<T: FromRequest> FromRequestAsync for T {
+    fn from_request_async(
+        req: &Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>> {
+        std::future::ready(T::from_request(req))
+    }
+}
+
 impl FromRequest for Request {
     fn from_request(req: &Request) -> Result<Self, Response> {
         Ok(req.clone())

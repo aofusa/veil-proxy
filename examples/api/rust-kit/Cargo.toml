@@ -1,0 +1,29 @@
+# veil-proxy-kit（F-267）の全モジュールのサンプル: Cookie・リダイレクト・静的ファイル・CORS・認証（Basic・API キー・JWT）・
+# セッション・HTTP / gRPC クライアント・GraphQL・依存性注入・バックグラウンドタスク。tests/api/library_e2e.sh kit が起動して叩く。
+#
+#   cargo run --release                     # 平文 127.0.0.1:8080（VEIL_LISTEN で変更）
+#   curl localhost:8080/api/hello
+[package]
+name = "veil-example-kit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# veil 本体のワークスペースとは独立させる（`[[example]]` を本体に足すとコンテナビルドが壊れるため）。
+[workspace]
+
+[dependencies]
+# 実際に使うときは crates.io:
+# veil = { package = "veil-proxy", version = "0.9", default-features = false, features = ["full", "api"] }
+# veil-kit = { package = "veil-proxy-kit", version = "0.9", features = ["full"] }
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", path = "../../../crates/veil-kit", features = ["full"] }
+async-graphql = { version = "7", default-features = false }
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+bytes = "1"
+
+[build-dependencies]
+veil-build = { package = "veil-proxy-build", path = "../../../crates/veil-build" }

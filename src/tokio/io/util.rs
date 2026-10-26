@@ -713,25 +713,32 @@ impl<R> Take<R> {
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for Take<R> {
+// B-170: tokio と同じく Unpin でない読み手も受ける（tower-http の ServeDir が `Take<File の包み>` を使う）
+impl<R: AsyncRead> AsyncRead for Take<R> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
-        if self.limit == 0 {
+        // SAFETY: Take は inner を構造的にピン留めする（pin-project と同じ形）。inner を Pin の外へ動かす
+        // メソッドは `&mut self`・`self` を取るもの（ピン留めされていない Take だけが呼べる）に限り、
+        // Take は Drop も Unpin も手で実装しない（Unpin は R が Unpin のときだけ自動で付く）。
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.limit == 0 {
             return Poll::Ready(Ok(()));
         }
-        let max = std::cmp::min(buf.remaining() as u64, self.limit) as usize;
+        let max = std::cmp::min(buf.remaining() as u64, this.limit) as usize;
         let mut b = buf.take(max);
         let ptr = b.filled().as_ptr();
-        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut b))?;
+        // SAFETY: 上と同じ（inner は this と一緒にピン留めされたまま動かない）
+        let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
+        ready!(inner.poll_read(cx, &mut b))?;
         assert_eq!(ptr, b.filled().as_ptr());
         let n = b.filled().len();
         // SAFETY: n バイトは読み込みで初期化された
         unsafe { buf.assume_init(n) };
         buf.advance(n);
-        self.limit -= n as u64;
+        this.limit -= n as u64;
         Poll::Ready(Ok(()))
     }
 }
@@ -1954,5 +1961,54 @@ impl AsyncRead for Stdin {
         buf.put_slice(&self.pending[..n]);
         self.pending.drain(..n);
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unpin でない読み手（tower-http の ServeDir が包むファイルと同じ形）。
+    struct NotUnpin {
+        data: &'static [u8],
+        _pin: std::marker::PhantomPinned,
+    }
+
+    impl AsyncRead for NotUnpin {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            // SAFETY: data（参照）を読むだけで、自分を動かさない
+            let this = unsafe { self.get_unchecked_mut() };
+            let n = buf.remaining().min(this.data.len());
+            buf.put_slice(&this.data[..n]);
+            this.data = &this.data[n..];
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // B-170: Take は Unpin でない読み手でも読める（上限で止まる）
+    #[test]
+    fn take_reads_not_unpin_reader_up_to_limit() {
+        let r = NotUnpin {
+            data: b"hello world",
+            _pin: std::marker::PhantomPinned,
+        };
+        let mut t = Box::pin(Take { inner: r, limit: 5 });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out = [0u8; 16];
+        let mut got = Vec::new();
+        loop {
+            let mut b = ReadBuf::new(&mut out);
+            match t.as_mut().poll_read(&mut cx, &mut b) {
+                Poll::Ready(Ok(())) if b.filled().is_empty() => break,
+                Poll::Ready(Ok(())) => got.extend_from_slice(b.filled()),
+                other => panic!("unexpected {:?}", other.map(|r| r.is_ok())),
+            }
+        }
+        assert_eq!(got, b"hello");
     }
 }

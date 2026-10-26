@@ -1025,6 +1025,16 @@ where
     })
 }
 
+/// プールに生きている接続があるか（F-267: `veil::api::client` が自分で接続を張る前に見る）。
+#[cfg(feature = "handler")]
+pub(crate) fn pool_has_live(key: &str) -> bool {
+    H2_MUX_POOL.with(|p| {
+        p.borrow()
+            .get(key)
+            .is_some_and(|conns| conns.iter().any(|m| !m.is_dead()))
+    })
+}
+
 /// 新しく張った接続をプールへ登録する（同時ストリームの上限に達したら次の接続を足す）。
 pub(crate) fn pool_insert(key: &str, mux: H2Mux) {
     H2_MUX_POOL.with(|p| {
@@ -1249,7 +1259,7 @@ pub(crate) fn https_known_h1(key: &str) -> bool {
     })
 }
 
-fn remember_h1(key: &str) {
+pub(crate) fn remember_h1(key: &str) {
     H1_ONLY.with(|m| {
         let mut m = m.borrow_mut();
         match m.get_mut(key) {

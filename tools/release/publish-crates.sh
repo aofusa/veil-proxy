@@ -3,7 +3,8 @@
 #
 #   tools/release/publish-crates.sh [--dry-run]
 #
-# 公開するのは veil-proxy-quiche・veil-proxy-wasmtime（vendoring）・veil-proxy-macros・veil-proxy・veil-proxy-build。
+# 公開するのは veil-proxy-quiche・veil-proxy-wasmtime（vendoring）・veil-proxy-macros・veil-proxy・veil-proxy-build・
+# veil-proxy-kit（F-267。veil-proxy に依存するので veil-proxy の後）。
 # vendoring の 2 つはワークスペースのメンバーではない（veil の clippy・test の対象にしないため）ので、
 # メンバーに入れた作業用のコピーを作り、`cargo publish --workspace` で依存の順に公開する（cargo は前の
 # クレートが索引に載るのを待ってから次を公開する）。既に同じ版が crates.io にあるクレートは飛ばすので、
@@ -25,13 +26,13 @@ import re
 p = "Cargo.toml"
 s = open(p).read()
 s = re.sub(r'^members = \[[^\]]*\]',
-           'members = [".", "crates/veil-macros", "crates/veil-build", "third_party/quiche", "third_party/wasmtime"]',
+           'members = [".", "crates/veil-macros", "crates/veil-build", "crates/veil-kit", "third_party/quiche", "third_party/wasmtime"]',
            s, count=1, flags=re.M)
 s = s.replace('    "third_party/wasmtime",\n', '').replace('    "third_party/quiche",\n', '')
 open(p, "w").write(s)
 PY
 
-crates=(veil-proxy-quiche veil-proxy-wasmtime veil-proxy-macros veil-proxy veil-proxy-build)
+crates=(veil-proxy-quiche veil-proxy-wasmtime veil-proxy-macros veil-proxy veil-proxy-build veil-proxy-kit)
 exclude=()
 for c in "${crates[@]}"; do
     ver="$(cargo metadata -q --no-deps --format-version 1 | python3 -c "import sys,json;print([p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$c'][0])")"

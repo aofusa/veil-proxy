@@ -1,6 +1,6 @@
 # F-267: Rust のヘルパークレート `veil-proxy-kit`（`veil_kit`）と tower のサンプル、API ライブラリの HTTP / gRPC クライアント
 
-**状態: 未着手（2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
+**状態: 完了（2026-10-26。2026-10-25 起票・設計。親は [F-258](F-258-v0100-plan.md)）**
 
 ## 依頼
 
@@ -170,3 +170,69 @@ Rust のライブラリ利用で、Cookie・リダイレクト・静的ファイ
 
 - kit の全モジュールとサンプル 2 個が E2E で動く。本体のバイナリと `veil` の既定の依存が変わらない。
 - 文書（英日）・`backlog.md` が更新されている。
+
+## 実施内容（2026-10-26）
+
+### veil 側の土台（`src/api/`、`cfg(feature = "handler")` の範囲）
+
+- `Request::extensions()`（型付きの拡張領域。`OnceLock` で、使わない要求では確保しない。`share()` で要求の clone と同じ表を共有）、
+  非同期の抽出子 `FromRequestAsync`（`FromRequest` の型には blanket impl）。マクロ（`crates/veil-macros/src/route.rs`）は kit の型名
+  （`Dep`・`Auth`・`MaybeAuth`・`CookieJar`・`SignedCookieJar`・`PrivateCookieJar`・`BackgroundTasks`・`BasicAuth`・`BearerToken`・
+  `ApiKey`・`Jwt`・`Session`）と `#[inject]` の引数を非同期の抽出子として扱う。
+- `Response::after_send`（`Option` の欄 1 個。応答を送った後（ストリームは終わった後）に drop で動く）、`App::with(impl Plugin)`、
+  `App::on_worker_start`（`WorkerInfo`、ワーカーの起動直後に `listener_workers` から呼ぶ）、`App::serve_dir`・`ServeOptions`
+  （`config_override` の合成で `type = "File"` のルートと `open_file_cache`・`static_file_cache`・`compression` を注入）、
+  `ShutdownSignal::new()` の公開。
+- **`veil::api::client`**（`src/api/client.rs`）: `Client`・`ClientBuilder`（`http2`・`timeout`・`connect_timeout`・
+  `pool_idle_timeout`・`max_response_size`・`ca`（F-259 の信頼アンカーと同じ指定）・`client_cert`・`danger_accept_invalid_certs`・
+  `user_agent`・`default_header`）・`RequestBuilder`（`header`・`bearer_auth`・`basic_auth`・`query`・`body`・`json`・`form`・`timeout`）・
+  `ClientResponse`・`ClientError`（`kind()`、`Response` へは 502 / 504）。HTTP/2 は `http2::upstream_mux` の多重化接続（TLS の h2・h2c）、
+  HTTP/1.1 はワーカーごとのプール（宛先ごとに 64 本まで、プールの接続が要求前に切れていた冪等な要求は 1 回だけ送り直す）、TLS は
+  上流の `tls_connector`（`TlsProfile`）、名前解決は `proxy::connect_target`（`runtime::dns::resolve`）、`unix:` の宛先。多重化接続の
+  層は状態コードしか返さないので、プールに接続が無いときはクライアントが TCP・TLS を自分で張ってから登録し（`upstream_mux::pool_has_live`・
+  `remember_h1` を `pub(crate)` に）、接続・証明書の失敗を `Connect` / `Timeout` として理由付きで返す（E2E の最初の実行で TLS の検証失敗が
+  `Protocol` に見えて分かった）。
+- **gRPC のクライアント**（`src/api/grpc/channel.rs`）: `Channel`（`connect`・`with_client`・`timeout`・`compression`・`metadata`・
+  `max_message_size`、unary・サーバ・クライアント・双方向のストリーミング。双方向は要求の汲み上げをローカルのタスクで回す）、
+  `IntoRequest`・`IntoStreamingRequest`、`Request::with_metadata`・`with_timeout`、`Response::trailers()`、クライアント側の `Streaming`
+  （`ClientStreaming` として再公開）。`veil-build` に `build_client`・`build_server`（既定はどちらも true）を足し、`<service>_client` の
+  `<Service>Client`（`new`・`connect`・`channel`）を生成する。
+- 本体のバイナリ（`full`）は変わらない: 追加はすべて `handler` の範囲で、`nonregression` が `veil::api::client`・
+  `veil::api::grpc::channel`・`veil_kit::` の記号が full に無いことを検査する。
+
+### `crates/veil-kit`（パッケージ `veil-proxy-kit`、ライブラリ `veil_kit`、ワークスペースのメンバー）
+
+- 設計の表のとおりのモジュール（`cookie`・`redirect`・`serve`・`cors`・`auth`（`jwt`）・`session`・`client`・`grpc`・`graphql`
+  （`graphiql`）・`di`・`tasks`（`cron`）・`full`）。veil には `api-core` だけで依存する。暗号は aws-lc-rs（OpenBSD・NetBSD は ring）。
+  JWT は HS256/384/512・RS256/384/512・PS256/384/512・ES256・ES384・EdDSA、PEM（SPKI・`RSA PUBLIC KEY`）・JWK・JWKS、`kid`、
+  `exp`・`nbf`・`iss`・`aud`。単体試験 23 本と doctest（README を含む）。
+- `tools/release/publish-crates.sh` の公開順に `veil-proxy-kit`（`veil-proxy-build` の後）、メンバーの書き換えに `crates/veil-kit` を足した。
+  `tools/release/bump-version.sh` は kit の `veil` 依存の版と Cargo.lock の `veil-proxy-kit` も上げる。Dockerfile の cacher 段・
+  `.dockerignore` は `crates/` を丸ごと写しているので変更不要（コメントだけ更新）。`tools/release/check-docs.sh` は `veil_kit` の rustdoc も見る。
+  crates.io の `veil-proxy-kit` は空いている（2026-10-26 に確認）。
+
+### サンプルと試験
+
+- `examples/api/rust-kit`（全モジュール、gRPC のサーバと生成クライアント（h2c・TLS、unary・3 種のストリーミング・トレーラ・
+  エラー）、GraphQL の HTTP・SSE・WebSocket、DI・タスク）と `examples/api/rust-tower-recipes`（tower-http の `CorsLayer`・
+  `SetResponseHeaderLayer`・`ValidateRequestHeaderLayer::custom`・`ServeDir`、Cookie・リダイレクトはヘッダで）。
+- `tests/api/library_e2e.sh kit`（`all` に含む）: rust-kit を既定（io_uring）と epoll で、tower のサンプルを 1 回。`veil::api::client` は
+  HTTP/1.1・h2c・HTTPS の h2（ALPN）・HTTPS の HTTP/1.1・UDS・自己署名の CA の拒否、gRPC クライアントは h2c と TLS。
+- tower のサンプルで見つけた shim の不具合は [B-170](../bugs/B-170-tokio-shim-take-requires-unpin.md)。
+
+### 設計からの変更・残したもの
+
+- DI: マクロは型しか知らないので、ルートの登録時にスロットを解決する代わりに、起動時に凍結した表を `TypeId` で 1 回引く
+  （ロック無し）。循環は登録時ではなく最初の解決時に検出する（500 とログ）。
+- ミドルウェアの順序: veil の `wrap_on` は後に登録したものが外側（先に動く）。`require` は `authenticate` より先に登録する（文書に書いた）。
+- `Tasks` のミドルウェアは対象の接頭辞で要求ごとに確保 1 回（`share()`）。`veil_kit_task_failures_total` は作らず、panic はログだけ。
+  アプリのタスクは停止の開始の次の周期で止まる（実行中の 1 回は待たない）。
+- `OAuth2PasswordBearer` の `securitySchemes` は OpenAPI へ自動では載らない（`security_scheme()` の JSON を利用者が足す）。
+- GraphiQL は CDN から読む（オフライン同梱は F-264 の方法がまとまってから）。tower 側の `Layer` 実装は作らなかった（ネイティブの
+  `wrap_on` だけ）。tower-cookies は `http` の拡張領域を veil のハンドラへ渡さないので届かない（サンプルはヘッダで書いた）。
+- File バックエンドに SPA のフォールバックは無い（`ServeOptions` に足さなかった）。クライアント証明書・CA はクライアントを作るとき
+  （起動時）に読む。FreeBSD の capability mode では任意の宛先へ接続できない（接続ブローカーの許可リスト）。
+- gRPC クライアントは veil 自身のサーバ（h2c・TLS）で試験した（tonic のサーバとの相互接続の試験は置いていない）。
+- 性能の比較（`tools/api-bench`）は行っていない。kit を使わないルートで増えたのは `Response` の `Option` の欄 1 個と `Request` の
+  `OnceLock` 1 個（未使用なら確保しない）。
+

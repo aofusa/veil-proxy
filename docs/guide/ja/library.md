@@ -14,6 +14,9 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 | C API | [`crates/veil-capi`](../../../crates/veil-capi/README.md)（`libveil.so` / `libveil.a`、`veil.h`） | C・C++ など C FFI を持つ言語 |
 | Python | [`crates/veil-python`](../../../crates/veil-python/README.md)（wheel、`import veil`） | FastAPI 風のデコレータ |
 
+Rust では、別のクレート [`veil-proxy-kit`](library-kit.md) が Cookie・リダイレクト・静的ファイル・CORS・認証（JWT）・セッション・
+GraphQL・依存性注入・バックグラウンドタスクを足します。
+
 - [アーキテクチャ](#アーキテクチャ)
 - [veil への依存](#veil-への依存)
 - [ライブラリモードの設定](#ライブラリモードの設定)
@@ -23,6 +26,7 @@ veil はリバースプロキシとして使えるだけでなく、自分のプ
 - [共有状態](#共有状態)
 - [tower の層と tokio 前提ライブラリ](#tower-の層と-tokio-前提ライブラリ)
 - [tokio 互換](#tokio-互換)
+- [HTTP クライアント](#http-クライアント)
 - [GraphQL](#graphql)
 - [L4（TCP/UDP）ハンドラ](#l4tcpudpハンドラ)
 - [TLS と HTTP/3](#tls-と-http3)
@@ -743,6 +747,25 @@ kqueue のリアクタ。[対応プラットフォーム](#対応プラットフ
 クライアント、reqwest（タイムアウトを含む）、tower-http の `TimeoutLayer`、axum 0.8（`axum::serve`・抽出子・State・
 graceful shutdown）、sqlx（SQLite・PostgreSQL）。
 
+## HTTP クライアント
+
+`veil::api::client`（feature `handler`）はワーカーのランタイムの上で動く非同期の HTTP クライアントで、ハンドラやタスクから
+tokio 無しで他のサービスを呼べます:
+
+```rust
+use veil::api::client::{Client, Http2};
+
+let client = Client::builder().http2(Http2::Auto).timeout(Duration::from_secs(5)).build()?;
+let res = client.get("https://api.example.com/v1/items").bearer_auth(token).send().await?;
+let items: Vec<Item> = res.error_for_status()?.json()?;
+```
+
+プロキシの上流の部品を使います: 名前解決は offload のプール、TLS は上流の TLS クライアント（信頼アンカーは `[tls_client] ca`、
+または `ClientBuilder::ca`。mTLS は `client_cert`）、多重化した HTTP/2 の接続と、ワーカーごとの HTTP/1.1 のプール。
+`Http2::Auto`（既定）は TLS では ALPN で h2 か HTTP/1.1 を選び、平文では HTTP/1.1。`Http2::On` は h2 と prior knowledge の h2c、
+`Http2::Off` は HTTP/1.1。`http://unix:/path.sock:/x` で Unix ソケットへ接続します。応答の本文は全部読みます（`max_response_size`、
+既定 64 MiB）。エラーには `kind()` があり、502・504 の `Response` に変換できます。詳しくは [library-kit.md](library-kit.md#http-クライアント)。
+
 ## GraphQL
 
 veil は GraphQL のライブラリに依存しません。利用者が好きな実装（async-graphql・juniper 等）を選び、普通のハンドラとして
@@ -763,6 +786,9 @@ graphql::graphql(App::new(), "/graphql", schema).run()?;
 （`Accept: text/html`）なら GraphiQL を返します。クライアントが求めたときは `application/graphql-response+json`、
 それ以外は `application/json` で応答します。`Accept: text/event-stream` の要求はサブスクリプションを SSE
 （GraphQL over SSE の distinct connections モード）で返します（結果ごとに `event: next`、最後に `event: complete`）。
+
+[`veil-proxy-kit`](library-kit.md#graphql) のクレートには同じ橋渡しが `veil_kit::graphql::mount` としてあり、WebSocket
+（`graphql-transport-ws`・`graphql-ws`）のサブスクリプションも使えます。
 
 > v0.7 までは `graphql` feature が `App::graphql(path, schema)` を提供していました。API ライブラリが async-graphql を
 > 引き込まないように廃止しました（F-207）。同じ動作はサンプルの `src/graphql.rs` をコピーすれば得られます。
@@ -807,6 +833,22 @@ add_greeter(App::new().grpc_health(), MyGreeter).run()
 Future に `Send` は要りません）、`add_<service>(app, 実装)`、`METHODS`、`ProstCodec`（`add_<service>` がメソッドの登録に使う prost の codec）を生成します。サーバ・双方向ストリーミングは
 `Response<BoxStream<T>>` を返し、クライアント・双方向ストリーミングは `Request<Streaming<T>>` を受け取ります。
 `veil_build::configure().veil_path("::my_veil")` でクレートのパスを変えられ、`config_mut()` で `prost_build::Config` を触れます。
+
+`veil-build` はクライアントのモジュール `<service>_client` も生成します（`build_client(false)` で止め、`build_server(false)` で
+クライアントだけにします）:
+
+```rust
+use hello::greeter_client::GreeterClient;
+
+let client = GreeterClient::connect("http://127.0.0.1:50051")?;   // https:// は TLS の上の h2
+let reply = client.say_hello(hello::HelloRequest { name: "veil".into() }).await?.into_inner();
+```
+
+unary のメソッドはメッセージか `Request<T>` を取り、サーバストリーミングは `Response<ClientStreaming<T>>`（`message().await`・
+`trailers()`）を返し、クライアントストリーミングと双方向は `Stream<Item = T> + Unpin` を取ります。通信は
+`veil::api::grpc::Channel`（`Channel::connect(url)`、独自の TLS には `Channel::with_client(&http_client, url)`）で、メタデータ・期限
+（`grpc-timeout`）・圧縮したメッセージを送り、トレーラから `Status` を返します。上の HTTP/2 のクライアントを使い、ワーカーの
+ランタイムの上で動きます。
 
 ### コード生成なし
 
@@ -1241,7 +1283,9 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 
 ## 制限事項
 
-- gRPC: veil は gRPC のサーバで、独自のクライアントはありません（`veil::tokio` の上で tonic を使います）。
+- gRPC クライアント: `veil-build` の生成するクライアントと `Channel` は HTTP/2 だけです（gRPC-Web・HTTP/3 は無い）。
+  `veil::tokio` の上の tonic も引き続き使えます。
+- `veil::api::client` は本文を全部読みます（応答の本文のストリーミングはまだ無い）。リダイレクトを追わず、Cookie も保持しません。
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
   そのイベントループが止まります（上記）。

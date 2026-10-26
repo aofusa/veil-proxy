@@ -20,6 +20,24 @@ pub struct Response {
     // F-270
     /// Set by [`Response::no_compression`]: the route's `[route.compression]` leaves this response alone.
     pub(crate) no_compress: bool,
+    // F-267: 送り終えた後に呼ぶ関数（使わない応答は None の確認だけ。Box で応答の大きさを 8 バイトに抑える）
+    pub(crate) after_send: Option<Box<AfterSend>>,
+}
+
+// F-267
+/// Functions run once the response has been sent (see [`Response::after_send`]). They run on the worker that sent
+/// the response, when the protocol layer is done with it (or when the response is dropped without being sent).
+pub struct AfterSend(Vec<Box<dyn FnOnce() + Send>>);
+
+impl Drop for AfterSend {
+    fn drop(&mut self) {
+        for f in self.0.drain(..) {
+            // 1 つの失敗で残りを止めない（panic はここで捕まえて記録する）
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                ftlog::error!("[api] an after-send callback panicked");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Response {
@@ -49,6 +67,7 @@ impl Response {
             stream: None,
             upgrade: None,
             no_compress: false,
+            after_send: None,
         }
     }
 
@@ -63,6 +82,7 @@ impl Response {
             stream: None,
             upgrade: None,
             no_compress: false,
+            after_send: None,
         }
     }
 
@@ -109,6 +129,7 @@ impl Response {
             stream: Some(Box::pin(futures::StreamExt::fuse(body))),
             upgrade: None,
             no_compress: false,
+            after_send: None,
         }
     }
 
@@ -130,6 +151,33 @@ impl Response {
             protocol, on_upgrade,
         )));
         r
+    }
+
+    // F-267
+    /// Runs `f` after the response has been sent: on HTTP/1.1 once the last byte is written, on HTTP/2 and HTTP/3
+    /// once the last frame is queued for the connection (and also if the response is dropped unsent, for example
+    /// when the client disconnects). `f` runs on the worker; start longer work from it with `veil::runtime::spawn`
+    /// or the handler pool. Several calls run in order.
+    pub fn after_send(mut self, f: impl FnOnce() + Send + 'static) -> Response {
+        match &mut self.after_send {
+            Some(a) => a.0.push(Box::new(f)),
+            None => self.after_send = Some(Box::new(AfterSend(vec![Box::new(f)]))),
+        }
+        self
+    }
+
+    /// Takes the after-send callbacks (protocol layers and middleware that build a new response move them over).
+    pub fn take_after_send(&mut self) -> Option<Box<AfterSend>> {
+        self.after_send.take()
+    }
+
+    /// Puts back callbacks taken with [`Response::take_after_send`] (appended after any already present).
+    pub fn set_after_send(&mut self, a: Option<Box<AfterSend>>) {
+        let Some(mut a) = a else { return };
+        match &mut self.after_send {
+            Some(cur) => cur.0.append(&mut a.0),
+            None => self.after_send = Some(a),
+        }
     }
 
     // F-270

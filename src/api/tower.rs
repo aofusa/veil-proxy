@@ -192,6 +192,7 @@ pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
         req.client_ip = o.client_ip;
         req.version = o.version;
         req.body_stream = o.body_stream;
+        req.extensions = o.extensions;
     }
     req
 }
