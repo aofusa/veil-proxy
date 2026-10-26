@@ -51,18 +51,13 @@ pub struct FilterEngine {
     fuel_limit: u64,
     /// Epoch deadline for timeout enforcement
     ///
-    /// B-56: wasmtime の epoch は **時計ではなく、この `Engine` を共有する全 WASM 実行
-    /// （全モジュール・全リクエスト・全プロトコル経路）が呼び出すたびに 1 ずつ増える
-    /// グローバルなカウンタ**である。`increment_epoch()` を定期的に呼ぶタイマースレッドは
-    /// 存在せず、各呼び出し箇所が実行直前に 1 回だけ呼ぶ（本ファイル中の
-    /// `self.registry.engine().increment_epoch()` の呼び出し箇所を参照）。
-    /// 各 store は生成時に `current_epoch + epoch_deadline` を締切として持ち、
-    /// エンジン全体でその締切分だけ**他の**WASM 呼び出しが積み重なるとトラップする
-    /// （経過時間ではなく「他の呼び出し回数」に依存する）。同時実行数が多いほど
-    /// 締切に達するまでの実時間は短くなる。F-62 の Pause/resume
-    /// （`resolve_pending_http_calls_inline`）のように store を長時間サスペンドしたまま
-    /// 外部 I/O を待つ経路では、再開直前に締切を引き直す必要がある（さもないと
-    /// 無関係な同時リクエストの WASM 呼び出しだけで誤ってトラップする）。
+    /// B-173: エポックは時計。`registry::spawn_epoch_ticker` の専用スレッドが `EPOCH_TICK`（100ms）ごとに
+    /// 1 進める（以前は各呼び出しの直前に 1 進める「全スレッドの WASM 呼び出し回数」で、ワーカーが複数あると
+    /// 他のスレッドの 10 回の呼び出しの間に終わらない呼び出しが負荷の下で `interrupt` でトラップし、
+    /// フィルタが飛ばされていた）。各 store はコールバックの前に `current_epoch + epoch_deadline` を締切にする
+    /// ので、1 回のコールバックの実時間の上限は約 1〜1.1 秒（CPU の上限は fuel）。
+    /// F-62 の Pause/resume（`resolve_pending_http_calls_inline`）のように store を止めたまま外部 I/O を
+    /// 待つ経路では、再開の直前に締切を引き直す（B-56）。
     epoch_deadline: u64,
     /// 要求ヘッダの段でモジュールが失敗（トラップ・proc_exit 等）したら 503 で拒否する
     /// （Envoy の `failure_policy: FAIL_CLOSED`。メッシュの WasmPlugin 用、F-222）。既定は false（従来どおり続行）。
@@ -78,8 +73,8 @@ impl FilterEngine {
         let fuel_limit = config.defaults.max_execution_time_ms * 1_000_000;
 
         // Epoch deadline: ticks after the current engine epoch before timeout.
-        // The tick thread increments the epoch every ~100ms, so deadline=10 allows ~1s.
-        // Fuel consumption is the primary timeout mechanism for CPU-bound limits.
+        // The ticker thread (registry::spawn_epoch_ticker) increments the epoch every 100ms, so deadline=10
+        // allows about 1s. Fuel consumption is the primary timeout mechanism for CPU-bound limits.
         let epoch_deadline = 10;
 
         Ok(Self {
@@ -201,7 +196,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
         Ok(())
     }
 
@@ -425,12 +419,10 @@ impl FilterEngine {
 
                 let response = Self::execute_http_call_offloaded(&module.name, call).await;
 
-                // B-56: エポックはエンジン共有の「WASM 呼び出し回数」カウンタであり時計ではない。
-                // pause 中に他リクエストが 10 回 WASM を呼ぶと、外部 I/O を待っていただけの本 store の
-                // デッドラインが期限切れになり resume 直後にトラップする。再開直前に猶予を与え直す。
+                // B-56: 外部 I/O を待っていた間にエポックが進んで（B-173 以降は時間で）締切が過ぎていると、
+                // resume 直後にトラップする。再開直前に猶予を与え直す。
                 // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない）
                 store.set_epoch_deadline(self.epoch_deadline);
-                self.registry.engine().increment_epoch();
 
                 // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
                 let (num_headers, body_size, num_trailers) = (
@@ -871,7 +863,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1387,7 +1378,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1480,7 +1470,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1605,7 +1594,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1754,7 +1742,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1862,7 +1849,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -1987,7 +1973,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2104,7 +2089,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2232,7 +2216,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2347,7 +2330,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2466,7 +2448,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2615,7 +2596,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2754,7 +2734,6 @@ impl FilterEngine {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
         let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
@@ -2987,6 +2966,98 @@ mod exec_smoke_tests {
         }
     }
 
+    /// B-173 回帰テスト: 他の要求の WASM 呼び出しは、すでに締切を入れた store の締切を減らさない。
+    /// 以前は呼び出しのたびに全エンジン共有のエポックを 1 進めていたので、複数のワーカーが同時に動くと
+    /// 「他のスレッドの 10 回の呼び出し」の間に終わらない呼び出しが `interrupt` でトラップし、フィルタが
+    /// 飛ばされていた。ここでは store を開いた後に他のスレッドで要求を `epoch_deadline` の 3 倍だけ同時に実行
+    /// してからコールバックを呼ぶ（修正前はトラップする）。
+    #[test]
+    fn b173_other_calls_do_not_consume_an_armed_deadline() {
+        let path = "tests/fixtures/wasm/header_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+        // header_filter は要求ヘッダを書き足すので、読み書きを許す（許さないとモジュールが panic する）
+        let config = WasmConfig {
+            enabled: true,
+            defaults: WasmDefaults::default(),
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: path.to_string(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
+                capabilities: ModuleCapabilities {
+                    allow_logging: true,
+                    allow_request_headers_read: true,
+                    allow_request_headers_write: true,
+                    allow_response_headers_read: true,
+                    allow_response_headers_write: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            interpreter: false,
+        };
+        let engine = FilterEngine::new(&config).expect("engine");
+        let module = engine
+            .get_module("header_filter")
+            .expect("module must be loaded");
+        let headers = || {
+            vec![
+                (b":path".to_vec(), b"/".to_vec()),
+                (b":method".to_vec(), b"GET".to_vec()),
+                (b":authority".to_vec(), b"example.com".to_vec()),
+            ]
+        };
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_request(
+            Arc::from("GET"),
+            Arc::from("/"),
+            headers(),
+            Arc::from("127.0.0.1"),
+        );
+        let configuration = module.configuration.clone();
+        let mut sess = match futures::executor::block_on(engine.open_session(
+            &module,
+            &configuration,
+            http_ctx,
+        )) {
+            Ok(s) => s,
+            Err((e, _)) => panic!("open_session must not error: {e}"),
+        };
+        // 他のワーカー（4 スレッド）が同時に要求を処理する（合わせて epoch_deadline の 3 倍の呼び出し）
+        let per_thread = engine.epoch_deadline * 3 / 4 + 1;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..per_thread {
+                        let _ =
+                            futures::executor::block_on(engine.on_request_headers_with_modules(
+                                &[ModuleRef::from_name("header_filter")],
+                                &Arc::from("/"),
+                                &Arc::from("GET"),
+                                headers(),
+                                &Arc::from("127.0.0.1"),
+                                true,
+                            ));
+                    }
+                });
+            }
+        });
+        let r = futures::executor::block_on(engine.run_headers_module(
+            &module,
+            &mut sess,
+            "proxy_on_request_headers",
+            3,
+            true,
+        ));
+        assert!(
+            r.is_ok(),
+            "a callback must not trap because other requests ran WASM in between (B-173): {:?}",
+            r.err()
+        );
+    }
+
     fn http_call_filter_engine() -> Option<FilterEngine> {
         let path = "tests/fixtures/wasm/http_call_filter.wasm";
         if !std::path::Path::new(path).exists() {
@@ -3024,11 +3095,10 @@ mod exec_smoke_tests {
     ///
     /// 負荷や並行リクエストは一切使わない — `Engine::increment_epoch()` を
     /// 直接呼んで「他のリクエストが epoch_deadline 回以上 WASM を呼んだ」状態を
-    /// 決定的に再現する（B-56 の真因はまさにこのグローバルカウンタの積み上がりであり、
-    /// 経過時間や並行数ではない）。
+    /// 決定的に再現する（B-173 以降のエポックは時計で、`increment_epoch()` は時間の経過の代わり）。
     ///
     /// このテストは `resolve_pending_http_calls_inline` 内の
-    /// `store.set_epoch_deadline(...); self.registry.engine().increment_epoch();`
+    /// `store.set_epoch_deadline(...)`
     /// （本チケットの修正そのもの）を一時的に取り除いた状態で実行すると
     /// `wasm trap: interrupt` で FAIL することを確認済み（コミットメッセージ参照）。
     #[test]

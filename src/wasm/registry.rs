@@ -35,6 +35,27 @@ pub struct LoadedModule {
     pub data_files: super::context::PluginData,
 }
 
+/// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
+pub(crate) const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// B-173: `engine` のエポックを `EPOCH_TICK` ごとに 1 進める専用スレッドを起こす。エンジンが捨てられたら
+/// （リロードで作り直したら）次の周期で終わる。データプレーンからは何も呼ばない。
+fn spawn_epoch_ticker(engine: &Engine) {
+    let weak = engine.weak();
+    let spawned = std::thread::Builder::new()
+        .name("veil-wasm-epoch".into())
+        .spawn(move || loop {
+            crate::server::cap_safe_sleep(EPOCH_TICK);
+            match weak.upgrade() {
+                Some(engine) => engine.increment_epoch(),
+                None => return,
+            }
+        });
+    if let Err(e) = spawned {
+        ftlog::warn!("[wasm] failed to start the epoch ticker thread: {}", e);
+    }
+}
+
 /// Module registry
 pub struct ModuleRegistry {
     /// Wasmtime engine
@@ -52,6 +73,8 @@ impl ModuleRegistry {
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
         // Create engine with pooling allocator
         let engine = Self::create_engine(config)?;
+        // B-173: エポックを時計にする（呼び出しの回数で進めない）
+        spawn_epoch_ticker(&engine);
         // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
         // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
         // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。

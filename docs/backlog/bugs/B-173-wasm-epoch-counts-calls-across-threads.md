@@ -1,6 +1,6 @@
 # B-173: Proxy-Wasm のエポックが「全スレッドの呼び出し回数」で進み、複数ワーカーの負荷の下でフィルタが `interrupt` でトラップして飛ばされる
 
-**状態: 修正の差分あり（wt/core の F-271 の後のコードに当てる。feat/v0100 への統合待ち）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -41,3 +41,14 @@ F-269（HttpArena の veil 単体の提出物）の validate で、`validate-fra
 
 - 差分は wt/core（F-271 の `arm_store` を入れた後）の `src/wasm` に対して作った。feat/v0100 の今の `src/wasm`（F-271 の前）には
   当たらない。wt/core を統合した後に当てる。
+
+## 実施内容（2026-10-26）
+
+- `docs/artifacts/benchmark/patches/B-173-wasm-epoch-ticker.patch` を F-271 の後の `src/wasm` にそのまま当てた（`arm_store` を含む
+  15 箇所の `increment_epoch()` を外し、`registry::spawn_epoch_ticker` を `ModuleRegistry::new` で起こす）。F-271 の文脈の使い回し
+  （store を開いたまま次の要求のコールバックを呼ぶ）は、コールバックの前の `arm_store` が `set_epoch_deadline` で締切を引き直すので
+  変更は要らなかった。
+- 試験 `b173_other_calls_do_not_consume_an_armed_deadline` は、他の要求を 4 本のスレッドで同時に流す形にした（store を開いた後に
+  合わせて `epoch_deadline` の 3 倍の呼び出し）。修正を当てる前の木では `wasm trap: interrupt` で失敗し、当てた後は通る
+  （`cargo test --lib --features full wasm::` 144 件）。
+
