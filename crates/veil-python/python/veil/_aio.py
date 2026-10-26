@@ -10,6 +10,7 @@ import concurrent.futures
 import functools
 import os
 import socket
+import sys
 import threading
 import traceback
 
@@ -25,7 +26,11 @@ _POOL_LOCK = threading.Lock()
 
 
 def _new_loop(kind):
-    """Create an event loop: uvloop when ``kind`` is ``"uvloop"`` (required) or ``"auto"`` (if installed)."""
+    """Create an event loop: uvloop when ``kind`` is ``"uvloop"`` (required) or ``"auto"`` (if installed).
+
+    Otherwise an asyncio loop; on Windows a ``SelectorEventLoop``, since the default proactor loop has no
+    ``add_reader``.
+    """
     if kind not in ("auto", "asyncio", "uvloop"):
         raise ValueError("python_event_loop must be \"auto\", \"asyncio\" or \"uvloop\", not %r" % (kind,))
     if kind != "asyncio":
@@ -36,6 +41,9 @@ def _new_loop(kind):
         except ImportError:
             if kind == "uvloop":
                 raise
+    # Windows の既定（ProactorEventLoop）は add_reader を持たない。起床のソケットを読むので selector のループにする
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop()
     return asyncio.new_event_loop()
 
 

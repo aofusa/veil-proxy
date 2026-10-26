@@ -32,7 +32,7 @@ Settings (`[api]` in the configuration, or arguments of `run`):
 | Key | `run(...)` argument | Default | Meaning |
 |-----|---------------------|---------|---------|
 | `python_event_loops` | `event_loops` | `1` | number of persistent loops (requests are spread over them) |
-| `python_event_loop` | `event_loop` | `"auto"` | `"auto"` uses uvloop when it is installed, `"asyncio"` never does, `"uvloop"` requires it |
+| `python_event_loop` | `event_loop` | `"auto"` | `"auto"` uses uvloop when it is installed, `"asyncio"` never does, `"uvloop"` requires it. On Windows the asyncio loop is a `SelectorEventLoop` (the proactor loop cannot watch the wake-up socket), so `asyncio` subprocesses are not available there |
 | `python_event_loop_queue` | | `65536` | calls that may wait for one loop; when it is full veil answers 503 |
 | `python_async_mode` | `async_mode` | `"loop"` | where `async def` handlers run: `"loop"` (persistent loop) or `"pool"` |
 
