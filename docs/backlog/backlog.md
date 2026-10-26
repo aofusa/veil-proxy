@@ -529,6 +529,7 @@
 | B-205 | P3 | 修正済み（v0.10.0） | [bugs/B-205-dependency-examples-stale-minor-version.md](bugs/B-205-dependency-examples-stale-minor-version.md) | 導入例の依存の版が存在しない "0.9" を指し、bump-version.sh が major.minor の例を更新しない |
 | B-206 | P3 | 修正済み（v0.10.0） | [bugs/B-206-c-websocket-on-close-skipped.md](bugs/B-206-c-websocket-on-close-skipped.md) | C の WebSocket: on_close が呼ばれないまま veil_ws_t が解放され得る |
 | B-207 | P3 | 修正済み（v0.10.0） | [bugs/B-207-python-aio-jobs-dropped-and-reregistration.md](bugs/B-207-python-aio-jobs-dropped-and-reregistration.md) | Python の常駐ループ: 捨てられたジョブでワーカーが永久に待ち、登録が 1 回きりで 2 回目の run が失敗する |
+| B-208 | P3 | 修正済み（v0.10.0） | [bugs/B-208-release-draft-check-swallows-gh-errors.md](bugs/B-208-release-draft-check-swallows-gh-errors.md) | release.yml の公開済みの判定が gh のどんな失敗も「draft 無し」とみなす |
 
 ---
 

@@ -522,9 +522,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.verify.outputs.tag }}
+        # B-208: API の一時的な失敗を「draft 無し」と見なさない（失敗にする）
         run: |
-          s="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
-          if [ "$s" = false ]; then
+          s="$(tools/release/release-state.sh "$TAG")"
+          if [ "$s" = published ]; then
             echo "::notice title=GitHub Release::$TAG is already published; skipping the draft, checksums, signatures and attestations"
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
