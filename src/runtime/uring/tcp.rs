@@ -477,8 +477,8 @@ impl TcpStream {
             return TcpStream::connect_unix(std::path::Path::new(path)).await;
         }
         // B-107: ホスト名は offload で解決する（同期 getaddrinfo でイベントループを止めない）。
-        let socket_addr = crate::runtime::dns::resolve(addr).await?;
-        TcpStream::connect(socket_addr).await
+        // B-180: 解決したアドレスを順に試す（localhost が ::1 と 127.0.0.1 の両方になる等）。
+        crate::runtime::dns::connect_each(addr, TcpStream::connect).await
     }
 
     /// バッファに非同期で読み込む（io_uring RECV）

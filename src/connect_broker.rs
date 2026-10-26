@@ -1104,7 +1104,7 @@ mod tests {
     /// 許可リストの添字で TCP・ホスト名・UDS の上流へ接続できる。
     #[test]
     fn connects_to_allowed_targets() {
-        // ブローカー（と runtime::dns::resolve）は解決結果の先頭アドレスへ接続する。
+        // ブローカーは解決結果の先頭アドレスへ接続する（本体の connect_str は全部を順に試す。B-180）。
         // localhost の先頭は環境で 127.0.0.1 とも ::1 とも限らない（コンテナビルドでは ::1。B-113）
         // ので、その先頭アドレスで待ち受ける。
         #[allow(clippy::disallowed_methods)] // テスト内の同期解決
