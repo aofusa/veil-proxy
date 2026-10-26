@@ -18,15 +18,16 @@ HTTP/1.1・HTTP/2（TLS / h2c）・HTTP/3（QUIC）・gRPC・WebSocket・生の 
   `splice(2)`/`sendfile(2)` によるゼロコピー、kTLS オフロード、`SO_REUSEPORT` による
   スレッドごとのワーカー。
 - **プロトコル** — HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC / gRPC-Web・WebSocket・L4 TCP/UDP
-  プロキシ・Unix ドメインソケットのリスナーとバックエンド。
+  プロキシ・1 プロセスで複数ポートの待ち受け（`[[listener]]`）・Unix ドメインソケットのリスナーとバックエンド。
 - **プロキシ機能** — パス/ホスト/ヘッダーによるルーティング、ロードバランシング、
   ヘルスチェック、サーキットブレーカー、リトライ、レスポンス圧縮、プロキシキャッシュ、
   バッファリング、ヘッダー書き換え。
 - **拡張性** — 全プロトコルで Proxy-Wasm フィルタ（Wasmtime）。
 - **動的設定** — [VDS](../guide/ja/vds.md) で制御プレーンからルート・アップストリームを配信（xDS 方式の長輪詢・ACK/NACK）、
   組み込みの [ACME](../guide/ja/acme.md) で証明書を自動発行・更新（HTTP-01、Let's Encrypt）。
-- **組み込み可能** — veil を[ライブラリ](../guide/ja/library.md)として使い、同じ io_uring データプレーン上で Rust（マクロ・OpenAPI・tower・GraphQL・L4 ハンドラ）・
-  C（`libveil`）・Python（FastAPI 風）の API サーバを書けます。
+- **組み込み可能** — veil を[ライブラリ](../guide/ja/library.md)として使い、同じ io_uring データプレーン上で Rust（マクロ・OpenAPI・tower・GraphQL・WebSocket・multipart・L4 ハンドラ）・
+  C（`libveil`）・Python（FastAPI 互換・ASGI）の API サーバを書けます。ヘルパーのパッケージ `veil-proxy-kit`・`veil-api-kit` と
+  [本番運用ガイド](../guide/ja/library-production.md)もあります。
 - **運用性** — 設定・証明書のホットリロード（`SIGHUP`）、Prometheus メトリクス、
   OpenTelemetry、構造化アクセスログ、管理 API。
 - **既定で安全** — メモリ安全な Rust、seccomp/Landlock（Linux）、capsicum（FreeBSD）、
