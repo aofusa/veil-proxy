@@ -868,6 +868,7 @@ static HTTP3_INVALID_PACKETS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 /// メトリクス: 解析できない HTTP/3 のデータグラムを数える（B-235）
+#[cfg(feature = "http3")]
 #[inline]
 pub(crate) fn record_http3_invalid_packet() {
     #[cfg(feature = "metrics")]

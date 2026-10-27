@@ -561,7 +561,8 @@ impl ForwardedValues {
 }
 
 impl AddedHeaders {
-    /// 何も足さない（受けたヘッダの方針も変えない）。
+    /// 何も足さない（受けたヘッダの方針も変えない）。HTTP/3 のバッファ経路だけが使う
+    #[cfg(feature = "http3")]
     pub(crate) const NONE: AddedHeaders = AddedHeaders {
         user: Vec::new(),
         fwd: None,
