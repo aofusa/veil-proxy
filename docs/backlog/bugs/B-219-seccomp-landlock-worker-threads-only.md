@@ -55,4 +55,4 @@ seccomp・Landlock は多層防御の 1 層で、これ自体で侵害が成立�
 ## 関連
 
 - [B-220](B-220-seccomp-missing-dup-unlink-mkdir.md)（許可リストの不足）、[F-279](../features/F-279-security-test-gaps.md)（seccomp 有効の E2E）
-- [B-103](B-103-seccomp-syscall-number-mismatch.md)（番号の確かめ方）
+- [B-103](B-103-seccomp-wrong-syscall-numbers.md)（番号の確かめ方）
