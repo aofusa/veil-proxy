@@ -1,6 +1,6 @@
 # B-257: Wasm の gRPC 実行器が受信 DATA に WINDOW_UPDATE を返さず、プール接続が累計 64KB で止まる。16KB 超のメッセージを 1 つの DATA フレームで送って接続ごと落とす
 
-**状態: 未修正（2026-10-28 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -35,6 +35,13 @@
 - 単体（`spawn_mock_grpc_server` を拡張）: 70KB の応答を返すケースが同じプール接続で 2 回連続で成功する。17KB のメッセージを送るケースで相手が
   `FRAME_SIZE_ERROR` を返さない。
 - 既存の gRPC の E2E（Wasm のプラグイン）が通る。
+
+## 修正（v0.10.0）
+
+- 受信: `ActiveCall::handle_frame` の DATA で、受けたペイロード長（パディング込み）を接続（`PooledConn::conn_recv_unacked`）・ストリームごとに積み、初期ウィンドウの半分（32,767）を超えたら `WINDOW_UPDATE` を返す（ストリームは END_STREAM のときは返さない。接続側はストリームが閉じても積み続けるので、プールした接続でも補充が続く）。前の呼び出しの残りの DATA は接続レベルの補充だけして捨て、HEADERS は HPACK の表を保つために復号だけして捨てる。
+- 送信: メッセージ（gRPC の 5 バイトの接頭辞付き）を `sending` に置き、`min(ストリームのウィンドウ, 接続のウィンドウ, 相手の SETTINGS_MAX_FRAME_SIZE)` ずつ DATA フレームに分けて送る（ウィンドウより大きいメッセージは以前は永久に送れなかった）。SETTINGS の `MAX_FRAME_SIZE` を保持し、`INITIAL_WINDOW_SIZE` の変更は開いているストリームのウィンドウにも差分を反映する（RFC 9113 §6.9.2）。
+- 試験: フロー制御とフレームの上限を守る模擬サーバ（`serve_strict_mock_connection`）で、`large_responses_on_pooled_connection_replenish_window`（70KB の応答を同じ接続で 3 回）・`large_request_messages_are_split_into_frames`（17KB・100KB・10B のメッセージ、`FRAME_SIZE_ERROR` 無し、接続 1 本）。補充・分割を外すとそれぞれ失敗することを確認。
+- 長期の「`http2::upstream_mux` と状態機械を共有する」は残す（F-283）。
 
 ## 関連
 

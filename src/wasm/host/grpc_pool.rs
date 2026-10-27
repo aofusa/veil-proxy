@@ -47,6 +47,10 @@ pub(super) struct PooledConn {
     pub(super) conn_send_window: i64,
     /// サーバーが SETTINGS で通知した INITIAL_WINDOW_SIZE（新規ストリームの初期値）。
     pub(super) peer_initial_window: i64,
+    /// 相手の SETTINGS_MAX_FRAME_SIZE（送る DATA の分割の単位。B-257）
+    pub(super) peer_max_frame_size: usize,
+    /// 受けたがまだ WINDOW_UPDATE で返していない接続レベルのバイト数（B-257）
+    pub(super) conn_recv_unacked: u32,
 }
 
 impl PooledConn {
@@ -65,6 +69,8 @@ impl PooledConn {
             last_used: Instant::now(),
             conn_send_window: crate::http2::settings::defaults::INITIAL_WINDOW_SIZE as i64,
             peer_initial_window: crate::http2::settings::defaults::INITIAL_WINDOW_SIZE as i64,
+            peer_max_frame_size: crate::http2::settings::defaults::MAX_FRAME_SIZE as usize,
+            conn_recv_unacked: 0,
         }
     }
 
