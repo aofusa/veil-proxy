@@ -116,6 +116,30 @@ drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
 
+#### 4. macOS Seatbelt (`sandbox_init`)
+
+On macOS, `enable_sandbox_macos = true` applies a Seatbelt profile once every listener is bound (it cannot be
+removed afterwards):
+
+```toml
+[security]
+enable_sandbox_macos = true
+```
+
+- The profile starts from `(deny default)`. Child processes (`process-fork`, `process-exec`) are not allowed.
+- Files can be read only under the paths the configuration names (the configuration file, certificates, keys,
+  CA files, tokens, JWKS, Proxy-Wasm modules and static roots; for a file, its whole directory, so a secret
+  replaced by swapping a symbolic link is still readable), and under the system paths the dynamic linker, name
+  resolution, the trust store and time zones need (`/usr/lib`, `/usr/share`, `/System`, `/Library/Keychains`,
+  `/private/etc`, `/private/var/db/dyld`, `/private/var/db/timezone`, `/dev`). File metadata (`stat`) is readable
+  everywhere.
+- Files can be written only under the log and disk-cache directories, the ACME storage directory (and the
+  certificate directory when `[acme]` is set), `upload_tmp_dir` and Unix sockets.
+- The allowed paths are fixed at startup. After a reload that points at a new location, veil cannot read it: a
+  new certificate or key makes the reload fail (the running configuration stays in place), and a new static root
+  answers 404. Restart veil to move files to a new location.
+- Network access, `mach-lookup` and signals to itself stay allowed.
+
 ### About Namespace Isolation
 
 > **Note**: Namespace isolation like `unshare(CLONE_NEWNET)` is **not recommended** for reverse proxies.

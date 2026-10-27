@@ -909,13 +909,14 @@ watch = false
 # ユーザ空間 rustls、暗号プロバイダは ring。F-125: aws-lc-sys は zig クロスリンク不可）。
 #
 # enable_sandbox_macos = true にすると:
-#   - 設定から導出した静的ファイルルート・TLS証明書/鍵・アクセスログ/アプリログの
-#     ディレクトリ・ディスクキャッシュディレクトリを基に SBPL プロファイルを生成し、
-#     全 TLS ワーカーの listener bind 完了後に sandbox_init(3) で適用する（不可逆）。
-#   - 実機での動作検証ができないため、保守的な最小プロファイルを採用している:
-#     ネットワーク（network*）とファイル読み取り（file-read*）は無条件許可し、
-#     ファイル**書き込み**のみ上記ログ/キャッシュディレクトリの subpath に限定する
-#     （`(deny default)` 起点。詳細は src/security.rs の `macos_sandbox` モジュール参照）。
+#   - 設定から導出したパスを基に SBPL プロファイルを生成し、全リスナーの bind 完了後に
+#     sandbox_init(3) で適用する（不可逆）。`(deny default)` 起点で、子プロセス（fork・exec）は許さない。
+#   - 読めるのは設定が指すファイル（設定ファイル・証明書・鍵・CA・トークン・JWKS・WASM モジュール。
+#     ファイルはディレクトリごと）・静的ルートと、システムのパス（/usr/lib・/System・/private/etc 等）だけ（F-282）。
+#   - 書けるのはログ・ディスクキャッシュ・ACME の保存先・upload_tmp_dir・UDS だけ。
+#   - 許すパスは起動時に決まる。リロードで新しい場所を指すと、証明書・鍵はリロードが失敗し（稼働中の設定のまま）、
+#     静的ルートは 404 になる（場所を変えるときは再起動）。
+#     ネットワーク（network*）は無条件許可（詳細は docs/guide/security.md）。
 #   - sandbox_init 失敗時の挙動は allow_security_failures に従う。
 #
 # enable_sandbox_macos = true

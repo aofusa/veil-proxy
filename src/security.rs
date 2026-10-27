@@ -3937,18 +3937,19 @@ pub mod pledge_unveil {
 // - ネットワークは `(allow network*)` で無条件許可する。プロキシ/upstream 構成の
 //   把握（listen/connect 先の網羅）を静的にはできず、誤って絞ると起動不能になる
 //   リスクの方が高いため、ネットワーク面はサンドボックスの対象外とする。
-// - ファイル読み取りは `(allow file-read*)` で無条件許可する。TLS 証明書・設定・
-//   WASM モジュール・共有ライブラリ等の読み取りパスを実行時に完全列挙するのは
-//   困難（動的リンカや DNS 解決ライブラリが参照する暗黙のパスを含む）で、
-//   誤って絞ると起動不能または TLS ハンドシェイク失敗を招く。
-// - ファイル**書き込み**のみ、設定から導出したログ/ディスクキャッシュディレクトリの
-//   `subpath` に限定する（`(deny default)` の恩恵が最も大きく、かつ誤検知リスクが
-//   低い面）。静的ファイルルート・証明書/鍵は読み取り専用のため明示 allow は不要
-//   （`file-read*` が既に無条件許可のため）だが、将来ここを絞る際の参照点として
-//   `static_roots`/`read_only` もプロファイルへ明示コメントとして残す。
-// - `process*`（fork/exec 監視外の意）・`signal (target self)`・`mach-lookup`
-//   （XPC・システムサービス解決に必要）・`system-socket` を許可し、通常起動を
-//   妨げないようにする。
+// - ファイル読み取りは設定から導出したパス（設定ファイル・証明書・鍵・CA・トークン・JWKS・WASM
+//   モジュール・静的ルート・ログ/キャッシュ）と、動的リンカ・DNS 解決・信頼ストア・タイムゾーンが
+//   参照するシステムのパス（`SYSTEM_READ_SUBPATHS`）の `subpath` に限る（F-282 SB-12）。
+//   証明書・鍵などのファイルは親ディレクトリごと許す（シークレットの差し替えはディレクトリ内の
+//   シンボリックリンクの付け替えで行われ、ファイル単体だと付け替え後の実体を読めない）。
+//   メタデータの読み取り（`stat`）は経路のたどりに要るので無条件に許す（内容は読めない）。
+//   許すパスは起動時に決まる。リロードで新しい場所を指すと、証明書・鍵はリロードが失敗し（稼働中の
+//   設定は残る）、静的ルートは 404 になる。
+// - ファイル書き込みは設定から導出したログ/ディスクキャッシュ/ACME の保存先/アップロードの一時
+//   ディレクトリ・UDS の `subpath` に限る。
+// - `process-fork`・`process-exec` は許さない（`deny default` のまま。veil は起動後に子プロセスを
+//   作らない）。`signal (target self)`・`mach-lookup`（XPC・DNS・trustd 等のシステムサービス
+//   解決に必要）・`system-socket` は許可する。
 #[cfg(target_os = "macos")]
 pub mod macos_sandbox {
     use ftlog::info;
@@ -3979,18 +3980,39 @@ pub mod macos_sandbox {
     /// 今回は使わない）。
     const SANDBOX_LITERAL_PROFILE: u64 = 0;
 
-    /// プロファイル生成に使う設定由来のパス集合。
+    /// プロファイル生成に使う設定由来のパス集合（絶対パス。相対パスは収集時に作業ディレクトリで
+    /// 解決する）。
     #[derive(Debug, Clone, Default)]
     pub struct SandboxPaths {
-        /// 静的ファイル配信のルートディレクトリ（読み取り専用。現行プロファイルでは
-        /// `file-read*` を無条件許可するため実効的には冗長だが、将来の tightening の
-        /// 参照点としてプロファイルへ明示コメント出力する）。
+        /// 静的ファイル配信のルートディレクトリ（読み取り専用、`subpath`）。
         pub static_roots: Vec<PathBuf>,
-        /// TLS 証明書・秘密鍵ファイル（読み取り専用。上記と同じ理由で現状は冗長）。
+        /// 設定ファイル・TLS 証明書・秘密鍵・CA・トークン・JWKS・WASM モジュール（読み取り専用。
+        /// 親ディレクトリごと許す）。
         pub read_only: Vec<PathBuf>,
-        /// アクセスログ/アプリログ・ディスクキャッシュのディレクトリ（読み書き許可）。
+        /// アクセスログ/アプリログ・ディスクキャッシュ・ACME の保存先等のディレクトリと UDS
+        /// （読み書き許可、`subpath`）。
         pub read_write: Vec<PathBuf>,
     }
+
+    /// 設定に依らず読み取りを許すシステムのパス（Seatbelt はシンボリックリンクを解決した実体の
+    /// パスで照合するので `/etc`・`/var` ではなく `/private/...` で書く）。
+    ///
+    /// - `/usr/lib`・`/System`・`/private/var/db/dyld`: 動的リンカと共有キャッシュ。
+    /// - `/private/etc`・`/private/var/run/resolv.conf`: `hosts`・`resolv.conf`・`services` 等の名前解決。
+    /// - `/Library/Keychains`・`/private/etc/ssl`: 上流の TLS 検証の信頼ストア。
+    /// - `/usr/share`・`/private/var/db/timezone`: タイムゾーン・ロケール。
+    /// - `/dev`: `/dev/urandom`・`/dev/null`。
+    pub const SYSTEM_READ_SUBPATHS: &[&str] = &[
+        "/usr/lib",
+        "/usr/share",
+        "/System",
+        "/Library/Keychains",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/private/var/db/timezone",
+        "/private/var/run/resolv.conf",
+        "/dev",
+    ];
 
     /// SBPL 文字列リテラル内へ安全に埋め込めるようエスケープする（`\` と `"` のみ）。
     fn escape_sbpl_string(path: &Path) -> String {
@@ -3999,44 +4021,77 @@ pub mod macos_sandbox {
             .replace('"', "\\\"")
     }
 
+    /// `path` と、実在すればシンボリックリンクを解決した実体（`/tmp` → `/private/tmp` 等）の
+    /// 両方を `(subpath ..)` として足す。ルート `/` は足さない（全体の許可になる）。
+    fn push_subpath(out: &mut String, path: &Path) {
+        let mut push = |p: &Path| {
+            if p.as_os_str().is_empty() || p == Path::new("/") {
+                return;
+            }
+            let line = format!("  (subpath \"{}\")\n", escape_sbpl_string(p));
+            if !out.contains(&line) {
+                out.push_str(&line);
+            }
+        };
+        push(path);
+        // 起動時コールドパス（プロファイル生成時に 1 回）。静的配信の経路ではない。
+        #[allow(clippy::disallowed_methods)]
+        let real = std::fs::canonicalize(path);
+        if let Ok(real) = real {
+            push(&real);
+        }
+    }
+
+    /// ファイルなら親ディレクトリ（ルート直下のファイルはファイル自体）、ディレクトリならそれ自体。
+    fn read_only_scope(path: &Path) -> &Path {
+        if path.is_dir() {
+            return path;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() && parent != Path::new("/") => parent,
+            _ => path,
+        }
+    }
+
     /// 設定から導出したパス集合から SBPL プロファイル文字列を生成する。
     ///
-    /// 最小構成: `(deny default)` を基点に `process*`/`network*`/`file-read*` を
-    /// 無条件許可し、書き込みのみ `read_write` の `subpath` に限定する（モジュール
-    /// 冒頭の設計判断コメント参照）。
+    /// `(deny default)` を基点に、読み取りは `SYSTEM_READ_SUBPATHS` と設定由来のパス、書き込みは
+    /// `read_write` の `subpath` に限る（モジュール冒頭の設計判断コメント参照）。
     pub fn build_profile(paths: &SandboxPaths) -> String {
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
-             (allow process-fork)\n\
-             (allow process-exec)\n\
              (allow signal (target self))\n\
              (allow mach-lookup)\n\
              (allow system-socket)\n\
              (allow network*)\n\
-             (allow file-read*)\n",
+             (allow file-read-metadata)\n",
         );
+
+        let mut read = String::new();
+        for p in SYSTEM_READ_SUBPATHS {
+            push_subpath(&mut read, Path::new(p));
+        }
+        for p in &paths.static_roots {
+            push_subpath(&mut read, p);
+        }
+        for p in &paths.read_only {
+            push_subpath(&mut read, read_only_scope(p));
+        }
+        profile.push_str("(allow file-read*\n");
+        profile.push_str(&read);
+        profile.push_str(")\n");
 
         if paths.read_write.is_empty() {
             profile.push_str("; no read-write subpaths configured\n");
         } else {
-            profile.push_str("(allow file-write*\n");
+            let mut rw = String::new();
             for p in &paths.read_write {
-                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl_string(p)));
+                push_subpath(&mut rw, p);
             }
+            profile.push_str("(allow file-read* file-write*\n");
+            profile.push_str(&rw);
             profile.push_str(")\n");
-        }
-
-        // 現状 file-read* が無条件許可のため以下は実効的に冗長だが、将来
-        // file-read* を絞る際の対象パスとして明示しておく（保守目的のコメント）。
-        if !paths.static_roots.is_empty() || !paths.read_only.is_empty() {
-            profile.push_str("; read-only paths (informational; already covered by file-read*):\n");
-            for p in paths.static_roots.iter().chain(paths.read_only.iter()) {
-                profile.push_str(&format!(
-                    "; (allow file-read* (subpath \"{}\"))\n",
-                    escape_sbpl_string(p)
-                ));
-            }
         }
 
         profile
@@ -4072,7 +4127,7 @@ pub mod macos_sandbox {
                 message
             )));
         }
-        info!("macos sandbox: sandbox_init applied (Seatbelt, deny-default + limited file-write)");
+        info!("macos sandbox: sandbox_init applied (Seatbelt, deny-default + limited file-read and file-write)");
         Ok(())
     }
 }
@@ -5352,9 +5407,26 @@ mod tests {
         assert!(profile.starts_with("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow network*)"));
-        assert!(profile.contains("(allow file-read*)"));
+        // F-282 SB-12: 読み取りは無条件ではなく subpath に限る。fork・exec は許さない
+        assert!(!profile.contains("(allow file-read*)"));
+        assert!(!profile.contains("process-fork"));
+        assert!(!profile.contains("process-exec"));
+        assert!(profile.contains("(subpath \"/srv/www\")"));
+        // ファイルは親ディレクトリごと（シークレットのシンボリックリンクの付け替えに追従する）
+        assert!(profile.contains("(subpath \"/etc/veil/tls\")"));
+        assert!(profile.contains("(subpath \"/usr/lib\")"));
         assert!(profile.contains("(subpath \"/var/log/veil\")"));
         assert!(profile.contains("(subpath \"/var/cache/veil\")"));
+        assert!(profile.contains("(allow file-read* file-write*"));
+        // ルートは足さない
+        let root_only = SandboxPaths {
+            read_only: vec![PathBuf::from("/cert.pem")],
+            static_roots: vec![PathBuf::from("/")],
+            ..Default::default()
+        };
+        let profile = build_profile(&root_only);
+        assert!(!profile.contains("(subpath \"/\")"));
+        assert!(profile.contains("(subpath \"/cert.pem\")"));
     }
 
     #[test]
@@ -5364,7 +5436,70 @@ mod tests {
 
         let profile = build_profile(&SandboxPaths::default());
         assert!(profile.contains("(deny default)"));
-        assert!(!profile.contains("(allow file-write*"));
+        assert!(!profile.contains("file-write*"));
+    }
+
+    // F-282 SB-12: 生成したプロファイルを子プロセスで実際に適用し、許したパスは読めて、許していない
+    // パスは読めず、子プロセスを起動できないことを確かめる（適用は不可逆なので子の中で行う）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn test_macos_sandbox_profile_enforced_in_child() {
+        use super::macos_sandbox::{apply, build_profile, SandboxPaths};
+        use std::path::PathBuf;
+
+        const CHILD_ENV: &str = "VEIL_SB12_SANDBOX_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD_ENV) {
+            let dir = PathBuf::from(dir);
+            let allowed = dir.join("allowed");
+            let denied = dir.join("denied");
+            let profile = build_profile(&SandboxPaths {
+                read_only: vec![allowed.join("cert.pem")],
+                read_write: vec![dir.join("logs")],
+                ..Default::default()
+            });
+            apply(&profile).expect("sandbox_init");
+            assert_eq!(
+                std::fs::read_to_string(allowed.join("cert.pem")).unwrap(),
+                "ok"
+            );
+            assert!(std::fs::read_to_string(denied.join("secret")).is_err());
+            std::fs::write(dir.join("logs").join("out.log"), "x").unwrap();
+            assert!(std::fs::write(denied.join("x"), "x").is_err());
+            // 共有ライブラリ・名前解決のシステムパスは読める
+            assert!(
+                std::fs::metadata("/usr/lib/libSystem.B.dylib").is_ok()
+                    || std::fs::read_dir("/usr/lib").is_ok()
+            );
+            assert!(std::fs::read_to_string("/etc/hosts").is_ok());
+            assert!(std::process::Command::new("/usr/bin/true")
+                .status()
+                .is_err());
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["allowed", "denied", "logs"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("allowed").join("cert.pem"), "ok").unwrap();
+        std::fs::write(dir.path().join("denied").join("secret"), "no").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::tests::test_macos_sandbox_profile_enforced_in_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 

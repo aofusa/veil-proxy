@@ -114,6 +114,27 @@ drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
 
+#### 4. macOS の Seatbelt（`sandbox_init`）
+
+macOS では `enable_sandbox_macos = true` で、全リスナーの bind が済んだ後に Seatbelt のプロファイルを掛けます
+（掛けた後は外せません）。
+
+```toml
+[security]
+enable_sandbox_macos = true
+```
+
+- プロファイルは `(deny default)` が起点です。子プロセス（`process-fork`・`process-exec`）は許しません。
+- 読めるのは、設定が指すパス（設定ファイル・証明書・秘密鍵・CA・トークン・JWKS・Proxy-Wasm のモジュール・静的ルート。
+  ファイルはディレクトリごと。シンボリックリンクの付け替えで差し替えるシークレットも読めます）と、動的リンカ・名前解決・
+  信頼ストア・タイムゾーンが使うシステムのパス（`/usr/lib`・`/usr/share`・`/System`・`/Library/Keychains`・`/private/etc`・
+  `/private/var/db/dyld`・`/private/var/db/timezone`・`/dev`）の下だけです。メタデータ（`stat`）はどこでも読めます。
+- 書けるのは、ログ・ディスクキャッシュのディレクトリ、ACME の保存先（`[acme]` があれば証明書のディレクトリも）、
+  `upload_tmp_dir`、Unix ソケットの下だけです。
+- 許すパスは起動時に決まります。リロードで新しい場所を指しても読めません。新しい場所の証明書・秘密鍵はリロードが失敗し
+  （稼働中の設定のまま動き続けます）、新しい場所の静的ルートは 404 を返します。場所を変えるときは再起動してください。
+- ネットワーク・`mach-lookup`・自分へのシグナルは許します。
+
 ### Namespace隔離について
 
 > **注意**: `unshare(CLONE_NEWNET)` などのNamespace隔離は、リバースプロキシでは**非推奨**です。
