@@ -74,13 +74,18 @@ jobs:
           echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       # quiche の BoringSSL（boring-sys）と aws-lc-sys は Windows の x86_64 のアセンブリに NASM を使う。試験は h2c
       # （--http2-prior-knowledge）を使うので、HTTP/2 の無い Git for Windows の curl の代わりに curl.se のビルドを先に置く
+      # （choco の curl は 8.23 から nghttp2 無しのビルドになった）
       - name: install build deps (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nasm curl protoc -y --no-progress
+          choco install nasm protoc -y --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $v = "8.23.0_1"
+          Invoke-WebRequest -Uri "https://curl.se/windows/dl-$v/curl-$v-win64-mingw.zip" -OutFile "$env:RUNNER_TEMP\curl.zip"
+          Expand-Archive "$env:RUNNER_TEMP\curl.zip" -DestinationPath "$env:RUNNER_TEMP\curl"
+          "$env:RUNNER_TEMP\curl\curl-$v-win64-mingw\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: tests/api/library_e2e.sh ${{ matrix.modes }}
         shell: bash
         env:
@@ -88,6 +93,7 @@ jobs:
           PYTHON3: python
         run: |
           curl -V | sed -n 1p
+          curl -V | grep -q HTTP2 || { echo "::error::this curl has no HTTP/2 (the h2c checks need it)"; exit 1; }
           openssl version
           rc=0
           for m in ${{ matrix.modes }}; do

@@ -36,14 +36,18 @@ case "$OS" in
   NetBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:0,muzzy_decay_ms:0}" ;;
 esac
 EXE=""; [ "$OS" = Windows ] && EXE=.exe
-# 同時接続の試験（WebSocket 2,000 本・asyncio の 2,000 並行）が OS の既定の上限で落ちないようにする（root のときだけ）。
-# OpenBSD の root のハード上限は 1024 fd。BSD の listen の待ち行列は既定 128 で、NetBSD は溢れた SYN に RST を返す
-# （ConnectionResetError）。veil の listen の値（1024）まで上げる。root でなければ ws_check.py が本数を上限に合わせる。
-if [ "$OS" != Windows ] && [ "$(id -u 2>/dev/null)" = 0 ]; then
-  h="$(ulimit -Hn)"; [ "$h" != unlimited ] && [ "$h" -lt 8192 ] && ulimit -Hn 8192 2>/dev/null
-  case "$OS" in NetBSD|OpenBSD) q=kern.somaxconn ;; FreeBSD) q=kern.ipc.soacceptqueue ;; *) q="" ;; esac
-  if [ -n "$q" ] && [ "$(sysctl -n "$q" 2>/dev/null || echo 1024)" -lt 1024 ]; then
-    { sysctl -w "$q=1024" || sysctl "$q=1024"; } >/dev/null 2>&1 && echo "== $q raised to 1024 for the concurrency tests"
+# 同時接続の試験（WebSocket 2,000 本・asyncio の 2,000 並行）が OS の既定の上限で落ちないようにする。
+# OpenBSD の root のハード上限は 1024 fd（root のときだけ上げる）。BSD・macOS の listen の待ち行列は既定 128 で、溢れた SYN に
+# RST を返す（ConnectionResetError）。veil の listen の値（1024）まで上げる（root か、パスワード無しの sudo が使えるとき。
+# GitHub Actions の macOS）。上げられなければ ws_check.py が本数を上限に合わせる。
+if [ "$OS" != Windows ]; then
+  SU=""; [ "$(id -u 2>/dev/null)" = 0 ] || { sudo -n true 2>/dev/null && SU="sudo -n"; } || SU=none
+  if [ "$SU" != none ]; then
+    if [ -z "$SU" ]; then h="$(ulimit -Hn)"; [ "$h" != unlimited ] && [ "$h" -lt 8192 ] && ulimit -Hn 8192 2>/dev/null; fi
+    case "$OS" in NetBSD|OpenBSD) q=kern.somaxconn ;; FreeBSD) q=kern.ipc.soacceptqueue ;; Darwin) q=kern.ipc.somaxconn ;; *) q="" ;; esac
+    if [ -n "$q" ] && [ "$(sysctl -n "$q" 2>/dev/null || echo 1024)" -lt 1024 ]; then
+      { $SU sysctl -w "$q=1024" || $SU sysctl "$q=1024"; } >/dev/null 2>&1 && echo "== $q raised to 1024 for the concurrency tests"
+    fi
   fi
 fi
 TMPD="$(mktemp -d)"
@@ -362,7 +366,7 @@ run_c() {
     make -s -C "$CH" hello hello-static >/dev/null || { bad "compile hello.c"; return; }
   else
     # 静的リンクに要るシステムライブラリは OS ごとに違う（OpenBSD・NetBSD に libdl は無い等）ので rustc に聞く
-    local libs; libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+    local libs; libs=$(cd "$ROOT" && cargo rustc -q --color never -p veil-capi --release --crate-type staticlib -- \
       --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
     if [ "$OS" = Windows ]; then
       c_msvc "$CH" "$libs" || { bad "compile hello.c (MSVC)"; return; }
@@ -452,7 +456,7 @@ run_c_features() {
   else
     local MK; MK=$(command -v gmake || command -v make)
     local libs="-lpthread -ldl -lm"
-    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q --color never -p veil-capi --release --crate-type staticlib -- \
       --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
     "$MK" -s -C "$CF" CC="${CC:-cc}" LIBS="$libs" features >/dev/null || { bad "compile features.c"; return; }
   fi

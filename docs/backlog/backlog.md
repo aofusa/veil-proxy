@@ -542,6 +542,7 @@
 | B-212 | P3 | 修正済み（v0.10.0） | [bugs/B-212-feature-combination-build-errors.md](bugs/B-212-feature-combination-build-errors.md) | 既定の features で `H2RequestCtx::tls` が dead code、`wasm` 単体で本文の chunked の復号・理由フレーズが未定義、kit の `jwt` 単体で `hmac_sha256` が dead code になり、`-D warnings` のビルドが通らなかった。使う feature だけで定義する（v0.10.0 の警告の検査で発覚） |
 | B-213 | P3 | 修正済み（v0.10.0） | [bugs/B-213-sphinx-autoapi-toctree.md](bugs/B-213-sphinx-autoapi-toctree.md) | sphinx-autoapi 3.8 が MyST の root の toctree へ API の頁を足さなくなり、Python の API 文書の `sphinx-build -W` が `toc.not_included` で落ちた。index.md の toctree に生成されるパッケージの頁を明示する（v0.10.0 の PR の CI で発覚） |
 | B-214 | P3 | 修正済み（v0.10.0） | [bugs/B-214-python-stub-drift.md](bugs/B-214-python-stub-drift.md) | `veil._veil` の型スタブが v0.10.0 で足した永続イベントループ・WebSocket・gRPC のクライアント等とずれていた（`__all__` の漏れ・`AioStream.closed` が getter・`@final` 無し）。stubtest が落ちた（v0.10.0 の PR の CI で発覚） |
+| B-215 | P3 | 修正済み（v0.10.0） | [bugs/B-215-bindings-ci-harness.md](bugs/B-215-bindings-ci-harness.md) | bindings の CI の library_e2e が、色付きの `native-static-libs`（`CARGO_TERM_COLOR=always`）・HTTP/2 の無い choco の curl・macOS の listen の待ち行列（128）で落ちた。`--color never`・curl.se の curl・`sudo -n` で待ち行列を上げる（v0.10.0 の PR の CI で発覚） |
 
 ---
 
