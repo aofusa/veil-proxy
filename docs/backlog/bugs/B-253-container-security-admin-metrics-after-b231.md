@@ -1,6 +1,6 @@
-# B-245: B-231（allowed_ips が空なら loopback だけ）の後、container_security の admin_security・metrics_probe が 403 で失敗し、metrics_host_label_bounded は届かないまま PASS と報告していた
+# B-253: B-231（allowed_ips が空なら loopback だけ）の後、container_security の admin_security・metrics_probe が 403 で失敗し、metrics_host_label_bounded は届かないまま PASS と報告していた
 
-**状態: 修正済み（v0.10.0）**
+**状態: 修正済み（v0.10.0）**（feat/v0100 で B-245 として起票・コミットしたが、main が同じ番号を F-281 の続きの起票に使ったので付け替えた。コミットのメッセージは B-245 のまま）
 
 ## 出典
 

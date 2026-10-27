@@ -259,7 +259,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
-    219, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
+    219, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
@@ -422,7 +422,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
-    219, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
+    219, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
@@ -581,7 +581,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
-    128, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
+    128, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
@@ -736,7 +736,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
-    128, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
+    128, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
@@ -1119,7 +1119,7 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     // アクション
     let action_allow = 0x7fff0000u32; // SECCOMP_RET_ALLOW
 
-    // B-246: Strict は 0（SECCOMP_RET_KILL_THREAD。違反したスレッドだけが黙って消え、残りは動き続ける）ではなく、
+    // B-254: Strict は 0（SECCOMP_RET_KILL_THREAD。違反したスレッドだけが黙って消え、残りは動き続ける）ではなく、
     // 文書どおりプロセスごと落とす。4.14 未満のカーネルは未知の動作の上位ビットを見ずに KILL_THREAD として扱う
     let action_deny = match mode {
         SeccompMode::Log => 0x7ffc0000u32,      // SECCOMP_RET_LOG
@@ -4362,7 +4362,7 @@ mod tests {
             ("getrandom", libc::SYS_getrandom),
             ("prlimit64", libc::SYS_prlimit64),
             ("rt_sigreturn", libc::SYS_rt_sigreturn),
-            // B-244: 止められた（SIGSTOP・ptrace）clock_nanosleep の再開。EPERM だと std の sleep が panic する
+            // B-252: 止められた（SIGSTOP・ptrace）clock_nanosleep の再開。EPERM だと std の sleep が panic する
             ("restart_syscall", libc::SYS_restart_syscall),
             ("futex", libc::SYS_futex),
             ("openat2", libc::SYS_openat2),
@@ -4699,7 +4699,7 @@ mod tests {
         );
     }
 
-    /// B-246: Strict の違反はプロセスごと落とす。違反したのが主スレッド以外でも、
+    /// B-254: Strict の違反はプロセスごと落とす。違反したのが主スレッド以外でも、
     /// 違反したスレッドだけが消えて残りが動き続けてはいけない（SECCOMP_RET_KILL_THREAD との区別）。
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

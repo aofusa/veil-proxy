@@ -1,6 +1,20 @@
 # F-281: 2026-10 のセキュリティレビューで読めなかった領域の続き（veil_alloc・kTLS の受信・本文の転送・BSD/macOS のサンドボックス・reactor・Wasm の外部呼び出し・メッシュの mTLS/RBAC）
 
-**状態: 未着手（2026-10-27 起票）**
+**状態: 完了（2026-10-27 起票、同日に読了）**
+
+## 結果（2026-10-27）
+
+8 領域を読み、本文の転送は aofish の Docker Desktop で v0.9.2 を使って実機再現した（`docs/artifacts/security/analysis/07-f281-followup.md`・
+`docs/artifacts/security/repro/`、git 管理外）。GraphQL（`src/api/graphql`）はこのリリース線に無いので対象外。
+
+- 起票: [B-244](../bugs/B-244-h1-chunked-timeout-upstream-conn-pooled-mid-response.md)（P1、chunked の停止で応答の途中の上流接続がプールに戻る）、
+  [B-245](../bugs/B-245-h1-head-204-304-upstream-body-wait.md)、[B-246](../bugs/B-246-upstream-response-cl-te-precedence.md)、
+  [B-247](../bugs/B-247-wasm-dequeue-shared-queue-abi-writes-payload-not-pointer.md)、[B-248](../bugs/B-248-wasi-random-get-not-csprng.md)、
+  [B-249](../bugs/B-249-xds-rbac-unsupported-rules-fail-open.md)、[B-250](../bugs/B-250-sandbox-capabilities-bounding-set-only.md)、
+  [B-251](../bugs/B-251-upstream-connect-failure-error-log-per-request.md)、Low/Info は [F-282](F-282-security-review-followup-hardening.md)。
+- 欠陥なし: `src/veil_alloc/`（全 `unsafe`）、reactor（`WakerSlot`・Future の Drop・readiness 確認）、`sendfile.rs`/`splice.rs` の TLS ガード、
+  `negotiation.rs`、`l4/proxy.rs`、`config/validate.rs`、capsicum/pledge/unveil/chroot/Job object。
+- 残り（次回）: `grpc_executor.rs` の本体、`mesh/identity.rs` の後半、KT-02 の実機再現。
 
 ## 今の状態
 

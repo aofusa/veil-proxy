@@ -1,6 +1,6 @@
-# B-244: seccomp の許可リストに `restart_syscall` が無く、SIGSTOP/SIGCONT・ptrace の後に背景スレッドの sleep が panic する（strict ではスレッドが黙って消え、終了が止まる）
+# B-252: seccomp の許可リストに `restart_syscall` が無く、SIGSTOP/SIGCONT・ptrace の後に背景スレッドの sleep が panic する（strict ではスレッドが黙って消え、終了が止まる）
 
-**状態: 修正済み（v0.10.0）**
+**状態: 修正済み（v0.10.0）**（feat/v0100 で B-244 として起票・コミットしたが、main が同じ番号を F-281 の続きの起票に使ったので付け替えた。コミットのメッセージは B-244 のまま）
 
 ## 出典
 

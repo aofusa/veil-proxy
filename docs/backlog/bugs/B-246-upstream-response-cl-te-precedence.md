@@ -1,0 +1,31 @@
+# B-246: 上流の応答のフレーミングが RFC 9112 §6.3 と逆（`Content-Length` が `Transfer-Encoding` に優先、複数の `Content-Length` を拒否せず、両ヘッダをそのまま転送）
+
+**状態: 未修正（2026-10-27 起票）**
+
+## 出典
+
+2026-10-27 のセキュリティレビュー 2 回目の FW-03。aofish で実機再現（`docs/artifacts/security/repro/fw-run.log` の T2）。
+
+## 事象
+
+- `src/http_utils.rs::parse_http_response`（L1133〜L1163）は `Content-Length` と `Transfer-Encoding: chunked` が両方あると **`Content-Length` を優先**して
+  本文の長さを決める。RFC 9112 §6.3 は Transfer-Encoding を優先し Content-Length を無視する（要求では拒否してよい）。
+- `Content-Length` が複数ある応答は、HTTP/1.1 の経路は **最初** を、HTTP/3 の経路（`src/http3_stream.rs::parse_response_headers` L2032 付近）は **最後** を採る。
+  値が異なる複数の `Content-Length` は拒否すべき（要求側 L985〜L1025 は拒否している）。
+- 両ヘッダを **そのままクライアントへ転送** する。再現では `Content-Length: 5` + `Transfer-Encoding: chunked` + `5\r\nhello\r\n0\r\n\r\n` がそのまま届いた。
+  veil は CL=5 で本文を切るので、chunked の本体が複数の読み込みにまたがると残りが **次の要求の応答** として扱われ、上流接続もプールに戻る（B-244 と同種の取り違え）。
+
+## 影響
+
+- 上流が信頼できない（マルチテナントの上流・侵害された上流・両ヘッダを返すバグのある上流）構成で応答の分割（response smuggling）になる。
+  既定の構成では上流は運用者のものなので P2。プロキシとして境界のフレーミングを正規化するのが筋。
+
+## 改修案
+
+- `parse_http_response`: TE が chunked なら CL を無視し、転送時に `Content-Length` を落とす（または 502）。CL が複数で値が異なれば 502。
+  HTTP/1.1 と HTTP/3 で 1 つの実装に寄せる。
+- 単体テスト: CL+TE → chunked、CL 複数（同値）→ 採用、CL 複数（不一致）→ エラー、`Transfer-Encoding: gzip, chunked` → chunked。
+
+## 関連
+
+- [B-244](B-244-h1-chunked-timeout-upstream-conn-pooled-mid-response.md)、[B-234](B-234-upstream-response-too-many-headers-waits.md)（上流応答の解析の待ち）
