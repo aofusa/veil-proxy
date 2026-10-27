@@ -505,6 +505,7 @@
 | B-237 | P3 | 未修正 | [bugs/B-237-jwks-key-without-alg-accepts-any-alg.md](bugs/B-237-jwks-key-without-alg-accepts-any-alg.md) | JWKS の鍵に `alg` が無いと、トークン側の `alg` でその鍵種の任意のアルゴリズム（RS*・PS*）を受理する |
 | B-238 | P3 | 未修正 | [bugs/B-238-ci-workflows-tag-pinned-no-permissions.md](bugs/B-238-ci-workflows-tag-pinned-no-permissions.md) | `ci.yml`・`container-security-nightly.yml`・`release-sbom.yml` の Actions がタグ固定で、`ci.yml` に `permissions:` が無い（公開系は SHA 固定済み） |
 | B-239 | P3 | 未修正 | [bugs/B-239-docker-base-images-latest-curl-sh.md](bugs/B-239-docker-base-images-latest-curl-sh.md) | Docker のベースイメージがタグ無し・`latest` で、`Dockerfile.lib` が rustup を `curl \| sh` で入れる（digest の固定と sha256 の検証） |
+| B-240 | P3 | 未修正 | [bugs/B-240-semgrep-dead-code-rule-false-findings.md](bugs/B-240-semgrep-dead-code-rule-false-findings.md) | semgrep のカスタムルール `veil-no-bare-allow-dead-code` がコメント内の文章と `examples/`・`third_party/` に一致して毎晩 37 件の偽の所見を出す（`paths.include: "src/"` がスキャンの root `/src` の全ファイルに一致）。本物は 0 件 |
 
 ---
 
