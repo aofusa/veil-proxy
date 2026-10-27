@@ -9,7 +9,10 @@
 Prints one "ok <name>" / "FAIL <name>: ..." line per check and exits non-zero on any failure.
 """
 import asyncio
-import resource
+try:  # Windows には無い（fd の上限を上げる処理は飛ばす）
+    import resource
+except ImportError:  # pragma: no cover
+    resource = None
 import socket
 import ssl
 import sys
@@ -139,6 +142,8 @@ def basic(port, tls):
 
 
 def raise_nofile(n):
+    if resource is None:
+        return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     want = min(hard, max(soft, n + 256))
     resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
