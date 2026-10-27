@@ -3,7 +3,7 @@
 //! シグナルハンドラ、バックグラウンドスレッド、リスナーソケットの作成を担当します。
 
 use crate::config::*;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
+use crate::runtime::io::AsyncWriteRentExt;
 use crate::runtime::tcp::{TcpListener, TcpStream};
 use crate::runtime::time::timeout;
 use ftlog::{debug, error, info, warn};
@@ -377,46 +377,29 @@ pub fn spawn_background_revalidation(
             if let Some(parsed) = parse_http_response(&accumulated) {
                 status_code = parsed.status_code;
                 let header_len = parsed.header_len;
-                let body_start = accumulated[header_len..].to_vec();
 
-                // ボディを読み込み（Content-Length または接続終了まで）
-                let mut body = body_start;
-                if let Some(cl) = parsed.content_length {
-                    let remaining = cl.saturating_sub(body.len());
-                    if remaining > 0 {
-                        let additional =
-                            buffer_exact_bytes_simple(&mut backend_stream, remaining).await;
-                        body.extend(additional);
-                    }
-                } else if !parsed.is_chunked {
-                    // 接続終了まで読む（最大10MB）
-                    const MAX_SIZE: usize = 10 * 1024 * 1024;
-                    loop {
-                        if body.len() >= MAX_SIZE {
-                            break;
-                        }
-                        let read_buf = buf_get();
-                        let read_result =
-                            timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-                        let (res, mut returned_buf) = match read_result {
-                            Ok(result) => result,
-                            Err(_) => break,
-                        };
-
-                        let n = match res {
-                            Ok(0) | Err(_) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                            Ok(n) => n,
-                        };
-
-                        returned_buf.set_valid_len(n);
-                        body.extend_from_slice(returned_buf.as_valid_slice());
-                        buf_put(returned_buf);
-                    }
+                // 本文を区切りどおりに読み切った応答だけをキャッシュする（B-244。以前は途中で止まった本文・
+                // chunked の最初の読み込みだけ・接続の終わりまでの本文を 10MB で切ったものを保存していた）。
+                // B-245/B-246: HEAD・本文の無い応答・区切りの不正な応答・接続の終わりで区切る応答は保存しない
+                let kind = parsed.body(method_str == "HEAD");
+                if parsed.framing_invalid
+                    || !matches!(
+                        kind,
+                        crate::http_utils::ResponseBody::Length(_)
+                            | crate::http_utils::ResponseBody::Chunked
+                    )
+                {
+                    break;
                 }
+                let Some((body, _extra)) = crate::proxy::collect_response_body_raw(
+                    &mut backend_stream,
+                    kind,
+                    &accumulated[header_len..],
+                )
+                .await
+                else {
+                    break;
+                };
 
                 // ヘッダー抽出
                 let headers_data = &accumulated[..header_len];
@@ -460,39 +443,6 @@ pub fn spawn_background_revalidation(
         debug!("Background revalidation completed (status={})", status_code);
         // _guard がドロップされて finish_revalidation(hash) が呼ばれる
     });
-}
-
-/// バックグラウンド更新用の簡易バイト読み込み
-pub async fn buffer_exact_bytes_simple(
-    backend_stream: &mut TcpStream,
-    mut remaining: usize,
-) -> Vec<u8> {
-    let mut result = Vec::with_capacity(remaining);
-
-    while remaining > 0 {
-        let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-
-        let n = match res {
-            Ok(0) | Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n.min(remaining),
-        };
-
-        returned_buf.set_valid_len(n);
-        result.extend_from_slice(&returned_buf.as_valid_slice()[..n]);
-        buf_put(returned_buf);
-        remaining = remaining.saturating_sub(n);
-    }
-
-    result
 }
 
 /// キャッシュクリーンアップスレッドを起動

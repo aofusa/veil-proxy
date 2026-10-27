@@ -224,6 +224,9 @@ pub(super) async fn proxy_http_request_splice(
 
     let client_tcp = client_stream.get_ref();
 
+    // B-245: HEAD への応答は本文を持たない（書く前に判定する）
+    let is_head = request_is_head(request);
+
     // 1. リクエストヘッダーをバックエンドに送信（raw_write）
     if let Err(e) = async_raw_write_all(backend_stream, request).await {
         warn!("Failed to send request header: {}", e);
@@ -261,7 +264,7 @@ pub(super) async fn proxy_http_request_splice(
     }
 
     // 4. レスポンスを受信して転送（splice 使用）
-    let result = splice_transfer_response_ktls(backend_stream, client_stream, pipe).await;
+    let result = splice_transfer_response_ktls(backend_stream, client_stream, pipe, is_head).await;
 
     Some(result)
 }
@@ -276,13 +279,13 @@ pub(super) async fn splice_transfer_response_ktls(
     backend_stream: &TcpStream,
     client_stream: &KtlsServerStream,
     pipe: &SplicePipe,
+    is_head: bool,
 ) -> (u16, u64, bool, bool) {
     let client_tcp = client_stream.get_ref();
 
     let mut total = 0u64;
     let mut status_code = 502u16;
     let mut accumulated = Vec::with_capacity(4096);
-    let mut backend_wants_keep_alive: bool;
 
     // ヘッダー読み取り用バッファ
     let mut header_buf = [0u8; 8192];
@@ -319,122 +322,113 @@ pub(super) async fn splice_transfer_response_ktls(
 
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
+            // B-246: Content-Length の食い違い・Transfer-Encoding との併記は本文の区切りが決まらないので 502
+            if parsed.framing_invalid {
+                warn!(
+                    "Backend response has conflicting Content-Length / Transfer-Encoding (splice)"
+                );
+                return (502, 0, false, true);
+            }
             status_code = parsed.status_code;
-            backend_wants_keep_alive = !parsed.is_connection_close;
+            let backend_wants_keep_alive = !parsed.is_connection_close;
 
             let header_len = parsed.header_len;
-            let body_start_len = accumulated.len().saturating_sub(header_len);
+            // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
+            let kind = parsed.body(is_head);
+            let start = response_body_start(kind, &accumulated[header_len..]);
 
-            // ヘッダー + 初期ボディをクライアントに送信（raw_write）
-            if let Err(e) = async_raw_write_all(client_tcp, &accumulated).await {
+            // ヘッダー + 初期ボディをクライアントに送信（raw_write）。本文の終端より後ろは送らない
+            let head_len = header_len + start.send;
+            if let Err(e) = async_raw_write_all(client_tcp, &accumulated[..head_len]).await {
                 warn!("Failed to send response header: {}", e);
                 return (status_code, total, false, true);
             }
-            total += accumulated.len() as u64;
+            total += head_len as u64;
 
-            // B-17: ボディが完結しなかった場合にクライアント接続をクローズするためのフラグ
-            let mut client_must_close = false;
+            let mut complete = start.done;
+            let extra = start.extra;
 
-            // ボディ転送
-            if parsed.is_chunked {
-                // Chunked 転送: 通常の方法で転送（終端検出が必要）
-                // レスポンス受信時は制限なし（バックエンドを信頼）
-                let mut chunked_decoder = ChunkedDecoder::new_unlimited();
-
-                // 初期ボディ部分をデコーダにフィード
-                if body_start_len > 0
-                    && chunked_decoder.feed(&accumulated[header_len..])
-                        == ChunkedFeedResult::Complete
-                {
-                    // 初期ボディで完了
-                    return (status_code, total, backend_wants_keep_alive, false);
-                }
-
-                // 残りの Chunked ボディを転送
-                loop {
-                    // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
-                    let n = match timeout(
-                        READ_TIMEOUT,
-                        async_raw_read(backend_stream, &mut header_buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(0)) => {
-                            // B-17: 終端チャンク前の EOF はクライアントを待たせないようクローズ
-                            backend_wants_keep_alive = false;
-                            client_must_close = true;
-                            break;
-                        }
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) | Err(_) => {
-                            backend_wants_keep_alive = false;
-                            client_must_close = true;
-                            break;
-                        }
-                    };
-
-                    let feed_result = chunked_decoder.feed(&header_buf[..n]);
-
-                    if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
-                        backend_wants_keep_alive = false;
-                        client_must_close = true;
-                        break;
-                    }
-                    total += n as u64;
-
-                    if feed_result == ChunkedFeedResult::Complete {
-                        break;
-                    }
-                }
-            } else if let Some(content_length) = parsed.content_length {
-                // Content-Length 転送: splice でゼロコピー
-                let remaining = content_length.saturating_sub(body_start_len);
-
-                if remaining > 0 {
-                    let transferred =
-                        splice_body_transfer(backend_stream, client_tcp, pipe, remaining).await;
-
-                    total += transferred;
-
-                    if transferred < remaining as u64 {
+            match kind {
+                ResponseBody::None => {}
+                ResponseBody::Length(content_length) => {
+                    // Content-Length 転送: splice でゼロコピー
+                    let remaining = content_length.saturating_sub(start.send);
+                    if remaining > 0 {
+                        let transferred =
+                            splice_body_transfer(backend_stream, client_tcp, pipe, remaining).await;
+                        total += transferred;
                         // B-17: CL 未達のままの終了はクライアントを待たせないようクローズ
-                        backend_wants_keep_alive = false;
-                        client_must_close = true;
+                        complete = transferred >= remaining as u64;
                     }
                 }
-            } else {
-                // Content-Length も Chunked もない場合: 接続クローズまで読み取り
-                // この場合は Keep-Alive 不可
-                backend_wants_keep_alive = false;
-
-                loop {
-                    // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
-                    let n = match timeout(
-                        READ_TIMEOUT,
-                        async_raw_read(backend_stream, &mut header_buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) | Err(_) => break,
-                    };
-
-                    if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
-                        break;
+                ResponseBody::Chunked => {
+                    // Chunked 転送: 通常の方法で転送（終端検出が必要）
+                    let mut chunked_decoder = start.into_decoder();
+                    while !complete {
+                        // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
+                        let n = match timeout(
+                            READ_TIMEOUT,
+                            async_raw_read(backend_stream, &mut header_buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            // 終端チャンク前の EOF・エラー・タイムアウトは途中で止まった応答
+                            _ => break,
+                        };
+                        let (feed_result, consumed) =
+                            chunked_decoder.feed_counted(&header_buf[..n]);
+                        if matches!(
+                            feed_result,
+                            ChunkedFeedResult::Invalid | ChunkedFeedResult::SizeLimitExceeded
+                        ) {
+                            break;
+                        }
+                        if async_raw_write_all(client_tcp, &header_buf[..consumed])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        total += consumed as u64;
+                        if feed_result == ChunkedFeedResult::Complete {
+                            complete = true;
+                            if consumed < n {
+                                // 終端の後ろにバイトがある上流接続は再利用しない
+                                return (status_code, total, false, false);
+                            }
+                        }
                     }
-                    total += n as u64;
                 }
-
-                // 接続クローズが終端のためクライアント側もクローズが必要
-                client_must_close = true;
+                ResponseBody::UntilClose => {
+                    // 接続クローズまで読み取り（Keep-Alive 不可）
+                    loop {
+                        // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
+                        let n = match timeout(
+                            READ_TIMEOUT,
+                            async_raw_read(backend_stream, &mut header_buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => break,
+                        };
+                        if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
+                            break;
+                        }
+                        total += n as u64;
+                    }
+                    // 接続クローズが終端のためクライアント側もクローズが必要
+                    return (status_code, total, false, true);
+                }
             }
 
+            // B-244: 本文を区切りどおりに読み切った接続だけを戻す
             return (
                 status_code,
                 total,
-                backend_wants_keep_alive,
-                client_must_close,
+                backend_wants_keep_alive && complete && !extra,
+                !complete,
             );
         }
 

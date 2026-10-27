@@ -4,6 +4,7 @@
 //! - HTTP 500 Error Server (ERROR_PORT env var, default 9006)
 //! - HTTP Chunked Streaming Server (CHUNKED_PORT env var, default 9007)
 //! - プロトコル違反サーバー (BAD_PORT env var, default 9009) — B-17 回帰テスト用
+//! - 応答の区切りの試験サーバー (FRAMING_PORT env var, default 9022) — B-244/B-246 回帰テスト用
 
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
@@ -158,6 +159,143 @@ async fn handle_bad_backend(
     }
     let _ = stream.flush().await;
     Ok(())
+}
+
+/// B-244: `/slow-chunk` の応答の途中で止めた接続に、続けて要求が届いたか（veil がその接続をプールへ戻した）。
+static FRAMING_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 応答の区切りの試験サーバー（キープアライブ。応答に接続の通し番号 `x-backend-conn-id` を付ける）。
+async fn run_framing_server(addr: SocketAddr) {
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind framing server on {}: {}", addr, e));
+    info!("Framing test server listening on {}", addr);
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let conn_id = next_echo_conn_id();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_framing(stream, conn_id).await {
+                        debug!("Framing handler error: {}", e);
+                    }
+                });
+            }
+            Err(e) => error!("Framing accept error: {}", e),
+        }
+    }
+}
+
+async fn serve_framing(
+    mut stream: TcpStream,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut stalled = false;
+    loop {
+        // 要求ヘッダー（本文の無い要求だけを使う）
+        let mut buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        if stalled {
+            // 途中で止めた応答の続きを送った後の接続に、別の要求が書かれた
+            FRAMING_POISONED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let path = buf.split(|&b| b == b' ').nth(1).unwrap_or(b"/").to_vec();
+        let contains = |needle: &[u8]| path.windows(needle.len()).any(|w| w == needle);
+        let id = conn_id.to_string();
+        let head = |extra: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nx-backend-conn-id: {}\r\n{}\r\n",
+                id, extra
+            )
+        };
+        if contains(b"slow-chunk") {
+            // 最初のチャンクの後、veil の READ_TIMEOUT（30 秒）より長く止まってから続きを送る
+            stream
+                .write_all(
+                    format!("{}5\r\nfirst\r\n", head("Transfer-Encoding: chunked\r\n")).as_bytes(),
+                )
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            stream.write_all(b"4\r\ntail\r\n0\r\n\r\n").await?;
+            stalled = true;
+        } else if contains(b"poisoned") {
+            let v = if FRAMING_POISONED.load(std::sync::atomic::Ordering::SeqCst) {
+                "1"
+            } else {
+                "0"
+            };
+            stream
+                .write_all(format!("{}{}", head("Content-Length: 1\r\n"), v).as_bytes())
+                .await?;
+        } else if contains(b"te-cl") {
+            // Transfer-Encoding と Content-Length の併記（応答の分割の試み）
+            stream
+                .write_all(
+                    format!(
+                        "{}5\r\nhello\r\n0\r\n\r\n",
+                        head("Transfer-Encoding: chunked\r\nContent-Length: 5\r\n")
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        } else if contains(b"dup-cl") {
+            // 値の違う Content-Length が 2 つ
+            stream
+                .write_all(
+                    format!(
+                        "{}hello!",
+                        head("Content-Length: 5\r\nContent-Length: 6\r\n")
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        } else if contains(b"head-cl") {
+            // HEAD への応答（本文なし。Content-Length は GET なら送る長さ）
+            stream
+                .write_all(head("Content-Length: 5\r\n").as_bytes())
+                .await?;
+        } else if contains(b"not-modified") {
+            // 304 に元の Content-Length を付ける上流（nginx 等）
+            stream
+                .write_all(
+                    format!("HTTP/1.1 304 Not Modified\r\nx-backend-conn-id: {}\r\nContent-Length: 5\r\n\r\n", id)
+                        .as_bytes(),
+                )
+                .await?;
+        } else if contains(b"chunk-extra") {
+            // 終端チャンクの後ろに余計なバイト（クライアントへ送らず、接続も再利用しない）
+            stream
+                .write_all(
+                    format!(
+                        "{}5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged",
+                        head("Transfer-Encoding: chunked\r\n")
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        } else {
+            stream
+                .write_all(
+                    format!(
+                        "{}{}",
+                        head(&format!("Content-Length: {}\r\n", id.len())),
+                        id
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        }
+        stream.flush().await?;
+    }
 }
 
 /// HTTP 500エラーサーバー: 常にHTTP 500を返す
@@ -576,6 +714,11 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(9021);
     let echo3_addr: SocketAddr = format!("127.0.0.1:{}", echo3_port).parse().unwrap();
+    let framing_port: u16 = std::env::var("FRAMING_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9022);
+    let framing_addr: SocketAddr = format!("127.0.0.1:{}", framing_port).parse().unwrap();
 
     info!(
         "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, udp-echo={}, bad={}",
@@ -593,5 +736,6 @@ async fn main() {
         run_udp_echo_server(udp_echo_addr),
         run_bad_backend_server(bad_addr),
         run_bad_backend_server(bad_b93_addr),
+        run_framing_server(framing_addr),
     );
 }

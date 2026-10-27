@@ -2370,6 +2370,8 @@ pub(super) async fn h2_proxy_http(
     // F-177: プールの接続が応答の前に切れていたら、冪等な要求に限り新しい接続で 1 回だけ再送する。
     // 要求バッファは write_all が返すものを使い回す（コピーしない）。
     let idempotent = request_line_is_idempotent(&request);
+    // B-245: HEAD への応答は本文を持たない
+    let is_head = request_is_head(&request);
     let mut request = request;
     let mut attempt = 0u32;
     loop {
@@ -2421,6 +2423,7 @@ pub(super) async fn h2_proxy_http(
             resp_tx,
             notify,
             retry,
+            is_head,
         )
         .await;
         if status == 0 && retry {
@@ -2461,6 +2464,8 @@ pub(super) async fn h2_proxy_https(
     let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_profile);
     // F-177: プールの接続が応答の前に切れていたら、冪等な要求に限り新しい接続で 1 回だけ再送する。
     let idempotent = request_line_is_idempotent(&request);
+    // B-245: HEAD への応答は本文を持たない
+    let is_head = request_is_head(&request);
     let mut request = request;
     let mut attempt = 0u32;
     loop {
@@ -2533,6 +2538,7 @@ pub(super) async fn h2_proxy_https(
             resp_tx,
             notify,
             retry,
+            is_head,
         )
         .await;
         if status == 0 && retry {
@@ -2781,6 +2787,7 @@ pub(super) async fn h2_relay_backend_response<B>(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     retry_on_empty: bool,
+    is_head: bool,
 ) -> (u16, u64, bool)
 where
     B: crate::runtime::io::AsyncReadRent + Unpin,
@@ -2932,6 +2939,15 @@ where
         }
     };
 
+    // B-246: Content-Length の食い違い・Transfer-Encoding との併記は本文の区切りが決まらないので 502
+    if parsed.framing_invalid {
+        warn!("[HTTP/2] Backend response has conflicting Content-Length / Transfer-Encoding");
+        let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+        return (s, sz, false);
+    }
+    // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
+    let kind = parsed.body(is_head);
+
     {
         let status = parsed.status_code;
         let body_start = parsed.header_len;
@@ -2952,16 +2968,27 @@ where
             .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
             .map(|h| h.value);
 
-        let stream_compress_hint = compression.should_compress(
-            client_encoding,
-            content_type,
-            parsed.content_length,
-            existing_encoding,
-        );
+        let stream_compress_hint = if kind == ResponseBody::None {
+            None
+        } else {
+            compression.should_compress(
+                client_encoding,
+                content_type,
+                parsed.content_length,
+                existing_encoding,
+            )
+        };
 
-        // 非圧縮 + CL 既知 + 非 chunked → 逐次ストリーミング。
-        if stream_compress_hint.is_none() && !parsed.is_chunked {
-            if let Some(content_len) = parsed.content_length {
+        // 非圧縮 + CL 既知（本文の無い応答は 0）→ 逐次ストリーミング。
+        if stream_compress_hint.is_none() {
+            let content_len = match kind {
+                ResponseBody::None => Some(0),
+                ResponseBody::Length(cl) => Some(cl),
+                _ => None,
+            };
+            if let Some(content_len) = content_len {
+                // 終端の後ろにバイトがある上流接続は再利用しない
+                let extra = body.len() > content_len;
                 let mut headers = h2_base_headers(true);
                 for header in resp.headers.iter() {
                     if header.name.is_empty() {
@@ -2995,13 +3022,14 @@ where
                     content_len,
                 )
                 .await;
-                let reusable = ok && sent == content_len as u64 && !parsed.is_connection_close;
+                let reusable =
+                    ok && sent == content_len as u64 && !extra && !parsed.is_connection_close;
                 return (status, sent, reusable);
             }
         }
 
         // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
-        if stream_compress_hint.is_none() && parsed.is_chunked {
+        if stream_compress_hint.is_none() && kind == ResponseBody::Chunked {
             let mut headers = h2_base_headers(true);
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
@@ -3031,62 +3059,15 @@ where
         }
 
         // 圧縮あり / 長さ不明 → 全読み込み後に（必要なら圧縮して）送信。
-        let mut backend_reusable = false;
-        let final_body = if parsed.is_chunked {
-            let mut decoder = ChunkedDecoder::new_unlimited();
-            let mut full_body = body.to_vec();
-            decoder.feed(body);
-            while !decoder.is_complete() {
-                let buf = buf_get();
-                let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let n = match res {
-                    Ok(0) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(_) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                };
-                returned_buf.set_valid_len(n);
-                full_body.extend_from_slice(returned_buf.as_valid_slice());
-                decoder.feed(returned_buf.as_valid_slice());
-                buf_put(returned_buf);
-            }
-            decode_chunked_body(&full_body)
-        } else if let Some(content_len) = parsed.content_length {
-            let mut full_body = body.to_vec();
-            while full_body.len() < content_len {
-                let buf = buf_get();
-                let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let n = match res {
-                    Ok(0) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(_) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                };
-                returned_buf.set_valid_len(n);
-                full_body.extend_from_slice(returned_buf.as_valid_slice());
-                buf_put(returned_buf);
-            }
-            backend_reusable = full_body.len() == content_len;
-            full_body
-        } else {
-            body.to_vec()
+        // B-244: 区切りどおりに終わらなかった本文は完結した応答に見せず 502（HEADERS は未送出）。
+        // 以前は長さ不明の応答で最初の読み込みしか送らず、途中で止まった本文も送っていた
+        let Some((final_body, extra)) = collect_response_body(backend, kind, body).await else {
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, false);
         };
+        let backend_reusable = !extra
+            && !parsed.is_connection_close
+            && matches!(kind, ResponseBody::Length(_) | ResponseBody::Chunked);
 
         let should_compress = compression.should_compress(
             client_encoding,
@@ -4031,6 +4012,8 @@ pub(super) async fn h2_run_streaming_upload<B>(
 where
     B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
+    // B-245: HEAD への応答は本文を持たない（書く前に判定する）
+    let is_head = request_is_head(&request);
     // ヘッダ送出。
     let (write_res, returned_request) = backend.write_all(request).await;
     request_buf_put(returned_request);
@@ -4069,6 +4052,7 @@ where
         resp_tx,
         notify,
         false,
+        is_head,
     )
     .await;
     (status, sent, req_size)

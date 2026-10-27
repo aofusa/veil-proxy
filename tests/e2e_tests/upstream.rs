@@ -995,3 +995,218 @@ pub(super) async fn test_f205_keepalive_direct_read_and_fallback() {
     s.write_all(req).unwrap();
     assert!(f205_read_response(&mut s, &mut carry).contains(" 200"));
 }
+
+// ====================
+// B-244〜B-246: 上流の HTTP/1.1 応答の区切り（tests/test_backends の framing サーバー）
+// ====================
+
+/// B-244: 上流が chunked の応答を `READ_TIMEOUT`（30 秒）より長く止めたら、クライアントの接続を閉じ、
+/// 応答の途中の上流接続をプールへ戻さない。以前は戻していたので、同じワーカーの次の要求がその接続に
+/// 書かれ、前の応答の続きを自分の応答として読んでいた（他の利用者の要求が 504 になる・応答の取り違え）。
+///
+/// HTTP/1.1・HTTP/2 で受けた要求と `buffering = full` のルートを同時に止め、止まっている間に新しい
+/// クライアント接続から何本も要求を出す。上流は止めた接続に別の要求が届いたかを `/framing/poisoned` で返す。
+#[tokio::test]
+#[ntest::timeout(90000)]
+pub(super) async fn test_b244_stalled_chunked_upstream_is_not_pooled() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let started = std::time::Instant::now();
+    // 上流は 35 秒後に続きを送る。それより前に veil が諦めて閉じること
+    let limit = Duration::from_secs(34);
+
+    let h1 = tokio::spawn(async move {
+        let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+        tokio::time::timeout(limit, client.get("/framing/b244-h1/slow-chunk")).await
+    });
+    let h2 = tokio::spawn(async move {
+        let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("h2 client");
+        tokio::time::timeout(limit, client.get("/framing/b244-h2/slow-chunk")).await
+    });
+    let full = tokio::spawn(async move {
+        let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+        tokio::time::timeout(limit, client.get("/framing-full/b244-full/slow-chunk")).await
+    });
+
+    let h1 = h1.await.expect("join");
+    let h1 = h1.expect("HTTP/1.1 client must not wait for the stalled body past READ_TIMEOUT");
+    // hyper は途中で閉じられた本文をエラーにする（終端チャンクを受け取っていない）
+    assert!(
+        h1.is_err(),
+        "a stalled chunked body must not look complete over HTTP/1.1: {:?}",
+        h1.map(|(s, b)| (s, String::from_utf8_lossy(&b).into_owned()))
+    );
+    let h2 = h2.await.expect("join");
+    let h2 = h2.expect("HTTP/2 client must not wait for the stalled body past READ_TIMEOUT");
+    assert!(
+        h2.is_err(),
+        "a stalled chunked body must be reset over HTTP/2: {:?}",
+        h2.map(|(s, b)| (s, String::from_utf8_lossy(&b).into_owned()))
+    );
+    let full = full.await.expect("join");
+    let full = full.expect("buffered route must not wait for the stalled body past READ_TIMEOUT");
+    match full {
+        Ok((status, _)) => assert_eq!(status, 502, "an incomplete buffered body must be 502"),
+        Err(e) => panic!("buffered route must answer 502: {}", e),
+    }
+
+    // 止まっている接続が戻されていれば、ここでどれかの要求がその接続に書かれる
+    for i in 0..16 {
+        let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+        let path = format!("/framing/b244-after-{}/id", i);
+        let (status, _) = tokio::time::timeout(Duration::from_secs(8), client.get(&path))
+            .await
+            .unwrap_or_else(|_| panic!("{} must not hang", path))
+            .unwrap_or_else(|e| panic!("{} failed: {}", path, e));
+        assert_eq!(
+            status, 200,
+            "{} must be served on a fresh upstream connection",
+            path
+        );
+    }
+
+    // 上流が続きを送り終え、戻された接続に書かれた要求を読む時間を待つ
+    let wait_until = Duration::from_secs(38);
+    if let Some(rest) = wait_until.checked_sub(started.elapsed()) {
+        tokio::time::sleep(rest).await;
+    }
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    let (status, body) = client
+        .get("/framing/b244-check/poisoned")
+        .await
+        .expect("poisoned probe");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body, b"0",
+        "the upstream connection of a stalled response must not be reused"
+    );
+}
+
+/// B-245: HEAD・304 への応答は Content-Length があっても本文を読まない（キープアライブの上流は閉じないので、
+/// 読みに行くと `READ_TIMEOUT` まで止まり、クライアント接続も閉じていた）。HTTP/1.1・HTTP/2 で受けた要求
+/// （HTTP/3 は B-104 の試験）。同じクライアント接続の次の要求もすぐ通ること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_b245_head_304_on_keepalive_upstream_h1_h2() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    for (method, case, want) in [("HEAD", "head-cl", 200u16), ("GET", "not-modified", 304)] {
+        let path = format!("/framing/b245/{}", case);
+        let (status, headers, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_request_with_response_headers(
+                http::Method::from_bytes(method.as_bytes()).unwrap(),
+                &path,
+                &[],
+                None,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("HTTP/1.1 {} {} must not wait for a body", method, path))
+        .unwrap_or_else(|e| panic!("HTTP/1.1 {} {} failed: {}", method, path, e));
+        assert_eq!(status, want, "HTTP/1.1 {} {}", method, path);
+        assert!(body.is_empty());
+        if method == "HEAD" {
+            assert!(
+                headers
+                    .iter()
+                    .any(|(k, v)| k == "content-length" && v == "5"),
+                "HEAD keeps the upstream Content-Length: {:?}",
+                headers
+            );
+        }
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            h2.send_request(method, &path, &[], None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("HTTP/2 {} {} must not wait for a body", method, path))
+        .unwrap_or_else(|e| panic!("HTTP/2 {} {} failed: {}", method, path, e));
+        assert_eq!(status, want, "HTTP/2 {} {}", method, path);
+        assert!(body.is_empty());
+    }
+    // 同じクライアント接続の次の要求
+    let (status, _) = tokio::time::timeout(Duration::from_secs(5), client.get("/framing/b245/id"))
+        .await
+        .expect("request after HEAD must not hang")
+        .expect("request after HEAD");
+    assert_eq!(status, 200);
+}
+
+/// B-246: Transfer-Encoding と Content-Length の併記・値の違う Content-Length は本文の区切りが決まらない
+/// （応答の分割に使える）ので 502。終端チャンクの後ろのバイトはクライアントへ送らない。
+#[tokio::test]
+#[ntest::timeout(60000)]
+pub(super) async fn test_b246_conflicting_upstream_framing_is_rejected() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    for prefix in ["/framing", "/framing-full"] {
+        for case in ["te-cl", "dup-cl"] {
+            let path = format!("{}/b246/{}", prefix, case);
+            let (status, _) = tokio::time::timeout(Duration::from_secs(8), client.get(&path))
+                .await
+                .unwrap_or_else(|_| panic!("HTTP/1.1 {} must not hang", path))
+                .unwrap_or_else(|e| panic!("HTTP/1.1 {} failed: {}", path, e));
+            assert_eq!(status, 502, "HTTP/1.1 {}", path);
+            let (status, _) = tokio::time::timeout(Duration::from_secs(8), h2.get(&path))
+                .await
+                .unwrap_or_else(|_| panic!("HTTP/2 {} must not hang", path))
+                .unwrap_or_else(|e| panic!("HTTP/2 {} failed: {}", path, e));
+            assert_eq!(status, 502, "HTTP/2 {}", path);
+        }
+        let path = format!("{}/b246/chunk-extra", prefix);
+        let (status, body) = tokio::time::timeout(Duration::from_secs(8), client.get(&path))
+            .await
+            .unwrap_or_else(|_| panic!("HTTP/1.1 {} must not hang", path))
+            .unwrap_or_else(|e| panic!("HTTP/1.1 {} failed: {}", path, e));
+        assert_eq!(
+            (status, body.as_slice()),
+            (200, &b"hello"[..]),
+            "HTTP/1.1 {}",
+            path
+        );
+        let (status, body) = tokio::time::timeout(Duration::from_secs(8), h2.get(&path))
+            .await
+            .unwrap_or_else(|_| panic!("HTTP/2 {} must not hang", path))
+            .unwrap_or_else(|e| panic!("HTTP/2 {} failed: {}", path, e));
+        assert_eq!(
+            (status, body.as_slice()),
+            (200, &b"hello"[..]),
+            "HTTP/2 {}",
+            path
+        );
+    }
+
+    #[cfg(feature = "http3")]
+    {
+        use common::http3_client::send_http3_request_full;
+        let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+            .parse()
+            .expect("Invalid server address");
+        let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+            .await
+            .expect("HTTP/3 connect");
+        for path in ["/framing/b246-h3/te-cl", "/framing/b246-h3/dup-cl"] {
+            let resp = send_http3_request_full(&mut send_request, "GET", path, &[], None)
+                .await
+                .unwrap_or_else(|e| panic!("HTTP/3 {} failed: {}", path, e));
+            assert_eq!(resp.status, 502, "HTTP/3 {}", path);
+        }
+    }
+}

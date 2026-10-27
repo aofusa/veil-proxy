@@ -1,6 +1,6 @@
 # B-246: 上流の応答のフレーミングが RFC 9112 §6.3 と逆（`Content-Length` が `Transfer-Encoding` に優先、複数の `Content-Length` を拒否せず、両ヘッダをそのまま転送）
 
-**状態: 未修正（2026-10-27 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -25,6 +25,11 @@
 - `parse_http_response`: TE が chunked なら CL を無視し、転送時に `Content-Length` を落とす（または 502）。CL が複数で値が異なれば 502。
   HTTP/1.1 と HTTP/3 で 1 つの実装に寄せる。
 - 単体テスト: CL+TE → chunked、CL 複数（同値）→ 採用、CL 複数（不一致）→ エラー、`Transfer-Encoding: gzip, chunked` → chunked。
+
+## 修正（v0.10.0）
+
+- `http_utils::FramingHeaders` で Content-Length を全部見る（数字以外・`+5` のような符号付き・値の違う複数は誤り）。Transfer-Encoding があれば Content-Length を使わず（RFC 9112 §6.3）、最後が chunked でなければ接続の終わりで区切る。Transfer-Encoding と Content-Length の併記は応答の分割の試みであり得るので誤り。誤りは 502（HTTP/1.1 の全経路・HTTP/2 で受けた要求・HTTP/3 の上流 `http3_stream::parse_response_headers` が同じ判定を共有）。
+- 試験: 単体 `response_framing_te_overrides_and_conflicts_are_invalid`・`parse_response_headers_framing_conflicts`、E2E `test_b246_conflicting_upstream_framing_is_rejected`（HTTP/1.1・HTTP/2・HTTP/3、`buffering = full` も。終端チャンクの後ろに偽の応答を付けた上流で本文が `hello` だけになること）。修正前のコードで失敗することを確認。
 
 ## 関連
 

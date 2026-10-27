@@ -58,6 +58,9 @@ where
         + crate::runtime::io::AsyncReadRent
         + crate::runtime::io::AsyncWriteRentExt,
 {
+    // B-245: HEAD への応答は本文を持たない（書く前に判定する）
+    let is_head = request_is_head(&request);
+
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
@@ -112,7 +115,8 @@ where
     }
 
     // 4. レスポンスを受信してバッファリング
-    let buffered = receive_and_buffer_response(backend_stream, buffering_config, cache_ctx).await;
+    let buffered =
+        receive_and_buffer_response(backend_stream, buffering_config, cache_ctx, is_head).await;
 
     match buffered {
         Some((status_code, mut headers_data, body_result, backend_wants_keep_alive)) => {
@@ -271,7 +275,8 @@ where
                     }
                     BufferedBodyResult::LimitExceeded => {
                         // すでにヘッダー送信済みのため、507を返すことはできないので接続を閉じる
-                        return Some((status_code, total, true, true));
+                        // （上流の本文は読み残しがあるので上流接続も戻さない。B-244）
+                        return Some((status_code, total, false, true));
                     }
                 }
             }
@@ -289,6 +294,7 @@ pub(super) async fn receive_and_buffer_response<R>(
     backend_stream: &mut R,
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
+    is_head: bool,
 ) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool)>
 where
     R: AsyncReadRent + Unpin,
@@ -326,8 +332,12 @@ where
 
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
+            // B-246: Content-Length の食い違い・Transfer-Encoding との併記は本文の区切りが決まらない（502）
+            if parsed.framing_invalid {
+                warn!("Backend response has conflicting Content-Length / Transfer-Encoding");
+                return None;
+            }
             let status_code = parsed.status_code;
-            let backend_wants_keep_alive = !parsed.is_connection_close;
 
             let header_len = parsed.header_len;
             let body_start = accumulated[header_len..].to_vec();
@@ -348,15 +358,17 @@ where
             }
 
             // ボディをバッファリング
-            let body_result = buffer_response_body_with_spillover(
+            // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
+            let (body_result, reusable) = buffer_response_body_with_spillover(
                 backend_stream,
-                parsed.content_length,
-                parsed.is_chunked,
+                parsed.body(is_head),
                 body_start,
                 buffering_config,
                 cache_ctx,
             )
             .await;
+            // B-244: 本文を区切りどおりに読み切った接続だけを戻す
+            let backend_wants_keep_alive = !parsed.is_connection_close && reusable;
 
             return Some((
                 status_code,
@@ -409,406 +421,144 @@ pub(super) async fn send_disk_buffer_to_client(
 }
 
 /// レスポンスボディをバッファリング（ディスクスピルオーバー対応）
+///
+/// 本文を区切り（`kind`）どおりに読み切ったときだけ `Memory`・`Disk` を返し、キャッシュに保存する。
+/// 途中で止まった・区切りが不正な本文は `Failed`（クライアントへは未送信なので 502 にする）、
+/// 上限を超えた本文は `LimitExceeded`（以前はディスク無しのとき切り詰めた本文を元の Content-Length で送っていた）。
+/// 2 つ目の戻り値は上流接続を再利用してよいか（終端の後ろにバイトが無く、接続の終わりで区切る応答でない）。
 pub(super) async fn buffer_response_body_with_spillover<R>(
     backend_stream: &mut R,
-    content_length: Option<usize>,
-    is_chunked: bool,
+    kind: ResponseBody,
     initial_body: Vec<u8>,
     buffering_config: &buffering::BufferingConfig,
-    mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> BufferedBodyResult
+    cache_ctx: Option<&mut CacheSaveContext>,
+) -> (BufferedBodyResult, bool)
 where
     R: AsyncReadRent + Unpin,
 {
     let mut body = initial_body;
-
-    debug!("buffer_response_body_with_spillover: content_length={:?}, is_chunked={}, initial_body_len={}, max_mem={}, max_disk={}", 
-          content_length, is_chunked, body.len(), buffering_config.max_memory_buffer, buffering_config.max_disk_buffer);
-
-    // キャッシュコンテキストに初期ボディをキャプチャ
-    if let Some(ref mut ctx) = cache_ctx {
-        ctx.append_body(&body);
-    }
-
-    if let Some(cl) = content_length {
-        // Content-Length 転送
-        let cl_usize = cl;
-        let remaining = cl.saturating_sub(body.len());
-
-        // バッファサイズ制限チェック (メモリ)
-        if cl_usize > buffering_config.max_memory_buffer {
-            // ディスクスピルオーバー
-            if let Some(ref disk_path) = buffering_config.disk_buffer_path {
-                // max_disk_buffer 制限チェック
-                if cl > buffering_config.max_disk_buffer {
-                    ftlog::warn!(
-                        "Response size {} exceeds max_disk_buffer {}, aborting buffer",
-                        cl,
-                        buffering_config.max_disk_buffer
-                    );
-                    return BufferedBodyResult::LimitExceeded;
-                }
-
-                debug!(
-                    "Response size {} exceeds memory limit {}, spilling to disk (max_disk={})",
-                    cl, buffering_config.max_memory_buffer, buffering_config.max_disk_buffer
-                );
-
-                // まず残りのデータをメモリに読み込み
-                if remaining > 0 {
-                    let additional =
-                        buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
-                    body.extend(additional);
-                }
-
-                // ディスクに書き込み
-                let key = format!(
-                    "buffer_{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                );
-
-                match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
-                    Ok(path) => {
-                        let size = cl as u64;
-                        return BufferedBodyResult::Disk { path, size };
-                    }
-                    Err(e) => {
-                        error!("Failed to write disk buffer: {}", e);
-                        return BufferedBodyResult::Failed;
-                    }
-                }
-            } else {
-                // ディスクなし: 可能な範囲でメモリにバッファリング
-                if remaining > 0 {
-                    let max_additional = buffering_config
-                        .max_memory_buffer
-                        .saturating_sub(body.len());
-                    if max_additional > 0 {
-                        let additional =
-                            buffer_exact_bytes(backend_stream, max_additional, &mut cache_ctx)
-                                .await;
-                        body.extend(additional);
-                    }
-                }
-                warn!("Response truncated: memory limit exceeded and no disk buffer configured");
-            }
-        } else {
-            // メモリ制限内
-            if remaining > 0 {
-                let additional =
-                    buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
-                body.extend(additional);
-            }
-        }
-    } else if is_chunked {
-        // Chunked 転送
-        let mut decoder = ChunkedDecoder::new_unlimited();
-        decoder.feed(&body);
-
-        if decoder.is_complete() {
-            if let Some(ctx) = cache_ctx {
-                ctx.save_to_cache();
-            }
-            return BufferedBodyResult::Memory(body);
-        }
-
-        loop {
-            // バッファサイズ制限チェック
-            if body.len() >= buffering_config.max_memory_buffer {
-                // ディスクスピルオーバー（Chunked）
-                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
-                    debug!("Chunked response exceeds memory limit, spilling to disk");
-
-                    // 残りを読み込み続ける
-                    let mut overflow = Vec::new();
-                    let max_disk = buffering_config.max_disk_buffer;
-                    let mut total_size = body.len();
-                    let mut size_exceeded = false;
-
-                    loop {
-                        // max_disk_buffer 制限チェック
-                        if total_size as u64 > max_disk as u64 {
-                            ftlog::warn!(
-                                "Chunked response exceeds max_disk_buffer {}, aborting buffer",
-                                max_disk
-                            );
-                            size_exceeded = true;
-                            break;
-                        }
-
-                        let read_buf = buf_get();
-                        let read_result =
-                            timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-                        let (res, mut returned_buf) = match read_result {
-                            Ok(result) => result,
-                            Err(_) => break,
-                        };
-
-                        let n = match res {
-                            Ok(0) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                            Ok(n) => n,
-                            Err(_) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                        };
-
-                        returned_buf.set_valid_len(n);
-                        let chunk = returned_buf.as_valid_slice();
-                        let feed_result = decoder.feed(chunk);
-
-                        if let Some(ref mut ctx) = cache_ctx {
-                            ctx.append_body(chunk);
-                        }
-
-                        overflow.extend_from_slice(chunk);
-                        total_size += n;
-                        buf_put(returned_buf);
-
-                        if feed_result == ChunkedFeedResult::Complete {
-                            break;
-                        }
-                    }
-
-                    if size_exceeded {
-                        return BufferedBodyResult::LimitExceeded;
-                    }
-
-                    // 全体をディスクに書き込み
-                    body.extend(overflow);
-                    let key = format!(
-                        "buffer_chunked_{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                    );
-
-                    let size = body.len() as u64;
-                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body)
-                        .await
-                    {
-                        Ok(path) => {
-                            if let Some(ctx) = cache_ctx {
-                                ctx.save_to_cache();
-                            }
-                            return BufferedBodyResult::Disk { path, size };
-                        }
-                        Err(e) => {
-                            error!("Failed to write chunked disk buffer: {}", e);
-                            return BufferedBodyResult::Failed;
-                        }
-                    }
-                }
-                break;
-            }
-
-            let read_buf = buf_get();
-            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-            let (res, mut returned_buf) = match read_result {
-                Ok(result) => result,
-                Err(_) => break,
-            };
-
-            let n = match res {
-                Ok(0) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-            };
-
-            returned_buf.set_valid_len(n);
-            let chunk = returned_buf.as_valid_slice();
-            let feed_result = decoder.feed(chunk);
-
-            if let Some(ref mut ctx) = cache_ctx {
-                ctx.append_body(chunk);
-            }
-
-            body.extend_from_slice(chunk);
-            buf_put(returned_buf);
-
-            if feed_result == ChunkedFeedResult::Complete {
-                break;
-            }
-        }
+    let start = response_body_start(kind, &body);
+    body.truncate(start.send);
+    let mut extra = start.extra;
+    let mut complete = start.done;
+    let mut decoder = start.into_decoder();
+    let mut remaining = match kind {
+        ResponseBody::Length(cl) => cl.saturating_sub(body.len()),
+        _ => 0,
+    };
+    // ディスクがあればディスクの上限、無ければメモリの上限まで溜められる
+    let limit = if buffering_config.disk_buffer_path.is_some() {
+        buffering_config.max_disk_buffer
     } else {
-        // Content-Length も Chunked もない場合: EOF まで読み取り（ブラインドバッファリング）
-        loop {
-            // メモリサイズ制限チェック
-            if body.len() >= buffering_config.max_memory_buffer {
-                // ディスクスピルオーバー（ブラインド）
-                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
-                    let mut overflow = Vec::new();
-                    let max_disk = buffering_config.max_disk_buffer;
-                    let mut total_size = body.len();
-                    let mut size_exceeded = false;
+        buffering_config.max_memory_buffer
+    };
 
-                    loop {
-                        if total_size as u64 > max_disk as u64 {
-                            ftlog::warn!(
-                                "Blind response exceeds max_disk_buffer {}, aborting buffer",
-                                max_disk
-                            );
-                            size_exceeded = true;
-                            break;
-                        }
+    debug!(
+        "buffer_response_body_with_spillover: kind={:?}, initial_body_len={}, max_mem={}, max_disk={}",
+        kind,
+        body.len(),
+        buffering_config.max_memory_buffer,
+        buffering_config.max_disk_buffer
+    );
 
-                        let read_buf = buf_get();
-                        let read_result =
-                            timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-                        let (res, mut returned_buf) = match read_result {
-                            Ok(result) => result,
-                            Err(_) => break,
-                        };
-
-                        let n = match res {
-                            Ok(0) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                            Ok(n) => n,
-                            Err(_) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                        };
-
-                        returned_buf.set_valid_len(n);
-                        let chunk = returned_buf.as_valid_slice();
-                        if let Some(ref mut ctx) = cache_ctx {
-                            ctx.append_body(chunk);
-                        }
-                        overflow.extend_from_slice(chunk);
-                        total_size += n;
-                        buf_put(returned_buf);
-                    }
-
-                    if size_exceeded {
-                        return BufferedBodyResult::LimitExceeded;
-                    }
-
-                    body.extend(overflow);
-                    let key = format!(
-                        "buffer_blind_{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                    );
-                    let size = body.len() as u64;
-                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body)
-                        .await
-                    {
-                        Ok(path) => {
-                            if let Some(ctx) = cache_ctx {
-                                ctx.save_to_cache();
-                            }
-                            return BufferedBodyResult::Disk { path, size };
-                        }
-                        Err(e) => {
-                            error!("Failed to write blind disk buffer: {}", e);
-                            return BufferedBodyResult::Failed;
-                        }
-                    }
-                }
-                break;
-            }
-
-            let read_buf = buf_get();
-            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-            let (res, mut returned_buf) = match read_result {
-                Ok(result) => result,
-                Err(_) => break,
-            };
-
-            let n = match res {
-                Ok(0) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-            };
-
-            returned_buf.set_valid_len(n);
-            let chunk = returned_buf.as_valid_slice();
-            if let Some(ref mut ctx) = cache_ctx {
-                ctx.append_body(chunk);
-            }
-            body.extend_from_slice(chunk);
-            buf_put(returned_buf);
+    if let ResponseBody::Length(cl) = kind {
+        if cl > limit {
+            ftlog::warn!(
+                "Response size {} exceeds buffer limit {}, aborting buffer",
+                cl,
+                limit
+            );
+            return (BufferedBodyResult::LimitExceeded, false);
         }
     }
 
-    // キャッシュに保存
+    while !complete {
+        let read_buf = buf_get();
+        let (res, mut returned_buf) =
+            match timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await {
+                Ok(result) => result,
+                // B-244: 上流が止まった本文は途中（以前は読めた分を完全な本文として送り、キャッシュしていた）
+                Err(_) => return (BufferedBodyResult::Failed, false),
+            };
+        let n = match res {
+            Ok(n) if n > 0 => n,
+            _ => {
+                buf_put(returned_buf);
+                // 接続の終わりで区切る応答だけは EOF が終端
+                if matches!(kind, ResponseBody::UntilClose) {
+                    break;
+                }
+                return (BufferedBodyResult::Failed, false);
+            }
+        };
+        returned_buf.set_valid_len(n);
+        let chunk = returned_buf.as_valid_slice();
+        let take = match kind {
+            ResponseBody::Length(_) => {
+                let take = n.min(remaining);
+                remaining -= take;
+                complete = remaining == 0;
+                take
+            }
+            ResponseBody::Chunked => {
+                let (fr, consumed) = decoder.feed_counted(chunk);
+                match fr {
+                    ChunkedFeedResult::Complete => complete = true,
+                    ChunkedFeedResult::Continue => {}
+                    ChunkedFeedResult::Invalid | ChunkedFeedResult::SizeLimitExceeded => {
+                        buf_put(returned_buf);
+                        return (BufferedBodyResult::Failed, false);
+                    }
+                }
+                consumed
+            }
+            ResponseBody::UntilClose => n,
+            ResponseBody::None => 0,
+        };
+        extra |= take < n;
+        if body.len() + take > limit {
+            buf_put(returned_buf);
+            ftlog::warn!("Response exceeds buffer limit {}, aborting buffer", limit);
+            return (BufferedBodyResult::LimitExceeded, false);
+        }
+        body.extend_from_slice(&chunk[..take]);
+        buf_put(returned_buf);
+    }
+
+    let reusable = !extra && !matches!(kind, ResponseBody::UntilClose);
+
+    // キャッシュに保存（読み切った本文だけ）
     if let Some(ctx) = cache_ctx {
+        ctx.append_body(&body);
         ctx.save_to_cache();
     }
 
-    BufferedBodyResult::Memory(body)
-}
-
-/// バックエンドから正確なバイト数を読み取りバッファに格納
-pub(super) async fn buffer_exact_bytes<R>(
-    backend_stream: &mut R,
-    mut remaining: usize,
-    cache_ctx: &mut Option<&mut CacheSaveContext>,
-) -> Vec<u8>
-where
-    R: AsyncReadRent + Unpin,
-{
-    let mut result = Vec::with_capacity(remaining);
-
-    while remaining > 0 {
-        let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n.min(remaining),
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-
-        returned_buf.set_valid_len(n);
-        let chunk = &returned_buf.as_valid_slice()[..n];
-
-        // キャッシュコンテキストにキャプチャ
-        if let Some(ref mut ctx) = cache_ctx {
-            ctx.append_body(chunk);
+    if body.len() > buffering_config.max_memory_buffer {
+        if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+            debug!(
+                "Response size {} exceeds memory limit {}, spilling to disk",
+                body.len(),
+                buffering_config.max_memory_buffer
+            );
+            let key = format!(
+                "buffer_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let size = body.len() as u64;
+            return match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body)
+                .await
+            {
+                Ok(path) => (BufferedBodyResult::Disk { path, size }, reusable),
+                Err(e) => {
+                    error!("Failed to write disk buffer: {}", e);
+                    (BufferedBodyResult::Failed, false)
+                }
+            };
         }
-
-        result.extend_from_slice(chunk);
-        buf_put(returned_buf);
-        remaining = remaining.saturating_sub(n);
     }
 
-    result
+    (BufferedBodyResult::Memory(body), reusable)
 }

@@ -1288,6 +1288,10 @@ async fn stream_response(
 
     let status = parse_status_code(&head_buf[..header_end]).unwrap_or(502);
     let mut parsed = parse_response_headers(&head_buf[..header_end]);
+    if parsed.framing_invalid {
+        warn!("[HTTP/3] Backend response has conflicting Content-Length / Transfer-Encoding");
+        return Err(502);
+    }
     // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片。
     let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
 
@@ -1839,6 +1843,12 @@ async fn buffered_round_trip(
 
     let status = parse_status_code(&head_buf[..header_end]).unwrap_or(502);
     let mut parsed = parse_response_headers(&head_buf[..header_end]);
+    if parsed.framing_invalid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend response has conflicting Content-Length / Transfer-Encoding",
+        ));
+    }
     if no_response_body || status == 204 || status == 304 {
         parsed.framing = Framing::Length(0);
     }
@@ -2028,13 +2038,15 @@ struct ParsedHeaders {
     /// B-104: 上流がこの応答の後も接続を維持するか（HTTP/1.1 で `Connection: close` 無し、
     /// または HTTP/1.0 で `Connection: keep-alive`）。`false` なら接続をプールへ返さない。
     keep_alive: bool,
+    /// B-246: 本文の区切りを決められない（Content-Length の食い違い・Transfer-Encoding との併記）
+    framing_invalid: bool,
 }
 
 /// HTTP/1.1 レスポンスヘッダ部（ステータス行除く）をパースし、転送用ヘッダとフレーミングを返す。
 fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
     let mut headers: RespHeaders = Vec::new();
-    let mut is_chunked = false;
-    let mut content_length: Option<usize> = None;
+    // B-246: Content-Length は全部見て、Transfer-Encoding を優先する
+    let mut framing_headers = crate::http_utils::FramingHeaders::default();
     let mut content_type: Option<Bytes> = None;
     let mut content_encoding: Option<Bytes> = None;
     let http11 = header_bytes.starts_with(b"HTTP/1.1");
@@ -2061,11 +2073,7 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
             .unwrap_or(&line[colon + 1..]);
 
         if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            if value.eq_ignore_ascii_case(b"chunked")
-                || value.to_ascii_lowercase().ends_with(b"chunked")
-            {
-                is_chunked = true;
-            }
+            framing_headers.transfer_encoding(value);
             continue; // HTTP/3 へは転送しない。
         }
         if name.eq_ignore_ascii_case(b"connection") {
@@ -2084,9 +2092,7 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
             continue; // ホップバイホップ。
         }
         if name.eq_ignore_ascii_case(b"content-length") {
-            if let Ok(s) = std::str::from_utf8(value) {
-                content_length = s.trim().parse().ok();
-            }
+            framing_headers.content_length(value);
             // content-length は転送ヘッダにも残す（length フレーミングのクライアント提示用）。
         }
         if name.eq_ignore_ascii_case(b"content-type") {
@@ -2098,6 +2104,9 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
         headers.push((Bytes::copy_from_slice(name), Bytes::copy_from_slice(value)));
     }
 
+    let f = framing_headers.finish();
+    let is_chunked = f.chunked;
+    let content_length = f.content_length;
     let framing = if is_chunked {
         Framing::Chunked
     } else if let Some(len) = content_length {
@@ -2114,6 +2123,7 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
         content_type,
         content_encoding,
         keep_alive: !conn_close && (http11 || conn_keep_alive),
+        framing_invalid: f.invalid,
     }
 }
 
@@ -2437,6 +2447,30 @@ mod tests {
         let parsed = parse_response_headers(h);
         assert!(matches!(parsed.framing, Framing::Eof));
         assert_eq!(parsed.content_length, None);
+    }
+
+    // B-246: Transfer-Encoding が Content-Length に優先し、食い違う区切りは誤り
+    #[test]
+    fn parse_response_headers_framing_conflicts() {
+        let p = parse_response_headers(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n",
+        );
+        assert!(p.framing_invalid);
+        let p = parse_response_headers(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n",
+        );
+        assert!(!p.framing_invalid);
+        assert!(matches!(p.framing, Framing::Length(3)));
+        let p = parse_response_headers(b"HTTP/1.1 200 OK\r\nContent-Length: +3\r\n");
+        assert!(p.framing_invalid);
+        let p = parse_response_headers(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n",
+        );
+        assert!(p.framing_invalid);
+        // 最後が chunked でない Transfer-Encoding は接続の終わりで区切る
+        let p = parse_response_headers(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n");
+        assert!(!p.framing_invalid);
+        assert!(matches!(p.framing, Framing::Eof));
     }
 
     // F-161: 同一 ConnWaker から複数回 notify() してもキュー長が 1（コアレッシング）。

@@ -75,6 +75,7 @@ use self::splice::*;
 mod https;
 use self::https::*;
 mod transfer;
+pub(crate) use self::transfer::collect_response_body_raw;
 use self::transfer::*;
 mod sendfile;
 use self::sendfile::*;

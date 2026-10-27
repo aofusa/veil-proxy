@@ -792,7 +792,13 @@ pub(crate) fn should_advertise_accept_ranges(method: &[u8]) -> bool {
 /// RFC 7230 Section 4.1に準拠した簡易的なChunkedデコーダ。
 /// Transfer-Encoding: chunked 形式のボディから、生のデータを抽出します。
 // HTTP/2 の上流への中継・ハンドラ・Wasm の本文フェーズとローカル応答が使う
-#[cfg(any(feature = "http2", feature = "handler", feature = "wasm"))]
+// 圧縮する応答の本文（chunked の上流。B-244 の後）も使う
+#[cfg(any(
+    feature = "http2",
+    feature = "handler",
+    feature = "wasm",
+    feature = "compression"
+))]
 pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(chunked_data.len());
     let mut pos = 0;
@@ -1054,22 +1060,6 @@ pub(crate) fn classify_request_framing<'a>(
     Ok(RequestFraming::ContentLength)
 }
 
-/// Transfer-Encoding ヘッダー値から chunked かどうかを正確に判定
-///
-/// Vec割り当てなしでスライスベースのトリムを使用する。
-#[inline]
-pub(crate) fn is_chunked_encoding(value: &[u8]) -> bool {
-    // カンマ区切りの各値をチェック
-    for part in value.split(|&b| b == b',') {
-        // アロケーションなしで空白をトリム
-        let trimmed = trim_ascii_whitespace(part);
-        if trimmed.eq_ignore_ascii_case(b"chunked") {
-            return true;
-        }
-    }
-    false
-}
-
 /// URLデコード（シンプルな実装）
 ///
 /// %XX形式のエンコードされた文字をデコードします。
@@ -1119,6 +1109,123 @@ pub(crate) struct ParsedResponse {
     pub(crate) is_chunked: bool,
     /// Connection: close かどうか（HTTP/1.1ではデフォルトはkeep-alive）
     pub(crate) is_connection_close: bool,
+    /// 本文の長さを決められない・食い違う（B-246: 値の違う複数の Content-Length、数でない Content-Length、
+    /// Transfer-Encoding と Content-Length の両方）。中継すると応答の分割になるので 502 にして上流接続を捨てる
+    pub(crate) framing_invalid: bool,
+    /// Transfer-Encoding があるが最後の符号化が chunked でない（RFC 9112 §6.3: 接続の終わりまでが本文）
+    pub(crate) te_not_chunked: bool,
+}
+
+/// 上流の応答の本文の区切り方（RFC 9112 §6.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseBody {
+    /// 本文なし（HEAD の応答・1xx・204・304。Content-Length があっても読まない。B-245）
+    None,
+    /// Content-Length の長さ
+    Length(usize),
+    /// chunked の終端まで
+    Chunked,
+    /// 接続の終わりまで（長さの指定が無い）。上流接続は再利用できず、クライアントも閉じて終わりを伝える
+    UntilClose,
+}
+
+impl ParsedResponse {
+    /// 要求が HEAD だったか（`is_head`）とステータスから、本文の区切り方を決める（B-244・B-245）。
+    /// `framing_invalid` の応答は呼び出し側が先に 502 にする。
+    pub(crate) fn body(&self, is_head: bool) -> ResponseBody {
+        if is_head
+            || (100..200).contains(&self.status_code)
+            || matches!(self.status_code, 204 | 304)
+        {
+            ResponseBody::None
+        } else if self.is_chunked {
+            ResponseBody::Chunked
+        } else if self.te_not_chunked {
+            ResponseBody::UntilClose
+        } else if let Some(cl) = self.content_length {
+            ResponseBody::Length(cl)
+        } else {
+            ResponseBody::UntilClose
+        }
+    }
+}
+
+/// 要求の先頭行が HEAD か（応答の本文の有無に使う。B-245）。
+#[inline]
+pub(crate) fn request_is_head(request: &[u8]) -> bool {
+    request.starts_with(b"HEAD ")
+}
+
+/// Transfer-Encoding の値の最後の符号化が chunked か（応答の本文の区切り。RFC 9112 §6.3）。
+fn te_final_is_chunked(value: &[u8]) -> bool {
+    value
+        .rsplit(|&b| b == b',')
+        .map(trim_ascii_whitespace)
+        .find(|t| !t.is_empty())
+        .is_some_and(|t| t.eq_ignore_ascii_case(b"chunked"))
+}
+
+/// 上流の応答の Content-Length・Transfer-Encoding から本文の区切りを決める（B-246。HTTP/1.1 の各経路と
+/// HTTP/3 の上流で共有する）。
+#[derive(Default)]
+pub(crate) struct FramingHeaders {
+    content_length: Option<usize>,
+    invalid: bool,
+    has_te: bool,
+    chunked: bool,
+}
+
+/// [`FramingHeaders::finish`] の結果。
+pub(crate) struct Framing {
+    /// Transfer-Encoding があれば `None`（RFC 9112 §6.3: TE が CL に優先する）
+    pub(crate) content_length: Option<usize>,
+    /// Transfer-Encoding の最後が chunked
+    pub(crate) chunked: bool,
+    /// Transfer-Encoding があるが最後が chunked でない（接続の終わりで区切る）
+    pub(crate) te_not_chunked: bool,
+    /// 区切りを決められない（Content-Length が数でない・値の違うものが複数ある・TE と CL の併記）
+    pub(crate) invalid: bool,
+}
+
+impl FramingHeaders {
+    /// Content-Length の値を 1 つ足す（全部見る。`+5` のような符号付きは数と認めない）。
+    pub(crate) fn content_length(&mut self, value: &[u8]) {
+        let v = trim_ascii_whitespace(value);
+        let parsed = if !v.is_empty() && v.iter().all(u8::is_ascii_digit) {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+        } else {
+            None
+        };
+        match (parsed, self.content_length) {
+            (None, _) => self.invalid = true,
+            (Some(n), Some(prev)) if n != prev => self.invalid = true,
+            (Some(n), _) => self.content_length = Some(n),
+        }
+    }
+
+    /// Transfer-Encoding の値を 1 つ足す（複数行は並べた順に連結したものとみなし、最後の行の最後が効く）。
+    pub(crate) fn transfer_encoding(&mut self, value: &[u8]) {
+        self.has_te = true;
+        self.chunked = te_final_is_chunked(value);
+    }
+
+    pub(crate) fn finish(self) -> Framing {
+        // 両方ある応答は応答の分割の試みであり得るので誤りとして扱う（上流の Content-Length で切ると、
+        // 残りが次の要求の応答になる）
+        let invalid = self.invalid || (self.has_te && self.content_length.is_some());
+        Framing {
+            content_length: if self.has_te {
+                None
+            } else {
+                self.content_length
+            },
+            chunked: self.chunked,
+            te_not_chunked: self.has_te && !self.chunked,
+            invalid,
+        }
+    }
 }
 
 /// バックエンド応答バッファ先頭の 1xx 中間応答を読み捨てる（B-11）。
@@ -1157,21 +1264,15 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
         Ok(Status::Complete(header_len)) => {
             let status_code = response.code.unwrap_or(502);
 
-            // Content-Length を取得
-            let content_length = response
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                .and_then(|h| std::str::from_utf8(h.value).ok())
-                .and_then(|s| s.trim().parse().ok());
-
-            // Transfer-Encoding: chunked をチェック
-            let is_chunked = response
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
-                .map(|h| is_chunked_encoding(h.value))
-                .unwrap_or(false);
+            let mut framing = FramingHeaders::default();
+            for h in response.headers.iter() {
+                if h.name.eq_ignore_ascii_case("content-length") {
+                    framing.content_length(h.value);
+                } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                    framing.transfer_encoding(h.value);
+                }
+            }
+            let framing = framing.finish();
 
             // Connection: close をチェック（HTTP/1.1ではデフォルトはkeep-alive）
             let is_connection_close = response
@@ -1187,9 +1288,11 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
             Some(ParsedResponse {
                 status_code,
                 header_len,
-                content_length,
-                is_chunked,
+                content_length: framing.content_length,
+                is_chunked: framing.chunked,
                 is_connection_close,
+                framing_invalid: framing.invalid,
+                te_not_chunked: framing.te_not_chunked,
             })
         }
         Ok(Status::Partial) => None, // データ不足
@@ -1386,7 +1489,8 @@ impl ChunkedDecoder {
         Self::new(0)
     }
 
-    /// 転送が完了したかどうかを確認
+    /// 転送が完了したかどうかを確認（HTTP/3 の上流の経路だけが使う）
+    #[cfg(any(feature = "http3", test))]
     #[inline]
     pub(crate) fn is_complete(&self) -> bool {
         self.state == ChunkedState::Complete
@@ -2452,6 +2556,70 @@ mod stack_fmt_tests {
         assert!(!response_head_invalid(
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
         ));
+    }
+
+    // B-246: 応答の本文の区切り（RFC 9112 §6.3）
+    #[test]
+    fn response_framing_te_overrides_and_conflicts_are_invalid() {
+        let p =
+            parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert!(p.is_chunked && !p.framing_invalid);
+        assert_eq!(p.body(false), ResponseBody::Chunked);
+
+        // TE と CL の両方は誤り（CL では切らない）
+        let p = parse_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+        assert!(p.framing_invalid);
+        assert_eq!(p.content_length, None);
+
+        // 同じ値の CL の重複は採る、値が違えば誤り、数でなければ誤り
+        let p = parse_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!p.framing_invalid);
+        assert_eq!(p.body(false), ResponseBody::Length(5));
+        let p = parse_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
+        )
+        .unwrap();
+        assert!(p.framing_invalid);
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n").unwrap();
+        assert!(p.framing_invalid);
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\n").unwrap();
+        assert!(p.framing_invalid);
+
+        // 最後の符号化が chunked なら chunked、そうでなければ接続の終わりまで
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+            .unwrap();
+        assert_eq!(p.body(false), ResponseBody::Chunked);
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")
+            .unwrap();
+        assert_eq!(p.body(false), ResponseBody::UntilClose);
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        assert_eq!(p.body(false), ResponseBody::UntilClose);
+    }
+
+    // B-245: HEAD の応答・204・304・1xx は Content-Length があっても本文を持たない
+    #[test]
+    fn response_body_none_for_head_204_304() {
+        let p = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").unwrap();
+        assert_eq!(p.body(true), ResponseBody::None);
+        assert_eq!(p.body(false), ResponseBody::Length(5));
+        for head in [
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"[..],
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+            b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ] {
+            assert_eq!(
+                parse_http_response(head).unwrap().body(false),
+                ResponseBody::None
+            );
+        }
+        assert!(request_is_head(b"HEAD / HTTP/1.1\r\n"));
+        assert!(!request_is_head(b"GET / HTTP/1.1\r\n"));
     }
 
     #[test]

@@ -357,6 +357,10 @@ url = "http://localhost:8080"
 | `client_write_timeout_secs` | クライアント書き込みタイムアウト | 60 |
 | `buffer_headers` | ヘッダーもボディと一緒にバッファリング | true |
 
+応答は本文が最後まで届いてから送ります。上流が本文の途中で止まったらクライアントへは 502 を返します。本文が
+`max_disk_buffer`（`disk_buffer_path` が無いときは `max_memory_buffer`）より大きければ 507 Insufficient Storage を返します
+（`buffer_headers = false` のときはヘッダを送った後に接続を閉じます）。
+
 ### 設定例
 
 ```toml

@@ -365,6 +365,11 @@ url = "http://localhost:8080"
 | `client_write_timeout_secs` | Client write timeout | 60 |
 | `buffer_headers` | Buffer headers along with body | true |
 
+A response is sent only after its whole body has arrived. If the upstream stops before the end of the body, the
+client gets 502. If the body is larger than `max_disk_buffer` (or `max_memory_buffer` when `disk_buffer_path` is not
+set), the client gets 507 Insufficient Storage (or, with `buffer_headers = false`, the connection is closed after
+the headers).
+
 ### Configuration Example
 
 ```toml

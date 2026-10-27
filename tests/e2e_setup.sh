@@ -75,6 +75,7 @@ BACKEND_TLS_ECHO_PORT=9018
 BACKEND_UDP_ECHO_PORT=9019
 BACKEND_ECHO2_PORT=9020
 BACKEND_ECHO3_PORT=9021
+BACKEND_FRAMING_PORT=9022  # B-244/B-246: 応答の区切りの試験サーバー
 
 # F-170: UDS バックエンド（Unix ドメインソケット上流）検証用のソケットパス。
 # バックエンドは veil 自身（F-164 の UDS リスナー）を使い、1 プロセスで
@@ -1383,6 +1384,23 @@ path = "/echo-head-ka/*"
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_ECHO2_PORT}"
 
+# B-244/B-245/B-246: 上流の応答の区切り（途中で止まった chunked・TE と CL の併記・値の違う CL）の検証用
+[[route]]
+[route.conditions]
+path = "/framing/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_FRAMING_PORT}"
+
+[[route]]
+[route.conditions]
+path = "/framing-full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_FRAMING_PORT}"
+[route.buffering]
+mode = "full"
+
 # B-104: 順に送った HTTP/3 の要求が上流接続を再利用することの検証用。3 つ目の echo（この試験だけが使う）
 [[route]]
 [route.conditions]
@@ -2294,7 +2312,7 @@ start_servers() {
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" ECHO2_PORT="${BACKEND_ECHO2_PORT}" ECHO3_PORT="${BACKEND_ECHO3_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" ECHO2_PORT="${BACKEND_ECHO2_PORT}" ECHO3_PORT="${BACKEND_ECHO3_PORT}" FRAMING_PORT="${BACKEND_FRAMING_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
@@ -2305,7 +2323,7 @@ start_servers() {
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_BAD_B93_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_BAD_B93_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT" && check_port_in_use "$BACKEND_FRAMING_PORT"; then
             sleep 0.2
             break
         fi
@@ -2483,7 +2501,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_REDIRECT_TLS_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_REDIRECT_TLS_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_FRAMING_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
