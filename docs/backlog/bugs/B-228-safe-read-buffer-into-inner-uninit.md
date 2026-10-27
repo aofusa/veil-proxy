@@ -1,6 +1,6 @@
 # B-228: `SafeReadBuffer::into_inner` が未初期化のバイトを含む `Vec` をそのまま返せる（型で防げていない）
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー ZC-01）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -23,6 +23,12 @@
 ## 受け入れ条件
 
 - `grep -rn "into_inner()" src/` で `SafeReadBuffer` の呼び出し元が無いか、すべて `valid_len` で切っている。性能の交互 A/B が変わらない。
+
+## 修正（v0.10.0）
+
+- `SafeReadBuffer::into_inner`（pub）を `pub(crate) fn into_pool_vec`（`#[must_use]`、`buf_put` だけが使う）に替え、クレートの外から未初期化のバイトを含む `Vec` を取り出せないようにした。データとして取り出すのは `into_truncated`（有効長で切る）だけ。rustdoc の例も `into_inner` を使わない形に直した。
+- 試験: `safe_read_buffer_tests::into_truncated_returns_only_valid_bytes`。
+- `MaybeUninit` ベースへの移行は残す（今の呼び出し側は有効長より先を読まない）。
 
 ## 関連
 
