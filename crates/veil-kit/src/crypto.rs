@@ -22,7 +22,7 @@ pub(crate) fn random(buf: &mut [u8]) {
 }
 
 /// HMAC-SHA256 of `parts` (concatenated) with `key`.
-#[cfg(any(feature = "cookie", feature = "jwt"))]
+#[cfg(feature = "cookie")]
 pub(crate) fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let k = provider::hmac::Key::new(provider::hmac::HMAC_SHA256, key);
     let mut ctx = provider::hmac::Context::with_key(&k);

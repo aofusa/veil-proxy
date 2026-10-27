@@ -770,7 +770,8 @@ pub(crate) fn should_advertise_accept_ranges(method: &[u8]) -> bool {
 ///
 /// RFC 7230 Section 4.1に準拠した簡易的なChunkedデコーダ。
 /// Transfer-Encoding: chunked 形式のボディから、生のデータを抽出します。
-#[cfg(feature = "http2")]
+// HTTP/2 の上流への中継・ハンドラ・Wasm の本文フェーズとローカル応答が使う
+#[cfg(any(feature = "http2", feature = "handler", feature = "wasm"))]
 pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(chunked_data.len());
     let mut pos = 0;
@@ -1789,7 +1790,8 @@ pub(crate) fn build_cached_response(
 }
 
 /// ステータスコードに対応する理由フレーズを返す
-#[cfg(feature = "http2")]
+// HTTP/2 の上流への中継・ハンドラ・Wasm の本文フェーズとローカル応答が使う
+#[cfg(any(feature = "http2", feature = "handler", feature = "wasm"))]
 pub(crate) fn status_reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",

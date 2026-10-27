@@ -83,8 +83,12 @@ where
         + crate::runtime::io::BufferedReadState
         + Unpin,
 {
+    // TLS かどうかを見るのはハンドラ（`Request::is_tls`）だけ
+    #[cfg(not(feature = "handler"))]
+    let _ = tls;
     let svc = ProxyH2Service {
         spawner: h2_task_spawner(),
+        #[cfg(feature = "handler")]
         tls,
     };
     handle_http2_requests_with(conn, client_ip, connection_metric, redirect_https, &svc).await
@@ -116,6 +120,7 @@ pub(crate) trait H2Service {
     );
 
     /// 接続が TLS か（B-204。ハンドラの `Request::is_tls` になる。既定は false）。
+    #[cfg(feature = "handler")]
     #[inline]
     fn tls(&self) -> bool {
         false
@@ -126,6 +131,7 @@ pub(crate) trait H2Service {
 #[cfg(feature = "http2")]
 pub(super) struct ProxyH2Service {
     spawner: H2TaskSpawner,
+    #[cfg(feature = "handler")]
     tls: bool,
 }
 
@@ -156,6 +162,7 @@ impl H2Service for ProxyH2Service {
         (self.spawner)(ctx, req_rx, resp_tx, notify)
     }
 
+    #[cfg(feature = "handler")]
     #[inline]
     fn tls(&self) -> bool {
         self.tls
@@ -509,6 +516,7 @@ pub(crate) struct H2RequestCtx {
     /// 平文リスナーの `enable_secure_redirect`（F-200）。`Some(port)` なら要求を https の `port` へ 301 で返す（F-260）。
     pub(crate) redirect_https: Option<u16>,
     /// TLS（ALPN の h2）の接続か。平文の h2c・メッシュは false（B-204。ハンドラの `Request::is_tls`）。
+    #[cfg(feature = "handler")]
     pub(crate) tls: bool,
     pub(crate) start: Instant,
 }
@@ -686,6 +694,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
         client_ip: std::rc::Rc::clone(client_ip),
         client_socket_addr,
         redirect_https,
+        #[cfg(feature = "handler")]
         tls: svc.tls(),
         // アクセスログ・メトリクスが無効なら時刻を読まない（ストリームごとの固定費）。
         start: crate::logging::request_start_instant(),
@@ -1594,6 +1603,7 @@ pub(super) async fn h2_dispatch(
             client_ip: ctx.client_ip.clone(),
             client_socket_addr: ctx.client_socket_addr,
             redirect_https: ctx.redirect_https,
+            #[cfg(feature = "handler")]
             tls: ctx.tls,
             start: ctx.start,
         };
