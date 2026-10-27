@@ -1074,16 +1074,21 @@ pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<us
     }
 
     // cmsghdr を構築
-    let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
-    // SAFETY: buf.len() >= cmsg_space を確認済みなので cmsghdr とその直後の u16 データ領域は buf 内に収まる。cmsghdr の整列は呼び出し側の CMSG バッファ（スタック上の配列）に依存する。
+    // B-227: buf は u8 のスライスで cmsghdr の整列を保証しないため、ヘッダ・データとも write_unaligned で書く
+    // （カーネルは msg_control の整列を要求しない）。
+    // SAFETY: cmsghdr は整数だけの POD で、全ビット 0 が有効な初期値。
+    let mut hdr: libc::cmsghdr = unsafe { std::mem::zeroed() };
+    // SAFETY: CMSG_LEN は引数の長さから計算するだけでメモリに触れない。
+    hdr.cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) } as _;
+    hdr.cmsg_level = libc::SOL_UDP;
+    hdr.cmsg_type = libc::UDP_SEGMENT;
+    // SAFETY: CMSG_LEN(0) はヘッダを整列した長さ（データ領域の先頭の位置）を計算するだけ。
+    let data_off = unsafe { libc::CMSG_LEN(0) } as usize;
+    // SAFETY: buf.len() >= cmsg_space（= CMSG_SPACE(2) >= data_off + 2）を確認済みなので、ヘッダと
+    // u16 のデータはどちらも buf 内に収まる。整列を仮定しない書き込み。
     unsafe {
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
-        (*cmsg).cmsg_level = libc::SOL_UDP;
-        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-
-        // セグメントサイズをデータ領域に書き込み
-        let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
-        *data_ptr = segment_size;
+        std::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::cmsghdr, hdr);
+        std::ptr::write_unaligned(buf.as_mut_ptr().add(data_off) as *mut u16, segment_size);
     }
 
     Ok(cmsg_space)
@@ -1094,26 +1099,52 @@ pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<us
 /// カーネルが GRO で結合したパケットの元のセグメントサイズを取得します。
 #[cfg(target_os = "linux")]
 fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
-    // CMSG を走査
-    // SAFETY: msg は有効な msghdr への参照で、msg_control/msg_controllen は recvmsg が埋めた領域を指す。CMSG_FIRSTHDR はそれらだけを読む。
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
-
-    while !cmsg.is_null() {
-        // SAFETY: while の条件で cmsg が非 NULL を確認済みで、CMSG_FIRSTHDR/CMSG_NXTHDR が返す msg_control 領域内の cmsghdr を指す。
-        let cmsg_ref = unsafe { &*cmsg };
-
-        if cmsg_ref.cmsg_level == libc::SOL_UDP && cmsg_ref.cmsg_type == libc::UDP_GRO {
-            // GRO セグメントサイズを読み取り
-            // SAFETY: cmsg_level/cmsg_type が UDP_GRO の cmsghdr で、CMSG_DATA はそのデータ領域の先頭を返す。
-            let data_ptr = unsafe { libc::CMSG_DATA(cmsg) as *const u16 };
-            // SAFETY: UDP_GRO の cmsg データは u16 一つ分。カーネルが書き込んだ領域で、読み取りは 1 回のみ。
-            return Some(unsafe { *data_ptr });
-        }
-
-        // SAFETY: cmsg は上で非 NULL を確認した msg 内の cmsghdr。CMSG_NXTHDR は msg の領域内で次を返す（末尾なら NULL）。
-        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    if msg.msg_control.is_null() {
+        return None;
     }
+    // msg_controllen は glibc では usize、musl では socklen_t なので変換が要る。
+    #[allow(clippy::unnecessary_cast)]
+    let controllen = msg.msg_controllen as usize;
+    // SAFETY: msg_control/msg_controllen は recvmsg が埋めた（呼び出し側が所有する）制御メッセージ領域を指す。
+    let control = unsafe { std::slice::from_raw_parts(msg.msg_control as *const u8, controllen) };
+    find_gro_segment(control)
+}
 
+/// 制御メッセージの列から UDP_GRO のセグメントサイズを探す純粋関数。
+///
+/// B-227: 制御メッセージの領域は u8 のバッファで cmsghdr の整列を保証しないため、
+/// `CMSG_FIRSTHDR`/`CMSG_NXTHDR`（ヘッダを参照として読む）を使わず、ヘッダ・データとも
+/// `read_unaligned` で読む。長さが壊れた（短すぎる・領域を越える）ヘッダで走査を打ち切る。
+// io_uring の受信（`runtime::uring::udp_recv`）からも使うため pub(crate)。
+#[cfg(target_os = "linux")]
+pub(crate) fn find_gro_segment(control: &[u8]) -> Option<u16> {
+    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+    // SAFETY: CMSG_LEN(0) はヘッダを整列した長さ（データ領域の先頭の位置）を計算するだけ。
+    let data_off = unsafe { libc::CMSG_LEN(0) } as usize;
+    let align = std::mem::size_of::<usize>();
+    let mut off = 0usize;
+    while control.len() - off >= hdr_len {
+        // SAFETY: off + hdr_len <= control.len() を確認済み。整列を仮定しない読み出し。
+        let hdr: libc::cmsghdr =
+            unsafe { std::ptr::read_unaligned(control.as_ptr().add(off) as *const libc::cmsghdr) };
+        let len = hdr.cmsg_len as usize;
+        if len < data_off || len > control.len() - off {
+            return None;
+        }
+        if hdr.cmsg_level == libc::SOL_UDP && hdr.cmsg_type == libc::UDP_GRO {
+            let data = &control[off + data_off..off + len];
+            // カーネルは int で渡す（udp_cmsg_recv）。古い形の u16 も受ける。
+            return if data.len() >= 4 {
+                u16::try_from(i32::from_ne_bytes([data[0], data[1], data[2], data[3]])).ok()
+            } else if data.len() >= 2 {
+                Some(u16::from_ne_bytes([data[0], data[1]]))
+            } else {
+                None
+            };
+        }
+        // 次のヘッダは CMSG_ALIGN(len) 先。末尾を越えたら終わり。
+        off = (len.checked_add(align - 1)? & !(align - 1)).min(control.len());
+    }
     None
 }
 
@@ -1986,6 +2017,48 @@ mod tests {
         let cmsg_len = result.unwrap();
         assert!(cmsg_len > 0);
         assert!(cmsg_len <= CMSG_BUFFER_SIZE);
+    }
+
+    // B-227: 整列していない位置でも組み立て・解析ができる（Miri でも確かめられる純粋関数）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gso_cmsg_roundtrip_at_unaligned_offsets() {
+        let mut backing = [0u8; CMSG_BUFFER_SIZE + 8];
+        for shift in 0..8 {
+            let buf = &mut backing[shift..shift + CMSG_BUFFER_SIZE];
+            buf.fill(0);
+            let n = build_gso_cmsg(buf, 1350).unwrap();
+            // UDP_SEGMENT のヘッダを UDP_GRO に書き換えれば同じ形の GRO の制御メッセージになる。
+            let type_off = std::mem::offset_of!(libc::cmsghdr, cmsg_type);
+            buf[type_off..type_off + 4].copy_from_slice(&libc::UDP_GRO.to_ne_bytes());
+            assert_eq!(find_gro_segment(&buf[..n]), Some(1350), "shift={shift}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_find_gro_segment_rejects_malformed() {
+        assert_eq!(find_gro_segment(&[]), None);
+        assert_eq!(find_gro_segment(&[0u8; 7]), None);
+        // cmsg_len がヘッダより短い・領域を越える
+        let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+        let mut buf = [0u8; 64];
+        buf[..std::mem::size_of::<libc::size_t>()].copy_from_slice(&(1usize).to_ne_bytes());
+        assert_eq!(find_gro_segment(&buf), None);
+        buf[..std::mem::size_of::<libc::size_t>()].copy_from_slice(&(1000usize).to_ne_bytes());
+        assert_eq!(find_gro_segment(&buf), None);
+        // int のデータ（カーネルの形）
+        let mut buf = [0u8; 64];
+        // SAFETY: CMSG_LEN は長さを計算するだけでメモリに触れない。
+        let data_off = unsafe { libc::CMSG_LEN(0) } as usize;
+        buf[..8].copy_from_slice(&((data_off + 4) as u64).to_ne_bytes());
+        let lvl = std::mem::offset_of!(libc::cmsghdr, cmsg_level);
+        let ty = std::mem::offset_of!(libc::cmsghdr, cmsg_type);
+        buf[lvl..lvl + 4].copy_from_slice(&libc::SOL_UDP.to_ne_bytes());
+        buf[ty..ty + 4].copy_from_slice(&libc::UDP_GRO.to_ne_bytes());
+        buf[data_off..data_off + 4].copy_from_slice(&1200i32.to_ne_bytes());
+        assert_eq!(find_gro_segment(&buf[..data_off + 8]), Some(1200));
+        assert!(hdr_len <= data_off);
     }
 
     #[cfg(target_os = "linux")]

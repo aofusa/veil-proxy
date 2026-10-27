@@ -1,6 +1,6 @@
 # B-227: `cmsghdr` を `u8` のバッファの先頭にキャストして読み書きしていて、8 バイトの整列を保証していない
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー RT-06・ZC-03）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -22,6 +22,12 @@
 ## 受け入れ条件
 
 - `cargo miri test` で `build_gso_cmsg`・`parse_gro_cmsg` の単体試験が通る。HTTP/3 の E2E（GSO・GRO）が変わらない。
+
+## 修正（v0.10.0）
+
+- `build_gso_cmsg` はヘッダと u16 のデータを `write_unaligned` で書く。
+- 解析は新しい純粋関数 `udp::socket::find_gro_segment(&[u8])` に寄せ、`CMSG_FIRSTHDR`/`CMSG_NXTHDR`（ヘッダを参照として読む）を使わずに `read_unaligned` で走査する。長さの壊れたヘッダで打ち切り、UDP_GRO のデータはカーネルの形（int）と u16 の両方を受ける。`udp::socket` と io_uring の受信（スロット・提供バッファ）の両方がこれを使う。
+- 試験: `test_gso_cmsg_roundtrip_at_unaligned_offsets`（0〜7 バイトずらした位置で組み立て・解析）、`test_find_gro_segment_rejects_malformed`。
 
 ## 関連
 

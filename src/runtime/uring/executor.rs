@@ -269,13 +269,24 @@ impl OpTable {
         }
     }
 
-    /// CQE を処理して対応する Waker を wake する
+    /// CQE を処理して対応する Waker を wake する（detach 済みの op のガードはその場で走らせる。fuzz のモデル・試験用）
     fn on_cqe(&mut self, cqe: &IoUringCqe) -> bool {
+        let (handled, guard) = self.on_cqe_take_guard(cqe);
+        if let Some((guard, res)) = guard {
+            guard.run(res);
+        }
+        handled
+    }
+
+    /// CQE を処理して対応する Waker を wake する。detach 済みの op が終わったら、そのガードを返す
+    /// （B-224: 呼び出し側は RING・OP_TABLE の借用を手放してから走らせる。ガードの閉包は with_ring・alloc_op を
+    /// 呼び得るので、consume_cqes の中で走らせると RefCell の二重借用で panic していた）。
+    fn on_cqe_take_guard(&mut self, cqe: &IoUringCqe) -> (bool, Option<(OpGuard, i32)>) {
         use crate::runtime::ring::IORING_CQE_F_MORE;
 
         let Some(i) = self.resolve(cqe.user_data) else {
             // 未知/stale な user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
-            return false;
+            return (false, None);
         };
         match &mut self.slots[i].state {
             OpSlotState::Active { result, waker } => {
@@ -283,7 +294,7 @@ impl OpTable {
                 if let Some(w) = waker.take() {
                     w.wake();
                 }
-                true
+                (true, None)
             }
             OpSlotState::MultishotActive { ms, waker } => {
                 // Multishot: キューへ積み、F_MORE 無し or エラーで終端。スロットは take まで残す。
@@ -294,23 +305,23 @@ impl OpTable {
                 if let Some(w) = waker.take() {
                     w.wake();
                 }
-                true
+                (true, None)
             }
             OpSlotState::Detached(_) => {
                 // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
                 // Multishot で F_MORE 付きの中間 CQE が来ても Detached では毎回ガードを走らせない
                 // （最終 CQE / cancel で 1 回）。F_MORE 中間はスロットを残す。
                 if (cqe.flags & IORING_CQE_F_MORE) != 0 && cqe.res >= 0 {
-                    return true;
+                    return (true, None);
                 }
                 let state = std::mem::replace(&mut self.slots[i].state, OpSlotState::Free);
                 self.free_slot(i);
-                if let OpSlotState::Detached(guard) = state {
-                    guard.run(cqe.res);
+                match state {
+                    OpSlotState::Detached(guard) => (true, Some((guard, cqe.res))),
+                    _ => (true, None),
                 }
-                true
             }
-            OpSlotState::Free => false,
+            OpSlotState::Free => (false, None),
         }
     }
 
@@ -413,6 +424,26 @@ impl OpTable {
         if let Some(i) = self.resolve(user_data) {
             self.free_slot(i);
         }
+    }
+
+    /// 未完了のまま残った detach 済みの op のガードを、走らせずに捨てる（解放しない）。返り値は件数。
+    ///
+    /// B-223（RT-04）: shutdown の drain の期限を過ぎても CQE が来ていない op は、スレッドを抜けた後の
+    /// OP_TABLE の破棄でガード（カーネルが書き得るバッファを持つ）が解放され、リングを閉じたときのカーネル側の
+    /// 非同期のキャンセルが解放済みのメモリへ書き得た。終了時に一度だけなので、意図的に漏らす。
+    fn leak_detached_guards(&mut self) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if matches!(slot.state, OpSlotState::Detached(_)) {
+                if let OpSlotState::Detached(guard) =
+                    std::mem::replace(&mut slot.state, OpSlotState::Free)
+                {
+                    std::mem::forget(guard);
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     /// 完了待ちの op（カーネルがバッファ等を参照し得る）が残っているか（B-118 のシャットダウン用）。
@@ -750,9 +781,29 @@ pub fn set_op_waker(user_data: u64, waker: Waker) {
 
 /// CQE を処理して対応する Future を wake する
 pub fn process_cqe(cqe: &IoUringCqe) {
-    OP_TABLE.with(|t| {
-        t.borrow_mut().on_cqe(cqe);
-    });
+    let guard = OP_TABLE.with(|t| t.borrow_mut().on_cqe_take_guard(cqe).1);
+    if let Some(g) = guard {
+        // B-224: RING の借用（consume_cqes の中）を手放した後で走らせる
+        DEFERRED_GUARDS.with(|d| d.borrow_mut().push(g));
+    }
+}
+
+thread_local! {
+    // B-224: CQE の処理中に終わった detach 済みの op のガード。poll_completions が consume_cqes の後に走らせる。
+    static DEFERRED_GUARDS: RefCell<Vec<(OpGuard, i32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// consume_cqes の中で溜めたガードを走らせる（RING・OP_TABLE を借りていない所で呼ぶ）。
+#[inline]
+fn run_deferred_guards() {
+    if DEFERRED_GUARDS.with(|d| d.borrow().is_empty()) {
+        return;
+    }
+    // ガードが更に op を detach しても（その CQE は次の poll で来る）借用が重ならないよう取り出してから走らせる
+    let guards = DEFERRED_GUARDS.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (guard, res) in guards {
+        guard.run(res);
+    }
 }
 
 /// 操作の結果を取得して削除する
@@ -829,6 +880,7 @@ pub fn poll_completions() {
             process_cqe(cqe);
         });
     });
+    run_deferred_guards();
 }
 
 /// io_uring の CQE を処理する（最低 1 件完了まで待機）
@@ -1300,6 +1352,11 @@ pub fn shutdown_tasks(drain: std::time::Duration) {
         // 理由付き allow: スレッド終了時に一度だけ通るシャットダウン経路（データプレーン外）。
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // B-223（RT-04）: 期限までに CQE の来なかった op のバッファは解放しない（リングを閉じた後もカーネルが書き得る）
+    let leaked = OP_TABLE.with(|t| t.borrow_mut().leak_detached_guards());
+    if leaked > 0 {
+        ftlog::debug!("shutdown: left {leaked} in-flight io_uring buffers allocated");
     }
 }
 
