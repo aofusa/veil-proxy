@@ -25,6 +25,20 @@ __all__ = [
     "_json_fast",
     "parse_multipart",
     "spool_threshold",
+    "AioJob",
+    "AioStream",
+    "NativeWebSocket",
+    "NativeWsSender",
+    "aio_setup",
+    "aio_take",
+    "aio_teardown",
+    "register_websocket",
+    "register_asgi",
+    "register_cors",
+    "register_static",
+    "grpc_client_setup",
+    "GrpcChannel",
+    "GrpcCall",
 ]
 
 @final
@@ -215,7 +229,7 @@ class AioJob:
         """Answer the call with 500."""
     def cancelled(self) -> None:
         """Acknowledge that the call was cancelled."""
-    def start_stream(self, response: Any) -> AioStream:
+    def start_stream(self, sr: Any) -> AioStream:
         """Answer the call with a streaming response and return its writer."""
 
 @final
@@ -224,6 +238,7 @@ class AioStream:
 
     def try_write(self, item: bytes | str) -> bool:
         """Queue a chunk; ``False`` when the queue is full (retry later)."""
+    @property
     def closed(self) -> bool:
         """``True`` once the client disconnected."""
     def finish(self, trailers: Any = None) -> None:
@@ -331,6 +346,7 @@ def register_static(
 def grpc_client_setup() -> None:
     """Start the gRPC client thread now (otherwise it starts with the first call)."""
 
+@final
 class GrpcChannel:
     """A gRPC channel on veil's HTTP/2 client (used by ``veil_kit.grpc.Channel``)."""
 
@@ -347,6 +363,7 @@ class GrpcChannel:
     ) -> GrpcCall:
         """Start a call of ``method`` (``/package.Service/Method``)."""
 
+@final
 class GrpcCall:
     """One call started by :meth:`GrpcChannel.call`."""
 
