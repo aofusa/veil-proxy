@@ -1,6 +1,6 @@
 # B-241: nightly の `sanitizers` ジョブは `RUN_E2E_ASAN=1` と `RUN_E2E_TSAN=1` を同時に渡すが、`e2e_sanitizer_chaos.sh` は TSAN を優先して ASAN の E2E を一度も走らせていない
 
-**状態: 未修正（2026-10-27 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -31,6 +31,12 @@ B-223〜B-225（終了時の use-after-free）のような ASAN でしか見つ�
 ## 受け入れ条件
 
 - `sanitizers` ジョブの artifact に address と thread の両方の `e2e_sanitizer` レポートがあり、Job Summary に両方の結果が出る。
+
+## 修正（v0.10.0）
+
+- `e2e_sanitizer_chaos.sh`: `RUN_E2E_ASAN=1` と `RUN_E2E_TSAN=1` が両方なら、自分を address → thread の順に別々に呼ぶ（それぞれ `e2e_sanitizer_<sanitizer>_report.txt`、`e2e_sanitizer_report.txt` には両方を続けて書く）。どちらかが失敗すれば非 0（`E2E_SANITIZER_BLOCKING=1` のとき）。workflow は変えていない。
+- 確認: `docker` を常に失敗させる仮のコマンドで、両方の段が順に始まり 2 つのレポートができることを確かめた。実際の ASAN・TSAN は `container-security-nightly` の `sanitizers` ジョブで確かめる。
+- `tools/container_security/README.md` に書いた。
 
 ## 関連
 

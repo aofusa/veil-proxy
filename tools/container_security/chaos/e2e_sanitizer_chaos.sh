@@ -28,7 +28,7 @@ SAN_RUN_IMAGE="veil-sec-san:local"
 SAN_CARGO_FEATURES="${SAN_CARGO_FEATURES:-ktls,http2,cache,buffering,compression,metrics,websocket,rate-limit,access-log,l4-proxy}"
 SAN_LOAD_SECONDS="${SAN_LOAD_SECONDS:-20}"
 SAN_TARGET="${SAN_TARGET:-x86_64-unknown-linux-gnu}"
-REPORT="${RESULTS_DIR}/e2e_sanitizer_report.txt"
+REPORT="${E2E_SANITIZER_REPORT:-${RESULTS_DIR}/e2e_sanitizer_report.txt}"
 
 mkdir -p "${RESULTS_DIR}"
 
@@ -38,6 +38,19 @@ RUN_E2E_TSAN="${RUN_E2E_TSAN:-0}"
 if [[ "${RUN_E2E_ASAN}" != "1" && "${RUN_E2E_TSAN}" != "1" ]]; then
     echo "e2e_sanitizer: skipped (RUN_E2E_ASAN=0 かつ RUN_E2E_TSAN=0)" | tee "${REPORT}"
     exit 0
+fi
+if [[ "${RUN_E2E_ASAN}" == "1" && "${RUN_E2E_TSAN}" == "1" ]]; then
+    # B-241: 両方が有効なら address → thread の順に別々に回す（以前は thread だけ走り、ASAN の E2E は一度も走っていなかった）。
+    # それぞれのレポートは e2e_sanitizer_<sanitizer>_report.txt、e2e_sanitizer_report.txt には両方を続けて書く
+    : >"${REPORT}"
+    rc=0
+    for san in address thread; do
+        sub="${RESULTS_DIR}/e2e_sanitizer_${san}_report.txt"
+        if [[ "${san}" == address ]]; then asan=1 tsan=0; else asan=0 tsan=1; fi
+        RUN_E2E_ASAN="${asan}" RUN_E2E_TSAN="${tsan}" E2E_SANITIZER_REPORT="${sub}" bash "$0" || rc=1
+        cat "${sub}" >>"${REPORT}" 2>/dev/null || echo "e2e_sanitizer: ${san} report missing" | tee -a "${REPORT}"
+    done
+    exit "${rc}"
 fi
 if [[ "${RUN_E2E_TSAN}" == "1" ]]; then
     SANITIZER="thread"
