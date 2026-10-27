@@ -30,7 +30,7 @@ if [[ "${mode}" == "dir" ]]; then
 fi
 
 # gitleaks の exit code: 0=検出なし, 1=検出あり, 2=エラー。
-# 非ブロッキング運用のため 1（検出）は警告としてレポートに残し suite を継続する。
+# 1（検出）は警告としてレポートに残し suite を継続する（集計で failed になり、run.sh が最後に 1 で終わる。B-217）。
 # --config: target/ 等を allowlist してビルド成果物の長時間走査を避ける。
 set +e
 docker run --rm \

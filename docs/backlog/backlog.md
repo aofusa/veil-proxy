@@ -544,6 +544,7 @@
 | B-214 | P3 | 修正済み（v0.10.0） | [bugs/B-214-python-stub-drift.md](bugs/B-214-python-stub-drift.md) | `veil._veil` の型スタブが v0.10.0 で足した永続イベントループ・WebSocket・gRPC のクライアント等とずれていた（`__all__` の漏れ・`AioStream.closed` が getter・`@final` 無し）。stubtest が落ちた（v0.10.0 の PR の CI で発覚） |
 | B-215 | P3 | 修正済み（v0.10.0） | [bugs/B-215-bindings-ci-harness.md](bugs/B-215-bindings-ci-harness.md) | bindings の CI の library_e2e が、色付きの `native-static-libs`（`CARGO_TERM_COLOR=always`）・HTTP/2 の無い choco の curl・macOS の listen の待ち行列（128）で落ちた。`--color never`・curl.se の curl・`sudo -n` で待ち行列を上げる（v0.10.0 の PR の CI で発覚） |
 | B-216 | P1 | 修正済み（v0.10.0） | [bugs/B-216-zstd-advisories.md](bugs/B-216-zstd-advisories.md) | zstd 0.13（`zstd-safe` 7・`zstd-sys` 2.0）に RustSec の勧告 14 件（使い回したコンテキストでのストリーム間の漏れ等）。zstd 0.14 へ上げ、wasmtime の未使用の `cache` feature を外した（v0.10.0 の security の実行で発覚） |
+| B-217 | P2 | 修正済み（v0.10.0） | [bugs/B-217-container-security-false-ok.md](bugs/B-217-container-security-false-ok.md) | container_security の `run.sh` が集計で failed のフェーズ（cargo-audit・cargo-deny・gitleaks・pumba）があっても 0 で終わり、CI が成功に見えていた。failed があれば 1 で終える。gitleaks の誤検知 2 件・pumba の HTTP/3 の確認の SNI も直す |
 
 ---
 

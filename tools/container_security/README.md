@@ -142,7 +142,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 4i differential | `security/run_differential.sh` | Veil vs nginx の応答差分比較（曖昧解釈検出、F-77、専用トポロジ・既定 SKIP） |
 | 4j full features | `security/run_full_features_security.sh` | admin/compression+cache/http3/l4/ws/grpc/rate-limit/wasm/metrics/otel プローブ（F-90） |
 | 5 Trivy | `run_trivy_scan` | イメージ脆弱性（HIGH/CRITICAL） |
-| 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml` |
+| 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml`。failed のフェーズが 1 つでもあれば `run.sh` は終了コード 1 で終わる（B-217。各フェーズは失敗しても続行し、最後にまとめて判定する） |
 | 最終 | `health_check.sh` | 全フェーズ後の応答確認（最大 10 回リトライ） |
 
 ---

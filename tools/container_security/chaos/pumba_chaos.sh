@@ -41,6 +41,7 @@ health() { # 適用中/後のヘルス確認（応答があれば OK）
 h3_probe() {
     docker run --rm --network "${NET_NAME}" \
         -e "VEIL_HOST=${veil_ip}" \
+        -e "VEIL_SNI=${VEIL_SNI:-veil-proxy}" \
         -e "VEIL_HTTP3_PORT=${VEIL_HTTP3_PORT:-443}" \
         "${HARNESS_IMAGE}" \
         bash -c '
