@@ -7,8 +7,10 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 |---|---|
 | [`linux_suite_ab_raw.tsv`](linux_suite_ab_raw.tsv) | Linux x86_64 のフルスイート（`suite_ab.sh`、v0.9.2 と交互、nginx の同じ仕事の相手を含む）の生データ |
 | [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.9.2 との比が 0.95 を下回った 7 構成を 5 反復で測り直した生データ |
+| [`linux_final_ab_raw.tsv`](linux_final_ab_raw.tsv) | セキュリティ修正の後の最終候補と v0.9.2 の交互 A/B（9 構成）の生データ |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B）の生データ |
 | [`freebsd_cpu_per_req.tsv`](freebsd_cpu_per_req.tsv) | FreeBSD のサーバの CPU 時間 / 要求（`cpu_per_req.sh`）の生データ |
+| [`freebsd_v092_ab_raw.tsv`](freebsd_v092_ab_raw.tsv) | FreeBSD の v0.9.2 と v0.10.0 の候補の交互 A/B（rps・CPU/要求）の生データ |
 | [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.8.3 の全件と、v0.8.4 で回し直したもの） |
 
 ---
@@ -94,6 +96,27 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 測り直しの 13 組は全体の中央値 1.001、最小 0.976（HTTP/1.1）・最大 1.012。**退行なし。** v0.10.0 の変更（複数の待ち受け・
 CORS の実際の応答・キャッシュの監視・Proxy-Wasm の再利用と協調的な yield 等）は、使わない構成では分岐だけで、計測の揺れの範囲だった。
 
+### 最終候補での確認（セキュリティ修正の後、2026-10-27）
+
+上のフルスイートの後に、セキュリティレビューの修正（B-219〜B-243。ヘッダの検査、HTTP/3 の接続数の上限、seccomp・Landlock の
+適用範囲、管理 API の認証の比較等）と B-240 が入ったので、最終候補（`d92eea6e`、`veil:v0100-final`）と v0.9.2 をホットパスの
+代表 9 構成で交互に測り直した（別のホスト: aofish の Docker Desktop、3 反復。±10% を外れた 2 構成は 7 反復）。
+全計測で Non-2xx = 0。比は v0.10.0 / v0.9.2 の Req/s の中央値。
+
+| 構成 | HTTP/1.1 | HTTP/2 | HTTP/3 | h2c |
+|---|---|---|---|---|
+| `h2_0_ktls_0_lb_kernel_ofc_1`（静的） | 1.002 | — | — | — |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（静的、7 反復） | 1.025 | 1.003 | — | — |
+| `h2_1_feat_proxy`（中継） | 1.028 | 1.004 | — | — |
+| `h2_1_proxy_wasm`（中継 + Proxy-Wasm） | 0.977 | 0.965 | — | — |
+| `h2c_file` / `h2c_proxy` | — | — | — | 1.040 / 1.018 |
+| `h3_file_access_log`（静的 + アクセスログ） | 1.035 | 1.045 | 0.998 | — |
+| `h3_file_cache`（静的 + キャッシュ） | 0.985 | 1.000 | 0.941 | — |
+| `h3_proxy`（中継、7 反復） | 1.004 | 0.985 | 1.029 | — |
+
+このホストは反復ごとの揺れが大きい（同じバイナリで ±10〜15%）。3 反復で 0.92（`h2_1_ktls_0_lb_kernel_ofc_1` の HTTP/2）・
+0.96（`h3_proxy` の HTTP/3）だった 2 構成は 7 反復で 1.003・1.029 になった。**退行なし。**
+
 ---
 
 ## FreeBSD 14.3 aarch64（2026-10-21、QEMU + HVF、ネイティブ）
@@ -103,6 +126,38 @@ CORS の実際の応答・キャッシュの監視・Proxy-Wasm の再利用と�
   - サーバ律速は `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3`。
   - CPU/要求は `tools/perf/bsd/cpu_per_req.sh`。
 - **全計測でエラー 0**
+
+### v0.9.2 との退行確認（v0.10.0、2026-10-27）
+
+同じ VM で v0.9.2 と v0.10.0 の候補（`--features full-freebsd`）を交互に 4 ラウンド（`h1_file_plain` 等の 8 シナリオ × 3B・54KB）。
+比は v0.10.0 / v0.9.2 の中央値（rps は大きいほど、CPU/要求は小さいほど良い）。
+
+| シナリオ | 大きさ | rps | CPU/要求 |
+|---|---|---|---|
+| `h1_file_plain` | 3B | 0.969 | 1.037 |
+| `h1_file_tls` | 3B | 0.965 | 1.047 |
+| `h1_proxy_tls` | 3B | 0.973 | 1.034 |
+| `h2_file_tls` | 3B | **1.092** | **0.915** |
+| `h2_proxy_tls` | 3B | 0.992 | 1.007 |
+| `h2c_file_plain` | 3B | **1.079** | **0.927** |
+| `h3_file` | 3B | 1.011 | 0.988 |
+| `l4_tcp` | 3B | 0.993 | 1.006 |
+| `h1_file_plain` | 54KB | 1.061 | 0.958 |
+| `h1_file_tls` | 54KB | 0.968 | 1.026 |
+| `h1_proxy_tls` | 54KB | 0.999 | 1.014 |
+| `h2_file_tls` | 54KB | 0.968 | 1.034 |
+| `h2_proxy_tls` | 54KB | 1.015 | 0.986 |
+| `h2c_file_plain` | 54KB | 0.994 | 0.965 |
+| `h3_file` | 54KB | 0.952 | 1.059 |
+| `l4_tcp` | 54KB | 0.987 | 1.016 |
+
+- HTTP/2・h2c の 3B は、途中の候補で 4〜7% 遅くなっていた（syscall の数は同じ）。bisect で F-272（静的配信のディスク監視）の後に
+  要求の future が大きくなり、毎回のコピーが増えたことが分かり、B-240 で直した（上の表は直した後。v0.9.2 より 8〜9% 少ない CPU）。
+- HTTP/1.1 の 3B の CPU/要求 +3〜5% は、`h1_file_plain` 3B を 8 ラウンドで v0.9.2 と交互に測る bisect で再現しなかった。
+  v0.9.2 から最終候補までの 7 点（`64c57ece`〜`8bff8d14`）の比は 0.986〜1.024（平均 1.002）で、閾値 1.02 を越えたのはテスト用の
+  スクリプトだけを変えたコミット（`3b25c067`）だった。VM の揺れの範囲と判断した。
+- `h3_file` 54KB の 1.059 は、FreeBSD の quiche（`boringssl-boring-crate`）の経路で、v0.10.0 は HTTP/3 の本文の送出を変えていない
+  （Linux の HTTP/3 静的配信は上の「最終候補での確認」で v0.9.2 と同等）。
 
 ### 対 nginx
 
