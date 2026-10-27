@@ -16,6 +16,10 @@ on:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/veil
 
+# B-238: GITHUB_TOKEN は既定で読み取りだけにする（書き込みが要るジョブで個別に広げる）
+permissions:
+  contents: read
+
 jobs:
   annotate:
     runs-on: ubuntu-24.04

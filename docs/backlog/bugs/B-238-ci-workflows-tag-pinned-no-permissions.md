@@ -1,6 +1,6 @@
 # B-238: `ci.yml` などの Actions がタグ固定で、`permissions:` が無い
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー SC-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -22,6 +22,13 @@
 ## 受け入れ条件
 
 - `grep -rn "uses:.*@v[0-9]" .github/workflows` が 0 件。PR の CI が通る。
+
+## 修正（v0.10.0）
+
+- 全 workflow の `uses:` を SHA 固定にした（`# vN.N.N` のコメント付き。同じメジャー版の最新に固定し挙動は変えない。`dtolnay/rust-toolchain` はブランチの SHA）。
+- `ci.yml`・`container-security-nightly.yml`・`ghcr-page.yml` の最上位に `permissions: contents: read` を足した（`ghcr-page.yml` は job で `packages: write` に広げている）。
+- `.github/dependabot.yml` で `github-actions` を週次で更新する。
+- `grep -rn "uses:.*@v[0-9]" .github/workflows` は 0 件。
 
 ## 関連
 

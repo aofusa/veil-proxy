@@ -24,7 +24,7 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
       - name: Build Veil image (glibc)
@@ -38,7 +38,7 @@ jobs:
           SKIP_SBOM: "0"
         run: ./tools/container_security/security/run_sbom.sh
       - name: Scan SBOM with grype (report only)
-        uses: anchore/scan-action@v6
+        uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e # v6.5.1
         with:
           sbom: tools/container_security/results/sbom_source.cdx.json
           fail-build: false

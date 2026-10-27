@@ -21,13 +21,17 @@ env:
   # ネットワーク不要なオフラインビルドで再現性を高める。
   CARGO_NET_RETRY: "3"
 
+# B-238: GITHUB_TOKEN は既定で読み取りだけにする（書き込みが要るジョブで個別に広げる）
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -37,7 +41,7 @@ jobs:
     name: messages (English, no ticket IDs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: python3 tools/lint/test_check_messages.py
       - run: python3 tools/lint/check-messages.py
       # B-208: 公開の状態の判定（API の失敗を「無い」と見なさない）
@@ -47,13 +51,13 @@ jobs:
     name: clippy (full)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # AGENTS.md: allow(dead_code) 禁止・論拠なき allow 追加禁止。警告ゼロを維持しているため
       # -D warnings でゲートする。clippy.toml の disallowed-methods（ホットパスのブロッキング検出、
       # F-88）もここで効く。reactor（epoll）は io_uring ビルドでは 1 行もコンパイルされないため両方回す。
@@ -65,17 +69,17 @@ jobs:
     name: docs (full,api)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo doc --no-deps --no-default-features --features full,api
         env:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --doc --no-default-features --features full,api
       # F-241: docs.rs に出る文書（と Python の文書）が英語だけで、チケット番号が無い
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       - run: tools/release/check-docs.sh
 
   build:
@@ -89,22 +93,22 @@ jobs:
           - features: "" # default features
           - features: "--features full"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build ${{ matrix.features }}
 
   test:
     name: unit + integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Unit tests (lib, full)
         run: cargo test --lib --features full
       - name: Integration tests (full)
@@ -129,11 +133,11 @@ jobs:
     if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # E2E は専用バックエンドを自動セットアップ・実行・クリーンアップする。
       - name: Run E2E suite
         run: ./tests/e2e_setup.sh test
@@ -142,8 +146,8 @@ jobs:
     name: python docs + stubs (F-239)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       # Read the Docs と同じ設定で警告をエラーにしてビルドする（Rust の拡張はコンパイルしない）。
@@ -153,8 +157,8 @@ jobs:
           sphinx-build -W -b html crates/veil-python/docs _build
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # wheel をビルドして入れ、_veil.pyi と実物のずれを stubtest で検出する。
       - name: Build the wheel
         run: |

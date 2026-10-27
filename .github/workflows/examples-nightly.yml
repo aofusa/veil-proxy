@@ -58,6 +58,6 @@ jobs:
           python-version: "3.12"
       - name: install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm clang
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Swagger UI offline (Playwright, --network none)
         run: tests/api/swagger_offline.sh all

@@ -1,0 +1,7 @@
+# B-238: ワークフローのアクションは SHA で固定しているので、更新は dependabot の PR で受ける
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
