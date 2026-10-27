@@ -40,7 +40,15 @@ configuration
 production
 ```
 
-The API reference (generated from the type stubs and docstrings) follows the guide.
+```{toctree}
+:maxdepth: 2
+:caption: API reference
+
+api/veil/index
+api/veil_kit/index
+```
+
+The API reference is generated from the type stubs and docstrings.
 
 ## Links
 

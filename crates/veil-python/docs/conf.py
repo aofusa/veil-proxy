@@ -49,7 +49,8 @@ autoapi_type = "python"
 autoapi_dirs = ["../python", "../../veil-python-kit/src"]
 autoapi_file_patterns = ["*.pyi", "*.py"]
 autoapi_root = "api"
-autoapi_add_toctree_entry = True
+# 3.8 以降は MyST（.md）の root の toctree へ自動で足さないので、index.md の toctree にパッケージごとの api/*/index を書く
+autoapi_add_toctree_entry = False
 autoapi_keep_files = False
 autoapi_python_class_content = "both"
 autoapi_member_order = "bysource"

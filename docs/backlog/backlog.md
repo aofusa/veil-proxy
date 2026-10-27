@@ -540,6 +540,7 @@
 | B-210 | P2 | 修正済み（v0.10.0） | [bugs/B-210-expect-continue-before-route-body-limit.md](bugs/B-210-expect-continue-before-route-body-limit.md) | HTTP/1.1 で `Expect: 100-continue` の要求にルートの検査（本文の上限等）より前に 100 Continue を返し、413 で閉じるときに未読の本文で RST になって Windows では 413 が届かなかった。100 Continue をルートの検査の後に返す（v0.10.0 の Windows の検証で発覚） |
 | B-211 | P2 | 修正済み（v0.10.0） | [bugs/B-211-expect-continue-before-api-body-limit.md](bugs/B-211-expect-continue-before-api-body-limit.md) | ハンドラのルートで `[api] max_body_size` を超える `Expect: 100-continue` の要求に 100 Continue を返し、本文の途中で 413 を書いて閉じるので Windows では 413 が届かなかった。100 Continue の前に上限を見て、413 の後は本文を読み捨ててから閉じる（v0.10.0 の Windows の検証で発覚） |
 | B-212 | P3 | 修正済み（v0.10.0） | [bugs/B-212-feature-combination-build-errors.md](bugs/B-212-feature-combination-build-errors.md) | 既定の features で `H2RequestCtx::tls` が dead code、`wasm` 単体で本文の chunked の復号・理由フレーズが未定義、kit の `jwt` 単体で `hmac_sha256` が dead code になり、`-D warnings` のビルドが通らなかった。使う feature だけで定義する（v0.10.0 の警告の検査で発覚） |
+| B-213 | P3 | 修正済み（v0.10.0） | [bugs/B-213-sphinx-autoapi-toctree.md](bugs/B-213-sphinx-autoapi-toctree.md) | sphinx-autoapi 3.8 が MyST の root の toctree へ API の頁を足さなくなり、Python の API 文書の `sphinx-build -W` が `toc.not_included` で落ちた。index.md の toctree に生成されるパッケージの頁を明示する（v0.10.0 の PR の CI で発覚） |
 
 ---
 
