@@ -2214,17 +2214,50 @@ mod admin_config_tests {
         assert!(!cfg.check_auth(Some("Bearer ")));
     }
 
+    // B-231: allowed_ips が空なら loopback（UDS の接続は 127.0.0.1）だけ。全許可は明示する
     #[test]
-    fn admin_ip_allowed_empty_allows_all() {
-        let cfg = AdminConfig {
+    fn admin_ip_allowed_empty_allows_loopback_only() {
+        let mut cfg = AdminConfig {
             enabled: true,
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: Vec::new(),
             cache_purge_prefix: "/__admin/cache/purge".into(),
         };
-        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(!cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("127.0.0.1"));
         assert!(cfg.is_ip_allowed("::1"));
+        assert!(cfg.is_ip_allowed("::ffff:127.0.0.1"));
+        assert!(!cfg.is_ip_allowed("not-an-ip"));
+        cfg.allowed_ips = vec!["0.0.0.0/0".into(), "::/0".into()];
+        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("2001:db8::1"));
+
+        let prom = PrometheusConfig::default();
+        assert!(!prom.is_ip_allowed("10.0.0.1"));
+        assert!(prom.is_ip_allowed("127.0.0.1"));
+    }
+
+    // B-231: 認証の失敗が IP ごとに上限を超えたら、正しい秘密でも拒否する（他の IP は影響を受けない）
+    #[test]
+    fn admin_auth_failures_are_rate_limited_per_ip() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "topsecret".into(),
+            allowed_ips: Vec::new(),
+            cache_purge_prefix: "/__admin/cache/purge".into(),
+        };
+        let ip = "198.51.100.231";
+        assert!(cfg.check_auth_from(ip, Some("Bearer topsecret")));
+        for _ in 0..crate::config::prometheus::ADMIN_AUTH_FAILURES_PER_MINUTE {
+            assert!(!cfg.check_auth_from(ip, Some("Bearer wrong")));
+        }
+        assert!(!cfg.check_auth_from(ip, Some("Bearer topsecret")));
+        assert!(cfg.check_auth_from("198.51.100.232", Some("Bearer topsecret")));
+        // 長さの違う秘密・前方一致は通らない
+        assert!(!cfg.check_auth(Some("topsecre")));
+        assert!(!cfg.check_auth(Some("topsecretx")));
     }
 
     #[test]

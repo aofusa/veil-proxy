@@ -4102,7 +4102,7 @@ pub(super) fn h2_admin_response(
     if is_purge_method || is_admin_purge_path {
         let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
             (403, Vec::new())
-        } else if !admin_config.check_auth(auth) {
+        } else if !admin_config.check_auth_from(client_ip, auth) {
             (401, Vec::new())
         } else {
             let resp = handle_cache_purge(path_str, is_purge_method);
@@ -4133,7 +4133,7 @@ pub(super) fn h2_admin_response(
 
     let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
         (403, b"{\"error\":\"403\"}".to_vec())
-    } else if !admin_config.check_auth(auth) {
+    } else if !admin_config.check_auth_from(client_ip, auth) {
         (401, b"{\"error\":\"401\"}".to_vec())
     } else {
         match (method, path_suffix) {

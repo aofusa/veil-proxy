@@ -23,7 +23,7 @@ enabled = true
 |--------|-------------|---------|
 | `enabled` | Enable metrics endpoint | **false** |
 | `path` | Metrics endpoint path | `/__metrics` |
-| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
+| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (loopback and Unix-socket listeners only) |
 
 ### Endpoint
 
@@ -155,7 +155,7 @@ allowed_ips = [
 ### Access Control
 
 When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint.
-When empty (default), all IPs can access.
+When empty (the default), only loopback clients (and Unix-socket listeners) can access it; before v0.10.0 every IP could. Write `["0.0.0.0/0", "::/0"]` to allow everyone. `[admin] allowed_ips` behaves the same way.
 
 | Format | Example |
 |--------|---------|

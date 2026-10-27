@@ -572,7 +572,7 @@ pub(super) async fn handle_requests(
                                 }
                             });
 
-                            if !admin_config.check_auth(auth) {
+                            if !admin_config.check_auth_from(client_ip, auth) {
                                 b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                             } else {
                                 handle_cache_purge(path_str, is_purge_method)
@@ -646,7 +646,7 @@ pub(super) async fn handle_requests(
                                     }
                                 });
 
-                                if !admin_config.check_auth(auth) {
+                                if !admin_config.check_auth_from(client_ip, auth) {
                                     b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"401\"}".to_vec()
                                 } else {
                                     // 認証成功: エンドポイントに応じた処理
