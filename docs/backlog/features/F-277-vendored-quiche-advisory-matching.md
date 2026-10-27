@@ -16,8 +16,16 @@
 - または vendoring 版の `[package] name` を `quiche` に戻し、`[patch.crates-io]` で差し替える（crates.io への公開は `veil` 本体だけなので、
   F-238 の衝突とは別。`cargo publish` が path 依存を拒むかを確かめる）。
 
+## 2026-10-28 の手作業の照合結果（セキュリティレビュー 3 回目）
+
+RustSec の advisory-db には **quiche の勧告が 1 件も無い**（`crates/quiche/` が存在しない）。quiche の勧告は GitHub Security Advisory（GHSA）だけに出るので、
+照合の対象に `gh api repos/cloudflare/quiche/security-advisories` も含める必要がある。照合の結果、vendoring 版 0.24.9 は GHSA-4fgf-9xrr-88gf と
+GHSA-4q5x-gp38-rfp4（High）に該当した → [B-255](../bugs/B-255-vendored-quiche-h3-frame-length-preallocation-ghsa-4fgf.md)・
+[B-256](../bugs/B-256-http3-path-event-queue-never-drained-ghsa-4q5x.md)。詳細は `docs/artifacts/security/analysis/11-supply-chain-vendored-advisories.md`（git 管理外）。
+
 ## 受け入れ条件
 
+- GHSA（quiche）も照合の対象に含め、該当があれば失敗にする。
 - 試験用に古い版の advisory（例: quiche の既知の勧告）を一時的に DB へ置き、`run_cargo_audit.sh` が失敗する。
 
 ## 関連
