@@ -16,6 +16,9 @@ echo "cargo_audit start" | tee "${REPORT}"
 # npm の advisory で照合する。該当があれば直す版の有無にかかわらず失敗（判定マーカーを書く前に止める）
 "${REPO_ROOT}/tools/release/update-swagger-ui.sh" --audit 2>&1 | tee -a "${REPORT}"
 
+# F-277: vendoring 版（third_party/*）を GitHub の勧告（GHSA）と照合する。quiche の勧告は RustSec に載らず GHSA だけに出る
+python3 "${SCRIPT_DIR}/vendored_ghsa_audit.py" "${REPO_ROOT}" 2>&1 | tee -a "${REPORT}"
+
 docker run --rm \
     -v "${REPO_ROOT}:/app:ro" \
     -v "${RESULTS_DIR}:/results:rw" \
@@ -39,6 +42,27 @@ docker run --rm \
             echo "== $lock" | tee -a /results/cargo_audit_report.txt
             timeout 300 cargo audit --color never --deny warnings -f "$lock" 2>&1 | tee -a /results/cargo_audit_report.txt
         done
+        # F-277: vendoring 版（third_party/*）は名前を変えている・path 依存なので、RustSec の勧告（crates.io の名前に付く）に
+        # 一致しない。README.veil.md の「crates.io の [`名前` 版]」から元の名前と版を取り、crates.io の版として並べた
+        # 仮の Cargo.lock を cargo audit に通す（版の範囲の判定は cargo audit に任せる）
+        vendored_lock=$(mktemp -d)/Cargo.lock
+        printf "version = 3\n" > "$vendored_lock"
+        for readme in third_party/*/README.veil.md; do
+            spec=$(grep -m1 -oE "crates\.io の \[\`[A-Za-z0-9_-]+\` [0-9][0-9A-Za-z.+-]*\]" "$readme" || true)
+            [ -n "$spec" ] || continue
+            name=$(echo "$spec" | sed -E "s/.*\`([^\`]+)\` .*/\1/")
+            ver=$(echo "$spec" | sed -E "s/.*\` ([^]]+)\]/\1/")
+            printf "\n[[package]]\nname = \"%s\"\nversion = \"%s\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n" \
+                "$name" "$ver" >> "$vendored_lock"
+        done
+        echo "== vendored crates (third_party/*/README.veil.md)" | tee -a /results/cargo_audit_report.txt
+        grep -A1 "^name" "$vendored_lock" | tee -a /results/cargo_audit_report.txt
+        # README.veil.md の「- advisory-ignore: ID（理由）」は vendoring の差分で直した勧告（版では一致し続ける）
+        ignore_args=()
+        for id in $(grep -ohE "^- advisory-ignore: RUSTSEC-[0-9]+-[0-9]+" third_party/*/README.veil.md | sed "s/.*: //"); do
+            ignore_args+=(--ignore "$id")
+        done
+        timeout 300 cargo audit --color never --deny warnings "${ignore_args[@]}" -f "$vendored_lock" 2>&1 | tee -a /results/cargo_audit_report.txt
         # 判定マーカーはレポートファイルへ書く（lib/report.sh がファイルを grep する）。
         echo "cargo_audit: ok" | tee -a /results/cargo_audit_report.txt
     '

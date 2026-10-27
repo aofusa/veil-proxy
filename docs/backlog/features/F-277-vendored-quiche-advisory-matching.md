@@ -1,6 +1,6 @@
 # F-277: vendoring 版 quiche（`veil-proxy-quiche`）の RustSec 勧告を `cargo audit` で照合できるようにする
 
-**状態: 未着手（2026-10-27 起票。セキュリティレビュー SC-04）**
+**状態: 完了（v0.10.0）**
 
 ## 今の状態
 
@@ -19,6 +19,14 @@
 ## 受け入れ条件
 
 - 試験用に古い版の advisory（例: quiche の既知の勧告）を一時的に DB へ置き、`run_cargo_audit.sh` が失敗する。
+
+## 修正（v0.10.0）
+
+- `tools/container_security/security/vendored_ghsa_audit.py`（新規）: `third_party/*/README.veil.md` の「crates.io の [`名前` 版]」から元の名前と版を取り、GitHub の勧告 API（`/advisories?ecosystem=rust&affects=名前@版`）で照合する。該当があれば失敗、API を読めなくても失敗（照合せずに ok と言わない）。
+- `run_cargo_audit.sh`: 上の GHSA の照合と、元の名前と版を crates.io の版として並べた仮の `Cargo.lock` を `cargo audit` に通す段を足した（RustSec の照合。版の範囲の判定は cargo audit に任せる）。`release.yml` の勧告の関門は同じスクリプトなので、`GITHUB_TOKEN` だけ渡した。
+- 差分で直した勧告は README.veil.md の `- advisory-ignore: ID（理由）` で外す（理由の無い行は一致しない）。
+- **照合で見つかった:** quiche 0.24.9 に GHSA-mh64-ph39-mrc9（CVE-2026-11941、C の FFI の connection ID の反復子の解放済み領域の参照。RustSec には無い）。veil は `ffi` feature を使わないので影響は無かったが、0.29.2 の修正を `src/ffi.rs`・`include/quiche.h` に取り込み（`veil-proxy-quiche` 0.24.9-veil.3）、回帰試験 `ffi::tests::connection_id_iter_next` を足した（mac で `--features ffi,boringssl-boring-crate`）。
+- 受け入れ: 版を古くした README で GHSA（quiche 0.19.0 → 4 件）と RustSec（wasmtime 0.30.0 → 35 件）の照合が失敗し、今の版では全 Cargo.lock と合わせて `cargo_audit: ok`（aofish の Docker）。RustSec には quiche の勧告が 1 件も無い（GHSA だけ）ので、cargo audit の段だけでは quiche を守れなかった。
 
 ## 関連
 

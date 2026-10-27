@@ -108,6 +108,14 @@ rustls と同じ aws-lc-sys を使うので、以前は aws-lc-sys を接頭辞�
 quiche を上げるときは、この 5 つの宣言の塊を upstream の新しい宣言で置き換えて `veil_ffi! {` に戻す。宣言が増えて
 aws-lc-sys に同じ名前が無い・型が合わない場合はコンパイルエラーになるので、`sys` か `Conv` に足す。
 
+### 6. FFI の解放済みの領域の参照（GHSA-mh64-ph39-mrc9 / CVE-2026-11941、F-277、0.24.9-veil.3）
+
+upstream の 0.29.2 の修正を `src/ffi.rs`・`include/quiche.h` へ取り込んだ。`quiche_connection_id_iter_next` は反復子の要素を
+複製して返していた（関数を抜けると解放される）ので、反復子が持つ要素を指す。`quiche_conn_retired_scid_next` は取り出した ID を
+解放してからポインタを返していたので、upstream と同じ `quiche_conn_retired_scid_iter`（ID を反復子に移し、
+`quiche_connection_id_iter_free` で解放する）に替えた。C の FFI は `ffi` feature のときだけビルドされ、veil は使わない
+（影響は無かった）。`grep -n 'veil: GHSA' src/ffi.rs`。
+
 ## 追従手順
 
 quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜4 を再適用する
@@ -128,8 +136,15 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.2`（`[lib] name = "quiche"` はそのまま。veil.2 は下の 5）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.3`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
 - ソースの差分は上の「差分」の節のまま。
+
+## 照合から外す勧告（F-277）
+
+`tools/container_security/security/run_cargo_audit.sh` は、上の「由来」の名前と版（crates.io の quiche 0.24.9）を RustSec と
+GitHub の勧告（GHSA）に突き合わせる。上の差分で直した勧告は版では一致し続けるので、次の行で外す（理由が無いものは書かない）。
+
+- advisory-ignore: GHSA-mh64-ph39-mrc9（差分 6 で修正済み。veil は `ffi` feature を使わない）

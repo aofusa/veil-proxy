@@ -132,7 +132,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 3i E2E sanitizer | `chaos/e2e_sanitizer_chaos.sh` | ASAN/TSAN ビルドの Veil にカオス負荷 + SIGHUP を与え UAF/リーク/データ競合を実行検出（F-85、既定 SKIP。`RUN_E2E_ASAN=1`/`RUN_E2E_TSAN=1`）。LeakSanitizer は終了時に走るので SIGTERM 後の終了（`SAN_EXIT_WAIT` 秒以内・終了コード 0）まで確かめ、ptrace を妨げる seccomp・Landlock・特権降格は外して起動する（B-116） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
-| 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性（と、ライブラリが同梱する Swagger UI の npm の advisory。F-264） |
+| 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性（と、ライブラリが同梱する Swagger UI の npm の advisory。F-264）。vendoring 版（`third_party/*`）は `README.veil.md` の元の名前と版で RustSec と GitHub の勧告（`vendored_ghsa_audit.py`）に照合し、差分で直した勧告は `- advisory-ignore: ID（理由）` で外す（F-277） |
 | 4c cargo-deny | `security/run_cargo_deny.sh` | advisory + ライセンス（`deny.toml`） |
 | 4d semgrep(SAST) | `security/run_semgrep.sh` | 自作コードの静的解析（`p/rust`+`p/security-audit`、F-64） |
 | 4e SBOM | `security/run_sbom.sh` | syft で source(CycloneDX)+image(SPDX) 生成（F-65） |
@@ -268,6 +268,7 @@ tools/container_security/
 ├── security/
 │   ├── run_cargo_audit.sh
 │   ├── run_cargo_deny.sh
+│   ├── vendored_ghsa_audit.py   # vendoring 版を GitHub の勧告と照合（F-277）
 │   └── run_testssl.sh
 ├── lib/
 │   ├── common.sh          # 起動・cleanup・run_harness

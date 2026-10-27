@@ -62,6 +62,9 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.tag }}
       - name: cargo audit (every Cargo.lock, warnings are errors)
+        env:
+          # vendoring 版を GitHub の勧告と照合する API の上限を広げる（F-277）
+          GITHUB_TOKEN: ${{ github.token }}
         run: tools/container_security/security/run_cargo_audit.sh
       - name: cargo deny (advisories, licenses)
         env:
