@@ -571,7 +571,7 @@
 | B-236 | P2 | 修正済み（v0.10.0） | [bugs/B-236-wasm-host-abi-ptr-len-unchecked-add.md](bugs/B-236-wasm-host-abi-ptr-len-unchecked-add.md) | Wasm のホスト関数（約 25 箇所）がゲストの `ptr`/`len` を符号拡張して無検査で加算し、不正な値で接続のタスクが panic する（接続単位で封じ込められる）。共通のヘルパで `checked_add` + `get(..)` |
 | B-237 | P3 | 修正済み（v0.10.0） | [bugs/B-237-jwks-key-without-alg-accepts-any-alg.md](bugs/B-237-jwks-key-without-alg-accepts-any-alg.md) | JWKS の鍵に `alg` が無いと、トークン側の `alg` でその鍵種の任意のアルゴリズム（RS*・PS*）を受理する |
 | B-238 | P3 | 修正済み（v0.10.0） | [bugs/B-238-ci-workflows-tag-pinned-no-permissions.md](bugs/B-238-ci-workflows-tag-pinned-no-permissions.md) | `ci.yml`・`container-security-nightly.yml`・`release-sbom.yml` の Actions がタグ固定で、`ci.yml` に `permissions:` が無い（公開系は SHA 固定済み） |
-| B-239 | P3 | 未修正 | [bugs/B-239-docker-base-images-latest-curl-sh.md](bugs/B-239-docker-base-images-latest-curl-sh.md) | Docker のベースイメージがタグ無し・`latest` で、`Dockerfile.lib` が rustup を `curl \| sh` で入れる（digest の固定と sha256 の検証） |
+| B-239 | P3 | 修正済み（v0.10.0） | [bugs/B-239-docker-base-images-latest-curl-sh.md](bugs/B-239-docker-base-images-latest-curl-sh.md) | Docker のベースイメージがタグ無し・`latest` で、`Dockerfile.lib` が rustup を `curl \| sh` で入れる（digest の固定と sha256 の検証） |
 | B-240 | P2 | 修正済み（v0.10.0） | [bugs/B-240-large-request-futures-memcpy.md](bugs/B-240-large-request-futures-memcpy.md) | 要求ごとの future（HTTP/2 のストリームのタスク 11.5KB、静的配信の子に Wasm の 5KB）の move の `memcpy` が FreeBSD の h2c 3B でユーザ空間の CPU の 28%。Wasm のコールバックを箱に入れ、reactor ではストリームのタスクをプールのスロットの中で作る（h2c 3B で CPU/要求 −11%） |
 
 ---

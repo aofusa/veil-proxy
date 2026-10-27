@@ -24,7 +24,7 @@
 # ==========================================
 # 1. ツールチェーンステージ
 # ==========================================
-FROM messense/cargo-zigbuild AS tool-builder
+FROM messense/cargo-zigbuild:latest@sha256:eb5578cfc06e070a09deb7b5852474bd128a4e561f9f123261b5ed2405e478b1 AS tool-builder
 
 WORKDIR /app
 

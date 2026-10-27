@@ -9,7 +9,7 @@
 #
 # 注入: Pod の注釈 `config.linkerd.io/proxy-image: veil.local/linkerd-proxy` と `config.linkerd.io/proxy-version: edge-26.10.1`
 # （または `linkerd inject --proxy-image ... --proxy-version ...`）。init も同じイメージを使うので、本家のタグに合わせる。
-ARG LINKERD_PROXY_IMAGE=cr.l5d.io/linkerd/proxy:edge-26.10.1
+ARG LINKERD_PROXY_IMAGE=cr.l5d.io/linkerd/proxy:edge-26.10.1@sha256:f2add36071cfca33754d2930800860785aaed672590bc0207be2f4da9889eb11
 ARG VEIL_IMAGE=veil:musl-mesh
 FROM ${VEIL_IMAGE} AS veil
 FROM ${LINKERD_PROXY_IMAGE}

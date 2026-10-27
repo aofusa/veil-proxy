@@ -22,7 +22,7 @@
 # ==========================================
 # 1. ツールチェーンステージ
 # ==========================================
-FROM messense/cargo-xwin AS tool-builder
+FROM messense/cargo-xwin:latest@sha256:9856b895265d4966f212228ba64802cf89337e2a2a537aa2533c1b8784cbc81b AS tool-builder
 
 WORKDIR /app
 

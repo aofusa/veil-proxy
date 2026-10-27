@@ -39,7 +39,7 @@ ARG RUNTIME_PLATFORM=linux/arm64
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
-FROM --platform=${BUILDER_PLATFORM} messense/cargo-zigbuild AS tool-builder
+FROM --platform=${BUILDER_PLATFORM} messense/cargo-zigbuild:latest@sha256:eb5578cfc06e070a09deb7b5852474bd128a4e561f9f123261b5ed2405e478b1 AS tool-builder
 
 WORKDIR /app
 
@@ -158,7 +158,7 @@ RUN find src -name '*.rs' -exec touch {} + \
 # 既定のユーザーは nonroot（65532）だが、distroless（root で起動し、設定の drop_privileges で降格する）と
 # 同じ振る舞いにするため root で起動する。作業ディレクトリも CMD の `./veil` のために / に固定する。
 # --platform はファイル冒頭で宣言した RUNTIME_PLATFORM を使う
-FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic:latest AS runtime
+FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runtime
 
 ARG RUST_TARGET=aarch64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28

@@ -6,14 +6,28 @@
 #
 # manylinux_2_28（AlmaLinux 8、glibc 2.28）でビルドするので、wheel と libveil.so は glibc 2.28 以上の
 # Linux（RHEL 8+・Debian 10+・Ubuntu 20.04+）で動く。
-ARG MANYLINUX=quay.io/pypa/manylinux_2_28_x86_64
+ARG MANYLINUX=quay.io/pypa/manylinux_2_28_x86_64:latest@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
 
 FROM ${MANYLINUX} AS builder
 ARG LIB_KINDS=rust,c,python
 ARG CARGO_PROFILE=dist
+# rustup-init は版と sha256 を固定して検証する（B-239。curl | sh にしない）
+ARG RUSTUP_VERSION=1.29.2
+ARG RUSTUP_SHA256_X86_64=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4
+ARG RUSTUP_SHA256_AARCH64=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697
 # aws-lc-sys のビルドに cmake・clang（bindgen）、成果物の zip に zip が要る
-RUN dnf install -y -q clang cmake perl zip && dnf clean all \
-    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN set -eux; dnf install -y -q clang cmake perl zip && dnf clean all; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) sha="${RUSTUP_SHA256_X86_64}" ;; \
+      aarch64) sha="${RUSTUP_SHA256_AARCH64}" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -sSfo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${arch}-unknown-linux-gnu/rustup-init"; \
+    echo "${sha}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --profile minimal --default-toolchain stable; \
+    rm /tmp/rustup-init
 ENV PATH=/root/.cargo/bin:/opt/python/cp312-cp312/bin:$PATH
 WORKDIR /app
 COPY . /app

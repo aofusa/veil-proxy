@@ -5,3 +5,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # B-239: Dockerfile のベースイメージは digest で固定しているので、更新は dependabot の PR で受ける
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
