@@ -1229,8 +1229,25 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             return (Ok(len), buf);
         }
 
-        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）
+        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）。平文以外のレコード（TLS 1.3 の
+        // NewSessionTicket・close_notify）では EIO になるので、そのときだけ取り出して処理する（B-259）
         if self.mode != TlsMode::Rustls {
+            #[cfg(target_os = "linux")]
+            loop {
+                let (res, b) = self.inner.read(buf).await;
+                buf = b;
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
+                            Ok(crate::ktls::ControlRecord::Skipped) => continue,
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => return (Ok(0), buf),
+                            Err(e) => return (Err(e), buf),
+                        }
+                    }
+                    res => return (res, buf),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             return self.inner.read(buf).await;
         }
 
@@ -1390,8 +1407,25 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
             return (Ok(len), buf);
         }
 
-        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）
+        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）。平文以外のレコード（TLS 1.3 の
+        // NewSessionTicket・close_notify）では EIO になるので、そのときだけ取り出して処理する（B-259）
         if self.mode != TlsMode::Rustls {
+            #[cfg(target_os = "linux")]
+            loop {
+                let (res, b) = self.inner.read(buf).await;
+                buf = b;
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
+                            Ok(crate::ktls::ControlRecord::Skipped) => continue,
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => return (Ok(0), buf),
+                            Err(e) => return (Err(e), buf),
+                        }
+                    }
+                    res => return (res, buf),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             return self.inner.read(buf).await;
         }
 
