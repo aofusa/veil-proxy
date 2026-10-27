@@ -460,6 +460,11 @@ pub(super) fn process_datagram_segments(
                 }
             }
             handler.conn.set_time_hint(None);
+            // B-256: パスのイベント（相手の送信元の変更など）は使わないが、取り出さないと接続の寿命の間
+            // 溜まり続ける（GHSA-4q5x-gp38-rfp4。アクティブマイグレーションを無効にしていても起きる）
+            while let Some(ev) = handler.conn.path_event_next() {
+                debug!("[HTTP/3] path event: {:?}", ev);
+            }
 
             // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
             // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。

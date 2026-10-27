@@ -379,6 +379,7 @@ pub async fn run_http3_server_async(
         config.retry_threshold,
         config.handshake_timeout,
     );
+    configure_max_field_section_size(config.max_field_section_size);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
     // F-130 C1/C2: io_uring RECVMSG バックエンド（Linux uring バックエンド）。

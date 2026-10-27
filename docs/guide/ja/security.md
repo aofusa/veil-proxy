@@ -423,6 +423,9 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
 - HTTP/3 はワーカーごとの接続数に上限を持ち（`[http3] max_connections`）、ハンドシェイク中の接続が `retry_threshold` に
   達したら Initial にステートレスな Retry を返し、`handshake_timeout` までに確立しない接続を捨てる。送信元を偽装した
   Initial の洪水で接続を際限なく確保させない。
+- HTTP/3 のフレームは宣言された長さで先に確保しない。大きなフレームは届いた分だけバッファを伸ばし、ヘッダは
+  `[http3] max_field_section_size` で上限を見て（長さの宣言の時点と QPACK の復号中）、パスのイベントは取り出して捨てるので、
+  送信元のポートを変え続ける相手にキューを伸ばさせない（quiche 0.29.3 の GHSA-4fgf-9xrr-88gf・GHSA-4q5x-gp38-rfp4 の修正の取り込み）。
 - HTTP/2・HTTP/3 のバッファ経路の要求本文は、溜める途中で上限（全ルートの `max_request_body_size` の最大。
   最低 10MB）を見て、超えたストリームを断る。
 - Linkerd の管理ポートの `/shutdown`・`/env.json` はループバックからだけ受ける。

@@ -26,7 +26,7 @@
 use crate::cache;
 #[cfg(target_os = "linux")]
 use crate::runtime::handle::AsRawFd;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 // CString / FromRawFd / Seek / Write は memfd 経由の証明書リロード（Linux 専用）でのみ
@@ -629,6 +629,21 @@ pub struct Http3ServerConfig {
     pub retry_threshold: usize,
     /// B-222: ハンドシェイクの期限（ミリ秒）。デフォルト: 10000
     pub handshake_timeout: u64,
+    /// B-255: `SETTINGS_MAX_FIELD_SECTION_SIZE`（要求のヘッダの大きさの上限）。デフォルト: 65536
+    pub max_field_section_size: u64,
+}
+
+/// B-255: `[http3] max_field_section_size` の既定（`[http2] max_header_list_size` と同じ）
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 65_536;
+
+thread_local! {
+    /// ワーカーの `[http3] max_field_section_size`（接続ごとの `h3::Config` に入れる）
+    static H3_MAX_FIELD_SECTION_SIZE: Cell<u64> = const { Cell::new(DEFAULT_MAX_FIELD_SECTION_SIZE) };
+}
+
+/// ワーカーの起動時に `[http3] max_field_section_size` を入れる（B-255）。
+pub(crate) fn configure_max_field_section_size(v: u64) {
+    H3_MAX_FIELD_SECTION_SIZE.with(|c| c.set(v));
 }
 
 impl Default for Http3ServerConfig {
@@ -657,6 +672,7 @@ impl Default for Http3ServerConfig {
             max_connections: admission::DEFAULT_MAX_CONNECTIONS,
             retry_threshold: admission::DEFAULT_RETRY_THRESHOLD,
             handshake_timeout: admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 }
@@ -1070,7 +1086,9 @@ impl Http3Handler {
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
     fn init_h3(&mut self) -> io::Result<()> {
         if self.h3_conn.is_none() && self.conn.is_established() && !self.conn.is_closed() {
-            let h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
+            let mut h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
+            // B-255: 宣言だけの大きな HEADERS で確保させない上限を広告する
+            h3_config.set_max_field_section_size(H3_MAX_FIELD_SECTION_SIZE.with(Cell::get));
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             self.h3_conn = Some(h3);

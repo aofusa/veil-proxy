@@ -1,6 +1,6 @@
 # B-255: vendoring の quiche 0.24.9 が HTTP/3 のフレーム長の宣言だけでストリームごとに最大 16MB を確保し、QPACK の上限計算も誤っている（GHSA-4fgf-9xrr-88gf、CVE-2026-12523）
 
-**状態: 未修正（2026-10-28 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -40,6 +40,14 @@ veil の vendoring 版（`third_party/quiche/src/h3/stream.rs`）では:
 - `fuzz/` に「HEADERS の長さ宣言だけを送るストリーム」の target を足し、RSS の上限を assert する。
 - `tools/container_security` の `http3` フェーズ（h3spec・h2load）が従来どおり通る。
 - `cargo audit` 相当の照合で quiche の GHSA を失敗にできる（F-277）。
+
+## 修正（v0.10.0）
+
+- upstream の 0.29.3 の 7 コミット（`b732cbfa97`・`1e0e53767a`・`1b52c6b05d`・`9be0e4fa18`・`8215ecdd74`・`f61d62d94e`・`439795b00f`）を upstream の 0.24.9 の上へ順に cherry-pick し（衝突は `stream.rs` の 2 か所。0.24.9 の `range_buf::BufFactory` と、0.24.9 に無い `critical_stream_closed` を足して解消）、その差分を `third_party/quiche` へ当てた（`README.veil.md` の差分 7、版 `0.24.9-veil.4`）。`octets` は 0.3.6 以上（`get_huffman_decoded_with_max_length`）。
+- veil 側: `[http3] max_field_section_size`（既定 65536 = `[http2] max_header_list_size`）を足し、接続ごとの `h3::Config` で `SETTINGS_MAX_FIELD_SECTION_SIZE` として広告する（quiche の新しい既定 32KiB を上書き。veil の要求ヘッダの上限 8KB を超えてこれ以下は従来どおり 431、超えたら H3_EXCESSIVE_LOAD で接続を閉じる）。文書（英日）と `examples/config.toml` を更新。
+- F-277 の照合: `vendored_ghsa_audit.py` が README.veil.md の `- advisory-repo:` で上流のリポジトリの勧告も見る（この 2 件は GitHub の全体の勧告に載っていない）。範囲は `,`・`&&`・`X+` と系列ごとの直した版を解釈する。quiche・wasmtime・quinn-udp で通る。
+- 試験: vendoring 版の上流の試験（`cargo test -p veil-proxy-quiche --features aws-lc-sys --lib`、`examples/` の証明書を一時的に置く）。当てる前後で失敗する 75 件（aws-lc での 0-RTT 等、当てる前から）は同じで、増えた 19 件（`large_state_buf_*`・`large_headers_*`・`large_priority_update_*` など）はすべて通る。E2E `test_b255_http3_header_section_within_limit_keeps_connection`（40KB のヘッダは 431 で接続は残る。上限を 32KiB にすると H3_EXCESSIVE_LOAD で落ちることを確認）。E2E は io_uring・epoll とも 575/575。
+- 残り: fuzz の target は足していない（上流の単体試験で代える）。根本の quiche 0.29.3 への追従は F-277 の残り。
 
 ## 関連
 

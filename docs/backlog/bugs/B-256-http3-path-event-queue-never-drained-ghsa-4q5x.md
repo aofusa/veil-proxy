@@ -1,6 +1,6 @@
 # B-256: HTTP/3 のサーバが quiche の `path_event_next()` を一度も呼ばず、相手の送信元の変更ごとに PathEvent が溜まる（GHSA-4q5x-gp38-rfp4、CVE-2026-12707）
 
-**状態: 未修正（2026-10-28 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -30,6 +30,13 @@
 
 - 単体: 送信元ポートを変えたパケットを多数処理しても `path_event_next()` の未消費の件数が 0 のまま、または上限で接続が閉じること。
 - `tools/container_security` の `http3` フェーズが通る。
+
+## 修正（v0.10.0）
+
+- vendoring の quiche に upstream の `439795b00f`（PathEvent をパスの挿入まで遅らせてキューを抑える）を当てた（B-255 と同じ差分 7、0.24.9-veil.4）。
+- veil 側: `event_loop.rs` の受信処理で `conn.recv` の後に `path_event_next()` を空になるまで取り出す（`debug!` のみ。veil はパスのイベントを使わない）。空のキューの確認だけなのでホットパスの費用は無視できる。
+- 試験: 上流のキューの上限の試験（vendoring 版の `tests.rs`）が通る。E2E（HTTP/3 を含む）は io_uring・epoll とも 575/575。
+- 残り: 改修案 3（`max_path_changes`）は入れていない（上流の修正でキューは抑えられ、veil も取り出すので、パス変更の回数そのものの上限は F-283 で扱う）。
 
 ## 関連
 

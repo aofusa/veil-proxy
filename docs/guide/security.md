@@ -429,6 +429,10 @@ Request-level hardening that came out of the audit:
 - HTTP/3 caps connections per worker (`[http3] max_connections`), answers Initials with a stateless Retry once
   `retry_threshold` connections are handshaking, and drops connections that do not finish the handshake within
   `handshake_timeout`, so a flood of Initials from spoofed addresses cannot allocate connections without bound.
+- HTTP/3 frames are not allocated from their announced length: large frames grow their buffer as bytes arrive,
+  header sections are capped by `[http3] max_field_section_size` (checked on the announced length and while QPACK
+  decodes), and path events are consumed so a peer that keeps changing its source port cannot grow a queue
+  (backports of quiche 0.29.3 fixes for GHSA-4fgf-9xrr-88gf and GHSA-4q5x-gp38-rfp4).
 - HTTP/2 and HTTP/3 buffered request bodies are capped while they accumulate (the largest
   `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
 - The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.

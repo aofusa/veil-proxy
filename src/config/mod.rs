@@ -1199,6 +1199,14 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_handshake_timeout")]
     pub handshake_timeout: u64,
 
+    /// 受け付ける要求のヘッダの大きさの上限（バイト、B-255）。`SETTINGS_MAX_FIELD_SECTION_SIZE` として相手に広告し、
+    /// HEADERS フレームの長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 9114 §4.2.2）で検査する。
+    /// 超えた接続は閉じる。
+    ///
+    /// デフォルト: `65536`（`[http2] max_header_list_size` と同じ）
+    #[serde(default = "default_h3_max_field_section_size")]
+    pub max_field_section_size: u64,
+
     // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
@@ -1259,6 +1267,9 @@ fn default_h3_retry_threshold() -> usize {
 fn default_h3_handshake_timeout() -> u64 {
     10_000
 }
+fn default_h3_max_field_section_size() -> u64 {
+    65_536
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -1286,6 +1297,7 @@ impl Default for Http3ConfigSection {
             max_connections: default_h3_max_connections(),
             retry_threshold: default_h3_retry_threshold(),
             handshake_timeout: default_h3_handshake_timeout(),
+            max_field_section_size: default_h3_max_field_section_size(),
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -1329,6 +1341,7 @@ impl Http3ConfigSection {
             max_connections: self.max_connections,
             retry_threshold: self.retry_threshold,
             handshake_timeout: self.handshake_timeout,
+            max_field_section_size: self.max_field_section_size,
         }
     }
 }

@@ -164,3 +164,7 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
 した（新しい rustc の `function_casts_as_integer` lint が警告する関数アイテムの直接キャスト。
 lint 名で allow すると、この lint を知らない古い rustc（BSD の pkg 版など）で `unknown lint`
 警告になるため、lint の提案どおりにソースを直した。得られるアドレスは同じ）。
+
+## 照合する勧告（F-277）
+
+- advisory-repo: bytecodealliance/wasmtime（上流のリポジトリの勧告も照合する）
