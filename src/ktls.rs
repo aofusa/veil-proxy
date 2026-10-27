@@ -155,6 +155,14 @@ impl CryptoInfo {
     }
 }
 
+// B-229: setsockopt が失敗して `?` で戻る経路では secure_clear が呼ばれず、鍵がスタック・ヒープに残っていた。
+// どの経路で落としてもゼロ化する（成功の経路の secure_clear と二重になっても無害）。
+impl Drop for CryptoInfo {
+    fn drop(&mut self) {
+        self.secure_clear();
+    }
+}
+
 // ====================
 // エラー型
 // ====================
@@ -484,6 +492,14 @@ pub struct TlsKeyMaterial {
     pub rec_seq: [u8; 8],
     /// TLS バージョン（`TLS_1_2_VERSION` / `TLS_1_3_VERSION`）
     pub version: u16,
+}
+
+// B-229: CryptoInfo と同じく、失敗の経路でも落とすときにゼロ化する
+#[cfg(target_os = "freebsd")]
+impl Drop for TlsKeyMaterial {
+    fn drop(&mut self) {
+        self.secure_clear();
+    }
 }
 
 #[cfg(target_os = "freebsd")]
