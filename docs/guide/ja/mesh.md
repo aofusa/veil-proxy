@@ -67,6 +67,9 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
     書かないときも正規化する）。エスケープされたスラッシュの扱いで拒否する要求は 400（`DPE`）。
   - `remoteIpBlocks` は Envoy の「元のクライアントのアドレス」を使う: `use_remote_address` なら接続の相手、そうでなければ
     X-Forwarded-For の右から `xff_num_trusted_hops` 番目。クライアントが書ける左端は使わない。
+  - veil が評価できない RBAC の規則（CEL の条件、permission の `metadata`・`matcher`）は安全側に倒す: ALLOW のポリシーでは
+    一致させず、DENY のポリシーでは常に一致させる（`not_rule`・`not_id` の下では反転）。そのようなポリシーを受け取ると
+    ポリシー名付きで警告を出す。
 - 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
 - WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く。`FAIL_CLOSE` はモジュールが落ちたら 503）。

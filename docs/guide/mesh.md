@@ -70,6 +70,9 @@ Supported (checked with `tools/k8s/mesh-e2e.sh`, stock / veil / mixed):
     default, also when the HCM does not set `normalize_path`). A request the escaped-slash action rejects gets 400 (`DPE`).
   - `remoteIpBlocks` uses Envoy's original client address: the peer with `use_remote_address`, otherwise the
     X-Forwarded-For entry `xff_num_trusted_hops` from the right. The client-controlled leftmost entry is never used.
+  - RBAC rules veil cannot evaluate (CEL conditions, `metadata` and `matcher` permissions) fail closed: in an ALLOW
+    policy they never match, in a DENY policy they always match (inverted under `not_rule`/`not_id`). veil logs a
+    warning with the policy name when it receives such a policy.
 - Telemetry: Istio's standard metrics (`istio_requests_total` etc. through pilot-agent's merged metrics),
   Telemetry API access logs (Envoy's default format), distributed tracing (Zipkin / B3).
 - WasmPlugin (ECDS → veil's Proxy-Wasm, including C++ SDK modules; `FAIL_CLOSE` returns 503 when the module traps).

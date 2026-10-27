@@ -265,8 +265,34 @@ fn from_rules(rules: Option<&Rbac>, shadow: Option<&Rbac>) -> R<RbacCfg> {
     for name in names {
         let pol = &r.policies[name];
         let unsupported_condition = pol.condition.is_some();
-        let mut permissions = pol.permissions.iter().map(perm).collect::<R<Vec<_>>>()?;
-        let principals = pol.principals.iter().map(princ).collect::<R<Vec<_>>>()?;
+        // 評価できない葉の値: ALLOW（と LOG）は一致させず、DENY は一致させる（否定の下では反転）
+        let mut cx = Cx {
+            fallback: matches!(action, RbacAction::Deny),
+            unsupported: 0,
+        };
+        let mut permissions = pol
+            .permissions
+            .iter()
+            .map(|x| perm(x, &mut cx))
+            .collect::<R<Vec<_>>>()?;
+        let principals = pol
+            .principals
+            .iter()
+            .map(|x| princ(x, &mut cx))
+            .collect::<R<Vec<_>>>()?;
+        if cx.unsupported > 0 {
+            // 設定の受信時だけ（要求ごとではない）
+            ftlog::warn!(
+                "RBAC policy '{}': {} unsupported rule(s) evaluated as {} (fail-closed)",
+                name,
+                cx.unsupported,
+                if cx.fallback {
+                    "matching"
+                } else {
+                    "not matching"
+                }
+            );
+        }
         if unsupported_condition {
             // CEL は評価できない: ALLOW は一致させない、DENY は常に一致させる
             permissions = match action {
@@ -309,17 +335,62 @@ fn cidr(c: &p::CidrRange) -> R<Cidr> {
     Ok(Cidr { addr, len })
 }
 
-fn perm(x: &Permission) -> R<RbacPermission> {
+/// 変換の文脈。
+struct Cx {
+    /// 評価できない葉を置き換える値（否定の下に入るたびに反転する）
+    fallback: bool,
+    /// 評価できずに置き換えた葉の数
+    unsupported: usize,
+}
+
+impl Cx {
+    fn unsupported_perm(&mut self) -> RbacPermission {
+        self.unsupported += 1;
+        if self.fallback {
+            RbacPermission::Any
+        } else {
+            RbacPermission::Not(Box::new(RbacPermission::Any))
+        }
+    }
+
+    fn unsupported_princ(&mut self) -> RbacPrincipal {
+        self.unsupported += 1;
+        if self.fallback {
+            RbacPrincipal::Any
+        } else {
+            RbacPrincipal::Not(Box::new(RbacPrincipal::Any))
+        }
+    }
+
+    /// 否定の中を変換する（安全側の値が反転する）
+    fn negated<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        self.fallback = !self.fallback;
+        let r = f(self);
+        self.fallback = !self.fallback;
+        r
+    }
+}
+
+/// `PathMatcher` の照合（空なら `None` = 評価できない）。
+fn path_matcher(pm: &PathMatcher) -> R<Option<StringMatcher>> {
+    pm.path.as_ref().map(string_matcher).transpose()
+}
+
+fn perm(x: &Permission, cx: &mut Cx) -> R<RbacPermission> {
     use permission::Rule as P;
     Ok(match &x.rule {
-        Some(P::AndRules(s)) => RbacPermission::And(s.rules.iter().map(perm).collect::<R<_>>()?),
-        Some(P::OrRules(s)) => RbacPermission::Or(s.rules.iter().map(perm).collect::<R<_>>()?),
+        Some(P::AndRules(s)) => {
+            RbacPermission::And(s.rules.iter().map(|r| perm(r, cx)).collect::<R<_>>()?)
+        }
+        Some(P::OrRules(s)) => {
+            RbacPermission::Or(s.rules.iter().map(|r| perm(r, cx)).collect::<R<_>>()?)
+        }
         Some(P::Any(true)) => RbacPermission::Any,
         Some(P::Any(false)) => RbacPermission::Not(Box::new(RbacPermission::Any)),
         Some(P::Header(h)) => RbacPermission::Header(header(h)?),
-        Some(P::UrlPath(pm)) => match &pm.path {
-            Some(sm) => RbacPermission::Path(string_matcher(sm)?),
-            None => RbacPermission::Any,
+        Some(P::UrlPath(pm)) => match path_matcher(pm)? {
+            Some(m) => RbacPermission::Path(m),
+            None => cx.unsupported_perm(),
         },
         Some(P::DestinationIp(c)) => RbacPermission::DestIp(cidr(c)?),
         Some(P::DestinationPort(port)) => RbacPermission::DestPort(*port as u16),
@@ -329,20 +400,22 @@ fn perm(x: &Permission) -> R<RbacPermission> {
                 .map(|p| RbacPermission::DestPort(p as u16))
                 .collect(),
         ),
-        Some(P::NotRule(n)) => RbacPermission::Not(Box::new(perm(n)?)),
+        Some(P::NotRule(n)) => RbacPermission::Not(Box::new(cx.negated(|cx| perm(n, cx))?)),
         Some(P::RequestedServerName(sm)) => RbacPermission::Sni(string_matcher(sm)?),
-        // 評価できない（安全側は呼び出し元のポリシーの種類で決まるので、ここでは「一致しない」）
-        Some(P::Metadata(_)) | Some(P::Matcher(_)) | None => {
-            RbacPermission::Not(Box::new(RbacPermission::Any))
-        }
+        // 評価できない: ポリシーの種類で安全側に倒す（ALLOW は一致させず、DENY は一致させる）
+        Some(P::Metadata(_)) | Some(P::Matcher(_)) | None => cx.unsupported_perm(),
     })
 }
 
-fn princ(x: &Principal) -> R<RbacPrincipal> {
+fn princ(x: &Principal, cx: &mut Cx) -> R<RbacPrincipal> {
     use principal::Identifier as I;
     Ok(match &x.identifier {
-        Some(I::AndIds(s)) => RbacPrincipal::And(s.ids.iter().map(princ).collect::<R<_>>()?),
-        Some(I::OrIds(s)) => RbacPrincipal::Or(s.ids.iter().map(princ).collect::<R<_>>()?),
+        Some(I::AndIds(s)) => {
+            RbacPrincipal::And(s.ids.iter().map(|i| princ(i, cx)).collect::<R<_>>()?)
+        }
+        Some(I::OrIds(s)) => {
+            RbacPrincipal::Or(s.ids.iter().map(|i| princ(i, cx)).collect::<R<_>>()?)
+        }
         Some(I::Any(true)) => RbacPrincipal::Any,
         Some(I::Any(false)) => RbacPrincipal::Not(Box::new(RbacPrincipal::Any)),
         Some(I::Authenticated(a)) => RbacPrincipal::Authenticated(match &a.principal_name {
@@ -353,7 +426,11 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
         Some(I::DirectRemoteIp(c)) => RbacPrincipal::DirectRemoteIp(cidr(c)?),
         Some(I::RemoteIp(c)) => RbacPrincipal::RemoteIp(cidr(c)?),
         Some(I::Header(h)) => RbacPrincipal::Header(header(h)?),
-        Some(I::UrlPath(_)) => RbacPrincipal::Any,
+        // Envoy の principal の url_path は permission の url_path と同じ照合
+        Some(I::UrlPath(pm)) => match path_matcher(pm)? {
+            Some(m) => RbacPrincipal::Path(m),
+            None => cx.unsupported_princ(),
+        },
         Some(I::Metadata(m)) => {
             let pr = RbacPrincipal::Metadata {
                 filter: m.filter.clone(),
@@ -369,7 +446,7 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
                 pr
             }
         }
-        Some(I::NotId(n)) => RbacPrincipal::Not(Box::new(princ(n)?)),
+        Some(I::NotId(n)) => RbacPrincipal::Not(Box::new(cx.negated(|cx| princ(n, cx))?)),
         // waypoint: HBONE の mTLS の相手（`%DOWNSTREAM_PEER_URI_SAN%`）。veil は内部リスナーへ相手の ID を
         // そのまま引き継ぐので、認証済みの主体と同じに扱う
         Some(I::FilterState(f)) if f.key == "io.istio.peer_principal" => {
@@ -381,7 +458,7 @@ fn princ(x: &Principal) -> R<RbacPrincipal> {
         Some(I::FilterState(f)) => {
             return Err(format!("unsupported RBAC filter_state principal {}", f.key));
         }
-        None => RbacPrincipal::Not(Box::new(RbacPrincipal::Any)),
+        None => cx.unsupported_princ(),
     })
 }
 
@@ -422,6 +499,15 @@ pub struct RbacInput<'a> {
     pub http: bool,
 }
 
+/// 要求のパス（クエリを除く）の照合。TCP の RBAC では一致しない。
+fn path_matches(m: &StringMatcher, i: &RbacInput<'_>) -> bool {
+    i.http && {
+        let p = i.path;
+        let p = p.split(|&b| b == b'?').next().unwrap_or(p);
+        m.matches(p)
+    }
+}
+
 fn eval_perm(x: &RbacPermission, i: &RbacInput<'_>) -> bool {
     match x {
         RbacPermission::Any => true,
@@ -429,13 +515,7 @@ fn eval_perm(x: &RbacPermission, i: &RbacInput<'_>) -> bool {
         RbacPermission::Or(v) => v.iter().any(|p| eval_perm(p, i)),
         RbacPermission::Not(p) => !eval_perm(p, i),
         RbacPermission::Header(h) => i.http && h.matches((i.header)(&h.name).as_deref()),
-        RbacPermission::Path(m) => {
-            i.http && {
-                let p = i.path;
-                let p = p.split(|&b| b == b'?').next().unwrap_or(p);
-                m.matches(p)
-            }
-        }
+        RbacPermission::Path(m) => path_matches(m, i),
         RbacPermission::DestIp(c) => i.dst.is_some_and(|d| c.contains(d.ip())),
         RbacPermission::DestPort(port) => i.dst.is_some_and(|d| d.port() == *port),
         RbacPermission::Sni(m) => i.sni.is_some_and(|s| m.matches(s.as_bytes())),
@@ -467,6 +547,7 @@ fn eval_princ(x: &RbacPrincipal, i: &RbacInput<'_>) -> bool {
             .or(i.direct_remote)
             .is_some_and(|ip| c.contains(ip)),
         RbacPrincipal::Header(h) => i.http && h.matches((i.header)(&h.name).as_deref()),
+        RbacPrincipal::Path(m) => path_matches(m, i),
         RbacPrincipal::Metadata {
             filter,
             path,
@@ -543,7 +624,11 @@ mod tests {
         };
         // ワイヤ形式を経由しても失われない（oneof の tags に 12 が無いと None になり全拒否になっていた）
         let decoded = Principal::decode(pr.encode_to_vec().as_slice()).unwrap();
-        let x = princ(&decoded).unwrap();
+        let mut cx = Cx {
+            fallback: false,
+            unsupported: 0,
+        };
+        let x = princ(&decoded, &mut cx).unwrap();
         let none = |_: &str| None;
         let md = |_: &str, _: &[String]| None;
         assert!(eval_princ(
@@ -639,5 +724,89 @@ mod tests {
         let md = |_: &str, _: &[String]| None;
         assert!(!allowed(&cfg, &input(None, b"/admin/x", &h, &md)));
         assert!(allowed(&cfg, &input(None, b"/public?a=/admin", &h, &md)));
+    }
+
+    fn prefix(p: &str) -> p::StringMatcher {
+        p::StringMatcher {
+            ignore_case: false,
+            pattern: Some(p::string_matcher::Pattern::Prefix(p.into())),
+        }
+    }
+
+    fn rbac(action: i32, pol: Policy) -> Rbac {
+        Rbac {
+            action,
+            policies: [("p".to_string(), pol)].into_iter().collect(),
+        }
+    }
+
+    fn any_principal() -> Principal {
+        Principal {
+            identifier: Some(principal::Identifier::Any(true)),
+        }
+    }
+
+    /// 評価できない permission（metadata・matcher）は DENY では一致させる（何も拒否しないポリシーにしない）。
+    #[test]
+    fn unsupported_permission_in_deny_policy_denies() {
+        let h = |_: &str| None;
+        let md = |_: &str, _: &[String]| None;
+        for rule in [
+            permission::Rule::Metadata(MetadataMatcher::default()),
+            permission::Rule::Matcher(p::Empty::default()),
+        ] {
+            let pol = Policy {
+                permissions: vec![Permission { rule: Some(rule) }],
+                principals: vec![any_principal()],
+                condition: None,
+            };
+            let cfg = from_rules(Some(&rbac(1, pol.clone())), None).unwrap();
+            assert!(!allowed(&cfg, &input(None, b"/", &h, &md)));
+            // ALLOW では一致させない（誰も通さない）
+            let cfg = from_rules(Some(&rbac(0, pol)), None).unwrap();
+            assert!(!allowed(&cfg, &input(None, b"/", &h, &md)));
+        }
+    }
+
+    /// 否定の下では安全側が反転する（DENY の `not_rule { metadata }` も一致させる）。
+    #[test]
+    fn unsupported_permission_under_not_rule_flips() {
+        let h = |_: &str| None;
+        let md = |_: &str, _: &[String]| None;
+        let not_md = Permission {
+            rule: Some(permission::Rule::NotRule(Box::new(Permission {
+                rule: Some(permission::Rule::Metadata(MetadataMatcher::default())),
+            }))),
+        };
+        let pol = Policy {
+            permissions: vec![not_md],
+            principals: vec![any_principal()],
+            condition: None,
+        };
+        let cfg = from_rules(Some(&rbac(1, pol.clone())), None).unwrap();
+        assert!(!allowed(&cfg, &input(None, b"/", &h, &md)));
+        let cfg = from_rules(Some(&rbac(0, pol)), None).unwrap();
+        assert!(!allowed(&cfg, &input(None, b"/", &h, &md)));
+    }
+
+    /// principal の url_path は全員ではなくパスの照合（ALLOW が全員を通さない）。
+    #[test]
+    fn principal_url_path_matches_path_only() {
+        let h = |_: &str| None;
+        let md = |_: &str, _: &[String]| None;
+        let pol = Policy {
+            permissions: vec![Permission {
+                rule: Some(permission::Rule::Any(true)),
+            }],
+            principals: vec![Principal {
+                identifier: Some(principal::Identifier::UrlPath(PathMatcher {
+                    path: Some(prefix("/public")),
+                })),
+            }],
+            condition: None,
+        };
+        let cfg = from_rules(Some(&rbac(0, pol)), None).unwrap();
+        assert!(allowed(&cfg, &input(None, b"/public/a", &h, &md)));
+        assert!(!allowed(&cfg, &input(None, b"/admin", &h, &md)));
     }
 }
