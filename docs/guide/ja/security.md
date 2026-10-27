@@ -178,7 +178,7 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 | **メモリ** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc、Huge Pages、io_uring登録バッファ |
 | **スレッド** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | ワーカースレッド |
 | **CPUアフィニティ** | `sched_setaffinity`, `sched_getaffinity` | CPUピンニング |
-| **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
+| **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `restart_syscall` | SIGTERM/SIGHUP、SIGSTOP/SIGCONT・ptrace で止まった sleep の再開 |
 | **時間** | `clock_gettime`, `nanosleep` | タイムアウト |
 | **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | 各種制御、制御プレーンのスレッドが自分に Landlock を掛ける |
 

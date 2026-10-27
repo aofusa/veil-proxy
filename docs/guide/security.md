@@ -182,7 +182,7 @@ Minimum system calls required for this server to operate:
 | **Memory** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc, Huge Pages, io_uring registered buffers |
 | **Threads** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | Worker threads |
 | **CPU Affinity** | `sched_setaffinity`, `sched_getaffinity` | CPU pinning |
-| **Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
+| **Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `restart_syscall` | SIGTERM/SIGHUP, resuming a sleep after SIGSTOP/SIGCONT or ptrace |
 | **Time** | `clock_gettime`, `nanosleep` | Timeouts |
 | **Other** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | Various control; control-plane threads restricting themselves |
 

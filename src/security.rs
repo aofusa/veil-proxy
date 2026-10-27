@@ -259,6 +259,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
+    219, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
@@ -421,6 +422,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
+    219, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
@@ -579,6 +581,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
+    128, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
@@ -733,6 +736,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
+    128, // restart_syscall (B-244: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
@@ -4355,6 +4359,8 @@ mod tests {
             ("getrandom", libc::SYS_getrandom),
             ("prlimit64", libc::SYS_prlimit64),
             ("rt_sigreturn", libc::SYS_rt_sigreturn),
+            // B-244: 止められた（SIGSTOP・ptrace）clock_nanosleep の再開。EPERM だと std の sleep が panic する
+            ("restart_syscall", libc::SYS_restart_syscall),
             ("futex", libc::SYS_futex),
             ("openat2", libc::SYS_openat2),
             ("eventfd2", libc::SYS_eventfd2),
