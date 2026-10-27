@@ -119,7 +119,13 @@ where
         receive_and_buffer_response(backend_stream, buffering_config, cache_ctx, is_head).await;
 
     match buffered {
-        Some((status_code, mut headers_data, body_result, backend_wants_keep_alive)) => {
+        Some((
+            status_code,
+            mut headers_data,
+            body_result,
+            backend_wants_keep_alive,
+            until_close,
+        )) => {
             // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
             crate::route_cors::apply_h1(&mut headers_data, security);
             // B-17: ボディのバッファリングに失敗した場合、クライアントへは未送信のため
@@ -127,6 +133,18 @@ where
             // None → 呼び出し元の 502 送出 + クローズに委ねる
             if matches!(body_result, BufferedBodyResult::Failed) {
                 return None;
+            }
+            // B-262: 接続の終わりで区切る本文は長さが分かったので Content-Length を付ける。veil はクライアントの
+            // 接続を閉じるときに close_notify を送らないので、閉じるだけでは厳格な TLS クライアントは切り詰めと区別できない
+            if until_close {
+                let len = match &body_result {
+                    BufferedBodyResult::Memory(b) => Some(b.len() as u64),
+                    BufferedBodyResult::Disk { size, .. } => Some(*size),
+                    _ => None,
+                };
+                if let Some(len) = len {
+                    add_content_length(&mut headers_data, len);
+                }
             }
             // 5. バッファからクライアントへ送信
             let mut total = 0u64;
@@ -281,21 +299,44 @@ where
                 }
             }
 
-            Some((status_code, total, backend_wants_keep_alive, false))
+            // B-262: 接続の終わりで区切る本文は長さを付けずに送っているので、クライアントの接続を閉じて
+            // 本文の終わりを伝える（閉じないとクライアントは本文の続きを待ち続ける）
+            Some((status_code, total, backend_wants_keep_alive, until_close))
         }
         None => None,
     }
 }
 
+/// 応答ヘッダ（`\r\n\r\n` で終わる）の終わりに `Content-Length` を足す。`Transfer-Encoding` があるときは足さない
+/// （併記は区切りの食い違いになる。そのときは接続を閉じて本文の終わりを伝える）
+fn add_content_length(headers_data: &mut Vec<u8>, len: u64) {
+    if !headers_data.ends_with(b"\r\n\r\n") {
+        return;
+    }
+    let has_te = headers_data
+        .split(|&b| b == b'\n')
+        .any(|line| line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:"));
+    if has_te {
+        return;
+    }
+    headers_data.truncate(headers_data.len() - 2);
+    headers_data.extend_from_slice(b"Content-Length: ");
+    let mut n = itoa::Buffer::new();
+    headers_data.extend_from_slice(n.format(len).as_bytes());
+    headers_data.extend_from_slice(b"\r\n\r\n");
+}
+
 /// バックエンドからレスポンスを受信してバッファリング
 ///
-/// 戻り値: Option<(status_code, headers_data, body_result, backend_wants_keep_alive)>
+/// 戻り値: Option<(status_code, headers_data, body_result, backend_wants_keep_alive, until_close)>
+///
+/// `until_close` は上流が接続を閉じて本文を終えた応答か（長さの無いままクライアントへ送るので、送った後に閉じる）。
 pub(super) async fn receive_and_buffer_response<R>(
     backend_stream: &mut R,
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     is_head: bool,
-) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool)>
+) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool, bool)>
 where
     R: AsyncReadRent + Unpin,
 {
@@ -359,9 +400,11 @@ where
 
             // ボディをバッファリング
             // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
+            let kind = parsed.body(is_head);
+            let until_close = matches!(kind, ResponseBody::UntilClose);
             let (body_result, reusable) = buffer_response_body_with_spillover(
                 backend_stream,
-                parsed.body(is_head),
+                kind,
                 body_start,
                 buffering_config,
                 cache_ctx,
@@ -375,6 +418,7 @@ where
                 headers_data,
                 body_result,
                 backend_wants_keep_alive,
+                until_close,
             ));
         }
 
@@ -564,4 +608,26 @@ where
     }
 
     (BufferedBodyResult::Memory(body), reusable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_content_length;
+
+    /// B-262: 接続の終わりで区切る応答に長さを足す（Transfer-Encoding があるときは足さない）
+    #[test]
+    fn add_content_length_to_close_delimited_head() {
+        let mut h =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n".to_vec();
+        add_content_length(&mut h, 23);
+        assert_eq!(
+            h,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 23\r\n\r\n"
+        );
+
+        let te = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n".to_vec();
+        let mut h = te.clone();
+        add_content_length(&mut h, 5);
+        assert_eq!(h, te);
+    }
 }

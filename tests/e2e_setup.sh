@@ -950,7 +950,7 @@ EOF
     # Specific route settings below will handle them.
     
     # バッファリング・キャッシュモード別のルート設定（streaming, full, adaptive, cached）
-    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ] || [ "$config_type" = "cache" ]; then
+    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ] || [ "$config_type" = "ktls" ] || [ "$config_type" = "cache" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
@@ -1058,7 +1058,7 @@ EOF
     fi
 
     # security プロファイル: レート制限・接続制限を集中検証
-    if [ "$config_type" = "security" ] || [ "$config_type" = "default" ]; then
+    if [ "$config_type" = "security" ] || [ "$config_type" = "default" ] || [ "$config_type" = "ktls" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
@@ -1447,6 +1447,16 @@ path = "/echo-upload-tls/*"
 type = "Proxy"
 upstream = "tls-echo-pool"
 
+# F-282: TLS の上流が閉じて終わる応答（close_notify の有無）をバッファ経路で見る
+[[route]]
+[route.conditions]
+path = "/echo-eof-tls-full/*"
+[route.action]
+type = "Proxy"
+upstream = "tls-echo-pool"
+[route.buffering]
+mode = "full"
+
 # タイムアウトテスト用ルート (存在しないポートへ転送)
 [[route]]
 [route.conditions]
@@ -1671,7 +1681,7 @@ add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
 EOF
 
     # WASM設定を追加（wasm設定タイプの時のみ有効化）
-    if [ "$config_type" = "wasm" ] || [ "$config_type" = "default" ]; then
+    if [ "$config_type" = "wasm" ] || [ "$config_type" = "default" ] || [ "$config_type" = "ktls" ]; then
         if [ -f "${FIXTURES_DIR}/wasm/header_filter.wasm" ]; then
             cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 

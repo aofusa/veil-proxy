@@ -175,6 +175,15 @@ impl BackendIo {
         }
     }
 
+    /// 直前の EOF が相手の正しい終了か（平文は常に真、TLS は close_notify を受けたときだけ真）。
+    /// EOF で区切る応答で、切れた接続を完了と取り違えないために使う（F-282）。
+    fn eof_was_clean(&self) -> bool {
+        match self {
+            BackendIo::Plain(_) => true,
+            BackendIo::Tls(t) => t.close_notify.get(),
+        }
+    }
+
     /// 所有バッファへ読み取る（EAGAIN 時は POLL_ADD で待機、ビジースピンしない）。
     async fn read_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         match self {
@@ -212,6 +221,8 @@ pub(crate) struct TlsBackend {
     read_scratch: RefCell<Vec<u8>>,
     /// TLS レコード書き出しスクラッチ（同上）。
     write_scratch: RefCell<Vec<u8>>,
+    /// 相手の close_notify を受けた（F-282: EOF で区切る応答の切り詰めを見分ける）
+    close_notify: Cell<bool>,
 }
 
 /// TLS スクラッチバッファサイズ（rustls の最大レコード長 16KB に合わせる）。
@@ -240,6 +251,7 @@ impl TlsBackend {
             drained: RefCell::new(drained),
             read_scratch: RefCell::new(vec![0u8; TLS_SCRATCH]),
             write_scratch: RefCell::new(Vec::with_capacity(TLS_SCRATCH)),
+            close_notify: Cell::new(false),
         }
     }
 
@@ -262,7 +274,7 @@ impl TlsBackend {
         }
         let cell = match &self.session {
             // kTLS 移行済み: カーネルが復号するため生ソケット read でよい。
-            None => return read_tcp(&self.inner, buf).await,
+            None => return self.read_ktls(buf).await,
             Some(c) => c,
         };
         let fd = self.inner.as_raw_fd();
@@ -298,9 +310,17 @@ impl TlsBackend {
                                     break;
                                 }
                             }
-                            if let Err(e) = conn.process_new_packets() {
-                                err = Some(io::Error::new(io::ErrorKind::InvalidData, e));
-                                break;
+                            match conn.process_new_packets() {
+                                // F-282: close_notify を受けたか（EOF で区切る応答の完了の判定に使う）
+                                Ok(state) => {
+                                    if state.peer_has_closed() {
+                                        self.close_notify.set(true);
+                                    }
+                                }
+                                Err(e) => {
+                                    err = Some(io::Error::new(io::ErrorKind::InvalidData, e));
+                                    break;
+                                }
                             }
                             // 復号済み平文を都度退避する。rustls は受信平文が 16KB
                             // （DEFAULT_RECEIVED_PLAINTEXT_LIMIT）を超えると次の read_tls を
@@ -331,6 +351,35 @@ impl TlsBackend {
                 }
             }
         }
+    }
+
+    /// kTLS 移行済みの接続から平文を読む。平文以外のレコード（TLS 1.3 の NewSessionTicket・
+    /// close_notify）では `EIO` になるので、そのときだけ取り出して処理する（B-259 と同じ。
+    /// 平文の読み取りに syscall は足さない）。
+    async fn read_ktls(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        #[cfg(all(veil_ktls, target_os = "linux"))]
+        {
+            let mut buf = buf;
+            loop {
+                let (res, b) = read_tcp(&self.inner, buf).await;
+                buf = b;
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
+                            Ok(crate::ktls::ControlRecord::Skipped) => continue,
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => {
+                                self.close_notify.set(true);
+                                return (Ok(0), buf);
+                            }
+                            Err(e) => return (Err(e), buf),
+                        }
+                    }
+                    res => return (res, buf),
+                }
+            }
+        }
+        #[cfg(not(all(veil_ktls, target_os = "linux")))]
+        read_tcp(&self.inner, buf).await
     }
 
     /// 平文を全量書き込む（rustls で暗号化し TLS レコードを全て送出する）。
@@ -1556,7 +1605,15 @@ async fn stream_body_eof(
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) => break, // EOF 終端なので正常終了
+            // EOF 終端の応答。TLS で close_notify を受けずに切れたら切り詰めなので、fin ではなく
+            // ストリームリセットにする（F-282）
+            Ok(0) if backend.eof_was_clean() => break,
+            Ok(0) => {
+                warn!(
+                    "[HTTP/3] TLS backend closed without close_notify; response may be truncated"
+                );
+                return Err(502);
+            }
             Ok(n) => {
                 let chunk = bytes_from_read(&read_buf, n);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
@@ -1612,7 +1669,8 @@ async fn stream_response_compressed(
             Ok(0) => {
                 // length / chunked フレーミングで終端前の EOF は本文の欠落。
                 // EOF 終端（どちらも無い）なら正常終了。
-                if !eof_framed {
+                // TLS で close_notify を受けずに切れたら EOF 終端でも切り詰め（F-282）。
+                if !eof_framed || !backend.eof_was_clean() {
                     warn!("[HTTP/3] streaming backend closed before the body completed");
                     return Err(502);
                 }
@@ -1882,7 +1940,8 @@ async fn buffered_round_trip(
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
-            Ok(0) if eof_framed => break,
+            // TLS で close_notify を受けずに切れたら切り詰めなので完了とみなさない（F-282）
+            Ok(0) if eof_framed && backend.eof_was_clean() => break,
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -2367,6 +2426,68 @@ mod tests {
         });
         assert_eq!(got, 16 * 1024 + 80 * 200);
         drop(writer.join().unwrap());
+    }
+
+    /// EOF で区切る応答の完了判定（F-282）: 上流が close_notify を送って閉じたときだけ
+    /// `eof_was_clean` が真になり、送らずに切れたときは偽になること。
+    #[cfg(unix)]
+    #[test]
+    fn tls_backend_eof_reports_close_notify() {
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd as _;
+
+        if !runtime_available() {
+            eprintln!("skip: async runtime unavailable (io_uring denied in this sandbox)");
+            return;
+        }
+
+        for send_close_notify in [true, false] {
+            let (client, mut server) = handshaked_pair();
+            let mut cipher = Vec::new();
+            server.writer().write_all(b"partial body").unwrap();
+            if send_close_notify {
+                server.send_close_notify();
+            }
+            while server.wants_write() {
+                server.write_tls(&mut cipher).unwrap();
+            }
+
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: fds は 2 要素の有効な配列。
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair failed");
+            {
+                // SAFETY: fds[1] は socketpair が返した所有 fd で、ここで一度だけ所有権を移す。
+                let mut peer = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[1]) };
+                peer.write_all(&cipher).unwrap();
+                // ブロックの終わりで閉じる（相手から見て EOF）。
+            }
+
+            // SAFETY: fds[0] は socketpair が返した所有 fd で、TlsBackend へ所有権を移す。
+            let inner = unsafe { TcpStream::from_raw_fd(fds[0]) };
+            let backend =
+                BackendIo::Tls(Box::new(TlsBackend::new(inner, Some(client), Vec::new())));
+            let (body, clean) = crate::runtime::block_on(async move {
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let (res, b) = backend.read_into(buf).await;
+                    buf = b;
+                    let n = res.expect("TLS backend read must not fail");
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                (got, backend.eof_was_clean())
+            });
+            assert_eq!(body, b"partial body");
+            assert_eq!(
+                clean, send_close_notify,
+                "close_notify sent: {send_close_notify}"
+            );
+        }
     }
 
     #[test]

@@ -426,10 +426,14 @@ pub(crate) async fn collect_response_body_raw<R: AsyncReadRent + Unpin>(
         let (res, mut buf) = timeout(READ_TIMEOUT, backend.read(buf_get())).await.ok()?;
         let n = match res {
             Ok(n) if n > 0 => n,
-            _ => {
+            res => {
                 buf_put(buf);
-                // 接続の終わりで区切る応答だけは EOF が終端
-                if matches!(kind, ResponseBody::UntilClose) {
+                // 接続の終わりで区切る応答だけは EOF が終端。TLS は close_notify を受けたときだけ（F-282:
+                // 受けずに切れたら切り詰めかもしれない）。読み取りの誤りは終端にしない
+                if res.is_ok()
+                    && matches!(kind, ResponseBody::UntilClose)
+                    && backend.eof_was_clean()
+                {
                     break;
                 }
                 return None;
@@ -527,6 +531,29 @@ mod eof_tests {
         }
     }
 
+    impl crate::runtime::io::AsyncReadRent for Upstream {
+        async fn read<T: IoBufMut>(
+            &mut self,
+            mut buf: T,
+        ) -> crate::runtime::io::BufResult<usize, T> {
+            if self.chunks.is_empty() {
+                return (Ok(0), buf);
+            }
+            let c = self.chunks.remove(0);
+            let n = c.len().min(buf.bytes_total());
+            // SAFETY: write_ptr は bytes_total バイト書ける。n バイトだけ書いて初期化済みにする
+            unsafe {
+                std::ptr::copy_nonoverlapping(c.as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            (Ok(n), buf)
+        }
+
+        fn eof_was_clean(&self) -> bool {
+            self.clean
+        }
+    }
+
     struct Sink(Vec<u8>);
 
     impl AsyncWriter for Sink {
@@ -562,6 +589,33 @@ mod eof_tests {
                 assert_eq!(out.complete, complete, "clean EOF = {clean}");
                 assert_eq!(sink.0, b"hello world");
                 assert!(out.client_must_close(ResponseBody::UntilClose));
+            }
+        });
+    }
+
+    /// F-282: 本文を集める経路（HTTP/2 への中継・圧縮）も、接続の終わりで区切る応答は close_notify を受けた
+    /// EOF のときだけ完全な本文として返す（受けずに切れたら None = 502）
+    #[cfg(any(feature = "compression", feature = "http2"))]
+    #[test]
+    fn collected_until_close_body_needs_clean_eof() {
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            for clean in [true, false] {
+                let mut up = Upstream {
+                    chunks: vec![b"world"],
+                    clean,
+                };
+                let got = collect_response_body(&mut up, ResponseBody::UntilClose, b"hello ").await;
+                if clean {
+                    assert_eq!(got, Some((b"hello world".to_vec(), false)));
+                } else {
+                    assert_eq!(
+                        got, None,
+                        "a body cut without close_notify must not be complete"
+                    );
+                }
             }
         });
     }

@@ -137,8 +137,8 @@ KeyUpdate closes the connection with a warning (kTLS cannot apply new keys; rust
 
 An upstream response without `Content-Length` or chunked encoding ends when the upstream closes the connection.
 With TLS (with or without kTLS) veil treats it as complete only if the upstream sent close_notify first; otherwise
-the body may have been cut off, so it is not cached, a buffered response becomes 502 and the client connection is
-closed.
+the body may have been cut off, so it is not cached, a buffered or compressed response and a response to an
+HTTP/2 client become 502, and otherwise the client connection is closed (an HTTP/3 client sees the stream reset).
 
 ## TLS Session Resumption (F-183)
 

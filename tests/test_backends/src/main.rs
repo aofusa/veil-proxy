@@ -554,6 +554,13 @@ where
     // F-177 E2E 用: `x-close-silently` があれば、応答に `Connection: close` を付けずに
     // 応答直後に接続を閉じる（プールへ戻された接続が次の要求の前に死ぬ状況を再現する）。
     let close_silently = header_str.contains("\r\nx-close-silently:");
+    // F-282 E2E 用: `x-eof-body: clean|abrupt` があれば、Content-Length も chunked も無い応答を返して
+    // 接続を閉じる（clean は TLS の close_notify を送ってから、abrupt は送らずに切る）。
+    let eof_body: Option<bool> = header_str
+        .split("\r\nx-eof-body:")
+        .nth(1)
+        .and_then(|s| s.split("\r\n").next())
+        .map(|s| s.trim() == "clean");
     let is_head = header_str.starts_with("head ");
     let is_chunked = header_str.contains("transfer-encoding: chunked");
     let content_length: Option<usize> = header_str
@@ -623,6 +630,22 @@ where
     // 遅延指定があれば応答前に待つ（F-116 多重化 E2E 用）。
     if let Some(ms) = delay_ms {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
+    if let Some(clean) = eof_body {
+        let mut out: Vec<u8> = Vec::with_capacity(body.len() + 128);
+        out.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        );
+        out.extend_from_slice(&body);
+        stream.write_all(&out).await?;
+        stream.flush().await?;
+        if clean {
+            // TLS では close_notify を送る（tokio-rustls は shutdown でだけ送る）
+            stream.shutdown().await?;
+        }
+        // abrupt は close_notify を送らずに drop して TCP だけ閉じる
+        return Ok(false);
     }
 
     // echo レスポンス
