@@ -37,14 +37,17 @@ health() { # 適用中/後のヘルス確認（応答があれば OK）
 }
 
 # F-112: HTTP/3 到達性（UDP）。curl --http3 が無いイメージでは skip。
+# ハーネスのイメージは ENTRYPOINT がフェーズ名を取るので、シェルは `--entrypoint bash` で起動する（B-217: `bash -c` を
+# フェーズ名として渡して「不明なフェーズ」で毎回 fail になっていた）。
 # 戻り値: ok / fail / skip
 h3_probe() {
     docker run --rm --network "${NET_NAME}" \
         -e "VEIL_HOST=${veil_ip}" \
         -e "VEIL_SNI=${VEIL_SNI:-veil-proxy}" \
         -e "VEIL_HTTP3_PORT=${VEIL_HTTP3_PORT:-443}" \
+        --entrypoint bash \
         "${HARNESS_IMAGE}" \
-        bash -c '
+        -c '
             set +e
             if command -v http3-client >/dev/null 2>&1; then
                 HTTP3_MODE=get HTTP3_PATH=/ HTTP3_REPORT=/tmp/h3_pumba.txt \
@@ -80,7 +83,8 @@ for scenario in \
     echo "  health during chaos: $(health)" | tee -a "${REPORT}"
     # F-112: パケットロス/遅延下で HTTP/3 を流し、生存を確認
     h3_during=$(h3_probe)
-    echo "  http3 during chaos: ${h3_during}" | tee -a "${REPORT}"
+    # netem の最中は UDP が落ちて fail し得る（参考。集計の `: fail` に数えない書き方にする）
+    echo "  http3 during chaos (informational): result=${h3_during}" | tee -a "${REPORT}"
     wait "${pumba_pid}" 2>/dev/null || true
     # 回復確認
     ok=down
