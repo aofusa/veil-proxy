@@ -1359,14 +1359,28 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     // ============================================
 
     // ABI v1 (Linux 5.13+) - 基本権限
-    // 注: EXECUTE (1 << 0) はサーバーでは不要のため定義しない
+    // B-230: EXECUTE・MAKE_CHAR/SOCK/FIFO/BLOCK/SYM も handled に入れて制限する（Landlock は handled に無い
+    // アクセスを制限しないので、以前は書き込みを許した外でもシンボリックリンク・ソケット・FIFO を作れた）。
+    // EXECUTE はどのパスにも許さない（サンドボックスの後に execve しない）。
+    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
     const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
     const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
     const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
     const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    // 制限するだけで、どのパスにも許さないアクセス（MAKE_SOCK は書き込みパスに許す）
+    const DENIED_EVERYWHERE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
     // ABI v2 (Linux 5.19+) - ファイル参照権限
     const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
@@ -1476,9 +1490,12 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         }
     };
 
+    // B-230: 書き込みパスでは UDS（`listen_unix` 等）を作れるようにする
+    let write_access = write_access | LANDLOCK_ACCESS_FS_MAKE_SOCK;
+
     // ルールセット作成
     let attr = LandlockRulesetAttr {
-        handled_access_fs: write_access,
+        handled_access_fs: write_access | DENIED_EVERYWHERE,
         handled_access_net: 0,
     };
 
@@ -1501,21 +1518,49 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         if path.is_empty() {
             continue;
         }
-        if let Ok(fd) = std::fs::File::open(path) {
-            use std::os::unix::io::AsRawFd;
-            let path_attr = LandlockPathBeneathAttr {
-                allowed_access: read_access,
-                parent_fd: fd.as_raw_fd(),
-            };
-            unsafe {
-                libc::syscall(
-                    LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    &path_attr as *const LandlockPathBeneathAttr,
-                    0u32,
+        // B-230: 開けないパス・追加に失敗したルールは黙って飛ばさず警告する（そのパスへのアクセスは拒否される）
+        let fd = match std::fs::File::open(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!(
+                    "Landlock: cannot open {} ({}); access to it will be denied",
+                    path, e
                 );
+                continue;
             }
+        };
+        use std::os::unix::io::AsRawFd;
+        // 通常のファイルに付けるルールは、ファイルに意味のあるアクセスだけにする（ディレクトリ用のビットを含むと EINVAL）
+        let is_dir = fd.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let allowed = if is_dir {
+            read_access
+        } else {
+            read_access
+                & (LANDLOCK_ACCESS_FS_READ_FILE
+                    | LANDLOCK_ACCESS_FS_WRITE_FILE
+                    | LANDLOCK_ACCESS_FS_TRUNCATE
+                    | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+        };
+        let path_attr = LandlockPathBeneathAttr {
+            allowed_access: allowed,
+            parent_fd: fd.as_raw_fd(),
+        };
+        let ret = unsafe {
+            libc::syscall(
+                LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_attr as *const LandlockPathBeneathAttr,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not add a read-only rule for {}: {}",
+                path,
+                io::Error::last_os_error()
+            );
+        } else {
             debug!("Landlock: Added read-only rule for {}", path);
         }
     }
@@ -1526,21 +1571,49 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         if path.is_empty() {
             continue;
         }
-        if let Ok(fd) = std::fs::File::open(path) {
-            use std::os::unix::io::AsRawFd;
-            let path_attr = LandlockPathBeneathAttr {
-                allowed_access: write_access,
-                parent_fd: fd.as_raw_fd(),
-            };
-            unsafe {
-                libc::syscall(
-                    LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    &path_attr as *const LandlockPathBeneathAttr,
-                    0u32,
+        // B-230: 開けないパス・追加に失敗したルールは黙って飛ばさず警告する（そのパスへのアクセスは拒否される）
+        let fd = match std::fs::File::open(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!(
+                    "Landlock: cannot open {} ({}); access to it will be denied",
+                    path, e
                 );
+                continue;
             }
+        };
+        use std::os::unix::io::AsRawFd;
+        // 通常のファイルに付けるルールは、ファイルに意味のあるアクセスだけにする（ディレクトリ用のビットを含むと EINVAL）
+        let is_dir = fd.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let allowed = if is_dir {
+            write_access
+        } else {
+            write_access
+                & (LANDLOCK_ACCESS_FS_READ_FILE
+                    | LANDLOCK_ACCESS_FS_WRITE_FILE
+                    | LANDLOCK_ACCESS_FS_TRUNCATE
+                    | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+        };
+        let path_attr = LandlockPathBeneathAttr {
+            allowed_access: allowed,
+            parent_fd: fd.as_raw_fd(),
+        };
+        let ret = unsafe {
+            libc::syscall(
+                LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_attr as *const LandlockPathBeneathAttr,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not add a read-write rule for {}: {}",
+                path,
+                io::Error::last_os_error()
+            );
+        } else {
             debug!("Landlock: Added read-write rule for {}", path);
         }
     }
@@ -4654,5 +4727,93 @@ mod tests {
         let profile = build_profile(&SandboxPaths::default());
         assert!(profile.contains("(deny default)"));
         assert!(!profile.contains("(allow file-write*"));
+    }
+}
+
+// B-230: Landlock の handled に MAKE_SYM・MAKE_FIFO 等が入り、書き込みを許したディレクトリの外ではシンボリックリンク・
+// UDS を作れず、中でも FIFO・シンボリックリンクは作れない（UDS は作れる）。Landlock はプロセス（スレッド）に
+// 掛かったら外せないので、試験は自分を子プロセスとして起動して子の中で確かめる。
+#[cfg(all(test, target_os = "linux"))]
+mod landlock_b230_tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "VEIL_LANDLOCK_B230_CHILD";
+
+    // 理由: 試験の子プロセス（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn child() -> i32 {
+        let base = std::env::var(CHILD_ENV).unwrap();
+        let allowed = format!("{base}/allowed");
+        let other = format!("{base}/other");
+        let config = SecurityConfig {
+            landlock_read_paths: vec![other.clone()],
+            landlock_write_paths: vec![allowed.clone()],
+            ..SecurityConfig::default()
+        };
+        if let Err(e) = apply_landlock(&config) {
+            eprintln!("landlock unavailable: {e}");
+            return 0;
+        }
+        let denied =
+            |r: io::Result<()>| matches!(r, Err(ref e) if e.raw_os_error() == Some(libc::EACCES));
+        let mkfifo = |p: &str| -> io::Result<()> {
+            let c = std::ffi::CString::new(p).unwrap();
+            if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        };
+        let bind = |p: &str| std::os::unix::net::UnixListener::bind(p).map(|_| ());
+        let mut fails = 0;
+        let mut check = |ok: bool, what: &str| {
+            if !ok {
+                eprintln!("FAILED: {what}");
+                fails += 1;
+            }
+        };
+        check(
+            denied(std::os::unix::fs::symlink("/", format!("{other}/l"))),
+            "symlink outside",
+        );
+        check(denied(bind(&format!("{other}/s"))), "bind outside");
+        check(
+            denied(std::os::unix::fs::symlink("/", format!("{allowed}/l"))),
+            "symlink inside",
+        );
+        check(denied(mkfifo(&format!("{allowed}/f"))), "fifo inside");
+        check(bind(&format!("{allowed}/s")).is_ok(), "bind inside");
+        check(
+            std::fs::write(format!("{allowed}/r"), b"x").is_ok(),
+            "regular file inside",
+        );
+        fails
+    }
+
+    #[test]
+    fn landlock_restricts_special_files() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        let base = std::env::temp_dir().join(format!("veil-b230-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("allowed")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        // 理由: 試験。Landlock を掛ける子プロセスとして自分を起動する
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::landlock_b230_tests::landlock_restricts_special_files",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, &base)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

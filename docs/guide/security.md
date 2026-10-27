@@ -35,6 +35,11 @@ landlock_write_paths = ["/var/log/veil"]
 | v3 | 6.2+ | TRUNCATE permission |
 | v4 | 6.7+ | ioctl permission |
 
+Everywhere outside the listed paths, veil denies reading and writing as well as creating symlinks, sockets, FIFOs
+and device nodes and executing files. Inside `landlock_write_paths` it allows regular files, directories and Unix
+sockets, but still no symlinks, FIFOs, device nodes or execution. A listed path that cannot be opened, or whose
+rule the kernel rejects, is logged as a warning at startup (access to it stays denied).
+
 #### 2. seccomp System Call Restriction
 
 Restricts system calls based on an allow list.
