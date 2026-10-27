@@ -294,16 +294,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 return 21;
             }
 
-            // Use simple PRNG for random bytes
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let mut seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-
-            for i in 0..len {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                data[ptr + i] = (seed >> 32) as u8;
+            // B-248: プラグインは暗号用の乱数源として使う（トークン・nonce・鍵）。OS の CSPRNG で埋める
+            // （以前は壁時計をシードにした LCG で、出力の 1〜2 バイトから内部状態を復元できた）
+            use crate::tls_provider::{SecureRandom, SystemRandom};
+            if SystemRandom::new().fill(&mut data[ptr..ptr + len]).is_err() {
+                return 29; // EIO
             }
 
             0 // Success

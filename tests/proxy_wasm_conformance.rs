@@ -778,6 +778,64 @@ async fn item4_shared_queue_dequeue_returns_allocated_pointer() {
     );
 }
 
+/// B-248: WASI の `random_get` は OS の CSPRNG で埋める（以前は壁時計をシードにした LCG）。
+/// 2 回の出力が一致せず、バイトの分布が一様に近い（カイ二乗の簡易検査）こと。
+#[tokio::test]
+async fn wasi_random_get_is_unpredictable() {
+    const WAT: &str = r#"(module
+        (import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))
+        (memory (export "memory") 2)
+        (func (export "fill") (param i32 i32) (result i32)
+          (call $random_get (local.get 0) (local.get 1))))"#;
+    let engine = build_conformance_test_engine().expect("engine should build");
+    let linker = build_conformance_test_linker(&engine).expect("linker should build");
+    let module = Module::new(&engine, WAT).expect("module should compile");
+    let host_state = HostState::new(HttpContext::new(1, ModuleCapabilities::default()));
+    let mut store = Store::new(&engine, host_state);
+    let instance = linker
+        .instantiate_async(&mut store, &module)
+        .await
+        .expect("module should instantiate");
+    let fill = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "fill")
+        .expect("fill export");
+    let memory = instance.get_memory(&mut store, "memory").expect("memory");
+
+    const N: usize = 65536;
+    assert_eq!(fill.call_async(&mut store, (0, N as i32)).await.unwrap(), 0);
+    assert_eq!(
+        fill.call_async(&mut store, (N as i32, 64)).await.unwrap(),
+        0
+    );
+    let mut a = vec![0u8; N];
+    memory.read(&store, 0, &mut a).unwrap();
+    let mut b = vec![0u8; 64];
+    memory.read(&store, N, &mut b).unwrap();
+    assert_ne!(&a[..64], &b[..], "two calls must not return the same bytes");
+
+    let mut counts = [0u64; 256];
+    for &x in &a {
+        counts[x as usize] += 1;
+    }
+    let expected = N as f64 / 256.0;
+    let chi2: f64 = counts
+        .iter()
+        .map(|&c| (c as f64 - expected).powi(2) / expected)
+        .sum();
+    // 自由度 255。p = 1e-6 の上側の値は約 375（一様なら平均 255）
+    assert!(
+        chi2 < 375.0,
+        "byte distribution is not uniform: chi2 = {chi2}"
+    );
+    // 範囲外は書かずに EFAULT 相当（21）
+    assert_eq!(
+        fill.call_async(&mut store, (2 * 65536 - 8, 64))
+            .await
+            .unwrap(),
+        21
+    );
+}
+
 #[tokio::test]
 async fn item5_guest_exports_present_in_real_sdk_modules() {
     let engine = Engine::default();
