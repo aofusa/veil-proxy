@@ -32,6 +32,7 @@ PROBES=(
     compression_cache_probe
     access_log_probe
     http3_probe
+    h3_flood_probe
     l4_flood_probe
     websocket_probe
     grpc_probe
@@ -56,8 +57,20 @@ else
     echo "wasm_invalid_module_probe: ok" | tee -a "${REPORT}"
 fi
 
+# veil コンテナのメモリ使用量（MiB。docker stats の "123.4MiB / 7.6GiB" の左側）
+mem_mib() {
+    docker stats --no-stream --format '{{.MemUsage}}' "${VEIL_CONTAINER}" 2>/dev/null | awk '{
+        v = $1; u = v; gsub(/[0-9.]/, "", u); gsub(/[^0-9.]/, "", v)
+        if (u == "GiB") v *= 1024; else if (u == "KiB" || u == "kB") v /= 1024; else if (u == "B") v /= 1048576
+        printf "%d", v }'
+}
+# F-279（B-222）: 偽装 Initial の洪水で増えてよいメモリの上限（MiB）
+H3_FLOOD_MAX_GROWTH_MB="${H3_FLOOD_MAX_GROWTH_MB:-256}"
+
 for probe in "${PROBES[@]}"; do
     echo "--- ${probe} ---" | tee -a "${REPORT}"
+    mem_before=""
+    [[ "${probe}" == "h3_flood_probe" ]] && mem_before="$(mem_mib)"
     set +e
     docker run --rm --network "${NET_NAME}" \
         -e "VEIL_HOST=veil-proxy" \
@@ -69,6 +82,14 @@ for probe in "${PROBES[@]}"; do
         "${HARNESS_IMAGE}" 2>&1 | tee -a "${REPORT}"
     rc="${PIPESTATUS[0]}"
     set -e
+    if [[ -n "${mem_before}" ]]; then
+        mem_after="$(mem_mib)"
+        growth=$(( ${mem_after:-0} - ${mem_before:-0} ))
+        echo "h3_flood memory: before=${mem_before}MiB after=${mem_after}MiB growth=${growth}MiB (limit ${H3_FLOOD_MAX_GROWTH_MB}MiB)" | tee -a "${REPORT}"
+        if [[ -z "${mem_after}" || "${growth}" -gt "${H3_FLOOD_MAX_GROWTH_MB}" ]]; then
+            rc=1
+        fi
+    fi
     if [[ "${rc}" -ne 0 ]]; then
         total_fails=$((total_fails + 1))
         echo "${probe}: FAIL (rc=${rc})" | tee -a "${REPORT}"

@@ -270,6 +270,7 @@ impl OpTable {
     }
 
     /// CQE を処理して対応する Waker を wake する（detach 済みの op のガードはその場で走らせる。fuzz のモデル・試験用）
+    #[cfg(test)]
     fn on_cqe(&mut self, cqe: &IoUringCqe) -> bool {
         let (handled, guard) = self.on_cqe_take_guard(cqe);
         if let Some((guard, res)) = guard {
@@ -325,15 +326,31 @@ impl OpTable {
         }
     }
 
-    /// in-flight op を detach する。
-    ///
-    /// 戻り値が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
-    /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
+    /// in-flight op を detach する（既に終わっていた op のガードはその場で走らせる。テスト用）。
+    #[cfg(test)]
     fn detach(&mut self, user_data: u64, guard: OpGuard) -> bool {
+        let (should_cancel, run) = self.detach_take_guard(user_data, guard);
+        if let Some((guard, res)) = run {
+            guard.run(res);
+        }
+        should_cancel
+    }
+
+    /// in-flight op を detach する。既に終わっていた op のガードは走らせずに返す（呼び出し側が
+    /// OP_TABLE の借用を手放してから走らせる。F-279: on_cqe_take_guard と同じく、ガードの閉包が
+    /// alloc_op・detach_op を呼んでも二重借用にならないように）。
+    ///
+    /// 戻り値の bool が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
+    /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
+    fn detach_take_guard(
+        &mut self,
+        user_data: u64,
+        guard: OpGuard,
+    ) -> (bool, Option<(OpGuard, i32)>) {
         let Some(i) = self.resolve(user_data) else {
             // 既に take 済み（Future が正常完了して結果を取り出した）等。カーネルはもう
             // バッファを触らないので、ガードは呼ばずに破棄する（accept fd は引き取り済み）。
-            return false;
+            return (false, None);
         };
         match &self.slots[i].state {
             OpSlotState::Active {
@@ -343,8 +360,7 @@ impl OpTable {
                 // 既に完了済み（CQE 到着済みだが take されていない）。即座に後始末。
                 let res = *res;
                 self.free_slot(i);
-                guard.run(res);
-                false
+                (false, Some((guard, res)))
             }
             OpSlotState::Active {
                 result: OpResult::Pending,
@@ -352,21 +368,20 @@ impl OpTable {
             } => {
                 // 未完了。ガードを保持して完了/キャンセルの CQE を待つ。
                 self.slots[i].state = OpSlotState::Detached(guard);
-                true
+                (true, None)
             }
             OpSlotState::MultishotActive { ms, .. } => {
                 if ms.finished && ms.queue.is_empty() {
                     // 既に終端済みで未消費なし → 即後始末。
                     self.free_slot(i);
-                    guard.run(0);
-                    false
+                    (false, Some((guard, 0)))
                 } else {
                     // 進行中 or 未消費あり。キャンセルしてガードで延命。
                     self.slots[i].state = OpSlotState::Detached(guard);
-                    true
+                    (true, None)
                 }
             }
-            _ => false,
+            _ => (false, None),
         }
     }
 
@@ -499,7 +514,15 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     /// 同時追跡する op の上限。
     const MAX_TRACKED: usize = 256;
 
-    let mut table = OpTable::new();
+    // 本番と同じく OP_TABLE は RefCell の中に置き、ガードは借用を手放してから走らせる
+    // （F-279: ガードがテーブルを再入する B-224 の型の不具合を検出する。下の `deliver`・`detach`）。
+    let table = Rc::new(RefCell::new(OpTable::new()));
+    let deliver = |cqe: IoUringCqe| {
+        let run = table.borrow_mut().on_cqe_take_guard(&cqe).1;
+        if let Some((guard, res)) = run {
+            guard.run(res);
+        }
+    };
     // alloc 済み op の user_data と「detach 済みか」（実コードでは Future ドロップ後に
     // 所有者が take/remove を呼ぶ経路は存在しないため、detach 済み id への remove は
     // 発行しない = 実際の呼び出し契約をモデル化する）。
@@ -521,7 +544,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
             // alloc: 新しい op スロットを確保
             0 => {
                 if tracked.len() < MAX_TRACKED {
-                    tracked.push((table.alloc(), false));
+                    tracked.push((table.borrow_mut().alloc(), false));
                 }
             }
             // 追跡中 id への CQE 配送（res は任意の i32 = 負のエラーコード・巨大サイズ等）
@@ -530,7 +553,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
                     let res = i32::from_le_bytes([b[1], b[2], b[3], b[4]]);
-                    table.on_cqe(&IoUringCqe {
+                    deliver(IoUringCqe {
                         user_data: ud,
                         res,
                         flags: 0,
@@ -541,7 +564,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
             2 => {
                 let Some(b) = next(8) else { break };
                 let ud = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-                table.on_cqe(&IoUringCqe {
+                deliver(IoUringCqe {
                     user_data: ud,
                     res: -22, // EINVAL
                     flags: 0,
@@ -555,10 +578,25 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                     let (ud, _) = tracked[i];
                     let counter = Rc::new(std::cell::Cell::new(0u32));
                     let c = counter.clone();
-                    let was_pending = table.detach(
+                    // ガードは走るときにテーブルを再入する（実際のガードが alloc_op・with_ring を呼ぶ場合の模擬）。
+                    // 借用中に走らせると try_borrow_mut が失敗する。
+                    let weak = Rc::downgrade(&table);
+                    let (was_pending, run) = table.borrow_mut().detach_take_guard(
                         ud,
-                        OpGuard::Cleanup(Box::new(move |_res| c.set(c.get() + 1))),
+                        OpGuard::Cleanup(Box::new(move |_res| {
+                            c.set(c.get() + 1);
+                            if let Some(t) = weak.upgrade() {
+                                let mut t = t
+                                    .try_borrow_mut()
+                                    .expect("detach guard ran while the op table was borrowed");
+                                let id = t.alloc();
+                                t.remove(id);
+                            }
+                        })),
                     );
+                    if let Some((guard, res)) = run {
+                        guard.run(res);
+                    }
                     assert!(
                         counter.get() <= 1,
                         "detach guard ran {} times synchronously",
@@ -573,7 +611,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    let _ = table.take_result(ud);
+                    let _ = table.borrow_mut().take_result(ud);
                 }
             }
             // peek_result（非破壊参照）
@@ -581,7 +619,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    let _ = table.peek_result(ud);
+                    let _ = table.borrow().peek_result(ud);
                 }
             }
             // remove（SQE 提出失敗の模擬。detach 済み id には所有者がいないため発行しない）
@@ -591,7 +629,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                     let i = b[0] as usize % tracked.len();
                     let (ud, detached) = tracked[i];
                     if !detached {
-                        table.remove(ud);
+                        table.borrow_mut().remove(ud);
                     }
                 }
             }
@@ -600,7 +638,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    table.set_waker(ud, fuzz_noop_waker());
+                    table.borrow_mut().set_waker(ud, fuzz_noop_waker());
                 }
             }
             _ => unreachable!(),
@@ -610,7 +648,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     // 遅延 CQE フラッシュ: カーネルから遅れて到着する完了/キャンセル CQE を全 id へ配送する
     // （解放済み id へは stale として無視されることも同時に検査される）。
     for &(ud, _) in &tracked {
-        table.on_cqe(&IoUringCqe {
+        deliver(IoUringCqe {
             user_data: ud,
             res: -125, // ECANCELED
             flags: 0,
@@ -618,7 +656,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     }
     // 未回収の完了結果を取り出してスロットを解放する（正常系の後始末）。
     for &(ud, _) in &tracked {
-        let _ = table.take_result(ud);
+        let _ = table.borrow_mut().take_result(ud);
     }
 
     // 不変条件 2・3: ガードは高々 1 回、pending detach はちょうど 1 回。
@@ -634,6 +672,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     }
 
     // 不変条件 4: 全スロット解放済み（リークなし）。
+    let table = table.borrow();
     assert!(
         table.all_slots_free(),
         "op table slot leak: {} slots, {} free",
@@ -829,7 +868,11 @@ pub fn remove_op(user_data: u64) {
 /// カーネルが参照中のメモリを解放してしまう use-after-free」や「孤立した accept が後続の
 /// 接続を奪って捨ててしまう問題」を防ぐ。
 pub fn detach_op(user_data: u64, guard: OpGuard) {
-    let should_cancel = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+    let (should_cancel, run) =
+        OP_TABLE.with(|t| t.borrow_mut().detach_take_guard(user_data, guard));
+    if let Some((guard, res)) = run {
+        guard.run(res);
+    }
     if should_cancel {
         submit_cancel(user_data);
     }
@@ -841,7 +884,10 @@ pub fn detach_op(user_data: u64, guard: OpGuard) {
 /// キャンセル SQE + 即時 submit のシステムコールを節約する（`timeout()` で内側 Future が
 /// 勝つたびに発生するホットパス）。スロットは自然完了の CQE 到着時に解放される。
 pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
-    let _ = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+    let (_, run) = OP_TABLE.with(|t| t.borrow_mut().detach_take_guard(user_data, guard));
+    if let Some((guard, res)) = run {
+        guard.run(res);
+    }
 }
 
 /// in-flight op を取り消す（ASYNC_CANCEL）。op は Future が持ったままで、取り消し（`-ECANCELED`）か

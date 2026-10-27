@@ -355,6 +355,9 @@ pub mod vds_grpc;
 pub use crate::config::*;
 #[doc(hidden)]
 pub mod fuzz_api;
+/// HTTP/3 のリクエストのフィールドセクションの検査（quiche に依らない。F-279 の fuzz からも呼ぶ）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) mod h3_fields;
 /// HTTP/3 / QPACK ワイヤ純関数パーサ（F-112、ホットパス外・ファジング用）。
 #[doc(hidden)]
 pub mod http3_wire;

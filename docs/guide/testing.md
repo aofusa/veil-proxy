@@ -13,14 +13,19 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 | **Unit Tests** (lib) | 1044 | ✅ All passing |
 | **Integration Tests** (`integration_tests` + property + cancellation-safety) | 55+ | ✅ All passing |
 | **E2E Tests** (`e2e_tests`) | 565 | ✅ All passing |
-| **Fuzz Targets** (`cargo fuzz`) | 8 | ✅ No crashes |
+| **Fuzz Targets** (`cargo fuzz`) | 17 | ✅ No crashes |
 | **Benchmarks** | 13 files | ✅ Ready |
 
 The fuzz targets include `io_uring_executor`, which injects arbitrary pseudo-CQE sequences
 into the runtime's completion-dispatch path (`src/runtime/executor.rs`) to assert the op-table
 never panics, leaks slots, or runs a drop guard more than once — complementing the
 `runtime_cancellation_test` integration test that randomly drops in-flight recv/send/accept/timer
-futures on a live ring.
+futures on a live ring. Its model also lets a drop guard re-enter the op table, which fails if a guard
+ever runs while the table is borrowed. `http2_connection_state` feeds frame sequences to an HTTP/2 server
+connection and checks the HPACK table, the number of concurrent streams and the buffered header block
+against their limits after every frame; `http_response_parse` checks the upstream response parser and the
+chunked decoder (fed whole and byte by byte, strict and lenient agree on where a body ends); `path_norm` and
+`h3_field_section` check path normalization and the HTTP/3 request field-section check.
 
 Hot-path discipline (the "no blocking calls on the event loop" rule) is enforced at the AST level
 by clippy `disallowed-methods` in [`clippy.toml`](../../clippy.toml): synchronous `std::fs`,

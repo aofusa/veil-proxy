@@ -8,6 +8,8 @@
 # レポート（`ERROR: AddressSanitizer` / `WARNING: ThreadSanitizer`）を検査する。
 #
 # ASAN/TSAN ビルドは nightly + `-Zbuild-std` を要し重いため既定 SKIP。docker のみで完結。
+# F-279: 終了は負荷を流したまま TERM を送る（graceful shutdown 中の処理中の要求。SAN_TERM_UNDER_LOAD=0 で従来どおり
+# 負荷の後）。TSAN は veil-alloc を足して回す（SAN_TSAN_VEIL_ALLOC=0 で外す）。
 # 有効化: `RUN_E2E_ASAN=1`（address）または `RUN_E2E_TSAN=1`（thread）。
 set -euo pipefail
 
@@ -55,6 +57,11 @@ fi
 if [[ "${RUN_E2E_TSAN}" == "1" ]]; then
     SANITIZER="thread"
     SAN_ERROR_RE='ThreadSanitizer|data race|WARNING: ThreadSanitizer'
+    # F-279: TSAN は veil-alloc（スレッドをまたぐ解放・リモートフリーのリスト）も計装して回す。
+    # ASAN は自前のアロケータを使うと検査できないので system のまま。SAN_TSAN_VEIL_ALLOC=0 で外す
+    if [[ "${SAN_TSAN_VEIL_ALLOC:-1}" == "1" && ",${SAN_CARGO_FEATURES}," != *",veil-alloc,"* ]]; then
+        SAN_CARGO_FEATURES="${SAN_CARGO_FEATURES},veil-alloc"
+    fi
 else
     SANITIZER="address"
     SAN_ERROR_RE='ERROR: AddressSanitizer|heap-use-after-free|heap-buffer-overflow|LeakSanitizer|detected memory leaks'
@@ -199,6 +206,26 @@ if [[ -n "${SAN_IP}" ]]; then
     " >>"${REPORT}" 2>&1 || true
 fi
 
+# F-279（B-223・B-225）: 処理中の要求（送信中の応答・受信中の本文）を抱えたまま graceful shutdown に入る。
+# 負荷を流しながら TERM を送り、終了処理と処理中のタスクの破棄が sanitizer に掛からないことを見る。
+SAN_TERM_UNDER_LOAD="${SAN_TERM_UNDER_LOAD:-1}"
+load_pid=""
+if [[ -n "${SAN_IP}" && "${SAN_TERM_UNDER_LOAD}" == "1" ]]; then
+    echo "== 負荷中に TERM（graceful shutdown 中の処理中の要求）==" | tee -a "${REPORT}"
+    docker run --rm --network "${NET_NAME}" curlimages/curl:latest sh -c "
+        end=\$(( \$(date +%s) + 15 ))
+        while [ \$(date +%s) -lt \$end ]; do
+            for i in \$(seq 1 16); do
+                curl -sk --http2 --max-time 5 https://${SAN_IP}:443/ >/dev/null 2>&1 &
+                curl -s  --max-time 5 -X POST --data-binary @/etc/os-release http://${SAN_IP}:80/ >/dev/null 2>&1 &
+            done
+            wait
+        done
+    " >>"${REPORT}" 2>&1 &
+    load_pid=$!
+    sleep 3
+fi
+
 # プロセスを正常終了させて LeakSanitizer のプロセス終了時レポートを促す。
 # LeakSanitizer はプロセス終了時にだけ走るので、終了を待って終了コードまで確かめる
 # （以前は TERM の 3 秒後にログを見ていた。sanitizer ビルドは graceful shutdown に時間がかかり、
@@ -216,6 +243,7 @@ for _ in $(seq 1 "${SAN_EXIT_WAIT}"); do
     fi
     sleep 1
 done
+[[ -n "${load_pid}" ]] && { kill "${load_pid}" 2>/dev/null || true; wait "${load_pid}" 2>/dev/null || true; }
 echo "e2e_sanitizer: TERM 後の終了 exited=${exited} exit_code=${exit_code:-none}（待機上限 ${SAN_EXIT_WAIT}s）" | tee -a "${REPORT}"
 
 # --- 判定: コンテナログに sanitizer エラーが出ていないこと ---

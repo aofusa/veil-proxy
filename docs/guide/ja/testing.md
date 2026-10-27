@@ -13,13 +13,17 @@ Veilには、ユニットテスト、統合テスト、エンドツーエンド�
 | **ユニットテスト**（lib） | 1044 | ✅ すべて成功 |
 | **統合テスト**（`integration_tests` + プロパティ + キャンセル安全性） | 55+ | ✅ すべて成功 |
 | **E2Eテスト**（`e2e_tests`） | 565 | ✅ すべて成功 |
-| **Fuzz ターゲット**（`cargo fuzz`） | 8 | ✅ クラッシュなし |
+| **Fuzz ターゲット**（`cargo fuzz`） | 17 | ✅ クラッシュなし |
 | **ベンチマーク** | 13ファイル | ✅ 準備完了 |
 
 Fuzz ターゲットには `io_uring_executor` が含まれる。ランタイムの完了ディスパッチ経路
 （`src/runtime/executor.rs`）へ任意の擬似 CQE 列を注入し、op テーブルが panic せず・スロットを
 リークせず・drop ガードを二重実行しないことを検証する（実リング上で in-flight な
 recv/send/accept/timer Future をランダムに Drop する `runtime_cancellation_test` 統合テストと補完関係）。
+このモデルでは drop ガードが op テーブルを再入し、テーブルを借りたままガードを走らせると失敗する。
+`http2_connection_state` は HTTP/2 のサーバの接続にフレームの列を流し、フレームごとに HPACK の表・同時ストリーム数・
+溜めたヘッダブロックが上限内かを確かめる。`http_response_parse` は上流の応答の解析と chunked の復号（一括と 1 バイトずつ、
+厳格と緩いの本文の終わりが一致する）、`path_norm`・`h3_field_section` はパスの正規化と HTTP/3 の要求のフィールドセクションの検査。
 
 ホットパス規則（「イベントループ上でブロッキング呼び出しをしない」）は
 [`clippy.toml`](../../../clippy.toml) の clippy `disallowed-methods` により AST レベルで強制する。

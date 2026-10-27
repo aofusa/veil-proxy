@@ -96,6 +96,34 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http2_connection_state"
+path = "fuzz_targets/http2_connection_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response_parse"
+path = "fuzz_targets/http_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_norm"
+path = "fuzz_targets/path_norm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_field_section"
+path = "fuzz_targets/h3_field_section.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ws_frame_decode"
 path = "fuzz_targets/ws_frame_decode.rs"
 test = false

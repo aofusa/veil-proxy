@@ -145,6 +145,137 @@ pub fn native_grpc_content_type_smoke(data: &[u8]) {
     let _ = crate::proxy::is_native_grpc_content_type(data);
 }
 
+// F-279: 上流の応答のヘッダの解析と chunked の本文の復号
+/// Parses `data` as an upstream response head followed by its body (must not panic).
+///
+/// Invariants: the head length is within the input; the chunked decoder gives the same result fed in one
+/// piece and byte by byte; when the strict (request) decoder completes, the lenient (response) decoder
+/// completes at the same byte (the two never disagree on where an accepted body ends).
+pub fn http_response_parse_smoke(data: &[u8]) {
+    use crate::http_utils::{parse_http_response, ChunkedDecoder, ChunkedFeedResult};
+
+    let mut interim = data.to_vec();
+    crate::http_utils::drain_interim_responses(&mut interim);
+    assert!(interim.len() <= data.len());
+
+    let Some(parsed) = parse_http_response(data) else {
+        return;
+    };
+    assert!(parsed.header_len <= data.len());
+    let body = &data[parsed.header_len..];
+    if !parsed.is_chunked {
+        return;
+    }
+    const LIMIT: u64 = 1 << 20;
+    let mut whole = ChunkedDecoder::new(LIMIT);
+    let (r_whole, n_whole) = whole.feed_counted(body);
+    assert!(n_whole <= body.len());
+    let mut bytewise = ChunkedDecoder::new(LIMIT);
+    let mut r_byte = ChunkedFeedResult::Continue;
+    let mut n_byte = body.len();
+    for (i, &b) in body.iter().enumerate() {
+        r_byte = bytewise.feed_byte(b);
+        if r_byte != ChunkedFeedResult::Continue {
+            n_byte = i + 1;
+            break;
+        }
+    }
+    assert_eq!(r_whole, r_byte);
+    assert_eq!(n_whole, n_byte);
+
+    let mut strict = ChunkedDecoder::new_request(LIMIT);
+    let (r_strict, n_strict) = strict.feed_counted(body);
+    if r_strict == ChunkedFeedResult::Complete {
+        assert_eq!(r_whole, ChunkedFeedResult::Complete);
+        assert_eq!(n_whole, n_strict);
+    }
+}
+
+// F-279: パスの正規化
+/// Normalizes `data[1..]` as a request path with the configuration chosen by `data[0]` (must not panic).
+///
+/// Invariants: a rewritten path starts with `/` and keeps the query; with `normalize` on, the result
+/// has no `.` or `..` segment (a decoded `%2E` counts), so a route prefix cannot be escaped.
+pub fn path_norm_smoke(data: &[u8]) {
+    use crate::path_norm::{normalize, EscapedSlashes, PathNormalization};
+
+    let Some((&flags, path)) = data.split_first() else {
+        return;
+    };
+    let cfg = PathNormalization {
+        normalize: flags & 1 != 0,
+        merge_slashes: flags & 2 != 0,
+        escaped_slashes: match (flags >> 2) % 3 {
+            0 => EscapedSlashes::Keep,
+            1 => EscapedSlashes::Reject,
+            _ => EscapedSlashes::Unescape,
+        },
+    };
+    let query_of = |p: &[u8]| {
+        p.iter()
+            .position(|&b| b == b'?')
+            .map_or(&b""[..], |i| &p[i..])
+            .to_vec()
+    };
+    let checked = match normalize(path, &cfg) {
+        Ok(Some(out)) => {
+            assert_eq!(out.first(), Some(&b'/'));
+            assert_eq!(query_of(&out), query_of(path));
+            out
+        }
+        Ok(None) => path.to_vec(),
+        Err(_) => return,
+    };
+    if cfg.normalize && checked.first() == Some(&b'/') {
+        let p = &checked[..checked
+            .iter()
+            .position(|&b| b == b'?')
+            .unwrap_or(checked.len())];
+        for seg in p.split(|&b| b == b'/') {
+            assert!(
+                seg != b"." && seg != b"..",
+                "dot segment left in {:?}",
+                String::from_utf8_lossy(&checked)
+            );
+        }
+    }
+}
+
+// F-279: HTTP/3 のリクエストのフィールドセクションの検査
+/// Checks `data` as an HTTP/3 field section: one field per line, `name:value` (a leading `:` is part of
+/// a pseudo-header name). Must not panic; an accepted request has `:method` and valid field values.
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub fn h3_field_section_smoke(data: &[u8]) {
+    use crate::h3_fields::{h3_check_field_section, H3FieldSection};
+
+    fn split(line: &[u8]) -> (&[u8], &[u8]) {
+        let from = usize::from(line.first() == Some(&b':'));
+        match line[from..].iter().position(|&b| b == b':') {
+            Some(i) => (&line[..from + i], &line[from + i + 1..]),
+            None => (line, &b""[..]),
+        }
+    }
+    let fields = || data.split(|&b| b == b'\n').map(split);
+    match h3_check_field_section(fields()) {
+        Ok(H3FieldSection::Request) => {
+            assert!(fields().any(|(n, _)| n == b":method"));
+            assert!(fields().all(|(_, v)| crate::http_utils::is_valid_h2_field_value(v)));
+        }
+        Ok(H3FieldSection::NoPseudo) => {
+            assert!(fields().all(|(n, _)| n.first() != Some(&b':')));
+        }
+        Err(_) => {}
+    }
+}
+
+// F-279: HTTP/2 の接続状態機械（SETTINGS・ストリームの列・CONTINUATION）
+/// Feeds the client preface and `data[1..]` (read in pieces of `data[0] + 1` bytes) to an HTTP/2
+/// server connection and checks the resource limits after each frame (must not panic).
+#[cfg(feature = "http2")]
+pub fn http2_connection_state_smoke(data: &[u8]) {
+    crate::http2::connection::fuzz_connection_state(data);
+}
+
 // F-262: WebSocket のフレームの復号器（ライブラリ専用。`handler` feature のときだけ）
 /// Feeds `data` to the WebSocket decoder in one piece and byte by byte (must not panic).
 #[cfg(feature = "handler")]
@@ -157,6 +288,83 @@ pub fn ws_frame_decode_smoke(data: &[u8]) {
 #[cfg(feature = "handler")]
 pub fn multipart_parse_smoke(data: &[u8]) {
     crate::api::multipart::fuzz_parse(data);
+}
+
+// F-279: 新しい fuzz の入口を代表的な入力で回す（cargo test で panic・不変条件の破れを見る）
+#[cfg(test)]
+mod f279_smoke_tests {
+    use super::*;
+
+    #[test]
+    fn response_parse_smoke_handles_representative_inputs() {
+        for input in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;a=b\r\nhello\r\n0\r\nx: 1\r\n\r\nrest",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffff\r\n",
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            b"",
+        ] {
+            http_response_parse_smoke(input);
+        }
+    }
+
+    #[test]
+    fn path_norm_smoke_handles_representative_inputs() {
+        for flags in 0u8..12 {
+            for path in [
+                &b"/a/./b/../c?q=/../x"[..],
+                b"/%2e%2E/%2E/x",
+                b"//a//b/%2F..",
+                b"/%%32F/..",
+                b"/a\\..\\b",
+                b"relative/../x",
+                b"/",
+                b"",
+            ] {
+                let mut d = vec![flags];
+                d.extend_from_slice(path);
+                path_norm_smoke(&d);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn h3_field_section_smoke_handles_representative_inputs() {
+        for input in [
+            &b":method:GET\n:scheme:https\n:path:/\n:authority:a.example"[..],
+            b":method:CONNECT\n:authority:a.example:443",
+            b"x-trailer:1",
+            b":method:GET\n:method:GET",
+            b"x:1\n:path:/",
+            b":method:GET\n:scheme:https\n:path:/\nhost:a\nx:v\r",
+            b"",
+        ] {
+            h3_field_section_smoke(input);
+        }
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn http2_connection_state_smoke_handles_representative_inputs() {
+        // SETTINGS（空）・HEADERS（END_HEADERS、静的表の GET / https /）・PING・巨大な表サイズの SETTINGS・CONTINUATION
+        let mut frames = Vec::new();
+        frames.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        frames.extend_from_slice(&[0, 0, 4, 1, 4, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41]);
+        frames.extend_from_slice(&[0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        frames.extend_from_slice(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff]);
+        frames.extend_from_slice(&[0, 0, 3, 1, 0, 0, 0, 0, 3, 0x82, 0x87, 0x84]);
+        frames.extend_from_slice(&[0, 0, 2, 9, 0, 0, 0, 0, 3, 0x40, 0x01]);
+        for chunk in [0u8, 6, 255] {
+            let mut d = vec![chunk];
+            d.extend_from_slice(&frames);
+            http2_connection_state_smoke(&d);
+            http2_connection_state_smoke(&d[..d.len() / 2]);
+        }
+        http2_connection_state_smoke(b"");
+    }
 }
 
 #[cfg(test)]

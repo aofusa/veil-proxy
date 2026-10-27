@@ -2647,6 +2647,90 @@ pub struct H2RequestParts {
     pub trailers: Vec<crate::http2::hpack::HeaderField>,
 }
 
+// ====================
+// F-279: 接続状態機械の fuzz（`fuzz_api::http2_connection_state_smoke`。ホットパス外）
+// ====================
+
+/// 渡されたバイト列を少しずつ返し、書いたものは捨てるソケット（fuzz 専用）。
+struct FuzzIo {
+    data: Vec<u8>,
+    pos: usize,
+    chunk: usize,
+}
+
+impl AsyncReadRent for FuzzIo {
+    async fn read<T: crate::runtime::buf::IoBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        let n = (self.data.len() - self.pos)
+            .min(self.chunk)
+            .min(buf.bytes_total());
+        // SAFETY: 書き込み先は buf の容量の内側（n <= bytes_total）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr().add(self.pos), buf.write_ptr(), n);
+            buf.set_init(n);
+        }
+        self.pos += n;
+        (Ok(n), buf)
+    }
+}
+
+impl crate::runtime::io::AsyncWriteRent for FuzzIo {
+    async fn write<T: crate::runtime::buf::IoBuf>(
+        &mut self,
+        buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        let n = buf.bytes_init();
+        (Ok(n), buf)
+    }
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// クライアントのプリフェースの後ろに `data` を続けて `Http2Connection` に流し、フレームを処理するたびに
+/// 資源の上限（HPACK の動的表・同時ストリーム数・CONTINUATION で溜めるヘッダブロック）を確かめる。
+/// 先頭の 1 バイトは読み取りの区切りの大きさ（1〜256 バイト）。panic・上限超過を不具合とする。
+pub(crate) fn fuzz_connection_state(data: &[u8]) {
+    let Some((&chunk, rest)) = data.split_first() else {
+        return;
+    };
+    let mut input = CONNECTION_PREFACE.to_vec();
+    input.extend_from_slice(rest);
+    let io = FuzzIo {
+        data: input,
+        pos: 0,
+        chunk: chunk as usize + 1,
+    };
+    let settings = Http2Settings::default();
+    futures::executor::block_on(async {
+        let mut conn = Http2Connection::new(io, settings.clone());
+        if conn.handshake().await.is_err() {
+            return;
+        }
+        for _ in 0..4096 {
+            let Ok(frame) = conn.read_frame().await else {
+                return;
+            };
+            if let Err(e) = conn.process_frame(frame).await {
+                if e.should_goaway() {
+                    return;
+                }
+            }
+            let table = conn.hpack_decoder.dynamic_table();
+            assert!(table.size() <= table.max_size());
+            assert!(table.max_size() <= settings.header_table_size as usize);
+            assert!(conn.streams.active_stream_count() <= settings.max_concurrent_streams as usize);
+            if let Some(id) = conn.streams.receiving_headers_stream() {
+                if let Some(st) = conn.streams.get_ref(id) {
+                    assert!(st.pending_header_len() <= settings.max_header_block_size);
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

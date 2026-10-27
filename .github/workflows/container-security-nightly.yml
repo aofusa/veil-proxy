@@ -10,7 +10,7 @@
 #                   リソース枯渇 / syscall 障害注入）と OWASP ZAP（DAST）
 #   sanitizers      毎週（土曜）。ASAN/TSAN の E2E カオスと ASAN libFuzzer。
 #                   fuzz コーパスを actions/cache で回次間に持ち越し、cmin で最小化する（F-82）
-#   e2e             毎日。tests/e2e_setup.sh の全 E2E（io_uring / epoll）。PR CI では
+#   e2e             毎日。tests/e2e_setup.sh の全 E2E（io_uring / epoll、それぞれ seccomp strict 有り・無し）。PR CI では
 #                   重いため走らせない（F-119）が、F-97〜F-112 で追加した E2E は
 #                   ここで毎日実行される（F-98 / F-100 / F-102 / F-104 / F-108 / F-110 / F-113）
 #   sbom            毎日。SBOM 生成 + grype による SBOM ベースの脆弱性照合（F-81）
@@ -239,18 +239,28 @@ jobs:
           retention-days: 30
 
   e2e:
-    name: e2e (${{ matrix.backend }})
+    name: e2e (${{ matrix.backend }}${{ matrix.seccomp && format(', seccomp {0}', matrix.seccomp) || '' }})
     if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        # F-279: veil 自身の seccomp（strict）を掛けた構成でも全 E2E を回す（全スレッドの Seccomp: 2 は
+        # security_audit.rs が検査する）
         include:
           - backend: io_uring
             features: full
+            seccomp: ''
           - backend: epoll
             features: full,epoll
+            seccomp: ''
+          - backend: io_uring
+            features: full
+            seccomp: strict
+          - backend: epoll
+            features: full,epoll
+            seccomp: strict
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
@@ -260,12 +270,13 @@ jobs:
       - name: Run E2E suite
         env:
           VEIL_E2E_FEATURES: ${{ matrix.features }}
+          VEIL_E2E_SECCOMP: ${{ matrix.seccomp }}
         run: ./tests/e2e_setup.sh test
       - name: Upload server logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: e2e-logs-${{ matrix.backend }}
+          name: e2e-logs-${{ matrix.backend }}${{ matrix.seccomp && format('-seccomp-{0}', matrix.seccomp) || '' }}
           path: /tmp/*.log
           retention-days: 7
 

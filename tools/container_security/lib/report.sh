@@ -34,6 +34,7 @@ aggregate_reports() {
         "compression_cache:compression_cache_report.txt"
         "http3:http3_report.txt"
         "l4_flood:l4_flood_report.txt"
+        "h3_flood:h3_flood_report.txt"
         "websocket:websocket_report.txt"
         "grpc:grpc_report.txt"
         "rate_limit:rate_limit_report.txt"
