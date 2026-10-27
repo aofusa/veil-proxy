@@ -64,6 +64,7 @@ GET /__metrics
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPCリクエスト数 |
 | `veil_http3_invalid_packets_total` | Counter | - | HTTP/3 のポートに届いた QUIC のパケットでない UDP のデータグラムの数（ログは debug だけ） |
 | `veil_upstream_connect_errors_total` | Counter | kind | 上流への接続の失敗の数（`error`・`timeout`・`tls`・`no_healthy`）。対応するログは出す箇所ごとに 10 秒に 1 行まで（残りは debug） |
+| `veil_uring_cq_overflow_total` | Counter | - | io_uring の完了キューが溢れた回数（io_uring のバックエンドのみ）。完了は失われないが、0 以外なら負荷に対してリングが小さい |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPCストリーム処理時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |

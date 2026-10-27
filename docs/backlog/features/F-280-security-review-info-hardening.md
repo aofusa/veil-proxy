@@ -1,6 +1,6 @@
 # F-280: 2026-10 のセキュリティレビューの Info 項目の小さな堅牢化（CQ overflow の監視・accept の fd・0-RTT の不変条件の試験・レートリミット表の衝突の文書化）
 
-**状態: 未着手（2026-10-27 起票。セキュリティレビュー RT-07・RT-08・PR-06・PR-07）**
+**状態: 完了（v0.10.0）**
 
 ## 今の状態
 
@@ -24,6 +24,10 @@
 - PR-07: `is_established()` のゲートに不変条件のコメントを書き、0-RTT のデータを含む Initial で要求が処理されないことを E2E で固定する
   （quinn の `0rtt` で送る）。
 - PR-06: `docs/guide/`（英・日）のレートリミットの節に衝突の性質と `RateTable` の大きさを書く。
+
+## 修正（v0.10.0）
+
+RT-07: CQ の溢れを SQ の flags で検出して GETEVENTS で移し veil_uring_cq_overflow_total で数える（単体で溢れ→flush で 16 件全部受ける）。RT-08: accept の変換失敗で fd を閉じる。PR-07: init_h3 の不変条件のコメントと 0-RTT の要求がハンドシェイク完了まで処理されない単体試験（quiche の 0-RTT で確認。E2E の quinn ではなく単体で固定）。PR-06: routing.md（英日）にレート制限の表の衝突を記載。security.md（英日）に早期データの節、protocols.md の 0-RTT の記述と既定の cc（cubic）を訂正
 
 ## 関連
 

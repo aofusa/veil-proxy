@@ -1084,6 +1084,11 @@ impl Http3Handler {
     }
 
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
+    ///
+    /// 不変条件（F-280）: `enable_early_data()` で 0-RTT のデータを受け取るが、h3 の層はハンドシェイクの完了
+    /// （`is_established()`）の後にしか作らないので、0-RTT で届いた要求はクライアントの Finished を検証した後に
+    /// 初めて読む。再送された 0-RTT はハンドシェイクを完了できず処理されない。この検査を外したり、
+    /// h3 の層の外でストリームを読んだりしない（`test_f280_zero_rtt_request_waits_for_handshake`）。
     fn init_h3(&mut self) -> io::Result<()> {
         if self.h3_conn.is_none() && self.conn.is_established() && !self.conn.is_closed() {
             let mut h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
@@ -2727,6 +2732,132 @@ mod tests {
             admission::DEFAULT_RETRY_THRESHOLD,
             admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
         );
+    }
+
+    /// F-280: 0-RTT のデータを受け取っても、ハンドシェイクが終わるまで HTTP/3 の層を作らない（要求を処理しない）。
+    /// 0-RTT は再送され得るので、`init_h3` の `is_established()` の検査が再送攻撃を防ぐ不変条件になっている。
+    #[test]
+    fn test_f280_zero_rtt_request_waits_for_handshake() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        server_cfg.set_initial_max_stream_data_bidi_remote(1 << 16);
+        server_cfg.set_initial_max_stream_data_uni(1 << 16);
+        server_cfg.set_initial_max_streams_bidi(16);
+        server_cfg.set_initial_max_streams_uni(16);
+        server_cfg.enable_early_data();
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut feed = |conns: &mut ConnMapInner, pkt: &mut [u8], from: SocketAddr| {
+            process_datagram_segments(
+                conns,
+                pkt,
+                from,
+                None,
+                &cid_key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        client_cfg.set_initial_max_data(1 << 20);
+        client_cfg.set_initial_max_stream_data_bidi_local(1 << 16);
+        client_cfg.set_initial_max_stream_data_uni(1 << 16);
+        client_cfg.set_initial_max_streams_bidi(16);
+        client_cfg.set_initial_max_streams_uni(16);
+        client_cfg.enable_early_data();
+        let mut buf = vec![0u8; 1500];
+
+        // 1 本目: ハンドシェイクを終えてセッション（チケット）を受け取る
+        let addr1: SocketAddr = "127.0.0.1:40011".parse().unwrap();
+        let mut c1 = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[1; 16]),
+            addr1,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let info1 = quiche::RecvInfo {
+            from: server_addr,
+            to: addr1,
+        };
+        for _ in 0..10 {
+            while let Ok((len, _)) = c1.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], addr1);
+            }
+            for h in conns.values_mut() {
+                while let Ok((len, _)) = h.conn.send(&mut buf) {
+                    let _ = c1.recv(&mut buf[..len], info1);
+                }
+            }
+        }
+        assert!(c1.is_established());
+        let session = c1.session().expect("session ticket").to_vec();
+
+        // 2 本目: 0-RTT で要求を送る。サーバは 0-RTT を受け入れるが、HTTP/3 の層はまだ作らない
+        let addr2: SocketAddr = "127.0.0.1:40012".parse().unwrap();
+        let mut c2 = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[2; 16]),
+            addr2,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        c2.set_session(&session).expect("set session");
+        let (len, _) = c2.send(&mut buf).unwrap();
+        let mut initial = buf[..len].to_vec();
+        assert!(c2.is_in_early_data(), "client must be sending 0-RTT");
+        let h3_cfg = h3::Config::new().unwrap();
+        let mut ch3 = h3::Connection::with_transport(&mut c2, &h3_cfg).unwrap();
+        let req = [
+            h3::Header::new(b":method", b"POST"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":path", b"/"),
+        ];
+        ch3.send_request(&mut c2, &req, true).unwrap();
+        let before = conns.len();
+        feed(&mut conns, &mut initial, addr2);
+        while let Ok((len, _)) = c2.send(&mut buf) {
+            feed(&mut conns, &mut buf[..len], addr2);
+        }
+        assert_eq!(conns.len(), before + 1);
+        let h = conns
+            .values_mut()
+            .find(|h| h.peer_addr == addr2)
+            .expect("second connection");
+        assert!(h.conn.is_in_early_data(), "server must have accepted 0-RTT");
+        assert!(!h.conn.is_established());
+        assert!(
+            h.h3_conn.is_none(),
+            "the HTTP/3 layer must not exist before the handshake completes"
+        );
+        let _ = h.init_h3();
+        assert!(h.h3_conn.is_none());
     }
 
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり

@@ -366,12 +366,14 @@ impl<'a> Future for Accept<'a> {
                     let fd = res;
                     // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないため、
                     // プレースホルダを返す（IP ブロックリスト・アクセスログはこの値を見る）。
+                    // F-280: 変換に失敗しても accept 済みの fd を漏らさない（TcpStream の Drop で閉じる）
+                    let stream = TcpStream { fd };
                     let peer_addr = if self.is_unix {
                         SocketAddr::from(([127, 0, 0, 1], 0))
                     } else {
                         storage_to_sockaddr(&self.addr_storage)?
                     };
-                    Poll::Ready(Ok((TcpStream { fd }, peer_addr)))
+                    Poll::Ready(Ok((stream, peer_addr)))
                 }
             }
             None => {

@@ -370,6 +370,16 @@ ExecStart=/usr/bin/bwrap \
 
 In this configuration, systemd creates the outer "container" and bubblewrap provides an even stricter filesystem view.
 
+## Early data (0-RTT)
+
+0-RTT data can be replayed by an attacker, so veil never acts on it:
+
+- TLS over TCP (HTTP/1.1, HTTP/2): early data is not offered (rustls `max_early_data_size` stays 0). Session
+  resumption (`[tls] session_resumption`) still saves a round trip.
+- HTTP/3: QUIC 0-RTT packets are accepted so the handshake completes sooner, but the HTTP/3 layer is created only
+  after the handshake is complete. A request sent as 0-RTT data is read and processed then, after the client has
+  proved it holds the session, and a replayed copy cannot complete a handshake.
+
 ## Panic Recovery
 
 Veil implements connection-level panic catching to ensure high availability.

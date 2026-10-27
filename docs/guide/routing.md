@@ -880,6 +880,12 @@ same order, and the first failing check decides the response:
 
 The stateless checks come first, so a request rejected for its size does not use the rate limit's budget.
 
+The rate limit table has a fixed size (65,536 slots, 512 KB, allocated on first use), so memory does not grow with
+the number of clients. The slot is chosen by a keyed hash with a per-process random seed, so a client cannot pick
+whose slot it shares. When many clients are active in the same minute (tens of thousands), some unrelated clients
+share a slot and one of them can receive 429 before reaching its own limit; the limit never lets more requests
+through than configured.
+
 #### IP Restriction Evaluation Order
 
 IP restrictions are evaluated in **deny → allow** order (deny takes priority).

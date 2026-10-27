@@ -1522,6 +1522,7 @@ watch = false
 #   veil_proxy_http_active_connections      アクティブな接続数
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
 #   veil_upstream_connect_errors_total{kind} 上流への接続の失敗（error / timeout / tls / no_healthy。ログは箇所ごとに 10 秒に 1 行まで）
+#   veil_uring_cq_overflow_total            io_uring の完了キューが溢れた回数（io_uring のバックエンドのみ。0 以外ならリングが小さい）
 #   veil_allocator_bytes{state}             veil-alloc のメモリ量（active / dirty / huge / purged_total。veil-alloc ビルドのみ）
 #   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
 #   veil_proxy_vds_connected 等             VDS の状態（[vds] 有効時のみ。F-211、[vds] の節を参照）

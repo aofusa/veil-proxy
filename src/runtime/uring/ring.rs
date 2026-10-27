@@ -52,6 +52,8 @@ pub const IORING_SETUP_R_DISABLED: u32 = 1 << 6;
 // ====================
 
 pub const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+/// SQ リングの flags: CQ が溢れてカーネルに完了が残っている
+pub const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
 pub const IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1;
 pub const IORING_ENTER_SQ_WAIT: u32 = 1 << 2;
 pub const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
@@ -417,9 +419,8 @@ pub struct IoUring {
     sq_tail: *mut AtomicU32,
     sq_ring_mask: *const u32,
     sq_ring_entries: *const u32,
-    // SQ フラグ（IORING_SQ_NEED_WAKEUP 等）と CQ のエントリ数は使っていないので持たない。
-    // SQPOLL や CQ オーバーフロー検査を足すときは `params.sq_off.flags` /
-    // `params.cq_off.ring_entries` から同じ形で導出する。
+    // SQ フラグ（F-280: IORING_SQ_CQ_OVERFLOW を見る）。CQ のエントリ数は使っていないので持たない。
+    sq_flags: *const AtomicU32,
     sq_array: *mut u32,
 
     // SQE 配列
@@ -539,6 +540,7 @@ impl IoUring {
         let sq_ring_entries =
             unsafe { sq_ring_ptr.add(params.sq_off.ring_entries as usize) as *const u32 };
         let sq_array = unsafe { sq_ring_ptr.add(params.sq_off.array as usize) as *mut u32 };
+        let sq_flags = unsafe { sq_ring_ptr.add(params.sq_off.flags as usize) as *const AtomicU32 };
 
         let cq_head = unsafe { cq_ring_ptr.add(params.cq_off.head as usize) as *mut AtomicU32 };
         let cq_tail = unsafe { cq_ring_ptr.add(params.cq_off.tail as usize) as *const AtomicU32 };
@@ -555,6 +557,7 @@ impl IoUring {
             sq_tail,
             sq_ring_mask,
             sq_ring_entries,
+            sq_flags,
             sq_array,
             sqes_ptr,
             sqes_size,
@@ -814,6 +817,19 @@ impl IoUring {
         }
     }
 
+    /// CQ が溢れてカーネル側に完了が残っているか（F-280）。`IORING_FEAT_NODROP` では溢れた完了は
+    /// 捨てられず、次の `GETEVENTS` 付きの `io_uring_enter` で CQ へ移る。
+    #[inline]
+    pub fn cq_overflowed(&self) -> bool {
+        // SAFETY: sq_flags は mmap した SQ リング内の有効な u32（リングの生存中は有効）
+        unsafe { (*self.sq_flags).load(Ordering::Relaxed) & IORING_SQ_CQ_OVERFLOW != 0 }
+    }
+
+    /// 溢れた完了を CQ へ移す（F-280）。待たない。
+    pub fn flush_cq_overflow(&self) -> io::Result<i32> {
+        self.enter(0, 0, IORING_ENTER_GETEVENTS)
+    }
+
     /// 保留中の SQE を提出する
     pub fn submit(&self) -> io::Result<i32> {
         self.enter(self.sq_pending(), 0, 0)
@@ -907,6 +923,40 @@ mod tests {
     ///
     /// 「R_DISABLED で生成 → 制限登録 → ENABLE_RINGS で有効化」のシーケンスが正しく機能して
     /// いることの回帰テスト。3 つの ABI/シーケンスバグのいずれかが再発すると失敗する。
+    #[test]
+    fn cq_overflow_is_detected_and_flushed() {
+        // F-280: SQ 4 本・CQ 8 本のリングへ NOP を 4 本ずつ 4 回出して CQ を溢れさせ、溢れの検出と、
+        // flush で残りの完了を失わずに受け取れることを確かめる（IORING_FEAT_NODROP 前提）
+        let mut ring = match IoUring::new(4, 0) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("io_uring unavailable ({e}); skipping");
+                return;
+            }
+        };
+        let mut user_data = 0u64;
+        for _ in 0..4 {
+            for _ in 0..4 {
+                let sqe = ring.get_sqe().expect("sqe slot");
+                sqe.opcode = IORING_OP_NOP;
+                user_data += 1;
+                sqe.user_data = user_data;
+            }
+            ring.submit().expect("submit nops");
+        }
+        assert!(
+            ring.cq_overflowed(),
+            "16 completions must overflow an 8-entry CQ"
+        );
+        let mut seen = 0;
+        ring.consume_cqes(|_| seen += 1);
+        assert!(ring.cq_overflowed());
+        ring.flush_cq_overflow().expect("flush");
+        ring.consume_cqes(|_| seen += 1);
+        assert_eq!(seen, 16, "no completion may be lost");
+        assert!(!ring.cq_overflowed());
+    }
+
     #[test]
     fn restrictions_block_disallowed_opcode() {
         // R_DISABLED 付きでリング生成（io_uring/権限が無い環境ではスキップ）。

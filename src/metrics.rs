@@ -530,6 +530,36 @@ fn refresh_alloc_stats_gauges() {
 }
 
 // ====================
+// io_uring の状態（F-280）
+// ====================
+
+#[cfg(all(veil_rt_uring, feature = "metrics"))]
+/// CQ が溢れた回数。0 以外ならリングの大きさが負荷に対して小さい（完了は失われないが余分な syscall が増える）
+static URING_CQ_OVERFLOW_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let counter = prometheus::IntCounter::with_opts(
+        Opts::new(
+            "uring_cq_overflow_total",
+            "Number of times an io_uring completion queue overflowed",
+        )
+        .namespace("veil"),
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// スクレイプ直前に実行器のカウンタを反映する
+#[cfg(all(veil_rt_uring, feature = "metrics"))]
+fn refresh_uring_counters() {
+    let now =
+        crate::runtime::executor::CQ_OVERFLOW_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    let c = &*URING_CQ_OVERFLOW_TOTAL;
+    c.inc_by(now.saturating_sub(c.get()));
+}
+
+// ====================
 // VDS の状態（F-211）
 // ====================
 //
@@ -1417,6 +1447,8 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     refresh_alloc_stats_gauges();
     #[cfg(veil_alloc_active)]
     refresh_veil_allocator_gauges();
+    #[cfg(veil_rt_uring)]
+    refresh_uring_counters();
 
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();

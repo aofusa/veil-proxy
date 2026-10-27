@@ -137,11 +137,11 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 
 | Feature | Effect |
 |---------|--------|
-| 0-RTT Connection Establishment | Instant communication without TLS handshake |
+| 1-RTT connection establishment | QUIC combines the transport and TLS handshakes; 0-RTT data is accepted but requests are processed only after the handshake completes (no replay) |
 | Head-of-Line Blocking Elimination | Packet loss doesn't affect other streams |
 | Connection Migration | Maintains connection during network switches |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
-| Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default BBR + pacing |
+| Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default cubic + pacing |
 | io_uring pipelined UDP I/O | Receive/send hot path uses pipelined `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG` (batch via `mmsg_batch_size`, default 64); no libc `recvmmsg`/`sendmmsg` on the hot path (F-130) |
 
 ### Enabling

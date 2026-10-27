@@ -879,9 +879,22 @@ pub fn poll_completions() {
         ring.consume_cqes(|cqe| {
             process_cqe(cqe);
         });
+        // F-280: CQ が溢れていたら、カーネルに残った完了を CQ へ移して続けて処理する。park（GETEVENTS 付き）まで
+        // 待つと、その間 multishot の受信が終端して再アームに頼ることになる。普段は SQ の flags を 1 回読むだけ
+        if ring.cq_overflowed() {
+            CQ_OVERFLOW_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ftlog::debug!("io_uring completion queue overflowed; flushing");
+            let _ = ring.flush_cq_overflow();
+            ring.consume_cqes(|cqe| {
+                process_cqe(cqe);
+            });
+        }
     });
     run_deferred_guards();
 }
+
+/// CQ の溢れを検出した回数（全スレッドの合計。`veil_uring_cq_overflow_total`。F-280）
+pub static CQ_OVERFLOW_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// io_uring の CQE を処理する（最低 1 件完了まで待機）
 ///
