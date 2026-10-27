@@ -592,7 +592,7 @@
 | B-255 | P1 | 修正済み（v0.10.0） | [bugs/B-255-vendored-quiche-h3-frame-length-preallocation-ghsa-4fgf.md](bugs/B-255-vendored-quiche-h3-frame-length-preallocation-ghsa-4fgf.md) | vendoring の quiche 0.24.9 が HTTP/3 のフレーム長の宣言だけでストリームごとに最大 16MB を確保し（`MAX_STATE_BUF_SIZE`）、QPACK の上限計算も誤る（GHSA-4fgf-9xrr-88gf、CVE-2026-12523。RustSec に無く cargo-audit では見えない）。上流コミットのバックポート + `set_max_field_section_size` の広告 |
 | B-256 | P1 | 修正済み（v0.10.0） | [bugs/B-256-http3-path-event-queue-never-drained-ghsa-4q5x.md](bugs/B-256-http3-path-event-queue-never-drained-ghsa-4q5x.md) | HTTP/3 のサーバが quiche の `path_event_next()` を一度も呼ばず、相手の送信元の変更ごとに PathEvent が溜まる（GHSA-4q5x-gp38-rfp4、CVE-2026-12707。マイグレーション無効でも起きる）。メインループで消費 + 上流コミットのバックポート + パス変更回数の上限 |
 | B-257 | P2 | 修正済み（v0.10.0） | [bugs/B-257-wasm-grpc-executor-no-window-update-no-frame-split.md](bugs/B-257-wasm-grpc-executor-no-window-update-no-frame-split.md) | Wasm の gRPC 実行器が受信 DATA に WINDOW_UPDATE を返さず、プール接続が累計 64KB で全呼び出し停止。16KB 超のメッセージを 1 つの DATA フレームで送って `FRAME_SIZE_ERROR` で接続ごと落とす |
-| B-258 | P3 | 未修正 | [bugs/B-258-ktls-handover-partial-record-left-in-rustls.md](bugs/B-258-ktls-handover-partial-record-left-in-rustls.md) | ハンドシェイク直後に rustls のデフレーマに部分レコードが残ったまま kTLS RX を有効化すると境界がずれて接続が切れる（rustls の秘密抽出は受信側の未処理バイトを検査しない。F-282 の KT-02 を確定して切り出し） |
+| B-258 | P3 | 修正済み（v0.10.0） | [bugs/B-258-ktls-handover-partial-record-left-in-rustls.md](bugs/B-258-ktls-handover-partial-record-left-in-rustls.md) | ハンドシェイク直後に rustls のデフレーマに部分レコードが残ったまま kTLS RX を有効化すると境界がずれて接続が切れる（rustls の秘密抽出は受信側の未処理バイトを検査しない。F-282 の KT-02 を確定して切り出し） |
 
 ---
 

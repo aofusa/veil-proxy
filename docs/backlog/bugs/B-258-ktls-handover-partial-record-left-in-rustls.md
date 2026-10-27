@@ -1,6 +1,6 @@
 # B-258: ハンドシェイク直後に rustls のデフレーマに部分レコードが残ったまま kTLS RX を有効化すると境界がずれて接続が切れる
 
-**状態: 未修正（2026-10-28 起票。F-282 の 2 番目の項目を切り出した）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -33,6 +33,12 @@
 
 - kTLS の E2E に「クライアントが最後のフライトと最初の要求を 1 セグメントで、レコード境界をまたぐ位置で送る」ケースを足し（`tests/e2e_tests/` に
   TCP の中継を 1 つ置き、届いたバイトを溜めて境界をまたぐ位置で 2 回に分けて送る）、200 が返ること。
+
+## 修正（v0.10.0）
+
+- 改修案 1 の形: `src/ktls_rustls.rs` に rustls へ渡したバイト列の TLS レコード境界を数える `RecordTracker` を足し、kTLS へ移るとき（`enable_ktls` のときだけ）はハンドシェイクの後に **今のレコードの残りのバイト数だけ** を読み足して rustls へ渡してから秘密を取り出す（次のレコードへは読み進めない）。部分レコードはそのまま復号されて平文がドレインバッファへ入る。サーバ側（`do_server_handshake`）・上流側（`do_client_handshake`）の両方。kTLS を使わないときは従来どおり。
+- 試験: 単体 `record_tracker_tests::tracks_record_boundaries_across_reads`（全ての切れ目で次の境界まで読み足して止まる）。E2E `test_b258_request_record_split_after_handshake`（クライアントが Finished と要求を 1 回で送り、要求のレコードの最後の 10 バイトを 200ms 後に送る）。`./tests/e2e_setup.sh test ktls` で通過し、読み足しを外すと失敗することを確認。
+- 検証の途中で、kTLS の構成では上流の TLS 1.3 の NewSessionTicket で全要求が 502 になる別の不具合を見つけた（B-259）。
 
 ## 関連
 
