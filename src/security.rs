@@ -1318,7 +1318,7 @@ fn seccomp_block(
     action_allow: u32,
     action_deny: u32,
 ) -> Vec<libc::sock_filter> {
-    const BPF_LD_W_ABS: u16 = 0x00 | 0x00 | 0x20;
+    const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD(0x00) | BPF_W(0x00) | BPF_ABS(0x20)
     const BPF_RET_K: u16 = 0x06;
     const BPF_JEQ_K: u16 = 0x05 | 0x10;
     const BPF_JSET_K: u16 = 0x05 | 0x40;
@@ -4988,6 +4988,130 @@ mod tests {
         assert_eq!(code, 255, "argument filters (bits {code:#010b})");
         let code = run(probe_tgkill);
         assert_eq!(code, 3, "tgkill filter (bits {code:#04b})");
+    }
+
+    /// F-283: 組み上げたフィルタをテスト内の小さな BPF インタプリタで実行し、判定を固定する
+    /// （許可リストや引数の検査を変えたときに、arch・x32・PROT_EXEC などの拒否が崩れないように）。
+    #[cfg(target_os = "linux")]
+    fn run_seccomp_bpf(filter: &[libc::sock_filter], nr: u32, arch: u32, args: [u64; 6]) -> u32 {
+        // struct seccomp_data { int nr; u32 arch; u64 ip; u64 args[6]; }（リトルエンディアン）
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        for (i, a) in args.iter().enumerate() {
+            data[16 + 8 * i..24 + 8 * i].copy_from_slice(&a.to_le_bytes());
+        }
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        loop {
+            let ins = filter[pc];
+            match ins.code {
+                0x20 => {
+                    // BPF_LD | BPF_W | BPF_ABS
+                    let k = ins.k as usize;
+                    acc = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+                    pc += 1;
+                }
+                0x15 | 0x45 => {
+                    // BPF_JMP | BPF_JEQ | BPF_K / BPF_JMP | BPF_JSET | BPF_K
+                    let hit = if ins.code == 0x15 {
+                        acc == ins.k
+                    } else {
+                        acc & ins.k != 0
+                    };
+                    pc += 1 + if hit { ins.jt } else { ins.jf } as usize;
+                }
+                0x06 => return ins.k,
+                code => panic!("unexpected BPF instruction {code:#x} at {pc}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_seccomp_filter_decisions() {
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: u32 = 0xc000003e;
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: u32 = 0xc00000b7;
+        const ALLOW: u32 = 0x7fff0000;
+        const EPERM: u32 = 0x00050000 | libc::EPERM as u32;
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let run = |nr: i64, args: [u64; 6]| run_seccomp_bpf(&filter, nr as u32, ARCH, args);
+        let prot_rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let prot_x = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+
+        // 別の arch（x86_64 なら i386 の番号体系）は全部拒否
+        assert_eq!(
+            run_seccomp_bpf(&filter, libc::SYS_read as u32, 0x40000003, [0; 6]),
+            EPERM
+        );
+        // x32 の番号（bit 30）は許可リストの番号と一致しないので拒否
+        assert_eq!(run(libc::SYS_read | 0x4000_0000, [0; 6]), EPERM);
+        assert_eq!(run(libc::SYS_read, [0; 6]), ALLOW);
+        // PROT_EXEC
+        assert_eq!(run(libc::SYS_mmap, [0, 4096, prot_rw, 0, 0, 0]), ALLOW);
+        assert_eq!(run(libc::SYS_mmap, [0, 4096, prot_x, 0, 0, 0]), EPERM);
+        assert_eq!(run(libc::SYS_mprotect, [0, 4096, prot_rw, 0, 0, 0]), ALLOW);
+        assert_eq!(run(libc::SYS_mprotect, [0, 4096, prot_x, 0, 0, 0]), EPERM);
+        // pkey_mprotect は許可していない（PROT_EXEC の検査を迂回させない）
+        assert_eq!(
+            run(libc::SYS_pkey_mprotect, [0, 4096, prot_rw, 0, 0, 0]),
+            EPERM
+        );
+        // 引数の上位 32bit は見ない（下位 32bit の値で判定する）
+        assert_eq!(
+            run(libc::SYS_socket, [libc::AF_INET as u64, 1, 0, 0, 0, 0]),
+            ALLOW
+        );
+        assert_eq!(
+            run(libc::SYS_socket, [libc::AF_PACKET as u64, 3, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(
+            run(
+                libc::SYS_clone,
+                [(libc::CLONE_VM | libc::CLONE_THREAD) as u64, 0, 0, 0, 0, 0]
+            ),
+            ALLOW
+        );
+        assert_eq!(
+            run(libc::SYS_clone, [libc::CLONE_NEWNET as u64, 0, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(
+            run(libc::SYS_clone3, [0; 6]),
+            0x00050000 | libc::ENOSYS as u32
+        );
+        assert_eq!(run(libc::SYS_setresuid, [0; 6]), EPERM);
+
+        // 引数の検査の無い許可済みの syscall はどれも ALLOW（ジャンプ先のずれの検出）
+        let checked: Vec<u32> = seccomp_arg_checks().iter().map(|(n, _)| *n).collect();
+        for &nr in ALLOWED_SYSCALLS {
+            if !checked.contains(&(nr as u32)) {
+                assert_eq!(run(nr, [0; 6]), ALLOW, "syscall {nr} must be allowed");
+            }
+        }
+
+        // strict・log でも拒否の動作だけが変わる
+        let strict = build_seccomp_filter(SeccompMode::Strict).expect("build filter");
+        assert_eq!(
+            run_seccomp_bpf(
+                &strict,
+                libc::SYS_socket as u32,
+                ARCH,
+                [libc::AF_PACKET as u64, 0, 0, 0, 0, 0]
+            ),
+            0x80000000
+        );
+        let log = build_seccomp_filter(SeccompMode::Log).expect("build filter");
+        assert_eq!(
+            run_seccomp_bpf(&log, libc::SYS_setresuid as u32, ARCH, [0; 6]),
+            0x7ffc0000
+        );
     }
 
     /// F-278: 許可リストが長くなってもフィルタは壊れない（ジャンプはブロック内だけ）。全モードで組めて、

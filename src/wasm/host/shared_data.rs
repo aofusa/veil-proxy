@@ -160,6 +160,13 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 crate::wasm::shared_data::SetResult::CasMismatch => {
                     return PROXY_RESULT_CAS_MISMATCH
                 }
+                crate::wasm::shared_data::SetResult::TooManyKeys => {
+                    crate::logging::log_throttled!(
+                        warn,
+                        "[wasm] shared data key limit (shared_data_max_keys) reached; set rejected"
+                    );
+                    return PROXY_RESULT_INTERNAL_FAILURE;
+                }
             }
 
             PROXY_RESULT_OK

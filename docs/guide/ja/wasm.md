@@ -210,6 +210,9 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 | `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
 | `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel で数える）。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
 | `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
+| `grpc_connect_timeout_ms` | `proxy_grpc_call`・`proxy_grpc_stream` で gRPC の上流へ接続する（TCP と TLS）時間の上限。ゲストの `timeout_ms` が長くても接続はこの時間で諦める（到達できない上流で全プラグインの gRPC が止まらないように）。gRPC のスレッドが取り込む前の呼び出し・ストリームのメッセージはそれぞれ 4096 件までで、超えるとホスト関数は `InternalFailure` を返す | 5000 |
+| `http_call_max_timeout_ms` | `proxy_http_call` にプラグインが渡す `timeout_ms` の上限（負の値は 0 とみなす） | 60000 |
+| `shared_data_max_keys` | 1 モジュールの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は `InternalFailure` を返す（既存のキーは更新できる） | 100000 |
 
 #### Poolingアロケータ設定
 

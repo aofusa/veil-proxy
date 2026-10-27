@@ -145,7 +145,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let pending_call = PendingHttpCall {
                 token,
                 upstream: upstream.clone(),
-                timeout_ms: timeout_ms as u32,
+                // F-282: 負の値を約 49 日にしない（上限は実行時に `[wasm] http_call_max_timeout_ms` で打ち切る）
+                timeout_ms: timeout_ms.max(0) as u32,
                 headers: headers_data.clone(),
                 body: body_data.clone(),
                 trailers: trailers_data.clone(),

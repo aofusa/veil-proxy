@@ -3184,6 +3184,9 @@ mod exec_smoke_tests {
                 ..Default::default()
             }],
             interpreter,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         FilterEngine::new(&config).ok()
     }
@@ -3254,6 +3257,9 @@ mod exec_smoke_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
@@ -3343,6 +3349,9 @@ mod exec_smoke_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         FilterEngine::new(&config).ok()
     }

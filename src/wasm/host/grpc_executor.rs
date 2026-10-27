@@ -161,20 +161,64 @@ pub fn wait_for_grpc_work() {
     }
 }
 
-/// 呼び出しをグローバルレジストリへ登録する（`proxy_grpc_call` から）。
-pub fn register_global_pending_grpc_call(call: PendingGrpcUnaryCall) {
-    if let Ok(mut registry) = GLOBAL_PENDING_GRPC_CALLS.write() {
-        registry.push(call);
-    }
-    wake_grpc_thread();
+/// 実行スレッドが取り込む前の呼び出し・送出・キャンセルの件数の上限（それぞれ。F-283）。実行スレッドが
+/// 止まっている（到達できない上流への接続を待つ等）間にゲストが積み続けてもメモリが伸び続けない
+pub const MAX_PENDING_GRPC: usize = 4096;
+
+/// 1 ステップで 1 つの接続から読む量の上限（F-283）。poll(2) はレベルトリガなので残りは次のステップで読む
+const MAX_READ_PER_STEP: usize = 256 * 1024;
+
+/// 上流への新規接続（TCP + TLS）を待つ時間の上限（F-283）。ゲストの `timeout_ms` がこれより長くても、
+/// 接続はこの時間で諦める（実行スレッドは接続を同期で待つので、全プラグインの gRPC が止まらないように）
+static CONNECT_TIMEOUT_MS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(crate::wasm::types::DEFAULT_GRPC_CONNECT_TIMEOUT_MS);
+
+/// `[wasm] grpc_connect_timeout_ms` を反映する（起動時・リロード時）。
+pub fn set_connect_timeout_ms(ms: u32) {
+    CONNECT_TIMEOUT_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// メッセージ 1 件分の逐次送出要求を登録する（`proxy_grpc_send` から、F-139）。
-pub fn register_global_pending_grpc_send(send: PendingGrpcSend) {
-    if let Ok(mut registry) = GLOBAL_PENDING_GRPC_SENDS.write() {
-        registry.push(send);
+fn connect_timeout(guest_timeout_ms: u32) -> Duration {
+    let cap = CONNECT_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    Duration::from_millis(guest_timeout_ms.clamp(1, cap.max(1)) as u64)
+}
+
+/// `MAX_PENDING_GRPC` 件未満なら積む
+fn push_bounded<T>(registry: &mut Vec<T>, item: T) -> bool {
+    if registry.len() >= MAX_PENDING_GRPC {
+        return false;
+    }
+    registry.push(item);
+    true
+}
+
+/// 呼び出しをグローバルレジストリへ登録する（`proxy_grpc_call` から）。積めなければ false（上限。F-283）
+#[must_use]
+pub fn register_global_pending_grpc_call(call: PendingGrpcUnaryCall) -> bool {
+    let pushed = GLOBAL_PENDING_GRPC_CALLS
+        .write()
+        .is_ok_and(|mut r| push_bounded(&mut r, call));
+    if !pushed {
+        crate::logging::log_throttled!(warn, "[wasm:grpc] too many pending gRPC calls; rejecting");
     }
     wake_grpc_thread();
+    pushed
+}
+
+/// メッセージ 1 件分の逐次送出要求を登録する（`proxy_grpc_send` から、F-139）。積めなければ false（F-283）
+#[must_use]
+pub fn register_global_pending_grpc_send(send: PendingGrpcSend) -> bool {
+    let pushed = GLOBAL_PENDING_GRPC_SENDS
+        .write()
+        .is_ok_and(|mut r| push_bounded(&mut r, send));
+    if !pushed {
+        crate::logging::log_throttled!(
+            warn,
+            "[wasm:grpc] too many pending gRPC messages; rejecting"
+        );
+    }
+    wake_grpc_thread();
+    pushed
 }
 
 /// キャンセル済み呼び出しをレジストリから取り除く（`proxy_grpc_cancel`/`proxy_grpc_close` から）。
@@ -194,7 +238,10 @@ pub fn cancel_global_pending_grpc_call(module_name: &str, call_id: u32) -> bool 
         removed |= registry.len() < before;
     }
     if let Ok(mut cancels) = GLOBAL_PENDING_GRPC_CANCELS.write() {
-        cancels.push((module_name.to_string(), call_id));
+        // F-283: 上限を超えたキャンセルは捨てる（その呼び出しは期限で終わる）
+        if cancels.len() < MAX_PENDING_GRPC {
+            cancels.push((module_name.to_string(), call_id));
+        }
     }
     wake_grpc_thread();
     removed
@@ -417,7 +464,9 @@ impl ActiveCall {
 
         // --- 受信: WouldBlock までフレームを読み、種別ごとに処理する ---
         let mut tmp = [0u8; 8192];
-        loop {
+        let mut read_this_step = 0usize;
+        // F-283: 1 ステップで読む量に上限を置く（相手がフロー制御を無視して送り続けても受信バッファが伸び続けない）
+        while read_this_step < MAX_READ_PER_STEP {
             match self.conn.stream.read(&mut tmp) {
                 Ok(0) => {
                     self.conn.goaway = true;
@@ -425,7 +474,10 @@ impl ActiveCall {
                     self.phase = CallPhase::Done;
                     return events;
                 }
-                Ok(n) => self.conn.read_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    read_this_step += n;
+                    self.conn.read_buf.extend_from_slice(&tmp[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     ftlog::warn!("[wasm:grpc] read failed: {e}");
@@ -1043,7 +1095,7 @@ fn connect_new(
     use_tls: bool,
     timeout_ms: u32,
 ) -> Result<PooledConn, String> {
-    let timeout = Duration::from_millis(timeout_ms.max(1) as u64);
+    let timeout = connect_timeout(timeout_ms);
     let addr = format!("{host}:{port}");
     let tcp_stream = crate::upstream::tcp_connect_timeout(
         &addr
@@ -1491,7 +1543,7 @@ mod tests {
             messages: vec![Bytes::from_static(b"hello")],
             timeout_ms: 1000,
         };
-        register_global_pending_grpc_call(call.clone());
+        assert!(register_global_pending_grpc_call(call.clone()));
 
         assert!(!cancel_global_pending_grpc_call(
             "test_module_grpc_exec",
@@ -1503,6 +1555,22 @@ mod tests {
         assert!(!taken
             .iter()
             .any(|c| c.module_name == "test_module_grpc_exec" && c.call_id == 42));
+    }
+
+    /// F-283: 実行スレッドが取り込む前のキューは上限で止まり、接続の待ち時間は設定の上限で切られる
+    #[test]
+    fn test_pending_queue_bound_and_connect_timeout_cap() {
+        let mut v = Vec::new();
+        for i in 0..MAX_PENDING_GRPC {
+            assert!(push_bounded(&mut v, i));
+        }
+        assert!(!push_bounded(&mut v, 0));
+        assert_eq!(v.len(), MAX_PENDING_GRPC);
+
+        set_connect_timeout_ms(5_000);
+        assert_eq!(connect_timeout(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(connect_timeout(200), Duration::from_millis(200));
+        assert_eq!(connect_timeout(0), Duration::from_millis(1));
     }
 
     /// F-139: `proxy_grpc_send` 相当の逐次送出登録が、half-close を待たずに
@@ -1519,7 +1587,7 @@ mod tests {
             message: Bytes::from_static(b"chunk-1"),
             end_of_stream: false,
         };
-        register_global_pending_grpc_send(send);
+        assert!(register_global_pending_grpc_send(send));
 
         let taken = take_global_pending_grpc_sends();
         assert!(taken

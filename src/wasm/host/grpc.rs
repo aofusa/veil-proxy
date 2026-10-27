@@ -345,23 +345,26 @@ fn proxy_grpc_call_impl(
     let state = caller.data_mut();
     let call_id = state.http_ctx.next_grpc_call_id();
     let module_name = state.http_ctx.plugin_name.clone();
-    state.http_ctx.register_grpc_call(
-        call_id,
-        grpc_path.clone(),
-        message.clone(),
-        timeout_ms as u32,
-    );
 
-    super::grpc_executor::register_global_pending_grpc_call(
+    // F-283: 実行スレッドが取り込む前の呼び出しが上限に達していたら受け付けない
+    if !super::grpc_executor::register_global_pending_grpc_call(
         super::grpc_executor::PendingGrpcUnaryCall {
             module_name: module_name.to_string(),
             call_id,
             upstream,
-            path: grpc_path,
+            path: grpc_path.clone(),
             initial_metadata,
-            messages: vec![message],
-            timeout_ms: timeout_ms as u32,
+            messages: vec![message.clone()],
+            timeout_ms: timeout_ms.max(0) as u32,
         },
+    ) {
+        return PROXY_RESULT_INTERNAL_FAILURE;
+    }
+    caller.data_mut().http_ctx.register_grpc_call(
+        call_id,
+        grpc_path,
+        message,
+        timeout_ms.max(0) as u32,
     );
 
     // Write call_id to return pointer
@@ -589,7 +592,8 @@ fn proxy_grpc_send_impl(
         // （`proxy_grpc_stream` 直後の最初の送出）場合は、実行スレッドが接続確立に
         // 必要な情報（upstream/path/initial_metadata）からその場で作成する。
         let path = format!("/{}/{}", stream.service, stream.method);
-        super::grpc_executor::register_global_pending_grpc_send(
+        // F-283: 実行スレッドが取り込む前の送出が上限に達していたら受け付けない
+        if !super::grpc_executor::register_global_pending_grpc_send(
             super::grpc_executor::PendingGrpcSend {
                 module_name: module_name.to_string(),
                 call_id: stream_id_u32,
@@ -602,7 +606,9 @@ fn proxy_grpc_send_impl(
                 message,
                 end_of_stream: end_of_stream != 0,
             },
-        );
+        ) {
+            return PROXY_RESULT_INTERNAL_FAILURE;
+        }
 
         if end_of_stream != 0 {
             stream.state = GrpcStreamState::HalfClosed;

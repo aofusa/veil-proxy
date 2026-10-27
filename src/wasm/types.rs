@@ -6,7 +6,7 @@ use super::capabilities::ModuleCapabilities;
 use crate::wasm_plugin_config::PluginConfiguration;
 
 /// WASM extension configuration
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WasmConfig {
     /// Enable WASM extensions
     #[serde(default)]
@@ -28,6 +28,54 @@ pub struct WasmConfig {
     /// **OpenBSD ではこの値は常に無視され、常に Pulley が使われる**（B-52）。
     #[serde(default)]
     pub interpreter: bool,
+
+    /// Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）。
+    /// ゲストの `timeout_ms` がこれより長くても接続はこの時間で諦める（F-283）
+    #[serde(default = "default_grpc_connect_timeout_ms")]
+    pub grpc_connect_timeout_ms: u32,
+
+    /// `proxy_http_call` の `timeout_ms` の上限（ミリ秒）。負の値・これより長い値はこの値で打ち切る（F-282）
+    #[serde(default = "default_http_call_max_timeout_ms")]
+    pub http_call_max_timeout_ms: u32,
+
+    /// モジュールごとの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は失敗する（F-282）
+    #[serde(default = "default_shared_data_max_keys")]
+    pub shared_data_max_keys: usize,
+}
+
+/// `[wasm] grpc_connect_timeout_ms` の既定（F-283）
+pub const DEFAULT_GRPC_CONNECT_TIMEOUT_MS: u32 = 5_000;
+
+fn default_grpc_connect_timeout_ms() -> u32 {
+    DEFAULT_GRPC_CONNECT_TIMEOUT_MS
+}
+
+/// `[wasm] http_call_max_timeout_ms` の既定（F-282）
+pub const DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS: u32 = 60_000;
+
+fn default_http_call_max_timeout_ms() -> u32 {
+    DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS
+}
+
+/// `[wasm] shared_data_max_keys` の既定（F-282）
+pub const DEFAULT_SHARED_DATA_MAX_KEYS: usize = 100_000;
+
+fn default_shared_data_max_keys() -> usize {
+    DEFAULT_SHARED_DATA_MAX_KEYS
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defaults: WasmDefaults::default(),
+            modules: Vec::new(),
+            interpreter: false,
+            grpc_connect_timeout_ms: DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: DEFAULT_SHARED_DATA_MAX_KEYS,
+        }
+    }
 }
 
 /// Default WASM settings

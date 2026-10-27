@@ -216,6 +216,9 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 | `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
 | `yield_interval_us` | How often a running callback yields the worker to other requests (approximate microseconds, measured in fuel). Smaller values shorten the wait of other requests on the same worker behind a CPU-heavy filter, but every callback pauses more often, more `instance_reuse` instances are open at once, and each request costs more | 1000 |
 | `interpreter` | Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135). Always forced to `true` on OpenBSD (B-52) | false |
+| `grpc_connect_timeout_ms` | Upper bound on connecting (TCP and TLS) to a gRPC upstream for `proxy_grpc_call`/`proxy_grpc_stream`. A longer guest `timeout_ms` still gives up connecting after this time, so an unreachable upstream does not stall every plugin's gRPC calls. At most 4096 calls and 4096 stream messages wait for the gRPC thread; beyond that the host call returns `InternalFailure` | 5000 |
+| `http_call_max_timeout_ms` | Upper bound on the `timeout_ms` a plugin passes to `proxy_http_call` (a negative value counts as 0) | 60000 |
+| `shared_data_max_keys` | Maximum number of keys in one module's shared data; `proxy_set_shared_data` with a new key beyond it returns `InternalFailure` (existing keys can still be updated) | 100000 |
 
 #### Pooling Allocator Settings
 

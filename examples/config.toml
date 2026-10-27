@@ -1589,6 +1589,19 @@ watch = false
 # （veil-wasmtime）を使うため Pulley 専用。false を指定すると起動時に警告ログが出る）。
 # interpreter = false
 
+# Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）
+# ゲストの timeout_ms が長くても接続はこの時間で諦める（gRPC の実行スレッドは接続を同期で待つため）
+# デフォルト: 5000
+# grpc_connect_timeout_ms = 5000
+
+# proxy_http_call の timeout_ms の上限（ミリ秒。負の値は 0 とみなす）
+# デフォルト: 60000
+# http_call_max_timeout_ms = 60000
+
+# 1 モジュールの shared data のキーの数の上限（超える新しいキーの proxy_set_shared_data は InternalFailure）
+# デフォルト: 100000
+# shared_data_max_keys = 100000
+
 # デフォルト設定
 # [wasm.defaults]
 # 最大実行時間（ミリ秒）

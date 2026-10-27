@@ -86,13 +86,18 @@ static RESOLVED: Lazy<Mutex<std::collections::HashSet<String>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
 fn resolved(name: &str) -> bool {
-    RESOLVED.lock().map(|r| r.contains(name)).unwrap_or(true)
+    // F-283: poison したロックを「解決済み」に丸めない（他と同じく中身を使う）
+    RESOLVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(name)
 }
 
 fn mark_resolved(name: &str) {
-    if let Ok(mut r) = RESOLVED.lock() {
-        r.insert(name.to_string());
-    }
+    RESOLVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string());
 }
 
 /// 設定が参照するバックエンドのクラスタ。
@@ -216,7 +221,7 @@ pub fn counts() -> (usize, usize, usize) {
     (
         OUT.load().len(),
         IN.load().len(),
-        BACKENDS.lock().map(|b| b.len()).unwrap_or(0),
+        BACKENDS.lock().unwrap_or_else(|e| e.into_inner()).len(),
     )
 }
 

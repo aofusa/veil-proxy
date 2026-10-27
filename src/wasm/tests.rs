@@ -394,6 +394,9 @@ mod interpreter_tests {
                 ..Default::default()
             }],
             interpreter,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         }
     }
 
@@ -506,6 +509,9 @@ mod f132_h3_lifecycle_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1542,6 +1548,9 @@ mod f133_network_filter_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1721,6 +1730,9 @@ mod instance_reuse_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1838,6 +1850,9 @@ mod instance_reuse_tests {
                 ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         assert!(FilterEngine::new(&config).is_err());
     }

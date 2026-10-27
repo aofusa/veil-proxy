@@ -112,6 +112,23 @@ pub fn set_content_length_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, len: usi
     headers.push((b"content-length".to_vec(), len.to_string().into_bytes()));
 }
 
+/// `[wasm] http_call_max_timeout_ms`（F-282）
+static MAX_TIMEOUT_MS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS);
+
+/// `[wasm] http_call_max_timeout_ms` を反映する（起動時・リロード時）
+pub fn set_max_timeout_ms(ms: u32) {
+    MAX_TIMEOUT_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// ゲストの `timeout_ms` を上限で打ち切る（ホスト関数で負の値は 0 にしてある。0 は 1ms）
+fn clamp_timeout(timeout_ms: u32) -> Duration {
+    let cap = MAX_TIMEOUT_MS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    Duration::from_millis(timeout_ms.clamp(1, cap) as u64)
+}
+
 /// Execute a pending HTTP call and return the response
 ///
 /// This function makes a synchronous HTTP/1.1 request to the upstream.
@@ -122,7 +139,7 @@ pub fn execute_http_call(
     upstream_port: u16,
     use_tls: bool,
 ) -> Result<HttpCallResponse, String> {
-    let timeout = Duration::from_millis(pending.call.timeout_ms as u64);
+    let timeout = clamp_timeout(pending.call.timeout_ms);
 
     // Connect to upstream
     let addr = format!("{}:{}", upstream_host, upstream_port);
@@ -405,6 +422,16 @@ pub fn execute_http_call_safe(
 
 #[cfg(test)]
 mod tests {
+
+    /// F-282: ゲストの timeout_ms は上限で打ち切る（負の値はホスト関数で 0 にしてある）
+    #[test]
+    fn http_call_timeout_is_clamped() {
+        set_max_timeout_ms(crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS);
+        assert_eq!(clamp_timeout(u32::MAX), Duration::from_millis(60_000));
+        assert_eq!(clamp_timeout(0), Duration::from_millis(1));
+        assert_eq!(clamp_timeout(250), Duration::from_millis(250));
+    }
+
     use super::*;
     use crate::wasm::types::PendingHttpCall;
 

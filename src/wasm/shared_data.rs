@@ -10,7 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use once_cell::sync::Lazy;
@@ -22,6 +22,16 @@ pub struct SharedData {
     shards: [RwLock<HashMap<Box<str>, (Arc<[u8]>, u32)>>; SHARDS],
     /// 次に払い出す CAS の値（0 は「CAS を検査しない」の意味なので使わない）
     next_cas: AtomicU32,
+    /// キーの数（F-282: 上限の検査に使う。区画のロックの下で増やす）
+    keys: AtomicUsize,
+}
+
+/// モジュールごとのキーの数の上限（`[wasm] shared_data_max_keys`。F-282）
+static MAX_KEYS: AtomicUsize = AtomicUsize::new(crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS);
+
+/// `[wasm] shared_data_max_keys` を反映する（起動時・リロード時）
+pub fn set_max_keys(n: usize) {
+    MAX_KEYS.store(n, Ordering::Relaxed);
 }
 
 /// `set` の結果
@@ -29,6 +39,8 @@ pub struct SharedData {
 pub enum SetResult {
     Ok,
     CasMismatch,
+    /// キーの数が上限に達していて新しいキーを置けない（F-282）
+    TooManyKeys,
 }
 
 impl Default for SharedData {
@@ -36,6 +48,7 @@ impl Default for SharedData {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             next_cas: AtomicU32::new(1),
+            keys: AtomicUsize::new(0),
         }
     }
 }
@@ -55,6 +68,11 @@ impl SharedData {
 
     /// 値を置く。`cas` が 0 でなく、キーがあってその CAS と違えば `CasMismatch`（Proxy-Wasm の `proxy_set_shared_data`）
     pub fn set(&self, key: &str, value: &[u8], cas: u32) -> SetResult {
+        self.set_with_limit(key, value, cas, MAX_KEYS.load(Ordering::Relaxed))
+    }
+
+    /// `set` の本体。キーの数が `max_keys` に達していたら新しいキーは置かない（F-282）
+    fn set_with_limit(&self, key: &str, value: &[u8], cas: u32, max_keys: usize) -> SetResult {
         let value: Arc<[u8]> = Arc::from(value);
         let mut shard = self.shard(key).write().unwrap_or_else(|e| e.into_inner());
         if cas != 0 {
@@ -64,6 +82,10 @@ impl SharedData {
                 }
             }
         }
+        let exists = shard.contains_key(key);
+        if !exists && self.keys.load(Ordering::Relaxed) >= max_keys {
+            return SetResult::TooManyKeys;
+        }
         let mut new_cas = self.next_cas.fetch_add(1, Ordering::Relaxed);
         if new_cas == 0 {
             new_cas = self.next_cas.fetch_add(1, Ordering::Relaxed);
@@ -72,6 +94,7 @@ impl SharedData {
             Some(slot) => *slot = (value, new_cas),
             None => {
                 shard.insert(Box::from(key), (value, new_cas));
+                self.keys.fetch_add(1, Ordering::Relaxed);
             }
         }
         SetResult::Ok
@@ -98,4 +121,25 @@ static REGISTRY: Lazy<Mutex<HashMap<Box<str>, Arc<SharedData>>>> =
 pub fn for_module(name: &str) -> Arc<SharedData> {
     let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     reg.entry(Box::from(name)).or_default().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-282: キーの数の上限に達したら新しいキーは置けないが、既存のキーの更新はできる
+    #[test]
+    fn new_keys_stop_at_limit_and_existing_keys_update() {
+        let d = SharedData::default();
+        for i in 0..3 {
+            assert_eq!(
+                d.set_with_limit(&format!("k{i}"), b"v", 0, 3),
+                SetResult::Ok
+            );
+        }
+        assert_eq!(d.set_with_limit("k3", b"v", 0, 3), SetResult::TooManyKeys);
+        assert_eq!(d.set_with_limit("k1", b"w", 0, 3), SetResult::Ok);
+        assert_eq!(&*d.get("k1").unwrap().0, b"w");
+        assert_eq!(d.len(), 3);
+    }
 }
