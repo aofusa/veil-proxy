@@ -787,7 +787,7 @@ watch = false
 #   "disabled" - 無効（デフォルト）
 #   "log"      - 違反をログに記録（ブロックしない、導入時推奨）
 #   "filter"   - 違反をEPERMで拒否（本番推奨）
-#   "strict"   - 違反したプロセスをSIGKILL（最も厳格、デバッグ困難）
+#   "strict"   - 違反するとプロセス全体を SIGSYS で終了（どのスレッドの違反でも。最も厳格、デバッグ困難）
 #
 # seccomp_mode = "log"  # まずログモードで検証
 

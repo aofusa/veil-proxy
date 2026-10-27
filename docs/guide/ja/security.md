@@ -49,6 +49,9 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+`log` は違反を記録するだけ、`filter` は許可されない呼び出しを `EPERM` で失敗させ、`strict` はどのスレッドが呼んでも
+プロセス全体を `SIGSYS` で終了させます（v0.10.0 より前は違反したスレッドだけが消え、残りは動き続けていました）。
+
 > 許可リストには静的ファイル配信に必要な `faccessat2`（glibc 2.33+ / musl が
 > `access()`/`faccessat()` の実体として発行）を含みます。これが無いと seccomp 有効時に
 > ファイル解決が `EPERM` で失敗し、静的配信が 404 になります（コンテナ用

@@ -1118,9 +1118,12 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
 
     // アクション
     let action_allow = 0x7fff0000u32; // SECCOMP_RET_ALLOW
+
+    // B-246: Strict は 0（SECCOMP_RET_KILL_THREAD。違反したスレッドだけが黙って消え、残りは動き続ける）ではなく、
+    // 文書どおりプロセスごと落とす。4.14 未満のカーネルは未知の動作の上位ビットを見ずに KILL_THREAD として扱う
     let action_deny = match mode {
         SeccompMode::Log => 0x7ffc0000u32,      // SECCOMP_RET_LOG
-        SeccompMode::Strict => 0x00000000u32,   // SECCOMP_RET_KILL_PROCESS
+        SeccompMode::Strict => 0x80000000u32,   // SECCOMP_RET_KILL_PROCESS
         SeccompMode::Filter => 0x00050001u32,   // SECCOMP_RET_ERRNO | EPERM
         SeccompMode::Disabled => 0x7fff0000u32, // SECCOMP_RET_ALLOW (no-op)
     };
@@ -4693,6 +4696,64 @@ mod tests {
             libc::WTERMSIG(status),
             libc::SIGSYS,
             "Strict mode: process must be killed by SIGSYS on a disallowed syscall"
+        );
+    }
+
+    /// B-246: Strict の違反はプロセスごと落とす。違反したのが主スレッド以外でも、
+    /// 違反したスレッドだけが消えて残りが動き続けてはいけない（SECCOMP_RET_KILL_THREAD との区別）。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_strict_kills_whole_process_from_other_thread() {
+        const PTRACE_TRACEME: libc::c_long = 0;
+
+        extern "C" fn violate(_: *mut libc::c_void) -> *mut libc::c_void {
+            unsafe { libc::syscall(libc::SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) };
+            std::ptr::null_mut()
+        }
+
+        let filter = build_seccomp_filter(SeccompMode::Strict).expect("build strict filter");
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                unsafe { libc::_exit(42) };
+            }
+            let applied = unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &prog as *const libc::sock_fprog,
+                    0,
+                    0,
+                )
+            };
+            if applied != 0 {
+                unsafe { libc::_exit(42) };
+            }
+            // 子スレッドで禁止 syscall を呼ぶ。KILL_THREAD なら join が返り、主スレッドが _exit(3) する
+            let mut th: libc::pthread_t = 0;
+            let rc = unsafe {
+                libc::pthread_create(&mut th, std::ptr::null(), violate, std::ptr::null_mut())
+            };
+            if rc != 0 {
+                unsafe { libc::_exit(43) };
+            }
+            unsafe { libc::pthread_join(th, std::ptr::null_mut()) };
+            unsafe { libc::_exit(3) };
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFEXITED(status) && matches!(libc::WEXITSTATUS(status), 42 | 43) {
+            eprintln!("seccomp strict or thread creation unavailable; skipping");
+            return;
+        }
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "Strict mode: a violation in another thread must kill the whole process (status {status:#x})"
         );
     }
 

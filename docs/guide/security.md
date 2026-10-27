@@ -50,6 +50,10 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+`log` only records violations, `filter` makes the disallowed call fail with `EPERM`, and `strict` terminates the
+whole process with `SIGSYS`, whichever thread made the call (before v0.10.0 only that thread was killed and the
+rest kept running).
+
 > The allowlist includes `faccessat2` (issued by glibc 2.33+/musl for `access()`/`faccessat()`) and
 > `openat2` (used to resolve static files with `RESOLVE_BENEATH`, F-153). The container profiles
 > (`docker/assets/security/seccomp.json` / `seccomp-epoll.json`) include both; `openat2` was added in

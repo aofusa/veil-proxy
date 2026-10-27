@@ -578,6 +578,7 @@
 | B-243 | P3 | 修正済み（v0.10.0） | [bugs/B-243-semgrep-dead-code-rule-false-findings.md](bugs/B-243-semgrep-dead-code-rule-false-findings.md) | semgrep のカスタムルール `veil-no-bare-allow-dead-code` がコメント内の文章と `examples/`・`third_party/` に一致して毎晩 37 件の偽の所見を出す（`paths.include: "src/"` がスキャンの root `/src` の全ファイルに一致）。本物は 0 件 |
 | B-244 | P1 | 修正済み（v0.10.0） | [bugs/B-244-seccomp-missing-restart-syscall.md](bugs/B-244-seccomp-missing-restart-syscall.md) | seccomp の許可リスト（`src/security.rs`・`docker/assets/security/seccomp*.json`）に `restart_syscall` が無く、SIGSTOP/SIGCONT・ptrace の後に背景スレッド（リロード・ヘルスチェック）の sleep が panic する。strict ではスレッドが黙って消え、SIGTERM で終了しなくなる |
 | B-245 | P2 | 修正済み（v0.10.0） | [bugs/B-245-container-security-admin-metrics-after-b231.md](bugs/B-245-container-security-admin-metrics-after-b231.md) | B-231 の後、container_security のフィクスチャに `allowed_ips` が無く admin_security・metrics_probe が 403 で失敗。`metrics_host_label_bounded` は系列を読めないまま PASS と報告していた |
+| B-246 | P1 | 修正済み（v0.10.0） | [bugs/B-246-seccomp-strict-kills-only-thread.md](bugs/B-246-seccomp-strict-kills-only-thread.md) | `seccomp_mode = "strict"` の拒否動作が `0`（`SECCOMP_RET_KILL_THREAD`）で、違反したスレッドだけが消えてプロセスは動き続ける（文書は「プロセスを終了」。コメントは KILL_PROCESS と誤記） |
 
 ---
 
