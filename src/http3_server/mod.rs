@@ -75,6 +75,7 @@ use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
 
 // F-233: 機能ごとのファイル（子モジュールは `use super::*;` で親の名前を見る）
+mod admission;
 mod request_task;
 use self::request_task::*;
 mod streaming;
@@ -622,6 +623,12 @@ pub struct Http3ServerConfig {
     /// reactor バックエンド専用: 1 イテレーションあたりに掻き出す UDP データグラム数の上限
     /// （`[http3] recv_drain_max`、1..=`H3_RECV_DRAIN_MAX_LIMIT`）。デフォルト: 1024（F-152、v0.8.0 で 64 から変更）
     pub recv_drain_max: usize,
+    /// B-222: ワーカーごとの接続数の上限（0 は上限なし）。デフォルト: 10000
+    pub max_connections: usize,
+    /// B-222: ハンドシェイク中の接続がこの数に達したら Retry でアドレスを検証する（0 は常に）。デフォルト: 1000
+    pub retry_threshold: usize,
+    /// B-222: ハンドシェイクの期限（ミリ秒）。デフォルト: 10000
+    pub handshake_timeout: u64,
 }
 
 impl Default for Http3ServerConfig {
@@ -647,6 +654,9 @@ impl Default for Http3ServerConfig {
             hystart: true,
             mmsg_batch_size: crate::udp::socket::MMSG_BATCH_DEFAULT,
             recv_drain_max: H3_RECV_DRAIN_MAX_DEFAULT,
+            max_connections: admission::DEFAULT_MAX_CONNECTIONS,
+            retry_threshold: admission::DEFAULT_RETRY_THRESHOLD,
+            handshake_timeout: admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
         }
     }
 }
@@ -970,6 +980,8 @@ struct Http3Handler {
     goaway_id: Option<u64>,
     /// F-187: graceful shutdown で CONNECTION_CLOSE を出した。
     shutdown_closed: bool,
+    /// B-222: ハンドシェイク中（確立前）の印。確立で外し、期限を過ぎたら接続を捨てる。
+    handshake: Option<admission::HandshakeSlot>,
 }
 
 impl Http3Handler {
@@ -1004,6 +1016,7 @@ impl Http3Handler {
             next_req_stream: 0,
             goaway_id: None,
             shutdown_closed: false,
+            handshake: None,
         }
     }
 
@@ -1061,6 +1074,8 @@ impl Http3Handler {
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             self.h3_conn = Some(h3);
+            // B-222: ハンドシェイク中の数から外す
+            self.handshake = None;
             debug!(
                 "[HTTP/3] HTTP/3 connection established from {}",
                 self.peer_addr
@@ -2560,6 +2575,139 @@ mod tests {
         assert!(
             handler.stream_bodies.contains_key(&u64::MAX),
             "the 2nd datagram must be delivered to the existing connection"
+        );
+    }
+
+    /// B-222: ハンドシェイク中の数が閾値に達したら（ここでは 0 = 常に）トークンの無い Initial には Retry を返し、
+    /// Retry のトークンを持って来た Initial で接続を作ってハンドシェイクが終わる。接続数の上限を超えた Initial は捨てる。
+    #[test]
+    fn test_b222_retry_then_handshake_and_connection_limit() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut feed = |conns: &mut ConnMapInner, pkt: &mut [u8], from: SocketAddr| {
+            process_datagram_segments(
+                conns,
+                pkt,
+                from,
+                None,
+                &cid_key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+        let new_client = |id: u8, addr: SocketAddr| {
+            let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            cfg.set_application_protos(h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            cfg.verify_peer(false);
+            quiche::connect(
+                Some("localhost"),
+                &ConnectionId::from_ref(&[id; 16]),
+                addr,
+                server_addr,
+                &mut cfg,
+            )
+            .unwrap()
+        };
+
+        admission::configure(1, 0, 10_000);
+        let client_addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let mut client = new_client(1, client_addr);
+        let mut buf = vec![0u8; 1500];
+        let (len, _) = client.send(&mut buf).unwrap();
+        feed(&mut conns, &mut buf[..len], client_addr);
+        assert!(
+            conns.is_empty(),
+            "an Initial without a token must get a Retry"
+        );
+        let mut retries = Vec::new();
+        admission::drain_retries(|p| retries.push((p.buf[..p.len].to_vec(), p.to)));
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].1, client_addr);
+        let recv_info = quiche::RecvInfo {
+            from: server_addr,
+            to: client_addr,
+        };
+        client.recv(&mut retries[0].0, recv_info).unwrap();
+
+        // トークン付きの Initial で接続を作り、ハンドシェイクを最後まで進める
+        for _ in 0..10 {
+            while let Ok((len, _)) = client.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], client_addr);
+            }
+            assert_eq!(
+                conns.len(),
+                1,
+                "the retried Initial must create the connection"
+            );
+            let h = conns.values_mut().next().unwrap();
+            while let Ok((len, _)) = h.conn.send(&mut buf) {
+                let _ = client.recv(&mut buf[..len], recv_info);
+            }
+            if client.is_established() && h.conn.is_established() {
+                break;
+            }
+        }
+        assert!(
+            client.is_established(),
+            "handshake must complete after Retry"
+        );
+
+        // 偽のトークン（別の送信元のもの）は捨てる。接続数の上限（1）を超える Initial も捨てる
+        admission::configure(2, 0, 10_000);
+        let other: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let mut c2 = new_client(2, other);
+        let (len, _) = c2.send(&mut buf).unwrap();
+        feed(&mut conns, &mut buf[..len], other);
+        let mut retried = Vec::new();
+        admission::drain_retries(|p| retried.push(p.buf[..p.len].to_vec()));
+        assert_eq!(retried.len(), 1);
+        c2.recv(
+            &mut retried[0],
+            quiche::RecvInfo {
+                from: server_addr,
+                to: other,
+            },
+        )
+        .unwrap();
+        let (len, _) = c2.send(&mut buf).unwrap();
+        // 同じパケットを別の送信元から届ける（トークンは送信元に結び付く）
+        let mut spoofed = buf[..len].to_vec();
+        feed(&mut conns, &mut spoofed, "127.0.0.1:40003".parse().unwrap());
+        assert_eq!(
+            conns.len(),
+            1,
+            "a token from another address must be rejected"
+        );
+        admission::configure(1, 0, 10_000);
+        feed(&mut conns, &mut buf[..len], other);
+        assert_eq!(conns.len(), 1, "max_connections must cap new connections");
+
+        admission::configure(
+            admission::DEFAULT_MAX_CONNECTIONS,
+            admission::DEFAULT_RETRY_THRESHOLD,
+            admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
         );
     }
 

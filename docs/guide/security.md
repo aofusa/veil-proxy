@@ -413,6 +413,9 @@ Request-level hardening that came out of the audit:
   the terminating chunk is forwarded upstream as part of that request.
 - WebSocket upgrades apply `remove_request_headers` / `add_request_headers`; client bytes that follow the
   handshake are sent upstream only after a `101`.
+- HTTP/3 caps connections per worker (`[http3] max_connections`), answers Initials with a stateless Retry once
+  `retry_threshold` connections are handshaking, and drops connections that do not finish the handshake within
+  `handshake_timeout`, so a flood of Initials from spoofed addresses cannot allocate connections without bound.
 - HTTP/2 and HTTP/3 buffered request bodies are capped while they accumulate (the largest
   `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
 - The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.

@@ -373,6 +373,12 @@ pub async fn run_http3_server_async(
     // F-152: reactor 経路の 1 イテレーションあたり drain 上限（`[http3] recv_drain_max`）。
     // io_uring 経路（`PipelinedUdpRecv`）は参照しないため、そちらのビルドでは未使用になる。
     let recv_drain_max = config.recv_drain_max.clamp(1, H3_RECV_DRAIN_MAX_LIMIT);
+    // B-222: このワーカーの接続の受け入れ制御
+    admission::configure(
+        config.max_connections,
+        config.retry_threshold,
+        config.handshake_timeout,
+    );
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
     // F-130 C1/C2: io_uring RECVMSG バックエンド（Linux uring バックエンド）。

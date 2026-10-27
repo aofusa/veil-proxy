@@ -1175,6 +1175,30 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_recv_drain_max")]
     pub recv_drain_max: usize,
 
+    /// ワーカーごとの QUIC 接続数の上限（B-222）
+    ///
+    /// 上限に達している間は新しい接続の Initial を捨てる。`0` は上限なし。
+    ///
+    /// デフォルト: `10000`
+    #[serde(default = "default_h3_max_connections")]
+    pub max_connections: usize,
+
+    /// Retry でアドレスを検証し始めるハンドシェイク中の接続数（ワーカーごと、B-222）
+    ///
+    /// ハンドシェイク中の接続がこの数に達したら、トークンの無い Initial にステートレスな Retry を返し、
+    /// クライアントが送信元のアドレスを持っていることを確かめてから接続を作る（送信元を偽装した Initial の
+    /// 洪水で接続を確保させない）。`0` は常に Retry（1 往復増える）。
+    ///
+    /// デフォルト: `1000`
+    #[serde(default = "default_h3_retry_threshold")]
+    pub retry_threshold: usize,
+
+    /// ハンドシェイクの期限（ミリ秒、B-222）。これまでに確立しない接続は捨てる。
+    ///
+    /// デフォルト: `10000`
+    #[serde(default = "default_h3_handshake_timeout")]
+    pub handshake_timeout: u64,
+
     // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
@@ -1226,6 +1250,15 @@ fn default_h3_mmsg_batch_size() -> usize {
 fn default_h3_recv_drain_max() -> usize {
     1024
 }
+fn default_h3_max_connections() -> usize {
+    10_000
+}
+fn default_h3_retry_threshold() -> usize {
+    1_000
+}
+fn default_h3_handshake_timeout() -> u64 {
+    10_000
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -1250,6 +1283,9 @@ impl Default for Http3ConfigSection {
             hystart: true,
             mmsg_batch_size: default_h3_mmsg_batch_size(),
             recv_drain_max: default_h3_recv_drain_max(),
+            max_connections: default_h3_max_connections(),
+            retry_threshold: default_h3_retry_threshold(),
+            handshake_timeout: default_h3_handshake_timeout(),
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -1290,6 +1326,9 @@ impl Http3ConfigSection {
             recv_drain_max: self
                 .recv_drain_max
                 .clamp(1, http3_server::H3_RECV_DRAIN_MAX_LIMIT),
+            max_connections: self.max_connections,
+            retry_threshold: self.retry_threshold,
+            handshake_timeout: self.handshake_timeout,
         }
     }
 }

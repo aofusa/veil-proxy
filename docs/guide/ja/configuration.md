@@ -85,6 +85,9 @@
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring パイプライン化 RECVMSG/SENDMSG バッチ幅（1..=128） |
+| `[http3]` | `max_connections` | `10000` | ワーカーごとの QUIC 接続数の上限。達している間は新しい接続の Initial を捨てる。`0` は上限なし |
+| `[http3]` | `retry_threshold` | `1000` | ワーカーでハンドシェイク中の接続がこの数に達したら、トークンの無い Initial にステートレスな Retry を返し、クライアントが送信元のアドレスを持つことを確かめてから接続を作る（1 往復増える）。`0` は常に Retry |
+| `[http3]` | `handshake_timeout` | `10000` | ハンドシェイクの期限（ミリ秒）。これまでに確立しない接続は捨てる（`max_idle_timeout` まで残さない） |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。v0.8.0 より前の既定は 64。1024 で FreeBSD の HTTP/3 3B が 37% 伸びた（p99 は 11 → 14ms）。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
