@@ -266,12 +266,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     102, // getuid
     104, // getgid
-    105, // setuid
-    106, // setgid
     107, // geteuid
     108, // getegid
     110, // getppid
-    116, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -429,12 +426,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     102, // getuid
     104, // getgid
-    105, // setuid
-    106, // setgid
     107, // geteuid
     108, // getegid
     110, // getppid
-    116, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -585,9 +579,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
     148, // getresuid
-    149, // setresgid
     150, // getresgid
     172, // getpid
     173, // getppid
@@ -595,7 +587,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     175, // geteuid
     176, // getgid
     177, // getegid
-    159, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -740,9 +731,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
     148, // getresuid
-    149, // setresgid
     150, // getresgid
     172, // getpid
     173, // getppid
@@ -750,7 +739,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     175, // geteuid
     176, // getgid
     177, // getegid
-    159, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -1102,7 +1090,6 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     const BPF_W: u16 = 0x00;
     const BPF_ABS: u16 = 0x20;
     const BPF_JEQ: u16 = 0x10;
-    const BPF_JSET: u16 = 0x40; // ビットセットテスト
     const BPF_K: u16 = 0x00;
 
     // seccomp データオフセット
@@ -1158,103 +1145,40 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     });
 
     // ====================
-    // PROT_EXEC 引数レベルチェック（mmap / mprotect）
-    //
-    // mprotect(addr, len, prot)   の prot は args[2]（オフセット 32）
-    // mmap(addr, len, prot, ...)  の prot は args[2]（オフセット 32）
-    // ※ どちらも prot は第 3 引数 = args[2]。len（args[1]）と混同しないこと。
+    // 許可リストと引数の検査
     //
     // seccomp_data 構造体レイアウト:
     //   u32 nr       @ offset 0
     //   u32 arch     @ offset 4
     //   u64 ip       @ offset 8
-    //   u64 args[0]  @ offset 16
-    //   u64 args[1]  @ offset 24
-    //   u64 args[2]  @ offset 32
+    //   u64 args[n]  @ offset 16 + 8n（BPF は 32bit 単位で読む。リトルエンディアンでは下位 32bit がこの位置）
+    //
+    // F-278: syscall ごとに「JEQ nr（一致しなければ自分のブロックを飛ばす）+ ブロック（必ず RET で終わる）」を
+    // 並べ、最後に DENY を置く。ジャンプは全てブロック内の短い距離なので、許可リストが長くなっても BPF の
+    // u8 のジャンプ幅（255）を超えない（以前は表の末尾の共通の ALLOW へ飛んでいて、約 250 を超えると黙って壊れた）。
+    // 引数を見るブロックは accumulator を引数で上書きするが、どの道も RET で終わるので次の JEQ には戻らない。
     // ====================
-    const PROT_EXEC: u32 = 0x4;
-
-    // seccomp_data.args フィールドは u64 だが、BPF は 32bit 単位で読む。
-    // リトルエンディアンでは下位 32bit がオフセット位置にある。
-    // mmap・mprotect とも prot は args[2]（第 3 引数, オフセット 32）。
-    const OFFSET_ARG2_LO: u32 = 32; // args[2] 下位 32bit（mmap/mprotect の prot）
-
-    #[cfg(target_arch = "x86_64")]
-    let (syscall_mmap, syscall_mprotect) = (9u32, 10u32);
-    #[cfg(target_arch = "aarch64")]
-    let (syscall_mmap, syscall_mprotect) = (222u32, 226u32);
-
-    // mprotect の PROT_EXEC チェックサブルーチンを後方に追加する都合上、
-    // まず全チェックの命令数を見積もる。
-    // シンプルな設計: mmap/mprotect は PROT_EXEC チェックジャンプ先に飛ばし、
-    // その他は従来どおり allow へジャンプする。
-    //
-    // フィルターレイアウト:
-    //   [現在位置] syscall_count 個の JEQ チェック
-    //             ├─ mmap   が一致 → PROT_EXEC_CHECK_MMAP へ
-    //             ├─ mprotect が一致 → PROT_EXEC_CHECK_MPROTECT へ
-    //             └─ その他  が一致 → ALLOW へ
-    //   [deny]    DENY
-    //   [allow]   ALLOW
-    //   [prot_exec_check_mprotect]
-    //             LD args[1] 下位32bit
-    //             JSET PROT_EXEC → DENY
-    //             ALLOW
-    //   [prot_exec_check_mmap]
-    //             LD args[2] 下位32bit
-    //             JSET PROT_EXEC → DENY
-    //             ALLOW
-    //
-    // DENY = filter.len() + syscall_count
-    // ALLOW = filter.len() + syscall_count + 1
-    // prot_check_mprotect = filter.len() + syscall_count + 2
-    //   mprotect チェックは LD, JSET, RET(allow), RET(deny) の 4 命令で構成される。
-    // prot_check_mmap = filter.len() + syscall_count + 6
-    //   （DENY 1 + ALLOW 1 + mprotect チェック 4 命令の先が mmap チェックの LD）
-
-    let base = filter.len(); // syscall LD 命令のインデックス
-    let deny_idx = base + 1; // DENY 命令のインデックス（スキップカウント計算用）
-                             // syscall_count 個の JEQ のあとに DENY, ALLOW, [mprotect check 3命令], [mmap check 3命令]
-
-    // 3. 許可リストにあるシステムコールをチェック
+    let checks = seccomp_arg_checks();
     let syscall_count = ALLOWED_SYSCALLS.len();
-    for (i, &syscall) in ALLOWED_SYSCALLS.iter().enumerate() {
-        let remaining = syscall_count - i - 1;
-        let allow_jump_dist = (remaining + 1) as u8; // ALLOW へのオフセット（deny の 1 先）
-
+    for &syscall in ALLOWED_SYSCALLS {
         let nr = syscall as u32;
-        if nr == syscall_mprotect {
-            // mprotect → PROT_EXEC チェック: deny+2 先（deny, allow, [LD] ← ここ）
-            let prot_check_jump = (remaining + 2) as u8;
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: prot_check_jump, // prot_exec_check_mprotect へ
-                jf: 0,
-                k: nr,
-            });
-        } else if nr == syscall_mmap {
-            // mmap → PROT_EXEC チェック: DENY(1) + ALLOW(1) + mprotect チェック(4命令) の先。
-            // mprotect チェックは LD/JSET/RET(allow)/RET(deny) の 4 命令なので +6 が正しい
-            // （+5 だと mprotect ブロックの RET(deny) に着地し、全 mmap が誤って拒否される）。
-            let prot_check_jump = (remaining + 6) as u8;
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: prot_check_jump, // prot_exec_check_mmap へ
-                jf: 0,
-                k: nr,
-            });
-        } else {
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: allow_jump_dist, // ALLOW へジャンプ
-                jf: 0,               // 次のチェックへ
-                k: nr,
-            });
-        }
+        let block = seccomp_block(
+            checks.iter().find(|(n, _)| *n == nr).map(|(_, c)| c),
+            action_allow,
+            action_deny,
+        );
+        let skip = u8::try_from(block.len())
+            .map_err(|_| io::Error::other("seccomp: argument check block too long"))?;
+        filter.push(libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: skip,
+            k: nr,
+        });
+        filter.extend(block);
     }
-    let _ = deny_idx; // suppress unused warning
 
-    // 4. リストにない -> 拒否
+    // リストにない -> 拒否
     filter.push(libc::sock_filter {
         code: BPF_RET | BPF_K,
         jt: 0,
@@ -1262,73 +1186,9 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         k: action_deny,
     });
 
-    // 5. 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-
-    // 6. mprotect PROT_EXEC チェック（args[2]=prot を検査）
-    // LD args[2] 下位32bit
-    filter.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: OFFSET_ARG2_LO,
-    });
-    // PROT_EXEC ビットが立っていれば DENY
-    filter.push(libc::sock_filter {
-        code: BPF_JMP | BPF_JSET | BPF_K,
-        jt: 1, // DENY へ（2 命令先 = ALLOW をスキップして DENY）
-        jf: 0, // ALLOW へ（次の命令）
-        k: PROT_EXEC,
-    });
-    // PROT_EXEC なし → 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-    // PROT_EXEC あり → 拒否
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_deny,
-    });
-
-    // 7. mmap PROT_EXEC チェック（args[2] を検査）
-    // LD args[2] 下位32bit
-    filter.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: OFFSET_ARG2_LO,
-    });
-    // PROT_EXEC ビットが立っていれば DENY
-    filter.push(libc::sock_filter {
-        code: BPF_JMP | BPF_JSET | BPF_K,
-        jt: 1, // ALLOW をスキップして DENY
-        jf: 0, // ALLOW へ
-        k: PROT_EXEC,
-    });
-    // PROT_EXEC なし → 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-    // PROT_EXEC あり → 拒否
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_deny,
-    });
+    if filter.len() > u16::MAX as usize {
+        return Err(io::Error::other("seccomp: filter too long"));
+    }
 
     debug!(
         "Built seccomp filter with {} instructions for {} syscalls",
@@ -1337,6 +1197,175 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     );
 
     Ok(filter)
+}
+
+/// syscall の引数の検査（F-25・F-278）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+enum SeccompArgCheck {
+    /// `args[arg]` の下位 32bit に `mask` のビットが 1 つでも立っていれば拒否（PROT_EXEC・名前空間の作成）
+    DenyBits { arg: u32, mask: u32 },
+    /// `args[arg]` の下位 32bit が列挙した値のどれかなら許可、他は拒否（ソケットのファミリ・ioctl・prctl・tgkill）
+    AllowValues { arg: u32, values: Vec<u32> },
+    /// 常にこの errno を返す（clone3 は ENOSYS にして libc を clone へフォールバックさせる。flags は
+    /// 構造体の中にあって BPF から見えない）
+    Errno(u32),
+}
+
+/// 引数を検査する syscall（番号, 検査）。番号は `ALLOWED_SYSCALLS` と同じく `libc::SYS_*` と照合する
+/// （`test_seccomp_arg_checks_match_libc`）。
+#[cfg(target_os = "linux")]
+fn seccomp_arg_checks() -> Vec<(u32, SeccompArgCheck)> {
+    use SeccompArgCheck::*;
+    // 名前空間を作る clone のフラグ（スレッド作成では立たない）
+    const CLONE_NS_MASK: u32 = (libc::CLONE_NEWNS
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET) as u32;
+    // SAFETY: 引数無しの syscall
+    let pid = unsafe { libc::getpid() } as u32;
+    vec![
+        // mmap・mprotect の prot は args[2]
+        (
+            libc::SYS_mmap as u32,
+            DenyBits {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+            },
+        ),
+        (
+            libc::SYS_mprotect as u32,
+            DenyBits {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+            },
+        ),
+        // socket(domain, ..): 使うファミリだけ（AF_NETLINK は glibc の getaddrinfo の AI_ADDRCONFIG）
+        (
+            libc::SYS_socket as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![
+                    libc::AF_UNIX as u32,
+                    libc::AF_INET as u32,
+                    libc::AF_INET6 as u32,
+                    libc::AF_NETLINK as u32,
+                ],
+            },
+        ),
+        // ioctl(fd, request, ..): std の set_nonblocking（FIONBIO）・close-on-exec（FIOCLEX）、パイプの残量（FIONREAD）、
+        // 端末の判定（TCGETS・TIOCGWINSZ。ログの出力先）
+        (
+            libc::SYS_ioctl as u32,
+            AllowValues {
+                arg: 1,
+                values: vec![
+                    libc::FIONBIO as u32,
+                    libc::FIONREAD as u32,
+                    libc::FIOCLEX as u32,
+                    libc::FIONCLEX as u32,
+                    libc::TCGETS as u32,
+                    libc::TIOCGWINSZ as u32,
+                ],
+            },
+        ),
+        // prctl(option, ..): スレッド名（std・ランタイム）、no_new_privs（B-219 の Landlock を掛けるスレッド）、
+        // seccomp の状態、bounding set の読み取り、無名メモリの名前（アロケータ）
+        (
+            libc::SYS_prctl as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![
+                    libc::PR_SET_NAME as u32,
+                    libc::PR_GET_NAME as u32,
+                    libc::PR_SET_NO_NEW_PRIVS as u32,
+                    libc::PR_GET_NO_NEW_PRIVS as u32,
+                    libc::PR_GET_SECCOMP as u32,
+                    libc::PR_SET_SECCOMP as u32,
+                    libc::PR_CAPBSET_READ as u32,
+                    libc::PR_GET_DUMPABLE as u32,
+                    libc::PR_SET_VMA as u32,
+                ],
+            },
+        ),
+        // clone(flags, ..): スレッドは作れるが名前空間は作れない
+        (
+            libc::SYS_clone as u32,
+            DenyBits {
+                arg: 0,
+                mask: CLONE_NS_MASK,
+            },
+        ),
+        (libc::SYS_clone3 as u32, Errno(libc::ENOSYS as u32)),
+        // tgkill(tgid, tid, sig): 自分のプロセスのスレッドだけ
+        (
+            libc::SYS_tgkill as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![pid],
+            },
+        ),
+    ]
+}
+
+/// 1 つの syscall のブロック（JEQ nr の直後に置く。必ず RET で終わる）。
+#[cfg(target_os = "linux")]
+fn seccomp_block(
+    check: Option<&SeccompArgCheck>,
+    action_allow: u32,
+    action_deny: u32,
+) -> Vec<libc::sock_filter> {
+    const BPF_LD_W_ABS: u16 = 0x00 | 0x00 | 0x20;
+    const BPF_RET_K: u16 = 0x06;
+    const BPF_JEQ_K: u16 = 0x05 | 0x10;
+    const BPF_JSET_K: u16 = 0x05 | 0x40;
+    let ret = |k| libc::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let load_arg = |arg: u32| libc::sock_filter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: 16 + 8 * arg,
+    };
+    match check {
+        None => vec![ret(action_allow)],
+        Some(SeccompArgCheck::DenyBits { arg, mask }) => vec![
+            load_arg(*arg),
+            // ビットが立っていれば 1 つ先（DENY）へ
+            libc::sock_filter {
+                code: BPF_JSET_K,
+                jt: 1,
+                jf: 0,
+                k: *mask,
+            },
+            ret(action_allow),
+            ret(action_deny),
+        ],
+        Some(SeccompArgCheck::AllowValues { arg, values }) => {
+            let n = values.len();
+            let mut v = vec![load_arg(*arg)];
+            for (j, &value) in values.iter().enumerate() {
+                // 一致したら残りの JEQ と DENY を飛ばして ALLOW へ
+                v.push(libc::sock_filter {
+                    code: BPF_JEQ_K,
+                    jt: (n - j) as u8,
+                    jf: 0,
+                    k: value,
+                });
+            }
+            v.push(ret(action_deny));
+            v.push(ret(action_allow));
+            v
+        }
+        Some(SeccompArgCheck::Errno(errno)) => vec![ret(0x0005_0000 | (errno & 0xffff))],
+    }
 }
 
 // ====================
@@ -4803,6 +4832,179 @@ mod tests {
              RW-mmap allowed / EXEC-mmap denied / EXEC-mprotect denied / RW-mprotect allowed), \
              got {code}"
         );
+    }
+
+    /// F-278: 引数を検査する syscall はどれも許可リストにある（無ければ検査は使われず丸ごと拒否になる）。
+    /// 権限降格の syscall は seccomp の前に終わるので許可リストに無い。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_seccomp_arg_checks_are_in_allow_list() {
+        for (nr, check) in seccomp_arg_checks() {
+            assert!(
+                ALLOWED_SYSCALLS.contains(&(nr as i64)),
+                "syscall {nr} has an argument check ({check:?}) but is not allowed"
+            );
+        }
+        for nr in [
+            libc::SYS_setgroups,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
+            libc::SYS_unshare,
+            libc::SYS_setns,
+        ] {
+            assert!(
+                !ALLOWED_SYSCALLS.contains(&nr),
+                "syscall {nr} must not be allowed"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        for nr in [libc::SYS_setuid, libc::SYS_setgid] {
+            assert!(
+                !ALLOWED_SYSCALLS.contains(&nr),
+                "syscall {nr} must not be allowed"
+            );
+        }
+    }
+
+    /// F-278: 引数の検査を子プロセスで実際に確かめる。終了コードのビット:
+    ///   1: socket(AF_INET) は通る / 2: socket(AF_PACKET) は EPERM / 4: ioctl(FIONBIO) は通る /
+    ///   8: 一覧に無い ioctl は EPERM / 16: prctl(PR_SET_NAME) は通る / 32: prctl(PR_SET_DUMPABLE) は EPERM /
+    ///   64: clone(CLONE_NEWUSER) は EPERM / 128: clone3 は ENOSYS で pthread_create は通る（clone へ戻る）
+    /// tgkill はフィルタを作ったプロセス（親）宛てだけ通るので、子からは親宛てが通り自分宛てが EPERM になる。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_argument_filters() {
+        extern "C" fn noop(p: *mut libc::c_void) -> *mut libc::c_void {
+            p
+        }
+        fn errno() -> i32 {
+            unsafe { *libc::__errno_location() }
+        }
+        fn probe_args() -> i32 {
+            let mut bits = 0;
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd >= 0 {
+                bits |= 1;
+            }
+            if unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 2;
+            }
+            let mut on: libc::c_int = 1;
+            if unsafe { libc::ioctl(fd, libc::FIONBIO, &mut on) } == 0 {
+                bits |= 4;
+            }
+            let mut buf = [0u8; 64];
+            if unsafe { libc::ioctl(fd, libc::SIOCGIFCONF, buf.as_mut_ptr()) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 8;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_NAME, c"probe".as_ptr(), 0, 0, 0) } == 0 {
+                bits |= 16;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 32;
+            }
+            let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+            let r = unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) };
+            if r == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            if r < 0 && errno() == libc::EPERM {
+                bits |= 64;
+            }
+            let r3 = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+            let clone3_enosys = r3 < 0 && errno() == libc::ENOSYS;
+            let mut th = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+            let created = unsafe {
+                libc::pthread_create(
+                    th.as_mut_ptr(),
+                    std::ptr::null(),
+                    noop,
+                    std::ptr::null_mut(),
+                )
+            };
+            if clone3_enosys && created == 0 {
+                unsafe { libc::pthread_join(th.assume_init(), std::ptr::null_mut()) };
+                bits |= 128;
+            }
+            bits
+        }
+        fn probe_tgkill() -> i32 {
+            let mut bits = 0;
+            let parent = unsafe { libc::getppid() };
+            if unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) } == 0 {
+                bits |= 1;
+            }
+            let me = unsafe { libc::getpid() };
+            if unsafe { libc::syscall(libc::SYS_tgkill, me, me, 0) } < 0 && errno() == libc::EPERM {
+                bits |= 2;
+            }
+            bits
+        }
+
+        // フィルタはフォーク前に構築する（子では heap alloc しない）。tgkill の許可先はこのプロセス
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        let run = |probe: fn() -> i32| -> i32 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                    unsafe { libc::_exit(250) };
+                }
+                let applied = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &prog as *const libc::sock_fprog,
+                        0,
+                        0,
+                    )
+                };
+                if applied != 0 {
+                    unsafe { libc::_exit(250) };
+                }
+                unsafe { libc::_exit(probe()) };
+            }
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child died: {status:#x}");
+            libc::WEXITSTATUS(status)
+        };
+
+        let code = run(probe_args);
+        if code == 250 {
+            eprintln!("seccomp could not be applied; skipping");
+            return;
+        }
+        assert_eq!(code, 255, "argument filters (bits {code:#010b})");
+        let code = run(probe_tgkill);
+        assert_eq!(code, 3, "tgkill filter (bits {code:#04b})");
+    }
+
+    /// F-278: 許可リストが長くなってもフィルタは壊れない（ジャンプはブロック内だけ）。全モードで組めて、
+    /// 引数の検査の無い syscall のブロックは 1 命令。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_seccomp_filter_layout() {
+        for mode in [SeccompMode::Log, SeccompMode::Filter, SeccompMode::Strict] {
+            let filter = build_seccomp_filter(mode).expect("build filter");
+            let checks = seccomp_arg_checks();
+            let extra: usize = checks
+                .iter()
+                .map(|(_, c)| seccomp_block(Some(c), 0, 0).len() - 1)
+                .sum();
+            // arch の検査 3 + nr のロード 1 + syscall ごとに JEQ と RET + 検査の追加分 + 末尾の DENY
+            assert_eq!(filter.len(), 4 + 2 * ALLOWED_SYSCALLS.len() + extra + 1);
+        }
     }
 
     /// F-54: 許可リスト**外**のシステムコールが seccomp で実際に拒否される（意図的発火）ことを

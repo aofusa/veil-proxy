@@ -81,7 +81,7 @@
 - **Client certificates (F-217 / F-220)**: `[tls] client_auth` / `client_ca`, and `client_allowed_sans` to accept only listed identities (see [TLS](tls.md))
 - **JWT (F-220)**: `[route.jwt]` verifies tokens (RS/PS/ES, `iss`, `aud`, `exp`) and claim conditions; 401 / 403 otherwise (requires `jwt`, included in `full*`; see [Security](security.md))
 - **Privilege Dropping**: Drop to unprivileged user after root startup
-- **seccomp Filter**: BPF-based system call restriction with argument-level PROT_EXEC validation for mmap/mprotect (optional)
+- **seccomp Filter**: BPF-based system call restriction with argument checks (no PROT_EXEC for mmap/mprotect, socket families, ioctl requests, prctl options, no namespaces for clone) (optional)
 - **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support

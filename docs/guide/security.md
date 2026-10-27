@@ -66,6 +66,22 @@ rest kept running).
 > Only the dedicated watcher thread issues them, at startup, on reload and when a directory is created.
 > veil starts the watcher thread (like the workers) after the sandbox is applied.
 
+**Argument checks.** For some allowed calls the filter also looks at the arguments, and a call outside the
+listed values is handled like a disallowed call (`log` / `EPERM` / `SIGSYS`):
+
+| System call | Allowed |
+|-------------|---------|
+| `mmap`, `mprotect` | without `PROT_EXEC` |
+| `socket` | `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` (glibc's `getaddrinfo`) |
+| `ioctl` | `FIONBIO`, `FIONREAD`, `FIOCLEX`, `FIONCLEX`, `TCGETS`, `TIOCGWINSZ` |
+| `prctl` | `PR_SET_NAME`, `PR_GET_NAME`, `PR_SET_NO_NEW_PRIVS`, `PR_GET_NO_NEW_PRIVS`, `PR_GET_SECCOMP`, `PR_SET_SECCOMP`, `PR_CAPBSET_READ`, `PR_GET_DUMPABLE`, `PR_SET_VMA` |
+| `clone` | without namespace flags (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWNET`, ...) |
+| `clone3` | never; it fails with `ENOSYS` so the C library falls back to `clone` (its flags are not visible to the filter) |
+| `tgkill` | threads of the veil process only |
+
+`setuid`, `setgid`, `setgroups`, `setresuid` and `setresgid` are no longer allowed: veil drops privileges before it
+installs the filter. These checks were added in v0.10.0.
+
 **Which threads are sandboxed.** veil installs the seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC`, so it applies to
 every thread of the process, including the control-plane threads started before it (logging, configuration and
 certificate reload, VDS, ACME, health checks, cache cleanup, Proxy-Wasm tick and gRPC). Landlock has no such flag and

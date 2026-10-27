@@ -81,7 +81,7 @@
 - **クライアント証明書（F-217・F-220）**: `[tls] client_auth`・`client_ca`、一覧の ID だけを受ける `client_allowed_sans`（[TLS](tls.md) 参照）
 - **JWT（F-220）**: `[route.jwt]` でトークン（RS/PS/ES、`iss`・`aud`・`exp`）と claim の条件を検証し、通らなければ 401 / 403（`jwt` feature が必要で `full*` に含まれる。[セキュリティ](security.md) 参照）
 - **権限降格**: root起動後の非特権ユーザーへの降格
-- **seccompフィルタ**: BPFベースのシステムコール制限 + mmap/mprotect の PROT_EXEC 引数レベル検証（オプション）
+- **seccompフィルタ**: BPFベースのシステムコール制限 + 引数の検査（mmap/mprotect の PROT_EXEC・socket のファミリ・ioctl・prctl・clone の名前空間）（オプション）
 - **io_uringオペコード制限**: リング作成時に `IORING_REGISTER_RESTRICTIONS` を適用し、必要なオペコード（ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD）のみ許可
 - **Landlockサンドボックス**: ファイルシステムアクセス制限（Linux 5.13+）
 - **systemdサンドボックス**: 名前空間隔離・システムコール制限対応

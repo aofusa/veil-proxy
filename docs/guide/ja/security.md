@@ -66,6 +66,22 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > これらを出すのは監視の専用スレッドだけで、起動時・リロード時・ディレクトリが作られたときに限ります。
 > veil は監視のスレッドを（ワーカーと同じく）サンドボックスを掛けた後に作ります。
 
+**引数の検査。** 許可する呼び出しの一部は引数も見ます。一覧に無い値での呼び出しは、許可しない呼び出しと同じ扱い
+（`log` / `EPERM` / `SIGSYS`）です。
+
+| システムコール | 許可するもの |
+|----------------|--------------|
+| `mmap`・`mprotect` | `PROT_EXEC` を含まないもの |
+| `socket` | `AF_UNIX`・`AF_INET`・`AF_INET6`・`AF_NETLINK`（glibc の `getaddrinfo`） |
+| `ioctl` | `FIONBIO`・`FIONREAD`・`FIOCLEX`・`FIONCLEX`・`TCGETS`・`TIOCGWINSZ` |
+| `prctl` | `PR_SET_NAME`・`PR_GET_NAME`・`PR_SET_NO_NEW_PRIVS`・`PR_GET_NO_NEW_PRIVS`・`PR_GET_SECCOMP`・`PR_SET_SECCOMP`・`PR_CAPBSET_READ`・`PR_GET_DUMPABLE`・`PR_SET_VMA` |
+| `clone` | 名前空間のフラグ（`CLONE_NEWUSER`・`CLONE_NEWNS`・`CLONE_NEWNET` など）を含まないもの |
+| `clone3` | 許可しない。`ENOSYS` を返し、C ライブラリが `clone` へ戻る（フラグがフィルタから見えないため） |
+| `tgkill` | veil のプロセスのスレッド宛てだけ |
+
+`setuid`・`setgid`・`setgroups`・`setresuid`・`setresgid` は許可しません（veil はフィルタを掛ける前に権限を降格します）。
+これらの検査は v0.10.0 で足しました。
+
 **サンドボックスが掛かるスレッド。** veil は seccomp のフィルタを `SECCOMP_FILTER_FLAG_TSYNC` で掛けるので、先に作った
 制御プレーンのスレッド（ログ・設定と証明書のリロード・VDS・ACME・ヘルスチェック・キャッシュの掃除・Proxy-Wasm の tick と gRPC）を
 含むプロセスの全スレッドに効きます。Landlock にはこれに当たるものが無く、掛けたスレッドとその後に作るスレッド（メインスレッド・
