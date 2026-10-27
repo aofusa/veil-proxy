@@ -723,6 +723,61 @@ const FIXTURE_WASM_FILES: &[&str] = &[
     "grpc_trailer_filter.wasm",
 ];
 
+/// B-247: `proxy_dequeue_shared_queue` はゲストのアロケータで確保した領域にペイロードを書き、
+/// その番地と長さを返す（以前は `return_data_ptr` の番地へペイロードそのものを書いていた）。
+#[tokio::test]
+async fn item4_shared_queue_dequeue_returns_allocated_pointer() {
+    let mut h = Harness::permissive().await;
+    h.write(scratch::KEY, b"b247-queue");
+    let status = h
+        .call(
+            "test_proxy_register_shared_queue",
+            &[scratch::KEY, 10, scratch::OUT_PTR],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "register failed");
+    let queue_id = h.read_i32(scratch::OUT_PTR);
+
+    h.write(scratch::VALUE, b"queued payload");
+    let status = h
+        .call(
+            "test_proxy_enqueue_shared_queue",
+            &[queue_id, scratch::VALUE, 14],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "enqueue failed");
+
+    // 返り値の書き込み先の直後に目印を置き、ペイロードがはみ出して壊さないことも見る
+    h.write(scratch::OUT_SIZE + 4, b"MARK");
+    let status = h
+        .call(
+            "test_proxy_dequeue_shared_queue",
+            &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "dequeue failed");
+    let ptr = h.read_i32(scratch::OUT_PTR);
+    let size = h.read_i32(scratch::OUT_SIZE);
+    assert!(
+        ptr >= 131072,
+        "payload must be written to memory from proxy_on_memory_allocate, got pointer {ptr:#x}"
+    );
+    assert_eq!(size, 14);
+    assert_eq!(h.read_bytes(ptr, size as usize), b"queued payload");
+    assert_eq!(h.read_bytes(scratch::OUT_SIZE + 4, 4), b"MARK");
+
+    let status = h
+        .call(
+            "test_proxy_dequeue_shared_queue",
+            &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE],
+        )
+        .await;
+    assert_eq!(
+        status, PROXY_RESULT_EMPTY,
+        "an empty queue must report Empty"
+    );
+}
+
 #[tokio::test]
 async fn item5_guest_exports_present_in_real_sdk_modules() {
     let engine = Engine::default();

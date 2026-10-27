@@ -24,7 +24,10 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
 /// Helper to allocate memory in WASM
 ///
 /// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
-async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
+pub(super) async fn allocate_wasm_memory(
+    caller: &mut Caller<'_, HostState>,
+    size: usize,
+) -> Option<i32> {
     let func = caller
         .get_export("proxy_on_memory_allocate")
         .or_else(|| caller.get_export("malloc"))?;
