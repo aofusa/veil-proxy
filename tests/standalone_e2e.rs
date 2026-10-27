@@ -3658,3 +3658,167 @@ max_request_body_size = 1000
         veil.log()
     );
 }
+
+/// 受けた要求のヘッダ部をそのまま本文で返す上流（B-232: 上流に届いた転送ヘッダを見る）。
+fn spawn_head_echo() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                // 1 接続で複数の要求（上流の接続の再利用）を受ける
+                loop {
+                    let end = loop {
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                        match s.read(&mut tmp) {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                            _ => return,
+                        }
+                    };
+                    let head: Vec<u8> = buf.drain(..end).collect();
+                    let mut resp =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", head.len())
+                            .into_bytes();
+                    resp.extend_from_slice(&head);
+                    if s.write_all(&resp).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// B-232: 既定（append）では、信頼しないクライアントが送った X-Forwarded-For・X-Real-IP・X-Forwarded-Proto・
+/// Forwarded は上流へ届かず、X-Forwarded-For にクライアントの IP が入る。`trusted_proxies` に入る送信元からは
+/// 受けた値が残り、X-Forwarded-For が足される。`passthrough` は以前のまま。HTTP/1.1・h2c・TLS の HTTP/2 で同じ。
+#[test]
+fn b232_forwarded_headers_append_trusted_and_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let echo = spawn_head_echo();
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+
+[[route]]
+[route.conditions]
+path = "/trusted/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+[route.security]
+trusted_proxies = ["127.0.0.0/8"]
+
+[[route]]
+[route.conditions]
+path = "/pass/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+[route.security]
+forwarded_headers = "passthrough"
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30))
+            && wait_for_port(tls_port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    let sent: &[(&str, &str)] = &[
+        ("X-Forwarded-For", "1.2.3.4"),
+        ("X-Real-IP", "1.2.3.4"),
+        ("X-Forwarded-Proto", "gopher"),
+        ("Forwarded", "for=1.2.3.4"),
+    ];
+    type Req<'a> = Box<dyn Fn(&str) -> String + 'a>;
+    let protocols: Vec<(&str, Req)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str| {
+                let r = http1_request(port, "GET", p, sent, b"").unwrap();
+                String::from_utf8_lossy(&r.body).to_ascii_lowercase()
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str| {
+                let (_, _, b) = h2_request_full(port, false, "GET", p, sent, b"");
+                String::from_utf8_lossy(&b).to_ascii_lowercase()
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str| {
+                let (_, _, b) = h2_request_full(tls_port, true, "GET", p, sent, b"");
+                String::from_utf8_lossy(&b).to_ascii_lowercase()
+            }),
+        ),
+    ];
+    for (proto, req) in &protocols {
+        let head = req("/plain/x");
+        assert!(
+            head.contains("x-forwarded-for: 127.0.0.1\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(!head.contains("1.2.3.4"), "{proto}: {head}");
+        assert!(!head.contains("gopher"), "{proto}: {head}");
+
+        let head = req("/trusted/x");
+        assert!(
+            head.contains("x-forwarded-for: 1.2.3.4\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(
+            head.contains("x-forwarded-for: 127.0.0.1\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(
+            head.contains("x-forwarded-proto: gopher"),
+            "{proto}: {head}"
+        );
+
+        let head = req("/pass/x");
+        assert!(
+            head.contains("x-forwarded-for: 1.2.3.4\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(!head.contains("127.0.0.1\r\n"), "{proto}: {head}");
+        assert!(head.contains("x-real-ip: 1.2.3.4"), "{proto}: {head}");
+    }
+}

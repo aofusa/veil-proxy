@@ -409,6 +409,9 @@ Request-level hardening that came out of the audit:
   whitespace; `:method` must be a token and `:path` must not contain spaces or control characters (RFC 9113 §8.2.1,
   RFC 9114 §4.2). Violations are stream errors, so they can never reach an HTTP/1.1 upstream.
 - `remove_request_headers` / `add_request_headers` apply to every client and upstream protocol.
+- `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and `Forwarded` from clients outside
+  `[route.security] trusted_proxies` are not forwarded; `X-Forwarded-For` carries the client IP instead
+  (`forwarded_headers = "passthrough"` restores the old pass-through).
 - The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
   or responses to `Authorization` requests (unless `key_headers` includes `Authorization`).
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.

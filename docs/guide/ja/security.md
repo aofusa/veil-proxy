@@ -404,6 +404,9 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
   `:path` は空白・制御文字を含まないこと（RFC 9113 §8.2.1・RFC 9114 §4.2）。違反はストリームのエラーなので、HTTP/1.1 の上流に
   届かない。
 - `remove_request_headers`・`add_request_headers` は、すべてのクライアント・上流のプロトコルに効く。
+- `[route.security] trusted_proxies` に入らないクライアントが送った `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・
+  `Forwarded` は上流へ送らず、`X-Forwarded-For` にはクライアントの IP を入れる（`forwarded_headers = "passthrough"` で
+  以前の素通しに戻せる）。
 - 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`Authorization` の要求への応答
   （`key_headers` に `Authorization` が無いとき）を保存しない。
 - IP の許可・拒否リストは、IPv4 射影の IPv6 のアドレスを IPv4 として照合する。

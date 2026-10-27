@@ -87,7 +87,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `proxy_pass http://app;` | `url = "http://app"` | = [プロキシのパス](#プロキシのパス) |
 | `proxy_set_header X-Real-IP $remote_addr;` | `[route.security] add_request_headers = { "X-Real-IP" = "$client_ip" }` | = 変数は `$client_ip`・`$host`・`$request_uri` |
 | `proxy_set_header Host $host;` | — | = 既定でクライアントの Host を送る |
-| `X-Forwarded-For` | `add_request_headers = { "X-Forwarded-For" = "$client_ip" }` | ≈ 足すのではなく置き換える |
+| `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` | 既定（`[route.security] forwarded_headers = "append"`。前段は `trusted_proxies`） | ≈ 信頼しないクライアントの値には足さずに捨てる |
 | `proxy_hide_header` / `add_header` | `remove_response_headers` / `add_response_headers` | = 静的ファイルにも効く |
 | `proxy_http_version 1.1;` + 上流への keepalive | 既定（接続をプールする） | = `max_idle_connections_per_host`・`idle_connection_timeout_secs` |
 | 上流への HTTP/2 | `use_h2c = true`（平文）・`https://` は ALPN | = 多重化（[routing.md](routing.md#h2c-http2-over-cleartext-proxy)） |

@@ -1052,6 +1052,8 @@ requests. Header values that would contain CR, LF or NUL after variable expansio
 |--------|-------------|---------|
 | `add_request_headers` | Headers to add (table format) | `{ "X-Real-IP" = "$client_ip" }` |
 | `remove_request_headers` | Headers to remove (array) | `["X-Debug-Token"]` |
+| `forwarded_headers` | `"append"` (default): `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and `Forwarded` sent by clients outside `trusted_proxies` are dropped, and `X-Forwarded-For` is set to the client IP. From `trusted_proxies` the received values are kept and the client IP is added as another `X-Forwarded-For` line. `"passthrough"`: forward what the client sent and add nothing (the behavior before v0.10.0). An `add_request_headers` entry for `X-Forwarded-For` replaces veil's own | `"append"` |
+| `trusted_proxies` | Sources (IP/CIDR) whose forwarded headers are kept, such as a load balancer in front of veil | `["10.0.0.0/8"]` |
 
 #### Special Variables
 

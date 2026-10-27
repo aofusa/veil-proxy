@@ -492,16 +492,110 @@ pub(crate) fn forward_allowed(security: &SecurityConfig, name: &[u8]) -> bool {
             .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
 }
 
+/// 上流への要求に足すヘッダ（`[route.security] add_request_headers` と既定の転送ヘッダ。B-232）。
+///
+/// 転送ヘッダはクライアントの IP をスタックに持つだけで、要求ごとに確保しない（`add_request_headers` が無ければ
+/// `user` も空のまま）。受けた要求のヘッダを送るかは `keeps` で決める。
+pub(crate) struct AddedHeaders {
+    user: Vec<(Vec<u8>, Vec<u8>)>,
+    fwd: Option<ForwardedValues>,
+}
+
+/// 既定の転送ヘッダの値（B-232）。
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardedValues {
+    ip: crate::http_utils::IpStr,
+    /// 送信元が `trusted_proxies` に入る（受けた転送ヘッダを残す）
+    trusted: bool,
+    add_xff: bool,
+}
+
+/// 転送ヘッダの名前か（信頼しない送信元から受けたものは上流へ送らない）。
+#[inline]
+fn is_forwarded_header(name: &[u8]) -> bool {
+    // 先頭の文字で大半を外す（要求ごとに全ヘッダへ掛かる）
+    match name.first() {
+        Some(b'x' | b'X') => {
+            name.eq_ignore_ascii_case(b"x-forwarded-for")
+                || name.eq_ignore_ascii_case(b"x-real-ip")
+                || name.eq_ignore_ascii_case(b"x-forwarded-proto")
+        }
+        Some(b'f' | b'F') => name.eq_ignore_ascii_case(b"forwarded"),
+        _ => false,
+    }
+}
+
+impl ForwardedValues {
+    /// ルートの方針と送信元から作る（`passthrough` なら `None`）。
+    pub(crate) fn new(security: &SecurityConfig, client_ip: &str) -> Option<Self> {
+        if security.forwarded_headers == crate::config::ForwardedHeadersMode::Passthrough {
+            return None;
+        }
+        let ip = crate::http_utils::IpStr::from_ip_text(client_ip)?;
+        // nginx・Envoy と同じく既定で足すのは X-Forwarded-For だけ（X-Real-IP は add_request_headers で足す）
+        let add_xff = security.add_request_headers.is_empty()
+            || !security
+                .add_request_headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("x-forwarded-for"));
+        Some(Self {
+            ip,
+            trusted: security.is_trusted_proxy(client_ip),
+            add_xff,
+        })
+    }
+
+    /// 受けた要求のヘッダ `name` を上流へ送ってよいか。
+    #[inline]
+    pub(crate) fn keeps(&self, name: &[u8]) -> bool {
+        self.trusted || !is_forwarded_header(name)
+    }
+
+    /// 足すヘッダ（`X-Forwarded-For`）。
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
+        self.add_xff
+            .then_some((&b"x-forwarded-for"[..], self.ip.as_str().as_bytes()))
+            .into_iter()
+    }
+}
+
+impl AddedHeaders {
+    /// 何も足さない（受けたヘッダの方針も変えない）。
+    pub(crate) const NONE: AddedHeaders = AddedHeaders {
+        user: Vec::new(),
+        fwd: None,
+    };
+
+    /// 受けた要求のヘッダ `name` を上流へ送ってよいか（転送ヘッダの方針）。
+    #[inline]
+    pub(crate) fn keeps(&self, name: &[u8]) -> bool {
+        self.fwd.as_ref().is_none_or(|f| f.keeps(name))
+    }
+
+    /// 足すヘッダ（`add_request_headers` の展開、続けて転送ヘッダ）。
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
+        self.user
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice()))
+            .chain(self.fwd.iter().flat_map(|f| f.pairs()))
+    }
+}
+
 /// `[route.security] add_request_headers` を展開する（`$client_ip`・`$host`・`$request_uri`）。設定が無ければ
-/// 確保しない（空の `Vec`）。値に CR・LF・NUL が入るもの（展開した値も含む）は送らない。
+/// 確保しない（空の `Vec`）。値に CR・LF・NUL が入るもの（展開した値も含む）は送らない。既定の転送ヘッダ
+/// （`forwarded_headers`。B-232）も持つ。
 pub(crate) fn expanded_added_headers(
     security: &SecurityConfig,
     client_ip: &str,
     host: &[u8],
     request_uri: &str,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+) -> AddedHeaders {
+    let fwd = ForwardedValues::new(security, client_ip);
     if security.add_request_headers.is_empty() {
-        return Vec::new();
+        return AddedHeaders {
+            user: Vec::new(),
+            fwd,
+        };
     }
     let host = std::str::from_utf8(host).unwrap_or("-");
     let mut out = Vec::with_capacity(security.add_request_headers.len());
@@ -512,7 +606,7 @@ pub(crate) fn expanded_added_headers(
             out.push((name.as_bytes().to_ascii_lowercase(), v));
         }
     }
-    out
+    AddedHeaders { user: out, fwd }
 }
 
 /// HTTP/2・HTTP/3 で受けた要求のヘッダを、HTTP/1.1 の上流への要求に書く。
@@ -526,7 +620,7 @@ pub(crate) fn write_h1_forward_headers<'a>(
     out: &mut Vec<u8>,
     headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
     security: &SecurityConfig,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &AddedHeaders,
 ) {
     for (name, value) in headers {
         if name.starts_with(b":")
@@ -539,6 +633,7 @@ pub(crate) fn write_h1_forward_headers<'a>(
             || name.eq_ignore_ascii_case(b"host")
             || name.eq_ignore_ascii_case(b"expect")
             || !forward_allowed(security, name)
+            || !added.keeps(name)
             || !is_valid_header_name(name)
             || !is_valid_header_value(value)
         {
@@ -549,7 +644,7 @@ pub(crate) fn write_h1_forward_headers<'a>(
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
     }
-    for (name, value) in added {
+    for (name, value) in added.iter() {
         out.extend_from_slice(name);
         out.extend_from_slice(b": ");
         out.extend_from_slice(value);
@@ -570,6 +665,48 @@ pub(crate) fn write_h1_forward_headers<'a>(
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    /// B-232: 信頼しない送信元の転送ヘッダは捨ててクライアントの IP を入れる。trusted_proxies からは残して
+    /// X-Forwarded-For を足す。passthrough は以前のまま
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn forwarded_headers_policy() {
+        let hdrs = || -> Vec<(&'static [u8], &'static [u8])> {
+            vec![
+                (b"X-Forwarded-For", b"1.2.3.4"),
+                (b"x-real-ip", b"1.2.3.4"),
+                (b"X-Forwarded-Proto", b"https"),
+                (b"forwarded", b"for=1.2.3.4"),
+                (b"x-other", b"v"),
+            ]
+        };
+        let write = |sec: &SecurityConfig, ip: &str| {
+            let added = expanded_added_headers(sec, ip, b"h", "/");
+            let mut out = Vec::new();
+            write_h1_forward_headers(&mut out, hdrs().into_iter(), sec, &added);
+            String::from_utf8(out).unwrap()
+        };
+        let mut sec = SecurityConfig::default();
+        assert_eq!(
+            write(&sec, "198.51.100.7"),
+            "x-other: v\r\nx-forwarded-for: 198.51.100.7\r\n"
+        );
+        sec.trusted_proxies = vec!["10.0.0.0/8".into()];
+        assert_eq!(
+            write(&sec, "10.1.2.3"),
+            "X-Forwarded-For: 1.2.3.4\r\nx-real-ip: 1.2.3.4\r\nX-Forwarded-Proto: https\r\n\
+             forwarded: for=1.2.3.4\r\nx-other: v\r\nx-forwarded-for: 10.1.2.3\r\n"
+        );
+        // 信頼リストの外は捨てる（IPv4 射影も IPv4 として見る）
+        assert!(write(&sec, "::ffff:10.1.2.3").starts_with("X-Forwarded-For: 1.2.3.4"));
+        assert!(!write(&sec, "192.0.2.9").contains("1.2.3.4"));
+        sec.forwarded_headers = crate::config::ForwardedHeadersMode::Passthrough;
+        assert_eq!(
+            write(&sec, "192.0.2.9"),
+            "X-Forwarded-For: 1.2.3.4\r\nx-real-ip: 1.2.3.4\r\nX-Forwarded-Proto: https\r\n\
+             forwarded: for=1.2.3.4\r\nx-other: v\r\n"
+        );
+    }
 
     /// F-236 の F1・F4: HTTP/2・HTTP/3 の要求を HTTP/1.1 へ書くとき、密輸になるもの・削除の指定を落とし、追加を足す
     #[cfg(any(feature = "http2", feature = "http3"))]
@@ -595,7 +732,11 @@ mod path_tests {
         let mut out = Vec::new();
         write_h1_forward_headers(&mut out, hdrs.into_iter(), &sec, &added);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "x-ok: 1\r\nx-real-ip: 192.0.2.1\r\n");
+        // B-232: add_request_headers の x-real-ip を使い、既定の転送ヘッダは X-Forwarded-For だけ足す
+        assert_eq!(
+            s,
+            "x-ok: 1\r\nx-real-ip: 192.0.2.1\r\nx-forwarded-for: 192.0.2.1\r\n"
+        );
         assert!(forward_allowed(&sec, b"x-ok"));
         assert!(!forward_allowed(&sec, b"x-INTERNAL-user"));
     }

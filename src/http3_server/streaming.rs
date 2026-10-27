@@ -135,7 +135,7 @@ pub(super) fn build_h1_request_head(
     final_path: &str,
     headers: &[h3::Header],
     security: &SecurityConfig,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &crate::proxy::AddedHeaders,
 ) -> Vec<u8> {
     let mut req = Vec::with_capacity(512);
     req.extend_from_slice(method);

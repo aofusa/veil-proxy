@@ -407,6 +407,9 @@ pub(super) async fn handle_proxy(
 
     request.extend_from_slice(HEADER_CRLF);
 
+    // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）
+    let fwd = ForwardedValues::new(security, client_ip);
+
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
         if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
@@ -443,6 +446,9 @@ pub(super) async fn handle_proxy(
             .iter()
             .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
         {
+            continue;
+        }
+        if fwd.as_ref().is_some_and(|f| !f.keeps(name)) {
             continue;
         }
 
@@ -501,6 +507,14 @@ pub(super) async fn handle_proxy(
             request.extend_from_slice(HEADER_CRLF);
         }
         crate::pool::header_value_scratch_put(scratch);
+    }
+    if let Some(f) = &fwd {
+        for (name, value) in f.pairs() {
+            request.extend_from_slice(name);
+            request.extend_from_slice(HEADER_COLON);
+            request.extend_from_slice(value);
+            request.extend_from_slice(HEADER_CRLF);
+        }
     }
 
     // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
@@ -1101,7 +1115,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     request_body: &[u8],
     client_wants_close: bool,
     tls_profile: crate::upstream_tls::TlsProfile,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &AddedHeaders,
 ) -> H1ViaH2 {
     use crate::http2::upstream_mux::{HttpsOpen, UpResp};
     let addr = target.conn_addr();
@@ -1117,9 +1131,9 @@ pub(super) async fn proxy_h1_via_https_h2(
         target.host.as_bytes(),
         headers
             .iter()
-            .filter(|(k, _)| forward_allowed(security, k))
+            .filter(|(k, _)| forward_allowed(security, k) && added.keeps(k))
             .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
+            .chain(added.iter()),
         request_body.is_empty(),
     )
     .await;
@@ -1373,7 +1387,7 @@ pub(super) async fn proxy_h2c(
     headers: &[(Bytes, Bytes)],
     request_body: &[u8],
     client_wants_close: bool,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &AddedHeaders,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）を使う
     // （従来は要求ごとに TCP 接続 + HTTP/2 ハンドシェイクしていた）。
@@ -1391,9 +1405,9 @@ pub(super) async fn proxy_h2c(
         target.host.as_bytes(),
         headers
             .iter()
-            .filter(|(k, _)| forward_allowed(security, k))
+            .filter(|(k, _)| forward_allowed(security, k) && added.keeps(k))
             .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
+            .chain(added.iter()),
         body,
         crate::http_utils::is_idempotent_method(method),
     )

@@ -80,6 +80,7 @@ pub(super) async fn handle_websocket_proxy(
     // ヘッダーを転送する。Host（上で書いた）・Connection と Upgrade 以外のホップバイホップ・
     // `remove_request_headers` に入っている名前・不正な名前と値は送らず、`add_request_headers` を足す
     // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
+    let added = expanded_added_headers(security, client_ip, host, path_str);
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b"host")
             || name.eq_ignore_ascii_case(b"keep-alive")
@@ -87,6 +88,7 @@ pub(super) async fn handle_websocket_proxy(
             || name.eq_ignore_ascii_case(b"proxy-connection")
             || name.eq_ignore_ascii_case(b"te")
             || !forward_allowed(security, name)
+            || !added.keeps(name)
         {
             continue;
         }
@@ -100,10 +102,10 @@ pub(super) async fn handle_websocket_proxy(
         request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
-    for (name, value) in expanded_added_headers(security, client_ip, host, path_str) {
-        request.extend_from_slice(&name);
+    for (name, value) in added.iter() {
+        request.extend_from_slice(name);
         request.extend_from_slice(HEADER_COLON);
-        request.extend_from_slice(&value);
+        request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
     request.extend_from_slice(HEADER_CRLF);

@@ -2014,9 +2014,9 @@ pub(super) async fn h2_proxy(
             .headers
             .iter()
             .filter(|h| is_grpc || !h.name.eq_ignore_ascii_case(b"te"))
-            .filter(|h| forward_allowed(security, &h.name))
+            .filter(|h| forward_allowed(security, &h.name) && added.keeps(&h.name))
             .map(|h| (h.name.as_ref(), h.value.as_ref()))
-            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
+            .chain(added.iter());
         let body = (!ctx.body.is_empty()).then(|| ctx.body.clone());
         match http2::upstream_mux::request_https_buffered(
             target,
@@ -2586,9 +2586,9 @@ pub(super) async fn h2_proxy_h2c(
         .headers
         .iter()
         .filter(|h| is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
-        .filter(|h| forward_allowed(security, &h.name))
+        .filter(|h| forward_allowed(security, &h.name) && added.keeps(&h.name))
         .map(|h| (h.name.as_ref(), h.value.as_ref()))
-        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
+        .chain(added.iter());
 
     // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）でストリームを開く。
     let key = crate::http_utils::PoolKeyStr::plain_addr(addr);
@@ -3609,9 +3609,9 @@ pub(super) async fn h2_relay_h2_streaming(
         .headers
         .iter()
         .filter(|h| is_grpc || !h.name.eq_ignore_ascii_case(b"te"))
-        .filter(|h| forward_allowed(security, &h.name))
+        .filter(|h| forward_allowed(security, &h.name) && added.keeps(&h.name))
         .map(|h| (h.name.as_ref(), h.value.as_ref()))
-        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
+        .chain(added.iter());
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
     let idle_timeout = Duration::from_secs(security.idle_connection_timeout_secs);
     let opened = if target.use_tls {

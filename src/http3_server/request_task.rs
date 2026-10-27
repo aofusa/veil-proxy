@@ -313,15 +313,15 @@ pub(super) fn pack_resp_headers(
 pub(super) fn pack_h3_request_headers(
     headers: &[h3::Header],
     security: &SecurityConfig,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &crate::proxy::AddedHeaders,
 ) -> crate::http3_stream::RespHeaders {
     // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を HTTP/2 の上流にも当てる
     let refs: Vec<(&[u8], &[u8])> = headers
         .iter()
         .filter(|h| !h.name().starts_with(b":"))
-        .filter(|h| crate::proxy::forward_allowed(security, h.name()))
+        .filter(|h| crate::proxy::forward_allowed(security, h.name()) && added.keeps(h.name()))
         .map(|h| (h.name(), h.value()))
-        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())))
+        .chain(added.iter())
         .collect();
     pack_resp_headers(&refs, None)
 }
@@ -1333,22 +1333,20 @@ impl H3BufferedTask {
         // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を、上流の種類（HTTP/1.1・h2c・
         // HTTPS の HTTP/2）に関わらず当てる（以前は HTTP/1.1 で受けた要求にだけ当てていた）
         let mut header_pairs = header_pairs;
-        if !security.remove_request_headers.is_empty() {
-            header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n));
-        }
-        if !security.add_request_headers.is_empty() {
-            let authority = headers
-                .iter()
-                .find(|h| h.name() == b":authority")
-                .map(|h| h.value())
-                .unwrap_or_default();
-            header_pairs.extend(crate::proxy::expanded_added_headers(
-                security,
-                self.client_ip.as_str(),
-                authority,
-                path_str,
-            ));
-        }
+        let authority = headers
+            .iter()
+            .find(|h| h.name() == b":authority")
+            .map(|h| h.value())
+            .unwrap_or_default();
+        // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）も当てる
+        let added = crate::proxy::expanded_added_headers(
+            security,
+            self.client_ip.as_str(),
+            authority,
+            path_str,
+        );
+        header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n) && added.keeps(n));
+        header_pairs.extend(added.iter().map(|(n, v)| (n.to_vec(), v.to_vec())));
 
         // gRPC はサービス/メソッドのフルパスを保持（B-39）
         #[cfg(feature = "grpc")]
@@ -1473,7 +1471,7 @@ impl H3BufferedTask {
                             .iter()
                             .map(|(n, v)| (n.as_slice(), v.as_slice())),
                         security,
-                        &[],
+                        &crate::proxy::AddedHeaders::NONE,
                     );
 
                     if !request_body.is_empty() {

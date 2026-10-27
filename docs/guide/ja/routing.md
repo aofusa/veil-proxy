@@ -1043,6 +1043,8 @@ redirect_status = 301
 |-----------|------|-----|
 | `add_request_headers` | 追加するヘッダー（テーブル形式） | `{ "X-Real-IP" = "$client_ip" }` |
 | `remove_request_headers` | 削除するヘッダー（配列） | `["X-Debug-Token"]` |
+| `forwarded_headers` | `"append"`（既定）: `trusted_proxies` に入らないクライアントが送った `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・`Forwarded` は上流へ送らず、`X-Forwarded-For` にクライアントの IP を入れる。`trusted_proxies` からは受けた値を残し、クライアントの IP を `X-Forwarded-For` の別の行として足す。`"passthrough"`: 受けたまま送り何も足さない（v0.10.0 より前の動き）。`add_request_headers` に `X-Forwarded-For` があればそちらを使う | `"append"` |
+| `trusted_proxies` | 転送ヘッダを信頼する送信元（IP/CIDR）。veil の前段のロードバランサなど | `["10.0.0.0/8"]` |
 
 #### 特殊変数
 

@@ -2497,6 +2497,15 @@ watch = false
 #   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
 #   # バックエンドに転送前にヘッダーを削除
 #   remove_request_headers = ["X-Debug-Token"]
+#   # 転送ヘッダ（X-Forwarded-For・X-Real-IP・X-Forwarded-Proto・Forwarded）の扱い（v0.10.0）
+#   #   "append"（既定）: trusted_proxies に入らないクライアントが送ったこれらは送らず、
+#   #                     X-Forwarded-For にクライアントの IP を入れる。trusted_proxies からは受けた値を残し、
+#   #                     クライアントの IP を X-Forwarded-For の別の行として足す
+#   #   "passthrough"   : 受けたまま送り、何も足さない（v0.10.0 より前の動き）
+#   # add_request_headers に X-Forwarded-For があればそちらを使う。X-Real-IP は既定では足さない
+#   forwarded_headers = "append"
+#   # 転送ヘッダを信頼する送信元（前段のロードバランサ等）
+#   trusted_proxies = ["10.0.0.0/8"]
 #   # クライアントに返送前にセキュリティヘッダーを追加
 #   add_response_headers = { "Strict-Transport-Security" = "max-age=31536000", "X-Frame-Options" = "DENY", "X-Content-Type-Options" = "nosniff" }
 

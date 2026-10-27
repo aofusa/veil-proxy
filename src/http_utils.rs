@@ -38,6 +38,27 @@ impl IpStr {
         s
     }
 
+    /// IP の文字列（`IpStr::as_str` が作ったもの）を写す。IP の表記に使わない文字・長すぎるものは `None`
+    /// （B-232: 上流へのヘッダの値に使うので、解析し直さずに検査だけする）。
+    #[inline]
+    pub(crate) fn from_ip_text(text: &str) -> Option<Self> {
+        let b = text.as_bytes();
+        if b.is_empty()
+            || b.len() > 46
+            || !b
+                .iter()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, b'.' | b':'))
+        {
+            return None;
+        }
+        let mut s = Self {
+            buf: [0u8; 46],
+            len: b.len() as u8,
+        };
+        s.buf[..b.len()].copy_from_slice(b);
+        Some(s)
+    }
+
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
         // SAFETY: IpAddr の Display 出力は ASCII のみ。
