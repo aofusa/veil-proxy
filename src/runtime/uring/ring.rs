@@ -377,6 +377,30 @@ pub struct KernelTimespec {
 // io_uring リング管理構造体
 // ====================
 
+// B-242 の試験用: `enter` を指定の errno で指定の回数だけ失敗させる（カーネルの一時的なエラーの再現）。
+#[cfg(test)]
+thread_local! {
+    static INJECT_ENTER_ERRORS: std::cell::Cell<(u32, i32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// 次の `count` 回の `enter` を `errno` で失敗させる（試験専用）。
+#[cfg(test)]
+pub(crate) fn inject_enter_errors(count: u32, errno: i32) {
+    INJECT_ENTER_ERRORS.with(|c| c.set((count, errno)));
+}
+
+#[cfg(test)]
+fn take_injected_enter_error() -> Option<i32> {
+    INJECT_ENTER_ERRORS.with(|c| {
+        let (count, errno) = c.get();
+        if count == 0 {
+            return None;
+        }
+        c.set((count - 1, errno));
+        Some(errno)
+    })
+}
+
 /// io_uring リング
 ///
 /// mmap によりマップされた SQ/CQ リングと SQE 配列を管理する。
@@ -746,6 +770,10 @@ impl IoUring {
     /// * `min_complete` - 最低限待つ完了数（0 = 待たない）
     /// * `flags` - IORING_ENTER_* フラグ
     pub fn enter(&self, to_submit: u32, min_complete: u32, flags: u32) -> io::Result<i32> {
+        #[cfg(test)]
+        if let Some(errno) = take_injected_enter_error() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         let ret = unsafe {
             libc::syscall(
                 SYS_IO_URING_ENTER,

@@ -891,7 +891,9 @@ pub fn poll_completions() {
 pub fn wait_for_completions() -> std::io::Result<()> {
     arm_kernel_timeout_if_needed();
 
-    with_ring(|ring| ring.submit_and_wait(1))?;
+    if let Err(e) = with_ring(|ring| ring.submit_and_wait(1)) {
+        park_enter_error(e)?;
+    }
 
     poll_completions();
     take_armed_timer_result_if_fired();
@@ -986,7 +988,51 @@ fn take_armed_timer_result_if_fired() {
 
 /// SQE を提出する
 pub fn submit_sqes() -> std::io::Result<()> {
-    with_ring(|ring| ring.submit())?;
+    match with_ring(|ring| ring.submit()) {
+        Ok(_) => Ok(()),
+        Err(e) => submit_enter_error(e),
+    }
+}
+
+/// `io_uring_enter` の一時的なエラーか（B-242）。
+///
+/// - `EBUSY`: CQ が溢れて overflow の一覧を CQ へ流し込めない（CQE を消費すれば通る）
+/// - `EAGAIN`・`ENOMEM`: カーネルが要求の資源（非同期ワーカー・メモリ）を確保できない（待てば通る）
+/// - `EINTR`: シグナルの配送（`GETEVENTS` の待ちだけ）
+///
+/// どれも SQE を 1 つも消費せずに返る（一部でも提出すれば件数が返る）ので、SQE は SQ リングに残り、
+/// 次の `enter`（park の `submit_and_wait`）がそのまま提出する。
+fn is_transient_enter_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EBUSY) | Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EINTR)
+    )
+}
+
+/// 提出の経路の `io_uring_enter` の失敗（B-242）。一時的なエラーは「まだ提出していない」として成功を返す
+/// （SQE は SQ に残り、次の park で提出される）。要求をエラーにしない。正常系に分岐を増やさないよう cold に置く。
+#[cold]
+#[inline(never)]
+fn submit_enter_error(e: std::io::Error) -> std::io::Result<()> {
+    if is_transient_enter_error(&e) {
+        ftlog::debug!("io_uring submit deferred to the next wait: {}", e);
+        return Ok(());
+    }
+    Err(e)
+}
+
+/// park の `io_uring_enter` の失敗（B-242）。一時的なエラーではワーカーを止めず、続く `poll_completions` で
+/// CQE を消費して（`EBUSY` の overflow を流し込める空きを作って）ループを続ける。`EAGAIN`・`ENOMEM` は他のスレッドへ譲る。
+#[cold]
+#[inline(never)]
+fn park_enter_error(e: std::io::Error) -> std::io::Result<()> {
+    if !is_transient_enter_error(&e) {
+        return Err(e);
+    }
+    if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ENOMEM)) {
+        std::thread::yield_now();
+    }
+    ftlog::debug!("io_uring wait interrupted: {}", e);
     Ok(())
 }
 
@@ -1286,12 +1332,12 @@ impl Executor {
             }
 
             // io_uring の完了を待つ
+            // 一時的なエラー（EINTR・EBUSY・EAGAIN）は wait_for_completions の中で吸収する（B-242）
+            // それ以外（EBADF 等）はリングが使えないので続けられない。future は完了していないので、
+            // 結果の取り出しの expect ではなく原因の分かる panic にする
             if let Err(e) = wait_for_completions() {
-                // EINTR は無視
-                if e.kind() != std::io::ErrorKind::Interrupted {
-                    ftlog::error!("io_uring wait error: {}", e);
-                    break;
-                }
+                ftlog::error!("io_uring wait error: {}", e);
+                panic!("io_uring wait failed: {e}");
             }
         }
 
@@ -1574,6 +1620,22 @@ mod executor_tests {
 
     fn yield_once() -> YieldOnce {
         YieldOnce { yielded: false }
+    }
+
+    /// B-242: park の `io_uring_enter` が一時的なエラー（EBUSY・EAGAIN・ENOMEM・EINTR）を返しても、ワーカー（`block_on`）を
+    /// 止めずに待ちを続ける（修正前は EBUSY・EAGAIN でループを抜け、結果の取り出しで panic していた）。
+    #[test]
+    fn b242_park_survives_transient_enter_errors() {
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping b242_park_survives_transient_enter_errors");
+            return;
+        }
+        for errno in [libc::EBUSY, libc::EAGAIN, libc::ENOMEM, libc::EINTR] {
+            crate::runtime::block_on(async move {
+                crate::runtime::ring::inject_enter_errors(3, errno);
+                timer::sleep(std::time::Duration::from_millis(2)).await;
+            });
+        }
     }
 
     #[test]

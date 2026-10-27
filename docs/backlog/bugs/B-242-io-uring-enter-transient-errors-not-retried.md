@@ -1,6 +1,6 @@
 # B-242: `io_uring_enter` の一時的なエラー（EINTR・EBUSY・EAGAIN）を提出の経路で再試行せず、要求の失敗・ワーカーの停止・起動の失敗にする
 
-**状態: 未修正（2026-10-27 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -38,6 +38,14 @@ findings に数えないので、集計は ok になる。
 
 - `syscall_chaos.sh` で、注入の最中に要求の失敗が一時的に増えても veil が `runtime=ok recovered=yes` になる（4 種とも）。
 - `fuzz/fuzz_targets/io_uring_executor.rs` のモデルに enter の一時エラーを足し、ワーカーが止まらないこと。
+
+## 修正（v0.10.0）
+
+- `executor::submit_sqes`: `io_uring_enter` の一時的なエラー（EBUSY・EAGAIN・ENOMEM・EINTR）は SQE を 1 つも消費せずに返る（一部でも提出すれば件数が返る）ので、「まだ提出していない」として成功を返す（SQE は SQ に残り、次の park の `submit_and_wait` が提出する）。各 Future の要求を失敗させない。
+- `executor::wait_for_completions`（park）: 一時的なエラーではワーカーを止めず、続く `poll_completions` で CQE を消費して（EBUSY の overflow を流し込める空きを作って）ループを続ける。EAGAIN・ENOMEM は `yield_now` で譲る。どちらも `#[cold]` の関数で、正常系の分岐は増やしていない。
+- `block_on`: それ以外のエラー（EBADF 等）は以前どおり続けられないが、ループを抜けて結果の取り出しの `expect("future completed but no result")` で panic していたのを、原因の分かる `panic!("io_uring wait failed: ..")` にした。
+- 試験: `ring::inject_enter_errors`（`cfg(test)` だけ。`enter` を指定の errno で指定の回数失敗させる）で、`executor_tests::b242_park_survives_transient_enter_errors`（タイマーの待ち。修正前は panic で試験のプロセスが abort）・`tcp::tests::test_b242_submit_survives_transient_enter_errors`（connect と書き込みの提出）。`io_uring_executor` の fuzz のモデルは `enter` を通らない（op テーブルと擬似 CQE だけ）ので、enter の失敗は実リングへの注入の単体試験で見る。
+- `syscall_chaos.sh`: veil を普通に起動して要求に応答してから `strace -f -p 1` を attach して注入する（起動から strace で包むと起動の I/O がオフセットを使い切っていた）。開始オフセットの既定は 1。strace のイメージに `nonroot` 利用者を足した（コンテナの設定は `nonroot` へ特権を落とす。Debian には無い）。止まった（`exited`）・起動・attach の失敗も findings にする。
 
 ## 関連
 

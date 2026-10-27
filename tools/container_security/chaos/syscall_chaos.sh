@@ -21,9 +21,10 @@ SC_CONTAINER="${SC_CONTAINER:-veil-sec-syscall}"
 # 注入対象の syscall とエラーコード（空白区切り。io_uring_enter を主軸に、submit/complete
 # 経路に効く EBUSY/ENOMEM/EFAULT/EINTR を順に試す）。
 SC_INJECTIONS="${SC_INJECTIONS:-io_uring_enter:error=EBUSY io_uring_enter:error=ENOMEM io_uring_enter:error=EINTR io_uring_setup:error=EFAULT}"
-# 注入開始オフセット（when=<first>+<step>）。起動時の ring 初期化 io_uring_enter を避け、
-# 稼働中イベントループの io_uring_enter に効かせるため、既定は数十回目以降から注入する。
-SC_WHEN_FIRST="${SC_WHEN_FIRST:-40}"
+# 注入開始オフセット（when=<first>+<step>）。B-242: strace は veil が要求に応答してから `-p 1` で attach する
+# （起動時から strace で包むと、起動の I/O がオフセットを使い切って運転中の注入を試験できなかった）。
+# attach 後の回数なので既定は 1 回目から。
+SC_WHEN_FIRST="${SC_WHEN_FIRST:-1}"
 # 注入間隔（<step> 回に 1 回）。1 に近いほど厳しい。既定は 5 回に 1 回。
 SC_WHEN_STEP="${SC_WHEN_STEP:-5}"
 SC_LOAD_SECONDS="${SC_LOAD_SECONDS:-15}"
@@ -73,7 +74,8 @@ build_strace_image() {
     cat >"${ctx}/Dockerfile" <<'DOCKERFILE'
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends strace ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && (id nonroot >/dev/null 2>&1 || useradd -r -U -M -s /usr/sbin/nologin nonroot)
 COPY veil /usr/local/bin/veil
 RUN chmod +x /usr/local/bin/veil
 ENTRYPOINT ["/usr/local/bin/veil"]
@@ -92,8 +94,8 @@ run_one_injection() {
     cleanup_sc
     local when="when=${SC_WHEN_FIRST}+${SC_WHEN_STEP}"
 
-    # strace でラップして Veil を起動（io_uring_enter 等に人為エラーを注入）。
-    # -f: 子スレッド追跡（thread-per-core）。エラー注入対象以外はそのまま通す。
+    # Veil を普通に起動し（PID 1）、要求に応答してから strace を attach して io_uring_enter 等に人為エラーを注入する。
+    # -f: 全スレッドに attach（thread-per-core）。エラー注入対象以外はそのまま通す。
     if ! docker run -d --name "${SC_CONTAINER}" --network "${NET_NAME}" \
         --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
         --tmpfs /var/cache/veil:rw,nosuid,uid=0,gid=0,size=64m \
@@ -101,9 +103,9 @@ run_one_injection() {
         -v "${DOCKER_DIR}/assets/conf.d/config.toml:/etc/veil/conf.d/config.toml:ro" \
         -v "${DOCKER_DIR}/assets/ssl:/etc/veil/ssl:ro" \
         -v "${DOCKER_DIR}/assets/www:/var/www:ro" \
-        --entrypoint strace \
+        --entrypoint /usr/local/bin/veil \
         "${SC_RUN_IMAGE}" \
-        -f -e "inject=${inject}:${when}" /usr/local/bin/veil -c /etc/veil/conf.d/config.toml \
+        -c /etc/veil/conf.d/config.toml \
         >/dev/null 2>>"${REPORT}"; then
         echo "${inject} runtime=start-error recovered=skip"
         return
@@ -111,7 +113,25 @@ run_one_injection() {
 
     local ip
     ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${SC_CONTAINER}" 2>/dev/null || true)
-    sleep 4
+    local ready=no r
+    for r in $(seq 1 20); do
+        if [[ -n "${ip}" ]] && docker run --rm --network "${NET_NAME}" curlimages/curl:latest \
+            curl -sk --max-time 2 -o /dev/null -w '%{http_code}' "https://${ip}:443/" 2>/dev/null \
+            | grep -qE '^[1-5][0-9]{2}$'; then
+            ready=yes; break
+        fi
+        sleep 1
+    done
+    if [[ "${ready}" != yes ]]; then
+        echo "${inject} runtime=start-error recovered=skip"
+        return
+    fi
+    # 注入を始める（attach 後の syscall から数える）
+    if ! docker exec -d "${SC_CONTAINER}" strace -f -p 1 -o /dev/null -e "inject=${inject}:${when}" 2>>"${REPORT}"; then
+        echo "${inject} runtime=attach-error recovered=skip"
+        return
+    fi
+    sleep 2
 
     # --- 注入中の負荷（curl 連打。strace 下で低速のため軽め）---
     if [[ -n "${ip}" ]]; then
@@ -166,9 +186,10 @@ fail=0
 for inject in ${SC_INJECTIONS}; do
     line="$(run_one_injection "${inject}")"
     echo "  ${line}" | tee -a "${REPORT}"
-    # panic は安全性違反 = findings。exited（注入エラーで graceful に終了）は許容だが記録。
-    if echo "${line}" | grep -qE 'runtime=panic'; then
-        echo "  WARNING: ${inject} で panic を検出（backlog 起票対象）" | tee -a "${REPORT}"
+    # panic は安全性違反 = findings。B-242: 一時的なエラーで止まる（exited）のも findings にする
+    # （以前は graceful な終了として数えず、起動の失敗が ok に集計されていた）
+    if echo "${line}" | grep -qE 'runtime=(panic|exited|graceful-exit|start-error|attach-error)'; then
+        echo "  WARNING: ${inject} で ${line#* } を検出（backlog 起票対象）" | tee -a "${REPORT}"
         docker logs "${SC_CONTAINER}" 2>&1 | grep -iE 'panic|abort|segfault' | head -5 | tee -a "${REPORT}" || true
         fail=1
     fi

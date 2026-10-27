@@ -1854,6 +1854,36 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    /// B-242: 提出の経路の `io_uring_enter` が一時的なエラーを返しても要求を失敗させない（SQE は SQ に残り、
+    /// 次の park で提出される）。修正前は connect がそのエラーで失敗していた。
+    #[test]
+    fn test_b242_submit_survives_transient_enter_errors() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_b242_submit_survives_transient_enter_errors"
+            );
+            return;
+        }
+        for errno in [libc::EBUSY, libc::EAGAIN, libc::ENOMEM] {
+            let (addr, handle) = spawn_sink_server();
+            let header = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_vec();
+            let body = bytes::Bytes::from_static(b"ok");
+            let mut expected = header.clone();
+            expected.extend_from_slice(&body);
+
+            crate::runtime::block_on(async move {
+                // connect の提出・park・write の提出がそれぞれ一時的なエラーに当たる回数
+                crate::runtime::ring::inject_enter_errors(4, errno);
+                let stream = TcpStream::connect(addr).await.expect("connect");
+                crate::runtime::ring::inject_enter_errors(2, errno);
+                let (res, _h, _b) = stream.write_all_vectored(header, body).await;
+                res.expect("write_all_vectored");
+            });
+
+            assert_eq!(handle.join().expect("join"), expected);
+        }
+    }
+
     /// F-59: ボディが空でも SENDMSG（iovec 1 本）で送出できること。
     #[test]
     fn test_writev2_sendmsg_empty_body() {
