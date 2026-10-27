@@ -39,7 +39,7 @@ semgrep は非ブロッキング（`--error` 無し）なので suite は失敗�
 - `.semgrep/veil-rules.yml`: `veil-no-bare-allow-dead-code` の regex を行頭の属性だけ（`(?m)^[ \t]*#\[allow\(dead_code\)\]`）にした（rustdoc・コメントの中の説明に一致しない）。2 つのルールの `paths.include` を走査の root からの `/src/` にし、`/third_party/`・`/examples/` を除外した。
 - `run_semgrep.sh`: リポジトリを `/repo` に置き、作業ディレクトリから `.` を走査する（`/src` に置くと全ファイルのパスに `src/` が入り include が全部に一致していた）。カスタムルールの指定も `/repo/.semgrep`。
 - 受け入れ: semgrep 1.182.1（venv）でカスタムルールだけを走らせ、今のリポジトリで 0 件、`src/lib.rs` に `#[allow(dead_code)]` を置くと 1 件（`veil-no-bare-allow-dead-code src/lib.rs`）。
-- `p/security-audit` の `temp-dir`・`args` の所見（試験・計測ツール）は残した（このチケットの受け入れの外。偽の所見として F-280 で扱う）。
+- `p/security-audit` の `temp-dir`・`args` の所見（試験・計測ツール）は残した（このチケットの受け入れの外。改修案の 3 つ目は未着手のまま）。
 
 ## 関連
 
