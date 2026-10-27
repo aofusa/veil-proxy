@@ -11,8 +11,8 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
 
     if end > data.len() {
         return None;
@@ -82,16 +82,16 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 let data = memory.data_mut(&mut caller);
-                let value_start = ptr as usize;
+                let value_start = ptr as u32 as usize;
                 if value_start + value.len() > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
                 data[value_start..value_start + value.len()].copy_from_slice(&value);
 
                 // Write return pointers
-                let ptr_offset = return_value_ptr as usize;
-                let size_offset = return_value_size as usize;
-                let cas_offset = return_cas as usize;
+                let ptr_offset = return_value_ptr as u32 as usize;
+                let size_offset = return_value_size as u32 as usize;
+                let cas_offset = return_cas as u32 as usize;
 
                 if ptr_offset + 4 > data.len()
                     || size_offset + 4 > data.len()
@@ -129,7 +129,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
 
                 // Check size limit
-                if value_size as usize > state.http_ctx.capabilities.max_shared_data_size {
+                if value_size as u32 as usize > state.http_ctx.capabilities.max_shared_data_size {
                     return PROXY_RESULT_BAD_ARGUMENT;
                 }
             }

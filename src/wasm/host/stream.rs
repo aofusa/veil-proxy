@@ -67,8 +67,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read body
             let body = if body_size > 0 {
-                let start = body_ptr as usize;
-                let end = start + body_size as usize;
+                let start = body_ptr as u32 as usize;
+                let end = start + body_size as u32 as usize;
                 if end > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
@@ -79,8 +79,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read headers
             let headers = if headers_size > 0 {
-                let start = headers_ptr as usize;
-                let end = start + headers_size as usize;
+                let start = headers_ptr as u32 as usize;
+                let end = start + headers_size as u32 as usize;
                 if end > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
@@ -168,15 +168,15 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Write status code
             let data = memory.data_mut(&mut caller);
-            let ptr = return_status_code_ptr as usize;
+            let ptr = return_status_code_ptr as u32 as usize;
             if ptr + 4 > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
             }
             data[ptr..ptr + 4].copy_from_slice(&status_code.to_le_bytes());
 
             // For message, write empty string (no message stored currently)
-            let _msg_ptr = return_status_msg_ptr as usize;
-            let msg_size_ptr = return_status_msg_size_ptr as usize;
+            let _msg_ptr = return_status_msg_ptr as u32 as usize;
+            let msg_size_ptr = return_status_msg_size_ptr as u32 as usize;
             if msg_size_ptr + 4 > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
             }

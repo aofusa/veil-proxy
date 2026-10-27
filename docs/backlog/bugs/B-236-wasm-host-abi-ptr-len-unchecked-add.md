@@ -1,6 +1,6 @@
 # B-236: Wasm のホスト関数がゲストの `ptr`/`len` を符号拡張して無検査で加算し、不正な値で接続のタスクが panic する
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー XT-01）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -24,6 +24,15 @@
 ## 受け入れ条件
 
 - fuzz target が panic を見つけない。`tests/e2e_tests/test_f62_*` の読み取り系 API の E2E が変わらない。
+
+## 修正（v0.10.0）
+
+- ホスト関数（`src/wasm/host/` の 12 ファイル、82 箇所）で、ゲストの `i32` のポインタ・長さを `as u32 as usize` で広げる（符号拡張しない）。
+  64 ビットの環境では 2 つの値がどちらも 2^32 未満なので加算が回り込まず、既存の `end > data.len()` の検査で
+  `InvalidMemoryAccess`・`BadArgument` を返す。WASI の `fd_write` の iovec の位置の計算（`i32` のまま足していた）も同じ。
+- 共通のヘルパへの集約はしていない（各関数の境界検査はすでにあり、壊れていたのは符号拡張だけ）。
+- 試験: `tests/proxy_wasm_conformance.rs` の `item2_hostile_pointers_and_lengths_do_not_trap`（ハーネスの全ホスト関数の各引数に
+  `-1`・`i32::MIN`・`i32::MAX` 付近を渡しても trap・panic しない）。
 
 ## 関連
 

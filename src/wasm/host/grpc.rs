@@ -18,8 +18,8 @@ fn read_wasm_memory(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> 
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + size as usize;
+    let start = ptr as u32 as usize;
+    let end = start + size as u32 as usize;
 
     if end > data.len() {
         return None;
@@ -369,7 +369,7 @@ fn proxy_grpc_call_impl(
         if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
             let call_id_bytes = call_id.to_le_bytes();
             let data = memory.data_mut(&mut *caller);
-            let ptr = return_call_id_ptr as usize;
+            let ptr = return_call_id_ptr as u32 as usize;
             if ptr + 4 <= data.len() {
                 data[ptr..ptr + 4].copy_from_slice(&call_id_bytes);
             } else {
@@ -502,7 +502,7 @@ fn proxy_grpc_stream_impl(
         if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
             let stream_id_bytes = stream_id.to_le_bytes();
             let data = memory.data_mut(&mut *caller);
-            let ptr = return_stream_id_ptr as usize;
+            let ptr = return_stream_id_ptr as u32 as usize;
             if ptr + 4 <= data.len() {
                 data[ptr..ptr + 4].copy_from_slice(&stream_id_bytes);
             } else {

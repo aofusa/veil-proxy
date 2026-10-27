@@ -117,8 +117,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<String> {
     let memory = caller.get_export("memory")?.into_memory()?;
     let data = memory.data(caller);
-    let start = ptr as usize;
-    let end = start + size as usize;
+    let start = ptr as u32 as usize;
+    let end = start + size as u32 as usize;
     if end > data.len() {
         return None;
     }
@@ -128,8 +128,8 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Optio
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<Vec<u8>> {
     let memory = caller.get_export("memory")?.into_memory()?;
     let data = memory.data(caller);
-    let start = ptr as usize;
-    let end = start + size as usize;
+    let start = ptr as u32 as usize;
+    let end = start + size as u32 as usize;
     if end > data.len() {
         return None;
     }
@@ -139,7 +139,7 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option
 fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
     if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
         let data = memory.data_mut(caller);
-        let start = ptr as usize;
+        let start = ptr as u32 as usize;
         if start + 4 <= data.len() {
             data[start..start + 4].copy_from_slice(&value.to_le_bytes());
             return true;
@@ -151,7 +151,7 @@ fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
 fn write_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> bool {
     if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
         let data = memory.data_mut(caller);
-        let start = ptr as usize;
+        let start = ptr as u32 as usize;
         if start + bytes.len() <= data.len() {
             data[start..start + bytes.len()].copy_from_slice(bytes);
             return true;

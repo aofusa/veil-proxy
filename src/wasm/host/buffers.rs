@@ -130,7 +130,7 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
     };
 
     let mem_data = memory.data_mut(caller);
-    let start = ptr as usize;
+    let start = ptr as u32 as usize;
     let end = start + data.len();
 
     if end > mem_data.len() {
@@ -177,8 +177,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 // Calculate range
-                let start_idx = start as usize;
-                let end_idx = std::cmp::min(start_idx + max_size as usize, buffer.len());
+                let start_idx = start as u32 as usize;
+                let end_idx = std::cmp::min(start_idx + max_size as u32 as usize, buffer.len());
 
                 if start_idx > buffer.len() {
                     return PROXY_RESULT_BAD_ARGUMENT;
@@ -195,8 +195,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     };
 
                     let data = memory.data_mut(&mut caller);
-                    let ptr_offset = return_buffer_ptr as usize;
-                    let size_offset = return_buffer_size as usize;
+                    let ptr_offset = return_buffer_ptr as u32 as usize;
+                    let size_offset = return_buffer_size as u32 as usize;
 
                     if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
                         return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -226,8 +226,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 let data = memory.data_mut(&mut caller);
-                let ptr_offset = return_buffer_ptr as usize;
-                let size_offset = return_buffer_size as usize;
+                let ptr_offset = return_buffer_ptr as u32 as usize;
+                let size_offset = return_buffer_size as u32 as usize;
 
                 if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -271,8 +271,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data(&caller);
-            let start_idx = value_ptr as usize;
-            let end_idx = start_idx + value_size as usize;
+            let start_idx = value_ptr as u32 as usize;
+            let end_idx = start_idx + value_size as u32 as usize;
 
             if end_idx > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -291,8 +291,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 _ => return PROXY_RESULT_BAD_ARGUMENT,
             };
 
-            let start_pos = start as usize;
-            let end_pos = start_pos + size as usize;
+            let start_pos = start as u32 as usize;
+            let end_pos = start_pos + size as u32 as usize;
 
             // Handle replacement
             if start_pos > buffer.len() {

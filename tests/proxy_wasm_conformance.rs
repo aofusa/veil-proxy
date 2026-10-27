@@ -351,6 +351,59 @@ async fn item2_out_of_range_offsets_return_bad_argument_not_trap() {
     );
 }
 
+/// B-236: 負・巨大なポインタと長さ（符号拡張・加算の回り込み）を全ホスト関数のどの引数に渡しても trap・panic しない。
+#[tokio::test]
+async fn item2_hostile_pointers_and_lengths_do_not_trap() {
+    const HOSTILE: [i32; 5] = [-1, i32::MIN, i32::MAX, -8, 0x7fff_fff0];
+    let mut h = Harness::permissive().await;
+    let names: Vec<String> = h
+        .instance
+        .exports(&mut h.store)
+        .filter(|e| e.name().starts_with("test_"))
+        .map(|e| e.name().to_string())
+        .collect();
+    assert!(names.len() > 30, "harness exports: {}", names.len());
+    for name in &names {
+        let func = h.instance.get_func(&mut h.store, name).unwrap();
+        let ty = func.ty(&h.store);
+        let is_i64: Vec<bool> = ty
+            .params()
+            .map(|p| matches!(p, wasmtime::ValType::I64))
+            .collect();
+        let val = |i: usize, v: i32| {
+            if is_i64[i] {
+                Val::I64(v as i64)
+            } else {
+                Val::I32(v)
+            }
+        };
+        let arity = is_i64.len();
+        let mut cases: Vec<Vec<Val>> = Vec::new();
+        for pos in 0..arity {
+            for &bad in &HOSTILE {
+                cases.push(
+                    (0..arity)
+                        .map(|i| val(i, if i == pos { bad } else { scratch::MSG }))
+                        .collect(),
+                );
+            }
+        }
+        cases.push((0..arity).map(|i| val(i, -1)).collect());
+        for args in cases {
+            let mut results = vec![Val::I32(0)];
+            // trap（ホスト関数の panic を含む）すると Err
+            func.call_async(&mut h.store, &args, &mut results)
+                .await
+                .unwrap_or_else(|e| panic!("{name}({args:?}) must not trap, got: {e}"));
+        }
+    }
+    record(
+        "Item2: 負・巨大なポインタと長さ",
+        Conformance::Implemented,
+        "どの引数に負・i32::MAX 付近を渡しても trap せず状態コードを返す",
+    );
+}
+
 #[tokio::test]
 async fn item2_capability_denied_returns_not_allowed() {
     // 全 capability を false にしたハーネスでは NOT_ALLOWED が返る（trap しない）。

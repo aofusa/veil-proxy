@@ -12,8 +12,8 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
 
     if end > data.len() {
         return None;
@@ -75,7 +75,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            let ptr = return_metric_id as usize;
+            let ptr = return_metric_id as u32 as usize;
 
             if ptr + 4 > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -171,7 +171,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            let ptr = return_value as usize;
+            let ptr = return_value as u32 as usize;
 
             if ptr + 8 > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
