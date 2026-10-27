@@ -15,6 +15,10 @@
 - 両ヘッダを **そのままクライアントへ転送** する。再現では `Content-Length: 5` + `Transfer-Encoding: chunked` + `5\r\nhello\r\n0\r\n\r\n` がそのまま届いた。
   veil は CL=5 で本文を切るので、chunked の本体が複数の読み込みにまたがると残りが **次の要求の応答** として扱われ、上流接続もプールに戻る（B-244 と同種の取り違え）。
 
+- **追記（2026-10-28、3 回目の SP-01）**: kTLS + splice の経路 `src/proxy/splice.rs::splice_transfer_response_ktls`（L330〜L420）も同じ。ヘッダと一緒に読めた初期本文を
+  `Content-Length` を超えていてもそのままクライアントへ書き、`remaining` を飽和減算で 0 にして上流接続を keep-alive のまま戻す。chunked の腕も終端チャンクの後に
+  同じ読み取りで届いたバイトを転送する。修正はこの経路にも適用し、単体テストに「初期本文が CL を超える」ケースを含める。
+
 ## 影響
 
 - 上流が信頼できない（マルチテナントの上流・侵害された上流・両ヘッダを返すバグのある上流）構成で応答の分割（response smuggling）になる。

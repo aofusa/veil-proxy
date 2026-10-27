@@ -12,7 +12,7 @@ Low/Info をここにまとめる。優先順:
    （`TLS_GET_RECORD_TYPE`）で制御レコードを受け、alert は close、KeyUpdate は rustls へ戻すか接続を閉じるのを明示する。
    (b) rustls・kTLS とも close_notify 無しの TCP EOF をきれいな EOF として扱う（`ktls_rustls.rs` L533・L576・L1185・L1341）。`Content-Length` 無し・
    EOF 終端の応答は切り詰めを検出できない。EOF 終端の応答では close_notify を要求する（無ければ本文不完全として B-17 の切断）。
-2. **KT-02**: ハンドシェイク直後に rustls のデフレーマに部分レコードが残った状態で kTLS RX を有効化すると境界がずれる（`try_enable_ktls_server`・
+2. **KT-02**（3 回目でコードから確定し [B-258](../bugs/B-258-ktls-handover-partial-record-left-in-rustls.md) に切り出した。ここでは扱わない）: ハンドシェイク直後に rustls のデフレーマに部分レコードが残った状態で kTLS RX を有効化すると境界がずれる（`try_enable_ktls_server`・
    `drain_rustls_into`）。残りバイトがあれば kTLS RX を諦めて rustls のまま続ける。TLS 1.3 のクライアントが最後のフライトと最初のアプリケーション
    データを 1 セグメントで送るケースで実機再現する。
 3. **SB-11**: namespace の `/proc`・`/dev` の mount 失敗を `warn!` だけで続行する（`security.rs` L2021・L2030）。`strict` 相当のモードでは起動を止め、
