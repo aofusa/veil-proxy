@@ -670,7 +670,7 @@ brotli = { version = "8.0.2", optional = true }
 # - 高速かつ高圧縮率（Gzipより高速で高圧縮）
 # - ストリーミング圧縮対応
 # - 圧縮レベル1-22をサポート
-zstd = { version = "0.13.3", optional = true }
+zstd = { version = "0.14.3", optional = true }
 
 # ====================
 # プロキシキャッシュ・バッファリング制御
@@ -789,12 +789,12 @@ boring = "4.3"
 # - 既定の feature のうち `profiling`（perf の jitdump・VTune）だけを外す。veil は使わず、保守終了の `fxhash`
 #   （RUSTSEC-2025-0057、`fxprof-processed-profile` 経由）を依存に持ち込むため。残りは既定のまま（B-158）。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 # 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
 # キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
-veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）

@@ -85,13 +85,16 @@ jobs:
           $v = "8.23.0_1"
           Invoke-WebRequest -Uri "https://curl.se/windows/dl-$v/curl-$v-win64-mingw.zip" -OutFile "$env:RUNNER_TEMP\curl.zip"
           Expand-Archive "$env:RUNNER_TEMP\curl.zip" -DestinationPath "$env:RUNNER_TEMP\curl"
-          "$env:RUNNER_TEMP\curl\curl-$v-win64-mingw\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # GITHUB_PATH では Git の /mingw64/bin より前に来ないので、試験のステップで PATH の先頭に置く
+          "CURL_BIN=$env:RUNNER_TEMP\curl\curl-$v-win64-mingw\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: tests/api/library_e2e.sh ${{ matrix.modes }}
         shell: bash
         env:
           PY3: python
           PYTHON3: python
         run: |
+          if [ -n "${CURL_BIN:-}" ]; then export PATH="$(cygpath -u "$CURL_BIN"):$PATH"; fi
+          command -v curl
           curl -V | sed -n 1p
           curl -V | grep -q HTTP2 || { echo "::error::this curl has no HTTP/2 (the h2c checks need it)"; exit 1; }
           openssl version
