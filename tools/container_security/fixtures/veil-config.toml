@@ -48,12 +48,15 @@ reuseport_balancing = "cbpf"
 [prometheus]
 enabled = true
 path = "/__metrics"
+# B-231 以降、allowed_ips が空なら loopback だけ許す。プローブは別コンテナ（Docker のネットワーク）から叩く
+allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
 # full: 管理 API（Bearer 認証 + IP 制限つき）。設定ロード・エンドポイント経路を有効化。
 [admin]
 enabled = true
 path_prefix = "/__admin"
 secret = "veil-sec-test-admin"
+allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
 # full: 構造化アクセスログ（stdout・非同期スレッド）。ホットパスのアクセスログ経路を有効化。
 [access_log]

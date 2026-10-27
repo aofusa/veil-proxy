@@ -576,6 +576,7 @@
 | B-241 | P2 | 修正済み（v0.10.0） | [bugs/B-241-sanitizers-job-never-runs-asan-e2e.md](bugs/B-241-sanitizers-job-never-runs-asan-e2e.md) | nightly の `sanitizers` ジョブは `RUN_E2E_ASAN=1` と `RUN_E2E_TSAN=1` を同時に渡すが、`e2e_sanitizer_chaos.sh` は二者択一で thread を優先するため、ASAN の E2E が一度も走っていない |
 | B-242 | P2 | 修正済み（v0.10.0） | [bugs/B-242-io-uring-enter-transient-errors-not-retried.md](bugs/B-242-io-uring-enter-transient-errors-not-retried.md) | `io_uring_enter` の一時的なエラー（EINTR・EBUSY・EAGAIN）を提出の経路で再試行せず、要求の失敗・ワーカーの `block_on` の離脱・起動の失敗にする（syscall_chaos の 4 種の注入すべてで起動時に exit 1。ハーネスの開始オフセットも起動で消費され運転中を試験できていない） |
 | B-243 | P3 | 修正済み（v0.10.0） | [bugs/B-243-semgrep-dead-code-rule-false-findings.md](bugs/B-243-semgrep-dead-code-rule-false-findings.md) | semgrep のカスタムルール `veil-no-bare-allow-dead-code` がコメント内の文章と `examples/`・`third_party/` に一致して毎晩 37 件の偽の所見を出す（`paths.include: "src/"` がスキャンの root `/src` の全ファイルに一致）。本物は 0 件 |
+| B-245 | P2 | 修正済み（v0.10.0） | [bugs/B-245-container-security-admin-metrics-after-b231.md](bugs/B-245-container-security-admin-metrics-after-b231.md) | B-231 の後、container_security のフィクスチャに `allowed_ips` が無く admin_security・metrics_probe が 403 で失敗。`metrics_host_label_bounded` は系列を読めないまま PASS と報告していた |
 
 ---
 
