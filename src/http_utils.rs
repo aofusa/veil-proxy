@@ -2398,7 +2398,16 @@ mod stack_fmt_tests {
         assert!(is_valid_h2_field_value(b"text/html; charset=utf-8"));
         assert!(is_valid_h2_field_value(b"a\tb"));
         assert!(is_valid_h2_field_value("caf\u{e9}".as_bytes()));
-        for bad in [&b"a\x1bb"[..], b"a\x7fb", b"a\x00b", b"a\rb", b"a\nb", b"a\x01", b" a", b"a\t"] {
+        for bad in [
+            &b"a\x1bb"[..],
+            b"a\x7fb",
+            b"a\x00b",
+            b"a\rb",
+            b"a\nb",
+            b"a\x01",
+            b" a",
+            b"a\t",
+        ] {
             assert!(!is_valid_h2_field_value(bad), "{bad:?}");
         }
     }
@@ -2419,7 +2428,9 @@ mod stack_fmt_tests {
         assert!(!response_head_invalid(partial));
 
         assert!(response_head_invalid(b"HTTX/1.1 200 OK\r\n\r\n"));
-        assert!(!response_head_invalid(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+        assert!(!response_head_invalid(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        ));
     }
 
     #[test]
