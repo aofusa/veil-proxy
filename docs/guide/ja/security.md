@@ -124,6 +124,7 @@ jwks_path = "/etc/veil/jwks.json"         # または jwks = '{"keys":[...]}' �
 # allow_missing = false                   # true: トークンの無い要求も通す（あれば検証する）
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                # 受ける "alg"（空なら鍵の "alg"、鍵に無ければその鍵種の全部）
 require_claims = { scope = ["read"] }     # 全部の claim がどれかの値を持つこと
 ```
 

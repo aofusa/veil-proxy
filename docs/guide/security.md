@@ -126,6 +126,7 @@ jwks_path = "/etc/veil/jwks.json"         # or jwks = '{"keys":[...]}' inline
 # allow_missing = false                   # true: requests without a token pass (a token present is still verified)
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                # accepted "alg" values (empty: the key's "alg", or any for its key type)
 require_claims = { scope = ["read"] }     # every claim must have one of the values
 ```
 

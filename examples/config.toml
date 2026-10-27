@@ -2586,6 +2586,8 @@ watch = false
 # allow_missing = false
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                 # 受ける "alg"（空なら鍵の "alg"。鍵に無ければその鍵種で検証できる全部で、
+#                                          # そのときはロード時に警告する）
 # require_claims = { scope = ["read"] }
 
 # ------------------------------------------

@@ -97,6 +97,9 @@ pub struct JwtConfig {
     pub require_expiration: bool,
     #[serde(default = "default_clock_skew")]
     pub clock_skew_secs: u64,
+    /// 受けるトークンの `alg`（例: `["RS256"]`。B-237）。空なら鍵の `alg`（鍵に無ければその鍵種で検証できる全部）
+    #[serde(default)]
+    pub allowed_algs: Vec<String>,
     /// claim の条件（名前 → 許す値。全部の claim がどれかの値を持つこと。配列・空白区切りの文字列も見る）
     #[serde(default)]
     pub require_claims: std::collections::BTreeMap<String, Vec<String>>,
@@ -120,6 +123,7 @@ struct JwtRule {
     keys: Vec<crate::jwt_verify::Jwk>,
     issuer: String,
     audiences: Vec<String>,
+    allowed_algs: Vec<String>,
     header: Box<[u8]>,
     prefix: Box<[u8]>,
     allow_missing: bool,
@@ -149,6 +153,7 @@ impl JwtRule {
             keys: &self.keys,
             issuer: &self.issuer,
             audiences: &self.audiences,
+            allowed_algs: &self.allowed_algs,
             require_expiration: self.require_expiration,
             clock_skew_secs: self.clock_skew_secs,
             now: crate::jwt_verify::unix_secs(),
@@ -781,6 +786,19 @@ fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> 
     if keys.is_empty() {
         return Err(err("[route.jwt] the JWKS has no usable keys".into()));
     }
+    // B-237: 鍵に alg が無く allowed_algs も無いと、その鍵種で検証できる全部の alg を受ける
+    if j.allowed_algs.is_empty() && keys.iter().any(|k| k.alg.is_none()) {
+        ftlog::warn!(
+            "[route.jwt] a JWKS key has no \"alg\"; tokens signed with any algorithm of that key type are accepted (set allowed_algs to restrict)"
+        );
+    }
+    for a in &j.allowed_algs {
+        if !crate::jwt_verify::SUPPORTED_ALGS.contains(&a.as_str()) {
+            return Err(err(format!(
+                "[route.jwt] allowed_algs: unsupported algorithm {a}"
+            )));
+        }
+    }
     let text_resp = |status: u16, body: &'static [u8], www: Option<&'static [u8]>| {
         let mut h = vec![(
             Bytes::from_static(b"content-type"),
@@ -798,6 +816,7 @@ fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> 
         keys,
         issuer: j.issuer.clone(),
         audiences: j.audiences.clone(),
+        allowed_algs: j.allowed_algs.clone(),
         header: j
             .header
             .to_ascii_lowercase()

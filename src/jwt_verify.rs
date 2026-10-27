@@ -96,6 +96,11 @@ pub fn parse_jwks(text: &str) -> Vec<Jwk> {
         .collect()
 }
 
+/// 検証できる `alg`。
+pub const SUPPORTED_ALGS: &[&str] = &[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384",
+];
+
 /// 署名を検証する。
 pub fn verify_sig(alg: &str, key: &Key, msg: &[u8], signature: &[u8]) -> bool {
     match (alg, key) {
@@ -133,6 +138,8 @@ pub struct Check<'a> {
     pub issuer: &'a str,
     /// 空なら見ない（どれかが `aud` に入っていればよい）
     pub audiences: &'a [String],
+    /// 受ける `alg`（空なら見ない。B-237）
+    pub allowed_algs: &'a [String],
     pub require_expiration: bool,
     pub clock_skew_secs: u64,
     pub now: u64,
@@ -149,6 +156,9 @@ pub fn verify(c: &Check<'_>, token: &str) -> Option<serde_json::Value> {
     let payload: serde_json::Value = serde_json::from_slice(&b64url(pl.as_bytes())?).ok()?;
     let signature = b64url(sg.as_bytes())?;
     let alg = header.get("alg")?.as_str()?;
+    if !c.allowed_algs.is_empty() && !c.allowed_algs.iter().any(|a| a == alg) {
+        return None;
+    }
     let kid = header.get("kid").and_then(|k| k.as_str());
     let msg = &token.as_bytes()[..h.len() + 1 + pl.len()];
     let ok = c.keys.iter().any(|k| {
@@ -261,6 +271,7 @@ pub(crate) mod tests {
             keys: &keys,
             issuer: "https://issuer",
             audiences: &aud,
+            allowed_algs: &[],
             require_expiration: true,
             clock_skew_secs: 60,
             now: 1_900_000_000,
@@ -278,6 +289,13 @@ pub(crate) mod tests {
         c.audiences = &other;
         assert!(verify(&c, &tok).is_none());
         c.audiences = &aud;
+        // B-237: 鍵に alg が無くても allowed_algs に無い alg のトークンは拒否する
+        let rs_only = vec!["RS256".to_string()];
+        c.allowed_algs = &rs_only;
+        assert!(verify(&c, &tok).is_none());
+        let es = vec!["ES256".to_string()];
+        c.allowed_algs = &es;
+        assert!(verify(&c, &tok).is_some());
         // 署名の中ほどの 1 文字を変える（末尾の文字は使われないビットだけのことがある）
         let mut bad = tok.clone().into_bytes();
         let i = bad.len() - 10;
