@@ -225,8 +225,12 @@ FreeBSD と NetBSD のシステムのアロケータは libc の jemalloc で、
 `veil` のバイナリが FreeBSD で使う設定でプロセスを起動してください:
 
 ```sh
-MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py
+MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py   # FreeBSD
+MALLOC_CONF=retain:false,dirty_decay_ms:0,muzzy_decay_ms:0 python app.py      # NetBSD
 ```
+
+FreeBSD では veil がワーカーのアイドル時にアロケータへ解放したメモリを返させます。NetBSD にはその仕組みが無いので、
+解放したページをすぐ返す設定（`dirty_decay_ms:0`）にします。
 
 ## ヘルスチェックとメトリクス
 

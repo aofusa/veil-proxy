@@ -31,7 +31,10 @@ esac
 PY3="${PY3:-python3}"
 # FreeBSD・NetBSD の libc の jemalloc は既定で解放したページを常駐のまま持つ（RSS が下がらない）。Python・C の
 # サーバの RSS の検査は、手引き（docs/guide/library-production.md）が勧める設定で動かす
-case "$OS" in FreeBSD|NetBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0}" ;; esac
+case "$OS" in
+  FreeBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0}" ;;
+  NetBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:0,muzzy_decay_ms:0}" ;;
+esac
 EXE=""; [ "$OS" = Windows ] && EXE=.exe
 # 同時接続の試験（WebSocket 2,000 本・asyncio の 2,000 並行）が OS の既定の上限で落ちないようにする（root のときだけ）。
 # OpenBSD の root のハード上限は 1024 fd。BSD の listen の待ち行列は既定 128 で、NetBSD は溢れた SYN に RST を返す

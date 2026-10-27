@@ -233,8 +233,12 @@ server can report the peak RSS for a long time. Start the process with the setti
 FreeBSD:
 
 ```sh
-MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py
+MALLOC_CONF=retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0 python app.py   # FreeBSD
+MALLOC_CONF=retain:false,dirty_decay_ms:0,muzzy_decay_ms:0 python app.py      # NetBSD
 ```
+
+On FreeBSD veil asks the allocator to return freed memory when a worker is idle; NetBSD has no such hook, so freed
+pages are returned at once (`dirty_decay_ms:0`).
 
 ## Health checks and metrics
 
