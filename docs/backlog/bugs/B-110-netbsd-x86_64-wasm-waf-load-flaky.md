@@ -12,6 +12,13 @@ NetBSD 10.1 x86_64（QEMU/KVM）のフル E2E で `test_http3_wasm_local_respons
 - NetBSD は全アーキで常に Pulley（B-55）。OpenBSD の B-58（Pulley で CPU 律速の WASM が極端に遅い）と同種の
   負荷依存の現象と見ている。
 
+## 追記（2026-10-27、Linux x86_64）
+
+feat/v0100 の io_uring の E2E（この端末の 4 コア、同時にビルドなし）で 1 回だけ同じ失敗（`status=200`、上流の
+`x-server-id: backend2`。WAF が fail-open）。続けて回した epoll・seccomp strict（io_uring）の E2E と、GitHub の
+nightly の io_uring・epoll の E2E では通った。Pulley でない Linux でも、並列の試験の負荷の下で初回要求の正規表現の
+構築が予算を超え得る（同じ現象）。
+
 ## 影響
 
 本番機能の不具合ではなく、Pulley で動く環境でのテストの安定性の問題。ただし同じ条件の本番でも、WAF の
