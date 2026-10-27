@@ -1,8 +1,9 @@
 // F-183: seccomp の許可リスト（security::ALLOWED_SYSCALLS）には mmap/munmap/madvise/mremap/
 // clock_gettime/sched_yield が元から含まれている（mimalloc と同じ syscall 集合）。
+// F-282 AL-01: セグメントのガードの mprotect(PROT_NONE) も許可リストにある（PROT_EXEC だけ拒否）。
 //! OS page management.
 //!
-//! Uses only `mmap` / `munmap` / `madvise` / `mremap` and a coarse monotonic clock.
+//! Uses only `mmap` / `munmap` / `madvise` / `mremap` / `mprotect` and a coarse monotonic clock.
 //! Everything calls libc directly and never performs a Rust allocation, because the allocator
 //! itself calls into this module.
 
@@ -62,6 +63,27 @@ pub(crate) fn map_aligned(size: usize, align: usize) -> *mut u8 {
         unmap((aligned + size) as *mut u8, tail);
     }
     aligned as *mut u8
+}
+
+/// Makes a range inaccessible (`PROT_NONE`). Failure is ignored (used only for guard regions).
+pub(crate) fn protect_none(p: *mut u8, size: usize) {
+    // SAFETY: 呼び出し側が自分でマップした範囲（ページ境界）だけを渡す。
+    unsafe { libc::mprotect(p.cast(), size, libc::PROT_NONE) };
+}
+
+/// The page size (cached after the first call; 0 if unknown).
+pub(crate) fn page_size() -> usize {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static PAGE: AtomicUsize = AtomicUsize::new(0);
+    let p = PAGE.load(Ordering::Relaxed);
+    if p != 0 {
+        return p;
+    }
+    // SAFETY: 引数の無い問い合わせ。アロケーションしない。
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let p = if p > 0 { p as usize } else { 0 };
+    PAGE.store(p, Ordering::Relaxed);
+    p
 }
 
 /// Releases a mapping.

@@ -354,3 +354,51 @@ fn large_blocks_reuse_spans_and_cross_threads() {
         }
     }
 }
+
+// F-282 AL-01: ヘッダはスロット 0 の中でガード（PROT_NONE）に挟まれ、ブロックは触れる。
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)] // 理由: 試験（/proc/self/maps を読む）
+fn segment_header_sits_between_guard_regions() {
+    thread::spawn(|| unsafe {
+        let l = layout(48, 8);
+        let p = A.alloc(l);
+        assert!(!p.is_null());
+        let seg = segment::segment_of(p);
+        let base = segment::segment_base(seg) as usize;
+        assert_eq!(base % SEGMENT_SIZE, 0);
+        assert_eq!(seg as usize, base + segment::HEADER_OFFSET);
+        assert!(p as usize >= base + SLOT_SIZE, "ブロックはスロット 1 以降");
+        fill(p, 48, 7);
+        check(p, 48, 7);
+
+        let page = os::page_size();
+        if page <= segment::HEADER_OFFSET {
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let perms = |addr: usize| -> String {
+                for line in maps.lines() {
+                    let mut it = line.split_whitespace();
+                    let range = it.next().unwrap();
+                    let perm = it.next().unwrap();
+                    let (lo, hi) = range.split_once('-').unwrap();
+                    let lo = usize::from_str_radix(lo, 16).unwrap();
+                    let hi = usize::from_str_radix(hi, 16).unwrap();
+                    if (lo..hi).contains(&addr) {
+                        return perm.to_string();
+                    }
+                }
+                panic!("{addr:#x} がマップに無い");
+            };
+            assert!(perms(base).starts_with("---"), "前のガード");
+            assert!(perms(seg as usize).starts_with("rw"), "ヘッダ");
+            assert!(
+                perms(base + SLOT_SIZE - 1).starts_with("---"),
+                "後ろのガード"
+            );
+            assert!(perms(p as usize).starts_with("rw"), "ブロック");
+        }
+        A.dealloc(p, l);
+    })
+    .join()
+    .unwrap();
+}

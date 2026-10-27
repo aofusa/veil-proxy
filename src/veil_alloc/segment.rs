@@ -2,9 +2,10 @@
 //! Segments and spans.
 //!
 //! A segment is a 4 MiB mapping aligned to `SEGMENT_SIZE` (4 MiB) and divided into 64 slots of
-//! 64 KiB. The header ([`Segment`]) sits at the start of slot 0, and the remaining 63 slots
-//! are assigned to spans (contiguous slots that blocks of one size class are carved from).
-//! The segment a pointer `p` belongs to is found with `p & !(SEGMENT_SIZE - 1)`.
+//! 64 KiB. The header ([`Segment`]) sits `HEADER_OFFSET` bytes into slot 0, between two
+//! inaccessible guard regions, and the remaining 63 slots are assigned to spans (contiguous
+//! slots that blocks of one size class are carved from). The header of the segment a pointer
+//! `p` belongs to is at `(p & !(SEGMENT_SIZE - 1)) + HEADER_OFFSET`.
 //!
 //! A segment is owned by exactly one heap ([`Heap`]) at any time, and only the owner touches the
 //! mutable state of the header (except `owner`). Frees from other threads are pushed onto the
@@ -105,10 +106,40 @@ pub(crate) struct Segment {
 const _: () = assert!(core::mem::size_of::<Segment>() <= 4096);
 const _: () = assert!(core::mem::size_of::<Page>() == 56);
 
-/// The segment a pointer belongs to.
+// F-282 AL-01: ヘッダをスロット 0 の先頭に置くと、直前のセグメント（アドレスが隣接し得る）の最後の
+// ブロックからの線形のオーバーフローがヘッダ（owner・pages）を書き換える。ヘッダをスロット 0 の中へ
+// ずらし、前後を PROT_NONE のガードにする（`guard_header`。新規マップのときだけ。高速パスは
+// 加算 1 つが増えるだけで分岐は増えない）。16 KiB はページ 16 KiB（macOS・aarch64）まで前のガードを置ける大きさ。
+/// Offset of the header inside slot 0 (the bytes before it are a guard region).
+pub(crate) const HEADER_OFFSET: usize = 16 * 1024;
+const _: () = assert!(HEADER_OFFSET + core::mem::size_of::<Segment>() <= SLOT_SIZE);
+
+/// The header of the segment a pointer belongs to.
 #[inline(always)]
 pub(crate) fn segment_of<T>(p: *const T) -> *mut Segment {
-    (p as usize & !(SEGMENT_SIZE - 1)) as *mut Segment
+    ((p as usize & !(SEGMENT_SIZE - 1)) + HEADER_OFFSET) as *mut Segment
+}
+
+/// Start of the mapping (slot 0) of the segment whose header is `seg`.
+#[inline(always)]
+pub(crate) fn segment_base(seg: *const Segment) -> *mut u8 {
+    (seg as usize - HEADER_OFFSET) as *mut u8
+}
+
+/// Makes slot 0 inaccessible except for the pages holding the header. Best effort: skipped when
+/// the page size is larger than `HEADER_OFFSET`, and a failing `mprotect` leaves the region
+/// accessible (only the hardening is lost).
+fn guard_header(base: *mut u8) {
+    let page = os::page_size();
+    if page == 0 || page > HEADER_OFFSET {
+        return;
+    }
+    os::protect_none(base, HEADER_OFFSET);
+    let header_end = (HEADER_OFFSET + core::mem::size_of::<Segment>() + page - 1) & !(page - 1);
+    if header_end < SLOT_SIZE {
+        // SAFETY: header_end < SLOT_SIZE でマッピング（スロット 0）の内側。
+        os::protect_none(unsafe { base.add(header_end) }, SLOT_SIZE - header_end);
+    }
 }
 
 /// Index of a page descriptor (equal to the number of the span's first slot).
@@ -121,8 +152,8 @@ pub(crate) fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
 /// The page descriptor of the span a pointer belongs to.
 #[inline(always)]
 pub(crate) unsafe fn page_of(seg: *mut Segment, p: *const u8) -> *mut Page {
-    let idx = (p as usize - seg as usize) >> SLOT_SHIFT;
-    // SAFETY: idx < SLOTS（セグメント内のポインタ）。slot_head は使用中スロットでは有効。
+    let idx = (p as usize & (SEGMENT_SIZE - 1)) >> SLOT_SHIFT;
+    // SAFETY: idx < SLOTS（マスク済み）。slot_head は使用中スロットでは有効。
     unsafe {
         let head = *(*seg).slot_head.get_unchecked(idx) as usize;
         (*seg).pages.as_mut_ptr().add(head)
@@ -220,7 +251,7 @@ impl Segment {
             return (0, earliest);
         }
         // 連続する並びごとに 1 回の madvise。
-        let base = self as *mut Segment as usize;
+        let base = segment_base(self) as usize;
         let mut t = todo;
         while t != 0 {
             let first = t.trailing_zeros() as usize;
@@ -286,7 +317,8 @@ pub(crate) fn acquire(owner: *mut Heap) -> *mut Segment {
                 return ptr::null_mut();
             }
         }
-        let seg = raw as *mut Segment;
+        guard_header(raw);
+        let seg = segment_of(raw);
         // 新規マッピングはゼロ埋め済み。ゼロでないフィールドだけ書く。
         // SAFETY: seg はヘッダを収める大きさの新規マッピング。
         unsafe {
@@ -322,7 +354,7 @@ pub(crate) fn release(seg: *mut Segment) {
         stats::CACHED_SEGMENTS.fetch_add(1, Ordering::Relaxed);
     } else {
         drop(c);
-        os::unmap(seg.cast(), SEGMENT_SIZE);
+        os::unmap(segment_base(seg), SEGMENT_SIZE);
         stats::SEGMENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -340,7 +372,7 @@ pub(crate) fn flush_cache() {
     while !head.is_null() {
         // SAFETY: リストから外したセグメントは誰も参照しない。
         let next = unsafe { (*head).next };
-        os::unmap(head.cast(), SEGMENT_SIZE);
+        os::unmap(segment_base(head), SEGMENT_SIZE);
         stats::SEGMENTS.fetch_sub(1, Ordering::Relaxed);
         head = next;
     }

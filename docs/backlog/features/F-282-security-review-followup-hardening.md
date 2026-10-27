@@ -1,6 +1,6 @@
 # F-282: 2026-10 のセキュリティレビュー 2 回目（F-281 の続き）の Low/Info の強化項目
 
-**状態: 未着手（2026-10-27 起票）**
+**状態: 完了（v0.10.0）**
 
 ## 今の状態
 
@@ -47,6 +47,23 @@ Low/Info をここにまとめる。優先順:
 
 - 1・2 は kTLS の受信経路（`src/ktls_rustls.rs`）の変更で、kTLS でしか顕在化する差がある（B-25/B-27/B-28 の経緯）。kTLS 有効の E2E を必ず回す。
 - 10 はアロケータの高速パスに触れないこと（AGENTS.md「アロケータ・メモリ」）。セグメント確保時だけに限る。
+
+## 修正（v0.10.0）
+
+- KT-01: 接続の終わりで区切る応答は TLS の close_notify を受けたときだけ完了とみなす（`eof_was_clean`。HTTP/1.1 のストリーミング・バッファ経路、
+  HTTP/2 への中継・圧縮・HTTP/3 は B-261）。kTLS の制御レコードは B-259（HTTP/3 は B-261）、TLS 1.3 の KeyUpdate は明示の警告で閉じる。
+  E2E `test_f282_*_tls_upstream_eof_body_*`（HTTP/1.1・HTTP/2・HTTP/3、既定と kTLS の構成）。ストリーミングで HTTP/1.1 のクライアントへ流す
+  接続の終わりで区切る応答の close_notify は F-284。
+- KT-02: B-258。SB-11: B-260（`/dev` のノードを元のデバイスから bind し、mount の失敗で起動を止める）。
+- SB-12: macOS Seatbelt の読み取りを設定が指すパス（証明書・静的ルート・Wasm 等）とシステムのパスに絞り、`process-fork`・`process-exec` を許さない
+  （mac の実機で静的配信・プロキシ・リロード・子プロセスの拒否を確認）。
+- WS-03・WS-04: `[wasm] shared_data_max_keys`・`[wasm] http_call_max_timeout_ms`。MS-02: mesh.md（英日）。WB-01:
+  `[route.security] websocket_idle_timeout_secs`。PY-01: 要求の `HandlerContext` を設定したスレッドからだけ使う。
+- AL-01: セグメントのヘッダをスロット 0 の 16 KiB の位置へ移し、前後を `PROT_NONE` のガードにした（セグメント確保時の `mprotect` だけ。
+  高速パスは変えない）。単体 `segment_header_sits_between_guard_regions`。`alloc_ab.sh` の交互 A/B（順序を入れ替えて 2 回、計 6〜7 ラウンド）で
+  3B・54KB のスループットと `*_cpu_us_per_req` は ±2% 以内（TLS 1.3 のハンドシェイクの rps は失敗の有無で二峰に分かれ、ハンドシェイクあたりの
+  CPU は +0.7%）。フリーリストの safe-linking（XOR）は解放・確保ごとに演算が増えるので入れない（高速パスに足さない方針）。`fork` の子のヒープの孤立は
+  veil が `fork` しないので扱わない。
 
 ## 関連
 
