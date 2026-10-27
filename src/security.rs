@@ -4735,14 +4735,21 @@ mod tests {
                 unsafe { libc::_exit(42) };
             }
             // 子スレッドで禁止 syscall を呼ぶ。KILL_THREAD なら join が返り、主スレッドが _exit(3) する
-            let mut th: libc::pthread_t = 0;
+            // pthread_t は glibc では整数、musl ではポインタなので 0 で初期化しない
+            let mut th = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
             let rc = unsafe {
-                libc::pthread_create(&mut th, std::ptr::null(), violate, std::ptr::null_mut())
+                libc::pthread_create(
+                    th.as_mut_ptr(),
+                    std::ptr::null(),
+                    violate,
+                    std::ptr::null_mut(),
+                )
             };
             if rc != 0 {
                 unsafe { libc::_exit(43) };
             }
-            unsafe { libc::pthread_join(th, std::ptr::null_mut()) };
+            // SAFETY: pthread_create が成功したので th は初期化済み
+            unsafe { libc::pthread_join(th.assume_init(), std::ptr::null_mut()) };
             unsafe { libc::_exit(3) };
         }
         let mut status: libc::c_int = 0;
