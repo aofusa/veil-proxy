@@ -53,8 +53,8 @@ use once_cell::sync::Lazy;
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 // ====================
@@ -848,6 +848,32 @@ pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: b
     HTTP_UPSTREAM_HEALTH
         .with_label_values(&[_upstream, _server])
         .set(if _healthy { 1 } else { 0 });
+}
+
+// B-235: 解析できない HTTP/3 のデータグラム（送信元を偽装したゴミを含む）。1 通ごとに warn! を出す代わりに数える。
+#[cfg(feature = "metrics")]
+static HTTP3_INVALID_PACKETS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        Opts::new(
+            "http3_invalid_packets_total",
+            "Total number of UDP datagrams on the HTTP/3 port that are not valid QUIC packets",
+        )
+        .namespace("veil"),
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// メトリクス: 解析できない HTTP/3 のデータグラムを数える（B-235）
+#[inline]
+pub(crate) fn record_http3_invalid_packet() {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        HTTP3_INVALID_PACKETS_TOTAL.inc();
+    }
 }
 
 /// メトリクス: キャッシュヒットを記録

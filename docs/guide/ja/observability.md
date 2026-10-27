@@ -62,6 +62,7 @@ GET /__metrics
 | `veil_connection_pool_hits_total` | Counter | upstream | コネクションプールヒット数 |
 | `veil_connection_pool_misses_total` | Counter | upstream | コネクションプールミス数 |
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPCリクエスト数 |
+| `veil_http3_invalid_packets_total` | Counter | - | HTTP/3 のポートに届いた QUIC のパケットでない UDP のデータグラムの数（ログは debug だけ） |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPCストリーム処理時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |

@@ -293,7 +293,9 @@ pub(super) fn process_datagram_segments(
         let hdr = match quiche::Header::from_slice(&mut data[start..end], quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
-                warn!("[HTTP/3] Invalid packet header: {}", e);
+                // B-235: 1 通ごとに出るので debug!（偽装した送信元のゴミでログを溢れさせられた）。件数はメトリクスで見る
+                debug!("[HTTP/3] Invalid packet header: {}", e);
+                crate::metrics::record_http3_invalid_packet();
                 // このセグメントのみスキップ。送信処理は呼び出し側ループ後に実行。
                 continue;
             }
@@ -384,7 +386,8 @@ pub(super) fn process_datagram_segments(
             match handler.conn.recv(&mut data[start..end], recv_info) {
                 Ok(_) => {}
                 Err(e) => {
-                    warn!("[HTTP/3] recv error: {}", e);
+                    // B-235: 相手のパケットごとに起き得るので debug!
+                    debug!("[HTTP/3] recv error: {}", e);
                     // エラー時も送信処理は続行
                 }
             }

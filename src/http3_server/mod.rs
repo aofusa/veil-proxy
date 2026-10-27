@@ -1170,7 +1170,8 @@ impl Http3Handler {
                                 // RFC 9114 §4.1.2: malformed はストリームエラー
                                 // H3_MESSAGE_ERROR。§8 によりコネクションエラーとして扱ってよく、
                                 // 不正なクライアントとの接続を残す理由が無いため接続ごと閉じる。
-                                warn!(
+                                // B-235: 相手が要求ごとに起こせるので debug!
+                                debug!(
                                     "[HTTP/3] malformed request on stream {} from {}: {}",
                                     stream_id, self.peer_addr, reason
                                 );
@@ -1239,7 +1240,8 @@ impl Http3Handler {
                     Ok((_, h3::Event::PriorityUpdate)) => did_work = true,
                     Err(h3::Error::Done) => break,
                     Err(e) => {
-                        warn!("[HTTP/3] h3 poll error: {}", e);
+                        // B-235: 相手のフレームで起きるので debug!
+                        debug!("[HTTP/3] h3 poll error: {}", e);
                         break;
                     }
                 }

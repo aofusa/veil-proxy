@@ -62,6 +62,7 @@ Use the `path` option to change the endpoint path.
 | `veil_connection_pool_hits_total` | Counter | upstream | Connection pool hit count |
 | `veil_connection_pool_misses_total` | Counter | upstream | Connection pool miss count |
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC request count |
+| `veil_http3_invalid_packets_total` | Counter | - | UDP datagrams on the HTTP/3 port that are not valid QUIC packets (logged at debug level only) |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPC stream duration |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
