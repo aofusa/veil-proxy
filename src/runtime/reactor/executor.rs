@@ -1094,31 +1094,43 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
         }
     }
 
+    /// 空きスロットを 1 つ取り出す（足りなければチャンクを足す）。
+    fn alloc_slot(&self) -> u32 {
+        let mut free = self.inner.free.borrow_mut();
+        match free.pop() {
+            Some(s) => s,
+            None => {
+                let mut chunks = self.inner.chunks.borrow_mut();
+                let base = (chunks.len() * POOL_CHUNK) as u32;
+                let chunk: Box<[RefCell<Option<F>>]> = (0..POOL_CHUNK)
+                    .map(|_| RefCell::new(None))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                chunks.push(chunk);
+                for i in (1..POOL_CHUNK as u32).rev() {
+                    free.push(base + i);
+                }
+                base
+            }
+        }
+    }
+
     /// future を空きスロットへ格納し、スロット index を返す（`spawn`/`spawn_inline` 共有）。
     fn store(&self, future: F) -> u32 {
-        let slot = {
-            let mut free = self.inner.free.borrow_mut();
-            match free.pop() {
-                Some(s) => s,
-                None => {
-                    let mut chunks = self.inner.chunks.borrow_mut();
-                    let base = (chunks.len() * POOL_CHUNK) as u32;
-                    let chunk: Box<[RefCell<Option<F>>]> = (0..POOL_CHUNK)
-                        .map(|_| RefCell::new(None))
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
-                    chunks.push(chunk);
-                    for i in (1..POOL_CHUNK as u32).rev() {
-                        free.push(base + i);
-                    }
-                    base
-                }
-            }
-        };
+        self.store_with(move || future)
+    }
+
+    /// `make` が作る future を空きスロットへ直接書き込み、スロット index を返す。
+    ///
+    /// 要求ごとの future は数 KB〜十数 KB あり（状態機械の大きさは一番大きい分岐で決まる）、値で
+    /// 受け渡すと `memcpy` が要求ごとに何回も走る（FreeBSD の h2c 3B でユーザ空間の CPU の 28%。B-240）。
+    /// 作る関数を呼び出しとして残し、戻り値の領域をスロットそのものにする。
+    fn store_with(&self, make: impl FnOnce() -> F) -> u32 {
+        let slot = self.alloc_slot();
         {
             let chunks = self.inner.chunks.borrow();
             let cell = &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK];
-            *cell.borrow_mut() = Some(future);
+            write_empty_slot(&mut cell.borrow_mut(), make);
         }
         slot
     }
@@ -1136,6 +1148,31 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
         let pool: Rc<dyn PoolPoll> = self.inner.clone();
         spawn_body_and_poll(TaskBody::Pooled { pool, slot })
     }
+
+    /// [`spawn_inline`](Self::spawn_inline) の、future をスロットの中で作る版（B-240）。
+    pub fn spawn_inline_with(&self, make: impl FnOnce() -> F) -> bool {
+        let slot = self.store_with(make);
+        let pool: Rc<dyn PoolPoll> = self.inner.clone();
+        spawn_body_and_poll(TaskBody::Pooled { pool, slot })
+    }
+}
+
+/// 空きスロット（常に `None`）へ `make()` の結果を書く。
+///
+/// `construct` を呼び出しのまま残すと、その戻り値の一時領域から `dst` への `memcpy` を LLVM が消して
+/// `dst` へ直接作らせる（call slot optimization）。`dst` は `&mut` の引数なので書ける大きさと
+/// 別名が無いことが分かる。古い値の drop を挟むと消えないので `ptr::write` で書く。
+#[inline(never)]
+fn write_empty_slot<F, M: FnOnce() -> F>(dst: &mut Option<F>, make: M) {
+    debug_assert!(dst.is_none(), "pool slot reused before release");
+    // SAFETY: 空きスロットは解放時（`poll_slot`・`drop_slot`）と作成時に `None` にしてあり、
+    // 上書きで drop し損なう値は無い。`dst` は有効な `&mut`。
+    unsafe { std::ptr::write(dst, Some(construct(make))) }
+}
+
+#[inline(never)]
+fn construct<F, M: FnOnce() -> F>(make: M) -> F {
+    make()
 }
 
 impl<F: Future<Output = ()> + 'static> Default for TaskPool<F> {

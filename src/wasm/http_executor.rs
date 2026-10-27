@@ -46,15 +46,15 @@ pub async fn apply_wasm_request_body(
     if modules.is_empty() {
         return WasmBodyOutcome::Continue(body);
     }
-    match engine
-        .on_request_body_with_modules(
-            modules,
-            body.clone(),
-            end_of_stream,
-            request,
-            modules.sessions(),
-        )
-        .await
+    // 呼び出し元の future に本体（数 KB）を埋め込まない（Wasm を使わない要求の move が重くなる。B-240）
+    match Box::pin(engine.on_request_body_with_modules(
+        modules,
+        body.clone(),
+        end_of_stream,
+        request,
+        modules.sessions(),
+    ))
+    .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
@@ -80,9 +80,14 @@ pub async fn apply_wasm_response_body(
     if modules.is_empty() {
         return WasmBodyOutcome::Continue(body);
     }
-    match engine
-        .on_response_body_with_modules(modules, body.clone(), end_of_stream, modules.sessions())
-        .await
+    // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+    match Box::pin(engine.on_response_body_with_modules(
+        modules,
+        body.clone(),
+        end_of_stream,
+        modules.sessions(),
+    ))
+    .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),

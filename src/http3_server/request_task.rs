@@ -887,17 +887,17 @@ impl H3BufferedTask {
                     let path_arc: std::sync::Arc<str> = std::sync::Arc::from(path_str);
                     let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str);
                     let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(self.client_ip.as_str());
-                    let wasm_result = wasm_engine
-                        .on_request_headers_with_modules(
-                            &modules_to_apply,
-                            &path_arc,
-                            &method_arc,
-                            headers_vec,
-                            &ip_arc,
-                            request_body.is_empty(),
-                            modules_to_apply.sessions(),
-                        )
-                        .await;
+                    // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+                    let wasm_result = Box::pin(wasm_engine.on_request_headers_with_modules(
+                        &modules_to_apply,
+                        &path_arc,
+                        &method_arc,
+                        headers_vec,
+                        &ip_arc,
+                        request_body.is_empty(),
+                        modules_to_apply.sessions(),
+                    ))
+                    .await;
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {

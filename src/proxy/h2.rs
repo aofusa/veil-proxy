@@ -598,14 +598,14 @@ pub(super) type H2TaskSpawner = std::rc::Rc<
 pub(super) fn h2_task_spawner() -> H2TaskSpawner {
     let pool = crate::runtime::TaskPool::new();
     std::rc::Rc::new(move |ctx, req_rx, resp_tx, notify| {
-        let fut = h2_request_task(ctx, req_rx, resp_tx, notify);
+        // reactor: future をプールのスロットの中で作る（値で受け渡すと要求ごとに数 KB の memcpy。B-240）
         #[cfg(veil_rt_reactor)]
         {
-            let _ = pool.spawn_inline(fut);
+            let _ = pool.spawn_inline_with(|| h2_request_task(ctx, req_rx, resp_tx, notify));
         }
         #[cfg(not(veil_rt_reactor))]
         {
-            pool.spawn(fut);
+            pool.spawn(h2_request_task(ctx, req_rx, resp_tx, notify));
         }
     })
 }

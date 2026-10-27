@@ -193,7 +193,8 @@ impl FilterEngine {
         client_ip: Arc<str>,
         end_of_stream: bool,
     ) -> FilterResult {
-        self.on_request_headers_with_modules(
+        // 呼び出し元の future に本体（数 KB）を埋め込まない（Wasm を使わない要求の move が重くなる。B-240）
+        Box::pin(self.on_request_headers_with_modules(
             &modules,
             &path,
             &method,
@@ -201,7 +202,7 @@ impl FilterEngine {
             &client_ip,
             end_of_stream,
             modules.sessions(),
-        )
+        ))
         .await
     }
 
@@ -821,13 +822,14 @@ impl FilterEngine {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        self.on_response_headers_with_modules(
+        // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+        Box::pin(self.on_response_headers_with_modules(
             &modules,
             status,
             headers,
             end_of_stream,
             modules.sessions(),
-        )
+        ))
         .await
     }
 
@@ -1190,8 +1192,15 @@ impl FilterEngine {
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_request_body_with_modules(&modules, body, end_of_stream, None, modules.sessions())
-            .await
+        // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+        Box::pin(self.on_request_body_with_modules(
+            &modules,
+            body,
+            end_of_stream,
+            None,
+            modules.sessions(),
+        ))
+        .await
     }
 
     /// テスト用: モジュールのプールにあるインスタンスの数（F-271）
@@ -1372,8 +1381,14 @@ impl FilterEngine {
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_response_body_with_modules(&modules, body, end_of_stream, modules.sessions())
-            .await
+        // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+        Box::pin(self.on_response_body_with_modules(
+            &modules,
+            body,
+            end_of_stream,
+            modules.sessions(),
+        ))
+        .await
     }
 
     /// Execute on_response_body for a single module
@@ -1482,7 +1497,8 @@ impl FilterEngine {
         self: Arc<Self>,
         modules: crate::wasm_plugin_config::WasmModules,
     ) {
-        self.on_log_with_modules(&modules, modules.sessions()).await;
+        // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+        Box::pin(self.on_log_with_modules(&modules, modules.sessions())).await;
     }
 
     /// Execute on_log for a single module
