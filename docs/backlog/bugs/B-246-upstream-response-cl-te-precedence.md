@@ -33,6 +33,7 @@
 ## 修正（v0.10.0）
 
 - `http_utils::FramingHeaders` で Content-Length を全部見る（数字以外・`+5` のような符号付き・値の違う複数は誤り）。Transfer-Encoding があれば Content-Length を使わず（RFC 9112 §6.3）、最後が chunked でなければ接続の終わりで区切る。Transfer-Encoding と Content-Length の併記は応答の分割の試みであり得るので誤り。誤りは 502（HTTP/1.1 の全経路・HTTP/2 で受けた要求・HTTP/3 の上流 `http3_stream::parse_response_headers` が同じ判定を共有）。
+- 追記の kTLS + splice の経路（`splice_transfer_response_ktls`）もこの修正で覆う: ヘッダと一緒に送るのは `response_body_start` が決めた本文の分（Content-Length を超える初期本文・終端チャンクの後ろは送らない）だけで、chunked の残りは `feed_counted` の消費分だけを書き、終端の後ろにバイトがあれば上流接続を戻さない。区切りの誤りは送る前に 502。
 - 試験: 単体 `response_framing_te_overrides_and_conflicts_are_invalid`・`parse_response_headers_framing_conflicts`、E2E `test_b246_conflicting_upstream_framing_is_rejected`（HTTP/1.1・HTTP/2・HTTP/3、`buffering = full` も。終端チャンクの後ろに偽の応答を付けた上流で本文が `hello` だけになること）。修正前のコードで失敗することを確認。
 
 ## 関連
