@@ -2146,7 +2146,20 @@ enabled = true
 preferred_encodings = ["zstd", "br", "gzip"]
 min_size = 1024
 EOF
-    
+
+    # B-219/B-220: VEIL_E2E_SECCOMP=strict|filter|log で veil 自身の seccomp を掛けて全 E2E を回す
+    # （strict は許可リストに無い syscall でプロセスごと落ちるので、制御プレーンのスレッドを含めて漏れが E2E の失敗で見える）。
+    # テーブルは最後に置く（後ろに追記した [[route]] のキーを取り込まないように）。
+    if [ -n "${VEIL_E2E_SECCOMP:-}" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[security]
+enable_seccomp = true
+seccomp_mode = "${VEIL_E2E_SECCOMP}"
+EOF
+        log_info "seccomp enabled for the proxy (mode: ${VEIL_E2E_SECCOMP})"
+    fi
+
     log_info "Configuration files generated (type: ${config_type})"
 }
 

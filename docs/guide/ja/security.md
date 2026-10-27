@@ -57,8 +57,15 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > ために、許可リストと両方のコンテナ用のプロファイルに `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch` を
 > 含みます。プロセス内の許可リストには `getdents64` も足しました（監視のスレッドが静的配信のルートを辿る）。
 > これらを出すのは監視の専用スレッドだけで、起動時・リロード時・ディレクトリが作られたときに限ります。
-> seccomp・Landlock は掛けたスレッドと、その後に作るスレッドにだけ効き、既に動いているスレッドには効かないので、
 > veil は監視のスレッドを（ワーカーと同じく）サンドボックスを掛けた後に作ります。
+
+**サンドボックスが掛かるスレッド。** veil は seccomp のフィルタを `SECCOMP_FILTER_FLAG_TSYNC` で掛けるので、先に作った
+制御プレーンのスレッド（ログ・設定と証明書のリロード・VDS・ACME・ヘルスチェック・キャッシュの掃除・Proxy-Wasm の tick と gRPC）を
+含むプロセスの全スレッドに効きます。Landlock にはこれに当たるものが無く、掛けたスレッドとその後に作るスレッド（メインスレッド・
+ワーカー・静的配信の監視）に効きます。先に作ったスレッドのうち、ヘルスチェック・Proxy-Wasm の tick・Proxy-Wasm の gRPC の
+スレッドは同じルールセットを自分に掛けます。設定のリロード・証明書のリロード・VDS・ACME のスレッドは Landlock の外です
+（設定・証明書・Proxy-Wasm のモジュールを読み、ACME は証明書を書くため）。これらには seccomp だけが掛かります。
+v0.10.0 より前は seccomp も、メインスレッドとその後に作るスレッドにしか掛かっていませんでした。
 
 **推奨導入手順:**
 
@@ -162,12 +169,13 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 | **io_uring** | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | monoio ランタイム |
 | **ネットワーク** | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt` | TCP/UDP ソケット |
 | **ファイルI/O** | `openat`, `read`, `write`, `close`, `fstat`, `readv`, `writev` | 設定、証明書、ログ |
+| **ファイル・ディレクトリ** | `dup`, `dup3`, `unlink(at)`, `mkdir(at)`, `rename(at)`, `renameat2`, `chmod`, `fchmod(at)` | Unix ソケットのリスナー、要求の本文のディスクへの退避、ACME の証明書の保存 |
 | **メモリ** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc、Huge Pages、io_uring登録バッファ |
 | **スレッド** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | ワーカースレッド |
 | **CPUアフィニティ** | `sched_setaffinity`, `sched_getaffinity` | CPUピンニング |
 | **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
 | **時間** | `clock_gettime`, `nanosleep` | タイムアウト |
-| **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname` | 各種制御 |
+| **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | 各種制御、制御プレーンのスレッドが自分に Landlock を掛ける |
 
 ### systemd サービスファイル
 

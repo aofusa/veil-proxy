@@ -578,6 +578,9 @@ pub fn spawn_wasm_tick_thread() {
         loop {
             cap_safe_sleep(tick_interval);
 
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
+
             // シャットダウン中は終了
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                 info!("WASM tick thread shutting down");
@@ -704,6 +707,8 @@ pub fn spawn_wasm_grpc_thread() {
                 info!("WASM gRPC executor thread shutting down");
                 break;
             }
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
 
             // 新規登録（呼び出し開始・逐次送出・キャンセル）を取り込む。
             let new_calls = crate::wasm::host::grpc_executor::take_global_pending_grpc_calls();
@@ -745,6 +750,8 @@ pub fn spawn_health_check_thread() {
         info!("Health check thread started");
 
         loop {
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
             // シャットダウン中はチェックしない
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                 break;

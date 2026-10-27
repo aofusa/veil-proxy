@@ -55,8 +55,17 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > the allowlist and both container profiles also include `inotify_init1`, `inotify_add_watch` and
 > `inotify_rm_watch`; the in-process allowlist adds `getdents64` (the watcher thread walks the static root).
 > Only the dedicated watcher thread issues them, at startup, on reload and when a directory is created.
-> seccomp and Landlock apply to the thread that installs them and to threads created afterwards, not to threads
-> already running, so veil starts the watcher thread (like the workers) after the sandbox is applied.
+> veil starts the watcher thread (like the workers) after the sandbox is applied.
+
+**Which threads are sandboxed.** veil installs the seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC`, so it applies to
+every thread of the process, including the control-plane threads started before it (logging, configuration and
+certificate reload, VDS, ACME, health checks, cache cleanup, Proxy-Wasm tick and gRPC). Landlock has no such flag and
+applies to the thread that installs it and to threads created afterwards: the main thread, the workers and the static
+file watcher. Of the threads started earlier, the health check, Proxy-Wasm tick and Proxy-Wasm gRPC threads restrict
+themselves with the same ruleset; the configuration reload, certificate reload, VDS and ACME threads stay outside
+Landlock (they read the configuration, certificates and Proxy-Wasm modules, and ACME writes certificates) and are
+covered by seccomp only. Before v0.10.0 the seccomp filter, too, covered only the main thread and the threads created
+after it.
 
 **Recommended Deployment Procedure:**
 
@@ -163,12 +172,13 @@ Minimum system calls required for this server to operate:
 | **io_uring** | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | monoio runtime |
 | **Network** | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt` | TCP/UDP sockets |
 | **File I/O** | `openat`, `read`, `write`, `close`, `fstat`, `readv`, `writev` | Config, certificates, logs |
+| **Files and directories** | `dup`, `dup3`, `unlink(at)`, `mkdir(at)`, `rename(at)`, `renameat2`, `chmod`, `fchmod(at)` | Unix socket listeners, disk spill-over of request bodies, ACME certificate storage |
 | **Memory** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc, Huge Pages, io_uring registered buffers |
 | **Threads** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | Worker threads |
 | **CPU Affinity** | `sched_setaffinity`, `sched_getaffinity` | CPU pinning |
 | **Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
 | **Time** | `clock_gettime`, `nanosleep` | Timeouts |
-| **Other** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname` | Various control |
+| **Other** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | Various control; control-plane threads restricting themselves |
 
 ### systemd Service File
 

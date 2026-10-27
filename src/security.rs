@@ -171,6 +171,21 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     89, // readlink (canonicalize() で使用)
     257, // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    32,  // dup
+    292, // dup3
+    87,  // unlink
+    263, // unlinkat
+    83,  // mkdir
+    258, // mkdirat
+    82,  // rename
+    264, // renameat
+    316, // renameat2
+    90,  // chmod
+    91,  // fchmod
+    268, // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送)
@@ -318,6 +333,21 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     89, // readlink (canonicalize() で使用)
     257, // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    32,  // dup
+    292, // dup3
+    87,  // unlink
+    263, // unlinkat
+    83,  // mkdir
+    258, // mkdirat
+    82,  // rename
+    264, // renameat
+    316, // renameat2
+    90,  // chmod
+    91,  // fchmod
+    268, // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
@@ -456,6 +486,18 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    // aarch64 には dup2・unlink・mkdir・rename・chmod が無く *at 系だけ。
+    23,  // dup
+    24,  // dup3
+    35,  // unlinkat
+    34,  // mkdirat
+    38,  // renameat
+    276, // renameat2
+    52,  // fchmod
+    53,  // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     57,  // close
     62,  // lseek
     63,  // read
@@ -598,6 +640,18 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    // aarch64 には dup2・unlink・mkdir・rename・chmod が無く *at 系だけ。
+    23,  // dup
+    24,  // dup3
+    35,  // unlinkat
+    34,  // mkdirat
+    38,  // renameat
+    276, // renameat2
+    52,  // fchmod
+    53,  // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     57,  // close
     62,  // lseek
     63,  // read
@@ -1003,18 +1057,26 @@ fn apply_seccomp(config: &SecurityConfig) -> io::Result<()> {
         filter: filter.as_ptr() as *mut libc::sock_filter,
     };
 
+    // B-219: prctl(PR_SET_SECCOMP) は呼んだスレッドにしか掛からず、先に作ったログ・設定リロード・証明書の
+    // リロード・VDS・ACME・ヘルスチェック・Wasm の tick 等のスレッドが無制限のまま動いていた。seccomp(2) の
+    // TSYNC で既存の全スレッドへ同じフィルタを同期する（no_new_privs も同期される）。同期できないスレッドが
+    // あると正の値（そのスレッドの TID）が返るので、失敗として起動を止める。
     let ret = unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            libc::SECCOMP_MODE_FILTER,
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_TSYNC,
             &prog as *const libc::sock_fprog,
-            0,
-            0,
         )
     };
 
-    if ret != 0 {
+    if ret < 0 {
         return Err(io::Error::last_os_error());
+    }
+    if ret > 0 {
+        return Err(io::Error::other(format!(
+            "seccomp: could not synchronize the filter to thread {ret}"
+        )));
     }
 
     Ok(())
@@ -1491,13 +1553,55 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
 
     let ret = unsafe { libc::syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
 
-    unsafe { libc::close(ruleset_fd) };
-
     if ret < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(ruleset_fd) };
+        return Err(e);
     }
 
+    // B-219: Landlock には seccomp の TSYNC に当たるものが無く、landlock_restrict_self は呼んだスレッドにしか掛からない。
+    // ruleset を閉じずに残し、先に作られた制御プレーンのスレッドのうちファイルを使わないもの（ヘルスチェック・
+    // Wasm の tick・Wasm の gRPC）が `landlock_restrict_current_thread` で自分に掛ける。
+    LANDLOCK_RULESET_FD.store(ruleset_fd, std::sync::atomic::Ordering::Release);
+
     Ok(())
+}
+
+// B-219: apply_landlock が作った ruleset の fd（未適用なら -1）。
+#[cfg(target_os = "linux")]
+static LANDLOCK_RULESET_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Applies the process's Landlock ruleset to the calling thread, once.
+///
+/// Landlock restricts only the thread that calls `landlock_restrict_self`, so control-plane threads started before
+/// the sandbox call this at the top of their loop. It does nothing until the ruleset exists, and nothing on other
+/// systems. Threads that read or write configuration or certificate files must not call it.
+pub fn landlock_restrict_current_thread() {
+    #[cfg(target_os = "linux")]
+    {
+        thread_local! {
+            static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if APPLIED.with(|a| a.get()) {
+            return;
+        }
+        let fd = LANDLOCK_RULESET_FD.load(std::sync::atomic::Ordering::Acquire);
+        if fd < 0 {
+            return;
+        }
+        APPLIED.with(|a| a.set(true));
+        // no_new_privs はスレッドごとの属性（seccomp の TSYNC が同期済みでも、Landlock だけのときは要る）
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        let ret = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not restrict a control-plane thread: {}",
+                io::Error::last_os_error()
+            );
+        } else {
+            debug!("Landlock: control-plane thread restricted");
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4191,10 +4295,32 @@ mod tests {
             ("inotify_init1", libc::SYS_inotify_init1),
             ("inotify_add_watch", libc::SYS_inotify_add_watch),
             ("inotify_rm_watch", libc::SYS_inotify_rm_watch),
+            // B-220・B-219: UDS のリスナーの dup・スピルオーバー・ACME の証明書の保存
+            ("dup", libc::SYS_dup),
+            ("dup3", libc::SYS_dup3),
+            ("unlinkat", libc::SYS_unlinkat),
+            ("mkdirat", libc::SYS_mkdirat),
+            ("renameat", libc::SYS_renameat),
+            ("renameat2", libc::SYS_renameat2),
+            ("fchmod", libc::SYS_fchmod),
+            ("fchmodat", libc::SYS_fchmodat),
+            ("landlock_restrict_self", libc::SYS_landlock_restrict_self),
         ];
         for (name, nr) in required {
             assert!(
                 ALLOWED_SYSCALLS.contains(nr),
+                "{name} ({nr}) が seccomp 許可リストに無い"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        for (name, nr) in [
+            ("unlink", libc::SYS_unlink),
+            ("mkdir", libc::SYS_mkdir),
+            ("rename", libc::SYS_rename),
+            ("chmod", libc::SYS_chmod),
+        ] {
+            assert!(
+                ALLOWED_SYSCALLS.contains(&nr),
                 "{name} ({nr}) が seccomp 許可リストに無い"
             );
         }
