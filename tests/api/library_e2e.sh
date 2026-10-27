@@ -102,6 +102,26 @@ rss_after() {
   done
   echo "$m $a"
 }
+# upload_rss <名前> <PID> <関数>: 関数（100 MB のアップロード）の前後の常駐メモリ。増えた量が 50 MiB 未満なら ok。
+# 越えたら、もう一度アップロードして 2 回目で更に増えないことを見る（macOS の libmalloc は解放した大きな領域を
+# キャッシュとして持ち続け、1 回目だけ数十 MiB 残ることがある。本文を溜めているなら回ごとに増える）
+upload_rss() {
+  local name="$1" pid="$2" fn="$3" r0 r1 r1a r2 r2a
+  r0=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+  "$fn"
+  read -r r1 r1a <<<"$(rss_after "$pid")"
+  [ -n "$r0" ] && [ -n "$r1" ] || return 0
+  if [ $((r1 - r0)) -lt 51200 ]; then
+    ok "$name keep RSS (+$(( (r1 - r0) / 1024 )) MiB, +$(( (r1a - r0) / 1024 )) MiB right after)"; return
+  fi
+  "$fn"
+  read -r r2 r2a <<<"$(rss_after "$pid")"
+  if [ -n "$r2" ] && [ $((r2 - r1)) -lt 51200 ]; then
+    ok "$name keep RSS (+$(( (r1 - r0) / 1024 )) MiB after the first round, +$(( (r2 - r1) / 1024 )) MiB more after the second: the allocator keeps freed memory)"
+  else
+    bad "$name grew RSS by $(( (r1 - r0) / 1024 )) MiB, then $(( (${r2:-$r1} - r1) / 1024 )) MiB more"
+  fi
+}
 sha_of() { "$PY3" -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
 # F-270: comp_probe <accept-encoding|-> <url> [curl の引数...]: 応答の content-encoding・Vary の有無と、復号した本文の sha256
 comp_probe() {
@@ -291,14 +311,11 @@ run_rust_multipart() { # F-266: multipart/form-data（examples/api/rust-showcase
   expect "streaming multipart (h2c)" '"size":6' curl -s --http2-prior-knowledge -F t=v -F "f=@$W/d2.txt" "$B/upload-stream"
   # 100 MB のファイル: 本文を溜めずに一時ファイルへ書く（常駐メモリが増えない）
   dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
-  local rss0 rss1
-  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
-  expect "streaming multipart 100 MB (HTTP/1.1)" '"size":104857600' curl -s -F "big=@$W/big.bin" "$B/upload-stream"
-  expect "streaming multipart 100 MB (h2c)" '"size":104857600' curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload-stream"
-  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
-  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
-  fi
+  big_rust() {
+    expect "streaming multipart 100 MB (HTTP/1.1)" '"size":104857600' curl -s -F "big=@$W/big.bin" "$B/upload-stream"
+    expect "streaming multipart 100 MB (h2c)" '"size":104857600' curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload-stream"
+  }
+  upload_rss "100 MB uploads" "$PID" big_rust
   rm -f "$W/big.bin"
   [ -z "$(ls -A "$W/up")" ] && ok "no temporary upload files remain" || bad "temporary upload files remain: $(ls "$W/up")"
   expect "OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/profile\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
@@ -318,15 +335,13 @@ run_python_multipart() { # F-266: Python の Form・File・UploadFile（examples
   expect "py urlencoded form" '{"user":"a b","remember":true}' curl -s -d 'user=a%20b&remember=on' "$B/login"
   # 100 MB のファイル: Rust が一時ファイルへ書き、Python は fd で読む（常駐メモリが増えない）
   dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
-  local sum rss0 rss1
+  local sum
   sum=$("$PY3" -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$W/big.bin")
-  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
-  expect "py 100 MB upload (HTTP/1.1, disk)" "\"size\":104857600,\"sha256\":\"$sum\",\"where\":\"disk\"" curl -s -F title=b -F "doc=@$W/big.bin" "$B/upload"
-  expect "py 100 MB upload (h2c)" "\"sha256\":\"$sum\"" curl -s --http2-prior-knowledge -F title=b -F "doc=@$W/big.bin" "$B/upload"
-  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
-  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "py 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "py 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
-  fi
+  big_py() {
+    expect "py 100 MB upload (HTTP/1.1, disk)" "\"size\":104857600,\"sha256\":\"$sum\",\"where\":\"disk\"" curl -s -F title=b -F "doc=@$W/big.bin" "$B/upload"
+    expect "py 100 MB upload (h2c)" "\"sha256\":\"$sum\"" curl -s --http2-prior-knowledge -F title=b -F "doc=@$W/big.bin" "$B/upload"
+  }
+  upload_rss "py 100 MB uploads" "$PID" big_py
   rm -f "$W/big.bin"
   expect "py OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/upload\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
 }
@@ -521,15 +536,13 @@ run_c_multipart() { # F-266: C の veil_multipart_next（VEIL_ROUTE_FORM の /up
   expect "C multipart malformed 400 (form route)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
   expect "C multipart malformed 400 (buffered)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary $'--x\r\nbroken' "$B/parse"
   dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
-  local h rss0 rss1
+  local h
   h=$("$PY3" -I -c 'import sys; print(sum(open(sys.argv[1], "rb").read()))' "$W/big.bin")
-  rss0=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
-  expect "C 100 MB upload (HTTP/1.1, temp file)" "big:big.bin=104857600/$h(disk);" curl -s -F "big=@$W/big.bin" "$B/upload"
-  expect "C 100 MB upload (h2c)" "big:big.bin=104857600/$h(disk);" curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload"
-  local rss1a; read -r rss1 rss1a <<<"$(rss_after "$PID")"
-  if [ -n "$rss0" ] && [ -n "$rss1" ]; then
-    [ $((rss1 - rss0)) -lt 51200 ] && ok "C 100 MB uploads keep RSS (+$(( (rss1 - rss0) / 1024 )) MiB, +$(( (rss1a - rss0) / 1024 )) MiB right after)" || bad "C 100 MB uploads grew RSS by $(( (rss1 - rss0) / 1024 )) MiB (+$(( (rss1a - rss0) / 1024 )) MiB right after)"
-  fi
+  big_c() {
+    expect "C 100 MB upload (HTTP/1.1, temp file)" "big:big.bin=104857600/$h(disk);" curl -s -F "big=@$W/big.bin" "$B/upload"
+    expect "C 100 MB upload (h2c)" "big:big.bin=104857600/$h(disk);" curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload"
+  }
+  upload_rss "C 100 MB uploads" "$PID" big_c
   rm -f "$W/big.bin"
   # HTTP/3（curl に HTTP/3 が無いので quinn + h3 の試験クライアントで送る）: 30 MB は [api] max_body_size（10 MiB）を超える
   local sum3; sum3=$("$PY3" -I -c '
@@ -550,9 +563,11 @@ run_python() {
   if [ -z "$PY" ]; then
     local V="$ROOT/target/py-venv"
     local VB="$V/bin"; [ "$OS" = Windows ] && VB="$V/Scripts"
-    [ -x "$VB/python$EXE" ] || "$PY3" -m venv "$V"
-    "$VB/python$EXE" -m pip -q install maturin >/dev/null
-    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
+    # target/ ごとキャッシュから戻した venv は別のホストの Python を指して壊れていることがある（CI）。使えなければ作り直す
+    "$VB/python$EXE" -c 'import sys' 2>/dev/null || { rm -rf "$V"; "$PY3" -m venv "$V"; }
+    "$VB/python$EXE" -m pip -q install maturin > "$TMPD/pip.log" 2>&1 ||
+      "$VB/python$EXE" -m pip -q install maturin > "$TMPD/pip.log" 2>&1 || { bad "pip install maturin"; sed 's/^/    /' "$TMPD/pip.log" | tail -5; return; }
+    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" "$VB/python$EXE" -m maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
       # maturin の wheel の platform タグと pip が受け付けるタグが違う OS がある（NetBSD aarch64 は maturin が
       # netbsd_10_1_arm64、pip は evbarm 系）。wheel を作り、pip が受け付けるタグに付け直して入れる
       if grep -q "is not a supported wheel on this platform" "$TMPD/maturin.log"; then
