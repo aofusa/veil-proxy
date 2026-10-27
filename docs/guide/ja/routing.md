@@ -773,6 +773,10 @@ Linuxのnamespace分離、bind mounts、capabilities制限を適用すること�
 | `sandbox_hostname` | サンドボックス内のホスト名 | "veil-sandbox" |
 | `sandbox_no_new_privs` | PR_SET_NO_NEW_PRIVSを設定 | true |
 
+bind・tmpfs・`/proc`・`/dev` のマウントに失敗すると、`allow_security_failures = true` でない限り起動を止めます。ソースが無い
+bind（環境によっては `/lib64` など）は飛ばします。起動時のセキュリティの状態に失敗したマウントが出ます。`sandbox_mount_dev` は
+`/dev` に tmpfs を被せ、`null`・`zero`・`random`・`urandom` をホストのデバイスから bind します。
+
 ```toml
 [security]
 enable_sandbox = true

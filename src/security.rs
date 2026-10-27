@@ -1763,6 +1763,21 @@ pub fn report_security_status() {
                     caps::read_status_mask(&status, "CapBnd").unwrap_or(0)
                 );
             }
+            #[cfg(target_os = "linux")]
+            if let Some((applied, failed)) =
+                &*MOUNT_STATUS.lock().unwrap_or_else(|e| e.into_inner())
+            {
+                if failed.is_empty() {
+                    info!("Sandbox mounts: {} applied", applied);
+                } else {
+                    warn!(
+                        "Sandbox mounts: {} applied, {} failed ({})",
+                        applied,
+                        failed.len(),
+                        failed.join(", ")
+                    );
+                }
+            }
             info!("=================================");
         }
         Err(e) => {
@@ -2086,10 +2101,12 @@ pub fn apply_sandbox_setup(config: &SandboxConfig) -> io::Result<()> {
     // Namespace分離
     apply_namespaces(config)?;
 
-    // Mount namespace内でのbind mounts
-    if config.unshare_mount {
-        apply_mounts(config)?;
-    }
+    // Mount namespace内でのbind mounts（F-282: 失敗しても残りの設定は済ませてからエラーを返す）
+    let mounts = if config.unshare_mount {
+        apply_mounts(config)
+    } else {
+        Ok(())
+    };
 
     // ホスト名設定（UTS namespace分離時）
     if config.unshare_uts {
@@ -2098,6 +2115,7 @@ pub fn apply_sandbox_setup(config: &SandboxConfig) -> io::Result<()> {
         }
     }
 
+    mounts?;
     info!("Sandbox namespace/mount setup completed");
     Ok(())
 }
@@ -2225,60 +2243,69 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("Failed to set mount propagation: {}", e)))?;
     debug!("Mount propagation set to private");
 
+    // F-282: 失敗したマウントを集め、最後にまとめてエラーにする（呼び出し側は allow_security_failures = false なら
+    // 起動を止める）。ソースが無いバインドマウント（既定の一覧の /lib64 等）は失敗に数えない
+    let mut failed: Vec<String> = Vec::new();
+    let mut applied = 0usize;
+    let mut record = |what: String, result: io::Result<()>| match result {
+        Ok(()) => {
+            applied += 1;
+            debug!("Applied {}", what);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            debug!("Skipped {} (source does not exist)", what);
+        }
+        Err(e) => {
+            warn!("Failed to apply {}: {}", what, e);
+            failed.push(what);
+        }
+    };
+
     // 読み取り専用バインドマウント
     for bind in &config.ro_bind_mounts {
-        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, true) {
-            warn!(
-                "Failed to apply ro-bind mount {} -> {}: {}",
-                bind.source, bind.dest, e
-            );
-        } else {
-            debug!("Applied ro-bind mount: {} -> {}", bind.source, bind.dest);
-        }
+        record(
+            format!("ro-bind mount {} -> {}", bind.source, bind.dest),
+            apply_bind_mount(&bind.source, &bind.dest, true),
+        );
     }
 
     // 読み書きバインドマウント
     for bind in &config.rw_bind_mounts {
-        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, false) {
-            warn!(
-                "Failed to apply rw-bind mount {} -> {}: {}",
-                bind.source, bind.dest, e
-            );
-        } else {
-            debug!("Applied rw-bind mount: {} -> {}", bind.source, bind.dest);
-        }
+        record(
+            format!("rw-bind mount {} -> {}", bind.source, bind.dest),
+            apply_bind_mount(&bind.source, &bind.dest, false),
+        );
     }
 
     // tmpfsマウント
     for path in &config.tmpfs_mounts {
-        if let Err(e) = apply_tmpfs_mount(path) {
-            warn!("Failed to apply tmpfs mount at {}: {}", path, e);
-        } else {
-            debug!("Applied tmpfs mount: {}", path);
-        }
+        record(format!("tmpfs mount at {}", path), apply_tmpfs_mount(path));
     }
 
     // /proc マウント
     if config.mount_proc {
-        if let Err(e) = apply_proc_mount() {
-            warn!("Failed to mount /proc: {}", e);
-        } else {
-            debug!("Mounted /proc");
-        }
+        record("/proc mount".to_string(), apply_proc_mount());
     }
 
     // /dev マウント
     if config.mount_dev {
-        if let Err(e) = apply_dev_mount() {
-            warn!("Failed to mount /dev: {}", e);
-        } else {
-            debug!("Mounted minimal /dev");
-        }
+        record("minimal /dev".to_string(), apply_dev_mount());
     }
 
+    *MOUNT_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((applied, failed.clone()));
+    if !failed.is_empty() {
+        return Err(io::Error::other(format!(
+            "sandbox mounts failed: {}",
+            failed.join(", ")
+        )));
+    }
     info!("Mount configuration applied");
     Ok(())
 }
+
+/// サンドボックスのマウントの結果（成功した数, 失敗したもの）。`report_security_status` が出す（F-282）
+#[cfg(target_os = "linux")]
+static MOUNT_STATUS: std::sync::Mutex<Option<(usize, Vec<String>)>> = std::sync::Mutex::new(None);
 
 /// バインドマウントを適用
 #[cfg(target_os = "linux")]
@@ -2391,6 +2418,23 @@ fn apply_dev_mount() -> io::Result<()> {
 
     let dev_path = "/dev";
 
+    // 必須デバイスノード
+    let devices = ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+
+    // B-260: tmpfs を被せると元のデバイスノードはそのパスから見えなくなる。被せる前に O_PATH で開いておき、
+    // `/proc/self/fd/N` から bind する（以前は被せた後の空のパスを自分自身へ bind していて、/dev/null などが
+    // 空の通常ファイルになっていた）
+    let originals: Vec<Option<std::os::fd::OwnedFd>> = devices
+        .iter()
+        .map(|d| {
+            let c = std::ffi::CString::new(*d).ok()?;
+            // SAFETY: c は NUL 終端の C 文字列。戻り値の fd はここで所有する
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            // SAFETY: open が返した有効な fd を 1 度だけ所有する
+            (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+        })
+        .collect();
+
     // tmpfs を /dev にマウント
     if !Path::new(dev_path).exists() {
         std::fs::create_dir_all(dev_path)?;
@@ -2405,30 +2449,28 @@ fn apply_dev_mount() -> io::Result<()> {
     )
     .map_err(|e| io::Error::other(format!("Failed to mount tmpfs on /dev: {}", e)))?;
 
-    // 必須デバイスノードをバインドマウント
-    let devices = [
-        ("/dev/null", "/dev/null"),
-        ("/dev/zero", "/dev/zero"),
-        ("/dev/random", "/dev/random"),
-        ("/dev/urandom", "/dev/urandom"),
-    ];
-
-    for (src, dest) in &devices {
-        // タッチでファイルを作成
-        let dest_path = Path::new(dest);
-        if !dest_path.exists() {
+    // 必須デバイスノードを元のノードからバインドマウント
+    for (dest, original) in devices.iter().zip(&originals) {
+        let Some(original) = original else {
+            warn!("Device {} does not exist; not created in the sandbox", dest);
+            continue;
+        };
+        // バインド先（空のファイル）を作る
+        if !Path::new(dest).exists() {
             std::fs::File::create(dest)?;
         }
-
-        if let Err(e) = mount(
-            Some(*src),
+        let src = format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(original)
+        );
+        mount(
+            Some(src.as_str()),
             *dest,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
-        ) {
-            warn!("Failed to bind mount device {}: {}", dest, e);
-        }
+        )
+        .map_err(|e| io::Error::other(format!("Failed to bind mount device {}: {}", dest, e)))?;
     }
 
     // /dev/pts を作成
@@ -5406,6 +5448,113 @@ mod landlock_b230_tests {
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// F-282・B-260: マウントの失敗はエラーにし、/dev のノードは元のデバイスのまま
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_mount_tests {
+    use super::*;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    const CHILD_ENV: &str = "VEIL_F282_MOUNT_CHILD";
+
+    // 理由: 試験
+    #[allow(clippy::disallowed_methods)]
+    fn child() -> i32 {
+        // SAFETY: 引数無しの unshare。このプロセスだけのマウント名前空間にする
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            eprintln!("FAILED: unshare: {}", io::Error::last_os_error());
+            return 1;
+        }
+        let cfg = SandboxConfig {
+            // sysfs にはディレクトリを作れない → 失敗として数える
+            tmpfs_mounts: vec!["/sys/kernel/veil-f282-test".into()],
+            mount_dev: true,
+            ..Default::default()
+        };
+        let mut fails = 0;
+        match apply_mounts(&cfg) {
+            Ok(()) => {
+                eprintln!("FAILED: a failed mount must be an error");
+                fails += 1;
+            }
+            Err(e)
+                if e.to_string()
+                    .contains("tmpfs mount at /sys/kernel/veil-f282-test") => {}
+            Err(e) => {
+                eprintln!("FAILED: unexpected error: {e}");
+                fails += 1;
+            }
+        }
+        let status = MOUNT_STATUS.lock().unwrap().clone();
+        if status
+            != Some((
+                1,
+                vec!["tmpfs mount at /sys/kernel/veil-f282-test".to_string()],
+            ))
+        {
+            eprintln!("FAILED: mount status {status:?}");
+            fails += 1;
+        }
+        // B-260: /dev のノードは元のデバイスのまま（空の通常ファイルではない）
+        for (path, rdev) in [
+            ("/dev/null", (1, 3)),
+            ("/dev/zero", (1, 5)),
+            ("/dev/urandom", (1, 9)),
+        ] {
+            match std::fs::metadata(path) {
+                Ok(m)
+                    if m.file_type().is_char_device()
+                        && (libc::major(m.rdev()), libc::minor(m.rdev())) == rdev => {}
+                Ok(m) => {
+                    eprintln!(
+                        "FAILED: {path} is not the device (type {:?}, rdev {:#x})",
+                        m.file_type(),
+                        m.rdev()
+                    );
+                    fails += 1;
+                }
+                Err(e) => {
+                    eprintln!("FAILED: {path}: {e}");
+                    fails += 1;
+                }
+            }
+        }
+        if std::fs::write("/dev/null", b"x").is_err() {
+            eprintln!("FAILED: cannot write /dev/null");
+            fails += 1;
+        }
+        fails
+    }
+
+    /// root で走らせたときだけ確かめる（マウント名前空間を作るには CAP_SYS_ADMIN が要る）。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn dev_nodes_survive_and_mount_failures_are_errors() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        // SAFETY: 引数無しの syscall
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test: needs root for a mount namespace");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::sandbox_mount_tests::dev_nodes_survive_and_mount_failures_are_errors",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "child failed: {}",

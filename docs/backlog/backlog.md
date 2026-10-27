@@ -594,6 +594,7 @@
 | B-257 | P2 | 修正済み（v0.10.0） | [bugs/B-257-wasm-grpc-executor-no-window-update-no-frame-split.md](bugs/B-257-wasm-grpc-executor-no-window-update-no-frame-split.md) | Wasm の gRPC 実行器が受信 DATA に WINDOW_UPDATE を返さず、プール接続が累計 64KB で全呼び出し停止。16KB 超のメッセージを 1 つの DATA フレームで送って `FRAME_SIZE_ERROR` で接続ごと落とす |
 | B-258 | P3 | 修正済み（v0.10.0） | [bugs/B-258-ktls-handover-partial-record-left-in-rustls.md](bugs/B-258-ktls-handover-partial-record-left-in-rustls.md) | ハンドシェイク直後に rustls のデフレーマに部分レコードが残ったまま kTLS RX を有効化すると境界がずれて接続が切れる（rustls の秘密抽出は受信側の未処理バイトを検査しない。F-282 の KT-02 を確定して切り出し） |
 | B-259 | P2 | 修正済み（v0.10.0） | [bugs/B-259-ktls-rx-control-record-eio.md](bugs/B-259-ktls-rx-control-record-eio.md) | kTLS の受信で TLS 1.3 の NewSessionTicket・close_notify が `EIO` になり、上流への kTLS 接続が最初の応答で 502 になる（既定でチケットを送る TLS 1.3 の上流すべて） |
+| B-260 | P3 | 修正済み（v0.10.0） | [bugs/B-260-sandbox-dev-nodes-become-empty-files.md](bugs/B-260-sandbox-dev-nodes-become-empty-files.md) | サンドボックスの `/dev`（`sandbox_mount_dev`）で `/dev/null`・`/dev/zero`・`/dev/random`・`/dev/urandom` が空の通常ファイルになる（tmpfs を被せた後に同じパスから bind していた） |
 
 ---
 

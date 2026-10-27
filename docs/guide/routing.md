@@ -777,6 +777,11 @@ Achieve security isolation equivalent to bubblewrap by applying Linux namespace 
 | `sandbox_hostname` | Hostname inside sandbox | "veil-sandbox" |
 | `sandbox_no_new_privs` | Set PR_SET_NO_NEW_PRIVS | true |
 
+A bind, tmpfs, `/proc` or `/dev` mount that fails stops start-up unless `allow_security_failures = true`; a bind mount
+whose source does not exist (such as `/lib64` on some systems) is skipped. The start-up security status lists the
+mounts that failed. `sandbox_mount_dev` mounts a tmpfs on `/dev` with `null`, `zero`, `random` and `urandom` bound
+from the host devices.
+
 ```toml
 [security]
 enable_sandbox = true
