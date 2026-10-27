@@ -26,11 +26,17 @@ pub(super) async fn connect_https_backend_fresh(
             stream
         }
         Ok(Err(e)) => {
-            error!("Proxy connect error to {}: {}", addr, e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(error, "Proxy connect error to {}: {}", addr, e);
             return Err((502, ERR_MSG_BAD_GATEWAY));
         }
         Err(_) => {
-            error!("Proxy connect timeout to {}", addr);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Timeout,
+            );
+            crate::logging::log_throttled!(error, "Proxy connect timeout to {}", addr);
             return Err((504, ERR_MSG_GATEWAY_TIMEOUT));
         }
     };
@@ -47,11 +53,28 @@ pub(super) async fn connect_https_backend_fresh(
     match tls_result {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(e)) => {
-            error!("TLS connect error to {} (SNI: {}): {}", target.host, sni, e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Tls,
+            );
+            crate::logging::log_throttled!(
+                error,
+                "TLS connect error to {} (SNI: {}): {}",
+                target.host,
+                sni,
+                e
+            );
             Err((502, ERR_MSG_BAD_GATEWAY))
         }
         Err(_) => {
-            error!("TLS connect timeout to {} (SNI: {})", target.host, sni);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Tls,
+            );
+            crate::logging::log_throttled!(
+                error,
+                "TLS connect timeout to {} (SNI: {})",
+                target.host,
+                sni
+            );
             Err((504, ERR_MSG_GATEWAY_TIMEOUT))
         }
     }

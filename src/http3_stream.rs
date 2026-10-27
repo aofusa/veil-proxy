@@ -998,11 +998,17 @@ async fn connect_backend_io(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            warn!("[HTTP/3] streaming backend connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(warn, "[HTTP/3] streaming backend connect error: {}", e);
             return Err(502);
         }
         Err(_) => {
-            warn!("[HTTP/3] streaming backend connect timeout");
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Timeout,
+            );
+            crate::logging::log_throttled!(warn, "[HTTP/3] streaming backend connect timeout");
             return Err(504);
         }
     };

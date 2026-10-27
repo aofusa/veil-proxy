@@ -59,6 +59,74 @@ pub(crate) fn coarse_now() -> OffsetDateTime {
 }
 
 // ====================
+// 要求ごとの失敗のログの間引き（B-251）
+// ====================
+
+/// 間引く間隔（秒）。
+pub(crate) const LOG_THROTTLE_INTERVAL_SECS: u64 = 10;
+
+/// 同じ箇所のログを間隔あたり 1 回に間引く。要求ごとに起こり得る失敗（上流の接続失敗等）を `warn!`・`error!` で
+/// 出すときに使う（上流が落ちている間、要求レートと同じ速度でログが増えないように）。間引いた分は `debug!` で出す。
+pub(crate) struct LogThrottle {
+    /// 次に出してよい時刻（プロセスの基準時刻からのミリ秒）
+    next_ms: std::sync::atomic::AtomicU64,
+    /// 前回出してから間引いた件数
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl LogThrottle {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_ms: std::sync::atomic::AtomicU64::new(0),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 出してよければ `Some(前回から間引いた件数)`。失敗の経路だけで呼ぶ（成功の経路に足さない）。
+    pub(crate) fn check(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let now = BASE.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let next = self.next_ms.load(Ordering::Relaxed);
+        if now >= next
+            && self
+                .next_ms
+                .compare_exchange(
+                    next,
+                    now + LOG_THROTTLE_INTERVAL_SECS * 1000,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Some(self.suppressed.swap(0, Ordering::Relaxed));
+        }
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// `log_throttled!(error, "...", args)`: 呼び出し箇所ごとに間隔あたり 1 回だけ指定のレベルで出し、残りは `debug!`。
+macro_rules! log_throttled {
+    ($lvl:ident, $($arg:tt)+) => {{
+        static THROTTLE: $crate::logging::LogThrottle = $crate::logging::LogThrottle::new();
+        match THROTTLE.check() {
+            Some(0) => ftlog::$lvl!($($arg)+),
+            Some(n) => {
+                ftlog::$lvl!($($arg)+);
+                ftlog::$lvl!(
+                    "{} similar messages were suppressed in the last {} seconds",
+                    n,
+                    $crate::logging::LOG_THROTTLE_INTERVAL_SECS
+                );
+            }
+            None => ftlog::debug!($($arg)+),
+        }
+    }};
+}
+pub(crate) use log_throttled;
+
+// ====================
 // ログ設定
 // ====================
 
@@ -724,5 +792,23 @@ mod tests {
         assert!(out.contains("\"type\":\"app\""));
         assert!(!out.contains(SENTINEL_APP as char));
         assert!(!out.contains("0ms"));
+    }
+}
+
+#[cfg(test)]
+mod log_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn throttle_allows_once_per_interval_and_counts_the_rest() {
+        let t = LogThrottle::new();
+        assert_eq!(t.check(), Some(0));
+        for _ in 0..5 {
+            assert_eq!(t.check(), None);
+        }
+        // 間隔が過ぎたことにする
+        t.next_ms.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(t.check(), Some(5));
+        assert_eq!(t.check(), None);
     }
 }

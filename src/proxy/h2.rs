@@ -2392,11 +2392,21 @@ pub(super) async fn h2_proxy_http(
                     Ok(GateAcquire::Pooled(stream)) => (stream, true),
                     Ok(GateAcquire::Fresh(stream)) => (stream, false),
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Timeout,
+                        );
                         request_buf_put(request);
                         return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                     }
                     Err(e) => {
-                        warn!("[HTTP/2] Backend connect error: {}", e);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Error,
+                        );
+                        crate::logging::log_throttled!(
+                            warn,
+                            "[HTTP/2] Backend connect error: {}",
+                            e
+                        );
                         request_buf_put(request);
                         return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                     }
@@ -2485,11 +2495,21 @@ pub(super) async fn h2_proxy_https(
                 let acquired = match acquire_backend_conn(addr, pool_get).await {
                     Ok(acquired) => acquired,
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Timeout,
+                        );
                         request_buf_put(request);
                         return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                     }
                     Err(e) => {
-                        warn!("[HTTP/2] Backend connect error: {}", e);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Error,
+                        );
+                        crate::logging::log_throttled!(
+                            warn,
+                            "[HTTP/2] Backend connect error: {}",
+                            e
+                        );
                         request_buf_put(request);
                         return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                     }

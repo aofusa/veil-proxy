@@ -1165,11 +1165,26 @@ where
     {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {
-            warn!("[h2-upstream] connect error ({}): {}", addr.as_str(), e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(
+                warn,
+                "[h2-upstream] connect error ({}): {}",
+                addr.as_str(),
+                e
+            );
             return Err(502);
         }
         Err(_) => {
-            warn!("[h2-upstream] connect timeout ({})", addr.as_str());
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Timeout,
+            );
+            crate::logging::log_throttled!(
+                warn,
+                "[h2-upstream] connect timeout ({})",
+                addr.as_str()
+            );
             return Err(504);
         }
     };
@@ -1315,11 +1330,26 @@ where
     {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {
-            warn!("[h2-upstream] connect error ({}): {}", addr.as_str(), e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(
+                warn,
+                "[h2-upstream] connect error ({}): {}",
+                addr.as_str(),
+                e
+            );
             return Err(502);
         }
         Err(_) => {
-            warn!("[h2-upstream] connect timeout ({})", addr.as_str());
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Timeout,
+            );
+            crate::logging::log_throttled!(
+                warn,
+                "[h2-upstream] connect timeout ({})",
+                addr.as_str()
+            );
             return Err(504);
         }
     };

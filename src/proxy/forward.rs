@@ -348,7 +348,10 @@ pub(super) async fn handle_proxy(
         Some(s) => s,
         None => {
             // 利用可能なサーバーがない
-            error!("No healthy upstream servers available");
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::NoHealthy,
+            );
+            crate::logging::log_throttled!(error, "No healthy upstream servers available");
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((client_stream, 502, 0, true));
@@ -864,13 +867,24 @@ pub(super) async fn proxy_http_pooled(
                         stream
                     }
                     Ok(Err(e)) => {
-                        error!("Proxy connect error to {}: {}", addr, e);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Error,
+                        );
+                        crate::logging::log_throttled!(
+                            error,
+                            "Proxy connect error to {}: {}",
+                            addr,
+                            e
+                        );
                         let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                         return Some((client_stream, 502, 0, true));
                     }
                     Err(_) => {
-                        error!("Proxy connect timeout to {}", addr);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Timeout,
+                        );
+                        crate::logging::log_throttled!(error, "Proxy connect timeout to {}", addr);
                         let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                         return Some((client_stream, 504, 0, true));
@@ -1415,7 +1429,12 @@ pub(super) async fn proxy_h2c(
     {
         Ok(resp) => resp,
         Err(status) => {
-            error!("H2C request error to {}: {}", addr.as_str(), status);
+            crate::logging::log_throttled!(
+                error,
+                "H2C request error to {}: {}",
+                addr.as_str(),
+                status
+            );
             let err_buf = if status == 504 {
                 ERR_MSG_GATEWAY_TIMEOUT.to_vec()
             } else {

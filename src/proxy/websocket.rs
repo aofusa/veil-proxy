@@ -168,7 +168,10 @@ pub(super) async fn handle_websocket_proxy_http(
             stream
         }
         Ok(Err(e)) => {
-            error!("WebSocket proxy connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(error, "WebSocket proxy connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -294,7 +297,10 @@ pub(super) async fn handle_websocket_proxy_https(
             stream
         }
         Ok(Err(e)) => {
-            error!("WebSocket proxy connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(error, "WebSocket proxy connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -317,7 +323,10 @@ pub(super) async fn handle_websocket_proxy_https(
     let mut backend_stream = match tls_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
-            error!("WebSocket TLS connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Tls,
+            );
+            crate::logging::log_throttled!(error, "WebSocket TLS connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));

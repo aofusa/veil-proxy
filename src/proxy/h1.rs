@@ -1194,7 +1194,13 @@ pub(super) async fn handle_requests(
                         let server = match upstream_group.select(client_ip) {
                             Some(s) => s,
                             None => {
-                                error!("No healthy upstream servers for WebSocket");
+                                crate::metrics::record_upstream_connect_error(
+                                    crate::metrics::UpstreamConnectError::NoHealthy,
+                                );
+                                crate::logging::log_throttled!(
+                                    error,
+                                    "No healthy upstream servers for WebSocket"
+                                );
                                 let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                                 let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                                 return;

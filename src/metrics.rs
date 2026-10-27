@@ -877,6 +877,53 @@ pub(crate) fn record_http3_invalid_packet() {
     }
 }
 
+// B-251: 上流への接続の失敗（要求ごとの error! の代わりに数える）。上流のアドレスはラベルにしない（系列の上限。B-159）
+#[cfg(feature = "metrics")]
+static UPSTREAM_CONNECT_ERRORS_TOTAL: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    let counter = prometheus::IntCounterVec::new(
+        Opts::new(
+            "upstream_connect_errors_total",
+            "Total number of failed connections to upstream servers",
+        )
+        .namespace("veil"),
+        &["kind"],
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// 上流への接続の失敗の種類。
+#[derive(Clone, Copy)]
+pub(crate) enum UpstreamConnectError {
+    /// 接続できなかった（拒否・到達不能等）
+    Error,
+    /// 接続がタイムアウトした
+    Timeout,
+    /// TLS のハンドシェイクに失敗した（タイムアウトを含む）
+    Tls,
+    /// 使える上流が無い（全て unhealthy）
+    NoHealthy,
+}
+
+/// メトリクス: 上流への接続の失敗を数える（B-251）
+#[inline]
+pub(crate) fn record_upstream_connect_error(_kind: UpstreamConnectError) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        UPSTREAM_CONNECT_ERRORS_TOTAL
+            .with_label_values(&[match _kind {
+                UpstreamConnectError::Error => "error",
+                UpstreamConnectError::Timeout => "timeout",
+                UpstreamConnectError::Tls => "tls",
+                UpstreamConnectError::NoHealthy => "no_healthy",
+            }])
+            .inc();
+    }
+}
+
 /// メトリクス: キャッシュヒットを記録
 #[inline]
 pub(crate) fn record_cache_hit(_host: &str) {
