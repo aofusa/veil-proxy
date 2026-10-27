@@ -763,7 +763,8 @@ Linuxのnamespace分離、bind mounts、capabilities制限を適用すること�
 | `sandbox_unshare_pid` | PID namespace分離 | false |
 | `sandbox_unshare_user` | User namespace分離 | false |
 | `sandbox_unshare_net` | Network namespace分離（**警告: 通信不可**） | false |
-| `sandbox_keep_capabilities` | 保持するケイパビリティ | [] |
+| `sandbox_keep_capabilities` | 保持するケイパビリティ（それ以外を全て落とす。優先） | [] |
+| `sandbox_drop_capabilities` | 落とすケイパビリティ | [] |
 | `sandbox_ro_bind_mounts` | 読み取り専用バインドマウント（source:dest形式） | 標準パス |
 | `sandbox_rw_bind_mounts` | 読み書きバインドマウント | [] |
 | `sandbox_tmpfs_mounts` | tmpfsマウント先 | ["/tmp"] |
@@ -782,6 +783,11 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 sandbox_ro_bind_mounts = ["/usr:/usr", "/lib:/lib", "/lib64:/lib64"]
 sandbox_tmpfs_mounts = ["/tmp"]
 ```
+
+落とすケイパビリティは bounding set だけでなく、プロセスの全スレッドの effective・permitted・inheritable・ambient から
+落とします（`drop_privileges_user` を使わずに root で起動しても持ち続けません）。結果は起動時のログ
+（`Capabilities: effective=… bounding=…`）に出ます。落とせないスレッドがあると、`allow_security_failures = true` で
+なければ起動を止めます。
 
 > **注意**: `sandbox_unshare_net = true` にするとネットワーク通信ができなくなります。リバースプロキシでは通常 `false` のままにしてください。
 

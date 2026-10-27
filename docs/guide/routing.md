@@ -767,7 +767,8 @@ Achieve security isolation equivalent to bubblewrap by applying Linux namespace 
 | `sandbox_unshare_pid` | PID namespace isolation | false |
 | `sandbox_unshare_user` | User namespace isolation | false |
 | `sandbox_unshare_net` | Network namespace isolation (**Warning: disables networking**) | false |
-| `sandbox_keep_capabilities` | Capabilities to keep | [] |
+| `sandbox_keep_capabilities` | Capabilities to keep (all others are dropped; takes precedence) | [] |
+| `sandbox_drop_capabilities` | Capabilities to drop | [] |
 | `sandbox_ro_bind_mounts` | Read-only bind mounts (source:dest format) | standard paths |
 | `sandbox_rw_bind_mounts` | Read-write bind mounts | [] |
 | `sandbox_tmpfs_mounts` | tmpfs mount destinations | ["/tmp"] |
@@ -786,6 +787,11 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 sandbox_ro_bind_mounts = ["/usr:/usr", "/lib:/lib", "/lib64:/lib64"]
 sandbox_tmpfs_mounts = ["/tmp"]
 ```
+
+Dropped capabilities are removed from the effective, permitted, inheritable and ambient sets of every thread of
+the process (not only from the bounding set), so a veil started as root without `drop_privileges_user` no longer
+keeps them. The start-up log shows the result (`Capabilities: effective=… bounding=…`). If a thread cannot drop
+them, start-up fails unless `allow_security_failures = true`.
 
 > **Note**: Setting `sandbox_unshare_net = true` will disable network communication. For reverse proxies, typically leave this as `false`.
 

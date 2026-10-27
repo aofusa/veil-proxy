@@ -1724,6 +1724,16 @@ pub fn report_security_status() {
                     "Not available"
                 }
             );
+            // 理由: 起動時に 1 回だけ読む（データプレーンの前）
+            #[cfg(target_os = "linux")]
+            #[allow(clippy::disallowed_methods)]
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                info!(
+                    "Capabilities: effective={:#x} bounding={:#x}",
+                    caps::read_status_mask(&status, "CapEff").unwrap_or(0),
+                    caps::read_status_mask(&status, "CapBnd").unwrap_or(0)
+                );
+            }
             info!("=================================");
         }
         Err(e) => {
@@ -2426,10 +2436,13 @@ fn apply_hostname(hostname: &str) -> io::Result<()> {
 }
 
 /// Capabilities制限を適用
+///
+/// bounding set だけでなく、プロセスの全スレッドの effective・permitted・inheritable・ambient からも落とす
+/// （bounding set は `execve` 時の上限でしかなく、今持っている capability には効かない。B-250）。
 #[cfg(target_os = "linux")]
 fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
-    // keep_capabilitiesが指定されている場合
-    if !config.keep_capabilities.is_empty() {
+    let mask = if !config.keep_capabilities.is_empty() {
+        // keep_capabilities が指定されている場合: 保持するケイパビリティ以外を全てドロップ
         let keep_caps: Vec<Capability> = config
             .keep_capabilities
             .iter()
@@ -2440,50 +2453,233 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
             warn!("No valid capabilities found in keep_capabilities list");
             return Ok(());
         }
-
-        // 保持するケイパビリティ以外を全てドロップ
-        let all_caps = Capability::all();
-        for cap in all_caps {
-            if !keep_caps.contains(&cap) {
-                drop_capability(cap)?;
-            }
-        }
-
-        info!("Keeping only capabilities: {:?}", config.keep_capabilities);
-        return Ok(());
-    }
-
-    // drop_capabilitiesが指定されている場合
-    if !config.drop_capabilities.is_empty() {
+        Capability::all()
+            .into_iter()
+            .filter(|c| !keep_caps.contains(c))
+            .fold(0u64, |m, c| m | (1u64 << c as u32))
+    } else {
+        let mut mask = 0u64;
         for cap_name in &config.drop_capabilities {
             if let Some(cap) = Capability::parse_str(cap_name) {
-                drop_capability(cap)?;
+                mask |= 1u64 << cap as u32;
             } else {
                 warn!("Unknown capability: {}", cap_name);
             }
         }
-
-        info!("Dropped capabilities: {:?}", config.drop_capabilities);
+        mask
+    };
+    if mask == 0 {
+        return Ok(());
     }
 
+    let r = caps::drop_on_all_threads(mask)?;
+    if r.bounding_denied {
+        // CAP_SETPCAP が無い（root でない）。bounding set は execve 時の上限なので、今持つ集合を落とせていれば足りる
+        warn!("Could not drop capabilities from the bounding set (CAP_SETPCAP is missing); effective and permitted sets were dropped");
+    }
+    debug!("Capabilities dropped on {} thread(s)", r.threads);
+    if !config.keep_capabilities.is_empty() {
+        info!("Keeping only capabilities: {:?}", config.keep_capabilities);
+    } else {
+        info!("Dropped capabilities: {:?}", config.drop_capabilities);
+    }
     Ok(())
 }
 
-/// 単一のケイパビリティをドロップ
+/// capability の削除（スレッドごとの属性なので全スレッドへ配る）。
 #[cfg(target_os = "linux")]
-fn drop_capability(cap: Capability) -> io::Result<()> {
-    // PR_CAPBSET_DROP を使用してbounding setからケイパビリティを削除
-    let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as u32, 0, 0, 0) };
+mod caps {
+    use std::io;
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        // EINVAL は権限不足やケイパビリティが既にない場合
-        if err.raw_os_error() != Some(libc::EINVAL) {
-            debug!("Failed to drop capability {:?}: {}", cap, err);
-        }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
     }
 
-    Ok(())
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    /// 削除の結果。
+    pub(super) struct Dropped {
+        /// 落としたスレッドの数（呼び出したスレッドを含む）
+        pub threads: usize,
+        /// bounding set から落とせなかった（CAP_SETPCAP が無い）
+        pub bounding_denied: bool,
+    }
+
+    /// 呼び出したスレッドから `mask` の capability を落とす。signal handler からも呼ぶので
+    /// syscall だけを使う（アロケーション・ロック無し）。戻り値: 0 = 成功、1 = bounding set だけ拒否、負 = capset の errno。
+    fn drop_this_thread(mask: u64) -> i32 {
+        let mut bounding_denied = false;
+        // bounding set の削除には effective の CAP_SETPCAP が要るので capset より先に行う
+        for cap in 0..64u64 {
+            if mask & (1 << cap) == 0 {
+                continue;
+            }
+            // SAFETY: 引数は整数だけ
+            let r = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+            if r != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                bounding_denied = true;
+            }
+            // ambient は permitted・inheritable から外せば消えるが、明示的にも下げる（未対応の古いカーネルの EINVAL は無視）
+            // SAFETY: 引数は整数だけ
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
+                    cap as libc::c_ulong,
+                    0,
+                    0,
+                )
+            };
+        }
+        let mut hdr = Header {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [Data::default(); 2];
+        // SAFETY: hdr・data は capget の v3 の形（ヘッダ 1 個 + データ 2 個）で、この関数の間だけ生きる
+        if unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut Header, data.as_mut_ptr()) }
+            != 0
+        {
+            return -io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        for (i, d) in data.iter_mut().enumerate() {
+            let m = !((mask >> (32 * i)) as u32);
+            d.effective &= m;
+            d.permitted &= m;
+            d.inheritable &= m;
+        }
+        // SAFETY: 同上（pid 0 = 呼び出したスレッド自身。他のスレッドは変えられない）
+        if unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut Header, data.as_ptr()) } != 0 {
+            return -io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        i32::from(bounding_denied)
+    }
+
+    // 他のスレッドへ配る signal handler の入出力（handler はこれだけを触る）
+    static MASK: AtomicU64 = AtomicU64::new(0);
+    static ACKS: AtomicUsize = AtomicUsize::new(0);
+    static BOUNDING_DENIED: AtomicUsize = AtomicUsize::new(0);
+    static FAILED: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn on_signal(_: libc::c_int) {
+        // SAFETY: errno はスレッドローカル。handler が割り込んだ処理の errno を壊さないよう戻す
+        let errno = unsafe { *libc::__errno_location() };
+        let r = drop_this_thread(MASK.load(Ordering::Acquire));
+        if r < 0 {
+            FAILED.store(-r, Ordering::Release);
+        } else if r == 1 {
+            BOUNDING_DENIED.fetch_add(1, Ordering::Relaxed);
+        }
+        ACKS.fetch_add(1, Ordering::AcqRel);
+        unsafe { *libc::__errno_location() = errno };
+    }
+
+    fn task_ids() -> io::Result<Vec<libc::pid_t>> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir("/proc/self/task")? {
+            if let Some(tid) = e?.file_name().to_str().and_then(|s| s.parse().ok()) {
+                v.push(tid);
+            }
+        }
+        Ok(v)
+    }
+
+    /// プロセスの全スレッドから `mask` の capability を落とす（glibc が setuid を全スレッドへ配るのと同じ方法）。
+    /// 起動時に 1 回だけ呼ぶ（設定の読み込み・制御プレーンのスレッドは既に動いている）。
+    pub(super) fn drop_on_all_threads(mask: u64) -> io::Result<Dropped> {
+        // 呼び出したスレッドが先（この後に作るスレッドはこの集合を引き継ぐ）
+        let r = drop_this_thread(mask);
+        if r < 0 {
+            return Err(io::Error::from_raw_os_error(-r));
+        }
+        let mut bounding_denied = r == 1;
+
+        let sig = libc::SIGRTMIN() + 3;
+        MASK.store(mask, Ordering::Release);
+        ACKS.store(0, Ordering::Release);
+        BOUNDING_DENIED.store(0, Ordering::Release);
+        FAILED.store(0, Ordering::Release);
+        // SAFETY: handler は async-signal-safe（syscall と atomics だけ）。SA_RESTART で割り込まれた syscall は再開する
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // SAFETY: 引数無しの syscall
+        let me = unsafe { libc::gettid() };
+        let pid = std::process::id() as libc::pid_t;
+        let mut done: Vec<libc::pid_t> = vec![me];
+        let mut sent = 0usize;
+        // 送っている間に作られたスレッドは作った側の（まだ落としていない）集合を引き継ぐので、新しいスレッドが無くなるまで繰り返す
+        loop {
+            let mut new = 0;
+            for tid in task_ids()? {
+                if done.contains(&tid) {
+                    continue;
+                }
+                done.push(tid);
+                // SAFETY: 自プロセスのスレッドへ送るだけ。終了済み（ESRCH）は数えない
+                if unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, sig) } == 0 {
+                    sent += 1;
+                }
+                new += 1;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ACKS.load(Ordering::Acquire) < sent {
+                if std::time::Instant::now() > deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "only {} of {} threads dropped their capabilities",
+                            ACKS.load(Ordering::Acquire),
+                            sent
+                        ),
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            if new == 0 {
+                break;
+            }
+        }
+        let failed = FAILED.load(Ordering::Acquire);
+        if failed != 0 {
+            return Err(io::Error::from_raw_os_error(failed));
+        }
+        bounding_denied |= BOUNDING_DENIED.load(Ordering::Acquire) > 0;
+        Ok(Dropped {
+            threads: sent + 1,
+            bounding_denied,
+        })
+    }
+
+    /// `/proc/<path>/status` の capability の行（`CapEff` 等）を 16 進で読む。
+    pub(super) fn read_status_mask(status: &str, key: &str) -> Option<u64> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+    }
 }
 
 /// サンドボックスの推奨設定を生成
@@ -4884,6 +5080,112 @@ mod landlock_b230_tests {
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// B-250: capability を bounding set だけでなく全スレッドの effective・permitted から落とす
+#[cfg(all(test, target_os = "linux"))]
+mod capabilities_b250_tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "VEIL_B250_CHILD";
+    const CAP_NET_RAW: u64 = 1 << 13;
+
+    // 理由: 試験
+    #[allow(clippy::disallowed_methods)]
+    fn thread_masks() -> Vec<(String, u64, u64, u64, u64)> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir("/proc/self/task").unwrap() {
+            let task = e.unwrap().path();
+            let st = std::fs::read_to_string(task.join("status")).unwrap_or_default();
+            let m = |k| caps::read_status_mask(&st, k).unwrap_or(u64::MAX);
+            v.push((
+                task.display().to_string(),
+                m("CapEff"),
+                m("CapPrm"),
+                m("CapInh"),
+                m("CapBnd"),
+            ));
+        }
+        v
+    }
+
+    fn child() -> i32 {
+        // サンドボックスより前に作られたスレッド（制御プレーンのスレッドに当たる）
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let olds: Vec<_> = (0..3)
+            .map(|_| {
+                let rx = rx.clone();
+                std::thread::spawn(move || {
+                    let _ = rx.lock().unwrap().recv();
+                })
+            })
+            .collect();
+        let cfg = SandboxConfig {
+            drop_capabilities: vec!["CAP_NET_RAW".into()],
+            ..Default::default()
+        };
+        if let Err(e) = apply_capabilities(&cfg) {
+            eprintln!("FAILED: apply_capabilities: {e}");
+            return 1;
+        }
+        // 後から作るスレッドは引き継ぐ
+        let after = std::thread::spawn(thread_masks).join().unwrap();
+        let mut fails = 0;
+        for (task, eff, prm, inh, bnd) in thread_masks().into_iter().chain(after) {
+            if (eff | prm | inh | bnd) & CAP_NET_RAW != 0 {
+                eprintln!("FAILED: {task} still has CAP_NET_RAW (eff={eff:#x} prm={prm:#x} inh={inh:#x} bnd={bnd:#x})");
+                fails += 1;
+            }
+            if eff == 0 {
+                eprintln!("FAILED: {task} lost every capability, not only CAP_NET_RAW");
+                fails += 1;
+            }
+        }
+        drop(tx);
+        for t in olds {
+            let _ = t.join();
+        }
+        fails
+    }
+
+    #[test]
+    fn status_mask_is_parsed() {
+        let st = "Name:\tveil\nCapInh:\t0000000000000000\nCapEff:\t00000000a80425fb\n";
+        assert_eq!(caps::read_status_mask(st, "CapEff"), Some(0xa80425fb));
+        assert_eq!(caps::read_status_mask(st, "CapInh"), Some(0));
+        assert_eq!(caps::read_status_mask(st, "CapBnd"), None);
+    }
+
+    /// root（またはコンテナの root）で走らせたときだけ確かめる（一般利用者は CAP_NET_RAW を持たない）。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn capabilities_are_dropped_on_every_thread() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        let st = std::fs::read_to_string("/proc/self/status").unwrap();
+        if caps::read_status_mask(&st, "CapEff").unwrap_or(0) & CAP_NET_RAW == 0 {
+            eprintln!("Skipping test: CAP_NET_RAW is not in the effective set (run as root)");
+            return;
+        }
+        // 理由: 試験。capability を落とす子プロセスとして自分を起動する
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::capabilities_b250_tests::capabilities_are_dropped_on_every_thread",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "child failed: {}",
