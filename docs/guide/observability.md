@@ -320,6 +320,10 @@ Access logs are written asynchronously by a dedicated writer thread. The hot pat
 | `resp_body_size` | Response body size (bytes) |
 | `user_agent` | User-Agent header |
 
+Values taken from the request (`method`, `host`, `path`, `upstream`, `user_agent`) are escaped: JSON uses JSON string
+escapes, and the text format writes control characters, `\` and bytes 0x7f and above as `\xNN` (as nginx's
+`escape=default`), so a request cannot inject terminal escape sequences or extra lines into the log.
+
 ### Example JSON Output
 
 ```json

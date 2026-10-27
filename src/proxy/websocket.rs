@@ -260,7 +260,10 @@ pub(super) async fn handle_websocket_proxy_http(
         }
 
         // ヘッダーが大きすぎる
-        if response_buf.len() > MAX_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
+        if response_buf.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&response_buf)
+        {
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -406,7 +409,10 @@ pub(super) async fn handle_websocket_proxy_https(
         }
 
         // ヘッダーが大きすぎる
-        if response_buf.len() > MAX_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
+        if response_buf.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&response_buf)
+        {
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));

@@ -450,7 +450,9 @@ pub fn spawn_background_revalidation(
             }
 
             // ヘッダーが大きすぎる
-            if accumulated.len() > MAX_HEADER_SIZE {
+            if accumulated.len() > MAX_HEADER_SIZE
+                || crate::http_utils::response_head_invalid(&accumulated)
+            {
                 break;
             }
         }

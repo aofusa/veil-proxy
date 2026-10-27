@@ -315,6 +315,10 @@ flush_interval_ms = 1000  # BufWriter のフラッシュ間隔（ミリ秒、デ
 | `resp_body_size` | レスポンスボディサイズ（バイト） |
 | `user_agent` | User-Agent ヘッダ |
 
+要求から取った値（`method`・`host`・`path`・`upstream`・`user_agent`）はエスケープします。JSON は JSON の文字列のエスケープ、
+テキスト形式は制御文字・`\`・0x7f 以上のバイトを `\xNN` にします（nginx の `escape=default` と同じ）。要求で端末のエスケープ列や
+余分な行をログに入れられません。
+
 ### JSON出力例
 
 ```json

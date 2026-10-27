@@ -891,13 +891,19 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
 /// HTTP/2・HTTP/3 のフィールドの値が RFC 9113 §8.2.1・RFC 9114 §4.2 の条件を満たすか:
 /// NUL・LF・CR を含まず、空白（SP・HTAB）で始まらず終わらない。HPACK・QPACK は任意のバイトを運べるので、
 /// HTTP/1.1 の上流へ渡すと要求の密輸になる（F-236 の F1・F2）。
+///
+/// 加えて HTAB 以外の制御文字（0x01〜0x1f・0x7f）も拒否する（RFC 9110 §5.5 の field-value に無い。HTTP/1.1 は
+/// httparse が拒否していて、HTTP/2・HTTP/3 だけ ESC 等が上流とログへ届いていた。B-233）。
 #[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 pub(crate) fn is_valid_h2_field_value(value: &[u8]) -> bool {
-    if !is_valid_header_value(value) {
-        return false;
-    }
-    !matches!(value.first(), Some(b' ' | b'\t')) && !matches!(value.last(), Some(b' ' | b'\t'))
+    // 分岐の無い畳み込み（ベクトル化される。値は短いので早期脱出しない）
+    let has_ctl = value.iter().fold(false, |acc, &b| {
+        acc | ((b < 0x20) & (b != b'\t')) | (b == 0x7f)
+    });
+    !has_ctl
+        && !matches!(value.first(), Some(b' ' | b'\t'))
+        && !matches!(value.last(), Some(b' ' | b'\t'))
 }
 
 /// `:method` が token か（RFC 9110 §9.1）。
@@ -1166,8 +1172,21 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
             })
         }
         Ok(Status::Partial) => None, // データ不足
-        Err(_) => None,              // パースエラー
+        Err(_) => None,              // パースエラー（`response_head_invalid` で見分ける）
     }
+}
+
+/// Whether the bytes received so far can never become a valid response head (malformed, or more headers than the
+/// parser accepts).
+///
+/// `parse_http_response` returns `None` both for "not complete yet" and for these, so callers check this before
+/// reading more; otherwise they waited for the header size limit or the read timeout (B-234). Only call it after
+/// `parse_http_response` returned `None` (it parses again).
+pub(crate) fn response_head_invalid(data: &[u8]) -> bool {
+    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+    httparse::Response::new(&mut headers_storage)
+        .parse(data)
+        .is_err()
 }
 
 // ====================
@@ -2370,6 +2389,37 @@ mod stack_fmt_tests {
         drain_interim_responses(&mut buf);
         assert!(buf.is_empty());
         assert!(parse_http_response(&buf).is_none());
+    }
+
+    // B-233: HTTP/2・HTTP/3 のフィールドの値は HTAB 以外の制御文字を拒否する
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn h2_field_value_rejects_control_characters() {
+        assert!(is_valid_h2_field_value(b"text/html; charset=utf-8"));
+        assert!(is_valid_h2_field_value(b"a\tb"));
+        assert!(is_valid_h2_field_value("caf\u{e9}".as_bytes()));
+        for bad in [&b"a\x1bb"[..], b"a\x7fb", b"a\x00b", b"a\rb", b"a\nb", b"a\x01", b" a", b"a\t"] {
+            assert!(!is_valid_h2_field_value(bad), "{bad:?}");
+        }
+    }
+
+    // B-234: ヘッダが 65 個以上・不正な応答は「データ不足」と区別できる（待たずに 502 にする）
+    #[test]
+    fn response_head_invalid_distinguishes_partial_from_too_many_headers() {
+        let mut many = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..65 {
+            many.extend_from_slice(format!("Set-Cookie: c{i}=v\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"\r\n");
+        assert!(parse_http_response(&many).is_none());
+        assert!(response_head_invalid(&many));
+
+        let partial = b"HTTP/1.1 200 OK\r\nContent-Len";
+        assert!(parse_http_response(partial).is_none());
+        assert!(!response_head_invalid(partial));
+
+        assert!(response_head_invalid(b"HTTX/1.1 200 OK\r\n\r\n"));
+        assert!(!response_head_invalid(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
     }
 
     #[test]

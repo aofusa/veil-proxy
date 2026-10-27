@@ -1,6 +1,6 @@
 # B-233: HTTP/2・HTTP/3 のフィールド値の検査が C0 制御文字を通し、テキスト形式のアクセスログがエスケープしない
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー PR-05・SB-08）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -25,6 +25,14 @@
 
 - 単体: `\x1b[2J` を含む HTTP/2 のヘッダが拒否される。テキストのアクセスログに `\x1b` が生で出ない。
 - h2spec・h3spec が変わらない。
+
+## 修正（v0.10.0）
+
+- `is_valid_h2_field_value` で HTAB 以外の制御文字（0x01〜0x1f・0x7f）も拒否する（HTTP/2 はストリームの PROTOCOL_ERROR、HTTP/3 は
+  H3_MESSAGE_ERROR。どちらも既存の NUL・CR・LF と同じ扱い）。分岐の無い畳み込みで、値の長さに比例するだけのコスト。
+- テキスト形式のアクセスログで、要求由来の値（method・host・path・upstream・user_agent）の制御文字・`\\`・0x7f 以上を `\\xNN` にする。
+  印字可能な ASCII だけの値（ほとんど）はそのまま書き、確保は増えない。`docs/guide/observability.md`（英・日）に書いた。
+- 単体: `h2_field_value_rejects_control_characters`・`test_text_log_escapes_control_characters`。
 
 ## 関連
 

@@ -439,9 +439,12 @@ pub(super) async fn splice_transfer_response_ktls(
         }
 
         // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
-        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は、上限か読み取りのタイムアウトまで待たずに 502
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&accumulated)
+        {
             warn!(
-                "Backend response header too large (> {} bytes, splice)",
+                "Backend response header too large (> {} bytes, splice) or invalid",
                 MAX_RESPONSE_HEADER_SIZE
             );
             return (502, 0, false, true);

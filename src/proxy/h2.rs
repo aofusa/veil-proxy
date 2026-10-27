@@ -2891,7 +2891,9 @@ where
                     if let Some(parsed) = parse_http_response(&heap) {
                         break parsed;
                     }
-                    if heap.len() > MAX_HEADER_SIZE {
+                    // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
+                    if heap.len() > MAX_HEADER_SIZE || crate::http_utils::response_head_invalid(&heap)
+                    {
                         let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                         return (s, sz, false);
                     }

@@ -367,7 +367,10 @@ where
         }
 
         // ヘッダーが大きすぎる場合は中止
-        if accumulated.len() > MAX_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は待たずに失敗
+        if accumulated.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&accumulated)
+        {
             return None;
         }
     }

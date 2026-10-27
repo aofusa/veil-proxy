@@ -464,9 +464,12 @@ pub(super) async fn transfer_response_with_compression(
         }
 
         // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
-        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は、上限か読み取りのタイムアウトまで待たずに 502
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&accumulated)
+        {
             warn!(
-                "Backend response header too large (> {} bytes)",
+                "Backend response header too large (> {} bytes) or invalid",
                 MAX_RESPONSE_HEADER_SIZE
             );
             return (0, 502, false, true);
