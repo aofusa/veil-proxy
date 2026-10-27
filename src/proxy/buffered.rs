@@ -482,10 +482,13 @@ where
             };
         let n = match res {
             Ok(n) if n > 0 => n,
-            _ => {
+            res => {
                 buf_put(returned_buf);
-                // 接続の終わりで区切る応答だけは EOF が終端
-                if matches!(kind, ResponseBody::UntilClose) {
+                // 接続の終わりで区切る応答だけは EOF が終端。TLS は close_notify を受けたときだけ（F-282）
+                if res.is_ok()
+                    && matches!(kind, ResponseBody::UntilClose)
+                    && backend_stream.eof_was_clean()
+                {
                     break;
                 }
                 return (BufferedBodyResult::Failed, false);

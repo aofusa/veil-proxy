@@ -115,6 +115,9 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 
 ## 違い・制限
 
+- 相手の証明書は常にメッシュのトラストバンドルで検証する。xDS の TLS コンテキストに `match_subject_alt_names` が無い
+  （Linkerd では期待する ID が無い）ときは、そのバンドルの証明書なら何でも受け入れる。相手の認証はするが名前での認可は
+  しない（Envoy と同じ）ので、認可は RBAC・AuthorizationPolicy で行う。
 - veil が実装していない Envoy のフィルタは、任意（optional）の指定が無ければ拒否（NACK）する。Envoy と同じく前の設定の
   まま動く。`config_dump` は istioctl が読む項目を返し、全項目ではない。
 - X.509 v1 のクライアント証明書は受け付けない（webpki）。Envoy（BoringSSL）は受け付ける。メッシュが発行する証明書は v3。

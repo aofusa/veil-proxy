@@ -1610,6 +1610,17 @@ path = "/ws/*"
 type = "Proxy"
 upstream = "ws-pool"
 
+# F-282: 101 の後のトンネルのアイドルタイムアウト
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/ws-idle/*"
+[route.action]
+type = "Proxy"
+upstream = "ws-pool"
+[route.security]
+websocket_idle_timeout_secs = 1
+
 EOF
 
     # gRPCルート設定

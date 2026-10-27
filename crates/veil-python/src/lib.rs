@@ -450,6 +450,9 @@ fn call_python(
             let ctx_ptr = ctx.map(|c| c as *mut HandlerContext);
             if let Some(p) = ctx_ptr {
                 native_req
+                    .ctx_owner
+                    .store(native::thread_token(), std::sync::atomic::Ordering::Release);
+                native_req
                     .ctx
                     .store(p as usize, std::sync::atomic::Ordering::Release);
             }

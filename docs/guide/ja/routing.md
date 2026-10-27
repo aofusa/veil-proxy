@@ -574,6 +574,7 @@ WebSocket双方向転送時のポーリング動作を制御します。
 | `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
 | `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
 | `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
+| `websocket_idle_timeout_secs` | アップグレード（`101`）の後のトンネルで、どちらの向きにもこの時間データが流れなければ閉じる。0 は無制限 | 0 |
 
 #### ポーリングモードの選択
 
@@ -829,6 +830,7 @@ sandbox_tmpfs_mounts = ["/tmp"]
 | | `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
 | | `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
 | | `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
+| | `websocket_idle_timeout_secs` | `101` の後のトンネルのアイドルタイムアウト（0 は無制限） | 0 |
 
 #### セキュリティ設定例
 

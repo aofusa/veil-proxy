@@ -460,6 +460,8 @@ pub(super) async fn websocket_bidirectional_transfer(
 
     // 現在のタイムアウト値（Adaptive モードで動的に変更）
     let mut current_timeout_ms = poll_config.initial_timeout_ms;
+    // アイドルになった時刻（F-282）
+    let mut idle_since: Option<std::time::Instant> = None;
 
     loop {
         let poll_timeout = Duration::from_millis(current_timeout_ms);
@@ -523,6 +525,17 @@ pub(super) async fn websocket_bidirectional_transfer(
             }
         }
 
+        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
+        if had_activity {
+            idle_since = None;
+        } else if let Some(limit) = poll_config.idle_timeout {
+            let now = std::time::Instant::now();
+            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
+                debug!("WebSocket tunnel idle for {:?}; closing", limit);
+                break;
+            }
+        }
+
         // Adaptive モードでのタイムアウト調整
         if poll_config.mode == WebSocketPollMode::Adaptive {
             if had_activity {
@@ -554,6 +567,8 @@ pub(super) async fn websocket_bidirectional_transfer_tls(
 
     // 現在のタイムアウト値（Adaptive モードで動的に変更）
     let mut current_timeout_ms = poll_config.initial_timeout_ms;
+    // アイドルになった時刻（F-282）
+    let mut idle_since: Option<std::time::Instant> = None;
 
     loop {
         let poll_timeout = Duration::from_millis(current_timeout_ms);
@@ -611,6 +626,17 @@ pub(super) async fn websocket_bidirectional_transfer_tls(
                 break;
             }
             Err(_) => {}
+        }
+
+        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
+        if had_activity {
+            idle_since = None;
+        } else if let Some(limit) = poll_config.idle_timeout {
+            let now = std::time::Instant::now();
+            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
+                debug!("WebSocket tunnel idle for {:?}; closing", limit);
+                break;
+            }
         }
 
         // Adaptive モードでのタイムアウト調整

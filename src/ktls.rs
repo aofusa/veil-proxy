@@ -683,6 +683,7 @@ pub fn consume_control_record(fd: RawFd, read_err: io::Error) -> io::Result<Cont
     const CONTENT_ALERT: u8 = 21;
     const CONTENT_HANDSHAKE: u8 = 22;
     const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
+    const HANDSHAKE_KEY_UPDATE: u8 = 24;
 
     let mut data = [0u8; 16384 + 256];
     // CMSG_SPACE(1) は 8 バイト境界に揃えた値。u64 の配列で整列を保証する
@@ -747,7 +748,18 @@ pub fn consume_control_record(fd: RawFd, read_err: io::Error) -> io::Result<Cont
             io::ErrorKind::ConnectionAborted,
             format!("TLS alert received from peer (description {})", data[1]),
         )),
-        // KeyUpdate 等（鍵の更新はカーネルへ渡せない）・平文のレコードでの EIO は元の誤り
+        // F-282: KeyUpdate（鍵の更新はカーネルへ渡せない）は明示の誤りで接続を閉じる（平文が混じることは無い）
+        Some(CONTENT_HANDSHAKE) if n > 0 && data[0] == HANDSHAKE_KEY_UPDATE => {
+            crate::logging::log_throttled!(
+                warn,
+                "kTLS: peer sent a TLS 1.3 KeyUpdate, which kTLS cannot apply; closing the connection"
+            );
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "TLS KeyUpdate is not supported with kTLS",
+            ))
+        }
+        // その他・平文のレコードでの EIO は元の誤り
         _ => Err(read_err),
     }
 }

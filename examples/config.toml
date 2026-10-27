@@ -2125,6 +2125,8 @@ watch = false
 #
 # WebSocket adaptive ポーリングのバックオフ倍率
 # websocket_poll_backoff_multiplier = 2.0
+# アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（0 = 無制限。デフォルト: 0）
+# websocket_idle_timeout_secs = 0
 
 # ------------------------------------------
 # ルーティング条件の例（header, method, query, source_ip）

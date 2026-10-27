@@ -578,6 +578,7 @@ Controls polling behavior during WebSocket bidirectional transfer.
 | `websocket_poll_timeout_ms` | Initial timeout (milliseconds) | 1 |
 | `websocket_poll_max_timeout_ms` | Maximum timeout (milliseconds) *adaptive only | 100 |
 | `websocket_poll_backoff_multiplier` | Backoff multiplier *adaptive only | 2.0 |
+| `websocket_idle_timeout_secs` | Close the tunnel after an upgrade (`101`) when no data has flowed in either direction for this long; 0 = no limit | 0 |
 
 #### Choosing Polling Mode
 
@@ -834,6 +835,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `websocket_poll_timeout_ms` | Initial timeout (milliseconds) | 1 |
 | | `websocket_poll_max_timeout_ms` | Maximum timeout (milliseconds) *adaptive only | 100 |
 | | `websocket_poll_backoff_multiplier` | Backoff multiplier *adaptive only | 2.0 |
+| | `websocket_idle_timeout_secs` | Idle timeout of the tunnel after `101` (0 = no limit) | 0 |
 
 #### Security Configuration Examples
 

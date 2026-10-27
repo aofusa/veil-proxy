@@ -329,10 +329,15 @@ pub(super) async fn transfer_response_body_rest<R: AsyncReader, W: AsyncWriter>(
         };
         let n = match res {
             Ok(n) if n > 0 => n,
-            _ => {
+            Ok(_) => {
                 buf_put(buf);
-                // 接続の終わりで区切る応答だけは EOF が終端
-                out.complete = matches!(kind, ResponseBody::UntilClose);
+                // 接続の終わりで区切る応答だけは EOF が終端。TLS は close_notify を受けたときだけ（F-282:
+                // 受けずに切れたら切り詰めかもしれないので不完全として切断で伝える）
+                out.complete = matches!(kind, ResponseBody::UntilClose) && backend.eof_was_clean();
+                break;
+            }
+            Err(_) => {
+                buf_put(buf);
                 break;
             }
         };
@@ -476,4 +481,88 @@ pub(super) async fn collect_response_body<R: AsyncReadRent + Unpin>(
         return Some((decode_chunked_body(&raw), extra));
     }
     Some((raw, extra))
+}
+
+#[cfg(test)]
+mod eof_tests {
+    use super::*;
+    use crate::runtime::buf::IoBufMut;
+
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(not(all(veil_rt_uring, target_os = "linux")))]
+    fn runtime_available() -> bool {
+        true
+    }
+
+    /// 決まった塊を返してから EOF になる上流（`clean` は EOF が close_notify 付きか）
+    struct Upstream {
+        chunks: Vec<&'static [u8]>,
+        clean: bool,
+    }
+
+    impl AsyncReader for Upstream {
+        async fn read_buf(
+            &mut self,
+            mut buf: SafeReadBuffer,
+        ) -> (io::Result<usize>, SafeReadBuffer) {
+            if self.chunks.is_empty() {
+                return (Ok(0), buf);
+            }
+            let c = self.chunks.remove(0);
+            let n = c.len().min(buf.bytes_total());
+            // SAFETY: write_ptr は bytes_total バイト書ける。n バイトだけ書いて初期化済みにする
+            unsafe {
+                std::ptr::copy_nonoverlapping(c.as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            (Ok(n), buf)
+        }
+
+        fn eof_was_clean(&self) -> bool {
+            self.clean
+        }
+    }
+
+    struct Sink(Vec<u8>);
+
+    impl AsyncWriter for Sink {
+        async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            self.0.extend_from_slice(&buf);
+            (Ok(buf.len()), buf)
+        }
+    }
+
+    /// F-282: 接続の終わりで区切る応答は、TLS の close_notify を受けた EOF のときだけ完了とみなす
+    /// （受けずに切れた応答は切り詰めかもしれないので不完全。キャッシュせず、再利用もしない）
+    #[test]
+    fn until_close_body_needs_clean_eof() {
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            for (clean, complete) in [(true, true), (false, false)] {
+                let mut up = Upstream {
+                    chunks: vec![b"hello ", b"world"],
+                    clean,
+                };
+                let mut sink = Sink(Vec::new());
+                let start = response_body_start(ResponseBody::UntilClose, b"");
+                let out = transfer_response_body_rest(
+                    &mut up,
+                    &mut sink,
+                    ResponseBody::UntilClose,
+                    start,
+                    None,
+                )
+                .await;
+                assert_eq!(out.complete, complete, "clean EOF = {clean}");
+                assert_eq!(sink.0, b"hello world");
+                assert!(out.client_must_close(ResponseBody::UntilClose));
+            }
+        });
+    }
 }

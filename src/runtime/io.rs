@@ -44,6 +44,12 @@ pub trait AsyncReadRent {
     ) -> impl std::future::Future<Output = BufResult<usize, T>> {
         async move { (Err(std::io::Error::other("readv not implemented")), buf) }
     }
+
+    /// 直前に `read` が返した EOF（`Ok(0)`）が相手の正しい終了か（F-282）。TLS は close_notify を受けたときだけ
+    /// `true`（受けずに TCP が閉じたら切り詰めの可能性がある）。TLS 以外は常に `true`
+    fn eof_was_clean(&self) -> bool {
+        true
+    }
 }
 
 /// 非同期書き込みトレイト（所有権ベース）

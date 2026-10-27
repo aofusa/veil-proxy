@@ -129,6 +129,17 @@ ktls_fallback_enabled = false  # kTLS required mode
 | Session Key Exposure | TLS handshake runs in userspace (rustls) (maintains PFS) |
 | DoS Attacks | Monitor kernel resources, rate limiting |
 
+### Control records and the end of a connection
+
+Under kTLS the kernel decrypts application data only. veil handles the other records itself: TLS 1.3 session tickets
+from an upstream are discarded, close_notify ends the stream, other alerts abort the connection, and a TLS 1.3
+KeyUpdate closes the connection with a warning (kTLS cannot apply new keys; rustls without kTLS handles it).
+
+An upstream response without `Content-Length` or chunked encoding ends when the upstream closes the connection.
+With TLS (with or without kTLS) veil treats it as complete only if the upstream sent close_notify first; otherwise
+the body may have been cut off, so it is not cached, a buffered response becomes 502 and the client connection is
+closed.
+
 ## TLS Session Resumption (F-183)
 
 `[tls] session_resumption` selects how HTTP/1.1 and HTTP/2 clients resume TLS sessions

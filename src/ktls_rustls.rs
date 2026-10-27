@@ -306,6 +306,8 @@ pub struct KtlsClientStream {
     drained_buffer: Vec<u8>,
     /// ALPN で `h2` が選ばれたか（F-175。kTLS 移行で rustls セッションを手放す前に記録する）。
     negotiated_h2: bool,
+    /// 相手の close_notify を受けた（F-282: EOF で区切る応答の切り詰めを見分ける）
+    close_notify: bool,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsClientStream {
@@ -1209,6 +1211,7 @@ pub async fn connect(
         mode,
         drained_buffer,
         negotiated_h2,
+        close_notify: false,
     })
 }
 
@@ -1395,6 +1398,10 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 // ====================
 
 impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
+    fn eof_was_clean(&self) -> bool {
+        self.close_notify
+    }
+
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // 【Phase 2】まずドレインバッファからデータを返す
         if !self.drained_buffer.is_empty() {
@@ -1418,7 +1425,10 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                         match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
                             Ok(crate::ktls::ControlRecord::Skipped) => continue,
-                            Ok(crate::ktls::ControlRecord::CloseNotify) => return (Ok(0), buf),
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => {
+                                self.close_notify = true;
+                                return (Ok(0), buf);
+                            }
                             Err(e) => return (Err(e), buf),
                         }
                     }
@@ -1476,8 +1486,11 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                             break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
                         consumed += r;
-                        conn.process_new_packets()
+                        let state = conn
+                            .process_new_packets()
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // F-282: close_notify を受けたか（EOF で区切る応答の完了の判定に使う）
+                        self.close_notify |= state.peer_has_closed();
                         // 各 process 後に平文を退避し received_plaintext を空に保つ。
                         drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }

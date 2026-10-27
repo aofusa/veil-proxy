@@ -421,6 +421,8 @@ pub struct WebSocketPollConfig {
     /// バックオフ倍率 - Adaptiveモードでのみ使用
     /// タイムアウト発生時に現在値に掛ける倍率
     pub backoff_multiplier: f64,
+    /// どちらの向きにもデータが流れない時間の上限（`None` は無制限。F-282）
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for WebSocketPollConfig {
@@ -430,6 +432,7 @@ impl Default for WebSocketPollConfig {
             initial_timeout_ms: default_websocket_poll_timeout_ms(),
             max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             backoff_multiplier: default_websocket_backoff_multiplier(),
+            idle_timeout: None,
         }
     }
 }
@@ -576,6 +579,12 @@ pub struct SecurityConfig {
     #[serde(default = "default_websocket_backoff_multiplier")]
     pub websocket_poll_backoff_multiplier: f64,
 
+    /// アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（F-282）。
+    ///
+    /// デフォルト: `0`（無制限）
+    #[serde(default)]
+    pub websocket_idle_timeout_secs: u64,
+
     /// 実際の応答（プリフライト以外）に足す CORS のヘッダ（F-273）。`[route.traffic.cors]` のあるルートで、
     /// 要求の `Origin` ごとに設定ロード時に作った `Backend` の写しだけが持つ（それ以外は `None`）
     #[serde(skip)]
@@ -661,6 +670,8 @@ impl SecurityConfig {
             initial_timeout_ms: self.websocket_poll_timeout_ms,
             max_timeout_ms: self.websocket_poll_max_timeout_ms,
             backoff_multiplier: self.websocket_poll_backoff_multiplier,
+            idle_timeout: (self.websocket_idle_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.websocket_idle_timeout_secs)),
         }
     }
 }
@@ -692,6 +703,7 @@ impl Default for SecurityConfig {
             websocket_poll_timeout_ms: default_websocket_poll_timeout_ms(),
             websocket_poll_max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             websocket_poll_backoff_multiplier: default_websocket_backoff_multiplier(),
+            websocket_idle_timeout_secs: 0,
             cors_actual: None,
             rate_limit_zone: 0,
         }

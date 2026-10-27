@@ -128,6 +128,9 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
   meshes are v3.
 - ztunnel (ambient L4) is not replaced (F-228). Linkerd's multicluster gateways (`authority_override`) and the legacy
   `ServiceProfile` routes (`GetProfile`) are not used; Linkerd's current `HTTPRoute`-based policies are.
+- Peer certificates are always checked against the mesh's trust bundle. When the xDS TLS context has no
+  `match_subject_alt_names` (Linkerd: no expected identity), any certificate from that bundle is accepted: the
+  peer is authenticated but not authorized by name, as with Envoy. Authorize with RBAC or AuthorizationPolicy.
 - Tap events are emitted when a request completes (the three events of a request carry the same timing).
 - `ext_authz` (Istio's `CUSTOM` AuthorizationPolicy action) is not implemented; a listener that needs it is rejected (F-229).
 - The ambient waypoint was tested with whoami workloads, not with bookinfo. Transparent interception was tested inside

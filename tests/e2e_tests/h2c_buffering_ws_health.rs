@@ -1779,6 +1779,64 @@ pub(super) async fn test_websocket_poll_mode_adaptive_idle() {
     );
 }
 
+/// F-282: `websocket_idle_timeout_secs` のルートでは、101 の後にどちらの向きにもデータが流れなければトンネルを閉じる
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f282_websocket_tunnel_idle_timeout_closes() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    while tls_conn.is_handshaking() {
+        tls_conn.complete_io(&mut stream).expect("TLS handshake");
+    }
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    let request = b"GET /ws-idle/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    tls_stream.write_all(request).unwrap();
+    tls_stream.flush().unwrap();
+    let mut response = Vec::new();
+    let mut single = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") && response.len() < 8192 {
+        match tls_stream.read(&mut single) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => response.push(single[0]),
+        }
+    }
+    let status = get_status_code(&String::from_utf8_lossy(&response));
+    assert_eq!(status, Some(101), "upgrade must succeed");
+
+    // 何も送らずに待つ。1 秒のアイドルタイムアウトで閉じられる（読み取りの 10 秒より十分前）
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1024];
+    let closed = loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break false
+            }
+            // close_notify 無しの切断も閉じたとみなす
+            Err(_) => break true,
+        }
+    };
+    let elapsed = started.elapsed();
+    assert!(closed, "the idle tunnel must be closed by the proxy");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the idle tunnel must close after about 1s, took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 pub(super) async fn test_websocket_idle_connection_timeout() {

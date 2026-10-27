@@ -38,6 +38,9 @@ pub struct NativeRequest {
     query_params: PyOnceLock<Py<PyAny>>,
     // F-210: ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0）
     pub(crate) ctx: AtomicUsize,
+    // F-282: ctx を設定したスレッド（`thread_token`）。ハンドラが作った別の Python スレッドから ctx を触らせない
+    // （GIL を外している間に同じ `HandlerContext` への &mut が 2 つできる・呼び出しの後に使われるのを防ぐ）
+    pub(crate) ctx_owner: AtomicUsize,
     // F-266: 本文を読む前に解析した multipart のパート（大きなファイルは名前の無い一時ファイル）
     parts: std::sync::Mutex<Option<Vec<veil::api::multipart::SpooledPart>>>,
 }
@@ -64,19 +67,25 @@ impl NativeRequest {
             client_ip: PyOnceLock::new(),
             query_params: PyOnceLock::new(),
             ctx: AtomicUsize::new(0),
+            ctx_owner: AtomicUsize::new(0),
             parts: std::sync::Mutex::new(None),
         }
     }
 
+    /// この要求の `HandlerContext`。ハンドラの呼び出し中に、それを呼んでいるスレッドから使うときだけ返す（F-282）
+    pub(crate) fn handler_ctx(&self) -> Option<*mut HandlerContext> {
+        let p = self.ctx.load(Ordering::Acquire);
+        (p != 0 && self.ctx_owner.load(Ordering::Acquire) == thread_token())
+            .then_some(p as *mut HandlerContext)
+    }
+
     /// Next chunk of the request body (only on streaming-body routes, during the handler call; waits with the GIL released).
     fn read_chunk(&self, py: Python<'_>) -> Option<Bytes> {
-        let p = self.ctx.load(Ordering::Acquire);
-        if p == 0 {
-            return None;
-        }
+        let p = self.handler_ctx()?;
         // SAFETY: ctx はこの要求を処理しているプールのスレッドの `call_blocking` の閉包が持つ `HandlerContext` で、
-        // 呼び出しが終わる前に 0 へ戻す（`lib.rs::call_python`）。同じスレッドからしか使わない。
-        let ctx = unsafe { &mut *(p as *mut HandlerContext) };
+        // 呼び出しが終わる前に 0 へ戻す（`lib.rs::call_python`）。`handler_ctx` が ctx を設定したスレッド
+        // （= 呼び出しの間ブロックしているスレッド）からの呼び出しに限るので、別の参照と重ならない
+        let ctx = unsafe { &mut *p };
         if !ctx.has_body_stream() {
             return None;
         }
@@ -344,9 +353,9 @@ impl NativeBodyIter {
     fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyBytes>> {
         let r = self.req.borrow(py);
         let streaming = {
-            let p = r.ctx.load(Ordering::Acquire);
             // SAFETY: read_chunk と同じ
-            p != 0 && unsafe { (*(p as *mut HandlerContext)).has_body_stream() }
+            r.handler_ctx()
+                .is_some_and(|p| unsafe { (*p).has_body_stream() })
         };
         if streaming {
             return r.read_chunk(py).map(|b| PyBytes::new(py, &b).unbind());
@@ -881,4 +890,12 @@ pub fn parse_multipart(
 #[pyfunction]
 pub fn spool_threshold() -> usize {
     veil::api::multipart::spool_threshold()
+}
+
+/// スレッドを見分ける値（スレッドローカルの番地。F-282）
+pub(crate) fn thread_token() -> usize {
+    thread_local! {
+        static TOKEN: u8 = const { 0 };
+    }
+    TOKEN.with(|t| t as *const u8 as usize)
 }
