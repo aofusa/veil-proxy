@@ -1008,6 +1008,7 @@ pub(super) async fn test_f205_keepalive_direct_read_and_fallback() {
 /// クライアント接続から何本も要求を出す。上流は止めた接続に別の要求が届いたかを `/framing/poisoned` で返す。
 #[tokio::test]
 #[ntest::timeout(90000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_b244_stalled_chunked_upstream_is_not_pooled() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1091,6 +1092,7 @@ pub(super) async fn test_b244_stalled_chunked_upstream_is_not_pooled() {
 /// （HTTP/3 は B-104 の試験）。同じクライアント接続の次の要求もすぐ通ること。
 #[tokio::test]
 #[ntest::timeout(30000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_b245_head_304_on_keepalive_upstream_h1_h2() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1147,6 +1149,7 @@ pub(super) async fn test_b245_head_304_on_keepalive_upstream_h1_h2() {
 /// （応答の分割に使える）ので 502。終端チャンクの後ろのバイトはクライアントへ送らない。
 #[tokio::test]
 #[ntest::timeout(60000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_b246_conflicting_upstream_framing_is_rejected() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

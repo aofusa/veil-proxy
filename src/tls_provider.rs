@@ -34,16 +34,19 @@ pub use rustls::crypto::aws_lc_rs as provider;
 #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
 pub use rustls::crypto::ring as provider;
 
-/// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
+/// HTTP/3（quiche）と WASI の `random_get`（B-248）の乱数生成に使う `SecureRandom` 実装。
 ///
 /// 非 OpenBSD/NetBSD は aws-lc-rs、OpenBSD/NetBSD は ring の `SystemRandom` を用いる
-/// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
+/// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3・wasm feature 有効時のみ使用。
 #[cfg(all(
-    feature = "http3",
+    any(feature = "http3", feature = "wasm"),
     not(any(target_os = "openbsd", target_os = "netbsd"))
 ))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
+#[cfg(all(
+    any(feature = "http3", feature = "wasm"),
+    any(target_os = "openbsd", target_os = "netbsd")
+))]
 pub use ring::rand::{SecureRandom, SystemRandom};
 
 /// HTTP/3 のサーバ接続 ID 導出（クライアントの元 DCID → 決定的な SCID、B-94）に使う HMAC。

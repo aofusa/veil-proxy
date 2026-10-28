@@ -72,7 +72,7 @@ impl NativeRequest {
         }
     }
 
-    /// この要求の `HandlerContext`。ハンドラの呼び出し中に、それを呼んでいるスレッドから使うときだけ返す（F-282）
+    // この要求の `HandlerContext`。ハンドラの呼び出し中に、それを呼んでいるスレッドから使うときだけ返す（F-282）
     pub(crate) fn handler_ctx(&self) -> Option<*mut HandlerContext> {
         let p = self.ctx.load(Ordering::Acquire);
         (p != 0 && self.ctx_owner.load(Ordering::Acquire) == thread_token())
@@ -892,7 +892,7 @@ pub fn spool_threshold() -> usize {
     veil::api::multipart::spool_threshold()
 }
 
-/// スレッドを見分ける値（スレッドローカルの番地。F-282）
+// スレッドを見分ける値（スレッドローカルの番地。F-282）
 pub(crate) fn thread_token() -> usize {
     thread_local! {
         static TOKEN: u8 = const { 0 };

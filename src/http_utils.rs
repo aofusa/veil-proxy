@@ -1489,8 +1489,8 @@ impl ChunkedDecoder {
         Self::new(0)
     }
 
-    /// 転送が完了したかどうかを確認（HTTP/3 の上流の経路だけが使う）
-    #[cfg(any(feature = "http3", test))]
+    /// 転送が完了したかどうかを確認（HTTP/3 の上流の経路と chunked_span_tests だけが使う）
+    #[cfg(any(feature = "http3", all(test, feature = "http2")))]
     #[inline]
     pub(crate) fn is_complete(&self) -> bool {
         self.state == ChunkedState::Complete

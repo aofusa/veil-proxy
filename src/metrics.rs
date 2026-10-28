@@ -53,8 +53,8 @@ use once_cell::sync::Lazy;
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 
 // ====================
@@ -881,9 +881,9 @@ pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: b
 }
 
 // B-235: 解析できない HTTP/3 のデータグラム（送信元を偽装したゴミを含む）。1 通ごとに warn! を出す代わりに数える。
-#[cfg(feature = "metrics")]
-static HTTP3_INVALID_PACKETS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
+#[cfg(all(feature = "metrics", feature = "http3"))]
+static HTTP3_INVALID_PACKETS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let counter = prometheus::IntCounter::with_opts(
         Opts::new(
             "http3_invalid_packets_total",
             "Total number of UDP datagrams on the HTTP/3 port that are not valid QUIC packets",
