@@ -29,7 +29,7 @@
 - **Header Manipulation**: Add/remove request/response headers (X-Real-IP, HSTS, etc.)
 - **Redirect**: 301/302/307/308 HTTP redirects (with path preservation option)
 - **SNI Configuration**: Specify SNI name when connecting to HTTPS backends via IP (virtual host support)
-- **Per-route traffic control (F-219)**: fixed responses (`type = "Respond"`), weighted splits across upstreams (canary), fault injection (abort) and CORS preflight answers (`[route.traffic]`, see [Routing](routing.md))
+- **Per-route traffic control (F-219)**: fixed responses (`type = "Respond"`), weighted splits across upstreams (canary), fault injection (abort) and CORS for preflights and actual responses (`[route.traffic]`, see [Routing](routing.md))
 - **Upstream mTLS (F-217)**: client certificate, trust anchors and expected SANs (e.g. SPIFFE IDs) per upstream (see [TLS](tls.md))
 
 ### HTTP Processing
@@ -81,7 +81,7 @@
 - **Client certificates (F-217 / F-220)**: `[tls] client_auth` / `client_ca`, and `client_allowed_sans` to accept only listed identities (see [TLS](tls.md))
 - **JWT (F-220)**: `[route.jwt]` verifies tokens (RS/PS/ES, `iss`, `aud`, `exp`) and claim conditions; 401 / 403 otherwise (requires `jwt`, included in `full*`; see [Security](security.md))
 - **Privilege Dropping**: Drop to unprivileged user after root startup
-- **seccomp Filter**: BPF-based system call restriction with argument-level PROT_EXEC validation for mmap/mprotect (optional)
+- **seccomp Filter**: BPF-based system call restriction with argument checks (no PROT_EXEC for mmap/mprotect, socket families, ioctl requests, prctl options, no namespaces for clone) (optional)
 - **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support

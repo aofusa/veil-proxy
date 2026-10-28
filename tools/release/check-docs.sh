@@ -2,7 +2,7 @@
 # F-241: 利用者が読む API の文書が英語だけで、チケット番号（F-123・B-45 など）を含まないことを確かめる。
 #
 #   tools/release/check-docs.sh            # Rust（docs.rs と同じ構成の rustdoc の HTML）+ Python のソース
-#   tools/release/check-docs.sh --python   # Python のソースだけ（README・docstring・PyO3 の doc・.pyi）
+#   tools/release/check-docs.sh --python   # Python のソースだけ（veil-api と veil-api-kit の README・docstring・PyO3 の doc・.pyi）
 #   tools/release/check-docs.sh --wheel    # 入れた veil-api の help() に出る __doc__（wheel の試験の後に。PYTHON で python を選ぶ）
 #
 # Rust は `cargo +nightly doc`（docs.rs と同じ --cfg docsrs）で作った target/doc の HTML の本文と検索の索引を見る。
@@ -29,7 +29,10 @@ def chk(where, text):
 py = root / "crates/veil-python"
 for n, line in enumerate((py / "README.md").read_text(encoding="utf-8").splitlines(), 1):
     chk(f"crates/veil-python/README.md:{n}", line)
-for f in sorted((py / "python/veil").glob("*.py*")):
+kit = root / "crates/veil-python-kit"
+for n, line in enumerate((kit / "README.md").read_text(encoding="utf-8").splitlines(), 1):
+    chk(f"crates/veil-python-kit/README.md:{n}", line)
+for f in sorted((py / "python/veil").glob("*.py*")) + sorted((kit / "src/veil_kit").glob("*.py")):
     tree = ast.parse(f.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -58,7 +61,7 @@ CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿＀-￯]")
 TICKET = re.compile(r"(?<![A-Za-z0-9_])[FB]-[0-9]+(?![0-9])")
 TAG = re.compile(r"<script\b.*?</script>|<style\b.*?</style>|<[^>]+>", re.S)
 bad = []
-crates = ["veil", "veil_macros", "veil_build"]
+crates = ["veil", "veil_macros", "veil_build", "veil_kit"]
 files = []
 for c in crates:
     if not (doc / c).is_dir():
@@ -127,12 +130,13 @@ fi
 
 check_python_sources || fail=1
 if [ "$mode" != "--python" ]; then
-    rm -rf target/doc/veil target/doc/veil_macros target/doc/veil_build
+    rm -rf target/doc/veil target/doc/veil_macros target/doc/veil_build target/doc/veil_kit
     if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
-        RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --no-default-features --features full,api \
-            -p veil-proxy -p veil-proxy-macros -p veil-proxy-build
+        RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --no-default-features --features full,api,veil-proxy-kit/full \
+            -p veil-proxy -p veil-proxy-macros -p veil-proxy-build -p veil-proxy-kit
     else
-        cargo doc --no-deps --no-default-features --features full,api -p veil-proxy -p veil-proxy-macros -p veil-proxy-build
+        cargo doc --no-deps --no-default-features --features full,api,veil-proxy-kit/full \
+            -p veil-proxy -p veil-proxy-macros -p veil-proxy-build -p veil-proxy-kit
     fi
     check_html || fail=1
 fi

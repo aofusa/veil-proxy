@@ -27,6 +27,8 @@ pub mod app;
 // F-210: C・Python のストリーミング・gRPC・L4 が使う。
 /// Bounded queues between the workers and the handler pool.
 pub mod bridge;
+// F-267
+pub mod client;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod extract;
@@ -39,9 +41,18 @@ pub mod response;
 pub(crate) mod routes;
 pub mod schema;
 pub mod stream;
+// F-261
+pub mod upgrade;
+// F-262
+pub mod ws;
+// F-266
+pub(crate) mod compress;
+pub mod multipart;
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
+#[cfg(feature = "openapi")]
+mod swagger_ui;
 
 #[cfg(feature = "tower-compat")]
 pub mod tower;
@@ -54,27 +65,31 @@ pub mod l4;
 
 pub use app::{
     block_on, serve, serve_blocking, serve_with_router, settings, shutdown, state, ApiSettings,
-    App, Error, Router,
+    App, Error, Plugin, Router, ServeOptions, WorkerInfo,
 };
-pub use config::{Config, ConfigBuilder, ConfigError};
-pub use extract::{Body, Form, FromRequest, Headers, Json, Query, State};
-pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta};
-pub use request::{HttpVersion, Request};
-pub use response::{ApiError, Html, IntoResponse, Response};
+pub use config::{Config, ConfigBuilder, ConfigError, Listener};
+pub use extract::{Body, Form, FromRequest, FromRequestAsync, Headers, Json, Query, State};
+pub use handler::{HandlerEntry, HandlerFn, HandlerFuture, OperationMeta, WebSocketMeta};
+pub use multipart::{Multipart, MultipartForm, UploadFile};
+pub use request::{Extensions, HttpVersion, Request};
+pub use response::{AfterSend, ApiError, Html, IntoResponse, Response};
 pub use schema::{ApiSchema, Definitions, FieldError, Validate, ValidationErrors};
 pub use stream::{BodyChunk, BodyStream, RequestBodyStream};
+pub use upgrade::{ShutdownSignal, Upgraded};
 
 /// Re-exports of the most commonly used types (`use veil::prelude::*;`).
 pub mod prelude {
     pub use super::app::{serve, serve_blocking, serve_with_router, shutdown, App, Router};
-    pub use super::config::{Config, ConfigBuilder};
+    pub use super::config::{Config, ConfigBuilder, Listener};
     pub use super::extract::{Body, Form, Headers, Json, Query, State};
     #[cfg(feature = "l4-handler")]
     pub use super::l4::{L4Connection, L4Datagram, L4Error};
+    pub use super::multipart::{Multipart, MultipartForm, UploadFile};
     pub use super::request::Request;
     pub use super::response::{ApiError, Html, IntoResponse, Response};
     pub use super::schema::{ApiSchema, Validate};
     pub use super::stream::{BodyChunk, RequestBodyStream};
+    pub use super::upgrade::Upgraded;
     #[cfg(feature = "macro")]
     pub use veil_macros::Schema;
 }
@@ -92,9 +107,14 @@ pub(crate) fn is_builtin_enabled(entry: &HandlerEntry, settings: &app::ApiSettin
 pub mod __private {
     pub use super::extract::{
         form_body, json_body, path_param, query_param, query_param_opt, query_struct, FromRequest,
+        FromRequestAsync,
     };
     pub use super::handler::{
-        BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef,
+        BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef, WebSocketMeta,
+    };
+    pub use super::multipart::{
+        multipart_body_meta, multipart_form, upload_file, upload_file_opt, upload_files,
+        MultipartForm, UploadFile,
     };
     pub use super::request::Request;
     pub use super::response::{IntoResponse, Response};

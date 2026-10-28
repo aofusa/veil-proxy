@@ -302,6 +302,15 @@ main() {
 
     log "=== 全テスト完了 ==="
     log "結果: ${RESULTS_DIR}/"
+
+    # 失敗したフェーズがあれば終了コードで返す（B-217: 各フェーズは `|| log` で続行するので、集計で failed でも
+    # run.sh は 0 で終わり、CI のジョブが成功に見えていた）
+    local failed_phases
+    failed_phases=$(sed -n 's/.*"name": "\([^"]*\)".*"status": "failed".*/\1/p' "${RESULTS_DIR}/suite_summary.json" | tr '\n' ' ')
+    if [[ -n "${failed_phases// /}" ]]; then
+        log "failed phases: ${failed_phases}(see ${RESULTS_DIR}/suite_summary.json)"
+        exit 1
+    fi
 }
 
 main "$@"

@@ -397,6 +397,9 @@ impl App {
     ///
     /// Panics if a descriptor is malformed (once, at startup; the constants of generated code are expected).
     pub fn grpc_reflection(self, descriptor_sets: &[&[u8]]) -> App {
+        // F-265: OpenAPI の型にも使う
+        super::describe::record_descriptors(descriptor_sets);
+        super::describe::record_reflection();
         let mut index = Index::default();
         for set in descriptor_sets {
             if let Err(e) = index.add_set(set) {

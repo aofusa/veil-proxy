@@ -1,0 +1,30 @@
+# Recommended production settings for a veil API application (docs/guide/library-production.md).
+# The Rust (src/main.rs) and Python (app.py) examples both load this file. Keys left out keep their defaults.
+
+[server]
+listen_cleartext = "0.0.0.0:8080"    # reachable from other hosts and containers (the library default is 127.0.0.1)
+enable_secure_redirect = false       # serve plaintext here; TLS is terminated in front, or add a TLS listener
+# threads = 0                        # default: one worker per CPU the process may use (affinity and cgroup quota)
+graceful_shutdown_timeout_secs = 30  # SIGTERM: stop accepting, finish requests in flight for up to 30 s
+
+[logging]
+level = "info"
+format = "json"                      # one JSON object per line for a log collector
+
+[access_log]
+enabled = false                      # the library default writes one line per request to stdout
+
+[api]
+openapi_enabled = false              # no /openapi.json and /docs on the public listener
+compression = true                   # br / gzip for JSON and text responses of 256 bytes or more
+max_body_size = 1048576              # 1 MiB request bodies
+websocket_ping_interval_secs = 30    # keep idle WebSockets alive through proxies and NAT
+websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 minutes
+
+[prometheus]
+enabled = true
+path = "/metrics"
+allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[tls_client]
+ca = "system"                        # outgoing TLS (veil::api::client, gRPC channels) trusts the OS store

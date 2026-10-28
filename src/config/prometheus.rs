@@ -32,7 +32,7 @@ pub struct PrometheusConfig {
     pub path: String,
 
     /// メトリクスエンドポイントへのアクセスを許可するIPアドレス/CIDR
-    /// 空の場合はすべてのIPからアクセス可能
+    /// 空の場合は loopback（と UDS のリスナー）だけ（B-231。全許可は `["0.0.0.0/0", "::/0"]`）
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
@@ -69,7 +69,7 @@ pub struct AdminConfig {
     /// 認証用シークレット（空の場合は全リクエストを拒否）
     #[serde(default)]
     pub secret: String,
-    /// アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+    /// アクセスを許可するIPアドレス/CIDR（空の場合は loopback だけ。B-231）
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
@@ -77,6 +77,34 @@ pub struct AdminConfig {
     /// デシリアライズ時に自動計算される: "{path_prefix}/cache/purge"
     #[serde(skip)]
     pub cache_purge_prefix: String,
+}
+
+/// B-231: 管理 API の認証の失敗を数えるレート表のゾーン（ルートのゾーン＝`SecurityConfig` のアドレスと重ならない値）。
+#[cfg(feature = "admin")]
+const ADMIN_AUTH_ZONE: usize = usize::MAX;
+/// B-231: IP ごとの管理 API の認証の失敗の上限（1 分あたり）。
+#[cfg(feature = "admin")]
+pub const ADMIN_AUTH_FAILURES_PER_MINUTE: u64 = 10;
+
+/// 長さが違っても途中で抜けずに比べる（時間は `expected` の長さだけで決まる）。
+#[cfg(feature = "admin")]
+fn constant_time_eq(given: &[u8], expected: &[u8]) -> bool {
+    let mut diff = (given.len() != expected.len()) as u8;
+    for (i, e) in expected.iter().enumerate() {
+        diff |= given.get(i).copied().unwrap_or(0) ^ e;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// loopback のアドレスか（IPv4 射影の IPv6 も含む。UDS のリスナーの接続は 127.0.0.1 として届く）。
+pub(super) fn is_loopback_ip(client_ip: &str) -> bool {
+    match client_ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(feature = "admin")]
@@ -170,19 +198,38 @@ impl AdminConfig {
             Some(h) => {
                 let h = h.trim();
                 let token = h.strip_prefix("Bearer ").unwrap_or(h);
-                // 定数時間比較ではないが、管理 API は信頼ネットワーク前提
-                token == self.secret
+                // B-231: 定数時間で比べる（以前の `==` は一致した先頭の長さでかかる時間が変わり、1 バイトずつ当てられた）
+                constant_time_eq(token.as_bytes(), self.secret.as_bytes())
             }
             None => false,
         }
     }
 
+    /// `check_auth` に、IP ごとの失敗の回数の上限（1 分あたり `ADMIN_AUTH_FAILURES_PER_MINUTE`）を加えたもの。
+    /// 上限を超えた IP は正しい秘密でも拒否する（総当たりを遅くする。B-231）。
+    pub fn check_auth_from(&self, client_ip: &str, auth_header: Option<&str>) -> bool {
+        if super::runtime_state::rate_peek(ADMIN_AUTH_ZONE, client_ip)
+            >= ADMIN_AUTH_FAILURES_PER_MINUTE
+        {
+            return false;
+        }
+        if self.check_auth(auth_header) {
+            return true;
+        }
+        super::runtime_state::check_rate_limit(
+            ADMIN_AUTH_ZONE,
+            client_ip,
+            ADMIN_AUTH_FAILURES_PER_MINUTE,
+        );
+        false
+    }
+
     /// クライアント IP が管理 API エンドポイントへのアクセスを許可されているか確認する。
     ///
-    /// `allowed_ips` が空の場合はすべての IP を許可する。
+    /// `allowed_ips` が空の場合は loopback（UDS のリスナーの接続を含む）だけを許可する（B-231。以前は全 IP）。
     pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
         if self.allowed_ips.is_empty() {
-            return true;
+            return is_loopback_ip(client_ip);
         }
         let client_addr: std::net::IpAddr = match client_ip.parse() {
             Ok(addr) => addr,
@@ -223,9 +270,9 @@ impl Default for PrometheusConfig {
 impl PrometheusConfig {
     /// IPアドレスがメトリクスエンドポイントへのアクセスを許可されているか確認
     pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
-        // allowed_ipsが空の場合はすべてのIPを許可
+        // B-231: allowed_ips が空なら loopback（UDS のリスナーの接続を含む）だけ。以前は全 IP を許していた
         if self.allowed_ips.is_empty() {
-            return true;
+            return is_loopback_ip(client_ip);
         }
 
         // クライアントIPをパース

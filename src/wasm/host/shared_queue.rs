@@ -201,54 +201,49 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
     // proxy_dequeue_shared_queue
     // Dequeues data from a shared queue
-    linker.func_wrap(
+    // B-247: Proxy-Wasm ABI どおり、ゲストのアロケータ（proxy_on_memory_allocate、無ければ malloc）で
+    // 確保した領域にペイロードを書き、その番地と長さを return_data_ptr / return_data_size に書く
+    // （以前は return_data_ptr の番地へペイロードそのものを書き、SDK が不正なポインタから Vec を作っていた）。
+    // ゲストのアロケータへ再入するため async ホスト関数（B-20）
+    linker.func_wrap_async(
         "env",
         "proxy_dequeue_shared_queue",
         |mut caller: Caller<'_, HostState>,
-         queue_id: i32,
-         return_data_ptr: i32,
-         return_data_size_ptr: i32|
-         -> i32 {
-            // Dequeue
-            let data = match SHARED_QUEUES.write() {
-                Ok(mut registry) => registry.dequeue(queue_id as u32),
-                Err(_) => return PROXY_RESULT_INTERNAL_FAILURE,
-            };
-
-            match data {
-                Some(bytes) => {
-                    // Allocate memory in WASM and write data
-                    // For simplicity, we expect the caller to have preallocated buffer
-                    // Write size first
-                    if return_data_size_ptr > 0
-                        && !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32)
-                    {
-                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                    }
-
-                    // Write data
-                    if return_data_ptr > 0
-                        && !bytes.is_empty()
-                        && !write_bytes(&mut caller, return_data_ptr, &bytes)
-                    {
-                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                    }
-
-                    ftlog::debug!(
-                        "WASM: proxy_dequeue_shared_queue id={} size={}",
-                        queue_id,
-                        bytes.len()
-                    );
-                    PROXY_RESULT_OK
-                }
-                None => {
+         (queue_id, return_data_ptr, return_data_size_ptr): (i32, i32, i32)| {
+            Box::new(async move {
+                let data = match SHARED_QUEUES.write() {
+                    Ok(mut registry) => registry.dequeue(queue_id as u32),
+                    Err(_) => return PROXY_RESULT_INTERNAL_FAILURE,
+                };
+                let Some(bytes) = data else {
                     // Queue empty or not found
-                    if return_data_size_ptr > 0 {
-                        let _ = write_u32(&mut caller, return_data_size_ptr, 0);
+                    return PROXY_RESULT_EMPTY;
+                };
+
+                let ptr = if bytes.is_empty() {
+                    0
+                } else {
+                    match super::shared_data::allocate_wasm_memory(&mut caller, bytes.len()).await {
+                        Some(p) => p,
+                        None => return PROXY_RESULT_INTERNAL_FAILURE,
                     }
-                    PROXY_RESULT_EMPTY
+                };
+                if !bytes.is_empty() && !write_bytes(&mut caller, ptr, &bytes) {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
-            }
+                if !write_u32(&mut caller, return_data_ptr, ptr as u32)
+                    || !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32)
+                {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
+
+                ftlog::debug!(
+                    "WASM: proxy_dequeue_shared_queue id={} size={}",
+                    queue_id,
+                    bytes.len()
+                );
+                PROXY_RESULT_OK
+            })
         },
     )?;
 
@@ -260,8 +255,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<String> {
     let memory = caller.get_export("memory")?.into_memory()?;
     let data = memory.data(caller);
-    let start = ptr as usize;
-    let end = start + size as usize;
+    let start = ptr as u32 as usize;
+    let end = start + size as u32 as usize;
     if end > data.len() {
         return None;
     }
@@ -271,8 +266,8 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Optio
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<Vec<u8>> {
     let memory = caller.get_export("memory")?.into_memory()?;
     let data = memory.data(caller);
-    let start = ptr as usize;
-    let end = start + size as usize;
+    let start = ptr as u32 as usize;
+    let end = start + size as u32 as usize;
     if end > data.len() {
         return None;
     }
@@ -282,7 +277,7 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option
 fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
     if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
         let data = memory.data_mut(caller);
-        let start = ptr as usize;
+        let start = ptr as u32 as usize;
         if start + 4 <= data.len() {
             data[start..start + 4].copy_from_slice(&value.to_le_bytes());
             return true;
@@ -294,7 +289,7 @@ fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
 fn write_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> bool {
     if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
         let data = memory.data_mut(caller);
-        let start = ptr as usize;
+        let start = ptr as u32 as usize;
         if start + bytes.len() <= data.len() {
             data[start..start + bytes.len()].copy_from_slice(bytes);
             return true;

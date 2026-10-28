@@ -50,7 +50,7 @@ Invalidate cached responses without restarting the proxy.
 enabled = true
 path_prefix = "/__admin"    # Admin endpoint prefix
 secret = "changeme"         # Bearer token for authentication
-# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IP allowlist (empty = all IPs allowed)
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IP allowlist (empty = loopback only)
 ```
 
 ### Purge Operations
@@ -97,7 +97,11 @@ curl -X POST "https://proxy.example.com/__admin/cache/purge?all=true" \
 | Admin disabled | `404 Not Found` |
 | Success | `200 OK` with `{"purged": N}` |
 
-IP filtering is checked before authentication. When `allowed_ips` is empty (default), all IPs are allowed.
+IP filtering is checked before authentication. When `allowed_ips` is empty (default), only loopback clients (and
+Unix-socket listeners) are allowed; before v0.10.0 every IP was. Write `["0.0.0.0/0", "::/0"]` to allow everyone.
+
+The secret is compared in constant time. After 10 failed authentications from one IP within a minute, that IP gets
+`401 Unauthorized` even with the right secret until the rate drops again.
 
 | Format | Example |
 |--------|---------|

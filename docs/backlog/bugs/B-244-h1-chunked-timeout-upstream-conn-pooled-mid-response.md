@@ -1,6 +1,6 @@
 # B-244: HTTP/1.1 の上流が chunked の応答を途中で止めると、応答の途中の上流接続がプールに戻り、別のクライアントの要求に前の応答の続きが混ざる
 
-**状態: 未修正（2026-10-27 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -47,6 +47,13 @@ HTTP/1.1 のリスナー（平文・rustls とも）から HTTP/1.1 の上流へ
 - E2E: 上流が chunked の途中で `READ_TIMEOUT` を超えて止まったとき、(a) クライアント A の接続が閉じられ、(b) 続く B の要求が **新しい** 上流接続で届く
   （上流の接続 ID を応答ヘッダで返す試験用サーバ）。平文・rustls・kTLS・HTTP/2 上流・HTTP/3 で同じ結果。
 - `tools/container_security` の `smuggling` フェーズに上流側のケースを足す（F-279）。
+
+## 修正（v0.10.0）
+
+- 上流の HTTP/1.1 応答の本文の区切りを `ParsedResponse::body(is_head)`（`http_utils::ResponseBody`: None / Length / Chunked / UntilClose）で一度だけ決め、全経路で同じ転送ヘルパー（`proxy/transfer.rs` の `response_body_start`・`transfer_response_body_rest`・`collect_response_body(_raw)`）を使う。結果（`ResponseBodyOutcome`）は区切りどおりに終わったか・終端の後ろにバイトがあったかを返し、**区切りどおりに読み切って余りの無い接続だけ** をプールへ戻す。途中で止まった応答はクライアント接続を閉じる（HTTP/2・HTTP/3 はストリームのリセット）。
+- 対象: 平文・rustls（`compress.rs`・`https.rs`）、kTLS（`splice.rs`。タイムアウトで keep-alive を落としていたのに加え、終端の後ろのバイトを送っていた）、HTTP/2 で受けた要求（`h2.rs` の `h2_relay_backend_response`。長さ不明の応答で最初の読み込みしか送らず、途中で止まった本文も送っていた → 502）、`buffering = full`（`buffered.rs`。途中の本文を完全な本文として送り・キャッシュしていた → 502、上限超過で切り詰めた本文を元の Content-Length で送っていた → 507）、キャッシュのバックグラウンド更新（`server.rs`。途中の本文・chunked の最初の読み込みだけを保存していた → 読み切った Length・Chunked だけを保存）。
+- 同時に直したもの: 圧縮する chunked 応答がチャンクの枠ごと圧縮されていた、途中の本文が完全な応答としてキャッシュ・圧縮されていた、終端の後ろのバイトがクライアントへ送られていた。
+- 試験: E2E `test_b244_stalled_chunked_upstream_is_not_pooled`（tests/test_backends の framing サーバーが 35 秒止めた接続に別の要求が届いたかを返す。HTTP/1.1・HTTP/2・`buffering = full` を同時に止め、新しいクライアントから 16 本要求する）。修正前のコードで失敗することを確認。kTLS の経路は E2E の既定で kTLS が無効なので同じヘルパーの単体試験と同じ判定で担保。
 
 ## 関連
 

@@ -44,7 +44,7 @@ struct OffloadPool {
 impl OffloadPool {
     fn submit(&self, job: Job) {
         {
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.push_back(job);
         }
         self.cv.notify_one();
@@ -64,14 +64,16 @@ impl OffloadPool {
                 .name(name.to_string())
                 .spawn(move || loop {
                     let job = {
-                        let mut q = pool.queue.lock().unwrap();
+                        let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
                         while q.is_empty() {
-                            q = pool.cv.wait(q).unwrap();
+                            q = pool.cv.wait(q).unwrap_or_else(|e| e.into_inner());
                         }
                         q.pop_front()
                     };
                     if let Some(job) = job {
-                        job();
+                        // B-226: 閉包の panic でプールのスレッドを失わない（`offload` の閉包は自分で捕まえるが、
+                        // 他の投入口の閉包にも効くようにここでも捕まえる）
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                     }
                 })
                 .unwrap_or_else(|e| panic!("failed to spawn {} thread: {}", name, e));
@@ -335,14 +337,18 @@ where
         None => return f(),
     };
 
-    let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
+    // B-226: 閉包の panic はプールのスレッドで捕まえ、結果として起点のタスクへ返して再送出する。捕まえないと
+    // スレッドが消え（全滅すると以後の静的配信・DNS の解決がすべて止まる）、`done` が立たずに要求も永久に待っていた。
+    // 起点のタスクは接続ごとの CatchUnwindFuture の中なので、その要求だけが失敗する。
+    type Slot<R> = Mutex<Option<std::thread::Result<R>>>;
+    let slot: Arc<Slot<R>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let slot_w = Arc::clone(&slot);
     let done_w = Arc::clone(&done);
 
     POOL.submit(Box::new(move || {
-        let result = f();
-        *slot_w.lock().unwrap() = Some(result);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        *slot_w.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         // 結果格納を Release で公開してから通知 fd を叩く（起点スレッドは Acquire で読む）。
         done_w.store(true, Ordering::Release);
         // SAFETY: write_fd は起点スレッドが `offload()` 呼び出しの間ずっと保持し続ける
@@ -355,10 +361,13 @@ where
     wait_until_done(read_fd, &done).await;
     let result = slot
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .take()
         .expect("offload result must be present once done");
-    result
+    match result {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// 完了フラグ `done` が立つまで、起点スレッドの通知 fd（`read_fd`）で待つ。
@@ -669,4 +678,28 @@ where
         }));
     })
     .await
+}
+
+#[cfg(test)]
+mod b226_tests {
+    /// B-226: 閉包が panic してもプールのスレッドは残り、要求はその panic で終わる（永久に待たない）。
+    /// ワーカーの本数（2〜8）より多く panic させても、次の `offload` が結果を返す。
+    #[test]
+    fn panicking_job_does_not_kill_pool_or_hang() {
+        #[cfg(all(veil_rt_uring, target_os = "linux"))]
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(async {
+            for _ in 0..16 {
+                let r = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    super::offload(|| -> u32 { panic!("offload job panicked on purpose") }),
+                ))
+                .await;
+                assert!(r.is_err(), "the panic must reach the caller");
+            }
+            assert_eq!(super::offload(|| 7u32).await, 7);
+        });
+    }
 }

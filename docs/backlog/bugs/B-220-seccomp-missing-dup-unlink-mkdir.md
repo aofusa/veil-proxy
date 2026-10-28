@@ -1,6 +1,6 @@
 # B-220: seccomp の許可リストに `dup`・`unlink(at)`・`mkdir(at)` が無く、UDS のリスナーとディスクのスピルオーバーが seccomp と両立しない
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー SB-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -37,6 +37,15 @@
 - E2E: `enable_seccomp = true, seccomp_mode = "strict"` で、UDS のリスナー・ディスクのスピルオーバー（上限を小さくして確実にスピルさせる）・
   静的配信・Wasm を 1 本ずつ通し、プロセスが生きていること（F-279 の seccomp 有効の E2E）。
 - 終了時に UDS のソケットファイルが消えていること。
+
+## 修正（v0.10.0）
+
+- 4 つの許可リスト（x86_64・aarch64 × io_uring・reactor）に `dup`・`dup3`・`unlink(at)`・`mkdir(at)`・`rename(at)`・`renameat2`・
+  `chmod`・`fchmod(at)` を足した（aarch64 は `*at` 系だけ）。`rename`・`chmod` は B-219 で全スレッドに掛かる ACME の証明書の保存のため。
+  `test_allowed_syscalls_match_libc_numbers` で番号を `libc::SYS_*` と照合する。
+- コンテナの `docker/assets/security/seccomp.json`・`seccomp-epoll.json` にも同じものを足した（`dup` 系はあった）。
+- `docs/guide/security.md`（英・日）の必要な syscall の表に足した。
+- E2E: `VEIL_E2E_SECCOMP=strict` の全 E2E（UDS のリスナー・ディスクのスピルオーバーを含む）。
 
 ## 関連
 

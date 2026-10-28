@@ -1,28 +1,30 @@
-# docs/perf — パフォーマンス計測サマリ（v0.9.0）
+# docs/perf — パフォーマンス計測サマリ（v0.10.0）
 
 Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスループットを、nginx を基準に計測した
 **最新の結果だけ**をまとめる（過去の計測は git 履歴で辿れる）。
 
 | ファイル | 内容 |
 |---|---|
-| [`linux_suite_ab_raw.tsv`](linux_suite_ab_raw.tsv) | Linux x86_64 のフルスイート（`suite_ab.sh`、v0.8.2 と交互、nginx の同じ仕事の相手を含む）の生データ |
-| [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.8.2 との比が 0.95 を下回った 2 構成を 5 反復で測り直した生データ |
+| [`linux_suite_ab_raw.tsv`](linux_suite_ab_raw.tsv) | Linux x86_64 のフルスイート（`suite_ab.sh`、v0.9.2 と交互、nginx の同じ仕事の相手を含む）の生データ |
+| [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.9.2 との比が 0.95 を下回った 7 構成を 5 反復で測り直した生データ |
+| [`linux_final_ab_raw.tsv`](linux_final_ab_raw.tsv) | セキュリティ修正の後の最終候補と v0.9.2 の交互 A/B（9 構成）の生データ |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B）の生データ |
 | [`freebsd_cpu_per_req.tsv`](freebsd_cpu_per_req.tsv) | FreeBSD のサーバの CPU 時間 / 要求（`cpu_per_req.sh`）の生データ |
-| [`linux_v084_ab_raw.tsv`](linux_v084_ab_raw.tsv) | v0.8.4 の変更の退行確認（Prometheus を有効にした 6 構成と静的配信の 4 構成。v0.8.3 の main と交互）の生データ |
-| [`linux_v090_ab_raw.tsv`](linux_v090_ab_raw.tsv) | v0.9.0 の変更の退行確認（静的配信の 2 構成・キャッシュ・プロキシ。v0.8.4 と交互）の生データ |
+| [`freebsd_v092_ab_raw.tsv`](freebsd_v092_ab_raw.tsv) | FreeBSD の v0.9.2 と v0.10.0 の候補の交互 A/B（rps・CPU/要求）の生データ |
 | [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.8.3 の全件と、v0.8.4 で回し直したもの） |
 
 ---
 
-## Linux x86_64（2026-10-22、Docker コンテナ間）
+## Linux x86_64（2026-10-27、Docker コンテナ間）
 
 - 比較:
-  - v0.8.3 の main（`637989f4` 相当。v0.8.3 のタグ `ff15ea56` + HTTP/2 の END_STREAM の改善 `403f79bf` + 試験の修正）、イメージは `veil:v083-ab`
-  - v0.8.2（`d8f9d6c0`、`veil:v082-ab`）
+  - v0.10.0 の候補（`feat/v0100` の `218f8415`。その後の変更はハンドラ（`handler` feature）の経路と 413 の後の読み捨てだけで、
+    `full` のデータプレーンの経路は同じ）、イメージは `veil:v0100-new`
+  - v0.9.2（タグ、`veil:v092-base`）
   - `nginx:alpine`
-- イメージ: どちらも `docker/Dockerfile.glibc`（`full`、io_uring、`--profile dist`）
-- 実行: `BASE=v082-ab NEW=v083-ab bash tools/perf/suite_ab.sh`（69 構成 × 3 反復、構成ごとに順を入れ替えて交互、3.7 時間）
+- イメージ: どちらも手元の `cargo build --profile dist --features full`（io_uring）を、同じ実行イメージ
+  （`cgr.dev/chainguard/glibc-dynamic`）に `/veil` だけ差し替えて入れた
+- 実行: `BASE=v092-base NEW=v0100-new bash tools/perf/suite_ab.sh`（69 構成 × 3 反復、構成ごとに順を入れ替えて交互、3.8 時間）
 - **全 834 計測で Non-2xx = 0、NA 行ゼロ**
 
 ### nginx との比較（同じ仕事の相手、Req/s 中央値）
@@ -37,99 +39,83 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 
 | 構成 | プロトコル | nginx | veil | 対 nginx |
 |---|---|---|---|---|
-| `h2_1_ktls_0_lb_kernel_ofc_1`（54KB 静的） | HTTP/1.1 | 6,284（`base`） | 9,118 | **1.45×** |
-| 同上 | HTTP/2 | 5,163（`base`） | 9,006 | **1.74×** |
-| `h2_1_feat_proxy`（54KB 中継） | HTTP/1.1 | 4,521（`base_proxy`） | 6,262 | **1.39×** |
-| 同上 | HTTP/2 | 3,418（`base_proxy`） | 6,570 | **1.92×** |
-| `h2_1_feat_compression`（毎回圧縮） | HTTP/1.1 | 2,199（`base_compression`） | 8,380 | **3.81×** |
-| 同上 | HTTP/2 | 2,072（`base_compression`） | 3,926 | **1.90×** |
-| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/1.1 | 1,974（`base_proxy_compression`） | 2,444 | **1.24×** |
-| 同上 | HTTP/2 | 1,792（`base_proxy_compression`） | 3,336 | **1.86×** |
-| `h2_1_feat_compression_cached` | HTTP/2 | 5,163（`base`） | 24,816 | **4.81×** |
-| `h3_file_metrics`（54KB 静的） | HTTP/3 | 1,982（`base`） | 2,498 | **1.26×** |
-| `h3_proxy`（54KB 中継） | HTTP/3 | 1,830（`base_proxy`） | 2,184 | **1.19×** |
-| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 6,284（`base`） | 12,814 | **2.04×** |
-| `h2c_file`（54KB 静的） | h2c | 8,014（`h2c_file`） | 27,717 | **3.46×** |
-| `h2c_proxy`（54KB 中継） | h2c | 6,302（`h2c_proxy`） | 10,370 | **1.65×** |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（54KB 静的） | HTTP/1.1 | 6,541（`base`） | 9,401 | **1.44×** |
+| 同上 | HTTP/2 | 5,826（`base`） | 9,528 | **1.64×** |
+| `h2_1_feat_proxy`（54KB 中継） | HTTP/1.1 | 4,930（`base_proxy`） | 6,629 | **1.34×** |
+| 同上 | HTTP/2 | 3,760（`base_proxy`） | 6,777 | **1.80×** |
+| `h2_1_feat_compression`（毎回圧縮） | HTTP/1.1 | 2,250（`base_compression`） | 8,645 | **3.84×** |
+| 同上 | HTTP/2 | 2,131（`base_compression`） | 4,450 | **2.09×** |
+| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/1.1 | 2,058（`base_proxy_compression`） | 3,002 | **1.46×** |
+| 同上 | HTTP/2 | 1,875（`base_proxy_compression`） | 3,729 | **1.99×** |
+| `h2_1_feat_compression_cached` | HTTP/2 | 5,826（`base`） | 24,200 | **4.15×** |
+| `h3_file_metrics`（54KB 静的） | HTTP/3 | 1,963（`base`） | 2,521 | **1.28×** |
+| `h3_proxy`（54KB 中継） | HTTP/3 | 1,671（`base_proxy`） | 2,241 | **1.34×** |
+| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 6,541（`base`） | 12,948 | **1.98×** |
+| `h2c_file`（54KB 静的） | h2c | 9,228（`h2c_file`） | 30,227 | **3.28×** |
+| `h2c_proxy`（54KB 中継） | h2c | 6,162（`h2c_proxy`） | 11,063 | **1.80×** |
 
 | プロトコル | 構成数 | 対 nginx の中央値 | 最小 | nginx 未満 |
 |---|---|---|---|---|
-| HTTP/1.1 | 54 | **1.34×** | 1.05 | 0 |
-| HTTP/2 | 45 | **1.75×** | 1.30 | 0 |
-| HTTP/3 | 19 | **1.23×** | 1.15 | 0 |
-| h2c | 2 | **2.55×** | 1.65 | 0 |
+| HTTP/1.1 | 54 | **1.32×** | 1.03（測り直し後） | 0 |
+| HTTP/2 | 45 | **1.64×** | 1.18 | 0 |
+| HTTP/3 | 19 | **1.32×** | 1.28 | 0 |
+| h2c | 2 | **2.54×** | 1.80 | 0 |
 
 - 全 120 構成で nginx 以上。
-- 1.0 付近まで下がるのは、kTLS を有効にした構成（`*_ktls_1_*`）の HTTP/1.1 だけ（最小 1.05×）。コンテナ（veth）では kTLS が不利で、
-  nginx 側は kTLS 無しの `base`。
-- gRPC（`grpc_h2_*` 約 5,000 req/s、`grpc_h3_*` 約 21,000 req/s）と WebSocket は、nginx の相手を置いていない。
+- 1.0 付近まで下がるのは、kTLS を有効にした構成（`*_ktls_1_*`）の HTTP/1.1 だけ。コンテナ（veth）では kTLS が不利で、
+  nginx 側は kTLS 無しの `base`。フルスイートでは `h2_0_ktls_1_lb_kernel_ofc_0` が 0.98× だったが、5 反復で測り直すと
+  6,733（1.03×。v0.9.2 は 6,745）。
+- gRPC（`grpc_h2_*` 約 5,000 req/s、`grpc_h3_*` 約 22,000 req/s）と WebSocket（`h2_1_feat_websocket` 約 3,100 req/s）は、
+  nginx の相手を置いていない。
 
-### v0.8.2 との退行確認（交互 A/B）
+### v0.9.2 との退行確認（交互 A/B）
 
 | プロトコル | 組数 | 比の中央値 | 最小 | 最大 |
 |---|---|---|---|---|
-| HTTP/1.1 | 54 | 0.998 | 0.966 | 1.026 |
-| HTTP/2 | 45 | 0.999 | 0.944 | 1.046 |
-| HTTP/3 | 19 | 0.994 | 0.966 | 1.035 |
-| h2c | 2 | 1.003 | 0.998 | 1.008 |
-| gRPC | 6 | 0.994 | 0.979 | 1.027 |
-| gRPC over HTTP/3 | 6 | 0.992 | 0.938 | 1.014 |
-| WebSocket | 1 | 1.004 | — | — |
-| **全体** | 133 | **0.998** | — | — |
+| HTTP/1.1 | 54 | 1.000 | 0.947 | 1.013 |
+| HTTP/2 | 45 | 0.988 | 0.915 | 1.053 |
+| HTTP/3 | 19 | 0.998 | 0.963 | 1.040 |
+| h2c | 2 | 0.998 | 0.998 | 0.999 |
+| gRPC | 6 | 0.997 | 0.937 | 1.013 |
+| gRPC over HTTP/3 | 6 | 1.024 | 0.993 | 1.047 |
+| WebSocket | 1 | 0.912 | — | — |
+| **全体** | 133 | **0.996** | — | — |
 
-0.95 を下回った 2 組は、その構成だけ 5 反復で測り直した（`linux_remeasure_raw.tsv`）。
+0.95 を下回った 7 組は、その構成だけ 5 反復で測り直した（`linux_remeasure_raw.tsv`、13 組）。
 
-- `grpc_h3_wasm`: 1.016
-- `h2_1_feat_compression`: HTTP/1.1 0.994、HTTP/2 0.999
-
-**退行なし。** v0.8.3 の変更による性能の影響は、計測の揺れの範囲だった。
-
-- quiche の FFI を aws-lc-sys のバインディング経由にした（F-243）。`#[inline(always)]` の包みで、呼び出し先は同じ関数。HTTP/3 は 0.994。
-- ログの文の英語化（F-242）は、文字列の変更だけ。
-- HTTP/2 の END_STREAM を最後の DATA フレームに付ける改善は、Linux では揺れの範囲（HTTP/2 0.999）。
-  FreeBSD の h2c 54KB では +9%（下）。
-
-### v0.9.0 の退行確認（交互 A/B、2026-10-23）
-
-v0.9.0 の変更のうち要求の経路に入るのは 2 つ（どちらも分岐 1 つ）。
-
-- B-160: 静的配信の包含の判定で、canonical 形と一致しないときだけ生の `base_path` とも比べる
-- B-162: 本文が最初の読み込みに収まった応答をキャッシュに保存する（キャッシュの有効なルートだけ）
-
-設定ファイルの決め方（F-247）・起動の終了コード（B-161）・サンドボックスのバリア（B-163）は起動時だけ。
-
-- 比較: v0.8.4（タグ）と v0.9.0（`feat/distribution-tickets` の `13b1045b`）を、同じ手元の `cargo build --profile dist --features full`
-  でビルドし、同じ実行イメージ（v0.8.4 の `docker/Dockerfile.glibc` の段。`/veil` だけ差し替え）に入れた。
-  ルートの容量が足りず `docker build` で両方を作れなかったため（Docker のビルドのキャッシュ）
-- 実行: `NGINX=0 BASE=abbase NEW=abnew bash tools/perf/suite_ab.sh`（構成ごとに順を入れ替えて交互、3 反復）
-
-| 構成 | HTTP/1.1 | HTTP/2 |
+| 構成 | フルスイート | 測り直し |
 |---|---|---|
-| 静的配信（`h2_*_ktls_0_lb_cbpf_ofc_1`） | 0.999（2 組: 0.987・1.010） | 1.041 |
-| キャッシュ（`h2_1_feat_cache`） | 0.993 | 0.994 |
-| プロキシ（`h2_1_feat_proxy`） | 0.987 | 0.994 |
+| `grpc_h2_otel`（gRPC） | 0.937 | 1.001 |
+| `h2_0_ktls_1_lb_kernel_ofc_0`（HTTP/1.1） | 0.947 | 0.998 |
+| `h2_1_feat_buffering`（HTTP/2） | 0.928 | 1.006 |
+| `h2_1_feat_compression_cached`（HTTP/2） | 0.915 | 1.012 |
+| `h2_1_feat_websocket`（WebSocket） | 0.912 | 0.992 |
+| `h3_file_admin`（HTTP/2） | 0.934 | 1.011 |
+| `h3_file_compression_cached`（HTTP/2） | 0.940 | 1.008 |
 
-比はすべて 0.95 以上で、ばらつきの範囲（同じイメージでもラン間で数 % 振れる）。退行は無い。
+測り直しの 13 組は全体の中央値 1.001、最小 0.976（HTTP/1.1）・最大 1.012。**退行なし。** v0.10.0 の変更（複数の待ち受け・
+CORS の実際の応答・キャッシュの監視・Proxy-Wasm の再利用と協調的な yield 等）は、使わない構成では分岐だけで、計測の揺れの範囲だった。
 
-### v0.8.4 の退行確認（交互 A/B、2026-10-22）
+### 最終候補での確認（セキュリティ修正の後、2026-10-27）
 
-v0.8.4 の変更のうち性能に効き得るのは 2 つ。
+上のフルスイートの後に、セキュリティレビューの修正（B-219〜B-243。ヘッダの検査、HTTP/3 の接続数の上限、seccomp・Landlock の
+適用範囲、管理 API の認証の比較等）と B-240 が入ったので、最終候補（`d92eea6e`、`veil:v0100-final`）と v0.9.2 をホットパスの
+代表 9 構成で交互に測り直した（別のホスト: aofish の Docker Desktop、3 反復。±10% を外れた 2 構成は 7 反復）。
+全計測で Non-2xx = 0。比は v0.10.0 / v0.9.2 の Req/s の中央値。
 
-- メトリクスのラベルを有限にした（B-159）: Prometheus が有効なとき、要求ごとに host ラベルの表の読み出しとスタック上の小文字化が増える。
-- glibc イメージの土台を distroless（Debian の glibc 2.41）から Wolfi（glibc 2.42）にした（B-158）。
-
-そこで、Prometheus を有効にした 6 構成（`*_metrics`）と、Prometheus を使わない静的配信の 4 構成を、v0.8.3 の main（`d72f39bc`、
-`veil:base084`）と v0.8.4（`veil:new084`）で交互に測った（どちらも `docker/Dockerfile.glibc` の `full`、3 反復）。
-
-| 対象 | 組数 | 比の中央値 | 最小 | 最大 |
+| 構成 | HTTP/1.1 | HTTP/2 | HTTP/3 | h2c |
 |---|---|---|---|---|
-| Prometheus 有効（gRPC・gRPC over HTTP/3・HTTP/1.1・HTTP/2・HTTP/3） | 12 | 0.996 | 0.949 | 1.027 |
-| 静的配信（HTTP/1.1・HTTP/2・h2c・HTTP/3） | 7 | 1.000 | 0.953 | 1.021 |
+| `h2_0_ktls_0_lb_kernel_ofc_1`（静的） | 1.002 | — | — | — |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（静的、7 反復） | 1.025 | 1.003 | — | — |
+| `h2_1_feat_proxy`（中継） | 1.028 | 1.004 | — | — |
+| `h2_1_proxy_wasm`（中継 + Proxy-Wasm） | 0.977 | 0.965 | — | — |
+| `h2c_file` / `h2c_proxy` | — | — | — | 1.040 / 1.018 |
+| `h3_file_access_log`（静的 + アクセスログ） | 1.035 | 1.045 | 0.998 | — |
+| `h3_file_cache`（静的 + キャッシュ） | 0.985 | 1.000 | 0.941 | — |
+| `h3_proxy`（中継、7 反復） | 1.004 | 0.985 | 1.029 | — |
 
-- 0.95 を下回った 1 組（`h3_proxy_metrics` の HTTP/3、0.949）は、5 反復で測り直して 0.998（同じ構成の HTTP/1.1・HTTP/2 は 0.990）。
-- 全計測で Non-2xx = 0。
-
-**退行なし。** nginx との比較は上の v0.8.3 のフルスイートの結果のまま（v0.8.4 はフルスイートを測り直していない）。
+このホストは反復ごとの揺れが大きい（同じバイナリで ±10〜15%）。3 反復で 0.92（`h2_1_ktls_0_lb_kernel_ofc_1` の HTTP/2）・
+0.96（`h3_proxy` の HTTP/3）だった 2 構成は 7 反復で 1.003・1.029 になった。**退行なし。**
 
 ---
 
@@ -140,6 +126,38 @@ v0.8.4 の変更のうち性能に効き得るのは 2 つ。
   - サーバ律速は `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3`。
   - CPU/要求は `tools/perf/bsd/cpu_per_req.sh`。
 - **全計測でエラー 0**
+
+### v0.9.2 との退行確認（v0.10.0、2026-10-27）
+
+同じ VM で v0.9.2 と v0.10.0 の候補（`--features full-freebsd`）を交互に 4 ラウンド（`h1_file_plain` 等の 8 シナリオ × 3B・54KB）。
+比は v0.10.0 / v0.9.2 の中央値（rps は大きいほど、CPU/要求は小さいほど良い）。
+
+| シナリオ | 大きさ | rps | CPU/要求 |
+|---|---|---|---|
+| `h1_file_plain` | 3B | 0.969 | 1.037 |
+| `h1_file_tls` | 3B | 0.965 | 1.047 |
+| `h1_proxy_tls` | 3B | 0.973 | 1.034 |
+| `h2_file_tls` | 3B | **1.092** | **0.915** |
+| `h2_proxy_tls` | 3B | 0.992 | 1.007 |
+| `h2c_file_plain` | 3B | **1.079** | **0.927** |
+| `h3_file` | 3B | 1.011 | 0.988 |
+| `l4_tcp` | 3B | 0.993 | 1.006 |
+| `h1_file_plain` | 54KB | 1.061 | 0.958 |
+| `h1_file_tls` | 54KB | 0.968 | 1.026 |
+| `h1_proxy_tls` | 54KB | 0.999 | 1.014 |
+| `h2_file_tls` | 54KB | 0.968 | 1.034 |
+| `h2_proxy_tls` | 54KB | 1.015 | 0.986 |
+| `h2c_file_plain` | 54KB | 0.994 | 0.965 |
+| `h3_file` | 54KB | 0.952 | 1.059 |
+| `l4_tcp` | 54KB | 0.987 | 1.016 |
+
+- HTTP/2・h2c の 3B は、途中の候補で 4〜7% 遅くなっていた（syscall の数は同じ）。bisect で F-272（静的配信のディスク監視）の後に
+  要求の future が大きくなり、毎回のコピーが増えたことが分かり、B-240 で直した（上の表は直した後。v0.9.2 より 8〜9% 少ない CPU）。
+- HTTP/1.1 の 3B の CPU/要求 +3〜5% は、`h1_file_plain` 3B を 8 ラウンドで v0.9.2 と交互に測る bisect で再現しなかった。
+  v0.9.2 から最終候補までの 7 点（`64c57ece`〜`8bff8d14`）の比は 0.986〜1.024（平均 1.002）で、閾値 1.02 を越えたのはテスト用の
+  スクリプトだけを変えたコミット（`3b25c067`）だった。VM の揺れの範囲と判断した。
+- `h3_file` 54KB の 1.059 は、FreeBSD の quiche（`boringssl-boring-crate`）の経路で、v0.10.0 は HTTP/3 の本文の送出を変えていない
+  （Linux の HTTP/3 静的配信は上の「最終候補での確認」で v0.9.2 と同等）。
 
 ### 対 nginx
 

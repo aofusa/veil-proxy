@@ -19,7 +19,7 @@ use std::ptr;
 
 use bytes::Bytes;
 use veil::api::bridge::HandlerContext;
-use veil::api::{App, Config, HandlerFn, OperationMeta, Request, Response};
+use veil::api::{App, Config, HandlerFn, Listener, OperationMeta, Request, Response};
 
 // ===================== BoringSSL 互換シンボルの橋渡し =====================
 
@@ -69,11 +69,20 @@ pub const VEIL_ERR_UTF8: c_int = -4;
 pub const VEIL_ERR_CLOSED: c_int = -5;
 /// 呼べない状態（INLINE のルートでのストリーミング・単項の 2 回目の送信等。F-210）。
 pub const VEIL_ERR_STATE: c_int = -6;
+/// フォームの本文が壊れている（400 を返す。F-266）。
+pub const VEIL_ERR_FORM: c_int = -7;
+/// フォームの本文が `[api] multipart_*` の上限を超えた（413 を返す。F-266）。
+pub const VEIL_ERR_TOO_LARGE: c_int = -8;
 
 /// コールバックをワーカースレッド上で直接実行する（既定はハンドラ用プール）。
 pub const VEIL_ROUTE_INLINE: u32 = 1;
 /// 要求本文を溜めずにコールバックを呼ぶ（`veil_request_body_read` で順に読む。F-210）。
 pub const VEIL_ROUTE_STREAM_BODY: u32 = 2;
+/// コールバックの前に本文を読み、`multipart/form-data` はパートに分ける（大きなファイルは名前の無い
+/// 一時ファイル。`veil_multipart_next` の `fd`。F-266）。
+pub const VEIL_ROUTE_FORM: u32 = 4;
+/// このルートの応答を `[route.compression]`・`[api] compression` で圧縮しない（F-270）。
+pub const VEIL_ROUTE_NO_COMPRESS: u32 = 8;
 
 // ===================== 最後のエラー =====================
 
@@ -131,6 +140,9 @@ struct CRoute {
     user_data: UserData,
     inline: bool,
     stream_body: bool,
+    form: bool,
+    // F-270: 応答の圧縮を許す（`VEIL_ROUTE_NO_COMPRESS` が無い）
+    compress: bool,
     meta: OperationMeta,
 }
 
@@ -154,6 +166,10 @@ pub struct veil_request_t {
     ctx: *mut HandlerContext,
     /// 読みかけの本文の断片（`veil_request_body_read` の残り）
     body_pending: RefCell<Bytes>,
+    /// multipart のパート（`VEIL_ROUTE_FORM` は先に読んだもの、他は最初の `veil_multipart_next` で解析。F-266）
+    parts: RefCell<Option<Vec<veil::api::multipart::SpooledPart>>>,
+    /// 次に返すパートの添字
+    part_next: std::cell::Cell<usize>,
 }
 
 /// レスポンス（不透明）。コールバックの間だけ有効。
@@ -171,6 +187,8 @@ impl veil_request_t {
             arena: RefCell::new(Vec::new()),
             ctx: ptr::null_mut(),
             body_pending: RefCell::new(Bytes::new()),
+            parts: RefCell::new(None),
+            part_next: std::cell::Cell::new(0),
         }
     }
 
@@ -371,6 +389,143 @@ pub unsafe extern "C" fn veil_config_threads(cfg: *mut veil_config_t, n: u32) ->
     }
 }
 
+// B-209: 0 で埋めたものが既定になるよう 3 値（0 = 既定、正 = true、負 = false）にし、先頭に大きさを置く
+// （公開前の今だけ ABI を変えられる。後の版はフィールドを末尾に足し、`size` までしか読まない）。
+/// `veil_listener_t` の 3 値: 既定（省略）。
+pub const VEIL_DEFAULT: c_int = 0;
+/// `veil_listener_t` の 3 値: true。
+pub const VEIL_ON: c_int = 1;
+/// `veil_listener_t` の 3 値: false。
+pub const VEIL_OFF: c_int = -1;
+
+/// 待ち受け 1 個（`[[listener]]`、F-260）。`veil_config_add_listener` に渡す。
+///
+/// 0 で埋めたものが既定。文字列は NULL なら省略。`http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+/// `VEIL_DEFAULT`（0）で省略、正で true、負で false。`threads` は 0 なら省略。`size` は
+/// `sizeof(veil_listener_t)`（0 はこの版の大きさとして読む）。
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct veil_listener_t {
+    /// `sizeof(veil_listener_t)`、または 0
+    pub size: usize,
+    pub name: *const c_char,
+    /// 必須。`host:port` か `unix:<path>`
+    pub listen: *const c_char,
+    /// 0 = 平文（HTTP/1.1 + h2c）、非 0 = TLS（`veil_config_tls` の証明書）
+    pub tls: c_int,
+    pub http2: c_int,
+    /// 非 0 = 同じポートの UDP で HTTP/3（TLS のみ）
+    pub http3: c_int,
+    pub http3_listen: *const c_char,
+    pub allow_http: c_int,
+    pub allow_h2c: c_int,
+    pub secure_redirect: c_int,
+    pub redirect_to: *const c_char,
+    pub threads: u32,
+    pub unix_socket_permissions: *const c_char,
+}
+
+/// この版（0.10）の `veil_listener_t` の大きさ（`size` が 0 のときに読む大きさ。後の版でも変えない）
+const LISTENER_V1_SIZE: usize = std::mem::size_of::<veil_listener_t>();
+
+/// 3 値（0 = 既定、正 = true、負 = false）
+fn tri(v: c_int) -> Option<bool> {
+    match v {
+        0 => None,
+        v => Some(v > 0),
+    }
+}
+
+/// NULL なら `None`、それ以外は UTF-8 の文字列
+unsafe fn opt_cstr<'a>(p: *const c_char) -> Result<Option<&'a str>, c_int> {
+    if p.is_null() {
+        Ok(None)
+    } else {
+        cstr(p).map(Some)
+    }
+}
+
+/// 待ち受けを 1 個足す（`[[listener]]`、F-260）。ポートごとに 1 回呼ぶ。1 個でも足すと、ライブラリ既定の
+/// `127.0.0.1:8080`（`listen_cleartext`）は `veil_config_listen_cleartext` で明示しない限り開かない。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`listener` は有効な `veil_listener_t` へのポインタ（文字列は NUL 終端か NULL）。
+#[no_mangle]
+pub unsafe extern "C" fn veil_config_add_listener(
+    cfg: *mut veil_config_t,
+    listener: *const veil_listener_t,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    if listener.is_null() {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL listener");
+    }
+    // B-209: 呼び出し側の大きさ（0 = この版の大きさ）までだけ読み、残り（後の版で足すフィールド）は既定
+    let full = std::mem::size_of::<veil_listener_t>();
+    let size = match ptr::read(ptr::addr_of!((*listener).size)) {
+        0 => LISTENER_V1_SIZE,
+        n => n,
+    };
+    if size < LISTENER_V1_SIZE {
+        return fail(
+            VEIL_ERR_INVALID_ARG,
+            "veil_listener_t.size must be 0 or sizeof(veil_listener_t)",
+        );
+    }
+    let mut l = std::mem::MaybeUninit::<veil_listener_t>::zeroed();
+    ptr::copy_nonoverlapping(
+        listener as *const u8,
+        l.as_mut_ptr() as *mut u8,
+        size.min(full),
+    );
+    // SAFETY: 全体を 0 で初期化してから読める分を写した（ポインタは NULL、整数は 0 が既定の値）
+    let l = l.assume_init();
+    if l.listen.is_null() {
+        return fail(VEIL_ERR_INVALID_ARG, "veil_listener_t.listen is required");
+    }
+    let listen = tryc!(cstr(l.listen));
+    let mut b = if l.tls != 0 {
+        Listener::tls(listen)
+    } else {
+        Listener::cleartext(listen)
+    };
+    if let Some(v) = tryc!(opt_cstr(l.name)) {
+        b = b.name(v);
+    }
+    if let Some(v) = tri(l.http2) {
+        b = b.http2(v);
+    }
+    if l.http3 != 0 {
+        b = b.http3(true);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.http3_listen)) {
+        b = b.http3_listen(v);
+    }
+    if let Some(v) = tri(l.allow_http) {
+        b = b.allow_http(v);
+    }
+    if let Some(v) = tri(l.allow_h2c) {
+        b = b.allow_h2c(v);
+    }
+    if let Some(v) = tri(l.secure_redirect) {
+        b = b.secure_redirect(v);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.redirect_to)) {
+        b = b.redirect_to(v);
+    }
+    if l.threads > 0 {
+        b = b.threads(l.threads as usize);
+    }
+    if let Some(v) = tryc!(opt_cstr(l.unix_socket_permissions)) {
+        b = b.unix_socket_permissions(v);
+    }
+    cfg.config.add_listener(b);
+    VEIL_OK
+}
+
 /// 設定を解放する（`veil_run` に渡した後は呼ばない。NULL は何もしない）。
 ///
 /// # Safety
@@ -455,13 +610,22 @@ pub unsafe extern "C" fn veil_register_route_ex(
     let Some(func) = handler else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL handler");
     };
-    if flags & !(VEIL_ROUTE_INLINE | VEIL_ROUTE_STREAM_BODY) != 0 {
+    if flags
+        & !(VEIL_ROUTE_INLINE | VEIL_ROUTE_STREAM_BODY | VEIL_ROUTE_FORM | VEIL_ROUTE_NO_COMPRESS)
+        != 0
+    {
         return fail(VEIL_ERR_INVALID_ARG, "unknown route flags");
     }
     if flags & VEIL_ROUTE_INLINE != 0 && flags & VEIL_ROUTE_STREAM_BODY != 0 {
         return fail(
             VEIL_ERR_INVALID_ARG,
             "VEIL_ROUTE_STREAM_BODY needs a handler-pool route (not VEIL_ROUTE_INLINE)",
+        );
+    }
+    if flags & VEIL_ROUTE_FORM != 0 && flags & VEIL_ROUTE_STREAM_BODY != 0 {
+        return fail(
+            VEIL_ERR_INVALID_ARG,
+            "VEIL_ROUTE_FORM reads the body before the callback (not with VEIL_ROUTE_STREAM_BODY)",
         );
     }
     let path = tryc!(cstr(path));
@@ -506,15 +670,24 @@ pub unsafe extern "C" fn veil_register_route_ex(
         user_data: UserData(user_data),
         inline: flags & VEIL_ROUTE_INLINE != 0,
         stream_body: flags & VEIL_ROUTE_STREAM_BODY != 0,
+        form: flags & VEIL_ROUTE_FORM != 0,
+        compress: flags & VEIL_ROUTE_NO_COMPRESS == 0,
         meta,
     });
     VEIL_OK
 }
 
 /// C コールバックを 1 回呼ぶ。0 以外の戻り値・panic は 500（ストリーミングを始めた後は使わない）。
-fn invoke(func: veil_handler_fn, ud: UserData, req: Request, ctx: *mut HandlerContext) -> Response {
+fn invoke(
+    func: veil_handler_fn,
+    ud: UserData,
+    req: Request,
+    parts: Option<Vec<veil::api::multipart::SpooledPart>>,
+    ctx: *mut HandlerContext,
+) -> Response {
     let mut wreq = veil_request_t::new(req);
     wreq.ctx = ctx;
+    *wreq.parts.borrow_mut() = parts;
     let mut wresp = veil_response_t {
         resp: Response::new(200),
         ctx,
@@ -531,20 +704,30 @@ fn invoke(func: veil_handler_fn, ud: UserData, req: Request, ctx: *mut HandlerCo
 }
 
 /// ルートからハンドラ関数を作る。
-fn make_handler(func: veil_handler_fn, ud: UserData, inline: bool) -> HandlerFn {
-    if inline {
-        std::sync::Arc::new(move |req| {
-            Box::pin(async move { invoke(func, ud, req, ptr::null_mut()) })
+fn make_handler(func: veil_handler_fn, ud: UserData, inline: bool, form: bool) -> HandlerFn {
+    std::sync::Arc::new(move |req| {
+        Box::pin(async move {
+            // F-266: VEIL_ROUTE_FORM は本文を先に読む（大きなファイルは一時ファイルへ）
+            let (req, parts) = if form {
+                match veil::api::multipart::prepare_form(req).await {
+                    Ok(x) => x,
+                    Err(resp) => return resp,
+                }
+            } else {
+                (req, None)
+            };
+            if inline {
+                invoke(func, ud, req, parts, ptr::null_mut())
+            } else {
+                // ハンドラ用プールで呼ぶ。コールバックは応答をストリーミングにでき（`veil_response_stream`）、
+                // ストリーミング受信のルートでは要求本文を順に読める（F-210）
+                veil::api::bridge::call_blocking(req, move |req, ctx| {
+                    invoke(func, ud, req, parts, ctx as *mut HandlerContext)
+                })
+                .await
+            }
         })
-    } else {
-        // ハンドラ用プールで呼ぶ。コールバックは応答をストリーミングにでき（`veil_response_stream`）、
-        // ストリーミング受信のルートでは要求本文を順に読める（F-210）
-        std::sync::Arc::new(move |req| {
-            Box::pin(veil::api::bridge::call_blocking(req, move |req, ctx| {
-                invoke(func, ud, req, ctx as *mut HandlerContext)
-            }))
-        })
-    }
+    })
 }
 
 // ===================== 起動・停止 =====================
@@ -565,12 +748,13 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
     let mut app = App::new().config(cfg.config).without_macro_routes();
     for r in cfg.routes {
         let methods: Vec<&str> = r.methods.iter().map(|m| m.as_str()).collect();
-        let func = make_handler(r.func, r.user_data, r.inline);
-        app = if r.stream_body {
+        let func = make_handler(r.func, r.user_data, r.inline, r.form);
+        app = if r.stream_body || r.form {
             app.route_fn_streaming(&r.name, &methods, &r.path, func, r.meta)
         } else {
             app.route_fn(&r.name, &methods, &r.path, func, r.meta)
-        };
+        }
+        .route_compression(r.compress);
     }
     for f in cfg.extra {
         app = f(app);
@@ -672,6 +856,133 @@ pub unsafe extern "C" fn veil_request_body(
         Some(r) => out_bytes(r.req.body(), len),
         None => out_none(len),
     }
+}
+
+// ===================== multipart（F-266） =====================
+
+/// `veil_multipart_next` が返す 1 パート。ポインタはコールバックの間だけ有効（NUL 終端ではない）。
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct veil_part_t {
+    /// `Content-Disposition` の `name`（無ければ NULL）
+    pub name: *const c_char,
+    pub name_len: usize,
+    /// `filename`（ファイルでなければ NULL）
+    pub filename: *const c_char,
+    pub filename_len: usize,
+    /// パートの `Content-Type`（無ければ NULL）
+    pub content_type: *const c_char,
+    pub content_type_len: usize,
+    /// 中身（一時ファイルに書いたときは NULL）
+    pub data: *const c_char,
+    pub data_len: usize,
+    /// 一時ファイルの fd（Windows はハンドル）。先頭に位置づけてある。メモリなら -1。
+    /// コールバックから戻ると閉じる（残すなら dup する）
+    pub fd: isize,
+    /// 中身のバイト数
+    pub size: u64,
+}
+
+unsafe fn put_str(s: Option<&str>, p: &mut *const c_char, l: &mut usize) {
+    match s {
+        Some(s) => {
+            *p = s.as_ptr() as *const c_char;
+            *l = s.len();
+        }
+        None => {
+            *p = ptr::null();
+            *l = 0;
+        }
+    }
+}
+
+/// 次の multipart のパートを `*out` に入れる。1 = 入れた、0 = 終わり、負 = エラー
+/// （`VEIL_ERR_FORM` は 400、`VEIL_ERR_TOO_LARGE` は 413 を返す。`VEIL_ERR_STATE` は multipart の本文ではない）。
+/// `VEIL_ROUTE_FORM` の無いルートは溜めた本文を解析する（ファイルもメモリ上）。
+///
+/// # Safety
+///
+/// `req` はコールバックに渡されたハンドル、`out` は書き込み可能な `veil_part_t`。
+#[no_mangle]
+pub unsafe extern "C" fn veil_multipart_next(
+    req: *const veil_request_t,
+    out: *mut veil_part_t,
+) -> c_int {
+    use veil::api::multipart::{SpooledData, SpooledPart};
+    let (Some(r), Some(out)) = (req.as_ref(), out.as_mut()) else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL request or part");
+    };
+    let mut parts = r.parts.borrow_mut();
+    if parts.is_none() {
+        if !veil::api::multipart::is_multipart(&r.req) {
+            return fail(VEIL_ERR_STATE, "not a multipart/form-data body");
+        }
+        match veil::api::multipart::request_parts(&r.req) {
+            Ok(v) => {
+                *parts = Some(
+                    v.into_iter()
+                        .map(|p| SpooledPart {
+                            info: p.info,
+                            data: SpooledData::Memory(p.data),
+                        })
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                let code = if e.status() == 413 {
+                    VEIL_ERR_TOO_LARGE
+                } else {
+                    VEIL_ERR_FORM
+                };
+                return fail(code, e.message());
+            }
+        }
+    }
+    let v = parts.as_mut().expect("parts are set above");
+    let i = r.part_next.get();
+    let Some(p) = v.get_mut(i) else {
+        return 0;
+    };
+    r.part_next.set(i + 1);
+    put_str(p.info.name.as_deref(), &mut out.name, &mut out.name_len);
+    put_str(
+        p.info.filename.as_deref(),
+        &mut out.filename,
+        &mut out.filename_len,
+    );
+    put_str(
+        p.info.content_type.as_deref(),
+        &mut out.content_type,
+        &mut out.content_type_len,
+    );
+    match &mut p.data {
+        SpooledData::Memory(b) => {
+            out.data = b.as_ptr() as *const c_char;
+            out.data_len = b.len();
+            out.fd = -1;
+            out.size = b.len() as u64;
+        }
+        SpooledData::File { file, len } => {
+            use std::io::Seek;
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+                return fail(VEIL_ERR_RUNTIME, format!("seek temporary upload: {}", e));
+            }
+            out.data = ptr::null();
+            out.data_len = 0;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                out.fd = file.as_raw_fd() as isize;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                out.fd = file.as_raw_handle() as isize;
+            }
+            out.size = *len;
+        }
+    }
+    1
 }
 
 /// ヘッダの値（名前は大文字小文字を区別しない）。無ければ NULL。
@@ -786,6 +1097,20 @@ pub unsafe extern "C" fn veil_response_set_status(
         return fail(VEIL_ERR_INVALID_ARG, "status out of range");
     }
     r.resp = std::mem::replace(&mut r.resp, Response::new(200)).with_status(status);
+    VEIL_OK
+}
+
+/// この応答を圧縮しない（ルートが `[route.compression]`・`[api] compression` で圧縮するときも。F-270）。
+///
+/// # Safety
+///
+/// `resp` はコールバックに渡されたハンドル。
+#[no_mangle]
+pub unsafe extern "C" fn veil_response_no_compression(resp: *mut veil_response_t) -> c_int {
+    let Some(r) = resp.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL response");
+    };
+    r.resp = std::mem::replace(&mut r.resp, Response::new(200)).no_compression();
     VEIL_OK
 }
 
@@ -919,6 +1244,112 @@ mod tests {
         )
         .with_params(vec![(Arc::from("id"), Bytes::from_static(b"4%202"))]);
         veil_request_t::new(req)
+    }
+
+    // F-260
+    #[test]
+    fn add_listener_builds_the_listener_array() {
+        let listen = c("0.0.0.0:8081");
+        let name = c("h1tls");
+        let l = veil_listener_t {
+            size: std::mem::size_of::<veil_listener_t>(),
+            name: name.as_ptr(),
+            listen: listen.as_ptr(),
+            tls: 1,
+            http2: VEIL_OFF,
+            http3: 0,
+            http3_listen: ptr::null(),
+            allow_http: VEIL_DEFAULT,
+            allow_h2c: VEIL_DEFAULT,
+            secure_redirect: VEIL_DEFAULT,
+            redirect_to: ptr::null(),
+            threads: 2,
+            unix_socket_permissions: ptr::null(),
+        };
+        unsafe {
+            let cfg = veil_config_new();
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            let plain = c("0.0.0.0:8082");
+            let l2 = veil_listener_t {
+                listen: plain.as_ptr(),
+                tls: 0,
+                name: ptr::null(),
+                threads: 0,
+                allow_http: VEIL_OFF,
+                ..l
+            };
+            assert_eq!(veil_config_add_listener(cfg, &l2), VEIL_OK);
+            assert_eq!(
+                veil_config_add_listener(cfg, ptr::null()),
+                VEIL_ERR_INVALID_ARG
+            );
+            let v = (*cfg).config.to_value().unwrap();
+            let ls = v["listener"].as_array().unwrap();
+            assert_eq!(ls.len(), 2);
+            assert_eq!(ls[0]["name"].as_str(), Some("h1tls"));
+            assert_eq!(ls[0]["tls"].as_bool(), Some(true));
+            assert_eq!(ls[0]["http2"].as_bool(), Some(false));
+            assert_eq!(ls[0]["threads"].as_integer(), Some(2));
+            assert!(ls[0].get("allow_http").is_none());
+            assert_eq!(ls[1]["allow_http"].as_bool(), Some(false));
+            assert!(ls[1].get("threads").is_none());
+            assert!(v["server"].get("listen_cleartext").is_none());
+            veil_config_free(cfg);
+        }
+    }
+
+    // B-209: 0 で埋めた veil_listener_t は既定（平文で HTTP/1.1 も h2c も受ける）。size は 0 か sizeof 以上
+    #[test]
+    fn zeroed_listener_means_defaults() {
+        let listen = c("127.0.0.1:8083");
+        unsafe {
+            let cfg = veil_config_new();
+            let mut l: veil_listener_t = std::mem::zeroed();
+            l.listen = listen.as_ptr();
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            l.size = std::mem::size_of::<veil_listener_t>();
+            l.allow_h2c = VEIL_ON;
+            l.secure_redirect = VEIL_OFF;
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_OK);
+            // 古い（小さい）大きさは受けない
+            l.size = 8;
+            assert_eq!(veil_config_add_listener(cfg, &l), VEIL_ERR_INVALID_ARG);
+            // 後の版の大きな構造体（末尾に知らないフィールド）でも、知っている分だけ読む
+            #[repr(C)]
+            struct Bigger {
+                l: veil_listener_t,
+                extra: u64,
+            }
+            let mut big: Bigger = std::mem::zeroed();
+            big.l.size = std::mem::size_of::<Bigger>();
+            big.l.listen = listen.as_ptr();
+            big.l.allow_http = VEIL_OFF;
+            big.extra = u64::MAX;
+            assert_eq!(
+                veil_config_add_listener(cfg, &big.l as *const veil_listener_t),
+                VEIL_OK
+            );
+            let mut none: veil_listener_t = std::mem::zeroed();
+            none.size = 0;
+            assert_eq!(veil_config_add_listener(cfg, &none), VEIL_ERR_INVALID_ARG);
+            let v = (*cfg).config.to_value().unwrap();
+            let ls = v["listener"].as_array().unwrap();
+            assert_eq!(ls.len(), 3);
+            for k in [
+                "allow_http",
+                "allow_h2c",
+                "secure_redirect",
+                "http2",
+                "threads",
+            ] {
+                assert!(ls[0].get(k).is_none(), "{k}");
+            }
+            assert_eq!(ls[0]["tls"].as_bool(), Some(false));
+            assert_eq!(ls[1]["allow_h2c"].as_bool(), Some(true));
+            assert_eq!(ls[1]["secure_redirect"].as_bool(), Some(false));
+            assert_eq!(ls[2]["allow_http"].as_bool(), Some(false));
+            veil_config_free(cfg);
+        }
     }
 
     #[test]
@@ -1064,6 +1495,7 @@ mod tests {
             echo_cb,
             ud,
             Request::new("POST", "/e", vec![], "body"),
+            None,
             ptr::null_mut(),
         );
         assert_eq!(r.status_code(), 200);
@@ -1073,9 +1505,56 @@ mod tests {
             fail_cb,
             UserData(ptr::null_mut()),
             Request::new("GET", "/", vec![], ""),
+            None,
             ptr::null_mut(),
         );
         assert_eq!(r.status_code(), 500);
+    }
+
+    // F-266
+    #[test]
+    fn multipart_next_iterates_parts() {
+        let body = "--b\r\ncontent-disposition: form-data; name=\"t\"\r\n\r\nv\r\n\
+                    --b\r\ncontent-disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\
+                    content-type: text/plain\r\n\r\nhello\r\n--b--\r\n";
+        let req = Request::new(
+            "POST",
+            "/u",
+            vec![(
+                Bytes::from_static(b"content-type"),
+                Bytes::from_static(b"multipart/form-data; boundary=b"),
+            )],
+            body,
+        );
+        let r = veil_request_t::new(req);
+        let s = |p: *const c_char, l: usize| unsafe {
+            String::from_utf8(std::slice::from_raw_parts(p as *const u8, l).to_vec()).unwrap()
+        };
+        unsafe {
+            let mut part: veil_part_t = std::mem::zeroed();
+            assert_eq!(veil_multipart_next(&r, &mut part), 1);
+            assert_eq!(s(part.name, part.name_len), "t");
+            assert!(part.filename.is_null());
+            assert_eq!(s(part.data, part.data_len), "v");
+            assert_eq!(part.fd, -1);
+            assert_eq!(veil_multipart_next(&r, &mut part), 1);
+            assert_eq!(s(part.filename, part.filename_len), "a.txt");
+            assert_eq!(s(part.content_type, part.content_type_len), "text/plain");
+            assert_eq!(part.size, 5);
+            assert_eq!(veil_multipart_next(&r, &mut part), 0);
+            let plain = sample_request();
+            assert_eq!(veil_multipart_next(&plain, &mut part), VEIL_ERR_STATE);
+            let bad = veil_request_t::new(Request::new(
+                "POST",
+                "/u",
+                vec![(
+                    Bytes::from_static(b"content-type"),
+                    Bytes::from_static(b"multipart/form-data; boundary=b"),
+                )],
+                "--b\r\nbroken",
+            ));
+            assert_eq!(veil_multipart_next(&bad, &mut part), VEIL_ERR_FORM);
+        }
     }
 
     #[test]

@@ -578,6 +578,7 @@ Controls polling behavior during WebSocket bidirectional transfer.
 | `websocket_poll_timeout_ms` | Initial timeout (milliseconds) | 1 |
 | `websocket_poll_max_timeout_ms` | Maximum timeout (milliseconds) *adaptive only | 100 |
 | `websocket_poll_backoff_multiplier` | Backoff multiplier *adaptive only | 2.0 |
+| `websocket_idle_timeout_secs` | Close the tunnel after an upgrade (`101`) when no data has flowed in either direction for this long; 0 = no limit | 0 |
 
 #### Choosing Polling Mode
 
@@ -767,7 +768,8 @@ Achieve security isolation equivalent to bubblewrap by applying Linux namespace 
 | `sandbox_unshare_pid` | PID namespace isolation | false |
 | `sandbox_unshare_user` | User namespace isolation | false |
 | `sandbox_unshare_net` | Network namespace isolation (**Warning: disables networking**) | false |
-| `sandbox_keep_capabilities` | Capabilities to keep | [] |
+| `sandbox_keep_capabilities` | Capabilities to keep (all others are dropped; takes precedence) | [] |
+| `sandbox_drop_capabilities` | Capabilities to drop | [] |
 | `sandbox_ro_bind_mounts` | Read-only bind mounts (source:dest format) | standard paths |
 | `sandbox_rw_bind_mounts` | Read-write bind mounts | [] |
 | `sandbox_tmpfs_mounts` | tmpfs mount destinations | ["/tmp"] |
@@ -775,6 +777,11 @@ Achieve security isolation equivalent to bubblewrap by applying Linux namespace 
 | `sandbox_mount_dev` | Create /dev | true |
 | `sandbox_hostname` | Hostname inside sandbox | "veil-sandbox" |
 | `sandbox_no_new_privs` | Set PR_SET_NO_NEW_PRIVS | true |
+
+A bind, tmpfs, `/proc` or `/dev` mount that fails stops start-up unless `allow_security_failures = true`; a bind mount
+whose source does not exist (such as `/lib64` on some systems) is skipped. The start-up security status lists the
+mounts that failed. `sandbox_mount_dev` mounts a tmpfs on `/dev` with `null`, `zero`, `random` and `urandom` bound
+from the host devices.
 
 ```toml
 [security]
@@ -786,6 +793,11 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 sandbox_ro_bind_mounts = ["/usr:/usr", "/lib:/lib", "/lib64:/lib64"]
 sandbox_tmpfs_mounts = ["/tmp"]
 ```
+
+Dropped capabilities are removed from the effective, permitted, inheritable and ambient sets of every thread of
+the process (not only from the bounding set), so a veil started as root without `drop_privileges_user` no longer
+keeps them. The start-up log shows the result (`Capabilities: effective=… bounding=…`). If a thread cannot drop
+them, start-up fails unless `allow_security_failures = true`.
 
 > **Note**: Setting `sandbox_unshare_net = true` will disable network communication. For reverse proxies, typically leave this as `false`.
 
@@ -823,6 +835,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `websocket_poll_timeout_ms` | Initial timeout (milliseconds) | 1 |
 | | `websocket_poll_max_timeout_ms` | Maximum timeout (milliseconds) *adaptive only | 100 |
 | | `websocket_poll_backoff_multiplier` | Backoff multiplier *adaptive only | 2.0 |
+| | `websocket_idle_timeout_secs` | Idle timeout of the tunnel after `101` (0 = no limit) | 0 |
 
 #### Security Configuration Examples
 
@@ -874,6 +887,12 @@ same order, and the first failing check decides the response:
 
 The stateless checks come first, so a request rejected for its size does not use the rate limit's budget.
 
+The rate limit table has a fixed size (65,536 slots, 512 KB, allocated on first use), so memory does not grow with
+the number of clients. The slot is chosen by a keyed hash with a per-process random seed, so a client cannot pick
+whose slot it shares. When many clients are active in the same minute (tens of thousands), some unrelated clients
+share a slot and one of them can receive 429 before reaching its own limit; the limit never lets more requests
+through than configured.
+
 #### IP Restriction Evaluation Order
 
 IP restrictions are evaluated in **deny → allow** order (deny takes priority).
@@ -897,7 +916,7 @@ the IPv4 range.
 ## Per-Route Traffic Control (F-219)
 
 `type = "Respond"` returns a fixed response, and `[route.traffic]` adds weighted splits, fault injection (abort) and
-CORS preflight answers to any route. They are resolved when the configuration is loaded; per request veil only picks
+CORS (preflight answers and the headers of actual responses) to any route. They are resolved when the configuration is loaded; per request veil only picks
 one of the prebuilt backends (one random number for splits and faults), and routes without `[route.traffic]` are
 unaffected. All of them work on HTTP/1.1, HTTP/2 and HTTP/3.
 
@@ -931,20 +950,39 @@ split = [
 abort_status = 503
 abort_percent = 5.0          # 0..=100, default 100
 
-# CORS preflight (OPTIONS with Origin and Access-Control-Request-Method)
+# CORS: preflight answers and the headers of actual responses
 [route.traffic.cors]
 allow_origins = ["https://app.example.com"]   # exact matches, or "*"
 allow_methods = ["GET", "POST"]
 allow_headers = ["content-type", "authorization"]
-expose_headers = []
+expose_headers = []          # Access-Control-Expose-Headers on actual responses (and preflights)
 max_age_secs = 600
 allow_credentials = false    # cannot be combined with "*"
+override_upstream = false    # true: replace the upstream's own Access-Control-* headers
+reject_disallowed = false    # true: answer 403 to requests whose Origin is not allowed
 ```
 
 - A split entry uses the route's `security`, `compression`, `buffering` and `modules`, like the action itself.
-- The preflight answer is `200` with the `Access-Control-Allow-*` headers and echoes the matching origin
-  (`Vary: Origin`). Preflights from other origins, and all non-preflight requests, go to the action. Add
-  `Access-Control-Allow-Origin` to actual responses with `[route.security] add_response_headers`.
+- **Preflight**: an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` from an allowed origin is answered
+  with `200` and the `Access-Control-Allow-*` headers, echoing the matching origin (`Vary: Origin`). Preflights from
+  other origins go to the action.
+- **Actual responses** (every other request, on File, Proxy, Handler, Redirect and Respond routes, over HTTP/1.1,
+  HTTP/2 and HTTP/3): when the request's `Origin` is allowed, veil adds `Access-Control-Allow-Origin` (the origin, or
+  `*` for the `"*"` entry), `Access-Control-Allow-Credentials: true` (with `allow_credentials`),
+  `Access-Control-Expose-Headers` (with `expose_headers`) and `Vary: Origin` (unless the only entry is `"*"`; it is
+  added next to an existing `Vary`). Requests without `Origin` or from other origins are served normally with only
+  `Vary: Origin` (the browser blocks them; set `reject_disallowed = true` to answer `403` instead).
+- If the upstream (or a handler, or the headers of a `Respond` action) already returns `Access-Control-Allow-Origin`,
+  veil keeps the upstream's CORS headers and adds none; `override_upstream = true` removes the upstream's
+  `Access-Control-Allow-Origin` / `-Allow-Credentials` / `-Expose-Headers` and adds veil's. Whenever veil adds its
+  headers, it removes the upstream's `Access-Control-Allow-Credentials` and `-Expose-Headers` (an upstream that
+  returns them without `Access-Control-Allow-Origin` neither duplicates veil's values nor turns on credentials
+  that the route does not allow).
+- The headers are built when the configuration is loaded, one copy of the route's backend per allowed origin; per
+  request veil compares the `Origin` once and adds prebuilt headers. Routes without `[route.traffic.cors]` are
+  unaffected. Responses that veil generates itself before the route is chosen (`404` for unknown paths, security
+  rejections, fault aborts, JWT errors) and WebSocket upgrades do not carry the headers. On HTTP/1.1 with kTLS, proxy
+  responses on a CORS route take the user-space path (the `splice(2)` relay cannot add headers).
 - When the fault abort applies to a route, its requests take the buffered path on HTTP/2 and HTTP/3 (the decision
   is made once, when the request is dispatched).
 - Not available on TOML routes yet (F-226): per-route request timeouts, conditional retries, mirroring and fault delays.
@@ -1033,6 +1071,8 @@ requests. Header values that would contain CR, LF or NUL after variable expansio
 |--------|-------------|---------|
 | `add_request_headers` | Headers to add (table format) | `{ "X-Real-IP" = "$client_ip" }` |
 | `remove_request_headers` | Headers to remove (array) | `["X-Debug-Token"]` |
+| `forwarded_headers` | `"append"` (default): `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and `Forwarded` sent by clients outside `trusted_proxies` are dropped, and `X-Forwarded-For` is set to the client IP. From `trusted_proxies` the received values are kept and the client IP is added as another `X-Forwarded-For` line. `"passthrough"`: forward what the client sent and add nothing (the behavior before v0.10.0). An `add_request_headers` entry for `X-Forwarded-For` replaces veil's own | `"append"` |
+| `trusted_proxies` | Sources (IP/CIDR) whose forwarded headers are kept, such as a load balancer in front of veil | `["10.0.0.0/8"]` |
 
 #### Special Variables
 

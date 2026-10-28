@@ -1,0 +1,56 @@
+# F-267: veil の API ライブラリのヘルパー（Cookie・リダイレクト・静的ファイル・CORS・認証・セッション・
+# HTTP / gRPC クライアント・GraphQL・依存性注入・バックグラウンドタスク）。veil 本体（プロキシのバイナリ・
+# default・full*）には入らない別のクレート。重い依存（async-graphql・prost）は feature（既定は off）。
+[package]
+name = "veil-proxy-kit"
+version.workspace = true
+edition.workspace = true
+description = "Helpers for the veil API server library: cookies, redirects, static files, CORS, auth (JWT), sessions, HTTP/gRPC clients, GraphQL, dependency injection and background tasks"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["veil", "web", "api", "middleware", "jwt"]
+categories = ["web-programming::http-server"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+features = ["full"]
+
+[lib]
+name = "veil_kit"
+
+[features]
+default = ["cookie", "cors", "auth", "di", "tasks"]
+cookie = []
+cors = []
+auth = []
+jwt = ["auth"]
+session = ["cookie"]
+di = []
+tasks = []
+cron = ["tasks"]
+grpc = ["dep:prost"]
+graphql = ["dep:async-graphql"]
+# GraphiQL のページ（スクリプトは CDN から読む）
+graphiql = ["graphql", "async-graphql/graphiql"]
+full = ["cookie", "cors", "auth", "jwt", "session", "di", "tasks", "cron", "grpc", "graphql", "graphiql"]
+
+[dependencies]
+# 利用側は veil を `features = ["full", "api"]` 等で指定する（feature は合わさる）。kit が要るのは API の土台だけ。
+veil = { package = "veil-proxy", path = "../..", version = "0.9.2", default-features = false, features = ["api-core"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+arc-swap = "1"
+ftlog = "0.2"
+prost = { version = "0.13", optional = true }
+async-graphql = { version = "7", default-features = false, optional = true }
+
+# 暗号（HMAC・AES-GCM・署名の検証）は veil の TLS と同じプロバイダの crate（依存を増やさない）。
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]
+aws-lc-rs = "1.15.2"
+
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+ring = "0.17"

@@ -88,7 +88,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `proxy_pass http://app;` | `url = "http://app"` | = see [Proxy paths](#proxy-paths) |
 | `proxy_set_header X-Real-IP $remote_addr;` | `[route.security] add_request_headers = { "X-Real-IP" = "$client_ip" }` | = variables `$client_ip`, `$host`, `$request_uri` |
 | `proxy_set_header Host $host;` | — | = the client's Host is forwarded by default |
-| `X-Forwarded-For` | `add_request_headers = { "X-Forwarded-For" = "$client_ip" }` | ≈ replaces instead of appending |
+| `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` | default (`[route.security] forwarded_headers = "append"`, plus `trusted_proxies` for hops in front) | ≈ untrusted clients' values are dropped instead of appended to |
 | `proxy_hide_header` / `add_header` | `remove_response_headers` / `add_response_headers` | = also on static files |
 | `proxy_http_version 1.1;` + keepalive to upstreams | default (pooled connections) | = `max_idle_connections_per_host`, `idle_connection_timeout_secs` |
 | HTTP/2 to the upstream | `use_h2c = true` (plaintext) / ALPN for `https://` | = multiplexed ([routing.md](routing.md#h2c-http2-over-cleartext-proxy)) |
@@ -121,7 +121,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `auth_request` (subrequest) | — | — not on TOML routes; ext_authz is planned (F-229); JWT verification is built in (`[route.jwt]`) |
 | `add_header Strict-Transport-Security ...` | `add_response_headers` | = |
 | `server_tokens off;` | default (no `Server` header) | = `server_header_enabled` turns it on |
-| CORS (`add_header Access-Control-*`) | `[route.traffic.cors]` (preflight) + `add_response_headers` | = |
+| CORS (`add_header Access-Control-*`) | `[route.traffic.cors]` (preflight and actual responses) | = |
 | `stream {}` (TCP / UDP) | `[[l4]]` | = TCP and UDP, with health checks ([l4-proxy.md](l4-proxy.md)) |
 | process sandboxing (none in nginx) | seccomp, Landlock, privilege dropping, capsicum, pledge/unveil | veil only ([security.md](security.md)) |
 

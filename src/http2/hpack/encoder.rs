@@ -47,6 +47,12 @@ impl Drop for EncodedHeaderBlock {
     }
 }
 
+// B-221: ピアの SETTINGS_HEADER_TABLE_SIZE は「使ってよい上限」で、エンコーダはそれ以下の任意の大きさを選べる
+// （RFC 7541 §4.2）。そのまま使うと 0xffffffff を送るピアに接続ごとの表を無制限に育てられるので、自前の上限で丸める
+// （nghttp2・h2 と同じ 4096）。
+/// Upper bound of the encoder's dynamic table, whatever the peer allows.
+pub const MAX_ENCODER_TABLE_SIZE: usize = 4096;
+
 /// HPACK エンコーダ
 pub struct HpackEncoder {
     /// 動的テーブル
@@ -61,7 +67,7 @@ impl HpackEncoder {
     /// 新しいエンコーダを作成
     pub fn new(max_table_size: usize) -> Self {
         Self {
-            dynamic_table: DynamicTable::new(max_table_size),
+            dynamic_table: DynamicTable::new(max_table_size.min(MAX_ENCODER_TABLE_SIZE)),
             use_huffman: true,
             pending_table_size_update: None,
         }
@@ -74,6 +80,7 @@ impl HpackEncoder {
 
     /// 動的テーブルの最大サイズを更新
     pub fn set_max_table_size(&mut self, size: usize) {
+        let size = size.min(MAX_ENCODER_TABLE_SIZE);
         self.pending_table_size_update = Some(size);
         self.dynamic_table.set_max_size(size);
     }
@@ -361,5 +368,24 @@ mod tests {
 
         // Never Indexed (静的テーブルに authorization があるのでインデックス使用)
         assert_eq!(encoded[0] & 0xF0, 0x10);
+    }
+
+    // B-221: ピアが SETTINGS_HEADER_TABLE_SIZE = u32::MAX を送っても、値が毎回違うヘッダで表が育たない
+    #[test]
+    fn test_peer_huge_table_size_is_clamped() {
+        let mut encoder = HpackEncoder::new(u32::MAX as usize);
+        assert!(encoder.dynamic_table().max_size() <= MAX_ENCODER_TABLE_SIZE);
+        encoder.set_max_table_size(u32::MAX as usize);
+        for i in 0..100_000u32 {
+            let etag = format!("\"{i:08x}\"");
+            let cookie = format!("s={i}; Path=/");
+            let headers = [
+                (b"etag".as_slice(), etag.as_bytes(), false),
+                (b"set-cookie".as_slice(), cookie.as_bytes(), false),
+            ];
+            encoder.encode(&headers).unwrap();
+        }
+        assert!(encoder.dynamic_table().size() <= MAX_ENCODER_TABLE_SIZE);
+        assert!(encoder.dynamic_table().max_size() <= MAX_ENCODER_TABLE_SIZE);
     }
 }

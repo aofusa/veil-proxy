@@ -530,6 +530,36 @@ fn refresh_alloc_stats_gauges() {
 }
 
 // ====================
+// io_uring の状態（F-280）
+// ====================
+
+#[cfg(all(veil_rt_uring, feature = "metrics"))]
+/// CQ が溢れた回数。0 以外ならリングの大きさが負荷に対して小さい（完了は失われないが余分な syscall が増える）
+static URING_CQ_OVERFLOW_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let counter = prometheus::IntCounter::with_opts(
+        Opts::new(
+            "uring_cq_overflow_total",
+            "Number of times an io_uring completion queue overflowed",
+        )
+        .namespace("veil"),
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// スクレイプ直前に実行器のカウンタを反映する
+#[cfg(all(veil_rt_uring, feature = "metrics"))]
+fn refresh_uring_counters() {
+    let now =
+        crate::runtime::executor::CQ_OVERFLOW_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    let c = &*URING_CQ_OVERFLOW_TOTAL;
+    c.inc_by(now.saturating_sub(c.get()));
+}
+
+// ====================
 // VDS の状態（F-211）
 // ====================
 //
@@ -848,6 +878,80 @@ pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: b
     HTTP_UPSTREAM_HEALTH
         .with_label_values(&[_upstream, _server])
         .set(if _healthy { 1 } else { 0 });
+}
+
+// B-235: 解析できない HTTP/3 のデータグラム（送信元を偽装したゴミを含む）。1 通ごとに warn! を出す代わりに数える。
+#[cfg(all(feature = "metrics", feature = "http3"))]
+static HTTP3_INVALID_PACKETS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let counter = prometheus::IntCounter::with_opts(
+        Opts::new(
+            "http3_invalid_packets_total",
+            "Total number of UDP datagrams on the HTTP/3 port that are not valid QUIC packets",
+        )
+        .namespace("veil"),
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// メトリクス: 解析できない HTTP/3 のデータグラムを数える（B-235）
+#[cfg(feature = "http3")]
+#[inline]
+pub(crate) fn record_http3_invalid_packet() {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        HTTP3_INVALID_PACKETS_TOTAL.inc();
+    }
+}
+
+// B-251: 上流への接続の失敗（要求ごとの error! の代わりに数える）。上流のアドレスはラベルにしない（系列の上限。B-159）
+#[cfg(feature = "metrics")]
+static UPSTREAM_CONNECT_ERRORS_TOTAL: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    let counter = prometheus::IntCounterVec::new(
+        Opts::new(
+            "upstream_connect_errors_total",
+            "Total number of failed connections to upstream servers",
+        )
+        .namespace("veil"),
+        &["kind"],
+    )
+    .unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// 上流への接続の失敗の種類。
+#[derive(Clone, Copy)]
+pub(crate) enum UpstreamConnectError {
+    /// 接続できなかった（拒否・到達不能等）
+    Error,
+    /// 接続がタイムアウトした
+    Timeout,
+    /// TLS のハンドシェイクに失敗した（タイムアウトを含む）
+    Tls,
+    /// 使える上流が無い（全て unhealthy）
+    NoHealthy,
+}
+
+/// メトリクス: 上流への接続の失敗を数える（B-251）
+#[inline]
+pub(crate) fn record_upstream_connect_error(_kind: UpstreamConnectError) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        UPSTREAM_CONNECT_ERRORS_TOTAL
+            .with_label_values(&[match _kind {
+                UpstreamConnectError::Error => "error",
+                UpstreamConnectError::Timeout => "timeout",
+                UpstreamConnectError::Tls => "tls",
+                UpstreamConnectError::NoHealthy => "no_healthy",
+            }])
+            .inc();
+    }
 }
 
 /// メトリクス: キャッシュヒットを記録
@@ -1343,6 +1447,8 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     refresh_alloc_stats_gauges();
     #[cfg(veil_alloc_active)]
     refresh_veil_allocator_gauges();
+    #[cfg(veil_rt_uring)]
+    refresh_uring_counters();
 
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();

@@ -21,7 +21,10 @@ rules:
       同種の危険パターン。所有権を持つ型プール（checkout/return, RAII ガード）で置き換えること。
     paths:
       include:
-        - "src/"
+        - "/src/"
+      exclude:
+        - "/third_party/"
+        - "/examples/"
     patterns:
       - pattern-regex: "transmute[^;]*&\\s*'static"
 
@@ -35,8 +38,13 @@ rules:
       AGENTS.md 禁止事項: 素の `#[allow(dead_code)]` は原則禁止。デッドコードは削除し、
       どうしても必要なら理由をコメントで明記して個別レビューすること
       （cfg 条件つき `#[cfg_attr(..., allow(dead_code))]` は許容）。
+    # B-243: 行頭の属性だけ（generic はコメントを区別しないので、文中の規約の説明に一致していた）。
+    # include は走査の root からの "/src/"（"src/" だと third_party/*/src 等の深い src にも一致する）
     paths:
       include:
-        - "src/"
+        - "/src/"
+      exclude:
+        - "/third_party/"
+        - "/examples/"
     patterns:
-      - pattern-regex: '#\[allow\(dead_code\)\]'
+      - pattern-regex: '(?m)^[ \t]*#\[allow\(dead_code\)\]'

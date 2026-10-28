@@ -33,8 +33,10 @@ pub(super) async fn proxy_http_request_with_compression(
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> Option<(u16, u64, bool, bool)> {
+    // HEAD の応答は本文を持たない（Content-Length があっても読まない。B-245）
+    let is_head = request_is_head(&request);
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
@@ -102,6 +104,7 @@ pub(super) async fn proxy_http_request_with_compression(
             cache_ctx,
             security,
             wasm_modules,
+            is_head,
         )
         .await;
 
@@ -131,7 +134,8 @@ pub(super) async fn transfer_response_with_compression(
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
+    is_head: bool,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -193,7 +197,13 @@ pub(super) async fn transfer_response_with_compression(
 
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
+            // B-246: 本文の長さを決められない応答は中継しない（応答の分割になる）
+            if parsed.framing_invalid {
+                warn!("Backend response has conflicting Content-Length / Transfer-Encoding");
+                return (0, 502, false, true);
+            }
             status_code = parsed.status_code;
+            let body_kind = parsed.body(is_head);
             backend_wants_keep_alive = !parsed.is_connection_close;
 
             let header_len = parsed.header_len;
@@ -205,12 +215,17 @@ pub(super) async fn transfer_response_with_compression(
                 extract_header_value(&accumulated[..header_len], b"content-encoding");
 
             // 圧縮すべきか判定
-            let should_compress = compression.should_compress(
-                client_encoding,
-                content_type,
-                parsed.content_length,
-                existing_encoding,
-            );
+            // 本文の無い応答（HEAD・204・304）は圧縮しない（本文を待たない。B-245）
+            let should_compress = if body_kind == ResponseBody::None {
+                None
+            } else {
+                compression.should_compress(
+                    client_encoding,
+                    content_type,
+                    parsed.content_length,
+                    existing_encoding,
+                )
+            };
 
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
@@ -220,23 +235,27 @@ pub(super) async fn transfer_response_with_compression(
                     "[Compression] Initializing compressed transfer with {:?}",
                     encoding
                 );
-                let result = transfer_compressed_response(
+                return match transfer_compressed_response(
                     client_stream,
                     backend_stream,
                     &accumulated[..header_len],
                     body_start,
-                    parsed.content_length,
-                    parsed.is_chunked,
+                    body_kind,
                     encoding,
                     compression,
                     backend_wants_keep_alive,
                     security,
                 )
-                .await;
-
-                return (result.0, status_code, result.1, false);
+                .await
+                {
+                    Some((total, reusable)) => (total, status_code, reusable, false),
+                    // 本文が途中で止まった・クライアントへ書けない: 上流接続は捨て、クライアントも閉じる
+                    None => (0, 502, false, true),
+                };
             } else {
                 // 圧縮無効: そのまま転送（キャッシュ保存対応）
+                // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
+                let start = response_body_start(body_kind, body_start);
 
                 // キャッシュコンテキストがある場合、ヘッダーを設定
                 if let Some(ref mut ctx) = cache_ctx {
@@ -253,7 +272,7 @@ pub(super) async fn transfer_response_with_compression(
                     }
 
                     // 初期ボディをキャプチャ
-                    ctx.append_body(body_start);
+                    ctx.append_body(&body_start[..start.send]);
                 }
 
                 // ヘッダーを修正（security.add_response_headersを追加、remove_response_headersを削除）。
@@ -263,7 +282,7 @@ pub(super) async fn transfer_response_with_compression(
                 let wasm_active = !wasm_modules.is_empty();
                 #[cfg(not(feature = "wasm"))]
                 let wasm_active = false;
-                let modified_headers = if !wasm_active {
+                let mut modified_headers = if !wasm_active {
                     render_response_head(&accumulated[..header_len], status_code, security)
                 } else {
                     let mut modified_headers = accumulated[..header_len].to_vec();
@@ -402,10 +421,12 @@ pub(super) async fn transfer_response_with_compression(
                     }
                     modified_headers
                 };
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+                crate::route_cors::apply_h1(&mut modified_headers, security);
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
-                let body_data = body_start.to_vec();
+                let body_data = body_start[..start.send].to_vec();
                 let write_result = timeout(
                     WRITE_TIMEOUT,
                     client_stream.write_all_vectored(modified_headers, body_data),
@@ -415,56 +436,39 @@ pub(super) async fn transfer_response_with_compression(
                     return (total, status_code, false, true);
                 }
                 total += header_len as u64;
-                total += body_start.len() as u64;
+                total += start.send as u64;
 
-                // 残りのボディを転送（キャッシュキャプチャ対応）
-                let body_remaining = if let Some(cl) = parsed.content_length {
-                    cl.saturating_sub(body_start.len())
-                } else if parsed.is_chunked {
-                    // Chunked の場合は終端まで転送
-                    usize::MAX
-                } else {
-                    0
-                };
-
-                if body_remaining > 0 {
-                    let transferred = transfer_response_body_with_cache(
-                        backend_stream,
-                        client_stream,
-                        parsed.content_length,
-                        parsed.is_chunked,
-                        body_start,
-                        cache_ctx,
-                    )
-                    .await;
-                    total += transferred;
-
-                    // B-17: Content-Length 宣言に満たないまま上流が終了した場合、
-                    // クライアントは残りボディを待ち続けるため接続を即クローズして通知する
-                    if parsed.content_length.is_some() && transferred < body_remaining as u64 {
-                        warn!(
-                            "Backend response body incomplete: {} < {}",
-                            transferred, body_remaining
-                        );
-                        return (total, status_code, false, true);
-                    }
-                } else if parsed.content_length.is_some() {
-                    // B-162: 本文が最初の読み込みに収まった（小さい応答）ときも保存する。以前は残りを転送する
-                    // `transfer_response_body_with_cache` の中でしか保存せず、小さい応答は一度もキャッシュされなかった。
-                    // Content-Length のある完全な本文だけ（接続の終わりで区切る応答は途中かもしれないので保存しない）。
-                    if let Some(ctx) = cache_ctx {
-                        ctx.save_to_cache();
-                    }
+                // 残りのボディを転送（キャッシュキャプチャ対応）。区切りどおりに終わったときだけ
+                // 上流接続を戻し、キャッシュに保存する（B-244。B-162 の小さい応答もここで保存する）
+                let outcome = transfer_response_body_rest(
+                    backend_stream,
+                    client_stream,
+                    body_kind,
+                    start,
+                    cache_ctx,
+                )
+                .await;
+                total += outcome.total;
+                if !outcome.complete {
+                    // B-17: 区切りに満たないまま上流が止まった・終わった。クライアントは残りを待ち続けるので閉じて知らせる
+                    warn!("Backend response body incomplete ({:?})", body_kind);
                 }
-
-                return (total, status_code, backend_wants_keep_alive, false);
+                return (
+                    total,
+                    status_code,
+                    backend_wants_keep_alive && outcome.reusable(body_kind),
+                    outcome.client_must_close(body_kind),
+                );
             }
         }
 
         // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
-        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は、上限か読み取りのタイムアウトまで待たずに 502
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&accumulated)
+        {
             warn!(
-                "Backend response header too large (> {} bytes)",
+                "Backend response header too large (> {} bytes) or invalid",
                 MAX_RESPONSE_HEADER_SIZE
             );
             return (0, 502, false, true);
@@ -527,116 +531,50 @@ pub(super) fn render_response_head(raw: &[u8], status: u16, security: &SecurityC
 }
 
 /// 圧縮してレスポンスを転送
-/// 戻り値: (転送バイト数, backend_wants_keep_alive)
+/// 戻り値: (転送バイト数, 上流接続を再利用できるか)。本文を区切りどおりに読み切れなければ何も送らず
+/// `None`（呼び出し側が 502 にする。途中までを圧縮して完結した応答に見せない。B-244）
 #[cfg(feature = "compression")]
-pub(super) async fn transfer_compressed_response(
+pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent + Unpin>(
     client_stream: &mut ServerTls,
-    backend_stream: &mut TcpStream,
+    backend_stream: &mut R,
     original_headers: &[u8],
     initial_body: &[u8],
-    content_length: Option<usize>,
-    is_chunked: bool,
+    body_kind: ResponseBody,
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
     backend_wants_keep_alive: bool,
     security: &SecurityConfig,
-) -> (u64, bool) {
+) -> Option<(u64, bool)> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
 
     let mut total = 0u64;
 
-    // 1. まず全てのボディデータを収集（ストリーミングは将来の改善）
-    let mut body_data = initial_body.to_vec();
-
-    if let Some(cl) = content_length {
-        let remaining = cl.saturating_sub(initial_body.len());
-        if remaining > 0 {
-            let mut remaining_to_read = remaining;
-            while remaining_to_read > 0 {
-                let read_buf = buf_get();
-                let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-                let (res, mut returned_buf) = match read_result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        return (total, false);
-                    }
-                };
-
-                let n = match res {
-                    Ok(0) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                    Ok(n) => n.min(remaining_to_read),
-                    Err(_) => {
-                        buf_put(returned_buf);
-                        return (total, false);
-                    }
-                };
-
-                returned_buf.set_valid_len(n);
-                body_data.extend_from_slice(returned_buf.as_valid_slice());
-                buf_put(returned_buf);
-                remaining_to_read = remaining_to_read.saturating_sub(n);
-            }
-        }
-    } else if is_chunked {
-        // Chunked の場合はデコードして収集
-        let mut decoder = ChunkedDecoder::new_unlimited();
-
-        // 初期ボディをデコーダにフィード
-        let initial_result = decoder.feed(initial_body);
-        if initial_result == ChunkedFeedResult::Complete {
-            // 初期ボディで完了（本来はデコード済みボディが必要だが、簡略化）
-        } else {
-            // 残りを読み取り
-            loop {
-                let read_buf = buf_get();
-                let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-                let (res, mut returned_buf) = match read_result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        // タイムアウト
-                        break;
-                    }
-                };
-
-                let n = match res {
-                    Ok(0) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(_) => {
-                        buf_put(returned_buf);
-                        break;
-                    }
-                };
-
-                returned_buf.set_valid_len(n);
-                let chunk = returned_buf.as_valid_slice();
-                body_data.extend_from_slice(chunk);
-                let feed_result = decoder.feed(chunk);
-                buf_put(returned_buf);
-
-                if feed_result == ChunkedFeedResult::Complete {
-                    break;
-                }
-            }
-        }
-    }
+    // 1. まず全てのボディデータを収集（ストリーミングは将来の改善）。chunked は復号する
+    // （以前は chunked の枠ごと圧縮していた）
+    let Some((body_data, extra)) =
+        collect_response_body(backend_stream, body_kind, initial_body).await
+    else {
+        warn!("Backend response body incomplete before compression");
+        return None;
+    };
+    let backend_wants_keep_alive =
+        backend_wants_keep_alive && !extra && !matches!(body_kind, ResponseBody::UntilClose);
 
     // 2. ボディを圧縮
     let compressed_body = match encoding {
         AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
             Some(compressed) => compressed,
             None => {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await
+                .map(|t| (t, backend_wants_keep_alive));
             }
         },
         AcceptedEncoding::Gzip => {
@@ -644,8 +582,14 @@ pub(super) async fn transfer_compressed_response(
             let mut encoder = GzEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
                 // 圧縮失敗: 非圧縮で送信
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await
+                .map(|t| (t, backend_wants_keep_alive));
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -654,8 +598,10 @@ pub(super) async fn transfer_compressed_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
-                    .await;
+                    .await
+                    .map(|t| (t, backend_wants_keep_alive));
                 }
             }
         }
@@ -667,8 +613,14 @@ pub(super) async fn transfer_compressed_response(
             };
             let mut input = std::io::Cursor::new(&body_data);
             if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await
+                .map(|t| (t, backend_wants_keep_alive));
             }
             compressed
         }
@@ -676,8 +628,14 @@ pub(super) async fn transfer_compressed_response(
             let level = Compression::new(compression.gzip_level);
             let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
             if encoder.write_all(&body_data).is_err() {
-                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
-                    .await;
+                return transfer_uncompressed_fallback(
+                    client_stream,
+                    original_headers,
+                    &body_data,
+                    security,
+                )
+                .await
+                .map(|t| (t, backend_wants_keep_alive));
             }
             match encoder.finish() {
                 Ok(data) => data,
@@ -686,8 +644,10 @@ pub(super) async fn transfer_compressed_response(
                         client_stream,
                         original_headers,
                         &body_data,
+                        security,
                     )
-                    .await;
+                    .await
+                    .map(|t| (t, backend_wants_keep_alive));
                 }
             }
         }
@@ -698,14 +658,19 @@ pub(super) async fn transfer_compressed_response(
     };
 
     // 3. 新しいヘッダーを構築
-    let new_headers =
-        build_compressed_headers(original_headers, encoding, compressed_body.len(), security);
+    let new_headers = build_compressed_headers(
+        original_headers,
+        Some(encoding),
+        compressed_body.len(),
+        security,
+    );
 
     // 4. ヘッダー送信（所有権を移動、clone 不要）
     let new_headers_len = new_headers.len();
     let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
-        return (total, false);
+        // クライアントへ書けない: 呼び出し側はクライアント接続を閉じる
+        return None;
     }
     total += new_headers_len as u64;
 
@@ -713,59 +678,51 @@ pub(super) async fn transfer_compressed_response(
     let compressed_len = compressed_body.len();
     let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(compressed_body)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
-        return (total, false);
+        // クライアントへ書けない: 呼び出し側はクライアント接続を閉じる
+        return None;
     }
     total += compressed_len as u64;
 
-    (total, backend_wants_keep_alive)
+    Some((total, backend_wants_keep_alive))
 }
 
-/// compression feature 無効時のスタブ
+/// compression feature 無効時のスタブ（`should_compress` が常に `None` なので呼ばれない）
 #[cfg(not(feature = "compression"))]
-pub(super) async fn transfer_compressed_response(
-    client_stream: &mut ServerTls,
-    _backend_stream: &mut TcpStream,
-    original_headers: &[u8],
-    initial_body: &[u8],
-    _content_length: Option<usize>,
-    _is_chunked: bool,
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent + Unpin>(
+    _client_stream: &mut ServerTls,
+    _backend_stream: &mut R,
+    _original_headers: &[u8],
+    _initial_body: &[u8],
+    _body_kind: ResponseBody,
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
     _backend_wants_keep_alive: bool,
     _security: &SecurityConfig,
-) -> (u64, bool) {
-    transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
+) -> Option<(u64, bool)> {
+    None
 }
 
-/// 圧縮失敗時のフォールバック（非圧縮で送信）
+/// 圧縮失敗時のフォールバック（非圧縮で送信）。クライアントへ書けなければ `None`。
+/// 本文は集めた（chunked は復号した）ものなので、長さのヘッダを付け直す。
+#[cfg(feature = "compression")]
 pub(super) async fn transfer_uncompressed_fallback(
     client_stream: &mut ServerTls,
     original_headers: &[u8],
     body_data: &[u8],
-) -> (u64, bool) {
-    let mut total = 0u64;
-
-    // ヘッダー送信（所有権ベースの I/O なので to_vec、clone は不要）
-    let headers_len = original_headers.len();
+    security: &SecurityConfig,
+) -> Option<u64> {
+    let head = build_compressed_headers(original_headers, None, body_data.len(), security);
+    let total = (head.len() + body_data.len()) as u64;
     let write_result = timeout(
         WRITE_TIMEOUT,
-        client_stream.write_all(original_headers.to_vec()),
+        client_stream.write_all_vectored(head, body_data.to_vec()),
     )
     .await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return (total, false);
+    if !matches!(write_result, Ok((Ok(()), _, _))) {
+        return None;
     }
-    total += headers_len as u64;
-
-    // ボディ送信
-    let body_len = body_data.len();
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(body_data.to_vec())).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return (total, false);
-    }
-    total += body_len as u64;
-
-    (total, true)
+    Some(total)
 }
 
 /// 圧縮用にヘッダーを書き換え
@@ -773,7 +730,7 @@ pub(super) async fn transfer_uncompressed_fallback(
 #[cfg(feature = "compression")]
 pub(super) fn build_compressed_headers(
     original_headers: &[u8],
-    encoding: AcceptedEncoding,
+    encoding: Option<AcceptedEncoding>,
     compressed_length: usize,
     security: &SecurityConfig,
 ) -> Vec<u8> {
@@ -818,10 +775,12 @@ pub(super) fn build_compressed_headers(
         new_headers.extend_from_slice(b"\r\n");
     }
 
-    // Content-Encoding を追加
-    new_headers.extend_from_slice(b"Content-Encoding: ");
-    new_headers.extend_from_slice(encoding.as_header_value());
-    new_headers.extend_from_slice(b"\r\n");
+    // Content-Encoding を追加（`None` は圧縮に失敗して素のまま送る本文。長さだけ付け直す）
+    if let Some(encoding) = encoding {
+        new_headers.extend_from_slice(b"Content-Encoding: ");
+        new_headers.extend_from_slice(encoding.as_header_value());
+        new_headers.extend_from_slice(b"\r\n");
+    }
 
     // Content-Length を追加（圧縮後のサイズ）
     new_headers.extend_from_slice(b"Content-Length: ");
@@ -830,7 +789,9 @@ pub(super) fn build_compressed_headers(
     new_headers.extend_from_slice(b"\r\n");
 
     // Vary ヘッダーを追加（キャッシュ制御）
-    new_headers.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    if encoding.is_some() {
+        new_headers.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
 
     // 追加するヘッダーを追加
     for (header_name, header_value) in &security.add_response_headers {
@@ -844,159 +805,10 @@ pub(super) fn build_compressed_headers(
 
     // ヘッダー終端
     new_headers.extend_from_slice(b"\r\n");
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::apply_h1(&mut new_headers, security);
 
     new_headers
-}
-
-/// レスポンスボディを転送（キャッシュキャプチャ対応版）
-///
-/// キャッシュコンテキストが指定されている場合、ボディをキャプチャしてキャッシュに保存します。
-pub(super) async fn transfer_response_body_with_cache(
-    backend_stream: &mut TcpStream,
-    client_stream: &mut ServerTls,
-    content_length: Option<usize>,
-    is_chunked: bool,
-    initial_body: &[u8],
-    mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> u64 {
-    let mut total = 0u64;
-
-    if let Some(cl) = content_length {
-        let remaining = cl.saturating_sub(initial_body.len());
-        if remaining > 0 {
-            let transferred = transfer_exact_bytes_from_backend_with_cache(
-                backend_stream,
-                client_stream,
-                remaining,
-                cache_ctx,
-            )
-            .await;
-            total += transferred;
-        }
-    } else if is_chunked {
-        // Chunked 転送（キャッシュキャプチャ対応）
-        let mut decoder = ChunkedDecoder::new_unlimited();
-        decoder.feed(initial_body);
-
-        if decoder.is_complete() {
-            // 転送完了後にキャッシュに保存
-            if let Some(ctx) = cache_ctx {
-                ctx.save_to_cache();
-            }
-            return total;
-        }
-
-        loop {
-            let read_buf = buf_get();
-            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-            let (res, mut returned_buf) = match read_result {
-                Ok(result) => result,
-                Err(_) => break,
-            };
-
-            let n = match res {
-                Ok(0) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-            };
-
-            returned_buf.set_valid_len(n);
-            let chunk = returned_buf.as_valid_slice();
-            let feed_result = decoder.feed(chunk);
-
-            // キャッシュコンテキストにボディをキャプチャ
-            if let Some(ref mut ctx) = cache_ctx {
-                ctx.append_body(chunk);
-            }
-
-            // クライアントに転送
-            let chunk_data = chunk.to_vec();
-            let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk_data)).await;
-            buf_put(returned_buf);
-
-            if !matches!(write_result, Ok((Ok(_), _))) {
-                break;
-            }
-            total += n as u64;
-
-            if feed_result == ChunkedFeedResult::Complete {
-                break;
-            }
-        }
-
-        // 転送完了後にキャッシュに保存
-        if let Some(ctx) = cache_ctx {
-            ctx.save_to_cache();
-        }
-    }
-
-    total
-}
-
-/// バックエンドから正確なバイト数を読み取りクライアントに転送（キャッシュキャプチャ対応版）
-pub(super) async fn transfer_exact_bytes_from_backend_with_cache(
-    backend_stream: &mut TcpStream,
-    client_stream: &mut ServerTls,
-    mut remaining: usize,
-    mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> u64 {
-    let mut total = 0u64;
-
-    while remaining > 0 {
-        let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => break,
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n.min(remaining),
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-
-        returned_buf.set_valid_len(n);
-        let chunk = returned_buf.as_valid_slice();
-
-        // キャッシュコンテキストにボディをキャプチャ
-        if let Some(ref mut ctx) = cache_ctx {
-            ctx.append_body(&chunk[..n]);
-        }
-
-        // クライアントに転送
-        let chunk_data = chunk[..n].to_vec();
-        let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk_data)).await;
-        buf_put(returned_buf);
-
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            break;
-        }
-
-        total += n as u64;
-        remaining = remaining.saturating_sub(n);
-    }
-
-    // 転送完了後にキャッシュに保存
-    if let Some(ctx) = cache_ctx {
-        ctx.save_to_cache();
-    }
-
-    total
 }
 
 #[cfg(test)]

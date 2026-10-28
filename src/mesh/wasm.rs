@@ -55,6 +55,7 @@ pub fn load(
             String::from_utf8_lossy(&configuration).into_owned(),
         ),
         capabilities: capabilities(),
+        ..Default::default()
     };
     // Envoy の Wasm にはメモリの上限が無い（C++ SDK の emscripten 製は最小で 16MB を要求する）。
     // プーリングアロケータは 1 スロットごとに仮想アドレスを予約するだけなので、上限を大きめにする
@@ -65,6 +66,9 @@ pub fn load(
         defaults,
         modules: vec![module],
         interpreter: false,
+        grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+        http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+        shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
     };
     let mut engine =
         FilterEngine::new(&cfg).map_err(|e| format!("wasm plugin {}: {:#}", name, e))?;
@@ -98,7 +102,14 @@ pub async fn on_request(
     let r = w
         .engine
         .clone()
-        .on_request_headers_with_modules_async(w.modules.clone(), path, method, hv, ip, rq.eos)
+        .on_request_headers_with_modules_async(
+            crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
+            path,
+            method,
+            hv,
+            ip,
+            rq.eos,
+        )
         .await;
     match r {
         FilterResult::Continue { headers, .. } => {
@@ -135,7 +146,12 @@ pub async fn on_response(ran: &Ran, status: u16, headers: &mut Vec<(Bytes, Bytes
         let r = w
             .engine
             .clone()
-            .on_response_headers_with_modules_async(w.modules.clone(), status, hv, false)
+            .on_response_headers_with_modules_async(
+                crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
+                status,
+                hv,
+                false,
+            )
             .await;
         if let FilterResult::Continue { headers: h, .. } = r {
             headers.clear();

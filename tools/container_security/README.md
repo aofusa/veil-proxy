@@ -129,10 +129,10 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損/順序逆転 + 複合(loss+delay)の注入と回復（F-69、既定 SKIP） |
 | 3g リソース枯渇 | `chaos/resource_exhaustion_chaos.sh` | cgroup 制約下の高並行負荷で panic/OOM 回避（F-68、既定 SKIP） |
 | 3h syscall 障害注入 | `chaos/syscall_chaos.sh` | strace inject で io_uring_enter/setup に EBUSY/ENOMEM/EINTR/EFAULT を注入し panic/segfault なしを検証（F-86、既定 SKIP。CAP_SYS_PTRACE 必要） |
-| 3i E2E sanitizer | `chaos/e2e_sanitizer_chaos.sh` | ASAN/TSAN ビルドの Veil にカオス負荷 + SIGHUP を与え UAF/リーク/データ競合を実行検出（F-85、既定 SKIP。`RUN_E2E_ASAN=1`/`RUN_E2E_TSAN=1`）。LeakSanitizer は終了時に走るので SIGTERM 後の終了（`SAN_EXIT_WAIT` 秒以内・終了コード 0）まで確かめ、ptrace を妨げる seccomp・Landlock・特権降格は外して起動する（B-116） |
+| 3i E2E sanitizer | `chaos/e2e_sanitizer_chaos.sh` | ASAN/TSAN ビルドの Veil にカオス負荷 + SIGHUP を与え UAF/リーク/データ競合を実行検出（F-85、既定 SKIP。`RUN_E2E_ASAN=1`/`RUN_E2E_TSAN=1`。両方 1 なら address → thread の順に別々に回し、`e2e_sanitizer_<sanitizer>_report.txt` に分ける。B-241）。LeakSanitizer は終了時に走るので SIGTERM 後の終了（`SAN_EXIT_WAIT` 秒以内・終了コード 0）まで確かめ、ptrace を妨げる seccomp・Landlock・特権降格は外して起動する（B-116） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
-| 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性 |
+| 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性（と、ライブラリが同梱する Swagger UI の npm の advisory。F-264）。vendoring 版（`third_party/*`）は `README.veil.md` の元の名前と版で RustSec と GitHub の勧告（`vendored_ghsa_audit.py`）に照合し、差分で直した勧告は `- advisory-ignore: ID（理由）` で外す（F-277） |
 | 4c cargo-deny | `security/run_cargo_deny.sh` | advisory + ライセンス（`deny.toml`） |
 | 4d semgrep(SAST) | `security/run_semgrep.sh` | 自作コードの静的解析（`p/rust`+`p/security-audit`、F-64） |
 | 4e SBOM | `security/run_sbom.sh` | syft で source(CycloneDX)+image(SPDX) 生成（F-65） |
@@ -142,7 +142,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 4i differential | `security/run_differential.sh` | Veil vs nginx の応答差分比較（曖昧解釈検出、F-77、専用トポロジ・既定 SKIP） |
 | 4j full features | `security/run_full_features_security.sh` | admin/compression+cache/http3/l4/ws/grpc/rate-limit/wasm/metrics/otel プローブ（F-90） |
 | 5 Trivy | `run_trivy_scan` | イメージ脆弱性（HIGH/CRITICAL） |
-| 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml` |
+| 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml`。failed のフェーズが 1 つでもあれば `run.sh` は終了コード 1 で終わる（B-217。各フェーズは失敗しても続行し、最後にまとめて判定する） |
 | 最終 | `health_check.sh` | 全フェーズ後の応答確認（最大 10 回リトライ） |
 
 ---
@@ -157,7 +157,11 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | `config_toml` | 設定 TOML パーサ（`test_config_file`） |
 | `http2_frame_decode` | HTTP/2 フレームデコーダ |
 | `http_header_validate` | HTTP/1 ヘッダー名・値の境界検証（`fuzz_api`） |
-| `io_uring_executor` | io_uring executor への擬似 CQE 注入（異常 res・偽造/stale user_data・順序逆転。`fuzz_api::io_uring_executor_smoke`、F-84） |
+| `io_uring_executor` | io_uring executor への擬似 CQE 注入（異常 res・偽造/stale user_data・順序逆転・ガードの再入。`fuzz_api::io_uring_executor_smoke`、F-84・F-279） |
+| `http2_connection_state` | HTTP/2 の接続状態機械（SETTINGS・ストリームの列・CONTINUATION。HPACK の表・同時ストリーム数・ヘッダブロックの上限。F-279） |
+| `http_response_parse` | 上流の応答のヘッダの解析と chunked の復号（一括と 1 バイトずつ・厳格と緩いの一致。F-279） |
+| `path_norm` | パスの正規化（ドットのセグメントが残らない・クエリを保つ。F-279） |
+| `h3_field_section` | HTTP/3 の要求のフィールドセクションの検査（RFC 9114 §4.3.1。F-279） |
 | `wasm_abi` | WASM モジュール/ABI 境界（`fuzz_api::wasm_module_smoke`、F-70。`--features wasm` で有効化） |
 | `wasm_host_abi` | WASM ホスト ABI 境界＝ゲスト→ホスト マップ復元の冪等性（`fuzz_api::wasm_host_abi_map_smoke`、F-70。`--features wasm`。`RUN_WASM_FUZZ=1` で有効化） |
 
@@ -268,6 +272,7 @@ tools/container_security/
 ├── security/
 │   ├── run_cargo_audit.sh
 │   ├── run_cargo_deny.sh
+│   ├── vendored_ghsa_audit.py   # vendoring 版を GitHub の勧告と照合（F-277）
 │   └── run_testssl.sh
 ├── lib/
 │   ├── common.sh          # 起動・cleanup・run_harness

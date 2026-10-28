@@ -143,6 +143,9 @@ pub async fn get_static_file_with_content(
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         if fast_path_available(path, containment) {
+            // F-272: 開く前に監視の世代を読む（読み込み中の差し替えを新しい世代で残さない）
+            let meta_stamp = super::watch::stamp(ofc.and_then(|c| c.watch_gen));
+            let content_stamp = super::watch::stamp(content_cfg.watch_gen);
             let owned = path.to_path_buf();
             // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
             let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
@@ -156,19 +159,22 @@ pub async fn get_static_file_with_content(
             let outcome = loaded?;
 
             match outcome {
-                FastOutcome::File(meta, data) => {
+                FastOutcome::File(mut meta, data) => {
                     // 両方のキャッシュへ登録する（各キャッシュの既存の有効化・上限判定を
                     // そのまま使う）。
+                    meta.set_stamp(meta_stamp);
                     file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
-                    content_cache::insert_bytes(
+                    content_cache::insert_bytes_stamped(
                         path,
                         data.clone(),
                         meta.mime_type.clone(),
                         content_cfg,
+                        content_stamp,
                     );
                     return Some(StaticFileOutcome::File(meta, data));
                 }
-                FastOutcome::Directory(meta) => {
+                FastOutcome::Directory(mut meta) => {
+                    meta.set_stamp(meta_stamp);
                     file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
                     return Some(StaticFileOutcome::Directory(meta));
                 }
@@ -359,6 +365,8 @@ mod tests {
             enabled: Some(true),
             valid_duration_secs: Some(60),
             max_entries: Some(1024),
+            watch: None,
+            watch_gen: None,
         }
     }
 
@@ -370,6 +378,8 @@ mod tests {
             max_file_size_bytes: 1024 * 1024,
             max_total_bytes: 64 * 1024 * 1024,
             revalidate_mtime: false,
+            watch: false,
+            watch_gen: None,
         }
     }
 

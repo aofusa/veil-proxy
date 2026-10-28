@@ -347,7 +347,7 @@ unsafe fn span_take(heap: *mut Heap, n: usize) -> Option<(*mut Page, bool)> {
         let zero = (*seg).take_run(first, n);
         (*heap).dirty_slots -= was_dirty.count_ones();
         let page = (*seg).pages.as_mut_ptr().add(first);
-        (*page).start = (seg as *mut u8).add(first << SLOT_SHIFT);
+        (*page).start = segment::segment_base(seg).add(first << SLOT_SHIFT);
         (*page).slots = n as u8;
         (*page).prev = ptr::null_mut();
         (*page).next = ptr::null_mut();

@@ -1,6 +1,6 @@
 # B-224: `MultishotUdpRecv` の後始末が `consume_cqes` の中で `with_ring` を再入し、`BorrowMutError` で HTTP/3 のワーカーが落ちる
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー RT-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -25,6 +25,10 @@ multishot 受信、opt-in）のときだけ通る経路。
 
 - `fuzz/fuzz_targets/io_uring_executor.rs` のモデルに「ガードが `with_ring` を呼ぶ」ケースを足し、`consume_cqes` 中の再入を検出する。
 - `VEIL_H3_BUFRING=1` で HTTP/3 の E2E を回し、graceful shutdown・`downgrade_to_pipelined_if_einval` の経路でワーカーが落ちない。
+
+## 修正（v0.10.0）
+
+- `OpTable::on_cqe_take_guard` は detach 済みの op のガードを走らせずに返し、`process_cqe` はスレッドローカルの `DEFERRED_GUARDS` に積む。`poll_completions` が `consume_cqes`（RING の可変借用）を抜けた後に `run_deferred_guards` で走らせるので、ガードの閉包が `with_ring`・`alloc_op` を呼んでも二重借用にならない。
 
 ## 関連
 

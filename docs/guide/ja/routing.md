@@ -574,6 +574,7 @@ WebSocket双方向転送時のポーリング動作を制御します。
 | `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
 | `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
 | `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
+| `websocket_idle_timeout_secs` | アップグレード（`101`）の後のトンネルで、どちらの向きにもこの時間データが流れなければ閉じる。0 は無制限 | 0 |
 
 #### ポーリングモードの選択
 
@@ -763,7 +764,8 @@ Linuxのnamespace分離、bind mounts、capabilities制限を適用すること�
 | `sandbox_unshare_pid` | PID namespace分離 | false |
 | `sandbox_unshare_user` | User namespace分離 | false |
 | `sandbox_unshare_net` | Network namespace分離（**警告: 通信不可**） | false |
-| `sandbox_keep_capabilities` | 保持するケイパビリティ | [] |
+| `sandbox_keep_capabilities` | 保持するケイパビリティ（それ以外を全て落とす。優先） | [] |
+| `sandbox_drop_capabilities` | 落とすケイパビリティ | [] |
 | `sandbox_ro_bind_mounts` | 読み取り専用バインドマウント（source:dest形式） | 標準パス |
 | `sandbox_rw_bind_mounts` | 読み書きバインドマウント | [] |
 | `sandbox_tmpfs_mounts` | tmpfsマウント先 | ["/tmp"] |
@@ -771,6 +773,10 @@ Linuxのnamespace分離、bind mounts、capabilities制限を適用すること�
 | `sandbox_mount_dev` | /devを作成 | true |
 | `sandbox_hostname` | サンドボックス内のホスト名 | "veil-sandbox" |
 | `sandbox_no_new_privs` | PR_SET_NO_NEW_PRIVSを設定 | true |
+
+bind・tmpfs・`/proc`・`/dev` のマウントに失敗すると、`allow_security_failures = true` でない限り起動を止めます。ソースが無い
+bind（環境によっては `/lib64` など）は飛ばします。起動時のセキュリティの状態に失敗したマウントが出ます。`sandbox_mount_dev` は
+`/dev` に tmpfs を被せ、`null`・`zero`・`random`・`urandom` をホストのデバイスから bind します。
 
 ```toml
 [security]
@@ -782,6 +788,11 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 sandbox_ro_bind_mounts = ["/usr:/usr", "/lib:/lib", "/lib64:/lib64"]
 sandbox_tmpfs_mounts = ["/tmp"]
 ```
+
+落とすケイパビリティは bounding set だけでなく、プロセスの全スレッドの effective・permitted・inheritable・ambient から
+落とします（`drop_privileges_user` を使わずに root で起動しても持ち続けません）。結果は起動時のログ
+（`Capabilities: effective=… bounding=…`）に出ます。落とせないスレッドがあると、`allow_security_failures = true` で
+なければ起動を止めます。
 
 > **注意**: `sandbox_unshare_net = true` にするとネットワーク通信ができなくなります。リバースプロキシでは通常 `false` のままにしてください。
 
@@ -819,6 +830,7 @@ sandbox_tmpfs_mounts = ["/tmp"]
 | | `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
 | | `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
 | | `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
+| | `websocket_idle_timeout_secs` | `101` の後のトンネルのアイドルタイムアウト（0 は無制限） | 0 |
 
 #### セキュリティ設定例
 
@@ -870,6 +882,11 @@ CORS のプリフライト〉と `[route.jwt]` の応答も含む）。HTTP/1.1�
 
 状態を持たない検査を先にするので、大きさで拒否する要求はレート制限の枠を使わない。
 
+レート制限の表は固定の大きさ（65,536 スロット・512KB。最初に使うときに確保）なので、クライアントの数でメモリは増えない。
+スロットはプロセスごとの乱数を鍵にしたハッシュで選ぶので、クライアントが同じスロットの相手を選ぶことはできない。
+同じ分に多数（数万）のクライアントが来ると無関係なクライアントがスロットを共有し、自分の上限の前に 429 を受けることがある
+（設定より多く通すことはない）。
+
 #### IP制限の評価順序
 
 IP制限は **deny → allow** の順で評価されます（denyが優先）。
@@ -891,8 +908,8 @@ IPv4 として照合するので、`192.0.2.0/24` に含まれる。射影の形
 
 ## ルート単位のトラフィック制御（F-219）
 
-`type = "Respond"` は固定応答を返す。`[route.traffic]` は任意のルートに重み付き分割・フォルト注入（中断）・CORS の
-プリフライトへの応答を足す。どれも設定のロード時に解決し、要求のたびには作っておいたバックエンドから 1 つ選ぶだけ
+`type = "Respond"` は固定応答を返す。`[route.traffic]` は任意のルートに重み付き分割・フォルト注入（中断）・CORS
+（プリフライトへの応答と、実際の応答のヘッダ）を足す。どれも設定のロード時に解決し、要求のたびには作っておいたバックエンドから 1 つ選ぶだけ
 （分割と中断は乱数 1 個）。`[route.traffic]` の無いルートには影響しない。HTTP/1.1・HTTP/2・HTTP/3 のどれでも効く。
 
 ```toml
@@ -925,20 +942,38 @@ split = [
 abort_status = 503
 abort_percent = 5.0          # 0〜100、既定 100
 
-# CORS のプリフライト（Origin と Access-Control-Request-Method の付いた OPTIONS）
+# CORS: プリフライトへの応答と実際の応答のヘッダ
 [route.traffic.cors]
 allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
 allow_methods = ["GET", "POST"]
 allow_headers = ["content-type", "authorization"]
-expose_headers = []
+expose_headers = []          # 実際の応答（とプリフライト）の Access-Control-Expose-Headers
 max_age_secs = 600
 allow_credentials = false    # "*" とは併用できない
+override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える
+reject_disallowed = false    # true: 許可しない Origin の要求に 403 を返す
 ```
 
 - 分割先にもルートの `security`・`compression`・`buffering`・`modules` が効く（action と同じ）。
-- プリフライトへの応答は `200` と `Access-Control-Allow-*` のヘッダで、一致したオリジンをそのまま返す（`Vary: Origin`）。
-  他のオリジンからのプリフライトと、プリフライトでない要求は action へ行く。実際の応答の
-  `Access-Control-Allow-Origin` は `[route.security] add_response_headers` で付ける。
+- **プリフライト**: 許可したオリジンからの `Origin` と `Access-Control-Request-Method` の付いた `OPTIONS` には、`200` と
+  `Access-Control-Allow-*` のヘッダで答え、一致したオリジンをそのまま返す（`Vary: Origin`）。他のオリジンからの
+  プリフライトは action へ行く。
+- **実際の応答**（それ以外の要求。File・Proxy・Handler・Redirect・Respond のルート、HTTP/1.1・HTTP/2・HTTP/3）: 要求の
+  `Origin` が許可したものなら、`Access-Control-Allow-Origin`（そのオリジン。`"*"` の項に当たったときは `*`）・
+  `Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）・`Access-Control-Expose-Headers`（`expose_headers`
+  のとき）・`Vary: Origin`（項が `"*"` だけのときは付けない。既存の `Vary` の隣に足す）を足す。`Origin` の無い要求と
+  許可しないオリジンの要求は普通に処理し、`Vary: Origin` だけを付ける（ブラウザが拒否する。`reject_disallowed = true`
+  なら 403 で返す）。
+- 上流（ハンドラ、`Respond` の action のヘッダも同じ）が既に `Access-Control-Allow-Origin` を返したら、上流の CORS の
+  ヘッダを残して何も足さない。`override_upstream = true` なら上流の `Access-Control-Allow-Origin`・`-Allow-Credentials`・
+  `-Expose-Headers` を除いて veil のものを足す。veil が足すときは、いつも上流の `Access-Control-Allow-Credentials`・
+  `-Expose-Headers` を除く（上流が `Access-Control-Allow-Origin` 無しで返したものが veil の値と重なったり、ルートが許可して
+  いない credentials を有効にしたりしない）。
+- ヘッダは設定のロード時に組み立てる（許可したオリジンごとにルートのバックエンドの写しを 1 つ作る）。要求のたびには
+  `Origin` を 1 回照合し、組み立て済みのヘッダを足すだけ。`[route.traffic.cors]` の無いルートには影響しない。ルートを
+  選ぶ前に veil が返す応答（未知のパスの `404`、セキュリティの拒否、フォルトの中断、JWT のエラー）と WebSocket の
+  Upgrade には付かない。HTTP/1.1 で kTLS のとき、CORS のあるルートのプロキシ応答はユーザー空間の経路を通る
+  （`splice(2)` の中継ではヘッダを足せないため）。
 - フォルトの中断を設定したルートの要求は、HTTP/2・HTTP/3 ではバッファ経路を通る（判定は要求をディスパッチするときの 1 回）。
 - TOML のルートにはまだ無いもの（F-226）: ルート単位の要求のタイムアウト、条件付きのリトライ、ミラー、フォルトの遅延。
   メッシュのデータプレーンは Istio / Linkerd のポリシーからこれらを実装している（[mesh.md](mesh.md)）。TOML のルートでは
@@ -1025,6 +1060,8 @@ redirect_status = 301
 |-----------|------|-----|
 | `add_request_headers` | 追加するヘッダー（テーブル形式） | `{ "X-Real-IP" = "$client_ip" }` |
 | `remove_request_headers` | 削除するヘッダー（配列） | `["X-Debug-Token"]` |
+| `forwarded_headers` | `"append"`（既定）: `trusted_proxies` に入らないクライアントが送った `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・`Forwarded` は上流へ送らず、`X-Forwarded-For` にクライアントの IP を入れる。`trusted_proxies` からは受けた値を残し、クライアントの IP を `X-Forwarded-For` の別の行として足す。`"passthrough"`: 受けたまま送り何も足さない（v0.10.0 より前の動き）。`add_request_headers` に `X-Forwarded-For` があればそちらを使う | `"append"` |
+| `trusted_proxies` | 転送ヘッダを信頼する送信元（IP/CIDR）。veil の前段のロードバランサなど | `["10.0.0.0/8"]` |
 
 #### 特殊変数
 

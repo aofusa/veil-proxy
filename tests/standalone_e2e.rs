@@ -1712,6 +1712,18 @@ path = "{www}"
 /// HTTP/3 で要求を 1 つ送り、(状態コード, 本文) を返す（F-234 のプロトコルの行列の試験）。
 #[cfg(feature = "http3")]
 fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    h3_request_with_headers(port, method, path, &[], body)
+}
+
+/// [`h3_request`] に要求ヘッダを足したもの（B-172）。
+#[cfg(feature = "http3")]
+fn h3_request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     use bytes::Buf;
     use std::sync::Arc;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1739,11 +1751,13 @@ fn h3_request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>
         let drive = tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
-        let req = http::Request::builder()
+        let mut req = http::Request::builder()
             .method(method)
-            .uri(format!("https://localhost:{port}{path}"))
-            .body(())
-            .unwrap();
+            .uri(format!("https://localhost:{port}{path}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = req.body(()).unwrap();
         let mut stream = send.send_request(req).await.unwrap();
         if !body.is_empty() {
             stream
@@ -1900,4 +1914,1911 @@ allowed_methods = ["POST"]
     check_order("h2", &|p, b| h2("POST", p, b));
     #[cfg(feature = "http3")]
     check_order("h3", &|p, b| h3_request(tls_port, "POST", p, b).0);
+}
+
+// ===================== F-260 =====================
+
+/// HttpArena と同じ 4 ポート（平文 HTTP/1.1 + h2c・TLS で h2 を選ばない HTTP/1.1・h2c だけ・TLS h2 + HTTP/3）と
+/// https へのリダイレクトのリスナーを 1 プロセスの `[[listener]]` で立てる。
+fn f260_config(dir: &std::path::Path, ports: &F260Ports, plain_extra: &str) -> String {
+    let (cert, key) = write_self_signed(dir);
+    let www = dir.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "multi").unwrap();
+    let http3 = if cfg!(feature = "http3") {
+        "http3 = true"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+[server]
+http2_enabled = true
+threads = 1
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[logging]
+level = "info"
+
+[[listener]]
+name = "plain"
+listen = "127.0.0.1:{plain}"
+tls = false
+
+[[listener]]
+name = "h1tls"
+listen = "127.0.0.1:{h1tls}"
+tls = true
+http2 = false
+
+[[listener]]
+name = "h2c"
+listen = "127.0.0.1:{h2c}"
+tls = false
+{plain_extra}
+
+[[listener]]
+name = "https"
+listen = "127.0.0.1:{https}"
+tls = true
+{http3}
+
+[[listener]]
+name = "redirect"
+listen = "127.0.0.1:{redirect}"
+tls = false
+secure_redirect = true
+redirect_to = "https"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www = tp(&www),
+        plain = ports.plain,
+        h1tls = ports.h1tls,
+        h2c = ports.h2c,
+        https = ports.https,
+        redirect = ports.redirect,
+    )
+}
+
+struct F260Ports {
+    plain: u16,
+    h1tls: u16,
+    h2c: u16,
+    https: u16,
+    redirect: u16,
+}
+
+impl F260Ports {
+    fn new() -> Self {
+        F260Ports {
+            plain: free_port(),
+            h1tls: free_port(),
+            h2c: free_port(),
+            https: free_port(),
+            redirect: free_port(),
+        }
+    }
+
+    fn all(&self) -> [u16; 5] {
+        [self.plain, self.h1tls, self.h2c, self.https, self.redirect]
+    }
+}
+
+/// F-260: 複数の `[[listener]]` を 1 プロセスで待ち受け、リスナーごとのプロトコル・ALPN・リダイレクトを守る。
+#[test]
+fn f260_multiple_listeners_in_one_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = F260Ports::new();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        f260_config(dir.path(), &ports, "allow_http = false"),
+    )
+    .unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    for p in ports.all() {
+        assert!(
+            wait_for_port(p, Duration::from_secs(20)),
+            "port {p}: {}",
+            veil.log()
+        );
+    }
+    // 1 リスナー 1 行の起動ログ
+    for name in ["plain", "h1tls", "h2c", "https", "redirect"] {
+        assert!(
+            veil.log().contains(&format!("listener \"{name}\"")),
+            "{name}: {}",
+            veil.log()
+        );
+    }
+
+    // 平文: HTTP/1.1 と h2c
+    let resp = http1_get(ports.plain, "/index.html").expect("plain HTTP/1.1");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "multi");
+    assert_eq!(
+        h2c_get(ports.plain, "/index.html"),
+        (200, b"multi".to_vec())
+    );
+
+    // TLS（http2 = false）: h2 を出しても選ばれず HTTP/1.1
+    let (alpn, resp) =
+        tls_alpn_get(ports.h1tls, &[b"h2", b"http/1.1"], "/index.html").expect("TLS h1");
+    assert_ne!(alpn.as_deref(), Some(&b"h2"[..]), "{}", veil.log());
+    let resp = resp.expect("HTTP/1.1 over TLS");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    assert_eq!(resp.text(), "multi");
+
+    // h2c だけ: HTTP/1.1 は 426、h2c は 200
+    let resp = http1_get(ports.h2c, "/index.html").expect("426");
+    assert_eq!(resp.status, 426, "{}", veil.log());
+    assert_eq!(h2c_get(ports.h2c, "/index.html"), (200, b"multi".to_vec()));
+
+    // TLS（http2 の既定 = [server] http2_enabled）: ALPN で h2
+    let (alpn, _) = tls_alpn_get(ports.https, &[b"h2", b"http/1.1"], "/index.html").expect("h2");
+    assert_eq!(alpn.as_deref(), Some(&b"h2"[..]), "{}", veil.log());
+    let (_, resp) = tls_alpn_get(ports.https, &[b"http/1.1"], "/index.html").expect("TLS h1");
+    let resp = resp.expect("HTTP/1.1 over TLS");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+    #[cfg(feature = "http3")]
+    {
+        // Alt-Svc は HTTP/3 のリスナーの UDP ポート
+        let want = format!("h3=\":{}\"", ports.https);
+        assert!(
+            resp.header("alt-svc").is_some_and(|v| v.contains(&want)),
+            "alt-svc: {:?}",
+            resp.headers
+        );
+        assert_eq!(
+            h3_get_status(ports.https, "/index.html"),
+            Ok(200),
+            "{}",
+            veil.log()
+        );
+    }
+
+    // リダイレクトのリスナー: redirect_to のポートへ 301（HTTP/1.1・h2c とも）
+    let want = format!("https://localhost:{}/index.html", ports.https);
+    let resp = http1_get(ports.redirect, "/index.html").expect("301");
+    assert_eq!(resp.status, 301, "{}", veil.log());
+    assert_eq!(resp.header("location"), Some(want.as_str()));
+    let (status, headers, _) = h2c_get_with_headers(ports.redirect, "/index.html");
+    assert_eq!(status, 301);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(n, _)| n == "location")
+            .map(|(_, v)| v.as_str()),
+        Some(want.as_str())
+    );
+
+    // リロード: 平文の方針は反映され、リスナーの列の変更は警告して待ち受けは起動時のまま
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            &cfg_path,
+            f260_config(dir.path(), &ports, "allow_http = true"),
+        )
+        .unwrap();
+        veil.sighup();
+        assert!(
+            wait_until(Duration::from_secs(10), || http1_get(
+                ports.h2c,
+                "/index.html"
+            )
+            .is_ok_and(|r| r.status == 200)),
+            "allow_http = true must apply on reload: {}",
+            veil.log()
+        );
+        let moved = free_port();
+        let text = f260_config(dir.path(), &ports, "allow_http = true").replace(
+            &format!("127.0.0.1:{}", ports.plain),
+            &format!("127.0.0.1:{moved}"),
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        veil.sighup();
+        assert!(
+            wait_until(Duration::from_secs(10), || veil
+                .log()
+                .contains("Listener settings changed (listener)")),
+            "{}",
+            veil.log()
+        );
+        // 古い待ち受けのまま（新しいポートは開かない）。方針の表も起動時の列のまま引かれる
+        assert_eq!(
+            http1_get(ports.plain, "/index.html").map(|r| r.status).ok(),
+            Some(200)
+        );
+        assert!(http1_get(moved, "/index.html").is_err());
+        assert_eq!(
+            http1_get(ports.h2c, "/index.html").map(|r| r.status).ok(),
+            Some(200)
+        );
+    }
+}
+
+/// F-260: `[[listener]]` の規則違反は `-t` で分かる。
+#[test]
+fn f260_listener_rules_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    let run = |cfg: &str| {
+        std::fs::write(&cfg_path, cfg).unwrap();
+        let out = std::process::Command::new(veil_bin())
+            .arg("-t")
+            .arg("-c")
+            .arg(&cfg_path)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // 同じポート（ワイルドカードと個別のアドレス）
+    let (ok, err) = run(
+        "[[listener]]\nlisten = \"0.0.0.0:18080\"\ntls = false\n[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\n",
+    );
+    assert!(!ok && err.contains("same address"), "{err}");
+    // redirect_to の名前が無い
+    let (ok, err) = run(
+        "[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\nsecure_redirect = true\nredirect_to = \"nope\"\n",
+    );
+    assert!(!ok && err.contains("names no listener"), "{err}");
+    // [server] を書かずに [[listener]] だけ（平文）は通る
+    let (ok, err) = run("[[listener]]\nlisten = \"127.0.0.1:18080\"\ntls = false\n");
+    assert!(ok, "{err}");
+}
+
+// ===================== F-273 =====================
+
+/// h2c（`tls = false`）または TLS 上の h2 で、要求ヘッダ付きの GET を 1 つ送り (状態コード, 応答ヘッダ) を返す。
+fn f273_h2_get(
+    port: u16,
+    tls: bool,
+    path: &str,
+    req: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>) {
+    let (status, headers, _) = h2_get_full(port, tls, path, req);
+    (status, headers)
+}
+
+/// [`f273_h2_get`] の本文も返す版（F-272）
+type H2Full = (u16, Vec<(String, String)>, Vec<u8>);
+fn h2_get_full(port: u16, tls: bool, path: &str, req: &[(&str, &str)]) -> H2Full {
+    h2_request_full(port, tls, "GET", path, req, b"")
+}
+
+/// h2c / TLS の h2 で任意のメソッド・本文の要求を 1 つ送る（F-271）
+fn h2_request_full(
+    port: u16,
+    tls: bool,
+    method: &str,
+    path: &str,
+    req: &[(&str, &str)],
+    req_body: &[u8],
+) -> H2Full {
+    use std::sync::Arc;
+    let req_body = bytes::Bytes::copy_from_slice(req_body);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let scheme = if tls { "https" } else { "http" };
+        let mut b = http::Request::builder()
+            .method(method)
+            .uri(format!("{scheme}://localhost:{port}{path}"));
+        for (k, v) in req {
+            b = b.header(*k, *v);
+        }
+        let request = b.body(()).unwrap();
+        async fn go<T>(io: T, request: http::Request<()>, req_body: bytes::Bytes) -> H2Full
+        where
+            T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            let (mut client, conn) = h2::client::handshake(io).await.expect("h2 handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let (resp, mut send) = client
+                .send_request(request, req_body.is_empty())
+                .expect("send");
+            if !req_body.is_empty() {
+                send.send_data(req_body, true).expect("send body");
+            }
+            let resp = resp.await.expect("response");
+            let status = resp.status().as_u16();
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.as_str().to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let mut body = resp.into_body();
+            let mut out = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("data");
+                let _ = body.flow_control().release_capacity(chunk.len());
+                out.extend_from_slice(&chunk);
+            }
+            (status, headers, out)
+        }
+        if tls {
+            let _ = veil::tls_provider::provider::default_provider().install_default();
+            let mut cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifyServer))
+                .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let io = connector.connect(name, tcp).await.expect("tls");
+            go(io, request, req_body).await
+        } else {
+            go(tcp, request, req_body).await
+        }
+    })
+}
+
+/// HTTP/3 で要求ヘッダ付きの GET を 1 つ送り (状態コード, 応答ヘッダ) を返す。
+#[cfg(feature = "http3")]
+fn f273_h3_get(port: u16, path: &str, req: &[(&str, &str)]) -> (u16, Vec<(String, String)>) {
+    use bytes::Buf;
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let _ = veil::tls_provider::provider::default_provider().install_default();
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifyServer))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let qc = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+        let conn = ep
+            .connect(([127, 0, 0, 1], port).into(), "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let drive = tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
+        let mut b = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://localhost:{port}{path}"));
+        for (k, v) in req {
+            b = b.header(*k, *v);
+        }
+        let mut stream = send.send_request(b.body(()).unwrap()).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            let n = chunk.remaining();
+            chunk.advance(n);
+        }
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        drop(send);
+        drive.abort();
+        ep.close(0u32.into(), b"");
+        (resp.status().as_u16(), headers)
+    })
+}
+
+/// `[route.traffic.cors]` が実際の応答（プリフライト以外）にも効く（F-273）。Respond・File（sendfile / memory）・
+/// Proxy（上流が CORS のヘッダを返す・返さない、`override_upstream`）・Redirect を、HTTP/1.1・h2c・TLS の HTTP/2・
+/// HTTP/3 で確かめる。許可しないオリジンには付けず、`reject_disallowed` なら 403、CORS の無いルートは変わらない。
+#[test]
+fn f273_cors_actual_responses_all_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("a.txt"), "static file").unwrap();
+    let port = free_port();
+    let tls_port = free_port();
+    let cors = r#"[route.traffic.cors]
+allow_origins = ["https://a.example"]
+allow_methods = ["GET"]
+expose_headers = ["X-Total"]
+allow_credentials = true"#;
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+[http3]
+enabled = true
+
+# 上流役（CORS 無し）
+[[route]]
+[route.conditions]
+path = "/plain"
+[route.action]
+type = "Respond"
+body = "plain"
+
+# 上流役（自分で Access-Control-Allow-Origin を返す）
+[[route]]
+[route.conditions]
+path = "/up-acao/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+[route.security]
+add_response_headers = {{ "Access-Control-Allow-Origin" = "https://up.example" }}
+
+[[route]]
+[route.conditions]
+path = "/respond"
+[route.action]
+type = "Respond"
+body = "respond"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/mem"
+[route.action]
+type = "File"
+path = "{www}/a.txt"
+mode = "memory"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/plain"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy-keep/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/up-acao"
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/proxy-override/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{port}/up-acao"
+{cors}
+override_upstream = true
+
+[[route]]
+[route.conditions]
+path = "/redir"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com/next"
+redirect_status = 302
+{cors}
+
+[[route]]
+[route.conditions]
+path = "/strict"
+[route.action]
+type = "Respond"
+body = "strict"
+[route.traffic.cors]
+allow_origins = ["https://a.example"]
+reject_disallowed = true
+
+[[route]]
+[route.conditions]
+path = "/any"
+[route.action]
+type = "Respond"
+body = "any"
+[route.traffic.cors]
+allow_origins = ["*"]
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www = tp(&www),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<(String, String)>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let r = http1_request(port, "GET", p, h, b"").unwrap();
+                (r.status, r.headers)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str, h: &[(&str, &str)]| f273_h2_get(port, false, p, h)),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str, h: &[(&str, &str)]| f273_h2_get(tls_port, true, p, h)),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str, h: &[(&str, &str)]| f273_h3_get(tls_port, p, h)),
+    ));
+    let values = |hs: &[(String, String)], name: &str| -> Vec<String> {
+        hs.iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    let ok_origin: &[(&str, &str)] = &[("Origin", "https://a.example")];
+    let bad_origin: &[(&str, &str)] = &[("Origin", "https://evil.example")];
+    for (proto, get) in &protocols {
+        for (path, want_status, want_origin) in [
+            ("/respond", 200, "https://a.example"),
+            ("/static/a.txt", 200, "https://a.example"),
+            ("/mem", 200, "https://a.example"),
+            ("/proxy", 200, "https://a.example"),
+            ("/proxy-keep/a.txt", 200, "https://up.example"),
+            ("/proxy-override/a.txt", 200, "https://a.example"),
+            ("/redir", 302, "https://a.example"),
+        ] {
+            let (st, hs) = get(path, ok_origin);
+            let ctx = format!("{proto} {path}: {hs:?}\n{}", veil.log());
+            assert_eq!(st, want_status, "{ctx}");
+            assert_eq!(
+                values(&hs, "access-control-allow-origin"),
+                vec![want_origin.to_string()],
+                "{ctx}"
+            );
+            if want_origin == "https://a.example" {
+                assert_eq!(
+                    values(&hs, "access-control-allow-credentials"),
+                    vec!["true".to_string()],
+                    "{ctx}"
+                );
+                assert_eq!(
+                    values(&hs, "access-control-expose-headers"),
+                    vec!["X-Total".to_string()],
+                    "{ctx}"
+                );
+                assert!(values(&hs, "vary").iter().any(|v| v == "Origin"), "{ctx}");
+            }
+            // 許可しないオリジン: 処理はするが Access-Control-Allow-Origin は付けない（Vary だけ）
+            let (st, hs) = get(path, bad_origin);
+            let ctx = format!("{proto} {path} (evil): {hs:?}\n{}", veil.log());
+            assert_eq!(st, want_status, "{ctx}");
+            if !path.starts_with("/proxy-keep") {
+                assert!(
+                    values(&hs, "access-control-allow-origin").is_empty(),
+                    "{ctx}"
+                );
+                assert!(values(&hs, "vary").iter().any(|v| v == "Origin"), "{ctx}");
+            }
+        }
+        // reject_disallowed
+        assert_eq!(get("/strict", bad_origin).0, 403, "{proto}");
+        assert_eq!(get("/strict", ok_origin).0, 200, "{proto}");
+        assert_eq!(get("/strict", &[]).0, 200, "{proto}");
+        // "*": どのオリジンにも `*`、Vary は付けない
+        let (_, hs) = get("/any", bad_origin);
+        assert_eq!(
+            values(&hs, "access-control-allow-origin"),
+            vec!["*".to_string()],
+            "{proto}"
+        );
+        assert!(values(&hs, "vary").is_empty(), "{proto} {hs:?}");
+        // CORS の無いルートは変わらない
+        let (st, hs) = get("/plain", ok_origin);
+        assert_eq!(st, 200);
+        assert!(
+            hs.iter().all(
+                |(n, _)| !n.to_ascii_lowercase().starts_with("access-control")
+                    && !n.eq_ignore_ascii_case("vary")
+            ),
+            "{proto} {hs:?}"
+        );
+    }
+}
+
+// ===================== F-272 =====================
+
+/// 静的配信のキャッシュがディスクの変更に追従する（F-272）。`open_file_cache`・`static_file_cache` を有効期限 600 秒で
+/// 有効にし、`watch = true` のルートは同じサイズの `mv` の差し替え・元に戻す・中身の上書き（`cp`）・後から作った
+/// ディレクトリの中の差し替えに 2 秒以内に追従し、`watch = false` のルートは古い中身のまま（有効期限まで）なことを、
+/// HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。通知は Linux が inotify、BSD・macOS が kqueue、Windows が
+/// ReadDirectoryChangesW（どの OS でも同じ手順で回す）。
+#[test]
+fn f272_static_cache_follows_disk_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let www_w = dir.path().join("www_w");
+    let www_n = dir.path().join("www_n");
+    for d in [&www_w, &www_n] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("a.txt"), "AAAA").unwrap();
+    }
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+[performance]
+open_file_cache_enabled = true
+open_file_cache_valid_duration_secs = 600
+[static_file_cache]
+enabled = true
+valid_duration_secs = 600
+
+[[route]]
+[route.conditions]
+path = "/w/*"
+[route.action]
+type = "File"
+path = "{www_w}"
+mode = "sendfile"
+[route.open_file_cache]
+watch = true
+[route.static_file_cache]
+watch = true
+
+[[route]]
+[route.conditions]
+path = "/n/*"
+[route.action]
+type = "File"
+path = "{www_n}"
+mode = "sendfile"
+[route.open_file_cache]
+watch = false
+[route.static_file_cache]
+watch = false
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        www_w = tp(&www_w),
+        www_n = tp(&www_n),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str) -> (u16, Vec<u8>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str| {
+                let r = http1_request(port, "GET", p, &[], b"").unwrap();
+                (r.status, r.body)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str| {
+                let (st, _, body) = h2_get_full(port, false, p, &[]);
+                (st, body)
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str| {
+                let (st, _, body) = h2_get_full(tls_port, true, p, &[]);
+                (st, body)
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str| h3_request(tls_port, "GET", p, b"")),
+    ));
+
+    let body_of = |get: &Get, p: &str| -> String {
+        let (st, body) = get(p);
+        assert_eq!(st, 200, "{p}\n{}", veil.log());
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    // 全プロトコルで 2 秒以内に `want` になるのを待つ
+    let wait_all = |p: &str, want: &str, what: &str| {
+        let t = std::time::Instant::now();
+        for (proto, get) in &protocols {
+            loop {
+                let got = body_of(get, p);
+                if got == want {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(2),
+                    "{proto} {p}: still {got:?} after {what} (want {want:?})\n{}",
+                    veil.log()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    // 同じサイズで `mv` の差し替え（inode が変わる）
+    let mv_replace = |root: &std::path::Path, name: &str, body: &str| {
+        let tmp = dir.path().join(format!(".tmp-{name}"));
+        std::fs::write(&tmp, body).unwrap();
+        std::fs::rename(&tmp, root.join(name)).unwrap();
+    };
+
+    // キャッシュを温める（各プロトコルで 2 回）
+    for (_, get) in &protocols {
+        for _ in 0..2 {
+            assert_eq!(body_of(get, "/w/a.txt"), "AAAA");
+            assert_eq!(body_of(get, "/n/a.txt"), "AAAA");
+        }
+    }
+
+    mv_replace(&www_w, "a.txt", "BBBB");
+    mv_replace(&www_n, "a.txt", "BBBB");
+    wait_all("/w/a.txt", "BBBB", "same-size mv");
+    // 監視しないルートは有効期限（600 秒）まで古い中身のまま
+    std::thread::sleep(Duration::from_millis(500));
+    for (proto, get) in &protocols {
+        assert_eq!(body_of(get, "/n/a.txt"), "AAAA", "{proto} unwatched route");
+    }
+
+    // 元に戻す
+    mv_replace(&www_w, "a.txt", "AAAA");
+    wait_all("/w/a.txt", "AAAA", "mv back");
+
+    // 中身の上書き（同じ inode）
+    std::fs::write(www_w.join("a.txt"), "CCCC").unwrap();
+    wait_all("/w/a.txt", "CCCC", "in-place overwrite");
+
+    // 起動後に作ったディレクトリの中の差し替え
+    std::fs::create_dir(www_w.join("sub")).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(www_w.join("sub").join("b.txt"), "x1").unwrap();
+    wait_all("/w/sub/b.txt", "x1", "new file in a new directory");
+    mv_replace(&www_w.join("sub"), "b.txt", "x2");
+    wait_all("/w/sub/b.txt", "x2", "mv in a new directory");
+}
+
+// ===================== F-271 =====================
+
+/// 1 本の接続で生の HTTP/1.1 の要求を順に送り、応答を Content-Length で区切って読む（F-271。keep-alive の確認用）
+#[cfg(feature = "wasm")]
+fn http1_raw_keepalive(port: u16, reqs: &[Vec<u8>]) -> Vec<HttpResponse> {
+    use std::io::{Read, Write};
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut out = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    for req in reqs {
+        s.write_all(req).unwrap();
+        loop {
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let cl: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse().unwrap())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + cl {
+                    let rest = buf.split_off(end + 4 + cl);
+                    out.push(parse_http1_response(&buf).unwrap());
+                    buf = rest;
+                    break;
+                }
+            }
+            let mut tmp = [0u8; 4096];
+            let n = s.read(&mut tmp).unwrap();
+            assert!(n > 0, "connection closed after {} responses", out.len());
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    out
+}
+
+/// 要求の本文を返すだけの上流（F-271 の `/rewrite`。`Connection: close`）
+#[cfg(feature = "wasm")]
+fn spawn_body_echo() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (end, cl) = loop {
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let cl: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        break (end + 4, cl);
+                    }
+                    match s.read(&mut tmp) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                        _ => return,
+                    }
+                };
+                while buf.len() < end + cl {
+                    match s.read(&mut tmp) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                        _ => return,
+                    }
+                }
+                let body = &buf[end..end + cl];
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body);
+                let _ = s.write_all(&resp);
+            });
+        }
+    });
+    port
+}
+
+/// Proxy-Wasm（F-271）: `type = "Respond"` のルートに付けたモジュールが、HTTP/1.1（Content-Length・chunked・
+/// keep-alive）・h2c・TLS の HTTP/2・HTTP/3 で要求ヘッダと要求本文のフェーズから答える。`data_files` がプロパティで
+/// 読め、本文の書き換えが上流に届く。`instance_reuse = true` は `on_configure` が 1 回だけで http context が増え、
+/// トラップの後は新しいインスタンスになる。`false` は要求ごとに新しいインスタンス。
+#[cfg(feature = "wasm")]
+#[test]
+fn f271_wasm_respond_body_phase_reuse_and_data_files() {
+    let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wasm/baseline_filter.wasm");
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    // 生成される .cwasm を作業ツリーに残さないよう一時ディレクトリへ写す
+    let wasm_copy = dir.path().join("baseline_filter.wasm");
+    std::fs::copy(&wasm, &wasm_copy).unwrap();
+    let dataset = dir.path().join("dataset.json");
+    std::fs::write(&dataset, r#"{"items":[1,2,3]}"#).unwrap();
+    let echo = spawn_body_echo();
+    let port = free_port();
+    let tls_port = free_port();
+    let caps = r#"
+allow_send_local_response = true
+allow_request_headers_read = true
+allow_request_body_read = true
+allow_request_body_write = true
+allowed_properties = ["request.*", "plugin_data.*"]
+"#;
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "baseline"
+path = "{wasm}"
+instance_reuse = true
+data_files = {{ dataset = "{dataset}" }}
+[wasm.modules.capabilities]
+{caps}
+
+[[wasm.modules]]
+name = "fresh"
+path = "{wasm}"
+[wasm.modules.capabilities]
+{caps}
+
+[[route]]
+modules = ["fresh"]
+[route.conditions]
+path = "/fresh/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/dataset"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/trap"
+[route.action]
+type = "Respond"
+status = 503
+body = "fallback"
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/rewrite"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+        wasm = tp(&wasm_copy),
+        dataset = tp(&dataset),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30))
+            && wait_for_port(tls_port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+
+    // (メソッド, パス, 本文) → (状態, 本文)
+    type Req<'a> = Box<dyn Fn(&str, &str, &[u8]) -> (u16, String) + 'a>;
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    let mut protocols: Vec<(&str, Req)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let r = http1_request(port, m, p, &[], b).unwrap();
+                (r.status, text(r.body))
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let (st, _, body) = h2_request_full(port, false, m, p, &[], b);
+                (st, text(body))
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|m: &str, p: &str, b: &[u8]| {
+                let (st, _, body) = h2_request_full(tls_port, true, m, p, &[], b);
+                (st, text(body))
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|m: &str, p: &str, b: &[u8]| {
+            let (st, body) = h3_request(tls_port, m, p, b);
+            (st, text(body))
+        }),
+    ));
+
+    for (proto, req) in &protocols {
+        let ctx = |what: &str| format!("{proto} {what}\n{}", veil.log());
+        // 要求ヘッダのフェーズ（本文なし）
+        assert_eq!(
+            req("GET", "/baseline11?a=1&b=2", b""),
+            (200, "3".into()),
+            "{}",
+            ctx("GET")
+        );
+        // 要求本文のフェーズ
+        assert_eq!(
+            req("POST", "/baseline11?a=1&b=2", b"10"),
+            (200, "13".into()),
+            "{}",
+            ctx("POST")
+        );
+        // data_files
+        assert_eq!(
+            req("GET", "/dataset", b""),
+            (200, r#"{"items":[1,2,3]}"#.into()),
+            "{}",
+            ctx("dataset")
+        );
+        // 本文の書き換えが上流に届く
+        assert_eq!(
+            req("POST", "/rewrite", b"hello"),
+            (200, "rewritten:hello".into()),
+            "{}",
+            ctx("rewrite")
+        );
+    }
+
+    // HTTP/1.1 の chunked と keep-alive（フィルタの応答の後も接続を続ける）
+    let rs = http1_raw_keepalive(
+        port,
+        &[
+            b"GET /baseline11?a=1&b=2 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            b"POST /baseline11?a=5 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n2\r\n1\r\n0\r\n0\r\n\r\n".to_vec(),
+            b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n9".to_vec(),
+            b"POST /rewrite HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n".to_vec(),
+        ],
+    );
+    let bodies: Vec<String> = rs.iter().map(|r| r.text()).collect();
+    assert_eq!(bodies, ["3", "25", "10", "rewritten:ab"], "{}", veil.log());
+
+    // instance_reuse = true: on_configure は 1 回、http context は増えていく（同じワーカーの HTTP/1.1）
+    let seq = |r: &HttpResponse| -> (u32, u32) {
+        (
+            r.header("x-configure-count").unwrap().parse().unwrap(),
+            r.header("x-instance-seq").unwrap().parse().unwrap(),
+        )
+    };
+    let rs = http1_raw_keepalive(
+        port,
+        &[
+            b"GET /baseline11 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            b"GET /baseline11 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        ],
+    );
+    let (c1, s1) = seq(&rs[0]);
+    let (c2, s2) = seq(&rs[1]);
+    assert_eq!((c1, c2), (1, 1), "{}", veil.log());
+    assert!(s2 > s1 && s1 > 1, "{s1} {s2}\n{}", veil.log());
+
+    // トラップしたら固定応答に落ち、次の要求は新しいインスタンス（http context の数が振り出しに戻る。
+    // トラップした要求の on_log が新しいインスタンスで 1 つ作るので 2 以下）
+    let r = http1_request(port, "GET", "/trap", &[], b"").unwrap();
+    assert_eq!(
+        (r.status, r.text()),
+        (503, "fallback".into()),
+        "{}",
+        veil.log()
+    );
+    let r = http1_request(port, "GET", "/baseline11", &[], b"").unwrap();
+    let (c3, s3) = seq(&r);
+    assert!(
+        c3 == 1 && s3 <= 2 && s3 < s2,
+        "{c3} {s3} (before {s2})\n{}",
+        veil.log()
+    );
+
+    // instance_reuse = false: 毎回新しいインスタンス
+    for _ in 0..2 {
+        let r = http1_request(port, "GET", "/fresh/baseline11?a=4", &[], b"").unwrap();
+        assert_eq!(r.text(), "4", "{}", veil.log());
+        assert_eq!(seq(&r), (1, 1), "{}", veil.log());
+    }
+}
+
+// ===================== B-172 =====================
+
+/// ルートのキャッシュが、前にある header・query 条件のルートを飛ばさない（B-172）。同じ path の 3 つのルート
+/// （header 条件・query 条件・条件なし）へ、条件なしの要求を先に送ってから条件に合う要求を送り、first-match の
+/// とおり前のルートに行くことを HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で確かめる。
+#[test]
+fn b172_route_cache_keeps_earlier_header_and_query_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/a"
+header = {{ "x-mode" = "fresh" }}
+[route.action]
+type = "Respond"
+body = "header"
+
+[[route]]
+[route.conditions]
+path = "/a"
+query = {{ "v" = "1" }}
+[route.action]
+type = "Respond"
+body = "query"
+
+[[route]]
+[route.conditions]
+path = "/a"
+[route.action]
+type = "Respond"
+body = "plain"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20))
+            && wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    type Get<'a> = Box<dyn Fn(&str, &[(&str, &str)]) -> (u16, Vec<u8>) + 'a>;
+    // HTTP/3 の無いビルドでは下の push が無くなる
+    #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
+    let mut protocols: Vec<(&str, Get)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let r = http1_request(port, "GET", p, h, b"").unwrap();
+                (r.status, r.body)
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let (st, _, body) = h2_get_full(port, false, p, h);
+                (st, body)
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str, h: &[(&str, &str)]| {
+                let (st, _, body) = h2_get_full(tls_port, true, p, h);
+                (st, body)
+            }),
+        ),
+    ];
+    #[cfg(feature = "http3")]
+    protocols.push((
+        "HTTP/3",
+        Box::new(|p: &str, h: &[(&str, &str)]| h3_request_with_headers(tls_port, "GET", p, h, b"")),
+    ));
+
+    for (proto, get) in &protocols {
+        for round in 0..3 {
+            for (path, headers, want) in [
+                ("/a", &[][..], "plain"),
+                ("/a", &[("x-mode", "fresh")][..], "header"),
+                ("/a?v=1", &[][..], "query"),
+                ("/a?v=2", &[("x-mode", "stale")][..], "plain"),
+            ] {
+                let (st, body) = get(path, headers);
+                assert_eq!(st, 200, "{proto} {path} {headers:?}\n{}", veil.log());
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    want,
+                    "{proto} round {round}: {path} {headers:?}"
+                );
+            }
+        }
+    }
+}
+
+// ===================== B-186・B-188・B-189（Proxy-Wasm の HTTP/1.1 の接続の継続） =====================
+
+/// baseline-filter（F-271）のルートを平文の HTTP/1.1 で待ち受ける veil を起動する（`/rewrite` の上流は本文のエコー）
+#[cfg(feature = "wasm")]
+fn spawn_baseline_wasm(dir: &std::path::Path) -> (VeilProcess, u16) {
+    let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wasm/baseline_filter.wasm");
+    // 生成される .cwasm を作業ツリーに残さないよう一時ディレクトリへ写す
+    let wasm_copy = dir.join("baseline_filter.wasm");
+    std::fs::copy(&wasm, &wasm_copy).unwrap();
+    let echo = spawn_body_echo();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "baseline"
+path = "{wasm}"
+[wasm.modules.capabilities]
+allow_send_local_response = true
+allow_request_headers_read = true
+allow_request_body_read = true
+allow_request_body_write = true
+allowed_properties = ["request.*", "plugin_data.*"]
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/dataset"
+[route.action]
+type = "Respond"
+status = 404
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/rewrite"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        wasm = tp(&wasm_copy),
+    );
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    (veil, port)
+}
+
+/// HTTP/1.1 の応答を 1 つ読む（`head` は HEAD の応答＝Content-Length があっても本文を読まない）。
+/// `buf` は前の応答の後ろに読んだ分を持ち越す。接続が閉じた・時間切れなら `None`
+#[cfg(feature = "wasm")]
+fn read_one_response(
+    s: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    head: bool,
+) -> Option<HttpResponse> {
+    use std::io::Read;
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let h = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let cl: usize = if head || h.starts_with("http/1.1 1") {
+                0
+            } else {
+                h.lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse().unwrap())
+                    .unwrap_or(0)
+            };
+            if buf.len() >= end + 4 + cl {
+                let rest = buf.split_off(end + 4 + cl);
+                let mut r = parse_http1_response(buf).unwrap();
+                if head {
+                    r.body.clear();
+                }
+                *buf = rest;
+                return Some(r);
+            }
+        }
+        let mut tmp = [0u8; 4096];
+        match s.read(&mut tmp) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+            _ => return None,
+        }
+    }
+}
+
+/// B-186: 本文の末尾と次の要求が同じ書き込みで届いても、次の要求を失わない（Wasm の要求本文の段の
+/// ローカル応答・本文を書き換えて上流へ送る経路・要求ヘッダの段のローカル応答の本文の読み捨て。
+/// 以前は本文の残りを読むときに次の要求を捨て、クライアントは応答を待ったまま止まった）
+#[cfg(feature = "wasm")]
+#[test]
+fn b186_wasm_paths_keep_pipelined_request_after_body() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let next = b"GET /baseline11?a=7 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    for (name, first, rest, want) in [
+        (
+            "body phase local response (Content-Length)",
+            &b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n1"[..],
+            &b"0"[..],
+            "11",
+        ),
+        (
+            "body phase local response (chunked)",
+            &b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n1"[..],
+            &b"0\r\n0\r\n\r\n"[..],
+            "11",
+        ),
+        (
+            "body rewritten and proxied",
+            &b"POST /rewrite HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\na"[..],
+            &b"b"[..],
+            "rewritten:ab",
+        ),
+        (
+            "header phase local response drains the body",
+            &b"POST /dataset HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\na"[..],
+            &b"b"[..],
+            "",
+        ),
+    ] {
+        let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(first).unwrap();
+        // veil がヘッダと本文の先頭を読んでから、本文の残りと次の要求を 1 回で送る
+        std::thread::sleep(Duration::from_millis(300));
+        let mut tail = rest.to_vec();
+        tail.extend_from_slice(next);
+        s.write_all(&tail).unwrap();
+        let mut buf = Vec::new();
+        let r1 = read_one_response(&mut s, &mut buf, false)
+            .unwrap_or_else(|| panic!("{name}: no first response\n{}", veil.log()));
+        assert_eq!(r1.status, 200, "{name}\n{}", veil.log());
+        if !want.is_empty() {
+            assert_eq!(r1.text(), want, "{name}");
+        }
+        let r2 = read_one_response(&mut s, &mut buf, false)
+            .unwrap_or_else(|| panic!("{name}: the pipelined request was lost\n{}", veil.log()));
+        assert_eq!((r2.status, r2.text()), (200, "7".into()), "{name}");
+    }
+}
+
+/// B-188: HEAD の要求へのフィルタのローカル応答に本文を書かない（接続を続けるので、書くと次の応答がずれる）
+#[cfg(feature = "wasm")]
+#[test]
+fn b188_wasm_local_response_to_head_has_no_body() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"HEAD /baseline11?a=12345 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /baseline11?a=7 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut buf = Vec::new();
+    let r1 = read_one_response(&mut s, &mut buf, true).expect("HEAD response");
+    assert_eq!(r1.status, 200, "{}", veil.log());
+    assert_eq!(r1.header("content-length"), Some("5"), "{:?}", r1.headers);
+    let r2 = read_one_response(&mut s, &mut buf, false).expect("GET response");
+    assert_eq!((r2.status, r2.text()), (200, "7".into()), "{}", veil.log());
+}
+
+/// B-189: chunked + `Expect: 100-continue` の要求に、Wasm の要求本文の段が本文を読む前に 100 Continue を返す
+/// （以前は返さずに本文を待ち、100 Continue を待つクライアントと互いに待って止まった）
+#[cfg(feature = "wasm")]
+#[test]
+fn b189_wasm_body_phase_sends_100_continue_for_chunked() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (veil, port) = spawn_baseline_wasm(dir.path());
+    let mut s = connect_local(port, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"POST /baseline11?a=1 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n").unwrap();
+    // 本文を送る前に 100 Continue が届く
+    let mut got = Vec::new();
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut tmp = [0u8; 256];
+        let n = s.read(&mut tmp).unwrap_or_else(|e| {
+            panic!(
+                "no 100 Continue ({e}): {:?}\n{}",
+                String::from_utf8_lossy(&got),
+                veil.log()
+            )
+        });
+        assert!(n > 0, "closed: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&tmp[..n]);
+    }
+    assert!(
+        got.starts_with(b"HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&got)
+    );
+    let end = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let mut buf = got.split_off(end + 4);
+    s.write_all(b"2\r\n41\r\n0\r\n\r\n").unwrap();
+    let r = read_one_response(&mut s, &mut buf, false).expect("final response");
+    assert_eq!((r.status, r.text()), (200, "42".into()), "{}", veil.log());
+}
+
+// ===================== B-192 =====================
+
+/// B-192: 起動時の設定に `watch = true` があっても、静的配信の監視スレッドは seccomp を掛けた後に作られ、
+/// フィルタの下で動く（以前は設定のロード＝サンドボックスの前に作られ、制限の外で動き続けた）
+#[cfg(target_os = "linux")]
+#[test]
+fn b192_fswatch_thread_runs_under_seccomp() {
+    let dir = tempfile::tempdir().unwrap();
+    let www = dir.path().join("www");
+    std::fs::create_dir(&www).unwrap();
+    std::fs::write(www.join("a.txt"), b"hello").unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[security]
+enable_seccomp = true
+seccomp_mode = "log"
+[static_file_cache]
+enabled = true
+watch = true
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        www = tp(&www),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    let task_dir = format!("/proc/{}/task", veil.pid());
+    // (スレッド名, Seccomp の値)
+    let threads = || -> Vec<(String, String)> {
+        std::fs::read_dir(&task_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|t| {
+                let status = std::fs::read_to_string(t.path().join("status")).ok()?;
+                let field = |k: &str| {
+                    status
+                        .lines()
+                        .find_map(|l| l.strip_prefix(k))
+                        .map(|v| v.trim().to_string())
+                };
+                Some((field("Name:")?, field("Seccomp:")?))
+            })
+            .collect()
+    };
+    let mut found = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            found = threads().into_iter().find(|(n, _)| n == "veil-fswatch");
+            found.is_some()
+        }),
+        "no veil-fswatch thread: {:?}\n{}",
+        threads(),
+        veil.log()
+    );
+    let (_, seccomp) = found.unwrap();
+    if threads().iter().all(|(_, s)| s == "0") {
+        // seccomp を掛けられない環境（allow_security_failures 無しなら起動しないので、ここには来ない）
+        eprintln!("seccomp is not applied in this environment; skipping");
+        return;
+    }
+    assert_eq!(
+        seccomp,
+        "2",
+        "veil-fswatch runs outside the seccomp filter: {:?}",
+        threads()
+    );
+}
+
+/// B-181: fd の上限（EMFILE）で accept が失敗し続けても、ワーカーは空回りせずに他の接続を進め、
+/// 接続が閉じて fd が空いたら受理を再開する（以前は reactor で accept のループが Pending を返さず、
+/// 閉じられた接続も片付かないまま固まった）。
+#[cfg(unix)]
+#[test]
+fn b181_accept_recovers_after_running_out_of_file_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "plain").unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+            www = tp(&www)
+        ),
+    )
+    .unwrap();
+    // veil は soft を hard まで上げるので、hard ごと下げてから exec する
+    let bin = veil_bin();
+    let veil = VeilProcess::spawn_with(
+        std::path::Path::new("/bin/sh"),
+        std::path::Path::new(""),
+        &[],
+        &[
+            "-c",
+            "ulimit -n 128 && exec \"$0\" -c \"$1\"",
+            bin.to_str().unwrap(),
+            cfg_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    assert_eq!(http1_get(port, "/").expect("before").status, 200);
+    // 上限を超える数の接続を張る（受理されない分はバックログに残る）
+    let mut held = Vec::new();
+    for _ in 0..200 {
+        if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            held.push(s);
+        }
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    drop(held);
+    // 閉じた接続が片付けば、新しい要求は受理される
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        match http1_get(port, "/") {
+            Ok(r) if r.status == 200 => {
+                last = None;
+                break;
+            }
+            other => last = Some(format!("{:?}", other.map(|r| r.status))),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        last.is_none(),
+        "not served after the descriptors were freed: {:?}\n{}",
+        last,
+        veil.log()
+    );
+}
+
+/// B-210: `Expect: 100-continue` の要求がルートの本文の上限（`[route.security] max_request_body_size`）を超えるなら、
+/// 100 Continue を返さずに 413 を返す（以前は先に 100 Continue を返し、クライアントが本文を送り始めてから 413 で閉じたため、
+/// Windows では未読の本文で RST になり 413 が届かなかった）。上限内の要求には従来どおり 100 Continue を返す。
+#[test]
+fn b210_expect_continue_waits_for_route_body_limit() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+[route.security]
+max_request_body_size = 1000
+"#,
+            www = tp(&www)
+        ),
+    )
+    .unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    // 本文を送らずに最初の応答行を読む
+    let first_line = |len: usize| -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            s,
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\nExpect: 100-continue\r\n\r\n"
+        )
+        .unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let over = first_line(5000);
+    assert!(over.starts_with("HTTP/1.1 413"), "{over:?}\n{}", veil.log());
+    let under = first_line(100);
+    assert!(
+        under.starts_with("HTTP/1.1 100"),
+        "{under:?}\n{}",
+        veil.log()
+    );
+}
+
+/// 受けた要求のヘッダ部をそのまま本文で返す上流（B-232: 上流に届いた転送ヘッダを見る）。
+fn spawn_head_echo() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                // 1 接続で複数の要求（上流の接続の再利用）を受ける
+                loop {
+                    let end = loop {
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                        match s.read(&mut tmp) {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                            _ => return,
+                        }
+                    };
+                    let head: Vec<u8> = buf.drain(..end).collect();
+                    let mut resp =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", head.len())
+                            .into_bytes();
+                    resp.extend_from_slice(&head);
+                    if s.write_all(&resp).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// B-232: 既定（append）では、信頼しないクライアントが送った X-Forwarded-For・X-Real-IP・X-Forwarded-Proto・
+/// Forwarded は上流へ届かず、X-Forwarded-For にクライアントの IP が入る。`trusted_proxies` に入る送信元からは
+/// 受けた値が残り、X-Forwarded-For が足される。`passthrough` は以前のまま。HTTP/1.1・h2c・TLS の HTTP/2 で同じ。
+#[test]
+fn b232_forwarded_headers_append_trusted_and_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let echo = spawn_head_echo();
+    let port = free_port();
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+
+[[route]]
+[route.conditions]
+path = "/trusted/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+[route.security]
+trusted_proxies = ["127.0.0.0/8"]
+
+[[route]]
+[route.conditions]
+path = "/pass/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+[route.security]
+forwarded_headers = "passthrough"
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{echo}"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30))
+            && wait_for_port(tls_port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    let sent: &[(&str, &str)] = &[
+        ("X-Forwarded-For", "1.2.3.4"),
+        ("X-Real-IP", "1.2.3.4"),
+        ("X-Forwarded-Proto", "gopher"),
+        ("Forwarded", "for=1.2.3.4"),
+    ];
+    type Req<'a> = Box<dyn Fn(&str) -> String + 'a>;
+    let protocols: Vec<(&str, Req)> = vec![
+        (
+            "HTTP/1.1",
+            Box::new(|p: &str| {
+                let r = http1_request(port, "GET", p, sent, b"").unwrap();
+                String::from_utf8_lossy(&r.body).to_ascii_lowercase()
+            }),
+        ),
+        (
+            "h2c",
+            Box::new(|p: &str| {
+                let (_, _, b) = h2_request_full(port, false, "GET", p, sent, b"");
+                String::from_utf8_lossy(&b).to_ascii_lowercase()
+            }),
+        ),
+        (
+            "HTTP/2",
+            Box::new(|p: &str| {
+                let (_, _, b) = h2_request_full(tls_port, true, "GET", p, sent, b"");
+                String::from_utf8_lossy(&b).to_ascii_lowercase()
+            }),
+        ),
+    ];
+    for (proto, req) in &protocols {
+        let head = req("/plain/x");
+        assert!(
+            head.contains("x-forwarded-for: 127.0.0.1\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(!head.contains("1.2.3.4"), "{proto}: {head}");
+        assert!(!head.contains("gopher"), "{proto}: {head}");
+
+        let head = req("/trusted/x");
+        assert!(
+            head.contains("x-forwarded-for: 1.2.3.4\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(
+            head.contains("x-forwarded-for: 127.0.0.1\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(
+            head.contains("x-forwarded-proto: gopher"),
+            "{proto}: {head}"
+        );
+
+        let head = req("/pass/x");
+        assert!(
+            head.contains("x-forwarded-for: 1.2.3.4\r\n"),
+            "{proto}: {head}"
+        );
+        assert!(!head.contains("127.0.0.1\r\n"), "{proto}: {head}");
+        assert!(head.contains("x-real-ip: 1.2.3.4"), "{proto}: {head}");
+    }
 }

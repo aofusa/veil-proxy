@@ -62,6 +62,9 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.tag }}
       - name: cargo audit (every Cargo.lock, warnings are errors)
+        env:
+          # vendoring 版を GitHub の勧告と照合する API の上限を広げる（F-277）
+          GITHUB_TOKEN: ${{ github.token }}
         run: tools/container_security/security/run_cargo_audit.sh
       - name: cargo deny (advisories, licenses)
         env:
@@ -347,9 +350,52 @@ jobs:
           name: sdist
           path: crates/veil-python/dist/*.tar.gz
 
+  # F-268: veil-api-kit（import veil_kit）。純 Python の wheel 1 個と sdist。版は veil-api と同じ（bump-version.sh）
+  kit:
+    name: veil-api-kit (wheel and sdist)
+    needs: [verify, advisories]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: build
+        shell: bash
+        run: |
+          python -m pip install -q build
+          python -m build crates/veil-python-kit --outdir crates/veil-python-kit/dist
+          # 版と veil-api への依存の版が veil-api と同じ（maturin と同じ PEP 440 の綴り）
+          python - <<'PY'
+          import glob, re, tomllib
+          kit = tomllib.load(open("crates/veil-python-kit/pyproject.toml", "rb"))["project"]
+          ws = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          m = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)(?:-([A-Za-z]+)\.?([0-9]*))?", ws)
+          base, pre, n = m.groups()
+          pep = base + ({"alpha": "a", "beta": "b", "rc": "rc"}.get(pre, ".dev") + (n or "0") if pre else "")
+          assert kit["version"] == pep, (kit["version"], pep)
+          assert "veil-api==%s" % pep in kit["dependencies"], kit["dependencies"]
+          files = sorted(glob.glob("crates/veil-python-kit/dist/*"))
+          assert len(files) == 2 and files[0].endswith(".tar.gz") and files[1].endswith("-py3-none-any.whl"), files
+          print("veil-api-kit", pep, files)
+          PY
+      # 純 Python の部分（veil の拡張無しで動く試験）。docstring は英語でチケット番号が無い（F-241）
+      - name: test
+        shell: bash
+        run: |
+          python -m pip install -q crates/veil-python-kit/dist/*.whl --no-deps
+          python -W error::SyntaxWarning -I crates/veil-python-kit/tests/test_kit.py
+          python tools/lint/check-messages.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kit
+          path: crates/veil-python-kit/dist/*
+
   pypi:
     name: PyPI
-    needs: [verify, wheels, sdist]
+    needs: [verify, wheels, sdist, kit]
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
@@ -359,7 +405,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-          pattern: "{wheel-*,sdist}"
+          pattern: "{wheel-*,sdist,kit}"
       - name: publish to TestPyPI (pre-release)
         if: needs.verify.outputs.prerelease == 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
@@ -383,12 +429,18 @@ jobs:
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           host=pypi.org; [ "$PRERELEASE" = true ] && host=test.pypi.org
-          ver="$(ls dist/*.tar.gz | sed -E 's/.*veil_api-(.*)\.tar\.gz/\1/')"
-          have="$(curl -s "https://$host/pypi/veil-api/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
-          # 公開の action が dist/ に置く *.publish.attestation は配布物ではないので数えない
-          missing=""; n=0; for f in dist/*.whl dist/*.tar.gz; do n=$((n+1)); b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
-          if [ -n "$missing" ]; then echo "::error title=PyPI ($host $ver)::missing:$missing"; exit 1; fi
-          echo "::notice title=PyPI ($host $ver)::all $n files are on $host"
+          fail=0
+          # F-268: veil-api と veil-api-kit（ファイル名の接頭辞 veil_api- と veil_api_kit- で分ける）
+          for pkg in veil-api veil-api-kit; do
+            norm="${pkg//-/_}"
+            ver="$(ls dist/"$norm"-*.tar.gz | sed -E "s/.*${norm}-(.*)\.tar\.gz/\1/")"
+            have="$(curl -s "https://$host/pypi/$pkg/$ver/json" | python3 -c 'import sys,json; print("\n".join(u["filename"] for u in json.load(sys.stdin)["urls"]))' 2>/dev/null || true)"
+            # 公開の action が dist/ に置く *.publish.attestation は配布物ではないので数えない
+            missing=""; n=0; for f in dist/"$norm"-*.whl dist/"$norm"-*.tar.gz; do n=$((n+1)); b="$(basename "$f")"; grep -qxF "$b" <<<"$have" || missing="$missing $b"; done
+            if [ -n "$missing" ]; then echo "::error title=PyPI $pkg ($host $ver)::missing:$missing"; fail=1; continue; fi
+            echo "::notice title=PyPI $pkg ($host $ver)::all $n files are on $host"
+          done
+          exit "$fail"
 
   # ---------------------------------------------------------------------------
   # 各 OS の成果物と試験（F-247。dist.yml）
@@ -466,12 +518,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.tag }}
+      # B-168: 公開済みのタグの run を（試験の job を確かめ直すために）再実行したときは、成果物・署名・出自の証明を
+      # 作り直さずに成功で終える（公開していないものの署名・attestation を透明性ログに残さない）
+      - name: release state
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        # B-208: API の一時的な失敗を「draft 無し」と見なさない（失敗にする）
+        run: |
+          s="$(tools/release/release-state.sh "$TAG")"
+          if [ "$s" = published ]; then
+            echo "::notice title=GitHub Release::$TAG is already published; skipping the draft, checksums, signatures and attestations"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ steps.state.outputs.published != 'true' }}
         with:
           pattern: dist-*
           path: assets
           merge-multiple: true
       - name: BSD ports (the port directories to submit, F-253)
+        if: ${{ steps.state.outputs.published != 'true' }}
         env:
           TAG: ${{ needs.verify.outputs.tag }}
           VERSION: ${{ needs.verify.outputs.version }}
@@ -479,24 +549,30 @@ jobs:
           python3 tools/release/bsd-ports.py "$TAG" "$RUNNER_TEMP/ports"
           tar -C "$RUNNER_TEMP/ports" -czf "assets/veil-$VERSION-bsd-ports.tar.gz" freebsd openbsd netbsd
       - name: checksums
+        if: ${{ steps.state.outputs.published != 'true' }}
         run: |
           cd assets
           ls -l
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: ${{ steps.state.outputs.published != 'true' }}
       - name: sign the checksums (Sigstore keyless)
+        if: ${{ steps.state.outputs.published != 'true' }}
         run: cosign sign-blob --yes --bundle assets/SHA256SUMS.sigstore.json assets/SHA256SUMS
       - name: build provenance attestations
+        if: ${{ steps.state.outputs.published != 'true' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: assets/SHA256SUMS
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ steps.state.outputs.published != 'true' }}
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: release notes
+        if: ${{ steps.state.outputs.published != 'true' }}
         env:
           TAG: ${{ needs.verify.outputs.tag }}
           VERSION: ${{ needs.verify.outputs.version }}
@@ -509,6 +585,7 @@ jobs:
           tools/release/release-notes.sh "$TAG" assets digests.txt > notes.md
           wc -c notes.md
       - name: create or update the draft
+        if: ${{ steps.state.outputs.published != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.verify.outputs.tag }}

@@ -6,17 +6,13 @@ use super::*;
 
 /// 設定読み込みの戻り値型（統一）
 pub struct LoadedConfig {
-    /// TLS のリスナー（`[server].listen`、F-200）。無ければ平文だけのサーバ。
-    pub listen_addr: Option<String>,
-    /// 平文のリスナー（`[server].listen_cleartext`、F-200）
-    pub listen_cleartext: Option<String>,
-    /// 平文リスナーの受け入れ方（F-200）
-    pub cleartext: CleartextPolicy,
-    /// UDS ソケットファイルパーミッション（`[server].unix_socket_permissions`、
-    /// F-164）。8 進数表記の文字列のまま保持し、bind 時に
-    /// `parse_unix_socket_permissions` でパースする。
-    pub unix_socket_permissions: String,
+    /// 正規化した待ち受けの列（F-260）。`[server] listen`・`listen_cleartext` は暗黙のリスナーとして先頭に入る。
+    /// 添字がリスナーの id（`RuntimeConfig::cleartext` の添字）。UDS のパーミッションも各リスナーが持つ（F-164）。
+    pub listeners: Vec<ListenerSpec>,
+    /// 既定の ALPN のプロファイル（`[server] http2_enabled`）の TLS 設定。L4 の TLS 終端もこれを使う。
     pub tls_config: Arc<ServerConfig>,
+    /// ALPN のプロファイルごとの TLS 設定（使うプロファイルだけ。`AlpnProfile::index` で引く。F-260）
+    pub tls_profiles: [Option<Arc<ServerConfig>>; crate::tls_reload::ALPN_PROFILE_COUNT],
     /// TLS証明書パス（ログ・表示用）
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
@@ -63,15 +59,9 @@ pub struct LoadedConfig {
     pub opentelemetry: OpenTelemetryConfig,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
-    /// HTTP/2 を有効化するかどうか
+    /// HTTP/2 を有効化するかどうか（`[server] http2_enabled`。TLS のリスナーの `http2` の既定）
     #[cfg(feature = "http2")]
     pub http2_enabled: bool,
-    /// HTTP/3 を有効化するかどうか
-    #[cfg(feature = "http3")]
-    pub http3_enabled: bool,
-    /// HTTP/3 リスナーアドレス (UDP)
-    #[cfg(feature = "http3")]
-    pub http3_listen: Option<String>,
     /// HTTP/2 設定（詳細設定）
     #[cfg(feature = "http2")]
     pub http2_config: Http2ConfigSection,
@@ -124,8 +114,9 @@ pub struct RuntimeConfig {
     pub tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定（ホットリロード時の参照用）
     pub ktls_config: Arc<KtlsConfig>,
-    /// 平文リスナー（`[server].listen_cleartext`）の受け入れ方（F-200）。ホットリロード対象。
-    pub cleartext: CleartextPolicy,
+    /// 平文のリスナーの受け入れ方（F-200）。リスナーの id で引く（TLS のリスナーの添字は使わない。F-260）。
+    /// ホットリロード対象（リスナーの列が変わらないときだけ差し替える）。
+    pub cleartext: Arc<[CleartextPolicy]>,
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
@@ -164,7 +155,7 @@ impl Default for RuntimeConfig {
             optimized_router: Arc::new(routing::OptimizedRouter::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
-            cleartext: CleartextPolicy::default(),
+            cleartext: Arc::new([]),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             #[cfg(feature = "admin")]
@@ -267,14 +258,6 @@ pub fn resolve_config_path(
 pub static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
     Lazy::new(|| ArcSwap::from_pointee(default_config_path()));
 
-/// HTTPSリダイレクト先のポート（listen設定から抽出）
-///
-/// HTTP→HTTPSリダイレクト時に使用するポート番号。
-/// デフォルトは443（HTTPSの標準ポート）。
-/// main関数で`[server].listen`の値から初期化される。
-pub static HTTPS_REDIRECT_PORT: std::sync::atomic::AtomicU16 =
-    std::sync::atomic::AtomicU16::new(443);
-
 /// 設定をホットリロードする
 ///
 /// 実行中のリクエストは古い設定を参照し続け、
@@ -302,7 +285,13 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
-        cleartext: loaded.cleartext,
+        // F-260: 平文の方針の表はリスナーの id で引くので、リスナーの列が起動時と同じときだけ差し替える
+        // （列が変わったリロードは警告済みで、待ち受けは起動時のまま）
+        cleartext: if same_listener_set(&loaded.listeners) {
+            cleartext_table(&loaded.listeners)
+        } else {
+            current.cleartext.clone()
+        },
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         #[cfg(feature = "admin")]
@@ -331,6 +320,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
     crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
+    crate::trust_store::commit_default(loaded.default_ca);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
@@ -342,6 +332,8 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
 /// Landlock適用後はTLS証明書ファイルへのアクセスが制限されるため、
 /// ホットリロード時はルーティング設定等のみを更新します。
 pub struct LoadedConfigWithoutTls {
+    /// 解決済みの `[tls_client] ca`（`reload_config` が最後に反映する。F-259）
+    pub default_ca: crate::trust_store::PendingDefault,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,
     /// 最適化ルーター（Phase 1-4最適化適用）
@@ -360,8 +352,8 @@ pub struct LoadedConfigWithoutTls {
     pub http2_config: Http2ConfigSection,
     #[cfg(feature = "http3")]
     pub http3_config: Http3ConfigSection,
-    /// 平文リスナーの受け入れ方（F-200）
-    pub cleartext: CleartextPolicy,
+    /// 正規化した待ち受けの列（平文の方針の表の元。F-260）
+    pub listeners: Vec<ListenerSpec>,
     pub performance: PerformanceConfigSection,
 }
 
@@ -394,6 +386,119 @@ pub(crate) fn read_config_text(path: &Path) -> io::Result<String> {
     fs::read_to_string(path)
 }
 
+/// リロードでは反映できない待ち受け関連の設定の写し（起動時の値と比べる）。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub(super) struct ListenerSettings {
+    listen: Option<String>,
+    listen_cleartext: Option<String>,
+    threads: Option<usize>,
+    http2_enabled: bool,
+    http3_enabled: bool,
+    http3_listen: Option<String>,
+    /// `[[listener]]`（F-260。リロードで変えられるのは平文の方針だけなので、それ以外を比べる）
+    listener: Vec<ListenerConfigSection>,
+    /// `[[l4]]` の (name, listen, protocol)
+    l4: Vec<(String, String, String)>,
+}
+
+impl ListenerSettings {
+    pub(super) fn from_config(config: &Config) -> Self {
+        Self {
+            listen: config.server.listen.clone(),
+            listen_cleartext: config.server.listen_cleartext.clone(),
+            threads: config.server.threads,
+            http2_enabled: config.server.http2_enabled,
+            http3_enabled: config.http3.enabled,
+            http3_listen: config.http3.listen.clone(),
+            listener: config
+                .listener
+                .iter()
+                .flatten()
+                .map(|l| ListenerConfigSection {
+                    allow_http: None,
+                    allow_h2c: None,
+                    secure_redirect: None,
+                    redirect_to: None,
+                    ..l.clone()
+                })
+                .collect(),
+            #[cfg(feature = "l4-proxy")]
+            l4: config
+                .l4
+                .iter()
+                .flatten()
+                .map(|l| {
+                    (
+                        l.name.clone(),
+                        l.listen.clone(),
+                        format!("{:?}", l.protocol),
+                    )
+                })
+                .collect(),
+            #[cfg(not(feature = "l4-proxy"))]
+            l4: Vec::new(),
+        }
+    }
+
+    /// `self`（起動時）と `new`（リロード後）で違う項目名を返す。
+    pub(super) fn changed_keys(&self, new: &Self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.listen != new.listen {
+            keys.push("server.listen");
+        }
+        if self.listen_cleartext != new.listen_cleartext {
+            keys.push("server.listen_cleartext");
+        }
+        if self.threads != new.threads {
+            keys.push("server.threads");
+        }
+        if self.http2_enabled != new.http2_enabled {
+            keys.push("server.http2_enabled");
+        }
+        if self.http3_enabled != new.http3_enabled {
+            keys.push("http3.enabled");
+        }
+        if self.http3_listen != new.http3_listen {
+            keys.push("http3.listen");
+        }
+        if self.listener != new.listener {
+            keys.push("listener");
+        }
+        if self.l4 != new.l4 {
+            keys.push("l4");
+        }
+        keys
+    }
+}
+
+/// 起動時に有効になった待ち受け関連の設定（リロードの比較の基準）
+static STARTUP_LISTENERS: std::sync::OnceLock<ListenerSettings> = std::sync::OnceLock::new();
+
+/// 起動時に開いたリスナーの列（F-260）。リロードで平文の方針の表を差し替えてよいかの判定と、
+/// リロード後の Alt-Svc（実際に開いている HTTP/3 のポート）に使う。
+static STARTUP_LISTENER_SPECS: std::sync::OnceLock<Vec<ListenerSpec>> = std::sync::OnceLock::new();
+
+/// リロードで読んだリスナーの列が、起動時に開いた列と同じ並び（名前・アドレス・TLS か）か
+fn same_listener_set(new: &[ListenerSpec]) -> bool {
+    STARTUP_LISTENER_SPECS
+        .get()
+        .is_none_or(|old| listener_identity(old) == listener_identity(new))
+}
+
+/// リロードした設定が起動時の待ち受け設定と違えば、再起動が要ることを 1 回警告する。
+fn warn_listener_changes(config: &Config) {
+    let Some(startup) = STARTUP_LISTENERS.get() else {
+        return;
+    };
+    let keys = startup.changed_keys(&ListenerSettings::from_config(config));
+    if !keys.is_empty() {
+        warn!(
+            "Listener settings changed ({}); these are not applied by reload, restart veil to apply them",
+            keys.join(", ")
+        );
+    }
+}
+
 /// TLS証明書を除いた設定をロード（ホットリロード用）
 ///
 /// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
@@ -418,6 +523,16 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     // 設定ファイルのバリデーション
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
+    warn_listener_changes(&config);
+    let listeners = normalize_listeners(&config)?;
+
+    // F-259: 外向きの TLS の既定の信頼アンカーは先に解決するだけで公開しない。上流の `intern`
+    // （`tls_ca` を書かない mTLS の設定が既定を使う）はこのスレッドの間だけ未反映の値を見て、
+    // 反映（`commit_default`）は `reload_config` がリロードの最後まで通ったときだけ行う。
+    // サンドボックス下で初めて `"system"` が現れたらここで拒否する
+    let default_ca = crate::trust_store::resolve_default(&config.tls_client.ca)
+        .map_err(|e| io::Error::new(e.kind(), format!("[tls_client] ca: {e}")))?;
+    let _pending_ca = crate::trust_store::PendingGuard::new(&default_ca);
 
     // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
@@ -426,7 +541,6 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
-    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を更新（リロード対応）
     init_server_header(
@@ -434,8 +548,14 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         &config.server.server_header_value,
     );
 
-    // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期
-    apply_alt_svc_from_config(&config);
+    // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期。広告するポートは起動時に開いた HTTP/3 のリスナーのもの
+    // （リスナーはリロードで開き直さない。F-260）
+    apply_alt_svc_from_config(
+        &config,
+        STARTUP_LISTENER_SPECS
+            .get()
+            .map_or(listeners.as_slice(), Vec::as_slice),
+    );
 
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -469,6 +589,13 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         }
     }
 
+    // F-272: ルートの Backend の組み立てはディスク監視の既定値を読む。B-185: 既定値は引数で渡し、プロセス全体の
+    // キャッシュ設定はルートの解決（失敗し得る）の後で書き換える（拒否されたリロードの値を残さない）
+    let watch_defaults = WatchDefaults::from_config(&config);
+    let build_loaded = |r: &Route, g: &HashMap<String, Arc<UpstreamGroup>>| {
+        build_backend_loaded(r, g, watch_defaults)
+    };
+
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
@@ -484,10 +611,10 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
             // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
-            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_backend = build_loaded(&route, &upstream_groups).ok();
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
-                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
+                crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -501,16 +628,13 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     // OptimizedRouter を構築（Phase 1-4 最適化）
     let optimized_router = build_optimized_router(&routes);
 
-    // グローバルOpenFileCache設定を適用
-    let performance_config = &config.performance;
-    cache::configure_global_open_file_cache(
-        performance_config.open_file_cache_enabled,
-        performance_config.open_file_cache_valid_duration_secs,
-        performance_config.open_file_cache_max_entries,
+    // グローバルの open_file_cache・静的コンテンツキャッシュの設定を適用する（F-146・F-272）。B-185: この後に
+    // 失敗する処理は無い（リロードで拒否された設定の値がプロセス全体に効かないよう、ルートの解決より後に置く）
+    apply_global_cache_settings(
+        &config.performance,
+        &config.static_file_cache,
+        watch_defaults,
     );
-
-    // F-146: グローバル静的コンテンツキャッシュ設定を適用
-    cache::configure_global_static_content_cache(&config.static_file_cache);
 
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
@@ -526,6 +650,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     };
 
     Ok(LoadedConfigWithoutTls {
+        default_ca,
         route: routes,
         optimized_router,
         global_security: config.security,
@@ -541,7 +666,7 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
-        cleartext,
+        listeners,
         performance: config.performance.clone(),
     })
 }
@@ -592,6 +717,15 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 設定ファイルのバリデーション
     validate_config(&config)?;
     warn_unbuilt_sections(&config);
+    let listeners = normalize_listeners(&config)?;
+    // リロードの比較の基準（最初に読んだ設定を残す）
+    let _ = STARTUP_LISTENERS.set(ListenerSettings::from_config(&config));
+    let _ = STARTUP_LISTENER_SPECS.set(listeners.clone());
+
+    // F-259: 外向きの TLS の既定の信頼アンカー。上流の `intern` より先に決める。
+    // `"system"` はここ（サンドボックスを掛ける前）で OS の信頼ストアを読む
+    crate::trust_store::set_default(&config.tls_client.ca)
+        .map_err(|e| io::Error::new(e.kind(), format!("[tls_client] ca: {e}")))?;
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
@@ -606,15 +740,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
-    #[cfg(feature = "http3")]
-    let http3_enabled = config.http3.enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
-    #[cfg(feature = "http3")]
-    let http3_listen = http3_config.listen.clone();
-    let cleartext = CleartextPolicy::from_server(&config.server);
 
     // Serverヘッダー設定を初期化
     init_server_header(
@@ -623,16 +752,31 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     );
 
     // Alt-Svc（HTTP/3 広告、F-94）
-    apply_alt_svc_from_config(&config);
+    apply_alt_svc_from_config(&config, &listeners);
 
     // バッファプール設定を初期化
     init_buffer_pool_config(config.buffer_pool.clone());
 
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
-    #[cfg(feature = "http2")]
-    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
-    #[cfg(not(feature = "http2"))]
-    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, false)?;
+    // F-260: ALPN のプロファイル（h2+http/1.1・http/1.1 のみ）ごとに作る。既定のプロファイル（`[server] http2_enabled`）は
+    // L4 の TLS 終端・平文だけのサーバのアクセプタの型のために常に作り、ほかは TLS のリスナーが使うものだけ作る。
+    let default_profile = crate::tls_reload::AlpnProfile::from_http2(config.server.http2_enabled);
+    let mut tls_profiles: [Option<Arc<ServerConfig>>; crate::tls_reload::ALPN_PROFILE_COUNT] =
+        Default::default();
+    for profile in std::iter::once(default_profile)
+        .chain(listeners.iter().filter_map(ListenerSpec::alpn_profile))
+    {
+        if tls_profiles[profile.index()].is_none() {
+            tls_profiles[profile.index()] = Some(load_tls_config(
+                &config.tls,
+                ktls_config.enabled,
+                profile.http2(),
+            )?);
+        }
+    }
+    let tls_config = tls_profiles[default_profile.index()]
+        .clone()
+        .expect("the default ALPN profile is always built");
 
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -669,6 +813,13 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     }
 
+    // F-272: ルートの Backend の組み立てはディスク監視の既定値を読む。B-185: 既定値は引数で渡し、プロセス全体の
+    // キャッシュ設定はルートの解決（失敗し得る）の後で書き換える（拒否されたリロードの値を残さない）
+    let watch_defaults = WatchDefaults::from_config(&config);
+    let build_loaded = |r: &Route, g: &HashMap<String, Arc<UpstreamGroup>>| {
+        build_backend_loaded(r, g, watch_defaults)
+    };
+
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
@@ -684,10 +835,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
             // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
             // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
-            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_backend = build_loaded(&route, &upstream_groups).ok();
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
-                crate::route_traffic::resolve(&route, &upstream_groups, build_backend)?;
+                crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
             route.resolved_compression =
                 Some(Arc::new(route.compression.clone().unwrap_or_default()));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
@@ -701,16 +852,13 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // OptimizedRouter を構築（Phase 1-4 最適化）
     let optimized_router = build_optimized_router(&routes);
 
-    // グローバルOpenFileCache設定を適用
-    let performance_config = &config.performance;
-    cache::configure_global_open_file_cache(
-        performance_config.open_file_cache_enabled,
-        performance_config.open_file_cache_valid_duration_secs,
-        performance_config.open_file_cache_max_entries,
+    // グローバルの open_file_cache・静的コンテンツキャッシュの設定を適用する（F-146・F-272）。B-185: この後に
+    // 失敗する処理は無い（リロードで拒否された設定の値がプロセス全体に効かないよう、ルートの解決より後に置く）
+    apply_global_cache_settings(
+        &config.performance,
+        &config.static_file_cache,
+        watch_defaults,
     );
-
-    // F-146: グローバル静的コンテンツキャッシュ設定を適用
-    cache::configure_global_static_content_cache(&config.static_file_cache);
 
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
@@ -803,11 +951,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     Ok(LoadedConfig {
-        listen_addr: config.server.listen.clone(),
-        listen_cleartext: config.server.listen_cleartext.clone(),
-        cleartext,
-        unix_socket_permissions: config.server.unix_socket_permissions.clone(),
+        listeners,
         tls_config,
+        tls_profiles,
         tls_cert_path: config.tls.cert_path.clone(),
         tls_key_path: config.tls.key_path.clone(),
         // 証明書が無い（平文専用サーバ）ならリロード対象も無い。
@@ -837,10 +983,6 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
-        #[cfg(feature = "http3")]
-        http3_enabled,
-        #[cfg(feature = "http3")]
-        http3_listen,
         #[cfg(feature = "http2")]
         http2_config,
         #[cfg(feature = "http3")]
@@ -1021,7 +1163,8 @@ pub fn reresolve_routes_after_chroot(
             .iter()
             .map(|route| {
                 let mut route = route.clone();
-                route.resolved_backend = build_backend(&route, upstream_groups).ok();
+                route.resolved_backend =
+                    build_backend_loaded(&route, upstream_groups, WatchDefaults::applied()).ok();
                 route
             })
             .collect(),
@@ -1193,7 +1336,7 @@ pub(super) fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
     #[cfg(not(feature = "l4-proxy"))]
     let has_l4 = false;
     #[cfg(feature = "http3")]
-    let http3 = config.http3.enabled;
+    let http3 = config_has_http3(config);
     #[cfg(not(feature = "http3"))]
     let http3 = false;
     let facts = CapModeFacts { has_l4, http3 };
@@ -1251,6 +1394,124 @@ pub fn load_backend(
         return Ok(b.clone());
     }
     build_backend(route, upstream_groups)
+}
+
+/// 設定ロード時の Backend の組み立て（F-272: File のルートにディスクの監視を付ける）。
+///
+/// リクエスト時の組み立て（`load_backend` の後方互換の経路）は監視を付けない（`build_backend`。
+/// 監視の登録はロックと syscall を伴うため、データプレーンから呼ばない）。
+pub(super) fn build_backend_loaded(
+    route: &Route,
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+    watch: WatchDefaults,
+) -> io::Result<Backend> {
+    let backend = build_backend(route, upstream_groups)?;
+    #[cfg(feature = "cache")]
+    let backend = attach_static_watch(backend, watch);
+    #[cfg(not(feature = "cache"))]
+    let _ = (
+        watch.open_file_cache,
+        watch.static_file_cache,
+        watch.max_connections,
+    );
+    Ok(backend)
+}
+
+/// 読み込み中の設定のディスク監視の既定値（F-272）。B-185: プロセス全体の値（`cache::configure_global_*`）は
+/// リロードが最後まで通ってから書き換えるので、ルートの解決にはこの写しを渡す
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct WatchDefaults {
+    /// `[performance] open_file_cache_watch`
+    open_file_cache: bool,
+    /// `[static_file_cache] watch`
+    static_file_cache: bool,
+    /// `[security] max_concurrent_connections`（kqueue の監視が持つ fd の予算。B-191）
+    max_connections: usize,
+}
+
+impl WatchDefaults {
+    pub(super) fn from_config(config: &Config) -> Self {
+        Self {
+            open_file_cache: config.performance.open_file_cache_watch,
+            static_file_cache: config.static_file_cache.watch,
+            max_connections: config.security.max_concurrent_connections,
+        }
+    }
+}
+
+/// 最後に適用した設定のディスク監視の既定値（chroot 後のルートの解決し直しが使う）
+static APPLIED_WATCH_DEFAULTS: std::sync::Mutex<WatchDefaults> =
+    std::sync::Mutex::new(WatchDefaults {
+        open_file_cache: false,
+        static_file_cache: false,
+        max_connections: 0,
+    });
+
+#[cfg(any(target_os = "netbsd", test))]
+impl WatchDefaults {
+    /// 最後に適用した設定の値
+    fn applied() -> Self {
+        *APPLIED_WATCH_DEFAULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// グローバルの open_file_cache・静的コンテンツキャッシュの設定を書き換える（設定ロードの最後。B-185）
+fn apply_global_cache_settings(
+    performance_config: &PerformanceConfigSection,
+    static_file_cache: &cache::StaticContentCacheConfig,
+    watch: WatchDefaults,
+) {
+    cache::configure_global_open_file_cache(
+        performance_config.open_file_cache_enabled,
+        performance_config.open_file_cache_valid_duration_secs,
+        performance_config.open_file_cache_max_entries,
+    );
+    cache::configure_global_static_content_cache(static_file_cache);
+    *APPLIED_WATCH_DEFAULTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = watch;
+}
+
+/// File のルートが `watch = true` なら、ルートの `path` を監視して世代をキャッシュの設定に持たせる（F-272）
+#[cfg(feature = "cache")]
+fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
+    let Backend::SendFile(path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules) =
+        backend
+    else {
+        return backend;
+    };
+    let want_ofc = cache::open_file_cache_watch_enabled(ofc.as_deref(), defaults.open_file_cache);
+    let want_sfc =
+        cache::static_file_cache_watch_enabled(sfc.as_deref(), defaults.static_file_cache);
+    let gen = if want_ofc || want_sfc {
+        cache::watch::register(&path, defaults.max_connections)
+    } else {
+        None
+    };
+    let (ofc, sfc) = match gen {
+        Some(g) => (
+            if want_ofc {
+                let mut c = ofc.as_deref().cloned().unwrap_or_default();
+                c.watch_gen = Some(g);
+                Some(Arc::new(c))
+            } else {
+                ofc
+            },
+            if want_sfc {
+                let mut c = sfc.as_deref().cloned().unwrap_or_default();
+                c.watch_gen = Some(g);
+                Some(Arc::new(c))
+            } else {
+                sfc
+            },
+        ),
+        None => (ofc, sfc),
+    };
+    Backend::SendFile(
+        path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules,
+    )
 }
 
 /// `load_backend` の実体。ログ出力・エラーメッセージ・メモ化を含め従来の
@@ -1529,7 +1790,8 @@ pub(super) fn build_backend(
                     headers,
                     bytes::Bytes::from(body.clone()),
                 )
-                .with_security(Arc::new(security)),
+                .with_security(Arc::new(security))
+                .with_modules(modules_arc.clone()),
             )))
         }
         BackendConfig::Redirect {
@@ -1545,11 +1807,16 @@ pub(super) fn build_backend(
         )),
         #[cfg(feature = "handler")]
         BackendConfig::Handler { handler } => match crate::api::handler::lookup(handler) {
-            Some(entry) => Ok(Backend::Handler(
-                entry,
-                Arc::new(security),
-                modules_arc.clone(),
-            )),
+            Some(entry) => {
+                // F-270: 応答の圧縮はロード時に解決する（無効なら None で、要求ごとの判定は Option の確認 1 回）
+                let comp = (compression.enabled && entry.compress).then(|| Arc::new(compression));
+                Ok(Backend::Handler(
+                    entry,
+                    Arc::new(security),
+                    modules_arc.clone(),
+                    comp,
+                ))
+            }
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unknown handler '{}' (not registered)", handler),
@@ -1628,5 +1895,133 @@ mod config_path_tests {
         );
         assert!(help.contains("create the file"), "{}", help);
         assert!(help.is_ascii(), "help must be English: {}", help);
+    }
+}
+
+#[cfg(test)]
+mod listener_settings_tests {
+    use super::*;
+
+    fn cfg(s: &str) -> ListenerSettings {
+        ListenerSettings::from_config(&toml::from_str::<Config>(s).unwrap())
+    }
+
+    #[test]
+    fn same_config_has_no_changes() {
+        let a = cfg("[server]\nlisten = \"127.0.0.1:443\"\n");
+        assert!(a.changed_keys(&a.clone()).is_empty());
+    }
+
+    #[test]
+    fn detects_changed_keys() {
+        let a = cfg("[server]\nlisten = \"127.0.0.1:443\"\nthreads = 2\n");
+        let b = cfg(
+            "[server]\nlisten = \"127.0.0.1:8443\"\nlisten_cleartext = \"127.0.0.1:80\"\nthreads = 4\nhttp2_enabled = true\n[http3]\nenabled = true\n",
+        );
+        assert_eq!(
+            a.changed_keys(&b),
+            vec![
+                "server.listen",
+                "server.listen_cleartext",
+                "server.threads",
+                "server.http2_enabled",
+                "http3.enabled"
+            ]
+        );
+    }
+
+    #[cfg(feature = "l4-proxy")]
+    #[test]
+    fn detects_l4_identity_change() {
+        let l4 = |listen: &str, proto: &str| {
+            cfg(&format!(
+                "[server]\n[[l4]]\nname = \"db\"\nlisten = \"{listen}\"\nprotocol = \"{proto}\"\n[[l4.upstreams]]\naddr = \"127.0.0.1:1\"\n"
+            ))
+        };
+        let a = l4("0.0.0.0:5432", "tcp");
+        assert!(a.changed_keys(&l4("0.0.0.0:5432", "tcp")).is_empty());
+        assert_eq!(a.changed_keys(&l4("0.0.0.0:5433", "tcp")), vec!["l4"]);
+        assert_eq!(a.changed_keys(&l4("0.0.0.0:5432", "udp")), vec!["l4"]);
+    }
+}
+
+#[cfg(test)]
+// 理由付き allow: 一時ディレクトリへ試験用の設定・PEM を書く（データプレーン外のテスト）。
+#[allow(clippy::disallowed_methods)]
+mod f259_reload_tests {
+    use super::*;
+
+    /// F-259: リロードの後続の手順が失敗したら、`[tls_client] ca` の既定は何も変わらない。
+    #[test]
+    fn failed_reload_leaves_default_trust_unchanged() {
+        let _l = crate::trust_store::DEFAULT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![]).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = rcgen::CertifiedIssuer::self_signed(p, key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("ca.pem");
+        std::fs::write(&pem, ca.pem()).unwrap();
+        let cfg = dir.path().join("config.toml");
+        // [tls_client] ca は有効だが、上流の tls_ca が無いファイルを指すので後続の手順で失敗する
+        std::fs::write(
+            &cfg,
+            format!(
+                "[server]\nlisten_cleartext = \"127.0.0.1:0\"\nenable_secure_redirect = false\n\
+                 [tls_client]\nca = [\"builtin\", {pem:?}]\n\
+                 [upstreams.u]\nservers = [\"https://127.0.0.1:1\"]\ntls_ca = \"/nonexistent/veil-ca.pem\"\n\
+                 [[route]]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"Proxy\"\nupstream = \"u\"\n"
+            ),
+        )
+        .unwrap();
+        let before_roots = crate::trust_store::default_roots();
+        let before_gen = crate::trust_store::generation();
+        let before_tag = crate::trust_store::verify_tag();
+        let e = reload_config(&cfg).unwrap_err();
+        // 上流の tls_ca の読み込みで失敗する（[tls_client] ca の解決より後の手順）
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        assert!(Arc::ptr_eq(
+            &before_roots,
+            &crate::trust_store::default_roots()
+        ));
+        assert_eq!(before_gen, crate::trust_store::generation());
+        assert_eq!(before_tag, crate::trust_store::verify_tag());
+    }
+}
+
+#[cfg(all(test, feature = "cache"))]
+// 理由付き allow: 一時ディレクトリへ試験用の設定を書く（データプレーン外のテスト）。
+#[allow(clippy::disallowed_methods)]
+mod b185_reload_tests {
+    use super::*;
+
+    /// B-185: ルートの解決で拒否されたリロードは、静的配信のキャッシュのグローバル設定を変えない。
+    #[test]
+    fn rejected_reload_leaves_global_cache_settings_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("www");
+        std::fs::create_dir(&root).unwrap();
+        let cfg = dir.path().join("config.toml");
+        // キャッシュの値は他の試験が使わない値にする。CORS の `"*"` と credentials の組は
+        // `route_traffic::resolve`（ルートの解決）で拒否される
+        std::fs::write(
+            &cfg,
+            format!(
+                "[server]\nlisten_cleartext = \"127.0.0.1:0\"\nenable_secure_redirect = false\n\
+                 [performance]\nopen_file_cache_enabled = true\nopen_file_cache_max_entries = 4185\n\
+                 [static_file_cache]\nenabled = true\nmax_entries = 4185\nwatch = true\n\
+                 [[route]]\n[route.conditions]\npath = \"/\"\n\
+                 [route.action]\ntype = \"File\"\npath = {root:?}\n\
+                 [route.traffic.cors]\nallow_origins = [\"*\"]\nallow_credentials = true\n"
+            ),
+        )
+        .unwrap();
+        let e = reload_config(&cfg).unwrap_err();
+        assert!(e.to_string().contains("allow_credentials"), "{e}");
+        assert_ne!(cache::open_file_cache_global_max_entries(), 4185);
+        let sfc = cache::effective_static_content_cache_config(None);
+        assert_ne!(sfc.max_entries, 4185);
     }
 }

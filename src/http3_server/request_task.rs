@@ -25,6 +25,8 @@ pub(super) struct H3BufferedTask {
     /// Wasm `on_log` の完了を待たずに fin を出せるようにする。
     pub(super) resp_tx: Option<crate::http3_stream::Sender<crate::http3_stream::RespMsg>>,
     pub(super) notify: crate::http3_stream::ConnWaker,
+    /// ルートの `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ルートの解決の後に入れ、応答の head に足す）
+    pub(super) cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
 }
 
 /// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
@@ -91,8 +93,12 @@ pub(super) async fn buffered_request_task(
 #[cfg(feature = "handler")]
 pub(super) struct H3HandlerStream {
     pub(super) entry: std::sync::Arc<crate::api::handler::HandlerEntry>,
+    // F-270: ルートの応答の圧縮
+    pub(super) comp: Option<std::sync::Arc<crate::config::CompressionConfig>>,
     pub(super) req: crate::api::request::Request,
     pub(super) max_request_body: u64,
+    /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。メインループが応答の head に足す）
+    pub(super) cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
     pub(super) log: H3AccessLog,
 }
 
@@ -119,6 +125,7 @@ pub(super) async fn h3_api_stream_task(
     let start = Instant::now();
     let H3HandlerStream {
         entry,
+        comp,
         mut req,
         log,
         ..
@@ -132,7 +139,6 @@ pub(super) async fn h3_api_stream_task(
     // `body_tx` は move で持たせる（中継が終わったら drop して受信ストリームを終える）。
     // ハンドラとこの中継はどちらもチャネルの待ちだけで、起こされていない側を poll しても syscall は出ない。
     let pump = async move {
-        use futures::SinkExt;
         while let Some(chunk) = rx.recv().await {
             req_size_ref.set(req_size_ref.get() + chunk.len() as u64);
             // 消費したらメインループを起こして残りの本文を受け取らせる（QUIC のフロー制御の補充）
@@ -143,11 +149,15 @@ pub(super) async fn h3_api_stream_task(
                     req_size_ref.set(req_size_ref.get() + c.len() as u64);
                     notify_ref.notify();
                 }
-                break;
+                return;
             }
         }
+        // B-187: fin の前に切れた（ストリームのリセット・接続の切断・上限超過）本文は、正常な終わりに見せない
+        if rx.is_cut_off() {
+            body_tx.abort();
+        }
     };
-    let work = h3_api_respond(&entry, req, &resp_tx, &notify);
+    let work = h3_api_respond(&entry, comp.as_deref(), req, &resp_tx, &notify);
     let (status, sent) =
         match futures::future::select(std::pin::pin!(work), std::pin::pin!(pump)).await {
             futures::future::Either::Left((r, _pump)) => r,
@@ -173,6 +183,7 @@ pub(super) async fn h3_api_stream_task(
 #[cfg(feature = "handler")]
 pub(super) async fn h3_api_respond(
     entry: &crate::api::handler::HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
     req: crate::api::request::Request,
     resp_tx: &crate::http3_stream::Sender<crate::http3_stream::RespMsg>,
     notify: &crate::http3_stream::ConnWaker,
@@ -185,7 +196,7 @@ pub(super) async fn h3_api_respond(
         notify.notify();
         r.is_ok()
     };
-    let mut resp = crate::api::dispatch::call(entry, req).await;
+    let mut resp = crate::api::dispatch::call(entry, req, comp).await;
     crate::api::dispatch::h2_h3_headers(&mut resp);
     let status = resp.status_code();
     let stream = resp.take_stream();
@@ -302,26 +313,32 @@ pub(super) fn pack_resp_headers(
 pub(super) fn pack_h3_request_headers(
     headers: &[h3::Header],
     security: &SecurityConfig,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &crate::proxy::AddedHeaders,
 ) -> crate::http3_stream::RespHeaders {
     // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を HTTP/2 の上流にも当てる
     let refs: Vec<(&[u8], &[u8])> = headers
         .iter()
         .filter(|h| !h.name().starts_with(b":"))
-        .filter(|h| crate::proxy::forward_allowed(security, h.name()))
+        .filter(|h| crate::proxy::forward_allowed(security, h.name()) && added.keeps(h.name()))
         .map(|h| (h.name(), h.value()))
-        .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice())))
+        .chain(added.iter())
         .collect();
     pack_resp_headers(&refs, None)
 }
 
 impl H3BufferedTask {
     /// 応答断片を 1 つ送ってメインループを起こす。
-    async fn send_msg(&self, msg: crate::http3_stream::RespMsg) -> io::Result<()> {
+    async fn send_msg(&self, mut msg: crate::http3_stream::RespMsg) -> io::Result<()> {
         let tx = self
             .resp_tx
             .as_ref()
             .ok_or_else(|| io::Error::other("HTTP/3 response already sent"))?;
+        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+        if let (Some(c), crate::http3_stream::RespMsg::Head { headers, .. }) =
+            (&self.cors, &mut msg)
+        {
+            c.apply_bytes(headers);
+        }
         let r = tx.send(msg).await;
         self.notify.notify();
         r.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "HTTP/3 stream closed"))
@@ -494,9 +511,7 @@ impl H3BufferedTask {
         request_body: &Bytes,
     ) -> io::Result<()> {
         #[cfg(feature = "wasm")]
-        let mut wasm_modules_to_apply: Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-        > = None;
+        let mut wasm_modules_to_apply: Option<crate::wasm_plugin_config::WasmModules> = None;
 
         let result = self
             .handle_request_impl(
@@ -518,7 +533,7 @@ impl H3BufferedTask {
         headers: &[h3::Header],
         request_body: &Bytes,
         #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
-            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+            crate::wasm_plugin_config::WasmModules,
         >,
     ) -> io::Result<()> {
         // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
@@ -834,6 +849,8 @@ impl H3BufferedTask {
             );
             return Ok(());
         }
+        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。以降の応答の head に `send_msg` が足す）
+        self.cors = security.cors_actual.clone();
 
         // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
         // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out
@@ -853,7 +870,7 @@ impl H3BufferedTask {
 
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                    backend_modules.clone()
+                    crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
                 } else {
                     crate::wasm::empty_wasm_modules()
                 };
@@ -867,16 +884,20 @@ impl H3BufferedTask {
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
-                    let wasm_result = wasm_engine
-                        .on_request_headers_with_modules(
-                            &modules_to_apply,
-                            &std::sync::Arc::from(path_str),
-                            &std::sync::Arc::from(method_str),
-                            headers_vec,
-                            &std::sync::Arc::from(self.client_ip.as_str()),
-                            request_body.is_empty(),
-                        )
-                        .await;
+                    let path_arc: std::sync::Arc<str> = std::sync::Arc::from(path_str);
+                    let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str);
+                    let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(self.client_ip.as_str());
+                    // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+                    let wasm_result = Box::pin(wasm_engine.on_request_headers_with_modules(
+                        &modules_to_apply,
+                        &path_arc,
+                        &method_arc,
+                        headers_vec,
+                        &ip_arc,
+                        request_body.is_empty(),
+                        modules_to_apply.sessions(),
+                    ))
+                    .await;
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -919,17 +940,25 @@ impl H3BufferedTask {
                             headers: modified, ..
                         } => {
                             // B-38: 変更後ヘッダを上流リクエストへ反映
-                            wasm_request_headers = Some(modified);
+                            let modified = wasm_request_headers.insert(modified);
 
                             // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
                             // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
                             // end_of_stream=true の 1 回呼びで実装できる）。
                             if !request_body.is_empty() {
+                                // F-271: 本文の段からも要求のパス・ヘッダが見える
+                                let meta = crate::wasm::RequestMeta {
+                                    method: &method_arc,
+                                    path: &path_arc,
+                                    headers: modified,
+                                    client_ip: &ip_arc,
+                                };
                                 match crate::wasm::http_executor::apply_wasm_request_body(
                                     wasm_engine,
                                     &modules_to_apply,
                                     request_body.clone(),
                                     true,
+                                    Some(&meta),
                                 )
                                 .await
                                 {
@@ -1151,7 +1180,7 @@ impl H3BufferedTask {
                 .await
                 .unwrap_or((500, 0)),
             #[cfg(feature = "handler")]
-            Backend::Handler(entry, _, _) => {
+            Backend::Handler(entry, _, _, comp) => {
                 // ネイティブハンドラ（API ライブラリ、F-188）
                 let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 1);
                 let mut has_host = false;
@@ -1176,7 +1205,7 @@ impl H3BufferedTask {
                     self.client_ip.as_str(),
                     crate::api::request::HttpVersion::Http3,
                 );
-                let mut resp = crate::api::dispatch::call(&entry, req).await;
+                let mut resp = crate::api::dispatch::call(&entry, req, comp.as_deref()).await;
                 crate::api::dispatch::h2_h3_headers(&mut resp);
                 let status = resp.status_code();
                 if let Some(stream) = resp.take_stream() {
@@ -1241,9 +1270,7 @@ impl H3BufferedTask {
         prefix: &[u8],
         headers: &[h3::Header],
         request_body: &Bytes,
-        #[cfg(feature = "wasm")] wasm_modules: Option<
-            &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-        >,
+        #[cfg(feature = "wasm")] wasm_modules: Option<&crate::wasm_plugin_config::WasmModules>,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
         // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
@@ -1306,22 +1333,20 @@ impl H3BufferedTask {
         // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を、上流の種類（HTTP/1.1・h2c・
         // HTTPS の HTTP/2）に関わらず当てる（以前は HTTP/1.1 で受けた要求にだけ当てていた）
         let mut header_pairs = header_pairs;
-        if !security.remove_request_headers.is_empty() {
-            header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n));
-        }
-        if !security.add_request_headers.is_empty() {
-            let authority = headers
-                .iter()
-                .find(|h| h.name() == b":authority")
-                .map(|h| h.value())
-                .unwrap_or_default();
-            header_pairs.extend(crate::proxy::expanded_added_headers(
-                security,
-                self.client_ip.as_str(),
-                authority,
-                path_str,
-            ));
-        }
+        let authority = headers
+            .iter()
+            .find(|h| h.name() == b":authority")
+            .map(|h| h.value())
+            .unwrap_or_default();
+        // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）も当てる
+        let added = crate::proxy::expanded_added_headers(
+            security,
+            self.client_ip.as_str(),
+            authority,
+            path_str,
+        );
+        header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n) && added.keeps(n));
+        header_pairs.extend(added.iter().map(|(n, v)| (n.to_vec(), v.to_vec())));
 
         // gRPC はサービス/メソッドのフルパスを保持（B-39）
         #[cfg(feature = "grpc")]
@@ -1446,7 +1471,7 @@ impl H3BufferedTask {
                             .iter()
                             .map(|(n, v)| (n.as_slice(), v.as_slice())),
                         security,
-                        &[],
+                        &crate::proxy::AddedHeaders::NONE,
                     );
 
                     if !request_body.is_empty() {

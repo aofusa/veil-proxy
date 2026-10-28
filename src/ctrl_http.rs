@@ -2,7 +2,7 @@
 //!
 //! データプレーン（ワーカーのイベントループ）からは呼ばない。名前解決・接続・読み書きはすべて
 //! ブロッキングで、呼び出し元の専用スレッドだけを止める（理由付きで clippy の禁止メソッドを許可）。
-//! https は rustls（webpki-roots + 任意の追加 CA、任意の mTLS クライアント証明書）。
+//! https は rustls（`[tls_client] ca` の信頼アンカー + 任意の追加 CA、任意の mTLS クライアント証明書）。
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -80,8 +80,8 @@ pub fn read_file(path: &str) -> std::io::Result<Vec<u8>> {
 pub fn client_config(opts: &TlsOptions) -> Result<Arc<rustls::ClientConfig>, String> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // 既定は `[tls_client] ca`（組み込み・OS・PEM）。追加の CA はその上に足す
+    let mut roots = (*crate::trust_store::default_roots()).clone();
     if let Some(ca) = opts.ca_cert.as_deref().filter(|s| !s.is_empty()) {
         let pem = read_file(ca).map_err(|e| format!("CA certificate {}: {}", ca, e))?;
         for c in CertificateDer::pem_slice_iter(&pem) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -29,7 +29,27 @@ case "$OS" in
   *) FULL=full; NODEF="" ;;
 esac
 PY3="${PY3:-python3}"
+# FreeBSD・NetBSD の libc の jemalloc は既定で解放したページを常駐のまま持つ（RSS が下がらない）。Python・C の
+# サーバの RSS の検査は、手引き（docs/guide/library-production.md）が勧める設定で動かす
+case "$OS" in
+  FreeBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0}" ;;
+  NetBSD) export MALLOC_CONF="${MALLOC_CONF:-retain:false,dirty_decay_ms:0,muzzy_decay_ms:0}" ;;
+esac
 EXE=""; [ "$OS" = Windows ] && EXE=.exe
+# 同時接続の試験（WebSocket 2,000 本・asyncio の 2,000 並行）が OS の既定の上限で落ちないようにする。
+# OpenBSD の root のハード上限は 1024 fd（root のときだけ上げる）。BSD・macOS の listen の待ち行列は既定 128 で、溢れた SYN に
+# RST を返す（ConnectionResetError）。veil の listen の値（1024）まで上げる（root か、パスワード無しの sudo が使えるとき。
+# GitHub Actions の macOS）。上げられなければ ws_check.py が本数を上限に合わせる。
+if [ "$OS" != Windows ]; then
+  SU=""; [ "$(id -u 2>/dev/null)" = 0 ] || { sudo -n true 2>/dev/null && SU="sudo -n"; } || SU=none
+  if [ "$SU" != none ]; then
+    if [ -z "$SU" ]; then h="$(ulimit -Hn)"; [ "$h" != unlimited ] && [ "$h" -lt 8192 ] && ulimit -Hn 8192 2>/dev/null; fi
+    case "$OS" in NetBSD|OpenBSD) q=kern.somaxconn ;; FreeBSD) q=kern.ipc.soacceptqueue ;; Darwin) q=kern.ipc.somaxconn ;; *) q="" ;; esac
+    if [ -n "$q" ] && [ "$(sysctl -n "$q" 2>/dev/null || echo 1024)" -lt 1024 ]; then
+      { $SU sysctl -w "$q=1024" || $SU sysctl "$q=1024"; } >/dev/null 2>&1 && echo "== $q raised to 1024 for the concurrency tests"
+    fi
+  fi
+fi
 TMPD="$(mktemp -d)"
 cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done; rm -rf "$TMPD"; }
 # timeout(1) は macOS・OpenBSD の基本システムに無い
@@ -72,17 +92,101 @@ expect() { # expect <name> <expected-substring> <command...>
   local got; got="$("$@" 2>&1)"
   if [[ "$got" == *"$want"* ]]; then ok "$name"; else bad "$name: want '$want' got '${got:0:300}'"; fi
 }
+# rss_after <pid>: 「数秒の間の最小の RSS（KiB）」と「直後の RSS」。アロケータは空き領域をワーカーのアイドル点で
+# 返す（alloc_tune::idle_tick。FreeBSD の libc jemalloc は decay）ので、直後の値だけでは解放済みの領域が残って見える
+rss_after() {
+  local a m v i; a=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' '); m=$a
+  for i in 1 2 3 4; do
+    sleep 1; v=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$v" ] && [ -n "$m" ] && [ "$v" -lt "$m" ] && m=$v
+  done
+  echo "$m $a"
+}
+# upload_rss <名前> <PID> <関数>: 関数（100 MB のアップロード）の前後の常駐メモリ。増えた量が 50 MiB 未満なら ok。
+# 越えたら、もう一度アップロードして 2 回目で更に増えないことを見る（macOS の libmalloc は解放した大きな領域を
+# キャッシュとして持ち続け、1 回目だけ数十 MiB 残ることがある。本文を溜めているなら回ごとに増える）
+upload_rss() {
+  local name="$1" pid="$2" fn="$3" r0 r1 r1a r2 r2a
+  r0=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+  "$fn"
+  read -r r1 r1a <<<"$(rss_after "$pid")"
+  [ -n "$r0" ] && [ -n "$r1" ] || return 0
+  if [ $((r1 - r0)) -lt 51200 ]; then
+    ok "$name keep RSS (+$(( (r1 - r0) / 1024 )) MiB, +$(( (r1a - r0) / 1024 )) MiB right after)"; return
+  fi
+  "$fn"
+  read -r r2 r2a <<<"$(rss_after "$pid")"
+  if [ -n "$r2" ] && [ $((r2 - r1)) -lt 51200 ]; then
+    ok "$name keep RSS (+$(( (r1 - r0) / 1024 )) MiB after the first round, +$(( (r2 - r1) / 1024 )) MiB more after the second: the allocator keeps freed memory)"
+  else
+    bad "$name grew RSS by $(( (r1 - r0) / 1024 )) MiB, then $(( (${r2:-$r1} - r1) / 1024 )) MiB more"
+  fi
+}
+sha_of() { "$PY3" -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+# F-270: comp_probe <accept-encoding|-> <url> [curl の引数...]: 応答の content-encoding・Vary の有無と、復号した本文の sha256
+comp_probe() {
+  local ae="$1" u="$2"; shift 2
+  local h="$TMPD/comp.h" b="$TMPD/comp.b"
+  # 前の確認の本文を読まない（curl が失敗すると -o のファイルを作らない）
+  rm -f "$h" "$b"
+  if [ "$ae" = - ]; then curl -s -D "$h" -o "$b" "$@" "$u"; else curl -s --compressed -H "accept-encoding: $ae" -D "$h" -o "$b" "$@" "$u"; fi
+  local ce vary
+  ce=$(tr -d '\r' < "$h" | tr A-Z a-z | sed -n 's/^content-encoding: *//p' | tail -1)
+  vary=$(tr -d '\r' < "$h" | tr A-Z a-z | grep -c '^vary:.*accept-encoding')
+  echo "ce=${ce:-none} vary=$vary sha=$(sha_of "$b")"
+}
+# F-270: comp_suite <label> <base> <json> <compress=false のルート> <応答ごとに止めるルート|-> <ストリーミング> [curl の引数...]
+comp_suite() {
+  local L="$1" B="$2" J="$3" R="$4" N="$5" S="$6"; shift 6
+  local want sw
+  want=$(comp_probe - "$B$J" "$@" | sed 's/.*sha=//')
+  sw=$(comp_probe - "$B$S" "$@" | sed 's/.*sha=//')
+  # macOS の /usr/bin/curl は brotli を復号できない（--compressed が 61 で失敗する）。br の復号を見る確認は飛ばす
+  local br=1; curl -V | grep -qi brotli || { br=0; echo "  skip $L compression: br decoding (this curl has no brotli)"; }
+  [ "$br" = 0 ] || expect "$L compression: br decodes to the original" "ce=br vary=1 sha=$want" comp_probe br "$B$J" "$@"
+  expect "$L compression: gzip decodes to the original" "ce=gzip vary=1 sha=$want" comp_probe gzip "$B$J" "$@"
+  expect "$L compression: q-values (gzip;q=1, br;q=0.5)" "ce=gzip" comp_probe "gzip;q=1, br;q=0.5" "$B$J" "$@"
+  expect "$L compression: configured order (gzip, deflate, br)" "ce=br" comp_probe "gzip, deflate, br" "$B$J" "$@"
+  expect "$L compression: none without Accept-Encoding" "ce=none vary=0" comp_probe - "$B$J" "$@"
+  expect "$L compression: identity only" "ce=none" comp_probe identity "$B$J" "$@"
+  expect "$L compression: compress=false route" "ce=none vary=0 sha=$want" comp_probe br "$B$R" "$@"
+  [ "$N" = - ] || expect "$L compression: per-response opt-out" "ce=none vary=0 sha=$want" comp_probe br "$B$N" "$@"
+  expect "$L compression: streaming gzip" "ce=gzip vary=1 sha=$sw" comp_probe gzip "$B$S" "$@"
+  [ "$br" = 0 ] || expect "$L compression: streaming br" "ce=br vary=1 sha=$sw" comp_probe br "$B$S" "$@"
+}
+# F-270: comp_h3 <h3 の host:port> <path> <want sha>: HTTP/3 で gzip を受けて復号する（curl に HTTP/3 が無いので試験クライアント）
+comp_h3() {
+  # Git Bash が "/json" 等の要求のパスを Windows のパスに書き換えないように（W は C:/ の形）
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "$1" GET "$2" -H 'accept-encoding: gzip' > "$TMPD/h3.out" 2>&1
+  "$PY3" -I -c '
+import gzip, hashlib, sys
+d = open(sys.argv[1], "rb").read()
+head, _, body = d.partition(b"\r\n\r\n")
+ce = "none"
+for line in head.split(b"\r\n")[1:]:
+    k, _, v = line.partition(b":")
+    if k.strip().lower() == b"content-encoding":
+        ce = v.strip().decode()
+if ce == "gzip":
+    body = gzip.decompress(body)
+print("ce=%s sha=%s" % (ce, hashlib.sha256(body).hexdigest()))' "$TMPD/h3.out"
+}
 
 run_rust() {
   echo "== Rust (examples/api/rust-showcase)"
   local T="$ROOT/target/examples-api"
   (cd "$ROOT/examples/api/rust-showcase" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build"; return; }
-  local W; W="$(mktemp -d)"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
+  # 設定に書く upload_tmp_dir はネイティブの veil が開くので、Windows は C:/... の形にする
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"; local P; P=$(free_port); local L4; L4=$(free_port); local U; U=$(free_port)
   cat > "$W/config.toml" <<TOML
 [server]
 listen_cleartext = "127.0.0.1:$P"
 [logging]
 level = "info"
+[api]
+multipart_max_file_size = 209715200
+upload_tmp_dir = "$W/up"
+compression = true
 [[l4]]
 name = "tcp_echo"
 listen = "127.0.0.1:$L4"
@@ -93,6 +197,7 @@ listen = "127.0.0.1:$U"
 protocol = "udp"
 handler = "udp_echo"
 TOML
+  mkdir -p "$W/up"
   (cd "$W" && exec "$T/debug/veil-example-showcase$EXE") > "$W/log" 2>&1 &
   local PID=$!; PIDS+=("$PID")
   wait_port "$P" "$PID" || { bad "start"; cat "$W/log"; return; }
@@ -121,13 +226,46 @@ TOML
   expect "streaming request (HTTP/1.1)" "HELLO STREAM" curl -s -X POST "$B/upper" -d 'hello stream'
   expect "streaming request (h2c)" "HELLO H2" curl -s --http2-prior-knowledge -X POST "$B/upper" -d 'hello h2'
   expect "streaming request (h2c, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/upper' | wc -c"
+  # B-186: 本文の残りと次の要求が同じ書き込みで届いても、次の要求を失わない（以前は本文の残りを読むときに捨てた）
+  expect "streaming request pipelined (HTTP/1.1)" "HELLOWORLD|Hello, World!" "$PY3" -I -c '
+import re, socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"POST /upper HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhello")
+time.sleep(0.3)
+s.sendall(b"world" + b"GET /hello HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+out = b""
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        out += b
+except socket.timeout:
+    pass
+t = re.sub(r"\r\n[0-9a-f]+\r\n", "", out.decode("latin-1"))  # chunked の区切りを外す
+print("|".join(w for w in ("HELLOWORLD", "Hello, World!") if w in t))' "$P"
+  run_rust_multipart "$B" "$W" "$PID"
+  # F-270: [api] compression = true（ルートの compress = false・256 バイト未満・ストリーミング）
+  comp_suite "rust" "$B" /dataset/200 /dataset-raw/200 - /stream-big
+  comp_suite "rust h2c" "$B" /dataset/200 /dataset-raw/200 - /stream-big --http2-prior-knowledge
+  expect "rust compression: small body stays identity" "ce=none" comp_probe br "$B/hello"
+  expect "rust compression: HEAD has no body" "content-encoding: br" bash -c "curl -s -I -H 'accept-encoding: br' '$B/dataset/200' | tr A-Z a-z"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
   expect "OpenAPI constraints" '"maxLength":50' curl -s "$B/openapi.json"
   expect "Swagger UI" "swagger-ui-bundle.js" curl -s "$B/docs"
+  # F-264: 同梱の Swagger UI（外への参照が無い・CSP・事前圧縮の資産・解凍・304）
+  local SV; SV=$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' "$ROOT/third_party/swagger-ui-dist/assets.rs")
+  local SA="$B/docs/assets/$SV/swagger-ui-bundle.js"
+  expect "Swagger UI has no external URL" "external=0" bash -c "echo external=\$(curl -s '$B/docs' | grep -c -E 'https?:|//cdn|unpkg|jsdelivr')"
+  expect "Swagger UI CSP" "content-security-policy: default-src 'none'; script-src 'self';" bash -c "curl -s -i '$B/docs' | tr A-Z a-z"
+  expect "Swagger UI asset (br)" "content-encoding: br" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: gzip, br' '$SA' | tr A-Z a-z"
+  expect "Swagger UI asset (gzip)" "content-encoding: gzip" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: gzip' '$SA' | tr A-Z a-z"
+  expect "Swagger UI asset (identity)" "decoded" bash -c "curl -s -H 'accept-encoding: identity' '$SA' | grep -q SwaggerUIBundle && echo decoded"
+  expect "Swagger UI asset (h2c, immutable)" "immutable" bash -c "curl -s --http2-prior-knowledge -o /dev/null -D - '$B/docs/assets/$SV/swagger-ui.css'"
+  expect "Swagger UI asset 304" "304" bash -c "e=\$(curl -s -o /dev/null -D - '$SA' | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p'); curl -s -o /dev/null -w '%{http_code}' -H \"if-none-match: \$e\" '$SA'"
   expect "404 for unknown" "404" curl -s -o /dev/null -w "%{http_code}" "$B/nope"
   expect "L4 TCP echo" "hello-tcp" l4_echo tcp "$L4" hello-tcp
   expect "L4 UDP echo" "echo:hi" l4_echo udp "$U" hi
-  expect "threads default = CPU count" "Workers: $(ncpu)" cat "$W/log"
+  expect "threads default = CPU count" "workers=$(ncpu)" cat "$W/log"
   # SIGHUP: ファイルを読み直しても組み込みのルート（マクロ）とコード側の上書きは保たれる
   if [ "$OS" != Windows ]; then  # Windows に SIGHUP は無い
     sed -i.bak 's/level = "info"/level = "warn"/' "$W/config.toml"; kill -HUP "$PID"; sleep 1
@@ -140,7 +278,7 @@ TOML
   (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P2" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log" 2> "$W2/err" &
   local PID2=$!; PIDS+=("$PID2")
   wait_port "$P2" && expect "no config.toml -> library defaults" "Hello, World!" curl -s "http://127.0.0.1:$P2/hello" || bad "no-config start"
-  expect "defaults are plaintext h2c-only + HTTP/1.1" "H2C (HTTP/2 Cleartext) Server" cat "$W2/log"
+  expect "defaults are plaintext h2c-only + HTTP/1.1" "cleartext http1=on h2c=on" cat "$W2/log"
   # F-244: ライブラリの既定はアクセスログを標準出力に出す（専用スレッドが最大 1 秒ごとにフラッシュする）
   sleep 1.5
   expect "access log on stdout by default" "path=/hello" bash -c "grep -a 'type=access' '$W2/log'"
@@ -155,6 +293,57 @@ TOML
   curl -s -o /dev/null "http://127.0.0.1:$P3/hello"; sleep 1.5
   if grep -a -q 'type=access' "$W2/log3"; then bad "access_log.enabled = false stops the access log"; else ok "access_log.enabled = false stops the access log"; fi
   kill "$!" 2>/dev/null
+}
+
+run_rust_multipart() { # F-266: multipart/form-data（examples/api/rust-showcase の /profile・/files-upload・/upload-stream）
+  local B="$1" W="$2" PID="$3"
+  printf 'PNGDATA' > "$W/a.png"; printf 'one' > "$W/d1.txt"; printf 'second' > "$W/d2.txt"
+  expect "multipart form + file" '"avatar":"a.png","avatar_size":7,"avatar_type":"image/png","banner_size":null,"name":"al"' \
+    curl -s -F name=al -F age=30 -F "avatar=@$W/a.png;type=image/png" "$B/profile"
+  expect "multipart optional file" '"banner_size":3' curl -s -F name=al -F age=30 -F "avatar=@$W/a.png" -F "banner=@$W/d1.txt" "$B/profile"
+  expect "multipart validation 422" '"less_than_equal"' curl -s -F name=al -F age=500 -F "avatar=@$W/a.png" "$B/profile"
+  expect "multipart missing file 422" '"loc":["body","avatar"]' curl -s -F name=al -F age=3 "$B/profile"
+  expect "multipart several files" '"sizes":[3,6]' curl -s -F "docs=@$W/d1.txt" -F "docs=@$W/d2.txt" "$B/files-upload"
+  expect "multipart malformed 400" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/files-upload"
+  expect "multipart (h2c)" '"sizes":[3,6]' curl -s --http2-prior-knowledge -F "docs=@$W/d1.txt" -F "docs=@$W/d2.txt" "$B/files-upload"
+  expect "streaming multipart (HTTP/1.1)" '{"parts":[{"name":"t","value":"v"},{"file":"d2.txt","name":"f","size":6}]}' \
+    curl -s -F t=v -F "f=@$W/d2.txt" "$B/upload-stream"
+  expect "streaming multipart (h2c)" '"size":6' curl -s --http2-prior-knowledge -F t=v -F "f=@$W/d2.txt" "$B/upload-stream"
+  # 100 MB のファイル: 本文を溜めずに一時ファイルへ書く（常駐メモリが増えない）
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  big_rust() {
+    expect "streaming multipart 100 MB (HTTP/1.1)" '"size":104857600' curl -s -F "big=@$W/big.bin" "$B/upload-stream"
+    expect "streaming multipart 100 MB (h2c)" '"size":104857600' curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload-stream"
+  }
+  upload_rss "100 MB uploads" "$PID" big_rust
+  rm -f "$W/big.bin"
+  [ -z "$(ls -A "$W/up")" ] && ok "no temporary upload files remain" || bad "temporary upload files remain: $(ls "$W/up")"
+  expect "OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/profile\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
+}
+
+run_python_multipart() { # F-266: Python の Form・File・UploadFile（examples/api/python-features の /upload・/upload-many・/login）
+  local B="$1" W="$2" PID="$3"
+  printf 'hello' > "$W/s.txt"; printf 'n1' > "$W/n.txt"
+  expect "py multipart form + small file (memory)" '"title":"t","count":2,"filename":"s.txt","size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","where":"memory","note":null' \
+    curl -s -F title=t -F count=2 -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart optional file" '"note":"n1"' curl -s -F title=t -F "doc=@$W/s.txt" -F "note=@$W/n.txt" "$B/upload"
+  expect "py multipart (h2c)" '"where":"memory"' curl -s --http2-prior-knowledge -F title=t -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart missing file 422" '"loc":["body","doc"]' curl -s -F title=t "$B/upload"
+  expect "py multipart bad int 422" '"loc":["body","count"]' curl -s -F title=t -F count=x -F "doc=@$W/s.txt" "$B/upload"
+  expect "py multipart malformed 400" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
+  expect "py several files" '[{"filename":"s.txt","size":5},{"filename":"n.txt","size":2}]' curl -s -F "docs=@$W/s.txt" -F "docs=@$W/n.txt" "$B/upload-many"
+  expect "py urlencoded form" '{"user":"a b","remember":true}' curl -s -d 'user=a%20b&remember=on' "$B/login"
+  # 100 MB のファイル: Rust が一時ファイルへ書き、Python は fd で読む（常駐メモリが増えない）
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  local sum
+  sum=$("$PY3" -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$W/big.bin")
+  big_py() {
+    expect "py 100 MB upload (HTTP/1.1, disk)" "\"size\":104857600,\"sha256\":\"$sum\",\"where\":\"disk\"" curl -s -F title=b -F "doc=@$W/big.bin" "$B/upload"
+    expect "py 100 MB upload (h2c)" "\"sha256\":\"$sum\"" curl -s --http2-prior-knowledge -F title=b -F "doc=@$W/big.bin" "$B/upload"
+  }
+  upload_rss "py 100 MB uploads" "$PID" big_py
+  rm -f "$W/big.bin"
+  expect "py OpenAPI multipart body" '"format":"binary"' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/upload\"][\"post\"][\"requestBody\"][\"content\"][\"multipart/form-data\"], separators=(\",\",\":\")))'"
 }
 
 run_graphql() {
@@ -192,7 +381,7 @@ run_c() {
     make -s -C "$CH" hello hello-static >/dev/null || { bad "compile hello.c"; return; }
   else
     # 静的リンクに要るシステムライブラリは OS ごとに違う（OpenBSD・NetBSD に libdl は無い等）ので rustc に聞く
-    local libs; libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+    local libs; libs=$(cd "$ROOT" && cargo rustc -q --color never -p veil-capi --release --crate-type staticlib -- \
       --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
     if [ "$OS" = Windows ]; then
       c_msvc "$CH" "$libs" || { bad "compile hello.c (MSVC)"; return; }
@@ -203,10 +392,11 @@ run_c() {
     fi
   fi
   for bin in hello hello-static; do
+    # ログは実行ファイルごとに分ける（前のプロセスが終わる前に同じファイルを切り詰めると、残った書き込みで NUL の穴が空く）
     local P; P=$(free_port)
-    VEIL_LISTEN="127.0.0.1:$P" PATH="$ROOT/target/release:$PATH" "$CH/$bin$EXE" > "$TMPD/c.log" 2>&1 &
+    VEIL_LISTEN="127.0.0.1:$P" PATH="$ROOT/target/release:$PATH" "$CH/$bin$EXE" > "$TMPD/c-$bin.log" 2>&1 &
     local PID=$!; PIDS+=("$PID")
-    wait_port "$P" "$PID" || { bad "$bin start"; cat "$TMPD/c.log"; continue; }
+    wait_port "$P" "$PID" || { bad "$bin start"; cat "$TMPD/c-$bin.log"; continue; }
     local B="http://127.0.0.1:$P"
     expect "$bin GET /" "Hello from C" curl -s "$B/"
     expect "$bin path param (decoded)" '{"id":"a b"}' curl -s "$B/users/a%20b"
@@ -215,11 +405,11 @@ run_c() {
     expect "$bin OpenAPI from C metadata" '"summary":"Get a user"' curl -s "$B/openapi.json"
     sleep 1.5
     # -a: ログに想定外のバイトがあっても grep が「Binary file matches」だけを返さないように（FreeBSD x86_64 で起きた）
-    expect "$bin access log by default" "path=/users/" bash -c "grep -a 'type=access' '$TMPD/c.log'"
+    expect "$bin access log by default" "path=/users/" bash -c "grep -a 'type=access' '$TMPD/c-$bin.log'"
     # ログに NUL などの制御文字（改行・タブ・ESC 以外）が混ざっていないこと（混ざっていれば中身を出す）
-    if LC_ALL=C grep -q -P '[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]' "$TMPD/c.log" 2>/dev/null \
-       || [ "$(LC_ALL=C tr -d -c '\000' < "$TMPD/c.log" | wc -c)" -gt 0 ]; then
-      bad "$bin log has control bytes: $(od -c "$TMPD/c.log" | grep -n -E '\\0|[0-9]{3}' | head -3 | tr '\n' ' ')"
+    if LC_ALL=C grep -q -P '[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]' "$TMPD/c-$bin.log" 2>/dev/null \
+       || [ "$(LC_ALL=C tr -d -c '\000' < "$TMPD/c-$bin.log" | wc -c)" -gt 0 ]; then
+      bad "$bin log has control bytes: $(od -c "$TMPD/c-$bin.log" | grep -n -E '\\0|[0-9]{3}' | head -3 | tr '\n' ' ')"
     else
       ok "$bin log is plain text"
     fi
@@ -281,7 +471,7 @@ run_c_features() {
   else
     local MK; MK=$(command -v gmake || command -v make)
     local libs="-lpthread -ldl -lm"
-    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q -p veil-capi --release --crate-type staticlib -- \
+    [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q --color never -p veil-capi --release --crate-type staticlib -- \
       --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
     "$MK" -s -C "$CF" CC="${CC:-cc}" LIBS="$libs" features >/dev/null || { bad "compile features.c"; return; }
   fi
@@ -299,13 +489,72 @@ run_c_features() {
   expect "C streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
   expect "C streaming request body (h2c)" "300000" bash -c "dd if=/dev/zero bs=1000 count=300 2>/dev/null | curl -s --http2-prior-knowledge -X POST --data-binary @- '$B/count'"
   expect "C L4 TCP echo" "c-tcp" l4_echo tcp "$L4" c-tcp
+  # F-261: C のハンドラのアップグレード（101 の後は L4 と同じコールバック。ヘッダと同じパケットの行も届く）
+  expect "C upgrade (101 + L4 callbacks)" "hello|c-up|x-from: c" "$PY3" -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"GET /upgrade HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: x-echo\r\n\r\nc-up")
+d = b""
+while not d.endswith(b"c-up"):
+    b = s.recv(4096)
+    if not b: break
+    d += b
+head, _, body = d.partition(b"\r\n\r\n")
+ok = head.startswith(b"HTTP/1.1 101 ") and b"x-from: c" in head
+print(body.decode().replace("\n", "|") + ("|x-from: c" if ok else "|bad head " + head.decode()))' "$P"
+  expect "C upgrade on h2c is 400" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "$B/upgrade"
+  # F-262: C の WebSocket（veil_ws_accept。コールバックはハンドラ用プール）
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" basic "$P" /ws | sed "s|\$| (C)|; s|^|  |" | tee "$W/wsr"
+  grep -q "FAIL" "$W/wsr" && FAIL=1
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" 200 | sed "s|\$| (C)|; s|^|  |" | tee "$W/wsr"
+  grep -q "^  ok" "$W/wsr" || FAIL=1
   expect "C L4 UDP echo" "echo:c-udp" l4_echo udp "$U" c-udp
   (cd "$ROOT/tests/api/grpc_client" && CARGO_TARGET_DIR="$ROOT/target/examples-api" cargo build -q) || { bad "build grpc client"; return; }
   local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$P" --h3 "127.0.0.1:$S" 2>&1)"
   local rc=$?
   echo "$out" | sed 's/^/  /'
   [ "$rc" = 0 ] && ok "C gRPC interop (tonic + HTTP/3, exit 0)" || bad "C gRPC interop (exit $rc)"
+  run_c_multipart "$B" "$W" "$PID" "$S"
+  # F-270: api.compression（VEIL_ROUTE_NO_COMPRESS・veil_response_no_compression・ストリーミング・HTTP/3）
+  comp_suite "C" "$B" /json /json-raw /json-nc /lines
+  comp_suite "C h2c" "$B" /json /json-raw /json-nc /lines --http2-prior-knowledge
+  expect "C compression: SSE stays identity" "ce=none" comp_probe gzip "$B/sse" -N
+  local jsha lsha
+  jsha=$(comp_probe - "$B/json" | sed 's/.*sha=//'); lsha=$(comp_probe - "$B/lines" | sed 's/.*sha=//')
+  expect "C compression (HTTP/3, gzip)" "ce=gzip sha=$jsha" comp_h3 "127.0.0.1:$S" /json
+  expect "C streaming compression (HTTP/3, gzip)" "ce=gzip sha=$lsha" comp_h3 "127.0.0.1:$S" /lines
   kill "$PID"
+}
+
+run_c_multipart() { # F-266: C の veil_multipart_next（VEIL_ROUTE_FORM の /upload と溜めた本文の /parse）
+  local B="$1" W="$2" PID="$3" S="$4"
+  printf 'hello' > "$W/s.txt"
+  # バイトの総和: hello = 532、v = 118
+  expect "C multipart (form route, memory)" "t=1/118(mem);f:s.txt=5/532(mem);" curl -s -F t=v -F "f=@$W/s.txt" "$B/upload"
+  expect "C multipart (buffered body)" "f:s.txt=5/532(mem);" curl -s -F "f=@$W/s.txt" "$B/parse"
+  expect "C multipart (h2c)" "f:s.txt=5/532(mem);" curl -s --http2-prior-knowledge -F "f=@$W/s.txt" "$B/upload"
+  expect "C multipart malformed 400 (form route)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
+  expect "C multipart malformed 400 (buffered)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary $'--x\r\nbroken' "$B/parse"
+  dd if=/dev/urandom of="$W/big.bin" bs=1048576 count=100 2>/dev/null
+  local h
+  h=$("$PY3" -I -c 'import sys; print(sum(open(sys.argv[1], "rb").read()))' "$W/big.bin")
+  big_c() {
+    expect "C 100 MB upload (HTTP/1.1, temp file)" "big:big.bin=104857600/$h(disk);" curl -s -F "big=@$W/big.bin" "$B/upload"
+    expect "C 100 MB upload (h2c)" "big:big.bin=104857600/$h(disk);" curl -s --http2-prior-knowledge -F "big=@$W/big.bin" "$B/upload"
+  }
+  upload_rss "C 100 MB uploads" "$PID" big_c
+  rm -f "$W/big.bin"
+  # HTTP/3（curl に HTTP/3 が無いので quinn + h3 の試験クライアントで送る）: 30 MB は [api] max_body_size（10 MiB）を超える
+  local sum3; sum3=$("$PY3" -I -c '
+import os, sys
+data = os.urandom(30 << 20)
+body = (b"--BND\r\ncontent-disposition: form-data; name=\"t\"\r\n\r\nv\r\n--BND\r\n"
+        b"content-disposition: form-data; name=\"big\"; filename=\"b.bin\"\r\n\r\n" + data + b"\r\n--BND--\r\n")
+open(sys.argv[1], "wb").write(body)
+print(sum(data))' "$W/mp.bin")
+  expect "C multipart 30 MB (HTTP/3)" "t=1/118(mem);big:b.bin=31457280/$sum3(disk);" \
+    env MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --h3-fetch "127.0.0.1:$S" POST /upload -H 'content-type: multipart/form-data; boundary=BND' --data-file "$W/mp.bin"
+  rm -f "$W/mp.bin"
 }
 
 run_python() {
@@ -314,9 +563,11 @@ run_python() {
   if [ -z "$PY" ]; then
     local V="$ROOT/target/py-venv"
     local VB="$V/bin"; [ "$OS" = Windows ] && VB="$V/Scripts"
-    [ -x "$VB/python$EXE" ] || "$PY3" -m venv "$V"
-    "$VB/python$EXE" -m pip -q install maturin >/dev/null
-    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
+    # target/ ごとキャッシュから戻した venv は別のホストの Python を指して壊れていることがある（CI）。使えなければ作り直す
+    "$VB/python$EXE" -c 'import sys' 2>/dev/null || { rm -rf "$V"; "$PY3" -m venv "$V"; }
+    "$VB/python$EXE" -m pip -q install maturin > "$TMPD/pip.log" 2>&1 ||
+      "$VB/python$EXE" -m pip -q install maturin > "$TMPD/pip.log" 2>&1 || { bad "pip install maturin"; sed 's/^/    /' "$TMPD/pip.log" | tail -5; return; }
+    if ! (cd "$ROOT/crates/veil-python" && unset CONDA_PREFIX && VIRTUAL_ENV="$V" PATH="$VB:$PATH" "$VB/python$EXE" -m maturin develop -q --release) > "$TMPD/maturin.log" 2>&1; then
       # maturin の wheel の platform タグと pip が受け付けるタグが違う OS がある（NetBSD aarch64 は maturin が
       # netbsd_10_1_arm64、pip は evbarm 系）。wheel を作り、pip が受け付けるタグに付け直して入れる
       if grep -q "is not a supported wheel on this platform" "$TMPD/maturin.log"; then
@@ -338,6 +589,166 @@ run_python() {
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
   run_python_f210 "$PY"
+  run_python_ws "$PY"
+  run_python_kit "$PY"
+}
+
+run_python_kit() { # F-268: FastAPI 互換（Depends 等）・veil-api-kit（examples/api/python-kit）・veil_kit.grpc のクライアント
+  local PY="$1" EX="$ROOT/examples/api"
+  echo "== Python: FastAPI compatibility / veil-api-kit (F-268)"
+  "$PY" -m pip -q install --no-deps -e "$ROOT/crates/veil-python-kit" > "$TMPD/kit-pip.log" 2>&1 || { bad "pip install veil-api-kit"; tail -5 "$TMPD/kit-pip.log"; return; }
+  "$PY" -m pip -q install pydantic PyJWT >/dev/null 2>&1
+  "$PY" -m pip -q install strawberry-graphql >/dev/null 2>&1 || echo "  skip kit GraphQL: strawberry-graphql is not installable here"
+  "$PY" -m pip -q install fastapi >/dev/null 2>&1 || echo "  skip kit ASGI mount: fastapi is not installable here"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_fastapi_compat.py) > "$TMPD/fc.log" 2>&1 && ok "py test_fastapi_compat.py" || { bad "py test_fastapi_compat.py"; tail -20 "$TMPD/fc.log"; }
+  (cd "$ROOT/crates/veil-python-kit" && "$PY" -I tests/test_kit.py) > "$TMPD/kit.log" 2>&1 && ok "kit tests/test_kit.py" || { bad "kit tests/test_kit.py"; tail -20 "$TMPD/kit.log"; }
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$EX/python-kit/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  if wait_port "$P" "$PID"; then
+    local B="http://127.0.0.1:$P"
+    expect "kit Depends / Query / Header / Inject / APIRouter" '"version":"2","greeting":"hello item"' curl -s -H 'x-api-version: 2' "$B/v1/items/5?skip=2"
+    expect "kit Depends validation is 422" "422" curl -s -o /dev/null -w "%{http_code}" "$B/v1/items/5?limit=500"
+    expect "kit BackgroundTasks (response first)" '{"queued":true}' curl -s -X POST "$B/notify?email=a@example"
+    local i; for i in $(seq 1 50); do curl -s "$B/log" | grep -q "sent to a@example" && break; sleep 0.1; done
+    expect "kit BackgroundTasks ran after the response" "sent to a@example" curl -s "$B/log"
+    expect "kit OAuth2 bad password is 400" "400" curl -s -o /dev/null -w "%{http_code}" -d username=alice -d password=x "$B/token"
+    local tok tok0
+    tok=$(curl -s -d username=alice -d password=wonderland -d 'scope=items:write' "$B/token" | "$PY3" -I -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    tok0=$(curl -s -d username=alice -d password=wonderland "$B/token" | "$PY3" -I -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    expect "kit JWT bearer" '{"user":"alice"}' curl -s -H "authorization: Bearer $tok" "$B/me"
+    expect "kit missing bearer is 401 + WWW-Authenticate" "www-authenticate: bearer" bash -c "curl -s -i '$B/me' | tr A-Z a-z"
+    expect "kit Security scopes granted" "201" curl -s -o /dev/null -w "%{http_code}" -X POST -H "authorization: Bearer $tok" "$B/items?name=x"
+    expect "kit Security scopes missing is 401" "401" curl -s -o /dev/null -w "%{http_code}" -X POST -H "authorization: Bearer $tok0" "$B/items?name=x"
+    expect "kit response_model filters fields" '[{"name":"alice"}]' curl -s "$B/users"
+    curl -s -c "$W/jar" -b "$W/jar" "$B/count" >/dev/null
+    expect "kit signed cookie session" '{"n":2}' curl -s -c "$W/jar" -b "$W/jar" "$B/count"
+    expect "kit safe_redirect rejects other hosts" "location: /" bash -c "curl -s -i '$B/go?next=https://evil.example/' | tr A-Z a-z"
+    expect "kit safe_redirect keeps allowed hosts" "location: https://app.example/x" bash -c "curl -s -i '$B/go?next=https://app.example/x' | tr A-Z a-z"
+    expect "kit CORS preflight answered by the server" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$B/me' | tr A-Z a-z"
+    expect "kit CORS headers on responses" "access-control-allow-credentials: true" bash -c "curl -s -i -H 'origin: https://app.example' '$B/log' | tr A-Z a-z"
+    expect "kit StaticFiles (html=True)" "static index" curl -s "$B/static/"
+    expect "kit periodic task" "True" bash -c "curl -s '$B/ticks' | $PY3 -I -c 'import json,sys; print(json.load(sys.stdin)[\"n\"] >= 1)'"
+    expect "kit OpenAPI: router paths, hidden route, security schemes" "True False ['OAuth2PasswordBearer']" bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; d=json.load(sys.stdin); ps=d[\"paths\"]; print(\"/v1/items/{item_id}\" in ps, \"/internal\" in ps, sorted(d[\"components\"][\"securitySchemes\"]))'"
+    if "$PY" -I -c 'import strawberry' 2>/dev/null; then
+      expect "kit GraphQL query (strawberry)" '{"data":{"hello":"hello kit"}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ hello(name: \"kit\") }"}'
+    fi
+    if "$PY" -I -c 'import fastapi' 2>/dev/null; then
+      expect "kit FastAPI mounted at /legacy (ASGI)" '"from":"fastapi"' curl -s "$B/legacy/hello/x?q=2"
+      expect "kit FastAPI mounted at /legacy (h2c)" '"q":2' curl -s --http2-prior-knowledge "$B/legacy/hello/x?q=2"
+    fi
+    if "$PY" -I -c 'import strawberry, fastapi' 2>/dev/null; then
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" kit "$P" | sed "s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+    fi
+  else
+    bad "python-kit start"; cat "$W/log"
+  fi
+  py_stop "$PID"
+  # veil_kit.grpc: grpc_tools の生成スタブを veil の HTTP/2 クライアントで（examples/api/python-grpc を相手に）
+  local GEN="$W/gen"; mkdir -p "$GEN"
+  if "$PY" -m pip -q install grpcio grpcio-tools protobuf >/dev/null 2>&1 && \
+     "$PY" -m grpc_tools.protoc -I "$EX/rust-grpc/proto" --python_out="$GEN" --grpc_python_out="$GEN" "$EX/rust-grpc/proto/demo.proto" 2>/dev/null; then
+    # rustls（webpki）は CA の証明書をサーバの証明書に使うのを拒むので、CA と CA で署名したサーバの証明書を作る
+    printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n' > "$W/ext"
+    { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/ca.key" -out "$W/ca.pem" -days 2 -subj /CN=kit-ca \
+        && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/leaf.csr" -subj /CN=localhost \
+        && openssl x509 -req -in "$W/leaf.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcreateserial -out "$W/cert.pem" -days 2 -extfile "$W/ext"; } >/dev/null 2>&1 \
+      || { bad "cert"; return; }
+    local GP GS; GP=$(free_port); GS=$(free_port)
+    GEN_DIR="$GEN" VEIL_GRPC_MODE=grpcio VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
+      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+    local GPID=$!; PIDS+=("$GPID")
+    if wait_port "$GP" "$GPID" && wait_port "$GS" "$GPID"; then
+      GEN_DIR="$GEN" tmo 120 "$PY" "$EX/python-kit/grpc_client.py" "127.0.0.1:$GP" --tls "127.0.0.1:$GS" "$W/ca.pem" 2>&1 | sed "s|^|  |" | tee "$W/gr"
+      grep -q "ok tls bidi" "$W/gr" && ! grep -q "FAIL\|Traceback" "$W/gr" && ok "kit gRPC client (h2c, TLS, asyncio)" || bad "kit gRPC client"
+    else
+      bad "python-grpc start (kit client)"; cat "$W/g.log"
+    fi
+    py_stop "$GPID"
+  else
+    echo "  skip kit gRPC client: grpcio-tools is not installable here"
+  fi
+}
+
+run_python_ws() { # F-263: 常駐のイベントループ・WebSocket・アップグレード・lifespan（examples/api/python-websocket）
+  local PY="$1"
+  echo "== Python: event loop / WebSocket / upgrade / lifespan (F-263)"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_aio.py) > "$TMPD/aio.log" 2>&1 && ok "py test_aio.py" || { bad "py test_aio.py"; tail -20 "$TMPD/aio.log"; }
+  "$PY" -m pip -q install pydantic >/dev/null 2>&1 || echo "  skip py /typed: pydantic is not installable here"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$ROOT/examples/api/python-websocket/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "python-websocket start"; cat "$W/log"; return; }
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" python "$P" | sed "s|^|  |" | tee "$W/r"
+  grep -q "FAIL" "$W/r" && FAIL=1
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" "${WS_E2E_CONNS:-2000}" | sed "s|^|  py |" | tee "$W/r"
+  grep -q "^  py ok" "$W/r" || FAIL=1
+  # 常駐のループ: await asyncio.sleep(1) を同時に（既定 2,000 本。PY_E2E_SLEEPERS=32768 で多くの接続を）
+  "$PY3" -I "$ROOT/tests/api/ws_check.py" sleepers "$P" "${PY_E2E_SLEEPERS:-2000}" | sed "s|^|  py |" | tee "$W/r"
+  grep -q "^  py ok" "$W/r" || FAIL=1
+  expect "py OpenAPI lists /ws with x-veil-websocket" "True ['echo.v1'] False" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; ps=json.load(sys.stdin)[\"paths\"]; o=ps[\"/ws\"][\"get\"]; print(\"101\" in o[\"responses\"], o[\"x-veil-websocket\"][\"subprotocols\"], \"/hidden\" in ps)'"
+  expect "py WebSocket on h2c is 400" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/ws"
+  if [ "$OS" != Windows ]; then
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+    local HP=$!
+    for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+    kill "$PID"; wait "$HP"
+    grep -q "close 1001" "$W/hold" && ok "py graceful shutdown sends Close 1001" || bad "py graceful shutdown sends Close 1001: $(cat "$W/hold")"
+    for _ in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+    grep -q "lifespan: shutdown" "$W/log" && ok "py lifespan shutdown runs after the server stopped" || bad "py lifespan shutdown: $(tail -5 "$W/log")"
+  fi
+  py_stop "$PID" 2>/dev/null
+  # lifespan の開始で例外なら起動しない（終了コード 1）
+  printf 'import contextlib, veil\n@contextlib.asynccontextmanager\nasync def ls(app):\n    raise RuntimeError("no db")\n    yield\napp = veil.App(lifespan=ls)\napp.run(listen_cleartext="127.0.0.1:%s")\n' "$(free_port)" > "$W/bad.py"
+  tmo 60 "$PY" "$W/bad.py" > "$W/bad.log" 2>&1
+  local rc=$?
+  [ "$rc" = 1 ] && grep -q "no db" "$W/bad.log" && ok "py lifespan startup failure exits 1" || bad "py lifespan startup failure (exit $rc): $(tail -3 "$W/bad.log")"
+  run_python_autobahn "$PY"
+}
+
+run_python_autobahn() { # Autobahn TestSuite の 1.*〜7.*（Python の /ws のエコー）
+  local PY="$1"
+  if ! command -v docker >/dev/null || ! docker image inspect crossbario/autobahn-testsuite >/dev/null 2>&1; then
+    echo "  skip py Autobahn TestSuite (docker or crossbario/autobahn-testsuite is missing)"
+    return
+  fi
+  mkdir -p "$ROOT/target"
+  local W; W="$(mktemp -d "$ROOT/target/autobahn-py.XXXXXX")"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" "$PY" "$ROOT/examples/api/python-websocket/app.py" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "python-websocket start (autobahn)"; cat "$W/log"; return; }
+  cat > "$W/fuzzingclient.json" <<JSON
+{ "outdir": "/w/reports", "servers": [ {"agent": "veil-python", "url": "ws://127.0.0.1:$P/ws"} ],
+  "cases": ["1.*", "2.*", "3.*", "4.*", "5.*", "6.*", "7.*"], "exclude-cases": [], "exclude-agent-cases": {} }
+JSON
+  tmo 3600 docker run --rm --network host --user "$(id -u):$(id -g)" -v "$W:/w" crossbario/autobahn-testsuite \
+    wstest -m fuzzingclient -s /w/fuzzingclient.json > "$W/autobahn.log" 2>&1 || { bad "py Autobahn fuzzingclient run"; tail -20 "$W/autobahn.log"; }
+  autobahn_summary "$W/reports/index.json" | tee "$W/r"
+  grep -q "^  ok" "$W/r" && ! grep -q "FAIL" "$W/r" || FAIL=1
+  py_stop "$PID" 2>/dev/null
+  rm -rf "$W"
+}
+
+autobahn_summary() { # autobahn_summary <index.json>
+  "$PY3" -I - "$1" <<'PY' | sed "s|^|  |"
+import json, sys
+idx = json.load(open(sys.argv[1]))
+for agent, cases in sorted(idx.items()):
+    # 13.* の UNIMPLEMENTED は「申し出のパラメータ（サーバの窓を 15 より小さく）を断った」もので、RFC 7692 で許される
+    def good(c, r):
+        ok = ("OK", "NON-STRICT", "INFORMATIONAL") + (("UNIMPLEMENTED",) if c.startswith("13.") else ())
+        return r["behavior"] in ok and r["behaviorClose"] in ("OK", "INFORMATIONAL")
+    badc = [(c, r["behavior"], r["behaviorClose"]) for c, r in cases.items() if not good(c, r)]
+    unimpl = sum(1 for r in cases.values() if r["behavior"] == "UNIMPLEMENTED")
+    if badc:
+        print(f"FAIL Autobahn {agent}: {len(badc)} of {len(cases)} cases failed: {badc[:20]}")
+    else:
+        print(f"ok   Autobahn {agent}: {len(cases)} cases OK / NON-STRICT / INFORMATIONAL ({unimpl} UNIMPLEMENTED in 13.*)")
+PY
 }
 
 py_stop() { # py_stop <pid>（Windows の venv の python はランチャなので子ごと止める）
@@ -360,6 +771,10 @@ run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio
     expect "py streaming request body (1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | curl -s -X POST --data-binary @- '$B/count'"
     expect "py L4 TCP echo" "py-tcp" l4_echo tcp "$L4" py-tcp
     expect "py L4 UDP echo" "echo:py-udp" l4_echo udp "$U" py-udp
+    run_python_multipart "$B" "$W" "$PID"
+    # F-270: veil.run(compression=True)・compress=False・Response.compress = False・ジェネレータ
+    comp_suite "py" "$B" /data /data-raw /data-nc /lines
+    comp_suite "py h2c" "$B" /data /data-raw /data-nc /lines --http2-prior-knowledge
   else
     bad "python-features start"; cat "$W/f.log"
   fi
@@ -381,9 +796,16 @@ run_python_f210() { # ストリーミング・L4・gRPC（基本の層と grpcio
   for mode in $modes; do
     local GP GS; GP=$(free_port); GS=$(free_port)
     GEN_DIR="$GEN" VEIL_GRPC_MODE=$mode VEIL_LISTEN="127.0.0.1:$GP" VEIL_TLS_LISTEN="127.0.0.1:$GS" VEIL_TLS_CERT="$W/cert.pem" \
-      VEIL_TLS_KEY="$W/key.pem" "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
+      VEIL_TLS_KEY="$W/key.pem" VEIL_OPENAPI=1 "$PY" "$EX/python-grpc/server.py" > "$W/g.log" 2>&1 &
     local GPID=$!; PIDS+=("$GPID")
     wait_port "$GP" "$GPID" || { bad "python-grpc ($mode) start"; cat "$W/g.log"; continue; }
+    # F-265: 生成された型（FromString）から .proto の記述子を取り、OpenAPI に型付きで載せる
+    expect "py gRPC methods in OpenAPI ($mode)" "unary server_streaming client_streaming bidi_streaming demo.v1.HelloRequest False" \
+      bash -c "curl -s 'http://127.0.0.1:$GP/openapi.json' | $PY3 -I -c '
+import json, sys
+p = json.load(sys.stdin)[\"paths\"]
+k = [p[\"/demo.v1.Demo/\" + m][\"post\"][\"x-grpc\"] for m in (\"SayHello\", \"CountUp\", \"Sum\", \"Chat\")]
+print(*[x[\"kind\"] for x in k], k[0].get(\"requestType\"), \"/grpc.health.v1.Health/Check\" in p)'"
     local out; out="$(tmo 300 "$ROOT/target/examples-api/debug/veil-grpc-check$EXE" --no-reflection --h2c "127.0.0.1:$GP" --h3 "127.0.0.1:$GS" 2>&1)"
     local rc=$?
     echo "$out" | sed 's/^/  /'
@@ -445,7 +867,94 @@ grpc_interop() { # grpc_interop <target-dir> <extra features>
   expect "grpc-web CORS preflight ($label)" "access-control-allow-origin: https://app.example" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example' -H 'access-control-request-method: POST' '$U' | tr A-Z a-z"
   expect "unknown gRPC service is UNIMPLEMENTED, not 404 ($label)" "grpc-status: 12" bash -c "curl -s -i --http2-prior-knowledge -X POST -H 'content-type: application/grpc' -H 'te: trailers' --data-binary '' 'http://127.0.0.1:$P/nope.v1.Nope/Call' | tr A-Z a-z"
   expect "grpc-web CORS rejects other origins ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://evil.example' "$U"
+  # F-265: gRPC のメソッドが記述子の型付きで OpenAPI に載る（4 種類・コメント・組み込みのサービスは載せない）
+  expect "gRPC methods in OpenAPI ($label)" "unary server_streaming client_streaming bidi_streaming demo.v1.HelloRequest HelloRequest SayHello False" \
+    bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+p = d[\"paths\"]
+k = [p[\"/demo.v1.Demo/\" + m][\"post\"][\"x-grpc\"][\"kind\"] for m in (\"SayHello\", \"CountUp\", \"Sum\", \"Chat\")]
+op = p[\"/demo.v1.Demo/SayHello\"][\"post\"]
+ref = op[\"requestBody\"][\"content\"][\"application/grpc\"][\"schema\"][\"\$ref\"].rsplit(\"/\", 1)[1]
+name = list(d[\"components\"][\"schemas\"][ref][\"properties\"])[0] == \"name\" and \"HelloRequest\"
+print(*k, ref, name, op[\"summary\"].split()[0], \"/grpc.health.v1.Health/Check\" in p)'"
+  if [ -z "$F" ]; then
+    kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+    P=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_OVERRIDE_1='api.openapi_grpc = false' exec "$T/debug/veil-example-grpc$EXE") > "$W/log2" 2>&1 &
+    PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "start (openapi_grpc = false)"; cat "$W/log2"; return; }
+    expect "openapi_grpc = false hides gRPC methods" "False" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; print(\"/demo.v1.Demo/SayHello\" in json.load(sys.stdin)[\"paths\"])'"
+  fi
   kill "$PID"
+}
+
+run_upgrade() { # F-261: ハンドラの HTTP/1.1 アップグレード（examples/api/rust-websocket の x-echo）
+  echo "== HTTP/1.1 upgrade (examples/api/rust-websocket, F-261)"
+  upgrade_suite "$ROOT/target/examples-api" ""
+  # Linux は既定の io_uring に加えて epoll の reactor でも確かめる
+  [ "$OS" = Linux ] && upgrade_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+}
+
+upgrade_suite() { # upgrade_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build websocket example ($label)"; return; }
+  local BIN="$T/debug/veil-example-websocket$EXE"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  local ktls_modes="0"; [ "$OS" = Linux ] && ktls_modes="0 1"
+  local K
+  for K in $ktls_modes; do
+    local P S; P=$(free_port); S=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+      VEIL_KTLS=$K VEIL_SHUTDOWN_SECS=10 exec "$BIN") > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
+    local tag="$label, ktls=$K"
+    if [ "$K" = 0 ]; then
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" basic "$P" | sed "s|\$| ($tag, plaintext)|; s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+      # 同時に開く数は fd の上限（OpenBSD の root は 1024）に収める（サーバ・クライアントの他の fd の分を残す）
+      local nmany=1000 hn; hn=$(ulimit -Hn 2>/dev/null)
+      case "$hn" in ''|unlimited) ;; *) [ $((hn - 200)) -lt "$nmany" ] && nmany=$((hn - 200)) ;; esac
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$P" "$nmany" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      expect "h2c: upgrade response is 400 ($tag)" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/raw-upgrade"
+      expect "HTTP/2 (TLS): upgrade response is 400 ($tag)" "400" curl -ks --http2 -o /dev/null -w "%{http_code}" "https://127.0.0.1:$S/raw-upgrade"
+    fi
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" basic "$S" tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "FAIL" "$W/r" && FAIL=1
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" many "$S" 200 tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    if [ "$OS" != Windows ] && [ "$K" = 0 ]; then
+      # graceful shutdown: 開いているアップグレード済みの接続は合図を受けて閉じ、プロセスは待ち時間より前に終わる
+      "$PY3" -I "$ROOT/tests/api/upgrade_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+      local HP=$!
+      for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+      kill "$PID"; wait "$HP"
+      sed "s|\$| ($tag)|; s|^|  |" "$W/hold" | grep -v held
+      grep -q "^ok" "$W/hold" || FAIL=1
+      for _ in $(seq 1 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+      kill -0 "$PID" 2>/dev/null && bad "process exits after closing upgraded connections ($tag)" || ok "process exits after closing upgraded connections ($tag)"
+    fi
+    kill "$PID" 2>/dev/null; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  done
+  # max_concurrent_connections にアップグレードした接続も数える
+  if [ "$OS" != Windows ]; then
+    local P; P=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_MAX_CONN=5 VEIL_SHUTDOWN_SECS=1 exec "$BIN") > "$W/log2" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "start max_conn ($label)"; cat "$W/log2"; return; }
+    sleep 0.5  # wait_port の接続が閉じて数から外れるまで
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" hold "$P" 5 > "$W/hold" 2>&1 &
+    local HP=$!
+    for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+    grep -q held "$W/hold" || { bad "open 5 upgraded connections ($label)"; cat "$W/hold"; }
+    "$PY3" -I "$ROOT/tests/api/upgrade_check.py" refused "$P" | sed "s|\$| ($label)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    kill "$PID"; wait "$HP" 2>/dev/null
+  fi
 }
 
 run_external() { # F-243: [env] 無しの利用者のビルド（と、[env] を書いた利用者のビルド）
@@ -527,6 +1036,346 @@ RS
   rm -rf "$BASE"
 }
 
+run_websocket() { # F-262: ハンドラの WebSocket（examples/api/rust-websocket の /ws・/chat・/typed）と Autobahn TestSuite
+  echo "== WebSocket (examples/api/rust-websocket, F-262)"
+  websocket_suite "$ROOT/target/examples-api" ""
+  [ "$OS" = Linux ] && websocket_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+  run_autobahn
+}
+
+websocket_suite() { # websocket_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build websocket example ($label)"; return; }
+  local BIN="$T/debug/veil-example-websocket$EXE"
+  local W; W="$(mktemp -d)"; [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  # 同時接続の数（既定 2,000。WS_E2E_CONNS=16384 で HttpArena の echo-ws の最大。ulimit -n を上げてから）
+  local CONNS="${WS_E2E_CONNS:-2000}"
+  local ktls_modes="0"; [ "$OS" = Linux ] && ktls_modes="0 1"
+  local K
+  for K in $ktls_modes; do
+    local P S; P=$(free_port); S=$(free_port)
+    (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+      VEIL_KTLS=$K VEIL_SHUTDOWN_SECS=10 exec "$BIN") > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start ($label)"; cat "$W/log"; return; }
+    local tag="$label, ktls=$K"
+    if [ "$K" = 0 ]; then
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" rust "$P" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "FAIL" "$W/r" && FAIL=1
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$P" "$CONNS" | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" churn "$P" 200 | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+      grep -q "^  ok" "$W/r" || FAIL=1
+      expect "OpenAPI lists /ws with x-veil-websocket ($tag)" "echo.v1" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; o=json.load(sys.stdin)[\"paths\"][\"/ws\"][\"get\"]; print(\"101\" in o[\"responses\"], o[\"x-veil-websocket\"][\"subprotocols\"])'"
+      expect "OpenAPI /typed has receive/send schemas ($tag)" "ChatIn ChatOut" bash -c "curl -s 'http://127.0.0.1:$P/openapi.json' | $PY3 -I -c 'import json,sys; x=json.load(sys.stdin)[\"paths\"][\"/typed\"][\"get\"][\"x-veil-websocket\"]; print(x[\"receive\"][\"\$ref\"].split(\"/\")[-1], x[\"send\"][\"\$ref\"].split(\"/\")[-1])'"
+      expect "WebSocket on h2c is 400 ($tag)" "400" curl -s -o /dev/null -w "%{http_code}" --http2-prior-knowledge "http://127.0.0.1:$P/ws"
+    fi
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" rust "$S" tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "FAIL" "$W/r" && FAIL=1
+    "$PY3" -I "$ROOT/tests/api/ws_check.py" many "$S" 500 tls | sed "s|\$| ($tag)|; s|^|  |" | tee "$W/r"
+    grep -q "^  ok" "$W/r" || FAIL=1
+    if [ "$OS" != Windows ] && [ "$K" = 0 ]; then
+      # graceful shutdown: 開いている WebSocket に Close 1001 を送ってから閉じる
+      "$PY3" -I "$ROOT/tests/api/ws_check.py" hold "$P" 20 > "$W/hold" 2>&1 &
+      local HP=$!
+      for _ in $(seq 1 600); do grep -q held "$W/hold" && break; sleep 0.1; done
+      kill "$PID"; wait "$HP"
+      grep -q "close 1001" "$W/hold" && ok "graceful shutdown sends Close 1001 ($tag)" || bad "graceful shutdown sends Close 1001 ($tag): $(cat "$W/hold")"
+      for _ in $(seq 1 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+      kill -0 "$PID" 2>/dev/null && bad "process exits after closing WebSockets ($tag)" || ok "process exits after closing WebSockets ($tag)"
+    fi
+    kill "$PID" 2>/dev/null; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  done
+}
+
+run_autobahn() { # Autobahn TestSuite の fuzzingclient（docker と crossbario/autobahn-testsuite が要る。無ければ飛ばす）
+  if ! command -v docker >/dev/null || ! docker image inspect crossbario/autobahn-testsuite >/dev/null 2>&1; then
+    echo "  skip Autobahn TestSuite (docker or crossbario/autobahn-testsuite is missing; docker pull crossbario/autobahn-testsuite)"
+    return
+  fi
+  local T="$ROOT/target/examples-api"
+  (cd "$ROOT/examples/api/rust-websocket" && CARGO_TARGET_DIR="$T" cargo build -q --release) || { bad "build websocket example (release)"; return; }
+  local BIN="$T/release/veil-example-websocket$EXE"
+  # snap の docker は /tmp を見られないので作業場所は target/ の下に置く
+  mkdir -p "$ROOT/target"
+  local W; W="$(mktemp -d "$ROOT/target/autobahn.XXXXXX")"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/cert.pem" -days 2 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null || { bad "cert"; return; }
+  # 1.*〜7.*・9.*（性能）・10.* は圧縮無しで、12.*・13.*（permessage-deflate）は websocket_compression = true で回す。
+  # TLS は 1.*〜7.* だけ（同じ復号器なので時間を抑える）
+  local P S; P=$(free_port); S=$(free_port)
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_WS_COMPRESSION=1 exec "$BIN") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" && wait_port "$S" "$PID" || { bad "start (autobahn)"; cat "$W/log"; return; }
+  cat > "$W/fuzzingclient.json" <<JSON
+{ "outdir": "/w/reports", "servers": [
+    {"agent": "veil", "url": "ws://127.0.0.1:$P/ws"},
+    {"agent": "veil-tls", "url": "wss://127.0.0.1:$S/ws"} ],
+  "cases": ["*"], "exclude-cases": [], "exclude-agent-cases": {"veil-tls": ["9.*", "10.*", "12.*", "13.*"]} }
+JSON
+  tmo 3600 docker run --rm --network host --user "$(id -u):$(id -g)" -v "$W:/w" crossbario/autobahn-testsuite \
+    wstest -m fuzzingclient -s /w/fuzzingclient.json > "$W/autobahn.log" 2>&1 || { bad "Autobahn fuzzingclient run"; tail -20 "$W/autobahn.log"; }
+  autobahn_summary "$W/reports/index.json" | tee "$W/r"
+  grep -q "^  ok" "$W/r" && ! grep -q "FAIL" "$W/r" || FAIL=1
+  [ -n "${AUTOBAHN_REPORTS:-}" ] && cp -r "$W/reports" "$AUTOBAHN_REPORTS"
+  kill "$PID" 2>/dev/null
+  rm -rf "$W"
+}
+
+run_production() { # F-274: 本番の推奨設定（examples/api/production の config.toml を Rust と Python で読む）
+  echo "== production settings (examples/api/production)"
+  local EX="$ROOT/examples/api/production" T="$ROOT/target/examples-api"
+  # 文書（英日）の設定の例が examples/api/production/config.toml と同じ
+  local g
+  for g in docs/guide/library-production.md docs/guide/ja/library-production.md; do
+    # BSD の VM（tools/qemu/bsd-vm.sh sync）は docs/ を送らない
+    [ -f "$ROOT/$g" ] || { echo "  skip $g: not in this copy of the tree"; continue; }
+    "$PY3" -I - "$ROOT/$g" "$EX/config.toml" <<'PY' && ok "$g has the example config.toml" || bad "$g differs from examples/api/production/config.toml"
+import sys
+doc, want = open(sys.argv[1], encoding="utf-8").read(), open(sys.argv[2], encoding="utf-8").read()
+i = doc.index("```toml\n") + len("```toml\n")
+sys.exit(0 if doc[i:doc.index("```", i)] == want else 1)
+PY
+  done
+  (cd "$EX" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build production example"; return; }
+  local PY="${PYTHON:-}"
+  if [ -z "$PY" ]; then
+    PY="$ROOT/target/py-venv/bin/python$EXE"; [ "$OS" = Windows ] && PY="$ROOT/target/py-venv/Scripts/python$EXE"
+  fi
+  local kind
+  for kind in rust python; do
+    local W; W="$(mktemp -d)"; local P; P=$(free_port)
+    local cmd=("$T/debug/veil-example-production$EXE")
+    if [ "$kind" = python ]; then
+      if ! "$PY" -c 'import veil' 2>/dev/null; then echo "  skip production (python): run the python suite first (or set PYTHON)"; continue; fi
+      cmd=("$PY" "$EX/app.py")
+    fi
+    APP_CONFIG="$EX/config.toml" VEIL_OVERRIDE_1="server.listen_cleartext = \"127.0.0.1:$P\"" "${cmd[@]}" > "$W/log" 2>&1 &
+    local PID=$!; PIDS+=("$PID")
+    wait_port "$P" "$PID" || { bad "production ($kind) start"; tail -20 "$W/log"; continue; }
+    local B="http://127.0.0.1:$P"
+    expect "production ($kind): health check" "ok" curl -s "$B/healthz"
+    expect "production ($kind): handler" '"id":7' curl -s "$B/api/items/7"
+    expect "production ($kind): OpenAPI is off" "404 404" bash -c "echo \$(curl -s -o /dev/null -w '%{http_code}' '$B/openapi.json') \$(curl -s -o /dev/null -w '%{http_code}' '$B/docs')"
+    expect "production ($kind): compression" "content-encoding: br" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: br' '$B/api/items' | tr A-Z a-z"
+    expect "production ($kind): small responses stay uncompressed" "none" bash -c "curl -s -o /dev/null -D - -H 'accept-encoding: br' '$B/api/items/7' | tr A-Z a-z | grep -q content-encoding && echo br || echo none"
+    expect "production ($kind): body under the limit" "201" bash -c "dd if=/dev/zero bs=1000 count=1 2>/dev/null | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
+    expect "production ($kind): body limit" "413" bash -c "dd if=/dev/zero bs=1000 count=2000 2>/dev/null | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- '$B/api/items'"
+    # B-211: Expect: 100-continue の上限超過は 100 を返さずに 413（本文を送る前の最初の応答行）
+    expect "production ($kind): Expect over the limit gets 413 first" "HTTP/1.1 413" "$PY3" -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"POST /api/items HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n")
+print(s.recv(256).decode("latin-1").splitlines()[0])' "${B##*:}"
+    expect "production ($kind): Prometheus metrics" "veil_proxy_http_requests_total" curl -s "$B/metrics"
+    expect "production ($kind): h2c" '"id":8' curl -s --http2-prior-knowledge "$B/api/items/8"
+    [ "$kind" = python ] && expect "production (python): async def and run_in_threadpool" '"sha256"' curl -s "$B/api/hash"
+    sleep 1.5   # アクセスログの書き出し（flush_interval_ms）を待つ
+    if grep -q "type=access\|\"type\":\"access\"" "$W/log"; then bad "production ($kind): access log is off"; else ok "production ($kind): access log is off"; fi
+    if grep -q '^{' "$W/log"; then ok "production ($kind): JSON application log"; else bad "production ($kind): JSON application log: $(head -2 "$W/log")"; fi
+    if [ "$OS" != Windows ]; then
+      kill -TERM "$PID"
+      local i; for i in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+      kill -0 "$PID" 2>/dev/null && bad "production ($kind): SIGTERM stops within 10 s" || ok "production ($kind): SIGTERM stops within 10 s"
+    fi
+    py_stop "$PID" 2>/dev/null
+  done
+}
+
+run_kit() { # F-267: veil-proxy-kit（examples/api/rust-kit）と tower のサンプル（examples/api/rust-tower-recipes）
+  echo "== kit (examples/api/rust-kit, examples/api/rust-tower-recipes)"
+  local T="$ROOT/target/examples-api"
+  kit_suite "$T" ""
+  # Linux は epoll の reactor でも（クライアントの接続・TLS・HTTP/2 の多重化は reactor で別の経路を通る）
+  [ "$OS" = Linux ] && kit_suite "$ROOT/target/examples-api-epoll" "veil/epoll"
+  run_tower_recipes "$T"
+}
+
+kit_suite() { # kit_suite <target-dir> <extra features>
+  local T="$1" F="$2" label="${2:-default}"
+  (cd "$ROOT/examples/api/rust-kit" && CARGO_TARGET_DIR="$T" cargo build -q ${F:+--features "$F"}) || { bad "build kit ($label)"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port); local S; S=$(free_port)
+  [ "$OS" = Windows ] && W="$(cygpath -m "$W")"
+  # クライアントの検証（webpki）は CA の証明書を末端に使うと拒むので、CA と末端の証明書を分けて作る
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/ca.key" -out "$W/ca.pem" -days 2 \
+    -subj /CN=kit-e2e-ca 2>/dev/null || { bad "cert"; return; }
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -newkey rsa:2048 -nodes -keyout "$W/key.pem" -out "$W/leaf.csr" -subj /CN=localhost 2>/dev/null || { bad "cert"; return; }
+  printf 'basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$W/leaf.ext"
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl x509 -req -in "$W/leaf.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcreateserial \
+    -days 2 -extfile "$W/leaf.ext" -out "$W/cert.pem" 2>/dev/null || { bad "cert"; return; }
+  mkdir -p "$W/static/sub"; printf 'hello static\n' > "$W/static/hello.txt"; printf '<h1>index</h1>\n' > "$W/static/sub/index.html"
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_TLS_LISTEN="127.0.0.1:$S" VEIL_TLS_CERT="$W/cert.pem" VEIL_TLS_KEY="$W/key.pem" \
+    VEIL_CLIENT_CA="$W/ca.pem" VEIL_STATIC_DIR="$W/static" exec "$T/debug/veil-example-kit$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start kit ($label)"; cat "$W/log"; return; }
+  wait_port "$S" "$PID" || { bad "start kit TLS ($label)"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P" J="$W/jar"
+  # Cookie・リダイレクト
+  expect "cookie: Set-Cookie ($label)" "set-cookie: visits=1; path=/; httponly" bash -c "curl -s -i '$B/cookie/visit' | tr A-Z a-z"
+  expect "cookie: reads the jar ($label)" "visit 3" curl -s -H 'cookie: a=b; visits=2' "$B/cookie/visit"
+  curl -s -c "$J" -X POST "$B/cookie/signed" >/dev/null
+  expect "signed cookie roundtrip ($label)" "alice" curl -s -b "$J" "$B/cookie/signed"
+  expect "signed cookie tampering ($label)" "invalid" bash -c "curl -s -H \"cookie: user=\$(awk '\$6==\"user\"{print \$7}' '$J' | sed 's/alice/admin/')\" '$B/cookie/signed'"
+  curl -s -c "$J.p" -X POST "$B/cookie/private" >/dev/null
+  expect "private cookie roundtrip ($label)" "s3cr3t" curl -s -b "$J.p" "$B/cookie/private"
+  if grep -q s3cr3t "$J.p"; then bad "private cookie is encrypted ($label)"; else ok "private cookie is encrypted ($label)"; fi
+  expect "redirect: allowed host ($label)" "location: https://app.example.com/x" bash -c "curl -s -i '$B/redirect?next=https://app.example.com/x' | tr -d '\\r'"
+  expect "redirect: open redirect blocked ($label)" "location: /" bash -c "curl -s -i '$B/redirect?next=//evil.example/' | tr -d '\\r' | grep -i '^location'"
+  expect "redirect: 303 ($label)" "303" curl -s -o /dev/null -w "%{http_code}" -X POST "$B/moved"
+  # 静的ファイル（本体の File バックエンド）と serve::file
+  expect "serve_dir file ($label)" "hello static" curl -s "$B/static/hello.txt"
+  expect "serve_dir index ($label)" "<h1>index</h1>" curl -s "$B/static/sub/"
+  expect "serve_dir Range ($label)" "206" curl -s -o /dev/null -w "%{http_code}" -r 0-4 "$B/static/hello.txt"
+  expect "serve_dir h2c ($label)" "hello static" curl -s --http2-prior-knowledge "$B/static/hello.txt"
+  expect "serve_dir 404 ($label)" "404" curl -s -o /dev/null -w "%{http_code}" "$B/static/nope.txt"
+  expect "serve::file ($label)" "content-type: text/plain" bash -c "curl -s -i '$B/download' | tr A-Z a-z"
+  # CORS（/api だけ）
+  expect "cors preflight ($label)" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example.com' -H 'access-control-request-method: POST' '$B/api/echo' | tr A-Z a-z"
+  expect "cors preflight 204 ($label)" "204" curl -s -o /dev/null -w "%{http_code}" -X OPTIONS -H 'origin: https://x.example.org' -H 'access-control-request-method: GET' "$B/api/hello"
+  expect "cors actual + credentials ($label)" "access-control-allow-credentials: true" bash -c "curl -s -i -H 'origin: https://a.example.org' '$B/api/hello' | tr A-Z a-z"
+  if curl -s -i -H 'origin: https://evil.example' "$B/api/hello" | grep -qi access-control-allow-origin; then bad "cors rejects other origins ($label)"; else ok "cors rejects other origins ($label)"; fi
+  if curl -s -i -H 'origin: https://app.example.com' "$B/cookie/visit" | grep -qi access-control; then bad "cors only on /api ($label)"; else ok "cors only on /api ($label)"; fi
+  # 認証
+  expect "basic 401 ($label)" "www-authenticate: basic" bash -c "curl -s -i '$B/auth/basic' | tr A-Z a-z"
+  expect "basic ok ($label)" "basic admin" curl -s -u admin:pw "$B/auth/basic"
+  expect "api key ok ($label)" "key ok" curl -s -H 'x-api-key: k-123' "$B/auth/key"
+  expect "api key wrong ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -H 'x-api-key: nope' "$B/auth/key"
+  local TOK ADM; TOK="$(curl -s -X POST "$B/auth/token" -H 'content-type: application/json' -d '{"user":"bob","admin":false}')"
+  ADM="$(curl -s -X POST "$B/auth/token" -H 'content-type: application/json' -d '{"user":"root","admin":true}')"
+  expect "jwt ok ($label)" "me bob" curl -s -H "authorization: Bearer $TOK" "$B/auth/me"
+  expect "jwt invalid ($label)" 'error="invalid_token"' bash -c "curl -s -i -H 'authorization: Bearer ${TOK}x' '$B/auth/me'"
+  expect "guard 401 ($label)" "401" curl -s -o /dev/null -w "%{http_code}" "$B/admin/area"
+  expect "guard 403 without scope ($label)" "403" curl -s -o /dev/null -w "%{http_code}" -H "authorization: Bearer $TOK" "$B/admin/area"
+  expect "guard ok with scope ($label)" "admin root" curl -s -H "authorization: Bearer $ADM" "$B/admin/area"
+  # セッション（保存先はメモリ、ログインで ID を替える）
+  local SJ="$W/sess"
+  expect "session anonymous ($label)" "anonymous 1" curl -s -c "$SJ" -b "$SJ" "$B/session/whoami"
+  local before; before="$(awk '$6=="veil_session"{print $7}' "$SJ")"
+  curl -s -c "$SJ" -b "$SJ" -X POST --data 'carol' "$B/session/login" >/dev/null
+  local after; after="$(awk '$6=="veil_session"{print $7}' "$SJ")"
+  [ -n "$after" ] && [ "$before" != "$after" ] && ok "session id cycles on login ($label)" || bad "session id cycles on login ($label)"
+  expect "session keeps data ($label)" "carol 2" curl -s -c "$SJ" -b "$SJ" "$B/session/whoami"
+  expect "session old id is gone ($label)" "anonymous 1" curl -s -H "cookie: veil_session=$before" "$B/session/whoami"
+  curl -s -c "$SJ" -b "$SJ" -X POST "$B/session/logout" >/dev/null
+  expect "session destroyed ($label)" "anonymous 1" curl -s -b "$SJ" "$B/session/whoami"
+  # 依存性注入
+  expect "di singleton ($label)" '"db":1' curl -s -H 'x-request-id: r1' "$B/di"
+  expect "di scoped shared within a request ($label)" '"scoped_shared":true' curl -s -H 'x-request-id: r1' "$B/di"
+  expect "di scoped value ($label)" '"request_id":"r2"' curl -s -H 'x-request-id: r2' "$B/di"
+  expect "di transient ($label)" '"transient_distinct":true' curl -s "$B/di"
+  expect "di #[inject] extractor ($label)" '"ua":"kit-e2e"' curl -s -A kit-e2e "$B/di"
+  expect "di singleton stays one ($label)" '"db":1' curl -s --http2-prior-knowledge "$B/di"
+  # バックグラウンドタスク（応答の後・定期・cron・起動時）
+  expect "background task queued ($label)" "queued" curl -s -X POST "$B/tasks/enqueue"
+  expect "background task queued (h2c, $label)" "queued" curl -s --http2-prior-knowledge -X POST "$B/tasks/enqueue"
+  sleep 2.2
+  expect "background tasks ran after the response ($label)" '"background":2' curl -s "$B/tasks/status"
+  expect "blocking background tasks ran ($label)" '"background_blocking":2' curl -s "$B/tasks/status"
+  expect "startup task ran once ($label)" '"started":1' curl -s "$B/tasks/status"
+  local st; st="$(curl -s "$B/tasks/status")"
+  local ticks cron; ticks="$(echo "$st" | sed -n 's/.*"ticks":\([0-9]*\).*/\1/p')"; cron="$(echo "$st" | sed -n 's/.*"cron":\([0-9]*\).*/\1/p')"
+  [ "${ticks:-0}" -ge 5 ] && ok "every() ticks ($label, $ticks)" || bad "every() ticks ($label): $st"
+  [ "${cron:-0}" -ge 1 ] && ok "cron ticks ($label, $cron)" || bad "cron ticks ($label): $st"
+  # HTTP クライアント（自分に要求する）
+  enc() { "$PY3" -I -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+  expect "client HTTP/1.1 ($label)" "status=200 version=Http11 body=hello" curl -s "$B/client/fetch?mode=h1&url=$(enc "$B/api/hello")"
+  expect "client h2c ($label)" "status=200 version=Http2 body=hello" curl -s "$B/client/fetch?mode=h2c&url=$(enc "$B/api/hello")"
+  expect "client HTTPS h2 via ALPN ($label)" "status=200 version=Http2 body=hello" curl -s "$B/client/fetch?mode=auto&url=$(enc "https://localhost:$S/api/hello")"
+  expect "client HTTPS HTTP/1.1 ($label)" "status=200 version=Http11 body=hello" curl -s "$B/client/fetch?mode=h1&url=$(enc "https://localhost:$S/api/hello")"
+  expect "client 404 status ($label)" "status=404" curl -s "$B/client/fetch?mode=h1&url=$(enc "$B/nope")"
+  expect "client keep-alive reuse ($label)" "status=200" bash -c "for i in 1 2 3; do curl -s '$B/client/fetch?mode=h1&url=$(enc "$B/api/hello")'; done"
+  expect "client JSON + retry ($label)" "json n=42 retry=hello" curl -s "$B/client/json"
+  expect "client rejects untrusted cert ($label)" "Connect" curl -s "$B/client/fetch?mode=noca&url=$(enc "https://127.0.0.1:$S/api/hello")"
+  if [ "$OS" != Windows ]; then
+    local US="$W/up.sock"
+    "$PY3" -I - "$US" <<'PY' > "$W/uds.log" 2>&1 &
+import http.server, socketserver, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = ("uds " + self.path + " " + (self.headers.get("x-from") or "")).encode()
+        self.send_response(200); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+    def address_string(self): return "uds"
+class S(socketserver.UnixStreamServer):
+    def get_request(self):
+        r, _ = super().get_request(); return r, ("uds", 0)
+S(sys.argv[1], H).serve_forever()
+PY
+    PIDS+=("$!"); for _ in $(seq 1 50); do [ -S "$US" ] && break; sleep 0.1; done
+    expect "client unix socket ($label)" "status=200 version=Http11 body=uds /v1/x kit-client" curl -s "$B/client/fetch?mode=h1&url=$(enc "http://unix:$US:/v1/x")"
+  fi
+  # gRPC: 生成したクライアント（veil-build の build_client）で自分のサービス（h2c と HTTPS の h2）
+  local G='hello=Hello kit echo=e2e trailer=t1 count=[1, 2, 3, 4, 5] sum=55 chat=A,B fail=NotFound/no such thing'
+  expect "grpc client h2c ($label)" "$G" curl -s "$B/grpc/call"
+  expect "grpc client TLS ($label)" "$G" curl -s "$B/grpc/call?tls=1"
+  # GraphQL（HTTP・SSE・WebSocket）
+  expect "graphql POST ($label)" '{"data":{"add":3}}' curl -s -X POST -H 'content-type: application/json' -d '{"query":"{ add(a:1,b:2) }"}' "$B/graphql"
+  expect "graphql GET ($label)" '{"data":{"add":5}}' curl -s "$B/graphql?query=%7B%20add(a%3A2%2Cb%3A3)%20%7D"
+  expect "graphql SSE subscription ($label)" '{"data":{"count":3}}' curl -s -N -H 'accept: text/event-stream' -X POST -H 'content-type: application/json' -d '{"query":"subscription { count(upto: 3) }"}' "$B/graphql"
+  expect "graphql WebSocket graphql-transport-ws ($label)" 'next {"count":1} {"count":2} complete' "$PY3" -I - "$P" <<'PY'
+import base64, json, os, socket, struct, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall(("GET /graphql HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+           "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n" % key).encode())
+buf = b""
+while b"\r\n\r\n" not in buf: buf += s.recv(4096)
+head, buf = buf.split(b"\r\n\r\n", 1)
+assert b" 101 " in head.split(b"\r\n")[0], head
+def send(obj):
+    p = json.dumps(obj).encode(); m = os.urandom(4)
+    hdr = bytes([0x81]) + (bytes([0x80 | len(p)]) if len(p) < 126 else bytes([0x80 | 126]) + struct.pack(">H", len(p)))
+    s.sendall(hdr + m + bytes(b ^ m[i % 4] for i, b in enumerate(p)))
+def recv():
+    global buf
+    while True:
+        if len(buf) >= 2:
+            n = buf[1] & 0x7f; off = 2
+            if n == 126: n = struct.unpack(">H", buf[2:4])[0]; off = 4
+            if len(buf) >= off + n:
+                op, p, buf = buf[0] & 0x0f, buf[off:off + n], buf[off + n:]
+                if op == 1: return json.loads(p)
+                if op == 8: return {"type": "close"}
+                continue
+        buf += s.recv(4096)
+send({"type": "connection_init"}); assert recv()["type"] == "connection_ack"
+send({"id": "1", "type": "subscribe", "payload": {"query": "subscription { count(upto: 2) }"}})
+out = []
+while True:
+    m = recv()
+    if m["type"] == "next": out.append(json.dumps(m["payload"]["data"], separators=(",", ":")))
+    else: out.append(m["type"]); break
+print("next " + " ".join(out))
+PY
+  kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+  kill -0 "$PID" 2>/dev/null && bad "kit graceful shutdown with app tasks ($label)" || ok "kit graceful shutdown with app tasks ($label)"
+}
+
+run_tower_recipes() { # run_tower_recipes <target-dir>
+  local T="$1"
+  (cd "$ROOT/examples/api/rust-tower-recipes" && CARGO_TARGET_DIR="$T" cargo build -q) || { bad "build tower recipes"; return; }
+  local W; W="$(mktemp -d)"; local P; P=$(free_port)
+  mkdir -p "$W/www/files"; printf 'tower file\n' > "$W/www/files/a.txt"; printf 'veil file\n' > "$W/www/b.txt"
+  (cd "$W" && VEIL_LISTEN="127.0.0.1:$P" VEIL_WWW="$W/www" exec "$T/debug/veil-example-tower-recipes$EXE") > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "start tower recipes"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P"
+  expect "tower-http CorsLayer preflight" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -X OPTIONS -H 'origin: https://app.example.com' -H 'access-control-request-method: GET' '$B/hello' | tr A-Z a-z"
+  expect "tower-http CorsLayer actual" "access-control-allow-origin: https://app.example.com" bash -c "curl -s -i -H 'origin: https://app.example.com' '$B/hello' | tr A-Z a-z"
+  expect "tower-http SetResponseHeaderLayer" "x-powered-by: veil" bash -c "curl -s -i '$B/hello' | tr A-Z a-z"
+  expect "tower-http ValidateRequestHeaderLayer::bearer 401" "401" curl -s -o /dev/null -w "%{http_code}" "$B/admin/stats"
+  expect "tower-http ValidateRequestHeaderLayer::bearer ok" "stats" curl -s -H 'authorization: Bearer secret' "$B/admin/stats"
+  expect "cookie with the http crate" "set-cookie: theme=dark" bash -c "curl -s -i '$B/theme' | tr A-Z a-z"
+  expect "cookie read" "theme=dark" curl -s -H 'cookie: theme=dark' "$B/theme"
+  expect "redirect (http::Response 302)" "location: /hello" bash -c "curl -s -i '$B/old' | tr -d '\\r' | tr A-Z a-z"
+  expect "tower-http ServeDir on veil::tokio" "tower file" curl -s "$B/files/a.txt"
+  expect "App::serve_dir (recommended)" "veil file" curl -s "$B/www/b.txt"
+  kill "$PID"
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない（${FULL}）"
   (cd "$ROOT" && cargo build -q $NODEF --features "$FULL") || { bad "build $FULL"; return; }
@@ -541,8 +1390,35 @@ run_nonregression() {
   [ "$n" = 0 ] && ok "no inventory/async-graphql/tokio/pyo3 in the full binary" || bad "library dependencies linked ($n)"
   n=$(grep -cE "veil_build::|prost_build::|(^|[^a-z_])tonic::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil-build/prost-build/tonic in the full binary" || bad "gRPC library code linked ($n)"
+  # F-261: アップグレードの記号（veil::api::upgrade）も入らない
+  n=$(grep -cE "veil::api::upgrade|veil_response_upgrade" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::upgrade in the full binary" || bad "upgrade symbols found ($n)"
+  # F-262: WebSocket の終端（veil::api::ws・C の veil_ws_*）も入らない
+  n=$(grep -cE "veil::api::ws|veil_ws_" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::ws in the full binary" || bad "WebSocket handler symbols found ($n)"
+  # F-266: multipart（veil::api::multipart・C の veil_multipart_next）も入らない
+  n=$(grep -cE "veil::api::multipart|veil_multipart_|multipart_parse" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::multipart in the full binary" || bad "multipart symbols found ($n)"
+  # F-270: ハンドラの応答の圧縮（veil::api::compress・C の veil_response_no_compression）も入らない
+  n=$(grep -cE "veil::api::compress|veil_response_no_compression" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::compress in the full binary" || bad "handler compression symbols found ($n)"
+  # F-267: HTTP / gRPC クライアント（veil::api::client・Channel）と veil-proxy-kit（veil_kit::）も入らない
+  n=$(grep -cE "veil::api::client|veil::api::grpc::channel|veil_kit::" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no veil::api::client / veil_kit in the full binary" || bad "client or kit symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
+  # F-264: Swagger UI の資産・ページはライブラリだけ（本体のバイナリの中身に文字列が 1 つも無い）
+  local BIN="$ROOT/target/debug/veil$EXE"
+  n=$(grep -a -c -E "swagger-ui|SwaggerUIBundle" "$BIN") || true
+  [ "$n" = 0 ] && ok "no swagger-ui in the $FULL binary" || bad "swagger-ui strings in the $FULL binary ($n)"
+  if [ "$OS" = Linux ]; then
+    (cd "$ROOT" && cargo build -q --no-default-features --features full-container) || { bad "build full-container"; return; }
+    n=$(grep -a -c -E "swagger-ui|SwaggerUIBundle" "$BIN") || true
+    [ "$n" = 0 ] && ok "no swagger-ui in the full-container binary" || bad "swagger-ui strings in the full-container binary ($n)"
+  fi
+  # openapi だけ（openapi-ui-embedded 無し）でもビルドできる（/docs は CDN の既定になる）
+  (cd "$ROOT" && cargo check -q --lib --no-default-features --features handler,openapi) \
+    && ok "builds with openapi but without openapi-ui-embedded" || bad "build handler,openapi"
   # F-198: api の既定（tokio-compat）は tokio に依存しない
   local t; t=$(cd "$ROOT" && cargo tree -q -e normal,build --no-default-features --features "$FULL",api -i tokio 2>&1 | head -1) || true
   case "$t" in
@@ -566,11 +1442,16 @@ run_nonregression() {
 case "$WHAT" in
   rust) run_rust; run_graphql ;;
   grpc) run_grpc ;;
+  upgrade) run_upgrade ;;
+  websocket) run_websocket ;;
+  autobahn) run_autobahn ;;
   c) run_c; run_c_features ;;
   python) run_python ;;
+  production) run_production ;;
   nonregression) run_nonregression ;;
   external) run_external ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_c; run_c_features; run_python ;;
-  *) echo "usage: $0 [rust|grpc|c|python|nonregression|all]"; exit 2 ;;
+  kit) run_kit ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_python; run_production ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

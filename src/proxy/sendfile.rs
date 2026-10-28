@@ -45,7 +45,7 @@ pub(super) async fn handle_sendfile(
     range_header: Option<&[u8]>, // RFC 7233 Range header support
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
     canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>, // F-150: HTTP/1.1 ユーザー空間 TLS 経路向け静的コンテンツキャッシュ設定
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
@@ -252,6 +252,8 @@ pub(super) async fn handle_sendfile(
         header_buf.extend_from_slice(header_value.as_bytes());
         header_buf.extend_from_slice(b"\r\n");
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::append_h1_lines(&mut header_buf, security);
     // F-94: HTTP/3 広告（Alt-Svc）
     append_alt_svc_header_line(&mut header_buf);
 

@@ -23,7 +23,7 @@ pub struct BackendProxyResult {
 /// B-38: HTTP/3 経路で WASM on_response_headers を適用する
 #[cfg(feature = "wasm")]
 pub(super) async fn apply_h3_wasm_response_headers(
-    wasm_modules: &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
     status: u16,
     header_store: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -63,7 +63,7 @@ pub(super) async fn apply_h3_wasm_response_headers(
 /// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
 #[cfg(feature = "wasm")]
 pub(super) async fn finish_h3_wasm_lifecycle(
-    wasm_modules_to_apply: &Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    wasm_modules_to_apply: &Option<crate::wasm_plugin_config::WasmModules>,
 ) {
     let Some(modules) = wasm_modules_to_apply else {
         return;
@@ -373,6 +373,13 @@ pub async fn run_http3_server_async(
     // F-152: reactor 経路の 1 イテレーションあたり drain 上限（`[http3] recv_drain_max`）。
     // io_uring 経路（`PipelinedUdpRecv`）は参照しないため、そちらのビルドでは未使用になる。
     let recv_drain_max = config.recv_drain_max.clamp(1, H3_RECV_DRAIN_MAX_LIMIT);
+    // B-222: このワーカーの接続の受け入れ制御
+    admission::configure(
+        config.max_connections,
+        config.retry_threshold,
+        config.handshake_timeout,
+    );
+    configure_max_field_section_size(config.max_field_section_size);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
     // F-130 C1/C2: io_uring RECVMSG バックエンド（Linux uring バックエンド）。

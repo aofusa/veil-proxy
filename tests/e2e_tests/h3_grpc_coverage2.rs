@@ -2498,6 +2498,41 @@ pub(super) async fn test_http3_error_handling_431_request_header_fields_too_larg
     }
 }
 
+/// B-255: vendoring の quiche の既定（32KiB）ではなく `[http3] max_field_section_size`（既定 64KiB、`[http2]
+/// max_header_list_size` と同じ）を広告する。40KB のヘッダの要求は veil の要求ヘッダの上限（8KB）で 431 になるが、
+/// 接続は閉じず（quiche の上限で切られない）、同じ接続の次の要求も通る。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+pub(super) async fn test_b255_http3_header_section_within_limit_keeps_connection() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let big = "B".repeat(40_000);
+    let resp = send_http3_request_full(
+        &mut send_request,
+        "GET",
+        "/",
+        &[("x-b255-header", big.as_str())],
+        None,
+    )
+    .await
+    .expect("a 40KB header section is within the 64KiB limit (stream error, not connection close)");
+    assert_eq!(resp.status, 431);
+    let resp = send_http3_request_full(&mut send_request, "GET", "/", &[], None)
+        .await
+        .expect("the connection stays usable");
+    assert_eq!(resp.status, 200);
+}
+
 /// レポート: `test_http3_compression_brotli`
 #[tokio::test]
 #[ntest::timeout(20000)]

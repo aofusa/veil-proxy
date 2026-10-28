@@ -1,0 +1,24 @@
+# tower の生態系（tower-http）だけで Cookie・リダイレクト・静的ファイル・CORS・認証を書くサンプル（F-267）。
+# 同じことを veil-proxy-kit で書いたものは examples/api/rust-kit。tests/api/library_e2e.sh kit が起動して叩く。
+#
+#   cargo run --release                     # 平文 127.0.0.1:8080（VEIL_LISTEN で変更）。VEIL_WWW に配信するディレクトリ
+[package]
+name = "veil-example-tower-recipes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# veil 本体のワークスペースとは独立させる（`[[example]]` を本体に足すとコンテナビルドが壊れるため）。
+[workspace]
+
+[dependencies]
+veil = { package = "veil-proxy", path = "../../..", default-features = false, features = ["full", "api"] }
+tower-http = { version = "0.6", features = ["cors", "set-header", "validate-request", "auth", "fs"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http = "1"
+bytes = "1"
+
+# tower-http の ServeDir は tokio の fs を使う。tokio を veil の互換レイヤー（veil::tokio）の shim に差し替え、
+# veil のワーカーの上で動かす（実際に使うときは git のタグから。docs/guide/library.md「tokio compatibility」）。
+[patch.crates-io]
+tokio = { path = "../../../crates/veil-tokio/tokio-shim" }

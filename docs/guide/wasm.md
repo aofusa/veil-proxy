@@ -130,6 +130,83 @@ Naming a module in `module_configuration` that is not listed in that route's `mo
 Merging and TOML → JSON conversion run **once at config load time** (startup and SIGHUP
 reload); the request path only clones an `Arc`.
 
+### Filter Phases by Protocol
+
+| Phase | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| `on_http_request_headers` | yes | yes | yes |
+| `on_http_request_body` | yes | yes | yes |
+| `on_http_request_trailers` | – | gRPC over h2c | – |
+| `on_http_response_headers` | yes | yes | yes |
+| `on_http_response_body` | – | – | yes |
+| `on_log` | yes | yes | yes |
+
+The request-body phase runs when the request has a body and at least one of the route's modules has
+`allow_request_body_read = true`. veil reads the whole body first (Content-Length or chunked, up to
+`max_request_body_size` / `max_chunked_body_size`; larger bodies get `413`) and calls
+`on_http_request_body` once with `end_of_stream = true`. The callback can read the request path, method
+and headers as well. If the module replaces the body, veil sends the new body upstream with a matching
+`Content-Length` (a chunked request is forwarded with `Content-Length`, without `Expect`). Routes without such a
+module keep streaming the body upstream as before. For a chunked request with `Expect: 100-continue`, veil sends
+`100 Continue` before reading the body (a request with `Content-Length` already gets it before the filters run).
+
+On HTTP/1.1 the connection stays open after a filter's local response (`send_local_response`), and a request that
+was pipelined behind the body is served next. The body of a local response is not sent for `HEAD` (the
+`Content-Length` stays the body's length) or for `1xx`, `204` and `304`.
+
+### Reusing the VM Context (`instance_reuse`)
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+instance_reuse = true   # default: false
+```
+
+By default every callback runs in a fresh instance (`_start`, `proxy_on_vm_start` and `proxy_on_configure`
+run each time). With `instance_reuse = true` an instance is created and configured once, then reused for
+later requests: each request only creates an HTTP context (`proxy_on_context_create`) and runs the callbacks,
+and `proxy_on_delete` runs when the request is done. This is the same lifetime as Envoy. All phases of a request
+(request headers, request body, response headers, response body and `on_log`) use the same HTTP context, so
+state the filter keeps in its HTTP context carries over from one phase to the next. One instance holds the
+HTTP contexts of several requests at once, as an Envoy worker's VM does. If a request ends before `on_log`
+(for example the client disconnects), its context is deleted the next time the instance is used. The filter's
+global variables and root-context state persist across requests. An instance that traps or returns an error
+is discarded and the next request gets a new one; later phases of the requests whose contexts lived in it
+run in a new HTTP context (the filter still runs, but state kept in the old context is lost). Each worker keeps
+configured instances per module (and per route `module_configuration`), up to half of the pooling allocator's
+`total_memories` divided among the workers and the modules with `instance_reuse`.
+
+### Answering Requests from a Filter (`Respond` + modules)
+
+A `type = "Respond"` route can carry `modules`. If a filter answers with `send_local_response`, veil returns
+that response; otherwise it returns the route's fixed response. This makes routes that are answered entirely by
+a filter, with no upstream:
+
+```toml
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+```
+
+### Files Loaded at Startup (`data_files`)
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+data_files = { dataset = "/etc/veil/data/dataset.json" }
+```
+
+Each file is read when the configuration is loaded (startup and reload) and exposed to the filter as the
+property `plugin_data.<name>` (`get_property(["plugin_data", "dataset"])`). Nothing is read from disk per
+request. A missing file is a configuration error. If the module sets `allowed_properties`, include
+`"plugin_data.*"`.
+
 ### Default Settings
 
 The `[wasm.defaults]` section allows you to configure global WASM runtime settings:
@@ -137,7 +214,11 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 | Option | Description | Default |
 |--------|-------------|---------|
 | `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+| `yield_interval_us` | How often a running callback yields the worker to other requests (approximate microseconds, measured in fuel). Smaller values shorten the wait of other requests on the same worker behind a CPU-heavy filter, but every callback pauses more often, more `instance_reuse` instances are open at once, and each request costs more | 1000 |
 | `interpreter` | Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135). Always forced to `true` on OpenBSD (B-52) | false |
+| `grpc_connect_timeout_ms` | Upper bound on connecting (TCP and TLS) to a gRPC upstream for `proxy_grpc_call`/`proxy_grpc_stream`. A longer guest `timeout_ms` still gives up connecting after this time, so an unreachable upstream does not stall every plugin's gRPC calls. At most 4096 calls and 4096 stream messages wait for the gRPC thread; beyond that the host call returns `InternalFailure` | 5000 |
+| `http_call_max_timeout_ms` | Upper bound on the `timeout_ms` a plugin passes to `proxy_http_call` (a negative value counts as 0) | 60000 |
+| `shared_data_max_keys` | Maximum number of keys in one module's shared data; `proxy_set_shared_data` with a new key beyond it returns `InternalFailure` (existing keys can still be updated) | 100000 |
 
 #### Pooling Allocator Settings
 
@@ -155,7 +236,7 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 |-----------|-------------|---------|
 | `allow_logging` | Log output | false |
 | `allow_metrics` | Metrics operations | false |
-| `allow_shared_data` | Shared data access | false |
+| `allow_shared_data` | Shared data access (`proxy_set_shared_data`/`proxy_get_shared_data`). One table per module name, shared by every request and worker and kept across config reloads (Envoy shares it per `vm_id`) | false |
 | `allow_request_headers_read` | Read request headers | false |
 | `allow_request_headers_write` | Modify request headers | false |
 | `allow_request_body_read` | Read request body | false |

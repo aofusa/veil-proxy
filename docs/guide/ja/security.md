@@ -35,6 +35,10 @@ landlock_write_paths = ["/var/log/veil"]
 | v3 | 6.2+ | TRUNCATE権限 |
 | v4 | 6.7+ | ioctl権限 |
 
+列挙したパスの外では、読み書きに加えてシンボリックリンク・ソケット・FIFO・デバイスノードの作成とファイルの実行も拒否する。
+`landlock_write_paths` の中では通常のファイル・ディレクトリ・Unix ソケットを作れるが、シンボリックリンク・FIFO・デバイスノードの
+作成と実行は拒否する。開けないパスやカーネルが拒否したルールは起動時に警告を出す（そのパスへのアクセスは拒否のまま）。
+
 #### 2. seccomp システムコール制限
 
 許可リストに基づいてシステムコールを制限します。
@@ -45,6 +49,9 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+`log` は違反を記録するだけ、`filter` は許可されない呼び出しを `EPERM` で失敗させ、`strict` はどのスレッドが呼んでも
+プロセス全体を `SIGSYS` で終了させます（v0.10.0 より前は違反したスレッドだけが消え、残りは動き続けていました）。
+
 > 許可リストには静的ファイル配信に必要な `faccessat2`（glibc 2.33+ / musl が
 > `access()`/`faccessat()` の実体として発行）を含みます。これが無いと seccomp 有効時に
 > ファイル解決が `EPERM` で失敗し、静的配信が 404 になります（コンテナ用
@@ -52,6 +59,36 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 > 静的配信のパス解決（`RESOLVE_BENEATH` での封じ込め、F-153）に使う `openat2` も含みます。
 > コンテナ用のプロファイルには v0.8.0 で足しました（無いと毎回 `canonicalize()` の経路に戻ります。
 > 以前は起動後最初の静的配信の要求だけが 404 になっていました。B-154）。
+>
+> 静的配信のキャッシュの `watch = true`（[圧縮・キャッシュ](compression-cache.md#静的配信のキャッシュがディスクの変更に追従する)）の
+> ために、許可リストと両方のコンテナ用のプロファイルに `inotify_init1`・`inotify_add_watch`・`inotify_rm_watch` を
+> 含みます。プロセス内の許可リストには `getdents64` も足しました（監視のスレッドが静的配信のルートを辿る）。
+> これらを出すのは監視の専用スレッドだけで、起動時・リロード時・ディレクトリが作られたときに限ります。
+> veil は監視のスレッドを（ワーカーと同じく）サンドボックスを掛けた後に作ります。
+
+**引数の検査。** 許可する呼び出しの一部は引数も見ます。一覧に無い値での呼び出しは、許可しない呼び出しと同じ扱い
+（`log` / `EPERM` / `SIGSYS`）です。
+
+| システムコール | 許可するもの |
+|----------------|--------------|
+| `mmap`・`mprotect` | `PROT_EXEC` を含まないもの |
+| `socket` | `AF_UNIX`・`AF_INET`・`AF_INET6`・`AF_NETLINK`（glibc の `getaddrinfo`） |
+| `ioctl` | `FIONBIO`・`FIONREAD`・`FIOCLEX`・`FIONCLEX`・`TCGETS`・`TIOCGWINSZ` |
+| `prctl` | `PR_SET_NAME`・`PR_GET_NAME`・`PR_SET_NO_NEW_PRIVS`・`PR_GET_NO_NEW_PRIVS`・`PR_GET_SECCOMP`・`PR_SET_SECCOMP`・`PR_CAPBSET_READ`・`PR_GET_DUMPABLE`・`PR_SET_VMA` |
+| `clone` | 名前空間のフラグ（`CLONE_NEWUSER`・`CLONE_NEWNS`・`CLONE_NEWNET` など）を含まないもの |
+| `clone3` | 許可しない。`ENOSYS` を返し、C ライブラリが `clone` へ戻る（フラグがフィルタから見えないため） |
+| `tgkill` | veil のプロセスのスレッド宛てだけ |
+
+`setuid`・`setgid`・`setgroups`・`setresuid`・`setresgid` は許可しません（veil はフィルタを掛ける前に権限を降格します）。
+これらの検査は v0.10.0 で足しました。
+
+**サンドボックスが掛かるスレッド。** veil は seccomp のフィルタを `SECCOMP_FILTER_FLAG_TSYNC` で掛けるので、先に作った
+制御プレーンのスレッド（ログ・設定と証明書のリロード・VDS・ACME・ヘルスチェック・キャッシュの掃除・Proxy-Wasm の tick と gRPC）を
+含むプロセスの全スレッドに効きます。Landlock にはこれに当たるものが無く、掛けたスレッドとその後に作るスレッド（メインスレッド・
+ワーカー・静的配信の監視）に効きます。先に作ったスレッドのうち、ヘルスチェック・Proxy-Wasm の tick・Proxy-Wasm の gRPC の
+スレッドは同じルールセットを自分に掛けます。設定のリロード・証明書のリロード・VDS・ACME のスレッドは Landlock の外です
+（設定・証明書・Proxy-Wasm のモジュールを読み、ACME は証明書を書くため）。これらには seccomp だけが掛かります。
+v0.10.0 より前は seccomp も、メインスレッドとその後に作るスレッドにしか掛かっていませんでした。
 
 **推奨導入手順:**
 
@@ -76,6 +113,27 @@ root起動後、リスナー作成後に非特権ユーザーへ降格します�
 drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
+
+#### 4. macOS の Seatbelt（`sandbox_init`）
+
+macOS では `enable_sandbox_macos = true` で、全リスナーの bind が済んだ後に Seatbelt のプロファイルを掛けます
+（掛けた後は外せません）。
+
+```toml
+[security]
+enable_sandbox_macos = true
+```
+
+- プロファイルは `(deny default)` が起点です。子プロセス（`process-fork`・`process-exec`）は許しません。
+- 読めるのは、設定が指すパス（設定ファイル・証明書・秘密鍵・CA・トークン・JWKS・Proxy-Wasm のモジュール・静的ルート。
+  ファイルはディレクトリごと。シンボリックリンクの付け替えで差し替えるシークレットも読めます）と、動的リンカ・名前解決・
+  信頼ストア・タイムゾーンが使うシステムのパス（`/usr/lib`・`/usr/share`・`/System`・`/Library/Keychains`・`/private/etc`・
+  `/private/var/db/dyld`・`/private/var/db/timezone`・`/dev`）の下だけです。メタデータ（`stat`）はどこでも読めます。
+- 書けるのは、ログ・ディスクキャッシュのディレクトリ、ACME の保存先（`[acme]` があれば証明書のディレクトリも）、
+  `upload_tmp_dir`、Unix ソケットの下だけです。
+- 許すパスは起動時に決まります。リロードで新しい場所を指しても読めません。新しい場所の証明書・秘密鍵はリロードが失敗し
+  （稼働中の設定のまま動き続けます）、新しい場所の静的ルートは 404 を返します。場所を変えるときは再起動してください。
+- ネットワーク・`mach-lookup`・自分へのシグナルは許します。
 
 ### Namespace隔離について
 
@@ -106,6 +164,7 @@ jwks_path = "/etc/veil/jwks.json"         # または jwks = '{"keys":[...]}' �
 # allow_missing = false                   # true: トークンの無い要求も通す（あれば検証する）
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                # 受ける "alg"（空なら鍵の "alg"、鍵に無ければその鍵種の全部）
 require_claims = { scope = ["read"] }     # 全部の claim がどれかの値を持つこと
 ```
 
@@ -155,12 +214,13 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 | **io_uring** | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | monoio ランタイム |
 | **ネットワーク** | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt` | TCP/UDP ソケット |
 | **ファイルI/O** | `openat`, `read`, `write`, `close`, `fstat`, `readv`, `writev` | 設定、証明書、ログ |
+| **ファイル・ディレクトリ** | `dup`, `dup3`, `unlink(at)`, `mkdir(at)`, `rename(at)`, `renameat2`, `chmod`, `fchmod(at)` | Unix ソケットのリスナー、要求の本文のディスクへの退避、ACME の証明書の保存 |
 | **メモリ** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc、Huge Pages、io_uring登録バッファ |
 | **スレッド** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | ワーカースレッド |
 | **CPUアフィニティ** | `sched_setaffinity`, `sched_getaffinity` | CPUピンニング |
-| **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
+| **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `restart_syscall` | SIGTERM/SIGHUP、SIGSTOP/SIGCONT・ptrace で止まった sleep の再開 |
 | **時間** | `clock_gettime`, `nanosleep` | タイムアウト |
-| **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname` | 各種制御 |
+| **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | 各種制御、制御プレーンのスレッドが自分に Landlock を掛ける |
 
 ### systemd サービスファイル
 
@@ -326,6 +386,16 @@ ExecStart=/usr/bin/bwrap \
 
 この構成では、systemd が外側の「器」を作り、bubblewrap がさらに厳格なファイルシステムビューを提供します。
 
+## 早期データ（0-RTT）
+
+0-RTT のデータは攻撃者に再送され得るので、veil はそれを元に処理しません。
+
+- TCP 上の TLS（HTTP/1.1・HTTP/2）: 早期データを受け付けません（rustls の `max_early_data_size` は 0 のまま）。
+  セッション再開（`[tls] session_resumption`）で 1 往復は減ります。
+- HTTP/3: QUIC の 0-RTT のパケットは受け取ってハンドシェイクを早く終えますが、HTTP/3 の層はハンドシェイクの完了後に作ります。
+  0-RTT で送られた要求はその時点（クライアントがセッションを持つことを示した後）で読んで処理し、再送された複製は
+  ハンドシェイクを完了できません。
+
 ## パニックリカバリー
 
 Veilは接続レベルのパニックキャッチを実装し、高可用性を確保しています。
@@ -385,6 +455,9 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
   `:path` は空白・制御文字を含まないこと（RFC 9113 §8.2.1・RFC 9114 §4.2）。違反はストリームのエラーなので、HTTP/1.1 の上流に
   届かない。
 - `remove_request_headers`・`add_request_headers` は、すべてのクライアント・上流のプロトコルに効く。
+- `[route.security] trusted_proxies` に入らないクライアントが送った `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・
+  `Forwarded` は上流へ送らず、`X-Forwarded-For` にはクライアントの IP を入れる（`forwarded_headers = "passthrough"` で
+  以前の素通しに戻せる）。
 - 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`Authorization` の要求への応答
   （`key_headers` に `Authorization` が無いとき）を保存しない。
 - IP の許可・拒否リストは、IPv4 射影の IPv6 のアドレスを IPv4 として照合する。
@@ -394,6 +467,12 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
   その要求の一部として上流へ送らない。
 - WebSocket のアップグレードにも `remove_request_headers`・`add_request_headers` が効く。ハンドシェイクの後ろの
   クライアントのバイトは、上流が `101` を返したときだけ送る。
+- HTTP/3 はワーカーごとの接続数に上限を持ち（`[http3] max_connections`）、ハンドシェイク中の接続が `retry_threshold` に
+  達したら Initial にステートレスな Retry を返し、`handshake_timeout` までに確立しない接続を捨てる。送信元を偽装した
+  Initial の洪水で接続を際限なく確保させない。
+- HTTP/3 のフレームは宣言された長さで先に確保しない。大きなフレームは届いた分だけバッファを伸ばし、ヘッダは
+  `[http3] max_field_section_size` で上限を見て（長さの宣言の時点と QPACK の復号中）、パスのイベントは取り出して捨てるので、
+  送信元のポートを変え続ける相手にキューを伸ばさせない（quiche 0.29.3 の GHSA-4fgf-9xrr-88gf・GHSA-4q5x-gp38-rfp4 の修正の取り込み）。
 - HTTP/2・HTTP/3 のバッファ経路の要求本文は、溜める途中で上限（全ルートの `max_request_body_size` の最大。
   最低 10MB）を見て、超えたストリームを断る。
 - Linkerd の管理ポートの `/shutdown`・`/env.json` はループバックからだけ受ける。

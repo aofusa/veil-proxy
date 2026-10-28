@@ -24,6 +24,9 @@ def echo(req: veil.Request):
 | `body`, `text()`, `json()` | the whole body as `bytes`, as text, parsed as JSON |
 | `params`, `query_params` | path parameters, query parameters (the first value of a repeated key) |
 | `client_ip` | the client address |
+| `cookies` | the `Cookie` header as a `dict` (the last value of a repeated name) |
+| `http_version` | `"1.1"`, `"2"` or `"3"` |
+| `is_tls` | whether veil received the request over TLS (HTTP/3 always) |
 | `stream()` | iterate over the body as it arrives (routes with `stream_body=True`) |
 
 Inside the server the object is a Rust-backed `veil._veil.NativeRequest` with the same attributes and methods;
@@ -42,6 +45,34 @@ def custom():
 def as_json():
     return veil.JSONResponse({"ok": True}, status=200)
 ```
+
+`status_code=` is accepted as well as `status=`, and `content=` as well as the first argument, as in FastAPI.
+`veil.HTMLResponse`, `veil.PlainTextResponse`, `veil.RedirectResponse(url, status_code=307)` and
+`veil.FileResponse(path, filename=None)` (streamed in 64 KiB chunks) are the other response classes; a route's
+`response_class=` makes a plain return value use one of them.
+
+## Cookies and redirects
+
+```python
+@veil.post("/login")
+def login(response: veil.Response):           # headers and cookies set here are merged into the response
+    response.set_cookie("session", "abc", max_age=3600, httponly=True, secure=True, samesite="lax")
+    return {"ok": True}
+
+@veil.get("/whoami")
+def whoami(req: veil.Request):
+    return {"session": req.cookies.get("session")}
+
+@veil.post("/logout")
+def logout():
+    r = veil.RedirectResponse("/", status_code=303)
+    r.delete_cookie("session")
+    return r
+```
+
+`set_cookie(key, value, max_age, expires, path, domain, secure, httponly, samesite, partitioned)` follows Starlette.
+Signed cookies, sessions and `safe_redirect` (no open redirects through `?next=`) are in the kit ({doc}`kit`).
+A `Cookie()` parameter reads one cookie ({doc}`dependency-injection`).
 
 ## Streaming (server to client)
 
@@ -73,6 +104,58 @@ def upload(req: veil.Request):
     return str(sum(len(c) for c in req.stream()))   # read in arrival order
 ```
 
+## Forms and file uploads
+
+The names are FastAPI's, and no `python-multipart` is needed: the body is parsed in Rust.
+
+```python
+from typing import Annotated, Optional
+
+import veil
+from veil import File, Form, UploadFile
+
+
+@veil.post("/profile")
+async def profile(
+    name: str = Form(),                       # required text field
+    age: int = Form(0),                       # converted like a query parameter
+    tags: list[str] = Form([]),               # repeated fields
+    avatar: UploadFile = File(),              # required file
+    banner: Optional[UploadFile] = None,      # optional file (UploadFile needs no File())
+):
+    data = await avatar.read()
+    return {"name": name, "file": avatar.filename, "type": avatar.content_type, "size": avatar.size}
+
+
+@veil.post("/files")
+def files(docs: list[UploadFile], note: Annotated[str, Form()] = ""):
+    return [d.filename for d in docs]
+
+
+@veil.post("/raw")
+def raw(doc: bytes = File()):                  # the content as bytes
+    return len(doc)
+
+
+@veil.post("/login")                          # application/x-www-form-urlencoded uses the same Form()
+def login(user: str = Form(), remember: bool = Form(False)):
+    return {"user": user}
+```
+
+- The form is read **before** the handler runs. Text fields and files up to `[api] multipart_spool_threshold`
+  (1 MiB) stay in memory; larger files are written by Rust to an anonymous temporary file in `[api] upload_tmp_dir`
+  and `UploadFile.file` reads it, so a 1 GB upload does not grow the process. The whole body is limited by
+  `[api] multipart_max_total_size` (by default `max_body_size`, 10 MiB, or `multipart_max_file_size` when that is
+  larger); raise both for large uploads. The temporary file disappears when it
+  is closed (`await upload.close()`, or when the object is collected).
+- `UploadFile` has `filename`, `content_type`, `headers` (a dict, lower-case names), `size`, `file` (a binary file
+  object positioned at the start), `async` `read(size=-1)` / `write` / `seek` / `close`, and `read_bytes()` for
+  synchronous handlers.
+- A missing field or file gives 422 with `loc = ["body", name]` (`Form(alias="other")` changes the name); a
+  malformed body gives 400 and one over the `[api] multipart_*` limits 413 (`{"detail": "..."}`).
+- OpenAPI describes the body as `multipart/form-data` (files are `{"type": "string", "format": "binary"}`) or as
+  `application/x-www-form-urlencoded` when there are no files, so the Swagger UI can send files.
+
 ## Server-Sent events and long-lived connections
 
-See {doc}`websocket` for what to use instead of WebSocket endpoints.
+WebSocket endpoints and other protocol upgrades (`veil.Response.switching_protocols`) are described in {doc}`websocket`.

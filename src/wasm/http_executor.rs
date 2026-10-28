@@ -33,18 +33,28 @@ pub enum WasmBodyOutcome {
 /// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
 /// `end_of_stream` は呼び出し元がボディ全体を保持しているかどうかを示す
 /// （HTTP/3 の Proxy 経路は WASM 適用時に必ず `Decision::Buffer` に落ちるため常に true）。
+///
+/// F-271: HTTP/1.1・HTTP/2・HTTP/3 の 3 経路がこの関数を共有する。`request` を渡すと、本文のコールバックから
+/// 要求のメソッド・パス（プロパティ `request.path`）・ヘッダが見える。
 pub async fn apply_wasm_request_body(
     engine: &FilterEngine,
-    modules: &[crate::wasm_plugin_config::ModuleRef],
+    modules: &crate::wasm_plugin_config::WasmModules,
     body: bytes::Bytes,
     end_of_stream: bool,
+    request: Option<&super::RequestMeta<'_>>,
 ) -> WasmBodyOutcome {
     if modules.is_empty() {
         return WasmBodyOutcome::Continue(body);
     }
-    match engine
-        .on_request_body_with_modules(modules, body.clone(), end_of_stream)
-        .await
+    // 呼び出し元の future に本体（数 KB）を埋め込まない（Wasm を使わない要求の move が重くなる。B-240）
+    match Box::pin(engine.on_request_body_with_modules(
+        modules,
+        body.clone(),
+        end_of_stream,
+        request,
+        modules.sessions(),
+    ))
+    .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
@@ -63,16 +73,21 @@ pub async fn apply_wasm_request_body(
 /// `modules` が空なら一切コストをかけずそのまま返す。
 pub async fn apply_wasm_response_body(
     engine: &FilterEngine,
-    modules: &[crate::wasm_plugin_config::ModuleRef],
+    modules: &crate::wasm_plugin_config::WasmModules,
     body: bytes::Bytes,
     end_of_stream: bool,
 ) -> WasmBodyOutcome {
     if modules.is_empty() {
         return WasmBodyOutcome::Continue(body);
     }
-    match engine
-        .on_response_body_with_modules(modules, body.clone(), end_of_stream)
-        .await
+    // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+    match Box::pin(engine.on_response_body_with_modules(
+        modules,
+        body.clone(),
+        end_of_stream,
+        modules.sessions(),
+    ))
+    .await
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
@@ -97,6 +112,23 @@ pub fn set_content_length_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, len: usi
     headers.push((b"content-length".to_vec(), len.to_string().into_bytes()));
 }
 
+/// `[wasm] http_call_max_timeout_ms`（F-282）
+static MAX_TIMEOUT_MS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS);
+
+/// `[wasm] http_call_max_timeout_ms` を反映する（起動時・リロード時）
+pub fn set_max_timeout_ms(ms: u32) {
+    MAX_TIMEOUT_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// ゲストの `timeout_ms` を上限で打ち切る（ホスト関数で負の値は 0 にしてある。0 は 1ms）
+fn clamp_timeout(timeout_ms: u32) -> Duration {
+    let cap = MAX_TIMEOUT_MS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    Duration::from_millis(timeout_ms.clamp(1, cap) as u64)
+}
+
 /// Execute a pending HTTP call and return the response
 ///
 /// This function makes a synchronous HTTP/1.1 request to the upstream.
@@ -107,7 +139,7 @@ pub fn execute_http_call(
     upstream_port: u16,
     use_tls: bool,
 ) -> Result<HttpCallResponse, String> {
-    let timeout = Duration::from_millis(pending.call.timeout_ms as u64);
+    let timeout = clamp_timeout(pending.call.timeout_ms);
 
     // Connect to upstream
     let addr = format!("{}:{}", upstream_host, upstream_port);
@@ -156,14 +188,9 @@ fn execute_https_request(
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
 
-    // Create TLS config with system roots
-    let mut root_store = rustls::RootCertStore::empty();
-
-    // Add webpki roots
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
+    // Trust anchors from `[tls_client] ca` (built-in roots by default)
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
 
     let server_name = ServerName::try_from(host.to_string())
@@ -395,6 +422,16 @@ pub fn execute_http_call_safe(
 
 #[cfg(test)]
 mod tests {
+
+    /// F-282: ゲストの timeout_ms は上限で打ち切る（負の値はホスト関数で 0 にしてある）
+    #[test]
+    fn http_call_timeout_is_clamped() {
+        set_max_timeout_ms(crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS);
+        assert_eq!(clamp_timeout(u32::MAX), Duration::from_millis(60_000));
+        assert_eq!(clamp_timeout(0), Duration::from_millis(1));
+        assert_eq!(clamp_timeout(250), Duration::from_millis(250));
+    }
+
     use super::*;
     use crate::wasm::types::PendingHttpCall;
 

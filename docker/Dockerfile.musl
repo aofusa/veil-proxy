@@ -4,7 +4,7 @@
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
-FROM messense/rust-musl-cross:x86_64-musl AS tool-builder
+FROM messense/rust-musl-cross:x86_64-musl@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a AS tool-builder
 
 WORKDIR /app
 
@@ -52,7 +52,7 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55）。
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
 COPY third_party /app/third_party
-# crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー（F-188）。本体はこれらを
+# crates/（veil-macros・veil-capi・veil-python・veil-build・veil-kit）はワークスペースメンバー（F-188）。本体はこれらを
 # ビルドしないが、マニフェストが無いとワークスペース解決に失敗する（小さいので丸ごとコピーする）
 COPY crates /app/crates
 

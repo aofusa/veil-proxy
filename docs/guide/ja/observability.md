@@ -23,7 +23,7 @@ enabled = true
 |-----------|------|-----------|
 | `enabled` | メトリクスエンドポイントを有効化 | **false** |
 | `path` | メトリクスエンドポイントのパス | `/__metrics` |
-| `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
+| `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（loopback と UDS のリスナーだけ） |
 
 ### エンドポイント
 
@@ -62,6 +62,9 @@ GET /__metrics
 | `veil_connection_pool_hits_total` | Counter | upstream | コネクションプールヒット数 |
 | `veil_connection_pool_misses_total` | Counter | upstream | コネクションプールミス数 |
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPCリクエスト数 |
+| `veil_http3_invalid_packets_total` | Counter | - | HTTP/3 のポートに届いた QUIC のパケットでない UDP のデータグラムの数（ログは debug だけ） |
+| `veil_upstream_connect_errors_total` | Counter | kind | 上流への接続の失敗の数（`error`・`timeout`・`tls`・`no_healthy`）。対応するログは出す箇所ごとに 10 秒に 1 行まで（残りは debug） |
+| `veil_uring_cq_overflow_total` | Counter | - | io_uring の完了キューが溢れた回数（io_uring のバックエンドのみ）。完了は失われないが、0 以外なら負荷に対してリングが小さい |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPCストリーム処理時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |
@@ -149,7 +152,7 @@ allowed_ips = [
 ### アクセス制御
 
 `allowed_ips` を設定すると、指定したIPアドレス/CIDRからのみメトリクスエンドポイントにアクセス可能になります。
-空の場合（デフォルト）は全てのIPからアクセス可能です。
+空の場合（デフォルト）は loopback（と UDS のリスナー）からだけアクセスできます（v0.10.0 より前は全ての IP）。全てを許可するには `["0.0.0.0/0", "::/0"]` と書きます。`[admin] allowed_ips` も同じです。
 
 | 形式 | 例 |
 |------|-----|
@@ -314,6 +317,10 @@ flush_interval_ms = 1000  # BufWriter のフラッシュ間隔（ミリ秒、デ
 | `req_body_size` | リクエストボディサイズ（バイト） |
 | `resp_body_size` | レスポンスボディサイズ（バイト） |
 | `user_agent` | User-Agent ヘッダ |
+
+要求から取った値（`method`・`host`・`path`・`upstream`・`user_agent`）はエスケープします。JSON は JSON の文字列のエスケープ、
+テキスト形式は制御文字・`\`・0x7f 以上のバイトを `\xNN` にします（nginx の `escape=default` と同じ）。要求で端末のエスケープ列や
+余分な行をログに入れられません。
 
 ### JSON出力例
 

@@ -177,6 +177,65 @@ server_header_enabled = true
 # server_header_value = "veil/1.0"
 
 
+# ====================
+# 複数のリスナー（[[listener]]、F-260）
+# ====================
+#
+# プロトコルの違う TCP ポートを 1 プロセスで複数開くときは、[[listener]] を並べます。
+# [server] の listen / listen_cleartext（と [http3] enabled）は名前 "tls" / "cleartext" の暗黙の
+# リスナーとして先頭に並び、併用できます。証明書（[tls]）・ルート・[http2]・[http3] の詳細キー・
+# セキュリティ設定は全リスナーで共通です。
+#
+# キー（name・listen・tls は全種類、http2/http3/http3_listen は TLS だけ、
+# allow_http/allow_h2c/secure_redirect/redirect_to は平文だけ。違う種類のキーは設定エラー）:
+#   name                    ログ・redirect_to で使う名前（既定 "listener-<添字>"。重複はエラー）
+#   listen                  "host:port" か "unix:<path>"（必須）
+#   tls                     true = TLS（[tls] の証明書）、false = 平文 HTTP/1.1 + h2c（必須）
+#   http2                   ALPN に h2 を出すか（既定: [server] http2_enabled）。false なら ALPN を出さない HTTP/1.1
+#   http3                   同じアドレスの UDP で HTTP/3 も受けるか（既定: false。http3 feature が必要）
+#   http3_listen            HTTP/3 の UDP を別アドレスにする（http3 = true のときだけ）
+#   allow_http / allow_h2c  平文で HTTP/1.1 / h2c を受けるか（既定: true。両方 false はエラー）
+#   secure_redirect         https へ 301 で返すか（既定: false。[server] の enable_secure_redirect と既定が違う）
+#   redirect_to             リダイレクト先のポートを取る TLS のリスナー名（既定: 最初の TLS のリスナー）
+#   threads                 このリスナーのワーカー数（既定: [server] threads）
+#   unix_socket_permissions unix:<path> のパーミッション（既定: [server] unix_socket_permissions）
+#
+# 同じアドレス（0.0.0.0:p と特定アドレスの :p も同じとみなす）をリスナー・[[l4]]・[acme] challenge_listen・
+# HTTP/3 の UDP で重ねるとエラーです。リロードではリスナーの増減・アドレスの変更は効かず（警告）、
+# allow_http・allow_h2c・secure_redirect は効きます。
+#
+# 例: 平文 HTTP/1.1 + h2c、HTTP/1.1 だけの TLS、h2c だけ、HTTP/1.1 + HTTP/2 + HTTP/3
+# [[listener]]
+# name = "plain"
+# listen = "0.0.0.0:8080"
+# tls = false
+#
+# [[listener]]
+# name = "h1tls"
+# listen = "0.0.0.0:8081"
+# tls = true
+# http2 = false
+#
+# [[listener]]
+# name = "h2c"
+# listen = "0.0.0.0:8082"
+# tls = false
+# allow_http = false
+#
+# [[listener]]
+# name = "https"
+# listen = "0.0.0.0:8443"
+# tls = true
+# http3 = true
+#
+# 例: 80 番を https（443）への 301 にする
+# [[listener]]
+# name = "redirect"
+# listen = "0.0.0.0:80"
+# tls = false
+# secure_redirect = true
+# redirect_to = "https"
+
 
 # ====================
 # ログ設定（非同期ログの最適化）
@@ -262,6 +321,19 @@ level = "info"
 # flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
 
 
+
+# ==========================================
+# 外向きの TLS の信頼アンカー（F-259）
+# ==========================================
+# veil が TLS のクライアントになる全経路（tls_ca を書かない HTTPS 上流、ヘルスチェック、VDS・ACME、
+# Proxy-Wasm の dispatch_http_call と gRPC 呼び出し）の既定の信頼アンカー。
+#   "builtin": veil に組み込んだ公開 CA 一覧（webpki-roots。既定。書かなければこれ）
+#   "system" : OS の信頼ストア（起動時に 1 回だけ読む。サンドボックスの前。リロードでは読み直さない）
+#   それ以外 : PEM ファイルのパス（ファイル名が system・builtin のときは "./system"）
+# 文字列 1 個か配列（和集合）。上流ごとの tls_ca はこれを置き換える。[vds] ca_cert はこれに足す。
+# パッケージ・アーカイブの既定の設定は "system"、コンテナは "builtin"
+# [tls_client]
+# ca = "system"                            # 例: ["system", "/etc/veil/internal-ca.pem"]
 
 # ==========================================
 # TLS設定
@@ -498,6 +570,19 @@ reuseport_balancing = "cbpf"
 # デフォルト: 10000
 # open_file_cache_max_entries = 10000
 
+# OpenFileCacheがディスクの変更を通知で追従するか（グローバルデフォルト、F-272）
+# true にすると File ルートの `path` の配下を監視し（専用スレッド。Linux は inotify、
+# BSD・macOS は kqueue、Windows は ReadDirectoryChangesW）、
+# ファイルの差し替え（同じサイズの mv・cp の上書き・ディレクトリごとの差し替え）を
+# 有効期間を待たずに反映する。キャッシュに当たった要求に増えるのは原子変数の読み取り 1 回だけ。
+# 監視の上限（Linux の fs.inotify.max_user_watches、kqueue は監視するファイル・ディレクトリごとに fd を 1 つ持ち、
+# RLIMIT_NOFILE の 4 分の 1 と、RLIMIT_NOFILE から [security] max_concurrent_connections の 2 倍 + 1024 を
+# 引いた数の小さい方まで。使える数は起動時に info で出る）に当たったときは警告して
+# 従来どおり有効期間だけで追従する（有効期間の確認は watch = true でも残る）。
+# ルーティングごとの `[route.open_file_cache] watch` で上書きできる。
+# デフォルト: false
+# open_file_cache_watch = false
+
 
 
 # ==========================================
@@ -565,6 +650,13 @@ max_total_bytes = 67108864
 # 復活する（即時反映が必要な場合のみ有効化を検討）
 # デフォルト: false
 revalidate_mtime = false
+
+# ディスクの変更を通知で追従するか（F-272。`[performance] open_file_cache_watch` と同じ仕組み）
+# revalidate_mtime と違いヒット時に syscall を出さない（原子変数の読み取り 1 回だけ）。
+# 圧縮結果キャッシュも同じく作り直す。open_file_cache と同じ値にすること（片方だけ追従すると
+# もう片方の古い内容が残る）。ルーティングごとの `[route.static_file_cache] watch` で上書きできる。
+# デフォルト: false
+watch = false
 
 # ------------------------------------------
 # 圧縮結果キャッシュ（F-169、専用の設定キーは無い）
@@ -666,7 +758,9 @@ revalidate_mtime = false
 #
 # 注意:
 #   - seccompは不可逆（一度適用すると解除不可）
-#   - 新しいスレッドにも自動的に継承される
+#   - seccomp は TSYNC で先に作った制御プレーンのスレッドを含む全スレッドに掛かる。Landlock は掛けた後に作る
+#     スレッド（ワーカー・静的配信の監視）と、ヘルスチェック・Proxy-Wasm の tick/gRPC のスレッドに掛かる
+#     （設定・証明書のリロード・VDS・ACME のスレッドは Landlock の外。docs/guide/security.md）
 #   - 必要なシステムコールを許可リストに含めること
 #
 # ============================================
@@ -693,7 +787,7 @@ revalidate_mtime = false
 #   "disabled" - 無効（デフォルト）
 #   "log"      - 違反をログに記録（ブロックしない、導入時推奨）
 #   "filter"   - 違反をEPERMで拒否（本番推奨）
-#   "strict"   - 違反したプロセスをSIGKILL（最も厳格、デバッグ困難）
+#   "strict"   - 違反するとプロセス全体を SIGSYS で終了（どのスレッドの違反でも。最も厳格、デバッグ困難）
 #
 # seccomp_mode = "log"  # まずログモードで検証
 
@@ -752,8 +846,10 @@ revalidate_mtime = false
 # 全面禁止されるため、次をすべて満たす構成でのみ適用される。満たさない構成・cap_enter の
 # 失敗・リスナー bind 待ちのタイムアウトでは、既定で起動を中止する（F-181。fail-closed）。
 # allow_security_failures = true のときだけ、警告して rights 制限のみで続行する:
-#   - L4 リスナー・平文リスナー（listen_cleartext）・HTTP/3 の追加リスナーが無い
+#   - L4 リスナー（[[l4]]）と HTTP/3（[http3] enabled・[[listener]] の http3）が無い
 #     （cap_enter 後の bind が要るため）
+# 平文リスナー（listen_cleartext・[[listener]] の平文）と複数の TCP リスナーは阻害要因ではない
+# （全リスナーの全ワーカーの bind をバリアで待ってから入る。B-163）。
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
 # 上流へのプロキシ（F-182）: Proxy ルート・[upstreams] があっても capability mode に入れる。
 # cap_enter の前（特権降格の後）にサンドボックス外の接続ブローカー（veil 自身を再実行した
@@ -813,13 +909,14 @@ revalidate_mtime = false
 # ユーザ空間 rustls、暗号プロバイダは ring。F-125: aws-lc-sys は zig クロスリンク不可）。
 #
 # enable_sandbox_macos = true にすると:
-#   - 設定から導出した静的ファイルルート・TLS証明書/鍵・アクセスログ/アプリログの
-#     ディレクトリ・ディスクキャッシュディレクトリを基に SBPL プロファイルを生成し、
-#     全 TLS ワーカーの listener bind 完了後に sandbox_init(3) で適用する（不可逆）。
-#   - 実機での動作検証ができないため、保守的な最小プロファイルを採用している:
-#     ネットワーク（network*）とファイル読み取り（file-read*）は無条件許可し、
-#     ファイル**書き込み**のみ上記ログ/キャッシュディレクトリの subpath に限定する
-#     （`(deny default)` 起点。詳細は src/security.rs の `macos_sandbox` モジュール参照）。
+#   - 設定から導出したパスを基に SBPL プロファイルを生成し、全リスナーの bind 完了後に
+#     sandbox_init(3) で適用する（不可逆）。`(deny default)` 起点で、子プロセス（fork・exec）は許さない。
+#   - 読めるのは設定が指すファイル（設定ファイル・証明書・鍵・CA・トークン・JWKS・WASM モジュール。
+#     ファイルはディレクトリごと）・静的ルートと、システムのパス（/usr/lib・/System・/private/etc 等）だけ（F-282）。
+#   - 書けるのはログ・ディスクキャッシュ・ACME の保存先・upload_tmp_dir・UDS だけ。
+#   - 許すパスは起動時に決まる。リロードで新しい場所を指すと、証明書・鍵はリロードが失敗し（稼働中の設定のまま）、
+#     静的ルートは 404 になる（場所を変えるときは再起動）。
+#     ネットワーク（network*）は無条件許可（詳細は docs/guide/security.md）。
 #   - sandbox_init 失敗時の挙動は allow_security_failures に従う。
 #
 # enable_sandbox_macos = true
@@ -1310,6 +1407,29 @@ revalidate_mtime = false
 # recv_drain_max = 1024
 
 # ------------------------------------------
+# HTTP/3 の新しい接続の受け入れ制御（ワーカーごと）
+# ------------------------------------------
+# 送信元を偽装した Initial の洪水で接続（TLS の状態・受信バッファ）を確保させないための上限。
+#
+# max_connections: ワーカーごとの QUIC 接続数の上限。達している間は新しい接続の Initial を捨てる。
+# 0 は上限なし。デフォルト: 10000
+# max_connections = 10000
+#
+# retry_threshold: ハンドシェイク中の接続がこの数に達したら、トークンの無い Initial に
+# ステートレスな Retry を返し、送信元のアドレスを確かめてから接続を作る（1 往復増える）。
+# 0 は常に Retry。デフォルト: 1000
+# retry_threshold = 1000
+#
+# handshake_timeout: ハンドシェイクの期限（ミリ秒）。これまでに確立しない接続は捨てる
+# （max_idle_timeout まで残さない）。デフォルト: 10000
+# handshake_timeout = 10000
+#
+# max_field_section_size: 要求のヘッダの大きさの上限（バイト）。SETTINGS_MAX_FIELD_SECTION_SIZE として広告し、
+# HEADERS の長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す）で検査する。超えた接続は閉じる。
+# veil の要求ヘッダの上限（8KB）を超えてこれ以下の要求は 431。デフォルト: 65536（[http2] max_header_list_size と同じ）
+# max_field_section_size = 65536
+
+# ------------------------------------------
 # HTTP/3 専用圧縮設定
 # ------------------------------------------
 # HTTP/3接続時のみ圧縮を常に有効化できます。
@@ -1381,7 +1501,9 @@ revalidate_mtime = false
 # enabled = true
 # path_prefix = "/__admin"
 # secret = "changeme"
-# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+# # アクセスを許可するIPアドレス/CIDR（空の場合は loopback と UDS のリスナーだけ。v0.10.0 より前は全IP。
+# # 全許可は ["0.0.0.0/0", "::/0"]）
+# # 秘密は定数時間で比べ、認証の失敗が IP ごとに 1 分 10 回を超えるとその IP は正しい秘密でも 401 になる
 # allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
 
 
@@ -1400,6 +1522,8 @@ revalidate_mtime = false
 #   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
 #   veil_proxy_http_active_connections      アクティブな接続数
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
+#   veil_upstream_connect_errors_total{kind} 上流への接続の失敗（error / timeout / tls / no_healthy。ログは箇所ごとに 10 秒に 1 行まで）
+#   veil_uring_cq_overflow_total            io_uring の完了キューが溢れた回数（io_uring のバックエンドのみ。0 以外ならリングが小さい）
 #   veil_allocator_bytes{state}             veil-alloc のメモリ量（active / dirty / huge / purged_total。veil-alloc ビルドのみ）
 #   veil_allocator_count{kind}              veil-alloc の構造数（segments / cached_segments / heaps / abandoned_heaps / remote_frees_total）
 #   veil_proxy_vds_connected 等             VDS の状態（[vds] 有効時のみ。F-211、[vds] の節を参照）
@@ -1413,7 +1537,8 @@ revalidate_mtime = false
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"
 #
-# # アクセスを許可するIPアドレス/CIDR（空の場合は全てのIPを許可）
+# # アクセスを許可するIPアドレス/CIDR（空の場合は loopback と UDS のリスナーだけ。v0.10.0 より前は全IP。
+# # 全許可は ["0.0.0.0/0", "::/0"]）
 # # 例: 内部ネットワークとlocalhostのみ許可
 # allowed_ips = [
 #   "127.0.0.1",
@@ -1465,11 +1590,29 @@ revalidate_mtime = false
 # （veil-wasmtime）を使うため Pulley 専用。false を指定すると起動時に警告ログが出る）。
 # interpreter = false
 
+# Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）
+# ゲストの timeout_ms が長くても接続はこの時間で諦める（gRPC の実行スレッドは接続を同期で待つため）
+# デフォルト: 5000
+# grpc_connect_timeout_ms = 5000
+
+# proxy_http_call の timeout_ms の上限（ミリ秒。負の値は 0 とみなす）
+# デフォルト: 60000
+# http_call_max_timeout_ms = 60000
+
+# 1 モジュールの shared data のキーの数の上限（超える新しいキーの proxy_set_shared_data は InternalFailure）
+# デフォルト: 100000
+# shared_data_max_keys = 100000
+
 # デフォルト設定
 # [wasm.defaults]
 # 最大実行時間（ミリ秒）
 # デフォルト: 100
 # max_execution_time_ms = 100
+# コールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel の換算）
+# 小さくすると CPU を長く使うフィルタと同じワーカーの他の要求の待ちが短くなるが、普通のコールバックも
+# 止まるので instance_reuse のインスタンスが同時に多く開き、要求ごとの費用が増える
+# デフォルト: 1000
+# yield_interval_us = 1000
 
 # Poolingアロケータ設定
 # [wasm.defaults.pooling]
@@ -1496,6 +1639,16 @@ revalidate_mtime = false
 # # mode = "block"
 # # max_body_size = 65536
 # # patterns = ["union select", "<script"]
+#
+# # F-271: VM の文脈を要求をまたいで使い回す（既定 false）。true なら `_start`・`proxy_on_vm_start`・
+# # `proxy_on_configure` はインスタンスを作るときに 1 回だけ走り、要求ごとは http context の作成
+# # （`proxy_on_context_create`）とコールバックだけになる（Envoy と同じ寿命。フィルタのグローバル変数・
+# # root context の状態が要求をまたいで残る）。トラップしたインスタンスは捨てて作り直す。
+# instance_reuse = false
+#
+# # F-271: 起動時（と設定のリロード時）に読むファイル。値はプロパティ `plugin_data.<名前>` で読める
+# # （capabilities の allowed_properties を書くなら "plugin_data.*" を含める）。要求ごとのファイルの読み取りは無い。
+# # data_files = { dataset = "/etc/veil/data/dataset.json" }
 #
 # # F-148: ルート単位で configuration を上書きしたい場合は [[route]] 側の
 # # [route.module_configuration.<モジュール名>] を使う（下記 [[route]] セクション参照）。
@@ -1743,13 +1896,15 @@ revalidate_mtime = false
 #
 # # 上流の mTLS（F-217）。Proxy の action（type = "Proxy"）にも同じキーを書ける
 # #   tls_client_cert / tls_client_key: 上流へ出すクライアント証明書と秘密鍵（PEM、組で指定）
-# #   tls_ca:       上流の証明書の信頼アンカー（PEM。省略時は既定の公開 CA）
+# #   tls_ca:       上流の証明書の信頼アンカー（F-259）。"builtin"（組み込みの公開 CA）・"system"（OS の信頼ストア）・
+# #                 PEM のパスのどれか、またはその配列（和集合）。書くと [tls_client] ca を置き換える。
+# #                 省略時は [tls_client] ca。ファイル名が system・builtin のときは "./system" と書く
 # #   expected_san: 上流の証明書の SAN の期待値（DNS 名・URI・IP。どれかが一致すれば受ける。
 # #                 指定するとホスト名の代わりにこれで照合する。SPIFFE ID 等）
 # # 設定のロード時に読み込む（証明書の差し替えは SIGHUP の設定リロードで反映）。tls_insecure より優先
 # tls_client_cert = "/etc/veil/upstream-client.pem"
 # tls_client_key = "/etc/veil/upstream-client.key"
-# tls_ca = "/etc/veil/upstream-ca.pem"
+# tls_ca = "/etc/veil/upstream-ca.pem"       # 例: tls_ca = "system" / ["system", "/etc/veil/upstream-ca.pem"]
 # expected_san = ["spiffe://cluster.local/ns/default/sa/backend"]
 #
 # # HTTPS 上流で HTTP/2 を使うか（F-175、デフォルト: "auto"）
@@ -1849,6 +2004,7 @@ revalidate_mtime = false
 # enabled = true
 # valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
 # max_entries = 50000
+# watch = true  # ディスクの変更を通知で追従する（F-272。既定は [performance] open_file_cache_watch）
 # # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き）
 # # HTTP/2・HTTP/3 のファイル本体をユーザ空間メモリに保持し、リクエストごとの
 # # オフロード読み込みを削減します（HTTP/1.1 は sendfile(2) 使用のため対象外）
@@ -1856,6 +2012,7 @@ revalidate_mtime = false
 # enabled = true
 # valid_duration_secs = 300
 # max_file_size_bytes = 2097152  # 2 MiB
+# watch = true  # ディスクの変更を通知で追従する（F-272。既定は [static_file_cache] watch）
 
 # カスタムインデックス (profile.html)
 # [[route]]
@@ -1969,6 +2126,8 @@ revalidate_mtime = false
 #
 # WebSocket adaptive ポーリングのバックオフ倍率
 # websocket_poll_backoff_multiplier = 2.0
+# アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（0 = 無制限。デフォルト: 0）
+# websocket_idle_timeout_secs = 0
 
 # ------------------------------------------
 # ルーティング条件の例（header, method, query, source_ip）
@@ -2361,6 +2520,15 @@ revalidate_mtime = false
 #   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
 #   # バックエンドに転送前にヘッダーを削除
 #   remove_request_headers = ["X-Debug-Token"]
+#   # 転送ヘッダ（X-Forwarded-For・X-Real-IP・X-Forwarded-Proto・Forwarded）の扱い（v0.10.0）
+#   #   "append"（既定）: trusted_proxies に入らないクライアントが送ったこれらは送らず、
+#   #                     X-Forwarded-For にクライアントの IP を入れる。trusted_proxies からは受けた値を残し、
+#   #                     クライアントの IP を X-Forwarded-For の別の行として足す
+#   #   "passthrough"   : 受けたまま送り、何も足さない（v0.10.0 より前の動き）
+#   # add_request_headers に X-Forwarded-For があればそちらを使う。X-Real-IP は既定では足さない
+#   forwarded_headers = "append"
+#   # 転送ヘッダを信頼する送信元（前段のロードバランサ等）
+#   trusted_proxies = ["10.0.0.0/8"]
 #   # クライアントに返送前にセキュリティヘッダーを追加
 #   add_response_headers = { "Strict-Transport-Security" = "max-age=31536000", "X-Frame-Options" = "DENY", "X-Content-Type-Options" = "nosniff" }
 
@@ -2395,6 +2563,17 @@ revalidate_mtime = false
 # body = "ok"
 # content_type = "text/plain"  # 任意
 #
+# F-271: Respond のルートにも [[route]] の modules を付けられる。フィルタが send_local_response で応答すれば
+# それを返し、しなければこの固定応答を返す（上流の無い、フィルタだけで答えるルート）。要求本文のフェーズ
+# （on_http_request_body）も HTTP/1.1・HTTP/2・HTTP/3 の全部で走る（allow_request_body_read のモジュールがあるとき）。
+# [[route]]
+# modules = ["baseline"]
+# [route.conditions]
+# path = "/baseline11"
+# [route.action]
+# type = "Respond"
+# status = 404
+#
 # [route.traffic] は任意のルートに書ける（ロード時に解決。無いルートには影響しない）
 # [route.traffic]
 # # 重み付き分割（upstream の名前か url。分割先にもルートの security 等が効く）
@@ -2407,14 +2586,18 @@ revalidate_mtime = false
 # [route.traffic.fault]
 # abort_status = 503
 # abort_percent = 5.0          # 0〜100、既定 100
-# # CORS のプリフライト（OPTIONS + Origin + Access-Control-Request-Method）に 200 で答える
+# # CORS（F-273）: プリフライト（OPTIONS + Origin + Access-Control-Request-Method）に 200 で答え、
+# # 実際の応答（File・Proxy・Handler・Redirect・Respond）にも許可したオリジンなら Access-Control-Allow-Origin 等を足す
 # [route.traffic.cors]
 # allow_origins = ["https://app.example.com"]   # 完全一致、または "*"
 # allow_methods = ["GET", "POST"]
 # allow_headers = ["content-type", "authorization"]
-# expose_headers = []
+# expose_headers = []          # 実際の応答の Access-Control-Expose-Headers
 # max_age_secs = 600
 # allow_credentials = false    # "*" とは併用できない
+# override_upstream = false    # true: 上流が返した Access-Control-* を veil のものに置き換える（既定は上流が ACAO を返したら上流のものを残す。
+#                              # veil が足すときは上流の Allow-Credentials・Expose-Headers をいつも除く）
+# reject_disallowed = false    # true: 許可しない Origin の要求に 403（既定は処理して CORS のヘッダを付けないだけ）
 #
 # JWT の検証（F-220、`jwt` feature）。トークン無し・検証できない → 401、require_claims を満たさない → 403
 # [route.jwt]
@@ -2426,6 +2609,8 @@ revalidate_mtime = false
 # allow_missing = false
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                 # 受ける "alg"（空なら鍵の "alg"。鍵に無ければその鍵種で検証できる全部で、
+#                                          # そのときはロード時に警告する）
 # require_claims = { scope = ["read"] }
 
 # ------------------------------------------
@@ -2640,6 +2825,9 @@ revalidate_mtime = false
 # [api]
 # openapi_enabled = true            # /openapi.json と Swagger UI を公開する
 # openapi_path = "/docs"            # Swagger UI のパス
+# openapi_docs_ui = "embedded"      # Swagger UI の配り方（F-264）: "embedded"（同梱の資産。外へ通信しない。
+#                                   # openapi-ui-embedded feature が要る）・"cdn"・"off"（/openapi.json だけ）
+# openapi_docs_cdn_url = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.34.0"  # "cdn" のときの URL
 # openapi_json_path = "/openapi.json"
 # openapi_title = "veil API"
 # openapi_version = "0.1.0"
@@ -2653,6 +2841,28 @@ revalidate_mtime = false
 #                                      # 受けるときだけ。compression feature が必要。F-209）
 # grpc_response_compression_min_size = 1024   # これ未満の gRPC メッセージは圧縮しない（バイト）
 # grpc_web_cors_origins = []      # ブラウザから gRPC-Web で呼んでよい Origin（["*"] で全部。空ならプリフライトは 403。F-209）
+# upgrade_idle_timeout_secs = 300  # アップグレードした HTTP/1.1 の接続で読み取りが待てる秒数（0 = 無制限。F-261、既定は B-197）
+# websocket_max_message_size = 16777216   # 組み立て後の WebSocket のメッセージの上限（超えたら 1009 で閉じる。F-262）
+# websocket_max_frame_size = 16777216     # WebSocket の 1 フレームの上限
+# websocket_ping_interval_secs = 30       # 黙った WebSocket にサーバから Ping を送るまでの秒数（0 = 送らない。B-197）
+# websocket_idle_timeout_secs = 120       # フレーム（Pong を含む）を受けない WebSocket を 1001 で閉じるまでの秒数（0 = 無制限。B-197）
+# websocket_compression = false           # permessage-deflate（RFC 7692）を交渉する（compression feature が必要）
+# openapi_websocket = true                # WebSocket のルートを OpenAPI に載せる
+# openapi_grpc = true                     # gRPC のメソッドを OpenAPI に載せる（POST /pkg.Svc/Method・x-grpc。F-265）
+# openapi_grpc_builtin = false            # grpc.health.v1・grpc.reflection.* も載せる
+# python_event_loops = 1                  # Python: async def・WebSocket を動かす常駐のイベントループの数（F-263）
+# python_event_loop = "auto"              # Python: "auto"（uvloop があれば使う）・"asyncio"・"uvloop"
+# python_event_loop_queue = 65536         # Python: 1 つのループで待てる呼び出しの数（一杯なら 503）
+# python_async_mode = "loop"              # Python: async def の実行先（"loop" = 常駐のループ、"pool" = 0.10 より前と同じ）
+# multipart_max_parts = 100               # multipart/form-data のパート数の上限（超えたら 413。F-266）
+# multipart_max_field_size = 1048576      # ファイルでないパートの大きさの上限
+# multipart_max_file_size = 0             # ファイルのパートの大きさの上限（0 = max_body_size）
+# multipart_max_total_size = 0            # 本文全体の上限。ストリーミングのルートにも効く（0 = max_body_size、multipart_max_file_size の方が大きければそちら。B-195）
+# multipart_max_header_size = 8192        # 1 パートのヘッダの大きさの上限
+# multipart_spool_threshold = 1048576     # Python の UploadFile・C の VEIL_ROUTE_FORM: これを超えるファイルは一時ファイルへ
+# upload_tmp_dir = "/var/tmp/veil"        # アップロードの名前の無い一時ファイルの置き場（既定は OS の一時ディレクトリ）
+# compression = false                     # ハンドラの応答を br・gzip で圧縮する（[route.compression] の無いハンドラのルートに
+#                                         # br・gzip、256 バイト以上、JSON・text/*・JavaScript・SVG の既定を入れる。compression feature が必要。F-270）
 
 # ==========================================
 # VDS（Veil Discovery Service、F-04）

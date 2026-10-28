@@ -28,18 +28,21 @@ for c in ${SEMGREP_CONFIG}; do config_args+=(--config "${c}"); done
 # F-64: Veil 固有のカスタムルール（.semgrep/）。io_uring/ゼロコピー/禁止事項の
 # 意味のある差分だけを拾う。SEMGREP_CUSTOM_RULES=0 で無効化可能。
 if [[ "${SEMGREP_CUSTOM_RULES:-1}" == "1" && -d "${REPO_ROOT}/.semgrep" ]]; then
-    config_args+=(--config /src/.semgrep)
+    config_args+=(--config /repo/.semgrep)
 fi
 
+# B-243: リポジトリは /repo に置き、作業ディレクトリから `.` を走査する（/src に置くと全ファイルのパスに "src/" が
+# 含まれ、ルールの paths.include "src/" が third_party・examples にも一致していた）
 docker run --rm \
-    -v "${REPO_ROOT}:/src:ro" \
+    -v "${REPO_ROOT}:/repo:ro" \
     -v "${RESULTS_DIR}:/results:rw" \
+    -w /repo \
     "${SEMGREP_IMAGE}" \
     semgrep scan "${config_args[@]}" \
         --metrics off \
         --sarif-output=/results/semgrep.sarif \
         --exclude target --exclude fuzz/target \
-        /src 2>&1 | tee -a "${REPORT}" || true
+        . 2>&1 | tee -a "${REPORT}" || true
 
 # findings 件数を要約（SARIF から results 配列長を素朴に数える）
 if [[ -f "${SARIF}" ]]; then

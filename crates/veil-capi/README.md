@@ -40,6 +40,21 @@ veil_run(cfg);                                      /* 停止までブロック�
 - アクセスログは既定で標準出力に出ます（`[access_log] enabled = true`・`format = "text"`）。止めるときは
   `veil_config_set(cfg, "access_log.enabled", "false")`。
 - 停止は SIGINT / SIGTERM、または別スレッドからの `veil_shutdown()`。
+- プロトコルの違うポートを複数開くときは `veil_listener_t` を埋めてポートごとに `veil_config_add_listener` を呼びます
+  （`[[listener]]` の 1 項目）。0 で埋めたものが既定です: `http2`・`allow_http`・`allow_h2c`・`secure_redirect` は
+  `VEIL_DEFAULT`（0）で既定、`VEIL_ON`（正）で true、`VEIL_OFF`（負）で false、文字列は `NULL` で省略です。先頭の `size` は
+  `sizeof(veil_listener_t)`（`VEIL_LISTENER_INIT` が入れる。0 でもよい）で、後の版でフィールドを足しても古いヘッダでビルドした
+  プログラムはそのまま動きます。1 個でも足すと、既定の `127.0.0.1:8080` は `veil_config_listen_cleartext` を呼ばない限り開きません。
+
+  ```c
+  veil_listener_t tls = VEIL_LISTENER_INIT;
+  tls.listen = "0.0.0.0:8443";
+  tls.tls = 1;
+  tls.http3 = 1;
+  veil_config_add_listener(cfg, &tls);
+  veil_listener_t plain = { .listen = "0.0.0.0:8080", .allow_h2c = VEIL_OFF };  /* HTTP/1.1 だけ */
+  veil_config_add_listener(cfg, &plain);
+  ```
 
 ## スレッドモデル
 
@@ -97,6 +112,7 @@ static int say_hello(veil_grpc_call_t *call, void *ud) {
 }
 veil_register_grpc(cfg, "/demo.v1.Demo/SayHello", VEIL_GRPC_UNARY, say_hello, NULL);
 veil_register_grpc_health(cfg);                          /* grpc.health.v1.Health */
+veil_grpc_descriptors(cfg, set, set_len);                /* 任意: OpenAPI にメッセージの型を載せる */
 ```
 
 - `veil_grpc_recv`: 1 = 受け取った（ポインタは次の recv かコールバックの終わりまで有効）、0 = 終わり、負 = エラー。
@@ -117,12 +133,92 @@ veil_register_l4_tcp(cfg, "echo", "127.0.0.1:7000", &cb, NULL);
 接続ごとのデータは `veil_l4_set_conn_data` / `veil_l4_conn_data`。UDP は `veil_register_l4_udp` のコールバックで
 `veil_l4_reply` を呼ぶと応答します。
 
+### HTTP/1.1 のプロトコルアップグレード（F-261）
+
+```c
+static int on_data(veil_l4_conn_t *c, const uint8_t *d, size_t n, void *ud) { return veil_l4_write(c, d, n); }
+static const veil_l4_tcp_callbacks_t cb = { .on_data = on_data };
+
+static int upgrade(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    return veil_response_upgrade(resp, "x-echo", &cb, NULL);   /* 101 → 以後は L4 と同じコールバック */
+}
+```
+
+`veil_response_upgrade` は応答を `101 Switching Protocols`（`Upgrade: x-echo`）にし、101 を書いた後の接続を L4 の TCP と同じ
+コールバック（`on_connect` → `on_data` … → `on_close`、`veil_l4_write`・`veil_l4_close`）で受けます。ヘッダの直後に届いていた
+バイト列も最初の `on_data` に渡ります。要求に `Connection: upgrade` と `Upgrade` が無い・本文付き・HTTP/1.0・HTTP/2・HTTP/3 なら
+veil が 400 に置き換えます（`h2c` は予約済みで 500）。
+
+### WebSocket（F-262）
+
+```c
+static int on_message(veil_ws_t *ws, int opcode, const uint8_t *d, size_t n, void *ud) {
+    return veil_ws_send(ws, opcode, d, n);                     /* エコー */
+}
+static const veil_ws_callbacks_t wcb = { .on_message = on_message };
+
+static int ws(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    veil_ws_accept(req, resp, &wcb, NULL);   /* 101（ハンドシェイクが正しくなければ 400 / 426 のまま） */
+    return 0;
+}
+```
+
+`veil_ws_accept` はハンドシェイクを検査して応答を 101（`Sec-WebSocket-Accept` 付き）にし、その後のメッセージを
+`on_open` → `on_message`（`VEIL_WS_TEXT`・`VEIL_WS_BINARY`。テキストは UTF-8 検査済み、断片は組み立て済み）… → `on_close`
+（相手の Close のコード。無ければ 1005、切断は 1006、サーバの停止で接続を捨てたときは 1001）で渡します。`on_open` が
+0 を返した接続では `on_close` が必ず 1 回呼ばれます（停止中でも。B-206）。コールバックはハンドラ用プールで接続ごとに 1 つずつ順に呼ばれ、
+非 0 を返すと 1000 で閉じます。`veil_ws_send`（コピーして送信キューに積む。キューは 16 MiB まで）・`veil_ws_close` は
+`on_open` から `on_close` が戻るまでの間ならどのスレッドからでも呼べます。Ping・閉じる手順・プロトコル違反（1002・1007・1009）は
+veil が処理します。HTTP/1.1 だけです（HTTP/2・HTTP/3 では 400）。接続ごとのデータは `veil_ws_set_data` / `veil_ws_data`、
+相手の IP は `veil_ws_peer`。
+
+### フォームとファイルのアップロード（F-266）
+
+```c
+static int upload(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    veil_part_t p;
+    int rc;
+    while ((rc = veil_multipart_next(req, &p)) == 1) {
+        if (p.fd >= 0) { /* 一時ファイル（先頭から read する。コールバックから戻ると閉じる） */ }
+        else { /* p.data / p.data_len */ }
+    }
+    if (rc < 0) { veil_response_set_status(resp, rc == VEIL_ERR_TOO_LARGE ? 413 : 400); }
+    return 0;
+}
+/* VEIL_ROUTE_FORM: 本文をコールバックの前に読み、大きなファイルは一時ファイルへ（本文全体を溜めない） */
+veil_register_route_ex(cfg, "/upload", "POST", upload, NULL, VEIL_ROUTE_FORM, NULL);
+```
+
+`veil_multipart_next` は `multipart/form-data` のパートを 1 つずつ返します（1 = 返した、0 = 終わり）。`name`・`filename`（ファイルでなければ
+NULL）・`content_type` と、中身の `data`/`data_len` か一時ファイルの `fd`（Windows は HANDLE。メモリなら -1）・`size` を持ちます。
+`VEIL_ROUTE_FORM` を付けたルートは本文をコールバックの前に読み、`[api] multipart_spool_threshold` を超えるファイルを `[api] upload_tmp_dir`
+の名前の無い一時ファイルに書きます（壊れた本文の 400・上限超えの 413 はコールバックの前に返す）。付けないルートは溜めた本文
+（`[api] max_body_size` まで）を解析します。上限は `[api] multipart_*`（`veil_config_set(cfg, "api.multipart_max_file_size", "209715200")`）。本文全体は
+`multipart_max_total_size`（既定 = `max_body_size`。`multipart_max_file_size` の方が大きければそちら）までです。
+
+### 応答の圧縮（F-270）
+
+```c
+/* [route.compression] の無いハンドラのルートに既定（br・gzip、256 バイト以上、JSON・text/*・JavaScript・SVG）を入れる */
+veil_config_set(cfg, "api.compression", "true");
+/* このルートは圧縮しない */
+veil_register_route_ex(cfg, "/raw", "GET", raw, NULL, VEIL_ROUTE_NO_COMPRESS, NULL);
+/* コールバックの中で、この応答だけ圧縮しない */
+veil_response_no_compression(resp);
+```
+
+クライアントの `Accept-Encoding` に応じて br・gzip を選び、`Content-Encoding`・`Vary` を付けます（無ければ圧縮しない）。
+`veil_response_stream` のストリーミングの応答は書くたびに圧縮して flush します（`text/event-stream` は圧縮しない）。HTTP/1.1・
+HTTP/2・HTTP/3 のどれでも同じです。規則の全体はガイドの `library.md` の「応答の圧縮」。
+
 ### 所有権
 
 | 対象 | 規則 |
 |------|------|
 | `veil_stream_t *` | `veil_stream_close` で必ず閉じる（閉じるまで応答は終わらない）。コールバックの後も別スレッドで使える。 |
 | `veil_grpc_call_t *` / `veil_l4_conn_t *` / `veil_l4_reply_t *` | コールバックの中でだけ有効。 |
+| `veil_ws_t *` | `on_open` から `on_close` が戻るまで有効（その間はどのスレッドからでも `veil_ws_send`・`veil_ws_close` を呼べる）。 |
+| `veil_part_t` の中身・`fd` | コールバックの中でだけ有効（`fd` は veil が閉じる。残すなら dup する）。 |
 | `VEIL_ROUTE_INLINE` のルート | ストリーミング・本文の読み取りは使えない（`VEIL_ERR_STATE` / `NULL`）。 |
 
 ## エラーコード
@@ -135,7 +231,9 @@ veil_register_l4_tcp(cfg, "echo", "127.0.0.1:7000", &cb, NULL);
 | -3 | `VEIL_ERR_RUNTIME` | 起動・実行時のエラー（ルート衝突、ポート使用中 など） |
 | -4 | `VEIL_ERR_UTF8` | 文字列が UTF-8 ではない |
 | -5 | `VEIL_ERR_CLOSED` | 相手が切断した・ストリームが閉じている（F-210） |
-| -6 | `VEIL_ERR_STATE` | 呼べない状態（INLINE でのストリーミング・単項の 2 回目の送信等） |
+| -6 | `VEIL_ERR_STATE` | 呼べない状態（INLINE でのストリーミング・単項の 2 回目の送信・multipart でない本文での `veil_multipart_next` 等） |
+| -7 | `VEIL_ERR_FORM` | フォームの本文が壊れている（400 を返す。F-266） |
+| -8 | `VEIL_ERR_TOO_LARGE` | フォームの本文が `[api] multipart_*` の上限を超えた（413 を返す。F-266） |
 
 理由は `veil_last_error()` で取れます。
 

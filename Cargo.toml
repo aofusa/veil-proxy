@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build"]
+members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build", "crates/veil-kit"]
 # third_party/wasmtime は crates.io wasmtime 36.0.18（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
@@ -71,6 +71,8 @@ include = [
     "/Cargo.toml",
     "/crates/README.crates-io.md",
     "/LICENSE*",
+    # F-264: ライブラリの /docs が同梱する Swagger UI（openapi-ui-embedded）
+    "/third_party/swagger-ui-dist/**",
 ]
 build = "build.rs"
 
@@ -394,6 +396,9 @@ tower-compat = [
 macro = ["handler", "dep:veil-macros"]
 # マクロのメタデータからの OpenAPI 3.1 生成・Swagger UI（F-189）
 openapi = ["handler", "macro"]
+# `/docs` の Swagger UI の資産（swagger-ui-dist、third_party/swagger-ui-dist）をライブラリに同梱する（F-264。約 0.8 MB）。
+# 外すと `[api] openapi_docs_ui` の既定は "cdn"（"embedded" は設定のエラー）
+openapi-ui-embedded = ["openapi", "dep:flate2"]
 # tokio 互換レイヤー（F-198）。2 つは排他（両方有効は compile_error）。tower の Service/Layer 互換は api-core に含む。
 # - tokio-compat（api の既定）: tokio 無し。veil のランタイムの上に tokio の API（veil::tokio、crates/veil-tokio/tokio-shim
 #   で依存ツリーの tokio を置き換えられる）を提供する。handler に依存しない（置き換えた tokio が serde_json 等を
@@ -408,7 +413,7 @@ l4-handler = ["handler", "l4-proxy"]
 # 生成コードは prost）が符号化する。F-208）。API ライブラリ専用
 grpc-handler = ["handler", "grpc"]
 # tokio 互換レイヤー以外の API ライブラリ一式（tokio-compat-bridge と組み合わせるときに使う）
-api-core = ["handler", "macro", "openapi", "l4-handler", "grpc-handler", "tower-compat"]
+api-core = ["handler", "macro", "openapi", "openapi-ui-embedded", "l4-handler", "grpc-handler", "tower-compat"]
 # API サーバ開発向けの便利セット（C API・Python は別クレート crates/veil-capi・crates/veil-python）
 api = ["api-core", "tokio-compat"]
 
@@ -592,6 +597,8 @@ full-container = [
 # provider feature は下の [target.*] で付与し、ここでは共通 feature のみ指定する。
 rustls = { version = "0.23.35", default-features = false, features = ["std", "tls12", "logging"] }
 webpki-roots = "1.0.4"
+# 外向きの TLS の信頼アンカーに OS の信頼ストアを使う（F-259）。Cargo.lock に間接依存で入っていた版
+rustls-native-certs = "0.8.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
 # mimalloc 高速メモリアロケータ（mimalloc feature で有効化）
@@ -663,7 +670,7 @@ brotli = { version = "8.0.2", optional = true }
 # - 高速かつ高圧縮率（Gzipより高速で高圧縮）
 # - ストリーミング圧縮対応
 # - 圧縮レベル1-22をサポート
-zstd = { version = "0.13.3", optional = true }
+zstd = { version = "0.14.3", optional = true }
 
 # ====================
 # プロキシキャッシュ・バッファリング制御
@@ -743,7 +750,7 @@ ring = "0.17"
 rcgen = { version = "0.14.6", optional = true, default-features = false, features = ["crypto", "pem", "ring"] }
 # OpenBSD/NetBSD の quiche(http3) は vendored BoringSSL（`boringssl-boring-crate` feature、
 # 外部 `boring` crate 経由）を無条件で使う（FreeBSD/macOS/Windows と同じ構成、F-136）。
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.4", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
 # `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD/macOS/Windows と
 # 同じ理由で optional にしない。
@@ -782,12 +789,12 @@ boring = "4.3"
 # - 既定の feature のうち `profiling`（perf の jitdump・VTune）だけを外す。veil は使わず、保守終了の `fxhash`
 #   （RUSTSEC-2025-0057、`fxprof-processed-profile` 経由）を依存に持ち込むため。残りは既定のまま（B-158）。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 # 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
 # キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
-veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "cache", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）
@@ -804,6 +811,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_IO",
     "Win32_System_Console",
+    # 静的配信のキャッシュの監視（ReadDirectoryChangesW。F-272）
+    "Win32_Storage_FileSystem",
 ] }
 
 # ====================
@@ -966,7 +975,7 @@ required-features = ["wasm"]
 # F-243: quiche の BoringSSL の FFI を aws-lc-sys の Rust のバインディング経由で呼ぶ（`aws-lc-sys` feature、
 # third_party/quiche/src/veil_ffi.rs）。aws-lc-sys の接頭辞の有無（AWS_LC_SYS_NO_PREFIX）を問わずリンクできるので、
 # veil を依存にする利用者は .cargo/config.toml に何も書かなくてよい。
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["aws-lc-sys"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.4", default-features = false, features = ["aws-lc-sys"], optional = true }
 # F-238: rustls（aws-lc-rs）が引く aws-lc-sys と必ず同じ 1 つの版にする（2 つになると、プレフィックス無しの
 # シンボルが衝突し、ビルドが libcrypto を見つけられずに失敗する）。crates.io から入れた利用者の解決では
 # aws-lc-rs の最新が新しい aws-lc-sys を要求するので、範囲で受けて同じ版に寄せる。
@@ -977,7 +986,7 @@ aws-lc-sys = { version = ">=0.45, <0.48", features = ["ssl", "bindgen"] }
 # `boringssl-boring-crate` feature 経由でしか提供されないため、常時これを使う
 # （macOS/Windows と同じ構成）。
 [target.'cfg(target_os = "freebsd")'.dependencies]
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.4", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
 # `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD は常に
 # BoringSSL 固定のため optional にしない（http3 feature 無効時の追加コストは
@@ -986,7 +995,7 @@ boring = "4.3"
 
 # macOS/Windows: 従来どおり vendored BoringSSL（boring crate）を無条件で使う（不変）。
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
-quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.2", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+quiche = { package = "veil-proxy-quiche", path = "third_party/quiche", version = "=0.24.9-veil.4", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # `src/http3_server.rs` が `boring::ssl::SslContextBuilder` 等を直接使うための直接依存
 # （quiche 内部の boring 依存とは別に、自クレートのコードから使うには直接宣言が要る）。
 # Cargo の feature はターゲット非依存（`http3 = ["dep:quiche"]` に `dep:boring` を
@@ -1016,7 +1025,7 @@ tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
 # ビルド時のみ複数フレームを詰める）。小さい応答を多数多重化する HTTP/3 ではリクエストごとに
 # 1 パケット（sendto + AEAD + ヘッダ保護）を払うことになり、FreeBSD aarch64 の 3B 静的配信で
 # 送信 syscall が 1.01/req（nginx 0.22/req）だった。常に詰めるよう 1 箇所だけ差し替えた
-# vendoring 版を `veil-proxy-quiche`（版 0.24.9-veil.2）として各ターゲットの依存に直接書く（上の
+# vendoring 版を `veil-proxy-quiche`（版 0.24.9-veil.4）として各ターゲットの依存に直接書く（上の
 # target 別の quiche。依存のキーは `quiche` のままなのでコードは `quiche::` のまま）。以前は
 # `[patch.crates-io]` で差し替えていたが、patch は crates.io から入れた利用者のビルドには効かない（F-238）。
 # 詳細は third_party/quiche/README.veil.md。

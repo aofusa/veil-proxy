@@ -31,7 +31,8 @@ use ftlog::warn;
 use crate::udp::socket::{build_gso_cmsg, socket_addr_to_raw, SendmmsgEntry};
 
 use super::executor::{
-    alloc_op, detach_op, remove_op, set_op_waker, submit_sqes, take_op_result, with_ring, OpGuard,
+    alloc_op, cancel_op, detach_op, poll_completions, remove_op, set_op_waker, submit_sqes,
+    take_op_result, with_ring, OpGuard,
 };
 use super::ring::IORING_OP_SENDMSG;
 
@@ -96,9 +97,34 @@ impl SendSlot {
         Ok(())
     }
 
+    /// in-flight の op を、msghdr・iovec・アドレス・cmsg の Box を後始末の閉包へ移して detach する。スロットには
+    /// 新しい Box を入れる（終了・失敗の経路だけなので確保は問題にならない。B-225）。
+    fn detach_keep_alive(&mut self) {
+        if !self.submitted || self.user_data == 0 {
+            return;
+        }
+        let fresh = SendSlot::new();
+        let keep = (
+            std::mem::replace(&mut self.addr, fresh.addr),
+            std::mem::replace(&mut self.cmsg, fresh.cmsg),
+            std::mem::replace(&mut self.iov, fresh.iov),
+            std::mem::replace(&mut self.msg, fresh.msg),
+        );
+        detach_op(
+            self.user_data,
+            OpGuard::Cleanup(Box::new(move |_res| drop(keep))),
+        );
+        self.user_data = 0;
+        self.submitted = false;
+    }
+
     /// SQE を積む（submit はしない）。
     fn submit_no_flush(&mut self, fd: RawFd) -> io::Result<()> {
-        debug_assert!(!self.submitted);
+        // B-225: release では debug_assert が消え、in-flight のスロットを上書きすると前の op の user_data を失って
+        // op テーブルのスロットが漏れた（カーネルが読んでいる msghdr を書き換えることにもなる）
+        if self.submitted {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let user_data = alloc_op();
         let msg_ptr = self.msg.as_ref() as *const libc::msghdr as u64;
         let acquired = with_ring(|ring| {
@@ -163,13 +189,47 @@ impl UringUdpSend {
 
 impl Drop for UringUdpSend {
     fn drop(&mut self) {
-        // F-130: ワーカー終了時のみ発生する経路。リング/エグゼキュータも同時に破棄されるため
-        // OpGuard::Noop で後始末不要とする（PipelinedUdpRecv と同方針）。
+        // B-225: in-flight の SENDMSG はカーネルが msghdr 等を読み終えるまで Box を生かす（以前は OpGuard::Noop で
+        // すぐ解放していた）。通常は SendBatch の Drop が完了まで待つので、ここで残っているのは期限切れのものだけ。
         for slot in self.slots.iter_mut() {
-            if slot.submitted && slot.user_data != 0 {
-                detach_op(slot.user_data, OpGuard::Noop);
-                slot.submitted = false;
+            slot.detach_keep_alive();
+        }
+    }
+}
+
+// B-225: 送るデータ（iov_base）は呼び出し側のバッファ（HTTP/3 の送信のスクラッチ）を指す。完了前に SendBatch が
+// 落とされる（終了時に親のタスクごと drop される）と、そのバッファも解放され、カーネルが解放済みのメモリを読んで
+// 相手へ送り得た。Drop で取り消しを投げ、CQE が来るまで（上限 1 秒）その場で待つ。UDP の送信は取り消しも含めて
+// すぐ終わる。期限を過ぎたものは msghdr 等を生かして detach する（データ自体は守れないが、到達しない想定）。
+impl Drop for SendBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed || self.remaining == 0 {
+            return;
+        }
+        for slot in self.inner.slots.iter() {
+            if slot.submitted {
+                cancel_op(slot.user_data);
             }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            for slot in self.inner.slots.iter_mut() {
+                if slot.submitted && take_op_result(slot.user_data).is_some() {
+                    slot.submitted = false;
+                    slot.user_data = 0;
+                }
+            }
+            if !self.inner.slots.iter().any(|s| s.submitted)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            // 理由: 終了時・取り消し時だけ通る。取り消しの CQE は直ちに来る
+            let _ = with_ring(|ring| ring.submit_and_wait(1));
+            poll_completions();
+        }
+        for slot in self.inner.slots.iter_mut() {
+            slot.detach_keep_alive();
         }
     }
 }

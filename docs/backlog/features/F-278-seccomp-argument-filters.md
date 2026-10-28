@@ -1,6 +1,6 @@
 # F-278: seccomp の引数フィルタを `socket`・`ioctl`・`prctl`・`clone3`・`tgkill`・`setuid` 系にも広げ、許可リストの長さを静的に検査する
 
-**状態: 未着手（2026-10-27 起票。セキュリティレビュー SB-04・SB-05）**
+**状態: 完了（v0.10.0）**
 
 ## 今の状態
 
@@ -21,6 +21,10 @@
 
 - seccomp 有効の E2E（F-279）が全経路で通る。`tools/container_security/security/run_full_features_security.sh` の seccomp 禁止 syscall の発火試験に
   `socket(AF_PACKET)` などを足して拒否される。
+
+## 修正（v0.10.0）
+
+socket・ioctl・prctl・clone・clone3・tgkill の引数の検査、set*id の除去、syscall ごとのブロックで u8 のジャンプ幅の制約を解消。単体（引数の検査を子プロセスで確認・レイアウト）+ strict seccomp の E2E 576 件で確認。container_security の発火試験への追加は F-279 で扱う
 
 ## 関連
 

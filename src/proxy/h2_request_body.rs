@@ -93,7 +93,7 @@ pub(super) fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
 /// HTTP/2 応答ヘッダーへ WASM レスポンスフィルタを適用（B-30）
 #[cfg(all(feature = "http2", feature = "wasm"))]
 pub(super) async fn apply_h2_wasm_response_headers(
-    wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
     status: u16,
     header_store: Vec<(Bytes, Bytes)>,
 ) -> Vec<(Bytes, Bytes)> {
@@ -139,7 +139,7 @@ pub(super) async fn apply_h2_wasm_response_headers(
 /// 警告ログのみ出し、トレイラーはそのまま（あるいは `Continue` の変更のみ反映して）通す。
 #[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
 pub(super) async fn apply_h2_wasm_response_trailers(
-    wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
     trailers: Vec<(Bytes, Bytes)>,
 ) -> Vec<(Bytes, Bytes)> {
     if wasm_modules.is_empty() {
@@ -236,6 +236,8 @@ pub(super) fn build_h2_compressed_file_response(
             Bytes::copy_from_slice(v.as_bytes()),
         ));
     }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_bytes(&mut header_store, security);
     // F-94: HTTP/3 広告（Alt-Svc）
     if let Some(g) = get_alt_svc_guard() {
         header_store.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));

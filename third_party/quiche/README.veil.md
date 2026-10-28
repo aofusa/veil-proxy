@@ -108,6 +108,28 @@ rustls と同じ aws-lc-sys を使うので、以前は aws-lc-sys を接頭辞�
 quiche を上げるときは、この 5 つの宣言の塊を upstream の新しい宣言で置き換えて `veil_ffi! {` に戻す。宣言が増えて
 aws-lc-sys に同じ名前が無い・型が合わない場合はコンパイルエラーになるので、`sys` か `Conv` に足す。
 
+### 6. FFI の解放済みの領域の参照（GHSA-mh64-ph39-mrc9 / CVE-2026-11941、F-277、0.24.9-veil.3）
+
+upstream の 0.29.2 の修正を `src/ffi.rs`・`include/quiche.h` へ取り込んだ。`quiche_connection_id_iter_next` は反復子の要素を
+複製して返していた（関数を抜けると解放される）ので、反復子が持つ要素を指す。`quiche_conn_retired_scid_next` は取り出した ID を
+解放してからポインタを返していたので、upstream と同じ `quiche_conn_retired_scid_iter`（ID を反復子に移し、
+`quiche_connection_id_iter_free` で解放する）に替えた。C の FFI は `ffi` feature のときだけビルドされ、veil は使わない
+（影響は無かった）。`grep -n 'veil: GHSA' src/ffi.rs`。
+
+### 7. HTTP/3 のフレームの事前確保・QPACK の上限・PathEvent（GHSA-4fgf-9xrr-88gf / CVE-2026-12523、GHSA-4q5x-gp38-rfp4 / CVE-2026-12707、B-255・B-256、0.24.9-veil.4）
+
+upstream の 0.29.3 の 7 コミットを 0.24.9 の上へ順に cherry-pick し（`stream.rs` の衝突は `use crate::range_buf::BufFactory`
+（0.24.9 の名前）と、0.24.9 に無い補助関数 `critical_stream_closed` を足して解消）、その差分を当てた:
+`b732cbfa97`（h3: enforce frames size limit early）、`1e0e53767a`（h3: avoid allocating state buffer when skipping unknown frames）、
+`1b52c6b05d`（h3: add configurable max size for PRIORITY_UPDATE frames。`include/quiche.h` は当てていない）、
+`9be0e4fa18`（h3: implement a default for SETTINGS_MAX_FIELD_SECTION_SIZE。既定 32KiB。veil は `[http3] max_field_section_size`
+（既定 64KiB）で上書きする）、`8215ecdd74`（qpack: fix size calculation when decoding。`octets` 0.3.6 の
+`get_huffman_decoded_with_max_length` を使うので `Cargo.toml` の `octets` を 0.3.6 以上にした）、`f61d62d94e`（h3: incrementally
+allocate state buffer for large frames）、`439795b00f`（fix: bound PathEvent queue by deferring events until path insertion）。
+上流の試験もそのまま入る（`cargo test -p veil-proxy-quiche --features aws-lc-sys --lib`。`examples/` の証明書は取り込んでいないので、
+試すときは upstream の 0.24.9 の `quiche/examples/{cert.crt,cert.key,cert-big.crt,rootca.crt}` を置く。aws-lc で動かすと
+0-RTT などの 75 件が当てる前から失敗する。当てて増えた 19 件はすべて通る）。veil 側は `path_event_next()` を受信のたびに取り出す。
+
 ## 追従手順
 
 quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜4 を再適用する
@@ -128,8 +150,18 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.2`（`[lib] name = "quiche"` はそのまま。veil.2 は下の 5）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.4`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
 - ソースの差分は上の「差分」の節のまま。
+
+## 照合から外す勧告（F-277）
+
+`tools/container_security/security/run_cargo_audit.sh` は、上の「由来」の名前と版（crates.io の quiche 0.24.9）を RustSec と
+GitHub の勧告（GHSA）に突き合わせる。上の差分で直した勧告は版では一致し続けるので、次の行で外す（理由が無いものは書かない）。
+
+- advisory-repo: cloudflare/quiche（quiche の勧告は RustSec に無く、GitHub の全体の勧告にも載らないものがある。B-255・B-256）
+- advisory-ignore: GHSA-mh64-ph39-mrc9（差分 6 で修正済み。veil は `ffi` feature を使わない）
+- advisory-ignore: GHSA-4fgf-9xrr-88gf（差分 7 で修正済み）
+- advisory-ignore: GHSA-4q5x-gp38-rfp4（差分 7 で修正済み。veil は `path_event_next()` も取り出す）

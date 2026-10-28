@@ -71,7 +71,7 @@ pub(crate) const HEADER_BUF_CAPACITY: usize = 512; // HTTPヘッダー用
 /// ```rust,ignore
 /// let mut buf = SafeReadBuffer::new(BUF_SIZE);
 /// // io_uring読み込み操作（内部バッファを使用）
-/// let (result, mut returned_buf) = stream.read(buf.into_inner()).await;
+/// let (result, mut returned_buf) = stream.read_buf(buf).await;
 /// // 読み込み成功後、有効長を設定
 /// returned_buf.set_valid_len(n);
 /// // 安全なアクセス：有効データのみが返される
@@ -179,13 +179,14 @@ impl SafeReadBuffer {
         self.valid_len == 0
     }
 
-    /// 内部Vecを取り出す（プール返却用）
+    /// 内部Vecを取り出す（プール返却用。`buf_put` だけが使う）
     ///
-    /// # Warning
-    /// 返されたVecは未初期化データを含む可能性があります。
-    /// 必ず SafeReadBuffer::from_vec() でラップし直してください。
+    /// 返す Vec は `len` に未初期化・前の要求の残りのバイトを含むので、中身として読んではならない。
+    /// B-228: 以前は `pub fn into_inner` で、誤って `len()` で扱うと前の要求のデータを漏らし得た。
+    /// クレート外へは出さず、データとして取り出すときは `into_truncated` を使う。
     #[inline(always)]
-    pub fn into_inner(self) -> Vec<u8> {
+    #[must_use]
+    pub(crate) fn into_pool_vec(self) -> Vec<u8> {
         self.inner
     }
 
@@ -951,7 +952,7 @@ pub(crate) fn buf_get() -> SafeReadBuffer {
 /// 以前のデータが漏洩することはありません（valid_len = 0 で初期化）。
 #[inline(always)]
 pub(crate) fn buf_put(buf: SafeReadBuffer) {
-    buf_put_vec(buf.into_inner());
+    buf_put_vec(buf.into_pool_vec());
 }
 
 /// バッファ返却ヘルパー（`Vec<u8>` 版、書き込み後の返却用）
@@ -1786,5 +1787,23 @@ mod tests {
         assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 1);
         let _ = accum_buf_get();
         assert_eq!(ACCUM_BUF_POOL.with(|p| p.borrow().len()), 0);
+    }
+}
+
+// B-228: データとして取り出す Vec は有効長で切ってある（未初期化・前の要求の残りを含めない）。
+#[cfg(test)]
+mod safe_read_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn into_truncated_returns_only_valid_bytes() {
+        let mut b = SafeReadBuffer::new(64);
+        b.inner[..3].copy_from_slice(b"abc");
+        b.set_valid_len(3);
+        assert_eq!(b.as_valid_slice(), b"abc");
+        assert_eq!(b.into_truncated(), b"abc");
+        let mut b = SafeReadBuffer::new(64);
+        b.set_valid_len(1000);
+        assert_eq!(b.valid_len(), 64);
     }
 }

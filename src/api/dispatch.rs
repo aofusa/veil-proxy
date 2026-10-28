@@ -29,7 +29,10 @@ pub(crate) fn build_request(
             .parse::<IpAddr>()
             .unwrap_or(IpAddr::from([0, 0, 0, 0])),
         version,
+        // HTTP/3 は常に TLS。HTTP/1.1・HTTP/2 は呼び出し側が接続を見て立てる（B-204）
+        tls: version == HttpVersion::Http3,
         body_stream: None,
+        extensions: Default::default(),
     }
 }
 
@@ -39,12 +42,29 @@ pub(crate) fn build_request(
 pub(crate) struct CallCache {
     #[cfg(feature = "tokio-compat")]
     waker: crate::tokio::waker::SafeWakerCache,
+    // F-261: HTTP/1.1 の経路が要求ごとに立てる（`Connection: upgrade`・`Upgrade` があり、HTTP/1.1 で本文が無い）。
+    // HTTP/2・HTTP/3 は既定の false のまま（アップグレードは 400）。
+    pub(crate) upgrade_allowed: bool,
+    // F-261: 101 を書いた後に接続を渡す関数（HTTP/1.1 の接続のループが受け取る）。
+    pub(crate) pending_upgrade: Option<super::upgrade::UpgradeFn>,
+}
+
+impl CallCache {
+    #[cfg(feature = "tokio-compat")]
+    pub(crate) fn waker_cache(&mut self) -> &mut crate::tokio::waker::SafeWakerCache {
+        &mut self.waker
+    }
 }
 
 /// Calls the handler. A body over the limit gives 413 and a handler panic gives 500; for HEAD the body is dropped
 /// and `content-length` carries the original length.
-pub(crate) async fn call(entry: &HandlerEntry, req: Request) -> Response {
-    call_with(entry, req, &mut CallCache::default()).await
+/// `comp` is the route's compression (`Backend::Handler`; `None` when off).
+pub(crate) async fn call(
+    entry: &HandlerEntry,
+    req: Request,
+    comp: Option<&crate::config::CompressionConfig>,
+) -> Response {
+    call_with(entry, req, &mut CallCache::default(), comp).await
 }
 
 /// Like [`call`], but uses the per-connection [`CallCache`] (reduces per-request allocation on HTTP/1.1 keep-alive).
@@ -52,11 +72,17 @@ pub(crate) async fn call_with(
     entry: &HandlerEntry,
     req: Request,
     cache: &mut CallCache,
+    comp: Option<&crate::config::CompressionConfig>,
 ) -> Response {
     if req.body.len() > super::app::max_body_size() {
         return Response::error(413, "Payload Too Large");
     }
     let head = &req.method[..] == b"HEAD";
+    // F-270: 圧縮するルートだけ、要求が handler へ移る前に Accept-Encoding を取っておく（参照カウントのみ）
+    let accept = match comp {
+        Some(_) => super::compress::accept_encoding(&req.headers),
+        None => None,
+    };
     // tokio 互換レイヤー（F-198）: ハンドラの中で使う同期プリミティブ・チャネルが別スレッドから
     // 起こしても、所有スレッドで再開するように Waker を包む
     #[cfg(feature = "tokio-compat")]
@@ -73,6 +99,28 @@ pub(crate) async fn call_with(
             Response::error(500, "Internal Server Error")
         }
     };
+    // F-261: アップグレードの応答のときだけ検査する（通常の応答は `Option` の確認 1 回）
+    if resp.upgrade.is_some() {
+        super::upgrade::check_response(&mut resp, cache.upgrade_allowed && !head);
+    }
+    // F-267: ストリーミング応答の after_send は本文のストリームと一緒に持ち回す（ストリームを送り終えて捨てたときに呼ぶ）
+    if resp.stream.is_some() && resp.after_send.is_some() {
+        let a = resp.after_send.take();
+        let s = resp.stream.take().expect("checked");
+        resp.stream = Some(Box::pin(AfterSendStream {
+            inner: s,
+            _after: a,
+        }));
+    }
+    let mut head_encoded = false;
+    if let (Some(c), Some(a)) = (comp, accept.as_deref()) {
+        if head {
+            // HEAD は本文を圧縮せず、GET と同じヘッダだけ付ける（圧縮した長さは分からないので content-length も付けない）
+            head_encoded = super::compress::apply_head(&mut resp, Some(a), c);
+        } else {
+            super::compress::apply(&mut resp, Some(a), c);
+        }
+    }
     if head {
         // HEAD はストリームを送らない（drop でハンドラ側の生成を止める）。長さは不明なので付けない。
         if resp.stream.take().is_some() {
@@ -85,10 +133,11 @@ pub(crate) async fn call_with(
         }
         let len = resp.body.len();
         resp.body = Bytes::new();
-        if !resp
-            .headers
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
+        if !head_encoded
+            && !resp
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
         {
             let mut buf = itoa::Buffer::new();
             resp.headers.push((
@@ -98,6 +147,23 @@ pub(crate) async fn call_with(
         }
     }
     resp
+}
+
+// F-267
+/// A body stream that runs the response's after-send callbacks when it is dropped.
+struct AfterSendStream {
+    inner: super::stream::BodyStream,
+    _after: Option<Box<super::response::AfterSend>>,
+}
+
+impl futures::Stream for AfterSendStream {
+    type Item = super::stream::BodyChunk;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        futures::Stream::poll_next(self.inner.as_mut(), cx)
+    }
 }
 
 /// Lowercases header names for HTTP/2 and HTTP/3 and removes connection-specific headers (RFC 9113 section 8.2.2).
@@ -248,7 +314,7 @@ mod tests {
             "127.0.0.1",
             HttpVersion::Http11,
         );
-        let resp = futures::executor::block_on(call(&entry, req));
+        let resp = futures::executor::block_on(call(&entry, req, None));
         assert!(!resp.is_streaming());
         let h = String::from_utf8(http1_head(&resp, true)).unwrap();
         assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{}", h);

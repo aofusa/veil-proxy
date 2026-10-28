@@ -20,8 +20,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data(&caller);
-            let start = msg_ptr as usize;
-            let end = start + msg_size as usize;
+            let start = msg_ptr as u32 as usize;
+            let end = start + msg_size as u32 as usize;
 
             if end > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -71,7 +71,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            let ptr = return_time_ptr as usize;
+            let ptr = return_time_ptr as u32 as usize;
 
             if ptr + 8 > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;

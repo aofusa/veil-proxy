@@ -938,6 +938,8 @@ pub enum RbacPrincipal {
     DirectRemoteIp(Cidr),
     RemoteIp(Cidr),
     Header(HeaderMatch),
+    /// 要求のパス（Envoy の principal の `url_path`。permission の `Path` と同じ照合）
+    Path(StringMatcher),
     /// JWT 等のメタデータ（`envoy.filters.http.jwt_authn` の `payload.iss` 等）
     Metadata {
         filter: String,

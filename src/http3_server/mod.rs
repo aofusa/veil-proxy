@@ -26,7 +26,7 @@
 use crate::cache;
 #[cfg(target_os = "linux")]
 use crate::runtime::handle::AsRawFd;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 // CString / FromRawFd / Seek / Write は memfd 経由の証明書リロード（Linux 専用）でのみ
@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use crate::h3_fields::{h3_check_field_section, H3FieldSection};
 use crate::udp::QuicUdpSocket;
 // F-122: RNG は OpenBSD では ring、他は aws-lc-rs（crate::tls_provider で選択）。
 use crate::tls_provider::{hmac, SecureRandom, SystemRandom};
@@ -75,6 +76,7 @@ use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
 
 // F-233: 機能ごとのファイル（子モジュールは `use super::*;` で親の名前を見る）
+mod admission;
 mod request_task;
 use self::request_task::*;
 mod streaming;
@@ -95,15 +97,6 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
         .sum()
 }
 
-/// HTTP/3 のフィールドセクション（HEADERS フレーム）の検査結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum H3FieldSection {
-    /// 疑似ヘッダを持ち、リクエストの必須要件を満たす（新規リクエスト）。
-    Request,
-    /// 疑似ヘッダを 1 つも持たない（既存ストリームなら trailers、新規ストリームなら malformed）。
-    NoPseudo,
-}
-
 /// HTTP/3 の H3_MESSAGE_ERROR（RFC 9114 §8.1）。
 const H3_MESSAGE_ERROR: u64 = 0x10e;
 /// HTTP/3 の H3_NO_ERROR（RFC 9114 §8.1。graceful shutdown の CONNECTION_CLOSE。F-187）。
@@ -112,106 +105,6 @@ const H3_NO_ERROR_CODE: u64 = 0x100;
 const H3_REQUEST_REJECTED: u64 = 0x10b;
 /// HTTP/3 の H3_EXCESSIVE_LOAD（RFC 9114 §8.1）。バッファ経路の要求本文が上限を超えたストリームを断る。
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
-
-/// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
-///
-/// `Err` は malformed（呼び出し側が H3_MESSAGE_ERROR で扱う）。検査するのは
-/// 疑似ヘッダの重複・未知/禁止（`:status`、拡張 CONNECT を広告していないので `:protocol` も）・
-/// 通常フィールドの後ろの疑似ヘッダ・大文字のフィールド名・接続固有フィールド・
-/// リクエストの必須疑似ヘッダ（CONNECT とそれ以外で異なる）。
-///
-/// quiche の h3 層はこれらを検査しないため、無ければ `:method` 欠落を GET と見なす等で
-/// malformed なリクエストに 200 を返していた（h3spec で検出）。
-///
-/// ホットパス（リクエストごと）: 確保なし・フィールド列を 1 回走査するだけ。
-fn h3_check_field_section<'a, I>(fields: I) -> Result<H3FieldSection, &'static str>
-where
-    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
-{
-    const METHOD: u8 = 1;
-    const SCHEME: u8 = 2;
-    const AUTHORITY: u8 = 4;
-    const PATH: u8 = 8;
-    let mut seen: u8 = 0;
-    let mut regular_seen = false;
-    let mut is_connect = false;
-    let mut host_seen = false;
-    let mut scheme_needs_authority = false;
-    for (name, value) in fields {
-        // F-236（F2）: 値に CR・LF・NUL・前後の空白があれば malformed（RFC 9114 §4.2）
-        if !crate::http_utils::is_valid_h2_field_value(value) {
-            return Err("invalid field value");
-        }
-        if let Some(pseudo) = name.strip_prefix(b":") {
-            if regular_seen {
-                return Err("pseudo-header after regular field");
-            }
-            let bit = match pseudo {
-                b"method" => METHOD,
-                b"scheme" => SCHEME,
-                b"authority" => AUTHORITY,
-                b"path" => PATH,
-                _ => return Err("unknown or prohibited pseudo-header"),
-            };
-            if seen & bit != 0 {
-                return Err("duplicated pseudo-header");
-            }
-            seen |= bit;
-            if bit == METHOD {
-                if !crate::http_utils::is_valid_method(value) {
-                    return Err("invalid :method");
-                }
-                is_connect = value == b"CONNECT";
-            } else if bit == SCHEME {
-                scheme_needs_authority = value == b"https" || value == b"http";
-            } else if bit == PATH && value.is_empty() {
-                return Err("empty :path");
-            } else if bit == PATH
-                && (!crate::http_utils::is_valid_request_target(value)
-                    || (value[0] != b'/' && value != b"*"))
-            {
-                // origin 形式か `*` だけ（RFC 9114 §4.3.1。絶対形式はルートの照合を素通りする）
-                return Err("invalid :path");
-            }
-        } else {
-            regular_seen = true;
-            if name.iter().any(u8::is_ascii_uppercase) {
-                return Err("uppercase field name");
-            }
-            if !crate::http_utils::is_valid_header_name(name) {
-                return Err("invalid field name");
-            }
-            match name {
-                b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
-                | b"upgrade" => return Err("connection-specific field"),
-                b"te" if value != b"trailers" => return Err("te other than trailers"),
-                b"host" => host_seen = true,
-                _ => {}
-            }
-        }
-    }
-    if seen == 0 {
-        return Ok(H3FieldSection::NoPseudo);
-    }
-    if seen & METHOD == 0 {
-        return Err("missing :method");
-    }
-    if is_connect {
-        // §4.4: CONNECT は :scheme と :path を省き、:authority を必須とする。
-        if seen & (SCHEME | PATH) != 0 {
-            return Err("CONNECT with :scheme or :path");
-        }
-        if seen & AUTHORITY == 0 {
-            return Err("CONNECT without :authority");
-        }
-    } else if seen & (SCHEME | PATH) != (SCHEME | PATH) {
-        return Err("missing :scheme or :path");
-    } else if scheme_needs_authority && seen & AUTHORITY == 0 && !host_seen {
-        // §4.3.1: http/https は authority 成分が必須 → :authority か Host のどちらかが要る。
-        return Err("missing :authority and host");
-    }
-    Ok(H3FieldSection::Request)
-}
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 ///
@@ -622,6 +515,27 @@ pub struct Http3ServerConfig {
     /// reactor バックエンド専用: 1 イテレーションあたりに掻き出す UDP データグラム数の上限
     /// （`[http3] recv_drain_max`、1..=`H3_RECV_DRAIN_MAX_LIMIT`）。デフォルト: 1024（F-152、v0.8.0 で 64 から変更）
     pub recv_drain_max: usize,
+    /// B-222: ワーカーごとの接続数の上限（0 は上限なし）。デフォルト: 10000
+    pub max_connections: usize,
+    /// B-222: ハンドシェイク中の接続がこの数に達したら Retry でアドレスを検証する（0 は常に）。デフォルト: 1000
+    pub retry_threshold: usize,
+    /// B-222: ハンドシェイクの期限（ミリ秒）。デフォルト: 10000
+    pub handshake_timeout: u64,
+    /// B-255: `SETTINGS_MAX_FIELD_SECTION_SIZE`（要求のヘッダの大きさの上限）。デフォルト: 65536
+    pub max_field_section_size: u64,
+}
+
+/// B-255: `[http3] max_field_section_size` の既定（`[http2] max_header_list_size` と同じ）
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 65_536;
+
+thread_local! {
+    /// ワーカーの `[http3] max_field_section_size`（接続ごとの `h3::Config` に入れる）
+    static H3_MAX_FIELD_SECTION_SIZE: Cell<u64> = const { Cell::new(DEFAULT_MAX_FIELD_SECTION_SIZE) };
+}
+
+/// ワーカーの起動時に `[http3] max_field_section_size` を入れる（B-255）。
+pub(crate) fn configure_max_field_section_size(v: u64) {
+    H3_MAX_FIELD_SECTION_SIZE.with(|c| c.set(v));
 }
 
 impl Default for Http3ServerConfig {
@@ -647,6 +561,10 @@ impl Default for Http3ServerConfig {
             hystart: true,
             mmsg_batch_size: crate::udp::socket::MMSG_BATCH_DEFAULT,
             recv_drain_max: H3_RECV_DRAIN_MAX_DEFAULT,
+            max_connections: admission::DEFAULT_MAX_CONNECTIONS,
+            retry_threshold: admission::DEFAULT_RETRY_THRESHOLD,
+            handshake_timeout: admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 }
@@ -690,6 +608,9 @@ struct ProxyStream {
     max_request_body: u64,
     /// ボディ上限超過（413 + ストリームリセット）。
     req_too_large: bool,
+    /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ストリーミング経路だけ。バッファ経路は
+    /// `H3BufferedTask` が head を送るときに足す）
+    cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
 }
 
 impl ProxyStream {
@@ -715,6 +636,7 @@ impl ProxyStream {
             req_bytes_total: 0,
             max_request_body,
             req_too_large: false,
+            cors: None,
         }
     }
 
@@ -736,6 +658,7 @@ impl ProxyStream {
             req_bytes_total: 0,
             max_request_body: 0,
             req_too_large: false,
+            cors: None,
         }
     }
 }
@@ -831,7 +754,7 @@ struct SendFileRequest<'a> {
     /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
     static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")]
-    wasm_modules: Option<&'a Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    wasm_modules: Option<&'a crate::wasm_plugin_config::WasmModules>,
 }
 
 /// QUIC ストリーム ID をキーにするマップ用の軽量ハッシャ（乗算ハッシュ 1 回）。
@@ -965,6 +888,8 @@ struct Http3Handler {
     goaway_id: Option<u64>,
     /// F-187: graceful shutdown で CONNECTION_CLOSE を出した。
     shutdown_closed: bool,
+    /// B-222: ハンドシェイク中（確立前）の印。確立で外し、期限を過ぎたら接続を捨てる。
+    handshake: Option<admission::HandshakeSlot>,
 }
 
 impl Http3Handler {
@@ -999,6 +924,7 @@ impl Http3Handler {
             next_req_stream: 0,
             goaway_id: None,
             shutdown_closed: false,
+            handshake: None,
         }
     }
 
@@ -1050,12 +976,21 @@ impl Http3Handler {
     }
 
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
+    ///
+    /// 不変条件（F-280）: `enable_early_data()` で 0-RTT のデータを受け取るが、h3 の層はハンドシェイクの完了
+    /// （`is_established()`）の後にしか作らないので、0-RTT で届いた要求はクライアントの Finished を検証した後に
+    /// 初めて読む。再送された 0-RTT はハンドシェイクを完了できず処理されない。この検査を外したり、
+    /// h3 の層の外でストリームを読んだりしない（`test_f280_zero_rtt_request_waits_for_handshake`）。
     fn init_h3(&mut self) -> io::Result<()> {
         if self.h3_conn.is_none() && self.conn.is_established() && !self.conn.is_closed() {
-            let h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
+            let mut h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
+            // B-255: 宣言だけの大きな HEADERS で確保させない上限を広告する
+            h3_config.set_max_field_section_size(H3_MAX_FIELD_SECTION_SIZE.with(Cell::get));
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             self.h3_conn = Some(h3);
+            // B-222: ハンドシェイク中の数から外す
+            self.handshake = None;
             debug!(
                 "[HTTP/3] HTTP/3 connection established from {}",
                 self.peer_addr
@@ -1165,7 +1100,8 @@ impl Http3Handler {
                                 // RFC 9114 §4.1.2: malformed はストリームエラー
                                 // H3_MESSAGE_ERROR。§8 によりコネクションエラーとして扱ってよく、
                                 // 不正なクライアントとの接続を残す理由が無いため接続ごと閉じる。
-                                warn!(
+                                // B-235: 相手が要求ごとに起こせるので debug!
+                                debug!(
                                     "[HTTP/3] malformed request on stream {} from {}: {}",
                                     stream_id, self.peer_addr, reason
                                 );
@@ -1234,7 +1170,8 @@ impl Http3Handler {
                     Ok((_, h3::Event::PriorityUpdate)) => did_work = true,
                     Err(h3::Error::Done) => break,
                     Err(e) => {
-                        warn!("[HTTP/3] h3 poll error: {}", e);
+                        // B-235: 相手のフレームで起きるので debug!
+                        debug!("[HTTP/3] h3 poll error: {}", e);
                         break;
                     }
                 }
@@ -1254,6 +1191,7 @@ impl Http3Handler {
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
                     let mut ps =
                         ProxyStream::new(resp_rx, req_tx, more_frames, params.max_request_body);
+                    ps.cors = params.cors.clone();
                     // 初回バッチで届いていたボディを取り込む。
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
@@ -1270,6 +1208,7 @@ impl Http3Handler {
                     let (resp_tx, resp_rx) =
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
                     let mut ps = ProxyStream::new(resp_rx, req_tx, more_frames, h.max_request_body);
+                    ps.cors = h.cors.clone();
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
                             ps.req_bytes_total += body.len() as u64;
@@ -1350,6 +1289,7 @@ impl Http3Handler {
                     client_ip: self.client_ip,
                     resp_tx: Some(resp_tx),
                     notify: self.notify.clone(),
+                    cors: None,
                 },
                 br.headers,
                 body,
@@ -1511,18 +1451,13 @@ impl Http3Handler {
         // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
         // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
         #[cfg(feature = "handler")]
-        if let Backend::Handler(entry, _, _) = &backend {
+        if let Backend::Handler(entry, _, _, comp) = &backend {
             if !entry.streaming_request || !more_frames {
                 return Decision::Buffer;
             }
             let security = backend.security();
-            let check = check_security(
-                security,
-                self.client_ip.as_str(),
-                method,
-                content_length,
-                false,
-            );
+            // F-266: ストリーミング受信のハンドラは本文の大きさを見ない（HTTP/2 と同じ）
+            let check = check_security(security, self.client_ip.as_str(), method, 0, false);
             if check != SecurityCheckResult::Allowed {
                 let status = check.status_code();
                 let msg = check.message();
@@ -1566,8 +1501,12 @@ impl Http3Handler {
             );
             return Decision::StreamHandler(Box::new(H3HandlerStream {
                 entry: entry.clone(),
+                comp: comp.clone(),
                 req,
-                max_request_body: crate::api::app::max_body_size() as u64,
+                // F-266: ストリーミング受信のハンドラは本文の累計に上限を掛けない（HTTP/2・HTTP/1.1 と同じ。
+                // gRPC はメッセージごと、multipart はパートごとに上限を見る）
+                max_request_body: 0,
+                cors: security.cors_actual.clone(),
                 log: H3AccessLog {
                     method: Bytes::copy_from_slice(method),
                     authority: Bytes::copy_from_slice(authority),
@@ -1748,6 +1687,7 @@ impl Http3Handler {
             retry_idempotent: crate::http_utils::is_idempotent_method(method),
             #[cfg(feature = "http2")]
             h2,
+            cors: security.cors_actual.clone(),
         })
     }
 
@@ -2553,6 +2493,265 @@ mod tests {
         );
     }
 
+    /// B-222: ハンドシェイク中の数が閾値に達したら（ここでは 0 = 常に）トークンの無い Initial には Retry を返し、
+    /// Retry のトークンを持って来た Initial で接続を作ってハンドシェイクが終わる。接続数の上限を超えた Initial は捨てる。
+    #[test]
+    fn test_b222_retry_then_handshake_and_connection_limit() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut feed = |conns: &mut ConnMapInner, pkt: &mut [u8], from: SocketAddr| {
+            process_datagram_segments(
+                conns,
+                pkt,
+                from,
+                None,
+                &cid_key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+        let new_client = |id: u8, addr: SocketAddr| {
+            let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            cfg.set_application_protos(h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            cfg.verify_peer(false);
+            quiche::connect(
+                Some("localhost"),
+                &ConnectionId::from_ref(&[id; 16]),
+                addr,
+                server_addr,
+                &mut cfg,
+            )
+            .unwrap()
+        };
+
+        admission::configure(1, 0, 10_000);
+        let client_addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let mut client = new_client(1, client_addr);
+        let mut buf = vec![0u8; 1500];
+        let (len, _) = client.send(&mut buf).unwrap();
+        feed(&mut conns, &mut buf[..len], client_addr);
+        assert!(
+            conns.is_empty(),
+            "an Initial without a token must get a Retry"
+        );
+        let mut retries = Vec::new();
+        admission::drain_retries(|p| retries.push((p.buf[..p.len].to_vec(), p.to)));
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].1, client_addr);
+        let recv_info = quiche::RecvInfo {
+            from: server_addr,
+            to: client_addr,
+        };
+        client.recv(&mut retries[0].0, recv_info).unwrap();
+
+        // トークン付きの Initial で接続を作り、ハンドシェイクを最後まで進める
+        for _ in 0..10 {
+            while let Ok((len, _)) = client.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], client_addr);
+            }
+            assert_eq!(
+                conns.len(),
+                1,
+                "the retried Initial must create the connection"
+            );
+            let h = conns.values_mut().next().unwrap();
+            while let Ok((len, _)) = h.conn.send(&mut buf) {
+                let _ = client.recv(&mut buf[..len], recv_info);
+            }
+            if client.is_established() && h.conn.is_established() {
+                break;
+            }
+        }
+        assert!(
+            client.is_established(),
+            "handshake must complete after Retry"
+        );
+
+        // 偽のトークン（別の送信元のもの）は捨てる。接続数の上限（1）を超える Initial も捨てる
+        admission::configure(2, 0, 10_000);
+        let other: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let mut c2 = new_client(2, other);
+        let (len, _) = c2.send(&mut buf).unwrap();
+        feed(&mut conns, &mut buf[..len], other);
+        let mut retried = Vec::new();
+        admission::drain_retries(|p| retried.push(p.buf[..p.len].to_vec()));
+        assert_eq!(retried.len(), 1);
+        c2.recv(
+            &mut retried[0],
+            quiche::RecvInfo {
+                from: server_addr,
+                to: other,
+            },
+        )
+        .unwrap();
+        let (len, _) = c2.send(&mut buf).unwrap();
+        // 同じパケットを別の送信元から届ける（トークンは送信元に結び付く）
+        let mut spoofed = buf[..len].to_vec();
+        feed(&mut conns, &mut spoofed, "127.0.0.1:40003".parse().unwrap());
+        assert_eq!(
+            conns.len(),
+            1,
+            "a token from another address must be rejected"
+        );
+        admission::configure(1, 0, 10_000);
+        feed(&mut conns, &mut buf[..len], other);
+        assert_eq!(conns.len(), 1, "max_connections must cap new connections");
+
+        admission::configure(
+            admission::DEFAULT_MAX_CONNECTIONS,
+            admission::DEFAULT_RETRY_THRESHOLD,
+            admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
+        );
+    }
+
+    /// F-280: 0-RTT のデータを受け取っても、ハンドシェイクが終わるまで HTTP/3 の層を作らない（要求を処理しない）。
+    /// 0-RTT は再送され得るので、`init_h3` の `is_established()` の検査が再送攻撃を防ぐ不変条件になっている。
+    #[test]
+    fn test_f280_zero_rtt_request_waits_for_handshake() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        server_cfg.set_initial_max_stream_data_bidi_remote(1 << 16);
+        server_cfg.set_initial_max_stream_data_uni(1 << 16);
+        server_cfg.set_initial_max_streams_bidi(16);
+        server_cfg.set_initial_max_streams_uni(16);
+        server_cfg.enable_early_data();
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut feed = |conns: &mut ConnMapInner, pkt: &mut [u8], from: SocketAddr| {
+            process_datagram_segments(
+                conns,
+                pkt,
+                from,
+                None,
+                &cid_key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        client_cfg.set_initial_max_data(1 << 20);
+        client_cfg.set_initial_max_stream_data_bidi_local(1 << 16);
+        client_cfg.set_initial_max_stream_data_uni(1 << 16);
+        client_cfg.set_initial_max_streams_bidi(16);
+        client_cfg.set_initial_max_streams_uni(16);
+        client_cfg.enable_early_data();
+        let mut buf = vec![0u8; 1500];
+
+        // 1 本目: ハンドシェイクを終えてセッション（チケット）を受け取る
+        let addr1: SocketAddr = "127.0.0.1:40011".parse().unwrap();
+        let mut c1 = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[1; 16]),
+            addr1,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let info1 = quiche::RecvInfo {
+            from: server_addr,
+            to: addr1,
+        };
+        for _ in 0..10 {
+            while let Ok((len, _)) = c1.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], addr1);
+            }
+            for h in conns.values_mut() {
+                while let Ok((len, _)) = h.conn.send(&mut buf) {
+                    let _ = c1.recv(&mut buf[..len], info1);
+                }
+            }
+        }
+        assert!(c1.is_established());
+        let session = c1.session().expect("session ticket").to_vec();
+
+        // 2 本目: 0-RTT で要求を送る。サーバは 0-RTT を受け入れるが、HTTP/3 の層はまだ作らない
+        let addr2: SocketAddr = "127.0.0.1:40012".parse().unwrap();
+        let mut c2 = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[2; 16]),
+            addr2,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        c2.set_session(&session).expect("set session");
+        let (len, _) = c2.send(&mut buf).unwrap();
+        let mut initial = buf[..len].to_vec();
+        assert!(c2.is_in_early_data(), "client must be sending 0-RTT");
+        let h3_cfg = h3::Config::new().unwrap();
+        let mut ch3 = h3::Connection::with_transport(&mut c2, &h3_cfg).unwrap();
+        let req = [
+            h3::Header::new(b":method", b"POST"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":path", b"/"),
+        ];
+        ch3.send_request(&mut c2, &req, true).unwrap();
+        let before = conns.len();
+        feed(&mut conns, &mut initial, addr2);
+        while let Ok((len, _)) = c2.send(&mut buf) {
+            feed(&mut conns, &mut buf[..len], addr2);
+        }
+        assert_eq!(conns.len(), before + 1);
+        let h = conns
+            .values_mut()
+            .find(|h| h.peer_addr == addr2)
+            .expect("second connection");
+        assert!(h.conn.is_in_early_data(), "server must have accepted 0-RTT");
+        assert!(!h.conn.is_established());
+        assert!(
+            h.h3_conn.is_none(),
+            "the HTTP/3 layer must not exist before the handshake completes"
+        );
+        let _ = h.init_h3();
+        assert!(h.h3_conn.is_none());
+    }
+
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり
     /// データグラム drain 上限）の既定値とクランプ範囲。
     ///
@@ -2909,7 +3108,7 @@ mod tests {
     #[cfg(feature = "wasm")]
     #[test]
     fn test_b38_apply_h3_wasm_empty_modules_passthrough() {
-        let modules = std::sync::Arc::new(Vec::new());
+        let modules = crate::wasm_plugin_config::WasmModules::default();
         let headers = vec![(b"x-a".to_vec(), b"1".to_vec())];
         let out = futures::executor::block_on(apply_h3_wasm_response_headers(
             &modules,

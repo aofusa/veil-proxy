@@ -36,6 +36,10 @@ server.add_insecure_port("127.0.0.1:50051")
 server.start(); server.wait_for_termination()     # = veil.run(listen_cleartext=...)
 ```
 
+With your own `app = veil.App()`, pass it to `veil.grpc.Server(app)` (and `veil.grpc.add_health(app)`,
+`@veil.grpc.unary_unary(..., app=app)`) and run that app. Without it the methods are registered on the
+module-level app, and `app.run()` warns (`RuntimeWarning`) that they are not served.
+
 The `context` has the main parts of grpcio's `ServicerContext` (`abort`, `abort_with_status`, `set_code`,
 `set_details`, `invocation_metadata`, `send_initial_metadata`, `set_trailing_metadata`, `time_remaining`,
 `is_active`, `peer`). Status codes may be `grpc.StatusCode` or {py:class}`veil.grpc.StatusCode`.
@@ -43,5 +47,15 @@ The `context` has the main parts of grpcio's `ServicerContext` (`abort`, `abort_
 For TLS (HTTP/2 and HTTP/3) use `app.run(listen=..., tls_cert=..., tls_key=...)`; there is no
 `add_secure_port`. Compression, deadlines, gRPC-Web and the `[api] grpc_*` settings are the same as for Rust
 handlers.
+
+## OpenAPI
+
+gRPC methods are listed in `/openapi.json` and `/docs` as `POST /<package>.<Service>/<Method>` with an `x-grpc`
+object (kind, service, message types); see the library guide's "gRPC in OpenAPI" for the format. The message types
+come from the generated `_pb2` modules: the plain layer reads them from `request_deserializer` (a generated
+`FromString`), and the grpcio layer from the servicer's registration. Add them yourself with
+`veil.grpc.add_descriptor(demo_pb2.DESCRIPTOR)` (a `FileDescriptor` or the bytes of a `FileDescriptorSet`) when the
+deserializer is not a generated message, for example with betterproto. `run(overrides={"api.openapi_grpc": False})` leaves gRPC out of
+the document.
 
 Example: `examples/api/python-grpc/` in the repository (`VEIL_GRPC_MODE=grpcio|plain`).

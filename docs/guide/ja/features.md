@@ -29,7 +29,7 @@
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
 - **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
 - **SNI設定**: HTTPSバックエンドへのIP直打ち時にSNI名を指定可能（仮想ホスト対応）
-- **ルート単位のトラフィック制御（F-219）**: 固定応答（`type = "Respond"`）、上流への重み付き分割（カナリア）、フォルト注入（中断）、CORS のプリフライトへの応答（`[route.traffic]`。[ルーティング](routing.md) 参照）
+- **ルート単位のトラフィック制御（F-219）**: 固定応答（`type = "Respond"`）、上流への重み付き分割（カナリア）、フォルト注入（中断）、CORS（プリフライトと実際の応答。`[route.traffic]`。[ルーティング](routing.md) 参照）
 - **上流の mTLS（F-217）**: 上流ごとのクライアント証明書・信頼アンカー・期待する SAN（SPIFFE ID 等。[TLS](tls.md) 参照）
 
 ### HTTP処理
@@ -81,7 +81,7 @@
 - **クライアント証明書（F-217・F-220）**: `[tls] client_auth`・`client_ca`、一覧の ID だけを受ける `client_allowed_sans`（[TLS](tls.md) 参照）
 - **JWT（F-220）**: `[route.jwt]` でトークン（RS/PS/ES、`iss`・`aud`・`exp`）と claim の条件を検証し、通らなければ 401 / 403（`jwt` feature が必要で `full*` に含まれる。[セキュリティ](security.md) 参照）
 - **権限降格**: root起動後の非特権ユーザーへの降格
-- **seccompフィルタ**: BPFベースのシステムコール制限 + mmap/mprotect の PROT_EXEC 引数レベル検証（オプション）
+- **seccompフィルタ**: BPFベースのシステムコール制限 + 引数の検査（mmap/mprotect の PROT_EXEC・socket のファミリ・ioctl・prctl・clone の名前空間）（オプション）
 - **io_uringオペコード制限**: リング作成時に `IORING_REGISTER_RESTRICTIONS` を適用し、必要なオペコード（ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD）のみ許可
 - **Landlockサンドボックス**: ファイルシステムアクセス制限（Linux 5.13+）
 - **systemdサンドボックス**: 名前空間隔離・システムコール制限対応

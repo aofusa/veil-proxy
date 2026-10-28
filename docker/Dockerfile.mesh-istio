@@ -9,7 +9,7 @@
 #
 # 注入: Pod の注釈 `sidecar.istio.io/proxyImage: veil.local/istio-proxy:1.31.1`（`/` を含む名前でないと注入テンプレートが無視する）（または istioctl install の
 # `--set values.global.proxy.image=...`）。
-ARG ISTIO_PROXY_IMAGE=docker.io/istio/proxyv2:1.31.1
+ARG ISTIO_PROXY_IMAGE=docker.io/istio/proxyv2:1.31.1@sha256:d86cba0dd1eb15c00b6901c69ce5ae3d2d5f8427a47751098cf8c3ab2a4a62e9
 ARG VEIL_IMAGE=veil:musl-mesh
 FROM ${VEIL_IMAGE} AS veil
 FROM ${ISTIO_PROXY_IMAGE}

@@ -269,13 +269,25 @@ impl OpTable {
         }
     }
 
-    /// CQE を処理して対応する Waker を wake する
+    /// CQE を処理して対応する Waker を wake する（detach 済みの op のガードはその場で走らせる。fuzz のモデル・試験用）
+    #[cfg(test)]
     fn on_cqe(&mut self, cqe: &IoUringCqe) -> bool {
+        let (handled, guard) = self.on_cqe_take_guard(cqe);
+        if let Some((guard, res)) = guard {
+            guard.run(res);
+        }
+        handled
+    }
+
+    /// CQE を処理して対応する Waker を wake する。detach 済みの op が終わったら、そのガードを返す
+    /// （B-224: 呼び出し側は RING・OP_TABLE の借用を手放してから走らせる。ガードの閉包は with_ring・alloc_op を
+    /// 呼び得るので、consume_cqes の中で走らせると RefCell の二重借用で panic していた）。
+    fn on_cqe_take_guard(&mut self, cqe: &IoUringCqe) -> (bool, Option<(OpGuard, i32)>) {
         use crate::runtime::ring::IORING_CQE_F_MORE;
 
         let Some(i) = self.resolve(cqe.user_data) else {
             // 未知/stale な user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
-            return false;
+            return (false, None);
         };
         match &mut self.slots[i].state {
             OpSlotState::Active { result, waker } => {
@@ -283,7 +295,7 @@ impl OpTable {
                 if let Some(w) = waker.take() {
                     w.wake();
                 }
-                true
+                (true, None)
             }
             OpSlotState::MultishotActive { ms, waker } => {
                 // Multishot: キューへ積み、F_MORE 無し or エラーで終端。スロットは take まで残す。
@@ -294,35 +306,51 @@ impl OpTable {
                 if let Some(w) = waker.take() {
                     w.wake();
                 }
-                true
+                (true, None)
             }
             OpSlotState::Detached(_) => {
                 // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
                 // Multishot で F_MORE 付きの中間 CQE が来ても Detached では毎回ガードを走らせない
                 // （最終 CQE / cancel で 1 回）。F_MORE 中間はスロットを残す。
                 if (cqe.flags & IORING_CQE_F_MORE) != 0 && cqe.res >= 0 {
-                    return true;
+                    return (true, None);
                 }
                 let state = std::mem::replace(&mut self.slots[i].state, OpSlotState::Free);
                 self.free_slot(i);
-                if let OpSlotState::Detached(guard) = state {
-                    guard.run(cqe.res);
+                match state {
+                    OpSlotState::Detached(guard) => (true, Some((guard, cqe.res))),
+                    _ => (true, None),
                 }
-                true
             }
-            OpSlotState::Free => false,
+            OpSlotState::Free => (false, None),
         }
     }
 
-    /// in-flight op を detach する。
-    ///
-    /// 戻り値が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
-    /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
+    /// in-flight op を detach する（既に終わっていた op のガードはその場で走らせる。テスト用）。
+    #[cfg(test)]
     fn detach(&mut self, user_data: u64, guard: OpGuard) -> bool {
+        let (should_cancel, run) = self.detach_take_guard(user_data, guard);
+        if let Some((guard, res)) = run {
+            guard.run(res);
+        }
+        should_cancel
+    }
+
+    /// in-flight op を detach する。既に終わっていた op のガードは走らせずに返す（呼び出し側が
+    /// OP_TABLE の借用を手放してから走らせる。F-279: on_cqe_take_guard と同じく、ガードの閉包が
+    /// alloc_op・detach_op を呼んでも二重借用にならないように）。
+    ///
+    /// 戻り値の bool が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
+    /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
+    fn detach_take_guard(
+        &mut self,
+        user_data: u64,
+        guard: OpGuard,
+    ) -> (bool, Option<(OpGuard, i32)>) {
         let Some(i) = self.resolve(user_data) else {
             // 既に take 済み（Future が正常完了して結果を取り出した）等。カーネルはもう
             // バッファを触らないので、ガードは呼ばずに破棄する（accept fd は引き取り済み）。
-            return false;
+            return (false, None);
         };
         match &self.slots[i].state {
             OpSlotState::Active {
@@ -332,8 +360,7 @@ impl OpTable {
                 // 既に完了済み（CQE 到着済みだが take されていない）。即座に後始末。
                 let res = *res;
                 self.free_slot(i);
-                guard.run(res);
-                false
+                (false, Some((guard, res)))
             }
             OpSlotState::Active {
                 result: OpResult::Pending,
@@ -341,21 +368,20 @@ impl OpTable {
             } => {
                 // 未完了。ガードを保持して完了/キャンセルの CQE を待つ。
                 self.slots[i].state = OpSlotState::Detached(guard);
-                true
+                (true, None)
             }
             OpSlotState::MultishotActive { ms, .. } => {
                 if ms.finished && ms.queue.is_empty() {
                     // 既に終端済みで未消費なし → 即後始末。
                     self.free_slot(i);
-                    guard.run(0);
-                    false
+                    (false, Some((guard, 0)))
                 } else {
                     // 進行中 or 未消費あり。キャンセルしてガードで延命。
                     self.slots[i].state = OpSlotState::Detached(guard);
-                    true
+                    (true, None)
                 }
             }
-            _ => false,
+            _ => (false, None),
         }
     }
 
@@ -415,6 +441,26 @@ impl OpTable {
         }
     }
 
+    /// 未完了のまま残った detach 済みの op のガードを、走らせずに捨てる（解放しない）。返り値は件数。
+    ///
+    /// B-223（RT-04）: shutdown の drain の期限を過ぎても CQE が来ていない op は、スレッドを抜けた後の
+    /// OP_TABLE の破棄でガード（カーネルが書き得るバッファを持つ）が解放され、リングを閉じたときのカーネル側の
+    /// 非同期のキャンセルが解放済みのメモリへ書き得た。終了時に一度だけなので、意図的に漏らす。
+    fn leak_detached_guards(&mut self) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if matches!(slot.state, OpSlotState::Detached(_)) {
+                if let OpSlotState::Detached(guard) =
+                    std::mem::replace(&mut slot.state, OpSlotState::Free)
+                {
+                    std::mem::forget(guard);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// 完了待ちの op（カーネルがバッファ等を参照し得る）が残っているか（B-118 のシャットダウン用）。
     fn has_pending_ops(&self) -> bool {
         self.slots
@@ -468,7 +514,15 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     /// 同時追跡する op の上限。
     const MAX_TRACKED: usize = 256;
 
-    let mut table = OpTable::new();
+    // 本番と同じく OP_TABLE は RefCell の中に置き、ガードは借用を手放してから走らせる
+    // （F-279: ガードがテーブルを再入する B-224 の型の不具合を検出する。下の `deliver`・`detach`）。
+    let table = Rc::new(RefCell::new(OpTable::new()));
+    let deliver = |cqe: IoUringCqe| {
+        let run = table.borrow_mut().on_cqe_take_guard(&cqe).1;
+        if let Some((guard, res)) = run {
+            guard.run(res);
+        }
+    };
     // alloc 済み op の user_data と「detach 済みか」（実コードでは Future ドロップ後に
     // 所有者が take/remove を呼ぶ経路は存在しないため、detach 済み id への remove は
     // 発行しない = 実際の呼び出し契約をモデル化する）。
@@ -490,7 +544,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
             // alloc: 新しい op スロットを確保
             0 => {
                 if tracked.len() < MAX_TRACKED {
-                    tracked.push((table.alloc(), false));
+                    tracked.push((table.borrow_mut().alloc(), false));
                 }
             }
             // 追跡中 id への CQE 配送（res は任意の i32 = 負のエラーコード・巨大サイズ等）
@@ -499,7 +553,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
                     let res = i32::from_le_bytes([b[1], b[2], b[3], b[4]]);
-                    table.on_cqe(&IoUringCqe {
+                    deliver(IoUringCqe {
                         user_data: ud,
                         res,
                         flags: 0,
@@ -510,7 +564,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
             2 => {
                 let Some(b) = next(8) else { break };
                 let ud = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-                table.on_cqe(&IoUringCqe {
+                deliver(IoUringCqe {
                     user_data: ud,
                     res: -22, // EINVAL
                     flags: 0,
@@ -524,10 +578,25 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                     let (ud, _) = tracked[i];
                     let counter = Rc::new(std::cell::Cell::new(0u32));
                     let c = counter.clone();
-                    let was_pending = table.detach(
+                    // ガードは走るときにテーブルを再入する（実際のガードが alloc_op・with_ring を呼ぶ場合の模擬）。
+                    // 借用中に走らせると try_borrow_mut が失敗する。
+                    let weak = Rc::downgrade(&table);
+                    let (was_pending, run) = table.borrow_mut().detach_take_guard(
                         ud,
-                        OpGuard::Cleanup(Box::new(move |_res| c.set(c.get() + 1))),
+                        OpGuard::Cleanup(Box::new(move |_res| {
+                            c.set(c.get() + 1);
+                            if let Some(t) = weak.upgrade() {
+                                let mut t = t
+                                    .try_borrow_mut()
+                                    .expect("detach guard ran while the op table was borrowed");
+                                let id = t.alloc();
+                                t.remove(id);
+                            }
+                        })),
                     );
+                    if let Some((guard, res)) = run {
+                        guard.run(res);
+                    }
                     assert!(
                         counter.get() <= 1,
                         "detach guard ran {} times synchronously",
@@ -542,7 +611,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    let _ = table.take_result(ud);
+                    let _ = table.borrow_mut().take_result(ud);
                 }
             }
             // peek_result（非破壊参照）
@@ -550,7 +619,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    let _ = table.peek_result(ud);
+                    let _ = table.borrow().peek_result(ud);
                 }
             }
             // remove（SQE 提出失敗の模擬。detach 済み id には所有者がいないため発行しない）
@@ -560,7 +629,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                     let i = b[0] as usize % tracked.len();
                     let (ud, detached) = tracked[i];
                     if !detached {
-                        table.remove(ud);
+                        table.borrow_mut().remove(ud);
                     }
                 }
             }
@@ -569,7 +638,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                 let Some(b) = next(1) else { break };
                 if !tracked.is_empty() {
                     let (ud, _) = tracked[b[0] as usize % tracked.len()];
-                    table.set_waker(ud, fuzz_noop_waker());
+                    table.borrow_mut().set_waker(ud, fuzz_noop_waker());
                 }
             }
             _ => unreachable!(),
@@ -579,7 +648,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     // 遅延 CQE フラッシュ: カーネルから遅れて到着する完了/キャンセル CQE を全 id へ配送する
     // （解放済み id へは stale として無視されることも同時に検査される）。
     for &(ud, _) in &tracked {
-        table.on_cqe(&IoUringCqe {
+        deliver(IoUringCqe {
             user_data: ud,
             res: -125, // ECANCELED
             flags: 0,
@@ -587,7 +656,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     }
     // 未回収の完了結果を取り出してスロットを解放する（正常系の後始末）。
     for &(ud, _) in &tracked {
-        let _ = table.take_result(ud);
+        let _ = table.borrow_mut().take_result(ud);
     }
 
     // 不変条件 2・3: ガードは高々 1 回、pending detach はちょうど 1 回。
@@ -603,6 +672,7 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
     }
 
     // 不変条件 4: 全スロット解放済み（リークなし）。
+    let table = table.borrow();
     assert!(
         table.all_slots_free(),
         "op table slot leak: {} slots, {} free",
@@ -750,9 +820,29 @@ pub fn set_op_waker(user_data: u64, waker: Waker) {
 
 /// CQE を処理して対応する Future を wake する
 pub fn process_cqe(cqe: &IoUringCqe) {
-    OP_TABLE.with(|t| {
-        t.borrow_mut().on_cqe(cqe);
-    });
+    let guard = OP_TABLE.with(|t| t.borrow_mut().on_cqe_take_guard(cqe).1);
+    if let Some(g) = guard {
+        // B-224: RING の借用（consume_cqes の中）を手放した後で走らせる
+        DEFERRED_GUARDS.with(|d| d.borrow_mut().push(g));
+    }
+}
+
+thread_local! {
+    // B-224: CQE の処理中に終わった detach 済みの op のガード。poll_completions が consume_cqes の後に走らせる。
+    static DEFERRED_GUARDS: RefCell<Vec<(OpGuard, i32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// consume_cqes の中で溜めたガードを走らせる（RING・OP_TABLE を借りていない所で呼ぶ）。
+#[inline]
+fn run_deferred_guards() {
+    if DEFERRED_GUARDS.with(|d| d.borrow().is_empty()) {
+        return;
+    }
+    // ガードが更に op を detach しても（その CQE は次の poll で来る）借用が重ならないよう取り出してから走らせる
+    let guards = DEFERRED_GUARDS.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (guard, res) in guards {
+        guard.run(res);
+    }
 }
 
 /// 操作の結果を取得して削除する
@@ -778,7 +868,11 @@ pub fn remove_op(user_data: u64) {
 /// カーネルが参照中のメモリを解放してしまう use-after-free」や「孤立した accept が後続の
 /// 接続を奪って捨ててしまう問題」を防ぐ。
 pub fn detach_op(user_data: u64, guard: OpGuard) {
-    let should_cancel = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+    let (should_cancel, run) =
+        OP_TABLE.with(|t| t.borrow_mut().detach_take_guard(user_data, guard));
+    if let Some((guard, res)) = run {
+        guard.run(res);
+    }
     if should_cancel {
         submit_cancel(user_data);
     }
@@ -790,7 +884,10 @@ pub fn detach_op(user_data: u64, guard: OpGuard) {
 /// キャンセル SQE + 即時 submit のシステムコールを節約する（`timeout()` で内側 Future が
 /// 勝つたびに発生するホットパス）。スロットは自然完了の CQE 到着時に解放される。
 pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
-    let _ = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+    let (_, run) = OP_TABLE.with(|t| t.borrow_mut().detach_take_guard(user_data, guard));
+    if let Some((guard, res)) = run {
+        guard.run(res);
+    }
 }
 
 /// in-flight op を取り消す（ASYNC_CANCEL）。op は Future が持ったままで、取り消し（`-ECANCELED`）か
@@ -828,8 +925,22 @@ pub fn poll_completions() {
         ring.consume_cqes(|cqe| {
             process_cqe(cqe);
         });
+        // F-280: CQ が溢れていたら、カーネルに残った完了を CQ へ移して続けて処理する。park（GETEVENTS 付き）まで
+        // 待つと、その間 multishot の受信が終端して再アームに頼ることになる。普段は SQ の flags を 1 回読むだけ
+        if ring.cq_overflowed() {
+            CQ_OVERFLOW_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ftlog::debug!("io_uring completion queue overflowed; flushing");
+            let _ = ring.flush_cq_overflow();
+            ring.consume_cqes(|cqe| {
+                process_cqe(cqe);
+            });
+        }
     });
+    run_deferred_guards();
 }
+
+/// CQ の溢れを検出した回数（全スレッドの合計。`veil_uring_cq_overflow_total`。F-280）
+pub static CQ_OVERFLOW_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// io_uring の CQE を処理する（最低 1 件完了まで待機）
 ///
@@ -839,7 +950,9 @@ pub fn poll_completions() {
 pub fn wait_for_completions() -> std::io::Result<()> {
     arm_kernel_timeout_if_needed();
 
-    with_ring(|ring| ring.submit_and_wait(1))?;
+    if let Err(e) = with_ring(|ring| ring.submit_and_wait(1)) {
+        park_enter_error(e)?;
+    }
 
     poll_completions();
     take_armed_timer_result_if_fired();
@@ -934,7 +1047,51 @@ fn take_armed_timer_result_if_fired() {
 
 /// SQE を提出する
 pub fn submit_sqes() -> std::io::Result<()> {
-    with_ring(|ring| ring.submit())?;
+    match with_ring(|ring| ring.submit()) {
+        Ok(_) => Ok(()),
+        Err(e) => submit_enter_error(e),
+    }
+}
+
+/// `io_uring_enter` の一時的なエラーか（B-242）。
+///
+/// - `EBUSY`: CQ が溢れて overflow の一覧を CQ へ流し込めない（CQE を消費すれば通る）
+/// - `EAGAIN`・`ENOMEM`: カーネルが要求の資源（非同期ワーカー・メモリ）を確保できない（待てば通る）
+/// - `EINTR`: シグナルの配送（`GETEVENTS` の待ちだけ）
+///
+/// どれも SQE を 1 つも消費せずに返る（一部でも提出すれば件数が返る）ので、SQE は SQ リングに残り、
+/// 次の `enter`（park の `submit_and_wait`）がそのまま提出する。
+fn is_transient_enter_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EBUSY) | Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EINTR)
+    )
+}
+
+/// 提出の経路の `io_uring_enter` の失敗（B-242）。一時的なエラーは「まだ提出していない」として成功を返す
+/// （SQE は SQ に残り、次の park で提出される）。要求をエラーにしない。正常系に分岐を増やさないよう cold に置く。
+#[cold]
+#[inline(never)]
+fn submit_enter_error(e: std::io::Error) -> std::io::Result<()> {
+    if is_transient_enter_error(&e) {
+        ftlog::debug!("io_uring submit deferred to the next wait: {}", e);
+        return Ok(());
+    }
+    Err(e)
+}
+
+/// park の `io_uring_enter` の失敗（B-242）。一時的なエラーではワーカーを止めず、続く `poll_completions` で
+/// CQE を消費して（`EBUSY` の overflow を流し込める空きを作って）ループを続ける。`EAGAIN`・`ENOMEM` は他のスレッドへ譲る。
+#[cold]
+#[inline(never)]
+fn park_enter_error(e: std::io::Error) -> std::io::Result<()> {
+    if !is_transient_enter_error(&e) {
+        return Err(e);
+    }
+    if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ENOMEM)) {
+        std::thread::yield_now();
+    }
+    ftlog::debug!("io_uring wait interrupted: {}", e);
     Ok(())
 }
 
@@ -1234,12 +1391,12 @@ impl Executor {
             }
 
             // io_uring の完了を待つ
+            // 一時的なエラー（EINTR・EBUSY・EAGAIN）は wait_for_completions の中で吸収する（B-242）
+            // それ以外（EBADF 等）はリングが使えないので続けられない。future は完了していないので、
+            // 結果の取り出しの expect ではなく原因の分かる panic にする
             if let Err(e) = wait_for_completions() {
-                // EINTR は無視
-                if e.kind() != std::io::ErrorKind::Interrupted {
-                    ftlog::error!("io_uring wait error: {}", e);
-                    break;
-                }
+                ftlog::error!("io_uring wait error: {}", e);
+                panic!("io_uring wait failed: {e}");
             }
         }
 
@@ -1300,6 +1457,11 @@ pub fn shutdown_tasks(drain: std::time::Duration) {
         // 理由付き allow: スレッド終了時に一度だけ通るシャットダウン経路（データプレーン外）。
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // B-223（RT-04）: 期限までに CQE の来なかった op のバッファは解放しない（リングを閉じた後もカーネルが書き得る）
+    let leaked = OP_TABLE.with(|t| t.borrow_mut().leak_detached_guards());
+    if leaked > 0 {
+        ftlog::debug!("shutdown: left {leaked} in-flight io_uring buffers allocated");
     }
 }
 
@@ -1517,6 +1679,22 @@ mod executor_tests {
 
     fn yield_once() -> YieldOnce {
         YieldOnce { yielded: false }
+    }
+
+    /// B-242: park の `io_uring_enter` が一時的なエラー（EBUSY・EAGAIN・ENOMEM・EINTR）を返しても、ワーカー（`block_on`）を
+    /// 止めずに待ちを続ける（修正前は EBUSY・EAGAIN でループを抜け、結果の取り出しで panic していた）。
+    #[test]
+    fn b242_park_survives_transient_enter_errors() {
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping b242_park_survives_transient_enter_errors");
+            return;
+        }
+        for errno in [libc::EBUSY, libc::EAGAIN, libc::ENOMEM, libc::EINTR] {
+            crate::runtime::block_on(async move {
+                crate::runtime::ring::inject_enter_errors(3, errno);
+                timer::sleep(std::time::Duration::from_millis(2)).await;
+            });
+        }
     }
 
     #[test]

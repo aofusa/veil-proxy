@@ -1,12 +1,41 @@
 //! Properties Host Functions
 
+use std::sync::Arc;
+
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 
+/// `get_property` の値。
+///
+/// B-178: 要求のパス・`plugin_data` 等は共有している `Arc` をそのまま持ち、ゲストのメモリへ 1 回写すだけにする
+/// （以前は呼ぶたびに `Vec` へ複製していた。`data_files` は数 MB もあり得る）。
+pub(crate) enum PropertyValue {
+    /// 共有しているバイト列（`plugin_data.<name>`）
+    Shared(Arc<[u8]>),
+    /// 共有している文字列（パス・メソッド・クライアントの IP・プラグイン名）
+    Str(Arc<str>),
+    /// 定数
+    Static(&'static [u8]),
+    /// その場で作った値
+    Owned(Vec<u8>),
+}
+
+impl PropertyValue {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match self {
+            PropertyValue::Shared(b) => b,
+            PropertyValue::Str(s) => s.as_bytes(),
+            PropertyValue::Static(b) => b,
+            PropertyValue::Owned(v) => v,
+        }
+    }
+}
+
 /// Get property value by path
-fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
+pub(crate) fn get_property_value(state: &HostState, path: &str) -> Option<PropertyValue> {
+    use PropertyValue::{Owned, Shared, Static, Str};
     // Check capability
     if !state.http_ctx.capabilities.is_property_allowed(path) {
         return None;
@@ -14,47 +43,61 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
 
     match path {
         // Request properties
-        "request.path" => Some(state.http_ctx.request_path.as_bytes().to_vec()),
-        "request.url_path" => Some(state.http_ctx.request_path.as_bytes().to_vec()),
+        "request.path" | "request.url_path" => Some(Str(state.http_ctx.request_path.clone())),
         "request.host" => state
             .http_ctx
             .request_headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(b"host"))
-            .map(|(_, v)| v.clone()),
-        "request.method" => Some(state.http_ctx.request_method.as_bytes().to_vec()),
-        "request.scheme" => Some(b"https".to_vec()),
-        "request.protocol" => Some(b"HTTP/1.1".to_vec()),
-        "request.query" => Some(state.http_ctx.request_query.as_bytes().to_vec()),
+            .map(|(_, v)| Owned(v.clone())),
+        "request.method" => Some(Str(state.http_ctx.request_method.clone())),
+        "request.scheme" => Some(Static(b"https")),
+        "request.protocol" => Some(Static(b"HTTP/1.1")),
+        "request.query" => Some(Owned(state.http_ctx.request_query.as_bytes().to_vec())),
         "request.time" => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().to_string())
                 .unwrap_or_default();
-            Some(now.into_bytes())
+            Some(Owned(now.into_bytes()))
         }
         "request.total_size" => {
             let size = state.http_ctx.request_body.len();
-            Some(size.to_string().into_bytes())
+            Some(Owned(size.to_string().into_bytes()))
         }
 
         // Response properties
-        "response.code" => Some(state.http_ctx.response_status.to_string().into_bytes()),
-        "response.code_details" => Some(b"via veil-proxy".to_vec()),
+        "response.code" => Some(Owned(
+            state.http_ctx.response_status.to_string().into_bytes(),
+        )),
+        "response.code_details" => Some(Static(b"via veil-proxy")),
 
         // Connection properties
-        "source.address" => Some(state.http_ctx.client_ip.as_bytes().to_vec()),
-        "destination.address" => Some(b"0.0.0.0:0".to_vec()),
+        "source.address" => Some(Str(state.http_ctx.client_ip.clone())),
+        "destination.address" => Some(Static(b"0.0.0.0:0")),
 
         // Plugin properties
-        "plugin_name" => Some(state.http_ctx.plugin_name.as_bytes().to_vec()),
+        "plugin_name" => Some(Str(state.http_ctx.plugin_name.clone())),
         "plugin_root_id" => match &state.http_ctx.plugin_root_id {
-            Some(r) => Some(r.as_bytes().to_vec()),
-            None => Some(state.http_ctx.root_context_id.to_string().into_bytes()),
+            Some(r) => Some(Str(r.clone())),
+            None => Some(Owned(
+                state.http_ctx.root_context_id.to_string().into_bytes(),
+            )),
         },
 
+        // 起動時に読んだファイル（`[[wasm.modules]] data_files`。F-271）。複製しない（B-178）
+        p if p.starts_with("plugin_data.") => state
+            .http_ctx
+            .plugin_data
+            .get(&p["plugin_data.".len()..])
+            .map(|d| Shared(d.clone())),
+
         // Check custom_properties for user-defined properties
-        _ => state.http_ctx.custom_properties.get(path).cloned(),
+        _ => state
+            .http_ctx
+            .custom_properties
+            .get(path)
+            .map(|v| Owned(v.clone())),
     }
 }
 
@@ -78,7 +121,7 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
     };
 
     let mem_data = memory.data_mut(caller);
-    let start = ptr as usize;
+    let start = ptr as u32 as usize;
     let end = start + data.len();
 
     if end > mem_data.len() {
@@ -95,14 +138,101 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
 
     if end > data.len() {
         return None;
     }
 
     Some(data[start..end].to_vec())
+}
+
+/// `.` で繋いだプロパティのパス。短いものはスタックに置く（B-178: 呼ぶたびに確保しない）
+pub(crate) struct PropertyPath {
+    buf: [u8; 128],
+    len: usize,
+    heap: Option<String>,
+}
+
+impl PropertyPath {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: [0; 128],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn push(&mut self, part: &[u8]) {
+        if let Some(h) = &mut self.heap {
+            h.push_str(&String::from_utf8_lossy(part));
+            return;
+        }
+        if std::str::from_utf8(part).is_ok() && self.len + part.len() <= self.buf.len() {
+            self.buf[self.len..self.len + part.len()].copy_from_slice(part);
+            self.len += part.len();
+        } else {
+            let mut h = String::from(self.as_str());
+            h.push_str(&String::from_utf8_lossy(part));
+            self.heap = Some(h);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match &self.heap {
+            Some(h) => h,
+            // push は UTF-8 の要素だけを buf に入れる
+            None => std::str::from_utf8(&self.buf[..self.len]).unwrap_or(""),
+        }
+    }
+}
+
+/// [`parse_path`] の確保しない版。読めたら true
+pub(crate) fn parse_path_into(data: &[u8], out: &mut PropertyPath) -> bool {
+    if parse_len_prefixed_into(data, out) {
+        return true;
+    }
+    *out = PropertyPath::new();
+    for part in data.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push(b".");
+        }
+        out.push(part);
+    }
+    !out.is_empty()
+}
+
+fn parse_len_prefixed_into(data: &[u8], out: &mut PropertyPath) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    let num_parts = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if num_parts > (data.len() - 4) / 4 {
+        return false;
+    }
+    let mut pos = 4;
+    for i in 0..num_parts {
+        if pos + 4 > data.len() {
+            return false;
+        }
+        let part_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if part_len > data.len() - pos {
+            return false;
+        }
+        if i > 0 {
+            out.push(b".");
+        }
+        out.push(&data[pos..pos + part_len]);
+        pos += part_len;
+    }
+    true
 }
 
 /// Parse property path from bytes
@@ -169,22 +299,30 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         |mut caller: Caller<'_, HostState>,
          (path_ptr, path_size, return_value_ptr, return_value_size): (i32, i32, i32, i32)| {
             Box::new(async move {
-                // Read path from WASM memory
-                let path_data = match read_bytes(&mut caller, path_ptr, path_size) {
-                    Some(d) => d,
-                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
-
-                let path = match parse_path(&path_data) {
-                    Some(p) => p,
-                    None => return PROXY_RESULT_PARSE_FAILURE,
-                };
+                // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる）
+                let mut path = PropertyPath::new();
+                {
+                    let memory = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(mem)) => mem,
+                        _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                    };
+                    let data = memory.data(&caller);
+                    let (start, len) = (path_ptr as u32 as usize, path_size as u32 as usize);
+                    let raw = match start.checked_add(len).and_then(|end| data.get(start..end)) {
+                        Some(r) => r,
+                        None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                    };
+                    if !parse_path_into(raw, &mut path) {
+                        return PROXY_RESULT_PARSE_FAILURE;
+                    }
+                }
 
                 let state = caller.data();
-                let value = match get_property_value(state, &path) {
+                let value = match get_property_value(state, path.as_str()) {
                     Some(v) => v,
                     None => return PROXY_RESULT_NOT_FOUND,
                 };
+                let value = value.as_bytes();
 
                 // Allocate memory and write value
                 let ptr = match allocate_wasm_memory(&mut caller, value.len()).await {
@@ -192,7 +330,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     None => return PROXY_RESULT_INTERNAL_FAILURE,
                 };
 
-                if !write_to_wasm(&mut caller, ptr, &value) {
+                if !write_to_wasm(&mut caller, ptr, value) {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
 
@@ -203,8 +341,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 let data = memory.data_mut(&mut caller);
-                let ptr_offset = return_value_ptr as usize;
-                let size_offset = return_value_size as usize;
+                let ptr_offset = return_value_ptr as u32 as usize;
+                let size_offset = return_value_size as u32 as usize;
 
                 if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -290,7 +428,77 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_len_prefixed_path, parse_path};
+    use super::{
+        get_property_value, parse_len_prefixed_path, parse_path, parse_path_into, PropertyPath,
+        PropertyValue,
+    };
+    use crate::wasm::capabilities::ModuleCapabilities;
+    use crate::wasm::context::{HostState, HttpContext};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn state_with(allowed: &[&str]) -> HostState {
+        let caps = ModuleCapabilities {
+            allowed_properties: allowed.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        HostState::new(HttpContext::new(1, caps))
+    }
+
+    /// B-178: `plugin_data.<name>` は読み込んだバイト列そのもの（`Arc`）を返し、複製しない
+    #[test]
+    fn plugin_data_is_shared_not_copied() {
+        let data: Arc<[u8]> = Arc::from(&b"[1,2,3]"[..]);
+        let mut map = HashMap::new();
+        map.insert("dataset".to_string(), data.clone());
+        let mut st = state_with(&["plugin_data.*", "request.path"]);
+        st.http_ctx.plugin_data = Arc::new(map);
+        st.http_ctx.request_path = Arc::from("/json/1?m=2");
+        match get_property_value(&st, "plugin_data.dataset") {
+            Some(PropertyValue::Shared(b)) => assert!(Arc::ptr_eq(&b, &data)),
+            _ => panic!("plugin_data must be returned as the shared bytes"),
+        }
+        match get_property_value(&st, "request.path") {
+            Some(PropertyValue::Str(p)) => {
+                assert!(Arc::ptr_eq(&p, &st.http_ctx.request_path));
+                assert_eq!(p.as_bytes(), b"/json/1?m=2");
+            }
+            _ => panic!("request.path must be returned as the shared string"),
+        }
+        assert!(get_property_value(&st, "plugin_data.missing").is_none());
+        // 許可の無いプロパティは読めない
+        assert!(
+            get_property_value(&state_with(&["request.path"]), "plugin_data.dataset").is_none()
+        );
+    }
+
+    /// B-178: 確保しない版のパスの解析は従来の [`parse_path`] と同じ結果になる
+    #[test]
+    fn parse_path_into_matches_parse_path() {
+        let mut lp = Vec::new();
+        lp.extend_from_slice(&2u32.to_le_bytes());
+        lp.extend_from_slice(&7u32.to_le_bytes());
+        lp.extend_from_slice(b"request");
+        lp.extend_from_slice(&4u32.to_le_bytes());
+        lp.extend_from_slice(b"path");
+        let long = [b"plugin_data\0".as_slice(), &[b'x'; 200]].concat();
+        let bad = u32::MAX.to_le_bytes();
+        let cases: [&[u8]; 8] = [
+            &bad,
+            b"plugin_root_id",
+            b"request\0path",
+            b"request\0path\0",
+            b"plugin_data\0dataset",
+            b"",
+            &lp,
+            &long,
+        ];
+        for c in cases {
+            let mut p = PropertyPath::new();
+            let ok = parse_path_into(c, &mut p);
+            assert_eq!(ok.then(|| p.as_str().to_string()), parse_path(c), "{:?}", c);
+        }
+    }
 
     #[test]
     fn parse_path_accepts_sdk_nul_separated_paths() {

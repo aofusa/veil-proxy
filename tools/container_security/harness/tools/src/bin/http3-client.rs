@@ -19,6 +19,7 @@
 //!               | smuggling_cl_te | smuggling_dup_cl | smuggling_te_inject
 //!               | websocket_bad_connect | websocket_missing_protocol
 //!               | grpc_web_status_spoof | grpc_web_cors_origin
+//!               | initial_flood（H3_FLOOD_CONNECTIONS、既定 5000）
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -140,6 +141,9 @@ fn main() {
             .map(|s| format!("control_stream_abuse done detail={}", s)),
         "cid_exhaustion" => cid_exhaustion(&host, port)
             .map(|s| format!("cid_exhaustion done detail={}", s)),
+        // F-279: 正しい ClientHello を持つ Initial を多数の送信元ポートから送り、ハンドシェイクを完了しない
+        "initial_flood" => initial_flood(&host, port)
+            .map(|s| format!("initial_flood done detail={}", s)),
         "token_spoofing" => token_spoofing(&host, port)
             .map(|s| format!("token_spoofing done detail={}", s)),
         // F-107: レポート Task 2 — 巨大メタデータ / RST フラッド / gRPC-Web 異常
@@ -455,6 +459,49 @@ fn qpack_bomb(host: &str, port: u16, path: &str) -> Result<String, Box<dyn std::
 
 /// F-92: Initial 相当パケットを 1 回送り、ハンドシェイクを完了させずに待機する。
 /// サーバがアイドルタイムアウトで状態を破棄してもクラッシュしないことをプローブ側 health で確認する。
+/// F-279（B-222）: 偽装 Initial の洪水。`quiche::connect` で作った正しい Initial（ClientHello 入り）を、
+/// 接続ごとに別の UDP ソケット（別の送信元ポート = 別のクライアントに見える）から 1 回だけ送り、
+/// 以後は何もしない。サーバはハンドシェイクの状態を持つか Retry を返すかのどちらかになる。
+/// 送信元 IP の偽装は権限が要るので、送信元ポートを変えて同じ効果（別の 4 タプル）を出す。
+fn initial_flood(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let count: usize = env::var("H3_FLOOD_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let peer = resolve(host, port)?;
+    let mut config = make_config(30_000)?;
+    let mut out = [0u8; 1350];
+    let mut sent = 0usize;
+    let mut retries = 0usize;
+    let mut held = Vec::new();
+    let mut buf = [0u8; 2048];
+    for _ in 0..count {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        socket.connect(peer)?;
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        getrandom::getrandom(&mut scid).map_err(|_| "random scid failed")?;
+        let scid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn = quiche::connect(Some(host), &scid, socket.local_addr()?, peer, &mut config)?;
+        let (n, _) = conn.send(&mut out)?;
+        if socket.send(&out[..n]).is_ok() {
+            sent += 1;
+        }
+        // 応答（Retry・Initial）を数えるだけで返事はしない。ソケットは最後まで持つ（ポートを使い回さない）
+        while let Ok(m) = socket.recv(&mut buf) {
+            if m > 0 && buf[0] & 0xf0 == 0xf0 {
+                retries += 1;
+            }
+        }
+        held.push(socket);
+        // ファイル記述子を使い切らないよう、古いものから閉じる
+        if held.len() > 900 {
+            held.remove(0);
+        }
+    }
+    Ok(format!("sent={} retry_responses_seen={}", sent, retries))
+}
+
 fn handshake_slowloris(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
     let peer = resolve(host, port)?;
     let socket = UdpSocket::bind("0.0.0.0:0")?;

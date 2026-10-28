@@ -25,11 +25,14 @@ pub mod http_executor;
 pub mod integration;
 // OpenBSD は wasmtime 既定のファイバスタック（MAP_STACK なし）で SIGSEGV するため、
 // MAP_STACK 付きでスタックを確保する StackCreator を差し込む（B-52）。
+mod instance_pool;
 #[cfg(target_os = "openbsd")]
 mod openbsd_stack;
 pub mod persistent_context;
 pub mod queue_notify;
 mod registry;
+// B-179: shared data の表（モジュール名ごとにプロセスで共有）
+pub(crate) mod shared_data;
 pub mod tick_manager;
 mod types;
 
@@ -40,13 +43,14 @@ pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
 pub use context::{HostState, HttpContext};
 pub use engine::{
-    BodyFilterResult, FilterEngine, FilterResult, NetworkAction, NetworkFilterResult,
+    BodyFilterResult, FilterEngine, FilterResult, NetworkAction, NetworkFilterResult, RequestMeta,
 };
 pub use grpc_integration::{
     on_grpc_close, on_grpc_initial_metadata, on_grpc_message, on_grpc_trailing_metadata,
 };
 #[cfg(feature = "grpc")]
 pub use grpc_integration::{process_grpc_response, status as grpc_status, GrpcCallResponse};
+pub use instance_pool::RequestSessions;
 pub use integration::{
     empty_wasm_modules, on_context_destroy, on_http_call_complete, on_queue_ready,
     on_request_complete, on_request_complete_async, on_tick, process_pending_http_calls,
@@ -83,6 +87,10 @@ pub use types::*;
 
 /// Initialize the WASM extension system
 pub fn init(config: &WasmConfig) -> anyhow::Result<FilterEngine> {
+    #[cfg(feature = "grpc")]
+    host::grpc_executor::set_connect_timeout_ms(config.grpc_connect_timeout_ms);
+    http_executor::set_max_timeout_ms(config.http_call_max_timeout_ms);
+    shared_data::set_max_keys(config.shared_data_max_keys);
     FilterEngine::new(config)
 }
 

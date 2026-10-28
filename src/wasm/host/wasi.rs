@@ -37,7 +37,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read iov structures
             for i in 0..iovs_len {
-                let iov_ptr = (iovs_ptr + i * 8) as usize;
+                // B-236: i32 のまま足すと回り込み・符号拡張するので、u32 として広げてから足す
+                let iov_ptr = iovs_ptr as u32 as usize + i as u32 as usize * 8;
                 if iov_ptr + 8 > data.len() {
                     return 21; // EINVAL
                 }
@@ -74,7 +75,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Write number of bytes written
             let data = memory.data_mut(&mut caller);
-            let ptr = nwritten_ptr as usize;
+            let ptr = nwritten_ptr as u32 as usize;
             if ptr + 4 > data.len() {
                 return 21; // EINVAL
             }
@@ -133,7 +134,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            let ptr = stat_ptr as usize;
+            let ptr = stat_ptr as u32 as usize;
             if ptr + 24 > data.len() {
                 return 21; // EINVAL
             }
@@ -181,8 +182,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let data = memory.data_mut(&mut caller);
 
             // Write 0 environment variables
-            let count_p = count_ptr as usize;
-            let size_p = size_ptr as usize;
+            let count_p = count_ptr as u32 as usize;
+            let size_p = size_ptr as u32 as usize;
             if count_p + 4 > data.len() || size_p + 4 > data.len() {
                 return 21;
             }
@@ -215,8 +216,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let data = memory.data_mut(&mut caller);
 
             // Write 0 arguments
-            let count_p = count_ptr as usize;
-            let size_p = size_ptr as usize;
+            let count_p = count_ptr as u32 as usize;
+            let size_p = size_ptr as u32 as usize;
             if count_p + 4 > data.len() || size_p + 4 > data.len() {
                 return 21;
             }
@@ -266,7 +267,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 .as_nanos() as u64;
 
             let data = memory.data_mut(&mut caller);
-            let ptr = time_ptr as usize;
+            let ptr = time_ptr as u32 as usize;
             if ptr + 8 > data.len() {
                 return 21;
             }
@@ -287,22 +288,17 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            let ptr = buf_ptr as usize;
-            let len = buf_len as usize;
+            let ptr = buf_ptr as u32 as usize;
+            let len = buf_len as u32 as usize;
             if ptr + len > data.len() {
                 return 21;
             }
 
-            // Use simple PRNG for random bytes
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let mut seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-
-            for i in 0..len {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                data[ptr + i] = (seed >> 32) as u8;
+            // B-248: プラグインは暗号用の乱数源として使う（トークン・nonce・鍵）。OS の CSPRNG で埋める
+            // （以前は壁時計をシードにした LCG で、出力の 1〜2 バイトから内部状態を復元できた）
+            use crate::tls_provider::{SecureRandom, SystemRandom};
+            if SystemRandom::new().fill(&mut data[ptr..ptr + len]).is_err() {
+                return 29; // EIO
             }
 
             0 // Success

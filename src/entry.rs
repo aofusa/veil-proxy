@@ -1,27 +1,20 @@
 //! バイナリエントリ（`main` から `veil::run()` で呼び出す）。
 
 use crate::logging::*;
-use crate::metrics::*;
 use crate::pool::*;
 use crate::system::*;
 
-use crate::runtime::tcp::TcpListener;
-use crate::runtime::time::timeout;
 use clap::Parser;
 use ftlog::{debug, error, info, warn};
 use rustls::crypto::CryptoProvider;
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 // ktls_rustls（kTLS 対応）
 #[cfg(veil_ktls)]
 use crate::ktls_rustls::RustlsAcceptor;
 
 pub use crate::config::*;
-use crate::proxy::*;
 use crate::server::*;
 
 /// OpenBSD pledge(2) の promise 集合（F-120 Phase 5）。
@@ -39,88 +32,6 @@ use crate::server::*;
 ///   F-170 の UDS バックエンド接続の両方に必要）。
 #[cfg(target_os = "openbsd")]
 const PLEDGE_PROMISES: &str = "stdio rpath wpath cpath inet dns flock unix";
-
-// ====================
-// ワーカースレッド
-// ====================
-
-/// I/O ワーカースレッド（per-core io_uring executor）を 8MB スタックで起動する。
-///
-/// `std::thread::spawn` の既定スタックは 2MB と小さく、接続ハンドラの async future は
-/// 深いネスト（TLS read/write → HTTP/2 フレーム処理 → ストリーミング転送 → 応答リレー）で
-/// 大きくなり得る。spawn 時に future はスタック上で構築されてからボックス化されるため、
-/// 既定 2MB では大きな接続でスタックオーバーフローし得る。十分なスタックを確保して防ぐ。
-fn spawn_worker_thread<F>(f: F) -> thread::JoinHandle<()>
-where
-    F: FnOnce() + Send + 'static,
-{
-    thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(f)
-        .expect("failed to spawn I/O worker thread")
-}
-
-// ====================
-// F-164: TCP / UDS 共通のワーカーリスナー取得
-// ====================
-
-/// メイン TLS リスナー・H2C リスナーのワーカーがそれぞれ自分専用の
-/// `runtime::TcpListener` を得る手段（F-164）。
-///
-/// - TCP: 各ワーカーが `SO_REUSEPORT` で個別に bind する（従来どおり）。
-/// - UDS（`cfg(unix)` のみ）: AF_UNIX に `SO_REUSEPORT` は無いため、ワーカー spawn 前に
-///   `server::bind_unix_listener` で 1 度だけ bind し、各ワーカーはその fd を
-///   `dup(2)` して使う（カーネルが accept を分散する）。
-#[derive(Clone)]
-enum WorkerListenerSource {
-    Tcp(SocketAddr),
-    #[cfg(unix)]
-    Unix(Arc<crate::server::OwnedListenerFd>),
-}
-
-impl WorkerListenerSource {
-    /// `ListenAddr` から、ワーカー spawn 前の準備（UDS の場合は bind）まで済ませて作る。
-    /// `unix_socket_permissions` は `[server].unix_socket_permissions`（8 進数表記の文字列）。
-    fn prepare(
-        addr: &crate::listen_addr::ListenAddr,
-        #[cfg_attr(not(unix), allow(unused_variables))] unix_socket_permissions: &str,
-    ) -> std::io::Result<Self> {
-        match addr {
-            crate::listen_addr::ListenAddr::Tcp(a) => Ok(Self::Tcp(*a)),
-            #[cfg(unix)]
-            crate::listen_addr::ListenAddr::Unix(path) => {
-                let mode = crate::config::parse_unix_socket_permissions(unix_socket_permissions)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                let fd = crate::server::bind_unix_listener(path, mode)?;
-                Ok(Self::Unix(Arc::new(fd)))
-            }
-        }
-    }
-
-    /// UDS の場合、bind したソケットファイルのパスを返す（グレースフルシャットダウン時の
-    /// unlink 用）。
-    #[cfg(unix)]
-    fn unix_socket_path(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::Tcp(_) => None,
-            Self::Unix(fd) => Some(fd.path()),
-        }
-    }
-
-    /// このワーカー専用の `runtime::TcpListener` を取得する。
-    fn obtain(
-        &self,
-        balancing: ReuseportBalancing,
-        workers: usize,
-        thread_id: usize,
-    ) -> std::io::Result<TcpListener> {
-        match self {
-            Self::Tcp(addr) => create_listener(*addr, balancing, workers, thread_id),
-            #[cfg(unix)]
-            Self::Unix(fd) => fd.dup_listener(),
-        }
-    }
-}
 
 // ====================
 // メイン関数
@@ -294,6 +205,10 @@ pub fn run_server(opts: ServerOptions) {
     #[cfg(not(feature = "acme"))]
     let acme_enabled = false;
 
+    // B-192: 設定のロード（ルートの監視の登録）で監視スレッドを作らず、サンドボックスの後まで預ける
+    #[cfg(feature = "cache")]
+    crate::cache::watch::hold_threads();
+
     // http3: 証明書世代の初期化で、NetBSD: chroot 後のルート再解決で書き換える。
     #[cfg(any(feature = "http3", target_os = "netbsd"))]
     let mut loaded_config = match load_config(&config_path) {
@@ -311,6 +226,22 @@ pub fn run_server(opts: ServerOptions) {
             return;
         }
     };
+
+    // F-259: OS の信頼ストア（`"system"`）は load_config で読み終えた。以後（リロード）に初めて
+    // `"system"` が現れても、サンドボックスの下では読めないので拒否する
+    {
+        let sec = &loaded_config.global_security;
+        crate::trust_store::set_sandboxed(
+            sec.enable_seccomp
+                || sec.enable_landlock
+                || sec.enable_capsicum
+                || sec.capsicum_capability_mode
+                || sec.enable_unveil
+                || sec.enable_pledge
+                || sec.enable_sandbox_macos
+                || sec.chroot_dir.is_some(),
+        );
+    }
 
     // F-153: 静的配信のパス解決をカーネル封じ込め（Linux: openat2 RESOLVE_BENEATH、
     // FreeBSD: F-123 の capsicum O_RESOLVE_BENEATH）へ切り替えるため、File ルートの
@@ -407,6 +338,14 @@ pub fn run_server(opts: ServerOptions) {
     if loaded_config.global_security.enable_unveil {
         match crate::config::collect_unveil_paths(&config_path) {
             Ok(paths) => {
+                // F-266: ライブラリのアップロードの一時ファイルの置き場
+                #[cfg(feature = "handler")]
+                let paths = {
+                    let mut p = paths;
+                    p.read_write_create
+                        .push(crate::api::multipart::upload_tmp_dir());
+                    p
+                };
                 let mut all_ok = true;
                 for p in &paths.read_only {
                     if let Err(e) = crate::security::pledge_unveil::unveil_path(p, "r") {
@@ -489,7 +428,7 @@ pub fn run_server(opts: ServerOptions) {
         info!("Graceful shutdown timeout: disabled (immediate shutdown)");
     }
 
-    // TLS アクセプターを作成
+    // TLS アクセプターを作成（TLS のリスナーごとに、そのリスナーの ALPN のプロファイルへ `with_profile` する。F-260）
     #[cfg(veil_ktls)]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled)
@@ -500,8 +439,16 @@ pub fn run_server(opts: ServerOptions) {
     let acceptor = crate::simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
 
-    // F-03: グローバル TLS 設定を初期化（アクセプタが毎ハンドシェイク参照）
-    crate::tls_reload::init_global_tls_config(loaded_config.tls_config.clone());
+    // F-03: グローバル TLS 設定を初期化（アクセプタが毎ハンドシェイク参照）。F-260: 作った ALPN のプロファイルごと。
+    let tls_profiles: Vec<crate::tls_reload::AlpnProfile> = crate::tls_reload::AlpnProfile::ALL
+        .into_iter()
+        .filter(|p| loaded_config.tls_profiles[p.index()].is_some())
+        .collect();
+    for p in &tls_profiles {
+        if let Some(c) = &loaded_config.tls_profiles[p.index()] {
+            crate::tls_reload::init_global_tls_config(*p, c.clone());
+        }
+    }
 
     // F-10: OpenTelemetry エクスポータを起動（feature 有効かつ enabled 時のみ）
     #[cfg(feature = "opentelemetry")]
@@ -532,22 +479,24 @@ pub fn run_server(opts: ServerOptions) {
         let key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
         let interval = loaded_config.tls_reload_interval_secs.max(1);
         let ktls_enabled = loaded_config.ktls_config.enabled;
-        #[cfg(feature = "http2")]
-        let http2_enabled = loaded_config.http2_enabled;
-        #[cfg(not(feature = "http2"))]
-        let http2_enabled = false;
         // F-50: リロード時も設定された暗号スイートを維持する
         let cipher_suites = loaded_config.tls_cipher_suites.clone();
-        let builder: crate::tls_reload::ServerConfigBuilder = Box::new(move |c, k| {
+        // F-260: 起動時に作った ALPN のプロファイルを全部作り直す（ACME の差し替えも同じ経路）
+        let builder: crate::tls_reload::ServerConfigBuilder = Box::new(move |c, k, profile| {
             crate::config::build_server_config_from_paths(
                 c,
                 k,
                 ktls_enabled,
-                http2_enabled,
+                profile.http2(),
                 &cipher_suites,
             )
         });
-        match crate::tls_reload::TlsCertReloader::new_global(cert_path, key_path, builder) {
+        match crate::tls_reload::TlsCertReloader::new_global(
+            cert_path,
+            key_path,
+            builder,
+            tls_profiles.clone(),
+        ) {
             Ok(reloader) => {
                 spawn_tls_reloader(reloader, interval);
                 info!(
@@ -561,27 +510,6 @@ pub fn run_server(opts: ServerOptions) {
         }
     }
 
-    // F-164: `unix:<path>` 形式（UDS）も受理する。`config::validate_config` で既に
-    // 検証済みのため、ここでのパース失敗は基本的に起こらない想定だが、防御的に
-    // 従来どおり TCP 既定値へフォールバックする。
-    // F-200: TLS のリスナー（`[server].listen`）は省略可（平文だけのサーバ）。
-    let listen_kind: Option<crate::listen_addr::ListenAddr> =
-        loaded_config.listen_addr.as_deref().map(|l| {
-            crate::listen_addr::ListenAddr::parse(l).unwrap_or_else(|e| {
-                warn!(
-                    "Invalid listen address '{}': {} (falling back to 0.0.0.0:443)",
-                    l, e
-                );
-                crate::listen_addr::ListenAddr::Tcp(SocketAddr::from(([0, 0, 0, 0], 443)))
-            })
-        });
-
-    // HTTPSリダイレクト用ポートを保存（平文リスナーの `enable_secure_redirect` が使う）。
-    // UDS にはポートの概念が無いため、TCP のときのみ更新する（既定値 443 のまま = F-164）。
-    if let Some(addr) = listen_kind.as_ref().and_then(|k| k.tcp_addr()) {
-        HTTPS_REDIRECT_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
-    }
-
     let ktls_config = Arc::new(loaded_config.ktls_config.clone());
 
     // CURRENT_CONFIG を初期化（ホットリロード対応）
@@ -591,7 +519,12 @@ pub fn run_server(opts: ServerOptions) {
         optimized_router: loaded_config.optimized_router.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
-        cleartext: loaded_config.cleartext,
+        // F-260: 平文の方針の表（リスナーの id で引く。リダイレクト先のポートも各リスナーが持つ）
+        cleartext: loaded_config
+            .listeners
+            .iter()
+            .map(|l| l.cleartext)
+            .collect(),
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         #[cfg(feature = "admin")]
@@ -850,8 +783,9 @@ pub fn run_server(opts: ServerOptions) {
     // 権限降格後、ワーカースレッド起動前にセキュリティ制限を適用します。
     // これにより、io_uringの悪用リスクを低減します。
     //
-    // 注意: seccompはプロセス全体に適用され、不可逆です。
-    // ワーカースレッド起動後は新しいスレッドにも自動的に継承されます。
+    // 注意: seccomp・Landlock は不可逆で、掛けたスレッド（このメインスレッド）と、その後に作るスレッド
+    // （ワーカー等）にだけ効く（TSYNC を使わないので、既に動いている背景スレッドには効かない）。
+    // 静的配信の監視スレッドは設定のロードでは作らずに預け、この後で作る（B-192）。
     // ====================
 
     // セキュリティ機能のサポート状況をレポート
@@ -895,6 +829,16 @@ pub fn run_server(opts: ServerOptions) {
         let s = p.to_string_lossy().into_owned();
         if !landlock_write_paths.contains(&s) {
             landlock_write_paths.push(s);
+        }
+    }
+    // F-266: ライブラリのアップロードの一時ファイルの置き場（[api] upload_tmp_dir）
+    #[cfg(feature = "handler")]
+    {
+        let d = crate::api::multipart::upload_tmp_dir()
+            .to_string_lossy()
+            .into_owned();
+        if !landlock_write_paths.contains(&d) {
+            landlock_write_paths.push(d);
         }
     }
 
@@ -951,6 +895,10 @@ pub fn run_server(opts: ServerOptions) {
         }
     }
 
+    // 設定のロードで預けた静的配信の監視スレッドを、サンドボックスの後で作る（B-192）
+    #[cfg(feature = "cache")]
+    crate::cache::watch::release_threads();
+
     // FreeBSD: capsicum（F-120 Phase 4）。
     //
     // リスナー fd の rights 制限（`enable_capsicum`）は `server::create_listener`
@@ -970,7 +918,7 @@ pub fn run_server(opts: ServerOptions) {
             #[cfg(not(feature = "l4-proxy"))]
             let has_l4 = false;
             #[cfg(feature = "http3")]
-            let http3 = loaded_config.http3_enabled;
+            let http3 = loaded_config.listeners.iter().any(|l| l.http3.is_some());
             #[cfg(not(feature = "http3"))]
             let http3 = false;
             // metrics（Prometheus）はメインリスナーのルートとして配信されるため
@@ -1102,204 +1050,59 @@ pub fn run_server(opts: ServerOptions) {
     #[cfg(target_os = "macos")]
     let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // 上の 3 つのバリアが待つ bind の数。TLS のリスナーと平文のリスナー（`listen_cleartext`）のワーカーを両方数える
+    // 上の 3 つのバリアが待つ bind の数。TCP の全リスナー（TLS・平文）のワーカーを数える
     // （以前は TLS のワーカーだけで、待つスレッド自体も TLS のリスナーがあるときだけ起動していた。平文だけの設定
     // ＝パッケージの既定の設定では capability mode・pledge・sandbox_init が掛からず、FreeBSD は起動を中止していた。B-163）。
+    // F-260: リスナーごとの `threads` の和（HTTP/3 は今までどおり数えない）。
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
-    let barrier_expected = num_threads
-        * (usize::from(listen_kind.is_some())
-            + usize::from(loaded_config.listen_cleartext.is_some()));
+    let barrier_expected: usize = loaded_config
+        .listeners
+        .iter()
+        .map(|l| l.worker_count(num_threads))
+        .sum();
 
-    // メイン TLS リスナーの UDS ソケットファイルパス（bind した場合のみ）。
-    // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
+    // TCP のリスナー（TLS・平文）を `[server] listen` → `listen_cleartext` → `[[listener]]` の順に起動する（F-260）。
+    let worker_env = crate::listener_workers::WorkerEnv {
+        core_ids: core_ids.clone(),
+        balancing: reuseport_balancing,
+        max_conn: max_connections,
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+        listeners_ready: std::sync::Arc::clone(&listeners_ready),
+    };
+    // veil 自身が bind した UDS のソケットファイル（グレースフルシャットダウン時に unlink する。F-164）
     #[cfg(unix)]
-    let mut main_listener_unix_path: Option<std::path::PathBuf> = None;
-
-    // TLS のリスナーを起動（`[server].listen` があるときだけ。F-200）
-    if let Some(listen_kind) = listen_kind.clone() {
-        // F-164: UDS の場合はワーカー spawn 前に 1 度だけ bind する
-        // （AF_UNIX には SO_REUSEPORT が無いため）。
-        let listener_source = match WorkerListenerSource::prepare(
-            &listen_kind,
-            &loaded_config.unix_socket_permissions,
+    let mut unix_socket_paths: Vec<std::path::PathBuf> = Vec::new();
+    for (id, spec) in loaded_config.listeners.iter().enumerate() {
+        let workers = spec.worker_count(num_threads);
+        let listener_acceptor = spec.alpn_profile().map(|p| {
+            let config = loaded_config.tls_profiles[p.index()]
+                .clone()
+                .unwrap_or_else(|| loaded_config.tls_config.clone());
+            acceptor.clone().with_profile(p, config)
+        });
+        match crate::listener_workers::spawn_tcp_listener(
+            id,
+            spec,
+            workers,
+            listener_acceptor,
+            &worker_env,
+            &mut handles,
         ) {
-            Ok(s) => s,
+            #[cfg(unix)]
+            Ok(path) => unix_socket_paths.extend(path),
+            #[cfg(not(unix))]
+            Ok(_) => {}
             Err(e) => {
-                error!("Bind error on {}: {}", listen_kind, e);
+                error!(
+                    "Bind error on listener \"{}\" {}: {}",
+                    spec.name, spec.addr, e
+                );
                 return;
             }
-        };
-        #[cfg(unix)]
-        {
-            main_listener_unix_path = listener_source.unix_socket_path().map(|p| p.to_path_buf());
         }
-
-        info!("============================================");
-        info!("HTTPS Server");
-        info!("Listen Address: {}", listen_kind);
-        info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!("============================================");
-
-        for thread_id in 0..num_threads {
-            let acceptor_clone = acceptor.clone();
-            // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
-            // ホットリロード時に各接続が最新の設定を参照できるようにする
-            let listener_source = listener_source.clone();
-            let balancing = reuseport_balancing;
-            let workers = num_threads;
-            let max_conn = max_connections;
-            #[cfg(target_os = "freebsd")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            #[cfg(target_os = "openbsd")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            #[cfg(target_os = "macos")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-
-            // このスレッドに割り当てるコアIDを決定
-            // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
-            let assigned_core = core_ids.as_ref().map(|ids| {
-                let core_index = thread_id % ids.len();
-                ids[core_index]
-            });
-
-            let handle = spawn_worker_thread(move || {
-                // スレッド開始直後にCPUアフィニティを設定
-                // これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
-                if let Some(core_id) = assigned_core {
-                    if core_affinity::set_for_current(core_id) {
-                        info!("[Thread {}] Pinned to CPU core {:?}", thread_id, core_id);
-                    } else {
-                        warn!(
-                            "[Thread {}] Failed to pin to CPU core {:?}, running unpinned",
-                            thread_id, core_id
-                        );
-                    }
-                }
-
-                crate::runtime::block_on(async move {
-                    let listener = match listener_source.obtain(balancing, workers, thread_id) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            error!("[Thread {}] Bind error: {}", thread_id, e);
-                            return;
-                        }
-                    };
-                    // capability mode バリア: bind 完了を通知（FreeBSD、コールドパス）。
-                    #[cfg(target_os = "freebsd")]
-                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    // pledge バリア: bind 完了を通知（OpenBSD、コールドパス）。
-                    #[cfg(target_os = "openbsd")]
-                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    // sandbox_init バリア: bind 完了を通知（macOS、コールドパス）。
-                    #[cfg(target_os = "macos")]
-                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
-
-                    info!("[Thread {}] Worker started", thread_id);
-
-                    // F-46: 接続ハンドラの型付きタスクプール（spawn ごとの Box 確保を排除）
-                    let conn_pool = crate::runtime::TaskPool::new();
-
-                    loop {
-                        // Shutdown チェック
-                        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-                            info!("[Thread {}] Shutting down...", thread_id);
-                            break;
-                        }
-
-                        // タイムアウト付きaccept（Graceful Shutdown対応）
-                        let accept_result =
-                            timeout(Duration::from_secs(1), listener.accept()).await;
-
-                        let (stream, peer_addr) = match accept_result {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => {
-                                error!("[Thread {}] Accept error: {}", thread_id, e);
-                                continue;
-                            }
-                            Err(_) => {
-                                // タイムアウト - ループを継続してshutdownチェック。
-                                // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
-                                crate::alloc_tune::idle_tick();
-                                continue;
-                            }
-                        };
-
-                        // F-155: 1 周回で受理した接続数のローカルカウンタ。
-                        // バッチ内で spawn したタスクはまだ `ConnectionGuard::new()` を
-                        // 実行していない可能性があるため（spawn 直後はまだ poll されて
-                        // いない）、`CURRENT_CONNECTIONS` のロード値だけでは同一バッチ内で
-                        // 受理済みの分を勘定できない。`CURRENT_CONNECTIONS.load(..) +
-                        // batch_accepted` で判定することで、バッチ受理中に同時接続数
-                        // 上限を一時的に超えるのを防ぐ。
-                        let mut batch_accepted: usize = 0;
-
-                        // 1 件受理した接続の検証・処理ロジック（1 件目・バッチ内の残りで
-                        // 共通のため、ローカルクロージャへまとめる）。
-                        let mut handle_accepted =
-                            |stream: crate::runtime::tcp::TcpStream, peer_addr: SocketAddr| {
-                                // F-35: 最前線 IP ブロックリスト。ブロック対象 IP は TLS
-                                // ハンドシェイク前・ハンドラ spawn 前に切断する
-                                // （stream は drop で閉じられる）。
-                                if crate::config::is_ip_blocked(peer_addr.ip()) {
-                                    return;
-                                }
-
-                                // 同時接続数制限チェック（上の doc コメント参照）。
-                                if max_conn > 0 {
-                                    let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed)
-                                        + batch_accepted;
-                                    if current >= max_conn {
-                                        warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}",
-                                          thread_id, current, max_conn, peer_addr);
-                                        drop(stream);
-                                        return;
-                                    }
-                                }
-
-                                let _ = stream.set_nodelay(true);
-                                batch_accepted += 1;
-
-                                let acceptor = acceptor_clone.clone();
-
-                                // パニックキャッチ + 型付きプール（F-46）でスレッド生存とゼロ確保を両立
-                                spawn_pooled_with_panic_catch(&conn_pool, async move {
-                                    // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
-                                    // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
-                                    let _guard = ConnectionGuard::new();
-                                    // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
-                                    // これによりホットリロード時に新しい設定が即座に反映される
-                                    handle_connection(stream, acceptor, peer_addr).await;
-                                });
-                            };
-
-                        handle_accepted(stream, peer_addr);
-
-                        // F-155: nginx の `multi_accept` 相当。1 件目に続けて、
-                        // バックログに滞留している接続を合計最大 32 件（1 件目 + 31 件）まで
-                        // 一気に受理・spawn する。io_uring バックエンド（`veil_rt_uring`）の
-                        // `TcpListener` には `accept_batch` が存在しない（io_uring パスの
-                        // ロジックは変更しない方針のため）ので、reactor バックエンド
-                        // （`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
-                        #[cfg(veil_rt_reactor)]
-                        {
-                            if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
-                                error!("[Thread {}] Accept error: {}", thread_id, e);
-                            }
-                        }
-                    }
-
-                    // グレースフルシャットダウン: 既存接続の完了を待機
-                    drain_connections("Thread", thread_id).await;
-
-                    info!("[Thread {}] Worker stopped", thread_id);
-                });
-                // B-118: 待ちが切れて残った接続タスクをスレッドローカルが生きているうちに破棄する
-                crate::runtime::shutdown_thread();
-            });
-            handles.push(handle);
-        }
-    } else {
-        info!("No TLS listener ([server].listen is not set): plaintext-only server");
+    }
+    if !loaded_config.listeners.iter().any(|l| l.tls) {
+        info!("No TLS listener: plaintext-only server");
     }
 
     // FreeBSD capability mode（オプトイン）: 全リスナー（TLS・平文）のワーカーの bind 完了を待って
@@ -1530,419 +1333,60 @@ pub fn run_server(opts: ServerOptions) {
             .expect("failed to spawn veil-macos-sandbox thread");
     }
 
-    // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
+    // HTTP/3 (QUIC/UDP) サーバー（`http3` のリスナーごと。F-260）
     // TCP側と同様に複数スレッドで並列起動し、CPUコアにピンニング
     //
     // 注意: quicheはファイルパスからの証明書読み込みのみサポートしているため、
-    // HTTP/3を使用する場合はLandlock設定で証明書パスを許可する必要があります。
+    // 証明書は事前に読んだ PEM を memfd 経由で渡す（Landlock の許可パスに証明書を足さなくてよい）。
+    // 証明書の PEM を写し終えた HTTP/3 のワーカーの数（全員が写してから元の PEM を消す）
     #[cfg(feature = "http3")]
-    if loaded_config.http3_enabled {
-        // F-200: `[http3] listen` が無ければ `[server].listen` と同じアドレス（UDP）。
-        let http3_addr_str = loaded_config
-            .http3_listen
-            .clone()
-            .or_else(|| loaded_config.listen_addr.clone())
-            .unwrap_or_default();
-
-        let http3_addr: SocketAddr = match http3_addr_str.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("Invalid HTTP/3 listen address '{}': {}", http3_addr_str, e);
-                return;
+    let http3_pem_copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(feature = "http3")]
+    let http3_workers: usize = {
+        let mut total = 0usize;
+        let h3_listeners: Vec<(&crate::config::ListenerSpec, std::net::SocketAddr)> = loaded_config
+            .listeners
+            .iter()
+            .filter_map(|l| l.http3.map(|a| (l, a)))
+            .collect();
+        if !h3_listeners.is_empty() {
+            if loaded_config.global_security.enable_landlock {
+                info!("[HTTP/3] Landlock enabled - using memfd for certificate loading");
+                info!("[HTTP/3] No need to add certificate paths to landlock_read_paths");
             }
-        };
-
-        // TLS証明書パス
-        let tls_cert_path = loaded_config.tls_cert_path.clone();
-        let tls_key_path = loaded_config.tls_key_path.clone();
-
-        // TLS証明書データ（事前読み込み済み、memfd経由でquicheに渡す）
-        let tls_cert_pem = loaded_config.tls_cert_pem.clone();
-        let tls_key_pem = loaded_config.tls_key_pem.clone();
-
-        // Landlock有効時の情報: memfd経由で証明書をロードするため、
-        // ファイルパスをlandlock_read_pathsに追加する必要はない
-        if loaded_config.global_security.enable_landlock {
-            info!("[HTTP/3] Landlock enabled - using memfd for certificate loading");
-            info!("[HTTP/3] No need to add certificate paths to landlock_read_paths");
-        }
-
-        info!("============================================");
-        info!("HTTP/3 (QUIC/UDP) Server");
-        info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
-        info!("HTTP/3 Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!(
-            "TLS Cert: {} (pre-loaded, {} bytes)",
-            tls_cert_path,
-            tls_cert_pem.len()
-        );
-        info!(
-            "TLS Key: {} (pre-loaded, {} bytes)",
-            tls_key_path,
-            tls_key_pem.len()
-        );
-        info!("============================================");
-
-        // [http3] セクションの quiche 輸送パラメータ・GSO/GRO・バッチ幅などをワーカーへ渡す。
-        // 証明書は memfd 経由で渡すため cert_path/key_path は空のまま、PEM バイトを差し込む。
-        let http3_server_base = loaded_config
-            .http3_config
-            .to_http3_config(&tls_cert_path, &tls_key_path);
-
-        // TCP/HTTP/2 と同様に thread-per-core: 各ワーカーが SO_REUSEPORT UDP ソケットを持ち、
-        // カーネルがフロー（5-tuple）単位でパケットを分散する。QUIC 状態はワーカー内で完結。
-        for thread_id in 0..num_threads {
-            let cert_pem = tls_cert_pem.clone();
-            let key_pem = tls_key_pem.clone();
-            let addr = http3_addr;
-            let mut worker_h3_config = http3_server_base.clone();
-
-            // CPUコアにピンニング
-            let assigned_core = core_ids.as_ref().map(|ids| {
-                let core_index = thread_id % ids.len();
-                ids[core_index]
-            });
-
-            let http3_handle = spawn_worker_thread(move || {
-                // スレッド開始直後にCPUアフィニティを設定
-                if let Some(core_id) = assigned_core {
-                    if core_affinity::set_for_current(core_id) {
-                        info!(
-                            "[HTTP/3 Worker {}] Pinned to CPU core {:?}",
-                            thread_id, core_id
-                        );
-                    } else {
-                        warn!(
-                            "[HTTP/3 Worker {}] Failed to pin to CPU core {:?}",
-                            thread_id, core_id
-                        );
-                    }
-                }
-
-                // memfd経由で証明書をロード（Landlock対応）
-                // 事前読み込み済みのPEMデータをmemfdに書き込み、
-                // /proc/self/fd/<fd>パス経由でquicheに渡す
-                //
-                // セキュリティ: Vec をクローンした後、Arc を即座にドロップして
-                // メインスレッドでのゼロ化を可能にする
-                let cert_data = (*cert_pem).clone();
-                let key_data = (*key_pem).clone();
-
-                // Arc 参照を即座にドロップ（参照カウントを減らす）
-                drop(cert_pem);
-                drop(key_pem);
-
-                worker_h3_config.cert_path = String::new(); // memfd使用時は不要
-                worker_h3_config.key_path = String::new(); // memfd使用時は不要
-                worker_h3_config.cert_pem = Some(cert_data);
-                worker_h3_config.key_pem = Some(key_data);
-
-                info!("[HTTP/3 Worker {}] Starting...", thread_id);
-
-                if let Err(e) = crate::http3_server::run_http3_server(addr, worker_h3_config) {
-                    error!("[HTTP/3 Worker {}] Server error: {}", thread_id, e);
-                }
-
-                info!("[HTTP/3 Worker {}] Stopped", thread_id);
-            });
-            handles.push(http3_handle);
-        }
-
-        // ローカル変数の Arc をドロップ（参照カウントを減らす）
-        drop(tls_cert_pem);
-        drop(tls_key_pem);
-    }
-
-    // 平文リスナーの UDS ソケットファイルパス（bind した場合のみ）。
-    // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
-    // `http2` feature 無効時は代入されないため `mut` が未使用になる。
-    #[cfg(unix)]
-    #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
-    let mut h2c_listener_unix_path: Option<std::path::PathBuf> = None;
-
-    // F-200: 平文のリスナー（`[server].listen_cleartext`）。HTTP/1.1 と h2c をプロトコル検出で
-    // 判別し、`allow_http`・`allow_h2c`・`enable_secure_redirect`（接続ごとに CURRENT_CONFIG を読む）に従う。
-    #[cfg(not(feature = "http2"))]
-    if loaded_config.listen_cleartext.is_some() {
-        error!("[server].listen_cleartext requires a build with the http2 feature");
-        return;
-    }
-    #[cfg(feature = "http2")]
-    if let Some(h2c_addr_str) = loaded_config.listen_cleartext.clone() {
-        // F-164: `unix:<path>` 形式（UDS）も受理する。
-        let h2c_listen_kind = match crate::listen_addr::ListenAddr::parse(&h2c_addr_str) {
-            Ok(k) => k,
-            Err(e) => {
-                error!("Invalid H2C listen address '{}': {}", h2c_addr_str, e);
-                return;
+            info!(
+                "[HTTP/3] TLS Cert: {} (pre-loaded, {} bytes), TLS Key: {} (pre-loaded, {} bytes)",
+                loaded_config.tls_cert_path,
+                loaded_config.tls_cert_pem.len(),
+                loaded_config.tls_key_path,
+                loaded_config.tls_key_pem.len()
+            );
+            // [http3] セクションの quiche 輸送パラメータ・GSO/GRO・バッチ幅などをワーカーへ渡す（全リスナー共通）。
+            // 証明書は memfd 経由で渡すため cert_path/key_path は空のまま、PEM バイトを差し込む。
+            let http3_server_base = loaded_config
+                .http3_config
+                .to_http3_config(&loaded_config.tls_cert_path, &loaded_config.tls_key_path);
+            for (spec, addr) in h3_listeners {
+                let workers = spec.worker_count(num_threads);
+                crate::listener_workers::spawn_http3_listener(
+                    spec,
+                    addr,
+                    workers,
+                    &http3_server_base,
+                    &loaded_config.tls_cert_pem,
+                    &loaded_config.tls_key_pem,
+                    &http3_pem_copied,
+                    &worker_env,
+                    &mut handles,
+                );
+                total += workers;
             }
-        };
-
-        // F-164: UDS の場合はワーカー spawn 前に 1 度だけ bind する
-        // （AF_UNIX には SO_REUSEPORT が無いため）。
-        let h2c_listener_source = match WorkerListenerSource::prepare(
-            &h2c_listen_kind,
-            &loaded_config.unix_socket_permissions,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Bind error on {}: {}", h2c_listen_kind, e);
-                return;
-            }
-        };
-        #[cfg(unix)]
-        {
-            h2c_listener_unix_path = h2c_listener_source
-                .unix_socket_path()
-                .map(|p| p.to_path_buf());
         }
-
-        info!("============================================");
-        info!("H2C (HTTP/2 Cleartext) Server");
-        info!("H2C Listen Address: {}", h2c_listen_kind);
-        info!("H2C Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!("============================================");
-
-        // 各ワーカースレッドでH2Cリスナーを起動
-        let core_ids = core_ids.clone();
-        for thread_id in 0..num_threads {
-            let h2c_listener_source = h2c_listener_source.clone();
-            let balancing = loaded_config.reuseport_balancing;
-            let max_conn = loaded_config.global_security.max_concurrent_connections;
-
-            // このスレッドに割り当てるコアIDを決定
-            let assigned_core = core_ids.as_ref().map(|ids| {
-                let core_index = thread_id % ids.len();
-                ids[core_index]
-            });
-
-            #[cfg(target_os = "freebsd")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            #[cfg(target_os = "openbsd")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            #[cfg(target_os = "macos")]
-            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
-            let h2c_handle = spawn_worker_thread(move || {
-                // スレッド開始直後にCPUアフィニティを設定
-                if let Some(core_id) = assigned_core {
-                    if core_affinity::set_for_current(core_id) {
-                        info!(
-                            "[H2C Worker {}] Pinned to CPU core {:?}",
-                            thread_id, core_id
-                        );
-                    } else {
-                        warn!(
-                            "[H2C Worker {}] Failed to pin to CPU core {:?}",
-                            thread_id, core_id
-                        );
-                    }
-                }
-
-                crate::runtime::block_on(async move {
-                    let listener =
-                        match h2c_listener_source.obtain(balancing, num_threads, thread_id) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                error!("[H2C Worker {}] Bind error: {}", thread_id, e);
-                                return;
-                            }
-                        };
-                    // capability mode・pledge・sandbox_init のバリア: bind 完了を通知（コールドパス。B-163）
-                    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
-                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
-
-                    info!("[H2C Worker {}] Started", thread_id);
-
-                    // F-46: H2C 接続ハンドラの型付きタスクプール
-                    let conn_pool = crate::runtime::TaskPool::new();
-
-                    loop {
-                        // Shutdown チェック
-                        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-                            info!("[H2C Worker {}] Shutting down...", thread_id);
-                            break;
-                        }
-
-                        // タイムアウト付きaccept
-                        let accept_result =
-                            timeout(Duration::from_secs(1), listener.accept()).await;
-
-                        let (stream, peer_addr) = match accept_result {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => {
-                                error!("[H2C Worker {}] Accept error: {}", thread_id, e);
-                                continue;
-                            }
-                            Err(_) => {
-                                // タイムアウト - ループを継続してshutdownチェック。
-                                // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
-                                crate::alloc_tune::idle_tick();
-                                continue;
-                            }
-                        };
-
-                        // F-155/H6: 1 周回で受理した接続数のローカルカウンタ。
-                        // バッチ内で spawn したタスクはまだ `ConnectionGuard::new()` を
-                        // 実行していない可能性があるため（spawn 直後はまだ poll されて
-                        // いない）、`CURRENT_CONNECTIONS` のロード値だけでは同一バッチ内で
-                        // 受理済みの分を勘定できない。`CURRENT_CONNECTIONS.load(..) +
-                        // batch_accepted` で判定することで、バッチ受理中に同時接続数
-                        // 上限を一時的に超えるのを防ぐ（メインワーカーと同じ方式）。
-                        let mut batch_accepted: usize = 0;
-
-                        // 1 件受理した接続の検証・処理ロジック（1 件目・バッチ内の残りで
-                        // 共通のため、ローカルクロージャへまとめる）。
-                        let mut handle_accepted =
-                            |mut stream: crate::runtime::tcp::TcpStream, peer_addr: SocketAddr| {
-                                // F-35: 最前線 IP ブロックリスト（プロトコル検出前に弾く）
-                                if crate::config::is_ip_blocked(peer_addr.ip()) {
-                                    return;
-                                }
-
-                                // 同時接続数制限チェック（上の doc コメント参照）。
-                                if max_conn > 0 {
-                                    let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed)
-                                        + batch_accepted;
-                                    if current >= max_conn {
-                                        warn!(
-                                            "[H2C Worker {}] Connection limit reached ({}/{}), rejecting connection from {}",
-                                            thread_id, current, max_conn, peer_addr
-                                        );
-                                        drop(stream);
-                                        return;
-                                    }
-                                }
-
-                                let _ = stream.set_nodelay(true);
-                                batch_accepted += 1;
-
-                                // H2C接続処理をspawn（パニック耐性あり・型付きプール）
-                                spawn_pooled_with_panic_catch(&conn_pool, async move {
-                                    let _guard = ConnectionGuard::new();
-                                    // H7: `peer_addr.ip().to_string()` のヒープ確保を排除し、
-                                    // メイン TLS ワーカー（`handle_connection`）と同じスタック
-                                    // 固定長バッファ（`IpStr`）を使う。`as_str()` の借用が
-                                    // `handle_h2c_connection(...).await` の呼び出し全体で
-                                    // 生存するよう、この async ブロック内で保持する。
-                                    let client_ip = crate::http_utils::IpStr::new(peer_addr.ip());
-                                    // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
-                                    // これにより、クライアントがまだプリフェースを送信していない場合でも
-                                    // 正しく処理できる
-                                    let (protocol_type, initial_data) =
-                                        detect_protocol_with_buffer(&mut stream).await;
-
-                                    match protocol_type {
-                                        // F-200: 受け入れ方は接続ごとに読む（SIGHUP で変えられる）。
-                                        ProtocolType::H2C
-                                            if CURRENT_CONFIG.load().cleartext.allow_h2c =>
-                                        {
-                                            let redirect =
-                                                CURRENT_CONFIG.load().cleartext.secure_redirect;
-                                            handle_h2c_connection(
-                                                stream,
-                                                client_ip.as_str(),
-                                                initial_data,
-                                                redirect,
-                                            )
-                                            .await;
-                                        }
-                                        ProtocolType::H2C => {
-                                            // allow_h2c = false: GOAWAY(PROTOCOL_ERROR) で閉じる（B-102 の作法）
-                                            debug!(
-                                                "[Cleartext] h2c is not allowed (allow_h2c = false), rejecting {}",
-                                                peer_addr
-                                            );
-                                            crate::proxy::reject_h2c_invalid_preface(stream).await;
-                                        }
-                                        ProtocolType::Http11
-                                            if CURRENT_CONFIG.load().cleartext.allow_http =>
-                                        {
-                                            if CURRENT_CONFIG.load().cleartext.secure_redirect {
-                                                crate::config::handle_http_redirect(
-                                                    stream,
-                                                    initial_data,
-                                                )
-                                                .await;
-                                            } else {
-                                                crate::proxy::handle_plain_http1_connection(
-                                                    stream,
-                                                    initial_data,
-                                                    peer_addr,
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                        ProtocolType::Http11 => {
-                                            // allow_http = false: 426 を返して閉じる
-                                            debug!(
-                                                "[Cleartext] plaintext HTTP/1.1 is not allowed (allow_http = false), rejecting {}",
-                                                peer_addr
-                                            );
-                                            crate::proxy::reject_plain_http1(stream).await;
-                                        }
-                                        ProtocolType::TLS => {
-                                            // 平文リスナーに TLS が来た（ポートの取り違え）
-                                            debug!(
-                                                "[Cleartext] TLS handshake on the cleartext listener from {}, closing",
-                                                peer_addr
-                                            );
-                                        }
-                                        ProtocolType::Closed => {
-                                            // 何も送らずに閉じた・アイドルのまま満了（TCP のヘルスチェック等。B-122）
-                                            debug!(
-                                                "[Cleartext] connection from {} closed before sending any data",
-                                                peer_addr
-                                            );
-                                        }
-                                        ProtocolType::Unknown => {
-                                            // 接続ごとのログなので debug（相手が任意に発生させられる。B-122）
-                                            debug!(
-                                                "[Cleartext] Unknown protocol from {}, closing connection",
-                                                peer_addr
-                                            );
-                                            // RFC 9113 §3.4: GOAWAY(PROTOCOL_ERROR) を返して閉じる。
-                                            crate::proxy::reject_h2c_invalid_preface(stream).await;
-                                        }
-                                    }
-                                });
-                            };
-
-                        handle_accepted(stream, peer_addr);
-
-                        // F-156: nginx の `multi_accept` 相当。1 件目に続けて、バックログに
-                        // 滞留している接続を合計最大 32 件（1 件目 + 31 件）まで一気に受理する。
-                        // メイン TLS ワーカー・L4 ワーカーと同じパターン。
-                        // io_uring バックエンド（`veil_rt_uring`）の `TcpListener` には
-                        // `accept_batch` が無い（io_uring パスのロジックは変更しない方針）ため、
-                        // reactor バックエンド（`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
-                        //
-                        // **効果は FreeBSD の既存ハーネスでは測定できない**（測定を試みた記録）:
-                        // `h2c_file_plain` は h2load が keep-alive で 64 接続を張りっぱなしに
-                        // するため、accept は計測開始時の 64 回しか実行されず、
-                        // 15 秒間のスループットにはほぼ寄与しない。実際、有無を変えた交互 A/B を
-                        // 2 回（計 8 ラウンド）取ったところ、1 回目は「有り」が一貫して劣り、
-                        // 2 回目は「有り」が一貫して勝つという逆の結果になり、8 サンプルの
-                        // 平均は 0.431 対 0.434 でほぼ同一だった（＝差は測定ノイズ）。
-                        // **この構成の数ラウンドの一致を根拠に採否を判断してはならない。**
-                        // 本最適化が効くのは短命接続が支配的なワークロードであり、
-                        // 評価するにはそれ用の負荷（接続確立レートを測るもの）が要る。
-                        #[cfg(veil_rt_reactor)]
-                        {
-                            if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
-                                error!("[H2C Worker {}] Accept error: {}", thread_id, e);
-                            }
-                        }
-                    }
-
-                    // グレースフルシャットダウン: 既存接続の完了を待機
-                    drain_connections("H2C Worker", thread_id).await;
-
-                    info!("[H2C Worker {}] Stopped", thread_id);
-                });
-                crate::runtime::shutdown_thread();
-            });
-            handles.push(h2c_handle);
-        }
+        total
+    };
+    #[cfg(not(feature = "http3"))]
+    if loaded_config.listeners.iter().any(|l| l.http3.is_some()) {
+        warn!("HTTP/3 is configured but this build does not include the http3 feature; ignoring");
     }
 
     // L4 (TCP/UDP) ストリームプロキシリスナーを起動（F-18）
@@ -1961,14 +1405,19 @@ pub fn run_server(opts: ServerOptions) {
         }
     }
 
-    // HTTP/3 ワーカーが証明書データをクローンするまで短時間待機
-    // その後、LoadedConfig の証明書データをセキュアにゼロ化
+    // HTTP/3 の全ワーカーが証明書データを写し終えるのを数えてから、LoadedConfig の証明書データを
+    // セキュアにゼロ化する（F-260: 複数の HTTP/3 リスナーの全員が写すまで消さない）
     #[cfg(feature = "http3")]
-    if loaded_config.http3_enabled {
-        // ワーカースレッドが Arc 参照をドロップするまで少し待機
-        // 理由付き allow: メインスレッドで一度だけ実行する起動後の待機（ワーカーの Arc ドロップ待ち）。イベントループ外。
-        #[allow(clippy::disallowed_methods)]
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if http3_workers > 0 {
+        // 起動直後に一度だけの待ち（ワーカーの PEM の複製と Arc の解放待ち）。最大 ~5 秒。
+        for _ in 0..500 {
+            if http3_pem_copied.load(Ordering::Acquire) >= http3_workers {
+                break;
+            }
+            // 理由付き allow: メインスレッドで一度だけ実行する起動後の待機（ワーカーの Arc ドロップ待ち）。イベントループ外。
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // LoadedConfig の証明書データをセキュアにゼロ化
         secure_clear_arc_vec(
@@ -1997,13 +1446,8 @@ pub fn run_server(opts: ServerOptions) {
     // F-164: veil 自身が bind した UDS ソケットファイルを unlink する
     // （全ワーカー join 後 = accept ループが抜けて fd が close された後）。
     #[cfg(unix)]
-    {
-        if let Some(path) = main_listener_unix_path {
-            crate::server::unlink_unix_socket(&path);
-        }
-        if let Some(path) = h2c_listener_unix_path {
-            crate::server::unlink_unix_socket(&path);
-        }
+    for path in &unix_socket_paths {
+        crate::server::unlink_unix_socket(path);
     }
 
     // F-10: OpenTelemetry エクスポータをクリーンに停止（最終 flush 込み）

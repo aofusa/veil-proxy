@@ -58,7 +58,7 @@ pub struct VdsConfig {
     pub cluster: String,
     /// Bearer トークンを読むファイル（要求ごとに読み直す。空なら送らない）。
     pub token_file: String,
-    /// https の追加の信頼 CA（PEM、空なら webpki-roots のみ）。
+    /// https の追加の信頼 CA（PEM、空なら `[tls_client] ca` のみ）。
     pub ca_cert: String,
     /// mTLS のクライアント証明書・鍵（PEM、両方指定したときだけ使う）。
     pub client_cert: String,

@@ -1,6 +1,6 @@
 # B-221: HPACK のエンコーダの動的表がピアの `SETTINGS_HEADER_TABLE_SIZE` をそのまま上限にして、1 接続で無制限に育つ
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー PR-01）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -33,6 +33,13 @@
 - 単体: `SETTINGS_HEADER_TABLE_SIZE = u32::MAX` の後に 10 万要求を流しても動的表のサイズが 4096 を超えない。
 - fuzz: HTTP/2 の接続状態機械（SETTINGS → HEADERS → CONTINUATION → DATA の列）に RSS の上限を assert する target（F-279）。
 - h2spec・性能の交互 A/B（HTTP/2 の 3B・54KB）が変わらないこと。
+
+## 修正（v0.10.0）
+
+- エンコーダの動的表の上限を、ピアの `SETTINGS_HEADER_TABLE_SIZE` と自前の上限 4096（`hpack::encoder::MAX_ENCODER_TABLE_SIZE`）の小さい方に丸める。
+  `HpackEncoder::new`・`set_max_table_size` の中で丸めるので、下流の接続（`http2/connection.rs`）・上流の多重化（`http2/upstream_mux.rs`）の両方に効く。
+- 単体: `SETTINGS_HEADER_TABLE_SIZE = u32::MAX` の後に値が毎回違うヘッダで 10 万回エンコードしても表が 4096 を超えない
+  （`test_peer_huge_table_size_is_clamped`）。
 
 ## 関連
 

@@ -302,11 +302,10 @@ pub fn tls_peer_cert(port: u16, sni: &str) -> std::io::Result<Vec<u8>> {
         .ok_or_else(|| std::io::Error::other("no peer certificate"))
 }
 
-#[cfg(unix)]
+/// 証明書を検証しない（自己署名の試験用）
 #[derive(Debug)]
-struct NoVerify;
+pub struct NoVerify;
 
-#[cfg(unix)]
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
@@ -342,6 +341,91 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// TLS で ALPN に `alpn` を出してハンドシェイクし、HTTP/1.1 の GET（`Connection: close`）を送る（F-260）。
+/// (ネゴシエートした ALPN, 応答)。ALPN で h2 が選ばれたら HTTP/1.1 は送らず応答は `None`。
+pub fn tls_alpn_get(
+    port: u16,
+    alpn: &[&[u8]],
+    path: &str,
+) -> std::io::Result<(Option<Vec<u8>>, Option<HttpResponse>)> {
+    use std::sync::Arc;
+    let _ = veil::tls_provider::provider::default_provider().install_default();
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    let name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), name)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let sock = connect_local(port, Duration::from_secs(2))?;
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+    while tls.conn.is_handshaking() {
+        tls.conn.complete_io(&mut tls.sock)?;
+    }
+    let negotiated = tls.conn.alpn_protocol().map(|p| p.to_vec());
+    if negotiated.as_deref() == Some(b"h2") {
+        return Ok((negotiated, None));
+    }
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    tls.write_all(req.as_bytes())?;
+    let mut raw = Vec::new();
+    // close_notify なしで閉じられても読めた分で解析する
+    let _ = tls.read_to_end(&mut raw);
+    Ok((negotiated, Some(parse_http1_response(&raw)?)))
+}
+
+/// HTTP/3 で GET してステータスを返す（quinn + h3、証明書は検証しない。F-260）。
+#[cfg(feature = "http3")]
+pub fn h3_get_status(port: u16, path: &str) -> Result<u16, String> {
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let run = async {
+            let _ = veil::tls_provider::provider::default_provider().install_default();
+            let mut tls = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+                .map_err(|e| e.to_string())?;
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| e.to_string())?;
+            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let conn = endpoint
+                .connect(addr, "localhost")
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                let _ = driver.wait_idle().await;
+            });
+            let req = http::Request::builder()
+                .method("GET")
+                .uri(format!("https://localhost:{port}{path}"))
+                .body(())
+                .unwrap();
+            let mut stream = send.send_request(req).await.map_err(|e| e.to_string())?;
+            stream.finish().await.map_err(|e| e.to_string())?;
+            let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
+            Ok::<u16, String>(resp.status().as_u16())
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .map_err(|_| "HTTP/3 request timed out".to_string())?
+    })
 }
 
 /// h2c（prior knowledge）で GET し、(status, body) を返す（h2 クレート + tokio のテスト専用クライアント）。

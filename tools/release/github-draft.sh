@@ -10,12 +10,13 @@ set -euo pipefail
 TAG="${1:?tag}"; TITLE="${2:?title}"; NOTES="${3:?notes}"; ASSETS="${4:?assets dir}"; PRE="${5:?prerelease}"
 REPO="${GITHUB_REPOSITORY:-aofusa/veil-proxy}"
 
-state="$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+# B-208: API の一時的な失敗は none と見なさず失敗にする
+state="$(GITHUB_REPOSITORY="$REPO" "$(dirname "$0")/release-state.sh" "$TAG")"
 case "$state" in
-    false)
+    published)
         echo "::error title=GitHub Release::$TAG is already published; not touching it"
         exit 1 ;;
-    true)
+    draft)
         echo "updating the existing draft for $TAG"
         gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes-file "$NOTES" --draft --prerelease="$PRE"
         gh release upload "$TAG" --repo "$REPO" --clobber "$ASSETS"/*

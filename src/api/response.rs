@@ -13,6 +13,31 @@ pub struct Response {
     // F-197
     /// Streaming body (sent in place of `body` when present).
     pub(crate) stream: Option<super::stream::BodyStream>,
+    // F-261
+    /// Protocol upgrade (`101 Switching Protocols`): the protocol name and the function that takes the connection.
+    // Box: 応答の大きさを増やさない（ハンドラの戻り値・抽出子の `Err` として毎要求ムーブされる）
+    pub(crate) upgrade: Option<Box<super::upgrade::UpgradeHook>>,
+    // F-270
+    /// Set by [`Response::no_compression`]: the route's `[route.compression]` leaves this response alone.
+    pub(crate) no_compress: bool,
+    // F-267: 送り終えた後に呼ぶ関数（使わない応答は None の確認だけ。Box で応答の大きさを 8 バイトに抑える）
+    pub(crate) after_send: Option<Box<AfterSend>>,
+}
+
+// F-267
+/// Functions run once the response has been sent (see [`Response::after_send`]). They run on the worker that sent
+/// the response, when the protocol layer is done with it (or when the response is dropped without being sent).
+pub struct AfterSend(Vec<Box<dyn FnOnce() + Send>>);
+
+impl Drop for AfterSend {
+    fn drop(&mut self) {
+        for f in self.0.drain(..) {
+            // 1 つの失敗で残りを止めない（panic はここで捕まえて記録する）
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                ftlog::error!("[api] an after-send callback panicked");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Response {
@@ -22,6 +47,7 @@ impl std::fmt::Debug for Response {
             .field("headers", &self.headers)
             .field("body_len", &self.body.len())
             .field("streaming", &self.stream.is_some())
+            .field("upgrade", &self.upgrade.is_some())
             .finish()
     }
 }
@@ -39,6 +65,9 @@ impl Response {
             headers: Vec::new(),
             body: Bytes::new(),
             stream: None,
+            upgrade: None,
+            no_compress: false,
+            after_send: None,
         }
     }
 
@@ -51,6 +80,9 @@ impl Response {
             )],
             body,
             stream: None,
+            upgrade: None,
+            no_compress: false,
+            after_send: None,
         }
     }
 
@@ -95,7 +127,69 @@ impl Response {
             body: Bytes::new(),
             // fuse: 送出側は終端の後にもう一度 poll することがある（`stream::coalesce`）
             stream: Some(Box::pin(futures::StreamExt::fuse(body))),
+            upgrade: None,
+            no_compress: false,
+            after_send: None,
         }
+    }
+
+    // F-261
+    /// `101 Switching Protocols` to `protocol` (HTTP/1.1 only). After the response head is written, the connection
+    /// (with any bytes the client already sent after the request) is passed to `on_upgrade`, which runs on the
+    /// worker thread until it returns; the connection closes when the [`Upgraded`](super::upgrade::Upgraded) is dropped.
+    ///
+    /// The request must carry `Connection: upgrade` and `Upgrade`, be HTTP/1.1 and have no body; otherwise the
+    /// response is replaced with 400 (HTTP/2 and HTTP/3 have no upgrades). Headers added with `with_header` are sent
+    /// with the 101. `h2c` is reserved (500).
+    pub fn switching_protocols<F, Fut>(protocol: &str, on_upgrade: F) -> Response
+    where
+        F: FnOnce(super::upgrade::Upgraded) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let mut r = Response::new(101);
+        r.upgrade = Some(Box::new(super::upgrade::UpgradeHook::new(
+            protocol, on_upgrade,
+        )));
+        r
+    }
+
+    // F-267
+    /// Runs `f` after the response has been sent: on HTTP/1.1 once the last byte is written, on HTTP/2 and HTTP/3
+    /// once the last frame is queued for the connection (and also if the response is dropped unsent, for example
+    /// when the client disconnects). `f` runs on the worker; start longer work from it with `veil::runtime::spawn`
+    /// or the handler pool. Several calls run in order.
+    pub fn after_send(mut self, f: impl FnOnce() + Send + 'static) -> Response {
+        match &mut self.after_send {
+            Some(a) => a.0.push(Box::new(f)),
+            None => self.after_send = Some(Box::new(AfterSend(vec![Box::new(f)]))),
+        }
+        self
+    }
+
+    /// Takes the after-send callbacks (protocol layers and middleware that build a new response move them over).
+    pub fn take_after_send(&mut self) -> Option<Box<AfterSend>> {
+        self.after_send.take()
+    }
+
+    /// Puts back callbacks taken with [`Response::take_after_send`] (appended after any already present).
+    pub fn set_after_send(&mut self, a: Option<Box<AfterSend>>) {
+        let Some(mut a) = a else { return };
+        match &mut self.after_send {
+            Some(cur) => cur.0.append(&mut a.0),
+            None => self.after_send = Some(a),
+        }
+    }
+
+    // F-270
+    /// Keeps this response uncompressed even when the route compresses responses (`[route.compression]`).
+    pub fn no_compression(mut self) -> Response {
+        self.no_compress = true;
+        self
+    }
+
+    /// Whether this is a protocol upgrade response ([`Response::switching_protocols`]).
+    pub fn is_upgrade(&self) -> bool {
+        self.upgrade.is_some()
     }
 
     /// Whether this is a streaming response.

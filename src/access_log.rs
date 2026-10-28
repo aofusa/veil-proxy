@@ -429,6 +429,26 @@ pub(crate) fn build_json_log(
     buf.push(b'\n');
 }
 
+/// テキスト形式のログへ要求由来の値を書く。制御文字・`\`・0x7f 以上を `\xNN` にする（nginx の `escape=default` と同じ）。
+///
+/// 端末で `tail` したときに ESC 等のエスケープ列が解釈されて画面を消したり偽のログ行を作ったりしないように（B-233）。
+/// ほとんどの値は印字可能な ASCII だけなので、そのときは確保もせずそのまま書く。
+#[inline]
+fn write_text_escaped(buf: &mut Vec<u8>, s: &[u8]) {
+    if s.iter().all(|&b| (0x20..0x7f).contains(&b) && b != b'\\') {
+        buf.extend_from_slice(s);
+        return;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in s {
+        if (0x20..0x7f).contains(&b) && b != b'\\' {
+            buf.push(b);
+        } else {
+            buf.extend_from_slice(&[b'\\', b'x', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]]);
+        }
+    }
+}
+
 /// テキスト形式（key=value スペース区切り）でアクセスログをバッファに書き込む
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_assignments)]
@@ -474,13 +494,13 @@ pub(crate) fn build_text_log(
     buf.extend_from_slice(b"type=access");
     first = false;
     text_field!("method", {
-        buf.extend_from_slice(method.as_bytes());
+        write_text_escaped(buf, method.as_bytes());
     });
     text_field!("host", {
-        buf.extend_from_slice(host.as_bytes());
+        write_text_escaped(buf, host.as_bytes());
     });
     text_field!("path", {
-        buf.extend_from_slice(path.as_bytes());
+        write_text_escaped(buf, path.as_bytes());
     });
     text_field!("status", {
         write_u16(buf, status);
@@ -492,7 +512,7 @@ pub(crate) fn build_text_log(
         buf.extend_from_slice(client_ip.as_bytes());
     });
     text_field!("upstream", {
-        buf.extend_from_slice(upstream.as_bytes());
+        write_text_escaped(buf, upstream.as_bytes());
     });
     text_field!("req_body_size", {
         write_u64(buf, req_body_size);
@@ -501,7 +521,7 @@ pub(crate) fn build_text_log(
         write_u64(buf, resp_body_size);
     });
     text_field!("user_agent", {
-        buf.extend_from_slice(user_agent.as_bytes());
+        write_text_escaped(buf, user_agent.as_bytes());
     });
 
     buf.push(b'\n');
@@ -758,6 +778,31 @@ mod tests {
         );
         assert!(s.contains("\"method\":\"GET\""));
         assert!(!s.contains("\"host\""));
+    }
+
+    #[test]
+    // B-233: 要求由来の値の制御文字（ESC 等）・`\`・非 ASCII はテキストのログで \xNN になる
+    fn test_text_log_escapes_control_characters() {
+        let mut buf = Vec::new();
+        build_text_log(
+            &mut buf,
+            test_dt(),
+            "GET",
+            "example.com",
+            "/a\x1b[2Jb\\c",
+            200,
+            1,
+            "1.2.3.4",
+            "",
+            0,
+            0,
+            "UA\nfake=1 é",
+            &[],
+        );
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("path=/a\\x1b[2Jb\\x5cc"), "{s}");
+        assert!(s.contains("user_agent=UA\\x0afake=1 \\xc3\\xa9"), "{s}");
+        assert_eq!(s.matches('\n').count(), 1, "{s}");
     }
 
     #[test]

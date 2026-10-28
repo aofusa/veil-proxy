@@ -27,12 +27,23 @@ extern "C" {
 #define VEIL_ERR_UTF8        (-4) /* 文字列が UTF-8 ではない */
 #define VEIL_ERR_CLOSED      (-5) /* 相手が切断した・ストリームが閉じている (F-210) */
 #define VEIL_ERR_STATE       (-6) /* 呼べない状態 (INLINE でのストリーミング・単項の 2 回目の送信等) */
+#define VEIL_ERR_FORM        (-7) /* フォームの本文が壊れている (400 を返す。F-266) */
+#define VEIL_ERR_TOO_LARGE   (-8) /* フォームの本文が [api] multipart_* の上限を超えた (413 を返す。F-266) */
 
 /* ---- ルートのフラグ ---- */
 /* コールバックをワーカースレッド上で直接実行する (既定はハンドラ用プール)。 */
 #define VEIL_ROUTE_INLINE 1u
 /* 要求本文を溜めずにコールバックを呼ぶ (veil_request_body_read で順に読む。INLINE とは併用不可)。 */
 #define VEIL_ROUTE_STREAM_BODY 2u
+/*
+ * コールバックの前に本文を読み、multipart/form-data はパートに分ける (F-266。STREAM_BODY とは併用不可)。
+ * [api] multipart_spool_threshold を超えるファイルは名前の無い一時ファイル ([api] upload_tmp_dir) に書き、
+ * veil_multipart_next の fd で渡す (本文全体をメモリに溜めない)。壊れた本文は 400、上限超えは 413 を
+ * コールバックの前に返す。
+ */
+#define VEIL_ROUTE_FORM 4u
+/* このルートの応答を [route.compression] / [api] compression で圧縮しない (F-270)。 */
+#define VEIL_ROUTE_NO_COMPRESS 8u
 
 /* ---- 不透明型 ---- */
 typedef struct veil_config   veil_config_t;   /* 設定 + 登録待ちルート */
@@ -70,6 +81,42 @@ int veil_config_tls(veil_config_t *cfg, const char *cert_path, const char *key_p
 
 /* ワーカースレッド数 ([server].threads)。 */
 int veil_config_threads(veil_config_t *cfg, uint32_t n);
+
+/*
+ * 待ち受け 1 個 ([[listener]]、F-260)。veil_config_add_listener に渡す。
+ * 0 で埋めたものが既定 (`veil_listener_t l = { .listen = "0.0.0.0:8080" };` は平文の HTTP/1.1 + h2c)。
+ * 文字列は NULL なら省略。http2・allow_http・allow_h2c・secure_redirect は 3 値:
+ * VEIL_DEFAULT (0) = 省略 (既定)、VEIL_ON (正) = true、VEIL_OFF (負) = false。threads は 0 なら省略。
+ * size は sizeof(veil_listener_t) (VEIL_LISTENER_INIT が入れる)。0 はこの版 (0.10) の大きさとして読む。
+ * 後の版でフィールドを末尾に足しても、古いヘッダでビルドした呼び出しは size までしか読まれない。
+ */
+#define VEIL_DEFAULT 0
+#define VEIL_ON      1
+#define VEIL_OFF     (-1)
+typedef struct {
+    size_t size;                         /* sizeof(veil_listener_t)、または 0 */
+    const char *name;                    /* ログ・redirect_to の名前 (NULL = "listener-<添字>") */
+    const char *listen;                  /* 必須。"host:port" か "unix:<path>" */
+    int tls;                             /* 0 = 平文 (HTTP/1.1 + h2c)、非 0 = TLS (veil_config_tls の証明書) */
+    int http2;                           /* TLS: ALPN に h2 を出すか (既定 [server].http2_enabled) */
+    int http3;                           /* TLS: 非 0 なら同じポートの UDP で HTTP/3 */
+    const char *http3_listen;            /* HTTP/3 の UDP を別のアドレスにするとき */
+    int allow_http;                      /* 平文: HTTP/1.1 を受けるか (既定 on) */
+    int allow_h2c;                       /* 平文: h2c を受けるか (既定 on) */
+    int secure_redirect;                 /* 平文: https へ 301 で返すか (既定 off) */
+    const char *redirect_to;             /* 平文: リダイレクト先のポートを取る TLS のリスナー名 */
+    uint32_t threads;                    /* このリスナーのワーカー数 */
+    const char *unix_socket_permissions; /* unix:<path> のパーミッション ("0660" 等) */
+} veil_listener_t;
+/* 既定の値で初期化する: veil_listener_t l = VEIL_LISTENER_INIT; l.listen = "..."; */
+#define VEIL_LISTENER_INIT { sizeof(veil_listener_t) }
+
+/*
+ * 待ち受けを 1 個足す ([[listener]])。ポートごとに 1 回呼ぶ。1 個でも足すと、ライブラリ既定の
+ * 127.0.0.1:8080 (listen_cleartext) は veil_config_listen_cleartext で明示しない限り開かない。
+ */
+/* VEIL_ERR_INVALID_ARG: listener が NULL、listen が無い、size が 0 でも sizeof(veil_listener_t) 以上でもない。 */
+int veil_config_add_listener(veil_config_t *cfg, const veil_listener_t *listener);
 
 /* 設定を解放する。veil_run に渡した後は呼ばない。NULL は何もしない。 */
 void veil_config_free(veil_config_t *cfg);
@@ -124,6 +171,29 @@ const char *veil_request_query_param(const veil_request_t *req, const char *name
 /* 送信元 IP の文字列表現。 */
 const char *veil_request_client_ip(const veil_request_t *req, size_t *len);
 
+/* ---- multipart/form-data (F-266) ---- */
+
+/* 1 パート。ポインタはコールバックの間だけ有効 (NUL 終端ではない)。 */
+typedef struct {
+    const char *name;          /* Content-Disposition の name (無ければ NULL) */
+    size_t name_len;
+    const char *filename;      /* filename (ファイルでなければ NULL。filename* は UTF-8 に復号済み) */
+    size_t filename_len;
+    const char *content_type;  /* パートの Content-Type (無ければ NULL) */
+    size_t content_type_len;
+    const char *data;          /* 中身 (一時ファイルに書いたときは NULL) */
+    size_t data_len;
+    intptr_t fd;               /* 一時ファイルの fd (Windows は HANDLE)。先頭に位置づけ済み。メモリなら -1。
+                                  コールバックから戻ると veil が閉じる (残すなら dup する) */
+    uint64_t size;             /* 中身のバイト数 */
+} veil_part_t;
+
+/*
+ * 次のパートを *out に入れる。1 = 入れた、0 = 終わり。VEIL_ERR_FORM (400)・VEIL_ERR_TOO_LARGE (413)・
+ * VEIL_ERR_STATE (multipart の本文ではない)。VEIL_ROUTE_FORM の無いルートは溜めた本文を解析する。
+ */
+int veil_multipart_next(const veil_request_t *req, veil_part_t *out);
+
 /* ---- レスポンスのセッター (成功で 0、失敗で負のエラーコード) ---- */
 
 /* ステータス (100-599)。 */
@@ -136,6 +206,8 @@ int veil_response_set_body(veil_response_t *resp, const uint8_t *data, size_t le
 int veil_response_set_text(veil_response_t *resp, const char *text);
 /* application/json の本文 (呼び出し側が正しい JSON を渡す)。 */
 int veil_response_set_json(veil_response_t *resp, const char *json);
+/* この応答を圧縮しない (ルートが [route.compression] / [api] compression で圧縮するときも。F-270)。 */
+int veil_response_no_compression(veil_response_t *resp);
 
 /* ---- ストリーミング (F-210。ハンドラ用プールのルートだけ) ----
  *
@@ -173,6 +245,9 @@ typedef int (*veil_grpc_fn)(veil_grpc_call_t *call, void *user_data);
 int veil_register_grpc(veil_config_t *cfg, const char *path, uint32_t kind, veil_grpc_fn fn, void *user_data);
 /* grpc.health.v1.Health (Check・Watch) を登録する。 */
 int veil_register_grpc_health(veil_config_t *cfg);
+/* gRPC のメソッドの型を OpenAPI に載せる FileDescriptorSet (protoc --include_imports --descriptor_set_out の出力)。
+ * data はこの呼び出しの間だけ読む。 */
+int veil_grpc_descriptors(veil_config_t *cfg, const uint8_t *data, size_t len);
 /*
  * 次の受信メッセージ。1 = 受け取った (*data・*len は次の recv かコールバックの終わりまで有効)、0 = 終わり、
  * 負 = エラー (壊れた・大きすぎるメッセージ)。単項・サーバストリーミングは 1 通だけ返す。
@@ -205,6 +280,14 @@ typedef struct {
 } veil_l4_tcp_callbacks_t;
 int veil_register_l4_tcp(veil_config_t *cfg, const char *name, const char *listen,
                          const veil_l4_tcp_callbacks_t *callbacks, void *user_data);
+/*
+ * HTTP/1.1 のプロトコルアップグレード (F-261): 応答を 101 Switching Protocols (Upgrade: protocol) にし、
+ * 101 を書いた後の接続を上の L4 の TCP コールバックで受ける (on_connect → on_data … → on_close。
+ * veil_l4_write・veil_l4_close が使える)。resp に設定済みのヘッダは 101 と一緒に送る。
+ * 要求が Connection: upgrade + Upgrade を持たない・本文付き・HTTP/2・HTTP/3 なら 400 になる。h2c は予約 (500)。
+ */
+int veil_response_upgrade(veil_response_t *resp, const char *protocol, const veil_l4_tcp_callbacks_t *callbacks,
+                          void *user_data);
 int veil_l4_write(veil_l4_conn_t *conn, const uint8_t *data, size_t len);
 void veil_l4_close(veil_l4_conn_t *conn);
 const char *veil_l4_peer(const veil_l4_conn_t *conn, size_t *len);
@@ -217,6 +300,32 @@ typedef int (*veil_l4_udp_fn)(const uint8_t *data, size_t len, const char *peer,
 int veil_register_l4_udp(veil_config_t *cfg, const char *name, const char *listen, veil_l4_udp_fn fn,
                          void *user_data);
 int veil_l4_reply(veil_l4_reply_t *reply, const uint8_t *data, size_t len);
+
+/* ---- WebSocket (RFC 6455、F-262) ----
+ *
+ * ハンドラの中で veil_ws_accept を呼ぶと応答が 101 になり、その後の接続をコールバックで受ける
+ * (ハンドラ用プールで、接続ごとに 1 つずつ順に呼ばれる)。Ping への Pong・閉じる手順・断片の組み立て・
+ * UTF-8 の検査は veil が行う。veil_ws_send・veil_ws_close は on_open から on_close が戻るまでの間なら
+ * どのスレッドからでも呼べる (送信キューに積んで戻る)。HTTP/1.1 だけ (HTTP/2・HTTP/3 では 400)。
+ */
+#define VEIL_WS_TEXT   1
+#define VEIL_WS_BINARY 2
+typedef struct veil_ws veil_ws_t;
+typedef struct {
+    int (*on_open)(veil_ws_t *ws, void *user_data);                                          /* 非 0 で閉じる (on_close は呼ばれない) */
+    int (*on_message)(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len, void *user_data); /* 非 0 で閉じる (1000) */
+    void (*on_close)(veil_ws_t *ws, uint16_t code, void *user_data); /* 相手の Close のコード (無ければ 1005、切断は 1006、停止は 1001)。on_open が 0 なら必ず 1 回呼ばれる */
+} veil_ws_callbacks_t;
+/* 0 = 受け入れた (resp は 101)。VEIL_ERR_STATE = ハンドシェイクが正しくない (resp は 400 か 426。そのまま返してよい)。 */
+int veil_ws_accept(const veil_request_t *req, veil_response_t *resp, const veil_ws_callbacks_t *callbacks,
+                   void *user_data);
+/* 送る (コピーする)。VEIL_ERR_CLOSED = 閉じた後、VEIL_ERR_STATE = 送信キューが一杯 (16 MiB)、VEIL_ERR_UTF8 = テキストが UTF-8 でない。 */
+int veil_ws_send(veil_ws_t *ws, int opcode, const uint8_t *data, size_t len);
+/* code の Close を送って閉じる手順を始める。 */
+int veil_ws_close(veil_ws_t *ws, uint16_t code);
+const char *veil_ws_peer(const veil_ws_t *ws, size_t *len);
+void veil_ws_set_data(veil_ws_t *ws, void *data);
+void *veil_ws_data(const veil_ws_t *ws);
 
 /* ---- その他 ---- */
 

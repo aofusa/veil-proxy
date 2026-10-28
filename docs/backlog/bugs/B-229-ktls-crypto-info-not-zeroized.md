@@ -1,6 +1,6 @@
 # B-229: kTLS の `CryptoInfo`（鍵・IV・シーケンス）を `setsockopt` に渡した後にゼロ化していない
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー ZC-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -21,6 +21,10 @@
 ## 受け入れ条件
 
 - 単体: `setup_tls_info` の後に構造体の領域がゼロであること（`Drop` の後の読み出しは UB なので、`zeroize` を明示的に呼ぶ関数を試験する）。
+
+## 修正（v0.10.0）
+
+- `CryptoInfo`（と FreeBSD の `TlsKeyMaterial`）に Drop を足し、`secure_clear` で鍵・IV・ソルト・シーケンスをゼロ化する（volatile 書き込み）。`setsockopt` に渡した後の drop・失敗の経路のどちらでも消える。
 
 ## 関連
 

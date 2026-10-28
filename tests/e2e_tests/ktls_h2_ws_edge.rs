@@ -92,6 +92,78 @@ pub(super) async fn test_ktls_tls_handshake() {
     }
 }
 
+/// B-258: クライアントが最後のフライト（Finished）と最初の要求を続けて送り、veil の最後の読み取りが要求のレコードの
+/// 途中で切れても、kTLS へ移った後にその要求を正しく読める（境界まで読み足してから移る）。
+/// kTLS の構成（`./tests/e2e_setup.sh test ktls`）で意味を持つ。既定の構成では rustls のまま通る。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "ktls")]
+pub(super) async fn test_b258_request_record_split_after_handshake() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+        let mut sock = TcpStream::connect(("127.0.0.1", PROXY_PORT)).map_err(|e| e.to_string())?;
+        sock.set_nodelay(true).ok();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut conn = ClientConnection::new(
+            create_client_config(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        // ハンドシェイク（クライアントの最後のフライトはまだ送らない）
+        while conn.is_handshaking() {
+            if conn.wants_write() {
+                conn.write_tls(&mut sock).map_err(|e| e.to_string())?;
+                continue;
+            }
+            conn.read_tls(&mut sock).map_err(|e| e.to_string())?;
+            conn.process_new_packets().map_err(|e| e.to_string())?;
+        }
+        conn.writer()
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut out).map_err(|e| e.to_string())?;
+        }
+        // Finished と要求のレコードの先頭を 1 回で、要求のレコードの最後の 10 バイトを後から送る
+        let cut = out.len() - 10;
+        sock.write_all(&out[..cut]).map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_millis(200));
+        sock.write_all(&out[cut..]).map_err(|e| e.to_string())?;
+
+        let mut resp = Vec::new();
+        loop {
+            match conn.read_tls(&mut sock) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if resp.is_empty() => return Err(format!("read: {e}")),
+                Err(_) => break,
+            }
+            if let Err(e) = conn.process_new_packets() {
+                return Err(format!("tls: {e}"));
+            }
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = conn.reader().read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                resp.extend_from_slice(&buf[..n]);
+            }
+            if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&resp).into_owned())
+    })
+    .await
+    .unwrap();
+    let resp = result.expect("the request split across the handshake must be answered");
+    assert_eq!(get_status_code(&resp), Some(200), "response: {resp}");
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 #[cfg(feature = "ktls")]

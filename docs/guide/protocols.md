@@ -125,6 +125,9 @@ Notes:
   (a separate port). With no `listen`, the server is plaintext-only and needs no `[tls]`.
 - There is no ALPN negotiation (prior knowledge). Do not expose plaintext listeners to untrusted networks.
 - See [Listeners](configuration.md#listeners-listen-and-listen_cleartext) for the full rules and the migration table.
+- To run several TLS and plaintext listeners in one process (for example HTTP/1.1-only TLS, h2c-only and
+  HTTP/2 + HTTP/3 on different ports), use `[[listener]]`; each listener sets its own `http2`, `http3`, `allow_http`
+  and `allow_h2c`. See [Multiple listeners](configuration.md#multiple-listeners-listener).
 
 ## HTTP/3 Support
 
@@ -134,11 +137,11 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 
 | Feature | Effect |
 |---------|--------|
-| 0-RTT Connection Establishment | Instant communication without TLS handshake |
+| 1-RTT connection establishment | QUIC combines the transport and TLS handshakes; 0-RTT data is accepted but requests are processed only after the handshake completes (no replay) |
 | Head-of-Line Blocking Elimination | Packet loss doesn't affect other streams |
 | Connection Migration | Maintains connection during network switches |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
-| Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default BBR + pacing |
+| Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default cubic + pacing |
 | io_uring pipelined UDP I/O | Receive/send hot path uses pipelined `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG` (batch via `mmsg_batch_size`, default 64); no libc `recvmmsg`/`sendmmsg` on the hot path (F-130) |
 
 ### Enabling
@@ -156,6 +159,10 @@ listen = "0.0.0.0:443"
 [http3]
 enabled = true  # Enable HTTP/3 (QUIC/UDP) on listen's address; needs `listen` and [tls]
 ```
+
+`[http3] enabled` applies to `[server].listen`. A `[[listener]]` turns HTTP/3 on with its own `http3 = true`
+(UDP on the same address, or `http3_listen`); the other `[http3]` keys apply to every HTTP/3 listener, and
+`Alt-Svc` advertises the first one. See [Multiple listeners](configuration.md#multiple-listeners-listener).
 
 ### Advanced Configuration
 

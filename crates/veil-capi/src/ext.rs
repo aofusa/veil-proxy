@@ -14,7 +14,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use veil::api::bridge::ResponseWriter;
 use veil::api::grpc::blocking::GrpcCall;
-use veil::api::grpc::{Code, Status};
+use veil::api::grpc::{Code, MethodKind, Status};
 use veil::api::l4::{L4Out, L4Session};
 use veil::api::App;
 
@@ -247,11 +247,43 @@ pub unsafe extern "C" fn veil_register_grpc(
     }
     let path = path.to_string();
     let ud = UserData(user_data);
+    // F-265: OpenAPI に載せる種類
+    let method_kind = MethodKind::from_streaming(!single_in(kind), !single_out(kind));
     cfg.extra.push(Box::new(move |app: App| {
         app.grpc_blocking(&path, move |call: &mut GrpcCall| {
             grpc_invoke(func, ud, kind, call)
         })
+        .grpc_kind(&path, method_kind)
     }));
+    VEIL_OK
+}
+
+// F-265
+/// gRPC のメソッドの型を OpenAPI に載せるための `FileDescriptorSet`（`protoc --include_imports
+/// --descriptor_set_out` の出力）を渡す。`data` はこの呼び出しの間だけ読む（中で複製する）。
+///
+/// # Safety
+///
+/// `cfg` は有効な設定ハンドル、`data` は `len` バイト読める（`len` が 0 なら NULL 可）。
+#[no_mangle]
+pub unsafe extern "C" fn veil_grpc_descriptors(
+    cfg: *mut veil_config_t,
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    let Some(cfg) = cfg.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL config");
+    };
+    if data.is_null() && len != 0 {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL descriptor data");
+    }
+    let set = if len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    cfg.extra
+        .push(Box::new(move |app: App| app.grpc_descriptors(&[&set])));
     VEIL_OK
 }
 
@@ -660,6 +692,61 @@ pub unsafe extern "C" fn veil_register_l4_tcp(
     VEIL_OK
 }
 
+/// 応答を `101 Switching Protocols`（`protocol` へのアップグレード。HTTP/1.1 だけ。F-261）にする。
+/// 101 を書いた後の接続は L4 の TCP ハンドラと同じコールバックで受ける（`on_connect` → `on_data` … →
+/// `on_close`。ハンドラ用プールで 1 つずつ順に呼ばれ、`veil_l4_write`・`veil_l4_close` が使える）。
+/// `resp` に設定済みのヘッダは 101 と一緒に送る。要求がアップグレードでない・HTTP/2・HTTP/3 では 400 になる。
+///
+/// # Safety
+///
+/// `resp` はコールバックに渡されたハンドル、`protocol` は NUL 終端の C 文字列、`cb` は有効な構造体（コピーされる）。
+/// `user_data` の契約は `veil_register_route` と同じ。
+#[no_mangle]
+pub unsafe extern "C" fn veil_response_upgrade(
+    resp: *mut veil_response_t,
+    protocol: *const c_char,
+    cb: *const veil_l4_tcp_callbacks_t,
+    user_data: *mut c_void,
+) -> c_int {
+    let Some(r) = resp.as_mut() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL response");
+    };
+    let Some(cb) = cb.as_ref().copied() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL callbacks");
+    };
+    let protocol = tryc!(cstr(protocol)).to_string();
+    let ud = UserData(user_data);
+    let mut up = veil::api::Response::switching_protocols(&protocol, move |up| async move {
+        let peer = up.client_ip().to_string();
+        up.serve_blocking(move |out| {
+            let mut s = CSession {
+                cb,
+                ud,
+                conn: Box::new(veil_l4_conn_t {
+                    peer,
+                    data: ptr::null_mut(),
+                    out: ptr::null_mut(),
+                }),
+            };
+            if let Some(f) = cb.on_connect {
+                let rc = s.with_out(out, |c, ud| {
+                    catch_unwind(AssertUnwindSafe(|| unsafe { f(c, ud) }))
+                });
+                if !matches!(rc, Ok(0)) {
+                    out.close();
+                }
+            }
+            Some(Box::new(s) as Box<dyn L4Session>)
+        })
+        .await
+    });
+    for (n, v) in r.resp.headers() {
+        up = up.with_header(n.clone(), v.clone());
+    }
+    r.resp = up;
+    VEIL_OK
+}
+
 /// 送るデータを足す（コピーする。コールバック（`on_connect`・`on_data`）の中でだけ呼べる）。
 ///
 /// # Safety
@@ -827,4 +914,259 @@ pub unsafe extern "C" fn veil_l4_reply(
         data, len,
     )));
     VEIL_OK
+}
+
+// ===================== WebSocket（F-262） =====================
+
+/// テキストのメッセージ（`veil_ws_send`・`on_message` の opcode）。
+pub const VEIL_WS_TEXT: c_int = 1;
+/// バイナリのメッセージ。
+pub const VEIL_WS_BINARY: c_int = 2;
+
+/// WebSocket の接続（不透明。`on_open` から `on_close` が戻るまで有効。`veil_ws_send`・`veil_ws_close` は
+/// その間ならどのスレッドからでも呼べる）。
+#[allow(non_camel_case_types)]
+pub struct veil_ws_t {
+    tx: veil::api::ws::WsSender,
+    /// 相手の IP アドレス（NUL 終端で持つ。返す長さは NUL を含まない）
+    peer: String,
+    /// 利用者のデータ（他のスレッドの `veil_ws_send` と同時に触れられるので原子的に置く）
+    data: std::sync::atomic::AtomicPtr<c_void>,
+}
+
+/// WebSocket のコールバック（どれも NULL 可。ハンドラ用プールで、接続ごとに 1 つずつ順に呼ばれる）。
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct veil_ws_callbacks_t {
+    /// 接続した。非 0 なら閉じる（1000）。
+    pub on_open: Option<unsafe extern "C" fn(*mut veil_ws_t, *mut c_void) -> c_int>,
+    /// メッセージ（`opcode` は `VEIL_WS_TEXT` か `VEIL_WS_BINARY`。テキストは UTF-8 検査済み）。非 0 なら閉じる（1000）。
+    pub on_message:
+        Option<unsafe extern "C" fn(*mut veil_ws_t, c_int, *const u8, usize, *mut c_void) -> c_int>,
+    /// 閉じた（`code` は相手の Close のコード。Close 無しで切れたら 1006）。`veil_ws_t` はこの後無効になる。
+    pub on_close: Option<unsafe extern "C" fn(*mut veil_ws_t, u16, *mut c_void)>,
+}
+
+struct CWsSession {
+    cb: veil_ws_callbacks_t,
+    ud: UserData,
+    ws: Box<veil_ws_t>,
+    /// `on_close` を呼んだ（B-206: 呼ばずに `veil_ws_t` を解放しない）
+    closed: bool,
+}
+
+impl CWsSession {
+    fn call_on_close(&mut self, code: u16) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        if let Some(f) = self.cb.on_close {
+            let ud = self.ud.get();
+            let ws = &*self.ws as *const veil_ws_t as *mut veil_ws_t;
+            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { f(ws, code, ud) }));
+        }
+    }
+}
+
+// B-206: on_close が呼ばれないまま捨てられる経路（停止時のタスクの破棄でプールが受けなかった等）の最後の守り。
+// 「veil_ws_t は on_close が戻るまで有効」の契約を守る（他のスレッドの veil_ws_send が解放後を触らない）。
+impl Drop for CWsSession {
+    fn drop(&mut self) {
+        self.call_on_close(1001);
+    }
+}
+
+// SAFETY: ws.data は C の利用者の値で、同じ接続のコールバックは 1 つずつ順に呼ばれる（並行しない）。
+// cb の関数ポインタと user_data の契約は veil_register_route と同じ。
+unsafe impl Send for CWsSession {}
+
+impl veil::api::ws::WsSession for CWsSession {
+    fn on_message(&mut self, msg: veil::api::ws::Message) {
+        let Some(f) = self.cb.on_message else { return };
+        let (op, data): (c_int, &[u8]) = match &msg {
+            veil::api::ws::Message::Text(t) => (VEIL_WS_TEXT, t.as_bytes()),
+            veil::api::ws::Message::Binary(b) => (VEIL_WS_BINARY, &b[..]),
+            _ => return,
+        };
+        let ud = self.ud.get();
+        let ws = &*self.ws as *const veil_ws_t as *mut veil_ws_t;
+        let rc = catch_unwind(AssertUnwindSafe(|| unsafe {
+            f(ws, op, data.as_ptr(), data.len(), ud)
+        }));
+        if !matches!(rc, Ok(0)) {
+            let _ = self.ws.tx.send(veil::api::ws::Message::Close(Some(
+                veil::api::ws::CloseFrame {
+                    code: 1000,
+                    reason: veil::api::ws::Utf8Bytes::from_static(""),
+                },
+            )));
+        }
+    }
+
+    fn on_close(&mut self, code: u16) {
+        self.call_on_close(code);
+    }
+}
+
+/// 要求を WebSocket にアップグレードする（ハンドラの中で呼ぶ）。ハンドシェイクを検査し、正しければ `resp` を
+/// `101 Switching Protocols` にして 0 を返す。その後の接続はコールバックで受ける（ハンドラ用プールで 1 つずつ順に）。
+/// 正しくなければ `resp` を 400（版違いは 426）にして `VEIL_ERR_STATE` を返す（ハンドラはそのまま 0 を返してよい）。
+///
+/// # Safety
+///
+/// `req`・`resp` はコールバックに渡されたハンドル、`cb` は有効な構造体（コピーされる）。
+/// `user_data` の契約は `veil_register_route` と同じ。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_accept(
+    req: *const veil_request_t,
+    resp: *mut veil_response_t,
+    cb: *const veil_ws_callbacks_t,
+    user_data: *mut c_void,
+) -> c_int {
+    let (Some(q), Some(r)) = (req.as_ref(), resp.as_mut()) else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL request or response");
+    };
+    let Some(cb) = cb.as_ref().copied() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL callbacks");
+    };
+    use veil::api::FromRequest as _;
+    let up = match veil::api::ws::WebSocketUpgrade::from_request(&q.req) {
+        Ok(u) => u,
+        Err(e) => {
+            r.resp = e;
+            return fail(VEIL_ERR_STATE, "not a valid WebSocket handshake");
+        }
+    };
+    let ud = UserData(user_data);
+    let mut peer = q.req.client_ip().to_string();
+    peer.push('\0');
+    let mut ws = up.on_upgrade_blocking(move |tx| {
+        let s = CWsSession {
+            cb,
+            ud,
+            ws: Box::new(veil_ws_t {
+                tx,
+                peer,
+                data: std::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+            }),
+            closed: false,
+        };
+        if let Some(f) = cb.on_open {
+            let ws = &*s.ws as *const veil_ws_t as *mut veil_ws_t;
+            let rc = catch_unwind(AssertUnwindSafe(|| unsafe { f(ws, ud.get()) }));
+            if !matches!(rc, Ok(0)) {
+                // on_open で断った接続は on_close を呼ばない（従来どおり。Drop の守りも外す）
+                let mut s = s;
+                s.closed = true;
+                return None;
+            }
+        }
+        Some(Box::new(s) as Box<dyn veil::api::ws::WsSession>)
+    });
+    for (n, v) in r.resp.headers() {
+        ws = ws.with_header(n.clone(), v.clone());
+    }
+    r.resp = ws;
+    VEIL_OK
+}
+
+/// メッセージを送る（`data` はコピーされる。`opcode` は `VEIL_WS_TEXT`（UTF-8 であること）か `VEIL_WS_BINARY`）。
+/// 送信キューに積んで戻る（待たない）。閉じた後は `VEIL_ERR_CLOSED`、キューが一杯（16 MiB）なら `VEIL_ERR_STATE`。
+///
+/// # Safety
+///
+/// `ws` は `on_open` から `on_close` が戻るまでの有効なハンドル、`data` は `len` バイト読める（`len` が 0 なら NULL 可）。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_send(
+    ws: *mut veil_ws_t,
+    opcode: c_int,
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    let Some(w) = ws.as_ref() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL websocket");
+    };
+    let bytes = if len == 0 {
+        Bytes::new()
+    } else if data.is_null() {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL data");
+    } else {
+        Bytes::copy_from_slice(std::slice::from_raw_parts(data, len))
+    };
+    let msg = match opcode {
+        VEIL_WS_TEXT => match veil::api::ws::Utf8Bytes::try_from(bytes) {
+            Ok(t) => veil::api::ws::Message::Text(t),
+            Err(_) => return fail(super::VEIL_ERR_UTF8, "text message is not valid UTF-8"),
+        },
+        VEIL_WS_BINARY => veil::api::ws::Message::Binary(bytes),
+        _ => {
+            return fail(
+                VEIL_ERR_INVALID_ARG,
+                "opcode must be VEIL_WS_TEXT or VEIL_WS_BINARY",
+            )
+        }
+    };
+    match w.tx.send(msg) {
+        Ok(()) => VEIL_OK,
+        Err(veil::api::ws::WsError::Full) => fail(VEIL_ERR_STATE, "websocket send queue is full"),
+        Err(_) => fail(VEIL_ERR_CLOSED, "websocket is closed"),
+    }
+}
+
+/// 閉じる手順を始める（`code` の Close を送る。相手の Close を受けると `on_close` が呼ばれる）。どのスレッドからでも。
+///
+/// # Safety
+///
+/// `ws` は `on_open` から `on_close` が戻るまでの有効なハンドル。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_close(ws: *mut veil_ws_t, code: u16) -> c_int {
+    let Some(w) = ws.as_ref() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL websocket");
+    };
+    let frame = veil::api::ws::CloseFrame {
+        code,
+        reason: veil::api::ws::Utf8Bytes::from_static(""),
+    };
+    match w.tx.send(veil::api::ws::Message::Close(Some(frame))) {
+        Ok(()) => VEIL_OK,
+        Err(_) => fail(VEIL_ERR_CLOSED, "websocket is closed"),
+    }
+}
+
+/// 相手の IP アドレス（NUL 終端。`veil_ws_t` が有効な間だけ有効）。
+///
+/// # Safety
+///
+/// `ws` は有効なハンドル、`len` は NULL か書き込める。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_peer(ws: *const veil_ws_t, len: *mut usize) -> *const c_char {
+    match ws.as_ref() {
+        Some(w) => out_bytes(&w.peer.as_bytes()[..w.peer.len() - 1], len),
+        None => out_none(len),
+    }
+}
+
+/// 接続ごとの利用者のデータを置く。
+///
+/// # Safety
+///
+/// `ws` は有効なハンドル。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_set_data(ws: *mut veil_ws_t, data: *mut c_void) {
+    if let Some(w) = ws.as_ref() {
+        w.data.store(data, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `veil_ws_set_data` で置いたデータ（無ければ NULL）。
+///
+/// # Safety
+///
+/// `ws` は有効なハンドル。
+#[no_mangle]
+pub unsafe extern "C" fn veil_ws_data(ws: *const veil_ws_t) -> *mut c_void {
+    ws.as_ref()
+        .map(|w| w.data.load(std::sync::atomic::Ordering::Acquire))
+        .unwrap_or(ptr::null_mut())
 }

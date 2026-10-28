@@ -14,7 +14,8 @@ pub use super::response::Json;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Query<T>(pub T);
 
-/// An `application/x-www-form-urlencoded` body. Validated automatically.
+/// An `application/x-www-form-urlencoded` or `multipart/form-data` body (file parts are ignored). Validated
+/// automatically.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Form<T>(pub T);
 
@@ -66,6 +67,28 @@ impl Headers {
 pub trait FromRequest: Sized {
     /// Extracts a value from `req`. On failure it returns, as `Err`, the response to send as is (400, 422 and so on).
     fn from_request(req: &Request) -> Result<Self, Response>;
+}
+
+// F-267
+/// Extracts a value from a request asynchronously (for extractors that look up state, call a dependency container or
+/// verify a token with I/O). Every [`FromRequest`] type is also a `FromRequestAsync`.
+///
+/// `#[veil::route]` uses it for arguments marked `#[inject]` and for the extractor types of `veil-proxy-kit`
+/// (`Dep<T>`, `Auth<T>`, `CookieJar`, `BackgroundTasks` and so on). The future runs on the worker that handles the
+/// request, so it does not need to be `Send`.
+pub trait FromRequestAsync: Sized {
+    /// Extracts a value from `req`; `Err` is the response to send as is.
+    fn from_request_async(
+        req: &Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>>;
+}
+
+impl<T: FromRequest> FromRequestAsync for T {
+    fn from_request_async(
+        req: &Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>> {
+        std::future::ready(T::from_request(req))
+    }
 }
 
 impl FromRequest for Request {
@@ -191,8 +214,12 @@ pub fn query_struct<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, 
         .map_err(|e| single_error("query", None, "value_error", &e.to_string()))
 }
 
-/// Deserializes a form body into `T`.
+// F-266: multipart も受ける
+/// Deserializes a form body into `T` (`multipart/form-data` too: its non-file fields).
 pub fn form_body<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    if super::multipart::is_multipart(req) {
+        return super::multipart::multipart_form(req);
+    }
     serde_urlencoded::from_bytes::<T>(&req.body)
         .map_err(|e| single_error("body", None, "value_error", &e.to_string()))
 }

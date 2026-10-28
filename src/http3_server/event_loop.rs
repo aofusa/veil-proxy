@@ -120,10 +120,14 @@ pub(super) fn schedule_timer(
     key: &ConnKey,
     timers: &mut BinaryHeap<Reverse<TimerKey>>,
 ) {
-    let deadline = match handler.conn.timeout_instant() {
+    let mut deadline = match handler.conn.timeout_instant() {
         Some(t) => t,
         None => Instant::now() + H3_DEFAULT_TIMER,
     };
+    // B-222: ハンドシェイク中はその期限にも起きる
+    if let Some(hs) = &handler.handshake {
+        deadline = deadline.min(hs.deadline());
+    }
     // ヒープに同じか早いエントリが既にあれば積まない（そのエントリが満了したときに本当の期限を確かめ直す。
     // `expire_due_timers`）。以前は接続を処理するたびに積み、期限が延びた古いエントリをヒープに溜めては
     // 捨てていた（FreeBSD の h3_file 54KB で expire_due_timers・HashMap::get_mut が上位。v0.8.0）。
@@ -162,8 +166,21 @@ pub(super) fn expire_due_timers(
             continue; // 期限が更新済みの古いエントリ（遅延削除）。
         }
         handler.timer_deadline = None;
+        // B-222: 期限までに確立しなかった接続は捨てる（偽装した送信元の接続を max_idle_timeout まで残さない）
+        if handler
+            .handshake
+            .as_ref()
+            .is_some_and(|hs| hs.deadline() <= now)
+        {
+            debug!("[HTTP/3] Handshake timed out from {}", handler.peer_addr);
+            conns.remove(&*key);
+            continue;
+        }
         // 積んだ後に期限が延びていたら（`schedule_timer` は早くなるときだけ積み直す）、本当の期限で積み直す
-        if let Some(actual) = handler.conn.timeout_instant() {
+        if let Some(mut actual) = handler.conn.timeout_instant() {
+            if let Some(hs) = &handler.handshake {
+                actual = actual.min(hs.deadline());
+            }
             if actual > now {
                 handler.timer_deadline = Some(actual);
                 timers.push(Reverse(TimerKey(actual, key)));
@@ -284,7 +301,7 @@ pub(super) fn process_datagram_segments(
 
     let mut prev_cid: Option<ConnectionId<'static>> = None;
     let mut offset = 0;
-    while offset < total {
+    'segments: while offset < total {
         let start = offset;
         let end = (offset + seg_size).min(total);
         offset = end;
@@ -293,7 +310,9 @@ pub(super) fn process_datagram_segments(
         let hdr = match quiche::Header::from_slice(&mut data[start..end], quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
-                warn!("[HTTP/3] Invalid packet header: {}", e);
+                // B-235: 1 通ごとに出るので debug!（偽装した送信元のゴミでログを溢れさせられた）。件数はメトリクスで見る
+                debug!("[HTTP/3] Invalid packet header: {}", e);
+                crate::metrics::record_http3_invalid_packet();
                 // このセグメントのみスキップ。送信処理は呼び出し側ループ後に実行。
                 continue;
             }
@@ -309,31 +328,80 @@ pub(super) fn process_datagram_segments(
                         continue;
                     }
 
-                    // B-94: サーバ接続 ID はクライアントの元 DCID から決定的に導出する。
-                    // クライアントはサーバの最初の応答を受け取るまで Initial を元 DCID 宛てに
-                    // 送り続ける（PTO による再送・複数パケットにまたがる ClientHello）。
-                    // 乱数で SCID を作っていた頃は、それらが届くたびに別の新規接続を
-                    // `accept` していた（孤児接続が増え、クライアントには SCID の異なる
-                    // 2 つのサーバ接続から応答が届いてハンドシェイクが崩れる）。
-                    let derived = derive_server_cid(cid_key, &hdr.dcid);
-                    let derived_ref = ConnectionId::from_ref(&derived);
-                    if conns.contains_key(&derived_ref) {
-                        let cid = derived_ref.into_owned();
-                        prev_cid = Some(cid.clone());
-                        cid
-                    } else {
+                    // B-222: 接続数の上限・ハンドシェイク中の数で受け入れるか・Retry を返すかを決める。
+                    // トークン付きの Initial は Retry を経たもの（DCID は Retry で渡したサーバの接続 ID）。
+                    if !quiche::version_is_supported(hdr.version) {
+                        debug!(
+                            "[HTTP/3] Initial with unsupported version {:#x}",
+                            hdr.version
+                        );
+                        continue;
+                    }
+                    let token = hdr.token.as_deref().unwrap_or(&[]);
+                    'conn_id: {
+                        let (scid, odcid) = if token.is_empty() {
+                            // B-94: サーバ接続 ID はクライアントの元 DCID から決定的に導出する。
+                            // クライアントはサーバの最初の応答を受け取るまで Initial を元 DCID 宛てに
+                            // 送り続ける（PTO による再送・複数パケットにまたがる ClientHello）。
+                            // 乱数で SCID を作っていた頃は、それらが届くたびに別の新規接続を
+                            // `accept` していた（孤児接続が増え、クライアントには SCID の異なる
+                            // 2 つのサーバ接続から応答が届いてハンドシェイクが崩れる）。
+                            let derived = derive_server_cid(cid_key, &hdr.dcid);
+                            let derived_ref = ConnectionId::from_ref(&derived);
+                            if conns.contains_key(&derived_ref) {
+                                let cid = derived_ref.into_owned();
+                                prev_cid = Some(cid.clone());
+                                break 'conn_id cid;
+                            }
+                            (derived_ref.into_owned(), None)
+                        } else {
+                            // Retry 後の Initial の再送は、上の contains_key(&hdr.dcid) に当たる
+                            let Some(odcid) = admission::validate_token(&from, token) else {
+                                debug!("[HTTP/3] Invalid retry token from {}", from);
+                                continue 'segments;
+                            };
+                            (
+                                hdr.dcid.clone().into_owned(),
+                                Some(ConnectionId::from_vec(odcid.to_vec())),
+                            )
+                        };
+                        match admission::decide(conns.len(), !token.is_empty()) {
+                            admission::Decision::Accept => {}
+                            admission::Decision::Retry => {
+                                admission::queue_retry(
+                                    &hdr.scid,
+                                    &hdr.dcid,
+                                    hdr.version,
+                                    &scid,
+                                    from,
+                                );
+                                continue 'segments;
+                            }
+                            admission::Decision::Drop => {
+                                debug!(
+                                    "[HTTP/3] Connection limit reached; dropping Initial from {}",
+                                    from
+                                );
+                                continue 'segments;
+                            }
+                        }
                         // 新規コネクション
-                        let scid = derived_ref.into_owned();
-
                         let mut config_ref = quic_config.borrow_mut();
-                        let conn = quiche::accept_with_buf_factory::<ZcFactory>(
+                        let conn = match quiche::accept_with_buf_factory::<ZcFactory>(
                             &scid,
-                            None,
+                            odcid.as_ref(),
                             local_addr,
                             from,
                             &mut config_ref,
-                        )
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                // B-222: 相手の Initial 次第で失敗し得るので、ワーカーごと落とさない
+                                debug!("[HTTP/3] accept failed for {}: {}", from, e);
+                                continue 'segments;
+                            }
+                        };
+                        drop(config_ref);
 
                         debug!("[HTTP/3] New connection from {}", from);
 
@@ -354,6 +422,8 @@ pub(super) fn process_datagram_segments(
                             backend_spawner.clone(),
                             key.clone(),
                         );
+                        // B-222: 確立するまでハンドシェイク中として数え、期限を過ぎたら捨てる
+                        handler.handshake = Some(admission::HandshakeSlot::new(now));
                         // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
                         // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
                         handler.dirty = true;
@@ -384,11 +454,17 @@ pub(super) fn process_datagram_segments(
             match handler.conn.recv(&mut data[start..end], recv_info) {
                 Ok(_) => {}
                 Err(e) => {
-                    warn!("[HTTP/3] recv error: {}", e);
+                    // B-235: 相手のパケットごとに起き得るので debug!
+                    debug!("[HTTP/3] recv error: {}", e);
                     // エラー時も送信処理は続行
                 }
             }
             handler.conn.set_time_hint(None);
+            // B-256: パスのイベント（相手の送信元の変更など）は使わないが、取り出さないと接続の寿命の間
+            // 溜まり続ける（GHSA-4q5x-gp38-rfp4。アクティブマイグレーションを無効にしていても起きる）
+            while let Some(ev) = handler.conn.path_event_next() {
+                debug!("[HTTP/3] path event: {:?}", ev);
+            }
 
             // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
             // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
@@ -471,7 +547,20 @@ pub(super) async fn send_pending_packets(
 
     // sweep 全体で継続する連結バッファのカーソル。「現在構築中のエントリ」は
     // [cur_batch_start, batch.len()) / offsets[cur_offsets_start..] が表す。
-    let mut cur_batch_start = 0usize;
+    // B-222: 受信の処理で溜めた Retry を先に積む（1 通ずつ単独のエントリ）
+    admission::drain_retries(|p| {
+        let start = batch.len();
+        batch.extend_from_slice(&p.buf[..p.len]);
+        sends.push(SendRaw {
+            batch_start: start,
+            len: p.len,
+            seg_size: p.len as u16,
+            segments: 1,
+            dest: p.to,
+        });
+    });
+
+    let mut cur_batch_start = batch.len();
     let mut cur_offsets_start = 0usize;
     let mut seg_size = 0usize;
     let mut cur_dest: Option<SocketAddr> = None;

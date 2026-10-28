@@ -16,12 +16,17 @@ crate-type = ["cdylib"]
 veil = { package = "veil-proxy", path = "../..", default-features = false, features = [
     "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
     "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
-    "handler", "openapi", "macro", "grpc-handler", "l4-handler",
+    "handler", "openapi", "openapi-ui-embedded", "macro", "grpc-handler", "l4-handler",
 ] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 bytes = "1.9"
 serde_json = "1"
 itoa = "1"
+# F-263: `[api] python_*` のキーを読む（veil と同じ版。依存は増えない）
+toml = "0.9.8"
+futures = "0.3"
+# F-268: app.cors()（veil_kit::cors。Python の層で要求ごとにヘッダを作らない）
+veil_kit = { package = "veil-proxy-kit", path = "../veil-kit", default-features = false, features = ["cors"] }
 
 # epoll feature は Linux でだけ指定できる（他の OS は kqueue / WSAPoll の reactor が自動で選ばれる）。
 [target.'cfg(target_os = "linux")'.dependencies]

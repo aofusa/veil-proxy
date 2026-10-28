@@ -1,6 +1,6 @@
 # B-232: 既定で `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto` をクライアントから素通しし、veil 自身は付け直さない
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー SB-07）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -27,6 +27,15 @@
 
 - E2E: クライアントが `X-Forwarded-For: 1.2.3.4` を送っても、上流には `1.2.3.4, <client>` が届く（`strip` では `<client>` だけ）。
 - 性能の交互 A/B（HTTP/1.1・HTTP/2 の 3B）が変わらない。
+
+## 修正（v0.10.0）
+
+- `[route.security] forwarded_headers`（`"append"` 既定・`"passthrough"`）と `trusted_proxies`（IP/CIDR、初回に解析して `OnceLock` に持つ）を足した。
+  - append: `trusted_proxies` に入らない送信元の `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・`Forwarded` は上流へ送らず、`X-Forwarded-For` にクライアントの IP を入れる。`trusted_proxies` からは受けた値を残し、クライアントの IP を `X-Forwarded-For` の別の行として足す（RFC 9110 のリストとしては末尾に連なる）。nginx・Envoy と同じく `X-Real-IP` は既定で足さない（移行の比較試験もそろう）。`add_request_headers` に `X-Forwarded-For` があればそちらを使う。
+  - passthrough: 以前の動き。
+- 実装: `expanded_added_headers` が返す型を `AddedHeaders`（利用者の追加 + `ForwardedValues`）にし、受けたヘッダを送るかを `keeps`、足すヘッダを `iter` で引く。クライアントの IP はスタック（`IpStr::from_ip_text`）に写すだけで要求ごとに確保しない。HTTP/1.1 の要求の組み立て（forward.rs）・HTTP/2/HTTP/3 → HTTP/1.1（`write_h1_forward_headers`）・上流 h2c/HTTPS h2（多重化）・HTTP/3 の上流 HTTP/2・WebSocket のすべてに当てた。
+- 試験: `proxy::path_tests::forwarded_headers_policy`、standalone E2E `b232_forwarded_headers_append_trusted_and_passthrough`（HTTP/1.1・h2c・TLS の HTTP/2 で、上流に届いたヘッダを見る）。
+- `examples/config.toml`・`docs/guide/routing.md`・`security.md`・`migration-nginx.md`（英日）を更新。挙動の変更はリリースノートの移行の注意に書く。
 
 ## 関連
 

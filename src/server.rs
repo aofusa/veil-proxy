@@ -3,7 +3,7 @@
 //! シグナルハンドラ、バックグラウンドスレッド、リスナーソケットの作成を担当します。
 
 use crate::config::*;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
+use crate::runtime::io::AsyncWriteRentExt;
 use crate::runtime::tcp::{TcpListener, TcpStream};
 use crate::runtime::time::timeout;
 use ftlog::{debug, error, info, warn};
@@ -377,46 +377,29 @@ pub fn spawn_background_revalidation(
             if let Some(parsed) = parse_http_response(&accumulated) {
                 status_code = parsed.status_code;
                 let header_len = parsed.header_len;
-                let body_start = accumulated[header_len..].to_vec();
 
-                // ボディを読み込み（Content-Length または接続終了まで）
-                let mut body = body_start;
-                if let Some(cl) = parsed.content_length {
-                    let remaining = cl.saturating_sub(body.len());
-                    if remaining > 0 {
-                        let additional =
-                            buffer_exact_bytes_simple(&mut backend_stream, remaining).await;
-                        body.extend(additional);
-                    }
-                } else if !parsed.is_chunked {
-                    // 接続終了まで読む（最大10MB）
-                    const MAX_SIZE: usize = 10 * 1024 * 1024;
-                    loop {
-                        if body.len() >= MAX_SIZE {
-                            break;
-                        }
-                        let read_buf = buf_get();
-                        let read_result =
-                            timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-                        let (res, mut returned_buf) = match read_result {
-                            Ok(result) => result,
-                            Err(_) => break,
-                        };
-
-                        let n = match res {
-                            Ok(0) | Err(_) => {
-                                buf_put(returned_buf);
-                                break;
-                            }
-                            Ok(n) => n,
-                        };
-
-                        returned_buf.set_valid_len(n);
-                        body.extend_from_slice(returned_buf.as_valid_slice());
-                        buf_put(returned_buf);
-                    }
+                // 本文を区切りどおりに読み切った応答だけをキャッシュする（B-244。以前は途中で止まった本文・
+                // chunked の最初の読み込みだけ・接続の終わりまでの本文を 10MB で切ったものを保存していた）。
+                // B-245/B-246: HEAD・本文の無い応答・区切りの不正な応答・接続の終わりで区切る応答は保存しない
+                let kind = parsed.body(method_str == "HEAD");
+                if parsed.framing_invalid
+                    || !matches!(
+                        kind,
+                        crate::http_utils::ResponseBody::Length(_)
+                            | crate::http_utils::ResponseBody::Chunked
+                    )
+                {
+                    break;
                 }
+                let Some((body, _extra)) = crate::proxy::collect_response_body_raw(
+                    &mut backend_stream,
+                    kind,
+                    &accumulated[header_len..],
+                )
+                .await
+                else {
+                    break;
+                };
 
                 // ヘッダー抽出
                 let headers_data = &accumulated[..header_len];
@@ -450,7 +433,9 @@ pub fn spawn_background_revalidation(
             }
 
             // ヘッダーが大きすぎる
-            if accumulated.len() > MAX_HEADER_SIZE {
+            if accumulated.len() > MAX_HEADER_SIZE
+                || crate::http_utils::response_head_invalid(&accumulated)
+            {
                 break;
             }
         }
@@ -458,39 +443,6 @@ pub fn spawn_background_revalidation(
         debug!("Background revalidation completed (status={})", status_code);
         // _guard がドロップされて finish_revalidation(hash) が呼ばれる
     });
-}
-
-/// バックグラウンド更新用の簡易バイト読み込み
-pub async fn buffer_exact_bytes_simple(
-    backend_stream: &mut TcpStream,
-    mut remaining: usize,
-) -> Vec<u8> {
-    let mut result = Vec::with_capacity(remaining);
-
-    while remaining > 0 {
-        let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-
-        let n = match res {
-            Ok(0) | Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n.min(remaining),
-        };
-
-        returned_buf.set_valid_len(n);
-        result.extend_from_slice(&returned_buf.as_valid_slice()[..n]);
-        buf_put(returned_buf);
-        remaining = remaining.saturating_sub(n);
-    }
-
-    result
 }
 
 /// キャッシュクリーンアップスレッドを起動
@@ -577,6 +529,9 @@ pub fn spawn_wasm_tick_thread() {
 
         loop {
             cap_safe_sleep(tick_interval);
+
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
 
             // シャットダウン中は終了
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -704,6 +659,8 @@ pub fn spawn_wasm_grpc_thread() {
                 info!("WASM gRPC executor thread shutting down");
                 break;
             }
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
 
             // 新規登録（呼び出し開始・逐次送出・キャンセル）を取り込む。
             let new_calls = crate::wasm::host::grpc_executor::take_global_pending_grpc_calls();
@@ -745,6 +702,8 @@ pub fn spawn_health_check_thread() {
         info!("Health check thread started");
 
         loop {
+            // B-219: ファイルを使わない制御プレーンのスレッドは、サンドボックスができたら自分にも Landlock を掛ける
+            crate::security::landlock_restrict_current_thread();
             // シャットダウン中はチェックしない
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                 break;
@@ -829,7 +788,7 @@ pub fn spawn_health_check_thread() {
 // SO_REUSEPORT CBPF ロードバランシング
 // ====================
 
-// CBPF_ATTACHED, create_reuseport_cbpf_program, attach_reuseport_cbpf は
+// create_reuseport_cbpf_program, attach_reuseport_cbpf は
 // crate::system モジュールに移動しました。
 
 /// リスナーソケットを作成する（SO_REUSEPORT + オプションのCBPF振り分け）
@@ -838,7 +797,7 @@ pub fn spawn_health_check_thread() {
 /// * `addr` - バインドするアドレス
 /// * `balancing` - 振り分け方式
 /// * `num_workers` - ワーカースレッド数（CBPF使用時に必要）
-/// * `worker_id` - このワーカーのID（最初のワーカーがCBPFをアタッチ）
+/// * `worker_id` - このワーカーのID（0 のワーカーがリスナーごとにCBPFをアタッチ）
 pub fn create_listener(
     addr: SocketAddr,
     #[allow(unused_variables)] balancing: ReuseportBalancing,
@@ -865,30 +824,25 @@ pub fn create_listener(
         }
     }
 
-    // Linux環境でCBPF振り分けが有効な場合、最初のワーカーのみCBPFプログラムをアタッチ
-    // 後続のワーカーはreuseportグループに参加し、自動的にBPFプログラムを継承する
+    // Linux環境でCBPF振り分けが有効な場合、リスナー（reuseport グループ）ごとに最初のワーカー
+    // （worker_id == 0）だけがCBPFプログラムをアタッチする。後続のワーカーはグループに参加し、
+    // 自動的にBPFプログラムを継承する。全呼び出し元は 0..num_workers を渡す。
     #[cfg(target_os = "linux")]
-    if balancing == ReuseportBalancing::Cbpf {
-        // CAS操作で最初の1回だけアタッチを実行
-        let prev = CBPF_ATTACHED.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
-
-        if prev.is_ok() {
-            // このワーカーが最初にリスナーを作成した
-            let fd = listener.as_raw_fd();
-            match attach_reuseport_cbpf(fd, num_workers) {
-                Ok(()) => {
-                    info!("[Worker {}] CBPF reuseport load balancing enabled (flow hash -> {} workers)",
-                          worker_id, num_workers);
-                }
-                Err(e) => {
-                    // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
-                    warn!(
-                        "[Worker {}] CBPF attach failed, falling back to kernel default: {}",
-                        worker_id, e
-                    );
-                    // フラグをリセットして他のワーカーも試行できるようにする（オプション）
-                    // CBPF_ATTACHED.store(0, Ordering::SeqCst);
-                }
+    if balancing == ReuseportBalancing::Cbpf && worker_id == 0 {
+        let fd = listener.as_raw_fd();
+        match attach_reuseport_cbpf(fd, num_workers) {
+            Ok(()) => {
+                info!(
+                    "[Worker {}] CBPF reuseport load balancing enabled on {} (flow hash -> {} workers)",
+                    worker_id, addr, num_workers
+                );
+            }
+            Err(e) => {
+                // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
+                warn!(
+                    "[Worker {}] CBPF attach failed on {}, falling back to kernel default: {}",
+                    worker_id, addr, e
+                );
             }
         }
     }

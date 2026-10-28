@@ -44,6 +44,9 @@ run_phase() {
         l4_flood)
             exec /scripts/l4_flood_probe.sh
             ;;
+        h3_flood)
+            exec /scripts/h3_flood_probe.sh
+            ;;
         websocket)
             exec /scripts/websocket_probe.sh
             ;;

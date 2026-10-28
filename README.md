@@ -17,14 +17,16 @@ HTTP/1.1, HTTP/2 (TLS and h2c), HTTP/3 (QUIC), gRPC, WebSocket and raw TCP/UDP (
 - **Fast data plane** — io_uring on Linux (epoll/kqueue/WSAPoll elsewhere), zero-copy
   `splice(2)`/`sendfile(2)`, kTLS offload, per-thread workers with `SO_REUSEPORT`.
 - **Protocols** — HTTP/1.1, HTTP/2, h2c, HTTP/3, gRPC / gRPC-Web, WebSocket, L4 TCP/UDP proxy,
-  Unix domain socket listeners and backends.
+  several listening ports per process (`[[listener]]`), Unix domain socket listeners and backends.
 - **Proxy features** — path/host/header routing, load balancing, health checks, circuit
   breaker, retries, response compression, proxy cache, buffering, header rewriting.
 - **Extensible** — Proxy-Wasm filters (Wasmtime) on every protocol.
 - **Dynamic** — [VDS](docs/guide/vds.md) pushes routes and upstreams from a control plane (xDS-style long polling,
   ACK/NACK), and built-in [ACME](docs/guide/acme.md) issues and renews certificates (HTTP-01, Let's Encrypt).
 - **Embeddable** — use veil as a [library](docs/guide/library.md) to write API servers in Rust (macros, OpenAPI,
-  tower, GraphQL, L4 handlers), C (`libveil`) or Python (FastAPI-style) on the same io_uring data plane.
+  tower, GraphQL, WebSocket, multipart, L4 handlers), C (`libveil`) or Python (FastAPI-compatible, ASGI) on the same
+  io_uring data plane, with helper packages `veil-proxy-kit` and `veil-api-kit` and a
+  [production guide](docs/guide/library-production.md).
 - **Operable** — hot reload (`SIGHUP`) of config and certificates, Prometheus metrics,
   OpenTelemetry, structured access logs, admin API.
 - **Secure by default** — memory-safe Rust, seccomp/Landlock (Linux), capsicum (FreeBSD),
@@ -134,7 +136,7 @@ A fully commented reference of every key is in [examples/config.toml](examples/c
 ```toml
 # Cargo.toml (the crate is `veil-proxy` on crates.io; keep the name `veil`, the macros refer to it)
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 ```
 

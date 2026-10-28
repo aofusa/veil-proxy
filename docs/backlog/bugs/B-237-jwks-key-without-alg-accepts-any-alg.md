@@ -1,6 +1,6 @@
 # B-237: JWKS の鍵に `alg` が無いと、トークン側の `alg` でその鍵種の任意のアルゴリズムを受理する
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー XT-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -20,6 +20,14 @@
 ## 受け入れ条件
 
 - 単体: `alg` 無しの鍵と `allowed_algs = ["RS256"]` で PS256 のトークンが拒否される。
+
+## 修正（v0.10.0）
+
+- `[route.jwt] allowed_algs`（例 `["RS256"]`）を足し、トークンの `alg` がこれに無ければ鍵を試す前に拒否する（`jwt_verify::Check::allowed_algs`。空なら従来どおり）。対応しない名前は設定のロードでエラー。
+- 鍵に `alg` が無く `allowed_algs` も無い JWKS はロード時に警告する。
+- メッシュの `jwt_authn`（Envoy の意味論）は変えない。
+- 試験: `jwt_verify::tests::es256_issuer_audience_and_expiry` に、`alg` の無い鍵で `allowed_algs = ["RS256"]` なら ES256 のトークンを拒否し、`["ES256"]` なら受けることを足した。
+- `examples/config.toml`・`docs/guide/security.md`（英日）を更新。
 
 ## 関連
 

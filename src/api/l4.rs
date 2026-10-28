@@ -327,6 +327,11 @@ impl L4Out {
     pub fn close(&mut self) {
         self.close = true;
     }
+
+    // F-261: アップグレードした接続（`Upgraded::serve_blocking`）が送り出す
+    pub(crate) fn into_parts(self) -> (Vec<Bytes>, bool) {
+        (self.writes, self.close)
+    }
 }
 
 /// The state of one TCP connection (created per connection; callbacks are called one at a time, in order, per connection).

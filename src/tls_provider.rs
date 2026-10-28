@@ -34,16 +34,19 @@ pub use rustls::crypto::aws_lc_rs as provider;
 #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
 pub use rustls::crypto::ring as provider;
 
-/// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
+/// HTTP/3（quiche）と WASI の `random_get`（B-248）の乱数生成に使う `SecureRandom` 実装。
 ///
 /// 非 OpenBSD/NetBSD は aws-lc-rs、OpenBSD/NetBSD は ring の `SystemRandom` を用いる
-/// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
+/// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3・wasm feature 有効時のみ使用。
 #[cfg(all(
-    feature = "http3",
+    any(feature = "http3", feature = "wasm"),
     not(any(target_os = "openbsd", target_os = "netbsd"))
 ))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
+#[cfg(all(
+    any(feature = "http3", feature = "wasm"),
+    any(target_os = "openbsd", target_os = "netbsd")
+))]
 pub use ring::rand::{SecureRandom, SystemRandom};
 
 /// HTTP/3 のサーバ接続 ID 導出（クライアントの元 DCID → 決定的な SCID、B-94）に使う HMAC。
@@ -55,3 +58,21 @@ pub use ring::rand::{SecureRandom, SystemRandom};
 pub use aws_lc_rs::hmac;
 #[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
 pub use ring::hmac;
+
+// F-262: WebSocket の `Sec-WebSocket-Accept`（SHA-1(key + GUID)）。依存を増やさずプラットフォームの暗号プロバイダを使う
+// （ライブラリ専用。本体のバイナリには入らない）。
+/// SHA-1 of the concatenation of `parts` (legacy use only: the WebSocket handshake).
+#[cfg(feature = "handler")]
+pub(crate) fn sha1_legacy(parts: &[&[u8]]) -> [u8; 20] {
+    #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+    use aws_lc_rs::digest;
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    use ring::digest;
+    let mut ctx = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
+    for p in parts {
+        ctx.update(p);
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}

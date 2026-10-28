@@ -16,6 +16,11 @@ use super::*;
 #[allow(async_fn_in_trait)]
 pub trait AsyncReader {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer);
+
+    /// 直前の EOF が相手の正しい終了か（`AsyncReadRent::eof_was_clean`。F-282）
+    fn eof_was_clean(&self) -> bool {
+        true
+    }
 }
 
 /// 非同期書き込みトレイト
@@ -64,6 +69,10 @@ impl AsyncReader for KtlsClientStream {
         use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
+
+    fn eof_was_clean(&self) -> bool {
+        crate::runtime::io::AsyncReadRent::eof_was_clean(self)
+    }
 }
 
 #[cfg(veil_ktls)]
@@ -95,6 +104,10 @@ impl AsyncReader for crate::simple_tls::SimpleTlsClientStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
+    }
+
+    fn eof_was_clean(&self) -> bool {
+        crate::runtime::io::AsyncReadRent::eof_was_clean(self)
     }
 }
 

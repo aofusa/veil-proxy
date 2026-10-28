@@ -366,12 +366,14 @@ impl<'a> Future for Accept<'a> {
                     let fd = res;
                     // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないため、
                     // プレースホルダを返す（IP ブロックリスト・アクセスログはこの値を見る）。
+                    // F-280: 変換に失敗しても accept 済みの fd を漏らさない（TcpStream の Drop で閉じる）
+                    let stream = TcpStream { fd };
                     let peer_addr = if self.is_unix {
                         SocketAddr::from(([127, 0, 0, 1], 0))
                     } else {
                         storage_to_sockaddr(&self.addr_storage)?
                     };
-                    Poll::Ready(Ok((TcpStream { fd }, peer_addr)))
+                    Poll::Ready(Ok((stream, peer_addr)))
                 }
             }
             None => {
@@ -477,8 +479,8 @@ impl TcpStream {
             return TcpStream::connect_unix(std::path::Path::new(path)).await;
         }
         // B-107: ホスト名は offload で解決する（同期 getaddrinfo でイベントループを止めない）。
-        let socket_addr = crate::runtime::dns::resolve(addr).await?;
-        TcpStream::connect(socket_addr).await
+        // B-180: 解決したアドレスを順に試す（localhost が ::1 と 127.0.0.1 の両方になる等）。
+        crate::runtime::dns::connect_each(addr, TcpStream::connect).await
     }
 
     /// バッファに非同期で読み込む（io_uring RECV）
@@ -1852,6 +1854,36 @@ mod tests {
 
         let received = handle.join().expect("join");
         assert_eq!(received, expected);
+    }
+
+    /// B-242: 提出の経路の `io_uring_enter` が一時的なエラーを返しても要求を失敗させない（SQE は SQ に残り、
+    /// 次の park で提出される）。修正前は connect がそのエラーで失敗していた。
+    #[test]
+    fn test_b242_submit_survives_transient_enter_errors() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_b242_submit_survives_transient_enter_errors"
+            );
+            return;
+        }
+        for errno in [libc::EBUSY, libc::EAGAIN, libc::ENOMEM] {
+            let (addr, handle) = spawn_sink_server();
+            let header = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_vec();
+            let body = bytes::Bytes::from_static(b"ok");
+            let mut expected = header.clone();
+            expected.extend_from_slice(&body);
+
+            crate::runtime::block_on(async move {
+                // connect の提出・park・write の提出がそれぞれ一時的なエラーに当たる回数
+                crate::runtime::ring::inject_enter_errors(4, errno);
+                let stream = TcpStream::connect(addr).await.expect("connect");
+                crate::runtime::ring::inject_enter_errors(2, errno);
+                let (res, _h, _b) = stream.write_all_vectored(header, body).await;
+                res.expect("write_all_vectored");
+            });
+
+            assert_eq!(handle.join().expect("join"), expected);
+        }
     }
 
     /// F-59: ボディが空でも SENDMSG（iovec 1 本）で送出できること。

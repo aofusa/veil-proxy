@@ -18,15 +18,44 @@ use super::types::{ModuleConfig, WasmConfig};
 /// Loaded WASM module
 pub struct LoadedModule {
     /// Module name
-    pub name: String,
+    pub name: Arc<str>,
     /// Pre-instantiated module for fast creation
     pub instance_pre: InstancePre<HostState>,
     /// Module capabilities
-    pub capabilities: ModuleCapabilities,
+    pub capabilities: Arc<ModuleCapabilities>,
     /// Plugin configuration
     pub configuration: Arc<[u8]>,
     /// Proxy-Wasm の root_id（`plugin_root_id`）。未設定なら従来どおりルートコンテキストの ID を返す
     pub root_id: Option<Arc<str>>,
+    /// HTTP のコールバックで VM の文脈を使い回す（F-271）
+    pub instance_reuse: bool,
+    /// 使い回すインスタンス（`instance_reuse` のときだけ使う）
+    pub(crate) pool: super::instance_pool::InstancePool,
+    /// 起動時に読んだファイル（`data_files`。F-271）
+    pub data_files: super::context::PluginData,
+    /// shared data の表（同じ名前のモジュールで共有し、リロードでも引き継ぐ。B-179）
+    pub shared_data: Arc<super::shared_data::SharedData>,
+}
+
+/// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
+pub(crate) const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// B-173: `engine` のエポックを `EPOCH_TICK` ごとに 1 進める専用スレッドを起こす。エンジンが捨てられたら
+/// （リロードで作り直したら）次の周期で終わる。データプレーンからは何も呼ばない。
+fn spawn_epoch_ticker(engine: &Engine) {
+    let weak = engine.weak();
+    let spawned = std::thread::Builder::new()
+        .name("veil-wasm-epoch".into())
+        .spawn(move || loop {
+            crate::server::cap_safe_sleep(EPOCH_TICK);
+            match weak.upgrade() {
+                Some(engine) => engine.increment_epoch(),
+                None => return,
+            }
+        });
+    if let Err(e) = spawned {
+        ftlog::warn!("[wasm] failed to start the epoch ticker thread: {}", e);
+    }
 }
 
 /// Module registry
@@ -39,6 +68,8 @@ pub struct ModuleRegistry {
     /// AOT サイドカーキャッシュのファイル名をネイティブ JIT 版と分けるために使う
     /// （F-135。Pulley と Cranelift のキャッシュはバイナリ非互換）。
     pulley: bool,
+    /// `instance_reuse` のプールの 1 スレッドに持つインスタンスの上限（[`super::instance_pool::per_thread_capacity`]）
+    pool_per_thread: usize,
 }
 
 impl ModuleRegistry {
@@ -46,6 +77,8 @@ impl ModuleRegistry {
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
         // Create engine with pooling allocator
         let engine = Self::create_engine(config)?;
+        // B-173: エポックを時計にする（呼び出しの回数で進めない）
+        spawn_epoch_ticker(&engine);
         // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
         // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
         // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
@@ -57,10 +90,15 @@ impl ModuleRegistry {
             || cfg!(veil_wasm_nosignals)
             || config.interpreter;
 
+        let reuse_modules = config.modules.iter().filter(|m| m.instance_reuse).count();
         let mut registry = Self {
             engine,
             modules: std::collections::HashMap::new(),
             pulley,
+            pool_per_thread: super::instance_pool::per_thread_capacity(
+                config.defaults.pooling.total_memories,
+                reuse_modules,
+            ),
         };
 
         // Load all modules
@@ -194,13 +232,34 @@ impl ModuleRegistry {
         // Create InstancePre for fast instantiation
         let instance_pre = linker.instantiate_pre(&module)?;
 
+        // F-271: data_files は設定ロード時に読む（読むのは設定に書いたパスだけ）
+        let mut data_files = std::collections::HashMap::new();
+        for (name, file) in &config.data_files {
+            // 理由付き allow: モジュールのロードは設定適用時（起動/リロード）のコールドパス
+            #[allow(clippy::disallowed_methods)]
+            let bytes = std::fs::read(file).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read data file '{}' ({}) for module '{}': {}",
+                    name,
+                    file,
+                    config.name,
+                    e
+                )
+            })?;
+            data_files.insert(name.clone(), Arc::<[u8]>::from(bytes));
+        }
+
         // Store module
         let loaded = LoadedModule {
-            name: config.name.clone(),
+            name: Arc::from(config.name.as_str()),
             instance_pre,
-            capabilities: config.capabilities.clone(),
+            capabilities: Arc::new(config.capabilities.clone()),
             configuration: config.configuration.to_bytes(),
             root_id: None,
+            instance_reuse: config.instance_reuse,
+            pool: super::instance_pool::InstancePool::new(self.pool_per_thread),
+            data_files: Arc::new(data_files),
+            shared_data: super::shared_data::for_module(&config.name),
         };
 
         ftlog::info!(
@@ -273,11 +332,18 @@ impl ModuleRegistry {
 
         // AOT バイナリをサイドカーへ書き出す（ベストエフォート、失敗は無視）。
         // tmp へ書いて rename することで部分書き込み/競合を避ける。
+        // tmp の名前は書き手ごとに分ける（同じ名前だと、別の書き手が rename 済みの inode を切り詰めて書き直し、
+        // それを mmap している側が SIGBUS になる。同じモジュールを並行してロードする単体試験で起きた。F-271）。
         match module.serialize() {
             Ok(bytes) => {
+                static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let tmp_path: PathBuf = {
                     let mut s = cache_path.clone().into_os_string();
-                    s.push(".tmp");
+                    s.push(format!(
+                        ".{}.{}.tmp",
+                        std::process::id(),
+                        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
                     PathBuf::from(s)
                 };
                 let written = std::fs::write(&tmp_path, &bytes)

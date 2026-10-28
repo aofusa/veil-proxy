@@ -1779,6 +1779,64 @@ pub(super) async fn test_websocket_poll_mode_adaptive_idle() {
     );
 }
 
+/// F-282: `websocket_idle_timeout_secs` のルートでは、101 の後にどちらの向きにもデータが流れなければトンネルを閉じる
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f282_websocket_tunnel_idle_timeout_closes() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    while tls_conn.is_handshaking() {
+        tls_conn.complete_io(&mut stream).expect("TLS handshake");
+    }
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    let request = b"GET /ws-idle/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    tls_stream.write_all(request).unwrap();
+    tls_stream.flush().unwrap();
+    let mut response = Vec::new();
+    let mut single = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") && response.len() < 8192 {
+        match tls_stream.read(&mut single) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => response.push(single[0]),
+        }
+    }
+    let status = get_status_code(&String::from_utf8_lossy(&response));
+    assert_eq!(status, Some(101), "upgrade must succeed");
+
+    // 何も送らずに待つ。1 秒のアイドルタイムアウトで閉じられる（読み取りの 10 秒より十分前）
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1024];
+    let closed = loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break false
+            }
+            // close_notify 無しの切断も閉じたとみなす
+            Err(_) => break true,
+        }
+    };
+    let elapsed = started.elapsed();
+    assert!(closed, "the idle tunnel must be closed by the proxy");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the idle tunnel must close after about 1s, took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 pub(super) async fn test_websocket_idle_connection_timeout() {
@@ -1955,5 +2013,149 @@ pub(super) async fn test_health_check_tls_invalid_cert() {
             // verify_cert = true の場合、不正証明書でヘルスチェックが失敗することを確認
             // verify_cert = false の場合、不正証明書でもヘルスチェックが成功することを確認
         }
+    }
+}
+
+/// F-282: TLS の上流が Content-Length も chunked も無い応答を返して閉じたとき、バッファ経路は close_notify を
+/// 受けたときだけ完了とみなす（受けずに切れたら途中で切れたかもしれないので 502）
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_f282_tls_upstream_eof_body_requires_close_notify_buffered() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let body = b"f282 eof-delimited body";
+    let clean = send_request_with_method(
+        PROXY_PORT,
+        "/echo-eof-tls-full/clean",
+        "POST",
+        &[("x-eof-body", "clean")],
+        Some(body),
+    )
+    .await
+    .expect("request with close_notify must get a response");
+    assert_eq!(get_status_code(&clean), Some(200), "response: {clean}");
+    assert!(
+        clean.ends_with("f282 eof-delimited body"),
+        "the whole body must be returned: {clean}"
+    );
+
+    let abrupt = send_request_with_method(
+        PROXY_PORT,
+        "/echo-eof-tls-full/abrupt",
+        "POST",
+        &[("x-eof-body", "abrupt")],
+        Some(body),
+    )
+    .await
+    .expect("request without close_notify must get a response");
+    assert_eq!(
+        get_status_code(&abrupt),
+        Some(502),
+        "a body cut without close_notify must not be returned as complete: {abrupt}"
+    );
+}
+
+/// F-282 / B-261: HTTP/3 で受けて TLS の上流へ流す要求でも、上流が閉じて終わる本文は close_notify を受けたときだけ
+/// 完了とみなす。ストリーミングでは切れた本文を fin で終えずストリームをリセットし、バッファ経路は 502
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+pub(super) async fn test_f282_http3_tls_upstream_eof_body_requires_close_notify() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request;
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let body = b"f282 h3 eof-delimited body".to_vec();
+
+    for (path, mode) in [
+        ("/echo-upload-tls/f282-clean", "clean"),
+        ("/echo-eof-tls-full/f282-clean", "clean"),
+    ] {
+        let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+            .await
+            .expect("HTTP/3 connect");
+        let (status, got) = send_http3_request(
+            &mut send_request,
+            "POST",
+            path,
+            &[("x-eof-body", mode)],
+            Some(&body),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{path}: request with close_notify failed: {e}"));
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(got, body, "{path}: the whole body must be returned");
+    }
+
+    // ストリーミング: 応答ヘッダは送った後なので、ストリームのリセットとしてクライアントに届く
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let streamed = send_http3_request(
+        &mut send_request,
+        "POST",
+        "/echo-upload-tls/f282-abrupt",
+        &[("x-eof-body", "abrupt")],
+        Some(&body),
+    )
+    .await;
+    assert!(
+        streamed.is_err(),
+        "a streamed body cut without close_notify must end in a stream reset, got {:?}",
+        streamed.map(|(s, b)| (s, b.len()))
+    );
+
+    // バッファ経路: 応答の前に分かるので 502
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 connect");
+    let (status, _) = send_http3_request(
+        &mut send_request,
+        "POST",
+        "/echo-eof-tls-full/f282-abrupt",
+        &[("x-eof-body", "abrupt")],
+        Some(&body),
+    )
+    .await
+    .expect("buffered request without close_notify must get a response");
+    assert_eq!(status, 502);
+}
+
+/// F-282: HTTP/2 で受けて HTTP/1.1 の TLS 上流へ流す要求でも、上流が閉じて終わる本文は close_notify を受けたときだけ
+/// 完了とみなす（HTTP/2 への中継は本文を集めてから送るので、受けずに切れたら 502）
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http2")]
+pub(super) async fn test_f282_http2_tls_upstream_eof_body_requires_close_notify() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let body = b"f282 h2 eof-delimited body";
+    for route in ["/echo-upload-tls/f282-h2", "/echo-eof-tls-full/f282-h2"] {
+        let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("HTTP/2 connect");
+        let (status, got) = client
+            .send_request("POST", route, &[("x-eof-body", "clean")], Some(body))
+            .await
+            .unwrap_or_else(|e| panic!("{route}: request with close_notify failed: {e}"));
+        assert_eq!(status, 200, "{route}");
+        assert_eq!(got, body, "{route}: the whole body must be returned");
+
+        let (status, _) = client
+            .send_request("POST", route, &[("x-eof-body", "abrupt")], Some(body))
+            .await
+            .unwrap_or_else(|e| panic!("{route}: request without close_notify failed: {e}"));
+        assert_eq!(
+            status, 502,
+            "{route}: a body cut without close_notify must not be returned as complete"
+        );
     }
 }

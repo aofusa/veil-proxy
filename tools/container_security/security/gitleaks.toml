@@ -46,4 +46,9 @@ regexes = [
   '''EdJnEZSH6X8hcyEii7c8H5lnhgjB5dwo07M5oheC8Xz8mOllyg''',
   # kind の E2E（tools/k8s/mesh-e2e.sh）で WasmPlugin の basic_auth に渡す試験用の資格情報
   '''^ok:(test|wrong)$''',
+  # --- トリアージ済み誤検知（2026-10-27、v0.10.0。B-217）---
+  # library_e2e.sh の Basic 認証の試験（veil-proxy-kit の例の固定の資格情報）
+  '''^admin:pw$''',
+  # Python の ASGI の文書の引数名（`forwarded_allow_ips="10.0.0.1"`）。値は IP アドレス
+  '''^forwarded_allow_ips=$''',
 ]

@@ -23,7 +23,7 @@ enabled = true
 |--------|-------------|---------|
 | `enabled` | Enable metrics endpoint | **false** |
 | `path` | Metrics endpoint path | `/__metrics` |
-| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
+| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (loopback and Unix-socket listeners only) |
 
 ### Endpoint
 
@@ -62,6 +62,9 @@ Use the `path` option to change the endpoint path.
 | `veil_connection_pool_hits_total` | Counter | upstream | Connection pool hit count |
 | `veil_connection_pool_misses_total` | Counter | upstream | Connection pool miss count |
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC request count |
+| `veil_http3_invalid_packets_total` | Counter | - | UDP datagrams on the HTTP/3 port that are not valid QUIC packets (logged at debug level only) |
+| `veil_upstream_connect_errors_total` | Counter | kind | Failed connections to upstream servers (`error`, `timeout`, `tls`, `no_healthy`). The matching log line is written at most once per 10 seconds per call site (the rest at debug level) |
+| `veil_uring_cq_overflow_total` | Counter | - | Times an io_uring completion queue overflowed (io_uring backend only). Completions are not lost, but a non-zero value means the rings are small for the load |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPC stream duration |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
@@ -154,7 +157,7 @@ allowed_ips = [
 ### Access Control
 
 When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint.
-When empty (default), all IPs can access.
+When empty (the default), only loopback clients (and Unix-socket listeners) can access it; before v0.10.0 every IP could. Write `["0.0.0.0/0", "::/0"]` to allow everyone. `[admin] allowed_ips` behaves the same way.
 
 | Format | Example |
 |--------|---------|
@@ -319,6 +322,10 @@ Access logs are written asynchronously by a dedicated writer thread. The hot pat
 | `req_body_size` | Request body size (bytes) |
 | `resp_body_size` | Response body size (bytes) |
 | `user_agent` | User-Agent header |
+
+Values taken from the request (`method`, `host`, `path`, `upstream`, `user_agent`) are escaped: JSON uses JSON string
+escapes, and the text format writes control characters, `\` and bytes 0x7f and above as `\xNN` (as nginx's
+`escape=default`), so a request cannot inject terminal escape sequences or extra lines into the log.
 
 ### Example JSON Output
 

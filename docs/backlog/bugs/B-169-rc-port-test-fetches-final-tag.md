@@ -21,3 +21,12 @@ v0.9.2-rc.1 の release の run（40189832094、2026-10-25）。FreeBSD・OpenBS
 ## 試験
 
 - 次の rc で port の試験 3 つが `make makesum` を通ること。
+
+## 実施内容（2026-10-25）
+
+- 原因: VM の中で `git describe --tags --exact-match` が取れず（VM へ同期した木にタグが無い）、Cargo.toml の版のタグ（v0.9.2）に
+  落ちていた。一方 `VEIL_PORT_LOCAL_SRC` は `inputs.ref` が `v` で始まれば 0 だったので、まだ無い `v0.9.2` を取りに行った。
+- dist.yml の `bsd-ports` で、runner 側の step（id `src`）が「ref が `v<Cargo.toml の版>` に一致し、版に `-` を含まない」ときだけ
+  `local=0`、それ以外（rc のタグ・ブランチ）は checkout した木から `src.tar.gz` を作って `local=1` にし、`VEIL_PORT_LOCAL_SRC` に渡す。
+- VM の中の port のタグは常に `v<Cargo.toml の版>`（`git describe` に頼らない）。
+- 試験: v0.10.0-rc.1 の run で port の試験 3 つが `make makesum` を通ることを確かめる。

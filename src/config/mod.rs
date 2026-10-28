@@ -76,6 +76,8 @@ mod loaded;
 pub use self::loaded::*;
 mod cli;
 pub use self::cli::*;
+mod listeners;
+pub use self::listeners::*;
 // ====================
 // WASM Response Filter Context
 // ====================
@@ -551,12 +553,24 @@ pub struct Route {
 
 #[derive(Deserialize)]
 struct Config {
+    /// 省略可（`[[listener]]` だけで待ち受けを書く設定。F-260）
+    #[serde(default = "default_server_section")]
     server: ServerConfigSection,
+    /// 待ち受けの列（F-260）。`[server] listen`・`listen_cleartext` は暗黙のリスナーとして先頭に足す。
+    #[serde(default)]
+    listener: Option<Vec<ListenerConfigSection>>,
+    /// `[acme]` のうち待ち受けの重なりの検査に使う部分（F-260。本体は `acme::bootstrap` が読む）
+    #[cfg(feature = "acme")]
+    #[serde(default)]
+    acme: AcmeListenSection,
     /// 省略可（平文専用サーバ構成のときだけ。`validate_tls_presence` 参照）。
     #[serde(default = "default_tls_section")]
     tls: TlsConfigSection,
     #[serde(default)]
     performance: PerformanceConfigSection,
+    /// 外向きの TLS 全体の既定の信頼アンカー（F-259）
+    #[serde(default)]
+    tls_client: crate::trust_store::TlsClientConfig,
     /// グローバルセキュリティ設定（権限降格など）
     #[serde(default)]
     security: GlobalSecurityConfig,
@@ -614,6 +628,36 @@ struct Config {
     #[cfg(feature = "l4-proxy")]
     #[serde(default)]
     l4: Option<Vec<L4ListenerConfig>>,
+}
+
+/// `[server]` を省略したときの既定値（F-260）
+fn default_server_section() -> ServerConfigSection {
+    toml::from_str("").expect("ServerConfigSection must deserialize from an empty table")
+}
+
+/// `[acme]` の待ち受けに関わるキー（F-260。既定は `acme::AcmeConfig` と同じ）
+#[cfg(feature = "acme")]
+#[derive(Deserialize)]
+struct AcmeListenSection {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_acme_challenge_listen")]
+    challenge_listen: String,
+}
+
+#[cfg(feature = "acme")]
+impl Default for AcmeListenSection {
+    fn default() -> Self {
+        AcmeListenSection {
+            enabled: false,
+            challenge_listen: default_acme_challenge_listen(),
+        }
+    }
+}
+
+#[cfg(feature = "acme")]
+fn default_acme_challenge_listen() -> String {
+    crate::acme::AcmeConfig::default().challenge_listen
 }
 
 // ====================
@@ -1131,6 +1175,38 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_recv_drain_max")]
     pub recv_drain_max: usize,
 
+    /// ワーカーごとの QUIC 接続数の上限（B-222）
+    ///
+    /// 上限に達している間は新しい接続の Initial を捨てる。`0` は上限なし。
+    ///
+    /// デフォルト: `10000`
+    #[serde(default = "default_h3_max_connections")]
+    pub max_connections: usize,
+
+    /// Retry でアドレスを検証し始めるハンドシェイク中の接続数（ワーカーごと、B-222）
+    ///
+    /// ハンドシェイク中の接続がこの数に達したら、トークンの無い Initial にステートレスな Retry を返し、
+    /// クライアントが送信元のアドレスを持っていることを確かめてから接続を作る（送信元を偽装した Initial の
+    /// 洪水で接続を確保させない）。`0` は常に Retry（1 往復増える）。
+    ///
+    /// デフォルト: `1000`
+    #[serde(default = "default_h3_retry_threshold")]
+    pub retry_threshold: usize,
+
+    /// ハンドシェイクの期限（ミリ秒、B-222）。これまでに確立しない接続は捨てる。
+    ///
+    /// デフォルト: `10000`
+    #[serde(default = "default_h3_handshake_timeout")]
+    pub handshake_timeout: u64,
+
+    /// 受け付ける要求のヘッダの大きさの上限（バイト、B-255）。`SETTINGS_MAX_FIELD_SECTION_SIZE` として相手に広告し、
+    /// HEADERS フレームの長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 9114 §4.2.2）で検査する。
+    /// 超えた接続は閉じる。
+    ///
+    /// デフォルト: `65536`（`[http2] max_header_list_size` と同じ）
+    #[serde(default = "default_h3_max_field_section_size")]
+    pub max_field_section_size: u64,
+
     // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
@@ -1182,6 +1258,18 @@ fn default_h3_mmsg_batch_size() -> usize {
 fn default_h3_recv_drain_max() -> usize {
     1024
 }
+fn default_h3_max_connections() -> usize {
+    10_000
+}
+fn default_h3_retry_threshold() -> usize {
+    1_000
+}
+fn default_h3_handshake_timeout() -> u64 {
+    10_000
+}
+fn default_h3_max_field_section_size() -> u64 {
+    65_536
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -1206,6 +1294,10 @@ impl Default for Http3ConfigSection {
             hystart: true,
             mmsg_batch_size: default_h3_mmsg_batch_size(),
             recv_drain_max: default_h3_recv_drain_max(),
+            max_connections: default_h3_max_connections(),
+            retry_threshold: default_h3_retry_threshold(),
+            handshake_timeout: default_h3_handshake_timeout(),
+            max_field_section_size: default_h3_max_field_section_size(),
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -1246,6 +1338,10 @@ impl Http3ConfigSection {
             recv_drain_max: self
                 .recv_drain_max
                 .clamp(1, http3_server::H3_RECV_DRAIN_MAX_LIMIT),
+            max_connections: self.max_connections,
+            retry_threshold: self.retry_threshold,
+            handshake_timeout: self.handshake_timeout,
+            max_field_section_size: self.max_field_section_size,
         }
     }
 }
@@ -1699,6 +1795,12 @@ pub struct PerformanceConfigSection {
     /// デフォルト: 10000
     #[serde(default = "default_open_file_cache_max_entries")]
     pub open_file_cache_max_entries: usize,
+
+    /// OpenFileCache がディスクの変更を通知で追従するか（グローバルデフォルト、F-272）
+    /// ルートの `[route.open_file_cache] watch` が無いルートに効く。
+    /// デフォルト: false（有効期限だけで追従する）
+    #[serde(default)]
+    pub open_file_cache_watch: bool,
 }
 
 impl PerformanceConfigSection {
@@ -1862,13 +1964,17 @@ mod f200_listener_tests {
 
     #[test]
     fn redirect_url_uses_listen_port() {
-        HTTPS_REDIRECT_PORT.store(443, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            https_redirect_url("a.example:80", "/x?y"),
+            https_redirect_url("a.example:80", "/x?y", 443),
             "https://a.example/x?y"
         );
-        assert_eq!(https_redirect_url("", "/"), "https://localhost/");
-        assert_eq!(https_redirect_url("[::1]:80", "/"), "https://[::1]/");
+        assert_eq!(https_redirect_url("", "/", 443), "https://localhost/");
+        assert_eq!(https_redirect_url("[::1]:80", "/", 443), "https://[::1]/");
+        // F-260: リダイレクト先のリスナーのポート
+        assert_eq!(
+            https_redirect_url("a.example:8080", "/", 8443),
+            "https://a.example:8443/"
+        );
     }
 }
 
@@ -2121,17 +2227,50 @@ mod admin_config_tests {
         assert!(!cfg.check_auth(Some("Bearer ")));
     }
 
+    // B-231: allowed_ips が空なら loopback（UDS の接続は 127.0.0.1）だけ。全許可は明示する
     #[test]
-    fn admin_ip_allowed_empty_allows_all() {
-        let cfg = AdminConfig {
+    fn admin_ip_allowed_empty_allows_loopback_only() {
+        let mut cfg = AdminConfig {
             enabled: true,
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: Vec::new(),
             cache_purge_prefix: "/__admin/cache/purge".into(),
         };
-        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(!cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("127.0.0.1"));
         assert!(cfg.is_ip_allowed("::1"));
+        assert!(cfg.is_ip_allowed("::ffff:127.0.0.1"));
+        assert!(!cfg.is_ip_allowed("not-an-ip"));
+        cfg.allowed_ips = vec!["0.0.0.0/0".into(), "::/0".into()];
+        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("2001:db8::1"));
+
+        let prom = PrometheusConfig::default();
+        assert!(!prom.is_ip_allowed("10.0.0.1"));
+        assert!(prom.is_ip_allowed("127.0.0.1"));
+    }
+
+    // B-231: 認証の失敗が IP ごとに上限を超えたら、正しい秘密でも拒否する（他の IP は影響を受けない）
+    #[test]
+    fn admin_auth_failures_are_rate_limited_per_ip() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "topsecret".into(),
+            allowed_ips: Vec::new(),
+            cache_purge_prefix: "/__admin/cache/purge".into(),
+        };
+        let ip = "198.51.100.231";
+        assert!(cfg.check_auth_from(ip, Some("Bearer topsecret")));
+        for _ in 0..crate::config::prometheus::ADMIN_AUTH_FAILURES_PER_MINUTE {
+            assert!(!cfg.check_auth_from(ip, Some("Bearer wrong")));
+        }
+        assert!(!cfg.check_auth_from(ip, Some("Bearer topsecret")));
+        assert!(cfg.check_auth_from("198.51.100.232", Some("Bearer topsecret")));
+        // 長さの違う秘密・前方一致は通らない
+        assert!(!cfg.check_auth(Some("topsecre")));
+        assert!(!cfg.check_auth(Some("topsecretx")));
     }
 
     #[test]

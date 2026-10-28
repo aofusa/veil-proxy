@@ -19,6 +19,12 @@ struct RouteArgs {
     offload: Option<bool>,
     hidden: bool,
     streaming: bool,
+    // F-270: `compress = false` で応答を圧縮しない
+    no_compress: bool,
+    // F-262: WebSocket のルートの OpenAPI（`x-veil-websocket`）
+    ws_receive: Option<Type>,
+    ws_send: Option<Type>,
+    ws_protocols: Vec<String>,
 }
 
 fn str_list(e: &Expr) -> syn::Result<Vec<String>> {
@@ -42,6 +48,16 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
             .get_ident()
             .map(|i| i.to_string())
             .unwrap_or_default();
+        // 型を取る引数（`Vec<T>` のような総称型は式として読めないので先に型として読む）
+        if key == "ws_receive" || key == "ws_send" {
+            let ty: Type = meta.value()?.parse()?;
+            if key == "ws_receive" {
+                a.ws_receive = Some(ty);
+            } else {
+                a.ws_send = Some(ty);
+            }
+            return Ok(());
+        }
         let value: Expr = meta.value()?.parse()?;
         match key.as_str() {
             "path" => {
@@ -53,6 +69,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
             "tags" | "tag" => a.tags.extend(str_list(&value)?),
             "summary" => a.summary = lit_str(&value),
             "description" => a.description = lit_str(&value),
+            "ws_protocols" => a.ws_protocols.extend(str_list(&value)?),
             "status" => match &value {
                 Expr::Lit(l) => match &l.lit {
                     Lit::Int(i) => a.status = Some(i.base10_parse()?),
@@ -60,7 +77,7 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                 },
                 _ => return Err(Error::new(value.span(), "expected an integer")),
             },
-            "offload" | "hidden" | "streaming" => {
+            "offload" | "hidden" | "streaming" | "compress" => {
                 let b = match &value {
                     Expr::Lit(l) => match &l.lit {
                         Lit::Bool(b) => b.value,
@@ -71,12 +88,13 @@ fn parse_args(attr: TokenStream) -> syn::Result<RouteArgs> {
                 match key.as_str() {
                     "offload" => a.offload = Some(b),
                     "hidden" => a.hidden = b,
+                    "compress" => a.no_compress = !b,
                     _ => a.streaming = b,
                 }
             }
             other => {
                 return Err(meta.error(format!(
-                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming)",
+                    "unknown route argument '{}' (expected path, method(s), name, tags, summary, description, status, offload, hidden, streaming, compress, ws_receive, ws_send, ws_protocols)",
                     other
                 )))
             }
@@ -96,6 +114,20 @@ enum ArgKind {
     Form(Type),
     /// Extracted with `FromRequest` (State, Headers, Bytes and so on).
     FromRequest(Type),
+    /// `WebSocketUpgrade` (extracted with `FromRequest`; the route is documented as a WebSocket endpoint).
+    WebSocket(Type),
+    /// `MultipartForm<T>`: the non-file fields of a multipart body.
+    MultipartForm(Type),
+    /// `UploadFile` (`Vec<UploadFile>`, `Option<UploadFile>`): the file field named after the argument.
+    Upload {
+        name: String,
+        many: bool,
+        optional: bool,
+    },
+    /// `Multipart`: the body read as it arrives (the route receives its body as a stream).
+    Multipart(Type),
+    /// Extracted with `FromRequestAsync` (`#[inject]` arguments and the extractor types of veil-proxy-kit).
+    Async(Type),
     PathParam(String, Type),
     QueryParam {
         name: String,
@@ -124,9 +156,39 @@ fn classify(name: Option<&str>, ty: &Type, path_params: &[String]) -> ArgKind {
             }
         }
         "State" | "Headers" | "Bytes" | "Body" => return ArgKind::FromRequest(ty.clone()),
+        // F-267: veil-proxy-kit の抽出子（型名で決める。他の型は `#[inject]` を付ける）
+        "Dep" | "Auth" | "MaybeAuth" | "CookieJar" | "SignedCookieJar" | "PrivateCookieJar"
+        | "BackgroundTasks" | "BasicAuth" | "BearerToken" | "ApiKey" | "Jwt" | "Session"
+        | "Inject" => return ArgKind::Async(ty.clone()),
+        "WebSocketUpgrade" => return ArgKind::WebSocket(ty.clone()),
+        "Multipart" => return ArgKind::Multipart(ty.clone()),
+        "MultipartForm" => {
+            if let Some(inner) = first_generic(ty) {
+                return ArgKind::MultipartForm(inner.clone());
+            }
+        }
         _ => {}
     }
     let name = name.unwrap_or("").trim_start_matches("r#").to_string();
+    let upload_inner = |t: &Type| last_ident(t).as_deref() == Some("UploadFile");
+    if last == "UploadFile" {
+        return ArgKind::Upload {
+            name,
+            many: false,
+            optional: false,
+        };
+    }
+    if last == "Vec" || last == "Option" {
+        if let Some(inner) = first_generic(ty) {
+            if upload_inner(inner) {
+                return ArgKind::Upload {
+                    name,
+                    many: last == "Vec",
+                    optional: last == "Option",
+                };
+            }
+        }
+    }
     if path_params.contains(&name) {
         return ArgKind::PathParam(name, ty.clone());
     }
@@ -181,7 +243,18 @@ fn response_content(ret: &ReturnType) -> TokenStream {
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let args = parse_args(attr)?;
-    let func: ItemFn = syn::parse2(item)?;
+    let mut func: ItemFn = syn::parse2(item)?;
+    // F-267: `#[inject]` の付いた引数は FromRequestAsync で取り出す（属性は関数から外して出力する）
+    let mut injected = Vec::new();
+    for input in func.sig.inputs.iter_mut() {
+        if let FnArg::Typed(pt) = input {
+            let before = pt.attrs.len();
+            pt.attrs.retain(|a| !a.path().is_ident("inject"));
+            injected.push(pt.attrs.len() != before);
+        } else {
+            injected.push(false);
+        }
+    }
     let (path, path_span) = args
         .path
         .clone()
@@ -219,6 +292,11 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let mut call_args = Vec::new();
     let mut meta_stmts = Vec::new();
     let mut can_fail = false;
+    let mut is_ws = false;
+    // F-266: multipart の引数（OpenAPI の requestBody を 1 つにまとめる）
+    let mut mp_form: Option<Type> = None;
+    let mut mp_files: Vec<(String, bool, bool)> = Vec::new();
+    let mut mp_stream = false;
     for (i, input) in func.sig.inputs.iter().enumerate() {
         let FnArg::Typed(pt) = input else {
             return Err(Error::new(
@@ -232,7 +310,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         };
         let var = format_ident!("__veil_arg{}", i);
         let ty = &*pt.ty;
-        match classify(arg_name.as_deref(), ty, &path_params) {
+        let kind = if injected[i] {
+            ArgKind::Async(ty.clone())
+        } else {
+            classify(arg_name.as_deref(), ty, &path_params)
+        };
+        match kind {
             ArgKind::RequestRef => call_args.push(quote!(&__veil_req)),
             ArgKind::RequestOwned => call_args.push(quote!(__veil_req.clone())),
             ArgKind::Json(inner) | ArgKind::Form(inner) | ArgKind::Query(inner) => {
@@ -279,7 +362,72 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                     });
                 }
             }
-            ArgKind::FromRequest(t) => {
+            ArgKind::FromRequest(t) | ArgKind::WebSocket(t) => {
+                is_ws |= last_ident(&t).as_deref() == Some("WebSocketUpgrade");
+                extract.push(quote! {
+                    let #var: #t = match <#t as ::veil::api::__private::FromRequest>::from_request(&__veil_req) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
+            }
+            ArgKind::MultipartForm(inner) => {
+                can_fail = true;
+                extract.push(quote! {
+                    let #var: #inner = match ::veil::api::__private::multipart_form::<#inner>(&__veil_req) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                    {
+                        use ::veil::api::__private::{ViaValidate as _, ViaNoValidate as _};
+                        if let Err(r) = (&::veil::api::__private::ValidateProbe(&#var)).veil_validate("body") {
+                            return r;
+                        }
+                    }
+                });
+                call_args.push(quote!(::veil::api::__private::MultipartForm(#var)));
+                mp_form = Some(inner);
+            }
+            ArgKind::Upload {
+                name: fname,
+                many,
+                optional,
+            } => {
+                if fname.is_empty() {
+                    return Err(Error::new(
+                        pt.pat.span(),
+                        "use a plain identifier for an UploadFile argument (it names the form field)",
+                    ));
+                }
+                can_fail = true;
+                let getter = if many {
+                    quote!(upload_files)
+                } else if optional {
+                    quote!(upload_file_opt)
+                } else {
+                    quote!(upload_file)
+                };
+                extract.push(quote! {
+                    let #var = match ::veil::api::__private::#getter(&__veil_req, #fname) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
+                mp_files.push((fname, many, !optional));
+            }
+            ArgKind::Async(t) => {
+                extract.push(quote! {
+                    let #var: #t = match <#t as ::veil::api::__private::FromRequestAsync>::from_request_async(&__veil_req).await {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
+                });
+                call_args.push(quote!(#var));
+            }
+            ArgKind::Multipart(t) => {
+                mp_stream = true;
                 extract.push(quote! {
                     let #var: #t = match <#t as ::veil::api::__private::FromRequest>::from_request(&__veil_req) {
                         Ok(v) => v,
@@ -349,6 +497,36 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         }
     }
 
+    if mp_stream && (mp_form.is_some() || !mp_files.is_empty()) {
+        return Err(Error::new(
+            Span::call_site(),
+            "`Multipart` reads the body as it arrives and cannot be combined with `MultipartForm` or `UploadFile`",
+        ));
+    }
+    if mp_stream || mp_form.is_some() || !mp_files.is_empty() {
+        let form_schema = match &mp_form {
+            Some(t) => quote! {
+                Some({
+                    use ::veil::api::__private::{ViaApiSchema as _, ViaNoSchema as _};
+                    (&::veil::api::__private::SchemaProbe::<#t>(::core::marker::PhantomData)).veil_schema(&mut __veil_defs)
+                })
+            },
+            None => quote!(None),
+        };
+        let names = mp_files.iter().map(|f| &f.0);
+        let manys = mp_files.iter().map(|f| f.1);
+        let reqs = mp_files.iter().map(|f| f.2);
+        meta_stmts.push(quote! {
+            {
+                let __veil_form: ::core::option::Option<::veil::api::__private::serde_json::Value> = #form_schema;
+                __veil_body = Some(::veil::api::__private::multipart_body_meta(
+                    __veil_form,
+                    &__veil_defs,
+                    &[#((#names, #manys, #reqs)),*],
+                ));
+            }
+        });
+    }
     let call = if offload {
         // 同期関数: 引数を取り出してからハンドラ用プールで実行する（引数・戻り値は Send が必要）。
         quote! {
@@ -384,9 +562,43 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let description = opt_string(args.description.clone().or(doc_desc));
     let tags = &args.tags;
     let hidden = args.hidden;
-    let streaming = args.streaming;
+    // F-266: `Multipart` は本文をストリーミングで受ける
+    let streaming = args.streaming || mp_stream;
+    let compress = !args.no_compress;
     let resp_content = response_content(&func.sig.output);
     let ok_status = args.status.unwrap_or(200);
+    if !is_ws
+        && (args.ws_receive.is_some() || args.ws_send.is_some() || !args.ws_protocols.is_empty())
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            "`ws_receive`, `ws_send` and `ws_protocols` need a `WebSocketUpgrade` argument",
+        ));
+    }
+    let ws_schema = |t: &Option<Type>| match t {
+        Some(t) => quote! {
+            Some({
+                use ::veil::api::__private::{ViaApiSchema as _, ViaNoSchema as _};
+                (&::veil::api::__private::SchemaProbe::<#t>(::core::marker::PhantomData)).veil_schema(&mut __veil_defs)
+            })
+        },
+        None => quote!(None),
+    };
+    let websocket = if is_ws {
+        let recv = ws_schema(&args.ws_receive);
+        let send = ws_schema(&args.ws_send);
+        let protos = &args.ws_protocols;
+        quote! {
+            Some(::veil::api::__private::WebSocketMeta {
+                subprotocols: ::veil::api::__private::Vec::from([#(::veil::api::__private::String::from(#protos)),*]),
+                receive: #recv,
+                send: #send,
+                message_format: None,
+            })
+        }
+    } else {
+        quote!(None)
+    };
     let ok_desc = if ok_status == 204 {
         "No Content"
     } else {
@@ -415,6 +627,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             let mut __veil_body: ::core::option::Option<::veil::api::__private::BodyMeta> = None;
             #(#meta_stmts)*
             let __veil_content = #resp_content;
+            let __veil_ws: ::core::option::Option<::veil::api::__private::WebSocketMeta> = #websocket;
             ::veil::api::__private::OperationMeta {
                 operation_id: #name.into(),
                 summary: #summary,
@@ -431,6 +644,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 validates: #can_fail,
                 hidden: #hidden,
                 raw: None,
+                websocket: __veil_ws,
             }
         }
 
@@ -442,6 +656,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 handler: #handler_ident,
                 meta: #meta_ident,
                 streaming_request: #streaming,
+                compress: #compress,
             }
         }
     })

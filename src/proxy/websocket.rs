@@ -80,6 +80,7 @@ pub(super) async fn handle_websocket_proxy(
     // ヘッダーを転送する。Host（上で書いた）・Connection と Upgrade 以外のホップバイホップ・
     // `remove_request_headers` に入っている名前・不正な名前と値は送らず、`add_request_headers` を足す
     // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
+    let added = expanded_added_headers(security, client_ip, host, path_str);
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b"host")
             || name.eq_ignore_ascii_case(b"keep-alive")
@@ -87,6 +88,7 @@ pub(super) async fn handle_websocket_proxy(
             || name.eq_ignore_ascii_case(b"proxy-connection")
             || name.eq_ignore_ascii_case(b"te")
             || !forward_allowed(security, name)
+            || !added.keeps(name)
         {
             continue;
         }
@@ -100,10 +102,10 @@ pub(super) async fn handle_websocket_proxy(
         request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
-    for (name, value) in expanded_added_headers(security, client_ip, host, path_str) {
-        request.extend_from_slice(&name);
+    for (name, value) in added.iter() {
+        request.extend_from_slice(name);
         request.extend_from_slice(HEADER_COLON);
-        request.extend_from_slice(&value);
+        request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
     request.extend_from_slice(HEADER_CRLF);
@@ -166,7 +168,10 @@ pub(super) async fn handle_websocket_proxy_http(
             stream
         }
         Ok(Err(e)) => {
-            error!("WebSocket proxy connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(error, "WebSocket proxy connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -260,7 +265,10 @@ pub(super) async fn handle_websocket_proxy_http(
         }
 
         // ヘッダーが大きすぎる
-        if response_buf.len() > MAX_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
+        if response_buf.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&response_buf)
+        {
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -289,7 +297,10 @@ pub(super) async fn handle_websocket_proxy_https(
             stream
         }
         Ok(Err(e)) => {
-            error!("WebSocket proxy connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Error,
+            );
+            crate::logging::log_throttled!(error, "WebSocket proxy connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -312,7 +323,10 @@ pub(super) async fn handle_websocket_proxy_https(
     let mut backend_stream = match tls_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
-            error!("WebSocket TLS connect error: {}", e);
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::Tls,
+            );
+            crate::logging::log_throttled!(error, "WebSocket TLS connect error: {}", e);
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -406,7 +420,10 @@ pub(super) async fn handle_websocket_proxy_https(
         }
 
         // ヘッダーが大きすぎる
-        if response_buf.len() > MAX_HEADER_SIZE {
+        // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
+        if response_buf.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&response_buf)
+        {
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
@@ -443,6 +460,8 @@ pub(super) async fn websocket_bidirectional_transfer(
 
     // 現在のタイムアウト値（Adaptive モードで動的に変更）
     let mut current_timeout_ms = poll_config.initial_timeout_ms;
+    // アイドルになった時刻（F-282）
+    let mut idle_since: Option<std::time::Instant> = None;
 
     loop {
         let poll_timeout = Duration::from_millis(current_timeout_ms);
@@ -506,6 +525,17 @@ pub(super) async fn websocket_bidirectional_transfer(
             }
         }
 
+        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
+        if had_activity {
+            idle_since = None;
+        } else if let Some(limit) = poll_config.idle_timeout {
+            let now = std::time::Instant::now();
+            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
+                debug!("WebSocket tunnel idle for {:?}; closing", limit);
+                break;
+            }
+        }
+
         // Adaptive モードでのタイムアウト調整
         if poll_config.mode == WebSocketPollMode::Adaptive {
             if had_activity {
@@ -537,6 +567,8 @@ pub(super) async fn websocket_bidirectional_transfer_tls(
 
     // 現在のタイムアウト値（Adaptive モードで動的に変更）
     let mut current_timeout_ms = poll_config.initial_timeout_ms;
+    // アイドルになった時刻（F-282）
+    let mut idle_since: Option<std::time::Instant> = None;
 
     loop {
         let poll_timeout = Duration::from_millis(current_timeout_ms);
@@ -594,6 +626,17 @@ pub(super) async fn websocket_bidirectional_transfer_tls(
                 break;
             }
             Err(_) => {}
+        }
+
+        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
+        if had_activity {
+            idle_since = None;
+        } else if let Some(limit) = poll_config.idle_timeout {
+            let now = std::time::Instant::now();
+            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
+                debug!("WebSocket tunnel idle for {:?}; closing", limit);
+                break;
+            }
         }
 
         // Adaptive モードでのタイムアウト調整

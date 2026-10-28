@@ -58,10 +58,6 @@ async = [
     "wasmtime-component-macro?/async",
     "runtime",
 ]
-cache = [
-    "dep:wasmtime-cache",
-    "std",
-]
 call-hook = []
 component-model = [
     "wasmtime-environ/component-model",
@@ -99,7 +95,6 @@ custom-virtual-memory = []
 debug-builtins = ["wasmtime-jit-debug/gdb_jit_int"]
 default = [
     "async",
-    "cache",
     "gc",
     "gc-drc",
     "gc-null",
@@ -339,11 +334,6 @@ version = "=36.0.19"
 optional = true
 package = "wasmtime-internal-asm-macros"
 
-[dependencies.wasmtime-cache]
-version = "=36.0.19"
-optional = true
-package = "wasmtime-internal-cache"
-
 [dependencies.wasmtime-component-macro]
 version = "=36.0.19"
 optional = true
@@ -513,6 +503,6 @@ check-cfg = [
     "cfg(pulley_tail_calls)",
     "cfg(pulley_assume_llvm_makes_tail_calls)",
     "cfg(pulley_disable_interp_simd)",
-    # veil: `profiling`・`profile-pulley` の feature を消した（B-158、README.veil.md）。src のその cfg は常に偽
-    'cfg(feature, values("profiling", "profile-pulley"))',
+    # veil: `profiling`・`profile-pulley`（B-158）・`cache`（B-216）の feature を消した（README.veil.md）。src のその cfg は常に偽
+    'cfg(feature, values("profiling", "profile-pulley", "cache"))',
 ]

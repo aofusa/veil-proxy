@@ -192,6 +192,7 @@ pub async fn from_http_request(req: http::Request<VeilBody>) -> Request {
         req.client_ip = o.client_ip;
         req.version = o.version;
         req.body_stream = o.body_stream;
+        req.extensions = o.extensions;
     }
     req
 }
@@ -215,8 +216,17 @@ pub fn to_http_response(resp: Response) -> http::Response<VeilBody> {
         out.extensions_mut()
             .insert(StreamCarrier(Arc::new(Mutex::new(Some(stream)))));
     }
+    // F-261: アップグレードの関数も同じく層を素通りさせる
+    if let Some(up) = resp.upgrade {
+        out.extensions_mut()
+            .insert(UpgradeCarrier(Arc::new(Mutex::new(Some(up)))));
+    }
     out
 }
+
+/// Carries the upgrade function of a `101` response through layers.
+#[derive(Clone)]
+struct UpgradeCarrier(Arc<Mutex<Option<Box<super::upgrade::UpgradeHook>>>>);
 
 /// A container that holds the streaming body while the response passes through layers (http extensions require `Clone + Sync`).
 #[derive(Clone)]
@@ -229,6 +239,16 @@ where
     B::Error: std::fmt::Display,
 {
     let (parts, body) = resp.into_parts();
+    let upgrade = parts
+        .extensions
+        .get::<UpgradeCarrier>()
+        .and_then(|c| c.0.lock().ok().and_then(|mut g| g.take()));
+    if let Some(up) = upgrade {
+        let mut r = Response::new(parts.status.as_u16());
+        r.upgrade = Some(up);
+        headers_into_vec(parts.headers, &mut r.headers);
+        return r;
+    }
     let carried = parts
         .extensions
         .get::<StreamCarrier>()

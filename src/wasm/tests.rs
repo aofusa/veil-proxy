@@ -327,6 +327,16 @@ mod types_tests {
         // routesフィールドは削除されました（ルートレベルのmodulesフィールドを使用）
     }
 
+    /// B-175: yield の間隔は既定 1,000µs、`[wasm.defaults] yield_interval_us` で変えられる
+    #[test]
+    fn yield_interval_us_default_and_override() {
+        let d: WasmDefaults = toml::from_str("").unwrap();
+        assert_eq!(d.yield_interval_us, 1_000);
+        assert_eq!(WasmDefaults::default().yield_interval_us, 1_000);
+        let d: WasmDefaults = toml::from_str("yield_interval_us = 10").unwrap();
+        assert_eq!(d.yield_interval_us, 10);
+    }
+
     #[test]
     fn test_pooling_config_defaults() {
         let config = PoolingConfig::default();
@@ -381,8 +391,12 @@ mod interpreter_tests {
                 path: FIXTURE.to_string(),
                 configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
+                ..Default::default()
             }],
             interpreter,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         }
     }
 
@@ -426,6 +440,7 @@ mod interpreter_tests {
                 headers.clone(),
                 &Arc::from("127.0.0.1"),
                 true,
+                None,
             ))
         };
 
@@ -491,8 +506,12 @@ mod f132_h3_lifecycle_tests {
                 path: FIXTURE.to_string(),
                 configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
+                ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -525,8 +544,12 @@ mod f132_h3_lifecycle_tests {
                 headers,
                 &Arc::from("127.0.0.1"),
                 true,
+                None,
             ));
-            futures::executor::block_on(on_request_complete_async(engine.clone(), modules.clone()));
+            futures::executor::block_on(on_request_complete_async(
+                engine.clone(),
+                crate::wasm_plugin_config::WasmModules::shared(modules.clone()),
+            ));
         }
 
         let after = crate::wasm::get_context_stats().total_contexts;
@@ -551,17 +574,22 @@ mod f132_h3_lifecycle_tests {
 
         let req_result = futures::executor::block_on(apply_wasm_request_body(
             &engine,
-            &[], // モジュール未指定 -> ゼロコピーでそのまま
+            &crate::wasm_plugin_config::WasmModules::default(), // モジュール未指定 -> ゼロコピーでそのまま
             body.clone(),
             true,
+            None,
         ));
         match req_result {
             WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
             WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
         }
 
-        let resp_result =
-            futures::executor::block_on(apply_wasm_response_body(&engine, &[], body.clone(), true));
+        let resp_result = futures::executor::block_on(apply_wasm_response_body(
+            &engine,
+            &crate::wasm_plugin_config::WasmModules::default(),
+            body.clone(),
+            true,
+        ));
         match resp_result {
             WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
             WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
@@ -603,7 +631,7 @@ mod host_function_tests {
     fn create_test_context() -> HttpContext {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        ctx.plugin_name = "test_plugin".to_string();
+        ctx.plugin_name = "test_plugin".into();
         ctx.request_headers = vec![
             (b":method".to_vec(), b"GET".to_vec()),
             (b":path".to_vec(), b"/api/test".to_vec()),
@@ -728,40 +756,53 @@ mod host_function_tests {
     #[test]
     fn test_shared_data_set_and_get() {
         let ctx = create_test_context();
-
-        // Set shared data
-        {
-            let mut data = ctx.shared_data.write().unwrap();
-            data.insert("test_key".to_string(), (b"test_value".to_vec(), 1));
-        }
-
-        // Get shared data
-        {
-            let data = ctx.shared_data.read().unwrap();
-            let (value, cas) = data.get("test_key").unwrap();
-            assert_eq!(value, b"test_value");
-            assert_eq!(*cas, 1);
-        }
+        assert_eq!(
+            ctx.shared_data.set("test_key", b"test_value", 0),
+            crate::wasm::shared_data::SetResult::Ok
+        );
+        let (value, cas) = ctx.shared_data.get("test_key").unwrap();
+        assert_eq!(&value[..], b"test_value");
+        assert_ne!(cas, 0);
     }
 
     #[test]
     fn test_shared_data_cas_increment() {
-        let mut ctx = create_test_context();
-
-        // Initial CAS
-        let cas1 = ctx.shared_data_cas;
-        ctx.shared_data_cas += 1;
-        let cas2 = ctx.shared_data_cas;
-
-        assert_eq!(cas2, cas1 + 1);
+        use crate::wasm::shared_data::SetResult;
+        let ctx = create_test_context();
+        ctx.shared_data.set("k", b"1", 0);
+        let (_, cas1) = ctx.shared_data.get("k").unwrap();
+        // 今の CAS なら書け、書いた後は古い CAS では書けない
+        assert_eq!(ctx.shared_data.set("k", b"2", cas1), SetResult::Ok);
+        let (_, cas2) = ctx.shared_data.get("k").unwrap();
+        assert_ne!(cas2, cas1);
+        assert_eq!(ctx.shared_data.set("k", b"3", cas1), SetResult::CasMismatch);
+        assert_eq!(&ctx.shared_data.get("k").unwrap().0[..], b"2");
     }
 
     #[test]
     fn test_shared_data_not_found() {
         let ctx = create_test_context();
+        assert!(ctx.shared_data.get("nonexistent_key").is_none());
+    }
 
-        let data = ctx.shared_data.read().unwrap();
-        assert!(data.get("nonexistent_key").is_none());
+    /// B-179: shared data はモジュール名ごとの表で、要求（context）をまたいで・リロードで作り直しても共有する。
+    /// 名前の違うモジュールとは共有しない。
+    #[test]
+    fn b179_shared_data_is_shared_per_module_name() {
+        use crate::wasm::shared_data::for_module;
+        let a1 = for_module("b179-module-a");
+        let a2 = for_module("b179-module-a");
+        let b = for_module("b179-module-b");
+        assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+        a1.set("counter", b"7", 0);
+        assert_eq!(&a2.get("counter").unwrap().0[..], b"7");
+        assert!(b.get("counter").is_none());
+        // 別スレッド（別のワーカー）から読んでも同じ値
+        let a3 = a1.clone();
+        let got = std::thread::spawn(move || a3.get("counter").map(|(v, _)| v.to_vec()))
+            .join()
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&b"7"[..]));
     }
 
     // === Metrics Operations Tests ===
@@ -1213,7 +1254,7 @@ mod p2_callback_tests {
         let ctx = HttpContext::new(1, caps);
 
         // Shared data should be initialized
-        assert!(ctx.shared_data.read().unwrap().is_empty());
+        assert!(ctx.shared_data.is_empty());
 
         // Verify capability for queue operations
         assert!(ctx.capabilities.allow_shared_data);
@@ -1504,8 +1545,12 @@ mod f133_network_filter_tests {
                     allow_upstream_data_write: true,
                     ..Default::default()
                 },
+                ..Default::default()
             }],
             interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1644,5 +1689,340 @@ mod f133_network_filter_tests {
         )];
         futures::executor::block_on(engine.on_downstream_close_with_modules(&modules));
         futures::executor::block_on(engine.on_upstream_close_with_modules(&modules));
+    }
+}
+
+// F-271: VM の文脈の使い回し・data_files・要求本文のフェーズ（baseline_filter.wasm）
+mod instance_reuse_tests {
+    use crate::wasm::{
+        BodyFilterResult, FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig,
+        RequestMeta, WasmConfig,
+    };
+    use std::sync::Arc;
+
+    const FIXTURE: &str = "tests/fixtures/wasm/baseline_filter.wasm";
+
+    fn engine(reuse: bool, data: Option<&std::path::Path>) -> Option<FilterEngine> {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return None;
+        }
+        let mut data_files = std::collections::BTreeMap::new();
+        if let Some(d) = data {
+            data_files.insert("dataset".to_string(), d.to_string_lossy().into_owned());
+        }
+        let capabilities = ModuleCapabilities {
+            allow_send_local_response: true,
+            allow_request_headers_read: true,
+            allow_request_body_read: true,
+            allow_request_body_write: true,
+            allowed_properties: vec!["request.*".into(), "plugin_data.*".into()],
+            ..Default::default()
+        };
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "baseline".to_string(),
+                path: FIXTURE.to_string(),
+                capabilities,
+                instance_reuse: reuse,
+                data_files,
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        Some(FilterEngine::new(&config).expect("engine should build"))
+    }
+
+    fn modules() -> Vec<crate::wasm_plugin_config::ModuleRef> {
+        vec![crate::wasm_plugin_config::ModuleRef::from_name("baseline")]
+    }
+
+    /// 要求ヘッダのフェーズの応答 → (状態, 本文, x-configure-count, x-instance-seq)
+    fn get(engine: &FilterEngine, path: &str) -> (u16, String, u32, u32) {
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from(path),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+            None,
+        ));
+        let FilterResult::LocalResponse(resp) = r else {
+            panic!("expected a local response for {path}");
+        };
+        let h = |n: &[u8]| -> u32 {
+            let v = &resp.headers.iter().find(|(k, _)| k == n).unwrap().1;
+            std::str::from_utf8(v).unwrap().parse().unwrap()
+        };
+        (
+            resp.status_code,
+            String::from_utf8(resp.body.clone()).unwrap(),
+            h(b"x-configure-count"),
+            h(b"x-instance-seq"),
+        )
+    }
+
+    #[test]
+    fn reused_instance_is_configured_once_and_trap_discards_it() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let (st, body, c1, s1) = get(&engine, "/baseline11?a=1&b=2");
+        assert_eq!((st, body.as_str()), (200, "3"));
+        let (_, _, c2, s2) = get(&engine, "/baseline11");
+        let (_, _, c3, s3) = get(&engine, "/baseline11");
+        // on_configure は 1 回、http context は要求ごとに増える
+        assert_eq!((c1, c2, c3), (1, 1, 1));
+        assert!(s1 < s2 && s2 < s3, "{s1} {s2} {s3}");
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+
+        // トラップしたインスタンスは捨てる（ローカル応答にならずに続く）
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from("/trap"),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+            None,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+        let (_, _, c4, s4) = get(&engine, "/baseline11");
+        assert_eq!((c4, s4), (1, 1));
+    }
+
+    #[test]
+    fn without_reuse_every_callback_gets_a_new_instance() {
+        let Some(engine) = engine(false, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            let (_, _, c, s) = get(&engine, "/baseline11");
+            assert_eq!((c, s), (1, 1));
+        }
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+    }
+
+    #[test]
+    // 理由付き allow: テストの一時ファイルの用意（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn data_files_are_readable_as_plugin_data_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("dataset.json");
+        std::fs::write(&data, b"[1,2,3]").unwrap();
+        let Some(engine) = engine(true, Some(&data)) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let (st, body, _, _) = get(&engine, "/dataset");
+        assert_eq!((st, body.as_str()), (200, "[1,2,3]"));
+    }
+
+    #[test]
+    // 理由付き allow: テストの一時ファイルの用意（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn missing_data_file_is_a_load_error() {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "baseline".to_string(),
+                path: FIXTURE.to_string(),
+                data_files: [(
+                    "dataset".to_string(),
+                    missing.to_string_lossy().into_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        assert!(FilterEngine::new(&config).is_err());
+    }
+
+    /// B-177: 要求の本文のフェーズ → ローカル応答のヘッダ x-instance-seq
+    fn post_body(
+        engine: &FilterEngine,
+        sessions: Option<&crate::wasm::RequestSessions>,
+        path: &str,
+        body: &'static [u8],
+    ) -> u32 {
+        let method: Arc<str> = Arc::from("POST");
+        let ip: Arc<str> = Arc::from("127.0.0.1");
+        let path: Arc<str> = Arc::from(path);
+        let meta = RequestMeta {
+            method: &method,
+            path: &path,
+            headers: &[],
+            client_ip: &ip,
+        };
+        match futures::executor::block_on(engine.on_request_body_with_modules(
+            &modules(),
+            bytes::Bytes::from_static(body),
+            true,
+            Some(&meta),
+            sessions,
+        )) {
+            BodyFilterResult::LocalResponse(r) => {
+                let v = &r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == b"x-instance-seq")
+                    .unwrap()
+                    .1;
+                std::str::from_utf8(v).unwrap().parse().unwrap()
+            }
+            _ => panic!("expected a local response"),
+        }
+    }
+
+    /// B-177: 要求ヘッダのフェーズ（本文が続く）
+    fn post_headers(
+        engine: &FilterEngine,
+        sessions: Option<&crate::wasm::RequestSessions>,
+        path: &str,
+    ) {
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from(path),
+            &Arc::from("POST"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            false,
+            sessions,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+    }
+
+    #[test]
+    fn reused_instance_keeps_one_http_context_per_request() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        // 要求ヘッダ・本文・on_log は同じ http context（context は 1 つだけ作られる）
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11?a=1");
+        assert_eq!(a.len(), 1);
+        assert_eq!(post_body(&engine, Some(&a), "/baseline11?a=1", b"2"), 1);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&a)));
+        // on_log の後は context を消した（proxy_on_delete 済み）
+        assert_eq!(a.len(), 0);
+        assert_eq!(engine.pending_deletes("baseline"), 0);
+
+        // 2 つの要求が同じインスタンスに別々の context を持つ
+        let b = crate::wasm::RequestSessions::default();
+        let c = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&b), "/baseline11");
+        post_headers(&engine, Some(&c), "/baseline11");
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+        // 本文のフェーズは新しい context を作らない（作った数は b・c の 2 つを足した 3 のまま）
+        assert_eq!(post_body(&engine, Some(&b), "/baseline11", b"1"), 3);
+        assert_eq!(post_body(&engine, Some(&c), "/baseline11", b"1"), 3);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&b)));
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&c)));
+
+        // 要求ごとの状態が無い呼び出しは従来どおりコールバックごとに context を作る
+        post_headers(&engine, None, "/baseline11");
+        assert_eq!(post_body(&engine, None, "/baseline11", b"1"), 5);
+    }
+
+    #[test]
+    fn dropped_request_context_is_deleted_on_next_use() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11");
+        // on_log まで行かずに要求が終わった（接続の切断等）
+        drop(a);
+        assert_eq!(engine.pending_deletes("baseline"), 1);
+        // 次にインスタンスを使うときに proxy_on_delete する
+        let (_, _, _, seq) = get(&engine, "/baseline11");
+        assert_eq!(seq, 2);
+        assert_eq!(engine.pending_deletes("baseline"), 0);
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+    }
+
+    #[test]
+    fn trap_of_another_request_moves_later_phases_to_a_new_context() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let a = crate::wasm::RequestSessions::default();
+        post_headers(&engine, Some(&a), "/baseline11");
+        // 別の要求のトラップでインスタンスを捨てる
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from("/trap"),
+            &Arc::from("GET"),
+            vec![],
+            &Arc::from("127.0.0.1"),
+            true,
+            None,
+        ));
+        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert_eq!(engine.pooled_instances("baseline"), 0);
+        // a の context は捨てたインスタンスにあったので、本文のフェーズは新しいインスタンスの新しい context で
+        // フィルタを通る（フィルタを飛ばさない）
+        assert_eq!(post_body(&engine, Some(&a), "/baseline11", b"1"), 1);
+        assert_eq!(a.len(), 1);
+        assert_eq!(engine.pooled_instances("baseline"), 1);
+        futures::executor::block_on(engine.on_log_with_modules(&modules(), Some(&a)));
+        assert_eq!(a.len(), 0);
+    }
+
+    #[test]
+    fn request_body_phase_sees_path_and_can_answer_or_rewrite() {
+        let Some(engine) = engine(true, None) else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        assert!(engine.wants_request_body(&modules()));
+        let method: Arc<str> = Arc::from("POST");
+        let ip: Arc<str> = Arc::from("127.0.0.1");
+        let run = |path: &str, body: &'static [u8]| {
+            let path: Arc<str> = Arc::from(path);
+            let meta = RequestMeta {
+                method: &method,
+                path: &path,
+                headers: &[],
+                client_ip: &ip,
+            };
+            futures::executor::block_on(engine.on_request_body_with_modules(
+                &modules(),
+                bytes::Bytes::from_static(body),
+                true,
+                Some(&meta),
+                None,
+            ))
+        };
+        match run("/baseline11?a=1&b=2", b"10") {
+            BodyFilterResult::LocalResponse(r) => assert_eq!(r.body, b"13"),
+            _ => panic!("expected a local response"),
+        }
+        match run("/rewrite", b"hi") {
+            BodyFilterResult::Continue { body } => assert_eq!(&body[..], b"rewritten:hi"),
+            _ => panic!("expected the rewritten body"),
+        }
     }
 }

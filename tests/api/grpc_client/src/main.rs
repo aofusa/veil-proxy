@@ -674,6 +674,97 @@ async fn h3_ping_pong(
     Ok(())
 }
 
+/// QUIC + h3 の接続（証明書は検証しない）。
+async fn h3_connect(
+    addr: std::net::SocketAddr,
+) -> Result<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, String> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipVerify))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let qc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+    let conn = endpoint
+        .connect(addr, "localhost")
+        .unwrap()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+    });
+    Ok(send)
+}
+
+// F-266/F-270: curl に HTTP/3 が無い環境向けの 1 要求（`--h3-fetch host:port METHOD PATH [-H "k: v"]... [--data-file F]`）。
+// 標準出力に「状態行・ヘッダ（小文字）・空行・本文（生のバイト）」を書く。
+async fn h3_fetch(args: &[String]) -> Result<(), String> {
+    let addr: std::net::SocketAddr = args[0].parse().map_err(|e| format!("{:?}", e))?;
+    let (method, path) = (&args[1], &args[2]);
+    let mut request = http::Request::builder()
+        .method(method.as_str())
+        .uri(format!("https://{}{}", addr, path));
+    let mut file = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-H" => {
+                let (k, v) = args[i + 1].split_once(':').ok_or("-H needs k: v")?;
+                request = request.header(k.trim(), v.trim());
+            }
+            "--data-file" => file = Some(args[i + 1].clone()),
+            other => return Err(format!("unknown option {}", other)),
+        }
+        i += 2;
+    }
+    let mut send = h3_connect(addr).await?;
+    let mut stream = send
+        .send_request(request.body(()).unwrap())
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(f) = file {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(f).await.map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = f.read(&mut buf).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            stream
+                .send_data(Bytes::copy_from_slice(&buf[..n]))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    stream.finish().await.map_err(|e| e.to_string())?;
+    let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
+    let mut out = format!("HTTP/3 {}\r\n", resp.status().as_u16()).into_bytes();
+    for (k, v) in resp.headers() {
+        out.extend_from_slice(k.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    while let Some(mut chunk) = stream.recv_data().await.map_err(|e| e.to_string())? {
+        while chunk.has_remaining() {
+            let c = chunk.chunk();
+            out.extend_from_slice(c);
+            let n = c.len();
+            chunk.advance(n);
+        }
+    }
+    use std::io::Write;
+    std::io::stdout().write_all(&out).map_err(|e| e.to_string())
+}
+
 async fn h3_checks(addr: std::net::SocketAddr) {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
@@ -863,6 +954,13 @@ async fn h3_checks(addr: std::net::SocketAddr) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--h3-fetch") {
+        if let Err(e) = h3_fetch(&args[i + 1..]).await {
+            eprintln!("h3 fetch: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
     let arg = |k: &str| {
         args.iter()
             .position(|a| a == k)

@@ -1643,7 +1643,13 @@ pub(super) async fn test_e2e_admin_config() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 pub(super) async fn test_e2e_admin_reload() {
+    // リロードは proxy.toml を読み直すので、他のテストが書き換えている最中に走らせない
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
@@ -1674,7 +1680,13 @@ pub(super) async fn test_e2e_admin_reload() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 pub(super) async fn test_e2e_admin_tls_reload() {
+    // リロードは proxy.toml を読み直すので、他のテストが書き換えている最中に走らせない
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
@@ -2109,6 +2121,19 @@ pub(super) async fn test_tls_cipher_suites_rejects_excluded_suite() {
 /// リロード系テストの直列化ロック（proxy.toml / 証明書ファイルを共有するため）
 pub(super) static RELOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// プロキシが読む設定・証明書を書き換える（一時ファイルへ書いてから rename する）。`fs::write` は切り詰めてから
+/// 書くので、その間にリロードが走ると途中までの設定（後ろのルートが欠けた有効な TOML）を読み込んでしまう
+// 理由: 試験
+#[allow(clippy::disallowed_methods)]
+pub(super) fn write_atomic(
+    path: &std::path::Path,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("e2e-tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
 pub(super) fn fixtures_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
@@ -2224,7 +2249,7 @@ index = "index.html"
 "#,
         dir = serve_dir.display()
     );
-    std::fs::write(&proxy_toml, format!("{original}{added}")).expect("write proxy.toml");
+    write_atomic(&proxy_toml, format!("{original}{added}")).expect("write proxy.toml");
     assert!(send_sighup(pid), "SIGHUP must be delivered");
 
     // リロードスレッドは 500ms 周期。反映をポーリングで確認（最大 10 秒）
@@ -2240,7 +2265,7 @@ index = "index.html"
     }
 
     // 原状復帰（追加ルート・作成ファイルを削除して再リロード）
-    std::fs::write(&proxy_toml, &original).expect("restore proxy.toml");
+    write_atomic(&proxy_toml, &original).expect("restore proxy.toml");
     let _ = std::fs::remove_dir_all(&route_file_dir);
     send_sighup(pid);
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -2289,7 +2314,7 @@ pub(super) async fn test_config_reload_invalid_config_keeps_serving() {
     let original = std::fs::read_to_string(&proxy_toml).expect("read proxy.toml");
 
     // 壊れた TOML を書いて SIGHUP
-    std::fs::write(&proxy_toml, "this is [not valid toml =").expect("write broken toml");
+    write_atomic(&proxy_toml, "this is [not valid toml =").expect("write broken toml");
     assert!(send_sighup(pid), "SIGHUP must be delivered");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -2297,7 +2322,7 @@ pub(super) async fn test_config_reload_invalid_config_keeps_serving() {
     let resp = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
 
     // 原状復帰
-    std::fs::write(&proxy_toml, &original).expect("restore proxy.toml");
+    write_atomic(&proxy_toml, &original).expect("restore proxy.toml");
     send_sighup(pid);
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -2345,8 +2370,8 @@ pub(super) async fn test_tls_cert_reload_via_sighup() {
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("generate cert");
-    std::fs::write(&cert_path, cert.cert.pem()).expect("write new cert");
-    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write new key");
+    write_atomic(&cert_path, cert.cert.pem()).expect("write new cert");
+    write_atomic(&key_path, cert.signing_key.serialize_pem()).expect("write new key");
     assert!(send_sighup(pid), "SIGHUP must be delivered");
 
     // リロード反映をポーリング（最大 10 秒）。その間もリクエストが成功し続けること。
@@ -2373,8 +2398,8 @@ pub(super) async fn test_tls_cert_reload_via_sighup() {
     }
 
     // 原状復帰（元の証明書へ戻して再リロード）
-    std::fs::write(&cert_path, &original_cert).expect("restore cert");
-    std::fs::write(&key_path, &original_key).expect("restore key");
+    write_atomic(&cert_path, &original_cert).expect("restore cert");
+    write_atomic(&key_path, &original_key).expect("restore key");
     send_sighup(pid);
     tokio::time::sleep(Duration::from_millis(1500)).await;
 

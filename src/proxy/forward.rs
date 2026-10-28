@@ -28,7 +28,7 @@ pub(super) async fn handle_proxy(
     headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // クライアントの Accept-Encoding を解析
@@ -132,11 +132,13 @@ pub(super) async fn handle_proxy(
                                         std::str::from_utf8(client_etag).unwrap_or("");
                                     if etag_matches(client_etag_str, cached_etag) {
                                         debug!("ETag match, returning 304 Not Modified");
-                                        let response = build_304_response(
+                                        let mut response = build_304_response(
                                             &cached_entry,
                                             client_wants_close,
                                             is_stale,
                                         );
+                                        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+                                        crate::route_cors::apply_h1(&mut response, security);
                                         match timeout(
                                             WRITE_TIMEOUT,
                                             client_stream.write_all(response),
@@ -170,11 +172,13 @@ pub(super) async fn handle_proxy(
                                         debug!(
                                             "If-Modified-Since match, returning 304 Not Modified"
                                         );
-                                        let response = build_304_response(
+                                        let mut response = build_304_response(
                                             &cached_entry,
                                             client_wants_close,
                                             is_stale,
                                         );
+                                        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+                                        crate::route_cors::apply_h1(&mut response, security);
                                         match timeout(
                                             WRITE_TIMEOUT,
                                             client_stream.write_all(response),
@@ -219,11 +223,13 @@ pub(super) async fn handle_proxy(
                             // ヘッダーのみ構築し、ボディは連結せずゼロコピーのまま
                             // F-59: ヘッダ + ボディを 1 回の SENDMSG（scatter-gather）で送出
                             // （平文接続。kTLS/rustls は内部で 2 回書き込みへフォールバック）
-                            let headers = build_cached_response_headers(
+                            let mut headers = build_cached_response_headers(
                                 &cached_entry,
                                 client_wants_close,
                                 is_stale,
                             );
+                            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+                            crate::route_cors::apply_h1(&mut headers, security);
                             match timeout(
                                 WRITE_TIMEOUT,
                                 client_stream.write_all_vectored(headers, body),
@@ -252,6 +258,7 @@ pub(super) async fn handle_proxy(
                                 disk_path,
                                 client_wants_close,
                                 is_stale,
+                                security,
                             )
                             .await
                             {
@@ -341,7 +348,10 @@ pub(super) async fn handle_proxy(
         Some(s) => s,
         None => {
             // 利用可能なサーバーがない
-            error!("No healthy upstream servers available");
+            crate::metrics::record_upstream_connect_error(
+                crate::metrics::UpstreamConnectError::NoHealthy,
+            );
+            crate::logging::log_throttled!(error, "No healthy upstream servers available");
             let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((client_stream, 502, 0, true));
@@ -400,6 +410,9 @@ pub(super) async fn handle_proxy(
 
     request.extend_from_slice(HEADER_CRLF);
 
+    // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）
+    let fwd = ForwardedValues::new(security, client_ip);
+
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
         if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
@@ -436,6 +449,9 @@ pub(super) async fn handle_proxy(
             .iter()
             .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
         {
+            continue;
+        }
+        if fwd.as_ref().is_some_and(|f| !f.keeps(name)) {
             continue;
         }
 
@@ -494,6 +510,14 @@ pub(super) async fn handle_proxy(
             request.extend_from_slice(HEADER_CRLF);
         }
         crate::pool::header_value_scratch_put(scratch);
+    }
+    if let Some(f) = &fwd {
+        for (name, value) in f.pairs() {
+            request.extend_from_slice(name);
+            request.extend_from_slice(HEADER_COLON);
+            request.extend_from_slice(value);
+            request.extend_from_slice(HEADER_CRLF);
+        }
     }
 
     // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
@@ -729,11 +753,13 @@ pub(super) async fn handle_proxy(
                             if let Some(body_data) = stale_entry.memory_body() {
                                 let body = body_data.clone(); // O(1) refcount、memcpy なし
                                 let body_len = body.len();
-                                let headers = build_cached_response_headers(
+                                let mut headers = build_cached_response_headers(
                                     &stale_entry,
                                     client_wants_close,
                                     true,
                                 );
+                                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+                                crate::route_cors::apply_h1(&mut headers, security);
                                 match timeout(
                                     WRITE_TIMEOUT,
                                     client_stream.write_all_vectored(headers, body),
@@ -759,6 +785,7 @@ pub(super) async fn handle_proxy(
                                     disk_path,
                                     client_wants_close,
                                     true,
+                                    security,
                                 )
                                 .await
                                 {
@@ -796,7 +823,7 @@ pub(super) async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     cache_ctx: Option<&mut CacheSaveContext>,
-    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -840,13 +867,24 @@ pub(super) async fn proxy_http_pooled(
                         stream
                     }
                     Ok(Err(e)) => {
-                        error!("Proxy connect error to {}: {}", addr, e);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Error,
+                        );
+                        crate::logging::log_throttled!(
+                            error,
+                            "Proxy connect error to {}: {}",
+                            addr,
+                            e
+                        );
                         let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                         return Some((client_stream, 502, 0, true));
                     }
                     Err(_) => {
-                        error!("Proxy connect timeout to {}", addr);
+                        crate::metrics::record_upstream_connect_error(
+                            crate::metrics::UpstreamConnectError::Timeout,
+                        );
+                        crate::logging::log_throttled!(error, "Proxy connect timeout to {}", addr);
                         let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                         return Some((client_stream, 504, 0, true));
@@ -898,6 +936,8 @@ pub(super) async fn proxy_http_pooled(
                 && !cache_save_needed
                 && !buffering_enabled
                 && !wasm_modules_active
+                // CORS のあるルートは応答のヘッダを足すのでユーザー空間の経路（F-273）
+                && security.cors_actual.is_none()
             {
                 let splice_result = try_splice_proxy(
                     &client_stream,
@@ -1089,7 +1129,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     request_body: &[u8],
     client_wants_close: bool,
     tls_profile: crate::upstream_tls::TlsProfile,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &AddedHeaders,
 ) -> H1ViaH2 {
     use crate::http2::upstream_mux::{HttpsOpen, UpResp};
     let addr = target.conn_addr();
@@ -1105,9 +1145,9 @@ pub(super) async fn proxy_h1_via_https_h2(
         target.host.as_bytes(),
         headers
             .iter()
-            .filter(|(k, _)| forward_allowed(security, k))
+            .filter(|(k, _)| forward_allowed(security, k) && added.keeps(k))
             .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
+            .chain(added.iter()),
         request_body.is_empty(),
     )
     .await;
@@ -1149,7 +1189,14 @@ pub(super) async fn proxy_h1_via_https_h2(
     };
     // 最終応答の head を待つ。
     let (status, mut resp_headers) = match timeout(READ_TIMEOUT, stream.resp_rx.recv()).await {
-        Ok(Some(UpResp::Head { status, headers })) => (status, headers),
+        Ok(Some(UpResp::Head {
+            status,
+            mut headers,
+        })) => {
+            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+            crate::route_cors::apply_bytes(&mut headers, security);
+            (status, headers)
+        }
         Err(_) => {
             let _ = timeout(
                 WRITE_TIMEOUT,
@@ -1354,7 +1401,7 @@ pub(super) async fn proxy_h2c(
     headers: &[(Bytes, Bytes)],
     request_body: &[u8],
     client_wants_close: bool,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &AddedHeaders,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // F-174: 多重化した上流 HTTP/2 接続（ワーカーごとのプール）を使う
     // （従来は要求ごとに TCP 接続 + HTTP/2 ハンドシェイクしていた）。
@@ -1372,9 +1419,9 @@ pub(super) async fn proxy_h2c(
         target.host.as_bytes(),
         headers
             .iter()
-            .filter(|(k, _)| forward_allowed(security, k))
+            .filter(|(k, _)| forward_allowed(security, k) && added.keeps(k))
             .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .chain(added.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))),
+            .chain(added.iter()),
         body,
         crate::http_utils::is_idempotent_method(method),
     )
@@ -1382,7 +1429,12 @@ pub(super) async fn proxy_h2c(
     {
         Ok(resp) => resp,
         Err(status) => {
-            error!("H2C request error to {}: {}", addr.as_str(), status);
+            crate::logging::log_throttled!(
+                error,
+                "H2C request error to {}: {}",
+                addr.as_str(),
+                status
+            );
             let err_buf = if status == 504 {
                 ERR_MSG_GATEWAY_TIMEOUT.to_vec()
             } else {
@@ -1441,6 +1493,8 @@ pub(super) async fn proxy_h2c(
     }
 
     http11_response.extend_from_slice(b"\r\n");
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_h1(&mut http11_response, security);
 
     // ボディ
     http11_response.extend_from_slice(&response.body);
@@ -1465,6 +1519,7 @@ pub(super) async fn serve_from_disk_cache(
     disk_path: &std::path::Path,
     client_wants_close: bool,
     is_stale: bool,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)> {
     // ディスクからボディを読み込み。whole-file 読み込みはイベントループをブロックするため、
     // ブロッキングオフロードで専用ワーカースレッドへ退避する（F-29 完全非同期化）。
@@ -1481,7 +1536,10 @@ pub(super) async fn serve_from_disk_cache(
         };
 
     // レスポンスを構築
-    let response = build_cached_response(cached_entry, &body_data, client_wants_close, is_stale);
+    let mut response =
+        build_cached_response(cached_entry, &body_data, client_wants_close, is_stale);
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。本文の前の空行へ足す）
+    crate::route_cors::apply_h1(&mut response, security);
 
     match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
         Ok((Ok(_), _)) => Some((cached_entry.status_code, body_data.len() as u64)),

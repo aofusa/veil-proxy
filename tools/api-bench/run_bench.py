@@ -11,7 +11,8 @@
     python3 tools/api-bench/run_bench.py --group rust --proto h3 --only "native" --out ...           # HTTP/3（h2load-h3）
 
 前提: tools/api-bench/README.md のビルド手順（axum-tokio・axum-veil の release ビルド、Python の venv）と
-docker イメージ local/wrk-openssl（wrk）。
+docker イメージ local/wrk-openssl（wrk）。待ち受けは BENCH_PORT（既定 3000）。始める前にそのポートが空いているかを確かめる
+（他のサーバが使っていると、そちらを測ってしまう）。
 """
 
 import argparse
@@ -28,7 +29,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 VENV = os.environ.get("BENCH_VENV", os.path.join(ROOT, "target", "py-bench-venv"))
-ADDR = "127.0.0.1:3000"
+PORT = int(os.environ.get("BENCH_PORT", "3000"))
+ADDR = f"127.0.0.1:{PORT}"
 SERVER_CPUS = os.environ.get("BENCH_SERVER_CPUS", "0,1")
 CLIENT_CPUS = os.environ.get("BENCH_CLIENT_CPUS", "2,3")
 THREADS = int(os.environ.get("BENCH_THREADS", "2"))
@@ -50,7 +52,7 @@ AVH3E = os.path.join(HERE, "axum-veil", "target-h3-epoll", "release", "api-bench
 PY = os.path.join(VENV, "bin", "python")
 UV = os.path.join(VENV, "bin", "uvicorn")
 PYDIR = os.path.join(HERE, "python")
-UVARGS = ["--host", "127.0.0.1", "--port", "3000", "--log-level", "warning", "--no-access-log"]
+UVARGS = ["--host", "127.0.0.1", "--port", str(PORT), "--log-level", "warning", "--no-access-log"]
 
 # 名前 → (コマンド, 追加の環境変数, 作業ディレクトリ)
 TARGETS = {
@@ -140,11 +142,22 @@ def cores_busy(cpus):
     return t
 
 
-def wait_port(timeout=20):
+def port_in_use():
+    try:
+        socket.create_connection(("127.0.0.1", PORT), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def wait_port(proc, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
+        # 起動に失敗して終わったサーバを、別のプロセスが同じポートで応えているのと取り違えない
+        if proc.poll() is not None:
+            return False
         try:
-            socket.create_connection(("127.0.0.1", 3000), timeout=0.5).close()
+            socket.create_connection(("127.0.0.1", PORT), timeout=0.5).close()
             return True
         except OSError:
             time.sleep(0.2)
@@ -215,10 +228,14 @@ def run_one(name, spec, endpoint, duration, conns, warmup, proto="h1"):
     e.setdefault("VEIL_OVERRIDE_90", "access_log.enabled=false")
     if proto == "h3":
         e.update(BENCH_TLS_CERT=TLS[0], BENCH_TLS_KEY=TLS[1])
+    e.setdefault("BENCH_LISTEN", ADDR)
+    # 前の対象の残り・無関係のサーバがポートを使っていると、そちらを測ってしまう
+    if port_in_use():
+        sys.exit(f"port {PORT} is already in use before starting {name!r}; stop that server or set BENCH_PORT")
     p = subprocess.Popen(["taskset", "-c", SERVER_CPUS] + cmd, env=e, cwd=cwd,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
-        if not wait_port():
+        if not wait_port(p):
             return {"rps": "NA", "p50_ms": "NA", "p99_ms": "NA", "errors": "start failed", "cpu_pct": "NA",
                     "cores_pct": "NA", "us_per_req": "NA", "rss_mb": "NA"}
         time.sleep(1.0)  # uvicorn の複数ワーカーが揃うまで

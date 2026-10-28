@@ -3,7 +3,7 @@
 //! Holds the state for a single HTTP request/response processing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -82,6 +82,21 @@ impl Default for BodyBuffer {
     }
 }
 
+/// 起動時に読んだファイル（名前 → 中身。F-271）
+pub type PluginData = Arc<HashMap<String, Arc<[u8]>>>;
+
+/// 空の `Arc<str>`（コンテキストを作るたびに確保しない。B-175）
+fn empty_str() -> Arc<str> {
+    static EMPTY: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from("")).clone()
+}
+
+/// 空の [`PluginData`]（共有。要求ごとに確保しない）
+pub fn empty_plugin_data() -> PluginData {
+    static EMPTY: std::sync::OnceLock<PluginData> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(HashMap::new())).clone()
+}
+
 /// HTTP context for a single request
 pub struct HttpContext {
     // === Context IDs ===
@@ -122,13 +137,15 @@ pub struct HttpContext {
     /// Client IP address
     pub client_ip: std::sync::Arc<str>,
     /// Plugin name
-    pub plugin_name: String,
+    pub plugin_name: Arc<str>,
     /// Proxy-Wasm の root_id（設定されたモジュールのみ。F-222）
     pub plugin_root_id: Option<Arc<str>>,
     /// Plugin configuration（ルート単位で実効値が解決されている場合はその値。F-148）
     pub plugin_configuration: Arc<[u8]>,
     /// VM configuration
     pub vm_configuration: Arc<[u8]>,
+    /// 起動時に読んだファイル（`[[wasm.modules]] data_files`。プロパティ `plugin_data.<名前>`。F-271）
+    pub plugin_data: PluginData,
 
     // === Modification Flags ===
     /// Request headers modified
@@ -175,10 +192,8 @@ pub struct HttpContext {
     pub next_metric_id: i32,
 
     // === Shared Data ===
-    /// Shared data (key -> (value, cas))
-    pub shared_data: Arc<RwLock<HashMap<String, (Vec<u8>, u32)>>>,
-    /// Next CAS value
-    pub shared_data_cas: u32,
+    /// Shared data（モジュールの表の共有。B-179: 以前は context ごとに作り、要求をまたいで共有されなかった）
+    pub shared_data: Arc<super::shared_data::SharedData>,
 
     // === Custom Properties ===
     /// User-defined properties (set via proxy_set_property)
@@ -186,7 +201,7 @@ pub struct HttpContext {
 
     // === Capabilities ===
     /// Module capabilities
-    pub capabilities: ModuleCapabilities,
+    pub capabilities: Arc<ModuleCapabilities>,
 
     // === Timer ===
     /// Tick period in milliseconds (0 = disabled)
@@ -264,15 +279,36 @@ pub enum GrpcStreamState {
 
 impl HttpContext {
     /// Create a new HTTP context
-    pub fn new(context_id: i32, capabilities: ModuleCapabilities) -> Self {
+    ///
+    /// モジュールに属さない context（試験等）。shared data は自分だけの表を作る。要求ごとの context は
+    /// `for_module`（B-175: 要求ごとに作るので確保しない。権限・shared data の表は `Arc` で共有、空の文字列も共有）。
+    pub fn new(context_id: i32, capabilities: impl Into<Arc<ModuleCapabilities>>) -> Self {
+        Self::with_shared_data(context_id, capabilities, Arc::default())
+    }
+
+    /// モジュールの要求の context（権限と shared data の表はモジュールのものを共有する。B-179）
+    pub(crate) fn for_module(context_id: i32, module: &super::registry::LoadedModule) -> Self {
+        Self::with_shared_data(
+            context_id,
+            module.capabilities.clone(),
+            module.shared_data.clone(),
+        )
+    }
+
+    fn with_shared_data(
+        context_id: i32,
+        capabilities: impl Into<Arc<ModuleCapabilities>>,
+        shared_data: Arc<super::shared_data::SharedData>,
+    ) -> Self {
+        let capabilities = capabilities.into();
         Self {
             context_id,
             root_context_id: 0,
             request_headers: Vec::new(),
             request_body: BodyBuffer::empty(),
             request_trailers: Vec::new(),
-            request_path: std::sync::Arc::from(""),
-            request_method: std::sync::Arc::from(""),
+            request_path: empty_str(),
+            request_method: empty_str(),
             request_query: String::new(),
             request_body_complete: false,
             response_status: 0,
@@ -280,11 +316,12 @@ impl HttpContext {
             response_body: BodyBuffer::empty(),
             response_trailers: Vec::new(),
             response_body_complete: false,
-            client_ip: std::sync::Arc::from(""),
-            plugin_name: String::new(),
+            client_ip: empty_str(),
+            plugin_name: empty_str(),
             plugin_root_id: None,
             plugin_configuration: crate::wasm_plugin_config::empty_configuration(),
             vm_configuration: crate::wasm_plugin_config::empty_configuration(),
+            plugin_data: empty_plugin_data(),
             request_headers_modified: false,
             request_body_modified: false,
             response_headers_modified: false,
@@ -301,8 +338,7 @@ impl HttpContext {
             current_http_call_token: None,
             metrics: HashMap::new(),
             next_metric_id: 1,
-            shared_data: Arc::new(RwLock::new(HashMap::new())),
-            shared_data_cas: 1,
+            shared_data,
             custom_properties: HashMap::new(),
             capabilities,
             tick_period_ms: 0,

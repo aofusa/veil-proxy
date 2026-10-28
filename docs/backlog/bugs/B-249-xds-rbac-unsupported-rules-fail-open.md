@@ -1,6 +1,6 @@
 # B-249: xDS RBAC の変換で、未対応の permission が DENY でも「一致しない」になり、`Principal::url_path` が「全員」になる（fail-open）
 
-**状態: 未修正（2026-10-27 起票）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -26,6 +26,14 @@
   `Principal::UrlPath` は `Permission::UrlPath` と同じ `Path` マッチに変換する。
 - 変換時に `warn!` で「未対応の規則を安全側に倒した」ことをポリシー名付きで出す（起動時・更新時のみ）。
 - 単体テスト: `Permission::Metadata` を含む DENY が拒否になる、`Principal::UrlPath` を含む ALLOW が全員を通さない。
+
+## 修正（v0.10.0）
+
+- `src/mesh/xds/rbac.rs` の変換に文脈 `Cx` を通し、評価できない葉（permission の `metadata`・`matcher`・空、principal の空、空の `PathMatcher`）をポリシーの種類で安全側に倒す: ALLOW・LOG は一致させず、DENY は一致させる。`not_rule`・`not_id` の下では反転する（CEL の条件の扱いと同じ約束）。
+- principal の `url_path` は `RbacPrincipal::Path`（`src/mesh/model.rs`）にし、permission の `Path` と同じ照合（クエリを除くパス）にする。
+- 置き換えた葉があれば、受信時にポリシー名と件数を `warn!` で出す（要求ごとではない）。
+- 試験: 単体 `unsupported_permission_in_deny_policy_denies`（DENY の metadata・matcher が拒否になり、ALLOW では誰も通さない）、`unsupported_permission_under_not_rule_flips`、`principal_url_path_matches_path_only`。
+- 文書: `docs/guide/mesh.md`（英日）、リリースノート。
 
 ## 関連
 

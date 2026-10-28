@@ -33,6 +33,10 @@ url = "http://localhost:8080"
   enabled = true
 ```
 
+The same table applies to `type = "Handler"` routes of the API library (HTTP/1.1, HTTP/2 and HTTP/3, buffered and
+streaming responses); `[api] compression = true` gives handler routes a default for JSON APIs. See
+[library.md](library.md#response-compression).
+
 ### Configuration Options
 
 | Option | Description | Default |
@@ -248,6 +252,67 @@ Cache keys are generated from:
 > [!CAUTION]
 > **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour old) when the backend returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.
 
+## Static File Caches Follow Disk Changes
+
+The static file caches (`open_file_cache` for file metadata and open fds, `static_file_cache` for file bodies,
+and the compressed-variant cache) normally keep an entry until `valid_duration_secs` (60 seconds by default)
+runs out, so a file replaced on disk is served stale until then. With `watch = true`, veil watches the
+File route's `path` and rebuilds the cached entries on the next request after a change: replacing a file with
+`mv` (even with the same size), overwriting it in place (`cp`), creating, deleting and moving files and
+directories, and swapping the whole directory (`mv` or a symlink switch of the route's `path`).
+
+```toml
+[performance]
+open_file_cache_enabled = true
+open_file_cache_watch = true    # default for routes without [route.open_file_cache] watch
+
+[static_file_cache]
+enabled = true
+watch = true                    # default for routes without [route.static_file_cache] watch
+
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "/var/www/assets/"
+[route.open_file_cache]
+watch = true
+[route.static_file_cache]
+watch = true                    # keep both caches on the same setting
+```
+
+- **Cost on a cache hit**: one atomic load (a per-route generation number). Unlike `revalidate_mtime = true`,
+  no `stat` is issued, so HTTP/2 and HTTP/3 static serving stays free of offloaded syscalls.
+- **How it works**: a dedicated thread receives change notifications and bumps the route's generation.
+  Entries remember the generation read before the file was opened, so a replacement during a read never
+  leaves the old content cached under the new generation.
+  - Linux: inotify on every directory under `path`, plus the parent directory to catch a swap of `path`
+    itself. A notification queue overflow rebuilds every watched route.
+  - FreeBSD, OpenBSD, NetBSD and macOS: kqueue `EVFILT_VNODE` on every directory and regular file under
+    `path` (the watcher holds one fd for each; the file fds catch in-place overwrites), plus the parent
+    directory. The tree is opened when the configuration is loaded, before the sandbox is entered, and later
+    changes are followed with `openat`/`fstatat` relative to the directory fds already held, so it keeps
+    working under Capsicum capability mode, `unveil` and Seatbelt.
+  - Windows: `ReadDirectoryChangesW` on `path` with its subtree, plus the parent directory, on a dedicated
+    thread per route.
+- **Fallback**: `valid_duration_secs` still applies. If watching cannot be set up, veil logs a warning and the
+  route follows disk changes after `valid_duration_secs` as before. Limits that trigger this: the inotify
+  watch limit `fs.inotify.max_user_watches` (and `fs.inotify.max_user_instances`) on Linux, and on kqueue
+  platforms a budget for the watcher's fds: a quarter of the soft `RLIMIT_NOFILE`, and no more than what is left
+  after reserving two fds per `[security] max_concurrent_connections` plus 1024 for connections (so watching a
+  large tree does not make `accept` fail with `EMFILE` below the connection limit). veil logs the budget at
+  startup. When the limit is hit
+  while following a new directory or file later on, veil warns once per route and that part of the tree is
+  followed after `valid_duration_secs`.
+- **Platforms**: Linux (io_uring and epoll builds), FreeBSD, OpenBSD, NetBSD, macOS and Windows.
+- **Sandbox**: the seccomp allow-list includes `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` and
+  `getdents64` (see [Security](security.md)). The watcher thread is started after seccomp and Landlock are
+  applied, so it runs under the same restrictions as the workers. With Landlock, list the static root in `landlock_read_paths` as
+  usual (the watcher reads the directory tree).
+- Routes added by a reload are watched from that reload on. A route removed by a reload stays watched until the
+  process restarts (bounded by the number of distinct roots ever configured).
+
 ## Buffering Control
 
 Controls response buffering to prevent slow clients from blocking backend connections.
@@ -299,6 +364,11 @@ url = "http://localhost:8080"
 | `max_disk_buffer` | Maximum disk buffer size (bytes) | 100MB |
 | `client_write_timeout_secs` | Client write timeout | 60 |
 | `buffer_headers` | Buffer headers along with body | true |
+
+A response is sent only after its whole body has arrived. If the upstream stops before the end of the body, the
+client gets 502. If the body is larger than `max_disk_buffer` (or `max_memory_buffer` when `disk_buffer_path` is not
+set), the client gets 507 Insufficient Storage (or, with `buffer_headers = false`, the connection is closed after
+the headers).
 
 ### Configuration Example
 

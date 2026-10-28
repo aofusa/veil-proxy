@@ -1,0 +1,25 @@
+// veil-proxy-kit のサンプル（F-267）の gRPC サービス。サーバと生成したクライアント（veil-build の build_client）の両方で使う。
+syntax = "proto3";
+package kit.v1;
+
+service Greeter {
+  // 単項
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  // サーバストリーミング: 1..=count
+  rpc Count(CountRequest) returns (stream CountReply);
+  // クライアントストリーミング: 合計
+  rpc Sum(stream Number) returns (SumReply);
+  // 双方向: 大文字にして返す
+  rpc Chat(stream Line) returns (stream Line);
+  // 指定のステータスで失敗する
+  rpc Fail(FailRequest) returns (HelloReply);
+}
+
+message HelloRequest { string name = 1; }
+message HelloReply { string message = 1; }
+message CountRequest { uint32 count = 1; }
+message CountReply { uint32 n = 1; }
+message Number { int64 value = 1; }
+message SumReply { int64 total = 1; }
+message Line { string text = 1; }
+message FailRequest { int32 code = 1; string message = 2; }

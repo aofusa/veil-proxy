@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.85"
 # veil: 公開名と版（F-238。`[lib] name = "quiche"` はそのまま）
 name = "veil-proxy-quiche"
-version = "0.24.9-veil.2"
+version = "0.24.9-veil.4"
 authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
 build = "src/build.rs"
 include = [
@@ -122,7 +122,7 @@ version = "0.4.20"
 features = ["std"]
 
 [dependencies.octets]
-version = "0.3.4"
+version = "0.3.6"
 features = ["huffman_hpack"]
 
 [dependencies.qlog]

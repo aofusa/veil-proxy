@@ -1,6 +1,6 @@
 # B-219: seccomp と Landlock がワーカースレッドにしか掛かっておらず、制御プレーンのスレッドがサンドボックスの外で動いている
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー SB-01）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -39,6 +39,18 @@ seccomp・Landlock は多層防御の 1 層で、これ自体で侵害が成立�
   Landlock は `/proc/<pid>/task/*/status` に出ないので、制御プレーンのスレッドから許可外のパスを開いて EACCES になることを確かめる
   （例: TLS リローダの経路で許可外のファイルを読ませる）。
 - 既存の E2E・`tests/e2e_setup.sh` の seccomp 有効の試験が通ること（F-279 で追加する）。
+
+## 修正（v0.10.0）
+
+- seccomp: `prctl(PR_SET_SECCOMP)` を `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)` に替え、先に作った制御プレーンの
+  スレッドを含む全スレッドに同じフィルタを掛ける（no_new_privs も同期される）。同期できないスレッドがあると正の TID が返るので起動を止める。
+  全スレッドに掛かるので、ACME の証明書の保存（`mkdir`・一時ファイルの `rename`・`chmod`）の syscall も許可リストに足した（B-220 と同じ変更）。
+- Landlock: TSYNC に当たるものが無いので、ruleset の fd を閉じずに残し、先に作ったスレッドのうちファイルを使わないもの
+  （ヘルスチェック・Proxy-Wasm の tick・Proxy-Wasm の gRPC）がループの先頭で `security::landlock_restrict_current_thread` で自分に掛ける
+  （`landlock_restrict_self` を許可リストに足した。制限を足すだけの syscall）。設定・証明書のリロード・VDS・ACME のスレッドは設定・証明書・
+  モジュールを読み書きするので Landlock の外（seccomp だけ）。`docs/guide/security.md`（英・日）・`examples/config.toml` に書いた。
+- E2E: `VEIL_E2E_SECCOMP=strict|filter|log ./tests/e2e_setup.sh test` で veil 自身の seccomp を掛けて全 E2E を回す。
+  `security_audit::test_b219_seccomp_on_every_thread` が `/proc/<pid>/task/*/status` の `Seccomp:` が全スレッドで 2 であることを確かめる。
 
 ## 関連
 

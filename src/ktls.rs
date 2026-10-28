@@ -155,6 +155,14 @@ impl CryptoInfo {
     }
 }
 
+// B-229: setsockopt が失敗して `?` で戻る経路では secure_clear が呼ばれず、鍵がスタック・ヒープに残っていた。
+// どの経路で落としてもゼロ化する（成功の経路の secure_clear と二重になっても無害）。
+impl Drop for CryptoInfo {
+    fn drop(&mut self) {
+        self.secure_clear();
+    }
+}
+
 // ====================
 // エラー型
 // ====================
@@ -486,6 +494,14 @@ pub struct TlsKeyMaterial {
     pub version: u16,
 }
 
+// B-229: CryptoInfo と同じく、失敗の経路でも落とすときにゼロ化する
+#[cfg(target_os = "freebsd")]
+impl Drop for TlsKeyMaterial {
+    fn drop(&mut self) {
+        self.secure_clear();
+    }
+}
+
 #[cfg(target_os = "freebsd")]
 impl TlsKeyMaterial {
     /// 鍵データをセキュアにゼロ化
@@ -643,6 +659,110 @@ pub fn setup_tls_info(fd: RawFd, direction: libc::c_int, info: &CryptoInfo) -> i
 // ====================
 // テスト
 // ====================
+
+/// kTLS の受信で読み取りが `EIO` を返したとき、待っている制御レコードを取り出して処理した結果（B-259）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControlRecord {
+    /// 読み捨てた（TLS 1.3 の NewSessionTicket）。読み取りをやり直す
+    Skipped,
+    /// 相手の close_notify（EOF として扱う）
+    CloseNotify,
+}
+
+/// kTLS の受信で `read(2)` が `EIO` を返したときに呼ぶ。カーネルは平文以外のレコード（アラート・ハンドシェイク）を
+/// 制御メッセージ無しの読み取りに渡さずに `EIO` を返し、レコードは受信キューに残す。それを `recvmsg(2)` と
+/// `TLS_GET_RECORD_TYPE` の制御メッセージで取り出す。TLS 1.3 のサーバはハンドシェイクの後に NewSessionTicket を送るので、
+/// 取り出さないと上流への kTLS の接続は最初の応答を読めない（B-259）。平文のレコードが待っているときの `EIO` は
+/// 本当の誤り（復号の失敗等）なので、そのまま返す。
+///
+/// 失敗の経路だけで呼ぶ（平文の読み取りに syscall を足さない）。
+#[cfg(target_os = "linux")]
+pub fn consume_control_record(fd: RawFd, read_err: io::Error) -> io::Result<ControlRecord> {
+    const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+    const CONTENT_ALERT: u8 = 21;
+    const CONTENT_HANDSHAKE: u8 = 22;
+    const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
+    const HANDSHAKE_KEY_UPDATE: u8 = 24;
+
+    let mut data = [0u8; 16384 + 256];
+    // CMSG_SPACE(1) は 8 バイト境界に揃えた値。u64 の配列で整列を保証する
+    let mut cmsg_buf = [0u64; 8];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    // SAFETY: msghdr はゼロ初期化が正しい初期値。ポインタは関数の間だけ生きる局所変数を指す
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
+
+    // 制御レコードを 1 つ覗く（平文のレコードなら消費しない）
+    // SAFETY: msg は上で組んだ有効な msghdr
+    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(read_err);
+    }
+    let mut record_type = None;
+    // SAFETY: msg は recvmsg が埋めた msghdr。CMSG_* はその制御バッファの範囲だけを辿る
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == SOL_TLS && (*c).cmsg_type == TLS_GET_RECORD_TYPE {
+                record_type = Some(*libc::CMSG_DATA(c));
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    let n = n as usize;
+    let consume = |fd: RawFd| -> io::Result<()> {
+        let mut iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: n,
+        };
+        let mut cmsg_buf = [0u64; 8];
+        // SAFETY: 同上。覗いたレコードと同じものを読み捨てる（制御メッセージを渡すので EIO にならない）
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
+        if unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    match record_type {
+        Some(CONTENT_HANDSHAKE) if n > 0 && data[0] == HANDSHAKE_NEW_SESSION_TICKET => {
+            // 上流のセッションは再開しないので読み捨てる。1 レコードに複数のチケットが入っていても同じ
+            consume(fd)?;
+            Ok(ControlRecord::Skipped)
+        }
+        Some(CONTENT_ALERT) if n >= 2 && data[1] == 0 => {
+            consume(fd)?;
+            Ok(ControlRecord::CloseNotify)
+        }
+        Some(CONTENT_ALERT) if n >= 2 => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("TLS alert received from peer (description {})", data[1]),
+        )),
+        // F-282: KeyUpdate（鍵の更新はカーネルへ渡せない）は明示の誤りで接続を閉じる（平文が混じることは無い）
+        Some(CONTENT_HANDSHAKE) if n > 0 && data[0] == HANDSHAKE_KEY_UPDATE => {
+            crate::logging::log_throttled!(
+                warn,
+                "kTLS: peer sent a TLS 1.3 KeyUpdate, which kTLS cannot apply; closing the connection"
+            );
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "TLS KeyUpdate is not supported with kTLS",
+            ))
+        }
+        // その他・平文のレコードでの EIO は元の誤り
+        _ => Err(read_err),
+    }
+}
 
 #[cfg(test)]
 mod tests {

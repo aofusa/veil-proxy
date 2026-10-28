@@ -13,13 +13,17 @@ Veilには、ユニットテスト、統合テスト、エンドツーエンド�
 | **ユニットテスト**（lib） | 1044 | ✅ すべて成功 |
 | **統合テスト**（`integration_tests` + プロパティ + キャンセル安全性） | 55+ | ✅ すべて成功 |
 | **E2Eテスト**（`e2e_tests`） | 565 | ✅ すべて成功 |
-| **Fuzz ターゲット**（`cargo fuzz`） | 8 | ✅ クラッシュなし |
+| **Fuzz ターゲット**（`cargo fuzz`） | 17 | ✅ クラッシュなし |
 | **ベンチマーク** | 13ファイル | ✅ 準備完了 |
 
 Fuzz ターゲットには `io_uring_executor` が含まれる。ランタイムの完了ディスパッチ経路
 （`src/runtime/executor.rs`）へ任意の擬似 CQE 列を注入し、op テーブルが panic せず・スロットを
 リークせず・drop ガードを二重実行しないことを検証する（実リング上で in-flight な
 recv/send/accept/timer Future をランダムに Drop する `runtime_cancellation_test` 統合テストと補完関係）。
+このモデルでは drop ガードが op テーブルを再入し、テーブルを借りたままガードを走らせると失敗する。
+`http2_connection_state` は HTTP/2 のサーバの接続にフレームの列を流し、フレームごとに HPACK の表・同時ストリーム数・
+溜めたヘッダブロックが上限内かを確かめる。`http_response_parse` は上流の応答の解析と chunked の復号（一括と 1 バイトずつ、
+厳格と緩いの本文の終わりが一致する）、`path_norm`・`h3_field_section` はパスの正規化と HTTP/3 の要求のフィールドセクションの検査。
 
 ホットパス規則（「イベントループ上でブロッキング呼び出しをしない」）は
 [`clippy.toml`](../../../clippy.toml) の clippy `disallowed-methods` により AST レベルで強制する。
@@ -237,15 +241,13 @@ veil-proxy/
 
 ### 継続的インテグレーション
 
-CI/CDパイプライン用の例：
+| workflow | いつ | 何を |
+|---|---|---|
+| `ci.yml` | `main` への push・pull request | rustfmt・メッセージの検査・clippy（`full` と `full,epoll`）・文書・feature の組み合わせのビルド・単体と統合の試験・Python の文書と Linux の wheel の `stubtest` |
+| `bindings.yml` | `main` への push・pull request のうち `src/`・`crates/`・`examples/api/`・`tests/api/`・マニフェスト・同梱の Swagger UI に触れるもの | macOS（arm64、`macos-14`）と Windows（x86_64、`windows-2022`）で `tests/api/library_e2e.sh c` と `python`、Linux（`ubuntu-24.04`）で `c`: C のライブラリ（`veil-capi`）と例、Python の wheel と単体・E2E（HTTP/1.1・h2c・ストリーミング・async・L4・gRPC・GraphQL） |
+| `examples-nightly.yml` | 毎晩 | 移行ガイドの nginx・Envoy との等価性、Grafana のダッシュボード |
+| `container-security-nightly.yml` | 毎晩 | ファジング・カオス・h2spec / h3spec・セキュリティの検査 |
+| `release.yml` | タグ | 全プラットフォームの wheel・crates・パッケージ・コンテナイメージ（draft のリリース） |
 
-```yaml
-# GitHub Actionsワークフローの例
-- name: テストを実行
-  run: |
-    cargo test --features http2 --all-targets
-    
-- name: E2Eテストを実行
-  run: |
-    ./tests/e2e_setup.sh test
-```
+E2E（`./tests/e2e_setup.sh test`）は CI ではなく手元で回す。`bindings` の job を手元で再現するには、その OS で同じ
+台本を回す（Windows は Git Bash から `PY3=python`、HTTP/2 の使える curl を `PATH` の先頭、NASM と MSVC を入れておく）。

@@ -15,7 +15,7 @@ pub(super) const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 ///
 /// F-134 フォローアップ: 従来は平文 `TcpStream` 決め打ちで gRPC over TLS（h2, ALPN
 /// `h2`）上流に接続できなかった。`src/wasm/http_executor.rs::execute_https_request` と
-/// 同じ設計（rustls + webpki-roots のシステムルート）を踏襲し、`Read`/`Write` を
+/// 同じ設計（rustls + `[tls_client] ca` の信頼アンカー）を踏襲し、`Read`/`Write` を
 /// 実装した列挙体で呼び出し側のロジック（フレーム送受信ループ）を TLS の有無に
 /// 関わらず共通化する。
 ///
@@ -63,17 +63,14 @@ impl Write for ClientStream {
 
 /// TLS 上流用の rustls `ClientConnection` を確立し、`TcpStream` を包む。
 ///
-/// システムルート（webpki-roots）で検証する。クライアント証明書認証は
+/// `[tls_client] ca` の信頼アンカー（既定は組み込みの webpki-roots）で検証する。クライアント証明書認証は
 /// veil の他の WASM 発呼経路（`proxy_http_call`）と同様に未対応。
 pub(super) fn wrap_tls(stream: TcpStream, host: &str) -> Result<ClientStream, String> {
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
     // gRPC over TLS は ALPN `h2` を要求するサーバーが多い。
     config.alpn_protocols = vec![b"h2".to_vec()];

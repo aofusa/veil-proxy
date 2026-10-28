@@ -6,7 +6,7 @@ use super::capabilities::ModuleCapabilities;
 use crate::wasm_plugin_config::PluginConfiguration;
 
 /// WASM extension configuration
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WasmConfig {
     /// Enable WASM extensions
     #[serde(default)]
@@ -28,6 +28,54 @@ pub struct WasmConfig {
     /// **OpenBSD ではこの値は常に無視され、常に Pulley が使われる**（B-52）。
     #[serde(default)]
     pub interpreter: bool,
+
+    /// Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）。
+    /// ゲストの `timeout_ms` がこれより長くても接続はこの時間で諦める（F-283）
+    #[serde(default = "default_grpc_connect_timeout_ms")]
+    pub grpc_connect_timeout_ms: u32,
+
+    /// `proxy_http_call` の `timeout_ms` の上限（ミリ秒）。負の値・これより長い値はこの値で打ち切る（F-282）
+    #[serde(default = "default_http_call_max_timeout_ms")]
+    pub http_call_max_timeout_ms: u32,
+
+    /// モジュールごとの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は失敗する（F-282）
+    #[serde(default = "default_shared_data_max_keys")]
+    pub shared_data_max_keys: usize,
+}
+
+/// `[wasm] grpc_connect_timeout_ms` の既定（F-283）
+pub const DEFAULT_GRPC_CONNECT_TIMEOUT_MS: u32 = 5_000;
+
+fn default_grpc_connect_timeout_ms() -> u32 {
+    DEFAULT_GRPC_CONNECT_TIMEOUT_MS
+}
+
+/// `[wasm] http_call_max_timeout_ms` の既定（F-282）
+pub const DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS: u32 = 60_000;
+
+fn default_http_call_max_timeout_ms() -> u32 {
+    DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS
+}
+
+/// `[wasm] shared_data_max_keys` の既定（F-282）
+pub const DEFAULT_SHARED_DATA_MAX_KEYS: usize = 100_000;
+
+fn default_shared_data_max_keys() -> usize {
+    DEFAULT_SHARED_DATA_MAX_KEYS
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defaults: WasmDefaults::default(),
+            modules: Vec::new(),
+            interpreter: false,
+            grpc_connect_timeout_ms: DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: DEFAULT_SHARED_DATA_MAX_KEYS,
+        }
+    }
 }
 
 /// Default WASM settings
@@ -36,6 +84,12 @@ pub struct WasmDefaults {
     /// Maximum execution time in milliseconds
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time_ms: u64,
+
+    /// コールバックがワーカーへ制御を返す間隔（マイクロ秒の目安。fuel は約 1,000 で 1µs）。
+    /// B-175: 既定 1,000（約 1ms）。小さくすると CPU を長く使うフィルタと同じワーカーの他の要求の待ちが短くなるが、
+    /// 普通のコールバックも止まって `instance_reuse` のインスタンスが同時に多く開く。
+    #[serde(default = "default_yield_interval_us")]
+    pub yield_interval_us: u64,
 
     /// Pooling allocator settings
     #[serde(default)]
@@ -46,6 +100,7 @@ impl Default for WasmDefaults {
     fn default() -> Self {
         Self {
             max_execution_time_ms: default_max_execution_time(),
+            yield_interval_us: default_yield_interval_us(),
             pooling: PoolingConfig::default(),
         }
     }
@@ -53,6 +108,10 @@ impl Default for WasmDefaults {
 
 fn default_max_execution_time() -> u64 {
     100
+}
+
+fn default_yield_interval_us() -> u64 {
+    1_000
 }
 
 /// Pooling allocator configuration
@@ -92,7 +151,7 @@ fn default_max_memory_size() -> usize {
 }
 
 /// Module configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModuleConfig {
     /// Module name (unique identifier)
     pub name: String,
@@ -107,6 +166,16 @@ pub struct ModuleConfig {
     /// Capability settings
     #[serde(default)]
     pub capabilities: ModuleCapabilities,
+
+    /// HTTP のコールバックで VM の文脈（インスタンスと root context）を使い回す（F-271）。
+    /// 既定は false（コールバックごとに新しいインスタンスで `_start`・`on_vm_start`・`on_configure` を実行する）
+    #[serde(default)]
+    pub instance_reuse: bool,
+
+    /// 起動時（設定ロード時）に veil が読むファイル（F-271）。名前 → パス。モジュールはプロパティ
+    /// `plugin_data.<名前>` で中身を読める（WASI の `path_open` は足さない）
+    #[serde(default)]
+    pub data_files: std::collections::BTreeMap<String, String>,
 }
 
 /// Filter action returned by callbacks

@@ -70,7 +70,7 @@ impl Harness {
         let module = Module::new(&engine, HARNESS_WAT).expect("abi_harness.wat should compile");
 
         let mut http_ctx = HttpContext::new(1, capabilities);
-        http_ctx.plugin_name = "conformance_harness".to_string();
+        http_ctx.plugin_name = "conformance_harness".into();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(&engine, host_state);
 
@@ -348,6 +348,59 @@ async fn item2_out_of_range_offsets_return_bad_argument_not_trap() {
         "Item2: 範囲外引数の扱い",
         Conformance::Implemented,
         "範囲外オフセット/未知の enum 値は trap せず BadArgument/InvalidMemoryAccess を返す",
+    );
+}
+
+/// B-236: 負・巨大なポインタと長さ（符号拡張・加算の回り込み）を全ホスト関数のどの引数に渡しても trap・panic しない。
+#[tokio::test]
+async fn item2_hostile_pointers_and_lengths_do_not_trap() {
+    const HOSTILE: [i32; 5] = [-1, i32::MIN, i32::MAX, -8, 0x7fff_fff0];
+    let mut h = Harness::permissive().await;
+    let names: Vec<String> = h
+        .instance
+        .exports(&mut h.store)
+        .filter(|e| e.name().starts_with("test_"))
+        .map(|e| e.name().to_string())
+        .collect();
+    assert!(names.len() > 30, "harness exports: {}", names.len());
+    for name in &names {
+        let func = h.instance.get_func(&mut h.store, name).unwrap();
+        let ty = func.ty(&h.store);
+        let is_i64: Vec<bool> = ty
+            .params()
+            .map(|p| matches!(p, wasmtime::ValType::I64))
+            .collect();
+        let val = |i: usize, v: i32| {
+            if is_i64[i] {
+                Val::I64(v as i64)
+            } else {
+                Val::I32(v)
+            }
+        };
+        let arity = is_i64.len();
+        let mut cases: Vec<Vec<Val>> = Vec::new();
+        for pos in 0..arity {
+            for &bad in &HOSTILE {
+                cases.push(
+                    (0..arity)
+                        .map(|i| val(i, if i == pos { bad } else { scratch::MSG }))
+                        .collect(),
+                );
+            }
+        }
+        cases.push((0..arity).map(|i| val(i, -1)).collect());
+        for args in cases {
+            let mut results = vec![Val::I32(0)];
+            // trap（ホスト関数の panic を含む）すると Err
+            func.call_async(&mut h.store, &args, &mut results)
+                .await
+                .unwrap_or_else(|e| panic!("{name}({args:?}) must not trap, got: {e}"));
+        }
+    }
+    record(
+        "Item2: 負・巨大なポインタと長さ",
+        Conformance::Implemented,
+        "どの引数に負・i32::MAX 付近を渡しても trap せず状態コードを返す",
     );
 }
 
@@ -670,6 +723,119 @@ const FIXTURE_WASM_FILES: &[&str] = &[
     "grpc_trailer_filter.wasm",
 ];
 
+/// B-247: `proxy_dequeue_shared_queue` はゲストのアロケータで確保した領域にペイロードを書き、
+/// その番地と長さを返す（以前は `return_data_ptr` の番地へペイロードそのものを書いていた）。
+#[tokio::test]
+async fn item4_shared_queue_dequeue_returns_allocated_pointer() {
+    let mut h = Harness::permissive().await;
+    h.write(scratch::KEY, b"b247-queue");
+    let status = h
+        .call(
+            "test_proxy_register_shared_queue",
+            &[scratch::KEY, 10, scratch::OUT_PTR],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "register failed");
+    let queue_id = h.read_i32(scratch::OUT_PTR);
+
+    h.write(scratch::VALUE, b"queued payload");
+    let status = h
+        .call(
+            "test_proxy_enqueue_shared_queue",
+            &[queue_id, scratch::VALUE, 14],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "enqueue failed");
+
+    // 返り値の書き込み先の直後に目印を置き、ペイロードがはみ出して壊さないことも見る
+    h.write(scratch::OUT_SIZE + 4, b"MARK");
+    let status = h
+        .call(
+            "test_proxy_dequeue_shared_queue",
+            &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE],
+        )
+        .await;
+    assert_eq!(status, PROXY_RESULT_OK, "dequeue failed");
+    let ptr = h.read_i32(scratch::OUT_PTR);
+    let size = h.read_i32(scratch::OUT_SIZE);
+    assert!(
+        ptr >= 131072,
+        "payload must be written to memory from proxy_on_memory_allocate, got pointer {ptr:#x}"
+    );
+    assert_eq!(size, 14);
+    assert_eq!(h.read_bytes(ptr, size as usize), b"queued payload");
+    assert_eq!(h.read_bytes(scratch::OUT_SIZE + 4, 4), b"MARK");
+
+    let status = h
+        .call(
+            "test_proxy_dequeue_shared_queue",
+            &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE],
+        )
+        .await;
+    assert_eq!(
+        status, PROXY_RESULT_EMPTY,
+        "an empty queue must report Empty"
+    );
+}
+
+/// B-248: WASI の `random_get` は OS の CSPRNG で埋める（以前は壁時計をシードにした LCG）。
+/// 2 回の出力が一致せず、バイトの分布が一様に近い（カイ二乗の簡易検査）こと。
+#[tokio::test]
+async fn wasi_random_get_is_unpredictable() {
+    const WAT: &str = r#"(module
+        (import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))
+        (memory (export "memory") 2)
+        (func (export "fill") (param i32 i32) (result i32)
+          (call $random_get (local.get 0) (local.get 1))))"#;
+    let engine = build_conformance_test_engine().expect("engine should build");
+    let linker = build_conformance_test_linker(&engine).expect("linker should build");
+    let module = Module::new(&engine, WAT).expect("module should compile");
+    let host_state = HostState::new(HttpContext::new(1, ModuleCapabilities::default()));
+    let mut store = Store::new(&engine, host_state);
+    let instance = linker
+        .instantiate_async(&mut store, &module)
+        .await
+        .expect("module should instantiate");
+    let fill = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "fill")
+        .expect("fill export");
+    let memory = instance.get_memory(&mut store, "memory").expect("memory");
+
+    const N: usize = 65536;
+    assert_eq!(fill.call_async(&mut store, (0, N as i32)).await.unwrap(), 0);
+    assert_eq!(
+        fill.call_async(&mut store, (N as i32, 64)).await.unwrap(),
+        0
+    );
+    let mut a = vec![0u8; N];
+    memory.read(&store, 0, &mut a).unwrap();
+    let mut b = vec![0u8; 64];
+    memory.read(&store, N, &mut b).unwrap();
+    assert_ne!(&a[..64], &b[..], "two calls must not return the same bytes");
+
+    let mut counts = [0u64; 256];
+    for &x in &a {
+        counts[x as usize] += 1;
+    }
+    let expected = N as f64 / 256.0;
+    let chi2: f64 = counts
+        .iter()
+        .map(|&c| (c as f64 - expected).powi(2) / expected)
+        .sum();
+    // 自由度 255。p = 1e-6 の上側の値は約 375（一様なら平均 255）
+    assert!(
+        chi2 < 375.0,
+        "byte distribution is not uniform: chi2 = {chi2}"
+    );
+    // 範囲外は書かずに EFAULT 相当（21）
+    assert_eq!(
+        fill.call_async(&mut store, (2 * 65536 - 8, 64))
+            .await
+            .unwrap(),
+        21
+    );
+}
+
 #[tokio::test]
 async fn item5_guest_exports_present_in_real_sdk_modules() {
     let engine = Engine::default();
@@ -822,6 +988,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
                 allow_request_body_read: true,
                 ..ModuleCapabilities::default()
             },
+            ..Default::default()
         }],
         ..WasmConfig::default()
     };
@@ -846,6 +1013,8 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk1"),
             false,
+            None,
+            None,
         )
         .await;
     assert!(matches!(
@@ -859,6 +1028,8 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk2"),
             true,
+            None,
+            None,
         )
         .await;
     assert!(matches!(

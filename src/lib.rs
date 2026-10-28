@@ -14,7 +14,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+//! veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 //! ```
 //!
 //! | Feature | Adds |
@@ -289,6 +289,9 @@ pub(crate) mod tls_writev;
 pub mod jwt_verify;
 #[doc(hidden)]
 pub mod route_traffic;
+// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273）
+#[doc(hidden)]
+pub mod route_cors;
 // HTTP/1.1・2・3 で共通の L7 の段（ルートの照合・セキュリティの検査。F-234）
 #[doc(hidden)]
 pub mod l7;
@@ -298,6 +301,9 @@ pub mod path_norm;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 #[doc(hidden)]
 pub mod tls_provider;
+/// 外向きの TLS の信頼アンカー（`"builtin"`・`"system"`・PEM。F-259）
+#[doc(hidden)]
+pub mod trust_store;
 /// 上流の mTLS（クライアント証明書・信頼アンカー・期待する SAN。F-217）
 #[doc(hidden)]
 pub mod upstream_tls;
@@ -349,6 +355,9 @@ pub mod vds_grpc;
 pub use crate::config::*;
 #[doc(hidden)]
 pub mod fuzz_api;
+/// HTTP/3 のリクエストのフィールドセクションの検査（quiche に依らない。F-279 の fuzz からも呼ぶ）。
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) mod h3_fields;
 /// HTTP/3 / QPACK ワイヤ純関数パーサ（F-112、ホットパス外・ファジング用）。
 #[doc(hidden)]
 pub mod http3_wire;
@@ -362,6 +371,8 @@ pub mod proxy;
 pub mod server;
 
 mod entry;
+// リスナー 1 個のワーカー群の起動（F-260。entry.rs は配線だけ）
+mod listener_workers;
 pub use entry::run;
 pub use entry::{run_server, ServerOptions};
 

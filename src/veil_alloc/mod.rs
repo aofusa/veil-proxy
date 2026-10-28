@@ -22,7 +22,7 @@
 //!   `pthread_atfork`.
 //!
 //! Memory layout: segments aligned to 4 MiB (64 slots of 64 KiB, with the header in the first
-//! slot). Requests of up to 256 KiB use size classes (52 classes), requests of up to 1 MiB use
+//! slot between inaccessible guard regions). Requests of up to 256 KiB use size classes (52 classes), requests of up to 1 MiB use
 //! large spans made of whole slots, and anything bigger is mapped directly from the OS.
 //!
 //! # Tuning

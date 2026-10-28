@@ -10,7 +10,7 @@
 #                   リソース枯渇 / syscall 障害注入）と OWASP ZAP（DAST）
 #   sanitizers      毎週（土曜）。ASAN/TSAN の E2E カオスと ASAN libFuzzer。
 #                   fuzz コーパスを actions/cache で回次間に持ち越し、cmin で最小化する（F-82）
-#   e2e             毎日。tests/e2e_setup.sh の全 E2E（io_uring / epoll）。PR CI では
+#   e2e             毎日。tests/e2e_setup.sh の全 E2E（io_uring / epoll、それぞれ seccomp strict 有り・無し）。PR CI では
 #                   重いため走らせない（F-119）が、F-97〜F-112 で追加した E2E は
 #                   ここで毎日実行される（F-98 / F-100 / F-102 / F-104 / F-108 / F-110 / F-113）
 #   sbom            毎日。SBOM 生成 + grype による SBOM ベースの脆弱性照合（F-81）
@@ -45,6 +45,10 @@ concurrency:
   group: container-security-${{ github.ref }}
   cancel-in-progress: false
 
+# B-238: GITHUB_TOKEN は既定で読み取りだけにする（書き込みが要るジョブで個別に広げる）
+permissions:
+  contents: read
+
 jobs:
   suite:
     name: run.sh (${{ matrix.libc }})
@@ -57,7 +61,7 @@ jobs:
       matrix:
         libc: [glibc, musl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build Veil image (${{ matrix.libc }})
         working-directory: docker
@@ -94,7 +98,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: container-security-results-${{ matrix.libc }}
           path: |
@@ -126,7 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build Veil image (glibc)
         working-directory: docker
         run: |
@@ -162,7 +166,7 @@ jobs:
         run: ./tools/container_security/run.sh
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: container-security-chaos-extended
           path: |
@@ -176,10 +180,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # F-82: 永続コーパスを回次間で持ち越す（キーは毎回新規、restore は前回分の最新）。
       - name: Restore fuzz corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: tools/container_security/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -219,13 +223,13 @@ jobs:
         run: ./tools/container_security/run.sh
       - name: Save fuzz corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: tools/container_security/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
       - name: Upload results and corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: container-security-sanitizers
           path: |
@@ -235,33 +239,44 @@ jobs:
           retention-days: 30
 
   e2e:
-    name: e2e (${{ matrix.backend }})
+    name: e2e (${{ matrix.backend }}${{ matrix.seccomp && format(', seccomp {0}', matrix.seccomp) || '' }})
     if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        # F-279: veil 自身の seccomp（strict）を掛けた構成でも全 E2E を回す（全スレッドの Seccomp: 2 は
+        # security_audit.rs が検査する）
         include:
           - backend: io_uring
             features: full
+            seccomp: ''
           - backend: epoll
             features: full,epoll
+            seccomp: ''
+          - backend: io_uring
+            features: full
+            seccomp: strict
+          - backend: epoll
+            features: full,epoll
+            seccomp: strict
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build deps
         run: sudo apt-get update -y && sudo apt-get install -y cmake nasm protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run E2E suite
         env:
           VEIL_E2E_FEATURES: ${{ matrix.features }}
+          VEIL_E2E_SECCOMP: ${{ matrix.seccomp }}
         run: ./tests/e2e_setup.sh test
       - name: Upload server logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: e2e-logs-${{ matrix.backend }}
+          name: e2e-logs-${{ matrix.backend }}${{ matrix.seccomp && format('-seccomp-{0}', matrix.seccomp) || '' }}
           path: /tmp/*.log
           retention-days: 7
 
@@ -270,7 +285,7 @@ jobs:
     if: github.event_name != 'schedule' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build Veil image (glibc)
         working-directory: docker
         run: |
@@ -283,14 +298,14 @@ jobs:
         run: ./tools/container_security/security/run_sbom.sh
       # F-81: SBOM を入力に grype で脆弱性を照合する（high 以上で失敗）。
       - name: Scan source SBOM with grype
-        uses: anchore/scan-action@v6
+        uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e # v6.5.1
         with:
           sbom: tools/container_security/results/sbom_source.cdx.json
           severity-cutoff: high
           output-format: table
       # 直す版の無い脆弱性も失敗にする（B-158。直す版が無いものは土台のイメージを替えるなどして取り除く）。
       - name: Scan image SBOM with grype
-        uses: anchore/scan-action@v6
+        uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e # v6.5.1
         with:
           sbom: tools/container_security/results/sbom_image.spdx.json
           severity-cutoff: high
@@ -298,7 +313,7 @@ jobs:
           output-format: table
       - name: Upload SBOM
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom
           path: |

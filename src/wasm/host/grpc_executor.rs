@@ -161,20 +161,64 @@ pub fn wait_for_grpc_work() {
     }
 }
 
-/// 呼び出しをグローバルレジストリへ登録する（`proxy_grpc_call` から）。
-pub fn register_global_pending_grpc_call(call: PendingGrpcUnaryCall) {
-    if let Ok(mut registry) = GLOBAL_PENDING_GRPC_CALLS.write() {
-        registry.push(call);
-    }
-    wake_grpc_thread();
+/// 実行スレッドが取り込む前の呼び出し・送出・キャンセルの件数の上限（それぞれ。F-283）。実行スレッドが
+/// 止まっている（到達できない上流への接続を待つ等）間にゲストが積み続けてもメモリが伸び続けない
+pub const MAX_PENDING_GRPC: usize = 4096;
+
+/// 1 ステップで 1 つの接続から読む量の上限（F-283）。poll(2) はレベルトリガなので残りは次のステップで読む
+const MAX_READ_PER_STEP: usize = 256 * 1024;
+
+/// 上流への新規接続（TCP + TLS）を待つ時間の上限（F-283）。ゲストの `timeout_ms` がこれより長くても、
+/// 接続はこの時間で諦める（実行スレッドは接続を同期で待つので、全プラグインの gRPC が止まらないように）
+static CONNECT_TIMEOUT_MS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(crate::wasm::types::DEFAULT_GRPC_CONNECT_TIMEOUT_MS);
+
+/// `[wasm] grpc_connect_timeout_ms` を反映する（起動時・リロード時）。
+pub fn set_connect_timeout_ms(ms: u32) {
+    CONNECT_TIMEOUT_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// メッセージ 1 件分の逐次送出要求を登録する（`proxy_grpc_send` から、F-139）。
-pub fn register_global_pending_grpc_send(send: PendingGrpcSend) {
-    if let Ok(mut registry) = GLOBAL_PENDING_GRPC_SENDS.write() {
-        registry.push(send);
+fn connect_timeout(guest_timeout_ms: u32) -> Duration {
+    let cap = CONNECT_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    Duration::from_millis(guest_timeout_ms.clamp(1, cap.max(1)) as u64)
+}
+
+/// `MAX_PENDING_GRPC` 件未満なら積む
+fn push_bounded<T>(registry: &mut Vec<T>, item: T) -> bool {
+    if registry.len() >= MAX_PENDING_GRPC {
+        return false;
+    }
+    registry.push(item);
+    true
+}
+
+/// 呼び出しをグローバルレジストリへ登録する（`proxy_grpc_call` から）。積めなければ false（上限。F-283）
+#[must_use]
+pub fn register_global_pending_grpc_call(call: PendingGrpcUnaryCall) -> bool {
+    let pushed = GLOBAL_PENDING_GRPC_CALLS
+        .write()
+        .is_ok_and(|mut r| push_bounded(&mut r, call));
+    if !pushed {
+        crate::logging::log_throttled!(warn, "[wasm:grpc] too many pending gRPC calls; rejecting");
     }
     wake_grpc_thread();
+    pushed
+}
+
+/// メッセージ 1 件分の逐次送出要求を登録する（`proxy_grpc_send` から、F-139）。積めなければ false（F-283）
+#[must_use]
+pub fn register_global_pending_grpc_send(send: PendingGrpcSend) -> bool {
+    let pushed = GLOBAL_PENDING_GRPC_SENDS
+        .write()
+        .is_ok_and(|mut r| push_bounded(&mut r, send));
+    if !pushed {
+        crate::logging::log_throttled!(
+            warn,
+            "[wasm:grpc] too many pending gRPC messages; rejecting"
+        );
+    }
+    wake_grpc_thread();
+    pushed
 }
 
 /// キャンセル済み呼び出しをレジストリから取り除く（`proxy_grpc_cancel`/`proxy_grpc_close` から）。
@@ -194,7 +238,10 @@ pub fn cancel_global_pending_grpc_call(module_name: &str, call_id: u32) -> bool 
         removed |= registry.len() < before;
     }
     if let Ok(mut cancels) = GLOBAL_PENDING_GRPC_CANCELS.write() {
-        cancels.push((module_name.to_string(), call_id));
+        // F-283: 上限を超えたキャンセルは捨てる（その呼び出しは期限で終わる）
+        if cancels.len() < MAX_PENDING_GRPC {
+            cancels.push((module_name.to_string(), call_id));
+        }
     }
     wake_grpc_thread();
     removed
@@ -283,6 +330,8 @@ struct ActiveCall {
     phase: CallPhase,
     /// `proxy_grpc_send` で積まれた未送出メッセージ。
     outbox: VecDeque<Bytes>,
+    /// 送出中のメッセージ（gRPC の 5 バイトの接頭辞付き）と送った位置。フロー制御・フレームの上限で分けて送る（B-257）
+    sending: Option<(Bytes, usize)>,
     /// ゲストがこれ以上 send しない（ユーナリーは常に true）。
     end_of_stream_requested: bool,
     /// 実際に END_STREAM 付き DATA フレームを送出済みか。
@@ -291,8 +340,13 @@ struct ActiveCall {
     got_initial_metadata: bool,
     /// ストリームレベルの送信フロー制御ウィンドウ。
     stream_send_window: i64,
+    /// 受けたがまだ WINDOW_UPDATE で返していないストリームレベルのバイト数（B-257）
+    stream_recv_unacked: u32,
     deadline: Instant,
 }
+
+/// 受信ウィンドウ（こちらは SETTINGS で既定の 65,535 を広告する）の半分を消費したら WINDOW_UPDATE で返す（B-257）。
+const RECV_WINDOW_UPDATE_THRESHOLD: u32 = crate::http2::settings::defaults::INITIAL_WINDOW_SIZE / 2;
 
 impl ActiveCall {
     fn raw_fd(&self) -> RawFd {
@@ -303,7 +357,9 @@ impl ActiveCall {
     }
 
     fn has_pending_write(&self) -> bool {
-        self.conn.write_offset < self.conn.write_buf.len() || !self.outbox.is_empty()
+        self.conn.write_offset < self.conn.write_buf.len()
+            || !self.outbox.is_empty()
+            || self.sending.is_some()
     }
 
     fn close_event(&self, status_code: i32) -> GrpcEvent {
@@ -330,34 +386,54 @@ impl ActiveCall {
             return events;
         }
 
-        // --- 送信: outbox のメッセージをフロー制御に従って write_buf へ積む ---
-        while let Some(msg) = self.outbox.front() {
-            let framed_len = 5 + msg.len();
-            if framed_len as i64 > self.stream_send_window
-                || framed_len as i64 > self.conn.conn_send_window
-            {
+        // --- 送信: outbox のメッセージをフロー制御と相手のフレームの上限に従って write_buf へ積む ---
+        // 1 メッセージを 1 フレームにすると SETTINGS_MAX_FRAME_SIZE を超えて相手が接続ごと落とし、ウィンドウより大きい
+        // メッセージは永久に送れないので、送れる分ずつ DATA フレームに分ける（B-257）。
+        loop {
+            if self.sending.is_none() {
+                let Some(msg) = self.outbox.pop_front() else {
+                    break;
+                };
+                let mut framed = Vec::with_capacity(5 + msg.len());
+                framed.push(0u8);
+                framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&msg);
+                self.sending = Some((Bytes::from(framed), 0));
+            }
+            let Some((buf, off)) = self.sending.as_mut() else {
+                break;
+            };
+            let window = self.stream_send_window.min(self.conn.conn_send_window);
+            if window <= 0 {
                 // ウィンドウ不足。WINDOW_UPDATE を待つ（F-106 の教訓）。
                 break;
             }
-            let msg = self.outbox.pop_front().expect("front checked above");
-            let mut framed = Vec::with_capacity(framed_len);
-            framed.push(0u8);
-            framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-            framed.extend_from_slice(&msg);
-            let end_stream = self.outbox.is_empty() && self.end_of_stream_requested;
+            let n = (buf.len() - *off)
+                .min(window as usize)
+                .min(self.conn.peer_max_frame_size);
+            let last = *off + n == buf.len();
+            let end_stream = last && self.outbox.is_empty() && self.end_of_stream_requested;
             encoder.encode_data_into(
                 &mut self.conn.write_buf,
                 self.stream_id,
-                &framed,
+                &buf[*off..*off + n],
                 end_stream,
             );
-            self.stream_send_window -= framed_len as i64;
-            self.conn.conn_send_window -= framed_len as i64;
+            *off += n;
+            self.stream_send_window -= n as i64;
+            self.conn.conn_send_window -= n as i64;
+            if last {
+                self.sending = None;
+            }
             if end_stream {
                 self.half_closed_sent = true;
             }
         }
-        if self.outbox.is_empty() && self.end_of_stream_requested && !self.half_closed_sent {
+        if self.outbox.is_empty()
+            && self.sending.is_none()
+            && self.end_of_stream_requested
+            && !self.half_closed_sent
+        {
             encoder.encode_data_into(&mut self.conn.write_buf, self.stream_id, &[], true);
             self.half_closed_sent = true;
         }
@@ -388,7 +464,9 @@ impl ActiveCall {
 
         // --- 受信: WouldBlock までフレームを読み、種別ごとに処理する ---
         let mut tmp = [0u8; 8192];
-        loop {
+        let mut read_this_step = 0usize;
+        // F-283: 1 ステップで読む量に上限を置く（相手がフロー制御を無視して送り続けても受信バッファが伸び続けない）
+        while read_this_step < MAX_READ_PER_STEP {
             match self.conn.stream.read(&mut tmp) {
                 Ok(0) => {
                     self.conn.goaway = true;
@@ -396,7 +474,10 @@ impl ActiveCall {
                     self.phase = CallPhase::Done;
                     return events;
                 }
-                Ok(n) => self.conn.read_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    read_this_step += n;
+                    self.conn.read_buf.extend_from_slice(&tmp[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     ftlog::warn!("[wasm:grpc] read failed: {e}");
@@ -443,9 +524,18 @@ impl ActiveCall {
                 if !header.is_ack() {
                     if let Frame::Settings { settings, .. } = &frame {
                         for (id, value) in settings {
-                            // SETTINGS_INITIAL_WINDOW_SIZE (0x4)
-                            if *id == 0x4 {
-                                self.conn.peer_initial_window = *value as i64;
+                            match *id {
+                                // SETTINGS_INITIAL_WINDOW_SIZE (0x4): 開いているストリームのウィンドウも差分だけ動かす（RFC 9113 §6.9.2）
+                                0x4 => {
+                                    self.stream_send_window +=
+                                        *value as i64 - self.conn.peer_initial_window;
+                                    self.conn.peer_initial_window = *value as i64;
+                                }
+                                // SETTINGS_MAX_FRAME_SIZE (0x5): 範囲外は相手の誤りなので既定のまま
+                                0x5 if (16_384..=16_777_215).contains(value) => {
+                                    self.conn.peer_max_frame_size = *value as usize;
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -507,6 +597,10 @@ impl ActiveCall {
                         return Some(true);
                     }
                 };
+                if header.stream_id != self.stream_id {
+                    // 前の呼び出しの残り。HPACK の動的表を保つために復号だけして捨てる
+                    return None;
+                }
                 // F-160 と同様に `Bytes::from` でそのまま引き継ぐ（コピー無し）。
                 let pairs: Vec<(Bytes, Bytes)> =
                     fields.into_iter().map(|f| (f.name, f.value)).collect();
@@ -558,12 +652,33 @@ impl ActiveCall {
                 }
             }
             Some(FrameType::Data) => {
+                // 受けた分（パディングを含むペイロード長）を接続・ストリームの両方で返す。返さないと相手の送信ウィンドウが
+                // 初期値のまま減り続け、プールした接続は累計 64KB で全呼び出しが止まる（B-257）
+                let len = header.length;
+                self.conn.conn_recv_unacked += len;
+                if self.conn.conn_recv_unacked >= RECV_WINDOW_UPDATE_THRESHOLD {
+                    let inc = std::mem::take(&mut self.conn.conn_recv_unacked);
+                    self.conn
+                        .write_buf
+                        .extend_from_slice(&encoder.encode_window_update(0, inc));
+                }
+                if header.stream_id != self.stream_id {
+                    // 前の呼び出しの残り（接続レベルの補充だけ）
+                    return None;
+                }
                 let Frame::Data {
                     end_stream, data, ..
                 } = frame
                 else {
                     return None;
                 };
+                self.stream_recv_unacked += len;
+                if !end_stream && self.stream_recv_unacked >= RECV_WINDOW_UPDATE_THRESHOLD {
+                    let inc = std::mem::take(&mut self.stream_recv_unacked);
+                    self.conn
+                        .write_buf
+                        .extend_from_slice(&encoder.encode_window_update(self.stream_id, inc));
+                }
                 self.grpc_dec.push(&data);
                 loop {
                     match self.grpc_dec.decode_next() {
@@ -840,11 +955,13 @@ impl GrpcRunner {
             stream_id,
             phase: CallPhase::Streaming,
             outbox: initial_messages.into_iter().collect(),
+            sending: None,
             end_of_stream_requested: end_of_stream,
             half_closed_sent: false,
             grpc_dec: GrpcFrameDecoder::new(),
             got_initial_metadata: false,
             stream_send_window,
+            stream_recv_unacked: 0,
             deadline: Instant::now() + Duration::from_millis(timeout_ms.max(1) as u64),
         };
         self.active
@@ -978,7 +1095,7 @@ fn connect_new(
     use_tls: bool,
     timeout_ms: u32,
 ) -> Result<PooledConn, String> {
-    let timeout = Duration::from_millis(timeout_ms.max(1) as u64);
+    let timeout = connect_timeout(timeout_ms);
     let addr = format!("{host}:{port}");
     let tcp_stream = crate::upstream::tcp_connect_timeout(
         &addr
@@ -1426,7 +1543,7 @@ mod tests {
             messages: vec![Bytes::from_static(b"hello")],
             timeout_ms: 1000,
         };
-        register_global_pending_grpc_call(call.clone());
+        assert!(register_global_pending_grpc_call(call.clone()));
 
         assert!(!cancel_global_pending_grpc_call(
             "test_module_grpc_exec",
@@ -1438,6 +1555,22 @@ mod tests {
         assert!(!taken
             .iter()
             .any(|c| c.module_name == "test_module_grpc_exec" && c.call_id == 42));
+    }
+
+    /// F-283: 実行スレッドが取り込む前のキューは上限で止まり、接続の待ち時間は設定の上限で切られる
+    #[test]
+    fn test_pending_queue_bound_and_connect_timeout_cap() {
+        let mut v = Vec::new();
+        for i in 0..MAX_PENDING_GRPC {
+            assert!(push_bounded(&mut v, i));
+        }
+        assert!(!push_bounded(&mut v, 0));
+        assert_eq!(v.len(), MAX_PENDING_GRPC);
+
+        set_connect_timeout_ms(5_000);
+        assert_eq!(connect_timeout(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(connect_timeout(200), Duration::from_millis(200));
+        assert_eq!(connect_timeout(0), Duration::from_millis(1));
     }
 
     /// F-139: `proxy_grpc_send` 相当の逐次送出登録が、half-close を待たずに
@@ -1454,7 +1587,7 @@ mod tests {
             message: Bytes::from_static(b"chunk-1"),
             end_of_stream: false,
         };
-        register_global_pending_grpc_send(send);
+        assert!(register_global_pending_grpc_send(send));
 
         let taken = take_global_pending_grpc_sends();
         assert!(taken
@@ -1530,11 +1663,13 @@ mod tests {
             stream_id: 1,
             phase: CallPhase::Streaming,
             outbox: VecDeque::new(),
+            sending: None,
             end_of_stream_requested: true,
             half_closed_sent: true,
             grpc_dec: GrpcFrameDecoder::new(),
             got_initial_metadata: false,
             stream_send_window: 65535,
+            stream_recv_unacked: 0,
             // 既に過去のデッドライン
             deadline: Instant::now() - Duration::from_millis(1),
         };
@@ -1840,5 +1975,250 @@ mod tests {
             conns_pooled, 1,
             "新方式は接続を再利用し 1 回だけ確立するはず"
         );
+    }
+
+    // ========================================================================
+    // B-257: フロー制御とフレームの上限を守る模擬サーバ
+    // ========================================================================
+
+    /// 1 フレームを読む（ブロッキング。読み取りタイムアウトはソケットに設定）。
+    fn read_mock_frame(
+        stream: &mut TcpStream,
+        read_buf: &mut Vec<u8>,
+        decoder: &FrameDecoder,
+    ) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        let mut tmp = [0u8; 16384];
+        loop {
+            if read_buf.len() >= FrameHeader::SIZE {
+                let header = decoder
+                    .decode_header(&read_buf[..FrameHeader::SIZE])
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+                let total = FrameHeader::SIZE + header.length as usize;
+                if read_buf.len() >= total {
+                    let payload = read_buf[FrameHeader::SIZE..total].to_vec();
+                    read_buf.drain(..total);
+                    return Ok((header, payload));
+                }
+            }
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            read_buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// 既定の SETTINGS（最大フレーム 16,384・初期ウィンドウ 65,535）を守る gRPC サーバ。受けた DATA が 16,384 を
+    /// 超えたら `FRAME_SIZE_ERROR` の GOAWAY を送って `frame_size_error` を立てる。応答は `resp_len` バイトの
+    /// 1 メッセージで、相手の WINDOW_UPDATE の範囲でしか送らない。
+    fn serve_strict_mock_connection(
+        mut stream: TcpStream,
+        resp_len: usize,
+        frame_size_error: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut preface = [0u8; 24];
+        stream.read_exact(&mut preface)?;
+        let decoder = FrameDecoder::new(1 << 24);
+        let encoder = FrameEncoder::new(16384);
+        let mut hpack_dec = crate::http2::hpack::HpackDecoder::new(4096);
+        let mut hpack_enc = crate::http2::hpack::HpackEncoder::new(4096);
+        stream.write_all(&encoder.encode_settings(&[], false))?;
+        let mut read_buf = Vec::new();
+        let mut conn_win: i64 = 65535;
+        let mut stream_wins: HashMap<u32, i64> = HashMap::new();
+
+        // 制御フレームを処理する。応答の開始が要るストリーム（END_STREAM を受けた）を返す
+        let mut handle = |header: &FrameHeader,
+                          payload: &[u8],
+                          stream: &mut TcpStream,
+                          conn_win: &mut i64,
+                          stream_wins: &mut HashMap<u32, i64>|
+         -> std::io::Result<Option<u32>> {
+            match header.get_frame_type() {
+                Some(FrameType::Settings) if !header.is_ack() => {
+                    stream.write_all(&encoder.encode_settings_ack())?;
+                }
+                Some(FrameType::WindowUpdate) => {
+                    let inc = u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7FFF_FFFF;
+                    if header.stream_id == 0 {
+                        *conn_win += inc as i64;
+                    } else {
+                        *stream_wins.entry(header.stream_id).or_insert(65535) += inc as i64;
+                    }
+                }
+                Some(FrameType::Data) if header.length > 16384 => {
+                    frame_size_error.store(true, std::sync::atomic::Ordering::SeqCst);
+                    stream.write_all(&encoder.encode_goaway(header.stream_id, 0x6, &[]))?;
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                Some(FrameType::Headers) | Some(FrameType::Data) => {
+                    if header.get_frame_type() == Some(FrameType::Headers) {
+                        let _ = hpack_dec.decode(payload);
+                    } else if header.length > 0 {
+                        // 受けた分を返す（実際のサーバと同じく、相手の送信ウィンドウを補充する）
+                        stream.write_all(&encoder.encode_window_update(0, header.length))?;
+                        stream.write_all(
+                            &encoder.encode_window_update(header.stream_id, header.length),
+                        )?;
+                    }
+                    stream_wins.entry(header.stream_id).or_insert(65535);
+                    if header.is_end_stream() {
+                        return Ok(Some(header.stream_id));
+                    }
+                }
+                _ => {}
+            }
+            Ok(None)
+        };
+
+        loop {
+            let (header, payload) = read_mock_frame(&mut stream, &mut read_buf, &decoder)?;
+            let Some(sid) = handle(
+                &header,
+                &payload,
+                &mut stream,
+                &mut conn_win,
+                &mut stream_wins,
+            )?
+            else {
+                continue;
+            };
+            let hdrs: Vec<(&[u8], &[u8], bool)> = vec![
+                (b":status", b"200", false),
+                (b"content-type", b"application/grpc", false),
+            ];
+            let block = hpack_enc.encode(&hdrs).expect("hpack encode");
+            stream.write_all(&encoder.encode_headers(sid, &block, false, true, None))?;
+            let mut body = vec![0u8; 5 + resp_len];
+            body[1..5].copy_from_slice(&(resp_len as u32).to_be_bytes());
+            let mut off = 0;
+            while off < body.len() {
+                let win = conn_win.min(stream_wins[&sid]);
+                if win <= 0 {
+                    // WINDOW_UPDATE を待つ（来なければ読み取りタイムアウトで失敗）
+                    let (h, p) = read_mock_frame(&mut stream, &mut read_buf, &decoder)?;
+                    handle(&h, &p, &mut stream, &mut conn_win, &mut stream_wins)?;
+                    continue;
+                }
+                let n = (body.len() - off).min(win as usize).min(16384);
+                stream.write_all(&encoder.encode_data(sid, &body[off..off + n], false))?;
+                off += n;
+                conn_win -= n as i64;
+                *stream_wins.get_mut(&sid).unwrap() -= n as i64;
+            }
+            let trailers: Vec<(&[u8], &[u8], bool)> = vec![(b"grpc-status", b"0", false)];
+            let block = hpack_enc.encode(&trailers).expect("hpack encode");
+            stream.write_all(&encoder.encode_headers(sid, &block, true, true, None))?;
+        }
+    }
+
+    /// 模擬サーバに `GrpcRunner` で 1 呼び出しを最後まで行い、(状態, 受けたメッセージの長さ) を返す。
+    fn run_unary_call(
+        runner: &mut GrpcRunner,
+        groups: &HashMap<String, Arc<UpstreamGroup>>,
+        call_id: u32,
+        message: Bytes,
+    ) -> (i32, Vec<usize>) {
+        let call = PendingGrpcUnaryCall {
+            module_name: "m".to_string(),
+            call_id,
+            upstream: "strict".to_string(),
+            path: "/t.Service/Call".to_string(),
+            initial_metadata: GrpcMetadataBlob::empty(),
+            messages: vec![message],
+            timeout_ms: 5_000,
+        };
+        let mut events = runner.ingest(vec![call], Vec::new(), Vec::new(), groups);
+        let mut lens = Vec::new();
+        loop {
+            for ev in events {
+                match ev {
+                    GrpcEvent::Message { message, .. } => lens.push(message.len()),
+                    GrpcEvent::Close { status_code, .. } => return (status_code, lens),
+                    _ => {}
+                }
+            }
+            events = runner.poll_all();
+        }
+    }
+
+    fn strict_upstream(
+        resp_len: usize,
+    ) -> (
+        HashMap<String, Arc<UpstreamGroup>>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        // 理由付き allow: 単体テスト（コールドパス）専用の同期 TCP。
+        #[allow(clippy::disallowed_methods)]
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let frame_size_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, f) = (accepted.clone(), frame_size_error.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                a.fetch_add(1, Ordering::SeqCst);
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    let _ = serve_strict_mock_connection(stream, resp_len, f);
+                });
+            }
+        });
+        let entry = crate::config::UpstreamServerEntry {
+            url: format!("http://127.0.0.1:{port}"),
+            sni_name: None,
+            use_h2c: true,
+            http2: None,
+            weight: 1,
+        };
+        let group = UpstreamGroup::new(
+            "strict".to_string(),
+            vec![entry],
+            crate::config::LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .expect("upstream group should build");
+        let mut groups = HashMap::new();
+        groups.insert("strict".to_string(), Arc::new(group));
+        (groups, accepted, frame_size_error)
+    }
+
+    /// B-257: 64KB を超える応答が同じプール接続で続けて受け取れる（受信した DATA に WINDOW_UPDATE を返す）。
+    #[test]
+    fn large_responses_on_pooled_connection_replenish_window() {
+        const LEN: usize = 70 * 1024;
+        let (groups, accepted, _) = strict_upstream(LEN);
+        let mut runner = GrpcRunner::new();
+        for call_id in 0..3 {
+            let (status, lens) = run_unary_call(&mut runner, &groups, call_id, Bytes::new());
+            assert_eq!(status, grpc_status::OK, "call {call_id}");
+            assert_eq!(lens, vec![LEN], "call {call_id}");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the connection is reused"
+        );
+    }
+
+    /// B-257: 最大フレームより大きいメッセージは DATA フレームに分けて送る（相手が FRAME_SIZE_ERROR で落とさない）。
+    /// ウィンドウより大きいメッセージも WINDOW_UPDATE を待って送り切る。
+    #[test]
+    fn large_request_messages_are_split_into_frames() {
+        let (groups, accepted, frame_size_error) = strict_upstream(16);
+        let mut runner = GrpcRunner::new();
+        for (call_id, len) in [(0, 17 * 1024), (1, 100 * 1024), (2, 10)] {
+            let (status, lens) =
+                run_unary_call(&mut runner, &groups, call_id, Bytes::from(vec![7u8; len]));
+            assert_eq!(status, grpc_status::OK, "message of {len} bytes");
+            assert_eq!(lens, vec![16]);
+        }
+        assert!(!frame_size_error.load(Ordering::SeqCst));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }

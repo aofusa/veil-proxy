@@ -45,8 +45,12 @@ for ((i = 1; i <= 200; i++)); do
 done
 after="$(series)"
 log "requests_total_series: before=${before} after=${after} (200 random Host headers)"
-# 状態コードの種類の分だけは増え得るので、少しの余裕を見る
-if [[ "${after}" -le $((before + 5)) ]]; then
+# 状態コードの種類の分だけは増え得るので、少しの余裕を見る。系列が 1 本も読めないのはメトリクスに届いていない
+# （B-253: allowed_ips で 403 になっていても、before=0 after=0 で PASS と報告していた）
+if [[ "${after}" -eq 0 ]]; then
+    log "FAIL metrics_host_label_bounded (no veil_proxy_http_requests_total series readable)"
+    fails=$((fails + 1))
+elif [[ "${after}" -le $((before + 5)) ]]; then
     log "PASS metrics_host_label_bounded"
 else
     log "FAIL metrics_host_label_bounded"

@@ -1,6 +1,6 @@
 # B-222: HTTP/3 に接続数の上限と Retry が無く、送信元を偽装した Initial の洪水でワーカーのメモリを使い切れる
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー PR-02）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -34,6 +34,16 @@
 
 - 偽装 Initial の洪水の負荷試験（`tools/container_security/chaos` の `l4_flood_probe` の UDP 版。F-279）で RSS が上限で頭打ちになる。
 - 正常なクライアント（quinn の E2E・h2load の HTTP/3）が Retry を越えて接続できる。HTTP/3 の性能の交互 A/B が変わらない。
+
+## 修正（v0.10.0）
+
+- 新しいモジュール `http3_server::admission` で新しい接続の受け入れを制御する（状態はワーカーのスレッドローカル。ハンドシェイク中の数は接続の生成・確立（`init_h3`）・破棄で増減し、全接続を数え直さない）。
+  - `[http3] max_connections`（ワーカーごと、既定 10000、0 は上限なし）: 達している間は新しい接続の Initial を捨てる。
+  - `[http3] retry_threshold`（既定 1000、0 は常に）: ハンドシェイク中の接続がこの数に達したら、トークンの無い Initial に `quiche::retry` でステートレスな Retry を返す。トークンは期限（10 秒）・元の DCID・送信元のアドレスとポートに対する HMAC-SHA256（プロセス共有の鍵、先頭 16 バイト）で、定数時間で検証する。トークン付きの Initial は検証を通ったときだけ `accept(scid = Retry で渡した接続 ID, odcid)` で接続を作る。Retry は受信の処理で溜め、`send_pending_packets` が送信の束の先頭に積む。
+  - `[http3] handshake_timeout`（既定 10000ms）: 確立しない接続はこの期限で捨てる（タイマーの期限にハンドシェイクの期限も含める）。
+- 対応しない版の Initial は accept せずに捨て、`accept` の失敗はワーカーを落とさず（以前は `?` でメインループから抜けていた）その Initial だけ捨てる。
+- 試験: `test_b222_retry_then_handshake_and_connection_limit`（quiche のクライアントで Retry → トークン付きの Initial → ハンドシェイク完了、別の送信元のトークンの拒否、接続数の上限）、`admission::tests`（トークンの改ざん・期限・送信元違い、判定と数え方）。
+- 設定のキーは `examples/config.toml`・`docs/guide/configuration.md`（英日）・`security.md`（英日）に追記した。
 
 ## 関連
 

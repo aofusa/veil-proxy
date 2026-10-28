@@ -1,6 +1,7 @@
 //! ルート単位のトラフィック制御（F-219、メッシュ無しの TOML のルート）。
 //!
-//! `[route.traffic]` の重み付き分割（`split`）・フォルト注入の中断（`fault`）・CORS のプリフライト（`cors`）、
+//! `[route.traffic]` の重み付き分割（`split`）・フォルト注入の中断（`fault`）・CORS（`cors`。プリフライトと、実際の応答に
+//! 足すヘッダを持つ `Backend` の写しの選択。F-273）、
 //! `[route.jwt]` の JWT の検証と claim の条件（F-220、`jwt` feature）と、固定応答の action（`type = "Respond"`）。どれもルートの照合（`upstream::find_backend_unified`）の直後に
 //! 解決済みの [`Backend`] を選ぶだけで、プロトコル（HTTP/1.1・HTTP/2・HTTP/3）ごとの経路は変えない。
 //!
@@ -28,7 +29,7 @@ pub struct TrafficConfig {
     /// フォルト注入（中断）
     #[serde(default)]
     pub fault: Option<FaultConfig>,
-    /// CORS のプリフライト（`OPTIONS` + `Origin` + `Access-Control-Request-Method`）への応答
+    /// CORS（プリフライトへの応答と、実際の応答に足すヘッダ。F-273）
     #[serde(default)]
     pub cors: Option<CorsConfig>,
 }
@@ -96,6 +97,9 @@ pub struct JwtConfig {
     pub require_expiration: bool,
     #[serde(default = "default_clock_skew")]
     pub clock_skew_secs: u64,
+    /// 受けるトークンの `alg`（例: `["RS256"]`。B-237）。空なら鍵の `alg`（鍵に無ければその鍵種で検証できる全部）
+    #[serde(default)]
+    pub allowed_algs: Vec<String>,
     /// claim の条件（名前 → 許す値。全部の claim がどれかの値を持つこと。配列・空白区切りの文字列も見る）
     #[serde(default)]
     pub require_claims: std::collections::BTreeMap<String, Vec<String>>,
@@ -119,6 +123,7 @@ struct JwtRule {
     keys: Vec<crate::jwt_verify::Jwk>,
     issuer: String,
     audiences: Vec<String>,
+    allowed_algs: Vec<String>,
     header: Box<[u8]>,
     prefix: Box<[u8]>,
     allow_missing: bool,
@@ -148,6 +153,7 @@ impl JwtRule {
             keys: &self.keys,
             issuer: &self.issuer,
             audiences: &self.audiences,
+            allowed_algs: &self.allowed_algs,
             require_expiration: self.require_expiration,
             clock_skew_secs: self.clock_skew_secs,
             now: crate::jwt_verify::unix_secs(),
@@ -169,7 +175,7 @@ impl JwtRule {
     }
 }
 
-/// CORS のプリフライトの応答。
+/// CORS（プリフライトの応答と実際の応答のヘッダ）。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorsConfig {
@@ -186,6 +192,12 @@ pub struct CorsConfig {
     pub max_age_secs: Option<u64>,
     #[serde(default)]
     pub allow_credentials: bool,
+    /// 上流が `Access-Control-Allow-Origin` を返しても上流の CORS のヘッダを除いて足す（既定は上流のものを残す。F-273）
+    #[serde(default)]
+    pub override_upstream: bool,
+    /// 許可しないオリジンの要求を 403 で返す（既定は処理して CORS のヘッダを付けないだけ。F-273）
+    #[serde(default)]
+    pub reject_disallowed: bool,
 }
 
 /// 固定応答（`type = "Respond"`・フォルトの中断・CORS のプリフライト）。ロード時に組み立てて共有する。
@@ -202,6 +214,9 @@ pub struct FixedResponse {
     /// `Backend::security()` が既定値を返し、`type = "Respond"` とトラフィック制御の応答（フォルト・CORS・JWT）は
     /// ルートのセキュリティ設定を無視していた
     pub security: Arc<SecurityConfig>,
+    /// `type = "Respond"` のルートに付けた Wasm のモジュール（F-271。フィルタが `send_local_response` しなければ
+    /// この固定応答を返す）。トラフィック制御の応答（フォルト・CORS・JWT）は持たない
+    pub modules: Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
 }
 
 impl FixedResponse {
@@ -237,7 +252,17 @@ impl FixedResponse {
             h1_keepalive,
             h1_close,
             security: default_security(),
+            modules: None,
         }
+    }
+
+    /// ルートの Wasm のモジュールを付ける（ロード時に 1 回。F-271）
+    pub fn with_modules(
+        mut self,
+        modules: Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+    ) -> Self {
+        self.modules = modules;
+        self
     }
 
     /// ルートのセキュリティ設定を付ける（ロード時に 1 回）
@@ -290,16 +315,78 @@ pub struct TrafficPolicy {
     split_total: u32,
     /// (100 万分率, 中断の応答)
     abort: Option<(u32, Backend)>,
-    cors: Option<CorsPreflight>,
+    cors: Option<CorsPolicy>,
     #[cfg(feature = "jwt")]
     jwt: Option<JwtRule>,
 }
 
-struct CorsPreflight {
-    /// `allow_origins` に `"*"` があるときの応答
+/// 解決済みの `[route.traffic.cors]`。
+struct CorsPolicy {
+    /// 一覧のオリジン（完全一致。`"*"` を除く）
+    origins: Vec<Box<[u8]>>,
+    /// `allow_origins` に `"*"` がある
+    any: bool,
+    /// プリフライトの応答（`origins` と同じ並び）
+    preflight_exact: Vec<Backend>,
+    /// `"*"` のときのプリフライトの応答
+    preflight_any: Option<Backend>,
+    /// `reject_disallowed = true` のときの 403
+    reject: Option<Backend>,
+    /// `[route.action]` の `Backend` の写し（解決に失敗したルートは `None`＝ヘッダを足さない）
+    base: Option<CorsVariants>,
+    /// 分割先ごとの写し（`TrafficPolicy::split` と同じ並び）
+    split: Vec<CorsVariants>,
+}
+
+/// 要求の `Origin` の照合の結果。
+#[derive(Clone, Copy)]
+enum OriginClass {
+    /// `Origin` が無い
+    Absent,
+    /// 一覧の i 番目
+    Exact(usize),
+    /// `"*"` で許可
+    Any,
+    /// 許可しない
+    Disallowed,
+}
+
+/// 1 つの `Backend` の、照合の結果ごとの写し（実際の応答に足すヘッダを持つ。F-273）。
+struct CorsVariants {
+    exact: Vec<Backend>,
     any: Option<Backend>,
-    /// オリジンごとの応答（`Access-Control-Allow-Origin` にそのオリジンを返す）
-    exact: Vec<(Box<[u8]>, Backend)>,
+    /// `Origin` が無い・許可しない要求（`"*"` だけの設定では元の `Backend`、それ以外は `Vary: Origin` だけを足す）
+    other: Backend,
+}
+
+impl CorsVariants {
+    #[inline]
+    fn pick(&self, class: OriginClass) -> Backend {
+        match class {
+            OriginClass::Exact(i) => self.exact[i].clone(),
+            OriginClass::Any => self.any.as_ref().unwrap_or(&self.other).clone(),
+            OriginClass::Absent | OriginClass::Disallowed => self.other.clone(),
+        }
+    }
+}
+
+impl CorsPolicy {
+    /// 要求の `Origin` を照合する（ルートの解決で 1 回）
+    #[inline]
+    fn classify(&self, headers: &[(&[u8], &[u8])]) -> OriginClass {
+        match header(headers, b"origin") {
+            None => OriginClass::Absent,
+            Some(o) => {
+                if let Some(i) = self.origins.iter().position(|x| x.as_ref() == o) {
+                    OriginClass::Exact(i)
+                } else if self.any {
+                    OriginClass::Any
+                } else {
+                    OriginClass::Disallowed
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for TrafficPolicy {
@@ -352,18 +439,29 @@ impl TrafficPolicy {
     /// `draw = false` は下見（乱数を引かない。中断の可能性があれば中断の応答を返してバッファ経路にさせる）。
     #[inline]
     pub fn select(&self, method: &[u8], headers: &[(&[u8], &[u8])], draw: bool) -> Option<Backend> {
-        if let Some(c) = &self.cors {
-            if method == b"OPTIONS" && header(headers, b"access-control-request-method").is_some() {
-                if let Some(origin) = header(headers, b"origin") {
-                    if let Some((_, b)) = c.exact.iter().find(|(o, _)| o.as_ref() == origin) {
-                        return Some(b.clone());
-                    }
-                    if let Some(b) = &c.any {
-                        return Some(b.clone());
+        let class = match &self.cors {
+            None => OriginClass::Absent,
+            Some(c) => {
+                let class = c.classify(headers);
+                if method == b"OPTIONS"
+                    && header(headers, b"access-control-request-method").is_some()
+                {
+                    match class {
+                        OriginClass::Exact(i) => return Some(c.preflight_exact[i].clone()),
+                        OriginClass::Any => {
+                            if let Some(b) = &c.preflight_any {
+                                return Some(b.clone());
+                            }
+                        }
+                        OriginClass::Absent | OriginClass::Disallowed => {}
                     }
                 }
+                if let (OriginClass::Disallowed, Some(r)) = (class, &c.reject) {
+                    return Some(r.clone());
+                }
+                class
             }
-        }
+        };
         // JWT（F-220）は乱数を使わないので下見でも判定する（HTTP/3 のストリーミングは下見だけでディスパッチする）
         #[cfg(feature = "jwt")]
         if let Some(j) = &self.jwt {
@@ -377,12 +475,20 @@ impl TrafficPolicy {
             }
         }
         if self.split_total > 0 {
-            if !draw {
-                return self.split.first().map(|(_, b)| b.clone());
+            let i = if draw {
+                let r = (next_u64() % u64::from(self.split_total)) as u32;
+                self.split.partition_point(|(cum, _)| *cum <= r)
+            } else {
+                0
+            };
+            // CORS のあるルートは、照合の結果に合う写し（実際の応答に足すヘッダを持つ。F-273）
+            if let Some(v) = self.cors.as_ref().and_then(|c| c.split.get(i)) {
+                return Some(v.pick(class));
             }
-            let r = (next_u64() % u64::from(self.split_total)) as u32;
-            let i = self.split.partition_point(|(cum, _)| *cum <= r);
             return self.split.get(i).map(|(_, b)| b.clone());
+        }
+        if let Some(v) = self.cors.as_ref().and_then(|c| c.base.as_ref()) {
+            return Some(v.pick(class));
         }
         None
     }
@@ -498,67 +604,12 @@ pub fn resolve(
     };
     let cors = match &t.cors {
         None => None,
-        Some(c) => {
-            if c.allow_origins.is_empty() {
-                return Err(err("[route.traffic] cors.allow_origins is empty".into()));
-            }
-            let make = |origin: &str| {
-                let mut h: Vec<(Bytes, Bytes)> = vec![(
-                    Bytes::from_static(b"access-control-allow-origin"),
-                    Bytes::from(origin.to_string()),
-                )];
-                if origin != "*" {
-                    h.push((Bytes::from_static(b"vary"), Bytes::from_static(b"Origin")));
-                }
-                if !c.allow_methods.is_empty() {
-                    h.push((
-                        Bytes::from_static(b"access-control-allow-methods"),
-                        Bytes::from(c.allow_methods.join(",")),
-                    ));
-                }
-                if !c.allow_headers.is_empty() {
-                    h.push((
-                        Bytes::from_static(b"access-control-allow-headers"),
-                        Bytes::from(c.allow_headers.join(",")),
-                    ));
-                }
-                if !c.expose_headers.is_empty() {
-                    h.push((
-                        Bytes::from_static(b"access-control-expose-headers"),
-                        Bytes::from(c.expose_headers.join(",")),
-                    ));
-                }
-                if let Some(age) = c.max_age_secs {
-                    h.push((
-                        Bytes::from_static(b"access-control-max-age"),
-                        Bytes::from(age.to_string()),
-                    ));
-                }
-                if c.allow_credentials {
-                    h.push((
-                        Bytes::from_static(b"access-control-allow-credentials"),
-                        Bytes::from_static(b"true"),
-                    ));
-                }
-                respond_backend(&sec, 200, h, Bytes::new())
-            };
-            let mut any = None;
-            let mut exact = Vec::new();
-            for o in &c.allow_origins {
-                if o == "*" {
-                    if c.allow_credentials {
-                        return Err(err(
-                            "[route.traffic] cors: allow_credentials cannot be used with \"*\""
-                                .into(),
-                        ));
-                    }
-                    any = Some(make("*"));
-                } else {
-                    exact.push((o.as_bytes().to_vec().into_boxed_slice(), make(o)));
-                }
-            }
-            Some(CorsPreflight { any, exact })
-        }
+        Some(c) => Some(resolve_cors(
+            c,
+            &sec,
+            route.resolved_backend.as_ref(),
+            &split,
+        )?),
     };
     Ok(Some(Arc::new(TrafficPolicy {
         split,
@@ -568,6 +619,151 @@ pub fn resolve(
         #[cfg(feature = "jwt")]
         jwt,
     })))
+}
+
+/// `[route.traffic.cors]` を解決する（設定のロード時。プリフライトの応答と、実際の応答の写し。F-273）。
+fn resolve_cors(
+    c: &CorsConfig,
+    sec: &Arc<SecurityConfig>,
+    base: Option<&Backend>,
+    split: &[(u32, Backend)],
+) -> io::Result<CorsPolicy> {
+    if c.allow_origins.is_empty() {
+        return Err(err("[route.traffic] cors.allow_origins is empty".into()));
+    }
+    let any = c.allow_origins.iter().any(|o| o == "*");
+    if any && c.allow_credentials {
+        return Err(err(
+            "[route.traffic] cors: allow_credentials cannot be used with \"*\"".into(),
+        ));
+    }
+    let origins: Vec<&String> = c.allow_origins.iter().filter(|o| *o != "*").collect();
+    // 応答がオリジンで変わる（`"*"` だけの設定以外）なら `Vary: Origin`
+    let vary = !origins.is_empty() || !any;
+    let preflight = |origin: &str| {
+        let mut h: Vec<(Bytes, Bytes)> = vec![(
+            Bytes::from_static(b"access-control-allow-origin"),
+            Bytes::from(origin.to_string()),
+        )];
+        if origin != "*" {
+            h.push((Bytes::from_static(b"vary"), Bytes::from_static(b"Origin")));
+        }
+        if !c.allow_methods.is_empty() {
+            h.push((
+                Bytes::from_static(b"access-control-allow-methods"),
+                Bytes::from(c.allow_methods.join(",")),
+            ));
+        }
+        if !c.allow_headers.is_empty() {
+            h.push((
+                Bytes::from_static(b"access-control-allow-headers"),
+                Bytes::from(c.allow_headers.join(",")),
+            ));
+        }
+        if !c.expose_headers.is_empty() {
+            h.push((
+                Bytes::from_static(b"access-control-expose-headers"),
+                Bytes::from(c.expose_headers.join(",")),
+            ));
+        }
+        if let Some(age) = c.max_age_secs {
+            h.push((
+                Bytes::from_static(b"access-control-max-age"),
+                Bytes::from(age.to_string()),
+            ));
+        }
+        if c.allow_credentials {
+            h.push((
+                Bytes::from_static(b"access-control-allow-credentials"),
+                Bytes::from_static(b"true"),
+            ));
+        }
+        respond_backend(sec, 200, h, Bytes::new())
+    };
+    // 実際の応答に足すヘッダ（`origin` が `None` は `Origin` の無い・許可しない要求で、`Vary` だけ）
+    let actual = |origin: Option<&str>| -> Option<Arc<crate::route_cors::CorsActual>> {
+        let mut h: Vec<(Bytes, Bytes)> = Vec::new();
+        if let Some(o) = origin {
+            h.push((
+                Bytes::from_static(b"access-control-allow-origin"),
+                Bytes::from(o.to_string()),
+            ));
+            if c.allow_credentials {
+                h.push((
+                    Bytes::from_static(b"access-control-allow-credentials"),
+                    Bytes::from_static(b"true"),
+                ));
+            }
+            if !c.expose_headers.is_empty() {
+                h.push((
+                    Bytes::from_static(b"access-control-expose-headers"),
+                    Bytes::from(c.expose_headers.join(",")),
+                ));
+            }
+        }
+        if vary {
+            h.push((Bytes::from_static(b"vary"), Bytes::from_static(b"Origin")));
+        }
+        (!h.is_empty())
+            .then(|| Arc::new(crate::route_cors::CorsActual::new(h, c.override_upstream)))
+    };
+    let variants = |b: &Backend| CorsVariants {
+        exact: origins
+            .iter()
+            .map(|o| cors_variant(b, actual(Some(o))))
+            .collect(),
+        any: any.then(|| cors_variant(b, actual(Some("*")))),
+        other: cors_variant(b, actual(None)),
+    };
+    Ok(CorsPolicy {
+        origins: origins
+            .iter()
+            .map(|o| o.as_bytes().to_vec().into_boxed_slice())
+            .collect(),
+        any,
+        preflight_exact: origins.iter().map(|o| preflight(o)).collect(),
+        preflight_any: any.then(|| preflight("*")),
+        reject: c.reject_disallowed.then(|| {
+            respond_backend(
+                sec,
+                403,
+                vec![(
+                    Bytes::from_static(b"content-type"),
+                    Bytes::from_static(b"text/plain"),
+                )],
+                Bytes::from_static(b"CORS origin not allowed"),
+            )
+        }),
+        base: base.map(variants),
+        split: split.iter().map(|(_, b)| variants(b)).collect(),
+    })
+}
+
+/// `Backend` の、実際の応答に `actual` のヘッダを足す写し（`None` なら元のまま）。
+fn cors_variant(b: &Backend, actual: Option<Arc<crate::route_cors::CorsActual>>) -> Backend {
+    let Some(actual) = actual else {
+        return b.clone();
+    };
+    if let Backend::Respond(r) = b {
+        // 固定応答は応答のヘッダへ組み込む（設定のヘッダが `Access-Control-Allow-Origin` を持てば上流と同じ扱い）
+        let mut h = r.headers.clone();
+        actual.apply_bytes(&mut h);
+        return Backend::Respond(Arc::new(
+            FixedResponse::new(r.status, h, r.body.clone())
+                .with_security(r.security.clone())
+                .with_modules(r.modules.clone()),
+        ));
+    }
+    let base_sec = b.security();
+    let mut sec = base_sec.clone();
+    // レート制限の枠は元の設定と共有する（オリジンごとに分けない）
+    sec.rate_limit_zone = if base_sec.rate_limit_zone != 0 {
+        base_sec.rate_limit_zone
+    } else {
+        base_sec as *const SecurityConfig as usize
+    };
+    sec.cors_actual = Some(actual);
+    b.with_security(Arc::new(sec))
 }
 
 #[cfg(feature = "jwt")]
@@ -590,6 +786,19 @@ fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> 
     if keys.is_empty() {
         return Err(err("[route.jwt] the JWKS has no usable keys".into()));
     }
+    // B-237: 鍵に alg が無く allowed_algs も無いと、その鍵種で検証できる全部の alg を受ける
+    if j.allowed_algs.is_empty() && keys.iter().any(|k| k.alg.is_none()) {
+        ftlog::warn!(
+            "[route.jwt] a JWKS key has no \"alg\"; tokens signed with any algorithm of that key type are accepted (set allowed_algs to restrict)"
+        );
+    }
+    for a in &j.allowed_algs {
+        if !crate::jwt_verify::SUPPORTED_ALGS.contains(&a.as_str()) {
+            return Err(err(format!(
+                "[route.jwt] allowed_algs: unsupported algorithm {a}"
+            )));
+        }
+    }
     let text_resp = |status: u16, body: &'static [u8], www: Option<&'static [u8]>| {
         let mut h = vec![(
             Bytes::from_static(b"content-type"),
@@ -607,6 +816,7 @@ fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> 
         keys,
         issuer: j.issuer.clone(),
         audiences: j.audiences.clone(),
+        allowed_algs: j.allowed_algs.clone(),
         header: j
             .header
             .to_ascii_lowercase()
@@ -737,7 +947,154 @@ status = 200
             (b"origin", b"https://b.example"),
             (b"access-control-request-method", b"POST"),
         ];
+        // 一覧に無いオリジン・プリフライトでない要求は action のまま（このルートは `resolved_backend` を
+        // 持たないので写しも無い）
         assert!(p.select(b"OPTIONS", &other, true).is_none());
         assert!(p.select(b"GET", &hs, true).is_none());
+    }
+
+    fn cors_route(action: &str, cors: CorsConfig) -> Route {
+        let mut route: Route = toml::from_str(action).unwrap();
+        route.traffic = Some(TrafficConfig {
+            cors: Some(cors),
+            ..Default::default()
+        });
+        route
+    }
+
+    const RESPOND: &str = r#"
+[conditions]
+path = "/"
+[action]
+type = "Respond"
+status = 200
+"#;
+
+    fn respond_text(b: Option<Backend>) -> String {
+        match b {
+            Some(Backend::Respond(r)) => String::from_utf8_lossy(&r.h1_close).to_string(),
+            other => panic!("expected a fixed response, got {:?}", other),
+        }
+    }
+
+    /// 実際の応答（F-273）: 許可したオリジンには Access-Control-Allow-Origin・credentials・expose・Vary、
+    /// 許可しない・Origin の無い要求には Vary だけ
+    #[test]
+    fn cors_actual_response_headers_by_origin() {
+        let mut route = cors_route(
+            RESPOND,
+            CorsConfig {
+                allow_origins: vec!["https://a.example".into()],
+                expose_headers: vec!["X-Total".into()],
+                allow_credentials: true,
+                ..Default::default()
+            },
+        );
+        route.resolved_backend = Some(crate::config::Backend::Respond(Arc::new(
+            FixedResponse::new(200, vec![], Bytes::from_static(b"ok")),
+        )));
+        let p = resolve(&route, &HashMap::new(), |_, _| unreachable!())
+            .unwrap()
+            .unwrap();
+        let ok: [(&[u8], &[u8]); 1] = [(b"origin", b"https://a.example")];
+        let t = respond_text(p.select(b"GET", &ok, true));
+        assert!(
+            t.contains("access-control-allow-origin: https://a.example"),
+            "{t}"
+        );
+        assert!(t.contains("access-control-allow-credentials: true"), "{t}");
+        assert!(t.contains("access-control-expose-headers: X-Total"), "{t}");
+        assert!(t.contains("vary: Origin"), "{t}");
+        assert!(t.ends_with("ok"), "{t}");
+
+        let bad: [(&[u8], &[u8]); 1] = [(b"origin", b"https://evil.example")];
+        let t = respond_text(p.select(b"GET", &bad, true));
+        assert!(!t.contains("access-control-allow-origin"), "{t}");
+        assert!(t.contains("vary: Origin"), "{t}");
+        let t = respond_text(p.select(b"GET", &[], true));
+        assert!(!t.contains("access-control-allow-origin"), "{t}");
+    }
+
+    #[test]
+    fn cors_wildcard_has_no_vary_and_rejects_credentials() {
+        let mut route = cors_route(
+            RESPOND,
+            CorsConfig {
+                allow_origins: vec!["*".into()],
+                ..Default::default()
+            },
+        );
+        route.resolved_backend = Some(crate::config::Backend::Respond(Arc::new(
+            FixedResponse::new(200, vec![], Bytes::new()),
+        )));
+        let p = resolve(&route, &HashMap::new(), |_, _| unreachable!())
+            .unwrap()
+            .unwrap();
+        let any: [(&[u8], &[u8]); 1] = [(b"origin", b"https://x.example")];
+        let t = respond_text(p.select(b"GET", &any, true));
+        assert!(t.contains("access-control-allow-origin: *"), "{t}");
+        assert!(!t.contains("vary"), "{t}");
+        // Origin の無い要求は元の応答のまま（`None` = action）
+        let t = respond_text(p.select(b"GET", &[], true));
+        assert!(!t.contains("access-control"), "{t}");
+
+        route
+            .traffic
+            .as_mut()
+            .unwrap()
+            .cors
+            .as_mut()
+            .unwrap()
+            .allow_credentials = true;
+        assert!(resolve(&route, &HashMap::new(), |_, _| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn cors_reject_disallowed_returns_403() {
+        let mut route = cors_route(
+            RESPOND,
+            CorsConfig {
+                allow_origins: vec!["https://a.example".into()],
+                reject_disallowed: true,
+                ..Default::default()
+            },
+        );
+        route.resolved_backend = Some(crate::config::Backend::Respond(Arc::new(
+            FixedResponse::new(200, vec![], Bytes::new()),
+        )));
+        let p = resolve(&route, &HashMap::new(), |_, _| unreachable!())
+            .unwrap()
+            .unwrap();
+        let bad: [(&[u8], &[u8]); 1] = [(b"origin", b"https://evil.example")];
+        let Some(Backend::Respond(r)) = p.select(b"GET", &bad, true) else {
+            panic!("expected 403");
+        };
+        assert_eq!(r.status, 403);
+        // Origin の無い要求（同一オリジン・curl）は拒否しない
+        let Some(Backend::Respond(r)) = p.select(b"GET", &[], true) else {
+            panic!("expected the action response");
+        };
+        assert_eq!(r.status, 200);
+    }
+
+    /// 固定応答以外の Backend の写しは cors_actual を持ち、レート制限の枠は元の設定と同じ
+    #[test]
+    fn cors_variant_shares_rate_limit_zone() {
+        let sec = Arc::new(SecurityConfig::default());
+        let base = Backend::Redirect(
+            Arc::from("https://x.example/"),
+            301,
+            false,
+            None,
+            sec.clone(),
+        );
+        let actual = Arc::new(crate::route_cors::CorsActual::new(
+            vec![(Bytes::from_static(b"vary"), Bytes::from_static(b"Origin"))],
+            false,
+        ));
+        let v = cors_variant(&base, Some(actual));
+        assert!(v.security().cors_actual.is_some());
+        assert!(base.security().cors_actual.is_none());
+        assert_eq!(v.security().rate_limit_zone, Arc::as_ptr(&sec) as usize);
     }
 }

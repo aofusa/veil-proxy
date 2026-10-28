@@ -135,7 +135,7 @@ pub(super) fn build_h1_request_head(
     final_path: &str,
     headers: &[h3::Header],
     security: &SecurityConfig,
-    added: &[(Vec<u8>, Vec<u8>)],
+    added: &crate::proxy::AddedHeaders,
 ) -> Vec<u8> {
     let mut req = Vec::with_capacity(512);
     req.extend_from_slice(method);
@@ -288,7 +288,10 @@ pub(super) fn drive_request_pump(
 
     // 3. クライアント END_STREAM 受信かつ全消化なら送信端を閉じて EOF 伝播。
     if ps.req_eof_seen && ps.req_pending.is_empty() && !ps.req_readable {
-        ps.req_tx = None;
+        // `finish` で正常な終わり（それ以外で閉じた（リセット・上限超過）ものは途中で切れた終わり。B-187）
+        if let Some(tx) = ps.req_tx.take() {
+            tx.finish();
+        }
         did_work = true;
     }
 
@@ -419,7 +422,14 @@ pub(super) fn drive_response_flush(
             return did_work;
         }
         match ps.resp_rx.try_recv() {
-            TryRecv::Item(RespMsg::Head { status, headers }) => {
+            TryRecv::Item(RespMsg::Head {
+                status,
+                mut headers,
+            }) => {
+                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。ストリーミング経路。CORS の無いルートは分岐だけ）
+                if let Some(c) = &ps.cors {
+                    c.apply_bytes(&mut headers);
+                }
                 // 本文の無い応答（リダイレクト・HEAD 等）は HEADERS に fin を載せる。
                 let fin = ps.resp_rx.is_finished();
                 match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin) {

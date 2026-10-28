@@ -20,6 +20,8 @@
 | 圧縮・キャッシュ・バッファリング | [docs/guide/ja/compression-cache.md](compression-cache.md) |
 | WASM 拡張 | [docs/guide/ja/wasm.md](wasm.md) |
 | API サーバライブラリ（Rust・C・Python） | [docs/guide/ja/library.md](library.md) |
+| Rust のヘルパークレート `veil-proxy-kit`（Cookie・CORS・JWT・セッション・DI・タスク） | [docs/guide/ja/library-kit.md](library-kit.md) |
+| API ライブラリを本番で動かす（推奨の設定） | [docs/guide/ja/library-production.md](library-production.md) |
 | VDS: 制御プレーンからの動的ルート配信 | [docs/guide/ja/vds.md](vds.md)（[スキーマ](../vds-schema.json)） |
 | ACME: 証明書の自動発行・更新 | [docs/guide/ja/acme.md](acme.md) |
 | Kubernetes（Helm chart、サイドカー、Istio / Linkerd） | [docs/guide/ja/kubernetes.md](kubernetes.md) |

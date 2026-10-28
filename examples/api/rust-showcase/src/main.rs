@@ -6,6 +6,8 @@
 //! - tower の層（`/admin` だけに認証、全体に応答ヘッダ）
 //! - L4 ネイティブハンドラ（TCP エコー・UDP エコー）
 //! - ストリーミング応答とトレーラ・ストリーミング受信（F-197）
+//! - multipart/form-data のフォームとファイルのアップロード（F-266）
+//! - 応答の圧縮（`[api] compression`・`[route.compression]`、ルート単位の `compress = false`。F-270）
 //! - config.toml の取り込みと Rust コードでの上書き
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,6 +128,38 @@ async fn stream_lines() -> Response {
     Response::stream(200, futures::stream::iter(chunks)).with_header("content-type", "text/plain")
 }
 
+/// 件数ぶんの JSON（`[api] compression = true` なら Accept-Encoding に応じて gzip・br で返る。F-270）
+#[veil::route(path = "/dataset/{count}", method = "GET", tags = ["demo"])]
+async fn dataset(count: u32) -> Json<serde_json::Value> {
+    Json(dataset_json(count))
+}
+
+fn dataset_json(count: u32) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = (0..count.min(10_000))
+        .map(|i| serde_json::json!({"id": i, "name": format!("item-{}", i), "price": i * 3, "tags": ["a", "b"]}))
+        .collect();
+    serde_json::json!({ "count": items.len(), "items": items })
+}
+
+/// 同じ本文でも圧縮しないルート（`compress = false`）
+#[veil::route(path = "/dataset-raw/{count}", method = "GET", compress = false, tags = ["demo"])]
+async fn dataset_raw(count: u32) -> Json<serde_json::Value> {
+    Json(dataset_json(count))
+}
+
+/// 長い行を断片で返す（ストリーミング応答の圧縮は断片ごとに flush する）
+#[veil::route(path = "/stream-big", method = "GET", tags = ["demo"])]
+async fn stream_big() -> Response {
+    let chunks = (1..=50).map(|i| {
+        BodyChunk::Data(bytes::Bytes::from(format!(
+            "line {:04} {}\n",
+            i,
+            "x".repeat(200)
+        )))
+    });
+    Response::stream(200, futures::stream::iter(chunks)).with_header("content-type", "text/plain")
+}
+
 /// 要求本文を届いた順に受け取り、大文字にして返す（ストリーミング受信 + 応答。HTTP/2 では全二重）
 #[veil::route(path = "/upper", method = "POST", streaming = true, tags = ["demo"])]
 async fn upper(req: &Request) -> Response {
@@ -134,6 +168,59 @@ async fn upper(req: &Request) -> Response {
         .take_body_stream()
         .map(|chunk| BodyChunk::Data(bytes::Bytes::from(chunk.to_ascii_uppercase())));
     Response::stream(200, body).with_header("content-type", "text/plain")
+}
+
+/// プロフィールのフォーム（multipart/form-data のファイルでないフィールド。F-266）
+#[derive(Debug, Deserialize, veil::Schema)]
+struct Profile {
+    #[validate(length(min = 1, max = 50))]
+    name: String,
+    #[validate(range(min = 0, max = 150))]
+    age: u32,
+}
+
+/// フォームとファイル（溜めた本文から。ファイルの中身は本文の切り出しで複製しない）
+#[veil::route(path = "/profile", method = "POST", tags = ["upload"])]
+async fn profile(
+    form: MultipartForm<Profile>,
+    avatar: UploadFile,
+    banner: Option<UploadFile>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": form.name,
+        "age": form.age,
+        "avatar": avatar.file_name(),
+        "avatar_type": avatar.content_type(),
+        "avatar_size": avatar.len(),
+        "banner_size": banner.map(|b| b.len()),
+    }))
+}
+
+/// 同じ名前の複数のファイル
+#[veil::route(path = "/files-upload", method = "POST", tags = ["upload"])]
+async fn files_upload(docs: Vec<UploadFile>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "names": docs.iter().map(|d| d.file_name()).collect::<Vec<_>>(),
+        "sizes": docs.iter().map(|d| d.len()).collect::<Vec<_>>(),
+    }))
+}
+
+/// 本文を届いた順に読み、ファイルは名前の無い一時ファイルへ書く（大きなファイルでもメモリに溜めない）
+#[veil::route(path = "/upload-stream", method = "POST", tags = ["upload"])]
+async fn upload_stream(mut form: Multipart) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut parts = Vec::new();
+    while let Some(mut part) = form.next_part().await? {
+        let name = part.name().unwrap_or("").to_string();
+        if part.file_name().is_some() {
+            let tmp = part.save_to_temp().await?;
+            parts.push(
+                serde_json::json!({"name": name, "file": tmp.file_name(), "size": tmp.len()}),
+            );
+        } else {
+            parts.push(serde_json::json!({"name": name, "value": part.text().await?}));
+        }
+    }
+    Ok(Json(serde_json::json!({ "parts": parts })))
 }
 
 /// 管理用（tower の層で認証する）
@@ -183,14 +270,20 @@ type VeilBody = veil::api::tower::VeilBody;
 
 impl<S> tower::Service<http::Request<VeilBody>> for RequireTokenService<S>
 where
-    S: tower::Service<http::Request<VeilBody>, Response = http::Response<VeilBody>> + Clone + 'static,
+    S: tower::Service<http::Request<VeilBody>, Response = http::Response<VeilBody>>
+        + Clone
+        + 'static,
     S::Future: 'static,
 {
     type Response = http::Response<VeilBody>;
     type Error = S::Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>>>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>>>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), S::Error>> {
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
         self.inner.poll_ready(cx)
     }
 

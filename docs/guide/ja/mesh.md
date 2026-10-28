@@ -67,6 +67,9 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
     書かないときも正規化する）。エスケープされたスラッシュの扱いで拒否する要求は 400（`DPE`）。
   - `remoteIpBlocks` は Envoy の「元のクライアントのアドレス」を使う: `use_remote_address` なら接続の相手、そうでなければ
     X-Forwarded-For の右から `xff_num_trusted_hops` 番目。クライアントが書ける左端は使わない。
+  - veil が評価できない RBAC の規則（CEL の条件、permission の `metadata`・`matcher`）は安全側に倒す: ALLOW のポリシーでは
+    一致させず、DENY のポリシーでは常に一致させる（`not_rule`・`not_id` の下では反転）。そのようなポリシーを受け取ると
+    ポリシー名付きで警告を出す。
 - 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
 - WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く。`FAIL_CLOSE` はモジュールが落ちたら 503）。
@@ -112,6 +115,9 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 
 ## 違い・制限
 
+- 相手の証明書は常にメッシュのトラストバンドルで検証する。xDS の TLS コンテキストに `match_subject_alt_names` が無い
+  （Linkerd では期待する ID が無い）ときは、そのバンドルの証明書なら何でも受け入れる。相手の認証はするが名前での認可は
+  しない（Envoy と同じ）ので、認可は RBAC・AuthorizationPolicy で行う。
 - veil が実装していない Envoy のフィルタは、任意（optional）の指定が無ければ拒否（NACK）する。Envoy と同じく前の設定の
   まま動く。`config_dump` は istioctl が読む項目を返し、全項目ではない。
 - X.509 v1 のクライアント証明書は受け付けない（webpki）。Envoy（BoringSSL）は受け付ける。メッシュが発行する証明書は v3。

@@ -50,7 +50,7 @@ curl -X POST -H "Authorization: Bearer changeme" https://proxy.example.com/__adm
 enabled = true
 path_prefix = "/__admin"    # 管理エンドポイントのプレフィックス
 secret = "changeme"         # 認証用Bearerトークン
-# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IPアドレス許可リスト（空の場合は全IP許可）
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IPアドレス許可リスト（空の場合は loopback だけ）
 ```
 
 ### Purge操作
@@ -97,7 +97,11 @@ curl -X POST "https://proxy.example.com/__admin/cache/purge?all=true" \
 | 管理API無効 | `404 Not Found` |
 | 成功 | `200 OK`、`{"purged": N}` |
 
-IP制限は認証より先にチェックされます。`allowed_ips` が空（デフォルト）の場合はすべてのIPを許可します。
+IP制限は認証より先にチェックされます。`allowed_ips` が空（デフォルト）の場合は loopback（と UDS のリスナー）だけを許可します
+（v0.10.0 より前はすべての IP）。すべてを許可するには `["0.0.0.0/0", "::/0"]` と書きます。
+
+秘密は定数時間で比べます。1 つの IP から 1 分間に 10 回認証に失敗すると、そのレートが下がるまでその IP は正しい秘密でも
+`401 Unauthorized` になります。
 
 | 形式 | 例 |
 |------|-----|

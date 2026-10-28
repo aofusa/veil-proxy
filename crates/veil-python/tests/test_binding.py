@@ -335,6 +335,33 @@ class TestOpenAPI(Base):
         self.assertEqual(veil._toml_literal(["x", 1]), '["x", 1]')
         self.assertEqual(veil._toml_literal({"k": 1}), '{"k" = 1}')
 
+    # F-260: 待ち受けの列（Listener・辞書）はネイティブの Config.add_listener に 1 個ずつ渡る
+    def test_listener_values(self):
+        calls = []
+
+        class FakeConfig:
+            def add_listener(self, listen, tls, **kw):
+                calls.append((listen, tls, kw))
+
+        for value in (
+            veil.Listener("0.0.0.0:8443", tls=True, http3=True, name="https"),
+            {"listen": "0.0.0.0:8082", "allow_http": False},
+        ):
+            veil.Listener.from_value(value).add_to(FakeConfig())
+        self.assertEqual(
+            calls,
+            [
+                ("0.0.0.0:8443", True, {"http3": True, "name": "https"}),
+                ("0.0.0.0:8082", False, {"allow_http": False}),
+            ],
+        )
+        with self.assertRaises(TypeError):
+            veil.Listener("0.0.0.0:1", alow_http=True)
+        with self.assertRaises(ValueError):
+            veil.Listener.from_value({"tls": True})
+        with self.assertRaises(TypeError):
+            veil.Listener.from_value("0.0.0.0:1")
+
 
 @unittest.skipUnless(HAVE_PYDANTIC, "pydantic 未インストール")
 class TestPydantic(Base):
@@ -388,6 +415,181 @@ class TestPydantic(Base):
         r = self.req(self.last())
         self.assertEqual(r.status, 202)
         self.assertEqual(self.j(r)["age"], 1)
+
+
+# F-266
+def _multipart(fields, boundary="XyZ"):
+    out = b""
+    for name, value, filename, ctype in fields:
+        disp = 'form-data; name="%s"' % name
+        if filename is not None:
+            disp += '; filename="%s"' % filename
+        out += b"--" + boundary.encode() + b"\r\ncontent-disposition: " + disp.encode() + b"\r\n"
+        if ctype:
+            out += b"content-type: " + ctype.encode() + b"\r\n"
+        out += b"\r\n" + value + b"\r\n"
+    return out + b"--" + boundary.encode() + b"--\r\n"
+
+
+class TestCompressFlags(Base):
+    # F-270: ルートと応答の圧縮の可否（圧縮そのものは Rust 側。ここでは Rust へ渡す値を確かめる）
+    def test_route_and_response_flags(self):
+        @self.app.get("/a")
+        def a():
+            return {"x": 1}
+
+        @self.app.get("/b", compress=False)
+        def b():
+            return {"x": 1}
+
+        self.assertEqual([r.compress for r in self.app.routes], [True, False])
+        self.assertTrue(veil.Response(b"x").compress)
+        self.assertFalse(veil.Response(b"x", compress=False).compress)
+        self.assertFalse(veil.JSONResponse({"a": 1}, compress=False).compress)
+        self.assertFalse(veil.StreamingResponse(iter([b"x"]), compress=False).compress)
+        self.assertTrue(veil.EventSourceResponse(iter([])).compress)
+
+
+class TestForms(Base):
+    MP = (("content-type", "multipart/form-data; boundary=XyZ"),)
+
+    def setUp(self):
+        super().setUp()
+
+        @self.app.post("/profile")
+        async def profile(
+            name: str = veil.Form(),
+            age: int = veil.Form(0),
+            tags: list[str] = veil.Form([]),
+            avatar: veil.UploadFile = veil.File(),
+            extra: veil.UploadFile = None,
+        ):
+            data = await avatar.read()
+            return {
+                "name": name,
+                "age": age,
+                "tags": tags,
+                "file": avatar.filename,
+                "ct": avatar.content_type,
+                "len": len(data),
+                "size": avatar.size,
+                "extra": extra.filename if extra else None,
+            }
+
+        self.route = self.last()
+
+    def test_multipart_fields_and_file(self):
+        body = _multipart(
+            [
+                ("name", b"al", None, None),
+                ("age", b"7", None, None),
+                ("tags", b"a", None, None),
+                ("tags", b"b", None, None),
+                ("avatar", b"\x00\x01png", "a.png", "image/png"),
+            ]
+        )
+        r = self.req(self.route, body=body, headers=self.MP)
+        self.assertEqual(r.status, 200, r.body)
+        self.assertEqual(
+            self.j(r),
+            {"name": "al", "age": 7, "tags": ["a", "b"], "file": "a.png", "ct": "image/png", "len": 5, "size": 5, "extra": None},
+        )
+
+    def test_missing_and_invalid(self):
+        r = self.req(self.route, body=_multipart([("age", b"x", None, None)]), headers=self.MP)
+        self.assertEqual(r.status, 422)
+        locs = [e["loc"] for e in self.j(r)["detail"]]
+        self.assertIn(["body", "name"], locs)
+        self.assertIn(["body", "age"], locs)
+        self.assertIn(["body", "avatar"], locs)
+
+    def test_malformed_is_400(self):
+        r = self.req(self.route, body=b"--XyZ\r\nbroken", headers=self.MP)
+        self.assertEqual(r.status, 400)
+
+    def test_urlencoded_and_bytes_file(self):
+        @self.app.post("/login")
+        def login(user: str = veil.Form(), remember: bool = veil.Form(False)):
+            return {"user": user, "remember": remember}
+
+        r = self.req(
+            self.last(), body=b"user=a%20b&remember=on", headers=(("content-type", "application/x-www-form-urlencoded"),)
+        )
+        self.assertEqual(self.j(r), {"user": "a b", "remember": True})
+
+        @self.app.post("/raw")
+        def raw(doc: bytes = veil.File(), docs: list[veil.UploadFile] = veil.File([])):
+            return {"n": len(doc), "docs": [d.filename for d in docs]}
+
+        body = _multipart([("doc", b"abc", "d.txt", None), ("docs", b"1", "x", None), ("docs", b"2", "y", None)])
+        r = self.req(self.last(), body=body, headers=self.MP)
+        self.assertEqual(self.j(r), {"n": 3, "docs": ["x", "y"]})
+
+    def test_openapi_multipart(self):
+        op = self.route.openapi()
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["properties"]["avatar"], {"type": "string", "format": "binary"})
+        self.assertEqual(schema["properties"]["tags"]["type"], "array")
+        self.assertEqual(schema["properties"]["age"], {"type": "integer", "default": 0})
+        self.assertEqual(schema["required"], ["name", "avatar"])
+        self.assertIn("422", op["responses"])
+
+
+class TestRouteOptions(unittest.TestCase):
+    # B-174: serve_dir の route_options の TOML 変換と、変換できない値の英語のエラー
+    def test_route_options_become_toml(self):
+        self.assertEqual(veil._toml_literal({"enabled": True}), '{"enabled" = true}')
+        self.assertEqual(veil._toml_literal([1, "a"]), '[1, "a"]')
+
+    def test_unconvertible_value_has_an_english_message(self):
+        with self.assertRaises(TypeError) as cm:
+            veil._toml_literal(object())
+        msg = str(cm.exception)
+        self.assertTrue(msg.startswith("cannot convert to TOML"), msg)
+        self.assertTrue(msg.isascii(), msg)
+
+
+class TestGrpcDefaultAppWarning(unittest.TestCase):
+    # B-176: 既定の App に gRPC を登録したまま別の App を run したら警告する
+    def setUp(self):
+        import veil.grpc
+
+        self.default = veil._default_app
+        self.saved = (list(self.default.grpc_methods), self.default.grpc_health)
+        self.grpc = veil.grpc
+
+    def tearDown(self):
+        self.default.grpc_methods[:] = self.saved[0]
+        self.default.grpc_health = self.saved[1]
+
+    def _warnings(self, app):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            app._warn_grpc_on_default_app()
+        return [x for x in w if issubclass(x.category, RuntimeWarning)]
+
+    def test_warns_when_another_app_is_run(self):
+        self.grpc.unary_unary("/demo.Demo/Hello")(lambda req, ctx: req)
+        w = self._warnings(App())
+        self.assertEqual(len(w), 1)
+        msg = str(w[0].message)
+        self.assertIn("veil.grpc.Server(app)", msg)
+        self.assertTrue(msg.isascii(), msg)
+
+    def test_health_on_default_app_also_warns(self):
+        self.grpc.add_health()
+        self.assertEqual(len(self._warnings(App())), 1)
+
+    def test_no_warning_when_registered_on_the_app(self):
+        app = App()
+        self.grpc.unary_unary("/demo.Demo/Hello", app=app)(lambda req, ctx: req)
+        self.assertEqual(self._warnings(app), [])
+
+    def test_no_warning_when_the_default_app_is_run(self):
+        self.grpc.unary_unary("/demo.Demo/Hello")(lambda req, ctx: req)
+        self.assertEqual(self._warnings(self.default), [])
 
 
 if __name__ == "__main__":

@@ -24,6 +24,10 @@
 // F-210: C・Python 用。
 /// Blocking gRPC handlers (for C and Python).
 pub mod blocking;
+// F-267
+mod channel;
+// F-265
+mod describe;
 pub mod health;
 pub mod reflection;
 mod web;
@@ -44,7 +48,8 @@ use super::stream::{BodyChunk, RequestBodyStream};
 use crate::grpc::compression::GrpcCompression;
 use crate::grpc::framing::GrpcFrameDecoder;
 use bytes::BufMut;
-use futures::{Stream, StreamExt};
+pub use futures::Stream;
+use futures::StreamExt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -53,11 +58,17 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+// F-265
+#[cfg(feature = "openapi")]
+pub(crate) use describe::add_to_openapi;
+pub use describe::MethodKind;
+
 /// The compression method of a response (`Response::with_compression`).
 pub use crate::grpc::compression::GrpcCompression as Compression;
 pub use crate::grpc::status::GrpcStatusCode as Code;
 /// The buffer types used by codec implementations (such as the generated `ProstCodec`).
 pub use bytes::{Bytes, BytesMut};
+pub use channel::{Channel, IntoRequest, IntoStreamingRequest, Streaming as ClientStreaming};
 
 // ===================== Codec =====================
 
@@ -261,6 +272,12 @@ impl Status {
     /// The message carried in `grpc-message`.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    // F-268: クライアント（veil::api::grpc::Channel）が受けた状態の trailers を読む
+    /// The extra metadata (trailers other than `grpc-status` / `grpc-message`; on a client, those of the response).
+    pub fn metadata(&self) -> &[(Bytes, Bytes)] {
+        &self.metadata
     }
 
     /// Metadata to add to the trailers (names are lowercased).
@@ -619,6 +636,12 @@ impl<T> Stream for Streaming<T> {
             }
             if this.body_done {
                 this.finished = true;
+                // B-187: クライアントのリセット・切断で切れた要求のストリームを、正常な終わりに見せない
+                if this.body.is_aborted() {
+                    return Poll::Ready(Some(Err(Status::cancelled(
+                        "request stream ended before the client finished it",
+                    ))));
+                }
                 if this.text.as_ref().is_some_and(|d| d.finish().is_err()) {
                     return Poll::Ready(Some(Err(Status::internal(
                         "grpc-web-text request body is not valid base64",
@@ -1088,7 +1111,9 @@ fn with_preflight(func: HandlerFn) -> HandlerFn {
     })
 }
 
-fn grpc_route(mut app: App, path: &str, func: HandlerFn) -> App {
+fn grpc_route(mut app: App, path: &str, kind: MethodKind, func: HandlerFn) -> App {
+    // F-265: OpenAPI は gRPC の記述子と種類から別に作る（ここでは一般の操作として載せない）
+    describe::record_kind(path, kind);
     let meta = OperationMeta {
         operation_id: path.trim_start_matches('/').replace(['/', '.'], "_"),
         hidden: true,
@@ -1192,7 +1217,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::Unary, func)
     }
 
     /// Registers a server-streaming RPC (one request, a stream of responses).
@@ -1232,7 +1257,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::ServerStreaming, func)
     }
 
     /// Registers a client-streaming RPC (a stream of requests, one response).
@@ -1284,7 +1309,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::ClientStreaming, func)
     }
 
     // F-209: HTTP/2・HTTP/3 とも全二重。
@@ -1320,7 +1345,7 @@ impl App {
                 }
             })
         });
-        grpc_route(self, path, func)
+        grpc_route(self, path, MethodKind::BidiStreaming, func)
     }
 }
 

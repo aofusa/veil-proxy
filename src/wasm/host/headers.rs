@@ -148,8 +148,8 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
 
     if end > data.len() {
         return None;
@@ -181,7 +181,7 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
     };
 
     let mem_data = memory.data_mut(caller);
-    let start = ptr as usize;
+    let start = ptr as u32 as usize;
     let end = start + data.len();
 
     if end > mem_data.len() {
@@ -239,8 +239,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 let data = memory.data_mut(&mut caller);
 
-                let ptr_offset = return_map_ptr as usize;
-                let size_offset = return_map_size as usize;
+                let ptr_offset = return_map_ptr as u32 as usize;
+                let size_offset = return_map_size as u32 as usize;
 
                 if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -278,8 +278,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data(&caller);
-            let start = map_ptr as usize;
-            let end = start + map_size as usize;
+            let start = map_ptr as u32 as usize;
+            let end = start + map_size as u32 as usize;
 
             if end > data.len() {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
@@ -370,8 +370,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 let data = memory.data_mut(&mut caller);
 
-                let ptr_offset = return_value_ptr as usize;
-                let size_offset = return_value_size as usize;
+                let ptr_offset = return_value_ptr as u32 as usize;
+                let size_offset = return_value_size as u32 as usize;
 
                 if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;

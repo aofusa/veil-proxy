@@ -36,3 +36,7 @@ path 依存では依存クレートの lint が cap されず、`cfg_aliases!` �
 
 `use std::ptr;` は Linux の `recvmmsg` 経路でしか使われず、BSD では未使用警告になる（path 依存では表示される）。
 使用箇所を `std::ptr::null_mut` に書き換えて import を削除した。
+
+## 照合する勧告（F-277）
+
+- advisory-repo: quinn-rs/quinn（上流のリポジトリの勧告も照合する。quinn-udp はこのリポジトリの一部）

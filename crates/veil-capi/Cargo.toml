@@ -18,7 +18,7 @@ crate-type = ["cdylib", "staticlib"]
 veil = { package = "veil-proxy", path = "../..", default-features = false, features = [
     "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
     "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
-    "handler", "openapi", "macro", "grpc-handler", "l4-handler",
+    "handler", "openapi", "openapi-ui-embedded", "macro", "grpc-handler", "l4-handler",
 ] }
 bytes = "1"
 serde_json = "1"

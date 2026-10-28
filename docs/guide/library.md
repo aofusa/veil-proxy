@@ -14,6 +14,12 @@ Three front ends share the same implementation:
 | C API | [`crates/veil-capi`](../../crates/veil-capi/README.md) (`libveil.so` / `libveil.a`, `veil.h`) | C, C++ and any language with a C FFI |
 | Python | [`crates/veil-python`](../../crates/veil-python/README.md) (wheel, `import veil`) | FastAPI-style decorators |
 
+For Rust, the separate crate [`veil-proxy-kit`](library-kit.md) adds cookies, redirects, static files, CORS,
+authentication (JWT), sessions, GraphQL, dependency injection and background tasks.
+
+For the settings to use in production (listen address, access log, OpenAPI, compression, threads, file descriptors,
+shutdown, metrics), see [library-production.md](library-production.md).
+
 - [Architecture](#architecture)
 - [Depending on veil](#depending-on-veil)
 - [Configuration in library mode](#configuration-in-library-mode)
@@ -23,6 +29,7 @@ Three front ends share the same implementation:
 - [Shared state](#shared-state)
 - [tower layers and tokio libraries](#tower-layers-and-tokio-libraries)
 - [tokio compatibility](#tokio-compatibility)
+- [HTTP client](#http-client)
 - [GraphQL](#graphql)
 - [L4 (TCP/UDP) handlers](#l4-tcpudp-handlers)
 - [TLS and HTTP/3](#tls-and-http3)
@@ -62,6 +69,7 @@ Three front ends share the same implementation:
 | `handler` | native `Handler` routes, `Request`/`Response`, configuration builder, library default configuration (implies `http2`) |
 | `macro` | `#[veil::route]`, `#[veil::main]`, `#[veil::l4_handler]`, `#[derive(veil::Schema)]` (implies `handler`) |
 | `openapi` | OpenAPI 3.1 generation, `/openapi.json` and Swagger UI (implies `macro`) |
+| `openapi-ui-embedded` | bundles the Swagger UI assets so `/docs` works offline (about 0.8 MB; part of `api`, `api-core`, the C library and the Python wheel; implies `openapi`) |
 | `tokio-compat` | tokio-free tokio compatibility layer (`veil::tokio`, `App::tokio_service`, [`veil::api::tokio_compat`]); see [tokio compatibility](#tokio-compatibility) |
 | `tokio-compat-bridge` | the alternative to `tokio-compat`: bundles a real tokio runtime and runs futures on it (mutually exclusive with `tokio-compat`) |
 | `l4-handler` | Rust functions as TCP/UDP handlers on `[[l4]]` listeners (implies `l4-proxy`) |
@@ -85,7 +93,7 @@ allocator is chosen). API reference: [docs.rs/veil-proxy](https://docs.rs/veil-p
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 # or the repository / a local checkout:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -206,7 +214,7 @@ Then the handler routes and the built-in OpenAPI routes are injected, and all ro
 (see [Routing macros](#routing-macros)).
 
 The same composition runs again on every SIGHUP reload, so builder and environment overrides **survive a
-reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[tls]`, `[[l4]]` and the thread
+reload**; only the contents of `config.toml` are re-read. `[server] listen` / `listen_cleartext`, `[[listener]]`, `[tls]`, `[[l4]]` and the thread
 count still cannot change without a restart (same as the proxy).
 
 ### Builder
@@ -224,7 +232,7 @@ let config = Config::load()?            // or Config::new() (defaults only), Con
 ```
 
 Typed setters: `listen_cleartext` (plaintext address), `listen` (TLS address), `allow_http`, `allow_h2c`, `secure_redirect`, `threads`, `http2_enabled`, `log_level`, `openapi_enabled`,
-`openapi_path`, `openapi_json_path`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
+`openapi_path`, `openapi_json_path`, `openapi_docs_ui`, `openapi_docs_cdn_url`, `openapi_title`, `openapi_version`, `max_body_size`, `handler_threads`,
 `grpc_max_message_size`, `grpc_response_compression`, `grpc_response_compression_min_size`, `tls(cert, key)` and `http3(listen)`. `set("key = value")` and `set_value(path, toml_value)` reach every other
 key. `Config::to_toml_string()` returns the composed result (before environment overrides and route injection)
 for debugging.
@@ -236,8 +244,10 @@ for debugging.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `openapi_enabled` | `true` | publish `/openapi.json` and the Swagger UI |
-| `openapi_path` | `"/docs"` | Swagger UI path (loads `swagger-ui-dist` from unpkg.com in the browser) |
+| `openapi_path` | `"/docs"` | Swagger UI path |
 | `openapi_json_path` | `"/openapi.json"` | OpenAPI document path |
+| `openapi_docs_ui` | `"embedded"` | how `/docs` serves Swagger UI: `"embedded"` (bundled assets, no network access), `"cdn"` (the browser loads `swagger-ui-dist` from `openapi_docs_cdn_url`) or `"off"` (only `/openapi.json`). Without the `openapi-ui-embedded` feature the default is `"cdn"` and `"embedded"` is a configuration error |
+| `openapi_docs_cdn_url` | `"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.34.0"` | base URL of `swagger-ui-dist` for `openapi_docs_ui = "cdn"` |
 | `openapi_title` | `"veil API"` | `info.title` |
 | `openapi_version` | `"0.1.0"` | `info.version` (your API's version) |
 | `openapi_description` | none | `info.description` |
@@ -249,6 +259,27 @@ for debugging.
 | `grpc_response_compression` | `"none"` | compress gRPC response messages: `"none"`, `"gzip"` or `"deflate"` (only when the client lists it in `grpc-accept-encoding`; needs the `compression` feature) |
 | `grpc_response_compression_min_size` | `1024` | gRPC response messages smaller than this many bytes are not compressed |
 | `grpc_web_cors_origins` | `[]` | origins allowed to call gRPC methods with gRPC-Web from a browser (`["*"]` for any); empty sends no CORS headers and rejects preflights with 403 |
+| `upgrade_idle_timeout_secs` | `300` | seconds a `read` on an upgraded HTTP/1.1 connection may wait (0 = no limit) |
+| `websocket_max_message_size` | `16777216` | maximum size of an assembled WebSocket message (larger closes with 1009) |
+| `websocket_max_frame_size` | `16777216` | maximum size of one WebSocket frame |
+| `websocket_ping_interval_secs` | `30` | seconds of silence after which the server sends a Ping on a WebSocket (0 = none) |
+| `websocket_idle_timeout_secs` | `120` | seconds without a received frame (a Pong counts) before a WebSocket is closed with 1001 (0 = no limit) |
+| `websocket_compression` | `false` | negotiate permessage-deflate (RFC 7692) when the client offers it (needs the `compression` feature) |
+| `openapi_websocket` | `true` | list WebSocket routes in the OpenAPI document |
+| `openapi_grpc` | `true` | list gRPC methods in the OpenAPI document (see [gRPC in OpenAPI](#grpc-in-openapi)) |
+| `openapi_grpc_builtin` | `false` | also list the built-in `grpc.health.v1` and `grpc.reflection.*` methods |
+| `python_event_loops` | `1` | Python: number of persistent event loops for `async def` handlers and WebSockets |
+| `python_event_loop` | `"auto"` | Python: `"auto"` (uvloop when installed), `"asyncio"` or `"uvloop"` |
+| `python_event_loop_queue` | `65536` | Python: calls that may wait for one loop (503 when full) |
+| `python_async_mode` | `"loop"` | Python: where `async def` handlers run: `"loop"` (persistent loop) or `"pool"` (as before 0.10) |
+| `multipart_max_parts` | `100` | maximum number of parts of a `multipart/form-data` body (more gives 413) |
+| `multipart_max_field_size` | `1048576` | maximum size of a part that is not a file |
+| `multipart_max_file_size` | `0` | maximum size of a file part (`0` = `max_body_size`) |
+| `multipart_max_total_size` | `0` | maximum size of a whole `multipart/form-data` body, also on streamed routes (`0` = `max_body_size`, or `multipart_max_file_size` when that is larger) |
+| `multipart_max_header_size` | `8192` | maximum size of the headers of one part |
+| `multipart_spool_threshold` | `1048576` | Python `UploadFile` and C `VEIL_ROUTE_FORM`: larger files are written to a temporary file instead of memory |
+| `upload_tmp_dir` | OS temp dir | directory of the anonymous temporary files for uploads (added to the Landlock / unveil write paths) |
+| `compression` | `false` | compress handler responses with br or gzip when the client accepts it: handler routes without their own `[route.compression]` get `{ preferred_encodings = ["br", "gzip"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` (needs the `compression` feature; see [Response compression](#response-compression)) |
 
 ## Routing macros
 
@@ -266,6 +297,7 @@ async fn get_user(id: u64, verbose: Option<bool>) -> Result<Json<User>, ApiError
 | `status = 201` | default success status for OpenAPI |
 | `offload = true/false` | run on the handler pool; default `true` for a sync `fn`, `false` for `async fn` |
 | `hidden = true` | leave the route out of the OpenAPI document |
+| `compress = false` | never compress this route's responses (see [Response compression](#response-compression)) |
 
 ### Arguments (FastAPI style)
 
@@ -276,7 +308,8 @@ Arguments are bound by type and name:
 | `&Request` / `Request` | the whole request |
 | `Json<T>` | JSON body |
 | `Query<T>` | the whole query string deserialized into `T` |
-| `Form<T>` | `application/x-www-form-urlencoded` body |
+| `Form<T>` | `application/x-www-form-urlencoded` body (or the text fields of a `multipart/form-data` body) |
+| `MultipartForm<T>`, `UploadFile`, `Vec<UploadFile>`, `Option<UploadFile>`, `Multipart` | `multipart/form-data` body (see [Forms and file uploads](#forms-and-file-uploads)) |
 | `State<T>` | shared state registered with `App::state` |
 | `Headers`, `Bytes` (alias `Body`) | request headers / raw body |
 | a name that matches `{name}` in the path | path parameter, parsed with `FromStr` |
@@ -304,7 +337,7 @@ route settings to it.
 
 `Request` gives `method()`, `path()`, `query()`, `query_param(name)`, `header(name)`, `headers()`, `body()`
 (`&Bytes`), `text()`, `json::<T>()`, `param(name)`, `param_as::<T>(name)`, `client_ip()`, `version()`
-(HTTP/1.1, 2 or 3) and `state::<T>()`.
+(HTTP/1.1, 2 or 3), `is_tls()` (received over TLS; HTTP/3 always) and `state::<T>()`.
 
 A handler may return anything that implements `IntoResponse`:
 
@@ -338,6 +371,11 @@ the handler runs as soon as the headers arrive and request and response flow in 
 HTTP/1.1 and HTTP/3 the body is read first and handed over as one chunk. `max_body_size` does not apply to a
 streaming route over HTTP/2 (limit it while reading). Both directions pass through tower layers unchanged.
 
+The body stream also ends (`None`) when the body is cut off before it is complete: the client disconnects, resets
+the stream or times out, or (HTTP/1.1) fewer bytes than `Content-Length` arrive. Check
+`RequestBodyStream::is_aborted()` after the end before treating the body as complete, for example before committing
+an uploaded file. `Multipart` and gRPC request streams report a cut-off body as an error by themselves.
+
 ```rust
 #[veil::route(path = "/upper", method = "POST", streaming = true)]
 async fn upper(req: &Request) -> Response {
@@ -347,6 +385,238 @@ async fn upper(req: &Request) -> Response {
     Response::stream(200, body).with_header("content-type", "text/plain")
 }
 ```
+
+### Protocol upgrades (HTTP/1.1)
+
+A handler can take over the connection with `101 Switching Protocols`. `Request::upgrade_protocol()` returns the
+`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; always `None` on HTTP/2 and
+HTTP/3), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
+`veil::api::upgrade::Upgraded` connection:
+
+```rust
+use veil::api::upgrade::Upgraded;
+
+#[veil::route(path = "/echo", method = "GET")]
+async fn echo(req: Request) -> Response {
+    if req.upgrade_protocol() != Some(&b"x-echo"[..]) {
+        return Response::error(426, "Upgrade Required");
+    }
+    Response::switching_protocols("x-echo", |mut up: Upgraded| async move {
+        let mut buf = bytes::BytesMut::with_capacity(4096);
+        loop {
+            let (res, b) = up.read(buf).await;          // ownership-passing read, as in veil's runtime
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => { if up.write_all(buf.split().freeze()).await.is_err() { break } }
+                _ => break,
+            }
+        }
+    })
+}
+```
+
+- `Upgraded` is the same type for plaintext, rustls and kTLS connections: `read(BytesMut)`, `readable()` (safe to
+  drop; `select` on it rather than on `read`, whose data would be lost on io_uring if dropped), `write_all(Bytes)`,
+  `write_vectored_all(&[Bytes])` (header + payload in one write), `shutdown()`, `client_ip()` and
+  `shutdown_signal()` (resolves when graceful shutdown starts; connections still open after
+  `[server] graceful_shutdown_timeout_secs` are dropped).
+- Bytes the client sent right after the request headers (even in the same packet) are returned by the first `read`.
+- The 101 carries `Connection: Upgrade`, `Upgrade: <protocol>` and the headers you add with `with_header`; it has no
+  `Content-Length` and the connection never returns to HTTP. The access log records the 101.
+- veil answers 400 instead when the request is not an upgrade request (no `Connection: upgrade` / `Upgrade`),
+  is HTTP/1.0, has a body, or arrived over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220 extended CONNECT is not supported).
+  `h2c` is reserved (500 and a warning).
+- An upgraded connection still counts against `[security] max_concurrent_connections`. `[api] upgrade_idle_timeout_secs`
+  (default 300; 0 = none) makes a `read` that waits longer fail with `TimedOut`.
+- With `tokio-compat`, `up.into_tokio_io()` returns an object implementing `veil::tokio::io::{AsyncRead, AsyncWrite}`
+  for tokio-based protocol libraries (one extra copy through a task on the same worker).
+- C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)` with the L4 TCP callbacks (`on_connect` / `on_data` /
+  `on_close`, `veil_l4_write`). Rust can do the same with `Upgraded::serve_blocking` (`l4-handler`).
+
+Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/).
+
+### WebSocket
+
+`veil::api::ws` terminates WebSocket (RFC 6455) in a handler. `WebSocketUpgrade` is an extractor that checks the
+handshake (HTTP/1.1, `GET`, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a 16-byte
+`Sec-WebSocket-Key`); a malformed handshake is answered with 400 and another version with 426 and
+`Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
+connection:
+
+```rust
+use veil::api::ws::{Message, WebSocket, WebSocketUpgrade};
+
+#[veil::route(path = "/ws", method = "GET", ws_protocols = ["chat.v1"])]
+async fn ws(upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .protocols(["chat.v1"])          // optional: Sec-WebSocket-Protocol selection
+        .max_message_size(1 << 20)       // optional: default [api] websocket_max_message_size
+        .on_upgrade(|mut ws: WebSocket| async move {
+            while let Some(Ok(msg)) = ws.recv().await {
+                match msg {
+                    Message::Text(_) | Message::Binary(_) => { if ws.send(msg).await.is_err() { break } }
+                    Message::Close(_) => break,
+                    _ => {}              // Pings are answered automatically
+                }
+            }
+        })
+}
+```
+
+- `Message` is `Text(Utf8Bytes) | Binary(Bytes) | Ping(Bytes) | Pong(Bytes) | Close(Option<CloseFrame>)`.
+  `Utf8Bytes` wraps `Bytes` (validated once, cheap to clone).
+- `WebSocket`: `recv()`, `send(msg)`, `send_batch(&[msg])` (one write), `flush()`, `ping(bytes)`,
+  `close(code, reason)`, `protocol()`, `client_ip()` and `split()`, which returns a `WsReceiver` (drives the
+  connection; keep calling `recv`) and a `WsSender` (`Clone + Send`, a queue any task or thread can push to without
+  waiting, e.g. to broadcast; up to 16 MiB queued).
+- veil handles the protocol: fragmented messages are reassembled (control frames may be interleaved), text is
+  checked as UTF-8 across fragments (1007), unmasked client frames, reserved bits, unknown opcodes and bad control
+  frames close with 1002, oversized messages with 1009, and a received Close is answered with the same code. When
+  your function returns, unsent messages are flushed and the closing handshake is completed (1000). Graceful
+  shutdown sends Close 1001 (`recv` returns `Message::Close(Some(1001))`).
+- Frames are decoded in place in a pooled receive buffer (the mask is removed 8 bytes at a time and payloads are
+  `Bytes` slices); a waiting connection holds no buffer. Server frames are written header + payload with one
+  vectored write, and replies to messages that arrived together (pipelining) are written together before the next read.
+- `auto_pong(false)` hands Pings to you without answering them. `[api] websocket_ping_interval_secs` (default 30) sends
+  Pings and `websocket_idle_timeout_secs` (default 120) closes connections that stay silent; a client that answers the
+  Pings stays open. A frame is buffered as it arrives, not reserved at its declared length.
+- `origin(&["https://app.example"])` accepts only those `Origin` values (403 otherwise). The default does not check
+  the origin: browsers send cookies with cross-site WebSocket handshakes, so restrict it if you authenticate with
+  cookies (cross-site WebSocket hijacking).
+- permessage-deflate (RFC 7692) is negotiated only with `[api] websocket_compression = true` (default off; the
+  decompressed size is limited by `websocket_max_message_size`).
+- WebSocket works on HTTP/1.1 only: over HTTP/2 and HTTP/3 the handshake is answered with 400 (RFC 8441 / RFC 9220
+  are not supported).
+- Metrics (`metrics` feature): `veil_proxy_websocket_connections` (open connections) and
+  `veil_proxy_websocket_messages_total{direction="received"|"sent"}`.
+- The connection counts against `[security] max_concurrent_connections` like any upgraded connection.
+
+**OpenAPI.** WebSocket routes are listed (unless `[api] openapi_websocket = false`) as a `GET` operation with the
+responses 101, 400 and 426, the `Sec-WebSocket-Protocol` header parameter (from `ws_protocols`) and an
+`x-veil-websocket` extension: `subprotocols`, `maxMessageSize`, and with `ws_receive = T` / `ws_send = T`
+(`derive(veil::Schema)` types) the message schemas `receive` (client to server) and `send` (server to client) and
+`messageFormat: "text/json"`. The Swagger UI disables "Try it out" for these operations. `upgrade.messages::<In, Out>()
+.validate(true)` also checks received text messages against `In` and closes with 1007 when they do not deserialize.
+
+**tokio libraries.** `Upgraded::into_tokio_io()` (`tokio-compat`) lets tokio-tungstenite or fastwebsockets run on
+`veil::tokio` with a plain `Response::switching_protocols`. axum's `WebSocketUpgrade` needs hyper's `OnUpgrade` and
+does not work through the tower bridge; use `veil::api::ws` or tokio-tungstenite.
+
+**C.** `veil_ws_accept(req, resp, &callbacks, ud)` inside a route callback turns the response into the 101 (or a
+400 / 426 with `VEIL_ERR_STATE`); `on_open`, `on_message(ws, opcode, data, len, ud)` and `on_close(ws, code, ud)`
+run on the handler pool, one at a time per connection. `veil_ws_send(ws, VEIL_WS_TEXT | VEIL_WS_BINARY, data, len)`
+(copies; any thread) and `veil_ws_close(ws, code)` queue frames. Describe the route in OpenAPI by passing an
+Operation Object with `x-veil-websocket` to `veil_register_route_ex`.
+
+Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/) (`/ws` echo, `/chat` broadcast with
+`split`, `/typed` JSON messages); C: `/ws` in [examples/api/c-features/](../../examples/api/c-features/).
+
+## Forms and file uploads
+
+veil parses `multipart/form-data` (RFC 7578) itself, with no extra dependency. Buffered parts are slices of the body
+(no copy); a streamed body is parsed as it arrives.
+
+```rust
+use veil::api::prelude::*;
+
+#[derive(Deserialize, veil::Schema)]
+struct Profile { name: String, #[validate(range(min = 0, max = 150))] age: u32 }
+
+// the body is buffered (up to [api] max_body_size); text fields go into T, files are matched by argument name
+#[veil::route(path = "/profile", method = "POST")]
+async fn profile(form: MultipartForm<Profile>, avatar: UploadFile, banner: Option<UploadFile>) -> Json<Value> {
+    Json(json!({"name": form.name, "avatar": avatar.file_name(), "size": avatar.len()}))
+}
+
+#[veil::route(path = "/docs", method = "POST")]
+async fn docs(docs: Vec<UploadFile>) -> Json<Vec<usize>> { Json(docs.iter().map(|d| d.len()).collect()) }
+
+// streamed: the route is made `streaming = true` automatically and files never sit in memory
+#[veil::route(path = "/upload", method = "POST")]
+async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
+    while let Some(mut part) = form.next_part().await? {
+        if part.file_name().is_some() {
+            let tmp = part.save_to_temp().await?;   // anonymous file in [api] upload_tmp_dir; or part.save_to(path)
+            // tmp.file(), tmp.len(), tmp.into_file()
+        } else {
+            let value = part.text().await?;          // or part.chunk().await / part.bytes().await
+        }
+    }
+    Ok(Json(json!({"ok": true})))
+}
+```
+
+- `MultipartForm<T>` deserializes the text fields like `Form<T>` (and validates `T` when it derives `Schema`);
+  `Form<T>` also accepts a multipart body and ignores its files. A missing file gives 422 with
+  `loc = ["body", name]`, a malformed body 400 and a body over the `[api] multipart_*` limits 413
+  (`{"detail": "..."}`).
+- `Multipart` cannot be combined with the buffered extractors. Streamed routes are not limited by
+  `max_body_size`; a multipart body is limited per part and as a whole (`multipart_max_total_size`); this holds on HTTP/1.1 (bodies with a `Content-Length`; chunked bodies
+  are buffered), HTTP/2 and HTTP/3. The anonymous files (`O_TMPFILE` on Linux, created and removed elsewhere, delete
+  on close on Windows) are written on the offload pool and disappear when closed.
+- OpenAPI describes the body as `multipart/form-data` with files as `{"type": "string", "format": "binary"}`, so
+  the Swagger UI offers a file picker.
+- **Python:** `name: str = veil.Form()`, `avatar: veil.UploadFile = veil.File()`, `files: list[veil.UploadFile]`,
+  `data: bytes = veil.File()` (FastAPI's names; `Annotated[str, veil.Form()]` works too, and urlencoded forms use the
+  same `Form()`). The body is parsed in Rust before the handler runs: text and small files stay in memory, files over
+  `multipart_spool_threshold` are handed to Python as temporary files, so a large upload does not grow the process
+  (the whole body is limited by `multipart_max_total_size`, by default `max_body_size`).
+  `UploadFile` has `filename`, `content_type`, `headers`, `size`, `file` and `async` `read` / `write` / `seek` /
+  `close` (plus `read_bytes()`).
+- **C:** `veil_multipart_next(req, &part)` returns the parts one by one (`name`, `filename`, `content_type`, and
+  `data` / `data_len` or a temporary file `fd`). With the route flag `VEIL_ROUTE_FORM` the body is read before the
+  callback and large files are written to temporary files (closed when the callback returns); without it the buffered
+  body is parsed.
+
+Examples: `/profile`, `/files-upload` and `/upload-stream` in [examples/api/rust-showcase/](../../examples/api/rust-showcase/),
+`/upload` in [examples/api/python-features/](../../examples/api/python-features/) and
+[examples/api/c-features/](../../examples/api/c-features/).
+
+## Response compression
+
+Handler responses are compressed with the same `[route.compression]` table as proxied responses
+([compression-cache.md](compression-cache.md)), on HTTP/1.1, HTTP/2 and HTTP/3, for buffered and streaming bodies
+(needs the `compression` feature, which `full` includes and `api` does not). `[api] compression = true` (builder
+`.compression(true)`, Python `veil.run(compression=True)`, C `veil_config_set(cfg, "api.compression", "true")`) gives
+every handler route without its own `[route.compression]` a default that suits JSON APIs: br, then gzip, from 256
+bytes, for `application/json`, `text/*`, `application/javascript` and `image/svg+xml`.
+
+```toml
+[api]
+compression = true            # default for all handler routes
+
+[[route]]                     # or per route (the route's table wins over [api] compression)
+[route.conditions]
+path = "/reports"
+[route.action]
+type = "Handler"
+handler = "reports"
+[route.compression]
+enabled = true
+preferred_encodings = ["br", "gzip"]
+brotli_level = 5
+```
+
+- The coding is chosen from `Accept-Encoding` by q-value, ties broken by `preferred_encodings` order (`q=0` and `*`
+  are honoured). Without `Accept-Encoding`, or when nothing listed is acceptable, the response is sent as is.
+- A compressed response gets `Content-Encoding`, `Vary: Accept-Encoding` and a recomputed `Content-Length` (a
+  strong `ETag` becomes weak). `HEAD` gets the same headers as `GET` without a body.
+- Not compressed: bodies under `min_size`, content types outside `compressible_types` (or in `skip_types`), responses
+  that already have `Content-Encoding`, `Cache-Control: no-transform`, `Content-Range`, status 1xx, 204, 206 and 304,
+  protocol upgrades, WebSockets and gRPC. Streaming bodies (`Response::stream`, Python generators, C
+  `veil_response_stream`) are compressed chunk by chunk with a flush after each chunk; `text/event-stream` is left
+  alone unless `compressible_types` lists it.
+- Opting out: `#[veil::route(..., compress = false)]` / `App::route_compression(false)` for a route,
+  `Response::no_compression()` for one response; Python `@app.get(..., compress=False)` and
+  `veil.Response(..., compress=False)` (also `JSONResponse` and `StreamingResponse`); C `VEIL_ROUTE_NO_COMPRESS` and
+  `veil_response_no_compression(resp)`.
+- Routes and responses that are not compressed take no extra allocation; the encoders' work areas are reused per
+  thread. `[http3] compression*` keys apply to proxied HTTP/3 responses only.
+
+Examples: `/dataset/{count}`, `/dataset-raw/{count}` and `/stream-big` in
+[examples/api/rust-showcase/](../../examples/api/rust-showcase/), `/data`, `/data-raw`, `/data-nc` and `/lines` in
+[examples/api/python-features/](../../examples/api/python-features/), `/json`, `/json-raw`, `/json-nc` and `/lines` in
+[examples/api/c-features/](../../examples/api/c-features/).
 
 ## Validation and OpenAPI
 
@@ -405,6 +675,17 @@ the macro metadata — paths, parameters, request bodies, response types inferre
 validated routes — and kept in memory; a request just returns the stored bytes. It is served at
 `openapi_json_path` (`/openapi.json`) and a Swagger UI at `openapi_path` (`/docs`). Set `[api]
 openapi_enabled = false` to turn both off.
+
+By default the Swagger UI is **embedded**: the library bundles `swagger-ui-dist` (pinned version, gzip and brotli
+pre-compressed; see `third_party/swagger-ui-dist/README.veil.md`) and serves it from
+`<openapi_path>/assets/<version>/` with `Cache-Control: public, max-age=31536000, immutable`, an `ETag` and
+`Content-Encoding: br`/`gzip` by `Accept-Encoding` (decompressed once on first use for clients that accept
+neither). The page makes no request to another origin, so `/docs` works on a closed network, and it carries
+`Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+font-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'` (no inline
+script; the initializer is also a same-origin file). The online validator badge is turned off. `openapi_docs_ui =
+"cdn"` restores the previous CDN page (pinned to the bundled version) and `"off"` serves only the JSON. The proxy
+binary (`full` and the other `full*` sets) contains none of these assets.
 
 ## Shared state
 
@@ -467,7 +748,7 @@ which re-exports `veil::tokio`):
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # resolved to the shim
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
@@ -532,6 +813,26 @@ FreeBSD, OpenBSD and NetBSD; see [Platforms](#platforms)): hyper server (HTTP/1.
 client, reqwest (incl. timeouts), tower-http `TimeoutLayer`, axum 0.8 (`axum::serve`, extractors, state, graceful
 shutdown), sqlx with SQLite and PostgreSQL.
 
+## HTTP client
+
+`veil::api::client` (feature `handler`) is an asynchronous HTTP client that runs on the worker's runtime, so handlers
+and tasks call other services without tokio:
+
+```rust
+use veil::api::client::{Client, Http2};
+
+let client = Client::builder().http2(Http2::Auto).timeout(Duration::from_secs(5)).build()?;
+let res = client.get("https://api.example.com/v1/items").bearer_auth(token).send().await?;
+let items: Vec<Item> = res.error_for_status()?.json()?;
+```
+
+It uses the proxy's upstream building blocks: name resolution on the offload pool, the upstream TLS client (trust
+anchors from `[tls_client] ca`, or `ClientBuilder::ca`; `client_cert` for mTLS), multiplexed HTTP/2 connections and a
+per-worker HTTP/1.1 pool. `Http2::Auto` (default) negotiates h2 or HTTP/1.1 by ALPN over TLS and uses HTTP/1.1 in
+plain text, `Http2::On` uses h2 and h2c with prior knowledge, `Http2::Off` HTTP/1.1. With
+`ClientBuilder::unix_sockets(true)`, `http://unix:/path.sock:/x` connects to a Unix socket (off by default). Response bodies are read whole (`max_response_size`, 64 MiB by default). Errors have a
+`kind()` and convert into a 502 or 504 `Response`. Details: [library-kit.md](library-kit.md#http-client).
+
 ## GraphQL
 
 veil does not depend on a GraphQL library: you pick one (async-graphql, juniper, ...) and mount it as an ordinary
@@ -549,10 +850,14 @@ let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
 graphql::graphql(App::new(), "/graphql", schema).run()?;
 ```
 
-It serves `POST` with a JSON body (single or batch) and `GET` with `?query=...&variables=...`, GraphiQL for a browser
+It serves `POST` with a JSON body (single or batch; a `Content-Type` other than `application/json` gives 415) and
+`GET` with `?query=...&variables=...` (queries and subscriptions; a mutation gives 405), GraphiQL for a browser
 `GET` without a query (`Accept: text/html`), `application/graphql-response+json` when the client asks for it
 (otherwise `application/json`), and subscriptions over SSE (GraphQL over SSE, distinct connections mode) when the
 request has `Accept: text/event-stream`: one `event: next` per result and a final `event: complete`.
+
+The [`veil-proxy-kit`](library-kit.md#graphql) crate has the same bridge as `veil_kit::graphql::mount`, plus
+subscriptions over WebSocket (`graphql-transport-ws`, `graphql-ws`).
 
 > Up to v0.7 the `graphql` feature provided `App::graphql(path, schema)`. It was removed (F-207) so that the API
 > library does not pull in async-graphql; copy `src/graphql.rs` from the example to keep the same behaviour.
@@ -600,6 +905,22 @@ them with `async fn`, the futures need not be `Send`), `add_<service>(app, impl)
 bidirectional streaming methods return `Response<BoxStream<T>>`; client streaming and bidirectional methods receive
 `Request<Streaming<T>>`. `veil_build::configure().veil_path("::my_veil")` changes the crate path and `config_mut()`
 exposes the `prost_build::Config`.
+
+`veil-build` also generates a client module `<service>_client` (`build_client(false)` turns it off, `build_server(false)`
+leaves only the client):
+
+```rust
+use hello::greeter_client::GreeterClient;
+
+let client = GreeterClient::connect("http://127.0.0.1:50051")?;   // https:// = h2 over TLS
+let reply = client.say_hello(hello::HelloRequest { name: "veil".into() }).await?.into_inner();
+```
+
+Unary methods take a message or a `Request<T>`; server streaming returns `Response<ClientStreaming<T>>`
+(`message().await`, `trailers()`); client streaming and bidirectional methods take any `Stream<Item = T> + Unpin`.
+The client runs over `veil::api::grpc::Channel` (`Channel::connect(url)`, `Channel::with_client(&http_client, url)`
+for custom TLS), which sends metadata, deadlines (`grpc-timeout`) and compressed messages and returns `Status` from
+the trailers. It uses the HTTP/2 client above and runs on the worker's runtime.
 
 ### Without code generation
 
@@ -656,9 +977,33 @@ for example to decode it yourself or to forward it.
 | Health | `App::grpc_health()` registers `grpc.health.v1.Health` (`Check`, `Watch`); the whole server (`""`) is `SERVING`, `veil::api::grpc::health::set_serving_status(service, status)` changes a service |
 | Reflection | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` registers `grpc.reflection.v1` and `v1alpha` (`ServerReflectionInfo`), so grpcurl, Postman and grpcui list the services and fetch their types without the `.proto` files. `FILE_DESCRIPTOR_SET` is generated by `veil-build`; pass one per compiled package. `list_services` reports every registered gRPC service; the types of the built-in health and reflection services are not described |
 
-gRPC routes are not listed in OpenAPI. A complete example is `examples/api/rust-grpc` (unary, the three streaming
-kinds, deadlines, errors, health), tested with a tonic client and an HTTP/3 client by
-`tests/api/library_e2e.sh grpc`.
+A complete example is `examples/api/rust-grpc` (unary, the three streaming kinds, deadlines, errors, health),
+tested with a tonic client and an HTTP/3 client by `tests/api/library_e2e.sh grpc`.
+
+### gRPC in OpenAPI
+
+Registered gRPC methods are listed in `/openapi.json` and the Swagger UI (unless `[api] openapi_grpc = false`) as
+`POST /<package>.<Service>/<Method>`, the same shape as grpc-gateway's output, under the tag `gRPC: <package>.<Service>`.
+OpenAPI describes REST, so the entry is a catalogue of the method and its types, not a way to call it: the request
+body is listed as `application/grpc` and `application/grpc-web`, the 200 response as `application/grpc`, and
+Swagger UI's "Try it out" is disabled for these operations. Each operation carries an `x-grpc` object with
+`service`, `method`, `kind` (`unary`, `server_streaming`, `client_streaming` or `bidi_streaming`), `streaming` and,
+when the types are known, `requestType` and `responseType`; streaming kinds are also named in the `summary`, and the
+schema is that of one message.
+
+The message types come from the file descriptor sets you give veil: `App::grpc_reflection(&[FILE_DESCRIPTOR_SET])`
+uses them for both reflection and OpenAPI, and `App::grpc_descriptors(&[FILE_DESCRIPTOR_SET])` uses them for
+OpenAPI only (no reflection service is registered). They are converted with the proto3 JSON mapping into
+`components.schemas`, named by their full name (`demo.v1.HelloRequest`): 64-bit integers are strings, `bytes` is a
+base64 string, enums are their value names, `repeated` is an array, `map` is an object with `additionalProperties`,
+`oneof` is a `oneOf`, recursive types use `$ref`, and the well-known types (`Timestamp` as a `date-time` string,
+`Duration`, `Struct`, `Value`, `Any`, the wrappers, `FieldMask`, `Empty`) have their JSON forms. Comments in the
+`.proto` file (kept by `veil-build`) become the descriptions of methods, services, messages and fields. A method
+whose types are unknown (no descriptor, or a hand-written `Codec`) is listed with
+`{"type": "string", "format": "binary"}` bodies. `App::grpc_kind(path, MethodKind::...)` sets the kind of a method
+registered through a lower-level route. The built-in health and reflection services and the `UNIMPLEMENTED`
+fallback of each service are left out unless `[api] openapi_grpc_builtin = true`. The document is built at startup
+and on reload; requests are not affected.
 
 ## L4 (TCP/UDP) handlers
 
@@ -717,6 +1062,34 @@ or make it redirect to the TLS port with `.secure_redirect(true)`. Add `.http3("
 feature, included in `full`) for HTTP/3 on a UDP port (`[http3] enabled = true` + `[http3] listen`). All other `[tls]`, `[http2]`, `[http3]` and `[security]` keys can be set in `config.toml` or with
 `set(..)`. The security sandbox is **off** by default in library mode; enabling `enable_seccomp` /
 `enable_landlock` is possible but must allow whatever your handlers do (files, sockets, DNS).
+
+### Several listeners
+
+To open several ports with different protocols (for example HTTP/1.1-only TLS, h2c-only and HTTP/2 + HTTP/3),
+add one `Listener` per port. Each one becomes a `[[listener]]` entry (see
+[Multiple listeners](configuration.md#multiple-listeners-listener) for the rules):
+
+```rust
+use veil::api::{Config, Listener};
+
+let config = Config::load()?
+    .builder()
+    .tls("/etc/veil/cert.pem", "/etc/veil/key.pem")
+    .listener(Listener::cleartext("0.0.0.0:8080").name("plain"))
+    .listener(Listener::tls("0.0.0.0:8081").name("h1tls").http2(false))
+    .listener(Listener::cleartext("0.0.0.0:8082").name("h2c").allow_http(false))
+    .listener(Listener::tls("0.0.0.0:8443").name("https").http3(true))
+    .build();
+```
+
+`Listener` methods: `tls(addr)` / `cleartext(addr)`, `name`, `http2`, `http3`, `http3_listen` (implies `http3`),
+`allow_http`, `allow_h2c`, `secure_redirect`, `redirect_to(name)` (implies `secure_redirect`), `threads` and
+`unix_socket_permissions`. Once any listener is added, the library's default plaintext listener
+(`listen_cleartext = "127.0.0.1:8080"`) is not opened unless you set `listen_cleartext` yourself. In C, fill a
+`veil_listener_t` and call `veil_config_add_listener(cfg, &l)` once per port (a zero-filled struct means the
+defaults: the `http2`, `allow_http`, `allow_h2c` and `secure_redirect` fields take `VEIL_DEFAULT` (0), `VEIL_ON` or
+`VEIL_OFF`, and the leading `size` field is `sizeof(veil_listener_t)`, set by `VEIL_LISTENER_INIT`, or 0); in Python, pass
+`veil.run(listeners=[veil.Listener("0.0.0.0:8443", tls=True, http3=True), ...])`.
 
 ## Memory allocator
 
@@ -802,9 +1175,16 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
   `veil_grpc_set_header` / `_set_trailer`, `veil_grpc_metadata`, `veil_grpc_deadline_ms`.
   `veil_register_grpc_health(cfg)` adds `grpc.health.v1.Health`. Compression, deadlines, gRPC-Web and the
   `[api] grpc_*` keys behave as for Rust handlers; HTTP/2 and HTTP/3 both work.
+  `veil_grpc_descriptors(cfg, data, len)` takes a `FileDescriptorSet` (`protoc --include_imports
+  --descriptor_set_out=...`) so that the methods are listed in OpenAPI with their message types
+  ([gRPC in OpenAPI](#grpc-in-openapi)).
 - L4: `veil_register_l4_tcp(cfg, name, listen, &callbacks, ud)` with `on_connect` / `on_data` / `on_close`
   (called on the handler pool, one at a time per connection; `veil_l4_write` / `veil_l4_close` inside a callback),
   and `veil_register_l4_udp(cfg, name, listen, fn, ud)` (`veil_l4_reply` answers a datagram).
+- Protocol upgrade (HTTP/1.1): `veil_response_upgrade(resp, protocol, &callbacks, ud)` answers 101 and serves the
+  connection with the L4 TCP callbacks (see [Protocol upgrades](#protocol-upgrades-http11)).
+- WebSocket: `veil_ws_accept(req, resp, &callbacks, ud)`, `veil_ws_send`, `veil_ws_close` (see [WebSocket](#websocket)).
+- Forms: `veil_multipart_next` and the route flag `VEIL_ROUTE_FORM` (see [Forms and file uploads](#forms-and-file-uploads)).
 - Streaming functions cannot be used on `VEIL_ROUTE_INLINE` routes (`VEIL_ERR_STATE`).
 
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
@@ -847,8 +1227,23 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
 - **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
   `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
   handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
-  into the response in Rust without copying the body (F-212). `async def` handlers run on one event loop per
-  handler-pool thread. Python 3.9 or later is required.
+  into the response in Rust without copying the body (F-212). Python 3.9 or later is required.
+- **async def and the event loop (F-263).** `async def` handlers run on a **persistent asyncio event loop** (a
+  thread of its own, as with uvicorn; uvloop when installed): an `await` does not hold a thread, so thousands of
+  requests can wait at once and `asyncio.create_task` tasks outlive the request. Blocking code inside them stalls the
+  loop: use `await veil.run_in_threadpool(f, ...)` or a plain `def`. A disconnected client cancels the handler's
+  task. `[api] python_event_loops` / `python_event_loop` / `python_event_loop_queue` tune the loops, and
+  `async_mode="pool"` (per route, or `[api] python_async_mode = "pool"`) restores the behaviour before 0.10 (an event
+  loop per handler-pool thread). `veil.App(lifespan=...)`, `@app.on_startup` / `@app.on_shutdown` and
+  `@app.on_event("startup" | "shutdown")` run on the loop before the listeners open and after the server stopped
+  (a failing startup exits with status 1); a dict yielded by the lifespan is merged into `app.state`.
+- **WebSocket (F-263)** with the names of Starlette / FastAPI: `@app.websocket("/ws")` on
+  `async def f(websocket: veil.WebSocket)` (`accept`, `receive_text/bytes/json`, `iter_text/bytes/json`,
+  `send_text/bytes/json`, `close`, `veil.WebSocketDisconnect`) and `veil.WebSocketEndpoint` classes. The frames,
+  Ping / Pong, UTF-8 checks, close handshake and limits are handled in Rust (the `[api] websocket_*` keys apply);
+  Python only sees complete messages. WebSocket routes are listed in OpenAPI with `x-veil-websocket` (`receive=` /
+  `send=` pydantic models, `validate=True` closes with 1007 on a mismatch). `veil.Response.switching_protocols(protocol,
+  factory)` upgrades to any other protocol (`veil.Protocol` or `veil.AsyncProtocol`).
 - **Streaming (F-210).** Return a generator or async generator (sent chunk by chunk as `text/plain`), a
   `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`, or a `veil.EventSourceResponse(iterable)` for
   Server-Sent Events (items are strings, JSON-able values or `{"event", "data", "id", "retry"}` dicts).
@@ -862,13 +1257,35 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   `set_trailing_metadata`, `time_remaining`, `is_active`). With `pip install veil-api[grpc]`, code generated by
   `grpc_tools.protoc` runs unchanged: pass `veil.grpc.Server()` to `add_<Service>Servicer_to_server`, then
   `server.add_insecure_port(...)` and `server.wait_for_termination()`. `veil.grpc.add_health()` adds
-  `grpc.health.v1.Health`. `async def` methods and async generators work.
+  `grpc.health.v1.Health`. `async def` methods and async generators work. With your own `app = veil.App()`, pass it:
+  `veil.grpc.Server(app)`, `veil.grpc.add_health(app)` (without it they go to the module-level app, and `app.run()`
+  warns that they are not served).
 - **L4 (F-210):** `@veil.l4_tcp(name, listen)` on a `veil.Protocol` subclass (`connection_made` /
   `data_received` / `connection_lost`, like asyncio; `self.transport.write` inside a callback) and
   `@veil.l4_udp(name, listen)` on `def f(data, peer) -> bytes | None`.
+- **Forms and files (F-266):** `veil.Form()`, `veil.File()` and `veil.UploadFile`, as in FastAPI (no
+  `python-multipart` needed; see [Forms and file uploads](#forms-and-file-uploads)).
+- **FastAPI-style dependencies (F-268):** `veil.Depends` (nested, cached per request, `yield` cleanup, `async`),
+  `veil.Security` / `SecurityScopes`, the markers `Query()` / `Path()` / `Header()` / `Cookie()` / `Body()` with their
+  checks (422 in FastAPI's shape), `BackgroundTasks` (run after the response is sent), `APIRouter` /
+  `include_router`, `app.dependency_overrides`, `response_model`, `request.cookies`, `response.set_cookie()` and
+  `veil.testclient.TestClient`. The dependency tree of a route is built from the signatures once; routes that do not
+  use these features keep the binding they had.
+- **ASGI (F-268):** `veil.asgi.run(fastapi_app)` serves a FastAPI / Starlette application in place of uvicorn, and
+  `app.mount("/legacy", fastapi_app)` puts one under a path of a veil application (`http` with the trailers and
+  pathsend extensions, `websocket`, `lifespan`). veil does HTTP/1.1, HTTP/2, HTTP/3, TLS and compression; the
+  application runs on the persistent event loop. The ASGI `scheme` follows the TLS of the connection
+  (`Request.is_tls`); `X-Forwarded-Proto` counts only from `forwarded_allow_ips` (default `FORWARDED_ALLOW_IPS` or
+  `127.0.0.1`).
+- **`veil-api-kit` (F-268)**, a pure-Python package (`pip install veil-api-kit`, `import veil_kit`, same version as
+  `veil-api`): signed cookies and sessions, `CORSMiddleware` (answered by the server), the security schemes of
+  `fastapi.security` and JWT (PyJWT), `safe_redirect`, `StaticFiles` (served by the server's file backend),
+  strawberry GraphQL over HTTP / SSE / WebSocket, a gRPC channel for `grpc_tools` stubs on veil's HTTP/2 client
+  (sync and `grpc.aio` style; grpcio not required), a DI container and periodic / cron tasks.
 - **GraphQL:** mount any library as an ordinary route; [examples/api/python-graphql/](../../examples/api/python-graphql/)
-  uses strawberry (queries, mutations, and subscriptions over SSE).
-- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, threads, overrides={"server.threads": 4}, openapi=True)`;
+  uses strawberry (queries, mutations, and subscriptions over SSE), and `veil_kit.graphql.mount` does the same with
+  WebSocket subscriptions and GraphiQL.
+- Configuration: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`;
   `VEIL_OVERRIDE_<n>` works as usual.
 
 Full documentation (quickstart, FastAPI migration table, API reference): <https://veil-api.readthedocs.io>.
@@ -876,7 +1293,10 @@ Details: [crates/veil-python/README.md](../../crates/veil-python/README.md). Exa
 [examples/api/python-hello/](../../examples/api/python-hello/),
 [examples/api/python-fastapi-like/](../../examples/api/python-fastapi-like/),
 [examples/api/python-features/](../../examples/api/python-features/) (streaming, L4),
-[examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer).
+[examples/api/python-grpc/](../../examples/api/python-grpc/) (grpcio-generated code and the plain layer),
+[examples/api/python-websocket/](../../examples/api/python-websocket/) (WebSocket, upgrade, lifespan, the event loop),
+[examples/api/python-kit/](../../examples/api/python-kit/) (`Depends`, `veil-api-kit`, a mounted FastAPI application, the
+gRPC client).
 
 ## Building library artifacts
 
@@ -995,27 +1415,36 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
 with curl (routing, validation, OpenAPI, tower, L4 echo, streaming, HTTP/1.1 and h2c, and GraphQL with SSE
 subscriptions through `examples/api/rust-graphql`), runs the gRPC
 interoperability checks against `examples/api/rust-grpc` (`grpc`; on Linux against both io_uring and epoll builds),
+the WebSocket checks (`websocket`: handshake, echo, fragmentation, pipelining, protocol errors, 2,000 connections —
+`WS_E2E_CONNS=16384` for more —, reconnect churn, graceful shutdown with 1001, plaintext, TLS and kTLS, and the
+Autobahn TestSuite fuzzingclient when docker and `crossbario/autobahn-testsuite` are available; the `python` step
+runs the same checks and Autobahn 1.*–7.* against `examples/api/python-websocket`, plus 2,000 concurrent
+`await asyncio.sleep(1)` requests — `PY_E2E_SLEEPERS` for more —, lifespan and the upgrade),
 and the `nonregression` step checks that the proxy binary is unaffected. It runs on Linux, macOS, FreeBSD, OpenBSD,
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
 (GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
 another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
---lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` for Python. See also
+--lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
 [Testing](testing.md).
 
 ## Limitations
 
 - `serve` / `run` can be called **once per process** (configuration hooks and shared state are process-wide); a
   second call returns an error.
-- gRPC: veil serves gRPC but has no gRPC client of its own (use tonic on `veil::tokio`).
-- Python handlers are bound by the GIL; C callbacks must be thread-safe.
-- The Swagger UI page loads `swagger-ui-dist` from a CDN, so the browser needs internet access to render `/docs`
-  (`/openapi.json` works offline).
+- gRPC client: `veil-build`'s generated clients and `Channel` use HTTP/2 only (no gRPC-Web, no HTTP/3); tonic on
+  `veil::tokio` remains an option.
+- `veil::api::client` reads bodies whole (no streaming response bodies yet) and does not follow redirects or keep
+  cookies.
+- Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
+  stalls its event loop (see above).
+- Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
+  is not supported).
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path
   you pass) is the only file.

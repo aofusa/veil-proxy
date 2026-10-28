@@ -4,7 +4,7 @@
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
-FROM messense/cargo-zigbuild AS tool-builder
+FROM messense/cargo-zigbuild:latest@sha256:eb5578cfc06e070a09deb7b5852474bd128a4e561f9f123261b5ed2405e478b1 AS tool-builder
 
 WORKDIR /app
 
@@ -44,7 +44,7 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55）。
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
 COPY third_party /app/third_party
-# crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー（F-188）。本体はこれらを
+# crates/（veil-macros・veil-capi・veil-python・veil-build・veil-kit）はワークスペースメンバー（F-188）。本体はこれらを
 # ビルドしないが、マニフェストが無いとワークスペース解決に失敗する（小さいので丸ごとコピーする）
 COPY crates /app/crates
 
@@ -120,7 +120,7 @@ RUN find src -name '*.rs' -exec touch {} + \
 # 中身は distroless と同じ最小構成（glibc・libgcc・CA 証明書・/etc/passwd の nonroot=65532）で、シェルは無い。
 # 既定のユーザーは nonroot（65532）だが、distroless（root で起動し、設定の drop_privileges で降格する）と
 # 同じ振る舞いにするため root で起動する。作業ディレクトリも CMD の `./veil` のために / に固定する。
-FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runtime
 
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28

@@ -61,7 +61,7 @@ routes first. veil has no separate virtual-host level: write the `host` conditio
 | Envoy filter | veil | |
 |---|---|---|
 | `router` | built in | = |
-| `cors` | `[route.traffic.cors]` | = preflight answers; add `Access-Control-Allow-Origin` to responses with `add_response_headers` |
+| `cors` | `[route.traffic.cors]` | = preflight answers and the headers of actual responses (`expose_headers`, `allow_credentials`; the upstream's own headers are kept unless `override_upstream`) |
 | `fault` (abort) | `[route.traffic.fault]` | = |
 | `fault` (delay) | — | — planned (F-226) |
 | `local_ratelimit` | `rate_limit_requests_per_min` | ≈ per client IP and route |
@@ -239,8 +239,6 @@ allow_methods = ["GET", "POST"]
 [route.traffic.fault]
 abort_status = 503
 abort_percent = 1.0
-[route.security]
-add_response_headers = { "Access-Control-Allow-Origin" = "https://app.example.com", "Vary" = "Origin" }
 ```
 
 ### TLS, HTTP/3 and JWT

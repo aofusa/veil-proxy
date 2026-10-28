@@ -171,11 +171,31 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     89, // readlink (canonicalize() で使用)
     257, // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    32,  // dup
+    292, // dup3
+    87,  // unlink
+    263, // unlinkat
+    83,  // mkdir
+    258, // mkdirat
+    82,  // rename
+    264, // renameat
+    316, // renameat2
+    90,  // chmod
+    91,  // fchmod
+    268, // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送)
     332, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    217, // getdents64 (監視するディレクトリを辿る)
+    254, // inotify_add_watch
+    255, // inotify_rm_watch
+    294, // inotify_init1
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -239,18 +259,16 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
+    219, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
     // ============================================
     102, // getuid
     104, // getgid
-    105, // setuid
-    106, // setgid
     107, // geteuid
     108, // getegid
     110, // getppid
-    116, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -313,11 +331,31 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     89, // readlink (canonicalize() で使用)
     257, // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    32,  // dup
+    292, // dup3
+    87,  // unlink
+    263, // unlinkat
+    83,  // mkdir
+    258, // mkdirat
+    82,  // rename
+    264, // renameat
+    316, // renameat2
+    90,  // chmod
+    91,  // fchmod
+    268, // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
     332, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    217, // getdents64 (監視するディレクトリを辿る)
+    254, // inotify_add_watch
+    255, // inotify_rm_watch
+    294, // inotify_init1
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -381,18 +419,16 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     13,  // rt_sigaction
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
+    219, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     131, // sigaltstack
     // ============================================
     // ユーザー・権限管理（権限降格用）
     // ============================================
     102, // getuid
     104, // getgid
-    105, // setuid
-    106, // setgid
     107, // geteuid
     108, // getegid
     110, // getppid
-    116, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -446,6 +482,18 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    // aarch64 には dup2・unlink・mkdir・rename・chmod が無く *at 系だけ。
+    23,  // dup
+    24,  // dup3
+    35,  // unlinkat
+    34,  // mkdirat
+    38,  // renameat
+    276, // renameat2
+    52,  // fchmod
+    53,  // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     57,  // close
     62,  // lseek
     63,  // read
@@ -462,6 +510,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     80,  // fstat
     291, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    61,  // getdents64 (監視するディレクトリを辿る)
+    27,  // inotify_add_watch
+    28,  // inotify_rm_watch
+    26,  // inotify_init1
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -522,12 +575,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
+    128, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
     148, // getresuid
-    149, // setresgid
     150, // getresgid
     172, // getpid
     173, // getppid
@@ -535,7 +587,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     175, // geteuid
     176, // getgid
     177, // getegid
-    159, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -583,6 +634,18 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
     437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
+    // B-220: UDS のリスナー（ワーカーが dup）・ディスクのスピルオーバー（一時ファイルとディレクトリ）・終了時の UDS の unlink。
+    // B-219: TSYNC で全スレッドに掛かるので、ACME の証明書の保存（mkdir・一時ファイルの rename・chmod）も要る。
+    // aarch64 には dup2・unlink・mkdir・rename・chmod が無く *at 系だけ。
+    23,  // dup
+    24,  // dup3
+    35,  // unlinkat
+    34,  // mkdirat
+    38,  // renameat
+    276, // renameat2
+    52,  // fchmod
+    53,  // fchmodat
+    446, // landlock_restrict_self（B-219: 先に作った制御プレーンのスレッドが後から自分に Landlock を掛ける。制限を足すだけ）
     57,  // close
     62,  // lseek
     63,  // read
@@ -599,6 +662,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     80,  // fstat
     291, // statx (非同期ファイル I/O offload で使用)
     439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // 静的配信のディスク監視（`watch = true`、専用スレッド。F-272）
+    61,  // getdents64 (監視するディレクトリを辿る)
+    27,  // inotify_add_watch
+    28,  // inotify_rm_watch
+    26,  // inotify_init1
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -659,12 +727,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
+    128, // restart_syscall (B-252: SIGSTOP/SIGCONT・ptrace で止まった sleep の再開。無いと std の sleep が panic)
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
     148, // getresuid
-    149, // setresgid
     150, // getresgid
     172, // getpid
     173, // getppid
@@ -672,7 +739,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     175, // geteuid
     176, // getgid
     177, // getegid
-    159, // setgroups
     // ============================================
     // 時間・タイマー
     // ============================================
@@ -983,18 +1049,26 @@ fn apply_seccomp(config: &SecurityConfig) -> io::Result<()> {
         filter: filter.as_ptr() as *mut libc::sock_filter,
     };
 
+    // B-219: prctl(PR_SET_SECCOMP) は呼んだスレッドにしか掛からず、先に作ったログ・設定リロード・証明書の
+    // リロード・VDS・ACME・ヘルスチェック・Wasm の tick 等のスレッドが無制限のまま動いていた。seccomp(2) の
+    // TSYNC で既存の全スレッドへ同じフィルタを同期する（no_new_privs も同期される）。同期できないスレッドが
+    // あると正の値（そのスレッドの TID）が返るので、失敗として起動を止める。
     let ret = unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            libc::SECCOMP_MODE_FILTER,
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_TSYNC,
             &prog as *const libc::sock_fprog,
-            0,
-            0,
         )
     };
 
-    if ret != 0 {
+    if ret < 0 {
         return Err(io::Error::last_os_error());
+    }
+    if ret > 0 {
+        return Err(io::Error::other(format!(
+            "seccomp: could not synchronize the filter to thread {ret}"
+        )));
     }
 
     Ok(())
@@ -1016,7 +1090,6 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     const BPF_W: u16 = 0x00;
     const BPF_ABS: u16 = 0x20;
     const BPF_JEQ: u16 = 0x10;
-    const BPF_JSET: u16 = 0x40; // ビットセットテスト
     const BPF_K: u16 = 0x00;
 
     // seccomp データオフセット
@@ -1032,9 +1105,12 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
 
     // アクション
     let action_allow = 0x7fff0000u32; // SECCOMP_RET_ALLOW
+
+    // B-254: Strict は 0（SECCOMP_RET_KILL_THREAD。違反したスレッドだけが黙って消え、残りは動き続ける）ではなく、
+    // 文書どおりプロセスごと落とす。4.14 未満のカーネルは未知の動作の上位ビットを見ずに KILL_THREAD として扱う
     let action_deny = match mode {
         SeccompMode::Log => 0x7ffc0000u32,      // SECCOMP_RET_LOG
-        SeccompMode::Strict => 0x00000000u32,   // SECCOMP_RET_KILL_PROCESS
+        SeccompMode::Strict => 0x80000000u32,   // SECCOMP_RET_KILL_PROCESS
         SeccompMode::Filter => 0x00050001u32,   // SECCOMP_RET_ERRNO | EPERM
         SeccompMode::Disabled => 0x7fff0000u32, // SECCOMP_RET_ALLOW (no-op)
     };
@@ -1069,103 +1145,40 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     });
 
     // ====================
-    // PROT_EXEC 引数レベルチェック（mmap / mprotect）
-    //
-    // mprotect(addr, len, prot)   の prot は args[2]（オフセット 32）
-    // mmap(addr, len, prot, ...)  の prot は args[2]（オフセット 32）
-    // ※ どちらも prot は第 3 引数 = args[2]。len（args[1]）と混同しないこと。
+    // 許可リストと引数の検査
     //
     // seccomp_data 構造体レイアウト:
     //   u32 nr       @ offset 0
     //   u32 arch     @ offset 4
     //   u64 ip       @ offset 8
-    //   u64 args[0]  @ offset 16
-    //   u64 args[1]  @ offset 24
-    //   u64 args[2]  @ offset 32
+    //   u64 args[n]  @ offset 16 + 8n（BPF は 32bit 単位で読む。リトルエンディアンでは下位 32bit がこの位置）
+    //
+    // F-278: syscall ごとに「JEQ nr（一致しなければ自分のブロックを飛ばす）+ ブロック（必ず RET で終わる）」を
+    // 並べ、最後に DENY を置く。ジャンプは全てブロック内の短い距離なので、許可リストが長くなっても BPF の
+    // u8 のジャンプ幅（255）を超えない（以前は表の末尾の共通の ALLOW へ飛んでいて、約 250 を超えると黙って壊れた）。
+    // 引数を見るブロックは accumulator を引数で上書きするが、どの道も RET で終わるので次の JEQ には戻らない。
     // ====================
-    const PROT_EXEC: u32 = 0x4;
-
-    // seccomp_data.args フィールドは u64 だが、BPF は 32bit 単位で読む。
-    // リトルエンディアンでは下位 32bit がオフセット位置にある。
-    // mmap・mprotect とも prot は args[2]（第 3 引数, オフセット 32）。
-    const OFFSET_ARG2_LO: u32 = 32; // args[2] 下位 32bit（mmap/mprotect の prot）
-
-    #[cfg(target_arch = "x86_64")]
-    let (syscall_mmap, syscall_mprotect) = (9u32, 10u32);
-    #[cfg(target_arch = "aarch64")]
-    let (syscall_mmap, syscall_mprotect) = (222u32, 226u32);
-
-    // mprotect の PROT_EXEC チェックサブルーチンを後方に追加する都合上、
-    // まず全チェックの命令数を見積もる。
-    // シンプルな設計: mmap/mprotect は PROT_EXEC チェックジャンプ先に飛ばし、
-    // その他は従来どおり allow へジャンプする。
-    //
-    // フィルターレイアウト:
-    //   [現在位置] syscall_count 個の JEQ チェック
-    //             ├─ mmap   が一致 → PROT_EXEC_CHECK_MMAP へ
-    //             ├─ mprotect が一致 → PROT_EXEC_CHECK_MPROTECT へ
-    //             └─ その他  が一致 → ALLOW へ
-    //   [deny]    DENY
-    //   [allow]   ALLOW
-    //   [prot_exec_check_mprotect]
-    //             LD args[1] 下位32bit
-    //             JSET PROT_EXEC → DENY
-    //             ALLOW
-    //   [prot_exec_check_mmap]
-    //             LD args[2] 下位32bit
-    //             JSET PROT_EXEC → DENY
-    //             ALLOW
-    //
-    // DENY = filter.len() + syscall_count
-    // ALLOW = filter.len() + syscall_count + 1
-    // prot_check_mprotect = filter.len() + syscall_count + 2
-    //   mprotect チェックは LD, JSET, RET(allow), RET(deny) の 4 命令で構成される。
-    // prot_check_mmap = filter.len() + syscall_count + 6
-    //   （DENY 1 + ALLOW 1 + mprotect チェック 4 命令の先が mmap チェックの LD）
-
-    let base = filter.len(); // syscall LD 命令のインデックス
-    let deny_idx = base + 1; // DENY 命令のインデックス（スキップカウント計算用）
-                             // syscall_count 個の JEQ のあとに DENY, ALLOW, [mprotect check 3命令], [mmap check 3命令]
-
-    // 3. 許可リストにあるシステムコールをチェック
+    let checks = seccomp_arg_checks();
     let syscall_count = ALLOWED_SYSCALLS.len();
-    for (i, &syscall) in ALLOWED_SYSCALLS.iter().enumerate() {
-        let remaining = syscall_count - i - 1;
-        let allow_jump_dist = (remaining + 1) as u8; // ALLOW へのオフセット（deny の 1 先）
-
+    for &syscall in ALLOWED_SYSCALLS {
         let nr = syscall as u32;
-        if nr == syscall_mprotect {
-            // mprotect → PROT_EXEC チェック: deny+2 先（deny, allow, [LD] ← ここ）
-            let prot_check_jump = (remaining + 2) as u8;
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: prot_check_jump, // prot_exec_check_mprotect へ
-                jf: 0,
-                k: nr,
-            });
-        } else if nr == syscall_mmap {
-            // mmap → PROT_EXEC チェック: DENY(1) + ALLOW(1) + mprotect チェック(4命令) の先。
-            // mprotect チェックは LD/JSET/RET(allow)/RET(deny) の 4 命令なので +6 が正しい
-            // （+5 だと mprotect ブロックの RET(deny) に着地し、全 mmap が誤って拒否される）。
-            let prot_check_jump = (remaining + 6) as u8;
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: prot_check_jump, // prot_exec_check_mmap へ
-                jf: 0,
-                k: nr,
-            });
-        } else {
-            filter.push(libc::sock_filter {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: allow_jump_dist, // ALLOW へジャンプ
-                jf: 0,               // 次のチェックへ
-                k: nr,
-            });
-        }
+        let block = seccomp_block(
+            checks.iter().find(|(n, _)| *n == nr).map(|(_, c)| c),
+            action_allow,
+            action_deny,
+        );
+        let skip = u8::try_from(block.len())
+            .map_err(|_| io::Error::other("seccomp: argument check block too long"))?;
+        filter.push(libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: skip,
+            k: nr,
+        });
+        filter.extend(block);
     }
-    let _ = deny_idx; // suppress unused warning
 
-    // 4. リストにない -> 拒否
+    // リストにない -> 拒否
     filter.push(libc::sock_filter {
         code: BPF_RET | BPF_K,
         jt: 0,
@@ -1173,73 +1186,9 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         k: action_deny,
     });
 
-    // 5. 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-
-    // 6. mprotect PROT_EXEC チェック（args[2]=prot を検査）
-    // LD args[2] 下位32bit
-    filter.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: OFFSET_ARG2_LO,
-    });
-    // PROT_EXEC ビットが立っていれば DENY
-    filter.push(libc::sock_filter {
-        code: BPF_JMP | BPF_JSET | BPF_K,
-        jt: 1, // DENY へ（2 命令先 = ALLOW をスキップして DENY）
-        jf: 0, // ALLOW へ（次の命令）
-        k: PROT_EXEC,
-    });
-    // PROT_EXEC なし → 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-    // PROT_EXEC あり → 拒否
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_deny,
-    });
-
-    // 7. mmap PROT_EXEC チェック（args[2] を検査）
-    // LD args[2] 下位32bit
-    filter.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: OFFSET_ARG2_LO,
-    });
-    // PROT_EXEC ビットが立っていれば DENY
-    filter.push(libc::sock_filter {
-        code: BPF_JMP | BPF_JSET | BPF_K,
-        jt: 1, // ALLOW をスキップして DENY
-        jf: 0, // ALLOW へ
-        k: PROT_EXEC,
-    });
-    // PROT_EXEC なし → 許可
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_allow,
-    });
-    // PROT_EXEC あり → 拒否
-    filter.push(libc::sock_filter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: action_deny,
-    });
+    if filter.len() > u16::MAX as usize {
+        return Err(io::Error::other("seccomp: filter too long"));
+    }
 
     debug!(
         "Built seccomp filter with {} instructions for {} syscalls",
@@ -1248,6 +1197,175 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     );
 
     Ok(filter)
+}
+
+/// syscall の引数の検査（F-25・F-278）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+enum SeccompArgCheck {
+    /// `args[arg]` の下位 32bit に `mask` のビットが 1 つでも立っていれば拒否（PROT_EXEC・名前空間の作成）
+    DenyBits { arg: u32, mask: u32 },
+    /// `args[arg]` の下位 32bit が列挙した値のどれかなら許可、他は拒否（ソケットのファミリ・ioctl・prctl・tgkill）
+    AllowValues { arg: u32, values: Vec<u32> },
+    /// 常にこの errno を返す（clone3 は ENOSYS にして libc を clone へフォールバックさせる。flags は
+    /// 構造体の中にあって BPF から見えない）
+    Errno(u32),
+}
+
+/// 引数を検査する syscall（番号, 検査）。番号は `ALLOWED_SYSCALLS` と同じく `libc::SYS_*` と照合する
+/// （`test_seccomp_arg_checks_match_libc`）。
+#[cfg(target_os = "linux")]
+fn seccomp_arg_checks() -> Vec<(u32, SeccompArgCheck)> {
+    use SeccompArgCheck::*;
+    // 名前空間を作る clone のフラグ（スレッド作成では立たない）
+    const CLONE_NS_MASK: u32 = (libc::CLONE_NEWNS
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET) as u32;
+    // SAFETY: 引数無しの syscall
+    let pid = unsafe { libc::getpid() } as u32;
+    vec![
+        // mmap・mprotect の prot は args[2]
+        (
+            libc::SYS_mmap as u32,
+            DenyBits {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+            },
+        ),
+        (
+            libc::SYS_mprotect as u32,
+            DenyBits {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+            },
+        ),
+        // socket(domain, ..): 使うファミリだけ（AF_NETLINK は glibc の getaddrinfo の AI_ADDRCONFIG）
+        (
+            libc::SYS_socket as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![
+                    libc::AF_UNIX as u32,
+                    libc::AF_INET as u32,
+                    libc::AF_INET6 as u32,
+                    libc::AF_NETLINK as u32,
+                ],
+            },
+        ),
+        // ioctl(fd, request, ..): std の set_nonblocking（FIONBIO）・close-on-exec（FIOCLEX）、パイプの残量（FIONREAD）、
+        // 端末の判定（TCGETS・TIOCGWINSZ。ログの出力先）
+        (
+            libc::SYS_ioctl as u32,
+            AllowValues {
+                arg: 1,
+                values: vec![
+                    libc::FIONBIO as u32,
+                    libc::FIONREAD as u32,
+                    libc::FIOCLEX as u32,
+                    libc::FIONCLEX as u32,
+                    libc::TCGETS as u32,
+                    libc::TIOCGWINSZ as u32,
+                ],
+            },
+        ),
+        // prctl(option, ..): スレッド名（std・ランタイム）、no_new_privs（B-219 の Landlock を掛けるスレッド）、
+        // seccomp の状態、bounding set の読み取り、無名メモリの名前（アロケータ）
+        (
+            libc::SYS_prctl as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![
+                    libc::PR_SET_NAME as u32,
+                    libc::PR_GET_NAME as u32,
+                    libc::PR_SET_NO_NEW_PRIVS as u32,
+                    libc::PR_GET_NO_NEW_PRIVS as u32,
+                    libc::PR_GET_SECCOMP as u32,
+                    libc::PR_SET_SECCOMP as u32,
+                    libc::PR_CAPBSET_READ as u32,
+                    libc::PR_GET_DUMPABLE as u32,
+                    libc::PR_SET_VMA as u32,
+                ],
+            },
+        ),
+        // clone(flags, ..): スレッドは作れるが名前空間は作れない
+        (
+            libc::SYS_clone as u32,
+            DenyBits {
+                arg: 0,
+                mask: CLONE_NS_MASK,
+            },
+        ),
+        (libc::SYS_clone3 as u32, Errno(libc::ENOSYS as u32)),
+        // tgkill(tgid, tid, sig): 自分のプロセスのスレッドだけ
+        (
+            libc::SYS_tgkill as u32,
+            AllowValues {
+                arg: 0,
+                values: vec![pid],
+            },
+        ),
+    ]
+}
+
+/// 1 つの syscall のブロック（JEQ nr の直後に置く。必ず RET で終わる）。
+#[cfg(target_os = "linux")]
+fn seccomp_block(
+    check: Option<&SeccompArgCheck>,
+    action_allow: u32,
+    action_deny: u32,
+) -> Vec<libc::sock_filter> {
+    const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD(0x00) | BPF_W(0x00) | BPF_ABS(0x20)
+    const BPF_RET_K: u16 = 0x06;
+    const BPF_JEQ_K: u16 = 0x05 | 0x10;
+    const BPF_JSET_K: u16 = 0x05 | 0x40;
+    let ret = |k| libc::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let load_arg = |arg: u32| libc::sock_filter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: 16 + 8 * arg,
+    };
+    match check {
+        None => vec![ret(action_allow)],
+        Some(SeccompArgCheck::DenyBits { arg, mask }) => vec![
+            load_arg(*arg),
+            // ビットが立っていれば 1 つ先（DENY）へ
+            libc::sock_filter {
+                code: BPF_JSET_K,
+                jt: 1,
+                jf: 0,
+                k: *mask,
+            },
+            ret(action_allow),
+            ret(action_deny),
+        ],
+        Some(SeccompArgCheck::AllowValues { arg, values }) => {
+            let n = values.len();
+            let mut v = vec![load_arg(*arg)];
+            for (j, &value) in values.iter().enumerate() {
+                // 一致したら残りの JEQ と DENY を飛ばして ALLOW へ
+                v.push(libc::sock_filter {
+                    code: BPF_JEQ_K,
+                    jt: (n - j) as u8,
+                    jf: 0,
+                    k: value,
+                });
+            }
+            v.push(ret(action_deny));
+            v.push(ret(action_allow));
+            v
+        }
+        Some(SeccompArgCheck::Errno(errno)) => vec![ret(0x0005_0000 | (errno & 0xffff))],
+    }
 }
 
 // ====================
@@ -1277,14 +1395,28 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     // ============================================
 
     // ABI v1 (Linux 5.13+) - 基本権限
-    // 注: EXECUTE (1 << 0) はサーバーでは不要のため定義しない
+    // B-230: EXECUTE・MAKE_CHAR/SOCK/FIFO/BLOCK/SYM も handled に入れて制限する（Landlock は handled に無い
+    // アクセスを制限しないので、以前は書き込みを許した外でもシンボリックリンク・ソケット・FIFO を作れた）。
+    // EXECUTE はどのパスにも許さない（サンドボックスの後に execve しない）。
+    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
     const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
     const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
     const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
     const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    // 制限するだけで、どのパスにも許さないアクセス（MAKE_SOCK は書き込みパスに許す）
+    const DENIED_EVERYWHERE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
     // ABI v2 (Linux 5.19+) - ファイル参照権限
     const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
@@ -1394,9 +1526,12 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         }
     };
 
+    // B-230: 書き込みパスでは UDS（`listen_unix` 等）を作れるようにする
+    let write_access = write_access | LANDLOCK_ACCESS_FS_MAKE_SOCK;
+
     // ルールセット作成
     let attr = LandlockRulesetAttr {
-        handled_access_fs: write_access,
+        handled_access_fs: write_access | DENIED_EVERYWHERE,
         handled_access_net: 0,
     };
 
@@ -1419,21 +1554,49 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         if path.is_empty() {
             continue;
         }
-        if let Ok(fd) = std::fs::File::open(path) {
-            use std::os::unix::io::AsRawFd;
-            let path_attr = LandlockPathBeneathAttr {
-                allowed_access: read_access,
-                parent_fd: fd.as_raw_fd(),
-            };
-            unsafe {
-                libc::syscall(
-                    LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    &path_attr as *const LandlockPathBeneathAttr,
-                    0u32,
+        // B-230: 開けないパス・追加に失敗したルールは黙って飛ばさず警告する（そのパスへのアクセスは拒否される）
+        let fd = match std::fs::File::open(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!(
+                    "Landlock: cannot open {} ({}); access to it will be denied",
+                    path, e
                 );
+                continue;
             }
+        };
+        use std::os::unix::io::AsRawFd;
+        // 通常のファイルに付けるルールは、ファイルに意味のあるアクセスだけにする（ディレクトリ用のビットを含むと EINVAL）
+        let is_dir = fd.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let allowed = if is_dir {
+            read_access
+        } else {
+            read_access
+                & (LANDLOCK_ACCESS_FS_READ_FILE
+                    | LANDLOCK_ACCESS_FS_WRITE_FILE
+                    | LANDLOCK_ACCESS_FS_TRUNCATE
+                    | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+        };
+        let path_attr = LandlockPathBeneathAttr {
+            allowed_access: allowed,
+            parent_fd: fd.as_raw_fd(),
+        };
+        let ret = unsafe {
+            libc::syscall(
+                LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_attr as *const LandlockPathBeneathAttr,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not add a read-only rule for {}: {}",
+                path,
+                io::Error::last_os_error()
+            );
+        } else {
             debug!("Landlock: Added read-only rule for {}", path);
         }
     }
@@ -1444,21 +1607,49 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         if path.is_empty() {
             continue;
         }
-        if let Ok(fd) = std::fs::File::open(path) {
-            use std::os::unix::io::AsRawFd;
-            let path_attr = LandlockPathBeneathAttr {
-                allowed_access: write_access,
-                parent_fd: fd.as_raw_fd(),
-            };
-            unsafe {
-                libc::syscall(
-                    LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    &path_attr as *const LandlockPathBeneathAttr,
-                    0u32,
+        // B-230: 開けないパス・追加に失敗したルールは黙って飛ばさず警告する（そのパスへのアクセスは拒否される）
+        let fd = match std::fs::File::open(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!(
+                    "Landlock: cannot open {} ({}); access to it will be denied",
+                    path, e
                 );
+                continue;
             }
+        };
+        use std::os::unix::io::AsRawFd;
+        // 通常のファイルに付けるルールは、ファイルに意味のあるアクセスだけにする（ディレクトリ用のビットを含むと EINVAL）
+        let is_dir = fd.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let allowed = if is_dir {
+            write_access
+        } else {
+            write_access
+                & (LANDLOCK_ACCESS_FS_READ_FILE
+                    | LANDLOCK_ACCESS_FS_WRITE_FILE
+                    | LANDLOCK_ACCESS_FS_TRUNCATE
+                    | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+        };
+        let path_attr = LandlockPathBeneathAttr {
+            allowed_access: allowed,
+            parent_fd: fd.as_raw_fd(),
+        };
+        let ret = unsafe {
+            libc::syscall(
+                LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_attr as *const LandlockPathBeneathAttr,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not add a read-write rule for {}: {}",
+                path,
+                io::Error::last_os_error()
+            );
+        } else {
             debug!("Landlock: Added read-write rule for {}", path);
         }
     }
@@ -1471,13 +1662,55 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
 
     let ret = unsafe { libc::syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
 
-    unsafe { libc::close(ruleset_fd) };
-
     if ret < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(ruleset_fd) };
+        return Err(e);
     }
 
+    // B-219: Landlock には seccomp の TSYNC に当たるものが無く、landlock_restrict_self は呼んだスレッドにしか掛からない。
+    // ruleset を閉じずに残し、先に作られた制御プレーンのスレッドのうちファイルを使わないもの（ヘルスチェック・
+    // Wasm の tick・Wasm の gRPC）が `landlock_restrict_current_thread` で自分に掛ける。
+    LANDLOCK_RULESET_FD.store(ruleset_fd, std::sync::atomic::Ordering::Release);
+
     Ok(())
+}
+
+// B-219: apply_landlock が作った ruleset の fd（未適用なら -1）。
+#[cfg(target_os = "linux")]
+static LANDLOCK_RULESET_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Applies the process's Landlock ruleset to the calling thread, once.
+///
+/// Landlock restricts only the thread that calls `landlock_restrict_self`, so control-plane threads started before
+/// the sandbox call this at the top of their loop. It does nothing until the ruleset exists, and nothing on other
+/// systems. Threads that read or write configuration or certificate files must not call it.
+pub fn landlock_restrict_current_thread() {
+    #[cfg(target_os = "linux")]
+    {
+        thread_local! {
+            static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if APPLIED.with(|a| a.get()) {
+            return;
+        }
+        let fd = LANDLOCK_RULESET_FD.load(std::sync::atomic::Ordering::Acquire);
+        if fd < 0 {
+            return;
+        }
+        APPLIED.with(|a| a.set(true));
+        // no_new_privs はスレッドごとの属性（seccomp の TSYNC が同期済みでも、Landlock だけのときは要る）
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        let ret = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) };
+        if ret < 0 {
+            warn!(
+                "Landlock: could not restrict a control-plane thread: {}",
+                io::Error::last_os_error()
+            );
+        } else {
+            debug!("Landlock: control-plane thread restricted");
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1520,6 +1753,31 @@ pub fn report_security_status() {
                     "Not available"
                 }
             );
+            // 理由: 起動時に 1 回だけ読む（データプレーンの前）
+            #[cfg(target_os = "linux")]
+            #[allow(clippy::disallowed_methods)]
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                info!(
+                    "Capabilities: effective={:#x} bounding={:#x}",
+                    caps::read_status_mask(&status, "CapEff").unwrap_or(0),
+                    caps::read_status_mask(&status, "CapBnd").unwrap_or(0)
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if let Some((applied, failed)) =
+                &*MOUNT_STATUS.lock().unwrap_or_else(|e| e.into_inner())
+            {
+                if failed.is_empty() {
+                    info!("Sandbox mounts: {} applied", applied);
+                } else {
+                    warn!(
+                        "Sandbox mounts: {} applied, {} failed ({})",
+                        applied,
+                        failed.len(),
+                        failed.join(", ")
+                    );
+                }
+            }
             info!("=================================");
         }
         Err(e) => {
@@ -1843,10 +2101,12 @@ pub fn apply_sandbox_setup(config: &SandboxConfig) -> io::Result<()> {
     // Namespace分離
     apply_namespaces(config)?;
 
-    // Mount namespace内でのbind mounts
-    if config.unshare_mount {
-        apply_mounts(config)?;
-    }
+    // Mount namespace内でのbind mounts（F-282: 失敗しても残りの設定は済ませてからエラーを返す）
+    let mounts = if config.unshare_mount {
+        apply_mounts(config)
+    } else {
+        Ok(())
+    };
 
     // ホスト名設定（UTS namespace分離時）
     if config.unshare_uts {
@@ -1855,6 +2115,7 @@ pub fn apply_sandbox_setup(config: &SandboxConfig) -> io::Result<()> {
         }
     }
 
+    mounts?;
     info!("Sandbox namespace/mount setup completed");
     Ok(())
 }
@@ -1982,60 +2243,69 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("Failed to set mount propagation: {}", e)))?;
     debug!("Mount propagation set to private");
 
+    // F-282: 失敗したマウントを集め、最後にまとめてエラーにする（呼び出し側は allow_security_failures = false なら
+    // 起動を止める）。ソースが無いバインドマウント（既定の一覧の /lib64 等）は失敗に数えない
+    let mut failed: Vec<String> = Vec::new();
+    let mut applied = 0usize;
+    let mut record = |what: String, result: io::Result<()>| match result {
+        Ok(()) => {
+            applied += 1;
+            debug!("Applied {}", what);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            debug!("Skipped {} (source does not exist)", what);
+        }
+        Err(e) => {
+            warn!("Failed to apply {}: {}", what, e);
+            failed.push(what);
+        }
+    };
+
     // 読み取り専用バインドマウント
     for bind in &config.ro_bind_mounts {
-        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, true) {
-            warn!(
-                "Failed to apply ro-bind mount {} -> {}: {}",
-                bind.source, bind.dest, e
-            );
-        } else {
-            debug!("Applied ro-bind mount: {} -> {}", bind.source, bind.dest);
-        }
+        record(
+            format!("ro-bind mount {} -> {}", bind.source, bind.dest),
+            apply_bind_mount(&bind.source, &bind.dest, true),
+        );
     }
 
     // 読み書きバインドマウント
     for bind in &config.rw_bind_mounts {
-        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, false) {
-            warn!(
-                "Failed to apply rw-bind mount {} -> {}: {}",
-                bind.source, bind.dest, e
-            );
-        } else {
-            debug!("Applied rw-bind mount: {} -> {}", bind.source, bind.dest);
-        }
+        record(
+            format!("rw-bind mount {} -> {}", bind.source, bind.dest),
+            apply_bind_mount(&bind.source, &bind.dest, false),
+        );
     }
 
     // tmpfsマウント
     for path in &config.tmpfs_mounts {
-        if let Err(e) = apply_tmpfs_mount(path) {
-            warn!("Failed to apply tmpfs mount at {}: {}", path, e);
-        } else {
-            debug!("Applied tmpfs mount: {}", path);
-        }
+        record(format!("tmpfs mount at {}", path), apply_tmpfs_mount(path));
     }
 
     // /proc マウント
     if config.mount_proc {
-        if let Err(e) = apply_proc_mount() {
-            warn!("Failed to mount /proc: {}", e);
-        } else {
-            debug!("Mounted /proc");
-        }
+        record("/proc mount".to_string(), apply_proc_mount());
     }
 
     // /dev マウント
     if config.mount_dev {
-        if let Err(e) = apply_dev_mount() {
-            warn!("Failed to mount /dev: {}", e);
-        } else {
-            debug!("Mounted minimal /dev");
-        }
+        record("minimal /dev".to_string(), apply_dev_mount());
     }
 
+    *MOUNT_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((applied, failed.clone()));
+    if !failed.is_empty() {
+        return Err(io::Error::other(format!(
+            "sandbox mounts failed: {}",
+            failed.join(", ")
+        )));
+    }
     info!("Mount configuration applied");
     Ok(())
 }
+
+/// サンドボックスのマウントの結果（成功した数, 失敗したもの）。`report_security_status` が出す（F-282）
+#[cfg(target_os = "linux")]
+static MOUNT_STATUS: std::sync::Mutex<Option<(usize, Vec<String>)>> = std::sync::Mutex::new(None);
 
 /// バインドマウントを適用
 #[cfg(target_os = "linux")]
@@ -2148,6 +2418,23 @@ fn apply_dev_mount() -> io::Result<()> {
 
     let dev_path = "/dev";
 
+    // 必須デバイスノード
+    let devices = ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+
+    // B-260: tmpfs を被せると元のデバイスノードはそのパスから見えなくなる。被せる前に O_PATH で開いておき、
+    // `/proc/self/fd/N` から bind する（以前は被せた後の空のパスを自分自身へ bind していて、/dev/null などが
+    // 空の通常ファイルになっていた）
+    let originals: Vec<Option<std::os::fd::OwnedFd>> = devices
+        .iter()
+        .map(|d| {
+            let c = std::ffi::CString::new(*d).ok()?;
+            // SAFETY: c は NUL 終端の C 文字列。戻り値の fd はここで所有する
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            // SAFETY: open が返した有効な fd を 1 度だけ所有する
+            (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+        })
+        .collect();
+
     // tmpfs を /dev にマウント
     if !Path::new(dev_path).exists() {
         std::fs::create_dir_all(dev_path)?;
@@ -2162,30 +2449,28 @@ fn apply_dev_mount() -> io::Result<()> {
     )
     .map_err(|e| io::Error::other(format!("Failed to mount tmpfs on /dev: {}", e)))?;
 
-    // 必須デバイスノードをバインドマウント
-    let devices = [
-        ("/dev/null", "/dev/null"),
-        ("/dev/zero", "/dev/zero"),
-        ("/dev/random", "/dev/random"),
-        ("/dev/urandom", "/dev/urandom"),
-    ];
-
-    for (src, dest) in &devices {
-        // タッチでファイルを作成
-        let dest_path = Path::new(dest);
-        if !dest_path.exists() {
+    // 必須デバイスノードを元のノードからバインドマウント
+    for (dest, original) in devices.iter().zip(&originals) {
+        let Some(original) = original else {
+            warn!("Device {} does not exist; not created in the sandbox", dest);
+            continue;
+        };
+        // バインド先（空のファイル）を作る
+        if !Path::new(dest).exists() {
             std::fs::File::create(dest)?;
         }
-
-        if let Err(e) = mount(
-            Some(*src),
+        let src = format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(original)
+        );
+        mount(
+            Some(src.as_str()),
             *dest,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
-        ) {
-            warn!("Failed to bind mount device {}: {}", dest, e);
-        }
+        )
+        .map_err(|e| io::Error::other(format!("Failed to bind mount device {}: {}", dest, e)))?;
     }
 
     // /dev/pts を作成
@@ -2222,10 +2507,13 @@ fn apply_hostname(hostname: &str) -> io::Result<()> {
 }
 
 /// Capabilities制限を適用
+///
+/// bounding set だけでなく、プロセスの全スレッドの effective・permitted・inheritable・ambient からも落とす
+/// （bounding set は `execve` 時の上限でしかなく、今持っている capability には効かない。B-250）。
 #[cfg(target_os = "linux")]
 fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
-    // keep_capabilitiesが指定されている場合
-    if !config.keep_capabilities.is_empty() {
+    let mask = if !config.keep_capabilities.is_empty() {
+        // keep_capabilities が指定されている場合: 保持するケイパビリティ以外を全てドロップ
         let keep_caps: Vec<Capability> = config
             .keep_capabilities
             .iter()
@@ -2236,50 +2524,233 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
             warn!("No valid capabilities found in keep_capabilities list");
             return Ok(());
         }
-
-        // 保持するケイパビリティ以外を全てドロップ
-        let all_caps = Capability::all();
-        for cap in all_caps {
-            if !keep_caps.contains(&cap) {
-                drop_capability(cap)?;
-            }
-        }
-
-        info!("Keeping only capabilities: {:?}", config.keep_capabilities);
-        return Ok(());
-    }
-
-    // drop_capabilitiesが指定されている場合
-    if !config.drop_capabilities.is_empty() {
+        Capability::all()
+            .into_iter()
+            .filter(|c| !keep_caps.contains(c))
+            .fold(0u64, |m, c| m | (1u64 << c as u32))
+    } else {
+        let mut mask = 0u64;
         for cap_name in &config.drop_capabilities {
             if let Some(cap) = Capability::parse_str(cap_name) {
-                drop_capability(cap)?;
+                mask |= 1u64 << cap as u32;
             } else {
                 warn!("Unknown capability: {}", cap_name);
             }
         }
-
-        info!("Dropped capabilities: {:?}", config.drop_capabilities);
+        mask
+    };
+    if mask == 0 {
+        return Ok(());
     }
 
+    let r = caps::drop_on_all_threads(mask)?;
+    if r.bounding_denied {
+        // CAP_SETPCAP が無い（root でない）。bounding set は execve 時の上限なので、今持つ集合を落とせていれば足りる
+        warn!("Could not drop capabilities from the bounding set (CAP_SETPCAP is missing); effective and permitted sets were dropped");
+    }
+    debug!("Capabilities dropped on {} thread(s)", r.threads);
+    if !config.keep_capabilities.is_empty() {
+        info!("Keeping only capabilities: {:?}", config.keep_capabilities);
+    } else {
+        info!("Dropped capabilities: {:?}", config.drop_capabilities);
+    }
     Ok(())
 }
 
-/// 単一のケイパビリティをドロップ
+/// capability の削除（スレッドごとの属性なので全スレッドへ配る）。
 #[cfg(target_os = "linux")]
-fn drop_capability(cap: Capability) -> io::Result<()> {
-    // PR_CAPBSET_DROP を使用してbounding setからケイパビリティを削除
-    let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as u32, 0, 0, 0) };
+mod caps {
+    use std::io;
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        // EINVAL は権限不足やケイパビリティが既にない場合
-        if err.raw_os_error() != Some(libc::EINVAL) {
-            debug!("Failed to drop capability {:?}: {}", cap, err);
-        }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
     }
 
-    Ok(())
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    /// 削除の結果。
+    pub(super) struct Dropped {
+        /// 落としたスレッドの数（呼び出したスレッドを含む）
+        pub threads: usize,
+        /// bounding set から落とせなかった（CAP_SETPCAP が無い）
+        pub bounding_denied: bool,
+    }
+
+    /// 呼び出したスレッドから `mask` の capability を落とす。signal handler からも呼ぶので
+    /// syscall だけを使う（アロケーション・ロック無し）。戻り値: 0 = 成功、1 = bounding set だけ拒否、負 = capset の errno。
+    fn drop_this_thread(mask: u64) -> i32 {
+        let mut bounding_denied = false;
+        // bounding set の削除には effective の CAP_SETPCAP が要るので capset より先に行う
+        for cap in 0..64u64 {
+            if mask & (1 << cap) == 0 {
+                continue;
+            }
+            // SAFETY: 引数は整数だけ
+            let r = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+            if r != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                bounding_denied = true;
+            }
+            // ambient は permitted・inheritable から外せば消えるが、明示的にも下げる（未対応の古いカーネルの EINVAL は無視）
+            // SAFETY: 引数は整数だけ
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
+                    cap as libc::c_ulong,
+                    0,
+                    0,
+                )
+            };
+        }
+        let mut hdr = Header {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [Data::default(); 2];
+        // SAFETY: hdr・data は capget の v3 の形（ヘッダ 1 個 + データ 2 個）で、この関数の間だけ生きる
+        if unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut Header, data.as_mut_ptr()) }
+            != 0
+        {
+            return -io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        for (i, d) in data.iter_mut().enumerate() {
+            let m = !((mask >> (32 * i)) as u32);
+            d.effective &= m;
+            d.permitted &= m;
+            d.inheritable &= m;
+        }
+        // SAFETY: 同上（pid 0 = 呼び出したスレッド自身。他のスレッドは変えられない）
+        if unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut Header, data.as_ptr()) } != 0 {
+            return -io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        i32::from(bounding_denied)
+    }
+
+    // 他のスレッドへ配る signal handler の入出力（handler はこれだけを触る）
+    static MASK: AtomicU64 = AtomicU64::new(0);
+    static ACKS: AtomicUsize = AtomicUsize::new(0);
+    static BOUNDING_DENIED: AtomicUsize = AtomicUsize::new(0);
+    static FAILED: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn on_signal(_: libc::c_int) {
+        // SAFETY: errno はスレッドローカル。handler が割り込んだ処理の errno を壊さないよう戻す
+        let errno = unsafe { *libc::__errno_location() };
+        let r = drop_this_thread(MASK.load(Ordering::Acquire));
+        if r < 0 {
+            FAILED.store(-r, Ordering::Release);
+        } else if r == 1 {
+            BOUNDING_DENIED.fetch_add(1, Ordering::Relaxed);
+        }
+        ACKS.fetch_add(1, Ordering::AcqRel);
+        unsafe { *libc::__errno_location() = errno };
+    }
+
+    fn task_ids() -> io::Result<Vec<libc::pid_t>> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir("/proc/self/task")? {
+            if let Some(tid) = e?.file_name().to_str().and_then(|s| s.parse().ok()) {
+                v.push(tid);
+            }
+        }
+        Ok(v)
+    }
+
+    /// プロセスの全スレッドから `mask` の capability を落とす（glibc が setuid を全スレッドへ配るのと同じ方法）。
+    /// 起動時に 1 回だけ呼ぶ（設定の読み込み・制御プレーンのスレッドは既に動いている）。
+    pub(super) fn drop_on_all_threads(mask: u64) -> io::Result<Dropped> {
+        // 呼び出したスレッドが先（この後に作るスレッドはこの集合を引き継ぐ）
+        let r = drop_this_thread(mask);
+        if r < 0 {
+            return Err(io::Error::from_raw_os_error(-r));
+        }
+        let mut bounding_denied = r == 1;
+
+        let sig = libc::SIGRTMIN() + 3;
+        MASK.store(mask, Ordering::Release);
+        ACKS.store(0, Ordering::Release);
+        BOUNDING_DENIED.store(0, Ordering::Release);
+        FAILED.store(0, Ordering::Release);
+        // SAFETY: handler は async-signal-safe（syscall と atomics だけ）。SA_RESTART で割り込まれた syscall は再開する
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // SAFETY: 引数無しの syscall
+        let me = unsafe { libc::gettid() };
+        let pid = std::process::id() as libc::pid_t;
+        let mut done: Vec<libc::pid_t> = vec![me];
+        let mut sent = 0usize;
+        // 送っている間に作られたスレッドは作った側の（まだ落としていない）集合を引き継ぐので、新しいスレッドが無くなるまで繰り返す
+        loop {
+            let mut new = 0;
+            for tid in task_ids()? {
+                if done.contains(&tid) {
+                    continue;
+                }
+                done.push(tid);
+                // SAFETY: 自プロセスのスレッドへ送るだけ。終了済み（ESRCH）は数えない
+                if unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, sig) } == 0 {
+                    sent += 1;
+                }
+                new += 1;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ACKS.load(Ordering::Acquire) < sent {
+                if std::time::Instant::now() > deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "only {} of {} threads dropped their capabilities",
+                            ACKS.load(Ordering::Acquire),
+                            sent
+                        ),
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            if new == 0 {
+                break;
+            }
+        }
+        let failed = FAILED.load(Ordering::Acquire);
+        if failed != 0 {
+            return Err(io::Error::from_raw_os_error(failed));
+        }
+        bounding_denied |= BOUNDING_DENIED.load(Ordering::Acquire) > 0;
+        Ok(Dropped {
+            threads: sent + 1,
+            bounding_denied,
+        })
+    }
+
+    /// `/proc/<path>/status` の capability の行（`CapEff` 等）を 16 進で読む。
+    pub(super) fn read_status_mask(status: &str, key: &str) -> Option<u64> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+    }
 }
 
 /// サンドボックスの推奨設定を生成
@@ -3466,18 +3937,19 @@ pub mod pledge_unveil {
 // - ネットワークは `(allow network*)` で無条件許可する。プロキシ/upstream 構成の
 //   把握（listen/connect 先の網羅）を静的にはできず、誤って絞ると起動不能になる
 //   リスクの方が高いため、ネットワーク面はサンドボックスの対象外とする。
-// - ファイル読み取りは `(allow file-read*)` で無条件許可する。TLS 証明書・設定・
-//   WASM モジュール・共有ライブラリ等の読み取りパスを実行時に完全列挙するのは
-//   困難（動的リンカや DNS 解決ライブラリが参照する暗黙のパスを含む）で、
-//   誤って絞ると起動不能または TLS ハンドシェイク失敗を招く。
-// - ファイル**書き込み**のみ、設定から導出したログ/ディスクキャッシュディレクトリの
-//   `subpath` に限定する（`(deny default)` の恩恵が最も大きく、かつ誤検知リスクが
-//   低い面）。静的ファイルルート・証明書/鍵は読み取り専用のため明示 allow は不要
-//   （`file-read*` が既に無条件許可のため）だが、将来ここを絞る際の参照点として
-//   `static_roots`/`read_only` もプロファイルへ明示コメントとして残す。
-// - `process*`（fork/exec 監視外の意）・`signal (target self)`・`mach-lookup`
-//   （XPC・システムサービス解決に必要）・`system-socket` を許可し、通常起動を
-//   妨げないようにする。
+// - ファイル読み取りは設定から導出したパス（設定ファイル・証明書・鍵・CA・トークン・JWKS・WASM
+//   モジュール・静的ルート・ログ/キャッシュ）と、動的リンカ・DNS 解決・信頼ストア・タイムゾーンが
+//   参照するシステムのパス（`SYSTEM_READ_SUBPATHS`）の `subpath` に限る（F-282 SB-12）。
+//   証明書・鍵などのファイルは親ディレクトリごと許す（シークレットの差し替えはディレクトリ内の
+//   シンボリックリンクの付け替えで行われ、ファイル単体だと付け替え後の実体を読めない）。
+//   メタデータの読み取り（`stat`）は経路のたどりに要るので無条件に許す（内容は読めない）。
+//   許すパスは起動時に決まる。リロードで新しい場所を指すと、証明書・鍵はリロードが失敗し（稼働中の
+//   設定は残る）、静的ルートは 404 になる。
+// - ファイル書き込みは設定から導出したログ/ディスクキャッシュ/ACME の保存先/アップロードの一時
+//   ディレクトリ・UDS の `subpath` に限る。
+// - `process-fork`・`process-exec` は許さない（`deny default` のまま。veil は起動後に子プロセスを
+//   作らない）。`signal (target self)`・`mach-lookup`（XPC・DNS・trustd 等のシステムサービス
+//   解決に必要）・`system-socket` は許可する。
 #[cfg(target_os = "macos")]
 pub mod macos_sandbox {
     use ftlog::info;
@@ -3508,18 +3980,39 @@ pub mod macos_sandbox {
     /// 今回は使わない）。
     const SANDBOX_LITERAL_PROFILE: u64 = 0;
 
-    /// プロファイル生成に使う設定由来のパス集合。
+    /// プロファイル生成に使う設定由来のパス集合（絶対パス。相対パスは収集時に作業ディレクトリで
+    /// 解決する）。
     #[derive(Debug, Clone, Default)]
     pub struct SandboxPaths {
-        /// 静的ファイル配信のルートディレクトリ（読み取り専用。現行プロファイルでは
-        /// `file-read*` を無条件許可するため実効的には冗長だが、将来の tightening の
-        /// 参照点としてプロファイルへ明示コメント出力する）。
+        /// 静的ファイル配信のルートディレクトリ（読み取り専用、`subpath`）。
         pub static_roots: Vec<PathBuf>,
-        /// TLS 証明書・秘密鍵ファイル（読み取り専用。上記と同じ理由で現状は冗長）。
+        /// 設定ファイル・TLS 証明書・秘密鍵・CA・トークン・JWKS・WASM モジュール（読み取り専用。
+        /// 親ディレクトリごと許す）。
         pub read_only: Vec<PathBuf>,
-        /// アクセスログ/アプリログ・ディスクキャッシュのディレクトリ（読み書き許可）。
+        /// アクセスログ/アプリログ・ディスクキャッシュ・ACME の保存先等のディレクトリと UDS
+        /// （読み書き許可、`subpath`）。
         pub read_write: Vec<PathBuf>,
     }
+
+    /// 設定に依らず読み取りを許すシステムのパス（Seatbelt はシンボリックリンクを解決した実体の
+    /// パスで照合するので `/etc`・`/var` ではなく `/private/...` で書く）。
+    ///
+    /// - `/usr/lib`・`/System`・`/private/var/db/dyld`: 動的リンカと共有キャッシュ。
+    /// - `/private/etc`・`/private/var/run/resolv.conf`: `hosts`・`resolv.conf`・`services` 等の名前解決。
+    /// - `/Library/Keychains`・`/private/etc/ssl`: 上流の TLS 検証の信頼ストア。
+    /// - `/usr/share`・`/private/var/db/timezone`: タイムゾーン・ロケール。
+    /// - `/dev`: `/dev/urandom`・`/dev/null`。
+    pub const SYSTEM_READ_SUBPATHS: &[&str] = &[
+        "/usr/lib",
+        "/usr/share",
+        "/System",
+        "/Library/Keychains",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/private/var/db/timezone",
+        "/private/var/run/resolv.conf",
+        "/dev",
+    ];
 
     /// SBPL 文字列リテラル内へ安全に埋め込めるようエスケープする（`\` と `"` のみ）。
     fn escape_sbpl_string(path: &Path) -> String {
@@ -3528,44 +4021,77 @@ pub mod macos_sandbox {
             .replace('"', "\\\"")
     }
 
+    /// `path` と、実在すればシンボリックリンクを解決した実体（`/tmp` → `/private/tmp` 等）の
+    /// 両方を `(subpath ..)` として足す。ルート `/` は足さない（全体の許可になる）。
+    fn push_subpath(out: &mut String, path: &Path) {
+        let mut push = |p: &Path| {
+            if p.as_os_str().is_empty() || p == Path::new("/") {
+                return;
+            }
+            let line = format!("  (subpath \"{}\")\n", escape_sbpl_string(p));
+            if !out.contains(&line) {
+                out.push_str(&line);
+            }
+        };
+        push(path);
+        // 起動時コールドパス（プロファイル生成時に 1 回）。静的配信の経路ではない。
+        #[allow(clippy::disallowed_methods)]
+        let real = std::fs::canonicalize(path);
+        if let Ok(real) = real {
+            push(&real);
+        }
+    }
+
+    /// ファイルなら親ディレクトリ（ルート直下のファイルはファイル自体）、ディレクトリならそれ自体。
+    fn read_only_scope(path: &Path) -> &Path {
+        if path.is_dir() {
+            return path;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() && parent != Path::new("/") => parent,
+            _ => path,
+        }
+    }
+
     /// 設定から導出したパス集合から SBPL プロファイル文字列を生成する。
     ///
-    /// 最小構成: `(deny default)` を基点に `process*`/`network*`/`file-read*` を
-    /// 無条件許可し、書き込みのみ `read_write` の `subpath` に限定する（モジュール
-    /// 冒頭の設計判断コメント参照）。
+    /// `(deny default)` を基点に、読み取りは `SYSTEM_READ_SUBPATHS` と設定由来のパス、書き込みは
+    /// `read_write` の `subpath` に限る（モジュール冒頭の設計判断コメント参照）。
     pub fn build_profile(paths: &SandboxPaths) -> String {
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
-             (allow process-fork)\n\
-             (allow process-exec)\n\
              (allow signal (target self))\n\
              (allow mach-lookup)\n\
              (allow system-socket)\n\
              (allow network*)\n\
-             (allow file-read*)\n",
+             (allow file-read-metadata)\n",
         );
+
+        let mut read = String::new();
+        for p in SYSTEM_READ_SUBPATHS {
+            push_subpath(&mut read, Path::new(p));
+        }
+        for p in &paths.static_roots {
+            push_subpath(&mut read, p);
+        }
+        for p in &paths.read_only {
+            push_subpath(&mut read, read_only_scope(p));
+        }
+        profile.push_str("(allow file-read*\n");
+        profile.push_str(&read);
+        profile.push_str(")\n");
 
         if paths.read_write.is_empty() {
             profile.push_str("; no read-write subpaths configured\n");
         } else {
-            profile.push_str("(allow file-write*\n");
+            let mut rw = String::new();
             for p in &paths.read_write {
-                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl_string(p)));
+                push_subpath(&mut rw, p);
             }
+            profile.push_str("(allow file-read* file-write*\n");
+            profile.push_str(&rw);
             profile.push_str(")\n");
-        }
-
-        // 現状 file-read* が無条件許可のため以下は実効的に冗長だが、将来
-        // file-read* を絞る際の対象パスとして明示しておく（保守目的のコメント）。
-        if !paths.static_roots.is_empty() || !paths.read_only.is_empty() {
-            profile.push_str("; read-only paths (informational; already covered by file-read*):\n");
-            for p in paths.static_roots.iter().chain(paths.read_only.iter()) {
-                profile.push_str(&format!(
-                    "; (allow file-read* (subpath \"{}\"))\n",
-                    escape_sbpl_string(p)
-                ));
-            }
         }
 
         profile
@@ -3601,7 +4127,7 @@ pub mod macos_sandbox {
                 message
             )));
         }
-        info!("macos sandbox: sandbox_init applied (Seatbelt, deny-default + limited file-write)");
+        info!("macos sandbox: sandbox_init applied (Seatbelt, deny-default + limited file-read and file-write)");
         Ok(())
     }
 }
@@ -4158,6 +4684,8 @@ mod tests {
             ("getrandom", libc::SYS_getrandom),
             ("prlimit64", libc::SYS_prlimit64),
             ("rt_sigreturn", libc::SYS_rt_sigreturn),
+            // B-252: 止められた（SIGSTOP・ptrace）clock_nanosleep の再開。EPERM だと std の sleep が panic する
+            ("restart_syscall", libc::SYS_restart_syscall),
             ("futex", libc::SYS_futex),
             ("openat2", libc::SYS_openat2),
             ("eventfd2", libc::SYS_eventfd2),
@@ -4166,10 +4694,37 @@ mod tests {
             ("sched_yield", libc::SYS_sched_yield),
             ("getcpu", libc::SYS_getcpu),
             ("mlock2", libc::SYS_mlock2),
+            // F-272: 静的配信のディスク監視（専用スレッド）
+            ("getdents64", libc::SYS_getdents64),
+            ("inotify_init1", libc::SYS_inotify_init1),
+            ("inotify_add_watch", libc::SYS_inotify_add_watch),
+            ("inotify_rm_watch", libc::SYS_inotify_rm_watch),
+            // B-220・B-219: UDS のリスナーの dup・スピルオーバー・ACME の証明書の保存
+            ("dup", libc::SYS_dup),
+            ("dup3", libc::SYS_dup3),
+            ("unlinkat", libc::SYS_unlinkat),
+            ("mkdirat", libc::SYS_mkdirat),
+            ("renameat", libc::SYS_renameat),
+            ("renameat2", libc::SYS_renameat2),
+            ("fchmod", libc::SYS_fchmod),
+            ("fchmodat", libc::SYS_fchmodat),
+            ("landlock_restrict_self", libc::SYS_landlock_restrict_self),
         ];
         for (name, nr) in required {
             assert!(
                 ALLOWED_SYSCALLS.contains(nr),
+                "{name} ({nr}) が seccomp 許可リストに無い"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        for (name, nr) in [
+            ("unlink", libc::SYS_unlink),
+            ("mkdir", libc::SYS_mkdir),
+            ("rename", libc::SYS_rename),
+            ("chmod", libc::SYS_chmod),
+        ] {
+            assert!(
+                ALLOWED_SYSCALLS.contains(&nr),
                 "{name} ({nr}) が seccomp 許可リストに無い"
             );
         }
@@ -4376,6 +4931,303 @@ mod tests {
         );
     }
 
+    /// F-278: 引数を検査する syscall はどれも許可リストにある（無ければ検査は使われず丸ごと拒否になる）。
+    /// 権限降格の syscall は seccomp の前に終わるので許可リストに無い。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_seccomp_arg_checks_are_in_allow_list() {
+        for (nr, check) in seccomp_arg_checks() {
+            assert!(
+                ALLOWED_SYSCALLS.contains(&(nr as i64)),
+                "syscall {nr} has an argument check ({check:?}) but is not allowed"
+            );
+        }
+        for nr in [
+            libc::SYS_setgroups,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
+            libc::SYS_unshare,
+            libc::SYS_setns,
+        ] {
+            assert!(
+                !ALLOWED_SYSCALLS.contains(&nr),
+                "syscall {nr} must not be allowed"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        for nr in [libc::SYS_setuid, libc::SYS_setgid] {
+            assert!(
+                !ALLOWED_SYSCALLS.contains(&nr),
+                "syscall {nr} must not be allowed"
+            );
+        }
+    }
+
+    /// F-278: 引数の検査を子プロセスで実際に確かめる。終了コードのビット:
+    ///   1: socket(AF_INET) は通る / 2: socket(AF_PACKET) は EPERM / 4: ioctl(FIONBIO) は通る /
+    ///   8: 一覧に無い ioctl は EPERM / 16: prctl(PR_SET_NAME) は通る / 32: prctl(PR_SET_DUMPABLE) は EPERM /
+    ///   64: clone(CLONE_NEWUSER) は EPERM / 128: clone3 は ENOSYS で pthread_create は通る（clone へ戻る）
+    /// tgkill はフィルタを作ったプロセス（親）宛てだけ通るので、子からは親宛てが通り自分宛てが EPERM になる。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_argument_filters() {
+        extern "C" fn noop(p: *mut libc::c_void) -> *mut libc::c_void {
+            p
+        }
+        fn errno() -> i32 {
+            unsafe { *libc::__errno_location() }
+        }
+        fn probe_args() -> i32 {
+            let mut bits = 0;
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd >= 0 {
+                bits |= 1;
+            }
+            if unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 2;
+            }
+            let mut on: libc::c_int = 1;
+            if unsafe { libc::ioctl(fd, libc::FIONBIO, &mut on) } == 0 {
+                bits |= 4;
+            }
+            let mut buf = [0u8; 64];
+            if unsafe { libc::ioctl(fd, libc::SIOCGIFCONF, buf.as_mut_ptr()) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 8;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_NAME, c"probe".as_ptr(), 0, 0, 0) } == 0 {
+                bits |= 16;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } < 0
+                && errno() == libc::EPERM
+            {
+                bits |= 32;
+            }
+            let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+            let r = unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) };
+            if r == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            if r < 0 && errno() == libc::EPERM {
+                bits |= 64;
+            }
+            let r3 = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+            let clone3_enosys = r3 < 0 && errno() == libc::ENOSYS;
+            let mut th = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+            let created = unsafe {
+                libc::pthread_create(
+                    th.as_mut_ptr(),
+                    std::ptr::null(),
+                    noop,
+                    std::ptr::null_mut(),
+                )
+            };
+            if clone3_enosys && created == 0 {
+                unsafe { libc::pthread_join(th.assume_init(), std::ptr::null_mut()) };
+                bits |= 128;
+            }
+            bits
+        }
+        fn probe_tgkill() -> i32 {
+            let mut bits = 0;
+            let parent = unsafe { libc::getppid() };
+            if unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) } == 0 {
+                bits |= 1;
+            }
+            let me = unsafe { libc::getpid() };
+            if unsafe { libc::syscall(libc::SYS_tgkill, me, me, 0) } < 0 && errno() == libc::EPERM {
+                bits |= 2;
+            }
+            bits
+        }
+
+        // フィルタはフォーク前に構築する（子では heap alloc しない）。tgkill の許可先はこのプロセス
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        let run = |probe: fn() -> i32| -> i32 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                    unsafe { libc::_exit(250) };
+                }
+                let applied = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &prog as *const libc::sock_fprog,
+                        0,
+                        0,
+                    )
+                };
+                if applied != 0 {
+                    unsafe { libc::_exit(250) };
+                }
+                unsafe { libc::_exit(probe()) };
+            }
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child died: {status:#x}");
+            libc::WEXITSTATUS(status)
+        };
+
+        let code = run(probe_args);
+        if code == 250 {
+            eprintln!("seccomp could not be applied; skipping");
+            return;
+        }
+        assert_eq!(code, 255, "argument filters (bits {code:#010b})");
+        let code = run(probe_tgkill);
+        assert_eq!(code, 3, "tgkill filter (bits {code:#04b})");
+    }
+
+    /// F-283: 組み上げたフィルタをテスト内の小さな BPF インタプリタで実行し、判定を固定する
+    /// （許可リストや引数の検査を変えたときに、arch・x32・PROT_EXEC などの拒否が崩れないように）。
+    #[cfg(target_os = "linux")]
+    fn run_seccomp_bpf(filter: &[libc::sock_filter], nr: u32, arch: u32, args: [u64; 6]) -> u32 {
+        // struct seccomp_data { int nr; u32 arch; u64 ip; u64 args[6]; }（リトルエンディアン）
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        for (i, a) in args.iter().enumerate() {
+            data[16 + 8 * i..24 + 8 * i].copy_from_slice(&a.to_le_bytes());
+        }
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        loop {
+            let ins = filter[pc];
+            match ins.code {
+                0x20 => {
+                    // BPF_LD | BPF_W | BPF_ABS
+                    let k = ins.k as usize;
+                    acc = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+                    pc += 1;
+                }
+                0x15 | 0x45 => {
+                    // BPF_JMP | BPF_JEQ | BPF_K / BPF_JMP | BPF_JSET | BPF_K
+                    let hit = if ins.code == 0x15 {
+                        acc == ins.k
+                    } else {
+                        acc & ins.k != 0
+                    };
+                    pc += 1 + if hit { ins.jt } else { ins.jf } as usize;
+                }
+                0x06 => return ins.k,
+                code => panic!("unexpected BPF instruction {code:#x} at {pc}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_seccomp_filter_decisions() {
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: u32 = 0xc000003e;
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: u32 = 0xc00000b7;
+        const ALLOW: u32 = 0x7fff0000;
+        const EPERM: u32 = 0x00050000 | libc::EPERM as u32;
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let run = |nr: i64, args: [u64; 6]| run_seccomp_bpf(&filter, nr as u32, ARCH, args);
+        let prot_rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let prot_x = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+
+        // 別の arch（x86_64 なら i386 の番号体系）は全部拒否
+        assert_eq!(
+            run_seccomp_bpf(&filter, libc::SYS_read as u32, 0x40000003, [0; 6]),
+            EPERM
+        );
+        // x32 の番号（bit 30）は許可リストの番号と一致しないので拒否
+        assert_eq!(run(libc::SYS_read | 0x4000_0000, [0; 6]), EPERM);
+        assert_eq!(run(libc::SYS_read, [0; 6]), ALLOW);
+        // PROT_EXEC
+        assert_eq!(run(libc::SYS_mmap, [0, 4096, prot_rw, 0, 0, 0]), ALLOW);
+        assert_eq!(run(libc::SYS_mmap, [0, 4096, prot_x, 0, 0, 0]), EPERM);
+        assert_eq!(run(libc::SYS_mprotect, [0, 4096, prot_rw, 0, 0, 0]), ALLOW);
+        assert_eq!(run(libc::SYS_mprotect, [0, 4096, prot_x, 0, 0, 0]), EPERM);
+        // pkey_mprotect は許可していない（PROT_EXEC の検査を迂回させない）
+        assert_eq!(
+            run(libc::SYS_pkey_mprotect, [0, 4096, prot_rw, 0, 0, 0]),
+            EPERM
+        );
+        // 引数の上位 32bit は見ない（下位 32bit の値で判定する）
+        assert_eq!(
+            run(libc::SYS_socket, [libc::AF_INET as u64, 1, 0, 0, 0, 0]),
+            ALLOW
+        );
+        assert_eq!(
+            run(libc::SYS_socket, [libc::AF_PACKET as u64, 3, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(
+            run(
+                libc::SYS_clone,
+                [(libc::CLONE_VM | libc::CLONE_THREAD) as u64, 0, 0, 0, 0, 0]
+            ),
+            ALLOW
+        );
+        assert_eq!(
+            run(libc::SYS_clone, [libc::CLONE_NEWNET as u64, 0, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(
+            run(libc::SYS_clone3, [0; 6]),
+            0x00050000 | libc::ENOSYS as u32
+        );
+        assert_eq!(run(libc::SYS_setresuid, [0; 6]), EPERM);
+
+        // 引数の検査の無い許可済みの syscall はどれも ALLOW（ジャンプ先のずれの検出）
+        let checked: Vec<u32> = seccomp_arg_checks().iter().map(|(n, _)| *n).collect();
+        for &nr in ALLOWED_SYSCALLS {
+            if !checked.contains(&(nr as u32)) {
+                assert_eq!(run(nr, [0; 6]), ALLOW, "syscall {nr} must be allowed");
+            }
+        }
+
+        // strict・log でも拒否の動作だけが変わる
+        let strict = build_seccomp_filter(SeccompMode::Strict).expect("build filter");
+        assert_eq!(
+            run_seccomp_bpf(
+                &strict,
+                libc::SYS_socket as u32,
+                ARCH,
+                [libc::AF_PACKET as u64, 0, 0, 0, 0, 0]
+            ),
+            0x80000000
+        );
+        let log = build_seccomp_filter(SeccompMode::Log).expect("build filter");
+        assert_eq!(
+            run_seccomp_bpf(&log, libc::SYS_setresuid as u32, ARCH, [0; 6]),
+            0x7ffc0000
+        );
+    }
+
+    /// F-278: 許可リストが長くなってもフィルタは壊れない（ジャンプはブロック内だけ）。全モードで組めて、
+    /// 引数の検査の無い syscall のブロックは 1 命令。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_seccomp_filter_layout() {
+        for mode in [SeccompMode::Log, SeccompMode::Filter, SeccompMode::Strict] {
+            let filter = build_seccomp_filter(mode).expect("build filter");
+            let checks = seccomp_arg_checks();
+            let extra: usize = checks
+                .iter()
+                .map(|(_, c)| seccomp_block(Some(c), 0, 0).len() - 1)
+                .sum();
+            // arch の検査 3 + nr のロード 1 + syscall ごとに JEQ と RET + 検査の追加分 + 末尾の DENY
+            assert_eq!(filter.len(), 4 + 2 * ALLOWED_SYSCALLS.len() + extra + 1);
+        }
+    }
+
     /// F-54: 許可リスト**外**のシステムコールが seccomp で実際に拒否される（意図的発火）ことを
     /// 子プロセスで実機検証する。
     ///
@@ -4466,6 +5318,71 @@ mod tests {
         );
     }
 
+    /// B-254: Strict の違反はプロセスごと落とす。違反したのが主スレッド以外でも、
+    /// 違反したスレッドだけが消えて残りが動き続けてはいけない（SECCOMP_RET_KILL_THREAD との区別）。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_strict_kills_whole_process_from_other_thread() {
+        const PTRACE_TRACEME: libc::c_long = 0;
+
+        extern "C" fn violate(_: *mut libc::c_void) -> *mut libc::c_void {
+            unsafe { libc::syscall(libc::SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) };
+            std::ptr::null_mut()
+        }
+
+        let filter = build_seccomp_filter(SeccompMode::Strict).expect("build strict filter");
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                unsafe { libc::_exit(42) };
+            }
+            let applied = unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &prog as *const libc::sock_fprog,
+                    0,
+                    0,
+                )
+            };
+            if applied != 0 {
+                unsafe { libc::_exit(42) };
+            }
+            // 子スレッドで禁止 syscall を呼ぶ。KILL_THREAD なら join が返り、主スレッドが _exit(3) する
+            // pthread_t は glibc では整数、musl ではポインタなので 0 で初期化しない
+            let mut th = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+            let rc = unsafe {
+                libc::pthread_create(
+                    th.as_mut_ptr(),
+                    std::ptr::null(),
+                    violate,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                unsafe { libc::_exit(43) };
+            }
+            // SAFETY: pthread_create が成功したので th は初期化済み
+            unsafe { libc::pthread_join(th.assume_init(), std::ptr::null_mut()) };
+            unsafe { libc::_exit(3) };
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFEXITED(status) && matches!(libc::WEXITSTATUS(status), 42 | 43) {
+            eprintln!("seccomp strict or thread creation unavailable; skipping");
+            return;
+        }
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "Strict mode: a violation in another thread must kill the whole process (status {status:#x})"
+        );
+    }
+
     // ====================
     // macOS sandbox_init プロファイル生成テスト（F-125）
     // ====================
@@ -4490,9 +5407,26 @@ mod tests {
         assert!(profile.starts_with("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow network*)"));
-        assert!(profile.contains("(allow file-read*)"));
+        // F-282 SB-12: 読み取りは無条件ではなく subpath に限る。fork・exec は許さない
+        assert!(!profile.contains("(allow file-read*)"));
+        assert!(!profile.contains("process-fork"));
+        assert!(!profile.contains("process-exec"));
+        assert!(profile.contains("(subpath \"/srv/www\")"));
+        // ファイルは親ディレクトリごと（シークレットのシンボリックリンクの付け替えに追従する）
+        assert!(profile.contains("(subpath \"/etc/veil/tls\")"));
+        assert!(profile.contains("(subpath \"/usr/lib\")"));
         assert!(profile.contains("(subpath \"/var/log/veil\")"));
         assert!(profile.contains("(subpath \"/var/cache/veil\")"));
+        assert!(profile.contains("(allow file-read* file-write*"));
+        // ルートは足さない
+        let root_only = SandboxPaths {
+            read_only: vec![PathBuf::from("/cert.pem")],
+            static_roots: vec![PathBuf::from("/")],
+            ..Default::default()
+        };
+        let profile = build_profile(&root_only);
+        assert!(!profile.contains("(subpath \"/\")"));
+        assert!(profile.contains("(subpath \"/cert.pem\")"));
     }
 
     #[test]
@@ -4502,6 +5436,370 @@ mod tests {
 
         let profile = build_profile(&SandboxPaths::default());
         assert!(profile.contains("(deny default)"));
-        assert!(!profile.contains("(allow file-write*"));
+        assert!(!profile.contains("file-write*"));
+    }
+
+    // F-282 SB-12: 生成したプロファイルを子プロセスで実際に適用し、許したパスは読めて、許していない
+    // パスは読めず、子プロセスを起動できないことを確かめる（適用は不可逆なので子の中で行う）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn test_macos_sandbox_profile_enforced_in_child() {
+        use super::macos_sandbox::{apply, build_profile, SandboxPaths};
+        use std::path::PathBuf;
+
+        const CHILD_ENV: &str = "VEIL_SB12_SANDBOX_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD_ENV) {
+            let dir = PathBuf::from(dir);
+            let allowed = dir.join("allowed");
+            let denied = dir.join("denied");
+            let profile = build_profile(&SandboxPaths {
+                read_only: vec![allowed.join("cert.pem")],
+                read_write: vec![dir.join("logs")],
+                ..Default::default()
+            });
+            apply(&profile).expect("sandbox_init");
+            assert_eq!(
+                std::fs::read_to_string(allowed.join("cert.pem")).unwrap(),
+                "ok"
+            );
+            assert!(std::fs::read_to_string(denied.join("secret")).is_err());
+            std::fs::write(dir.join("logs").join("out.log"), "x").unwrap();
+            assert!(std::fs::write(denied.join("x"), "x").is_err());
+            // 共有ライブラリ・名前解決のシステムパスは読める
+            assert!(
+                std::fs::metadata("/usr/lib/libSystem.B.dylib").is_ok()
+                    || std::fs::read_dir("/usr/lib").is_ok()
+            );
+            assert!(std::fs::read_to_string("/etc/hosts").is_ok());
+            assert!(std::process::Command::new("/usr/bin/true")
+                .status()
+                .is_err());
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["allowed", "denied", "logs"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("allowed").join("cert.pem"), "ok").unwrap();
+        std::fs::write(dir.path().join("denied").join("secret"), "no").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::tests::test_macos_sandbox_profile_enforced_in_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// B-230: Landlock の handled に MAKE_SYM・MAKE_FIFO 等が入り、書き込みを許したディレクトリの外ではシンボリックリンク・
+// UDS を作れず、中でも FIFO・シンボリックリンクは作れない（UDS は作れる）。Landlock はプロセス（スレッド）に
+// 掛かったら外せないので、試験は自分を子プロセスとして起動して子の中で確かめる。
+#[cfg(all(test, target_os = "linux"))]
+mod landlock_b230_tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "VEIL_LANDLOCK_B230_CHILD";
+
+    // 理由: 試験の子プロセス（データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn child() -> i32 {
+        let base = std::env::var(CHILD_ENV).unwrap();
+        let allowed = format!("{base}/allowed");
+        let other = format!("{base}/other");
+        let config = SecurityConfig {
+            landlock_read_paths: vec![other.clone()],
+            landlock_write_paths: vec![allowed.clone()],
+            ..SecurityConfig::default()
+        };
+        if let Err(e) = apply_landlock(&config) {
+            eprintln!("landlock unavailable: {e}");
+            return 0;
+        }
+        let denied =
+            |r: io::Result<()>| matches!(r, Err(ref e) if e.raw_os_error() == Some(libc::EACCES));
+        let mkfifo = |p: &str| -> io::Result<()> {
+            let c = std::ffi::CString::new(p).unwrap();
+            if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        };
+        let bind = |p: &str| std::os::unix::net::UnixListener::bind(p).map(|_| ());
+        let mut fails = 0;
+        let mut check = |ok: bool, what: &str| {
+            if !ok {
+                eprintln!("FAILED: {what}");
+                fails += 1;
+            }
+        };
+        check(
+            denied(std::os::unix::fs::symlink("/", format!("{other}/l"))),
+            "symlink outside",
+        );
+        check(denied(bind(&format!("{other}/s"))), "bind outside");
+        check(
+            denied(std::os::unix::fs::symlink("/", format!("{allowed}/l"))),
+            "symlink inside",
+        );
+        check(denied(mkfifo(&format!("{allowed}/f"))), "fifo inside");
+        check(bind(&format!("{allowed}/s")).is_ok(), "bind inside");
+        check(
+            std::fs::write(format!("{allowed}/r"), b"x").is_ok(),
+            "regular file inside",
+        );
+        fails
+    }
+
+    #[test]
+    fn landlock_restricts_special_files() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        let base = std::env::temp_dir().join(format!("veil-b230-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("allowed")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        // 理由: 試験。Landlock を掛ける子プロセスとして自分を起動する
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::landlock_b230_tests::landlock_restricts_special_files",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, &base)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// F-282・B-260: マウントの失敗はエラーにし、/dev のノードは元のデバイスのまま
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_mount_tests {
+    use super::*;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    const CHILD_ENV: &str = "VEIL_F282_MOUNT_CHILD";
+
+    // 理由: 試験
+    #[allow(clippy::disallowed_methods)]
+    fn child() -> i32 {
+        // SAFETY: 引数無しの unshare。このプロセスだけのマウント名前空間にする
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            eprintln!("FAILED: unshare: {}", io::Error::last_os_error());
+            return 1;
+        }
+        let cfg = SandboxConfig {
+            // sysfs にはディレクトリを作れない → 失敗として数える
+            tmpfs_mounts: vec!["/sys/kernel/veil-f282-test".into()],
+            mount_dev: true,
+            ..Default::default()
+        };
+        let mut fails = 0;
+        match apply_mounts(&cfg) {
+            Ok(()) => {
+                eprintln!("FAILED: a failed mount must be an error");
+                fails += 1;
+            }
+            Err(e)
+                if e.to_string()
+                    .contains("tmpfs mount at /sys/kernel/veil-f282-test") => {}
+            Err(e) => {
+                eprintln!("FAILED: unexpected error: {e}");
+                fails += 1;
+            }
+        }
+        let status = MOUNT_STATUS.lock().unwrap().clone();
+        if status
+            != Some((
+                1,
+                vec!["tmpfs mount at /sys/kernel/veil-f282-test".to_string()],
+            ))
+        {
+            eprintln!("FAILED: mount status {status:?}");
+            fails += 1;
+        }
+        // B-260: /dev のノードは元のデバイスのまま（空の通常ファイルではない）
+        for (path, rdev) in [
+            ("/dev/null", (1, 3)),
+            ("/dev/zero", (1, 5)),
+            ("/dev/urandom", (1, 9)),
+        ] {
+            match std::fs::metadata(path) {
+                Ok(m)
+                    if m.file_type().is_char_device()
+                        && (libc::major(m.rdev()), libc::minor(m.rdev())) == rdev => {}
+                Ok(m) => {
+                    eprintln!(
+                        "FAILED: {path} is not the device (type {:?}, rdev {:#x})",
+                        m.file_type(),
+                        m.rdev()
+                    );
+                    fails += 1;
+                }
+                Err(e) => {
+                    eprintln!("FAILED: {path}: {e}");
+                    fails += 1;
+                }
+            }
+        }
+        if std::fs::write("/dev/null", b"x").is_err() {
+            eprintln!("FAILED: cannot write /dev/null");
+            fails += 1;
+        }
+        fails
+    }
+
+    /// root で走らせたときだけ確かめる（マウント名前空間を作るには CAP_SYS_ADMIN が要る）。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn dev_nodes_survive_and_mount_failures_are_errors() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        // SAFETY: 引数無しの syscall
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test: needs root for a mount namespace");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::sandbox_mount_tests::dev_nodes_survive_and_mount_failures_are_errors",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// B-250: capability を bounding set だけでなく全スレッドの effective・permitted から落とす
+#[cfg(all(test, target_os = "linux"))]
+mod capabilities_b250_tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "VEIL_B250_CHILD";
+    const CAP_NET_RAW: u64 = 1 << 13;
+
+    // 理由: 試験
+    #[allow(clippy::disallowed_methods)]
+    fn thread_masks() -> Vec<(String, u64, u64, u64, u64)> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir("/proc/self/task").unwrap() {
+            let task = e.unwrap().path();
+            let st = std::fs::read_to_string(task.join("status")).unwrap_or_default();
+            let m = |k| caps::read_status_mask(&st, k).unwrap_or(u64::MAX);
+            v.push((
+                task.display().to_string(),
+                m("CapEff"),
+                m("CapPrm"),
+                m("CapInh"),
+                m("CapBnd"),
+            ));
+        }
+        v
+    }
+
+    fn child() -> i32 {
+        // サンドボックスより前に作られたスレッド（制御プレーンのスレッドに当たる）
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let olds: Vec<_> = (0..3)
+            .map(|_| {
+                let rx = rx.clone();
+                std::thread::spawn(move || {
+                    let _ = rx.lock().unwrap().recv();
+                })
+            })
+            .collect();
+        let cfg = SandboxConfig {
+            drop_capabilities: vec!["CAP_NET_RAW".into()],
+            ..Default::default()
+        };
+        if let Err(e) = apply_capabilities(&cfg) {
+            eprintln!("FAILED: apply_capabilities: {e}");
+            return 1;
+        }
+        // 後から作るスレッドは引き継ぐ
+        let after = std::thread::spawn(thread_masks).join().unwrap();
+        let mut fails = 0;
+        for (task, eff, prm, inh, bnd) in thread_masks().into_iter().chain(after) {
+            if (eff | prm | inh | bnd) & CAP_NET_RAW != 0 {
+                eprintln!("FAILED: {task} still has CAP_NET_RAW (eff={eff:#x} prm={prm:#x} inh={inh:#x} bnd={bnd:#x})");
+                fails += 1;
+            }
+            if eff == 0 {
+                eprintln!("FAILED: {task} lost every capability, not only CAP_NET_RAW");
+                fails += 1;
+            }
+        }
+        drop(tx);
+        for t in olds {
+            let _ = t.join();
+        }
+        fails
+    }
+
+    #[test]
+    fn status_mask_is_parsed() {
+        let st = "Name:\tveil\nCapInh:\t0000000000000000\nCapEff:\t00000000a80425fb\n";
+        assert_eq!(caps::read_status_mask(st, "CapEff"), Some(0xa80425fb));
+        assert_eq!(caps::read_status_mask(st, "CapInh"), Some(0));
+        assert_eq!(caps::read_status_mask(st, "CapBnd"), None);
+    }
+
+    /// root（またはコンテナの root）で走らせたときだけ確かめる（一般利用者は CAP_NET_RAW を持たない）。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験
+    fn capabilities_are_dropped_on_every_thread() {
+        if std::env::var(CHILD_ENV).is_ok() {
+            std::process::exit(child());
+        }
+        let st = std::fs::read_to_string("/proc/self/status").unwrap();
+        if caps::read_status_mask(&st, "CapEff").unwrap_or(0) & CAP_NET_RAW == 0 {
+            eprintln!("Skipping test: CAP_NET_RAW is not in the effective set (run as root)");
+            return;
+        }
+        // 理由: 試験。capability を落とす子プロセスとして自分を起動する
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::capabilities_b250_tests::capabilities_are_dropped_on_every_thread",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -1052,17 +1052,6 @@ pub struct ConnectionIdIter<'a> {
     index: usize,
 }
 
-impl<'a> Iterator for ConnectionIdIter<'a> {
-    type Item = ConnectionId<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let v = self.cids.get(self.index)?;
-        self.index += 1;
-        Some(v.clone())
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn quiche_conn_source_ids(
     conn: &Connection,
@@ -1078,10 +1067,13 @@ pub extern "C" fn quiche_conn_source_ids(
 pub extern "C" fn quiche_connection_id_iter_next(
     iter: &mut ConnectionIdIter, out: &mut *const u8, out_len: &mut size_t,
 ) -> bool {
-    if let Some(conn_id) = iter.next() {
+    // veil: GHSA-mh64-ph39-mrc9（quiche 0.29.2 の修正の取り込み）。複製を返すと関数を抜けたところで
+    // 解放されるので、反復子が持つ要素を指す
+    if let Some(conn_id) = iter.cids.get(iter.index) {
         let id = conn_id.as_ref();
         *out = id.as_ptr();
         *out_len = id.len();
+        iter.index += 1;
         return true;
     }
 
@@ -1090,7 +1082,9 @@ pub extern "C" fn quiche_connection_id_iter_next(
 
 #[no_mangle]
 pub extern "C" fn quiche_connection_id_iter_free(iter: *mut ConnectionIdIter) {
-    drop(unsafe { Box::from_raw(iter) });
+    if !iter.is_null() {
+        drop(unsafe { Box::from_raw(iter) });
+    }
 }
 
 #[no_mangle]
@@ -1635,19 +1629,16 @@ pub extern "C" fn quiche_conn_retired_scids(conn: &Connection) -> size_t {
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_conn_retired_scid_next(
-    conn: &mut Connection, out: &mut *const u8, out_len: &mut size_t,
-) -> bool {
-    match conn.retired_scid_next() {
-        None => false,
-
-        Some(conn_id) => {
-            let id = conn_id.as_ref();
-            *out = id.as_ptr();
-            *out_len = id.len();
-            true
-        },
+pub extern "C" fn quiche_conn_retired_scid_iter(
+    conn: &mut Connection,
+) -> *mut ConnectionIdIter<'_> {
+    // veil: GHSA-mh64-ph39-mrc9（quiche 0.29.2 の修正の取り込み）。取り出した ID を関数の中で解放して
+    // ポインタだけ返していたので、反復子に移して C 側が quiche_connection_id_iter_free で解放する
+    let mut cids = Vec::with_capacity(conn.retired_scids());
+    while let Some(cid) = conn.retired_scid_next() {
+        cids.push(cid);
     }
+    Box::into_raw(Box::new(ConnectionIdIter { cids, index: 0 }))
 }
 
 #[no_mangle]
@@ -2103,6 +2094,47 @@ mod tests {
     use libc::c_void;
     #[cfg(windows)]
     use windows_sys::Win32::Networking::WinSock::inet_ntop;
+
+    // veil: GHSA-mh64-ph39-mrc9 の回帰試験（quiche 0.29.2 から。返したポインタが反復子の解放まで有効）
+    #[test]
+    fn connection_id_iter_next() {
+        let cids = vec![
+            ConnectionId::from_vec(vec![1, 2, 3, 4]),
+            ConnectionId::from_vec(vec![5, 6]),
+        ];
+
+        let mut iter = ConnectionIdIter { cids, index: 0 };
+
+        let mut out: *const u8 = std::ptr::null();
+        let mut out_len: size_t = 0;
+
+        assert!(quiche_connection_id_iter_next(
+            &mut iter,
+            &mut out,
+            &mut out_len
+        ));
+        assert_eq!(out_len, 4);
+        let first = out;
+
+        assert!(quiche_connection_id_iter_next(
+            &mut iter,
+            &mut out,
+            &mut out_len
+        ));
+        assert_eq!(out_len, 2);
+        let slice = unsafe { std::slice::from_raw_parts(out, out_len) };
+        assert_eq!(slice, &[5, 6]);
+
+        // 先に返したポインタも反復子が生きている間は有効
+        let slice = unsafe { std::slice::from_raw_parts(first, 4) };
+        assert_eq!(slice, &[1, 2, 3, 4]);
+
+        assert!(!quiche_connection_id_iter_next(
+            &mut iter,
+            &mut out,
+            &mut out_len
+        ));
+    }
 
     #[test]
     fn addr_v4() {

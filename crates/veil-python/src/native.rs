@@ -13,7 +13,7 @@
 //!   Anything else (tuples, pydantic models, ...) is passed to the Python `Route.to_response`.
 
 use bytes::Bytes;
-use pyo3::exceptions::PyKeyError;
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
@@ -38,9 +38,25 @@ pub struct NativeRequest {
     query_params: PyOnceLock<Py<PyAny>>,
     // F-210: ハンドラ用プールで動く間の文脈（`*mut HandlerContext`。呼び出しの外・INLINE は 0）
     pub(crate) ctx: AtomicUsize,
+    // F-282: ctx を設定したスレッド（`thread_token`）。ハンドラが作った別の Python スレッドから ctx を触らせない
+    // （GIL を外している間に同じ `HandlerContext` への &mut が 2 つできる・呼び出しの後に使われるのを防ぐ）
+    pub(crate) ctx_owner: AtomicUsize,
+    // F-266: 本文を読む前に解析した multipart のパート（大きなファイルは名前の無い一時ファイル）
+    parts: std::sync::Mutex<Option<Vec<veil::api::multipart::SpooledPart>>>,
 }
 
 impl NativeRequest {
+    // F-266
+    /// A request whose multipart body was read beforehand (`multipart::prepare_form`).
+    pub fn with_parts(
+        req: Request,
+        parts: Option<Vec<veil::api::multipart::SpooledPart>>,
+    ) -> NativeRequest {
+        let r = NativeRequest::new(req);
+        *r.parts.lock().unwrap() = parts;
+        r
+    }
+
     pub fn new(req: Request) -> NativeRequest {
         NativeRequest {
             req,
@@ -51,18 +67,25 @@ impl NativeRequest {
             client_ip: PyOnceLock::new(),
             query_params: PyOnceLock::new(),
             ctx: AtomicUsize::new(0),
+            ctx_owner: AtomicUsize::new(0),
+            parts: std::sync::Mutex::new(None),
         }
+    }
+
+    // この要求の `HandlerContext`。ハンドラの呼び出し中に、それを呼んでいるスレッドから使うときだけ返す（F-282）
+    pub(crate) fn handler_ctx(&self) -> Option<*mut HandlerContext> {
+        let p = self.ctx.load(Ordering::Acquire);
+        (p != 0 && self.ctx_owner.load(Ordering::Acquire) == thread_token())
+            .then_some(p as *mut HandlerContext)
     }
 
     /// Next chunk of the request body (only on streaming-body routes, during the handler call; waits with the GIL released).
     fn read_chunk(&self, py: Python<'_>) -> Option<Bytes> {
-        let p = self.ctx.load(Ordering::Acquire);
-        if p == 0 {
-            return None;
-        }
+        let p = self.handler_ctx()?;
         // SAFETY: ctx はこの要求を処理しているプールのスレッドの `call_blocking` の閉包が持つ `HandlerContext` で、
-        // 呼び出しが終わる前に 0 へ戻す（`lib.rs::call_python`）。同じスレッドからしか使わない。
-        let ctx = unsafe { &mut *(p as *mut HandlerContext) };
+        // 呼び出しが終わる前に 0 へ戻す（`lib.rs::call_python`）。`handler_ctx` が ctx を設定したスレッド
+        // （= 呼び出しの間ブロックしているスレッド）からの呼び出しに限るので、別の参照と重ならない
+        let ctx = unsafe { &mut *p };
         if !ctx.has_body_stream() {
             return None;
         }
@@ -79,6 +102,8 @@ struct Helpers {
     // F-210: `veil.StreamingResponse`・`veil._stream_of`（ジェネレータ等をストリーミングの応答にする）
     streaming_type: Py<PyAny>,
     stream_of: Py<PyAny>,
+    // F-263: `veil.SwitchingProtocols`（`Response.switching_protocols` の戻り値）
+    switching_type: Py<PyAny>,
 }
 
 static HELPERS: PyOnceLock<Helpers> = PyOnceLock::new();
@@ -93,6 +118,7 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
             response_type: veil.getattr("Response")?.unbind(),
             streaming_type: veil.getattr("StreamingResponse")?.unbind(),
             stream_of: veil.getattr("_stream_of")?.unbind(),
+            switching_type: veil.getattr("SwitchingProtocols")?.unbind(),
         })
     })
 }
@@ -101,7 +127,8 @@ fn helpers(py: Python<'_>) -> PyResult<&'static Helpers> {
 impl NativeRequest {
     /// Build a request directly (tests); takes the same arguments as `veil.Request`.
     #[new]
-    #[pyo3(signature = (method="GET", path="/", query="", headers=None, body=None, params=None, client_ip=""))]
+    #[pyo3(signature = (method="GET", path="/", query="", headers=None, body=None, params=None, client_ip="", tls=false))]
+    #[allow(clippy::too_many_arguments)] // Python のキーワード引数（veil.Request と同じ形）
     fn py_new(
         method: &str,
         path: &str,
@@ -110,6 +137,7 @@ impl NativeRequest {
         body: Option<Vec<u8>>,
         params: Option<std::collections::HashMap<String, String>>,
         client_ip: &str,
+        tls: bool,
     ) -> NativeRequest {
         let target = if query.is_empty() {
             path.to_string()
@@ -121,7 +149,8 @@ impl NativeRequest {
             .into_iter()
             .map(|(n, v)| (Bytes::from(n), Bytes::from(v)))
             .collect();
-        let mut req = Request::new(method.to_string(), target, hdrs, body.unwrap_or_default());
+        let mut req =
+            Request::new(method.to_string(), target, hdrs, body.unwrap_or_default()).with_tls(tls);
         if let Ok(ip) = client_ip.parse() {
             req = req.with_client_ip(ip);
         }
@@ -227,9 +256,72 @@ impl NativeRequest {
         }
     }
 
+    // F-266
+    /// The parts of a `multipart/form-data` body: tuples `(name, filename, content_type, headers, data, fd, size)`
+    /// where `data` is `bytes` (or `None` when the file was spooled to the temporary file descriptor `fd`; on
+    /// Windows `fd` is a handle). Malformed bodies raise `ValueError(status, message)`.
+    fn multipart(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        if let Some(parts) = self.parts.lock().unwrap().take() {
+            return parts.into_iter().map(|p| spooled_tuple(py, p)).collect();
+        }
+        let parts = veil::api::multipart::request_parts(&self.req)
+            .map_err(|e| PyValueError::new_err((e.status(), e.message().to_string())))?;
+        parts
+            .into_iter()
+            .map(|p| {
+                spooled_tuple(
+                    py,
+                    veil::api::multipart::SpooledPart {
+                        info: p.info,
+                        data: veil::api::multipart::SpooledData::Memory(p.data),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Parse the body as JSON.
     fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         helpers(py)?.loads.call1(py, (self.body(py),))
+    }
+
+    // F-268: Cookie の値（同じ名前は後のものが勝つ。Starlette と同じ）と HTTP の版
+    /// Request cookies as a dict (`Cookie` headers; a repeated name keeps the last value).
+    #[getter]
+    fn cookies(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = PyDict::new(py);
+        for (n, v) in self.req.headers() {
+            if !n.eq_ignore_ascii_case(b"cookie") {
+                continue;
+            }
+            for pair in lossy(v).split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, val) = pair.split_once('=').unwrap_or(("", pair));
+                let val = val.trim();
+                let val = val
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(val);
+                d.set_item(k.trim(), val)?;
+            }
+        }
+        Ok(d.unbind())
+    }
+
+    /// `HTTP/1.1`, `HTTP/2` or `HTTP/3`.
+    #[getter]
+    fn http_version(&self) -> &'static str {
+        self.req.version().as_str()
+    }
+
+    // B-204
+    /// Whether veil received the request over TLS (HTTP/3 always; `X-Forwarded-Proto` is not consulted).
+    #[getter]
+    fn is_tls(&self) -> bool {
+        self.req.is_tls()
     }
 
     /// Body decoded as UTF-8 (lossy).
@@ -261,9 +353,9 @@ impl NativeBodyIter {
     fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyBytes>> {
         let r = self.req.borrow(py);
         let streaming = {
-            let p = r.ctx.load(Ordering::Acquire);
             // SAFETY: read_chunk と同じ
-            p != 0 && unsafe { (*(p as *mut HandlerContext)).has_body_stream() }
+            r.handler_ctx()
+                .is_some_and(|p| unsafe { (*p).has_body_stream() })
         };
         if streaming {
             return r.read_chunk(py).map(|b| PyBytes::new(py, &b).unbind());
@@ -418,6 +510,9 @@ pub fn to_response(
     if result.is_instance(h.streaming_type.bind(py))? {
         return stream_response(py, &result, ctx);
     }
+    if result.is_instance(h.switching_type.bind(py))? {
+        return switching_protocols(&result);
+    }
     let resp = if result.is_instance(h.response_type.bind(py))? {
         result
     } else if let Some(sr) = {
@@ -537,7 +632,9 @@ fn stream_response(
         for item in it.try_iter()? {
             body.extend_from_slice(&to_chunk(item?)?);
         }
-        return Ok(head.with_body(body));
+        let mut r = head.with_body(body);
+        background(sr, &mut r)?;
+        return Ok(r);
     };
     let trailers = sr.getattr(pyo3::intern!(py, "trailers")).ok();
     let Some(writer) = ctx.start_stream(std::mem::replace(&mut head, Response::new(200))) else {
@@ -577,11 +674,43 @@ fn stream_response(
     } else {
         py.detach(|| writer.finish_with_trailers(t));
     }
+    // F-268: ストリーミングの応答の background は送り終えたここ（ハンドラ用プールのスレッド）で呼ぶ
+    if let Ok(bg) = sr.getattr(pyo3::intern!(py, "background")) {
+        if !bg.is_none() {
+            if let Err(e) = bg.call0() {
+                e.print(py);
+            }
+        }
+    }
     Ok(Response::new(200))
 }
 
+// F-263: Python のハンドラからのプロトコルアップグレード（`veil.Protocol` / `veil.AsyncProtocol` で受ける）
+/// Turn a `veil.SwitchingProtocols` into a 101 whose connection is served by the protocol `factory()` returns
+/// (callbacks on the handler pool, like an L4 TCP listener).
+fn switching_protocols(sp: &Bound<'_, PyAny>) -> PyResult<Response> {
+    let py = sp.py();
+    let protocol: String = sp.getattr(pyo3::intern!(py, "protocol"))?.extract()?;
+    let make = sp.getattr(pyo3::intern!(py, "_make_protocol"))?.unbind();
+    let head = response_object_head(sp)?;
+    let mut r =
+        Response::switching_protocols(&protocol, move |up: veil::api::Upgraded| async move {
+            let peer = up
+                .client_ip()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            up.serve_blocking(move |out| crate::ext::PySession::connect(&make, peer, out))
+                .await
+        });
+    for (n, v) in head.headers() {
+        r = r.with_header(n.clone(), v.clone());
+    }
+    Ok(r)
+}
+
 /// Turn a chunk into `Bytes` (`bytes` is not copied, `str` is UTF-8, `bytearray` and `memoryview` are copied).
-fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
+pub(crate) fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
     if let Ok(s) = item.cast::<PyString>() {
         let s: PyBackedStr = s.extract()?;
         return Ok(Bytes::from_owner(PyStrOwner(s)));
@@ -594,11 +723,12 @@ fn to_chunk(item: Bound<'_, PyAny>) -> PyResult<Bytes> {
 }
 
 /// Read only `status` and `headers` (the head of a streaming response).
-fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
+pub(crate) fn response_object_head(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
     let status: u16 = resp
         .getattr(pyo3::intern!(resp.py(), "status"))?
         .extract()?;
     let mut r = Response::new(status);
+    no_compression(resp, &mut r)?;
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
@@ -617,6 +747,8 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
         .extract()?;
     let body = resp.getattr(pyo3::intern!(resp.py(), "body"))?;
     let mut r = Response::new(status).with_body(backed(&body)?);
+    no_compression(resp, &mut r)?;
+    background(resp, &mut r)?;
     let headers = resp.getattr(pyo3::intern!(resp.py(), "headers"))?;
     for item in headers.try_iter()? {
         let item = item?;
@@ -626,6 +758,40 @@ fn response_object(resp: &Bound<'_, PyAny>) -> PyResult<Response> {
         r = r.with_header(known_header(&n), Bytes::copy_from_slice(v.as_bytes()));
     }
     Ok(r)
+}
+
+// F-270
+/// Applies `Response.compress = False` (the class default is `True`; objects without the attribute are compressible).
+fn no_compression(resp: &Bound<'_, PyAny>, r: &mut Response) -> PyResult<()> {
+    if let Ok(v) = resp.getattr(pyo3::intern!(resp.py(), "compress")) {
+        if !v.is_truthy()? {
+            *r = std::mem::replace(r, Response::new(200)).no_compression();
+        }
+    }
+    Ok(())
+}
+
+// F-268: `Response.background`（`BackgroundTasks` 等の呼び出し可能なもの）を送り終えた後にハンドラ用プールで呼ぶ。
+// 送出したワーカーで GIL を取らない（after_send はワーカーで走るので、プールへ投げるだけにする）。
+/// Runs `Response.background` (a callable, e.g. `veil.BackgroundTasks`) on the handler pool once the response was sent.
+fn background(resp: &Bound<'_, PyAny>, r: &mut Response) -> PyResult<()> {
+    let Ok(bg) = resp.getattr(pyo3::intern!(resp.py(), "background")) else {
+        return Ok(());
+    };
+    if bg.is_none() {
+        return Ok(());
+    }
+    let bg = bg.unbind();
+    *r = std::mem::replace(r, Response::new(200)).after_send(move || {
+        veil::runtime::offload::spawn_handler(move || {
+            Python::attach(|py| {
+                if let Err(e) = bg.call0(py) {
+                    e.print(py);
+                }
+            })
+        })
+    });
+    Ok(())
 }
 
 /// Map common header names to static byte strings (avoids copying the name).
@@ -646,4 +812,90 @@ impl AsRef<[u8]> for PyStrOwner {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes()
     }
+}
+
+// F-266
+/// One multipart part as the tuple `NativeRequest.multipart` returns.
+pub(crate) fn spooled_tuple(
+    py: Python<'_>,
+    p: veil::api::multipart::SpooledPart,
+) -> PyResult<Py<PyAny>> {
+    use veil::api::multipart::SpooledData;
+    let i = p.info;
+    let headers: Vec<(String, String)> = i.headers;
+    let (data, fd, size): (Option<Py<PyAny>>, Option<i64>, u64) = match p.data {
+        SpooledData::Memory(b) => {
+            let n = b.len() as u64;
+            (Some(PyBytes::new(py, &b).into_any().unbind()), None, n)
+        }
+        SpooledData::File { file, len } => {
+            #[cfg(unix)]
+            let fd = {
+                use std::os::unix::io::IntoRawFd;
+                file.into_raw_fd() as i64
+            };
+            #[cfg(windows)]
+            let fd = {
+                use std::os::windows::io::IntoRawHandle;
+                file.into_raw_handle() as usize as i64
+            };
+            (None, Some(fd), len)
+        }
+    };
+    Ok(
+        (i.name, i.filename, i.content_type, headers, data, fd, size)
+            .into_pyobject(py)?
+            .into_any()
+            .unbind(),
+    )
+}
+
+// F-266
+/// Parse a buffered `multipart/form-data` body (for requests built in Python); see `NativeRequest.multipart`.
+#[pyfunction]
+pub fn parse_multipart(
+    py: Python<'_>,
+    body: &[u8],
+    content_type: &str,
+) -> PyResult<Vec<Py<PyAny>>> {
+    let b = veil::api::multipart::boundary(content_type).ok_or_else(|| {
+        PyValueError::new_err((
+            400u16,
+            "expected a multipart/form-data body with a boundary".to_string(),
+        ))
+    })?;
+    let parts: Result<Vec<_>, _> = veil::api::multipart::parse(
+        Bytes::copy_from_slice(body),
+        &b,
+        veil::api::multipart::Limits::current(),
+    )
+    .collect();
+    let parts = parts.map_err(|e| PyValueError::new_err((e.status(), e.message().to_string())))?;
+    parts
+        .into_iter()
+        .map(|p| {
+            spooled_tuple(
+                py,
+                veil::api::multipart::SpooledPart {
+                    info: p.info,
+                    data: veil::api::multipart::SpooledData::Memory(p.data),
+                },
+            )
+        })
+        .collect()
+}
+
+// F-266
+/// `[api] multipart_spool_threshold` (uploads up to this size stay in memory).
+#[pyfunction]
+pub fn spool_threshold() -> usize {
+    veil::api::multipart::spool_threshold()
+}
+
+// スレッドを見分ける値（スレッドローカルの番地。F-282）
+pub(crate) fn thread_token() -> usize {
+    thread_local! {
+        static TOKEN: u8 = const { 0 };
+    }
+    TOKEN.with(|t| t as *const u8 as usize)
 }

@@ -92,3 +92,50 @@ pub(super) async fn test_f236_malformed_chunked_request_rejected() {
         assert_ne!(first, Some(200), "上流へ渡して成功にしないこと");
     }
 }
+
+/// B-219: `VEIL_E2E_SECCOMP` で seccomp を掛けたとき、制御プレーンを含む全スレッドに掛かっている
+/// （prctl は呼んだスレッドにしか掛からず、先に作ったスレッドが無制限のまま動いていた）
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_b219_seccomp_on_every_thread() {
+    if std::env::var("VEIL_E2E_SECCOMP").map_or(true, |m| m.is_empty()) {
+        eprintln!("Skipping test: VEIL_E2E_SECCOMP is not set");
+        return;
+    }
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "veil.*proxy.toml"])
+        .output()
+        .expect("pgrep");
+    let pids = String::from_utf8_lossy(&out.stdout);
+    let pid = pids
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .expect("proxy pid");
+    let mut threads = 0;
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task")).expect("task dir") {
+        let task = entry.expect("task").path();
+        let status = std::fs::read_to_string(task.join("status")).unwrap_or_default();
+        let name = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+        let mode = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp:"))
+            .map(str::trim)
+            .unwrap_or("?");
+        assert_eq!(
+            mode,
+            "2",
+            "thread {} ({}) is not under the seccomp filter",
+            task.display(),
+            name.trim()
+        );
+        threads += 1;
+    }
+    assert!(threads > 1, "expected several threads, found {threads}");
+    eprintln!("seccomp filter on all {threads} threads of pid {pid}");
+}

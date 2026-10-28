@@ -1,6 +1,6 @@
 # B-223: `PipelinedUdpRecv` の Drop と失敗の経路が、in-flight の RECVMSG が参照するバッファを `OpGuard::Noop` で解放する
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー RT-01・RT-04）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -40,6 +40,11 @@
 - ASAN の E2E（`tools/container_security/chaos/e2e_sanitizer_chaos.sh` に追加。F-279）: HTTP/3 のワーカーが in-flight の RECVMSG を持ったまま
   graceful shutdown する間に UDP を打ち続けても ASAN が報告しない。
 - `new()` の失敗（SQ を枯渇させる）の単体試験で、SQ に残った SQE が解放済みのアドレスを指さない（`fuzz/fuzz_targets/io_uring_executor.rs` のモデルに足す）。
+
+## 修正（v0.10.0）
+
+- `PipelinedUdpRecv` の Drop を `RecvSlot` の Drop に移し、in-flight のスロットは `buf`・`addr`・`cmsg`・`msg`・`iov` の Box を `OpGuard::Cleanup` の閉包へ移して detach する（CQE が来るまでカーネルが書く先を生かす）。失敗の経路でスロットを落とすときも同じ。
+- RT-04: `shutdown_tasks` の drain の期限までに CQE の来なかった detach 済みの op のガードは `OpTable::leak_detached_guards` で走らせずに捨てる（リングを閉じた後もカーネルが書き得るため、終了時に一度だけ意図的に漏らす）。
 
 ## 関連
 

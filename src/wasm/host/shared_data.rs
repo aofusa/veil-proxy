@@ -11,8 +11,8 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
 
     if end > data.len() {
         return None;
@@ -24,7 +24,10 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
 /// Helper to allocate memory in WASM
 ///
 /// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
-async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
+pub(super) async fn allocate_wasm_memory(
+    caller: &mut Caller<'_, HostState>,
+    size: usize,
+) -> Option<i32> {
     let func = caller
         .get_export("proxy_on_memory_allocate")
         .or_else(|| caller.get_export("malloc"))?;
@@ -63,15 +66,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
                 };
 
-                // Get value from shared data
-                // （RwLock ガードを await 前に確実にドロップするためブロックで囲む）
-                let (value, cas) = {
-                    let state = caller.data();
-                    let shared_data = state.http_ctx.shared_data.read().unwrap();
-                    match shared_data.get(&key) {
-                        Some((v, c)) => (v.clone(), *c),
-                        None => return PROXY_RESULT_NOT_FOUND,
-                    }
+                // Get value from shared data（B-179: モジュールで共有する表。値は `Arc` の参照を増やすだけ）
+                let (value, cas) = match caller.data().http_ctx.shared_data.get(&key) {
+                    Some(found) => found,
+                    None => return PROXY_RESULT_NOT_FOUND,
                 };
 
                 // Allocate memory and write value
@@ -87,16 +85,16 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 let data = memory.data_mut(&mut caller);
-                let value_start = ptr as usize;
+                let value_start = ptr as u32 as usize;
                 if value_start + value.len() > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
                 data[value_start..value_start + value.len()].copy_from_slice(&value);
 
                 // Write return pointers
-                let ptr_offset = return_value_ptr as usize;
-                let size_offset = return_value_size as usize;
-                let cas_offset = return_cas as usize;
+                let ptr_offset = return_value_ptr as u32 as usize;
+                let size_offset = return_value_size as u32 as usize;
+                let cas_offset = return_cas as u32 as usize;
 
                 if ptr_offset + 4 > data.len()
                     || size_offset + 4 > data.len()
@@ -134,7 +132,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
 
                 // Check size limit
-                if value_size as usize > state.http_ctx.capabilities.max_shared_data_size {
+                if value_size as u32 as usize > state.http_ctx.capabilities.max_shared_data_size {
                     return PROXY_RESULT_BAD_ARGUMENT;
                 }
             }
@@ -151,24 +149,25 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
-            // Set value with CAS check
-            let state = caller.data_mut();
-            let mut shared_data = state.http_ctx.shared_data.write().unwrap();
-
-            if cas != 0 {
-                // CAS check
-                if let Some((_, current_cas)) = shared_data.get(&key) {
-                    if *current_cas != cas as u32 {
-                        return PROXY_RESULT_CAS_MISMATCH;
-                    }
+            // Set value with CAS check（B-179: モジュールで共有する表。CAS も表で払い出す）
+            match caller
+                .data()
+                .http_ctx
+                .shared_data
+                .set(&key, &value, cas as u32)
+            {
+                crate::wasm::shared_data::SetResult::Ok => {}
+                crate::wasm::shared_data::SetResult::CasMismatch => {
+                    return PROXY_RESULT_CAS_MISMATCH
+                }
+                crate::wasm::shared_data::SetResult::TooManyKeys => {
+                    crate::logging::log_throttled!(
+                        warn,
+                        "[wasm] shared data key limit (shared_data_max_keys) reached; set rejected"
+                    );
+                    return PROXY_RESULT_INTERNAL_FAILURE;
                 }
             }
-
-            // Increment CAS
-            state.http_ctx.shared_data_cas = state.http_ctx.shared_data_cas.wrapping_add(1);
-            let new_cas = state.http_ctx.shared_data_cas;
-
-            shared_data.insert(key, (value, new_cas));
 
             PROXY_RESULT_OK
         },

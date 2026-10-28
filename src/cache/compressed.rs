@@ -86,6 +86,8 @@ mod enabled {
         data: Bytes,
         len: u64,
         cached_at: Instant,
+        /// 圧縮する前に読んだ監視の世代（F-272）
+        stamp: Option<crate::cache::watch::Stamp>,
     }
 
     /// パスごとの圧縮バリアント集合。`invalidate(path)` が外側キーを丸ごと
@@ -140,6 +142,10 @@ mod enabled {
             }
             let path_entry = self.entries.get(path)?;
             let variant = path_entry.variants.get(&key)?;
+            // F-272: 監視しているルートが作った後に変わっていたら圧縮し直す
+            if !crate::cache::watch::fresh(variant.stamp, cfg.watch_gen) {
+                return None;
+            }
             let ttl = Duration::from_secs(cfg.valid_duration_secs);
             if variant.cached_at.elapsed() >= ttl {
                 return None;
@@ -248,6 +254,7 @@ mod enabled {
             return hit;
         }
         COMPRESSED_CACHE.misses.fetch_add(1, Ordering::Relaxed);
+        let stamp = crate::cache::watch::stamp(cfg.watch_gen);
         let compressed = compress();
         let len = compressed.len() as u64;
         let data = Bytes::from(compressed);
@@ -258,6 +265,7 @@ mod enabled {
                 data: data.clone(),
                 len,
                 cached_at: Instant::now(),
+                stamp,
             },
             cfg,
         );
@@ -299,6 +307,8 @@ mod enabled {
                 max_file_size_bytes: 1024 * 1024,
                 max_total_bytes: 64 * 1024 * 1024,
                 revalidate_mtime: false,
+                watch: false,
+                watch_gen: None,
             }
         }
 
@@ -320,6 +330,7 @@ mod enabled {
                         data: data.clone(),
                         len: data.len() as u64,
                         cached_at: Instant::now(),
+                        stamp: None,
                     },
                     &cfg,
                 );
@@ -346,6 +357,7 @@ mod enabled {
                     data: Bytes::from_static(b"zstd"),
                     len: 4,
                     cached_at: Instant::now(),
+                    stamp: None,
                 },
                 &cfg,
             );
@@ -356,6 +368,7 @@ mod enabled {
                     data: Bytes::from_static(b"gzip"),
                     len: 4,
                     cached_at: Instant::now(),
+                    stamp: None,
                 },
                 &cfg,
             );
@@ -391,6 +404,7 @@ mod enabled {
                     data: Bytes::from_static(b"zstd-body"),
                     len: 9,
                     cached_at: Instant::now(),
+                    stamp: None,
                 },
                 &cfg,
             );
@@ -416,6 +430,7 @@ mod enabled {
                     data: Bytes::from_static(b"x"),
                     len: 1,
                     cached_at: Instant::now(),
+                    stamp: None,
                 },
                 &cfg,
             );

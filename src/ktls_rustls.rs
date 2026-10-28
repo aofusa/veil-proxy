@@ -35,7 +35,7 @@ use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::{IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
 // ====================
 // TLS ストリーム状態
@@ -306,6 +306,8 @@ pub struct KtlsClientStream {
     drained_buffer: Vec<u8>,
     /// ALPN で `h2` が選ばれたか（F-175。kTLS 移行で rustls セッションを手放す前に記録する）。
     negotiated_h2: bool,
+    /// 相手の close_notify を受けた（F-282: EOF で区切る応答の切り詰めを見分ける）
+    close_notify: bool,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsClientStream {
@@ -507,15 +509,18 @@ async fn do_server_handshake(
     stream: &TcpStream,
     conn: &mut ServerConnection,
     initial_data: &mut Option<Vec<u8>>,
+    align_records: bool,
 ) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
+    let mut records = RecordTracker::default();
 
     while conn.is_handshaking() {
         // 先行読み取りデータがあれば先に処理
         if let Some(data) = initial_data.take() {
             if !data.is_empty() {
                 crate::tls_writev::read_tls_all(&mut *conn, &data)?;
+                records.feed(&data);
                 // データの処理後にハンドシェイクが終わる可能性があるため、ループの先頭に戻る
                 continue;
             }
@@ -526,25 +531,19 @@ async fn do_server_handshake(
 
         // 読み込みが必要な場合
         if conn.wants_read() {
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "EOF during handshake",
-                        ))
-                    }
-                    Ok(n) => {
-                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable().await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            read_handshake_bytes(
+                stream,
+                fd,
+                &mut *conn,
+                &mut read_buf,
+                usize::MAX,
+                &mut records,
+            )
+            .await?;
         }
+    }
+    if align_records {
+        finish_partial_record(stream, fd, &mut *conn, &mut read_buf, &mut records).await?;
     }
 
     // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
@@ -555,13 +554,107 @@ async fn do_server_handshake(
     Ok(())
 }
 
+/// rustls へ渡したバイト列の TLS レコードの境界を追う（B-258）。
+///
+/// ハンドシェイクの最後の読み取りに次のレコードの先頭だけが入っていると、その部分は rustls のデフレーマに残ったまま
+/// kTLS へ移り（rustls の秘密の抽出は受信側の未処理バイトを検査しない）、カーネルはレコードの途中から読んで復号に
+/// 失敗する。境界まで読み足してから移るために、渡したバイトがどのレコードのどこまでかを数える。
+#[derive(Default)]
+struct RecordTracker {
+    header: [u8; 5],
+    header_len: usize,
+    body_left: usize,
+}
+
+impl RecordTracker {
+    fn feed(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.body_left > 0 {
+                let n = self.body_left.min(data.len());
+                self.body_left -= n;
+                data = &data[n..];
+                continue;
+            }
+            let n = (5 - self.header_len).min(data.len());
+            self.header[self.header_len..self.header_len + n].copy_from_slice(&data[..n]);
+            self.header_len += n;
+            data = &data[n..];
+            if self.header_len == 5 {
+                self.body_left = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+                self.header_len = 0;
+            }
+        }
+    }
+
+    /// 今のレコード（ヘッダの途中ならヘッダ）を終えるのに要るバイト数。境界にいれば 0。
+    fn remaining(&self) -> usize {
+        if self.header_len > 0 {
+            5 - self.header_len
+        } else {
+            self.body_left
+        }
+    }
+}
+
+/// ハンドシェイク中に 1 回読み（最大 `limit` バイト）、rustls へ渡す。
+async fn read_handshake_bytes<D>(
+    stream: &TcpStream,
+    fd: RawFd,
+    conn: &mut rustls::ConnectionCommon<D>,
+    read_buf: &mut [u8],
+    limit: usize,
+    records: &mut RecordTracker,
+) -> io::Result<()> {
+    let want = read_buf.len().min(limit);
+    loop {
+        match raw_read(fd, &mut read_buf[..want]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF during handshake",
+                ))
+            }
+            Ok(n) => {
+                crate::tls_writev::read_tls_all(conn, &read_buf[..n])?;
+                records.feed(&read_buf[..n]);
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                stream.readable().await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// kTLS へ移る前に、rustls へ渡した最後のレコードを読み切る（次のレコードへは読み進めない。B-258）。
+/// 相手は既にそのレコードを送り始めているので、残りはすぐ届く。
+async fn finish_partial_record<D>(
+    stream: &TcpStream,
+    fd: RawFd,
+    conn: &mut rustls::ConnectionCommon<D>,
+    read_buf: &mut [u8],
+    records: &mut RecordTracker,
+) -> io::Result<()> {
+    while records.remaining() > 0 {
+        let limit = records.remaining();
+        read_handshake_bytes(stream, fd, conn, read_buf, limit, records).await?;
+    }
+    Ok(())
+}
+
 /// rustls コネクションを使用して非同期ハンドシェイクを実行（クライアント側）
 ///
 /// 重要: ハンドシェイク完了後、kTLS のシークレット抽出に備えて
 /// バッファリングされた全ての TLS レコードを送信する必要があります。
-async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) -> io::Result<()> {
+async fn do_client_handshake(
+    stream: &TcpStream,
+    conn: &mut ClientConnection,
+    align_records: bool,
+) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
+    let mut records = RecordTracker::default();
 
     while conn.is_handshaking() {
         // 書き込みが必要な場合
@@ -569,25 +662,19 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
 
         // 読み込みが必要な場合
         if conn.wants_read() {
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "EOF during handshake",
-                        ))
-                    }
-                    Ok(n) => {
-                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable().await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            read_handshake_bytes(
+                stream,
+                fd,
+                &mut *conn,
+                &mut read_buf,
+                usize::MAX,
+                &mut records,
+            )
+            .await?;
         }
+    }
+    if align_records {
+        finish_partial_record(stream, fd, &mut *conn, &mut read_buf, &mut records).await?;
     }
 
     // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
@@ -878,7 +965,14 @@ pub async fn accept(
         ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ハンドシェイクを実行
-    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+    // kTLS へ移るときは最後のレコードを読み切ってから（B-258）
+    do_server_handshake(
+        &stream,
+        &mut conn,
+        &mut initial_data,
+        cfg!(feature = "ktls") && enable_ktls,
+    )
+    .await?;
 
     // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
     let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
@@ -961,7 +1055,14 @@ pub async fn accept_with_peer_cert(
         ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ハンドシェイクを実行
-    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
+    // kTLS へ移るときは最後のレコードを読み切ってから（B-258）
+    do_server_handshake(
+        &stream,
+        &mut conn,
+        &mut initial_data,
+        cfg!(feature = "ktls") && enable_ktls,
+    )
+    .await?;
 
     // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
     let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
@@ -1055,7 +1156,8 @@ pub async fn connect(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ハンドシェイクを実行
-    do_client_handshake(&stream, &mut conn).await?;
+    // kTLS へ移るときは最後のレコードを読み切ってから（B-258）
+    do_client_handshake(&stream, &mut conn, cfg!(feature = "ktls") && enable_ktls).await?;
 
     // F-175: ALPN の結果は kTLS 移行で rustls セッションを手放す前に記録する。
     let negotiated_h2 = conn.alpn_protocol() == Some(b"h2");
@@ -1109,6 +1211,7 @@ pub async fn connect(
         mode,
         drained_buffer,
         negotiated_h2,
+        close_notify: false,
     })
 }
 
@@ -1129,8 +1232,25 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             return (Ok(len), buf);
         }
 
-        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）
+        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）。平文以外のレコード（TLS 1.3 の
+        // NewSessionTicket・close_notify）では EIO になるので、そのときだけ取り出して処理する（B-259）
         if self.mode != TlsMode::Rustls {
+            #[cfg(target_os = "linux")]
+            loop {
+                let (res, b) = self.inner.read(buf).await;
+                buf = b;
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
+                            Ok(crate::ktls::ControlRecord::Skipped) => continue,
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => return (Ok(0), buf),
+                            Err(e) => return (Err(e), buf),
+                        }
+                    }
+                    res => return (res, buf),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             return self.inner.read(buf).await;
         }
 
@@ -1278,6 +1398,10 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 // ====================
 
 impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
+    fn eof_was_clean(&self) -> bool {
+        self.close_notify
+    }
+
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // 【Phase 2】まずドレインバッファからデータを返す
         if !self.drained_buffer.is_empty() {
@@ -1290,7 +1414,28 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
             return (Ok(len), buf);
         }
 
+        // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）。平文以外のレコード（TLS 1.3 の
+        // NewSessionTicket・close_notify）では EIO になるので、そのときだけ取り出して処理する（B-259）
         if self.mode != TlsMode::Rustls {
+            #[cfg(target_os = "linux")]
+            loop {
+                let (res, b) = self.inner.read(buf).await;
+                buf = b;
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        match crate::ktls::consume_control_record(self.inner.as_raw_fd(), e) {
+                            Ok(crate::ktls::ControlRecord::Skipped) => continue,
+                            Ok(crate::ktls::ControlRecord::CloseNotify) => {
+                                self.close_notify = true;
+                                return (Ok(0), buf);
+                            }
+                            Err(e) => return (Err(e), buf),
+                        }
+                    }
+                    res => return (res, buf),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             return self.inner.read(buf).await;
         }
 
@@ -1341,8 +1486,11 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                             break; // rustls がこれ以上読めない（close_notify 受信後）
                         }
                         consumed += r;
-                        conn.process_new_packets()
+                        let state = conn
+                            .process_new_packets()
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        // F-282: close_notify を受けたか（EOF で区切る応答の完了の判定に使う）
+                        self.close_notify |= state.peer_has_closed();
                         // 各 process 後に平文を退避し received_plaintext を空に保つ。
                         drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
@@ -1433,6 +1581,8 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
 #[derive(Clone)]
 pub struct RustlsAcceptor {
     config: Arc<ServerConfig>,
+    /// ハンドシェイクで読むグローバルの TLS 設定のスロット（ALPN のプロファイル。F-260）
+    profile: crate::tls_reload::AlpnProfile,
     /// kTLS を有効化するかどうか
     enable_ktls: bool,
     /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
@@ -1446,6 +1596,7 @@ impl RustlsAcceptor {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         RustlsAcceptor {
             config,
+            profile: crate::tls_reload::AlpnProfile::H2AndH1,
             enable_ktls: false,
             allow_fallback: true,   // デフォルトはフォールバック有効
             tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
@@ -1476,6 +1627,17 @@ impl RustlsAcceptor {
         self
     }
 
+    /// ALPN のプロファイルを設定する（`config` はそのプロファイルの起動時の設定。F-260）
+    pub fn with_profile(
+        mut self,
+        profile: crate::tls_reload::AlpnProfile,
+        config: Arc<ServerConfig>,
+    ) -> Self {
+        self.profile = profile;
+        self.config = config;
+        self
+    }
+
     /// TLS ハンドシェイクを実行
     pub async fn accept(
         &self,
@@ -1483,8 +1645,8 @@ impl RustlsAcceptor {
         initial_data: Option<Vec<u8>>,
     ) -> io::Result<KtlsServerStream> {
         // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
-        let config =
-            crate::tls_reload::current_global_tls_config().unwrap_or_else(|| self.config.clone());
+        let config = crate::tls_reload::current_tls_config(self.profile)
+            .unwrap_or_else(|| self.config.clone());
         accept(
             stream,
             config,
@@ -1830,11 +1992,8 @@ pub fn is_ktls_available() -> bool {
 ///
 /// * `enable_ktls` - kTLS を有効化する場合は true。true の場合、シークレット抽出が有効化される。
 pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(crate::trust_store::default_roots())
         .with_no_client_auth();
 
     // kTLS が有効な場合のみシークレット抽出を有効化
@@ -1898,4 +2057,43 @@ pub fn insecure_client_config() -> Arc<ClientConfig> {
     config.enable_secret_extraction = true;
 
     Arc::new(config)
+}
+
+#[cfg(test)]
+mod record_tracker_tests {
+    use super::RecordTracker;
+
+    fn record(len: usize) -> Vec<u8> {
+        let mut r = vec![0x17, 0x03, 0x03];
+        r.extend_from_slice(&(len as u16).to_be_bytes());
+        r.resize(5 + len, 0xAA);
+        r
+    }
+
+    #[test]
+    fn tracks_record_boundaries_across_reads() {
+        let mut stream = record(30);
+        stream.extend(record(0));
+        stream.extend(record(100));
+        // どこで切っても、残りのバイト数が次の境界までの長さになる
+        let boundaries = [0usize, 35, 40, 145];
+        for cut in 0..=stream.len() {
+            let mut t = RecordTracker::default();
+            t.feed(&stream[..cut]);
+            let next = boundaries.iter().copied().find(|&b| b >= cut).unwrap();
+            if boundaries.contains(&cut) {
+                assert_eq!(t.remaining(), 0, "cut {cut}");
+            } else {
+                assert!(t.remaining() > 0, "cut {cut}");
+                // 残りを読み足していくと次の境界で止まる
+                let mut pos = cut;
+                while t.remaining() > 0 {
+                    let n = t.remaining();
+                    t.feed(&stream[pos..pos + n]);
+                    pos += n;
+                }
+                assert_eq!(pos, next, "cut {cut}");
+            }
+        }
+    }
 }

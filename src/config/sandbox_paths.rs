@@ -10,8 +10,8 @@ use super::*;
 
 /// 生の `Config`（unveil/Seatbelt 専用の再パース結果）から UDS ソケットパスを収集する。
 ///
-/// - `[server].listen` / `[server].listen_cleartext` の `unix:<path>`（F-164。リスナー側は
-///   これまで収集漏れだった）。
+/// - `[server].listen` / `[server].listen_cleartext`・`[[listener]]` の `listen` の `unix:<path>`
+///   （F-164。リスナー側はこれまで収集漏れだった。`[[listener]]` は F-260）。
 /// - `[[route]]` の Proxy URL（`http(s)://unix:<path>[:<prefix>]`）・
 ///   `[upstreams.*.servers]` の URL（F-170、単一 URL プロキシと Upstream グループの両方）。
 /// - `[[l4]].upstreams` の `addr`（`unix:<path>`、F-170、上流のみ。`[[l4]].listen` は
@@ -26,12 +26,14 @@ use super::*;
 pub(super) fn collect_uds_socket_paths(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    // F-260: `[[listener]]` の `listen` も全部集める
     for listen in [
         config.server.listen.as_ref(),
         config.server.listen_cleartext.as_ref(),
     ]
     .into_iter()
     .flatten()
+    .chain(config.listener.iter().flatten().map(|l| &l.listen))
     {
         if let Some(path) = listen.strip_prefix("unix:") {
             if !path.is_empty() {
@@ -232,17 +234,12 @@ pub fn collect_macos_sandbox_paths(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut static_roots = Vec::new();
-    // `read_only` は wasm feature 有効時のみ変更されるため、mut 修飾を feature で分岐する
-    // （wasm 無効ビルドで `unused_mut` 警告を出さないため。allow は使わない）。
     // 平文専用サーバ（`[tls]` 無し）では証明書パスが空なので含めない。
-    let tls_paths = [&config.tls.cert_path, &config.tls.key_path]
+    let mut read_only: Vec<PathBuf> = [&config.tls.cert_path, &config.tls.key_path]
         .into_iter()
         .filter(|p| !p.is_empty())
-        .map(PathBuf::from);
-    #[cfg(feature = "wasm")]
-    let mut read_only: Vec<PathBuf> = tls_paths.collect();
-    #[cfg(not(feature = "wasm"))]
-    let read_only: Vec<PathBuf> = tls_paths.collect();
+        .map(PathBuf::from)
+        .collect();
     let mut read_write = Vec::new();
 
     if let Some(routes) = &config.route {
@@ -282,11 +279,109 @@ pub fn collect_macos_sandbox_paths(
     // パーミッションも必要なため読み書き許可へ追加する。
     read_write.extend(collect_uds_socket_paths(&config));
 
+    // F-282 SB-12: 読み取りを無条件に許さなくなったので、リロードで読み直す設定ファイル自体と、
+    // 設定の中のファイルのパスを表すキー（CA・クライアント証明書・JWKS・トークン等。ネストした
+    // `[[listener]]`・SNI のものも）を全部集める。
+    read_only.push(config_path.to_path_buf());
+    let raw: toml::Value = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    collect_sandbox_file_keys(&raw, &mut read_only, &mut read_write);
+
+    let cwd = std::env::current_dir()?;
+    let abs = |v: Vec<PathBuf>| v.into_iter().map(|p| cwd.join(p)).collect();
     Ok(SandboxPaths {
-        static_roots,
-        read_only,
-        read_write,
+        static_roots: abs(static_roots),
+        read_only: abs(read_only),
+        read_write: abs(read_write),
     })
+}
+
+/// 読み取りを許すファイルのパスを値に持つキー（文字列 1 個か配列）。
+#[cfg(any(target_os = "macos", test))]
+const SANDBOX_READ_KEYS: &[&str] = &[
+    "cert_path",
+    "key_path",
+    "client_ca",
+    "ca",
+    "ca_cert",
+    "client_cert",
+    "client_key",
+    "directory_ca_cert",
+    "jwks_path",
+    "tls_ca",
+    "tls_client_cert",
+    "tls_client_key",
+    "token_file",
+];
+
+/// 書き込みも許すディレクトリを値に持つキー。
+#[cfg(any(target_os = "macos", test))]
+const SANDBOX_WRITE_KEYS: &[&str] = &["storage_dir", "upload_tmp_dir"];
+
+/// 生の設定（上書きの合成後）を辿り、ファイルのパスを表すキーの値を集める（macOS の Seatbelt 用）。
+/// `"system"`・`"builtin"`（信頼ストアの指定）と空文字は除く。`[acme]` があると証明書・鍵を
+/// 書き換えるので、`[tls]` の `cert_path`・`key_path` の親ディレクトリは書き込みも許す。
+#[cfg(any(target_os = "macos", test))]
+fn collect_sandbox_file_keys(
+    raw: &toml::Value,
+    read_only: &mut Vec<PathBuf>,
+    read_write: &mut Vec<PathBuf>,
+) {
+    fn walk(v: &toml::Value, ro: &mut Vec<PathBuf>, rw: &mut Vec<PathBuf>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, v) in t {
+                    let target = if SANDBOX_READ_KEYS.contains(&k.as_str()) {
+                        Some(&mut *ro)
+                    } else if SANDBOX_WRITE_KEYS.contains(&k.as_str()) {
+                        Some(&mut *rw)
+                    } else {
+                        None
+                    };
+                    match target {
+                        Some(out) => push_path_values(v, out),
+                        None => walk(v, ro, rw),
+                    }
+                }
+            }
+            toml::Value::Array(a) => {
+                for v in a {
+                    walk(v, ro, rw);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn push_path_values(v: &toml::Value, out: &mut Vec<PathBuf>) {
+        match v {
+            toml::Value::String(s) => {
+                if !s.is_empty() && s != "system" && s != "builtin" && !s.contains('\n') {
+                    out.push(PathBuf::from(s));
+                }
+            }
+            toml::Value::Array(a) => {
+                for v in a {
+                    push_path_values(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(raw, read_only, read_write);
+
+    if raw.get("acme").is_some() {
+        if let Some(tls) = raw.get("tls") {
+            for key in ["cert_path", "key_path"] {
+                if let Some(toml::Value::String(s)) = tls.get(key) {
+                    if let Some(parent) = Path::new(s).parent() {
+                        if !parent.as_os_str().is_empty() {
+                            read_write.push(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// ログ/アクセスログファイルパスの親ディレクトリ（ローテーション・新規作成に必要）を
@@ -310,5 +405,60 @@ pub(super) fn push_unveil_parent_dir(paths: &mut Vec<PathBuf>, file_path: &str) 
     match p.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => paths.push(parent.to_path_buf()),
         _ => paths.push(p.to_path_buf()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-282 SB-12: Seatbelt の読み取り許可に入れるファイルのキーをネストも含めて集める
+    #[test]
+    fn sandbox_file_keys_are_collected_from_nested_tables() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [tls]
+            cert_path = "/etc/veil/cert.pem"
+            key_path = "/etc/veil/key.pem"
+            client_ca = "/etc/veil/client-ca.pem"
+            [tls_client]
+            ca = ["system", "/etc/veil/internal-ca.pem"]
+            [[listener]]
+            listen = "0.0.0.0:8443"
+            [listener.tls]
+            cert_path = "/srv/l2/cert.pem"
+            [[route]]
+            [route.action]
+            type = "Proxy"
+            tls_ca = "builtin"
+            tls_client_cert = "/etc/veil/up.pem"
+            [route.auth]
+            jwks_path = "jwks.json"
+            [acme]
+            storage_dir = "/var/lib/veil/acme"
+            directory_ca_cert = ""
+            "#,
+        )
+        .unwrap();
+        let (mut ro, mut rw) = (Vec::new(), Vec::new());
+        collect_sandbox_file_keys(&raw, &mut ro, &mut rw);
+        for p in [
+            "/etc/veil/cert.pem",
+            "/etc/veil/key.pem",
+            "/etc/veil/client-ca.pem",
+            "/etc/veil/internal-ca.pem",
+            "/srv/l2/cert.pem",
+            "/etc/veil/up.pem",
+            "jwks.json",
+        ] {
+            assert!(ro.contains(&PathBuf::from(p)), "{p} missing from {ro:?}");
+        }
+        assert!(!ro
+            .iter()
+            .any(|p| p == Path::new("system") || p == Path::new("builtin")));
+        assert!(!ro.iter().any(|p| p.as_os_str().is_empty()));
+        assert!(rw.contains(&PathBuf::from("/var/lib/veil/acme")));
+        // [acme] があると証明書のディレクトリは書き換える
+        assert!(rw.contains(&PathBuf::from("/etc/veil")));
     }
 }

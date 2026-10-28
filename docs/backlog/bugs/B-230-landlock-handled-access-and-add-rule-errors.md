@@ -1,6 +1,6 @@
 # B-230: Landlock の handled access に `MAKE_SYM`・`MAKE_SOCK`・`MAKE_FIFO`・`EXECUTE` が無く、`LANDLOCK_ADD_RULE` の失敗を無視している
 
-**状態: 未修正（2026-10-27 起票。セキュリティレビュー SB-03）**
+**状態: 修正済み（v0.10.0）**
 
 ## 出典
 
@@ -24,6 +24,13 @@
 ## 受け入れ条件
 
 - E2E（seccomp/Landlock 有効）: 許可外のディレクトリで `symlink`・UDS の `bind` が EACCES になり、`listen_unix` のソケットは作れる。
+
+## 修正（v0.10.0）
+
+- Landlock の handled に `EXECUTE`・`MAKE_CHAR`・`MAKE_SOCK`・`MAKE_FIFO`・`MAKE_BLOCK`・`MAKE_SYM` を足した（ABI v1 から全部ある）。`MAKE_SOCK` だけ `landlock_write_paths` に許し、他はどのパスにも許さない。
+- ルールを足すときは、開けないパスと `landlock_add_rule` の失敗を `warn!` で出す。通常のファイルのパスにはファイルに意味のあるアクセス（READ_FILE・WRITE_FILE・TRUNCATE・IOCTL_DEV）だけを渡す（以前は READ_DIR 等を含めて EINVAL になり、ファイルを列挙したルールは黙って効いていなかった）。
+- 試験: `landlock_b230_tests::landlock_restricts_special_files`（自分を子プロセスとして起動して Landlock を掛け、許可外のシンボリックリンク・UDS の bind が EACCES、許可内では UDS と通常のファイルは作れてシンボリックリンク・FIFO は EACCES）。
+- `docs/guide/security.md`（英日）に説明を足した。
 
 ## 関連
 

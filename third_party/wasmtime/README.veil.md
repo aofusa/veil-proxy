@@ -43,6 +43,10 @@ crates.io の [`wasmtime` 36.0.19](https://crates.io/crates/wasmtime/36.0.19)（
   載る）。`src/` のその 2 つの `cfg(feature = ...)` は常に偽になるので、`[lints.rust.unexpected_cfgs]` の `check-cfg` に
   `cfg(feature, values("profiling", "profile-pulley"))` を足した。本体（`Cargo.toml`）の依存は `default-features = false` で
   `profiling` 以外の既定を並べている（crates.io の `wasmtime` も同じ）。
+- `cache` の feature（コンパイル結果のディスクキャッシュ）と、それだけが使う任意の依存 `wasmtime-internal-cache` を消した（B-216）。
+  veil は使わず、`wasmtime-internal-cache` が `zstd` 0.13（RUSTSEC-2026-0391・0395〜0406・0410 の `zstd-safe` 7・`zstd-sys` 2.0）を
+  `Cargo.lock` に持ち込むため。`src/` の `cfg(feature = "cache")` は常に偽になるので、上の `check-cfg` に `"cache"` を足した。
+  本体の crates.io の `wasmtime` の依存も `cache` を外している。
 - `[lints.rust]` の `unused-lifetimes` / `unused-macro-rules` をアンダースコア表記
   （`unused_lifetimes` / `unused_macro_rules`）へ変更。cargo 1.99 以降はハイフン表記を
   非推奨としてビルドのたびに manifest 警告を出すため（2026-10、Linux aarch64 VM の
@@ -160,3 +164,7 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
 した（新しい rustc の `function_casts_as_integer` lint が警告する関数アイテムの直接キャスト。
 lint 名で allow すると、この lint を知らない古い rustc（BSD の pkg 版など）で `unknown lint`
 警告になるため、lint の提案どおりにソースを直した。得られるアドレスは同じ）。
+
+## 照合する勧告（F-277）
+
+- advisory-repo: bytecodealliance/wasmtime（上流のリポジトリの勧告も照合する）

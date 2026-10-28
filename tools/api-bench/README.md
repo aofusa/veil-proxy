@@ -49,6 +49,8 @@ python3 tools/api-bench/run_bench.py --summary docs/artifacts/api_bench_rust.tsv
 - 列: `rps`・`p50_ms`・`p99_ms`（wrk）、`cpu_pct`（サーバのプロセスツリーの utime + stime）、`cores_pct`（サーバに割り当てた
   コアの busy。ループバックのソフト割り込みを含む）、`us_per_req`（`cores_pct` から求めた 1 要求あたりの CPU 時間）、`rss_mb`。
 - 計測前に他の負荷が無いことを確かめる（`top`。tokio のテストハーネスの取り残しが CPU を使い続けていたことがある）。
+- 待ち受けは `127.0.0.1:$BENCH_PORT`（既定 3000。`allocs.py` も同じ）。対象を起動する前にそのポートが応えたら止まる
+  （Grafana の既定ポートでもあり、使われたまま測ると全対象が同じ数字になる。B-218）。`cpu_pct` が 0 の行は対象を測れていない。
 
 ## HTTP/2・HTTP/3（F-206）
 

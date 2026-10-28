@@ -421,6 +421,8 @@ pub struct WebSocketPollConfig {
     /// バックオフ倍率 - Adaptiveモードでのみ使用
     /// タイムアウト発生時に現在値に掛ける倍率
     pub backoff_multiplier: f64,
+    /// どちらの向きにもデータが流れない時間の上限（`None` は無制限。F-282）
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for WebSocketPollConfig {
@@ -430,6 +432,7 @@ impl Default for WebSocketPollConfig {
             initial_timeout_ms: default_websocket_poll_timeout_ms(),
             max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             backoff_multiplier: default_websocket_backoff_multiplier(),
+            idle_timeout: None,
         }
     }
 }
@@ -506,6 +509,26 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub remove_request_headers: Vec<String>,
 
+    /// 転送ヘッダ（`X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・`Forwarded`）の扱い（B-232）
+    ///
+    /// - `"append"`（既定）: `trusted_proxies` に入らないクライアントが送ったこれらは上流へ送らず、
+    ///   `X-Forwarded-For` にクライアントの IP を入れる。`trusted_proxies` からの要求は受けた値を残し、
+    ///   `X-Forwarded-For` にクライアントの IP を足す（別の行として。リストとしては末尾に連なる）。
+    ///   `X-Real-IP` は足さない（必要なら `add_request_headers` に `$client_ip` で書く）。
+    /// - `"passthrough"`: v0.10.0 より前の動き（受けた値をそのまま送り、何も足さない）。
+    ///
+    /// `add_request_headers` に同じ名前があればそちらを使う。
+    #[serde(default)]
+    pub forwarded_headers: ForwardedHeadersMode,
+
+    /// 転送ヘッダを信頼する送信元（IP/CIDR）。前段のロードバランサ等（B-232）
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// `trusted_proxies` を解析したもの（初回に作る）
+    #[serde(skip)]
+    pub trusted_proxy_ranges: std::sync::OnceLock<Vec<CidrRange>>,
+
     /// レスポンスに追加するヘッダー（クライアントへ返送前）
     /// 例: { "X-Frame-Options" = "DENY", "Strict-Transport-Security" = "max-age=31536000" }
     #[serde(default)]
@@ -555,9 +578,54 @@ pub struct SecurityConfig {
     /// デフォルト: `2.0`
     #[serde(default = "default_websocket_backoff_multiplier")]
     pub websocket_poll_backoff_multiplier: f64,
+
+    /// アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（F-282）。
+    ///
+    /// デフォルト: `0`（無制限）
+    #[serde(default)]
+    pub websocket_idle_timeout_secs: u64,
+
+    /// 実際の応答（プリフライト以外）に足す CORS のヘッダ（F-273）。`[route.traffic.cors]` のあるルートで、
+    /// 要求の `Origin` ごとに設定ロード時に作った `Backend` の写しだけが持つ（それ以外は `None`）
+    #[serde(skip)]
+    pub cors_actual: Option<Arc<crate::route_cors::CorsActual>>,
+
+    /// レート制限の表の鍵（F-273）。0 ならこの設定のアドレス。CORS の写しは元の設定のアドレスを持ち、
+    /// オリジンごとに枠が分かれないようにする
+    #[serde(skip)]
+    pub rate_limit_zone: usize,
+}
+
+/// 転送ヘッダの扱い（`[route.security] forwarded_headers`。B-232）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardedHeadersMode {
+    /// 信頼しない送信元の転送ヘッダを捨て、クライアントの IP を入れる
+    #[default]
+    Append,
+    /// 受けたまま送る（何も足さない）
+    Passthrough,
 }
 
 impl SecurityConfig {
+    /// 送信元が `trusted_proxies` に入るか（B-232）。リストが空なら解析もしない。
+    #[inline]
+    pub fn is_trusted_proxy(&self, client_ip: &str) -> bool {
+        if self.trusted_proxies.is_empty() {
+            return false;
+        }
+        let ranges = self.trusted_proxy_ranges.get_or_init(|| {
+            self.trusted_proxies
+                .iter()
+                .filter_map(|s| CidrRange::parse(s.trim()))
+                .collect()
+        });
+        match client_ip.parse::<std::net::IpAddr>() {
+            Ok(addr) => ranges.iter().any(|r| r.contains_addr(addr)),
+            Err(_) => false,
+        }
+    }
+
     /// IP制限フィルターを構築
     pub fn ip_filter(&self) -> IpFilter {
         IpFilter::from_lists(&self.allowed_ips, &self.denied_ips)
@@ -602,6 +670,8 @@ impl SecurityConfig {
             initial_timeout_ms: self.websocket_poll_timeout_ms,
             max_timeout_ms: self.websocket_poll_max_timeout_ms,
             backoff_multiplier: self.websocket_poll_backoff_multiplier,
+            idle_timeout: (self.websocket_idle_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.websocket_idle_timeout_secs)),
         }
     }
 }
@@ -623,6 +693,9 @@ impl Default for SecurityConfig {
             denied_ips: Vec::new(),
             add_request_headers: HashMap::new(),
             remove_request_headers: Vec::new(),
+            forwarded_headers: ForwardedHeadersMode::default(),
+            trusted_proxies: Vec::new(),
+            trusted_proxy_ranges: std::sync::OnceLock::new(),
             add_response_headers: HashMap::new(),
             remove_response_headers: Vec::new(),
             // WebSocket設定
@@ -630,6 +703,9 @@ impl Default for SecurityConfig {
             websocket_poll_timeout_ms: default_websocket_poll_timeout_ms(),
             websocket_poll_max_timeout_ms: default_websocket_poll_max_timeout_ms(),
             websocket_poll_backoff_multiplier: default_websocket_backoff_multiplier(),
+            websocket_idle_timeout_secs: 0,
+            cors_actual: None,
+            rate_limit_zone: 0,
         }
     }
 }

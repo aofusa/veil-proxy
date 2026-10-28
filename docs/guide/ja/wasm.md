@@ -131,6 +131,76 @@ path = "./www"
 合成と TOML → JSON 変換は**設定ロード時（起動・SIGHUP リロード）に 1 回だけ**実行され、
 リクエスト経路では `Arc` の clone しか行いません。
 
+### プロトコルごとのフィルタのフェーズ
+
+| フェーズ | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| `on_http_request_headers` | ○ | ○ | ○ |
+| `on_http_request_body` | ○ | ○ | ○ |
+| `on_http_request_trailers` | – | h2c の gRPC | – |
+| `on_http_response_headers` | ○ | ○ | ○ |
+| `on_http_response_body` | – | – | ○ |
+| `on_log` | ○ | ○ | ○ |
+
+要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
+veil は本文を全部読んでから（Content-Length・chunked。上限は `max_request_body_size`・`max_chunked_body_size`、超えたら
+`413`）`on_http_request_body` を `end_of_stream = true` で 1 回呼ぶ。コールバックからは要求のパス・メソッド・ヘッダも読める。
+モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送り、
+`Expect` は外す）。そういうモジュールの無いルートは、今までどおり本文を上流へ流す。`Expect: 100-continue` の chunked の要求には、
+本文を読む前に `100 Continue` を返す（`Content-Length` の要求にはフィルタより前に返している）。
+
+HTTP/1.1 では、フィルタのローカル応答（`send_local_response`）の後も接続を続け、本文の後ろにパイプラインで届いた要求を
+続けて処理する。ローカル応答の本文は、`HEAD` の要求（`Content-Length` は本文の長さのまま）と `1xx`・`204`・`304` では送らない。
+
+### VM の文脈の使い回し（`instance_reuse`）
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+instance_reuse = true   # 既定 false
+```
+
+既定ではコールバックごとに新しいインスタンスで動く（`_start`・`proxy_on_vm_start`・`proxy_on_configure` が毎回走る）。
+`instance_reuse = true` なら、インスタンスを 1 回作って設定し、後の要求で使い回す。要求ごとは HTTP context の作成
+（`proxy_on_context_create`）とコールバックだけで、要求が終わると `proxy_on_delete` が走る（Envoy と同じ寿命）。
+1 つの要求のフェーズ（要求ヘッダ・要求本文・応答ヘッダ・応答本文・`on_log`）はすべて同じ HTTP context で呼ぶので、
+フィルタが HTTP context に持つ状態はフェーズをまたいで残る。1 つのインスタンスに複数の要求の HTTP context が同時に住む
+（Envoy のワーカーの VM と同じ）。要求が `on_log` の前に終わったら（クライアントの切断等）、その context はインスタンスを
+次に使うときに消す。フィルタのグローバル変数と root context の状態は要求をまたいで残る。トラップ・エラーを返した
+インスタンスは捨て、次の要求は新しいインスタンスを使う。そこに context を持っていた要求の以後のフェーズは新しい
+HTTP context で呼ぶ（フィルタは飛ばさないが、前の context に持っていた状態は失われる）。ワーカーはモジュールごと（とルートの `module_configuration` ごと）に
+設定済みのインスタンスを持つ。上限はプーリングアロケータの `total_memories` の半分を、ワーカーと `instance_reuse` の
+モジュールで分けた数。
+
+### フィルタだけで要求に答える（`Respond` + モジュール）
+
+`type = "Respond"` のルートにも `modules` を付けられる。フィルタが `send_local_response` で答えればその応答を返し、
+答えなければルートの固定応答を返す。上流の無い、フィルタだけで答えるルートを作れる。
+
+```toml
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/baseline11"
+[route.action]
+type = "Respond"
+status = 404
+```
+
+### 起動時に読むファイル（`data_files`）
+
+```toml
+[[wasm.modules]]
+name = "baseline"
+path = "/etc/veil/wasm/baseline_filter.wasm"
+data_files = { dataset = "/etc/veil/data/dataset.json" }
+```
+
+各ファイルは設定のロード時（起動・リロード）に読み、プロパティ `plugin_data.<名前>` としてフィルタに見せる
+（`get_property(["plugin_data", "dataset"])`）。要求ごとのディスクの読み取りは無い。ファイルが無ければ設定のエラー。
+モジュールに `allowed_properties` を書くなら `"plugin_data.*"` を含める。
+
 ### デフォルト設定
 
 `[wasm.defaults]` セクションでは、WASMランタイムのグローバル設定を行えます：
@@ -138,7 +208,11 @@ path = "./www"
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+| `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel で数える）。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
 | `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
+| `grpc_connect_timeout_ms` | `proxy_grpc_call`・`proxy_grpc_stream` で gRPC の上流へ接続する（TCP と TLS）時間の上限。ゲストの `timeout_ms` が長くても接続はこの時間で諦める（到達できない上流で全プラグインの gRPC が止まらないように）。gRPC のスレッドが取り込む前の呼び出し・ストリームのメッセージはそれぞれ 4096 件までで、超えるとホスト関数は `InternalFailure` を返す | 5000 |
+| `http_call_max_timeout_ms` | `proxy_http_call` にプラグインが渡す `timeout_ms` の上限（負の値は 0 とみなす） | 60000 |
+| `shared_data_max_keys` | 1 モジュールの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は `InternalFailure` を返す（既存のキーは更新できる） | 100000 |
 
 #### Poolingアロケータ設定
 
@@ -156,7 +230,7 @@ path = "./www"
 |-----------|------|----------|
 | `allow_logging` | ログ出力 | false |
 | `allow_metrics` | メトリクス操作 | false |
-| `allow_shared_data` | 共有データ | false |
+| `allow_shared_data` | 共有データ（`proxy_set_shared_data`・`proxy_get_shared_data`）。モジュール名ごとに 1 つの表を全要求・全ワーカーで共有し、設定のリロードでも引き継ぐ（Envoy の `vm_id` ごとの共有に当たる） | false |
 | `allow_request_headers_read` | リクエストヘッダー読み取り | false |
 | `allow_request_headers_write` | リクエストヘッダー書き換え | false |
 | `allow_request_body_read` | リクエストボディ読み取り | false |

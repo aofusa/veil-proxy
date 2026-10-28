@@ -5,11 +5,11 @@ Use it from `build.rs`; the generated code depends on `veil` and `prost` only (n
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.8", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
 prost = "0.13"            # the version prost-build 0.13 generates code for
 
 [build-dependencies]
-veil-build = { package = "veil-proxy-build", version = "0.8" }
+veil-build = { package = "veil-proxy-build", version = "0.10" }
 ```
 
 ```rust

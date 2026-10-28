@@ -68,6 +68,11 @@ pub struct StaticContentCacheConfig {
     pub max_total_bytes: u64,
     /// キャッシュヒット時に mtime を再検証するか（デフォルト: 無効、syscall ゼロ優先）
     pub revalidate_mtime: bool,
+    /// ディスクの変更を通知で追従する（F-272。グローバルの既定値。ルートの解決にだけ使う）
+    pub watch: bool,
+    /// 監視しているルートの世代（ルートの設定から写す。グローバルの設定では常に None）
+    #[serde(skip)]
+    pub watch_gen: Option<super::watch::WatchGen>,
 }
 
 impl Default for StaticContentCacheConfig {
@@ -79,6 +84,8 @@ impl Default for StaticContentCacheConfig {
             max_file_size_bytes: 1024 * 1024,
             max_total_bytes: 64 * 1024 * 1024,
             revalidate_mtime: false,
+            watch: false,
+            watch_gen: None,
         }
     }
 }
@@ -100,6 +107,12 @@ pub struct StaticContentCacheRouteConfig {
     pub max_total_bytes: Option<u64>,
     #[serde(default, rename = "revalidate_mtime")]
     pub revalidate_mtime: Option<bool>,
+    /// ディスクの変更を通知で追従する（F-272。None はグローバルの `[static_file_cache] watch`）
+    #[serde(default)]
+    pub watch: Option<bool>,
+    /// 監視しているルートの世代（設定ロード時に解決。監視しないルートは None）
+    #[serde(skip)]
+    pub watch_gen: Option<super::watch::WatchGen>,
 }
 
 /// グローバルデフォルト（ロックフリー atomic。`configure_global_open_file_cache` と
@@ -110,6 +123,18 @@ static GLOBAL_MAX_ENTRIES: AtomicUsize = AtomicUsize::new(1024);
 static GLOBAL_MAX_FILE_SIZE_BYTES: AtomicU64 = AtomicU64::new(1024 * 1024);
 static GLOBAL_MAX_TOTAL_BYTES: AtomicU64 = AtomicU64::new(64 * 1024 * 1024);
 static GLOBAL_REVALIDATE_MTIME: AtomicBool = AtomicBool::new(false);
+static GLOBAL_WATCH: AtomicBool = AtomicBool::new(false);
+
+/// ルートの `static_file_cache` がディスクの変更を監視するか（設定ロード時。F-272）。
+///
+/// `global` は読み込み中の設定の `[static_file_cache] watch`（B-185: プロセス全体の値は、リロードが最後まで
+/// 通ってから書き換えるので、ルートの解決には引数で渡す）
+pub fn static_file_cache_watch_enabled(
+    route: Option<&StaticContentCacheRouteConfig>,
+    global: bool,
+) -> bool {
+    route.and_then(|r| r.watch).unwrap_or(global)
+}
 
 /// グローバル静的コンテンツキャッシュ設定を適用（起動時・SIGHUP リロード時）。
 pub fn configure_global_static_content_cache(cfg: &StaticContentCacheConfig) {
@@ -119,6 +144,7 @@ pub fn configure_global_static_content_cache(cfg: &StaticContentCacheConfig) {
     GLOBAL_MAX_FILE_SIZE_BYTES.store(cfg.max_file_size_bytes, Ordering::Relaxed);
     GLOBAL_MAX_TOTAL_BYTES.store(cfg.max_total_bytes, Ordering::Relaxed);
     GLOBAL_REVALIDATE_MTIME.store(cfg.revalidate_mtime, Ordering::Relaxed);
+    GLOBAL_WATCH.store(cfg.watch, Ordering::Relaxed);
 }
 
 /// ルート上書きとグローバル設定をマージして解決済み設定を返す（アロケーション無し）。
@@ -145,6 +171,10 @@ pub fn effective_static_content_cache_config(
         revalidate_mtime: route
             .and_then(|r| r.revalidate_mtime)
             .unwrap_or_else(|| GLOBAL_REVALIDATE_MTIME.load(Ordering::Relaxed)),
+        watch: route
+            .and_then(|r| r.watch)
+            .unwrap_or_else(|| GLOBAL_WATCH.load(Ordering::Relaxed)),
+        watch_gen: route.and_then(|r| r.watch_gen),
     }
 }
 
@@ -160,6 +190,8 @@ struct CachedContent {
     mime_type: Arc<str>,
     /// キャッシュ時刻
     cached_at: Instant,
+    /// 読み込む前に読んだ監視の世代（F-272）
+    stamp: Option<super::watch::Stamp>,
 }
 
 struct ContentCache {
@@ -268,6 +300,10 @@ impl ContentCache {
             return None;
         }
         let entry = self.entries.get(path)?;
+        // F-272: 監視しているルートが作った後に変わっていたら作り直す（原子変数の読み取り 1 回）
+        if !super::watch::fresh(entry.stamp, cfg.watch_gen) {
+            return None;
+        }
         let ttl = Duration::from_secs(cfg.valid_duration_secs);
         if entry.cached_at.elapsed() >= ttl {
             return None;
@@ -325,6 +361,8 @@ impl ContentCache {
 
         self.misses.fetch_add(1, Ordering::Relaxed);
 
+        // F-272: 読む前に世代を読む（読み込み中の差し替えを新しい世代で残さない）
+        let stamp = super::watch::stamp(cfg.watch_gen);
         let load_path = path.to_path_buf();
         // 理由付き allow: offload 専用ワーカースレッド内で実行、イベントループ非ブロック
         // （F-146: HTTP/2・HTTP/3 静的配信の既存 offload 読み込みと同じ許容箇所）。
@@ -357,6 +395,7 @@ impl ContentCache {
                     mtime,
                     mime_type: mime.clone(),
                     cached_at: Instant::now(),
+                    stamp,
                 },
                 cfg,
             );
@@ -392,12 +431,15 @@ impl ContentCache {
     /// キャッシュが効かなくなるが、内容の正しさには影響しない
     /// （`revalidate_mtime` は既定 `false` であり、この trade-off が効くのはこの経路を
     /// 明示的に選んだ場合のみ）。
+    ///
+    /// `stamp` は読む前に読んだ監視の世代（F-272）。
     fn insert_bytes(
         &self,
         path: &Path,
         data: Bytes,
         mime: Arc<str>,
         cfg: &StaticContentCacheConfig,
+        stamp: Option<super::watch::Stamp>,
     ) {
         let len = data.len() as u64;
         if !cfg.enabled || len > cfg.max_file_size_bytes {
@@ -411,6 +453,7 @@ impl ContentCache {
                 mtime: None,
                 mime_type: mime,
                 cached_at: Instant::now(),
+                stamp,
             },
             cfg,
         );
@@ -460,8 +503,24 @@ pub async fn get_cached(path: &Path, cfg: &StaticContentCacheConfig) -> Option<B
 
 /// 既に読み込み済みのバイト列をキャッシュへ登録する（グローバルシングルトン、F-150）。
 /// 詳細は `ContentCache::insert_bytes` 参照。
+///
+/// 監視しているルートの世代は登録の時点で読む（F-272。読む前に読んだ世代を持っている呼び出し元は
+/// `insert_bytes_stamped` を使う）。
 pub fn insert_bytes(path: &Path, data: Bytes, mime: Arc<str>, cfg: &StaticContentCacheConfig) {
-    CONTENT_CACHE.insert_bytes(path, data, mime, cfg);
+    let stamp = super::watch::stamp(cfg.watch_gen);
+    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp);
+}
+
+/// [`insert_bytes`] の、読む前に読んだ監視の世代を付ける版（F-272。静的配信の高速経路）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn insert_bytes_stamped(
+    path: &Path,
+    data: Bytes,
+    mime: Arc<str>,
+    cfg: &StaticContentCacheConfig,
+    stamp: Option<super::watch::Stamp>,
+) {
+    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp);
 }
 
 /// 指定パスのキャッシュエントリを無効化する（読み込み失敗時等に既存の
@@ -509,6 +568,8 @@ mod tests {
             max_file_size_bytes: 1024 * 1024,
             max_total_bytes: 64 * 1024 * 1024,
             revalidate_mtime: false,
+            watch: false,
+            watch_gen: None,
         }
     }
 
@@ -861,7 +922,7 @@ mod tests {
         let payload = Bytes::from_static(b"round trip payload");
         let mime: Arc<str> = Arc::from("text/plain");
 
-        cache.insert_bytes(&path, payload.clone(), mime.clone(), &cfg);
+        cache.insert_bytes(&path, payload.clone(), mime.clone(), &cfg, None);
 
         let hit =
             block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
@@ -886,6 +947,7 @@ mod tests {
             Bytes::from_static(b"too large"),
             Arc::from("text/plain"),
             &cfg,
+            None,
         );
 
         assert_eq!(cache.entries.len(), 0, "上限を超えるバイト列は挿入されない");
@@ -908,6 +970,7 @@ mod tests {
             Bytes::from_static(b"data"),
             Arc::from("text/plain"),
             &cfg,
+            None,
         );
 
         assert_eq!(cache.entries.len(), 0, "無効時は insert_bytes も何もしない");

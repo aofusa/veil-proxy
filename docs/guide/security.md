@@ -35,6 +35,11 @@ landlock_write_paths = ["/var/log/veil"]
 | v3 | 6.2+ | TRUNCATE permission |
 | v4 | 6.7+ | ioctl permission |
 
+Everywhere outside the listed paths, veil denies reading and writing as well as creating symlinks, sockets, FIFOs
+and device nodes and executing files. Inside `landlock_write_paths` it allows regular files, directories and Unix
+sockets, but still no symlinks, FIFOs, device nodes or execution. A listed path that cannot be opened, or whose
+rule the kernel rejects, is logged as a warning at startup (access to it stays denied).
+
 #### 2. seccomp System Call Restriction
 
 Restricts system calls based on an allow list.
@@ -45,11 +50,47 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+`log` only records violations, `filter` makes the disallowed call fail with `EPERM`, and `strict` terminates the
+whole process with `SIGSYS`, whichever thread made the call (before v0.10.0 only that thread was killed and the
+rest kept running).
+
 > The allowlist includes `faccessat2` (issued by glibc 2.33+/musl for `access()`/`faccessat()`) and
 > `openat2` (used to resolve static files with `RESOLVE_BENEATH`, F-153). The container profiles
 > (`docker/assets/security/seccomp.json` / `seccomp-epoll.json`) include both; `openat2` was added in
 > v0.8.0 (without it veil falls back to `canonicalize()` on every request, and before B-154 the first
 > static request after startup returned 404).
+>
+> For `watch = true` on the static file caches ([Compression & Cache](compression-cache.md#static-file-caches-follow-disk-changes)),
+> the allowlist and both container profiles also include `inotify_init1`, `inotify_add_watch` and
+> `inotify_rm_watch`; the in-process allowlist adds `getdents64` (the watcher thread walks the static root).
+> Only the dedicated watcher thread issues them, at startup, on reload and when a directory is created.
+> veil starts the watcher thread (like the workers) after the sandbox is applied.
+
+**Argument checks.** For some allowed calls the filter also looks at the arguments, and a call outside the
+listed values is handled like a disallowed call (`log` / `EPERM` / `SIGSYS`):
+
+| System call | Allowed |
+|-------------|---------|
+| `mmap`, `mprotect` | without `PROT_EXEC` |
+| `socket` | `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` (glibc's `getaddrinfo`) |
+| `ioctl` | `FIONBIO`, `FIONREAD`, `FIOCLEX`, `FIONCLEX`, `TCGETS`, `TIOCGWINSZ` |
+| `prctl` | `PR_SET_NAME`, `PR_GET_NAME`, `PR_SET_NO_NEW_PRIVS`, `PR_GET_NO_NEW_PRIVS`, `PR_GET_SECCOMP`, `PR_SET_SECCOMP`, `PR_CAPBSET_READ`, `PR_GET_DUMPABLE`, `PR_SET_VMA` |
+| `clone` | without namespace flags (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWNET`, ...) |
+| `clone3` | never; it fails with `ENOSYS` so the C library falls back to `clone` (its flags are not visible to the filter) |
+| `tgkill` | threads of the veil process only |
+
+`setuid`, `setgid`, `setgroups`, `setresuid` and `setresgid` are no longer allowed: veil drops privileges before it
+installs the filter. These checks were added in v0.10.0.
+
+**Which threads are sandboxed.** veil installs the seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC`, so it applies to
+every thread of the process, including the control-plane threads started before it (logging, configuration and
+certificate reload, VDS, ACME, health checks, cache cleanup, Proxy-Wasm tick and gRPC). Landlock has no such flag and
+applies to the thread that installs it and to threads created afterwards: the main thread, the workers and the static
+file watcher. Of the threads started earlier, the health check, Proxy-Wasm tick and Proxy-Wasm gRPC threads restrict
+themselves with the same ruleset; the configuration reload, certificate reload, VDS and ACME threads stay outside
+Landlock (they read the configuration, certificates and Proxy-Wasm modules, and ACME writes certificates) and are
+covered by seccomp only. Before v0.10.0 the seccomp filter, too, covered only the main thread and the threads created
+after it.
 
 **Recommended Deployment Procedure:**
 
@@ -74,6 +115,30 @@ After starting as root and creating listeners, drop to unprivileged user.
 drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
+
+#### 4. macOS Seatbelt (`sandbox_init`)
+
+On macOS, `enable_sandbox_macos = true` applies a Seatbelt profile once every listener is bound (it cannot be
+removed afterwards):
+
+```toml
+[security]
+enable_sandbox_macos = true
+```
+
+- The profile starts from `(deny default)`. Child processes (`process-fork`, `process-exec`) are not allowed.
+- Files can be read only under the paths the configuration names (the configuration file, certificates, keys,
+  CA files, tokens, JWKS, Proxy-Wasm modules and static roots; for a file, its whole directory, so a secret
+  replaced by swapping a symbolic link is still readable), and under the system paths the dynamic linker, name
+  resolution, the trust store and time zones need (`/usr/lib`, `/usr/share`, `/System`, `/Library/Keychains`,
+  `/private/etc`, `/private/var/db/dyld`, `/private/var/db/timezone`, `/dev`). File metadata (`stat`) is readable
+  everywhere.
+- Files can be written only under the log and disk-cache directories, the ACME storage directory (and the
+  certificate directory when `[acme]` is set), `upload_tmp_dir` and Unix sockets.
+- The allowed paths are fixed at startup. After a reload that points at a new location, veil cannot read it: a
+  new certificate or key makes the reload fail (the running configuration stays in place), and a new static root
+  answers 404. Restart veil to move files to a new location.
+- Network access, `mach-lookup` and signals to itself stay allowed.
 
 ### About Namespace Isolation
 
@@ -105,6 +170,7 @@ jwks_path = "/etc/veil/jwks.json"         # or jwks = '{"keys":[...]}' inline
 # allow_missing = false                   # true: requests without a token pass (a token present is still verified)
 # require_expiration = false
 # clock_skew_secs = 60
+# allowed_algs = ["RS256"]                # accepted "alg" values (empty: the key's "alg", or any for its key type)
 require_claims = { scope = ["read"] }     # every claim must have one of the values
 ```
 
@@ -156,12 +222,13 @@ Minimum system calls required for this server to operate:
 | **io_uring** | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | monoio runtime |
 | **Network** | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt` | TCP/UDP sockets |
 | **File I/O** | `openat`, `read`, `write`, `close`, `fstat`, `readv`, `writev` | Config, certificates, logs |
+| **Files and directories** | `dup`, `dup3`, `unlink(at)`, `mkdir(at)`, `rename(at)`, `renameat2`, `chmod`, `fchmod(at)` | Unix socket listeners, disk spill-over of request bodies, ACME certificate storage |
 | **Memory** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc, Huge Pages, io_uring registered buffers |
 | **Threads** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | Worker threads |
 | **CPU Affinity** | `sched_setaffinity`, `sched_getaffinity` | CPU pinning |
-| **Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
+| **Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `restart_syscall` | SIGTERM/SIGHUP, resuming a sleep after SIGSTOP/SIGCONT or ptrace |
 | **Time** | `clock_gettime`, `nanosleep` | Timeouts |
-| **Other** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname` | Various control |
+| **Other** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname`, `landlock_restrict_self` | Various control; control-plane threads restricting themselves |
 
 ### systemd Service File
 
@@ -327,6 +394,16 @@ ExecStart=/usr/bin/bwrap \
 
 In this configuration, systemd creates the outer "container" and bubblewrap provides an even stricter filesystem view.
 
+## Early data (0-RTT)
+
+0-RTT data can be replayed by an attacker, so veil never acts on it:
+
+- TLS over TCP (HTTP/1.1, HTTP/2): early data is not offered (rustls `max_early_data_size` stays 0). Session
+  resumption (`[tls] session_resumption`) still saves a round trip.
+- HTTP/3: QUIC 0-RTT packets are accepted so the handshake completes sooner, but the HTTP/3 layer is created only
+  after the handshake is complete. A request sent as 0-RTT data is read and processed then, after the client has
+  proved it holds the session, and a replayed copy cannot complete a handshake.
+
 ## Panic Recovery
 
 Veil implements connection-level panic catching to ensure high availability.
@@ -387,6 +464,9 @@ Request-level hardening that came out of the audit:
   whitespace; `:method` must be a token and `:path` must not contain spaces or control characters (RFC 9113 §8.2.1,
   RFC 9114 §4.2). Violations are stream errors, so they can never reach an HTTP/1.1 upstream.
 - `remove_request_headers` / `add_request_headers` apply to every client and upstream protocol.
+- `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and `Forwarded` from clients outside
+  `[route.security] trusted_proxies` are not forwarded; `X-Forwarded-For` carries the client IP instead
+  (`forwarded_headers = "passthrough"` restores the old pass-through).
 - The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
   or responses to `Authorization` requests (unless `key_headers` includes `Authorization`).
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
@@ -396,6 +476,13 @@ Request-level hardening that came out of the audit:
   the terminating chunk is forwarded upstream as part of that request.
 - WebSocket upgrades apply `remove_request_headers` / `add_request_headers`; client bytes that follow the
   handshake are sent upstream only after a `101`.
+- HTTP/3 caps connections per worker (`[http3] max_connections`), answers Initials with a stateless Retry once
+  `retry_threshold` connections are handshaking, and drops connections that do not finish the handshake within
+  `handshake_timeout`, so a flood of Initials from spoofed addresses cannot allocate connections without bound.
+- HTTP/3 frames are not allocated from their announced length: large frames grow their buffer as bytes arrive,
+  header sections are capped by `[http3] max_field_section_size` (checked on the announced length and while QPACK
+  decodes), and path events are consumed so a peer that keeps changing its source port cannot grow a queue
+  (backports of quiche 0.29.3 fixes for GHSA-4fgf-9xrr-88gf and GHSA-4q5x-gp38-rfp4).
 - HTTP/2 and HTTP/3 buffered request bodies are capped while they accumulate (the largest
   `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
 - The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.

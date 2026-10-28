@@ -232,6 +232,25 @@ pub fn check_rate_limit(zone: usize, client_ip: &str, limit: u64) -> bool {
     rate as u64 <= limit
 }
 
+/// `check_rate_limit` と同じ数え方の推定レートを、記録せずに読む（B-231: 管理 API の認証の失敗の上限）。
+pub fn rate_peek(zone: usize, client_ip: &str) -> u64 {
+    let table = &*RATE_TABLE;
+    let idx = (std::hash::BuildHasher::hash_one(&table.hasher, (zone, client_ip)) as usize)
+        & (RATE_SLOTS - 1);
+    let now_secs = coarse_now().unix_timestamp() as u64;
+    let minute = (now_secs / 60) as u32;
+    let (m, cur, prev) = rate_unpack(table.slots[idx].load(std::sync::atomic::Ordering::Relaxed));
+    let (cur, prev) = if m == minute {
+        (cur, prev)
+    } else if m.wrapping_add(1) == minute {
+        (0, cur)
+    } else {
+        (0, 0)
+    };
+    let weight = 60u64.saturating_sub(now_secs % 60);
+    (prev as u64 * weight).div_ceil(60) + cur as u64
+}
+
 #[cfg(test)]
 pub(super) mod b31_rate_limit_tests {
     use super::*;

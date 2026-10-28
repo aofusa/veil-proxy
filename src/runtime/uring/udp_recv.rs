@@ -302,16 +302,37 @@ fn build_slot_result(
     })
 }
 
-impl Drop for PipelinedUdpRecv {
+// B-223: in-flight（SQ に積んだだけで未提出のものを含む）の RECVMSG は、キャンセルの CQE が来るまでカーネルが
+// msghdr・iovec・アドレス・cmsg・本体のバッファへ書き得る。以前は PipelinedUdpRecv の Drop が OpGuard::Noop で
+// detach してすぐスロットを解放しており（graceful shutdown の後に届いたデータグラムが解放済みのヒープへ書かれる）、
+// new() の失敗の経路では detach すらしていなかった。スロット自身の Drop で、バッファの Box を後始末の閉包へ移して
+// CQE まで生かす（Box の中身は動かないのでカーネルが持つアドレスはそのまま）。終了・失敗の経路だけなので、
+// 差し替えの小さな確保は問題にならない。
+impl Drop for RecvSlot {
     fn drop(&mut self) {
-        // F-129 から踏襲: ワーカー終了時のみ発生する経路であり、リング/エグゼキュータも
-        // 同時に破棄されるため OpGuard::Noop で後始末不要とする（バッファ解放は行わない）。
-        for slot in self.slots.iter_mut() {
-            if slot.submitted && slot.user_data != 0 {
-                detach_op(slot.user_data, OpGuard::Noop);
-                slot.submitted = false;
-            }
+        if !self.submitted || self.user_data == 0 {
+            return;
         }
+        let keep = (
+            std::mem::take(&mut self.buf),
+            std::mem::replace(&mut self.addr, Box::new(unsafe { std::mem::zeroed() })),
+            std::mem::take(&mut self.cmsg),
+            std::mem::replace(&mut self.msg, Box::new(unsafe { std::mem::zeroed() })),
+            std::mem::replace(
+                &mut self.iov,
+                Box::new(libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                }),
+            ),
+        );
+        self.submitted = false;
+        // detach_op は未提出の SQE も提出してからキャンセルを投げる。完了済みなら閉包はその場で走る。
+        detach_op(
+            self.user_data,
+            OpGuard::Cleanup(Box::new(move |_res| drop(keep))),
+        );
+        self.user_data = 0;
     }
 }
 
@@ -380,16 +401,16 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr
 }
 
 fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
-    while !cmsg.is_null() {
-        let cmsg_ref = unsafe { &*cmsg };
-        if cmsg_ref.cmsg_level == libc::SOL_UDP && cmsg_ref.cmsg_type == libc::UDP_GRO {
-            let data_ptr = unsafe { libc::CMSG_DATA(cmsg) as *const u16 };
-            return Some(unsafe { *data_ptr });
-        }
-        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    if msg.msg_control.is_null() {
+        return None;
     }
-    None
+    // msg_controllen は glibc では usize、musl では socklen_t なので変換が要る。
+    #[allow(clippy::unnecessary_cast)]
+    let controllen = msg.msg_controllen as usize;
+    // SAFETY: msg_control/msg_controllen はスロットが所有する cmsg バッファを指し、RECVMSG の完了後に読む。
+    let control = unsafe { std::slice::from_raw_parts(msg.msg_control as *const u8, controllen) };
+    // B-227: 整列を仮定せずに読む（cmsg は u8 のバッファ）。
+    crate::udp::socket::find_gro_segment(control)
 }
 
 /// provided buffer 1 本（ヘッダ + name + control + payload）から `SlotMeta` を切り出す純粋関数。
@@ -433,10 +454,8 @@ fn parse_recvmsg_buf(buf: &[u8]) -> Option<SlotMeta> {
     let from = raw_to_socket_addr(&storage).ok()?;
 
     let control_bytes = &buf[BUF_HDR + NAME_CAP..BUF_HDR + NAME_CAP + CMSG_CAP];
-    let mut tmp_msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    tmp_msg.msg_control = control_bytes.as_ptr() as *mut libc::c_void;
-    tmp_msg.msg_controllen = hdr.controllen as _;
-    let gro = parse_gro_cmsg(&tmp_msg);
+    // B-227: provided buffer 内の control 領域は整列を保証しないため、整列を仮定しない走査で読む。
+    let gro = crate::udp::socket::find_gro_segment(&control_bytes[..hdr.controllen as usize]);
 
     Some(SlotMeta {
         from,

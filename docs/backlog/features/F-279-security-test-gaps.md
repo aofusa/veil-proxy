@@ -1,6 +1,6 @@
 # F-279: セキュリティ試験の空白を埋める（seccomp 有効の E2E・HTTP/2 の接続状態機械と上流の応答の fuzz・終了時の ASAN・veil-alloc の TSAN・偽装 Initial の洪水）
 
-**状態: 未着手（2026-10-27 起票。セキュリティレビュー 06 §6）**
+**状態: 完了（v0.10.0）**
 
 ## 今の状態
 
@@ -34,6 +34,23 @@ semgrep・gitleaks・ZAP・chaos・sanitizer・cargo-audit/deny・full_features 
 ## 受け入れ条件
 
 - 上の試験が `container-security-nightly` で毎晩走り、B-219〜B-225 の修正の前は失敗・後は成功する。
+
+## 修正（v0.10.0）
+
+- seccomp・Landlock を有効にした E2E: `VEIL_E2E_SECCOMP=strict|filter|log`（B-219/B-220 で `tests/e2e_setup.sh` に追加、`security_audit.rs` が全スレッドの
+  `Seccomp:` を検査）。`container-security-nightly` の E2E の行列に seccomp `strict` を io_uring・epoll の両方で足した。
+- fuzz target を 4 本足した（計 17 本）: `http2_connection_state`（`Http2Connection` にバイト列を流し、HPACK の動的表・同時ストリーム数・
+  ヘッダブロックの上限を assert）、`http_response_parse`（上流の応答 + chunked を一括と 1 バイトずつで比べる）、`path_norm`、`h3_field_section`
+  （`h3_check_field_section` を `src/h3_fields.rs` へ切り出し）。`run_libfuzzer.sh` の `FUZZ_TARGETS` に追加。手元で各 60 秒（66〜94 万回）落ちない。
+- `io_uring_executor` の fuzz のモデルにガードの再入（detach のガードが op 表を借りる）を足し、`detach` もガードを借用の外で走らせるようにした
+  （`detach_take_guard`）。借用の中でガードを走らせる変異をモデルが検出することを確認。
+- `e2e_sanitizer_chaos.sh`: 負荷を流したまま TERM を送る（graceful shutdown 中の処理中の要求。HTTP/1.1・HTTP/2）。TSAN は `veil-alloc` を足して回す。
+  サニタイザのビルドは既定で `http3` を含まない（build-std で quiche が重い）ので、HTTP/3 の受信中の終了は `SAN_CARGO_FEATURES` に `http3` を
+  足したときだけ見る。
+- 偽装 Initial の洪水: `http3-client` の `initial_flood`（別ソケットから本物の Initial を `H3_FLOOD_CONNECTIONS` 本）と `h3_flood_probe.sh`
+  （洪水の後に HTTP/3・HTTPS が応答するか）、`run_full_features_security.sh` で RSS の増加の上限（`H3_FLOOD_MAX_GROWTH_MB`）。送信元の偽装（NET_RAW）は
+  使わず、別ソケットで接続 ID と送信元ポートを変える。
+- 受け入れ条件のうち「修正の前は失敗」は fuzz のモデルの変異でだけ確かめた（nightly で B-219〜B-225 の前のコミットを回してはいない）。
 
 ## 関連
 
