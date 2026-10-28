@@ -575,7 +575,13 @@ pub(super) async fn test_http3_quic_keepalive_idle() {
 #[tokio::test]
 #[ntest::timeout(45000)]
 #[cfg(feature = "http3")]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 pub(super) async fn test_http3_goaway_graceful_reload() {
+    // リロードは proxy.toml を読み直すので、他のテストが書き換えている最中に走らせない
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
@@ -2103,8 +2109,8 @@ pub(super) async fn test_http3_sni_and_cert_reload() {
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("generate cert");
-    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
-    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
+    super::tickets::write_atomic(&cert_path, cert.cert.pem()).expect("write cert");
+    super::tickets::write_atomic(&key_path, cert.signing_key.serialize_pem()).expect("write key");
     assert!(send_sighup(pid), "SIGHUP must be delivered");
 
     for i in 0..6 {
@@ -2131,8 +2137,8 @@ pub(super) async fn test_http3_sni_and_cert_reload() {
     }
 
     // 原状復帰
-    std::fs::write(&cert_path, &original_cert).expect("restore cert");
-    std::fs::write(&key_path, &original_key).expect("restore key");
+    super::tickets::write_atomic(&cert_path, &original_cert).expect("restore cert");
+    super::tickets::write_atomic(&key_path, &original_key).expect("restore key");
     send_sighup(pid);
     tokio::time::sleep(Duration::from_millis(800)).await;
 
