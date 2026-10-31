@@ -38,7 +38,7 @@ full = ["cookie", "cors", "auth", "jwt", "session", "di", "tasks", "cron", "grpc
 
 [dependencies]
 # 利用側は veil を `features = ["full", "api"]` 等で指定する（feature は合わさる）。kit が要るのは API の土台だけ。
-veil = { package = "veil-proxy", path = "../..", version = "0.9.2", default-features = false, features = ["api-core"] }
+veil = { package = "veil-proxy", path = "../..", version = "0.10.0", default-features = false, features = ["api-core"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
