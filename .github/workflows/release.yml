@@ -242,6 +242,8 @@ jobs:
       - name: publish (dry-run on pre-releases)
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          # まだ crates.io に無いクレート（veil-proxy-kit 等）の最初の版だけに使う（trusted publishing は既にあるクレートだけ）
+          NEW_CRATES_TOKEN: ${{ secrets.CRATES_IO_NEW_CRATES_TOKEN }}
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           if [ "$PRERELEASE" = true ]; then

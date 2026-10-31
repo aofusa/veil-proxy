@@ -601,6 +601,15 @@ git tag v0.9.0      && git push origin v0.9.0        # 本番の draft を作る
 
 1. **GitHub**: Settings → Environments に `crates-io`・`pypi`・`release` を作る。
 2. **crates.io・PyPI・ghcr.io・Read the Docs**: v0.8.0 で済み（trusted publishing、パッケージの可視性）。
+   **新しいパッケージを足したときの最初の版**（v0.10.0 の `veil-proxy-kit`・`veil-api-kit`）:
+   - crates.io の trusted publishing は既にあるクレートにしか使えない。`publish-new` の範囲（クレート名を限ってよい）の
+     API token を作り、environment `crates-io` の secret `CRATES_IO_NEW_CRATES_TOKEN` に入れる。`publish-crates.sh` は
+     まだ 1 版も無いクレートだけをこの token で公開する（無ければそのクレートの名前を出して失敗する）。公開の後に
+     crates.io のそのクレートの設定で trusted publishing（リポジトリ `aofusa/veil-proxy`・workflow `release.yml`・
+     environment `crates-io`）を足し、secret は消してよい。
+   - PyPI・TestPyPI は、まだ無いプロジェクトに「pending publisher」を登録する（PyPI の Account → Publishing。
+     プロジェクト名・owner `aofusa`・リポジトリ `veil-proxy`・workflow `release.yml`・environment `pypi`）。
+     rc は TestPyPI へ出すので、TestPyPI にも同じものを登録する。
 3. **公開の後の配布先**（`release-downstream.yml`。environment `release` の secrets）:
 
    | secret | 用途 |

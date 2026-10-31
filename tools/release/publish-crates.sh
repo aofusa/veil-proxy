@@ -45,28 +45,48 @@ if [ "$DRY" = 1 ] && [ "${DRY_RUN_VERSION:-}" != keep ]; then
 fi
 
 crates=(veil-proxy-quiche veil-proxy-wasmtime veil-proxy-macros veil-proxy veil-proxy-build veil-proxy-kit)
+UA='veil-proxy release (https://github.com/aofusa/veil-proxy)'
 exclude=()
+# まだ crates.io に 1 版も無いクレート。trusted publishing（OIDC）の token は既にあるクレートにしか使えないので、
+# 最初の版だけ NEW_CRATES_TOKEN（environment crates-io の secret CRATES_IO_NEW_CRATES_TOKEN）で別に公開する
+new_crates=()
 for c in "${crates[@]}"; do
     ver="$(cargo metadata -q --no-deps --format-version 1 | python3 -c "import sys,json;print([p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$c'][0])")"
-    code="$(curl -s -o /dev/null -w '%{http_code}' -A 'veil-proxy release (https://github.com/aofusa/veil-proxy)' \
-        "https://crates.io/api/v1/crates/$c/$ver")"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "https://crates.io/api/v1/crates/$c/$ver")"
     if [ "$code" = 200 ]; then
         echo "skip $c $ver (already on crates.io)"
         exclude+=(--exclude "$c")
+    elif [ "$DRY" = 0 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "https://crates.io/api/v1/crates/$c")" = 404 ]; then
+        echo "publish $c $ver (first version, with NEW_CRATES_TOKEN)"
+        exclude+=(--exclude "$c")
+        new_crates+=("$c")
     else
         echo "publish $c $ver"
     fi
 done
-
-if [ "${#exclude[@]}" -eq $((${#crates[@]} * 2)) ]; then
-    # 全部が公開済み（最初の版を手元から公開した後の rc など）。cargo package は対象が 0 個だと失敗するので何もしない
-    echo "nothing to publish (all crates are already on crates.io)"
-    exit 0
+if [ "${#new_crates[@]}" -gt 0 ] && [ -z "${NEW_CRATES_TOKEN:-}" ]; then
+    echo "error: ${new_crates[*]} not on crates.io yet; trusted publishing cannot publish a crate's first version." >&2
+    echo "Set the secret CRATES_IO_NEW_CRATES_TOKEN (environment crates-io; a token with the publish-new scope) and re-run." >&2
+    exit 1
 fi
 
 if [ "$DRY" = 1 ]; then
+    if [ "${#exclude[@]}" -eq $((${#crates[@]} * 2)) ]; then
+        # 全部が公開済み（最初の版を手元から公開した後の rc など）。cargo package は対象が 0 個だと失敗するので何もしない
+        echo "nothing to publish (all crates are already on crates.io)"
+        exit 0
+    fi
     # 公開前のクレートに依存するクレートも、cargo package --workspace はまとめて検証できる
     cargo package --workspace "${exclude[@]}" --allow-dirty
-else
+    exit 0
+fi
+if [ "${#exclude[@]}" -lt $((${#crates[@]} * 2)) ]; then
     cargo publish --workspace "${exclude[@]}" --allow-dirty
+fi
+# 最初の版（依存する veil-proxy は上で索引に載っている）
+for c in ${new_crates[@]+"${new_crates[@]}"}; do
+    CARGO_REGISTRY_TOKEN="$NEW_CRATES_TOKEN" cargo publish -p "$c" --allow-dirty
+done
+if [ "${#exclude[@]}" -eq $((${#crates[@]} * 2)) ] && [ "${#new_crates[@]}" -eq 0 ]; then
+    echo "nothing to publish (all crates are already on crates.io)"
 fi
