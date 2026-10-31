@@ -11,7 +11,7 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B）の生データ |
 | [`freebsd_cpu_per_req.tsv`](freebsd_cpu_per_req.tsv) | FreeBSD のサーバの CPU 時間 / 要求（`cpu_per_req.sh`）の生データ |
 | [`freebsd_v092_ab_raw.tsv`](freebsd_v092_ab_raw.tsv) | FreeBSD の v0.9.2 と v0.10.0 の候補の交互 A/B（rps・CPU/要求）の生データ |
-| [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.8.3 の全件と、v0.8.4 で回し直したもの） |
+| [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.10.0） |
 
 ---
 
@@ -96,26 +96,29 @@ Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスルー�
 測り直しの 13 組は全体の中央値 1.001、最小 0.976（HTTP/1.1）・最大 1.012。**退行なし。** v0.10.0 の変更（複数の待ち受け・
 CORS の実際の応答・キャッシュの監視・Proxy-Wasm の再利用と協調的な yield 等）は、使わない構成では分岐だけで、計測の揺れの範囲だった。
 
-### 最終候補での確認（セキュリティ修正の後、2026-10-27）
+### 最終候補での確認（セキュリティ修正の後、2026-10-28）
 
-上のフルスイートの後に、セキュリティレビューの修正（B-219〜B-243。ヘッダの検査、HTTP/3 の接続数の上限、seccomp・Landlock の
-適用範囲、管理 API の認証の比較等）と B-240 が入ったので、最終候補（`d92eea6e`、`veil:v0100-final`）と v0.9.2 をホットパスの
-代表 9 構成で交互に測り直した（別のホスト: aofish の Docker Desktop、3 反復。±10% を外れた 2 構成は 7 反復）。
-全計測で Non-2xx = 0。比は v0.10.0 / v0.9.2 の Req/s の中央値。
+上のフルスイートの後に、セキュリティレビューの修正（B-219〜B-262・F-277〜F-284。ヘッダの検査、HTTP/3 の接続数の上限、
+seccomp・Landlock の適用範囲、上流の応答の区切りの統一（B-244〜B-246）、TLS の上流の close_notify の確認（F-282 KT-01）、
+veil-alloc のセグメントのガード（F-282 AL-01）等）が入ったので、最終候補（`83b94152`、`veil:v0100-final`）と v0.9.2 を
+ホットパスの代表 9 構成で交互に測り直した（別のホスト: aofish の Docker Desktop、3 反復。±10% を外れた 2 構成は 5 反復で
+測り直した）。全計測で Non-2xx = 0。比は v0.10.0 / v0.9.2 の Req/s の中央値。生データは
+[linux_final_ab_raw.tsv](linux_final_ab_raw.tsv)。
 
 | 構成 | HTTP/1.1 | HTTP/2 | HTTP/3 | h2c |
 |---|---|---|---|---|
-| `h2_0_ktls_0_lb_kernel_ofc_1`（静的） | 1.002 | — | — | — |
-| `h2_1_ktls_0_lb_kernel_ofc_1`（静的、7 反復） | 1.025 | 1.003 | — | — |
-| `h2_1_feat_proxy`（中継） | 1.028 | 1.004 | — | — |
-| `h2_1_proxy_wasm`（中継 + Proxy-Wasm） | 0.977 | 0.965 | — | — |
-| `h2c_file` / `h2c_proxy` | — | — | — | 1.040 / 1.018 |
-| `h3_file_access_log`（静的 + アクセスログ） | 1.035 | 1.045 | 0.998 | — |
-| `h3_file_cache`（静的 + キャッシュ） | 0.985 | 1.000 | 0.941 | — |
-| `h3_proxy`（中継、7 反復） | 1.004 | 0.985 | 1.029 | — |
+| `h2_0_ktls_0_lb_kernel_ofc_1`（静的） | 0.981 | — | — | — |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（静的） | 1.039 | 1.158 | — | — |
+| `h2_1_feat_proxy`（中継） | 0.992 | 1.054 | — | — |
+| `h2_1_proxy_wasm`（中継 + Proxy-Wasm） | 1.068 | 0.991 | — | — |
+| `h2c_file` / `h2c_proxy`（h2c_proxy は 5 反復） | — | — | — | 1.008 / 1.259 |
+| `h3_file_access_log`（静的 + アクセスログ） | 1.124 | 1.005 | 1.037 | — |
+| `h3_file_cache`（静的 + キャッシュ） | 0.961 | 1.076 | 0.962 | — |
+| `h3_proxy`（中継、5 反復） | 0.982 | 1.008 | 1.178 | — |
 
-このホストは反復ごとの揺れが大きい（同じバイナリで ±10〜15%）。3 反復で 0.92（`h2_1_ktls_0_lb_kernel_ofc_1` の HTTP/2）・
-0.96（`h3_proxy` の HTTP/3）だった 2 構成は 7 反復で 1.003・1.029 になった。**退行なし。**
+`suite_ab.sh` は構成ごとに片方の反復をまとめて測るので、このホストの時間で変わる揺れが片側だけに乗る。3 反復で
+0.859（`h2c_proxy`）・0.746（`h3_proxy` の HTTP/1.1。CPU も下がり、待ちが増えた形）だった 2 構成は、5 反復で
+1.259・0.982 になった（`h3_proxy` の HTTP/1.1 は d92eea6e の 7 反復でも 1.004）。**退行なし。**
 
 ---
 
