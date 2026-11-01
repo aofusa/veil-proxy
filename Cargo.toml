@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build", "crates/veil-kit"]
-# third_party/wasmtime は crates.io wasmtime 36.0.18（LTS）の vendoring（B-55 / B-79、path 依存）で
+# third_party/wasmtime は crates.io wasmtime 36.0.20（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
 # vendoring 先まで対象にしてしまう。詳細は third_party/wasmtime/README.veil.md）。
@@ -789,12 +789,12 @@ boring = "4.3"
 # - 既定の feature のうち `profiling`（perf の jitdump・VTune）だけを外す。veil は使わず、保守終了の `fxhash`
 #   （RUSTSEC-2025-0057、`fxprof-processed-profile` 経由）を依存に持ち込むため。残りは既定のまま（B-158）。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+wasmtime = { version = "36.0.20", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 # 依存のキーはパッケージ名と同じにする（`package =` で別名にすると、クレートの名前が `[lib] name = "wasmtime"` ではなく
 # キー〈veil_wasmtime〉になり、`use wasmtime::...` が解決できない。F-238 の改名で FreeBSD aarch64 のビルドが壊れた）
-veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.19", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
+veil-proxy-wasmtime = { path = "third_party/wasmtime", version = "36.0.20", optional = true, default-features = false, features = ["async", "gc", "gc-drc", "gc-null", "wat", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "threads", "stack-switching", "std", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）

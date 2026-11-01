@@ -598,6 +598,7 @@
 | B-260 | P3 | 修正済み（v0.10.0） | [bugs/B-260-sandbox-dev-nodes-become-empty-files.md](bugs/B-260-sandbox-dev-nodes-become-empty-files.md) | サンドボックスの `/dev`（`sandbox_mount_dev`）で `/dev/null`・`/dev/zero`・`/dev/random`・`/dev/urandom` が空の通常ファイルになる（tmpfs を被せた後に同じパスから bind していた） |
 | B-261 | P2 | 修正済み（v0.10.0） | [bugs/B-261-h3-ktls-upstream-control-record-and-close-notify.md](bugs/B-261-h3-ktls-upstream-control-record-and-close-notify.md) | HTTP/3 の上流 TLS 接続で kTLS の制御レコード（NewSessionTicket）が `EIO` のまま 502 になり、HTTP/2・HTTP/3・圧縮の経路が close_notify の無い EOF を応答の完了とみなす（B-259・F-282 KT-01 の取りこぼし） |
 | B-262 | P2 | 修正済み（v0.10.0） | [bugs/B-262-h1-buffered-close-delimited-response-never-ends.md](bugs/B-262-h1-buffered-close-delimited-response-never-ends.md) | HTTP/1.1 のバッファリングのルートで、上流が接続を閉じて本文を終える応答（長さも chunked も無い）をクライアントへ送った後に接続を閉じず、クライアントは本文の終わりを知れずに待ち続ける |
+| B-263 | P1 | 修正済み（v0.10.0） | [bugs/B-263-nightly-advisories-and-musl-test-build-v0100.md](bugs/B-263-nightly-advisories-and-musl-test-build-v0100.md) | v0.10.0 の最終候補で container-security の nightly が落ちる: wasmtime 36.0.19 の GHSA-6fr9-xmw9-5352（→ 36.0.20、vendoring 版も）・`gh-action-pypi-publish` v1.14.2 の GHSA-5xjx-3w67-w9x9（→ v1.14.3）・musl で F-278 の試験の `ioctl` の型が合わない・`CAP_SYS_ADMIN` の無い root で B-260 の試験が落ちる（イメージのビルドが止まる） |
 
 ---
 

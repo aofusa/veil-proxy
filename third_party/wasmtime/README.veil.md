@@ -2,8 +2,15 @@
 
 ## 由来
 
-crates.io の [`wasmtime` 36.0.19](https://crates.io/crates/wasmtime/36.0.19)（LTS）をそのままコピー
-（ローカルの `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-36.0.19/` から）。
+crates.io の [`wasmtime` 36.0.20](https://crates.io/crates/wasmtime/36.0.20)（LTS）をそのままコピー
+（36.0.19 までは `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-<版>/` から）。
+
+> **2026-11-01: 36.0.19 → 36.0.20（v0.10.0、B-263）。** GHSA-6fr9-xmw9-5352（component model で自分が定義した資源の
+> `borrow` を受け取るたびにホストのメモリが数えられずに増える）の修正版。veil は core module しか使わないが、同じ LTS の
+> 修正版に揃えた。36.0.19 との差は `src/runtime/vm/component/resources.rs` と `Cargo.toml`（依存の版）だけなので、
+> crates.io の `wasmtime-36.0.20.crate`（sha256 が crates.io の索引の `cksum` と一致することを確かめた）から
+> `resources.rs` を取り込み、`Cargo.toml` の版（`36.0.19` → `36.0.20`、Cranelift の `0.123.19` → `0.123.20`）を書き換えた。
+> 下の差分はそのまま残っている。
 
 > **2026-10-22: 36.0.18 → 36.0.19（v0.8.3 の後、B-157）。** RUSTSEC-2026-0379（aarch64 の Cranelift が大きな `br_table` で
 > 誤った飛び先へ飛ぶ）・RUSTSEC-2026-0380（Cranelift のビットの詰め込みの桁あふれによる誤コンパイル）の修正版。

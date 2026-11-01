@@ -4993,7 +4993,8 @@ mod tests {
                 bits |= 4;
             }
             let mut buf = [0u8; 64];
-            if unsafe { libc::ioctl(fd, libc::SIOCGIFCONF, buf.as_mut_ptr()) } < 0
+            // ioctl の要求の型は glibc が c_ulong・musl が c_int（定数は両方 c_ulong）
+            if unsafe { libc::ioctl(fd, libc::SIOCGIFCONF as _, buf.as_mut_ptr()) } < 0
                 && errno() == libc::EPERM
             {
                 bits |= 8;
