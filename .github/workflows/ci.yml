@@ -79,7 +79,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --doc --no-default-features --features full,api
       # F-241: docs.rs に出る文書（と Python の文書）が英語だけで、チケット番号が無い
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # nightly
       - run: tools/release/check-docs.sh
 
   build:
