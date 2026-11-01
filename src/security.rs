@@ -5598,13 +5598,21 @@ mod sandbox_mount_tests {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     const CHILD_ENV: &str = "VEIL_F282_MOUNT_CHILD";
+    /// 子がマウント名前空間を作れなかったときの終了コード
+    const SKIP_EXIT: i32 = 77;
 
     // 理由: 試験
     #[allow(clippy::disallowed_methods)]
     fn child() -> i32 {
         // SAFETY: 引数無しの unshare。このプロセスだけのマウント名前空間にする
         if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
-            eprintln!("FAILED: unshare: {}", io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            // root でも CAP_SYS_ADMIN が無い（コンテナイメージのビルド等）ときは試せない
+            if e.raw_os_error() == Some(libc::EPERM) {
+                eprintln!("Skipping test: no permission for a mount namespace: {e}");
+                return SKIP_EXIT;
+            }
+            eprintln!("FAILED: unshare: {e}");
             return 1;
         }
         let cfg = SandboxConfig {
@@ -5690,6 +5698,10 @@ mod sandbox_mount_tests {
             .env(CHILD_ENV, "1")
             .output()
             .unwrap();
+        if out.status.code() == Some(SKIP_EXIT) {
+            eprintln!("{}", String::from_utf8_lossy(&out.stderr).trim_end());
+            return;
+        }
         assert!(
             out.status.success(),
             "child failed: {}",

@@ -23,3 +23,5 @@ v0.10.0 の F-282（SB-11: namespace の mount の失敗の扱い）の作業中
 - tmpfs を被せる前に元のノードを `O_PATH` で開き、`/proc/self/fd/N` から bind する。開けないノードは作らない（警告）。
 - bind の失敗はマウントの失敗として扱う（F-282 の SB-11 と同じく `allow_security_failures = false` なら起動を止める）。
 - 試験: `security::sandbox_mount_tests`（root のときだけ。子プロセスでマウント名前空間を作り、`/dev/null` などがデバイスのままであることを確かめる）。
+  root でも `CAP_SYS_ADMIN` が無い（コンテナイメージのビルドの中の `cargo test --lib`）ときは `unshare` が `EPERM` になるので飛ばす
+  （飛ばさずに失敗させて container-security の nightly のイメージのビルドが落ちた）。
