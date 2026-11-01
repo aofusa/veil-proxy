@@ -120,7 +120,7 @@ RUN find src -name '*.rs' -exec touch {} + \
 # 中身は distroless と同じ最小構成（glibc・libgcc・CA 証明書・/etc/passwd の nonroot=65532）で、シェルは無い。
 # 既定のユーザーは nonroot（65532）だが、distroless（root で起動し、設定の drop_privileges で降格する）と
 # 同じ振る舞いにするため root で起動する。作業ディレクトリも CMD の `./veil` のために / に固定する。
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:709673274b417a48f56374da8a7633ef7b2f5b27e34612ce98a335737318cc94 AS runtime
 
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28

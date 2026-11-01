@@ -158,7 +158,7 @@ RUN find src -name '*.rs' -exec touch {} + \
 # 既定のユーザーは nonroot（65532）だが、distroless（root で起動し、設定の drop_privileges で降格する）と
 # 同じ振る舞いにするため root で起動する。作業ディレクトリも CMD の `./veil` のために / に固定する。
 # --platform はファイル冒頭で宣言した RUNTIME_PLATFORM を使う
-FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runtime
+FROM --platform=${RUNTIME_PLATFORM} cgr.dev/chainguard/glibc-dynamic:latest@sha256:709673274b417a48f56374da8a7633ef7b2f5b27e34612ce98a335737318cc94 AS runtime
 
 ARG RUST_TARGET=aarch64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28
