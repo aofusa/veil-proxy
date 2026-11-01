@@ -380,7 +380,8 @@ jobs:
           assert kit["version"] == pep, (kit["version"], pep)
           assert "veil-api==%s" % pep in kit["dependencies"], kit["dependencies"]
           files = sorted(glob.glob("crates/veil-python-kit/dist/*"))
-          assert len(files) == 2 and files[0].endswith(".tar.gz") and files[1].endswith("-py3-none-any.whl"), files
+          # 名前の順は whl（"-py3"）が sdist（".tar.gz"）より前になる
+          assert len(files) == 2 and sum(f.endswith(".tar.gz") for f in files) == 1 and sum(f.endswith("-py3-none-any.whl") for f in files) == 1, files
           print("veil-api-kit", pep, files)
           PY
       # 純 Python の部分（veil の拡張無しで動く試験）。docstring は英語でチケット番号が無い（F-241）

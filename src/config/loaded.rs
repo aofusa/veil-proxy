@@ -600,6 +600,8 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
         for mut route in routes_config {
+            #[cfg(target_os = "macos")]
+            absolutize_file_root(&mut route);
             // F-148: モジュール設定の合成は設定ロード時に 1 回だけ行い、`resolved_modules`
             // へ Arc 共有で持たせる（load_backend はリクエストごとに呼ばれるため）。
             resolve_route_modules(
@@ -824,6 +826,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
         for mut route in routes_config {
+            #[cfg(target_os = "macos")]
+            absolutize_file_root(&mut route);
             // F-148: モジュール設定の合成は設定ロード時に 1 回だけ行い、`resolved_modules`
             // へ Arc 共有で持たせる（load_backend はリクエストごとに呼ばれるため）。
             resolve_route_modules(
@@ -1103,6 +1107,25 @@ thread_local! {
     static CANONICAL_BASE_MEMO: std::cell::RefCell<
         std::collections::HashMap<String, Option<Arc<Path>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// macOS: File ルートの相対パスを、最初の設定ロード（サンドボックスの前）の作業ディレクトリからの
+/// 絶対パスにする。Seatbelt の下では `getcwd` が拒否され、相対パスの `canonicalize()` が失敗して
+/// 例の設定（`path = 'examples/www/'`）が全部 404 になっていた（`sandbox_init` は絶対パスの
+/// `subpath` で許可しているので、絶対パスなら解決できる）。リロードは同じ作業ディレクトリを使う。
+#[cfg(target_os = "macos")]
+fn absolutize_file_root(route: &mut Route) {
+    static STARTUP_CWD: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    if let BackendConfig::File { path, .. } = &mut route.action {
+        if Path::new(path.as_str()).is_absolute() {
+            return;
+        }
+        // 起動時の設定ロードで 1 回だけ（リロードはメモを使う）
+        let cwd = STARTUP_CWD.get_or_init(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            *path = cwd.join(path.as_str()).to_string_lossy().into_owned();
+        }
+    }
 }
 
 /// `path` の canonical 形をメモ化して返す（B-64。詳細は [`CANONICAL_BASE_MEMO`]）。
@@ -2023,5 +2046,40 @@ mod b185_reload_tests {
         assert_ne!(cache::open_file_cache_global_max_entries(), 4185);
         let sfc = cache::effective_static_content_cache_config(None);
         assert_ne!(sfc.max_entries, 4185);
+    }
+}
+
+// macOS: File ルートの相対パスはサンドボックスの前に絶対パスにする（Seatbelt の下では相対パスを解決できない）
+#[cfg(all(test, target_os = "macos"))]
+mod macos_file_root_tests {
+    use super::*;
+
+    fn file_route(path: &str) -> Route {
+        toml::from_str(&format!(
+            "[conditions]\npath = \"/\"\n[action]\ntype = \"File\"\npath = {path:?}\n"
+        ))
+        .unwrap()
+    }
+
+    fn root_of(route: &Route) -> &str {
+        match &route.action {
+            BackendConfig::File { path, .. } => path,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn relative_root_becomes_absolute_from_the_working_directory() {
+        let mut r = file_route("examples/www/");
+        absolutize_file_root(&mut r);
+        let want = std::env::current_dir().unwrap().join("examples/www/");
+        assert_eq!(root_of(&r), want.to_string_lossy());
+    }
+
+    #[test]
+    fn absolute_root_is_unchanged() {
+        let mut r = file_route("/srv/www/");
+        absolutize_file_root(&mut r);
+        assert_eq!(root_of(&r), "/srv/www/");
     }
 }
