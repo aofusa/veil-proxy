@@ -214,6 +214,11 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 | `http_call_max_timeout_ms` | `proxy_http_call` にプラグインが渡す `timeout_ms` の上限（負の値は 0 とみなす） | 60000 |
 | `shared_data_max_keys` | 1 モジュールの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は `InternalFailure` を返す（既存のキーは更新できる） | 100000 |
 
+コールバックがトラップしたり上限（`max_execution_time_ms` から決まる CPU の量、または他の要求へ譲っていた時間を含む約 1 秒の
+実時間）を超えたりすると、エラーをログに出し、そのフィルタが無かったものとして要求を続ける（fail open）。WAF のようなセキュリティの
+フィルタは、ワーカーが混んでいるときでも上限より十分短く終わるようにする。メッシュの `WasmPlugin` の `failure_policy: FAIL_CLOSED` は
+代わりに 503 を返す。
+
 #### Poolingアロケータ設定
 
 `[wasm.defaults.pooling]` セクションでは、高速インスタンス化のためのPoolingアロケータを設定します：

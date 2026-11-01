@@ -220,6 +220,11 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 | `http_call_max_timeout_ms` | Upper bound on the `timeout_ms` a plugin passes to `proxy_http_call` (a negative value counts as 0) | 60000 |
 | `shared_data_max_keys` | Maximum number of keys in one module's shared data; `proxy_set_shared_data` with a new key beyond it returns `InternalFailure` (existing keys can still be updated) | 100000 |
 
+A callback that traps or runs past its limits (the CPU budget from `max_execution_time_ms`, or about one second
+of wall time including the time it yielded to other requests) is logged as an error and the request continues as
+if the filter had not run (fail open). A security filter such as a WAF should finish well within these limits even
+when the worker is busy; the mesh's `WasmPlugin` with `failure_policy: FAIL_CLOSED` answers 503 instead.
+
 #### Pooling Allocator Settings
 
 The `[wasm.defaults.pooling]` section configures the pooling allocator for high-speed instance creation:
