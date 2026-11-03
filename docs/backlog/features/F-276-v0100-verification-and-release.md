@@ -1,6 +1,6 @@
 # F-276: v0.10.0 の全体検証（全プラットフォームの試験・警告・性能・セキュリティ）と、rc での CI の確認・公開
 
-**状態: 未着手（2026-10-25 起票・計画。親は [F-258](F-258-v0100-plan.md)。F-259〜F-275・B-164〜B-166 を main に入れた後に着手）**
+**状態: 完了（v0.10.0）**
 
 ## 依頼（2026-10-25）
 
@@ -96,3 +96,17 @@ F-258 の子チケットの実装が全部終わった後に、次の 1〜3 を�
 
 - 1〜3 がすべて問題無し（記録が `docs/perf/`・`docs/artifacts/v0100/` にある）。v0.10.0 が公開され、下流の配布先が更新されている。
 - 見つけた問題がチケットになって完了している。`backlog.md` が更新されている。
+
+## 結果（2026-11-03）
+
+- 1〜3 の検証で見つけた問題はチケットにして直した（B-180・B-181 ほか、`backlog.md` の「v0.10.0」の行）。最終候補
+  （`0ef8f3e4`）で単体 1216 件・clippy・io_uring の E2E 580/580・epoll の E2E 580/580（負荷の下の HTTP/3 の WAF の 1 件は再実行で通過。
+  Proxy-Wasm の fail open を `docs/guide/wasm.md` に記載）。記録は `docs/artifacts/v0100/`。
+- rc: rc.1（macOS の相対の File ルートが 404 → B-264、veil-api-kit のファイルの順序の決めつけ）、rc.2（新しいパッケージの
+  最初の公開の準備待ち。利用者が PyPI・TestPyPI の pending publisher と crates.io の新規用 token を登録）、rc.3（新しい勧告
+  RUSTSEC-2026-0433 → B-265）、rc.4 で全部緑（NetBSD の port の VM が 1 回止まり、再実行で通過）。nightly の失敗は B-263。
+- `v0.10.0`（`fffa3643`）を公開。crates.io（veil-proxy・veil-proxy-build・veil-proxy-macros・veil-proxy-kit 0.10.0、
+  veil-proxy-quiche 0.24.9-veil.4、veil-proxy-wasmtime 36.0.20）、PyPI（veil-api・veil-api-kit 0.10.0）、ghcr・Docker Hub
+  （`musl-v0.10.0`・`glibc-v0.10.0`・`latest`）、`release-downstream.yml`（apt/dnf・Homebrew・minisign）が緑。
+- 人の作業として残るもの: winget-pkgs の `Aofusa.Veil` の最初の版の提出（artifact `winget-manifests`）、`veil-proxy-kit` の
+  trusted publishing の設定と新規用 token の削除。
