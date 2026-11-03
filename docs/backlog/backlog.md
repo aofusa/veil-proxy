@@ -600,6 +600,7 @@
 | B-262 | P2 | 修正済み（v0.10.0） | [bugs/B-262-h1-buffered-close-delimited-response-never-ends.md](bugs/B-262-h1-buffered-close-delimited-response-never-ends.md) | HTTP/1.1 のバッファリングのルートで、上流が接続を閉じて本文を終える応答（長さも chunked も無い）をクライアントへ送った後に接続を閉じず、クライアントは本文の終わりを知れずに待ち続ける |
 | B-263 | P1 | 修正済み（v0.10.0） | [bugs/B-263-nightly-advisories-and-musl-test-build-v0100.md](bugs/B-263-nightly-advisories-and-musl-test-build-v0100.md) | v0.10.0 の最終候補で container-security の nightly が落ちる: wasmtime 36.0.19 の GHSA-6fr9-xmw9-5352（→ 36.0.20、vendoring 版も）・`gh-action-pypi-publish` v1.14.2 の GHSA-5xjx-3w67-w9x9（→ v1.14.3）・musl で F-278 の試験の `ioctl` の型が合わない・`CAP_SYS_ADMIN` の無い root で B-260 の試験が落ちる（イメージのビルドが止まる） |
 | B-264 | P1 | 修正済み（v0.10.0） | [bugs/B-264-macos-sandbox-relative-static-root-404.md](bugs/B-264-macos-sandbox-relative-static-root-404.md) | macOS の Seatbelt の下で File ルートの相対パス（例の設定の `examples/www/`）が `canonicalize()` できず全部 404（F-282 SB-12 の読み取りの絞り込みで `getcwd` が拒否される）。設定ロードで最初の作業ディレクトリからの絶対パスにする。同じ rc で `release.yml` の veil-api-kit のファイルの順序の決めつけも直した（v0.10.0-rc.1 で発覚） |
+| B-265 | P1 | 修正済み（v0.10.0） | [bugs/B-265-pulldown-cmark-advisory-vds-server.md](bugs/B-265-pulldown-cmark-advisory-vds-server.md) | VDS の参照サーバ（`tools/vds/server`）の `Cargo.lock` の `pulldown-cmark` 0.13.5 に RUSTSEC-2026-0433（ビルド依存。0.13.6 へ）。全 `Cargo.lock` を見る cargo-audit で release の検査が落ちる（v0.10.0-rc.3 で発覚） |
 
 ---
 
