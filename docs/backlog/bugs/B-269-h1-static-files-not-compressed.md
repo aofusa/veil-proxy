@@ -1,6 +1,6 @@
 # B-269: HTTP/1.1 の静的配信（`type = "File"`・`mode = "memory"`）に `[route.compression]` が効かない
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -48,6 +48,12 @@ v0.10.0 の公開後に「バグか実装漏れか」を確かめた。v0.10.0 �
 - 試験: E2E で HTTP/1.1（平文・TLS・kTLS）の File・memory の gzip・br・zstd、圧縮しない型（画像）と `min_size` 未満はそのまま、
   圧縮の無いルートは `sendfile` のまま（strace か `alloc_ab.sh` で確かめる）。性能は 54KB 静的 + zstd を nginx の `gzip_static` 無しの
   `gzip on` と交互 A/B。
+
+## 修正（v0.10.1）
+
+- HTTP/1.1 の静的配信（File・memory）にも `[route.compression]` をかける（`static_response::plan` の圧縮の判定を全プロトコルで共有）。
+  圧縮しないルート・圧縮しない応答は `sendfile` のまま。
+- 統合試験 `b266_f286_f287_static_responses_match_across_protocols`（4 プロトコルで `Content-Encoding: gzip` と伸張した本文が一致）。
 
 ## 関連
 

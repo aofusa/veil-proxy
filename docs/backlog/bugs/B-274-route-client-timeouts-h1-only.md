@@ -1,6 +1,6 @@
 # B-274: ルートの `client_body_timeout_secs` が HTTP/2・HTTP/3 で効かず、`client_header_timeout_secs` はどのプロトコルでも使われない
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -34,6 +34,15 @@
 - `client_header_timeout_secs`: ルートの設定から外して `[server]`（リスナー）の設定にする（HTTP/1.1 のヘッダ・HTTP/2 の HEADERS・HTTP/3 の
   HEADERS の受信に効かせる）か、使わないなら設定と文書から消す。古い設定は警告して無視する。
 - 試験: E2E で h2c・HTTP/2・HTTP/3 の本文を途中で止めた要求が、設定した秒数で打ち切られること（HTTP/1.1 は今の試験を残す）。
+
+## 修正（v0.10.1）
+
+- `client_body_timeout_secs` を HTTP/2・HTTP/3 の要求本文の受信にも効かせる（最後に本文を受け取ってから、応答を始めるまで）。
+  HTTP/2 は接続の見回りで `RST_STREAM(CANCEL)`、HTTP/3 は 1 秒ごとの見回りで `H3_REQUEST_CANCELLED`。I/O ごとにタイマーを張らない。
+  上流への要求も打ち切る（途中までの本文を完結に見せない。[B-277](B-277-mid-upload-reset-completes-upstream.md)）。
+- `client_header_timeout_secs` はルートの設定にできないので使わない。互換のため受け付け、書かれていたら起動時に警告する。
+- `[http2] stream_idle_timeout_secs` が使われていなかった件は [B-276](B-276-http2-stream-idle-timeout-unused.md)。
+- 統合試験 `b274_client_body_timeout_applies_to_h2_and_h3`、文書（`routing.md`・`protocols.md`・`migration-nginx.md`・`performance.md`、英日）。
 
 ## 関連
 

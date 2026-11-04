@@ -541,11 +541,7 @@ Serverヘッダーはサーバーソフトウェア情報を公開するため�
 server_header_enabled = false
 
 # カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
-# デフォルト: "veil"
-# 未指定の場合、プロトコルごとに自動設定:
-#   - HTTP/1.1: "veil/http1.1"
-#   - HTTP/2: "veil/http2"
-#   - HTTP/3: "veil/http3"
+# デフォルト: "veil"（HTTP/1.1・HTTP/2・HTTP/3 で同じ値）
 server_header_value = "MyServer/1.0"
 ```
 
@@ -553,9 +549,10 @@ server_header_value = "MyServer/1.0"
 
 | 設定 | 動作 |
 |------|------|
-| `server_header_enabled = false` | Serverヘッダーを送信しない（デフォルト、本番環境推奨） |
-| `server_header_enabled = true`、`server_header_value`未指定 | プロトコル固有の値: `veil/http1.1`、`veil/http2`、または`veil/http3` |
+| `server_header_enabled = false` | どのプロトコルでも veil は Server ヘッダーを足さない（デフォルト、本番環境推奨）。上流の `Server` はそのまま返す |
+| `server_header_enabled = true`、`server_header_value`未指定 | すべてのプロトコルで `Server: veil`（上流の `Server` を置き換える） |
 | `server_header_enabled = true`、`server_header_value = "Custom"` | すべてのプロトコルでカスタム値を使用: `Server: Custom` |
+| ルートの `remove_response_headers` に `Server` がある | そのルートの応答には `Server` を付けない（veil のものも上流のものも） |
 
 ### 用途
 

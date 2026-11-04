@@ -30,10 +30,6 @@ pub(crate) static ERR_MSG_REQUEST_TIMEOUT: &[u8] =
 pub(crate) static ERR_MSG_GATEWAY_TIMEOUT: &[u8] =
     b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-// HTTP ヘッダー部品（事前計算）
-pub(crate) static HTTP_200_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: ";
-pub(crate) static CONTENT_LENGTH_HEADER: &[u8] = b"\r\nContent-Length: ";
-
 // HTTPリクエスト構築用定数（ホットパス最適化）
 pub(crate) static HEADER_HTTP11_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
 pub(crate) static HEADER_COLON: &[u8] = b": ";

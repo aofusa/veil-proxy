@@ -268,6 +268,15 @@ impl CompressionConfig {
         let ct_str = std::str::from_utf8(content_type?).unwrap_or("");
         debug!("[Compression] Checking Content-Type: '{}'", ct_str);
 
+        // B-281: SSE は終わらないストリームなので、溜めて圧縮すると利用者へ何も届かない
+        // （設定の compressible_types に text/ があっても圧縮しない）
+        if ct_str
+            .get(..17)
+            .is_some_and(|p| p.eq_ignore_ascii_case("text/event-stream"))
+        {
+            return None;
+        }
+
         // スキップ対象をチェック
         if self.skip_types.iter().any(|skip| ct_str.starts_with(skip)) {
             return None;
@@ -284,6 +293,10 @@ impl CompressionConfig {
 
         // 5. サイズ確認（Content-Length 不明なら圧縮を試みる）
         if let Some(len) = content_length {
+            // B-281: 溜める上限を超える応答は圧縮せず逐次送る
+            if len > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                return None;
+            }
             if len < self.min_size {
                 debug!(
                     "[Compression] Content-Length {} is below min_size {}, skipping",

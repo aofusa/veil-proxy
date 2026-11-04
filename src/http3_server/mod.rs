@@ -105,6 +105,33 @@ const H3_NO_ERROR_CODE: u64 = 0x100;
 const H3_REQUEST_REJECTED: u64 = 0x10b;
 /// HTTP/3 の H3_EXCESSIVE_LOAD（RFC 9114 §8.1）。バッファ経路の要求本文が上限を超えたストリームを断る。
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
+/// H3_REQUEST_CANCELLED（RFC 9114 §8.1）。本文の受信が止まった要求の打ち切りに使う（B-274）。
+const H3_REQUEST_CANCELLED: u64 = 0x10c;
+/// 本文の受信が止まった要求を見回る間隔（B-274。打ち切りの秒数はこの粒度）。
+const H3_RECV_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 本文の受信の見張り（ルートの `client_body_timeout_secs`。B-274）。
+#[derive(Clone, Copy)]
+struct RecvWatch {
+    /// 打ち切るまでの秒数（> 0）。
+    secs: u64,
+    /// 最後に本文を受け取った時刻（粗い時計）。
+    last: Instant,
+}
+
+impl RecvWatch {
+    /// `secs` が 0 なら見張らない。
+    fn new(secs: u64) -> Option<Self> {
+        (secs > 0).then(|| Self {
+            secs,
+            last: crate::runtime::time::coarse_now(),
+        })
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last).as_secs() >= self.secs
+    }
+}
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 ///
@@ -611,6 +638,10 @@ struct ProxyStream {
     /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ストリーミング経路だけ。バッファ経路は
     /// `H3BufferedTask` が head を送るときに足す）
     cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
+    /// `add_response_headers`・`remove_response_headers`（B-267。ストリーミング経路だけ）
+    resp_policy: Option<std::sync::Arc<SecurityConfig>>,
+    /// 本文の受信の見張り（B-274。本文の続きを待つ間だけ Some）
+    recv_watch: Option<RecvWatch>,
 }
 
 impl ProxyStream {
@@ -637,6 +668,8 @@ impl ProxyStream {
             max_request_body,
             req_too_large: false,
             cors: None,
+            resp_policy: None,
+            recv_watch: None,
         }
     }
 
@@ -659,6 +692,8 @@ impl ProxyStream {
             max_request_body: 0,
             req_too_large: false,
             cors: None,
+            resp_policy: None,
+            recv_watch: None,
         }
     }
 }
@@ -672,6 +707,8 @@ struct BufferedReq {
     headers: Vec<h3::Header>,
     /// END_STREAM 受信済み（= 処理可能）。
     end: bool,
+    /// 本文の受信の見張り（B-274）
+    recv_watch: Option<RecvWatch>,
 }
 
 /// メインループの `select_biased!` 受信結果（F-32）。
@@ -717,19 +754,6 @@ struct PartialResponse {
     written: usize,
 }
 
-/// `Arc<Vec<u8>>` を `Bytes::from_owner` でゼロコピー化するための薄いラッパ（F-169）。
-///
-/// `Backend::MemoryFile` はコンテンツを `Arc<Vec<u8>>` で保持しており、`Arc<Vec<u8>>`
-/// 自体は `AsRef<[u8]>` を実装しない（`AsRef<Vec<u8>>` のみ）ため、そのまま
-/// `Bytes::from_owner` には渡せない。`src/proxy.rs` の同名ラッパと同じ設計。
-struct ArcVecBytes(Arc<Vec<u8>>);
-
-impl AsRef<[u8]> for ArcVecBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-}
-
 /// `Http3Handler::handle_sendfile` の引数まとめ。
 ///
 /// F-132: WASM モジュールリストを渡す引数が増えたことで `clippy::too_many_arguments`
@@ -744,8 +768,8 @@ struct SendFileRequest<'a> {
     /// 圧縮設定（F-169: HTTP/3 専用設定を解決済みのもの。h2 の `h2_sendfile` と同様、
     /// 呼び出し元が `resolve_http3_compression_config` で解決してから渡す）。
     compression: &'a CompressionConfig,
-    /// クライアントの Accept-Encoding から解決した圧縮方式（F-169）。
-    client_encoding: AcceptedEncoding,
+    /// 静的配信が見る要求ヘッダ（HEAD・Range・条件付き要求・Accept-Encoding）
+    sreq: crate::static_response::StaticRequest<'a>,
     /// OpenFileCache 設定（ルーティングごとの上書き、F-146 で is_dir 判定にも使用）
     open_file_cache_config: Option<&'a cache::OpenFileCacheConfig>,
     /// base_path の canonical 形（F-145、config ロード時に一度だけ解決）。
@@ -890,6 +914,10 @@ struct Http3Handler {
     shutdown_closed: bool,
     /// B-222: ハンドシェイク中（確立前）の印。確立で外し、期限を過ぎたら接続を捨てる。
     handshake: Option<admission::HandshakeSlot>,
+    /// `classify` が解決したルートの `client_body_timeout_secs`（ルートが無ければ 0。B-274）
+    classify_body_timeout: u64,
+    /// 本文の受信が止まった要求を次に見回る時刻（見張る要求がある間だけ Some。接続のタイマーに載せる。B-274）
+    body_check_at: Option<Instant>,
 }
 
 impl Http3Handler {
@@ -925,7 +953,74 @@ impl Http3Handler {
             goaway_id: None,
             shutdown_closed: false,
             handshake: None,
+            classify_body_timeout: 0,
+            body_check_at: None,
         }
+    }
+
+    /// 本文の受信を見張る要求ができたら見回りを始める（B-274）
+    fn arm_body_check(&mut self) {
+        if self.body_check_at.is_none() {
+            self.body_check_at = Some(crate::runtime::time::coarse_now() + H3_RECV_SWEEP_INTERVAL);
+        }
+    }
+
+    /// 本文の受信が止まった要求を H3_REQUEST_CANCELLED で打ち切る（B-274。接続のタイマーから 1 秒ごと）。
+    ///
+    /// 応答を送り始めた要求（双方向のストリーミング等）と、こちらが上流へ渡し切れずに受信を止めている
+    /// （バックプレッシャ）要求は打ち切らない。ストリーミングの要求は送信端を `finish` せずに捨てるので、
+    /// 上流へは途中で切れた本文として伝わる（B-277）。打ち切ったら `true`。
+    fn check_stalled_bodies(&mut self, now: Instant) -> bool {
+        let mut expired: Vec<u64> = Vec::new();
+        let mut watching = false;
+        for (&id, ps) in self.proxy_streams.iter_mut() {
+            let Some(w) = ps.recv_watch.as_mut() else {
+                continue;
+            };
+            if ps.req_eof_seen || ps.req_tx.is_none() {
+                ps.recv_watch = None;
+                continue;
+            }
+            let backpressure =
+                !ps.req_pending.is_empty() || ps.req_tx.as_ref().is_some_and(|t| t.is_full());
+            if ps.resp_started || backpressure {
+                w.last = now;
+            } else if w.expired(now) {
+                expired.push(id);
+                continue;
+            }
+            watching = true;
+        }
+        for (&id, br) in self.buffered_reqs.iter_mut() {
+            let Some(w) = br.recv_watch.as_ref() else {
+                continue;
+            };
+            if br.end {
+                br.recv_watch = None;
+            } else if w.expired(now) {
+                expired.push(id);
+            } else {
+                watching = true;
+            }
+        }
+        self.body_check_at = watching.then(|| now + H3_RECV_SWEEP_INTERVAL);
+        for &id in &expired {
+            debug!(
+                "[HTTP/3] Request body stalled on stream {} from {}; cancelling",
+                id, self.peer_addr
+            );
+            let _ = self
+                .conn
+                .stream_shutdown(id, quiche::Shutdown::Read, H3_REQUEST_CANCELLED);
+            let _ = self
+                .conn
+                .stream_shutdown(id, quiche::Shutdown::Write, H3_REQUEST_CANCELLED);
+            self.proxy_streams.remove(&id);
+            self.buffered_reqs.remove(&id);
+            self.stream_bodies.remove(&id);
+            self.metric_stream_close(id);
+        }
+        !expired.is_empty()
     }
 
     /// F-187: 処理中の要求が無いか（応答の送出途中・バックエンド待ち・本文の受信途中のいずれも無い）。
@@ -1117,6 +1212,13 @@ impl Http3Handler {
                             ps.req_readable = true;
                         } else {
                             // バッファ経路（または未分類の初回バッチ）: stream_bodies へ排出。
+                            if let Some(w) = self
+                                .buffered_reqs
+                                .get_mut(&stream_id)
+                                .and_then(|br| br.recv_watch.as_mut())
+                            {
+                                w.last = crate::runtime::time::coarse_now();
+                            }
                             let body = self.stream_bodies.entry(stream_id).or_default();
                             let limit = crate::l7::max_buffered_request_body();
                             loop {
@@ -1192,6 +1294,13 @@ impl Http3Handler {
                     let mut ps =
                         ProxyStream::new(resp_rx, req_tx, more_frames, params.max_request_body);
                     ps.cors = params.cors.clone();
+                    ps.resp_policy = params.resp_policy.clone();
+                    if more_frames {
+                        ps.recv_watch = RecvWatch::new(self.classify_body_timeout);
+                        if ps.recv_watch.is_some() {
+                            self.arm_body_check();
+                        }
+                    }
                     // 初回バッチで届いていたボディを取り込む。
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
@@ -1209,6 +1318,10 @@ impl Http3Handler {
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
                     let mut ps = ProxyStream::new(resp_rx, req_tx, more_frames, h.max_request_body);
                     ps.cors = h.cors.clone();
+                    ps.recv_watch = RecvWatch::new(self.classify_body_timeout);
+                    if ps.recv_watch.is_some() {
+                        self.arm_body_check();
+                    }
                     if let Some(body) = self.stream_bodies.remove(&stream_id) {
                         if !body.is_empty() {
                             ps.req_bytes_total += body.len() as u64;
@@ -1224,11 +1337,20 @@ impl Http3Handler {
                     self.proxy_streams.insert(stream_id, ps);
                 }
                 Decision::Buffer => {
+                    let recv_watch = if more_frames {
+                        RecvWatch::new(self.classify_body_timeout)
+                    } else {
+                        None
+                    };
+                    if recv_watch.is_some() {
+                        self.arm_body_check();
+                    }
                     self.buffered_reqs.insert(
                         stream_id,
                         BufferedReq {
                             headers,
                             end: !more_frames,
+                            recv_watch,
                         },
                     );
                 }
@@ -1290,6 +1412,8 @@ impl Http3Handler {
                     resp_tx: Some(resp_tx),
                     notify: self.notify.clone(),
                     cors: None,
+                    head_req: false,
+                    removes_server: false,
                 },
                 br.headers,
                 body,
@@ -1350,6 +1474,7 @@ impl Http3Handler {
     /// `Handled` を返す。それ以外の非適格（メトリクス・非 Proxy・404・gRPC・full・wasm・
     /// TLS・サーバ選択失敗）は `Buffer` を返し、既存の `handle_request` が処理する。
     fn classify(&mut self, stream_id: u64, headers: &[h3::Header], more_frames: bool) -> Decision {
+        self.classify_body_timeout = 0;
         // --- 疑似ヘッダ + 必要ヘッダを抽出 ---
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
@@ -1447,6 +1572,8 @@ impl Http3Handler {
             Some(b) => b,
             None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
         };
+        // B-274: 本文の受信が止まったら打ち切る秒数（ストリーミング・バッファの両経路）
+        self.classify_body_timeout = backend.security().client_body_timeout_secs;
 
         // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
         // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
@@ -1670,8 +1797,13 @@ impl Http3Handler {
         let sni = server.target.sni().to_string();
         let tls_profile = upstream_group.tls_profile();
 
+        let resilience = upstream_group
+            .records_outcomes(&server)
+            .then(|| upstream_group.clone());
         Decision::Stream(crate::http3_stream::BackendTaskParams {
             server,
+            resilience,
+            resp_status: std::cell::Cell::new(0),
             request_head,
             has_request_body: more_frames,
             compression,
@@ -1688,6 +1820,9 @@ impl Http3Handler {
             #[cfg(feature = "http2")]
             h2,
             cors: security.cors_actual.clone(),
+            resp_policy: security
+                .has_response_header_ops()
+                .then(|| backend.security_arc().clone()),
         })
     }
 
@@ -1842,12 +1977,14 @@ impl Http3Handler {
             status,
             body.len()
         );
-        let result = self.send_response(
-            stream_id,
-            status,
-            &[(b"content-type", b"text/plain"), (b"server", b"veil/http3")],
-            Some(body),
-        );
+        // `server` は `[server] server_header_enabled` のときだけ（B-271）
+        let server = crate::pool::get_server_header_guard();
+        let with_server: [(&[u8], &[u8]); 2] = [
+            (b"content-type", b"text/plain"),
+            (b"server", server.as_ref().map_or(&[][..], |g| g.value())),
+        ];
+        let n = if server.is_some() { 2 } else { 1 };
+        let result = self.send_response(stream_id, status, &with_server[..n], Some(body));
         debug!("[HTTP/3] Error response send result: {:?}", result.is_ok());
         result
     }
@@ -2020,86 +2157,15 @@ impl Http3Handler {
 // ヘルパー関数
 // ====================
 
-/// F-169 Part B: zstd 圧縮コンテキストをスレッドローカルに保持して使い回す。
-///
-/// `src/proxy.rs` の同名ヘルパーと同じ設計・同じ注意点（詳細はそちらの doc 参照）。
-/// **「確保が減った」ことと「速くなった」ことは別の主張**であり（`AGENTS.md` F-168 の
-/// 教訓）、本変更はスループット改善を約束するものではない。
+/// HTTP/3 用レスポンスボディ圧縮（`static_response::compress_body` と同じ。失敗したら元のまま）
 #[cfg(feature = "compression")]
-fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
-            const { RefCell::new(None) };
-    }
-
-    ZSTD_COMPRESSOR.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let compressor = match slot.as_mut() {
-            Some(c) => c,
-            None => {
-                let c = match zstd::bulk::Compressor::new(level) {
-                    Ok(c) => c,
-                    Err(_) => return body.to_vec(),
-                };
-                slot.get_or_insert(c)
-            }
-        };
-        if compressor.set_compression_level(level).is_err() {
-            return body.to_vec();
-        }
-        compressor.compress(body).unwrap_or_else(|_| body.to_vec())
-    })
-}
-
-/// HTTP/3 用レスポンスボディ圧縮ヘルパー関数
-///
-/// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
-/// 圧縮に失敗した場合は元のデータをそのまま返します。
-#[cfg(feature = "compression")]
+#[inline]
 pub(crate) fn compress_body_h3(
     body: &[u8],
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
 ) -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    match encoding {
-        AcceptedEncoding::Zstd => zstd_compress_reuse_ctx(body, compression.zstd_level),
-        AcceptedEncoding::Gzip => {
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Brotli => {
-            let mut compressed = Vec::with_capacity(body.len());
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: compression.brotli_level as i32,
-                ..Default::default()
-            };
-            let mut input = std::io::Cursor::new(body);
-            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return body.to_vec();
-            }
-            compressed
-        }
-        AcceptedEncoding::Deflate => {
-            use flate2::write::DeflateEncoder;
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Identity => body.to_vec(),
-    }
+    crate::static_response::compress_body(body, encoding, compression)
 }
 
 /// compression feature 無効時のスタブ

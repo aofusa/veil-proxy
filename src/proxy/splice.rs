@@ -143,6 +143,7 @@ pub(super) async fn try_splice_proxy(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     proxy_http_request_splice(
         client_stream,
@@ -151,6 +152,7 @@ pub(super) async fn try_splice_proxy(
         content_length,
         is_chunked,
         initial_body,
+        security,
     )
     .await
 }
@@ -165,6 +167,7 @@ pub(super) async fn try_splice_proxy(
     _content_length: usize,
     _is_chunked: bool,
     _initial_body: &[u8],
+    _security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     None
 }
@@ -177,6 +180,7 @@ pub(super) async fn proxy_http_request_splice(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     // 設定に基づいてパイプを取得または作成
     let per_stream_pipe_enabled = {
@@ -264,10 +268,20 @@ pub(super) async fn proxy_http_request_splice(
     }
 
     // 4. レスポンスを受信して転送（splice 使用）
-    let result = splice_transfer_response_ktls(backend_stream, client_stream, pipe, is_head).await;
+    let result =
+        splice_transfer_response_ktls(backend_stream, client_stream, pipe, is_head, security).await;
 
     Some(result)
 }
+
+#[cfg(all(veil_ktls, target_os = "linux"))]
+thread_local! {
+    /// kTLS の splice 経路で作り直した応答 head を書くバッファ（B-275。要求ごとに確保しない）
+    static SPLICE_HEAD_BUF: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+/// これより大きく育ったバッファは戻さない（大きいヘッダの応答 1 回でスレッドに常駐させない）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+const SPLICE_HEAD_BUF_KEEP: usize = 64 * 1024;
 
 /// kTLS + splice によるレスポンス転送
 ///
@@ -280,6 +294,7 @@ pub(super) async fn splice_transfer_response_ktls(
     client_stream: &KtlsServerStream,
     pipe: &SplicePipe,
     is_head: bool,
+    security: &SecurityConfig,
 ) -> (u16, u64, bool, bool) {
     let client_tcp = client_stream.get_ref();
 
@@ -339,11 +354,43 @@ pub(super) async fn splice_transfer_response_ktls(
 
             // ヘッダー + 初期ボディをクライアントに送信（raw_write）。本文の終端より後ろは送らない
             let head_len = header_len + start.send;
-            if let Err(e) = async_raw_write_all(client_tcp, &accumulated[..head_len]).await {
-                warn!("Failed to send response header: {}", e);
-                return (status_code, total, false, true);
+            // 応答ヘッダの方針・Alt-Svc・Server・HTTP/1.1 以外のステータス行があれば、他の経路と同じ
+            // `render_response_head` で直してから送る（以前は上流の head をそのまま送っていた。B-275）。
+            // どれも無ければ今までどおり上流の head をそのまま送る（確保しない）
+            let rewrite = security.has_response_header_ops()
+                || get_alt_svc_guard().is_some()
+                || get_server_header_guard().is_some()
+                || !accumulated.starts_with(b"HTTP/1.1 ");
+            let sent = if rewrite {
+                // 作り直した head はスレッドごとのバッファへ書く（要求ごとに確保しない）。await をまたぐので
+                // 借用せずに取り出して使い、終わったら戻す（同じスレッドの別の接続は空のバッファを使うだけ）
+                let mut out = SPLICE_HEAD_BUF.with(|c| c.take());
+                out.clear();
+                super::compress::render_response_head_into(
+                    &accumulated[..header_len],
+                    status_code,
+                    security,
+                    &mut out,
+                );
+                out.extend_from_slice(&accumulated[header_len..head_len]);
+                let r = async_raw_write_all(client_tcp, &out).await;
+                let n = out.len();
+                if out.capacity() <= SPLICE_HEAD_BUF_KEEP {
+                    SPLICE_HEAD_BUF.with(|c| c.set(out));
+                }
+                r.map(|_| n)
+            } else {
+                async_raw_write_all(client_tcp, &accumulated[..head_len])
+                    .await
+                    .map(|_| head_len)
+            };
+            match sent {
+                Ok(n) => total += n as u64,
+                Err(e) => {
+                    warn!("Failed to send response header: {}", e);
+                    return (status_code, total, false, true);
+                }
             }
-            total += head_len as u64;
 
             let mut complete = start.done;
             let extra = start.extra;

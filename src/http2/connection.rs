@@ -2366,6 +2366,32 @@ where
         self.streams.get_ref(stream_id)
     }
 
+    /// 要求の受信が止まったストリーム（[`StreamManager::collect_stalled_receiving`]）を `out` へ集める。
+    /// 既定の秒数は `[http2] stream_idle_timeout_secs`（B-276）。
+    pub fn collect_stalled_receiving_streams(&self, out: &mut Vec<u32>) {
+        self.streams
+            .collect_stalled_receiving(self.local_settings.stream_idle_timeout_secs, out);
+    }
+
+    /// ストリームの要求の受信を打ち切るまでの秒数を設定する（ルートの `client_body_timeout_secs`。B-274）
+    pub fn set_stream_recv_timeout(&mut self, stream_id: u32, secs: u64) {
+        if let Some(s) = self.streams.get(stream_id) {
+            s.recv_timeout_secs = secs;
+        }
+    }
+
+    /// ストリームの最終アクティビティを今にする（こちらの都合で受信を止めている間は打ち切らない）
+    pub fn touch_stream(&mut self, stream_id: u32) {
+        if let Some(s) = self.streams.get(stream_id) {
+            s.update_activity();
+        }
+    }
+
+    /// 開いているストリームが無いか（`cleanup_closed` の後に見る）
+    pub fn has_no_streams(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     /// ストリームを可変で取得
     pub fn get_stream_mut(&mut self, stream_id: u32) -> Option<&mut Stream> {
         self.streams.get(stream_id)

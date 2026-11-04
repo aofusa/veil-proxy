@@ -324,6 +324,22 @@ path = "/"
 path = "/var/www/html"
 ```
 
+#### 条件付き要求・範囲要求
+
+どちらのモードも HTTP/1.1・HTTP/2・HTTP/3 で同じに応えます。
+
+- 応答には `ETag` と `Last-Modified` が付きます。`sendfile` モードの ETag はファイルの更新時刻と大きさから作ります。`memory` モードは
+  内容のハッシュ（内容が変わらなければリロードしても同じ）で、`Last-Modified` は読み込んだときのファイルの更新時刻です。
+- `If-None-Match`（弱い比較。`*` は常に一致）と `If-Modified-Since` には本文の無い `304 Not Modified` を返します。両方あれば
+  `If-None-Match` を優先します。
+- `Range: bytes=...` には `Content-Range` 付きの `206 Partial Content` を返します（`bytes=0-9`・`bytes=10-`・`bytes=-10` の形）。
+  複数の範囲の要求は最初の範囲だけを返します。ファイルの外の範囲には `Content-Range: bytes */<大きさ>` 付きの
+  `416 Range Not Satisfiable` を返します。全体と範囲の応答には `Accept-Ranges: bytes` が付きます。
+- `If-Range` が今の ETag（強い比較）か `Last-Modified` と同じ日時なら範囲を返し、違えばファイル全体を `200` で返します。
+- `HEAD` には同じヘッダ（`Content-Length` を含む）を本文なしで返します。
+- `[route.compression]` が有効なら、圧縮できる型のファイルはクライアントが受け付ける方式で圧縮します。圧縮した応答は弱い ETag
+  （`W/"..."`）と `Vary: Accept-Encoding` を付け、`Range` は見ません（nginx の gzip と同じ）。`Accept-Encoding` の無い要求には範囲を返します。
+
 ### プロキシ設定
 
 HTTPおよびHTTPSバックエンドへのプロキシに対応：
@@ -813,8 +829,8 @@ sandbox_tmpfs_mounts = ["/tmp"]
 | サイズ制限 | `max_request_body_size` | リクエストボディ最大サイズ（バイト） | 10MB |
 | | `max_chunked_body_size` | Chunked転送時の累積最大サイズ | 10MB |
 | | `max_request_header_size` | リクエストヘッダー最大サイズ | 8KB |
-| タイムアウト | `client_header_timeout_secs` | クライアントヘッダー受信タイムアウト | 30秒 |
-| | `client_body_timeout_secs` | クライアントボディ受信タイムアウト | 30秒 |
+| タイムアウト | `client_header_timeout_secs` | 使われません（要求のヘッダが揃うまでルートが決まらないため効かせられない）。互換のため受け付け、起動時に警告を出します | なし |
+| | `client_body_timeout_secs` | 要求本文が届かなくなってから要求を打ち切るまでの秒数（応答を始めるまで）。HTTP/1.1 は `408`、HTTP/2 は `RST_STREAM(CANCEL)`、HTTP/3 は `H3_REQUEST_CANCELLED` でストリームを打ち切ります。ストリーミングのアップロード・バッファする本文・gRPC のクライアントストリーミングに効きます | 30秒 |
 | | `backend_connect_timeout_secs` | バックエンド接続タイムアウト | 10秒 |
 | アクセス制御 | `allowed_methods` | 許可するHTTPメソッド（配列） | すべて許可 |
 | | `rate_limit_requests_per_min` | **クライアント IP・ルートごと、全ワーカー共通**の分間リクエスト数上限（B-31: プロセス共有の 65,536 スロットのアトミック表によるスライディングウィンドウ。あるルートへの要求は別のルートの上限を消費しない。同じスロットに入ったキーはカウントを共有するため、上限は厳しくなる方向にしかずれない） | 0（無制限） |
@@ -1080,7 +1096,10 @@ redirect_status = 301
 
 ### レスポンスヘッダー操作
 
-クライアントへ返送する前にヘッダーを追加・削除します。静的ファイル配信時にも適用されます。
+クライアントへ返送する前にヘッダーを追加・削除します。どちらもクライアントのすべてのプロトコル（HTTP/1.1・HTTP/2・HTTP/3）と、
+すべての応答に効きます: プロキシの応答（ストリーミング・バッファ・圧縮。上流は HTTP/1.1・h2c・HTTPS）、静的ファイル、固定応答
+（`type = "Respond"`）。削除は `add_response_headers`・Proxy-Wasm の `on_http_response_headers`・CORS のヘッダより前に行います。
+`remove_response_headers` に `Server`・`Alt-Svc` を書くと、veil 自身の `Server`（`server_header_enabled`）と HTTP/3 の広告も消します。
 
 | オプション | 説明 | 例 |
 |-----------|------|-----|

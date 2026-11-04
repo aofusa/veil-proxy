@@ -88,11 +88,20 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             } else {
                 Vec::new()
             };
+            // モジュールの返すヘッダはそのままクライアントへ書かれる。名前は小文字にし（HTTP/2・HTTP/3 は大文字を
+            // PROTOCOL_ERROR にする）、CR・LF・NUL を含むもの・空の名前は捨てる（HTTP/1.1 のヘッダの注入を防ぐ）
+            let headers = sanitize_local_response_headers(headers);
+            // 範囲外のステータスは 500（u16 への切り詰めで 0 や別の値にしない）
+            let status_code = if (100..=599).contains(&status_code) {
+                status_code as u16
+            } else {
+                500
+            };
 
             // Set local response
             let state = caller.data_mut();
             state.http_ctx.local_response = Some(LocalResponse {
-                status_code: status_code as u16,
+                status_code,
                 headers,
                 body,
             });
@@ -190,4 +199,33 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // Note: proxy_get_current_time_nanoseconds is defined in logging.rs
 
     Ok(())
+}
+
+/// `proxy_send_local_response` のヘッダを、どのプロトコルでもそのまま書ける形にする
+fn sanitize_local_response_headers(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let bad = |b: &u8| matches!(*b, b'\r' | b'\n' | 0);
+    headers
+        .into_iter()
+        .filter(|(n, v)| !n.is_empty() && !n.iter().any(bad) && !v.iter().any(bad))
+        .map(|(mut n, v)| {
+            n.make_ascii_lowercase();
+            (n, v)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod local_response_tests {
+    use super::sanitize_local_response_headers;
+
+    #[test]
+    fn local_response_headers_are_lowercased_and_injection_free() {
+        let out = sanitize_local_response_headers(vec![
+            (b"X-Blocked".to_vec(), b"1".to_vec()),
+            (b"x-evil".to_vec(), b"a\r\nset-cookie: x".to_vec()),
+            (b"bad\nname".to_vec(), b"v".to_vec()),
+            (Vec::new(), b"v".to_vec()),
+        ]);
+        assert_eq!(out, vec![(b"x-blocked".to_vec(), b"1".to_vec())]);
+    }
 }

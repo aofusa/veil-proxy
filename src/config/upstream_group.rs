@@ -705,6 +705,94 @@ impl UpstreamGroup {
         }
     }
 
+    /// `server` の結果を記録する必要があるか（サーキットブレーカーか外れ値の排除が有効）。
+    #[inline]
+    pub fn records_outcomes(&self, server: &UpstreamServer) -> bool {
+        server.circuit_breaker.is_some() || self.outlier_detection.enabled
+    }
+
+    /// 上流の 1 要求の結果をサーキットブレーカー・外れ値の排除へ記録する（HTTP/1.1・HTTP/2・HTTP/3 で共有。B-272）。
+    ///
+    /// `server` は `select*` が返したこのグループのサーバ（またはそのクローン）、`start` は要求を始めた粗い時計（`coarse_now`）。
+    /// どちらも設定していないグループは分岐だけで抜ける（要求ごとの経路に費用を足さない）。
+    pub fn record_request(
+        &self,
+        server: &UpstreamServer,
+        start: std::time::Instant,
+        success: bool,
+    ) {
+        if !self.records_outcomes(server) {
+            return;
+        }
+        let latency_ms = crate::runtime::time::coarse_now()
+            .saturating_duration_since(start)
+            .as_millis() as u64;
+        // メトリクスは状態が変わったときだけ更新する（ラベルの引き当てを要求ごとにしない）
+        #[cfg(feature = "metrics")]
+        let before = (
+            server.circuit_breaker.as_ref().map(|cb| {
+                (
+                    cb.state_code(),
+                    cb.stats()
+                        .open_count
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            }),
+            server.is_ejected(),
+        );
+        // 状態は Arc で共有しているので、`select*` の返したサーバのクローン（HTTP/3 のタスク）でもよい
+        server.record_outcome(success, latency_ms, Some(&self.outlier_detection));
+        #[cfg(feature = "metrics")]
+        {
+            if let (Some(cb), Some((state_before, opened_before))) =
+                (&server.circuit_breaker, before.0)
+            {
+                if cb.state_code() != state_before {
+                    // B-278: ゲージはグループに 1 系列なので、サーバごとの状態をまとめて出す
+                    // （どれかが Open なら 1、どれかが HalfOpen なら 2、ほかは 0）。最後に記録したサーバの
+                    // 状態で上書きすると、健全なサーバの成功で Open が消えていた
+                    crate::metrics::set_circuit_breaker_state(
+                        &self.name,
+                        self.circuit_state_code(),
+                    );
+                }
+                // B-273: Open へ移った回数（`veil_circuit_breaker_open_total`）
+                let opened = cb
+                    .stats()
+                    .open_count
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                for _ in opened_before..opened {
+                    crate::metrics::record_circuit_breaker_open(&self.name);
+                }
+            }
+            let ejected = server.is_ejected();
+            if ejected != before.1 {
+                // F-170: 接続先表記（conn_addr）で識別する。TCP は従来と不変。
+                // B-278: 排除が解けたら 0 に戻す（以前は 1 のまま残った）
+                let addr = server.target.conn_addr();
+                crate::metrics::set_outlier_ejected(&self.name, addr.as_str(), ejected);
+            }
+        }
+    }
+
+    /// グループのサーキットブレーカーの状態（どれかが Open なら 1、どれかが HalfOpen なら 2、ほかは 0）
+    #[cfg(feature = "metrics")]
+    fn circuit_state_code(&self) -> u64 {
+        let mut code = 0;
+        for cb in self
+            .servers
+            .iter()
+            .filter_map(|s| s.circuit_breaker.as_ref())
+        {
+            match cb.state_code() {
+                1 => return 1,
+                2 => code = 2,
+                _ => {}
+            }
+        }
+        code
+    }
+
     /// サーバー数を取得
     pub fn len(&self) -> usize {
         self.servers.len()

@@ -128,6 +128,10 @@ pub(super) fn schedule_timer(
     if let Some(hs) = &handler.handshake {
         deadline = deadline.min(hs.deadline());
     }
+    // B-274: 本文の受信が止まった要求の見回り
+    if let Some(t) = handler.body_check_at {
+        deadline = deadline.min(t);
+    }
     // ヒープに同じか早いエントリが既にあれば積まない（そのエントリが満了したときに本当の期限を確かめ直す。
     // `expire_due_timers`）。以前は接続を処理するたびに積み、期限が延びた古いエントリをヒープに溜めては
     // 捨てていた（FreeBSD の h3_file 54KB で expire_due_timers・HashMap::get_mut が上位。v0.8.0）。
@@ -176,14 +180,23 @@ pub(super) fn expire_due_timers(
             conns.remove(&*key);
             continue;
         }
+        // B-274: 本文の受信が止まった要求を打ち切る（打ち切ったらストリームの終わりを送るためにダーティ化）
+        let cancelled =
+            handler.body_check_at.is_some_and(|t| t <= now) && handler.check_stalled_bodies(now);
         // 積んだ後に期限が延びていたら（`schedule_timer` は早くなるときだけ積み直す）、本当の期限で積み直す
         if let Some(mut actual) = handler.conn.timeout_instant() {
             if let Some(hs) = &handler.handshake {
                 actual = actual.min(hs.deadline());
             }
+            if let Some(t) = handler.body_check_at {
+                actual = actual.min(t);
+            }
             if actual > now {
                 handler.timer_deadline = Some(actual);
-                timers.push(Reverse(TimerKey(actual, key)));
+                timers.push(Reverse(TimerKey(actual, key.clone())));
+                if cancelled {
+                    mark_dirty(conns, dirty_queue, &key);
+                }
                 continue;
             }
         }

@@ -139,7 +139,7 @@ path = "./www"
 | `on_http_request_body` | ○ | ○ | ○ |
 | `on_http_request_trailers` | – | h2c の gRPC | – |
 | `on_http_response_headers` | ○ | ○ | ○ |
-| `on_http_response_body` | – | – | ○ |
+| `on_http_response_body` | ○ | ○ | ○ |
 | `on_log` | ○ | ○ | ○ |
 
 要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
@@ -148,6 +148,13 @@ veil は本文を全部読んでから（Content-Length・chunked。上限は `m
 モジュールが本文を書き換えたら、新しい本文を合った `Content-Length` で上流へ送る（chunked の要求も `Content-Length` で送り、
 `Expect` は外す）。そういうモジュールの無いルートは、今までどおり本文を上流へ流す。`Expect: 100-continue` の chunked の要求には、
 本文を読む前に `100 Continue` を返す（`Content-Length` の要求にはフィルタより前に返している）。
+
+応答本文のフェーズは、ルートのモジュールのどれかが `allow_response_body_read = true` のときに走る。veil は上流の応答を全部読んでから
+（上流は HTTP/1.1・h2c・HTTPS。HTTP/1.1 のクライアントではルートの `[route.buffering] max_memory_buffer`〈既定 10MB〉まで。超えたら `507`、
+`disk_buffer_path` があればフィルタを通さずに送る）`on_http_response_body` を `end_of_stream = true` で 1 回呼ぶ。書き換えた本文は
+合った `Content-Length` で送り、`[route.compression]` はフィルタの後の本文を圧縮する。このフェーズのローカル応答は上流の応答の代わりに返す。
+`HEAD`・`1xx`・`204`・`304`・gRPC の応答では呼ばない。そういうルートの応答は `[route.cache]` に保存しない（キャッシュに当たるとフィルタを
+通らないため）。そういうモジュールの無いルートは今までどおり応答を流す。
 
 HTTP/1.1 では、フィルタのローカル応答（`send_local_response`）の後も接続を続け、本文の後ろにパイプラインで届いた要求を
 続けて処理する。ローカル応答の本文は、`HEAD` の要求（`Content-Length` は本文の長さのまま）と `1xx`・`204`・`304` では送らない。

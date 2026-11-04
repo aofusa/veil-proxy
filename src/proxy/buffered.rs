@@ -50,6 +50,9 @@ pub(super) async fn proxy_request_buffered<R>(
     buffering_config: &buffering::BufferingConfig,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
+    // F-285: Some なら溜めた本文へ Wasm の応答本文のフェーズをかけ、その後で（設定があれば）圧縮する
+    #[cfg(feature = "wasm")] wasm_body: Option<(&CompressionConfig, AcceptedEncoding)>,
 ) -> Option<(u16, u64, bool, bool)>
 where
     R: AsyncReader
@@ -121,18 +124,81 @@ where
     match buffered {
         Some((
             status_code,
-            mut headers_data,
+            headers_data,
             body_result,
             backend_wants_keep_alive,
             until_close,
+            _chunked,
         )) => {
-            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-            crate::route_cors::apply_h1(&mut headers_data, security);
+            // ステータス行を HTTP/1.1 に直し、応答ヘッダの方針・Alt-Svc・Wasm・CORS をかける（他の HTTP/1.1 の
+            // 経路と同じ。以前は上流の head をそのまま返していた。B-267・B-268・B-271）
+            let mut headers_data = super::compress::finish_h1_upstream_head(
+                &headers_data,
+                status_code,
+                security,
+                #[cfg(feature = "wasm")]
+                wasm_modules,
+            )
+            .await;
             // B-17: ボディのバッファリングに失敗した場合、クライアントへは未送信のため
             // ヘッダーだけ送って（CL 分のボディを待たせて）ハングさせず、
             // None → 呼び出し元の 502 送出 + クローズに委ねる
             if matches!(body_result, BufferedBodyResult::Failed) {
                 return None;
+            }
+            #[cfg(feature = "wasm")]
+            let mut body_result = body_result;
+            // F-285: Wasm の応答本文のフェーズ（メモリに溜まった本文だけ。ディスクへ溢れた本文はかけずに流す）
+            #[cfg(feature = "wasm")]
+            if let (Some((compression, client_encoding)), BufferedBodyResult::Memory(raw)) =
+                (wasm_body, &mut body_result)
+            {
+                if !is_head && !matches!(status_code, 100..=199 | 204 | 304) {
+                    let raw = std::mem::take(raw);
+                    let decoded = if _chunked {
+                        crate::http_utils::decode_chunked_body(&raw)
+                    } else {
+                        raw
+                    };
+                    match super::compress::wasm_filter_response_body(
+                        wasm_modules,
+                        Bytes::from(decoded),
+                    )
+                    .await
+                    {
+                        Ok(b) => {
+                            let (ct, ce) = h1_head_content_type_encoding(&headers_data);
+                            let enc = compression.should_compress(
+                                client_encoding,
+                                ct.as_deref(),
+                                Some(b.len()),
+                                ce.as_deref(),
+                            );
+                            let body = match enc {
+                                Some(enc) => {
+                                    super::compress::add_h1_content_encoding(
+                                        &mut headers_data,
+                                        enc,
+                                    );
+                                    crate::static_response::compress_body(&b, enc, compression)
+                                }
+                                None => b.to_vec(),
+                            };
+                            super::compress::set_h1_content_length(&mut headers_data, body.len());
+                            body_result = BufferedBodyResult::Memory(body);
+                        }
+                        Err(local) => {
+                            let response = super::h1::wasm_local_response_h1(&local, is_head);
+                            let len = response.len() as u64;
+                            let _ = timeout(
+                                Duration::from_secs(buffering_config.client_write_timeout_secs),
+                                client_stream.write_all(response),
+                            )
+                            .await;
+                            return Some((local.status_code, len, backend_wants_keep_alive, false));
+                        }
+                    }
+                }
             }
             // B-262: 接続の終わりで区切る本文は長さが分かったので Content-Length を付ける。veil はクライアントの
             // 接続を閉じるときに close_notify を送らないので、閉じるだけでは厳格な TLS クライアントは切り詰めと区別できない
@@ -307,6 +373,23 @@ where
     }
 }
 
+/// HTTP/1.1 の応答ヘッダの `Content-Type`・`Content-Encoding` の値（F-285 の圧縮の判定）
+#[cfg(feature = "wasm")]
+fn h1_head_content_type_encoding(head: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut storage = [httparse::EMPTY_HEADER; 64];
+    let mut resp = httparse::Response::new(&mut storage);
+    if resp.parse(head).is_err() {
+        return (None, None);
+    }
+    let find = |n: &str| {
+        resp.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(n))
+            .map(|h| h.value.to_vec())
+    };
+    (find("content-type"), find("content-encoding"))
+}
+
 /// 応答ヘッダ（`\r\n\r\n` で終わる）の終わりに `Content-Length` を足す。`Transfer-Encoding` があるときは足さない
 /// （併記は区切りの食い違いになる。そのときは接続を閉じて本文の終わりを伝える）
 fn add_content_length(headers_data: &mut Vec<u8>, len: u64) {
@@ -336,7 +419,7 @@ pub(super) async fn receive_and_buffer_response<R>(
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     is_head: bool,
-) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool, bool)>
+) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool, bool, bool)>
 where
     R: AsyncReadRent + Unpin,
 {
@@ -402,6 +485,7 @@ where
             // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
             let kind = parsed.body(is_head);
             let until_close = matches!(kind, ResponseBody::UntilClose);
+            let chunked = matches!(kind, ResponseBody::Chunked);
             let (body_result, reusable) = buffer_response_body_with_spillover(
                 backend_stream,
                 kind,
@@ -419,6 +503,7 @@ where
                 body_result,
                 backend_wants_keep_alive,
                 until_close,
+                chunked,
             ));
         }
 

@@ -33,6 +33,9 @@ url = "http://localhost:8080"
   enabled = true
 ```
 
+この表は HTTP/1.1・HTTP/2・HTTP/3 のプロキシの応答（上流は HTTP/1.1・h2c・HTTPS、ストリーミング・バッファ）と静的ファイル
+（`type = "File"` の `sendfile`・`memory`）に効く。圧縮と `ETag`・`Range` の関係は [routing.md](routing.md#条件付き要求範囲要求) を参照。
+
 同じ表は API ライブラリの `type = "Handler"` のルートにも効く（HTTP/1.1・HTTP/2・HTTP/3、バッファ・ストリーミングの応答）。
 `[api] compression = true` でハンドラのルートに JSON の API 向けの既定が入る。[library.md](library.md#応答の圧縮) を参照。
 
@@ -126,6 +129,14 @@ path = "/var/www/static"
 - `application/gzip`
 - `application/x-gzip`
 - `application/x-brotli`
+
+設定によらず、次は圧縮しません。
+
+- `text/event-stream`（Server-Sent Events）。圧縮には本文の全体が要りますが、イベントのストリームは終わらないので、常にそのまま流します。
+- `Content-Length` が 64 MiB を超える応答。圧縮せずに流します。
+- 8 MiB を超える静的ファイル（`type = "File"`）。圧縮するには要求ごとにファイル全体を読み込むので、圧縮せずに `sendfile` で送ります。
+
+圧縮するときは、上流の本文の全体を先に溜めます（上限 64 MiB）。長さ不明の応答や chunked の応答がこれを超えたら、打ち切って 502 を返します。
 
 ### HTTP/3圧縮設定
 

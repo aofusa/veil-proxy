@@ -1,6 +1,6 @@
 # B-271: HTTP/3 の広告（`Alt-Svc`）が一部の応答に付かない・HTTP/3 だけ `server` ヘッダを返す
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -35,6 +35,12 @@
   （リロードで `alt_svc` が変わったら作り直す）。
 - `server: veil/http3` は消すか、3 つのプロトコルでそろえる（既定は返さない。nginx の `server_tokens off` 相当）。
 - 試験: E2E で各経路の HTTP/1.1・HTTP/2 の応答に `Alt-Svc` があること、`alt_svc_enabled = false` で無いこと、HTTP/3 の応答に `server` が無いこと。
+
+## 修正（v0.10.1）
+
+- `Alt-Svc` を HTTP/1.1 の全経路（`buffering = "full"`・h2c と TLS の h2 の上流・`Respond`）と HTTP/2 の `Respond` に付ける
+  （`pool::append_own_alt_svc_line` 等、1 か所の判定）。HTTP/3 の `Server` も `server_header_value`（既定 `veil`）にそろえる。
+- 統合試験 `b267_b271_header_policy_alt_svc_and_server_header_match_across_protocols`。
 
 ## 関連
 

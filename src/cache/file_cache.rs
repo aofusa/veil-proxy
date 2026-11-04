@@ -93,6 +93,8 @@ pub struct CachedFileInfo {
     pub mime_type: std::sync::Arc<str>,
     /// 最終更新時刻
     pub last_modified: Option<SystemTime>,
+    /// `ETag`・`Last-Modified`（F-287。エントリを作るときに 1 回だけ組み立て、ヒットでは参照カウントだけ）
+    pub validators: std::sync::Arc<crate::static_response::Validators>,
     /// ファイルかどうか（ディレクトリでない）
     pub is_file: bool,
     /// メタデータ取得時に開いた fd（通常ファイルのみ）。nginx の `open_file_cache` と同じく
@@ -127,6 +129,11 @@ impl CachedFileInfo {
         Self {
             canonical_path: path.into(),
             file_size: meta.len(),
+            validators: crate::static_response::Validators::shared_for_file(
+                meta.len(),
+                meta.modified().ok(),
+                &mime_type,
+            ),
             mime_type,
             last_modified: meta.modified().ok(),
             is_file: meta.is_file(),
@@ -342,6 +349,11 @@ impl OpenFileCache {
                         Some(CachedFileInfo {
                             canonical_path: path.into(),
                             file_size: meta.len(),
+                            validators: crate::static_response::Validators::shared_for_file(
+                                meta.len(),
+                                meta.modified().ok(),
+                                &mime_type,
+                            ),
                             mime_type,
                             last_modified: meta.modified().ok(),
                             is_file,
@@ -373,6 +385,11 @@ impl OpenFileCache {
                 return Some(CachedFileInfo {
                     canonical_path: path.into(),
                     file_size: meta.len(),
+                    validators: crate::static_response::Validators::shared_for_file(
+                        meta.len(),
+                        meta.modified().ok(),
+                        &mime_type,
+                    ),
                     mime_type,
                     last_modified: meta.modified().ok(),
                     is_file,
@@ -403,6 +420,11 @@ impl OpenFileCache {
             Some(CachedFileInfo {
                 canonical_path: canonical.into(),
                 file_size: metadata.len(),
+                validators: crate::static_response::Validators::shared_for_file(
+                    metadata.len(),
+                    metadata.modified().ok(),
+                    &mime_type,
+                ),
                 mime_type,
                 last_modified: metadata.modified().ok(),
                 is_file,

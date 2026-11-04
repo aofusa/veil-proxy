@@ -2128,7 +2128,8 @@ pub(super) async fn test_f282_http3_tls_upstream_eof_body_requires_close_notify(
 }
 
 /// F-282: HTTP/2 で受けて HTTP/1.1 の TLS 上流へ流す要求でも、上流が閉じて終わる本文は close_notify を受けたときだけ
-/// 完了とみなす（HTTP/2 への中継は本文を集めてから送るので、受けずに切れたら 502）
+/// 完了とみなす。ストリーミングの中継（B-281 で長さ不明の本文も溜めずに流す）は応答ヘッダを送った後なので
+/// ストリームのリセット、バッファ経路（`buffering = "full"`）は 502
 #[tokio::test]
 #[ntest::timeout(30000)]
 #[cfg(feature = "http2")]
@@ -2149,13 +2150,22 @@ pub(super) async fn test_f282_http2_tls_upstream_eof_body_requires_close_notify(
         assert_eq!(status, 200, "{route}");
         assert_eq!(got, body, "{route}: the whole body must be returned");
 
-        let (status, _) = client
+        let cut = client
             .send_request("POST", route, &[("x-eof-body", "abrupt")], Some(body))
-            .await
-            .unwrap_or_else(|e| panic!("{route}: request without close_notify failed: {e}"));
-        assert_eq!(
-            status, 502,
-            "{route}: a body cut without close_notify must not be returned as complete"
-        );
+            .await;
+        if route.starts_with("/echo-upload-tls/") {
+            assert!(
+                cut.is_err(),
+                "{route}: a streamed body cut without close_notify must end in a stream reset, got {:?}",
+                cut.map(|(s, b)| (s, b.len()))
+            );
+        } else {
+            let (status, _) =
+                cut.unwrap_or_else(|e| panic!("{route}: request without close_notify failed: {e}"));
+            assert_eq!(
+                status, 502,
+                "{route}: a body cut without close_notify must not be returned as complete"
+            );
+        }
     }
 }

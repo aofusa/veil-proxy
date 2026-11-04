@@ -1100,6 +1100,13 @@ pub(crate) async fn collect_response(
                 resp.status = status;
                 resp.headers = headers;
             }
+            // B-281: 溜める上限を超えたら打ち切る（再送しない）
+            Some(UpResp::Data(b))
+                if joined.as_ref().map_or(resp.body.len(), |j| j.len()) + b.len()
+                    > crate::pool::MAX_COLLECTED_RESPONSE_BODY =>
+            {
+                return Err(CollectError::Reset { retryable: false });
+            }
             Some(UpResp::Data(b)) => match joined.as_mut() {
                 Some(j) => j.extend_from_slice(&b),
                 None if resp.body.is_empty() => resp.body = b,
@@ -1245,6 +1252,7 @@ where
             Ok(resp) => return Ok(resp),
             Err(CollectError::Reset { retryable: true }) if attempt == 1 => {
                 debug!("[h2-upstream] stream failed before processing; retrying once");
+                crate::metrics::record_retry(target.conn_addr().as_str(), "stale_connection");
                 continue;
             }
             Err(CollectError::Reset { .. }) => return Err(502),
@@ -1449,7 +1457,10 @@ where
         stream.finish_request();
         match collect_response(&stream, idempotent, read_timeout).await {
             Ok(resp) => return Ok(HttpsBuffered::H2(resp)),
-            Err(CollectError::Reset { retryable: true }) if attempt == 1 => continue,
+            Err(CollectError::Reset { retryable: true }) if attempt == 1 => {
+                crate::metrics::record_retry(target.conn_addr().as_str(), "stale_connection");
+                continue;
+            }
             Err(CollectError::Reset { .. }) => return Err(502),
             Err(CollectError::Timeout) => return Err(504),
         }

@@ -551,11 +551,7 @@ Configure in the `[server]` section:
 server_header_enabled = false
 
 # Custom Server header value (only effective when server_header_enabled = true)
-# Default: "veil"
-# When not specified, protocol-specific values are used:
-#   - HTTP/1.1: "veil/http1.1"
-#   - HTTP/2: "veil/http2"
-#   - HTTP/3: "veil/http3"
+# Default: "veil" (the same value on HTTP/1.1, HTTP/2 and HTTP/3)
 server_header_value = "MyServer/1.0"
 ```
 
@@ -563,9 +559,10 @@ server_header_value = "MyServer/1.0"
 
 | Setting | Behavior |
 |---------|----------|
-| `server_header_enabled = false` | No Server header is sent (default, recommended for production) |
-| `server_header_enabled = true`, `server_header_value` not specified | Protocol-specific values: `veil/http1.1`, `veil/http2`, or `veil/http3` |
+| `server_header_enabled = false` | veil adds no Server header on any protocol (default, recommended for production). An upstream's own `Server` header is passed through |
+| `server_header_enabled = true`, `server_header_value` not specified | `Server: veil` on every protocol (it replaces the upstream's `Server`) |
 | `server_header_enabled = true`, `server_header_value = "Custom"` | All protocols use the custom value: `Server: Custom` |
+| A route lists `Server` in `remove_response_headers` | No `Server` header on that route's responses (neither veil's nor the upstream's) |
 
 ### Use Cases
 

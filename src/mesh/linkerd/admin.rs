@@ -138,11 +138,11 @@ impl H2Service for AdminH2 {
         _stream_id: u32,
         _client_ip: &str,
         _client_socket_addr: SocketAddr,
-    ) -> Option<u64>
+    ) -> crate::proxy::H2StreamPlan
     where
         S: AsyncReadRent + AsyncWriteRentExt + Unpin,
     {
-        None
+        crate::proxy::H2StreamPlan::BUFFERED
     }
 
     fn spawn(

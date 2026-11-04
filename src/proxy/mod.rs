@@ -459,24 +459,7 @@ fn admin_vds_json() -> String {
 /// 1 リクエストあたり約 1.6ms の CPU を使っていた（静的配信の 6 倍）。HTTP/2・HTTP/3 と
 /// 同じくこの関数でコンテキストを使い回す。
 #[cfg(feature = "compression")]
-fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
-            const { RefCell::new(None) };
-    }
-
-    ZSTD_COMPRESSOR.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let compressor = match slot.as_mut() {
-            Some(c) => c,
-            None => slot.get_or_insert(zstd::bulk::Compressor::new(level).ok()?),
-        };
-        compressor.set_compression_level(level).ok()?;
-        compressor.compress(body).ok()
-    })
-}
+use crate::static_response::zstd_compress_reused;
 
 // ====================
 // 上流へ転送する要求ヘッダの方針（F-236 の監査の F1・F2・F4）

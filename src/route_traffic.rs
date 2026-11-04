@@ -204,12 +204,15 @@ pub struct CorsConfig {
 #[derive(Debug)]
 pub struct FixedResponse {
     pub status: u16,
-    /// 応答ヘッダ（小文字の名前。`content-length` は含めない）
+    /// 応答ヘッダ（小文字の名前。`content-length` は含めない。ルートの応答ヘッダの方針をかけた後）
     pub headers: Vec<(Bytes, Bytes)>,
     pub body: Bytes,
     /// HTTP/1.1 の応答全体（`Connection: keep-alive` / `close`）
     pub h1_keepalive: Bytes,
     pub h1_close: Bytes,
+    /// ルートの `remove_response_headers` に `Server`・`Alt-Svc` がある（自分の `server`・HTTP/3 の広告も付けない）
+    pub drop_server: bool,
+    pub drop_alt_svc: bool,
     /// ルートの `[route.security]`（IP 制限・許可メソッド・本文の大きさ・レート制限）。B-133 より前は
     /// `Backend::security()` が既定値を返し、`type = "Respond"` とトラフィック制御の応答（フォルト・CORS・JWT）は
     /// ルートのセキュリティ設定を無視していた
@@ -221,36 +224,15 @@ pub struct FixedResponse {
 
 impl FixedResponse {
     pub fn new(status: u16, headers: Vec<(Bytes, Bytes)>, body: Bytes) -> Self {
-        let h1 = |conn: &str| {
-            let mut v = Vec::with_capacity(128 + body.len());
-            v.extend_from_slice(
-                format!("HTTP/1.1 {} {}\r\n", status, reason_phrase(status)).as_bytes(),
-            );
-            for (k, val) in &headers {
-                v.extend_from_slice(k);
-                v.extend_from_slice(b": ");
-                v.extend_from_slice(val);
-                v.extend_from_slice(b"\r\n");
-            }
-            v.extend_from_slice(
-                format!(
-                    "Content-Length: {}\r\nConnection: {}\r\n\r\n",
-                    body.len(),
-                    conn
-                )
-                .as_bytes(),
-            );
-            v.extend_from_slice(&body);
-            Bytes::from(v)
-        };
-        let h1_keepalive = h1("keep-alive");
-        let h1_close = h1("close");
+        let (h1_keepalive, h1_close) = h1_fixed_bytes(status, &headers, &body, false, false);
         FixedResponse {
             status,
             headers,
             body,
             h1_keepalive,
             h1_close,
+            drop_server: false,
+            drop_alt_svc: false,
             security: default_security(),
             modules: None,
         }
@@ -265,11 +247,94 @@ impl FixedResponse {
         self
     }
 
-    /// ルートのセキュリティ設定を付ける（ロード時に 1 回）
+    /// ルートのセキュリティ設定を付ける（ロード時に 1 回）。応答ヘッダの方針（`remove_response_headers`・
+    /// `add_response_headers`）もここで 1 回かけ、HTTP/1.1 の応答全体を作り直す（B-267）
     pub fn with_security(mut self, security: Arc<SecurityConfig>) -> Self {
+        if security.has_response_header_ops() {
+            self.drop_server = security.removes_response_header(b"server");
+            self.drop_alt_svc = security.removes_response_header(b"alt-svc");
+            security.apply_response_headers(&mut self.headers);
+            (self.h1_keepalive, self.h1_close) = h1_fixed_bytes(
+                self.status,
+                &self.headers,
+                &self.body,
+                self.drop_server,
+                self.drop_alt_svc,
+            );
+        }
         self.security = security;
         self
     }
+}
+
+impl FixedResponse {
+    /// ヘッダだけ差し替えた写し（`headers` は方針をかけた後のもの。方針を 2 度かけない）
+    fn with_headers(&self, headers: Vec<(Bytes, Bytes)>) -> Self {
+        let (h1_keepalive, h1_close) = h1_fixed_bytes(
+            self.status,
+            &headers,
+            &self.body,
+            self.drop_server,
+            self.drop_alt_svc,
+        );
+        FixedResponse {
+            status: self.status,
+            headers,
+            body: self.body.clone(),
+            h1_keepalive,
+            h1_close,
+            drop_server: self.drop_server,
+            drop_alt_svc: self.drop_alt_svc,
+            security: self.security.clone(),
+            modules: self.modules.clone(),
+        }
+    }
+}
+
+/// 固定応答の HTTP/1.1 の応答全体（`Connection: keep-alive`・`close` の 2 つ）を組み立てる（ロード時）
+fn h1_fixed_bytes(
+    status: u16,
+    headers: &[(Bytes, Bytes)],
+    body: &Bytes,
+    drop_server: bool,
+    drop_alt_svc: bool,
+) -> (Bytes, Bytes) {
+    let h1 = |conn: &str| {
+        let mut v = Vec::with_capacity(128 + body.len());
+        v.extend_from_slice(
+            format!("HTTP/1.1 {} {}\r\n", status, reason_phrase(status)).as_bytes(),
+        );
+        // B-271: 他の応答と同じく Server（有効なときだけ）と HTTP/3 の広告を付ける。どちらも設定のロード時に
+        // ルートより先に決まり、リロードでは固定応答ごと作り直す
+        let has = |n: &[u8]| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+        if !drop_server && !has(b"server") {
+            crate::pool::append_server_header_line(&mut v);
+        }
+        if !drop_alt_svc && !has(b"alt-svc") {
+            if let Some(g) = crate::pool::get_alt_svc_guard() {
+                v.extend_from_slice(b"Alt-Svc: ");
+                v.extend_from_slice(g.value());
+                v.extend_from_slice(b"\r\n");
+            }
+        }
+        for (k, val) in headers {
+            v.extend_from_slice(k);
+            v.extend_from_slice(b": ");
+            v.extend_from_slice(val);
+            v.extend_from_slice(b"\r\n");
+        }
+        v.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                body.len(),
+                conn
+            )
+            .as_bytes(),
+        );
+        v.extend_from_slice(body);
+        Bytes::from(v)
+    };
+    (h1("keep-alive"), h1("close"))
 }
 
 /// セキュリティ設定の無い固定応答（単体テスト・ルートの外で作る応答）が共有する既定値
@@ -748,11 +813,7 @@ fn cors_variant(b: &Backend, actual: Option<Arc<crate::route_cors::CorsActual>>)
         // 固定応答は応答のヘッダへ組み込む（設定のヘッダが `Access-Control-Allow-Origin` を持てば上流と同じ扱い）
         let mut h = r.headers.clone();
         actual.apply_bytes(&mut h);
-        return Backend::Respond(Arc::new(
-            FixedResponse::new(r.status, h, r.body.clone())
-                .with_security(r.security.clone())
-                .with_modules(r.modules.clone()),
-        ));
+        return Backend::Respond(Arc::new(r.with_headers(h)));
     }
     let base_sec = b.security();
     let mut sec = base_sec.clone();

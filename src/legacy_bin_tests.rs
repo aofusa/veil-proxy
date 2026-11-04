@@ -550,6 +550,35 @@ mod compression_config_tests {
         let result = config.should_compress(AcceptedEncoding::Gzip, None, Some(2048), None);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_should_compress_skips_event_stream_and_huge_bodies() {
+        // B-281: SSE は text/ でも圧縮しない（溜めると届かない）。溜める上限を超える既知長も圧縮しない
+        let config = CompressionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for ct in [
+            &b"text/event-stream"[..],
+            b"Text/Event-Stream; charset=utf-8",
+        ] {
+            assert!(config
+                .should_compress(AcceptedEncoding::Gzip, Some(ct), None, None)
+                .is_none());
+        }
+        let cap = crate::pool::MAX_COLLECTED_RESPONSE_BODY;
+        assert!(config
+            .should_compress(AcceptedEncoding::Gzip, Some(b"text/plain"), Some(cap), None)
+            .is_some());
+        assert!(config
+            .should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"text/plain"),
+                Some(cap + 1),
+                None
+            )
+            .is_none());
+    }
 }
 
 // ====================
@@ -591,7 +620,8 @@ mod security_config_tests {
         let config = SecurityConfig::default();
         assert_eq!(config.max_request_body_size, MAX_BODY_SIZE);
         assert_eq!(config.max_request_header_size, MAX_HEADER_SIZE);
-        assert_eq!(config.client_header_timeout_secs, 30);
+        assert_eq!(config.client_header_timeout_secs, None);
+        assert_eq!(config.client_body_timeout_secs, 30);
         assert!(config.allowed_methods.is_empty());
     }
 

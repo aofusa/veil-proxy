@@ -1,6 +1,6 @@
 # B-273: メトリクスの一部が特定のプロトコルでしか数えられず、文書にある 4 系列はどこからも記録されない
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -36,6 +36,14 @@
   Grafana の例が使っているかも確かめる（F-256 の PromQL の試験）。
 - 要求ごとの経路は今と同じく、メトリクスが無効なら分岐 1 回だけ（ラベルの文字列を要求ごとに作らない）。
 - 試験: `/metrics` を HTTP/1.1・HTTP/2・HTTP/3 の gRPC・バッファリングの要求の後に読み、各系列が増えること。
+
+## 修正（v0.10.1）
+
+- `veil_grpc_requests_total`・`veil_grpc_stream_duration_seconds` を HTTP/2・HTTP/3 の gRPC の中継の完了（`grpc-status` のトレーラー）で記録する
+  （`record_grpc_completion`）。`veil_proxy_buffering_used_total` は全プロトコルで要求ごとに 1 回、`veil_retry_total` は再送した経路、
+  `veil_circuit_breaker_open_total` は開いたとき、`veil_proxy_cache_stores_total` は保存したとき（`storage` は実際の置き場所）に記録する。
+- 統合試験 `b270_h2c_upstream_responses_are_compressed`（`buffering_used_total`）・`b272_circuit_breaker_opens_on_every_protocol`（`open_total`）。
+- `docs/guide/observability.md`（英日）の各行に、記録する経路を書いた。
 
 ## 関連
 

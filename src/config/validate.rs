@@ -219,6 +219,16 @@ pub(super) fn warn_unbuilt_sections(_config: &Config) {
     if _config.http2.is_some() {
         warn!("[config] [http2] is ignored: this build does not include the http2 feature");
     }
+    // B-274: ルートの client_header_timeout_secs は使えない（ヘッダを受け取るまでルートが決まらない）
+    if _config.route.iter().flatten().any(|r| {
+        r.security
+            .as_ref()
+            .is_some_and(|s| s.client_header_timeout_secs.is_some())
+    }) {
+        warn!(
+            "[config] [route.security] client_header_timeout_secs is ignored: the route is not known until the headers arrive; request headers are bounded by the listener's idle timeout"
+        );
+    }
 }
 
 pub(super) fn validate_config(config: &Config) -> io::Result<()> {

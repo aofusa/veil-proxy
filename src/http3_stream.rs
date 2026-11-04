@@ -561,7 +561,13 @@ pub(crate) type RespHeaders = Vec<(Bytes, Bytes)>;
 /// [`TryRecv::Closed`] を fin として扱う）。
 pub(crate) enum RespMsg {
     /// レスポンス head（ステータス + ヘッダ）。最初に 1 回だけ送られる。
-    Head { status: u16, headers: RespHeaders },
+    /// `own_server` が false なら `[server] server_header_enabled` の `server` を付けない（ルートの
+    /// `remove_response_headers` に `Server` がある。HTTP/1.1・HTTP/2 と同じ）
+    Head {
+        status: u16,
+        headers: RespHeaders,
+        own_server: bool,
+    },
     /// レスポンスボディ断片（ゼロコピー）。
     Body(Bytes),
     /// バックエンドエラー（head 送出前なら指定ステータスを返し、送出後はストリームをリセット）。
@@ -579,6 +585,10 @@ pub(crate) enum RespMsg {
 pub(crate) struct BackendTaskParams {
     /// 選択済みアップストリームサーバ（`acquire`/`release` のためクローンを保持）。
     pub server: UpstreamServer,
+    /// サーキットブレーカー・外れ値の排除へ結果を記録するグループ（どちらかが有効なときだけ Some。B-272）。
+    pub resilience: Option<std::sync::Arc<crate::config::UpstreamGroup>>,
+    /// 上流の応答のステータス（head を受けたら設定。0 = 未受信）。`resilience` の成否の判定に使う。
+    pub resp_status: Cell<u16>,
     /// 完成済み HTTP/1.1 リクエスト head（リクエストライン + ヘッダ + 空行）。ボディは含まない。
     pub request_head: Vec<u8>,
     /// リクエストボディを chunked で転送するか（`true` のとき head は `Transfer-Encoding: chunked`）。
@@ -610,6 +620,9 @@ pub(crate) struct BackendTaskParams {
     pub h2: Option<H2Upstream>,
     /// `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273）。メインループが応答の head に足す
     pub cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
+    /// `add_response_headers`・`remove_response_headers` のあるルートのセキュリティ設定（B-267。メインループが応答の
+    /// head にかける。方針の無いルートは `None`）
+    pub resp_policy: Option<std::sync::Arc<crate::config::SecurityConfig>>,
 }
 
 /// F-171: HTTP/2 上流へ送る要求（HTTP/1.1 の `request_head` の代わり）。
@@ -738,6 +751,7 @@ async fn backend_task(
     notify: ConnWaker,
 ) {
     params.server.acquire();
+    let resilience_start = crate::runtime::time::coarse_now();
     #[cfg(feature = "http2")]
     let outcome = if params.h2.is_some() {
         if params.use_tls {
@@ -765,6 +779,19 @@ async fn backend_task(
         run_backend_task(&params, &mut head, &req_body_rx, &resp_tx, &notify).await
     };
     params.server.release();
+    if let Some(group) = &params.resilience {
+        // head 送出後のエラー（Err）も上流の失敗として数える
+        // Err(0) はクライアントが去った（B-277。上流の成否ではない）
+        match outcome {
+            Ok(()) => group.record_request(
+                &params.server,
+                resilience_start,
+                (1..500).contains(&params.resp_status.get()),
+            ),
+            Err(0) => {}
+            Err(_) => group.record_request(&params.server, resilience_start, false),
+        }
+    }
 
     if let Err(status) = outcome {
         // head 送出前のエラーはそのステータスで応答し、送出後のエラーはメインループが
@@ -861,21 +888,28 @@ async fn relay_h2_stream(
 ) -> Result<(), u16> {
     use crate::http2::upstream_mux::UpResp;
     let read_timeout = Duration::from_secs(params.timeout_secs);
+    // F-09・B-273: gRPC の要求数・時間（HTTP/2 の中継と同じくトレーラーの grpc-status で数える）
+    #[cfg(feature = "grpc")]
+    let started = crate::runtime::time::coarse_now();
 
     // 要求方向: 送信端を所有して流し、終わったら drop（= END_STREAM）。
     let req_tx = stream.req_tx.take();
     let upload = async move {
-        let Some(tx) = req_tx else {
-            return;
-        };
+        let tx = req_tx?;
         while let Some(chunk) = req_body_rx.recv().await {
             if tx.send(chunk).await.is_err() {
                 // 上流がストリームを閉じた（早期応答・リセット）。残りは応答側で判定する。
-                return;
+                return None;
             }
             // 要求チャネルに空きができた → メインループの recv_body を再開させる。
             notify.notify();
         }
+        // B-277: fin の前に切れた本文。送信端を生かして返し（drop すると END_STREAM になり切り詰めた
+        // 本文が完結して見える）、上流のストリームごと捨てて CANCEL にする。
+        if req_body_rx.is_cut_off() {
+            return Some(tx);
+        }
+        None
     };
 
     // 応答方向。
@@ -893,6 +927,7 @@ async fn relay_h2_stream(
             match msg {
                 None => return Ok(()),
                 Some(UpResp::Head { status, headers }) => {
+                    params.resp_status.set(status);
                     let content_type = headers
                         .iter()
                         .find(|(n, _)| n.as_ref() == b"content-type")
@@ -932,7 +967,11 @@ async fn relay_h2_stream(
                         .await;
                     }
                     if resp_tx
-                        .send(RespMsg::Head { status, headers })
+                        .send(RespMsg::Head {
+                            status,
+                            headers,
+                            own_server: true,
+                        })
                         .await
                         .is_err()
                     {
@@ -956,6 +995,17 @@ async fn relay_h2_stream(
                 Some(UpResp::Trailers(trailers)) => {
                     #[cfg(feature = "grpc")]
                     {
+                        if let Some((_, code)) =
+                            trailers.iter().find(|(n, _)| n.as_ref() == b"grpc-status")
+                        {
+                            let path = params.h2.as_ref().map_or(&b""[..], |h| h.path.as_ref());
+                            crate::metrics::record_grpc_completion(
+                                std::str::from_utf8(path).unwrap_or(""),
+                                std::str::from_utf8(code).unwrap_or("").trim(),
+                                &params.server.target.host,
+                                started,
+                            );
+                        }
                         if resp_tx.send(RespMsg::Trailers(trailers)).await.is_err() {
                             return Ok(());
                         }
@@ -977,7 +1027,12 @@ async fn relay_h2_stream(
     loop {
         futures::select_biased! {
             r = download => return r,
-            _ = upload => {}
+            held = upload => {
+                if let Some(tx) = held {
+                    drop(tx);
+                    return Err(0);
+                }
+            }
         }
     }
 }
@@ -999,7 +1054,13 @@ async fn h2_relay_compressed(
         match crate::runtime::time::timeout(read_timeout, resp_rx.recv()).await {
             Err(_) => return Err(504),
             Ok(None) => break,
-            Ok(Some(UpResp::Data(b))) => body.extend_from_slice(&b),
+            Ok(Some(UpResp::Data(b))) => {
+                // B-281: 溜める上限を超えたら打ち切る
+                if body.len() + b.len() > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                    return Err(502);
+                }
+                body.extend_from_slice(&b)
+            }
             Ok(Some(UpResp::Trailers(_))) | Ok(Some(UpResp::Head { .. })) => {}
             Ok(Some(UpResp::Reset { .. })) => return Err(502),
         }
@@ -1013,7 +1074,11 @@ async fn h2_relay_compressed(
         Bytes::from_static(enc.as_header_value()),
     ));
     if resp_tx
-        .send(RespMsg::Head { status, headers })
+        .send(RespMsg::Head {
+            status,
+            headers,
+            own_server: true,
+        })
         .await
         .is_ok()
     {
@@ -1154,6 +1219,10 @@ async fn run_backend_task(
                     "[HTTP/3] pooled backend connection failed before the response ({}); retrying on a fresh connection",
                     status
                 );
+                crate::metrics::record_retry(
+                    params.server.target.conn_addr().as_str(),
+                    "stale_connection",
+                );
                 continue;
             }
             Err(status) => return Err(status),
@@ -1193,6 +1262,7 @@ async fn exchange(
             resp_tx,
             notify,
             before_head,
+            &params.resp_status,
         )
     };
 
@@ -1234,6 +1304,11 @@ async fn exchange(
                     send_backend_chunk(backend, chunk).await?;
                     notify.notify();
                 }
+                // B-277: fin の前に切れた（ストリームのリセット・切断・上限超過）本文に終端チャンクを送ると、
+                // 切り詰めた本文が完結して見える（B-187 のハンドラと同じ）。送らずに上流の接続ごと捨てる。
+                if req_body_rx.is_cut_off() {
+                    return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+                }
                 // 終端チャンク。
                 backend.write_all(Bytes::from_static(b"0\r\n\r\n")).await?;
                 Ok::<(), io::Error>(())
@@ -1253,6 +1328,9 @@ async fn exchange(
                     u = upload => {
                         match u {
                             Ok(()) => upload_done = true,
+                            // B-277: クライアントが去った。上流の接続ごと捨てる（0 = 上流の失敗に数えない）
+                            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted
+                                && req_body_rx.is_cut_off() => return Err(0),
                             Err(e) => {
                                 // レスポンス完結後にバックエンドがリクエスト読み取りを
                                 // 打ち切るのは合法。ここでは中断せずレスポンス側の完了・
@@ -1302,6 +1380,7 @@ async fn stream_response(
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
     before_head: &Cell<bool>,
+    resp_status: &Cell<u16>,
 ) -> Result<RespEnd, u16> {
     // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。
     let mut read_buf = vec![0u8; RESP_READ_CHUNK];
@@ -1347,6 +1426,7 @@ async fn stream_response(
         warn!("[HTTP/3] Backend response has conflicting Content-Length / Transfer-Encoding");
         return Err(502);
     }
+    resp_status.set(status);
     // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片。
     let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
 
@@ -1396,7 +1476,11 @@ async fn stream_response(
         }
         before_head.set(false);
         if resp_tx
-            .send(RespMsg::Head { status, headers })
+            .send(RespMsg::Head {
+                status,
+                headers,
+                own_server: true,
+            })
             .await
             .is_err()
         {
@@ -1677,6 +1761,11 @@ async fn stream_response_compressed(
                 break;
             }
             Ok(n) => {
+                // B-281: 溜める上限を超えたら打ち切る（長さ不明・chunked の応答）
+                if body.len() + n > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                    warn!("[HTTP/3] upstream response body exceeds the buffering limit");
+                    return Err(502);
+                }
                 let slice = Bytes::copy_from_slice(&read_buf[..n]);
                 exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
                 done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)
@@ -1703,7 +1792,11 @@ async fn stream_response_compressed(
     ));
 
     if resp_tx
-        .send(RespMsg::Head { status, headers })
+        .send(RespMsg::Head {
+            status,
+            headers,
+            own_server: true,
+        })
         .await
         .is_err()
     {
@@ -1949,6 +2042,13 @@ async fn buffered_round_trip(
                 ))
             }
             Ok(n) => {
+                // B-281: 溜める上限を超えたら打ち切る（長さ不明・chunked の応答）
+                if body.len() + n > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "upstream response body exceeds the buffering limit",
+                    ));
+                }
                 let slice = Bytes::copy_from_slice(&read_buf[..n]);
                 exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
                 done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)

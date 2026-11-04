@@ -232,6 +232,9 @@ Closed ──(failure_threshold超過)──▶ Open
 
 プール内の**全サーバー**のCBがOpenになった場合は、完全停止を避けるために healthy なサーバーへのフォールバックが動作します。
 
+結果はクライアントのすべてのプロトコル（HTTP/1.1・HTTP/2・HTTP/3）と上流のすべてのプロトコル（HTTP/1.1・h2c・HTTPS）の要求で記録します。
+上流が `5xx` を返したか、接続・要求が失敗・時間切れになったら失敗として数えます。応答の前にクライアントが去った要求は数えません。
+
 ### 設定
 
 ```toml
@@ -278,7 +281,7 @@ servers = ["http://api1:8080", "http://api2:8080"]
 
 | メトリクス | タイプ | 説明 |
 |-----------|--------|------|
-| `veil_circuit_breaker_open_total` | Counter | CB Openイベント数（upstreamラベル） |
-| `veil_circuit_breaker_state` | Gauge | CB状態（0=Closed, 1=Open, 2=HalfOpen、upstreamラベル） |
-| `veil_retry_total` | Counter | リトライ試行回数（upstream, resultラベル） |
-| `veil_outlier_ejected` | Gauge | サーバー排除状態（1=排除中、upstream, serverラベル） |
+| `veil_circuit_breaker_open_total` | Counter | サーバーのCBがOpenになった回数（upstream グループのラベル） |
+| `veil_circuit_breaker_state` | Gauge | upstream グループの状態: どれかのサーバーがOpenなら1、どれかがHalfOpenなら2、ほかは0 |
+| `veil_retry_total` | Counter | プールの接続が応答の前に切れた冪等な要求の再送（`upstream` はサーバーのアドレス、`result="stale_connection"`） |
+| `veil_outlier_ejected` | Gauge | サーバー排除状態（排除中は1、排除が解けたら0。upstream, serverラベル） |

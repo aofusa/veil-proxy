@@ -325,6 +325,25 @@ path = "/"
 path = "/var/www/html"
 ```
 
+#### Conditional and Range Requests
+
+Both modes answer the same way on HTTP/1.1, HTTP/2 and HTTP/3:
+
+- Every response carries `ETag` and `Last-Modified`. In `sendfile` mode the ETag is built from the file's modification time and
+  size; in `memory` mode it is a hash of the content (it stays the same across reloads when the content does not change) and
+  `Last-Modified` is the file's modification time when it was loaded.
+- `If-None-Match` (weak comparison, `*` matches) and `If-Modified-Since` return `304 Not Modified` without a body.
+  `If-None-Match` takes precedence when both are sent.
+- `Range: bytes=...` returns `206 Partial Content` with `Content-Range` (`bytes=0-9`, `bytes=10-` and `bytes=-10` forms). Only the
+  first range of a multi-range request is served. A range outside the file returns `416 Range Not Satisfiable` with
+  `Content-Range: bytes */<size>`. Full and partial responses carry `Accept-Ranges: bytes`.
+- `If-Range` with the current ETag (strong comparison) or the exact `Last-Modified` date keeps the range; otherwise the whole file
+  is returned with `200`.
+- `HEAD` returns the same headers (including `Content-Length`) without a body.
+- With `[route.compression]` enabled, a compressible file is compressed when the client accepts an encoding. Compressed responses
+  carry a weak ETag (`W/"..."`) and `Vary: Accept-Encoding`, and ignore `Range` (as nginx's gzip module does). Requests without
+  `Accept-Encoding` still get ranges.
+
 ### Proxy Configuration
 
 Supports proxying to HTTP and HTTPS backends:
@@ -818,8 +837,8 @@ Add a `security` subsection to each route for fine-grained security settings.
 | Size Limits | `max_request_body_size` | Maximum request body size (bytes) | 10MB |
 | | `max_chunked_body_size` | Maximum cumulative size for chunked transfer | 10MB |
 | | `max_request_header_size` | Maximum request header size | 8KB |
-| Timeouts | `client_header_timeout_secs` | Client header receive timeout | 30s |
-| | `client_body_timeout_secs` | Client body receive timeout | 30s |
+| Timeouts | `client_header_timeout_secs` | Not used: the route is not known until the request headers have arrived, so this key cannot apply. It is accepted for compatibility and logs a warning at start-up | none |
+| | `client_body_timeout_secs` | How long the request body may stop arriving before the request is aborted (until the response starts). HTTP/1.1 returns `408`; HTTP/2 resets the stream with `RST_STREAM(CANCEL)`; HTTP/3 resets it with `H3_REQUEST_CANCELLED`. Applies to streamed uploads, buffered bodies and gRPC client streaming | 30s |
 | | `backend_connect_timeout_secs` | Backend connection timeout | 10s |
 | Access Control | `allowed_methods` | Allowed HTTP methods (array) | all allowed |
 | | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
@@ -1091,7 +1110,11 @@ placeholder (e.g. `$foo`) is left in the value unchanged.
 
 ### Response Header Manipulation
 
-Add or remove headers before sending to the client. Also applies to static file serving.
+Add or remove headers before sending to the client. Both options apply to every client protocol (HTTP/1.1, HTTP/2, HTTP/3)
+and every response source: proxied responses (streamed, buffered or compressed, from HTTP/1.1, h2c or HTTPS upstreams),
+static files and fixed responses (`type = "Respond"`). Removal runs before `add_response_headers`, before the Proxy-Wasm
+`on_http_response_headers` phase and before CORS headers are added. Listing `Server` or `Alt-Svc` in
+`remove_response_headers` also removes veil's own `Server` header (`server_header_enabled`) and the HTTP/3 advertisement.
 
 | Option | Description | Example |
 |--------|-------------|---------|

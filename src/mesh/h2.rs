@@ -29,11 +29,14 @@ impl H2Service for MeshH2Service {
         _stream_id: u32,
         _client_ip: &str,
         _client_socket_addr: std::net::SocketAddr,
-    ) -> Option<u64>
+    ) -> crate::proxy::H2StreamPlan
     where
         S: AsyncReadRent + AsyncWriteRentExt + Unpin,
     {
-        Some(0)
+        crate::proxy::H2StreamPlan {
+            streaming: Some(0),
+            body_timeout_secs: 0,
+        }
     }
 
     fn spawn(

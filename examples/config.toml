@@ -169,11 +169,8 @@ http2_enabled = true
 server_header_enabled = true
 
 # カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
-# デフォルト: "veil"
-# 未指定の場合、プロトコルごとに自動設定:
-#   - HTTP/1.1: "veil/http1.1"
-#   - HTTP/2: "veil/http2"
-#   - HTTP/3: "veil/http3"
+# デフォルト: "veil"（HTTP/1.1・HTTP/2・HTTP/3 で同じ値。上流の Server を置き換える）
+# ルートの remove_response_headers に "Server" があれば、そのルートでは veil のものも付けない
 # server_header_value = "veil/1.0"
 
 
@@ -1274,7 +1271,8 @@ watch = false
 
 # ストリームアイドルタイムアウト (秒)
 # Slow Loris 対策
-# リクエストが完了しないストリームの切断までの時間
+# 要求本文が届かなくなったストリームを RST_STREAM(CANCEL) で打ち切るまでの時間。ルートの
+# [route.security] client_body_timeout_secs（既定 30）があればそちらを使い、これはルートの設定の無いストリームに使う（0 で無効）
 # デフォルト: 60
 # stream_idle_timeout_secs = 60
 
@@ -2092,10 +2090,12 @@ watch = false
 # Chunked 転送時の累積最大ボディサイズ（バイト）
 # max_chunked_body_size = 10_485_760
 #
-# クライアントヘッダー受信タイムアウト（秒）
+# クライアントヘッダー受信タイムアウト（秒）: 使われない（要求のヘッダが揃うまでルートが決まらない）。
+# 互換のため受け付け、書くと起動時に警告を出す
 # client_header_timeout_secs = 30
 #
-# クライアントボディ受信タイムアウト（秒）
+# クライアントボディ受信タイムアウト（秒）: 要求本文が届かなくなってから打ち切るまで（応答を始めるまで）。
+# HTTP/1.1 は 408、HTTP/2 は RST_STREAM(CANCEL)、HTTP/3 は H3_REQUEST_CANCELLED。gRPC のクライアントストリーミングにも効く
 # client_body_timeout_secs = 30
 #
 # リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
@@ -2111,7 +2111,8 @@ watch = false
 #   0 ならプールしない）
 # idle_connection_timeout_secs = 30
 #
-# レスポンスから削除するヘッダー（クライアントへ返送前）
+# レスポンスから削除するヘッダー（クライアントへ返送前。全プロトコル・プロキシ・静的配信・固定応答に効く。
+# "Server"・"Alt-Svc" を書くと veil 自身の Server・HTTP/3 の広告も付けない）
 # remove_response_headers = ["Server", "X-Powered-By"]
 #
 # WebSocket 転送のポーリングモード（"adaptive" | "fixed"）

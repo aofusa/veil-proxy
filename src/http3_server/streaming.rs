@@ -241,6 +241,9 @@ pub(super) fn drive_request_pump(
                     did_work = true;
                     unsafe { buf.advance_mut(n) };
                     ps.req_bytes_total += n as u64;
+                    if let Some(w) = ps.recv_watch.as_mut() {
+                        w.last = crate::runtime::time::coarse_now();
+                    }
                     // ボディ上限チェック（0 = 無制限）。
                     if ps.max_request_body > 0 && ps.req_bytes_total > ps.max_request_body {
                         ps.req_too_large = true;
@@ -425,14 +428,25 @@ pub(super) fn drive_response_flush(
             TryRecv::Item(RespMsg::Head {
                 status,
                 mut headers,
+                own_server,
             }) => {
+                // `remove_response_headers`・`add_response_headers`（B-267。方針の無いルートは分岐だけ）
+                if let Some(p) = &ps.resp_policy {
+                    p.apply_response_headers(&mut headers);
+                }
                 // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。ストリーミング経路。CORS の無いルートは分岐だけ）
                 if let Some(c) = &ps.cors {
                     c.apply_bytes(&mut headers);
                 }
                 // 本文の無い応答（リダイレクト・HEAD 等）は HEADERS に fin を載せる。
                 let fin = ps.resp_rx.is_finished();
-                match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin) {
+                // ルートの `remove_response_headers` に `Server` があれば自分の `server` も付けない（HTTP/1.1・HTTP/2 と同じ）
+                let own_server = own_server
+                    && !ps
+                        .resp_policy
+                        .as_ref()
+                        .is_some_and(|p| p.removes_response_header(b"server"));
+                match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin, own_server) {
                     HeadSend::Sent => {
                         ps.resp_started = true;
                         did_work = true;
@@ -543,10 +557,11 @@ pub(super) fn send_h3_head(
     status: u16,
     headers: &[(Bytes, Bytes)],
 ) -> HeadSend {
-    send_h3_head_fin(h3, conn, stream_id, status, headers, false)
+    send_h3_head_fin(h3, conn, stream_id, status, headers, false, true)
 }
 
 /// レスポンス head を送る。`fin` なら HEADERS でストリームを閉じる（本文の無い応答）。
+/// `own_server` が false なら `[server] server_header_enabled` の `server` を付けない。
 pub(super) fn send_h3_head_fin(
     h3: &mut h3::Connection,
     conn: &mut H3Conn,
@@ -554,15 +569,27 @@ pub(super) fn send_h3_head_fin(
     status: u16,
     headers: &[(Bytes, Bytes)],
     fin: bool,
+    own_server: bool,
 ) -> HeadSend {
     let mut status_buf = itoa::Buffer::new();
     let status_str = status_buf.format(status);
     // 借用ヘッダ（`HeaderRef`）で渡す（`h3::Header::new` は名前と値を毎回 `Vec` にコピーする）。
     let mut h3_headers: Vec<h3::HeaderRef<'_>> = Vec::with_capacity(headers.len() + 2);
     h3_headers.push(h3::HeaderRef::new(b":status", status_str.as_bytes()));
-    h3_headers.push(h3::HeaderRef::new(b"server", b"veil/http3"));
+    // `[server] server_header_enabled` のときだけ自分の `server` を付ける（HTTP/1.1・HTTP/2 と同じ。以前は設定に
+    // 関わらず `veil/http3` を付け、上流の `server` を消していた。B-271）
+    let server = if own_server {
+        crate::pool::get_server_header_guard()
+    } else {
+        None
+    };
+    if let Some(g) = &server {
+        h3_headers.push(h3::HeaderRef::new(b"server", g.value()));
+    }
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case(b":status") || name.eq_ignore_ascii_case(b"server") {
+        if name.eq_ignore_ascii_case(b":status")
+            || (server.is_some() && name.eq_ignore_ascii_case(b"server"))
+        {
             continue;
         }
         h3_headers.push(h3::HeaderRef::new(name, value));
@@ -667,12 +694,15 @@ pub(super) fn send_simple_h3_error(
         _ => b"Error",
     };
     let mut len_buf = itoa::Buffer::new();
-    let h3_headers = [
+    let mut h3_headers = vec![
         h3::Header::new(b":status", status_str.as_bytes()),
-        h3::Header::new(b"server", b"veil/http3"),
         h3::Header::new(b"content-type", b"text/plain"),
         h3::Header::new(b"content-length", len_buf.format(body.len()).as_bytes()),
     ];
+    // `[server] server_header_enabled` のときだけ（B-271）
+    if let Some(g) = crate::pool::get_server_header_guard() {
+        h3_headers.push(h3::Header::new(b"server", g.value()));
+    }
     match h3.send_response(conn, stream_id, &h3_headers, false) {
         Ok(()) => {
             let _ = h3.send_body(conn, stream_id, body, true);

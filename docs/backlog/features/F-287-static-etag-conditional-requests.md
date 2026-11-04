@@ -1,6 +1,6 @@
 # F-287: 静的配信に `ETag`・`Last-Modified` と条件付き要求（304・`If-Range`）を足す（文書は「ETag が効く」と書いている）
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 完了（v0.10.1）**
 
 ## 今の状態
 
@@ -26,6 +26,12 @@
 - E2E: HTTP/1.1・h2c・HTTP/2・HTTP/3 × File・memory で、2 回目の要求に `If-None-Match`・`If-Modified-Since` を付けると 304、ファイルを書き換えると 200。
   `If-Range` の一致・不一致。
 - 交互 A/B: 条件付きでない静的配信の性能が変わらない（3B・54KB、ヘッダが 2 行増える分の差を見る）。
+
+## 修正（v0.10.1）
+
+- 静的配信に `ETag`（ファイルは mtime と長さ、memory は内容のハッシュと長さから作る強い ETag。圧縮した表現は弱い ETag）・`Last-Modified`（memory も読み込み時の mtime）を付け、`If-None-Match`・
+  `If-Modified-Since` に 304、`If-Range` が合わなければ全体を返す。全プロトコル同じ（`static_response::plan`）。
+- 統合試験 `b266_f286_f287_static_responses_match_across_protocols`、`docs/guide/routing.md`（英日）。
 
 ## 関連
 

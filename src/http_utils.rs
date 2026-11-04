@@ -709,6 +709,8 @@ pub(crate) fn build_partial_response_header(
 }
 
 /// 416 Range Not Satisfiable レスポンスを構築 (RFC 7233 Section 4.4)
+// 単体テストのみで使用（静的配信の 416 は `proxy::sendfile::build_h1_static_head` が作る。F-286）
+#[cfg(test)]
 pub(crate) fn build_range_not_satisfiable_response(content_length: u64) -> Vec<u8> {
     let mut response = Vec::with_capacity(128);
     response.extend_from_slice(b"HTTP/1.1 416 Range Not Satisfiable\r\n");

@@ -1,6 +1,6 @@
 # F-288: HTTP/2・HTTP/3 の上の WebSocket（RFC 8441・RFC 9220 の拡張 CONNECT）をプロキシとハンドラで受ける
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 未着手（2026-11-04 起票。v0.10.1 で文書を「WebSocket は HTTP/1.1 だけ」に直した）**
 
 ## 今の状態
 
@@ -27,6 +27,11 @@
 - E2E: h2c・HTTP/2・HTTP/3 の拡張 CONNECT で、プロキシのルート（上流 HTTP/1.1 の WebSocket サーバ）とハンドラのルートの echo・ping・close が通る。
   HTTP/1.1 の WebSocket は今のまま。h2spec・h3spec の既存の項目が通る。
 - WebSocket の無いルートの性能が変わらない。
+
+## v0.10.1 での扱い
+
+- 実装は見送り、`docs/guide/protocols.md`・`migration-nginx.md`・`performance.md`（英日）に WebSocket は HTTP/1.1 だけと書いた
+  （文書と挙動の食い違いを無くす。拡張 CONNECT の実装はこのチケットで続ける）。
 
 ## 関連
 

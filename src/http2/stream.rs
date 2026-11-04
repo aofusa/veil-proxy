@@ -112,6 +112,9 @@ pub struct Stream {
     pub received_body_size: u64,
     /// 最終アクティビティ時刻 (Slow Loris 対策)
     pub last_activity: std::time::Instant,
+    /// 要求の受信が止まったら打ち切るまでの秒数（ルートの `client_body_timeout_secs`。0 = 接続の
+    /// `stream_idle_timeout_secs`。B-274）
+    pub recv_timeout_secs: u64,
     /// gRPC モード（content-type: application/grpc 検出時に true）
     #[cfg(feature = "grpc")]
     pub grpc_mode: bool,
@@ -142,6 +145,7 @@ impl Stream {
             content_length: None,
             received_body_size: 0,
             last_activity: std::time::Instant::now(),
+            recv_timeout_secs: 0,
             #[cfg(feature = "grpc")]
             grpc_mode: false,
             #[cfg(feature = "grpc")]
@@ -624,6 +628,31 @@ impl StreamManager {
             .collect()
     }
 
+    /// 要求の受信（ヘッダの続き・本文）が止まったストリームを `out` へ集める（B-274・B-276）。
+    ///
+    /// 対象はクライアントがまだ送っている（`Open`・`HalfClosedLocal`）ストリームだけ。打ち切るまでの秒数は
+    /// ストリームの `recv_timeout_secs`、0 なら `default_secs`（どちらも 0 なら打ち切らない）。
+    pub fn collect_stalled_receiving(&self, default_secs: u64, out: &mut Vec<u32>) {
+        for (id, s) in self.streams.iter() {
+            if !matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal) {
+                continue;
+            }
+            let secs = if s.recv_timeout_secs > 0 {
+                s.recv_timeout_secs
+            } else {
+                default_secs
+            };
+            if secs > 0 && s.is_idle_timeout(secs) {
+                out.push(*id);
+            }
+        }
+    }
+
+    /// 表にストリームが無いか（閉じたものは `cleanup_closed` で除いた後に見る）
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     /// ピアの初期ウィンドウサイズを更新（SETTINGS_INITIAL_WINDOW_SIZE受信時）
     pub fn update_initial_window_size(&mut self, new_size: i32) -> Result<(), Http2Error> {
         let delta = new_size - self.peer_initial_window_size;
@@ -757,6 +786,34 @@ impl StreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-274・B-276: 本文を受信中のストリームだけを、ストリームの秒数（無ければ接続の既定）で選ぶ
+    #[test]
+    fn collect_stalled_receiving_uses_stream_then_default_timeout() {
+        let mut manager = StreamManager::new(100, 65535);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        for (id, secs) in [(1u32, 0u64), (3, 2), (5, 60)] {
+            let s = manager.get_or_create_client_stream(id).unwrap();
+            s.recv_headers(false).unwrap();
+            s.recv_timeout_secs = secs;
+            s.last_activity = past;
+        }
+        // 本文を受け終えたストリームは対象外
+        {
+            let s = manager.get_or_create_client_stream(7).unwrap();
+            s.recv_headers(true).unwrap();
+            s.last_activity = past;
+        }
+        let mut out = Vec::new();
+        manager.collect_stalled_receiving(3, &mut out);
+        out.sort_unstable();
+        // 1 は既定の 3 秒、3 はストリームの 2 秒で止まっている。5 は 60 秒まで待つ
+        assert_eq!(out, vec![1, 3]);
+        out.clear();
+        // 既定が 0（`stream_idle_timeout_secs = 0`）なら秒数を持つストリームだけ
+        manager.collect_stalled_receiving(0, &mut out);
+        assert_eq!(out, vec![3]);
+    }
 
     #[test]
     fn test_stream_state_transitions() {

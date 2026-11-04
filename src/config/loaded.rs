@@ -1740,21 +1740,35 @@ pub(super) fn build_backend(
                     // F-178: FreeBSD の capability mode 中（リロード）は絶対パスの read が
                     // できないため、登録済み静的ルート配下なら dirfd 相対で読む。
                     #[cfg(target_os = "freebsd")]
-                    let data = match crate::security::capsicum::open_static_ro(Path::new(path)) {
-                        Some(f) => {
-                            use std::io::Read;
-                            let mut v = Vec::new();
-                            f?.read_to_end(&mut v)?;
-                            v
-                        }
-                        None => fs::read(path)?,
-                    };
+                    let (data, modified) =
+                        match crate::security::capsicum::open_static_ro(Path::new(path)) {
+                            Some(f) => {
+                                use std::io::Read;
+                                let mut f = f?;
+                                let modified = f.metadata().and_then(|m| m.modified()).ok();
+                                let mut v = Vec::new();
+                                f.read_to_end(&mut v)?;
+                                (v, modified)
+                            }
+                            None => (
+                                fs::read(path)?,
+                                fs::metadata(path).and_then(|m| m.modified()).ok(),
+                            ),
+                        };
+                    // Last-Modified は読み込んだときのファイルの更新時刻（F-287）
                     #[cfg(not(target_os = "freebsd"))]
-                    let data = fs::read(path)?;
+                    let (data, modified) = (
+                        fs::read(path)?,
+                        fs::metadata(path).and_then(|m| m.modified()).ok(),
+                    );
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
 
                     Ok(Backend::MemoryFile(
-                        Arc::new(data),
+                        Arc::new(crate::static_response::MemoryContent::new(
+                            data,
+                            modified,
+                            mime_type.as_ref(),
+                        )),
                         Arc::from(mime_type.as_ref()),
                         security,
                         modules_arc.clone(),

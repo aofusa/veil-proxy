@@ -253,6 +253,10 @@ Closed ──(failure_threshold exceeded)──▶ Open
 
 When **all** servers in a pool have open circuit breakers, the pool falls back to healthy servers to avoid complete service unavailability.
 
+Results are recorded for requests from every client protocol (HTTP/1.1, HTTP/2, HTTP/3) and every upstream protocol
+(HTTP/1.1, h2c, HTTPS). A request counts as a failure when the upstream returns a `5xx` status or the connection or request
+fails or times out. A request the client abandons before the response is not counted.
+
 ### Configuration
 
 ```toml
@@ -299,7 +303,7 @@ In addition to the circuit breaker, individual servers can be passively ejected 
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `veil_circuit_breaker_open_total` | Counter | Total number of CB open events per upstream |
-| `veil_circuit_breaker_state` | Gauge | Current CB state per upstream (0=Closed, 1=Open, 2=HalfOpen) |
-| `veil_retry_total` | Counter | Total retry attempts |
-| `veil_outlier_ejected` | Gauge | 1 if server is currently ejected |
+| `veil_circuit_breaker_open_total` | Counter | Number of times a server's breaker opened, per upstream group |
+| `veil_circuit_breaker_state` | Gauge | State of the upstream group: 1 if any server's breaker is Open, 2 if any is HalfOpen, otherwise 0 |
+| `veil_retry_total` | Counter | Retries of idempotent requests whose pooled connection closed before the response (`upstream` = server address, `result="stale_connection"`) |
+| `veil_outlier_ejected` | Gauge | 1 while the server is ejected, back to 0 when the ejection ends |

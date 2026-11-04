@@ -91,6 +91,11 @@ stream_idle_timeout_secs = 60
 
 制限を超過した場合、サーバーは `ENHANCE_YOUR_CALM` (0xb) エラーで応答し、接続を閉じます。
 
+要求本文が届かなくなったストリームは、ルートの `[route.security] client_body_timeout_secs`（既定 30 秒）の間本文を受け取らなければ
+（応答を始めるまで）`RST_STREAM(CANCEL)` で打ち切ります。`stream_idle_timeout_secs` はルートの設定の無いストリーム（どのルートにも
+当たらなかった要求など）の上限です。確かめるのは入力を待っている接続ごとに 1 秒に 1 回です。HTTP/3 もルートの
+`client_body_timeout_secs` を同じに使い、`H3_REQUEST_CANCELLED` でストリームを打ち切ります。
+
 ### HTTP/1.1フォールバック
 
 HTTP/2をサポートしないクライアントは自動的にHTTP/1.1にフォールバックします。
@@ -249,6 +254,10 @@ alt_svc_enabled = true          # 既定: true。false で広告を抑制
 WebSocket（RFC 6455）のプロキシに対応しています。
 `Connection: Upgrade` と `Upgrade: websocket` ヘッダーを自動検出し、
 双方向のデータ転送を行います。
+
+WebSocket を受けるのは HTTP/1.1 の接続（平文・TLS）だけです。veil は `SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告しないので、
+HTTP/2（RFC 8441）・HTTP/3（RFC 9220）の上の WebSocket は使えません。ブラウザは WebSocket 用に HTTP/1.1 の別の接続を張ります。
+HTTP/3 だけを受けるリスナーでは WebSocket を使えません。
 
 ### 動作
 

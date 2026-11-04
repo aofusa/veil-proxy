@@ -99,14 +99,14 @@ where
 #[cfg(feature = "http2")]
 pub(crate) trait H2Service {
     /// 本文がまだ届いている途中の要求を、本文をチャネルで流す（ストリーミング）にするか。
-    /// `Some(上限)` ならストリーミング（0 は上限なし）、`None` は本文を溜めてから処理する。
+    /// `streaming` が `Some(上限)` ならストリーミング（0 は上限なし）、`None` は本文を溜めてから処理する。
     fn streaming_plan<S>(
         &self,
         conn: &http2::Http2Connection<S>,
         stream_id: u32,
         client_ip: &str,
         client_socket_addr: SocketAddr,
-    ) -> Option<u64>
+    ) -> H2StreamPlan
     where
         S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin;
 
@@ -144,7 +144,7 @@ impl H2Service for ProxyH2Service {
         stream_id: u32,
         client_ip: &str,
         client_socket_addr: SocketAddr,
-    ) -> Option<u64>
+    ) -> H2StreamPlan
     where
         S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
     {
@@ -199,6 +199,10 @@ where
     // `drive_h2_streams` のストリーム ID 走査用バッファ（F-157）。コネクションごとに
     // 1 本持ち回して毎イテレーションのヒープ確保を避ける。
     let mut stream_ids: Vec<u32> = Vec::new();
+    // B-274・B-276: 要求の受信（本文・ヘッダの続き）が止まったストリームを打ち切る見回り。待つときだけ
+    // 1 秒のタイマーを 1 本張って使い回す（I/O・要求ごとにタイマーを張らない）。
+    let mut recv_sweep = std::pin::pin!(None::<crate::runtime::time::Sleep>);
+    let mut stalled: Vec<u32> = Vec::new();
 
     loop {
         // 1. 各ストリームのレスポンスを送出（HPACK エンコードは送信順にここでのみ行う）。
@@ -413,8 +417,9 @@ where
         } else if processed_any {
             // 進捗ありだが追加入力はまだ。drive へ戻る（fill しない）。
             continue;
-        } else if streams.is_empty() && !conn.has_partial_frame() {
-            // 処理中のストリームも分割フレームの続きも無い＝次の要求を待っているだけ。
+        } else if streams.is_empty() && !conn.has_partial_frame() && conn.has_no_streams() {
+            // 処理中のストリームも分割フレームの続きも無い＝次の要求を待っているだけ（本文を溜めている
+            // 途中のストリームがあればここに来ない。B-274）。
             // アイドルタイムアウト（B-119: 以前は無期限に待っていた）と graceful shutdown
             // （F-187: `expire_idle_timeouts` で即座に満了）で GOAWAY を送って閉じる。
             match timeout_idle(
@@ -433,7 +438,24 @@ where
             }
         } else {
             // 処理中のストリームがある: 可読 or notify を待つ。可読なら fill する。
-            h2_select_readable_or_notify(conn.raw_fd(), &notify).await
+            if recv_sweep.is_none() {
+                recv_sweep.set(Some(crate::runtime::time::sleep(H2_RECV_SWEEP_INTERVAL)));
+            }
+            match h2_select_readable_notify_or_sweep(
+                conn.raw_fd(),
+                &notify,
+                recv_sweep.as_mut().as_pin_mut(),
+            )
+            .await
+            {
+                H2Wake::Readable => true,
+                H2Wake::Notify => false,
+                H2Wake::Sweep => {
+                    recv_sweep.set(None);
+                    h2_reset_stalled_streams(conn, &mut streams, &mut stalled).await?;
+                    continue;
+                }
+            }
         };
 
         if need_fill {
@@ -548,6 +570,8 @@ pub(super) struct H2ActiveStream {
     end_with_pending: bool,
     /// 最後の断片かを見るために先読みしたメッセージ（次の周回で最初に処理する）。
     peeked: Option<H2RespMsg>,
+    /// HEAD の要求（HEADERS に END_STREAM を付け、本文は送らない。どの経路の応答でも。B-266）。
+    head_req: bool,
 }
 
 /// per-stream リクエストタスクのスポーナ型（F-46: 型付きタスクプールで Box 確保を回避）。
@@ -650,7 +674,11 @@ pub(super) fn h2_spawn_for_request<S, V>(
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
     let plan = if body_pending && redirect_https.is_none() {
-        svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr)
+        let plan = svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr);
+        if plan.body_timeout_secs > 0 {
+            conn.set_stream_recv_timeout(stream_id, plan.body_timeout_secs);
+        }
+        plan.streaming
     } else {
         None
     };
@@ -683,6 +711,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
         connection_metric.set_host("unknown");
     }
 
+    let head_req = parts.method.as_ref() == b"HEAD";
     let ctx = H2RequestCtx {
         method: parts.method,
         path: parts.path,
@@ -736,6 +765,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
             pending_body: None,
             end_with_pending: false,
             peeked: None,
+            head_req,
         },
     );
 }
@@ -767,6 +797,93 @@ pub(super) async fn h2_select_readable_or_notify(
         Poll::Pending
     })
     .await
+}
+
+/// 要求の受信が止まったストリームを見回る間隔（B-274・B-276。打ち切りの秒数はこの粒度）。
+#[cfg(feature = "http2")]
+const H2_RECV_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`h2_select_readable_notify_or_sweep`] の起床理由。
+#[cfg(feature = "http2")]
+pub(super) enum H2Wake {
+    Readable,
+    Notify,
+    Sweep,
+}
+
+/// [`h2_select_readable_or_notify`] に、受信の見回りのタイマー（`sweep`）を足したもの。
+#[cfg(feature = "http2")]
+pub(super) async fn h2_select_readable_notify_or_sweep(
+    fd: RawFd,
+    notify: &crate::stream_channel::Notify,
+    mut sweep: Option<std::pin::Pin<&mut crate::runtime::time::Sleep>>,
+) -> H2Wake {
+    use std::future::poll_fn;
+    use std::future::Future;
+    use std::task::Poll;
+
+    let readable = crate::runtime::tcp::wait_readable_fd(fd);
+    let wait = notify.wait();
+    let mut readable = std::pin::pin!(readable);
+    let mut wait = std::pin::pin!(wait);
+    poll_fn(move |cx| {
+        if readable.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(H2Wake::Readable);
+        }
+        if wait.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(H2Wake::Notify);
+        }
+        if let Some(s) = sweep.as_mut() {
+            if s.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(H2Wake::Sweep);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// 要求の受信が止まったストリームを RST_STREAM(CANCEL) で打ち切る（B-274・B-276）。
+///
+/// 応答を送り始めたストリーム（gRPC の双方向等。要求の続きを待つのはアプリケーションの都合）と、
+/// こちらが本文を上流へ渡し切れずに受信を止めている（バックプレッシャ）ストリームは打ち切らない。
+/// 打ち切ったストリーミングの要求は送信端を `finish` せずに捨てるので、上流へは途中で切れた本文として
+/// 伝わる（B-277）。
+#[cfg(feature = "http2")]
+async fn h2_reset_stalled_streams<S>(
+    conn: &mut http2::Http2Connection<S>,
+    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+    stalled: &mut Vec<u32>,
+) -> Result<(), http2::Http2Error>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    stalled.clear();
+    conn.collect_stalled_receiving_streams(stalled);
+    if stalled.is_empty() {
+        return Ok(());
+    }
+    // send_rst_stream は write_all（write_buf が空の前提）
+    conn.flush_write_buf().await?;
+    for &id in stalled.iter() {
+        if let Some(st) = streams.get(&id) {
+            if st.head_sent || (st.req_streaming && !st.req_pending.is_empty()) {
+                conn.touch_stream(id);
+                continue;
+            }
+        }
+        debug!("[HTTP/2] Request body stalled on stream {}; resetting", id);
+        conn.send_rst_stream(id, http2::Http2ErrorCode::Cancel)
+            .await?;
+        if let Some(st) = streams.remove(&id) {
+            if st.req_streaming {
+                // 未転送分のクレジットが conn レベルに残らないよう補充する
+                conn.replenish_recv_window(id);
+                conn.flush_write_buf().await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 全ストリームのレスポンスを 1 回駆動する（F-116）。
@@ -902,11 +1019,20 @@ where
                     // 直接受け付けるようジェネリクス化済みのため、`headers: Vec<(Vec<u8>, Vec<u8>)>`
                     // を `&[u8]` へ変換する中間 `Vec<(&[u8], &[u8])>` の `collect()`
                     // （1 レスポンスにつき 1 回のヒープ確保）が不要になった。
+                    // HEAD は本文を送らない（RFC 9110 §9.3.2）。応答の作り手（静的配信・エラー・固定応答・
+                    // プロキシ等）に関わらずここで HEADERS に END_STREAM を付けて終える（B-266）。
+                    // 1xx（情報応答）の後には本当の応答が続くので終えない。
+                    let end_stream = end_stream || (st.head_req && status >= 200);
                     conn.send_headers_buffered_end(sid, status, &headers, end_stream)
                         .await?;
                     st.head_sent = true;
                     if end_stream {
                         st.end_sent = true;
+                        if st.head_req {
+                            // 残りの断片（本文）は読まずに捨てる（送り手はチャネルが閉じて止まる）
+                            done.push(sid);
+                            break;
+                        }
                     }
                 }
                 H2RespMsg::Body(bytes) => {
@@ -1007,16 +1133,37 @@ where
 /// 上流 use_h2c 以外 + セキュリティ許可 + サーバー選択成功。conn は借用のみ（変更しない）。
 /// 適格なら `Some(max_request_body)`（0 = 無制限）を返す。
 #[cfg(feature = "http2")]
+/// [`H2Service::streaming_plan`] の結果。
+#[cfg(feature = "http2")]
+#[derive(Clone, Copy)]
+pub(crate) struct H2StreamPlan {
+    /// `Some(上限)` なら本文をチャネルで流す（0 は上限なし）。`None` は溜めてから処理する。
+    pub(crate) streaming: Option<u64>,
+    /// 本文の受信が止まったら打ち切るまでの秒数（ルートの `client_body_timeout_secs`。0 = 接続の既定。B-274）。
+    pub(crate) body_timeout_secs: u64,
+}
+
+#[cfg(feature = "http2")]
+impl H2StreamPlan {
+    /// 溜めてから処理し、受信の打ち切りは接続の既定（`[http2] stream_idle_timeout_secs`）。
+    pub(crate) const BUFFERED: Self = Self {
+        streaming: None,
+        body_timeout_secs: 0,
+    };
+}
+
 pub(super) fn h2_route_streaming_plan<S>(
     conn: &http2::Http2Connection<S>,
     stream_id: u32,
     client_ip: &str,
     client_socket_addr: SocketAddr,
-) -> Option<u64>
+) -> H2StreamPlan
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    let stream = conn.get_stream(stream_id)?;
+    let Some(stream) = conn.get_stream(stream_id) else {
+        return H2StreamPlan::BUFFERED;
+    };
     let method = stream
         .method()
         .map(|m| m.to_vec())
@@ -1062,11 +1209,21 @@ where
         false,
     );
 
-    let (_prefix, backend, _rc) = backend_result?;
+    let Some((_prefix, backend, _rc)) = backend_result else {
+        return H2StreamPlan::BUFFERED;
+    };
+    // B-274: 本文の受信が止まったら打ち切る秒数（ルートの設定。ストリーミングかどうかによらない）
+    let buffered = H2StreamPlan {
+        streaming: None,
+        body_timeout_secs: backend.security().client_body_timeout_secs,
+    };
     // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
     #[cfg(feature = "handler")]
     if let Backend::Handler(entry, _, _, _) = &backend {
-        return entry.streaming_request.then_some(0);
+        return H2StreamPlan {
+            streaming: entry.streaming_request.then_some(0),
+            ..buffered
+        };
     }
     let (upstream_group, security, buffering) = match &backend {
         Backend::Proxy(ug, sec, _comp, buf, _cache, modules) => {
@@ -1074,11 +1231,11 @@ where
                 .as_ref()
                 .is_some_and(|m: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>| !m.is_empty())
             {
-                return None;
+                return buffered;
             }
             (ug.clone(), sec.clone(), buf.clone())
         }
-        _ => return None,
+        _ => return buffered,
     };
 
     let is_grpc = h2_headers_store.iter().any(|(name, value)| {
@@ -1090,20 +1247,25 @@ where
     });
     // gRPC は buffering = full をバイパスする（F-97）。
     if buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc {
-        return None;
+        return buffered;
     }
     if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
-        return None;
+        return buffered;
     }
-    let server = upstream_group.select(client_ip)?;
+    let Some(server) = upstream_group.select(client_ip) else {
+        return buffered;
+    };
     // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する。gRPC を HTTP/1.1
     // 上流へ送る構成は従来どおりバッファ経路（トレーラーを HTTP/1.1 で受けられない）。
     let h2_upstream =
         server.target.use_h2c || upstream_group.use_h2c() || server.target.h2_over_tls();
     if is_grpc && !h2_upstream {
-        return None;
+        return buffered;
     }
-    Some(security.max_request_body_size as u64)
+    H2StreamPlan {
+        streaming: Some(security.max_request_body_size as u64),
+        ..buffered
+    }
 }
 
 /// クライアント IP 文字列を `SocketAddr` に変換する（ルーティング入力）。
@@ -1193,6 +1355,37 @@ pub(super) fn h2_base_headers(add_alt_svc: bool) -> Vec<(Bytes, Bytes)> {
     headers
 }
 
+/// 固定応答（`type = "Respond"` 等）の HTTP/2 の応答ヘッダ（`server`・HTTP/3 の広告 + ルートのヘッダ。
+/// ルートの応答ヘッダの方針はロード時にかけてある。B-267・B-271）
+#[cfg(feature = "http2")]
+fn h2_fixed_headers(r: &crate::route_traffic::FixedResponse) -> Vec<(Bytes, Bytes)> {
+    let mut headers = h2_base_headers(!r.drop_alt_svc);
+    if r.drop_server {
+        headers.retain(|(n, _)| n.as_ref() != b"server");
+    }
+    headers.extend(r.headers.iter().cloned());
+    headers
+}
+
+/// 上流の応答のヘッダの仕上げ: `remove_response_headers`・`add_response_headers`（B-267）→ Wasm の
+/// `on_http_response_headers`（B-268）→ CORS（F-273）。HTTP/1.1 の `render_response_head` と同じ順。
+/// 方針・モジュール・CORS の無いルートは分岐だけ。
+#[cfg(feature = "http2")]
+pub(super) async fn h2_finish_upstream_headers(
+    mut headers: Vec<(Bytes, Bytes)>,
+    status: u16,
+    security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
+) -> Vec<(Bytes, Bytes)> {
+    security.apply_response_headers(&mut headers);
+    #[cfg(feature = "wasm")]
+    let mut headers = apply_h2_wasm_response_headers(wasm_modules, status, headers).await;
+    #[cfg(not(feature = "wasm"))]
+    let _ = status;
+    crate::route_cors::apply_bytes(&mut headers, security);
+    headers
+}
+
 /// 完結した（頭+本体一括の）レスポンスをメッセージ化して送る。戻り値 `(status, body_len)`。
 #[cfg(feature = "http2")]
 pub(super) async fn h2_emit_full(
@@ -1222,6 +1415,32 @@ pub(super) async fn h2_emit_full(
         let _ = h2_send(resp_tx, notify, H2RespMsg::Body(body)).await;
     }
     (status, len)
+}
+
+/// Wasm のモジュールのローカル応答（`send_local_response`）を返す（F-285 の応答本文のフェーズ）。
+/// HEAD・204・304 の本文は drive のループが落とす（B-266）。
+#[cfg(feature = "wasm")]
+async fn h2_emit_wasm_local_response(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    local: crate::wasm::LocalResponse,
+) -> (u16, u64) {
+    let mut headers: Vec<(Bytes, Bytes)> = local
+        .headers
+        .into_iter()
+        .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
+        .collect();
+    for (n, v) in h2_base_headers(false) {
+        headers.push((n, v));
+    }
+    h2_emit_full(
+        resp_tx,
+        notify,
+        local.status_code,
+        headers,
+        Bytes::from(local.body),
+    )
+    .await
 }
 
 /// 要求本文の残りを読み捨てる。戻り値は読み捨てたバイト数。
@@ -1621,10 +1840,17 @@ pub(super) async fn h2_dispatch(
         .unwrap_or(AcceptedEncoding::Identity);
 
     let result = match backend {
-        Backend::Proxy(upstream_group, security, compression, _buffering, _cache, _) => {
+        Backend::Proxy(upstream_group, security, compression, buffering, _cache, _) => {
+            // `buffering = "full"` の経路（gRPC は使わない。F-97）を数える（HTTP/1.1 と同じ。B-273）
+            let buffering_full = buffering.mode == crate::buffering::BufferingMode::Full
+                && !ctx
+                    .headers
+                    .iter()
+                    .any(|h| header_pair_is_grpc(&h.name, &h.value));
             h2_proxy(
                 ctx,
                 &upstream_group,
+                buffering_full,
                 &compression,
                 client_encoding,
                 &prefix,
@@ -1647,23 +1873,29 @@ pub(super) async fn h2_dispatch(
             if !remainder.trim_matches('/').is_empty() {
                 h2_emit_error(resp_tx, notify, 404, b"Not Found").await
             } else {
-                let (built_headers, response_body) = build_h2_compressed_file_response(
-                    Bytes::from_owner(ArcVecBytes(data)),
+                let sreq = crate::static_response::StaticRequest::from_headers(
+                    &ctx.method,
+                    ctx.headers
+                        .iter()
+                        .map(|h| (h.name.as_ref(), h.value.as_ref())),
+                );
+                let (status, built_headers, response_body) = build_h2_static_response(
+                    &sreq,
+                    data.body.clone(),
                     mime_type.as_ref(),
+                    &data.validators,
                     &security,
                     &route_compression,
-                    client_encoding,
-                    // MemoryFile はファイルシステムパスを持たない（config 由来の
-                    // インメモリ内容）ため、圧縮結果キャッシュのキーが作れない。
                     None,
+                    Some(&data),
                 );
                 #[cfg(feature = "wasm")]
                 let header_store =
-                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, 200, built_headers)
+                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, status, built_headers)
                         .await;
                 #[cfg(not(feature = "wasm"))]
                 let header_store = built_headers;
-                h2_emit_full(resp_tx, notify, 200, header_store, response_body).await
+                h2_emit_full(resp_tx, notify, status, header_store, response_body).await
             }
         }
         Backend::SendFile(
@@ -1685,7 +1917,6 @@ pub(super) async fn h2_dispatch(
                 &prefix,
                 &security,
                 &route_compression,
-                client_encoding,
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 static_file_cache_config.as_deref(),
@@ -1697,10 +1928,15 @@ pub(super) async fn h2_dispatch(
             .await
         }
         Backend::Respond(r) => {
-            // 固定応答（F-219）
-            let mut headers = h2_base_headers(false);
-            headers.extend(r.headers.iter().cloned());
-            h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await
+            // 固定応答（F-219）。HTTP/3 の広告も付ける（HTTP/1.1 の固定応答と同じ。B-271）
+            h2_emit_full(
+                resp_tx,
+                notify,
+                r.status,
+                h2_fixed_headers(&r),
+                r.body.clone(),
+            )
+            .await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _, security) => {
             h2_redirect(
@@ -1913,6 +2149,7 @@ pub(super) async fn h2_api_respond(
 pub(super) async fn h2_proxy(
     ctx: &H2RequestCtx,
     upstream_group: &Arc<UpstreamGroup>,
+    buffering_full: bool,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     prefix: &[u8],
@@ -1962,6 +2199,19 @@ pub(super) async fn h2_proxy(
         None => return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await,
     };
     server.acquire();
+    if buffering_full {
+        crate::metrics::record_buffering_used(&server.target.host);
+    }
+    // F-06・B-272: サーキットブレーカー・外れ値の排除へ結果を記録する（HTTP/1.1 と同じ。開始は粗い時計）
+    let resilience_start = crate::runtime::time::coarse_now();
+    let finish = |result: (u16, u64)| {
+        server.release();
+        // 0 はクライアントの切断（上流の成否ではない）
+        if result.0 != 0 {
+            upstream_group.record_request(server, resilience_start, result.0 < 500);
+        }
+        result
+    };
     let target = &server.target;
 
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -1984,14 +2234,15 @@ pub(super) async fn h2_proxy(
             method,
             final_path.as_bytes(),
             security,
+            compression,
+            client_encoding,
             #[cfg(feature = "wasm")]
             wasm_modules,
             resp_tx,
             notify,
         )
         .await;
-        server.release();
-        return result;
+        return finish(result);
     }
 
     // F-175: HTTPS 上流は ALPN で HTTP/2 を試す（多重化接続）。上流が HTTP/1.1 を選べば
@@ -2038,6 +2289,7 @@ pub(super) async fn h2_proxy(
                 let result = h2_emit_upstream_response(
                     final_path.as_bytes(),
                     target,
+                    ctx.start,
                     resp,
                     Some((compression, client_encoding)),
                     security,
@@ -2047,8 +2299,7 @@ pub(super) async fn h2_proxy(
                     notify,
                 )
                 .await;
-                server.release();
-                return result;
+                return finish(result);
             }
             Ok(http2::upstream_mux::HttpsBuffered::Http1(conn)) => {
                 if let Some(conn) = conn {
@@ -2063,13 +2314,12 @@ pub(super) async fn h2_proxy(
                 }
             }
             Err(status) => {
-                server.release();
                 let msg: &[u8] = if status == 504 {
                     b"Gateway Timeout"
                 } else {
                     b"Bad Gateway"
                 };
-                return h2_emit_error(resp_tx, notify, status, msg).await;
+                return finish(h2_emit_error(resp_tx, notify, status, msg).await);
             }
         }
     }
@@ -2123,6 +2373,8 @@ pub(super) async fn h2_proxy(
             client_encoding,
             security,
             upstream_group.tls_profile(),
+            #[cfg(feature = "wasm")]
+            wasm_modules,
             resp_tx,
             notify,
         )
@@ -2135,13 +2387,14 @@ pub(super) async fn h2_proxy(
             compression,
             client_encoding,
             security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
             resp_tx,
             notify,
         )
         .await
     };
-    server.release();
-    result
+    finish(result)
 }
 
 /// バックエンド接続の EADDRNOTAVAIL 一時的失敗を指数バックオフでリトライして吸収する（B-44 第2段）。
@@ -2364,6 +2617,7 @@ pub(super) async fn h2_proxy_http(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2419,6 +2673,7 @@ pub(super) async fn h2_proxy_http(
         request = returned_request;
         if write_res.is_err() {
             if retry {
+                crate::metrics::record_retry(addr, "stale_connection");
                 continue;
             }
             request_buf_put(request);
@@ -2430,6 +2685,8 @@ pub(super) async fn h2_proxy_http(
             compression,
             client_encoding,
             security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
             resp_tx,
             notify,
             retry,
@@ -2437,6 +2694,7 @@ pub(super) async fn h2_proxy_http(
         )
         .await;
         if status == 0 && retry {
+            crate::metrics::record_retry(addr, "stale_connection");
             continue;
         }
         request_buf_put(request);
@@ -2468,6 +2726,7 @@ pub(super) async fn h2_proxy_https(
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
     tls_profile: crate::upstream_tls::TlsProfile,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2544,6 +2803,7 @@ pub(super) async fn h2_proxy_https(
         request = returned_request;
         if write_res.is_err() {
             if retry {
+                crate::metrics::record_retry(addr, "stale_connection");
                 continue;
             }
             request_buf_put(request);
@@ -2555,6 +2815,8 @@ pub(super) async fn h2_proxy_https(
             compression,
             client_encoding,
             security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
             resp_tx,
             notify,
             retry,
@@ -2562,6 +2824,7 @@ pub(super) async fn h2_proxy_https(
         )
         .await;
         if status == 0 && retry {
+            crate::metrics::record_retry(addr, "stale_connection");
             continue;
         }
         request_buf_put(request);
@@ -2591,6 +2854,8 @@ pub(super) async fn h2_proxy_h2c(
     method: &[u8],
     path: &[u8],
     security: &SecurityConfig,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -2644,11 +2909,13 @@ pub(super) async fn h2_proxy_h2c(
             return h2_emit_error(resp_tx, notify, status, msg).await;
         }
     };
+    // B-270: h2c の上流の応答も HTTP/1.1・TLS の h2 の上流と同じく圧縮する
     h2_emit_upstream_response(
         path,
         target,
+        ctx.start,
         h2c_resp,
-        None,
+        Some((compression, client_encoding)),
         security,
         #[cfg(feature = "wasm")]
         wasm_modules,
@@ -2667,6 +2934,7 @@ pub(super) async fn h2_proxy_h2c(
 pub(super) async fn h2_emit_upstream_response(
     path: &[u8],
     target: &ProxyTarget,
+    started: Instant,
     h2c_resp: http2::upstream_mux::H2cResponse,
     compress: Option<(&CompressionConfig, AcceptedEncoding)>,
     security: &SecurityConfig,
@@ -2674,17 +2942,34 @@ pub(super) async fn h2_emit_upstream_response(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    // path / target は gRPC メトリクスにだけ使う。
+    // path / target / started は gRPC メトリクスにだけ使う。
     #[cfg(not(feature = "grpc"))]
-    let _ = (path, target);
+    let _ = (path, target, started);
     let mut h2c_resp = h2c_resp;
     // F-166(B-2)/F-165(A3/A4): バックエンド応答の `Bytes` ヘッダをそのままムーブする
     // （従来の `(k.clone(), v.clone())` ディープコピーを排除）。
     let mut header_store: Vec<(Bytes, Bytes)> = std::mem::take(&mut h2c_resp.headers);
+    // F-285: Wasm の応答本文のフェーズ（受けるモジュールのあるルートだけ。圧縮の前。gRPC は対象外）
     #[cfg(feature = "wasm")]
+    if !matches!(h2c_resp.status, 100..=199 | 204 | 304)
+        && super::compress::wasm_wants_response_body(wasm_modules)
+        && !header_store.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case(b"content-type") && v.starts_with(b"application/grpc")
+        })
     {
-        header_store =
-            apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store).await;
+        let body = std::mem::take(&mut h2c_resp.body);
+        match super::compress::wasm_filter_response_body(wasm_modules, body).await {
+            Ok(b) => {
+                header_store.retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-length"));
+                let mut len = itoa::Buffer::new();
+                header_store.push((
+                    Bytes::from_static(b"content-length"),
+                    Bytes::copy_from_slice(len.format(b.len()).as_bytes()),
+                ));
+                h2c_resp.body = b;
+            }
+            Err(local) => return h2_emit_wasm_local_response(resp_tx, notify, local).await,
+        }
     }
     if let Some((compression, client_encoding)) = compress {
         let header = |name: &[u8]| {
@@ -2726,8 +3011,14 @@ pub(super) async fn h2_emit_upstream_response(
     for (n, v) in h2_base_headers(true) {
         header_store.push((n, v));
     }
-    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-    crate::route_cors::apply_bytes(&mut header_store, security);
+    let header_store = h2_finish_upstream_headers(
+        header_store,
+        h2c_resp.status,
+        security,
+        #[cfg(feature = "wasm")]
+        wasm_modules,
+    )
+    .await;
 
     let has_body = !h2c_resp.body.is_empty();
     let has_trailers = !h2c_resp.trailers.is_empty();
@@ -2778,7 +3069,7 @@ pub(super) async fn h2_emit_upstream_response(
             let grpc_method = std::str::from_utf8(path).unwrap_or("");
             let mut status_buf = itoa::Buffer::new();
             let status_str = status_buf.format(grpc_status);
-            crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
+            crate::metrics::record_grpc_completion(grpc_method, status_str, &target.host, started);
             let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
         }
         #[cfg(not(feature = "grpc"))]
@@ -2804,6 +3095,7 @@ pub(super) async fn h2_relay_backend_response<B>(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     retry_on_empty: bool,
@@ -2967,6 +3259,12 @@ where
     }
     // B-245: HEAD・1xx・204・304 は本文を持たない。B-246: TE は CL より優先
     let kind = parsed.body(is_head);
+    // F-285: Wasm の応答本文のフェーズを受けるモジュールがあれば、本文を全部溜める下の経路を通す
+    #[cfg(feature = "wasm")]
+    let wasm_body =
+        kind != ResponseBody::None && super::compress::wasm_wants_response_body(wasm_modules);
+    #[cfg(not(feature = "wasm"))]
+    let wasm_body = false;
 
     {
         let status = parsed.status_code;
@@ -3000,10 +3298,14 @@ where
         };
 
         // 非圧縮 + CL 既知（本文の無い応答は 0）→ 逐次ストリーミング。
-        if stream_compress_hint.is_none() {
+        if stream_compress_hint.is_none() && !wasm_body {
+            // B-281: 長さ不明（上流が閉じるまで）の応答も溜めずに逐次送る（SSE 等が届かない・
+            // 本文の大きさだけメモリを使うのを防ぐ）。`usize::MAX` は「閉じるまで」の印。
+            let until_close = kind == ResponseBody::UntilClose;
             let content_len = match kind {
                 ResponseBody::None => Some(0),
                 ResponseBody::Length(cl) => Some(cl),
+                ResponseBody::UntilClose => Some(usize::MAX),
                 _ => None,
             };
             if let Some(content_len) = content_len {
@@ -3029,8 +3331,14 @@ where
                 // ヘッダー抽出（上のループ）が済んだ時点で `data`（= `response_buf`/
                 // `body` の借用元）はもう参照されないため、ここで `Bytes` へ消費
                 // 変換してゼロコピーでボディを渡す（F-165 R4）。
-                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-                crate::route_cors::apply_bytes(&mut headers, security);
+                let headers = h2_finish_upstream_headers(
+                    headers,
+                    status,
+                    security,
+                    #[cfg(feature = "wasm")]
+                    wasm_modules,
+                )
+                .await;
                 let initial_body = data.into_body_bytes(body_start);
                 let (sent, ok) = h2_stream_body_cl(
                     resp_tx,
@@ -3040,16 +3348,20 @@ where
                     backend,
                     initial_body,
                     content_len,
+                    until_close,
                 )
                 .await;
-                let reusable =
-                    ok && sent == content_len as u64 && !extra && !parsed.is_connection_close;
+                let reusable = ok
+                    && !until_close
+                    && sent == content_len as u64
+                    && !extra
+                    && !parsed.is_connection_close;
                 return (status, sent, reusable);
             }
         }
 
         // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
-        if stream_compress_hint.is_none() && kind == ResponseBody::Chunked {
+        if stream_compress_hint.is_none() && !wasm_body && kind == ResponseBody::Chunked {
             let mut headers = h2_base_headers(true);
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
@@ -3069,8 +3381,14 @@ where
                 ));
             }
             // 同上（F-165 R4）: ヘッダー抽出後に `data` を `Bytes` へ消費変換する。
-            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
-            crate::route_cors::apply_bytes(&mut headers, security);
+            let headers = h2_finish_upstream_headers(
+                headers,
+                status,
+                security,
+                #[cfg(feature = "wasm")]
+                wasm_modules,
+            )
+            .await;
             let initial_body = data.into_body_bytes(body_start);
             let sent =
                 h2_stream_body_chunked(resp_tx, notify, status, headers, backend, initial_body)
@@ -3088,6 +3406,21 @@ where
         let backend_reusable = !extra
             && !parsed.is_connection_close
             && matches!(kind, ResponseBody::Length(_) | ResponseBody::Chunked);
+        // F-285: 溜めた本文へ Wasm の応答本文のフェーズをかける（圧縮の前）
+        #[cfg(feature = "wasm")]
+        let final_body = if wasm_body {
+            match super::compress::wasm_filter_response_body(wasm_modules, Bytes::from(final_body))
+                .await
+            {
+                Ok(b) => b.to_vec(),
+                Err(local) => {
+                    let (s, sz) = h2_emit_wasm_local_response(resp_tx, notify, local).await;
+                    return (s, sz, backend_reusable);
+                }
+            }
+        } else {
+            final_body
+        };
 
         let should_compress = compression.should_compress(
             client_encoding,
@@ -3133,6 +3466,10 @@ where
             {
                 continue;
             }
+            // F-285: 書き換えた本文の長さは下で付け直す
+            if wasm_body && header.name.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
             // 応答ヘッダはパース元バッファ（プールへ返却される）を参照しているため、
             // `Bytes::copy_from_slice` による 1 回のコピーが必要（従来の `to_vec()` と同等）。
             headers.push((
@@ -3146,8 +3483,21 @@ where
         } else {
             final_body
         };
-        // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
-        crate::route_cors::apply_bytes(&mut headers, security);
+        if wasm_body && should_compress.is_none() {
+            let mut len = itoa::Buffer::new();
+            headers.push((
+                Bytes::from_static(b"content-length"),
+                Bytes::copy_from_slice(len.format(response_body.len()).as_bytes()),
+            ));
+        }
+        let headers = h2_finish_upstream_headers(
+            headers,
+            status,
+            security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
+        )
+        .await;
         let (status2, sent) =
             h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
         (
@@ -3169,6 +3519,7 @@ pub(super) async fn h2_stream_body_cl<B>(
     backend: &mut B,
     initial_body: Bytes,
     content_length: usize,
+    until_close: bool,
 ) -> (u64, bool)
 where
     B: crate::runtime::io::AsyncReadRent + Unpin,
@@ -3222,9 +3573,22 @@ where
             }
         };
         let n = match res {
-            Ok(0) => {
-                // content-length 未達でバックエンド切断: 空 END_STREAM で閉じる（graceful）。
+            Ok(0) if until_close => {
+                // 閉じるまでの本文: 区切りどおりに閉じたら完了。TLS で close_notify の無い切断は
+                // 切り詰めなので完結に見せずリセットする（F-282）
                 body_buf_put(returned_buf);
+                let sent = (content_length - remaining) as u64;
+                if backend.eof_was_clean() {
+                    return (sent, true);
+                }
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
+                return (sent, false);
+            }
+            Ok(0) => {
+                // content-length 未達でバックエンド切断: 切り詰めを完結した応答に見せないよう
+                // END_STREAM ではなくリセットで打ち切る（HTTP/3 と同じ。B-282）
+                body_buf_put(returned_buf);
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
                 return ((content_length - remaining) as u64, false);
             }
             Ok(n) => n,
@@ -3307,8 +3671,9 @@ where
         };
         let n = match res {
             Ok(0) => {
-                // 終端チャンク前に切断: 空 END_STREAM で閉じる（graceful）。
+                // 終端チャンク前に切断: 切り詰めなのでリセットで打ち切る（B-282）
                 body_buf_put(returned_buf);
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
                 return sent;
             }
             Ok(n) => n,
@@ -3388,7 +3753,6 @@ pub(super) async fn h2_sendfile(
     prefix: &[u8],
     security: &SecurityConfig,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     canonical_base: Option<&Path>,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
@@ -3458,8 +3822,10 @@ pub(super) async fn h2_sendfile(
     // ルートで index ファイルへフォールバックした場合は index 側のパス）を
     // `full_path` の所有権をそのまま流用して求める（参照渡しの検索は既に完了して
     // いるため `full_path` 自体はこの後不要 = 追加のクローンなしで済む）。
-    let (mime_type, data, served_path) = match first_result {
-        Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data, full_path),
+    let (mime_type, validators, data, served_path) = match first_result {
+        Some(cache::StaticFileOutcome::File(info, data)) => {
+            (info.mime_type, info.validators, data, full_path)
+        }
         Some(cache::StaticFileOutcome::Forbidden) => {
             return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
         }
@@ -3478,7 +3844,7 @@ pub(super) async fn h2_sendfile(
             .await
             {
                 Some(cache::StaticFileOutcome::File(info, data)) => {
-                    (info.mime_type, data, index_path)
+                    (info.mime_type, info.validators, data, index_path)
                 }
                 Some(cache::StaticFileOutcome::Forbidden) | None => {
                     return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
@@ -3498,19 +3864,27 @@ pub(super) async fn h2_sendfile(
         }
     };
 
-    let (built_headers, response_body) = build_h2_compressed_file_response(
+    let sreq = crate::static_response::StaticRequest::from_headers(
+        &ctx.method,
+        ctx.headers
+            .iter()
+            .map(|h| (h.name.as_ref(), h.value.as_ref())),
+    );
+    let (status, built_headers, response_body) = build_h2_static_response(
+        &sreq,
         data,
         &mime_type,
+        &validators,
         security,
         compression,
-        client_encoding,
         Some((served_path.as_path(), &content_cfg)),
+        None,
     );
     #[cfg(feature = "wasm")]
-    let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
+    let header_store = apply_h2_wasm_response_headers(wasm_modules, status, built_headers).await;
     #[cfg(not(feature = "wasm"))]
     let header_store = built_headers;
-    h2_emit_full(resp_tx, notify, 200, header_store, response_body).await
+    h2_emit_full(resp_tx, notify, status, header_store, response_body).await
 }
 
 /// リダイレクトレスポンスをメッセージ化する（F-116）。
@@ -3593,11 +3967,22 @@ pub(super) async fn h2_relay_h2_streaming(
     tls_profile: crate::upstream_tls::TlsProfile,
     prefix: &[u8],
     security: &SecurityConfig,
+    compression: &CompressionConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> H2Relay {
     use crate::http2::upstream_mux::{HttpsOpen, UpResp};
     let method = &ctx.method[..];
+    // B-270: 圧縮する応答だけ本文を溜めて圧縮する（HTTP/3 の `h2_relay_compressed` と同じ）。gRPC・HEAD は中継のまま
+    let client_encoding = if compression.enabled && method != b"HEAD" {
+        ctx.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
+            .map(|h| AcceptedEncoding::parse(&h.value))
+            .unwrap_or(AcceptedEncoding::Identity)
+    } else {
+        AcceptedEncoding::Identity
+    };
     let is_grpc = ctx
         .headers
         .iter()
@@ -3668,13 +4053,11 @@ pub(super) async fn h2_relay_h2_streaming(
     let req_tx = stream.req_tx.take();
     let initial = ctx.body.clone();
     let upload = async {
-        let Some(tx) = req_tx else {
-            return;
-        };
+        let tx = req_tx?;
         if !initial.is_empty() {
             req_size.set(initial.len() as u64);
             if tx.send(initial).await.is_err() {
-                return;
+                return None;
             }
         }
         while let Some(chunk) = req_rx.recv().await {
@@ -3682,17 +4065,25 @@ pub(super) async fn h2_relay_h2_streaming(
             if tx.send(chunk).await.is_err() {
                 // 上流がストリームを閉じた（早期応答・リセット）。下流の残りは捨てる。
                 h2_drain_req(req_rx, notify).await;
-                return;
+                return None;
             }
             notify.notify();
         }
+        // B-277: END_STREAM の前に切れた本文。送信端を返して生かしておき（drop すると END_STREAM になり
+        // 切り詰めた本文が完結して見える）、上流のストリームごと捨てて RST_STREAM(CANCEL) にする。
+        if req_rx.is_cut_off() {
+            return Some(tx);
+        }
         // tx の drop で END_STREAM。
+        None
     };
 
     let resp_rx = &stream.resp_rx;
     let download = async {
         let mut status = 0u16;
         let mut sent = 0u64;
+        // 圧縮のために溜めている応答（head を送る前。`status` は 0 のまま）
+        let mut pending: Option<(u16, Vec<(Bytes, Bytes)>, AcceptedEncoding, BytesMut)> = None;
         loop {
             let msg = match timeout(READ_TIMEOUT, resp_rx.recv()).await {
                 Ok(m) => m,
@@ -3707,6 +4098,10 @@ pub(super) async fn h2_relay_h2_streaming(
             };
             match msg {
                 None => {
+                    if let Some((s, headers, enc, body)) = pending.take() {
+                        let body = Bytes::from(compress_body_h2(&body, enc, compression));
+                        return h2_emit_full(resp_tx, notify, s, headers, body).await;
+                    }
                     if status == 0 {
                         return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                     }
@@ -3717,10 +4112,52 @@ pub(super) async fn h2_relay_h2_streaming(
                     status: s,
                     mut headers,
                 }) => {
-                    status = s;
+                    let header = |name: &[u8]| {
+                        headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.clone())
+                    };
+                    let encoding = if client_encoding == AcceptedEncoding::Identity
+                        || is_grpc
+                        || s == 204
+                        || s == 304
+                        || resp_rx.is_finished()
+                    {
+                        None
+                    } else {
+                        let content_type = header(b"content-type");
+                        let content_length = header(b"content-length")
+                            .and_then(|v| std::str::from_utf8(&v).ok()?.trim().parse().ok());
+                        compression.should_compress(
+                            client_encoding,
+                            content_type.as_deref(),
+                            content_length,
+                            header(b"content-encoding").as_deref(),
+                        )
+                    };
                     headers.extend(h2_base_headers(true));
+                    // `remove_response_headers`・`add_response_headers`（B-267）
+                    security.apply_response_headers(&mut headers);
                     // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
                     crate::route_cors::apply_bytes(&mut headers, security);
+                    if let Some(enc) = encoding {
+                        headers.retain(|(n, _)| {
+                            !n.eq_ignore_ascii_case(b"content-length")
+                                && !n.eq_ignore_ascii_case(b"content-encoding")
+                        });
+                        headers.push((
+                            Bytes::from_static(b"content-encoding"),
+                            Bytes::from_static(enc.as_header_value()),
+                        ));
+                        headers.push((
+                            Bytes::from_static(b"vary"),
+                            Bytes::from_static(b"Accept-Encoding"),
+                        ));
+                        pending = Some((s, headers, enc, BytesMut::new()));
+                        continue;
+                    }
+                    status = s;
                     // 上流が HEADERS で終わった（gRPC の trailers-only 応答など）なら、下流にも
                     // END_STREAM 付きの HEADERS 1 枚で返す（空 DATA で閉じ直さない）。
                     let end_stream = resp_rx.is_finished();
@@ -3734,6 +4171,14 @@ pub(super) async fn h2_relay_h2_streaming(
                     }
                 }
                 Some(UpResp::Data(b)) => {
+                    if let Some((_, _, _, buf)) = pending.as_mut() {
+                        // B-281: 溜める上限を超えたら打ち切る（HEADERS は未送出なので 502）
+                        if buf.len() + b.len() > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                            return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                        }
+                        buf.extend_from_slice(&b);
+                        continue;
+                    }
                     if status == 0 {
                         return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                     }
@@ -3743,6 +4188,11 @@ pub(super) async fn h2_relay_h2_streaming(
                     }
                 }
                 Some(UpResp::Trailers(trailers)) => {
+                    // 圧縮のために溜めている応答（gRPC 以外）の trailers は捨てる（HTTP/1.1 へ直すときと同じ）
+                    if pending.is_some() {
+                        drop(trailers);
+                        continue;
+                    }
                     #[cfg(feature = "grpc")]
                     {
                         if let Some(code) = trailers
@@ -3750,10 +4200,11 @@ pub(super) async fn h2_relay_h2_streaming(
                             .find(|(n, _)| n.as_ref() == b"grpc-status")
                             .and_then(|(_, v)| std::str::from_utf8(v).ok())
                         {
-                            crate::metrics::record_grpc_request(
+                            crate::metrics::record_grpc_completion(
                                 &final_path,
                                 code.trim(),
                                 &target.host,
+                                ctx.start,
                             );
                         }
                         let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
@@ -3778,7 +4229,13 @@ pub(super) async fn h2_relay_h2_streaming(
     loop {
         futures::select_biased! {
             (status, sent) = download => return H2Relay::Done((status, sent, req_size.get())),
-            _ = upload => {}
+            held = upload => {
+                if let Some(tx) = held {
+                    // 送信端と上流のストリームを同時に捨てる（アクターは応答の受け手が無いのを見て CANCEL を送る）
+                    drop(tx);
+                    return H2Relay::Done((0, 0, req_size.get()));
+                }
+            }
         }
     }
 }
@@ -3844,9 +4301,14 @@ pub(super) async fn h2_serve_streaming(
         // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
         Some((_prefix, Backend::Respond(r), _rc)) => {
             h2_drain_req(req_rx, notify).await;
-            let mut headers = h2_base_headers(false);
-            headers.extend(r.headers.iter().cloned());
-            let (s, sz) = h2_emit_full(resp_tx, notify, r.status, headers, r.body.clone()).await;
+            let (s, sz) = h2_emit_full(
+                resp_tx,
+                notify,
+                r.status,
+                h2_fixed_headers(&r),
+                r.body.clone(),
+            )
+            .await;
             return (s, sz, 0);
         }
         _ => {
@@ -3874,6 +4336,13 @@ pub(super) async fn h2_serve_streaming(
     // F-171 / F-175: 上流 HTTP/2（h2c、または ALPN で h2 を選んだ HTTPS 上流）は全二重で中継する。
     // HTTPS 上流が HTTP/1.1 を選んだら、ネゴシエーションに使った接続を下の HTTP/1.1 経路で使う。
     let mut preconnected: Option<Box<ClientTls>> = None;
+    // F-06・B-272: サーキットブレーカー・外れ値の排除へ結果を記録する（0 はクライアントの切断で数えない）
+    let resilience_start = crate::runtime::time::coarse_now();
+    let record = |status: u16| {
+        if status != 0 {
+            upstream_group.record_request(server, resilience_start, status < 500);
+        }
+    };
     if server.target.use_h2c || upstream_group.use_h2c() || server.target.h2_over_tls() {
         server.acquire();
         let relayed = h2_relay_h2_streaming(
@@ -3883,13 +4352,17 @@ pub(super) async fn h2_serve_streaming(
             upstream_group.tls_profile(),
             &prefix,
             &security,
+            &compression,
             resp_tx,
             notify,
         )
         .await;
         server.release();
         match relayed {
-            H2Relay::Done(r) => return r,
+            H2Relay::Done(r) => {
+                record(r.0);
+                return r;
+            }
             H2Relay::Http1(conn) => preconnected = conn,
         }
     }
@@ -3956,6 +4429,7 @@ pub(super) async fn h2_serve_streaming(
         )
         .await;
         server.release();
+        record(r.0);
         return r;
     }
 
@@ -3964,6 +4438,7 @@ pub(super) async fn h2_serve_streaming(
         Ok(Ok(s)) => s,
         _ => {
             server.release();
+            record(502);
             request_buf_put(request);
             h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
@@ -4013,6 +4488,7 @@ pub(super) async fn h2_serve_streaming(
     };
     let _ = &security;
     server.release();
+    record(status);
     (status, resp_size, req_size)
 }
 
@@ -4055,6 +4531,11 @@ where
         }
         notify.notify();
     }
+    // B-277: END_STREAM の前に切れた（RST_STREAM・本文の受信の打ち切り・切断）本文に終端チャンクを送ると、
+    // 切り詰めた本文が完結して見える（B-187 のハンドラと同じ）。終端を送らずに上流の接続ごと捨てる。
+    if req_rx.is_cut_off() {
+        return (0, 0, req_size);
+    }
     // 終端チャンク。
     if backend_write_all_bytes(backend, Bytes::from_static(b"0\r\n\r\n"))
         .await
@@ -4064,11 +4545,14 @@ where
         return (s, sz, req_size);
     }
 
+    // ストリーミングの経路は Wasm モジュールの無いルートだけ（`h2_route_streaming_plan`）
     let (status, sent, _reusable) = h2_relay_backend_response(
         backend,
         compression,
         client_encoding,
         security,
+        #[cfg(feature = "wasm")]
+        &super::h1::no_wasm_modules(),
         resp_tx,
         notify,
         false,

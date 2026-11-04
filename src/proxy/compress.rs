@@ -245,6 +245,9 @@ pub(super) async fn transfer_response_with_compression(
                     compression,
                     backend_wants_keep_alive,
                     security,
+                    status_code,
+                    #[cfg(feature = "wasm")]
+                    &wasm_modules,
                 )
                 .await
                 {
@@ -275,154 +278,16 @@ pub(super) async fn transfer_response_with_compression(
                     ctx.append_body(&body_start[..start.send]);
                 }
 
-                // ヘッダーを修正（security.add_response_headersを追加、remove_response_headersを削除）。
-                // WASM のフィルタが無ければ、1 本のバッファへ直接書く（以前はヘッダの行ごとに `format!` と
-                // `Vec` を作って連結していた。FreeBSD の h1_proxy_tls 3B のプロファイルで fmt・realloc が上位。v0.8.0）
-                #[cfg(feature = "wasm")]
-                let wasm_active = !wasm_modules.is_empty();
-                #[cfg(not(feature = "wasm"))]
-                let wasm_active = false;
-                let mut modified_headers = if !wasm_active {
-                    render_response_head(&accumulated[..header_len], status_code, security)
-                } else {
-                    let mut modified_headers = accumulated[..header_len].to_vec();
-
-                    // ヘッダーをパースして操作
-                    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-                    let mut response = httparse::Response::new(&mut headers_storage);
-                    if response.parse(&modified_headers).is_ok() {
-                        let mut new_header_lines = Vec::new();
-
-                        // ステータス行を追加
-                        let status_line = format!(
-                            "HTTP/1.1 {} {}\r\n",
-                            status_code,
-                            status_code_to_reason(status_code)
-                        );
-                        new_header_lines.push(status_line.into_bytes());
-
-                        // 既存のヘッダーを追加（削除対象を除外）
-                        // eq_ignore_ascii_case でアロケーションなしに比較
-                        for header in response.headers.iter() {
-                            if !security
-                                .remove_response_headers
-                                .iter()
-                                .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
-                            {
-                                new_header_lines.push(
-                                    format!(
-                                        "{}: {}\r\n",
-                                        header.name,
-                                        std::str::from_utf8(header.value).unwrap_or("")
-                                    )
-                                    .into_bytes(),
-                                );
-                            }
-                        }
-
-                        // 追加するヘッダーを追加
-                        for (header_name, header_value) in &security.add_response_headers {
-                            new_header_lines.push(
-                                format!("{}: {}\r\n", header_name, header_value).into_bytes(),
-                            );
-                        }
-                        // F-94: HTTP/3 広告（Alt-Svc）
-                        if let Some(g) = get_alt_svc_guard() {
-                            let mut line = Vec::with_capacity(16 + g.value().len());
-                            line.extend_from_slice(b"Alt-Svc: ");
-                            line.extend_from_slice(g.value());
-                            line.extend_from_slice(b"\r\n");
-                            new_header_lines.push(line);
-                        }
-
-                        // WASMレスポンスヘッダーフィルタを適用
-                        #[cfg(feature = "wasm")]
-                        {
-                            if !wasm_modules.is_empty() {
-                                let config = CURRENT_CONFIG.load();
-                                if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                    // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
-                                    let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines
-                                        .iter()
-                                        .skip(1) // ステータス行をスキップ
-                                        .filter_map(|line| {
-                                            let line_str = std::str::from_utf8(line).ok()?;
-                                            let line_trimmed = line_str.trim_end_matches("\r\n");
-                                            if line_trimmed.is_empty() {
-                                                return None;
-                                            }
-                                            let colon_pos = line_trimmed.find(':')?;
-                                            let name =
-                                                line_trimmed.as_bytes()[..colon_pos].to_vec();
-                                            let value = line_trimmed[colon_pos + 1..]
-                                                .trim_start()
-                                                .as_bytes()
-                                                .to_vec();
-                                            Some((name, value))
-                                        })
-                                        .collect();
-
-                                    // WASMフィルタを実行（レスポンスヘッダー処理）
-                                    let wasm_result = wasm_engine
-                                        .clone()
-                                        .on_response_headers_with_modules_async(
-                                            wasm_modules.clone(),
-                                            status_code,
-                                            current_headers,
-                                            true, // end_of_stream
-                                        )
-                                        .await;
-
-                                    match wasm_result {
-                                        crate::wasm::FilterResult::Continue {
-                                            headers: modified_headers,
-                                            ..
-                                        } => {
-                                            // WASMから修正されたヘッダーで置き換え
-                                            new_header_lines.clear();
-
-                                            // ステータス行を再追加
-                                            let status_line = format!(
-                                                "HTTP/1.1 {} {}\r\n",
-                                                status_code,
-                                                status_code_to_reason(status_code)
-                                            );
-                                            new_header_lines.push(status_line.into_bytes());
-
-                                            // WASMから返されたヘッダーを追加
-                                            for (name, value) in modified_headers {
-                                                let mut line = Vec::with_capacity(
-                                                    name.len() + value.len() + 4,
-                                                );
-                                                line.extend_from_slice(&name);
-                                                line.extend_from_slice(b": ");
-                                                line.extend_from_slice(&value);
-                                                line.extend_from_slice(b"\r\n");
-                                                new_header_lines.push(line);
-                                            }
-                                        }
-                                        crate::wasm::FilterResult::LocalResponse(_) => {
-                                            // レスポンスヘッダー処理ではLocalResponseは無視
-                                            // （すでにバックエンドレスポンスを受信しているため）
-                                        }
-                                        crate::wasm::FilterResult::Pause => {
-                                            // 非同期処理待ち（現在は未実装）
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // ヘッダー終了マーカーを追加
-                        new_header_lines.push(b"\r\n".to_vec());
-
-                        // 結合
-                        modified_headers = new_header_lines.into_iter().flatten().collect();
-                    }
-                    modified_headers
-                };
-                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-                crate::route_cors::apply_h1(&mut modified_headers, security);
+                // ヘッダーを修正（remove_response_headers・add_response_headers・Alt-Svc・Wasm・CORS）。1 本のバッファへ
+                // 直接書く（以前は Wasm のあるルートでヘッダの行ごとに `format!` と `Vec` を作って連結していた）
+                let modified_headers = finish_h1_upstream_head(
+                    &accumulated[..header_len],
+                    status_code,
+                    security,
+                    #[cfg(feature = "wasm")]
+                    &wasm_modules,
+                )
+                .await;
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
@@ -476,23 +341,154 @@ pub(super) async fn transfer_response_with_compression(
     }
 }
 
+/// F-285: 応答本文の Wasm フェーズを受けるモジュールがあるか（無いルートは本文を溜めない）。
+#[cfg(feature = "wasm")]
+pub(crate) fn wasm_wants_response_body(
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
+) -> bool {
+    if wasm_modules.is_empty() {
+        return false;
+    }
+    CURRENT_CONFIG
+        .load()
+        .wasm_filter_engine
+        .as_ref()
+        .is_some_and(|e| e.wants_response_body(wasm_modules))
+}
+
+/// F-285: 溜めた応答本文へ Wasm の `on_http_response_body` を `end_of_stream = true` で 1 回かける
+/// （HTTP/3 の F-132 と同じ）。`Err` はモジュールのローカル応答（`send_local_response`）。
+#[cfg(feature = "wasm")]
+pub(crate) async fn wasm_filter_response_body(
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
+    body: Bytes,
+) -> Result<Bytes, crate::wasm::LocalResponse> {
+    let config = CURRENT_CONFIG.load();
+    let Some(engine) = config.wasm_filter_engine.as_ref() else {
+        return Ok(body);
+    };
+    match crate::wasm::http_executor::apply_wasm_response_body(engine, wasm_modules, body, true)
+        .await
+    {
+        crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => Ok(b),
+        crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(r) => Err(r),
+    }
+}
+
+/// HTTP/1.1 の応答ヘッダ（空行まで）の本文の区切りを `Content-Length: len` に置き換える（`Transfer-Encoding`・
+/// 元の `Content-Length` を除く。本文を書き換えた・chunked を溜めて解いたとき。F-285）
+#[cfg(feature = "wasm")]
+pub(super) fn set_h1_content_length(head: &mut Vec<u8>, len: usize) {
+    if !head.ends_with(b"\r\n\r\n") {
+        return;
+    }
+    let mut out = Vec::with_capacity(head.len() + 24);
+    let mut first = true;
+    for line in head[..head.len() - 2].split_inclusive(|&b| b == b'\n') {
+        if !first {
+            let name = line.split(|&b| b == b':').next().unwrap_or(b"");
+            let name = name.trim_ascii();
+            if name.eq_ignore_ascii_case(b"content-length")
+                || name.eq_ignore_ascii_case(b"transfer-encoding")
+            {
+                continue;
+            }
+        }
+        first = false;
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(b"Content-Length: ");
+    let mut n = itoa::Buffer::new();
+    out.extend_from_slice(n.format(len).as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+    *head = out;
+}
+
+/// HTTP/1.1 の応答ヘッダへ `Content-Encoding` と `Vary: Accept-Encoding` を足す（F-285 の溜めた本文の圧縮）
+#[cfg(feature = "wasm")]
+pub(super) fn add_h1_content_encoding(head: &mut Vec<u8>, enc: AcceptedEncoding) {
+    let name: &[u8] = match enc {
+        AcceptedEncoding::Zstd => b"zstd",
+        AcceptedEncoding::Brotli => b"br",
+        AcceptedEncoding::Gzip => b"gzip",
+        AcceptedEncoding::Deflate => b"deflate",
+        AcceptedEncoding::Identity => return,
+    };
+    if !head.ends_with(b"\r\n\r\n") {
+        return;
+    }
+    head.truncate(head.len() - 2);
+    head.extend_from_slice(b"Content-Encoding: ");
+    head.extend_from_slice(name);
+    head.extend_from_slice(b"\r\nVary: Accept-Encoding\r\n\r\n");
+}
+
+/// 空行まで含む HTTP/1.1 の応答ヘッダに Wasm の `on_http_response_headers` をかける（モジュールが無ければそのまま）
+#[cfg(feature = "wasm")]
+async fn wasm_on_full_head(
+    head: Vec<u8>,
+    status: u16,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
+) -> Vec<u8> {
+    if wasm_modules.is_empty() || !head.ends_with(b"\r\n\r\n") {
+        return head;
+    }
+    let mut lines = head;
+    lines.truncate(lines.len() - 2);
+    let mut out = super::sendfile::h1_wasm_response_head(lines, status, wasm_modules).await;
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// 上流の応答のヘッダ（ステータス行から空行まで）をクライアントへ返す形にし（`render_response_head`）、Wasm の
+/// `on_http_response_headers`（B-268）と CORS（F-273）をかける。`buffering = "full"` の経路が使う（B-267）。
+pub(super) async fn finish_h1_upstream_head(
+    raw: &[u8],
+    status: u16,
+    security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
+) -> Vec<u8> {
+    let head = render_response_head(raw, status, security);
+    #[cfg(feature = "wasm")]
+    let head = wasm_on_full_head(head, status, wasm_modules).await;
+    let mut head = head;
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_h1(&mut head, security);
+    head
+}
+
 /// 上流の応答のヘッダ（ステータス行から空行まで）を、クライアントへ返す形にする（WASM のフィルタが無いとき）。
 ///
 /// ステータス行は `HTTP/1.1 <code> <reason>` に直し、`remove_response_headers` を除き、`add_response_headers` と
 /// Alt-Svc を足す。確保は返すバッファ 1 本だけ。解析できなければ受け取ったまま返す（従来どおり）。
 pub(super) fn render_response_head(raw: &[u8], status: u16, security: &SecurityConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    render_response_head_into(raw, status, security, &mut out);
+    out
+}
+
+/// [`render_response_head`] と同じだが、`out` の末尾へ書く（呼び出し側が使い回すバッファで確保を避ける）。
+pub(super) fn render_response_head_into(
+    raw: &[u8],
+    status: u16,
+    security: &SecurityConfig,
+    out: &mut Vec<u8>,
+) {
     let mut storage = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut storage);
     if response.parse(raw).is_err() {
-        return raw.to_vec();
+        out.extend_from_slice(raw);
+        return;
     }
     let added: usize = security
         .add_response_headers
         .iter()
         .map(|(k, v)| k.len() + v.len() + 4)
         .sum();
-    let alt_svc = get_alt_svc_guard();
-    let mut out = Vec::with_capacity(
+    let alt_svc = get_alt_svc_guard().filter(|_| {
+        security.remove_response_headers.is_empty() || !security.removes_response_header(b"alt-svc")
+    });
+    out.reserve(
         raw.len() + added + alt_svc.as_ref().map(|g| g.value().len() + 11).unwrap_or(0) + 16,
     );
     out.extend_from_slice(b"HTTP/1.1 ");
@@ -501,11 +497,14 @@ pub(super) fn render_response_head(raw: &[u8], status: u16, security: &SecurityC
     out.push(b' ');
     out.extend_from_slice(status_code_to_reason(status).as_bytes());
     out.extend_from_slice(b"\r\n");
+    // `[server] server_header_enabled` なら自分の `Server` にする（B-271。`remove_response_headers` の `Server` は自分のものも消す）
+    let own_server = crate::pool::append_own_server_line(out, security);
     for header in response.headers.iter() {
         if security
             .remove_response_headers
             .iter()
             .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
+            || (own_server && header.name.eq_ignore_ascii_case("server"))
         {
             continue;
         }
@@ -527,7 +526,6 @@ pub(super) fn render_response_head(raw: &[u8], status: u16, security: &SecurityC
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out
 }
 
 /// 圧縮してレスポンスを転送
@@ -544,6 +542,8 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     compression: &CompressionConfig,
     backend_wants_keep_alive: bool,
     security: &SecurityConfig,
+    status_code: u16,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
 ) -> Option<(u64, bool)> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -664,6 +664,11 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
         compressed_body.len(),
         security,
     );
+    // Wasm の `on_http_response_headers` は圧縮した後のヘッダに（B-268。区切りの行は元のまま残る）
+    #[cfg(feature = "wasm")]
+    let new_headers = wasm_on_full_head(new_headers, status_code, wasm_modules).await;
+    #[cfg(not(feature = "wasm"))]
+    let _ = status_code;
 
     // 4. ヘッダー送信（所有権を移動、clone 不要）
     let new_headers_len = new_headers.len();
@@ -699,6 +704,8 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     _compression: &CompressionConfig,
     _backend_wants_keep_alive: bool,
     _security: &SecurityConfig,
+    _status_code: u16,
+    #[cfg(feature = "wasm")] _wasm_modules: &crate::wasm_plugin_config::WasmModules,
 ) -> Option<(u64, bool)> {
     None
 }
@@ -753,6 +760,8 @@ pub(super) fn build_compressed_headers(
     new_headers.extend_from_slice(b" ");
     new_headers.extend_from_slice(reason.as_bytes());
     new_headers.extend_from_slice(b"\r\n");
+    // `[server] server_header_enabled` なら自分の `Server` にする（B-271。`remove_response_headers` の `Server` は自分のものも消す）
+    let own_server = crate::pool::append_own_server_line(&mut new_headers, security);
 
     // 元のヘッダーをコピー（Content-Length, Content-Encoding, Transfer-Encoding を除く）
     // 削除対象のヘッダーも除外
@@ -762,6 +771,7 @@ pub(super) fn build_compressed_headers(
         if n.eq_ignore_ascii_case(b"content-length")
             || n.eq_ignore_ascii_case(b"content-encoding")
             || n.eq_ignore_ascii_case(b"transfer-encoding")
+            || (own_server && n.eq_ignore_ascii_case(b"server"))
             || security
                 .remove_response_headers
                 .iter()
@@ -801,7 +811,7 @@ pub(super) fn build_compressed_headers(
         new_headers.extend_from_slice(b"\r\n");
     }
     // F-94: HTTP/3 広告（Alt-Svc）
-    append_alt_svc_header_line(&mut new_headers);
+    crate::pool::append_own_alt_svc_line(&mut new_headers, security);
 
     // ヘッダー終端
     new_headers.extend_from_slice(b"\r\n");

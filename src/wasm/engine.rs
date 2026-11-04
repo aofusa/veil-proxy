@@ -942,6 +942,16 @@ impl FilterEngine {
         self.registry.get_module(name)
     }
 
+    /// 並びに応答本文のフェーズ（`allow_response_body_read`）を受けるモジュールがあるか（F-285）。
+    ///
+    /// 無いルートは応答本文を溜めない（ストリーミング・splice のまま）。
+    pub fn wants_response_body(&self, modules: &crate::wasm_plugin_config::WasmModules) -> bool {
+        modules.modules().iter().any(|m| {
+            self.get_module(&m.name)
+                .is_some_and(|lm| lm.capabilities.allow_response_body_read)
+        })
+    }
+
     /// Execute proxy_on_http_call_response callback for a module
     ///
     /// This should be called after an HTTP call completes to deliver the response

@@ -239,7 +239,10 @@ unsafe impl IoBufMut for SafeReadBuffer {
 // セキュリティ制限
 pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
 pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
-                                                  // http2 (H2C/gRPC) 経路でのみ使用
+                                                  // 圧縮・HTTP/2 への中継のために上流の応答本文を溜める上限（B-281）。既知長がこれを超える応答は
+                                                  // 圧縮せずに逐次送り、長さ不明で超えたものは 502（または切断）にする
+pub(crate) const MAX_COLLECTED_RESPONSE_BODY: usize = 64 * 1024 * 1024;
+// http2 (H2C/gRPC) 経路でのみ使用
 #[cfg(feature = "http2")]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
@@ -1468,6 +1471,41 @@ pub fn append_alt_svc_header_line(buf: &mut Vec<u8>) {
         buf.extend_from_slice(b"Alt-Svc: ");
         buf.extend_from_slice(g.value());
         buf.extend_from_slice(b"\r\n");
+    }
+}
+
+/// ルートの応答ヘッダの方針を見て自分の `Server` 行を足す（`remove_response_headers` に `Server` があれば足さず
+/// `true` を返す＝上流の `Server` も落とす）。HTTP/2・HTTP/3・静的配信と同じ扱い。
+#[inline]
+pub fn append_own_server_line(buf: &mut Vec<u8>, security: &crate::config::SecurityConfig) -> bool {
+    if !security.remove_response_headers.is_empty() && security.removes_response_header(b"server") {
+        return true;
+    }
+    append_server_header_line(buf)
+}
+
+/// ルートの応答ヘッダの方針を見て `Alt-Svc` 行を足す（`remove_response_headers` に `Alt-Svc` があれば足さない）
+#[inline]
+pub fn append_own_alt_svc_line(buf: &mut Vec<u8>, security: &crate::config::SecurityConfig) {
+    if !security.remove_response_headers.is_empty() && security.removes_response_header(b"alt-svc")
+    {
+        return;
+    }
+    append_alt_svc_header_line(buf);
+}
+
+/// HTTP/1.1 応答バッファへ `Server: ...\r\n` を追記（`[server] server_header_enabled` のときだけ。B-271）。
+/// 追記したら `true`（呼び出し側は上流の `Server` を落とす。HTTP/2・HTTP/3 と同じ）。
+#[inline]
+pub fn append_server_header_line(buf: &mut Vec<u8>) -> bool {
+    match get_server_header_guard() {
+        Some(g) => {
+            buf.extend_from_slice(b"Server: ");
+            buf.extend_from_slice(g.value());
+            buf.extend_from_slice(b"\r\n");
+            true
+        }
+        None => false,
     }
 }
 

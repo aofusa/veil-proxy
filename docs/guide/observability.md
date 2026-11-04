@@ -35,6 +35,9 @@ Use the `path` option to change the endpoint path.
 
 ### Available Metrics
 
+Every series is recorded for HTTP/1.1, HTTP/2 and HTTP/3 clients alike. The response cache series (`veil_proxy_cache_*`)
+only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves HTTP/1.1 requests only.
+
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `veil_proxy_http_requests_total` | Counter | method, status, host | Total request count |
@@ -49,23 +52,23 @@ Use the `path` option to change the endpoint path.
 | `veil_proxy_vds_last_update_timestamp_seconds` | Gauge | - | VDS: Unix time of the last snapshot applied or rejected |
 | `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
 | `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
-| `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations (`storage` = `memory` or `disk`, by where the entry is kept) |
 | `veil_proxy_cache_evictions_total` | Counter | reason | Total cache eviction count |
 | `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
 | `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
-| `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
-| `veil_circuit_breaker_open_total` | Counter | upstream | CB open event count |
-| `veil_circuit_breaker_state` | Gauge | upstream | CB state (0=Closed, 1=Open, 2=HalfOpen) |
-| `veil_retry_total` | Counter | upstream, result | Retry attempt count |
-| `veil_outlier_ejected` | Gauge | upstream, server | Server ejection status (1=ejected) |
+| `veil_proxy_buffering_used_total` | Counter | host | Requests on routes whose `[route.buffering]` mode buffers the response (gRPC excluded) |
+| `veil_circuit_breaker_open_total` | Counter | upstream | Times a server's breaker opened, per upstream group |
+| `veil_circuit_breaker_state` | Gauge | upstream | Group state: 1 if any server's breaker is Open, 2 if any is HalfOpen, otherwise 0 |
+| `veil_retry_total` | Counter | upstream, result | Retries of idempotent requests whose pooled upstream connection closed before the response (`upstream` = server address, `result` = `stale_connection`) |
+| `veil_outlier_ejected` | Gauge | upstream, server | Server ejection status (1 while ejected, 0 after the ejection ends) |
 | `veil_connection_pool_size` | Gauge | upstream | Current connection pool size |
 | `veil_connection_pool_hits_total` | Counter | upstream | Connection pool hit count |
 | `veil_connection_pool_misses_total` | Counter | upstream | Connection pool miss count |
-| `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC request count |
+| `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC calls relayed to an HTTP/2 upstream, counted by the `grpc-status` trailer |
 | `veil_http3_invalid_packets_total` | Counter | - | UDP datagrams on the HTTP/3 port that are not valid QUIC packets (logged at debug level only) |
 | `veil_upstream_connect_errors_total` | Counter | kind | Failed connections to upstream servers (`error`, `timeout`, `tls`, `no_healthy`). The matching log line is written at most once per 10 seconds per call site (the rest at debug level) |
 | `veil_uring_cq_overflow_total` | Counter | - | Times an io_uring completion queue overflowed (io_uring backend only). Completions are not lost, but a non-zero value means the rings are small for the load |
-| `veil_grpc_stream_duration_seconds` | Histogram | method | gRPC stream duration |
+| `veil_grpc_stream_duration_seconds` | Histogram | method | Time from the start of a relayed gRPC call to its `grpc-status` trailer |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
 

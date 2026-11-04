@@ -1,6 +1,6 @@
 # B-268: Proxy-Wasm の `on_http_response_headers` が、HTTP/2 → HTTP/1.1 の上流・HTTP/1.1 → h2c の上流・HTTP/1.1 の圧縮とバッファの経路で呼ばれない
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -44,6 +44,12 @@
 - モジュールの無いルートは今と同じ（`is_empty()` の分岐だけ）。
 - 試験: E2E で HTTP/1.1（圧縮あり・なし・`buffering = "full"`）・h2c・HTTP/2・HTTP/3 × 上流 HTTP/1.1・HTTPS・h2c で `X-Veil-Processed` が付くこと。
   `tests/proxy_wasm_conformance.rs` にもプロトコルの軸を足す。
+
+## 修正（v0.10.1）
+
+- `on_http_response_headers` を HTTP/2 → HTTP/1.1 の上流、HTTP/1.1 → h2c の上流、HTTP/1.1 の圧縮する応答、`buffering = "full"` でも呼ぶ
+  （応答ヘッダの方針の後、圧縮の前。他の経路と同じ順）。
+- 統合試験 `b268_wasm_response_headers_on_every_path`（応答ヘッダを足す WAT のモジュールで、4 プロトコル × 各経路にヘッダが付くこと）。
 
 ## 関連
 

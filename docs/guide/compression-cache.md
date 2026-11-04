@@ -33,6 +33,10 @@ url = "http://localhost:8080"
   enabled = true
 ```
 
+The table applies on HTTP/1.1, HTTP/2 and HTTP/3 to proxied responses (HTTP/1.1, h2c and HTTPS upstreams, streamed or
+buffered) and to static files (`type = "File"`, both `sendfile` and `memory`; see
+[routing.md](routing.md#conditional-and-range-requests) for how compression interacts with `ETag` and `Range`).
+
 The same table applies to `type = "Handler"` routes of the API library (HTTP/1.1, HTTP/2 and HTTP/3, buffered and
 streaming responses); `[api] compression = true` gives handler routes a default for JSON APIs. See
 [library.md](library.md#response-compression).
@@ -127,6 +131,14 @@ The following MIME types are **not** compressed (already compressed or binary):
 - `application/gzip`
 - `application/x-gzip`
 - `application/x-brotli`
+
+Regardless of these settings, veil never compresses:
+
+- `text/event-stream` (Server-Sent Events). Compressing needs the whole body, and an event stream never ends, so it is always streamed as-is.
+- Responses whose `Content-Length` is above 64 MiB. They are streamed uncompressed.
+- Static files (`type = "File"`) larger than 8 MiB. They are sent uncompressed with `sendfile`, since compressing reads the whole file for every request.
+
+To compress, veil collects the whole upstream body first, up to 64 MiB. If a response of unknown length or a chunked response goes past that, veil stops and returns 502.
 
 ### HTTP/3 Compression Settings
 

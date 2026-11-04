@@ -1,6 +1,6 @@
 # F-286: HTTP/2・HTTP/3 の静的配信で Range 要求（206・416・`Accept-Ranges`）に応える（今は HTTP/1.1 の `type = "File"` だけ）
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 完了（v0.10.1）**
 
 ## 今の状態
 
@@ -29,6 +29,12 @@
 
 - E2E: HTTP/1.1・h2c・HTTP/2・HTTP/3 × File・memory で、`bytes=0-9`・`bytes=-10`・`bytes=10-`・範囲外の結果が同じ。HEAD とも組み合わせる。
 - 交互 A/B: Range の無い静的配信の性能が変わらない（3B・54KB）。
+
+## 修正（v0.10.1）
+
+- 静的配信（File・memory）の Range 要求（206・複数範囲は先頭だけ・416 と `Content-Range: bytes */<長さ>`・`Accept-Ranges: bytes`）を
+  `static_response::plan` で全プロトコル同じに返す。
+- 統合試験 `b266_f286_f287_static_responses_match_across_protocols`、`docs/guide/routing.md`（英日）の「条件付き要求・範囲要求」。
 
 ## 関連
 

@@ -247,7 +247,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10); // Backend connection
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Alive idle timeout
 ```
 
-> **Note**: Some timeouts can be individually adjusted from config.toml via per-route security settings using `client_header_timeout_secs` and `backend_connect_timeout_secs`.
+> **Note**: Some timeouts can be individually adjusted from config.toml via per-route security settings using `client_body_timeout_secs` and `backend_connect_timeout_secs`. Request headers are bounded by the listener's read timeout (`READ_TIMEOUT`); the route's `client_header_timeout_secs` is not used.
 
 ### Buffer Pool Configuration
 

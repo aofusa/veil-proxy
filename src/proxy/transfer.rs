@@ -467,6 +467,15 @@ pub(crate) async fn collect_response_body_raw<R: AsyncReadRent + Unpin>(
             ResponseBody::UntilClose => n,
             ResponseBody::None => 0,
         };
+        // B-281: 溜める上限を超えたら打ち切る（長さ不明・chunked の応答でメモリを使い切らない）
+        if raw.len() + take > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+            buf_put(buf);
+            warn!(
+                "Upstream response body exceeds the {} byte buffering limit; aborting",
+                crate::pool::MAX_COLLECTED_RESPONSE_BODY
+            );
+            return None;
+        }
         raw.extend_from_slice(&buf.as_valid_slice()[..take]);
         buf_put(buf);
     }

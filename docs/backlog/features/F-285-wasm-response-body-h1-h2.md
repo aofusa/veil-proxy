@@ -1,6 +1,6 @@
 # F-285: Proxy-Wasm の `on_http_response_body` を HTTP/1.1・HTTP/2 でも呼ぶ（今は HTTP/3 だけ）
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 完了（v0.10.1）**
 
 ## 今の状態
 
@@ -25,6 +25,12 @@
 - E2E: 応答本文を書き換えるモジュールで、HTTP/1.1（平文・TLS・パイプライン）・h2c・HTTP/2・HTTP/3 × 上流 HTTP/1.1・h2c の応答が同じ本文・
   正しい長さで返る。`tests/proxy_wasm_conformance.rs` にプロトコルの軸を足す。
 - 交互 A/B: モジュールの無いルートの性能が変わらない。
+
+## 修正（v0.10.1）
+
+- `on_http_response_body` を HTTP/1.1・HTTP/2 でも呼ぶ（HTTP/3 と同じく本文を溜めてから 1 回。圧縮の前）。応答本文のフェーズを受ける
+  モジュール（`allow_response_body_read`）が無いルートは溜めない（ストリーミング・splice のまま。`FilterEngine::wants_response_body`）。
+- 統合試験 `f285_wasm_response_body_rewrite_on_every_protocol`、`docs/guide/wasm.md`（英日）。
 
 ## 関連
 

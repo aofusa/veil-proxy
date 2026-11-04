@@ -177,170 +177,53 @@ pub(super) async fn apply_h2_wasm_response_trailers(
     }
 }
 
-/// `Arc<Vec<u8>>` を `Bytes::from_owner` でゼロコピー化するための薄いラッパ（F-157）。
-///
-/// `Backend::MemoryFile` はコンテンツを `Arc<Vec<u8>>` で保持しており、そのまま
-/// `Bytes` へ変換すると 1 回のディープコピーが発生する。`AsRef<[u8]>` を実装した
-/// この newtype を `Bytes::from_owner` に渡すことで、`Arc` の参照カウントだけで
-/// `Bytes` 化できる（`Bytes` の内部が `Arc` を保持し続けるだけでコピーは発生しない）。
+/// HTTP/2 静的応答（`type = "File"`・`mode = "memory"`）のステータス・ヘッダ・本文（B-32・B-266・F-286・F-287）。
+/// 共通の `static_response::build_bytes_response` に `server`・`alt-svc` を足す。
 #[cfg(feature = "http2")]
-pub(super) struct ArcVecBytes(pub(super) Arc<Vec<u8>>);
-
-#[cfg(feature = "http2")]
-impl AsRef<[u8]> for ArcVecBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-}
-
-/// HTTP/2 静的応答の圧縮ネゴシエーションとヘッダー構築（B-32）
-///
-/// F-157: `data` は `Bytes`（参照カウント共有）で受け取り、非圧縮時はそのまま返す。
-/// 圧縮する場合のみ `compress_body_h2` で新規バッファを確保する。呼び出し元
-/// （`h2_sendfile`）が渡す `data` はキャッシュヒット時に参照カウントクローンだけで
-/// 得られるため、非圧縮の静的配信ホットパスからディープコピーが完全に消える。
-///
-/// `static_ctx`（F-169）: 呼び出し元が静的配信のパスを把握している場合のみ
-/// `Some((path, static_content_cache_cfg))` を渡す。この場合、圧縮結果を
-/// `cache::compressed` でキャッシュする（`static_content_cache_cfg.enabled` が
-/// `false` なら内部でキャッシュを使わず毎回圧縮する）。プロキシ応答は毎回内容が
-/// 異なるためキャッシュしてはならず、その呼び出し元は必ず `None` を渡す
-/// （`Backend::MemoryFile` もパスを持たないため `None`）。
-#[cfg(feature = "http2")]
-pub(super) fn build_h2_compressed_file_response(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_h2_static_response(
+    sreq: &crate::static_response::StaticRequest<'_>,
     data: Bytes,
     mime_type: &str,
+    validators: &crate::static_response::Validators,
     security: &SecurityConfig,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
     static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
-) -> (Vec<(Bytes, Bytes)>, Bytes) {
-    let should_compress = compression.should_compress(
-        client_encoding,
-        Some(mime_type.as_bytes()),
-        Some(data.len()),
-        None,
+    memory: Option<&crate::static_response::MemoryContent>,
+) -> (u16, Vec<(Bytes, Bytes)>, Bytes) {
+    let (status, mut header_store, body) = crate::static_response::build_bytes_response(
+        sreq,
+        data,
+        mime_type,
+        validators,
+        security,
+        compression,
+        static_ctx,
+        memory,
     );
-
-    let mut header_store: Vec<(Bytes, Bytes)> = Vec::with_capacity(8);
-    header_store.push((
-        Bytes::from_static(b"content-type"),
-        Bytes::copy_from_slice(mime_type.as_bytes()),
-    ));
     if let Some(ref g) = get_server_header_guard() {
-        header_store.push((Bytes::from_static(b"server"), g.value_bytes()));
+        if !security.removes_response_header(b"server") {
+            header_store.push((Bytes::from_static(b"server"), g.value_bytes()));
+        }
     }
-    for (k, v) in &security.add_response_headers {
-        header_store.push((
-            Bytes::copy_from_slice(k.as_bytes()),
-            Bytes::copy_from_slice(v.as_bytes()),
-        ));
-    }
-    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-    crate::route_cors::apply_bytes(&mut header_store, security);
     // F-94: HTTP/3 広告（Alt-Svc）
     if let Some(g) = get_alt_svc_guard() {
-        header_store.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));
+        if !security.removes_response_header(b"alt-svc") {
+            header_store.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));
+        }
     }
-
-    let response_body = if let Some(enc) = should_compress {
-        let encoding_name: &'static [u8] = match enc {
-            AcceptedEncoding::Zstd => b"zstd",
-            AcceptedEncoding::Brotli => b"br",
-            AcceptedEncoding::Gzip => b"gzip",
-            AcceptedEncoding::Deflate => b"deflate",
-            AcceptedEncoding::Identity => b"",
-        };
-        if !encoding_name.is_empty() {
-            header_store.push((
-                Bytes::from_static(b"content-encoding"),
-                Bytes::from_static(encoding_name),
-            ));
-            header_store.push((
-                Bytes::from_static(b"vary"),
-                Bytes::from_static(b"Accept-Encoding"),
-            ));
-        }
-        match static_ctx {
-            Some((path, static_cfg)) if static_cfg.enabled => {
-                let level = cache::compressed::compression_level(enc, compression);
-                cache::compressed::get_or_compress(path, enc, level, static_cfg, || {
-                    compress_body_h2(&data, enc, compression)
-                })
-            }
-            _ => Bytes::from(compress_body_h2(&data, enc, compression)),
-        }
-    } else {
-        data
-    };
-
-    (header_store, response_body)
+    (status, header_store, body)
 }
 
-/// F-169 Part B: zstd 圧縮コンテキストをスレッドローカルに保持して使い回す。
-///
-/// `zstd::encode_all` は呼び出しごとに内部コンテキスト（ワークスペース確保を伴う）
-/// を作り捨てていた。ワーカースレッドは固定でリクエストを処理し続けるため、
-/// スレッドローカルに `zstd::bulk::Compressor` を 1 つ保持し使い回すことで、
-/// 確保自体を消す。**「確保が減った」ことと「速くなった」ことは別の主張**であり
-/// （`AGENTS.md` F-168 の教訓）、本変更はスループット改善を約束するものではなく、
-/// ホットパス絶対規則（不要な確保をしない）に沿わせるための一貫性改修である。
-///
-/// 圧縮レベルは設定リロードで変わり得るため、使い回す前に必ず
-/// `set_compression_level` で反映する（level 変更自体のコストは
-/// コンテキスト新規確保よりは軽い）。
+/// HTTP/2 用レスポンスボディ圧縮（`static_response::compress_body` と同じ。失敗したら元のまま）
 #[cfg(all(feature = "http2", feature = "compression"))]
-pub(super) fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
-    zstd_compress_reused(body, level).unwrap_or_else(|| body.to_vec())
-}
-
-/// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
-///
-/// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
-/// 圧縮に失敗した場合は元のデータをそのまま返します。
-#[cfg(all(feature = "http2", feature = "compression"))]
+#[inline]
 pub(super) fn compress_body_h2(
     body: &[u8],
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
 ) -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    match encoding {
-        AcceptedEncoding::Zstd => zstd_compress_reuse_ctx(body, compression.zstd_level),
-        AcceptedEncoding::Gzip => {
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Brotli => {
-            let mut compressed = Vec::with_capacity(body.len());
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: compression.brotli_level as i32,
-                ..Default::default()
-            };
-            let mut input = std::io::Cursor::new(body);
-            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return body.to_vec();
-            }
-            compressed
-        }
-        AcceptedEncoding::Deflate => {
-            use flate2::write::DeflateEncoder;
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Identity => body.to_vec(),
-    }
+    crate::static_response::compress_body(body, encoding, compression)
 }
 
 /// compression feature 無効時のスタブ

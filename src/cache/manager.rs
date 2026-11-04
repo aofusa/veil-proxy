@@ -118,6 +118,14 @@ impl CacheManager {
         }
     }
 
+    /// `size` バイトの応答を保存する先（`veil_proxy_cache_stores_total` の `storage` ラベル。`store_with_vary` と同じ選び方）
+    pub fn storage_label(&self, size: usize) -> &'static str {
+        match self.config.select_storage(size) {
+            StorageType::Disk if self.disk.is_some() => "disk",
+            _ => "memory",
+        }
+    }
+
     /// レスポンスをキャッシュに保存
     ///
     /// レスポンスがキャッシュ可能な場合のみ保存します。

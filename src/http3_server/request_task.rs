@@ -27,6 +27,10 @@ pub(super) struct H3BufferedTask {
     pub(super) notify: crate::http3_stream::ConnWaker,
     /// ルートの `[route.traffic.cors]` の実際の応答に足すヘッダ（F-273。ルートの解決の後に入れ、応答の head に足す）
     pub(super) cors: Option<std::sync::Arc<crate::route_cors::CorsActual>>,
+    /// HEAD の要求（どの応答でも本文を送らない。B-266）
+    pub(super) head_req: bool,
+    /// ルートの `remove_response_headers` に `Server` がある（自分の `server` も付けない。ルートの解決の後に入れる）
+    pub(super) removes_server: bool,
 }
 
 /// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
@@ -211,6 +215,7 @@ pub(super) async fn h3_api_respond(
         let head = RespMsg::Head {
             status,
             headers: pack_resp_headers(&headers, Some(body.len())),
+            own_server: true,
         };
         if send(head).await && !body.is_empty() {
             send(RespMsg::Body(body)).await;
@@ -220,6 +225,7 @@ pub(super) async fn h3_api_respond(
     if !send(RespMsg::Head {
         status,
         headers: pack_resp_headers(&headers, None),
+        own_server: true,
     })
     .await
     {
@@ -307,6 +313,20 @@ pub(super) fn pack_resp_headers(
     out
 }
 
+/// 静的配信が見る要求ヘッダ（疑似ヘッダを除く。借用のまま）
+fn static_request_h3<'a>(
+    method: &[u8],
+    headers: &'a [h3::Header],
+) -> crate::static_response::StaticRequest<'a> {
+    crate::static_response::StaticRequest::from_headers(
+        method,
+        headers
+            .iter()
+            .filter(|h| !h.name().starts_with(b":"))
+            .map(|h| (h.name(), h.value())),
+    )
+}
+
 /// F-171: HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を 1 回の確保に詰めて所有ペアにする
 /// （上流 HTTP/2 への転送用。ホップバイホップは上流クライアントが落とす）。
 #[cfg(feature = "http2")]
@@ -338,6 +358,13 @@ impl H3BufferedTask {
             (&self.cors, &mut msg)
         {
             c.apply_bytes(headers);
+        }
+        if let crate::http3_stream::RespMsg::Head { own_server, .. } = &mut msg {
+            *own_server &= !self.removes_server;
+        }
+        // HEAD は本文を送らない（RFC 9110 §9.3.2。応答の作り手に関わらずここで落とす。B-266）
+        if self.head_req && matches!(msg, crate::http3_stream::RespMsg::Body(_)) {
+            return Ok(());
         }
         let r = tx.send(msg).await;
         self.notify.notify();
@@ -371,6 +398,7 @@ impl H3BufferedTask {
         self.send_msg(RespMsg::Head {
             status,
             headers: pack_resp_headers(headers, cl),
+            own_server: true,
         })
         .await?;
         if let Some(b) = body {
@@ -396,6 +424,7 @@ impl H3BufferedTask {
         self.send_msg(RespMsg::Head {
             status,
             headers: pack_resp_headers(headers, None),
+            own_server: true,
         })
         .await?;
         let mut sent = 0usize;
@@ -441,7 +470,7 @@ impl H3BufferedTask {
     async fn send_error_response(&mut self, status: u16, body: &'static [u8]) -> io::Result<()> {
         self.send_response(
             status,
-            &[(b"content-type", b"text/plain"), (b"server", b"veil/http3")],
+            &[(b"content-type", b"text/plain")],
             Some(Bytes::from_static(body)),
         )
         .await
@@ -469,6 +498,7 @@ impl H3BufferedTask {
         self.send_msg(RespMsg::Head {
             status: 200,
             headers: pack_resp_headers(&initial, None),
+            own_server: true,
         })
         .await?;
         if let Some(b) = body {
@@ -589,6 +619,7 @@ impl H3BufferedTask {
         let method: &[u8] = method.unwrap_or(b"GET");
         let path: &[u8] = path.unwrap_or(b"/");
         let authority: &[u8] = authority.unwrap_or_default();
+        self.head_req = method == b"HEAD";
 
         // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
         let start_time = crate::logging::request_start_instant();
@@ -681,7 +712,6 @@ impl H3BufferedTask {
                     &[
                         (b":status", b"200"),
                         (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                        (b"server", b"veil/http3"),
                     ],
                     Some(Bytes::copy_from_slice(&body)),
                 )
@@ -851,6 +881,8 @@ impl H3BufferedTask {
         }
         // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。以降の応答の head に `send_msg` が足す）
         self.cors = security.cors_actual.clone();
+        self.removes_server = !security.remove_response_headers.is_empty()
+            && security.removes_response_header(b"server");
 
         // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
         // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out
@@ -1009,8 +1041,15 @@ impl H3BufferedTask {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, security, path_compression, _buffering, _cache, _) => {
+            Backend::Proxy(upstream_group, security, path_compression, buffering, _cache, _) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
+                // `buffering = "full"` の経路（gRPC は使わない。F-97）を数える（HTTP/1.1 と同じ。B-273）
+                #[cfg(feature = "grpc")]
+                let is_grpc = super::Http3Handler::is_grpc_request(headers);
+                #[cfg(not(feature = "grpc"))]
+                let is_grpc = false;
+                let buffering_full =
+                    buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc;
 
                 // HTTP/3専用圧縮設定を解決
                 // 優先順位: パス設定 > HTTP/3設定 > デフォルト
@@ -1028,6 +1067,7 @@ impl H3BufferedTask {
                 let result = self
                     .handle_proxy(
                         &upstream_group,
+                        buffering_full,
                         &security,
                         &effective_compression,
                         client_encoding,
@@ -1065,64 +1105,22 @@ impl H3BufferedTask {
                     self.send_error_response(404, b"Not Found").await?;
                     (404, 9)
                 } else {
-                    // F-132: h1/h2 と同様、静的配信（Backend::File 系）にも WASM
-                    // on_response_headers を適用する。
-                    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                        (b"content-type".to_vec(), mime_type.as_bytes().to_vec()),
-                        (b"server".to_vec(), b"veil/http3".to_vec()),
-                    ];
-                    for (k, v) in &security.add_response_headers {
-                        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
-                    }
-
-                    // F-169: HTTP/3 の File 系バックエンドは従来ここで圧縮設定
-                    // （`route_compression`）を破棄しており、h2 と違って圧縮が
-                    // 一切効いていなかった。h2 (`build_h2_compressed_file_response`)
-                    // と同じネゴシエーションを適用する。MemoryFile はファイルシステム
-                    // パスを持たないため圧縮結果キャッシュ（`cache::compressed`）は
-                    // 使えない（毎回圧縮する。h2 側の MemoryFile 経路と同じ扱い）。
                     let file_compression =
                         resolve_http3_compression_config(&route_compression, &config.http3_config);
-                    let should_compress = file_compression.should_compress(
-                        client_encoding,
-                        Some(mime_type.as_bytes()),
-                        Some(data.len()),
+                    let sreq = static_request_h3(method, headers);
+                    self.send_static_response(
+                        &sreq,
+                        data.body.clone(),
+                        &mime_type,
+                        &data.validators,
+                        &security,
+                        &file_compression,
                         None,
-                    );
-
-                    let response_body: Bytes = if let Some(enc) = should_compress {
-                        let encoding_name: &[u8] = match enc {
-                            AcceptedEncoding::Zstd => b"zstd",
-                            AcceptedEncoding::Brotli => b"br",
-                            AcceptedEncoding::Gzip => b"gzip",
-                            AcceptedEncoding::Deflate => b"deflate",
-                            AcceptedEncoding::Identity => b"",
-                        };
-                        if !encoding_name.is_empty() {
-                            header_store
-                                .push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
-                        }
-                        Bytes::from(compress_body_h3(data.as_slice(), enc, &file_compression))
-                    } else {
-                        // Arc<Vec<u8>> の参照カウントクローンのみ（ディープコピー無し）。
-                        Bytes::from_owner(ArcVecBytes(data.clone()))
-                    };
-
-                    #[cfg(feature = "wasm")]
-                    if let Some(modules) = wasm_modules_to_apply.as_ref() {
-                        header_store =
-                            apply_h3_wasm_response_headers(modules, 200, header_store).await;
-                    }
-
-                    let resp_headers: Vec<(&[u8], &[u8])> = header_store
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-
-                    self.send_response(200, &resp_headers, Some(response_body.clone()))
-                        .await?;
-                    (200, response_body.len())
+                        Some(&data),
+                        #[cfg(feature = "wasm")]
+                        wasm_modules_to_apply.as_ref(),
+                    )
+                    .await?
                 }
             }
             Backend::SendFile(
@@ -1149,7 +1147,7 @@ impl H3BufferedTask {
                     prefix: &prefix,
                     security: &security,
                     compression: &file_compression,
-                    client_encoding,
+                    sreq: static_request_h3(method, headers),
                     open_file_cache_config: open_file_cache_config.as_deref(),
                     canonical_base: canonical_base.as_deref(),
                     static_file_cache_config: static_file_cache_config.as_deref(),
@@ -1160,15 +1158,14 @@ impl H3BufferedTask {
                 .unwrap_or((404, 9))
             }
             Backend::Respond(r) => {
-                // 固定応答（F-219）。ヘッダはスタック上の配列へ参照を並べる
+                // 固定応答（F-219）。ヘッダはスタック上の配列へ参照を並べる（`server` は送出時に付く。B-271）
                 let mut hs: [(&[u8], &[u8]); 12] = [(&[], &[]); 12];
-                let n = r.headers.len().min(hs.len() - 1);
+                let n = r.headers.len().min(hs.len());
                 for (slot, (k, v)) in hs.iter_mut().zip(r.headers.iter().take(n)) {
                     *slot = (k.as_ref(), v.as_ref());
                 }
-                hs[n] = (b"server", b"veil/http3");
                 match self
-                    .send_response(r.status, &hs[..n + 1], Some(r.body.clone()))
+                    .send_response(r.status, &hs[..n], Some(r.body.clone()))
                     .await
                 {
                     Ok(()) => (r.status, r.body.len()),
@@ -1261,6 +1258,7 @@ impl H3BufferedTask {
     async fn handle_proxy(
         &mut self,
         upstream_group: &Arc<UpstreamGroup>,
+        buffering_full: bool,
         // 上流接続プール（B-74 の H2C_POOL・B-104 の HTTP/1.1 プール）の max_idle/idle_timeout。
         security: &SecurityConfig,
         compression: &CompressionConfig,
@@ -1288,6 +1286,11 @@ impl H3BufferedTask {
         };
 
         server.acquire();
+        if buffering_full {
+            crate::metrics::record_buffering_used(&server.target.host);
+        }
+        // F-06・B-272: サーキットブレーカー・外れ値の排除へ結果を記録する（HTTP/1.1・HTTP/2 と同じ）
+        let resilience_start = crate::runtime::time::coarse_now();
         let target = &server.target;
 
         // リクエストパス構築
@@ -1507,6 +1510,11 @@ impl H3BufferedTask {
         };
 
         server.release();
+        upstream_group.record_request(
+            server,
+            resilience_start,
+            matches!(&proxy_result, Ok(r) if r.status_code < 500),
+        );
 
         match proxy_result {
             Ok(backend_result) => {
@@ -1517,9 +1525,15 @@ impl H3BufferedTask {
                 let body = backend_result.body;
                 let trailers = backend_result.trailers;
 
-                // B-38: WASM レスポンスヘッダフィルタ
-                #[cfg(feature = "wasm")]
+                // `remove_response_headers`・`add_response_headers`（B-267。HTTP/1.1・HTTP/2 と同じく Wasm の前）
                 let mut resp_header_store = backend_result.headers;
+                if !security.remove_response_headers.is_empty() {
+                    resp_header_store.retain(|(n, _)| !security.removes_response_header(n));
+                }
+                for (k, v) in security.add_response_header_bytes() {
+                    resp_header_store.push((k.to_vec(), v.to_vec()));
+                }
+                // B-38: WASM レスポンスヘッダフィルタ
                 #[cfg(feature = "wasm")]
                 if let Some(modules) = wasm_modules {
                     if !modules.is_empty() {
@@ -1528,8 +1542,6 @@ impl H3BufferedTask {
                                 .await;
                     }
                 }
-                #[cfg(not(feature = "wasm"))]
-                let resp_header_store = backend_result.headers;
 
                 // gRPC は圧縮ネゴシエーション/ボディフィルタ対象外（application/grpc、trailers は F-133）
                 #[cfg(feature = "grpc")]
@@ -1610,11 +1622,23 @@ impl H3BufferedTask {
                 };
 
                 // レスポンスヘッダ + H2C trailers をマージ（B-39）
-                let owned_headers = merge_response_headers_and_trailers(
+                let mut owned_headers = merge_response_headers_and_trailers(
                     &resp_header_store,
                     &trailers,
                     should_compress.is_some(),
                 );
+                // B-279: 圧縮した本文には Content-Encoding と Vary を付ける（以前は付けず、クライアントは圧縮された
+                // 本文をそのまま受け取った。バッファ経路＝Wasm・`buffering = "full"` の上流の応答）
+                if let Some(enc) = should_compress {
+                    owned_headers
+                        .push((b"content-encoding".to_vec(), enc.as_header_value().to_vec()));
+                    if !owned_headers
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case(b"vary"))
+                    {
+                        owned_headers.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+                    }
+                }
 
                 let response_body = if let Some(enc) = should_compress {
                     compress_body_h3(&body, enc, compression)
@@ -1641,6 +1665,14 @@ impl H3BufferedTask {
                         .iter()
                         .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-message"))
                         .and_then(|(_, v)| String::from_utf8(v.clone()).ok());
+                    // F-09・B-273: gRPC の要求数（HTTP/2 の中継と同じくトレーラーの grpc-status で数える）
+                    let mut code_buf = itoa::Buffer::new();
+                    crate::metrics::record_grpc_completion(
+                        std::str::from_utf8(req_path).unwrap_or(""),
+                        code_buf.format(grpc_status),
+                        &target.host,
+                        resilience_start,
+                    );
                     // ヘッダにマージ済み + ボディ送信。status 200 で trailers も送る。
                     self.send_grpc_response(
                         &resp_headers,
@@ -1674,7 +1706,7 @@ impl H3BufferedTask {
             prefix,
             security,
             compression,
-            client_encoding,
+            sreq,
             open_file_cache_config,
             canonical_base,
             static_file_cache_config,
@@ -1745,12 +1777,10 @@ impl H3BufferedTask {
         // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
         // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
         // （h2 側 `h2_sendfile` と同じ方針）。
-        let (data, mime_owned, served_path): (
-            bytes::Bytes,
-            std::sync::Arc<str>,
-            std::path::PathBuf,
-        ) = match first_result {
-            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type, full_path),
+        let (data, mime_owned, validators, served_path) = match first_result {
+            Some(cache::StaticFileOutcome::File(info, data)) => {
+                (data, info.mime_type, info.validators, full_path)
+            }
             Some(cache::StaticFileOutcome::Forbidden) => {
                 self.send_error_response(403, b"Forbidden").await?;
                 return Ok((403, 9));
@@ -1770,7 +1800,7 @@ impl H3BufferedTask {
                 .await
                 {
                     Some(cache::StaticFileOutcome::File(info, data)) => {
-                        (data, info.mime_type, index_path)
+                        (data, info.mime_type, info.validators, index_path)
                     }
                     Some(cache::StaticFileOutcome::Forbidden) | None => {
                         self.send_error_response(403, b"Forbidden").await?;
@@ -1792,75 +1822,72 @@ impl H3BufferedTask {
                 return Ok((404, 9));
             }
         };
-        let mime_str: &str = &mime_owned;
-
-        // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
-        // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
-        // 従来この関数は圧縮設定自体を受け取っておらず、HTTP/3 の静的配信では
-        // 圧縮が一切効いていなかった。
-        let should_compress = compression.should_compress(
-            client_encoding,
-            Some(mime_str.as_bytes()),
-            Some(data.len()),
+        self.send_static_response(
+            &sreq,
+            data,
+            &mime_owned,
+            &validators,
+            security,
+            compression,
+            Some((served_path.as_path(), &content_cfg)),
             None,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
+        )
+        .await
+    }
+
+    /// 静的配信（File・memory）の応答を送る（HTTP/1.1・HTTP/2 と同じ `static_response` で決める。B-266・F-286・F-287）
+    #[allow(clippy::too_many_arguments)]
+    async fn send_static_response(
+        &mut self,
+        sreq: &crate::static_response::StaticRequest<'_>,
+        data: Bytes,
+        mime: &str,
+        validators: &crate::static_response::Validators,
+        security: &SecurityConfig,
+        compression: &CompressionConfig,
+        static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
+        memory: Option<&crate::static_response::MemoryContent>,
+        #[cfg(feature = "wasm")] wasm_modules: Option<&crate::wasm_plugin_config::WasmModules>,
+    ) -> io::Result<(u16, usize)> {
+        use crate::http3_stream::RespMsg;
+        #[cfg_attr(not(feature = "wasm"), allow(unused_mut))]
+        let (status, mut headers, body) = crate::static_response::build_bytes_response(
+            sreq,
+            data,
+            mime,
+            validators,
+            security,
+            compression,
+            static_ctx,
+            memory,
         );
-        let mut encoding_name: &[u8] = b"";
-        let response_body: Bytes = if let Some(enc) = should_compress {
-            encoding_name = match enc {
-                AcceptedEncoding::Zstd => b"zstd",
-                AcceptedEncoding::Brotli => b"br",
-                AcceptedEncoding::Gzip => b"gzip",
-                AcceptedEncoding::Deflate => b"deflate",
-                AcceptedEncoding::Identity => b"",
-            };
-            if content_cfg.enabled {
-                let level = cache::compressed::compression_level(enc, compression);
-                cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
-                    compress_body_h3(&data, enc, compression)
-                })
-            } else {
-                Bytes::from(compress_body_h3(&data, enc, compression))
-            }
-        } else {
-            // Bytes::clone() は参照カウント増加のみ（ディープコピー無し）。
-            data.clone()
-        };
-
-        // 応答ヘッダは借用のまま組み立てる（以前は `Vec<(Vec<u8>, Vec<u8>)>` で
-        // リクエストごとに 7〜8 回確保していた）。所有バッファが要るのは F-132 の
-        // WASM on_response_headers を適用するときだけ。
-        let mut resp_headers: Vec<(&[u8], &[u8])> =
-            Vec::with_capacity(4 + security.add_response_headers.len());
-        resp_headers.push((b"content-type", mime_str.as_bytes()));
-        resp_headers.push((b"server", b"veil/http3"));
-        for (k, v) in &security.add_response_headers {
-            resp_headers.push((k.as_bytes(), v.as_bytes()));
-        }
-        if !encoding_name.is_empty() {
-            resp_headers.push((b"content-encoding", encoding_name));
-            resp_headers.push((b"vary", b"Accept-Encoding"));
-        }
-
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
         #[cfg(feature = "wasm")]
-        if let Some(modules) = wasm_modules {
-            let header_store: Vec<(Vec<u8>, Vec<u8>)> = resp_headers
+        if let Some(modules) = wasm_modules.filter(|m| !m.is_empty()) {
+            let store: Vec<(Vec<u8>, Vec<u8>)> = headers
                 .iter()
                 .map(|(k, v)| (k.to_vec(), v.to_vec()))
                 .collect();
-            let header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
-            let owned: Vec<(&[u8], &[u8])> = header_store
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            let store = apply_h3_wasm_response_headers(modules, status, store).await;
+            headers = store
+                .into_iter()
+                .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
                 .collect();
-            self.send_response(200, &owned, Some(response_body.clone()))
-                .await?;
-            return Ok((200, response_body.len()));
         }
-
-        self.send_response(200, &resp_headers, Some(response_body.clone()))
-            .await?;
-        Ok((200, response_body.len()))
+        self.send_msg(RespMsg::Head {
+            status,
+            headers,
+            own_server: true,
+        })
+        .await?;
+        let len = if self.head_req { 0 } else { body.len() };
+        if !body.is_empty() {
+            self.send_msg(RespMsg::Body(body)).await?;
+        }
+        self.finish();
+        Ok((status, len))
     }
 
     /// リダイレクト処理
@@ -1898,15 +1925,8 @@ impl H3BufferedTask {
             }
         }
 
-        self.send_response(
-            status_code,
-            &[
-                (b"location", final_url.as_bytes()),
-                (b"server", b"veil/http3"),
-            ],
-            None,
-        )
-        .await?;
+        self.send_response(status_code, &[(b"location", final_url.as_bytes())], None)
+            .await?;
 
         Ok((status_code, 0))
     }

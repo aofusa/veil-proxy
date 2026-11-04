@@ -155,12 +155,20 @@ pub(super) async fn proxy_https_pooled(
         };
         // wasm_modules は通常空（割り当てなし）のため毎試行クローンしても実質コストは無い。
         let wasm_mods = wasm_modules.clone();
+        // F-285: Wasm の応答本文のフェーズを受けるモジュールがあれば本文を全部溜める（buffering = "full" の経路）
+        #[cfg(feature = "wasm")]
+        let wasm_body = super::compress::wasm_wants_response_body(&wasm_mods);
+        #[cfg(not(feature = "wasm"))]
+        let wasm_body = false;
 
-        let result = if buffering_enabled
-            && (!compression.enabled || client_encoding == AcceptedEncoding::Identity)
+        // `buffering` の適用を数える（圧縮の経路を通っても本文は溜める。B-273）
+        if buffering_enabled && attempt == 1 {
+            record_buffering_used(&target.host);
+        }
+        let result = if wasm_body
+            || (buffering_enabled
+                && (!compression.enabled || client_encoding == AcceptedEncoding::Identity))
         {
-            let host_str_for_metrics = &target.host;
-            record_buffering_used(host_str_for_metrics);
             proxy_request_buffered(
                 &mut client_stream,
                 &mut backend_stream,
@@ -172,6 +180,10 @@ pub(super) async fn proxy_https_pooled(
                 buffering_config,
                 None,
                 security,
+                #[cfg(feature = "wasm")]
+                &wasm_mods,
+                #[cfg(feature = "wasm")]
+                wasm_body.then_some((compression, client_encoding)),
             )
             .await
         } else {
@@ -197,6 +209,7 @@ pub(super) async fn proxy_https_pooled(
                 // プールから取り出した接続が応答前に死んでいた（total==0 かつ status は初期値 502 = レスポンス未受信）。
                 // クライアントへ未送信のため、新規接続で一度だけ透過リトライ。死んだ接続はプールに戻さない。
                 if from_pool && total == 0 && status_code == 502 && replayable && attempt < 2 {
+                    crate::metrics::record_retry(target.conn_addr().as_str(), "stale_connection");
                     continue;
                 }
                 // B-17: クライアントへ 1 バイトも送らないままバックエンド異常で終わった場合、
@@ -227,6 +240,7 @@ pub(super) async fn proxy_https_pooled(
             None => {
                 // プール接続でのエラーかつクライアントへ未送信なら新規接続でリトライ
                 if from_pool && replayable && attempt < 2 {
+                    crate::metrics::record_retry(target.conn_addr().as_str(), "stale_connection");
                     continue;
                 }
                 // エラー発生時は接続を破棄
@@ -437,6 +451,9 @@ pub(super) async fn transfer_https_response_with_compression(
                     compression,
                     backend_wants_keep_alive,
                     security,
+                    status_code,
+                    #[cfg(feature = "wasm")]
+                    &wasm_modules,
                 )
                 .await
                 {
@@ -445,126 +462,15 @@ pub(super) async fn transfer_https_response_with_compression(
                     None => (0, 502, false, true),
                 };
             } else {
-                // 圧縮無効: そのまま転送（ヘッダー追加処理）
-                let mut modified_headers = accumulated[..header_len].to_vec();
-
-                // ヘッダーをパースして操作
-                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-                let mut response = httparse::Response::new(&mut headers_storage);
-                if response.parse(&modified_headers).is_ok() {
-                    let mut new_header_lines = Vec::new();
-
-                    // ステータス行を追加
-                    let status_line = format!(
-                        "HTTP/1.1 {} {}\r\n",
-                        status_code,
-                        status_code_to_reason(status_code)
-                    );
-                    new_header_lines.push(status_line.into_bytes());
-
-                    // 既存のヘッダーを追加（削除対象を除外）
-                    // eq_ignore_ascii_case でアロケーションなしに比較
-                    for header in response.headers.iter() {
-                        if !security
-                            .remove_response_headers
-                            .iter()
-                            .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
-                        {
-                            new_header_lines.push(
-                                format!(
-                                    "{}: {}\r\n",
-                                    header.name,
-                                    std::str::from_utf8(header.value).unwrap_or("")
-                                )
-                                .into_bytes(),
-                            );
-                        }
-                    }
-
-                    // 追加するヘッダーを追加
-                    for (header_name, header_value) in &security.add_response_headers {
-                        new_header_lines
-                            .push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
-                    }
-                    // F-94: HTTP/3 広告（Alt-Svc）
-                    if let Some(g) = get_alt_svc_guard() {
-                        let mut line = Vec::with_capacity(16 + g.value().len());
-                        line.extend_from_slice(b"Alt-Svc: ");
-                        line.extend_from_slice(g.value());
-                        line.extend_from_slice(b"\r\n");
-                        new_header_lines.push(line);
-                    }
-
-                    // WASMレスポンスヘッダーフィルタを適用
+                // 圧縮無効: そのまま転送（応答ヘッダの方針・Alt-Svc・Wasm・CORS を `compress` の平文の経路と共有）
+                let modified_headers = finish_h1_upstream_head(
+                    &accumulated[..header_len],
+                    status_code,
+                    security,
                     #[cfg(feature = "wasm")]
-                    {
-                        if !wasm_modules.is_empty() {
-                            let config = CURRENT_CONFIG.load();
-                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines
-                                    .iter()
-                                    .skip(1)
-                                    .filter_map(|line| {
-                                        let line_str = std::str::from_utf8(line).ok()?;
-                                        let line_trimmed = line_str.trim_end_matches("\r\n");
-                                        if line_trimmed.is_empty() {
-                                            return None;
-                                        }
-                                        let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
-                                        let value = line_trimmed[colon_pos + 1..]
-                                            .trim_start()
-                                            .as_bytes()
-                                            .to_vec();
-                                        Some((name, value))
-                                    })
-                                    .collect();
-
-                                let wasm_result = wasm_engine
-                                    .clone()
-                                    .on_response_headers_with_modules_async(
-                                        wasm_modules.clone(),
-                                        status_code,
-                                        current_headers,
-                                        true,
-                                    )
-                                    .await;
-
-                                if let crate::wasm::FilterResult::Continue {
-                                    headers: modified_headers_wasm,
-                                    ..
-                                } = wasm_result
-                                {
-                                    new_header_lines.clear();
-                                    let status_line = format!(
-                                        "HTTP/1.1 {} {}\r\n",
-                                        status_code,
-                                        status_code_to_reason(status_code)
-                                    );
-                                    new_header_lines.push(status_line.into_bytes());
-                                    for (name, value) in modified_headers_wasm {
-                                        let mut line =
-                                            Vec::with_capacity(name.len() + value.len() + 4);
-                                        line.extend_from_slice(&name);
-                                        line.extend_from_slice(b": ");
-                                        line.extend_from_slice(&value);
-                                        line.extend_from_slice(b"\r\n");
-                                        new_header_lines.push(line);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // ヘッダー終了マーカーを追加
-                    new_header_lines.push(b"\r\n".to_vec());
-
-                    // 結合
-                    modified_headers = new_header_lines.into_iter().flatten().collect();
-                }
-
-                // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-                crate::route_cors::apply_h1(&mut modified_headers, security);
+                    &wasm_modules,
+                )
+                .await;
                 // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
                 // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
                 let start = response_body_start(body_kind, body_start);

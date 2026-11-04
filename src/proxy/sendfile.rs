@@ -42,7 +42,10 @@ pub(super) async fn handle_sendfile(
     prefix: &[u8],
     client_wants_close: bool,
     security: &SecurityConfig,
-    range_header: Option<&[u8]>, // RFC 7233 Range header support
+    // HEAD・Range・条件付き要求・Accept-Encoding（B-266・F-286・F-287）
+    sreq: &crate::static_response::StaticRequest<'_>,
+    // ルートの `[route.compression]`（B-269: HTTP/2・HTTP/3 と同じく静的配信も圧縮する）
+    compression: &CompressionConfig,
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
     canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
     wasm_modules: crate::wasm_plugin_config::WasmModules,
@@ -140,7 +143,7 @@ pub(super) async fn handle_sendfile(
     // `file_info` / `idx_info` は所有値なのでフィールドをムーブする（clone による
     // PathBuf / String の確保をしない）。open_file_cache が開いた fd を共有していれば
     // それを使い、open/close を省く（nginx の open_file_cache と同じ）。
-    let (final_path, file_size, mime_type, shared_file) = if !file_info.is_file {
+    let (final_path, file_size, mime_type, shared_file, validators) = if !file_info.is_file {
         let filename = index_filename.unwrap_or("index.html");
         let index_path = file_info.canonical_path.join(filename);
 
@@ -153,6 +156,7 @@ pub(super) async fn handle_sendfile(
                     idx_info.file_size,
                     idx_info.mime_type,
                     shared,
+                    idx_info.validators,
                 )
             }
             _ => {
@@ -169,6 +173,7 @@ pub(super) async fn handle_sendfile(
             file_info.file_size,
             file_info.mime_type,
             shared,
+            file_info.validators,
         )
     };
 
@@ -187,163 +192,94 @@ pub(super) async fn handle_sendfile(
         },
     };
 
-    // キャッシュから取得したサイズとMIMEタイプを使用
-    // （file.metadata()の呼び出しを省略）
+    // 返す応答を決める（HTTP/2・HTTP/3 と同じ関数。B-266・B-269・F-286・F-287）
+    let plan =
+        crate::static_response::plan(sreq, file_size, &mime_type, Some(&validators), compression);
+    let response_status = plan.status();
+    let vary = crate::static_response::compression_applies(compression, &mime_type, file_size);
 
-    // RFC 7233 Range リクエスト処理
-    let range_info: Option<(u64, u64)> = if let Some(range_bytes) = range_header {
-        if let Some(parsed) = parse_range_header(range_bytes) {
-            if let Some(first_range) = parsed.ranges.first() {
-                match normalize_range(first_range, file_size) {
-                    Some((start, end)) => Some((start, end)),
-                    None => {
-                        // 416 Range Not Satisfiable
-                        let resp = build_range_not_satisfiable_response(file_size);
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(resp)).await;
-                        return Some((tls_stream, 416, 0, true));
-                    }
+    // 圧縮して返すときは本体を読んで圧縮する（静的コンテンツキャッシュ・圧縮結果のキャッシュが有効なら再利用）
+    let compressed: Option<bytes::Bytes> = match plan {
+        crate::static_response::Plan::Full {
+            encoding: Some(enc),
+        } => {
+            let content_cfg =
+                cache::effective_static_content_cache_config(static_file_cache_config);
+            match load_file_bytes(&file, &final_path, file_size, &mime_type, &content_cfg).await {
+                Some(data) => {
+                    let level = cache::compressed::compression_level(enc, compression);
+                    Some(cache::compressed::get_or_compress(
+                        &final_path,
+                        enc,
+                        level,
+                        &content_cfg,
+                        || crate::static_response::compress_body(&data, enc, compression),
+                    ))
                 }
-            } else {
-                None
+                None => {
+                    let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return Some((tls_stream, 404, 0, true));
+                }
             }
-        } else {
-            None // 不正なRange形式は無視して通常レスポンス
         }
-    } else {
-        None
+        _ => None,
     };
 
-    // ヘッダー構築（Keep-Alive対応 + カスタムレスポンスヘッダー）
-    let mut header_buf = Vec::with_capacity(HEADER_BUF_CAPACITY);
-
-    // Range リクエストの場合は 206 Partial Content
-    let (response_status, _response_content_length) = if let Some((start, end)) = range_info {
-        let content_length = end - start + 1;
-        // 数値→バイト列は itoa でスタックバッファに直接書き込む（String の一時確保を排除）。
-        let mut num_buf = itoa::Buffer::new();
-        header_buf.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ");
-        header_buf.extend_from_slice(mime_type.as_bytes());
-        header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
-        header_buf.extend_from_slice(num_buf.format(start).as_bytes());
-        header_buf.extend_from_slice(b"-");
-        header_buf.extend_from_slice(num_buf.format(end).as_bytes());
-        header_buf.extend_from_slice(b"/");
-        header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
-        header_buf.extend_from_slice(b"\r\nContent-Length: ");
-        header_buf.extend_from_slice(num_buf.format(content_length).as_bytes());
-        header_buf.extend_from_slice(b"\r\n");
-        (206u16, content_length)
-    } else {
-        // 通常のレスポンス
-        header_buf.extend_from_slice(HTTP_200_PREFIX);
-        header_buf.extend_from_slice(mime_type.as_bytes());
-        header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes"); // Range サポートを通知
-        header_buf.extend_from_slice(CONTENT_LENGTH_HEADER);
-        let mut num_buf = itoa::Buffer::new();
-        header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
-        header_buf.extend_from_slice(b"\r\n");
-        (200u16, file_size)
+    // 本文の範囲（送る位置と長さ。304・416 は本文なし）
+    let (transfer_offset, transfer_length) = match plan {
+        crate::static_response::Plan::Partial { start, end } => (start as i64, end - start + 1),
+        crate::static_response::Plan::Full { .. } => (
+            0i64,
+            compressed.as_ref().map_or(file_size, |c| c.len() as u64),
+        ),
+        _ => (0i64, 0u64),
     };
 
-    // 追加レスポンスヘッダー（セキュリティヘッダーなど）
-    for (header_name, header_value) in &security.add_response_headers {
-        header_buf.extend_from_slice(header_name.as_bytes());
-        header_buf.extend_from_slice(b": ");
-        header_buf.extend_from_slice(header_value.as_bytes());
-        header_buf.extend_from_slice(b"\r\n");
-    }
-    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
-    crate::route_cors::append_h1_lines(&mut header_buf, security);
-    // F-94: HTTP/3 広告（Alt-Svc）
-    append_alt_svc_header_line(&mut header_buf);
+    let header_buf = build_h1_static_head(
+        &plan,
+        file_size,
+        transfer_length,
+        &mime_type,
+        Some(&validators),
+        vary,
+        security,
+    );
 
     // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
     #[cfg(feature = "wasm")]
-    let mut header_buf = {
-        if !wasm_modules.is_empty() {
-            let config = CURRENT_CONFIG.load();
-            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                // 現在のヘッダーをVec<(String, String)>形式に変換
-                let header_str = String::from_utf8_lossy(&header_buf);
-                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = header_str
-                    .lines()
-                    .skip(1) // ステータス行をスキップ
-                    .filter_map(|line| {
-                        let line_trimmed = line.trim_end_matches("\r\n").trim_end_matches("\r");
-                        if line_trimmed.is_empty() {
-                            return None;
-                        }
-                        let colon_pos = line_trimmed.find(':')?;
-                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
-                        let value = line_trimmed[colon_pos + 1..]
-                            .trim_start()
-                            .as_bytes()
-                            .to_vec();
-                        Some((name, value))
-                    })
-                    .collect();
+    let mut header_buf = h1_wasm_response_head(header_buf, response_status, &wasm_modules).await;
+    #[cfg(not(feature = "wasm"))]
+    let mut header_buf = header_buf;
 
-                // WASMフィルタを実行（レスポンスヘッダー処理）
-                let wasm_result = wasm_engine
-                    .clone()
-                    .on_response_headers_with_modules_async(
-                        wasm_modules.clone(),
-                        200,
-                        current_headers,
-                        true, // end_of_stream
-                    )
-                    .await;
-
-                match wasm_result {
-                    crate::wasm::FilterResult::Continue {
-                        headers: modified_headers,
-                        ..
-                    } => {
-                        // WASMから修正されたヘッダーで再構築
-                        let mut new_header = Vec::with_capacity(HEADER_BUF_CAPACITY);
-                        new_header.extend_from_slice(HTTP_200_PREFIX);
-                        new_header.extend_from_slice(mime_type.as_bytes());
-                        new_header.extend_from_slice(CONTENT_LENGTH_HEADER);
-                        let mut num_buf = itoa::Buffer::new();
-                        new_header.extend_from_slice(num_buf.format(file_size).as_bytes());
-                        new_header.extend_from_slice(b"\r\n");
-
-                        // WASMから返されたヘッダーを追加
-                        for (name, value) in modified_headers {
-                            new_header.extend_from_slice(&name);
-                            new_header.extend_from_slice(b": ");
-                            new_header.extend_from_slice(&value);
-                            new_header.extend_from_slice(b"\r\n");
-                        }
-                        new_header
-                    }
-                    _ => header_buf,
-                }
-            } else {
-                header_buf
-            }
-        } else {
-            header_buf
-        }
-    };
-
-    // Connection ヘッダーを追加（header_buf は上で `let mut` 済み）
+    // Connection ヘッダーを追加
     if client_wants_close {
         header_buf.extend_from_slice(b"Connection: close\r\n\r\n");
     } else {
         header_buf.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
     }
 
-    // ファイル転送
-    // Range リクエストの場合はオフセットと長さを調整
-    // （F-155: ヘッダー送信より前に移動。この計算はヘッダー送信に依存しないため
-    // 移動しても挙動は変わらない。FreeBSD 高速経路がヘッダー送信前にこの値を
-    // 必要とするため。）
-    let (transfer_offset, transfer_length) = if let Some((start, end)) = range_info {
-        (start as i64, end - start + 1)
-    } else {
-        (0i64, file_size)
-    };
+    // HEAD・304・416 はヘッダだけ（B-266）
+    if sreq.head || transfer_length == 0 {
+        return match timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await {
+            Ok((Ok(_), _)) => Some((tls_stream, response_status, 0, client_wants_close)),
+            _ => None,
+        };
+    }
+
+    // 圧縮した本体はヘッダと一緒に 1 回で送る
+    if let Some(body) = compressed {
+        let len = body.len() as u64;
+        return match timeout(
+            WRITE_TIMEOUT,
+            tls_stream.write_all_vectored(header_buf, body),
+        )
+        .await
+        {
+            Ok((Ok(_), _, _)) => Some((tls_stream, response_status, len, client_wants_close)),
+            _ => None,
+        };
+    }
 
     // F-155: FreeBSD の平文（TLS 終端なし）接続に限り、レスポンスヘッダーと
     // ファイル本体を sf_hdtr 付き sendfile(2) 1 回で送る（write(2) + sendfile(2) の
@@ -587,38 +523,7 @@ pub(super) async fn handle_sendfile_userspace(
     if content_cfg.enabled && file_size <= content_cfg.max_file_size_bytes {
         // キャッシュはファイル全体を保持する（Range リクエストであっても部分内容だけを
         // 挿入すると、後続の別範囲・全体リクエストが正しく解決できなくなるため）。
-        let cached =
-            if let Some(data) = cache::get_cached_content_cache(file_path, &content_cfg).await {
-                Some(data)
-            } else {
-                // キャッシュミス: 既に開いている fd から 1 回の read_exact_at でファイル
-                // 全体を読み込む。`cache::get_or_load` は `std::fs::read(path)` で
-                // **開き直す**ため使えない（FreeBSD capability mode = `cap_enter` 下では
-                // 絶対パス open が禁止されている、F-123）。既に開いている fd を使えば
-                // open/close も増えない。`Vec::with_capacity` はゼロ初期化を伴わず、
-                // `read_exact_at` が生ポインタへ直接書き込む（`IoBufMut` 実装参照）。
-                let read_buf: Vec<u8> = Vec::with_capacity(file_size as usize);
-                let (res, returned_buf) = file.read_exact_at(read_buf, 0).await;
-                match res {
-                    Ok(n) if n as u64 == file_size => {
-                        // Vec<u8> -> Bytes はヒープ確保をそのまま引き継ぐだけで memcpy を
-                        // 伴わない（`Bytes::from(Vec<u8>)`）。
-                        // `use bytes::Bytes` は `feature = "http2"` 限定のため、本経路
-                        // （feature 非依存）ではフルパスで参照する。
-                        let data = bytes::Bytes::from(returned_buf);
-                        // mime_guess の再計算を避けるため、呼び出し元（handle_sendfile）が
-                        // 既に決定済みの MIME タイプを使い回す（Arc<str> 化はミス時のみ発生）。
-                        cache::insert_content_cache_bytes(
-                            file_path,
-                            data.clone(),
-                            Arc::from(mime_type),
-                            &content_cfg,
-                        );
-                        Some(data)
-                    }
-                    _ => None, // 読み込み失敗・短い読み込み時は下の通常経路へフォールバック
-                }
-            };
+        let cached = load_file_bytes(file, file_path, file_size, mime_type, &content_cfg).await;
 
         if let Some(data) = cached {
             let start = transfer_offset as usize;
@@ -701,4 +606,174 @@ pub(super) async fn handle_sendfile_userspace(
     }
 
     Some((tls_stream, response_status, total_sent, client_wants_close))
+}
+
+/// ファイル全体を `Bytes` で得る（静的コンテンツキャッシュが有効ならキャッシュから、無ければ開いている fd から 1 回の
+/// `read_exact_at` で読み、キャッシュに入れる）。読めなければ `None`。
+///
+/// `cache::get_or_load` は `std::fs::read(path)` で **開き直す**ため使えない（FreeBSD capability mode = `cap_enter` 下では
+/// 絶対パス open が禁止されている、F-123）。既に開いている fd を使えば open/close も増えない。
+pub(super) async fn load_file_bytes(
+    file: &crate::runtime::io::File,
+    file_path: &Path,
+    file_size: u64,
+    mime_type: &str,
+    content_cfg: &cache::StaticContentCacheConfig,
+) -> Option<bytes::Bytes> {
+    let cacheable = content_cfg.enabled && file_size <= content_cfg.max_file_size_bytes;
+    if cacheable {
+        if let Some(data) = cache::get_cached_content_cache(file_path, content_cfg).await {
+            return Some(data);
+        }
+    }
+    // `Vec::with_capacity` はゼロ初期化を伴わず、`read_exact_at` が生ポインタへ直接書き込む（`IoBufMut` 実装参照）。
+    let read_buf: Vec<u8> = Vec::with_capacity(file_size as usize);
+    let (res, returned_buf) = file.read_exact_at(read_buf, 0).await;
+    match res {
+        Ok(n) if n as u64 == file_size => {
+            // Vec<u8> -> Bytes はヒープ確保をそのまま引き継ぐだけで memcpy を伴わない
+            let data = bytes::Bytes::from(returned_buf);
+            if cacheable {
+                // mime_guess の再計算を避けるため、呼び出し元が決定済みの MIME タイプを使い回す
+                cache::insert_content_cache_bytes(
+                    file_path,
+                    data.clone(),
+                    Arc::from(mime_type),
+                    content_cfg,
+                );
+            }
+            Some(data)
+        }
+        _ => None,
+    }
+}
+
+/// 名前を `Content-Type` の形（先頭と `-` の後を大文字）で HTTP/1.1 のヘッダ行として足す
+fn push_h1_header(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    let mut upper = true;
+    for &b in name {
+        out.push(if upper { b.to_ascii_uppercase() } else { b });
+        upper = b == b'-';
+    }
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// 静的配信（`type = "File"`・`mode = "memory"`）の HTTP/1.1 の応答ヘッダを、ステータス行から `Connection` の直前まで
+/// 組み立てる（`static_response::emit_headers` を HTTP/2・HTTP/3 と共有。B-266・B-269・F-286・F-287）。
+///
+/// `content_length` は送る本文の長さ（HEAD でも GET と同じ値。304 では付けない）。
+pub(super) fn build_h1_static_head(
+    plan: &crate::static_response::Plan,
+    size: u64,
+    content_length: u64,
+    mime: &str,
+    validators: Option<&crate::static_response::Validators>,
+    vary: bool,
+    security: &SecurityConfig,
+) -> Vec<u8> {
+    use crate::static_response::Plan;
+    let mut h = Vec::with_capacity(HEADER_BUF_CAPACITY);
+    h.extend_from_slice(match plan {
+        Plan::Full { .. } => b"HTTP/1.1 200 OK\r\n".as_slice(),
+        Plan::Partial { .. } => b"HTTP/1.1 206 Partial Content\r\n",
+        Plan::NotModified => b"HTTP/1.1 304 Not Modified\r\n",
+        Plan::Unsatisfiable => b"HTTP/1.1 416 Range Not Satisfiable\r\n",
+    });
+    let removes = !security.remove_response_headers.is_empty();
+    crate::static_response::emit_headers(plan, size, mime, validators, vary, |n, v| {
+        if !removes || !security.removes_response_header(n) {
+            push_h1_header(&mut h, n, v.as_slice());
+        }
+    });
+    // `[server] server_header_enabled`（B-271。HTTP/2・HTTP/3 と同じ）
+    if !removes || !security.removes_response_header(b"server") {
+        crate::pool::append_server_header_line(&mut h);
+    }
+    if !matches!(plan, Plan::NotModified) {
+        h.extend_from_slice(b"Content-Length: ");
+        let mut num = itoa::Buffer::new();
+        h.extend_from_slice(num.format(content_length).as_bytes());
+        h.extend_from_slice(b"\r\n");
+    }
+    // 追加レスポンスヘッダー（セキュリティヘッダーなど）
+    for (header_name, header_value) in &security.add_response_headers {
+        h.extend_from_slice(header_name.as_bytes());
+        h.extend_from_slice(b": ");
+        h.extend_from_slice(header_value.as_bytes());
+        h.extend_from_slice(b"\r\n");
+    }
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
+    crate::route_cors::append_h1_lines(&mut h, security);
+    // F-94: HTTP/3 広告（Alt-Svc）
+    crate::pool::append_own_alt_svc_line(&mut h, security);
+    h
+}
+
+/// HTTP/1.1 の応答ヘッダ（ステータス行からヘッダの行まで。空行は含めない）に Wasm の `on_http_response_headers` を
+/// かける。モジュールが無ければそのまま返す。
+///
+/// ステータス行と本文の区切り（`Content-Length`・`Transfer-Encoding`・`Connection`）は元のまま残し、モジュールには
+/// 変えさせない（送る本文と食い違うと接続が壊れる。以前の静的配信は 206・304 でも 200 に作り直し、`Content-Length` を
+/// 二重に付けていた。B-268）。
+#[cfg(feature = "wasm")]
+pub(super) async fn h1_wasm_response_head(
+    head: Vec<u8>,
+    status: u16,
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
+) -> Vec<u8> {
+    if wasm_modules.is_empty() {
+        return head;
+    }
+    let config = CURRENT_CONFIG.load();
+    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+        return head;
+    };
+    let status_end = match head.windows(2).position(|w| w == b"\r\n") {
+        Some(i) => i + 2,
+        None => return head,
+    };
+    let is_framing = |name: &[u8]| {
+        name.eq_ignore_ascii_case(b"content-length")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"connection")
+    };
+    let mut current: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(16);
+    for line in head[status_end..].split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        current.push((
+            line[..colon].to_vec(),
+            line[colon + 1..].trim_ascii().to_vec(),
+        ));
+    }
+    let result = wasm_engine
+        .clone()
+        .on_response_headers_with_modules_async(wasm_modules.clone(), status, current, true)
+        .await;
+    let crate::wasm::FilterResult::Continue {
+        headers: modified, ..
+    } = result
+    else {
+        return head;
+    };
+    let mut out = Vec::with_capacity(head.len() + 64);
+    out.extend_from_slice(&head[..status_end]);
+    for (name, value) in modified.iter().filter(|(n, _)| !is_framing(n)) {
+        out.extend_from_slice(name);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+    // 元の区切りの行をそのまま戻す
+    for line in head[status_end..].split_inclusive(|&b| b == b'\n') {
+        let name_end = line.iter().position(|&b| b == b':').unwrap_or(0);
+        if name_end > 0 && is_framing(&line[..name_end]) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }

@@ -361,6 +361,7 @@ pub struct CachedFileInfo {
     pub file_size: u64,
     pub mime_type: std::sync::Arc<str>,
     pub last_modified: Option<std::time::SystemTime>,
+    pub validators: std::sync::Arc<crate::static_response::Validators>,
     pub is_file: bool,
 }
 
@@ -423,6 +424,11 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
                     Some(CachedFileInfo {
                         canonical_path: path.into(),
                         file_size: meta.len(),
+                        validators: crate::static_response::Validators::shared_for_file(
+                            meta.len(),
+                            meta.modified().ok(),
+                            &mime_type,
+                        ),
                         mime_type,
                         last_modified: meta.modified().ok(),
                         is_file: meta.is_file(),
@@ -444,6 +450,9 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
             return Some(CachedFileInfo {
                 canonical_path: path.into(),
                 file_size: st.len,
+                validators: crate::static_response::Validators::shared_for_file(
+                    st.len, st.mtime, &mime_type,
+                ),
                 mime_type,
                 last_modified: st.mtime,
                 is_file: st.is_file,
@@ -461,6 +470,11 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         Some(CachedFileInfo {
             canonical_path: canonical.into(),
             file_size: metadata.len(),
+            validators: crate::static_response::Validators::shared_for_file(
+                metadata.len(),
+                metadata.modified().ok(),
+                &mime_type,
+            ),
             mime_type,
             last_modified: metadata.modified().ok(),
             is_file: metadata.is_file(),
@@ -496,6 +510,11 @@ fn build_cached_file_info_uncached(
     CachedFileInfo {
         canonical_path: path.into(),
         file_size: meta.len(),
+        validators: crate::static_response::Validators::shared_for_file(
+            meta.len(),
+            meta.modified().ok(),
+            &mime_type,
+        ),
         mime_type,
         last_modified: meta.modified().ok(),
         is_file: meta.is_file(),

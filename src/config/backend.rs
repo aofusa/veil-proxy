@@ -29,11 +29,11 @@ pub enum Backend {
         Option<Arc<Vec<ModuleRef>>>,
     ),
     /// MemoryFile バックエンド
-    /// - `Arc<Vec<u8>>`: ファイルコンテンツ
+    /// - `Arc<MemoryContent>`: ファイルコンテンツと検証子（ETag。F-287）・圧縮した本体
     /// - `Arc<str>`: MIMEタイプ
     /// - `Arc<SecurityConfig>`: ルートごとのセキュリティ設定
     MemoryFile(
-        Arc<Vec<u8>>,
+        Arc<crate::static_response::MemoryContent>,
         Arc<str>,
         Arc<SecurityConfig>,
         /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
@@ -110,6 +110,20 @@ impl Backend {
     /// このバックエンドのセキュリティ設定を取得
     #[inline]
     pub fn security(&self) -> &SecurityConfig {
+        match self {
+            Backend::Proxy(_, security, _, _, _, _) => security,
+            Backend::MemoryFile(_, _, security, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
+            Backend::Redirect(_, _, _, _, security) => security,
+            Backend::Respond(r) => &r.security,
+            #[cfg(feature = "handler")]
+            Backend::Handler(_, security, _, _) => security,
+        }
+    }
+
+    /// このバックエンドのセキュリティ設定（`Arc`。応答の head に方針をかけるタスクへ渡す）
+    #[inline]
+    pub fn security_arc(&self) -> &Arc<SecurityConfig> {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,

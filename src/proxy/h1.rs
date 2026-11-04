@@ -779,7 +779,7 @@ pub(super) async fn handle_requests(
                     )
                 };
 
-                let (prefix, backend, _route_compression) = match backend_result {
+                let (prefix, backend, route_compression) = match backend_result {
                     Some(b) => b,
                     None => {
                         let err_buf = ERR_MSG_NOT_FOUND.to_vec();
@@ -1284,6 +1284,7 @@ pub(super) async fn handle_requests(
                 let result = handle_backend(
                     tls_stream,
                     backend,
+                    &route_compression,
                     &method_bytes,
                     &path_bytes,
                     prefix,
@@ -1473,6 +1474,8 @@ pub(super) async fn drain_request_body(
 pub(super) async fn handle_backend(
     mut tls_stream: ServerTls,
     backend: Backend,
+    // ルートの `[route.compression]`（静的配信の圧縮に使う。B-269）
+    route_compression: &CompressionConfig,
     method: &Bytes,
     req_path: &Bytes,
     prefix: Arc<[u8]>,
@@ -1552,122 +1555,56 @@ pub(super) async fn handle_backend(
                 return Some((tls_stream, 404, 0, true));
             }
 
-            // Keep-Alive対応: クライアントの要求に応じてConnectionヘッダーを動的に生成
-            let mut header = Vec::with_capacity(HEADER_BUF_CAPACITY);
-            header.extend_from_slice(HTTP_200_PREFIX);
-            header.extend_from_slice(mime_type.as_bytes());
-            header.extend_from_slice(CONTENT_LENGTH_HEADER);
-            let mut num_buf = itoa::Buffer::new();
-            header.extend_from_slice(num_buf.format(data.len()).as_bytes());
-            header.extend_from_slice(b"\r\n");
-
-            // 追加レスポンスヘッダー（セキュリティヘッダーなど）
-            for (header_name, header_value) in &security.add_response_headers {
-                header.extend_from_slice(header_name.as_bytes());
-                header.extend_from_slice(b": ");
-                header.extend_from_slice(header_value.as_bytes());
-                header.extend_from_slice(b"\r\n");
-            }
-            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273）
-            crate::route_cors::append_h1_lines(&mut header, &security);
-            // F-94: HTTP/3 広告（Alt-Svc）
-            append_alt_svc_header_line(&mut header);
-
+            // 返す応答を決める（HTTP/2・HTTP/3 と同じ関数。B-266・B-269・F-286・F-287）
+            let sreq = crate::static_response::StaticRequest::from_headers(
+                method,
+                headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+            );
+            let plan = crate::static_response::plan(
+                &sreq,
+                data.len(),
+                &mime_type,
+                Some(&data.validators),
+                route_compression,
+            );
+            let status = plan.status();
+            let vary = crate::static_response::compression_applies(
+                route_compression,
+                &mime_type,
+                data.len(),
+            );
+            let body = data.body_for(&plan, route_compression);
+            let header = sendfile::build_h1_static_head(
+                &plan,
+                data.len(),
+                body.len() as u64,
+                &mime_type,
+                Some(&data.validators),
+                vary,
+                &security,
+            );
             // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
             #[cfg(feature = "wasm")]
-            let mut header = {
-                ftlog::debug!(
-                    "[WASM Response] MemoryFile: wasm_modules count = {}",
-                    wasm_modules.len()
-                );
-                if !wasm_modules.is_empty() {
-                    let config = CURRENT_CONFIG.load();
-                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                        // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
-                        let header_str = String::from_utf8_lossy(&header);
-                        let current_headers: Vec<(Vec<u8>, Vec<u8>)> = header_str
-                            .lines()
-                            .skip(1) // ステータス行をスキップ
-                            .filter_map(|line| {
-                                let line_trimmed =
-                                    line.trim_end_matches("\r\n").trim_end_matches("\r");
-                                if line_trimmed.is_empty() {
-                                    return None;
-                                }
-                                let colon_pos = line_trimmed.find(':')?;
-                                let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
-                                let value = line_trimmed[colon_pos + 1..]
-                                    .trim_start()
-                                    .as_bytes()
-                                    .to_vec();
-                                Some((name, value))
-                            })
-                            .collect();
+            let mut header = sendfile::h1_wasm_response_head(header, status, &wasm_modules).await;
+            #[cfg(not(feature = "wasm"))]
+            let mut header = header;
 
-                        // WASMフィルタを実行（レスポンスヘッダー処理）
-                        let wasm_result = wasm_engine
-                            .clone()
-                            .on_response_headers_with_modules_async(
-                                wasm_modules.clone(),
-                                200,
-                                current_headers,
-                                true, // end_of_stream
-                            )
-                            .await;
-
-                        match wasm_result {
-                            crate::wasm::FilterResult::Continue {
-                                headers: modified_headers,
-                                ..
-                            } => {
-                                // WASMから修正されたヘッダーで再構築
-                                let mut new_header = Vec::with_capacity(HEADER_BUF_CAPACITY);
-                                new_header.extend_from_slice(HTTP_200_PREFIX);
-                                new_header.extend_from_slice(mime_type.as_bytes());
-                                new_header.extend_from_slice(CONTENT_LENGTH_HEADER);
-                                let mut num_buf = itoa::Buffer::new();
-                                new_header.extend_from_slice(num_buf.format(data.len()).as_bytes());
-                                new_header.extend_from_slice(b"\r\n");
-
-                                // WASMから返されたヘッダーを追加
-                                for (name, value) in modified_headers {
-                                    new_header.extend_from_slice(&name);
-                                    new_header.extend_from_slice(b": ");
-                                    new_header.extend_from_slice(&value);
-                                    new_header.extend_from_slice(b"\r\n");
-                                }
-                                new_header
-                            }
-                            _ => header,
-                        }
-                    } else {
-                        header
-                    }
-                } else {
-                    header
-                }
-            };
-
-            // Connection header を追加（header は上で `let mut` 済み）
             if client_wants_close {
                 header.extend_from_slice(b"Connection: close\r\n\r\n");
             } else {
                 header.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
             }
 
-            // ヘッダー送信（タイムアウト付き）
-            let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header)).await;
-            match write_result {
-                Ok((Ok(_), _)) => {}
-                _ => return None,
+            // HEAD・304・416 はヘッダだけ（B-266）。本文はヘッダと一緒に 1 回で送る（コピーしない）
+            if sreq.head || body.is_empty() {
+                return match timeout(WRITE_TIMEOUT, tls_stream.write_all(header)).await {
+                    Ok((Ok(_), _)) => Some((tls_stream, status, 0, client_wants_close)),
+                    _ => None,
+                };
             }
-
-            // ボディ送信（タイムアウト付き）
-            let data_len = data.len() as u64;
-            let data_buf = data.to_vec();
-            let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(data_buf)).await;
-            match write_result {
-                Ok((Ok(_), _)) => Some((tls_stream, 200, data_len, client_wants_close)),
+            let data_len = body.len() as u64;
+            match timeout(WRITE_TIMEOUT, tls_stream.write_all_vectored(header, body)).await {
+                Ok((Ok(_), _, _)) => Some((tls_stream, status, data_len, client_wants_close)),
                 _ => None,
             }
         }
@@ -1682,11 +1619,10 @@ pub(super) async fn handle_backend(
             static_file_cache_config,
             _,
         ) => {
-            // Range ヘッダーを抽出 (RFC 7233)
-            let range_header = headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(b"range"))
-                .map(|(_, v)| v.as_ref());
+            let sreq = crate::static_response::StaticRequest::from_headers(
+                method,
+                headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+            );
             handle_sendfile(
                 tls_stream,
                 &base_path,
@@ -1696,7 +1632,8 @@ pub(super) async fn handle_backend(
                 &prefix,
                 client_wants_close,
                 &security,
-                range_header,
+                &sreq,
+                route_compression,
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 wasm_modules,
@@ -2076,7 +2013,7 @@ async fn pump_api_body(
 /// 書くとクライアントは残りを次の応答の先頭として読む）。HEAD は Content-Length を本文の長さのまま付ける
 /// （GET と同じヘッダ）。1xx・204・304 は補わない。
 #[cfg(feature = "wasm")]
-fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bool) -> Vec<u8> {
+pub(super) fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bool) -> Vec<u8> {
     let no_body_status = matches!(resp.status_code, 100..=199 | 204 | 304);
     let write_body = !head && !no_body_status;
     let mut response = Vec::with_capacity(
@@ -2131,9 +2068,10 @@ fn set_body_framing_headers(headers: &mut Vec<(Bytes, Bytes)>, len: usize) {
     ));
 }
 
-/// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧。要求ごとに `Arc` を作らないよう
+/// `wasm` feature 無しのビルドで handle_backend に渡す空のモジュール一覧（HTTP/2 の要求本文のストリーミングの
+/// 経路も使う。モジュールのあるルートはその経路に乗らない）。要求ごとに `Arc` を作らないよう
 /// スレッドごとに 1 つを使い回す（F-202）。
-#[cfg(not(feature = "wasm"))]
+#[cfg(any(not(feature = "wasm"), feature = "http2"))]
 pub(super) fn no_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     thread_local! {
         static EMPTY: crate::wasm_plugin_config::WasmModules =

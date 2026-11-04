@@ -35,6 +35,9 @@ GET /__metrics
 
 ### 利用可能なメトリクス
 
+どの系列も HTTP/1.1・HTTP/2・HTTP/3 のクライアントで同じに記録します。応答キャッシュの系列（`veil_proxy_cache_*`）が動くのは HTTP/1.1 だけです
+（プロキシの応答キャッシュ `[route.cache]` が HTTP/1.1 の要求だけに効くため）。
+
 | メトリクス | タイプ | ラベル | 説明 |
 |-----------|--------|--------|------|
 | `veil_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
@@ -49,23 +52,23 @@ GET /__metrics
 | `veil_proxy_vds_last_update_timestamp_seconds` | Gauge | - | VDS: 最後にスナップショットを適用・拒否した時刻（UNIX 秒） |
 | `veil_proxy_cache_hits_total` | Counter | host | キャッシュヒット総数 |
 | `veil_proxy_cache_misses_total` | Counter | host | キャッシュミス総数 |
-| `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数 |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数（`storage` は置き場所で `memory` か `disk`） |
 | `veil_proxy_cache_evictions_total` | Counter | reason | キャッシュ削除総数 |
 | `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
 | `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
-| `veil_proxy_buffering_used_total` | Counter | host | バッファリング使用リクエスト総数 |
-| `veil_circuit_breaker_open_total` | Counter | upstream | CBオープンイベント数 |
-| `veil_circuit_breaker_state` | Gauge | upstream | CB状態（0=Closed, 1=Open, 2=HalfOpen） |
-| `veil_retry_total` | Counter | upstream, result | リトライ試行回数 |
-| `veil_outlier_ejected` | Gauge | upstream, server | サーバー排除状態（1=排除中） |
+| `veil_proxy_buffering_used_total` | Counter | host | `[route.buffering]` で応答を溜めるルートの要求数（gRPC を除く） |
+| `veil_circuit_breaker_open_total` | Counter | upstream | サーバーのCBがOpenになった回数（upstream グループごと） |
+| `veil_circuit_breaker_state` | Gauge | upstream | グループの状態: どれかのサーバーがOpenなら1、どれかがHalfOpenなら2、ほかは0 |
+| `veil_retry_total` | Counter | upstream, result | プールの上流の接続が応答の前に切れた冪等な要求の再送（`upstream` はサーバーのアドレス、`result` は `stale_connection`） |
+| `veil_outlier_ejected` | Gauge | upstream, server | サーバー排除状態（排除中は1、解けたら0） |
 | `veil_connection_pool_size` | Gauge | upstream | コネクションプールサイズ |
 | `veil_connection_pool_hits_total` | Counter | upstream | コネクションプールヒット数 |
 | `veil_connection_pool_misses_total` | Counter | upstream | コネクションプールミス数 |
-| `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPCリクエスト数 |
+| `veil_grpc_requests_total` | Counter | method, status_code, upstream | HTTP/2 の上流へ中継した gRPC の呼び出し数（トレーラーの `grpc-status` で数える） |
 | `veil_http3_invalid_packets_total` | Counter | - | HTTP/3 のポートに届いた QUIC のパケットでない UDP のデータグラムの数（ログは debug だけ） |
 | `veil_upstream_connect_errors_total` | Counter | kind | 上流への接続の失敗の数（`error`・`timeout`・`tls`・`no_healthy`）。対応するログは出す箇所ごとに 10 秒に 1 行まで（残りは debug） |
 | `veil_uring_cq_overflow_total` | Counter | - | io_uring の完了キューが溢れた回数（io_uring のバックエンドのみ）。完了は失われないが、0 以外なら負荷に対してリングが小さい |
-| `veil_grpc_stream_duration_seconds` | Histogram | method | gRPCストリーム処理時間 |
+| `veil_grpc_stream_duration_seconds` | Histogram | method | 中継した gRPC の呼び出しの始まりから `grpc-status` のトレーラーまでの時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |
 

@@ -1,6 +1,6 @@
 # B-270: h2c の上流の応答に、HTTP/1.1・HTTP/2 のクライアントでは `[route.compression]` が効かない（HTTP/3 は圧縮する）
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -33,6 +33,12 @@
 - 圧縮しない応答（`Accept-Encoding` 無し・型が対象外・小さい）は今のまま流す。
 - 試験: E2E で HTTP/1.1・h2c・HTTP/2・HTTP/3 × h2c の上流で `Content-Encoding` が付くこと、gRPC は圧縮しないこと、ストリーミングの gRPC の
   双方向が今のまま動くこと。
+
+## 修正（v0.10.1）
+
+- h2c の上流の応答にも、HTTP/1.1・HTTP/2 のクライアントで `[route.compression]` をかける（溜める上限は [B-281](B-281-unbounded-response-collection-for-compression.md)）。
+- HTTP/3 のバッファ経路で `Content-Encoding` が付かなかった件は [B-279](B-279-h3-buffered-compression-no-content-encoding.md)。
+- 統合試験 `b270_h2c_upstream_responses_are_compressed`（`/front`・`/front-buffered`）。
 
 ## 関連
 

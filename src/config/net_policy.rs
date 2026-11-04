@@ -36,9 +36,6 @@ pub(super) fn default_max_body_size() -> usize {
 pub(super) fn default_max_header_size() -> usize {
     MAX_HEADER_SIZE
 }
-pub(super) fn default_client_header_timeout() -> u64 {
-    30
-}
 pub(super) fn default_client_body_timeout() -> u64 {
     30
 }
@@ -449,9 +446,10 @@ pub struct SecurityConfig {
     #[serde(default = "default_max_body_size")]
     pub max_chunked_body_size: usize,
 
-    /// クライアントヘッダー受信タイムアウト（秒）
-    #[serde(default = "default_client_header_timeout")]
-    pub client_header_timeout_secs: u64,
+    /// 使わない（B-274）。ヘッダを受け取るまではルートが決まらないので、ルートの設定にできない。
+    /// 書かれていたら読み込み時に無視することを警告する（`validate::warn_unbuilt_sections`）。
+    #[serde(default)]
+    pub client_header_timeout_secs: Option<u64>,
 
     /// クライアントボディ受信タイムアウト（秒）
     #[serde(default = "default_client_body_timeout")]
@@ -538,6 +536,11 @@ pub struct SecurityConfig {
     /// 例: ["Server", "X-Powered-By"]
     #[serde(default)]
     pub remove_response_headers: Vec<String>,
+
+    /// `add_response_headers` を HTTP/2・HTTP/3 のヘッダの形（小文字の名前の `Bytes`）にしたもの（初回に作る。
+    /// 要求ごとに名前・値を複製しない。B-267）
+    #[serde(skip)]
+    pub add_response_header_bytes: std::sync::OnceLock<Vec<(bytes::Bytes, bytes::Bytes)>>,
 
     // ====================
     // WebSocket設定
@@ -631,6 +634,48 @@ impl SecurityConfig {
         IpFilter::from_lists(&self.allowed_ips, &self.denied_ips)
     }
 
+    /// `add_response_headers`・`remove_response_headers` のどちらかがあるか
+    #[inline]
+    pub fn has_response_header_ops(&self) -> bool {
+        !self.add_response_headers.is_empty() || !self.remove_response_headers.is_empty()
+    }
+
+    /// `remove_response_headers` に入っている名前か（大文字小文字を区別しない）
+    #[inline]
+    pub fn removes_response_header(&self, name: &[u8]) -> bool {
+        self.remove_response_headers
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
+    }
+
+    /// クライアントへ返す HTTP/2・HTTP/3 の応答ヘッダに `remove_response_headers`・`add_response_headers` をかける
+    /// （HTTP/1.1 の `render_response_head` と同じ: 削除は受けたヘッダから、追加はすべての応答に。B-267）。
+    /// どちらも空なら分岐 2 個で抜ける。追加は `Bytes` の参照カウントだけ。
+    #[inline]
+    pub fn apply_response_headers(&self, headers: &mut Vec<(bytes::Bytes, bytes::Bytes)>) {
+        if !self.remove_response_headers.is_empty() {
+            headers.retain(|(n, _)| !self.removes_response_header(n));
+        }
+        if !self.add_response_headers.is_empty() {
+            headers.extend(self.add_response_header_bytes().iter().cloned());
+        }
+    }
+
+    /// `add_response_headers` の小文字の名前・値の `Bytes`
+    pub fn add_response_header_bytes(&self) -> &[(bytes::Bytes, bytes::Bytes)] {
+        self.add_response_header_bytes.get_or_init(|| {
+            self.add_response_headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        bytes::Bytes::from(k.to_ascii_lowercase()),
+                        bytes::Bytes::copy_from_slice(v.as_bytes()),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// ヘッダー操作が設定されているかどうか
     pub fn has_header_operations(&self) -> bool {
         !self.add_request_headers.is_empty()
@@ -681,7 +726,7 @@ impl Default for SecurityConfig {
         Self {
             max_request_body_size: default_max_body_size(),
             max_chunked_body_size: default_max_body_size(),
-            client_header_timeout_secs: default_client_header_timeout(),
+            client_header_timeout_secs: None,
             client_body_timeout_secs: default_client_body_timeout(),
             allowed_methods: Vec::new(),
             rate_limit_requests_per_min: 0,
@@ -698,6 +743,7 @@ impl Default for SecurityConfig {
             trusted_proxy_ranges: std::sync::OnceLock::new(),
             add_response_headers: HashMap::new(),
             remove_response_headers: Vec::new(),
+            add_response_header_bytes: std::sync::OnceLock::new(),
             // WebSocket設定
             websocket_poll_mode: WebSocketPollMode::default(),
             websocket_poll_timeout_ms: default_websocket_poll_timeout_ms(),

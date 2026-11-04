@@ -302,6 +302,7 @@ pub(crate) fn open_beneath_force_fallback(root: &Path, rel: &Path) -> io::Result
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{fallback_open_beneath, info, log_runtime_fallback_engaged, warn};
+    use ftlog::debug;
     use std::ffi::CString;
     use std::fs::File;
     use std::io;
@@ -370,7 +371,16 @@ mod linux_impl {
                 )
             };
             if fd < 0 {
-                warn_skip(root, &io::Error::last_os_error().to_string());
+                let e = io::Error::last_os_error();
+                // 1 ファイルのルート（`path` がファイル）はディレクトリの封じ込めが要らない（B-280。以前は警告していた）
+                if e.raw_os_error() == Some(libc::ENOTDIR) {
+                    debug!(
+                        "static files: {:?} is a file, not registered as a static root",
+                        root
+                    );
+                } else {
+                    warn_skip(root, &e.to_string());
+                }
                 continue;
             }
             info!(

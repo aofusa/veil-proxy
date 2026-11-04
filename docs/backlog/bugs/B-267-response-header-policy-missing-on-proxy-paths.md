@@ -1,6 +1,6 @@
 # B-267: `add_response_headers`・`remove_response_headers` が HTTP/2・HTTP/3 のプロキシの応答と一部の HTTP/1.1 の経路で効かない
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -49,6 +49,16 @@
   付けるなら `FixedResponse` はロード時に組み込めるので要求ごとの費用は無い。
 - 試験: E2E で HTTP/1.1（平文・TLS・`buffering = "full"`）・h2c・HTTP/2・HTTP/3 × 上流 HTTP/1.1・HTTPS・h2c・TLS の h2 の応答で、
   足すヘッダがあり消すヘッダが無いこと。交互 A/B で方針の無いルートの性能が変わらないこと（3B・54KB、io_uring と epoll）。
+
+## 修正（v0.10.1）
+
+- `[route.security] add_response_headers`・`remove_response_headers` を全プロトコル・全経路（プロキシのストリーミング・圧縮・
+  `buffering = "full"`・h2c と TLS の h2 の上流・静的配信・`Respond`）にかける。HTTP/2・HTTP/3 は `SecurityConfig::apply_response_headers`
+  （追加するヘッダは設定ロード後の初回に `Bytes` にしておき、要求ごとは参照カウントだけ）、HTTP/1.1 は `render_response_head`。
+  `Respond` の応答は設定ロード時に 1 回だけかける（`FixedResponse::with_security`）。`buffering = "full"` のステータス行は `HTTP/1.1` に直す。
+- `remove_response_headers` に `Server`・`Alt-Svc` を書くと veil 自身の `Server`・HTTP/3 の広告も付けない（全プロトコル）。
+- kTLS の splice 経路の同じ漏れは [B-275](B-275-ktls-splice-raw-response-head.md)。
+- 統合試験 `b267_b271_header_policy_alt_svc_and_server_header_match_across_protocols`。
 
 ## 関連
 

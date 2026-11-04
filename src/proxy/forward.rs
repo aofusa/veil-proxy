@@ -361,11 +361,7 @@ pub(super) async fn handle_proxy(
     // 接続カウンターを増加（Least Connections 用）
     server.acquire();
 
-    // F-06: リクエスト結果記録用にサーバーのインデックスと開始時刻を記録
-    let resilience_server_idx = upstream_group
-        .servers
-        .iter()
-        .position(|s| std::ptr::eq(s, server));
+    // F-06: リクエスト結果記録用の開始時刻（記録は `UpstreamGroup::record_request`。B-272）
     // 粗い時計（起床時に読んだ時刻）を使う: 遅延は負荷分散・異常検知の平均にしか使わず、ミリ秒の精度で足りる。
     // 要求ごとに 2 回の `Instant::now()`（FreeBSD aarch64 のプロファイルで `__vdso_gettc` が上位）を減らす
     let resilience_start = crate::runtime::time::coarse_now();
@@ -589,13 +585,8 @@ pub(super) async fn handle_proxy(
             H1ViaH2::Done(r) => {
                 server.release();
                 // F-06: HTTP/1.1 経路と同じくサーキットブレーカー・異常検知へ反映する。
-                if let Some(idx) = resilience_server_idx {
-                    let success = matches!(&r, Some((_, status, _, _)) if *status < 500);
-                    let latency_ms = crate::runtime::time::coarse_now()
-                        .saturating_duration_since(resilience_start)
-                        .as_millis() as u64;
-                    upstream_group.record_outcome(idx, success, latency_ms);
-                }
+                let success = matches!(&r, Some((_, status, _, _)) if *status < 500);
+                upstream_group.record_request(server, resilience_start, success);
                 return r;
             }
             H1ViaH2::Http1(c) => c,
@@ -647,6 +638,10 @@ pub(super) async fn handle_proxy(
                     client_stream,
                     target,
                     security,
+                    compression,
+                    client_encoding,
+                    #[cfg(feature = "wasm")]
+                    &wasm_modules,
                     method,
                     final_path.as_bytes(),
                     headers,
@@ -703,34 +698,12 @@ pub(super) async fn handle_proxy(
     // 接続カウンターを減少（Least Connections 用）
     server.release();
 
-    // F-06: リクエスト結果をサーキットブレーカー・異常検知へ反映
-    if let Some(idx) = resilience_server_idx {
-        let latency_ms = crate::runtime::time::coarse_now()
-            .saturating_duration_since(resilience_start)
-            .as_millis() as u64;
-        // 5xx をバックエンド障害として扱う
-        let success = match &result {
-            Some((_, status, _, _)) => *status < 500,
-            None => false,
-        };
-        upstream_group.record_outcome(idx, success, latency_ms);
-        #[cfg(feature = "metrics")]
-        {
-            if let Some(s) = upstream_group.servers.get(idx) {
-                if let Some(cb) = &s.circuit_breaker {
-                    crate::metrics::set_circuit_breaker_state(
-                        &upstream_group.name,
-                        cb.state_code(),
-                    );
-                }
-                if s.is_ejected() {
-                    // F-170: 接続先表記（conn_addr）で識別する。TCP は従来と不変。
-                    let addr = s.target.conn_addr();
-                    crate::metrics::set_outlier_ejected(&upstream_group.name, addr.as_str(), true);
-                }
-            }
-        }
-    }
+    // F-06: リクエスト結果をサーキットブレーカー・異常検知へ反映（5xx をバックエンド障害として扱う）
+    let success = match &result {
+        Some((_, status, _, _)) => *status < 500,
+        None => false,
+    };
+    upstream_group.record_request(server, resilience_start, success);
 
     // stale-if-error: バックエンドエラー時にstaleキャッシュを返す
     if cache_config.stale_if_error {
@@ -909,6 +882,16 @@ pub(super) async fn proxy_http_pooled(
         let buffering_enabled = !is_grpc_req
             && buffering_config.is_enabled()
             && buffering_config.should_buffer(Some(content_length));
+        // F-285: Wasm の応答本文のフェーズを受けるモジュールがあれば本文を全部溜める（buffering = "full" の経路）
+        #[cfg(feature = "wasm")]
+        let wasm_body = super::compress::wasm_wants_response_body(&wasm_modules);
+        #[cfg(not(feature = "wasm"))]
+        let wasm_body = false;
+
+        // `buffering` の適用を数える（圧縮の経路を通っても本文は溜める。HTTP/2・HTTP/3 と同じ。B-273）
+        if buffering_enabled {
+            record_buffering_used(host_str_for_metrics);
+        }
 
         // リクエスト送信とレスポンス受信
         // kTLS 有効時は splice(2) を使用してゼロコピー転送
@@ -946,6 +929,7 @@ pub(super) async fn proxy_http_pooled(
                     content_length,
                     is_chunked,
                     initial_body,
+                    security,
                 )
                 .await;
 
@@ -969,13 +953,12 @@ pub(super) async fn proxy_http_pooled(
                     )
                     .await
                 }
-            } else if buffering_enabled && !compression_enabled {
+            } else if wasm_body || (buffering_enabled && !compression_enabled) {
                 // バッファリング有効時（圧縮無効の場合のみ）
                 debug!(
                     "Calling proxy_request_buffered for {} {}",
                     target.host, target.port
                 );
-                record_buffering_used(host_str_for_metrics);
                 proxy_request_buffered(
                     &mut client_stream,
                     &mut backend_stream,
@@ -985,8 +968,17 @@ pub(super) async fn proxy_http_pooled(
                     initial_body,
                     max_chunked,
                     buffering_config,
-                    cache_ctx.as_deref_mut(),
+                    // F-285: Wasm で書き換える前の本文をキャッシュへ置かない（ヒットはフィルタを通らない）
+                    if wasm_body {
+                        None
+                    } else {
+                        cache_ctx.as_deref_mut()
+                    },
                     security,
+                    #[cfg(feature = "wasm")]
+                    &wasm_modules,
+                    #[cfg(feature = "wasm")]
+                    wasm_body.then_some((compression, client_encoding)),
                 )
                 .await
             } else {
@@ -1012,9 +1004,8 @@ pub(super) async fn proxy_http_pooled(
         };
 
         #[cfg(not(veil_ktls))]
-        let result = if buffering_enabled && !compression_enabled {
+        let result = if wasm_body || (buffering_enabled && !compression_enabled) {
             // バッファリング有効時（圧縮無効の場合のみ）
-            record_buffering_used(host_str_for_metrics);
             proxy_request_buffered(
                 &mut client_stream,
                 &mut backend_stream,
@@ -1024,8 +1015,17 @@ pub(super) async fn proxy_http_pooled(
                 initial_body,
                 max_chunked,
                 buffering_config,
-                cache_ctx.as_deref_mut(),
+                // F-285: Wasm で書き換える前の本文をキャッシュへ置かない（ヒットはフィルタを通らない）
+                if wasm_body {
+                    None
+                } else {
+                    cache_ctx.as_deref_mut()
+                },
                 security,
+                #[cfg(feature = "wasm")]
+                &wasm_modules,
+                #[cfg(feature = "wasm")]
+                wasm_body.then_some((compression, client_encoding)),
             )
             .await
         } else {
@@ -1050,6 +1050,7 @@ pub(super) async fn proxy_http_pooled(
         // クライアントへ未送信のうちに新しい接続で 1 回だけ再送する（冪等・本文受信済みの要求のみ）。
         if from_pool && replayable && attempt == 1 && matches!(result, None | Some((502, 0, _, _)))
         {
+            crate::metrics::record_retry(target.conn_addr().as_str(), "stale_connection");
             continue;
         }
         if let Some(original) = request_holder.take() {
@@ -1110,6 +1111,72 @@ pub(super) enum H1ViaH2 {
     /// 上流が ALPN で HTTP/1.1 を選んだ。クライアント接続を返すので HTTP/1.1 経路で続ける
     /// （ネゴシエーションに使った上流接続は TLS プールへ入れてある）。
     Http1(ServerTls),
+}
+
+/// HTTP/2 の上流（h2c・TLS の h2）の応答を HTTP/1.1 の head（空行まで）にする。
+///
+/// ステータス行は `HTTP/1.1`、ホップバイホップと `remove_response_headers` を落とし、`add_response_headers`・Alt-Svc を足し
+/// （B-267・B-271）、Wasm の `on_http_response_headers`（B-268）・CORS（F-273）をかける。HTTP/1.1 の上流の
+/// `render_response_head` と同じ順。`framing` は送り方で決まる `Content-Length`・`Transfer-Encoding` の行（空なら上流の
+/// `content-length` をそのまま使う）。`extra` は head に並べる追加のヘッダ（h2c の gRPC の trailers）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn render_h2_upstream_head(
+    status: u16,
+    headers: &[(Bytes, Bytes)],
+    extra: &[(Bytes, Bytes)],
+    framing: &[u8],
+    security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
+    client_wants_close: bool,
+) -> Vec<u8> {
+    let mut head = Vec::with_capacity(256);
+    head.extend_from_slice(b"HTTP/1.1 ");
+    let mut sb = itoa::Buffer::new();
+    head.extend_from_slice(sb.format(status).as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(status_reason_phrase(status).as_bytes());
+    head.extend_from_slice(b"\r\n");
+    // `[server] server_header_enabled` なら自分の `Server` にする（B-271）。`remove_response_headers` に
+    // `Server` があれば自分のものも付けない（HTTP/2・HTTP/3・静的配信と同じ）
+    let removes = !security.remove_response_headers.is_empty();
+    let drop_upstream_server = crate::pool::append_own_server_line(&mut head, security);
+    for (n, v) in headers.iter().chain(extra.iter()) {
+        if (drop_upstream_server && n.eq_ignore_ascii_case(b"server"))
+            || n.eq_ignore_ascii_case(b"connection")
+            || n.eq_ignore_ascii_case(b"keep-alive")
+            || n.eq_ignore_ascii_case(b"transfer-encoding")
+            || n.eq_ignore_ascii_case(b"upgrade")
+            || n.eq_ignore_ascii_case(b"proxy-connection")
+            || (!framing.is_empty() && n.eq_ignore_ascii_case(b"content-length"))
+            || (removes && security.removes_response_header(n))
+        {
+            continue;
+        }
+        head.extend_from_slice(n);
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(v);
+        head.extend_from_slice(b"\r\n");
+    }
+    for (name, value) in &security.add_response_headers {
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    // F-94: HTTP/3 広告（Alt-Svc）
+    crate::pool::append_own_alt_svc_line(&mut head, security);
+    #[cfg(feature = "wasm")]
+    let mut head = super::sendfile::h1_wasm_response_head(head, status, wasm_modules).await;
+    head.extend_from_slice(framing);
+    head.extend_from_slice(if client_wants_close {
+        b"Connection: close\r\n\r\n"
+    } else {
+        b"Connection: keep-alive\r\n\r\n"
+    });
+    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
+    crate::route_cors::apply_h1(&mut head, security);
+    head
 }
 
 /// F-175: HTTP/1.1 で受けた要求（本文は受信済み）を、ALPN で HTTP/2 を選んだ HTTPS 上流の
@@ -1189,14 +1256,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     };
     // 最終応答の head を待つ。
     let (status, mut resp_headers) = match timeout(READ_TIMEOUT, stream.resp_rx.recv()).await {
-        Ok(Some(UpResp::Head {
-            status,
-            mut headers,
-        })) => {
-            // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-            crate::route_cors::apply_bytes(&mut headers, security);
-            (status, headers)
-        }
+        Ok(Some(UpResp::Head { status, headers })) => (status, headers),
         Err(_) => {
             let _ = timeout(
                 WRITE_TIMEOUT,
@@ -1233,44 +1293,18 @@ pub(super) async fn proxy_h1_via_https_h2(
         )
     };
 
-    // 応答 head（ホップバイホップは HTTP/2 には無いが、念のため落とす）。
-    let write_head = |status: u16, hs: &[(Bytes, Bytes)], framing: &[u8]| {
-        let mut head = Vec::with_capacity(256);
-        head.extend_from_slice(b"HTTP/1.1 ");
-        let mut sb = itoa::Buffer::new();
-        head.extend_from_slice(sb.format(status).as_bytes());
-        head.push(b' ');
-        head.extend_from_slice(status_reason_phrase(status).as_bytes());
-        head.extend_from_slice(b"\r\n");
-        for (n, v) in hs {
-            if n.eq_ignore_ascii_case(b"connection")
-                || n.eq_ignore_ascii_case(b"keep-alive")
-                || n.eq_ignore_ascii_case(b"transfer-encoding")
-                || n.eq_ignore_ascii_case(b"upgrade")
-                || n.eq_ignore_ascii_case(b"proxy-connection")
-            {
-                continue;
-            }
-            head.extend_from_slice(n);
-            head.extend_from_slice(b": ");
-            head.extend_from_slice(v);
-            head.extend_from_slice(b"\r\n");
-        }
-        head.extend_from_slice(framing);
-        head.extend_from_slice(if client_wants_close {
-            b"Connection: close\r\n\r\n"
-        } else {
-            b"Connection: keep-alive\r\n\r\n"
-        });
-        head
-    };
-
     if let Some(enc) = should_compress {
         let mut body: Vec<u8> = Vec::new();
         loop {
             match timeout(READ_TIMEOUT, stream.resp_rx.recv()).await {
                 Ok(None) => break,
-                Ok(Some(UpResp::Data(b))) => body.extend_from_slice(&b),
+                Ok(Some(UpResp::Data(b))) => {
+                    // B-281: 溜める上限を超えたら打ち切る
+                    if body.len() + b.len() > crate::pool::MAX_COLLECTED_RESPONSE_BODY {
+                        return bad_gateway(client_stream).await;
+                    }
+                    body.extend_from_slice(&b)
+                }
                 Ok(Some(UpResp::Trailers(_))) | Ok(Some(UpResp::Head { .. })) => {}
                 Ok(Some(UpResp::Reset { .. })) => return bad_gateway(client_stream).await,
                 Err(_) => {
@@ -1301,7 +1335,18 @@ pub(super) async fn proxy_h1_via_https_h2(
         let mut lb = itoa::Buffer::new();
         framing.extend_from_slice(lb.format(compressed.len()).as_bytes());
         framing.extend_from_slice(b"\r\n");
-        let head = write_head(status, &resp_headers, &framing);
+        // この経路は Wasm モジュールの無いルートだけ（呼び出し側の条件）
+        let head = render_h2_upstream_head(
+            status,
+            &resp_headers,
+            &[],
+            &framing,
+            security,
+            #[cfg(feature = "wasm")]
+            &super::h1::no_wasm_modules(),
+            client_wants_close,
+        )
+        .await;
         let sent = compressed.len() as u64;
         return match timeout(
             WRITE_TIMEOUT,
@@ -1323,7 +1368,17 @@ pub(super) async fn proxy_h1_via_https_h2(
     } else {
         b""
     };
-    let head = write_head(status, &resp_headers, framing);
+    let head = render_h2_upstream_head(
+        status,
+        &resp_headers,
+        &[],
+        framing,
+        security,
+        #[cfg(feature = "wasm")]
+        &super::h1::no_wasm_modules(),
+        client_wants_close,
+    )
+    .await;
     if !matches!(
         timeout(WRITE_TIMEOUT, client_stream.write_all(head)).await,
         Ok((Ok(_), _))
@@ -1392,10 +1447,14 @@ pub(super) async fn proxy_h1_via_https_h2(
 /// HTTP/2 Prior Knowledge モードでバックエンドに接続し、
 /// リクエストを送信してレスポンスを受信します。
 #[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_h2c(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
     security: &SecurityConfig,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     method: &[u8],
     path: &[u8],
     headers: &[(Bytes, Bytes)],
@@ -1447,57 +1506,90 @@ pub(super) async fn proxy_h2c(
 
     // レスポンスをHTTP/1.1形式でクライアントに返す
     let status_code = response.status;
-    let mut http11_response = Vec::with_capacity(512 + response.body.len());
+    let mut response = response;
 
-    // ステータス行
-    http11_response.extend_from_slice(b"HTTP/1.1 ");
-    let mut status_buf = itoa::Buffer::new();
-    http11_response.extend_from_slice(status_buf.format(status_code).as_bytes());
-    http11_response.extend_from_slice(b" ");
-    http11_response.extend_from_slice(status_reason_phrase(status_code).as_bytes());
-    http11_response.extend_from_slice(b"\r\n");
-
-    // レスポンスヘッダー
-    for (name, value) in &response.headers {
-        // ホップバイホップヘッダーはスキップ
-        if name.eq_ignore_ascii_case(b"connection")
-            || name.eq_ignore_ascii_case(b"transfer-encoding")
-            || name.eq_ignore_ascii_case(b"keep-alive")
-        {
-            continue;
+    // F-285: Wasm の応答本文のフェーズ（受けるモジュールのあるルートだけ。圧縮の前。gRPC・本文の無い応答は除く）
+    #[cfg(feature = "wasm")]
+    if !(method.eq_ignore_ascii_case(b"HEAD") || matches!(status_code, 100..=199 | 204 | 304))
+        && !response.headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case(b"content-type") && v.starts_with(b"application/grpc")
+        })
+        && super::compress::wasm_wants_response_body(wasm_modules)
+    {
+        let body = std::mem::take(&mut response.body);
+        match super::compress::wasm_filter_response_body(wasm_modules, body).await {
+            Ok(b) => response.body = b,
+            Err(local) => {
+                let out = super::h1::wasm_local_response_h1(&local, false);
+                let len = out.len() as u64;
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(out)).await;
+                return Some((client_stream, local.status_code, len, client_wants_close));
+            }
         }
-        http11_response.extend_from_slice(name);
-        http11_response.extend_from_slice(b": ");
-        http11_response.extend_from_slice(value);
-        http11_response.extend_from_slice(b"\r\n");
     }
 
-    // トレーラーヘッダー（gRPC-status など）をレスポンスヘッダーとして転送
-    for (name, value) in &response.trailers {
-        http11_response.extend_from_slice(name);
-        http11_response.extend_from_slice(b": ");
-        http11_response.extend_from_slice(value);
-        http11_response.extend_from_slice(b"\r\n");
-    }
-
-    // Content-Length
-    http11_response.extend_from_slice(b"Content-Length: ");
-    http11_response.extend_from_slice(status_buf.format(response.body.len()).as_bytes());
-    http11_response.extend_from_slice(b"\r\n");
-
-    // Connection ヘッダー
-    if client_wants_close {
-        http11_response.extend_from_slice(b"Connection: close\r\n");
+    // B-270: HTTP/1.1・TLS の h2 の上流と同じく圧縮する（gRPC・本文の無い応答は除く）
+    let header = |name: &[u8]| {
+        response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let content_type = header(b"content-type");
+    let is_grpc = content_type
+        .as_deref()
+        .is_some_and(|ct| ct.starts_with(b"application/grpc"));
+    let no_body = method.eq_ignore_ascii_case(b"HEAD") || status_code == 204 || status_code == 304;
+    let should_compress = if is_grpc || no_body || response.body.is_empty() {
+        None
     } else {
-        http11_response.extend_from_slice(b"Connection: keep-alive\r\n");
+        compression.should_compress(
+            client_encoding,
+            content_type.as_deref(),
+            Some(response.body.len()),
+            header(b"content-encoding").as_deref(),
+        )
+    };
+    if let Some(enc) = should_compress {
+        response.body = Bytes::from(compress_body_h2(&response.body, enc, compression));
+        response
+            .headers
+            .retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-encoding"));
+        response.headers.push((
+            Bytes::from_static(b"content-encoding"),
+            Bytes::from_static(enc.as_header_value()),
+        ));
+        response.headers.push((
+            Bytes::from_static(b"vary"),
+            Bytes::from_static(b"Accept-Encoding"),
+        ));
     }
 
-    http11_response.extend_from_slice(b"\r\n");
-    // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
-    crate::route_cors::apply_h1(&mut http11_response, security);
-
-    // ボディ
-    http11_response.extend_from_slice(&response.body);
+    // Content-Length（本文の無い応答は上流の値を残す。HEAD の応答の長さは GET と同じ）
+    let mut framing = Vec::with_capacity(32);
+    if !no_body || !response.body.is_empty() {
+        framing.extend_from_slice(b"Content-Length: ");
+        let mut lb = itoa::Buffer::new();
+        framing.extend_from_slice(lb.format(response.body.len()).as_bytes());
+        framing.extend_from_slice(b"\r\n");
+    }
+    // トレーラーヘッダー（gRPC-status など）はレスポンスヘッダーとして転送する
+    let head = render_h2_upstream_head(
+        status_code,
+        &response.headers,
+        &response.trailers,
+        &framing,
+        security,
+        #[cfg(feature = "wasm")]
+        wasm_modules,
+        client_wants_close,
+    )
+    .await;
+    let mut http11_response = head;
+    if !no_body {
+        http11_response.extend_from_slice(&response.body);
+    }
 
     let resp_size = http11_response.len() as u64;
 

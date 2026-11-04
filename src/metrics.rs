@@ -1109,7 +1109,8 @@ pub fn set_circuit_breaker_state(_upstream: &str, _state: u64) {
     }
 }
 
-/// メトリクス: リトライを記録（result は "success" / "exhausted" 等）
+/// メトリクス: 上流への再送を記録（upstream は上流サーバの接続先、result は再送の理由。
+/// 今は F-177 のプール接続が応答前に切れていたときの `stale_connection` だけ）
 #[inline]
 pub fn record_retry(_upstream: &str, _result: &str) {
     #[cfg(feature = "metrics")]
@@ -1242,6 +1243,28 @@ pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
                 .with_label_values(&[method, status, _upstream])
                 .inc();
         });
+    }
+}
+
+/// メトリクス: 中継した gRPC の要求の終わり（トレーラーの `grpc-status`）を記録する（要求数とストリームの時間。B-273）
+///
+/// `started` は要求を始めた時刻（HTTP/2 は要求の受信、HTTP/3 は上流への要求の開始）。
+#[inline]
+pub fn record_grpc_completion(
+    _method: &str,
+    _status_code: &str,
+    _upstream: &str,
+    _started: std::time::Instant,
+) {
+    #[cfg(all(feature = "metrics", feature = "grpc"))]
+    if metrics_runtime_enabled() {
+        record_grpc_request(_method, _status_code, _upstream);
+        observe_grpc_stream_duration(
+            _method,
+            crate::runtime::time::coarse_now()
+                .saturating_duration_since(_started)
+                .as_secs_f64(),
+        );
     }
 }
 
@@ -1423,7 +1446,11 @@ impl CacheSaveContext {
                 );
 
                 if stored {
-                    record_cache_store(&self.host, "memory");
+                    // B-273: ディスクへ置いた応答も "memory" と数えていた
+                    record_cache_store(
+                        &self.host,
+                        cache_manager.storage_label(self.captured_body.len()),
+                    );
                     ftlog::debug!(
                         "Cached response for {} (status={}, size={}, vary={:?})",
                         self.host,
@@ -1644,6 +1671,7 @@ mod tests {
         record_connection_pool_miss("up");
         set_connection_pool_size("up", 3);
         record_grpc_request("/svc/Method", "0", "up");
+        record_grpc_completion("/svc/Method", "0", "up", std::time::Instant::now());
         observe_grpc_stream_duration("/svc/Method", 0.1);
         observe_wasm_filter_duration("auth", "request", 0.001);
         // F-99: HTTP/3 ゲージも無効時ノーオップ（http3 feature 時のみシンボルあり）

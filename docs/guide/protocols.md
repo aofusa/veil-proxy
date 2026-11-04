@@ -91,6 +91,12 @@ stream_idle_timeout_secs = 60
 
 When limits are exceeded, the server responds with `ENHANCE_YOUR_CALM` (0xb) error and closes the connection.
 
+A stream whose request body stops arriving is reset with `RST_STREAM(CANCEL)` once no body data has been received for the
+route's `[route.security] client_body_timeout_secs` (default 30 seconds), until the response starts.
+`stream_idle_timeout_secs` is the limit for streams that have no route setting (for example a request that matched no
+route). The check runs once a second on each connection while it waits for input. HTTP/3 applies the route's
+`client_body_timeout_secs` the same way and cancels the stream with `H3_REQUEST_CANCELLED`.
+
 ### HTTP/1.1 Fallback
 
 Clients that don't support HTTP/2 automatically fall back to HTTP/1.1.
@@ -246,6 +252,11 @@ alt_svc_enabled = true          # default: true; set false to suppress advertisi
 Supports WebSocket (RFC 6455) proxying.
 Automatically detects `Connection: Upgrade` and `Upgrade: websocket` headers
 and performs bidirectional data transfer.
+
+WebSocket is accepted on HTTP/1.1 connections only (plain and TLS). veil does not advertise
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`, so WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) is not available;
+browsers then open a separate HTTP/1.1 connection for the WebSocket. A listener that only serves HTTP/3 cannot carry
+WebSocket.
 
 ### Behavior
 

@@ -295,6 +295,9 @@ pub mod route_cors;
 // HTTP/1.1・2・3 で共通の L7 の段（ルートの照合・セキュリティの検査。F-234）
 #[doc(hidden)]
 pub mod l7;
+// 静的配信の応答の決め方（HEAD・Range・条件付き要求・圧縮。HTTP/1.1・2・3 で共有。B-266・F-286・F-287）
+#[doc(hidden)]
+pub mod static_response;
 // 要求のパスの正規化（TOML の経路とメッシュで共有。F-236）
 #[doc(hidden)]
 pub mod path_norm;

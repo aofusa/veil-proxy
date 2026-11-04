@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub mod parity;
+
 /// cargo がビルドした veil バイナリ。
 pub fn veil_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_veil"))

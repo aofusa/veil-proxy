@@ -1,6 +1,6 @@
 # B-266: HEAD の要求に、静的配信・固定応答・エラー応答が本文を付けて返す（HTTP/1.1 は次の応答がずれ、HTTP/2 は PROTOCOL_ERROR）
 
-**状態: 未着手（2026-11-04 起票）**
+**状態: 修正済み（v0.10.1）**
 
 ## 出典
 
@@ -43,6 +43,14 @@ HEAD の応答は本文を持たない（RFC 9110 §9.3.2）。プロキシの�
 - 試験: E2E で HTTP/1.1（平文・TLS・パイプライン）・h2c・HTTP/2・HTTP/3 の HEAD を File・memory・Respond・404 に送り、
   本文が無いこと・`Content-Length` が GET と同じこと・同じ接続の次の要求が正しく返ること。HTTP/2 は h2spec と同じ厳格さのクライアント
   （nghttp2）で、HTTP/3 は h2load ではなく本文の有無を見られるクライアントで確かめる。
+
+## 修正（v0.10.1）
+
+- 静的配信（File の sendfile・memory）の応答を `static_response::plan` 1 か所で決め、HTTP/1.1・HTTP/2・HTTP/3 で同じ形にする。HEAD は
+  ヘッダだけ（`Content-Length` は GET と同じ値）を返し、本文を送らない。`Respond` の固定応答・ルートの無い要求等のエラー応答も HEAD には
+  本文を付けない（HTTP/1.1 の keep-alive のずれ・HTTP/2 の PROTOCOL_ERROR が無くなる）。
+- 統合試験 `b266_f286_f287_static_responses_match_across_protocols`・`b267_b271_header_policy_alt_svc_and_server_header_match_across_protocols`
+  （4 プロトコルで HEAD の後ろに本文が来ないこと、keep-alive の次の要求が正しく返ること）。
 
 ## 関連
 

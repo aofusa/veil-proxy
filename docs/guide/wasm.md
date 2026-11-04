@@ -138,7 +138,7 @@ reload); the request path only clones an `Arc`.
 | `on_http_request_body` | yes | yes | yes |
 | `on_http_request_trailers` | – | gRPC over h2c | – |
 | `on_http_response_headers` | yes | yes | yes |
-| `on_http_response_body` | – | – | yes |
+| `on_http_response_body` | yes | yes | yes |
 | `on_log` | yes | yes | yes |
 
 The request-body phase runs when the request has a body and at least one of the route's modules has
@@ -149,6 +149,15 @@ and headers as well. If the module replaces the body, veil sends the new body up
 `Content-Length` (a chunked request is forwarded with `Content-Length`, without `Expect`). Routes without such a
 module keep streaming the body upstream as before. For a chunked request with `Expect: 100-continue`, veil sends
 `100 Continue` before reading the body (a request with `Content-Length` already gets it before the filters run).
+
+The response-body phase runs when at least one of the route's modules has `allow_response_body_read = true`. veil
+reads the whole upstream response first (HTTP/1.1, h2c and HTTPS upstreams; on HTTP/1.1 clients up to the route's
+`[route.buffering] max_memory_buffer`, default 10 MB, larger responses get `507` unless `disk_buffer_path` is set, in
+which case they are sent unfiltered) and calls `on_http_response_body` once with `end_of_stream = true`. A replaced body is
+sent with a matching `Content-Length`, and `[route.compression]` compresses the filtered body. A local response from this
+phase replaces the upstream response. The phase is skipped for `HEAD`, `1xx`, `204`, `304` and gRPC responses, and
+responses of such routes are not stored in `[route.cache]` (a cache hit would skip the filter). Routes without such a module
+keep streaming responses.
 
 On HTTP/1.1 the connection stays open after a filter's local response (`send_local_response`), and a request that
 was pipelined behind the body is served next. The body of a local response is not sent for `HEAD` (the

@@ -92,13 +92,14 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `proxy_http_version 1.1;` + 上流への keepalive | 既定（接続をプールする） | = `max_idle_connections_per_host`・`idle_connection_timeout_secs` |
 | 上流への HTTP/2 | `use_h2c = true`（平文）・`https://` は ALPN | = 多重化（[routing.md](routing.md#h2c-http2-over-cleartext-proxy)） |
 | `grpc_pass` | h2c・h2 の上流への `type = "Proxy"` | = gRPC、多重化（[routing.md](routing.md)） |
-| WebSocket（`Upgrade` ヘッダ） | 自動 | = |
+| WebSocket（`Upgrade` ヘッダ） | 自動 | = HTTP/1.1（HTTP/2・HTTP/3 の上の WebSocket は使えない） |
 | `proxy_connect_timeout` | `backend_connect_timeout_secs` | = |
 | `proxy_read_timeout` / `proxy_send_timeout` | TOML のルートには無い | ≈ 全体の I/O のタイムアウト。ルートごとの要求のタイムアウトは予定（F-226） |
 | `proxy_next_upstream` | 閉じていたプールの接続での冪等な要求の 1 回の再送 | ≈ 状態コードによる再試行はまだ無い（F-226） |
 | `proxy_buffering on/off` | `[route.buffering] mode` | = `streaming`・`full`・`adaptive`（[compression-cache.md](compression-cache.md)） |
 | `client_max_body_size` | `[route.security] max_request_body_size` | = |
-| `client_header_timeout` / `client_body_timeout` | `client_header_timeout_secs` / `client_body_timeout_secs` | = |
+| `client_header_timeout` | — | ≈ 要求のヘッダはリスナーの読み込みタイムアウトで抑える（ルートの `client_header_timeout_secs` は使われない） |
+| `client_body_timeout` | `client_body_timeout_secs` | = ルートごと。HTTP/1.1・HTTP/2・HTTP/3 |
 | `upstream` のラウンドロビン・`weight=` | `algorithm = "round_robin"`・`"weighted"` + `weight` | = |
 | `least_conn;` | `algorithm = "least_conn"` | = |
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |
