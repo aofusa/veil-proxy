@@ -29,7 +29,7 @@ TLS and HTTP/3, reverse proxying and Kubernetes: see the
 
 | Tag | Contents |
 |-----|----------|
-| `latest`, `musl`, `musl-vX.Y.Z` | static musl binary on `scratch` |
+| `latest`, `vX.Y.Z`, `musl`, `musl-vX.Y.Z` | static musl binary on `scratch` (`vX.Y.Z` is the same image as `musl-vX.Y.Z`) |
 | `glibc`, `glibc-vX.Y.Z` | glibc binary on Wolfi (Chainguard `glibc-dynamic`) |
 
 All tags are multi-arch (amd64, arm64). Versioned tags are never overwritten. Every image is scanned with

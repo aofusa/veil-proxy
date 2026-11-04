@@ -4,7 +4,8 @@
 #
 # - 版はタグの版。タグ（v を除く）と Cargo.toml の [workspace.package] version が違えば何も公開しない（F-231）。
 # - プレリリースのタグ（v0.8.0-rc.1 のように - を含む）では:
-#     イメージ … 版のタグ（musl-v…・glibc-v…）だけを付け、latest・musl・glibc は動かさない
+#     イメージ … 版のタグ（musl-v…・glibc-v…・v…。v… は musl と同じ）だけを付け、latest・musl・glibc は動かさない
+#   正式版では latest＝vX.Y.Z＝musl＝musl-vX.Y.Z、glibc＝glibc-vX.Y.Z（tools/release/publish-images.sh）
 #     crates  … cargo publish --dry-run だけ（crates.io の公開は取り消せないため）
 #     PyPI    … TestPyPI へ送る
 # - 鍵は置かない: ghcr は GITHUB_TOKEN、crates.io と PyPI は trusted publishing（OIDC）。最初の 1 回だけ人が行う

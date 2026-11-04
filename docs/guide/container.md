@@ -4,7 +4,7 @@ veil is published as a multi-arch (amd64, arm64) container image at **`ghcr.io/a
 
 | Tag | Contents |
 |-----|----------|
-| `latest`, `musl`, `musl-vX.Y.Z` | static musl binary on `scratch` |
+| `latest`, `vX.Y.Z`, `musl`, `musl-vX.Y.Z` | static musl binary on `scratch` (`vX.Y.Z` is the same image as `musl-vX.Y.Z`) |
 | `glibc`, `glibc-vX.Y.Z` | glibc binary on Wolfi ([Chainguard `glibc-dynamic`](https://images.chainguard.dev/directory/image/glibc-dynamic/overview); distroless up to v0.8.3) |
 
 Both run under Docker's default seccomp profile and Kubernetes `RuntimeDefault`: the binary is the

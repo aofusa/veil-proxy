@@ -7,14 +7,13 @@
 # 渡すと、そのリポジトリのダイジェストを <image> にコピーする（Docker Hub への複製）。
 #
 # タグ（例 v0.8.0）:
-#   musl  → musl-v0.8.0、正式版なら musl・latest も
+#   musl  → musl-v0.8.0 と v0.8.0（プレリリースも）、正式版なら musl・latest も
 #   glibc → glibc-v0.8.0、正式版なら glibc も
-# 版のタグが既にあれば上書きせず失敗する（動くタグだけが付け替わる）。
+# 版のタグ（musl-v…・glibc-v…・v…）が既にあれば上書きせず失敗する（動くタグだけが付け替わる）。
 set -euo pipefail
 IMAGE="${1:?image}"; TAG="${2:?tag}"; PRE="${3:?prerelease}"; DIR="${4:?digest dir}"; SRC="${5:-$1}"
 
-for variant in musl glibc; do
-    versioned="$IMAGE:$variant-$TAG"
+for versioned in "$IMAGE:musl-$TAG" "$IMAGE:glibc-$TAG" "$IMAGE:$TAG"; do
     if docker buildx imagetools inspect "$versioned" >/dev/null 2>&1; then
         echo "error: $versioned already exists (version tags are never overwritten)" >&2
         exit 1
@@ -49,9 +48,14 @@ for variant in musl glibc; do
         # キーレス署名（GitHub の OIDC。workflow の id-token: write）
         cosign sign --yes "$IMAGE@$digest"
     fi
+    # 版だけのタグ（v0.8.0）は musl と同じ index。正式版なら動くタグ（musl・glibc・latest）も付ける
+    tags=()
+    [ "$variant" = musl ] && tags+=(-t "$IMAGE:$TAG")
     if [ "$PRE" != true ]; then
-        tags=(-t "$IMAGE:$variant")
+        tags+=(-t "$IMAGE:$variant")
         [ "$variant" = musl ] && tags+=(-t "$IMAGE:latest")
+    fi
+    if [ "${#tags[@]}" -gt 0 ]; then
         # 同じ index（ダイジェスト）にタグを付けるだけ（中身は版のタグと同じ）
         docker buildx imagetools create "${tags[@]}" "$IMAGE@$digest"
         for t in "${tags[@]}"; do

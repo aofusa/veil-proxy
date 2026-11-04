@@ -5,7 +5,7 @@
 #
 # - oras copy -r で、版のタグの index と、それを指す署名・SBOM（OCI の referrer）をそのまま写す（digest は ghcr.io と同じ）。
 #   cosign v3 の署名は referrer なので、cosign copy（非推奨）では Docker Hub の cosign verify が署名を見つけられない
-# - 正式版なら latest・musl・glibc を同じ digest に付ける
+# - 版だけのタグ（vX.Y.Z）を musl と同じ digest に付ける（プレリリースも）。正式版なら latest・musl・glibc も付ける
 # - 写した後、digest が ghcr.io と同じで cosign verify が通ることを確かめる
 # - Docker Hub の説明（短い説明と packaging/container/dockerhub.md）を API で更新する
 # 要る環境変数: DOCKERHUB_USERNAME・DOCKERHUB_TOKEN（docker login 済みであること）
@@ -22,9 +22,18 @@ for variant in musl glibc; do
     oras copy -r "$src" "$DST:$variant-$TAG"
     got="$(digest_of "$DST:$variant-$TAG")"
     [ "$got" = "$d" ] || { echo "::error title=Docker Hub::$DST:$variant-$TAG is $got, ghcr.io has $d"; exit 1; }
+    tags=()
+    [ "$variant" = musl ] && tags+=(-t "$DST:$TAG")
     if [ "$PRE" != true ]; then
-        tags=(-t "$DST:$variant"); [ "$variant" = musl ] && tags+=(-t "$DST:latest")
+        tags+=(-t "$DST:$variant"); [ "$variant" = musl ] && tags+=(-t "$DST:latest")
+    fi
+    if [ "${#tags[@]}" -gt 0 ]; then
         docker buildx imagetools create "${tags[@]}" "$DST@$d"
+        for t in "${tags[@]}"; do
+            [ "$t" = -t ] && continue
+            got="$(digest_of "$t")"
+            [ "$got" = "$d" ] || { echo "::error title=Docker Hub::$t is $got, expected $d"; exit 1; }
+        done
     fi
     cosign verify "$DST@$d" \
         --certificate-identity-regexp '^https://github.com/aofusa/veil-proxy/' \

@@ -567,7 +567,7 @@ packaging/output/veil-0.10.1-x86_64-unknown-linux-musl.tar.gz
 
 | 公開先 | 中身 | いつ | 鍵 |
 |---|---|---|---|
-| `ghcr.io/aofusa/veil` | `latest`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`（`linux/amd64`・`linux/arm64`、`full-container`） | タグ | `GITHUB_TOKEN` |
+| `ghcr.io/aofusa/veil` | `latest`＝`vX.Y.Z`＝`musl`＝`musl-vX.Y.Z`、`glibc`＝`glibc-vX.Y.Z`（プレリリースは版のタグ `musl-v…`・`glibc-v…`・`v…` だけ）（`linux/amd64`・`linux/arm64`、`full-container`） | タグ | `GITHUB_TOKEN` |
 | crates.io | `veil-proxy`・`-macros`・`-build`・`-quiche`・`-wasmtime` | タグ | trusted publishing |
 | PyPI | `veil-api` の wheel と sdist | タグ | trusted publishing |
 | GitHub Release（**draft**） | 全 OS のアーカイブ・deb・rpm・MSI・BSD の ports・`SHA256SUMS`（Sigstore の署名）・出自の証明・リリースノート | タグ | `GITHUB_TOKEN` |
