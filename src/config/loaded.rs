@@ -317,6 +317,11 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（以前は設定ロード時に
     // 一度も呼ばれておらず、無効設定・既定値でも毎リクエストのメトリクス記録が走っていた）。
     crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
+    // B-289: リロードで作り直したサーキットブレーカー（Closed から始まる）の状態ゲージを出す
+    #[cfg(feature = "metrics")]
+    for group in runtime_config.upstream_groups.values() {
+        group.export_circuit_state();
+    }
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
     crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);

@@ -546,6 +546,11 @@ pub fn run_server(opts: ServerOptions) {
     };
     // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（config::reload と同じ）。
     crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
+    // B-289: サーキットブレーカーの状態ゲージは状態が変わるまで出ないので、起動時の値を出しておく
+    #[cfg(feature = "metrics")]
+    for group in runtime_config.upstream_groups.values() {
+        group.export_circuit_state();
+    }
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
     crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);

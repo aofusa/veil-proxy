@@ -1685,6 +1685,52 @@ mod tests {
         set_metrics_runtime_enabled(true);
     }
 
+    /// B-289: サーキットブレーカーのあるグループは、状態が一度も変わらなくてもロード時に 0（Closed）の系列を持つ。
+    /// ブレーカーの無いグループは系列を作らない
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn circuit_breaker_state_is_exported_at_load() {
+        use crate::config::{
+            CircuitBreakerConfig, LoadBalanceAlgorithm, OutlierConfig, UpstreamGroup,
+            UpstreamServerEntry,
+        };
+        let _guard = metrics_test_lock();
+        set_metrics_runtime_enabled(true);
+        let group = |name: &str, enabled: bool| {
+            let entry = UpstreamServerEntry {
+                url: "http://10.0.0.1:80".into(),
+                sni_name: None,
+                use_h2c: false,
+                http2: None,
+                weight: 1,
+            };
+            let cb: CircuitBreakerConfig = toml::from_str(&format!("enabled = {enabled}")).unwrap();
+            UpstreamGroup::new(
+                name.into(),
+                vec![entry],
+                LoadBalanceAlgorithm::RoundRobin,
+                None,
+                false,
+            )
+            .unwrap()
+            .with_resilience(&cb, &OutlierConfig::default())
+        };
+        group("b289-cb", true).export_circuit_state();
+        group("b289-nocb", false).export_circuit_state();
+        let series = |name: &str| {
+            METRICS_REGISTRY
+                .gather()
+                .iter()
+                .filter(|f| f.name() == "veil_circuit_breaker_state")
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| m.get_label().iter().any(|l| l.value() == name))
+                .map(|m| m.get_gauge().value())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(series("b289-cb"), vec![0.0]);
+        assert!(series("b289-nocb").is_empty());
+    }
+
     /// B-158: host のラベルは設定の host 条件（パターン）か `other` だけ。でたらめな Host で系列が増えない
     #[test]
     #[cfg(feature = "metrics")]

@@ -775,6 +775,16 @@ impl UpstreamGroup {
         }
     }
 
+    /// サーキットブレーカーのあるグループの状態ゲージを今の値で出す（設定のロード・リロードでメトリクスを
+    /// 有効にした直後に呼ぶ）。
+    // B-289: ゲージは状態が変わったときだけ更新するので、一度も変わらないと系列が無いままだった
+    #[cfg(feature = "metrics")]
+    pub fn export_circuit_state(&self) {
+        if self.servers.iter().any(|s| s.circuit_breaker.is_some()) {
+            crate::metrics::set_circuit_breaker_state(&self.name, self.circuit_state_code());
+        }
+    }
+
     /// グループのサーキットブレーカーの状態（どれかが Open なら 1、どれかが HalfOpen なら 2、ほかは 0）
     #[cfg(feature = "metrics")]
     fn circuit_state_code(&self) -> u64 {
