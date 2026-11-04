@@ -219,6 +219,21 @@ sysctl -w kern.somaxconn=1024        # NetBSD
 
 OpenBSD では既定のログインクラスが root でもファイル数を 1024 に制限します。`/etc/login.conf` の `openfiles-max` を上げてください。
 
+### HTTP/1.1 の本文のゼロコピー
+
+HTTP/1.1 の応答の本文は、次の場合に veil のメモリへコピーせずにカーネルへ渡す。
+
+| 接続 | 静的配信（`mode = "sendfile"`） | プロキシ（`Content-Length` の本文） |
+|---|---|---|
+| 平文・Linux | `sendfile(2)`、ヘッダは `MSG_MORE` で送る（静的コンテンツキャッシュにあるファイルはキャッシュから送る） | `splice(2)` |
+| 平文・FreeBSD | ヘッダも同じ呼び出しで送る `sendfile(2)` | コピー |
+| kTLS | `sendfile(2)` | `splice(2)`（Linux） |
+| ユーザー空間の TLS（rustls） | コピー（して暗号化） | コピー |
+
+プロキシの経路は、圧縮・キャッシュ・`buffering`・Proxy-Wasm・CORS のヘッダを足すルートと chunked の本文では使わない。
+HTTP/2・HTTP/3 は常にコピーする（DATA フレーム・QUIC のパケットごとに枠が要り、フレームごとの複数のシステムコールより、
+コピーした本文の `writev` 1 回のほうが安い）。
+
 ### FreeBSD: h2c の静的配信のゼロコピー（F-240）
 
 FreeBSD では、静的コンテンツキャッシュ（`[static_file_cache]` + `[route.open_file_cache]`）は 16KB 以上のファイルの本体を

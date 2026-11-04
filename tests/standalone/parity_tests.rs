@@ -1118,3 +1118,191 @@ body = "ok"
         veil.log()
     );
 }
+
+/// 中身の位置が分かる本文（並びが崩れたり一部が抜けたりすれば一致しない）
+fn binary_body(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 7) ^ (i >> 15)) as u8)
+        .collect()
+}
+
+/// 平文の HTTP/1.1 のキープアライブ接続で 1 要求を送り、Content-Length の分だけ本文を読む。
+/// 応答の後ろに余分なバイトが続いていれば次の応答の読み取りで食い違う。`slow` は本文を少しずつ読む
+/// （サーバの送信バッファを一杯にして、送信の途中の再開を通す）
+fn h1_keepalive(
+    s: &mut std::net::TcpStream,
+    pending: &mut Vec<u8>,
+    req: &[u8],
+    slow: bool,
+) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    s.write_all(req).unwrap();
+    let mut tmp = vec![0u8; 65536];
+    let end = loop {
+        if let Some(e) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+            break e + 4;
+        }
+        let n = s.read(&mut tmp).unwrap();
+        assert!(n > 0, "closed before the response head");
+        pending.extend_from_slice(&tmp[..n]);
+    };
+    let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+    pending.drain(..end);
+    let status: u16 = head[9..12].parse().unwrap();
+    let cl: usize = head
+        .lines()
+        .find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    while pending.len() < cl {
+        if slow {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let want = if slow { 4096 } else { tmp.len() };
+        let n = s.read(&mut tmp[..want]).unwrap();
+        assert!(n > 0, "closed after {} of {cl} body bytes", pending.len());
+        pending.extend_from_slice(&tmp[..n]);
+    }
+    let body: Vec<u8> = pending.drain(..cl).collect();
+    (status, head, body)
+}
+
+/// 平文の HTTP/1.1 は静的配信の本文を sendfile(2)、プロキシの本文を splice(2) で送る（以前は Linux では
+/// ファイルを pread して send し直し、上流の本文を読んで書き直していた）。大きいファイル（送信バッファを
+/// 超え、受け手が遅い）・小さいファイル・Range・静的コンテンツキャッシュのあるルート・上流の大きい応答と
+/// 要求の本文を、同じキープアライブ接続で続けて送っても中身と区切りが崩れない
+#[test]
+fn plaintext_h1_zero_copy_files_and_proxy_bodies_keep_framing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    let big = binary_body(3 * 1024 * 1024 + 17);
+    std::fs::write(www.join("big.bin"), &big).unwrap();
+    std::fs::write(www.join("small.txt"), b"abc").unwrap();
+    let upstream_body = binary_body(2 * 1024 * 1024 + 5);
+    let ub = upstream_body.clone();
+    let (up, seen) = spawn_recording_upstream(move |_| (200, String::new(), ub.clone()));
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+
+[[route]]
+[route.conditions]
+path = "/cached/*"
+[route.action]
+type = "File"
+path = "{www}"
+mode = "sendfile"
+[route.open_file_cache]
+enabled = true
+[route.static_file_cache]
+enabled = true
+max_file_size_bytes = 8388608
+
+[[route]]
+[route.conditions]
+path = "/p"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}/p"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+        www = tp(&www),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut pending = Vec::new();
+    let get = |path: &str, extra: &str| {
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n").into_bytes()
+    };
+
+    for prefix in ["/static", "/cached"] {
+        for slow in [false, true] {
+            let ctx = format!("{prefix} slow={slow}\n{}", veil.log());
+            let (st, _, body) = h1_keepalive(
+                &mut s,
+                &mut pending,
+                &get(&format!("{prefix}/big.bin"), ""),
+                slow,
+            );
+            assert_eq!(st, 200, "{ctx}");
+            assert!(body == big, "big body differs ({} bytes) {ctx}", body.len());
+        }
+        let ctx = format!("{prefix}\n{}", veil.log());
+        let (st, _, body) = h1_keepalive(
+            &mut s,
+            &mut pending,
+            &get(&format!("{prefix}/small.txt"), ""),
+            false,
+        );
+        assert_eq!((st, body.as_slice()), (200, &b"abc"[..]), "{ctx}");
+        // Range（送信の開始位置がファイルの途中）
+        let (st, head, body) = h1_keepalive(
+            &mut s,
+            &mut pending,
+            &get(
+                &format!("{prefix}/big.bin"),
+                "Range: bytes=1000000-2500000\r\n",
+            ),
+            false,
+        );
+        assert_eq!(st, 206, "{head} {ctx}");
+        assert!(
+            body == big[1_000_000..=2_500_000],
+            "range body differs ({} bytes) {ctx}",
+            body.len()
+        );
+        let (st, _, body) = h1_keepalive(
+            &mut s,
+            &mut pending,
+            &get(&format!("{prefix}/big.bin"), "Range: bytes=-5\r\n"),
+            false,
+        );
+        assert_eq!((st, body.as_slice()), (206, &big[big.len() - 5..]), "{ctx}");
+    }
+
+    // プロキシ: 上流の大きい応答（速い・遅い受け手）と、大きい要求の本文
+    for slow in [false, true] {
+        let (st, _, body) = h1_keepalive(&mut s, &mut pending, &get("/p", ""), slow);
+        assert_eq!(st, 200, "{}", veil.log());
+        assert!(
+            body == upstream_body,
+            "proxied body differs ({} bytes, slow={slow})\n{}",
+            body.len(),
+            veil.log()
+        );
+    }
+    let upload = binary_body(1024 * 1024 + 3);
+    let mut req = format!(
+        "POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        upload.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&upload);
+    let (st, _, body) = h1_keepalive(&mut s, &mut pending, &req, false);
+    assert_eq!(st, 200, "{}", veil.log());
+    assert!(body == upstream_body, "{}", veil.log());
+    let got = seen.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        got.complete && got.body == upload,
+        "upstream got {} bytes",
+        got.body.len()
+    );
+
+    // 最後に同じ接続で小さい要求がそのまま通る（区切りがずれていない）
+    let (st, _, body) = h1_keepalive(&mut s, &mut pending, &get("/static/small.txt", ""), false);
+    assert_eq!((st, body.as_slice()), (200, &b"abc"[..]), "{}", veil.log());
+    assert!(pending.is_empty(), "{} extra bytes", pending.len());
+}

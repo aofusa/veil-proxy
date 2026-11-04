@@ -1104,6 +1104,8 @@ NUL 終端ではなく、コールバックから戻るまで有効です。Open
 Operation Object を JSON で渡すと説明が反映されます）。設定は `veil_config_set(cfg, "server.threads", "4")` で上書きでき、
 `VEIL_OVERRIDE_<n>` も通常どおり効きます。詳細（所有権の表・エラーコード・API 一覧）は
 [crates/veil-capi/README.md](../../../crates/veil-capi/README.md)、サンプルは [examples/api/c-hello/](../../../examples/api/c-hello/) です。
+`veil_run`（Rust の `App::run` も）はプロセス全体で `SIGPIPE` を無視する設定にします（ファイルやプロキシの本文を送っている間に
+クライアントが接続を閉じても、プログラムが落ちないようにするため）。
 
 **ストリーミング・gRPC・L4（F-210）。** C API も Rust と同じ機能を持ちます。veil はバイト列を運ぶだけで、メッセージの
 直列化は好きなライブラリ（protobuf-c・nanopb・upb 等）で行います。

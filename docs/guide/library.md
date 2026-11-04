@@ -1158,6 +1158,8 @@ thread-safe. `veil_register_route_ex(..., VEIL_ROUTE_INLINE)` runs the callback 
 worker. Request accessors return non-NUL-terminated pointers valid until the callback returns. OpenAPI is
 generated for C routes too (pass an Operation Object as JSON to `veil_register_route_ex` to describe them).
 Settings are applied with `veil_config_set(cfg, "server.threads", "4")`, and `VEIL_OVERRIDE_<n>` works as usual.
+`veil_run` (and `App::run` in Rust) sets `SIGPIPE` to be ignored for the whole process, so that a client closing
+its connection while a file or proxied body is being sent does not kill the program.
 Details (ownership table, error codes, API list): [crates/veil-capi/README.md](../../crates/veil-capi/README.md).
 Example: [examples/api/c-hello/](../../examples/api/c-hello/).
 

@@ -913,7 +913,8 @@ pub(super) async fn proxy_http_pooled(
             let wasm_modules_active = !wasm_modules.is_empty();
             #[cfg(not(feature = "wasm"))]
             let wasm_modules_active = false;
-            if client_stream.is_ktls_enabled()
+            // 平文の接続も同じ splice の経路（ユーザー空間へ読んで書き直さない）
+            if (client_stream.is_ktls_enabled() || client_stream.is_plain())
                 && !is_chunked
                 && !compression_enabled
                 && !cache_save_needed

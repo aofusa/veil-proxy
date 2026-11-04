@@ -10,6 +10,7 @@ use super::*;
 //
 // kTLS が有効な場合、splice(2) を使用してカーネル空間で直接
 // データを転送します。HTTPバックエンド（平文）への接続で効果的です。
+// 平文（TLS 終端なし）のクライアント接続も同じ経路を使います（rustls の接続は使わない）。
 //
 // 注意: Chunked 転送の場合は終端検出のためユーザー空間での
 // 処理が必要なため、splice は使用しません。
@@ -24,12 +25,18 @@ use super::*;
 ///
 /// pipe に取り込んだ n バイトは dst のバックプレッシャに追従して**必ず全量ドレイン**
 /// してから次のチャンクへ進む（pipe 内残データと `remaining` のずれによるデータ損失を防ぐ）。
+///
+/// `direct` は splice(2) を io_uring に出さずにその場で非ブロッキングで呼ぶ（平文のクライアント接続）。io_uring の
+/// `IORING_OP_SPLICE` はソケットが相手でも常にカーネルのワーカースレッドへ回され（その場で発行しない）、54KB の応答で
+/// 要求あたりの命令数が 1.5 倍になった。両端とも非ブロッキング（ソケットは `SOCK_NONBLOCK`、パイプは `O_NONBLOCK`、
+/// `SPLICE_F_NONBLOCK`）なので待たずに `EAGAIN` で戻る（reactor の `runtime::splice` と同じ）。
 #[cfg(all(veil_ktls, target_os = "linux"))]
 pub(super) async fn splice_body_transfer(
     src_stream: &TcpStream,
     dst_stream: &TcpStream,
     pipe: &SplicePipe,
     mut remaining: usize,
+    direct: bool,
 ) -> u64 {
     use crate::runtime::splice::{splice as iouring_splice, splice_more as iouring_splice_more};
     use std::os::unix::io::AsRawFd;
@@ -51,7 +58,12 @@ pub(super) async fn splice_body_transfer(
         let chunk_size = remaining.min(chunk_size_config);
 
         // Step 1: src → pipe（io_uring 非同期 splice）
-        let n = match iouring_splice(src_fd, pipe.write_fd(), chunk_size).await {
+        let step = if direct {
+            splice_now(src_fd, pipe.write_fd(), chunk_size, false)
+        } else {
+            iouring_splice(src_fd, pipe.write_fd(), chunk_size).await
+        };
+        let n = match step {
             Ok(0) => break, // src EOF
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -78,12 +90,14 @@ pub(super) async fn splice_body_transfer(
         let more_follows = remaining > n;
         let mut moved = 0usize;
         while moved < n {
-            let splice_step = if more_follows {
-                iouring_splice_more(pipe.read_fd(), dst_fd, n - moved)
+            let splice_step = if direct {
+                splice_now(pipe.read_fd(), dst_fd, n - moved, more_follows)
+            } else if more_follows {
+                iouring_splice_more(pipe.read_fd(), dst_fd, n - moved).await
             } else {
-                iouring_splice(pipe.read_fd(), dst_fd, n - moved)
+                iouring_splice(pipe.read_fd(), dst_fd, n - moved).await
             };
-            match splice_step.await {
+            match splice_step {
                 Ok(0) => break 'outer, // dst クローズ
                 Ok(m) => moved += m,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -106,6 +120,47 @@ pub(super) async fn splice_body_transfer(
     }
 
     total
+}
+
+/// 平文の接続へ応答 head を `MSG_MORE` で書く（受け取らないクライアントで永久に待たない）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+async fn send_head_more(client_tcp: &TcpStream, head: &[u8]) -> io::Result<()> {
+    match timeout(WRITE_TIMEOUT, async_raw_send_more_all(client_tcp, head)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "response head write timed out",
+        )),
+    }
+}
+
+/// 非ブロッキングの splice(2) をその場で 1 回呼ぶ（`splice_body_transfer` の `direct`）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+fn splice_now(fd_in: RawFd, fd_out: RawFd, len: usize, more: bool) -> io::Result<usize> {
+    let mut flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+    if more {
+        flags |= libc::SPLICE_F_MORE;
+    }
+    loop {
+        // SAFETY: 両 fd は呼び出しの間有効。オフセットは使わない（null）。
+        let r = unsafe {
+            libc::splice(
+                fd_in,
+                std::ptr::null_mut(),
+                fd_out,
+                std::ptr::null_mut(),
+                len,
+                flags,
+            )
+        };
+        if r >= 0 {
+            return Ok(r as usize);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 // ====================
@@ -221,12 +276,21 @@ pub(super) async fn proxy_http_request_splice(
         }
     };
 
-    // kTLS が有効でない場合はフォールバック
-    if !client_stream.is_ktls_enabled() {
+    // kTLS か平文でなければフォールバック（rustls の暗号文を splice しない）
+    if !(client_stream.is_ktls_enabled() || client_stream.is_plain()) {
+        return None;
+    }
+    // 平文の接続が読み取り済みの未消費データを抱えていたら、ソケットから splice すると本文の順序が崩れる
+    // （何も送る前に通常の経路へ戻す）
+    if content_length > initial_body.len() && {
+        use crate::runtime::io::BufferedReadState;
+        client_stream.has_buffered_read_data()
+    } {
         return None;
     }
 
     let client_tcp = client_stream.get_ref();
+    let plain = client_stream.is_plain();
 
     // B-245: HEAD への応答は本文を持たない（書く前に判定する）
     let is_head = request_is_head(request);
@@ -256,7 +320,7 @@ pub(super) async fn proxy_http_request_splice(
         // Content-Length の場合: splice でゼロコピー転送
         // kTLS クライアント → バックエンド TCP
         let transferred =
-            splice_body_transfer(client_tcp, backend_stream, pipe, remaining_body).await;
+            splice_body_transfer(client_tcp, backend_stream, pipe, remaining_body, plain).await;
 
         if transferred < remaining_body as u64 {
             warn!(
@@ -354,6 +418,10 @@ pub(super) async fn splice_transfer_response_ktls(
 
             // ヘッダー + 初期ボディをクライアントに送信（raw_write）。本文の終端より後ろは送らない
             let head_len = header_len + start.send;
+            // 平文の接続で splice の本文が続くなら、head を MSG_MORE で本文の最初のセグメントとまとめる
+            // （kTLS には付けない。B-25）
+            let more = client_stream.is_plain()
+                && matches!(kind, ResponseBody::Length(cl) if cl > start.send);
             // 応答ヘッダの方針・Alt-Svc・Server・HTTP/1.1 以外のステータス行があれば、他の経路と同じ
             // `render_response_head` で直してから送る（以前は上流の head をそのまま送っていた。B-275）。
             // どれも無ければ今までどおり上流の head をそのまま送る（確保しない）
@@ -373,12 +441,20 @@ pub(super) async fn splice_transfer_response_ktls(
                     &mut out,
                 );
                 out.extend_from_slice(&accumulated[header_len..head_len]);
-                let r = async_raw_write_all(client_tcp, &out).await;
+                let r = if more {
+                    send_head_more(client_tcp, &out).await
+                } else {
+                    async_raw_write_all(client_tcp, &out).await
+                };
                 let n = out.len();
                 if out.capacity() <= SPLICE_HEAD_BUF_KEEP {
                     SPLICE_HEAD_BUF.with(|c| c.set(out));
                 }
                 r.map(|_| n)
+            } else if more {
+                send_head_more(client_tcp, &accumulated[..head_len])
+                    .await
+                    .map(|_| head_len)
             } else {
                 async_raw_write_all(client_tcp, &accumulated[..head_len])
                     .await
@@ -401,8 +477,14 @@ pub(super) async fn splice_transfer_response_ktls(
                     // Content-Length 転送: splice でゼロコピー
                     let remaining = content_length.saturating_sub(start.send);
                     if remaining > 0 {
-                        let transferred =
-                            splice_body_transfer(backend_stream, client_tcp, pipe, remaining).await;
+                        let transferred = splice_body_transfer(
+                            backend_stream,
+                            client_tcp,
+                            pipe,
+                            remaining,
+                            client_stream.is_plain(),
+                        )
+                        .await;
                         total += transferred;
                         // B-17: CL 未達のままの終了はクライアントを待たせないようクローズ
                         complete = transferred >= remaining as u64;

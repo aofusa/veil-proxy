@@ -515,7 +515,7 @@ pub(super) async fn handle_sendfile_userspace(
     // F-150: kTLS 無効（ユーザー空間 rustls）経路の静的配信に静的コンテンツキャッシュを
     // 適用する。ここに到達した時点で、上の FreeBSD 平文 sendfile 分岐にも kTLS
     // ゼロコピー分岐（handle_sendfile_zerocopy、呼び出し元 handle_sendfile 参照）にも
-    // 乗っていない＝暗号化コピーを伴うユーザー空間 TLS 経路であることが確定しており、
+    // 乗っていない＝暗号化コピーを伴うユーザー空間 TLS 経路か Linux の平文の経路であることが確定しており、
     // F-146 が「HTTP/1.1 は sendfile(2)/kTLS のゼロコピー経路だから対象外」としていた
     // 前提はここでは成立しない（詳細は F-150 チケット参照）。既定は enabled=false のため
     // 既定挙動は完全に不変。
@@ -555,10 +555,42 @@ pub(super) async fn handle_sendfile_userspace(
         }
     }
 
-    // ヘッダー送信（タイムアウト付き）
-    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
+    // 平文（TLS 終端なし）の Linux は本文を sendfile(2) でページキャッシュから直接送る（ユーザー空間へ
+    // pread して send し直さない）。ヘッダは MSG_MORE で本文の最初のセグメントとまとめる。静的コンテンツキャッシュに
+    // 載る本文は上のキャッシュから送る（検証子と同じ版の中身を返す。監視しないルートは有効期限まで古い中身のまま、
+    // という他のプロトコルと同じ振る舞い。F-272）。rustls には通さない（ファイルの内容が暗号化されずに流れる）
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    let mut header_buf = Some(header_buf);
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    if tls_stream.is_plain() && transfer_length > 0 {
+        match sendfile_plain(
+            &tls_stream,
+            header_buf.take(),
+            file,
+            transfer_offset,
+            transfer_length,
+        )
+        .await
+        {
+            PlainSend::Sent(n) => {
+                // 長さに届かなければ Content-Length と食い違うので接続を閉じる
+                let close = client_wants_close || n < transfer_length;
+                return Some((tls_stream, response_status, n, close));
+            }
+            PlainSend::HeaderFailed => return None,
+            // ファイルが sendfile(2) に対応しない: ヘッダは送ったので本文だけ下の読み書きで送る
+            PlainSend::Unsupported => {}
+        }
+    }
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    let header_buf = header_buf.unwrap_or_default();
+
+    // ヘッダー送信（タイムアウト付き。平文で sendfile(2) に対応しないファイルはヘッダを送り済み）
+    if !header_buf.is_empty() {
+        let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+        if !matches!(write_result, Ok((Ok(_), _))) {
+            return None;
+        }
     }
 
     let mut total_sent = 0u64;
@@ -605,7 +637,98 @@ pub(super) async fn handle_sendfile_userspace(
         }
     }
 
-    Some((tls_stream, response_status, total_sent, client_wants_close))
+    // 長さに届かずに終わったら Content-Length と食い違うので接続を閉じる（次の応答とずれる）
+    let close = client_wants_close || total_sent < transfer_length;
+    Some((tls_stream, response_status, total_sent, close))
+}
+
+/// 平文の sendfile(2) 1 回で送る上限。送り切るたびにワーカーへ譲る（54KB 等の小さい応答は 1 回で終わる）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+const SENDFILE_PLAIN_CHUNK: usize = 1024 * 1024;
+
+/// 平文の sendfile(2) の結果
+#[cfg(all(veil_ktls, target_os = "linux"))]
+enum PlainSend {
+    /// ヘッダを送り、本文をこのバイト数だけ送った（途中で切れたら長さに届かない）
+    Sent(u64),
+    /// ヘッダを送れなかった（接続は使えない）
+    HeaderFailed,
+    /// ヘッダは送ったが、ファイルが sendfile(2) に対応しない（本文は 1 バイトも送っていない）
+    Unsupported,
+}
+
+/// 平文の接続へヘッダ（`MSG_MORE`）と本文（`sendfile(2)`）を送る（Linux）。
+///
+/// 受理したソケットは非ブロッキング（`SOCK_NONBLOCK`）なので、送信バッファが一杯なら `EAGAIN` で戻り、書き込み可能を
+/// 待って続きから送る（`sendfile(2)` が `offset` を進める）。ファイルの読み込みはページキャッシュから行う（kTLS の
+/// `handle_sendfile_zerocopy` と同じ）。`sendfile(2)` に `MSG_NOSIGNAL` は付けられないが、相手が閉じたときの SIGPIPE は
+/// プロセスで無視している（Rust の実行時が `main` の前に `SIG_IGN` にする）ので `EPIPE` として返る。
+#[cfg(all(veil_ktls, target_os = "linux"))]
+async fn sendfile_plain(
+    tls_stream: &ServerTls,
+    header: Option<Vec<u8>>,
+    file: &crate::runtime::io::File,
+    transfer_offset: i64,
+    transfer_length: u64,
+) -> PlainSend {
+    use std::os::unix::io::AsRawFd;
+
+    let sock = tls_stream.get_ref();
+    if let Some(h) = header {
+        if !matches!(
+            timeout(WRITE_TIMEOUT, async_raw_send_more_all(sock, &h)).await,
+            Ok(Ok(()))
+        ) {
+            return PlainSend::HeaderFailed;
+        }
+    }
+
+    let out_fd = sock.as_raw_fd();
+    let in_fd = file.as_raw_fd();
+    let mut offset = transfer_offset;
+    let end = transfer_offset + transfer_length as i64;
+    let mut sent = 0u64;
+    while offset < end {
+        let count = ((end - offset) as usize).min(SENDFILE_PLAIN_CHUNK);
+        // SAFETY: 両 fd は呼び出しの間有効で、offset は有効なスタック変数（カーネルが進める）。
+        let r = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
+        if r > 0 {
+            sent += r as u64;
+            // 速く受け取る相手へ大きいファイルを送る間も同じワーカーの他の接続を止めない（1 回の上限まで送れたら譲る）
+            if r as usize == SENDFILE_PLAIN_CHUNK && offset < end {
+                crate::runtime::yield_now().await;
+            }
+            continue;
+        }
+        if r == 0 {
+            // ファイルが縮んだ（長さに届かないまま終わる）
+            break;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::WouldBlock => {
+                // B-17 と同じ: 受け取らないクライアントで永久に待たない
+                if !matches!(timeout(WRITE_TIMEOUT, sock.writable()).await, Ok(Ok(()))) {
+                    break;
+                }
+            }
+            io::ErrorKind::Interrupted => {}
+            _ if sent == 0
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+                ) =>
+            {
+                debug!("sendfile(2) is not supported for this file: {}", e);
+                return PlainSend::Unsupported;
+            }
+            _ => {
+                debug!("sendfile(2) error (plain): {}", e);
+                break;
+            }
+        }
+    }
+    PlainSend::Sent(sent)
 }
 
 /// ファイル全体を `Bytes` で得る（静的コンテンツキャッシュが有効ならキャッシュから、無ければ開いている fd から 1 回の

@@ -221,6 +221,21 @@ sysctl -w kern.somaxconn=1024        # NetBSD
 
 On OpenBSD the default login class limits even root to 1024 open files; raise `openfiles-max` in `/etc/login.conf`.
 
+### Zero-copy HTTP/1.1 bodies
+
+HTTP/1.1 response bodies are passed to the kernel without copying them through veil's memory in these cases:
+
+| Connection | Static files (`mode = "sendfile"`) | Proxy (`Content-Length` bodies) |
+|---|---|---|
+| Plaintext, Linux | `sendfile(2)`, header sent with `MSG_MORE` (files in the static content cache are sent from the cache) | `splice(2)` |
+| Plaintext, FreeBSD | `sendfile(2)` with the header in the same call | copied |
+| kTLS | `sendfile(2)` | `splice(2)` (Linux) |
+| Userspace TLS (rustls) | copied (and encrypted) | copied |
+
+The proxy path is not used on routes that compress, cache, buffer (`buffering`), run Proxy-Wasm or add CORS headers,
+or for chunked bodies. HTTP/2 and HTTP/3 always copy: each DATA frame or QUIC packet needs its own framing, and one
+`writev` of copied data is cheaper than several system calls per frame.
+
 ### FreeBSD: zero-copy h2c static files (F-240)
 
 On FreeBSD, the static content cache (`[static_file_cache]` + `[route.open_file_cache]`) keeps file bodies of 16 KB

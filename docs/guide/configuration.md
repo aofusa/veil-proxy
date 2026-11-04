@@ -283,7 +283,8 @@ valid_duration_secs = 300  # 5 minutes (static files change infrequently)
 max_entries = 50000
 watch = true  # follow disk changes by change notification
 # Static content cache configuration (route-specific, overrides global setting).
-# HTTP/2/HTTP/3 only — HTTP/1.1 already uses sendfile(2) and is unaffected.
+# Used by HTTP/2, HTTP/3, HTTP/1.1 with userspace TLS, and plaintext HTTP/1.1 on Linux.
+# HTTP/1.1 with kTLS, and plaintext HTTP/1.1 on FreeBSD, always send files with sendfile(2).
 [route.static_file_cache]
 enabled = true
 valid_duration_secs = 300

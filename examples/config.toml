@@ -598,8 +598,9 @@ reuseport_balancing = "cbpf"
 #     往復が一切発生しない（DashMap ルックアップ + Bytes::clone() のみ）
 #
 # 注意事項:
-#   - HTTP/1.1 は kTLS 有効時・平文時は sendfile(2) のゼロコピー経路を使うため
-#     本キャッシュの対象外
+#   - HTTP/1.1 は kTLS 有効時と FreeBSD の平文では sendfile(2) のゼロコピー経路を
+#     使うため本キャッシュの対象外。Linux の平文の HTTP/1.1 はキャッシュにある本体を
+#     ここから送り、それ以外は sendfile(2) で送る
 #   - kTLS 無効（ユーザー空間 rustls）の HTTP/1.1 は sendfile(2) を使えないため
 #     本キャッシュの対象になる（F-150）。FreeBSD の推奨構成（kTLS は大きな応答で
 #     不利なため ktls_enabled = false）がこれに該当する

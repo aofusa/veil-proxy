@@ -276,7 +276,8 @@ valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い�
 max_entries = 50000
 watch = true  # ディスクの変更を通知で追従する
 # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き。
-# HTTP/2・HTTP/3 限定。HTTP/1.1 は sendfile(2) を使うため対象外）
+# HTTP/2・HTTP/3、ユーザー空間 TLS の HTTP/1.1、Linux の平文の HTTP/1.1 が使う。
+# kTLS の HTTP/1.1 と FreeBSD の平文の HTTP/1.1 は常に sendfile(2) で送る）
 [route.static_file_cache]
 enabled = true
 valid_duration_secs = 300

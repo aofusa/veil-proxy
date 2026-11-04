@@ -667,6 +667,13 @@ impl App {
 
     /// Starts the server and blocks until shutdown (SIGINT/SIGTERM or `veil::shutdown()`).
     pub fn run(self) -> Result<(), Error> {
+        // 平文の HTTP/1.1 は sendfile(2)・splice(2) で送り、これらには MSG_NOSIGNAL を付けられない。相手が先に閉じたとき
+        // SIGPIPE でプロセスが落ちないよう無視する（Rust の実行ファイルと Python は既に無視している。C のホストのため）
+        #[cfg(unix)]
+        // SAFETY: シグナルの処理を SIG_IGN にするだけ（ハンドラを登録しない）。
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
         let config = self.config?;
         for f in self.setup {
             f()?;

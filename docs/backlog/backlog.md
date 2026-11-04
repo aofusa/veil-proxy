@@ -625,6 +625,7 @@
 | B-283 | P2 | 修正済み（v0.10.1） | [bugs/B-283-v0101-security-review-findings.md](bugs/B-283-v0101-security-review-findings.md) | v0.10.1 の改修のセキュリティレビュー（Fable 5.1）の所見: h2 の上流の 3 経路に溜める上限が無い（Medium）・静的配信のその場の圧縮の増幅（8 MiB 以下に）・Content-Range の配列・Wasm の固定応答のヘッダの大文字と CR/LF・splice の head の確保 |
 | B-284 | P1 | 修正済み（v0.10.1） | [bugs/B-284-v0101-static-and-h2-per-request-cost.md](bugs/B-284-v0101-static-and-h2-per-request-cost.md) | v0.10.1 の候補で静的配信と HTTP/2 が v0.10.0 より遅い（open_file_cache 無しの HTTP/1.1 で 0.80）。検証子の要求ごとの組み立て・ファイル情報の二重の組み立て・HPACK の静的表の線形探索・受信の見回りのタイマー |
 | B-285 | P2 | 修正済み（v0.10.1） | [bugs/B-285-h2-stalled-continuation-never-swept.md](bugs/B-285-h2-stalled-continuation-never-swept.md) | END_STREAM 付き・END_HEADERS 無しの HEADERS の続きを送らない HTTP/2 のクライアントを、受信の打ち切りもアイドルタイムアウトも効かずに保持し続ける（slowloris） |
+| B-286 | P2 | 修正済み（v0.10.1） | [bugs/B-286-plaintext-h1-copies-file-and-proxy-bodies.md](bugs/B-286-plaintext-h1-copies-file-and-proxy-bodies.md) | Linux の平文の HTTP/1.1 がファイルを pread して送り直し、上流の本文を read して書き直していた（文書は sendfile と書いていた）。ファイルを `sendfile(2)`（ヘッダは `MSG_MORE`）、プロキシの本文を非ブロッキングの `splice(2)` で送る（54KB のファイル 1.40 倍・プロキシ 1.11 倍） |
 
 ---
 
