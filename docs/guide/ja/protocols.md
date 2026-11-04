@@ -93,7 +93,7 @@ stream_idle_timeout_secs = 60
 
 要求本文が届かなくなったストリームは、ルートの `[route.security] client_body_timeout_secs`（既定 30 秒）の間本文を受け取らなければ
 （応答を始めるまで）`RST_STREAM(CANCEL)` で打ち切ります。`stream_idle_timeout_secs` はルートの設定の無いストリーム（どのルートにも
-当たらなかった要求など）の上限です。確かめるのは入力を待っている接続ごとに 1 秒に 1 回です。HTTP/3 もルートの
+当たらなかった要求、最後の CONTINUATION が届かないヘッダなど）の上限です。確かめるのは受信中のストリームがある接続ごとに 1 秒に 1 回です。HTTP/3 もルートの
 `client_body_timeout_secs` を同じに使い、`H3_REQUEST_CANCELLED` でストリームを打ち切ります。
 
 ### HTTP/1.1フォールバック

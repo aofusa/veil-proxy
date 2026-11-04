@@ -390,6 +390,14 @@ impl Stream {
         self.receiving_headers
     }
 
+    /// クライアントがまだ要求を送っているか: 本文の途中（`Open`・`HalfClosedLocal`）か、ヘッダの続き
+    /// （CONTINUATION）を待っている。HEADERS に END_STREAM が付いていても END_HEADERS が無ければ `HalfClosedRemote`
+    /// のまま続きを待つので、状態だけで見ると受信の打ち切り（B-276）から漏れる（B-285）。
+    pub fn is_receiving_request(&self) -> bool {
+        matches!(self.state, StreamState::Open | StreamState::HalfClosedLocal)
+            || self.receiving_headers
+    }
+
     /// 保留中のヘッダーブロック長を取得
     pub fn pending_header_len(&self) -> usize {
         self.pending_headers.len()
@@ -630,11 +638,11 @@ impl StreamManager {
 
     /// 要求の受信（ヘッダの続き・本文）が止まったストリームを `out` へ集める（B-274・B-276）。
     ///
-    /// 対象はクライアントがまだ送っている（`Open`・`HalfClosedLocal`）ストリームだけ。打ち切るまでの秒数は
+    /// 対象はクライアントがまだ送っているストリームだけ（[`Stream::is_receiving_request`]）。打ち切るまでの秒数は
     /// ストリームの `recv_timeout_secs`、0 なら `default_secs`（どちらも 0 なら打ち切らない）。
     pub fn collect_stalled_receiving(&self, default_secs: u64, out: &mut Vec<u32>) {
         for (id, s) in self.streams.iter() {
-            if !matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal) {
+            if !s.is_receiving_request() {
                 continue;
             }
             let secs = if s.recv_timeout_secs > 0 {
@@ -648,12 +656,10 @@ impl StreamManager {
         }
     }
 
-    /// クライアントがまだ要求を送っている（`Open`・`HalfClosedLocal`）ストリームがあるか。受信の見回りの
+    /// クライアントがまだ要求を送っているストリーム（[`Stream::is_receiving_request`]）があるか。受信の見回りの
     /// タイマーはこれがあるときだけ張る（GET 等の本文の無い要求だけの接続ではタイマーを持たない）。
     pub fn has_receiving(&self) -> bool {
-        self.streams
-            .values()
-            .any(|s| matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal))
+        self.streams.values().any(Stream::is_receiving_request)
     }
 
     /// 表にストリームが無いか（閉じたものは `cleanup_closed` で除いた後に見る）
@@ -841,6 +847,29 @@ mod tests {
             .recv_headers(false)
             .unwrap();
         assert!(manager.has_receiving());
+    }
+
+    /// B-285: END_STREAM 付きの HEADERS の続き（CONTINUATION）が来ないストリームも受信中として見回りの対象にする
+    #[test]
+    fn stalled_continuation_after_end_stream_is_receiving() {
+        let mut manager = StreamManager::new(100, 65535);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        {
+            let s = manager.get_or_create_client_stream(1).unwrap();
+            s.recv_headers(true).unwrap();
+            s.append_header_fragment(b"\x82", false);
+            s.last_activity = past;
+        }
+        assert!(manager.has_receiving());
+        let mut out = Vec::new();
+        manager.collect_stalled_receiving(3, &mut out);
+        assert_eq!(out, vec![1]);
+        // 続きが届いてヘッダが終われば対象外
+        manager
+            .get_or_create_client_stream(1)
+            .unwrap()
+            .append_header_fragment(b"", true);
+        assert!(!manager.has_receiving());
     }
 
     #[test]

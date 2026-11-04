@@ -94,7 +94,8 @@ When limits are exceeded, the server responds with `ENHANCE_YOUR_CALM` (0xb) err
 A stream whose request body stops arriving is reset with `RST_STREAM(CANCEL)` once no body data has been received for the
 route's `[route.security] client_body_timeout_secs` (default 30 seconds), until the response starts.
 `stream_idle_timeout_secs` is the limit for streams that have no route setting (for example a request that matched no
-route). The check runs once a second on each connection while it waits for input. HTTP/3 applies the route's
+route), including a header block that never gets its final CONTINUATION frame. The check runs once a second on each
+connection that has a stream still receiving. HTTP/3 applies the route's
 `client_body_timeout_secs` the same way and cancels the stream with `H3_REQUEST_CANCELLED`.
 
 ### HTTP/1.1 Fallback

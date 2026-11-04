@@ -1052,3 +1052,69 @@ url = "http://127.0.0.1:{up}"
         }
     }
 }
+
+/// B-285: END_STREAM 付き・END_HEADERS 無しの HEADERS の続き（CONTINUATION）を送らずに止めたクライアントも、
+/// `[http2] stream_idle_timeout_secs` で打ち切る（以前はストリームの状態が HalfClosedRemote のため見回りから漏れ、
+/// 接続のアイドルタイムアウトも効かずにいつまでも保持した）
+#[test]
+fn b285_stalled_continuation_is_reset_on_h2() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[http2]
+stream_idle_timeout_secs = 2
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Respond"
+status = 200
+body = "ok"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    // SETTINGS（空）
+    s.write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0]).unwrap();
+    // HEADERS（stream 1、END_STREAM のみ。END_HEADERS 無し）: `:method GET` だけで止める
+    s.write_all(&[0, 0, 1, 0x1, 0x1, 0, 0, 0, 1, 0x82]).unwrap();
+    let started = Instant::now();
+    // RST_STREAM（type 3）か GOAWAY（type 7）か接続の終わりが来るまで読む
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let outcome = loop {
+        let mut off = 0;
+        let mut found = None;
+        while buf.len() >= off + 9 {
+            let len = ((buf[off] as usize) << 16)
+                | ((buf[off + 1] as usize) << 8)
+                | buf[off + 2] as usize;
+            if matches!(buf[off + 3], 3 | 7) {
+                found = Some(format!("frame type {}", buf[off + 3]));
+                break;
+            }
+            off += 9 + len;
+        }
+        if let Some(f) = found {
+            break f;
+        }
+        match s.read(&mut chunk) {
+            Ok(0) => break "closed".to_string(),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => break format!("read error: {e}"),
+        }
+    };
+    let waited = started.elapsed();
+    assert!(
+        !outcome.starts_with("read error") && waited >= Duration::from_millis(1500),
+        "{outcome} after {waited:?}\n{}",
+        veil.log()
+    );
+}
