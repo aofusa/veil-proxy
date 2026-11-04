@@ -1,6 +1,9 @@
 # F-269: HttpArena（veil 単体・Rust API・Python）と the benchmarker（Python）へのベンチマークの提出
 
-**状態: 未着手（2026-10-25 起票・計画。親は [F-258](F-258-v0100-plan.md)。v0.10.0 で validate は通ったが、B-266〜B-274・F-285〜F-288 を直した版で作り直してから提出する）**
+**状態: 提出の準備完了（v0.10.1 の公開物で再検証済み、2026-11-05。fork・push・PR は利用者の確認を得てから 1 件ずつ。親は [F-258](F-258-v0100-plan.md)）**
+
+- v0.10.1 の公開物（crates.io・PyPI・ghcr.io）だけで: HttpArena veil-api 113/0・veil-python 113/0・veil 72/0（`static-tls compression` も PASS）、
+  the-benchmarker python/veil `.spec` 16/0・helpers_spec 10/0。提出文は `docs/artifacts/benchmark/pr/`、ログは `results/v0101/published/`（git 管理外）。
 
 ## 背景
 
