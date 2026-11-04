@@ -1,6 +1,6 @@
 # F-269: HttpArena（veil 単体・Rust API・Python）と the benchmarker（Python）へのベンチマークの提出
 
-**状態: 未着手（2026-10-25 起票・計画。親は [F-258](F-258-v0100-plan.md)。F-259〜F-268 を入れた版の公開の後に着手）**
+**状態: 未着手（2026-10-25 起票・計画。親は [F-258](F-258-v0100-plan.md)。v0.10.0 で validate は通ったが、B-266〜B-274・F-285〜F-288 を直した版で作り直してから提出する）**
 
 ## 背景
 
@@ -121,6 +121,16 @@
   内容（差分・PR 本文の下書き `docs/artifacts/benchmark/pr/<entry>.md`）を人に見せて承認を得てから行う。
 - HttpArena は 1 エントリ 1 PR を基本にする（レビューしやすさ）。3 エントリをまとめるかは提出前に人が決める。
 - 計測結果のコメントを見て、設定・エントリ側だけで直せるものは直す。本体の不具合なら本体のチケットを起票し、そのプロファイルは購読から外す。
+
+## 提出の前に直すもの（2026-11-04）
+
+v0.10.0 の公開物で A〜D の validate / test は通った（`docs/artifacts/benchmark/findings.md`）が、提出は保留にした。HttpArena の
+`static-tls compression` の SKIP（HTTP/1.1 の静的配信を圧縮しない）を調べ、プロトコル間で同じ機能が効かない箇所を
+[B-266](../bugs/B-266-head-local-responses-send-body.md)〜[B-274](../bugs/B-274-route-client-timeouts-h1-only.md)・
+[F-285](F-285-wasm-response-body-h1-h2.md)〜[F-288](F-288-websocket-over-h2-h3.md) に起票した。これらを直した版を公開してから、
+HttpArena・the benchmarker 用の内容（エントリ・PR の本文）を作り直して提出する。少なくとも
+[B-269](../bugs/B-269-h1-static-files-not-compressed.md)（`static-tls compression`）と [B-266](../bugs/B-266-head-local-responses-send-body.md)
+（静的配信の HEAD）を含める。
 
 ## 受け入れ条件
 
