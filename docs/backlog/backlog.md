@@ -630,6 +630,7 @@
 | B-287 | P2 | 修正済み（v0.10.1） | [bugs/B-287-homebrew-7-untrusted-tap.md](bugs/B-287-homebrew-7-untrusted-tap.md) | Homebrew 7 は信頼していない tap の formula を読まず、公開の試験の `brew audit` が落ちた（短い名前の `brew services`・`brew upgrade` も読まない）。試験で tap を `brew trust` し、利用者の手順に `brew trust aofusa/tap` を足す |
 | B-288 | P3 | 修正済み（v0.10.1） | [bugs/B-288-swagger-offline-try-out-race.md](bugs/B-288-swagger-offline-try-out-race.md) | `examples-nightly` の Swagger UI オフライン試験が、操作の解決（非同期）前に Try it out を数えて `/plaintext` で「無い」と誤判定していた。Parameters の見出しの描画を待ってから数える |
 | B-289 | P3 | 修正済み（v0.10.1） | [bugs/B-289-circuit-breaker-gauge-missing-until-change.md](bugs/B-289-circuit-breaker-gauge-missing-until-change.md) | `veil_circuit_breaker_state` は状態が変わるまで系列が無く（B-278 以降）、Grafana の例の試験（`examples-nightly`）がタイミング次第で落ちた。起動・リロードでメトリクスを有効にした直後に今の状態を出す |
+| B-290 | P3 | 修正済み | [bugs/B-290-dockerhub-signature-verify-race.md](bugs/B-290-dockerhub-signature-verify-race.md) | Docker Hub へ写した直後の `cosign verify` が、署名の反映の遅れで `no signatures found` になり v0.10.1 の `dockerhub` ジョブが落ちた（再実行で通過）。検証を間を置いて数回試す |
 
 ---
 

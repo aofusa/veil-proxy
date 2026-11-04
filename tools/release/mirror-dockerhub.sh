@@ -35,9 +35,16 @@ for variant in musl glibc; do
             [ "$got" = "$d" ] || { echo "::error title=Docker Hub::$t is $got, expected $d"; exit 1; }
         done
     fi
-    cosign verify "$DST@$d" \
-        --certificate-identity-regexp '^https://github.com/aofusa/veil-proxy/' \
-        --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+    # B-290: Docker Hub は写した署名（referrer）を少し遅れて返すことがある（直後の verify が no signatures found）。
+    # 間を置いて数回だけ確かめ直す
+    for i in 1 2 3 4 5 6; do
+        cosign verify "$DST@$d" \
+            --certificate-identity-regexp '^https://github.com/aofusa/veil-proxy/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null && break
+        [ "$i" = 6 ] && { echo "::error title=Docker Hub::no valid signature for $DST@$d"; exit 1; }
+        echo "signature of $DST@$d not visible yet, retrying in 20s"
+        sleep 20
+    done
     echo "ok   $DST:$variant-$TAG = $d (signature verified)"
 done
 
