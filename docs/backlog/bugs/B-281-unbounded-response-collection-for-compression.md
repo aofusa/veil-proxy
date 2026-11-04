@@ -20,6 +20,9 @@ B-266〜B-274 の修正のあと、応答本文を溜める経路を全部たど
 - 既知長が溜める上限（64 MiB、`pool::MAX_COLLECTED_RESPONSE_BODY`）を超える応答は圧縮せずに逐次送る。長さ不明・chunked で上限を超えたら
   打ち切る（ヘッダ送出前なので 502）。HTTP/1.1・HTTP/2・HTTP/3 の溜める経路すべてに同じ上限をかける。
 - HTTP/2 のクライアントへの長さ不明の応答は溜めずに逐次送る（上流が閉じたら END_STREAM。TLS で close_notify の無い切断はリセット。F-282）。
+- HTTP/2 のクライアントの `buffering = "full"` は、メトリクスを数えるだけで本文を溜めていなかった（長さ不明の応答を溜めていたので
+  偶然 502 になっていた）。HTTP/1.1 の上流の応答を全部溜めてから送るようにする（区切りどおりに終わらなければ応答ヘッダの前に 502。
+  HTTP/1.1・HTTP/3 と同じ。E2E `test_f282_http2_tls_upstream_eof_body_requires_close_notify`）。
 - 単体試験 `test_should_compress_skips_event_stream_and_huge_bodies`、統合試験 `b281_sse_streams_through_compression_route_on_every_protocol`
   （chunked・閉じるまでの SSE が、圧縮するルートとしないルートで 4 プロトコルとも最初のイベントを 5 秒以内に受け取る）。
 - `docs/guide/compression-cache.md`（英日）に書いた。

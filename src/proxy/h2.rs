@@ -2377,6 +2377,7 @@ pub(super) async fn h2_proxy(
             wasm_modules,
             resp_tx,
             notify,
+            buffering_full,
         )
         .await
     } else {
@@ -2391,6 +2392,7 @@ pub(super) async fn h2_proxy(
             wasm_modules,
             resp_tx,
             notify,
+            buffering_full,
         )
         .await
     };
@@ -2620,6 +2622,7 @@ pub(super) async fn h2_proxy_http(
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
+    buffer_full: bool,
 ) -> (u16, u64) {
     // F-177: プールの接続が応答の前に切れていたら、冪等な要求に限り新しい接続で 1 回だけ再送する。
     // 要求バッファは write_all が返すものを使い回す（コピーしない）。
@@ -2691,6 +2694,7 @@ pub(super) async fn h2_proxy_http(
             notify,
             retry,
             is_head,
+            buffer_full,
         )
         .await;
         if status == 0 && retry {
@@ -2729,6 +2733,7 @@ pub(super) async fn h2_proxy_https(
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
+    buffer_full: bool,
 ) -> (u16, u64) {
     let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_profile);
     // F-177: プールの接続が応答の前に切れていたら、冪等な要求に限り新しい接続で 1 回だけ再送する。
@@ -2821,6 +2826,7 @@ pub(super) async fn h2_proxy_https(
             notify,
             retry,
             is_head,
+            buffer_full,
         )
         .await;
         if status == 0 && retry {
@@ -3100,6 +3106,7 @@ pub(super) async fn h2_relay_backend_response<B>(
     notify: &crate::stream_channel::Notify,
     retry_on_empty: bool,
     is_head: bool,
+    buffer_full: bool,
 ) -> (u16, u64, bool)
 where
     B: crate::runtime::io::AsyncReadRent + Unpin,
@@ -3265,6 +3272,9 @@ where
         kind != ResponseBody::None && super::compress::wasm_wants_response_body(wasm_modules);
     #[cfg(not(feature = "wasm"))]
     let wasm_body = false;
+    // `buffering = "full"`: 本文を全部溜めてから送る（下の溜める経路。逐次送る分岐を通さない）。
+    // 区切りどおりに終わらない本文は応答ヘッダの前に分かるので 502（HTTP/1.1・HTTP/3 と同じ）
+    let collect_all = wasm_body || (buffer_full && kind != ResponseBody::None);
 
     {
         let status = parsed.status_code;
@@ -3298,7 +3308,7 @@ where
         };
 
         // 非圧縮 + CL 既知（本文の無い応答は 0）→ 逐次ストリーミング。
-        if stream_compress_hint.is_none() && !wasm_body {
+        if stream_compress_hint.is_none() && !collect_all {
             // B-281: 長さ不明（上流が閉じるまで）の応答も溜めずに逐次送る（SSE 等が届かない・
             // 本文の大きさだけメモリを使うのを防ぐ）。`usize::MAX` は「閉じるまで」の印。
             let until_close = kind == ResponseBody::UntilClose;
@@ -3361,7 +3371,7 @@ where
         }
 
         // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
-        if stream_compress_hint.is_none() && !wasm_body && kind == ResponseBody::Chunked {
+        if stream_compress_hint.is_none() && !collect_all && kind == ResponseBody::Chunked {
             let mut headers = h2_base_headers(true);
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
@@ -4557,6 +4567,7 @@ where
         notify,
         false,
         is_head,
+        false,
     )
     .await;
     (status, sent, req_size)
