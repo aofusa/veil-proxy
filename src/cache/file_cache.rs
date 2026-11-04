@@ -108,6 +108,15 @@ pub struct CachedFileInfo {
     stamp: Option<super::watch::Stamp>,
 }
 
+/// 開き直したファイルの情報に前のエントリから引き継ぐ値（MIME・検証子。参照カウントだけで渡す）
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) struct ReusableFileInfo {
+    mime_type: std::sync::Arc<str>,
+    validators: std::sync::Arc<crate::static_response::Validators>,
+    file_size: u64,
+    last_modified: Option<SystemTime>,
+}
+
 impl CachedFileInfo {
     /// 開いた File の `Metadata` から直接構築する（B-65 専用）。
     ///
@@ -121,25 +130,59 @@ impl CachedFileInfo {
     /// 呼び出し元ごと存在しなくなる。cfg で本関数自体の存在を絞ることで unused
     /// warning を解消する（`#[allow(dead_code)]` は規約で禁止）。
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub(crate) fn from_open_metadata(path: &Path, meta: &std::fs::Metadata) -> Self {
-        let mime_type: std::sync::Arc<str> = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .as_ref()
-            .into();
+    pub(crate) fn from_open_metadata(
+        path: &Path,
+        meta: &std::fs::Metadata,
+        prev: Option<&ReusableFileInfo>,
+    ) -> Self {
+        let modified = meta.modified().ok();
+        // 同じパスの前のエントリがあれば MIME はそのまま、検証子は大きさと更新時刻が同じならそのまま使う
+        // （open_file_cache だけのルートは要求ごとにここを通る。作り直すと MIME の推測と検証子の組み立てが毎回走る）
+        let (mime_type, validators) = match prev {
+            Some(p) if p.file_size == meta.len() && p.last_modified == modified => {
+                (p.mime_type.clone(), p.validators.clone())
+            }
+            Some(p) => (
+                p.mime_type.clone(),
+                crate::static_response::Validators::shared_for_file(
+                    meta.len(),
+                    modified,
+                    &p.mime_type,
+                ),
+            ),
+            None => {
+                let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                    mime_guess::from_path(path).first_or_octet_stream().as_ref(),
+                );
+                let validators = crate::static_response::Validators::shared_for_file(
+                    meta.len(),
+                    modified,
+                    &mime_type,
+                );
+                (mime_type, validators)
+            }
+        };
         Self {
             canonical_path: path.into(),
             file_size: meta.len(),
-            validators: crate::static_response::Validators::shared_for_file(
-                meta.len(),
-                meta.modified().ok(),
-                &mime_type,
-            ),
+            validators,
             mime_type,
-            last_modified: meta.modified().ok(),
+            last_modified: modified,
             is_file: meta.is_file(),
             shared_file: None,
             cached_at: Instant::now(),
             stamp: None,
+        }
+    }
+
+    /// [`Self::from_open_metadata`] が同じパスを開き直すときに引き継ぐ値
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(crate) fn reusable(&self) -> ReusableFileInfo {
+        ReusableFileInfo {
+            mime_type: self.mime_type.clone(),
+            validators: self.validators.clone(),
+            file_size: self.file_size,
+            last_modified: self.last_modified,
         }
     }
 
@@ -341,10 +384,11 @@ impl OpenFileCache {
             if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
                 return match res {
                     Ok((file, meta)) => {
-                        let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
-                            .first_or_octet_stream()
-                            .as_ref()
-                            .into();
+                        let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                            mime_guess::from_path(&path)
+                                .first_or_octet_stream()
+                                .as_ref(),
+                        );
                         let is_file = meta.is_file();
                         Some(CachedFileInfo {
                             canonical_path: path.into(),
@@ -377,10 +421,11 @@ impl OpenFileCache {
             if let Some(res) = crate::security::capsicum::open_static_ro(&path) {
                 let file = res.ok()?;
                 let meta = file.metadata().ok()?;
-                let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
-                    .first_or_octet_stream()
-                    .as_ref()
-                    .into();
+                let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                    mime_guess::from_path(&path)
+                        .first_or_octet_stream()
+                        .as_ref(),
+                );
                 let is_file = meta.is_file();
                 return Some(CachedFileInfo {
                     canonical_path: path.into(),
@@ -403,10 +448,11 @@ impl OpenFileCache {
             // メタデータを取得
             let metadata = std::fs::metadata(&canonical).ok()?;
             // MIMEタイプを推測
-            let mime_type: std::sync::Arc<str> = mime_guess::from_path(&canonical)
-                .first_or_octet_stream()
-                .as_ref()
-                .into();
+            let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                mime_guess::from_path(&canonical)
+                    .first_or_octet_stream()
+                    .as_ref(),
+            );
 
             let is_file = metadata.is_file();
             // 通常ファイルは配信に使う fd も保持する（開けなければ配信時に開き直す）。

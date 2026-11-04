@@ -199,8 +199,8 @@ where
     // `drive_h2_streams` のストリーム ID 走査用バッファ（F-157）。コネクションごとに
     // 1 本持ち回して毎イテレーションのヒープ確保を避ける。
     let mut stream_ids: Vec<u32> = Vec::new();
-    // B-274・B-276: 要求の受信（本文・ヘッダの続き）が止まったストリームを打ち切る見回り。待つときだけ
-    // 1 秒のタイマーを 1 本張って使い回す（I/O・要求ごとにタイマーを張らない）。
+    // B-274・B-276: 要求の受信（本文・ヘッダの続き）が止まったストリームを打ち切る見回り。受信中の
+    // ストリームがあって待つときだけ 1 秒のタイマーを 1 本張って使い回す（I/O・要求ごとにタイマーを張らない）。
     let mut recv_sweep = std::pin::pin!(None::<crate::runtime::time::Sleep>);
     let mut stalled: Vec<u32> = Vec::new();
 
@@ -438,7 +438,8 @@ where
             }
         } else {
             // 処理中のストリームがある: 可読 or notify を待つ。可読なら fill する。
-            if recv_sweep.is_none() {
+            // 見回りは受信中のストリームがあるときだけ（応答を返しているだけならタイマーを張らない）
+            if recv_sweep.is_none() && conn.has_receiving_streams() {
                 recv_sweep.set(Some(crate::runtime::time::sleep(H2_RECV_SWEEP_INTERVAL)));
             }
             match h2_select_readable_notify_or_sweep(

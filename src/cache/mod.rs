@@ -417,10 +417,11 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
             return match res {
                 Ok((_file, meta)) => {
-                    let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
-                        .first_or_octet_stream()
-                        .as_ref()
-                        .into();
+                    let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                        mime_guess::from_path(&path)
+                            .first_or_octet_stream()
+                            .as_ref(),
+                    );
                     Some(CachedFileInfo {
                         canonical_path: path.into(),
                         file_size: meta.len(),
@@ -443,10 +444,11 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         #[cfg(target_os = "freebsd")]
         if let Some(res) = crate::security::capsicum::stat_static(&path) {
             let st = res.ok()?;
-            let mime_type: std::sync::Arc<str> = mime_guess::from_path(&path)
-                .first_or_octet_stream()
-                .as_ref()
-                .into();
+            let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+                mime_guess::from_path(&path)
+                    .first_or_octet_stream()
+                    .as_ref(),
+            );
             return Some(CachedFileInfo {
                 canonical_path: path.into(),
                 file_size: st.len,
@@ -463,10 +465,11 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
         // ブロックしない（AGENTS.md がホットパス外の正当な同期 FS 利用として許可）。
         #[allow(clippy::disallowed_methods)]
         let metadata = std::fs::metadata(&canonical).ok()?;
-        let mime_type: std::sync::Arc<str> = mime_guess::from_path(&canonical)
-            .first_or_octet_stream()
-            .as_ref()
-            .into();
+        let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+            mime_guess::from_path(&canonical)
+                .first_or_octet_stream()
+                .as_ref(),
+        );
         Some(CachedFileInfo {
             canonical_path: canonical.into(),
             file_size: metadata.len(),
@@ -503,10 +506,9 @@ fn build_cached_file_info_uncached(
     path: &std::path::Path,
     meta: &std::fs::Metadata,
 ) -> CachedFileInfo {
-    let mime_type: std::sync::Arc<str> = mime_guess::from_path(path)
-        .first_or_octet_stream()
-        .as_ref()
-        .into();
+    let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+        mime_guess::from_path(path).first_or_octet_stream().as_ref(),
+    );
     CachedFileInfo {
         canonical_path: path.into(),
         file_size: meta.len(),

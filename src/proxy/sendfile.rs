@@ -650,10 +650,25 @@ pub(super) async fn load_file_bytes(
 
 /// 名前を `Content-Type` の形（先頭と `-` の後を大文字）で HTTP/1.1 のヘッダ行として足す
 fn push_h1_header(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-    let mut upper = true;
-    for &b in name {
-        out.push(if upper { b.to_ascii_uppercase() } else { b });
-        upper = b == b'-';
+    // `emit_headers` の付ける名前は決まっているので表記をそのまま写す（1 バイトずつ大文字にしない）
+    let title: &[u8] = match name {
+        b"content-type" => b"Content-Type",
+        b"accept-ranges" => b"Accept-Ranges",
+        b"content-range" => b"Content-Range",
+        b"etag" => b"ETag",
+        b"last-modified" => b"Last-Modified",
+        b"content-encoding" => b"Content-Encoding",
+        b"vary" => b"Vary",
+        _ => b"",
+    };
+    if title.is_empty() {
+        let mut upper = true;
+        for &b in name {
+            out.push(if upper { b.to_ascii_uppercase() } else { b });
+            upper = b == b'-';
+        }
+    } else {
+        out.extend_from_slice(title);
     }
     out.extend_from_slice(b": ");
     out.extend_from_slice(value);

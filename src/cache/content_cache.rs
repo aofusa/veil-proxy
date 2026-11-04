@@ -464,7 +464,9 @@ static CONTENT_CACHE: Lazy<ContentCache> = Lazy::new(ContentCache::new);
 
 /// MIME タイプ推測（キャッシュミス時のデフォルトフォールバック）。
 fn guess_mime(path: &Path) -> Arc<str> {
-    Arc::from(mime_guess::from_path(path).first_or_octet_stream().as_ref())
+    crate::static_response::intern_mime(
+        mime_guess::from_path(path).first_or_octet_stream().as_ref(),
+    )
 }
 
 /// ファイル本体をキャッシュ優先で取得する（グローバルシングルトン、`mime_guess`

@@ -9,6 +9,7 @@
 //! 1 回だけ組み立てた `Bytes` を参照カウントで渡し、要求ヘッダは借用のまま見る。
 
 use bytes::Bytes;
+use std::io::Write as _;
 use std::time::SystemTime;
 
 use crate::config::{AcceptedEncoding, CompressionConfig};
@@ -36,17 +37,41 @@ impl Validators {
         let mtime_secs = modified
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        let tag = format!("{:x}-{:x}", mtime_secs.unwrap_or(0), size);
-        Self::build(&tag, mtime_secs, mime, size)
+        Self::build(
+            |out| {
+                let _ = write!(out, "{:x}-{:x}", mtime_secs.unwrap_or(0), size);
+            },
+            mtime_secs,
+            mime,
+            size,
+        )
     }
 
     /// ファイル情報のキャッシュに載せる形（`Arc`）で作る。
+    ///
+    /// open_file_cache の無いルートは要求ごとに（offload のスレッドで）ここを通るので、スレッドごとの小さな表で
+    /// 同じ大きさ・更新時刻・型の検証子を使い回す（参照カウントだけ。表に無ければ作って置き換える）。
     pub fn shared_for_file(
         size: u64,
         modified: Option<SystemTime>,
         mime: &str,
     ) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::for_file(size, modified, mime))
+        let mtime_secs = modified
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let key = (size, mtime_secs);
+        let slot = (size ^ mtime_secs.unwrap_or(0).rotate_left(17)) as usize % VALIDATOR_SLOTS;
+        VALIDATOR_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if let Some((k, v)) = &c[slot] {
+                if *k == key && &v.content_type[..] == mime.as_bytes() {
+                    return v.clone();
+                }
+            }
+            let v = std::sync::Arc::new(Self::for_file(size, modified, mime));
+            c[slot] = Some((key, v.clone()));
+            v
+        })
     }
 
     /// memory の内容から作る（設定のロード時に 1 回）。内容のハッシュを ETag にする（再読み込みで内容が
@@ -60,22 +85,75 @@ impl Validators {
             h ^= b as u64;
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
-        let tag = format!("m{:x}-{:x}", h, body.len());
-        Self::build(&tag, mtime_secs, mime, body.len() as u64)
+        Self::build(
+            |out| {
+                let _ = write!(out, "m{:x}-{:x}", h, body.len());
+            },
+            mtime_secs,
+            mime,
+            body.len() as u64,
+        )
     }
 
-    fn build(tag: &str, mtime_secs: Option<u64>, mime: &str, size: u64) -> Self {
+    /// 値をすべて 1 つのバッファに書き、`slice` で切り分ける。open_file_cache が無いルートでは要求ごとに作るので、
+    /// 確保はバッファ・`Bytes` の共有部分・呼び出し側の `Arc` だけにする（値ごとに `String` を作らない）。
+    fn build<F>(write_tag: F, mtime_secs: Option<u64>, mime: &str, size: u64) -> Self
+    where
+        F: Fn(&mut Vec<u8>),
+    {
+        // content-type + 長さ（最大 20）+ 強い・弱い ETag（各 最大 2 + 34 + 2）+ IMF-fixdate（29）
+        let mut buf: Vec<u8> = Vec::with_capacity(mime.len() + 20 + 40 + 42 + 29);
+        buf.extend_from_slice(mime.as_bytes());
+        let ct_end = buf.len();
+        buf.extend_from_slice(itoa::Buffer::new().format(size).as_bytes());
+        let len_end = buf.len();
+        buf.extend_from_slice(b"W/\"");
+        write_tag(&mut buf);
+        buf.push(b'"');
+        let etag_end = buf.len();
+        if let Some(s) = mtime_secs {
+            write_http_date(&mut buf, s);
+        }
+        let buf = Bytes::from(buf);
         Self {
-            content_type: Bytes::copy_from_slice(mime.as_bytes()),
-            full_length: Bytes::copy_from_slice(itoa::Buffer::new().format(size).as_bytes()),
-            etag: Bytes::from(format!("\"{tag}\"")),
-            weak_etag: Bytes::from(format!("W/\"{tag}\"")),
-            last_modified: mtime_secs
-                .map(|s| Bytes::from(http_date(s)))
-                .unwrap_or_default(),
+            content_type: buf.slice(..ct_end),
+            full_length: buf.slice(ct_end..len_end),
+            etag: buf.slice(len_end + 2..etag_end),
+            weak_etag: buf.slice(len_end..etag_end),
+            last_modified: buf.slice(etag_end..),
             mtime_secs,
         }
     }
+}
+
+/// [`Validators::shared_for_file`] のスレッドごとの表の大きさ（直接写像。衝突したら置き換えるだけ）
+const VALIDATOR_SLOTS: usize = 64;
+
+type ValidatorSlot = Option<((u64, Option<u64>), std::sync::Arc<Validators>)>;
+
+thread_local! {
+    static VALIDATOR_CACHE: std::cell::RefCell<[ValidatorSlot; VALIDATOR_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; VALIDATOR_SLOTS]) };
+    static MIME_INTERN: std::cell::RefCell<Vec<std::sync::Arc<str>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// MIME の型の文字列を共有の `Arc<str>` にする（スレッドごとに型 1 つにつき 1 回だけ確保する）。
+/// ファイル情報を要求ごとに作る経路（open_file_cache の無いルート）で型の文字列を毎回確保しない。
+pub fn intern_mime(mime: &str) -> std::sync::Arc<str> {
+    // 型の種類は少ない（配信するファイルの拡張子の数）。上限を超えたら表に置かずに作る
+    const MAX: usize = 64;
+    MIME_INTERN.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(m) = t.iter().find(|m| &***m == mime) {
+            return m.clone();
+        }
+        let m: std::sync::Arc<str> = mime.into();
+        if t.len() < MAX {
+            t.push(m.clone());
+        }
+        m
+    })
 }
 
 /// `mode = "memory"` の内容（設定のロード時に読む。B-266・F-286・F-287）
@@ -617,10 +695,18 @@ const MONTHS: [&str; 12] = [
 
 /// UNIX 秒を IMF-fixdate（`Sun, 06 Nov 1994 08:49:37 GMT`）にする
 pub fn http_date(secs: u64) -> String {
+    let mut out = Vec::with_capacity(29);
+    write_http_date(&mut out, secs);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// IMF-fixdate（29 バイト）を `out` に足す
+fn write_http_date(out: &mut Vec<u8>, secs: u64) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (y, m, d) = civil_from_days(days);
-    format!(
+    let _ = write!(
+        out,
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
         WEEKDAYS[(days.rem_euclid(7)) as usize],
         d,
@@ -629,7 +715,7 @@ pub fn http_date(secs: u64) -> String {
         rem / 3600,
         (rem % 3600) / 60,
         rem % 60
-    )
+    );
 }
 
 /// IMF-fixdate を UNIX 秒にする（RFC 850・asctime の形は受け付けない＝条件が無いのと同じ扱い）
@@ -715,6 +801,27 @@ mod tests {
         assert_eq!(parse_http_date(b"garbage"), None);
     }
 
+    /// 同じ大きさ・更新時刻・型の検証子はスレッドの表から使い回し、どれかが違えば作り直す。型の文字列は共有する
+    #[test]
+    fn shared_validators_and_mime_are_reused_per_thread() {
+        let t = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5000));
+        let a = Validators::shared_for_file(77, t, "text/css");
+        let b = Validators::shared_for_file(77, t, "text/css");
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let other_type = Validators::shared_for_file(77, t, "text/html");
+        assert_eq!(&other_type.content_type[..], b"text/html");
+        let other_size = Validators::shared_for_file(78, t, "text/css");
+        assert_eq!(&other_size.full_length[..], b"78");
+        let other_time = Validators::shared_for_file(77, None, "text/css");
+        assert!(other_time.last_modified.is_empty());
+        assert_eq!(&a.etag[..], b"\"1388-4d\"");
+        assert!(std::sync::Arc::ptr_eq(
+            &intern_mime("image/png"),
+            &intern_mime("image/png")
+        ));
+        assert_eq!(&*intern_mime("image/webp"), "image/webp");
+    }
+
     #[test]
     fn conditional_requests() {
         let v = Validators::for_file(
@@ -723,6 +830,15 @@ mod tests {
             "text/plain",
         );
         assert_eq!(&v.etag[..], b"\"3e8-a\"");
+        // 1 つのバッファから切り分けた値がそれぞれ正しいこと
+        assert_eq!(&v.weak_etag[..], b"W/\"3e8-a\"");
+        assert_eq!(&v.content_type[..], b"text/plain");
+        assert_eq!(&v.full_length[..], b"10");
+        assert_eq!(&v.last_modified[..], b"Thu, 01 Jan 1970 00:16:40 GMT");
+        let no_mtime = Validators::for_file(0, None, "a/b");
+        assert_eq!(&no_mtime.etag[..], b"\"0-0\"");
+        assert!(no_mtime.last_modified.is_empty());
+        assert_eq!(&no_mtime.full_length[..], b"0");
         let c = comp(false);
         let etag = v.etag.clone();
         let weak = v.weak_etag.clone();

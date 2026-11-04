@@ -2387,6 +2387,11 @@ where
         }
     }
 
+    /// 要求の受信が続いているストリームがあるか（[`StreamManager::has_receiving`]）
+    pub fn has_receiving_streams(&self) -> bool {
+        self.streams.has_receiving()
+    }
+
     /// 開いているストリームが無いか（`cleanup_closed` の後に見る）
     pub fn has_no_streams(&self) -> bool {
         self.streams.is_empty()

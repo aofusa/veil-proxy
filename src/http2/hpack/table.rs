@@ -138,24 +138,78 @@ impl StaticTable {
         Self::get(index).map(|(n, v)| (Bytes::from_static(n), Bytes::from_static(v)))
     }
 
+    /// 名前の最初のインデックス（1-indexed）と同じ名前のエントリ数。同じ名前のエントリは連続している。
+    ///
+    /// 応答ごとに全ヘッダを引くので、61 個を順に比べず名前の `match`（長さと内容の分岐）で決める。
+    #[inline]
+    fn name_range(name: &[u8]) -> Option<(usize, usize)> {
+        match name {
+            b":authority" => Some((1, 1)),
+            b":method" => Some((2, 2)),
+            b":path" => Some((4, 2)),
+            b":scheme" => Some((6, 2)),
+            b":status" => Some((8, 7)),
+            b"accept-charset" => Some((15, 1)),
+            b"accept-encoding" => Some((16, 1)),
+            b"accept-language" => Some((17, 1)),
+            b"accept-ranges" => Some((18, 1)),
+            b"accept" => Some((19, 1)),
+            b"access-control-allow-origin" => Some((20, 1)),
+            b"age" => Some((21, 1)),
+            b"allow" => Some((22, 1)),
+            b"authorization" => Some((23, 1)),
+            b"cache-control" => Some((24, 1)),
+            b"content-disposition" => Some((25, 1)),
+            b"content-encoding" => Some((26, 1)),
+            b"content-language" => Some((27, 1)),
+            b"content-length" => Some((28, 1)),
+            b"content-location" => Some((29, 1)),
+            b"content-range" => Some((30, 1)),
+            b"content-type" => Some((31, 1)),
+            b"cookie" => Some((32, 1)),
+            b"date" => Some((33, 1)),
+            b"etag" => Some((34, 1)),
+            b"expect" => Some((35, 1)),
+            b"expires" => Some((36, 1)),
+            b"from" => Some((37, 1)),
+            b"host" => Some((38, 1)),
+            b"if-match" => Some((39, 1)),
+            b"if-modified-since" => Some((40, 1)),
+            b"if-none-match" => Some((41, 1)),
+            b"if-range" => Some((42, 1)),
+            b"if-unmodified-since" => Some((43, 1)),
+            b"last-modified" => Some((44, 1)),
+            b"link" => Some((45, 1)),
+            b"location" => Some((46, 1)),
+            b"max-forwards" => Some((47, 1)),
+            b"proxy-authenticate" => Some((48, 1)),
+            b"proxy-authorization" => Some((49, 1)),
+            b"range" => Some((50, 1)),
+            b"referer" => Some((51, 1)),
+            b"refresh" => Some((52, 1)),
+            b"retry-after" => Some((53, 1)),
+            b"server" => Some((54, 1)),
+            b"set-cookie" => Some((55, 1)),
+            b"strict-transport-security" => Some((56, 1)),
+            b"transfer-encoding" => Some((57, 1)),
+            b"user-agent" => Some((58, 1)),
+            b"vary" => Some((59, 1)),
+            b"via" => Some((60, 1)),
+            b"www-authenticate" => Some((61, 1)),
+            _ => None,
+        }
+    }
+
     /// 名前と値の両方が一致するインデックスを検索
     pub fn find_exact(name: &[u8], value: &[u8]) -> Option<usize> {
-        for (i, (n, v)) in Self::ENTRIES.iter().enumerate() {
-            if *n == name && *v == value {
-                return Some(i + 1);
-            }
-        }
-        None
+        let (first, count) = Self::name_range(name)?;
+        (first..first + count).find(|&i| Self::ENTRIES[i - 1].1 == value)
     }
 
     /// 名前が一致するインデックスを検索
+    #[inline]
     pub fn find_name(name: &[u8]) -> Option<usize> {
-        for (i, (n, _)) in Self::ENTRIES.iter().enumerate() {
-            if *n == name {
-                return Some(i + 1);
-            }
-        }
-        None
+        Self::name_range(name).map(|(first, _)| first)
     }
 }
 
@@ -347,6 +401,30 @@ mod tests {
         assert_eq!(StaticTable::find_exact(b":method", b"POST"), Some(3));
         assert_eq!(StaticTable::find_exact(b":method", b"PUT"), None);
         assert_eq!(StaticTable::find_name(b":method"), Some(2));
+    }
+
+    /// 名前の `match` が全エントリを順に比べたのと同じ結果になること（表と `match` のずれを防ぐ）
+    #[test]
+    fn test_static_table_find_matches_linear_scan() {
+        let linear_exact = |n: &[u8], v: &[u8]| {
+            (1..=StaticTable::SIZE).find(|&i| StaticTable::get(i) == Some((n, v)))
+        };
+        let linear_name =
+            |n: &[u8]| (1..=StaticTable::SIZE).find(|&i| StaticTable::get(i).unwrap().0 == n);
+        for i in 1..=StaticTable::SIZE {
+            let (n, v) = StaticTable::get(i).unwrap();
+            assert_eq!(StaticTable::find_exact(n, v), Some(i), "{i}");
+            assert_eq!(StaticTable::find_name(n), linear_name(n), "{i}");
+            assert_eq!(
+                StaticTable::find_exact(n, b"x"),
+                linear_exact(n, b"x"),
+                "{i}"
+            );
+        }
+        for n in [&b"x-custom"[..], b"", b"Etag", b":status2"] {
+            assert_eq!(StaticTable::find_name(n), None);
+            assert_eq!(StaticTable::find_exact(n, b""), None);
+        }
     }
 
     /// R1: 静的テーブルのエントリが `Bytes::from_static` 由来（確保ゼロ）であることを検証。

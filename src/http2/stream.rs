@@ -648,6 +648,14 @@ impl StreamManager {
         }
     }
 
+    /// クライアントがまだ要求を送っている（`Open`・`HalfClosedLocal`）ストリームがあるか。受信の見回りの
+    /// タイマーはこれがあるときだけ張る（GET 等の本文の無い要求だけの接続ではタイマーを持たない）。
+    pub fn has_receiving(&self) -> bool {
+        self.streams
+            .values()
+            .any(|s| matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal))
+    }
+
     /// 表にストリームが無いか（閉じたものは `cleanup_closed` で除いた後に見る）
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
@@ -804,6 +812,7 @@ mod tests {
             s.recv_headers(true).unwrap();
             s.last_activity = past;
         }
+        assert!(manager.has_receiving());
         let mut out = Vec::new();
         manager.collect_stalled_receiving(3, &mut out);
         out.sort_unstable();
@@ -813,6 +822,25 @@ mod tests {
         // 既定が 0（`stream_idle_timeout_secs = 0`）なら秒数を持つストリームだけ
         manager.collect_stalled_receiving(0, &mut out);
         assert_eq!(out, vec![3]);
+    }
+
+    /// 本文の無い要求（HEADERS に END_STREAM）だけなら受信中のストリームは無い（見回りのタイマーを張らない）
+    #[test]
+    fn has_receiving_ignores_requests_without_body() {
+        let mut manager = StreamManager::new(100, 65535);
+        assert!(!manager.has_receiving());
+        manager
+            .get_or_create_client_stream(1)
+            .unwrap()
+            .recv_headers(true)
+            .unwrap();
+        assert!(!manager.has_receiving());
+        manager
+            .get_or_create_client_stream(3)
+            .unwrap()
+            .recv_headers(false)
+            .unwrap();
+        assert!(manager.has_receiving());
     }
 
     #[test]

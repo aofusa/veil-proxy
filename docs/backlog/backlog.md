@@ -623,6 +623,7 @@
 | B-281 | P1 | 修正済み（v0.10.1） | [bugs/B-281-unbounded-response-collection-for-compression.md](bugs/B-281-unbounded-response-collection-for-compression.md) | 圧縮・HTTP/2 への中継のために上流の応答本文を上限なく溜め、圧縮の効くルートの SSE（HTTP/2 は長さ不明の応答も）が届かない。SSE は圧縮せず、溜める上限 64 MiB、HTTP/2 の長さ不明の応答は逐次送る |
 | B-282 | P2 | 修正済み（v0.10.1） | [bugs/B-282-h2-truncated-upstream-body-ends-cleanly.md](bugs/B-282-h2-truncated-upstream-body-ends-cleanly.md) | 上流が本文の途中で閉じた応答を、HTTP/2 のクライアントへ空の END_STREAM で完結した応答に見せていた（HTTP/3 はリセット）。RST_STREAM にする |
 | B-283 | P2 | 修正済み（v0.10.1） | [bugs/B-283-v0101-security-review-findings.md](bugs/B-283-v0101-security-review-findings.md) | v0.10.1 の改修のセキュリティレビュー（Fable 5.1）の所見: h2 の上流の 3 経路に溜める上限が無い（Medium）・静的配信のその場の圧縮の増幅（8 MiB 以下に）・Content-Range の配列・Wasm の固定応答のヘッダの大文字と CR/LF・splice の head の確保 |
+| B-284 | P1 | 修正済み（v0.10.1） | [bugs/B-284-v0101-static-and-h2-per-request-cost.md](bugs/B-284-v0101-static-and-h2-per-request-cost.md) | v0.10.1 の候補で静的配信と HTTP/2 が v0.10.0 より遅い（open_file_cache 無しの HTTP/1.1 で 0.80）。検証子の要求ごとの組み立て・ファイル情報の二重の組み立て・HPACK の静的表の線形探索・受信の見回りのタイマー |
 
 ---
 

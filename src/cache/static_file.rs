@@ -114,6 +114,9 @@ pub async fn get_static_file_with_content(
 ) -> Option<StaticFileOutcome> {
     // 1. メタデータキャッシュがヒットしていれば、その場で封じ込め検査とディレクトリ
     //    判定まで済ませる（いずれも offload 不要）。
+    // 本体だけ読み直すときに前のエントリの MIME・検証子を引き継ぐ（作り直さない）
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let mut reuse: Option<file_cache::ReusableFileInfo> = None;
     if let Some(meta) = file_cache::get_file_cache().peek_with_config(path, ofc) {
         if let Some(c) = containment {
             if !sendfile_base_contains(&meta.canonical_path, c.canonical_base, c.root) {
@@ -129,6 +132,10 @@ pub async fn get_static_file_with_content(
             return Some(StaticFileOutcome::File(meta, data));
         }
         // 本体キャッシュのみ未ヒット: 下の高速経路（offload）で open+read し直す。
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            reuse = Some(meta.reusable());
+        }
     }
 
     // 2. 登録済みルート配下なら 1 回の offload で open+fstat+read をまとめる。
@@ -153,7 +160,7 @@ pub async fn get_static_file_with_content(
             // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
             #[allow(clippy::disallowed_methods)]
             let loaded = crate::runtime::offload::offload(move || {
-                open_and_read_fast(&owned, owned_root.as_deref())
+                open_and_read_fast(&owned, owned_root.as_deref(), reuse.as_ref())
             })
             .await;
             let outcome = loaded?;
@@ -280,7 +287,11 @@ enum FastOutcome {
 // （`#[allow(dead_code)]` は規約で禁止）。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[allow(clippy::disallowed_methods)]
-fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
+fn open_and_read_fast(
+    path: &Path,
+    root: Option<&Path>,
+    prev: Option<&file_cache::ReusableFileInfo>,
+) -> Option<FastOutcome> {
     #[cfg(target_os = "linux")]
     {
         let opened = match root {
@@ -294,7 +305,7 @@ fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
             return Some(FastOutcome::Unavailable);
         };
         match opened {
-            Ok((file, meta)) => finish_fast(path, file, meta),
+            Ok((file, meta)) => finish_fast(path, file, meta, prev),
             // 登録済みルート配下と判定された上での失敗（404 相当）。
             Err(_) => None,
         }
@@ -311,7 +322,7 @@ fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
                 // 伴わないため、本体読み込みが必須の本関数では fd を再利用できる
                 // `open_static_ro` を使い、その fd から fstat する）。
                 let meta = file.metadata().ok()?;
-                finish_fast(path, file, meta)
+                finish_fast(path, file, meta, prev)
             }
             Err(_) => None,
         }
@@ -327,30 +338,26 @@ fn finish_fast(
     path: &Path,
     mut file: std::fs::File,
     meta: std::fs::Metadata,
+    prev: Option<&file_cache::ReusableFileInfo>,
 ) -> Option<FastOutcome> {
-    let info = CachedFileInfo::from_open_metadata(path, &meta);
+    let info = CachedFileInfo::from_open_metadata(path, &meta, prev);
     if !info.is_file {
         return Some(FastOutcome::Directory(info));
     }
 
-    let (info, data) = read_into_bytes(path, &mut file, &meta)?;
+    let data = read_into_bytes(&mut file, &meta)?;
     Some(FastOutcome::File(info, data))
 }
 
-/// 既に開いている `File` と、それから取得済みの `Metadata` から
-/// メタデータ + 本体をまとめて構築する（新規 open を発生させない）。
+/// 既に開いている `File` と、それから取得済みの `Metadata` から本体を読む（新規 open を発生させない）。
+/// メタデータは呼び出し側が組み立て済みのものを使う（以前はここでもう一度組み立てていた）。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn read_into_bytes(
-    path: &Path,
-    file: &mut std::fs::File,
-    meta: &std::fs::Metadata,
-) -> Option<(CachedFileInfo, Bytes)> {
+fn read_into_bytes(file: &mut std::fs::File, meta: &std::fs::Metadata) -> Option<Bytes> {
     // Metadata::len() で 1 回だけ確保し、リサイズの繰り返しを避ける。
     let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
     file.read_to_end(&mut buf).ok()?;
-    let info = CachedFileInfo::from_open_metadata(path, meta);
     // Vec<u8> -> Bytes はムーブ（memcpy 無し）。
-    Some((info, Bytes::from(buf)))
+    Some(Bytes::from(buf))
 }
 
 #[cfg(test)]
@@ -459,6 +466,52 @@ mod tests {
         std::thread::scope(|s| s.spawn(fut_fn).join().expect("test thread panicked"))
     }
 
+    /// open_file_cache だけ（本体キャッシュ無し）のルートで本体を読み直すとき、前のエントリの MIME・検証子を
+    /// 作り直さずに引き継ぎ、大きさが変われば検証子だけ作り直すこと（要求ごとの組み立てを増やさない）
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn reread_reuses_mime_and_validators_until_file_changes() {
+        let roots = registered_test_roots();
+        let path = write_file_in(roots.dirs[0].path(), "reuse-validators.txt", b"one");
+        let ofc = test_ofc();
+        let content_cfg = StaticContentCacheConfig {
+            enabled: false,
+            ..test_content_cfg()
+        };
+        let fetch = || {
+            block_on_fresh_thread(|| {
+                futures::executor::block_on(get_static_file_with_content(
+                    &path,
+                    Some(&ofc),
+                    &content_cfg,
+                    None,
+                ))
+            })
+        };
+        let info = |o: Option<StaticFileOutcome>| match o {
+            Some(StaticFileOutcome::File(info, _)) => info,
+            _ => panic!("expected a file"),
+        };
+        let first = info(fetch());
+        let second = info(fetch());
+        assert!(std::sync::Arc::ptr_eq(
+            &first.validators,
+            &second.validators
+        ));
+        assert!(std::sync::Arc::ptr_eq(&first.mime_type, &second.mime_type));
+        assert_eq!(&first.validators.full_length[..], b"3");
+
+        write_file_in(roots.dirs[0].path(), "reuse-validators.txt", b"longer");
+        let third = info(fetch());
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.validators,
+            &third.validators
+        ));
+        assert!(std::sync::Arc::ptr_eq(&first.mime_type, &third.mime_type));
+        assert_eq!(&third.validators.full_length[..], b"6");
+        assert_eq!(&third.validators.content_type[..], b"text/plain");
+    }
+
     /// 内容とサイズを正しく返すこと（高速経路が使えない環境でもフォールバック経路で
     /// 同じ結果になること）。
     #[test]
@@ -494,11 +547,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_file(&dir, "fallback.txt", b"fallback");
         assert!(matches!(
-            open_and_read_fast(&path, Some(dir.path())),
+            open_and_read_fast(&path, Some(dir.path()), None),
             Some(FastOutcome::Unavailable)
         ));
         assert!(matches!(
-            open_and_read_fast(&path, None),
+            open_and_read_fast(&path, None, None),
             Some(FastOutcome::Unavailable)
         ));
     }
