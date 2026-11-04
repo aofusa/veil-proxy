@@ -46,7 +46,7 @@ nginx との性能比較は [docs/perf/README.md](../perf/README.md) にあり�
 |---|---|
 | コンテナ | `docker run --rm -p 8080:8080 ghcr.io/aofusa/veil`（Docker Hub の `aofusa/veil` も同じ） |
 | Debian・Ubuntu、RHEL・Fedora・Amazon Linux | [apt・dnf のリポジトリ](../guide/ja/running.md#aptdnf-のリポジトリ) を足して `apt install veil`・`dnf install veil` |
-| Homebrew（macOS・Linux） | `brew install aofusa/tap/veil` |
+| Homebrew（macOS・Linux） | `brew install aofusa/tap/veil` の後に `brew trust aofusa/tap`（Homebrew 7 以降） |
 | Windows | `winget install Aofusa.Veil` |
 | FreeBSD・OpenBSD・NetBSD | [packaging/bsd/ports](../../packaging/bsd/ports/README.md) の ports |
 | Rust | `cargo binstall veil-proxy`・`cargo install veil-proxy --locked --features full` |

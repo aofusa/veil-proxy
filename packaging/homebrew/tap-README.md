@@ -5,6 +5,7 @@ server (HTTP/1.1, HTTP/2, HTTP/3).
 
 ```sh
 brew install aofusa/tap/veil
+brew trust aofusa/tap           # Homebrew 7 and later: lets `brew services` and `brew upgrade` load the formula
 brew services start veil        # or just: veil
 curl http://127.0.0.1:8080/
 ```

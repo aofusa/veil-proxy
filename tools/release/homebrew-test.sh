@@ -30,6 +30,9 @@ v="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT/Cargo.toml")"
 sleep 1
 "$ROOT/tools/release/homebrew-formula.sh" "$v" http://127.0.0.1:18600 "$DIST/SHA256SUMS" > "$DIST/veil.rb" || { bad "formula generation"; exit 1; }
 step "brew tap-new" brew tap-new --no-git aofusa/localtest
+# Homebrew 7 以降は信頼していない tap の formula を読まない（完全な名前で指定した install 以外。audit が落ちる）。
+# 利用者にも文書で `brew trust aofusa/tap` を案内している
+if brew trust --help >/dev/null 2>&1; then step "brew trust" brew trust aofusa/localtest; fi
 tap="$(brew --repository)/Library/Taps/aofusa/homebrew-localtest"
 cp "$DIST/veil.rb" "$tap/Formula/veil.rb"
 step "brew style" brew style "$tap/Formula/veil.rb"

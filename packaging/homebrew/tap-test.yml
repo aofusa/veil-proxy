@@ -24,6 +24,8 @@ jobs:
             eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           fi
           brew tap aofusa/tap "https://github.com/${GITHUB_REPOSITORY}"
+          # Homebrew 7 and later load formulae only from trusted taps
+          if brew trust --help >/dev/null 2>&1; then brew trust aofusa/tap; fi
           brew install aofusa/tap/veil
           brew test aofusa/tap/veil
           brew audit --strict --online aofusa/tap/veil

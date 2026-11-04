@@ -106,6 +106,7 @@ left as it was.
 
 ```bash
 brew install aofusa/tap/veil
+brew trust aofusa/tap           # Homebrew 7 and later: lets `brew services` and `brew upgrade` load the formula
 brew services start veil        # or run `veil` in a terminal
 curl http://127.0.0.1:8080/
 ```

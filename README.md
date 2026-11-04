@@ -44,7 +44,7 @@ The packages and the container image install a default configuration and page: r
 |---|---|
 | Container | `docker run --rm -p 8080:8080 ghcr.io/aofusa/veil` (also `aofusa/veil` on Docker Hub) |
 | Debian / Ubuntu, RHEL / Fedora / Amazon Linux | add the [apt or dnf repository](docs/guide/running.md#apt-and-dnf-repositories), then `apt install veil` / `dnf install veil` |
-| Homebrew (macOS, Linux) | `brew install aofusa/tap/veil` |
+| Homebrew (macOS, Linux) | `brew install aofusa/tap/veil`, then `brew trust aofusa/tap` (Homebrew 7 and later) |
 | Windows | `winget install Aofusa.Veil` |
 | FreeBSD, OpenBSD, NetBSD | the ports in [packaging/bsd/ports](packaging/bsd/ports/README.md) |
 | Rust | `cargo binstall veil-proxy` or `cargo install veil-proxy --locked --features full` |

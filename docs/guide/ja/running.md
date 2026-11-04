@@ -103,6 +103,7 @@ curl http://127.0.0.1:8080/
 
 ```bash
 brew install aofusa/tap/veil
+brew trust aofusa/tap           # Homebrew 7 以降: brew services・brew upgrade が formula を読めるようにする
 brew services start veil        # または端末で veil を起動
 curl http://127.0.0.1:8080/
 ```
