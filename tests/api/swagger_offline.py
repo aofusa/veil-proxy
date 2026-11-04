@@ -35,7 +35,9 @@ with sync_playwright() as p:
             continue
         block = page.locator(".opblock", has=page.locator(f".opblock-summary-path[data-path='{path}']")).first
         block.locator(".opblock-summary").first.click()
-        block.locator(".opblock-body").first.wait_for(timeout=10000)
+        # B-288: Try it out は操作の解決（非同期）後に描かれる Parameters の見出しの中にある。
+        # .opblock-body だけを待つと解決前に数えてしまい、先に開いた操作以外で「無い」と誤判定する。
+        block.locator(".opblock-body .opblock-section-header").first.wait_for(timeout=10000)
         has_try = block.locator(".try-out__btn").count() > 0
         if has_try != arg.startswith("try:"):
             bad_try.append(f"{path}: Try it out {'shown' if has_try else 'missing'}")
