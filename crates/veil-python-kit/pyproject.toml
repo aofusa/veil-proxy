@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "veil-api-kit"
 # 版は veil-api と揃える（tools/release/bump-version.sh が書き換える。F-268）
-version = "0.10.0"
+version = "0.10.1rc1"
 description = "Helpers for veil-api: cookies, sessions, CORS, security, static files, GraphQL, gRPC client, DI, tasks"
 requires-python = ">=3.9"
 readme = "README.md"
 license = "Apache-2.0 OR MIT"
 authors = [{ name = "aofusa" }]
-dependencies = ["veil-api==0.10.0"]
+dependencies = ["veil-api==0.10.1rc1"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
