@@ -1082,7 +1082,15 @@ where
         let upstream_ms = started.elapsed().as_millis() as u64;
         out.upstream_ms = Some(upstream_ms);
         let mut resp_headers = rh.headers;
-        f.response_filters(rh.status, &mut resp_headers).await;
+        if let Err(lr) = f.response_filters(rh.status, &mut resp_headers).await {
+            // Wasm のローカル応答（B-300）。上流の本文は読まないので上流の接続は捨てる
+            picked.end(false, false);
+            out.status = lr.status;
+            out.keep_alive = false;
+            out.peer = l7::peer_workload(ctx, peer_req, None, picked.endpoint());
+            let _ = write_local(io, &lr, is_grpc, ctx, true).await;
+            return out;
+        }
         let peer_resp = l7::downstream_response_headers(
             ctx,
             Some(f),
@@ -1410,7 +1418,14 @@ where
                 status,
                 mut headers,
             }) => {
-                f.response_filters(status, &mut headers).await;
+                if let Err(lr) = f.response_filters(status, &mut headers).await {
+                    // Wasm のローカル応答（B-300）
+                    picked.end(false, false);
+                    out.status = lr.status;
+                    out.keep_alive = false;
+                    let _ = write_local(io, &lr, is_grpc, ctx, true).await;
+                    return H2Result::Done(out);
+                }
                 let peer_resp = l7::downstream_response_headers(
                     ctx,
                     Some(f),

@@ -447,7 +447,15 @@ mod tests {
         REGISTERED_TEST_ROOTS.get_or_init(|| {
             let root_a = tempdir().unwrap();
             let root_b = tempdir().unwrap();
-            register_test_roots(&[root_a.path().to_path_buf(), root_b.path().to_path_buf()]);
+            // root_a の中に入れ子のルート（`nested`）も登録する。外側を先に並べ、内側が先に引かれることを
+            // 確かめる（B-305）
+            let nested = root_a.path().join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            register_test_roots(&[
+                root_a.path().to_path_buf(),
+                root_b.path().to_path_buf(),
+                nested,
+            ]);
             RegisteredTestRoots {
                 dirs: [root_a, root_b],
             }
@@ -821,6 +829,33 @@ mod tests {
         {
             let _ = call_count;
         }
+    }
+
+    /// B-305: 入れ子のルート（外側 root_a・内側 root_a/nested）では、内側のルートの相対シンボリックリンクで
+    /// 外側のルートのファイル（内側の外）を開けない（HTTP/1.1 の「どれかの登録済みルート」探索も内側の
+    /// dirfd を使う）。外側のルートの中のパスは外側の dirfd で開ける
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_root_link_cannot_escape_through_outer_root() {
+        let roots = registered_test_roots();
+        let outer = roots.dirs[0].path();
+        let nested = outer.join("nested");
+        let secret = write_file_in(outer, "b305_outer_secret.txt", b"outer secret");
+        let link = nested.join("b305_link");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("../b305_outer_secret.txt", &link).unwrap();
+
+        let via_link = resolve::open_beneath_for_request(&link);
+        assert!(
+            matches!(via_link, Some(Err(_))),
+            "a relative link in the nested root must not reach the outer root"
+        );
+        assert!(matches!(
+            resolve::open_beneath_for_request(&secret),
+            Some(Ok(_))
+        ));
     }
 
     /// **最重要（F-154）**: 2 つの登録済みルート A・B があるとき、A を `containment.root`

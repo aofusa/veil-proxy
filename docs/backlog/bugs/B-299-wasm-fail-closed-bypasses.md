@@ -1,6 +1,6 @@
 # B-299: Proxy-Wasm のフィルタが拒否のつもりでも素通しになる経路（http_call の resume の trap・trap 前のローカルレスポンスの破棄・capability 不足の trap・インスタンス枠切れ）
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見。行番号は f8dc80de）**
+**状態: 修正済み（2026-11-05、v0.11.0）**
 
 ## 事象（コードの読み取り）
 
@@ -26,6 +26,13 @@
 ## 影響
 
 - P1（セキュリティのフィルタの迂回）。1・2・4 は利用者の設定に関係なく起きる。
+
+## 修正
+
+1. http_call の resume の失敗は `http_call_resume` の失敗としてポリシーで扱う。
+2. `send_local_response` 済みならトラップの後でも返す（全フェーズ）。
+3. ロード時に、import する host 関数に要る capability が無いモジュールを警告する（`registry::warn_missing_capabilities`）。拒否の要求ごとのログは `log_throttled!`。文書に症状を書いた。
+4. インスタンス枠（`PoolConcurrencyLimitError`）が尽きたら 1+2+…+64ms 待ってやり直し、それでも無ければ `instantiate` の失敗。
 
 ## 関連
 

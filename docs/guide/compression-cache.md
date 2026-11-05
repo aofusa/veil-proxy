@@ -13,11 +13,13 @@ Supports dynamic response compression (Gzip, Brotli, Zstd). Compress responses b
 | **Multiple Algorithms** | Gzip, Brotli, Zstd, Deflate support |
 | **Content-Type Filtering** | Only compress text/HTML/JSON/etc. |
 | **Minimum Size Threshold** | Skip compression for small responses |
-| **Accept-Encoding Negotiation** | Automatically select best encoding |
+| **Accept-Encoding Negotiation** | Picks, among `preferred_encodings`, the encoding with the highest q-value the client accepts (ties follow `preferred_encodings`; `q=0` refuses an encoding, `*` covers the ones not listed, names are case-insensitive, `x-gzip` counts as gzip) |
 
 ### Enabling
 
 Compression is **disabled by default** to maintain kTLS optimization (zero-copy sendfile).
+Compressing needs a build with the `compression` feature (included in `full`); without it, `enabled = true` logs a warning
+at load and responses are sent uncompressed.
 Enable per-route using the `compression` section:
 
 ```toml
@@ -52,7 +54,7 @@ streaming responses); `[api] compression = true` gives handler routes a default 
 | `zstd_level` | Zstd compression level (1-22) | 3 |
 | `min_size` | Minimum size to compress (bytes) | 1024 |
 | `compressible_types` | MIME types to compress (prefix match) | text/*, application/json, etc. |
-| `skip_types` | MIME types to skip (prefix match) | image/*, video/*, audio/*, etc. |
+| `skip_types` | MIME types to skip (prefix match). When both lists match, the longer match wins (so `image/svg+xml` in `compressible_types` beats `image/` here) | image/*, video/*, audio/*, etc. |
 
 ### Compression Level Guidelines
 

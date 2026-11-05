@@ -1314,6 +1314,32 @@ pub fn observe_wasm_filter_duration(_filter: &str, _phase: &str, _duration_secs:
 }
 
 #[cfg(all(feature = "metrics", feature = "wasm"))]
+/// WASM フィルタの失敗の数（F-293。filter, phase, reason, action）
+pub(crate) static WASM_FAILURES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "wasm_failures_total",
+        "Total Proxy-Wasm filter failures (trap, fuel, timeout, instantiate, lifecycle, http_call_resume, unsupported_pause) by the action taken",
+    )
+    .namespace("veil");
+    let counter = CounterVec::new(opts, &["filter", "phase", "reason", "action"]).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// メトリクス: WASM フィルタの失敗を数える（F-293。`action` は `rejected` か `continued`）
+#[inline]
+pub fn inc_wasm_failure(_filter: &str, _phase: &str, _reason: &str, _action: &str) {
+    #[cfg(all(feature = "metrics", feature = "wasm"))]
+    if metrics_runtime_enabled() {
+        WASM_FAILURES_TOTAL
+            .with_label_values(&[_filter, _phase, _reason, _action])
+            .inc();
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "wasm"))]
 /// WASM fuel 消費量カウンタ（filter, phase。F-48: ベンチ・運用での CPU 消費観測用）
 pub(crate) static WASM_FUEL_CONSUMED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new(

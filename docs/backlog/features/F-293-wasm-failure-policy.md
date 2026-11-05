@@ -1,6 +1,6 @@
 # F-293: Proxy-Wasm のフィルタが失敗したときの扱い（`failure_policy`）をメッシュ外でも選べるようにし、既定を fail closed にする
 
-**状態: 未着手（2026-11-05 起票。調査・設計のみ）**
+**状態: 完了（2026-11-05、v0.11.0）**
 
 調査の全文（失敗点 × プロトコルの表）は `docs/artifacts/v0110/review-05-wasm-fail-open.md`（git 管理外）。行番号は f8dc80de 時点。
 
@@ -48,6 +48,14 @@
 - E2E（`tests/e2e_tests/wasm.rs`）: `trap-filter`・`fuel-burner-filter` のルートを open・closed で、503 と 200、キープアライブが続く、新しいメトリクス、アクセスログ。
   HTTP/1.1・HTTP/2・HTTP/3、io_uring・epoll。`test_wasm_timeout`・`test_wasm_error_handling` が実際に失敗を起こしていないので直す。
 - メッシュ: `tools/k8s/mesh-e2e.sh veil wasm` を各 failStrategy で回し、Istio が送る ECDS の `failure_policy` の値を記録する。
+
+## 修正
+
+- `[wasm.defaults] failure_policy`（既定 `fail_closed`）と `[[wasm.modules]] failure_policy` を追加し、ロード時に `LoadedModule.failure_policy` へ解決（`FilterEngine.fail_closed` の bool は削除。メッシュも同じフィールド）。
+- `src/wasm/engine.rs`: `settle`（Pause の解決・トラップ前のローカルレスポンス）と `record_failure`（`veil_wasm_failures_total{filter,phase,reason,action}`・`log_throttled!`・`fail_reload` でプールの世代を進める）を全フェーズ（要求・応答ヘッダ、本文、トレーラー）で共有。成功時の経路は変わらない。
+- 応答ヘッダの段のローカルレスポンス・拒否を HTTP/1.1・HTTP/2・HTTP/3・メッシュの全経路で元の応答の代わりに送る（B-300）。
+- 文書: `wasm.md`（英日）に「失敗の扱い」、`observability.md`・`mesh.md`・`examples/config.toml`。`yield` の説明（約 1ms）・`max_execution_time_ms`・`allowed_upstreams` の食い違いも直した。
+- 試験: `src/wasm/tests.rs` の `failure_policy_tests`（インラインの WAT。trap・fuel・トラップ前のローカルレスポンス・on_configure の false・Pause・本文と応答ヘッダの段・枠切れ・serde・Envoy の 8 通り）、E2E `test_wasm_timeout`・`test_wasm_error_handling`（HTTP/1.1・HTTP/2・HTTP/3、メトリクス）、container_security の W-06 は 503 を期待する。
 
 ## 関連
 

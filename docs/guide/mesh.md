@@ -75,7 +75,10 @@ Supported (checked with `tools/k8s/mesh-e2e.sh`, stock / veil / mixed):
     warning with the policy name when it receives such a policy.
 - Telemetry: Istio's standard metrics (`istio_requests_total` etc. through pilot-agent's merged metrics),
   Telemetry API access logs (Envoy's default format), distributed tracing (Zipkin / B3).
-- WasmPlugin (ECDS → veil's Proxy-Wasm, including C++ SDK modules; `FAIL_CLOSE` returns 503 when the module traps).
+- WasmPlugin (ECDS → veil's Proxy-Wasm, including C++ SDK modules). The resource's `failStrategy` (`FAIL_CLOSE`,
+  the default, or `FAIL_OPEN`; Envoy's `failure_policy` `FAIL_CLOSED`/`FAIL_OPEN`/`FAIL_RELOAD`) maps to veil's
+  `failure_policy` (see [Proxy-Wasm failure handling](wasm.md#failure-handling)): a failing filter answers 503 or is
+  skipped. With `FAIL_OPEN`, a module that cannot be loaded is skipped instead of rejecting the configuration.
 - Gateways: HTTP, HTTPS `SIMPLE` / `MUTUAL` with `credentialName`, TLS `PASSTHROUGH` (SNI), egress gateway,
   Gateway API `HTTPRoute`.
 - Ambient: veil as the **waypoint** (HBONE: HTTP/2 CONNECT over mTLS on 15008, Envoy's internal listeners,

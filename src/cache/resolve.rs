@@ -392,6 +392,10 @@ mod linux_impl {
                 dirfd: fd,
             });
         }
+        // 入れ子のルート（`/srv` と `/srv/public`）では内側を先に見る（B-305）。パスが前方一致した最初のルートの
+        // dirfd で開くので、外側が先だと内側のルートの相対シンボリックリンク（`../private/x`）を外側の封じ込めで
+        // 許してしまい、別のルート（認証・IP 制限付き）配下のファイルを配れた
+        dirs.sort_by_key(|r| std::cmp::Reverse(r.root.components().count()));
         // 複数回呼ばれても 2 回目以降は無視される（設定ロードは通常起動時 1 回のみ）。
         let _ = LINUX_ROOTS.set(dirs);
     }

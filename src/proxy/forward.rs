@@ -35,8 +35,8 @@ pub(super) async fn handle_proxy(
     let client_encoding = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(b"accept-encoding"))
-        .map(|(_, value)| AcceptedEncoding::parse(value))
-        .unwrap_or(AcceptedEncoding::Identity);
+        .map(|(_, value)| crate::config::ClientAccept::parse(value))
+        .unwrap_or(crate::config::ClientAccept::NONE);
 
     // ホスト名を取得
     let host_str = headers
@@ -788,7 +788,7 @@ pub(super) async fn proxy_http_pooled(
     security: &SecurityConfig,
     compression: &CompressionConfig,
     buffering_config: &buffering::BufferingConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     pool_key: &str,
     request: Vec<u8>,
     content_length: usize,
@@ -871,8 +871,7 @@ pub(super) async fn proxy_http_pooled(
 
         // 圧縮が有効かどうかの事前判定
         // 注意: 実際のContent-Typeはレスポンス受信後に判定するため、ここでは設定の有効/無効のみ確認
-        let compression_enabled =
-            compression.enabled && client_encoding != AcceptedEncoding::Identity;
+        let compression_enabled = compression.enabled && client_encoding.accepts_any();
 
         // メトリクス用ホスト名
         let host_str_for_metrics = &target.host;
@@ -1130,7 +1129,7 @@ pub(super) async fn render_h2_upstream_head(
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     client_wants_close: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, super::sendfile::HeadLocal> {
     let mut head = Vec::with_capacity(256);
     head.extend_from_slice(b"HTTP/1.1 ");
     let mut sb = itoa::Buffer::new();
@@ -1168,7 +1167,7 @@ pub(super) async fn render_h2_upstream_head(
     // F-94: HTTP/3 広告（Alt-Svc）
     crate::pool::append_own_alt_svc_line(&mut head, security);
     #[cfg(feature = "wasm")]
-    let mut head = super::sendfile::h1_wasm_response_head(head, status, wasm_modules).await;
+    let mut head = super::sendfile::h1_wasm_response_head(head, status, wasm_modules).await?;
     head.extend_from_slice(framing);
     head.extend_from_slice(if client_wants_close {
         b"Connection: close\r\n\r\n"
@@ -1177,7 +1176,7 @@ pub(super) async fn render_h2_upstream_head(
     });
     // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
     crate::route_cors::apply_h1(&mut head, security);
-    head
+    Ok(head)
 }
 
 /// F-175: HTTP/1.1 で受けた要求（本文は受信済み）を、ALPN で HTTP/2 を選んだ HTTPS 上流の
@@ -1190,7 +1189,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     target: &ProxyTarget,
     security: &SecurityConfig,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     method: &[u8],
     path: &[u8],
     headers: &[(Bytes, Bytes)],
@@ -1336,8 +1335,8 @@ pub(super) async fn proxy_h1_via_https_h2(
         let mut lb = itoa::Buffer::new();
         framing.extend_from_slice(lb.format(compressed.len()).as_bytes());
         framing.extend_from_slice(b"\r\n");
-        // この経路は Wasm モジュールの無いルートだけ（呼び出し側の条件）
-        let head = render_h2_upstream_head(
+        // この経路は Wasm モジュールの無いルートだけ（呼び出し側の条件）なのでローカルレスポンスは無い
+        let Some(head) = render_h2_upstream_head(
             status,
             &resp_headers,
             &[],
@@ -1347,7 +1346,10 @@ pub(super) async fn proxy_h1_via_https_h2(
             &super::h1::no_wasm_modules(),
             client_wants_close,
         )
-        .await;
+        .await
+        .ok() else {
+            return H1ViaH2::Done(None);
+        };
         let sent = compressed.len() as u64;
         return match timeout(
             WRITE_TIMEOUT,
@@ -1369,7 +1371,7 @@ pub(super) async fn proxy_h1_via_https_h2(
     } else {
         b""
     };
-    let head = render_h2_upstream_head(
+    let Some(head) = render_h2_upstream_head(
         status,
         &resp_headers,
         &[],
@@ -1379,7 +1381,10 @@ pub(super) async fn proxy_h1_via_https_h2(
         &super::h1::no_wasm_modules(),
         client_wants_close,
     )
-    .await;
+    .await
+    .ok() else {
+        return H1ViaH2::Done(None);
+    };
     if !matches!(
         timeout(WRITE_TIMEOUT, client_stream.write_all(head)).await,
         Ok((Ok(_), _))
@@ -1454,7 +1459,7 @@ pub(super) async fn proxy_h2c(
     target: &ProxyTarget,
     security: &SecurityConfig,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     method: &[u8],
     path: &[u8],
@@ -1587,7 +1592,19 @@ pub(super) async fn proxy_h2c(
         client_wants_close,
     )
     .await;
-    let mut http11_response = head;
+    let mut http11_response = match head {
+        Ok(h) => h,
+        // 応答ヘッダの段のローカルレスポンス（B-300。本文は受信済みなので接続は続けられる）
+        Err(resp) => {
+            return super::sendfile::write_h1_wasm_local(
+                &mut client_stream,
+                &resp,
+                method == b"HEAD",
+            )
+            .await
+            .map(|(st, n)| (client_stream, st, n, client_wants_close));
+        }
+    };
     if !no_body {
         http11_response.extend_from_slice(&response.body);
     }

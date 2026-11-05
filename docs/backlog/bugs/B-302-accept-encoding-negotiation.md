@@ -1,6 +1,6 @@
 # B-302: `Accept-Encoding` の交渉が q=0 を無視し、クライアントが受け付けない方式・設定に無い方式を返す。要求ごとに小文字化で確保する
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見。行番号は f8dc80de）**
+**状態: 修正済み（v0.11.0）**
 
 ## 事象（コードの読み取り。静的配信とプロキシの全プロトコルに効く）
 
@@ -24,6 +24,13 @@
   ライブラリで共有する。`should_compress` は「クライアントが q>0 で受け付ける ∩ `preferred_encodings`」の中から q の最大、同点は設定順で選ぶ。
 - 単体試験の表（q=0、`*`、`*;q=0`、空白、大文字、`identity;q=0`、設定に無い方式）。allocs/req が減ることを確かめる。
 - [F-294](../features/F-294-precompressed-static-siblings.md) はこの解析器を使う。
+
+## 修正
+
+- `config::ClientAccept`（`src/config/compression.rs`）: `Accept-Encoding` を確保せずに 1 回走査し、方式ごとの q（千分率）を持つ。大文字小文字・`;` 前後の空白・`*`・`q=0`・`x-gzip` を扱う。
+- `should_compress` は「クライアントが q>0 で受け付ける ∩ `preferred_encodings`」の中で q 最大、同点は設定順（`ClientAccept::negotiate`）。設定に無い方式は返さない。
+- 静的配信・プロキシ（HTTP/1.1・HTTP/2・HTTP/3）とライブラリ（`src/api/compress.rs`）が同じ解析器を使う。`AcceptedEncoding::parse`（要求ごとの `to_ascii_lowercase`）は削除。
+- 試験: `config::compression::client_accept_tests`、`legacy_bin_tests::encoding_tests`。
 
 ## 関連
 

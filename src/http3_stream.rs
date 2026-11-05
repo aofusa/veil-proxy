@@ -594,9 +594,9 @@ pub(crate) struct BackendTaskParams {
     /// リクエストボディを chunked で転送するか（`true` のとき head は `Transfer-Encoding: chunked`）。
     pub has_request_body: bool,
     /// レスポンス圧縮設定。
-    pub compression: CompressionConfig,
+    pub compression: std::sync::Arc<CompressionConfig>,
     /// クライアントの受理エンコーディング。
-    pub client_encoding: AcceptedEncoding,
+    pub client_encoding: crate::config::ClientAccept,
     /// 接続/読み取りタイムアウト秒。
     pub timeout_secs: u64,
     /// リクエストボディ上限（0 = 無制限）。メインループ側の `ProxyStream` が強制する。
@@ -1374,7 +1374,7 @@ async fn exchange(
 async fn stream_response(
     backend: &BackendIo,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     timeout_secs: u64,
     no_response_body: bool,
     resp_tx: &Sender<RespMsg>,

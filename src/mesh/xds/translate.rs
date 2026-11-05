@@ -148,8 +148,8 @@ pub fn ecds_filter(name: &str, any: &p::Any) -> R<HttpFilterCfg> {
     if ty == p::T_WASM {
         let w = decode_any::<p::WasmFilter>(any, p::T_WASM).ok_or("invalid Wasm filter")?;
         let pc = w.config.unwrap_or_default();
-        let fail_open = pc.fail_open || pc.failure_policy == 1;
-        return match wasm_plugin(name, &pc, !fail_open) {
+        let fail_open = envoy_fail_open(&pc);
+        return match wasm_plugin(name, &pc) {
             Ok(f) => Ok(f),
             Err(e) if fail_open => {
                 ftlog::warn!("[mesh] wasm plugin {} disabled (fail open): {}", name, e);
@@ -171,8 +171,18 @@ pub fn ecds_filter(name: &str, any: &p::Any) -> R<HttpFilterCfg> {
     Err(format!("unsupported ECDS filter {} ({})", name, ty))
 }
 
+/// Envoy の `failure_policy`（UNSPECIFIED=0・FAIL_RELOAD=1・FAIL_CLOSED=2・FAIL_OPEN=3）で fail open か。
+/// UNSPECIFIED は非推奨の `fail_open` に従う（B-298。以前は FAIL_RELOAD を fail open と読んでいた）
+fn envoy_fail_open(pc: &p::WasmPluginConfig) -> bool {
+    match pc.failure_policy {
+        1 | 2 => false,
+        3 => true,
+        _ => pc.fail_open,
+    }
+}
+
 #[cfg(feature = "wasm")]
-fn wasm_plugin(name: &str, pc: &p::WasmPluginConfig, fail_closed: bool) -> R<HttpFilterCfg> {
+fn wasm_plugin(name: &str, pc: &p::WasmPluginConfig) -> R<HttpFilterCfg> {
     let vm = pc
         .vm_config
         .as_ref()
@@ -187,12 +197,13 @@ fn wasm_plugin(name: &str, pc: &p::WasmPluginConfig, fail_closed: bool) -> R<Htt
         _ => return Err("Wasm plugin without a local module file".into()),
     };
     let configuration = pc.configuration.as_ref().map(any_bytes).unwrap_or_default();
-    let w = crate::mesh::wasm::load(name, &path, &pc.root_id, configuration, fail_closed)?;
+    let policy = crate::wasm::FailurePolicy::from_envoy(pc.fail_open, pc.failure_policy);
+    let w = crate::mesh::wasm::load(name, &path, &pc.root_id, configuration, policy)?;
     Ok(HttpFilterCfg::Wasm(Arc::new(w)))
 }
 
 #[cfg(not(feature = "wasm"))]
-fn wasm_plugin(_name: &str, _pc: &p::WasmPluginConfig, _fail_closed: bool) -> R<HttpFilterCfg> {
+fn wasm_plugin(_name: &str, _pc: &p::WasmPluginConfig) -> R<HttpFilterCfg> {
     Err("this veil is built without Proxy-Wasm (the `wasm` feature)".into())
 }
 

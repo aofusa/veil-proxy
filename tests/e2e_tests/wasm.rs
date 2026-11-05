@@ -462,57 +462,98 @@ pub(super) mod wasm_tests {
     // 追加テスト: タイムアウト・エラーハンドリング
     // ====================
 
+    /// F-293: 応答ヘッダの段で fuel を使い切るフィルタは、既定の fail_closed で 503、fail_open で上流の応答
+    /// （以前は常に素通しで、このテストは失敗を起こしていなかった）。
     #[tokio::test]
-    #[ntest::timeout(15000)]
+    #[ntest::timeout(30000)]
     async fn test_wasm_timeout() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
+        let closed = send_request(PROXY_PORT, "/wasm-fuel-closed/", &[])
+            .await
+            .expect("response");
+        assert_eq!(get_status_code(&closed), Some(503), "{closed}");
+        let open = send_request(PROXY_PORT, "/wasm-fuel-open/", &[])
+            .await
+            .expect("response");
+        assert_eq!(get_status_code(&open), Some(200), "{open}");
 
-        // タイムアウト処理のテスト
-        // 注意: 実際のタイムアウトテストには、長時間実行するWASMモジュールが必要
-        // 現在は基本的な動作確認のみ
-        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
-        assert!(response.is_some(), "Should receive response");
-
-        let response = response.unwrap();
-        let status = get_status_code(&response);
-        assert_eq!(status, Some(200), "Should return 200 OK");
-
-        // タイムアウトが発生しないことを確認（正常に処理される）
-        let processed = get_header_value(&response, "X-Veil-Processed");
-        assert_eq!(
-            processed,
-            Some("true".to_string()),
-            "Should have X-Veil-Processed header indicating WASM module executed without timeout"
-        );
+        let metrics = send_request(PROXY_PORT, "/__metrics", &[])
+            .await
+            .expect("metrics");
+        for want in [
+            r#"veil_wasm_failures_total{action="rejected",filter="fuel_burner",phase="response_headers",reason="fuel"}"#,
+            r#"veil_wasm_failures_total{action="continued",filter="fuel_burner_open",phase="response_headers",reason="fuel"}"#,
+        ] {
+            assert!(metrics.contains(want), "missing {want}");
+        }
     }
 
+    /// F-293・B-299: 要求ヘッダの段でトラップするフィルタは 503（HTTP/1.1・HTTP/2・HTTP/3）。インスタンスを捨てた後も
+    /// 次の要求は通る。
     #[tokio::test]
-    #[ntest::timeout(15000)]
+    #[ntest::timeout(30000)]
     async fn test_wasm_error_handling() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
+        let r = send_request(PROXY_PORT, "/trap", &[])
+            .await
+            .expect("response");
+        assert_eq!(get_status_code(&r), Some(503), "{r}");
+        let r = send_request(PROXY_PORT, "/wasm/", &[])
+            .await
+            .expect("response");
+        assert_eq!(get_status_code(&r), Some(200), "{r}");
 
-        // エラーハンドリングのテスト
-        // 正常なリクエストがエラーなく処理されることを確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
-        assert!(response.is_some(), "Should receive response");
+        let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("HTTP/2 connect");
+        let (status, _) = h2
+            .send_request("GET", "/trap", &[], None)
+            .await
+            .expect("HTTP/2 request");
+        assert_eq!(status, 503);
+        let (status, _) = h2
+            .send_request("GET", "/wasm-fuel-closed/", &[], None)
+            .await
+            .expect("HTTP/2 request");
+        assert_eq!(status, 503);
+        // 同じ接続で続けられる
+        let (status, _) = h2
+            .send_request("GET", "/wasm-fuel-open/", &[], None)
+            .await
+            .expect("HTTP/2 request");
+        assert_eq!(status, 200);
 
-        let response = response.unwrap();
-        let status = get_status_code(&response);
-        assert_eq!(status, Some(200), "Should return 200 OK");
-
-        // WASMモジュールがエラーなく動作することを確認
-        let processed = get_header_value(&response, "X-Veil-Processed");
-        assert_eq!(
-            processed,
-            Some("true".to_string()),
-            "Should have X-Veil-Processed header indicating WASM module executed without error"
-        );
+        #[cfg(feature = "http3")]
+        {
+            let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+                .parse()
+                .expect("Invalid server address");
+            let (_client, mut send) = Http3TestClient::new(server_addr, "localhost")
+                .await
+                .expect("HTTP/3 client");
+            for (path, want) in [
+                ("/trap", 503),
+                ("/wasm-fuel-closed/", 503),
+                ("/wasm-fuel-open/", 200),
+            ] {
+                let resp = common::http3_client::send_http3_request_full(
+                    &mut send,
+                    "GET",
+                    path,
+                    &[],
+                    None,
+                )
+                .await
+                .expect("HTTP/3 request");
+                assert_eq!(resp.status, want, "HTTP/3 {path}");
+            }
+        }
     }
 
     // ====================

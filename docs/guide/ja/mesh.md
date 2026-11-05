@@ -72,7 +72,10 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
     ポリシー名付きで警告を出す。
 - 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
-- WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く。`FAIL_CLOSE` はモジュールが落ちたら 503）。
+- WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く）。リソースの `failStrategy`（既定の `FAIL_CLOSE` か
+  `FAIL_OPEN`。Envoy の `failure_policy` では `FAIL_CLOSED`・`FAIL_OPEN`・`FAIL_RELOAD`）は veil の `failure_policy` になる
+  （[Proxy-Wasm の失敗の扱い](wasm.md#失敗の扱い)）。失敗したフィルタは 503 を返すか、飛ばされる。`FAIL_OPEN` では読み込めない
+  モジュールも設定を拒否せずに飛ばす。
 - ゲートウェイ: HTTP、`credentialName` の HTTPS `SIMPLE` / `MUTUAL`、TLS の `PASSTHROUGH`（SNI）、egress ゲートウェイ、
   Gateway API の `HTTPRoute`。
 - ambient: veil を **waypoint** にする（HBONE: 15008 の mTLS の上の HTTP/2 CONNECT、Envoy の内部リスナー、

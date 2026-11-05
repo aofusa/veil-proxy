@@ -66,6 +66,17 @@ pub fn compression_level(encoding: AcceptedEncoding, compression: &CompressionCo
     }
 }
 
+/// 圧縮の元にしたファイルの同一性（大きさと更新時刻。B-304）。キャッシュのキーはパスなので、
+/// 監視していないルートで中身が置き換わっても古い圧縮結果を返さないよう、ヒット時にこれを比べる。
+/// 精度は ETag と同じ（更新時刻は秒）。
+pub fn file_ident(size: u64, mtime_secs: Option<u64>) -> u64 {
+    mtime_secs
+        .unwrap_or(0)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        ^ size
+}
+
 #[cfg(feature = "cache")]
 mod enabled {
     use super::AcceptedEncoding;
@@ -88,6 +99,9 @@ mod enabled {
         cached_at: Instant,
         /// 圧縮する前に読んだ監視の世代（F-272）
         stamp: Option<crate::cache::watch::Stamp>,
+        /// 圧縮の元にしたファイルの同一性（大きさ・更新時刻。B-304）。監視・TTL より先に、
+        /// 置き換わったファイルへ古い圧縮結果を返さない
+        ident: u64,
     }
 
     /// パスごとの圧縮バリアント集合。`invalidate(path)` が外側キーを丸ごと
@@ -135,6 +149,7 @@ mod enabled {
             &self,
             path: &Path,
             key: VariantKey,
+            ident: u64,
             cfg: &StaticContentCacheConfig,
         ) -> Option<Bytes> {
             if !cfg.enabled {
@@ -142,6 +157,9 @@ mod enabled {
             }
             let path_entry = self.entries.get(path)?;
             let variant = path_entry.variants.get(&key)?;
+            if variant.ident != ident {
+                return None;
+            }
             // F-272: 監視しているルートが作った後に変わっていたら圧縮し直す
             if !crate::cache::watch::fresh(variant.stamp, cfg.watch_gen) {
                 return None;
@@ -240,6 +258,7 @@ mod enabled {
         path: &Path,
         encoding: AcceptedEncoding,
         level: i32,
+        ident: u64,
         cfg: &StaticContentCacheConfig,
         compress: F,
     ) -> Bytes
@@ -250,7 +269,7 @@ mod enabled {
             return Bytes::from(compress());
         }
         let key = (encoding, level);
-        if let Some(hit) = COMPRESSED_CACHE.try_hit(path, key, cfg) {
+        if let Some(hit) = COMPRESSED_CACHE.try_hit(path, key, ident, cfg) {
             return hit;
         }
         COMPRESSED_CACHE.misses.fetch_add(1, Ordering::Relaxed);
@@ -266,6 +285,7 @@ mod enabled {
                 len,
                 cached_at: Instant::now(),
                 stamp,
+                ident,
             },
             cfg,
         );
@@ -320,7 +340,7 @@ mod enabled {
             let calls = AtomicUsize::new(0);
 
             let key = (AcceptedEncoding::Zstd, 3);
-            let first = cache.try_hit(&path, key, &cfg).unwrap_or_else(|| {
+            let first = cache.try_hit(&path, key, 0, &cfg).unwrap_or_else(|| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 let data = Bytes::from_static(b"compressed-once");
                 cache.try_insert(
@@ -331,6 +351,7 @@ mod enabled {
                         len: data.len() as u64,
                         cached_at: Instant::now(),
                         stamp: None,
+                        ident: 0,
                     },
                     &cfg,
                 );
@@ -340,7 +361,7 @@ mod enabled {
             assert_eq!(calls.load(Ordering::Relaxed), 1);
 
             // 2回目はヒットするはず（同じ compress クロージャを呼ばない）。
-            let second = cache.try_hit(&path, key, &cfg);
+            let second = cache.try_hit(&path, key, 0, &cfg);
             assert_eq!(second, Some(Bytes::from_static(b"compressed-once")));
         }
 
@@ -358,6 +379,7 @@ mod enabled {
                     len: 4,
                     cached_at: Instant::now(),
                     stamp: None,
+                    ident: 0,
                 },
                 &cfg,
             );
@@ -369,23 +391,24 @@ mod enabled {
                     len: 4,
                     cached_at: Instant::now(),
                     stamp: None,
+                    ident: 0,
                 },
                 &cfg,
             );
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Zstd, 3), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Zstd, 3), 0, &cfg)
                 .is_some());
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Gzip, 4), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Gzip, 4), 0, &cfg)
                 .is_some());
 
             cache.invalidate(&path);
 
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Zstd, 3), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Zstd, 3), 0, &cfg)
                 .is_none());
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Gzip, 4), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Gzip, 4), 0, &cfg)
                 .is_none());
             assert_eq!(cache.total_bytes.load(Ordering::Relaxed), 0);
             assert_eq!(cache.entry_count.load(Ordering::Relaxed), 0);
@@ -405,15 +428,16 @@ mod enabled {
                     len: 9,
                     cached_at: Instant::now(),
                     stamp: None,
+                    ident: 0,
                 },
                 &cfg,
             );
             // gzip はまだ挿入していないのでミスのはず。
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Gzip, 4), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Gzip, 4), 0, &cfg)
                 .is_none());
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Zstd, 3), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Zstd, 3), 0, &cfg)
                 .is_some());
         }
 
@@ -431,13 +455,41 @@ mod enabled {
                     len: 1,
                     cached_at: Instant::now(),
                     stamp: None,
+                    ident: 0,
                 },
                 &cfg,
             );
             cfg.enabled = false;
             assert!(cache
-                .try_hit(&path, (AcceptedEncoding::Zstd, 3), &cfg)
+                .try_hit(&path, (AcceptedEncoding::Zstd, 3), 0, &cfg)
                 .is_none());
+        }
+
+        /// 同じパスでも元のファイルが変わったら（大きさ・更新時刻）圧縮し直す（B-304）
+        #[test]
+        fn changed_file_identity_misses() {
+            let cache = CompressedCache::new();
+            let cfg = test_cfg();
+            let path = PathBuf::from("/var/www/ident.txt");
+            let key = (AcceptedEncoding::Gzip, 6);
+            let old = super::super::file_ident(10, Some(100));
+            cache.try_insert(
+                &path,
+                key,
+                CachedVariant {
+                    data: Bytes::from_static(b"old"),
+                    len: 3,
+                    cached_at: Instant::now(),
+                    stamp: None,
+                    ident: old,
+                },
+                &cfg,
+            );
+            assert!(cache.try_hit(&path, key, old, &cfg).is_some());
+            let resized = super::super::file_ident(11, Some(100));
+            let touched = super::super::file_ident(10, Some(101));
+            assert!(cache.try_hit(&path, key, resized, &cfg).is_none());
+            assert!(cache.try_hit(&path, key, touched, &cfg).is_none());
         }
 
         /// public API (`get_or_compress`/`invalidate`) の smoke test（グローバル
@@ -453,14 +505,14 @@ mod enabled {
             let cfg = test_cfg();
             let calls = AtomicUsize::new(0);
 
-            let first = get_or_compress(&path, AcceptedEncoding::Zstd, 3, &cfg, || {
+            let first = get_or_compress(&path, AcceptedEncoding::Zstd, 3, 0, &cfg, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 b"compressed".to_vec()
             });
             assert_eq!(first, Bytes::from_static(b"compressed"));
             assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-            let second = get_or_compress(&path, AcceptedEncoding::Zstd, 3, &cfg, || {
+            let second = get_or_compress(&path, AcceptedEncoding::Zstd, 3, 0, &cfg, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 b"compressed".to_vec()
             });
@@ -472,7 +524,7 @@ mod enabled {
             );
 
             invalidate(&path);
-            let third = get_or_compress(&path, AcceptedEncoding::Zstd, 3, &cfg, || {
+            let third = get_or_compress(&path, AcceptedEncoding::Zstd, 3, 0, &cfg, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 b"compressed".to_vec()
             });
@@ -487,11 +539,11 @@ mod enabled {
             let mut disabled_cfg = cfg;
             disabled_cfg.enabled = false;
             let calls2 = AtomicUsize::new(0);
-            let _ = get_or_compress(&path, AcceptedEncoding::Zstd, 3, &disabled_cfg, || {
+            let _ = get_or_compress(&path, AcceptedEncoding::Zstd, 3, 0, &disabled_cfg, || {
                 calls2.fetch_add(1, Ordering::Relaxed);
                 b"no-cache".to_vec()
             });
-            let _ = get_or_compress(&path, AcceptedEncoding::Zstd, 3, &disabled_cfg, || {
+            let _ = get_or_compress(&path, AcceptedEncoding::Zstd, 3, 0, &disabled_cfg, || {
                 calls2.fetch_add(1, Ordering::Relaxed);
                 b"no-cache".to_vec()
             });
@@ -515,6 +567,7 @@ pub fn get_or_compress<F>(
     _path: &std::path::Path,
     _encoding: AcceptedEncoding,
     _level: i32,
+    _ident: u64,
     _cfg: &crate::cache::StaticContentCacheConfig,
     compress: F,
 ) -> bytes::Bytes

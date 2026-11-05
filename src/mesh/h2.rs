@@ -684,7 +684,14 @@ async fn forward(
                     }
                     let ums = started.elapsed().as_millis() as u64;
                     out.upstream_ms = Some(ums);
-                    f.response_filters(status, &mut headers).await;
+                    if let Err(lr) = f.response_filters(status, &mut headers).await {
+                        // Wasm のローカル応答（B-300）。上流のストリームはここで捨てる
+                        out.status = lr.status;
+                        local(tx, notify, &lr, is_grpc, &c.hcm).await;
+                        head_sent = true;
+                        done = true;
+                        continue;
+                    }
                     let peer_resp = l7::downstream_response_headers(
                         c,
                         Some(f),
@@ -988,7 +995,13 @@ async fn to_h1(
     }
     let ums = started.elapsed().as_millis() as u64;
     out.upstream_ms = Some(ums);
-    f.response_filters(status, &mut headers).await;
+    if let Err(lr) = f.response_filters(status, &mut headers).await {
+        // Wasm のローカル応答（B-300）。上流の本文は読まないので上流の接続は戻さない
+        picked.end(false, false);
+        out.status = lr.status;
+        local(tx, notify, &lr, is_grpc, &c.hcm).await;
+        return out;
+    }
     let peer_resp = l7::downstream_response_headers(c, Some(f), &mut headers, Some(ums), origin);
     // Linkerd の inbound で HTTP/1.1 に戻した要求の応答には元の版を付ける（相手のプロキシが外す）
     if c.hcm.linkerd && c.direction == super::model::Direction::Inbound {

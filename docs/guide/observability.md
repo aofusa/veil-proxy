@@ -71,6 +71,7 @@ only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves
 | `veil_grpc_stream_duration_seconds` | Histogram | method | Time from the start of a relayed gRPC call to its `grpc-status` trailer |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
+| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm filter failures (`reason`: trap, fuel, timeout, instantiate, lifecycle, http_call_resume, unsupported_pause; `action`: rejected, continued per `failure_policy`) |
 
 Label values are kept to a fixed set, so a client cannot create new time series by sending arbitrary values
 (each series stays in memory and in every scrape):

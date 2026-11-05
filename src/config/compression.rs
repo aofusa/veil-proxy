@@ -3,6 +3,7 @@
 //! F-233 で `src/config.rs` から移した（中身は変えていない）。
 
 use super::*;
+use std::sync::Arc;
 
 // ====================
 // 圧縮設定（プロキシバックエンド用）
@@ -33,48 +34,15 @@ pub enum AcceptedEncoding {
 }
 
 impl AcceptedEncoding {
-    /// Accept-Encodingヘッダーから最適な圧縮方式を選択
-    ///
-    /// 優先順位: zstd > br > gzip > deflate > identity
-    /// q値（品質値）も考慮します。
-    pub fn parse(value: &[u8]) -> Self {
-        let value_str = match std::str::from_utf8(value) {
-            Ok(s) => s.to_ascii_lowercase(),
-            Err(_) => return Self::Identity,
-        };
-
-        // q値を考慮した解析
-        let mut best = (Self::Identity, 0.0f32);
-
-        for part in value_str.split(',') {
-            let part = part.trim();
-            let (encoding, q) = if let Some((enc, q_part)) = part.split_once(";q=") {
-                (enc.trim(), q_part.trim().parse().unwrap_or(1.0))
-            } else {
-                (part, 1.0)
-            };
-
-            let candidate = match encoding {
-                "zstd" => (Self::Zstd, q),
-                "br" => (Self::Brotli, q),
-                "gzip" => (Self::Gzip, q),
-                "deflate" => (Self::Deflate, q),
-                "*" => (Self::Gzip, q * 0.9), // * は gzip として扱う
-                _ => continue,
-            };
-
-            // q値が高いもの、または同じq値ならZstd > Brotliを優先
-            if candidate.1 > best.1
-                || (candidate.1 == best.1 && matches!(candidate.0, Self::Zstd))
-                || (candidate.1 == best.1
-                    && matches!(candidate.0, Self::Brotli)
-                    && !matches!(best.0, Self::Zstd))
-            {
-                best = candidate;
-            }
+    /// 設定の方式名（`preferred_encodings` の値）から
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "zstd" => Some(Self::Zstd),
+            "br" => Some(Self::Brotli),
+            "gzip" => Some(Self::Gzip),
+            "deflate" => Some(Self::Deflate),
+            _ => None,
         }
-
-        best.0
     }
 
     /// Content-Encodingヘッダー値を返す
@@ -89,10 +57,129 @@ impl AcceptedEncoding {
     }
 }
 
+/// クライアントの `Accept-Encoding` が受け付ける方式と q 値（B-302）。
+///
+/// 要求ごとに確保しない（以前は値を小文字にした `String` を作っていた）。q は千分率（RFC 9110 §12.4.2）で、
+/// 0 は受け付けない。明示の無い方式は `*` の q に従う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct ClientAccept {
+    /// zstd・br・gzip・deflate の順
+    q: [u16; 4],
+}
+
+impl ClientAccept {
+    /// 圧縮を受け付けない（`Accept-Encoding` が無い要求）
+    pub const NONE: Self = Self { q: [0; 4] };
+    /// すべての方式を受け付ける（「この応答は圧縮し得るか」の判定用）
+    pub const ALL: Self = Self { q: [1000; 4] };
+
+    fn slot(enc: AcceptedEncoding) -> Option<usize> {
+        match enc {
+            AcceptedEncoding::Zstd => Some(0),
+            AcceptedEncoding::Brotli => Some(1),
+            AcceptedEncoding::Gzip => Some(2),
+            AcceptedEncoding::Deflate => Some(3),
+            AcceptedEncoding::Identity => None,
+        }
+    }
+
+    /// `Accept-Encoding` の値を解析する（大文字小文字・`;` の前後の空白・`*`・`q=0` を扱う）
+    pub fn parse(value: &[u8]) -> Self {
+        let mut explicit = [None::<u16>; 4];
+        let mut star = None;
+        for item in value.split(|&b| b == b',') {
+            let mut parts = item.split(|&b| b == b';');
+            let name = trim_ascii(parts.next().unwrap_or(b""));
+            let mut q = 1000u16;
+            for p in parts {
+                if let Some(eq) = p.iter().position(|&b| b == b'=') {
+                    if trim_ascii(&p[..eq]).eq_ignore_ascii_case(b"q") {
+                        q = parse_q(trim_ascii(&p[eq + 1..]));
+                    }
+                }
+            }
+            let idx = if name.eq_ignore_ascii_case(b"zstd") {
+                0
+            } else if name.eq_ignore_ascii_case(b"br") {
+                1
+            } else if name.eq_ignore_ascii_case(b"gzip") || name.eq_ignore_ascii_case(b"x-gzip") {
+                2
+            } else if name.eq_ignore_ascii_case(b"deflate") {
+                3
+            } else {
+                if name == b"*" {
+                    star = Some(q);
+                }
+                continue;
+            };
+            explicit[idx] = Some(q);
+        }
+        let mut q = [0u16; 4];
+        for (i, e) in explicit.iter().enumerate() {
+            q[i] = e.or(star).unwrap_or(0);
+        }
+        Self { q }
+    }
+
+    /// `enc` の q（千分率。0 は受け付けない）
+    pub fn q(&self, enc: AcceptedEncoding) -> u16 {
+        Self::slot(enc).map(|i| self.q[i]).unwrap_or(0)
+    }
+
+    /// 圧縮した方式を 1 つでも受け付けるか
+    pub fn accepts_any(&self) -> bool {
+        self.q.iter().any(|&q| q > 0)
+    }
+
+    /// `preferred` の中でクライアントが受け付ける（q > 0）方式のうち q が最大のもの（同点は `preferred` の順）
+    pub fn negotiate<S: AsRef<str>>(&self, preferred: &[S]) -> Option<AcceptedEncoding> {
+        let mut best: Option<(AcceptedEncoding, u16)> = None;
+        for name in preferred {
+            let Some(enc) = AcceptedEncoding::from_name(name.as_ref()) else {
+                continue;
+            };
+            let q = self.q(enc);
+            if q > 0 && best.is_none_or(|(_, b)| q > b) {
+                best = Some((enc, q));
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+}
+
+fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    s.trim_ascii()
+}
+
+/// q 値を千分率に（小数は 3 桁まで。読めない値は 0）
+fn parse_q(v: &[u8]) -> u16 {
+    match v {
+        [b'1'] => 1000,
+        [b'1', b'.', rest @ ..] if rest.len() <= 3 && rest.iter().all(|&b| b == b'0') => 1000,
+        [b'0'] => 0,
+        [b'0', b'.', frac @ ..] if frac.len() <= 3 && frac.iter().all(|b| b.is_ascii_digit()) => {
+            let mut q = 0u16;
+            for i in 0..3 {
+                q = q * 10 + frac.get(i).map(|d| (d - b'0') as u16).unwrap_or(0);
+            }
+            q
+        }
+        _ => 0,
+    }
+}
+
 /// ルートごとの圧縮設定
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct CompressionConfig {
+    /// HTTP/3 で使う設定（`resolve_http3_compression_config` が初回に作って持つ。B-303）。要求ごとに
+    /// 文字列の配列を複製しない。複製した設定には引き継がない（複製後に変えられても古い値を返さない）
+    #[serde(skip)]
+    pub(crate) h3_resolved: H3Resolved,
     /// 圧縮を有効にするかどうか
     /// デフォルト: false（kTLS最適化を維持）
     pub enabled: bool,
@@ -194,11 +281,39 @@ impl Default for CompressionConfig {
             min_size: default_compression_min_size(),
             compressible_types: default_compressible_types(),
             skip_types: default_skip_types(),
+            h3_resolved: H3Resolved::default(),
         }
     }
 }
 
+/// HTTP/3 用に解決した圧縮設定の置き場（B-303）。`Clone` は空にする
+#[derive(Default)]
+pub struct H3Resolved(std::sync::OnceLock<Arc<CompressionConfig>>);
+
+impl Clone for H3Resolved {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for H3Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("H3Resolved")
+    }
+}
+
 impl CompressionConfig {
+    /// `compression` feature の無いビルドで圧縮を有効にした設定を警告する（設定のロード時。B-303）。
+    /// このビルドの `should_compress` は常に圧縮しない（以前は圧縮しない本文に `Content-Encoding` を付けたり、
+    /// プロキシ応答を 502 にしていた）
+    pub fn warn_if_unbuilt(&self) {
+        if self.enabled && !cfg!(feature = "compression") {
+            warn!(
+                "compression is enabled in the configuration but this build lacks the `compression` feature; responses are sent uncompressed"
+            );
+        }
+    }
+
     /// 設定の妥当性を検証
     pub fn validate(&self) -> Result<(), String> {
         if self.gzip_level < 1 || self.gzip_level > 9 {
@@ -240,18 +355,18 @@ impl CompressionConfig {
     /// 圧縮すべき場合は使用する圧縮方式、それ以外はNone
     pub fn should_compress(
         &self,
-        client_encoding: AcceptedEncoding,
+        client: ClientAccept,
         content_type: Option<&[u8]>,
         content_length: Option<usize>,
         existing_encoding: Option<&[u8]>,
     ) -> Option<AcceptedEncoding> {
-        // 1. 圧縮が無効
-        if !self.enabled {
+        // 1. 圧縮が無効（`compression` feature の無いビルドは圧縮できない。B-303）
+        if !self.enabled || !cfg!(feature = "compression") {
             return None;
         }
 
         // 2. クライアントが圧縮非対応
-        if client_encoding == AcceptedEncoding::Identity {
+        if !client.accepts_any() {
             return None;
         }
 
@@ -277,18 +392,18 @@ impl CompressionConfig {
             return None;
         }
 
-        // スキップ対象をチェック
-        if self.skip_types.iter().any(|skip| ct_str.starts_with(skip)) {
-            return None;
-        }
-
-        // 圧縮対象をチェック
-        if !self
-            .compressible_types
-            .iter()
-            .any(|t| ct_str.starts_with(t))
-        {
-            return None;
+        // 圧縮対象・スキップ対象は長く一致した方を優先する（B-303。既定の skip_types の "image/" より
+        // compressible_types の "image/svg+xml" が勝つ）。同じ長さならスキップ
+        let longest = |list: &[String]| {
+            list.iter()
+                .filter(|t| starts_with_ignore_case(ct_str, t))
+                .map(|t| t.len())
+                .max()
+        };
+        match (longest(&self.compressible_types), longest(&self.skip_types)) {
+            (Some(c), Some(k)) if c > k => {}
+            (Some(_), None) => {}
+            _ => return None,
         }
 
         // 5. サイズ確認（Content-Length 不明なら圧縮を試みる）
@@ -306,57 +421,9 @@ impl CompressionConfig {
             }
         }
 
-        // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
-        let client_supports = |enc: &str| -> bool {
-            matches!(
-                (enc, client_encoding),
-                ("zstd", AcceptedEncoding::Zstd)
-                    | ("br", AcceptedEncoding::Brotli | AcceptedEncoding::Zstd)
-                    | (
-                        "gzip",
-                        AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd,
-                    )
-                    | (
-                        "deflate",
-                        AcceptedEncoding::Deflate
-                            | AcceptedEncoding::Gzip
-                            | AcceptedEncoding::Brotli
-                            | AcceptedEncoding::Zstd,
-                    )
-            )
-        };
-
-        for enc in &self.preferred_encodings {
-            if client_supports(enc) {
-                return match enc.as_str() {
-                    "zstd" if client_encoding == AcceptedEncoding::Zstd => {
-                        Some(AcceptedEncoding::Zstd)
-                    }
-                    "br" if matches!(
-                        client_encoding,
-                        AcceptedEncoding::Brotli | AcceptedEncoding::Zstd
-                    ) =>
-                    {
-                        Some(AcceptedEncoding::Brotli)
-                    }
-                    "gzip"
-                        if matches!(
-                            client_encoding,
-                            AcceptedEncoding::Gzip
-                                | AcceptedEncoding::Brotli
-                                | AcceptedEncoding::Zstd
-                        ) =>
-                    {
-                        Some(AcceptedEncoding::Gzip)
-                    }
-                    "deflate" => Some(AcceptedEncoding::Deflate),
-                    _ => continue,
-                };
-            }
-        }
-
-        // クライアントの圧縮方式を使用
-        Some(client_encoding)
+        // 6. クライアントが受け付ける（q > 0）方式のうち、設定で許可したものから q が最大のもの（同点は設定の順）。
+        // 以前は「zstd を受け付けるクライアントは br・gzip も受け付ける」とみなし、設定に無い方式も返していた（B-302）
+        client.negotiate(&self.preferred_encodings)
     }
 }
 
@@ -374,67 +441,50 @@ impl CompressionConfig {
 /// # 戻り値
 /// 解決された圧縮設定
 pub fn resolve_http3_compression_config(
+    path_compression: &Arc<CompressionConfig>,
+    http3_config: &Http3ConfigSection,
+) -> Arc<CompressionConfig> {
+    // パス設定も HTTP/3 の設定も圧縮しないなら、パス設定をそのまま使う（参照カウントだけ）
+    if !path_compression.enabled && !http3_config.compression_enabled {
+        return path_compression.clone();
+    }
+    // 経路の設定はロード（リロード）ごとに作り直すので、初回に解決したものを使い回せる（B-303。
+    // 以前は要求ごとに約 20 個の文字列を複製していた）
+    path_compression
+        .h3_resolved
+        .0
+        .get_or_init(|| Arc::new(merge_http3_compression(path_compression, http3_config)))
+        .clone()
+}
+
+/// パス設定に HTTP/3 専用の設定を重ねる（パス設定が有効、または HTTP/3 で圧縮を有効にしたとき）
+fn merge_http3_compression(
     path_compression: &CompressionConfig,
     http3_config: &Http3ConfigSection,
 ) -> CompressionConfig {
-    // パスごとの設定で明示的に有効化されている場合はそれを優先
-    // （パス設定が既に有効なら、HTTP/3設定で上書きするだけ）
-    if path_compression.enabled {
-        // パス設定が有効な場合、HTTP/3専用パラメータで上書き
-        let h3_comp = &http3_config.compression;
-        return CompressionConfig {
-            enabled: true,
-            preferred_encodings: h3_comp
-                .preferred_encodings
-                .clone()
-                .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
-            gzip_level: h3_comp.gzip_level.unwrap_or(path_compression.gzip_level),
-            brotli_level: h3_comp
-                .brotli_level
-                .unwrap_or(path_compression.brotli_level),
-            zstd_level: h3_comp.zstd_level.unwrap_or(path_compression.zstd_level),
-            min_size: h3_comp.min_size.unwrap_or(path_compression.min_size),
-            compressible_types: h3_comp
-                .compressible_types
-                .clone()
-                .unwrap_or_else(|| path_compression.compressible_types.clone()),
-            skip_types: h3_comp
-                .skip_types
-                .clone()
-                .unwrap_or_else(|| path_compression.skip_types.clone()),
-        };
+    let h3_comp = &http3_config.compression;
+    CompressionConfig {
+        h3_resolved: H3Resolved::default(),
+        enabled: true,
+        preferred_encodings: h3_comp
+            .preferred_encodings
+            .clone()
+            .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
+        gzip_level: h3_comp.gzip_level.unwrap_or(path_compression.gzip_level),
+        brotli_level: h3_comp
+            .brotli_level
+            .unwrap_or(path_compression.brotli_level),
+        zstd_level: h3_comp.zstd_level.unwrap_or(path_compression.zstd_level),
+        min_size: h3_comp.min_size.unwrap_or(path_compression.min_size),
+        compressible_types: h3_comp
+            .compressible_types
+            .clone()
+            .unwrap_or_else(|| path_compression.compressible_types.clone()),
+        skip_types: h3_comp
+            .skip_types
+            .clone()
+            .unwrap_or_else(|| path_compression.skip_types.clone()),
     }
-
-    // パスごとの設定で圧縮が無効の場合
-    // HTTP/3の compression_enabled をチェック
-    if http3_config.compression_enabled {
-        // HTTP/3で圧縮が有効化されている場合、HTTP/3専用設定を適用
-        let h3_comp = &http3_config.compression;
-        return CompressionConfig {
-            enabled: true, // HTTP/3では有効
-            preferred_encodings: h3_comp
-                .preferred_encodings
-                .clone()
-                .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
-            gzip_level: h3_comp.gzip_level.unwrap_or(path_compression.gzip_level),
-            brotli_level: h3_comp
-                .brotli_level
-                .unwrap_or(path_compression.brotli_level),
-            zstd_level: h3_comp.zstd_level.unwrap_or(path_compression.zstd_level),
-            min_size: h3_comp.min_size.unwrap_or(path_compression.min_size),
-            compressible_types: h3_comp
-                .compressible_types
-                .clone()
-                .unwrap_or_else(|| path_compression.compressible_types.clone()),
-            skip_types: h3_comp
-                .skip_types
-                .clone()
-                .unwrap_or_else(|| path_compression.skip_types.clone()),
-        };
-    }
-
-    // HTTP/3圧縮も無効の場合はパス設定をそのまま使用（圧縮無効）
-    path_compression.clone()
 }
 
 /// グローバルセキュリティ設定
@@ -771,4 +821,86 @@ pub(super) fn default_landlock_read_paths() -> Vec<String> {
 
 pub(super) fn default_landlock_write_paths() -> Vec<String> {
     vec!["/var/log".to_string(), "/tmp".to_string()]
+}
+
+#[cfg(test)]
+mod client_accept_tests {
+    use super::*;
+
+    const ALL: [&str; 4] = ["zstd", "br", "gzip", "deflate"];
+
+    // B-302: q=0 は拒否・大文字小文字と空白・`*`・x-gzip・同点は設定の順
+    #[test]
+    fn parse_honours_q_values_case_and_wildcards() {
+        assert_eq!(ClientAccept::parse(b"gzip;q=0").negotiate(&ALL), None);
+        assert_eq!(
+            ClientAccept::parse(b"GZIP ; Q=0.5, br;q=0").negotiate(&ALL),
+            Some(AcceptedEncoding::Gzip)
+        );
+        assert_eq!(
+            ClientAccept::parse(b"*;q=0.1, zstd;q=0").negotiate(&ALL),
+            Some(AcceptedEncoding::Brotli)
+        );
+        assert_eq!(
+            ClientAccept::parse(b"x-gzip").negotiate(&ALL),
+            Some(AcceptedEncoding::Gzip)
+        );
+        assert_eq!(
+            ClientAccept::parse(b"gzip, br").negotiate(&["gzip", "br"]),
+            Some(AcceptedEncoding::Gzip)
+        );
+        assert_eq!(
+            ClientAccept::parse(b"gzip;q=0.5, br").negotiate(&["gzip", "br"]),
+            Some(AcceptedEncoding::Brotli)
+        );
+        assert_eq!(ClientAccept::parse(b"br;q=0").negotiate(&ALL), None);
+        assert_eq!(
+            ClientAccept::parse(b"gzip;q=0, *").negotiate(&["gzip", "br"]),
+            Some(AcceptedEncoding::Brotli)
+        );
+        assert_eq!(ClientAccept::parse(b"*;q=0").negotiate(&ALL), None);
+        assert!(!ClientAccept::parse(b"identity;q=0").accepts_any());
+        assert!(!ClientAccept::parse(b"identity").accepts_any());
+        assert!(!ClientAccept::parse(&[0xff, 0xfe]).accepts_any());
+    }
+
+    // B-302: 設定で許可していない方式は（クライアントが受け付けても）選ばない
+    #[cfg(feature = "compression")]
+    #[test]
+    fn should_compress_only_picks_configured_encodings() {
+        let cfg = CompressionConfig {
+            enabled: true,
+            preferred_encodings: vec!["gzip".to_string()],
+            ..Default::default()
+        };
+        let pick = |ae: &[u8]| {
+            cfg.should_compress(
+                ClientAccept::parse(ae),
+                Some(b"text/html"),
+                Some(4096),
+                None,
+            )
+        };
+        assert_eq!(pick(b"zstd, br"), None);
+        assert_eq!(pick(b"zstd, gzip"), Some(AcceptedEncoding::Gzip));
+    }
+
+    // B-303: 長く一致した方を優先する（skip_types の image/ より compressible_types の image/svg+xml）
+    #[cfg(feature = "compression")]
+    #[test]
+    fn svg_is_compressed_despite_image_skip() {
+        let cfg = CompressionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let all = ClientAccept::ALL;
+        if cfg.compressible_types.iter().any(|t| t == "image/svg+xml") {
+            assert!(cfg
+                .should_compress(all, Some(b"image/svg+xml"), Some(4096), None)
+                .is_some());
+        }
+        assert!(cfg
+            .should_compress(all, Some(b"image/png"), Some(4096), None)
+            .is_none());
+    }
 }

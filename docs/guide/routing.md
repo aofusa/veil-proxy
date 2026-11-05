@@ -339,10 +339,13 @@ Both modes answer the same way on HTTP/1.1, HTTP/2 and HTTP/3:
   `Content-Range: bytes */<size>`. Full and partial responses carry `Accept-Ranges: bytes`.
 - `If-Range` with the current ETag (strong comparison) or the exact `Last-Modified` date keeps the range; otherwise the whole file
   is returned with `200`.
-- `HEAD` returns the same headers (including `Content-Length`) without a body.
+- `HEAD` returns the same headers (including `Content-Length`) without a body. Over HTTP/1.1, a `HEAD` whose `GET` would be
+  compressed is answered without `Content-Length` (the file is not read and compressed only to measure it).
 - With `[route.compression]` enabled, a compressible file is compressed when the client accepts an encoding. Compressed responses
-  carry a weak ETag (`W/"..."`) and `Vary: Accept-Encoding`, and ignore `Range` (as nginx's gzip module does). Requests without
-  `Accept-Encoding` still get ranges.
+  carry a weak ETag per encoding (`W/"...-br"`, `W/"...-gzip"`, `W/"...-zstd"`) and `Vary: Accept-Encoding`, and ignore `Range`
+  (as nginx's gzip module does). Conditional requests are compared with the ETag of the representation the request would get,
+  so a `304` carries the same ETag as the `200` it stands for. Requests without `Accept-Encoding` still get ranges. `416` also
+  carries `Vary: Accept-Encoding`.
 
 ### Proxy Configuration
 

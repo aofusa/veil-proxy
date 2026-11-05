@@ -71,6 +71,7 @@ GET /__metrics
 | `veil_grpc_stream_duration_seconds` | Histogram | method | 中継した gRPC の呼び出しの始まりから `grpc-status` のトレーラーまでの時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |
+| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm フィルタの失敗（`reason`: trap・fuel・timeout・instantiate・lifecycle・http_call_resume・unsupported_pause、`action`: `failure_policy` による rejected・continued） |
 
 ラベルの値は決まった範囲に収めます。クライアントが自由な値を送っても、新しい系列は増えません（系列はメモリとスクレイプの
 応答に残り続けるため）。

@@ -1,6 +1,6 @@
 # B-305: HTTP/1.1 の静的配信だけ、ルート自身ではなく前方一致した最初の登録ルートの dirfd で開く（入れ子のルートで別ルートのファイルを配り得る）
 
-**状態: 未修正・要実機確認（2026-11-05 起票。コードレビューで発見、確度 中）**
+**状態: 修正済み（v0.11.0）**
 
 ## 事象（コードの読み取り）
 
@@ -15,6 +15,12 @@
 - HTTP/1.1 もルート自身の dirfd（`open_beneath_in_root`）へ寄せ、3 プロトコルで同じ関数にする。[F-294](../features/F-294-precompressed-static-siblings.md) の兄弟の探索も最初からルート単位にする。
 - 実機確認: 入れ子の 2 つの File ルート（外側に `allowed_ips`）と内側の相対リンクで、HTTP/1.1・HTTP/2・HTTP/3 の結果を比べる。確認できたら優先度を上げる。
   回帰試験（統合試験）にする。Linux（openat2）・FreeBSD（capsicum）・その他（canonicalize の経路）。
+
+## 修正
+
+- 登録済みの静的ルート（Linux の `LINUX_ROOTS`・FreeBSD の capsicum の `STATIC_DIRS`）を深い順に並べ、HTTP/1.1 の「パスが前方一致したルート」探索が入れ子の内側のルートの dirfd を使う。内側のルートの相対シンボリックリンクで外側（別のルート）へ出られない。
+- 外側のルートの要求で内側のディレクトリを通るパスも内側の封じ込めになる（より厳しくなるだけ）。HTTP/2・HTTP/3 は従来どおり経路自身の dirfd。
+- 試験: `cache::static_file::tests::nested_root_link_cannot_escape_through_outer_root`。
 
 ## 関連
 

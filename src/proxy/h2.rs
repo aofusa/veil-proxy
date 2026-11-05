@@ -1377,14 +1377,32 @@ pub(super) async fn h2_finish_upstream_headers(
     status: u16,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
-) -> Vec<(Bytes, Bytes)> {
+) -> Result<Vec<(Bytes, Bytes)>, super::sendfile::HeadLocal> {
     security.apply_response_headers(&mut headers);
     #[cfg(feature = "wasm")]
-    let mut headers = apply_h2_wasm_response_headers(wasm_modules, status, headers).await;
+    let mut headers = apply_h2_wasm_response_headers(wasm_modules, status, headers).await?;
     #[cfg(not(feature = "wasm"))]
     let _ = status;
     crate::route_cors::apply_bytes(&mut headers, security);
-    headers
+    Ok(headers)
+}
+
+/// 応答ヘッダの段のローカルレスポンスを元の応答の代わりに送る（B-300）。戻り値 `(status, body_len)`。
+#[cfg(feature = "http2")]
+pub(super) async fn h2_emit_head_local(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    local: super::sendfile::HeadLocal,
+) -> (u16, u64) {
+    #[cfg(feature = "wasm")]
+    {
+        h2_emit_wasm_local_response(resp_tx, notify, local).await
+    }
+    #[cfg(not(feature = "wasm"))]
+    {
+        let _ = (resp_tx, notify);
+        match local {}
+    }
 }
 
 /// 完結した（頭+本体一括の）レスポンスをメッセージ化して送る。戻り値 `(status, body_len)`。
@@ -1655,9 +1673,6 @@ pub(super) async fn h2_dispatch(
                         .await;
                         return (st, sz);
                     }
-                    crate::wasm::FilterResult::Pause => {
-                        warn!("WASM module requested pause, but async operations are not yet supported");
-                    }
                     crate::wasm::FilterResult::Continue { headers, .. } => {
                         // F-133: 変更後ヘッダを上流リクエストへ反映する（下の ctx 差し替え）。
                         wasm_request_headers_override = Some(
@@ -1703,7 +1718,7 @@ pub(super) async fn h2_dispatch(
                     for (n, v) in h2_base_headers(false) {
                         headers.push((n, v));
                     }
-                    return h2_emit_full(
+                    let (st, sz) = h2_emit_full(
                         resp_tx,
                         notify,
                         resp.status_code,
@@ -1711,11 +1726,13 @@ pub(super) async fn h2_dispatch(
                         Bytes::from(resp.body),
                     )
                     .await;
-                }
-                crate::wasm::FilterResult::Pause => {
-                    warn!(
-                        "WASM module requested pause on request trailers, but async operations are not yet supported"
-                    );
+                    // ローカルレスポンスでも on_log を呼ぶ（B-300）
+                    crate::wasm::on_request_complete_async(
+                        wasm_engine.clone(),
+                        wasm_modules_to_apply.clone(),
+                    )
+                    .await;
+                    return (st, sz);
                 }
                 // F-133 調査結果: リクエストトレイラー自体が上流バックエンドへ転送される
                 // 経路が存在しない（`h2_proxy_h2c` は `h2c_client.send_request` に
@@ -1837,8 +1854,8 @@ pub(super) async fn h2_dispatch(
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
-        .map(|h| AcceptedEncoding::parse(&h.value))
-        .unwrap_or(AcceptedEncoding::Identity);
+        .map(|h| crate::config::ClientAccept::parse(&h.value))
+        .unwrap_or(crate::config::ClientAccept::NONE);
 
     let result = match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, _cache, _) => {
@@ -1891,9 +1908,16 @@ pub(super) async fn h2_dispatch(
                     Some(&data),
                 );
                 #[cfg(feature = "wasm")]
-                let header_store =
-                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, status, built_headers)
-                        .await;
+                let header_store = match apply_h2_wasm_response_headers(
+                    &wasm_modules_to_apply,
+                    status,
+                    built_headers,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(local) => return h2_emit_head_local(resp_tx, notify, local).await,
+                };
                 #[cfg(not(feature = "wasm"))]
                 let header_store = built_headers;
                 h2_emit_full(resp_tx, notify, status, header_store, response_body).await
@@ -2152,7 +2176,7 @@ pub(super) async fn h2_proxy(
     upstream_group: &Arc<UpstreamGroup>,
     buffering_full: bool,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     prefix: &[u8],
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
@@ -2618,7 +2642,7 @@ pub(super) async fn h2_proxy_http(
     addr: &str,
     request: Vec<u8>,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
@@ -2728,7 +2752,7 @@ pub(super) async fn h2_proxy_https(
     sni: &str,
     request: Vec<u8>,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     tls_profile: crate::upstream_tls::TlsProfile,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
@@ -2862,7 +2886,7 @@ pub(super) async fn h2_proxy_h2c(
     path: &[u8],
     security: &SecurityConfig,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -2943,7 +2967,7 @@ pub(super) async fn h2_emit_upstream_response(
     target: &ProxyTarget,
     started: Instant,
     h2c_resp: http2::upstream_mux::H2cResponse,
-    compress: Option<(&CompressionConfig, AcceptedEncoding)>,
+    compress: Option<(&CompressionConfig, crate::config::ClientAccept)>,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
@@ -3018,14 +3042,18 @@ pub(super) async fn h2_emit_upstream_response(
     for (n, v) in h2_base_headers(true) {
         header_store.push((n, v));
     }
-    let header_store = h2_finish_upstream_headers(
+    let header_store = match h2_finish_upstream_headers(
         header_store,
         h2c_resp.status,
         security,
         #[cfg(feature = "wasm")]
         wasm_modules,
     )
-    .await;
+    .await
+    {
+        Ok(h) => h,
+        Err(local) => return h2_emit_head_local(resp_tx, notify, local).await,
+    };
 
     let has_body = !h2c_resp.body.is_empty();
     let has_trailers = !h2c_resp.trailers.is_empty();
@@ -3100,7 +3128,7 @@ pub(super) async fn h2_emit_upstream_response(
 pub(super) async fn h2_relay_backend_response<B>(
     backend: &mut B,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
@@ -3342,14 +3370,22 @@ where
                 // ヘッダー抽出（上のループ）が済んだ時点で `data`（= `response_buf`/
                 // `body` の借用元）はもう参照されないため、ここで `Bytes` へ消費
                 // 変換してゼロコピーでボディを渡す（F-165 R4）。
-                let headers = h2_finish_upstream_headers(
+                let headers = match h2_finish_upstream_headers(
                     headers,
                     status,
                     security,
                     #[cfg(feature = "wasm")]
                     wasm_modules,
                 )
-                .await;
+                .await
+                {
+                    Ok(h) => h,
+                    // 上流の本文は読まないので上流の接続は戻さない（B-300）
+                    Err(local) => {
+                        let (s, sz) = h2_emit_head_local(resp_tx, notify, local).await;
+                        return (s, sz, false);
+                    }
+                };
                 let initial_body = data.into_body_bytes(body_start);
                 let (sent, ok) = h2_stream_body_cl(
                     resp_tx,
@@ -3392,14 +3428,21 @@ where
                 ));
             }
             // 同上（F-165 R4）: ヘッダー抽出後に `data` を `Bytes` へ消費変換する。
-            let headers = h2_finish_upstream_headers(
+            let headers = match h2_finish_upstream_headers(
                 headers,
                 status,
                 security,
                 #[cfg(feature = "wasm")]
                 wasm_modules,
             )
-            .await;
+            .await
+            {
+                Ok(h) => h,
+                Err(local) => {
+                    let (s, sz) = h2_emit_head_local(resp_tx, notify, local).await;
+                    return (s, sz, false);
+                }
+            };
             let initial_body = data.into_body_bytes(body_start);
             let sent =
                 h2_stream_body_chunked(resp_tx, notify, status, headers, backend, initial_body)
@@ -3501,14 +3544,22 @@ where
                 Bytes::copy_from_slice(len.format(response_body.len()).as_bytes()),
             ));
         }
-        let headers = h2_finish_upstream_headers(
+        let headers = match h2_finish_upstream_headers(
             headers,
             status,
             security,
             #[cfg(feature = "wasm")]
             wasm_modules,
         )
-        .await;
+        .await
+        {
+            Ok(h) => h,
+            // 本文は読み切っている
+            Err(local) => {
+                let (s, sz) = h2_emit_head_local(resp_tx, notify, local).await;
+                return (s, sz, backend_reusable && !parsed.is_connection_close);
+            }
+        };
         let (status2, sent) =
             h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
         (
@@ -3892,7 +3943,11 @@ pub(super) async fn h2_sendfile(
         None,
     );
     #[cfg(feature = "wasm")]
-    let header_store = apply_h2_wasm_response_headers(wasm_modules, status, built_headers).await;
+    let header_store =
+        match apply_h2_wasm_response_headers(wasm_modules, status, built_headers).await {
+            Ok(h) => h,
+            Err(local) => return h2_emit_head_local(resp_tx, notify, local).await,
+        };
     #[cfg(not(feature = "wasm"))]
     let header_store = built_headers;
     h2_emit_full(resp_tx, notify, status, header_store, response_body).await
@@ -3989,10 +4044,10 @@ pub(super) async fn h2_relay_h2_streaming(
         ctx.headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
-            .map(|h| AcceptedEncoding::parse(&h.value))
-            .unwrap_or(AcceptedEncoding::Identity)
+            .map(|h| crate::config::ClientAccept::parse(&h.value))
+            .unwrap_or(crate::config::ClientAccept::NONE)
     } else {
-        AcceptedEncoding::Identity
+        crate::config::ClientAccept::NONE
     };
     let is_grpc = ctx
         .headers
@@ -4129,7 +4184,7 @@ pub(super) async fn h2_relay_h2_streaming(
                             .find(|(n, _)| n.eq_ignore_ascii_case(name))
                             .map(|(_, v)| v.clone())
                     };
-                    let encoding = if client_encoding == AcceptedEncoding::Identity
+                    let encoding = if !client_encoding.accepts_any()
                         || is_grpc
                         || s == 204
                         || s == 304
@@ -4382,8 +4437,8 @@ pub(super) async fn h2_serve_streaming(
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
-        .map(|h| AcceptedEncoding::parse(&h.value))
-        .unwrap_or(AcceptedEncoding::Identity);
+        .map(|h| crate::config::ClientAccept::parse(&h.value))
+        .unwrap_or(crate::config::ClientAccept::NONE);
 
     server.acquire();
     let target = &server.target;
@@ -4511,7 +4566,7 @@ pub(super) async fn h2_run_streaming_upload<B>(
     request: Vec<u8>,
     req_rx: &crate::stream_channel::Receiver<Bytes>,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,

@@ -1022,11 +1022,6 @@ pub(super) async fn handle_requests(
                                     }
                                     continue;
                                 }
-                                crate::wasm::FilterResult::Pause => {
-                                    // 非同期処理待ち（現在は未実装）
-                                    warn!("WASM module requested pause, but async operations are not yet supported");
-                                    headers_for_proxy
-                                }
                             }
                         } else {
                             headers_for_proxy
@@ -1577,7 +1572,7 @@ pub(super) async fn handle_backend(
             let header = sendfile::build_h1_static_head(
                 &plan,
                 data.len(),
-                body.len() as u64,
+                Some(body.len() as u64),
                 &mime_type,
                 Some(&data.validators),
                 vary,
@@ -1585,7 +1580,15 @@ pub(super) async fn handle_backend(
             );
             // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
             #[cfg(feature = "wasm")]
-            let mut header = sendfile::h1_wasm_response_head(header, status, &wasm_modules).await;
+            let mut header =
+                match sendfile::h1_wasm_response_head(header, status, &wasm_modules).await {
+                    Ok(h) => h,
+                    Err(resp) => {
+                        return sendfile::write_h1_wasm_local(&mut tls_stream, &resp, sreq.head)
+                            .await
+                            .map(|(st, n)| (tls_stream, st, n, client_wants_close));
+                    }
+                };
             #[cfg(not(feature = "wasm"))]
             let mut header = header;
 

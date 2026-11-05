@@ -47,7 +47,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 let state = caller.data();
                 if !state.http_ctx.capabilities.allow_http_calls {
-                    ftlog::warn!(
+                    crate::logging::log_throttled!(
+                        warn,
                         "[wasm:{}] HTTP call denied: allow_http_calls=false",
                         state.http_ctx.plugin_name
                     );
@@ -58,7 +59,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 if state.http_ctx.pending_http_calls.len()
                     >= state.http_ctx.capabilities.max_http_calls
                 {
-                    ftlog::warn!(
+                    crate::logging::log_throttled!(
+                        warn,
                         "[wasm:{}] HTTP call denied: max_http_calls exceeded",
                         state.http_ctx.plugin_name
                     );
@@ -76,7 +78,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 let state = caller.data();
                 if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
-                    ftlog::warn!(
+                    crate::logging::log_throttled!(
+                        warn,
                         "[wasm:{}] HTTP call to '{}' denied: not in allowed_upstreams",
                         state.http_ctx.plugin_name,
                         upstream

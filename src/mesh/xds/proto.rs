@@ -1352,7 +1352,8 @@ pub struct WasmPluginConfig {
     pub configuration: Option<Any>,
     #[prost(bool, tag = "5")]
     pub fail_open: bool,
-    /// 0 = FAIL_CLOSED, 1 = FAIL_OPEN, 2 = FAIL_RELOAD
+    /// `envoy.extensions.wasm.v3.FailurePolicy`: 0 = UNSPECIFIED（`fail_open` に従う）, 1 = FAIL_RELOAD,
+    /// 2 = FAIL_CLOSED, 3 = FAIL_OPEN
     #[prost(int32, tag = "7")]
     pub failure_policy: i32,
 }

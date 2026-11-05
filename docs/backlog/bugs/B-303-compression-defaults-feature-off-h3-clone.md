@@ -1,6 +1,6 @@
 # B-303: 既定の設定で SVG を圧縮しない、`compression` feature の無いビルドで圧縮を有効にすると壊れた応答になる、HTTP/3 が要求ごとに圧縮の設定を丸ごと複製する
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見。行番号は f8dc80de）**
+**状態: 修正済み（v0.11.0）**
 
 ## 事象（コードの読み取り）
 
@@ -22,6 +22,14 @@
 3. ルートごとの HTTP/3 の圧縮設定をロード時に解決して `Arc` で持つ（F-148/F-159 と同じ）。
 4. memory の圧縮本文のキーに方式・レベルを含める。
 - 試験: SVG が既定で圧縮される、feature 無しのビルドで圧縮の設定が警告になり応答が壊れない（`--no-default-features` の統合試験）、allocs/req（HTTP/3）。
+
+## 修正
+
+1. `compressible_types` と `skip_types` は長く一致した方が勝つ（`image/svg+xml` は `image/` に勝つ）。
+2. `compression` feature の無いビルドで `enabled = true` はロード時に警告し（`CompressionConfig::warn_if_unbuilt`）、`should_compress` は常に `None`（壊れた本文・502 を返さない）。
+3. `resolve_http3_compression_config` は `Arc<CompressionConfig>` を受けて返し、HTTP/3 用に重ねた設定を経路の設定の中（`H3Resolved` の `OnceLock`）に 1 回だけ作る。要求ごとの深い複製は無い（どちらも無効なら参照カウントだけ）。
+4. `mode = "memory"` の圧縮本文は作ったときのレベルを持ち、違うレベル（HTTP/3 専用の設定）の要求はその要求だけ圧縮する。
+- 試験: `svg_is_compressed_despite_image_skip`・`should_compress_only_picks_configured_encodings`。
 
 ## 関連
 

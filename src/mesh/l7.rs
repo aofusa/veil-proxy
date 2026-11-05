@@ -258,14 +258,20 @@ impl Forward {
         &self.table.vhosts[self.vh]
     }
 
-    /// 応答ヘッダの段の Wasm のフィルタ（無ければ何もしない）。
-    pub async fn response_filters(&self, status: u16, headers: &mut Vec<(Bytes, Bytes)>) {
+    /// 応答ヘッダの段の Wasm のフィルタ（無ければ何もしない）。プラグインのローカル応答（`failure_policy` の
+    /// 拒否を含む）は `Err`。呼び出し元は上流の応答の代わりにそれを返す（B-300）。
+    pub async fn response_filters(
+        &self,
+        status: u16,
+        headers: &mut Vec<(Bytes, Bytes)>,
+    ) -> Result<(), LocalReply> {
         #[cfg(feature = "wasm")]
         if !self.wasm.is_empty() {
-            super::wasm::on_response(&self.wasm, status, headers).await;
+            return super::wasm::on_response(&self.wasm, status, headers).await;
         }
         #[cfg(not(feature = "wasm"))]
         let _ = (status, headers);
+        Ok(())
     }
 }
 

@@ -613,8 +613,8 @@ impl H3BufferedTask {
 
         // クライアントの Accept-Encoding を解析
         let client_encoding = accept_encoding
-            .map(AcceptedEncoding::parse)
-            .unwrap_or(AcceptedEncoding::Identity);
+            .map(crate::config::ClientAccept::parse)
+            .unwrap_or(crate::config::ClientAccept::NONE);
 
         let method: &[u8] = method.unwrap_or(b"GET");
         let path: &[u8] = path.unwrap_or(b"/");
@@ -965,9 +965,6 @@ impl H3BufferedTask {
                             // （`*wasm_modules_to_apply` は既にセット済み）。
                             return Ok(());
                         }
-                        crate::wasm::FilterResult::Pause => {
-                            warn!("WASM module requested pause, but async operations are not yet supported");
-                        }
                         crate::wasm::FilterResult::Continue {
                             headers: modified, ..
                         } => {
@@ -1262,7 +1259,7 @@ impl H3BufferedTask {
         // 上流接続プール（B-74 の H2C_POOL・B-104 の HTTP/1.1 プール）の max_idle/idle_timeout。
         security: &SecurityConfig,
         compression: &CompressionConfig,
-        client_encoding: AcceptedEncoding,
+        client_encoding: crate::config::ClientAccept,
         method: &[u8],
         req_path: &[u8],
         prefix: &[u8],
@@ -1537,9 +1534,29 @@ impl H3BufferedTask {
                 #[cfg(feature = "wasm")]
                 if let Some(modules) = wasm_modules {
                     if !modules.is_empty() {
-                        resp_header_store =
-                            apply_h3_wasm_response_headers(modules, status_code, resp_header_store)
-                                .await;
+                        match apply_h3_wasm_response_headers(
+                            modules,
+                            status_code,
+                            resp_header_store,
+                        )
+                        .await
+                        {
+                            Ok(h) => resp_header_store = h,
+                            Err(resp) => {
+                                let resp_headers: Vec<(&[u8], &[u8])> = resp
+                                    .headers
+                                    .iter()
+                                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                    .collect();
+                                self.send_response(
+                                    resp.status_code,
+                                    &resp_headers,
+                                    Some(Bytes::copy_from_slice(&resp.body)),
+                                )
+                                .await?;
+                                return Ok((resp.status_code, resp.body.len()));
+                            }
+                        }
                     }
                 }
 
@@ -1870,7 +1887,24 @@ impl H3BufferedTask {
                 .iter()
                 .map(|(k, v)| (k.to_vec(), v.to_vec()))
                 .collect();
-            let store = apply_h3_wasm_response_headers(modules, status, store).await;
+            let store = match apply_h3_wasm_response_headers(modules, status, store).await {
+                Ok(s) => s,
+                // 応答ヘッダの段のローカルレスポンス（B-300）
+                Err(resp) => {
+                    let resp_headers: Vec<(&[u8], &[u8])> = resp
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    self.send_response(
+                        resp.status_code,
+                        &resp_headers,
+                        Some(Bytes::copy_from_slice(&resp.body)),
+                    )
+                    .await?;
+                    return Ok((resp.status_code, resp.body.len()));
+                }
+            };
             headers = store
                 .into_iter()
                 .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))

@@ -1,6 +1,6 @@
 # B-298: メッシュの Wasm の `failure_policy` の番号を読み違え、FAIL_RELOAD が fail open、FAIL_OPEN が fail closed になる
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見）**
+**状態: 修正済み（2026-11-05、v0.11.0）**
 
 ## 事象
 
@@ -18,6 +18,10 @@
 
 - 対応を純粋な関数へ出し、明示の `failure_policy` を非推奨の `fail_open` より優先する（[F-293](../features/F-293-wasm-failure-policy.md) の対応表）。
   `proto.rs` のコメントを直す。4 × 2 の全組み合わせの単体試験。
+
+## 修正
+
+- `FailurePolicy::from_envoy`（UNSPECIFIED は `fail_open` に従う・1=FAIL_RELOAD・2=FAIL_CLOSED・3=FAIL_OPEN）を `xds/translate.rs` で使い、読み込めないモジュールを飛ばすのは fail open のときだけにした。`proto.rs` のコメントも直した。8 通りの対応を単体試験にした。
 
 ## 関連
 

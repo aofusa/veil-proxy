@@ -13,11 +13,13 @@
 | **複数アルゴリズム対応** | Gzip、Brotli、Zstd、Deflateをサポート |
 | **Content-Typeフィルタリング** | text/HTML/JSON等のみ圧縮 |
 | **最小サイズ閾値** | 小さなレスポンスは圧縮スキップ |
-| **Accept-Encodingネゴシエーション** | 最適なエンコーディングを自動選択 |
+| **Accept-Encodingネゴシエーション** | `preferred_encodings` の中からクライアントが受け付ける q 値の最も高い方式を選ぶ（同点は `preferred_encodings` の順。`q=0` はその方式を拒否、`*` は挙げていない方式すべて、名前の大文字小文字は区別しない、`x-gzip` は gzip とみなす） |
 
 ### 有効化
 
 圧縮はデフォルトで**無効**です（kTLS最適化のゼロコピーsendfileを維持）。
+圧縮には `compression` feature（`full` に含まれる）付きのビルドが要ります。無いビルドで `enabled = true` にするとロード時に警告し、
+応答は圧縮せずに送ります。
 ルートごとに `compression` セクションで有効化します：
 
 ```toml
@@ -50,7 +52,7 @@ url = "http://localhost:8080"
 | `zstd_level` | Zstd圧縮レベル（1-22） | 3 |
 | `min_size` | 圧縮する最小サイズ（バイト） | 1024 |
 | `compressible_types` | 圧縮対象のMIMEタイプ（プレフィックスマッチ） | text/*, application/json等 |
-| `skip_types` | スキップするMIMEタイプ（プレフィックスマッチ） | image/*, video/*, audio/*等 |
+| `skip_types` | スキップするMIMEタイプ（プレフィックスマッチ）。両方に一致したら長く一致した方が勝つ（`compressible_types` の `image/svg+xml` はここの `image/` に勝つ） | image/*, video/*, audio/*等 |
 
 ### 圧縮レベルガイドライン
 

@@ -11,7 +11,7 @@ Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1
 - **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
 - **AOT Compilation & Auto-Cache**: Modules are AOT-compiled; a `.cwasm` sidecar is generated next to each `.wasm` on first load and reused via `deserialize` on subsequent startups (invalidated automatically when the `.wasm` is newer or the wasmtime version changes; falls back to recompilation on any error). Explicit `.cwasm` paths are also supported.
 - **Pooling Allocator**: High-speed instance creation
-- **Async Execution (no Head-of-Line blocking)**: Modules run on wasmtime async support with fuel-based cooperative yielding (every ~10k instructions), so a CPU-heavy filter cannot stall the io_uring worker's other I/O
+- **Async Execution (no Head-of-Line blocking)**: Modules run on wasmtime async support with fuel-based cooperative yielding (about every millisecond of guest CPU time, `yield_interval_us`), so a CPU-heavy filter cannot stall the io_uring worker's other I/O
 - **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
 - **Optional Pulley Interpreter** (`[wasm] interpreter = true`, F-135): runs Wasm through wasmtime's Pulley portable-bytecode interpreter instead of the Cranelift native JIT, emitting no native code at all. Useful on hosts with W^X constraints or where executable `mmap` cannot be granted. Slower than the native JIT. Default is `false` (Cranelift JIT). The AOT sidecar cache uses a distinct filename (`.pulley.cwasm`) so JIT and Pulley builds never fight over — or invalidate — the same cache file. **On OpenBSD (any arch), NetBSD (any arch), and FreeBSD aarch64 this setting is always ignored and Pulley is always used** (B-52/B-55; explicitly setting `interpreter = false` logs a startup warning and is otherwise ignored)
 - **HTTP/3 parity with HTTP/1.1/HTTP/2** (F-132): the HTTP/3 path now runs the full filter lifecycle — `on_log` fires from every exit point (including early `LocalResponse` returns), `Backend::File` static-serving routes also get the `on_response_headers` filter applied, and `Backend::Proxy` routes run request/response body filters (`on_request_body`/`on_response_body`, applied once with `end_of_stream=true` since HTTP/3 already buffers the whole body when a WASM module is configured). A response body rewrite updates `content-length` to match, avoiding the H3 message-framing error nghttp3 raises on a mismatch/duplicate.
@@ -141,6 +141,11 @@ reload); the request path only clones an `Arc`.
 | `on_http_response_body` | yes | yes | yes |
 | `on_log` | yes | yes | yes |
 
+A local response (`send_local_response`) from any request phase or from `on_http_response_headers` replaces the
+upstream response; veil does not read the rest of the upstream response and does not reuse that upstream connection.
+A local response from `on_http_response_trailers` cannot be sent because the response head is already out; the
+original trailers are kept. `on_log` runs after a local response too.
+
 The request-body phase runs when the request has a body and at least one of the route's modules has
 `allow_request_body_read = true`. veil reads the whole body first (Content-Length or chunked, up to
 `max_request_body_size` / `max_chunked_body_size`; larger bodies get `413`) and calls
@@ -222,17 +227,47 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+| `max_execution_time_ms` | CPU budget of one callback in milliseconds (measured in fuel, about 1M per millisecond). The startup callbacks of a new instance (`_start`, `proxy_on_vm_start`, `proxy_on_configure`) get their own budget | 100 |
 | `yield_interval_us` | How often a running callback yields the worker to other requests (approximate microseconds, measured in fuel). Smaller values shorten the wait of other requests on the same worker behind a CPU-heavy filter, but every callback pauses more often, more `instance_reuse` instances are open at once, and each request costs more | 1000 |
 | `interpreter` | Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135). Always forced to `true` on OpenBSD (B-52) | false |
 | `grpc_connect_timeout_ms` | Upper bound on connecting (TCP and TLS) to a gRPC upstream for `proxy_grpc_call`/`proxy_grpc_stream`. A longer guest `timeout_ms` still gives up connecting after this time, so an unreachable upstream does not stall every plugin's gRPC calls. At most 4096 calls and 4096 stream messages wait for the gRPC thread; beyond that the host call returns `InternalFailure` | 5000 |
 | `http_call_max_timeout_ms` | Upper bound on the `timeout_ms` a plugin passes to `proxy_http_call` (a negative value counts as 0) | 60000 |
 | `shared_data_max_keys` | Maximum number of keys in one module's shared data; `proxy_set_shared_data` with a new key beyond it returns `InternalFailure` (existing keys can still be updated) | 100000 |
+| `failure_policy` | What to do when a filter fails: `fail_closed`, `fail_open` or `fail_reload` (see [Failure Handling](#failure-handling)). A module's own `failure_policy` in `[[wasm.modules]]` overrides it | `fail_closed` |
 
-A callback that traps or runs past its limits (the CPU budget from `max_execution_time_ms`, or about one second
-of wall time including the time it yielded to other requests) is logged as an error and the request continues as
-if the filter had not run (fail open). A security filter such as a WAF should finish well within these limits even
-when the worker is busy; the mesh's `WasmPlugin` with `failure_policy: FAIL_CLOSED` answers 503 instead.
+### Failure Handling
+
+A filter fails when a callback traps (a panic in the SDK, `proc_exit`, `unreachable`), runs out of its CPU budget
+(`max_execution_time_ms`), runs past about one second of wall time including the time it yielded to other requests,
+when no instance can be created (all `total_memories` slots stay busy for about 130 ms), when the startup callbacks
+of a new instance fail, when the `proxy_on_http_call_response` that resumes a paused request traps, or when a
+callback returns `Pause` with nothing veil can wait for (see below). `failure_policy` decides what happens to the
+request:
+
+| `failure_policy` | Request | Instance |
+|---|---|---|
+| `fail_closed` (default) | `503` (gRPC clients see `UNAVAILABLE`) | discarded; the next request gets a new one |
+| `fail_open` | The failed module is skipped and the request continues with the next module. Header changes the module made before it failed are kept | discarded |
+| `fail_reload` | `503` | discarded, and every reused instance of the module (`instance_reuse`) is recreated before its next use |
+
+Unlike Envoy's `FAIL_CLOSED`, one failed request does not make later requests fail: veil always starts the next
+request on a healthy instance. A local response the filter set before it failed is always sent, whatever the policy.
+Each failure counts in `veil_wasm_failures_total{filter, phase, reason, action}` (`reason` is `trap`, `fuel`,
+`timeout`, `instantiate`, `lifecycle`, `http_call_resume` or `unsupported_pause`; `action` is `rejected` or
+`continued`) and is logged as a warning (rate-limited).
+
+`Pause` is honored when veil can wait for what the filter waits for: a `dispatch_http_call` made in any phase
+(resolved inline, see [External Service Integration](#external-service-integration-http-calls)), or the request body
+when `on_http_request_headers` returns `Pause` before the body (`end_of_stream = false`) and the module reads the body
+(`allow_request_body_read`); the same for the response. A `Pause` that waits for a `proxy_grpc_call`/`proxy_grpc_stream`,
+or that has nothing to wait for, is an `unsupported_pause` failure.
+
+At startup and on reload veil runs each module's `_start`, `proxy_on_vm_start` and `proxy_on_configure` once. If one
+traps or returns `false` (for example the plugin rejects its configuration), the configuration is rejected: startup
+fails, and a reload keeps the previous configuration.
+
+Versions before 0.11.0 always continued after a failure (as `fail_open` does now, without the metric). Set
+`failure_policy = "fail_open"` in `[wasm.defaults]` to keep that behavior.
 
 #### Pooling Allocator Settings
 
@@ -265,7 +300,13 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 | `allow_upstream_data_write` | Modify L4 upstream connection data (F-133) | false |
 | `allow_send_local_response` | Send local response | false |
 | `allow_http_calls` | HTTP external calls | false |
-| `allowed_upstreams` | Allowed upstreams | [] |
+| `allowed_upstreams` | Upstreams `proxy_http_call`/`proxy_grpc_call` may call. Empty allows every upstream group | [] |
+
+A host function called without its capability returns `NotAllowed`. SDKs that unwrap the status (the Rust SDK
+`proxy-wasm` does for most calls) then panic, the callback traps, and the request is handled by `failure_policy`
+(by default `503`). veil warns at load time when a module imports `proxy_send_local_response`, `proxy_http_call`,
+`proxy_grpc_call`/`proxy_grpc_stream`, `proxy_define_metric`, the shared data functions or `proxy_set_property`
+without the matching capability.
 
 ### Developing Extensions with Rust
 
@@ -376,7 +417,7 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 ### External Service Integration (HTTP Calls)
 
 Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis).
-When a filter returns `Action::Pause` after dispatching a call, Veil resolves the upstream
+When a filter returns `Action::Pause` after dispatching a call (in any HTTP phase), Veil resolves the upstream
 call inline on the request path — the blocking HTTP client runs on a dedicated offload thread
 so the event loop is never blocked — and resumes the same WASM instance via
 `proxy_on_http_call_response`. A runnable example lives at

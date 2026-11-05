@@ -91,7 +91,9 @@ pub fn init(config: &WasmConfig) -> anyhow::Result<FilterEngine> {
     host::grpc_executor::set_connect_timeout_ms(config.grpc_connect_timeout_ms);
     http_executor::set_max_timeout_ms(config.http_call_max_timeout_ms);
     shared_data::set_max_keys(config.shared_data_max_keys);
-    FilterEngine::new(config)
+    let engine = FilterEngine::new(config)?;
+    engine.validate()?;
+    Ok(engine)
 }
 
 // ============================================================================

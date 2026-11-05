@@ -35,6 +35,8 @@ pub struct LoadedModule {
     pub data_files: super::context::PluginData,
     /// shared data の表（同じ名前のモジュールで共有し、リロードでも引き継ぐ。B-179）
     pub shared_data: Arc<super::shared_data::SharedData>,
+    /// 失敗したときの扱い（F-293。モジュールの設定 → `[wasm.defaults]` の順にロード時に決める）
+    pub failure_policy: super::types::FailurePolicy,
 }
 
 /// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
@@ -55,6 +57,59 @@ fn spawn_epoch_ticker(engine: &Engine) {
         });
     if let Err(e) = spawned {
         ftlog::warn!("[wasm] failed to start the epoch ticker thread: {}", e);
+    }
+}
+
+/// import する host 関数と、それを使うのに要る capability（B-299）。ヘッダ・本文の読み書きは引数の
+/// map の種類で決まるので、import からは判断できない（ここに載せない）
+const IMPORT_CAPABILITIES: &[(&str, &str, fn(&ModuleCapabilities) -> bool)] = &[
+    (
+        "proxy_send_local_response",
+        "allow_send_local_response",
+        |c| c.allow_send_local_response,
+    ),
+    ("proxy_http_call", "allow_http_calls", |c| {
+        c.allow_http_calls
+    }),
+    ("proxy_dispatch_http_call", "allow_http_calls", |c| {
+        c.allow_http_calls
+    }),
+    ("proxy_grpc_call", "allow_http_calls", |c| {
+        c.allow_http_calls
+    }),
+    ("proxy_grpc_stream", "allow_http_calls", |c| {
+        c.allow_http_calls
+    }),
+    ("proxy_define_metric", "allow_metrics", |c| c.allow_metrics),
+    ("proxy_set_shared_data", "allow_shared_data", |c| {
+        c.allow_shared_data
+    }),
+    ("proxy_get_shared_data", "allow_shared_data", |c| {
+        c.allow_shared_data
+    }),
+    ("proxy_set_property", "allow_property_write", |c| {
+        c.allow_property_write
+    }),
+];
+
+/// モジュールが import する host 関数に要る capability が無ければ、ロード時に警告する（B-299）。
+/// 権限の無い呼び出しは `NotAllowed` を返し、それを unwrap する SDK（proxy-wasm の Rust SDK 等）は
+/// トラップする＝要求ごとに `failure_policy` の失敗になる。
+fn warn_missing_capabilities(name: &str, module: &Module, caps: &ModuleCapabilities) {
+    for import in module.imports() {
+        if let Some((func, cap, _)) = IMPORT_CAPABILITIES
+            .iter()
+            .find(|(f, _, granted)| *f == import.name() && !granted(caps))
+        {
+            ftlog::warn!(
+                "[wasm:{}] the module imports {} but {} is not granted; such calls fail with \
+                 NotAllowed, and SDKs that unwrap the status trap (the request is then handled \
+                 by failure_policy)",
+                name,
+                func,
+                cap
+            );
+        }
     }
 }
 
@@ -103,7 +158,7 @@ impl ModuleRegistry {
 
         // Load all modules
         for module_config in &config.modules {
-            registry.load_module(module_config)?;
+            registry.load_module(module_config, config.defaults.failure_policy)?;
         }
 
         Ok(registry)
@@ -204,7 +259,11 @@ impl ModuleRegistry {
     }
 
     /// Load a module
-    fn load_module(&mut self, config: &ModuleConfig) -> anyhow::Result<()> {
+    fn load_module(
+        &mut self,
+        config: &ModuleConfig,
+        default_policy: super::types::FailurePolicy,
+    ) -> anyhow::Result<()> {
         // Check if file exists
         let path = Path::new(&config.path);
         if !path.exists() {
@@ -231,6 +290,7 @@ impl ModuleRegistry {
 
         // Create InstancePre for fast instantiation
         let instance_pre = linker.instantiate_pre(&module)?;
+        warn_missing_capabilities(&config.name, &module, &config.capabilities);
 
         // F-271: data_files は設定ロード時に読む（読むのは設定に書いたパスだけ）
         let mut data_files = std::collections::HashMap::new();
@@ -260,6 +320,7 @@ impl ModuleRegistry {
             pool: super::instance_pool::InstancePool::new(self.pool_per_thread),
             data_files: Arc::new(data_files),
             shared_data: super::shared_data::for_module(&config.name),
+            failure_policy: config.failure_policy.unwrap_or(default_policy),
         };
 
         ftlog::info!(
@@ -367,6 +428,11 @@ impl ModuleRegistry {
     /// Get a loaded module by name
     pub fn get_module(&self, name: &str) -> Option<Arc<LoadedModule>> {
         self.modules.get(name).cloned()
+    }
+
+    /// 読み込んだモジュール（起動時の検証用。B-301）
+    pub(crate) fn modules(&self) -> impl Iterator<Item = &Arc<LoadedModule>> {
+        self.modules.values()
     }
 
     /// Get the Wasmtime engine

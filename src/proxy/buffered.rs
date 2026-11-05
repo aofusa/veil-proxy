@@ -52,7 +52,7 @@ pub(super) async fn proxy_request_buffered<R>(
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     // F-285: Some なら溜めた本文へ Wasm の応答本文のフェーズをかけ、その後で（設定があれば）圧縮する
-    #[cfg(feature = "wasm")] wasm_body: Option<(&CompressionConfig, AcceptedEncoding)>,
+    #[cfg(feature = "wasm")] wasm_body: Option<(&CompressionConfig, crate::config::ClientAccept)>,
 ) -> Option<(u16, u64, bool, bool)>
 where
     R: AsyncReader
@@ -132,7 +132,7 @@ where
         )) => {
             // ステータス行を HTTP/1.1 に直し、応答ヘッダの方針・Alt-Svc・Wasm・CORS をかける（他の HTTP/1.1 の
             // 経路と同じ。以前は上流の head をそのまま返していた。B-267・B-268・B-271）
-            let mut headers_data = super::compress::finish_h1_upstream_head(
+            let head = super::compress::finish_h1_upstream_head(
                 &headers_data,
                 status_code,
                 security,
@@ -146,6 +146,15 @@ where
             if matches!(body_result, BufferedBodyResult::Failed) {
                 return None;
             }
+            let mut headers_data = match head {
+                Ok(h) => h,
+                // 応答ヘッダの段のローカルレスポンス（B-300。上流の本文は読み切っている）
+                Err(resp) => {
+                    return super::sendfile::write_h1_wasm_local(client_stream, &resp, is_head)
+                        .await
+                        .map(|(st, n)| (st, n, backend_wants_keep_alive, false));
+                }
+            };
             #[cfg(feature = "wasm")]
             let mut body_result = body_result;
             // F-285: Wasm の応答本文のフェーズ（メモリに溜まった本文だけ。ディスクへ溢れた本文はかけずに流す）

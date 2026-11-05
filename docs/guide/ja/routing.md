@@ -336,9 +336,12 @@ path = "/var/www/html"
   複数の範囲の要求は最初の範囲だけを返します。ファイルの外の範囲には `Content-Range: bytes */<大きさ>` 付きの
   `416 Range Not Satisfiable` を返します。全体と範囲の応答には `Accept-Ranges: bytes` が付きます。
 - `If-Range` が今の ETag（強い比較）か `Last-Modified` と同じ日時なら範囲を返し、違えばファイル全体を `200` で返します。
-- `HEAD` には同じヘッダ（`Content-Length` を含む）を本文なしで返します。
-- `[route.compression]` が有効なら、圧縮できる型のファイルはクライアントが受け付ける方式で圧縮します。圧縮した応答は弱い ETag
-  （`W/"..."`）と `Vary: Accept-Encoding` を付け、`Range` は見ません（nginx の gzip と同じ）。`Accept-Encoding` の無い要求には範囲を返します。
+- `HEAD` には同じヘッダ（`Content-Length` を含む）を本文なしで返します。HTTP/1.1 で `GET` なら圧縮する `HEAD` には
+  `Content-Length` を付けません（長さを測るためだけにファイルを読んで圧縮しません）。
+- `[route.compression]` が有効なら、圧縮できる型のファイルはクライアントが受け付ける方式で圧縮します。圧縮した応答は方式ごとの弱い ETag
+  （`W/"...-br"`・`W/"...-gzip"`・`W/"...-zstd"`）と `Vary: Accept-Encoding` を付け、`Range` は見ません（nginx の gzip と同じ）。
+  条件付き要求はその要求が受け取る表現の ETag と比べるので、`304` は代わりになる `200` と同じ ETag を持ちます。`Accept-Encoding` の
+  無い要求には範囲を返します。`416` にも `Vary: Accept-Encoding` を付けます。
 
 ### プロキシ設定
 

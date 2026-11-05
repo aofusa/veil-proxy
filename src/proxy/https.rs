@@ -86,7 +86,7 @@ pub(super) async fn proxy_https_pooled(
     security: &SecurityConfig,
     compression: &CompressionConfig,
     buffering_config: &buffering::BufferingConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     pool_key: &str,
     request: Vec<u8>,
     content_length: usize,
@@ -166,8 +166,7 @@ pub(super) async fn proxy_https_pooled(
             record_buffering_used(&target.host);
         }
         let result = if wasm_body
-            || (buffering_enabled
-                && (!compression.enabled || client_encoding == AcceptedEncoding::Identity))
+            || (buffering_enabled && (!compression.enabled || !client_encoding.accepts_any()))
         {
             proxy_request_buffered(
                 &mut client_stream,
@@ -263,7 +262,7 @@ pub(super) async fn proxy_https_request_with_compression(
     initial_body: &[u8],
     max_chunked_body_size: u64,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
 ) -> Option<(u16, u64, bool, bool)> {
@@ -351,7 +350,7 @@ pub(super) async fn transfer_https_response_with_compression(
     backend_stream: &mut ClientTls,
     client_stream: &mut ServerTls,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     is_head: bool,
@@ -463,14 +462,30 @@ pub(super) async fn transfer_https_response_with_compression(
                 };
             } else {
                 // 圧縮無効: そのまま転送（応答ヘッダの方針・Alt-Svc・Wasm・CORS を `compress` の平文の経路と共有）
-                let modified_headers = finish_h1_upstream_head(
+                let modified_headers = match finish_h1_upstream_head(
                     &accumulated[..header_len],
                     status_code,
                     security,
                     #[cfg(feature = "wasm")]
                     &wasm_modules,
                 )
-                .await;
+                .await
+                {
+                    Ok(h) => h,
+                    // 応答ヘッダの段のローカルレスポンス（B-300）。上流の本文は読まないので上流の接続は戻さない
+                    Err(resp) => {
+                        return match super::sendfile::write_h1_wasm_local(
+                            client_stream,
+                            &resp,
+                            false,
+                        )
+                        .await
+                        {
+                            Some((st, n)) => (total + n, st, false, false),
+                            None => (total, status_code, false, true),
+                        };
+                    }
+                };
                 // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
                 // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
                 let start = response_body_start(body_kind, body_start);

@@ -622,8 +622,9 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
                 crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
-            route.resolved_compression =
-                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            let compression = route.compression.clone().unwrap_or_default();
+            compression.warn_if_unbuilt();
+            route.resolved_compression = Some(Arc::new(compression));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }
@@ -848,8 +849,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
                 crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
-            route.resolved_compression =
-                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            let compression = route.compression.clone().unwrap_or_default();
+            compression.warn_if_unbuilt();
+            route.resolved_compression = Some(Arc::new(compression));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }

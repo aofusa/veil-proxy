@@ -1739,8 +1739,8 @@ impl Http3Handler {
 
         // --- リクエスト head 構築 ---
         let client_encoding = accept_encoding
-            .map(AcceptedEncoding::parse)
-            .unwrap_or(AcceptedEncoding::Identity);
+            .map(crate::config::ClientAccept::parse)
+            .unwrap_or(crate::config::ClientAccept::NONE);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
         let added = crate::proxy::expanded_added_headers(
             security,
@@ -3181,7 +3181,7 @@ mod tests {
             200,
             headers.clone(),
         ));
-        assert_eq!(out, headers);
+        assert_eq!(out.ok(), Some(headers));
     }
 
     /// B-41: 初期ヘッダから grpc-status/message と CL を除外し trailers 専用にする

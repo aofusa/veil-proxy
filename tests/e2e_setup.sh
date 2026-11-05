@@ -344,6 +344,9 @@ prepare_fixtures() {
     copy_wasm_module "network_filter.wasm"
     # F-133: gRPC トレーラー/リクエストヘッダ書き換え E2E 用
     copy_wasm_module "grpc_trailer_filter.wasm"
+    # F-293: 失敗の扱い（failure_policy）の E2E 用（応答ヘッダの段で fuel を使い切る・/trap でトラップする）
+    copy_wasm_module "fuel_burner.wasm"
+    copy_wasm_module "baseline_filter.wasm"
 }
 
 # 設定ファイルを生成
@@ -1768,6 +1771,55 @@ allow_request_headers_read = true
 allow_request_headers_write = true
 allow_response_headers_read = true
 allow_response_headers_write = true
+EOF
+            fi
+
+            # F-293: failure_policy（既定 fail_closed と fail_open）。fuel_burner は応答ヘッダの段で fuel を使い切り、
+            # baseline は /trap でトラップする
+            if [ -f "${FIXTURES_DIR}/wasm/fuel_burner.wasm" ] && [ -f "${FIXTURES_DIR}/wasm/baseline_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "fuel_burner"
+path = "${FIXTURES_DIR}/wasm/fuel_burner.wasm"
+
+[[wasm.modules]]
+name = "fuel_burner_open"
+path = "${FIXTURES_DIR}/wasm/fuel_burner.wasm"
+failure_policy = "fail_open"
+
+[[wasm.modules]]
+name = "baseline"
+path = "${FIXTURES_DIR}/wasm/baseline_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_send_local_response = true
+allow_request_headers_read = true
+allowed_properties = ["request.*"]
+
+[[route]]
+modules = ["fuel_burner"]
+[route.conditions]
+path = "/wasm-fuel-closed/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["fuel_burner_open"]
+[route.conditions]
+path = "/wasm-fuel-open/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/trap"
+[route.action]
+type = "Respond"
+status = 404
 EOF
             fi
 

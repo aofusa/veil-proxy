@@ -46,7 +46,7 @@ pub fn load(
     path: &str,
     root_id: &str,
     configuration: Vec<u8>,
-    fail_closed: bool,
+    failure_policy: crate::wasm::FailurePolicy,
 ) -> Result<MeshWasm, String> {
     let module = ModuleConfig {
         name: name.to_string(),
@@ -55,6 +55,7 @@ pub fn load(
             String::from_utf8_lossy(&configuration).into_owned(),
         ),
         capabilities: capabilities(),
+        failure_policy: Some(failure_policy),
         ..Default::default()
     };
     // Envoy の Wasm にはメモリの上限が無い（C++ SDK の emscripten 製は最小で 16MB を要求する）。
@@ -74,7 +75,9 @@ pub fn load(
         FilterEngine::new(&cfg).map_err(|e| format!("wasm plugin {}: {:#}", name, e))?;
     // 空の root_id もそのまま渡す（C++ SDK は空の名前で登録したファクトリを引く）
     engine.set_root_id(name, root_id);
-    engine.set_fail_closed(fail_closed);
+    engine
+        .validate()
+        .map_err(|e| format!("wasm plugin {}: {:#}", name, e))?;
     Ok(MeshWasm {
         name: name.to_string(),
         engine: Arc::new(engine),
@@ -125,19 +128,16 @@ pub async fn on_request(
             }
             Ok(())
         }
-        FilterResult::Pause => {
-            ftlog::debug!(
-                "[mesh] wasm plugin {} paused the request; continuing",
-                w.name
-            );
-            Ok(())
-        }
         FilterResult::LocalResponse(resp) => Err(local_reply(resp)),
     }
 }
 
-/// 応答ヘッダの段（逆順）。プラグインのローカル応答は応答の段では使わない（ヘッダの変更だけ反映する）。
-pub async fn on_response(ran: &Ran, status: u16, headers: &mut Vec<(Bytes, Bytes)>) {
+/// 応答ヘッダの段（逆順）。プラグインのローカル応答は `Err`（上流の応答の代わりに返す。B-300）。
+pub async fn on_response(
+    ran: &Ran,
+    status: u16,
+    headers: &mut Vec<(Bytes, Bytes)>,
+) -> Result<(), LocalReply> {
     for w in ran.iter().rev() {
         let hv: Vec<(Vec<u8>, Vec<u8>)> = headers
             .iter()
@@ -153,15 +153,19 @@ pub async fn on_response(ran: &Ran, status: u16, headers: &mut Vec<(Bytes, Bytes
                 false,
             )
             .await;
-        if let FilterResult::Continue { headers: h, .. } = r {
-            headers.clear();
-            headers.extend(
-                h.into_iter()
-                    .filter(|(k, _)| !k.starts_with(b":"))
-                    .map(|(k, v)| (Bytes::from(k), Bytes::from(v))),
-            );
+        match r {
+            FilterResult::Continue { headers: h, .. } => {
+                headers.clear();
+                headers.extend(
+                    h.into_iter()
+                        .filter(|(k, _)| !k.starts_with(b":"))
+                        .map(|(k, v)| (Bytes::from(k), Bytes::from(v))),
+                );
+            }
+            FilterResult::LocalResponse(resp) => return Err(local_reply(resp)),
         }
     }
+    Ok(())
 }
 
 fn local_reply(resp: crate::wasm::LocalResponse) -> LocalReply {

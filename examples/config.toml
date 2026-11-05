@@ -1612,6 +1612,12 @@ watch = false
 # 止まるので instance_reuse のインスタンスが同時に多く開き、要求ごとの費用が増える
 # デフォルト: 1000
 # yield_interval_us = 1000
+# フィルタが失敗した（トラップ・CPU や時間の上限・インスタンスを作れない・起動時のコールバックの失敗・
+# 待てない Pause）ときの扱い。"fail_closed"（503）・"fail_open"（そのモジュールを飛ばして続ける）・
+# "fail_reload"（503 にして使い回しているインスタンスを作り直す）。[[wasm.modules]] の failure_policy で上書きできる。
+# 0.11.0 より前は常に fail_open 相当だった
+# デフォルト: "fail_closed"
+# failure_policy = "fail_closed"
 
 # Poolingアロケータ設定
 # [wasm.defaults.pooling]
@@ -1644,6 +1650,9 @@ watch = false
 # # （`proxy_on_context_create`）とコールバックだけになる（Envoy と同じ寿命。フィルタのグローバル変数・
 # # root context の状態が要求をまたいで残る）。トラップしたインスタンスは捨てて作り直す。
 # instance_reuse = false
+#
+# # F-293: このモジュールが失敗したときの扱い（[wasm.defaults] の failure_policy を上書き）
+# # failure_policy = "fail_open"
 #
 # # F-271: 起動時（と設定のリロード時）に読むファイル。値はプロパティ `plugin_data.<名前>` で読める
 # # （capabilities の allowed_properties を書くなら "plugin_data.*" を含める）。要求ごとのファイルの読み取りは無い。
@@ -2231,6 +2240,8 @@ watch = false
 #   
 #   # 圧縮方式の優先順位（クライアントのAccept-Encodingと照合）
 #   # サポート: "zstd", "br" (Brotli), "gzip", "deflate"
+#   # この中からクライアントの q 値が最も高い方式を選ぶ（同点はこの順。q=0 の方式・ここに無い方式は使わない）
+#   # 圧縮には compression feature 付きのビルドが要る（無ければロード時に警告し、圧縮せずに送る）
 #   preferred_encodings = ["zstd", "br", "gzip"]
 #   
 #   # Gzip圧縮レベル (1-9)
@@ -2254,7 +2265,7 @@ watch = false
 #     "image/svg+xml",
 #   ]
 #   
-#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
+#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ。compressible_types と両方に一致したら長く一致した方が勝つ）
 #   skip_types = [
 #     "image/",
 #     "video/",
