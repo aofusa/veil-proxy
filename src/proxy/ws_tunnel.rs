@@ -96,13 +96,14 @@ impl TunnelOut {
     pub(crate) async fn head(
         &self,
         status: u16,
-        mut headers: Vec<(Bytes, Bytes)>,
+        headers: Vec<(Bytes, Bytes)>,
         own_server: bool,
         end: bool,
     ) -> Result<(), ()> {
         match self {
             #[cfg(feature = "http2")]
             TunnelOut::H2 { tx, notify } => {
+                let mut headers = headers;
                 if own_server {
                     if let Some(g) = get_server_header_guard() {
                         headers.retain(|(n, _)| !n.eq_ignore_ascii_case(b"server"));
@@ -122,6 +123,8 @@ impl TunnelOut {
             }
             #[cfg(feature = "http3")]
             TunnelOut::H3 { tx, notify } => {
+                // HTTP/3 のストリームは送り手（`tx`）を捨てたときに fin で閉じるので `end` は要らない
+                let _ = end;
                 let r = tx
                     .send(crate::http3_stream::RespMsg::Head {
                         status,
