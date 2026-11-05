@@ -1,6 +1,6 @@
 # F-288: HTTP/2・HTTP/3 の上の WebSocket（RFC 8441・RFC 9220 の拡張 CONNECT）をプロキシとハンドラで受ける
 
-**状態: 未着手（2026-11-04 起票。v0.10.1 で文書を「WebSocket は HTTP/1.1 だけ」に直した）**
+**状態: 未着手（2026-11-04 起票。v0.10.1 で文書を「WebSocket は HTTP/1.1 だけ」に直した。2026-11-05 に設計を詳細化）**
 
 ## 今の状態
 
@@ -32,6 +32,47 @@
 
 - 実装は見送り、`docs/guide/protocols.md`・`migration-nginx.md`・`performance.md`（英日）に WebSocket は HTTP/1.1 だけと書いた
   （文書と挙動の食い違いを無くす。拡張 CONNECT の実装はこのチケットで続ける）。
+
+## 設計（2026-11-05、v0.11.0 の計画で詳細化）
+
+調査の全文は `docs/artifacts/v0110/review-07-websocket.md`（git 管理外）の §2。行番号は f8dc80de 時点。
+
+- **先に直すもの**: HTTP/1.1 の中継の [B-306](../bugs/B-306-websocket-relay-drops-data-iouring.md)（io_uring でデータを失う・交互のポーリング・書き込みの時間切れ）。
+  その作り直しで、両方向を同時に待つ中継の部品ができ、HTTP/2・HTTP/3 でも使う。
+- **HTTP/2**: `src/http2/settings.rs` に `SettingsId::EnableConnectProtocol = 0x8`。送り、受け取った値が 0・1 以外か 1 → 0 の変更は接続エラー。
+  `validate_request_headers`（`connection.rs:1170`）は `:protocol` を CONNECT のときだけ、0x8 を広告した後だけ許し、拡張 CONNECT には `:scheme`・`:path`・
+  `:authority` を求める。要求の部品に `protocol` を持たせる。トンネルのストリームは `stream_idle_timeout_secs`・`set_stream_recv_timeout` の対象から外し、
+  `websocket_idle_timeout_secs` で切る。
+- **上流の HTTP/2 の多重化接続**（`upstream_mux`）: 相手の 0x8 を記録する。今は SETTINGS の前にストリームを開く（`upstream_mux.rs:216`）ので、拡張 CONNECT の
+  ストリームはサーバの SETTINGS が届くまで待たせる。双方向の CONNECT はメッシュの HBONE で既に扱っている。上流が 0x8 を広告しなければ 502。
+- **HTTP/3**: vendoring の quiche は `h3::Config::enable_extended_connect`（`third_party/quiche/src/h3/mod.rs:641`）と `extended_connect_enabled_by_peer`（:1803）を
+  持つが `:protocol` を検査しない。`init_h3`（`http3_server/mod.rs:1081`）で有効にし、`h3_check_field_section` に PROTOCOL のビットと「広告済み」を足す
+  （既存の否定の試験 `mod.rs:2293` は残す）。`classify` でトンネルと判定し、`Decision::Stream`/`ProxyStream` で `RecvWatch` 無しに流す（B-97 を守る。
+  メインループで待たない）。素の CONNECT（`:protocol` 無し）は [B-308](../bugs/B-308-websocket-shutdown-metrics-docs-h3-connect.md) の W-12。
+- **中継のタスク**（新しい `src/proxy/ws_tunnel.rs`、HTTP/2・HTTP/3 で共有。既存の `H2RespMsg`/`RespMsg` のチャネルと `req_rx` を使う）:
+  - ルーティング・セキュリティの検査は GET として行う（RFC 8441 §5）。
+  - 上流 HTTP/1.1: `GET` + `Upgrade: websocket` を組み、RFC 8441 のクライアントは `Sec-WebSocket-Key` を送らないので**プロキシが作り、返った Accept を検査する**。
+    101 をクライアントへは 200 にし、`Sec-WebSocket-Protocol`・`Sec-WebSocket-Extensions` を残す。101 以外は本文ごと返す。上流は `readable()` で、チャネルと同時に待つ
+    （`futures::join!` を使わない。F-173）。本文は `Bytes` のまま渡す。
+  - フロー制御は既存の消費連動のウィンドウ補充（h2）と quiche のクレジット（h3）。END_STREAM・fin は上流の `shutdown(Write)`、エラー・アイドルの満了は
+    RST_STREAM(CANCEL)・H3_REQUEST_CANCELLED（B-86 と同じく切り詰めを成功に見せない）。
+  - permessage-deflate は触らずに通す。
+- **ハンドラ**: `Request::upgrade_protocol` は HTTP/2・HTTP/3 で `:protocol` を返す。`Upgraded` を enum（H1、チャネルのストリーム。キャンセル安全）にする。
+  `check_response` は拡張 CONNECT を許し、101 ではなく 200 で答える。`WebSocketUpgrade::from_request` は CONNECT + `:protocol` を鍵無しで受ける。C（`veil_ws_accept`）・
+  Python は同じ抽出器を使うのでそのまま効く。
+- **横断**: リスナーごとの `extended_connect` の設定（広告するとブラウザが全部そちらへ移るので、最初は既定オフも検討）。トンネルを
+  `max_concurrent_connections` に数えるか、トンネルの上限と接続あたりの上限を足す（1 本の h2 接続から 100 本のトンネル＝上流の TCP 100 本を張れる）。
+  graceful shutdown（F-187）でトンネルを閉じる。メトリクスは [B-308](../bugs/B-308-websocket-shutdown-metrics-docs-h3-connect.md) の W-10
+  （`veil_proxy_websocket_connections` はハンドラだけを数えている。上の「HTTP/1.1 と同じに数える」はこの前提が誤り）。
+- **試験**: 受け入れ条件に加えて、h2spec・h3spec（CONNECT 以外の `:protocol` は malformed のまま）、WebSocket の無い要求の性能（分岐 1 つ・確保なし）の交互 A/B、
+  epoll の E2E。
+- **PR の順**: B-306 → HTTP/2 → HTTP/3 → 上流の h2 の多重化接続 → 文書。
+
+## 同じ調査で見つけた HTTP/1.1 の WebSocket の不具合
+
+- [B-306](../bugs/B-306-websocket-relay-drops-data-iouring.md)（High）、[B-307](../bugs/B-307-websocket-upgrade-handling.md)（Medium）、
+  [B-308](../bugs/B-308-websocket-shutdown-metrics-docs-h3-connect.md)（Low）。
+- 「v0.10.1 での扱い」の `performance.md` は英日とも WebSocket の記述が無い（B-308 で足す）。
 
 ## 関連
 
