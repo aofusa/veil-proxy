@@ -623,6 +623,24 @@ impl TcpStream {
     pub fn readable(&self) -> Readable<'_> {
         Readable {
             fd: self.fd,
+            #[cfg(veil_poller_kqueue)]
+            trust_hint: true,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 読み取り可能になるまで待つ（kqueue の readiness ヒントを信じず、必ず `poll(2)` で確かめる）。
+    ///
+    /// ヒントは起床の後に別の読み取りがデータを読み切っていても残るので、`readable` は読めないのに
+    /// `Ready` を返し得る（呼び出し側は直後の非ブロッキング I/O の `WouldBlock` で気付く前提）。
+    /// 読み取り可能を見てから時間切れ付きで読む WebSocket の中継は、偽の `Ready` で片方向の読み取りに
+    /// 止まり、反対方向を中継しなくなる（B-309）。そういう呼び出し側はこちらを使う。
+    /// epoll は元々ヒントを使わないので `readable` と同じ。
+    pub fn readable_confirmed(&self) -> Readable<'_> {
+        Readable {
+            fd: self.fd,
+            #[cfg(veil_poller_kqueue)]
+            trust_hint: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1376,6 +1394,9 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
 /// 読み取り可能まで待つ Future。
 pub struct Readable<'a> {
     fd: RawFd,
+    /// kqueue のヒントで確認の `poll(2)` を省いてよいか（`readable_confirmed` は false）
+    #[cfg(veil_poller_kqueue)]
+    trust_hint: bool,
     _marker: std::marker::PhantomData<&'a TcpStream>,
 }
 
@@ -1389,8 +1410,9 @@ impl<'a> Future for Readable<'a> {
         // 後続呼び出しに古いヒントが漏れることはない）。epoll は F-166 A-2 で ET 常時
         // 登録に変わったため、ヒントが立っていない場合の以下の `poll(2)` フォールバックが
         // 「エッジを取りこぼしていないか」の最終確認として必須になる（削除禁止）。
+        // B-309: `readable_confirmed` はヒントを捨てるだけで信じない（古いヒントを残さない）
         #[cfg(veil_poller_kqueue)]
-        if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+        if crate::runtime::executor::take_read_hint(self.fd) > 0 && self.trust_hint {
             return Poll::Ready(Ok(()));
         }
         // POLLIN/EPOLLIN 相当を即座に確認するため 0 バイト peek は行わず、まず fd の

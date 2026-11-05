@@ -9,6 +9,7 @@ use super::standalone::parity::*;
 use super::standalone::*;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "compression")]
 fn text_body(len: usize) -> Vec<u8> {
     (0..len).map(|i| b'a' + (i % 26) as u8).collect()
 }

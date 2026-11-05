@@ -874,7 +874,7 @@ async fn relay<B: RelayIo>(
             let rx = req_rx.as_ref();
             let tcp = backend.relay_tcp();
             up_flag.woken.store(true, Ordering::Relaxed);
-            let mut readable = std::pin::pin!(tcp.readable());
+            let mut readable = std::pin::pin!(tcp.readable_confirmed());
             let waiting = std::future::poll_fn(|cx: &mut Context<'_>| {
                 if let Some(rx) = rx {
                     if let Poll::Ready(item) = rx.poll_recv(cx) {

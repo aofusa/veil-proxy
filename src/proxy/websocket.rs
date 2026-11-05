@@ -541,8 +541,8 @@ async fn ready_either(
     // 最初は両方を poll する
     fa.woken.store(true, Ordering::Relaxed);
     fb.woken.store(true, Ordering::Relaxed);
-    let mut ra = std::pin::pin!(a.readable());
-    let mut rb = std::pin::pin!(b.readable());
+    let mut ra = std::pin::pin!(a.readable_confirmed());
+    let mut rb = std::pin::pin!(b.readable_confirmed());
     std::future::poll_fn(|cx| {
         fa.parent.register(cx.waker());
         fb.parent.register(cx.waker());

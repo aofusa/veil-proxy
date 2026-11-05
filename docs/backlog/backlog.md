@@ -654,6 +654,7 @@
 | B-306 | P1 | 修正済み | [bugs/B-306-websocket-relay-drops-data-iouring.md](bugs/B-306-websocket-relay-drops-data-iouring.md) | HTTP/1.1 の WebSocket の中継が io_uring で受信済みのデータを捨て得る（交互の読み取りを時間切れで drop）。アイドルでも 100ms ごとに RECV・取り消し、書き込みに時間の上限が無い |
 | B-307 | P2 | 修正済み | [bugs/B-307-websocket-upgrade-handling.md](bugs/B-307-websocket-upgrade-handling.md) | WebSocket のアップグレード: 101 以外の上流の応答を切り詰める、101 が応答ヘッダの方針・CORS・Wasm を通らない、Proxy 以外のルートで常に 400、`Connection` の部分一致・確保、GET・HTTP/1.1 以外も受ける |
 | B-308 | P3 | 一部修正済み | [bugs/B-308-websocket-shutdown-metrics-docs-h3-connect.md](bugs/B-308-websocket-shutdown-metrics-docs-h3-connect.md) | WebSocket のトンネルが graceful shutdown で閉じない・メトリクスに出ない、文書と `websocket` feature の食い違い、HTTP/3 の `:protocol` 無しの CONNECT が `/` へルーティングされる |
+| B-309 | P1 | 修正済み（v0.11.0） | [bugs/B-309-kqueue-stale-read-hint-stalls-websocket-relay.md](bugs/B-309-kqueue-stale-read-hint-stalls-websocket-relay.md) | kqueue（macOS・BSD）で WebSocket の中継（HTTP/1.1・HTTP/2・HTTP/3）が古い readiness ヒントの偽の `Ready` で片方向の読み取りに止まり、反対方向を中継しない。中継は `readable_confirmed`（必ず `poll(2)` で確かめる）で待つ |
 
 ---
 

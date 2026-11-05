@@ -583,6 +583,11 @@ impl TcpStream {
         }
     }
 
+    /// `readable` と同じ（POLL_ADD の完了は実際の readiness。reactor の `readable_confirmed` に対応する）
+    pub fn readable_confirmed(&self) -> Readable<'_> {
+        self.readable()
+    }
+
     /// 書き込み可能になるまで待つ（POLL_ADD POLLOUT）
     pub fn writable(&self) -> Writable<'_> {
         Writable {
