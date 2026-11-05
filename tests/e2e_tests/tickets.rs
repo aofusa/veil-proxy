@@ -2725,6 +2725,7 @@ pub(super) async fn test_f294_precompressed_http1() {
 
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_f294_precompressed_http2() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

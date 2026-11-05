@@ -301,10 +301,12 @@ impl Precompressed {
                 "br" => AcceptedEncoding::Brotli,
                 "gzip" => AcceptedEncoding::Gzip,
                 "zstd" => AcceptedEncoding::Zstd,
-                other => return Err(format!(
+                other => {
+                    return Err(format!(
                     "invalid precompressed encoding: {:?} (expected \"br\", \"gzip\" or \"zstd\")",
                     other
-                )),
+                ))
+                }
             };
             if order.contains(&Some(enc)) {
                 return Err(format!(

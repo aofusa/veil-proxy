@@ -13,6 +13,7 @@ fn text_body(len: usize) -> Vec<u8> {
     (0..len).map(|i| b'a' + (i % 26) as u8).collect()
 }
 
+#[cfg(feature = "compression")]
 fn gunzip(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -25,6 +26,7 @@ fn gunzip(data: &[u8]) -> Vec<u8> {
 /// B-266・B-269・F-286・F-287: 静的配信（`type = "File"` の sendfile・memory）の HEAD・Range・416・
 /// 条件付き要求（304・If-Range）・検証子・圧縮が 4 つのプロトコルで同じになる
 #[test]
+#[cfg(feature = "compression")]
 fn b266_f286_f287_static_responses_match_across_protocols() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key) = write_self_signed(dir.path());
@@ -314,6 +316,7 @@ body = "respond"
 /// （上流は同じ veil の memory の静的配信を h2c で引く）。B-279: `buffering = "full"` の上流の応答を
 /// 圧縮したら Content-Encoding を付ける（HTTP/3 は付けずに圧縮した本文を返していた）
 #[test]
+#[cfg(feature = "compression")]
 fn b270_h2c_upstream_responses_are_compressed() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key) = write_self_signed(dir.path());
@@ -667,7 +670,7 @@ use_h2c = true
 }
 
 /// 応答本文を `REWRITTEN-BODY` に置き換える Proxy-Wasm モジュール（WAT）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 const RESPONSE_BODY_REWRITER: &str = r#"
 (module
   (import "env" "proxy_set_buffer_bytes"
@@ -689,7 +692,7 @@ const RESPONSE_BODY_REWRITER: &str = r#"
 "#;
 
 /// 応答ヘッダに `x-wasm-resp: 1` を足す Proxy-Wasm モジュール（WAT）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 const RESPONSE_HEADER_ADDER: &str = r#"
 (module
   (import "env" "proxy_add_header_map_value"
@@ -712,7 +715,7 @@ const RESPONSE_HEADER_ADDER: &str = r#"
 /// B-268: Proxy-Wasm の `on_http_response_headers` が上流（HTTP/1.1・h2c）・圧縮・`buffering = "full"` の
 /// どの経路でも全プロトコルで呼ばれる（以前は HTTP/2 → HTTP/1.1 の上流・HTTP/1.1 → h2c の上流・HTTP/1.1 の
 /// 圧縮とバッファの経路で呼ばれなかった）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 #[test]
 fn b268_wasm_response_headers_on_every_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -807,7 +810,7 @@ mode = "memory"
 
 /// F-285: Proxy-Wasm の `on_http_response_body` が HTTP/1.1・HTTP/2 でも呼ばれ、書き換えた本文と
 /// Content-Length・圧縮が全プロトコルでそろう（上流は HTTP/1.1・h2c）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 #[test]
 fn f285_wasm_response_body_rewrite_on_every_protocol() {
     let dir = tempfile::tempdir().unwrap();

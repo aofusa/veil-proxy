@@ -2969,6 +2969,8 @@ url = "http://127.0.0.1:{echo}"
     // (メソッド, パス, 本文) → (状態, 本文)
     type Req<'a> = Box<dyn Fn(&str, &str, &[u8]) -> (u16, String) + 'a>;
     let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    // HTTP/3 の分は feature があるときだけ足す（all_protos と同じ）
+    #[allow(unused_mut)]
     let mut protocols: Vec<(&str, Req)> = vec![
         (
             "HTTP/1.1",

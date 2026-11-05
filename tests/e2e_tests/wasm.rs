@@ -509,25 +509,28 @@ pub(super) mod wasm_tests {
             .expect("response");
         assert_eq!(get_status_code(&r), Some(200), "{r}");
 
-        let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
-            .await
-            .expect("HTTP/2 connect");
-        let (status, _) = h2
-            .send_request("GET", "/trap", &[], None)
-            .await
-            .expect("HTTP/2 request");
-        assert_eq!(status, 503);
-        let (status, _) = h2
-            .send_request("GET", "/wasm-fuel-closed/", &[], None)
-            .await
-            .expect("HTTP/2 request");
-        assert_eq!(status, 503);
-        // 同じ接続で続けられる
-        let (status, _) = h2
-            .send_request("GET", "/wasm-fuel-open/", &[], None)
-            .await
-            .expect("HTTP/2 request");
-        assert_eq!(status, 200);
+        #[cfg(feature = "http2")]
+        {
+            let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+                .await
+                .expect("HTTP/2 connect");
+            let (status, _) = h2
+                .send_request("GET", "/trap", &[], None)
+                .await
+                .expect("HTTP/2 request");
+            assert_eq!(status, 503);
+            let (status, _) = h2
+                .send_request("GET", "/wasm-fuel-closed/", &[], None)
+                .await
+                .expect("HTTP/2 request");
+            assert_eq!(status, 503);
+            // 同じ接続で続けられる
+            let (status, _) = h2
+                .send_request("GET", "/wasm-fuel-open/", &[], None)
+                .await
+                .expect("HTTP/2 request");
+            assert_eq!(status, 200);
+        }
 
         #[cfg(feature = "http3")]
         {
