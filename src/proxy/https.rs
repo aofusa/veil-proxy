@@ -103,9 +103,7 @@ pub(super) async fn proxy_https_pooled(
     // バッファリングが有効かどうか判定
     // F-97: gRPC は Full バッファをバイパス
     let is_grpc_req = request_bytes_indicate_grpc(&request);
-    let buffering_enabled = !is_grpc_req
-        && buffering_config.is_enabled()
-        && buffering_config.should_buffer(Some(content_length));
+    let buffering_enabled = !is_grpc_req && buffering_config.is_enabled();
 
     // プールから取り出した keep-alive 接続は、バックエンド側の idle タイムアウト等で
     // 既に閉じられていることがある。その場合バックエンドからの最初の read が即座に EOF を
@@ -162,7 +160,11 @@ pub(super) async fn proxy_https_pooled(
         let wasm_body = false;
 
         // `buffering` の適用を数える（圧縮の経路を通っても本文は溜める。B-273）
-        if buffering_enabled && attempt == 1 {
+        // adaptive は応答の長さを見て溜めると決めたときに数える（proxy_request_buffered。B-296）
+        if buffering_enabled
+            && attempt == 1
+            && buffering_config.mode == crate::buffering::BufferingMode::Full
+        {
             record_buffering_used(&target.host);
         }
         let result = if wasm_body
@@ -183,6 +185,7 @@ pub(super) async fn proxy_https_pooled(
                 &wasm_mods,
                 #[cfg(feature = "wasm")]
                 wasm_body.then_some((compression, client_encoding)),
+                &target.host,
             )
             .await
         } else {

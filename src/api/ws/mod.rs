@@ -309,8 +309,9 @@ pub struct WebSocketUpgrade {
     key: Bytes,
     offered: Option<Bytes>,
     origin: Option<Bytes>,
+    // B-308: `Sec-WebSocket-Extensions` の全部の行
     #[cfg(feature = "compression")]
-    extensions: Option<Bytes>,
+    extensions: Vec<Bytes>,
     supported: Vec<String>,
     allowed_origins: Option<Vec<String>>,
     max_message: Option<usize>,
@@ -373,7 +374,12 @@ impl super::extract::FromRequest for WebSocketUpgrade {
             offered: header(req, "sec-websocket-protocol").cloned(),
             origin: header(req, "origin").cloned(),
             #[cfg(feature = "compression")]
-            extensions: header(req, "sec-websocket-extensions").cloned(),
+            extensions: req
+                .headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-extensions"))
+                .map(|(_, v)| v.clone())
+                .collect(),
             supported: Vec::new(),
             allowed_origins: None,
             max_message: None,
@@ -465,11 +471,10 @@ impl WebSocketUpgrade {
         let accept = codec::accept_key(&self.key);
         let protocol = self.selected_protocol().map(str::to_string);
         #[cfg(feature = "compression")]
-        let deflate = match &self.extensions {
-            Some(e) if COMPRESSION.load(Ordering::Relaxed) => {
-                deflate::negotiate(std::iter::once(&e[..]))
-            }
-            _ => None,
+        let deflate = if !self.extensions.is_empty() && COMPRESSION.load(Ordering::Relaxed) {
+            deflate::negotiate(self.extensions.iter().map(|e| &e[..]))
+        } else {
+            None
         };
         let opts = Options {
             max_message: self.max_message,

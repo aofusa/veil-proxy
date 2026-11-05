@@ -845,20 +845,29 @@ pub(crate) async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::R
 /// 使わない（`MSG_MORE` の後の最終レコードが保留されたままになる。B-25）。
 #[cfg(all(veil_ktls, target_os = "linux"))]
 pub(crate) async fn async_raw_send_more_all(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
+    async_raw_send_all(stream, buf, true).await
+}
+
+/// `buf` を send(2) で全部書く（`more` なら `MSG_MORE`）。kTLS のソケットへの平文の send はカーネルが暗号化する
+/// （kTLS には `more = false` で使う。B-25）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+pub(crate) async fn async_raw_send_all(
+    stream: &TcpStream,
+    buf: &[u8],
+    more: bool,
+) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
+    let flags = if more {
+        libc::MSG_MORE | libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+    } else {
+        libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+    };
     let fd = stream.as_raw_fd();
     let mut sent = 0;
     while sent < buf.len() {
         let rest = &buf[sent..];
         // SAFETY: fd は stream が生きている間有効で、rest は呼び出しの間だけ読まれる。
-        let r = unsafe {
-            libc::send(
-                fd,
-                rest.as_ptr() as *const libc::c_void,
-                rest.len(),
-                libc::MSG_MORE | libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-            )
-        };
+        let r = unsafe { libc::send(fd, rest.as_ptr() as *const libc::c_void, rest.len(), flags) };
         if r > 0 {
             sent += r as usize;
             continue;

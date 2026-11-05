@@ -878,9 +878,7 @@ pub(super) async fn proxy_http_pooled(
 
         // バッファリングが有効かどうか判定
         // F-97: Content-Type: application/grpc は Full バッファをバイパス（リクエスト行に含む）
-        let buffering_enabled = !is_grpc_req
-            && buffering_config.is_enabled()
-            && buffering_config.should_buffer(Some(content_length));
+        let buffering_enabled = !is_grpc_req && buffering_config.is_enabled();
         // F-285: Wasm の応答本文のフェーズを受けるモジュールがあれば本文を全部溜める（buffering = "full" の経路）
         #[cfg(feature = "wasm")]
         let wasm_body = super::compress::wasm_wants_response_body(&wasm_modules);
@@ -888,7 +886,8 @@ pub(super) async fn proxy_http_pooled(
         let wasm_body = false;
 
         // `buffering` の適用を数える（圧縮の経路を通っても本文は溜める。HTTP/2・HTTP/3 と同じ。B-273）
-        if buffering_enabled {
+        // adaptive は応答の長さを見て溜めると決めたときに数える（proxy_request_buffered。B-296）
+        if buffering_enabled && buffering_config.mode == crate::buffering::BufferingMode::Full {
             record_buffering_used(host_str_for_metrics);
         }
 
@@ -979,6 +978,7 @@ pub(super) async fn proxy_http_pooled(
                     &wasm_modules,
                     #[cfg(feature = "wasm")]
                     wasm_body.then_some((compression, client_encoding)),
+                    host_str_for_metrics,
                 )
                 .await
             } else {
@@ -1026,6 +1026,7 @@ pub(super) async fn proxy_http_pooled(
                 &wasm_modules,
                 #[cfg(feature = "wasm")]
                 wasm_body.then_some((compression, client_encoding)),
+                host_str_for_metrics,
             )
             .await
         } else {

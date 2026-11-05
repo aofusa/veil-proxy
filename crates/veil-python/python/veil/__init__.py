@@ -2299,14 +2299,16 @@ class App:
             "max_age": None if max_age is None else int(max_age),
         })
 
-    def serve_dir(self, path, directory, index=None, cache=True, **route_options):
+    def serve_dir(self, path, directory, index=None, cache=True, precompressed=None, **route_options):
         """Serve ``directory`` below ``path`` with the server's file backend (sendfile, Range, ``ETag``; requests do
         not reach Python). ``index`` is the file served for a directory; ``cache=False`` turns off the open-file and
-        content caches; ``route_options`` are more ``[[route]]`` keys (e.g. ``security={...}``)."""
+        content caches; ``precompressed`` (e.g. ``["br", "gzip"]``) serves precompressed ``.br`` / ``.gz`` / ``.zst``
+        siblings; ``route_options`` are more ``[[route]]`` keys (e.g. ``security={...}``)."""
         import os
 
         extra = "\n".join("%s = %s" % (k, _toml_literal(v)) for k, v in route_options.items()) or None
-        self.static_dirs.append((path.rstrip("/") or "/", os.path.abspath(directory), index, bool(cache), extra))
+        pre = [str(e) for e in (precompressed or [])]
+        self.static_dirs.append((path.rstrip("/") or "/", os.path.abspath(directory), index, bool(cache), extra, pre))
 
     def mount(self, path, app, name=None, *, forwarded_allow_ips=None):
         """Mount ``app`` at ``path``: a ``veil_kit.staticfiles.StaticFiles`` or an ASGI application (FastAPI,
@@ -2496,8 +2498,8 @@ class App:
             hid = len(_HANDLERS)
             _HANDLERS.append(m)
             _veil.register_asgi(m.prefix, hid)
-        for prefix, directory, index, cache, extra in self.static_dirs:
-            _veil.register_static(prefix, directory, index, cache, extra)
+        for prefix, directory, index, cache, extra, pre in self.static_dirs:
+            _veil.register_static(prefix, directory, index, cache, extra, pre)
         for opts in self.cors_options:
             _veil.register_cors(**opts)
         for kind, name, listen, f in self.l4:

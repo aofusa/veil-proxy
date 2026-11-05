@@ -876,6 +876,7 @@ mod backend_tests {
             path: "/var/www".to_string(),
             mode: "sendfile".to_string(),
             index: None,
+            precompressed: Default::default(),
         };
         assert!(matches!(file, crate::config::BackendConfig::File { .. }));
     }

@@ -1,6 +1,6 @@
 # B-307: HTTP/1.1 の WebSocket のアップグレードの扱い（101 以外の応答の切り詰め・応答ヘッダの方針を通らない・Proxy 以外のルートで常に 400・`Connection` の解析・検査の緩さ）
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見。行番号は f8dc80de）**
+**状態: 修正済み（2026-11-05）**
 
 ## 事象（コードの読み取り）
 
@@ -24,6 +24,17 @@
 5. GET・HTTP/1.1 以外は 400（RFC 6455 §4.1）。`Connection` のトークンに挙がったヘッダを上流へ送らない。
 - 試験: 上流が 403 + 本文・`100 Continue` → 101、`remove_response_headers` が 101 に効く、JWT のルートで 401、`Connection: keep-alive, Upgrade` と
   `Connection: x-upgrade-hint` の区別、HTTP/1.0 の拒否。
+
+## 修正
+
+- 1: 101 以外の 1xx は `drain_interim_responses` で捨て、101 以外の最終応答は本文（Content-Length・chunked・接続の終わりまで）も返してから閉じる。
+- 2: 101・拒否の応答の head は `render_response_head` を通す（`remove_response_headers`・`add_response_headers`・`Server`・Alt-Svc）。
+  Wasm の `on_response_headers` はトンネルには呼ばない（応答の後に中継に移るため。文書には書かない範囲）。
+- 3: WebSocket の分岐は `Backend::Proxy` のときだけ。他のルートは通常の経路（`Upgrade` を無視）。
+- 4: `http_utils::header_has_token`（全ての `Connection` ヘッダをトークンで比べる。確保なし）。`close` の判定・ハンドラの `upgrade_allowed` も同じ。
+- 5: GET・HTTP/1.1 以外はアップグレードしない（400 ではなく通常の要求として扱う。RFC 9110 で Upgrade は無視してよい）。上流へは
+  `Connection: Upgrade` だけを送り、`Connection` に挙がったヘッダは送らない。
+- 試験: E2E `test_b307_websocket_upgrade_requires_get_and_token`。
 
 ## 関連
 

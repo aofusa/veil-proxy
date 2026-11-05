@@ -496,7 +496,9 @@ reuseport_balancing = "cbpf"
 # チャンクサイズ設定 (sendfile/splice)
 # ------------------------------------------
 #
-# kTLSのsendfile/splice転送時のチャンクサイズを制御します。
+# プロキシの本文を splice(2) で転送するときのチャンクサイズを制御します（平文・kTLS の HTTP/1.1）。
+# Linux の静的ファイルの sendfile(2) は 1 回 1MB まで送るごとにワーカーへ譲ります（この設定は使いません）。
+# FreeBSD の kTLS の静的ファイルの sendfile(2) はこの大きさで送ります。
 #
 # モード:
 #   "dynamic" - ファイルサイズに基づいて自動調整（デフォルト）
@@ -512,7 +514,7 @@ reuseport_balancing = "cbpf"
 # Per-Stream パイプ割当 (kTLS splice)
 # ------------------------------------------
 #
-# splice転送で使用するパイプの割当方式を制御します。
+# splice転送（平文・kTLS の HTTP/1.1 のプロキシの本文）で使用するパイプの割当方式を制御します。
 #
 # false（デフォルト）: スレッドローカルパイプを再利用
 #   - メモリ効率が良い
@@ -1432,7 +1434,7 @@ watch = false
 # HTTP/3 専用圧縮設定
 # ------------------------------------------
 # HTTP/3接続時のみ圧縮を常に有効化できます。
-# パスごとの設定で compression.enabled = false の場合はそちらが優先されます。
+# compression_enabled = true はパスごとの設定の enabled = false より優先されます（その経路も HTTP/3 では圧縮する）。
 #
 # compression_enabled = true  # HTTP/3接続時は常に圧縮を有効化
 #
@@ -2014,13 +2016,28 @@ watch = false
 # max_entries = 50000
 # watch = true  # ディスクの変更を通知で追従する（F-272。既定は [performance] open_file_cache_watch）
 # # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き）
-# # HTTP/2・HTTP/3 のファイル本体をユーザ空間メモリに保持し、リクエストごとの
-# # オフロード読み込みを削減します（HTTP/1.1 は sendfile(2) 使用のため対象外）
+# # ファイル本体をユーザ空間メモリに保持し、リクエストごとのオフロード読み込みを削減します。
+# # HTTP/1.1 は kTLS と FreeBSD の平文では sendfile(2) で送るので対象外（Linux の平文・rustls は使う）
 # [route.static_file_cache]
 # enabled = true
 # valid_duration_secs = 300
 # max_file_size_bytes = 2097152  # 2 MiB
 # watch = true  # ディスクの変更を通知で追従する（F-272。既定は [static_file_cache] watch）
+
+# 事前圧縮したファイル（F-294。nginx の gzip_static / brotli_static 相当）
+# app.js の隣の app.js.br・app.js.gz・app.js.zst を圧縮せずに返す（sendfile・kTLS のまま）。
+# 値は "br"（.br）・"gzip"（.gz）・"zstd"（.zst）。並びは同じ q のときの優先順。
+# 元のファイルより古い兄弟は使わない。このルートの応答には常に Vary: Accept-Encoding を付ける。
+# open_file_cache が有効なら兄弟の有無を有効期間だけ覚える（無効だと要求ごとに探す）。
+# [[route]]
+# [route.conditions]
+# path = "/assets/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/assets/"
+# precompressed = ["br", "gzip"]
+# [route.open_file_cache]
+# enabled = true
 
 # カスタムインデックス (profile.html)
 # [[route]]
@@ -2125,18 +2142,9 @@ watch = false
 # "Server"・"Alt-Svc" を書くと veil 自身の Server・HTTP/3 の広告も付けない）
 # remove_response_headers = ["Server", "X-Powered-By"]
 #
-# WebSocket 転送のポーリングモード（"adaptive" | "fixed"）
-# adaptive: アイドル時にタイムアウトを指数的に伸ばして CPU を節約（デフォルト）
-# websocket_poll_mode = "adaptive"
-#
-# WebSocket adaptive ポーリングの初期タイムアウト（ミリ秒）
-# websocket_poll_timeout_ms = 1
-#
-# WebSocket adaptive ポーリングの最大タイムアウト（ミリ秒）
-# websocket_poll_max_timeout_ms = 100
-#
-# WebSocket adaptive ポーリングのバックオフ倍率
-# websocket_poll_backoff_multiplier = 2.0
+# WebSocket のポーリングの設定（websocket_poll_mode・websocket_poll_timeout_ms・websocket_poll_max_timeout_ms・
+# websocket_poll_backoff_multiplier）は v0.11.0 で廃止し、無視する（中継は両方向を同時に待つのでポーリングしない。B-306）。
+# 既存の設定が読めるようキーは受け付ける。
 # アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（0 = 無制限。デフォルト: 0）
 # websocket_idle_timeout_secs = 0
 
@@ -2227,7 +2235,8 @@ watch = false
 # 
 # 注意:
 #   - デフォルトは無効（enabled = false）
-#   - 有効にするとkTLSのゼロコピー最適化は迂回されます
+#   - 有効にすると、Accept-Encoding でルートの方式を受け付ける要求はゼロコピー（平文・kTLS の splice）を
+#     使わずユーザー空間を通ります（結果として圧縮しない応答も）
 #   - 帯域節約が重要なAPIエンドポイントでの使用を推奨
 #
 # [route.action]

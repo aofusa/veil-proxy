@@ -229,11 +229,12 @@ HTTP/1.1 response bodies are passed to the kernel without copying them through v
 |---|---|---|
 | Plaintext, Linux | `sendfile(2)`, header sent with `MSG_MORE` (files in the static content cache are sent from the cache) | `splice(2)` |
 | Plaintext, FreeBSD | `sendfile(2)` with the header in the same call | copied |
-| kTLS | `sendfile(2)` | `splice(2)` (Linux) |
+| kTLS | `sendfile(2)`, header sent separately without `MSG_MORE` (the kernel encrypts; Linux uses the same path as plaintext) | `splice(2)` (Linux) |
 | Userspace TLS (rustls) | copied (and encrypted) | copied |
 
 The proxy path is not used on routes that compress, cache, buffer (`buffering`), run Proxy-Wasm or add CORS headers,
-or for chunked bodies. HTTP/2 and HTTP/3 always copy: each DATA frame or QUIC packet needs its own framing, and one
+or for chunked bodies. HTTPS upstreams (even with kTLS on both ends), WebSocket and HTTP/2 over kTLS also copy.
+HTTP/2 and HTTP/3 always copy: each DATA frame or QUIC packet needs its own framing, and one
 `writev` of copied data is cheaper than several system calls per frame.
 
 ### FreeBSD: zero-copy h2c static files (F-240)

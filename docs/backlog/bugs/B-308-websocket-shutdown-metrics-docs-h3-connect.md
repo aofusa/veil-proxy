@@ -1,6 +1,6 @@
 # B-308: WebSocket のトンネルが graceful shutdown で閉じない・メトリクスに出ない、文書・feature 定義の食い違い、HTTP/3 の素の CONNECT が `/` へルーティングされる
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見。行番号は f8dc80de）**
+**状態: 一部修正済み（2026-11-05。W-12 の拡張 CONNECT は F-288）**
 
 ## 事象（コードの読み取り）
 
@@ -23,6 +23,14 @@
 - 別のゲージ `veil_proxy_websocket_tunnels{protocol}` を足し、トンネルの要求はレイテンシのヒストグラムから外すか別ラベルにする。文書（`observability` 系・英日）。
 - 文書の食い違いを英日で直す。`websocket` feature は削除するか意味を持たせる（`--no-default-features` の組み合わせで確認）。`Sec-WebSocket-Extensions` は全行を見る。
 - HTTP/3 の `:protocol` 無しの CONNECT は、メッシュの用途が無い限り H3_MESSAGE_ERROR か 405（[F-288](../features/F-288-websocket-over-h2-h3.md) の CONNECT の分岐で扱う）。
+
+## 修正
+
+- W-9: 中継の待ちを `timeout_idle(.., true, ..)` にし、graceful shutdown（`expire_idle_timeouts`）でトンネルを閉じる。
+- W-10: ゲージ `veil_proxy_websocket_tunnels{protocol}`（drop で減らすガード）。101 は所要時間・大きさのヒストグラムに入れない。文書（observability 英日）。
+- W-11: `websocket` feature は互換のために残し「何も切り替えない」と Cargo.toml・building（英日）に書いた。protocols・routing（英日）の
+  「バイパス転送」・ポーリング・h2c の上流でも HTTP/1.1 を直した。library（英日）に 405。ハンドラは `Sec-WebSocket-Extensions` の全行を見る。
+- W-12: HTTP/3 の `:protocol` 無しの CONNECT は 405（`http3_server`）。拡張 CONNECT は F-288 で扱う。
 
 ## 関連
 

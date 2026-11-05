@@ -1,6 +1,6 @@
 # B-306: HTTP/1.1 の WebSocket の中継が io_uring で受信済みのデータを捨て得る（読み取りを時間切れで drop）。交互のポーリングが重く、書き込みに時間の上限が無い
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見、再現は未実施。行番号は f8dc80de）**
+**状態: 修正済み（2026-11-05）**
 
 ## 事象（コードの読み取り）
 
@@ -25,6 +25,15 @@
 - 作った中継の部品を [F-288](../features/F-288-websocket-over-h2-h3.md)（HTTP/2・HTTP/3）でも使う。
 - 試験: 数 KB のフレームを数万往復させて欠けないこと（io_uring・epoll、平文・kTLS・rustls、上流は平文・TLS）、読まないクライアントで時間切れ後に閉じる、
   アイドルの接続で syscall が出ない（`strace -c`）。
+
+## 修正
+
+- `websocket_relay`（`src/proxy/websocket.rs`）: 両側の `readable()` を同時に待ち（片側ずつの `Waker` で起きた側だけ poll し直す。F-173）、
+  起きた側（または TLS が平文を抱えている側。`BufferedReadState`）から 1 回読んで反対側へ全部書く。読み取り可能の待ちは drop しても受信データを
+  失わない。書き込みは `WRITE_TIMEOUT`、読み取り（TLS のレコードの途中で止まった相手）はアイドルの上限で閉じる。平文・TLS の上流を 1 つの関数にした。
+- アイドルの接続は待ちの間 SQE もタイマーの周回も出さない。`websocket_poll_*` は廃止（キーは受け付けて無視。文書・`examples/config.toml`）。
+- splice（平文・kTLS の組）は採らなかった: WebSocket のフレームは小さく、往復の遅延が支配的なため。文書は「ユーザー空間のバッファを通す」と書いた。
+- 試験: E2E `test_b306_websocket_relay_keeps_every_byte`（1〜4000 バイトのフレームを 2000 往復）。
 
 ## 関連
 

@@ -508,6 +508,7 @@ impl OpenFileCache {
 
     /// キャッシュをクリア
     pub fn clear(&self) {
+        super::precompressed::clear();
         self.entries.clear();
     }
 
@@ -707,6 +708,35 @@ pub async fn get_file_info_with_config(
             config.and_then(|c| c.watch_gen),
         )
         .await
+}
+
+/// ルートの open_file_cache が有効なら、その有効期間・最大エントリ数・監視の世代（無効なら None）。
+/// 事前圧縮の兄弟の有無の表（F-294）が同じ寿命で持つために使う
+pub(crate) fn effective_params(
+    config: Option<&OpenFileCacheConfig>,
+) -> Option<(Duration, usize, Option<super::watch::WatchGen>)> {
+    let enabled = config
+        .and_then(|c| c.enabled)
+        .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_ENABLED.load(Ordering::Relaxed));
+    if !enabled {
+        return None;
+    }
+    let valid_duration = config
+        .and_then(|c| c.valid_duration_secs)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| {
+            Duration::from_nanos(
+                OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS.load(Ordering::Relaxed),
+            )
+        });
+    let max_entries = config
+        .and_then(|c| c.max_entries)
+        .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.load(Ordering::Relaxed));
+    Some((
+        valid_duration,
+        max_entries,
+        config.and_then(|c| c.watch_gen),
+    ))
 }
 
 /// 指定パスのキャッシュを無効化

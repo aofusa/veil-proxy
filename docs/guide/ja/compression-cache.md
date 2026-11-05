@@ -136,9 +136,15 @@ path = "/var/www/static"
 
 - `text/event-stream`（Server-Sent Events）。圧縮には本文の全体が要りますが、イベントのストリームは終わらないので、常にそのまま流します。
 - `Content-Length` が 64 MiB を超える応答。圧縮せずに流します。
-- 8 MiB を超える静的ファイル（`type = "File"`）。圧縮するには要求ごとにファイル全体を読み込むので、圧縮せずに `sendfile` で送ります。
+- 8 MiB を超える静的ファイル（`type = "File"`）。圧縮するには要求ごとにファイル全体を読み込むので、圧縮せずに送ります（HTTP/1.1 は `sendfile`、HTTP/2・HTTP/3 は他のファイルと同じく読んで送ります）。
 
 圧縮するときは、上流の本文の全体を先に溜めます（上限 64 MiB）。長さ不明の応答や chunked の応答がこれを超えたら、打ち切って 502 を返します。
+
+### 事前圧縮した静的ファイル
+
+静的ファイルは前もって圧縮しておくこともできます。`type = "File"` のルートの `[route.action]` に
+`precompressed = ["br", "gzip"]` と書くと、`app.js` の隣の `app.js.br`・`app.js.gz` を圧縮せずに返します（`sendfile`・kTLS のまま）。
+[事前圧縮したファイル](routing.md#事前圧縮したファイル) を参照してください。
 
 ### HTTP/3圧縮設定
 
@@ -154,7 +160,10 @@ compression_enabled = true
   gzip_level = 5
 ```
 
-> **Note**: 圧縮を有効にすると、圧縮されたレスポンスに対してはkTLSのゼロコピーsendfile最適化は使用されません。大きなファイルの最大スループットを得るには、静的ファイルルートでは圧縮を無効にすることを検討してください。
+> **Note**: 圧縮するとゼロコピー（`sendfile`・`splice`。平文も kTLS も）を使いません。静的ファイルでは実際に圧縮する応答だけをユーザー空間で
+> 読んで圧縮します。HTTP/1.1 のプロキシでは、`Accept-Encoding` がルートの方式のどれかを受け付ける要求はすべて（判定に応答ヘッダが
+> 要るので、結果として圧縮しない応答も）ユーザー空間を通します。大きなファイルの最大スループットを得るには、そのルートの圧縮を無効に
+> することを検討してください。
 
 ## プロキシキャッシュ
 
@@ -251,7 +260,8 @@ url = "http://localhost:8080"
 
 - プロキシのキャッシュは、**HTTP/1.1 のクライアント**から**平文（`http://`）の上流**への要求に効きます。HTTP/2・HTTP/3 の要求と、
   `https://` の上流の応答は、まだキャッシュしません（F-257）。
-- `streaming` バッファリングモード使用時、kTLSのゼロコピー転送は維持されます
+- キャッシュのあるルートでは、キャッシュに入り得る要求はユーザー空間を通ります（キャッシュに入れるため）。`streaming` モードの
+  ゼロコピー（`splice`）の経路を使うのはそれ以外の要求だけです
 - キャッシュは `Cache-Control: no-cache`、`no-store`、`private` ヘッダーを尊重します
 - `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません
 - `respect_vary = true` の場合、`Vary` が `key_headers` に無いヘッダを挙げる応答はキャッシュされません（キーでその要求を
@@ -402,6 +412,10 @@ Content-Length <= adaptive_threshold → フルバッファリング
 Content-Length > adaptive_threshold  → ストリーミング
 Content-Length 不明（chunked）       → ストリーミング
 ```
+
+判定には**応答の** `Content-Length`（上流の応答ヘッダ）を使います（要求の長さではありません）。`veil_proxy_buffering_used_total` は
+溜めた応答だけを数えます。HTTP/2・HTTP/3 のクライアント（ストリームごとにフロー制御がある）では `adaptive` は `streaming` と同じく
+流し、溜めるのは `full` だけです。応答本文を読む Proxy-Wasm モジュールのあるルートは常に溜めます。
 
 ### kTLS互換性
 

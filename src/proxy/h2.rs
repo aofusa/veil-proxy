@@ -1906,6 +1906,7 @@ pub(super) async fn h2_dispatch(
                     &route_compression,
                     None,
                     Some(&data),
+                    false,
                 );
                 #[cfg(feature = "wasm")]
                 let header_store = match apply_h2_wasm_response_headers(
@@ -1933,6 +1934,7 @@ pub(super) async fn h2_dispatch(
             canonical_base,
             static_file_cache_config,
             _,
+            precompressed,
         ) => {
             h2_sendfile(
                 ctx,
@@ -1945,6 +1947,7 @@ pub(super) async fn h2_dispatch(
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 static_file_cache_config.as_deref(),
+                precompressed,
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -3818,6 +3821,7 @@ pub(super) async fn h2_sendfile(
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     canonical_base: Option<&Path>,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
+    precompressed: crate::config::Precompressed,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -3932,16 +3936,49 @@ pub(super) async fn h2_sendfile(
             .iter()
             .map(|h| (h.name.as_ref(), h.value.as_ref())),
     );
-    let (status, built_headers, response_body) = build_h2_static_response(
-        &sreq,
-        data,
-        &mime_type,
-        &validators,
-        security,
-        compression,
-        Some((served_path.as_path(), &content_cfg)),
-        None,
-    );
+    // F-294: 事前圧縮した兄弟（`app.js.br` 等）があればそれを返す（圧縮はしない。Vary は常に付ける）
+    let force_vary = !precompressed.is_empty();
+    let sibling = if force_vary {
+        cache::precompressed::select_with_content(
+            &served_path,
+            data.len() as u64,
+            &validators,
+            &mime_type,
+            sreq.accept_encoding,
+            precompressed,
+            compression,
+            open_file_cache_config,
+            &content_cfg,
+            containment,
+        )
+        .await
+    } else {
+        None
+    };
+    let (status, built_headers, response_body) = match sibling {
+        Some((sib_data, sib_validators, sib_path)) => build_h2_static_response(
+            &sreq,
+            sib_data,
+            &mime_type,
+            &sib_validators,
+            security,
+            crate::static_response::no_compression(),
+            Some((&*sib_path, &content_cfg)),
+            None,
+            true,
+        ),
+        None => build_h2_static_response(
+            &sreq,
+            data,
+            &mime_type,
+            &validators,
+            security,
+            compression,
+            Some((served_path.as_path(), &content_cfg)),
+            None,
+            force_vary,
+        ),
+    };
     #[cfg(feature = "wasm")]
     let header_store =
         match apply_h2_wasm_response_headers(wasm_modules, status, built_headers).await {

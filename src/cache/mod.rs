@@ -48,6 +48,9 @@ pub mod resolve;
 // そのまま `super::StaticContentCacheConfig` として使い回せる）。
 pub mod compressed;
 
+// 事前圧縮した兄弟ファイル（`app.js.br` 等）を探す（F-294）
+pub mod precompressed;
+
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
 mod content_cache;

@@ -329,7 +329,7 @@ path = "/var/www/html"
 
 Both modes answer the same way on HTTP/1.1, HTTP/2 and HTTP/3:
 
-- Every response carries `ETag` and `Last-Modified`. In `sendfile` mode the ETag is built from the file's modification time and
+- Every response except `416` carries `ETag` and `Last-Modified`. In `sendfile` mode the ETag is built from the file's modification time and
   size; in `memory` mode it is a hash of the content (it stays the same across reloads when the content does not change) and
   `Last-Modified` is the file's modification time when it was loaded.
 - `If-None-Match` (weak comparison, `*` matches) and `If-Modified-Since` return `304 Not Modified` without a body.
@@ -346,6 +346,37 @@ Both modes answer the same way on HTTP/1.1, HTTP/2 and HTTP/3:
   (as nginx's gzip module does). Conditional requests are compared with the ETag of the representation the request would get,
   so a `304` carries the same ETag as the `200` it stands for. Requests without `Accept-Encoding` still get ranges. `416` also
   carries `Vary: Accept-Encoding`.
+
+#### Precompressed Files
+
+`precompressed` serves files you compressed ahead of time (`app.js.br`, `app.js.gz`, `app.js.zst` next to `app.js`),
+like nginx's `gzip_static` / `brotli_static`. List the encodings to look for; the order breaks ties between encodings the
+client accepts with the same `q`. The values are `"br"` (`.br`), `"gzip"` (`.gz`) and `"zstd"` (`.zst`).
+
+```toml
+[[route]]
+[route.conditions]
+path = "/assets/*"
+[route.action]
+type = "File"
+path = "/var/www/assets"
+precompressed = ["br", "gzip"]
+[route.open_file_cache]
+enabled = true   # remembers which siblings exist (see below)
+```
+
+- veil picks the encoding the client accepts with the highest `q` among the siblings that exist. When
+  `[route.compression]` would compress on the fly with an encoding of strictly higher `q`, on-the-fly compression wins.
+  Without `Accept-Encoding`, or when no sibling fits, the original file is served (or compressed on the fly).
+- A sibling is used only when it is a regular file at least as new as the original (an older sibling is ignored, so a stale
+  compressed copy is never served). In a directory route it must stay inside the route's directory, like the original.
+- The response has the original's `Content-Type`, `Content-Encoding` of the sibling, a strong ETag per sibling
+  (`"<mtime>-<size>-br"`) and the original's `Last-Modified`. `Range` applies to the compressed bytes. Every response of a
+  route with `precompressed` carries `Vary: Accept-Encoding`.
+- Siblings are served without compressing, so HTTP/1.1 keeps `sendfile` (including kTLS) and there is no size limit.
+- With `open_file_cache` on, veil remembers whether each sibling exists for the cache's lifetime (and follows disk changes
+  when `watch` is on). Without it, every request looks for the siblings on disk.
+- In `memory` mode the siblings are read at load time together with the file.
 
 ### Proxy Configuration
 
@@ -566,9 +597,9 @@ Notes and limitations:
 
 ### WebSocket Configuration
 
-WebSocket is automatically supported with regular Proxy. Polling behavior during bidirectional transfer can be customized via configuration.
-
-#### Basic Configuration
+WebSocket works with a regular `Proxy` route: an HTTP/1.1 `GET` with `Connection: upgrade` and `Upgrade: websocket` is
+forwarded upstream, and after the upstream answers `101 Switching Protocols` veil relays bytes in both directions until
+either side closes.
 
 ```toml
 # WebSocket application
@@ -590,83 +621,28 @@ type = "Proxy"
 upstream = "websocket-pool"
 ```
 
-#### Polling Mode Configuration
+How the tunnel behaves:
 
-Controls polling behavior during WebSocket bidirectional transfer.
+- The relay waits for both directions at once and reads from whichever side has data, so no data is lost and an idle
+  tunnel costs no CPU or system calls. Writes have the same time limit as other responses, so a peer that stops reading
+  closes the tunnel instead of holding both connections.
+- The upstream connection is always HTTP/1.1, including routes whose upstream uses `use_h2c` or HTTP/2 over TLS.
+- The `101` response (and a refused upgrade) goes through the route's response-header policy like any proxied response:
+  `remove_response_headers`, `add_response_headers` and `Server` apply. When the upstream does not upgrade, its whole
+  response (with the body) is returned and the connection is closed. `1xx` responses other than `101` are dropped.
+- Only `GET` over HTTP/1.1 is upgraded (RFC 6455). Other requests carrying `Upgrade: websocket`, and requests on routes
+  that are not `Proxy` (files, fixed responses, redirects), are handled as normal requests and the `Upgrade` header is
+  ignored. Headers named in the client's `Connection` header are not forwarded.
+- Graceful shutdown closes open tunnels when it starts draining (a relay cannot send a WebSocket close frame, so the TCP
+  connections are closed).
+- Open tunnels are counted by the `veil_proxy_websocket_tunnels{protocol}` gauge. The `101` request is still counted in
+  `http_requests_total`, but not in the duration and size histograms (its duration is the tunnel's lifetime).
+- WebSocket over HTTP/2 and HTTP/3 front ends is not supported yet (clients fall back to HTTP/1.1).
 
-| Option | Description | Default |
+| Option (`[route.security]`) | Description | Default |
 |--------|-------------|---------|
-| `websocket_poll_mode` | Polling mode (`"fixed"` / `"adaptive"`) | `"adaptive"` |
-| `websocket_poll_timeout_ms` | Initial timeout (milliseconds) | 1 |
-| `websocket_poll_max_timeout_ms` | Maximum timeout (milliseconds) *adaptive only | 100 |
-| `websocket_poll_backoff_multiplier` | Backoff multiplier *adaptive only | 2.0 |
-| `websocket_idle_timeout_secs` | Close the tunnel after an upgrade (`101`) when no data has flowed in either direction for this long; 0 = no limit | 0 |
-
-#### Choosing Polling Mode
-
-| Mode | Behavior | Use Case |
-|------|----------|----------|
-| `fixed` | Always uses fixed timeout | Real-time games, low latency priority |
-| `adaptive` | Short when active, longer when idle | Chat, monitoring dashboards, balance focused |
-
-**Adaptive Mode Behavior:**
-
-```
-Data transferred → Reset timeout (return to initial value)
-Timeout occurred → Timeout × multiplier (extend up to max)
-
-Example: initial=1ms, max=100ms, multiplier=2.0
-1ms → 2ms → 4ms → 8ms → 16ms → 32ms → 64ms → 100ms (stops at max)
-↓ When data arrives
-1ms (reset)
-```
-
-#### WebSocket Configuration Examples
-
-```toml
-# Real-time game (low latency priority)
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3000"
-
-[route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
-
-# Chat application (balance focused)
-[[route]]
-[route.conditions]
-host = "chat.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
-[route.security]
-  websocket_poll_mode = "adaptive"
-  websocket_poll_timeout_ms = 1
-  websocket_poll_max_timeout_ms = 50
-  websocket_poll_backoff_multiplier = 2.0
-
-# Monitoring dashboard (CPU efficiency priority)
-[[route]]
-[route.conditions]
-host = "monitor.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3002"
-
-[route.security]
-  websocket_poll_mode = "adaptive"
-  websocket_poll_timeout_ms = 10
-  websocket_poll_max_timeout_ms = 200
-  websocket_poll_backoff_multiplier = 1.5
-```
+| `websocket_idle_timeout_secs` | Close the tunnel when no data has flowed in either direction for this long; 0 = no limit | 0 |
+| `websocket_poll_mode`, `websocket_poll_timeout_ms`, `websocket_poll_max_timeout_ms`, `websocket_poll_backoff_multiplier` | Deprecated since v0.11.0 and ignored (the relay no longer polls). Still accepted so existing configurations load | — |
 
 ### Global Security Configuration
 

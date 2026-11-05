@@ -175,13 +175,14 @@ fn register_cors(
 
 /// Serve the directory `dir` below `prefix` with the server's file backend (`extra_toml`: more `[[route]]` keys).
 #[pyfunction]
-#[pyo3(signature = (prefix, dir, index=None, cache=true, extra_toml=None))]
+#[pyo3(signature = (prefix, dir, index=None, cache=true, extra_toml=None, precompressed=Vec::new()))]
 fn register_static(
     prefix: String,
     dir: String,
     index: Option<String>,
     cache: bool,
     extra_toml: Option<String>,
+    precompressed: Vec<String>,
 ) -> PyResult<()> {
     let extra = match extra_toml {
         Some(t) => Some(
@@ -194,6 +195,7 @@ fn register_static(
         index,
         open_file_cache: cache,
         static_file_cache: cache,
+        precompressed,
         extra,
         ..Default::default()
     };

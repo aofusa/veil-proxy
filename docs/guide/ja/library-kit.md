@@ -90,8 +90,9 @@ App::new().state(Key::derive_from(secret_bytes)?)   // 署名付き・暗号化�
 
 `serve::dir("/assets", "/srv/www")` は既定の設定の `App::serve_dir` です: `open_file_cache` と `static_file_cache` を付けた
 `type = "File"` のルートで、要求はハンドラを通りません。sendfile・kTLS・Range・ETag がプロキシと同じく効きます。
-事前圧縮した `.br`・`.gz` のファイルは使いません。`compression` は HTTP/2・HTTP/3 でファイルをその場で圧縮します（HTTP/1.1 はそのまま送ります）。
-`serve::dir_with(prefix, dir, ServeOptions { .. })` は `index`・`mode`・2 つのキャッシュ・`compression`・その他のルートのキーを
+`precompressed`（例: `vec!["br".into(), "gzip".into()]`）は事前圧縮した `.br`・`.gz`・`.zst` の兄弟を返し、`compression` は
+HTTP/1.1・HTTP/2・HTTP/3 でファイルをその場で圧縮します。
+`serve::dir_with(prefix, dir, ServeOptions { .. })` は `index`・`mode`・2 つのキャッシュ・`compression`・`precompressed`・その他のルートのキーを
 取ります。File バックエンドには SPA のフォールバックがありません。必要なら `index.html` を返すルートをハンドラで書いてください。
 
 `serve::file(path, max_size).await` はファイル 1 個をファイル用の offload のプールで読み、拡張子からメディアタイプを決めて返します

@@ -123,8 +123,9 @@ br か gzip で圧縮します（クライアントの `Accept-Encoding` で決�
 ## 静的ファイル
 
 `App::serve_dir`（Rust）と `veil_kit.staticfiles.StaticFiles`・`app.serve_dir`（Python）は、プロキシのファイル配信
-（sendfile・Range・`ETag`）でディレクトリを配ります。事前圧縮した `.br`・`.gz` は使いません。ルートの
-`[route.compression]` が HTTP/2・HTTP/3 でファイルをその場で圧縮し、結果をキャッシュします（HTTP/1.1 はそのまま送ります）。
+（sendfile・Range・`ETag`）でディレクトリを配ります。`precompressed`（Rust は `ServeOptions::precompressed`、Python は
+`precompressed=["br", "gzip"]`）は事前圧縮した `.br`・`.gz`・`.zst` の兄弟を圧縮せずに返します。ルートの
+`[route.compression]` が HTTP/1.1・HTTP/2・HTTP/3 でファイルをその場で圧縮し、結果をキャッシュします。
 
 `serve_dir` はそのルートのファイルのメタデータのキャッシュ（`open_file_cache`）と HTTP/2・HTTP/3 のファイル本体のキャッシュ
 （`static_file_cache`）を有効にします（Rust は `ServeOptions { open_file_cache, static_file_cache, .. }`、Python は `cache=False`

@@ -439,8 +439,8 @@ Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/).
 
 `veil::api::ws` terminates WebSocket (RFC 6455) in a handler. `WebSocketUpgrade` is an extractor that checks the
 handshake (HTTP/1.1, `GET`, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a 16-byte
-`Sec-WebSocket-Key`); a malformed handshake is answered with 400 and another version with 426 and
-`Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
+`Sec-WebSocket-Key`); a request other than `GET` is answered with 405, another malformed handshake with 400, and
+another version with 426 and `Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
 connection:
 
 ```rust

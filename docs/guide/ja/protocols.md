@@ -261,29 +261,20 @@ HTTP/3 だけを受けるリスナーでは WebSocket を使えません。
 
 ### 動作
 
-1. クライアントからの Upgrade リクエストを検出
-2. バックエンドに Upgrade リクエストを転送
-3. 101 Switching Protocols を受信
-4. 双方向のバイパス転送を開始（設定されたポーリングモードで動作）
-5. どちらかの接続が閉じるまで継続
+1. クライアントからの Upgrade リクエストを検出（`Proxy` のルートへの HTTP/1.1 の `GET`）
+2. バックエンドに Upgrade リクエストを転送（常に HTTP/1.1）
+3. 101 Switching Protocols を受信（それ以外の応答は全体を返して接続を閉じる）
+4. 両方向にバイトを中継する。中継は両側を同時に待ち、データの届いた側からコピーする（ユーザー空間のバッファを通す。
+   アイドルのトンネルは CPU を使わない）
+5. どちらかの接続が閉じる・アイドルの上限（`websocket_idle_timeout_secs`）を過ぎる・graceful shutdown が始まるまで継続
 
-### ポーリングモード
-
-WebSocket双方向転送時のポーリング動作を設定で制御できます。
-
-| モード | 説明 | 用途 |
-|--------|------|------|
-| `adaptive`（デフォルト） | データ転送時は短く、アイドル時は長くなる | 汎用、CPU効率重視 |
-| `fixed` | 常に固定のタイムアウトを使用 | リアルタイムゲーム、低レイテンシ最優先 |
-
-詳細な設定オプションは「[WebSocket設定](routing.md#websocket設定)」セクションを参照してください。
+以前の版の `websocket_poll_*` は廃止し、無視します。詳細は「[WebSocket設定](routing.md#websocket設定)」を参照してください。
 
 ### 設定例
 
-WebSocketは通常のProxyバックエンドで自動的にサポートされます：
+WebSocketは通常のProxyバックエンドで自動的にサポートされます:
 
 ```toml
-# WebSocketアプリケーション（デフォルト設定）
 [[route]]
 [route.conditions]
 host = "example.com"
@@ -292,18 +283,9 @@ path = "/ws/*"
 type = "Proxy"
 url = "http://localhost:3000"
 
-# 低レイテンシ設定（リアルタイムゲーム向け）
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
+# 10 分データが流れないトンネルを閉じる
 [route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
+websocket_idle_timeout_secs = 600
 ```
 
 ### 対応バックエンド

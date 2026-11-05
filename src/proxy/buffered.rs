@@ -18,6 +18,12 @@ pub(super) enum BufferedBodyResult {
     LimitExceeded,
     /// バッファリング失敗（ストリーミングにフォールバック）
     Failed,
+    /// `mode = "adaptive"` で溜めない応答（応答の Content-Length が閾値を超える・chunked・長さ不明。B-296）。
+    /// `initial` はヘッダと同じ読み込みに入っていた本文
+    Stream {
+        kind: crate::http_utils::ResponseBody,
+        initial: Vec<u8>,
+    },
 }
 
 impl BufferedBodyResult {}
@@ -53,6 +59,8 @@ pub(super) async fn proxy_request_buffered<R>(
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
     // F-285: Some なら溜めた本文へ Wasm の応答本文のフェーズをかけ、その後で（設定があれば）圧縮する
     #[cfg(feature = "wasm")] wasm_body: Option<(&CompressionConfig, crate::config::ClientAccept)>,
+    // `buffering` の適用を数えるホスト（`mode = "adaptive"` は溜めると決めたときだけ数える。B-296）
+    metrics_host: &str,
 ) -> Option<(u16, u64, bool, bool)>
 where
     R: AsyncReader
@@ -117,9 +125,26 @@ where
         }
     }
 
-    // 4. レスポンスを受信してバッファリング
-    let buffered =
-        receive_and_buffer_response(backend_stream, buffering_config, cache_ctx, is_head).await;
+    // 4. レスポンスを受信してバッファリング（adaptive は応答の長さを見て溜めるか決める。Wasm の応答本文の
+    // フェーズは溜めた本文にかけるので常に溜める）
+    #[cfg(feature = "wasm")]
+    let allow_stream = wasm_body.is_none();
+    #[cfg(not(feature = "wasm"))]
+    let allow_stream = true;
+    let mut cache_ctx = cache_ctx;
+    let buffered = receive_and_buffer_response(
+        backend_stream,
+        buffering_config,
+        cache_ctx.as_deref_mut(),
+        is_head,
+        allow_stream,
+    )
+    .await;
+    if buffering_config.mode == crate::buffering::BufferingMode::Adaptive
+        && matches!(&buffered, Some((_, _, b, ..)) if !matches!(b, BufferedBodyResult::Stream { .. }))
+    {
+        record_buffering_used(metrics_host);
+    }
 
     match buffered {
         Some((
@@ -155,6 +180,40 @@ where
                         .map(|(st, n)| (st, n, backend_wants_keep_alive, false));
                 }
             };
+            // B-296: 溜めない応答はヘッダと最初の本文を送り、残りを区切りどおりに流す
+            if let BufferedBodyResult::Stream { kind, initial } = body_result {
+                let start = super::transfer::response_body_start(kind, &initial);
+                if let Some(ctx) = cache_ctx.as_deref_mut() {
+                    ctx.append_body(&initial[..start.send]);
+                }
+                let mut first = headers_data;
+                let head_len = first.len() as u64;
+                first.extend_from_slice(&initial[..start.send]);
+                match timeout(
+                    Duration::from_secs(buffering_config.client_write_timeout_secs),
+                    client_stream.write_all(first),
+                )
+                .await
+                {
+                    Ok((Ok(_), _)) => {}
+                    _ => return Some((status_code, 0, false, true)),
+                }
+                let sent_first = head_len + start.send as u64;
+                let out = super::transfer::transfer_response_body_rest(
+                    backend_stream,
+                    client_stream,
+                    kind,
+                    start,
+                    cache_ctx,
+                )
+                .await;
+                return Some((
+                    status_code,
+                    sent_first + out.total,
+                    backend_wants_keep_alive && out.reusable(kind),
+                    out.client_must_close(kind),
+                ));
+            }
             #[cfg(feature = "wasm")]
             let mut body_result = body_result;
             // F-285: Wasm の応答本文のフェーズ（メモリに溜まった本文だけ。ディスクへ溢れた本文はかけずに流す）
@@ -293,6 +352,10 @@ where
                         }
                         return Some((status_code, total, false, true));
                     }
+                    // 溜めない応答は上で送り終えている（ここへは来ない）
+                    BufferedBodyResult::Stream { .. } => {
+                        return Some((status_code, total, false, true))
+                    }
                     BufferedBodyResult::LimitExceeded => {
                         // 507 Insufficient Storage を送信
                         let err_buf = ERR_MSG_INSUFFICIENT_STORAGE.to_vec();
@@ -366,6 +429,10 @@ where
                     BufferedBodyResult::Failed => {
                         return Some((status_code, total, false, true));
                     }
+                    // 溜めない応答は上で送り終えている（ここへは来ない）
+                    BufferedBodyResult::Stream { .. } => {
+                        return Some((status_code, total, false, true))
+                    }
                     BufferedBodyResult::LimitExceeded => {
                         // すでにヘッダー送信済みのため、507を返すことはできないので接続を閉じる
                         // （上流の本文は読み残しがあるので上流接続も戻さない。B-244）
@@ -428,6 +495,8 @@ pub(super) async fn receive_and_buffer_response<R>(
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     is_head: bool,
+    // `mode = "adaptive"` で閾値を超える・長さの分からない応答を溜めずに返してよいか（B-296）
+    allow_stream: bool,
 ) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool, bool, bool)>
 where
     R: AsyncReadRent + Unpin,
@@ -495,6 +564,28 @@ where
             let kind = parsed.body(is_head);
             let until_close = matches!(kind, ResponseBody::UntilClose);
             let chunked = matches!(kind, ResponseBody::Chunked);
+            // B-296: adaptive は**応答の** Content-Length で決める（以前は要求の長さを見ていたので GET は常に溜めた）。
+            // 閾値以下の長さ・本文の無い応答だけ溜め、超える・chunked・長さ不明は流す
+            if allow_stream && buffering_config.mode == crate::buffering::BufferingMode::Adaptive {
+                let small = match kind {
+                    ResponseBody::None => true,
+                    ResponseBody::Length(len) => len <= buffering_config.adaptive_threshold,
+                    ResponseBody::Chunked | ResponseBody::UntilClose => false,
+                };
+                if !small {
+                    return Some((
+                        status_code,
+                        headers_data,
+                        BufferedBodyResult::Stream {
+                            kind,
+                            initial: body_start,
+                        },
+                        !parsed.is_connection_close,
+                        until_close,
+                        chunked,
+                    ));
+                }
+            }
             let (body_result, reusable) = buffer_response_body_with_spillover(
                 backend_stream,
                 kind,
@@ -723,5 +814,90 @@ mod tests {
         let mut h = te.clone();
         add_content_length(&mut h, 5);
         assert_eq!(h, te);
+    }
+
+    /// 決まった応答を 1 回で返す上流
+    struct OneShot(Option<&'static [u8]>);
+
+    impl crate::runtime::io::AsyncReadRent for OneShot {
+        async fn read<T: crate::runtime::buf::IoBufMut>(
+            &mut self,
+            mut buf: T,
+        ) -> crate::runtime::io::BufResult<usize, T> {
+            let Some(c) = self.0.take() else {
+                return (Ok(0), buf);
+            };
+            let n = c.len().min(buf.bytes_total());
+            // SAFETY: write_ptr は bytes_total バイト書ける。n バイトだけ書いて初期化済みにする
+            unsafe {
+                std::ptr::copy_nonoverlapping(c.as_ptr(), buf.write_ptr(), n);
+                buf.set_init(n);
+            }
+            (Ok(n), buf)
+        }
+    }
+
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(not(all(veil_rt_uring, target_os = "linux")))]
+    fn runtime_available() -> bool {
+        true
+    }
+
+    /// B-296: adaptive は応答の Content-Length で決める（閾値以下は溜め、超える・chunked は流す）。
+    /// Wasm の応答本文のフェーズがあるとき（allow_stream = false）は常に溜める
+    #[test]
+    fn adaptive_decides_on_the_response_length() {
+        use super::{receive_and_buffer_response, BufferedBodyResult};
+        use crate::buffering::{BufferingConfig, BufferingMode};
+        if !runtime_available() {
+            return;
+        }
+        let cfg = BufferingConfig {
+            mode: BufferingMode::Adaptive,
+            adaptive_threshold: 8,
+            ..Default::default()
+        };
+        crate::runtime::block_on(async move {
+            let cases: [(&'static [u8], bool, bool); 4] = [
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                    false,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world",
+                    true,
+                    true,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                    true,
+                    true,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world",
+                    false,
+                    false,
+                ),
+            ];
+            for (resp, allow_stream, streamed) in cases {
+                let mut up = OneShot(Some(resp));
+                let (status, _, body, ..) =
+                    receive_and_buffer_response(&mut up, &cfg, None, false, allow_stream)
+                        .await
+                        .expect("response");
+                assert_eq!(status, 200);
+                assert_eq!(
+                    matches!(body, BufferedBodyResult::Stream { .. }),
+                    streamed,
+                    "{}",
+                    String::from_utf8_lossy(resp)
+                );
+            }
+        });
     }
 }

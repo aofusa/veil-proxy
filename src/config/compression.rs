@@ -286,6 +286,77 @@ impl Default for CompressionConfig {
     }
 }
 
+/// 事前圧縮した兄弟ファイル（`app.js.br` 等）を使う方式と、q が同点のときの優先順（`[route.action] precompressed`。F-294）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Precompressed {
+    order: [Option<AcceptedEncoding>; 3],
+}
+
+impl Precompressed {
+    /// 設定の値（`["br", "gzip"]` 等）を読む。`br`・`gzip`・`zstd` だけ。重複・未知の名前はエラー
+    pub fn parse<S: AsRef<str>>(names: &[S]) -> Result<Self, String> {
+        let mut order = [None; 3];
+        for (i, name) in names.iter().enumerate() {
+            let enc = match name.as_ref() {
+                "br" => AcceptedEncoding::Brotli,
+                "gzip" => AcceptedEncoding::Gzip,
+                "zstd" => AcceptedEncoding::Zstd,
+                other => return Err(format!(
+                    "invalid precompressed encoding: {:?} (expected \"br\", \"gzip\" or \"zstd\")",
+                    other
+                )),
+            };
+            if order.contains(&Some(enc)) {
+                return Err(format!(
+                    "duplicate precompressed encoding: {:?}",
+                    name.as_ref()
+                ));
+            }
+            // 3 種類しか無く重複も無いので添字は 3 未満
+            order[i] = Some(enc);
+        }
+        Ok(Self { order })
+    }
+
+    /// 使わない（既定）
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.order[0].is_none()
+    }
+
+    /// 方式（同点のときの優先順）
+    pub fn iter(&self) -> impl Iterator<Item = AcceptedEncoding> + '_ {
+        self.order.iter().map_while(|e| *e)
+    }
+
+    /// 兄弟ファイルの拡張子（`br` → `.br`、`gzip` → `.gz`、`zstd` → `.zst`）
+    pub fn extension(enc: AcceptedEncoding) -> Option<&'static str> {
+        match enc {
+            AcceptedEncoding::Brotli => Some(".br"),
+            AcceptedEncoding::Gzip => Some(".gz"),
+            AcceptedEncoding::Zstd => Some(".zst"),
+            AcceptedEncoding::Deflate | AcceptedEncoding::Identity => None,
+        }
+    }
+
+    /// 兄弟の表の添字（br・gzip・zstd の順）
+    pub fn slot(enc: AcceptedEncoding) -> Option<usize> {
+        match enc {
+            AcceptedEncoding::Brotli => Some(0),
+            AcceptedEncoding::Gzip => Some(1),
+            AcceptedEncoding::Zstd => Some(2),
+            AcceptedEncoding::Deflate | AcceptedEncoding::Identity => None,
+        }
+    }
+
+    /// 兄弟を探す方式の全部（表の添字の順）
+    pub const ALL: [AcceptedEncoding; 3] = [
+        AcceptedEncoding::Brotli,
+        AcceptedEncoding::Gzip,
+        AcceptedEncoding::Zstd,
+    ];
+}
+
 /// HTTP/3 用に解決した圧縮設定の置き場（B-303）。`Clone` は空にする
 #[derive(Default)]
 pub struct H3Resolved(std::sync::OnceLock<Arc<CompressionConfig>>);
@@ -306,6 +377,22 @@ impl CompressionConfig {
     /// `compression` feature の無いビルドで圧縮を有効にした設定を警告する（設定のロード時。B-303）。
     /// このビルドの `should_compress` は常に圧縮しない（以前は圧縮しない本文に `Content-Encoding` を付けたり、
     /// プロキシ応答を 502 にしていた）
+    /// `content_type` が圧縮対象の型か（`compressible_types` と `skip_types` の長く一致した方が勝つ。同じ長さならスキップ。
+    /// B-303: 既定の skip_types の "image/" より compressible_types の "image/svg+xml" が勝つ）
+    pub fn type_compressible(&self, content_type: &str) -> bool {
+        let longest = |list: &[String]| {
+            list.iter()
+                .filter(|t| starts_with_ignore_case(content_type, t))
+                .map(|t| t.len())
+                .max()
+        };
+        match (longest(&self.compressible_types), longest(&self.skip_types)) {
+            (Some(c), Some(k)) => c > k,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
     pub fn warn_if_unbuilt(&self) {
         if self.enabled && !cfg!(feature = "compression") {
             warn!(
@@ -392,18 +479,8 @@ impl CompressionConfig {
             return None;
         }
 
-        // 圧縮対象・スキップ対象は長く一致した方を優先する（B-303。既定の skip_types の "image/" より
-        // compressible_types の "image/svg+xml" が勝つ）。同じ長さならスキップ
-        let longest = |list: &[String]| {
-            list.iter()
-                .filter(|t| starts_with_ignore_case(ct_str, t))
-                .map(|t| t.len())
-                .max()
-        };
-        match (longest(&self.compressible_types), longest(&self.skip_types)) {
-            (Some(c), Some(k)) if c > k => {}
-            (Some(_), None) => {}
-            _ => return None,
+        if !self.type_compressible(ct_str) {
+            return None;
         }
 
         // 5. サイズ確認（Content-Length 不明なら圧縮を試みる）

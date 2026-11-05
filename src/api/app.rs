@@ -107,10 +107,14 @@ pub struct ServeOptions {
     pub mode: String,
     /// Enable `[route.open_file_cache]` (file metadata cache; default `true`).
     pub open_file_cache: bool,
-    /// Enable `[route.static_file_cache]` (file contents cache for HTTP/2 and HTTP/3; default `true`).
+    /// Enable `[route.static_file_cache]` (file contents cache: HTTP/2, HTTP/3, and HTTP/1.1 over plaintext on Linux
+    /// or userspace TLS; default `true`).
     pub static_file_cache: bool,
     /// Enable `[route.compression]` for the files (default `false`).
     pub compression: bool,
+    /// Serve precompressed siblings (`app.js.br`, `app.js.gz`, `app.js.zst`) for these encodings, in tie-break order
+    /// (`[route.action] precompressed`, for example `["br", "gzip"]`; default empty = not used).
+    pub precompressed: Vec<String>,
     /// Extra keys merged into the route table (for example `security` or `header`), as TOML.
     pub extra: Option<toml::Table>,
 }
@@ -123,6 +127,7 @@ impl Default for ServeOptions {
             open_file_cache: true,
             static_file_cache: true,
             compression: false,
+            precompressed: Vec::new(),
             extra: None,
         }
     }
@@ -148,6 +153,17 @@ impl ServeOptions {
         action.insert("mode".into(), Value::String(self.mode.clone()));
         if let Some(i) = &self.index {
             action.insert("index".into(), Value::String(i.clone()));
+        }
+        if !self.precompressed.is_empty() {
+            action.insert(
+                "precompressed".into(),
+                Value::Array(
+                    self.precompressed
+                        .iter()
+                        .map(|e| Value::String(e.clone()))
+                        .collect(),
+                ),
+            );
         }
         let mut cond = toml::Table::new();
         cond.insert("path".into(), Value::String(pattern));
@@ -457,8 +473,8 @@ impl App {
     // F-267
     /// Serves the directory `dir` under `prefix` with veil's static file server (a `type = "File"` route with
     /// `open_file_cache` and `static_file_cache`): sendfile, kTLS, Range and ETag work as for the proxy, and requests
-    /// do not go through a handler. Precompressed `.br` / `.gz` files are not used; `ServeOptions::compression`
-    /// compresses files on the fly for HTTP/2 and HTTP/3 (HTTP/1.1 sends them as they are).
+    /// do not go through a handler. `ServeOptions::precompressed` serves precompressed siblings (`.br`, `.gz`, `.zst`);
+    /// `ServeOptions::compression` compresses files on the fly on HTTP/1.1, HTTP/2 and HTTP/3.
     pub fn serve_dir(
         mut self,
         prefix: &str,

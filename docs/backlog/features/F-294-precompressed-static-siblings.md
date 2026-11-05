@@ -1,6 +1,6 @@
 # F-294: 静的配信で事前圧縮した兄弟ファイル（`.br`・`.gz`・`.zst`）を返す（nginx の `gzip_static`・`brotli_static` 相当）
 
-**状態: 未着手（2026-11-05 起票。調査・設計のみ）**
+**状態: 実装済み（2026-11-05。全 OS の E2E・A/B は v0.11.0 の試験で）**
 
 調査の全文は `docs/artifacts/v0110/review-06-precompressed.md`（git 管理外）の §1（今の経路）・§3（設計）。行番号は f8dc80de 時点。
 
@@ -72,6 +72,22 @@ precompressed = ["br", "gzip"]   # 既定 []（無効）。"zstd" も可。並�
   ディレクトリ・FIFO・古い兄弟を無視、キャッシュのヒットで offload ゼロ。
 - E2E: HTTP/1.1（平文・kTLS・rustls）・h2c・HTTP/2・HTTP/3（quinn に加えて h2load でも）、io_uring・epoll、FreeBSD の VM。
 - 交互 A/B: `precompressed` の無いルートで 3B・54KB の性能・allocs/req が変わらない。ある場合は兄弟の応答がゼロコピー（strace で sendfile）。
+
+## 修正
+
+- `[route.action] precompressed = ["br", "gzip", "zstd"]`（`config::Precompressed`。未知・重複はロード時のエラー）。`Backend::SendFile` の 10 番目の値。
+- 兄弟の探索は `src/cache/precompressed.rs`: 元のファイルのパスごとに兄弟の有無の表（DashMap。open_file_cache の有効期間・最大数・監視の世代。
+  元のファイルの大きさ・更新時刻が変わったら探し直す）。兄弟は `get_file_info_with_config`（open_file_cache・封じ込めの高速経路・フォールバックをそのまま）で開き、
+  通常のファイル・ルートの封じ込め（ディレクトリのルート）・元のファイル以上の更新時刻を確かめる。open_file_cache が無効なら毎回探す。
+- 選び方 `static_response::precompressed_candidates`: q の降順（同点は設定の順）、その場の圧縮の q の方が厳密に高い方式は除く。型では絞らない（nginx の gzip_static と同じ）。
+- 検証子 `Validators::for_sibling`（強い ETag `"<mtime>-<size>-br"`・元の Last-Modified・元の型）が `content_encoding` を持ち、`emit_headers` が 200・206 に
+  `Content-Encoding` を付ける。兄弟は `no_compression()` で `plan` するので Range・304 はそのまま効く。ルートに `precompressed` があれば `Vary` を常に付ける。
+- HTTP/1.1 は兄弟の fd・大きさで `sendfile`（kTLS も）。HTTP/2・HTTP/3 は `select_with_content` で本体を静的コンテンツキャッシュから。memory は
+  ロード時に兄弟を読む（`MemoryContent::load_precompressed`。FIFO で止まらないよう `O_NONBLOCK`、FreeBSD の capability mode は dirfd 相対）。
+- ライブラリ: `ServeOptions::precompressed`、Python の `app.serve_dir(precompressed=...)`・`StaticFiles(precompressed=...)`。C は F-291 の `veil_config_serve_dir` 側。
+- 文書: routing・compression-cache・library-kit・library-production（英日）、`examples/config.toml`。
+- 試験: 単体（候補の順・その場の圧縮との比較・兄弟の検証子のヘッダ・memory の選択と Vary）、E2E `test_f294_precompressed_http{1,2,3}`（古い兄弟を無視・304・Range）。
+- `ServeOptions` は `#[non_exhaustive]` にせず、リリースノートで `..Default::default()` を案内する。
 
 ## 関連
 

@@ -316,7 +316,6 @@ pub(super) async fn proxy_http_request_splice(
     }
 
     let client_tcp = client_stream.get_ref();
-    let plain = client_stream.is_plain();
 
     // B-245: HEAD への応答は本文を持たない（書く前に判定する）
     let is_head = request_is_head(request);
@@ -351,7 +350,7 @@ pub(super) async fn proxy_http_request_splice(
         // Content-Length の場合: splice でゼロコピー転送
         // kTLS クライアント → バックエンド TCP
         let transferred =
-            splice_body_transfer(client_tcp, backend_stream, pipe, remaining_body, plain).await;
+            splice_body_transfer(client_tcp, backend_stream, pipe, remaining_body, true).await;
 
         if transferred < remaining_body as u64 {
             warn!(
@@ -513,7 +512,9 @@ pub(super) async fn splice_transfer_response_ktls(
                             client_tcp,
                             pipe,
                             remaining,
-                            client_stream.is_plain(),
+                            // kTLS も平文と同じくその場で splice する（io_uring の splice はカーネルのワーカースレッドへ
+                            // 回る。F-292 の交互 A/B で決めた）
+                            true,
                         )
                         .await;
                         total += transferred;

@@ -138,9 +138,15 @@ Regardless of these settings, veil never compresses:
 
 - `text/event-stream` (Server-Sent Events). Compressing needs the whole body, and an event stream never ends, so it is always streamed as-is.
 - Responses whose `Content-Length` is above 64 MiB. They are streamed uncompressed.
-- Static files (`type = "File"`) larger than 8 MiB. They are sent uncompressed with `sendfile`, since compressing reads the whole file for every request.
+- Static files (`type = "File"`) larger than 8 MiB. They are sent uncompressed, since compressing reads the whole file for every request (HTTP/1.1 sends them with `sendfile`; HTTP/2 and HTTP/3 read them like any other file).
 
 To compress, veil collects the whole upstream body first, up to 64 MiB. If a response of unknown length or a chunked response goes past that, veil stops and returns 502.
+
+### Precompressed Static Files
+
+For static files you can compress ahead of time instead: `precompressed = ["br", "gzip"]` in a `type = "File"` route's
+`[route.action]` serves `app.js.br` / `app.js.gz` next to `app.js` without compressing, keeping `sendfile` and kTLS.
+See [Precompressed Files](routing.md#precompressed-files).
 
 ### HTTP/3 Compression Settings
 
@@ -156,7 +162,11 @@ compression_enabled = true
   gzip_level = 5
 ```
 
-> **Note**: When compression is enabled, kTLS zero-copy sendfile optimization is not used for compressed responses. For maximum throughput with large files, consider disabling compression for static file routes.
+> **Note**: Compression gives up zero-copy (`sendfile`/`splice`, plaintext and kTLS alike). For static files only the responses
+> that are actually compressed are read and compressed in user space. For proxied responses on HTTP/1.1, every request whose
+> `Accept-Encoding` accepts one of the route's encodings is relayed through user space (the decision needs the response
+> headers), even if the response ends up uncompressed. For maximum throughput with large files, consider disabling
+> compression for those routes.
 
 ## Proxy Cache
 
@@ -253,7 +263,8 @@ Cache keys are generated from:
 
 - The proxy cache serves requests from **HTTP/1.1 clients** to **plaintext (`http://`) upstreams**. Requests over
   HTTP/2 and HTTP/3, and responses from `https://` upstreams, are not cached yet (F-257).
-- When `streaming` buffering mode is used, kTLS zero-copy transfer is preserved
+- On a route with the cache, requests the cache may store are relayed through user space (to fill the cache); only the
+  other requests keep the zero-copy (`splice`) path of `streaming` mode
 - Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
 - `Vary: *` responses are not cached when `respect_vary = true`
 - With `respect_vary = true`, a response whose `Vary` names a header that is not in `key_headers` is not cached
@@ -412,6 +423,11 @@ Content-Length <= adaptive_threshold → Full buffering
 Content-Length > adaptive_threshold  → Streaming
 Content-Length unknown (chunked)     → Streaming
 ```
+
+The decision uses the **response's** `Content-Length` (read from the upstream response head), not the request's.
+`veil_proxy_buffering_used_total` counts only the responses that were buffered. On HTTP/2 and HTTP/3 clients, where
+each stream has its own flow control, `adaptive` streams like `streaming`; only `full` buffers. A route with a Proxy-Wasm
+module that reads the response body always buffers.
 
 ### kTLS Compatibility
 

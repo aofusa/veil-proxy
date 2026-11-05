@@ -261,29 +261,21 @@ WebSocket.
 
 ### Behavior
 
-1. Detect Upgrade request from client
-2. Forward Upgrade request to backend
-3. Receive 101 Switching Protocols
-4. Start bidirectional bypass transfer (operates in configured polling mode)
-5. Continue until either connection closes
+1. Detect an Upgrade request from the client (`GET` over HTTP/1.1 on a `Proxy` route)
+2. Forward the Upgrade request to the backend (always over HTTP/1.1)
+3. Receive 101 Switching Protocols (other responses are returned whole and the connection is closed)
+4. Relay bytes in both directions: the relay waits on both sides at once and copies from whichever side has data
+   (through a userspace buffer; idle tunnels cost no CPU)
+5. Continue until either connection closes, the idle limit (`websocket_idle_timeout_secs`) passes, or graceful shutdown starts
 
-### Polling Modes
-
-Control polling behavior during WebSocket bidirectional transfer via configuration.
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `adaptive` (default) | Short during data transfer, longer when idle | General purpose, CPU efficiency focused |
-| `fixed` | Always uses fixed timeout | Real-time games, low latency priority |
-
-See the "[WebSocket Configuration](routing.md#websocket-configuration)" section for detailed configuration options.
+The `websocket_poll_*` options of older versions are deprecated and ignored. See
+"[WebSocket Configuration](routing.md#websocket-configuration)" for the details.
 
 ### Configuration Examples
 
 WebSocket is automatically supported with regular Proxy backends:
 
 ```toml
-# WebSocket application (default settings)
 [[route]]
 [route.conditions]
 host = "example.com"
@@ -292,18 +284,9 @@ path = "/ws/*"
 type = "Proxy"
 url = "http://localhost:3000"
 
-# Low latency configuration (for real-time games)
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
+# Close tunnels that carry no data for 10 minutes
 [route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
+websocket_idle_timeout_secs = 600
 ```
 
 ### Supported Backends

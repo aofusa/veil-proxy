@@ -280,6 +280,16 @@ prepare_fixtures() {
     dd if=/dev/zero bs=40000 count=1 2>/dev/null | tr '\0' 'F' \
         > "${FIXTURES_DIR}/f150_cache/cached.txt"
 
+    # F-294: 事前圧縮した兄弟ファイル（中身は判別用の ASCII。サーバは中身を検査しない）。
+    # old.css.br は元のファイルより古いので使われない。
+    mkdir -p "${FIXTURES_DIR}/f294_pre"
+    dd if=/dev/zero bs=2000 count=1 2>/dev/null | tr '\0' 'C' > "${FIXTURES_DIR}/f294_pre/app.css"
+    printf 'BR-SIBLING-CONTENT' > "${FIXTURES_DIR}/f294_pre/app.css.br"
+    printf 'GZ-SIBLING-CONTENT' > "${FIXTURES_DIR}/f294_pre/app.css.gz"
+    printf 'OLD-BR-SIBLING' > "${FIXTURES_DIR}/f294_pre/old.css.br"
+    touch -t 202001010000 "${FIXTURES_DIR}/f294_pre/old.css.br"
+    printf 'old-original-content' > "${FIXTURES_DIR}/f294_pre/old.css"
+
     # ルーティングテスト用フィクスチャ（各テストが使用するサブパス）
     for backend in backend1 backend2; do
         mkdir -p "${FIXTURES_DIR}/${backend}/api/v1"
@@ -2004,6 +2014,19 @@ path = "${FIXTURES_DIR}/f150_cache/"
 enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 1048576
+
+# F-294: 事前圧縮した兄弟ファイル
+[[route]]
+[route.conditions]
+path = "/f294/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/f294_pre/"
+precompressed = ["br", "gzip"]
+[route.open_file_cache]
+enabled = true
+[route.static_file_cache]
+enabled = true
 EOF
 
     # リダイレクトルート（302/307/308テスト用）

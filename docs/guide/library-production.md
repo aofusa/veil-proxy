@@ -126,9 +126,9 @@ Compression needs the `compression` feature (in `full`; the Python wheel has it)
 ## Static files
 
 `App::serve_dir` (Rust) and `veil_kit.staticfiles.StaticFiles` / `app.serve_dir` (Python) serve a directory with
-the proxy's file backend (sendfile, Range, `ETag`). Precompressed `.br` / `.gz` siblings are not used; the route's
-`[route.compression]` compresses files on the fly for HTTP/2 and HTTP/3 and caches the result (HTTP/1.1 sends files
-as they are).
+the proxy's file backend (sendfile, Range, `ETag`). `precompressed` (`ServeOptions::precompressed` in Rust,
+`precompressed=["br", "gzip"]` in Python) serves precompressed `.br` / `.gz` / `.zst` siblings without compressing; the
+route's `[route.compression]` compresses files on the fly on HTTP/1.1, HTTP/2 and HTTP/3 and caches the result.
 
 `serve_dir` turns on the file metadata cache (`open_file_cache`) and the file contents cache for HTTP/2 and
 HTTP/3 (`static_file_cache`) for its route (`ServeOptions { open_file_cache, static_file_cache, .. }` in Rust,

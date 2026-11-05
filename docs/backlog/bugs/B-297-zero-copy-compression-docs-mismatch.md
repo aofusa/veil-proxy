@@ -1,6 +1,6 @@
 # B-297: ゼロコピー（sendfile・splice・kTLS）・圧縮・キャッシュ・L4 の文書が実装と食い違っている
 
-**状態: 未修正（2026-11-05 起票。項目 4・6 のコードレビューで発見。文書の修正のみ）**
+**状態: 修正済み（2026-11-05）**
 
 ## 食い違い（f8dc80de。英日とも）
 
@@ -31,6 +31,11 @@
 
 - コードを直すもの（D3・D4・B-296）はそのチケットと同じ PR で文書を直す。それ以外は本チケットで英日・`examples/config.toml`・rustdoc を直す。
 - `tools/release/check-docs.sh` で拾えるもの（キー名の存在）は拾う。
+
+## 修正
+
+- D1〜D8 を英日の文書・`examples/config.toml`・rustdoc で直した（compression-cache・routing・performance・l4-proxy・features・library-kit・library-production、
+  `App::serve_dir`・`veil-kit` の `serve`）。事前圧縮の行は F-294 に合わせて書き直した。Known limitations の行は v0.11.0 のリリースノートで消す。
 
 ## 関連
 

@@ -282,8 +282,7 @@ pub(super) async fn handle_requests(
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
                     .map(|h| slice_range(&accumulated, h.value));
-                // F-261: HTTP/1.0 の要求はアップグレードできない（ハンドラの判定にだけ使う）
-                #[cfg(feature = "handler")]
+                // F-261・B-307: HTTP/1.0 の要求はアップグレードできない
                 let http10 = req.version == Some(0);
                 // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
                 // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
@@ -426,32 +425,29 @@ pub(super) async fn handle_requests(
                     }
                 };
 
-                // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
-                let connection_header: Option<&[u8]> = headers_for_proxy
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
-                    .map(|(_, value)| value.as_ref());
+                // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）。B-307: 全ての `Connection` ヘッダを
+                // トークンに分けて比べる（確保しない。`close, foo` も close、`x-upgrade-hint` は upgrade ではない）
+                let client_wants_close: bool = crate::http_utils::header_has_token(
+                    &headers_for_proxy,
+                    b"connection",
+                    b"close",
+                );
+                let is_upgrade_connection: bool = crate::http_utils::header_has_token(
+                    &headers_for_proxy,
+                    b"connection",
+                    b"upgrade",
+                );
 
-                let client_wants_close: bool = connection_header
-                    .map(|v| v.eq_ignore_ascii_case(b"close"))
-                    .unwrap_or(false);
-
-                // WebSocket Upgrade チェック
-                // Connection: upgrade と Upgrade: websocket の両方が必要
-                let is_upgrade_connection: bool = connection_header
-                    .map(|v| {
-                        // "upgrade" または "keep-alive, upgrade" などのパターンに対応
-                        v.to_ascii_lowercase().windows(7).any(|w| w == b"upgrade")
-                    })
-                    .unwrap_or(false);
-
-                let is_websocket_upgrade: bool = headers_for_proxy
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(b"upgrade"))
-                    .map(|(_, value)| value.eq_ignore_ascii_case(b"websocket"))
-                    .unwrap_or(false);
-
-                let is_websocket: bool = is_upgrade_connection && is_websocket_upgrade;
+                // WebSocket Upgrade チェック: Connection: upgrade と Upgrade: websocket の両方が要る。
+                // RFC 6455 §4.1: GET・HTTP/1.1 だけ（それ以外はアップグレードせず通常の要求として扱う）
+                let is_websocket: bool = is_upgrade_connection
+                    && !http10
+                    && method_bytes.as_ref() == b"GET"
+                    && crate::http_utils::header_has_token(
+                        &headers_for_proxy,
+                        b"upgrade",
+                        b"websocket",
+                    );
 
                 // F-266: ライブラリのビルドでは、上限を超える本文は経路を見てから判断する（ストリーミング受信の
                 // ハンドラは本文を溜めないので通す）。本体のビルドは今までどおりここで 413
@@ -788,10 +784,9 @@ pub(super) async fn handle_requests(
                     }
                 };
 
-                // F-261: ハンドラのルートの WebSocket の要求は 400 にせず、通常のハンドラの経路へ進める
-                // （ハンドラが 101 を返して接続を引き取る）。先読みの残りはパイプラインの分として取っておく。
-                #[cfg(feature = "handler")]
-                let is_websocket = is_websocket && !matches!(backend, Backend::Handler(..));
+                // B-307: WebSocket のトンネルは Proxy のルートだけ。他のルート（ハンドラ・File・Respond・Redirect）は
+                // 通常の経路へ進める（ハンドラは 101 を返して接続を引き取る。F-261。認可・fault の応答はそのまま返る）
+                let is_websocket = is_websocket && matches!(backend, Backend::Proxy(..));
 
                 // セキュリティ設定を取得
                 let security = backend.security();
@@ -1178,7 +1173,7 @@ pub(super) async fn handle_requests(
 
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
-                    // WebSocket はプロキシバックエンドでのみサポート
+                    // WebSocket はプロキシバックエンドでのみ（上で Proxy 以外は外した）
                     if let Backend::Proxy(ref upstream_group, ref security, _, _, _, _) = backend {
                         debug!(
                             "WebSocket upgrade request detected for path: {}",
@@ -1253,11 +1248,6 @@ pub(super) async fn handle_requests(
                             }
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
-                        return;
-                    } else {
-                        // ファイルバックエンドでは WebSocket 非対応
-                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                         return;
                     }
                 }
@@ -1555,26 +1545,40 @@ pub(super) async fn handle_backend(
                 method,
                 headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
             );
+            // F-294: 事前圧縮した兄弟があればそれを返す（圧縮はしない）
+            let sibling = data.select_sibling(sreq.accept_encoding, route_compression);
+            let (rep_len, rep_validators, rep_compression) = match sibling {
+                Some(sib) => (
+                    sib.body.len() as u64,
+                    &sib.validators,
+                    crate::static_response::no_compression(),
+                ),
+                None => (data.len(), &data.validators, route_compression),
+            };
             let plan = crate::static_response::plan(
                 &sreq,
-                data.len(),
+                rep_len,
                 &mime_type,
-                Some(&data.validators),
-                route_compression,
+                Some(rep_validators),
+                rep_compression,
             );
             let status = plan.status();
-            let vary = crate::static_response::compression_applies(
-                route_compression,
-                &mime_type,
-                data.len(),
-            );
-            let body = data.body_for(&plan, route_compression);
+            let vary = data.uses_precompressed()
+                || crate::static_response::compression_applies(
+                    route_compression,
+                    &mime_type,
+                    data.len(),
+                );
+            let body = match sibling {
+                Some(sib) => crate::static_response::slice_for_plan(&sib.body, &plan),
+                None => data.body_for(&plan, route_compression),
+            };
             let header = sendfile::build_h1_static_head(
                 &plan,
-                data.len(),
+                rep_len,
                 Some(body.len() as u64),
                 &mime_type,
-                Some(&data.validators),
+                Some(rep_validators),
                 vary,
                 &security,
             );
@@ -1621,6 +1625,7 @@ pub(super) async fn handle_backend(
             canonical_base,
             static_file_cache_config,
             _,
+            precompressed,
         ) => {
             let sreq = crate::static_response::StaticRequest::from_headers(
                 method,
@@ -1641,6 +1646,7 @@ pub(super) async fn handle_backend(
                 canonical_base.as_deref(),
                 wasm_modules,
                 static_file_cache_config.as_deref(),
+                precompressed,
             )
             .await
         }

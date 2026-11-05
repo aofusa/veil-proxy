@@ -190,6 +190,7 @@ pub(super) fn build_h2_static_response(
     compression: &CompressionConfig,
     static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
     memory: Option<&crate::static_response::MemoryContent>,
+    force_vary: bool,
 ) -> (u16, Vec<(Bytes, Bytes)>, Bytes) {
     let (status, mut header_store, body) = crate::static_response::build_bytes_response(
         sreq,
@@ -200,6 +201,7 @@ pub(super) fn build_h2_static_response(
         compression,
         static_ctx,
         memory,
+        force_vary,
     );
     if let Some(ref g) = get_server_header_guard() {
         if !security.removes_response_header(b"server") {

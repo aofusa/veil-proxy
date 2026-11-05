@@ -227,10 +227,11 @@ HTTP/1.1 の応答の本文は、次の場合に veil のメモリへコピー�
 |---|---|---|
 | 平文・Linux | `sendfile(2)`、ヘッダは `MSG_MORE` で送る（静的コンテンツキャッシュにあるファイルはキャッシュから送る） | `splice(2)` |
 | 平文・FreeBSD | ヘッダも同じ呼び出しで送る `sendfile(2)` | コピー |
-| kTLS | `sendfile(2)` | `splice(2)`（Linux） |
+| kTLS | `sendfile(2)`。ヘッダは `MSG_MORE` を付けずに別に送る（カーネルが暗号化する。Linux は平文と同じ経路） | `splice(2)`（Linux） |
 | ユーザー空間の TLS（rustls） | コピー（して暗号化） | コピー |
 
 プロキシの経路は、圧縮・キャッシュ・`buffering`・Proxy-Wasm・CORS のヘッダを足すルートと chunked の本文では使わない。
+HTTPS の上流（両端が kTLS でも）・WebSocket・kTLS の上の HTTP/2 もコピーする。
 HTTP/2・HTTP/3 は常にコピーする（DATA フレーム・QUIC のパケットごとに枠が要り、フレームごとの複数のシステムコールより、
 コピーした本文の `writev` 1 回のほうが安い）。
 

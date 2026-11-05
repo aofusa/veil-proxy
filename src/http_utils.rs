@@ -488,6 +488,34 @@ pub(crate) const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
     b"upgrade",
 ];
 
+/// どれかの `name` ヘッダのカンマ区切りの値に `token` があるか（大文字小文字を区別しない。確保しない。B-307）
+pub(crate) fn header_has_token<N: AsRef<[u8]>, V: AsRef<[u8]>>(
+    headers: &[(N, V)],
+    name: &[u8],
+    token: &[u8],
+) -> bool {
+    headers
+        .iter()
+        .filter(|(n, _)| n.as_ref().eq_ignore_ascii_case(name))
+        .any(|(_, v)| has_token(v.as_ref(), token))
+}
+
+/// カンマ区切りの値に `token` があるか（大文字小文字を区別しない）
+#[inline]
+pub(crate) fn has_token(value: &[u8], token: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|t| t.trim_ascii().eq_ignore_ascii_case(token))
+}
+
+/// `Connection` ヘッダに `name` が挙がっているか（そのヘッダはホップバイホップ。B-307）
+pub(crate) fn connection_lists<N: AsRef<[u8]>, V: AsRef<[u8]>>(
+    headers: &[(N, V)],
+    name: &[u8],
+) -> bool {
+    header_has_token(headers, b"connection", name)
+}
+
 /// 指定されたヘッダーがHop-by-hopヘッダーかチェック (RFC 7230 Section 6.1)
 ///
 /// # Arguments

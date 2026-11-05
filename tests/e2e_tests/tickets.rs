@@ -2628,3 +2628,286 @@ pub(super) async fn test_f62_wasm_http_call_concurrent_requests() {
         assert_eq!(body, b"wasm-http-call-ok");
     }
 }
+
+// ====================
+// F-294: 事前圧縮した兄弟ファイル（`precompressed = ["br", "gzip"]`）
+// ====================
+
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f294_precompressed_http1() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    // q が同点なら設定の順（br）
+    let r = send_request(
+        PROXY_PORT,
+        "/f294/app.css",
+        &[("Accept-Encoding", "gzip, br")],
+    )
+    .await
+    .expect("response");
+    assert_eq!(get_status_code(&r), Some(200));
+    assert_eq!(super::upstream::f150_body(&r), "BR-SIBLING-CONTENT");
+    assert_eq!(
+        get_header_value(&r, "Content-Encoding").as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        get_header_value(&r, "Content-Type").as_deref(),
+        Some("text/css")
+    );
+    assert_eq!(
+        get_header_value(&r, "Vary").as_deref(),
+        Some("Accept-Encoding")
+    );
+    let etag = get_header_value(&r, "ETag").expect("etag");
+    assert!(
+        etag.ends_with("-br\"") && !etag.starts_with("W/"),
+        "{}",
+        etag
+    );
+
+    // gzip だけ受け付ける
+    let r = send_request(PROXY_PORT, "/f294/app.css", &[("Accept-Encoding", "gzip")])
+        .await
+        .expect("response");
+    assert_eq!(super::upstream::f150_body(&r), "GZ-SIBLING-CONTENT");
+    assert_eq!(
+        get_header_value(&r, "Content-Encoding").as_deref(),
+        Some("gzip")
+    );
+
+    // 同じ ETag の条件付き要求は 304
+    let r = send_request(
+        PROXY_PORT,
+        "/f294/app.css",
+        &[("Accept-Encoding", "br"), ("If-None-Match", etag.as_str())],
+    )
+    .await
+    .expect("response");
+    assert_eq!(get_status_code(&r), Some(304));
+
+    // Accept-Encoding 無し: 元のファイル（Vary は付く）
+    let r = send_request(PROXY_PORT, "/f294/app.css", &[])
+        .await
+        .expect("response");
+    assert_eq!(super::upstream::f150_body(&r).len(), 2000);
+    assert!(get_header_value(&r, "Content-Encoding").is_none());
+    assert_eq!(
+        get_header_value(&r, "Vary").as_deref(),
+        Some("Accept-Encoding")
+    );
+
+    // 元のファイルより古い兄弟は使わない
+    let r = send_request(PROXY_PORT, "/f294/old.css", &[("Accept-Encoding", "br")])
+        .await
+        .expect("response");
+    assert_eq!(super::upstream::f150_body(&r), "old-original-content");
+    assert!(get_header_value(&r, "Content-Encoding").is_none());
+
+    // 兄弟の範囲要求は圧縮したバイト列に対して
+    let r = send_request(
+        PROXY_PORT,
+        "/f294/app.css",
+        &[("Accept-Encoding", "br"), ("Range", "bytes=0-1")],
+    )
+    .await
+    .expect("response");
+    assert_eq!(get_status_code(&r), Some(206));
+    assert_eq!(super::upstream::f150_body(&r), "BR");
+    assert_eq!(
+        get_header_value(&r, "Content-Encoding").as_deref(),
+        Some("br")
+    );
+}
+
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f294_precompressed_http2() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    let r = client
+        .send_request_full("GET", "/f294/app.css", &[("accept-encoding", "br")], None)
+        .await
+        .expect("response");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b"BR-SIBLING-CONTENT");
+    let h = |n: &str| {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(h("content-encoding").as_deref(), Some("br"));
+    assert_eq!(h("vary").as_deref(), Some("Accept-Encoding"));
+    let r = client
+        .send_request_full("GET", "/f294/app.css", &[], None)
+        .await
+        .expect("response");
+    assert_eq!(r.body.len(), 2000);
+}
+
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+pub(super) async fn test_f294_precompressed_http3() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("address");
+    let (_client, mut send) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("h3 client");
+    let (status, body) = common::http3_client::send_http3_request(
+        &mut send,
+        "GET",
+        "/f294/app.css",
+        &[("accept-encoding", "gzip")],
+        None,
+    )
+    .await
+    .expect("h3 response");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"GZ-SIBLING-CONTENT");
+}
+
+// ====================
+// B-306・B-307: WebSocket の中継（データの欠落・アップグレードの判定）
+// ====================
+
+/// TLS でプロキシにつなぎ、`request` を送って応答の head（空行まで）を読む
+fn ws_open(path_and_headers: &[u8]) -> (ClientConnection, TcpStream, String) {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    while tls_conn.is_handshaking() {
+        tls_conn.complete_io(&mut stream).expect("TLS handshake");
+    }
+    let head = {
+        let mut tls = rustls::Stream::new(&mut tls_conn, &mut stream);
+        tls.write_all(path_and_headers).unwrap();
+        tls.flush().unwrap();
+        let mut response = Vec::new();
+        let mut single = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") && response.len() < 8192 {
+            match tls.read(&mut single) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => response.push(single[0]),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    };
+    (tls_conn, stream, head)
+}
+
+/// マスクした binary フレーム
+fn ws_frame(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let mut f = vec![0x82u8];
+    if payload.len() < 126 {
+        f.push(0x80 | payload.len() as u8);
+    } else {
+        f.push(0x80 | 126);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    f.extend_from_slice(&mask);
+    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    f
+}
+
+/// マスクしないフレームを 1 つ読む（payload）
+fn ws_read_frame<R: Read>(r: &mut R) -> Vec<u8> {
+    let mut h = [0u8; 2];
+    r.read_exact(&mut h).expect("frame header");
+    let mut len = (h[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut e = [0u8; 2];
+        r.read_exact(&mut e).unwrap();
+        len = u16::from_be_bytes(e) as usize;
+    } else if len == 127 {
+        let mut e = [0u8; 8];
+        r.read_exact(&mut e).unwrap();
+        len = u64::from_be_bytes(e) as usize;
+    }
+    let mut p = vec![0u8; len];
+    r.read_exact(&mut p).unwrap();
+    p
+}
+
+/// B-306: 大きさの違うフレームを数千往復させ、1 バイトも欠けず順序どおりに返ること（以前は io_uring で時間切れの
+/// 読み取りが受信済みのデータを捨て得た）
+#[tokio::test]
+#[ntest::timeout(60000)]
+pub(super) async fn test_b306_websocket_relay_keeps_every_byte() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let (mut conn, mut sock, head) = ws_open(b"GET /ws/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq!(get_status_code(&head), Some(101), "{}", head);
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    let mut seed: u32 = 0x1234_5678;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for round in 0..20 {
+        let mut sent = Vec::new();
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            let len = (next() % 4000) as usize + 1;
+            let payload: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            out.extend_from_slice(&ws_frame(&payload, (next()).to_be_bytes()));
+            sent.push(payload);
+        }
+        tls.write_all(&out).unwrap();
+        tls.flush().unwrap();
+        for (i, want) in sent.iter().enumerate() {
+            let got = ws_read_frame(&mut tls);
+            assert_eq!(&got, want, "round {} frame {} differs", round, i);
+        }
+    }
+}
+
+/// B-307: `GET` 以外はアップグレードしない（通常の要求として上流へ。101 にならない）。`Connection` の部分一致では
+/// アップグレードしない
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_b307_websocket_upgrade_requires_get_and_token() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let (_c, _s, head) = ws_open(b"POST /ws/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_ne!(get_status_code(&head), Some(101), "{}", head);
+    let (_c, _s, head) = ws_open(b"GET /ws/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: x-upgrade-hint\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_ne!(get_status_code(&head), Some(101), "{}", head);
+    // 101 にも remove_response_headers 等の方針が効く（`/ws/*` のルートは `X-Proxied-By` を足さないので Server の扱いだけ見る）
+    let (_c, _s, head) = ws_open(b"GET /ws/ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq!(get_status_code(&head), Some(101), "{}", head);
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{}",
+        head
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("sec-websocket-accept:"),
+        "{}",
+        head
+    );
+}

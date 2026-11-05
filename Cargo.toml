@@ -306,9 +306,7 @@ cache = ["dep:dashmap", "dep:glob"]
 # ビルド方法: cargo build --features metrics
 metrics = ["dep:prometheus"]
 
-# WebSocket プロキシサポート
-# Upgrade ヘッダー検出による双方向プロキシ
-# ビルド方法: cargo build --features websocket
+# 互換のためだけに残す（何も切り替えない。WebSocket のプロキシはどの feature の組み合わせでも使える。B-308）
 websocket = []
 
 # レートリミット・接続制限

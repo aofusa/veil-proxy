@@ -777,6 +777,8 @@ struct SendFileRequest<'a> {
     canonical_base: Option<&'a Path>,
     /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
     static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
+    /// 事前圧縮した兄弟ファイル（F-294）
+    precompressed: crate::config::Precompressed,
     #[cfg(feature = "wasm")]
     wasm_modules: Option<&'a crate::wasm_plugin_config::WasmModules>,
 }
@@ -1505,6 +1507,25 @@ impl Http3Handler {
 
         // F-101: H1 と同等のリクエストヘッダサイズ上限（RFC 6585 / 431）。
         // 巨大 QPACK 展開ヘッダによるメモリ枯渇をストリーム処理前に拒否する。
+        // B-308: `:protocol` の無い CONNECT（トンネル）は扱わない（以前は `:path` が無いので `/` として上流へ転送され得た）
+        if method == b"CONNECT" {
+            let msg: &[u8] = b"Method Not Allowed";
+            let _ = self.send_error_response(stream_id, 405, msg);
+            log_access(
+                method,
+                authority,
+                b"",
+                user_agent,
+                content_length as u64,
+                405,
+                msg.len() as u64,
+                Instant::now(),
+                self.client_ip.as_str(),
+                "",
+            );
+            return Decision::Handled;
+        }
+
         let header_block = h3_request_header_block_size(headers);
         if header_block > MAX_HEADER_SIZE {
             warn!(

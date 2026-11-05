@@ -421,7 +421,7 @@ async fn echo(req: Request) -> Response {
 
 `veil::api::ws` でハンドラが WebSocket（RFC 6455）を終端します。`WebSocketUpgrade` はハンドシェイク（HTTP/1.1・`GET`・
 `Upgrade: websocket`・`Connection: upgrade`・`Sec-WebSocket-Version: 13`・16 バイトの `Sec-WebSocket-Key`）を検査する抽出子で、
-正しくなければ 400、版違いは 426 と `Sec-WebSocket-Version: 13` を返します。`on_upgrade` は `Sec-WebSocket-Accept` 付きの
+`GET` 以外は 405、それ以外の不正は 400、版違いは 426 と `Sec-WebSocket-Version: 13` を返します。`on_upgrade` は `Sec-WebSocket-Accept` 付きの
 101 を返し、接続を渡して関数を呼びます。
 
 ```rust

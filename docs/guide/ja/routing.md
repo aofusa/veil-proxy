@@ -328,7 +328,7 @@ path = "/var/www/html"
 
 どちらのモードも HTTP/1.1・HTTP/2・HTTP/3 で同じに応えます。
 
-- 応答には `ETag` と `Last-Modified` が付きます。`sendfile` モードの ETag はファイルの更新時刻と大きさから作ります。`memory` モードは
+- `416` 以外の応答には `ETag` と `Last-Modified` が付きます。`sendfile` モードの ETag はファイルの更新時刻と大きさから作ります。`memory` モードは
   内容のハッシュ（内容が変わらなければリロードしても同じ）で、`Last-Modified` は読み込んだときのファイルの更新時刻です。
 - `If-None-Match`（弱い比較。`*` は常に一致）と `If-Modified-Since` には本文の無い `304 Not Modified` を返します。両方あれば
   `If-None-Match` を優先します。
@@ -342,6 +342,37 @@ path = "/var/www/html"
   （`W/"...-br"`・`W/"...-gzip"`・`W/"...-zstd"`）と `Vary: Accept-Encoding` を付け、`Range` は見ません（nginx の gzip と同じ）。
   条件付き要求はその要求が受け取る表現の ETag と比べるので、`304` は代わりになる `200` と同じ ETag を持ちます。`Accept-Encoding` の
   無い要求には範囲を返します。`416` にも `Vary: Accept-Encoding` を付けます。
+
+#### 事前圧縮したファイル
+
+`precompressed` は前もって圧縮したファイル（`app.js` の隣の `app.js.br`・`app.js.gz`・`app.js.zst`）を返します（nginx の
+`gzip_static`・`brotli_static` 相当）。探す方式を並べます。並びはクライアントが同じ `q` で受け付ける方式のどちらを選ぶかに使います。
+値は `"br"`（`.br`）・`"gzip"`（`.gz`）・`"zstd"`（`.zst`）です。
+
+```toml
+[[route]]
+[route.conditions]
+path = "/assets/*"
+[route.action]
+type = "File"
+path = "/var/www/assets"
+precompressed = ["br", "gzip"]
+[route.open_file_cache]
+enabled = true   # 兄弟の有無を覚える（下記）
+```
+
+- 存在する兄弟のうち、クライアントが受け付ける `q` の最も高い方式を選びます。`[route.compression]` がそれより `q` の厳密に
+  高い方式でその場で圧縮できるときは、その場の圧縮を使います。`Accept-Encoding` が無いときや合う兄弟が無いときは元のファイルを
+  返します（その場で圧縮することもあります）。
+- 兄弟は通常のファイルで、元のファイルと同じかそれより新しいときだけ使います（古い兄弟は無視するので古い内容を返しません）。
+  ディレクトリのルートでは元のファイルと同じくルートのディレクトリの中に限ります。
+- 応答は元のファイルの `Content-Type`、兄弟の `Content-Encoding`、兄弟ごとの強い ETag（`"<mtime>-<size>-br"`）、元のファイルの
+  `Last-Modified` を持ちます。`Range` は圧縮したバイト列に対して効きます。`precompressed` のあるルートの応答には常に
+  `Vary: Accept-Encoding` を付けます。
+- 兄弟は圧縮せずに送るので、HTTP/1.1 は `sendfile`（kTLS も）のままで、大きさの上限もありません。
+- `open_file_cache` が有効なら、兄弟の有無をキャッシュの有効期間だけ覚えます（`watch` が有効ならディスクの変更に追従します）。
+  無効だと要求ごとにディスク上の兄弟を探します。
+- `memory` モードでは兄弟もロード時にファイルと一緒に読みます。
 
 ### プロキシ設定
 
@@ -559,9 +590,8 @@ url = "http://unix:/run/app1.sock"
 
 ### WebSocket設定
 
-WebSocketは通常のProxyで自動サポートされます。双方向転送時のポーリング動作を設定でカスタマイズ可能です。
-
-#### 基本設定
+WebSocket は通常の `Proxy` のルートで使えます。HTTP/1.1 の `GET` で `Connection: upgrade` と `Upgrade: websocket` を持つ要求を
+上流へ転送し、上流が `101 Switching Protocols` を返したら、どちらかが閉じるまで両方向にバイトを中継します。
 
 ```toml
 # WebSocketアプリケーション
@@ -583,83 +613,26 @@ type = "Proxy"
 upstream = "websocket-pool"
 ```
 
-#### ポーリングモード設定
+トンネルの動き:
 
-WebSocket双方向転送時のポーリング動作を制御します。
+- 中継は両方向を同時に待ち、データの届いた側から読みます。データを失わず、アイドルのトンネルは CPU も syscall も使いません。
+  書き込みには他の応答と同じ時間の上限があり、読まない相手はトンネルを閉じさせます（両方の接続を握り続けられません）。
+- 上流への接続は常に HTTP/1.1 です（上流が `use_h2c`・TLS の HTTP/2 のルートでも）。
+- `101` の応答（とアップグレードを断った応答）は通常のプロキシの応答と同じくルートの応答ヘッダの方針を通ります
+  （`remove_response_headers`・`add_response_headers`・`Server`）。上流がアップグレードしなければ応答全体（本文も）を返して接続を閉じます。
+  `101` 以外の `1xx` は捨てます。
+- アップグレードするのは HTTP/1.1 の `GET` だけです（RFC 6455）。それ以外の `Upgrade: websocket` の要求と、`Proxy` 以外のルート
+  （ファイル・固定応答・リダイレクト）の要求は通常の要求として扱い、`Upgrade` を無視します。クライアントの `Connection` に挙がった
+  ヘッダは上流へ送りません。
+- graceful shutdown は drain の開始で開いているトンネルを閉じます（中継は WebSocket の close フレームを作れないので TCP を閉じます）。
+- 開いているトンネルはゲージ `veil_proxy_websocket_tunnels{protocol}` で数えます。`101` の要求は `http_requests_total` には数えますが、
+  所要時間・大きさのヒストグラムには入れません（所要時間はトンネルの寿命なので）。
+- HTTP/2・HTTP/3 のクライアント側の WebSocket はまだ対応していません（クライアントは HTTP/1.1 にフォールバックします）。
 
-| オプション | 説明 | デフォルト |
+| オプション（`[route.security]`） | 説明 | デフォルト |
 |-----------|------|-----------|
-| `websocket_poll_mode` | ポーリングモード（`"fixed"` / `"adaptive"`） | `"adaptive"` |
-| `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
-| `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
-| `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
-| `websocket_idle_timeout_secs` | アップグレード（`101`）の後のトンネルで、どちらの向きにもこの時間データが流れなければ閉じる。0 は無制限 | 0 |
-
-#### ポーリングモードの選択
-
-| モード | 動作 | 用途 |
-|--------|------|------|
-| `fixed` | 常に固定タイムアウトを使用 | リアルタイムゲームなど低レイテンシ最優先 |
-| `adaptive` | アクティブ時は短く、アイドル時は長くなる | チャット、監視ダッシュボードなどバランス重視 |
-
-**Adaptive モードの動作:**
-
-```
-データ転送あり → タイムアウトをリセット（初期値に戻す）
-タイムアウト発生 → タイムアウト × 倍率（最大値まで延長）
-
-例: 初期値=1ms, 最大=100ms, 倍率=2.0 の場合
-1ms → 2ms → 4ms → 8ms → 16ms → 32ms → 64ms → 100ms（最大値で停止）
-↓ データが来たら
-1ms（リセット）
-```
-
-#### WebSocket設定例
-
-```toml
-# リアルタイムゲーム（低レイテンシ最優先）
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3000"
-
-[route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
-
-# チャットアプリ（バランス重視）
-[[route]]
-[route.conditions]
-host = "chat.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
-[route.security]
-  websocket_poll_mode = "adaptive"
-  websocket_poll_timeout_ms = 1
-  websocket_poll_max_timeout_ms = 50
-  websocket_poll_backoff_multiplier = 2.0
-
-# 監視ダッシュボード（CPU効率優先）
-[[route]]
-[route.conditions]
-host = "monitor.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3002"
-
-[route.security]
-  websocket_poll_mode = "adaptive"
-  websocket_poll_timeout_ms = 10
-  websocket_poll_max_timeout_ms = 200
-  websocket_poll_backoff_multiplier = 1.5
-```
+| `websocket_idle_timeout_secs` | どちらの向きにもこの時間データが流れなければトンネルを閉じる。0 は無制限 | 0 |
+| `websocket_poll_mode`・`websocket_poll_timeout_ms`・`websocket_poll_max_timeout_ms`・`websocket_poll_backoff_multiplier` | v0.11.0 で廃止し、無視します（中継はポーリングしなくなりました）。既存の設定が読めるようキーは受け付けます | — |
 
 ### グローバルセキュリティ設定
 

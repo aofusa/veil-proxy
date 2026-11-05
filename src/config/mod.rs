@@ -3167,7 +3167,7 @@ mod f159_resolved_backend_tests {
 
         fn canonical_base(route: &Route) -> PathBuf {
             match route.resolved_backend.as_ref() {
-                Some(Backend::SendFile(_, true, _, _, _, _, Some(base), _, _)) => {
+                Some(Backend::SendFile(_, true, _, _, _, _, Some(base), _, _, _)) => {
                     base.to_path_buf()
                 }
                 other => panic!("expected a directory SendFile backend, got {:?}", other),

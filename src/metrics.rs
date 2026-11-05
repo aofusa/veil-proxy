@@ -907,6 +907,53 @@ pub(crate) fn record_http3_invalid_packet() {
     }
 }
 
+// B-308: プロキシの WebSocket のトンネル（ハンドラが終端する接続は `websocket_connections`）。ラベルはクライアント側の
+// プロトコル（"http/1.1"・"h2"・"h3"）だけ（系列の上限。B-159）
+#[cfg(feature = "metrics")]
+static WEBSOCKET_TUNNELS: Lazy<prometheus::IntGaugeVec> = Lazy::new(|| {
+    let g = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "websocket_tunnels",
+            "Number of open WebSocket tunnels relayed to upstreams",
+        )
+        .namespace("veil_proxy"),
+        &["protocol"],
+    )
+    .unwrap();
+    METRICS_REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// 開いている WebSocket のトンネルを数える（drop で減らす。トンネルの task が途中で捨てられても数を戻す）
+pub(crate) struct WebSocketTunnelGuard {
+    #[cfg(feature = "metrics")]
+    gauge: Option<prometheus::IntGauge>,
+}
+
+/// トンネルを開いた（`protocol` は "http/1.1"・"h2"・"h3"）
+pub(crate) fn websocket_tunnel_opened(_protocol: &'static str) -> WebSocketTunnelGuard {
+    #[cfg(feature = "metrics")]
+    {
+        let gauge = metrics_runtime_enabled().then(|| {
+            let g = WEBSOCKET_TUNNELS.with_label_values(&[_protocol]);
+            g.inc();
+            g
+        });
+        WebSocketTunnelGuard { gauge }
+    }
+    #[cfg(not(feature = "metrics"))]
+    WebSocketTunnelGuard {}
+}
+
+impl Drop for WebSocketTunnelGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "metrics")]
+        if let Some(g) = &self.gauge {
+            g.dec();
+        }
+    }
+}
+
 // B-251: 上流への接続の失敗（要求ごとの error! の代わりに数える）。上流のアドレスはラベルにしない（系列の上限。B-159）
 #[cfg(feature = "metrics")]
 static UPSTREAM_CONNECT_ERRORS_TOTAL: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
@@ -1601,12 +1648,16 @@ pub(crate) fn record_request_metrics(
             .with_label_values(&[method, status_str, host])
             .inc();
 
-        HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[method, host])
-            .observe(_duration_secs);
+        // B-308: 101（アップグレードしたトンネル）の時間はトンネルの寿命なので、所要時間・大きさの分布に入れない
+        // （トンネルは `websocket_tunnels` で数える）
+        if _status != 101 {
+            HTTP_REQUEST_DURATION_SECONDS
+                .with_label_values(&[method, host])
+                .observe(_duration_secs);
 
-        HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
-        HTTP_RESPONSE_SIZE_BYTES.observe(_resp_body_size as f64);
+            HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
+            HTTP_RESPONSE_SIZE_BYTES.observe(_resp_body_size as f64);
+        }
     }
 }
 

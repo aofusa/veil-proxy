@@ -1114,6 +1114,7 @@ impl H3BufferedTask {
                         &file_compression,
                         None,
                         Some(&data),
+                        false,
                         #[cfg(feature = "wasm")]
                         wasm_modules_to_apply.as_ref(),
                     )
@@ -1130,6 +1131,7 @@ impl H3BufferedTask {
                 canonical_base,
                 static_file_cache_config,
                 _,
+                precompressed,
             ) => {
                 // F-169: HTTP/3 専用圧縮設定を解決（Proxy 経路の `handle_proxy` と同じ
                 // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
@@ -1148,6 +1150,7 @@ impl H3BufferedTask {
                     open_file_cache_config: open_file_cache_config.as_deref(),
                     canonical_base: canonical_base.as_deref(),
                     static_file_cache_config: static_file_cache_config.as_deref(),
+                    precompressed,
                     #[cfg(feature = "wasm")]
                     wasm_modules: wasm_modules_to_apply.as_ref(),
                 })
@@ -1727,6 +1730,7 @@ impl H3BufferedTask {
             open_file_cache_config,
             canonical_base,
             static_file_cache_config,
+            precompressed,
             #[cfg(feature = "wasm")]
             wasm_modules,
         } = req;
@@ -1839,6 +1843,41 @@ impl H3BufferedTask {
                 return Ok((404, 9));
             }
         };
+        // F-294: 事前圧縮した兄弟（`app.js.br` 等）があればそれを返す（圧縮はしない。Vary は常に付ける）
+        let force_vary = !precompressed.is_empty();
+        if force_vary {
+            if let Some((sib_data, sib_validators, sib_path)) =
+                cache::precompressed::select_with_content(
+                    &served_path,
+                    data.len() as u64,
+                    &validators,
+                    &mime_owned,
+                    sreq.accept_encoding,
+                    precompressed,
+                    compression,
+                    open_file_cache_config,
+                    &content_cfg,
+                    containment,
+                )
+                .await
+            {
+                return self
+                    .send_static_response(
+                        &sreq,
+                        sib_data,
+                        &mime_owned,
+                        &sib_validators,
+                        security,
+                        crate::static_response::no_compression(),
+                        Some((&*sib_path, &content_cfg)),
+                        None,
+                        true,
+                        #[cfg(feature = "wasm")]
+                        wasm_modules,
+                    )
+                    .await;
+            }
+        }
         self.send_static_response(
             &sreq,
             data,
@@ -1848,6 +1887,7 @@ impl H3BufferedTask {
             compression,
             Some((served_path.as_path(), &content_cfg)),
             None,
+            force_vary,
             #[cfg(feature = "wasm")]
             wasm_modules,
         )
@@ -1866,6 +1906,7 @@ impl H3BufferedTask {
         compression: &CompressionConfig,
         static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
         memory: Option<&crate::static_response::MemoryContent>,
+        force_vary: bool,
         #[cfg(feature = "wasm")] wasm_modules: Option<&crate::wasm_plugin_config::WasmModules>,
     ) -> io::Result<(u16, usize)> {
         use crate::http3_stream::RespMsg;
@@ -1879,6 +1920,7 @@ impl H3BufferedTask {
             compression,
             static_ctx,
             memory,
+            force_vary,
         );
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
         #[cfg(feature = "wasm")]
