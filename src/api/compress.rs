@@ -496,10 +496,6 @@ mod tests {
             n("gzip ; q=1.0 , br ; q = 0.9"),
             Some(AcceptedEncoding::Gzip)
         );
-        assert_eq!(parse_q(b"0.001"), 1);
-        assert_eq!(parse_q(b"0.5"), 500);
-        assert_eq!(parse_q(b"1.000"), 1000);
-        assert_eq!(parse_q(b"x"), 0);
     }
 
     fn json_resp(n: usize) -> Response {

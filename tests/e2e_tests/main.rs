@@ -621,7 +621,7 @@ mod tickets;
 #[cfg(feature = "wasm")]
 mod wasm;
 // h3_grpc_coverage のリロードの試験（http3）が使う
-#[cfg(feature = "http3")]
+#[cfg(all(feature = "http3", unix))]
 use self::tickets::{fixtures_dir, proxy_pid, send_sighup, RELOAD_TEST_LOCK};
 mod coverage;
 #[cfg(any(feature = "http3", feature = "grpc", feature = "grpc-web"))]

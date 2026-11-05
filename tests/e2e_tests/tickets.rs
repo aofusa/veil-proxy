@@ -2126,6 +2126,7 @@ pub(super) static RELOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 /// 書くので、その間にリロードが走ると途中までの設定（後ろのルートが欠けた有効な TOML）を読み込んでしまう
 // 理由: 試験
 #[allow(clippy::disallowed_methods)]
+#[cfg(unix)] // SIGHUP の試験だけが使う
 pub(super) fn write_atomic(
     path: &std::path::Path,
     contents: impl AsRef<[u8]>,
@@ -2135,11 +2136,13 @@ pub(super) fn write_atomic(
     std::fs::rename(&tmp, path)
 }
 
+#[cfg(unix)] // SIGHUP の試験だけが使う
 pub(super) fn fixtures_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 /// e2e_setup.sh が書き出したプロキシの PID を読む
+#[cfg(unix)] // SIGHUP の試験だけが使う
 pub(super) fn proxy_pid() -> Option<i32> {
     std::fs::read_to_string(fixtures_dir().join("proxy.pid"))
         .ok()?
@@ -2924,6 +2927,7 @@ pub(super) async fn test_b307_websocket_upgrade_requires_get_and_token() {
 
 /// 拡張 CONNECT が広告されるまで待ってから `:protocol` 付きの CONNECT を開く（h2 は SETTINGS を受けるまで送れない）。
 /// `cleartext` は平文の h2c（`listen_cleartext`）
+#[cfg(feature = "http2")]
 async fn f288_open(
     path: &str,
     protocol: &'static str,
@@ -2971,6 +2975,7 @@ async fn f288_open(
 }
 
 /// ストリームの本文から WebSocket のフレームを 1 つ取り出す
+#[cfg(feature = "http2")]
 async fn f288_read_frame(body: &mut h2::RecvStream, buf: &mut Vec<u8>) -> Vec<u8> {
     loop {
         if buf.len() >= 2 {
@@ -3002,6 +3007,7 @@ async fn f288_read_frame(body: &mut h2::RecvStream, buf: &mut Vec<u8>) -> Vec<u8
 /// フレームがストリームの DATA で往復する。クライアントがストリームを終えたらトンネルも終わる
 #[tokio::test]
 #[ntest::timeout(40000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_f288_h2_websocket_extended_connect_echo() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3013,6 +3019,7 @@ pub(super) async fn test_f288_h2_websocket_extended_connect_echo() {
 /// F-288: 平文の h2c でも同じ（TLS の有無で経路が分かれない）
 #[tokio::test]
 #[ntest::timeout(40000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_f288_h2c_websocket_extended_connect_echo() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3021,6 +3028,7 @@ pub(super) async fn test_f288_h2c_websocket_extended_connect_echo() {
     f288_echo(true).await;
 }
 
+#[cfg(feature = "http2")]
 async fn f288_echo(cleartext: bool) {
     let (resp, mut send) = f288_open("/ws/", "websocket", cleartext).await;
     assert_eq!(resp.status(), 200, "{:?}", resp.headers());
@@ -3079,6 +3087,7 @@ async fn f288_echo(cleartext: bool) {
 /// F-288: `websocket` 以外の `:protocol` は Proxy のルートでは 501（上流へは送らない）
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_f288_h2_extended_connect_unknown_protocol() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3091,6 +3100,7 @@ pub(super) async fn test_f288_h2_extended_connect_unknown_protocol() {
 /// F-288: トンネルのストリームにもルートの `websocket_idle_timeout_secs` が効き、切れたら RST_STREAM（END_STREAM にしない）
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(feature = "http2")]
 pub(super) async fn test_f288_h2_websocket_idle_timeout_resets_stream() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

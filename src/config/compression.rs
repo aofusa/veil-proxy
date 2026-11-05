@@ -982,4 +982,12 @@ mod client_accept_tests {
             .should_compress(all, Some(b"image/png"), Some(4096), None)
             .is_none());
     }
+
+    #[test]
+    fn parse_q_reads_three_decimal_places() {
+        assert_eq!(parse_q(b"0.001"), 1);
+        assert_eq!(parse_q(b"0.5"), 500);
+        assert_eq!(parse_q(b"1.000"), 1000);
+        assert_eq!(parse_q(b"x"), 0);
+    }
 }
