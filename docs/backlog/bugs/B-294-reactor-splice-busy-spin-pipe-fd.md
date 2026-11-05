@@ -1,6 +1,6 @@
 # B-294: reactor（epoll）の `SpliceFuture` が `EAGAIN` で空回りし、時間切れも効かない。splice のパイプの fd を reactor から外さずに閉じる
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見、実機での確認は未実施）**
+**状態: 修正済み（v0.11.0）**
 
 ## 事象（コードの読み取り）
 
@@ -23,6 +23,12 @@
 - `SplicePipe` の Drop で reactor の登録を外す（`veil_rt_reactor` のときだけ）。`EPOLL_CTL_MOD` の `ENOENT` は `ADD` でやり直す（防御）。
 - 確認: epoll ビルドで L4 の接続を 1 本張り、少し送って止め、`top -H`・`strace -c` で空回りしないこと、`idle_timeout` で閉じること。
   `per_stream_pipe_enabled = true` で kTLS のプロキシを途中で切る要求を繰り返し、以後の接続が止まらないこと。epoll の E2E（F-145）。
+
+## 修正
+
+- `src/runtime/reactor/splice.rs`: `EAGAIN` を `Err(WouldBlock)` で返す（io_uring 版と同じ意味。readiness の登録をやめた）。呼び出し側（`splice_body_transfer`・L4 の `forward_direction_splice`）は既に `WouldBlock` でソケットの `readable()`/`writable()` を時間切れ付きで待つ。パイプの fd は reactor に登録されなくなる。
+- `src/runtime/reactor/executor.rs`（epoll）: `EPOLL_CTL_MOD` が `ENOENT`（別の経路で閉じられた同じ番号の fd）なら `ADD` でやり直す（防御）。
+- 単体試験 `splice_without_data_returns_would_block`（epoll ビルド）。
 
 ## 関連
 

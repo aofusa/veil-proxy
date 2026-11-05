@@ -44,6 +44,7 @@ pub(super) async fn splice_body_transfer(
     let src_fd = src_stream.as_raw_fd();
     let dst_fd = dst_stream.as_raw_fd();
     let mut total = 0u64;
+    let mut since_yield = 0usize;
 
     // 設定に基づいてチャンクサイズを決定
     let chunk_size_config = {
@@ -87,7 +88,9 @@ pub(super) async fn splice_body_transfer(
         // 中間チャンクのみに付与する。最終チャンクに付与すると、dst が kTLS ソケットの
         // 場合に 16KiB 未満の最終部分 TLS レコードがカーネル内で保留されたまま
         // フラッシュされず、クライアントが応答完了を永遠に待つハングになる。
-        let more_follows = remaining > n;
+        // B-295: 「残りがある」だけでは付けない。残りがあってもすぐ届くとは限らず、上流を待つ間 kTLS が 16KB 未満の
+        // レコードを保留する。今回チャンクいっぱい読めた（続きが既に届いている見込みが高い）ときだけ付ける
+        let more_follows = remaining > n && n == chunk_size;
         let mut moved = 0usize;
         while moved < n {
             let splice_step = if direct {
@@ -117,9 +120,31 @@ pub(super) async fn splice_body_transfer(
 
         total += n as u64;
         remaining = remaining.saturating_sub(n);
+        // B-295: その場の splice（`direct`）は待たずに進み続けるので、速い両端の間で大きな本文を流す間も同じワーカーの
+        // 他の接続を止めないよう、一定量ごとに譲る（io_uring の splice は完了待ちで自然に譲る）
+        if direct && remaining > 0 {
+            since_yield += n;
+            if since_yield >= SPLICE_YIELD_BYTES {
+                since_yield = 0;
+                crate::runtime::yield_now().await;
+            }
+        }
     }
 
     total
+}
+
+/// その場の splice で譲るまでに動かす量（B-295。平文の sendfile の 1 回の上限と同じ）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+const SPLICE_YIELD_BYTES: usize = 1024 * 1024;
+
+/// 生の書き込みを `WRITE_TIMEOUT` 付きで行う（B-295: 読まない相手で接続とタスクを永久に残さない）
+#[cfg(all(veil_ktls, target_os = "linux"))]
+async fn timed_raw_write(stream: &TcpStream, data: &[u8]) -> io::Result<()> {
+    match timeout(WRITE_TIMEOUT, async_raw_write_all(stream, data)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out")),
+    }
 }
 
 /// 平文の接続へ応答 head を `MSG_MORE` で書く（受け取らないクライアントで永久に待たない）
@@ -276,8 +301,9 @@ pub(super) async fn proxy_http_request_splice(
         }
     };
 
-    // kTLS か平文でなければフォールバック（rustls の暗号文を splice しない）
-    if !(client_stream.is_ktls_enabled() || client_stream.is_plain()) {
+    // 送受信とも kTLS か平文でなければフォールバック（rustls の暗号文を splice しない。送信だけの kTLS では
+    // 要求の本文を splice すると暗号文を上流へ流すので受信も見る）
+    if !(client_stream.is_ktls_recv_enabled() || client_stream.is_plain()) {
         return None;
     }
     // 平文の接続が読み取り済みの未消費データを抱えていたら、ソケットから splice すると本文の順序が崩れる
@@ -295,28 +321,33 @@ pub(super) async fn proxy_http_request_splice(
     // B-245: HEAD への応答は本文を持たない（書く前に判定する）
     let is_head = request_is_head(request);
 
-    // 1. リクエストヘッダーをバックエンドに送信（raw_write）
-    if let Err(e) = async_raw_write_all(backend_stream, request).await {
-        warn!("Failed to send request header: {}", e);
+    // Chunked 転送はフォールバック（終端検出が必要）。上流へ何か書く前に判定する（B-293）
+    let remaining_body = content_length.saturating_sub(initial_body.len());
+    if remaining_body > 0 && is_chunked {
         return None;
+    }
+
+    // B-293: ここから先は上流へ書き始める。途中で失敗しても `None`（＝呼び出し側が通常の経路で同じ上流の接続へ
+    // 要求を書き直す）を返さない。書き直すと上流から見て 1 つ目の要求の本文の途中に 2 つ目の head が入り、本文の残りを
+    // 別の要求として解釈させられる（要求の密輸）。502 で両方の接続を閉じる（上流はプールへ戻さない）
+    const ABORT: (u16, u64, bool, bool) = (502, 0, false, true);
+
+    // 1. リクエストヘッダーをバックエンドに送信（raw_write）
+    if let Err(e) = timed_raw_write(backend_stream, request).await {
+        warn!("Failed to send request header: {}", e);
+        return Some(ABORT);
     }
 
     // 2. 初期ボディがあれば送信
     if !initial_body.is_empty() {
-        if let Err(e) = async_raw_write_all(backend_stream, initial_body).await {
+        if let Err(e) = timed_raw_write(backend_stream, initial_body).await {
             warn!("Failed to send initial body: {}", e);
-            return None;
+            return Some(ABORT);
         }
     }
 
     // 3. 残りのリクエストボディを転送
-    let remaining_body = content_length.saturating_sub(initial_body.len());
     if remaining_body > 0 {
-        if is_chunked {
-            // Chunked 転送はフォールバック（終端検出が必要）
-            return None;
-        }
-
         // Content-Length の場合: splice でゼロコピー転送
         // kTLS クライアント → バックエンド TCP
         let transferred =
@@ -327,7 +358,7 @@ pub(super) async fn proxy_http_request_splice(
                 "Request body transfer incomplete: {} < {}",
                 transferred, remaining_body
             );
-            return None;
+            return Some(ABORT);
         }
     }
 
@@ -444,7 +475,7 @@ pub(super) async fn splice_transfer_response_ktls(
                 let r = if more {
                     send_head_more(client_tcp, &out).await
                 } else {
-                    async_raw_write_all(client_tcp, &out).await
+                    timed_raw_write(client_tcp, &out).await
                 };
                 let n = out.len();
                 if out.capacity() <= SPLICE_HEAD_BUF_KEEP {
@@ -456,7 +487,7 @@ pub(super) async fn splice_transfer_response_ktls(
                     .await
                     .map(|_| head_len)
             } else {
-                async_raw_write_all(client_tcp, &accumulated[..head_len])
+                timed_raw_write(client_tcp, &accumulated[..head_len])
                     .await
                     .map(|_| head_len)
             };
@@ -513,7 +544,7 @@ pub(super) async fn splice_transfer_response_ktls(
                         ) {
                             break;
                         }
-                        if async_raw_write_all(client_tcp, &header_buf[..consumed])
+                        if timed_raw_write(client_tcp, &header_buf[..consumed])
                             .await
                             .is_err()
                         {
@@ -542,7 +573,7 @@ pub(super) async fn splice_transfer_response_ktls(
                             Ok(Ok(n)) if n > 0 => n,
                             _ => break,
                         };
-                        if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
+                        if (timed_raw_write(client_tcp, &header_buf[..n]).await).is_err() {
                             break;
                         }
                         total += n as u64;

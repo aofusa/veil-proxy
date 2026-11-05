@@ -1,6 +1,6 @@
 # B-295: HTTP/1.1 の splice の経路のいくつかの書き込みに時間の上限が無く、平文の splice のループが譲らない。`SPLICE_F_MORE` を本文が続くかで付けている
 
-**状態: 未修正（2026-11-05 起票。コードレビューで発見）**
+**状態: 修正済み（v0.11.0）**
 
 ## 事象（コードの読み取り、f8dc80de）
 
@@ -18,6 +18,11 @@
 2. 1MB 動かすごとに `yield_now`。
 3. MORE は「今回の src → pipe でチャンクいっぱい（`n == chunk_size`）読めた」ときだけ付ける。
 - 確認: 読まないクライアントで `WRITE_TIMEOUT` 後に閉じる（応答 head・chunked・EOF 終端）。大きな本文を流しながら同じワーカーの別の接続の応答時間が伸びない。
+
+## 修正
+
+- `src/proxy/splice.rs`: 上流への要求 head・本文、クライアントへの応答 head・chunked・EOF 終端の本文の書き込みを `timed_raw_write`（`WRITE_TIMEOUT`）にした。その場の splice は 1MB ごとに `yield_now`。`SPLICE_F_MORE` は残りがありチャンクいっぱい読めたときだけ。
+- 要求本文の splice の条件を `is_ktls_recv_enabled() || is_plain()` にした（送信だけの kTLS で暗号文を上流へ流さない。F-292 の項目 6）。
 
 ## 関連
 

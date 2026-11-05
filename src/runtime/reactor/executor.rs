@@ -235,11 +235,18 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
     // カーネルがレベル状態を再評価するため、「`poll(2)` は readable なのに `recvmsg` が
     // `EAGAIN` を返す」kTLS ソケットでも次の周回で必ず起床できる。F-166 A-2 で
     // `EPOLLET` + 生涯 1 回 ADD に変えたところ、まさにこの状況で恒久ハングした。
-    let res = if needs_add {
+    let mut needs_add = needs_add;
+    let mut res = if needs_add {
         with_poller(|p| p.add(fd, mask))
     } else {
         with_poller(|p| p.modify(fd, mask))
     };
+    // B-294: 表では「カーネルが知っている」となっているのに、別の経路で close された同じ番号の fd が
+    // 再利用されていると MOD は ENOENT になる（epoll は close で登録を外す）。ADD でやり直して待ちを武装する
+    if !needs_add && matches!(&res, Err(e) if e.raw_os_error() == Some(libc::ENOENT)) {
+        needs_add = true;
+        res = with_poller(|p| p.add(fd, mask));
+    }
     match res {
         Ok(()) => {
             if needs_add {

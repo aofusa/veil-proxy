@@ -1306,3 +1306,71 @@ url = "http://127.0.0.1:{up}/p"
     assert_eq!((st, body.as_slice()), (200, &b"abc"[..]), "{}", veil.log());
     assert!(pending.is_empty(), "{} extra bytes", pending.len());
 }
+
+/// B-293: プロキシの splice の経路で要求の本文が途中で終わっても、同じ上流の接続へ要求の head を書き直さない
+/// （以前は `None` を返し、通常の経路が head と最初の本文をもう一度書いた＝上流から見て本文の途中に 2 つ目の要求）。
+#[test]
+fn b293_truncated_request_body_is_not_resent_upstream() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    // 上流は受け取った生のバイト列を全部記録する（不完全な要求の本文も見る）
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = l.local_addr().unwrap().port();
+    let raw = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let raw2 = raw.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let raw = raw2.clone();
+            std::thread::spawn(move || {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(20)));
+                let mut tmp = [0u8; 16384];
+                while let Ok(n) = c.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.lock().unwrap().extend_from_slice(&tmp[..n]);
+                }
+            });
+        }
+    });
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/p"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}/p"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    // head だけ先に送り（読み取り済みの本文を小さくして splice の経路に乗せる）、本文の一部を送って送信側を閉じる
+    s.write_all(b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    s.write_all(&binary_body(100 * 1024)).unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    std::thread::sleep(Duration::from_millis(500));
+    let raw = raw.lock().unwrap();
+    let heads = raw.windows(8).filter(|w| w == b"POST /p/").count();
+    assert_eq!(
+        heads,
+        1,
+        "upstream must see the request head once ({} bytes received)\n{}",
+        raw.len(),
+        veil.log()
+    );
+    assert!(
+        resp.starts_with(b"HTTP/1.1 502"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+}
