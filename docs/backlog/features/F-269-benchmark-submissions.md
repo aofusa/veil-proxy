@@ -1,11 +1,13 @@
 # F-269: HttpArena（veil 単体・Rust API・Python）と the benchmarker（Python）へのベンチマークの提出
 
-**状態: HttpArena は PR 提出済み（2026-11-05、#1706 veil-api・#1707 veil-python・#1708 veil。メンテナの validate の承認・`/benchmark` 待ち）。the benchmarker は未着手。親は [F-258](F-258-v0100-plan.md)**
+**状態: HttpArena は PR 提出済み（2026-11-05、#1706 veil-api・#1707 veil-python・#1708 veil。メンテナの validate の承認・`/benchmark` 待ち）。the benchmarker は fork・push 済み（PR は利用者の確認待ち）。親は [F-258](F-258-v0100-plan.md)**
 
 - v0.10.1 の公開物（crates.io・PyPI・ghcr.io）だけで: HttpArena veil-api 113/0・veil-python 113/0・veil 72/0（`static-tls compression` も PASS）、
   the-benchmarker python/veil `.spec` 16/0・helpers_spec 10/0。提出文は `docs/artifacts/benchmark/pr/`、ログは `results/v0101/published/`（git 管理外）。
 - HttpArena: fork `aofusa/HttpArena` に枝 `add-veil-api`（bb43c240）・`add-veil-python`（c331a46b）・`add-veil`（2f3b6e37）を push 済み
   （上流 main 76e0fad の上。検証した a1b4c3f からの差分は結果のデータだけ）。PR 本文は `pr/body-httparena-*.md`。
+- the benchmarker: fork `aofusa/web-frameworks` に枝 `add-python-veil`（c73aca7d、上流 develop 5e3d529 の上。検証した 78c6a94
+  からの差分は他のフレームワークだけ）を push 済み。PR 本文は `pr/body-web-frameworks-python-veil.md`。
 
 ## 背景
 
