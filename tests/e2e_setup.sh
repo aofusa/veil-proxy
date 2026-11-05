@@ -164,6 +164,11 @@ ensure_veil_binary() {
     elif ! cargo build ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}"; then
         log_error "cargo build --features ${VEIL_E2E_FEATURES} failed"
         exit 1
+    elif is_windows_host && ! cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" --no-run; then
+        # Windows は実行中の veil.exe を置き換えられない。E2E の試験のビルドは dev-dependencies の feature の統合で
+        # veil を作り直すので、サーバを起動する前に済ませておく（起動後の cargo test がリンクで失敗していた）
+        log_error "cargo test --test e2e_tests --no-run failed"
+        exit 1
     fi
     if ! (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet); then
         log_error "grpc_server build failed"
