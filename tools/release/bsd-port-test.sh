@@ -70,12 +70,12 @@ freebsd)
     sysrc veil_enable=YES >/dev/null
     check "service veil start" service veil start
     sleep 3
-    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS --max-time 10 http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "default path built in" sh -c '/usr/local/bin/veil --help | grep -q /usr/local/etc/veil/config.toml'
     check "runs as www" sh -c 'ps -axo user,args | grep -E "^www +[^ ]*veil( |$)" >/dev/null'
     check "service veil reload" service veil reload
     sleep 2
-    check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "GET / after reload" sh -c 'curl -fsS --max-time 10 http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "reload reached veil" grep -q "SIGHUP received" /var/log/veil.log
     check "service veil stop" service veil stop
     sleep 2
@@ -128,11 +128,11 @@ openbsd)
     check "rcctl enable veil" rcctl enable veil
     check "rcctl start veil" rcctl start veil
     sleep 3
-    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS --max-time 10 http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "runs as _veil" sh -c 'ps -axo user,args | grep -E "^_veil +[^ ]*veil( |$)" >/dev/null'
     check "rcctl reload veil" rcctl reload veil
     sleep 2
-    check "GET / after reload" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "GET / after reload" sh -c 'curl -fsS --max-time 10 http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "rcctl stop veil" rcctl stop veil
     sleep 2
     check "no veil left after stop" sh -c '! pgrep -x veil'
@@ -205,7 +205,7 @@ netbsd)
     echo veil=YES >> /etc/rc.conf
     check "service veil start" /etc/rc.d/veil start
     sleep 3
-    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
+    check "GET / on 127.0.0.1:8080" sh -c 'curl -fsS --max-time 10 http://127.0.0.1:8080/quickstart.html | grep -q "veil quickstart"'
     check "runs as veil" sh -c 'ps -axo user,args | grep -E "^veil +[^ ]*veil( |$)" >/dev/null'
     # 降格の結果（NetBSD の ps の comm は実行ファイルのパスで、桁で切れる。上の検査は args の先頭で見る）
     ps -axo user,uid,args | grep '[v]eil' || true

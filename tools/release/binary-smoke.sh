@@ -36,21 +36,21 @@ serve_check() {
     local up=0
     local i=0
     while [ "$i" -lt 60 ]; do
-        if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then up=1; break; fi
+        if curl -s --max-time 10 -o /dev/null "http://127.0.0.1:$PORT/"; then up=1; break; fi
         sleep 1; i=$((i+1))
     done
     if [ "$up" = 1 ]; then
         for p in / /quickstart.html; do
-            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$p")"
+            code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$p")"
             [ "$code" = 200 ] && ok "$label: GET $p" || bad "$label: GET $p -> $code"
         done
         if curl -V 2>/dev/null | grep -qi 'HTTP2'; then
-            code="$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code} %{http_version}' "http://127.0.0.1:$PORT/")"
+            code="$(curl -s --max-time 10 --http2-prior-knowledge -o /dev/null -w '%{http_code} %{http_version}' "http://127.0.0.1:$PORT/")"
             [ "$code" = "200 2" ] && ok "$label: h2c" || bad "$label: h2c -> $code"
         else
             echo "skip $label: h2c (this curl has no HTTP/2)"
         fi
-        code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/no-such-file")"
+        code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/no-such-file")"
         [ "$code" = 404 ] && ok "$label: missing file is 404" || bad "$label: missing file -> $code"
     else
         if kill -0 "$pid" 2>/dev/null; then bad "$label: running but not answering on 127.0.0.1:$PORT"

@@ -360,11 +360,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
-      # VM の起動が止まることがある（rc.2 の NetBSD は起動の途中で 3 時間止まった。いつもは 40 分以内）。
+      # VM の中のコマンドが止まることがある（B-292: v0.9.0-rc.4・v0.10.1-rc.3 の NetBSD は 100 分の時間切れまで止まった。
+      # いつもは 40 分以内）。ログは job にも流し（tee）、bsd-guest-build.sh が段ごとに時間を切る。
       # ビルドの失敗はこの step を失敗にしない（BUILD_FAILED を書く）ので、失敗・時間切れは VM の不調として 1 回だけやり直す
       - name: build, unit tests and smoke test in the VM
         id: vm
-        timeout-minutes: 100
+        timeout-minutes: 60
         continue-on-error: true
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
@@ -376,7 +377,8 @@ jobs:
           shell: bash
           run: |
             mkdir -p out
-            sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out > out/build.log 2>&1 || { echo "BUILD_FAILED" >> out/build.log; }
+            { sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out; echo $? > out/rc; } 2>&1 | tee out/build.log
+            [ "$(cat out/rc)" = 0 ] || echo "BUILD_FAILED" >> out/build.log
             sudo chown -R "$(id -u)" out || true
       - name: stop the stuck VM
         if: steps.vm.outcome != 'success'
@@ -386,7 +388,7 @@ jobs:
           rm -rf out
       - name: build, unit tests and smoke test in the VM (retry)
         if: steps.vm.outcome != 'success'
-        timeout-minutes: 100
+        timeout-minutes: 60
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
           operating_system: ${{ matrix.os }}
@@ -397,7 +399,8 @@ jobs:
           shell: bash
           run: |
             mkdir -p out
-            sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out > out/build.log 2>&1 || { echo "BUILD_FAILED" >> out/build.log; }
+            { sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out; echo $? > out/rc; } 2>&1 | tee out/build.log
+            [ "$(cat out/rc)" = 0 ] || echo "BUILD_FAILED" >> out/build.log
             sudo chown -R "$(id -u)" out || true
       - name: report
         if: always()
