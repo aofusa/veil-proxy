@@ -1,6 +1,6 @@
 # F-292: HTTP/1.1 の kTLS の本文のゼロコピー転送を平文と同じ経路（`sendfile_plain` 相当・その場の非ブロッキング `splice`）にそろえる
 
-**状態: 未着手（2026-11-05 起票。調査・設計のみ）**
+**状態: 実装済み**
 
 調査の全文は `docs/artifacts/v0110/review-04-ktls-zero-copy.md`（git 管理外）。行番号は f8dc80de 時点。
 
@@ -45,6 +45,15 @@
 - 交互 A/B（f8dc80de の `git worktree` をベースライン、4 回以上の中央値）: io_uring と epoll、3B・54KB・1MB 以上、静的（キャッシュ有無）とプロキシ、
   両方 kTLS（nginx は `ssl_conf_command Options KTLS`・`sendfile on`・`open_file_cache`、TLS 1.3 AES-128-GCM）。CPU µs/req・命令数/req・`strace -c`・
   TLS のレコード数。errors 列を先に見る。io_uring の splice より遅ければ、その経路は io_uring のまま残す（理由を記録）。
+
+## 修正
+
+- HTTP/1.1 の kTLS（Linux）の静的配信を平文と同じ `sendfile_body`（`src/proxy/sendfile.rs`）に一般化した。ヘッダは `MSG_MORE` を付けずに `send(2)`（カーネルが暗号化する。B-25）、本文は `sendfile(2)`。時間切れ・他の接続へ譲る・短い本文で閉じる・`sendfile` 非対応のファイルは読み書きへ、を平文と共有する。
+- プロキシの本文の `splice(2)` は kTLS でも平文と同じくその場の非ブロッキング（io_uring の splice はカーネルのワーカースレッドへ回る）。
+- kTLS の `MSG_MORE` は既定オフのまま（各カーネルでの確認が要るため本チケットでは入れない）。
+- 交互 A/B（fcde8dd9 対 新、静的 kTLS・wrk 2 スレッド 32 接続 8 秒・6 周、他のビルドと同居のため CPU 時間/要求で判断）:
+  3B 90.1→78.8 µs/req（−12.5%）・54KB 278.4→278.6（同等）・1MB 3294.6→3117.7（−5.4%）。退行なしとして採用。
+  プロキシの組は上流（nginx）の設定誤りで Non-2xx だったため判定に使っていない（プロキシの splice は従来から平文と同じ経路）。
 
 ## 関連
 
