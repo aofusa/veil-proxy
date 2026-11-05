@@ -1483,6 +1483,7 @@ pub(super) async fn test_cache_purge_prefix() {
 
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_proxy_still_responds_after_sighup() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2148,6 +2149,7 @@ pub(super) fn proxy_pid() -> Option<i32> {
 }
 
 /// プロキシへ SIGHUP を送る（設定 + TLS 証明書リロードのトリガー）
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) fn send_sighup(pid: i32) -> bool {
     std::process::Command::new("kill")
         .args(["-HUP", &pid.to_string()])
@@ -2187,6 +2189,7 @@ pub(super) fn get_server_cert_der(port: u16) -> Result<Vec<u8>, String> {
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
 #[allow(clippy::await_holding_lock)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_config_reload_adds_route_via_sighup() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2296,6 +2299,7 @@ index = "index.html"
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
 #[allow(clippy::await_holding_lock)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_config_reload_invalid_config_keeps_serving() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2342,6 +2346,7 @@ pub(super) async fn test_config_reload_invalid_config_keeps_serving() {
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
 #[allow(clippy::await_holding_lock)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_tls_cert_reload_via_sighup() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

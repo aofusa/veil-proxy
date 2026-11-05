@@ -222,6 +222,30 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// Windows の UDP ソケットで、送ったデータグラムへの ICMP port unreachable を次の受信の `WSAECONNRESET`
+/// （10054）として報告させない（B-310）。既定では、閉じたクライアントへの送信のたびに受信がエラーになり、
+/// HTTP/3 の受信の周回を 1 回捨ててエラーをログする。失敗しても受信は動くので無視する。
+#[cfg(windows)]
+pub(crate) fn disable_udp_connreset(sock: windows_sys::Win32::Networking::WinSock::SOCKET) {
+    let off: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY: sock は呼び出し側が所有する有効な UDP ソケット。入力は生存する u32 の FALSE（4 バイト）、出力は無し、
+    // returned は生存する u32。OVERLAPPED と完了ルーチンを渡さないので同期の呼び出し。
+    unsafe {
+        WinSock::WSAIoctl(
+            sock,
+            WinSock::SIO_UDP_CONNRESET,
+            &off as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        );
+    }
+}
+
 #[cfg(windows)]
 fn new_nonblocking_dgram_socket(domain: i32) -> io::Result<RawFd> {
     ensure_wsa_started();
@@ -238,6 +262,7 @@ fn new_nonblocking_dgram_socket(domain: i32) -> io::Result<RawFd> {
         unsafe { closesocket(sock) };
         return Err(e);
     }
+    disable_udp_connreset(sock);
     Ok(crate::runtime::handle::win::from_socket(sock))
 }
 
