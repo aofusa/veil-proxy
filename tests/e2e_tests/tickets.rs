@@ -2876,20 +2876,28 @@ pub(super) async fn test_b306_websocket_relay_keeps_every_byte() {
         seed ^= seed << 5;
         seed
     };
+    // 1 回に送る量は 16KB ほどまで（読まずに書き続けると、ソケットの送受信のバッファが小さい OS（NetBSD）では
+    // 経路のバッファが埋まり、中継の書き込みが WRITE_TIMEOUT で切れる。試験のクライアントの作りの問題）
+    const IN_FLIGHT: usize = 16 * 1024;
     for round in 0..20 {
-        let mut sent = Vec::new();
-        let mut out = Vec::new();
-        for _ in 0..100 {
-            let len = (next() % 4000) as usize + 1;
-            let payload: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            out.extend_from_slice(&ws_frame(&payload, (next()).to_be_bytes()));
-            sent.push(payload);
-        }
-        tls.write_all(&out).unwrap();
-        tls.flush().unwrap();
-        for (i, want) in sent.iter().enumerate() {
-            let got = ws_read_frame(&mut tls);
-            assert_eq!(&got, want, "round {} frame {} differs", round, i);
+        let mut frame = 0;
+        while frame < 100 {
+            let mut sent = Vec::new();
+            let mut out = Vec::new();
+            while frame < 100 && out.len() < IN_FLIGHT {
+                let len = (next() % 4000) as usize + 1;
+                let payload: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                out.extend_from_slice(&ws_frame(&payload, (next()).to_be_bytes()));
+                sent.push(payload);
+                frame += 1;
+            }
+            tls.write_all(&out).unwrap();
+            tls.flush().unwrap();
+            let first = frame - sent.len();
+            for (i, want) in sent.iter().enumerate() {
+                let got = ws_read_frame(&mut tls);
+                assert_eq!(&got, want, "round {} frame {} differs", round, first + i);
+            }
         }
     }
 }
