@@ -483,11 +483,27 @@ pub(super) mod wasm_tests {
         let metrics = send_request(PROXY_PORT, "/__metrics", &[])
             .await
             .expect("metrics");
-        for want in [
-            r#"veil_wasm_failures_total{action="rejected",filter="fuel_burner",phase="response_headers",reason="fuel"}"#,
-            r#"veil_wasm_failures_total{action="continued",filter="fuel_burner_open",phase="response_headers",reason="fuel"}"#,
+        // Pulley（インタープリタ）のターゲットは命令が遅く、fuel を使い切る前に実時間の上限（エポック、約 1 秒）に
+        // 当たって `timeout` になる（fuel の上限は「1ms に 100 万命令」のネイティブの速さを前提にしている）
+        let pulley = cfg!(any(
+            target_os = "openbsd",
+            target_os = "netbsd",
+            veil_wasm_nosignals
+        ));
+        for (action, filter) in [
+            ("rejected", "fuel_burner"),
+            ("continued", "fuel_burner_open"),
         ] {
-            assert!(metrics.contains(want), "missing {want}");
+            let line = |reason: &str| {
+                format!(
+                    r#"veil_wasm_failures_total{{action="{action}",filter="{filter}",phase="response_headers",reason="{reason}"}}"#
+                )
+            };
+            assert!(
+                metrics.contains(&line("fuel")) || (pulley && metrics.contains(&line("timeout"))),
+                "missing {}",
+                line("fuel")
+            );
         }
     }
 

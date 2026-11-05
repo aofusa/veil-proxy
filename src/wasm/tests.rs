@@ -2284,6 +2284,8 @@ mod failure_policy_tests {
     }
 
     #[test]
+    // OpenBSD は OnDemand アロケータで pooling の枠が無い（B-52）。枠が埋まる状況が起きない
+    #[cfg(not(target_os = "openbsd"))]
     fn exhausted_instance_slots_wait_briefly_then_follow_the_policy() {
         // 待ちはランタイムのタイマーを使う（ワーカーのランタイムの中で動かす）
         #[cfg(veil_rt_uring)]
