@@ -2162,6 +2162,7 @@ pub(super) fn send_sighup(pid: i32) -> bool {
 }
 
 /// TLS ハンドシェイクを行い、サーバ証明書（リーフ）の DER を返す
+#[cfg(unix)] // SIGHUP の試験だけが使う
 pub(super) fn get_server_cert_der(port: u16) -> Result<Vec<u8>, String> {
     init_crypto_provider();
     let config = ClientConfig::builder()
