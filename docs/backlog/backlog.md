@@ -631,6 +631,7 @@
 | B-288 | P3 | 修正済み（v0.10.1） | [bugs/B-288-swagger-offline-try-out-race.md](bugs/B-288-swagger-offline-try-out-race.md) | `examples-nightly` の Swagger UI オフライン試験が、操作の解決（非同期）前に Try it out を数えて `/plaintext` で「無い」と誤判定していた。Parameters の見出しの描画を待ってから数える |
 | B-289 | P3 | 修正済み（v0.10.1） | [bugs/B-289-circuit-breaker-gauge-missing-until-change.md](bugs/B-289-circuit-breaker-gauge-missing-until-change.md) | `veil_circuit_breaker_state` は状態が変わるまで系列が無く（B-278 以降）、Grafana の例の試験（`examples-nightly`）がタイミング次第で落ちた。起動・リロードでメトリクスを有効にした直後に今の状態を出す |
 | B-290 | P3 | 修正済み | [bugs/B-290-dockerhub-signature-verify-race.md](bugs/B-290-dockerhub-signature-verify-race.md) | Docker Hub へ写した直後の `cosign verify` が、署名の反映の遅れで `no signatures found` になり v0.10.1 の `dockerhub` ジョブが落ちた（再実行で通過）。検証を間を置いて数回試す |
+| B-291 | P3 | 修正済み | [bugs/B-291-ghsa-audit-rate-limit-nightly.md](bugs/B-291-ghsa-audit-rate-limit-nightly.md) | `container-security-nightly` が vendoring 版の勧告照合（F-277）に `GITHUB_TOKEN` を渡さず無認証で GitHub API を呼び、共有ランナーの上限で 403 rate limit になり cargo_audit が落ちた。トークンを渡し、レート制限のときだけ待って数回やり直す |
 
 ---
 

@@ -81,6 +81,9 @@ jobs:
       - name: Run container security suite
         env:
           VEIL_IMAGE: "veil:${{ matrix.libc }}"
+          # vendoring 版を GitHub の勧告と照合する API の上限を広げる（F-277。無認証は共有ランナーの IP ごとに
+          # 1 時間 60 回で、他の利用者と分け合うため 403 rate limit で落ちていた。B-291）
+          GITHUB_TOKEN: ${{ github.token }}
           # nightly は fuzz・cargo-audit・cargo-deny を有効化。
           SKIP_LIBFUZZER: ${{ (github.event_name == 'schedule' || inputs.run_libfuzzer) && '0' || '1' }}
           SKIP_LIBFUZZER_ASAN: ${{ inputs.run_libfuzzer_asan && '0' || '1' }}

@@ -10,13 +10,22 @@ advisory that the vendored copy has fixed. "- advisory-repo: <owner>/<repo>（re
 checks the advisories published on the upstream repository, which GitHub does not always
 copy into the global database (quiche's GHSA-4fgf-9xrr-88gf and GHSA-4q5x-gp38-rfp4). Exits non-zero when an unignored advisory
 matches or the advisory API cannot be read (never reports success without checking).
+A rate-limited response (set GITHUB_TOKEN to raise the limit) is retried a few times
+after the wait GitHub asks for, and still fails if the API stays unreadable.
 """
 import glob
 import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
+
+# B-291: レート制限（403 + X-RateLimit-Remaining: 0、または 429）のときだけ待ってやり直す。
+# 待ちが長すぎる（上限の回復が遠い）・回数を使い切ったら従来どおり失敗にする（照合せずに ok にしない）
+RETRIES = 3
+MAX_WAIT = 120
 
 SPEC = re.compile(r"crates\.io の \[`([A-Za-z0-9_-]+)` ([0-9][0-9A-Za-z.+-]*)\]")
 IGNORE = re.compile(r"^- advisory-ignore: ((?:GHSA|RUSTSEC)-[0-9A-Za-z-]+)（.+）", re.M)
@@ -24,19 +33,32 @@ REPO = re.compile(r"^- advisory-repo: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)（.+）"
 
 
 def advisories(name, version):
-    url = (
+    data = _get(
         "https://api.github.com/advisories?ecosystem=rust"
         f"&affects={name}@{version}&per_page=100"
     )
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.load(resp)
     if not isinstance(data, list):
         raise RuntimeError(f"unexpected advisory API response for {name}@{version}")
     return [a for a in data if not a.get("withdrawn_at")]
+
+
+def rate_limit_wait(err, now=None):
+    """Seconds to wait before retrying a rate-limited GitHub API response, or None when
+    `err` is not a rate limit (a plain 403 such as a permission error is not retried)."""
+    if err.code not in (403, 429):
+        return None
+    headers = err.headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after and retry_after.strip().isdigit():
+        return int(retry_after.strip())
+    if headers.get("X-RateLimit-Remaining") == "0":
+        reset = headers.get("X-RateLimit-Reset")
+        if reset and reset.strip().isdigit():
+            return max(0, int(reset.strip()) - int(now if now is not None else time.time())) + 1
+        return 60
+    if err.code == 429:
+        return 60
+    return None
 
 
 def _get(url):
@@ -44,8 +66,16 @@ def _get(url):
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)
+    for attempt in range(RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            wait = rate_limit_wait(e)
+            if wait is None or wait > MAX_WAIT or attempt == RETRIES:
+                raise
+            print(f"warning: GitHub API rate limited ({e.code}); retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
 
 
 def _ver(v):
