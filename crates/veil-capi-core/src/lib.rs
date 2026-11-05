@@ -145,6 +145,8 @@ struct CRoute {
     // F-270: 応答の圧縮を許す（`VEIL_ROUTE_NO_COMPRESS` が無い）
     compress: bool,
     meta: OperationMeta,
+    /// 本文の JSON Schema（`veil_register_route_ex2`。合わなければ 422。F-291）
+    schema: Option<std::sync::Arc<validate::Schema>>,
 }
 
 /// 設定 + 登録待ちルート（不透明）。
@@ -613,6 +615,85 @@ pub unsafe extern "C" fn veil_register_route_ex(
     flags: u32,
     openapi_json: *const c_char,
 ) -> c_int {
+    register(
+        cfg,
+        path,
+        methods_csv,
+        handler,
+        user_data,
+        flags,
+        openapi_json,
+        ptr::null(),
+    )
+}
+
+/// Route options of `veil_register_route_ex2` (zero-filled means defaults; `size` is
+/// `sizeof(veil_route_options_t)` or 0).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct veil_route_options_t {
+    pub size: usize,
+    /// `VEIL_ROUTE_*` flags.
+    pub flags: u32,
+    /// An OpenAPI Operation Object as JSON (NULL: none).
+    pub openapi_json: *const c_char,
+    /// A JSON Schema of the request body (NULL: no validation). A body that is not JSON or does not match is
+    /// answered with 422 and `{"detail": [...]}` before the handler runs; the schema is also documented as the
+    /// operation's `requestBody`.
+    pub body_schema_json: *const c_char,
+}
+
+/// Registers a route with options (`opts` may be NULL). The body schema supports `type` (including `null` and
+/// lists of types), `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`,
+/// `minLength`, `maxLength`, `pattern`, `enum`, `const`, `minimum`, `maximum`, `exclusiveMinimum`,
+/// `exclusiveMaximum`, `multipleOf`, `format` (`email`, `uri`), `nullable`, `allOf`, `anyOf`, `oneOf` and `not`;
+/// annotations such as `description` are ignored. Other keywords and `$ref` are rejected with
+/// `VEIL_ERR_INVALID_ARG`. A body schema cannot be combined with `VEIL_ROUTE_STREAM_BODY` or `VEIL_ROUTE_FORM`.
+///
+/// # Safety
+///
+/// As for `veil_register_route`; `opts` is NULL or a valid `veil_route_options_t` whose strings are
+/// NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn veil_register_route_ex2(
+    cfg: *mut veil_config_t,
+    path: *const c_char,
+    methods_csv: *const c_char,
+    handler: Option<veil_handler_fn>,
+    user_data: *mut c_void,
+    opts: *const veil_route_options_t,
+) -> c_int {
+    let (flags, openapi, schema) = if opts.is_null() {
+        (0, ptr::null(), ptr::null())
+    } else {
+        let o = tryc!(hooks::read_sized(opts, "veil_route_options_t"));
+        (o.flags, o.openapi_json, o.body_schema_json)
+    };
+    register(
+        cfg,
+        path,
+        methods_csv,
+        handler,
+        user_data,
+        flags,
+        openapi,
+        schema,
+    )
+}
+
+// 理由付き allow: C の関数の引数をそのまま受ける内部関数（構造体に詰め直すと呼び出し側が冗長になるだけ）
+#[allow(clippy::too_many_arguments)]
+unsafe fn register(
+    cfg: *mut veil_config_t,
+    path: *const c_char,
+    methods_csv: *const c_char,
+    handler: Option<veil_handler_fn>,
+    user_data: *mut c_void,
+    flags: u32,
+    openapi_json: *const c_char,
+    body_schema_json: *const c_char,
+) -> c_int {
     let Some(cfg) = cfg.as_mut() else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL config");
     };
@@ -671,6 +752,32 @@ pub unsafe extern "C" fn veil_register_route_ex(
             Err(e) => return fail(VEIL_ERR_INVALID_ARG, format!("openapi_json: {}", e)),
         }
     }
+    let schema = if body_schema_json.is_null() {
+        None
+    } else {
+        if flags & (VEIL_ROUTE_STREAM_BODY | VEIL_ROUTE_FORM) != 0 {
+            return fail(
+                VEIL_ERR_INVALID_ARG,
+                "body_schema_json validates a JSON body (not with VEIL_ROUTE_STREAM_BODY or VEIL_ROUTE_FORM)",
+            );
+        }
+        let text = tryc!(cstr(body_schema_json));
+        let v = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => v,
+            Err(e) => return fail(VEIL_ERR_INVALID_ARG, format!("body_schema_json: {}", e)),
+        };
+        let compiled = match validate::Schema::compile(&v) {
+            Ok(c) => c,
+            Err(e) => return fail(VEIL_ERR_INVALID_ARG, format!("body_schema_json: {}", e)),
+        };
+        meta.request_body = Some(veil::api::handler::BodyMeta {
+            content_type: "application/json",
+            schema: v,
+            required: true,
+        });
+        meta.validates = true;
+        Some(std::sync::Arc::new(compiled))
+    };
     cfg.routes.push(CRoute {
         name,
         path: path.to_string(),
@@ -682,6 +789,7 @@ pub unsafe extern "C" fn veil_register_route_ex(
         form: flags & VEIL_ROUTE_FORM != 0,
         compress: flags & VEIL_ROUTE_NO_COMPRESS == 0,
         meta,
+        schema,
     });
     VEIL_OK
 }
@@ -720,10 +828,18 @@ fn make_handler(
     inline: bool,
     form: bool,
     mw: std::sync::Arc<[hooks::MwFn]>,
+    schema: Option<std::sync::Arc<validate::Schema>>,
 ) -> HandlerFn {
     std::sync::Arc::new(move |req| {
         let mw = mw.clone();
+        let schema = schema.clone();
         Box::pin(async move {
+            // F-291: 本文の JSON Schema に合わなければハンドラを呼ばずに 422
+            if let Some(s) = &schema {
+                if let Err(e) = validate::check_body(s, req.body()) {
+                    return e.into_response();
+                }
+            }
             // F-266: VEIL_ROUTE_FORM は本文を先に読む（大きなファイルは一時ファイルへ）
             let (req, parts) = if form {
                 match veil::api::multipart::prepare_form(req).await {
@@ -763,11 +879,29 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
         return fail(VEIL_ERR_INVALID_ARG, "NULL config");
     }
     let cfg = *Box::from_raw(cfg);
+    let (app, shutdown, started) = build_app(cfg);
+    let rc = match catch_unwind(AssertUnwindSafe(|| app.run())) {
+        Ok(Ok(())) => VEIL_OK,
+        Ok(Err(e)) => fail(VEIL_ERR_RUNTIME, e.0),
+        Err(_) => fail(VEIL_ERR_RUNTIME, "server panicked"),
+    };
+    if started.load(std::sync::atomic::Ordering::Acquire) {
+        hooks::run_shutdown(shutdown);
+    }
+    rc
+}
+
+/// 起動時の関数が全部成功したかの印。
+type Started = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// 設定から `App` を組む（`veil_run` と `veil_test_new` で共有）。戻り値は App・停止後の関数・起動時の関数が
+/// 全部成功したかの印。
+fn build_app(cfg: veil_config_t) -> (App, Vec<hooks::Hook>, Started) {
     let mut app = App::new().config(cfg.config).without_macro_routes();
     for r in cfg.routes {
         let methods: Vec<&str> = r.methods.iter().map(|m| m.as_str()).collect();
         let mw = hooks::chain_for(&cfg.middleware, &r.path);
-        let func = make_handler(r.func, r.user_data, r.inline, r.form, mw);
+        let func = make_handler(r.func, r.user_data, r.inline, r.form, mw, r.schema);
         app = if r.stream_body || r.form {
             app.route_fn_streaming(&r.name, &methods, &r.path, func, r.meta)
         } else {
@@ -785,15 +919,7 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
         flag.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     });
-    let rc = match catch_unwind(AssertUnwindSafe(|| app.run())) {
-        Ok(Ok(())) => VEIL_OK,
-        Ok(Err(e)) => fail(VEIL_ERR_RUNTIME, e.0),
-        Err(_) => fail(VEIL_ERR_RUNTIME, "server panicked"),
-    };
-    if started.load(std::sync::atomic::Ordering::Acquire) {
-        hooks::run_shutdown(cfg.shutdown);
-    }
-    rc
+    (app, cfg.shutdown, started)
 }
 
 /// 実行中のサーバを graceful に停止する（別スレッドから呼べる）。
@@ -1249,6 +1375,14 @@ mod ext;
 mod hooks;
 pub mod internal;
 pub use hooks::*;
+/// HTTP クライアント・gRPC のチャネル（F-291）。
+mod client;
+pub use client::*;
+/// 遅延応答・ソケットを開かない試験の呼び出し（F-291）。
+mod deferred;
+pub use deferred::*;
+/// 本文の JSON Schema 検証（F-291）。
+mod validate;
 
 #[cfg(test)]
 mod tests {

@@ -271,6 +271,38 @@ impl HandlerContext {
     pub fn has_body_stream(&self) -> bool {
         self.body.is_some()
     }
+
+    // F-291: 遅延応答（C の veil_response_defer）。ハンドラは戻ってプールのスレッドを返し、後で別のスレッドが
+    // 応答を渡す。開始済み（ストリーミング・遅延の 2 回目）なら None
+    /// Defers the response: the handler may return (freeing its pool thread) and any thread completes the
+    /// request later with [`Deferred::complete`]. The value the handler returns is then ignored. Dropping the
+    /// [`Deferred`] without completing answers 500. The second call (or one after streaming started) returns `None`.
+    pub fn defer(&mut self) -> Option<Deferred> {
+        if self.started {
+            return None;
+        }
+        self.started = true;
+        Some(Deferred {
+            events: self.events.clone(),
+        })
+    }
+}
+
+/// A response to give later, from any thread (see [`HandlerContext::defer`]).
+pub struct Deferred {
+    events: Arc<BlockingSender<Event>>,
+}
+
+impl Deferred {
+    /// Sends the response. Returns `false` when the client has gone (the response is dropped).
+    pub fn complete(self, resp: Response) -> bool {
+        self.events.send(Event::Full(resp)).is_ok()
+    }
+
+    /// Whether the client has disconnected.
+    pub fn is_closed(&self) -> bool {
+        self.events.is_closed()
+    }
 }
 
 /// Writes the body of a streaming response (from any thread; dropping it finishes the body).

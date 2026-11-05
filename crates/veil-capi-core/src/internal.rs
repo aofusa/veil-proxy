@@ -138,3 +138,105 @@ pub fn with_test_handles<R>(
     let r = f(&wreq, &mut wresp);
     (r, wresp.resp)
 }
+
+// ===================== F-291: クライアント・gRPC のチャネル（helpers の client・grpc Balanced 用） =====================
+
+pub use super::client::OwnedRequest;
+use super::client::{
+    veil_client_request_t, veil_client_response_t, veil_client_t, veil_grpc_call_options_t,
+    veil_grpc_channel_t, veil_grpc_client_call_t,
+};
+use bytes::Bytes;
+use veil::api::client::{Client, ClientError, ClientResponse};
+use veil::api::grpc::client_call::{BlockingCall, CallStatus};
+use veil::api::grpc::Channel;
+
+/// The Rust client behind a handle.
+///
+/// # Safety
+///
+/// `c` is NULL or a valid client.
+pub unsafe fn client(c: *const veil_client_t) -> Option<Client> {
+    c.as_ref().map(|c| c.client.clone())
+}
+
+/// Copies a C request (records the error and returns its code on failure).
+///
+/// # Safety
+///
+/// `req` is a valid `veil_client_request_t`.
+pub unsafe fn client_request(req: *const veil_client_request_t) -> Result<OwnedRequest, c_int> {
+    super::client::owned_request(req)
+}
+
+/// A response handle for C (freed with `veil_client_response_free`).
+pub fn client_response(r: ClientResponse) -> *mut veil_client_response_t {
+    Box::into_raw(Box::new(veil_client_response_t::from_response(r)))
+}
+
+/// Records a client error and returns `VEIL_ERR_TIMEOUT` or `VEIL_ERR_CLIENT`.
+pub fn client_error(e: &ClientError) -> c_int {
+    super::client::client_error(e)
+}
+
+/// `Err(VEIL_ERR_STATE)` (with the reason recorded) on a thread that runs an event loop.
+pub fn check_blocking() -> Result<(), c_int> {
+    super::client::check_blocking()
+}
+
+/// Header pairs from `name, value, ...` (`n` pairs; names lower-cased, control characters rejected).
+///
+/// # Safety
+///
+/// `p` is NULL with `n == 0` or points to `2 * n` NUL-terminated strings.
+pub unsafe fn header_pairs(
+    p: *const *const c_char,
+    n: usize,
+    what: &str,
+) -> Result<Vec<(Bytes, Bytes)>, c_int> {
+    super::client::header_pairs(p, n, what)
+}
+
+/// The Rust channel behind a handle.
+///
+/// # Safety
+///
+/// `ch` is NULL or a valid channel.
+pub unsafe fn grpc_channel(ch: *const veil_grpc_channel_t) -> Option<Channel> {
+    ch.as_ref().map(|c| c.channel.clone())
+}
+
+/// Starts a call with one request message (the messages are closed).
+///
+/// # Safety
+///
+/// `opts` is NULL or a valid `veil_grpc_call_options_t`.
+pub unsafe fn grpc_start_one(
+    ch: &Channel,
+    path: &str,
+    msg: Bytes,
+    opts: *const veil_grpc_call_options_t,
+) -> Result<BlockingCall, c_int> {
+    super::client::start_one(ch, path, msg, opts)
+}
+
+/// A call handle for C of a finished call (freed with `veil_grpc_client_call_free`).
+pub fn grpc_finished(
+    call: std::sync::Arc<BlockingCall>,
+    st: CallStatus,
+) -> *mut veil_grpc_client_call_t {
+    super::client::finished_call(call, st)
+}
+
+/// `n` NUL-terminated strings as owned strings (records the error and returns its code otherwise).
+///
+/// # Safety
+///
+/// `p` is NULL with `n == 0` or points to `n` NUL-terminated strings.
+pub unsafe fn str_array(
+    p: *const *const c_char,
+    n: usize,
+    what: &str,
+) -> Result<Vec<String>, c_int> {
+    super::hooks::str_array(p, n, what)
+}

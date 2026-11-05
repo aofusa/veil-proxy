@@ -43,7 +43,8 @@ cd "$ROOT"
 WHEELS="$ROOT/target/lib-wheels"
 rm -rf "$WHEELS"; mkdir -p "$WHEELS"
 if [[ ",$KINDS," == *",c,"* ]]; then
-  cargo build --locked --profile "$PROFILE" -p veil-capi
+  # F-291: libveil と、その上位集合の libveil_kit（helpers kit）を並べて配る
+  cargo build --locked --profile "$PROFILE" -p veil-capi -p veil-capi-helpers
 fi
 if [[ ",$KINDS," == *",python,"* ]]; then
   command -v maturin >/dev/null || { echo "maturin is required (pip install maturin)" >&2; exit 1; }

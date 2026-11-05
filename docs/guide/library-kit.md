@@ -327,6 +327,12 @@ cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/
 | Small helpers | `veil_kit_form_get`, `veil_kit_error` (`{"detail": ...}`), `veil_kit_json_string`, `veil_kit_oauth2_security_scheme`, `veil_kit_free`, `veil_kit_version` |
 | Tasks | `veil_kit_every`, `veil_kit_cron` (app tasks on the handler pool; after-response work is `veil_response_after_send` in `libveil`) |
 | Route tables | `veil_kit_route_t`, `VEIL_KIT_GET / POST / PUT / PATCH / DELETE`, `veil_kit_register_all` (header only) |
+| Dependency injection | `veil_kit_di_new / free / register / value / override / override_value / get` (string keys; `VEIL_KIT_DI_SINGLETON`, `_SCOPED` (per request), `_TRANSIENT`; factories may resolve other keys, cycles are errors) |
+| HTTP client | `veil_kit_client_get_json`, `veil_kit_client_post_json` (2xx and a JSON body, else `VEIL_KIT_ERR_STATUS` / `VEIL_KIT_ERR_JSON` with the response kept), `veil_kit_client_send_retry` / `_async` (`veil_kit_retry_t`: attempts, exponential backoff, 502/503/504) |
+| gRPC | `veil_kit_grpc_balanced_new / pick / unary / unary_async / free` (round robin; a unary call that fails with `UNAVAILABLE` moves to the next server) |
+| GraphQL | `veil_kit_graphql` (transport only; the executor is a C callback), `veil_kit_graphql_query / operation_name / variables / extensions / request / set_result` |
+| Tests | `veil_kit_test_new / free / request / get / post_json / header / set_cookie / cookie / clear_cookies` (`veil_test_*` plus a cookie jar and default headers) |
+| JSON writer | `veil_kit_jw_t`, `veil_kit_jw_object / array / end / key / string / string_n / int / double / bool / null / json` (header only) |
 
 CORS, static directories, middleware, request-scoped values, lifecycle hooks, WebSocket subprotocols and gRPC
 reflection are in `libveil` itself (`veil_config_cors`, `veil_config_serve_dir`, `veil_register_middleware`,
@@ -345,4 +351,24 @@ reflection are in `libveil` itself (`veil_config_cors`, `veil_config_serve_dir`,
   directories with `veil_config_serve_dir`.
 - The example [`examples/api/c-kit`](../../examples/api/c-kit/) uses every area and is run by
   `tests/api/library_e2e.sh c-kit`, which also checks cookies and tokens against independent implementations.
-- Not in the C kit yet: the HTTP and gRPC clients, dependency injection, GraphQL and `Balanced`.
+- The HTTP and gRPC clients, deferred responses, JSON body validation (422) and in-process tests are in `libveil`
+  (`veil_client_*`, `veil_grpc_channel_*`, `veil_response_defer`, `veil_register_route_ex2`, `veil_test_*`; see
+  [library.md](library.md#c-api)). The kit's client helpers and `Balanced` are built on them and follow the same
+  rule: the waiting forms return `VEIL_ERR_STATE` on a worker, the `_async` forms call back on the handler pool.
+- Dependency injection has no types in C, so keys are strings and instances are `void *` with an optional free
+  function. Singletons and values live as long as the container; scoped and transient instances are freed when the
+  request ends. `veil_kit_di_override` replaces a registration in tests, like `Container::replace`.
+- `veil_kit_grpc_balanced_*` follows `veil_kit::grpc::Balanced` (round robin, failover on `UNAVAILABLE` once per
+  server). Messages are bytes, so there is no codec parameter; `pick` returns a channel for streaming calls.
+- GraphQL: there is no GraphQL engine in C, so `veil_kit_graphql` is the HTTP transport of the Rust kit's `mount`
+  and the executor is your callback (it receives the query, the operation name and the variables as JSON text and
+  sets the result JSON). The HTTP rules are the same: `POST` takes JSON only (415 otherwise) and batches, `GET`
+  takes the query string and a mutation gets 405, `Accept` picks `application/graphql-response+json`,
+  `text/event-stream` gets the result as GraphQL over SSE, and GraphiQL is served when enabled. Subscriptions need a
+  stream of results from the executor, so the closest equivalent is the `upgrade` option: WebSocket upgrades on the
+  path go to your handler, which accepts `graphql-transport-ws` with `veil_ws_accept_ex` and sends the results.
+- The JSON writer is header-only (no allocation in the library): it escapes strings, inserts commas and reports
+  allocation failure, too deep nesting or an unbalanced `end` in `failed`.
+- Distribution: the library archive (`packaging/scripts/build-lib.sh`) ships `libveil_kit` and `veil_kit.h` next to
+  `libveil`, with the pkg-config file `veil-kit.pc` (it does not require `veil`, since `libveil_kit` contains it) and
+  the CMake targets `veil::kit` / `veil::kit_static`.

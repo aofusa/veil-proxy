@@ -312,6 +312,12 @@ cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/
 | 小物 | `veil_kit_form_get`、`veil_kit_error`（`{"detail": ...}`）、`veil_kit_json_string`、`veil_kit_oauth2_security_scheme`、`veil_kit_free`、`veil_kit_version` |
 | タスク | `veil_kit_every`、`veil_kit_cron`（ハンドラ用プールで動くアプリのタスク。応答の後の処理は `libveil` の `veil_response_after_send`） |
 | ルート表 | `veil_kit_route_t`、`VEIL_KIT_GET / POST / PUT / PATCH / DELETE`、`veil_kit_register_all`（ヘッダだけ） |
+| 依存性注入 | `veil_kit_di_new / free / register / value / override / override_value / get`（文字列の鍵。`VEIL_KIT_DI_SINGLETON`・`_SCOPED`（要求ごと）・`_TRANSIENT`。工場は他の鍵を取り出せ、循環は誤り） |
+| HTTP クライアント | `veil_kit_client_get_json`、`veil_kit_client_post_json`（2xx と JSON の本文。違えば応答を残したまま `VEIL_KIT_ERR_STATUS`・`VEIL_KIT_ERR_JSON`）、`veil_kit_client_send_retry` / `_async`（`veil_kit_retry_t`: 回数・指数バックオフ・502/503/504） |
+| gRPC | `veil_kit_grpc_balanced_new / pick / unary / unary_async / free`（順番に回し、単項が `UNAVAILABLE` で失敗したら次のサーバ） |
+| GraphQL | `veil_kit_graphql`（トランスポートだけ。実行器は C のコールバック）、`veil_kit_graphql_query / operation_name / variables / extensions / request / set_result` |
+| 試験 | `veil_kit_test_new / free / request / get / post_json / header / set_cookie / cookie / clear_cookies`（`veil_test_*` + Cookie の入れ物・既定のヘッダ） |
+| JSON の書き出し | `veil_kit_jw_t`、`veil_kit_jw_object / array / end / key / string / string_n / int / double / bool / null / json`（ヘッダだけ） |
 
 CORS・静的ディレクトリ・ミドルウェア・要求ごとの値・ライフサイクルのフック・WebSocket のサブプロトコル・gRPC リフレクションは
 `libveil` 自体にあります（`veil_config_cors`、`veil_config_serve_dir`、`veil_register_middleware`、`veil_request_set_local`、
@@ -327,4 +333,24 @@ CORS・静的ディレクトリ・ミドルウェア・要求ごとの値・ラ�
   `veil_config_serve_dir` で出します。
 - サンプル [`examples/api/c-kit`](../../../examples/api/c-kit/) は全分野を使い、`tests/api/library_e2e.sh c-kit` が動かします
   （Cookie とトークンは独立した実装とも突き合わせます）。
-- C の kit にまだ無いもの: HTTP・gRPC のクライアント、依存性注入、GraphQL、`Balanced`。
+- HTTP・gRPC のクライアント、遅延応答、JSON 本文の検証（422）、ソケットを開かない試験は `libveil` にあります
+  （`veil_client_*`・`veil_grpc_channel_*`・`veil_response_defer`・`veil_register_route_ex2`・`veil_test_*`。
+  [library.md](library.md#c-api)）。kit のクライアントの補助と `Balanced` はその上にあり、同じ規則に従います: 待つ形は
+  ワーカーでは `VEIL_ERR_STATE`、`_async` の形はハンドラ用プールで呼び返します。
+- C には型が無いので、依存性注入の鍵は文字列、値は解放関数（省略可）付きの `void *` です。singleton と値はコンテナと
+  同じだけ生き、scoped と transient は要求の終わりに解放します。`veil_kit_di_override` は試験で登録を差し替えます
+  （`Container::replace` と同じ）。
+- `veil_kit_grpc_balanced_*` は `veil_kit::grpc::Balanced` と同じ規則です（順番に回し、`UNAVAILABLE` なら 1 サーバにつき
+  1 回まで次へ）。メッセージはバイト列なのでコーデックの引数はありません。`pick` はストリーミングの呼び出し用のチャネルを返します。
+- GraphQL: C には GraphQL の実行器が無いので、`veil_kit_graphql` は Rust の kit の `mount` の HTTP のトランスポートで、
+  実行器はコールバックです（クエリ・操作名・変数の JSON のテキストを受け取り、結果の JSON を設定する）。HTTP の規則は
+  同じです: `POST` は JSON だけ（違えば 415）でバッチも受け、`GET` はクエリ文字列で mutation は 405、`Accept` で
+  `application/graphql-response+json` を選び、`text/event-stream` には GraphQL over SSE で結果を返し、有効にすれば
+  GraphiQL を出します。サブスクリプションには実行器からの結果の列が要るので、いちばん近いものとして `upgrade` を
+  用意しました: そのパスの WebSocket のアップグレードを C のハンドラへ回し、`veil_ws_accept_ex` で
+  `graphql-transport-ws` を受けて結果を送ります。
+- JSON の書き出しはヘッダだけ（ライブラリは確保しない）で、文字列をエスケープし、カンマを入れ、確保の失敗・深すぎる入れ子・
+  対応しない `end` を `failed` で知らせます。
+- 配布: ライブラリのアーカイブ（`packaging/scripts/build-lib.sh`）は `libveil` の隣に `libveil_kit` と `veil_kit.h` を入れ、
+  pkg-config の `veil-kit.pc`（`libveil_kit` が `veil` を含むので `Requires: veil` にしない）と CMake のターゲット
+  `veil::kit`・`veil::kit_static` を付けます。

@@ -26,6 +26,8 @@
 pub mod blocking;
 // F-267
 mod channel;
+// F-291: ランタイムを持たないスレッドからの呼び出し（C・Python のクライアント）
+pub mod client_call;
 // F-265
 mod describe;
 pub mod health;

@@ -1153,7 +1153,41 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 - WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` はサブプロトコルを選び、`Origin` を確かめ（403）、
   メッセージの大きさの上限と自動の pong を設定します。選んだものは `veil_ws_protocol(ws, &len)`。
 
-C 向けの Cookie・セッション・認証（Basic・API キー・JWT）・リダイレクト・ファイル・アプリのタスクは別のライブラリ
+**外向きの呼び出し・遅延応答・検証・試験。** これらも `libveil` にあります:
+
+- HTTP クライアント: `veil_client_new(&veil_client_options_t)`（タイムアウト・HTTP/2・CA とクライアント証明書・User-Agent・
+  応答の大きさの上限・Unix ソケット）と `veil_client_send(c, &veil_client_request_t, &resp)`（待つ）、または
+  `veil_client_send_async(c, &req, done, ud)`（`done(rc, resp, ud)` はハンドラ用プールで呼ばれる）。応答は
+  `veil_client_response_status / header / header_count / header_at / body / free`。誤りは `VEIL_ERR_TIMEOUT` と
+  `VEIL_ERR_CLIENT` で、状態コードが何でも（4xx・5xx でも）呼び出しは成功です。
+- gRPC クライアント: `veil_grpc_channel_new(url, &veil_grpc_channel_options_t)`（h2c か ALPN h2 の TLS、gzip、メッセージの
+  大きさ、既定の期限）。`veil_grpc_channel_unary(ch, path, msg, len, &veil_grpc_call_options_t, &call)` と
+  `veil_grpc_channel_unary_async`、全種類のメソッドは `veil_grpc_channel_call` と
+  `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free`。メッセージは
+  サーバ側と同じく符号化済みのバイト列です。
+- 呼び出しは Python の束縛と共有する veil の専用スレッドで動き、ワーカーでは動きません。待つ形（`veil_client_send`・
+  `veil_grpc_channel_unary`・`veil_grpc_client_recv`・`veil_grpc_client_finish`）はハンドラ用プールのハンドラ・起動時の
+  関数・自前のスレッド向けで、ワーカー（`VEIL_ROUTE_INLINE` のルート・ワーカー開始の関数）では `VEIL_ERR_STATE` を返します。
+  そこでは `_async` の形を使います。
+- 遅延応答: `veil_deferred_t *d = veil_response_defer(resp)` でハンドラはすぐ戻れ、プールのスレッドを空けます。応答は
+  `veil_deferred_response(d)` にいつもの関数で任意のスレッドから組み立て（例: 非同期の呼び出しの `done` の中）、
+  `veil_deferred_complete(d)` で送ります（相手が切断していれば `VEIL_ERR_CLOSED`）。`veil_deferred_free(d)` は代わりに 500 を
+  返します。`VEIL_ROUTE_INLINE` のルートでは使えません。遅延応答にはミドルウェアの後処理は走りません。
+- JSON 本文の検証: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` の `body_schema_json`
+  （JSON Schema）。JSON でない・合わない本文には、ハンドラを呼ぶ前に 422 と `{"detail": [{"type", "loc", "msg"}]}`
+  （Rust の `Validate`・FastAPI と同じ形。`loc` は `"body"` から）を返し、スキーマは OpenAPI のルートの `requestBody` に
+  なります。使えるキーワード: `type`（`null`・型の配列も）、`properties`、`required`、`additionalProperties`、`items`、
+  `minItems`、`maxItems`、`minLength`、`maxLength`、`pattern`、`enum`、`const`、`minimum`、`maximum`、`exclusiveMinimum`、
+  `exclusiveMaximum`、`multipleOf`、`format`（`email`・`uri`）、`nullable`、`allOf`、`anyOf`、`oneOf`、`not`。注釈は無視します。
+  `$ref` と他のキーワードは登録時に拒否します（参照先は展開して書く）。スキーマは登録時に 1 回だけコンパイルします。
+- ソケットを開かない試験: `veil_test_t *t = veil_test_new(cfg)` はアプリを組み（起動時の関数は走り、ソケットは開かない）、
+  `veil_test_request(t, &veil_test_request_t, &resp)` はサーバと同じルートの選び方（404・405）・ミドルウェア・プラグイン
+  （CORS・セッション）・検証・ハンドラ用プールで呼び、ストリーミングの本文は集めて返します。
+  `veil_test_response_status / header / header_count / header_at / body / trailer / free`。`veil_test_free` は停止後の
+  関数を呼びます。Rust では `App::into_test_client()` で同じことができます。
+
+C 向けの Cookie・セッション・認証（Basic・API キー・JWT）・リダイレクト・ファイル・アプリのタスク・依存性注入・
+クライアントの補助・gRPC の Balanced・GraphQL・Cookie を覚える試験のクライアントは別のライブラリ
 `libveil_kit`（`libveil` を含む上位集合。どちらか 1 つとリンクする）にあります:
 [ヘルパークレートの C](library-kit.md#clibveil_kit)。サンプル: [examples/api/c-kit/](../../../examples/api/c-kit/)。
 
@@ -1262,7 +1296,10 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 
 指定した種類（既定は `all`）をビルドし（`--docker` は `docker/Dockerfile.lib` を使ってコンテナ内でビルド）、
 `packaging/output/lib/` に 1 つのアーカイブ `veil-lib-<version>-<arch>-linux-gnu.zip` を出力します。中身は
-`libveil.so`/`libveil.a` と `veil.h`（C）、Python の wheel、Rust 向けのソースと使い方のメモです。
+`libveil.so`/`libveil.a` と `veil.h`、helpers kit の `libveil_kit.so`/`libveil_kit.a` と `veil_kit.h`（C。pkg-config の
+`veil.pc`・`veil-kit.pc` と CMake のパッケージ: `find_package(veil CONFIG)` で `veil::veil`・`veil::kit`、静的は
+`veil::veil_static`・`veil::kit_static`）、Python の wheel、Rust 向けのソースと使い方のメモです。`veil` と `veil-kit` は
+どちらか 1 つをリンクします。
 プロキシ本体のパッケージは[ビルドとパッケージ](building.md)を参照してください。
 
 ## 性能
@@ -1364,7 +1401,7 @@ F-212 の後に測り直した値です（前のバインディングと 5 ラ�
 ## テスト
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # 既定: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|c-kit|python|nonregression|all]     # 既定: all
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・

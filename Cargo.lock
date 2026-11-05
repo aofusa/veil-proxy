@@ -4554,6 +4554,7 @@ version = "0.10.1"
 dependencies = [
  "bytes",
  "ftlog",
+ "regex",
  "serde_json",
  "toml",
  "veil-proxy",
@@ -4567,6 +4568,7 @@ dependencies = [
  "bytes",
  "ftlog",
  "futures",
+ "serde",
  "serde_json",
  "veil-capi-core",
  "veil-proxy",

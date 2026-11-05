@@ -3,8 +3,10 @@
  *
  * 環境変数: VEIL_LISTEN（既定 127.0.0.1:8080）、VEIL_STATIC_DIR（/static で出すディレクトリ）、
  * VEIL_DOWNLOAD（/download で返すファイル）、VEIL_SHUTDOWN_MARK（停止後に書くファイル）。
+ * `kit --selftest` はソケットを開かずにルートを呼ぶ試験（veil_test_*・veil_kit_test_*）だけを行う。
  * Cookie の鍵と JWT の秘密は examples/api/rust-kit と同じ（Rust と C のサービスが互いの Cookie・トークンを読める）。
  */
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -356,6 +358,376 @@ static int hello(const veil_request_t *req, veil_response_t *resp, void *ud) {
     return veil_response_set_text(resp, "hello");
 }
 
+/* `hay` の `n` バイトに `needle` があるか（memmem は POSIX に無い） */
+static int contains(const void *hay, size_t n, const char *needle) {
+    size_t k = strlen(needle);
+    const char *h = hay;
+    for (size_t i = 0; h != NULL && i + k <= n; i++)
+        if (memcmp(h + i, needle, k) == 0) return 1;
+    return 0;
+}
+
+/* ---- HTTP クライアント（自分自身へ）・遅延応答 ---- */
+
+static veil_client_t *g_client;
+static char g_self[128]; /* http://127.0.0.1:<port> */
+static atomic_long g_flaky;
+
+static int body_text(veil_response_t *resp, veil_client_response_t *r) {
+    size_t n = 0;
+    const uint8_t *b = veil_client_response_body(r, &n);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%d %.*s", veil_client_response_status(r), (int)n, (const char *)b);
+    veil_client_response_free(r);
+    return veil_response_set_text(resp, buf);
+}
+
+static int client_sync(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    char url[192];
+    snprintf(url, sizeof url, "%s/api/hello", g_self);
+    veil_client_request_t r = VEIL_CLIENT_REQUEST_INIT;
+    r.url = url;
+    veil_client_response_t *out = NULL;
+    int rc = veil_client_send(g_client, &r, &out);
+    if (rc != VEIL_OK) return veil_kit_error(resp, 502, veil_last_error());
+    return body_text(resp, out);
+}
+
+/* INLINE のルート（ワーカー）では同期の呼び出しは VEIL_ERR_STATE */
+static int client_inline(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    veil_client_request_t r = VEIL_CLIENT_REQUEST_INIT;
+    r.url = g_self;
+    veil_client_response_t *out = NULL;
+    int rc = veil_client_send(g_client, &r, &out);
+    return veil_response_set_text(resp, rc == VEIL_ERR_STATE ? "state" : "unexpected");
+}
+
+static int json_doc(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    return veil_response_set_json(resp, "{\"items\":[1,2,3]}");
+}
+
+static int client_json(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    char url[192];
+    snprintf(url, sizeof url, "%s/json", g_self);
+    veil_client_response_t *out = NULL;
+    int ok = veil_kit_client_get_json(g_client, url, &out);
+    snprintf(url, sizeof url, "%s/api/hello", g_self);
+    veil_client_response_t *out2 = NULL;
+    int notjson = veil_kit_client_get_json(g_client, url, &out2);
+    veil_client_response_free(out2);
+    char buf[256];
+    size_t n = 0;
+    const uint8_t *b = out ? veil_client_response_body(out, &n) : NULL;
+    snprintf(buf, sizeof buf, "ok=%d notjson=%d body=%.*s", ok, notjson == VEIL_KIT_ERR_JSON, (int)n,
+             b ? (const char *)b : "");
+    veil_client_response_free(out);
+    return veil_response_set_text(resp, buf);
+}
+
+/* 2 回 503 を返してから 200 */
+static int flaky(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    if (atomic_fetch_add(&g_flaky, 1) % 3 < 2) {
+        veil_response_set_status(resp, 503);
+        return veil_response_set_text(resp, "busy");
+    }
+    return veil_response_set_text(resp, "recovered");
+}
+
+static int client_retry(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    atomic_store(&g_flaky, 0);
+    char url[192];
+    snprintf(url, sizeof url, "%s/flaky", g_self);
+    veil_client_request_t r = VEIL_CLIENT_REQUEST_INIT;
+    r.url = url;
+    veil_kit_retry_t p = VEIL_KIT_RETRY_INIT;
+    p.backoff_ms = 10;
+    veil_client_response_t *out = NULL;
+    if (veil_kit_client_send_retry(g_client, &r, &p, &out) != VEIL_OK) return veil_kit_error(resp, 502, veil_last_error());
+    return body_text(resp, out);
+}
+
+/* 非同期の呼び出しの完了で遅延応答を返す（プールのスレッドを握らない） */
+static void client_done(int rc, veil_client_response_t *r, void *ud) {
+    veil_deferred_t *d = ud;
+    veil_response_t *resp = veil_deferred_response(d);
+    if (rc != VEIL_OK) {
+        veil_kit_error(resp, 502, veil_last_error());
+    } else {
+        body_text(resp, r);
+        veil_response_set_header(resp, "x-deferred", "1");
+    }
+    veil_deferred_complete(d);
+}
+
+static int client_async(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    char url[192];
+    snprintf(url, sizeof url, "%s/api/hello", g_self);
+    veil_deferred_t *d = veil_response_defer(resp);
+    if (d == NULL) return -1;
+    veil_client_request_t r = VEIL_CLIENT_REQUEST_INIT;
+    r.url = url;
+    if (veil_client_send_async(g_client, &r, client_done, d) != VEIL_OK) veil_deferred_free(d);
+    return 0;
+}
+
+static void *deferred_thread(void *arg) {
+    veil_deferred_t *d = arg;
+    struct timespec ts = {0, 20 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+    veil_response_set_text(veil_deferred_response(d), "later");
+    veil_deferred_complete(d);
+    return NULL;
+}
+
+static int deferred(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    veil_deferred_t *d = veil_response_defer(resp);
+    if (d == NULL) return -1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, deferred_thread, d) != 0) {
+        veil_deferred_free(d);
+        return 0;
+    }
+    pthread_detach(t);
+    return 0;
+}
+
+/* ---- JSON 本文の検証（422） ---- */
+
+static const char USER_SCHEMA[] =
+    "{\"type\":\"object\",\"required\":[\"name\",\"age\"],\"additionalProperties\":false,"
+    "\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":1},"
+    "\"age\":{\"type\":\"integer\",\"minimum\":0},\"email\":{\"type\":\"string\",\"format\":\"email\"}}}";
+
+static int create_user(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)ud;
+    size_t n = 0;
+    const char *b = veil_request_body(req, &n);
+    veil_response_set_status(resp, 201);
+    veil_response_set_header(resp, "content-type", "application/json");
+    return veil_response_set_body(resp, (const uint8_t *)b, n);
+}
+
+/* ---- gRPC（サーバ・チャネル・Balanced） ---- */
+
+static int grpc_echo(veil_grpc_call_t *call, void *ud) {
+    (void)ud;
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (veil_grpc_recv(call, &data, &len) != 1) return veil_grpc_set_status(call, 3, "no message");
+    veil_grpc_set_trailer(call, "x-echo", "yes");
+    return veil_grpc_send(call, data, len);
+}
+
+static veil_grpc_channel_t *g_chan;
+static veil_kit_grpc_balanced_t *g_lb;
+
+static int grpc_reply(veil_response_t *resp, veil_grpc_client_call_t *c) {
+    const uint8_t *m = NULL;
+    size_t n = 0;
+    int got = veil_grpc_client_recv(c, &m, &n);
+    int code = veil_grpc_client_finish(c);
+    size_t tl = 0;
+    const char *t = veil_grpc_client_metadata(c, "x-echo", &tl);
+    char buf[256];
+    snprintf(buf, sizeof buf, "code=%d msg=%.*s trailer=%.*s", code, got == 1 ? (int)n : 0,
+             got == 1 ? (const char *)m : "", (int)tl, t ? t : "");
+    veil_grpc_client_call_free(c);
+    return veil_response_set_text(resp, buf);
+}
+
+static int grpc_unary(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    veil_grpc_client_call_t *c = NULL;
+    if (veil_grpc_channel_unary(g_chan, "/kit.Echo/Echo", (const uint8_t *)"ping", 4, NULL, &c) != VEIL_OK)
+        return veil_kit_error(resp, 502, veil_last_error());
+    return grpc_reply(resp, c);
+}
+
+static int grpc_balanced(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    /* 1 台目は落ちている（UNAVAILABLE）: どちらの順で回っても成功する */
+    veil_grpc_client_call_t *c = NULL;
+    for (int i = 0; i < 2; i++) {
+        if (c != NULL) veil_grpc_client_call_free(c);
+        c = NULL;
+        if (veil_kit_grpc_balanced_unary(g_lb, "/kit.Echo/Echo", (const uint8_t *)"lb", 2, NULL, &c) != VEIL_OK)
+            return veil_kit_error(resp, 502, veil_last_error());
+        if (veil_grpc_client_finish(c) != 0) break;
+    }
+    return grpc_reply(resp, c);
+}
+
+/* ---- DI ---- */
+
+static atomic_long g_made;
+
+static void *make_counter(veil_kit_di_t *di, const veil_request_t *req, void *ud) {
+    (void)di;
+    (void)req;
+    (void)ud;
+    long *p = malloc(sizeof *p);
+    if (p) *p = atomic_fetch_add(&g_made, 1) + 1;
+    return p;
+}
+
+static veil_kit_di_t *g_di;
+
+static int di_route(const veil_request_t *req, veil_response_t *resp, void *ud) {
+    (void)ud;
+    long *config = veil_kit_di_get(g_di, NULL, "config");
+    long *s1 = veil_kit_di_get(g_di, req, "scoped");
+    long *s2 = veil_kit_di_get(g_di, req, "scoped");
+    long *t1 = veil_kit_di_get(g_di, req, "transient");
+    long *t2 = veil_kit_di_get(g_di, req, "transient");
+    if (!config || !s1 || !s2 || !t1 || !t2) return veil_kit_error(resp, 500, veil_last_error());
+    veil_kit_jw_t w = VEIL_KIT_JW_INIT;
+    veil_kit_jw_object(&w);
+    veil_kit_jw_key(&w, "config");
+    veil_kit_jw_int(&w, *config);
+    veil_kit_jw_key(&w, "scoped_same");
+    veil_kit_jw_bool(&w, s1 == s2);
+    veil_kit_jw_key(&w, "transient_same");
+    veil_kit_jw_bool(&w, t1 == t2);
+    veil_kit_jw_key(&w, "note");
+    veil_kit_jw_string(&w, "a \"quoted\"\n line");
+    veil_kit_jw_end(&w);
+    int rc = w.failed ? -1 : veil_response_set_json(resp, w.buf);
+    free(w.buf);
+    return rc;
+}
+
+/* ---- GraphQL（実行器はおもちゃ: hello と bump だけ） ---- */
+
+static atomic_long g_bumps;
+
+static int gql_exec(veil_kit_graphql_op_t *op, void *ud) {
+    (void)ud;
+    size_t n = 0;
+    const char *q = veil_kit_graphql_query(op, &n);
+    char buf[128];
+    if (contains(q, n, "bump")) {
+        snprintf(buf, sizeof buf, "{\"data\":{\"bump\":%ld}}", atomic_fetch_add(&g_bumps, 1) + 1);
+    } else if (contains(q, n, "hello")) {
+        snprintf(buf, sizeof buf, "{\"data\":{\"hello\":\"world\"}}");
+    } else {
+        snprintf(buf, sizeof buf, "{\"data\":null,\"errors\":[{\"message\":\"unknown field\"}]}");
+    }
+    return veil_kit_graphql_set_result(op, buf, strlen(buf));
+}
+
+/* ---- ソケットを開かない試験（kit --selftest） ---- */
+
+static int selftest(void) {
+    int fails = 0;
+#define EXPECT(c)                                                \
+    do {                                                         \
+        if (!(c)) {                                              \
+            fprintf(stderr, "selftest: %s failed (line %d)\n", #c, __LINE__); \
+            fails++;                                             \
+        }                                                        \
+    } while (0)
+    veil_config_t *cfg = veil_config_new();
+    veil_kit_register_all(cfg, (const veil_kit_route_t[]){VEIL_KIT_GET("/api/hello", hello)}, 1, NULL);
+    veil_route_options_t ro = VEIL_ROUTE_OPTIONS_INIT;
+    ro.body_schema_json = USER_SCHEMA;
+    veil_register_route_ex2(cfg, "/users", "POST", create_user, NULL, &ro);
+    veil_register_route(cfg, "/cookie/visit", "GET", cookie_visit, NULL);
+    veil_register_middleware(cfg, "/mw", NULL, mw_after, NULL);
+    veil_register_middleware(cfg, "/mw", mw_before, NULL, NULL);
+    veil_register_route(cfg, "/mw/echo", "GET", mw_echo, NULL);
+    veil_register_route(cfg, "/deferred", "GET", deferred, NULL);
+
+    /* コア: veil_test_* */
+    veil_test_t *t = veil_test_new(cfg);
+    EXPECT(t != NULL);
+    if (t == NULL) return 1;
+    veil_test_request_t r = VEIL_TEST_REQUEST_INIT;
+    veil_test_response_t *out = NULL;
+    size_t n = 0;
+    r.target = "/api/hello";
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK);
+    EXPECT(veil_test_response_status(out) == 200);
+    const uint8_t *b = veil_test_response_body(out, &n);
+    EXPECT(n == 5 && memcmp(b, "hello", 5) == 0);
+    veil_test_response_free(out);
+    r.target = "/nope";
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 404);
+    veil_test_response_free(out);
+    r.target = "/api/hello";
+    r.method = "DELETE";
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 405);
+    veil_test_response_free(out);
+    r.method = "POST";
+    r.target = "/users";
+    r.body = (const uint8_t *)"{\"name\":\"\",\"x\":1}";
+    r.body_len = strlen((const char *)r.body);
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 422);
+    b = veil_test_response_body(out, &n);
+    EXPECT(contains(b, n, "\"missing\"") && contains(b, n, "extra_forbidden") && contains(b, n, "too_short"));
+    veil_test_response_free(out);
+    r.body = (const uint8_t *)"{\"name\":\"ann\",\"age\":3}";
+    r.body_len = strlen((const char *)r.body);
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 201);
+    veil_test_response_free(out);
+    static const char *const hs[] = {"x-request-id", "t-1"};
+    veil_test_request_t m = VEIL_TEST_REQUEST_INIT;
+    m.target = "/mw/echo";
+    m.headers = hs;
+    m.n_headers = 1;
+    m.version = VEIL_HTTP_2;
+    EXPECT(veil_test_request(t, &m, &out) == VEIL_OK);
+    const char *h = veil_test_response_header(out, "x-mw", &n);
+    EXPECT(h != NULL && n == 5 && memcmp(h, "after", 5) == 0);
+    veil_test_response_free(out);
+    veil_test_request_t d = VEIL_TEST_REQUEST_INIT;
+    d.target = "/deferred";
+    EXPECT(veil_test_request(t, &d, &out) == VEIL_OK);
+    b = veil_test_response_body(out, &n);
+    EXPECT(n == 5 && memcmp(b, "later", 5) == 0);
+    veil_test_response_free(out);
+    veil_test_free(t);
+
+    /* kit: Cookie の入れ物 */
+    cfg = veil_config_new();
+    veil_register_route(cfg, "/cookie/visit", "GET", cookie_visit, NULL);
+    veil_register_route_ex2(cfg, "/users", "POST", create_user, NULL, &ro);
+    veil_kit_test_t *kt = veil_kit_test_new(cfg);
+    EXPECT(kt != NULL);
+    if (kt == NULL) return 1;
+    for (int i = 1; i <= 3; i++) {
+        EXPECT(veil_kit_test_get(kt, "/cookie/visit", &out) == VEIL_OK);
+        veil_test_response_free(out);
+    }
+    const char *v = veil_kit_test_cookie(kt, "visits", &n);
+    EXPECT(v != NULL && n == 1 && v[0] == '3');
+    const char *ok_json = "{\"name\":\"bo\",\"age\":30}";
+    EXPECT(veil_kit_test_post_json(kt, "/users", ok_json, strlen(ok_json), &out) == VEIL_OK);
+    EXPECT(veil_test_response_status(out) == 201);
+    veil_test_response_free(out);
+    veil_kit_test_free(kt);
+    if (fails == 0) printf("selftest ok\n");
+    return fails == 0 ? 0 : 1;
+#undef EXPECT
+}
+
 static const veil_kit_route_t ROUTES[] = {
     VEIL_KIT_GET("/api/hello", hello),
     VEIL_KIT_POST("/api/echo", hello),
@@ -379,6 +751,17 @@ static const veil_kit_route_t ROUTES[] = {
     VEIL_KIT_POST("/tasks/enqueue", tasks_enqueue),
     VEIL_KIT_GET("/tasks/status", tasks_status),
     VEIL_KIT_GET("/ws", ws_route),
+    VEIL_KIT_GET("/json", json_doc),
+    VEIL_KIT_GET("/flaky", flaky),
+    VEIL_KIT_GET("/client/sync", client_sync),
+    {"/client/inline", "GET", client_inline, VEIL_ROUTE_INLINE, NULL},
+    VEIL_KIT_GET("/client/json", client_json),
+    VEIL_KIT_GET("/client/retry", client_retry),
+    VEIL_KIT_GET("/client/async", client_async),
+    VEIL_KIT_GET("/deferred", deferred),
+    VEIL_KIT_GET("/grpc/unary", grpc_unary),
+    VEIL_KIT_GET("/grpc/balanced", grpc_balanced),
+    VEIL_KIT_GET("/di", di_route),
 };
 
 #define CHECK(x)                                                                       \
@@ -389,8 +772,9 @@ static const veil_kit_route_t ROUTES[] = {
         }                                                                              \
     } while (0)
 
-int main(void) {
+int main(int argc, char **argv) {
     printf("veil kit %s\n", veil_kit_version());
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0) return selftest();
     g_key = veil_kit_key_derive((const uint8_t *)COOKIE_SECRET, strlen(COOKIE_SECRET));
     g_jwt = veil_kit_jwt_verifier_new();
     if (g_key == NULL || g_jwt == NULL) return 1;
@@ -442,7 +826,43 @@ int main(void) {
     CHECK(veil_config_on_worker_start(cfg, on_worker, NULL));
     CHECK(veil_config_on_shutdown(cfg, on_shutdown, NULL));
 
+    /* JSON 本文の検証（合わなければハンドラの前に 422） */
+    veil_route_options_t ro = VEIL_ROUTE_OPTIONS_INIT;
+    ro.body_schema_json = USER_SCHEMA;
+    CHECK(veil_register_route_ex2(cfg, "/users", "POST", create_user, NULL, &ro));
+
+    /* HTTP クライアント・gRPC（自分自身へ。1 台目の Balanced の先は落ちているポート） */
+    snprintf(g_self, sizeof g_self, "http://%s", listen ? listen : "127.0.0.1:8080");
+    veil_client_options_t co = VEIL_CLIENT_OPTIONS_INIT;
+    co.timeout_ms = 5000;
+    g_client = veil_client_new(&co);
+    g_chan = veil_grpc_channel_new(g_self, NULL);
+    const char *dead = getenv("VEIL_DEAD_URL");
+    const char *urls[] = {dead ? dead : "http://127.0.0.1:1", g_self};
+    g_lb = veil_kit_grpc_balanced_new(urls, 2, NULL);
+    if (g_client == NULL || g_chan == NULL || g_lb == NULL) {
+        fprintf(stderr, "client: %s\n", veil_last_error() ? veil_last_error() : "?");
+        return 1;
+    }
+    CHECK(veil_register_grpc(cfg, "/kit.Echo/Echo", VEIL_GRPC_UNARY, grpc_echo, NULL));
+
+    /* DI: 値（singleton）・要求ごと・取り出すたび */
+    static long config_value = 42;
+    g_di = veil_kit_di_new();
+    CHECK(veil_kit_di_value(g_di, "config", &config_value, NULL));
+    CHECK(veil_kit_di_register(g_di, "scoped", VEIL_KIT_DI_SCOPED, make_counter, free, NULL));
+    CHECK(veil_kit_di_register(g_di, "transient", VEIL_KIT_DI_TRANSIENT, make_counter, free, NULL));
+
+    /* GraphQL（GraphiQL も出す） */
+    veil_kit_graphql_options_t go = VEIL_KIT_GRAPHQL_OPTIONS_INIT;
+    go.graphiql = VEIL_ON;
+    CHECK(veil_kit_graphql(cfg, "/graphql", gql_exec, NULL, &go));
+
     int rc = veil_run(cfg);
+    veil_kit_grpc_balanced_free(g_lb);
+    veil_grpc_channel_free(g_chan);
+    veil_client_free(g_client);
+    veil_kit_di_free(g_di);
     veil_kit_jwt_verifier_free(g_jwt);
     veil_kit_key_free(g_key);
     if (rc != VEIL_OK) {

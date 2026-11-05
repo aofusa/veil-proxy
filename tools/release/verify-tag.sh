@@ -23,7 +23,7 @@ if [ "$BASE_VERSION" != "$WS_VERSION" ]; then
     exit 1
 fi
 # crates/* が版を継いでいること（版を直書きしたメンバーがあれば、公開物の版がずれる）
-for m in crates/veil-macros crates/veil-build crates/veil-python crates/veil-capi; do
+for m in crates/veil-macros crates/veil-build crates/veil-python crates/veil-capi crates/veil-capi-core crates/veil-capi-helpers; do
     if ! grep -q '^version.workspace = true' "$m/Cargo.toml"; then
         echo "error: $m/Cargo.toml does not use version.workspace = true" >&2
         exit 1
