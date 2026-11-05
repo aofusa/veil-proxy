@@ -415,8 +415,10 @@ impl Key {
         std::iter::once(&self.enc).chain(self.fallback.iter().map(|k| &k.1))
     }
 
-    /// `base64url(HMAC(name=value)).value`.
-    pub(crate) fn sign_value(&self, name: &str, value: &str) -> String {
+    // F-291: C の kit（veil-capi-helpers）も同じ形式で読み書きするので公開する
+    /// The value of a signed cookie named `name`: `base64url(HMAC-SHA256(name=value)).value` (what
+    /// [`SignedCookieJar::cookie`] sends).
+    pub fn sign_value(&self, name: &str, value: &str) -> String {
         let mac =
             crate::crypto::hmac_sha256(&self.sign, &[name.as_bytes(), b"=", value.as_bytes()]);
         let mut s = crate::b64::encode(&mac);
@@ -425,7 +427,9 @@ impl Key {
         s
     }
 
-    pub(crate) fn verify_value(&self, name: &str, signed: &[u8]) -> Option<String> {
+    /// The value of a signed cookie named `name` made by [`Key::sign_value`] with this key or a fallback key
+    /// (`None` when the signature does not match or the value is not UTF-8).
+    pub fn verify_value(&self, name: &str, signed: &[u8]) -> Option<String> {
         let dot = signed.iter().position(|&b| b == b'.')?;
         let mac = crate::b64::decode(&signed[..dot])?;
         let value = &signed[dot + 1..];
@@ -439,12 +443,15 @@ impl Key {
         String::from_utf8(value.to_vec()).ok()
     }
 
-    /// `base64url(nonce || AES-256-GCM(value))`, with the name as associated data.
-    pub(crate) fn encrypt_value(&self, name: &str, value: &[u8]) -> String {
+    /// The value of a private cookie named `name`: `base64url(nonce || AES-256-GCM(value))` with the name as
+    /// associated data (what [`PrivateCookieJar::cookie`] sends).
+    pub fn encrypt_value(&self, name: &str, value: &[u8]) -> String {
         crate::b64::encode(&crate::crypto::seal(&self.enc, name.as_bytes(), value))
     }
 
-    pub(crate) fn decrypt_value(&self, name: &str, sealed: &[u8]) -> Option<Vec<u8>> {
+    /// The plaintext of a private cookie named `name` made by [`Key::encrypt_value`] with this key or a fallback
+    /// key (`None` when it was altered or made with another key).
+    pub fn decrypt_value(&self, name: &str, sealed: &[u8]) -> Option<Vec<u8>> {
         let raw = crate::b64::decode(sealed)?;
         self.enc_keys()
             .find_map(|k| crate::crypto::open(k, name.as_bytes(), &raw))

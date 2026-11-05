@@ -387,6 +387,18 @@ fn answer(index: &Index, req: ReflectionRequest) -> ReflectionResponse {
     }
 }
 
+// F-291: C の veil_grpc_reflection は登録時に検査する（grpc_reflection は起動時に panic する）
+/// Checks that `descriptor_sets` can be used by [`App::grpc_reflection`] (the error explains what is malformed).
+pub fn check_descriptor_sets(descriptor_sets: &[&[u8]]) -> Result<(), String> {
+    let mut index = Index::default();
+    for set in descriptor_sets {
+        index
+            .add_set(set)
+            .map_err(|e| format!("invalid FileDescriptorSet: {}", e.message()))?;
+    }
+    Ok(())
+}
+
 impl App {
     // F-209
     /// Registers server reflection (`ServerReflectionInfo` of `grpc.reflection.v1` and `v1alpha`).

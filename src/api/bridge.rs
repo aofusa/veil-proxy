@@ -372,6 +372,8 @@ where
             });
             let mut r = Response::stream(status, body);
             r.headers = headers;
+            // F-291: 応答後の処理は本文を送り終えてから（先頭の Response と一緒に捨てると始めた時点で走る）
+            r.set_after_send(head.take_after_send());
             r
         }
         // ハンドラが panic した等で何も届かなかった

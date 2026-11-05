@@ -1134,6 +1134,29 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
 相互運用試験を通ります）。
 
+**ミドルウェア・フック・アプリの補助。** 次も `libveil` にあります:
+
+- ヘッダ: `veil_response_add_header`（同じ名前のヘッダをもう 1 つ足す。2 個目の `Set-Cookie` など）、
+  `veil_request_header_count` / `veil_request_header_at` / `veil_request_header_next`（繰り返されたヘッダの全部の値）、
+  `veil_request_version`（`VEIL_HTTP_1_1`・`VEIL_HTTP_2`・`VEIL_HTTP_3`）、`veil_request_is_tls`。
+- 要求ごとの値: `veil_request_set_local(req, key, ptr, free_fn)` / `veil_request_get_local(req, key)`（要求の終わりで解放）。
+- ミドルウェア: `veil_register_middleware(cfg, prefix, before, after, ud)`。`before` は `VEIL_MW_CONTINUE` か `VEIL_MW_STOP`
+  （設定した応答を返す）を返し、`after` は最終的な応答を見ます（ストリーミングの応答では呼ばれません）。ミドルウェアは
+  ハンドラと同じ呼び出しの中でハンドラ用プールで動き、最後に登録したものが最初（最も外側）です（Rust の `wrap_on` と同じ）。
+- 応答の後: `veil_response_after_send(resp, fn, ud)` は応答を送り終えてから（ストリーミングでは本文の終わりの後）
+  ハンドラ用プールで `fn(ud)` を呼びます。
+- ライフサイクル: `veil_config_on_startup`（リスナーを開く前。0 以外を返すと起動を止め、`veil_run` は `VEIL_ERR_RUNTIME` を返す）、`veil_config_on_worker_start`
+  （`veil_worker_info_t`）、`veil_config_on_shutdown`（サーバが止まった後）。
+- `veil_config_cors(cfg, &veil_cors_t)`（プリフライトにも答える CORS）、`veil_config_serve_dir(cfg, prefix, dir,
+  &veil_serve_options_t)`（veil のファイルサーバ）、`veil_grpc_reflection(cfg, data, len)`（`FileDescriptorSet` からの
+  gRPC サーバリフレクション）。
+- WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` はサブプロトコルを選び、`Origin` を確かめ（403）、
+  メッセージの大きさの上限と自動の pong を設定します。選んだものは `veil_ws_protocol(ws, &len)`。
+
+C 向けの Cookie・セッション・認証（Basic・API キー・JWT）・リダイレクト・ファイル・アプリのタスクは別のライブラリ
+`libveil_kit`（`libveil` を含む上位集合。どちらか 1 つとリンクする）にあります:
+[ヘルパークレートの C](library-kit.md#clibveil_kit)。サンプル: [examples/api/c-kit/](../../../examples/api/c-kit/)。
+
 ## Python
 
 `crates/veil-python` は PyO3 の拡張（abi3、Python 3.9 以上）で、`veil` として import します。
@@ -1348,7 +1371,7 @@ Rust のショーケース、C のサンプル（動的・静的）、Python の
 OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`websocket` は WebSocket の試験（ハンドシェイク・エコー・断片化・まとめ送り・プロトコル違反・2,000 接続〈`WS_E2E_CONNS=16384` で増やせる〉・繋ぎ直しの繰り返し・graceful shutdown の 1001、平文・TLS・kTLS。docker と `crossbario/autobahn-testsuite` があれば Autobahn TestSuite の fuzzingclient も）です。`python` は `examples/api/python-websocket` に同じ試験と Autobahn の 1.*〜7.* を行い、`await asyncio.sleep(1)` の要求 2,000 本の同時実行（`PY_E2E_SLEEPERS` で増やせる）・lifespan・アップグレードも確かめます。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
 cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
-（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` と `tests/test_aio.py` です。
+（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi-core -p veil-capi-helpers`、Python は `tests/test_binding.py` と `tests/test_aio.py` です。
 [テスト](testing.md)も参照してください。
 
 ## 制限事項

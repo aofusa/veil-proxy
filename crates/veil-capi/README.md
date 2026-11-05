@@ -3,6 +3,10 @@
 C（および C ABI を話せる言語）から veil の HTTP/1.1・HTTP/2・HTTP/3 サーバを使うための共有/静的ライブラリです。
 C のコールバックを HTTP ハンドラとして登録し、`veil_run()` で起動します。ヘッダは [include/veil.h](include/veil.h)。
 
+実装は [`veil-capi-core`](../veil-capi-core/)（rlib）にあり、このクレートはそれを `libveil` として書き出すだけです。
+Cookie・セッション・認証・JWT などの補助を足した上位集合 `libveil_kit` は [`veil-capi-helpers`](../veil-capi-helpers/README.md)
+（`libveil` とは一緒にリンクしない）。
+
 ## ビルド
 
 ```bash
@@ -211,6 +215,26 @@ veil_response_no_compression(resp);
 `veil_response_stream` のストリーミングの応答は書くたびに圧縮して flush します（`text/event-stream` は圧縮しない）。HTTP/1.1・
 HTTP/2・HTTP/3 のどれでも同じです。規則の全体はガイドの `library.md` の「応答の圧縮」。
 
+### ミドルウェア・フック・アプリの補助（F-291）
+
+| 関数 | 内容 |
+|------|------|
+| `veil_response_add_header` | 同名を置き換えずにヘッダを足す（2 個目の `Set-Cookie` など） |
+| `veil_request_header_count` / `_at` / `_next` | 要求ヘッダの列挙・同名の全部の値 |
+| `veil_request_version` / `veil_request_is_tls` | `VEIL_HTTP_1_1`・`VEIL_HTTP_2`・`VEIL_HTTP_3`、TLS で受けたか |
+| `veil_request_set_local` / `_get_local` | 要求ごとの値（要求の終わりに `free` を呼ぶ） |
+| `veil_register_middleware` | `prefix` の下の C のルートに掛かる前処理・後処理（`VEIL_MW_CONTINUE` / `VEIL_MW_STOP`、後に登録したものほど外側） |
+| `veil_response_after_send` | 応答を送った後にハンドラ用プールで呼ぶ |
+| `veil_config_on_startup` / `_on_shutdown` / `_on_worker_start` | 起動前（非 0 で起動を止める）・停止後（逆順）・各ワーカーの開始 |
+| `veil_config_cors`（`veil_cors_t`） | プリフライトにも答える CORS |
+| `veil_config_serve_dir`（`veil_serve_options_t`） | 本体のファイル配信でディレクトリを出す |
+| `veil_grpc_reflection` | `FileDescriptorSet` から gRPC サーバリフレクション |
+| `veil_ws_accept_ex`（`veil_ws_options_t`） / `veil_ws_protocol` | サブプロトコルの選択・Origin の検査・メッセージの上限 |
+
+大きさ付きの構造体（`veil_cors_t` など）は `VEIL_CORS_INIT` のような初期化子で 0 埋めし、必要な項目だけ設定します。
+C のミドルウェアはハンドラと同じ呼び出しの中でハンドラ用プール（INLINE のルートはワーカー）で動き、gRPC・静的配信・Rust の
+プラグインには掛かりません。
+
 ### 所有権
 
 | 対象 | 規則 |
@@ -240,6 +264,8 @@ HTTP/2・HTTP/3 のどれでも同じです。規則の全体はガイドの `li
 ## テスト
 
 ```bash
-cargo test -p veil-capi
-cargo clippy -p veil-capi --release
+cargo test -p veil-capi-core
+cargo clippy -p veil-capi-core -p veil-capi --all-targets
+tests/api/library_e2e.sh c        # c-hello・c-features
+tests/api/library_e2e.sh c-kit    # libveil_kit と F-291 の関数の書き出し
 ```

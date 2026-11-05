@@ -327,6 +327,141 @@ const char *veil_ws_peer(const veil_ws_t *ws, size_t *len);
 void veil_ws_set_data(veil_ws_t *ws, void *data);
 void *veil_ws_data(const veil_ws_t *ws);
 
+/* Options of veil_ws_accept_ex. Zero-filled means defaults; size is sizeof(veil_ws_options_t) or 0. */
+typedef struct {
+    size_t size;
+    const char *protocols;   /* subprotocols the server speaks, comma-separated, preferred first (NULL = none) */
+    const char *origins;     /* allowed Origin values, comma-separated; others get 403 (NULL = not checked) */
+    size_t max_message_size; /* largest assembled message in bytes (0 = [api] websocket_max_message_size) */
+    int auto_pong;           /* VEIL_DEFAULT (on) / VEIL_ON / VEIL_OFF */
+} veil_ws_options_t;
+#define VEIL_WS_OPTIONS_INIT { sizeof(veil_ws_options_t) }
+/* veil_ws_accept with subprotocol selection, an Origin check and a message limit. VEIL_ERR_STATE with resp set
+ * to 403 when the origin is not allowed (return resp as it is). `opts` may be NULL. */
+int veil_ws_accept_ex(const veil_request_t *req, veil_response_t *resp, const veil_ws_callbacks_t *callbacks,
+                      void *user_data, const veil_ws_options_t *opts);
+/* The selected subprotocol (not NUL-terminated), or NULL when none. */
+const char *veil_ws_protocol(const veil_ws_t *ws, size_t *len);
+
+/* ---- Headers, protocol, per-request values, middleware, lifecycle ---- */
+
+/* Adds a header (does not replace one of the same name; use it for several Set-Cookie). Control characters
+ * such as CR and LF are rejected (VEIL_ERR_INVALID_ARG). */
+int veil_response_add_header(veil_response_t *resp, const char *name, const char *value);
+
+/* The number of request headers (each header counts once, also repeated names). */
+size_t veil_request_header_count(const veil_request_t *req);
+/* The name and value of the request header at `index` (in order of arrival; not NUL-terminated, valid until the
+ * callback returns). The output pointers may be NULL. VEIL_ERR_INVALID_ARG when `index` is out of range. */
+int veil_request_header_at(const veil_request_t *req, size_t index, const char **name, size_t *name_len,
+                           const char **value, size_t *value_len);
+/* The values of every header named `name` (case-insensitive), one per call: set *iter = 0, then call until it
+ * returns NULL. Reads repeated headers such as the separate Cookie headers of HTTP/2. */
+const char *veil_request_header_next(const veil_request_t *req, const char *name, size_t *iter, size_t *len);
+
+#define VEIL_HTTP_1_1 11 /* HTTP/1.1 (and HTTP/1.0) */
+#define VEIL_HTTP_2   20
+#define VEIL_HTTP_3   30
+/* 1 when the request arrived over TLS on veil's listener (HTTP/3 always). X-Forwarded-Proto is not consulted. */
+int veil_request_is_tls(const veil_request_t *req);
+/* VEIL_HTTP_1_1, VEIL_HTTP_2 or VEIL_HTTP_3 (0 for NULL). */
+int veil_request_version(const veil_request_t *req);
+
+/* Frees a value given to veil (veil_request_set_local, veil_response_after_send, lifecycle functions). */
+typedef void (*veil_free_fn)(void *p);
+/*
+ * Attaches a value to the request under `key` (from a middleware to the handler, for example). A previous
+ * value of the same key is released with its `free` function. `free` (may be NULL) is called once when the
+ * request ends, from any thread.
+ */
+int veil_request_set_local(const veil_request_t *req, const char *key, void *val, veil_free_fn free);
+/* The value set with veil_request_set_local, or NULL. */
+void *veil_request_get_local(const veil_request_t *req, const char *key);
+
+/*
+ * Middleware for the C routes under a prefix. `before` runs before the handler: VEIL_MW_CONTINUE (0) goes on,
+ * VEIL_MW_STOP (1) answers with `resp` as it is, a negative value answers 500. `after` runs after the handler
+ * (and may change `resp`) for every middleware whose `before` continued; it is not called once the response
+ * streams. Both run on the handler's thread (the handler pool; a worker for VEIL_ROUTE_INLINE routes) in the
+ * same pool job as the handler. The middleware registered last is the outermost (its `before` runs first and
+ * its `after` last), as with Rust's App::wrap_on. It does not apply to gRPC, static files or Rust plugins.
+ */
+#define VEIL_MW_CONTINUE 0
+#define VEIL_MW_STOP     1
+typedef int (*veil_before_fn)(const veil_request_t *req, veil_response_t *resp, void *user_data);
+typedef void (*veil_after_fn)(const veil_request_t *req, veil_response_t *resp, void *user_data);
+/* `prefix` NULL is "/". Either function may be NULL. user_data follows the rules of veil_register_route. */
+int veil_register_middleware(veil_config_t *cfg, const char *prefix, veil_before_fn before, veil_after_fn after,
+                             void *user_data);
+
+/*
+ * Calls func(user_data) once on the handler pool after the response has been sent (also when the client went
+ * away), for work that should not delay the response (Rust's BackgroundTasks). For a streaming response it runs
+ * after the body ends. Several calls run in order.
+ */
+int veil_response_after_send(veil_response_t *resp, veil_free_fn func, void *user_data);
+
+/* Lifecycle. Startup functions run in order on the thread of veil_run before the listeners open; a non-zero
+ * result stops startup (veil_run returns VEIL_ERR_RUNTIME). Shutdown functions run in reverse order on the same
+ * thread after the server stopped, only when it had started. */
+int veil_config_on_startup(veil_config_t *cfg, int (*func)(void *user_data), void *user_data);
+int veil_config_on_shutdown(veil_config_t *cfg, veil_free_fn func, void *user_data);
+/* Information about a worker thread (valid during the call). */
+typedef struct {
+    size_t size;          /* sizeof(veil_worker_info_t) */
+    const char *listener; /* the listener's name (not NUL-terminated) */
+    size_t listener_len;
+    size_t index;         /* the worker's number within its listener */
+} veil_worker_info_t;
+/* Called on each worker thread when it starts (each listener has its own workers). It runs on the worker:
+ * return quickly and never block. */
+int veil_config_on_worker_start(veil_config_t *cfg, void (*func)(const veil_worker_info_t *info, void *user_data),
+                                void *user_data);
+
+/* ---- CORS and static directories ---- */
+
+/* Zero-filled means defaults; size is sizeof(veil_cors_t) or 0. Arrays are read during the call only. */
+typedef struct {
+    size_t size;
+    const char *prefix;                 /* only routes under this prefix (NULL = "/") */
+    const char *const *origins;         /* allowed origins (a "*.example.com" host matches subdomains) */
+    size_t n_origins;
+    int any_origin;                     /* non-zero: every origin (not with credentials) */
+    const char *const *methods;         /* none = GET, HEAD, POST, PUT, PATCH, DELETE */
+    size_t n_methods;
+    const char *const *headers;         /* allowed request headers */
+    size_t n_headers;
+    int any_header;                     /* non-zero: every requested header */
+    const char *const *expose_headers;
+    size_t n_expose_headers;
+    int credentials;                    /* non-zero: Access-Control-Allow-Credentials: true */
+    uint64_t max_age_secs;              /* preflight cache time (0 = default) */
+} veil_cors_t;
+#define VEIL_CORS_INIT { sizeof(veil_cors_t) }
+/* Answers CORS preflights and adds the CORS headers (the Rust kit's Cors). The settings are checked here:
+ * VEIL_ERR_CONFIG for mistakes such as any_origin with credentials. */
+int veil_config_cors(veil_config_t *cfg, const veil_cors_t *cors);
+
+/* Zero-filled means defaults; size is sizeof(veil_serve_options_t) or 0. */
+typedef struct {
+    size_t size;
+    const char *index;      /* file for directory requests (NULL = index.html) */
+    int cache;              /* VEIL_DEFAULT (on) / VEIL_ON / VEIL_OFF: open_file_cache and static_file_cache */
+    int compression;        /* VEIL_DEFAULT (off) / VEIL_ON / VEIL_OFF: compress on the fly for HTTP/2 and HTTP/3 */
+    const char *extra_toml; /* more [[route]] keys as TOML (NULL = none) */
+} veil_serve_options_t;
+#define VEIL_SERVE_OPTIONS_INIT { sizeof(veil_serve_options_t) }
+/* Serves the directory `dir` under `prefix` with veil's file server (sendfile, kTLS, Range, ETag); requests do
+ * not reach a handler or C middleware. `opts` may be NULL. */
+int veil_config_serve_dir(veil_config_t *cfg, const char *prefix, const char *dir, const veil_serve_options_t *opts);
+
+/* ---- gRPC reflection ---- */
+
+/* Registers server reflection (grpc.reflection.v1 and v1alpha) for the services of a FileDescriptorSet
+ * (protoc --include_imports --descriptor_set_out); their types also go to OpenAPI. VEIL_ERR_INVALID_ARG when it
+ * is malformed. `data` is read during the call only. */
+int veil_grpc_reflection(veil_config_t *cfg, const uint8_t *data, size_t len);
+
 /* ---- その他 ---- */
 
 /* 呼び出しスレッドで最後に起きたエラーのメッセージ (NUL 終端)。無ければ NULL。 */

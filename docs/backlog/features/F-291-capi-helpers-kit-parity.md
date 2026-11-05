@@ -1,6 +1,6 @@
 # F-291: C 向けの kit `veil-capi-helpers` を作り、C からも Rust・Python と同じ機能を使えるようにする
 
-**状態: 未着手（2026-11-05 起票。調査・設計のみ）**
+**状態: 一部実装**
 
 調査の全文（機能 × 層の対応表・FFI の ABI 案・モジュールごとの API 案）は `docs/artifacts/v0110/survey-03-capi-helpers.md`（git 管理外）。
 
@@ -93,6 +93,45 @@ Python と同じ 2 層にする。**プロキシ本体には触れない**（追
   C はメモリストア + 暗号化 cookie に限るか。
 - GraphQL の GET の mutation 拒否に操作種別の判定が要る（コールバックで問う案）。
 - libveil と libveil_kit の二重リンクの検出は文書と pkg-config で足りるか。
+
+## 実装
+
+分割の 1〜3 と 5 の tasks を実装した（4・6 と 5 の残りは下の「残り」）。
+
+- **クレート分割（分割 2）**: `veil-capi` の中身を rlib の `crates/veil-capi-core`（lib 名 `veil_capi`）へ移した（git mv）。`veil-capi`
+  （lib 名 `veil`、cdylib + staticlib）は `pub use veil_capi::*;` だけ。新規 `crates/veil-capi-helpers`（lib 名 `veil_kit`、cdylib + staticlib）は
+  `pub use veil_capi::*;` に `veil_kit_*` を足した上位集合。依存 rlib の `#[no_mangle]` が cdylib から公開されることは `nm -D` で確かめ、
+  `library_e2e.sh c-kit` の回帰試験にした（`libveil` は veil.h の 79 関数、`libveil_kit` は加えて veil_kit.h の 63 関数）。
+- **コア FFI 第 1 弾（分割 1、`crates/veil-capi-core/src/hooks.rs`）**: `veil_response_add_header`、`veil_request_header_count`/`_at`/`_next`、
+  `veil_request_is_tls`/`veil_request_version`、`veil_request_set_local`/`_get_local`（`extensions` に 1 個、使った要求だけ確保）、
+  `veil_register_middleware`（ハンドラと同じ `call_blocking` の閉包の中で順に呼ぶ。後に登録したものほど外側＝`wrap_on` と同じ。ストリーミング後は
+  後処理を呼ばない）、`veil_response_after_send`（`Response::after_send` → `spawn_handler`。`src/api/bridge.rs` でストリーミングの応答にも
+  after_send を引き継ぐよう 1 行足した）、`veil_config_on_startup`/`_on_shutdown`/`_on_worker_start`、`veil_config_cors`（`veil_kit::cors` に委譲）、
+  `veil_config_serve_dir`、`veil_grpc_reflection`（`src/api/grpc/reflection.rs` に `check_descriptor_sets` を足して登録時に検査）、
+  `veil_ws_accept_ex`/`veil_ws_protocol`（Origin 拒否は 403 + `VEIL_ERR_STATE`）。構造体は `size_t size` + `*_INIT`（B-209）。
+  helpers 用の Rust だけの口 `veil_capi::internal`（`#[doc(hidden)]`）。
+- **helpers 第 1 弾（分割 3）**: cookie（取得・`Set-Cookie`・削除、鍵 `derive`/`from`/`generate`/`add_fallback`、署名・暗号化 Cookie）、
+  session（Rust kit の `Sessions` をそのまま入れる。メモリ保存・暗号化 Cookie）、auth（Basic・Bearer・API キー（定数時間）・主体・`require_scope`）、
+  jwt（HMAC・PEM・JWKS・鍵の差し替え・発行・`veil_kit_jwt_authenticate`）、redirect（safe）、send_file、フォームの値、`{"detail"}` のエラー、
+  JSON 文字列、OAuth2 の securitySchemes、ヘッダだけのルート表（`VEIL_KIT_GET` 等・`veil_kit_register_all`）。Cookie の形式は Rust kit と同じ
+  （利用者の決定）にするため `veil-kit` の `Key::sign_value`/`verify_value`/`encrypt_value`/`decrypt_value` を pub にした。
+  ガード（JWT・scope）は Rust の `wrap_on` だと C のミドルウェアより先にワーカーで走るので、C の鎖のミドルウェアとして実装した。
+- **tasks（分割 5 の一部）**: `veil_kit_every`・`veil_kit_cron`（予定はワーカー上の Rust タスク、C の関数はハンドラ用プール、重ならない、
+  停止で止まる）。BackgroundTasks はコアの `veil_response_after_send`。
+- 試験: 単体 `cargo test -p veil-capi-core -p veil-capi -p veil-capi-helpers`（14 + 10 件。Rust kit の鍵・JWT との相互運用を含む）、
+  `examples/api/c-kit` + `tests/api/library_e2e.sh c-kit`（53 件: 全記号の公開、ヘッダの C99/C++ コンパイル、CORS・serve_dir・ミドルウェア・
+  複数 Set-Cookie・署名/暗号化 Cookie の改ざん拒否・**Python 標準ライブラリだけの独立実装（`tests/api/kit_interop.py`）との署名 Cookie・HS256 の相互検証**・
+  セッション・401/403・リダイレクト・send_file・WS のサブプロトコルと Origin・after_send/every/cron/起動/ワーカー/停止のフック）、
+  `library_e2e.sh c`（分割後も 103 件）、`nonregression` にプロキシのバイナリへ `veil_kit_`・`veil_register_middleware` 等が入らない検査を追加。
+  C のライブラリは Linux では元から epoll（reactor）でビルドされるので、c-kit は epoll の経路で動いている。
+- 文書: `library-kit.md`・`library.md`（英日）に C の節、`crates/veil-capi/README.md`、新規 `crates/veil-capi-helpers/README.md`。設定キーは増やしていない。
+
+### 残り（後続のチケットで扱う）
+
+- コア FFI 第 2 弾（分割 4）: HTTP クライアント・gRPC チャネル・遅延応答（`veil_response_defer`）・JSON 本文の検証（422）・試験用呼び出し（`veil_test_*`）。
+- helpers 第 2 弾の残り: di・client の JSON/retry・grpc `Balanced`・graphql、ヘッダだけの JSON 書き出し器。
+- 配布（分割 6）: `build-lib.sh`・`assemble-lib-zip.sh`・`docker/Dockerfile.lib`・pkg-config・CMake・`bindings.yml`。
+- `library_e2e.sh c-kit` の macOS・Windows（MSVC の手順が無いので Windows は飛ばす）・BSD での実行。
 
 ## 関連
 

@@ -301,3 +301,48 @@ App::new().with(
 headers, and `ServeDir` mounted with `App::tokio_service` on `veil::tokio` (the `tokio` crate patched to the shim) next
 to the recommended `App::serve_dir`. tower-cookies' `Cookies` lives in the `http` request extensions and does not
 reach veil handlers.
+
+## C (`libveil_kit`)
+
+The crate `veil-capi-helpers` builds `libveil_kit` (`.so` / `.dylib` / `.dll` and a static library) with the header
+[`veil_kit.h`](../../crates/veil-capi-helpers/include/veil_kit.h). It contains the whole C API of
+[`libveil`](library.md#c-api) plus the `veil_kit_*` helpers, so a program links **one** of the two libraries, never both.
+Cookies, signed and private cookies and sessions use the Rust kit's format byte for byte (the same `Key` derived from
+the same secret reads the other side's cookies), and HS256/RS256/ES256 tokens issued by one side verify on the other.
+
+```sh
+cargo build -p veil-capi-helpers --release      # target/release/libveil_kit.{so,a}
+cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/release -lveil_kit -lpthread -ldl -lm
+```
+
+| Area | Functions |
+|---|---|
+| Cookies | `veil_kit_cookie_get`, `veil_kit_set_cookie` (`veil_kit_cookie_t`: path, domain, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`, `Partitioned`), `veil_kit_remove_cookie` |
+| Keys, signed and private cookies | `veil_kit_key_derive / from / generate / add_fallback / free`, `veil_kit_signed_get / set` (HMAC-SHA256), `veil_kit_private_get / set` (AES-256-GCM) |
+| Sessions | `veil_kit_sessions_install` (`veil_kit_sessions_t`: prefix, cookie name, TTL, memory store), `veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
+| Credentials | `veil_kit_basic_auth`, `veil_kit_basic_matches`, `veil_kit_bearer`, `veil_kit_api_key`, `veil_kit_api_key_matches` (constant-time), `veil_kit_unauthorized` |
+| Principal | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`, `veil_kit_set_principal`, `veil_kit_principal`, `veil_kit_principal_subject / has_scope / has_role / attributes`, `veil_kit_require_scope` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`, `veil_kit_jwt_verify`, `veil_kit_jwt_encode_hmac`, `veil_kit_jwt_authenticate` |
+| Redirects and files | `veil_kit_redirect`, `veil_kit_redirect_safe` (against open redirects), `veil_kit_send_file` |
+| Small helpers | `veil_kit_form_get`, `veil_kit_error` (`{"detail": ...}`), `veil_kit_json_string`, `veil_kit_oauth2_security_scheme`, `veil_kit_free`, `veil_kit_version` |
+| Tasks | `veil_kit_every`, `veil_kit_cron` (app tasks on the handler pool; after-response work is `veil_response_after_send` in `libveil`) |
+| Route tables | `veil_kit_route_t`, `VEIL_KIT_GET / POST / PUT / PATCH / DELETE`, `veil_kit_register_all` (header only) |
+
+CORS, static directories, middleware, request-scoped values, lifecycle hooks, WebSocket subprotocols and gRPC
+reflection are in `libveil` itself (`veil_config_cors`, `veil_config_serve_dir`, `veil_register_middleware`,
+`veil_request_set_local`, `veil_config_on_startup / on_shutdown / on_worker_start`, `veil_ws_accept_ex`,
+`veil_grpc_reflection`; see [library.md](library.md#c-api)).
+
+- C middleware and the kit's guards run on the handler pool in the same call as the handler. The middleware
+  registered last runs first, so register `veil_kit_require_scope` before `veil_kit_jwt_authenticate` on the same
+  prefix. `veil_kit_jwt_authenticate` answers 401 with `WWW-Authenticate: Bearer` for a missing or invalid token
+  (with `VEIL_KIT_JWT_OPTIONAL`, a missing token passes), and sets the principal from `sub`, `scope` / `scp` and
+  `roles`.
+- Strings returned without `veil_kit_free` (`veil_kit_cookie_get`, `veil_kit_session_get`, `veil_kit_form_get`, ...)
+  are not NUL-terminated (use the length) and stay valid until the callback returns. Strings documented as "free it
+  with `veil_kit_free`" are NUL-terminated and owned by the caller.
+- `veil_kit_send_file` reads the file in the callback and is refused on `VEIL_ROUTE_INLINE` routes; serve
+  directories with `veil_config_serve_dir`.
+- The example [`examples/api/c-kit`](../../examples/api/c-kit/) uses every area and is run by
+  `tests/api/library_e2e.sh c-kit`, which also checks cookies and tokens against independent implementations.
+- Not in the C kit yet: the HTTP and gRPC clients, dependency injection, GraphQL and `Balanced`.

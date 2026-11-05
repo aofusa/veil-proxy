@@ -1192,6 +1192,31 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
 interoperability checks as the Rust gRPC example).
 
+**Middleware, hooks and app helpers.** These are part of `libveil` too:
+
+- Headers: `veil_response_add_header` (adds another header of the same name, for example a second `Set-Cookie`),
+  `veil_request_header_count` / `veil_request_header_at` / `veil_request_header_next` (every value of a repeated
+  header), `veil_request_version` (`VEIL_HTTP_1_1`, `VEIL_HTTP_2`, `VEIL_HTTP_3`), `veil_request_is_tls`.
+- Request-scoped values: `veil_request_set_local(req, key, ptr, free_fn)` / `veil_request_get_local(req, key)`
+  (freed when the request ends).
+- Middleware: `veil_register_middleware(cfg, prefix, before, after, ud)`. `before` returns `VEIL_MW_CONTINUE` or
+  `VEIL_MW_STOP` (the response it set is sent); `after` sees the final response (not called for streamed
+  responses). Middleware runs on the handler pool in the same call as the handler; the one registered last runs
+  first (outermost), as with Rust's `wrap_on`.
+- After the response: `veil_response_after_send(resp, fn, ud)` runs `fn(ud)` on the handler pool once the response
+  has been sent (after the end of a streamed body).
+- Lifecycle: `veil_config_on_startup` (before the listeners open; a non-zero return stops the start and `veil_run` returns `VEIL_ERR_RUNTIME`),
+  `veil_config_on_worker_start` (`veil_worker_info_t`), `veil_config_on_shutdown` (after the server stopped).
+- `veil_config_cors(cfg, &veil_cors_t)` (CORS with preflight answers), `veil_config_serve_dir(cfg, prefix, dir,
+  &veil_serve_options_t)` (veil's file server), `veil_grpc_reflection(cfg, data, len)` (gRPC server reflection from a
+  `FileDescriptorSet`).
+- WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` picks a subprotocol, checks `Origin`
+  (403) and sets the message size limit and automatic pong; `veil_ws_protocol(ws, &len)` returns the chosen one.
+
+Cookies, sessions, authentication (Basic, API keys, JWT), redirects, files and app tasks for C are in the separate
+library `libveil_kit` (a superset of `libveil`; link one of the two): see
+[Helper crate, C](library-kit.md#c-libveil_kit). Example: [examples/api/c-kit/](../../examples/api/c-kit/).
+
 ## Python
 
 `crates/veil-python` is a PyO3 extension (abi3, Python 3.9+) imported as `veil`:
@@ -1433,7 +1458,7 @@ and the `nonregression` step checks that the proxy binary is unaffected. It runs
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
 (GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
 another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
---lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
+--lib --features full,api`, `cargo test -p veil-capi-core -p veil-capi-helpers`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
 [Testing](testing.md).
 
 ## Limitations

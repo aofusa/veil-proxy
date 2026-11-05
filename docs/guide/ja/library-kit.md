@@ -286,3 +286,45 @@ App::new().with(
 `ValidateRequestHeaderLayer::custom`、ヘッダだけで書く Cookie とリダイレクト、`veil::tokio`（`tokio` を shim に差し替え）の上で
 `App::tokio_service` に載せた `ServeDir` と、推奨の `App::serve_dir`。tower-cookies の `Cookies` は `http` の要求の拡張領域にあり、
 veil のハンドラには届きません。
+
+## C（`libveil_kit`）
+
+クレート `veil-capi-helpers` は `libveil_kit`（`.so`・`.dylib`・`.dll` と静的ライブラリ）とヘッダ
+[`veil_kit.h`](../../../crates/veil-capi-helpers/include/veil_kit.h) を作ります。[`libveil`](library.md#c-api) の C API をすべて含み、
+その上に `veil_kit_*` の補助を足したものなので、プログラムは 2 つのライブラリの **どちらか 1 つ** とリンクします（両方は不可）。
+Cookie・署名付き/暗号化 Cookie・セッションは Rust の kit と 1 バイトも違わない形式で（同じ秘密から導いた同じ `Key` で互いの
+Cookie を読めます）、HS256・RS256・ES256 のトークンは片方が発行したものをもう片方で検証できます。
+
+```sh
+cargo build -p veil-capi-helpers --release      # target/release/libveil_kit.{so,a}
+cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/release -lveil_kit -lpthread -ldl -lm
+```
+
+| 分野 | 関数 |
+|---|---|
+| Cookie | `veil_kit_cookie_get`、`veil_kit_set_cookie`（`veil_kit_cookie_t`: path・domain・`Max-Age`・`Secure`・`HttpOnly`・`SameSite`・`Partitioned`）、`veil_kit_remove_cookie` |
+| 鍵・署名付き/暗号化 Cookie | `veil_kit_key_derive / from / generate / add_fallback / free`、`veil_kit_signed_get / set`（HMAC-SHA256）、`veil_kit_private_get / set`（AES-256-GCM） |
+| セッション | `veil_kit_sessions_install`（`veil_kit_sessions_t`: 接頭辞・Cookie 名・寿命・メモリ保存）、`veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
+| 資格情報 | `veil_kit_basic_auth`、`veil_kit_basic_matches`、`veil_kit_bearer`、`veil_kit_api_key`、`veil_kit_api_key_matches`（定数時間）、`veil_kit_unauthorized` |
+| 主体（Principal） | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`、`veil_kit_set_principal`、`veil_kit_principal`、`veil_kit_principal_subject / has_scope / has_role / attributes`、`veil_kit_require_scope` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`、`veil_kit_jwt_verify`、`veil_kit_jwt_encode_hmac`、`veil_kit_jwt_authenticate` |
+| リダイレクト・ファイル | `veil_kit_redirect`、`veil_kit_redirect_safe`（オープンリダイレクト対策）、`veil_kit_send_file` |
+| 小物 | `veil_kit_form_get`、`veil_kit_error`（`{"detail": ...}`）、`veil_kit_json_string`、`veil_kit_oauth2_security_scheme`、`veil_kit_free`、`veil_kit_version` |
+| タスク | `veil_kit_every`、`veil_kit_cron`（ハンドラ用プールで動くアプリのタスク。応答の後の処理は `libveil` の `veil_response_after_send`） |
+| ルート表 | `veil_kit_route_t`、`VEIL_KIT_GET / POST / PUT / PATCH / DELETE`、`veil_kit_register_all`（ヘッダだけ） |
+
+CORS・静的ディレクトリ・ミドルウェア・要求ごとの値・ライフサイクルのフック・WebSocket のサブプロトコル・gRPC リフレクションは
+`libveil` 自体にあります（`veil_config_cors`、`veil_config_serve_dir`、`veil_register_middleware`、`veil_request_set_local`、
+`veil_config_on_startup / on_shutdown / on_worker_start`、`veil_ws_accept_ex`、`veil_grpc_reflection`。[library.md](library.md#c-api) を参照）。
+
+- C のミドルウェアと kit のガードは、ハンドラと同じ呼び出しの中でハンドラ用プールで動きます。最後に登録したミドルウェアが
+  最初に動くので、同じ接頭辞では `veil_kit_require_scope` を `veil_kit_jwt_authenticate` より先に登録します。
+  `veil_kit_jwt_authenticate` はトークンが無い・不正なとき `WWW-Authenticate: Bearer` 付きの 401 を返し（`VEIL_KIT_JWT_OPTIONAL`
+  では無いときは通す）、`sub`・`scope` / `scp`・`roles` から主体を設定します。
+- `veil_kit_free` で解放しない文字列（`veil_kit_cookie_get`・`veil_kit_session_get`・`veil_kit_form_get` など）は NUL 終端されず
+  （長さを使う）、コールバックが戻るまで有効です。「`veil_kit_free` で解放する」とある文字列は NUL 終端で、呼び出し側のものです。
+- `veil_kit_send_file` はコールバックの中でファイルを読むので `VEIL_ROUTE_INLINE` のルートでは拒否されます。ディレクトリは
+  `veil_config_serve_dir` で出します。
+- サンプル [`examples/api/c-kit`](../../../examples/api/c-kit/) は全分野を使い、`tests/api/library_e2e.sh c-kit` が動かします
+  （Cookie とトークンは独立した実装とも突き合わせます）。
+- C の kit にまだ無いもの: HTTP・gRPC のクライアント、依存性注入、GraphQL、`Balanced`。

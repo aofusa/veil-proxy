@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # API ライブラリ（F-188〜F-195）の E2E。Rust・C・Python の各サンプルを実際にビルド・起動して叩く。
 #
-#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]   （既定 all）
+#   tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|autobahn|kit|c|c-kit|python|production|nonregression|external|all]   （既定 all）
 #
 # external（Linux のみ。all には含めない。依存を 2 回ビルドするので重い）: リポジトリの外に veil を path 依存にした
 # プロジェクトを作り、`.cargo/config.toml` の `[env]` 無しと有りの両方でビルドして HTTP/1.1・HTTP/3 で応答を確かめる（F-243）。
@@ -1376,6 +1376,139 @@ run_tower_recipes() { # run_tower_recipes <target-dir>
   kill "$PID"
 }
 
+run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）と、コアに足した FFI の書き出し
+  echo "== C helpers kit (examples/api/c-kit, libveil_kit)"
+  # Windows（MSVC）向けのビルド手順はまだ無い（ライブラリ自体は単体テストで確かめる）
+  [ "$OS" = Windows ] && { echo "  skip: the C kit example has no MSVC build yet"; return; }
+  (cd "$ROOT" && cargo build -q -p veil-capi -p veil-capi-helpers --release) || { bad "build libveil / libveil_kit"; return; }
+  # ヘッダで宣言した関数が全部ライブラリから見える（libveil_kit は veil.h と veil_kit.h の全部、libveil は veil.h の全部）
+  if [ "$OS" = Linux ]; then
+    local decl_core decl_kit missing
+    decl_core=$(grep -o -E '\bveil_[a-z0-9_]+\(' "$ROOT/crates/veil-capi/include/veil.h" | tr -d '(' | sort -u)
+    decl_kit=$(grep -v 'static inline' "$ROOT/crates/veil-capi-helpers/include/veil_kit.h" \
+      | grep -o -E '\bveil_kit_[a-z0-9_]+\(' | tr -d '(' | grep -v '^veil_kit_register_all$' | sort -u)
+    nm -D --defined-only "$ROOT/target/release/libveil.so" | awk '{print $3}' | sort -u > "$TMPD/syms-veil"
+    nm -D --defined-only "$ROOT/target/release/libveil_kit.so" | awk '{print $3}' | sort -u > "$TMPD/syms-kit"
+    missing=$(comm -23 <(echo "$decl_core") "$TMPD/syms-veil" | tr '\n' ' ')
+    [ -z "$missing" ] && ok "libveil exports every function of veil.h ($(echo "$decl_core" | wc -l))" \
+      || bad "libveil misses: $missing"
+    missing=$(comm -23 <(printf '%s\n%s\n' "$decl_core" "$decl_kit" | sort -u) "$TMPD/syms-kit" | tr '\n' ' ')
+    [ -z "$missing" ] && ok "libveil_kit exports every function of veil.h and veil_kit.h ($(echo "$decl_kit" | wc -l) kit)" \
+      || bad "libveil_kit misses: $missing"
+    n=$(grep -c '^veil_kit_' "$TMPD/syms-veil") || true
+    [ "$n" = 0 ] && ok "libveil has no veil_kit_ symbols" || bad "libveil exports veil_kit_ symbols ($n)"
+  fi
+  # ヘッダだけを C99 と C++ でコンパイルする
+  local INC=(-I"$ROOT/crates/veil-capi/include" -I"$ROOT/crates/veil-capi-helpers/include")
+  echo '#include "veil_kit.h"' > "$TMPD/h.c"
+  "${CC:-cc}" -std=c99 -Wall -Wextra -pedantic -fsyntax-only "${INC[@]}" "$TMPD/h.c" 2>"$TMPD/h.err" \
+    && ok "veil_kit.h compiles as C99" || bad "veil_kit.h as C99: $(head -3 "$TMPD/h.err")"
+  if command -v "${CXX:-c++}" >/dev/null; then
+    "${CXX:-c++}" -x c++ -std=c++11 -Wall -Wextra -fsyntax-only "${INC[@]}" "$TMPD/h.c" 2>"$TMPD/h.err" \
+      && ok "veil_kit.h compiles as C++" || bad "veil_kit.h as C++: $(head -3 "$TMPD/h.err")"
+  fi
+  local CK="$ROOT/examples/api/c-kit"
+  rm -f "$CK/kit" "$CK/kit.exe"
+  local MK; MK=$(command -v gmake || command -v make)
+  local libs="-lpthread -ldl -lm"
+  [ "$OS" = Linux ] || libs=$(cd "$ROOT" && cargo rustc -q --color never -p veil-capi-helpers --release --crate-type staticlib -- \
+    --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
+  "$MK" -s -C "$CK" CC="${CC:-cc}" LIBS="$libs" kit >/dev/null || { bad "compile kit.c"; return; }
+  local W; W="$(mktemp -d)"
+  mkdir -p "$W/www"; echo "static index" > "$W/www/index.html"; printf 'file-%s' body > "$W/report.txt"
+  local P; P=$(free_port)
+  VEIL_LISTEN="127.0.0.1:$P" VEIL_STATIC_DIR="$W/www" VEIL_DOWNLOAD="$W/report.txt" VEIL_SHUTDOWN_MARK="$W/shutdown" \
+    VEIL_WS_ORIGIN="https://app.example.com" "$CK/kit$EXE" > "$W/log" 2>&1 &
+  local PID=$!; PIDS+=("$PID")
+  wait_port "$P" "$PID" || { bad "kit start"; cat "$W/log"; return; }
+  local B="http://127.0.0.1:$P" KI=("$PY3" -I "$ROOT/tests/api/kit_interop.py")
+  local CS="kit-example-cookie-secret-0123456789" JS="kit-example-secret-0123456789abcdef"
+  expect "C kit route table" "hello" curl -s "$B/api/hello"
+  # CORS（コア）: 許した Origin のプリフライトと実際の応答、許していない Origin
+  expect "C CORS preflight" "access-control-allow-origin: https://app.example.com" bash -c \
+    "curl -s -i -X OPTIONS -H 'Origin: https://app.example.com' -H 'Access-Control-Request-Method: POST' '$B/api/echo' | tr -d '\r' | tr A-Z a-z"
+  expect "C CORS wildcard subdomain" "access-control-allow-origin: https://x.example.org" bash -c \
+    "curl -s -i -H 'Origin: https://x.example.org' '$B/api/hello' | tr -d '\r' | tr A-Z a-z"
+  expect "C CORS other origin gets no header" "none" bash -c \
+    "curl -s -i -H 'Origin: https://evil.example' '$B/api/hello' | grep -qi '^access-control-allow-origin' && echo found || echo none"
+  expect "C serve_dir" "static index" curl -s "$B/static/"
+  # ミドルウェア・要求ごとの値・ヘッダの列挙・HTTP の版
+  expect "C middleware + locals" "local=req-7" curl -s -H 'x-request-id: req-7' "$B/mw/echo"
+  expect "C middleware after hook" "x-request-id: req-7|x-mw: after" bash -c \
+    "curl -s -i -H 'x-request-id: req-7' '$B/mw/echo' | tr -d '\r' | tr A-Z a-z | grep -E '^x-(request-id|mw):' | paste -sd'|'"
+  expect "C middleware stop" "stopped by middleware 418" curl -s -w ' %{http_code}' "$B/mw/stop"
+  expect "C header_next + version (HTTP/1.1)" "multi=a;b; version=11 tls=0" curl -s -H 'x-multi: a' -H 'x-multi: b' "$B/headers"
+  expect "C version (h2c)" "version=20" curl -s --http2-prior-knowledge "$B/headers"
+  expect "C add_header twice" "2" bash -c "curl -s -i '$B/headers' | grep -ci '^x-twice:'"
+  # Cookie: 2 個の Set-Cookie・読み取り
+  expect "C two Set-Cookie" "2" bash -c "curl -s -i '$B/cookie/visit' | grep -ci '^set-cookie:'"
+  expect "C cookie attributes" "visits=1; path=/; httponly" bash -c "curl -s -i '$B/cookie/visit' | tr -d '\r' | tr A-Z a-z | grep '^set-cookie: visits'"
+  expect "C cookie read" "visit 5" curl -s -b 'visits=4' "$B/cookie/visit"
+  # 署名付き・暗号化 Cookie（Rust の kit と同じ鍵の導出・形式。署名は Python で独立に確かめる）
+  curl -s -c "$W/jar" -X POST "$B/cookie/signed" >/dev/null
+  expect "C signed + private cookies round trip" "user=alice secret=s3cr3t" curl -s -b "$W/jar" "$B/cookie/signed"
+  local sv; sv=$(awk '$6 == "user" {print $7}' "$W/jar")
+  expect "C signed cookie verifies in Python" "alice" "${KI[@]}" verify-signed "$CS" user "$sv"
+  expect "Python signed cookie verifies in C" "user=alice" curl -s -b "user=$("${KI[@]}" signed "$CS" user alice)" "$B/cookie/signed"
+  expect "C signed cookie rejects tampering" "user=invalid" curl -s -b "user=${sv%%.*}.mallory" "$B/cookie/signed"
+  expect "C private cookie rejects tampering" "secret=invalid" curl -s -b 'secret=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$B/cookie/signed"
+  # セッション（メモリ保存・ID の付け替え・破棄）
+  curl -s -c "$W/sj" -b "$W/sj" -X POST --data bob "$B/session/login" >/dev/null
+  expect "C session 1" "bob 1" curl -s -c "$W/sj" -b "$W/sj" "$B/session/whoami"
+  expect "C session 2" "bob 2" curl -s -c "$W/sj" -b "$W/sj" "$B/session/whoami"
+  expect "C session cookie is signed with the kit key" "veil_session" bash -c "cat '$W/sj'"
+  curl -s -c "$W/sj" -b "$W/sj" -X POST "$B/session/logout" >/dev/null
+  expect "C session destroyed" "anonymous 1" curl -s -c "$W/sj" -b "$W/sj" "$B/session/whoami"
+  # 認証: Basic・API キー・JWT（C が発行したものを Python で、Python が発行したものを C で検証する）
+  expect "C basic auth" "basic admin" curl -s -u admin:pw "$B/auth/basic"
+  expect "C basic auth challenge" "401 basic realm=\"veil\"" bash -c \
+    "curl -s -i -u admin:no '$B/auth/basic' | tr -d '\r' | tr A-Z a-z | awk 'NR==1{s=\$2} /^www-authenticate:/{sub(/^www-authenticate: /,\"\"); print s, \$0}'"
+  expect "C API key" "key ok" curl -s -H 'x-api-key: k-456' "$B/auth/key"
+  expect "C API key wrong" '{"detail":"wrong API key"}' curl -s -H 'x-api-key: nope' "$B/auth/key"
+  expect "C API key missing" "401" curl -s -o /dev/null -w '%{http_code}' "$B/auth/key"
+  local tok; tok=$(curl -s -X POST --data 'grant_type=password&username=carol&scope=admin+read' "$B/auth/token")
+  expect "C-issued JWT verifies in Python" '"iss":"veil-kit-example","scope":"admin read","sub":"carol"' "${KI[@]}" verify-jwt "$JS" "$tok"
+  expect "C jwt_authenticate" "me carol" curl -s -H "Authorization: Bearer $tok" "$B/auth/me"
+  expect "C require_scope (admin)" "admin carol" curl -s -H "Authorization: Bearer $tok" "$B/admin/area"
+  local rtok; rtok=$(curl -s -X POST --data 'username=dave&scope=read' "$B/auth/token")
+  expect "C require_scope (403 without admin)" "403" curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $rtok" "$B/admin/area"
+  expect "C jwt_authenticate (401 without token)" "401" curl -s -o /dev/null -w '%{http_code}' "$B/admin/area"
+  expect "C jwt_authenticate (invalid token)" 'error="invalid_token"' bash -c \
+    "curl -s -i -H 'Authorization: Bearer x.y.z' '$B/auth/me' | tr -d '\r' | grep -i '^www-authenticate:'"
+  local ptok; ptok=$("${KI[@]}" jwt "$JS" erin admin veil-kit-example)
+  expect "Python-issued JWT accepted by C" "admin erin" curl -s -H "Authorization: Bearer $ptok" "$B/admin/area"
+  expect "Python-issued JWT claims in C" '"sub":"erin"' curl -s -X POST --data "$ptok" "$B/auth/verify"
+  local btok; btok=$("${KI[@]}" jwt "$JS" erin admin someone-else)
+  expect "C JWT issuer check" "401" curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $btok" "$B/auth/me"
+  # リダイレクト（オープンリダイレクト対策）・ファイル
+  # curl は相対の Location を要求の URL で解決して出す
+  expect "C safe redirect (path)" "302 $B/home" curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$B/redirect?next=/home"
+  expect "C safe redirect (allowed host)" "https://app.example.com/x" curl -s -o /dev/null -w '%{redirect_url}' "$B/redirect?next=https://app.example.com/x"
+  expect "C safe redirect (rejected)" "$B/" curl -s -o /dev/null -w '%{redirect_url}' "$B/redirect?next=//evil.example/"
+  expect "C send_file" "file-body" curl -s "$B/download"
+  expect "C send_file content type" "text/plain" curl -s -o /dev/null -w '%{content_type}' "$B/download"
+  # WebSocket のサブプロトコル・Origin
+  expect "C ws subprotocol" "101 chat protocol=chat" "${KI[@]}" ws "$P" /ws "foo, chat" https://app.example.com
+  expect "C ws no common subprotocol" "101 - protocol=none" "${KI[@]}" ws "$P" /ws foo https://app.example.com
+  expect "C ws origin rejected" "403" "${KI[@]}" ws "$P" /ws chat https://evil.example
+  # 応答の後の処理・定期タスク・cron・起動とワーカー開始のフック
+  for _ in 1 2 3; do curl -s -X POST "$B/tasks/enqueue" >/dev/null; done
+  sleep 2.5
+  local st; st=$(curl -s "$B/tasks/status")
+  "$PY3" -I -c '
+import json, sys
+s = json.loads(sys.argv[1])
+bad = [k for k, lo in (("background", 3), ("ticks", 3), ("cron", 1), ("started", 1), ("workers", 1)) if s[k] < lo]
+print("tasks ok" if not bad and s["started"] == 1 else "bad " + ",".join(bad) + " " + sys.argv[1])' "$st" > "$W/st"
+  expect "C after_send / every / cron / startup / worker_start ($st)" "tasks ok" cat "$W/st"
+  # 停止: SIGTERM で on_shutdown が呼ばれる
+  kill -TERM "$PID"
+  for _ in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+  expect "C on_shutdown" "background=" cat "$W/shutdown"
+  # ログの水準の欄（"<時刻> <経過>ms ERROR ..."）だけを見る（起動時の "error log (ERROR)" の行は数えない）
+  if grep -q -E "panicked|ms (ERROR|WARN) " "$W/log"; then bad "kit log has errors: $(grep -E 'panicked|ms (ERROR|WARN) ' "$W/log" | head -3)"; else ok "kit log has no errors"; fi
+}
+
 run_nonregression() {
   echo "== 本体ビルドにライブラリのコードが入っていない（${FULL}）"
   (cd "$ROOT" && cargo build -q $NODEF --features "$FULL") || { bad "build $FULL"; return; }
@@ -1405,6 +1538,9 @@ run_nonregression() {
   # F-267: HTTP / gRPC クライアント（veil::api::client・Channel）と veil-proxy-kit（veil_kit::）も入らない
   n=$(grep -cE "veil::api::client|veil::api::grpc::channel|veil_kit::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::client / veil_kit in the full binary" || bad "client or kit symbols found ($n)"
+  # F-291: C の helpers kit（veil_kit_*）とコアに足した C API（ミドルウェア・CORS 等）も入らない
+  n=$(grep -cE "veil_kit_|veil_register_middleware|veil_config_cors|veil_config_serve_dir|veil_request_set_local" "$SYMS") || true
+  [ "$n" = 0 ] && ok "no C API / C kit symbols in the full binary" || bad "C API or C kit symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"
   # F-264: Swagger UI の資産・ページはライブラリだけ（本体のバイナリの中身に文字列が 1 つも無い）
@@ -1451,7 +1587,8 @@ case "$WHAT" in
   nonregression) run_nonregression ;;
   external) run_external ;;
   kit) run_kit ;;
-  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_python; run_production ;;
-  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|python|production|nonregression|external|all]"; exit 2 ;;
+  c-kit) run_c_kit ;;
+  all) run_nonregression; run_rust; run_graphql; run_grpc; run_upgrade; run_websocket; run_kit; run_c; run_c_features; run_c_kit; run_python; run_production ;;
+  *) echo "usage: $0 [rust|grpc|upgrade|websocket|autobahn|kit|c|c-kit|python|production|nonregression|external|all]"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED"; exit 1; }

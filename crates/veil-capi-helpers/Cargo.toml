@@ -1,0 +1,26 @@
+# F-291: C 向けの kit（libveil_kit = libveil の全関数 + veil_kit_*）。Rust の veil-proxy-kit をそのまま使い、
+# Cookie・セッション・JWT の形式と検査を Rust の kit とそろえる。C のプログラムは libveil か libveil_kit の
+# どちらか一方だけをリンクする（両方入れるとランタイムとグローバルが 2 個になる）。
+[package]
+name = "veil-capi-helpers"
+version.workspace = true
+edition.workspace = true
+description = "C helpers kit for the veil API server library (libveil_kit: libveil plus cookies, sessions, auth, JWT, redirects and tasks)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "veil_kit"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+veil-capi-core = { path = "../veil-capi-core" }
+# veil の feature は veil-capi-core が決める（ここでは足さない）
+veil = { package = "veil-proxy", path = "../..", default-features = false, features = ["handler"] }
+kit = { package = "veil-proxy-kit", path = "../veil-kit", default-features = false, features = ["cookie", "cors", "auth", "jwt", "session", "cron"] }
+bytes = "1"
+serde_json = "1"
+ftlog = "0.2"
+futures = "0.3"
