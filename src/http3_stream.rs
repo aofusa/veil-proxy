@@ -472,6 +472,7 @@ fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
 }
 
 /// `libc::read` ラッパー（ノンブロッキング fd 用）。
+#[cfg(unix)]
 fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe {
         libc::read(
@@ -488,6 +489,7 @@ fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<
 }
 
 /// `libc::write` ラッパー（ノンブロッキング fd 用）。
+#[cfg(unix)]
 fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
     let n = unsafe {
         libc::write(
@@ -498,6 +500,55 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
     };
     if n < 0 {
         Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Winsock 版の `raw_fd_read`（B-312）。Windows の `libc::read` は CRT のファイル記述子を取り、
+/// ソケットを渡すと CRT の不正引数ハンドラがプロセスを `__fastfail` で落とす。
+#[cfg(windows)]
+fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Networking::WinSock;
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    // SAFETY: fd はこの接続が所有する有効なソケット。buf は len バイト書き込める可変スライス。
+    let n = unsafe {
+        WinSock::recv(
+            crate::runtime::handle::win::to_socket(fd),
+            buf.as_mut_ptr(),
+            len,
+            0,
+        )
+    };
+    if n < 0 {
+        // SAFETY: 引数を取らず、このスレッドの直前の Winsock の誤りを返すだけ。
+        Err(io::Error::from_raw_os_error(unsafe {
+            WinSock::WSAGetLastError()
+        }))
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Winsock 版の `raw_fd_write`（B-312）。
+#[cfg(windows)]
+fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Networking::WinSock;
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    // SAFETY: fd はこの接続が所有する有効なソケット。buf は len バイト読める。
+    let n = unsafe {
+        WinSock::send(
+            crate::runtime::handle::win::to_socket(fd),
+            buf.as_ptr(),
+            len,
+            0,
+        )
+    };
+    if n < 0 {
+        // SAFETY: 引数を取らず、このスレッドの直前の Winsock の誤りを返すだけ。
+        Err(io::Error::from_raw_os_error(unsafe {
+            WinSock::WSAGetLastError()
+        }))
     } else {
         Ok(n as usize)
     }

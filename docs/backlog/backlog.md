@@ -657,6 +657,7 @@
 | B-309 | P1 | 修正済み（v0.11.0） | [bugs/B-309-kqueue-stale-read-hint-stalls-websocket-relay.md](bugs/B-309-kqueue-stale-read-hint-stalls-websocket-relay.md) | kqueue（macOS・BSD）で WebSocket の中継（HTTP/1.1・HTTP/2・HTTP/3）が古い readiness ヒントの偽の `Ready` で片方向の読み取りに止まり、反対方向を中継しない。中継は `readable_confirmed`（必ず `poll(2)` で確かめる）で待つ |
 | B-310 | P2 | 修正済み（v0.11.0） | [bugs/B-310-windows-udp-connreset-breaks-http3-recv.md](bugs/B-310-windows-udp-connreset-breaks-http3-recv.md) | Windows の UDP ソケット（HTTP/3・L4）が閉じたクライアントへの送信の ICMP を次の受信の `WSAECONNRESET` として返し、HTTP/3 が受信の周回を捨てて ERROR をログする。`SIO_UDP_CONNRESET` を切る |
 | B-311 | P2 | 修正済み（v0.11.0） | [bugs/B-311-windows-e2e-suite-could-not-run.md](bugs/B-311-windows-e2e-suite-could-not-run.md) | E2E が Windows で走らない（UDS の上流で起動しない・試験のビルドが実行中の veil.exe を置き換えられない・SIGHUP の試験がプロキシを終了させる） |
+| B-312 | P1 | 修正済み（v0.11.0） | [bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md](bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md) | Windows で HTTP/3 の要求を TLS の上流へ中継すると、`http3_stream` が CRT の `read`/`write` にソケットを渡してプロセスが `__fastfail` で落ちる。Winsock の `recv`/`send` にした |
 
 ---
 
