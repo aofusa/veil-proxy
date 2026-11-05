@@ -46,19 +46,8 @@ pub(super) async fn handle_websocket_proxy(
 
     // リクエストパス構築
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let sub_path = if prefix.is_empty() {
-        path_str.to_string()
-    } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
-    };
-
-    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    let final_path = ws_upstream_path(target, path_str, prefix);
+    let final_path = final_path.as_str();
 
     // WebSocket アップグレードリクエスト構築（プール使用）
     // Connection: Upgrade と Upgrade: websocket を維持
@@ -152,6 +141,27 @@ pub(super) async fn handle_websocket_proxy(
             security,
         )
         .await
+    }
+}
+
+/// WebSocket の上流へ送るパス（ルートの接頭辞を外して上流の `path_prefix` を前に付ける。HTTP/1.1 と
+/// HTTP/2・HTTP/3 の拡張 CONNECT（F-288）で共有）
+pub(super) fn ws_upstream_path(target: &ProxyTarget, path_str: &str, prefix: &[u8]) -> String {
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
+            let base = target.path_prefix.trim_end_matches('/');
+            build_sub_path(base, remaining)
+        } else {
+            path_str.to_string()
+        }
+    };
+    if sub_path.is_empty() {
+        "/".to_string()
+    } else {
+        sub_path
     }
 }
 

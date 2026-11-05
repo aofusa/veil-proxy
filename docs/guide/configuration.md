@@ -73,6 +73,7 @@ The following table lists default values for major configuration options:
 | `[http2]` | `max_continuation_frames` | `10` | Max CONTINUATION frames |
 | `[http2]` | `max_header_block_size` | `65536` | Max header block (64KB) |
 | `[http2]` | `stream_idle_timeout_secs` | `60` | Stream idle timeout (seconds) |
+| `[http2]` | `enable_connect_protocol` | `false` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept WebSocket over HTTP/2 (extended CONNECT, RFC 8441) |
 | `[http3]` | `max_idle_timeout` | `30000` | Max idle timeout (ms, 30s) |
 | `[http3]` | `max_udp_payload_size` | `1452` | Max UDP payload size: the upper bound of path MTU discovery (`1350` before v0.8.0; a fixed 1350 needed 42 packets per 54 KB response vs nginx's 39 and was 6.7% slower on Linux) |
 | `[http3]` | `discover_pmtu` | `true` | Path MTU discovery (quiche, RFC 8899 DPLPMTUD). Starts at 1200 bytes and only uses sizes whose probes arrived, so small-MTU paths keep working; the UDP sockets set DF (Linux `IP_PMTUDISC_PROBE`, BSD/macOS `IP_DONTFRAG`/`IPV6_DONTFRAG`) |
@@ -90,6 +91,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `max_connections` | `10000` | Per-worker cap on QUIC connections; Initials for new connections are dropped while the cap is reached. `0` = unlimited |
 | `[http3]` | `retry_threshold` | `1000` | When this many connections per worker are still handshaking, Initials without a token get a stateless Retry, so a connection is only created after the client proves it owns its source address (one extra round trip). `0` = always Retry |
 | `[http3]` | `handshake_timeout` | `10000` | Milliseconds a connection may spend handshaking before it is dropped (instead of lingering until `max_idle_timeout`) |
+| `[http3]` | `enable_connect_protocol` | `false` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept WebSocket over HTTP/3 (extended CONNECT, RFC 9220) |
 | `[http3]` | `max_field_section_size` | `65536` | Largest request header section in bytes, advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE` and checked when a HEADERS frame announces its length and while QPACK decodes it (32 bytes added per field, RFC 9114 §4.2.2). A larger section closes the connection; a section over veil's request header limit (8 KB) but within this one gets 431. Same default as `[http2] max_header_list_size` |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The default was 64 before v0.8.0; 1024 raised FreeBSD HTTP/3 3B throughput by 37% (p99 11 → 14 ms). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |

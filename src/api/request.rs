@@ -51,6 +51,8 @@ pub struct Request {
     // F-197
     /// The body when received as a stream (for a `streaming_request` route over HTTP/2).
     pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
+    // F-288: HTTP/2・HTTP/3 の拡張 CONNECT の `:protocol`
+    pub(crate) protocol: Option<Bytes>,
     // F-267: 要求に紐づく型付きの値（認証の主体・DI の scoped の値など）。使わない要求では確保しない
     pub(crate) extensions: Extensions,
 }
@@ -152,6 +154,7 @@ impl Request {
             version: HttpVersion::Http11,
             tls: false,
             body_stream: None,
+            protocol: None,
             extensions: Extensions::default(),
         }
     }
@@ -283,10 +286,11 @@ impl Request {
 
     // F-261
     /// The `Upgrade` header when the request asks for a protocol upgrade (`Connection` lists `upgrade` and
-    /// `Upgrade` is present). Always `None` on HTTP/2 and HTTP/3, which have no upgrades.
+    /// `Upgrade` is present). On HTTP/2 and HTTP/3, the `:protocol` of an extended CONNECT request
+    /// (RFC 8441 / RFC 9220; `None` for other requests).
     pub fn upgrade_protocol(&self) -> Option<&[u8]> {
         if self.version != HttpVersion::Http11 {
-            return None;
+            return self.protocol.as_deref();
         }
         let mut wants = false;
         let mut proto = None;

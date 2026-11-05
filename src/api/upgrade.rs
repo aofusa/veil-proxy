@@ -5,7 +5,13 @@
 //!
 //! A handler returns [`Response::switching_protocols`](super::Response::switching_protocols); after the 101 is
 //! written, the connection is handed to the given function as an [`Upgraded`]. Plaintext, rustls and kTLS
-//! connections all look the same. HTTP/2 and HTTP/3 have no upgrades (the response becomes 400).
+//! connections all look the same.
+//!
+//! On HTTP/2 and HTTP/3, an extended CONNECT request (RFC 8441 / RFC 9220, enabled with
+//! `[http2] enable_connect_protocol` / `[http3] enable_connect_protocol`) carries the protocol in `:protocol`
+//! ([`Request::upgrade_protocol`](super::Request::upgrade_protocol)). Answering it with
+//! `switching_protocols` for that protocol sends `200` and runs the function on the stream (the same
+//! [`Upgraded`] type). Other upgrade responses on HTTP/2 and HTTP/3 become 400.
 //!
 //! ```no_run
 //! use veil::prelude::*;
@@ -142,13 +148,44 @@ pub(crate) async fn run(
     client_ip: &str,
     cache: &mut super::dispatch::CallCache,
 ) {
-    let secs = IDLE_TIMEOUT_SECS.load(Ordering::Relaxed);
     let up = Upgraded {
-        stream,
+        io: UpIo::H1(stream),
         prebuf: leftover.freeze(),
         client_ip: client_ip.to_string(),
-        idle_timeout: (secs > 0).then(|| Duration::from_secs(secs)),
+        idle_timeout: idle_timeout(),
     };
+    run_upgraded(on_upgrade, up, cache).await;
+}
+
+/// `[api] upgrade_idle_timeout_secs`
+fn idle_timeout() -> Option<Duration> {
+    let secs = IDLE_TIMEOUT_SECS.load(Ordering::Relaxed);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+// F-288: HTTP/2・HTTP/3 の拡張 CONNECT のストリームの上でアップグレードの関数を動かす（200 は呼び出し側が送った）
+/// Runs the upgrade function on an HTTP/2 or HTTP/3 stream (extended CONNECT). `rx` carries the request
+/// body (the client's bytes); `out` is where the response body goes.
+pub(crate) async fn run_on_stream(
+    on_upgrade: UpgradeFn,
+    rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    out: crate::proxy::ws_tunnel::TunnelOut,
+    client_ip: &str,
+) {
+    let up = Upgraded {
+        io: UpIo::Stream(StreamIo {
+            rx,
+            peeked: std::cell::RefCell::new(None),
+            out: Some(out),
+        }),
+        prebuf: Bytes::new(),
+        client_ip: client_ip.to_string(),
+        idle_timeout: idle_timeout(),
+    };
+    run_upgraded(on_upgrade, up, &mut super::dispatch::CallCache::default()).await;
+}
+
+async fn run_upgraded(on_upgrade: UpgradeFn, up: Upgraded, cache: &mut super::dispatch::CallCache) {
     let fut = on_upgrade(up);
     // tokio 互換レイヤー（F-198）: ハンドラと同じく別スレッドからの起床を所有スレッドへ戻す
     #[cfg(feature = "tokio-compat")]
@@ -163,12 +200,13 @@ pub(crate) async fn run(
     }
 }
 
-/// An upgraded HTTP/1.1 connection (plaintext, rustls or kTLS; the same type for all).
+/// An upgraded HTTP/1.1 connection (plaintext, rustls or kTLS), or an HTTP/2 / HTTP/3 stream opened with
+/// extended CONNECT; the same type for all.
 ///
 /// Bytes the client sent right after the request (in the same packet as the headers) are returned first by
-/// [`read`](Upgraded::read). The connection closes when this is dropped.
+/// [`read`](Upgraded::read). The connection (or stream) closes when this is dropped.
 pub struct Upgraded {
-    stream: ServerTls,
+    io: UpIo,
     /// 要求の解析で読みすぎた分（ヘッダの直後に届いたバイト列）。先に返す。
     prebuf: Bytes,
     client_ip: String,
@@ -187,6 +225,85 @@ impl std::fmt::Debug for Upgraded {
 /// Reserved spare capacity when `read` is given a buffer without room (bytes).
 const READ_RESERVE: usize = 16 * 1024;
 
+/// 接続の実体（F-288: HTTP/1.1 の接続か、HTTP/2・HTTP/3 のストリーム）
+enum UpIo {
+    H1(ServerTls),
+    Stream(StreamIo),
+}
+
+/// HTTP/2・HTTP/3 のストリーム（要求のチャネルと応答の送り先。チャネルの待ちは取り消しても失わない）
+struct StreamIo {
+    /// クライアントのバイト列（None は読み終わった）
+    rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    /// `readable` が受け取って `read` へ渡す断片（`Some(None)` は終わり）
+    peeked: std::cell::RefCell<Option<Option<Bytes>>>,
+    /// 応答の送り先（`shutdown` で閉じる = END_STREAM・fin）
+    out: Option<crate::proxy::ws_tunnel::TunnelOut>,
+}
+
+impl StreamIo {
+    /// 次の断片（None は終わり。リセットはエラー）。取り消し安全
+    async fn next(&mut self) -> io::Result<Option<Bytes>> {
+        if let Some(item) = self.peeked.get_mut().take() {
+            return self.took(item);
+        }
+        let Some(rx) = self.rx.as_ref() else {
+            return Ok(None);
+        };
+        let item = rx.recv().await;
+        self.took(item)
+    }
+
+    fn took(&mut self, item: Option<Bytes>) -> io::Result<Option<Bytes>> {
+        match item {
+            Some(b) => {
+                // 受け取った分のウィンドウ・クレジットを返してもらう
+                if let Some(o) = &self.out {
+                    o.notify();
+                }
+                Ok(Some(b))
+            }
+            None => {
+                let finished = self.rx.as_ref().is_none_or(|r| r.is_finished());
+                self.rx = None;
+                if finished {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "the stream was reset",
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn readable(&self) -> io::Result<()> {
+        if self.peeked.borrow().is_some() {
+            return Ok(());
+        }
+        let Some(rx) = self.rx.as_ref() else {
+            return Ok(());
+        };
+        let item = std::future::poll_fn(|cx| rx.poll_recv(cx)).await;
+        *self.peeked.borrow_mut() = Some(item);
+        Ok(())
+    }
+
+    async fn write(&self, b: Bytes) -> io::Result<()> {
+        match &self.out {
+            Some(o) => o
+                .body(b)
+                .await
+                .map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "the stream was closed")),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the sending side was shut down",
+            )),
+        }
+    }
+}
+
 impl Upgraded {
     /// Reads into the spare capacity of `buf` (it is extended; `Ok(0)` means the peer closed). Ownership of the
     /// buffer passes through the call, as in veil's runtime. With `[api] upgrade_idle_timeout_secs`, a read that
@@ -204,8 +321,34 @@ impl Upgraded {
             let _ = self.prebuf.split_to(n);
             return (Ok(n), buf);
         }
+        let stream = match &mut self.io {
+            UpIo::H1(s) => s,
+            UpIo::Stream(st) => {
+                let r = match self.idle_timeout {
+                    Some(d) => match crate::runtime::time::timeout(d, st.next()).await {
+                        Ok(r) => r,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upgraded connection idle timeout",
+                        )),
+                    },
+                    None => st.next().await,
+                };
+                return match r {
+                    Ok(Some(mut b)) => {
+                        let n = b.len().min(buf.capacity() - buf.len());
+                        buf.extend_from_slice(&b[..n]);
+                        let _ = b.split_to(n);
+                        self.prebuf = b;
+                        (Ok(n), buf)
+                    }
+                    Ok(None) => (Ok(0), buf),
+                    Err(e) => (Err(e), buf),
+                };
+            }
+        };
         match self.idle_timeout {
-            Some(d) => match crate::runtime::time::timeout(d, self.stream.read(buf)).await {
+            Some(d) => match crate::runtime::time::timeout(d, stream.read(buf)).await {
                 Ok(r) => r,
                 Err(_) => (
                     Err(io::Error::new(
@@ -215,7 +358,7 @@ impl Upgraded {
                     BytesMut::new(),
                 ),
             },
-            None => self.stream.read(buf).await,
+            None => stream.read(buf).await,
         }
     }
 
@@ -224,13 +367,19 @@ impl Upgraded {
         if !self.prebuf.is_empty() {
             return Ok(());
         }
-        self.stream.wait_next_request().await
+        match &self.io {
+            UpIo::H1(s) => s.wait_next_request().await,
+            UpIo::Stream(st) => st.readable().await,
+        }
     }
 
     /// Whether bytes are already buffered (a [`read`](Upgraded::read) returns without waiting).
     pub fn has_buffered(&self) -> bool {
         !self.prebuf.is_empty()
-            || crate::runtime::io::BufferedReadState::has_buffered_read_data(&self.stream)
+            || match &self.io {
+                UpIo::H1(s) => crate::runtime::io::BufferedReadState::has_buffered_read_data(s),
+                UpIo::Stream(st) => st.peeked.borrow().is_some(),
+            }
     }
 
     /// Writes all of `buf` (not copied).
@@ -238,17 +387,34 @@ impl Upgraded {
         if buf.is_empty() {
             return Ok(());
         }
-        self.stream.write_all(buf).await.0.map(drop)
+        match &mut self.io {
+            UpIo::H1(s) => s.write_all(buf).await.0.map(drop),
+            UpIo::Stream(st) => st.write(buf).await,
+        }
     }
 
     /// Writes all buffers in order. Two buffers (such as a frame header and its payload) go out in one
     /// vectored write; more are coalesced into one buffer when small.
     pub async fn write_vectored_all(&mut self, bufs: &[Bytes]) -> io::Result<()> {
+        // HTTP/2・HTTP/3 のストリームは断片ごとに送る（メインループがまとめてフレームにする。コピーしない）
+        let stream = match &mut self.io {
+            UpIo::H1(s) => s,
+            UpIo::Stream(st) => {
+                for b in bufs.iter().filter(|b| !b.is_empty()) {
+                    st.write(b.clone()).await?;
+                }
+                return Ok(());
+            }
+        };
         match bufs {
             [] => Ok(()),
-            [a] => self.write_all(a.clone()).await,
-            [a, b] => self
-                .stream
+            [a] => {
+                if a.is_empty() {
+                    return Ok(());
+                }
+                stream.write_all(a.clone()).await.0.map(drop)
+            }
+            [a, b] => stream
                 .write_all_vectored(a.clone(), b.clone())
                 .await
                 .0
@@ -260,17 +426,16 @@ impl Upgraded {
                     for b in bufs {
                         out.extend_from_slice(b);
                     }
-                    self.write_all(out.freeze()).await
+                    stream.write_all(out.freeze()).await.0.map(drop)
                 } else {
                     for pair in bufs.chunks(2) {
                         match pair {
-                            [a, b] => self
-                                .stream
+                            [a, b] => stream
                                 .write_all_vectored(a.clone(), b.clone())
                                 .await
                                 .0
                                 .map(drop)?,
-                            [a] => self.write_all(a.clone()).await?,
+                            [a] => stream.write_all(a.clone()).await.0.map(drop)?,
                             _ => {}
                         }
                     }
@@ -282,9 +447,16 @@ impl Upgraded {
 
     /// Closes the sending side (the peer reads EOF).
     pub async fn shutdown(&mut self) -> io::Result<()> {
-        match self.stream.get_ref().shutdown(std::net::Shutdown::Write) {
-            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
-            r => r,
+        match &mut self.io {
+            UpIo::H1(s) => match s.get_ref().shutdown(std::net::Shutdown::Write) {
+                Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+                r => r,
+            },
+            // 応答の送り先を閉じる = END_STREAM・fin
+            UpIo::Stream(st) => {
+                st.out = None;
+                Ok(())
+            }
         }
     }
 

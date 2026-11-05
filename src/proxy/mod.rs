@@ -62,7 +62,10 @@ mod h1;
 use self::h1::*;
 mod websocket;
 use self::websocket::*;
+// F-288: HTTP/2・HTTP/3 の上の WebSocket（拡張 CONNECT）
 mod forward;
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) mod ws_tunnel;
 use self::forward::*;
 mod buffered;
 use self::buffered::*;

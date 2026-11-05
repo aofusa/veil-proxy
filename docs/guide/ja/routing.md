@@ -621,13 +621,16 @@ upstream = "websocket-pool"
 - `101` の応答（とアップグレードを断った応答）は通常のプロキシの応答と同じくルートの応答ヘッダの方針を通ります
   （`remove_response_headers`・`add_response_headers`・`Server`）。上流がアップグレードしなければ応答全体（本文も）を返して接続を閉じます。
   `101` 以外の `1xx` は捨てます。
-- アップグレードするのは HTTP/1.1 の `GET` だけです（RFC 6455）。それ以外の `Upgrade: websocket` の要求と、`Proxy` 以外のルート
+- アップグレードするのは HTTP/1.1 の `GET`（RFC 6455）と、有効にしたときの HTTP/2・HTTP/3 の拡張 `CONNECT` だけです。それ以外の `Upgrade: websocket` の要求と、`Proxy` 以外のルート
   （ファイル・固定応答・リダイレクト）の要求は通常の要求として扱い、`Upgrade` を無視します。クライアントの `Connection` に挙がった
   ヘッダは上流へ送りません。
 - graceful shutdown は drain の開始で開いているトンネルを閉じます（中継は WebSocket の close フレームを作れないので TCP を閉じます）。
 - 開いているトンネルはゲージ `veil_proxy_websocket_tunnels{protocol}` で数えます。`101` の要求は `http_requests_total` には数えますが、
   所要時間・大きさのヒストグラムには入れません（所要時間はトンネルの寿命なので）。
-- HTTP/2・HTTP/3 のクライアント側の WebSocket はまだ対応していません（クライアントは HTTP/1.1 にフォールバックします）。
+- HTTP/2・HTTP/3 のクライアント側の WebSocket（拡張 CONNECT。RFC 8441 / RFC 9220）は `[http2] enable_connect_protocol`・
+  `[http3] enable_connect_protocol` を `true` にすると使えます（既定は無効で、クライアントは HTTP/1.1 にフォールバックします）。
+  要求は `GET` と同じにルーティングし、上流へは HTTP/1.1 のアップグレードを送り、上流の `101` はストリームでは `200` で返します。
+  [プロトコル](protocols.md#http2http3-の上の-websocket拡張-connect) を参照してください。
 
 | オプション（`[route.security]`） | 説明 | デフォルト |
 |-----------|------|-----------|

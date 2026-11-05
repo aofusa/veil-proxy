@@ -550,6 +550,8 @@ pub struct Http3ServerConfig {
     pub handshake_timeout: u64,
     /// B-255: `SETTINGS_MAX_FIELD_SECTION_SIZE`（要求のヘッダの大きさの上限）。デフォルト: 65536
     pub max_field_section_size: u64,
+    /// F-288: `SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告して拡張 CONNECT（RFC 9220）を受けるか。デフォルト: false
+    pub enable_connect_protocol: bool,
 }
 
 /// B-255: `[http3] max_field_section_size` の既定（`[http2] max_header_list_size` と同じ）
@@ -558,11 +560,18 @@ pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 65_536;
 thread_local! {
     /// ワーカーの `[http3] max_field_section_size`（接続ごとの `h3::Config` に入れる）
     static H3_MAX_FIELD_SECTION_SIZE: Cell<u64> = const { Cell::new(DEFAULT_MAX_FIELD_SECTION_SIZE) };
+    /// ワーカーの `[http3] enable_connect_protocol`（接続ごとの `h3::Config` と要求の検査に使う。F-288）
+    static H3_EXTENDED_CONNECT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// ワーカーの起動時に `[http3] max_field_section_size` を入れる（B-255）。
 pub(crate) fn configure_max_field_section_size(v: u64) {
     H3_MAX_FIELD_SECTION_SIZE.with(|c| c.set(v));
+}
+
+/// ワーカーの起動時に `[http3] enable_connect_protocol` を入れる（F-288）。
+pub(crate) fn configure_extended_connect(on: bool) {
+    H3_EXTENDED_CONNECT.with(|c| c.set(on));
 }
 
 impl Default for Http3ServerConfig {
@@ -592,6 +601,7 @@ impl Default for Http3ServerConfig {
             retry_threshold: admission::DEFAULT_RETRY_THRESHOLD,
             handshake_timeout: admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
             max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
+            enable_connect_protocol: false,
         }
     }
 }
@@ -737,6 +747,8 @@ enum Decision {
     Buffer,
     /// classify が即時応答済み（セキュリティ拒否など）。
     Handled,
+    /// 拡張 CONNECT（WebSocket over HTTP/3。F-288）→ 中継のタスクを spawn（ルーティング・検査はタスクが行う）。
+    Tunnel(Box<crate::proxy::ws_tunnel::TunnelRequest>),
 }
 
 /// B-43: StreamBlocked で保留した静的応答。head が Some の間はヘッダ未送出。
@@ -1083,6 +1095,8 @@ impl Http3Handler {
             let mut h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
             // B-255: 宣言だけの大きな HEADERS で確保させない上限を広告する
             h3_config.set_max_field_section_size(H3_MAX_FIELD_SECTION_SIZE.with(Cell::get));
+            // F-288: 拡張 CONNECT（RFC 9220）を広告する（有効なときだけ。既定は従来の SETTINGS のまま）
+            h3_config.enable_extended_connect(H3_EXTENDED_CONNECT.with(Cell::get));
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             self.h3_conn = Some(h3);
@@ -1150,8 +1164,10 @@ impl Http3Handler {
                             list.len()
                         );
                         did_work = true;
-                        let section =
-                            h3_check_field_section(list.iter().map(|h| (h.name(), h.value())));
+                        let section = h3_check_field_section(
+                            list.iter().map(|h| (h.name(), h.value())),
+                            H3_EXTENDED_CONNECT.with(Cell::get),
+                        );
                         // 既にリクエストを受け付けたストリームの 2 つ目のセクションは trailers。
                         let known_stream = self.proxy_streams.contains_key(&stream_id)
                             || self.buffered_reqs.contains_key(&stream_id)
@@ -1361,6 +1377,27 @@ impl Http3Handler {
                     // 即時応答済み（セキュリティ拒否等）— ストリーム close
                     self.metric_stream_close(stream_id);
                 }
+                Decision::Tunnel(req) => {
+                    // F-288: 本文（トンネルのバイト列）は上限・受信の見張り無しでチャネルへ流す。中継は別タスク
+                    // （長く続くのでワーカーの `FuturesUnordered` には置かない。HTTP/3 のストリーミングのハンドラと同じ）
+                    let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
+                    let (resp_tx, resp_rx) =
+                        crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
+                    let mut ps = ProxyStream::new(resp_rx, req_tx, more_frames, 0);
+                    if let Some(body) = self.stream_bodies.remove(&stream_id) {
+                        if !body.is_empty() {
+                            ps.req_bytes_total += body.len() as u64;
+                            ps.req_pending.push_back(body.freeze());
+                        }
+                    }
+                    crate::runtime::spawn(h3_tunnel_task(
+                        req,
+                        req_rx,
+                        resp_tx,
+                        self.notify.clone(),
+                    ));
+                    self.proxy_streams.insert(stream_id, ps);
+                }
             }
         }
         // new_headers は drain 済みで既に空。容量を保持したままフィールドへ戻す。
@@ -1481,6 +1518,7 @@ impl Http3Handler {
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
         let mut authority: &[u8] = b"";
+        let mut protocol: Option<&[u8]> = None;
         let mut content_length: usize = 0;
         let mut accept_encoding: Option<&[u8]> = None;
         let mut user_agent: &[u8] = b"";
@@ -1492,6 +1530,9 @@ impl Http3Handler {
                 path = Some(h.value());
             } else if name == b":authority" {
                 authority = h.value();
+            } else if name == b":protocol" {
+                // 拡張 CONNECT（`h3_check_field_section` が広告済みの CONNECT にだけ許している。F-288）
+                protocol = Some(h.value());
             } else if name.eq_ignore_ascii_case(b"content-length") {
                 if let Ok(s) = std::str::from_utf8(h.value()) {
                     content_length = s.trim().parse().unwrap_or(0);
@@ -1509,6 +1550,30 @@ impl Http3Handler {
         // 巨大 QPACK 展開ヘッダによるメモリ枯渇をストリーム処理前に拒否する。
         // B-308: `:protocol` の無い CONNECT（トンネル）は扱わない（以前は `:path` が無いので `/` として上流へ転送され得た）
         if method == b"CONNECT" {
+            // F-288: 拡張 CONNECT（RFC 9220）はトンネルの中継のタスクへ（メインループでは待たない。B-97）
+            if let Some(protocol) = protocol {
+                return Decision::Tunnel(Box::new(crate::proxy::ws_tunnel::TunnelRequest {
+                    path: Bytes::copy_from_slice(path),
+                    authority: Bytes::copy_from_slice(authority),
+                    protocol: Bytes::copy_from_slice(protocol),
+                    headers: headers
+                        .iter()
+                        .filter(|h| !h.name().starts_with(b":"))
+                        .map(|h| {
+                            (
+                                Bytes::copy_from_slice(h.name()),
+                                Bytes::copy_from_slice(h.value()),
+                            )
+                        })
+                        .collect(),
+                    client_ip: std::rc::Rc::from(self.client_ip.as_str()),
+                    client_addr: self.peer_addr,
+                    redirect_https: None,
+                    #[cfg(feature = "handler")]
+                    tls: true,
+                    start: crate::logging::request_start_instant(),
+                }));
+            }
             let msg: &[u8] = b"Method Not Allowed";
             let _ = self.send_error_response(stream_id, 405, msg);
             log_access(
@@ -2241,7 +2306,53 @@ mod tests {
     }
 
     fn check(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
-        h3_check_field_section(fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))
+        h3_check_field_section(
+            fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())),
+            false,
+        )
+    }
+
+    fn check_ext(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
+        h3_check_field_section(
+            fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())),
+            true,
+        )
+    }
+
+    /// F-288: 拡張 CONNECT を広告したときだけ、CONNECT の `:protocol` を受ける（RFC 9220・RFC 8441 §4）
+    #[test]
+    fn test_h3_field_section_extended_connect() {
+        let ext = [
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            (":path", "/chat"),
+        ];
+        assert_eq!(check_ext(&ext), Ok(H3FieldSection::Request));
+        // 広告していなければ malformed のまま
+        assert!(check(&ext).is_err());
+        // CONNECT 以外の :protocol は malformed
+        let mut get = GOOD.to_vec();
+        get.push((":protocol", "websocket"));
+        assert!(check_ext(&get).is_err());
+        // 拡張 CONNECT には :scheme・:path・:authority が要る
+        for drop in [":scheme", ":path", ":authority"] {
+            let f: Vec<_> = ext.iter().copied().filter(|(n, _)| *n != drop).collect();
+            assert!(check_ext(&f).is_err(), "{drop}");
+        }
+        // 重複・不正な値
+        let mut dup = ext.to_vec();
+        dup.push((":protocol", "websocket"));
+        assert!(check_ext(&dup).is_err());
+        let mut bad = ext.to_vec();
+        bad[1] = (":protocol", "web socket");
+        assert!(check_ext(&bad).is_err());
+        // 素の CONNECT は従来どおり
+        assert_eq!(
+            check_ext(&[(":method", "CONNECT"), (":authority", "example.com:443")]),
+            Ok(H3FieldSection::Request)
+        );
     }
 
     const GOOD: [(&str, &str); 4] = [

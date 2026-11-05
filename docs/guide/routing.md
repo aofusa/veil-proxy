@@ -630,14 +630,18 @@ How the tunnel behaves:
 - The `101` response (and a refused upgrade) goes through the route's response-header policy like any proxied response:
   `remove_response_headers`, `add_response_headers` and `Server` apply. When the upstream does not upgrade, its whole
   response (with the body) is returned and the connection is closed. `1xx` responses other than `101` are dropped.
-- Only `GET` over HTTP/1.1 is upgraded (RFC 6455). Other requests carrying `Upgrade: websocket`, and requests on routes
+- Only `GET` over HTTP/1.1 is upgraded (RFC 6455), plus extended `CONNECT` over HTTP/2 / HTTP/3 when enabled. Other requests carrying `Upgrade: websocket`, and requests on routes
   that are not `Proxy` (files, fixed responses, redirects), are handled as normal requests and the `Upgrade` header is
   ignored. Headers named in the client's `Connection` header are not forwarded.
 - Graceful shutdown closes open tunnels when it starts draining (a relay cannot send a WebSocket close frame, so the TCP
   connections are closed).
 - Open tunnels are counted by the `veil_proxy_websocket_tunnels{protocol}` gauge. The `101` request is still counted in
   `http_requests_total`, but not in the duration and size histograms (its duration is the tunnel's lifetime).
-- WebSocket over HTTP/2 and HTTP/3 front ends is not supported yet (clients fall back to HTTP/1.1).
+- WebSocket over HTTP/2 and HTTP/3 front ends (extended CONNECT, RFC 8441 / RFC 9220) is available when
+  `[http2] enable_connect_protocol` / `[http3] enable_connect_protocol` is `true` (off by default; clients then fall
+  back to HTTP/1.1). The request is routed like a `GET`, the upstream still gets an HTTP/1.1 upgrade, and the
+  upstream's `101` is answered as `200` on the stream. See
+  [Protocols](protocols.md#websocket-over-http2-and-http3-extended-connect).
 
 | Option (`[route.security]`) | Description | Default |
 |--------|-------------|---------|

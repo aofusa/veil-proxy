@@ -39,12 +39,12 @@ pub use rustls::crypto::ring as provider;
 /// 非 OpenBSD/NetBSD は aws-lc-rs、OpenBSD/NetBSD は ring の `SystemRandom` を用いる
 /// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3・wasm feature 有効時のみ使用。
 #[cfg(all(
-    any(feature = "http3", feature = "wasm"),
+    any(feature = "http2", feature = "http3", feature = "wasm"),
     not(any(target_os = "openbsd", target_os = "netbsd"))
 ))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 #[cfg(all(
-    any(feature = "http3", feature = "wasm"),
+    any(feature = "http2", feature = "http3", feature = "wasm"),
     any(target_os = "openbsd", target_os = "netbsd")
 ))]
 pub use ring::rand::{SecureRandom, SystemRandom};
@@ -60,9 +60,9 @@ pub use aws_lc_rs::hmac;
 pub use ring::hmac;
 
 // F-262: WebSocket の `Sec-WebSocket-Accept`（SHA-1(key + GUID)）。依存を増やさずプラットフォームの暗号プロバイダを使う
-// （ライブラリ専用。本体のバイナリには入らない）。
+// （ハンドラと、HTTP/2・HTTP/3 の拡張 CONNECT を上流の HTTP/1.1 の WebSocket へ中継するプロキシ（F-288））。
 /// SHA-1 of the concatenation of `parts` (legacy use only: the WebSocket handshake).
-#[cfg(feature = "handler")]
+#[cfg(any(feature = "handler", feature = "http2", feature = "http3"))]
 pub(crate) fn sha1_legacy(parts: &[&[u8]]) -> [u8; 20] {
     #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
     use aws_lc_rs::digest;

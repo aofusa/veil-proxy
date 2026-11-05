@@ -256,15 +256,22 @@ pub fn h3_field_section_smoke(data: &[u8]) {
         }
     }
     let fields = || data.split(|&b| b == b'\n').map(split);
-    match h3_check_field_section(fields()) {
-        Ok(H3FieldSection::Request) => {
-            assert!(fields().any(|(n, _)| n == b":method"));
-            assert!(fields().all(|(_, v)| crate::http_utils::is_valid_h2_field_value(v)));
+    // 拡張 CONNECT（F-288）を広告していないときと、しているときの両方
+    for extended_connect in [false, true] {
+        match h3_check_field_section(fields(), extended_connect) {
+            Ok(H3FieldSection::Request) => {
+                assert!(fields().any(|(n, _)| n == b":method"));
+                assert!(fields().all(|(_, v)| crate::http_utils::is_valid_h2_field_value(v)));
+                if fields().any(|(n, _)| n == b":protocol") {
+                    assert!(extended_connect);
+                    assert!(fields().any(|(n, v)| n == b":method" && v == b"CONNECT"));
+                }
+            }
+            Ok(H3FieldSection::NoPseudo) => {
+                assert!(fields().all(|(n, _)| n.first() != Some(&b':')));
+            }
+            Err(_) => {}
         }
-        Ok(H3FieldSection::NoPseudo) => {
-            assert!(fields().all(|(n, _)| n.first() != Some(&b':')));
-        }
-        Err(_) => {}
     }
 }
 

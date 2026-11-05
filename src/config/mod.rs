@@ -854,6 +854,11 @@ pub struct Http2ConfigSection {
     /// デフォルト: 60
     #[serde(default = "default_h2_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL（RFC 8441）を広告し、HTTP/2 の上の WebSocket（拡張 CONNECT）を受ける（F-288）。
+    /// デフォルト: false（広告するとブラウザが WebSocket を HTTP/2 の接続へ移すので明示で有効にする）
+    #[serde(default)]
+    pub enable_connect_protocol: bool,
 }
 
 // HTTP/2 設定のデフォルト値（high_performance と同等）
@@ -909,6 +914,7 @@ impl Default for Http2ConfigSection {
             max_continuation_frames: default_h2_max_continuation_frames(),
             max_header_block_size: default_h2_max_header_block_size(),
             stream_idle_timeout_secs: default_h2_stream_idle_timeout_secs(),
+            enable_connect_protocol: false,
         }
     }
 }
@@ -931,6 +937,7 @@ impl Http2ConfigSection {
             max_continuation_frames: self.max_continuation_frames,
             max_header_block_size: self.max_header_block_size,
             stream_idle_timeout_secs: self.stream_idle_timeout_secs,
+            enable_connect_protocol: self.enable_connect_protocol,
         }
     }
 }
@@ -1207,6 +1214,12 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_max_field_section_size")]
     pub max_field_section_size: u64,
 
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL（RFC 9220）を広告し、HTTP/3 の上の WebSocket（拡張 CONNECT）を受ける（F-288）。
+    ///
+    /// デフォルト: `false`（広告するとブラウザが WebSocket を HTTP/3 の接続へ移すので明示で有効にする）
+    #[serde(default)]
+    pub enable_connect_protocol: bool,
+
     // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
@@ -1298,6 +1311,7 @@ impl Default for Http3ConfigSection {
             retry_threshold: default_h3_retry_threshold(),
             handshake_timeout: default_h3_handshake_timeout(),
             max_field_section_size: default_h3_max_field_section_size(),
+            enable_connect_protocol: false,
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -1342,6 +1356,7 @@ impl Http3ConfigSection {
             retry_threshold: self.retry_threshold,
             handshake_timeout: self.handshake_timeout,
             max_field_section_size: self.max_field_section_size,
+            enable_connect_protocol: self.enable_connect_protocol,
         }
     }
 }

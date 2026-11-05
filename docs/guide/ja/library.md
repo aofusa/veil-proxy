@@ -374,7 +374,7 @@ async fn upper(req: &Request) -> Response {
 ### プロトコルアップグレード（HTTP/1.1）
 
 ハンドラは `101 Switching Protocols` で接続を引き取れます。`Request::upgrade_protocol()` は要求がアップグレードを求めているとき
-（`Connection: upgrade` と `Upgrade` がある。HTTP/2・HTTP/3 では常に `None`）に `Upgrade` の値を返し、
+（`Connection: upgrade` と `Upgrade` がある。HTTP/2・HTTP/3 では拡張 CONNECT の `:protocol`。下記）に `Upgrade` の値を返し、
 `Response::switching_protocols(protocol, f)` は 101 を書いてから `veil::api::upgrade::Upgraded` の接続で `f` を呼びます。
 
 ```rust
@@ -463,7 +463,10 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
   WebSocket のハンドシェイクにも Cookie を付けるので、Cookie で認証するなら絞ってください（クロスサイト WebSocket ハイジャック）。
 - permessage-deflate（RFC 7692）は `[api] websocket_compression = true` のときだけ交渉します（既定は off。展開後の大きさは
   `websocket_max_message_size` で制限）。
-- WebSocket は HTTP/1.1 だけです。HTTP/2・HTTP/3 のハンドシェイクは 400 になります（RFC 8441 / RFC 9220 は非対応）。
+- HTTP/2・HTTP/3 の上の WebSocket（拡張 CONNECT。RFC 8441 / RFC 9220）は `[http2]`・`[http3]` の `enable_connect_protocol = true`
+  で使えます。`WebSocketUpgrade` は `:protocol = websocket` の `CONNECT` を受け（`Sec-WebSocket-Key` は無い）、`on_upgrade` は `200` で
+  応えて、`WebSocket` はストリームの上で動きます。HTTP/2・HTTP/3 のそれ以外のハンドシェイクは 400 です。`Response::switching_protocols`
+  も `:protocol` の一致する拡張 CONNECT で同じに動きます（不一致は 500）。`Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
 - メトリクス（`metrics` feature）: `veil_proxy_websocket_connections`（開いている接続数）と
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`。
 - アップグレードした接続と同じく `[security] max_concurrent_connections` に数えます。
@@ -1382,5 +1385,6 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
   そのイベントループが止まります（上記）。
-- プロトコルアップグレードと WebSocket は HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
+- HTTP/2・HTTP/3 のプロトコルアップグレードと WebSocket には `enable_connect_protocol = true`（拡張 CONNECT。既定は無効）が要ります。
+  `Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

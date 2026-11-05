@@ -115,6 +115,9 @@ pub struct Stream {
     /// 要求の受信が止まったら打ち切るまでの秒数（ルートの `client_body_timeout_secs`。0 = 接続の
     /// `stream_idle_timeout_secs`。B-274）
     pub recv_timeout_secs: u64,
+    /// 拡張 CONNECT のトンネル（WebSocket over HTTP/2。F-288）。受信の打ち切り（B-274・B-276）の対象にしない
+    /// （トンネルのアイドルは中継のタスクが `websocket_idle_timeout_secs` で切る）
+    pub tunnel: bool,
     /// gRPC モード（content-type: application/grpc 検出時に true）
     #[cfg(feature = "grpc")]
     pub grpc_mode: bool,
@@ -146,6 +149,7 @@ impl Stream {
             received_body_size: 0,
             last_activity: std::time::Instant::now(),
             recv_timeout_secs: 0,
+            tunnel: false,
             #[cfg(feature = "grpc")]
             grpc_mode: false,
             #[cfg(feature = "grpc")]
@@ -394,7 +398,7 @@ impl Stream {
     /// （CONTINUATION）を待っている。HEADERS に END_STREAM が付いていても END_HEADERS が無ければ `HalfClosedRemote`
     /// のまま続きを待つので、状態だけで見ると受信の打ち切り（B-276）から漏れる（B-285）。
     pub fn is_receiving_request(&self) -> bool {
-        matches!(self.state, StreamState::Open | StreamState::HalfClosedLocal)
+        (matches!(self.state, StreamState::Open | StreamState::HalfClosedLocal) && !self.tunnel)
             || self.receiving_headers
     }
 
@@ -630,6 +634,7 @@ impl StreamManager {
                 // アクティブなストリームのみ対象
                 // Open または HalfClosedLocal = まだリクエストを受信中
                 matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal)
+                    && !s.tunnel
                     && s.is_idle_timeout(timeout_secs)
             })
             .map(|(id, _)| *id)

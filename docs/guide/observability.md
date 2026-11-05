@@ -57,7 +57,7 @@ only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves
 | `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
 | `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
 | `veil_proxy_buffering_used_total` | Counter | host | Requests on routes whose `[route.buffering]` mode buffers the response (gRPC excluded) |
-| `veil_proxy_websocket_tunnels` | Gauge | protocol | Open WebSocket tunnels relayed to upstreams (`protocol` = client side, `http/1.1`). The `101` request is counted in `http_requests_total` but kept out of the duration and size histograms |
+| `veil_proxy_websocket_tunnels` | Gauge | protocol | Open WebSocket tunnels relayed to upstreams (`protocol` = client side: `http/1.1`, `h2` or `h3`). The `101` request is counted in `http_requests_total` but kept out of the duration and size histograms |
 | `veil_circuit_breaker_open_total` | Counter | upstream | Times a server's breaker opened, per upstream group |
 | `veil_circuit_breaker_state` | Gauge | upstream | Group state: 1 if any server's breaker is Open, 2 if any is HalfOpen, otherwise 0 |
 | `veil_retry_total` | Counter | upstream, result | Retries of idempotent requests whose pooled upstream connection closed before the response (`upstream` = server address, `result` = `stale_connection`) |

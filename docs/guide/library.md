@@ -389,8 +389,8 @@ async fn upper(req: &Request) -> Response {
 ### Protocol upgrades (HTTP/1.1)
 
 A handler can take over the connection with `101 Switching Protocols`. `Request::upgrade_protocol()` returns the
-`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; always `None` on HTTP/2 and
-HTTP/3), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
+`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; on HTTP/2 and HTTP/3 the
+`:protocol` of an extended CONNECT, see below), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
 `veil::api::upgrade::Upgraded` connection:
 
 ```rust
@@ -485,8 +485,11 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
   cookies (cross-site WebSocket hijacking).
 - permessage-deflate (RFC 7692) is negotiated only with `[api] websocket_compression = true` (default off; the
   decompressed size is limited by `websocket_max_message_size`).
-- WebSocket works on HTTP/1.1 only: over HTTP/2 and HTTP/3 the handshake is answered with 400 (RFC 8441 / RFC 9220
-  are not supported).
+- WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 / RFC 9220) works when `[http2]` / `[http3]
+  enable_connect_protocol = true`: `WebSocketUpgrade` accepts `CONNECT` with `:protocol = websocket` (no
+  `Sec-WebSocket-Key`), `on_upgrade` answers `200`, and the `WebSocket` runs over the stream. Other handshakes on
+  HTTP/2 and HTTP/3 are answered with 400. `Response::switching_protocols` works the same way on an extended CONNECT
+  whose `:protocol` matches (a mismatch is answered with 500); `Upgraded::into_tokio_io()` is HTTP/1.1 only.
 - Metrics (`metrics` feature): `veil_proxy_websocket_connections` (open connections) and
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`.
 - The connection counts against `[security] max_concurrent_connections` like any upgraded connection.
@@ -1471,7 +1474,7 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
   cookies.
 - Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
   stalls its event loop (see above).
-- Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
-  is not supported).
+- Protocol upgrades and WebSocket over HTTP/2 and HTTP/3 need `enable_connect_protocol = true` (extended CONNECT,
+  off by default); `Upgraded::into_tokio_io()` works on HTTP/1.1 only.
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path
   you pass) is the only file.

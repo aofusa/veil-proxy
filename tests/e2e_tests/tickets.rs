@@ -2911,3 +2911,234 @@ pub(super) async fn test_b307_websocket_upgrade_requires_get_and_token() {
         head
     );
 }
+
+// ====================
+// F-288: HTTP/2 の拡張 CONNECT（RFC 8441）の上の WebSocket
+// ====================
+
+/// 拡張 CONNECT が広告されるまで待ってから `:protocol` 付きの CONNECT を開く（h2 は SETTINGS を受けるまで送れない）。
+/// `cleartext` は平文の h2c（`listen_cleartext`）
+async fn f288_open(
+    path: &str,
+    protocol: &'static str,
+    cleartext: bool,
+) -> (http::Response<h2::RecvStream>, h2::SendStream<bytes::Bytes>) {
+    let (sender, scheme) = if cleartext {
+        let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", PROXY_H2C_PORT))
+            .await
+            .expect("h2c connect");
+        let (sender, conn) = h2::client::handshake(tcp).await.expect("h2c handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        (sender, "http")
+    } else {
+        let client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("HTTP/2 client");
+        (client.raw_sender(), "https")
+    };
+    let mut sender = sender.ready().await.expect("h2 ready");
+    let mut waited = 0;
+    while !sender.is_extended_connect_protocol_enabled() {
+        assert!(
+            waited < 100,
+            "SETTINGS_ENABLE_CONNECT_PROTOCOL must be advertised"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += 1;
+        sender = sender.ready().await.expect("h2 ready");
+    }
+    let req = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("{}://localhost{}", scheme, path))
+        .extension(h2::ext::Protocol::from_static(protocol))
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (resp_fut, send) = sender.send_request(req, false).expect("open stream");
+    let resp = tokio::time::timeout(Duration::from_secs(10), resp_fut)
+        .await
+        .expect("response head")
+        .expect("response");
+    (resp, send)
+}
+
+/// ストリームの本文から WebSocket のフレームを 1 つ取り出す
+async fn f288_read_frame(body: &mut h2::RecvStream, buf: &mut Vec<u8>) -> Vec<u8> {
+    loop {
+        if buf.len() >= 2 {
+            let len7 = (buf[1] & 0x7f) as usize;
+            let (hdr, len) = if len7 == 126 && buf.len() >= 4 {
+                (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
+            } else if len7 < 126 {
+                (2, len7)
+            } else {
+                (usize::MAX, 0)
+            };
+            if hdr != usize::MAX && buf.len() >= hdr + len {
+                let p = buf[hdr..hdr + len].to_vec();
+                buf.drain(..hdr + len);
+                return p;
+            }
+        }
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.data())
+            .await
+            .expect("echoed frame")
+            .expect("stream must stay open")
+            .expect("data");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
+    }
+}
+
+/// F-288: `:protocol = websocket` の CONNECT を `/ws/*`（Proxy）へ。上流（HTTP/1.1 の WebSocket のエコー）の 101 は 200 になり、
+/// フレームがストリームの DATA で往復する。クライアントがストリームを終えたらトンネルも終わる
+#[tokio::test]
+#[ntest::timeout(40000)]
+pub(super) async fn test_f288_h2_websocket_extended_connect_echo() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    f288_echo(false).await;
+}
+
+/// F-288: 平文の h2c でも同じ（TLS の有無で経路が分かれない）
+#[tokio::test]
+#[ntest::timeout(40000)]
+pub(super) async fn test_f288_h2c_websocket_extended_connect_echo() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    f288_echo(true).await;
+}
+
+async fn f288_echo(cleartext: bool) {
+    let (resp, mut send) = f288_open("/ws/", "websocket", cleartext).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.headers());
+    assert!(
+        resp.headers().get("sec-websocket-accept").is_none(),
+        "{:?}",
+        resp.headers()
+    );
+    assert!(
+        resp.headers().get("upgrade").is_none(),
+        "{:?}",
+        resp.headers()
+    );
+    let mut body = resp.into_body();
+    let mut buf = Vec::new();
+    let mut seed: u32 = 0x0bad_cafe;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for round in 0..10 {
+        let mut sent = Vec::new();
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            let len = (next() % 3000) as usize + 1;
+            let payload: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            out.extend_from_slice(&ws_frame(&payload, next().to_be_bytes()));
+            sent.push(payload);
+        }
+        send.reserve_capacity(out.len());
+        send.send_data(bytes::Bytes::from(out), false)
+            .expect("send frames");
+        for (i, want) in sent.iter().enumerate() {
+            let got = f288_read_frame(&mut body, &mut buf).await;
+            assert_eq!(&got, want, "round {} frame {} differs", round, i);
+        }
+    }
+    // END_STREAM → 上流へ半分閉じを伝え、上流が閉じるとストリームが終わる（リセットでも可。ハングしないこと）
+    send.send_data(bytes::Bytes::new(), true)
+        .expect("end stream");
+    let end = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match body.data().await {
+                Some(Ok(_)) => continue,
+                other => return other.map(|r| r.map(|_| ())),
+            }
+        }
+    })
+    .await
+    .expect("the tunnel must end after the client ends its stream");
+    eprintln!("F-288 h2 tunnel end: {:?}", end);
+}
+
+/// F-288: `websocket` 以外の `:protocol` は Proxy のルートでは 501（上流へは送らない）
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f288_h2_extended_connect_unknown_protocol() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let (resp, _send) = f288_open("/ws/", "x-not-websocket", false).await;
+    assert_eq!(resp.status(), 501, "{:?}", resp.headers());
+}
+
+/// F-288: トンネルのストリームにもルートの `websocket_idle_timeout_secs` が効き、切れたら RST_STREAM（END_STREAM にしない）
+#[tokio::test]
+#[ntest::timeout(20000)]
+pub(super) async fn test_f288_h2_websocket_idle_timeout_resets_stream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let (resp, _send) = f288_open("/ws-idle/", "websocket", false).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.headers());
+    let mut body = resp.into_body();
+    let started = std::time::Instant::now();
+    let end = tokio::time::timeout(Duration::from_secs(10), body.data())
+        .await
+        .expect("the idle tunnel must be closed");
+    let err = match end {
+        Some(Err(e)) => e,
+        other => panic!(
+            "expected a stream reset, got {:?}",
+            other.map(|r| r.map(|b| b.len()))
+        ),
+    };
+    assert_eq!(err.reason(), Some(h2::Reason::CANCEL), "{:?}", err);
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "closed too early: {:?}",
+        started.elapsed()
+    );
+}
+
+/// F-288: HTTP/3 の拡張 CONNECT（RFC 9220）が広告され、トンネルのタスクまで届く。テストの h3 クライアントは `:protocol` に
+/// `websocket` を送れない（`h3::ext::Protocol` が webtransport・connect-udp だけ）ので、Proxy のルートへの `connect-udp` が
+/// 501 になることで、`:protocol` の検査・振り分け・応答の経路を確かめる（WebSocket の中継は単体試験と HTTP/2 の E2E で見る）
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+pub(super) async fn test_f288_h3_extended_connect_reaches_tunnel() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("address");
+    let (_client, mut send) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("h3 client");
+    let req = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("https://localhost/ws/")
+        .extension(h3::ext::Protocol::CONNECT_UDP)
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.expect("send request");
+    let resp = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+        .await
+        .expect("response head")
+        .expect("response");
+    assert_eq!(resp.status(), 501, "{:?}", resp.headers());
+}

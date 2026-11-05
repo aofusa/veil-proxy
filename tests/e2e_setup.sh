@@ -659,10 +659,15 @@ enabled = true
 path_prefix = "/__admin"
 secret = "test-admin-secret"
 
+# F-288: 拡張 CONNECT（WebSocket over HTTP/2・HTTP/3）
+[http2]
+enable_connect_protocol = true
+
 [http3]
 enabled = true
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 compression_enabled = true
+enable_connect_protocol = true
 
 # L4 TCP プロキシ（TLS パススルー、F-30 splice 検証用）
 # クライアントの TLS は backend1/2(HTTPS) へ透過転送され、L4 は生バイトを双方向中継する。

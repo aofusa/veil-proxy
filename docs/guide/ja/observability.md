@@ -57,7 +57,7 @@ GET /__metrics
 | `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
 | `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
 | `veil_proxy_buffering_used_total` | Counter | host | `[route.buffering]` で応答を溜めるルートの要求数（gRPC を除く） |
-| `veil_proxy_websocket_tunnels` | Gauge | protocol | 上流へ中継している WebSocket のトンネルの数（`protocol` はクライアント側。`http/1.1`）。`101` の要求は `http_requests_total` には数えるが、所要時間・大きさのヒストグラムには入れない |
+| `veil_proxy_websocket_tunnels` | Gauge | protocol | 上流へ中継している WebSocket のトンネルの数（`protocol` はクライアント側。`http/1.1`・`h2`・`h3`）。`101` の要求は `http_requests_total` には数えるが、所要時間・大きさのヒストグラムには入れない |
 | `veil_circuit_breaker_open_total` | Counter | upstream | サーバーのCBがOpenになった回数（upstream グループごと） |
 | `veil_circuit_breaker_state` | Gauge | upstream | グループの状態: どれかのサーバーがOpenなら1、どれかがHalfOpenなら2、ほかは0 |
 | `veil_retry_total` | Counter | upstream, result | プールの上流の接続が応答の前に切れた冪等な要求の再送（`upstream` はサーバーのアドレス、`result` は `stale_connection`） |

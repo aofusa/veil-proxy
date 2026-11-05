@@ -116,6 +116,47 @@ pub(super) struct H3AccessLog {
     pub(super) client_ip: crate::http_utils::IpStr,
 }
 
+/// 拡張 CONNECT（WebSocket over HTTP/3。F-288）のタスク。ルーティング・検査・上流のハンドシェイク・中継は
+/// HTTP/2 と共有の [`crate::proxy::ws_tunnel::serve`] が行う（quiche には触れず、応答は `RespMsg` で返す）。
+pub(super) async fn h3_tunnel_task(
+    req: Box<crate::proxy::ws_tunnel::TunnelRequest>,
+    req_rx: crate::http3_stream::Receiver<Bytes>,
+    resp_tx: crate::http3_stream::Sender<crate::http3_stream::RespMsg>,
+    notify: crate::http3_stream::ConnWaker,
+) {
+    let req = *req;
+    let authority = req.authority.clone();
+    let path = req.path.clone();
+    let start = req.start;
+    let client_ip = req.client_ip.clone();
+    let user_agent = req
+        .headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"user-agent"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let out = crate::proxy::ws_tunnel::TunnelOut::H3 {
+        tx: resp_tx,
+        notify: notify.clone(),
+    };
+    let (status, sent, received) = crate::proxy::ws_tunnel::serve(req, Some(req_rx), out).await;
+    notify.notify();
+    if status != 0 {
+        log_access(
+            b"CONNECT",
+            &authority,
+            &path,
+            &user_agent,
+            received,
+            status,
+            sent,
+            start,
+            &client_ip,
+            "",
+        );
+    }
+}
+
 /// 要求本文をストリーミングで受けるハンドラのタスク（F-209 #5）。メインループが `req_rx` へ流す本文を
 /// ハンドラの受信ストリームへ中継しながらハンドラを呼び、応答を `RespMsg` でメインループへ返す
 /// （HTTP/2 の `h2_api_handler` と同じ形。両方向が同時に進むので gRPC の双方向が全二重になる）。

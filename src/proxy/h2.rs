@@ -524,6 +524,8 @@ pub(crate) struct H2RequestCtx {
     pub(crate) path: Bytes,
     /// `:authority`（無ければ host ヘッダー、いずれも無ければ空）。
     pub(crate) authority: Bytes,
+    /// `:protocol`（拡張 CONNECT のときだけ `Some`。F-288）
+    pub(crate) protocol: Option<Bytes>,
     /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
     pub(crate) headers: Vec<crate::http2::hpack::HeaderField>,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
@@ -674,7 +676,8 @@ pub(super) fn h2_spawn_for_request<S, V>(
     // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
-    let plan = if body_pending && redirect_https.is_none() {
+    let tunnel = body_pending && conn.get_stream(stream_id).is_some_and(|s| s.tunnel);
+    let plan = if body_pending && redirect_https.is_none() && !tunnel {
         let plan = svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr);
         if plan.body_timeout_secs > 0 {
             conn.set_stream_recv_timeout(stream_id, plan.body_timeout_secs);
@@ -683,6 +686,9 @@ pub(super) fn h2_spawn_for_request<S, V>(
     } else {
         None
     };
+    // F-288: 拡張 CONNECT のトンネルは本文（トンネルのバイト列）を常にチャネルで流す。上限・受信の打ち切りは
+    // 掛けない（トンネルのアイドルは中継のタスクが `websocket_idle_timeout_secs` で切る）
+    let plan = if tunnel { Some(0) } else { plan };
     let streaming = plan.is_some();
     if body_pending && !streaming {
         // 非適格: 何もしない。DATA は process_frame が request_body へ蓄積し、
@@ -717,6 +723,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
         method: parts.method,
         path: parts.path,
         authority,
+        protocol: parts.protocol,
         headers: parts.headers,
         body: parts.body.freeze(),
         #[cfg(feature = "wasm")]
@@ -1296,7 +1303,10 @@ pub(super) async fn h2_request_task(
         .map(|h| h.value.clone())
         .unwrap_or_default();
 
-    let (status, resp_size, req_size) = if let Some(rx) = req_rx {
+    let (status, resp_size, req_size) = if ctx.protocol.is_some() {
+        // F-288: 拡張 CONNECT（WebSocket over HTTP/2）。通常の要求はこの分岐 1 つだけ
+        h2_serve_tunnel(&ctx, req_rx, resp_tx, notify.clone()).await
+    } else if let Some(rx) = req_rx {
         h2_serve_streaming(&ctx, &rx, &resp_tx, &notify).await
     } else {
         h2_serve_buffered(&ctx, &resp_tx, &notify).await
@@ -1318,6 +1328,43 @@ pub(super) async fn h2_request_task(
     }
     // resp_tx / req_rx はここで drop → メインループへ EOF 伝播。
     notify.notify();
+}
+
+/// 拡張 CONNECT（WebSocket over HTTP/2。F-288）の要求を [`ws_tunnel::serve`] へ渡す。
+#[cfg(feature = "http2")]
+async fn h2_serve_tunnel(
+    ctx: &H2RequestCtx,
+    req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+    notify: crate::stream_channel::Notify,
+) -> (u16, u64, u64) {
+    let req = ws_tunnel::TunnelRequest {
+        path: ctx.path.clone(),
+        authority: ctx.authority.clone(),
+        protocol: ctx.protocol.clone().unwrap_or_default(),
+        headers: ctx
+            .headers
+            .iter()
+            .filter(|h| !h.name.starts_with(b":"))
+            .map(|h| (h.name.clone(), h.value.clone()))
+            .collect(),
+        client_ip: ctx.client_ip.clone(),
+        client_addr: ctx.client_socket_addr,
+        redirect_https: ctx.redirect_https,
+        #[cfg(feature = "handler")]
+        tls: ctx.tls,
+        #[cfg(feature = "http3")]
+        start: ctx.start,
+    };
+    ws_tunnel::serve(
+        req,
+        req_rx,
+        ws_tunnel::TunnelOut::H2 {
+            tx: resp_tx,
+            notify,
+        },
+    )
+    .await
 }
 
 /// レスポンスチャネルへ送り、メインループへ通知する。receiver 切断時は `Err(())`。
@@ -1834,6 +1881,7 @@ pub(super) async fn h2_dispatch(
             method: ctx.method.clone(),
             path: ctx.path.clone(),
             authority: ctx.authority.clone(),
+            protocol: ctx.protocol.clone(),
             headers,
             body: wasm_request_body_override.unwrap_or_else(|| ctx.body.clone()),
             trailers: ctx.trailers.clone(),
