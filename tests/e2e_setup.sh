@@ -24,6 +24,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Windows の Git Bash（MSYS）では設定ファイルに書くパスを veil.exe が読める "C:/..." の形にする
 # （"/c/..." のままだと TLS 証明書などが見つからない）。bash も "C:/..." をそのまま扱える。
 case "$(uname -s)" in MINGW*|MSYS*) SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)" ;; esac
+# Windows（Git Bash）で動いているか
+is_windows_host() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac; return 1; }
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # ワークスペース構成の場合、バイナリはワークスペースルートにある
 WORKSPACE_DIR="$(dirname "$PROJECT_DIR")"
@@ -616,6 +618,59 @@ EOF
     esac
     
     # 基本設定
+    # F-170 の UDS 上流。Windows は UDS の上流を受け付けない（設定のロードが失敗する）ので入れない
+    local UDS_UPSTREAMS=""
+    if ! is_windows_host; then
+        UDS_UPSTREAMS="$(cat << EOF
+# F-170: UDS バックエンド（Unix ドメインソケット上流）
+# http(s)://unix:<socket-path>[:<path-prefix>] は nginx の
+# "proxy_pass http://unix:/path:/uri;" と同じ表記。Host ヘッダは既定で "localhost"。
+[upstreams."uds-tls-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://unix:${BACKEND_UDS_TLS_SOCK}"
+]
+tls_insecure = true
+
+[upstreams."uds-h2c-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+# パスプレフィックス付き（/uds-prefix/v1/test -> バックエンドの /api/v1/test）
+[upstreams."uds-prefix-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}:/api", use_h2c = true }
+]
+
+# 存在しないソケットへの接続（502 になること）
+[upstreams."uds-missing-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_MISSING_SOCK}", use_h2c = true }
+]
+
+# UDS 上流に対する TCP ヘルスチェック（unix: アドレスでプローブできること）
+[upstreams."uds-health-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+[upstreams."uds-health-pool".health_check]
+enabled = true
+check_type = "tcp"
+interval_secs = 2
+timeout_secs = 2
+healthy_threshold = 1
+unhealthy_threshold = 3
+
+EOF
+)
+"
+    fi
     cat > "${FIXTURES_DIR}/proxy.toml" << EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
@@ -821,52 +876,7 @@ servers = [
 ]
 tls_insecure = true
 
-# F-170: UDS バックエンド（Unix ドメインソケット上流）
-# http(s)://unix:<socket-path>[:<path-prefix>] は nginx の
-# "proxy_pass http://unix:/path:/uri;" と同じ表記。Host ヘッダは既定で "localhost"。
-[upstreams."uds-tls-pool"]
-algorithm = "round_robin"
-servers = [
-    "https://unix:${BACKEND_UDS_TLS_SOCK}"
-]
-tls_insecure = true
-
-[upstreams."uds-h2c-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
-]
-
-# パスプレフィックス付き（/uds-prefix/v1/test -> バックエンドの /api/v1/test）
-[upstreams."uds-prefix-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}:/api", use_h2c = true }
-]
-
-# 存在しないソケットへの接続（502 になること）
-[upstreams."uds-missing-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_MISSING_SOCK}", use_h2c = true }
-]
-
-# UDS 上流に対する TCP ヘルスチェック（unix: アドレスでプローブできること）
-[upstreams."uds-health-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
-]
-
-[upstreams."uds-health-pool".health_check]
-enabled = true
-check_type = "tcp"
-interval_secs = 2
-timeout_secs = 2
-healthy_threshold = 1
-unhealthy_threshold = 3
-
-# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
+${UDS_UPSTREAMS}# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
 # （BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する。この上流を https:// で参照し、
 # 上流クライアントの ALPN から h2 を外しても中継が壊れないことを確認する。
 [upstreams."alpn-h2-pool"]
@@ -1112,8 +1122,9 @@ rate_limit_requests_per_min = 10
 EOF
     fi
 
-    # F-170: UDS バックエンド検証ルート
-    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+    if ! is_windows_host; then
+        # F-170: UDS バックエンド検証ルート
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
 [route.conditions]
@@ -1195,6 +1206,7 @@ path = "/uds-health/*"
 type = "Proxy"
 upstream = "uds-health-pool"
 EOF
+    fi
 
     # バックエンド接続オプション検証ルート（SNI / 厳密証明書 / ヘルスチェック種別）
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF

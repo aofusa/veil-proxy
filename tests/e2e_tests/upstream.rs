@@ -151,6 +151,7 @@ pub(super) async fn test_f150_static_content_cache_http1_range() {
 /// HTTP/1.1 クライアント → TLS over UDS バックエンドへ中継できること。
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_tls() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -171,6 +172,7 @@ pub(super) async fn test_e2e_uds_backend_tls() {
 /// HTTP/1.1 クライアント → h2c over UDS バックエンドへ中継できること。
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_h2c() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -192,6 +194,7 @@ pub(super) async fn test_e2e_uds_backend_h2c() {
 /// （`/uds-prefix/v1/test` → バックエンドの `/api/v1/test`）。
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_path_prefix() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -213,6 +216,7 @@ pub(super) async fn test_e2e_uds_backend_path_prefix() {
 /// （ハングせずエラー応答へ変換されること）。
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_missing_socket_returns_502() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -236,6 +240,7 @@ pub(super) async fn test_e2e_uds_backend_missing_socket_returns_502() {
 /// （`unix:<path>` 形式のアドレスで同期プローブが接続できること）。
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_tcp_health_check() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -260,6 +265,7 @@ pub(super) async fn test_e2e_uds_backend_tcp_health_check() {
 #[tokio::test]
 #[ntest::timeout(15000)]
 #[cfg(feature = "http2")]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_via_http2_client() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -292,6 +298,7 @@ pub(super) async fn test_e2e_uds_backend_via_http2_client() {
 #[tokio::test]
 #[ntest::timeout(20000)]
 #[cfg(feature = "http3")]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_via_http3_client() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -329,6 +336,7 @@ pub(super) async fn test_e2e_uds_backend_via_http3_client() {
 #[tokio::test]
 #[ntest::timeout(20000)]
 #[cfg(feature = "http3")]
+#[cfg(unix)] // Windows は UDS の上流を受け付けない（e2e_setup.sh も設定に入れない）
 pub(super) async fn test_e2e_uds_backend_via_http3_client_tls() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
