@@ -16,6 +16,8 @@ MODULES =		devel/cargo lang/clang
 MODCLANG_COMPILER_LINKS =	No
 # the cargo module patches zstd-sys to link archivers/zstd
 LIB_DEPENDS =		archivers/zstd
+# hicolor icons (packaging/icons): the icon cache is updated by gtk-update-icon-cache
+RUN_DEPENDS =		x11/gtk+4,-guic
 
 # devel/git: boring-sys (BoringSSL for HTTP/3) applies its patches with git init / git apply
 BUILD_DEPENDS =		devel/cmake \
@@ -54,7 +56,14 @@ post-install:
 	${INSTALL_DATA_DIR} ${PREFIX}/share/examples/veil ${PREFIX}/share/veil/www
 	${INSTALL_DATA} ${WRKDIR}/defaults/config.toml ${PREFIX}/share/examples/veil/config.toml
 	${INSTALL_DATA} ${WRKDIR}/defaults/www/index.html ${WRKDIR}/defaults/www/quickstart.html \
-		${PREFIX}/share/veil/www/
+		${WRKDIR}/defaults/www/favicon.ico ${PREFIX}/share/veil/www/
+.for s in 16 32 48 64 128 256 512
+	${INSTALL_DATA_DIR} ${PREFIX}/share/icons/hicolor/${s}x${s}/apps
+	${INSTALL_DATA} ${WRKSRC}/packaging/icons/hicolor/${s}x${s}/apps/veil.png \
+		${PREFIX}/share/icons/hicolor/${s}x${s}/apps/
+.endfor
+	${INSTALL_DATA_DIR} ${PREFIX}/share/metainfo
+	${INSTALL_DATA} ${WRKSRC}/packaging/icons/io.github.aofusa.veil.metainfo.xml ${PREFIX}/share/metainfo/
 
 .include "crates.inc"
 

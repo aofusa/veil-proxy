@@ -81,6 +81,11 @@ jobs:
       # F-241: docs.rs に出る文書（と Python の文書）が英語だけで、チケット番号が無い
       - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       - run: tools/release/check-docs.sh
+      # F-290: 配布物のアイコン（packaging/icons）がロゴから作り直されている・AppStream のメタデータが正しい
+      - name: Icons made from the logo, AppStream metadata
+        run: |
+          sudo apt-get install -y appstream
+          tools/release/render-icons.sh --check
 
   build:
     name: build (${{ matrix.features }})

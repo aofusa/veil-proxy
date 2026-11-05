@@ -87,6 +87,9 @@ perm="$(x 'stat -c "%U:%G %a" /etc/veil/config.toml')"
 [ "$perm" = "root:veil 640" ] && ok "config owner/mode $perm" || bad "config owner/mode $perm (want root:veil 640)"
 x 'journalctl -u veil --no-pager | grep -q "Config File: /etc/veil/config.toml (from default path)"' && ok "reads the default path" || bad "did not read /etc/veil/config.toml from the default path"
 x 'ps -o user= -C veil | sort -u | grep -qx veil' && ok "runs as the veil user after dropping privileges" || bad "not running as veil"
+# F-290: ソフトウェアセンターが出すアイコンと AppStream のメタデータ
+x 'test -s /usr/share/icons/hicolor/256x256/apps/veil.png && test -s /usr/share/metainfo/io.github.aofusa.veil.metainfo.xml' \
+    && ok "icons and AppStream metadata installed" || bad "missing /usr/share/icons/hicolor/256x256/apps/veil.png or the AppStream metadata"
 
 # 2. 書き換えて入れ直す
 x 'sed -i "s/^level = \"info\"/level = \"info\"  # edited/" /etc/veil/config.toml'

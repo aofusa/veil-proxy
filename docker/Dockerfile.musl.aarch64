@@ -182,6 +182,8 @@ COPY --from=builder /app/out/ /
 # 試験（tools/container_security）は docker/assets/conf.d/config.toml を -v で渡して使う。
 COPY --from=builder /app/packaging/container/config.toml /etc/veil/conf.d/config.toml
 COPY --from=builder /app/packaging/defaults/www/ /var/www/
+# Artifact Hub に出るロゴ（F-290。Docker Hub・ghcr.io のロゴはリポジトリの設定で人が入れる）
+LABEL io.artifacthub.package.logo-url="https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/256x256/apps/veil.png"
 
 EXPOSE 8080/tcp 80/tcp 443/tcp 443/udp
 

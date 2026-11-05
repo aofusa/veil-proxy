@@ -323,6 +323,14 @@ stage_rootfs() {
     install -m 0755 "${SCRIPT_DIR}/postinstall.sh" "${dest}/usr/share/veil/scripts/postinstall.sh"
     install -m 0755 "${SCRIPT_DIR}/preuninstall.sh" "${dest}/usr/share/veil/scripts/preuninstall.sh"
     install -m 0644 "${PKG_ROOT}/debian/copyright" "${dest}/usr/share/doc/veil/copyright"
+    # F-290: ソフトウェアセンター（GNOME Software・Discover）が出すアイコンと AppStream のメタデータ
+    local icon size
+    for icon in "${PKG_ROOT}"/icons/hicolor/*/apps/veil.png; do
+        size="$(basename "$(dirname "$(dirname "${icon}")")")"
+        install -D -m 0644 "${icon}" "${dest}/usr/share/icons/hicolor/${size}/apps/veil.png"
+    done
+    install -D -m 0644 "${PKG_ROOT}/icons/io.github.aofusa.veil.metainfo.xml" \
+        "${dest}/usr/share/metainfo/io.github.aofusa.veil.metainfo.xml"
 }
 
 build_deb() {

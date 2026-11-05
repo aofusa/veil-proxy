@@ -3,6 +3,7 @@
 #   pwsh tools/release/build-msi.ps1 -Zip packaging/output/veil-<ver>-x86_64-pc-windows-msvc.zip -Arch x64 -Defaults <dir> -Out <msi>
 #
 # -Defaults は tools/release/render-defaults.sh winget <dir> の出力（config.toml と www/）。
+# 一覧のアイコンは packaging/icons/veil.ico（tools/release/render-icons.sh の生成物。F-290）。
 param(
   [Parameter(Mandatory)] [string]$Zip,
   [Parameter(Mandatory)] [ValidateSet('x64','arm64')] [string]$Arch,
@@ -22,6 +23,7 @@ Expand-Archive -Path $Zip -DestinationPath $work
 $src = (Get-ChildItem $work -Directory | Select-Object -First 1).FullName
 $log = wix build -arch $Arch `
   -d "Version=$version" -d "SourceDir=$src" -d "DefaultsDir=$((Resolve-Path $Defaults).Path)" `
+  -d "IconFile=$((Resolve-Path "$root/packaging/icons/veil.ico").Path)" `
   -o $Out "$root/packaging/windows/veil.wxs" 2>&1
 $rc = $LASTEXITCODE
 $log | Out-Host

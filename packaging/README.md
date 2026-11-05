@@ -121,6 +121,8 @@ packaging/
 ├── README.md                    # 本ファイル
 ├── debian/DEBIAN/               # .deb メタデータ
 ├── rpm/veil.spec                # .rpm spec ファイル
+├── icons/                       # ロゴから作ったアイコン（tools/release/render-icons.sh の生成物）と AppStream のメタデータ
+├── windows/                     # MSI（veil.wxs）と veil.exe のリソースの雛形（veil.rc。build.rs が使う）
 ├── scripts/
 │   ├── build.sh                 # 統合ビルド（.deb + .rpm）
 │   ├── build-bsd.sh             # FreeBSD/OpenBSD/NetBSD tar.gz（VM ネイティブビルド）
@@ -493,6 +495,14 @@ zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt`
 `SetInformationJobObject` でプロセスに最小限のリソース制限
 （`ACTIVE_PROCESS=1`、`KILL_ON_JOB_CLOSE`）を適用するのみで、seccomp/Landlock
 相当のシステムコールフィルタではない。
+
+**アイコンと版の情報（F-290）**: `build.rs` が `packaging/windows/veil.rc`（`packaging/icons/veil.ico` と版）を
+llvm-rc で `.res` にして `veil.exe` にリンクする。Dockerfile は `VEIL_REQUIRE_WIN_RESOURCES=1` を設定しているので、
+リソースコンパイラが無ければビルドが失敗する（手元の cargo では警告だけで続く）。`dist.yml` の `cross` の job が
+`tools/release/check-pe-resources.py` でリソースがあることを、`windows-test` の job がエクスプローラと同じ API で版の情報を確かめる。
+MSI は同じ ico を `ARPPRODUCTICON` に使う。deb・rpm・ports は `packaging/icons/hicolor/` と AppStream のメタデータを入れる。
+ロゴを差し替えたら `tools/release/render-icons.sh` で作り直してコミットする（CI の `--check` が検出する）。
+Docker Hub・ghcr.io のリポジトリのロゴはレジストリの画面で人が設定する（`packaging/icons/hicolor/256x256/apps/veil.png`）。
 
 **`AWS_LC_SYS_NO_PREFIX` について（B-47）**: `http3` / `full` ビルドで
 `aws-lc-sys` と `quiche` のシンボルをどう扱うかは

@@ -6,6 +6,8 @@ type: application
 version: 0.10.1
 appVersion: "0.10.1"
 home: https://github.com/aofusa/veil-proxy
+# Shown by Artifact Hub, Rancher and Lens (packaging/icons, made by tools/release/render-icons.sh)
+icon: https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/256x256/apps/veil.png
 sources:
   - https://github.com/aofusa/veil-proxy
 keywords: [proxy, reverse-proxy, web-server, http3, grpc]

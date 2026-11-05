@@ -1,6 +1,6 @@
 # F-290: 配布する各バイナリ・パッケージにアプリケーションのロゴ（`docs/images/veil_logo.webp`）を組み込む
 
-**状態: 未着手（2026-11-05 起票。調査・設計のみ）**
+**状態: 完了（v0.11.0）**
 
 ## 今の状態
 
@@ -91,6 +91,73 @@ ELF・Mach-O の中にロゴの画像そのものを埋め込んでも OS は見
 - crates.io のパッケージの大きさ（`include`/`exclude`）。ico を入れると 100KB 程度増える。
 - cargo-xwin のイメージに `llvm-rc` が無い版がある → `docker/Dockerfile.windows` で入れる。
 - ロゴの webp は透過付き。16px・32px で潰れて読めない場合は、`veil_logo_alternative.svg` から小さいサイズを作る（デザインの判断は人）。
+
+## 実装
+
+設計のとおり。選んだ既定値と設計からの差分:
+
+- **派生物**: `tools/release/render-icons.sh`（引数無しで作り直す・`--check`）。`packaging/icons/veil.ico`（16・20・24・32・40・48・64・128・256。
+  256 は PNG 圧縮。約 210KB）、`packaging/icons/hicolor/<N>x<N>/apps/veil.png`（16〜512。`/usr/share/icons/hicolor` と同じ形に
+  したのでそのまま写せる）、`packaging/defaults/www/favicon.ico`（16・32・48 だけ。約 15KB。`veil.ico` と同じにすると既定のページに
+  210KB の favicon を配ることになるので分けた）、`packaging/icons/SOURCE.sha256`。日時のチャンクを書かないので、同じ ImageMagick
+  なら作り直しても 1 バイトも変わらない（6.9.12 で確認）。`--check` は元画像のハッシュ・生成物の有無・`appstreamcli validate`
+  （入っていれば）を見る。CI は `ci.yml` の `docs` の job で `appstream` を入れて回す。`.icns` は作っていない（設計どおり）。
+- **AppStream**: `packaging/icons/io.github.aofusa.veil.metainfo.xml`（`console-application`、`<icon type="stock">veil</icon>`、
+  `<provides><binary>veil</binary>`）。`<releases>` は入れていない（版を上げるたびの更新を増やさない。`appstreamcli validate
+  --pedantic` の `releases-info-missing` だけが出る）。
+- **Windows の PE**: `build.rs` の `emit_windows_resources`。`packaging/windows/veil.rc` は雛形で、`@ICON_PATH@`・`@VERSION@`・
+  `@VERSION_COMMA@` を build.rs が埋めて `OUT_DIR` に書く（`/D` で渡す形にしなかったのは、llvm-rc のマクロの展開が clang の
+  プリプロセッサ頼みで、clang が見つからない環境で結果が変わるため。llvm-rc には `/no-preprocess` を渡す）。`FILEVERSION` は
+  `0.11.0-rc.1` → `0,11,0,0`、文字列の `ProductVersion` は版そのまま。リソースコンパイラは `RC_<target>`・`RC` → `llvm-rc`
+  （`llvm-rc-<版>`・`/usr/lib/llvm-<版>/bin/llvm-rc` も）→ Windows のホストだけ `rc.exe`（PATH → Windows SDK）。Linux のホストで
+  PATH の `rc` を使わない（Plan 9 の rc シェルのことがある）。llvm-rc は `/` で始まる引数をオプションとして読むので、`OUT_DIR` を
+  作業ディレクトリにして相対パスで渡す。`cargo:rustc-link-arg-bins` で veil の bin だけにリンクする。見つからない・失敗したら
+  `cargo:warning`、`VEIL_REQUIRE_WIN_RESOURCES=1` なら panic。Windows（MSVC）以外の target では環境変数を 1 つ読むだけで何もしない。
+  `veil_capi.dll` の `VERSIONINFO`（任意）は入れていない。
+- **Docker**: `docker/Dockerfile.windows` の cacher 段に `veil.rc`・`veil.ico` を COPY（cacher 段でも build.rs が走る）、
+  `ENV VEIL_REQUIRE_WIN_RESOURCES=1`（`dist.yml` の Windows の job ではなく Dockerfile に置いた。配布の Windows ビルドはこの
+  Dockerfile だけ）、`llvm-rc` が無ければ版付きの名前へのリンクを張る（それも無ければ apt の llvm）。`.dockerignore` に
+  `packaging/windows/veil.rc`・`packaging/icons/veil.ico` を足した。Linux の Dockerfile は build.rs が何も読まないので変えていない。
+- **crates.io**: `Cargo.toml` の `include` に `veil.rc`・`veil.ico` を足した（crates.io から入れた Windows のビルドでもリソースが付く）。
+- **確認**: `tools/release/check-pe-resources.py`（標準ライブラリだけで PE のリソースの表を読み、RT_ICON・RT_GROUP_ICON・RT_VERSION と
+  ProductName "veil" を確かめる）を `dist.yml` の `cross`（windows）の job で回す。`windows-test` で `(Get-Item veil.exe).VersionInfo`
+  の ProductName・ProductVersion を確かめる。アイコンの比較（`ExtractAssociatedIcon`）は既定のアイコンの比べる相手が安定しないので
+  入れず、リソースの表で見る。`test-msi.ps1` は Uninstall の `DisplayIcon` と `www\favicon.ico` を見る。`test-package.sh`（deb・rpm）は
+  hicolor の 256 と metainfo が入ったことを見る。
+- **MSI**: `<Icon>` + `ARPPRODUCTICON`（`build-msi.ps1` が `-d IconFile=` で渡す）、`www\favicon.ico` の Component。
+- **deb・rpm**: `packaging/scripts/build.sh` の `stage_rootfs` が hicolor と metainfo を置き、`veil.spec` の `%files` に足した。
+- **ports**: FreeBSD は `INSTALLS_ICONS=yes`、OpenBSD は `RUN_DEPENDS = x11/gtk+4,-guic` と `@tag gtk-update-icon-cache`、
+  NetBSD は `ICON_THEMES=yes`。3 つとも PLIST に hicolor・metainfo・`favicon.ico` を足した（ソースの tarball の `packaging/icons` から入れる）。
+- **コンテナ・Helm・rustdoc**: 4 つの Linux の Dockerfile の runtime 段に `LABEL io.artifacthub.package.logo-url`、`Chart.yaml` に
+  `icon:`、`src/lib.rs`・`crates/veil-kit`・`crates/veil-build`・`crates/veil-macros` に `html_logo_url`（128px）・`html_favicon_url`
+  （32px）。URL は `raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/...`（main に入るまでは 404）。
+- **既定のページ**: `index.html`・`quickstart.html` に `<link rel="icon" href="favicon.ico">`。`render-defaults.sh` は `www/` を丸ごと
+  写すので、コンテナ・アーカイブ・Homebrew・deb・rpm・MSI・ports に入る。
+- **文書**: `docs/guide/building.md`・`docs/guide/ja/building.md` の「Application icon and version information」、`packaging/README.md`。
+
+### 確かめたこと
+
+- Linux: `cargo fmt --all --check`、`cargo build --features full`、`cargo clippy --all-targets --features full -- -D warnings`、`cargo check`（default）、
+  `cargo check --no-default-features` がすべて警告無しで通る。`cargo package --list` に `packaging/windows/veil.rc`・`packaging/icons/veil.ico` が入る。
+  `render-defaults.sh --check`・`render-icons.sh --check` が通る。
+- 本物の build.rs を最小のクレートに写して `cargo check --target x86_64-pc-windows-msvc` を回し、llvm-rc 18（`/usr/lib/llvm-18/bin`）で
+  `.res` ができて `rustc-link-arg-bins` が出ること、`llvm-cvtres` で COFF にして `llvm-readobj --coff-resources` で ICON（9 枚）・
+  GROUP_ICON・VERSIONINFO があること、`check-pe-resources.py` が ok を返すことを確かめた。`RC` を存在しないパスにすると警告で続き、
+  `VEIL_REQUIRE_WIN_RESOURCES=1` を足すと失敗することも確かめた。
+- `appstreamcli validate --no-net --pedantic`（1.0.2）が通る。
+
+### 人の作業・未確認（残り）
+
+- **Windows の実機**: 実際の `veil.exe` のリンク（cargo-xwin の lld-link、MSVC の link.exe）とエクスプローラのプロパティ・
+  タスクマネージャの表示、MSI の「インストールされているアプリ」のアイコンは、`dist.yml` の Windows の job か Windows の機械で確かめる。
+  手元の Windows で確かめるときは `cargo build --release`（Visual Studio Build Tools の Windows SDK の rc.exe を自動で探す）の後に
+  `python tools/release/check-pe-resources.py target\release\veil.exe`。
+- **cargo-xwin のイメージの llvm-rc**: Dockerfile は名前の揺れを吸収しているが、実際のイメージでの `docker build` は未確認。
+- **パッケージ**: deb・rpm（lintian・rpmlint を含む）・BSD の ports（`bsd-port-test.sh`）のビルドと試験は未確認。
+- **Docker Hub・ghcr.io のリポジトリのロゴ**: レジストリの画面で人が設定する（`packaging/icons/hicolor/256x256/apps/veil.png` を
+  上げる）。Artifact Hub はラベルと `Chart.yaml` の `icon` で出る。
+- **小さい大きさの絵**: 16px・32px はロゴを縮めただけ（読めるが細部は潰れる）。`veil_logo_alternative.svg` から小さい大きさを
+  描き分けるかはデザインの判断（人）。
 
 ## 関連
 

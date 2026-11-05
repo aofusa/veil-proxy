@@ -29,6 +29,179 @@ fn main() {
     emit_wasm_nosignals_cfg();
     emit_allocator_cfg();
     check_default_config_path();
+    emit_windows_resources();
+}
+
+/// F-290: Windows（MSVC）の veil.exe にアイコンと版の情報（`ICON`・`VERSIONINFO`）を埋め込む。
+///
+/// `packaging/windows/veil.rc` の雛形に版とアイコンのパスを埋めて `OUT_DIR` に書き、リソースコンパイラで `.res` にして
+/// `cargo:rustc-link-arg-bins` で **veil の bin だけ**にリンクする（`link.exe`・`lld-link` は `.res` をそのまま受け取る）。
+/// ライブラリとして veil を使う側のバイナリには付かない（`-bins` は依存先のパッケージには効かない）。依存は足さない。
+///
+/// Windows（MSVC）以外の target では何もしない。リソースコンパイラが見つからない・失敗したときは `cargo:warning` を出して
+/// リソース無しで続ける（ビルドを壊さない）。`VEIL_REQUIRE_WIN_RESOURCES=1` のとき（配布物のビルド）は失敗にする。
+fn emit_windows_resources() {
+    println!("cargo:rerun-if-env-changed=VEIL_REQUIRE_WIN_RESOURCES");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os != "windows" || target_env != "msvc" {
+        return;
+    }
+    let required = std::env::var("VEIL_REQUIRE_WIN_RESOURCES").is_ok_and(|v| v == "1");
+    match compile_windows_resources() {
+        Ok(res) => println!("cargo:rustc-link-arg-bins={}", res.display()),
+        Err(e) if required => panic!(
+            "veil build.rs: cannot embed the icon and version information in veil.exe: {e} \
+             (VEIL_REQUIRE_WIN_RESOURCES=1)"
+        ),
+        Err(e) => println!(
+            "cargo:warning=veil.exe is built without its icon and version information: {e}"
+        ),
+    }
+}
+
+/// `.rc` の雛形を埋めて `.res` を作り、そのパスを返す。
+// build.rs はビルド時に 1 回だけ走る（データプレーンではない）ので、std::fs の同期 I/O を使う。
+#[allow(clippy::disallowed_methods)]
+fn compile_windows_resources() -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
+    let out = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
+    let template = manifest.join("packaging/windows/veil.rc");
+    let icon = manifest.join("packaging/icons/veil.ico");
+    println!("cargo:rerun-if-changed={}", template.display());
+    println!("cargo:rerun-if-changed={}", icon.display());
+    for f in [&template, &icon] {
+        if !f.is_file() {
+            return Err(format!("{} is missing", f.display()));
+        }
+    }
+
+    let version = std::env::var("CARGO_PKG_VERSION").map_err(|e| e.to_string())?;
+    let icon_path = icon.to_string_lossy().into_owned();
+    if icon_path.contains('"') {
+        return Err(format!(
+            "the icon path {icon_path:?} contains a double quote"
+        ));
+    }
+    let text = std::fs::read_to_string(&template)
+        .map_err(|e| format!("cannot read {}: {e}", template.display()))?;
+    let rc: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .map(|l| {
+            l.replace("@ICON_PATH@", &icon_path.replace('\\', "\\\\"))
+                .replace("@VERSION_COMMA@", &rc_version_comma(&version))
+                .replace("@VERSION@", &version)
+                + "\n"
+        })
+        .collect();
+    let rc_file = out.join("veil.rc");
+    let res_file = out.join("veil.res");
+    std::fs::write(&rc_file, rc).map_err(|e| format!("cannot write {}: {e}", rc_file.display()))?;
+
+    let compiler = find_resource_compiler().ok_or(
+        "no resource compiler found (set RC, or install llvm-rc or the Windows SDK's rc.exe)",
+    )?;
+    let is_llvm_rc = compiler
+        .file_stem()
+        .is_some_and(|s| s.to_string_lossy().starts_with("llvm-rc"));
+    let mut cmd = std::process::Command::new(&compiler);
+    // 相対パスで渡す（llvm-rc は / で始まる引数をオプションとして読むので、Unix の絶対パスを入力に渡せない）
+    cmd.current_dir(&out);
+    if is_llvm_rc {
+        // 雛形はプリプロセッサを使わない。clang を探しに行かせない
+        cmd.arg("/no-preprocess");
+    }
+    cmd.args(["/fo", "veil.res", "veil.rc"]);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", compiler.display()))?;
+    if !output.status.success() || !res_file.is_file() {
+        return Err(format!(
+            "{} failed ({}): {}",
+            compiler.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(res_file)
+}
+
+/// `VERSIONINFO` の `FILEVERSION` は 16 ビットの数 4 つ。`0.11.0-rc.1` は `0,11,0,0`（プレリリースの部分は落とす）。
+fn rc_version_comma(version: &str) -> String {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let mut parts: Vec<u16> = core.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    parts.resize(4, 0);
+    parts
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// リソースコンパイラを探す: `RC_<target>`・`RC` の環境変数 → PATH の `llvm-rc`（`llvm-rc-<版>`・Linux の
+/// `/usr/lib/llvm-<版>/bin` を含む。cargo-xwin のクロスビルド）→ PATH の `rc.exe` → Windows SDK の `rc.exe`
+/// （MSVC のホストで開発者用のプロンプトの外から cargo を呼んだとき）。後の 2 つは Windows のホストだけ。
+fn find_resource_compiler() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    for var in [format!("RC_{}", target.replace('-', "_")), "RC".to_string()] {
+        println!("cargo:rerun-if-env-changed={var}");
+        if let Some(v) = std::env::var_os(&var).filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(v));
+        }
+    }
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let in_path = |name: &str| {
+        path.iter()
+            .map(|d| d.join(format!("{name}{exe}")))
+            .find(|p| p.is_file())
+    };
+    if let Some(p) = in_path("llvm-rc") {
+        return Some(p);
+    }
+    for v in (13..=40).rev() {
+        if let Some(p) = in_path(&format!("llvm-rc-{v}")) {
+            return Some(p);
+        }
+        let p = PathBuf::from(format!("/usr/lib/llvm-{v}/bin/llvm-rc"));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Windows のホストだけ（Linux の PATH の rc は別物のシェルのことがある）
+    if !cfg!(windows) {
+        return None;
+    }
+    in_path("rc").or_else(windows_sdk_rc)
+}
+
+/// `%ProgramFiles(x86)%\Windows Kits\10\bin\<版>\<ホストのアーキ>\rc.exe` の最も新しい版。
+fn windows_sdk_rc() -> Option<std::path::PathBuf> {
+    let host_arch = match std::env::var("HOST").unwrap_or_default().split('-').next() {
+        Some("aarch64") => "arm64",
+        Some("i686") => "x86",
+        _ => "x64",
+    };
+    let base = std::path::PathBuf::from(std::env::var_os("ProgramFiles(x86)")?)
+        .join("Windows Kits")
+        .join("10")
+        .join("bin");
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(host_arch).join("rc.exe"))
+        .filter(|p| p.is_file())
+        .collect();
+    // 版のディレクトリ名（10.0.22621.0 など）は桁数が揃っているので、文字列の順で最も新しいものが最後になる
+    found.sort();
+    found.pop()
 }
 
 /// F-247: ソースからビルドするパッケージ（BSD の ports）が `VEIL_DEFAULT_CONFIG_PATH` で既定の設定ファイルの

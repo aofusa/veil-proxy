@@ -6,6 +6,7 @@
   - %ProgramData%\veil\config.toml: 既定の設定（render-defaults.sh の winget）。上げても消しても残す
     （NeverOverwrite・Permanent）。veil は Windows の既定のパスとしてこれを読む（F-247）
   - %ProgramData%\veil\www\: 既定のページ（上げたときは新しいものに替える）
+  - 「インストールされているアプリ」・winget の一覧のアイコン（ARPPRODUCTICON。packaging/icons/veil.ico。F-290）
   - %ProgramData%\veil の ACL は Administrators・SYSTEM が書き込み、Users は読み取りだけ
     （%ProgramData% の既定では Users が新しいファイルを作れるので、設定を書き換えられないように絞る）
   UpgradeCode は版をまたいで変えない（MajorUpgrade で前の版を消して入れ直す）。
@@ -19,6 +20,8 @@
     <MediaTemplate EmbedCab="yes" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/aofusa/veil-proxy" />
     <Property Id="ARPHELPLINK" Value="https://github.com/aofusa/veil-proxy/blob/main/docs/guide/running.md" />
+    <Icon Id="veil.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="veil.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLDIR" Name="veil">
@@ -54,6 +57,9 @@
           <Component Id="VeilQuickstartHtml">
             <File Id="QuickstartHtml" Source="$(var.DefaultsDir)\www\quickstart.html" KeyPath="yes" />
           </Component>
+          <Component Id="VeilFaviconIco">
+            <File Id="FaviconIco" Source="$(var.DefaultsDir)\www\favicon.ico" KeyPath="yes" />
+          </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -66,6 +72,7 @@
       <ComponentRef Id="VeilConfig" />
       <ComponentRef Id="VeilIndexHtml" />
       <ComponentRef Id="VeilQuickstartHtml" />
+      <ComponentRef Id="VeilFaviconIco" />
     </Feature>
   </Package>
 </Wix>

@@ -47,6 +47,8 @@ fi
 %dir /etc/veil
 %config(noreplace) %attr(0640,root,veil) /etc/veil/config.toml
 /usr/lib/systemd/system/veil.service
+/usr/share/icons/hicolor/*/apps/veil.png
+/usr/share/metainfo/io.github.aofusa.veil.metainfo.xml
 %doc /usr/share/doc/veil/copyright
 
 %changelog

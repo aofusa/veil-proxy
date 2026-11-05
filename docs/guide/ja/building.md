@@ -126,6 +126,35 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 
 
 
+### アプリケーションのアイコンと版の情報
+
+ロゴ（[docs/images/veil_logo.webp](../../images/veil_logo.webp)）は、各プラットフォームがアイコンを探す場所に入れています。
+
+| 配布物 | 入っているもの |
+|---|---|
+| Windows の `veil.exe`（`*-pc-windows-msvc`） | PE のリソースとしてアイコンと版の情報（製品名・版・説明）。エクスプローラ・ファイルのプロパティ・タスクマネージャに出ます |
+| Windows の MSI（winget） | 「インストールされているアプリ」の一覧のアイコン |
+| deb・rpm、BSD の ports | ソフトウェアセンター向けの `share/icons/hicolor/<大きさ>/apps/veil.png` と AppStream のメタデータ（`share/metainfo/io.github.aofusa.veil.metainfo.xml`） |
+| コンテナイメージ・Helm チャート | ラベル `io.artifacthub.package.logo-url` とチャートの `icon`（Artifact Hub） |
+| docs.rs・既定のページ | rustdoc のロゴと favicon、既定のページの隣の `favicon.ico` |
+
+ELF・Mach-O のコマンドラインのプログラムにはアイコンを置く標準の場所が無いので、Linux・BSD・macOS のバイナリと
+リリースのアーカイブ（tar.gz・zip）にはアイコンを入れていません。
+
+Windows の target では、`build.rs` が [packaging/windows/veil.rc](../../../packaging/windows/veil.rc) をリソースコンパイラで
+コンパイルし、`veil` のバイナリだけにリンクします（veil をライブラリとして使うプログラムには付きません）。リソースコンパイラは
+`RC_<target>`・`RC` の環境変数、`llvm-rc`（`llvm-rc-<版>` も。cargo-xwin のクロスビルドが使う）、Windows のホストでは
+`PATH` か Windows SDK の `rc.exe` の順に探します。見つからなければ警告を出してアイコン無しでビルドを続けます。
+`VEIL_REQUIRE_WIN_RESOURCES=1` でエラーにできます（[docker/Dockerfile.windows](../../../docker/Dockerfile.windows) はそうしています）。
+
+[packaging/icons/](../../../packaging/icons/) のアイコンはロゴから作ってコミットしたものです（veil のビルドに画像の道具は要りません）。
+ロゴを差し替えたら ImageMagick で作り直してコミットします。CI が確認を回します。
+
+```bash
+tools/release/render-icons.sh            # ImageMagick（magick か convert。WebP を読めること）が要る
+tools/release/render-icons.sh --check    # アイコンが今のロゴから作られているか・AppStream のファイルが正しいか
+```
+
 ### ライブラリ成果物（Rust ソース・C ライブラリ・Python wheel）
 
 API サーバライブラリ（[library.md](library.md)）は `veil` バイナリとは別に、`packaging/output/lib/` に 1 個の zip で出す:

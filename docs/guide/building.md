@@ -118,6 +118,38 @@ See [packaging/README.md](../../packaging/README.md) for details (Docker build, 
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
 
+### Application icon and version information
+
+The logo ([docs/images/veil_logo.webp](../images/veil_logo.webp)) is shipped where each platform looks for it:
+
+| Artifact | What it carries |
+|---|---|
+| Windows `veil.exe` (`*-pc-windows-msvc`) | Icon and version information (product name, version, description) as PE resources, shown by Explorer, the file's Properties and Task Manager |
+| Windows MSI (winget) | The icon of the entry in *Installed apps* |
+| deb / rpm, BSD ports | `share/icons/hicolor/<size>/apps/veil.png` and AppStream metadata (`share/metainfo/io.github.aofusa.veil.metainfo.xml`) for software centers |
+| Container image, Helm chart | `io.artifacthub.package.logo-url` label and the chart's `icon` (Artifact Hub) |
+| docs.rs, default pages | The rustdoc logo and favicon; `favicon.ico` next to the default pages |
+
+ELF and Mach-O command-line programs have no standard place for an icon, so the Linux, BSD and macOS binaries
+and the release archives (tar.gz, zip) carry none.
+
+On Windows targets, `build.rs` compiles [packaging/windows/veil.rc](../../packaging/windows/veil.rc) with a resource
+compiler and links it into the `veil` binary only (programs that use veil as a library get nothing). It looks for
+the compiler in this order: the `RC_<target>` or `RC` environment variable, `llvm-rc` (also `llvm-rc-<version>`,
+used by cross builds with cargo-xwin), then — on a Windows host — `rc.exe` in `PATH` or in the Windows SDK. When
+none is found the build continues with a warning and the executable has no icon; set
+`VEIL_REQUIRE_WIN_RESOURCES=1` to make that an error ([docker/Dockerfile.windows](../../docker/Dockerfile.windows)
+does).
+
+The icons in [packaging/icons/](../../packaging/icons/) are generated from the logo and committed (no image tools
+are needed to build veil). After replacing the logo, regenerate them with ImageMagick and commit the result;
+CI runs the check:
+
+```bash
+tools/release/render-icons.sh            # needs ImageMagick (magick or convert) with WebP support
+tools/release/render-icons.sh --check    # the logo is the one the icons were made from; validates the AppStream file
+```
+
 ### Library artifacts (Rust source, C library, Python wheel)
 
 The API server library ([library.md](library.md)) is packaged separately from the `veil` binaries, as a

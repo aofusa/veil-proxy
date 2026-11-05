@@ -41,7 +41,13 @@ CONF_FILES=	${EGDIR}/config.toml ${PKG_SYSCONFDIR}/config.toml
 RCD_SCRIPTS=	veil
 PKG_USERS=	veil:veil
 PKG_GROUPS=	veil
-INSTALLATION_DIRS=	bin ${EGDIR} share/veil/www
+INSTALLATION_DIRS=	bin ${EGDIR} share/veil/www share/metainfo
+# hicolor icons and AppStream metadata for software centers (packaging/icons)
+VEIL_ICON_SIZES=	16 32 48 64 128 256 512
+.for s in ${VEIL_ICON_SIZES}
+INSTALLATION_DIRS+=	share/icons/hicolor/${s}x${s}/apps
+.endfor
+ICON_THEMES=	yes
 
 post-build:
 	${PREFIX}/bin/bash ${WRKSRC}/tools/release/render-defaults.sh ports-netbsd \
@@ -51,7 +57,12 @@ do-install:
 	${INSTALL_PROGRAM} ${WRKSRC}/target/release/veil ${DESTDIR}${PREFIX}/bin/veil
 	${INSTALL_DATA} ${WRKDIR}/defaults/config.toml ${DESTDIR}${EGDIR}/config.toml
 	${INSTALL_DATA} ${WRKDIR}/defaults/www/index.html ${WRKDIR}/defaults/www/quickstart.html \
-		${DESTDIR}${PREFIX}/share/veil/www/
+		${WRKDIR}/defaults/www/favicon.ico ${DESTDIR}${PREFIX}/share/veil/www/
+.for s in ${VEIL_ICON_SIZES}
+	${INSTALL_DATA} ${WRKSRC}/packaging/icons/hicolor/${s}x${s}/apps/veil.png \
+		${DESTDIR}${PREFIX}/share/icons/hicolor/${s}x${s}/apps/
+.endfor
+	${INSTALL_DATA} ${WRKSRC}/packaging/icons/io.github.aofusa.veil.metainfo.xml ${DESTDIR}${PREFIX}/share/metainfo/
 
 .include "cargo-depends.mk"
 

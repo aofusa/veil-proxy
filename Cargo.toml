@@ -73,6 +73,9 @@ include = [
     "/LICENSE*",
     # F-264: ライブラリの /docs が同梱する Swagger UI（openapi-ui-embedded）
     "/third_party/swagger-ui-dist/**",
+    # F-290: build.rs が Windows の veil.exe に埋め込むアイコンと版の情報の雛形
+    "/packaging/windows/veil.rc",
+    "/packaging/icons/veil.ico",
 ]
 build = "build.rs"
 

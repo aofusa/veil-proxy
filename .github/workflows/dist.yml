@@ -201,6 +201,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/pe"
           for z in packaging/output/*.zip; do unzip -q -o "$z" -d "$RUNNER_TEMP/pe"; done
           python3 tools/release/check-pe-imports.py "$RUNNER_TEMP"/pe/*/veil.exe
+      # F-290: veil.exe にアイコンと版の情報のリソースがある（build.rs が埋め込む）
+      - name: icon and version information in veil.exe
+        if: matrix.target == 'windows'
+        run: python3 tools/release/check-pe-resources.py "$RUNNER_TEMP"/pe/*/veil.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
@@ -310,6 +314,17 @@ jobs:
           n="veil-$v-${{ matrix.arch }}-pc-windows-msvc"
           mkdir -p x && (cd x && unzip -q "../dist/$n.zip")
           tools/release/binary-smoke.sh "x/$n" "$v"
+      # F-290: veil.exe の版の情報をエクスプローラのプロパティと同じ API で読む（アイコンの有無は cross の job が
+      # check-pe-resources.py で確かめる）
+      - name: version information in veil.exe
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $exe = (Resolve-Path "x/veil-$v-${{ matrix.arch }}-pc-windows-msvc/veil.exe").Path
+          $vi = (Get-Item $exe).VersionInfo
+          $vi | Format-List ProductName, ProductVersion, FileVersion, FileDescription, CompanyName
+          if ($vi.ProductName -ne 'veil' -or $vi.ProductVersion -ne $v) { Write-Output "::error title=Windows::veil.exe has no version information (ProductName '$($vi.ProductName)', ProductVersion '$($vi.ProductVersion)')"; exit 1 }
+          Write-Output "ok veil.exe has its version information ($($vi.ProductVersion))"
       # B-167: runner には Visual C++ 再頒布パッケージが入っているので、それが無い Windows（Nano Server のコンテナ）でも起動する
       - name: run on a Windows without the Visual C++ runtime (Nano Server)
         if: matrix.arch == 'x86_64'
