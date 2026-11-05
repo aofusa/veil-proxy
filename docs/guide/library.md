@@ -1216,7 +1216,44 @@ interoperability checks as the Rust gRPC example).
 - WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` picks a subprotocol, checks `Origin`
   (403) and sets the message size limit and automatic pong; `veil_ws_protocol(ws, &len)` returns the chosen one.
 
-Cookies, sessions, authentication (Basic, API keys, JWT), redirects, files and app tasks for C are in the separate
+**Outgoing calls, deferred responses, validation and tests.** Also in `libveil`:
+
+- HTTP client: `veil_client_new(&veil_client_options_t)` (timeouts, HTTP/2, CA / client certificate, user agent,
+  response size limit, Unix sockets) and `veil_client_send(c, &veil_client_request_t, &resp)` (waits), or
+  `veil_client_send_async(c, &req, done, ud)` (`done(rc, resp, ud)` runs on the handler pool). Responses:
+  `veil_client_response_status / header / header_count / header_at / body / free`. Errors are `VEIL_ERR_TIMEOUT`
+  and `VEIL_ERR_CLIENT`; any status code is a successful call.
+- gRPC client: `veil_grpc_channel_new(url, &veil_grpc_channel_options_t)` (h2c or TLS with ALPN h2, gzip, message
+  size, default deadline). `veil_grpc_channel_unary(ch, path, msg, len, &veil_grpc_call_options_t, &call)` and
+  `veil_grpc_channel_unary_async`, or `veil_grpc_channel_call` for every kind of method with
+  `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free`. Messages
+  are encoded bytes, as on the server side.
+- Calls run on a veil thread shared with the Python bindings, never on a worker. The waiting forms (`veil_client_send`,
+  `veil_grpc_channel_unary`, `veil_grpc_client_recv`, `veil_grpc_client_finish`) are for handlers on the handler pool,
+  setup functions and your own threads; on a worker (`VEIL_ROUTE_INLINE` routes, worker-start functions) they return
+  `VEIL_ERR_STATE`. Use the `_async` forms there.
+- Deferred responses: `veil_deferred_t *d = veil_response_defer(resp)` lets the handler return at once and frees the
+  pool thread. Build the response on `veil_deferred_response(d)` with the usual setters, from any thread (for example
+  from the `done` callback of an asynchronous call), then call `veil_deferred_complete(d)` (`VEIL_ERR_CLOSED` when the
+  client left). `veil_deferred_free(d)` answers 500 instead. Not on `VEIL_ROUTE_INLINE` routes. Middleware "after"
+  steps do not run on a deferred response.
+- JSON body validation: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` with
+  `body_schema_json` (a JSON Schema). A body that is not JSON or does not match is answered with 422 and
+  `{"detail": [{"type", "loc", "msg"}]}` (the format of Rust's `Validate` and FastAPI; `loc` starts with `"body"`)
+  before the handler runs, and the schema becomes the route's `requestBody` in OpenAPI. Supported keywords: `type`
+  (also `null` and lists of types), `properties`, `required`, `additionalProperties`, `items`, `minItems`,
+  `maxItems`, `minLength`, `maxLength`, `pattern`, `enum`, `const`, `minimum`, `maximum`, `exclusiveMinimum`,
+  `exclusiveMaximum`, `multipleOf`, `format` (`email`, `uri`), `nullable`, `allOf`, `anyOf`, `oneOf`, `not`;
+  annotations are ignored. `$ref` and other keywords are rejected when the route is registered (inline referenced
+  schemas). The schema is compiled once at registration.
+- In-process tests: `veil_test_t *t = veil_test_new(cfg)` builds the app (setup functions run, no socket is opened)
+  and `veil_test_request(t, &veil_test_request_t, &resp)` calls it with the same routing (404 / 405), middleware,
+  plugins (CORS, sessions), validation and handler pool as the server, collecting streamed bodies.
+  `veil_test_response_status / header / header_count / header_at / body / trailer / free`; `veil_test_free` runs the
+  shutdown functions. Rust has the same through `App::into_test_client()`.
+
+Cookies, sessions, authentication (Basic, API keys, JWT), redirects, files, app tasks, dependency injection, client
+helpers, a balanced gRPC channel, GraphQL and a test client with a cookie jar for C are in the separate
 library `libveil_kit` (a superset of `libveil`; link one of the two): see
 [Helper crate, C](library-kit.md#c-libveil_kit). Example: [examples/api/c-kit/](../../examples/api/c-kit/).
 
@@ -1338,8 +1375,10 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 
 builds the selected kinds (`all` is the default; `--docker` runs the build in a container using
 `docker/Dockerfile.lib`) and writes a single archive `veil-lib-<version>-<arch>-linux-gnu.zip` to
-`packaging/output/lib/`. It contains `libveil.so`/`libveil.a` with `veil.h` (C), the Python wheel, and the
-Rust source/usage notes. See [Building](building.md) for the proxy packages.
+`packaging/output/lib/`. It contains `libveil.so`/`libveil.a` with `veil.h` and the helpers kit
+`libveil_kit.so`/`libveil_kit.a` with `veil_kit.h` (C; pkg-config files `veil.pc` and `veil-kit.pc`, and a CMake
+package: `find_package(veil CONFIG)` gives `veil::veil` and `veil::kit`, plus `veil::veil_static` and
+`veil::kit_static`), the Python wheel, and the Rust source/usage notes. Link one of `veil` and `veil-kit`. See [Building](building.md) for the proxy packages.
 
 ## Performance
 
@@ -1445,7 +1484,7 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|c-kit|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them

@@ -1,7 +1,9 @@
 # veil-capi-helpers — C の helpers kit `libveil_kit`（F-291）
 
 Rust の [`veil-proxy-kit`](../veil-kit/)・Python の `veil-api-kit` と同じ補助（Cookie・署名付き/暗号化 Cookie・セッション・
-Basic / API キー / JWT の認証・主体と scope の検査・リダイレクト・ファイル・定期タスクと cron）を C から使うためのライブラリです。
+Basic / API キー / JWT の認証・主体と scope の検査・リダイレクト・ファイル・定期タスクと cron・依存性注入・HTTP クライアントの
+JSON と再試行・gRPC の Balanced・GraphQL のトランスポート・Cookie を覚える試験のクライアント・ヘッダだけの JSON の書き出し）を
+C から使うためのライブラリです。
 ヘッダは [include/veil_kit.h](include/veil_kit.h)（`veil.h` を include する）。関数の接頭辞は `veil_kit_`。
 
 `libveil_kit` は [`libveil`](../veil-capi/README.md) の C API を全部含む上位集合です。プログラムは **どちらか 1 つ** とリンクします
@@ -40,10 +42,17 @@ Cookie の署名と HS256 のトークンを Python の標準ライブラリだ�
 
 エラーコードは `libveil` と同じ（理由は `veil_last_error()`）。加えて `VEIL_KIT_ERR_TOKEN`（-20）はトークンが不正なとき。
 
-## まだ無いもの
+| 依存性注入（`veil_kit_di_*`） | 鍵は文字列、値は `void *` と解放関数。singleton と値はコンテナと同じだけ生き、scoped・transient は要求の終わりに解放。工場は他の鍵を取り出してよい（循環は誤り）。 |
+| クライアント・`Balanced` | 待つ形はワーカーでは `VEIL_ERR_STATE`、`_async` はハンドラ用プールで呼び返す（コアの `veil_client_*`・`veil_grpc_*` と同じ）。 |
+| GraphQL（`veil_kit_graphql`） | 実行器は C のコールバック（ハンドラ用プール）。サブスクリプションは `upgrade` で WebSocket を C のハンドラへ回す。 |
 
-HTTP・gRPC のクライアント、遅延応答、JSON の本文の検査（422）、プロセス内の試験呼び出し、依存性注入、gRPC の `Balanced`、
-GraphQL、配布物（zip・pkg-config・CMake）は後の版で扱います。
+加えて `VEIL_KIT_ERR_STATUS`（-21。2xx でない）・`VEIL_KIT_ERR_JSON`（-22。本文が JSON でない）はクライアントの補助で、
+応答は `*out` に残ります。
+
+## 配布
+
+`packaging/scripts/build-lib.sh` のアーカイブ（`c/`）に `libveil` と並べて `libveil_kit.{so,a}`・`veil_kit.h`・pkg-config の
+`veil-kit.pc`（`Requires: veil` にしない）・CMake のパッケージ（`find_package(veil CONFIG)` の `veil::kit`・`veil::kit_static`）を入れます。
 
 ## テスト
 

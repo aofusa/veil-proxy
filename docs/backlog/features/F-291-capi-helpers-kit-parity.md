@@ -1,6 +1,6 @@
 # F-291: C 向けの kit `veil-capi-helpers` を作り、C からも Rust・Python と同じ機能を使えるようにする
 
-**状態: 一部実装**
+**状態: 完了（v0.11.0）**
 
 調査の全文（機能 × 層の対応表・FFI の ABI 案・モジュールごとの API 案）は `docs/artifacts/v0110/survey-03-capi-helpers.md`（git 管理外）。
 
@@ -96,7 +96,7 @@ Python と同じ 2 層にする。**プロキシ本体には触れない**（追
 
 ## 実装
 
-分割の 1〜3 と 5 の tasks を実装した（4・6 と 5 の残りは下の「残り」）。
+分割の 1〜6 を実装した（第 1 弾は分割 1〜3 と 5 の tasks、第 2 弾は分割 4・5 の残り・6）。
 
 - **クレート分割（分割 2）**: `veil-capi` の中身を rlib の `crates/veil-capi-core`（lib 名 `veil_capi`）へ移した（git mv）。`veil-capi`
   （lib 名 `veil`、cdylib + staticlib）は `pub use veil_capi::*;` だけ。新規 `crates/veil-capi-helpers`（lib 名 `veil_kit`、cdylib + staticlib）は
@@ -126,12 +126,52 @@ Python と同じ 2 層にする。**プロキシ本体には触れない**（追
   C のライブラリは Linux では元から epoll（reactor）でビルドされるので、c-kit は epoll の経路で動いている。
 - 文書: `library-kit.md`・`library.md`（英日）に C の節、`crates/veil-capi/README.md`、新規 `crates/veil-capi-helpers/README.md`。設定キーは増やしていない。
 
-### 残り（後続のチケットで扱う）
+### 第 2 弾（分割 4〜6）
 
-- コア FFI 第 2 弾（分割 4）: HTTP クライアント・gRPC チャネル・遅延応答（`veil_response_defer`）・JSON 本文の検証（422）・試験用呼び出し（`veil_test_*`）。
-- helpers 第 2 弾の残り: di・client の JSON/retry・grpc `Balanced`・graphql、ヘッダだけの JSON 書き出し器。
-- 配布（分割 6）: `build-lib.sh`・`assemble-lib-zip.sh`・`docker/Dockerfile.lib`・pkg-config・CMake・`bindings.yml`。
-- `library_e2e.sh c-kit` の macOS・Windows（MSVC の手順が無いので Windows は飛ばす）・BSD での実行。
+- **外向きの呼び出しの共通化**: Python の gRPC クライアントの仕組み（専用スレッドで `veil::runtime::block_on`、キューと
+  `WakeFlag`、結果は Mutex+Condvar かハンドラ用プールでの関数）を `src/api/client_thread.rs`（`start`・`spawn`・`run_blocking`・
+  `run_then`・`on_event_loop`）と `src/api/grpc/client_call.rs`（`BlockingCall`。B-203 の取消しの規則のまま）へ移し、
+  `crates/veil-python/src/grpc_client.rs` はその上の写しだけにした（Python の API は変えていない）。
+- **コア FFI 第 2 弾（分割 4、`crates/veil-capi-core/src/{client,deferred,validate}.rs`）**:
+  - HTTP クライアント `veil_client_new / free / send / send_async`・`veil_client_response_*`（`veil_client_options_t`・
+    `veil_client_request_t`）。gRPC のチャネル `veil_grpc_channel_new / free / call / unary / unary_async` と
+    `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free`。待つ形はワーカー
+    （INLINE・ワーカー開始）で `VEIL_ERR_STATE`（`has_driver()` で判定）、`_async` の完了はハンドラ用プール。誤りは新しい
+    `VEIL_ERR_CLIENT`（-9）・`VEIL_ERR_TIMEOUT`（-10）。
+  - 遅延応答 `veil_response_defer`・`veil_deferred_response / complete / is_closed / free`（`HandlerContext::defer` →
+    `bridge::Deferred`。捨てたら 500）。
+  - JSON 本文の検証 `veil_register_route_ex2`（`veil_route_options_t.body_schema_json`）。JSON Schema の部分集合を登録時に
+    コンパイル（`pattern` は `regex`）し、要求ごとは木をたどって `ValidationErrors` の 422（`loc` は `"body"` から）。`$ref`・
+    未対応のキーワードは登録時に拒否（黙って飛ばさない）。スキーマは OpenAPI の `requestBody` にも載る。Python の
+    `body_constraints` とは共用しなかった（Python は pydantic の型から検査するので、スキーマの解釈器は要らない）。
+  - 試験 `veil_test_new / request / free`・`veil_test_response_*`。`veil_run` と同じ `App` を組む `build_app` に分け、
+    `App::into_test_client()`（`src/api/testing.rs` の `TestClient`。サーバと同じ規則でルートを選び、ストリーミングの本文は
+    集める）でソケットを開かずに呼ぶ。
+- **helpers 第 2 弾の残り（分割 5）**: `veil_kit_di_*`（文字列の鍵、singleton・scoped（要求の locals）・transient、override、
+  循環の検出）、`veil_kit_client_get_json / post_json / send_retry / send_retry_async`（retry は Rust の kit の `client::retry`）、
+  `veil_kit_grpc_balanced_*`（Rust の kit の `Balanced` と同じ規則をコアの `BlockingCall` で組んだ。C のメッセージはバイト列なので
+  prost の Codec は使わない）、`veil_kit_graphql`（トランスポートだけ。実行器は C のコールバック。POST は JSON だけ・バッチ、GET の
+  mutation は字句解析で判定して 405、Accept の切り替え、SSE、GraphiQL）、`veil_kit_test_*`（Cookie の入れ物と既定のヘッダ）、
+  ヘッダだけの JSON の書き出し器 `veil_kit_jw_*`。
+  - C では同じにできないものと代わり: GraphQL のサブスクリプションは実行器から結果の列を受ける口が要るので、`upgrade` の
+    選択肢で WebSocket のアップグレードを C のハンドラへ回し、`veil_ws_accept_ex` で `graphql-transport-ws` を受ける（文書に記した）。
+    DI は型の代わりに文字列の鍵と `void *`。
+- **配布（分割 6）**: `build-lib.sh`・`docker/Dockerfile.lib` は `-p veil-capi -p veil-capi-helpers` をビルドし、
+  `assemble-lib-zip.sh` は `c/` に `libveil_kit.{so,a}`・`veil_kit.h`・`veil-kit.pc`（`Requires: veil` にしない）・CMake の
+  `lib/cmake/veil/veil-config.cmake`（`veil::veil`・`veil::kit`・`veil::veil_static`・`veil::kit_static`）と `-version.cmake`・
+  `examples/c-kit` を入れる。`bindings.yml` は Linux・macOS・Windows で `library_e2e.sh c-kit` を回す（Windows は下の残り）。
+  `verify-tag.sh` は `veil-capi-core`・`veil-capi-helpers` の版の継承も確かめる。
+- 試験: 単体（veil-capi-core 17 件・veil-capi-helpers 16 件。JSON Schema・DI の寿命と循環・Balanced の回転・GraphQL の操作の判定・
+  Cookie の入れ物など）、`examples/api/c-kit` に自分自身への HTTP・gRPC 呼び出し・遅延応答（非同期の完了・別スレッド）・
+  422・DI・GraphQL・Balanced（1 台目は落ちている）と `kit --selftest`（`veil_test_*`・`veil_kit_test_*`）を足して
+  `library_e2e.sh c-kit` で確かめる。`nonregression` はプロキシのバイナリに `veil_client_`・`veil_test_`・`veil_deferred_`・
+  `veil_grpc_channel_`・`veil::api::testing` 等が無いことも見る。
+
+### 残り
+
+- `library_e2e.sh c-kit` の Windows（MSVC）: サンプルが pthread・C11 の atomics を使い、MSVC のビルド手順が無いので飛ばす
+  （ライブラリ自体は Windows でもビルドされ、`cargo test` の単体テストは通る想定。CI の `bindings.yml` で macOS は回る）。
+  macOS・BSD での `c-kit` はこの端末では回していない。
 
 ## 関連
 

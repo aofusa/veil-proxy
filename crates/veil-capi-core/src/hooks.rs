@@ -48,7 +48,11 @@ pub(crate) unsafe fn read_sized<T: Copy>(p: *const T, what: &str) -> Result<T, c
 }
 
 /// Reads `n` C strings from a `const char *const *` (NULL is allowed when `n` is 0).
-unsafe fn str_array(p: *const *const c_char, n: usize, what: &str) -> Result<Vec<String>, c_int> {
+pub(crate) unsafe fn str_array(
+    p: *const *const c_char,
+    n: usize,
+    what: &str,
+) -> Result<Vec<String>, c_int> {
     if n == 0 {
         return Ok(Vec::new());
     }

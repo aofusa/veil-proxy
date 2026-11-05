@@ -29,6 +29,8 @@ pub mod app;
 pub mod bridge;
 // F-267
 pub mod client;
+// F-291: ランタイムを持たないスレッドから使う外向きの呼び出しの専用スレッド（C・Python）
+pub mod client_thread;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod extract;
@@ -41,6 +43,8 @@ pub mod response;
 pub(crate) mod routes;
 pub mod schema;
 pub mod stream;
+// F-291: ソケットを開かずにルートを呼ぶ（C の veil_test_*）
+pub mod testing;
 // F-261
 pub mod upgrade;
 // F-262

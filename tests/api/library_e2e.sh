@@ -1386,7 +1386,7 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
     local decl_core decl_kit missing
     decl_core=$(grep -o -E '\bveil_[a-z0-9_]+\(' "$ROOT/crates/veil-capi/include/veil.h" | tr -d '(' | sort -u)
     decl_kit=$(grep -v 'static inline' "$ROOT/crates/veil-capi-helpers/include/veil_kit.h" \
-      | grep -o -E '\bveil_kit_[a-z0-9_]+\(' | tr -d '(' | grep -v '^veil_kit_register_all$' | sort -u)
+      | grep -o -E '\bveil_kit_[a-z0-9_]+\(' | tr -d '(' | grep -v -E '^veil_kit_(register_all|jw_[a-z_]+)$' | sort -u)
     nm -D --defined-only "$ROOT/target/release/libveil.so" | awk '{print $3}' | sort -u > "$TMPD/syms-veil"
     nm -D --defined-only "$ROOT/target/release/libveil_kit.so" | awk '{print $3}' | sort -u > "$TMPD/syms-kit"
     missing=$(comm -23 <(echo "$decl_core") "$TMPD/syms-veil" | tr '\n' ' ')
@@ -1491,6 +1491,41 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
   expect "C ws subprotocol" "101 chat protocol=chat" "${KI[@]}" ws "$P" /ws "foo, chat" https://app.example.com
   expect "C ws no common subprotocol" "101 - protocol=none" "${KI[@]}" ws "$P" /ws foo https://app.example.com
   expect "C ws origin rejected" "403" "${KI[@]}" ws "$P" /ws chat https://evil.example
+  # HTTP クライアント（自分自身へ）・遅延応答・ワーカーでの同期呼び出しの拒否
+  expect "C client sync" "200 hello" curl -s "$B/client/sync"
+  expect "C client refuses blocking on a worker" "state" curl -s "$B/client/inline"
+  expect "C kit client get_json" 'ok=0 notjson=1 body={"items":[1,2,3]}' curl -s "$B/client/json"
+  expect "C kit client retry (503, 503, 200)" "200 recovered" curl -s "$B/client/retry"
+  expect "C client async + deferred response" "x-deferred: 1|200 hello" bash -c \
+    "curl -s -i '$B/client/async' | tr -d '\r' | grep -iE '^x-deferred:|^200 ' | tr A-Z a-z | paste -sd'|'"
+  expect "C deferred response from a thread" "later" curl -s "$B/deferred"
+  # JSON 本文の検証（422）と OpenAPI の requestBody
+  expect "C body schema 422" '422 {"detail":[' bash -c "curl -s -w '%{http_code} ' -o '$W/422' -X POST --data '{\"name\":\"\",\"extra\":1}' '$B/users'; cat '$W/422'"
+  expect "C body schema error kinds" "extra_forbidden missing too_short" bash -c \
+    "$PY3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]))[\"detail\"]; print(\" \".join(sorted(e[\"type\"] for e in d)))' '$W/422'"
+  expect "C body schema invalid JSON" "json_invalid" curl -s -X POST --data '{bad' "$B/users"
+  expect "C body schema valid" '201 {"name":"ann","age":3}' bash -c "curl -s -w '%{http_code} ' -o '$W/201' -X POST --data '{\"name\":\"ann\",\"age\":3}' '$B/users'; cat '$W/201'"
+  expect "C body schema in OpenAPI" '"required":["name","age"]' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/users\"][\"post\"][\"requestBody\"][\"content\"][\"application/json\"][\"schema\"], separators=(\",\",\":\")))'"
+  # gRPC のチャネル（自分の gRPC サービスへ）と Balanced（1 台目は落ちている）
+  expect "C gRPC channel unary" "code=0 msg=ping trailer=yes" curl -s "$B/grpc/unary"
+  expect "C kit gRPC balanced failover" "code=0 msg=lb trailer=yes" curl -s "$B/grpc/balanced"
+  # DI と JSON の書き出し器
+  expect "C kit DI + JSON writer" '{"config":42,"scoped_same":true,"transient_same":false,"note":"a \"quoted\"\n line"}' curl -s "$B/di"
+  # GraphQL のトランスポート
+  expect "C kit GraphQL POST" '{"data":{"hello":"world"}}' curl -s -H 'content-type: application/json' --data '{"query":"{ hello }"}' "$B/graphql"
+  expect "C kit GraphQL GET" '{"data":{"hello":"world"}}' curl -s -G --data-urlencode 'query={ hello }' "$B/graphql"
+  expect "C kit GraphQL GET mutation is 405" "405" curl -s -o /dev/null -w '%{http_code}' -G --data-urlencode 'query=mutation { bump }' "$B/graphql"
+  expect "C kit GraphQL POST mutation" '{"data":{"bump":1}}' curl -s -H 'content-type: application/json' --data '{"query":"mutation { bump }"}' "$B/graphql"
+  expect "C kit GraphQL non-JSON is 415" "415" curl -s -o /dev/null -w '%{http_code}' -H 'content-type: text/plain' --data '{"query":"{ hello }"}' "$B/graphql"
+  expect "C kit GraphQL batch" '[{"data":{"hello":"world"}},{"data":{"bump":2}}]' curl -s -H 'content-type: application/json' \
+    --data '[{"query":"{ hello }"},{"query":"mutation { bump }"}]' "$B/graphql"
+  expect "C kit GraphQL response type" "application/graphql-response+json" curl -s -o /dev/null -w '%{content_type}' \
+    -H 'accept: application/graphql-response+json' -H 'content-type: application/json' --data '{"query":"{ hello }"}' "$B/graphql"
+  expect "C kit GraphQL over SSE" 'event: next|data: {"data":{"hello":"world"}}|event: complete' bash -c \
+    "curl -s -H 'accept: text/event-stream' -H 'content-type: application/json' --data '{\"query\":\"{ hello }\"}' '$B/graphql' | grep -v '^\$' | paste -sd'|'"
+  expect "C kit GraphiQL" "GraphiQL.createFetcher" curl -s -H 'accept: text/html' "$B/graphql"
+  # ソケットを開かない試験（veil_test_*・veil_kit_test_*）
+  expect "C in-process tests (veil_test_*, veil_kit_test_*)" "selftest ok" "$CK/kit$EXE" --selftest
   # 応答の後の処理・定期タスク・cron・起動とワーカー開始のフック
   for _ in 1 2 3; do curl -s -X POST "$B/tasks/enqueue" >/dev/null; done
   sleep 2.5
@@ -1539,7 +1574,7 @@ run_nonregression() {
   n=$(grep -cE "veil::api::client|veil::api::grpc::channel|veil_kit::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::api::client / veil_kit in the full binary" || bad "client or kit symbols found ($n)"
   # F-291: C の helpers kit（veil_kit_*）とコアに足した C API（ミドルウェア・CORS 等）も入らない
-  n=$(grep -cE "veil_kit_|veil_register_middleware|veil_config_cors|veil_config_serve_dir|veil_request_set_local" "$SYMS") || true
+  n=$(grep -cE "veil_kit_|veil_register_middleware|veil_config_cors|veil_config_serve_dir|veil_request_set_local|veil_client_|veil_test_|veil_deferred_|veil_grpc_channel_|veil_register_route_ex2|veil::api::testing|veil::api::client_thread" "$SYMS") || true
   [ "$n" = 0 ] && ok "no C API / C kit symbols in the full binary" || bad "C API or C kit symbols found ($n)"
   n=$(grep -cE "veil::tokio::" "$SYMS") || true
   [ "$n" = 0 ] && ok "no veil::tokio (tokio-compat) in the full binary" || bad "veil::tokio symbols found ($n)"

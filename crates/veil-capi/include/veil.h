@@ -29,6 +29,8 @@ extern "C" {
 #define VEIL_ERR_STATE       (-6) /* 呼べない状態 (INLINE でのストリーミング・単項の 2 回目の送信等) */
 #define VEIL_ERR_FORM        (-7) /* フォームの本文が壊れている (400 を返す。F-266) */
 #define VEIL_ERR_TOO_LARGE   (-8) /* フォームの本文が [api] multipart_* の上限を超えた (413 を返す。F-266) */
+#define VEIL_ERR_CLIENT      (-9)  /* an outgoing call failed (URL, connection, TLS, protocol, response too large) */
+#define VEIL_ERR_TIMEOUT     (-10) /* an outgoing call timed out */
 
 /* ---- ルートのフラグ ---- */
 /* コールバックをワーカースレッド上で直接実行する (既定はハンドラ用プール)。 */
@@ -461,6 +463,193 @@ int veil_config_serve_dir(veil_config_t *cfg, const char *prefix, const char *di
  * (protoc --include_imports --descriptor_set_out); their types also go to OpenAPI. VEIL_ERR_INVALID_ARG when it
  * is malformed. `data` is read during the call only. */
 int veil_grpc_reflection(veil_config_t *cfg, const uint8_t *data, size_t len);
+
+/* ---- Routes with options: JSON body validation ---- */
+
+typedef struct veil_route_options {
+    size_t size;
+    uint32_t flags;                /* VEIL_ROUTE_* */
+    const char *openapi_json;      /* an OpenAPI Operation Object (NULL = none) */
+    const char *body_schema_json;  /* a JSON Schema of the body (NULL = no validation) */
+} veil_route_options_t;
+#define VEIL_ROUTE_OPTIONS_INIT { sizeof(veil_route_options_t) }
+/* Like veil_register_route_ex, with options (`opts` may be NULL). With body_schema_json, a body that is not JSON
+ * or does not match is answered with 422 {"detail": [{"type", "loc", "msg"}]} before the handler runs (loc starts
+ * with "body"), and the schema becomes the operation's requestBody in OpenAPI. Supported keywords: type (also
+ * "null" and lists of types), properties, required, additionalProperties, items, minItems, maxItems, minLength,
+ * maxLength, pattern, enum, const, minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf,
+ * format (email, uri), nullable, allOf, anyOf, oneOf, not; annotations (title, description, default, examples, ...)
+ * are ignored. $ref and other keywords are rejected with VEIL_ERR_INVALID_ARG. Not with VEIL_ROUTE_STREAM_BODY or
+ * VEIL_ROUTE_FORM. */
+int veil_register_route_ex2(veil_config_t *cfg, const char *path, const char *methods_csv,
+                            veil_handler_fn handler, void *user_data, const veil_route_options_t *opts);
+
+/* ---- Deferred responses ---- */
+
+typedef struct veil_deferred veil_deferred_t;
+/* Turns the current request into a deferred one: the handler returns right away (its `resp` is no longer used)
+ * and the response goes out when veil_deferred_complete is called, from any thread (for example from the callback
+ * of veil_client_send_async). NULL on a VEIL_ROUTE_INLINE route or once the response was started. Middleware
+ * "after" steps do not run on a deferred response. */
+veil_deferred_t *veil_response_defer(veil_response_t *resp);
+/* The response to build with veil_response_set_* (no streaming); valid until complete or free. */
+veil_response_t *veil_deferred_response(veil_deferred_t *d);
+/* Sends the response and frees `d`. VEIL_ERR_CLOSED when the client has gone. */
+int veil_deferred_complete(veil_deferred_t *d);
+/* 1 when the client has disconnected, 0 otherwise. */
+int veil_deferred_is_closed(const veil_deferred_t *d);
+/* Frees `d` without completing it: the client gets 500. */
+void veil_deferred_free(veil_deferred_t *d);
+
+/* ---- HTTP client ----
+ * Calls run on a veil thread. The blocking forms (veil_client_send, veil_grpc_channel_unary,
+ * veil_grpc_client_recv, veil_grpc_client_finish) are for handlers on the handler pool, setup functions and your
+ * own threads; on a worker (VEIL_ROUTE_INLINE routes, worker-start functions) they return VEIL_ERR_STATE: use the
+ * _async forms there. */
+
+typedef struct veil_client veil_client_t;
+typedef struct veil_client_response veil_client_response_t;
+
+typedef struct veil_client_options {
+    size_t size;
+    uint64_t timeout_ms;          /* request timeout (0 = 30 s) */
+    uint64_t connect_timeout_ms;  /* connect timeout (0 = 10 s) */
+    int http2;                    /* VEIL_DEFAULT (ALPN over TLS, HTTP/1.1 in plain text) / VEIL_ON / VEIL_OFF */
+    const char *ca_file;          /* trusted CA certificates, PEM (NULL = the system's) */
+    const char *cert_file;        /* client certificate, PEM (with key_file) */
+    const char *key_file;
+    int insecure;                 /* non-zero: accept any server certificate (tests only) */
+    const char *user_agent;       /* NULL = veil's */
+    size_t max_response_size;     /* 0 = the default */
+    int unix_sockets;             /* non-zero: accept http://unix:/path:/uri URLs */
+} veil_client_options_t;
+#define VEIL_CLIENT_OPTIONS_INIT { sizeof(veil_client_options_t) }
+
+typedef struct veil_client_request {
+    size_t size;
+    const char *method;           /* NULL = GET */
+    const char *url;              /* http:// or https:// */
+    const char *const *headers;   /* name, value, name, value, ... */
+    size_t n_headers;             /* number of pairs */
+    const uint8_t *body;
+    size_t body_len;
+    uint64_t timeout_ms;          /* 0 = the client's */
+} veil_client_request_t;
+#define VEIL_CLIENT_REQUEST_INIT { sizeof(veil_client_request_t) }
+
+/* A client with a connection pool; thread-safe, share one. `opts` may be NULL. NULL on error. */
+veil_client_t *veil_client_new(const veil_client_options_t *opts);
+void veil_client_free(veil_client_t *c);
+/* Sends and waits; *out gets the response (any status code is a success). VEIL_ERR_TIMEOUT, VEIL_ERR_CLIENT,
+ * VEIL_ERR_STATE (on a worker). */
+int veil_client_send(const veil_client_t *c, const veil_client_request_t *req, veil_client_response_t **out);
+/* Called on the handler pool: rc = VEIL_OK with `resp` (yours to free), or an error code with resp NULL and the
+ * reason in veil_last_error(). */
+typedef void (*veil_client_done_fn)(int rc, veil_client_response_t *resp, void *user_data);
+/* Sends without waiting (works on workers too); the request is copied before return. */
+int veil_client_send_async(const veil_client_t *c, const veil_client_request_t *req,
+                           veil_client_done_fn done, void *user_data);
+int veil_client_response_status(const veil_client_response_t *r);
+/* Header values and the body are not NUL-terminated; valid until veil_client_response_free. */
+const char *veil_client_response_header(const veil_client_response_t *r, const char *name, size_t *len);
+size_t veil_client_response_header_count(const veil_client_response_t *r);
+int veil_client_response_header_at(const veil_client_response_t *r, size_t i, const char **name, size_t *name_len,
+                                   const char **value, size_t *value_len);
+const uint8_t *veil_client_response_body(const veil_client_response_t *r, size_t *len);
+void veil_client_response_free(veil_client_response_t *r);
+
+/* ---- gRPC client ----
+ * Messages are serialized bytes (encode them with your protobuf library). */
+
+typedef struct veil_grpc_channel veil_grpc_channel_t;
+typedef struct veil_grpc_client_call veil_grpc_client_call_t;
+
+typedef struct veil_grpc_channel_options {
+    size_t size;
+    const char *ca_file;          /* trusted CA certificates, PEM (NULL = the system's) */
+    const char *cert_file;        /* client certificate, PEM (with key_file) */
+    const char *key_file;
+    int gzip;                     /* non-zero: compress request messages */
+    size_t max_message_size;      /* 0 = the default */
+    uint64_t timeout_ms;          /* default deadline of calls (0 = none) */
+} veil_grpc_channel_options_t;
+#define VEIL_GRPC_CHANNEL_OPTIONS_INIT { sizeof(veil_grpc_channel_options_t) }
+
+typedef struct veil_grpc_call_options {
+    size_t size;
+    uint64_t timeout_ms;          /* deadline (0 = the channel's) */
+    const char *const *metadata;  /* name, value, ... (-bin names carry base64 text) */
+    size_t n_metadata;            /* number of pairs */
+} veil_grpc_call_options_t;
+#define VEIL_GRPC_CALL_OPTIONS_INIT { sizeof(veil_grpc_call_options_t) }
+
+/* A channel to `url` (http:// = h2c, https:// = TLS with ALPN h2). `opts` may be NULL. NULL on error. */
+veil_grpc_channel_t *veil_grpc_channel_new(const char *url, const veil_grpc_channel_options_t *opts);
+void veil_grpc_channel_free(veil_grpc_channel_t *ch);
+/* Starts a call of any kind (`path` = /package.Service/Method): send with veil_grpc_client_send, end with
+ * veil_grpc_client_close_send, read with veil_grpc_client_recv and veil_grpc_client_finish. NULL on error. */
+veil_grpc_client_call_t *veil_grpc_channel_call(const veil_grpc_channel_t *ch, const char *path,
+                                                const veil_grpc_call_options_t *opts);
+/* One request message, waits for the end; *out is the finished call (recv and finish no longer wait). VEIL_OK
+ * whatever the gRPC status; VEIL_ERR_STATE on a worker. */
+int veil_grpc_channel_unary(const veil_grpc_channel_t *ch, const char *path, const uint8_t *msg, size_t len,
+                            const veil_grpc_call_options_t *opts, veil_grpc_client_call_t **out);
+/* Called on the handler pool with the finished call (yours to free). */
+typedef void (*veil_grpc_done_fn)(veil_grpc_client_call_t *call, void *user_data);
+int veil_grpc_channel_unary_async(const veil_grpc_channel_t *ch, const char *path, const uint8_t *msg, size_t len,
+                                  const veil_grpc_call_options_t *opts, veil_grpc_done_fn done, void *user_data);
+/* Sends one message (copied). VEIL_ERR_CLOSED once the call ended or sending was closed. */
+int veil_grpc_client_send(veil_grpc_client_call_t *c, const uint8_t *msg, size_t len);
+int veil_grpc_client_close_send(veil_grpc_client_call_t *c);
+/* 1 = the next message is in *data and *len (valid until the next recv or the free), 0 = no more messages,
+ * negative = error (VEIL_ERR_STATE on a worker while the call runs). */
+int veil_grpc_client_recv(veil_grpc_client_call_t *c, const uint8_t **data, size_t *len);
+/* Waits for the end; returns the gRPC status code (0 = OK) or a negative error. */
+int veil_grpc_client_finish(veil_grpc_client_call_t *c);
+/* After finish: the status message (not NUL-terminated). */
+const char *veil_grpc_client_status_message(const veil_grpc_client_call_t *c, size_t *len);
+/* Response metadata (headers, then trailers after finish); not NUL-terminated, or NULL. */
+const char *veil_grpc_client_metadata(veil_grpc_client_call_t *c, const char *name, size_t *len);
+/* The status becomes CANCELLED (1) unless the call already ended. */
+void veil_grpc_client_cancel(veil_grpc_client_call_t *c);
+/* Frees a call, cancelling it when it still runs. */
+void veil_grpc_client_call_free(veil_grpc_client_call_t *c);
+
+/* ---- In-process tests ---- */
+
+typedef struct veil_test veil_test_t;
+typedef struct veil_test_response veil_test_response_t;
+
+typedef struct veil_test_request {
+    size_t size;
+    const char *method;           /* NULL = GET */
+    const char *target;           /* path and query: "/users/1?x=2" */
+    const char *const *headers;   /* name, value, ... */
+    size_t n_headers;             /* number of pairs */
+    const uint8_t *body;
+    size_t body_len;
+    int version;                  /* 0 or VEIL_HTTP_1_1 / VEIL_HTTP_2 / VEIL_HTTP_3 */
+    int tls;                      /* non-zero: as if received over TLS */
+    const char *client_ip;        /* NULL = 127.0.0.1 */
+} veil_test_request_t;
+#define VEIL_TEST_REQUEST_INIT { sizeof(veil_test_request_t) }
+
+/* Builds the app of `cfg` without opening sockets (setup functions run now; `cfg` is consumed). NULL on error. */
+veil_test_t *veil_test_new(veil_config_t *cfg);
+/* Frees the app and runs the shutdown functions. */
+void veil_test_free(veil_test_t *t);
+/* Calls a route on this thread (with middleware, plugins, validation and the handler pool) and waits for the
+ * whole response. Not from a handler or a worker. */
+int veil_test_request(const veil_test_t *t, const veil_test_request_t *req, veil_test_response_t **out);
+int veil_test_response_status(const veil_test_response_t *r);
+const char *veil_test_response_header(const veil_test_response_t *r, const char *name, size_t *len);
+size_t veil_test_response_header_count(const veil_test_response_t *r);
+int veil_test_response_header_at(const veil_test_response_t *r, size_t i, const char **name, size_t *name_len,
+                                 const char **value, size_t *value_len);
+const uint8_t *veil_test_response_body(const veil_test_response_t *r, size_t *len);
+/* Trailers of a streamed body. */
+const char *veil_test_response_trailer(const veil_test_response_t *r, const char *name, size_t *len);
+void veil_test_response_free(veil_test_response_t *r);
 
 /* ---- その他 ---- */
 

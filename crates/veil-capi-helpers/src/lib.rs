@@ -9,11 +9,16 @@
 pub use veil_capi::*;
 
 mod auth;
+mod client;
 mod cookie;
+mod di;
+mod graphql;
+mod grpc;
 mod jwt;
 mod misc;
 mod session;
 mod tasks;
+mod testkit;
 
 use std::ffi::{c_char, c_int, c_void, CString};
 
