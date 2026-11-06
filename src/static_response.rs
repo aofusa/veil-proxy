@@ -911,6 +911,67 @@ fn write_content_range(
     n
 }
 
+/// brotli のウィンドウ（`lgwin`）。本文を全部覆う最小の大きさにしてリングバッファを抑える。
+///
+/// リングバッファは入力が 1 ブロックに収まらないと `2^lgwin` の 2 倍まで伸び、既定の 22 では 8 MiB になる
+/// （要求ごとの mmap/munmap とページフォールト。B-331）。本文より大きいウィンドウは圧縮率に効かない。
+/// q5 以上で 17 未満にすると別のハッシャが選ばれて極端に遅くなるので下限を 18 にする。
+#[cfg(feature = "compression")]
+fn brotli_window(len: usize) -> i32 {
+    const DEFAULT: i32 = 22;
+    let bits = usize::BITS as i32 - len.saturating_sub(1).leading_zeros() as i32;
+    bits.clamp(18, DEFAULT)
+}
+
+/// `body` の全量を brotli で圧縮する（`None` なら圧縮できなかった）。
+///
+/// `brotli::BrotliCompress` は入力を 4096 バイトずつ流すので、2 回目でリングバッファが全量へ伸びて要求ごとに
+/// 数 MiB の領域を取る。全量を 1 回で渡すとリングバッファは本文の大きさで済み、同じバイト列を 3 倍以上速く出す（B-331）。
+#[cfg(feature = "compression")]
+pub(crate) fn brotli_compress_all(body: &[u8], quality: i32) -> Option<Vec<u8>> {
+    use brotli::enc::backward_references::BrotliEncoderParams;
+    use brotli::enc::encode::{BrotliEncoderOperation, BrotliEncoderStateStruct};
+    use brotli::enc::StandardAlloc;
+
+    let mut state = BrotliEncoderStateStruct::new(StandardAlloc::default());
+    state.params = BrotliEncoderParams {
+        quality,
+        lgwin: brotli_window(body.len()),
+        size_hint: body.len(),
+        ..Default::default()
+    };
+    let mut out = vec![0u8; body.len() / 2 + 1024];
+    let (mut in_off, mut avail_in, mut out_off) = (0usize, body.len(), 0usize);
+    let mut no_metablock_callback =
+        |_: &mut brotli::interface::PredictionModeContextMap<brotli::InputReferenceMut>,
+         _: &mut [brotli::interface::StaticCommand],
+         _: brotli::InputPair,
+         _: &mut StandardAlloc| ();
+    loop {
+        let mut avail_out = out.len() - out_off;
+        if !state.compress_stream(
+            BrotliEncoderOperation::BROTLI_OPERATION_FINISH,
+            &mut avail_in,
+            body,
+            &mut in_off,
+            &mut avail_out,
+            &mut out,
+            &mut out_off,
+            &mut None,
+            &mut no_metablock_callback,
+        ) {
+            return None;
+        }
+        if state.is_finished() {
+            out.truncate(out_off);
+            return Some(out);
+        }
+        if avail_out == 0 {
+            out.resize(out.len() * 2, 0);
+        }
+    }
+}
+
 /// 本文を圧縮する（HTTP/1.1・HTTP/2・HTTP/3 の静的配信とプロキシで共有）。失敗したら元のまま返す。
 #[cfg(feature = "compression")]
 pub fn compress_body(
@@ -934,18 +995,8 @@ pub fn compress_body(
             }
             encoder.finish().unwrap_or_else(|_| body.to_vec())
         }
-        AcceptedEncoding::Brotli => {
-            let mut compressed = Vec::with_capacity(body.len());
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: compression.brotli_level as i32,
-                ..Default::default()
-            };
-            let mut input = std::io::Cursor::new(body);
-            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return body.to_vec();
-            }
-            compressed
-        }
+        AcceptedEncoding::Brotli => brotli_compress_all(body, compression.brotli_level as i32)
+            .unwrap_or_else(|| body.to_vec()),
         AcceptedEncoding::Deflate => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
@@ -1077,6 +1128,46 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // B-331: 全量を 1 回で渡す圧縮。圧縮できない入力では出力の領域を伸ばす経路も通る
+    #[cfg(feature = "compression")]
+    #[test]
+    fn brotli_compress_all_round_trips() {
+        use std::io::Read as _;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let noise = |n: usize, x: &mut u64| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    *x ^= *x << 13;
+                    *x ^= *x >> 7;
+                    *x ^= *x << 17;
+                    *x as u8
+                })
+                .collect()
+        };
+        for len in [0usize, 1, 100, 4096, 4097, 70_000, 300_000, 2_000_000] {
+            let repeated: Vec<u8> = b"{\"id\":1,\"name\":\"Alpha\"},".iter().copied().cycle().take(len).collect();
+            for (body, q) in [(repeated, 4), (noise(len, &mut x), 4), (noise(len.min(70_000), &mut x), 5)] {
+                let out = brotli_compress_all(&body, q).expect("compressed");
+                let mut back = Vec::new();
+                brotli::Decompressor::new(&out[..], 4096)
+                    .read_to_end(&mut back)
+                    .expect("valid brotli stream");
+                assert_eq!(back, body, "len {}", body.len());
+            }
+        }
+    }
+
+    // 既定のウィンドウ（22）に比べて出力が大きくならない（本文より大きいウィンドウは効かない）
+    #[cfg(feature = "compression")]
+    #[test]
+    fn brotli_window_covers_the_body() {
+        assert_eq!(brotli_window(0), 18);
+        assert_eq!(brotli_window(6_000), 18);
+        assert_eq!(brotli_window((1 << 18) + 1), 19);
+        assert_eq!(brotli_window(1 << 20), 20);
+        assert_eq!(brotli_window(100 << 20), 22);
+    }
 
     fn comp(enabled: bool) -> CompressionConfig {
         CompressionConfig {

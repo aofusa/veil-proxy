@@ -396,8 +396,8 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
     //
     // eventfd カウンタは全 completions を合算した 1 本のレベル信号のため、あるタスクの
     // drain が **他の待機タスク宛ての通知シグナルごと消費** し得る。消費されたシグナルの
-    // 持ち主は「readable 待ち」のままでは二度と起床できない（EPOLLONESHOT のイベントは
-    // epoll_wait 時点のレベル再評価で蒸発する）。そのため:
+    // 持ち主は「readable 待ち」のままでは二度と起床できない（epoll のイベントは
+    // epoll_wait 時点のレベルの評価で蒸発する）。そのため:
     //
     // 1. 待機 Future の poll で **毎回 `done` を最初に検査**する（どんな起床でも、
     //    readiness の有無に関わらず完了を観測できる）。

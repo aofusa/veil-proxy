@@ -146,11 +146,11 @@ impl KtlsServerStream {
         if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
             return Ok(());
         }
-        #[cfg(veil_poller_kqueue)]
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         {
             self.inner.readable_lazy().await
         }
-        #[cfg(not(veil_poller_kqueue))]
+        #[cfg(not(any(veil_poller_kqueue, veil_poller_epoll)))]
         {
             self.inner.readable().await
         }

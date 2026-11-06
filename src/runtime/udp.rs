@@ -609,6 +609,9 @@ impl AsRawFd for UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        // 待ちの記録を残して閉じない（同じ番号の fd が古い武装を引き継ぐ。F-297）
+        #[cfg(veil_rt_reactor)]
+        crate::runtime::executor::unregister(self.fd);
         #[cfg(unix)]
         // SAFETY: self.fd は自分の所有する有効なソケットで、Drop により 1 度だけ閉じる。
         unsafe {

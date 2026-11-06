@@ -59,9 +59,9 @@ impl WakerSlot {
     /// 空スロットの `wake_all()` は no-op のため呼び分け不要）。WSAPoll バックエンド
     /// （Windows 専用ビルド）でのみ使う。
     #[inline]
-    // WSAPoll バックエンド（Windows 専用ビルド）と単体テストからのみ使うため、
+    // epoll（起こす相手の有無で武装を決める）・WSAPoll（Windows 専用ビルド）と単体テストからのみ使うため、
     // それ以外のビルドではコンパイル対象から外す（`allow(dead_code)` は使わない）。
-    #[cfg(any(veil_poller_wsapoll, test))]
+    #[cfg(any(veil_poller_epoll, veil_poller_wsapoll, test))]
     pub fn is_empty(&self) -> bool {
         matches!(self, WakerSlot::Empty)
     }
@@ -69,6 +69,13 @@ impl WakerSlot {
     /// Waker を追加する（既存の待機者を上書きしない。1 人目は `Vec` を経由せずインライン
     /// 格納するため確保が起きない。2 人目以降のみ `Vec` へ昇格する）。
     pub fn push(&mut self, waker: Waker) {
+        // 同じタスクの待ちは 1 つで足りる（`select` の中で待ち直すたびに積むと、イベントが来るまで増え続ける
+        // うえ `Vec` の確保が要る。Waker の比較はポインタ 2 つ）
+        match self {
+            WakerSlot::One(prev) if prev.will_wake(&waker) => return,
+            WakerSlot::Many(v) if v.last().is_some_and(|w| w.will_wake(&waker)) => return,
+            _ => {}
+        }
         match std::mem::replace(self, WakerSlot::Empty) {
             WakerSlot::Empty => *self = WakerSlot::One(waker),
             WakerSlot::One(prev) => *self = WakerSlot::Many(vec![prev, waker]),
@@ -97,6 +104,18 @@ impl WakerSlot {
     }
 }
 
+/// `ReadableLazy` の待ちの状態（epoll）。起床の理由が「この fd のイベント」のときだけ確認なしで読みにいく。
+#[cfg(veil_poller_epoll)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LazyRead {
+    #[default]
+    None,
+    /// 待っている。
+    Waiting,
+    /// 待ちの間にイベントが届いた（次の `poll` で読みにいく）。
+    Fired,
+}
+
 /// fd ごとの登録状態。
 ///
 /// `read_waker` / `write_waker` は同時に存在してよい（同一 fd への読み待ちと書き待ちの
@@ -104,12 +123,8 @@ impl WakerSlot {
 /// **有効化されている** interest ビット（poller 実装が解釈するビット表現。epoll では
 /// `EPOLLIN`/`EPOLLOUT`）を保持する。
 ///
-/// `known_to_kernel` は `armed` とは別に管理する: `EPOLLONESHOT` は発火後に interest を
-/// 無効化するのみで、epoll インスタンスの監視対象リストからは fd を除去しない
-/// （`EPOLL_CTL_DEL` を呼ばない限り fd は登録済みのまま）。そのため「現在 armed なビットが
-/// 無い（`armed == 0`）」は「ADD 未実施」を意味しない。一度でも `EPOLL_CTL_ADD` に成功した
-/// fd は次回以降 `armed` の値に関わらず必ず `EPOLL_CTL_MOD` を使う必要がある
-/// （F-120 Phase 2 で発見した実装バグ）。
+/// `known_to_kernel` は fd が epoll の監視対象リストに入っているか。epoll では `armed` が 0 になったら
+/// `EPOLL_CTL_DEL` で外す（`EPOLLHUP` はマスクできず、レベルトリガのままだと鳴り続けるため。F-297）。
 ///
 /// `read_waker`/`write_waker` は [`WakerSlot`] で持つ（F-166 A-3。旧実装は常に
 /// `Vec<Waker>` だったため 1 fd 1 待機者という支配的ケースでも malloc/free が起床の
@@ -123,16 +138,17 @@ pub(crate) struct FdRecord {
     /// フィルタ（READ/WRITE）」の意味で使う（`kqueue::KqueuePoller::update`
     /// の `prev_mask` 引数に渡し、ビットが立たなくなった方向を `EV_DELETE` する判定に使う）。
     /// WSAPoll バックエンドでは「次回 `WSAPoll` 呼び出しに含める方向」の意味で使う。
-    /// epoll バックエンドでは「`EPOLLONESHOT` で現在カーネルへ有効化されている方向」。
+    /// epoll バックエンドでは「レベルトリガで現在カーネルへ有効化されている方向」。
     pub armed: u32,
-    /// この fd に対して `EPOLL_CTL_ADD` を一度でも実行済みか（`EPOLL_CTL_DEL` するまで
-    /// true のまま。F-166 A-2 以降、ADD/MOD 判定ではなく「初回登録か否か」の唯一の正になる:
-    /// true なら `register()` は epoll_ctl を一切呼ばない）。
+    /// fd が epoll の監視対象リストに入っているか（ADD 済みで DEL していない）。
     ///
     /// epoll 専用: kqueue の `EV_ADD` は EEXIST を返さず冪等なため、この判定自体が
     /// 不要（常に `EV_ADD` でよい）。
     #[cfg(veil_poller_epoll)]
     pub known_to_kernel: bool,
+    /// [`ReadableLazy`](super::tcp::ReadableLazy) の待ちの状態（epoll 専用。F-297）。
+    #[cfg(veil_poller_epoll)]
+    pub lazy_read: LazyRead,
     /// 直近に届いた読み取り可能イベントのヒント（consume-once、F-141/F-166 A-1）。
     ///
     /// - kqueue: `EVFILT_READ` の `data`（読み取り可能バイト数、カーネルが kevent 発火

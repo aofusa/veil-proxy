@@ -171,13 +171,13 @@ fn with_poller<R>(f: impl FnOnce(&KqueuePoller) -> R) -> R {
     })
 }
 
-/// fd の読み取り可能待ちを（再）登録する（oneshot）。
+/// fd の読み取り可能待ちを（再）登録する。
 #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
 pub(crate) fn register_read(fd: RawFd, waker: Waker) {
     register(fd, Interest::Read, waker);
 }
 
-/// fd の書き込み可能待ちを（再）登録する（oneshot）。
+/// fd の書き込み可能待ちを（再）登録する。
 #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
 pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
@@ -185,28 +185,15 @@ pub(crate) fn register_write(fd: RawFd, waker: Waker) {
 
 /// fd の interest（READ/WRITE いずれか）を登録する（epoll 版）。
 ///
-/// **呼び出しごとに `epoll_ctl` を 1 回発行する**（初回は `EPOLL_CTL_ADD`、以降は
-/// `EPOLL_CTL_MOD`）。マスクは `EPOLLONESHOT` 付きのレベルトリガで、待機者のいる方向
-/// （`armed`）だけを載せる。発火すると interest が外れるので、次の待機で MOD により
-/// 再武装する。
-///
-/// F-166 A-2 で一度「`EPOLLET` + fd あたり生涯 1 回の ADD（以降の `register()` は
-/// syscall 無し）」に変えたが、kTLS ソケットで「`poll(2)` は readable なのに `recvmsg` が
-/// `EAGAIN`」になる状況で恒久ハングしたため元に戻した（B-75。`epoll.rs` の冒頭）。
-/// 毎回の MOD でカーネルがレベル状態を再評価するので、その状況でも次の周回で起床できる。
-///
-/// ADD と MOD の判定は `known_to_kernel`（一度でも ADD したか）だけで行う
-/// （`poller::FdRecord` の doc）。
+/// レベルトリガで、**既にその方向が武装済みなら `epoll_ctl` を呼ばない**（F-297。キープアライブの待ちごとの
+/// `EPOLL_CTL_MOD` が 1 要求あたり 1 本だった）。武装の下げは `dispatch_event` が行う。読み取りの方向は
+/// 待機者がいる間ずっと武装のままで、レベルが高ければ次の `epoll_wait` が報告するので取りこぼさない。
+/// 下げた方向を上げ直すときはカーネルがその時点のレベルも評価する。
 #[cfg(veil_poller_epoll)]
 fn register(fd: RawFd, interest: Interest, waker: Waker) {
-    let (needs_add, mask) = FD_TABLE.with(|t| {
+    let change = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let rec = t.get_or_insert(fd);
-        // ADD/MOD の判定は「一度でも ADD 済みか」（`known_to_kernel`）だけを見る。
-        // `armed == 0` は EPOLLONESHOT 発火直後にも起こり得るが、その場合でも fd 自体は
-        // epoll の監視対象リストに残っているため MOD を使う必要がある（このコメントに
-        // 至った実装バグの詳細は `poller::FdRecord` の doc を参照）。
-        let needs_add = !rec.known_to_kernel;
         // 同一方向の複数同時待機者を許容する（キューへ追加。`poller::WakerSlot` の doc
         // 参照。offload の共有 eventfd 等、1 fd に複数タスクが同時に読み取り可能待ちを
         // するケースで、先行者の Waker を上書き消失させないために必須）。
@@ -220,36 +207,35 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
                 WRITE
             }
         };
-        let new_mask = rec.armed | bit;
-        rec.armed = new_mask;
-        (needs_add, new_mask)
+        if rec.known_to_kernel && rec.armed & bit != 0 {
+            return None;
+        }
+        rec.armed |= bit;
+        Some((rec.known_to_kernel, rec.armed))
     });
-    // 「既に armed 済みなら epoll_ctl を省略する」最適化はあえて行わない。
-    // `register()` は個々の Future の poll ごとに（EAGAIN の度に）呼ばれるため、
-    // ここでの epoll_ctl は「新規待機開始」だけでなく「まだ完了していない待機の
-    // 再確認」でも起こり得る。呼び出しごとに MOD/ADD を無条件で発行することで、
-    // fd ごとの armed ビット計算に依存する ADD/MOD 判定ミス（EPOLLONESHOT の
-    // 再武装漏れ）の余地を構造的に排除する（EPOLL_CTL_MOD は冪等で安全に繰り返せる）。
-    //
-    // **B-75: この「毎回 MOD で再武装する」ことが正しさの要でもある。** 再武装のたびに
-    // カーネルがレベル状態を再評価するため、「`poll(2)` は readable なのに `recvmsg` が
-    // `EAGAIN` を返す」kTLS ソケットでも次の周回で必ず起床できる。F-166 A-2 で
-    // `EPOLLET` + 生涯 1 回 ADD に変えたところ、まさにこの状況で恒久ハングした。
-    let mut needs_add = needs_add;
-    let mut res = if needs_add {
-        with_poller(|p| p.add(fd, mask))
-    } else {
-        with_poller(|p| p.modify(fd, mask))
+    let Some((known, mask)) = change else {
+        return;
     };
-    // B-294: 表では「カーネルが知っている」となっているのに、別の経路で close された同じ番号の fd が
-    // 再利用されていると MOD は ENOENT になる（epoll は close で登録を外す）。ADD でやり直して待ちを武装する
-    if !needs_add && matches!(&res, Err(e) if e.raw_os_error() == Some(libc::ENOENT)) {
-        needs_add = true;
-        res = with_poller(|p| p.add(fd, mask));
-    }
+    let (res, added) = if known {
+        match with_poller(|p| p.modify(fd, mask)) {
+            // B-294: 表では「カーネルが知っている」となっているのに、別の経路で close された同じ番号の fd が
+            // 再利用されていると MOD は ENOENT になる（epoll は close で登録を外す）。ADD でやり直す
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                (with_poller(|p| p.add(fd, mask)), true)
+            }
+            r => (r, false),
+        }
+    } else {
+        match with_poller(|p| p.add(fd, mask)) {
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                (with_poller(|p| p.modify(fd, mask)), true)
+            }
+            r => (r, true),
+        }
+    };
     match res {
         Ok(()) => {
-            if needs_add {
+            if added {
                 FD_TABLE.with(|t| {
                     if let Some(rec) = t.borrow_mut().get_mut(fd) {
                         rec.known_to_kernel = true;
@@ -261,6 +247,29 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
             ftlog::error!("reactor: epoll register failed for fd {}: {}", fd, e);
         }
     }
+}
+
+/// `ReadableLazy` の待ち（epoll。F-297）。この fd のイベントで起きたのなら `true`（確認なしで読みにいってよい）。
+///
+/// それ以外は待ちを登録して `false`。`true` のあとの読み取りが `EAGAIN` でも `ReadFuture` が待ち直すので実害は無い
+/// （[`ReadableLazy`](super::tcp::ReadableLazy) はそのように使うところだけで使う）。
+#[cfg(veil_poller_epoll)]
+pub(crate) fn lazy_read_ready(fd: RawFd, waker: &Waker) -> bool {
+    use super::poller::LazyRead;
+    let fired = FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let rec = t.get_or_insert(fd);
+        if rec.lazy_read == LazyRead::Fired {
+            rec.lazy_read = LazyRead::None;
+            return true;
+        }
+        rec.lazy_read = LazyRead::Waiting;
+        false
+    });
+    if !fired {
+        register(fd, Interest::Read, waker.clone());
+    }
+    fired
 }
 
 /// fd の interest（READ/WRITE いずれか）を oneshot で（再）登録する（kqueue 版）。
@@ -327,8 +336,8 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
 ///
 /// 共有 fd（`runtime::offload` のスレッドごと eventfd）では、複数タスクが同一 fd の
 /// 読み取り可能を待つ。あるタスクの try-first `poll(2)` チェックがカウンタを drain すると、
-/// **他タスク宛ての通知シグナルごと消費**してしまい、EPOLLONESHOT のイベントは
-/// `epoll_wait` 時点のレベル再評価で蒸発する（drain 済み = 非 readable）。このとき
+/// **他タスク宛ての通知シグナルごと消費**してしまい、epoll のイベントは
+/// `epoll_wait` 時点のレベルの評価で蒸発する（drain 済み = 非 readable）。このとき
 /// 待機中タスクは自分の完了フラグが立っていても永久に起床しない
 /// （F-120 Phase 2 の E2E `test_f62_wasm_http_call_concurrent_requests` で発見した
 /// 実装バグ。io_uring 版は `POLL_ADD` の完了が write 時点で CQE として記録されるため
@@ -342,10 +351,6 @@ pub(crate) fn wake_all_readers(fd: RawFd) {
     // A-3: 単一待機者（支配的なケース）なら `WakerSlot::wake_all()` はヒープ操作なしで
     // 直接 wake する（`poller::WakerSlot` の doc 参照）。
     //
-    // ET（F-166 A-2、epoll のみ）でもこの経路は安全: eventfd への次の `write(2)` が
-    // 新しいエッジを生成するため、ここで一旦全読者を起こして再登録させても
-    // 取りこぼしは発生しない（`offload.rs` の `OffloadWait::poll` が try-first で
-    // 自前の `poll(2)` を行うため、`read_hint`/ET の armed 状態に依存しない）。
     let mut wakers = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
@@ -372,10 +377,14 @@ pub(crate) fn wake_all_readers(fd: RawFd) {
 /// 自動でクローズして epoll 登録も自動除去するため、明示 unregister の省略は安全）。
 #[cfg(veil_poller_epoll)]
 pub(crate) fn unregister(fd: RawFd) {
-    let existed = FD_TABLE
-        .try_with(|t| t.borrow_mut().remove(fd).is_some())
+    let known = FD_TABLE
+        .try_with(|t| {
+            t.borrow_mut()
+                .remove(fd)
+                .is_some_and(|rec| rec.known_to_kernel)
+        })
         .unwrap_or(false);
-    if existed {
+    if known {
         let _ = POLLER.try_with(|p| {
             if let Some(poller) = p.borrow().as_ref() {
                 poller.delete(fd);
@@ -411,8 +420,45 @@ pub(crate) fn unregister(fd: RawFd) {
     let _ = FD_TABLE.try_with(|t| t.borrow_mut().remove(fd));
 }
 
+/// 新しく作った fd に残っている同じ番号の古い記録を捨てる（F-297）。
+///
+/// epoll の武装の記録は「カーネルが知っている」前提でシステムコールを省くので、`unregister` を通らずに
+/// 閉じられた fd の記録が残っていると、同じ番号の新しい fd の待ちが武装されない。
+#[cfg(veil_poller_epoll)]
+pub(crate) fn forget_stale_fd(fd: RawFd) {
+    let _ = FD_TABLE.try_with(|t| t.borrow_mut().remove(fd));
+}
+
 /// poller wait のイベントバッファ最大件数（事前確保しホットパスで再アロケーションしない）。
 const EVENT_BATCH: usize = 256;
+
+/// タスクの 1 回の `poll` の中で続けて進められる I/O の回数（B-332）。
+///
+/// reactor の読み書きは try-first なので、相手がすぐ応える接続のタスクは `Pending` を返さず処理を続け、同じ
+/// ワーカーの他の接続を飢えさせる。回数を使い切ったタスクは自分を起こして `Pending` を返す。
+const COOP_BUDGET: u32 = 16;
+
+thread_local! {
+    static COOP: std::cell::Cell<u32> = const { std::cell::Cell::new(COOP_BUDGET) };
+}
+
+/// I/O の協調的な予算を 1 回分使う（B-332）。`false` なら呼び出し側は `Poll::Pending` を返す（再度起こす登録は済み）。
+#[inline]
+pub(crate) fn coop_proceed(cx: &mut std::task::Context<'_>) -> bool {
+    COOP.with(|c| {
+        let n = c.get();
+        if n == 0 {
+            cx.waker().wake_by_ref();
+            false
+        } else {
+            c.set(n - 1);
+            true
+        }
+    })
+}
+
+/// ready キューにタスクが残っている間に、待たずにイベントとタイマーを取り込む間隔（タスクの `poll` の回数）。
+const EVENT_INTERVAL: u32 = 61;
 
 /// 1 回分の poller wait + イベント/タイマー処理。
 #[cfg(veil_poller_epoll)]
@@ -444,60 +490,62 @@ fn park(timeout: Option<Duration>) {
     super::timer::fire_expired(super::timer::refresh_now());
 }
 
-/// epoll 版イベント配送（F-166 A-1/A-2/A-3）。
+/// epoll 版イベント配送（F-297）。
 ///
-/// A-2（ET 常時登録）により、ここでは **epoll_ctl を一切呼ばない**（旧実装の
-/// 「片方だけ起きたらもう片方を再武装する」`modify` 呼び出しは、fd が生涯 ADD
-/// されたまま・両方向常時 armed のため不要になった）。
+/// レベルトリガなので、発火しても武装はカーネルに残る。次の 3 通りだけ武装を下げる。
 ///
-/// A-1: 起床させる Waker の有無に関わらず、観測したイベント方向の `read_hint`/
-/// `write_hint` へ非ゼロ番兵値（`EPOLL_HINT_SENTINEL`）を立てる（`take_read_hint`/
-/// `take_write_hint` の doc 参照）。待機者がいない方向にヒントだけ立てても、
-/// 対応する `Readable`/`Writable` 系 Future が次に poll されたときに consume-once で
-/// 読み取って `poll(2)` を省略するだけで実害は無い（詳細設計の「正しさの根拠」4）。
+/// - 書き込みの方向: 送信バッファが空いている間は鳴り続けるので、発火したら必ず下げる（待機は `EAGAIN` の後だけ）。
+/// - 読み取りの方向で起こす相手がいない: 読まれないデータがある間は鳴り続けるので下げる。次に待つときに上げ直す
+///   （カーネルがその時点のレベルも評価するので取りこぼさない）。
+/// - 全方向が下りたら監視対象から外す（`EPOLLHUP`・`EPOLLERR` はマスクできない）。
 #[cfg(veil_poller_epoll)]
 fn dispatch_event(fd: RawFd, flags: u32) {
+    use super::poller::{LazyRead, WakerSlot};
     // ヒント設定と Waker の取り出しは FD_TABLE を借用したまま行うが、実際に
     // `wake()` するのは借用を外した後にする（Waker::wake() が再帰的に
     // register()/FD_TABLE を触るタスクを起こし得るため、二重借用パニックを避ける）。
-    // A-3: `mem::take`（`WakerSlot::default()` = `Empty`）で取り出すのは単一待機者
+    // `mem::take`（`WakerSlot::default()` = `Empty`）で取り出すのは単一待機者
     // ならヒープ操作なしの `WakerSlot::One`（ムーブのみ）で、`Vec` を経由しない。
-    let (mut read_waker, mut write_waker, remaining) = FD_TABLE.with(|t| {
+    let (mut read_waker, mut write_waker, change) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
-            return (
-                super::poller::WakerSlot::Empty,
-                super::poller::WakerSlot::Empty,
-                0,
-            );
+            // 記録が無い fd がレベルで鳴り続けないようにする（`unregister` は記録と登録を一緒に消すので通常は来ない）
+            return (WakerSlot::Empty, WakerSlot::Empty, Some(0));
         };
-        // B-75: epoll では readiness ヒント（F-166 A-1）を **使わない**。
-        // ヒントで確認用 `poll(2)` を省略すると kTLS + HTTP/2 の負荷で恒久ハングし、
-        // しかも省略できる `poll(2)` は実測で 0.558 → 0.531/req（-5%）とほぼ無価値だった。
-        // kqueue 版（F-141、`data` に読み取り可能バイト数が入る）はそのまま維持する。
-        // EPOLLONESHOT により、発火した時点でカーネル側の interest は全方向とも
-        // 無効化されている。テーブル側の armed からも発火方向のビットを落とす
-        // （再武装は待機側の `register()`、または下の「残った方向の再武装」で行う）。
-        let rw = if flags & (READ | ERR_HUP) != 0 {
-            rec.armed &= !READ;
+        let hup = flags & ERR_HUP != 0;
+        let mut lower = 0;
+        let rw = if flags & READ != 0 || hup {
+            if rec.read_waker.is_empty() {
+                lower |= READ;
+            } else if rec.lazy_read == LazyRead::Waiting {
+                rec.lazy_read = LazyRead::Fired;
+            }
             std::mem::take(&mut rec.read_waker)
         } else {
-            super::poller::WakerSlot::Empty
+            WakerSlot::Empty
         };
-        let ww = if flags & (WRITE | ERR_HUP) != 0 {
-            rec.armed &= !WRITE;
+        let ww = if flags & WRITE != 0 || hup {
+            lower |= WRITE;
             std::mem::take(&mut rec.write_waker)
         } else {
-            super::poller::WakerSlot::Empty
+            WakerSlot::Empty
         };
-        (rw, ww, rec.armed)
+        let armed = rec.armed & !lower;
+        let change = (armed != rec.armed || armed == 0).then_some(armed);
+        rec.armed = armed;
+        if armed == 0 {
+            rec.known_to_kernel = false;
+        }
+        (rw, ww, change)
     });
     read_waker.wake_all();
     write_waker.wake_all();
-    if remaining != 0 {
-        // EPOLLONESHOT により fd 全体の interest が disarm されているため、まだ待ち手が
-        // 残っている方向（読み書きどちらか一方のみ起床した場合）を再武装する。
-        let _ = with_poller(|p| p.modify(fd, remaining));
+    match change {
+        None => {}
+        Some(0) => with_poller(|p| p.delete(fd)),
+        Some(mask) => {
+            let _ = with_poller(|p| p.modify(fd, mask));
+        }
     }
 }
 
@@ -877,8 +925,12 @@ impl Executor {
         spawn(future);
     }
 
-    fn run_ready_tasks(&self) {
-        loop {
+    /// ready キューの今の長さの分だけタスクを進める（途中で起きたタスクは次の周回。B-332: ずっと ready のタスクが
+    /// いても poller へ戻れるように）。実行した回数と、キューが残っているかを返す。
+    fn run_ready_tasks(&self) -> (u32, bool) {
+        let batch = EXEC_STATE.with(|s| s.borrow().ready.len());
+        let mut ran = 0;
+        for _ in 0..batch {
             let next = EXEC_STATE.with(|s| s.borrow_mut().ready.pop_front());
             let (index, generation) = match next {
                 Some(v) => v,
@@ -902,6 +954,8 @@ impl Executor {
 
             let waker = make_waker(index, generation);
             let mut cx = Context::from_waker(&waker);
+            COOP.with(|c| c.set(COOP_BUDGET));
+            ran += 1;
             let poll = match &mut body {
                 TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
                 TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
@@ -928,6 +982,7 @@ impl Executor {
                 }
             });
         }
+        (ran, EXEC_STATE.with(|s| !s.borrow().ready.is_empty()))
     }
 
     /// メインの実行ループ。
@@ -947,14 +1002,25 @@ impl Executor {
             *setter.borrow_mut() = Some(r);
         });
 
+        let mut since_park = 0u32;
         loop {
-            self.run_ready_tasks();
+            let (ran, more) = self.run_ready_tasks();
 
             if result.borrow().is_some() {
                 break;
             }
 
-            let timeout = next_timeout();
+            // タスクが残っているときは待たない。残っている間もときどきイベントとタイマーを見る（B-332）
+            since_park = since_park.saturating_add(ran);
+            if more && since_park < EVENT_INTERVAL {
+                continue;
+            }
+            since_park = 0;
+            let timeout = if more {
+                Some(Duration::ZERO)
+            } else {
+                next_timeout()
+            };
             #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
             park(timeout);
             #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll)))]
@@ -1291,6 +1357,7 @@ mod tests {
 
     #[test]
     fn spawn_children_and_join() {
+        init_reactor().unwrap();
         init_executor();
         let exec = current_executor();
         let counter = Rc::new(Cell::new(0usize));
@@ -1315,6 +1382,7 @@ mod tests {
 
     #[test]
     fn task_pool_spawn_and_complete() {
+        init_reactor().unwrap();
         init_executor();
         let exec = current_executor();
         let counter = Rc::new(Cell::new(0usize));

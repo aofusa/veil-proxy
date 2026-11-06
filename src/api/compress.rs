@@ -281,14 +281,8 @@ mod imp {
                 Some(Bytes::from(out))
             }
             AcceptedEncoding::Brotli => {
-                let mut out = Vec::with_capacity(body.len() / 2 + 64);
-                let params = brotli::enc::BrotliEncoderParams {
-                    quality: cfg.brotli_level.min(11) as i32,
-                    size_hint: body.len(),
-                    ..Default::default()
-                };
-                brotli::BrotliCompress(&mut &body[..], &mut out, &params).ok()?;
-                Some(Bytes::from(out))
+                crate::static_response::brotli_compress_all(body, cfg.brotli_level.min(11) as i32)
+                    .map(Bytes::from)
             }
             AcceptedEncoding::Zstd => ZSTD.with(|cell| {
                 let mut slot = cell.borrow_mut();

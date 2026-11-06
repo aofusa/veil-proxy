@@ -88,6 +88,14 @@ pub struct QuicUdpSocket {
     local_addr: SocketAddr,
 }
 
+// 待ちの記録を残して閉じない（同じ番号の fd が古い武装を引き継ぐ。F-297）
+#[cfg(veil_rt_reactor)]
+impl Drop for QuicUdpSocket {
+    fn drop(&mut self) {
+        crate::runtime::executor::unregister(self.socket.as_raw_fd());
+    }
+}
+
 impl QuicUdpSocket {
     /// 新しいソケットをバインド
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {

@@ -26,7 +26,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
-use crate::runtime::executor::{register_read, register_write, unregister};
+use crate::runtime::executor::{coop_proceed, register_read, register_write, unregister};
 use crate::runtime::handle::{win, AsRawFd, RawFd};
 
 /// `WSAStartup` を一度だけ実行する。プロセス内のどの Winsock API 呼び出しよりも
@@ -692,6 +692,10 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // B-332: try-first の I/O が成功し続けるタスクにワーカーを占有させない
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         let this = unsafe { self.get_unchecked_mut() };
         let buf = this
             .buf
@@ -733,6 +737,10 @@ impl<T: IoBuf> Future for WriteFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // B-332: try-first の I/O が成功し続けるタスクにワーカーを占有させない
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         let this = unsafe { self.get_unchecked_mut() };
         let buf = this
             .buf
@@ -774,6 +782,10 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
     type Output = (io::Result<usize>, A, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // B-332: try-first の I/O が成功し続けるタスクにワーカーを占有させない
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         let this = unsafe { self.get_unchecked_mut() };
         let (a, b) = this
             .bufs
@@ -869,6 +881,10 @@ impl<'a> Future for Readable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // B-332: try-first の I/O が成功し続けるタスクにワーカーを占有させない
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         if poll_ready_now(self.fd, false) {
             return Poll::Ready(Ok(()));
         }

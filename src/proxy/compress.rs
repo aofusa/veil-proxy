@@ -143,20 +143,20 @@ pub(super) async fn transfer_response_with_compression(
     // 初期値false: エラー時はKeep-Aliveを無効化
     let mut backend_wants_keep_alive = false;
 
-    // kqueue: 要求を送った直後の 1 回目は応答がまだ届いていないのが普通なので、
-    // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから読む
+    // kqueue・epoll: 要求を送った直後の 1 回目は応答がまだ届いていないのが普通なので、
+    // 先読み（EAGAIN）+ 確認用 poll(2) を打たずにイベントを待ってから読む
     // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
-    #[cfg(veil_poller_kqueue)]
+    #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
     let mut first_read = true;
 
     // ヘッダー読み取り用バッファ
     loop {
         // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
         let read_buf = buf_get();
-        #[cfg(veil_poller_kqueue)]
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         let wait_first = std::mem::replace(&mut first_read, false);
         let read_result = timeout(BACKEND_HEADER_TIMEOUT, async {
-            #[cfg(veil_poller_kqueue)]
+            #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
             if wait_first {
                 if let Err(e) = backend_stream.readable_lazy().await {
                     return (Err(e), read_buf);
@@ -622,13 +622,10 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
             }
         }
         AcceptedEncoding::Brotli => {
-            let mut compressed = Vec::new();
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: compression.brotli_level as i32,
-                ..Default::default()
-            };
-            let mut input = std::io::Cursor::new(&body_data);
-            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
+            let Some(compressed) = crate::static_response::brotli_compress_all(
+                &body_data,
+                compression.brotli_level as i32,
+            ) else {
                 return transfer_uncompressed_fallback(
                     client_stream,
                     original_headers,
@@ -637,7 +634,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                 )
                 .await
                 .map(|t| (t, backend_wants_keep_alive));
-            }
+            };
             compressed
         }
         AcceptedEncoding::Deflate => {

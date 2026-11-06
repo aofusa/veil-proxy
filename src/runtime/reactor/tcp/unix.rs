@@ -2,7 +2,7 @@
 //!
 //! `runtime::uring::tcp` と同一の公開 API（型・メソッドシグネチャ）を提供する。
 //! 実装方式は「try-first」: まず非ブロッキング syscall（`accept4`/`read`/`write`/
-//! `sendmsg`/`connect`）を試し、`EAGAIN` なら oneshot readiness を登録して `Pending` を
+//! `sendmsg`/`connect`）を試し、`EAGAIN` なら readiness を登録して `Pending` を
 //! 返し、起床後に再試行する。
 //!
 //! io_uring 版と異なり、readiness モデルではカーネルが Future 保有のバッファを非同期に
@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
-use crate::runtime::executor::{register_read, register_write, unregister};
+use crate::runtime::executor::{coop_proceed, register_read, register_write, unregister};
 
 // SO_* ソケットオプション
 const TCP_NODELAY: libc::c_int = 1;
@@ -124,6 +124,9 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
     }
     #[cfg(target_os = "macos")]
     set_so_nosigpipe(fd);
+    // 同じ番号の古い武装の記録を引き継がない（F-297）
+    #[cfg(veil_poller_epoll)]
+    crate::runtime::executor::forget_stale_fd(fd);
     Ok(fd)
 }
 
@@ -318,7 +321,7 @@ impl TcpListener {
                 Ok(Some((fd, storage))) => {
                     // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                     // fd がクローズされ、リークしない（`Accept::poll` と同じ順序）。
-                    let stream = TcpStream { fd };
+                    let stream = TcpStream::new_accepted(fd);
                     // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないため、
                     // プレースホルダを返す（IP ブロックリスト・アクセスログはこの値を見る）。
                     if self.is_unix {
@@ -442,7 +445,7 @@ impl<'a> Future for Accept<'a> {
             Some((fd, storage)) => {
                 // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                 // fd がクローズされ、リークしない。
-                let stream = TcpStream { fd };
+                let stream = TcpStream::new_accepted(fd);
                 let peer_addr = if self.is_unix {
                     SocketAddr::from(([127, 0, 0, 1], 0))
                 } else {
@@ -468,6 +471,14 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// 受理したばかりの fd から作る（同じ番号の古い武装の記録を引き継がない。F-297）。
+    #[inline]
+    fn new_accepted(fd: RawFd) -> TcpStream {
+        #[cfg(veil_poller_epoll)]
+        crate::runtime::executor::forget_stale_fd(fd);
+        TcpStream { fd }
+    }
+
     /// raw fd から作成する。
     ///
     /// # Safety
@@ -635,7 +646,7 @@ impl TcpStream {
     /// `Ready` を返し得る（呼び出し側は直後の非ブロッキング I/O の `WouldBlock` で気付く前提）。
     /// 読み取り可能を見てから時間切れ付きで読む WebSocket の中継は、偽の `Ready` で片方向の読み取りに
     /// 止まり、反対方向を中継しなくなる（B-309）。そういう呼び出し側はこちらを使う。
-    /// epoll は元々ヒントを使わないので `readable` と同じ。
+    /// epoll の `readable` はヒントを使わないので同じ動作。
     pub fn readable_confirmed(&self) -> Readable<'_> {
         Readable {
             fd: self.fd,
@@ -645,7 +656,7 @@ impl TcpStream {
         }
     }
 
-    /// 読み取り可能になるまで待つ（kqueue では確認用の `poll(2)` を打たずに登録から入る）。
+    /// 読み取り可能になるまで待つ（kqueue・epoll では確認用の `poll(2)` を打たずに登録から入る）。
     ///
     /// HTTP/1.1 keep-alive で「応答を返した直後に次のリクエストを待つ」箇所専用。
     /// この時点でデータが届いていることはほぼ無いため、`read` を先に試すと毎回 EAGAIN、
@@ -654,7 +665,7 @@ impl TcpStream {
     /// nginx は kevent の通知を待ってから 1 回だけ読む）。kqueue の `EVFILT_READ` は
     /// レベルトリガなので、登録時点で既にデータがあればすぐに通知され取りこぼさない。
     /// 2 回目以降の poll（ヒント無しの起床）は `Readable` と同じく `poll(2)` で確認する。
-    /// epoll は B-75 の理由で確認用 `poll(2)` を省略しないため `Readable` と同じ動作。
+    /// epoll はレベルトリガで同じ動作に加え、この fd のイベントで起きたら確認せずに読みにいく（F-297）。
     pub fn readable_lazy(&self) -> ReadableLazy<'_> {
         ReadableLazy {
             fd: self.fd,
@@ -1211,6 +1222,10 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // B-332: try-first の I/O が成功し続けるタスクにワーカーを占有させない
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         // SAFETY: ReadFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
@@ -1260,6 +1275,9 @@ impl<T: IoBuf> Future for WriteFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         // SAFETY: WriteFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
@@ -1315,6 +1333,9 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
     type Output = (io::Result<usize>, A, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         // SAFETY: SendMsgFuture は自己参照ポインタを持たないので、Pin から &mut を取り出して移動しない限り安全。
         let this = unsafe { self.get_unchecked_mut() };
         loop {
@@ -1404,12 +1425,12 @@ impl<'a> Future for Readable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // F-141/F-166 A-1: kqueue/epoll いずれのバックエンドでも、直前の起床が
-        // この fd を readable と報告済みなら、確認用の `poll(2)` syscall を省略する
-        // （`executor::take_read_hint` の doc 参照。consume-once のため、無関係な
-        // 後続呼び出しに古いヒントが漏れることはない）。epoll は F-166 A-2 で ET 常時
-        // 登録に変わったため、ヒントが立っていない場合の以下の `poll(2)` フォールバックが
-        // 「エッジを取りこぼしていないか」の最終確認として必須になる（削除禁止）。
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
+        // F-141: 直前の起床が kqueue でこの fd を readable と報告済みなら、確認用の `poll(2)` syscall を
+        // 省略する（`executor::take_read_hint` の doc 参照。consume-once のため、無関係な後続呼び出しに
+        // 古いヒントが漏れることはない）。
         // B-309: `readable_confirmed` はヒントを捨てるだけで信じない（古いヒントを残さない）
         #[cfg(veil_poller_kqueue)]
         if crate::runtime::executor::take_read_hint(self.fd) > 0 && self.trust_hint {
@@ -1443,6 +1464,26 @@ impl<'a> Future for ReadableLazy<'a> {
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // epoll（F-297）: 応答の直後の待ちはまず待ちに入り、この fd のイベントで起きたら確認せずに読みにいく。
+        // 確認の `poll(2)` が 1 要求あたり 2 本だった。読み取りは `EAGAIN` なら待ち直すので、ここの `Ready` が
+        // 外れても待つ場所が変わるだけ（`ReadableLazy` はその読み取りだけが続く箇所で使う）。
+        // 必ず一度は executor へ戻るので、すぐ次を送ってくる接続が他の接続を飢えさせない（B-332）。
+        #[cfg(veil_poller_epoll)]
+        {
+            let _ = &mut self.registered;
+            if crate::runtime::executor::lazy_read_ready(self.fd, cx.waker()) {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+        #[cfg(not(veil_poller_epoll))]
+        self.poll_confirming(cx)
+    }
+}
+
+impl ReadableLazy<'_> {
+    #[cfg(not(veil_poller_epoll))]
+    fn poll_confirming(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         #[cfg(veil_poller_kqueue)]
         {
             if crate::runtime::executor::take_read_hint(self.fd) > 0 {
@@ -1455,7 +1496,7 @@ impl<'a> Future for ReadableLazy<'a> {
             }
         }
         let _ = &mut self.registered;
-        // ヒント無しの起床（他タスクによる wake_all_readers 等）や epoll では、
+        // ヒント無しの起床（他タスクによる wake_all_readers 等）では、
         // `Readable` と同じく poll(2) で確認してから登録し直す。
         let mut pfd = libc::pollfd {
             fd: self.fd,
@@ -1482,6 +1523,9 @@ impl<'a> Future for Writable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !coop_proceed(cx) {
+            return Poll::Pending;
+        }
         // F-155: kqueue バックエンドでは、直前の `EVFILT_WRITE` 起床がこの fd を
         // writable と報告済みなら、確認用の `poll(2)` syscall を省略する
         // （`executor::take_write_hint` の doc 参照。consume-once のため、無関係な
@@ -1512,12 +1556,24 @@ impl<'a> Future for Writable<'a> {
 /// 任意の FD が読み込み可能になるまで待つ Future。
 pub struct ReadableFd {
     fd: RawFd,
+    /// epoll: 待ちを登録した（F-297）。
+    #[cfg(veil_poller_epoll)]
+    registered: bool,
 }
 
 impl Future for ReadableFd {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // epoll（F-297）: まず待ちに入る（レベルトリガなので、もう読めるなら次の `epoll_wait` が報告する）。
+        // 確認の `poll(2)` は起きた後の 1 本だけ。必ず一度 executor へ戻るので、すぐ次を送ってくる接続が同じ
+        // ワーカーの他の接続を飢えさせない（B-332）。起きた後の確認は省かない: HTTP/2 の接続のループは
+        // 可読を見てから読み取りを待つので、外れると応答の通知を待てなくなる（B-75）。
+        #[cfg(veil_poller_epoll)]
+        if !std::mem::replace(&mut self.registered, true) {
+            register_read(self.fd, cx.waker().clone());
+            return Poll::Pending;
+        }
         // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
         // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
@@ -1572,7 +1628,11 @@ impl Future for WritableFd {
 
 /// 任意の FD が読み込み可能になるまで待つ。
 pub fn wait_readable_fd(fd: RawFd) -> ReadableFd {
-    ReadableFd { fd }
+    ReadableFd {
+        fd,
+        #[cfg(veil_poller_epoll)]
+        registered: false,
+    }
 }
 
 /// 任意の FD が書き込み可能になるまで待つ。

@@ -72,6 +72,7 @@ class Server:
             raise SystemExit(f"{addr} is already in use")  # 残ったサーバを測らない（B-218）
         full_env = dict(os.environ, **env)
         self.sc_out = None
+        self.sc_prev = {}
         if count_syscalls:
             self.sc_out = tempfile.mktemp(prefix="veil-sc-")
             full_env.update(LD_PRELOAD=count_syscalls, SC_OUT=self.sc_out)
@@ -87,18 +88,26 @@ class Server:
             self.proc.kill()
             self.proc.wait()
 
-    def syscalls(self, requests):
-        if not self.sc_out:
-            return ""
+    def syscall_totals(self):
+        """プロセス開始からの累計（SIGUSR2 で書かせる）。"""
         self.proc.send_signal(signal.SIGUSR2)
         time.sleep(0.3)
         try:
             with open(self.sc_out) as f:
-                pairs = [line.split() for line in f]
+                totals = {k: int(v) for k, v in (line.split() for line in f)}
             os.unlink(self.sc_out)
         except OSError:
+            return {}
+        return totals
+
+    def syscalls(self, requests):
+        """前の行からの増分を要求数で割る（同じサーバで複数の行を測るので累計のままでは割れない）。"""
+        if not self.sc_out:
             return ""
-        return " ".join(f"{k}={int(v) / requests:.3f}" for k, v in pairs if int(v) / requests >= 0.0005)
+        totals = self.syscall_totals()
+        per_req = {k: (v - self.sc_prev.get(k, 0)) / requests for k, v in totals.items()}
+        self.sc_prev = totals
+        return " ".join(f"{k}={v:.3f}" for k, v in per_req.items() if v >= 0.0005)
 
 
 def run_row(args, srv, target, rnd, row, load_args, writer, warmup=None):

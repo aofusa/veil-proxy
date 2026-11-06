@@ -9,8 +9,10 @@
 //!
 //! ## 設計要点
 //!
-//! - 各 I/O は「非ブロッキング syscall を先に試す → `WouldBlock` なら oneshot readiness を
+//! - 各 I/O は「非ブロッキング syscall を先に試す → `WouldBlock` なら readiness を
 //!   登録して `Pending` を返す → 起床後に再試行する」という **try-first** パターンで実装する。
+//! - 連続して成功する I/O には回数の上限（`executor::coop_proceed`）があり、タスクはワーカーを
+//!   占有しない。ready キューが残っていても、ときどき poller を見る（B-332）。
 //! - io_uring と異なり、readiness モデルでは「カーネルが Future 保有のバッファを非同期に
 //!   参照し続ける」ことが構造的に発生しない（実際の read/write syscall は Future が
 //!   起床して再 poll された時点で同期的に発行する）。そのため io_uring 版の
