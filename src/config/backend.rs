@@ -269,6 +269,11 @@ impl ProxyTarget {
             }
             None => (host_port.to_string(), if scheme { 443 } else { 80 }),
         };
+        // B-324: ホスト名 `unix` は接続先表記が `unix:<port>` になり、接続で UDS（相対パス）と取り違えるので拒否する
+        // （API クライアントの unix_sockets = false を `http://unix/` で越えられた）
+        if host.eq_ignore_ascii_case("unix") {
+            return None;
+        }
 
         // host が IP アドレスリテラルであれば、設定ロード時に一度だけ SocketAddr を
         // 構築しておく（ホットパスでのブロッキング DNS 解決・to_socket_addrs() の
@@ -509,6 +514,14 @@ pub(super) mod proxy_target_socket_addr_tests {
         let t = ProxyTarget::parse("http://backend.example.com:8080/").unwrap();
         let expected = crate::http_utils::HostPortStr::new(&t.host, t.port);
         assert_eq!(t.conn_addr().as_str(), expected.as_str());
+    }
+
+    // B-324
+    #[test]
+    fn host_named_unix_is_rejected() {
+        assert!(ProxyTarget::parse("http://unix/").is_none());
+        assert!(ProxyTarget::parse("http://UNIX:8080/").is_none());
+        assert!(ProxyTarget::parse("http://unixhost/").is_some());
     }
 
     #[cfg(unix)]

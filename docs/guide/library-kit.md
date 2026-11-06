@@ -202,7 +202,8 @@ let created: Item = res.error_for_status()?.json()?;
 - HTTP/1.1 connections are pooled per worker (`pool_idle_timeout`, default 60 s); an idempotent request whose pooled
   connection turned out to be closed is sent once more on a new connection.
 - Bodies are read whole (`max_response_size`, default 64 MiB). Errors have a `kind()` (`Connect`, `Timeout`,
-  `Protocol`, `Status`, ...) and convert into a 502/504 `Response`.
+  `Protocol`, `Status`, ...) and convert into a 502/504 `Response` whose body says only `Bad Gateway` / `Gateway Timeout`
+  (log the error itself for the details; its message never contains the URL's query or userinfo).
 - Build clients at startup: a custom CA or client certificate is read from disk when the client is built.
 
 `veil_kit::client::{get_json, post_json, retry}` add JSON round trips and retries with exponential backoff for

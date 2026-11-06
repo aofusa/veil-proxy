@@ -194,7 +194,8 @@ let created: Item = res.error_for_status()?.json()?;
 - HTTP/1.1 の接続はワーカーごとにプールします（`pool_idle_timeout`、既定 60 秒）。プールの接続が切れていた冪等な要求は、新しい接続で
   1 回だけ送り直します。
 - 本文は全部読みます（`max_response_size`、既定 64 MiB）。エラーには `kind()`（`Connect`・`Timeout`・`Protocol`・`Status` 等）があり、
-  502・504 の `Response` に変換できます。
+  502・504 の `Response` に変換できます（本文は `Bad Gateway` / `Gateway Timeout` だけ。詳細はエラー自体をログに出してください。
+  エラーの文に URL のクエリ・userinfo は入りません）。
 - クライアントは起動時に作ってください。独自の CA・クライアント証明書はクライアントを作るときにディスクから読みます。
 
 `veil_kit::client::{get_json, post_json, retry}` は JSON の往復と、接続エラー・タイムアウト・502〜504 での指数バックオフの再試行を足します。

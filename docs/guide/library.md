@@ -834,7 +834,7 @@ anchors from `[tls_client] ca`, or `ClientBuilder::ca`; `client_cert` for mTLS),
 per-worker HTTP/1.1 pool. `Http2::Auto` (default) negotiates h2 or HTTP/1.1 by ALPN over TLS and uses HTTP/1.1 in
 plain text, `Http2::On` uses h2 and h2c with prior knowledge, `Http2::Off` HTTP/1.1. With
 `ClientBuilder::unix_sockets(true)`, `http://unix:/path.sock:/x` connects to a Unix socket (off by default). Response bodies are read whole (`max_response_size`, 64 MiB by default). Errors have a
-`kind()` and convert into a 502 or 504 `Response`. Details: [library-kit.md](library-kit.md#http-client).
+`kind()` and convert into a 502 or 504 `Response` with a generic body (log the error for the details). Details: [library-kit.md](library-kit.md#http-client).
 
 ## GraphQL
 

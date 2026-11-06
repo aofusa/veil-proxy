@@ -122,8 +122,30 @@ impl From<ClientError> for super::response::Response {
             ErrorKind::Timeout => 504,
             _ => 502,
         };
-        super::response::Response::error(status, &e.message)
+        // B-324: 詳細（URL のクエリの API キー・内部のアドレス・OS のエラー）は利用者へ返さない。
+        // 詳細は Display・message でログに出す
+        let msg = if status == 504 {
+            "Gateway Timeout"
+        } else {
+            "Bad Gateway"
+        };
+        super::response::Response::error(status, msg)
     }
+}
+
+/// エラーの文に入れる URL（クエリ・フラグメント・userinfo を外す。B-324）。
+fn url_for_error(url: &str) -> String {
+    let base = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    let (scheme, rest) = match base.find("://") {
+        Some(i) => (&base[..i + 3], &base[i + 3..]),
+        None => ("", base),
+    };
+    let auth_end = rest.find('/').unwrap_or(rest.len());
+    let rest = match rest[..auth_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    format!("{}{}", scheme, rest).escape_debug().to_string()
 }
 
 /// Settings of a [`Client`].
@@ -399,7 +421,7 @@ impl Client {
         let bad = || {
             ClientError::new(
                 ErrorKind::Url,
-                format!("unsupported URL '{}'", url.escape_debug()),
+                format!("unsupported URL '{}'", url_for_error(url)),
             )
         };
         // B-198: 空白・制御文字（CR・LF 等）は要求行に書けない
@@ -456,9 +478,18 @@ impl Client {
         } else {
             format!("{}:{}", t.host, t.port)
         };
+        // B-324: 方式も鍵に入れる（同じ host:port の http:// の平文の接続を https:// の要求が使い、資格情報を平文で送った）
+        let scheme = if t.use_tls {
+            "https"
+        } else if t.use_h2c {
+            "h2c"
+        } else {
+            "http"
+        };
         let pool_key = format!(
-            "veil-client#{}|{}|{}|{}",
+            "veil-client#{}|{}|{}|{}|{}",
             self.inner.id,
+            scheme,
             t.conn_addr().as_str(),
             t.sni(),
             self.inner.tls.tag()
@@ -544,7 +575,7 @@ impl Client {
             Ok(r) => r,
             Err(_) => Err(ClientError::new(
                 ErrorKind::Timeout,
-                format!("request to {} timed out", req.url),
+                format!("request to {} timed out", url_for_error(&req.url)),
             )),
         }
     }
@@ -1397,6 +1428,28 @@ mod tests {
             assert_eq!(t, "/v1/x");
         }
         assert_eq!(c.resolve("ftp://x").unwrap_err().kind(), ErrorKind::Url);
+    }
+
+    // B-324: 方式ごとにプールを分ける・ホスト名 unix を UDS にしない・利用者へ詳細を返さない
+    #[test]
+    fn b324_pool_scheme_unix_host_and_error_details() {
+        let c = Client::new();
+        let (h, _) = c.resolve("http://example.com:8443/").unwrap();
+        let (s, _) = c.resolve("https://example.com:8443/").unwrap();
+        assert_ne!(h.pool_key, s.pool_key);
+        assert_eq!(
+            c.resolve("http://unix/").unwrap_err().kind(),
+            ErrorKind::Url
+        );
+        assert_eq!(
+            url_for_error("https://user:pw@api.example.com/v1/x?key=secret#f"),
+            "https://api.example.com/v1/x"
+        );
+        let r: super::super::response::Response =
+            ClientError::new(ErrorKind::Connect, "connect to 10.0.0.1:5432 failed").into();
+        assert_eq!(r.status, 502);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert!(!body.contains("10.0.0.1"), "{body}");
     }
 
     // B-198: 制御文字・空白を要求行・ヘッダに書かない
