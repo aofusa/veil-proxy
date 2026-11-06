@@ -52,7 +52,8 @@ impl H2Service for MeshH2Service {
             *self.ctx.borrow_mut() = r;
         }
         let c = self.ctx.borrow().clone();
-        crate::runtime::spawn(async move {
+        // B-315: ストリームの処理の panic はそのストリームだけで止める
+        crate::system::spawn_with_panic_catch(async move {
             task(c, ctx, req_rx, &resp_tx, &notify).await;
             drop(resp_tx);
             notify.notify();

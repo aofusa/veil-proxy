@@ -103,7 +103,7 @@ pub async fn connect_internal(name: &str, dst: SocketAddr) -> io::Result<TcpStre
     }
     let (mine, theirs) = socketpair()?;
     let peer = SocketAddr::from(([0, 0, 0, 0], 0));
-    crate::runtime::spawn(server::handle_internal(
+    crate::system::spawn_with_panic_catch(server::handle_internal(
         theirs,
         lst,
         peer,
@@ -271,7 +271,9 @@ pub async fn terminate<F, Fut>(
         Ok(p) => p,
         Err(_) => return,
     };
-    crate::runtime::spawn(server::handle_internal(theirs, lst, peer, dst, inherited));
+    crate::system::spawn_with_panic_catch(server::handle_internal(
+        theirs, lst, peer, dst, inherited,
+    ));
     let wr = match dup(&mine) {
         Ok(w) => w,
         Err(_) => return,

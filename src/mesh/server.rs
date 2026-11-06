@@ -188,7 +188,9 @@ async fn accept_loop<F, Fut>(
         }
         match crate::runtime::timeout(Duration::from_secs(1), l.accept()).await {
             Ok(Ok((stream, peer))) => {
-                pool.spawn(h(stream, peer, addr));
+                // B-315: 接続タスクの panic をタスクの中で止める（データプレーンの accept と同じ）。
+                // 止めないと 1 つの要求の panic でワーカーと、その上の全接続が落ちる
+                crate::system::spawn_pooled_with_panic_catch(&pool, h(stream, peer, addr));
             }
             Ok(Err(e)) => {
                 ftlog::debug!("[mesh] accept on {}: {}", addr, e);
