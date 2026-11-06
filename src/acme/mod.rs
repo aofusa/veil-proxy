@@ -371,3 +371,30 @@ fn run_loop() {
         sleep_interruptible(Duration::from_secs(st.cfg.check_interval_secs.max(60)));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-325: 秘密は所有者だけ（unix は 0600、Windows は継承を切った DACL）で書く
+    #[test]
+    fn secret_files_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("veil-acme-b325-{}", std::process::id()));
+        create_dir(&dir).unwrap();
+        let key = dir.join("key.pem");
+        write_atomic(&key, b"secret", true).unwrap();
+        assert_eq!(read(&key).as_deref(), Some(&b"secret"[..]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(dmode & 0o777, 0o700);
+        }
+        // 書き直せる（所有者が DACL で締め出されない）
+        write_atomic(&key, b"secret2", true).unwrap();
+        assert_eq!(read(&key).as_deref(), Some(&b"secret2"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

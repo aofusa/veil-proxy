@@ -16,5 +16,6 @@ v0.11.0 前のセキュリティスキャン（Claude Security の F25）で判�
 
 ## 試験
 
-- Windows 実機（aofish）でのビルドと ACME の E2E で確かめる。
+- `acme::tests::secret_files_are_owner_only`（unix は 0600・0700、Windows は DACL を付けて所有者が書き直せる）。
+  Windows 実機（aofish）の `cargo test --lib --features full-windows acme::` で通過。
 - 文書: `docs/guide/acme.md`（英日）。
