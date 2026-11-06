@@ -808,6 +808,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Foundation",
     "Win32_Security",
+    # ACME の鍵ファイルの DACL（SetNamedSecurityInfoW。B-325）
+    "Win32_Security_Authorization",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_IO",

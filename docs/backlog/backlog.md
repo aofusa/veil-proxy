@@ -670,6 +670,7 @@
 | B-322 | P1 | 修正済み（v0.11.0） | [bugs/B-322-misc-auth-routing-transport.md](bugs/B-322-misc-auth-routing-transport.md) | JWT の小数・文字列の exp を期限なしで通す、読めない allowed_ips で全許可、`$path` のオープンリダイレクト、gRPC の content-type でパスの書き換えを外せる、https の上流へ平文（h2c・裏の再検証・OTLP）、HPACK の資格情報、HTTP/3 の Content-Length の確保 |
 | B-323 | P1 | 修正済み（v0.11.0） | [bugs/B-323-mesh-tls-policy-gaps.md](bugs/B-323-mesh-tls-policy-gaps.md) | メッシュ: 証明書の無い相手の XFCC を残す、SAN の条件が無い上流の TLS で名前を検査しない、失効リストを黙って捨てる、Linkerd の inbound がポリシー無しで中継 |
 | B-324 | P1 | 修正済み（v0.11.0） | [bugs/B-324-api-client-pool-errors-unix-host.md](bugs/B-324-api-client-pool-errors-unix-host.md) | API クライアント: プールの鍵に方式が無く https の要求が平文の接続を使う、エラーの詳細（URL のクエリ・内部のアドレス）を利用者へ返す、`http://unix/` が UDS になる |
+| B-325 | P2 | 修正済み（v0.11.0） | [bugs/B-325-acme-windows-key-permissions.md](bugs/B-325-acme-windows-key-permissions.md) | Windows で ACME の秘密鍵・アカウント鍵が親ディレクトリの DACL を継承する |
 
 ---
 
