@@ -2186,7 +2186,11 @@ pub(super) async fn write_api_chunked(
     }
     let mut tail = Vec::with_capacity(5 + trailers.len() * 32);
     tail.extend_from_slice(b"0\r\n");
-    for (n, v) in &trailers {
+    // B-318: CR・LF を含むトレーラは書かない
+    for (n, v) in trailers
+        .iter()
+        .filter(|(n, v)| crate::http_utils::is_writable_h1_field(n, v))
+    {
         tail.extend_from_slice(n);
         tail.extend_from_slice(b": ");
         tail.extend_from_slice(v);

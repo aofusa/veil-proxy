@@ -128,6 +128,8 @@ pub(crate) fn write_http1_101(out: &mut Vec<u8>, resp: &Response, protocol: &[u8
             || n.eq_ignore_ascii_case(b"upgrade")
             || n.eq_ignore_ascii_case(b"content-length")
             || n.eq_ignore_ascii_case(b"transfer-encoding")
+            // B-318: CR・LF を含むヘッダは書かない
+            || !crate::http_utils::is_writable_h1_field(n, v)
         {
             continue;
         }

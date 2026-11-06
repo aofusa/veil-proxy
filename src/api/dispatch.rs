@@ -311,7 +311,11 @@ pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: b
     out.extend_from_slice(b"\r\n");
     let mut has_len = false;
     for (n, v) in &resp.headers {
-        if n.eq_ignore_ascii_case(b"connection") || n.eq_ignore_ascii_case(b"transfer-encoding") {
+        // B-318: CR・LF を含むヘッダは書かない（ハンドラはデコード済みのクエリ・パスを返し得る）
+        if n.eq_ignore_ascii_case(b"connection")
+            || n.eq_ignore_ascii_case(b"transfer-encoding")
+            || !crate::http_utils::is_writable_h1_field(n, v)
+        {
             continue;
         }
         if n.eq_ignore_ascii_case(b"content-length") {

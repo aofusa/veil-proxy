@@ -982,7 +982,11 @@ pub(super) async fn h1_wasm_response_head(
     };
     let mut out = Vec::with_capacity(head.len() + 64);
     out.extend_from_slice(&head[..status_end]);
-    for (name, value) in modified.iter().filter(|(n, _)| !is_framing(n)) {
+    // B-318: Wasm が書き換えたヘッダは CR・LF を含むものを書かない（応答の分割。F40）
+    for (name, value) in modified
+        .iter()
+        .filter(|(n, v)| !is_framing(n) && crate::http_utils::is_writable_h1_field(n, v))
+    {
         out.extend_from_slice(name);
         out.extend_from_slice(b": ");
         out.extend_from_slice(value);

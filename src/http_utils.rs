@@ -947,6 +947,15 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
     memchr3(b'\r', b'\n', 0, value).is_none()
 }
 
+/// HTTP/1.1 の応答の head にそのまま書いてよいフィールドか（名前が token、値に CR・LF・NUL が無い）。
+///
+/// B-318: ハンドラ・Proxy-Wasm・上流の HTTP/2 の応答のヘッダは任意のバイトを持ち得るので、HTTP/1.1 へ書く
+/// 直前に確かめて、満たさないものは書かない（応答の分割を防ぐ。F15・F30・F40）
+#[inline]
+pub(crate) fn is_writable_h1_field(name: &[u8], value: &[u8]) -> bool {
+    is_valid_header_name(name) && is_valid_header_value(value)
+}
+
 /// HTTP/2・HTTP/3 のフィールドの値が RFC 9113 §8.2.1・RFC 9114 §4.2 の条件を満たすか:
 /// NUL・LF・CR を含まず、空白（SP・HTAB）で始まらず終わらない。HPACK・QPACK は任意のバイトを運べるので、
 /// HTTP/1.1 の上流へ渡すと要求の密輸になる（F-236 の F1・F2）。
@@ -2113,6 +2122,19 @@ mod idempotent_method_tests {
         for m in [&b"POST"[..], b"PATCH", b"CONNECT", b"get"] {
             assert!(!super::is_idempotent_method(m));
         }
+    }
+
+    /// B-318: HTTP/1.1 の応答の head に書けるフィールド
+    #[test]
+    fn writable_h1_field() {
+        assert!(super::is_writable_h1_field(b"x-a", b"v 1"));
+        assert!(!super::is_writable_h1_field(
+            b"x-a",
+            b"v\r\nSet-Cookie: a=b"
+        ));
+        assert!(!super::is_writable_h1_field(b"x-a", b"v\0"));
+        assert!(!super::is_writable_h1_field(b"x a", b"v"));
+        assert!(!super::is_writable_h1_field(b"x-a\r\n", b"v"));
     }
 
     /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）

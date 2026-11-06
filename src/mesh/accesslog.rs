@@ -315,7 +315,19 @@ fn render(toks: &[Tok], r: &Record<'_>, out: &mut String) {
                 }
                 None => out.push('-'),
             },
-            Tok::RequestedServerName => out.push_str(r.sni.unwrap_or("-")),
+            // B-318: SNI は ClientHello の値なので制御文字をエスケープする（ログの行の偽造。F51）
+            Tok::RequestedServerName => match r.sni {
+                Some(s) => {
+                    for ch in s.chars() {
+                        if ch.is_control() {
+                            let _ = write!(out, "\\x{:02x}", ch as u32);
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                }
+                None => out.push('-'),
+            },
             Tok::RouteName => out.push_str(if r.route_name.is_empty() {
                 "-"
             } else {

@@ -1247,7 +1247,7 @@ where
 
                 match name.as_ref() {
                     b":method" => {
-                        method_count += 1;
+                        method_count = method_count.saturating_add(1);
                         if !crate::http_utils::is_valid_method(&header.value) {
                             return Err(Http2Error::stream_error(
                                 stream_id,
@@ -1260,10 +1260,10 @@ where
                         }
                     }
                     b":scheme" => {
-                        scheme_count += 1;
+                        scheme_count = scheme_count.saturating_add(1);
                     }
                     b":path" => {
-                        path_count += 1;
+                        path_count = path_count.saturating_add(1);
                         // 空の :path は禁止 (RFC 7540 8.1.2.3)
                         if header.value.is_empty() {
                             return Err(Http2Error::stream_error(
@@ -1284,10 +1284,10 @@ where
                         }
                     }
                     b":authority" => {
-                        authority_count += 1;
+                        authority_count = authority_count.saturating_add(1);
                     }
                     b":protocol" if extended_connect => {
-                        protocol_count += 1;
+                        protocol_count = protocol_count.saturating_add(1);
                         // 値は token（上流へ `Upgrade` として渡し得る）
                         if !crate::http_utils::is_valid_header_name(&header.value) {
                             return Err(Http2Error::stream_error(
@@ -1929,12 +1929,13 @@ where
 
         // エラーコードが 0 以外の場合はログを出力
         if error_code != 0 {
-            let debug_str = String::from_utf8_lossy(debug_data);
+            // B-318: 相手の送るデバッグデータは改行・制御文字をエスケープし、長さも切って書く
+            // （そのまま書くとログの行を偽造できた。F36）
             ftlog::warn!(
                 "HTTP/2 GOAWAY received: error_code={}, last_stream_id={}, debug={}",
                 error_code,
                 last_stream_id,
-                debug_str
+                debug_data[..debug_data.len().min(256)].escape_ascii()
             );
         } else {
             ftlog::debug!("HTTP/2 GOAWAY received: last_stream_id={}", last_stream_id);

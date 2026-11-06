@@ -842,6 +842,19 @@ fn on_headers(
     if st.reset {
         return Ok(());
     }
+    // B-318: 上流の応答のフィールドは名前が token、値に CR・LF・NUL が無いものだけ受ける（RFC 9113 §8.2.1。
+    // HPACK は任意のバイトを運べるので、HTTP/1.1 のクライアントへそのまま書くと応答を分割できた。F15）
+    if fields.iter().any(|f| {
+        !f.name.starts_with(b":")
+            && (!crate::http_utils::is_valid_header_name(&f.name)
+                || !crate::http_utils::is_valid_header_value(&f.value))
+    }) {
+        st.reset = true;
+        st.remote_closed = true;
+        st.resp_queue.push_back(UpResp::Reset { retryable: false });
+        rst(g, stream_id, ERR_PROTOCOL);
+        return Ok(());
+    }
     if !st.head_seen {
         let mut status: u16 = 0;
         let mut headers = Vec::with_capacity(fields.len());
