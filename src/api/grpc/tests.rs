@@ -148,6 +148,56 @@ fn unary_error_is_trailers_only() {
     assert_eq!(field(&h, "x-detail"), Some(&b"d"[..]));
 }
 
+/// A request whose body arrived whole (the buffered path: no body stream).
+fn buffered_request(body: Bytes, extra: &[(&str, &str)]) -> ApiRequest {
+    let mut req = grpc_request(HttpVersion::Http2, Vec::new(), extra);
+    req.body_stream = None;
+    req.body = body;
+    req
+}
+
+// F-298: 本文が全部届いている要求はストリームを通らない
+#[test]
+fn unary_with_a_whole_body_needs_no_body_stream() {
+    let f = handler_of(echo_app());
+    let m = frame(&HealthCheckRequest {
+        service: "whole".into(),
+    });
+    assert!(single_message(
+        &buffered_request(m.clone(), &[]),
+        &accept(&buffered_request(m.clone(), &[])).unwrap()
+    )
+    .is_some());
+    let req = buffered_request(m, &[("x-who", "me")]);
+    let (_, data, t) = collect(futures::executor::block_on(f(req)));
+    let msgs: Vec<HealthCheckRequest> = decode_all(&data);
+    assert_eq!(msgs[0].service, "me:whole");
+    assert_eq!(field(&t, "grpc-status"), Some(&b"0"[..]));
+}
+
+// F-298: 枠がちょうど 1 つでない本文は、ストリームの経路と同じ状態で失敗する
+#[test]
+fn unary_with_a_whole_body_keeps_the_stream_errors() {
+    let f = handler_of(echo_app());
+    let m = frame(&HealthCheckRequest {
+        service: "x".into(),
+    });
+    let two = Bytes::from([&m[..], &m[..]].concat());
+    let mut compressed = m.to_vec();
+    compressed[0] = 1;
+    for (body, code, why) in [
+        (Bytes::new(), &b"13"[..], "missing message"),
+        (two, b"13", "more than one message"),
+        (m.slice(..m.len() - 1), b"13", "cut short"),
+        (m.slice(..3), b"13", "cut inside the frame header"),
+        (Bytes::from(compressed), b"13", "compressed, no grpc-encoding"),
+    ] {
+        let resp = futures::executor::block_on(f(buffered_request(body, &[])));
+        let h = resp.headers().to_vec();
+        assert_eq!(field(&h, "grpc-status"), Some(code), "{}", why);
+    }
+}
+
 #[test]
 fn split_frames_and_missing_or_extra_messages() {
     let f = handler_of(echo_app());

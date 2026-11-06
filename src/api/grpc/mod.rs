@@ -903,6 +903,21 @@ struct Call {
     path: Bytes,
 }
 
+/// Whether the header belongs to the protocol rather than to the call's metadata.
+fn is_protocol_header(name: &[u8]) -> bool {
+    const NAMES: [&[u8]; 7] = [
+        b"content-type",
+        b"te",
+        b"grpc-timeout",
+        b"grpc-encoding",
+        b"grpc-accept-encoding",
+        b"content-length",
+        b"connection",
+    ];
+    // F-298: 要求のヘッダごとに小文字のコピーを作らない
+    NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// Checks whether the request can be accepted as a gRPC request (the response to return if not).
 fn accept(req: &super::request::Request) -> Result<Call, super::response::Response> {
     let ct = req.header("content-type").unwrap_or_default();
@@ -944,18 +959,7 @@ fn accept(req: &super::request::Request) -> Result<Call, super::response::Respon
     let metadata = req
         .headers()
         .iter()
-        .filter(|(n, _)| {
-            !matches!(
-                &n.to_ascii_lowercase()[..],
-                b"content-type"
-                    | b"te"
-                    | b"grpc-timeout"
-                    | b"grpc-encoding"
-                    | b"grpc-accept-encoding"
-                    | b"content-length"
-                    | b"connection"
-            )
-        })
+        .filter(|(n, _)| !is_protocol_header(n))
         .cloned()
         .collect();
     Ok(Call {
@@ -1018,6 +1022,19 @@ where
             }
         }
     }
+}
+
+// F-298: unary の要求のほとんどはここで終わる（チャネル・枠のデコーダ・メッセージのコピーを通さない）。
+/// When the whole body has already arrived and is exactly one uncompressed message within the limit, the message
+/// (a view of the body, no copy). Anything else (`None`) goes through [`Streaming`], which reports the errors.
+fn single_message(req: &super::request::Request, call: &Call) -> Option<Bytes> {
+    if req.is_body_streaming() || call.web.as_ref().is_some_and(|w| w.text) {
+        return None;
+    }
+    let body = req.body();
+    let header: &[u8; 5] = body.get(..5)?.try_into().ok()?;
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    (header[0] == 0 && body.len() - 5 == len && len <= max_message_size()).then(|| body.slice(5..))
 }
 
 /// Reads the single request message of a unary call (zero or two or more messages is an error).
@@ -1186,10 +1203,14 @@ impl App {
                 };
                 let accepts = call.accepts;
                 let web = call.web.clone();
-                let body: Streaming<Req> = request_parts(&req, &call, &decode);
+                let body: Result<Bytes, Streaming<Req>> = single_message(&req, &call)
+                    .ok_or_else(|| request_parts(&req, &call, &decode));
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
-                    let m = read_single(body).await?;
+                    let m = match body {
+                        Ok(m) => decode(m)?,
+                        Err(s) => read_single(s).await?,
+                    };
                     let (req, _) = make_request(call, m);
                     f(req).await
                 })

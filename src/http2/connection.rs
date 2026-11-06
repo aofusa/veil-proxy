@@ -11,7 +11,7 @@ use crate::runtime::buf::OffsetBufMut;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2ErrorCode, Http2Result};
-use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
+use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameFlags, FrameHeader, FrameType};
 use crate::http2::hpack::{HpackDecoder, HpackEncoder};
 use crate::http2::settings::{defaults, Http2Settings};
 use crate::http2::stream::{Stream, StreamManager, StreamState};
@@ -475,6 +475,22 @@ where
         }
 
         Ok(Some(frame))
+    }
+
+    /// 読み込みバッファの次のフレームが `stream_id` の END_STREAM 付き DATA で、全量が届いているか（F-298）。
+    ///
+    /// HEADERS の直後に本文の全量が見えている要求（unary の gRPC 等）を、本文を流すチャネルなしで処理する判定に
+    /// 使う。バッファを消費しない。壊れたフレームは false（続きの [`try_read_frame_buffered`](Self::try_read_frame_buffered)
+    /// がエラーにする）。
+    pub fn next_buffered_frame_ends_stream(&self, stream_id: u32) -> bool {
+        let buf = &self.read_buf[self.buf_start..self.buf_end];
+        let Ok(header) = self.frame_decoder.decode_header(buf) else {
+            return false;
+        };
+        header.frame_type == FrameType::Data as u8
+            && header.stream_id == stream_id
+            && header.flags & FrameFlags::END_STREAM != 0
+            && buf.len() >= FrameHeader::SIZE + header.length as usize
     }
 
     /// 追加データを読み込みバッファへ 1 回だけ読み込む（読み込んだバイト数を返す）。
@@ -2061,14 +2077,11 @@ where
             .await
     }
 
-    /// 任意のトレーラ（名前は小文字）を END_STREAM 付き HEADERS で送る（ハンドラのストリーミング
-    /// 応答、F-197）。呼び出し側は先に `flush_write_buf` しておくこと。
+    /// 任意のトレーラ（名前は小文字）を END_STREAM 付き HEADERS として連結バッファへ積む（ハンドラの
+    /// ストリーミング応答、F-197）。即送出しない（B-333: 応答ごとに `send(2)` を 2 回呼んでいた）。
+    /// 先に積んだ DATA の後ろへ並ぶので、送出の順序は積んだ順のまま。
     #[cfg(feature = "handler")]
-    pub async fn send_trailers<K, V>(
-        &mut self,
-        stream_id: u32,
-        trailers: &[(K, V)],
-    ) -> Http2Result<()>
+    pub fn queue_trailers<K, V>(&mut self, stream_id: u32, trailers: &[(K, V)]) -> Http2Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -2081,10 +2094,14 @@ where
             .hpack_encoder
             .encode(&trailer_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
-        let trailer_frame =
-            self.frame_encoder
-                .encode_headers(stream_id, &trailer_block, true, true, None);
-        self.write_all(trailer_frame).await?;
+        self.frame_encoder.encode_headers_into(
+            &mut self.write_buf,
+            stream_id,
+            &trailer_block,
+            true,
+            true,
+            None,
+        );
         if let Some(stream) = self.streams.get(stream_id) {
             stream.send_headers(true)?;
         }
@@ -2097,6 +2114,18 @@ where
     /// ストリームを END_STREAM でクローズします。
     #[cfg(feature = "grpc")]
     pub async fn send_grpc_trailers(
+        &mut self,
+        stream_id: u32,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> Http2Result<()> {
+        self.queue_grpc_trailers(stream_id, grpc_status, grpc_message)?;
+        self.flush_write_buf().await
+    }
+
+    /// gRPC トレイラーを連結バッファへ積む（送出は次の `flush_write_buf`。B-333）
+    #[cfg(feature = "grpc")]
+    pub fn queue_grpc_trailers(
         &mut self,
         stream_id: u32,
         grpc_status: u32,
@@ -2125,14 +2154,14 @@ where
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         // HEADERS (as trailers) with end_stream=true
-        let trailer_frame = self.frame_encoder.encode_headers(
+        self.frame_encoder.encode_headers_into(
+            &mut self.write_buf,
             stream_id,
             &trailer_block,
             true, // end_stream
             true, // end_headers
             None,
         );
-        self.write_all(trailer_frame).await?;
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
@@ -2922,6 +2951,35 @@ mod tests {
         }
     }
 
+    /// F-298: 次のフレームが同じストリームの END_STREAM 付き DATA で、全量が見えているときだけ true。
+    /// 覗くだけでバッファは消費しない。
+    #[test]
+    fn next_buffered_frame_ends_stream_needs_the_whole_final_data() {
+        let enc = FrameEncoder::new(16384);
+        let conn = |bytes: &[u8]| {
+            Http2Connection::new_with_initial_buffer(
+                NullIo,
+                Http2Settings::default(),
+                bytes.to_vec(),
+            )
+        };
+        let last = enc.encode_data(1, b"hello", true);
+
+        let mut c = conn(&last);
+        assert!(c.next_buffered_frame_ends_stream(1));
+        assert!(!c.next_buffered_frame_ends_stream(3), "another stream");
+        assert!(matches!(
+            c.try_read_frame_buffered(),
+            Ok(Some(Frame::Data { .. }))
+        ));
+        assert!(!c.next_buffered_frame_ends_stream(1), "nothing left");
+
+        assert!(!conn(&last[..last.len() - 1]).next_buffered_frame_ends_stream(1));
+        assert!(!conn(&last[..4]).next_buffered_frame_ends_stream(1));
+        assert!(!conn(&enc.encode_data(1, b"hello", false)).next_buffered_frame_ends_stream(1));
+        assert!(!conn(&enc.encode_ping(&[0; 8], false)).next_buffered_frame_ends_stream(1));
+    }
+
     /// 閉じて表から消えたストリームへの WINDOW_UPDATE・DATA は接続エラーにしない（RFC 9113 §5.1）。
     /// 開いたことの無い ID は従来どおり idle として接続エラー。
     #[test]
@@ -3170,6 +3228,50 @@ mod tests {
         async fn shutdown(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// B-333: トレーラは連結バッファへ積むだけ。先に積んだ応答の後ろに並び、1 回の書き込みで出る
+    #[cfg(feature = "handler")]
+    #[test]
+    fn queued_trailers_follow_the_response_in_one_write() {
+        futures::executor::block_on(async {
+            let mut conn = conn_with_open_stream(1);
+            let head: [(&[u8], &[u8]); 1] = [(b"content-type", b"application/grpc")];
+            conn.send_headers_buffered_end(1, 200, &head, false)
+                .await
+                .unwrap();
+            assert_eq!(conn.queue_data_frames(1, b"payload", false).unwrap(), 7);
+            let trailers: [(&[u8], &[u8]); 1] = [(b"grpc-status", b"0")];
+            conn.queue_trailers(1, &trailers).unwrap();
+            assert!(conn.stream.writes.is_empty(), "queued, not sent");
+            conn.flush_write_buf().await.unwrap();
+            assert_eq!(conn.stream.writes.len(), 1);
+
+            let mut dec = Http2Connection::new_with_initial_buffer(
+                NullIo,
+                Http2Settings::default(),
+                conn.stream.concat(),
+            );
+            let frames: Vec<Frame> =
+                std::iter::from_fn(|| dec.try_read_frame_buffered().unwrap()).collect();
+            assert!(matches!(
+                frames[..],
+                [
+                    Frame::Headers {
+                        end_stream: false,
+                        ..
+                    },
+                    Frame::Data {
+                        end_stream: false,
+                        ..
+                    },
+                    Frame::Headers {
+                        end_stream: true,
+                        ..
+                    }
+                ]
+            ));
+        });
     }
 
     /// 単純な同期ドライバ（io_uring 不要な送信テスト用）。Pending は自己 wake 前提で即再試行。

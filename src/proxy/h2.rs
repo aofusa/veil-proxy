@@ -125,6 +125,13 @@ pub(crate) trait H2Service {
     fn tls(&self) -> bool {
         false
     }
+
+    /// HEADERS の直後に本文の全量が読み込みバッファに見えている要求を、本文のチャネルを作らずに溜める経路で
+    /// 処理してよいか（F-298）。`streaming_plan` が常にストリーミングを選ぶサービスは既定の false のまま。
+    #[inline]
+    fn buffers_complete_body(&self) -> bool {
+        false
+    }
 }
 
 /// 通常のプロキシの per-stream 処理（ルーティング・セキュリティ・WASM・バックエンド）。
@@ -166,6 +173,11 @@ impl H2Service for ProxyH2Service {
     #[inline]
     fn tls(&self) -> bool {
         self.tls
+    }
+
+    #[inline]
+    fn buffers_complete_body(&self) -> bool {
+        true
     }
 }
 
@@ -677,6 +689,15 @@ pub(super) fn h2_spawn_for_request<S, V>(
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     // リダイレクトだけを返す接続（F-200）は本文を読む必要が無いのでストリーミングにしない。
     let tunnel = body_pending && conn.get_stream(stream_id).is_some_and(|s| s.tunnel);
+    // F-298: 本文が続く 1 つの DATA で全量届いている（unary の gRPC 等）。流す相手を作らずに、END_STREAM で
+    // 溜める経路として起動する（ルートの解決・チャネル 2 本・本文の中継のタスク切り替えが要求ごとに消える）
+    if body_pending
+        && !tunnel
+        && svc.buffers_complete_body()
+        && conn.next_buffered_frame_ends_stream(stream_id)
+    {
+        return;
+    }
     let plan = if body_pending && redirect_https.is_none() && !tunnel {
         let plan = svc.streaming_plan(conn, stream_id, client_ip, client_socket_addr);
         if plan.body_timeout_secs > 0 {
@@ -1073,8 +1094,6 @@ where
                 }
                 #[cfg(feature = "grpc")]
                 H2RespMsg::Trailers(_trailers) => {
-                    // トレイラー送出は write_all を伴うため先に合流バッファをフラッシュ。
-                    conn.flush_write_buf().await?;
                     {
                         let mut grpc_status = 0u32;
                         let mut grpc_message: Option<String> = None;
@@ -1088,17 +1107,15 @@ where
                                     std::str::from_utf8(value).ok().map(|s| s.to_string());
                             }
                         }
-                        let _ = conn
-                            .send_grpc_trailers(sid, grpc_status, grpc_message.as_deref())
-                            .await;
+                        let _ =
+                            conn.queue_grpc_trailers(sid, grpc_status, grpc_message.as_deref());
                     }
                     st.head_sent = true;
                     st.end_sent = true;
                 }
                 #[cfg(feature = "handler")]
                 H2RespMsg::HandlerTrailers(trailers) => {
-                    conn.flush_write_buf().await?;
-                    let _ = conn.send_trailers(sid, &trailers).await;
+                    let _ = conn.queue_trailers(sid, &trailers);
                     st.head_sent = true;
                     st.end_sent = true;
                 }
