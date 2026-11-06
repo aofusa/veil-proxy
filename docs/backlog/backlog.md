@@ -662,6 +662,7 @@
 | B-314 | P1 | 修正済み（v0.11.0） | [bugs/B-314-mesh-jwt-panic-cookies-claim-crlf.md](bugs/B-314-mesh-jwt-panic-cookies-claim-crlf.md) | メッシュの JWT 認証: 接頭辞の境界の多バイト文字で panic してワーカーごと落ちる・`from_cookies` を読まず偽造トークンが通る・クレームの CR/LF を上流のヘッダに書く |
 | B-315 | P1 | 修正済み（v0.11.0） | [bugs/B-315-mesh-h1-absolute-form-framing-chunk-overflow.md](bugs/B-315-mesh-h1-absolute-form-framing-chunk-overflow.md) | メッシュの HTTP/1.1: 絶対形式の要求先でパスの認可（DENY・notPaths）を素通り・曖昧な本文の区切り（CL+TE・複数 CL）を上流へ送る・chunked の長さの溢れで panic |
 | B-316 | P1 | 修正済み（v0.11.0） | [bugs/B-316-mesh-network-rbac-only-last-filter.md](bugs/B-316-mesh-network-rbac-only-last-filter.md) | メッシュの network RBAC がチェーンの最後の 1 つしか効かず、Istio の TCP の DENY が ALLOW と併用すると無視される |
+| B-317 | P1 | 修正済み（v0.11.0） | [bugs/B-317-http-frontend-handler-bypass-leading-crlf-connect.md](bugs/B-317-http-frontend-handler-bypass-leading-crlf-connect.md) | HTTP/2・HTTP/3 のハンドラのストリーミング経路・拡張 CONNECT が route.security・Proxy-Wasm を飛ばす、HTTP/1.1 の先頭の空行でヘッダの上限をすり抜ける、CONNECT の authority 形式を上流へ送る |
 
 ---
 

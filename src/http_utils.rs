@@ -995,12 +995,13 @@ pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
 ///
 /// - origin 形式（`/` で始まる）: そのまま
 /// - 絶対形式（`http://host/path`・`https://...`）: authority の後ろのパスの部分（パスの無い絶対形式は `None`）
-/// - CONNECT（authority 形式）と OPTIONS の `*`: そのまま
-/// - それ以外: `None`（呼び出し側は 400）
+/// - OPTIONS の `*`: そのまま
+/// - それ以外（CONNECT の authority 形式を含む）: `None`（呼び出し側は 400）
+///
+/// B-317: HTTP/1.1 の CONNECT のトンネルは持たないので、authority 形式（`host:443`・`x/admin`）を
+/// 通常の要求として通さない（ルートの照合は catch-all にしか合わず、上流は `/admin` と読んでいた。F18）
 pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::ops::Range<usize>> {
-    if target.first() == Some(&b'/')
-        || method.eq_ignore_ascii_case(b"CONNECT")
-        || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
+    if target.first() == Some(&b'/') || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
     {
         return Some(0..target.len());
     }
@@ -2112,6 +2113,26 @@ mod idempotent_method_tests {
         for m in [&b"POST"[..], b"PATCH", b"CONNECT", b"get"] {
             assert!(!super::is_idempotent_method(m));
         }
+    }
+
+    /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）
+    #[test]
+    fn origin_form_target_rejects_connect_authority_form() {
+        assert_eq!(
+            super::origin_form_target(b"CONNECT", b"x/admin/users"),
+            None
+        );
+        assert_eq!(
+            super::origin_form_target(b"CONNECT", b"example.com:443"),
+            None
+        );
+        assert_eq!(super::origin_form_target(b"GET", b"/a"), Some(0..2));
+        assert_eq!(super::origin_form_target(b"OPTIONS", b"*"), Some(0..1));
+        assert_eq!(super::origin_form_target(b"GET", b"*"), None);
+        assert_eq!(
+            super::origin_form_target(b"GET", b"http://h/admin"),
+            Some(8..14)
+        );
     }
 }
 

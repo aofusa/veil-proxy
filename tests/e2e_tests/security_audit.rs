@@ -93,6 +93,56 @@ pub(super) async fn test_f236_malformed_chunked_request_rejected() {
     }
 }
 
+/// B-317: CONNECT の authority 形式は通常の要求として通さない（catch-all のルートで上流へ送っていた）
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_b317_connect_authority_form_rejected() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    for target in ["x/api/ip-restricted/x", "localhost:443"] {
+        let req = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            target
+        );
+        let resp = send_raw_tls_request(req.as_bytes()).expect("response");
+        assert_eq!(
+            status_codes(&resp).first().copied(),
+            Some(400),
+            "{}: {}",
+            target,
+            resp.lines().next().unwrap_or("")
+        );
+    }
+}
+
+/// B-317: 要求行の前の空行は捨ててから大きさを測る（`\r\n\r\n` で始めると 8KB の上限をすり抜けていた）
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_b317_leading_empty_lines_do_not_bypass_header_limit() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    // 空行に続く普通の要求は処理する
+    let resp = send_raw_tls_request(
+        b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("response");
+    assert_eq!(status_codes(&resp).first().copied(), Some(200), "{}", resp);
+    // 空行のあとに 8KB を超えるヘッダ
+    let mut req = b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    req.extend(std::iter::repeat_n(b'a', 20 * 1024));
+    req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    let first = send_raw_tls_request(&req).and_then(|r| status_codes(&r).first().copied());
+    assert!(
+        first == Some(431) || first.is_none(),
+        "oversized header after empty lines must be refused: {:?}",
+        first
+    );
+}
+
 /// B-219: `VEIL_E2E_SECCOMP` で seccomp を掛けたとき、制御プレーンを含む全スレッドに掛かっている
 /// （prctl は呼んだスレッドにしか掛からず、先に作ったスレッドが無制限のまま動いていた）
 #[cfg(target_os = "linux")]

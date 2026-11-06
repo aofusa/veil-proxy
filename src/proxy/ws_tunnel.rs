@@ -251,20 +251,36 @@ pub(crate) async fn serve(
 
     // ハンドラのルート（F-262 の WebSocket ハンドラを HTTP/2・HTTP/3 のストリームの上で動かす）
     #[cfg(feature = "handler")]
-    if let Backend::Handler(entry, security, _, comp) = &backend {
+    if let Backend::Handler(entry, security, modules, comp) = &backend {
         let check = check_security(security, &req.client_ip, b"GET", 0, false);
         if check != SecurityCheckResult::Allowed {
             let r = out.error(check.status_code(), check.message()).await;
             return (r.0, r.1, 0);
         }
-        return crate::api::dispatch::serve_extended_connect(
-            &req,
-            entry,
-            comp.as_deref(),
-            req_rx,
-            out,
-        )
-        .await;
+        // B-317: ハンドラのルートでも Proxy-Wasm の要求ヘッダの段を通す（HTTP/1.1 の WebSocket と同じ）。
+        // 以前は RFC 8441・9220 の拡張 CONNECT だけ Wasm の認可を飛ばしてハンドラを呼んでいた（F16）
+        #[cfg(feature = "wasm")]
+        let (req, wasm) = {
+            let mut wasm = match wasm_request_headers(&req, modules.as_ref(), &out).await {
+                Ok(w) => w,
+                Err(r) => return (r.0, r.1, 0),
+            };
+            let mut req = req;
+            if let Some(h) = wasm.headers.take() {
+                req.headers = h;
+            }
+            (req, wasm)
+        };
+        #[cfg(not(feature = "wasm"))]
+        let _ = modules;
+        let result =
+            crate::api::dispatch::serve_extended_connect(&req, entry, comp.as_deref(), req_rx, out)
+                .await;
+        #[cfg(feature = "wasm")]
+        if let Some(engine) = wasm.engine {
+            crate::wasm::on_request_complete_async(engine, wasm.modules).await;
+        }
+        return result;
     }
 
     let Backend::Proxy(upstream_group, security, _, _, _, modules) = &backend else {

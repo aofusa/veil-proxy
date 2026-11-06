@@ -158,6 +158,8 @@ pub(super) async fn handle_requests(
     let mut first_read = true;
     // B-129: 蓄積に次の要求のヘッダが揃っている（パイプライン）
     let mut pipelined_ready = false;
+    // B-317: 今の要求の前に捨てた空行のバイト数
+    let mut skipped_empty_lines = 0usize;
     // ネイティブハンドラの呼び出しで要求をまたいで使い回す状態（F-202）
     #[cfg(feature = "handler")]
     let mut api_cache = crate::api::dispatch::CallCache::default();
@@ -222,6 +224,30 @@ pub(super) async fn handle_requests(
             }
         }
 
+        // B-317: 要求行の前の空行（RFC 9112 §2.2）はここで捨てる。httparse は先頭の空行を飛ばして読むが、
+        // 下のヘッダの大きさの検査は最初の CRLFCRLF の位置で測るので、`\r\n\r\n` で始まる要求は検査を
+        // すり抜け、蓄積が際限なく伸びる（F8）うえ、8KB を超えるヘッダの位置を u16 に詰めて別のバイトを
+        // ヘッダとして読んでいた（F7）。捨てる量にも上限を掛ける
+        if matches!(accumulated.first(), Some(b'\r' | b'\n')) {
+            let lead = accumulated
+                .iter()
+                .take_while(|&&b| b == b'\r' || b == b'\n')
+                .count();
+            bytes::Buf::advance(&mut accumulated, lead);
+            skipped_empty_lines += lead;
+            if skipped_empty_lines > MAX_HEADER_SIZE {
+                let _ = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all(ERR_MSG_BAD_REQUEST.to_vec()),
+                )
+                .await;
+                return;
+            }
+            if accumulated.is_empty() {
+                continue;
+            }
+        }
+
         // ヘッダーサイズ制限チェック（RFC 6585: 431 Request Header Fields Too Large）
         // ヘッダー終端 \r\n\r\n が見つかった場合はヘッダー部分のみをチェック。
         // まだヘッダーが完全でない場合は蓄積サイズで判定する。
@@ -266,7 +292,18 @@ pub(super) async fn handle_requests(
         let mut req = Request::new(&mut headers_storage);
 
         match req.parse(&accumulated) {
+            // B-317: httparse が読んだヘッダの長さでも上限を確かめる（下でヘッダの位置を u16 に詰める前提）
+            Ok(Status::Complete(header_len)) if header_len > MAX_HEADER_SIZE => {
+                let _ = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all(ERR_MSG_REQUEST_HEADER_TOO_LARGE.to_vec()),
+                )
+                .await;
+                lingering_drain_before_close(&mut tls_stream).await;
+                return;
+            }
             Ok(Status::Complete(header_len)) => {
+                skipped_empty_lines = 0;
                 // 各フィールドの (offset, len) を req の借用中（accumulated への参照が
                 // 生きている間）に確定する。以後は accumulated を可変利用するため、
                 // ここでオフセットをすべて集め終えたら直ちに req をドロップする。
@@ -389,10 +426,11 @@ pub(super) async fn handle_requests(
                     return;
                 }
 
+                // B-317: 値は数字だけを受ける（`+5`・Unicode の空白を受け付けると、生の値を受け取る上流と本文の
+                // 長さの解釈が食い違う。F17）
                 let content_length: usize = if let Some((_, cl_value)) = cl_first {
-                    match std::str::from_utf8(cl_value)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
+                    match crate::http_utils::parse_content_length(cl_value)
+                        .and_then(|n| usize::try_from(n).ok())
                     {
                         Some(len) => len,
                         None => {

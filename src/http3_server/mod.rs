@@ -1664,8 +1664,13 @@ impl Http3Handler {
         // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
         // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
         #[cfg(feature = "handler")]
-        if let Backend::Handler(entry, _, _, comp) = &backend {
-            if !entry.streaming_request || !more_frames {
+        if let Backend::Handler(entry, _, modules, comp) = &backend {
+            // B-317: Proxy-Wasm のあるルートはバッファ経路で要求のフェーズを通す（ストリーミングの経路は
+            // Wasm を走らせず、HEADERS で終えないだけで Wasm の認可を素通りできた。F14）
+            if !entry.streaming_request
+                || !more_frames
+                || modules.as_ref().is_some_and(|m| !m.is_empty())
+            {
                 return Decision::Buffer;
             }
             let security = backend.security();

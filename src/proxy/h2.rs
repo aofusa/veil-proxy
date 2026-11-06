@@ -1227,9 +1227,19 @@ where
     };
     // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
     #[cfg(feature = "handler")]
-    if let Backend::Handler(entry, _, _, _) = &backend {
+    if let Backend::Handler(entry, sec, modules, _) = &backend {
+        // B-317: ストリーミングの経路は `[route.security]`（IP・メソッド・レート制限）と Proxy-Wasm の要求の
+        // フェーズを通らない。HEADERS に END_STREAM を付けないだけ（gRPC の普通の呼び出し）で、バッファ経路・
+        // HTTP/1.1・HTTP/3 では拒否されるハンドラのルートへ届いていた（F5・F6）。検査で拒否される要求と
+        // Wasm のあるルートはバッファ経路へ回し、そこで検査・Wasm を通す（Proxy の分岐と同じ）
+        if !entry.streaming_request
+            || modules.as_ref().is_some_and(|m| !m.is_empty())
+            || check_security(sec, client_ip, &method, 0, true) != SecurityCheckResult::Allowed
+        {
+            return buffered;
+        }
         return H2StreamPlan {
-            streaming: entry.streaming_request.then_some(0),
+            streaming: Some(0),
             ..buffered
         };
     }
