@@ -4069,24 +4069,10 @@ pub(super) async fn h2_redirect(
 ) -> (u16, u64) {
     let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-        &path_str[prefix_str.len()..]
-    } else {
-        path_str
-    };
-    let mut final_url = redirect_url
-        .replace("$request_uri", path_str)
-        .replace("$path", sub_path);
-    if preserve_path && !sub_path.is_empty() {
-        if final_url.ends_with('/') && sub_path.starts_with('/') {
-            final_url.push_str(&sub_path[1..]);
-        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-            final_url.push('/');
-            final_url.push_str(sub_path);
-        } else {
-            final_url.push_str(sub_path);
-        }
-    }
+    // B-322: `$path` は常に `/` で始める（ルートが `/` のとき `/@evil.com` から `@evil.com` になり、
+    // `https://new.example.com$path` が別のホストを指した。F56）
+    let final_url =
+        crate::http_utils::build_redirect_url(redirect_url, path_str, prefix_str, preserve_path);
 
     let mut headers = h2_base_headers(false);
     headers.push((

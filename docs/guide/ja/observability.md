@@ -207,7 +207,7 @@ batch_interval_secs = 30             # エクスポート間隔（デフォル�
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `enabled` | OTLPエクスポートを有効化 | `false` |
-| `endpoint` | OTLP/HTTPエンドポイントURL | `http://localhost:4318` |
+| `endpoint` | OTLP/HTTPエンドポイントURL。`http://` だけ（エクスポータは TLS を持たないので、`https://` は起動時・リロード時に拒否する。ローカルのコレクタ・サイドカーへ送る） | `http://localhost:4318` |
 | `service_name` | `service.name` リソース属性 | `veil-proxy` |
 | `batch_interval_secs` | エクスポート間隔（秒） | `30` |
 

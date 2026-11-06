@@ -85,6 +85,13 @@ pub struct CidrRange {
 }
 
 impl CidrRange {
+    /// どのクライアントにも合わない範囲（`::/128`。送信元が未指定アドレスの接続は無い。B-322）
+    pub const DENY_ALL: CidrRange = CidrRange {
+        network: 0,
+        prefix_len: 128,
+        is_ipv6: true,
+    };
+
     /// CIDR文字列をパース（例: "192.168.1.0/24" または "10.0.0.1"）
     pub fn parse(s: &str) -> Option<Self> {
         let (ip_str, prefix_len) = if let Some(idx) = s.find('/') {
@@ -303,14 +310,22 @@ impl IpFilter {
     pub fn from_lists(allowed_ips: &[String], denied_ips: &[String]) -> Self {
         let allowed: Vec<CidrRange> = allowed_ips
             .iter()
-            .filter_map(|s| CidrRange::parse(s))
+            .filter_map(|s| CidrRange::parse(s.trim()))
             .collect();
 
         let denied: Vec<CidrRange> = denied_ips
             .iter()
-            .filter_map(|s| CidrRange::parse(s))
+            .filter_map(|s| CidrRange::parse(s.trim()))
             .collect();
 
+        // B-322: 許可リストを書いたのに 1 つも読めなければ全部拒否する（空＝全許可に倒さない。設定の検査が
+        // 先に断るので、ここは検査を通らない経路の安全網。F46）
+        if allowed.is_empty() && !allowed_ips.is_empty() {
+            return Self {
+                allowed: vec![CidrRange::DENY_ALL],
+                denied,
+            };
+        }
         Self { allowed, denied }
     }
 
@@ -759,6 +774,18 @@ impl Default for SecurityConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-322: 許可リストが 1 つも読めなければ全部拒否する。前後の空白は許す
+    #[test]
+    fn unparsable_allow_list_denies_all() {
+        let f = IpFilter::from_lists(&["10.0.0.0/33".to_string(), "bogus".to_string()], &[]);
+        for ip in ["10.0.0.1", "1.2.3.4", "::1", "::ffff:10.0.0.1"] {
+            assert!(!f.is_allowed(ip), "{ip}");
+        }
+        let f = IpFilter::from_lists(&[" 10.0.0.0/8 ".to_string()], &[]);
+        assert!(f.is_allowed("10.1.2.3"));
+        assert!(!f.is_allowed("11.1.2.3"));
+    }
 
     #[test]
     fn ipv4_mapped_ipv6_matches_ipv4_ranges() {

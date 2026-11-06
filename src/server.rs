@@ -277,6 +277,21 @@ pub fn spawn_background_revalidation(
         };
 
         let target = &server.target;
+        // B-322: TLS の上流へは平文で送らない（以前は `use_tls` を見ずに平文の TCP で要求を書いていた。F42）。
+        // 利用者の資格情報（Cookie・Authorization）の付いた要求は裏で送り直さない（共有のキャッシュの更新に
+        // 利用者の資格情報を使わない。キーに Authorization があれば外して送ると別の利用者の応答になる）
+        if target.use_tls {
+            debug!("Background revalidation skipped: TLS upstream");
+            return;
+        }
+        if headers.iter().any(|(n, _)| {
+            n.eq_ignore_ascii_case(b"cookie")
+                || n.eq_ignore_ascii_case(b"authorization")
+                || n.eq_ignore_ascii_case(b"proxy-authorization")
+        }) {
+            debug!("Background revalidation skipped: request carries credentials");
+            return;
+        }
         // F-170: 接続先表記（UDS 対応、TCP は不変）。
         let addr = target.conn_addr();
         let addr = addr.as_str();

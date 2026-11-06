@@ -445,6 +445,10 @@ use_h2c = true
 |--------|-------------|---------|
 | `use_h2c` | Use H2C (HTTP/2 without TLS) | false |
 
+gRPC requests (`content-type: application/grpc*`) keep their full path (`/package.Service/Method`), so a route like
+`path = "/grpc/*"` does not strip `/grpc` from them, but only when the backend URL has no path. When the URL has a path
+(`url = "http://backend:50051/v1"`), every request, gRPC or not, gets the usual prefix rewrite.
+
 **H2C Use Cases:**
 - Connecting to gRPC backends (internal network)
 - Leverage HTTP/2 multiplexing and header compression for backend communication

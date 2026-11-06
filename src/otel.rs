@@ -319,10 +319,17 @@ pub(crate) fn connect_addr(endpoint: &str) -> Option<String> {
 }
 
 fn parse_endpoint(endpoint: &str) -> anyhow::Result<(String, u16, String)> {
-    let without_scheme = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint);
+    // B-322: エクスポータは TLS を持たないので https:// は断る（以前は `https://` を外して平文で送っていた。F37）
+    if endpoint
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
+        return Err(anyhow::anyhow!(
+            "https:// OTLP endpoints are not supported (the exporter sends plain HTTP): {}",
+            endpoint
+        ));
+    }
+    let without_scheme = endpoint.strip_prefix("http://").unwrap_or(endpoint);
 
     let (host_port, path) = match without_scheme.find('/') {
         Some(i) => (&without_scheme[..i], &without_scheme[i..]),
@@ -361,10 +368,13 @@ mod tests {
         assert_eq!(p, 4318);
         assert_eq!(path, "");
 
-        let (h, p, path) = parse_endpoint("https://otel.example.com:443/base").unwrap();
+        let (h, p, path) = parse_endpoint("http://otel.example.com:443/base").unwrap();
         assert_eq!(h, "otel.example.com");
         assert_eq!(p, 443);
         assert_eq!(path, "/base");
+        // B-322: TLS の無いエクスポータは https:// を断る
+        assert!(parse_endpoint("https://otel.example.com/base").is_err());
+        assert!(parse_endpoint("HTTPS://otel.example.com").is_err());
 
         let (h, p, _) = parse_endpoint("collector").unwrap();
         assert_eq!(h, "collector");

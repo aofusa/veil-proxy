@@ -2073,6 +2073,13 @@ async fn buffered_round_trip(
         _ => None,
     };
     let eof_framed = matches!(parsed.framing, Framing::Eof);
+    // B-322: 上流の Content-Length（信用できない）で確保しない。上限を超えるものは読む前に断る（F35）
+    if remaining.is_some_and(|n| n > crate::pool::MAX_COLLECTED_RESPONSE_BODY) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upstream response body exceeds the buffering limit",
+        ));
+    }
     let mut body: Vec<u8> = Vec::with_capacity(remaining.unwrap_or(leftover.len()));
     let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
     let mut done =

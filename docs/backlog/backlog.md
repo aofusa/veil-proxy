@@ -667,6 +667,7 @@
 | B-319 | P1 | 修正済み（v0.11.0） | [bugs/B-319-l4-wasm-fail-open-pause-short-write.md](bugs/B-319-l4-wasm-fail-open-pause-short-write.md) | L4 の Proxy-Wasm が失敗・Pause でデータを素通しし、ショートライトの再送が 2 回目で panic する |
 | B-320 | P1 | 修正済み（v0.11.0） | [bugs/B-320-wasm-host-pause-alloc-ids.md](bugs/B-320-wasm-host-pause-alloc-ids.md) | Proxy-Wasm で再開しない Pause が許可になる、`proxy_set_buffer_bytes` がホストのヒープを確保できる、NULL の確保へ書く、呼び出しの ID が要求をまたいで重なる、WebSocket で本文を待つ Pause が通る |
 | B-321 | P1 | 修正済み（v0.11.0） | [bugs/B-321-cache-static-isolation.md](bugs/B-321-cache-static-isolation.md) | 応答のキャッシュが no-cache・Cookie の応答を共有しルートをまたぐ・Vary のキーを偽造できる、静的配信のキャッシュが内側のルートの封じ込めを飛ばす、HTTP/2・HTTP/3 の静的配信の丸ごと読みに上限が無い、退避ファイルの名前が重なる |
+| B-322 | P1 | 修正済み（v0.11.0） | [bugs/B-322-misc-auth-routing-transport.md](bugs/B-322-misc-auth-routing-transport.md) | JWT の小数・文字列の exp を期限なしで通す、読めない allowed_ips で全許可、`$path` のオープンリダイレクト、gRPC の content-type でパスの書き換えを外せる、https の上流へ平文（h2c・裏の再検証・OTLP）、HPACK の資格情報、HTTP/3 の Content-Length の確保 |
 
 ---
 

@@ -331,7 +331,10 @@ fn compute_upstream_path(
     target_path_prefix: &str,
     preserve_full_path: bool,
 ) -> String {
-    if preserve_full_path {
+    // B-322: gRPC（クライアントの content-type で決まる）でフルパスを保つのは、上流の URL にパスが無いときだけ。
+    // パスを書いたルートはいつもその書き換えに従う（以前はクライアントが content-type で書き換えを外し、
+    // 設定の対応付けの外のパスを上流へ要求できた。F45）
+    if preserve_full_path && target_path_prefix.trim_matches('/').is_empty() {
         return if path_str.is_empty() {
             "/".to_string()
         } else {
@@ -739,6 +742,21 @@ mod path_tests {
         // 非 gRPC では従来どおり prefix 除去
         let stripped = compute_upstream_path(path, prefix, "", false);
         assert_eq!(stripped, "/UnaryCall");
+    }
+
+    /// B-322: 上流の URL にパスがあれば、gRPC でも書き換えに従う（content-type で外せない）
+    #[test]
+    fn grpc_full_path_only_without_target_prefix() {
+        let path = "/api/admin/x";
+        assert_eq!(
+            compute_upstream_path(path, b"/api", "/v1", true),
+            "/v1/admin/x"
+        );
+        assert_eq!(
+            compute_upstream_path(path, b"/api", "/v1", false),
+            "/v1/admin/x"
+        );
+        assert_eq!(compute_upstream_path(path, b"/api", "/", true), path);
     }
 
     #[test]

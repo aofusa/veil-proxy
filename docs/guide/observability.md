@@ -212,7 +212,7 @@ batch_interval_secs = 30             # Export interval (default: 30s)
 | Option | Description | Default |
 |--------|-------------|---------|
 | `enabled` | Enable OTLP export | `false` |
-| `endpoint` | OTLP/HTTP endpoint URL | `http://localhost:4318` |
+| `endpoint` | OTLP/HTTP endpoint URL. Only `http://`: the exporter does not speak TLS, and an `https://` endpoint is rejected at startup and reload (send to a local collector or sidecar) | `http://localhost:4318` |
 | `service_name` | `service.name` resource attribute | `veil-proxy` |
 | `batch_interval_secs` | Export interval (seconds) | `30` |
 

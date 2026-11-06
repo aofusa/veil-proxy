@@ -2030,28 +2030,13 @@ impl H3BufferedTask {
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
-        // パス部分（prefix除去後）
-        let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-            &path_str[prefix_str.len()..]
-        } else {
-            path_str
-        };
-
-        // 変数置換とパス追加
-        let mut final_url = redirect_url
-            .replace("$request_uri", path_str)
-            .replace("$path", sub_path);
-
-        if preserve_path && !sub_path.is_empty() {
-            if final_url.ends_with('/') && sub_path.starts_with('/') {
-                final_url.push_str(&sub_path[1..]);
-            } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-                final_url.push('/');
-                final_url.push_str(sub_path);
-            } else {
-                final_url.push_str(sub_path);
-            }
-        }
+        // B-322: `$path` は常に `/` で始める（F56）
+        let final_url = crate::http_utils::build_redirect_url(
+            redirect_url,
+            path_str,
+            prefix_str,
+            preserve_path,
+        );
 
         self.send_response(status_code, &[(b"location", final_url.as_bytes())], None)
             .await?;

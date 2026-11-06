@@ -439,6 +439,10 @@ use_h2c = true
 |-----------|------|-----------|
 | `use_h2c` | H2C (HTTP/2 without TLS) を使用 | false |
 
+gRPC の要求（`content-type: application/grpc*`）はフルパス（`/package.Service/Method`）を保ちます（`path = "/grpc/*"` のルートでも
+`/grpc` を除きません）。ただしバックエンドの URL にパスが無いときだけです。URL にパスがある（`url = "http://backend:50051/v1"`）
+ときは、gRPC かどうかに関わらず通常の接頭辞の書き換えをします。
+
 **H2Cの用途：**
 - gRPCバックエンドへの接続（内部ネットワーク）
 - HTTP/2の多重化とヘッダー圧縮をバックエンド通信でも活用

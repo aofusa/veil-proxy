@@ -2305,30 +2305,10 @@ pub(super) async fn handle_redirect(
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
-    // パス部分（prefix除去後）
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-        &path_str[prefix_str.len()..]
-    } else {
-        path_str
-    };
-
-    // 変数置換とパス追加
-    let mut final_url = redirect_url
-        .replace("$request_uri", path_str)
-        .replace("$path", sub_path);
-
-    // preserve_path が true の場合、元のパスを追加
-    if preserve_path && !sub_path.is_empty() {
-        // URLにすでにパスがある場合は結合
-        if final_url.ends_with('/') && sub_path.starts_with('/') {
-            final_url.push_str(&sub_path[1..]);
-        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-            final_url.push('/');
-            final_url.push_str(sub_path);
-        } else {
-            final_url.push_str(sub_path);
-        }
-    }
+    // B-322: `$path` は常に `/` で始める（ルートが `/` のとき `/@evil.com` から `@evil.com` になり、
+    // `https://new.example.com$path` が別のホストを指した。F56）
+    let final_url =
+        crate::http_utils::build_redirect_url(redirect_url, path_str, prefix_str, preserve_path);
 
     // ステータス行を構築
     let status_line = match status_code {

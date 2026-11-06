@@ -342,7 +342,14 @@ impl H2Mux {
             if self.skip(name, value) {
                 continue;
             }
-            list.push((lowered[li].as_slice(), value, false));
+            // B-322: 資格情報は never-indexed で送る。この接続は別のクライアントの要求と共有するので、動的テーブルに
+            // 入れると他の利用者の値を推測でき（符号の長さで当否が分かる）た（F39。RFC 7541 §7.1.3）
+            let name = lowered[li].as_slice();
+            let sensitive = matches!(
+                name,
+                b"authorization" | b"proxy-authorization" | b"cookie" | b"set-cookie"
+            );
+            list.push((name, value, sensitive));
             li += 1;
         }
         let block = match g.hpack_enc.encode(&list) {

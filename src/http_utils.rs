@@ -1001,6 +1001,43 @@ pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
     Some(n)
 }
 
+/// `Redirect` のルートの `Location` を作る（HTTP/1.1・HTTP/2・HTTP/3 で共通）。
+///
+/// - `$request_uri` は要求のパス全体、`$path` はルートの接頭辞を除いた残り。
+/// - B-322: `$path` は空でなければ必ず `/` で始める。接頭辞が `/` で終わる（`path = "/"` のルート等）と残りが
+///   `/` で始まらず、`/@evil.com` が `https://new.example.com@evil.com`（別のホスト）になっていた（F56）。
+/// - `preserve_path` なら残りを後ろに足す（`/` を 1 つにまとめる）。
+pub(crate) fn build_redirect_url(
+    redirect_url: &str,
+    path_str: &str,
+    prefix_str: &str,
+    preserve_path: bool,
+) -> String {
+    let stripped = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    let slashed;
+    let sub_path = if stripped.is_empty() || stripped.starts_with('/') {
+        stripped
+    } else {
+        slashed = format!("/{stripped}");
+        &slashed
+    };
+    let mut final_url = redirect_url
+        .replace("$request_uri", path_str)
+        .replace("$path", sub_path);
+    if preserve_path && !sub_path.is_empty() {
+        if final_url.ends_with('/') {
+            final_url.push_str(&sub_path[1..]);
+        } else {
+            final_url.push_str(sub_path);
+        }
+    }
+    final_url
+}
+
 /// HTTP/1.1 の要求先を origin 形式の範囲にする（RFC 9112 §3.2）。
 ///
 /// - origin 形式（`/` で始まる）: そのまま
@@ -2137,6 +2174,40 @@ mod idempotent_method_tests {
         assert!(!super::is_writable_h1_field(b"x-a", b"v\0"));
         assert!(!super::is_writable_h1_field(b"x a", b"v"));
         assert!(!super::is_writable_h1_field(b"x-a\r\n", b"v"));
+    }
+
+    /// B-322: `$path` は `/` で始まる（別のホストを指す Location を作らない）
+    #[test]
+    fn redirect_path_keeps_leading_slash() {
+        use super::build_redirect_url as b;
+        let t = "https://new.example.com$path";
+        assert_eq!(
+            b(t, "/@evil.com", "/", false),
+            "https://new.example.com/@evil.com"
+        );
+        assert_eq!(
+            b(t, "/.evil.com", "/", false),
+            "https://new.example.com/.evil.com"
+        );
+        assert_eq!(b(t, "/old/a", "/old", false), "https://new.example.com/a");
+        assert_eq!(b(t, "/old/a", "/old/", false), "https://new.example.com/a");
+        assert_eq!(b(t, "/", "/", false), "https://new.example.com");
+        assert_eq!(
+            b("https://n.example$request_uri", "/x?y", "/", false),
+            "https://n.example/x?y"
+        );
+        assert_eq!(
+            b("https://n.example/", "/old/a", "/old", true),
+            "https://n.example/a"
+        );
+        assert_eq!(
+            b("https://n.example", "/old/a", "/old", true),
+            "https://n.example/a"
+        );
+        assert_eq!(
+            b("https://n.example/", "/a", "/", true),
+            "https://n.example/a"
+        );
     }
 
     /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）
