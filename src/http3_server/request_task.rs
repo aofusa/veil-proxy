@@ -1847,6 +1847,12 @@ impl H3BufferedTask {
                 self.send_error_response(403, b"Forbidden").await?;
                 return Ok((403, 9));
             }
+            // B-321: 丸ごと読む量の上限
+            Some(cache::StaticFileOutcome::Busy) => {
+                self.send_error_response(503, b"Service Unavailable")
+                    .await?;
+                return Ok((503, 19));
+            }
             Some(cache::StaticFileOutcome::Directory(file_info)) => {
                 // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
                 // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
@@ -1863,6 +1869,11 @@ impl H3BufferedTask {
                 {
                     Some(cache::StaticFileOutcome::File(info, data)) => {
                         (data, info.mime_type, info.validators, index_path)
+                    }
+                    Some(cache::StaticFileOutcome::Busy) => {
+                        self.send_error_response(503, b"Service Unavailable")
+                            .await?;
+                        return Ok((503, 19));
                     }
                     Some(cache::StaticFileOutcome::Forbidden) | None => {
                         self.send_error_response(403, b"Forbidden").await?;

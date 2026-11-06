@@ -140,6 +140,12 @@ pub struct CacheConfig {
     /// 注意: Linux環境以外では自動的に同期I/Oにフォールバック
     #[serde(default = "default_use_async_io")]
     pub use_async_io: bool,
+
+    /// キャッシュのキーに付けるルートの名前空間（設定ロード時に `build_backend` がルートの条件・
+    /// アクションから決める。0 は付けない）。B-321: 全ルートで 1 つのキャッシュを共有するので、条件
+    /// （source_ip・ヘッダ・クエリ）の違うルートの応答を別のルートの要求へ返していた（F23）
+    #[serde(skip)]
+    pub route_ns: u64,
 }
 
 /// use_async_ioのデフォルト値（true）
@@ -170,6 +176,7 @@ impl Default for CacheConfig {
             include_query: true,
             key_headers: Vec::new(),
             use_async_io: default_use_async_io(),
+            route_ns: 0,
         }
     }
 }

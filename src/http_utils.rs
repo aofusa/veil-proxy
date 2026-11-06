@@ -951,6 +951,7 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
 ///
 /// B-318: ハンドラ・Proxy-Wasm・上流の HTTP/2 の応答のヘッダは任意のバイトを持ち得るので、HTTP/1.1 へ書く
 /// 直前に確かめて、満たさないものは書かない（応答の分割を防ぐ。F15・F30・F40）
+#[cfg(any(feature = "handler", feature = "wasm"))]
 #[inline]
 pub(crate) fn is_writable_h1_field(name: &[u8], value: &[u8]) -> bool {
     is_valid_header_name(name) && is_valid_header_value(value)
@@ -2125,6 +2126,7 @@ mod idempotent_method_tests {
     }
 
     /// B-318: HTTP/1.1 の応答の head に書けるフィールド
+    #[cfg(any(feature = "handler", feature = "wasm"))]
     #[test]
     fn writable_h1_field() {
         assert!(super::is_writable_h1_field(b"x-a", b"v 1"));

@@ -772,13 +772,7 @@ where
                 body.len(),
                 buffering_config.max_memory_buffer
             );
-            let key = format!(
-                "buffer_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
+            let key = buffering::disk_buffer::unique_key();
             let size = body.len() as u64;
             return match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body)
                 .await

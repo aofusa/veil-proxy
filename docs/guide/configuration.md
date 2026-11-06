@@ -292,6 +292,9 @@ enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 2097152  # 2 MiB
 watch = true
+# HTTP/2 and HTTP/3 read a static file whole. Files larger than max_file_size_bytes (or every file when the cache is
+# off) are read only while less than 256 MiB of such reads are in flight across the process (one read of any size is
+# always allowed); beyond that the request gets 503.
 
 # Directory serving (without trailing slash - same behavior, no redirect)
 [[route]]

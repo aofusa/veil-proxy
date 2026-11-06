@@ -91,6 +91,7 @@ pub(super) async fn handle_proxy(
                 query,
                 cache_config.include_query,
                 vary_key_headers.as_deref(), // key_headers に基づくVaryキー
+                cache_config.route_ns,
             ) {
                 // グローバルキャッシュからエントリを取得
                 if let Some(cache_manager) = cache::get_global_cache() {
@@ -318,14 +319,20 @@ pub(super) async fn handle_proxy(
             query,
             cache_config.include_query,
             vary_key_headers.as_deref(), // key_headers に基づくVaryキー
+            cache_config.route_ns,
         ) {
             // キャッシュ保存用コンテキストを作成
             let max_capture = cache_config.max_memory_size.min(10 * 1024 * 1024); // 最大10MB
-            cache_save_ctx = Some(CacheSaveContext::new(
-                cache_key,
-                host_str.to_string(),
-                max_capture,
-            ));
+            let mut ctx = CacheSaveContext::new(cache_key, host_str.to_string(), max_capture);
+            // B-321: Cookie の付いた要求への応答は、共有を明示したものだけ保存する（キーに Cookie があれば別）
+            ctx.request_has_cookie = headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"cookie"))
+                && !cache_config
+                    .key_headers
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case("cookie"));
+            cache_save_ctx = Some(ctx);
         }
     }
 

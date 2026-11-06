@@ -3953,6 +3953,10 @@ pub(super) async fn h2_sendfile(
         Some(cache::StaticFileOutcome::Forbidden) => {
             return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
         }
+        // B-321: 丸ごと読む量の上限
+        Some(cache::StaticFileOutcome::Busy) => {
+            return h2_emit_error(resp_tx, notify, 503, b"Service Unavailable").await;
+        }
         Some(cache::StaticFileOutcome::Directory(file_info)) => {
             // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
             // （封じ込め検査は既に上で通過済みのため index パスにも同じ containment
@@ -3969,6 +3973,9 @@ pub(super) async fn h2_sendfile(
             {
                 Some(cache::StaticFileOutcome::File(info, data)) => {
                     (info.mime_type, info.validators, data, index_path)
+                }
+                Some(cache::StaticFileOutcome::Busy) => {
+                    return h2_emit_error(resp_tx, notify, 503, b"Service Unavailable").await;
                 }
                 Some(cache::StaticFileOutcome::Forbidden) | None => {
                     return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;

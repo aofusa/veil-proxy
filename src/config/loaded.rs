@@ -1567,6 +1567,32 @@ fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
 /// B-64 で判明したコストの大きい `canonicalize`/`metadata` は `canonical_base_memoized` /
 /// `is_dir_memoized` で設定パスごとに 1 回だけ実行するようメモ化してある（2 回目以降は
 /// syscall なし）。
+/// ルートのキャッシュの名前空間（B-321）。条件とアクションから決める（再読み込み・再起動で同じルートなら同じ値。
+/// HashMap の条件は並べ替えて書く）
+fn route_cache_namespace(route: &Route) -> u64 {
+    use std::fmt::Write as _;
+    let c = &route.conditions;
+    fn sorted(m: &Option<HashMap<String, String>>) -> Vec<(&String, &String)> {
+        let mut v: Vec<_> = m.iter().flatten().collect();
+        v.sort();
+        v
+    }
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+        c.host,
+        c.path,
+        sorted(&c.header),
+        c.method,
+        sorted(&c.query),
+        c.source_ip,
+        route.action,
+        route.traffic
+    );
+    xxhash_rust::xxh3::xxh3_64(s.as_bytes()).max(1)
+}
+
 #[allow(clippy::disallowed_methods)]
 pub(super) fn build_backend(
     route: &Route,
@@ -1576,7 +1602,8 @@ pub(super) fn build_backend(
     let security = route.security.clone().unwrap_or_default();
     let compression = route.compression.clone().unwrap_or_default();
     let buffering = route.buffering.clone().unwrap_or_default();
-    let cache = route.cache.clone().unwrap_or_default();
+    let mut cache = route.cache.clone().unwrap_or_default();
+    cache.route_ns = route_cache_namespace(route);
     // F-148: 設定ロード時に解決済みの `resolved_modules` を Arc clone するだけ
     // （従来あった `Arc::new(m.clone())` = リクエストごとの `Vec<String>` ディープコピーを排除）。
     // `resolved_modules` が未設定（安全網）の場合のみ、名前のみの `ModuleRef` を都度組み立てる。
@@ -1706,7 +1733,8 @@ pub(super) fn build_backend(
         } => {
             // Routeレベルの設定のみを使用
             let security = route.security.clone().unwrap_or_default();
-            let cache = route.cache.clone().unwrap_or_default();
+            let mut cache = route.cache.clone().unwrap_or_default();
+            cache.route_ns = route_cache_namespace(route);
             let access_err = |e: io::Error| {
                 let error_msg = format!(
                     "Failed to access file '{}': {} (error code: {})",

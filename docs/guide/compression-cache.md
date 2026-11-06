@@ -265,7 +265,13 @@ Cache keys are generated from:
   HTTP/2 and HTTP/3, and responses from `https://` upstreams, are not cached yet (F-257).
 - On a route with the cache, requests the cache may store are relayed through user space (to fill the cache); only the
   other requests keep the zero-copy (`splice`) path of `streaming` mode
-- Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
+- Responses with `Cache-Control: no-cache`, `no-store` or `private` are not stored (all `Cache-Control` lines are
+  read). Without `Cache-Control`, `Pragma: no-cache` and an `Expires` in the past (or not a valid date) are not
+  stored, and a future `Expires` sets the TTL
+- Responses to requests carrying `Cookie` are stored only when the response says it may be shared
+  (`Cache-Control: public` or `s-maxage`), unless `key_headers` contains `Cookie`
+- Each route has its own entries: two routes for the same host and path (for example one limited by `source_ip`)
+  never answer each other's requests from the cache
 - `Vary: *` responses are not cached when `respect_vary = true`
 - With `respect_vary = true`, a response whose `Vary` names a header that is not in `key_headers` is not cached
   (the cache key would not tell those requests apart). Add the header to `key_headers` (for example

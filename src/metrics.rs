@@ -1439,6 +1439,9 @@ pub struct CacheSaveContext {
     pub capture_aborted: bool,
     /// レスポンスのVaryヘッダーで指定されたヘッダー名のリスト
     pub vary_headers: Option<Vec<String>>,
+    /// 要求に Cookie が付いていた（キーに Cookie を含めないとき）。B-321: このときは応答が `public`・`s-maxage`
+    /// で共有を明示したときだけ保存する（利用者ごとのページを別の利用者へ返さない。F22）
+    pub request_has_cookie: bool,
 }
 
 impl CacheSaveContext {
@@ -1454,6 +1457,7 @@ impl CacheSaveContext {
             max_capture_size,
             capture_aborted: false,
             vary_headers: None,
+            request_has_cookie: false,
         }
     }
 
@@ -1468,6 +1472,7 @@ impl CacheSaveContext {
             max_capture_size: 0,
             capture_aborted: true,
             vary_headers: None,
+            request_has_cookie: false,
         }
     }
 
@@ -1506,6 +1511,11 @@ impl CacheSaveContext {
         #[cfg(feature = "cache")]
         {
             if self.capture_aborted || self.captured_body.is_empty() {
+                return false;
+            }
+            if self.request_has_cookie
+                && !crate::cache::CachePolicy::explicitly_shared(&self.captured_headers)
+            {
                 return false;
             }
 

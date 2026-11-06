@@ -262,7 +262,13 @@ url = "http://localhost:8080"
   `https://` の上流の応答は、まだキャッシュしません（F-257）。
 - キャッシュのあるルートでは、キャッシュに入り得る要求はユーザー空間を通ります（キャッシュに入れるため）。`streaming` モードの
   ゼロコピー（`splice`）の経路を使うのはそれ以外の要求だけです
-- キャッシュは `Cache-Control: no-cache`、`no-store`、`private` ヘッダーを尊重します
+- `Cache-Control: no-cache`・`no-store`・`private` の応答は保存しません（`Cache-Control` の行はすべて読みます）。
+  `Cache-Control` が無いときは、`Pragma: no-cache` と過去の（または日付として読めない）`Expires` の応答を保存せず、
+  未来の `Expires` を TTL にします
+- `Cookie` の付いた要求への応答は、共有してよいと応答が示したとき（`Cache-Control: public` か `s-maxage`）だけ保存します
+  （`key_headers` に `Cookie` があれば別）
+- キャッシュはルートごとに分かれます。同じホスト・パスの 2 つのルート（例えば `source_ip` で絞ったもの）が互いの要求に
+  キャッシュから答えることはありません
 - `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません
 - `respect_vary = true` の場合、`Vary` が `key_headers` に無いヘッダを挙げる応答はキャッシュされません（キーでその要求を
   区別できないため）。値ごとにキャッシュするには、そのヘッダを `key_headers` に足します（例: `key_headers = ["Accept-Encoding"]`）

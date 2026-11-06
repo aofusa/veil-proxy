@@ -458,8 +458,9 @@ CLAUDE_CODE_WORKFLOWS=1 claude -p \
 - `[route.security] trusted_proxies` に入らないクライアントが送った `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-Proto`・
   `Forwarded` は上流へ送らず、`X-Forwarded-For` にはクライアントの IP を入れる（`forwarded_headers = "passthrough"` で
   以前の素通しに戻せる）。
-- 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`Authorization` の要求への応答
-  （`key_headers` に `Authorization` が無いとき）を保存しない。
+- 応答のキャッシュは、`Set-Cookie` の応答・`key_headers` に無いヘッダで `Vary` する応答・`no-cache` の応答・`Authorization` の
+  要求への応答（`key_headers` に `Authorization` が無いとき）を保存しない。`Cookie` の要求への応答は `public` か `s-maxage` の
+  ときだけ保存する。エントリはルートごとに分かれる。
 - IP の許可・拒否リストは、IPv4 射影の IPv6 のアドレスを IPv4 として照合する。
 - 要求のパスは、ルートの照合・`[route.security]` の検査の前に正規化し、正規化したまま上流へ送る
   （`[security] path_normalization`）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないものは 400。

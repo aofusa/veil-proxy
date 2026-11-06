@@ -285,6 +285,8 @@ enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 2097152  # 2 MiB
 watch = true
+# HTTP/2・HTTP/3 は静的ファイルを丸ごと読む。max_file_size_bytes を超えるファイル（キャッシュが無効なら全部）は、
+# プロセス全体でそうした読み込みが 256 MiB 未満のときだけ読み（大きさに関わらず 1 つは読む）、超えると 503 を返す。
 
 # ディレクトリ配信（末尾スラッシュなし - 同じ動作、リダイレクトなし）
 [[route]]

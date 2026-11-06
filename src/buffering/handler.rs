@@ -47,6 +47,26 @@ pub mod disk_buffer {
     use std::path::Path;
     use xxhash_rust::xxh3::xxh3_64;
 
+    /// 退避するファイルのキー（プロセスで一意。B-321: 以前は時刻のナノ秒だけで、同じ刻みの 2 つの応答が
+    /// 同じファイルを使い、片方の利用者へもう片方の本文を返し得た。F44・F58）
+    pub fn unique_key() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static START: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let start = *START.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        });
+        format!(
+            "buffer_{}_{}_{}",
+            std::process::id(),
+            start,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     /// ディスクバッファへの非同期書き込み（offload 経由・イベントループ非ブロック）
     pub async fn write_to_disk(
         base_path: &Path,
@@ -68,7 +88,13 @@ pub mod disk_buffer {
         crate::runtime::offload::offload(move || {
             std::fs::create_dir_all(&dir_path)?;
             use std::io::Write;
-            let mut file = std::fs::File::create(&file_path_for_io)?;
+            // B-321: 既にある名前は開かない（O_EXCL。以前は切り詰めて開き、同じ名前の別の応答の本文を
+            // 上書きしていた。F44・F58）。持ち主だけ読める（0600）
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            let mut file = opts.open(&file_path_for_io)?;
             file.write_all(&data)?;
             file.sync_all()?;
             Ok::<(), io::Error>(())
@@ -261,7 +287,18 @@ mod tests {
         let read = block_on(disk_buffer::read_from_disk(&path)).unwrap();
         assert_eq!(read, data);
 
+        // B-321: 同じキーでは上書きしない（既にあれば失敗）
+        assert!(block_on(disk_buffer::write_to_disk(
+            dir.path(),
+            b"rt-key",
+            vec![1u8; 8]
+        ))
+        .is_err());
+        assert_eq!(block_on(disk_buffer::read_from_disk(&path)).unwrap(), data);
+
         block_on(disk_buffer::remove_disk_buffer(&path)).unwrap();
         assert!(!path.exists());
+        // キーはプロセスで一意
+        assert_ne!(disk_buffer::unique_key(), disk_buffer::unique_key());
     }
 }
