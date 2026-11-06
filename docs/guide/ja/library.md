@@ -90,7 +90,7 @@ HTTP/3・kTLS・gRPC・WASM などプロキシ機能を一通り含み、コン�
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 # リポジトリやローカルのチェックアウトを使う場合:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -712,7 +712,7 @@ tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が v
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # シムに解決される
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
@@ -720,8 +720,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
 # 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は

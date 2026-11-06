@@ -16,6 +16,6 @@ dependencies are installed with extras (``pip install "veil-api-kit[jwt,graphql,
 * ``veil_kit.testing`` - ``TestClient`` and dependency overrides
 """
 
-__version__ = "0.10.1"
+__version__ = "0.11.0rc1"
 
 __all__ = ["__version__"]

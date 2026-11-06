@@ -93,7 +93,7 @@ allocator is chosen). API reference: [docs.rs/veil-proxy](https://docs.rs/veil-p
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 # or the repository / a local checkout:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -751,7 +751,7 @@ which re-exports `veil::tokio`):
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # resolved to the shim
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
@@ -759,8 +759,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # the shim is not on crates.io (its package name is `tokio`), so it comes from the repository. Take veil from the
 # same tag so that the shim and your code use one copy of veil (two copies would mean two runtimes).
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1" }
 ```
 
 Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.
