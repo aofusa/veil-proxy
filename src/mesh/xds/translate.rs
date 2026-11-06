@@ -258,6 +258,7 @@ fn inner_type(any: &p::Any) -> String {
 fn san_matchers(v: Option<&p::CertificateValidationContext>) -> R<Vec<StringMatcher>> {
     let mut out = Vec::new();
     if let Some(v) = v {
+        reject_crl(v)?;
         for m in &v.match_subject_alt_names {
             out.push(string_matcher(m)?);
         }
@@ -268,6 +269,14 @@ fn san_matchers(v: Option<&p::CertificateValidationContext>) -> R<Vec<StringMatc
         }
     }
     Ok(out)
+}
+
+/// 失効リスト（`crl`）は検査しないので、受けた設定を拒否する（黙って捨てると失効した証明書を通す。B-323）。
+pub(crate) fn reject_crl(v: &p::CertificateValidationContext) -> R<()> {
+    if v.crl.is_some() {
+        return Err("certificate revocation lists (crl) are not supported".into());
+    }
+    Ok(())
 }
 
 /// 共通の TLS 設定から（自分の証明書の名前・信頼アンカーの名前・SAN の条件・ALPN）。
@@ -313,6 +322,10 @@ fn common_tls(c: &p::CommonTlsContext) -> R<(Option<String>, Option<String>, Vec
         }
         None => (None, Vec::new()),
     };
+    // 信頼アンカー無しの SAN の条件は、誰でも作れる自己署名の証明書で満たせるので拒否する（Envoy と同じ。B-323）
+    if roots.is_none() && !sans.is_empty() {
+        return Err("subject alt name matchers require trusted_ca".into());
+    }
     Ok((cert, roots, sans))
 }
 

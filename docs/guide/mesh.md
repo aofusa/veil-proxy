@@ -134,6 +134,15 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
 - Peer certificates are always checked against the mesh's trust bundle. When the xDS TLS context has no
   `match_subject_alt_names` (Linkerd: no expected identity), any certificate from that bundle is accepted: the
   peer is authenticated but not authorized by name, as with Envoy. Authorize with RBAC or AuthorizationPolicy.
+- For upstream TLS with no `match_subject_alt_names`, veil checks the server certificate against the SNI name (like
+  Envoy's `auto_san_validation`); connections without an SNI name are checked against the trust bundle only. SAN
+  matchers without `trusted_ca` are rejected (NACK), as with Envoy.
+- Certificate revocation lists (`crl` in a validation context) are not supported; configurations and SDS secrets that
+  carry one are rejected (NACK) instead of being applied without revocation checks.
+- An inbound `x-forwarded-client-cert` header is kept only when the client presented a certificate over TLS
+  (`ALWAYS_FORWARD_ONLY` keeps it regardless), as with Envoy.
+- Linkerd: when the inbound port policy has not arrived within 3 seconds, the connection is authorized with the
+  default policy (`LINKERD2_PROXY_INBOUND_DEFAULT_POLICY`), never relayed without a policy.
 - Tap events are emitted when a request completes (the three events of a request carry the same timing).
 - `ext_authz` (Istio's `CUSTOM` AuthorizationPolicy action) is not implemented; a listener that needs it is rejected (F-229).
 - The ambient waypoint was tested with whoami workloads, not with bookinfo. Transparent interception was tested inside

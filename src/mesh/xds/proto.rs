@@ -1528,6 +1528,9 @@ pub struct SdsSecretConfig {
 pub struct CertificateValidationContext {
     #[prost(message, optional, tag = "1")]
     pub trusted_ca: Option<DataSource>,
+    /// 失効リスト。検査を実装していないので、あれば拒否する（黙って捨てない。B-323）
+    #[prost(message, optional, tag = "7")]
+    pub crl: Option<DataSource>,
     #[prost(message, repeated, tag = "9")]
     pub match_subject_alt_names: Vec<StringMatcher>,
     #[prost(message, repeated, tag = "15")]

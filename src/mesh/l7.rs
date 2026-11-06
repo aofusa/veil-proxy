@@ -1018,12 +1018,15 @@ pub fn upstream_request_headers(
         ));
     }
     // XFCC
+    // B-323: 受けた XFCC を残すのは相手がクライアント証明書を出したときだけ（Envoy と同じ）。以前は TLS の
+    // チェーンなら証明書の無い相手の XFCC も残していて、任意の身元を上流へ信じさせられた（F28）
+    let peer_cert = ctx.tls && ctx.peer_cert_hash.is_some();
     let elem = if ctx.tls { xfcc_element(ctx) } else { None };
     match ctx.hcm.xfcc {
         XfccMode::Sanitize => {}
         XfccMode::ForwardOnly | XfccMode::AlwaysForwardOnly => {
             if let Some(x) = xfcc {
-                if ctx.tls || ctx.hcm.xfcc == XfccMode::AlwaysForwardOnly {
+                if peer_cert || ctx.hcm.xfcc == XfccMode::AlwaysForwardOnly {
                     out.push((Bytes::from_static(b"x-forwarded-client-cert"), x));
                 }
             }
@@ -1036,7 +1039,7 @@ pub fn upstream_request_headers(
                     e
                 ))),
                 (None, Some(e)) => Some(Bytes::from(e)),
-                (Some(x), None) if ctx.tls => Some(x),
+                (Some(x), None) if peer_cert => Some(x),
                 _ => None,
             };
             if let Some(v) = v {

@@ -291,10 +291,11 @@ async fn serve_port(
     http_ok: bool,
 ) {
     let _tcp = super::metrics::TcpGuard::inbound(dst, client_id.as_deref());
-    let ic = discovery::inbound(dst.port()).await;
-    let Some(ic) = ic else {
-        relay(ds, &discovery::app_tcp(cfg), dst).await;
-        return;
+    // B-323: ポリシーが 3 秒で届かなければ既定のポリシー（`LINKERD2_PROXY_INBOUND_DEFAULT_POLICY`）で
+    // 判定する（届かないまま認可せずにアプリへ中継していた。制御プレーンが遅い・識別子の発行待ちでも開かない）
+    let ic = match discovery::inbound(dst.port()).await {
+        Some(ic) => ic,
+        None => std::sync::Arc::new(discovery::default_inbound(cfg, dst.port())),
     };
     let tcp_allowed = |client: Option<&str>| {
         let header = |_: &str| None;

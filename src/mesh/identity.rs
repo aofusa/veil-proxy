@@ -349,7 +349,7 @@ impl ServerCertVerifier for MeshServerVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        server_name: &ServerName<'_>,
         _ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
@@ -367,7 +367,14 @@ impl ServerCertVerifier for MeshServerVerifier {
             now,
             PROVIDER.signature_verification_algorithms.all,
         )?;
-        if !san_matches(&parse_sans(end_entity), &self.san) {
+        if self.san.is_empty() {
+            // B-323: SAN の条件が無く SNI（DNS 名）があるときは、その名前で証明書を検査する（信頼アンカーに
+            // つながる証明書なら宛先を問わず通していた。Envoy の auto_san_validation 相当）。SNI の無い
+            // 接続（IP で呼ぶ名前）は従来どおり名前を問わない
+            if let ServerName::DnsName(_) = server_name {
+                rustls::client::verify_server_name(&parsed, server_name)?;
+            }
+        } else if !san_matches(&parse_sans(end_entity), &self.san) {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForName,
             ));
@@ -504,5 +511,31 @@ mod tests {
         );
         assert!(roots("test-root").is_some());
         assert_eq!(cert_sha256_hex(b"").len(), 64);
+    }
+    // B-323: SAN の条件が無ければ SNI の名前で検査する（信頼アンカーにつながれば宛先を問わず通していた）
+    #[test]
+    fn server_verifier_checks_name_without_san_matchers() {
+        let (der, pem, _) = gen_cert("spiffe://cluster.local/ns/demo/sa/srv");
+        set_roots_pem("test-root-b323", pem.as_bytes()).unwrap();
+        let der = CertificateDer::from(der);
+        let now = UnixTime::now();
+        let v = MeshServerVerifier {
+            roots_name: Some("test-root-b323".into()),
+            san: Vec::new(),
+        };
+        let ok = ServerName::try_from("a.example").unwrap();
+        let bad = ServerName::try_from("b.example").unwrap();
+        let ip = ServerName::IpAddress(std::net::IpAddr::from([10, 0, 0, 1]).into());
+        assert!(v.verify_server_cert(&der, &[], &ok, &[], now).is_ok());
+        assert!(v.verify_server_cert(&der, &[], &bad, &[], now).is_err());
+        assert!(v.verify_server_cert(&der, &[], &ip, &[], now).is_ok());
+        // SAN の条件があれば名前でなく条件で決める（Istio の mTLS の SNI は証明書に無い）
+        let v = MeshServerVerifier {
+            roots_name: Some("test-root-b323".into()),
+            san: vec![StringMatcher::exact(
+                "spiffe://cluster.local/ns/demo/sa/srv",
+            )],
+        };
+        assert!(v.verify_server_cert(&der, &[], &bad, &[], now).is_ok());
     }
 }
