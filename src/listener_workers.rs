@@ -13,7 +13,7 @@ use crate::config::{
 use crate::runtime::tcp::{TcpListener, TcpStream};
 use crate::runtime::time::timeout;
 use crate::server::create_listener;
-use ftlog::{error, info, warn};
+use ftlog::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -129,10 +129,17 @@ impl WorkerEnv {
 
 /// スレッド開始直後にCPUアフィニティを設定する。
 /// これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
-fn pin_to_core(label: &str, thread_id: usize, core: Option<core_affinity::CoreId>) {
+pub(crate) fn pin_to_core(label: &str, thread_id: usize, core: Option<core_affinity::CoreId>) {
     if let Some(core_id) = core {
         if core_affinity::set_for_current(core_id) {
             info!("[{} {}] Pinned to CPU core {:?}", label, thread_id, core_id);
+        } else if cfg!(target_os = "macos") {
+            // B-328: macOS（Apple silicon）は thread_policy_set のアフィニティに対応せず毎回失敗する。
+            // 起動のたびにワーカーの数だけ WARN を出さない（ピン留め無しで動くのは仕様）。
+            debug!(
+                "[{} {}] CPU pinning is not supported on this platform, running unpinned",
+                label, thread_id
+            );
         } else {
             warn!(
                 "[{} {}] Failed to pin to CPU core {:?}, running unpinned",

@@ -673,6 +673,7 @@
 | B-325 | P2 | 修正済み（v0.11.0） | [bugs/B-325-acme-windows-key-permissions.md](bugs/B-325-acme-windows-key-permissions.md) | Windows で ACME の秘密鍵・アカウント鍵が親ディレクトリの DACL を継承する |
 | B-326 | P2 | 修正済み（v0.11.0） | [bugs/B-326-mesh-linkerd-build-h2-stream-plan.md](bugs/B-326-mesh-linkerd-build-h2-stream-plan.md) | `mesh-linkerd` のビルドが通らない（tap の H2Service が H2StreamPlan に追従していない。v0.10.1 から） |
 | B-327 | P2 | 修正済み（v0.11.0） | [bugs/B-327-ci-macos14-runner-pyi-precompressed.md](bugs/B-327-ci-macos14-runner-pyi-precompressed.md) | CI: macOS arm64 のランナー（macos-14）の廃止、Python の型スタブに `precompressed` が無い、試験の値が秘密の検出に掛かる |
+| B-328 | P2 | 修正済み（v0.11.0） | [bugs/B-328-macos-cpu-pin-warn-bsd-paste.md](bugs/B-328-macos-cpu-pin-warn-bsd-paste.md) | macOS で起動のたびに CPU のピン留めの失敗を WARN、ライブラリ E2E の `paste` が BSD で動かない |
 
 ---
 

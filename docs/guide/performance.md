@@ -20,7 +20,7 @@ threads = 0  # If unspecified or 0, uses same number as CPU cores
 | `threads = 0` | Same number of threads as CPU cores |
 | `threads = 4` | Start with 4 threads |
 
-- Each worker thread is pinned to a CPU core (CPU affinity)
+- Each worker thread is pinned to a CPU core (CPU affinity). macOS does not support pinning (Apple silicon), so workers run unpinned there
 - If thread count exceeds core count, assigned round-robin
 - Recommend setting lower in memory-constrained environments
 - `0` / unspecified honors the cgroup CPU quota (`cpu.max` / `cpu.cfs_quota_us`): a container started with `--cpus 0.25` gets 1 worker, not one per host core

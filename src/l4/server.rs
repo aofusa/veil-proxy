@@ -195,19 +195,11 @@ pub fn spawn_l4_listeners(
                         thread::Builder::new()
                             .stack_size(8 * 1024 * 1024)
                             .spawn(move || {
-                                if let Some(core_id) = assigned_core {
-                                    if core_affinity::set_for_current(core_id) {
-                                        info!(
-                                            "[L4:{} Worker {}] Pinned to CPU core {:?}",
-                                            config.name, thread_id, core_id
-                                        );
-                                    } else {
-                                        warn!(
-                                            "[L4:{} Worker {}] Failed to pin to CPU core {:?}",
-                                            config.name, thread_id, core_id
-                                        );
-                                    }
-                                }
+                                crate::listener_workers::pin_to_core(
+                                    &format!("L4:{} Worker", config.name),
+                                    thread_id,
+                                    assigned_core,
+                                );
 
                                 crate::runtime::block_on(async move {
                                     // F-156: 全リスナー作成経路を `create_listener` に統一する

@@ -1435,7 +1435,7 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
   # ミドルウェア・要求ごとの値・ヘッダの列挙・HTTP の版
   expect "C middleware + locals" "local=req-7" curl -s -H 'x-request-id: req-7' "$B/mw/echo"
   expect "C middleware after hook" "x-request-id: req-7|x-mw: after" bash -c \
-    "curl -s -i -H 'x-request-id: req-7' '$B/mw/echo' | tr -d '\r' | tr A-Z a-z | grep -E '^x-(request-id|mw):' | paste -sd'|'"
+    "curl -s -i -H 'x-request-id: req-7' '$B/mw/echo' | tr -d '\r' | tr A-Z a-z | grep -E '^x-(request-id|mw):' | paste -sd'|' -"
   expect "C middleware stop" "stopped by middleware 418" curl -s -w ' %{http_code}' "$B/mw/stop"
   expect "C header_next + version (HTTP/1.1)" "multi=a;b; version=11 tls=0" curl -s -H 'x-multi: a' -H 'x-multi: b' "$B/headers"
   expect "C version (h2c)" "version=20" curl -s --http2-prior-knowledge "$B/headers"
@@ -1497,7 +1497,7 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
   expect "C kit client get_json" 'ok=0 notjson=1 body={"items":[1,2,3]}' curl -s "$B/client/json"
   expect "C kit client retry (503, 503, 200)" "200 recovered" curl -s "$B/client/retry"
   expect "C client async + deferred response" "x-deferred: 1|200 hello" bash -c \
-    "curl -s -i '$B/client/async' | tr -d '\r' | grep -iE '^x-deferred:|^200 ' | tr A-Z a-z | paste -sd'|'"
+    "curl -s -i '$B/client/async' | tr -d '\r' | grep -iE '^x-deferred:|^200 ' | tr A-Z a-z | paste -sd'|' -"
   expect "C deferred response from a thread" "later" curl -s "$B/deferred"
   # JSON 本文の検証（422）と OpenAPI の requestBody
   expect "C body schema 422" '422 {"detail":[' bash -c "curl -s -w '%{http_code} ' -o '$W/422' -X POST --data '{\"name\":\"\",\"extra\":1}' '$B/users'; cat '$W/422'"
@@ -1522,7 +1522,7 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
   expect "C kit GraphQL response type" "application/graphql-response+json" curl -s -o /dev/null -w '%{content_type}' \
     -H 'accept: application/graphql-response+json' -H 'content-type: application/json' --data '{"query":"{ hello }"}' "$B/graphql"
   expect "C kit GraphQL over SSE" 'event: next|data: {"data":{"hello":"world"}}|event: complete' bash -c \
-    "curl -s -H 'accept: text/event-stream' -H 'content-type: application/json' --data '{\"query\":\"{ hello }\"}' '$B/graphql' | grep -v '^\$' | paste -sd'|'"
+    "curl -s -H 'accept: text/event-stream' -H 'content-type: application/json' --data '{\"query\":\"{ hello }\"}' '$B/graphql' | grep -v '^\$' | paste -sd'|' -"
   expect "C kit GraphiQL" "GraphiQL.createFetcher" curl -s -H 'accept: text/html' "$B/graphql"
   # ソケットを開かない試験（veil_test_*・veil_kit_test_*）
   expect "C in-process tests (veil_test_*, veil_kit_test_*)" "selftest ok" "$CK/kit$EXE" --selftest
