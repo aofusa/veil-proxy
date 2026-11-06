@@ -29,10 +29,10 @@ use arc_swap::ArcSwap;
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::{
-    mpsc::{self, RecvTimeoutError, SyncSender},
+    mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError},
     Arc, OnceLock,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use crate::config::CURRENT_CONFIG;
@@ -189,6 +189,10 @@ fn open_log_file(path: &str) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// 流れている間に溜まった行をまとめて書く間隔（B-335）。この間に `channel_size`（既定 10,000）を超える行が
+/// 来ない限り落ちない（1,000 万行/秒に相当）。
+const WRITER_BATCH_INTERVAL: Duration = Duration::from_millis(1);
+
 /// ログライタースレッドを起動する
 fn spawn_log_thread(
     rx: mpsc::Receiver<Vec<u8>>,
@@ -229,30 +233,60 @@ fn spawn_log_thread(
                 None => Writer::Stdout(io::BufWriter::new(io::stdout())),
             };
 
-            loop {
+            let handle = |writer: &mut Writer, bytes: Vec<u8>| {
+                // 開き直し指示（F-178）。失敗したら旧ファイルへ書き続ける
+                // （stdout へは切り替えない）。
+                if !bytes.is_empty() {
+                    let _ = writer.write_all(&bytes);
+                    return;
+                }
+                let is_file = matches!(writer, Writer::File(_));
+                if let (Some(path), true) = (&file_path, is_file) {
+                    let _ = writer.flush();
+                    match open_log_file(path) {
+                        Ok(f) => *writer = Writer::File(io::BufWriter::new(f)),
+                        Err(e) => eprintln!(
+                            "access-log: failed to reopen '{}' (keeping the previous file): {}",
+                            path, e
+                        ),
+                    }
+                }
+            };
+
+            'run: loop {
+                // 静かな間だけチャネルの通知で眠る
                 match rx.recv_timeout(flush_interval) {
-                    // 開き直し指示（F-178）。失敗したら旧ファイルへ書き続ける
-                    // （stdout へは切り替えない）。
-                    Ok(bytes) if bytes.is_empty() => {
-                        let is_file = matches!(writer, Writer::File(_));
-                        if let (Some(path), true) = (&file_path, is_file) {
-                            let _ = writer.flush();
-                            match open_log_file(path) {
-                                Ok(f) => writer = Writer::File(io::BufWriter::new(f)),
-                                Err(e) => eprintln!(
-                                    "access-log: failed to reopen '{}' (keeping the previous file): {}",
-                                    path, e
-                                ),
-                            }
-                        }
-                    }
-                    Ok(bytes) => {
-                        let _ = writer.write_all(&bytes);
-                    }
+                    Ok(bytes) => handle(&mut writer, bytes),
                     Err(RecvTimeoutError::Timeout) => {
                         let _ = writer.flush();
+                        continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
+                }
+                // B-335: 流れている間は通知で眠らない。通知で眠るとワーカーが要求ごとにこのスレッドを起こし、
+                // 要求ごとに futex が 2 本走る（ワーカーはチャネルに待ち手がいなければ起こさない）。
+                // 溜まった分をまとめて書いて短く眠り、1 周の間に 1 件も来なければ通知の待ちへ戻る
+                let mut last_flush = Instant::now();
+                loop {
+                    let mut got = false;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(bytes) => {
+                                got = true;
+                                handle(&mut writer, bytes);
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break 'run,
+                        }
+                    }
+                    if !got {
+                        break;
+                    }
+                    if last_flush.elapsed() >= flush_interval {
+                        let _ = writer.flush();
+                        last_flush = Instant::now();
+                    }
+                    crate::server::cap_safe_sleep(WRITER_BATCH_INTERVAL);
                 }
             }
             let _ = writer.flush();
@@ -620,6 +654,43 @@ mod tests {
     fn test_dt() -> OffsetDateTime {
         // Unix timestamp 1704067200 = 2024-01-01T00:00:00Z
         OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("valid timestamp")
+    }
+
+    /// B-335: まとめて書く周回をまたいでも、行を落とさず順序どおりに書き、送信端が閉じたら書き切って終わる
+    #[test]
+    fn writer_keeps_every_line_across_batches() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-access-log-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(64);
+        spawn_log_thread(
+            rx,
+            Some(path.to_string_lossy().into_owned()),
+            Duration::from_millis(5),
+        );
+        const LINES: usize = 2000;
+        for i in 0..LINES {
+            tx.send(format!("{}\n", i).into_bytes()).unwrap();
+            if i % 500 == 0 {
+                // 周回の途中で止まっても（通知の待ちへ戻っても）続きを受ける
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            let got = std::fs::read_to_string(&path).unwrap_or_default();
+            if got.lines().count() == LINES || Instant::now() > deadline {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let _ = std::fs::remove_file(&path);
+        let want: Vec<String> = (0..LINES).map(|i| i.to_string()).collect();
+        assert_eq!(got.lines().collect::<Vec<_>>(), want);
     }
 
     #[test]
